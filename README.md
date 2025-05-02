@@ -38,7 +38,7 @@ In axx, the lines input from assembly language source files or standard input ar
 
 ## install and execution(assemble)
 
-``
+```
 # install (archlinux)
 yay -S axx
 
