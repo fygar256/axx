@@ -43,8 +43,8 @@ In axx, the lines input from assembly language source files or standard input ar
 yay -S axx
 
 # install
-git clone https://github.com/fygar256/general-assembler-axx.git
-cd general-assembler-axx
+git clone https://github.com/fygar256/axx.git
+cd axx
 chmod +x axx.py
 sudo cp axx.py /usr/bin/axx
 
