@@ -38,7 +38,10 @@ In axx, the lines input from assembly language source files or standard input ar
 
 ## install and execution(assemble)
 
-```
+``
+# install (archlinux)
+yay -S axx
+
 # install
 git clone https://github.com/fygar256/general-assembler-axx.git
 cd general-assembler-axx
