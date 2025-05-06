@@ -723,3 +723,8 @@ If you find a bug, I would appreciate it if you could let me know how to fix it.
 I would like to express my gratitude to my mentor, Junichi Hamada, and Tokyo Electronics Design, who gave me the problems and hints, the University of Electro-Communications, the computer scientists and engineers, Qiita, Google, IEEE, The Alan Turing Institute and some unforgettable people. Thank you very much.
 
 ### English is not my mother tongue so this document is translated by google translation. there may be some mistakes and sorry that my broken English.
+
+### Mascot Character
+
+<img alt="image" width="200px" height="200px" src="https://github.com/fygar256/axx/blob/main/axxgirl.png">
+
