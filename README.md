@@ -716,7 +716,7 @@ LISP machine programs are not assembly language.
 
 ### Request
 
-If you find a bug, I would appreciate it if you could let me know how to fix it.
+If you find a bug, I would appreciate it if you could let me know how　axx　won't work.
 
 ### Acknowledgements
 
