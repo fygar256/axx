@@ -409,6 +409,14 @@ Please prefix hexadecimal numbers with '0x'.
 .asciiz "sample2"
 ```
 
+### Fill with 0x00
+
+`.zero <expression>` fills the number of bytes specified by <expression> with 0x00.
+
+```
+.zero 65536
+```
+
 #### export
 
 The following command exports a label along with section/segment information. Only the label specified by the .export command is exported.
