@@ -1080,6 +1080,17 @@ def export_processing(l1,l2):
             idx+=1
     return True
 
+def zero_processing(l1,l2):
+    global pc
+    if upper(l1)!=".ZERO":
+        return False
+    x,idx=expression(l2,0)
+    for i in range(x+1):
+        outbin2(pc,0x00)
+        pc+=1
+    return True
+
+
 def ascii_processing(l1,l2):
     if upper(l1)!=".ASCII":
         return False
@@ -1216,6 +1227,8 @@ def lineassemble2(line,idx):
     if section_processing(l,l2):
         return [],[],True,idx
     if endsection_processing(l,l2):
+        return [],[],True,idx
+    if zero_processing(l,l2):
         return [],[],True,idx
     if ascii_processing(l,l2):
         return [],[],True,idx
