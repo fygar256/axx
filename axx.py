@@ -904,7 +904,7 @@ def match(s,t):
                 put_vars(a,v)
                 continue
             else:
-                (v,idx_s)=expression1(s,idx_s)
+                (v,idx_s)=expression0(s,idx_s)
                 put_vars(a,v)
                 continue
         elif a in lower:
@@ -1084,7 +1084,7 @@ def zero_processing(l1,l2):
     global pc
     if upper(l1)!=".ZERO":
         return False
-    x,idx=expression(l2,0)
+    x,idx=expression1(l2,0)
     for i in range(x+1):
         outbin2(pc,0x00)
         pc+=1
