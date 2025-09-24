@@ -1327,11 +1327,11 @@ def vliwprocess(line,idxs,objl,flag,idx):
     vliwstop=0
     while True:
         idx=skipspc(line,idx)
-        if line[idx:idx+4]=='!!!!':
+        if idx+4<=len(line) and line[idx:idx+4]=='!!!!':
             idx+=4
             vliwstop=1
             continue
-        elif line[idx:idx+2]=='!!':
+        elif idx+2<=len(line) and line[idx:idx+2]=='!!':
             idx+=2
             idxs,objl,flag,idx=lineassemble2(line,idx)
             objs+=[objl]
