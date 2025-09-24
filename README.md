@@ -16,7 +16,7 @@ Arch linux terminal
 
 # Main text
 
-axx.py is a general assembler that generalizes assemblers. In theory, it can process almost any generic processor architecture. To process each processor architecture, a pattern file (processor description file) for it is required. You can define any instruction, but if you create a pattern file based on the assembly language of the target processor, you can process the assembly language of that processor, although the notation is slightly different. In short, it is just the grammar rules of the instructions and the generation of binaries based on them.
+axx.py is a general assembler that generalizes assemblers. In theory, it can process any von Neumann type processor architecture. To process each processor architecture, a pattern file (processor description file) for it is required. You can define any instruction, but if you create a pattern file based on the assembly language of the target processor, you can process the assembly language of that processor, although the notation is slightly different. In short, it is just the grammar rules of the instructions and the generation of binaries based on them.
 
 The execution platform is also independent of a specific processing system. It is also set to ignore chr(13) at the end of lines in DOS files. I think it will work on any processing system that runs python.
 
