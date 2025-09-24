@@ -476,7 +476,9 @@ You can include a file like this.
 
 Assembly line comments are `;`.
 
-## Expressions, operators
+## Expressions, Operators, and Special factor
+
+One special factor is `!!!`, which represents the number of commands connected by !!.
 
 Since the assembly line expressions and pattern data expressions call the same functions, they work almost the same. Variables in lowercase cannot be referenced from the assembly line.
 
