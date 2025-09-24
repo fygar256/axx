@@ -103,8 +103,9 @@ def get_vars(s):
 
 def put_vars(s,v):
     global vars
-    c=ord(upper(s))
-    vars[c-ord('A')]=int(v)
+    if upper(s) in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        c=ord(upper(s))
+        vars[c-ord('A')]=int(v)
     return
 
 def q(s,t,idx):
@@ -1344,7 +1345,7 @@ def vliwprocess(line,idxs,objl,flag,idx):
     if vliwtemplatebits==0:
         vliwset=[ [ [0], "0" ]]
     for k in vliwset:
-        if sorted(k[0])==sorted(idxlst) or vliwtemplatebits==0:
+        if list(set(k[0]))==list(set(idxlst)) or vliwtemplatebits==0:
             im=2**vliwinstbits-1
             tm=2**vliwtemplatebits-1
             pm=2**vliwbits-1
