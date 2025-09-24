@@ -16,7 +16,7 @@ Arch linux terminal
 
 # Main text
 
-axx.py is a general assembler that generalizes assemblers. In theory, it can process any von Neumann type processor architecture. To process each processor architecture, a pattern file (processor description file) for it is required. You can define any instruction, but if you create a pattern file based on the assembly language of the target processor, you can process the assembly language of that processor, although the notation is slightly different. In short, it is just the grammar rules of the instructions and the generation of binaries based on them.
+axx.py is a general assembler that generalizes assemblers. In theory, it can process almost any von Neumann type processor architecture. To process each processor architecture, a pattern file (processor description file) for it is required. You can define any instruction, but if you create a pattern file based on the assembly language of the target processor, you can process the assembly language of that processor, although the notation is slightly different. In short, it is just the grammar rules of the instructions and the generation of binaries based on them.
 
 The execution platform is also independent of a specific processing system. It is also set to ignore chr(13) at the end of lines in DOS files. I think it will work on any processing system that runs python.
 
@@ -24,7 +24,7 @@ This version only has the core of the assembler, so it does not support practica
 
 Since the pattern file and source file are separated, it is possible to generate machine code for another processor from the source of a certain instruction set, if you do not mind the effort of coding. It is also possible to generate machine code for different processors from a common language. If you write multiple instruction codes in the binary_list of the pattern data, it will function as a macro, but it is not very smart. This allows you to write a simple compiler.
 
-Pattern data has only control syntax: assignment, ternary operator, ; modifier, and alignment. It can be used to generate binaries, not just assembly language. Pattern files are not Turing complete. They are not Turing complete, so it is not suitable for processors with very complex architectures, but it is possible.
+Pattern data has only control syntax: assignment, ternary operator, ; modifier, and alignment. It can be used to generate binaries, not just assembly language. Pattern files are not Turing complete. They are Turing incomplete, so it is not suitable for processors with very complex architectures.
 
 Since assembly language has a one-to-one correspondence with processor instruction code, axx was made possible.
 
