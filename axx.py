@@ -151,7 +151,7 @@ def factor(s,idx):
     global vcnt
     idx=skipspc(s,idx)
     x=0
-    if idx+3<=len(s) and s[idx:idx+3]=='!!!':
+    if idx+3<=len(s) and s[idx:idx+3]=='!!!' and expmode==EXP_PAT:
         x=vcnt+1
         idx+=3
     elif s[idx]=='-':
