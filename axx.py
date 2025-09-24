@@ -47,6 +47,7 @@ vliwbits=128
 vliwset=[]
 vliwflag=False
 vliwtemplatebits=0x00
+vcnt=1
 
 expmode=EXP_PAT
 error_undefined_label=False
@@ -147,9 +148,13 @@ def get_param_to_eon(s,idx):
     return t,idx
 
 def factor(s,idx):
+    global vcnt
     idx=skipspc(s,idx)
     x=0
-    if s[idx]=='-':
+    if idx+3<=len(s) and s[idx:idx+3]=='!!!':
+        x=vcnt+1
+        idx+=3
+    elif s[idx]=='-':
         (x,idx)=factor(s,idx+1)
 
     elif s[idx]=='~':
@@ -1312,9 +1317,10 @@ def lineassemble2(line,idx):
     return idxs,objl,True,idx
 
 def vliwprocess(line,idxs,objl,flag,idx):
-    global pc,vliwset
+    global pc,vliwset,vcnt
     objs=[objl]
     idxlst=[idxs]
+    vcnt=1
     while True:
         idx=skipspc(line,idx)
         if line[idx:idx+2]=='!!':
@@ -1322,6 +1328,7 @@ def vliwprocess(line,idxs,objl,flag,idx):
             idxs,objl,flag,idx=lineassemble2(line,idx)
             objs+=[objl]
             idxlst+=[idxs]
+            vcnt+=1
             continue
         else:
             break
