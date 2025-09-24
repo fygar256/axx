@@ -47,6 +47,7 @@ vliwbits=128
 vliwset=[]
 vliwflag=False
 vliwtemplatebits=0x00
+vliwstop=0
 vcnt=1
 
 expmode=EXP_PAT
@@ -148,10 +149,13 @@ def get_param_to_eon(s,idx):
     return t,idx
 
 def factor(s,idx):
-    global vcnt
+    global vcnt,vliwstop
     idx=skipspc(s,idx)
     x=0
-    if idx+3<=len(s) and s[idx:idx+3]=='!!!' and expmode==EXP_PAT:
+    if idx+4<=len(s) and s[idx:idx+4]=='!!!!' and expmode==EXP_PAT:
+        x=vliwstop
+        idx+=4
+    elif idx+3<=len(s) and s[idx:idx+3]=='!!!' and expmode==EXP_PAT:
         x=vcnt
         idx+=3
     elif s[idx]=='-':
@@ -1216,9 +1220,8 @@ def epic(i):
             idx+=1
             continue
         break
-    v2,idx=expression0(i[2],0)
-    v2=int(v2)
-    vliwset=add_avoiding_dup(vliwset,[idxs,v2])
+    s2=i[2]
+    vliwset=add_avoiding_dup(vliwset,[idxs,s2])
     return True
    
 def lineassemble2(line,idx):
@@ -1317,15 +1320,20 @@ def lineassemble2(line,idx):
     return idxs,objl,True,idx
 
 def vliwprocess(line,idxs,objl,flag,idx):
-    global pc,vliwset,vcnt
+    global pc,vliwset,vcnt,vliwstop
     objs=[objl]
     idxlst=[idxs]
     vcnt=1
+    vliwstop=0
     while True:
         idx=skipspc(line,idx)
-        if line[idx:idx+2]=='!!':
-            idx+=2
+        if line[idx:idx+4]=='!!!!':
+            idx+=4
+            vliwstop=1
+            continue
+        elif line[idx:idx+2]=='!!':
             vcnt+=1
+            idx+=2
             idxs,objl,flag,idx=lineassemble2(line,idx)
             objs+=[objl]
             idxlst+=[idxs]
@@ -1334,13 +1342,14 @@ def vliwprocess(line,idxs,objl,flag,idx):
             break
 
     if vliwtemplatebits==0:
-        vliwset=[ [ [0], 0 ]]
+        vliwset=[ [ [0], "0" ]]
     for k in vliwset:
         if k[0]==idxlst or vliwtemplatebits==0:
             im=2**vliwinstbits-1
             tm=2**vliwtemplatebits-1
             pm=2**vliwbits-1
-            templ=k[1]&tm
+            (x,idx)=expression0(k[1],0)
+            templ=x&tm
             vvv=0
             g=0
             values=[]
@@ -1376,6 +1385,7 @@ def vliwprocess(line,idxs,objl,flag,idx):
             r=r&pm
 
             # templateを追加する
+            print(templ)
             res=r|(templ<<(vliwbits-vliwtemplatebits))
 
             bc=vliwbits-8
