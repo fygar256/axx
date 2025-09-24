@@ -1344,7 +1344,7 @@ def vliwprocess(line,idxs,objl,flag,idx):
     if vliwtemplatebits==0:
         vliwset=[ [ [0], "0" ]]
     for k in vliwset:
-        if k[0]==idxlst or vliwtemplatebits==0:
+        if sorted(k[0])==sorted(idxlst) or vliwtemplatebits==0:
             im=2**vliwinstbits-1
             tm=2**vliwtemplatebits-1
             pm=2**vliwbits-1
@@ -1385,7 +1385,6 @@ def vliwprocess(line,idxs,objl,flag,idx):
             r=r&pm
 
             # templateを追加する
-            print(templ)
             res=r|(templ<<(vliwbits-vliwtemplatebits))
 
             bc=vliwbits-8
