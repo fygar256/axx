@@ -152,7 +152,7 @@ def factor(s,idx):
     idx=skipspc(s,idx)
     x=0
     if idx+3<=len(s) and s[idx:idx+3]=='!!!' and expmode==EXP_PAT:
-        x=vcnt+1
+        x=vcnt
         idx+=3
     elif s[idx]=='-':
         (x,idx)=factor(s,idx+1)
@@ -1325,10 +1325,10 @@ def vliwprocess(line,idxs,objl,flag,idx):
         idx=skipspc(line,idx)
         if line[idx:idx+2]=='!!':
             idx+=2
+            vcnt+=1
             idxs,objl,flag,idx=lineassemble2(line,idx)
             objs+=[objl]
             idxlst+=[idxs]
-            vcnt+=1
             continue
         else:
             break
