@@ -329,6 +329,7 @@ To put multiple VLIW instructions into one bundle, connect them with `!!` as sho
 ad r1,r2,r3 !! lod r4,[0x1234]
 ```
 
+If a pattern file has `!!!` in its binary_list, it represents the number of instructions concatenated with `!!`.
 
 ### Assembly file explanation
 
