@@ -1321,10 +1321,9 @@ def lineassemble2(line,idx):
     return idxs,objl,True,idx
 
 def vliwprocess(line,idxs,objl,flag,idx):
-    global pc,vliwset,vcnt,vliwstop
+    global pc,vliwset,vliwstop
     objs=[objl]
     idxlst=[idxs]
-    vcnt=1
     vliwstop=0
     while True:
         idx=skipspc(line,idx)
@@ -1333,7 +1332,6 @@ def vliwprocess(line,idxs,objl,flag,idx):
             vliwstop=1
             continue
         elif line[idx:idx+2]=='!!':
-            vcnt+=1
             idx+=2
             idxs,objl,flag,idx=lineassemble2(line,idx)
             objs+=[objl]
@@ -1406,8 +1404,9 @@ def vliwprocess(line,idxs,objl,flag,idx):
             return False
     return True
 
+
 def lineassemble(line):
-    global pc,vliwflag
+    global pc,vliwflag,vcnt
     line=line.replace('\t',' ').replace('\n','')
     line=reduce_spaces(line)
     line=remove_comment_asm(line)
@@ -1416,6 +1415,9 @@ def lineassemble(line):
     line=label_processing(line)
     clear_symbol([".clearsym","",""])
 
+    parts = line.split("!!")
+    vcnt= sum(1 for p in parts if p != "")
+    
     idxs,objl,flag,idx=lineassemble2(line,0)
 
     if flag==False:
