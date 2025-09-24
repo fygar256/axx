@@ -268,21 +268,20 @@ This allows you to include a file.
 .include "file.axx"
 ```
 
-### VLIW processor
+## VLIW Processor
 
-#### .vliw directive
+#### .vliw Directive
 
 ```
 .vliw::128::41::5::00
 ```
 
-This will allow you to handle an EPIC processor with a bundle bit count of 128, instruction bit count of 41, template bit count of 5, and NOP code of 0x00 (Itanium example).
+This will handle an EPIC processor with a bundle bit count of 128, instruction bit count of 41, template bit count of 5, and NOP code of 0x00 (Itanium example).
 
-For example, on Itanium, there are three 41-bit instructions, a set of instructions with a length of 41*3=123 (bits) + 5 template bits at the beginning. If it is not EPIC, specify 0 for the template bits.
+For example, on Itanium, there are three 41-bit instructions, a total length of 41 * 3 = 123 (bits), plus a 5-bit template bit at the beginning. For non-EPIC processors, specify 0 for the template bit.
 
 ##### For EPIC
-
-For EPIC processors, the pattern file is written as follows.
+For EPIC processors, the pattern file is written as follows:
 
 ```
 /* VLIW
@@ -291,22 +290,23 @@ For EPIC processors, the pattern file is written as follows.
 .setsym::R3::3
 .setsym::R4::4
 .vliw::128::41::5::00
-EPIC::1,2::0x8
+EPIC::1,2::0x8|!!!!
 EPIC::1::0x01
 AD a,b,c:: ::0x01,0,0,a,b,c::1
 LOD d,[!e]:: :: 0x00,0x01,0,d,e,e>>8::2
 ```
 
-Written like this, `EPIC::1,2::0x8` represents the set of EPIC instructions, and the code with template 0x8 for the bundle of instructions with indexes 1 and 2.
-The next, `AD a,b,c:: ::0x01,0,0,a,b,c::1` means that the ADD instruction r1,r2,r3 outputs 0x01,0,0,a,b,c without error checking, and the index code is 1, and `LOD d,[!e]:: :: 0x00,0x01,0,d,e,e>>8::2` means that the LOAD instruction r4 stores the contents of [!e], outputs 0,1,0,0xd,e (lower 8 bits), e (upper 8 bits) without error checking, and the index code is 2. This sample is for testing purposes and differs from the actual bytecode.
+Written as above, `!!!!` represents the stop bit. `EPIC::1,2::0x8|!!!!` represents the set of EPIC instructions, the bundle of instructions with indexes 1 and 2, and the bitwise OR code for the template with 0x8 and the stop bit.
 
-The parameter specified in .viw must match the number of bytes represented by the pattern, which is (number of bits in the bundle - number of bits in the template divided by 8 (bits)) + (1 if there is a remainder, 0 if not).
+The next instruction, `AD a,b,c:: ::0x01,0,0,a,b,c::1`, outputs 0x01,0,0,a,b,c to the ADD instruction r1,r2,r3 without error checking, with an index code of 1. `LOD d,[!e]:: :: 0x00,0x01,0,d,e,e>>8::2` stores the contents of [!e] in the LOAD instruction r4, outputs 0,1,0,0xd,e (lower 8 bits), e (upper 8 bits) without error checking, and represents an instruction with an index code of 2. This sample is for testing purposes and will differ from the actual bytecode.
 
-In EPIC, the error pattern must be explicitly specified as `:: ::`.
+The parameter specified in .viw is (number of bits in the bundle - number of bits in the template divided by 8) + (1 if there is a remainder, 0 if there is not) which must match the number of bytes represented by the pattern.
 
-##### Non-EPIC VLIW
+In EPIC, error patterns must be explicitly omitted using `:: ::`.
 
-For non-EPIC processors, the pattern file is written as follows.
+#### Non-EPIC VLIW
+
+For non-EPIC processors, the pattern file is written as follows:
 
 ```
 /* VLIW
@@ -321,15 +321,17 @@ LOD d,[!e]::0x02,d,e,e>>8
 JMP !a ::0x03,a,a>>8,0
 ```
 
-##### Concatenating instructions
+##### Concatenating Instructions
 
-To put multiple VLIW instructions into one bundle, connect them with `!!` as shown below.
+To bundle multiple VLIW instructions into a single bundle, use !! to connect them as shown below.
 
 ```
 ad r1,r2,r3 !! lod r4,[0x1234]
 ```
 
-If a pattern file has `!!!` in its binary_list, it represents the number of instructions concatenated with `!!`.
+If a pattern file's binary_list contains `!!!`, it represents the number of instructions concatenated with `!!`.
+
+If the concatenation ends with '!!!!', it sets a stop bit.
 
 ### Assembly file explanation
 
