@@ -300,9 +300,9 @@ Written as above, `!!!!` represents the stop bit. `EPIC::1,2::0x8|!!!!` represen
 
 The next instruction, `AD a,b,c:: ::0x01,0,0,a,b,c::1`, outputs 0x01,0,0,a,b,c to the ADD instruction r1,r2,r3 without error checking, with an index code of 1. `LOD d,[!e]:: :: 0x00,0x01,0,d,e,e>>8::2` stores the contents of [!e] in the LOAD instruction r4, outputs 0,1,0,0xd,e (lower 8 bits), e (upper 8 bits) without error checking, and represents an instruction with an index code of 2. This sample is for testing purposes and will differ from the actual bytecode.
 
-The parameter specified in .viw is (number of bits in the bundle - number of bits in the template divided by 8) + (1 if there is a remainder, 0 if there is not) which must match the number of bytes represented by the pattern.
+For example, on Itanium, there are three 41-bit instructions, a group of instructions with a length of 41 * 3 = 123 (bits), plus 5 template bits at the end. If the instruction is not EPIC, set the template bits to 0.
 
-If the template bit is a positive number, the template bit is on the right, if it is a negative number, the template bit is on the left.
+If the template bits are positive, they are placed at the right end, and if they are negative, they are placed at the left end. The number of template bits is an absolute value.
 
 In EPIC, error patterns must be explicitly omitted using `:: ::`.
 
