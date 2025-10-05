@@ -161,6 +161,7 @@ def factor(s,idx):
         idx+=3
     elif s[idx]=='-':
         (x,idx)=factor(s,idx+1)
+        x=-x
 
     elif s[idx]=='~':
         (x,idx)=factor(s,idx+1)
@@ -1139,7 +1140,6 @@ def vliwp(i):
     vliwbits=int(v1)
     vliwinstbits=int(v2)
     vliwtemplatebits=int(v3)
-
     vliwflag=True
     l=[]
     for i in range(vliwinstbits//8 + (0 if vliwinstbits%8==0 else 1)):
@@ -1342,10 +1342,11 @@ def vliwprocess(line,idxs,objl,flag,idx):
 
     if vliwtemplatebits==0:
         vliwset=[ [ [0], "0" ]]
+
     for k in vliwset:
         if list(set(k[0]))==list(set(idxlst)) or vliwtemplatebits==0:
             im=2**vliwinstbits-1
-            tm=2**vliwtemplatebits-1
+            tm=2**abs(vliwtemplatebits)-1
             pm=2**vliwbits-1
             (x,idx)=expression0(k[1],0)
             templ=x&tm
@@ -1354,7 +1355,7 @@ def vliwprocess(line,idxs,objl,flag,idx):
             values=[]
             nob=vliwbits//8+(0 if vliwbits%8==0 else 1)
             ibyte=vliwinstbits//8+(0 if vliwinstbits%8==0 else 1)
-            noi=(vliwbits-vliwtemplatebits)//vliwinstbits
+            noi=(vliwbits-abs(vliwtemplatebits))//vliwinstbits
 
 
             # バイナリコードを全部取ってきて足りない部分はNOPを足す
@@ -1384,7 +1385,11 @@ def vliwprocess(line,idxs,objl,flag,idx):
             r=r&pm
 
             # templateを追加する
-            res=r|(templ<<(vliwbits-vliwtemplatebits))
+
+            if vliwtemplatebits<0:
+                res=r|(templ<<(vliwbits-abs(vliwtemplatebits)))
+            else:
+                res=(r<<vliwtemplatebits)|templ
 
             bc=vliwbits-8
             vm=0xff<<bc
