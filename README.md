@@ -302,6 +302,8 @@ The next instruction, `AD a,b,c:: ::0x01,0,0,a,b,c::1`, outputs 0x01,0,0,a,b,c t
 
 The parameter specified in .viw is (number of bits in the bundle - number of bits in the template divided by 8) + (1 if there is a remainder, 0 if there is not) which must match the number of bytes represented by the pattern.
 
+If the template bit is a positive number, the template bit is on the right, if it is a negative number, the template bit is on the left.
+
 In EPIC, error patterns must be explicitly omitted using `:: ::`.
 
 #### Non-EPIC VLIW
