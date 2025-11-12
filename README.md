@@ -18,6 +18,8 @@ Arch linux terminal
 
 axx.py is a general assembler that generalizes assemblers. In theory, it can process almost any von Neumann type processor architecture. To process each processor architecture, a pattern file (processor description file) for it is required. You can define any instruction, but if you create a pattern file based on the assembly language of the target processor, you can process the assembly language of that processor, although the notation is slightly different. In short, it is just the grammar rules of the instructions and the generation of binaries based on them.
 
+It is not a "general-purpose" assembler in the sense that it can be used widely. It is a "general" assembler in the sense that it has a simple architecture that is "common to all".
+
 The execution platform is also independent of a specific processing system. It is also set to ignore chr(13) at the end of lines in DOS files. I think it will work on any processing system that runs python.
 
 This version only has the core of the assembler, so it does not support practical features such as optimization, advanced macros, and debuggers that are provided by dedicated assemblers. For practical features, please use a preprocessor for macros. For now, please use a program that manages binary files and label (symbol) files as a linker/loader. Since this is not an IDE, please use an external debugger as a debugger. Optimization is not supported. I think it has basic functions, so please apply them. The current version is not practical enough.
