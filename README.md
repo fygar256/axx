@@ -399,9 +399,9 @@ For example, suppose you have a processor that includes floating point operands,
 MOVF FA,!d ::0x01,d>>24,d>>16,d>>8,d
 ```
 
-If you pass `movf fa,flt(3.14)` to the assemble line, the binary output will be 0x01,0xc3,0xf5,0x48,0x40. If flt is dbl, it is a double precision floating point, and if it is qad, it is a quadruple precision floating point.
+If you pass `movf fa,flt{3.14}` to the assemble line, the binary output will be 0x01,0xc3,0xf5,0x48,0x40. If flt is dbl, it is a double precision floating point, and if it is qad, it is a quadruple precision floating point.
 
-In the current specification, the x in qad(x) of flt(x) and dbl(x) is a constant, and `nan`, `inf`, and `-inf` are only handled within flt(x), dbl(x), and qad(x).
+In the current specification, expression can write in flt(x) and dbl(x), and `nan`, `inf`, and `-inf` are not permitted to operate.
 
 Please prefix binary numbers with '0b'.
 
@@ -496,7 +496,7 @@ Operators and precedence are based on Python and are as follows.
 ```
 (expression)         An expression enclosed in parentheses
 #                    An operator that returns the value of a symbol
-flt(x),dbl(x)        Operators that convert x to float and double bytecodes, respectively
+flt{x},dbl{x}        Operators that convert x to float and double bytecodes, respectively
 qad(x)               Operators that convert x to a 128-bit floating point number. However, in this case, x can only be a constant.
 -,~                  Negative, bitwise NOT
 @                    Unary operator that returns the bit position from the right of the most significant bit of the value that follows
@@ -703,7 +703,7 @@ LISP machine programs are not assembly language.
 
 -For now, only constants can be used for quadruple precision floating point numbers. This is the specification of python3. It would be nice if quadruple precision floating point numbers could be handled in python4.
 
--nan, inf, and -inf processing can only be used in flt(x), dbl(x), and qad(x). Nan, inf, and -inf are first loaded into registers or memory, or constants are taken as operands, and then the processor performs the calculations, so this may be sufficient.
+-nan, inf, and -inf processing can only be used in flt{x}, dbl{x}, and qad{x}. Nan, inf, and -inf are first loaded into registers or memory, or constants are taken as operands, and then the processor performs the calculations, so this may be sufficient.
 
 - Use the preprocessor for the macro function. It would be nice if there were more advanced macros.
 
@@ -723,7 +723,7 @@ LISP machine programs are not assembly language.
 
 ・The order of evaluation of pattern files is difficult.
 
-・Make it possible to take an equation for x in flt(x), dbl(x), and qad(x).
+・Make it possible to take an equation for x in qad(x).
 
 ・Now that the core is complete, I think it would be a great system if I prepared a pattern file for axx and added a linker, high-performance macros, optimization functions, and an IDE wrapper, but it would be difficult for an individual to complete such a large project, so please make one. I would be happy if it were put to practical use.
 
