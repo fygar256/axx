@@ -6,7 +6,7 @@
 
 from decimal import Decimal, getcontext
 import readline
-import string as str
+import string
 import subprocess
 import itertools
 import struct
@@ -60,7 +60,7 @@ bts=8
 endian='little'
 byte='yes'
 pas=0
-debug=0
+debug=False
 cl=""
 ln=0
 fnstack=[]
@@ -452,6 +452,22 @@ def get_floatstr(s,idx):
             idx+=1
     return(fs,idx)
 
+def get_curlb(s,idx):
+    idx=skipspc(s,idx)
+    f=False
+    if s[idx]=='{':
+        idx+=1
+        f=True
+        t=''
+        idx=skipspc(s,idx)
+        while s[idx]!='}':
+            t+=s[idx]
+            idx+=1
+        idx=skipspc(s,idx)
+        if s[idx]=='}':
+            idx+=1
+    return f,t,idx
+
 def factor1(s,idx):
     x = 0
 
@@ -481,29 +497,49 @@ def factor1(s,idx):
             x=16*x+int(s[idx].lower(),16)
             idx+=1
 
-    elif s[idx:idx+4]=='qad(':
-        idx+=4
-        (fs,idx)=get_floatstr(s,idx)
-        h=decimal_to_ieee754_128bit_hex(fs)
-        x=int(h,16)
-        if s[idx]==')':
+    elif s[idx:idx+3]=='qad':
+        idx+=3
+        idx=skipspc(s,idx)
+        if s[idx]=='{':
+            (fs,idx)=get_floatstr(s,idx+1)
+            h=decimal_to_ieee754_128bit_hex(fs)
+            x=int(h,16)
+        else:
+            pass
+        if s[idx]=='}':
             idx+=1
 
-    elif s[idx:idx+4]=='dbl(':
-        idx+=4
-        (fs,idx)=get_floatstr(s,idx)
-        h=decimal_to_ieee754_64bit_hex(fs)
-        x=int(h,16)
-        if s[idx]==')':
-            idx+=1
+    elif s[idx:idx+3]=='dbl':
+        idx+=3
+        f,t,idx=get_curlb(s,idx)
+        if f:
+            if t=='nan':
+                x=0x7ff8000000000000
+            elif t=='inf':
+                x=0x7ff0000000000000
+            elif t=='-inf':
+                x=0xfff0000000000000
+            else:
+                v=float(eval(t))
+                t=str(v)
+                x=v
+                x=int.from_bytes(struct.pack('>d',x),"big")
 
-    elif s[idx:idx+4]=='flt(':
-        idx+=4
-        (fs,idx)=get_floatstr(s,idx)
-        h=decimal_to_ieee754_32bit_hex(fs)
-        x=int(h,16)
-        if s[idx]==')':
-            idx+=1
+    elif s[idx:idx+3]=='flt':
+        idx+=3
+        f,t,idx=get_curlb(s,idx)
+        if f:
+            if t=='nan':
+                x=0x7fc00000
+            elif t=='inf':
+                x=0x7f800000
+            elif t=='-inf':
+                x=0xff800000
+            else:
+                v=float(eval(t))
+                t=str(v)
+                x=v
+                x=int.from_bytes(struct.pack('>f',x),"big")
 
     elif s[idx].isdigit():
         (fs,idx)=get_intstr(s,idx)
@@ -1411,19 +1447,27 @@ def lineassemble2(line,idx):
             break
         error_undefined_label=False
         
-        try:
-            if match0(lin,i[0])==True:
-                error(i[1])
-                objl=makeobj(i[2])
-                idxs,_=expression0(i[3],0)
+        if not debug:
+            try:
+                if match0(lin,i[0])==True:
+                    error(i[1])
+                    objl=makeobj(i[2])
+                    idxs,_=expression0(i[3],0)
+                    loopflag=False
+                    break
+            except:
+                oerr=True
                 loopflag=False
                 break
-        except:
-            oerr=True
-            loopflag=False
-            break
+
         else:
-            pass
+             if match0(lin,i[0])==True:
+                 error(i[1])
+                 objl=makeobj(i[2])
+                 idxs,_=expression0(i[3],0)
+                 loopflag=False
+                 break
+
     if loopflag==True:
         se=True
         pln=0
