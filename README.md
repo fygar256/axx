@@ -401,7 +401,7 @@ MOVF FA,!d ::0x01,d>>24,d>>16,d>>8,d
 
 If you pass `movf fa,flt(3.14)` to the assemble line, the binary output will be 0x01,0xc3,0xf5,0x48,0x40. If flt is dbl, it is a double precision floating point, and if it is qad, it is a quadruple precision floating point.
 
-In the current specification, expressions are allowed for x in flt(x) and dbl(x), but only constants are allowed for x in qad(x), and nan, inf, and -inf are only handled within flt(x), dbl(x), and qad(x).
+In the current specification, the x in qad(x) of flt(x) and dbl(x) is a constant, and `nan`, `inf`, and `-inf` are only handled within flt(x), dbl(x), and qad(x).
 
 Please prefix binary numbers with '0b'.
 
@@ -723,7 +723,7 @@ LISP machine programs are not assembly language.
 
 ・The order of evaluation of pattern files is difficult.
 
-・Make it possible to take an expression for x in qad(x).
+・Make it possible to take an equation for x in flt(x), dbl(x), and qad(x).
 
 ・Now that the core is complete, I think it would be a great system if I prepared a pattern file for axx and added a linker, high-performance macros, optimization functions, and an IDE wrapper, but it would be difficult for an individual to complete such a large project, so please make one. I would be happy if it were put to practical use.
 
