@@ -5,6 +5,7 @@
 #
 
 from decimal import Decimal, getcontext
+import readline
 import string as str
 import subprocess
 import itertools
@@ -12,6 +13,7 @@ import struct
 import numpy as np
 import sys
 import os
+import math
 import re
 EXP_PAT=0
 EXP_ASM=1
@@ -213,6 +215,137 @@ def put_label_value(k,v,s):
     labels[k]=[v,s]
     return True
 
+def decimal_to_ieee754_32bit_hex(a):
+    # IEEE 754 単精度の定義
+    BIAS = 127
+    SIGNIFICAND_BITS = 23
+    EXPONENT_BITS = 8
+    
+    # Decimalモジュールの精度を設定
+    getcontext().prec = 34  # 単精度は約34桁の10進数精度に相当
+    
+    # 入力をDecimal型に変換
+    if a == 'inf':
+        a = 'Infinity'
+    elif a == '-inf':
+        a = '-Infinity'
+    elif a == 'nan':
+        a = 'NaN'
+    d = Decimal(a)
+    
+    # 特殊ケースの処理
+    if d.is_nan():
+        # NaNの場合（符号=1、指数=全ビット1、仮数部は非ゼロ）
+        sign = 0
+        exponent = (1 << EXPONENT_BITS) - 1
+        fraction = 1 << (SIGNIFICAND_BITS - 1)  # 仮数部の最上位ビットを1に設定
+    elif d == Decimal('Infinity'):
+        # 正の無限大の場合（符号=0、指数=全ビット1、仮数部=0）
+        sign = 0
+        exponent = (1 << EXPONENT_BITS) - 1
+        fraction = 0
+    elif d == Decimal('-Infinity'):
+        # 負の無限大の場合（符号=1、指数=全ビット1、仮数部=0）
+        sign = 1
+        exponent = (1 << EXPONENT_BITS) - 1
+        fraction = 0
+    elif d == Decimal(0):
+        # ゼロの場合（符号のみ異なり、それ以外は全ビット0）
+        sign = 0 if d >= 0 else 1
+        exponent = 0
+        fraction = 0
+    else:
+        # 通常の数値の場合
+        sign = 0 if d >= 0 else 1
+        d = abs(d)
+        
+        # 指数部と仮数部を計算
+        exponent_value = d.adjusted() + BIAS
+        
+        if exponent_value <= 0:
+            # 非正規化数（指数が最小値未満）
+            exponent = 0
+            fraction = int(d.scaleb(BIAS - SIGNIFICAND_BITS).normalize() * (2**SIGNIFICAND_BITS))
+        else:
+            # 正規化数
+            exponent = exponent_value
+            normalized_value = d / (Decimal(2) ** d.adjusted())
+            fraction = int((normalized_value - 1) * (2**SIGNIFICAND_BITS))
+        
+        # 仮数部がオーバーフローしないように調整
+        fraction &= (1 << SIGNIFICAND_BITS) - 1
+    
+    # ビット列を組み立てる（符号 | 指数 | 仮数部）
+    bits = (sign << 31) | (exponent << SIGNIFICAND_BITS) | fraction
+    
+    # 結果を16進数文字列として返す
+    return f"0x{bits:08X}"
+
+def decimal_to_ieee754_64bit_hex(a):
+    # IEEE 754 倍精度の定義
+    BIAS = 1023
+    SIGNIFICAND_BITS = 52
+    EXPONENT_BITS = 11
+    
+    # Decimalモジュールの精度を設定
+    getcontext().prec = 34  # 倍精度は約34桁の10進数精度に相当
+    
+    # 入力をDecimal型に変換
+    if a == 'inf':
+        a = 'Infinity'
+    elif a == '-inf':
+        a = '-Infinity'
+    elif a == 'nan':
+        a = 'NaN'
+    d = Decimal(a)
+    
+    # 特殊ケースの処理
+    if d.is_nan():
+        # NaNの場合（符号=1、指数=全ビット1、仮数部は非ゼロ）
+        sign = 0
+        exponent = (1 << EXPONENT_BITS) - 1
+        fraction = 1 << (SIGNIFICAND_BITS - 1)  # 仮数部の最上位ビットを1に設定
+    elif d == Decimal('Infinity'):
+        # 正の無限大の場合（符号=0、指数=全ビット1、仮数部=0）
+        sign = 0
+        exponent = (1 << EXPONENT_BITS) - 1
+        fraction = 0
+    elif d == Decimal('-Infinity'):
+        # 負の無限大の場合（符号=1、指数=全ビット1、仮数部=0）
+        sign = 1
+        exponent = (1 << EXPONENT_BITS) - 1
+        fraction = 0
+    elif d == Decimal(0):
+        # ゼロの場合（符号のみ異なり、それ以外は全ビット0）
+        sign = 0 if d >= 0 else 1
+        exponent = 0
+        fraction = 0
+    else:
+        # 通常の数値の場合
+        sign = 0 if d >= 0 else 1
+        d = abs(d)
+        
+        # 指数部と仮数部を計算
+        exponent_value = d.adjusted() + BIAS
+        
+        if exponent_value <= 0:
+            # 非正規化数（指数が最小値未満）
+            exponent = 0
+            fraction = int(d.scaleb(BIAS - SIGNIFICAND_BITS).normalize() * (2**SIGNIFICAND_BITS))
+        else:
+            # 正規化数
+            exponent = exponent_value
+            normalized_value = d / (Decimal(2) ** d.adjusted())
+            fraction = int((normalized_value - 1) * (2**SIGNIFICAND_BITS))
+        
+        # 仮数部がオーバーフローしないように調整
+        fraction &= (1 << SIGNIFICAND_BITS) - 1
+    
+    # ビット列を組み立てる（符号 | 指数 | 仮数部）
+    bits = (sign << 63) | (exponent << SIGNIFICAND_BITS) | fraction
+    
+    # 結果を16進数文字列として返す
+    return f"0x{bits:016X}"
 
 def decimal_to_ieee754_128bit_hex(a):
     # IEEE 754 四倍精度の定義
@@ -314,7 +447,7 @@ def get_floatstr(s,idx):
         idx+=3
     else:
         fs=''
-        while(s[idx] in "0123456789-.e"):
+        while(s[idx] in "0123456789-.eE"):
             fs+=s[idx]
             idx+=1
     return(fs,idx)
@@ -356,37 +489,25 @@ def factor1(s,idx):
         if s[idx]==')':
             idx+=1
 
-    elif s[idx:idx+4]=='flt(':
-        (x,idx)=expression(s,idx+3)
-        if (x==float('nan')):
-            x=0x7fc00000
-        elif (x==float('inf')):
-            x=0x7f800000
-        elif (x==float('-inf')):
-            x=0xff800000
-        else:
-            x=int.from_bytes(struct.pack('>f',x),"big")
-
     elif s[idx:idx+4]=='dbl(':
-        (x,idx)=expression(s,idx+3)
-        if (x==float('nan')):
-            x=0x7ff8000000000000
-        elif (x==float('inf')):
-            x=0x7ff0000000000000
-        elif (x==float('-inf')):
-            x=0xfff0000000000000
-        else:
-            x=int.from_bytes(struct.pack('>d',x),"big")
+        idx+=4
+        (fs,idx)=get_floatstr(s,idx)
+        h=decimal_to_ieee754_64bit_hex(fs)
+        x=int(h,16)
+        if s[idx]==')':
+            idx+=1
 
-    elif s[idx].isdigit() or s[idx:idx+3]=='nan' or s[idx:idx+4]=='-inf' or s[idx:idx+3]=='inf':
-        (fs,idxi)=get_intstr(s,idx)
-        (fs2,idxf)=get_floatstr(s,idx)
-        if fs==fs2:
-            x=int(fs)
-            idx=idxi
-        else:
-            x=float(fs2)
-            idx=idxf
+    elif s[idx:idx+4]=='flt(':
+        idx+=4
+        (fs,idx)=get_floatstr(s,idx)
+        h=decimal_to_ieee754_32bit_hex(fs)
+        x=int(h,16)
+        if s[idx]==')':
+            idx+=1
+
+    elif s[idx].isdigit():
+        (fs,idx)=get_intstr(s,idx)
+        x=int(float(fs))
 
     elif expmode==EXP_PAT and (s[idx] in lower and s[idx+1] not in lower):
         ch=s[idx]
@@ -423,18 +544,18 @@ def term0(s,idx):
         if (s[idx]=='*'):
             (t,idx)=term0_0(s,idx+1)
             x*=t
-        elif s[idx]=='/' and s[idx+1]!='/':
-            (t,idx)=term0_0(s,idx+1)
-            if t==0:
-                err("Division by 0 error.")
-            else:
-                x=x/t
         elif q(s,'//',idx):
             (t,idx)=term0_0(s,idx+2)
             if t==0:
                 err("Division by 0 error.")
             else:
                 x//=t
+        #elif s[idx]=='/':
+        #    (t,idx)=term0_0(s,idx+1)
+        #    if t==0:
+        #        err("Division by 0 error.")
+        #    else:
+        #        x=x/t
         elif s[idx]=='%':
             (t,idx)=term0_0(s,idx+1)
             if t==0:
