@@ -16,9 +16,9 @@ Arch linux terminal
 
 # Main text
 
-axx.py is a general assembler that generalizes assembly language. It can process any processor architecture, as long as the assembly language has a one-to-one correspondence with the processor's instruction code. To process each processor architecture, a specific pattern file (processor description file) is required. While you can define any instructions, creating a pattern file based on the target processor's assembly language will allow you to process that processor's assembly language, albeit with slightly different syntax. In essence, all it requires is instruction grammar rules and binary generation based on those rules.
+axx.py is a general assembler that generalizes assembly language. It can process almost any processor architecture. To process each processor architecture, a corresponding pattern file (processor description file) is required. While you can define any instructions, creating a pattern file based on the target processor's assembly language will allow it to process that processor's assembly language, albeit with slightly different syntax. Essentially, all it requires is instruction grammar rules and binary generation based on those rules.
 
-It is not a "general-purpose assembler" in the sense that it can be used widely. For processors where the assembly language has a one-to-one correspondence with the instruction code, it is a "general assembler" in the sense that it can be used for all. In other words, axx.py can adapt to processors with complex architectures, but it cannot support some VLIW processors, which have instruction meta-level bundling.
+It is not a "general purpose assembler" in the sense of being "widely applicable." It is a "general assembler" in the sense of being "common to all" processors except those with meta-level complexity. In other words, axx.py can adapt to processors with complex architectures, but it cannot support some VLIW processors that have instruction meta-level bundling.
 
 The execution platform is also independent of a specific processing system. It is also set to ignore chr(13) at the end of lines in DOS files. I think it will work on any processing system that runs python.
 
