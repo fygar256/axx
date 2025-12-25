@@ -267,7 +267,7 @@ This allows you to include a file.
 ```
 #### Escape Characters in Expressions in Pattern Files
 
-An expression stops evaluation when it encounters the escape character '\'. The escape character is saved for later processing within the pattern file.
+An expression stops evaluation when it encounters the escape character '\'. Escaped character is saved for later processing within the pattern file.
 
 ```
 LEAQ r, [ s + t * !h \+ !i ] :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
