@@ -761,7 +761,25 @@ def expression1(s,idx):
 def expression_esc(s,idx,stopchar):
     global expmode
     expmode=EXP_PAT
-    replaced=s.replace(stopchar,chr(0))
+    result = []
+    depth = 0  # 括弧のネスト深さ
+
+    for ch in s:
+        if ch == '(':
+            depth += 1
+            result.append(ch)
+        elif ch == ')':
+            if depth > 0:
+                depth -= 1
+            result.append(ch)
+        else:
+            if depth == 0 and ch == stopchar:
+                result.append(chr(0))
+            else:
+                result.append(ch)
+
+    replaced=''.join(result)
+    
     t,i=expression(replaced,idx)
     return (t,i)
 
