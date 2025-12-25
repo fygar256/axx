@@ -472,7 +472,6 @@ def factor1(s,idx):
     x = 0
 
     idx=skipspc(s,idx)
-
     if s[idx]=='(':
         (x,idx)=expression(s,idx+1)
         if s[idx]==')':
@@ -757,6 +756,13 @@ def expression1(s,idx):
     global expmode
     expmode=EXP_ASM
     t,i=expression(s,idx)
+    return (t,i)
+
+def expression_esc(s,idx,stopchar):
+    global expmode
+    expmode=EXP_PAT
+    replaced=s.replace(stopchar,chr(0))
+    t,i=expression(replaced,idx)
     return (t,i)
 
 def getsymval(w):
@@ -1072,7 +1078,15 @@ def match(s,t):
                 put_vars(a,v)
                 continue
             else:
-                (v,idx_s)=expression0(s,idx_s)
+                idx_t=skipspc(t,idx_t)
+                if t[idx_t]=='\\':
+                    idx_t=skipspc(t,idx_t+1)
+                    b=t[idx_t]
+                    stopchar=b
+                else:
+                    stopchar=chr(0)
+
+                (v,idx_s)=expression_esc(s,idx_s,stopchar)
                 put_vars(a,v)
                 continue
         elif a in lower:
