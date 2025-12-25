@@ -265,6 +265,14 @@ This allows you to include a file.
 ```
 .include "file.axx"
 ```
+#### Escape Characters in Expressions in Pattern Files
+
+An expression stops evaluation when it encounters the escape character '\'. The escape character is saved for later processing within the pattern file.
+
+```
+LEAQ r, [ s + t * !h \+ !i ] :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
+```
+This example processes an x86_64 assembly line like `leaq rax,[rax+rbx*2+0x40]`, as shown below.
 
 ## VLIW Processor
 
@@ -632,8 +640,8 @@ ADDI x,y,!d :: (e:=(0x20000000|(y<<21)|(x<<16)|d&0xffff))>>24,e>>16,e>>8,e
 .setsym ::rep ::1
 MMX A,B :: ,0x12,0x13
 LEAQ r,[s,t,!d,!e] :: 0x48,0x8d,0x04,((@d)-1)<<6|t<<3|s,e
-LEAQ r, [ s + t * !!h + !!i ] :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
-[[u]] MOVSB ​​:: ;u?0xf3:0,0xa4
+LEAQ r, [ s + t * !h \+ !i ] :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
+[[u]]MOVSB ​​:: ;u?0xf3:0,0xa4
 TEST !a:: a==3?0xc0:4,0x12,0x13
 
 /* ookakko test
@@ -694,8 +702,6 @@ LISP machine programs are not assembly language.
 -From homemade processors to supercomputers, please feel free to use them.
 
 -Please evaluate, extend, and modify axx. The structure is difficult to understand, but since it is written in Python, it is easy to extend. Please feel free to extend it.
-
--It is difficult to put escape characters in expressions.
 
 -For now, only constants can be used for quadruple precision floating point numbers. This is the specification of python3. It would be nice if quadruple precision floating point numbers could be handled in python4.
 
