@@ -673,22 +673,22 @@ def term7(s,idx):
     while True:
         if q(s,'<=',idx):
             (t,idx)=term6(s,idx+2)
-            x=x<=t
+            x=1 if x<=t else 0
         elif (s[idx]=='<'):
             (t,idx)=term6(s,idx+1)
-            x=x<t
+            x=1 if x<t else 0
         elif q(s,'>=',idx):
             (t,idx)=term6(s,idx+2)
-            x=x>=t
+            x=1 if x>=t else 0
         elif (s[idx]=='>'):
             (t,idx)=term6(s,idx+1)
-            x=x>t
+            x=1 if x>t else 0
         elif q(s,'==',idx):
             (t,idx)=term6(s,idx+2)
-            x=x==t
+            x=1 if x==t else 0
         elif q(s,'!=',idx):
             (t,idx)=term6(s,idx+2)
-            x=x!=t
+            x=1 if x!=t else 0
         else:
             break
     return (x,idx)
@@ -696,7 +696,7 @@ def term7(s,idx):
 def term8(s,idx):
     if s[idx:idx+4]=='not(':
         (x,idx)=expression(s,idx+3)
-        x=not x
+        x=0 if x else 1
     else:
         (x,idx)=term7(s,idx)
     return (x,idx)
@@ -706,7 +706,7 @@ def term9(s,idx):
     while True:
         if q(s,'&&',idx):
             (t,idx)=term8(s,idx+2)
-            x=x and t
+            x=1 if x and t else 0
         else:
             break
     return (x,idx)
@@ -716,7 +716,7 @@ def term10(s,idx):
     while True:
         if q(s,'||',idx):
             (t,idx)=term9(s,idx+2)
-            x=x or t
+            x=1 if x or t else 0
         else:
             break
     return (x,idx)
