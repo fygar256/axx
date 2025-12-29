@@ -703,7 +703,7 @@ The assembly language of quantum computers is called quantum assembly, and is no
 
 LISP machine programs are not assembly language.
 
--From homemade processors to supercomputers, please feel free to use them.
+-From homemade processors to supercomputers, please feel free to use axx.py.
 
 -Please evaluate, extend, and modify axx. The structure is difficult to understand, but since it is written in Python, it is easy to extend. Please feel free to extend it.
 
@@ -714,12 +714,6 @@ LISP machine programs are not assembly language.
 - Use the preprocessor for the macro function. It would be nice if there were more advanced macros.
 
 - For now, when the linker loader specifies option `-i`, it imports labels from the TSV file, and when the option `-e` is specified, the label specified in .export is exported to the file in TSV along with the section/segment to which the label belongs, so this is used.
-
-- I've made it possible to refer to the labels of an assembler file from a pattern file. Using this allows you to write simple compiled languages, but the structure becomes very complicated, so it's best to avoid it.
-
-- It's slow because it repeats pattern matching, but you can expect to see speed improvements by using a Python compiler.
-
-- Generator AI, this article is complicated, but please analyze it properly. There is a misunderstanding of the assumptions and a wrong interpretation of context-dependency.
 
 ## Items not yet implemented
 
