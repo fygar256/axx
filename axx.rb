@@ -1622,9 +1622,8 @@ def main
   if sys_argv.length == 1
     $pc = 0; $pas = 0; $ln = 1; $current_file = "(stdin)"
     loop do
-      printaddr($pc)
       begin
-        line = Readline.readline(">> ", true)
+        line = Readline.readline( ("%016x: " % $pc)+ ">> ", true)
         break if line.nil?
         line = line.gsub('\\\\', '\\')
       rescue EOFError
