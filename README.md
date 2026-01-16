@@ -10,9 +10,28 @@ It was written in python, so the nickname is Paxx.
 
 Original article in Japanee:Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
 
+Ruby version and Go version are also available. Ruby version is Raxx and Go version is Gaxx.
+
+##### initialization,build and execution for go version
+
+```
+go mod init axx # initialization
+go build -o axx axx.go # build
+axx z80.axx z80.s [option] # execution
+```
+
+##### execution for Ruby version
+
+```
+chmod +x axx.rb
+axx.rb z80.axx z80.s [option] # execution
+```
+
+
+
 # Test environment
 
-Arch linux terminal
+FreeBSD terminal
 
 # Main text
 
