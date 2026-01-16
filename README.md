@@ -10,7 +10,7 @@ It was written in python, so the nickname is Paxx.
 
 Original article in Japanee:Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
 
-Ruby version and Go version are also available. Ruby version is Raxx and Go version is Gaxx.
+Ruby version and Go version are also available. Ruby version is Raxx and Go version is Gaxx. Go version is much faster than Python version and Ruby version.
 
 ##### initialization,build and execution for go version
 
