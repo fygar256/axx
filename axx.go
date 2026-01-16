@@ -749,6 +749,12 @@ func getSymVal(w string) int64 {
     return 0
 }
 
+func getSymValWithOk(w string) (int64, bool) {
+    w = strings.ToUpper(w)
+    v, ok := Symbols[w]
+    return v, ok
+}
+
 func clearSymbol(i []string) bool {
     if len(i) == 0 || i[0] != ".clearsym" {
         return false
@@ -882,7 +888,7 @@ func readpat(fn string) [][]string {
         l = strings.ReplaceAll(l, "\t", " ")
         l = strings.ReplaceAll(l, "\r", "")
         l = strings.ReplaceAll(l, "\n", "")
-        l = reduceSpaces(l)
+        l = strings.TrimRight(l," ")
         if ww := includePat(l); len(ww) > 0 {
             w = append(w, ww...)
             continue
@@ -1062,16 +1068,20 @@ func match(s, t string) bool {
     idxT := skipspc(t2, 0)
     s2 := s + "\x00"
     t2 += "\x00"
+
     Deb1 = s2
     Deb2 = t2
+
     for {
         idxS = skipspc(s2, idxS)
         idxT = skipspc(t2, idxT)
         b := safeChar(s2, idxS)
         a := safeChar(t2, idxT)
+
         if a == 0 && b == 0 {
             return true
         }
+
         if a == '\\' {
             idxT++
             if safeChar(t2, idxT) == b {
@@ -1091,6 +1101,8 @@ func match(s, t string) bool {
             idxT++
             a = safeChar(t2, idxT)
             idxT++
+
+            // !!x → factor 1 個だけ読む
             if a == '!' {
                 a = safeChar(t2, idxT)
                 idxT++
@@ -1099,15 +1111,21 @@ func match(s, t string) bool {
                 putVars(string(a), v)
                 continue
             }
+
+            // !x → 式を「次の区切り文字」まで読む
             idxT = skipspc(t2, idxT)
+
+            // デフォルトの区切り文字は「次の非スペース文字」
             var stopchar byte
             if safeChar(t2, idxT) == '\\' {
+                // !x\] みたいな場合：明示的に区切り文字を指定
                 idxT = skipspc(t2, idxT+1)
-                b = safeChar(t2, idxT)
-                stopchar = b
+                stopchar = safeChar(t2, idxT)
             } else {
-                stopchar = 0
+                // 次の非スペース文字を区切り文字として扱う（例: ',', ']' など）
+                stopchar = safeChar(t2, idxT)
             }
+
             v, tIdx := expressionEsc(s2, idxS, stopchar)
             idxS = tIdx
             putVars(string(a), v)
@@ -1116,8 +1134,8 @@ func match(s, t string) bool {
             idxT++
             w, tIdx := getSymbolWord(s2, idxS)
             idxS = tIdx
-            v := getSymVal(w)
-            if v == 0 {
+            v,ok := getSymValWithOk(w)
+            if !ok {
                 return false
             }
             putVars(string(a), v)
@@ -1127,6 +1145,7 @@ func match(s, t string) bool {
             idxS++
             continue
         }
+
         return false
     }
 }
