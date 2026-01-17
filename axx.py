@@ -698,8 +698,6 @@ def term8(s,idx):
     if s[idx:idx+4]=='not(':
         (x,idx)=expression(s,idx+3)
         x=0 if x else 1
-        if s[idx]==')':
-            idx+=1
     else:
         (x,idx)=term7(s,idx)
     return (x,idx)
