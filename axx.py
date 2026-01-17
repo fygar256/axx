@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# cython: language_level=3
 
 #
 # axx general assembler designed and programmed by Taisuke Maekawa
@@ -697,6 +698,8 @@ def term8(s,idx):
     if s[idx:idx+4]=='not(':
         (x,idx)=expression(s,idx+3)
         x=0 if x else 1
+        if s[idx]==')':
+            idx+=1
     else:
         (x,idx)=term7(s,idx)
     return (x,idx)
@@ -796,7 +799,7 @@ def clear_symbol(i):
     if len(i)==0:
         return False
     if i[0]!='.clearsym':
-    	return False
+        return False
     key=upper(i[2])
     if key in symbols:
         symbols.pop(key)
@@ -810,7 +813,7 @@ def set_symbol(i):
     if len(i)==0:
         return False
     if i[0]!='.setsym':
-    	return False
+        return False
     key=upper(i[1])
     if len(i)>2:
         v,idx=expression0(i[2],0)
@@ -824,7 +827,7 @@ def bits(i):
     if len(i)==0:
         return False
     if len(i)>1 and i[0]!='.bits':
-    	return False
+        return False
     if len(i)>=2 and i[1]=='big':
         endian='big'
     else:
@@ -841,7 +844,7 @@ def paddingp(i):
     if len(i)==0:
         return False
     if len(i)>1 and i[0]!='.padding':
-    	return False
+        return False
     if len(i)>=3:
         v,idx=expression0(i[2],0)
     else:
@@ -854,7 +857,7 @@ def symbolc(i):
     if len(i)==0:
         return False
     if len(i)>1 and i[0]!='.symbolc':
-    	return False
+        return False
     if len(i)>3:
         swordchars=alphabet+digit+i[2]
     return True
@@ -903,7 +906,10 @@ def readpat(fn):
 
     p=[]
     w=[]
-    while(l:=f.readline()):
+    while True:
+        l=f.readline()
+        if not l:
+            break
         l=remove_comment(l)
         l=l.replace('\t',' ')
         l=l.replace(chr(13),'')
@@ -1018,12 +1024,6 @@ def makeobj(s):
         break
 
     return objl
-
-def isword(s,idx):
-    t,idx_s=getword(s,idx)
-    if idx_s==idx:
-        return False
-    return True
 
 def get_symbol_word(s,idx):
     t=""
@@ -1174,7 +1174,10 @@ def error(s):
     s+=chr(0)
     idx=0
     error_code=0
-    while (ch:=s[idx])!=chr(0):
+    while True:
+        ch=s[idx]
+        if ch==chr(0):
+            break
         if ch==',':
             idx+=1
             continue
@@ -1195,7 +1198,7 @@ def error(s):
 def labelc_processing(l,ll):
     global lwordchars
     if l.upper()!='.LABELC':
-    	return False
+        return False
     if ll:
         lwordchars=alphabet+digit+ll
     return True
@@ -1754,7 +1757,10 @@ def main():
 
     if impfile!="":
         with open(impfile,"rt") as label_file:
-            while (l:=label_file.readline()):
+            while True:
+                l=label_file.readline()
+                if not l:
+                    break
                 imp_label(l)
 
     try:
