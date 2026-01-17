@@ -26,7 +26,7 @@ axx z80.axx z80.s [option] # execution
 chmod +x axx.rb
 axx.rb z80.axx z80.s [option] # execution
 ```
-
+When using, please change one of the talismans' `ptint` to `print`.
 
 
 # Test environment
