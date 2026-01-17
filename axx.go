@@ -1,6 +1,6 @@
 // axx general assembler
-// Go translation of axx.rb (Taisuke Maekawa)
-// できる限り Ruby 版と完全互換になるように移植した単一ファイル版。
+// Go translation of axx (Taisuke Maekawa)
+//
 
 package main
 
