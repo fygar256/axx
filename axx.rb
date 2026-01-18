@@ -385,6 +385,17 @@ def factor(s, idx)
   elsif safe_char(s, idx) == '@'
     (x, idx) = factor(s, idx + 1)
     x = nbit(x)
+  elsif safe_char(s, idx) == '*'
+    if safe_char(s, idx+1) == '('
+      (x, idx) = expression(s,idx+2)
+      if safe_char(s, idx) == ','
+        (x2, idx) = expression(s,idx+1)
+        if safe_char(s, idx)==')'
+          idx+=1
+          x=x>>(x2*8)
+        end
+      end
+    end
   else
     (x, idx) = factor1(s, idx)
   end

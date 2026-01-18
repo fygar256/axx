@@ -288,6 +288,27 @@ func factor(s string, idx int) (int64, int) {
         x, t = factor(s, idx+1)
         idx = t
         x = nbit(x)
+    } else if safeChar(s, idx) == '*' {
+        idx+=1
+        if safeChar(s, idx) == '(' {
+            var t int
+            x,t = expression(s, idx+1)
+            idx=t
+            if safeChar(s, idx)==',' {
+                var tt int
+                var x2 int64
+                x2, tt = expression(s,idx+1)
+                idx=tt
+                if safeChar(s, idx)==')' {
+                    idx+=1
+                    x=x>>(x2*8)
+                }
+            } else {
+                x = 0
+            }
+        } else {
+            x = 0
+        }
     } else {
         var t int
         x, t = factor1(s, idx)
