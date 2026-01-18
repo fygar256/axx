@@ -636,7 +636,7 @@ Because this is a test, the binary is different from the actual code.
 .setsym ::b:: 1
 .setsym ::%% ::7
 .setsym ::||:: 8
-LDF A,!x :: 0x1,x,x>>8,x>>16,x>>24,x>>32,x>>40,x>>48,x>>56,x>>64,x>>72,x>>80,x>>88,x>>96,x>>104,x>>112,x>>120
+LDF A,!x :: 0x1,x,*(x,1),*(x,2),*(x,3),*(x,4),*(x,5),*(x,6),*(x,7),*(x,8),*(x,9),*(x,10),*(x,11),*(x,12),*(x,13),*(x,14),*(x,15)
 
 /* ARM64
 .setsym ::r1 :: 2
