@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # cython: language_level=3
 
-#
-# axx general assembler designed and programmed by Taisuke Maekawa
-#
+"""
+axx general assembler designed and programmed by Taisuke Maekawa
+Refactored with OOP design for improved maintainability
+"""
 
 from decimal import Decimal, getcontext
 import readline
@@ -16,1821 +17,1926 @@ import sys
 import os
 import math
 import re
-EXP_PAT=0
-EXP_ASM=1
-OB=chr(0x90)     # open double bracket
-CB=chr(0x91)     # close double bracket
-UNDEF=0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
-VAR_UNDEF=0
-capital="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-lower="abcdefghijklmnopqrstuvwxyz"
-digit='0123456789'
-xdigit="0123456789ABCDEF"
-errors=[ "Value out of range.","Invalid syntax.","Address out of range.","","","Register out of range.","Port number out of range." ]
-outfile=""
-expfile=""
-impfile=""
-pc=0
-padding=0
-alphabet=lower+capital
-lwordchars=digit+alphabet+"_."
-swordchars=digit+alphabet+"_%$-~&|"
-current_section=".text"
-current_file=""
-sections={}
-symbols={}
-patsymbols={}
-labels={}
-export_labels={}
-pat=[]
 
-vliwinstbits=41
-vliwnop=[]
-vliwbits=128
-vliwset=[]
-vliwflag=False
-vliwtemplatebits=0x00
-vliwstop=0
-vcnt=1
+# Expression mode constants
+EXP_PAT = 0
+EXP_ASM = 1
 
-expmode=EXP_PAT
-error_undefined_label=False
-error_already_defined=False
-align=16
-bts=8
-endian='little'
-byte='yes'
-pas=0
-debug=False
-cl=""
-ln=0
-fnstack=[]
-lnstack=[]
-vars=[ VAR_UNDEF for i in range(26) ]
-deb1=""
-deb2=""
+# Special bracket characters
+OB = chr(0x90)  # open double bracket
+CB = chr(0x91)  # close double bracket
 
-def add_avoiding_dup(l,e):
-    seen=False
-    for item in l:
-        if item==e:
-            seen=True
-    if not seen:
-        l+=[e]
-    return l
+# Constants
+UNDEF = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+VAR_UNDEF = 0
 
-def upper(o):
-    t=""
-    idx=0
-    while len(o)>idx:
-        a=o[idx]
-        if a in lower:
-            a=o[idx].upper()
-        t+=a
-        idx+=1
-    return t
+# Character sets
+CAPITAL = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+LOWER = "abcdefghijklmnopqrstuvwxyz"
+DIGIT = '0123456789'
+XDIGIT = "0123456789ABCDEF"
+ALPHABET = LOWER + CAPITAL
 
-def outbin2(a,x):
-    if pas==2 or pas==0:
-        x=int(x)
-        fwrite(outfile,a,x,0)
+# Error messages
+ERRORS = [
+    "Value out of range.",
+    "Invalid syntax.",
+    "Address out of range.",
+    "",
+    "",
+    "Register out of range.",
+    "Port number out of range."
+]
 
-def outbin(a,x):
-    if pas==2 or pas==0:
-        x=int(x)
-        fwrite(outfile,a,x,1)
 
-def get_vars(s):
-    c=ord(upper(s))
-    return vars[c-ord('A')]
+class AssemblerState:
+    """Global state container for the assembler"""
+    
+    def __init__(self):
+        # File paths
+        self.outfile = ""
+        self.expfile = ""
+        self.impfile = ""
+        
+        # Program counter and padding
+        self.pc = 0
+        self.padding = 0
+        
+        # Character sets for parsing
+        self.lwordchars = DIGIT + ALPHABET + "_."
+        self.swordchars = DIGIT + ALPHABET + "_%$-~&|"
+        
+        # Current context
+        self.current_section = ".text"
+        self.current_file = ""
+        
+        # Data structures
+        self.sections = {}
+        self.symbols = {}
+        self.patsymbols = {}
+        self.labels = {}
+        self.export_labels = {}
+        self.pat = []
+        
+        # VLIW configuration
+        self.vliwinstbits = 41
+        self.vliwnop = []
+        self.vliwbits = 128
+        self.vliwset = []
+        self.vliwflag = False
+        self.vliwtemplatebits = 0x00
+        self.vliwstop = 0
+        self.vcnt = 1
+        
+        # Expression mode and errors
+        self.expmode = EXP_PAT
+        self.error_undefined_label = False
+        self.error_already_defined = False
+        
+        # Assembly configuration
+        self.align = 16
+        self.bts = 8
+        self.endian = 'little'
+        self.byte = 'yes'
+        self.pas = 0
+        self.debug = False
+        
+        # Current line info
+        self.cl = ""
+        self.ln = 0
+        self.fnstack = []
+        self.lnstack = []
+        
+        # Variables (a-z)
+        self.vars = [VAR_UNDEF for i in range(26)]
+        
+        # Debug strings
+        self.deb1 = ""
+        self.deb2 = ""
 
-def put_vars(s,v):
-    global vars
-    if upper(s) in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-        c=ord(upper(s))
-        vars[c-ord('A')]=int(v)
-    return
 
-def q(s,t,idx):
-    return upper(s[idx:idx+len(t)])==upper(t)
-
-def err(m):
-    print(m)
-    return -1
-
-def nbit(l):
-    b=0
-    r=l
-    while(r):
-        r>>=1
-        b+=1
-    return b
-
-def skipspc(s,idx):
-    while len(s)>idx:
-        if s[idx]==' ':
-            idx+=1
-            continue
-        break
-    return idx
-
-def get_param_to_spc(s,idx):
-    t=""
-    idx=skipspc(s,idx)
-    while len(s)>idx:
-        if s[idx]==' ':
-            break
-        t+=s[idx]
-        idx+=1
-    return t,idx
-
-def get_param_to_eon(s,idx):
-    t=""
-    idx=skipspc(s,idx)
-    while len(s)>idx and s[idx:idx+2]!='!!':
-        t+=s[idx]
-        idx+=1
-    return t,idx
-
-def factor(s,idx):
-    global vcnt,vliwstop
-    idx=skipspc(s,idx)
-    x=0
-    if idx+4<=len(s) and s[idx:idx+4]=='!!!!' and expmode==EXP_PAT:
-        x=vliwstop
-        idx+=4
-    elif idx+3<=len(s) and s[idx:idx+3]=='!!!' and expmode==EXP_PAT:
-        x=vcnt
-        idx+=3
-    elif s[idx]=='-':
-        (x,idx)=factor(s,idx+1)
-        x=-x
-
-    elif s[idx]=='~':
-        (x,idx)=factor(s,idx+1)
-        x=~x
-    elif s[idx]=='@':
-        (x,idx)=factor(s,idx+1)
-        x=nbit(x)
-    elif s[idx]=='*':   # *(x,3)
-        if idx+1<len(s) and s[idx+1]=='(':
-            (x,idx)=expression(s,idx+2)
-            if s[idx]==',':
-                (x2,idx)=expression(s,idx+1)
-                if s[idx]==')':
-                    idx+=1
-                    return (x>>(x2*8),idx)
+class StringUtils:
+    """Utility functions for string manipulation"""
+    
+    @staticmethod
+    def upper(s):
+        """Convert string to uppercase"""
+        return ''.join(c.upper() if c in LOWER else c for c in s)
+    
+    @staticmethod
+    def q(s, t, idx):
+        """Quick comparison of substring"""
+        return StringUtils.upper(s[idx:idx+len(t)]) == StringUtils.upper(t)
+    
+    @staticmethod
+    def skipspc(s, idx):
+        """Skip spaces in string"""
+        while idx < len(s) and s[idx] == ' ':
+            idx += 1
+        return idx
+    
+    @staticmethod
+    def reduce_spaces(text):
+        """Reduce multiple spaces to single space"""
+        return re.sub(r'\s{2,}', ' ', text)
+    
+    @staticmethod
+    def remove_comment(l):
+        """Remove /* style comments"""
+        idx = 0
+        while idx < len(l):
+            if l[idx:idx+2] == '/*':
+                return "" if idx == 0 else l[0:idx-1]
+            idx += 1
+        return l
+    
+    @staticmethod
+    def remove_comment_asm(l):
+        """Remove ; style comments"""
+        if ';' in l:
+            s = l[0:l.index(';')]
         else:
-            return (0,idx)
-    else:
-        (x,idx)=factor1(s,idx)
-    idx=skipspc(s,idx)
-    return (x,idx)
+            s = l
+        return s.rstrip()
+    
+    @staticmethod
+    def get_param_to_spc(s, idx):
+        """Get parameter up to space"""
+        t = ""
+        idx = StringUtils.skipspc(s, idx)
+        while idx < len(s) and s[idx] != ' ':
+            t += s[idx]
+            idx += 1
+        return t, idx
+    
+    @staticmethod
+    def get_param_to_eon(s, idx):
+        """Get parameter to end of line or !!"""
+        t = ""
+        idx = StringUtils.skipspc(s, idx)
+        while idx < len(s) and s[idx:idx+2] != '!!':
+            t += s[idx]
+            idx += 1
+        return t, idx
+    
+    @staticmethod
+    def get_string(l2):
+        """Get quoted string"""
+        idx = 0
+        idx = StringUtils.skipspc(l2, idx)
+        if l2 == '' or idx >= len(l2) or l2[idx] != '"':
+            return ""
+        idx += 1
+        s = ""
+        while idx < len(l2):
+            if l2[idx] == '"':
+                return s
+            else:
+                s += l2[idx]
+                idx += 1
+        return s
 
-def get_label_section(k):
-    global error_undefined_label
-    error_undefine_label=False
-    try:
-        v=labels[k][1]
-    except:
-        v=UNDEF
-        error_undefined_label=True
-    return v
 
-def get_label_value(k):
-    global labels,error_undefined_label
-    error_undefine_label=False
-    try:
-        v=labels[k][0]
-    except:
-        v=UNDEF
-        error_undefined_label=True
-    return v
+class Parser:
+    """Parser for extracting tokens and strings from assembly code"""
+    
+    def __init__(self, state):
+        self.state = state
+    
+    def get_intstr(self, s, idx):
+        """Get integer string from position"""
+        fs = ''
+        while idx < len(s) and s[idx] in DIGIT:
+            fs += s[idx]
+            idx += 1
+        return fs, idx
+    
+    def get_floatstr(self, s, idx):
+        """Get float string from position"""
+        if s[idx:idx+3] == 'inf':
+            return 'inf', idx + 3
+        elif s[idx:idx+4] == '-inf':
+            return '-inf', idx + 4
+        elif s[idx:idx+3] == 'nan':
+            return 'nan', idx + 3
+        else:
+            fs = ''
+            while idx < len(s) and s[idx] in "0123456789-.eE":
+                fs += s[idx]
+                idx += 1
+            return fs, idx
+    
+    def get_curlb(self, s, idx):
+        """Get curly bracket content"""
+        idx = StringUtils.skipspc(s, idx)
+        f = False
+        t = ''
+        
+        if idx < len(s) and s[idx] == '{':
+            idx += 1
+            f = True
+            idx = StringUtils.skipspc(s, idx)
+            while idx < len(s) and s[idx] != '}':
+                t += s[idx]
+                idx += 1
+            idx = StringUtils.skipspc(s, idx)
+            if idx < len(s) and s[idx] == '}':
+                idx += 1
+        
+        return f, t, idx
+    
+    def get_symbol_word(self, s, idx):
+        """Get symbol word from position"""
+        t = ""
+        if idx < len(s) and s[idx] not in DIGIT and s[idx] in self.state.swordchars:
+            t = s[idx]
+            idx += 1
+            while idx < len(s) and s[idx] in self.state.swordchars:
+                t += s[idx]
+                idx += 1
+        return StringUtils.upper(t), idx
+    
+    def get_label_word(self, s, idx):
+        """Get label word from position"""
+        t = ""
+        if idx < len(s) and (s[idx] == '.' or (s[idx] not in DIGIT and s[idx] in self.state.lwordchars)):
+            t = s[idx]
+            idx += 1
+            while idx < len(s) and s[idx] in self.state.lwordchars:
+                t += s[idx]
+                idx += 1
+            
+            if idx < len(s) and s[idx] == ':':
+                idx += 1
+        
+        return t, idx
+    
+    def get_params1(self, l, idx):
+        """Get parameters separated by ::"""
+        idx = StringUtils.skipspc(l, idx)
+        
+        if idx >= len(l):
+            return "", idx
+        
+        s = ""
+        while idx < len(l):
+            if l[idx:idx+2] == '::':
+                idx += 2
+                break
+            else:
+                s += l[idx]
+                idx += 1
+        return s.rstrip(' \t'), idx
 
-def put_label_value(k,v,s):
-    global labels,error_already_defined,patsymbols
-    if pas==1 or pas==0:
 
-        for i in list(labels.keys()):
-            if i==k:
-                error_already_defined=True
+class IEEE754Converter:
+    """IEEE 754 floating point conversion utilities"""
+    
+    @staticmethod
+    def decimal_to_ieee754_32bit_hex(a):
+        """Convert decimal to IEEE 754 32-bit hex"""
+        BIAS = 127
+        SIGNIFICAND_BITS = 23
+        EXPONENT_BITS = 8
+        
+        getcontext().prec = 34
+        
+        if a == 'inf':
+            a = 'Infinity'
+        elif a == '-inf':
+            a = '-Infinity'
+        elif a == 'nan':
+            a = 'NaN'
+        d = Decimal(a)
+        
+        if d.is_nan():
+            sign = 0
+            exponent = (1 << EXPONENT_BITS) - 1
+            fraction = 1 << (SIGNIFICAND_BITS - 1)
+        elif d == Decimal('Infinity'):
+            sign = 0
+            exponent = (1 << EXPONENT_BITS) - 1
+            fraction = 0
+        elif d == Decimal('-Infinity'):
+            sign = 1
+            exponent = (1 << EXPONENT_BITS) - 1
+            fraction = 0
+        elif d == Decimal(0):
+            sign = 0 if d >= 0 else 1
+            exponent = 0
+            fraction = 0
+        else:
+            sign = 0 if d >= 0 else 1
+            d = abs(d)
+            
+            exponent_value = d.adjusted() + BIAS
+            
+            if exponent_value <= 0:
+                exponent = 0
+                fraction = int(d.scaleb(BIAS - SIGNIFICAND_BITS).normalize() * (2**SIGNIFICAND_BITS))
+            else:
+                exponent = exponent_value
+                normalized_value = d / (Decimal(2) ** d.adjusted())
+                fraction = int((normalized_value - 1) * (2**SIGNIFICAND_BITS))
+            
+            fraction &= (1 << SIGNIFICAND_BITS) - 1
+        
+        bits = (sign << 31) | (exponent << SIGNIFICAND_BITS) | fraction
+        return f"0x{bits:08X}"
+    
+    @staticmethod
+    def decimal_to_ieee754_64bit_hex(a):
+        """Convert decimal to IEEE 754 64-bit hex"""
+        BIAS = 1023
+        SIGNIFICAND_BITS = 52
+        EXPONENT_BITS = 11
+        
+        getcontext().prec = 34
+        
+        if a == 'inf':
+            a = 'Infinity'
+        elif a == '-inf':
+            a = '-Infinity'
+        elif a == 'nan':
+            a = 'NaN'
+        d = Decimal(a)
+        
+        if d.is_nan():
+            sign = 0
+            exponent = (1 << EXPONENT_BITS) - 1
+            fraction = 1 << (SIGNIFICAND_BITS - 1)
+        elif d == Decimal('Infinity'):
+            sign = 0
+            exponent = (1 << EXPONENT_BITS) - 1
+            fraction = 0
+        elif d == Decimal('-Infinity'):
+            sign = 1
+            exponent = (1 << EXPONENT_BITS) - 1
+            fraction = 0
+        elif d == Decimal(0):
+            sign = 0 if d >= 0 else 1
+            exponent = 0
+            fraction = 0
+        else:
+            sign = 0 if d >= 0 else 1
+            d = abs(d)
+            
+            exponent_value = d.adjusted() + BIAS
+            
+            if exponent_value <= 0:
+                exponent = 0
+                fraction = int(d.scaleb(BIAS - SIGNIFICAND_BITS).normalize() * (2**SIGNIFICAND_BITS))
+            else:
+                exponent = exponent_value
+                normalized_value = d / (Decimal(2) ** d.adjusted())
+                fraction = int((normalized_value - 1) * (2**SIGNIFICAND_BITS))
+            
+            fraction &= (1 << SIGNIFICAND_BITS) - 1
+        
+        bits = (sign << 63) | (exponent << SIGNIFICAND_BITS) | fraction
+        return f"0x{bits:016X}"
+    
+    @staticmethod
+    def decimal_to_ieee754_128bit_hex(a):
+        """Convert decimal to IEEE 754 128-bit hex"""
+        BIAS = 16383
+        SIGNIFICAND_BITS = 112
+        EXPONENT_BITS = 15
+        
+        getcontext().prec = 34
+        
+        if a == 'inf':
+            a = 'Infinity'
+        elif a == '-inf':
+            a = '-Infinity'
+        elif a == 'nan':
+            a = 'NaN'
+        d = Decimal(a)
+        
+        if d.is_nan():
+            sign = 0
+            exponent = (1 << EXPONENT_BITS) - 1
+            fraction = 1 << (SIGNIFICAND_BITS - 1)
+        elif d == Decimal('Infinity'):
+            sign = 0
+            exponent = (1 << EXPONENT_BITS) - 1
+            fraction = 0
+        elif d == Decimal('-Infinity'):
+            sign = 1
+            exponent = (1 << EXPONENT_BITS) - 1
+            fraction = 0
+        elif d == Decimal(0):
+            sign = 0 if d >= 0 else 1
+            exponent = 0
+            fraction = 0
+        else:
+            sign = 0 if d >= 0 else 1
+            d = abs(d)
+            
+            exponent_value = d.adjusted() + BIAS
+            
+            if exponent_value <= 0:
+                exponent = 0
+                fraction = int(d.scaleb(BIAS - SIGNIFICAND_BITS).normalize() * (2**SIGNIFICAND_BITS))
+            else:
+                exponent = exponent_value
+                normalized_value = d / (Decimal(2) ** d.adjusted())
+                fraction = int((normalized_value - 1) * (2**SIGNIFICAND_BITS))
+            
+            fraction &= (1 << SIGNIFICAND_BITS) - 1
+        
+        bits = (sign << 127) | (exponent << SIGNIFICAND_BITS) | fraction
+        return f"0x{bits:032X}"
+
+
+class VariableManager:
+    """Manages assembler variables (a-z)"""
+    
+    def __init__(self, state):
+        self.state = state
+    
+    def get(self, s):
+        """Get variable value by letter"""
+        c = ord(StringUtils.upper(s))
+        return self.state.vars[c - ord('A')]
+    
+    def put(self, s, v):
+        """Set variable value by letter"""
+        if StringUtils.upper(s) in CAPITAL:
+            c = ord(StringUtils.upper(s))
+            self.state.vars[c - ord('A')] = int(v)
+
+
+class LabelManager:
+    """Manages assembly labels"""
+    
+    def __init__(self, state):
+        self.state = state
+    
+    def get_section(self, k):
+        """Get label section"""
+        self.state.error_undefined_label = False
+        try:
+            v = self.state.labels[k][1]
+        except:
+            v = UNDEF
+            self.state.error_undefined_label = True
+        return v
+    
+    def get_value(self, k):
+        """Get label value"""
+        self.state.error_undefined_label = False
+        try:
+            v = self.state.labels[k][0]
+        except:
+            v = UNDEF
+            self.state.error_undefined_label = True
+        return v
+    
+    def put_value(self, k, v, s):
+        """Set label value"""
+        if self.state.pas == 1 or self.state.pas == 0:
+            if k in self.state.labels:
+                self.state.error_already_defined = True
                 print(f" error - label already defined.")
                 return False
-
-    for i in list(patsymbols.keys()):
-        if i==upper(k):
-            print(f" error - \'{k}\' is a pattern file symbol.")
+        
+        if StringUtils.upper(k) in self.state.patsymbols:
+            print(f" error - '{k}' is a pattern file symbol.")
             return False
-
-    error_already_defined=False
-    labels[k]=[v,s]
-    return True
-
-def decimal_to_ieee754_32bit_hex(a):
-    # IEEE 754 単精度の定義
-    BIAS = 127
-    SIGNIFICAND_BITS = 23
-    EXPONENT_BITS = 8
-    
-    # Decimalモジュールの精度を設定
-    getcontext().prec = 34  # 単精度は約34桁の10進数精度に相当
-    
-    # 入力をDecimal型に変換
-    if a == 'inf':
-        a = 'Infinity'
-    elif a == '-inf':
-        a = '-Infinity'
-    elif a == 'nan':
-        a = 'NaN'
-    d = Decimal(a)
-    
-    # 特殊ケースの処理
-    if d.is_nan():
-        # NaNの場合（符号=1、指数=全ビット1、仮数部は非ゼロ）
-        sign = 0
-        exponent = (1 << EXPONENT_BITS) - 1
-        fraction = 1 << (SIGNIFICAND_BITS - 1)  # 仮数部の最上位ビットを1に設定
-    elif d == Decimal('Infinity'):
-        # 正の無限大の場合（符号=0、指数=全ビット1、仮数部=0）
-        sign = 0
-        exponent = (1 << EXPONENT_BITS) - 1
-        fraction = 0
-    elif d == Decimal('-Infinity'):
-        # 負の無限大の場合（符号=1、指数=全ビット1、仮数部=0）
-        sign = 1
-        exponent = (1 << EXPONENT_BITS) - 1
-        fraction = 0
-    elif d == Decimal(0):
-        # ゼロの場合（符号のみ異なり、それ以外は全ビット0）
-        sign = 0 if d >= 0 else 1
-        exponent = 0
-        fraction = 0
-    else:
-        # 通常の数値の場合
-        sign = 0 if d >= 0 else 1
-        d = abs(d)
         
-        # 指数部と仮数部を計算
-        exponent_value = d.adjusted() + BIAS
+        self.state.error_already_defined = False
+        self.state.labels[k] = [v, s]
+        return True
+
+
+class SymbolManager:
+    """Manages assembler symbols"""
+    
+    def __init__(self, state):
+        self.state = state
+    
+    def get(self, w):
+        """Get symbol value"""
+        w = w.upper()
+        return self.state.symbols.get(w, "")
+
+
+class ExpressionEvaluator:
+    """Evaluates mathematical expressions"""
+    
+    def __init__(self, state, var_manager, label_manager, symbol_manager, parser):
+        self.state = state
+        self.var_manager = var_manager
+        self.label_manager = label_manager
+        self.symbol_manager = symbol_manager
+        self.parser = parser
+    
+    def nbit(self, l):
+        """Count number of bits needed to represent value"""
+        b = 0
+        r = l
+        while r:
+            r >>= 1
+            b += 1
+        return b
+    
+    def err(self, m):
+        """Print error message"""
+        print(m)
+        return -1
+    
+    def factor(self, s, idx):
+        """Parse factor in expression"""
+        idx = StringUtils.skipspc(s, idx)
+        x = 0
         
-        if exponent_value <= 0:
-            # 非正規化数（指数が最小値未満）
-            exponent = 0
-            fraction = int(d.scaleb(BIAS - SIGNIFICAND_BITS).normalize() * (2**SIGNIFICAND_BITS))
-        else:
-            # 正規化数
-            exponent = exponent_value
-            normalized_value = d / (Decimal(2) ** d.adjusted())
-            fraction = int((normalized_value - 1) * (2**SIGNIFICAND_BITS))
-        
-        # 仮数部がオーバーフローしないように調整
-        fraction &= (1 << SIGNIFICAND_BITS) - 1
-    
-    # ビット列を組み立てる（符号 | 指数 | 仮数部）
-    bits = (sign << 31) | (exponent << SIGNIFICAND_BITS) | fraction
-    
-    # 結果を16進数文字列として返す
-    return f"0x{bits:08X}"
-
-def decimal_to_ieee754_64bit_hex(a):
-    # IEEE 754 倍精度の定義
-    BIAS = 1023
-    SIGNIFICAND_BITS = 52
-    EXPONENT_BITS = 11
-    
-    # Decimalモジュールの精度を設定
-    getcontext().prec = 34  # 倍精度は約34桁の10進数精度に相当
-    
-    # 入力をDecimal型に変換
-    if a == 'inf':
-        a = 'Infinity'
-    elif a == '-inf':
-        a = '-Infinity'
-    elif a == 'nan':
-        a = 'NaN'
-    d = Decimal(a)
-    
-    # 特殊ケースの処理
-    if d.is_nan():
-        # NaNの場合（符号=1、指数=全ビット1、仮数部は非ゼロ）
-        sign = 0
-        exponent = (1 << EXPONENT_BITS) - 1
-        fraction = 1 << (SIGNIFICAND_BITS - 1)  # 仮数部の最上位ビットを1に設定
-    elif d == Decimal('Infinity'):
-        # 正の無限大の場合（符号=0、指数=全ビット1、仮数部=0）
-        sign = 0
-        exponent = (1 << EXPONENT_BITS) - 1
-        fraction = 0
-    elif d == Decimal('-Infinity'):
-        # 負の無限大の場合（符号=1、指数=全ビット1、仮数部=0）
-        sign = 1
-        exponent = (1 << EXPONENT_BITS) - 1
-        fraction = 0
-    elif d == Decimal(0):
-        # ゼロの場合（符号のみ異なり、それ以外は全ビット0）
-        sign = 0 if d >= 0 else 1
-        exponent = 0
-        fraction = 0
-    else:
-        # 通常の数値の場合
-        sign = 0 if d >= 0 else 1
-        d = abs(d)
-        
-        # 指数部と仮数部を計算
-        exponent_value = d.adjusted() + BIAS
-        
-        if exponent_value <= 0:
-            # 非正規化数（指数が最小値未満）
-            exponent = 0
-            fraction = int(d.scaleb(BIAS - SIGNIFICAND_BITS).normalize() * (2**SIGNIFICAND_BITS))
-        else:
-            # 正規化数
-            exponent = exponent_value
-            normalized_value = d / (Decimal(2) ** d.adjusted())
-            fraction = int((normalized_value - 1) * (2**SIGNIFICAND_BITS))
-        
-        # 仮数部がオーバーフローしないように調整
-        fraction &= (1 << SIGNIFICAND_BITS) - 1
-    
-    # ビット列を組み立てる（符号 | 指数 | 仮数部）
-    bits = (sign << 63) | (exponent << SIGNIFICAND_BITS) | fraction
-    
-    # 結果を16進数文字列として返す
-    return f"0x{bits:016X}"
-
-def decimal_to_ieee754_128bit_hex(a):
-    # IEEE 754 四倍精度の定義
-    BIAS = 16383
-    SIGNIFICAND_BITS = 112
-    EXPONENT_BITS = 15
-    
-    # Decimalモジュールの精度を設定
-    getcontext().prec = 34  # 四倍精度は約34桁の10進数精度に相当
-    
-    # 入力をDecimal型に変換
-    if a=='inf':
-        a='Infinity'
-    elif a=='-inf':
-        a='-Infinity'
-    elif a=='nan':
-        a='NaN'
-    d = Decimal(a)
-    
-    # 特殊ケースの処理
-    if d.is_nan():
-        # NaNの場合（符号=1、指数=全ビット1、仮数部は非ゼロ）
-        sign = 0
-        exponent = (1 << EXPONENT_BITS) - 1
-        fraction = 1 << (SIGNIFICAND_BITS - 1)  # 仮数部の最上位ビットを1に設定
-    elif d == Decimal('Infinity'):
-        # 正の無限大の場合（符号=0、指数=全ビット1、仮数部=0）
-        sign = 0
-        exponent = (1 << EXPONENT_BITS) - 1
-        fraction = 0
-    elif d == Decimal('-Infinity'):
-        # 負の無限大の場合（符号=1、指数=全ビット1、仮数部=0）
-        sign = 1
-        exponent = (1 << EXPONENT_BITS) - 1
-        fraction = 0
-    elif d == Decimal(0):
-        # ゼロの場合（符号のみ異なり、それ以外は全ビット0）
-        sign = 0 if d >= 0 else 1
-        exponent = 0
-        fraction = 0
-    else:
-        # 通常の数値の場合
-        sign = 0 if d >= 0 else 1
-        d = abs(d)
-        
-        # 指数部と仮数部を計算
-        exponent_value = d.adjusted() + BIAS
-        
-        if exponent_value <= 0:
-            # 非正規化数（指数が最小値未満）
-            exponent = 0
-            fraction = int(d.scaleb(BIAS - SIGNIFICAND_BITS).normalize() * (2**SIGNIFICAND_BITS))
-        else:
-            # 正規化数
-            exponent = exponent_value
-            normalized_value = d / (Decimal(2) ** d.adjusted())
-            fraction = int((normalized_value - 1) * (2**SIGNIFICAND_BITS))
-        
-        # 仮数部がオーバーフローしないように調整
-        fraction &= (1 << SIGNIFICAND_BITS) - 1
-    
-    # ビット列を組み立てる（符号 | 指数 | 仮数部）
-    bits = (sign << 127) | (exponent << SIGNIFICAND_BITS) | fraction
-    
-    # 結果を16進数文字列として返す
-    return f"0x{bits:032X}"
-
-"""
-# 使用例
-numbers = ['3.141592653589793238462643383279502884', 
-           '-3.141592653589793238462643383279502884', 
-           'Infinity', 
-           '-Infinity', 
-           'NaN', 
-           '0']
-
-for num in numbers:
-    result = decimal_to_ieee754_128bit_hex(Decimal(num))
-    print(f"{num} -> {result}")
-
-"""
-
-def get_intstr(s,idx):
-    fs=''
-    while(s[idx] in "0123456789"):
-        fs+=s[idx]
-        idx+=1
-    return(fs,idx)
-
-def get_floatstr(s,idx):
-    if s[idx:idx+3]=='inf':
-        fs='inf'
-        idx+=3
-    elif s[idx:idx+4]=='-inf':
-        fs='-inf'
-        idx+=4
-    elif s[idx:idx+3]=='nan':
-        fs='nan'
-        idx+=3
-    else:
-        fs=''
-        while(s[idx] in "0123456789-.eE"):
-            fs+=s[idx]
-            idx+=1
-    return(fs,idx)
-
-def get_curlb(s,idx):
-    idx=skipspc(s,idx)
-    f=False
-    if s[idx]=='{':
-        idx+=1
-        f=True
-        t=''
-        idx=skipspc(s,idx)
-        while s[idx]!='}':
-            t+=s[idx]
-            idx+=1
-        idx=skipspc(s,idx)
-        if s[idx]=='}':
-            idx+=1
-    return f,t,idx
-
-def factor1(s,idx):
-    x = 0
-
-    idx=skipspc(s,idx)
-    if s[idx]=='(':
-        (x,idx)=expression(s,idx+1)
-        if s[idx]==')':
-            idx+=1
-    elif q(s,'$$',idx):
-        idx+=2
-        x=pc
-    elif q(s,'#',idx):
-        idx+=1
-        (t,idx)=get_symbol_word(s,idx)
-        x=getsymval(t)
-
-    elif q(s,'0b',idx):
-        idx+=2
-        while s[idx] in "01":
-            x=2*x+int(s[idx],2)
-            idx+=1
-
-    elif q(s,'0x',idx):
-        idx+=2
-        while(upper(s[idx]) in xdigit):
-            x=16*x+int(s[idx].lower(),16)
-            idx+=1
-
-    elif s[idx:idx+3]=='qad':
-        idx+=3
-        idx=skipspc(s,idx)
-        if s[idx]=='{':
-            (fs,idx)=get_floatstr(s,idx+1)
-            h=decimal_to_ieee754_128bit_hex(fs)
-            x=int(h,16)
-        else:
-            pass
-        if s[idx]=='}':
-            idx+=1
-
-    elif s[idx:idx+3]=='dbl':
-        idx+=3
-        f,t,idx=get_curlb(s,idx)
-        if f:
-            if t=='nan':
-                x=0x7ff8000000000000
-            elif t=='inf':
-                x=0x7ff0000000000000
-            elif t=='-inf':
-                x=0xfff0000000000000
-            else:
-                v=float(eval(t))
-                t=str(v)
-                x=v
-                x=int.from_bytes(struct.pack('>d',x),"big")
-
-    elif s[idx:idx+3]=='flt':
-        idx+=3
-        f,t,idx=get_curlb(s,idx)
-        if f:
-            if t=='nan':
-                x=0x7fc00000
-            elif t=='inf':
-                x=0x7f800000
-            elif t=='-inf':
-                x=0xff800000
-            else:
-                v=float(eval(t))
-                t=str(v)
-                x=v
-                x=int.from_bytes(struct.pack('>f',x),"big")
-
-    elif s[idx].isdigit():
-        (fs,idx)=get_intstr(s,idx)
-        x=int(float(fs))
-
-    elif expmode==EXP_PAT and (s[idx] in lower and s[idx+1] not in lower):
-        ch=s[idx]
-        if s[idx+1:idx+3]==':=':
-            (x,idx)=expression(s,idx+3)
-            put_vars(ch,x)
-        else:
-            x=get_vars(ch)
-            idx+=1
-    elif (s[idx] in lwordchars):
-            (w,idx_new)=get_label_word(s,idx)
-            if idx!=idx_new:
-                idx=idx_new
-                x=get_label_value(w)
+        if idx + 4 <= len(s) and s[idx:idx+4] == '!!!!' and self.state.expmode == EXP_PAT:
+            x = self.state.vliwstop
+            idx += 4
+        elif idx + 3 <= len(s) and s[idx:idx+3] == '!!!' and self.state.expmode == EXP_PAT:
+            x = self.state.vcnt
+            idx += 3
+        elif idx < len(s) and s[idx] == '-':
+            x, idx = self.factor(s, idx + 1)
+            x = -x
+        elif idx < len(s) and s[idx] == '~':
+            x, idx = self.factor(s, idx + 1)
+            x = ~x
+        elif idx < len(s) and s[idx] == '@':
+            x, idx = self.factor(s, idx + 1)
+            x = self.nbit(x)
+        elif idx < len(s) and s[idx] == '*':
+            if idx+1<len(s) and s[idx+1] == '(':
+                x, idx = self.expression(s,idx+2)
+                if idx<len(s) and s[idx] == ',':
+                    x2,idx = self.expression(s,idx+1)
+                    if idx<len(s) and s[idx] == ')':
+                        idx+=1
+                        x=x>>(x2*8)
+                    else:
+                        x=0
+                else:
+                    x=0
             else:
                 x=0
-                pass
-    idx=skipspc(s,idx)
-    return (x,idx)
-
-def term0_0(s,idx):
-    (x,idx)=factor(s,idx)
-    while True:
-        if q(s,'**',idx):
-            (t,idx)=factor(s,idx+2)
-            x=x**t
         else:
-            break
-    return(x,idx)
-
-def term0(s,idx):
-    (x,idx)=term0_0(s,idx)
-    while True:
-        if (s[idx]=='*'):
-            (t,idx)=term0_0(s,idx+1)
-            x*=t
-        elif q(s,'//',idx):
-            (t,idx)=term0_0(s,idx+2)
-            if t==0:
-                err("Division by 0 error.")
-            else:
-                x//=t
-        #elif s[idx]=='/':
-        #    (t,idx)=term0_0(s,idx+1)
-        #    if t==0:
-        #        err("Division by 0 error.")
-        #    else:
-        #        x=x/t
-        elif s[idx]=='%':
-            (t,idx)=term0_0(s,idx+1)
-            if t==0:
-                err("Division by 0 error.")
-            else:
-                x=x%t
-        else:
-            break
-    return (x,idx)
-
-def term1(s,idx):
-    (x,idx)=term0(s,idx)
-    while True:
-        if (s[idx]=='+'):
-            (t,idx)=term0(s,idx+1)
-            x+=t
-        elif (s[idx]=='-'):
-            (t,idx)=term0(s,idx+1)
-            x-=t
-        else:
-            break
-    return (x,idx)
-
-def term2(s,idx):
-    (x,idx)=term1(s,idx)
-    while True:
-        if q(s,'<<',idx):
-            (t,idx)=term1(s,idx+2)
-            x<<=t
-        elif q(s,'>>',idx):
-            (t,idx)=term1(s,idx+2)
-            x>>=t
-        else:
-            break
-    return (x,idx)
-
-def term3(s,idx):
-    (x,idx)=term2(s,idx)
-    while True:
-        if (s[idx]=='&' and s[idx+1]!='&'):
-            (t,idx)=term2(s,idx+1)
-            x=int(x)&int(t)
-        else:
-            break
-    return (x,idx)
-
-
-def term4(s,idx):
-    (x,idx)=term3(s,idx)
-    while True:
-        if (s[idx]=='|' and s[idx+1]!='|'):
-            (t,idx)=term3(s,idx+1)
-            x=int(x)|int(t)
-        else:
-            break
-    return (x,idx)
-
-def term5(s,idx):
-    (x,idx)=term4(s,idx)
-    while True:
-        if (s[idx]=='^'):
-            (t,idx)=term4(s,idx+1)
-            x=int(x)^int(t)
-        else:
-            break
-    return (x,idx)
-
-def term6(s,idx):
-    (x,idx)=term5(s,idx)
-    while True:
-        if (s[idx]=='\''):
-            (t,idx)=term5(s,idx+1)
-            x=(x&~((~0)<<t))|((~0)<<t if (x>>(t-1)&1) else 0)
-        else:
-            break
-    return (x,idx)
-
-def term7(s,idx):
-    (x,idx)=term6(s,idx)
-    while True:
-        if q(s,'<=',idx):
-            (t,idx)=term6(s,idx+2)
-            x=1 if x<=t else 0
-        elif (s[idx]=='<'):
-            (t,idx)=term6(s,idx+1)
-            x=1 if x<t else 0
-        elif q(s,'>=',idx):
-            (t,idx)=term6(s,idx+2)
-            x=1 if x>=t else 0
-        elif (s[idx]=='>'):
-            (t,idx)=term6(s,idx+1)
-            x=1 if x>t else 0
-        elif q(s,'==',idx):
-            (t,idx)=term6(s,idx+2)
-            x=1 if x==t else 0
-        elif q(s,'!=',idx):
-            (t,idx)=term6(s,idx+2)
-            x=1 if x!=t else 0
-        else:
-            break
-    return (x,idx)
-
-def term8(s,idx):
-    if s[idx:idx+4]=='not(':
-        (x,idx)=expression(s,idx+3)
-        x=0 if x else 1
-    else:
-        (x,idx)=term7(s,idx)
-    return (x,idx)
-
-def term9(s,idx):
-    (x,idx)=term8(s,idx)
-    while True:
-        if q(s,'&&',idx):
-            (t,idx)=term8(s,idx+2)
-            x=1 if x and t else 0
-        else:
-            break
-    return (x,idx)
-
-def term10(s,idx):
-    (x,idx)=term9(s,idx)
-    while True:
-        if q(s,'||',idx):
-            (t,idx)=term9(s,idx+2)
-            x=1 if x or t else 0
-        else:
-            break
-    return (x,idx)
-
-def term11(s,idx):
-    (x,idx)=term10(s,idx)
-    while True:
-        if q(s,'?',idx):
-            (t,idx)=term10(s,idx+1)
-            if q(s,':',idx):
-                (u,idx)=term10(s,idx+1)
-                if (x==0):
-                    x=u
-                else:
-                    x=t
-            else:
-                pass
-        else:
-            break
-    return (x,idx)
-
-
-
-def expression(s,idx):
-    s+=chr(0)
-    idx=skipspc(s,idx)
-    (x,idx)=term11(s,idx)
-    return (x,idx)
-
-def expression0(s,idx):
-    global expmode
-    expmode=EXP_PAT
-    t,i=expression(s,idx)
-    return (t,i)
-
-def expression1(s,idx):
-    global expmode
-    expmode=EXP_ASM
-    t,i=expression(s,idx)
-    return (t,i)
-
-def expression_esc(s,idx,stopchar):
-    global expmode
-    expmode=EXP_PAT
-    result = []
-    depth = 0  # 括弧のネスト深さ
-
-    for ch in s:
-        if ch == '(':
-            depth += 1
-            result.append(ch)
-        elif ch == ')':
-            if depth > 0:
-                depth -= 1
-            result.append(ch)
-        else:
-            if depth == 0 and ch == stopchar:
-                result.append(chr(0))
-            else:
-                result.append(ch)
-
-    replaced=''.join(result)
+            x, idx = self.factor1(s, idx)
+        
+        idx = StringUtils.skipspc(s, idx)
+        return x, idx
     
-    t,i=expression(replaced,idx)
-    return (t,i)
+    def factor1(self, s, idx):
+        """Parse primary factor"""
+        x = 0
+        idx = StringUtils.skipspc(s, idx)
+        
+        if idx >= len(s):
+            return x, idx
+        
+        if s[idx] == '(':
+            x, idx = self.expression(s, idx + 1)
+            if idx < len(s) and s[idx] == ')':
+                idx += 1
+        elif StringUtils.q(s, '$$', idx):
+            idx += 2
+            x = self.state.pc
+        elif StringUtils.q(s, '#', idx):
+            idx += 1
+            t, idx = self.parser.get_symbol_word(s, idx)
+            x = self.symbol_manager.get(t)
+        elif StringUtils.q(s, '0b', idx):
+            idx += 2
+            while idx < len(s) and s[idx] in "01":
+                x = 2 * x + int(s[idx], 2)
+                idx += 1
+        elif StringUtils.q(s, '0x', idx):
+            idx += 2
+            while idx < len(s) and StringUtils.upper(s[idx]) in XDIGIT:
+                x = 16 * x + int(s[idx].lower(), 16)
+                idx += 1
+        elif idx + 3 <= len(s) and s[idx:idx+3] == 'qad':
+            idx += 3
+            idx = StringUtils.skipspc(s, idx)
+            if idx < len(s) and s[idx] == '{':
+                fs, idx = self.parser.get_floatstr(s, idx + 1)
+                h = IEEE754Converter.decimal_to_ieee754_128bit_hex(fs)
+                x = int(h, 16)
+            if idx < len(s) and s[idx] == '}':
+                idx += 1
+        elif idx + 3 <= len(s) and s[idx:idx+3] == 'dbl':
+            idx += 3
+            f, t, idx = self.parser.get_curlb(s, idx)
+            if f:
+                if t == 'nan':
+                    x = 0x7ff8000000000000
+                elif t == 'inf':
+                    x = 0x7ff0000000000000
+                elif t == '-inf':
+                    x = 0xfff0000000000000
+                else:
+                    v = float(eval(t))
+                    x = int.from_bytes(struct.pack('>d', v), "big")
+        elif idx + 3 <= len(s) and s[idx:idx+3] == 'flt':
+            idx += 3
+            f, t, idx = self.parser.get_curlb(s, idx)
+            if f:
+                if t == 'nan':
+                    x = 0x7fc00000
+                elif t == 'inf':
+                    x = 0x7f800000
+                elif t == '-inf':
+                    x = 0xff800000
+                else:
+                    v = float(eval(t))
+                    x = int.from_bytes(struct.pack('>f', v), "big")
+        elif idx < len(s) and s[idx].isdigit():
+            fs, idx = self.parser.get_intstr(s, idx)
+            x = int(float(fs))
+        elif (idx < len(s) and self.state.expmode == EXP_PAT and 
+              s[idx] in LOWER and idx + 1 < len(s) and s[idx+1] not in LOWER):
+            ch = s[idx]
+            if idx + 3 <= len(s) and s[idx+1:idx+3] == ':=':
+                x, idx = self.expression(s, idx + 3)
+                self.var_manager.put(ch, x)
+            else:
+                x = self.var_manager.get(ch)
+                idx += 1
+        elif idx < len(s) and s[idx] in self.state.lwordchars:
+            w, idx_new = self.parser.get_label_word(s, idx)
+            if idx != idx_new:
+                idx = idx_new
+                x = self.label_manager.get_value(w)
+        
+        idx = StringUtils.skipspc(s, idx)
+        return x, idx
+    
+    def term0_0(self, s, idx):
+        """Handle exponentiation"""
+        x, idx = self.factor(s, idx)
+        while idx < len(s) and StringUtils.q(s, '**', idx):
+            t, idx = self.factor(s, idx + 2)
+            x = x ** t
+        return x, idx
+    
+    def term0(self, s, idx):
+        """Handle multiplication, division, modulo"""
+        x, idx = self.term0_0(s, idx)
+        while idx < len(s):
+            if s[idx] == '*':
+                t, idx = self.term0_0(s, idx + 1)
+                x *= t
+            elif StringUtils.q(s, '//', idx):
+                t, idx = self.term0_0(s, idx + 2)
+                if t == 0:
+                    self.err("Division by 0 error.")
+                else:
+                    x //= t
+            elif s[idx] == '%':
+                t, idx = self.term0_0(s, idx + 1)
+                if t == 0:
+                    self.err("Division by 0 error.")
+                else:
+                    x = x % t
+            else:
+                break
+        return x, idx
+    
+    def term1(self, s, idx):
+        """Handle addition, subtraction"""
+        x, idx = self.term0(s, idx)
+        while idx < len(s):
+            if s[idx] == '+':
+                t, idx = self.term0(s, idx + 1)
+                x += t
+            elif s[idx] == '-':
+                t, idx = self.term0(s, idx + 1)
+                x -= t
+            else:
+                break
+        return x, idx
+    
+    def term2(self, s, idx):
+        """Handle bit shifts"""
+        x, idx = self.term1(s, idx)
+        while idx < len(s):
+            if StringUtils.q(s, '<<', idx):
+                t, idx = self.term1(s, idx + 2)
+                x <<= t
+            elif StringUtils.q(s, '>>', idx):
+                t, idx = self.term1(s, idx + 2)
+                x >>= t
+            else:
+                break
+        return x, idx
+    
+    def term3(self, s, idx):
+        """Handle bitwise AND"""
+        x, idx = self.term2(s, idx)
+        while idx < len(s) and s[idx] == '&' and (idx + 1 >= len(s) or s[idx+1] != '&'):
+            t, idx = self.term2(s, idx + 1)
+            x = int(x) & int(t)
+        return x, idx
+    
+    def term4(self, s, idx):
+        """Handle bitwise OR"""
+        x, idx = self.term3(s, idx)
+        while idx < len(s) and s[idx] == '|' and (idx + 1 >= len(s) or s[idx+1] != '|'):
+            t, idx = self.term3(s, idx + 1)
+            x = int(x) | int(t)
+        return x, idx
+    
+    def term5(self, s, idx):
+        """Handle bitwise XOR"""
+        x, idx = self.term4(s, idx)
+        while idx < len(s) and s[idx] == '^':
+            t, idx = self.term4(s, idx + 1)
+            x = int(x) ^ int(t)
+        return x, idx
+    
+    def term6(self, s, idx):
+        """Handle sign extension"""
+        x, idx = self.term5(s, idx)
+        while idx < len(s) and s[idx] == '\'':
+            t, idx = self.term5(s, idx + 1)
+            x = (x & ~((~0) << t)) | ((~0) << t if (x >> (t-1) & 1) else 0)
+        return x, idx
+    
+    def term7(self, s, idx):
+        """Handle comparisons"""
+        x, idx = self.term6(s, idx)
+        while idx < len(s):
+            if StringUtils.q(s, '<=', idx):
+                t, idx = self.term6(s, idx + 2)
+                x = 1 if x <= t else 0
+            elif s[idx] == '<':
+                t, idx = self.term6(s, idx + 1)
+                x = 1 if x < t else 0
+            elif StringUtils.q(s, '>=', idx):
+                t, idx = self.term6(s, idx + 2)
+                x = 1 if x >= t else 0
+            elif s[idx] == '>':
+                t, idx = self.term6(s, idx + 1)
+                x = 1 if x > t else 0
+            elif StringUtils.q(s, '==', idx):
+                t, idx = self.term6(s, idx + 2)
+                x = 1 if x == t else 0
+            elif StringUtils.q(s, '!=', idx):
+                t, idx = self.term6(s, idx + 2)
+                x = 1 if x != t else 0
+            else:
+                break
+        return x, idx
+    
+    def term8(self, s, idx):
+        """Handle logical NOT"""
+        if idx + 4 <= len(s) and s[idx:idx+4] == 'not(':
+            x, idx = self.expression(s, idx + 3)
+            x = 0 if x else 1
+        else:
+            x, idx = self.term7(s, idx)
+        return x, idx
+    
+    def term9(self, s, idx):
+        """Handle logical AND"""
+        x, idx = self.term8(s, idx)
+        while idx < len(s) and StringUtils.q(s, '&&', idx):
+            t, idx = self.term8(s, idx + 2)
+            x = 1 if x and t else 0
+        return x, idx
+    
+    def term10(self, s, idx):
+        """Handle logical OR"""
+        x, idx = self.term9(s, idx)
+        while idx < len(s) and StringUtils.q(s, '||', idx):
+            t, idx = self.term9(s, idx + 2)
+            x = 1 if x or t else 0
+        return x, idx
+    
+    def term11(self, s, idx):
+        """Handle ternary operator"""
+        x, idx = self.term10(s, idx)
+        while idx < len(s) and StringUtils.q(s, '?', idx):
+            t, idx = self.term10(s, idx + 1)
+            if idx < len(s) and StringUtils.q(s, ':', idx):
+                u, idx = self.term10(s, idx + 1)
+                x = t if x != 0 else u
+        return x, idx
+    
+    def expression(self, s, idx):
+        """Main expression evaluator"""
+        s += chr(0)
+        idx = StringUtils.skipspc(s, idx)
+        x, idx = self.term11(s, idx)
+        return x, idx
+    
+    def expression_pat(self, s, idx):
+        """Expression in pattern mode"""
+        self.state.expmode = EXP_PAT
+        return self.expression(s, idx)
+    
+    def expression_asm(self, s, idx):
+        """Expression in assembly mode"""
+        self.state.expmode = EXP_ASM
+        return self.expression(s, idx)
+    
+    def expression_esc(self, s, idx, stopchar):
+        """Expression with escaped stop character"""
+        self.state.expmode = EXP_PAT
+        result = []
+        depth = 0
+        
+        for ch in s:
+            if ch == '(':
+                depth += 1
+                result.append(ch)
+            elif ch == ')':
+                if depth > 0:
+                    depth -= 1
+                result.append(ch)
+            else:
+                if depth == 0 and ch == stopchar:
+                    result.append(chr(0))
+                else:
+                    result.append(ch)
+        
+        replaced = ''.join(result)
+        return self.expression(replaced, idx)
 
-def getsymval(w):
-    w=w.upper()
-    l=list(symbols.items())
-    for i in l:
-        if i[0]==w:
-            return symbols[w]
-    return "" 
 
-def clear_symbol(i):
-    global symbols
-    if len(i)==0:
-        return False
-    if i[0]!='.clearsym':
-        return False
-    key=upper(i[2])
-    if key in symbols:
-        symbols.pop(key)
+class BinaryWriter:
+    """Handles binary output to files"""
+    
+    def __init__(self, state):
+        self.state = state
+    
+    def fwrite(self, file_path, position, x, prt):
+        """Write binary data to file"""
+        b = 8 if self.state.bts <= 8 else self.state.bts
+        byts = b // 8 + (0 if b / 8 == b // 8 else 1)
+        
+        if file_path != "":
+            file = open(file_path, 'a+b')
+            file.seek(position * byts)
+        
+        cnt = 0
+        if self.state.endian == 'little':
+            p = (2 ** self.state.bts) - 1
+            v = x & p
+            for i in range(byts):
+                vv = v & 0xff
+                if file_path != "":
+                    file.write(struct.pack('B', vv))
+                if prt:
+                    print(" 0x%02x" % vv, end='')
+                v = v >> 8
+                cnt += 1
+        else:
+            bp = (2 ** self.state.bts) - 1
+            x = x & bp
+            p = 0xff << (byts * 8 - 8)
+            for i in range(byts - 1, -1, -1):
+                v = ((x & p) >> (i * 8)) & 0xff
+                if file_path != "":
+                    file.write(struct.pack('B', v))
+                if prt:
+                    print(" 0x%02x" % v, end='')
+                p = p >> 8
+                cnt += 1
+        
+        if file_path != "":
+            file.close()
+        return cnt
+    
+    def outbin2(self, a, x):
+        """Output binary without printing"""
+        if self.state.pas == 2 or self.state.pas == 0:
+            x = int(x)
+            self.fwrite(self.state.outfile, a, x, 0)
+    
+    def outbin(self, a, x):
+        """Output binary with printing"""
+        if self.state.pas == 2 or self.state.pas == 0:
+            x = int(x)
+            self.fwrite(self.state.outfile, a, x, 1)
+    
+    def align_(self, addr):
+        """Align address"""
+        a = addr % self.state.align
+        if a == 0:
+            return addr
+        return addr + self.state.align - a
+
+
+class DirectiveProcessor:
+    """Processes assembler directives"""
+    
+    def __init__(self, state, expr_eval, binary_writer):
+        self.state = state
+        self.expr_eval = expr_eval
+        self.binary_writer = binary_writer
+    
+    def add_avoiding_dup(self, l, e):
+        """Add element to list avoiding duplicates"""
+        if e not in l:
+            l.append(e)
+        return l
+    
+    def clear_symbol(self, i):
+        """Clear symbol directive"""
+        if len(i) == 0 or i[0] != '.clearsym':
+            return False
+        
+        if len(i) > 2:
+            key = StringUtils.upper(i[2])
+            self.state.symbols.pop(key, None)
+        elif len(i) == 1:
+            self.state.symbols = {}
+        
         return True
-    if len(i)==1:
-        symbols={}
-    return True
+    
+    def set_symbol(self, i):
+        """Set symbol directive"""
+        if len(i) == 0 or i[0] != '.setsym':
+            return False
+        
+        key = StringUtils.upper(i[1])
+        if len(i) > 2:
+            v, idx = self.expr_eval.expression_pat(i[2], 0)
+        else:
+            v = 0
+        self.state.symbols[key] = v
+        return True
+    
+    def bits(self, i):
+        """Bits directive"""
+        if len(i) == 0 or (len(i) > 1 and i[0] != '.bits'):
+            return False
+        
+        if len(i) >= 2 and i[1] == 'big':
+            self.state.endian = 'big'
+        else:
+            self.state.endian = 'little'
+        
+        if len(i) >= 3:
+            v, idx = self.expr_eval.expression_pat(i[2], 0)
+        else:
+            v = 8
+        self.state.bts = int(v)
+        return True
+    
+    def paddingp(self, i):
+        """Padding directive"""
+        if len(i) == 0 or (len(i) > 1 and i[0] != '.padding'):
+            return False
+        
+        if len(i) >= 3:
+            v, idx = self.expr_eval.expression_pat(i[2], 0)
+        else:
+            v = 0
+        self.state.padding = int(v)
+        return True
+    
+    def symbolc(self, i):
+        """Symbol characters directive"""
+        if len(i) == 0 or (len(i) > 1 and i[0] != '.symbolc'):
+            return False
+        
+        if len(i) > 3:
+            self.state.swordchars = ALPHABET + DIGIT + i[2]
+        return True
+    
+    def vliwp(self, i):
+        """VLIW directive"""
+        if len(i) == 0 or i[0] != ".vliw":
+            return False
+        
+        v1, idx = self.expr_eval.expression_pat(i[1], 0)
+        v2, idx = self.expr_eval.expression_pat(i[2], 0)
+        v3, idx = self.expr_eval.expression_pat(i[3], 0)
+        v4, idx = self.expr_eval.expression_pat(i[4], 0)
+        
+        self.state.vliwbits = int(v1)
+        self.state.vliwinstbits = int(v2)
+        self.state.vliwtemplatebits = int(v3)
+        self.state.vliwflag = True
+        
+        l = []
+        for i in range(self.state.vliwinstbits // 8 + (0 if self.state.vliwinstbits % 8 == 0 else 1)):
+            l += [v4 & 0xff]
+            v4 >>= 8
+        self.state.vliwnop = l
+        return True
+    
+    def epic(self, i):
+        """EPIC directive"""
+        if len(i) == 0 or StringUtils.upper(i[0]) != "EPIC":
+            return False
+        
+        if len(i) <= 1 or i[1] == '':
+            return False
+        
+        s = i[1]
+        idxs = []
+        idx = 0
+        while True:
+            v, idx = self.expr_eval.expression_pat(s, idx)
+            idxs += [v]
+            if idx < len(s) and s[idx] == ',':
+                idx += 1
+                continue
+            break
+        
+        s2 = i[2]
+        self.state.vliwset = self.add_avoiding_dup(self.state.vliwset, [idxs, s2])
+        return True
+    
+    def error(self, s):
+        """Process error directive"""
+        ss = s.replace(' ', '')
+        if ss == "":
+            return
+        
+        s += chr(0)
+        idx = 0
+        error_code = 0
+        
+        while True:
+            ch = s[idx] if idx < len(s) else chr(0)
+            if ch == chr(0):
+                break
+            if ch == ',':
+                idx += 1
+                continue
+            
+            u, idxn = self.expr_eval.expression_pat(s, idx)
+            idx = idxn
+            if idx < len(s) and s[idx] == ';':
+                idx += 1
+            t, idx = self.expr_eval.expression_pat(s, idx)
+            
+            if (self.state.pas == 2 or self.state.pas == 0) and u:
+                print(f"Line {self.state.ln} Error code {t} ", end="")
+                if t >= 0 and t < len(ERRORS):
+                    print(f"{ERRORS[t]}", end='')
+                print(": ")
+                error_code = t
 
-def set_symbol(i):
-    global symbols
-    if len(i)==0:
-        return False
-    if i[0]!='.setsym':
-        return False
-    key=upper(i[1])
-    if len(i)>2:
-        v,idx=expression0(i[2],0)
-    else:
-        v=0
-    symbols[key]=v
-    return True
 
-def bits(i):
-    global bts,endian
-    if len(i)==0:
+class PatternMatcher:
+    """Handles pattern matching for assembly instructions"""
+    
+    def __init__(self, state, expr_eval, var_manager, symbol_manager, parser):
+        self.state = state
+        self.expr_eval = expr_eval
+        self.var_manager = var_manager
+        self.symbol_manager = symbol_manager
+        self.parser = parser
+    
+    def remove_brackets(self, s, l):
+        """Remove specified bracket pairs"""
+        open_count = 0
+        result = list(s)
+        bracket_positions = []
+        
+        for i, char in enumerate(s):
+            if char == OB:
+                open_count += 1
+                bracket_positions.append((open_count, i, 'open'))
+            elif char == CB:
+                bracket_positions.append((open_count, i, 'close'))
+        
+        for index in sorted(l, reverse=True):
+            start_index = None
+            end_index = None
+            for count, pos, type in bracket_positions:
+                if count == index and type == 'open':
+                    start_index = pos
+                elif count == index and type == 'close':
+                    end_index = pos
+                    break
+            
+            if start_index is not None and end_index is not None:
+                for j in range(start_index, end_index + 1):
+                    result[j] = ''
+        
+        return ''.join(result)
+    
+    def match(self, s, t):
+        """Match assembly line against pattern"""
+        self.state.deb1 = s
+        self.state.deb2 = t
+        
+        t = t.replace(OB, '').replace(CB, '')
+        idx_s = 0
+        idx_t = 0
+        idx_s = StringUtils.skipspc(s, idx_s)
+        idx_t = StringUtils.skipspc(t, idx_t)
+        s += chr(0)
+        t += chr(0)
+        
+        while True:
+            idx_s = StringUtils.skipspc(s, idx_s)
+            idx_t = StringUtils.skipspc(t, idx_t)
+            b = s[idx_s]
+            a = t[idx_t]
+            
+            if a == chr(0) and b == chr(0):
+                return True
+            
+            if a == '\\':
+                idx_t += 1
+                if idx_t < len(t) and t[idx_t] == b:
+                    idx_t += 1
+                    idx_s += 1
+                    continue
+                else:
+                    return False
+            elif a.isupper():
+                if a == b.upper():
+                    idx_s += 1
+                    idx_t += 1
+                    continue
+                else:
+                    return False
+            elif a == '!':
+                idx_t += 1
+                a = t[idx_t]
+                idx_t += 1
+                if a == '!':
+                    a = t[idx_t]
+                    idx_t += 1
+                    v, idx_s = self.expr_eval.factor(s, idx_s)
+                    self.var_manager.put(a, v)
+                    continue
+                else:
+                    idx_t = StringUtils.skipspc(t, idx_t)
+                    if idx_t < len(t) and t[idx_t] == '\\':
+                        idx_t = StringUtils.skipspc(t, idx_t + 1)
+                        b = t[idx_t] if idx_t < len(t) else chr(0)
+                        stopchar = b
+                    else:
+                        stopchar = chr(0)
+                    
+                    v, idx_s = self.expr_eval.expression_esc(s, idx_s, stopchar)
+                    self.var_manager.put(a, v)
+                    continue
+            elif a in LOWER:
+                idx_t += 1
+                w, idx_s = self.parser.get_symbol_word(s, idx_s)
+                v = self.symbol_manager.get(w)
+                if v == "":
+                    return False
+                self.var_manager.put(a, v)
+                continue
+            elif a == b:
+                idx_t += 1
+                idx_s += 1
+                continue
+            else:
+                return False
+    
+    def match0(self, s, t):
+        """Match with optional bracket combinations"""
+        t = t.replace('[[', OB).replace(']]', CB)
+        cnt = t.count(OB)
+        sl = [_ + 1 for _ in range(cnt)]
+        
+        for i in range(len(sl) + 1):
+            ll = list(itertools.combinations(sl, i))
+            for j in ll:
+                lt = self.remove_brackets(t, list(j))
+                if self.match(s, lt):
+                    return True
         return False
-    if len(i)>1 and i[0]!='.bits':
-        return False
-    if len(i)>=2 and i[1]=='big':
-        endian='big'
-    else:
-        endian='little'
-    if len(i)>=3:
-        v,idx=expression0(i[2],0)
-    else:
-        v=8
-    bts=int(v)
-    return True
 
-def paddingp(i):
-    global padding
-    if len(i)==0:
-        return False
-    if len(i)>1 and i[0]!='.padding':
-        return False
-    if len(i)>=3:
-        v,idx=expression0(i[2],0)
-    else:
-        v=0
-    padding=int(v)
-    return True
 
-def symbolc(i):
-    global swordchars
-    if len(i)==0:
-        return False
-    if len(i)>1 and i[0]!='.symbolc':
-        return False
-    if len(i)>3:
-        swordchars=alphabet+digit+i[2]
-    return True
+class PatternFileReader:
+    """Reads and processes pattern files"""
+    
+    def __init__(self, parser):
+        self.parser = parser
+    
+    def readpat(self, fn):
+        """Read pattern file"""
+        if fn == '':
+            return []
+        
+        f = open(fn, "rt")
+        p = []
+        w = []
+        
+        while True:
+            l = f.readline()
+            if not l:
+                break
+            
+            l = StringUtils.remove_comment(l)
+            l = l.replace('\t', ' ')
+            l = l.replace(chr(13), '')
+            l = l.replace('\n', '')
+            l = StringUtils.reduce_spaces(l)
+            
+            ww = self.include_pat(l)
+            if ww:
+                w = w + ww
+                continue
+            else:
+                r = []
+                idx = 0
+                while True:
+                    s, idx = self.parser.get_params1(l, idx)
+                    r += [s]
+                    if len(l) <= idx:
+                        break
+                l = r
+                
+                if len(l) == 1:
+                    p = [l[0], '', '', '', '', '']
+                elif len(l) == 2:
+                    p = [l[0], '', l[1], '', '', '']
+                elif len(l) == 3:
+                    p = [l[0], l[1], l[2], '', '', '']
+                elif len(l) == 4:
+                    p = [l[0], l[1], l[2], l[3], '', '']
+                elif len(l) == 5:
+                    p = [l[0], l[1], l[2], l[3], l[4], '']
+                elif len(l) == 6:
+                    p = [l[0], l[1], l[2], l[3], l[4], l[5]]
+                else:
+                    p = ["", "", "", "", "", "", ""]
+                w.append(p)
+        
+        f.close()
+        return w
+    
+    def include_pat(self, l):
+        """Include pattern directive"""
+        idx = StringUtils.skipspc(l, 0)
+        i = l[idx:idx+8]
+        i = i.upper()
+        if i != ".INCLUDE":
+            return []
+        s = StringUtils.get_string(l[8:])
+        w = self.readpat(s)
+        return w
 
-def remove_comment(l):
-    idx=0
-    while idx<len(l):
-        if len(l[idx:])>2 and l[idx:idx+2]=='/*':
-            if idx==0:
+
+class ObjectGenerator:
+    """Generates object code from expressions"""
+    
+    def __init__(self, state, expr_eval, binary_writer):
+        self.state = state
+        self.expr_eval = expr_eval
+        self.binary_writer = binary_writer
+    
+    def makeobj(self, s):
+        """Make object code from expression string"""
+        s += chr(0)
+        idx = 0
+        objl = []
+        
+        while True:
+            if idx >= len(s) or s[idx] == chr(0):
+                break
+            
+            if s[idx] == ',':
+                idx += 1
+                p = self.state.pc + len(objl)
+                n = self.binary_writer.align_(p)
+                for i in range(p, n):
+                    objl += [self.state.padding]
+                continue
+            
+            semicolon = False
+            if s[idx] == ';':
+                semicolon = True
+                idx += 1
+            
+            x, idx = self.expr_eval.expression_pat(s, idx)
+            
+            if (semicolon == True and x != 0) or (semicolon == False):
+                objl += [x]
+            
+            if idx < len(s) and s[idx] == ',':
+                idx += 1
+                continue
+            break
+        
+        return objl
+
+
+class VLIWProcessor:
+    """Handles VLIW instruction processing"""
+    
+    def __init__(self, state, expr_eval, binary_writer):
+        self.state = state
+        self.expr_eval = expr_eval
+        self.binary_writer = binary_writer
+    
+    def vliwprocess(self, line, idxs, objl, flag, idx, lineassemble2_func):
+        """Process VLIW instruction"""
+        objs = [objl]
+        idxlst = [idxs]
+        self.state.vliwstop = 0
+        
+        while True:
+            idx = StringUtils.skipspc(line, idx)
+            if idx + 4 <= len(line) and line[idx:idx+4] == '!!!!':
+                idx += 4
+                self.state.vliwstop = 1
+                continue
+            elif idx + 2 <= len(line) and line[idx:idx+2] == '!!':
+                idx += 2
+                idxs, objl, flag, idx = lineassemble2_func(line, idx)
+                objs += [objl]
+                idxlst += [idxs]
+                continue
+            else:
+                break
+        
+        if self.state.vliwtemplatebits == 0:
+            self.state.vliwset = [[[0], "0"]]
+        
+        vbits = abs(self.state.vliwbits)
+        for k in self.state.vliwset:
+            if list(set(k[0])) == list(set(idxlst)) or self.state.vliwtemplatebits == 0:
+                im = 2 ** self.state.vliwinstbits - 1
+                tm = 2 ** abs(self.state.vliwtemplatebits) - 1
+                pm = 2 ** vbits - 1
+                x, idx = self.expr_eval.expression_pat(k[1], 0)
+                templ = x & tm
+                
+                values = []
+                nob = vbits // 8 + (0 if vbits % 8 == 0 else 1)
+                ibyte = self.state.vliwinstbits // 8 + (0 if self.state.vliwinstbits % 8 == 0 else 1)
+                noi = (vbits - abs(self.state.vliwtemplatebits)) // self.state.vliwinstbits
+                
+                for j in objs:
+                    for m in j:
+                        values += [m]
+                
+                for i in range(ibyte * noi - len(values)):
+                    values += self.state.vliwnop
+                
+                v1 = []
+                cnt = 0
+                
+                for j in range(noi):
+                    vv = 0
+                    for i in range(ibyte):
+                        vv <<= 8
+                        if len(values) > cnt:
+                            vv |= values[cnt] & 0xff
+                        cnt += 1
+                    v1 += [vv & im]
+                
+                r = 0
+                for v in v1:
+                    r = (r << self.state.vliwinstbits) | v
+                r = r & pm
+                
+                if self.state.vliwtemplatebits < 0:
+                    res = r | (templ << (vbits - abs(self.state.vliwtemplatebits)))
+                else:
+                    res = (r << self.state.vliwtemplatebits) | templ
+                
+                q = 0
+                if self.state.vliwbits > 0:
+                    bc = vbits - 8
+                    vm = 0xff << bc
+                    for cnt in range(vbits // 8):
+                        self.binary_writer.outbin(self.state.pc + cnt, ((res & vm) >> bc) & 0xff)
+                        bc = bc - 8
+                        vm >>= 8
+                        q += 1
+                else:
+                    for cnt in range(vbits // 8):
+                        self.binary_writer.outbin(self.state.pc + cnt, res & 0xff)
+                        res >>= 8
+                        q += 1
+                
+                self.state.pc += q
+                break
+        else:
+            if self.state.pas == 0 or self.state.pas == 2:
+                print(" error - No vliw instruction-set defined.")
+                return False
+        return True
+
+
+class AssemblyDirectiveProcessor:
+    """Processes assembly-level directives"""
+    
+    def __init__(self, state, expr_eval, binary_writer, label_manager, parser):
+        self.state = state
+        self.expr_eval = expr_eval
+        self.binary_writer = binary_writer
+        self.label_manager = label_manager
+        self.parser = parser
+    
+    def labelc_processing(self, l, ll):
+        """Label characters directive"""
+        if l.upper() != '.LABELC':
+            return False
+        if ll:
+            self.state.lwordchars = ALPHABET + DIGIT + ll
+        return True
+    
+    def label_processing(self, l):
+        """Process label definitions"""
+        if l == "":
+            return ""
+        
+        label, idx = self.parser.get_label_word(l, 0)
+        lidx = idx
+        
+        if label != "" and idx > 0 and l[idx-1] == ':':
+            idx = StringUtils.skipspc(l, idx)
+            e, idx = StringUtils.get_param_to_spc(l, idx)
+            if e.upper() == '.EQU':
+                u, idx = self.expr_eval.expression_asm(l, idx)
+                self.label_manager.put_value(label, u, self.state.current_section)
                 return ""
             else:
-                return l[0:idx-1]
-        idx+=1
-    return l
-
-def remove_comment_asm(l):
-    if ';' in l:
-        s=l[0:l.index(';')]
-    else:
-        s=l
-    return s.rstrip()
-
-def get_params1(l,idx):
-    idx=skipspc(l,idx)
-
-    if idx>=len(l):
-        return ("",idx)
-
-    s=""
-    while idx<len(l):
-        if '::'==l[idx:idx+2]:
-            idx+=2
-            break
-        else:
-            s+=l[idx]
-            idx+=1
-    return(s.rstrip(' \t'),idx)
-
-def reduce_spaces(text):
-    return re.sub(r'\s{2,}', ' ', text)
-
-def readpat(fn):
-    if fn=='':
-        return []
-    f=open(fn,"rt")
-
-    p=[]
-    w=[]
-    while True:
-        l=f.readline()
-        if not l:
-            break
-        l=remove_comment(l)
-        l=l.replace('\t',' ')
-        l=l.replace(chr(13),'')
-        l=l.replace('\n','')
-        l=reduce_spaces(l)
-        ww=include_pat(l)
-        if ww:
-            w=w+ww
-            continue
-        else:
-            r=[]
-            idx=0
-            while True:
-                s,idx=get_params1(l,idx)
-                r+=[s]
-                if len(l)<=idx:
-                    break
-            l=r
-            prev=l[0]
-            #l=[_ for _ in l if _]
-            idx=0
-            if len(l)==1:
-                p=[l[0],'','','','','']
-            elif len(l)==2:
-                p=[l[0],'',l[1],'','','']
-            elif len(l)==3:
-                p=[l[0],l[1],l[2],'','','']
-            elif len(l)==4:
-                p=[l[0],l[1],l[2],l[3],"",'']
-            elif len(l)==5:
-                p=[l[0],l[1],l[2],l[3],l[4],'']
-            elif len(l)==6:
-                p=[l[0],l[1],l[2],l[3],l[4],l[5]]
-            else:
-                p=["","","","","","",""]
-            w.append(p)
-    f.close()
-    return w
-
-def fwrite(file_path, position, x,prt):
-    global bts,endian,byte
-    b=8 if bts<=8 else bts
-    byts=b//8+(0 if b/8==b//8 else 1)
+                self.label_manager.put_value(label, self.state.pc, self.state.current_section)
+                return l[lidx:]
+        return l
     
-    if file_path!="":
-        file=open(file_path, 'a+b')
-        file.seek(position*byts)
-
-    cnt=0
-    if endian=='little':
-        p=(2**bts)-1
-        v=x&p
-        for i in range(byts):
-            vv=v&0xff
-            if file_path!="":
-                file.write(struct.pack('B',vv))
-            if prt:
-                print(" 0x%02x" % vv,end='')
-            v=v>>8
-            cnt+=1
-    else:
-        bp=(2**bts)-1
-        x=x&bp
-        p=0xff<<(byts*8-8)
-        for i in range(byts-1,-1,-1):
-            v=((x&p)>>(i*8))&0xff
-            if file_path!="":
-                file.write(struct.pack('B',v))
-            if prt:
-                print(" 0x%02x" % v,end='')
-            p=p>>8
-            cnt+=1
-
-    if file_path!="":
-        file.close()
-    return cnt
-
-def align_(addr):
-    a=addr%align
-    if a==0:
-        return addr
-    addr+=align-a
-    return addr
-
-def makeobj(s):
-    global pc
-    s+=chr(0)
-    idx=0
-    objl=[]
-    while True:
-        if s[idx]==chr(0):
-            break
-        if s[idx]==',':
-            idx+=1
-            p=pc+len(objl)
-            n=align_(p)
-            for i in range(p,n):
-                objl+=[padding]
-            continue
-
-        semicolon=False
-        if s[idx]==';':
-            semicolon=True
-            idx+=1
-        (x,idx)=expression0(s,idx)
-
-        if (semicolon==True and x!=0) or (semicolon==False):
-            objl+=[x]
-        if s[idx]==',':
-            idx+=1
-            continue
-        break
-
-    return objl
-
-def get_symbol_word(s,idx):
-    t=""
-    if len(s)>idx and (not s[idx] in digit and s[idx] in swordchars):
-        t=s[idx]
-        idx+=1
-        while len(s)>idx:
-            if not s[idx] in swordchars : 
-                break
-            t+=s[idx]
-            idx+=1
-    return upper(t),idx
-
-def get_label_word(s,idx):
-    t=""
-    if len(s)>idx and (s[idx]=='.' or not s[idx] in digit and s[idx] in lwordchars):
-        t=s[idx]
-        idx+=1
-        while len(s)>idx:
-            if not s[idx] in lwordchars: 
-                break
-            t+=s[idx]
-            idx+=1
-
-        if len(s)>idx and s[idx]==':':
-            idx+=1
-    return t,idx
-
-def match(s,t):
-    global deb1,deb2
-    t=t.replace(OB,'').replace(CB,'')
-    idx_s=0
-    idx_t=0
-    idx_s=skipspc(s,idx_s)
-    idx_t=skipspc(t,idx_t)
-    s+=chr(0)
-    t+=chr(0)
-    deb1=s
-    deb2=t
-    while True:
-        idx_s=skipspc(s,idx_s)
-        idx_t=skipspc(t,idx_t)
-        b=s[idx_s] # bはアセンブリライン
-        a=t[idx_t] # aはパターンファイル
-        if a==chr(0) and b==chr(0):
-            return True
-        if a=='\\':
-            idx_t+=1
-            if t[idx_t]==b:
-                idx_t+=1
-                idx_s+=1
-                continue
-            else:
-                return False
-        elif a.isupper():
-            if a==b.upper():
-                idx_s+=1
-                idx_t+=1
-                continue
-            else:
-                return False
-        elif a=='!':
-            idx_t+=1
-            a=t[idx_t]
-            idx_t+=1
-            if a=='!':
-                a=t[idx_t]
-                idx_t+=1
-                (v,idx_s)=factor(s,idx_s)
-                put_vars(a,v)
-                continue
-            else:
-                idx_t=skipspc(t,idx_t)
-                if t[idx_t]=='\\':
-                    idx_t=skipspc(t,idx_t+1)
-                    b=t[idx_t]
-                    stopchar=b
-                else:
-                    stopchar=chr(0)
-
-                (v,idx_s)=expression_esc(s,idx_s,stopchar)
-                put_vars(a,v)
-                continue
-        elif a in lower:
-            idx_t+=1
-            (w,idx_s)=get_symbol_word(s,idx_s)
-            v=getsymval(w)
-            if (v==""):
-                return False
-            put_vars(a,v)
-            continue
-        elif a==b:
-            idx_t+=1
-            idx_s+=1
-            continue
-        else:
-              return False
-
-def remove_brackets(s, l):
-    open_count = 0
-    result = list(s)
-    
-    # 開き大括弧と閉じ大括弧の位置を記録
-    bracket_positions = []
-    
-    for i, char in enumerate(s):
-        if char == OB:
-            open_count += 1
-            bracket_positions.append((open_count, i, 'open'))
-        elif char == CB:
-            bracket_positions.append((open_count, i, 'close'))
-    
-    # 指定されたインデックスの開き大括弧から閉じ大括弧までを削除
-    for index in sorted(l, reverse=True):
-        start_index = None
-        end_index = None
-        for count, pos, type in bracket_positions:
-            if count == index and type == 'open':
-                start_index = pos
-            elif count == index and type == 'close':
-                end_index = pos
-                break
-        
-        if start_index is not None and end_index is not None:
-            for j in range(start_index, end_index + 1):
-                result[j] = ''
-    
-    return ''.join(result)
-
-
-def match0(s,t):
-    t=t.replace('[[',OB).replace(']]',CB)
-    cnt=t.count(OB)
-    sl=[ _+1 for _ in range(cnt) ]
-    for i in range(len(sl)+1):
-        ll=list(itertools.combinations(sl,i))
-        for j in ll:
-            lt=remove_brackets(t,list(j))
-            if match(s,lt):
-                return True
-    return False
-        
-def error(s):
-    ss=s.replace(' ','')
-    if ss=="":
-        return
-    ch=','
-    s+=chr(0)
-    idx=0
-    error_code=0
-    while True:
-        ch=s[idx]
-        if ch==chr(0):
-            break
-        if ch==',':
-            idx+=1
-            continue
-        u,idxn=expression0(s,idx)
-        idx=idxn
-        if s[idx]==';':
-            idx+=1
-        t,idx=expression0(s,idx)
-        if (pas==2 or pas==0) and u:
-            print(f"Line {ln} Error code {t} ",end="")
-            if t>=0 and t<len(errors):
-                print(f"{errors[t]}",end='')
-            print(": ")
-            error_code=t
-
-    return
-
-def labelc_processing(l,ll):
-    global lwordchars
-    if l.upper()!='.LABELC':
-        return False
-    if ll:
-        lwordchars=alphabet+digit+ll
-    return True
-
-def label_processing(l):
-    if l=="":
-        return ""
-
-    label,idx=get_label_word(l,0)
-    lidx=idx
-    if label!="" and l[idx-1]==':':
-        idx=skipspc(l,idx)
-        e,idx=get_param_to_spc(l,idx)
-        if e.upper()=='.EQU':
-            u,idx=expression1(l,idx)
-            put_label_value(label,u,current_section)
-            return ""
-        else:
-            put_label_value(label,pc,current_section)
-            return l[lidx:]
-    return l
-
-def get_string(l2):
-    idx=0
-    idx=skipspc(l2,idx)
-    if l2=='' or l2[idx]!='"':
-        return ""
-    idx+=1
-    s=""
-    while idx<len(l2):
-        if l2[idx]=='"':
-            return s
-        else:
-            s+=l2[idx]
-            idx+=1
-    return s
-
-def asciistr(l2):
-    global pc
-    idx=0
-    if l2=='' or l2[idx]!='"':
-        return False
-    idx+=1
-    while idx<len(l2):
-        if l2[idx]=='"':
-            return True
-        if l2[idx:idx+2]=='\\0':
-            idx+=2
-            ch=chr(0)
-        elif l2[idx:idx+2]=='\\t':
-            idx+=2
-            ch='\t'
-        elif l2[idx:idx+2]=='\\n':
-            idx+=2
-            ch='\n'
-        else:
-            ch=l2[idx]
-            idx+=1
-        outbin(pc,ord(ch))
-        pc+=1
-
-def export_processing(l1,l2):
-    global export_labels
-    if not (pas==2 or pas==0):
-        return False
-    if upper(l1)!=".EXPORT":
-        return False
-
-    idx=0
-    l2+=chr(0)
-    while l2[idx]!=chr(0):
-        idx=skipspc(l2,idx)
-        s,idx=get_label_word(l2,idx)
-        if s=="":
-            break
-        if l2[idx]==':':
-            idx+=1
-        v=get_label_value(s)
-        sec=get_label_section(s)
-        export_labels[s]=[v,sec]
-        if l2[idx]==',':
-            idx+=1
-    return True
-
-def zero_processing(l1,l2):
-    global pc
-    if upper(l1)!=".ZERO":
-        return False
-    x,idx=expression1(l2,0)
-    for i in range(x+1):
-        outbin2(pc,0x00)
-        pc+=1
-    return True
-
-
-def ascii_processing(l1,l2):
-    if upper(l1)!=".ASCII":
-        return False
-
-    f=asciistr(l2)
-    return(f)
-
-def asciiz_processing(l1,l2):
-    global pc
-    if upper(l1)!=".ASCIIZ":
-        return False
-    f=asciistr(l2)
-    if f:
-        outbin(pc,0x00)
-        pc+=1
-    return True
-
-def include_pat(l):
-    idx=skipspc(l,0)
-    i=l[idx:idx+8]
-    i=i.upper()
-    if i!=".INCLUDE":
-        return []
-    s=get_string(l[8:])
-    w=readpat(s)
-    return w
-
-def vliwp(i):
-    global vliwtemplatebits,vliwflag,vliwbits,vliwinstbits,vliwnop
-    if i[0]!=".vliw":
-        return False
-    v1,idx=expression0(i[1],0)
-    v2,idx=expression0(i[2],0)
-    v3,idx=expression0(i[3],0)
-    v4,idx=expression0(i[4],0)
-    vliwbits=int(v1)
-    vliwinstbits=int(v2)
-    vliwtemplatebits=int(v3)
-    vliwflag=True
-    l=[]
-    for i in range(vliwinstbits//8 + (0 if vliwinstbits%8==0 else 1)):
-        l+=[v4&0xff]
-        v4>>=8
-    vliwnop=l
-    return True
-
-
-def include_asm(l1,l2):
-    if upper(l1)!=".INCLUDE":
-        return False
-    s=get_string(l2)
-    if s:
-        fileassemble(s)
-    return True
-
-def section_processing(l1,l2):
-    global current_section,sections
-
-    if upper(l1)!="SECTION" and upper(l1)!="SEGMENT":
-        return False
-
-    if l2!='':
-        current_section=l2
-        sections[l2]=[pc,0]
-    return True
-
-def align_processing(l1,l2):
-    global pc,align
-
-    if upper(l1)!=".ALIGN":
-        return False
-
-    if l2!='':
-        u,idx=expression1(l2,0)
-        align=int(u)
-
-    pc=align_(pc)
-    return True
-
-def printaddr(pc):
-    print("%016x: " % pc,end='')
-
-def endsection_processing(l1,l2):
-    global sections
-
-    if upper(l1)!="ENDSECTION" and upper(l1)!="ENDSEGMENT":
-        return False
-    start=sections[current_section][0]
-    sections[current_section]=[start,pc-start]
-    return True
-
-def org_processing(l1,l2):
-    global pc
-    if upper(l1)!=".ORG":
-        return False
-    u,idx=expression1(l2,0)
-    if l2[idx:idx+2].upper()==',P':
-        if u>pc:
-            for i in range(u-pc):
-                outbin2(i+pc,padding)
-    pc=u
-    return True
-
-def epic(i):
-    global vliwset
-    if upper(i[0])!="EPIC":
-        return False
-    if not(len(i)>1 and i[1]!=''):
-        return False
-    s=i[1]
-    idxs=[]
-    idx=0
-    while True:
-        v,idx=expression0(s,idx)
-        idxs+=[v]
-        if len(s)>idx and s[idx]==',':
-            idx+=1
-            continue
-        break
-    s2=i[2]
-    vliwset=add_avoiding_dup(vliwset,[idxs,s2])
-    return True
-   
-def lineassemble2(line,idx):
-    global pc,pat,error_undefined_label,patsymbols
-
-    (l,idx)=get_param_to_spc(line,idx)
-    (l2,idx)=get_param_to_eon(line,idx)
-    l=l.rstrip()
-    l2=l2.rstrip()
-    l=l.replace(' ','')
-    if section_processing(l,l2):
-        return [],[],True,idx
-    if endsection_processing(l,l2):
-        return [],[],True,idx
-    if zero_processing(l,l2):
-        return [],[],True,idx
-    if ascii_processing(l,l2):
-        return [],[],True,idx
-    if asciiz_processing(l,l2):
-        return [],[],True,idx
-    if include_asm(l,l2):
-        return [],[],True,idx
-    if align_processing(l,l2):
-        return [],[],True,idx
-    if org_processing(l,l2):
-        return [],[],True,idx
-    if labelc_processing(l,l2):
-        return [],[],True,idx
-    if export_processing(l,l2):
-        return [],[],True,idx
-    if  l=="":
-        return [],[],False,idx
-    of=0
-    se=False
-    oerr=False
-    pln=0
-    pl=""
-    idxs=0
-    objl=[]
-    loopflag=True
-    for i in pat:
-        pln+=1
-        pl=i
-        for a in lower:
-            put_vars(a,VAR_UNDEF)
-        #
-        # i はパターンファイルのデータ
-        # l はアセンブリライン
-        #
-        if i is None: continue
-        if set_symbol(i): continue
-        if clear_symbol(i): continue
-        if paddingp(i): continue
-        if bits(i): continue
-        if symbolc(i): continue
-        if epic(i): continue
-        if vliwp(i): continue
-        lw=len([_ for _ in i if _])
-        if lw==0:
-            continue
-        lin=l+' '+l2
-        lin=reduce_spaces(lin)
-        if i[0]=='':
-            loopflag=False
-            break
-        error_undefined_label=False
-        
-        if not debug:
-            try:
-                if match0(lin,i[0])==True:
-                    error(i[1])
-                    objl=makeobj(i[2])
-                    idxs,_=expression0(i[3],0)
-                    loopflag=False
-                    break
-            except:
-                oerr=True
-                loopflag=False
-                break
-
-        else:
-             if match0(lin,i[0])==True:
-                 error(i[1])
-                 objl=makeobj(i[2])
-                 idxs,_=expression0(i[3],0)
-                 loopflag=False
-                 break
-
-    if loopflag==True:
-        se=True
-        pln=0
-        pl=""
-
-    if (pas==2 or pas==0):
-        if error_undefined_label:
-            print(f" error - undefined label error.")
-            return [],[],False,idx
-        if se:
-            print(f" error - Syntax error.")
-            return [],[],False,idx
-        if oerr:
-            print(f" ; pat {pln} {pl} error - Illegal syntax in assemble line or pattern line.")
-            return [],[],False,idx
-    return idxs,objl,True,idx
-
-def vliwprocess(line,idxs,objl,flag,idx):
-    global pc,vliwset,vliwstop
-    objs=[objl]
-    idxlst=[idxs]
-    vliwstop=0
-    while True:
-        idx=skipspc(line,idx)
-        if idx+4<=len(line) and line[idx:idx+4]=='!!!!':
-            idx+=4
-            vliwstop=1
-            continue
-        elif idx+2<=len(line) and line[idx:idx+2]=='!!':
-            idx+=2
-            idxs,objl,flag,idx=lineassemble2(line,idx)
-            objs+=[objl]
-            idxlst+=[idxs]
-            continue
-        else:
-            break
-
-    if vliwtemplatebits==0:
-        vliwset=[ [ [0], "0" ]]
-
-    vbits=abs(vliwbits)
-    for k in vliwset:
-        if list(set(k[0]))==list(set(idxlst)) or vliwtemplatebits==0:
-            im=2**vliwinstbits-1
-            tm=2**abs(vliwtemplatebits)-1
-            pm=2**vbits-1
-            (x,idx)=expression0(k[1],0)
-            templ=x&tm
-            vvv=0
-            q=0
-            values=[]
-            nob=vbits//8+(0 if vbits%8==0 else 1)
-            ibyte=vliwinstbits//8+(0 if vliwinstbits%8==0 else 1)
-            noi=(vbits-abs(vliwtemplatebits))//vliwinstbits
-
-
-            # バイナリコードを全部取ってきて足りない部分はNOPを足す
-            for j in objs:
-                i=vliwinstbits
-                for m in j:
-                    values+=[m]
-            for i in range (ibyte*noi-len(values)):
-                 values+=vliwnop
-            # values から、instructionを取り出す
-            v1=[]
-            cnt=0
-
-            for j in range(noi):
-                vv=0
-                for i in range(ibyte):
-                    vv<<=8
-                    if len(values)>cnt:
-                        vv|=values[cnt]&0xff
-                    cnt+=1
-                v1+=[vv&im]
-
-            # 全体のinstructionsのビットパターンを得る
-            r=0
-            for v in v1:
-                r=(r<<vliwinstbits)|v
-            r=r&pm
-
-            # templateを追加する
-
-            if vliwtemplatebits<0:
-                res=r|(templ<<(vbits-abs(vliwtemplatebits)))
-            else:
-                res=(r<<vliwtemplatebits)|templ
-
-            q=0
-            if vliwbits>0:
-                bc=vbits-8
-                vm=0xff<<bc
-                for cnt in range(vbits//8):
-                    outbin(pc+cnt,((res&vm)>>bc)&0xff)
-                    bc=bc-8
-                    vm>>=8
-                    q+=1
-            else:
-                for cnt in range(vbits//8):
-                    outbin(pc+cnt,res&0xff)
-                    res>>=8
-                    q+=1
-
-            pc+=q
-            break
-        else:
-            continue
-    else:
-        if pas==0 or pas==2:
-            print(" error - No vliw instruction-set defined.")
+    def asciistr(self, l2):
+        """Process ASCII string"""
+        idx = 0
+        if l2 == '' or l2[idx] != '"':
             return False
-    return True
-
-
-def lineassemble(line):
-    global pc,vliwflag,vcnt
-    line=line.replace('\t',' ').replace('\n','')
-    line=reduce_spaces(line)
-    line=remove_comment_asm(line)
-    if line=='':
-        return False
-    line=label_processing(line)
-    clear_symbol([".clearsym","",""])
-
-    parts = line.split("!!")
-    vcnt= sum(1 for p in parts if p != "")
-    
-    idxs,objl,flag,idx=lineassemble2(line,0)
-
-    if flag==False:
-        return False
-
-    if vliwflag==False or line[idx:idx+2]!='!!':
-        of=len(objl)
-        for cnt in range (of):
-            outbin(pc+cnt,objl[cnt])
-        pc+=of
-
-    else:
-        vflag=False
-        try:
-            vflag=vliwprocess(line,idxs,objl,flag,idx)
-        except:
-            if pas==0 or pas==2:
-                print(" error - Some error(s) in vliw definition.")
-        return vflag
-    return True
-
-def lineassemble0(line):
-    global cl,ln
-    cl=line.replace('\n','')
-    if pas==2 or pas==0:
-        print("%016x " % pc,end='')
-        print(f"{current_file} {ln} {cl} " ,end='')
-    f=lineassemble(cl)
-    if pas==2 or pas==0:
-        print("")
-    ln+=1
-    return f
-
-
-def option(l,o):
-    if o in l:
-        idx=l.index(o)
-        if idx+1<len(l):
-            if idx+2<len(l):
-                return l[0:idx]+l[idx+2:],l[idx+1]
+        idx += 1
+        
+        while idx < len(l2):
+            if l2[idx] == '"':
+                return True
+            if l2[idx:idx+2] == '\\0':
+                idx += 2
+                ch = chr(0)
+            elif l2[idx:idx+2] == '\\t':
+                idx += 2
+                ch = '\t'
+            elif l2[idx:idx+2] == '\\n':
+                idx += 2
+                ch = '\n'
             else:
-                return l[0:idx],l[idx+1]
-        else:
-            return l[0:idx],''
-    return l,''
-
-def file_input_from_stdin():
-    af=""
-    while True:
-        line=sys.stdin.readline().strip()
-        if line=='':
-            break
-        af+=line+'\n'
-    return af
-
-def setpatsymbols(pat):
-    global patsymbols,symbols
-    for i in pat:
-        if set_symbol(i): continue
-    patsymbols.update(symbols)
-
-def fileassemble(fn):
-    global current_file,fnstack,lnstack,ln,lines
+                ch = l2[idx]
+                idx += 1
+            self.binary_writer.outbin(self.state.pc, ord(ch))
+            self.state.pc += 1
     
-    fnstack+=[current_file]
-    lnstack+=[ln]
-    current_file=fn
-    ln=1
+    def export_processing(self, l1, l2):
+        """Export directive"""
+        if not (self.state.pas == 2 or self.state.pas == 0):
+            return False
+        if StringUtils.upper(l1) != ".EXPORT":
+            return False
+        
+        idx = 0
+        l2 += chr(0)
+        while idx < len(l2) and l2[idx] != chr(0):
+            idx = StringUtils.skipspc(l2, idx)
+            s, idx = self.parser.get_label_word(l2, idx)
+            if s == "":
+                break
+            if idx < len(l2) and l2[idx] == ':':
+                idx += 1
+            v = self.label_manager.get_value(s)
+            sec = self.label_manager.get_section(s)
+            self.state.export_labels[s] = [v, sec]
+            if idx < len(l2) and l2[idx] == ',':
+                idx += 1
+        return True
+    
+    def zero_processing(self, l1, l2):
+        """Zero directive"""
+        if StringUtils.upper(l1) != ".ZERO":
+            return False
+        x, idx = self.expr_eval.expression_asm(l2, 0)
+        for i in range(x + 1):
+            self.binary_writer.outbin2(self.state.pc, 0x00)
+            self.state.pc += 1
+        return True
+    
+    def ascii_processing(self, l1, l2):
+        """ASCII directive"""
+        if StringUtils.upper(l1) != ".ASCII":
+            return False
+        return self.asciistr(l2)
+    
+    def asciiz_processing(self, l1, l2):
+        """ASCIIZ directive"""
+        if StringUtils.upper(l1) != ".ASCIIZ":
+            return False
+        f = self.asciistr(l2)
+        if f:
+            self.binary_writer.outbin(self.state.pc, 0x00)
+            self.state.pc += 1
+        return True
+    
+    def section_processing(self, l1, l2):
+        """Section directive"""
+        if StringUtils.upper(l1) != "SECTION" and StringUtils.upper(l1) != "SEGMENT":
+            return False
+        
+        if l2 != '':
+            self.state.current_section = l2
+            self.state.sections[l2] = [self.state.pc, 0]
+        return True
+    
+    def align_processing(self, l1, l2):
+        """Align directive"""
+        if StringUtils.upper(l1) != ".ALIGN":
+            return False
+        
+        if l2 != '':
+            u, idx = self.expr_eval.expression_asm(l2, 0)
+            self.state.align = int(u)
+        
+        self.state.pc = self.binary_writer.align_(self.state.pc)
+        return True
+    
+    def endsection_processing(self, l1, l2):
+        """End section directive"""
+        if StringUtils.upper(l1) != "ENDSECTION" and StringUtils.upper(l1) != "ENDSEGMENT":
+            return False
+        start = self.state.sections[self.state.current_section][0]
+        self.state.sections[self.state.current_section] = [start, self.state.pc - start]
+        return True
+    
+    def org_processing(self, l1, l2):
+        """ORG directive"""
+        if StringUtils.upper(l1) != ".ORG":
+            return False
+        u, idx = self.expr_eval.expression_asm(l2, 0)
+        if idx + 2 <= len(l2) and l2[idx:idx+2].upper() == ',P':
+            if u > self.state.pc:
+                for i in range(u - self.state.pc):
+                    self.binary_writer.outbin2(i + self.state.pc, self.state.padding)
+        self.state.pc = u
+        return True
 
-    if fn=="stdin":
-        if pas!=2 and pas!=0:
-            af=file_input_from_stdin()
-            with open("axx.tmp","wt") as stdintmp:
-                stdintmp.write(af)
+
+class Assembler:
+    """Main assembler class"""
+    
+    def __init__(self):
+        self.state = AssemblerState()
+        self.parser = Parser(self.state)
+        self.var_manager = VariableManager(self.state)
+        self.label_manager = LabelManager(self.state)
+        self.symbol_manager = SymbolManager(self.state)
+        self.expr_eval = ExpressionEvaluator(self.state, self.var_manager, 
+                                            self.label_manager, self.symbol_manager, self.parser)
+        self.binary_writer = BinaryWriter(self.state)
+        self.directive_proc = DirectiveProcessor(self.state, self.expr_eval, self.binary_writer)
+        self.pattern_matcher = PatternMatcher(self.state, self.expr_eval, self.var_manager, 
+                                             self.symbol_manager, self.parser)
+        self.pattern_reader = PatternFileReader(self.parser)
+        self.obj_gen = ObjectGenerator(self.state, self.expr_eval, self.binary_writer)
+        self.vliw_proc = VLIWProcessor(self.state, self.expr_eval, self.binary_writer)
+        self.asm_directive_proc = AssemblyDirectiveProcessor(self.state, self.expr_eval, 
+                                                             self.binary_writer, self.label_manager, self.parser)
+    
+    def include_asm(self, l1, l2):
+        """Include directive"""
+        if StringUtils.upper(l1) != ".INCLUDE":
+            return False
+        s = StringUtils.get_string(l2)
+        if s:
+            self.fileassemble(s)
+        return True
+    
+    def lineassemble2(self, line, idx):
+        """Assemble line (phase 2)"""
+        l, idx = StringUtils.get_param_to_spc(line, idx)
+        l2, idx = StringUtils.get_param_to_eon(line, idx)
+        l = l.rstrip()
+        l2 = l2.rstrip()
+        l = l.replace(' ', '')
+        
+        if self.asm_directive_proc.section_processing(l, l2):
+            return [], [], True, idx
+        if self.asm_directive_proc.endsection_processing(l, l2):
+            return [], [], True, idx
+        if self.asm_directive_proc.zero_processing(l, l2):
+            return [], [], True, idx
+        if self.asm_directive_proc.ascii_processing(l, l2):
+            return [], [], True, idx
+        if self.asm_directive_proc.asciiz_processing(l, l2):
+            return [], [], True, idx
+        if self.include_asm(l, l2):
+            return [], [], True, idx
+        if self.asm_directive_proc.align_processing(l, l2):
+            return [], [], True, idx
+        if self.asm_directive_proc.org_processing(l, l2):
+            return [], [], True, idx
+        if self.asm_directive_proc.labelc_processing(l, l2):
+            return [], [], True, idx
+        if self.asm_directive_proc.export_processing(l, l2):
+            return [], [], True, idx
+        if l == "":
+            return [], [], False, idx
+        
+        of = 0
+        se = False
+        oerr = False
+        pln = 0
+        pl = ""
+        idxs = 0
+        objl = []
+        loopflag = True
+        
+        for i in self.state.pat:
+            pln += 1
+            pl = i
+            for a in LOWER:
+                self.var_manager.put(a, VAR_UNDEF)
+            
+            if i is None:
+                continue
+            if self.directive_proc.set_symbol(i):
+                continue
+            if self.directive_proc.clear_symbol(i):
+                continue
+            if self.directive_proc.paddingp(i):
+                continue
+            if self.directive_proc.bits(i):
+                continue
+            if self.directive_proc.symbolc(i):
+                continue
+            if self.directive_proc.epic(i):
+                continue
+            if self.directive_proc.vliwp(i):
+                continue
+            
+            lw = len([_ for _ in i if _])
+            if lw == 0:
+                continue
+            
+            lin = l + ' ' + l2
+            lin = StringUtils.reduce_spaces(lin)
+            
+            if i[0] == '':
+                loopflag = False
+                break
+            
+            self.state.error_undefined_label = False
+            
+            if not self.state.debug:
+                try:
+                    if self.pattern_matcher.match0(lin, i[0]) == True:
+                        self.directive_proc.error(i[1])
+                        objl = self.obj_gen.makeobj(i[2])
+                        idxs, _ = self.expr_eval.expression_pat(i[3], 0)
+                        loopflag = False
+                        break
+                except:
+                    oerr = True
+                    loopflag = False
+                    break
+            else:
+                if self.pattern_matcher.match0(lin, i[0]) == True:
+                    self.directive_proc.error(i[1])
+                    objl = self.obj_gen.makeobj(i[2])
+                    idxs, _ = self.expr_eval.expression_pat(i[3], 0)
+                    loopflag = False
+                    break
+        
+        if loopflag == True:
+            se = True
+            pln = 0
+            pl = ""
+        
+        if self.state.pas == 2 or self.state.pas == 0:
+            if self.state.error_undefined_label:
+                print(f" error - undefined label error.")
+                return [], [], False, idx
+            if se:
+                print(f" error - Syntax error.")
+                return [], [], False, idx
+            if oerr:
+                print(f" ; pat {pln} {pl} error - Illegal syntax in assemble line or pattern line.")
+                return [], [], False, idx
+        
+        return idxs, objl, True, idx
+    
+    def lineassemble(self, line):
+        """Assemble single line"""
+        line = line.replace('\t', ' ').replace('\n', '')
+        line = StringUtils.reduce_spaces(line)
+        line = StringUtils.remove_comment_asm(line)
+        if line == '':
+            return False
+        
+        line = self.asm_directive_proc.label_processing(line)
+        self.directive_proc.clear_symbol([".clearsym", "", ""])
+        
+        parts = line.split("!!")
+        self.state.vcnt = sum(1 for p in parts if p != "")
+        
+        idxs, objl, flag, idx = self.lineassemble2(line, 0)
+        
+        if flag == False:
+            return False
+        
+        if self.state.vliwflag == False or (idx >= len(line) or line[idx:idx+2] != '!!'):
+            of = len(objl)
+            for cnt in range(of):
+                self.binary_writer.outbin(self.state.pc + cnt, objl[cnt])
+            self.state.pc += of
         else:
+            vflag = False
+            try:
+                vflag = self.vliw_proc.vliwprocess(line, idxs, objl, flag, idx, self.lineassemble2)
+            except:
+                if self.state.pas == 0 or self.state.pas == 2:
+                    print(" error - Some error(s) in vliw definition.")
+            return vflag
+        
+        return True
+    
+    def lineassemble0(self, line):
+        """Assemble line with output"""
+        self.state.cl = line.replace('\n', '')
+        if self.state.pas == 2 or self.state.pas == 0:
+            print("%016x " % self.state.pc, end='')
+            print(f"{self.state.current_file} {self.state.ln} {self.state.cl} ", end='')
+        f = self.lineassemble(self.state.cl)
+        if self.state.pas == 2 or self.state.pas == 0:
+            print("")
+        self.state.ln += 1
+        return f
+    
+    def setpatsymbols(self, pat):
+        """Set pattern symbols"""
+        for i in pat:
+            if self.directive_proc.set_symbol(i):
+                continue
+        self.state.patsymbols.update(self.state.symbols)
+    
+    def fileassemble(self, fn):
+        """Assemble file"""
+        self.state.fnstack += [self.state.current_file]
+        self.state.lnstack += [self.state.ln]
+        self.state.current_file = fn
+        self.state.ln = 1
+        
+        if fn == "stdin":
+            if self.state.pas != 2 and self.state.pas != 0:
+                af = self.file_input_from_stdin()
+                with open("axx.tmp", "wt") as stdintmp:
+                    stdintmp.write(af)
+            fn = "axx.tmp"
+        
+        f = open(fn, "rt")
+        af = f.readlines()
+        f.close()
+        
+        for i in af:
+            self.lineassemble0(i)
+        
+        if self.state.fnstack:
+            self.state.current_file = self.state.fnstack.pop()
+            self.state.ln = self.state.lnstack.pop()
+    
+    def file_input_from_stdin(self):
+        """Read input from stdin"""
+        af = ""
+        while True:
+            line = sys.stdin.readline().strip()
+            if line == '':
+                break
+            af += line + '\n'
+        return af
+    
+    def imp_label(self, l):
+        """Import label"""
+        idx = StringUtils.skipspc(l, 0)
+        section, idx = self.parser.get_label_word(l, idx)
+        idx = StringUtils.skipspc(l, 0)
+        label, idx = self.parser.get_label_word(l, idx)
+        if label == '':
+            return False
+        idx = StringUtils.skipspc(l, idx)
+        v, new_idx = self.expr_eval.expression(l, idx)
+        if new_idx == idx:
+            return False
+        idx = new_idx
+        self.label_manager.put_value(label, v, section)
+        return True
+    
+    def option(self, l, o):
+        """Parse command line option"""
+        if o in l:
+            idx = l.index(o)
+            if idx + 1 < len(l):
+                if idx + 2 < len(l):
+                    return l[0:idx] + l[idx+2:], l[idx+1]
+                else:
+                    return l[0:idx], l[idx+1]
+            else:
+                return l[0:idx], ''
+        return l, ''
+    
+    def printaddr(self, pc):
+        """Print address"""
+        print("%016x: " % pc, end='')
+    
+    def run(self):
+        """Main assembly process"""
+        if len(sys.argv) == 1:
+            print("axx general assembler programmed and designed by Taisuke Maekawa")
+            print("Usage: python axx.py patternfile.axx [sourcefile.s] [-o outfile.bin] [-e export_labels.tsv] [-i import_labels.tsv]")
+            return
+        
+        sys_argv = sys.argv
+        
+        if len(sys_argv) >= 2:
+            self.state.pat = self.pattern_reader.readpat(sys_argv[1])
+            self.setpatsymbols(self.state.pat)
+        
+        sys_argv, self.state.expfile = self.option(sys_argv, "-e")
+        sys_argv, expefile = self.option(sys_argv, "-E")
+        sys_argv, self.state.outfile = self.option(sys_argv, '-o')
+        sys_argv, self.state.impfile = self.option(sys_argv, "-i")
+        
+        if self.state.impfile != "":
+            with open(self.state.impfile, "rt") as label_file:
+                while True:
+                    l = label_file.readline()
+                    if not l:
+                        break
+                    self.imp_label(l)
+        
+        try:
+            os.remove(self.state.outfile)
+        except:
             pass
-        fn="axx.tmp"
+        
+        if self.state.outfile:
+            f = open(self.state.outfile, "wb")
+            f.close()
+        
+        if len(sys_argv) == 2:
+            self.state.pc = 0
+            self.state.pas = 0
+            self.state.ln = 1
+            self.state.current_file = "(stdin)"
+            while True:
+                self.printaddr(self.state.pc)
+                try:
+                    line = input(">> ")
+                    line = line.replace("\\\\", "\\")
+                except EOFError:
+                    break
+                line = line.strip()
+                if line == "":
+                    continue
+                self.lineassemble0(line)
+        
+        elif len(sys_argv) >= 3:
+            self.state.pc = 0
+            self.state.pas = 1
+            self.state.ln = 1
+            self.fileassemble(sys.argv[2])
+            self.state.pc = 0
+            self.state.pas = 2
+            self.state.ln = 1
+            self.fileassemble(sys.argv[2])
+        
+        if expefile != "":
+            self.state.expfile = expefile
+            elf = 1
+        else:
+            elf = 0
+        
+        if self.state.expfile != "":
+            h = list(self.state.export_labels.items())
+            key = list(self.state.sections.keys())
+            with open(self.state.expfile, "wt") as label_file:
+                for i in key:
+                    if i == '.text' and elf == 1:
+                        flag = 'AX'
+                    elif i == '.data' and elf == 1:
+                        flag = 'WA'
+                    else:
+                        flag = ''
+                    start = self.state.sections[i][0]
+                    label_file.write(f"{i}\t{start:#x}\t{self.state.sections[i][1]:#x}\t{flag}\n")
+                for i in h:
+                    label_file.write(f"{i[0]}\t{i[1][0]:#x}\n")
 
-    f=open(fn,"rt")
-    af=f.readlines()
-    f.close()
-
-    for i in af:
-        lineassemble0(i)
-
-    if fnstack:
-        current_file=fnstack.pop()
-        ln=lnstack.pop()
-
-def imp_label(l):
-    global labels
-    idx=skipspc(l,0)
-    (section,idx)=get_label_word(l,idx)
-    idx=skipspc(l,0)
-    (label,idx)=get_label_word(l,idx)
-    if label=='':
-        return False
-    idx=skipspc(l,idx)
-    (v,new_idx)=expression(l,idx)
-    if new_idx==idx:
-        return False
-    idx=new_idx
-    put_label_value(label,v,section)
-    return True
 
 def main():
-    global pc,pas,ln,outfile,expfile,impfile,current_file,pat
+    """Main entry point"""
+    assembler = Assembler()
+    assembler.run()
 
-    if len(sys.argv)==1:
-        print("axx general assembler programmed and designed by Taisuke Maekawa")
-        print("Usage: python axx.py patternfile.axx [sourcefile.s] [-o outfile.bin] [-e export_labels.tsv] [-i import_labels.tsv]")
-        return
 
-    sys_argv=sys.argv
-
-    if len(sys_argv)>=2:
-        pat=readpat(sys_argv[1])
-        setpatsymbols(pat)
-
-    (sys_argv,expfile)=option(sys_argv,"-e")
-    (sys_argv,expefile)=option(sys_argv,"-E")
-    (sys_argv,outfile)=option(sys_argv,'-o')
-    (sys_argv,impfile)=option(sys_argv,"-i")
-
-    if impfile!="":
-        with open(impfile,"rt") as label_file:
-            while True:
-                l=label_file.readline()
-                if not l:
-                    break
-                imp_label(l)
-
-    try:
-        os.remove(outfile)
-    except:
-        pass
-    else:
-        pass
-
-    if outfile:
-        f=open(outfile,"wb")
-        f.close()
-
-    if len(sys_argv)==2:
-        pc=0
-        pas=0
-        ln=1
-        current_file="(stdin)"
-        while True:
-            printaddr(pc)
-            try:
-                line=input(">> ")
-                line=line.replace("\\\\","\\")
-            except EOFError: # EOF
-                break
-            line=line.strip()
-            if line=="":
-                continue
-            lineassemble0(line)
-
-    elif len(sys_argv)>=3:
-        pc=0
-        pas=1
-        ln=1
-        fileassemble(sys.argv[2])
-        pc=0
-        pas=2
-        ln=1
-        fileassemble(sys.argv[2])
-
-    if expefile!="":
-        expfile=expefile
-        elf=1
-    else:
-        elf=0
-
-    if expfile!="":
-        h=list(export_labels.items())
-        key=list(sections.keys())
-        with open(expfile,"wt") as label_file:
-            for i in key:
-                if i=='.text' and elf==1:
-                    flag='AX'
-                elif i=='.data' and elf==1:
-                    flag='WA'
-                else:
-                    flag=''
-                start=sections[i][0]
-                label_file.write(f"{i}\t{start:#x}\t{sections[i][1]:#x}\t{flag}\n")
-            for i in h:
-                label_file.write(f"{i[0]}\t{i[1][0]:#x}\n")
-
-if __name__=='__main__':
+if __name__ == '__main__':
     main()
     exit(0)
