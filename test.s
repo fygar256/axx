@@ -6,3 +6,4 @@ st1 {v0.4s},[x0]
 add r1, r2, r3 lsl #20
 rep movsb
 movsb
+load a,[b]
