@@ -12,7 +12,7 @@ Original article in Japanee:Qiita: https://qiita.com/fygar256/items/1d06fb757ac4
 
 Ruby version and Go version are also available. Ruby version is Raxx and Go version is Gaxx. Go version is much faster than Python version and Ruby version.
 
-##### initialization,build and execution for go version
+##### initialization,build and execution for go version　'Gaxx'
 
 ```
 go mod init axx # initialization
@@ -20,7 +20,7 @@ go build -o axx axx.go # build
 axx z80.axx z80.s [option] # execution
 ```
 
-##### execution for Ruby version
+##### execution for Ruby version 'Raxx'
 
 ```
 chmod +x axx.rb
