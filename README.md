@@ -733,6 +733,8 @@ LISP machine programs are not assembly language.
 
 - For now, when the linker loader specifies option `-i`, it imports labels from the TSV file, and when the option `-e` is specified, the label specified in .export is exported to the file in TSV along with the section/segment to which the label belongs, so this is used.
 
+- Creating axx pattern files is difficult for large ISAs, and since the specifications have been fixed, I'm wondering if AI can do it.
+
 ## Items not yet implemented
 
 - Make it compatible with the linker.
