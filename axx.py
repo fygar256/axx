@@ -598,6 +598,18 @@ class ExpressionEvaluator:
             x, idx = self.expression(s, idx + 1)
             if idx < len(s) and s[idx] == ')':
                 idx += 1
+        elif idx+4<len(s) and s[idx:idx+4]=="'\\t'":
+            x=0x09
+            idx+=4
+        elif idx+4<len(s) and s[idx:idx+4]=="'\\''":
+            x=ord("'")
+            idx+=4
+        elif idx+4<len(s) and s[idx:idx+4]=="'\\\\'":
+            x=ord("\\")
+            idx+=4
+        elif idx+4<len(s) and s[idx:idx+4]=="'\\n'":
+            x=0x0a
+            idx+=4
         elif idx+3<len(s) and s[idx]=='\'' and s[idx+2]=='\'':
             x=ord(s[idx+1])
             idx+=3
