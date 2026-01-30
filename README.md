@@ -525,6 +525,7 @@ flt{x},dbl{x}        Operators that convert x to float and double bytecodes, res
 qad(x)               Operators that convert x to a 128-bit floating point number. However, in this case, x can only be a constant.
 *(x,y)               yth byte from the lowest value of x (y>=0)
 -,~                  Negative, bitwise NOT
+'c'                  character code of 'c'
 @                    Unary operator that returns the bit position from the right of the most significant bit of the value that follows
 :=                   Assignment operator
 **                   Power
