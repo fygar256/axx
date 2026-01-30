@@ -598,6 +598,9 @@ class ExpressionEvaluator:
             x, idx = self.expression(s, idx + 1)
             if idx < len(s) and s[idx] == ')':
                 idx += 1
+        elif idx+3<len(s) and s[idx]=='\'' and s[idx+2]=='\'':
+            x=ord(s[idx+1])
+            idx+=3
         elif StringUtils.q(s, '$$', idx):
             idx += 2
             x = self.state.pc
