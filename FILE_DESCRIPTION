@@ -12,7 +12,7 @@ axx.py.org                          axx in python not refactored
 axx.rb                              axx in ruby
 axxgirl.png                         mascot character picture file
 bf.axx                              pattern file for brainfuck virtual CPU system
-bf.s                                test assemble file for brainfuck virtual CPU
+bf.s                                hello world test assemble file for brainfuck virtual CPU
 format_of_exp_imp_file              format description for export/import file
 hello.axx                           pattern file for x86_64 hello world
 hello.bin                           binary file of hello world for x86_64
