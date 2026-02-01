@@ -1832,7 +1832,7 @@ class Assembler:
         """Import label"""
         idx = StringUtils.skipspc(l, 0)
         section, idx = self.parser.get_label_word(l, idx)
-        idx = StringUtils.skipspc(l, 0)
+        idx = StringUtils.skipspc(l, idx)
         label, idx = self.parser.get_label_word(l, idx)
         if label == '':
             return False
