@@ -267,7 +267,22 @@ func getCurlb(s string, idx int) (bool, string, int) {
 func factor(s string, idx int) (int64, int) {
     idx = skipspc(s, idx)
     var x int64
-    if idx+4 <= len(s) && s[idx:idx+4] == "!!!!" && ExpMode == EXP_PAT {
+    if idx+4<=len(s) && s[idx:idx+4] == "'\\n'" {
+        idx+=4
+        x=0x0a
+    } else if idx+4<=len(s) && s[idx:idx+4] == "'\\t'" {
+        idx+=4
+        x=0x09
+    } else if idx+3<=len(s) && s[idx:idx+3] == "'\\'" {
+        idx+=3
+        x=int64('\\')
+    } else if idx+4<=len(s) && s[idx:idx+4] == "'\\''" {
+        idx+=4
+        x=int64('\'')
+    } else if idx+3<=len(s) && s[idx] == '\'' && s[idx+2]=='\'' {
+        x=int64(s[idx+1])
+        idx+=3
+    } else if idx+4 <= len(s) && s[idx:idx+4] == "!!!!" && ExpMode == EXP_PAT {
         x = VliwStop
         idx += 4
     } else if idx+3 <= len(s) && s[idx:idx+3] == "!!!" && ExpMode == EXP_PAT {
