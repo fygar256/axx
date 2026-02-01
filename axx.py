@@ -509,7 +509,14 @@ class LabelManager:
         self.state.labels[k] = [v, s]
         return True
 
-
+    def printlabels(self):
+        result = {}
+        for key, value in self.state.labels.items():
+            num, section = value
+            result[key] = [hex(num), section]
+        print(result)
+        return
+        
 class SymbolManager:
     """Manages assembler symbols"""
     
@@ -1910,6 +1917,9 @@ class Assembler:
                     break
                 line = line.strip()
                 if line == "":
+                    continue
+                if line == "?":
+                    self.label_manager.printlabels()
                     continue
                 self.lineassemble0(line)
         
