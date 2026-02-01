@@ -14,7 +14,7 @@ C version, Ruby version and Go version are also available. C version is Caxx, Ru
 
 When using the Ruby version of axx, please change the talisman `ptint` to `print`.
 
-#### compile c version
+#### compile c version 'Caxx'
 
 make sure the include file bigint_simple.h is in current directory.
 
