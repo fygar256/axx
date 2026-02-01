@@ -565,6 +565,10 @@ The binary operator `**` is exponentiation.
 
 The ternary operator `?:`, for example `x?a:b`, will return a if x is true and b if it is false.
 
+### Prompt Mode
+
+When the prompt `>>>` appears and you enter text from the keyboard, you can use the label display command `?`.
+
 ## Example of binary output
 
 ```
