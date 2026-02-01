@@ -10,16 +10,25 @@ It was written in python, so the nickname is Paxx.
 
 Original article in Japanee:Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
 
-Ruby version and Go version are also available. Ruby version is Raxx and Go version is Gaxx. Go version is much faster than Python version and Ruby version.
+C version, Ruby version and Go version are also available. C version is Caxx, Ruby version is Raxx and Go version is Gaxx. C and Go version are much faster than Python version and Ruby version.
 
 When using the Ruby version of axx, please change the talisman `ptint` to `print`.
+
+#### compile c version
+
+make sure the include file bigint_simple.h is in current directory.
+
+```
+cc -o caxx axx.c -lm -O2
+caxx z80.axx z80.s [ option ] # execution
+```
 
 ##### initialization,build and execution for go version　'Gaxx'
 
 ```
 go mod init axx # initialization
-go build -o axx axx.go # build
-axx z80.axx z80.s [option] # execution
+go build -o gaxx axx.go # build
+gaxx z80.axx z80.s [option] # execution
 ```
 
 ##### execution for Ruby version 'Raxx'
