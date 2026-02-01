@@ -1,4 +1,3 @@
-#include "bigint_simple.h"
 // axx general assembler - Complete C translation
 // Programmed and designed by Taisuke Maekawa
 // C translation maintains full compatibility
@@ -20,6 +19,93 @@
 #define MAX_PAT 10000
 #define MAX_FIELDS 10
 #define UNDEF_VAL -1
+
+// bigint_simple.h
+
+#ifndef BIGINT_SIMPLE_H
+#define BIGINT_SIMPLE_H
+#include <stdint.h>
+#include <string.h>
+
+// 256-bit integer (4 x 64-bit words) for VLIW
+typedef struct {
+    uint64_t w[4];
+} bigint_t;
+
+static inline void bi_zero(bigint_t *a) {
+    memset(a->w, 0, sizeof(a->w));
+}
+
+static inline void bi_set(bigint_t *a, int64_t val) {
+    bi_zero(a);
+    a->w[0] = val;
+}
+
+static inline void bi_lsh(bigint_t *r, const bigint_t *a, int bits) {
+    *r = *a;
+    if (bits >= 256) { bi_zero(r); return; }
+    
+    int ws = bits / 64;
+    int bs = bits % 64;
+    
+    if (ws > 0) {
+        for (int i = 3; i >= ws; i--) r->w[i] = r->w[i - ws];
+        for (int i = 0; i < ws; i++) r->w[i] = 0;
+    }
+    
+    if (bs > 0) {
+        uint64_t c = 0;
+        for (int i = 0; i < 4; i++) {
+            uint64_t nc = r->w[i] >> (64 - bs);
+            r->w[i] = (r->w[i] << bs) | c;
+            c = nc;
+        }
+    }
+}
+
+static inline void bi_rsh(bigint_t *r, const bigint_t *a, int bits) {
+    *r = *a;
+    if (bits >= 256) { bi_zero(r); return; }
+    
+    int ws = bits / 64;
+    int bs = bits % 64;
+    
+    if (ws > 0) {
+        for (int i = 0; i < 4 - ws; i++) r->w[i] = r->w[i + ws];
+        for (int i = 4 - ws; i < 4; i++) r->w[i] = 0;
+    }
+    
+    if (bs > 0) {
+        for (int i = 0; i < 4; i++) {
+            uint64_t c = (i + 1 < 4) ? (r->w[i + 1] << (64 - bs)) : 0;
+            r->w[i] = (r->w[i] >> bs) | c;
+        }
+    }
+}
+
+static inline void bi_or(bigint_t *r, const bigint_t *a, const bigint_t *b) {
+    for (int i = 0; i < 4; i++) r->w[i] = a->w[i] | b->w[i];
+}
+
+static inline void bi_and(bigint_t *r, const bigint_t *a, const bigint_t *b) {
+    for (int i = 0; i < 4; i++) r->w[i] = a->w[i] & b->w[i];
+}
+
+static inline void bi_sub(bigint_t *r, const bigint_t *a, const bigint_t *b) {
+    uint64_t borrow = 0;
+    for (int i = 0; i < 4; i++) {
+        uint64_t old = a->w[i];
+        r->w[i] = old - b->w[i] - borrow;
+        borrow = (r->w[i] > old || (borrow && r->w[i] == old)) ? 1 : 0;
+    }
+}
+
+static inline int64_t bi_get(const bigint_t *a) {
+    return a->w[0];
+}
+
+#endif
+// END of bigint_simple.h
 
 // Global constants
 static char OB[2] = {(char)0x90, 0};
@@ -1478,37 +1564,72 @@ static int64_t align_(int64_t addr) {
 }
 
 static void errorDirective(const char *s) {
-    if (!s || s[0] == '\0') return;
-    
-    // Remove all spaces
+    if (!s || s[0] == '\0') {
+        return;
+    }
+
+    // 先頭・末尾の空白をスキップして実質的な内容を確認
+    const char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0') {
+        return;  // 空白のみ → 何もしない
+    }
+
+    // スペースを全て削除したバージョンを生成
     char ss[MAX_LINE];
     int j = 0;
     for (int i = 0; s[i] && j < MAX_LINE - 1; i++) {
-        if (s[i] != ' ') {
+        if (s[i] != ' ' && s[i] != '\t') {
             ss[j++] = s[i];
         }
     }
     ss[j] = '\0';
-    
-    if (ss[0] == '\0') return;
-    
+
+    // 内容が空になった場合も早期リターン
+    if (ss[0] == '\0') {
+        return;
+    }
+
     int idx = 0;
+    int safeguard = 0;
+
     while (idx < (int)strlen(s) && safe_char(s, idx) != 0) {
+        // 無限ループ防止
+        if (++safeguard > 10000) {
+            printf("Infinite loop detected in errorDirective: input='%s'\n", s);
+            return;
+        }
+
         if (s[idx] == ',') {
             idx++;
             continue;
         }
-        
+
         int64_t u;
+        int old_idx = idx;
         idx = expression0(s, idx, &u);
-        
+
+        // expression0 が進まなかった場合（無効な文字など）
+        if (idx == old_idx && s[idx] != '\0') {
+            // 1文字進める（ハング防止）
+            idx++;
+            continue;
+        }
+
         if (safe_char(s, idx) == ';') {
             idx++;
         }
-        
+
         int64_t t;
+        old_idx = idx;
         idx = expression0(s, idx, &t);
-        
+
+        if (idx == old_idx && s[idx] != '\0') {
+            idx++;
+            continue;
+        }
+
+        // 出力（Pas == 2 || Pas == 0 のとき）
         if ((Pas == 2 || Pas == 0) && u != 0) {
             printf("Line %d Error code %ld ", Ln, t);
             if (t >= 0 && t < (int64_t)(sizeof(Errors)/sizeof(Errors[0]))) {
