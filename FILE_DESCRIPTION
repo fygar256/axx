@@ -6,11 +6,13 @@ File description
 LICENSE                             license
 README.md                           readme
 URL_to_newest_article_in_Japanese   as it is
-axx.go                              axx in go
-axx.py                              axx in python
+axx.c                               axx in C 'Caxx'
+axx.go                              axx in go 'Gaxx'
+axx.py                              axx in python 'Paxx'
 axx.py.org                          axx in python not refactored
-axx.rb                              axx in ruby
+axx.rb                              axx in ruby 'Raxx'
 axxgirl.png                         mascot character picture file
+bigint_simple.h                     caxx headerfie
 bf.axx                              pattern file for brainfuck virtual CPU system
 bf.s                                hello world test assemble file for brainfuck virtual CPU
 format_of_exp_imp_file              format description for export/import file
