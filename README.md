@@ -22,9 +22,6 @@ make sure the include file bigint_simple.h is in current directory.
 cc -o caxx axx.c -lm -O2
 caxx z80.axx z80.s [ option ] # execution
 ```
-
-There is a difference for Caxx from Paxx. When writing VLIW/EPIC pattern file without error_pattern, the delimiter should be described `::` for Caaxx but for Paxx, the delimiter is `:: ::`.
-
 ##### initialization,build and execution for go version　'Gaxx'
 
 ```
