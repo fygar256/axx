@@ -14,6 +14,25 @@ C version, Ruby version and Go version are also available. C version is Caxx, Ru
 
 When using the Ruby version of axx, please change the talisman `ptint` to `print`.
 
+## install and execution(assemble) Python version 'Paxx'
+
+```
+# install
+git clone https://github.com/fygar256/axx.git
+cd axx
+chmod +x axx.py
+sudo cp axx.py /usr/local/bin/axx　# or sudo cp axx.py /usr/local/bin/paxx
+
+# execution(assemble)
+paxx patternfile.axx [source.s] [-o outfile.bin] [-e expfile.tsv] [-i impfile.tsv]
+```
+
+patternfile.axx --- pattern file
+source.s --- assembly source
+outfile.bin --- raw binary output file
+expfile.tsv --- section and label information export file
+impfile.tsv --- section and label information import file
+
 #### compile c version 'Caxx'
 
 ```
@@ -60,28 +79,6 @@ The results are output as text to standard output, and if an argument is specifi
 
 In axx, lines input from an assembly language source file or standard input are named assembly lines.
 # Explanation
-
-## install and execution(assemble)
-
-```
-# install (archlinux)
-yay -S axx
-
-# install
-git clone https://github.com/fygar256/axx.git
-cd axx
-chmod +x axx.py
-sudo cp axx.py /usr/bin/axx
-
-# execution(assemble)
-axx patternfile.axx [source.s] [-o outfile.bin] [-e expfile.tsv] [-i impfile.tsv]
-```
-
-patternfile.axx --- pattern file
-source.s --- assembly source
-outfile.bin --- raw binary output file
-expfile.tsv --- section and label information export file
-impfile.tsv --- section and label information import file
 
 ## Explanation of pattern file
 
