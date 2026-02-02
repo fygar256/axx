@@ -21,7 +21,7 @@ When using the Ruby version of axx, please change the talisman `ptint` to `print
 git clone https://github.com/fygar256/axx.git
 cd axx
 chmod +x axx.py
-sudo cp axx.py /usr/local/bin/axx　# or sudo cp axx.py /usr/local/bin/paxx
+sudo cp axx.py /usr/local/bin/paxx
 
 # execution(assemble)
 paxx patternfile.axx [source.s] [-o outfile.bin] [-e expfile.tsv] [-i impfile.tsv]
@@ -54,7 +54,8 @@ gaxx z80.axx z80.s [option] # execution
 
 ```
 chmod +x axx.rb
-axx.rb z80.axx z80.s [option] # execution
+sudo cp axx.rb /usr/local/bin/raxx 
+raxx z80.axx z80.s [option] # execution
 ```
 
 # Test environment
