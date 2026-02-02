@@ -2507,7 +2507,7 @@ static bool vliwprocess(const char *line, int64_t idxs, int64_t *objl, int objl_
         
         // Pad with nop bytes
         int ibyte = (VliwInstBits + 7) / 8;
-        int noi = (vbits - abs(VliwTemplateBits)) / VliwInstBits;
+        int noi = (vbits - labs(VliwTemplateBits)) / VliwInstBits;
         int needed = ibyte * noi;
         
         while (values_count < needed) {
@@ -2548,12 +2548,12 @@ static bool vliwprocess(const char *line, int64_t idxs, int64_t *objl, int objl_
         }
         
         // Add template bits
-        __uint128_t tm = ((__uint128_t)1 << abs(VliwTemplateBits)) - 1;
+        __uint128_t tm = ((__uint128_t)1 << labs(VliwTemplateBits)) - 1;
         __uint128_t templ = (__uint128_t)templ_val & tm;
         
         __uint128_t res;
         if (VliwTemplateBits < 0) {
-            res = r | (templ << (vbits - abs(VliwTemplateBits)));
+            res = r | (templ << (vbits - labs(VliwTemplateBits)));
         } else {
             res = (r << VliwTemplateBits) | templ;
         }
@@ -2741,5 +2741,3 @@ int main(int argc, char *argv[]) {
     
     return 0;
 }
-
-// Missing impLabel implementation
