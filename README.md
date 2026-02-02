@@ -20,6 +20,9 @@ When using the Ruby version of axx, please change the talisman `ptint` to `print
 cc -o caxx axx.c -lm -O2
 caxx z80.axx z80.s [ option ] # execution
 ```
+
+Because caxx is written in C, I'm wondering if someone will incorporate this into their toolchain.
+
 ##### initialization,build and execution for go version　'Gaxx'
 
 ```
