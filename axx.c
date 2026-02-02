@@ -539,25 +539,6 @@ static int factor1(const char *s, int idx, int64_t *result) {
     idx = skipspc(s, idx);
     char c = safe_char(s, idx);
     
-
-    // Character literals (Go patch)
-    if (idx + 4 <= (int)strlen(s) && strncmp(s + idx, "'\n'", 4) == 0) {
-        idx += 4;
-        x = 0x0a;
-    } else if (idx + 4 <= (int)strlen(s) && strncmp(s + idx, "'\t'", 4) == 0) {
-        idx += 4;
-        x = 0x09;
-    } else if (idx + 3 <= (int)strlen(s) && strncmp(s + idx, "'\\'", 3) == 0) {
-        idx += 3;
-        x = (int64_t)'\\';
-    } else if (idx + 4 <= (int)strlen(s) && strncmp(s + idx, "'\\''", 4) == 0) {
-        idx += 4;
-        x = (int64_t)'\'';
-    } else if (idx + 3 <= (int)strlen(s) && s[idx] == '\'' && s[idx + 2] == '\'') {
-        x = (int64_t)s[idx + 1];
-        idx += 3;
-    }
-    
     if (c == '(') {
         idx = expression(s, idx + 1, &x);
         if (safe_char(s, idx) == ')') {
@@ -668,7 +649,23 @@ static int factor(const char *s, int idx, int64_t *result) {
     idx = skipspc(s, idx);
     int64_t x = 0;
     
-    if (idx + 4 <= (int)strlen(s) && strncmp(s + idx, "!!!!", 4) == 0 && ExpMode == EXP_PAT) {
+    // Character literals (Go patch)
+    if (idx + 4 <= (int)strlen(s) && strncmp(s + idx, "'\\n'", 4) == 0) {
+        idx += 4;
+        x = 0x0a;
+    } else if (idx + 4 <= (int)strlen(s) && strncmp(s + idx, "'\\t'", 4) == 0) {
+        idx += 4;
+        x = 0x09;
+    } else if (idx + 3 <= (int)strlen(s) && strncmp(s + idx, "'\\'", 3) == 0) {
+        idx += 3;
+        x = (int64_t)'\\';
+    } else if (idx + 4 <= (int)strlen(s) && strncmp(s + idx, "'\\''", 4) == 0) {
+        idx += 4;
+        x = (int64_t)'\'';
+    } else if (idx + 3 <= (int)strlen(s) && s[idx] == '\'' && s[idx + 2] == '\'') {
+        x = (int64_t)s[idx + 1];
+        idx += 3;
+    } else if (idx + 4 <= (int)strlen(s) && strncmp(s + idx, "!!!!", 4) == 0 && ExpMode == EXP_PAT) {
         x = VliwStop;
         idx += 4;
     } else if (idx + 3 <= (int)strlen(s) && strncmp(s + idx, "!!!", 3) == 0 && ExpMode == EXP_PAT) {
@@ -2741,3 +2738,5 @@ int main(int argc, char *argv[]) {
     
     return 0;
 }
+
+// Missing impLabel implementation
