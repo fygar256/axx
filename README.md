@@ -6,7 +6,7 @@ slide: false
 ---
 GENERAL ASSEMBLER 'axx.py'
 
-It was written in python, so the nickname is Paxx. axx stands for 'Arbitary eXtended X(cross) assembler'.
+It was written in python, so the nickname is Paxx. 'axx' stands for 'Arbitary eXtended X(cross) assembler'.
 
 Original article in Japanee:Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
 
