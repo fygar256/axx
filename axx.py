@@ -864,6 +864,7 @@ class ExpressionEvaluator:
     
     def expression_esc(self, s, idx, stopchar):
         """Expression with escaped stop character"""
+        self.state.expmode = EXP_PAT
         result = []
         depth = 0
         
@@ -1311,8 +1312,72 @@ class ObjectGenerator:
         self.expr_eval = expr_eval
         self.binary_writer = binary_writer
     
+    def replace_percent_with_index(self, s):
+        """Replace %% with sequential numbers starting from 1"""
+        count = 1
+        result = []
+        i = 0
+        while i < len(s):
+            if i + 1 < len(s) and s[i:i+2] == '%%':
+                result.append(str(count))
+                count += 1
+                i += 2
+            else:
+                result.append(s[i])
+                i += 1
+        return ''.join(result)
+
+    def e_p(self, pattern):
+        """Expand rep[expr,pattern] syntax"""
+        result = []
+        i = 0
+        while i < len(pattern):
+            if i + 4 <= len(pattern) and pattern[i:i+4] == 'rep[':
+                # Find matching ]
+                i += 4
+                depth = 1
+                expr_start = i
+                comma_pos = -1
+                
+                while i < len(pattern) and depth > 0:
+                    if pattern[i] == '[':
+                        depth += 1
+                    elif pattern[i] == ']':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    elif pattern[i] == ',' and depth == 1 and comma_pos == -1:
+                        comma_pos = i
+                    i += 1
+                
+                if comma_pos > 0:
+                    expr = pattern[expr_start:comma_pos]
+                    rep_pattern = pattern[comma_pos+1:i]
+                    
+                    # Evaluate expression
+                    n, idx = self.expr_eval.expression_pat(expr, 0)
+                    
+                    # Expand pattern n times
+                    for j in range(int(n)):
+                        if j > 0:
+                            result.append(',')
+                        result.append(rep_pattern)
+                    
+                    i += 1  # Skip closing ]
+                else:
+                    result.append('rep[')
+            else:
+                result.append(pattern[i])
+                i += 1
+        
+        return ''.join(result)
+
     def makeobj(self, s):
         """Make object code from expression string"""
+        # Expand rep[] and replace %%
+        s = self.e_p(s)
+        s = self.replace_percent_with_index(s)
+        
         s += chr(0)
         idx = 0
         objl = []
@@ -1709,7 +1774,6 @@ class Assembler:
             
             if not self.state.debug:
                 try:
-                    self.state.expmode=EXP_ASM
                     if self.pattern_matcher.match0(lin, i[0]) == True:
                         self.directive_proc.error(i[1])
                         objl = self.obj_gen.makeobj(i[2])
@@ -1721,7 +1785,6 @@ class Assembler:
                     loopflag = False
                     break
             else:
-                self.state.expmode=EXP_ASM
                 if self.pattern_matcher.match0(lin, i[0]) == True:
                     self.directive_proc.error(i[1])
                     objl = self.obj_gen.makeobj(i[2])

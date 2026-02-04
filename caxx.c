@@ -1554,10 +1554,112 @@ static void errorDirective(const char *s) {
     }
 }
 
+// Expand rep[n,pattern] syntax
+static void expand_rep(const char *input, char *output) {
+    int in_idx = 0;
+    int out_idx = 0;
+    
+    while (input[in_idx] != '\0' && out_idx < MAX_LINE - 1) {
+        // Check for rep[ pattern
+        if (strncmp(input + in_idx, "rep[", 4) == 0) {
+            in_idx += 4;
+            
+            // Extract expression before comma
+            char expr[256];
+            int expr_idx = 0;
+            int depth = 0;
+            while (input[in_idx] != '\0' && expr_idx < 255) {
+                if (input[in_idx] == '[') depth++;
+                else if (input[in_idx] == ']') {
+                    if (depth == 0) break;
+                    depth--;
+                }
+                else if (input[in_idx] == ',' && depth == 0) break;
+                expr[expr_idx++] = input[in_idx++];
+            }
+            expr[expr_idx] = '\0';
+            
+            if (input[in_idx] != ',') {
+                // Invalid syntax, copy as-is
+                strcpy(output + out_idx, "rep[");
+                out_idx += 4;
+                strcpy(output + out_idx, expr);
+                out_idx += strlen(expr);
+                continue;
+            }
+            in_idx++; // Skip comma
+            
+            // Extract pattern
+            char pattern[256];
+            int pat_idx = 0;
+            depth = 0;
+            while (input[in_idx] != '\0' && pat_idx < 255) {
+                if (input[in_idx] == '[') depth++;
+                else if (input[in_idx] == ']') {
+                    if (depth == 0) break;
+                    depth--;
+                }
+                pattern[pat_idx++] = input[in_idx++];
+            }
+            pattern[pat_idx] = '\0';
+            
+            if (input[in_idx] == ']') {
+                in_idx++; // Skip ]
+            }
+            
+            // Evaluate expression to get repeat count
+            int64_t n;
+            expression0(expr, 0, &n);
+            
+            // Expand pattern n times
+            for (int64_t i = 0; i < n && out_idx < MAX_LINE - 10; i++) {
+                if (i > 0 && out_idx < MAX_LINE - 1) {
+                    output[out_idx++] = ',';
+                }
+                for (int j = 0; pattern[j] != '\0' && out_idx < MAX_LINE - 1; j++) {
+                    output[out_idx++] = pattern[j];
+                }
+            }
+        } else {
+            output[out_idx++] = input[in_idx++];
+        }
+    }
+    output[out_idx] = '\0';
+}
+
+// Replace %% with sequential numbers starting from 1
+static void replace_percent_with_index(const char *input, char *output) {
+    int in_idx = 0;
+    int out_idx = 0;
+    int count = 1;
+    
+    while (input[in_idx] != '\0' && out_idx < MAX_LINE - 20) {
+        if (in_idx + 1 < (int)strlen(input) && 
+            input[in_idx] == '%' && input[in_idx + 1] == '%') {
+            // Replace %% with current count
+            char num[20];
+            snprintf(num, sizeof(num), "%d", count);
+            strcpy(output + out_idx, num);
+            out_idx += strlen(num);
+            in_idx += 2;
+            count++;
+        } else {
+            output[out_idx++] = input[in_idx++];
+        }
+    }
+    output[out_idx] = '\0';
+}
+
 static int makeobj(const char *s, int64_t *objl) {
     // ErrorUndefinedLabel = false;  // FIXED: Don't reset here
+    
+    // Step 1: Expand rep[] constructs
+    char expanded[MAX_LINE];
+    expand_rep(s, expanded);
+    
+    // Step 2: Replace %% with sequential numbers
     char s2[MAX_LINE];
-    snprintf(s2, sizeof(s2), "%s", s);
+    replace_percent_with_index(expanded, s2);
     
     int idx = 0;
     int objl_count = 0;
@@ -2508,7 +2610,7 @@ static bool vliwprocess(const char *line, int64_t idxs, int64_t *objl, int objl_
         
         // Pad with nop bytes
         int ibyte = (VliwInstBits + 7) / 8;
-        int noi = (vbits - labs(VliwTemplateBits)) / VliwInstBits;
+        int noi = (vbits - abs(VliwTemplateBits)) / VliwInstBits;
         int needed = ibyte * noi;
         
         while (values_count < needed) {
@@ -2549,12 +2651,12 @@ static bool vliwprocess(const char *line, int64_t idxs, int64_t *objl, int objl_
         }
         
         // Add template bits
-        __uint128_t tm = ((__uint128_t)1 << labs(VliwTemplateBits)) - 1;
+        __uint128_t tm = ((__uint128_t)1 << abs(VliwTemplateBits)) - 1;
         __uint128_t templ = (__uint128_t)templ_val & tm;
         
         __uint128_t res;
         if (VliwTemplateBits < 0) {
-            res = r | (templ << (vbits - labs(VliwTemplateBits)));
+            res = r | (templ << (vbits - abs(VliwTemplateBits)));
         } else {
             res = (r << VliwTemplateBits) | templ;
         }
