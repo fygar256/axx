@@ -508,11 +508,13 @@ static char *getLabelSectionName(const char *k) {
 
 // Expression evaluation - complete implementation
 static int expressionEsc(const char *s, int idx, char stopchar, int64_t *result) {
+    // ExpMode should not be changed here - use caller's mode
     char replaced[MAX_LINE];
     int depth = 0;
     int j = 0;
     
-    for (int i = 0; i < (int)strlen(s) && j < MAX_LINE - 1; i++) {
+    // Process from idx onwards
+    for (int i = idx; i < (int)strlen(s) && j < MAX_LINE - 1; i++) {
         char ch = s[i];
         if (ch == '(') {
             depth++;
@@ -522,7 +524,7 @@ static int expressionEsc(const char *s, int idx, char stopchar, int64_t *result)
             replaced[j++] = ch;
         } else {
             if (depth == 0 && ch == stopchar) {
-                replaced[j++] = '\0';
+                break; // Stop at stopchar
             } else {
                 replaced[j++] = ch;
             }
@@ -530,7 +532,13 @@ static int expressionEsc(const char *s, int idx, char stopchar, int64_t *result)
     }
     replaced[j] = '\0';
     
-    return expression(replaced, idx, result);
+    // Now evaluate from index 0 of replaced string
+    int64_t val;
+    int end_idx = expression(replaced, 0, &val);
+    *result = val;
+    
+    // Return the new index in the original string
+    return idx + end_idx;
 }
 
 static int factor1(const char *s, int idx, int64_t *result) {
@@ -1553,9 +1561,232 @@ static void errorDirective(const char *s) {
     }
 }
 
+// Expand rep[n,pattern] syntax
+static void expand_rep(const char *input, char *output) {
+    int in_idx = 0;
+    int out_idx = 0;
+    
+    while (input[in_idx] != '\0' && out_idx < MAX_LINE - 1) {
+        // Check for rep[ pattern
+        if (strncmp(input + in_idx, "rep[", 4) == 0) {
+            in_idx += 4;
+            
+            // Extract expression before comma
+            char expr[256];
+            int expr_idx = 0;
+            int depth = 0;
+            while (input[in_idx] != '\0' && expr_idx < 255) {
+                if (input[in_idx] == '[') depth++;
+                else if (input[in_idx] == ']') {
+                    if (depth == 0) break;
+                    depth--;
+                }
+                else if (input[in_idx] == ',' && depth == 0) break;
+                expr[expr_idx++] = input[in_idx++];
+            }
+            expr[expr_idx] = '\0';
+            
+            if (input[in_idx] != ',') {
+                // Invalid syntax, copy as-is
+                strcpy(output + out_idx, "rep[");
+                out_idx += 4;
+                strcpy(output + out_idx, expr);
+                out_idx += strlen(expr);
+                continue;
+            }
+            in_idx++; // Skip comma
+            
+            // Extract pattern
+            char pattern[256];
+            int pat_idx = 0;
+            depth = 0;
+            while (input[in_idx] != '\0' && pat_idx < 255) {
+                if (input[in_idx] == '[') depth++;
+                else if (input[in_idx] == ']') {
+                    if (depth == 0) break;
+                    depth--;
+                }
+                pattern[pat_idx++] = input[in_idx++];
+            }
+            pattern[pat_idx] = '\0';
+            
+            if (input[in_idx] == ']') {
+                in_idx++; // Skip ]
+            }
+            
+            // Evaluate expression to get repeat count
+            int64_t n;
+            expression0(expr, 0, &n);
+            
+            // Expand pattern n times
+            for (int64_t i = 0; i < n && out_idx < MAX_LINE - 10; i++) {
+                if (i > 0 && out_idx < MAX_LINE - 1) {
+                    output[out_idx++] = ',';
+                }
+                for (int j = 0; pattern[j] != '\0' && out_idx < MAX_LINE - 1; j++) {
+                    output[out_idx++] = pattern[j];
+                }
+            }
+        } else {
+            output[out_idx++] = input[in_idx++];
+        }
+    }
+    output[out_idx] = '\0';
+}
+
+// Expand @@[n,pattern] syntax - returns true if pattern is empty (all @@[])
+static bool expand_atat(const char *input, char *output) {
+    int in_idx = 0;
+    int out_idx = 0;
+    bool all_empty = true;
+    
+    while (input[in_idx] != '\0' && out_idx < MAX_LINE - 1) {
+        // Check for @@[ pattern
+        if (in_idx + 3 < (int)strlen(input) && strncmp(input + in_idx, "@@[", 3) == 0) {
+            in_idx += 3;
+            
+            // Extract expression before comma
+            char expr[256];
+            int expr_idx = 0;
+            int depth = 1;
+            while (input[in_idx] != '\0' && expr_idx < 255) {
+                if (input[in_idx] == '[') depth++;
+                else if (input[in_idx] == ']') {
+                    if (depth == 1) break;
+                    depth--;
+                }
+                else if (input[in_idx] == ',' && depth == 1) break;
+                expr[expr_idx++] = input[in_idx++];
+            }
+            expr[expr_idx] = '\0';
+            
+            if (input[in_idx] != ',') {
+                // Invalid syntax, copy as-is
+                strcpy(output + out_idx, "@@[");
+                out_idx += 3;
+                strcpy(output + out_idx, expr);
+                out_idx += strlen(expr);
+                all_empty = false;
+                continue;
+            }
+            in_idx++; // Skip comma
+            
+            // Extract pattern
+            char pattern[256];
+            int pat_idx = 0;
+            depth = 1;
+            while (input[in_idx] != '\0' && pat_idx < 255) {
+                if (input[in_idx] == '[') depth++;
+                else if (input[in_idx] == ']') {
+                    if (depth == 1) break;
+                    depth--;
+                }
+                pattern[pat_idx++] = input[in_idx++];
+            }
+            pattern[pat_idx] = '\0';
+            
+            if (input[in_idx] == ']') {
+                in_idx++; // Skip ]
+            }
+            
+            // Evaluate expression to get repeat count
+            int64_t n;
+            expression0(expr, 0, &n);
+            
+            // Expand pattern n times
+            if (n > 0) {
+                all_empty = false;
+                for (int64_t i = 0; i < n && out_idx < MAX_LINE - 10; i++) {
+                    if (i > 0 && out_idx < MAX_LINE - 1) {
+                        output[out_idx++] = ',';
+                    }
+                    for (int j = 0; pattern[j] != '\0' && out_idx < MAX_LINE - 1; j++) {
+                        output[out_idx++] = pattern[j];
+                    }
+                }
+            }
+        } else {
+            output[out_idx++] = input[in_idx++];
+            all_empty = false;
+        }
+    }
+    output[out_idx] = '\0';
+    return all_empty;
+}
+
+// Replace %% with sequential numbers, %0 resets counter
+static void replace_percent_with_index_v2(const char *input, char *output) {
+    int in_idx = 0;
+    int out_idx = 0;
+    int count = 0;
+    
+    while (input[in_idx] != '\0' && out_idx < MAX_LINE - 20) {
+        if (in_idx + 1 < (int)strlen(input)) {
+            if (input[in_idx] == '%' && input[in_idx + 1] == '%') {
+                // Replace %% with current count
+                char num[20];
+                snprintf(num, sizeof(num), "%d", count);
+                strcpy(output + out_idx, num);
+                out_idx += strlen(num);
+                in_idx += 2;
+                count++;
+                continue;
+            } else if (input[in_idx] == '%' && input[in_idx + 1] == '0') {
+                // %0 resets counter
+                count = 0;
+                in_idx += 2;
+                continue;
+            }
+        }
+        output[out_idx++] = input[in_idx++];
+    }
+    output[out_idx] = '\0';
+}
+
+
+
+// Replace %% with sequential numbers starting from 1
+static void replace_percent_with_index(const char *input, char *output) {
+    int in_idx = 0;
+    int out_idx = 0;
+    int count = 1;
+    
+    while (input[in_idx] != '\0' && out_idx < MAX_LINE - 20) {
+        if (in_idx + 1 < (int)strlen(input) && 
+            input[in_idx] == '%' && input[in_idx + 1] == '%') {
+            // Replace %% with current count
+            char num[20];
+            snprintf(num, sizeof(num), "%d", count);
+            strcpy(output + out_idx, num);
+            out_idx += strlen(num);
+            in_idx += 2;
+            count++;
+        } else {
+            output[out_idx++] = input[in_idx++];
+        }
+    }
+    output[out_idx] = '\0';
+}
+
 static int makeobj(const char *s, int64_t *objl) {
+    // ErrorUndefinedLabel = false;  // FIXED: Don't reset here
+    
+    // Step 1: Expand @@[] constructs - returns true if all patterns are empty
+    char atat_expanded[MAX_LINE];
+    bool all_empty = expand_atat(s, atat_expanded);
+    
+    // If all @@[] expanded to nothing, return empty
+    if (all_empty && atat_expanded[0] == '\0') {
+        return 0;
+    }
+    
+    // Step 2: Expand rep[] constructs
+    char rep_expanded[MAX_LINE];
+    expand_rep(atat_expanded, rep_expanded);
+    
+    // Step 3: Replace %% with sequential numbers and handle %0
     char s2[MAX_LINE];
-    snprintf(s2, sizeof(s2), "%s", s);
+    replace_percent_with_index_v2(rep_expanded, s2);
     
     int idx = 0;
     int objl_count = 0;
@@ -1934,8 +2165,12 @@ static bool lineassemble2(const char *line, int idx, int64_t *idxs_out, int64_t 
             break;
         }
         
-        ExpMode=EXP_ASM;
+        ErrorUndefinedLabel = false;
+        
+        ExpMode = EXP_ASM;  // Match assembly input
         if (match0(lin, Pat[i].fields[0])) {
+            // ErrorUndefinedLabel = false;  // FIXED: Don't reset here
+            
             // Check error directive (field 1)
             if (Pat[i].field_count > 1 && Pat[i].fields[1]) {
                 errorDirective(Pat[i].fields[1]);
@@ -2502,7 +2737,7 @@ static bool vliwprocess(const char *line, int64_t idxs, int64_t *objl, int objl_
         
         // Pad with nop bytes
         int ibyte = (VliwInstBits + 7) / 8;
-        int noi = (vbits - labs(VliwTemplateBits)) / VliwInstBits;
+        int noi = (vbits - abs(VliwTemplateBits)) / VliwInstBits;
         int needed = ibyte * noi;
         
         while (values_count < needed) {
@@ -2543,12 +2778,12 @@ static bool vliwprocess(const char *line, int64_t idxs, int64_t *objl, int objl_
         }
         
         // Add template bits
-        __uint128_t tm = ((__uint128_t)1 << labs(VliwTemplateBits)) - 1;
+        __uint128_t tm = ((__uint128_t)1 << abs(VliwTemplateBits)) - 1;
         __uint128_t templ = (__uint128_t)templ_val & tm;
         
         __uint128_t res;
         if (VliwTemplateBits < 0) {
-            res = r | (templ << (vbits - labs(VliwTemplateBits)));
+            res = r | (templ << (vbits - abs(VliwTemplateBits)));
         } else {
             res = (r << VliwTemplateBits) | templ;
         }
