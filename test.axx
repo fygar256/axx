@@ -43,4 +43,5 @@ TEST !a:: a==3?0xc0:4,0x12,0x13
 LD (IX[[+!d]]),(IX[[+!e]]):: 0xfd,0x04,d,e 
 NOP :: 0x01
 LOAD A,[B] :: 0x43
+REPEAT !n::@@[n,%%],%0@@[n,0x10+%%]
 
