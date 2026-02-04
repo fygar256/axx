@@ -27,3 +27,6 @@ test.axx                            test pattern file of some CPUs
 test.s                              test assemble file of some CPUs
 z80.axx                             pattern file for Z80
 z80.s                               test assemble file for Z80
+vliw.axx                            test pattern file for vliw
+vliw.s                              test assembly file for vliw
+itanium.axx                         test pattern file for itanium
