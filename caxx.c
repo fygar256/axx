@@ -1555,9 +1555,10 @@ static void errorDirective(const char *s) {
 }
 
 // Expand rep[n,pattern] syntax
-static void expand_rep(const char *input, char *output) {
+static bool expand_rep(const char *input, char *output) {
     int in_idx = 0;
     int out_idx = 0;
+    bool z=true;
     
     while (input[in_idx] != '\0' && out_idx < MAX_LINE - 1) {
         // Check for rep[ pattern
@@ -1617,6 +1618,7 @@ static void expand_rep(const char *input, char *output) {
                     output[out_idx++] = ',';
                 }
                 for (int j = 0; pattern[j] != '\0' && out_idx < MAX_LINE - 1; j++) {
+                    z=false;
                     output[out_idx++] = pattern[j];
                 }
             }
@@ -1625,6 +1627,7 @@ static void expand_rep(const char *input, char *output) {
         }
     }
     output[out_idx] = '\0';
+    return z;
 }
 
 // Replace %% with sequential numbers starting from 1
@@ -1643,6 +1646,10 @@ static void replace_percent_with_index(const char *input, char *output) {
             out_idx += strlen(num);
             in_idx += 2;
             count++;
+        } else if (in_idx + 1 < (int)strlen(input) && 
+            input[in_idx] == '%' && input[in_idx + 1] == '0') {
+            count=0;
+            in_idx += 2;
         } else {
             output[out_idx++] = input[in_idx++];
         }
@@ -1651,11 +1658,15 @@ static void replace_percent_with_index(const char *input, char *output) {
 }
 
 static int makeobj(const char *s, int64_t *objl) {
+    bool z=false;
     // ErrorUndefinedLabel = false;  // FIXED: Don't reset here
     
     // Step 1: Expand rep[] constructs
     char expanded[MAX_LINE];
-    expand_rep(s, expanded);
+    z=expand_rep(s, expanded);
+    if (z) {
+        return 0;
+    }
     
     // Step 2: Replace %% with sequential numbers
     char s2[MAX_LINE];

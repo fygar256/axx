@@ -1322,6 +1322,9 @@ class ObjectGenerator:
                 result.append(str(count))
                 count += 1
                 i += 2
+            elif i+1<len(s) and s[i:i+2] == "%0":
+                count = 0
+                i += 2
             else:
                 result.append(s[i])
                 i += 1
@@ -1329,6 +1332,7 @@ class ObjectGenerator:
 
     def e_p(self, pattern):
         """Expand rep[expr,pattern] syntax"""
+        z=True
         result = []
         i = 0
         while i < len(pattern):
@@ -1356,12 +1360,12 @@ class ObjectGenerator:
                     
                     # Evaluate expression
                     n, idx = self.expr_eval.expression_pat(expr, 0)
-                    
                     # Expand pattern n times
                     for j in range(int(n)):
                         if j > 0:
                             result.append(',')
                         result.append(rep_pattern)
+                        z=False
                     
                     i += 1  # Skip closing ]
                 else:
@@ -1370,18 +1374,21 @@ class ObjectGenerator:
                 result.append(pattern[i])
                 i += 1
         
-        return ''.join(result)
+        return ''.join(result),z
 
     def makeobj(self, s):
         """Make object code from expression string"""
         # Expand rep[] and replace %%
-        s = self.e_p(s)
+        s,z = self.e_p(s)
         s = self.replace_percent_with_index(s)
         
         s += chr(0)
         idx = 0
         objl = []
         
+        if z:
+            return objl
+
         while True:
             if idx >= len(s) or s[idx] == chr(0):
                 break
