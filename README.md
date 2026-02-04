@@ -651,7 +651,11 @@ Because this is a test, the binary is different from the actual code.
 .setsym ::b:: 1
 .setsym ::%% ::7
 .setsym ::||:: 8
-LDF A,!x :: 0x1,x,*(x,1),*(x,2),*(x,3),*(x,4),*(x,5),*(x,6),*(x,7),*(x,8),*(x,9),*(x,10),*(x,11),*(x,12),*(x,13),*(x,14),*(x,15)
+LDF A,!x :: 0x1,rep[4,x>>(%%*8)]
+LDD A,!x :: 0x1,rep[8,x>>(%%*8)]
+LDQ A,!x :: 0x1,rep[16,x>>(%%*8)]
+LDR A,[ [ !x ] ]:: ~~0x3?3:0,x,x>>8
+REP !n :: rep[n,0x99],%0rep[n,0x88]
 
 /* ARM64
 .setsym ::r1 :: 2
@@ -664,7 +668,7 @@ ADD x, y, !e :: 0x91,x,y,e
 /* A64FX
 .setsym ::v0 :: 0
 .setsym ::x0 :: 1
-ST1 {x.4S},[y] :: 0x01,x,y,0
+ST1 {x.4S},\[y\] :: 0x01,x,y,0
 
 /* MIPS
 .setsym ::$s5 ::21
@@ -677,15 +681,19 @@ ADDI x,y,!d :: (e:=(0x20000000|(y<<21)|(x<<16)|d&0xffff))>>24,e>>16,e>>8,e
 .setsym ::rbx:: 3
 .setsym ::rcx ::1
 .setsym ::rep ::1
-MMX A,B :: ,0x12,0x13
-LEAQ r,[s,t,!d,!e] :: 0x48,0x8d,0x04,((@d)-1)<<6|t<<3|s,e
-LEAQ r, [ s + t * !h \+ !i ] :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
-[[u]]MOVSB ​​:: ;u?0xf3:0,0xa4
+
+MMX A,B ::  ,0x12,0x13
+LEAQ r,\[s,t,!d,!e\] :: 0x48,0x8d,0x04,((@d)-1)<<6|t<<3|s,e
+LEAQ r, \[ s+t*!h\+!i\] :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
+[[z]]MOVSB :: ;z?0xf3:0,0xa4
 TEST !a:: a==3?0xc0:4,0x12,0x13
 
 /* ookakko test
-LD (IX[[+!d]]),(IX[[+!e]]):: 0xfd,0x04,d,e
+LD (IX[[+!d]]),(IX[[+!e]]):: 0xfd,0x04,d,e 
+
 NOP :: 0x01
+LOAD A,[B] :: 0x43
+
 ```
 
 For x86_64 expressions such as `LEAQ r,[s+t*h+i]`, please write `LEAQ r,[s+t*!!h+!!i]`. If you write `!h` instead of `!!h`, when pattern matching, the assembly line expression evaluation function will interpret the part after 2 in `leaq rax,[rbx+rcx*2+0x40]` as `!h`, and will interpret the part after that as an expression, 2+0x40, as `!h`, and 2+0x40 will be substituted for h, resulting in a syntax analysis error for the remaining `+!!i`. `!!h` is a factor, and `!h` is an expression. This is because escape characters in expressions cannot be processed.
