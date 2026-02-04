@@ -864,7 +864,6 @@ class ExpressionEvaluator:
     
     def expression_esc(self, s, idx, stopchar):
         """Expression with escaped stop character"""
-        self.state.expmode = EXP_PAT
         result = []
         depth = 0
         
@@ -1782,6 +1781,7 @@ class Assembler:
             
             self.state.error_undefined_label = False
             
+            self.state.expmode=EXP_ASM
             if not self.state.debug:
                 try:
                     if self.pattern_matcher.match0(lin, i[0]) == True:
