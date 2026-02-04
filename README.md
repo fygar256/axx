@@ -305,7 +305,7 @@ LEAQ r,(s+t*!!h+!!i) :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
 This example would be used in a case like `leaq rax,(rax+rbx*(2+2)+0x40)`.
 
 #### rep[]
-You can use rep[n,\<str\>] in a binary_list. This means repeating \<str\> n times. To set the counter %% to 0, use %0.
+You can use rep[n,\<str\>] in a binary_list. This means repeating \<str\> n times. To set the index %% to 0, use %0.
 
 ## VLIW Processor
 
