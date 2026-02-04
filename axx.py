@@ -1332,8 +1332,8 @@ class ObjectGenerator:
 
     def e_p(self, pattern):
         """Expand rep[expr,pattern] syntax"""
-        z=True
         result = []
+        z=True
         i = 0
         while i < len(pattern):
             if i + 4 <= len(pattern) and pattern[i:i+4] == 'rep[':
@@ -1372,6 +1372,7 @@ class ObjectGenerator:
                     result.append('rep[')
             else:
                 result.append(pattern[i])
+                z=False
                 i += 1
         
         return ''.join(result),z

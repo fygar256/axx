@@ -1624,6 +1624,7 @@ static bool expand_rep(const char *input, char *output) {
             }
         } else {
             output[out_idx++] = input[in_idx++];
+            z=false;
         }
     }
     output[out_idx] = '\0';
