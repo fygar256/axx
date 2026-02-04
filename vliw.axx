@@ -1,0 +1,13 @@
+/* VLIW
+.setsym::R1::1
+.setsym::R2::2
+.setsym::R3::3
+.setsym::R4::4
+
+.vliw::128::32::0::0x00
+AD a,b,c::0x01,a,b,c
+LOD d,[!e]::0x02,d,e,e>>8
+JMP !a ::0x03,a,a>>8,!!!
+NOP ::0x00
+
+
