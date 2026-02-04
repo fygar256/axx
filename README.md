@@ -654,7 +654,6 @@ Because this is a test, the binary is different from the actual code.
 LDF A,!x :: 0x1,rep[4,x>>(%%*8)]
 LDD A,!x :: 0x1,rep[8,x>>(%%*8)]
 LDQ A,!x :: 0x1,rep[16,x>>(%%*8)]
-LDR A,[ [ !x ] ]:: ~~0x3?3:0,x,x>>8
 REP !n :: rep[n,0x99],%0rep[n,0x88]
 
 /* ARM64
