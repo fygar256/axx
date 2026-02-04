@@ -118,7 +118,6 @@ Lowercase variables are initialized to 0 for each line in the pattern file.
 
 From the assembly line, uppercase and lowercase letters are accepted as the same, except for labels and section names.
 
-The special variable is '$$', which represents the current location counter.
 
 #### Escape Characters
 
@@ -524,6 +523,10 @@ Assembly line comments are `;`.
 ## Expressions, Operators, and Special factor
 
 One special factor is `!!!`, which represents the number of commands connected by !!.
+
+The special variable is '$$', which represents the current location counter.
+
+And there's %%, which returns the number of times %% appears (index starting from 0).
 
 Since the assembly line expressions and pattern data expressions call the same functions, they work almost the same. Variables in lowercase cannot be referenced from the assembly line.
 
