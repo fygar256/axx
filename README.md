@@ -151,6 +151,10 @@ If an element of binary_list is empty, it will be aligned. If it starts with `,`
 
 If an element of binary_list is preceded by `;`, it will not be output if it is 0.
 
+#### rep[]
+
+In a binary_list, you can use rep[n,<str>]. This means repeating <str> n times. To set the index %% to 0, use %0.
+
 #### symbol
 
 ```
