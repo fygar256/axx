@@ -508,7 +508,6 @@ static char *getLabelSectionName(const char *k) {
 
 // Expression evaluation - complete implementation
 static int expressionEsc(const char *s, int idx, char stopchar, int64_t *result) {
-    ExpMode = EXP_PAT;
     char replaced[MAX_LINE];
     int depth = 0;
     int j = 0;
@@ -1555,7 +1554,6 @@ static void errorDirective(const char *s) {
 }
 
 static int makeobj(const char *s, int64_t *objl) {
-    ErrorUndefinedLabel = false;
     char s2[MAX_LINE];
     snprintf(s2, sizeof(s2), "%s", s);
     
@@ -1936,11 +1934,8 @@ static bool lineassemble2(const char *line, int idx, int64_t *idxs_out, int64_t 
             break;
         }
         
-        ErrorUndefinedLabel = false;
-        
+        ExpMode=EXP_ASM;
         if (match0(lin, Pat[i].fields[0])) {
-            ErrorUndefinedLabel = false;
-            
             // Check error directive (field 1)
             if (Pat[i].field_count > 1 && Pat[i].fields[1]) {
                 errorDirective(Pat[i].fields[1]);
@@ -2507,7 +2502,7 @@ static bool vliwprocess(const char *line, int64_t idxs, int64_t *objl, int objl_
         
         // Pad with nop bytes
         int ibyte = (VliwInstBits + 7) / 8;
-        int noi = (vbits - abs(VliwTemplateBits)) / VliwInstBits;
+        int noi = (vbits - labs(VliwTemplateBits)) / VliwInstBits;
         int needed = ibyte * noi;
         
         while (values_count < needed) {
@@ -2548,12 +2543,12 @@ static bool vliwprocess(const char *line, int64_t idxs, int64_t *objl, int objl_
         }
         
         // Add template bits
-        __uint128_t tm = ((__uint128_t)1 << abs(VliwTemplateBits)) - 1;
+        __uint128_t tm = ((__uint128_t)1 << labs(VliwTemplateBits)) - 1;
         __uint128_t templ = (__uint128_t)templ_val & tm;
         
         __uint128_t res;
         if (VliwTemplateBits < 0) {
-            res = r | (templ << (vbits - abs(VliwTemplateBits)));
+            res = r | (templ << (vbits - labs(VliwTemplateBits)));
         } else {
             res = (r << VliwTemplateBits) | templ;
         }
