@@ -66,7 +66,7 @@ FreeBSD terminal
 
 axx.py is a general assembler that generalizes assembly language. It can process almost any processor architecture. A dedicated pattern file (processor description file) is required to process each processor architecture. While you can define any instructions, creating a pattern file based on the target processor's assembly language will allow you to process that processor's assembly language, albeit with slightly different syntax. In essence, all it requires is instruction grammar rules and binary generation based on those rules. axx targets not only virtual CPUs, but also "abstracted real CPUs." If you create a pattern from an existing assembly instruction, it can be assembled as is.
 
-It is not a "general-purpose assembler" in the sense of being "widely applicable." It is a "general assembler" in the sense of being "common to all" processors except those with meta-level complexity. In other words, axx.py can adapt to processors with complex architectures, but it cannot support some EPIC processors, which have instruction meta-level bundling.(Itanium can be handled) Therefore, it is a "general assembler," not a "universal assembler." Pattern data has only four control syntaxes: assignment, ternary operator, `;` modifier, and alignment. `@@[n,<str>]` is not a control syntax because it simply expands `<str>` n times internally. This can be used to generate binaries not limited to assembly languages. Patterns are expressed by evaluating expressions containing any string constant, any numeric string constant, and any integer or floating-point number, so it can process any assembly language. However, the binary generation function is not universal, which limits the number of compatible processors. However, it can process any processor as long as instructions and machine code are a one-to-one mapping. The pattern file is Turing-incomplete therefore it is not suitable for processors with extremely twisted architectures. Processor architectures can become as complex as desired. While it could be followed if it were Turing-complete, axx.py is Turing-incomplete, so it is not a "universal assembler."
+It is not a "general-purpose assembler" in the sense of being "widely applicable." It is a "general assembler" in the sense of being "common to all" processors except those with meta-level complexity. In other words, axx.py can adapt to processors with complex architectures, but it cannot support some EPIC processors, which have instruction meta-level bundling.(Itanium can be handled) Therefore, it is a "general assembler," not a "universal assembler." Pattern data has only five control syntaxes: assignment, ternary operator, `;` modifier, alignment and `@@[n,<str>]`. This can be used to generate binaries not limited to assembly languages. Patterns are expressed by evaluating expressions containing any string constant, any numeric string constant, and any integer or floating-point number, so it can process any assembly language. However, the binary generation function is not universal, which limits the number of compatible processors. However, it can process any processor as long as instructions and machine code are a one-to-one mapping. The pattern file is Turing-incomplete therefore it is not suitable for processors with extremely twisted architectures. Processor architectures can become as complex as desired. While it could be followed if it were Turing-complete, axx.py is Turing-incomplete, so it is not a "universal assembler."
 
 The execution platform is also independent of any specific processing system. It is designed to ignore chr(13) at the end of lines in DOS files. It should work on any processing system that runs Python.
 
@@ -150,9 +150,11 @@ If an element of binary_list is empty, it will be aligned. If it starts with `,`
 
 If an element of binary_list is preceded by `;`, it will not be output if it is 0.
 
-#### rep[]
+#### @@[]
 
-In a binary_list, you can use rep[n,<str>]. This means repeating <str> n times. To set the index %% to 0, use %0.
+In a binary_list, you can use @@[n,<str>]. This expands <str> n times. for example, `@@[3,%%],@@[4,0x10+%%]` expanded to `0x00,0x01,0x02,0x13,0x14,0x15,0x16`. To get correct expansion, write binary_list like this : `@@[3,%%],%0@@[4,0x10+%%]`.
+
+%0 set the index %% to 0.
 
 #### symbol
 
