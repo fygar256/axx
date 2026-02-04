@@ -864,7 +864,6 @@ class ExpressionEvaluator:
     
     def expression_esc(self, s, idx, stopchar):
         """Expression with escaped stop character"""
-        self.state.expmode = EXP_PAT
         result = []
         depth = 0
         
@@ -1710,6 +1709,7 @@ class Assembler:
             
             if not self.state.debug:
                 try:
+                    self.state.expmode=EXP_ASM
                     if self.pattern_matcher.match0(lin, i[0]) == True:
                         self.directive_proc.error(i[1])
                         objl = self.obj_gen.makeobj(i[2])
@@ -1721,6 +1721,7 @@ class Assembler:
                     loopflag = False
                     break
             else:
+                self.state.expmode=EXP_ASM
                 if self.pattern_matcher.match0(lin, i[0]) == True:
                     self.directive_proc.error(i[1])
                     objl = self.obj_gen.makeobj(i[2])
