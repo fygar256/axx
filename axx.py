@@ -1314,7 +1314,7 @@ class ObjectGenerator:
     
     def replace_percent_with_index(self, s):
         """Replace %% with sequential numbers starting from 1"""
-        count = 1
+        count = 0
         result = []
         i = 0
         while i < len(s):
