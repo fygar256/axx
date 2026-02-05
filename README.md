@@ -10,7 +10,7 @@ It was written in python, so the nickname is Paxx.
 
 Since axx stands for 'Arbitary eXtended X(cross) assembler'. It also means that I combined the unknown X in 'ASM', which represents the CPU, to create 'AXX'.
 
-The original idea for axx, the name 'AXX', and the prototype were already there in 1987, but it wasn't until 2024, 37 years later, that I published the code that works as it does today. It's a shame I missed out, as I was so close to becoming the first inventor of a pattern language. However, it lacks abstraction to be considered a pattern language.
+The original idea for axx, the name 'AXX', and the prototype were already there in 1986, but it wasn't until 2024, 38 years later, that I published the code that works as it does today. It's a shame I missed out, as I was so close to becoming the first inventor of a pattern language. However, it lacks abstraction to be considered a pattern language.
 
 Original article in Japanee:Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
 
