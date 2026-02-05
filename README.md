@@ -36,7 +36,7 @@ impfile.tsv --- section and label information import file
 #### compile c version 'Caxx'
 
 ```
-cc -o caxx axx.c -lm -O2
+cc -o caxx caxx.c -lm -O2
 caxx z80.axx z80.s [ option ] # execution
 ```
 
@@ -46,7 +46,7 @@ Because caxx is written in C, I'm wondering if someone will incorporate this int
 
 ```
 go mod init axx # initialization
-go build -o gaxx axx.go # build
+go build -o gaxx gaxx.go # build
 gaxx z80.axx z80.s [option] # execution
 ```
 
