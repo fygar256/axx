@@ -72,6 +72,17 @@ axx.py is a general assembler that generalizes assembly language. It can process
 
 It is not a "general-purpose assembler" in the sense of being "widely applicable." It is a "general assembler" in the sense of being "common to all" processors except those with meta-level complexity. In other words, axx.py can adapt to processors with complex architectures, but it cannot support some EPIC processors, which have instruction meta-level bundling.(Itanium can be handled) Therefore, it is a "general assembler," not a "universal assembler." Pattern data has only five control syntaxes: assignment, ternary operator, `;` modifier, alignment and `@@[n,<str>]`. This can be used to generate binaries not limited to assembly languages. Patterns are expressed by evaluating expressions containing any string constant, any numeric string constant, and any integer or floating-point number, so it can process any assembly language. However, the binary generation function is not universal, which limits the number of compatible processors. However, it can process any processor as long as instructions and machine code are a one-to-one mapping. The pattern file is Turing-incomplete therefore it is not suitable for processors with extremely twisted architectures. Processor architectures can become as complex as desired. While it could be followed if it were Turing-complete, axx.py is Turing-incomplete, so it is not a "universal assembler."
 
+For example, the ISAs of the following processors, other than general processors, cannot be described.
+
+Processors - Reason
+
+Mill CPU - Belt Architecture
+
+ZISC - No Instructions
+
+Thinking Machines - Massively Parallel
+
+
 The execution platform is also independent of any specific processing system. It is designed to ignore chr(13) at the end of lines in DOS files. It should work on any processing system that runs Python.
 
 This version only includes the core assembler, so it does not support practical features such as optimization, advanced macros, and debuggers that are available in dedicated assemblers. For practical functionality, use a preprocessor for macros. For now, use a program that manages binary files and label (symbol) files as a linker/loader. Since this is not an IDE, use an external debugger. Optimization is not supported. I believe it has basic functionality, so please apply it. The current version is not practical enough.
