@@ -555,7 +555,7 @@ Operators and precedence are based on Python and are as follows.
 (expression)         An expression enclosed in parentheses
 #                    An operator that returns the value of a symbol
 flt{x},dbl{x}        Operators that convert x to float and double bytecodes, respectively
-qad(x)               Operators that convert x to a 128-bit floating point number. However, in this case, x can only be a constant.
+qad(x)               Operators that convert x to a 128-bit floating point number's bytcode. However, in this case, x can only be a constant.
 *(x,y)               yth byte from the lowest value of x (y>=0)
 -,~                  Negative, bitwise NOT
 'c'                  character code of 'c'
