@@ -674,7 +674,7 @@ Because this is a test, the binary is different from the actual code.
 .setsym ::b:: 1
 .setsym ::%% ::7
 .setsym ::||:: 8
-LDF A,!x :: 0x1,@@[16,*(x,%%-1)]
+LDF A,!x :: 0x1,@@[16,*(x,%%)]
 
 /* ARM64
 .setsym ::r1 :: 2
