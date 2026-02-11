@@ -288,6 +288,17 @@ class Parser:
                 idx += 1
         return s.rstrip(' \t'), idx
 
+class en:
+    @staticmethod
+
+    def enfloat(a):
+        float_value = struct.unpack('f', struct.pack('I', a))[0]
+        return float_value
+
+    @staticmethod
+    def endouble(a):
+        double_value = struct.unpack('d',struct.pack('Q',a))[0]
+        return double_value
 
 class IEEE754Converter:
     """IEEE 754 floating point conversion utilities"""
@@ -657,7 +668,7 @@ class ExpressionEvaluator:
                 elif t == '-inf':
                     x = 0xfff0000000000000
                 else:
-                    v = float(eval(t))
+                    v = float(eval(t,globals()))
                     x = int.from_bytes(struct.pack('>d', v), "big")
         elif idx + 3 <= len(s) and s[idx:idx+3] == 'flt':
             idx += 3
@@ -670,7 +681,7 @@ class ExpressionEvaluator:
                 elif t == '-inf':
                     x = 0xff800000
                 else:
-                    v = float(eval(t))
+                    v = float(eval(t,globals()))
                     x = int.from_bytes(struct.pack('>f', v), "big")
         elif idx < len(s) and s[idx].isdigit():
             fs, idx = self.parser.get_intstr(s, idx)
