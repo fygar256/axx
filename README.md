@@ -480,6 +480,7 @@ Use it like this.
 LABELS['label0'][0]
 ```
 
+If it's too complicated to write it like this, you can use a preprocessor to convert `:label` to `LABELS['label'][0]`, for example.
 
 #### string
 
