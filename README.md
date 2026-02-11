@@ -18,6 +18,8 @@ C version, Ruby version and Go version are also available. C version is Caxx, Ru
 
 When using the Ruby version of axx, please change the talisman `ptint` to `print`.
 
+Caxx is version 7.4.7.1, Raxx, Gaxx is version 7.2
+
 ## install and execution(assemble) Python version 'Paxx'
 
 ```
