@@ -614,8 +614,6 @@ class ExpressionEvaluator:
             return f"LABELS['{label_name}'][0]"
 
         s = re.sub(pattern, replacer, x)
-        print(s)
-
         return eval(s,y)
 
     def factor1(self, s, idx):
