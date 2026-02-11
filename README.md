@@ -463,6 +463,15 @@ Please prefix binary numbers with '0b'.
 
 Please prefix hexadecimal numbers with '0x'.
 
+You can use en.enfloat(} and en.endoube() within flt{} and dbl{}. However, nesting is not allowed. For example, flt{en.enfloat(flt{3.14})} is not valid.
+
+Use it like this:
+
+```
+label: .equ dbl{3.14}
+ldd a,dbl{en.endouble(label)}
+```
+
 #### string
 
 `.ascii` outputs the bytecode of a string, and `.asciiz` outputs the bytecode of a string with 0x00 at the end.
