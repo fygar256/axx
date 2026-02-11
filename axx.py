@@ -29,6 +29,7 @@ CB = chr(0x91)  # close double bracket
 # Constants
 UNDEF = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 VAR_UNDEF = 0
+LABELS = {}
 
 # Character sets
 CAPITAL = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -74,7 +75,6 @@ class AssemblerState:
         self.sections = {}
         self.symbols = {}
         self.patsymbols = {}
-        self.labels = {}
         self.export_labels = {}
         self.pat = []
         
@@ -288,15 +288,11 @@ class Parser:
                 idx += 1
         return s.rstrip(' \t'), idx
 
-class en:
-    @staticmethod
-
-    def enfloat(a):
+def enfloat(a):
         float_value = struct.unpack('f', struct.pack('I', a))[0]
         return float_value
 
-    @staticmethod
-    def endouble(a):
+def endouble(a):
         double_value = struct.unpack('d',struct.pack('Q',a))[0]
         return double_value
 
@@ -488,7 +484,7 @@ class LabelManager:
         """Get label section"""
         self.state.error_undefined_label = False
         try:
-            v = self.state.labels[k][1]
+            v = LABELS[k][1]
         except:
             v = UNDEF
             self.state.error_undefined_label = True
@@ -498,7 +494,7 @@ class LabelManager:
         """Get label value"""
         self.state.error_undefined_label = False
         try:
-            v = self.state.labels[k][0]
+            v = LABELS[k][0]
         except:
             v = UNDEF
             self.state.error_undefined_label = True
@@ -507,7 +503,7 @@ class LabelManager:
     def put_value(self, k, v, s):
         """Set label value"""
         if self.state.pas == 1 or self.state.pas == 0:
-            if k in self.state.labels:
+            if k in LABELS:
                 self.state.error_already_defined = True
                 print(f" error - label already defined.")
                 return False
@@ -517,12 +513,12 @@ class LabelManager:
             return False
         
         self.state.error_already_defined = False
-        self.state.labels[k] = [v, s]
+        LABELS[k] = [v, s]
         return True
 
     def printlabels(self):
         result = {}
-        for key, value in self.state.labels.items():
+        for key, value in LABELS.items():
             num, section = value
             result[key] = [hex(num), section]
         print(result)
