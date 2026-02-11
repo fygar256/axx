@@ -465,7 +465,7 @@ Please prefix binary numbers with '0b'.
 
 Please prefix hexadecimal numbers with '0x'.
 
-You can use en.enfloat(<some hexa>} and en.endoube(<some hexa>) within flt{} and dbl{}. However, nesting is not allowed. For example, flt{en.enfloat(flt{3.14})} is not valid.
+Within flt{} and dbl{}, enfloat(<some hexa>} and endoube(<some hexa>) can be used. These are the inverse conversions of flt{} and dbl{}, respectively. However, nesting cannot be used. For example, flt{enfloat(flt{3.14})} is not allowed.
 
 ```
 label: .equ flt{3.14}
