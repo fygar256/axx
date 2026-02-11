@@ -465,14 +465,21 @@ Please prefix binary numbers with '0b'.
 
 Please prefix hexadecimal numbers with '0x'.
 
-You can use en.enfloat(} and en.endoube() within flt{} and dbl{}. However, nesting is not allowed. For example, flt{en.enfloat(flt{3.14})} is not valid.
-
-Use it like this:
+You can use en.enfloat(<some hexa>} and en.endoube(<some hexa>) within flt{} and dbl{}. However, nesting is not allowed. For example, flt{en.enfloat(flt{3.14})} is not valid.
 
 ```
-label: .equ dbl{3.14}
-ldd a,dbl{en.endouble(label)}
+label: .equ flt{3.14}
+ldf a,flt{enfloat(LABELS['label0'][0])+1}
 ```
+
+Use it like this.
+
+#### To reference a label in a Python eval expression, use
+
+```
+LABELS['label0'][0]
+```
+
 
 #### string
 
