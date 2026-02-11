@@ -599,7 +599,25 @@ class ExpressionEvaluator:
         
         idx = StringUtils.skipspc(s, idx)
         return x, idx
-    
+
+    def xeval(self,x,y):
+        escaped = re.escape(self.state.lwordchars)
+        pattern = rf":([{escaped}]+)(?=[^{escaped}]|$)"
+
+        def replacer(match):
+            full_label = match.group(0)   # 例 ":name"
+            label_name = match.group(1)   # 例 "name"
+            try:
+                dummy=LABELS[f'{label_name}'][0]
+            except:
+                self.state.error_undefined_label = True
+            return f"LABELS['{label_name}'][0]"
+
+        s = re.sub(pattern, replacer, x)
+        print(s)
+
+        return eval(s,y)
+
     def factor1(self, s, idx):
         """Parse primary factor"""
         x = 0
@@ -664,7 +682,7 @@ class ExpressionEvaluator:
                 elif t == '-inf':
                     x = 0xfff0000000000000
                 else:
-                    v = float(eval(t,globals()))
+                    v = float(self.xeval(t,globals()))
                     x = int.from_bytes(struct.pack('>d', v), "big")
         elif idx + 3 <= len(s) and s[idx:idx+3] == 'flt':
             idx += 3
@@ -677,7 +695,7 @@ class ExpressionEvaluator:
                 elif t == '-inf':
                     x = 0xff800000
                 else:
-                    v = float(eval(t,globals()))
+                    v = float(self.xeval(t,globals()))
                     x = int.from_bytes(struct.pack('>f', v), "big")
         elif idx < len(s) and s[idx].isdigit():
             fs, idx = self.parser.get_intstr(s, idx)
