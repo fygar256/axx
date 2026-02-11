@@ -468,7 +468,7 @@ Please prefix hexadecimal numbers with '0x'.
 Within flt{} and dbl{}, enfloat(<some hexa>} and endoube(<some hexa>) can be used. These are the inverse conversions of flt{} and dbl{}, respectively. However, nesting cannot be used. For example, flt{enfloat(flt{3.14})} is not allowed.
 
 ```
-label: .equ flt{3.14}
+label0: .equ flt{3.14}
 ldf a,flt{enfloat(LABELS['label0'][0])+1}
 ```
 
