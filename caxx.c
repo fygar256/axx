@@ -615,30 +615,36 @@ static int expressionEsc(const char *s, int idx, char stopchar, int64_t *result)
 }
 
 static int factor1(const char *s, int idx, int64_t *result) {
+    if (!s || !result) return idx;
+
+    size_t len = strlen(s);
+    if (idx < 0 || idx > len) {
+        *result = 0;
+        return idx;
+    }
+
     int64_t x = 0;
     idx = skipspc(s, idx);
     char c = safe_char(s, idx);
     
 
     // Character literals (Go patch)
-    if (idx + 4 <= (int)strlen(s) && strncmp(s + idx, "'\n'", 4) == 0) {
+    if (idx + 4 <= len && strncmp(s + idx, "'\\n'", 4) == 0) {
         idx += 4;
         x = 0x0a;
-    } else if (idx + 4 <= (int)strlen(s) && strncmp(s + idx, "'\t'", 4) == 0) {
+    } else if (idx + 4 <= len && strncmp(s + idx, "'\\t'", 4) == 0) {
         idx += 4;
         x = 0x09;
-    } else if (idx + 3 <= (int)strlen(s) && strncmp(s + idx, "'\\'", 3) == 0) {
+    } else if (idx + 3 <= len && strncmp(s + idx, "'\\'", 3) == 0) {
         idx += 3;
         x = (int64_t)'\\';
-    } else if (idx + 4 <= (int)strlen(s) && strncmp(s + idx, "'\\''", 4) == 0) {
+    } else if (idx + 4 <= len && strncmp(s + idx, "'\\''", 4) == 0) {
         idx += 4;
         x = (int64_t)'\'';
-    } else if (idx + 3 <= (int)strlen(s) && s[idx] == '\'' && s[idx + 2] == '\'') {
+    } else if (idx + 3 <= len && s[idx] == '\'' && s[idx + 2] == '\'') {
         x = (int64_t)s[idx + 1];
         idx += 3;
-    }
-    
-    if (c == '(') {
+    } else if (c == '(') {
         idx = expression(s, idx + 1, &x);
         if (safe_char(s, idx) == ')') {
             idx++;
