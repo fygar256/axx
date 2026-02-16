@@ -608,10 +608,11 @@ class ExpressionEvaluator:
             full_label = match.group(0)   # 例 ":name"
             label_name = match.group(1)   # 例 "name"
             try:
-                dummy=LABELS[f'{label_name}'][0]
+                val=LABELS[f'{label_name}'][0]
             except:
                 self.state.error_undefined_label = True
-            return f"LABELS['{label_name}'][0]"
+                val=0
+            return hex(val)
 
         s = re.sub(pattern, replacer, x)
         return eval(s,y)
