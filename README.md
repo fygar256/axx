@@ -425,8 +425,6 @@ You can specify characters other than numbers and uppercase and lowercase letter
 
 The default is letters + numbers + underscore + period.
 
-If you add `:` after the label reference, it will check for undefined label errors. In assembly languages ​​that use `:`, add a space after the label reference.
-
 #### ORG
 
 ORG is specified from the assembly line as
