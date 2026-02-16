@@ -146,6 +146,11 @@ static int64_t Vars[26];
 static char Deb1[MAX_LINE] = "";
 static char Deb2[MAX_LINE] = "";
 
+// For qad{} 128-bit support
+static __uint128_t LastQadValue = 0;
+static bool LastQadValueValid = false;
+static int64_t LastQadValueLow64 = 0;  // For matching
+
 // Forward declarations
 static void init_globals(void);
 static char safe_char(const char *s, int idx);
@@ -185,6 +190,8 @@ static int term9(const char *s, int idx, int64_t *result);
 static int term10(const char *s, int idx, int64_t *result);
 static int term11(const char *s, int idx, int64_t *result);
 static double pyEval(const char *expr);
+static float enfloat(uint32_t a);
+static double endouble(uint64_t a);
 static void outbin(int64_t a, int64_t x);
 static void outbin2(int64_t a, int64_t x);
 static int fwrite_custom(const char *filePath, int64_t position, int64_t x, int prt);
@@ -200,6 +207,7 @@ static bool match0(const char *s, const char *t);
 static bool generate_combinations(const char *s, const char *t2, int cnt, const int *sl, int start, int k, int *cur, int cur_count);
 static void removeBrackets(const char *s, const int *remove, int remove_count, char *result);
 static int makeobj(const char *s, int64_t *objl);
+static void expandColonLabels(const char *input, char *output);
 static bool lineassemble2(const char *line, int idx, int64_t *idxs_out, int64_t *objl, int *objl_count, int *idx_out);
 static bool lineassemble(const char *line);
 static bool lineassemble0(const char *line);
@@ -468,19 +476,84 @@ static void putVars(const char *s, int64_t v) {
 }
 
 static double pyEval(const char *expr) {
-    char cmd[MAX_LINE * 2];
-    snprintf(cmd, sizeof(cmd), "echo '%s' | python3 -c 'import sys; s=sys.stdin.read(); print(repr(eval(s)))' 2>/dev/null", expr);
+    // Replace :label with label values
+    char expanded[MAX_LINE * 2];
+    int j = 0;
+    for (int i = 0; i < (int)strlen(expr) && j < MAX_LINE * 2 - 50; i++) {
+        if (expr[i] == ':' && i + 1 < (int)strlen(expr) && 
+            (isalpha(expr[i+1]) || expr[i+1] == '.' || expr[i+1] == '_')) {
+            // Extract label name
+            char label[256];
+            int k = 0;
+            i++; // Skip ':'
+            while (i < (int)strlen(expr) && 
+                   (isalnum(expr[i]) || expr[i] == '_' || expr[i] == '.') && 
+                   k < 255) {
+                label[k++] = expr[i++];
+            }
+            label[k] = '\0';
+            i--; // Back one position for loop increment
+            
+            // Get label value
+            int64_t val = getLabelValue(label);
+            j += snprintf(expanded + j, MAX_LINE * 2 - j, "%lld", (long long)val);
+        } else {
+            expanded[j++] = expr[i];
+        }
+    }
+    expanded[j] = '\0';
+    
+    // Create Python command with enfloat and endouble support
+    // Use a multi-line Python script
+    char cmd[MAX_LINE * 3];
+    snprintf(cmd, sizeof(cmd), 
+        "python3 << 'PYEOF' 2>/dev/null\n"
+        "import struct\n"
+        "def enfloat(a): return struct.unpack('f', struct.pack('I', int(a)))[0]\n"
+        "def endouble(a): return struct.unpack('d', struct.pack('Q', int(a)))[0]\n"
+        "print(repr(eval('%s')))\n"
+        "PYEOF\n",
+        expanded);
     
     FILE *fp = popen(cmd, "r");
     if (fp) {
         char buf[256];
         if (fgets(buf, sizeof(buf), fp)) {
             pclose(fp);
-            return atof(buf);
+            double result = atof(buf);
+            return result;
         }
         pclose(fp);
     }
-    return atof(expr);
+    
+    // If Python evaluation fails, try to evaluate the expanded expression directly
+    // This handles simple numeric expressions
+    double result = atof(expanded);
+    if (result == 0.0 && expanded[0] != '0') {
+        // atof failed, return 0 to avoid NaN
+        return 0.0;
+    }
+    return result;
+}
+
+// Convert uint32_t to float (IEEE 754 interpretation)
+static float enfloat(uint32_t a) {
+    union {
+        uint32_t i;
+        float f;
+    } converter;
+    converter.i = a;
+    return converter.f;
+}
+
+// Convert uint64_t to double (IEEE 754 interpretation)
+static double endouble(uint64_t a) {
+    union {
+        uint64_t i;
+        double d;
+    } converter;
+    converter.i = a;
+    return converter.d;
 }
 
 static int64_t getLabelValue(const char *k) {
@@ -602,6 +675,48 @@ static int factor1(const char *s, int idx, int64_t *result) {
             x = (x << 3) | (s[idx] - '0');
             idx++;
         }
+    } else if (idx + 3 <= (int)strlen(s) && strncmp(s + idx, "qad", 3) == 0) {
+        idx += 3;
+        idx = skipspc(s, idx);
+        if (safe_char(s, idx) == '{') {
+            char floatstr[256];
+            idx = getFloatStr(s, idx + 1, floatstr);
+            
+            // Use Python to compute IEEE 754 128-bit hex
+            char cmd[MAX_LINE];
+            snprintf(cmd, sizeof(cmd), 
+                "python3 -c \"from decimal import Decimal, getcontext; "
+                "getcontext().prec=34; "
+                "a='%s'; "
+                "BIAS=16383; SB=112; EB=15; "
+                "d=Decimal(a if a not in ['inf','-inf','nan'] else ('Infinity' if a=='inf' else '-Infinity' if a=='-inf' else 'NaN')); "
+                "sign=0 if (not d.is_nan() and d>=0) else (1 if not d.is_nan() else 0); "
+                "d_abs=abs(d) if (not d.is_nan() and not d.is_infinite()) else d; "
+                "exp=((1<<EB)-1 if (d.is_nan() or d.is_infinite()) else (0 if d==0 else int(d_abs.adjusted()+BIAS))); "
+                "frac=((1<<(SB-1)) if d.is_nan() else 0) if (d.is_nan() or d.is_infinite() or d==0) else (int((d_abs/(Decimal(2)**d_abs.adjusted())-1)*(2**SB))&((1<<SB)-1)); "
+                "bits=(sign<<127)|(exp<<SB)|frac; "
+                "print('%%016x %%016x' %% (bits >> 64, bits & 0xffffffffffffffff))\" 2>/dev/null",
+                floatstr);
+            
+            FILE *fp = popen(cmd, "r");
+            if (fp) {
+                char buf[256];
+                if (fgets(buf, sizeof(buf), fp)) {
+                    unsigned long long high, low;
+                    if (sscanf(buf, "%llx %llx", &high, &low) == 2) {
+                        LastQadValue = ((__uint128_t)high << 64) | (__uint128_t)low;
+                        LastQadValueValid = true;
+                        LastQadValueLow64 = (int64_t)low;
+                        x = (int64_t)low;  // Store low 64 bits
+                    }
+                }
+                pclose(fp);
+            }
+            
+            if (safe_char(s, idx) == '}') {
+                idx++;
+            }
+        }
     } else if (idx + 3 <= (int)strlen(s) && strncmp(s + idx, "dbl", 3) == 0) {
         idx += 3;
         bool found;
@@ -644,6 +759,18 @@ static int factor1(const char *s, int idx, int64_t *result) {
         char intstr[256];
         idx = getIntStr(s, idx, intstr);
         x = strtoll(intstr, NULL, 10);
+    } else if (c == ':' && idx + 1 < (int)strlen(s) && 
+               (isalpha(s[idx+1]) || s[idx+1] == '.' || s[idx+1] == '_')) {
+        // :label syntax - get label value
+        idx++; // Skip ':'
+        char w[256];
+        int old_idx = idx;
+        idx = getLabelWord(s, idx, w);
+        if (idx != old_idx) {
+            x = getLabelValue(w);
+        } else {
+            x = 0;
+        }
     } else if (ExpMode == EXP_PAT && strchr(Lower, c) && !(idx + 1 < (int)strlen(s) && strchr(Lower, s[idx + 1]))) {
         char ch[2] = {c, 0};
         if (idx + 3 <= (int)strlen(s) && s[idx + 1] == ':' && s[idx + 2] == '=') {
@@ -1200,7 +1327,20 @@ static char *removeCommentAsm(char *s) {
 static char *labelProcessing(char *line) {
     static char result[MAX_LINE];
     
-    char *colon = strchr(line, ':');
+    // Find the first ':' that is NOT inside curly braces
+    char *colon = NULL;
+    int brace_depth = 0;
+    for (int i = 0; line[i]; i++) {
+        if (line[i] == '{') {
+            brace_depth++;
+        } else if (line[i] == '}') {
+            brace_depth--;
+        } else if (line[i] == ':' && brace_depth == 0) {
+            colon = &line[i];
+            break;
+        }
+    }
+    
     if (!colon) {
         strcpy(result, line);
         return result;
@@ -1823,6 +1963,32 @@ static int makeobj(const char *s, int64_t *objl) {
     return objl_count;
 }
 
+// Expand :label syntax in a line before pattern matching
+static void expandColonLabels(const char *input, char *output) {
+    int j = 0;
+    for (int i = 0; input[i] && j < MAX_LINE - 50; i++) {
+        if (input[i] == ':' && i + 1 < (int)strlen(input) && 
+            (isalpha(input[i+1]) || input[i+1] == '.' || input[i+1] == '_')) {
+            // Extract label name
+            char label[256];
+            int k = 0;
+            i++; // Skip ':'
+            while (input[i] && (isalnum(input[i]) || input[i] == '_' || input[i] == '.') && k < 255) {
+                label[k++] = input[i++];
+            }
+            label[k] = '\0';
+            i--; // Back one position for loop increment
+            
+            // Get label value and replace
+            int64_t val = getLabelValue(label);
+            j += snprintf(output + j, MAX_LINE - j, "%lld", (long long)val);
+        } else {
+            output[j++] = input[i];
+        }
+    }
+    output[j] = '\0';
+}
+
 // Directive processing
 static bool sectionProcessing(const char *l1, const char *l2) {
     char u[256];
@@ -2040,6 +2206,8 @@ static bool labelcProcessing(const char *l, const char *ll) {
 
 // Assembly functions
 static bool lineassemble2(const char *line, int idx, int64_t *idxs_out, int64_t *objl, int *objl_count, int *idx_out) {
+    // Note: :label expansion is done in lineassemble() before this function is called
+    
     char l[MAX_LINE];
     idx = getParamToSpc(line, idx, l);
     
@@ -2237,6 +2405,11 @@ static bool lineassemble(const char *line) {
     
     char *processed_line = labelProcessing(line_copy);
     strcpy(line_copy,processed_line);
+    
+    // Expand :label syntax early, before any pattern matching
+    char expanded_line[MAX_LINE];
+    expandColonLabels(line_copy, expanded_line);
+    strcpy(line_copy, expanded_line);
     
     const char *clear_fields[] = {".clearsym", "", ""};
     clearSymbol(clear_fields, 3);
