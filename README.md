@@ -76,6 +76,14 @@ It is not a "general-purpose assembler" in the sense of being "widely applicable
 
 While a typical general assembler uses `mnemonic operand definition`, axx's pattern definition uses `instruction :: error_pattern :: binay_list`, allowing for free instruction patterns. Therefore, notations such as `r1 = r2 + r2` are also possible, and it can be used as a general-purpose binary generator, not just for assembly language.
 
+Rice's theorem
+
+・Non-trivial semantic properties of Turing-complete languages ​​are undecidable
+
+・Complete generalizations would make them impossible to debug
+
+So, we'll leave generalizations here.
+
 For example, the ISAs of the following processors, other than general processors, cannot be described.
 
 Processors - Reason
