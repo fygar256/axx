@@ -10,7 +10,7 @@ It was written in python, so the nickname is Paxx.
 
 Since axx stands for 'Arbitary eXtended X(cross) assembler'. It also means that I combined the unknown X in 'ASM', which represents the CPU, to create 'AXX'.
 
-The original idea for axx, the name 'AXX', and the prototype written in C were already in 1986 when I was working part-time at Tokyo Electronics Design during my university days, but it wasn't until 2024, 38 years later, that I published the code that works as it does today. axx's meta language is a pattern language of any assembly language.
+The original idea for axx, the name 'AXX', and the prototype written in C were already in 1986 when I was working part-time at Tokyo Electronics Design during my university days, but it wasn't until 2024, 38 years later, that I published the code that works as it does today. The axx pattern file is a meta-language for any assembly language. It is a DSL, but it does not have a specific grammar. It is a pattern language that creates grammar by combining string literals, symbols, expressions, etc.
 
 Original article in Japanee:Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
 
