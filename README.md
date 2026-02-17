@@ -6,13 +6,15 @@ slide: false
 ---
 GENERAL ASSEMBLER 'axx.py'
 
-It was written in python, so the nickname is Paxx.
+# Test environment
 
-Since axx stands for 'Arbitary eXtended X(cross) assembler'. It also means that I combined the unknown X in 'ASM', which represents the CPU, to create 'AXX'.
+FreeBSD terminal
 
-The original idea for axx, the name 'AXX', and the prototype written in C were already in 1986 when I was working part-time at Tokyo Electronics Design during my university days, but it wasn't until 2024, 38 years later, that I published the code that works as it does today. The axx pattern file is a meta-language for any assembly language. It is a DSL, but it does not have a specific grammar. It is a pattern language that creates grammar by combining string literals, symbols, expressions, etc.
+# Original article in Japanee
 
-Original article in Japanee:Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
+Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
+
+
 
 C version, Ruby version and Go version are also available. C version is Caxx, Ruby version is Raxx and Go version is Gaxx. C and Go version are much faster than Python version and Ruby version.
 
@@ -64,52 +66,55 @@ sudo cp axx.rb /usr/local/bin/raxx
 raxx z80.axx z80.s [option] # execution
 ```
 
-# Test environment
+It was written in python, so the nickname is Paxx.
 
-FreeBSD terminal
+Since axx stands for 'Arbitary eXtended X(cross) assembler'. It also means that I combined the unknown X in 'ASM', which represents the CPU, to create 'AXX'.
+
+The original idea for axx, the name 'AXX', and the prototype written in C were conceived as early as 1986, when I was working part-time at Tokyo Electronics Design during my university days. However, it wasn't until 2024, 38 years later, that I published the working code we know today. The axx pattern file is the meta-language for all assembly languages. While it's a DSL, it doesn't have a specific grammar; instead, it's a pattern language that creates grammar by combining string literals, symbols, expressions, and other elements.
+
+All assembly languages, except EPIC, which have a meta-level of complexity in machine code, essentially reduce to the simple structure `instruction::error_patterns::binary_list`. Further simplifying, and omitting error checking, it becomes `instruction::binary_list`. For practical purposes, axx's binary_list includes complex formula calculations, alignment, prefixes (do not output binary if the value is 0), and so on. However, these are unnecessary for the minimal model. Instructions are combinations of string literals, symbols replaced by integer values, integer expressions, and integer divisors. Floating-point numbers are also replaced by integer values ​​using bit patterns. This allows for processing of any assembly language. However, the binary generation function is not universal, which limits the number of compatible processors. However, any processor with a one-to-one mapping between instructions and machine code can be processed. Itanium-based EPIC and vliw processors can also be processed.
+
+Extracting the essential commonalities of the von Neumann architecture
+Instruction Set Architecture (ISA) metamodel
+Formalization using pattern matching.
 
 # Main text
 
-axx.py is a general assembler that generalizes assembly language. It can process almost any processor architecture. A dedicated pattern file (processor description file) is required to process each processor architecture. While you can define any instructions, creating a pattern file based on the target processor's assembly language will allow you to process that processor's assembly language, albeit with slightly different syntax. In essence, all it requires is instruction grammar rules and binary generation based on those rules. axx targets not only virtual CPUs, but also "abstracted real CPUs." If you convert the specifications of an existing processor into a pattern file, you can assemble it as is. In that sense, creating pattern files for large ISAs is well suited to AI, considering the amount of work required by humans.
+axx.py is a general assembler that generalizes assembly language. It can process almost any processor architecture. To process a specific processor architecture, a corresponding pattern file (processor description file) is required. While free instructions can be defined, creating a pattern file based on the target processor's assembly language will allow processing of that processor's assembly language, albeit with slightly different syntax. In essence, it's all about instruction grammar rules and binary generation based on them. axx targets not only virtual CPUs, but also "abstracted real CPUs." Converting the specifications of a real processor into a pattern file allows for direct assembly. In that sense, creating pattern files for large ISAs is more suited to AI than human labor.
 
-It is not a "general-purpose assembler" in the sense of being "widely applicable." It is a "general assembler" in the sense of being "common to all" processors except those with meta-level complexity. In other words, axx.py can adapt to processors with complex architectures, but it cannot support some EPIC processors, which have instruction meta-level bundling.(Itanium can be handled) Therefore, it is a "general assembler," not a "universal assembler." Pattern data has only five control syntaxes: assignment, ternary operator, `;` modifier, alignment and `n,<str>]`. This can be used to generate binaries not limited to assembly languages. Patterns are expressed by evaluating expressions containing any string constant, any numeric string constant, and any integer or floating-point number, so it can process any assembly language. However, the binary generation function is not universal, which limits the number of compatible processors. However, it can process any processor as long as instructions and machine code are a one-to-one mapping. The pattern file is Turing-incomplete therefore it is not suitable for processors with extremely twisted architectures. Processor architectures can become as complex as desired. While it could be followed if it were Turing-complete, axx.py is Turing-incomplete, so it is not a "universal assembler."
-
-While a typical general assembler uses `mnemonic operand definition`, axx's pattern definition uses `instruction :: error_pattern :: binay_list`, allowing for free instruction patterns. Therefore, notations such as `r1 = r2 + r3` are also possible, and it can be used as a general-purpose binary generator, not just for assembly language.
-
-All assembly except EPIC, which has meta-level complexity in machine code, basically boils down to a simple structure: `instruction :: error_patterns :: binary_list`.
-
-I extracted the essential commonalities of the von Neumann architecture, created a metamodel of the instruction set architecture (ISA), and formalized it using pattern matching.
+It is not a "general-purpose assembler" in the sense of being "widely applicable." It is a "general assembler" in the sense of being "common to all." Pattern data has only five control syntax constructs: assignment, ternary operator, ; modifier, alignment, and @@[]. While typical general assemblers use mnemonic operand definitions, axx's pattern definitions use instruction :: error_pattern :: binary_list, allowing for flexible instruction patterns. Therefore, notations such as r1 = r2 + r3 are possible, making it usable as a general-purpose binary generator, not just for assembly language. Pattern files are Turing-incomplete. Because it is Turing-incomplete, it is not suitable for processors with extremely twisted architectures. Processor architectures can become infinitely complex. While it can be adapted to Turing-complete languages, axx.py is Turing-incomplete and therefore not a "universal assembler."
 
 Rice's theorem
+- Non-trivial semantic properties of Turing-complete languages ​​are undecidable.
+- Fully generalizing languages ​​make debugging impossible.
 
-・Non-trivial semantic properties of Turing-complete languages ​​are undecidable
+Due to these limitations, we will leave generalization here.
 
-・Complete generalizations would make them impossible to debug
-
-So, we'll leave generalizations here.
-
-For example, the ISAs of the following processors, other than general processors, cannot be described.
+It cannot handle very specialized processors. For example, it cannot describe the ISAs of the following processors other than general processors.
 
 Processors - Reason
 
 Mill CPU - Belt Architecture
-
 ZISC - No Instructions
-
 Thinking Machines - Massively Parallel
 
+The execution platform is also independent of a specific processing system. It also ignores chr(13) at the end of lines in DOS files. It should work on any processing system that runs Python.
 
-The execution platform is also independent of any specific processing system. It is designed to ignore chr(13) at the end of lines in DOS files. It should work on any processing system that runs Python.
-
-This version only includes the core assembler, so it does not support practical features such as optimization, advanced macros, and debuggers that are available in dedicated assemblers. For practical functionality, use a preprocessor for macros. For now, use a program that manages  files and label (symbol) files as a linker/loader. Since this is not an IDE, use an external debugger. Optimization is not supported. I believe it has basic functionality, so please apply it. The current version is not practical enough.
+This version only includes the core assembler, so it does not support practical features such as optimization, advanced macros, or a debugger, which are found in dedicated assemblers. For practical features, please use a preprocessor for macros. For now, please use a program that manages binary files and label (symbol) files as a linker/loader. Since this is not an IDE, please use an external debugger. Optimization is not supported. I believe it has basic functionality, so please apply it. The current version is not practical enough.
 
 Because the pattern file and source file are separated, it is possible to generate machine code for a different processor from source code of a certain instruction set, provided the coding effort is not a problem. It is also possible to generate machine code for different processors from a common language. Writing multiple instruction codes in the _list of pattern data functions as a macro, but it is not very elegant. This allows you to write simple compilers.
 
 axx reads assembler pattern data from the first argument and assembles the source file of the second argument based on the pattern data. The pattern data is then matched line by line from the top to each assembly line, and the binary_list of matching patterns is output as the result. If the second argument is omitted, source code is input from the terminal (standard input).
 
-The results are output as text to standard output, and if an argument is specified with the -o option, a binary file is output to the current directory. The -e option outputs the labels specified with .export along with section/segment information to a file in TSV format.
+The result is output as text to standard output, and if an argument is specified with the -o option, a binary file is output to the current directory. The -e option outputs the labels specified in .export along with section/segment information to a file in TSV format.
 
-In axx, lines input from an assembly language source file or standard input are named assembly lines.
+In axx, assembly language source files and lines input from standard input are named assembly lines.
+
+The execution platform is also independent of any specific processing system. It is designed to ignore chr(13) at the end of lines in DOS files. It should work on any processing system that runs Python.
+
+This version only includes the core assembler, so it does not support practical features such as optimization, advanced macros, and debuggers that are available in dedicated assemblers. For practical functionality, use a preprocessor for macros. For now, use a program that manages  files and label (symbol) files as a linker/loader. Since this is not an IDE, use an external debugger. Optimization is not supported. I believe it has basic functionality, so please apply it. The current version is not practical enough.
+
+
 # Explanation
 
 ## Explanation of pattern file
