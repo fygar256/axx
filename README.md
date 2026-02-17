@@ -95,7 +95,9 @@ It cannot handle very specialized processors. For example, it cannot describe th
 Processors - Reason
 
 Mill CPU - Belt Architecture
+
 ZISC - No Instructions
+
 Thinking Machines - Massively Parallel
 
 The execution platform is also independent of a specific processing system. It also ignores chr(13) at the end of lines in DOS files. It should work on any processing system that runs Python.
