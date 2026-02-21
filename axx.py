@@ -1638,7 +1638,7 @@ class AssemblyDirectiveProcessor:
         if StringUtils.upper(l1) != ".ZERO":
             return False
         x, idx = self.expr_eval.expression_asm(l2, 0)
-        for i in range(x + 1):
+        for i in range(x):
             self.binary_writer.outbin2(self.state.pc, 0x00)
             self.state.pc += 1
         return True
@@ -2028,11 +2028,11 @@ class Assembler:
             self.state.pc = 0
             self.state.pas = 1
             self.state.ln = 1
-            self.fileassemble(sys.argv[2])
+            self.fileassemble(sys_argv[2])
             self.state.pc = 0
             self.state.pas = 2
             self.state.ln = 1
-            self.fileassemble(sys.argv[2])
+            self.fileassemble(sys_argv[2])
         
         if expefile != "":
             self.state.expfile = expefile
