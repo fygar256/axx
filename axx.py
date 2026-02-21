@@ -1592,9 +1592,7 @@ class AssemblyDirectiveProcessor:
             return False
         idx += 1
         
-        while idx < len(l2):
-            if l2[idx] == '"':
-                return True
+        while idx < len(l2) and not l2[idx]=='"':
             if l2[idx:idx+2] == '\\0':
                 idx += 2
                 ch = chr(0)
@@ -1609,6 +1607,7 @@ class AssemblyDirectiveProcessor:
                 idx += 1
             self.binary_writer.outbin(self.state.pc, ord(ch))
             self.state.pc += 1
+        return True
     
     def export_processing(self, l1, l2):
         """Export directive"""
