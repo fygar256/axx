@@ -146,7 +146,7 @@ class StringUtils:
         idx = 0
         while idx < len(l):
             if l[idx:idx+2] == '/*':
-                return "" if idx == 0 else l[0:idx-1]
+                return "" if idx == 0 else l[0:idx]
             idx += 1
         return l
     
@@ -805,7 +805,10 @@ class ExpressionEvaluator:
         x, idx = self.term5(s, idx)
         while idx < len(s) and s[idx] == '\'':
             t, idx = self.term5(s, idx + 1)
-            x = (x & ~((~0) << t)) | ((~0) << t if (x >> (t-1) & 1) else 0)
+            if t==0:
+                x=0
+            else:
+                x = (x & ~((~0) << t)) | ((~0) << t if (x >> (t-1) & 1) else 0)
         return x, idx
     
     def term7(self, s, idx):
