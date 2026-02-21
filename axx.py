@@ -12,7 +12,6 @@ import string
 import subprocess
 import itertools
 import struct
-import numpy as np
 import sys
 import os
 import math
@@ -29,7 +28,6 @@ CB = chr(0x91)  # close double bracket
 # Constants
 UNDEF = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 VAR_UNDEF = 0
-LABELS = {}
 
 # Character sets
 CAPITAL = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -72,6 +70,7 @@ class AssemblerState:
         self.current_file = ""
         
         # Data structures
+        self.labels = {}
         self.sections = {}
         self.symbols = {}
         self.patsymbols = {}
@@ -484,7 +483,7 @@ class LabelManager:
         """Get label section"""
         self.state.error_undefined_label = False
         try:
-            v = LABELS[k][1]
+            v = self.state.labels[k][1]
         except:
             v = UNDEF
             self.state.error_undefined_label = True
@@ -494,7 +493,7 @@ class LabelManager:
         """Get label value"""
         self.state.error_undefined_label = False
         try:
-            v = LABELS[k][0]
+            v = self.state.labels[k][0]
         except:
             v = UNDEF
             self.state.error_undefined_label = True
@@ -503,7 +502,7 @@ class LabelManager:
     def put_value(self, k, v, s):
         """Set label value"""
         if self.state.pas == 1 or self.state.pas == 0:
-            if k in LABELS:
+            if k in self.state.labels:
                 self.state.error_already_defined = True
                 print(f" error - label already defined.")
                 return False
@@ -513,16 +512,15 @@ class LabelManager:
             return False
         
         self.state.error_already_defined = False
-        LABELS[k] = [v, s]
+        self.state.labels[k] = [v, s]
         return True
 
     def printlabels(self):
         result = {}
-        for key, value in LABELS.items():
+        for key, value in self.state.labels.items():
             num, section = value
             result[key] = [hex(num), section]
         print(result)
-        return
         
 class SymbolManager:
     """Manages assembler symbols"""
@@ -600,22 +598,22 @@ class ExpressionEvaluator:
         idx = StringUtils.skipspc(s, idx)
         return x, idx
 
-    def xeval(self,x,y):
+    def xeval(self, x, _=None):
         escaped = re.escape(self.state.lwordchars)
         pattern = rf":([{escaped}]+)(?=[^{escaped}]|$)"
 
         def replacer(match):
-            full_label = match.group(0)   # 例 ":name"
-            label_name = match.group(1)   # 例 "name"
+            label_name = match.group(1)
             try:
-                val=LABELS[f'{label_name}'][0]
+                val = self.state.labels[label_name][0]
             except:
                 self.state.error_undefined_label = True
-                val=0
+                val = 0
             return hex(val)
 
         s = re.sub(pattern, replacer, x)
-        return eval(s,y)
+        safe_env = {"enfloat": enfloat, "endouble": endouble, "__builtins__": {}}
+        return eval(s, safe_env)
 
     def factor1(self, s, idx):
         """Parse primary factor"""
@@ -681,7 +679,7 @@ class ExpressionEvaluator:
                 elif t == '-inf':
                     x = 0xfff0000000000000
                 else:
-                    v = float(self.xeval(t,globals()))
+                    v = float(self.xeval(t, None))
                     x = int.from_bytes(struct.pack('>d', v), "big")
         elif idx + 3 <= len(s) and s[idx:idx+3] == 'flt':
             idx += 3
@@ -694,7 +692,7 @@ class ExpressionEvaluator:
                 elif t == '-inf':
                     x = 0xff800000
                 else:
-                    v = float(self.xeval(t,globals()))
+                    v = float(self.xeval(t, None))
                     x = int.from_bytes(struct.pack('>f', v), "big")
         elif idx < len(s) and s[idx].isdigit():
             fs, idx = self.parser.get_intstr(s, idx)
@@ -917,56 +915,64 @@ class BinaryWriter:
     
     def __init__(self, state):
         self.state = state
+        self._buffer = {}   # {position: byte_value} のランダムアクセスバッファ
     
-    def fwrite(self, file_path, position, x, prt):
-        """Write binary data to file"""
+    def _store(self, position, byte_val):
+        """バッファに1バイト格納"""
+        self._buffer[position] = byte_val & 0xff
+    
+    def flush(self):
+        """バッファをファイルに書き出す（アセンブル終了時に呼ぶ）"""
+        if not self.state.outfile or not self._buffer:
+            return
+        max_pos = max(self._buffer.keys())
         b = 8 if self.state.bts <= 8 else self.state.bts
         byts = b // 8 + (0 if b / 8 == b // 8 else 1)
-        
-        if file_path != "":
-            file = open(file_path, 'a+b')
-            file.seek(position * byts)
-        
+        size = (max_pos + 1) * byts
+        data = bytearray(size)
+        for pos, val in self._buffer.items():
+            data[pos] = val & 0xff
+        with open(self.state.outfile, 'wb') as f:
+            f.write(data)
+
+    def fwrite(self, position, x, prt):
+        """1ワードをバッファへ書き込み、標準出力にも表示"""
+        b = 8 if self.state.bts <= 8 else self.state.bts
+        byts = b // 8 + (0 if b / 8 == b // 8 else 1)
+
         cnt = 0
         if self.state.endian == 'little':
             p = (2 ** self.state.bts) - 1
             v = x & p
             for i in range(byts):
                 vv = v & 0xff
-                if file_path != "":
-                    file.write(struct.pack('B', vv))
+                self._store(position + i, vv)
                 if prt:
                     print(" 0x%02x" % vv, end='')
-                v = v >> 8
+                v >>= 8
                 cnt += 1
         else:
             bp = (2 ** self.state.bts) - 1
             x = x & bp
             p = 0xff << (byts * 8 - 8)
             for i in range(byts - 1, -1, -1):
-                v = ((x & p) >> (i * 8)) & 0xff
-                if file_path != "":
-                    file.write(struct.pack('B', v))
+                vv = ((x & p) >> (i * 8)) & 0xff
+                self._store(position + (byts - 1 - i), vv)
                 if prt:
-                    print(" 0x%02x" % v, end='')
-                p = p >> 8
+                    print(" 0x%02x" % vv, end='')
+                p >>= 8
                 cnt += 1
-        
-        if file_path != "":
-            file.close()
         return cnt
-    
+
     def outbin2(self, a, x):
         """Output binary without printing"""
         if self.state.pas == 2 or self.state.pas == 0:
-            x = int(x)
-            self.fwrite(self.state.outfile, a, x, 0)
+            self.fwrite(a, int(x), 0)
     
     def outbin(self, a, x):
         """Output binary with printing"""
         if self.state.pas == 2 or self.state.pas == 0:
-            x = int(x)
-            self.fwrite(self.state.outfile, a, x, 1)
+            self.fwrite(a, int(x), 1)
     
     def align_(self, addr):
         """Align address"""
@@ -1999,10 +2005,6 @@ class Assembler:
         except:
             pass
         
-        if self.state.outfile:
-            f = open(self.state.outfile, "wb")
-            f.close()
-        
         if len(sys_argv) == 2:
             self.state.pc = 0
             self.state.pas = 0
@@ -2032,6 +2034,8 @@ class Assembler:
             self.state.pas = 2
             self.state.ln = 1
             self.fileassemble(sys_argv[2])
+        
+        self.binary_writer.flush()
         
         if expefile != "":
             self.state.expfile = expefile
