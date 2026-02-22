@@ -151,12 +151,14 @@ class StringUtils:
     
     @staticmethod
     def remove_comment_asm(l):
-        """Remove ; style comments"""
-        if ';' in l:
-            s = l[0:l.index(';')]
-        else:
-            s = l
-        return s.rstrip()
+        """Remove ; style comments, but preserve semicolons inside string literals."""
+        in_string = False
+        for i, ch in enumerate(l):
+            if ch == '"':
+                in_string = not in_string
+            elif ch == ';' and not in_string:
+                return l[:i].rstrip()
+        return l.rstrip()
     
     @staticmethod
     def get_param_to_spc(s, idx):
