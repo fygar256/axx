@@ -989,8 +989,9 @@ class BinaryWriter:
         val = x & mask
         
         if prt:
-            # 11ビットなどの場合、16進数で表示
-            print(f" 0x{val:x}", end='')
+            b = self.state.bts
+            colm = (b + 3) // 4  # bビットを16進表示するのに必要な桁数（切り上げ）
+            print(f" 0x{val:0{colm}x}", end='')
 
         self._store(position, val)
         return 1 # 1ワード書き込んだことを返す
@@ -1056,7 +1057,7 @@ class DirectiveProcessor:
     
     def bits(self, i):
         """Bits directive"""
-        if len(i) == 0 or (len(i) > 1 and i[0] != '.bits'):
+        if len(i) == 0 or i[0] != '.bits':
             return False
         
         if len(i) >= 2 and i[1] == 'big':
@@ -1073,7 +1074,7 @@ class DirectiveProcessor:
     
     def paddingp(self, i):
         """Padding directive"""
-        if len(i) == 0 or (len(i) > 1 and i[0] != '.padding'):
+        if len(i) == 0 or i[0] != '.padding':
             return False
         
         if len(i) >= 3:
@@ -1085,7 +1086,7 @@ class DirectiveProcessor:
     
     def symbolc(self, i):
         """Symbol characters directive"""
-        if len(i) == 0 or (len(i) > 1 and i[0] != '.symbolc'):
+        if len(i) == 0 or i[0] != '.symbolc':
             return False
         
         if len(i) > 3:
@@ -1190,9 +1191,9 @@ class PatternMatcher:
                 open_count += 1
                 bracket_positions.append((open_count, i, 'open'))
             elif char == CB:
-                # Record close with the same level as its matching open
-                bracket_positions.append((open_count, i, 'close'))
+                # Decrement first so close matches the same level as its open
                 open_count -= 1
+                bracket_positions.append((open_count + 1, i, 'close'))
 
         for index in sorted(l, reverse=True):
             start_index = None
@@ -1310,52 +1311,50 @@ class PatternFileReader:
         if fn == '':
             return []
         
-        f = open(fn, "rt")
         p = []
         w = []
-        
-        while True:
-            l = f.readline()
-            if not l:
-                break
-            
-            l = StringUtils.remove_comment(l)
-            l = l.replace('\t', ' ')
-            l = l.replace(chr(13), '')
-            l = l.replace('\n', '')
-            l = StringUtils.reduce_spaces(l)
-            
-            ww = self.include_pat(l)
-            if ww:
-                w = w + ww
-                continue
-            else:
-                r = []
-                idx = 0
-                while True:
-                    s, idx = self.parser.get_params1(l, idx)
-                    r += [s]
-                    if len(l) <= idx:
-                        break
-                l = r
+        with open(fn, "rt") as f:
+            while True:
+                l = f.readline()
+                if not l:
+                    break
                 
-                if len(l) == 1:
-                    p = [l[0], '', '', '', '', '']
-                elif len(l) == 2:
-                    p = [l[0], '', l[1], '', '', '']
-                elif len(l) == 3:
-                    p = [l[0], l[1], l[2], '', '', '']
-                elif len(l) == 4:
-                    p = [l[0], l[1], l[2], l[3], '', '']
-                elif len(l) == 5:
-                    p = [l[0], l[1], l[2], l[3], l[4], '']
-                elif len(l) == 6:
-                    p = [l[0], l[1], l[2], l[3], l[4], l[5]]
+                l = StringUtils.remove_comment(l)
+                l = l.replace('\t', ' ')
+                l = l.replace(chr(13), '')
+                l = l.replace('\n', '')
+                l = StringUtils.reduce_spaces(l)
+                
+                ww = self.include_pat(l)
+                if ww:
+                    w = w + ww
+                    continue
                 else:
-                    p = ["", "", "", "", "", "", ""]
-                w.append(p)
+                    r = []
+                    idx = 0
+                    while True:
+                        s, idx = self.parser.get_params1(l, idx)
+                        r += [s]
+                        if len(l) <= idx:
+                            break
+                    l = r
+                    
+                    if len(l) == 1:
+                        p = [l[0], '', '', '', '', '']
+                    elif len(l) == 2:
+                        p = [l[0], '', l[1], '', '', '']
+                    elif len(l) == 3:
+                        p = [l[0], l[1], l[2], '', '', '']
+                    elif len(l) == 4:
+                        p = [l[0], l[1], l[2], l[3], '', '']
+                    elif len(l) == 5:
+                        p = [l[0], l[1], l[2], l[3], l[4], '']
+                    elif len(l) == 6:
+                        p = [l[0], l[1], l[2], l[3], l[4], l[5]]
+                    else:
+                        p = ["", "", "", "", "", "", ""]
+                    w.append(p)
         
-        f.close()
         return w
     
     def include_pat(self, l):
@@ -1522,7 +1521,7 @@ class VLIWProcessor:
         
         vbits = abs(self.state.vliwbits)
         for k in self.state.vliwset:
-            if list(set(k[0])) == list(set(idxlst)) or self.state.vliwtemplatebits == 0:
+            if set(k[0]) == set(idxlst) or self.state.vliwtemplatebits == 0:
                 im = 2 ** self.state.vliwinstbits - 1
                 tm = 2 ** abs(self.state.vliwtemplatebits) - 1
                 pm = 2 ** vbits - 1
@@ -1958,9 +1957,8 @@ class Assembler:
                     stdintmp.write(af)
             fn = tmp_path
         
-        f = open(fn, "rt")
-        af = f.readlines()
-        f.close()
+        with open(fn, "rt") as f:
+            af = f.readlines()
         
         for i in af:
             self.lineassemble0(i)
