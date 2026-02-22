@@ -270,7 +270,12 @@ class Parser:
         return StringUtils.upper(t), idx
     
     def get_label_word(self, s, idx):
-        """Get label word from position"""
+        """Get label word from position.
+
+        A trailing ':' is consumed as part of the label definition only when
+        it is NOT immediately followed by '=' (which would form ':=' – an
+        assignment operator rather than a label terminator).
+        """
         t = ""
         if idx < len(s) and (s[idx] == '.' or (s[idx] not in DIGIT and s[idx] in self.state.lwordchars)):
             t = s[idx]
@@ -278,10 +283,11 @@ class Parser:
             while idx < len(s) and s[idx] in self.state.lwordchars:
                 t += s[idx]
                 idx += 1
-            
-            if idx < len(s) and s[idx] == ':':
+
+            # Consume ':' only when it is a label terminator, not part of ':='
+            if idx < len(s) and s[idx] == ':' and (idx + 1 >= len(s) or s[idx + 1] != '='):
                 idx += 1
-        
+
         return t, idx
     
     def get_params1(self, l, idx):
@@ -314,117 +320,57 @@ class IEEE754Converter:
     
     @staticmethod
     def decimal_to_ieee754_32bit_hex(a):
-        """Convert decimal to IEEE 754 32-bit hex"""
-        BIAS = 127
-        SIGNIFICAND_BITS = 23
-        EXPONENT_BITS = 8
-        
-        getcontext().prec = 34
-        
+        """Convert decimal to IEEE 754 32-bit hex.
+
+        Uses Python's struct module for the actual bit conversion so that
+        the result is identical to what the hardware would produce.  The
+        Decimal-based path was previously incorrect because Decimal.adjusted()
+        returns a *decimal* (base-10) exponent, not a binary (base-2) one,
+        which produced wrong bit patterns for most non-power-of-10 values.
+        """
         if a == 'inf':
-            a = 'Infinity'
+            return "0x7F800000"
         elif a == '-inf':
-            a = '-Infinity'
+            return "0xFF800000"
         elif a == 'nan':
-            a = 'NaN'
-        d = Decimal(a)
-        
-        if d.is_nan():
-            sign = 0
-            exponent = (1 << EXPONENT_BITS) - 1
-            fraction = 1 << (SIGNIFICAND_BITS - 1)
-        elif d == Decimal('Infinity'):
-            sign = 0
-            exponent = (1 << EXPONENT_BITS) - 1
-            fraction = 0
-        elif d == Decimal('-Infinity'):
-            sign = 1
-            exponent = (1 << EXPONENT_BITS) - 1
-            fraction = 0
-        elif d == Decimal(0):
-            sign = 0 if d >= 0 else 1
-            exponent = 0
-            fraction = 0
-        else:
-            sign = 0 if d >= 0 else 1
-            d = abs(d)
-            
-            exponent_value = d.adjusted() + BIAS
-            
-            if exponent_value <= 0:
-                exponent = 0
-                fraction = int(d.scaleb(BIAS - SIGNIFICAND_BITS).normalize() * (2**SIGNIFICAND_BITS))
-            else:
-                exponent = exponent_value
-                normalized_value = d / (Decimal(2) ** d.adjusted())
-                fraction = int((normalized_value - 1) * (2**SIGNIFICAND_BITS))
-            
-            fraction &= (1 << SIGNIFICAND_BITS) - 1
-        
-        bits = (sign << 31) | (exponent << SIGNIFICAND_BITS) | fraction
+            return "0x7FC00000"
+
+        fval = float(Decimal(a))
+        bits = struct.unpack('I', struct.pack('f', fval))[0]
         return f"0x{bits:08X}"
     
     @staticmethod
     def decimal_to_ieee754_64bit_hex(a):
-        """Convert decimal to IEEE 754 64-bit hex"""
-        BIAS = 1023
-        SIGNIFICAND_BITS = 52
-        EXPONENT_BITS = 11
-        
-        getcontext().prec = 34
-        
+        """Convert decimal to IEEE 754 64-bit hex.
+
+        Uses struct for correctness (same reason as the 32-bit variant).
+        """
         if a == 'inf':
-            a = 'Infinity'
+            return "0x7FF0000000000000"
         elif a == '-inf':
-            a = '-Infinity'
+            return "0xFFF0000000000000"
         elif a == 'nan':
-            a = 'NaN'
-        d = Decimal(a)
-        
-        if d.is_nan():
-            sign = 0
-            exponent = (1 << EXPONENT_BITS) - 1
-            fraction = 1 << (SIGNIFICAND_BITS - 1)
-        elif d == Decimal('Infinity'):
-            sign = 0
-            exponent = (1 << EXPONENT_BITS) - 1
-            fraction = 0
-        elif d == Decimal('-Infinity'):
-            sign = 1
-            exponent = (1 << EXPONENT_BITS) - 1
-            fraction = 0
-        elif d == Decimal(0):
-            sign = 0 if d >= 0 else 1
-            exponent = 0
-            fraction = 0
-        else:
-            sign = 0 if d >= 0 else 1
-            d = abs(d)
-            
-            exponent_value = d.adjusted() + BIAS
-            
-            if exponent_value <= 0:
-                exponent = 0
-                fraction = int(d.scaleb(BIAS - SIGNIFICAND_BITS).normalize() * (2**SIGNIFICAND_BITS))
-            else:
-                exponent = exponent_value
-                normalized_value = d / (Decimal(2) ** d.adjusted())
-                fraction = int((normalized_value - 1) * (2**SIGNIFICAND_BITS))
-            
-            fraction &= (1 << SIGNIFICAND_BITS) - 1
-        
-        bits = (sign << 63) | (exponent << SIGNIFICAND_BITS) | fraction
+            return "0x7FF8000000000000"
+
+        fval = float(Decimal(a))
+        bits = struct.unpack('Q', struct.pack('d', fval))[0]
         return f"0x{bits:016X}"
     
     @staticmethod
     def decimal_to_ieee754_128bit_hex(a):
-        """Convert decimal to IEEE 754 128-bit hex"""
+        """Convert decimal to IEEE 754 128-bit (binary128 / quad) hex.
+
+        Python's struct does not support binary128, so we implement the
+        conversion with the Decimal module.  The key fix versus the previous
+        version is that the binary exponent is computed via log2 rather than
+        Decimal.adjusted() (which gives a *decimal* exponent).
+        """
         BIAS = 16383
         SIGNIFICAND_BITS = 112
         EXPONENT_BITS = 15
-        
-        getcontext().prec = 34
-        
+
+        getcontext().prec = 40  # extra precision headroom for 128-bit
+
         if a == 'inf':
             a = 'Infinity'
         elif a == '-inf':
@@ -432,7 +378,7 @@ class IEEE754Converter:
         elif a == 'nan':
             a = 'NaN'
         d = Decimal(a)
-        
+
         if d.is_nan():
             sign = 0
             exponent = (1 << EXPONENT_BITS) - 1
@@ -445,26 +391,45 @@ class IEEE754Converter:
             sign = 1
             exponent = (1 << EXPONENT_BITS) - 1
             fraction = 0
-        elif d == Decimal(0):
-            sign = 0 if d >= 0 else 1
+        elif d == 0:
+            sign = 0
             exponent = 0
             fraction = 0
         else:
             sign = 0 if d >= 0 else 1
             d = abs(d)
-            
-            exponent_value = d.adjusted() + BIAS
-            
-            if exponent_value <= 0:
+
+            # Compute the binary exponent: floor(log2(d))
+            # Use integer scaling to stay exact inside Decimal arithmetic.
+            # Scale d by 2^SIGNIFICAND_BITS to extract the significand bits.
+            two = Decimal(2)
+            # Find biased binary exponent via repeated halving/doubling
+            exp_unbiased = int(d.ln() / Decimal(2).ln())  # approximate
+            # Refine: make sure 1 <= d / 2^exp_unbiased < 2
+            scale = two ** exp_unbiased
+            normalized = d / scale
+            if normalized >= 2:
+                exp_unbiased += 1
+                normalized /= 2
+            elif normalized < 1:
+                exp_unbiased -= 1
+                normalized *= 2
+
+            biased_exp = exp_unbiased + BIAS
+
+            if biased_exp <= 0:
+                # Subnormal
                 exponent = 0
-                fraction = int(d.scaleb(BIAS - SIGNIFICAND_BITS).normalize() * (2**SIGNIFICAND_BITS))
+                # Shift significand: value = d / 2^(1 - BIAS - SIGNIFICAND_BITS)
+                shift = Decimal(2) ** (1 - BIAS - SIGNIFICAND_BITS)
+                fraction = int(d / shift)
             else:
-                exponent = exponent_value
-                normalized_value = d / (Decimal(2) ** d.adjusted())
-                fraction = int((normalized_value - 1) * (2**SIGNIFICAND_BITS))
-            
+                exponent = biased_exp
+                # Fractional bits = (normalized - 1) * 2^SIGNIFICAND_BITS
+                fraction = int((normalized - 1) * (two ** SIGNIFICAND_BITS))
+
             fraction &= (1 << SIGNIFICAND_BITS) - 1
-        
+
         bits = (sign << 127) | (exponent << SIGNIFICAND_BITS) | fraction
         return f"0x{bits:032X}"
 
@@ -1968,13 +1933,15 @@ class Assembler:
             self.state.ln = self.state.lnstack.pop()
     
     def file_input_from_stdin(self):
-        """Read input from stdin"""
+        """Read input from stdin until EOF (Ctrl+D / piped end).
+        Empty lines within the input are preserved correctly."""
         af = ""
         while True:
-            line = sys.stdin.readline().strip()
-            if line == '':
+            line = sys.stdin.readline()
+            if line == '':   # EOF: readline() returns '' only at EOF
                 break
-            af += line + '\n'
+            # Normalize line endings but keep the newline so line numbers match
+            af += line.replace('\r', '')
         return af
     
     def imp_label(self, l):
@@ -1993,55 +1960,74 @@ class Assembler:
         self.label_manager.put_value(label, v, section)
         return True
     
-    def option(self, l, o):
-        """Parse command line option"""
-        if o in l:
-            idx = l.index(o)
-            if idx + 1 < len(l):
-                if idx + 2 < len(l):
-                    return l[0:idx] + l[idx+2:], l[idx+1]
-                else:
-                    return l[0:idx], l[idx+1]
-            else:
-                return l[0:idx], ''
-        return l, ''
-    
     def printaddr(self, pc):
         """Print address"""
         print("%016x: " % pc, end='')
-    
+
+    def _build_arg_parser(self):
+        """Build and return the argparse.ArgumentParser for axx."""
+        import argparse
+        ap = argparse.ArgumentParser(
+            prog='axx',
+            description='axx general assembler programmed and designed by Taisuke Maekawa',
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        ap.add_argument('patternfile',
+                        help='Pattern definition file (.axx)')
+        ap.add_argument('sourcefile', nargs='?', default=None,
+                        help='Assembly source file (.s). Omit for interactive mode.')
+        ap.add_argument('-o', dest='outfile', default='',
+                        metavar='OUTFILE',
+                        help='Output binary file')
+        ap.add_argument('-e', dest='expfile', default='',
+                        metavar='EXPORT_TSV',
+                        help='Export labels to TSV file (plain format)')
+        ap.add_argument('-E', dest='expfile_elf', default='',
+                        metavar='EXPORT_ELF_TSV',
+                        help='Export labels to TSV file (ELF section flags format)')
+        ap.add_argument('-i', dest='impfile', default='',
+                        metavar='IMPORT_TSV',
+                        help='Import labels from TSV file')
+        return ap
+
     def run(self):
         """Main assembly process"""
+        ap = self._build_arg_parser()
+
+        # argparse prints help and exits when no arguments are given,
+        # but we want a custom usage message and a clean return instead.
         if len(sys.argv) == 1:
-            print("axx general assembler programmed and designed by Taisuke Maekawa")
-            print("Usage: python axx.py patternfile.axx [sourcefile.s] [-o outfile.bin] [-e export_labels.tsv] [-i import_labels.tsv]")
+            ap.print_help()
             return
-        
-        sys_argv = sys.argv
-        
-        if len(sys_argv) >= 2:
-            self.state.pat = self.pattern_reader.readpat(sys_argv[1])
-            self.setpatsymbols(self.state.pat)
-        
-        sys_argv, self.state.expfile = self.option(sys_argv, "-e")
-        sys_argv, expefile = self.option(sys_argv, "-E")
-        sys_argv, self.state.outfile = self.option(sys_argv, '-o')
-        sys_argv, self.state.impfile = self.option(sys_argv, "-i")
-        
-        if self.state.impfile != "":
-            with open(self.state.impfile, "rt") as label_file:
-                while True:
-                    l = label_file.readline()
-                    if not l:
-                        break
+
+        args = ap.parse_args()
+
+        # --- Apply parsed options to assembler state ---
+        self.state.outfile  = args.outfile
+        self.state.expfile  = args.expfile
+        self.state.impfile  = args.impfile
+        expefile            = args.expfile_elf   # ELF-flavoured export (sets elf=1)
+
+        # Load pattern file
+        self.state.pat = self.pattern_reader.readpat(args.patternfile)
+        self.setpatsymbols(self.state.pat)
+
+        # Import labels
+        if self.state.impfile:
+            with open(self.state.impfile, 'rt') as label_file:
+                for l in label_file:
                     self.imp_label(l)
-        
-        try:
-            os.remove(self.state.outfile)
-        except:
-            pass
-        
-        if len(sys_argv) == 2:
+
+        # Remove stale output file before writing
+        if self.state.outfile:
+            try:
+                os.remove(self.state.outfile)
+            except OSError:
+                pass
+
+        # --- Assemble ---
+        if args.sourcefile is None:
+            # Interactive / stdin mode (single pass)
             self.state.pc = 0
             self.state.pas = 0
             self.state.ln = 1
@@ -2060,29 +2046,30 @@ class Assembler:
                     self.label_manager.printlabels()
                     continue
                 self.lineassemble0(line)
-        
-        elif len(sys_argv) >= 3:
+        else:
+            # Two-pass file assembly
             self.state.pc = 0
             self.state.pas = 1
             self.state.ln = 1
-            self.fileassemble(sys_argv[2])
+            self.fileassemble(args.sourcefile)
             self.state.pc = 0
             self.state.pas = 2
             self.state.ln = 1
-            self.fileassemble(sys_argv[2])
-        
+            self.fileassemble(args.sourcefile)
+
         self.binary_writer.flush()
-        
-        if expefile != "":
+
+        # --- Export labels ---
+        if expefile:
             self.state.expfile = expefile
             elf = 1
         else:
             elf = 0
-        
-        if self.state.expfile != "":
-            h = list(self.state.export_labels.items())
+
+        if self.state.expfile:
+            h   = list(self.state.export_labels.items())
             key = list(self.state.sections.keys())
-            with open(self.state.expfile, "wt") as label_file:
+            with open(self.state.expfile, 'wt') as label_file:
                 for i in key:
                     if i == '.text' and elf == 1:
                         flag = 'AX'
@@ -2091,7 +2078,9 @@ class Assembler:
                     else:
                         flag = ''
                     start = self.state.sections[i][0]
-                    label_file.write(f"{i}\t{start:#x}\t{self.state.sections[i][1]:#x}\t{flag}\n")
+                    label_file.write(
+                        f"{i}\t{start:#x}\t{self.state.sections[i][1]:#x}\t{flag}\n"
+                    )
                 for i in h:
                     label_file.write(f"{i[0]}\t{i[1][0]:#x}\n")
 
