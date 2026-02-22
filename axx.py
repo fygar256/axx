@@ -481,11 +481,18 @@ class LabelManager:
     def put_value(self, k, v, s):
         """Set label value"""
         if self.state.pas == 1 or self.state.pas == 0:
+            # パス1/インタラクティブ: 同名ラベルの二重定義はエラー
             if k in self.state.labels:
                 self.state.error_already_defined = True
                 print(f" error - label already defined.")
                 return False
-        
+        elif self.state.pas == 2:
+            # パス2: パス1で登録されていないラベルが新出現した場合はエラー
+            if k not in self.state.labels:
+                self.state.error_already_defined = True
+                print(f" error - label '{k}' not defined in pass 1.")
+                return False
+
         if StringUtils.upper(k) in self.state.patsymbols:
             print(f" error - '{k}' is a pattern file symbol.")
             return False
@@ -788,8 +795,8 @@ class ExpressionEvaluator:
             if next_idx >= len(s) or (s[next_idx] not in DIGIT and s[next_idx] != '('):
                 break
             t, idx = self.term5(s, idx + 1)
-            if t==0:
-                x=0
+            if t <= 0:
+                x = 0
             else:
                 x = (x & ~((~0) << t)) | ((~0) << t if (x >> (t-1) & 1) else 0)
         return x, idx
@@ -999,7 +1006,7 @@ class DirectiveProcessor:
         if len(i) == 0 or i[0] != '.clearsym':
             return False
         
-        if len(i) > 2:
+        if len(i) >= 2:
             key = StringUtils.upper(i[2])
             self.state.symbols.pop(key, None)
         elif len(i) == 1:
@@ -1164,9 +1171,9 @@ class PatternMatcher:
             start_index = None
             end_index = None
             for count, pos, btype in bracket_positions:
-                if count == index and btype == 'open':
+                if count == index and btype == 'open' and start_index is None:
                     start_index = pos
-                elif count == index and btype == 'close':
+                elif count == index and btype == 'close' and start_index is not None:
                     end_index = pos
                     break
 
@@ -1781,26 +1788,17 @@ class Assembler:
             for a in LOWER:
                 self.var_manager.put(a, VAR_UNDEF)
             
-            if i is None:
-                continue
-            if self.directive_proc.set_symbol(i):
-                continue
-            if self.directive_proc.clear_symbol(i):
-                continue
-            if self.directive_proc.paddingp(i):
-                continue
-            if self.directive_proc.bits(i):
-                continue
-            if self.directive_proc.symbolc(i):
-                continue
-            if self.directive_proc.epic(i):
-                continue
-            if self.directive_proc.vliwp(i):
-                continue
+            if i is None: continue
+            if self.directive_proc.set_symbol(i): continue
+            if self.directive_proc.clear_symbol(i): continue
+            if self.directive_proc.paddingp(i): continue
+            if self.directive_proc.bits(i): continue
+            if self.directive_proc.symbolc(i): continue
+            if self.directive_proc.epic(i): continue
+            if self.directive_proc.vliwp(i): continue
             
             lw = len([_ for _ in i if _])
-            if lw == 0:
-                continue
+            if lw == 0: continue
             
             lin = l + ' ' + l2
             lin = StringUtils.reduce_spaces(lin)
@@ -1820,7 +1818,7 @@ class Assembler:
                         idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                         loopflag = False
                         break
-                except:
+                except Exception:
                     oerr = True
                     loopflag = False
                     break
@@ -1878,7 +1876,7 @@ class Assembler:
             vflag = False
             try:
                 vflag = self.vliw_proc.vliwprocess(line, idxs, objl, flag, idx, self.lineassemble2)
-            except:
+            except Exception:
                 if self.state.pas == 0 or self.state.pas == 2:
                     print(" error - Some error(s) in vliw definition.")
             return vflag
@@ -1911,26 +1909,27 @@ class Assembler:
         self.state.current_file = fn
         self.state.ln = 1
         
-        if fn == "stdin":
-            # Pass 1 (pas==1): read stdin and write to axx.tmp
-            # Pass 2 (pas==2) and interactive (pas==0): re-use axx.tmp written in pass 1.
-            # If axx.tmp does not exist yet (e.g. first/only pass), always read from stdin.
-            tmp_path = "axx.tmp"
-            if self.state.pas == 1 or not os.path.exists(tmp_path):
-                af = self.file_input_from_stdin()
-                with open(tmp_path, "wt") as stdintmp:
-                    stdintmp.write(af)
-            fn = tmp_path
-        
-        with open(fn, "rt") as f:
-            af = f.readlines()
-        
-        for i in af:
-            self.lineassemble0(i)
-        
-        if self.state.fnstack:
-            self.state.current_file = self.state.fnstack.pop()
-            self.state.ln = self.state.lnstack.pop()
+        try:
+            if fn == "stdin":
+                # Pass 1 (pas==1): read stdin and write to axx.tmp
+                # Pass 2 (pas==2) and interactive (pas==0): re-use axx.tmp written in pass 1.
+                # If axx.tmp does not exist yet (e.g. first/only pass), always read from stdin.
+                tmp_path = "axx.tmp"
+                if self.state.pas == 1 or not os.path.exists(tmp_path):
+                    af = self.file_input_from_stdin()
+                    with open(tmp_path, "wt") as stdintmp:
+                        stdintmp.write(af)
+                fn = tmp_path
+            
+            with open(fn, "rt") as f:
+                af = f.readlines()
+            
+            for i in af:
+                self.lineassemble0(i)
+        finally:
+            if self.state.fnstack:
+                self.state.current_file = self.state.fnstack.pop()
+                self.state.ln = self.state.lnstack.pop()
     
     def file_input_from_stdin(self):
         """Read input from stdin until EOF (Ctrl+D / piped end).
