@@ -1350,8 +1350,8 @@ class ObjectGenerator:
         self.binary_writer = binary_writer
     
     def replace_percent_with_index(self, s):
-        """Replace %% with sequential numbers starting from 1"""
-        count = 1
+        """Replace %% with sequential numbers starting from 0"""
+        count = 0
         result = []
         i = 0
         while i < len(s):
@@ -1360,7 +1360,7 @@ class ObjectGenerator:
                 count += 1
                 i += 2
             elif i+1<len(s) and s[i:i+2] == "%0":
-                count = 1
+                count = 0
                 i += 2
             else:
                 result.append(s[i])
