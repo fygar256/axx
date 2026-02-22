@@ -361,15 +361,17 @@ class IEEE754Converter:
         """Convert decimal to IEEE 754 128-bit (binary128 / quad) hex.
 
         Python's struct does not support binary128, so we implement the
-        conversion with the Decimal module.  The key fix versus the previous
-        version is that the binary exponent is computed via log2 rather than
-        Decimal.adjusted() (which gives a *decimal* exponent).
+        conversion with the Decimal module at high precision.
+        The binary exponent is found by integer bit-length of the scaled
+        integer approximation, which avoids any float-precision loss.
+        Precision is set to 60 digits to cover the 112-bit significand
+        (~34 significant decimal digits) with rounding headroom.
         """
         BIAS = 16383
         SIGNIFICAND_BITS = 112
         EXPONENT_BITS = 15
 
-        getcontext().prec = 40  # extra precision headroom for 128-bit
+        getcontext().prec = 60  # 112ビット仮数部(約34桁)を十分カバー
 
         if a == 'inf':
             a = 'Infinity'
@@ -399,34 +401,40 @@ class IEEE754Converter:
             sign = 0 if d >= 0 else 1
             d = abs(d)
 
-            # Compute the binary exponent: floor(log2(d))
-            # Use integer scaling to stay exact inside Decimal arithmetic.
-            # Scale d by 2^SIGNIFICAND_BITS to extract the significand bits.
             two = Decimal(2)
-            # Find biased binary exponent via repeated halving/doubling
-            exp_unbiased = int(d.ln() / Decimal(2).ln())  # approximate
-            # Refine: make sure 1 <= d / 2^exp_unbiased < 2
+
+            # 2進指数を純粋なDecimal演算で求める:
+            #   d に 2^SIGNIFICAND_BITS を掛けて整数化し、
+            #   そのbit長から指数を逆算する。float変換は一切使わない。
+            scaled = int(d * (two ** SIGNIFICAND_BITS))
+            if scaled == 0:
+                exp_unbiased = -(BIAS - 1)
+            else:
+                # bit_length() - 1 = floor(log2(scaled))
+                exp_unbiased = scaled.bit_length() - 1 - SIGNIFICAND_BITS
+
             scale = two ** exp_unbiased
             normalized = d / scale
-            if normalized >= 2:
+
+            # 念のため境界を確認・微調整
+            while normalized >= 2:
                 exp_unbiased += 1
                 normalized /= 2
-            elif normalized < 1:
+            while normalized < 1:
                 exp_unbiased -= 1
                 normalized *= 2
 
             biased_exp = exp_unbiased + BIAS
 
             if biased_exp <= 0:
-                # Subnormal
+                # サブノーマル数
                 exponent = 0
-                # Shift significand: value = d / 2^(1 - BIAS - SIGNIFICAND_BITS)
-                shift = Decimal(2) ** (1 - BIAS - SIGNIFICAND_BITS)
-                fraction = int(d / shift)
+                shift = two ** (1 - BIAS - SIGNIFICAND_BITS)
+                fraction = int(d / shift + Decimal('0.5'))
             else:
                 exponent = biased_exp
-                # Fractional bits = (normalized - 1) * 2^SIGNIFICAND_BITS
-                fraction = int((normalized - 1) * (two ** SIGNIFICAND_BITS))
+                # 仮数部ビット（最近接丸め）
+                fraction = int((normalized - 1) * (two ** SIGNIFICAND_BITS) + Decimal('0.5'))
 
             fraction &= (1 << SIGNIFICAND_BITS) - 1
 
@@ -652,8 +660,8 @@ class ExpressionEvaluator:
                 fs, idx = self.parser.get_floatstr(s, idx + 1)
                 h = IEEE754Converter.decimal_to_ieee754_128bit_hex(fs)
                 x = int(h, 16)
-            if idx < len(s) and s[idx] == '}':
-                idx += 1
+                if idx < len(s) and s[idx] == '}':
+                    idx += 1
         elif idx + 3 <= len(s) and s[idx:idx+3] == 'dbl':
             idx += 3
             f, t, idx = self.parser.get_curlb(s, idx)
@@ -713,7 +721,7 @@ class ExpressionEvaluator:
         """Handle multiplication, division, modulo"""
         x, idx = self.term0_0(s, idx)
         while idx < len(s):
-            if s[idx] == '*':
+            if s[idx] == '*' and s[idx+1] !='*':
                 t, idx = self.term0_0(s, idx + 1)
                 x *= t
             elif StringUtils.q(s, '//', idx):
@@ -1007,7 +1015,7 @@ class DirectiveProcessor:
             return False
         
         if len(i) >= 2:
-            key = StringUtils.upper(i[2])
+            key = StringUtils.upper(i[2]) # This is an abbreviation for field 1, so this is OK.
             self.state.symbols.pop(key, None)
         elif len(i) == 1:
             self.state.symbols = {}
@@ -1493,7 +1501,7 @@ class VLIWProcessor:
         
         vbits = abs(self.state.vliwbits)
         for k in self.state.vliwset:
-            if set(k[0]) == set(idxlst) or self.state.vliwtemplatebits == 0:
+            if sorted(k[0]) == sorted(idxlst) or self.state.vliwtemplatebits == 0:
                 im = 2 ** self.state.vliwinstbits - 1
                 tm = 2 ** abs(self.state.vliwtemplatebits) - 1
                 pm = 2 ** vbits - 1
