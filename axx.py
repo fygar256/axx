@@ -917,13 +917,6 @@ class BinaryWriter:
         self.state = state
         self._buffer = {}   # {position: byte_value} のランダムアクセスバッファ
     
-    class BinaryWriter:
-        """Handles binary output to files"""
-    
-    def __init__(self, state):
-        self.state = state
-        self._buffer = {}   # {word_position: word_value} ワード単位で保持
-
     def _store(self, position, word_val):
         """ワード単位でバッファに格納"""
         # 11ビットなら 0x7ff でマスクして格納
@@ -976,54 +969,6 @@ class BinaryWriter:
 
         self._store(position, val)
         return 1 # 1ワード書き込んだことを返す
-
-    """
-    def _store(self, position, byte_val):
-        self._buffer[position] = byte_val & 0xff
-    
-    def flush(self):
-        if not self.state.outfile or not self._buffer:
-            return
-        max_pos = max(self._buffer.keys())
-        b = 8 if self.state.bts <= 8 else self.state.bts
-        byts = b // 8 + (0 if b / 8 == b // 8 else 1)
-        size = (max_pos + 1) * byts
-        data = bytearray(size)
-        for pos, val in self._buffer.items():
-            data[pos] = val & 0xff
-        with open(self.state.outfile, 'wb') as f:
-            f.write(data)
-
-    def fwrite(self, position, x, prt):
-        b = 8 if self.state.bts <= 8 else self.state.bts
-        byts = b // 8 + (0 if b / 8 == b // 8 else 1)
-
-        cnt = 0
-        if prt:
-            if b==8:
-                print(" 0x%02x" % (x & 0xff), end='')
-            else:
-                print(" 0x%x" % x, end='')
-
-        if self.state.endian == 'little':
-            p = (2 ** self.state.bts) - 1
-            v = x & p
-            for i in range(byts):
-                vv = v & 0xff
-                self._store(position + i, vv)
-                v >>= 8
-                cnt += 1
-        else:
-            bp = (2 ** self.state.bts) - 1
-            x = x & bp
-            p = 0xff << (byts * 8 - 8)
-            for i in range(byts - 1, -1, -1):
-                vv = ((x & p) >> (i * 8)) & 0xff
-                self._store(position + (byts - 1 - i), vv)
-                p >>= 8
-                cnt += 1
-        return cnt
-        """
 
     def outbin2(self, a, x):
         """Output binary without printing"""
