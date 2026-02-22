@@ -917,12 +917,71 @@ class BinaryWriter:
         self.state = state
         self._buffer = {}   # {position: byte_value} のランダムアクセスバッファ
     
+    class BinaryWriter:
+        """Handles binary output to files"""
+    
+    def __init__(self, state):
+        self.state = state
+        self._buffer = {}   # {word_position: word_value} ワード単位で保持
+
+    def _store(self, position, word_val):
+        """ワード単位でバッファに格納"""
+        # 11ビットなら 0x7ff でマスクして格納
+        mask = (1 << self.state.bts) - 1
+        self._buffer[position] = word_val & mask
+    
+    def flush(self):
+        """バッファをファイルに書き出す"""
+        if not self.state.outfile or not self._buffer:
+            return
+
+        max_word_pos = max(self._buffer.keys())
+        
+        # 1ワードあたりに必要なバイト数を計算 (例: 11bit -> 2bytes)
+        word_bits = self.state.bts
+        bytes_per_word = (word_bits + 7) // 8
+        
+        total_size = (max_word_pos + 1) * bytes_per_word
+        data = bytearray(total_size)
+
+        for pos, val in self._buffer.items():
+            # 書き込み先のバイト位置を特定
+            base_idx = pos * bytes_per_word
+            
+            # エンディアンに基づいてバイト列に変換
+            temp_val = val
+            if self.state.endian == 'little':
+                for i in range(bytes_per_word):
+                    if base_idx + i < total_size:
+                        data[base_idx + i] = temp_val & 0xff
+                        temp_val >>= 8
+            else:
+                for i in range(bytes_per_word - 1, -1, -1):
+                    if base_idx + i < total_size:
+                        data[base_idx + i] = temp_val & 0xff
+                        temp_val >>= 8
+                        
+        with open(self.state.outfile, 'wb') as f:
+            f.write(data)
+
+    def fwrite(self, position, x, prt):
+        """1ワードをバッファへ書き込み"""
+        # デバッグ表示用のマスク
+        mask = (1 << self.state.bts) - 1
+        val = x & mask
+        
+        if prt:
+            # 11ビットなどの場合、16進数で表示
+            print(f" 0x{val:x}", end='')
+
+        self._store(position, val)
+        return 1 # 1ワード書き込んだことを返す
+
+    """
     def _store(self, position, byte_val):
-        """バッファに1バイト格納"""
         self._buffer[position] = byte_val & 0xff
     
     def flush(self):
-        """バッファをファイルに書き出す（アセンブル終了時に呼ぶ）"""
         if not self.state.outfile or not self._buffer:
             return
         max_pos = max(self._buffer.keys())
@@ -936,19 +995,22 @@ class BinaryWriter:
             f.write(data)
 
     def fwrite(self, position, x, prt):
-        """1ワードをバッファへ書き込み、標準出力にも表示"""
         b = 8 if self.state.bts <= 8 else self.state.bts
         byts = b // 8 + (0 if b / 8 == b // 8 else 1)
 
         cnt = 0
+        if prt:
+            if b==8:
+                print(" 0x%02x" % (x & 0xff), end='')
+            else:
+                print(" 0x%x" % x, end='')
+
         if self.state.endian == 'little':
             p = (2 ** self.state.bts) - 1
             v = x & p
             for i in range(byts):
                 vv = v & 0xff
                 self._store(position + i, vv)
-                if prt:
-                    print(" 0x%02x" % vv, end='')
                 v >>= 8
                 cnt += 1
         else:
@@ -958,16 +1020,16 @@ class BinaryWriter:
             for i in range(byts - 1, -1, -1):
                 vv = ((x & p) >> (i * 8)) & 0xff
                 self._store(position + (byts - 1 - i), vv)
-                if prt:
-                    print(" 0x%02x" % vv, end='')
                 p >>= 8
                 cnt += 1
         return cnt
+        """
 
     def outbin2(self, a, x):
         """Output binary without printing"""
         if self.state.pas == 2 or self.state.pas == 0:
             self.fwrite(a, int(x), 0)
+
     
     def outbin(self, a, x):
         """Output binary with printing"""
