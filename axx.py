@@ -220,9 +220,23 @@ class Parser:
             return 'nan', idx + 3
         else:
             fs = ''
-            while idx < len(s) and s[idx] in "0123456789-.eE":
+            # Accept leading minus sign only at the start
+            if idx < len(s) and s[idx] == '-':
+                fs += '-'
+                idx += 1
+            while idx < len(s) and s[idx] in "0123456789.":
                 fs += s[idx]
                 idx += 1
+            # Accept exponent part: e/E followed by optional sign and digits
+            if idx < len(s) and s[idx] in "eE":
+                fs += s[idx]
+                idx += 1
+                if idx < len(s) and s[idx] in "+-":
+                    fs += s[idx]
+                    idx += 1
+                while idx < len(s) and s[idx] in "0123456789":
+                    fs += s[idx]
+                    idx += 1
             return fs, idx
     
     def get_curlb(self, s, idx):
@@ -801,7 +815,13 @@ class ExpressionEvaluator:
     def term6(self, s, idx):
         """Handle sign extension"""
         x, idx = self.term5(s, idx)
+        # Use '\'' as sign-extension operator only when followed by a digit or '('
+        # to avoid ambiguity with character literal closing quotes.
         while idx < len(s) and s[idx] == '\'':
+            next_idx = idx + 1
+            next_idx = StringUtils.skipspc(s, next_idx)
+            if next_idx >= len(s) or (s[next_idx] not in DIGIT and s[next_idx] != '('):
+                break
             t, idx = self.term5(s, idx + 1)
             if t==0:
                 x=0
@@ -871,21 +891,26 @@ class ExpressionEvaluator:
         return x, idx
     
     def expression(self, s, idx):
-        """Main expression evaluator"""
-        s += chr(0)
+        """Main expression evaluator (internal, s must already be NUL-terminated)"""
         idx = StringUtils.skipspc(s, idx)
         x, idx = self.term11(s, idx)
         return x, idx
-    
+
+    def _terminate(self, s):
+        """Return s with a single NUL sentinel appended (idempotent)."""
+        if not s or s[-1] != chr(0):
+            return s + chr(0)
+        return s
+
     def expression_pat(self, s, idx):
         """Expression in pattern mode"""
         self.state.expmode = EXP_PAT
-        return self.expression(s, idx)
+        return self.expression(self._terminate(s), idx)
     
     def expression_asm(self, s, idx):
         """Expression in assembly mode"""
         self.state.expmode = EXP_ASM
-        return self.expression(s, idx)
+        return self.expression(self._terminate(s), idx)
     
     def expression_esc(self, s, idx, stopchar):
         """Expression with escaped stop character"""
@@ -907,7 +932,7 @@ class ExpressionEvaluator:
                     result.append(ch)
         
         replaced = ''.join(result)
-        return self.expression(replaced, idx)
+        return self.expression(self._terminate(replaced), idx)
 
 
 class BinaryWriter:
@@ -1156,31 +1181,33 @@ class PatternMatcher:
     
     def remove_brackets(self, s, l):
         """Remove specified bracket pairs"""
-        open_count = 0
         result = list(s)
         bracket_positions = []
-        
+        open_count = 0
+
         for i, char in enumerate(s):
             if char == OB:
                 open_count += 1
                 bracket_positions.append((open_count, i, 'open'))
             elif char == CB:
+                # Record close with the same level as its matching open
                 bracket_positions.append((open_count, i, 'close'))
-        
+                open_count -= 1
+
         for index in sorted(l, reverse=True):
             start_index = None
             end_index = None
-            for count, pos, type in bracket_positions:
-                if count == index and type == 'open':
+            for count, pos, btype in bracket_positions:
+                if count == index and btype == 'open':
                     start_index = pos
-                elif count == index and type == 'close':
+                elif count == index and btype == 'close':
                     end_index = pos
                     break
-            
+
             if start_index is not None and end_index is not None:
                 for j in range(start_index, end_index + 1):
                     result[j] = ''
-        
+
         return ''.join(result)
     
     def match(self, s, t):
@@ -1353,7 +1380,7 @@ class ObjectGenerator:
     
     def replace_percent_with_index(self, s):
         """Replace %% with sequential numbers starting from 1"""
-        count = 0
+        count = 1
         result = []
         i = 0
         while i < len(s):
@@ -1362,7 +1389,7 @@ class ObjectGenerator:
                 count += 1
                 i += 2
             elif i+1<len(s) and s[i:i+2] == "%0":
-                count = 0
+                count = 1
                 i += 2
             else:
                 result.append(s[i])
@@ -1921,11 +1948,15 @@ class Assembler:
         self.state.ln = 1
         
         if fn == "stdin":
-            if self.state.pas != 2 and self.state.pas != 0:
+            # Pass 1 (pas==1): read stdin and write to axx.tmp
+            # Pass 2 (pas==2) and interactive (pas==0): re-use axx.tmp written in pass 1.
+            # If axx.tmp does not exist yet (e.g. first/only pass), always read from stdin.
+            tmp_path = "axx.tmp"
+            if self.state.pas == 1 or not os.path.exists(tmp_path):
                 af = self.file_input_from_stdin()
-                with open("axx.tmp", "wt") as stdintmp:
+                with open(tmp_path, "wt") as stdintmp:
                     stdintmp.write(af)
-            fn = "axx.tmp"
+            fn = tmp_path
         
         f = open(fn, "rt")
         af = f.readlines()
