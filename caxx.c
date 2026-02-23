@@ -159,7 +159,7 @@ static uint256_t u256_udiv(uint256_t a, uint256_t b) {
         /* set bit i of r's lsb from a */
         int wi = i/64, bi = i%64;
         r.w[0] |= ((a.w[wi]>>bi)&1);
-        /* r >= b? (unsigned compare) */
+        /* unsigned compare: r >= b? */
         int ge=0;
         for(int k=3;k>=0;k--){
             if(r.w[k]>b.w[k]){ge=1;break;}
@@ -797,8 +797,8 @@ static int axx_get_intstr(const char *s, int idx, char *fs, size_t fsz){
 }
 
 static int axx_get_floatstr(const char *s, int idx, char *fs, size_t fsz){
-    if(strncmp(s+idx,"-inf",4)==0){strcpy(fs,"-inf");return idx+4;}
     if(strncmp(s+idx,"inf",3)==0){strcpy(fs,"inf");return idx+3;}
+    if(strncmp(s+idx,"-inf",4)==0){strcpy(fs,"-inf");return idx+4;}
     if(strncmp(s+idx,"nan",3)==0){strcpy(fs,"nan");return idx+3;}
     size_t n=0;
     if(s[idx]=='-'){fs[n++]='-';idx++;}
@@ -1499,11 +1499,13 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             x=u256_from_u64(bits);
         }
     }
-    /* decimal integer */
+    /* decimal integer - parse with u256 arithmetic to support >64-bit values */
     else if(is_digit(s[idx])){
         char fs[64];
         idx=axx_get_intstr(s,idx,fs,sizeof(fs));
-        x=u256_from_i64((int64_t)(long long)strtoll(fs,NULL,10));
+        x=u256_zero();
+        uint256_t ten=u256_from_u64(10);
+        for(int di=0;fs[di];di++) x=u256_add(u256_mul(x,ten),u256_from_u64((uint64_t)(fs[di]-'0')));
     }
     /* single lowercase letter variable (EXP_PAT mode) */
     else if(st->expmode==EXP_PAT && is_lower(s[idx]) && (s[idx+1]=='\0'||!is_lower(s[idx+1]))){
@@ -2209,8 +2211,8 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
 
         int ibyte=st->vliwinstbits/8+(st->vliwinstbits%8?1:0);
         int noi=(vbits-at)/st->vliwinstbits;
-        /* pad with nop or truncate (Python: warn and truncate if too many) */
         int target_len=ibyte*noi;
+        /* pad with nop, or warn+truncate on overflow */
         if(values.len > target_len){
             if(st->pas==2||st->pas==0)
                 printf("warning-VLIW:%d values exceed slot capacity %d,truncating.\n",values.len,target_len);
