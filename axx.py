@@ -214,10 +214,10 @@ class Parser:
     
     def get_floatstr(self, s, idx):
         """Get float string from position"""
-        if s[idx:idx+3] == 'inf':
-            return 'inf', idx + 3
-        elif s[idx:idx+4] == '-inf':
+        if s[idx:idx+4] == '-inf':
             return '-inf', idx + 4
+        elif s[idx:idx+3] == 'inf':
+            return 'inf', idx + 3
         elif s[idx:idx+3] == 'nan':
             return 'nan', idx + 3
         else:
@@ -608,8 +608,18 @@ class ExpressionEvaluator:
             return hex(val)
 
         s = re.sub(pattern, replacer, x)
-        safe_env = {"enfloat": enfloat, "endouble": endouble, "__builtins__": {}}
-        return eval(s, safe_env)
+        safe_env = {
+            "__builtins__": {},
+            "enfloat": enfloat,
+            "endouble": endouble,
+        }
+        # eval の第3引数にも空辞書を渡すことでローカルスコープも封鎖する。
+        # クラス継承チェーン経由のエスケープを防ぐため、
+        # 評価結果が数値型であることを確認する。
+        result = eval(s, safe_env, {})
+        if not isinstance(result, (int, float, bool)):
+            raise ValueError(f"xeval: unsafe result type {type(result)}")
+        return result
 
     def factor1(self, s, idx):
         """Parse primary factor"""
@@ -723,7 +733,7 @@ class ExpressionEvaluator:
         """Handle multiplication, division, modulo"""
         x, idx = self.term0_0(s, idx)
         while idx < len(s):
-            if s[idx] == '*' and s[idx+1] !='*':
+            if s[idx] == '*' and (idx + 1 >= len(s) or s[idx+1] != '*'):
                 t, idx = self.term0_0(s, idx + 1)
                 x *= t
             elif StringUtils.q(s, '//', idx):
@@ -1358,7 +1368,7 @@ class PatternFileReader:
                     elif len(l) == 6:
                         p = [l[0], l[1], l[2], l[3], l[4], l[5]]
                     else:
-                        p = ["", "", "", "", "", "", ""]
+                        p = [l[0], l[1], l[2], l[3], l[4], l[5]]
                     w.append(p)
         
         return w
@@ -1543,8 +1553,16 @@ class VLIWProcessor:
                     for m in j:
                         values += [m]
                 
-                for i in range(ibyte * noi - len(values)):
-                    values += self.state.vliwnop
+                # values がスロット数より多い場合は末尾を切り捨て、
+                # 少ない場合は NOP で埋める。
+                target_len = ibyte * noi
+                if len(values) > target_len:
+                    if self.state.pas == 2 or self.state.pas == 0:
+                        print(f"warning-VLIW:{len(values)} values exceed slot capacity {target_len},truncating.")
+                    values = values[:target_len]
+                else:
+                    for i in range(target_len - len(values)):
+                        values += self.state.vliwnop
                 
                 v1 = []
                 cnt = 0
@@ -1938,11 +1956,13 @@ class Assembler:
     
     def fileassemble(self, fn):
         """Assemble file"""
-        self.state.fnstack += [self.state.current_file]
-        self.state.lnstack += [self.state.ln]
+        # fnstack と lnstack を必ずペアで push してから try に入る。
+        # これにより finally での pop が常に対称になる。
+        self.state.fnstack.append(self.state.current_file)
+        self.state.lnstack.append(self.state.ln)
         self.state.current_file = fn
         self.state.ln = 1
-        
+
         try:
             if fn == "stdin":
                 # Pass 1 (pas==1): read stdin and write to axx.tmp
@@ -1961,9 +1981,9 @@ class Assembler:
             for i in af:
                 self.lineassemble0(i)
         finally:
-            if self.state.fnstack:
-                self.state.current_file = self.state.fnstack.pop()
-                self.state.ln = self.state.lnstack.pop()
+            # push は try の前で必ず成功しているので、無条件で pop する。
+            self.state.current_file = self.state.fnstack.pop()
+            self.state.ln = self.state.lnstack.pop()
     
     def file_input_from_stdin(self):
         """Read input from stdin until EOF (Ctrl+D / piped end).
