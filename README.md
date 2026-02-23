@@ -340,7 +340,7 @@ An expression stops evaluation when it encounters the escape character '\'. Esca
 ```
 LEAQ r, [ s + t * !h \+ !i ] :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
 ```
-This example processes an x86_64 assembly line like `leaq rax,[rax+rbx*2+0x40]`, as shown below. If you have needed to use escape characters within parentheses, use !! to evaluate the factor.
+This example processes an x86_64 assembly line like `leaq rax,[rax+rbx*2+0x40]`. 
 
 ```
 LEAQ r,(s+t*!!h+!!i) :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
