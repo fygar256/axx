@@ -159,18 +159,14 @@ static uint256_t u256_udiv(uint256_t a, uint256_t b) {
         /* set bit i of r's lsb from a */
         int wi = i/64, bi = i%64;
         r.w[0] |= ((a.w[wi]>>bi)&1);
-        /* r >= b? */
-        if (!u256_lt_signed(r,b) || u256_ge_signed(r,b)) {
-            /* unsigned compare */
-            /* actually we need unsigned >= here */
-            int ge=0;
-            for(int k=3;k>=0;k--){
-                if(r.w[k]>b.w[k]){ge=1;break;}
-                if(r.w[k]<b.w[k]){ge=0;break;}
-                ge=1;
-            }
-            if(ge){ r=u256_sub(r,b); q.w[wi]|=((uint64_t)1<<bi); }
+        /* r >= b? (unsigned compare) */
+        int ge=0;
+        for(int k=3;k>=0;k--){
+            if(r.w[k]>b.w[k]){ge=1;break;}
+            if(r.w[k]<b.w[k]){ge=0;break;}
+            ge=1;
         }
+        if(ge){ r=u256_sub(r,b); q.w[wi]|=((uint64_t)1<<bi); }
     }
     return q;
 }
@@ -801,8 +797,8 @@ static int axx_get_intstr(const char *s, int idx, char *fs, size_t fsz){
 }
 
 static int axx_get_floatstr(const char *s, int idx, char *fs, size_t fsz){
-    if(strncmp(s+idx,"inf",3)==0){strcpy(fs,"inf");return idx+3;}
     if(strncmp(s+idx,"-inf",4)==0){strcpy(fs,"-inf");return idx+4;}
+    if(strncmp(s+idx,"inf",3)==0){strcpy(fs,"inf");return idx+3;}
     if(strncmp(s+idx,"nan",3)==0){strcpy(fs,"nan");return idx+3;}
     size_t n=0;
     if(s[idx]=='-'){fs[n++]='-';idx++;}
@@ -1888,7 +1884,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
     int idx_s=0,idx_t=0;
     idx_s=axx_skipspc(s,idx_s);
     idx_t=axx_skipspc(t,idx_t);
-    int slen=(int)strlen(s);
     int tlen=(int)strlen(t);
     int result=0;
 
@@ -1918,11 +1913,18 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 idx_t=axx_skipspc(t,idx_t);
                 char stopchar='\0';
                 if(idx_t<tlen && t[idx_t]=='\\'){
-                    idx_t=axx_skipspc(t,idx_t+1);
+                    idx_t++;                          /* skip '\' in pattern   */
+                    idx_t=axx_skipspc(t,idx_t);
                     stopchar=t[idx_t];
+                    idx_t++;                          /* skip stopchar in pattern */
                 }
                 uint256_t v=expr_expression_esc(asmb,s,idx_s,stopchar,&idx_s);
                 var_put(st,a,v);
+                /* stopchar was used as the NUL sentinel in the buffer, so
+                   idx_s now points AT the stopchar in s (or past end).
+                   Consume it from s so the next pattern char can match
+                   whatever follows the stopchar. */
+                if(stopchar && s[idx_s]==stopchar) idx_s++;
                 continue;
             }
         } else if(a>='a'&&a<='z'){
@@ -2164,7 +2166,7 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
             IntVec new_idxs; iv_init(&new_idxs);
             IntVec new_objl; iv_init(&new_objl);
             int new_idx;
-            int ok=lineassemble2(asmb,line,idx,&new_idxs,&new_objl,&new_idx);
+            lineassemble2(asmb,line,idx,&new_idxs,&new_objl,&new_idx);
             idx=new_idx;
             ivv_push(&objs,&new_objl);
             if(nidxlst<256) for(int i=0;i<new_idxs.len;i++) idxlst[nidxlst++]=(int)u256_to_i64(new_idxs.data[i]);
@@ -2207,9 +2209,16 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
 
         int ibyte=st->vliwinstbits/8+(st->vliwinstbits%8?1:0);
         int noi=(vbits-at)/st->vliwinstbits;
-        /* pad with nop */
-        int needed=ibyte*noi-values.len;
-        for(int pi=0;pi<needed;pi++) for(int ni=0;ni<st->vliwnop.len;ni++) iv_push(&values,st->vliwnop.data[ni]);
+        /* pad with nop or truncate (Python: warn and truncate if too many) */
+        int target_len=ibyte*noi;
+        if(values.len > target_len){
+            if(st->pas==2||st->pas==0)
+                printf("warning-VLIW:%d values exceed slot capacity %d,truncating.\n",values.len,target_len);
+            values.len=target_len;
+        } else {
+            int needed=target_len-values.len;
+            for(int pi=0;pi<needed;pi++) for(int ni=0;ni<st->vliwnop.len;ni++) iv_push(&values,st->vliwnop.data[ni]);
+        }
 
         /* build v1: noi instruction words */
         IntVec v1; iv_init(&v1);
@@ -2434,7 +2443,7 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(adir_export(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(!l[0]){ *idx_out=idx; return 0; }
 
-    int of=0, se=0, oerr=0, pln=0;
+    int se=0, oerr=0, pln=0;
     int idxs_val=0;
     int loopflag=1;
 
