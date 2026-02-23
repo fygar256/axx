@@ -895,11 +895,20 @@ class ExpressionEvaluator:
         return self.expression(self._terminate(s), idx)
     
     def expression_esc(self, s, idx, stopchar):
-        """Expression with escaped stop character"""
-        result = []
+        """Expression with escaped stop character.
+
+        stopchar は深さ0の位置だけで NUL に置換する。
+        ループを idx から始めることで、idx より前にある '(' や '[' を
+        誤って depth/bracket_depth にカウントしてしまうのを防ぐ。
+        (例: leaq rax,[ rbx+rcx*2+0x40 ] で ']' を stopchar にした場合、
+         先行する '[' を深さ1と数えてしまい本来の ']' が無視されるバグを修正)
+        """
+        # prefix (s[:idx]) はそのままコピー
+        result = list(s[:idx])
         depth = 0
-        
-        for ch in s:
+        bracket_depth = 0
+
+        for ch in s[idx:]:
             if ch == '(':
                 depth += 1
                 result.append(ch)
@@ -907,12 +916,23 @@ class ExpressionEvaluator:
                 if depth > 0:
                     depth -= 1
                 result.append(ch)
-            else:
-                if depth == 0 and ch == stopchar:
+            elif ch == '[':
+                bracket_depth += 1
+                result.append(ch)
+            elif ch == ']':
+                if bracket_depth > 0:
+                    bracket_depth -= 1
+                    result.append(ch)
+                elif depth == 0 and stopchar == ']':
                     result.append(chr(0))
                 else:
                     result.append(ch)
-        
+            else:
+                if depth == 0 and bracket_depth == 0 and ch == stopchar:
+                    result.append(chr(0))
+                else:
+                    result.append(ch)
+
         replaced = ''.join(result)
         return self.expression(self._terminate(replaced), idx)
 
@@ -1243,14 +1263,18 @@ class PatternMatcher:
                 else:
                     idx_t = StringUtils.skipspc(t, idx_t)
                     if idx_t < len(t) and t[idx_t] == '\\':
-                        idx_t = StringUtils.skipspc(t, idx_t + 1)
-                        b = t[idx_t] if idx_t < len(t) else chr(0)
-                        stopchar = b
+                        idx_t += 1                                    # skip '\'
+                        idx_t = StringUtils.skipspc(t, idx_t)
+                        stopchar = t[idx_t] if idx_t < len(t) else chr(0)
+                        idx_t += 1                                    # skip stopchar in pattern
                     else:
                         stopchar = chr(0)
                     
                     v, idx_s = self.expr_eval.expression_esc(s, idx_s, stopchar)
                     self.var_manager.put(a, v)
+                    # consume stopchar from source as well
+                    if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
+                        idx_s += 1
                     continue
             elif a in LOWER:
                 idx_t += 1
