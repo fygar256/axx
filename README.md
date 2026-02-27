@@ -84,12 +84,6 @@ axx.py is a general assembler that generalizes assembly language. It can process
 
 It is not a "general-purpose assembler" in the sense of being "widely applicable." It is a "general assembler" in the sense of being "common to all." Pattern data has only five control syntax constructs: assignment, ternary operator, ; modifier, alignment, and @@[]. While typical general assemblers use mnemonic operand definitions, axx's pattern definitions use instruction :: error_pattern :: binary_list, allowing for flexible instruction patterns. Therefore, notations such as r1 = r2 + r3 are possible, making it usable as a general-purpose binary generator, not just for assembly language. Pattern files are Turing-incomplete. Because it is Turing-incomplete, it is not suitable for processors with extremely twisted architectures. Processor architectures can become infinitely complex. While it can be adapted to Turing-complete languages, axx.py is Turing-incomplete and therefore not a "universal assembler."
 
-Rice's theorem
-- Non-trivial semantic properties of Turing-complete languages ​​are undecidable.
-- Fully generalizing languages ​​make debugging impossible.
-
-Due to these limitations, we will leave generalization here.
-
 It cannot handle very specialized processors. For example, it cannot describe the ISAs of the following processors other than general processors.
 
 Processors - Reason
