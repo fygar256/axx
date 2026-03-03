@@ -310,12 +310,12 @@ class Parser:
         return s.rstrip(' \t'), idx
 
 def enfloat(a):
-        float_value = struct.unpack('f', struct.pack('I', a))[0]
-        return float_value
+    float_value = struct.unpack('f', struct.pack('I', a))[0]
+    return float_value
 
 def endouble(a):
-        double_value = struct.unpack('d',struct.pack('Q',a))[0]
-        return double_value
+    double_value = struct.unpack('d', struct.pack('Q', a))[0]
+    return double_value
 
 class IEEE754Converter:
     """IEEE 754 floating point conversion utilities"""
@@ -473,7 +473,7 @@ class LabelManager:
         self.state.error_undefined_label = False
         try:
             v = self.state.labels[k][1]
-        except:
+        except (KeyError, IndexError):
             v = UNDEF
             self.state.error_undefined_label = True
         return v
@@ -483,7 +483,7 @@ class LabelManager:
         self.state.error_undefined_label = False
         try:
             v = self.state.labels[k][0]
-        except:
+        except (KeyError, IndexError):
             v = UNDEF
             self.state.error_undefined_label = True
         return v
@@ -543,7 +543,7 @@ class ExpressionEvaluator:
     def nbit(self, l):
         """Count number of bits needed to represent value"""
         b = 0
-        r = l
+        r = abs(l)  # negative values would loop forever with arithmetic right shift
         while r:
             r >>= 1
             b += 1
@@ -602,7 +602,7 @@ class ExpressionEvaluator:
             label_name = match.group(1)
             try:
                 val = self.state.labels[label_name][0]
-            except:
+            except (KeyError, IndexError):
                 self.state.error_undefined_label = True
                 val = 0
             return hex(val)
@@ -702,7 +702,7 @@ class ExpressionEvaluator:
                     x = int.from_bytes(struct.pack('>f', v), "big")
         elif idx < len(s) and s[idx].isdigit():
             fs, idx = self.parser.get_intstr(s, idx)
-            x = int(float(fs))
+            x = int(fs)  # int(float(fs)) would lose precision for large integers
         elif (idx < len(s) and self.state.expmode == EXP_PAT and 
               s[idx] in LOWER and idx + 1 < len(s) and s[idx+1] not in LOWER):
             ch = s[idx]
@@ -873,12 +873,12 @@ class ExpressionEvaluator:
         return x, idx
     
     def term11(self, s, idx):
-        """Handle ternary operator"""
+        """Handle ternary operator (right-associative: a?b:c?d:e => a?b:(c?d:e))"""
         x, idx = self.term10(s, idx)
-        while idx < len(s) and StringUtils.q(s, '?', idx):
-            t, idx = self.term10(s, idx + 1)
+        if idx < len(s) and StringUtils.q(s, '?', idx):
+            t, idx = self.term11(s, idx + 1)   # 右辺を再帰でterm11に委譲 → 右結合
             if idx < len(s) and StringUtils.q(s, ':', idx):
-                u, idx = self.term10(s, idx + 1)
+                u, idx = self.term11(s, idx + 1)
                 x = t if x != 0 else u
         return x, idx
     
@@ -1046,10 +1046,10 @@ class DirectiveProcessor:
         if len(i) == 0 or i[0] != '.clearsym':
             return False
         
-        if len(i) >= 2:
+        if len(i) >= 3 and i[2] != '':
             key = StringUtils.upper(i[2]) # This is an abbreviation for field 1, so this is OK.
             self.state.symbols.pop(key, None)
-        elif len(i) == 1:
+        else:
             self.state.symbols = {}
         
         return True
@@ -1101,7 +1101,7 @@ class DirectiveProcessor:
         if len(i) == 0 or i[0] != '.symbolc':
             return False
         
-        if len(i) > 3:
+        if len(i) > 2 and i[2] != '':
             self.state.swordchars = ALPHABET + DIGIT + i[2]
         return True
     
@@ -1747,6 +1747,9 @@ class AssemblyDirectiveProcessor:
         """End section directive"""
         if StringUtils.upper(l1) != "ENDSECTION" and StringUtils.upper(l1) != "ENDSEGMENT":
             return False
+        if self.state.current_section not in self.state.sections:
+            print(f" error - ENDSECTION without matching SECTION for '{self.state.current_section}'.")
+            return True
         start = self.state.sections[self.state.current_section][0]
         self.state.sections[self.state.current_section] = [start, self.state.pc - start]
         return True
@@ -2006,7 +2009,7 @@ class Assembler:
         if label == '':
             return False
         idx = StringUtils.skipspc(l, idx)
-        v, new_idx = self.expr_eval.expression(l, idx)
+        v, new_idx = self.expr_eval.expression_asm(l, idx)
         if new_idx == idx:
             return False
         idx = new_idx
@@ -2113,16 +2116,16 @@ class Assembler:
         self.binary_writer.flush()
 
         # --- Export labels ---
-        if expefile:
-            self.state.expfile = expefile
-            elf = 1
-        else:
-            elf = 0
+        # -e と -E が同時に指定された場合は警告を出し、両方を別々に出力する。
+        # 以前は -E が -e をサイレントに上書きしていた。
+        if expefile and self.state.expfile:
+            print(f"warning: both -e '{self.state.expfile}' and -E '{expefile}' specified; "
+                  f"exporting plain format to -e and ELF format to -E separately.")
 
-        if self.state.expfile:
+        def _write_export(path, elf):
             h   = list(self.state.export_labels.items())
             key = list(self.state.sections.keys())
-            with open(self.state.expfile, 'wt') as label_file:
+            with open(path, 'wt') as label_file:
                 for i in key:
                     if i == '.text' and elf == 1:
                         flag = 'AX'
@@ -2136,6 +2139,11 @@ class Assembler:
                     )
                 for i in h:
                     label_file.write(f"{i[0]}\t{i[1][0]:#x}\n")
+
+        if self.state.expfile:
+            _write_export(self.state.expfile, elf=0)
+        if expefile:
+            _write_export(expefile, elf=1)
 
 
 def main():
