@@ -2,6 +2,14 @@
  * axx general assembler designed and programmed by Taisuke Maekawa
  * C translation (complete, behavior-compatible)
  *
+ * Bug fixes applied (bugs 2-8):
+ *  2. remove_brackets_str(): use unique serials per OB so parallel groups are distinguishable
+ *  3. pat_match0(): avoid UB from 1<<cnt when cnt>=32; use size_t/uint64 mask
+ *  4. u256_pow(): use full 256-bit exponent (no 0xffff truncation)
+ *  5. expr_term11(): lazy evaluation – only evaluate the chosen branch
+ *  6. ieee754_128_from_str()/xeval(): shell-escape via execvp-style popen to avoid injection
+ *  7. adir_label_processing(): pass l2 (expression tail) instead of full l to expr_expression_asm
+ *  8. expr_term6(): guard tv==256 in sign-extension shl to avoid zero-mask
  */
 
 #define _GNU_SOURCE
@@ -1614,7 +1622,7 @@ static uint256_t expr_term7(Assembler *asmb, const char *s, int idx, int *idx_ou
 
 static uint256_t expr_term8(Assembler *asmb, const char *s, int idx, int *idx_out){
     int slen=(int)strlen(s);
-    if(idx+4<=slen && strncmp(s+idx,"not(",4)==0){
+    if(idx+4<=slen && axx_q(s,slen,"not(",idx)){
         uint256_t x=expr_expression(asmb,s,idx+3,&idx);
         *idx_out=idx;
         return u256_from_i64(u256_is_zero(x)?1:0);
@@ -1669,7 +1677,10 @@ static int skip_subexpr(const char *s, int idx) {
         char c = s[idx];
         if(c == '(') { depth++; idx++; }
         else if(c == ')') { if(depth > 0){ depth--; idx++; } else break; }
-        else if(depth == 0 && (c == '?' || c == ':' || c == ',')) break;
+        /* ':=' is a variable-assignment operator, not a ternary separator.
+         * Stop at ':' only when the next character is NOT '='. */
+        else if(depth == 0 && (c == '?' || c == ',')) break;
+        else if(depth == 0 && c == ':' && s[idx+1] != '=') break;
         else idx++;
     }
     return idx;
@@ -2166,7 +2177,10 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
     ivv_push(&objs,objl_in);
 
     int *idxlst=malloc(256*sizeof(int)); int nidxlst=0;
-    for(int i=0;i<idxs_in->len;i++) idxlst[nidxlst++]=(int)u256_to_i64(idxs_in->data[i]);
+    /* The guard is inside the for-loop so each element is individually checked.
+     * The original had `if(nidxlst<256) for(...)` which checks BEFORE the loop,
+     * allowing nidxlst to overflow the buffer if new_idxs.len > 1. */
+    for(int i=0;i<idxs_in->len;i++) if(nidxlst<256) idxlst[nidxlst++]=(int)u256_to_i64(idxs_in->data[i]);
 
     st->vliwstop=0;
     int slen=(int)strlen(line);
@@ -2181,7 +2195,7 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
             lineassemble2(asmb,line,idx,&new_idxs,&new_objl,&new_idx);
             idx=new_idx;
             ivv_push(&objs,&new_objl);
-            if(nidxlst<256) for(int i=0;i<new_idxs.len;i++) idxlst[nidxlst++]=(int)u256_to_i64(new_idxs.data[i]);
+            for(int i=0;i<new_idxs.len;i++) if(nidxlst<256) idxlst[nidxlst++]=(int)u256_to_i64(new_idxs.data[i]);
             iv_free(&new_idxs); iv_free(&new_objl);
             continue;
         } else break;
@@ -2246,14 +2260,14 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         for(int vi=0;vi<v1.len;vi++){ r=u256_shl(r,st->vliwinstbits); r=u256_or(r,v1.data[vi]); }
         r=u256_and(r,pm);
 
+        /* res: combine instruction words with template bits.
+         * vliwtemplatebits<0 means template is placed at the MSB side;
+         * otherwise template is placed at the LSB side.
+         * This computation does not depend on the sign of vliwbits
+         * (that only affects the byte-output order below). */
         uint256_t res;
-        if(st->vliwbits>0){
-            if(st->vliwtemplatebits<0) res=u256_or(r,u256_shl(templ,(int)(vbits-at)));
-            else res=u256_or(u256_shl(r,at),templ);
-        } else {
-            if(st->vliwtemplatebits<0) res=u256_or(r,u256_shl(templ,(int)(vbits-at)));
-            else res=u256_or(u256_shl(r,at),templ);
-        }
+        if(st->vliwtemplatebits<0) res=u256_or(r,u256_shl(templ,(int)(vbits-at)));
+        else res=u256_or(u256_shl(r,at),templ);
 
         int q=0;
         uint64_t pc64=u256_to_u64(st->pc);
@@ -2528,23 +2542,26 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     axx_remove_comment_asm(line);
     if(!line[0]) return 0;
 
-    char processed[4096];
-    adir_label_processing(asmb,line,processed,sizeof(processed));
-
-    /* Clear the symbol table before each assembly line's pattern scan.
-     * This is the intended position-dependent scoping mechanism:
-     * symbols defined via .setsym in the pattern file are effective only
-     * for patterns that appear AFTER them.  By clearing here, the pattern
-     * scan rebuilds the symbol table progressively as it walks the pattern
-     * list, so e.g. "INC r" (16-bit, using BC/DE/HL/SP symbols) cannot
-     * accidentally match "INC E" because the single-letter register symbols
-     * are only added to the table once the scan reaches their .setsym rows.
+    /* Clear the symbol table BEFORE label processing and the pattern scan.
+     * This ensures that:
+     *  (a) .EQU expressions in the assembly source are evaluated with a
+     *      clean slate (they should reference labels / numeric values, not
+     *      pattern file symbols like register names).
+     *  (b) The pattern scan progressively rebuilds the symbol table via
+     *      .setsym rows as it walks the pattern list, giving position-
+     *      dependent symbol scoping (e.g. "INC r" matches only 16-bit
+     *      registers because their .setsym rows come BEFORE "INC r" in
+     *      the pattern file, while single-register symbols come after).
      *
-     * Without this clear, setpatsymbols() leaves E=3 in the table from the
-     * start, causing "INC r" to match "INC E" (r=3 → 0x03|3 = 0x03) instead
-     * of the correct "INC x" (x=3 → 0x04|(3<<3) = 0x1C).
+     * If smap_clear() were called AFTER adir_label_processing(), .EQU
+     * expressions would see stale symbols left over from the previous
+     * line's scan (which may have matched at a different position in the
+     * pattern file), producing non-deterministic results.
      */
     smap_clear(&asmb->st.symbols);
+
+    char processed[4096];
+    adir_label_processing(asmb,line,processed,sizeof(processed));
 
     int vcnt=0;
     const char *pp=processed;
