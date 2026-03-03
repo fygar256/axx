@@ -2,14 +2,6 @@
  * axx general assembler designed and programmed by Taisuke Maekawa
  * C translation (complete, behavior-compatible)
  *
- * Bug fixes applied (bugs 2-8):
- *  2. remove_brackets_str(): use unique serials per OB so parallel groups are distinguishable
- *  3. pat_match0(): avoid UB from 1<<cnt when cnt>=32; use size_t/uint64 mask
- *  4. u256_pow(): use full 256-bit exponent (no 0xffff truncation)
- *  5. expr_term11(): lazy evaluation – only evaluate the chosen branch
- *  6. ieee754_128_from_str()/xeval(): shell-escape via execvp-style popen to avoid injection
- *  7. adir_label_processing(): pass l2 (expression tail) instead of full l to expr_expression_asm
- *  8. expr_term6(): guard tv==256 in sign-extension shl to avoid zero-mask
  */
 
 #define _GNU_SOURCE
