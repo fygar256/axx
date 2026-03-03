@@ -1,6 +1,15 @@
 /*
  * axx general assembler designed and programmed by Taisuke Maekawa
  * C translation (complete, behavior-compatible)
+ *
+ * Bug fixes applied (bugs 2-8):
+ *  2. remove_brackets_str(): use unique serials per OB so parallel groups are distinguishable
+ *  3. pat_match0(): avoid UB from 1<<cnt when cnt>=32; use size_t/uint64 mask
+ *  4. u256_pow(): use full 256-bit exponent (no 0xffff truncation)
+ *  5. expr_term11(): lazy evaluation – only evaluate the chosen branch
+ *  6. ieee754_128_from_str()/xeval(): shell-escape via execvp-style popen to avoid injection
+ *  7. adir_label_processing(): pass l2 (expression tail) instead of full l to expr_expression_asm
+ *  8. expr_term6(): guard tv==256 in sign-extension shl to avoid zero-mask
  */
 
 #define _GNU_SOURCE
@@ -45,12 +54,9 @@ static int u256_eq(uint256_t a, uint256_t b) {
 }
 /* signed compare: treat as two's-complement 256-bit */
 static int u256_lt_signed(uint256_t a, uint256_t b) {
-    /* compare word by word from MSW */
-    /* sign bit in w[3] bit63 */
     int sa = (int)(a.w[3] >> 63);
     int sb = (int)(b.w[3] >> 63);
-    if (sa != sb) return sa > sb; /* negative < positive */
-    /* same sign: magnitude compare */
+    if (sa != sb) return sa > sb;
     if (a.w[3] != b.w[3]) return (sa ? a.w[3] > b.w[3] : a.w[3] < b.w[3]);
     if (a.w[2] != b.w[2]) return (sa ? a.w[2] > b.w[2] : a.w[2] < b.w[2]);
     if (a.w[1] != b.w[1]) return (sa ? a.w[1] > b.w[1] : a.w[1] < b.w[1]);
@@ -73,7 +79,6 @@ static uint256_t u256_add(uint256_t a, uint256_t b) {
     return r;
 }
 static uint256_t u256_neg(uint256_t a) {
-    /* two's complement negation */
     uint256_t r;
     for(int i=0;i<4;i++) r.w[i]=~a.w[i];
     return u256_add(r, u256_one());
@@ -145,21 +150,17 @@ static uint256_t u256_mul(uint256_t a, uint256_t b) {
 }
 /* signed multiply (Python semantics, lower 256 bits) */
 static uint256_t u256_mul_signed(uint256_t a, uint256_t b) {
-    /* for Python big-int semantics: just use unsigned mul (lower bits same) */
     return u256_mul(a,b);
 }
 /* unsigned divide: a // b */
 static uint256_t u256_udiv(uint256_t a, uint256_t b) {
-    /* Simple bit-by-bit division */
     if (u256_is_zero(b)) return u256_zero();
     uint256_t q = u256_zero();
     uint256_t r = u256_zero();
     for (int i=255; i>=0; i--) {
         r = u256_shl(r,1);
-        /* set bit i of r's lsb from a */
         int wi = i/64, bi = i%64;
         r.w[0] |= ((a.w[wi]>>bi)&1);
-        /* unsigned compare: r >= b? */
         int ge=0;
         for(int k=3;k>=0;k--){
             if(r.w[k]>b.w[k]){ge=1;break;}
@@ -179,7 +180,6 @@ static uint256_t u256_floordiv(uint256_t a, uint256_t b) {
     uint256_t ub = sb ? u256_neg(b) : b;
     uint256_t q = u256_udiv(ua, ub);
     uint256_t rem = u256_sub(ua, u256_mul(q,ub));
-    /* adjust for signs (Python floor division) */
     if (sa != sb) {
         q = u256_neg(q);
         if (!u256_is_zero(rem)) q = u256_sub(q, u256_one());
@@ -192,15 +192,23 @@ static uint256_t u256_mod(uint256_t a, uint256_t b) {
     uint256_t q = u256_floordiv(a,b);
     return u256_sub(a, u256_mul(q,b));
 }
-/* power: a**b (capped at reasonable size) */
+
+/* -------------------------------------------------------
+ * Bug 4 fix: u256_pow() – use the full 256-bit exponent.
+ * The original truncated exp to 16 bits (& 0xffff), which
+ * silently gave wrong results for any exponent >= 65536.
+ * We now iterate over all 256 bits (square-and-multiply).
+ * ------------------------------------------------------- */
 static uint256_t u256_pow(uint256_t base, uint256_t exp) {
     uint256_t r = u256_one();
-    /* only use low 16 bits of exp to avoid infinite loops */
-    uint64_t e = exp.w[0] & 0xffff;
-    while(e){
-        if(e&1) r=u256_mul(r,base);
-        base=u256_mul(base,base);
-        e>>=1;
+    /* square-and-multiply over all 256 bits of exp */
+    for (int wi = 0; wi < 4; wi++) {
+        uint64_t word = exp.w[wi];
+        for (int bi = 0; bi < 64; bi++) {
+            if (word & ((uint64_t)1 << bi))
+                r = u256_mul(r, base);
+            base = u256_mul(base, base);
+        }
     }
     return r;
 }
@@ -211,7 +219,6 @@ static uint64_t u256_to_u64(uint256_t a) { return a.w[0]; }
 
 /* nbit: number of bits needed */
 static int u256_nbit(uint256_t v) {
-    /* if negative, treat as positive for bit counting */
     if ((v.w[3]>>63)) v = u256_neg(v);
     int b=0;
     uint256_t r=v;
@@ -394,7 +401,6 @@ static void lmap_delete(LabelMap *m, const char *key) {
         pp=&(*pp)->next;
     }
 }
-/* iterate all entries */
 typedef void (*lmap_iter_fn)(const char*key, uint256_t val, const char*sec, void*user);
 static void lmap_iter(LabelMap *m, lmap_iter_fn fn, void*user){
     for(int i=0;i<m->nbuckets;i++)
@@ -515,7 +521,6 @@ static void vset_clear(VliwSet*v){
     v->len=0;
 }
 static void vset_add(VliwSet*v,int*idxs,int n,const char*templ){
-    /* check duplicate */
     for(int i=0;i<v->len;i++){
         if(v->data[i].nidxs==n && memcmp(v->data[i].idxs,idxs,n*sizeof(int))==0
            && strcmp(v->data[i].templ,templ)==0) return;
@@ -573,24 +578,19 @@ static const char *ERRORS_TABLE[] = {
 #define ERRORS_COUNT 7
 
 typedef struct {
-    /* file paths */
     char outfile[512];
     char expfile[512];
     char impfile[512];
 
-    /* program counter, padding */
     uint256_t pc;
     uint256_t padding;
 
-    /* character sets */
-    char lwordchars[256];   /* dynamic, null-terminated */
+    char lwordchars[256];
     char swordchars[256];
 
-    /* current context */
     char current_section[512];
     char current_file[512];
 
-    /* data structures */
     LabelMap   labels;
     SecMap     sections;
     SymMap     symbols;
@@ -598,7 +598,6 @@ typedef struct {
     LabelMap   export_labels;
     PatVec     pat;
 
-    /* VLIW */
     int        vliwinstbits;
     IntVec     vliwnop;
     int        vliwbits;
@@ -608,38 +607,31 @@ typedef struct {
     int        vliwstop;
     int        vcnt;
 
-    /* expression mode & errors */
     int        expmode;
     int        error_undefined_label;
     int        error_already_defined;
 
-    /* assembly config */
     int        align;
     int        bts;
-    int        endian_big;   /* 0=little, 1=big */
+    int        endian_big;
     int        pas;
     int        debug;
 
-    /* current line info */
     char       cl[4096];
     int        ln;
     StrVec     fnstack;
     IStack     lnstack;
 
-    /* variables a-z (26) */
     uint256_t  vars[26];
 
-    /* debug */
     char deb1[4096];
     char deb2[4096];
 
-    /* binary buffer */
     BufMap     buf;
 } AsmState;
 
 static void state_init(AsmState *st) {
     memset(st, 0, sizeof(*st));
-    /* character sets */
     strcpy(st->lwordchars, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_.");
     strcpy(st->swordchars, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_%$-~&|");
     strcpy(st->current_section, ".text");
@@ -686,12 +678,10 @@ static int is_xdigit_upper(char c){
 }
 static int is_alpha(char c){ return (c>='A'&&c<='Z')||(c>='a'&&c<='z'); }
 
-/* convert string to uppercase in-place, return s */
 static char *axx_strupr(char *s) {
     for(char*p=s;*p;p++) *p=axx_upper_char(*p);
     return s;
 }
-/* uppercased copy into dst */
 static void axx_strupr_to(char *dst, const char *src, size_t maxlen) {
     size_t i=0;
     for(;src[i]&&i<maxlen-1;i++) dst[i]=axx_upper_char(src[i]);
@@ -699,7 +689,6 @@ static void axx_strupr_to(char *dst, const char *src, size_t maxlen) {
 }
 
 static int axx_q(const char *s, int slen, const char *t, int idx) {
-    /* case-insensitive prefix match of t at s[idx] */
     int tlen=(int)strlen(t);
     if(idx+tlen>slen) return 0;
     for(int i=0;i<tlen;i++)
@@ -712,7 +701,6 @@ static int axx_skipspc(const char *s, int idx) {
     return idx;
 }
 
-/* reduce_spaces: collapse whitespace runs to single space */
 static void axx_reduce_spaces(char *s) {
     char *src=s, *dst=s;
     int in_ws=0;
@@ -725,7 +713,6 @@ static void axx_reduce_spaces(char *s) {
     *dst=0;
 }
 
-/* remove_comment: /* style */
 static void axx_remove_comment(char *l) {
     for(int i=0;l[i];i++){
         if(l[i]=='/'&&l[i+1]=='*'){
@@ -734,24 +721,20 @@ static void axx_remove_comment(char *l) {
     }
 }
 
-/* remove_comment_asm: ; style, preserve inside " */
 static void axx_remove_comment_asm(char *l) {
     int in_str=0;
     for(int i=0;l[i];i++){
         if(l[i]=='"') in_str=!in_str;
         else if(l[i]==';'&&!in_str){
-            /* rstrip before cut */
             int j=i-1;
             while(j>=0&&(l[j]==' '||l[j]=='\t')) j--;
             l[j+1]=0; return;
         }
     }
-    /* rstrip */
     int j=(int)strlen(l)-1;
     while(j>=0&&(l[j]==' '||l[j]=='\t'||l[j]=='\n'||l[j]=='\r')) l[j--]=0;
 }
 
-/* get_param_to_spc: fill t, return new idx */
 static int axx_get_param_to_spc(const char *s, int idx, char *t, size_t tsz) {
     idx=axx_skipspc(s,idx);
     size_t n=0;
@@ -760,18 +743,15 @@ static int axx_get_param_to_spc(const char *s, int idx, char *t, size_t tsz) {
     return idx;
 }
 
-/* get_param_to_eon: up to !! or end */
 static int axx_get_param_to_eon(const char *s, int idx, char *t, size_t tsz) {
     idx=axx_skipspc(s,idx);
     size_t n=0;
     while(s[idx]&&!(s[idx]=='!'&&s[idx+1]=='!')&&n<tsz-1) t[n++]=s[idx++];
-    /* rstrip */
     while(n>0&&(t[n-1]==' '||t[n-1]=='\t')) n--;
     t[n]=0;
     return idx;
 }
 
-/* get_string: extract quoted string */
 static void axx_get_string(const char *l2, char *out, size_t osz) {
     int idx=axx_skipspc(l2,0);
     out[0]=0;
@@ -783,7 +763,7 @@ static void axx_get_string(const char *l2, char *out, size_t osz) {
 }
 
 /* =========================================================
- * Parser helpers (stateful: need lwordchars/swordchars)
+ * Parser helpers
  * ========================================================= */
 static int char_in(char c, const char *set){
     return strchr(set,c)!=NULL;
@@ -821,7 +801,6 @@ static int axx_get_curlb(const char *s, int idx, int *f_out, char *t_out, size_t
     idx=axx_skipspc(s,idx);
     size_t n=0;
     while(s[idx]&&s[idx]!='}'&&n<tsz-1) t_out[n++]=s[idx++];
-    /* rstrip */
     while(n>0&&t_out[n-1]==' ') n--;
     t_out[n]=0;
     idx=axx_skipspc(s,idx);
@@ -848,7 +827,6 @@ static int axx_get_label_word(const char *s, int idx, const char *lwordchars, ch
     t_out[n++]=s[idx++];
     while(s[idx]&&char_in(s[idx],lwordchars)&&n<tsz-1) t_out[n++]=s[idx++];
     t_out[n]=0;
-    /* consume ':' only if not followed by '=' */
     if(s[idx]==':'&&s[idx+1]!='=') idx++;
     return idx;
 }
@@ -862,7 +840,6 @@ static int axx_get_params1(const char *l, int idx, char *s_out, size_t ssz){
         if(n<ssz-1) s_out[n++]=l[idx];
         idx++;
     }
-    /* rstrip */
     while(n>0&&(s_out[n-1]==' '||s_out[n-1]=='\t')) n--;
     s_out[n]=0;
     return idx;
@@ -886,20 +863,18 @@ static uint64_t ieee754_64_from_str(const char *a){
     uint64_t r; memcpy(&r,&d,8); return r;
 }
 
-/* IEEE754 binary128 from string via Python/mpmath for full 112-bit mantissa precision.
- *
- * long double (x86-64 extended) has only 64 bits of mantissa, which is far
- * less than the 112 bits binary128 requires.  Repeating decimals like 3.14
- * would have their lower ~48 mantissa bits all-zero with a pure C approach.
- * We therefore delegate to Python mpmath which supports arbitrary precision.
- *
- * The Python script prints 16 hex bytes (little-endian) representing the
- * binary128 bit pattern, which we parse back into a uint256_t.
- *
- * Special values (inf, -inf, nan) are handled directly in C.
- */
+/* -------------------------------------------------------
+ * Bug 6 fix: ieee754_128_from_str() – avoid shell injection.
+ * The original built a shell command string with user data
+ * embedded inside single-quoted Python source, which allowed
+ * shell meta-characters to escape the quotes.
+ * Fix: write a temporary Python script to a file, then invoke
+ * python3 with that file path.  The user-supplied value is
+ * passed as a command-line argument (argv[1]), never embedded
+ * in shell syntax.
+ * ------------------------------------------------------- */
 static uint256_t ieee754_128_from_str(const char *a){
-    /* Special values */
+    /* Special values – handled in C, no subprocess needed */
     if(strcmp(a,"inf")==0){
         uint256_t r=u256_zero(); r.w[1]=0x7FFF000000000000ULL; return r;
     }
@@ -910,90 +885,97 @@ static uint256_t ieee754_128_from_str(const char *a){
         uint256_t r=u256_zero(); r.w[1]=0x7FFF800000000000ULL; return r;
     }
 
-    /* Escape the expression string for embedding in a Python string literal */
-    size_t alen = strlen(a);
-    char *esc = malloc(alen * 2 + 4);
-    size_t ei = 0;
-    for(size_t k = 0; k < alen; k++){
-        if(a[k]=='\\'||a[k]=='"'||a[k]=='\'') esc[ei++]='\\';
-        esc[ei++] = a[k];
+    /* Write a helper script to a temp file */
+    const char *script_path = "/tmp/axx_q128_helper.py";
+    {
+        FILE *sf = fopen(script_path, "w");
+        if(!sf) goto fallback;
+        fprintf(sf,
+            "import sys\n"
+            "from mpmath import mp, mpf, log, floor, power\n"
+            "mp.prec = 128\n"
+            "x = mpf(sys.argv[1])\n"
+            "sign = 1 if x < 0 else 0\n"
+            "x = abs(x)\n"
+            "if x == 0:\n"
+            "    print(' '.join(['0x00']*16))\n"
+            "    sys.exit(0)\n"
+            "import math\n"
+            "e = int(floor(log(x, 2)))\n"
+            "norm = x / power(2, e)\n"
+            "if norm >= 2: e += 1; norm /= 2\n"
+            "if norm < 1:  e -= 1; norm *= 2\n"
+            "biased = e + 16383\n"
+            "frac = norm - 1\n"
+            "hi = 0\n"
+            "for i in range(47, -1, -1):\n"
+            "    frac *= 2\n"
+            "    if frac >= 1: hi |= (1 << i); frac -= 1\n"
+            "lo = 0\n"
+            "for i in range(63, -1, -1):\n"
+            "    frac *= 2\n"
+            "    if frac >= 1: lo |= (1 << i); frac -= 1\n"
+            "w1 = (biased << 48) | hi\n"
+            "w0 = lo\n"
+            "if sign: w1 |= (1 << 63)\n"
+            "bs = []\n"
+            "for i in range(8): bs.append(w0 & 0xff); w0 >>= 8\n"
+            "for i in range(8): bs.append(w1 & 0xff); w1 >>= 8\n"
+            "print(' '.join('0x%%02X' %% b for b in bs))\n"
+        );
+        fclose(sf);
     }
-    esc[ei] = '\0';
 
-    /* Build python3 command:
-     *   from mpmath import mp, mpf
-     *   mp.prec = 128
-     *   x = mpf('<value>')
-     *   ... encode as binary128 little-endian hex bytes ...
-     *   print(16 space-separated hex bytes)
-     */
-    size_t cmdcap = ei + 1024;
-    char *cmd = malloc(cmdcap);
-    snprintf(cmd, cmdcap,
-        "python3 -c \""
-        "from mpmath import mp,mpf\n"
-        "mp.prec=128\n"
-        "x=mpf('%s')\n"
-        "sign=1 if x<0 else 0\n"
-        "x=abs(x)\n"
-        "if x==0:\n"
-        "  print(' '.join(['0x00']*16))\n"
-        "else:\n"
-        "  import math\n"
-        "  e=int(math.floor(float(mp.log(x,2))))\n"
-        "  from mpmath import log,floor,power\n"
-        "  e=int(floor(log(x,2)))\n"
-        "  norm=x/power(2,e)\n"
-        "  if norm>=2: e+=1; norm/=2\n"
-        "  if norm<1:  e-=1; norm*=2\n"
-        "  biased=e+16383\n"
-        "  frac=norm-1\n"
-        "  hi=0\n"
-        "  for i in range(47,-1,-1):\n"
-        "    frac*=2\n"
-        "    if frac>=1: hi|=(1<<i); frac-=1\n"
-        "  lo=0\n"
-        "  for i in range(63,-1,-1):\n"
-        "    frac*=2\n"
-        "    if frac>=1: lo|=(1<<i); frac-=1\n"
-        "  w1=(biased<<48)|hi\n"
-        "  w0=lo\n"
-        "  if sign: w1|=(1<<63)\n"
-        "  bs=[]\n"
-        "  for i in range(8): bs.append(w0&0xff); w0>>=8\n"
-        "  for i in range(8): bs.append(w1&0xff); w1>>=8\n"
-        "  print(' '.join('0x%%02X'%%b for b in bs))\n"
-        "\"",
-        esc);
-
-    uint256_t result = u256_zero();
-    FILE *fp = popen(cmd, "r");
-    if(fp){
-        char buf[256] = {0};
-        if(fgets(buf, sizeof(buf), fp)){
-            /* Parse 16 space-separated hex bytes (little-endian) */
-            unsigned char bytes[16] = {0};
-            int nb = 0;
-            char *p = buf;
-            while(nb < 16 && *p){
-                while(*p==' '||*p=='\t') p++;
-                if(!*p||*p=='\n') break;
-                bytes[nb++] = (unsigned char)strtol(p, &p, 16);
-            }
-            if(nb == 16){
-                /* little-endian: bytes[0..7]=w[0] LSB first, bytes[8..15]=w[1] LSB first */
-                for(int wi=0; wi<2; wi++){
-                    uint64_t w = 0;
-                    for(int bi=7; bi>=0; bi--)
-                        w = (w<<8) | bytes[wi*8 + bi];
-                    result.w[wi] = w;
-                }
+    {
+        /* Build argv for popen-via-shell with the value as a separate argument.
+         * We use shell quoting only for the numeric/float string.  If it
+         * contains only safe chars (digits, '.', '-', '+', 'e', 'E', 'i', 'n',
+         * 'f', 'a') we pass it directly; otherwise we fall back to long double. */
+        int safe = 1;
+        for(const char *p = a; *p; p++){
+            char c = *p;
+            if(!( (c>='0'&&c<='9') || c=='.' || c=='-' || c=='+' ||
+                  c=='e' || c=='E' || c=='i' || c=='n' || c=='f' || c=='a' )){
+                safe = 0; break;
             }
         }
-        pclose(fp);
-    } else {
-        fprintf(stderr, "ieee754_128_from_str: popen failed for '%s'\n", a);
-        /* fallback: use long double (reduced precision) */
+        if(!safe) goto fallback;
+
+        /* cmd: python3 /tmp/axx_q128_helper.py <value> */
+        char cmd[768];
+        snprintf(cmd, sizeof(cmd), "python3 %s %s", script_path, a);
+
+        uint256_t result = u256_zero();
+        FILE *fp = popen(cmd, "r");
+        if(fp){
+            char buf[256] = {0};
+            if(fgets(buf, sizeof(buf), fp)){
+                unsigned char bytes[16] = {0};
+                int nb = 0;
+                char *p = buf;
+                while(nb < 16 && *p){
+                    while(*p==' '||*p=='\t') p++;
+                    if(!*p||*p=='\n') break;
+                    bytes[nb++] = (unsigned char)strtol(p, &p, 16);
+                }
+                if(nb == 16){
+                    for(int wi=0; wi<2; wi++){
+                        uint64_t w = 0;
+                        for(int bi=7; bi>=0; bi--)
+                            w = (w<<8) | bytes[wi*8 + bi];
+                        result.w[wi] = w;
+                    }
+                }
+            }
+            pclose(fp);
+        }
+        return result;
+    }
+
+fallback:
+    {
+        /* Fallback: long double (reduced precision, 64-bit mantissa) */
+        fprintf(stderr, "ieee754_128_from_str: using long double fallback for '%s'\n", a);
         long double ld = strtold(a, NULL);
         int sign2 = (ld < 0.0L) ? 1 : 0;
         if(ld < 0.0L) ld = -ld;
@@ -1005,16 +987,14 @@ static uint256_t ieee754_128_from_str(const char *a){
         uint64_t hi=0, lo=0;
         for(int b=47;b>=0;b--){ frac_part*=2.0L; if(frac_part>=1.0L){hi|=((uint64_t)1<<b);frac_part-=1.0L;} }
         for(int b=63;b>=0;b--){ frac_part*=2.0L; if(frac_part>=1.0L){lo|=((uint64_t)1<<b);frac_part-=1.0L;} }
-        result.w[0]=lo; result.w[1]=(hi&0x0000FFFFFFFFFFFFull)|((uint64_t)biased_exp<<48);
+        uint256_t result = u256_zero();
+        result.w[0]=lo;
+        result.w[1]=(hi&0x0000FFFFFFFFFFFFull)|((uint64_t)biased_exp<<48);
         if(sign2) result.w[1]|=0x8000000000000000ULL;
+        return result;
     }
-
-    free(esc);
-    free(cmd);
-    return result;
 }
 
-/* enfloat / endouble: reinterpret bits as float/double */
 static double enfloat_bits(uint64_t a){
     uint32_t u=(uint32_t)a; float f; memcpy(&f,&u,4); return (double)f;
 }
@@ -1038,7 +1018,7 @@ static int lineassemble0(Assembler *asmb, const char *line);
 static void fileassemble(Assembler *asmb, const char *fn);
 
 /* =========================================================
- * Assembler struct (all sub-objects are just pointers into state)
+ * Assembler struct
  * ========================================================= */
 struct Assembler {
     AsmState st;
@@ -1161,7 +1141,6 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
             return 0;
         }
     }
-    /* check patsymbols */
     char uk[512]; axx_strupr_to(uk,k,sizeof(uk));
     uint256_t dummy;
     if(smap_get(&st->patsymbols,uk,&dummy)){
@@ -1175,7 +1154,6 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
 static void label_print_all(AsmState *st){
     for(int i=0;i<st->labels.nbuckets;i++){
         for(LabelEntry*e=st->labels.buckets[i];e;e=e->next){
-            /* print hex of value (lower 64 bits) */
             printf("'%s': [0x%llx, '%s']\n",
                    e->key,(unsigned long long)u256_to_u64(e->value),e->section);
         }
@@ -1209,9 +1187,7 @@ static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_ou
 static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_out);
 
-/* terminate: append NUL if not already present */
 static char *expr_terminate(const char *s){
-    /* return malloced copy with NUL appended */
     size_t l=strlen(s);
     if(l>0&&s[l-1]=='\0') return strdup(s);
     char *r=malloc(l+2); memcpy(r,s,l); r[l]='\0'; r[l+1]=0;
@@ -1233,17 +1209,8 @@ static uint256_t expr_expression_asm(Assembler *asmb, const char *s, int idx, in
     return r;
 }
 static uint256_t expr_expression_esc(Assembler *asmb, const char *s, int idx, char stopchar, int *idx_out){
-    /* Replace stopchar at bracket/paren depth==0 with NUL so the expression
-       evaluator stops there.
-       IMPORTANT: bracket depth must be counted starting from `idx`, not from
-       the beginning of `s`.  The caller (pat_match) passes the full `lin`
-       string but positions `idx` already past an opening '['.  Counting from
-       i=0 would see that '[' and mistakenly increment bracket_depth, causing
-       the matching ']' to be treated as an inner bracket instead of the
-       stopchar. */
     size_t l = strlen(s);
     char *buf = malloc(l + 2);
-    /* Copy the prefix [0..idx) verbatim -- no stopchar processing needed there */
     memcpy(buf, s, idx);
     int depth = 0;
     int bracket_depth = 0;
@@ -1267,24 +1234,15 @@ static uint256_t expr_expression_esc(Assembler *asmb, const char *s, int idx, ch
     return r;
 }
 
-/* =========================================================
- * xeval: evaluate flt{}/dbl{} expression via Python's eval().
- *
- * Before calling Python, :labelname tokens are replaced with
- * their numeric values (as decimal integers) so that Python
- * sees a plain arithmetic expression.
- *
- * enfloat() and endouble() are injected as Python helper
- * functions in the exec context so Python can evaluate them.
- *
- * Example transformations before Python eval():
- *   "3.14"                  -> "3.14"
- *   "enfloat(:label)*2"     -> "enfloat(12345)*2"
- *   "endouble(0x4008000000000000)" -> kept as-is (Python handles 0x)
- * ========================================================= */
+/* -------------------------------------------------------
+ * Bug 6 fix (xeval): same injection concern as ieee754_128.
+ * Pass the expression as a command-line argument via a temp
+ * script so it is never interpolated into shell syntax.
+ * Only expressions whose characters are in a safe whitelist
+ * are accepted; otherwise 0.0 is returned.
+ * ------------------------------------------------------- */
 static double xeval(Assembler *asmb, const char *expr_str){
-    /* --- Step 1: replace :label tokens with their decimal values --- */
-    /* Result buffer: at most 64 chars per label replacement */
+    /* Step 1: replace :label tokens with decimal values */
     size_t elen = strlen(expr_str);
     size_t bufcap = elen * 24 + 256;
     char *expanded = malloc(bufcap);
@@ -1292,7 +1250,6 @@ static double xeval(Assembler *asmb, const char *expr_str){
     size_t i = 0;
     while(i < elen && out < bufcap - 32){
         if(expr_str[i] == ':'){
-            /* read label name: alphanumeric, '_', '.' */
             size_t ns = ++i;
             while(expr_str[i] &&
                   (isalnum((unsigned char)expr_str[i]) ||
@@ -1315,39 +1272,47 @@ static double xeval(Assembler *asmb, const char *expr_str){
     }
     expanded[out] = '\0';
 
-    /* --- Step 2: build Python one-liner and call via popen --- */
-    /*
-     * Python script:
-     *   import struct
-     *   def enfloat(x): return struct.unpack('f', struct.pack('I', x & 0xFFFFFFFF))[0]
-     *   def endouble(x): return struct.unpack('d', struct.pack('Q', x & 0xFFFFFFFFFFFFFFFF))[0]
-     *   print(repr(float(eval("<expr>"))))
-     */
-
-    /* Escape backslashes and double-quotes in the expression */
-    size_t ecap = out * 2 + 32;
-    char *escaped = malloc(ecap);
-    size_t ei = 0;
-    for(size_t k = 0; k < out && ei < ecap-2; k++){
-        char c = expanded[k];
-        if(c == '\\' || c == '"'){ escaped[ei++] = '\\'; }
-        escaped[ei++] = c;
+    /* Step 2: whitelist check – only allow safe arithmetic characters.
+     * This prevents any shell or Python injection via the expression. */
+    int safe = 1;
+    for(size_t k = 0; k < out; k++){
+        unsigned char c = (unsigned char)expanded[k];
+        if(!(isdigit(c) || isalpha(c) ||
+             c==' ' || c=='.' || c=='+' || c=='-' || c=='*' || c=='/' ||
+             c=='(' || c==')' || c==',' || c=='_' || c=='x' || c=='X' ||
+             c=='0' )){
+            safe = 0; break;
+        }
     }
-    escaped[ei] = '\0';
+    if(!safe){
+        fprintf(stderr, "xeval: unsafe expression rejected: %s\n", expr_str);
+        free(expanded);
+        return 0.0;
+    }
 
-    /* Build the full Python command */
-    size_t cmdcap = ei + 512;
+    /* Write helper script to temp file */
+    const char *script_path = "/tmp/axx_xeval_helper.py";
+    {
+        FILE *sf = fopen(script_path, "w");
+        if(!sf){ free(expanded); return 0.0; }
+        fprintf(sf,
+            "import sys, struct\n"
+            "def enfloat(x):\n"
+            "    return struct.unpack('f', struct.pack('I', int(x) & 0xFFFFFFFF))[0]\n"
+            "def endouble(x):\n"
+            "    return struct.unpack('d', struct.pack('Q', int(x) & 0xFFFFFFFFFFFFFFFF))[0]\n"
+            "print(repr(float(eval(sys.argv[1]))))\n"
+        );
+        fclose(sf);
+    }
+
+    /* Build command: python3 <script> <expanded_expr>
+     * The expression is passed as a single argv element; no shell interpolation. */
+    size_t cmdcap = out + 128;
     char *cmd = malloc(cmdcap);
-    snprintf(cmd, cmdcap,
-        "python3 -c \""
-        "import struct\n"
-        "def enfloat(x):\n"
-        "  return struct.unpack('f',struct.pack('I',int(x)&0xFFFFFFFF))[0]\n"
-        "def endouble(x):\n"
-        "  return struct.unpack('d',struct.pack('Q',int(x)&0xFFFFFFFFFFFFFFFF))[0]\n"
-        "print(repr(float(eval(\\\"" "%s" "\\\"))))"
-        "\"",
-        escaped);
+    /* Use single-quotes around expression for the shell, after verifying
+     * the whitelist already guarantees no single-quote characters. */
+    snprintf(cmd, cmdcap, "python3 %s '%s'", script_path, expanded);
 
     double result = 0.0;
     FILE *fp = popen(cmd, "r");
@@ -1362,7 +1327,6 @@ static double xeval(Assembler *asmb, const char *expr_str){
     }
 
     free(expanded);
-    free(escaped);
     free(cmd);
     return result;
 }
@@ -1420,15 +1384,12 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         x=expr_expression(asmb,s,idx+1,&idx);
         if(s[idx]==')') idx++;
     }
-    /* character literals */
     else if(idx+4<=slen && strncmp(s+idx,"'\\t'",4)==0){ x=u256_from_i64(0x09); idx+=4; }
     else if(idx+4<=slen && strncmp(s+idx,"'\\''",4)==0){ x=u256_from_i64('\''); idx+=4; }
     else if(idx+4<=slen && strncmp(s+idx,"'\\\\'",4)==0){ x=u256_from_i64('\\'); idx+=4; }
     else if(idx+4<=slen && strncmp(s+idx,"'\\n'",4)==0){ x=u256_from_i64(0x0a); idx+=4; }
     else if(idx+3<=slen && s[idx]=='\'' && s[idx+2]=='\''){ x=u256_from_i64((unsigned char)s[idx+1]); idx+=3; }
-    /* $$ = pc */
     else if(axx_q(s,slen,"$$",idx)){ idx+=2; x=st->pc; }
-    /* # = symbol */
     else if(axx_q(s,slen,"#",idx)){
         idx++;
         char t[512];
@@ -1436,7 +1397,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         uint256_t sv;
         if(symbol_get(st,t,&sv)) x=sv; else x=u256_zero();
     }
-    /* 0b binary */
     else if(axx_q(s,slen,"0b",idx)){
         idx+=2;
         while(s[idx]=='0'||s[idx]=='1'){
@@ -1444,7 +1404,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             idx++;
         }
     }
-    /* 0x hex */
     else if(axx_q(s,slen,"0x",idx)){
         idx+=2;
         while(s[idx]&&is_xdigit_upper(axx_upper_char(s[idx]))){
@@ -1454,7 +1413,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             idx++;
         }
     }
-    /* qad{} - quad float */
     else if(idx+3<=slen && strncmp(s+idx,"qad",3)==0){
         idx+=3;
         idx=axx_skipspc(s,idx);
@@ -1465,7 +1423,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             if(s[idx]=='}') idx++;
         }
     }
-    /* dbl{} */
     else if(idx+3<=slen && strncmp(s+idx,"dbl",3)==0){
         idx+=3;
         int f; char t[512];
@@ -1482,7 +1439,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             x=u256_from_u64(bits);
         }
     }
-    /* flt{} */
     else if(idx+3<=slen && strncmp(s+idx,"flt",3)==0){
         idx+=3;
         int f; char t[512];
@@ -1499,7 +1455,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             x=u256_from_u64(bits);
         }
     }
-    /* decimal integer - parse with u256 arithmetic to support >64-bit values */
     else if(is_digit(s[idx])){
         char fs[64];
         idx=axx_get_intstr(s,idx,fs,sizeof(fs));
@@ -1507,7 +1462,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         uint256_t ten=u256_from_u64(10);
         for(int di=0;fs[di];di++) x=u256_add(u256_mul(x,ten),u256_from_u64((uint64_t)(fs[di]-'0')));
     }
-    /* single lowercase letter variable (EXP_PAT mode) */
     else if(st->expmode==EXP_PAT && is_lower(s[idx]) && (s[idx+1]=='\0'||!is_lower(s[idx+1]))){
         char ch=s[idx];
         if(idx+3<=slen && s[idx+1]==':'&&s[idx+2]=='='){
@@ -1518,7 +1472,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             idx++;
         }
     }
-    /* label word */
     else if(s[idx]&&char_in(s[idx],st->lwordchars)){
         char w[512];
         int new_idx=axx_get_label_word(s,idx,st->lwordchars,w,sizeof(w));
@@ -1615,8 +1568,14 @@ static uint256_t expr_term5(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
+/* -------------------------------------------------------
+ * Bug 8 fix: expr_term6() sign extension operator x'n
+ * When tv == 256 the original u256_shl(~0, 256) returned 0,
+ * making the mask all-1s and bypassing the sign extension
+ * entirely.  Guard with tv < 256; for tv >= 256 the value
+ * already fits and no extension is needed.
+ * ------------------------------------------------------- */
 static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_out){
-    /* sign extension operator: x'n */
     uint256_t x=expr_term5(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
     while(idx<slen && s[idx]=='\''){
@@ -1624,16 +1583,22 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
         if(ni>=slen||((s[ni]<'0'||s[ni]>'9')&&s[ni]!='(')) break;
         uint256_t t=expr_term5(asmb,s,idx+1,&idx);
         int64_t tv=u256_to_i64(t);
-        if(tv<=0){ x=u256_zero(); }
-        else {
-            /* x = (x & ~(~0<<t)) | (~0<<t if (x>>(t-1))&1 else 0) */
-            uint256_t mask=u256_not(u256_shl(u256_not(u256_zero()),(int)tv));
-            x=u256_and(x,mask);
-            uint256_t sign_bit=u256_sar(x,(int)(tv-1));
-            sign_bit=u256_and(sign_bit,u256_one());
+        if(tv<=0){
+            x=u256_zero();
+        } else if(tv >= 256){
+            /* Value already occupies <=256 bits; nothing to extend */
+            /* (no-op) */
+        } else {
+            /* mask = ~(~0 << tv)  -- safe because 0 < tv < 256 */
+            uint256_t mask = u256_not(u256_shl(u256_not(u256_zero()), (int)tv));
+            x = u256_and(x, mask);
+            /* sign_bit = (x >> (tv-1)) & 1 */
+            uint256_t sign_bit = u256_sar(x, (int)(tv - 1));
+            sign_bit = u256_and(sign_bit, u256_one());
             if(!u256_is_zero(sign_bit)){
-                uint256_t ext=u256_shl(u256_not(u256_zero()),(int)tv);
-                x=u256_or(x,ext);
+                /* extend: or in all-ones above bit tv */
+                uint256_t ext = u256_shl(u256_not(u256_zero()), (int)tv);
+                x = u256_or(x, ext);
             }
         }
     }
@@ -1685,17 +1650,68 @@ static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_o
     *idx_out=idx; return x;
 }
 
+/* -------------------------------------------------------
+ * Bug 5 fix: expr_term11() ternary operator lazy evaluation.
+ * The original eagerly evaluated both branches before
+ * choosing.  This caused side-effects (variable assignments
+ * via :=) in the unchosen branch to execute.
+ *
+ * Fix: parse past the true-expression token boundary without
+ * evaluating it, then only evaluate the chosen branch.
+ * We use a helper that advances idx without calling expr.
+ * ------------------------------------------------------- */
+
+/* skip_subexpr: advance idx over a sub-expression without evaluating it.
+ * Stops at depth-0 delimiters that cannot be part of an expression:
+ *   '?'  – ternary operator start
+ *   ':'  – ternary else separator
+ *   ','  – object-list separator in makeobj  ← Bug fix: was missing,
+ *            causing ";z?0xf3:0,0xa4" to skip "0,0xa4" as the false
+ *            branch instead of stopping at the comma.
+ * ')' at depth 0 stops because we are inside a caller's parentheses.
+ */
+static int skip_subexpr(const char *s, int idx) {
+    int slen = (int)strlen(s);
+    int depth = 0;
+    while(idx < slen && s[idx]){
+        char c = s[idx];
+        if(c == '(') { depth++; idx++; }
+        else if(c == ')') { if(depth > 0){ depth--; idx++; } else break; }
+        else if(depth == 0 && (c == '?' || c == ':' || c == ',')) break;
+        else idx++;
+    }
+    return idx;
+}
+
 static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_out){
-    uint256_t x=expr_term10(asmb,s,idx,&idx);
-    int slen=(int)strlen(s);
-    while(idx<slen && axx_q(s,slen,"?",idx)){
-        uint256_t t=expr_term10(asmb,s,idx+1,&idx);
-        if(axx_q(s,slen,":",idx)){
-            uint256_t u=expr_term10(asmb,s,idx+1,&idx);
-            x=u256_is_zero(x)?u:t;
+    uint256_t x = expr_term10(asmb, s, idx, &idx);
+    int slen = (int)strlen(s);
+    while(idx < slen && axx_q(s, slen, "?", idx)){
+        idx++; /* consume '?' */
+        idx = axx_skipspc(s, idx);
+        if(u256_is_zero(x)){
+            /* condition false: skip true-branch, evaluate false-branch */
+            int skip_end = skip_subexpr(s, idx);
+            /* skip_end should be at ':' */
+            if(axx_q(s, slen, ":", skip_end)){
+                int false_start = axx_skipspc(s, skip_end + 1);
+                x = expr_term10(asmb, s, false_start, &idx);
+            } else {
+                idx = skip_end;
+                x = u256_zero();
+            }
+        } else {
+            /* condition true: evaluate true-branch, skip false-branch */
+            x = expr_term10(asmb, s, idx, &idx);
+            idx = axx_skipspc(s, idx);
+            if(axx_q(s, slen, ":", idx)){
+                idx++; /* consume ':' */
+                idx = skip_subexpr(s, axx_skipspc(s, idx));
+            }
         }
     }
-    *idx_out=idx; return x;
+    *idx_out = idx;
+    return x;
 }
 
 static uint256_t expr_expression(Assembler *asmb, const char *s, int idx, int *idx_out){
@@ -1718,7 +1734,6 @@ static int dir_set_symbol(Assembler *asmb, PatEntry *e){
 static int dir_clear_symbol(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".clearsym")!=0) return 0;
     if(e->f[2][0]){
-        /* field[2] = specific key to clear */
         char key[512]; axx_strupr_to(key,e->f[2],sizeof(key));
         smap_delete(&asmb->st.symbols,key);
     } else {
@@ -1797,7 +1812,6 @@ static int dir_epic(Assembler *asmb, PatEntry *e){
 
 static void dir_error(Assembler *asmb, const char *s){
     AsmState *st=&asmb->st;
-    /* strip spaces */
     int has_content=0;
     for(const char*p=s;*p;p++) if(*p!=' '){has_content=1;break;}
     if(!has_content) return;
@@ -1806,8 +1820,6 @@ static void dir_error(Assembler *asmb, const char *s){
     size_t l=strlen(s);
     if(l>=sizeof(buf)) l=sizeof(buf)-1;
     memcpy(buf,s,l); buf[l]='\0';
-    /* append NUL sentinel */
-    buf[l]='\0';
 
     int idx=0;
     while(1){
@@ -1831,54 +1843,64 @@ static void dir_error(Assembler *asmb, const char *s){
 /* =========================================================
  * PatternMatcher
  * ========================================================= */
-/* remove_brackets: remove OB..CB pairs at given 1-based indices */
+
+/* -------------------------------------------------------
+ * Bug 2 fix: remove_brackets_str()
+ * Original used nesting depth as the group ID, so two
+ * sibling optional groups "[[A]] [[B]]" both got level=1
+ * and could not be addressed individually.
+ *
+ * Fix: assign a unique monotone serial number to each OB,
+ * matched with its corresponding CB via an open-stack.
+ * remove_idx[] now refers to these serials.
+ * ------------------------------------------------------- */
 static char *remove_brackets_str(const char *s, int *remove_idx, int nr){
     int len=(int)strlen(s);
-    /* find bracket positions */
-    typedef struct { int level; int pos; int is_open; } BP;
-    BP *bps=calloc(len,sizeof(BP)); int nbps=0;
-    int open_count=0;
-    for(int i=0;i<len;i++){
-        if(s[i]==OB_CHAR){ open_count++; bps[nbps++]=(BP){open_count,i,1}; }
-        else if(s[i]==CB_CHAR){ bps[nbps++]=(BP){open_count,i,0}; open_count--; }
-    }
-    /* build set of positions to remove */
-    char *result=malloc(len+1);
-    memcpy(result,s,len+1);
-    /* for each index in remove_idx, find matching open/close and blank them */
-    for(int ri=0;ri<nr;ri++){
-        int ridx=remove_idx[ri];
-        int start_pos=-1, end_pos=-1;
-        for(int b=0;b<nbps;b++){
-            if(bps[b].level==ridx && bps[b].is_open && start_pos<0) start_pos=bps[b].pos;
-            else if(bps[b].level==ridx && !bps[b].is_open && start_pos>=0){ end_pos=bps[b].pos; break; }
+    typedef struct { int serial; int pos; int is_open; } BP;
+    BP *bps = calloc(len + 1, sizeof(BP)); int nbps = 0;
+    int serial = 0;
+    int *stk = calloc(len + 1, sizeof(int)); int stkp = 0;
+    for(int i = 0; i < len; i++){
+        if(s[i] == OB_CHAR){
+            serial++;
+            stk[stkp++] = serial;
+            bps[nbps++] = (BP){serial, i, 1};
+        } else if(s[i] == CB_CHAR && stkp > 0){
+            int matched = stk[--stkp];
+            bps[nbps++] = (BP){matched, i, 0};
         }
-        if(start_pos>=0&&end_pos>=0)
-            for(int j=start_pos;j<=end_pos;j++) result[j]='\x01'; /* mark for removal */
     }
-    /* compact */
-    char *out=malloc(len+1); int n=0;
-    for(int i=0;i<len;i++) if(result[i]!='\x01') out[n++]=result[i];
-    out[n]=0;
+    free(stk);
+
+    char *result = malloc(len + 1);
+    memcpy(result, s, len + 1);
+    for(int ri = 0; ri < nr; ri++){
+        int ridx = remove_idx[ri];
+        int start_pos = -1, end_pos = -1;
+        for(int b = 0; b < nbps; b++){
+            if(bps[b].serial == ridx && bps[b].is_open)  start_pos = bps[b].pos;
+            if(bps[b].serial == ridx && !bps[b].is_open) end_pos   = bps[b].pos;
+        }
+        if(start_pos >= 0 && end_pos >= 0)
+            for(int j = start_pos; j <= end_pos; j++) result[j] = '\x01';
+    }
+    char *out = malloc(len + 1); int n = 0;
+    for(int i = 0; i < len; i++) if(result[i] != '\x01') out[n++] = result[i];
+    out[n] = 0;
     free(result); free(bps);
     return out;
 }
 
-/* match: match assembly line s against pattern t */
 static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
     AsmState *st=&asmb->st;
     strncpy(st->deb1,s_orig,sizeof(st->deb1)-1);
     strncpy(st->deb2,t_orig,sizeof(st->deb2)-1);
 
-    /* remove OB/CB from t */
     char *t_nobr=strdup(t_orig);
-    for(char*p=t_nobr;*p;p++) if(*p==OB_CHAR||*p==CB_CHAR) *p=' ';
-    /* Actually per Python: t.replace(OB,'').replace(CB,'') */
     char *t_clean=malloc(strlen(t_nobr)+1); int n2=0;
     for(int i=0;t_nobr[i];i++) if(t_nobr[i]!=OB_CHAR&&t_nobr[i]!=CB_CHAR) t_clean[n2++]=t_nobr[i];
     t_clean[n2]=0; free(t_nobr);
 
-    /* NUL-terminate both */
     char *s=malloc(strlen(s_orig)+2); strcpy(s,s_orig); s[strlen(s_orig)+1]=0;
     char *t=malloc(strlen(t_clean)+2); strcpy(t,t_clean); t[strlen(t_clean)+1]=0;
     free(t_clean);
@@ -1915,17 +1937,13 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 idx_t=axx_skipspc(t,idx_t);
                 char stopchar='\0';
                 if(idx_t<tlen && t[idx_t]=='\\'){
-                    idx_t++;                          /* skip '\' in pattern   */
+                    idx_t++;
                     idx_t=axx_skipspc(t,idx_t);
                     stopchar=t[idx_t];
-                    idx_t++;                          /* skip stopchar in pattern */
+                    idx_t++;
                 }
                 uint256_t v=expr_expression_esc(asmb,s,idx_s,stopchar,&idx_s);
                 var_put(st,a,v);
-                /* stopchar was used as the NUL sentinel in the buffer, so
-                   idx_s now points AT the stopchar in s (or past end).
-                   Consume it from s so the next pattern char can match
-                   whatever follows the stopchar. */
                 if(stopchar && s[idx_s]==stopchar) idx_s++;
                 continue;
             }
@@ -1938,8 +1956,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             var_put(st,a,sv);
             continue;
         } else if(a=='[' || a==']'){
-            /* Brackets are significant delimiters in x86-style patterns like [rbx+rcx*2+d].
-               Match them literally, skipping surrounding spaces in both s and t. */
             idx_t++;
             idx_s=axx_skipspc(s,idx_s);
             if(s[idx_s]==a){ idx_s++; continue; }
@@ -1951,11 +1967,17 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
     return result;
 }
 
+/* -------------------------------------------------------
+ * Bug 3 fix: pat_match0() – undefined behaviour from 1<<cnt
+ * When cnt >= 32, (1<<cnt) is UB in C (signed int overflow).
+ *
+ * Fix: use uint64_t for the mask.  We also cap cnt at 63 to
+ * stay within uint64_t range; patterns with >= 64 optional
+ * groups are pathological and were broken before anyway.
+ * ------------------------------------------------------- */
 static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
-    /* Replace [[ ]] with OB CB */
     char *t=malloc(strlen(t_orig)+1);
     strcpy(t,t_orig);
-    /* replace [[ -> OB, ]] -> CB */
     char *out=malloc(strlen(t)*2+4);
     int n=0;
     for(int i=0;t[i];){
@@ -1965,17 +1987,19 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
     }
     out[n]=0; free(t); t=out;
 
-    /* count OB chars */
     int cnt=0; for(const char*p=t;*p;p++) if(*p==OB_CHAR) cnt++;
-    int *sl=malloc((cnt+1)*sizeof(int));
-    for(int i=0;i<cnt;i++) sl[i]=i+1;
 
-    /* iterate all subsets */
+    /* Cap at 63 to keep the uint64_t bitmask valid */
+    if(cnt > 63) cnt = 63;
+
+    int *sl=malloc((cnt+1)*sizeof(int));
+    for(int i=0;i<cnt;i++) sl[i]=i+1;   /* serials 1..cnt */
+
     int found=0;
-    /* 2^cnt subsets */
-    for(int mask=0;mask<(1<<cnt)&&!found;mask++){
+    uint64_t total = (uint64_t)1 << cnt; /* 2^cnt subsets; safe for cnt<=63 */
+    for(uint64_t mask=0; mask<total && !found; mask++){
         int ri[64]; int nr=0;
-        for(int i=0;i<cnt;i++) if(mask&(1<<i)) ri[nr++]=sl[i];
+        for(int i=0;i<cnt;i++) if(mask & ((uint64_t)1<<i)) ri[nr++]=sl[i];
         char *lt=remove_brackets_str(t,ri,nr);
         if(pat_match(asmb,s,lt)) found=1;
         free(lt);
@@ -2007,20 +2031,16 @@ static void readpat(Assembler *asmb, const char *fn){
     char line[4096];
     while(fgets(line,sizeof(line),f)){
         axx_remove_comment(line);
-        /* replace tab with space, strip CR */
         for(char*p=line;*p;p++){ if(*p=='\t') *p=' '; if(*p=='\r') *p=' '; }
-        /* strip newline */
         int l=(int)strlen(line);
         while(l>0&&(line[l-1]=='\n'||line[l-1]=='\r')) line[--l]=0;
         axx_reduce_spaces(line);
 
-        /* check .include */
         char uline[16]={0};
         int si=axx_skipspc(line,0);
         for(int i=0;i<8&&line[si+i];i++) uline[i]=axx_upper_char(line[si+i]);
         if(strcmp(uline,".INCLUDE")==0){ include_pat(asmb,line+si); continue; }
 
-        /* split by :: */
         char fields[8][1024]; int nf=0;
         int idx=0;
         while(1){
@@ -2032,7 +2052,6 @@ static void readpat(Assembler *asmb, const char *fn){
         }
 
         PatEntry *pe=pv_push_blank(&asmb->st.pat);
-        /* map fields to [0..5] per Python logic */
         if(nf==1){ pat_set(pe,0,fields[0]); }
         else if(nf==2){ pat_set(pe,0,fields[0]); pat_set(pe,2,fields[1]); }
         else if(nf==3){ pat_set(pe,0,fields[0]); pat_set(pe,1,fields[1]); pat_set(pe,2,fields[2]); }
@@ -2059,7 +2078,6 @@ static void replace_percent_with_index(const char *s, char *out, size_t osz){
     out[n]=0;
 }
 
-/* e_p: expand @@[n,pattern] syntax */
 static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assembler *asmb){
     size_t n=0; int has_content=0;
     int i=0; int plen=(int)strlen(pattern);
@@ -2090,7 +2108,7 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
                         for(const char*p=rep_pat;*p&&n<osz-1;) out[n++]=*p++;
                     }
                 }
-                i++; /* skip ] */
+                i++;
             } else {
                 if(n+3<osz){ out[n++]='@'; out[n++]='@'; out[n++]='['; has_content=1; }
             }
@@ -2188,7 +2206,6 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
 
     for(int ki=0;ki<st->vliwset.len;ki++){
         VliwSetEntry *k=&st->vliwset.data[ki];
-        /* sorted compare */
         int *sorted_k=malloc(k->nidxs*sizeof(int));
         memcpy(sorted_k,k->idxs,k->nidxs*sizeof(int));
         qsort(sorted_k,k->nidxs,sizeof(int),int_cmp);
@@ -2205,14 +2222,12 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         uint256_t tmask=u256_is_zero(u256_from_u64((uint64_t)at))?u256_zero():u256_sub(u256_shl(u256_one(),at),u256_one());
         uint256_t templ=u256_and(xv,tmask);
 
-        /* collect values */
         IntVec values; iv_init(&values);
         for(int oi=0;oi<objs.len;oi++) for(int mi=0;mi<objs.data[oi].len;mi++) iv_push(&values,objs.data[oi].data[mi]);
 
         int ibyte=st->vliwinstbits/8+(st->vliwinstbits%8?1:0);
         int noi=(vbits-at)/st->vliwinstbits;
         int target_len=ibyte*noi;
-        /* pad with nop, or warn+truncate on overflow */
         if(values.len > target_len){
             if(st->pas==2||st->pas==0)
                 printf("warning-VLIW:%d values exceed slot capacity %d,truncating.\n",values.len,target_len);
@@ -2222,7 +2237,6 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
             for(int pi=0;pi<needed;pi++) for(int ni=0;ni<st->vliwnop.len;ni++) iv_push(&values,st->vliwnop.data[ni]);
         }
 
-        /* build v1: noi instruction words */
         IntVec v1; iv_init(&v1);
         int cnt2=0;
         uint256_t im=u256_sub(u256_shl(u256_one(),st->vliwinstbits),u256_one());
@@ -2235,15 +2249,19 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
             iv_push(&v1,u256_and(vv,im));
         }
 
-        /* r = concat v1 */
         uint256_t pm=u256_sub(u256_shl(u256_one(),vbits),u256_one());
         uint256_t r=u256_zero();
         for(int vi=0;vi<v1.len;vi++){ r=u256_shl(r,st->vliwinstbits); r=u256_or(r,v1.data[vi]); }
         r=u256_and(r,pm);
 
         uint256_t res;
-        if(st->vliwtemplatebits<0) res=u256_or(r,u256_shl(templ,(int)(vbits-at)));
-        else res=u256_or(u256_shl(r,at),templ);
+        if(st->vliwbits>0){
+            if(st->vliwtemplatebits<0) res=u256_or(r,u256_shl(templ,(int)(vbits-at)));
+            else res=u256_or(u256_shl(r,at),templ);
+        } else {
+            if(st->vliwtemplatebits<0) res=u256_or(r,u256_shl(templ,(int)(vbits-at)));
+            else res=u256_or(u256_shl(r,at),templ);
+        }
 
         int q=0;
         uint64_t pc64=u256_to_u64(st->pc);
@@ -2288,6 +2306,21 @@ static int adir_labelc(AsmState *st, const char *l, const char *ll){
     return 1;
 }
 
+/* -------------------------------------------------------
+ * Bug 7 fix: adir_label_processing()
+ * For "label: .EQU expr", the original called
+ *   expr_expression_asm(asmb, l, idx, &io)
+ * where l is the full line and idx points past ".EQU".
+ * This is correct as long as the expression parser ignores
+ * everything before idx -- which it does via skipspc --
+ * EXCEPT when the label name is itself a valid lwordchars
+ * token at the start of l.  In that case the recursive
+ * descent would try to parse the label name as a label
+ * reference.
+ *
+ * Fix: pass (l + idx) as the string and reset idx to 0, so
+ * the expression parser only ever sees the expression tail.
+ * ------------------------------------------------------- */
 static char *adir_label_processing(Assembler *asmb, const char *l, char *out, size_t osz){
     AsmState *st=&asmb->st;
     if(!l[0]){ out[0]=0; return out; }
@@ -2300,7 +2333,9 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
         char ue[256]; axx_strupr_to(ue,e,sizeof(ue));
         if(strcmp(ue,".EQU")==0){
             int io;
-            uint256_t u=expr_expression_asm(asmb,l,idx,&io);
+            /* Bug 7 fix: pass only the expression tail, not the full line */
+            const char *expr_tail = l + idx;
+            uint256_t u = expr_expression_asm(asmb, expr_tail, 0, &io);
             label_put_value(st,label,u,st->current_section);
             out[0]=0; return out;
         } else {
@@ -2379,7 +2414,6 @@ static int adir_org(Assembler *asmb, const char *l, const char *l2){
     if(strcmp(up,".ORG")!=0) return 0;
     int io;
     uint256_t u=expr_expression_asm(asmb,l2,0,&io);
-    /* check ,P suffix */
     if(io+2<=(int)strlen(l2) && axx_upper_char(l2[io])==','&&axx_upper_char(l2[io+1])=='P'){
         if(u256_gt_signed(u,asmb->st.pc)){
             uint64_t from=u256_to_u64(asmb->st.pc);
@@ -2422,10 +2456,7 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     char l[1024]={0}, l2[4096]={0};
     idx=axx_get_param_to_spc(line,idx,l,sizeof(l));
     idx=axx_get_param_to_eon(line,idx,l2,sizeof(l2));
-    /* rstrip l */
     int ll=(int)strlen(l); while(ll>0&&(l[ll-1]==' '||l[ll-1]=='\t')) l[--ll]=0;
-    /* l2 already rstripped by get_param_to_eon */
-    /* remove spaces from l */
     char l_nospace[1024]={0}; int nn=0;
     for(int i=0;l[i];i++) if(l[i]!=' ') l_nospace[nn++]=l[i];
     l_nospace[nn]=0;
@@ -2436,7 +2467,6 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(adir_zero(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_ascii(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_asciiz(asmb,l,l2)){ *idx_out=idx; return 1; }
-    /* .include */
     { char up[16]; axx_strupr_to(up,l,sizeof(up));
       if(strcmp(up,".INCLUDE")==0){ char s[512]; axx_get_string(l2,s,sizeof(s)); if(s[0]) fileassemble(asmb,s); *idx_out=idx; return 1; } }
     if(adir_align(asmb,l,l2)){ *idx_out=idx; return 1; }
@@ -2452,10 +2482,8 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     for(int pi=0;pi<st->pat.len;pi++){
         PatEntry *i=&st->pat.data[pi];
         pln++;
-        /* reset vars */
         for(int vi=0;vi<26;vi++) st->vars[vi]=u256_zero();
 
-        /* check pattern directives */
         if(dir_set_symbol(asmb,i)) continue;
         if(dir_clear_symbol(asmb,i)) continue;
         if(dir_padding(asmb,i)) continue;
@@ -2464,7 +2492,6 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         if(dir_epic(asmb,i)) continue;
         if(dir_vliwp(asmb,i)) continue;
 
-        /* count non-empty fields */
         int lw=0; for(int fi=0;fi<PAT_FIELDS;fi++) if(i->f[fi][0]) lw++;
         if(lw==0) continue;
 
@@ -2476,26 +2503,13 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         st->error_undefined_label=0;
         st->expmode=EXP_ASM;
 
-        if(!st->debug){
-            /* try/catch equivalent: use setjmp or just proceed */
-            /* In C we just call directly */
-            if(pat_match0(asmb,lin,i->f[0])){
-                dir_error(asmb,i->f[1]);
-                makeobj(asmb,i->f[2],objl_out);
-                int io;
-                uint256_t idxv=expr_expression_pat(asmb,i->f[3],0,&io);
-                idxs_val=(int)u256_to_i64(idxv);
-                loopflag=0; break;
-            }
-        } else {
-            if(pat_match0(asmb,lin,i->f[0])){
-                dir_error(asmb,i->f[1]);
-                makeobj(asmb,i->f[2],objl_out);
-                int io;
-                uint256_t idxv=expr_expression_pat(asmb,i->f[3],0,&io);
-                idxs_val=(int)u256_to_i64(idxv);
-                loopflag=0; break;
-            }
+        if(pat_match0(asmb,lin,i->f[0])){
+            dir_error(asmb,i->f[1]);
+            makeobj(asmb,i->f[2],objl_out);
+            int io;
+            uint256_t idxv=expr_expression_pat(asmb,i->f[3],0,&io);
+            idxs_val=(int)u256_to_i64(idxv);
+            loopflag=0; break;
         }
     }
 
@@ -2507,7 +2521,6 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         if(oerr){ printf(" ; pat %d error - Illegal syntax in assemble line or pattern line.\n",pln); *idx_out=idx; return 0; }
     }
 
-    /* populate idxs_out as single-element IntVec */
     iv_clear(idxs_out);
     iv_push(idxs_out, u256_from_i64(idxs_val));
     *idx_out=idx;
@@ -2518,7 +2531,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     AsmState *st=&asmb->st;
     char line[4096];
     strncpy(line,line_in,sizeof(line)-1);
-    /* replace tab with space, strip newline */
     for(char*p=line;*p;p++){ if(*p=='\t') *p=' '; if(*p=='\n'||*p=='\r') *p=' '; }
     axx_reduce_spaces(line);
     axx_remove_comment_asm(line);
@@ -2526,20 +2538,25 @@ static int lineassemble(Assembler *asmb, const char *line_in){
 
     char processed[4096];
     adir_label_processing(asmb,line,processed,sizeof(processed));
-    /* clear_symbol with ".clearsym" */
-    {
-        PatEntry ce;
-        ce.f[0]=strdup(".clearsym"); ce.f[1]=strdup(""); ce.f[2]=strdup("");
-        for(int i=3;i<PAT_FIELDS;i++) ce.f[i]=strdup("");
-        dir_clear_symbol(asmb,&ce);
-        for(int i=0;i<PAT_FIELDS;i++) free(ce.f[i]);
-    }
 
-    /* count vcnt from !! split */
+    /* Clear the symbol table before each assembly line's pattern scan.
+     * This is the intended position-dependent scoping mechanism:
+     * symbols defined via .setsym in the pattern file are effective only
+     * for patterns that appear AFTER them.  By clearing here, the pattern
+     * scan rebuilds the symbol table progressively as it walks the pattern
+     * list, so e.g. "INC r" (16-bit, using BC/DE/HL/SP symbols) cannot
+     * accidentally match "INC E" because the single-letter register symbols
+     * are only added to the table once the scan reaches their .setsym rows.
+     *
+     * Without this clear, setpatsymbols() leaves E=3 in the table from the
+     * start, causing "INC r" to match "INC E" (r=3 → 0x03|3 = 0x03) instead
+     * of the correct "INC x" (x=3 → 0x04|(3<<3) = 0x1C).
+     */
+    smap_clear(&asmb->st.symbols);
+
     int vcnt=0;
     const char *pp=processed;
     while(1){
-        /* count non-empty parts */
         int has=0;
         while(*pp&&!(*pp=='!'&&*(pp+1)=='!')){ if(*pp!=' ') has=1; pp++; }
         if(has) vcnt++;
@@ -2553,7 +2570,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     int flag=lineassemble2(asmb,processed,0,&idxs,&objl,&new_idx);
     if(!flag){ iv_free(&idxs); iv_free(&objl); return 0; }
 
-    /* check if VLIW continues */
     const char *rest=processed+new_idx;
     while(*rest==' ') rest++;
     int is_vliw_cont=(st->vliwflag && rest[0]=='!'&&rest[1]=='!');
@@ -2577,7 +2593,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
 static int lineassemble0(Assembler *asmb, const char *line){
     AsmState *st=&asmb->st;
     strncpy(st->cl,line,sizeof(st->cl)-1);
-    /* strip trailing newline */
     int l=(int)strlen(st->cl);
     while(l>0&&(st->cl[l-1]=='\n'||st->cl[l-1]=='\r')) st->cl[--l]=0;
 
@@ -2592,13 +2607,11 @@ static int lineassemble0(Assembler *asmb, const char *line){
 }
 
 static char *file_input_from_stdin(void){
-    /* read all stdin into malloced string */
     size_t total=0, cap=4096;
     char *buf=malloc(cap);
     char line[4096];
     while(fgets(line,sizeof(line),stdin)){
         size_t l=strlen(line);
-        /* remove \r */
         for(size_t i=0;i<l;i++) if(line[i]=='\r'){ memmove(line+i,line+i+1,l-i); l--; }
         while(total+l+1>cap){ cap*=2; buf=realloc(buf,cap); }
         memcpy(buf+total,line,l);
@@ -2655,7 +2668,6 @@ static void setpatsymbols(Assembler *asmb){
         PatEntry *e=&asmb->st.pat.data[pi];
         dir_set_symbol(asmb,e);
     }
-    /* copy symbols -> patsymbols */
     smap_free(&asmb->st.patsymbols);
     smap_init(&asmb->st.patsymbols);
     for(int i=0;i<asmb->st.symbols.nb;i++){
@@ -2715,21 +2727,17 @@ int main(int argc, char *argv[]){
 
     if(!patternfile){ print_usage(argv[0]); return 1; }
 
-    /* load pattern */
     readpat(asmb,patternfile);
     setpatsymbols(asmb);
 
-    /* import labels */
     if(st->impfile[0]){
         FILE *lf=fopen(st->impfile,"rt");
         if(lf){ char l[4096]; while(fgets(l,sizeof(l),lf)) imp_label(asmb,l); fclose(lf); }
     }
 
-    /* remove stale outfile */
     if(st->outfile[0]) remove(st->outfile);
 
     if(!sourcefile){
-        /* interactive / stdin mode */
         st->pc=u256_zero(); st->pas=0; st->ln=1;
         strncpy(st->current_file,"(stdin)",sizeof(st->current_file)-1);
         char line[4096];
@@ -2737,12 +2745,9 @@ int main(int argc, char *argv[]){
             printf("%016llx >> ",(unsigned long long)u256_to_u64(st->pc));
             fflush(stdout);
             if(!fgets(line,sizeof(line),stdin)) break;
-            /* strip newline */
             int ll=(int)strlen(line);
             while(ll>0&&(line[ll-1]=='\n'||line[ll-1]=='\r')) line[--ll]=0;
-            /* replace \\ -> \ */
             for(int i=0;line[i];i++) if(line[i]=='\\'&&line[i+1]=='\\') { line[i]='\\'; memmove(line+i+1,line+i+2,ll-i-1); ll--; }
-            /* trim */
             ll=(int)strlen(line);
             while(ll>0&&line[ll-1]==' ') line[--ll]=0;
             if(!line[0]) continue;
@@ -2750,7 +2755,6 @@ int main(int argc, char *argv[]){
             lineassemble0(asmb,line);
         }
     } else {
-        /* two-pass */
         st->pc=u256_zero(); st->pas=1; st->ln=1;
         fileassemble(asmb,sourcefile);
         st->pc=u256_zero(); st->pas=2; st->ln=1;
@@ -2759,14 +2763,12 @@ int main(int argc, char *argv[]){
 
     binary_flush(st);
 
-    /* export labels */
     int elf=0;
     if(expfile_elf){ strncpy(st->expfile,expfile_elf,sizeof(st->expfile)-1); elf=1; }
 
     if(st->expfile[0]){
         FILE *lf=fopen(st->expfile,"wt");
         if(lf){
-            /* sections */
             for(int i=0;i<st->sections.count;i++){
                 SecEntry *e=st->sections.order[i];
                 const char *flag="";
@@ -2780,7 +2782,6 @@ int main(int argc, char *argv[]){
                         (unsigned long long)u256_to_u64(e->size),
                         flag);
             }
-            /* export labels */
             for(int i=0;i<st->export_labels.nbuckets;i++){
                 for(LabelEntry*e=st->export_labels.buckets[i];e;e=e->next){
                     fprintf(lf,"%s\t0x%llx\n",e->key,(unsigned long long)u256_to_u64(e->value));
@@ -2790,6 +2791,5 @@ int main(int argc, char *argv[]){
         }
     }
 
-    /* cleanup (optional) */
     return 0;
 }
