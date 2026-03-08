@@ -112,6 +112,11 @@ class AssemblerState:
         # Debug strings
         self.deb1 = ""
         self.deb2 = ""
+        
+        # Pass 1 size-estimation mode:
+        # True の間は未定義ラベルを UNDEF ではなく 0 として返す。
+        # forward参照があっても makeobj がサイズを正しく計算できるようにするため。
+        self._pass1_size_mode = False
 
 
 class StringUtils:
@@ -484,7 +489,8 @@ class LabelManager:
         try:
             v = self.state.labels[k][0]
         except (KeyError, IndexError):
-            v = UNDEF
+            # Pass1 サイズ推定モード中は 0 を返す（値は不正だがリスト長=命令サイズは正しく求まる）
+            v = 0 if self.state._pass1_size_mode else UNDEF
             self.state.error_undefined_label = True
         return v
     
@@ -1874,8 +1880,21 @@ class Assembler:
                         loopflag = False
                         break
                 except Exception:
-                    oerr = True
-                    loopflag = False
+                    if self.state.pas == 1:
+                        # Pass1: パターンはマッチしたが forward参照で makeobj が失敗した。
+                        # ラベルを 0 と仮定してサイズだけ確定させ、PC を正しく進める。
+                        try:
+                            self.state._pass1_size_mode = True
+                            objl = self.obj_gen.makeobj(i[2])
+                            idxs, _ = self.expr_eval.expression_pat(i[3], 0)
+                        except Exception:
+                            objl = []  # それでも失敗した場合はサイズ0のまま
+                        finally:
+                            self.state._pass1_size_mode = False
+                        loopflag = False
+                    else:
+                        oerr = True
+                        loopflag = False
                     break
             else:
                 if self.pattern_matcher.match0(lin, i[0]) == True:
