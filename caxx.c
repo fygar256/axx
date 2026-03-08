@@ -233,12 +233,26 @@ static uint256_t u256_pow(uint256_t base, uint256_t exp) {
 static int64_t u256_to_i64(uint256_t a) { return (int64_t)a.w[0]; }
 static uint64_t u256_to_u64(uint256_t a) { return a.w[0]; }
 
-/* nbit: number of bits needed */
+/* nbit: number of bits needed.
+ * Fix #3: the 256-bit signed minimum value (0x8000...0) is its own negation
+ * under two's-complement, so the original "if negative, negate first" approach
+ * left it unchanged and the while-loop ran forever.
+ * Fix: use a pure unsigned bit-scan over all 256 bits instead. */
 static int u256_nbit(uint256_t v) {
-    if ((v.w[3]>>63)) v = u256_neg(v);
-    int b=0;
-    uint256_t r=v;
-    while(!u256_is_zero(r)){ r=u256_sar(r,1); b++; }
+    /* Treat v as unsigned magnitude: find 1 + floor(log2(|v|)).
+     * For signed semantics the assembler's @-operator counts bits of abs(v),
+     * so for the minimum value 0x8000...0 we return 256 (the true bit width). */
+    int b = 0;
+    for (int wi = 3; wi >= 0; wi--) {
+        if (v.w[wi]) {
+            /* floor(log2(v.w[wi])) + 1 */
+            uint64_t word = v.w[wi];
+            int bits = 0;
+            while (word) { word >>= 1; bits++; }
+            b = wi * 64 + bits;
+            break;
+        }
+    }
     return b;
 }
 
@@ -799,7 +813,7 @@ static int axx_get_floatstr(const char *s, int idx, char *fs, size_t fsz){
     size_t n=0;
     if(s[idx]=='-'){fs[n++]='-';idx++;}
     while(s[idx]&&(is_digit(s[idx])||s[idx]=='.')&&n<fsz-1) fs[n++]=s[idx++];
-    if(s[idx]=='e'||s[idx]=='E'){
+    if((s[idx]=='e'||s[idx]=='E') && n<fsz-1){
         fs[n++]=s[idx++];
         if((s[idx]=='+'||s[idx]=='-')&&n<fsz-1) fs[n++]=s[idx++];
         while(s[idx]&&is_digit(s[idx])&&n<fsz-1) fs[n++]=s[idx++];
@@ -932,6 +946,9 @@ static void safe_spawn_close(FILE *fp, pid_t pid){
  * python3 with that file path.  The user-supplied value is
  * passed as a command-line argument (argv[1]), never embedded
  * in shell syntax.
+ *
+ * Fix #7: use mkstemp() instead of a fixed /tmp/ path to avoid
+ * TOCTOU races when multiple caxx processes run concurrently.
  * ------------------------------------------------------- */
 static uint256_t ieee754_128_from_str(const char *a){
     /* Special values – handled in C, no subprocess needed */
@@ -945,11 +962,13 @@ static uint256_t ieee754_128_from_str(const char *a){
         uint256_t r=u256_zero(); r.w[1]=0x7FFF800000000000ULL; return r;
     }
 
-    /* Write a helper script to a temp file */
-    const char *script_path = "/tmp/axx_q128_helper.py";
+    /* Fix #7: use mkstemp to get a process-unique temp file path */
+    char script_path[] = "/tmp/axx_q128_XXXXXX.py";
     {
-        FILE *sf = fopen(script_path, "w");
-        if(!sf) goto fallback;
+        int fd = mkstemps(script_path, 3);   /* suffix ".py" = 3 chars */
+        if(fd < 0) goto fallback;
+        FILE *sf = fdopen(fd, "w");
+        if(!sf){ close(fd); goto fallback; }
         fprintf(sf,
             "import sys\n"
             "from mpmath import mp, mpf, log, floor, power\n"
@@ -1029,6 +1048,7 @@ static uint256_t ieee754_128_from_str(const char *a){
             }
             safe_spawn_close(fp, pid);
         }
+        unlink(script_path);  /* Fix #7: clean up the process-unique temp file */
         return result;
     }
 
@@ -1131,6 +1151,31 @@ static void binary_flush(AsmState *st){
     if(total_size==0) return;
     unsigned char *data = calloc(1, (size_t)total_size);
     if(!data){perror("calloc");return;}
+
+    /* Fix #6: fill every word-slot with the padding value first,
+     * then overwrite only the positions that were actually written.
+     * The original calloc() always pre-filled with 0, ignoring st->padding. */
+    uint64_t pad_val = u256_to_u64(st->padding);
+    if(pad_val != 0){
+        for(uint64_t pos = 0; pos <= max_pos; pos++){
+            uint64_t base_idx = pos*(uint64_t)bytes_per_word;
+            uint64_t tmp = pad_val;
+            if(!st->endian_big){
+                for(int j=0;j<bytes_per_word;j++){
+                    if(base_idx+j<total_size)
+                        data[base_idx+j]=(unsigned char)(tmp&0xff);
+                    tmp>>=8;
+                }
+            } else {
+                for(int j=bytes_per_word-1;j>=0;j--){
+                    if(base_idx+j<total_size)
+                        data[base_idx+j]=(unsigned char)(tmp&0xff);
+                    tmp>>=8;
+                }
+            }
+        }
+    }
+
     for(int i=0;i<BUFMAP_NB;i++){
         for(BufEntry*e=st->buf.buckets[i];e;e=e->next){
             uint64_t base_idx = e->pos*(uint64_t)bytes_per_word;
@@ -1358,11 +1403,13 @@ static double xeval(Assembler *asmb, const char *expr_str){
         return 0.0;
     }
 
-    /* Write helper script to temp file */
-    const char *script_path = "/tmp/axx_xeval_helper.py";
+    /* Write helper script to temp file (Fix #7: mkstemp for uniqueness) */
+    char script_path[] = "/tmp/axx_xeval_XXXXXX.py";
     {
-        FILE *sf = fopen(script_path, "w");
-        if(!sf){ free(expanded); return 0.0; }
+        int fd = mkstemps(script_path, 3);
+        if(fd < 0){ free(expanded); return 0.0; }
+        FILE *sf = fdopen(fd, "w");
+        if(!sf){ close(fd); free(expanded); return 0.0; }
         fprintf(sf,
             "import sys, struct\n"
             "def enfloat(x):\n"
@@ -1391,6 +1438,7 @@ static double xeval(Assembler *asmb, const char *expr_str){
         fprintf(stderr, "xeval: spawn failed for expr: %s\n", expr_str);
     }
 
+    unlink(script_path);  /* Fix #7: clean up process-unique temp file */
     free(expanded);
     return result;
 }
@@ -1750,29 +1798,39 @@ static int skip_subexpr(const char *s, int idx) {
     return idx;
 }
 
+/* Fix #5: expr_term11() – ternary operator must be RIGHT-associative.
+ * The previous while-loop implementation was left-associative, so
+ *   a ? b : c ? d : e  was parsed as  (a ? b : c) ? d : e
+ * instead of the correct  a ? b : (c ? d : e).
+ *
+ * Fix: replace the while-loop with a single if + recursive call for the
+ * false-branch, exactly mirroring the Python version's recursion on term11.
+ * The true-branch still uses term10 (no recursion needed there because
+ * right-associativity only applies to the else-chain).
+ */
 static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x = expr_term10(asmb, s, idx, &idx);
     int slen = (int)strlen(s);
-    while(idx < slen && axx_q(s, slen, "?", idx)){
+    if(idx < slen && axx_q(s, slen, "?", idx)){
         idx++; /* consume '?' */
         idx = axx_skipspc(s, idx);
         if(u256_is_zero(x)){
-            /* condition false: skip true-branch, evaluate false-branch */
+            /* condition false: skip true-branch, recurse into false-branch */
             int skip_end = skip_subexpr(s, idx);
-            /* skip_end should be at ':' */
-            if(axx_q(s, slen, ":", skip_end)){
+            if(axx_q(s, slen, ":", skip_end) && s[skip_end+1] != '='){
                 int false_start = axx_skipspc(s, skip_end + 1);
-                x = expr_term10(asmb, s, false_start, &idx);
+                x = expr_term11(asmb, s, false_start, &idx);  /* right-recursive */
             } else {
                 idx = skip_end;
                 x = u256_zero();
             }
         } else {
-            /* condition true: evaluate true-branch, skip false-branch */
+            /* condition true: evaluate true-branch with term10, then skip false-branch */
             x = expr_term10(asmb, s, idx, &idx);
             idx = axx_skipspc(s, idx);
-            if(axx_q(s, slen, ":", idx)){
+            if(axx_q(s, slen, ":", idx) && s[idx+1] != '='){
                 idx++; /* consume ':' */
+                /* skip the false-branch (right-recursive) without evaluating */
                 idx = skip_subexpr(s, axx_skipspc(s, idx));
             }
         }
@@ -2689,11 +2747,18 @@ static int lineassemble0(Assembler *asmb, const char *line){
 static char *file_input_from_stdin(void){
     size_t total=0, cap=4096;
     char *buf=malloc(cap);
+    if(!buf){ perror("malloc"); exit(1); }
     char line[4096];
     while(fgets(line,sizeof(line),stdin)){
         size_t l=strlen(line);
         for(size_t i=0;i<l;i++) if(line[i]=='\r'){ memmove(line+i,line+i+1,l-i); l--; }
-        while(total+l+1>cap){ cap*=2; buf=realloc(buf,cap); }
+        while(total+l+1>cap){
+            cap*=2;
+            /* Fix #8: save old pointer so it can be freed if realloc fails */
+            char *tmp=realloc(buf,cap);
+            if(!tmp){ free(buf); perror("realloc"); exit(1); }
+            buf=tmp;
+        }
         memcpy(buf+total,line,l);
         total+=l;
     }
@@ -2843,33 +2908,45 @@ int main(int argc, char *argv[]){
 
     binary_flush(st);
 
-    int elf=0;
-    if(expfile_elf){ strncpy(st->expfile,expfile_elf,sizeof(st->expfile)-1); elf=1; }
+    /* Fix #2: -e と -E が同時指定された場合、元のコードは expfile_elf で
+     * st->expfile を上書きしてから一回だけ書き出していたため -e ファイルが
+     * 消えていた。修正: write_export() を分離し、-e と -E をそれぞれ独立して
+     * 書き出す。両方指定された場合は警告を表示する。             */
+    if(expfile_elf && st->expfile[0])
+        fprintf(stderr,"warning: both -e '%s' and -E '%s' specified; "
+                "exporting plain format to -e and ELF format to -E separately.\n",
+                st->expfile, expfile_elf);
 
-    if(st->expfile[0]){
-        FILE *lf=fopen(st->expfile,"wt");
-        if(lf){
-            for(int i=0;i<st->sections.count;i++){
-                SecEntry *e=st->sections.order[i];
-                const char *flag="";
-                if(elf){
-                    if(strcmp(e->name,".text")==0) flag="AX";
-                    else if(strcmp(e->name,".data")==0) flag="WA";
-                }
-                fprintf(lf,"%s\t0x%llx\t0x%llx\t%s\n",
-                        e->name,
-                        (unsigned long long)u256_to_u64(e->start),
-                        (unsigned long long)u256_to_u64(e->size),
-                        flag);
-            }
-            for(int i=0;i<st->export_labels.nbuckets;i++){
-                for(LabelEntry*e=st->export_labels.buckets[i];e;e=e->next){
-                    fprintf(lf,"%s\t0x%llx\n",e->key,(unsigned long long)u256_to_u64(e->value));
-                }
-            }
-            fclose(lf);
-        }
-    }
+    /* Helper lambda (as a nested function via a local write) */
+    #define WRITE_EXPORT(path_, elf_) do { \
+        FILE *lf=fopen((path_),"wt"); \
+        if(lf){ \
+            for(int i=0;i<st->sections.count;i++){ \
+                SecEntry *e=st->sections.order[i]; \
+                const char *flag=""; \
+                if(elf_){ \
+                    if(strcmp(e->name,".text")==0) flag="AX"; \
+                    else if(strcmp(e->name,".data")==0) flag="WA"; \
+                } \
+                fprintf(lf,"%s\t0x%llx\t0x%llx\t%s\n", \
+                        e->name, \
+                        (unsigned long long)u256_to_u64(e->start), \
+                        (unsigned long long)u256_to_u64(e->size), \
+                        flag); \
+            } \
+            for(int i=0;i<st->export_labels.nbuckets;i++){ \
+                for(LabelEntry*e=st->export_labels.buckets[i];e;e=e->next){ \
+                    fprintf(lf,"%s\t0x%llx\n",e->key,(unsigned long long)u256_to_u64(e->value)); \
+                } \
+            } \
+            fclose(lf); \
+        } \
+    } while(0)
+
+    if(st->expfile[0])   WRITE_EXPORT(st->expfile, 0);
+    if(expfile_elf)      WRITE_EXPORT(expfile_elf,  1);
+
+    #undef WRITE_EXPORT
 
     return 0;
 }
