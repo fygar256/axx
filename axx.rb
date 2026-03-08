@@ -894,7 +894,7 @@ def fwrite(file_path, position, x, prt)
         byts.times do
           vv = v & 0xff
           file.write([vv].pack('C'))
-          ptint(" 0x%02x" % vv) if prt == 1
+          print(" 0x%02x" % vv) if prt == 1
           v >>= 8
           cnt += 1
         end
