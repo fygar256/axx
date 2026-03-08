@@ -22,6 +22,8 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 /* =========================================================
  * Big integer: 256-bit unsigned, stored as 4x uint64_t
@@ -52,15 +54,29 @@ static int u256_is_zero(uint256_t a) {
 static int u256_eq(uint256_t a, uint256_t b) {
     return a.w[0]==b.w[0] && a.w[1]==b.w[1] && a.w[2]==b.w[2] && a.w[3]==b.w[3];
 }
-/* signed compare: treat as two's-complement 256-bit */
+/* signed compare: treat as two's-complement 256-bit.
+ *
+ * Bug 1/3 fix: when both operands have the same sign, the correct ordering
+ * is always the UNSIGNED ordering, regardless of sign.
+ *
+ * Proof: for two's-complement negatives, the more-negative (smaller signed)
+ * value has a SMALLER unsigned representation.
+ *   e.g. INT256_MIN = 0x8000...0  <  -1 = 0xFFFF...F  (both unsigned and signed)
+ *   e.g. -2 = 0xFFFF...E  <  -1 = 0xFFFF...F          (both unsigned and signed)
+ *
+ * The original code inverted the comparison for negative operands (sa==1),
+ * making every negative-vs-negative comparison return the wrong answer.
+ */
 static int u256_lt_signed(uint256_t a, uint256_t b) {
     int sa = (int)(a.w[3] >> 63);
     int sb = (int)(b.w[3] >> 63);
+    /* Different signs: negative < positive */
     if (sa != sb) return sa > sb;
-    if (a.w[3] != b.w[3]) return (sa ? a.w[3] > b.w[3] : a.w[3] < b.w[3]);
-    if (a.w[2] != b.w[2]) return (sa ? a.w[2] > b.w[2] : a.w[2] < b.w[2]);
-    if (a.w[1] != b.w[1]) return (sa ? a.w[1] > b.w[1] : a.w[1] < b.w[1]);
-    return (sa ? a.w[0] > b.w[0] : a.w[0] < b.w[0]);
+    /* Same sign: plain unsigned word-by-word comparison (correct for both signs) */
+    if (a.w[3] != b.w[3]) return a.w[3] < b.w[3];
+    if (a.w[2] != b.w[2]) return a.w[2] < b.w[2];
+    if (a.w[1] != b.w[1]) return a.w[1] < b.w[1];
+    return a.w[0] < b.w[0];
 }
 static int u256_le_signed(uint256_t a, uint256_t b) {
     return u256_eq(a,b) || u256_lt_signed(a,b);
@@ -864,7 +880,51 @@ static uint64_t ieee754_64_from_str(const char *a){
 }
 
 /* -------------------------------------------------------
- * Bug 6 fix: ieee754_128_from_str() – avoid shell injection.
+ * Bug 6 helper: safe_spawn_read() / safe_spawn_close()
+ *
+ * popen(cmd, "r") launches "/bin/sh -c cmd", meaning the shell still
+ * interprets the command string even after whitelist-guarding the value.
+ * The only safe approach is to bypass the shell entirely via fork+execvp,
+ * which passes arguments as a NULL-terminated argv[] array with no
+ * shell quoting or interpolation at all.
+ *
+ * Usage:
+ *   pid_t pid;
+ *   FILE *fp = safe_spawn_read("python3", (const char*[]){
+ *                  "python3", script_path, arg, NULL }, &pid);
+ *   // ... fgets from fp ...
+ *   safe_spawn_close(fp, pid);
+ * ------------------------------------------------------- */
+static FILE *safe_spawn_read(const char *prog, const char *const argv[], pid_t *pid_out){
+    int pfd[2];
+    if(pipe(pfd) != 0){ *pid_out = -1; return NULL; }
+    pid_t pid = fork();
+    if(pid < 0){
+        close(pfd[0]); close(pfd[1]);
+        *pid_out = -1; return NULL;
+    }
+    if(pid == 0){
+        /* child: wire stdout to the write-end of the pipe, then exec */
+        close(pfd[0]);
+        if(dup2(pfd[1], STDOUT_FILENO) < 0) _exit(127);
+        close(pfd[1]);
+        execvp(prog, (char *const *)argv);
+        _exit(127);   /* execvp failed */
+    }
+    /* parent */
+    close(pfd[1]);
+    *pid_out = pid;
+    FILE *fp = fdopen(pfd[0], "r");
+    if(!fp){ close(pfd[0]); waitpid(pid, NULL, 0); *pid_out = -1; return NULL; }
+    return fp;
+}
+static void safe_spawn_close(FILE *fp, pid_t pid){
+    if(fp)  fclose(fp);
+    if(pid > 0) waitpid(pid, NULL, 0);
+}
+
+/* -------------------------------------------------------
+ * Bug 6 fix: ieee754_128_from_str()
  * The original built a shell command string with user data
  * embedded inside single-quoted Python source, which allowed
  * shell meta-characters to escape the quotes.
@@ -941,12 +1001,12 @@ static uint256_t ieee754_128_from_str(const char *a){
         }
         if(!safe) goto fallback;
 
-        /* cmd: python3 /tmp/axx_q128_helper.py <value> */
-        char cmd[768];
-        snprintf(cmd, sizeof(cmd), "python3 %s %s", script_path, a);
-
+        /* Launch: python3 <script_path> <value>
+         * execvp is used directly — no shell, no quoting, no injection risk. */
         uint256_t result = u256_zero();
-        FILE *fp = popen(cmd, "r");
+        pid_t pid;
+        const char *argv_spawn[] = { "python3", script_path, a, NULL };
+        FILE *fp = safe_spawn_read("python3", argv_spawn, &pid);
         if(fp){
             char buf[256] = {0};
             if(fgets(buf, sizeof(buf), fp)){
@@ -967,7 +1027,7 @@ static uint256_t ieee754_128_from_str(const char *a){
                     }
                 }
             }
-            pclose(fp);
+            safe_spawn_close(fp, pid);
         }
         return result;
     }
@@ -1187,10 +1247,18 @@ static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_ou
 static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_out);
 
+/* Bug 4 fix: expr_terminate()
+ * The original had a dead branch `if(l>0 && s[l-1]=='\0')` which can never
+ * be true: strlen() returns the index of the first NUL, so s[l-1] is always
+ * a non-NUL character when l>0.  The then-branch was therefore unreachable.
+ * Simplified to the single always-taken path. */
 static char *expr_terminate(const char *s){
-    size_t l=strlen(s);
-    if(l>0&&s[l-1]=='\0') return strdup(s);
-    char *r=malloc(l+2); memcpy(r,s,l); r[l]='\0'; r[l+1]=0;
+    size_t l = strlen(s);
+    char *r = malloc(l + 2);
+    if(!r){ perror("malloc"); exit(1); }
+    memcpy(r, s, l);
+    r[l]   = '\0';
+    r[l+1] = '\0';
     return r;
 }
 
@@ -1306,28 +1374,24 @@ static double xeval(Assembler *asmb, const char *expr_str){
         fclose(sf);
     }
 
-    /* Build command: python3 <script> <expanded_expr>
-     * The expression is passed as a single argv element; no shell interpolation. */
-    size_t cmdcap = out + 128;
-    char *cmd = malloc(cmdcap);
-    /* Use single-quotes around expression for the shell, after verifying
-     * the whitelist already guarantees no single-quote characters. */
-    snprintf(cmd, cmdcap, "python3 %s '%s'", script_path, expanded);
-
+    /* Launch: python3 <script_path> <expanded_expr>
+     * execvp is used directly — no shell, no quoting, no injection risk.
+     * The expanded expression is passed as a plain argv element. */
     double result = 0.0;
-    FILE *fp = popen(cmd, "r");
+    pid_t pid;
+    const char *argv_spawn[] = { "python3", script_path, expanded, NULL };
+    FILE *fp = safe_spawn_read("python3", argv_spawn, &pid);
     if(fp){
         char buf[128] = {0};
         if(fgets(buf, sizeof(buf), fp)){
             result = strtod(buf, NULL);
         }
-        pclose(fp);
+        safe_spawn_close(fp, pid);
     } else {
-        fprintf(stderr, "xeval: popen failed for expr: %s\n", expr_str);
+        fprintf(stderr, "xeval: spawn failed for expr: %s\n", expr_str);
     }
 
     free(expanded);
-    free(cmd);
     return result;
 }
 
@@ -2017,13 +2081,20 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
 static void readpat(Assembler *asmb, const char *fn);
 static void include_pat(Assembler *asmb, const char *l);
 
+/* Bug 5 fix: include_pat()
+ * The original passed `l+8` to axx_get_string(), hard-coding an 8-character
+ * skip that is only correct when the line starts at column 0.  When the
+ * assembler source has leading whitespace before ".INCLUDE", `idx` holds the
+ * actual start position and the filename parser must begin at `l+idx+8`
+ * (skip idx leading spaces, then the 8 characters of ".INCLUDE" itself).
+ * Without this fix, indented .INCLUDE lines silently fail to load the file. */
 static void include_pat(Assembler *asmb, const char *l){
     int idx=axx_skipspc(l,0);
     char upper8[16]={0};
     for(int i=0;i<8&&l[idx+i];i++) upper8[i]=axx_upper_char(l[idx+i]);
     if(strcmp(upper8,".INCLUDE")!=0) return;
     char s[512];
-    axx_get_string(l+8,s,sizeof(s));
+    axx_get_string(l+idx+8,s,sizeof(s));
     if(s[0]) readpat(asmb,s);
 }
 
