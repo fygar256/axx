@@ -55,6 +55,7 @@ class AssemblerState:
         # File paths
         self.outfile = ""
         self.expfile = ""
+        self.expfile_elf = ""
         self.impfile = ""
         
         # Program counter and padding
@@ -90,7 +91,7 @@ class AssemblerState:
         # Expression mode and errors
         self.expmode = EXP_PAT
         self.error_undefined_label = False
-        self.error_already_defined = False
+        self.error_label_conflict = False
         
         # Assembly configuration
         self.align = 16
@@ -499,13 +500,13 @@ class LabelManager:
         if self.state.pas == 1 or self.state.pas == 0:
             # パス1/インタラクティブ: 同名ラベルの二重定義はエラー
             if k in self.state.labels:
-                self.state.error_already_defined = True
+                self.state.error_label_conflict = True
                 print(f" error - label already defined.")
                 return False
         elif self.state.pas == 2:
             # パス2: パス1で登録されていないラベルが新出現した場合はエラー
             if k not in self.state.labels:
-                self.state.error_already_defined = True
+                self.state.error_label_conflict = True
                 print(f" error - label '{k}' not defined in pass 1.")
                 return False
 
@@ -513,7 +514,7 @@ class LabelManager:
             print(f" error - '{k}' is a pattern file symbol.")
             return False
         
-        self.state.error_already_defined = False
+        self.state.error_label_conflict = False
         self.state.labels[k] = [v, s]
         return True
 
@@ -1671,6 +1672,15 @@ class AssemblyDirectiveProcessor:
             elif l2[idx:idx+2] == '\\n':
                 idx += 2
                 ch = '\n'
+            elif l2[idx:idx+2] == '\\r':
+                idx += 2
+                ch = '\r'
+            elif l2[idx:idx+2] == '\\\\'  :
+                idx += 2
+                ch = '\\'
+            elif l2[idx:idx+2] == '\\"':
+                idx += 2
+                ch = '"'
             else:
                 ch = l2[idx]
                 idx += 1
@@ -1722,9 +1732,12 @@ class AssemblyDirectiveProcessor:
         if StringUtils.upper(l1) != ".ASCIIZ":
             return False
         f = self.asciistr(l2)
-        if f:
-            self.binary_writer.outbin(self.state.pc, 0x00)
-            self.state.pc += 1
+        if not f:
+            if self.state.pas == 2 or self.state.pas == 0:
+                print(f" error - .ASCIIZ requires a quoted string.")
+            return False
+        self.binary_writer.outbin(self.state.pc, 0x00)
+        self.state.pc += 1
         return True
     
     def section_processing(self, l1, l2):
@@ -2078,10 +2091,10 @@ class Assembler:
         args = ap.parse_args()
 
         # --- Apply parsed options to assembler state ---
-        self.state.outfile  = args.outfile
-        self.state.expfile  = args.expfile
-        self.state.impfile  = args.impfile
-        expefile            = args.expfile_elf   # ELF-flavoured export (sets elf=1)
+        self.state.outfile      = args.outfile
+        self.state.expfile      = args.expfile
+        self.state.expfile_elf  = args.expfile_elf
+        self.state.impfile      = args.impfile
 
         # Load pattern file
         self.state.pat = self.pattern_reader.readpat(args.patternfile)
@@ -2137,8 +2150,8 @@ class Assembler:
         # --- Export labels ---
         # -e と -E が同時に指定された場合は警告を出し、両方を別々に出力する。
         # 以前は -E が -e をサイレントに上書きしていた。
-        if expefile and self.state.expfile:
-            print(f"warning: both -e '{self.state.expfile}' and -E '{expefile}' specified; "
+        if self.state.expfile_elf and self.state.expfile:
+            print(f"warning: both -e '{self.state.expfile}' and -E '{self.state.expfile_elf}' specified; "
                   f"exporting plain format to -e and ELF format to -E separately.")
 
         def _write_export(path, elf):
@@ -2161,8 +2174,8 @@ class Assembler:
 
         if self.state.expfile:
             _write_export(self.state.expfile, elf=0)
-        if expefile:
-            _write_export(expefile, elf=1)
+        if self.state.expfile_elf:
+            _write_export(self.state.expfile_elf, elf=1)
 
 
 def main():
