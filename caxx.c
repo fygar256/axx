@@ -658,6 +658,16 @@ typedef struct {
     char deb2[4096];
 
     BufMap     buf;
+
+    /* Fix C-3: Pass1 size-estimation mode.
+     * When true, label_get_value() returns 0 for unknown labels instead of
+     * UNDEF_VAL().  This lets makeobj() compute the correct byte count even
+     * when a forward-referenced label is not yet defined. */
+    int        pass1_size_mode;
+
+    /* Fix C-6: per-process stdin temp file path (replaces fixed "axx.tmp").
+     * NULL until first stdin read; freed and unlinked at the end of run(). */
+    char       stdin_tmp_path[512];
 } AsmState;
 
 static void state_init(AsmState *st) {
@@ -692,6 +702,8 @@ static void state_init(AsmState *st) {
     bufmap_init(&st->buf);
     st->pc = u256_zero();
     st->padding = u256_zero();
+    st->pass1_size_mode = 0;
+    st->stdin_tmp_path[0] = '\0';
 }
 
 /* =========================================================
@@ -1223,7 +1235,9 @@ static uint256_t label_get_value(AsmState *st, const char *k){
     LabelEntry *e=lmap_find(&st->labels,k);
     if(e) return e->value;
     st->error_undefined_label=1;
-    return UNDEF_VAL();
+    /* Fix C-3: in pass1 size-estimation mode return 0 so makeobj() can
+     * compute the correct instruction byte count even for forward refs. */
+    return st->pass1_size_mode ? u256_zero() : UNDEF_VAL();
 }
 static const char *label_get_section(AsmState *st, const char *k){
     st->error_undefined_label=0;
@@ -1321,23 +1335,52 @@ static uint256_t expr_expression_asm(Assembler *asmb, const char *s, int idx, in
     free(ts);
     return r;
 }
+/* Fix C-4: expr_expression_esc() – stack-based bracket matching.
+ *
+ * The old implementation used two independent counters (depth for '()'
+ * and bracket_depth for '[]').  This failed for mixed-bracket patterns
+ * such as "([)]" or when stopchar is ')' while '[' is open: the counters
+ * could go out of sync.
+ *
+ * Fix: push the opening bracket type onto a stack; pop only when the
+ * matching closing bracket arrives.  stopchar is recognized only when the
+ * stack is empty (depth == 0). */
 static uint256_t expr_expression_esc(Assembler *asmb, const char *s, int idx, char stopchar, int *idx_out){
     size_t l = strlen(s);
     char *buf = malloc(l + 2);
-    memcpy(buf, s, idx);
-    int depth = 0;
-    int bracket_depth = 0;
+    if(!buf){ perror("malloc"); exit(1); }
+    memcpy(buf, s, idx);   /* copy prefix unchanged */
+
+    /* Stack of opening brackets seen so far. */
+    char stk[256];
+    int  stkp = 0;
+
     for(size_t i = (size_t)idx; i < l; i++){
-        if(s[i]=='(') { depth++; buf[i]=s[i]; }
-        else if(s[i]==')') { if(depth>0) depth--; buf[i]=s[i]; }
-        else if(s[i]=='[') { bracket_depth++; buf[i]=s[i]; }
-        else if(s[i]==']') {
-            if(bracket_depth>0){ bracket_depth--; buf[i]=s[i]; }
-            else if(depth==0 && stopchar==']') buf[i]='\0';
-            else buf[i]=s[i];
+        char c = s[i];
+        if(c == '(' || c == '['){
+            /* Opening bracket: push and copy */
+            if(stkp < (int)(sizeof(stk)-1)) stk[stkp++] = c;
+            buf[i] = c;
+        } else if(c == ')' || c == ']'){
+            /* Closing bracket */
+            char expected = (c == ')') ? '(' : '[';
+            if(stkp > 0 && stk[stkp-1] == expected){
+                /* Matched: pop, copy normally */
+                stkp--;
+                buf[i] = c;
+            } else if(stkp == 0 && c == stopchar){
+                /* Depth-0 match of stopchar → terminate expression */
+                buf[i] = '\0';
+            } else {
+                /* Mismatched closing bracket (malformed input) – copy as-is */
+                buf[i] = c;
+            }
+        } else {
+            if(stkp == 0 && c == stopchar)
+                buf[i] = '\0';
+            else
+                buf[i] = c;
         }
-        else if(depth==0 && bracket_depth==0 && s[i]==stopchar) buf[i]='\0';
-        else buf[i]=s[i];
     }
     buf[l] = '\0';
     char *ts = expr_terminate(buf);
@@ -1742,22 +1785,46 @@ static uint256_t expr_term8(Assembler *asmb, const char *s, int idx, int *idx_ou
     return expr_term7(asmb,s,idx,idx_out);
 }
 
+/* Fix C-2: expr_term9() – short-circuit &&
+ * The original always evaluated both sides.  When the left operand is
+ * zero the right side must be skipped, otherwise ':=' assignments in the
+ * unchosen branch fire as side-effects.
+ * Note: skip_subexpr() is defined after expr_term11(); forward-declare it. */
+static int skip_subexpr(const char *s, int idx);
+
 static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term8(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
     while(idx<slen && axx_q(s,slen,"&&",idx)){
-        uint256_t t=expr_term8(asmb,s,idx+2,&idx);
-        x=u256_from_i64((!u256_is_zero(x)&&!u256_is_zero(t))?1:0);
+        idx+=2; /* consume '&&' */
+        if(u256_is_zero(x)){
+            /* Short-circuit: skip right-hand side without evaluating */
+            idx = skip_subexpr(s, axx_skipspc(s, idx));
+            /* result stays zero */
+        } else {
+            uint256_t t=expr_term8(asmb,s,idx,&idx);
+            x=u256_from_i64((!u256_is_zero(t))?1:0);
+        }
     }
     *idx_out=idx; return x;
 }
 
+/* Fix C-2: expr_term10() – short-circuit ||
+ * When the left operand is non-zero the right side must be skipped. */
 static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term9(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
     while(idx<slen && axx_q(s,slen,"||",idx)){
-        uint256_t t=expr_term9(asmb,s,idx+2,&idx);
-        x=u256_from_i64((!u256_is_zero(x)||!u256_is_zero(t))?1:0);
+        idx+=2; /* consume '||' */
+        if(!u256_is_zero(x)){
+            /* Short-circuit: skip right-hand side without evaluating */
+            idx = skip_subexpr(s, axx_skipspc(s, idx));
+            /* result stays 1 */
+            x = u256_one();
+        } else {
+            uint256_t t=expr_term9(asmb,s,idx,&idx);
+            x=u256_from_i64((!u256_is_zero(t))?1:0);
+        }
     }
     *idx_out=idx; return x;
 }
@@ -2126,7 +2193,19 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
         int ri[64]; int nr=0;
         for(int i=0;i<cnt;i++) if(mask & ((uint64_t)1<<i)) ri[nr++]=sl[i];
         char *lt=remove_brackets_str(t,ri,nr);
-        if(pat_match(asmb,s,lt)) found=1;
+
+        /* Fix C-1: snapshot vars before each trial so that failed match
+         * attempts cannot leave partial variable writes visible to the
+         * next attempt (or to the caller after a final failure). */
+        uint256_t saved_vars[26];
+        memcpy(saved_vars, asmb->st.vars, sizeof(saved_vars));
+
+        if(pat_match(asmb,s,lt)){
+            found=1;
+        } else {
+            /* restore vars on failure */
+            memcpy(asmb->st.vars, saved_vars, sizeof(saved_vars));
+        }
         free(lt);
     }
     free(sl); free(t);
@@ -2254,8 +2333,14 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     AsmState *st=&asmb->st;
     iv_clear(objl);
 
+    /* Fix C-8: warn if the pattern string is so long that e_p / replace_percent
+     * would silently truncate it.  8192 bytes should be ample in practice, but
+     * large @@[N,…] expansions or deeply nested %% can exceed it. */
     char ep_buf[8192]={0}; int is_empty;
     e_p(s_in,ep_buf,sizeof(ep_buf),&is_empty,asmb);
+    if(strlen(s_in) > sizeof(ep_buf)-16)
+        fprintf(stderr,"warning: makeobj pattern string may have been truncated "
+                        "(len=%zu, buf=%zu)\n", strlen(s_in), sizeof(ep_buf));
     if(is_empty) return;
 
     char s[8192]={0};
@@ -2277,6 +2362,14 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         int io;
         uint256_t x=expr_expression_pat(asmb,s,idx,&io);
         idx=io;
+        /* Fix C-6 (UNDEF propagation): if the expression evaluated to UNDEF
+         * (undefined label mixed into arithmetic), skip the byte rather than
+         * emitting a garbage 0xffff…ff word.  The error will be reported
+         * by the label manager on pass 2. */
+        if(u256_is_undef(x)){
+            if(s[idx]==','){idx++;continue;}
+            break;
+        }
         if(semicolon?!u256_is_zero(x):1) iv_push(objl,x);
         if(s[idx]==','){idx++;continue;}
         break;
@@ -2641,6 +2734,17 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         if(pat_match0(asmb,lin,i->f[0])){
             dir_error(asmb,i->f[1]);
             makeobj(asmb,i->f[2],objl_out);
+            /* Fix C-3/C-7: if pass1 hit an undefined label inside makeobj,
+             * retry with pass1_size_mode=1 (unknown labels → 0) so the
+             * byte-count (and therefore the PC advance) is correct.
+             * Without this, variable-length instructions with forward
+             * references leave the PC wrong for everything that follows. */
+            if(st->pas==1 && st->error_undefined_label && objl_out->len==0){
+                st->pass1_size_mode=1;
+                makeobj(asmb,i->f[2],objl_out);
+                st->pass1_size_mode=0;
+                st->error_undefined_label=0;
+            }
             int io;
             uint256_t idxv=expr_expression_pat(asmb,i->f[3],0,&io);
             idxs_val=(int)u256_to_i64(idxv);
@@ -2687,7 +2791,19 @@ static int lineassemble(Assembler *asmb, const char *line_in){
      * line's scan (which may have matched at a different position in the
      * pattern file), producing non-deterministic results.
      */
+    /* Fix C-9: smap_clear + .EQU timing.
+     * The original cleared symbols completely, then called adir_label_processing
+     * for .EQU.  This meant .EQU expressions could not reference any pattern
+     * symbols (register names etc.) because the symbol table was empty.
+     *
+     * Fix: after clearing, re-populate symbols from patsymbols so .EQU sees
+     * the full baseline symbol set.  The pattern scan will then overlay
+     * position-dependent .setsym/.clearsym changes on top of this baseline,
+     * exactly as the Python version does (it never clears the symbol table). */
     smap_clear(&asmb->st.symbols);
+    for(int pi=0; pi<asmb->st.patsymbols.nb; pi++)
+        for(SymEntry *se=asmb->st.patsymbols.buckets[pi]; se; se=se->next)
+            smap_set(&asmb->st.symbols, se->key, se->val);
 
     char processed[4096];
     adir_label_processing(asmb,line,processed,sizeof(processed));
@@ -2768,6 +2884,9 @@ static char *file_input_from_stdin(void){
 
 static void fileassemble(Assembler *asmb, const char *fn){
     AsmState *st=&asmb->st;
+    /* Fix C-10: push is always unconditional; pop must therefore also be
+     * unconditional.  Save fn locally so we can replace it with the temp
+     * path for stdin without altering the caller's string. */
     sv_push(&st->fnstack, st->current_file);
     is_push(&st->lnstack, st->ln);
     strncpy(st->current_file,fn,sizeof(st->current_file)-1);
@@ -2777,15 +2896,34 @@ static void fileassemble(Assembler *asmb, const char *fn){
     char *stdin_buf=NULL;
 
     if(strcmp(fn,"stdin")==0){
-        char tmp_path[]="axx.tmp";
-        int need_read=(st->pas==1);
-        if(!need_read){ FILE*test=fopen(tmp_path,"rt"); if(test)fclose(test); else need_read=1; }
+        /* Fix C-6: use a per-process unique temp file instead of the fixed
+         * name "axx.tmp" to avoid races when multiple caxx instances run
+         * concurrently.  The path is stored in st->stdin_tmp_path so that
+         * pass2 re-uses the same file written by pass1. */
+        if(st->stdin_tmp_path[0] == '\0'){
+            /* First call: create a new unique temp file */
+            char tmpl[] = "/tmp/axx_XXXXXX";
+            int fd = mkstemp(tmpl);
+            if(fd >= 0){
+                close(fd);
+                strncpy(st->stdin_tmp_path, tmpl, sizeof(st->stdin_tmp_path)-1);
+            } else {
+                /* fallback to fixed name if mkstemp fails */
+                strncpy(st->stdin_tmp_path, "axx.tmp", sizeof(st->stdin_tmp_path)-1);
+            }
+        }
+
+        int need_read = (st->pas==1);
+        if(!need_read){
+            FILE *test=fopen(st->stdin_tmp_path,"rt");
+            if(test) fclose(test); else need_read=1;
+        }
         if(need_read){
             stdin_buf=file_input_from_stdin();
-            FILE*tmpf=fopen(tmp_path,"wt");
+            FILE *tmpf=fopen(st->stdin_tmp_path,"wt");
             if(tmpf){ fwrite(stdin_buf,1,strlen(stdin_buf),tmpf); fclose(tmpf); }
         }
-        fn=tmp_path;
+        fn=st->stdin_tmp_path;
     }
 
     f=fopen(fn,"rt");
@@ -2798,11 +2936,13 @@ static void fileassemble(Assembler *asmb, const char *fn){
 
 done:
     free(stdin_buf);
-    if(st->fnstack.len>0){
-        strncpy(st->current_file,st->fnstack.data[st->fnstack.len-1],sizeof(st->current_file)-1);
-        sv_pop(&st->fnstack);
-        st->ln=is_pop(&st->lnstack);
-    }
+    /* Fix C-10: pop unconditionally to mirror the unconditional push above.
+     * The original guarded the pop with (fnstack.len>0) which could silently
+     * leave current_file/ln unrestored if the stack was somehow empty. */
+    strncpy(st->current_file, st->fnstack.data[st->fnstack.len-1],
+            sizeof(st->current_file)-1);
+    sv_pop(&st->fnstack);
+    st->ln = is_pop(&st->lnstack);
 }
 
 /* =========================================================
@@ -2900,8 +3040,57 @@ int main(int argc, char *argv[]){
             lineassemble0(asmb,line);
         }
     } else {
-        st->pc=u256_zero(); st->pas=1; st->ln=1;
-        fileassemble(asmb,sourcefile);
+        /* Fix C-3: pass1 relaxation loop.
+         *
+         * For variable-length instruction architectures, a single pass1 may
+         * estimate instruction sizes incorrectly when forward references force
+         * label values to 0.  This shifts all subsequent label addresses, which
+         * in turn may change instruction sizes again.
+         *
+         * Fix: repeat pass1 (up to MAX_RELAX times) until every label's PC
+         * value is identical to the previous iteration ("converged").  Then
+         * run pass2 once against the stable label table.
+         *
+         * For fixed-size ISAs the loop converges in one iteration (no change).
+         */
+#define MAX_RELAX 8
+        LabelMap prev_labels;
+        lmap_init(&prev_labels);
+        int converged = 0;
+
+        for(int relax=0; relax<MAX_RELAX; relax++){
+            st->pc=u256_zero(); st->pas=1; st->ln=1;
+            lmap_free(&st->labels); lmap_init(&st->labels);
+            fileassemble(asmb,sourcefile);
+
+            /* Check convergence: all labels same PC as previous iteration */
+            converged = 1;
+            for(int bi=0; bi<st->labels.nbuckets; bi++){
+                for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next){
+                    LabelEntry *p=lmap_find(&prev_labels, e->key);
+                    if(!p || !u256_eq(p->value, e->value)){ converged=0; break; }
+                }
+                if(!converged) break;
+            }
+            /* Also check no label was removed */
+            if(converged && prev_labels.count != st->labels.count) converged=0;
+
+            /* Update prev_labels snapshot */
+            lmap_free(&prev_labels); lmap_init(&prev_labels);
+            for(int bi=0; bi<st->labels.nbuckets; bi++)
+                for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
+                    lmap_set(&prev_labels, e->key, e->value, e->section);
+
+            if(converged) break;
+        }
+        lmap_free(&prev_labels);
+
+        if(!converged)
+            fprintf(stderr,"warning: pass1 relaxation did not converge after %d iterations; "
+                    "addresses may be incorrect for variable-length instructions "
+                    "with forward references.\n", MAX_RELAX);
+#undef MAX_RELAX
+
         st->pc=u256_zero(); st->pas=2; st->ln=1;
         fileassemble(asmb,sourcefile);
     }
@@ -2947,6 +3136,12 @@ int main(int argc, char *argv[]){
     if(expfile_elf)      WRITE_EXPORT(expfile_elf,  1);
 
     #undef WRITE_EXPORT
+
+    /* Fix C-6: clean up the per-process stdin temp file if one was created. */
+    if(st->stdin_tmp_path[0]){
+        unlink(st->stdin_tmp_path);
+        st->stdin_tmp_path[0] = '\0';
+    }
 
     return 0;
 }
