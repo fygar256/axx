@@ -16,6 +16,7 @@ import sys
 import os
 import math
 import re
+import tempfile
 
 # Expression mode constants
 EXP_PAT = 0
@@ -118,6 +119,16 @@ class AssemblerState:
         # True の間は未定義ラベルを UNDEF ではなく 0 として返す。
         # forward参照があっても makeobj がサイズを正しく計算できるようにするため。
         self._pass1_size_mode = False
+
+        # リラクゼーション用: 直前のpass1でのラベルアドレス記録
+        # {label_name: pc_value} の辞書。収束判定に使う。
+        self._pass1_prev_label_pcs = None
+
+        # stdin 入力を保持する一時ファイルパス。
+        # 固定名 "axx.tmp" の代わりに tempfile で生成したパスを使うことで
+        # 複数インスタンスの同時実行時の競合を防ぐ。
+        # None のとき未生成。run() 終了後に cleanup される。
+        self.stdin_tmp_path: str | None = None
 
 
 class StringUtils:
@@ -914,38 +925,42 @@ class ExpressionEvaluator:
     def expression_esc(self, s, idx, stopchar):
         """Expression with escaped stop character.
 
-        stopchar は深さ0の位置だけで NUL に置換する。
-        ループを idx から始めることで、idx より前にある '(' や '[' を
-        誤って depth/bracket_depth にカウントしてしまうのを防ぐ。
-        (例: leaq rax,[ rbx+rcx*2+0x40 ] で ']' を stopchar にした場合、
-         先行する '[' を深さ1と数えてしまい本来の ']' が無視されるバグを修正)
+        stopchar は「どの括弧にも囲まれていない深さ0の位置」でのみ NUL に置換する。
+        ( ) と [ ] を別カウンタで管理していた旧実装は、両者が混在した場合
+        （例: `([)]` のような不正なネストや、stopcharが `)` のケース）に
+        誤動作する可能性があった。
+
+        修正後はスタック方式で開き括弧の種類を積み、対応する閉じ括弧が来たときだけ
+        pop する。スタックが空のときに stopchar が現れた場合のみ NUL に置換する。
+        これにより `([])`, `[(])` などの混在パターンも正確に処理できる。
         """
         # prefix (s[:idx]) はそのままコピー
         result = list(s[:idx])
-        depth = 0
-        bracket_depth = 0
+
+        # 開き括弧 → 対応する閉じ括弧
+        OPEN_TO_CLOSE = {'(': ')', '[': ']'}
+        CLOSE_CHARS   = set(OPEN_TO_CLOSE.values())
+
+        stack = []   # 開き括弧を積むスタック
 
         for ch in s[idx:]:
-            if ch == '(':
-                depth += 1
+            if ch in OPEN_TO_CLOSE:
+                # 開き括弧: スタックに積んで出力
+                stack.append(ch)
                 result.append(ch)
-            elif ch == ')':
-                if depth > 0:
-                    depth -= 1
-                result.append(ch)
-            elif ch == '[':
-                bracket_depth += 1
-                result.append(ch)
-            elif ch == ']':
-                if bracket_depth > 0:
-                    bracket_depth -= 1
+            elif ch in CLOSE_CHARS:
+                if stack and OPEN_TO_CLOSE.get(stack[-1]) == ch:
+                    # 対応する開き括弧と一致 → ネストを1段抜ける
+                    stack.pop()
                     result.append(ch)
-                elif depth == 0 and stopchar == ']':
+                elif not stack and ch == stopchar:
+                    # 深さ0 かつ stopchar → ここで式を終端
                     result.append(chr(0))
                 else:
+                    # 対応不一致の閉じ括弧（不正な入力）はそのまま出力
                     result.append(ch)
             else:
-                if depth == 0 and bracket_depth == 0 and ch == stopchar:
+                if not stack and ch == stopchar:
                     result.append(chr(0))
                 else:
                     result.append(ch)
@@ -1309,17 +1324,26 @@ class PatternMatcher:
                 return False
     
     def match0(self, s, t):
-        """Match with optional bracket combinations"""
+        """Match with optional bracket combinations.
+
+        各 match() 試行の前に vars をスナップショットし、
+        マッチ失敗した試行で書き込まれた変数値を必ずリストアする。
+        これにより、失敗した組み合わせの副作用が次の試行に持ち越されない。
+        """
         t = t.replace('[[', OB).replace(']]', CB)
         cnt = t.count(OB)
         sl = [_ + 1 for _ in range(cnt)]
-        
+
         for i in range(len(sl) + 1):
             ll = list(itertools.combinations(sl, i))
             for j in ll:
                 lt = self.remove_brackets(t, list(j))
+                # マッチ前の vars を保存
+                saved_vars = self.state.vars[:]
                 if self.match(s, lt):
                     return True
+                # 失敗 → vars をリストア
+                self.state.vars = saved_vars
         return False
 
 
@@ -2000,15 +2024,21 @@ class Assembler:
 
         try:
             if fn == "stdin":
-                # Pass 1 (pas==1): read stdin and write to axx.tmp
-                # Pass 2 (pas==2) and interactive (pas==0): re-use axx.tmp written in pass 1.
-                # If axx.tmp does not exist yet (e.g. first/only pass), always read from stdin.
-                tmp_path = "axx.tmp"
-                if self.state.pas == 1 or not os.path.exists(tmp_path):
+                # Pass 1 (pas==1): read stdin and write to a per-instance temp file.
+                # Pass 2 (pas==2) and relaxation iterations: re-use the same temp file.
+                # Using tempfile instead of the fixed name "axx.tmp" prevents races
+                # when multiple axx instances run concurrently.
+                if self.state.stdin_tmp_path is None:
+                    # 初回: 一時ファイルを作成してパスを記録
+                    fd, tmp_path = tempfile.mkstemp(prefix="axx_", suffix=".tmp", text=True)
+                    os.close(fd)
+                    self.state.stdin_tmp_path = tmp_path
+
+                if self.state.pas == 1 or not os.path.exists(self.state.stdin_tmp_path):
                     af = self.file_input_from_stdin()
-                    with open(tmp_path, "wt") as stdintmp:
+                    with open(self.state.stdin_tmp_path, "wt") as stdintmp:
                         stdintmp.write(af)
-                fn = tmp_path
+                fn = self.state.stdin_tmp_path
             
             with open(fn, "rt") as f:
                 af = f.readlines()
@@ -2135,11 +2165,33 @@ class Assembler:
                     continue
                 self.lineassemble0(line)
         else:
-            # Two-pass file assembly
-            self.state.pc = 0
-            self.state.pas = 1
-            self.state.ln = 1
-            self.fileassemble(args.sourcefile)
+            # Two-pass file assembly with pass1 relaxation.
+            #
+            # 可変長命令アーキテクチャでは、forward参照ラベルを 0 と仮定した
+            # pass1 のサイズ推定が間違い、pass2 でアドレスがずれることがある。
+            # 対策: pass1 を最大 MAX_RELAX 回繰り返し、全ラベルの PC が
+            # 前回と一致したら収束とみなして pass2 に進む（リラクゼーション法）。
+            MAX_RELAX = 8
+            self.state._pass1_prev_label_pcs = None
+
+            for relax_iter in range(MAX_RELAX):
+                self.state.pc = 0
+                self.state.pas = 1
+                self.state.ln = 1
+                self.state.labels = {}
+                self.state.sections = {}
+                self.state.export_labels = {}
+                self.fileassemble(args.sourcefile)
+
+                current_pcs = {k: v[0] for k, v in self.state.labels.items()}
+                if current_pcs == self.state._pass1_prev_label_pcs:
+                    break   # 収束
+                self.state._pass1_prev_label_pcs = current_pcs
+            else:
+                print("warning: pass1 relaxation did not converge; "
+                      "generated code may have incorrect addresses for "
+                      "variable-length instructions with forward references.")
+
             self.state.pc = 0
             self.state.pas = 2
             self.state.ln = 1
@@ -2176,6 +2228,14 @@ class Assembler:
             _write_export(self.state.expfile, elf=0)
         if self.state.expfile_elf:
             _write_export(self.state.expfile_elf, elf=1)
+
+        # stdin 用一時ファイルをクリーンアップ
+        if self.state.stdin_tmp_path and os.path.exists(self.state.stdin_tmp_path):
+            try:
+                os.remove(self.state.stdin_tmp_path)
+            except OSError:
+                pass
+            self.state.stdin_tmp_path = None
 
 
 def main():
