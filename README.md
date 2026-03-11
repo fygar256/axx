@@ -40,6 +40,15 @@ expfile.tsv --- section and label information export file
 impfile.tsv --- section and label information import file
 object.o --- ELF relocatable object file
 
+#### sample test of hello world on x86_64 FreeBSD
+
+```
+% paxx hello.axx hello.s -r hello.o # assemble
+% ld hello.o -o hello               # link
+% ./hello
+hello, world
+```
+
 #### compile c version 'Caxx'
 
 ```
