@@ -34,10 +34,15 @@ paxx patternfile.axx [source.s] [-o outfile.bin] [-e expfile.tsv] [-i impfile.ts
 ```
 
 patternfile.axx --- pattern file
+
 source.s --- assembly source
+
 outfile.bin --- raw binary output file
+
 expfile.tsv --- section and label information export file
+
 impfile.tsv --- section and label information import file
+
 object.o --- ELF relocatable object file
 
 #### sample test of hello world on x86_64 FreeBSD
