@@ -764,14 +764,28 @@ static void axx_remove_comment(char *l) {
 }
 
 static void axx_remove_comment_asm(char *l) {
+    /* Fix C-N1: handle backslash-escaped quotes inside string literals.
+     * The original for-loop toggled in_str on every '"', so a \\" inside a
+     * string flipped the flag and caused the ';' that followed to be treated
+     * as a comment start.
+     * Fix: when inside a string, skip the character after any backslash so
+     * that \\" is consumed as an escape sequence rather than a string terminator. */
     int in_str=0;
-    for(int i=0;l[i];i++){
-        if(l[i]=='"') in_str=!in_str;
-        else if(l[i]==';'&&!in_str){
+    int i=0;
+    while(l[i]){
+        if(in_str && l[i]=='\\'){
+            /* escape sequence inside string: skip the next character */
+            i++;
+            if(l[i]) i++;
+            continue;
+        }
+        if(l[i]=='"'){ in_str=!in_str; i++; continue; }
+        if(l[i]==';'&&!in_str){
             int j=i-1;
             while(j>=0&&(l[j]==' '||l[j]=='\t')) j--;
             l[j+1]=0; return;
         }
+        i++;
     }
     int j=(int)strlen(l)-1;
     while(j>=0&&(l[j]==' '||l[j]=='\t'||l[j]=='\n'||l[j]=='\r')) l[j--]=0;
@@ -1357,13 +1371,18 @@ static uint256_t expr_expression_esc(Assembler *asmb, const char *s, int idx, ch
 
     for(size_t i = (size_t)idx; i < l; i++){
         char c = s[i];
-        if(c == '(' || c == '['){
+        /* Fix C-N5: include OB_CHAR(0x90)/CB_CHAR(0x91) – the special bracket
+         * characters produced by [[/]] in pattern files – in the bracket stack.
+         * The original tracked only '('/')' and '['/']', so expressions inside
+         * OB…CB groups were not shielded from stopchar substitution, causing the
+         * expression termination point to be detected too early. */
+        if(c == '(' || c == '[' || c == OB_CHAR){
             /* Opening bracket: push and copy */
             if(stkp < (int)(sizeof(stk)-1)) stk[stkp++] = c;
             buf[i] = c;
-        } else if(c == ')' || c == ']'){
-            /* Closing bracket */
-            char expected = (c == ')') ? '(' : '[';
+        } else if(c == ')' || c == ']' || c == CB_CHAR){
+            /* Closing bracket – determine the matching opener */
+            char expected = (c == ')') ? '(' : (c == ']') ? '[' : OB_CHAR;
             if(stkp > 0 && stk[stkp-1] == expected){
                 /* Matched: pop, copy normally */
                 stkp--;
@@ -1851,15 +1870,24 @@ static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_o
  */
 static int skip_subexpr(const char *s, int idx) {
     int slen = (int)strlen(s);
-    int depth = 0;
+    int paren_depth = 0;   /* depth for '(' / ')' */
+    int brack_depth = 0;   /* depth for '[' / ']'  – Fix C-N7: was missing    */
     while(idx < slen && s[idx]){
         char c = s[idx];
-        if(c == '(') { depth++; idx++; }
-        else if(c == ')') { if(depth > 0){ depth--; idx++; } else break; }
+        if(c == '(') { paren_depth++; idx++; }
+        else if(c == ')') {
+            if(paren_depth > 0){ paren_depth--; idx++; }
+            else break;  /* depth-0 ')': stop (we are inside caller's parens) */
+        }
+        else if(c == '[') { brack_depth++; idx++; }
+        else if(c == ']') {
+            if(brack_depth > 0){ brack_depth--; idx++; }
+            else break;  /* depth-0 ']': stop */
+        }
         /* ':=' is a variable-assignment operator, not a ternary separator.
          * Stop at ':' only when the next character is NOT '='. */
-        else if(depth == 0 && (c == '?' || c == ',')) break;
-        else if(depth == 0 && c == ':' && s[idx+1] != '=') break;
+        else if(paren_depth == 0 && brack_depth == 0 && (c == '?' || c == ',')) break;
+        else if(paren_depth == 0 && brack_depth == 0 && c == ':' && s[idx+1] != '=') break;
         else idx++;
     }
     return idx;
@@ -2362,13 +2390,22 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         int io;
         uint256_t x=expr_expression_pat(asmb,s,idx,&io);
         idx=io;
-        /* Fix C-6 (UNDEF propagation): if the expression evaluated to UNDEF
-         * (undefined label mixed into arithmetic), skip the byte rather than
-         * emitting a garbage 0xffff…ff word.  The error will be reported
-         * by the label manager on pass 2. */
+        /* Fix C-N3: when an expression evaluates to UNDEF (forward reference to
+         * an undefined label), skip that element and continue scanning rather
+         * than breaking out of the loop.  The previous "break" caused all
+         * elements after the first UNDEF to be silently dropped, making objl
+         * shorter than the true instruction size.  This confused the pass1
+         * retry logic (which only retried when objl->len==0) and left the PC
+         * advanced by the wrong amount for every subsequent label.
+         *
+         * Behaviour: the element is omitted from objl (so pass1 will under-count
+         * by one slot per UNDEF), but the loop continues to the next comma-
+         * separated element.  The pass1_size_mode retry in lineassemble2 is
+         * separately conditioned on error_undefined_label, which is already set
+         * by label_get_value(), so the retry fires correctly. */
         if(u256_is_undef(x)){
             if(s[idx]==','){idx++;continue;}
-            break;
+            continue;  /* last element: let the loop's own termination check end it */
         }
         if(semicolon?!u256_is_zero(x):1) iv_push(objl,x);
         if(s[idx]==','){idx++;continue;}
@@ -2734,12 +2771,15 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         if(pat_match0(asmb,lin,i->f[0])){
             dir_error(asmb,i->f[1]);
             makeobj(asmb,i->f[2],objl_out);
-            /* Fix C-3/C-7: if pass1 hit an undefined label inside makeobj,
+            /* Fix C-3/C-N3: if pass1 hit an undefined label inside makeobj,
              * retry with pass1_size_mode=1 (unknown labels → 0) so the
              * byte-count (and therefore the PC advance) is correct.
-             * Without this, variable-length instructions with forward
-             * references leave the PC wrong for everything that follows. */
-            if(st->pas==1 && st->error_undefined_label && objl_out->len==0){
+             * The old guard `objl_out->len==0` only retried when ALL elements
+             * were UNDEF.  Now that UNDEF elements are skipped (not break),
+             * objl may be non-empty yet still too short (some elements omitted).
+             * Fix: retry whenever error_undefined_label is set, regardless of
+             * whether objl already has some elements. */
+            if(st->pas==1 && st->error_undefined_label){
                 st->pass1_size_mode=1;
                 makeobj(asmb,i->f[2],objl_out);
                 st->pass1_size_mode=0;
@@ -2896,12 +2936,20 @@ static void fileassemble(Assembler *asmb, const char *fn){
     char *stdin_buf=NULL;
 
     if(strcmp(fn,"stdin")==0){
-        /* Fix C-6: use a per-process unique temp file instead of the fixed
-         * name "axx.tmp" to avoid races when multiple caxx instances run
-         * concurrently.  The path is stored in st->stdin_tmp_path so that
-         * pass2 re-uses the same file written by pass1. */
+        /* Fix C-6 / Fix C-N4: use a per-process unique temp file instead of
+         * the fixed name "axx.tmp" to avoid races when multiple caxx instances
+         * run concurrently.
+         *
+         * Fix C-N4: the old code set need_read=(st->pas==1), which caused stdin
+         * to be read again on every relaxation iteration (pas is always 1 inside
+         * the loop).  By the second iteration stdin is at EOF, so the temp file
+         * was overwritten with an empty string and all subsequent passes assembled
+         * nothing.
+         *
+         * Fix: read stdin exactly once – when stdin_tmp_path is first created.
+         * All subsequent calls (relaxation iterations + pass2) reuse the file. */
         if(st->stdin_tmp_path[0] == '\0'){
-            /* First call: create a new unique temp file */
+            /* First call: create unique temp file AND read stdin into it. */
             char tmpl[] = "/tmp/axx_XXXXXX";
             int fd = mkstemp(tmpl);
             if(fd >= 0){
@@ -2911,18 +2959,11 @@ static void fileassemble(Assembler *asmb, const char *fn){
                 /* fallback to fixed name if mkstemp fails */
                 strncpy(st->stdin_tmp_path, "axx.tmp", sizeof(st->stdin_tmp_path)-1);
             }
-        }
-
-        int need_read = (st->pas==1);
-        if(!need_read){
-            FILE *test=fopen(st->stdin_tmp_path,"rt");
-            if(test) fclose(test); else need_read=1;
-        }
-        if(need_read){
             stdin_buf=file_input_from_stdin();
             FILE *tmpf=fopen(st->stdin_tmp_path,"wt");
             if(tmpf){ fwrite(stdin_buf,1,strlen(stdin_buf),tmpf); fclose(tmpf); }
         }
+        /* All passes (including relaxation iterations) reuse the same file. */
         fn=st->stdin_tmp_path;
     }
 
@@ -3061,6 +3102,15 @@ int main(int argc, char *argv[]){
         for(int relax=0; relax<MAX_RELAX; relax++){
             st->pc=u256_zero(); st->pas=1; st->ln=1;
             lmap_free(&st->labels); lmap_init(&st->labels);
+            /* Fix C-N6: reset symbols to the post-pattern-file baseline at the
+             * start of every relaxation iteration.  Source-level .setsym /
+             * .clearsym directives mutate st->symbols during assembly; without
+             * this reset their effects accumulate across iterations, producing
+             * non-deterministic symbol tables on the 2nd and later passes. */
+            smap_clear(&st->symbols);
+            for(int pi=0; pi<st->patsymbols.nb; pi++)
+                for(SymEntry *se2=st->patsymbols.buckets[pi]; se2; se2=se2->next)
+                    smap_set(&st->symbols, se2->key, se2->val);
             fileassemble(asmb,sourcefile);
 
             /* Check convergence: all labels same PC as previous iteration */
