@@ -130,6 +130,18 @@ class AssemblerState:
         # None のとき未生成。run() 終了後に cleanup される。
         self.stdin_tmp_path: str | None = None
 
+        # ELF relocatable object file output (-r / -m options)
+        self.elf_objfile: str = ""
+        self.elf_machine: int = 62   # default EM_X86_64
+
+        # ELF relocation tracking
+        # relocations: list of (section_name, sec_rel_byte_offset, sym_name, reloc_type, addend)
+        self.relocations = []
+        # _elf_tracking: True while assembling an instruction during pass2 ELF output
+        self._elf_tracking = False
+        # _elf_label_refs_seen: label refs collected during current instruction assembly
+        self._elf_label_refs_seen = []  # [(label_name, abs_word_value)]
+
 
 class StringUtils:
     """Utility functions for string manipulation"""
@@ -516,6 +528,10 @@ class LabelManager:
             # Pass1 サイズ推定モード中は 0 を返す（値は不正だがリスト長=命令サイズは正しく求まる）
             v = 0 if self.state._pass1_size_mode else UNDEF
             self.state.error_undefined_label = True
+            return v
+        # ELF リロケーション追跡: pass2 でラベル参照をキャプチャ
+        if self.state._elf_tracking and not self.state.error_undefined_label:
+            self.state._elf_label_refs_seen.append((k, v))
         return v
     
     def put_value(self, k, v, s):
@@ -1009,7 +1025,27 @@ class BinaryWriter:
         bytes_per_word = (word_bits + 7) // 8
         
         total_size = (max_word_pos + 1) * bytes_per_word
+
+        # 修正8: .padding で設定した state.padding 値で全ワードを初期化してから
+        # 実際に書き込まれたワードで上書きする。
+        # 旧実装は bytearray(total_size) でゼロ初期化のみ行い padding を無視していた。
+        # ROM の未使用領域を 0xFF で埋める用途などで誤った出力が生成されていた。
         data = bytearray(total_size)
+        pad_val = int(self.state.padding) & ((1 << word_bits) - 1)
+        if pad_val != 0:
+            for pos in range(max_word_pos + 1):
+                base_idx = pos * bytes_per_word
+                tmp = pad_val
+                if self.state.endian == 'little':
+                    for i in range(bytes_per_word):
+                        if base_idx + i < total_size:
+                            data[base_idx + i] = tmp & 0xff
+                        tmp >>= 8
+                else:
+                    for i in range(bytes_per_word - 1, -1, -1):
+                        if base_idx + i < total_size:
+                            data[base_idx + i] = tmp & 0xff
+                        tmp >>= 8
 
         for pos, val in self._buffer.items():
             # 書き込み先のバイト位置を特定
@@ -1230,32 +1266,39 @@ class PatternMatcher:
         self.parser = parser
     
     def remove_brackets(self, s, l):
-        """Remove specified bracket pairs"""
-        result = list(s)
-        bracket_positions = []
-        open_count = 0
+        """Remove specified bracket pairs.
+
+        修正3: 旧実装はネスト深度 (open_count) をグループIDとして使っていた。
+        これだと兄弟関係にある [[A]] [[B]] は両方 open_count==1 になり、
+        個別に指定できなかった。
+
+        修正後: OB を見るたびに単調増加するシリアル番号を割り当て、
+        スタックで対応する CB と紐付ける。
+        remove_brackets(t, [1,3]) は「シリアル1番と3番のグループを除去せよ」
+        という意味になり、どの兄弟でも正しく個別指定できる。
+        match0 が渡す l のシリアルは 1-origin の連番 (sl = [1,2,...,cnt]) なので
+        この変更と完全に対応している。
+        """
+        # --- シリアル番号と文字位置の対応表を構築 ---
+        serial = 0          # 次に割り当てるシリアル
+        stack = []          # (serial, open_pos) のスタック
+        bracket_pairs = {}  # serial -> (open_pos, close_pos)
 
         for i, char in enumerate(s):
             if char == OB:
-                open_count += 1
-                bracket_positions.append((open_count, i, 'open'))
+                serial += 1
+                stack.append((serial, i))
             elif char == CB:
-                # Decrement first so close matches the same level as its open
-                open_count -= 1
-                bracket_positions.append((open_count + 1, i, 'close'))
+                if stack:
+                    ser, open_pos = stack.pop()
+                    bracket_pairs[ser] = (open_pos, i)
 
-        for index in sorted(l, reverse=True):
-            start_index = None
-            end_index = None
-            for count, pos, btype in bracket_positions:
-                if count == index and btype == 'open' and start_index is None:
-                    start_index = pos
-                elif count == index and btype == 'close' and start_index is not None:
-                    end_index = pos
-                    break
-
-            if start_index is not None and end_index is not None:
-                for j in range(start_index, end_index + 1):
+        # --- l に含まれるシリアルのグループを除去 ---
+        result = list(s)
+        for index in l:
+            if index in bracket_pairs:
+                start_pos, end_pos = bracket_pairs[index]
+                for j in range(start_pos, end_pos + 1):
                     result[j] = ''
 
         return ''.join(result)
@@ -1420,13 +1463,22 @@ class PatternFileReader:
         return w
     
     def include_pat(self, l):
-        """Include pattern directive"""
+        """Include pattern directive.
+
+        修正7: 旧実装は StringUtils.skipspc で先頭スペースをスキップして
+        idx を求めておきながら、ファイル名の抽出に固定オフセット l[8:] を
+        使っていた。インデントがある行（例: "  .INCLUDE foo.axx"）では
+        l[8:] が .INCLUDE 文字列の途中から始まってしまいファイル名を
+        正しく取り出せなかった。
+        修正後: l[idx+8:] を使い、スキップ後の先頭位置から 8 文字
+        (.INCLUDE) 分進んだ位置からファイル名を読み取る。
+        """
         idx = StringUtils.skipspc(l, 0)
         i = l[idx:idx+8]
         i = i.upper()
         if i != ".INCLUDE":
             return []
-        s = StringUtils.get_string(l[8:])
+        s = StringUtils.get_string(l[idx+8:])
         w = self.readpat(s)
         return w
 
@@ -1981,20 +2033,88 @@ class Assembler:
         line = StringUtils.remove_comment_asm(line)
         if line == '':
             return False
-        
+
+        # 修正4a: .EQU 式はパターンファイル由来のシンボル（レジスタ名など）を
+        # 参照できるべきだが、前行のパターンスキャンで蓄積された
+        # 位置依存 .setsym の残留値には依存すべきでない。
+        # そのため label_processing (= .EQU 評価) の前に symbols を
+        # patsymbols ベースラインにリセットしてから評価する。
+        self.state.symbols = dict(self.state.patsymbols)
+
         line = self.asm_directive_proc.label_processing(line)
-        self.directive_proc.clear_symbol([".clearsym", "", ""])
+
+        # 修正4b: 旧実装は clear_symbol([".clearsym","",...]) で symbols={} に
+        # 空クリアしていた。これでは patsymbols に定義されたシンボルまで
+        # 消えてしまい、lineassemble2 内のパターンスキャンが再構築する前の
+        # .setsym 参照が失敗する。
+        # 修正後: lineassemble2 の先頭でパターンスキャンが .setsym を
+        # 順次適用するため、ここでの明示的クリアは不要。
+        # patsymbols ベースラインは上記 4a で設定済み。
         
         parts = line.split("!!")
         self.state.vcnt = sum(1 for p in parts if p != "")
-        
+
+        # ELF リロケーション追跡: pass2 かつ ELF 出力時のみ有効
+        if self.state.elf_objfile and self.state.pas == 2:
+            self.state._elf_tracking = True
+            self.state._elf_label_refs_seen = []
+
         idxs, objl, flag, idx = self.lineassemble2(line, 0)
-        
+
+        self.state._elf_tracking = False
+
         if flag == False:
             return False
         
         if self.state.vliwflag == False or (idx >= len(line) or line[idx:idx+2] != '!!'):
             of = len(objl)
+
+            # ------------------------------------------------------------------ #
+            # ELF リロケーション検出                                               #
+            # 命令バイト列(objl)の中にラベルの絶対アドレスが埋め込まれているか    #
+            # スキャンし、見つかった箇所をゼロクリアしてリロケーションを記録する。 #
+            # ------------------------------------------------------------------ #
+            if self.state.elf_objfile and self.state.pas == 2 and objl and self.state._elf_label_refs_seen:
+                bpw_r = max(1, (self.state.bts + 7) // 8)
+                # セクション開始ワードアドレス
+                sec_name_r = self.state.current_section
+                sec_start_w = 0
+                if sec_name_r in self.state.sections:
+                    sec_start_w = self.state.sections[sec_name_r][0]
+                # ラベルを重複排除
+                seen_unique = {}
+                for (lname, lval) in self.state._elf_label_refs_seen:
+                    if lname not in seen_unique:
+                        seen_unique[lname] = lval
+                for lname, abs_w in seen_unique.items():
+                    if abs_w == 0:
+                        continue  # ゼロは誤検出の恐れあり → スキップ
+                    found_reloc = False
+                    for nbytes in [8, 4, 2]:
+                        if found_reloc:
+                            break
+                        # リトルエンディアン展開
+                        le = [(abs_w >> (8 * i)) & 0xff for i in range(nbytes)]
+                        # 上位バイトがすべてゼロでも下位バイトに意味がある場合は除く
+                        # (nbytes=2のとき上位が0ならほぼ偶然一致の可能性大 → スキップ)
+                        if nbytes <= 4 and all(b == 0 for b in le[nbytes // 2:]):
+                            continue
+                        for j in range(len(objl) - nbytes + 1):
+                            chunk = [v & 0xff for v in objl[j:j + nbytes]]
+                            if chunk == le:
+                                # 見つかった: セクション相対バイトオフセット
+                                sec_rel = (self.state.pc + j - sec_start_w) * bpw_r
+                                # プレースホルダをゼロクリア
+                                for b in range(nbytes):
+                                    objl[j + b] = 0
+                                # リロケーションタイプ: R_X86_64_64=1, R_X86_64_32=10
+                                rtype = 1 if nbytes == 8 else (10 if nbytes == 4 else 0)
+                                if rtype != 0:
+                                    self.state.relocations.append(
+                                        (sec_name_r, sec_rel, lname, rtype, 0))
+                                found_reloc = True
+                                break
+
             for cnt in range(of):
                 self.binary_writer.outbin(self.state.pc + cnt, objl[cnt])
             self.state.pc += of
@@ -2097,6 +2217,337 @@ class Assembler:
         """Print address"""
         print("%016x: " % pc, end='')
 
+    def write_elf_obj(self, path: str, machine: int = 62) -> None:
+        """Write a FreeBSD ELF64 relocatable object file (.o).
+
+        File layout:
+          ELF header (64 bytes)
+          Content section data  (16-byte aligned each)
+          .symtab               (8-byte aligned, 24 bytes/entry)
+          .strtab
+          .shstrtab
+          Section header table  (8-byte aligned, 64 bytes/entry)
+
+        Section header indices:
+          0          NULL
+          1 … N      Content sections in SECTION-directive order
+          N+1        .symtab
+          N+2        .strtab
+          N+3        .shstrtab  (e_shstrndx)
+        """
+        import struct as _struct
+
+        bpw = max(1, (self.state.bts + 7) // 8)
+        buf = self.binary_writer._buffer   # {word_pos: word_val}
+
+        # ------------------------------------------------------------------ #
+        # Helper: pack ELF structures                                          #
+        # ------------------------------------------------------------------ #
+        def _pack_ehdr(e_type, e_machine, e_shoff, e_shnum, e_shstrndx):
+            ident = (b'\x7fELF'
+                     + bytes([2, 1, 1, 9])   # class64, LSB, ver1, ELFOSABI_FREEBSD
+                     + b'\x00' * 8)
+            return ident + _struct.pack('<HHIQQQIHHHHHH',
+                e_type, e_machine,
+                1,       # e_version
+                0,       # e_entry
+                0,       # e_phoff
+                e_shoff,
+                0,       # e_flags
+                64,      # e_ehsize
+                0, 0,    # phentsize, phnum
+                64,      # e_shentsize
+                e_shnum,
+                e_shstrndx)
+
+        def _pack_shdr(sh_name, sh_type, sh_flags, sh_addr, sh_offset,
+                       sh_size, sh_link, sh_info, sh_addralign, sh_entsize):
+            return _struct.pack('<IIQQQQIIQQ',
+                sh_name, sh_type, sh_flags, sh_addr, sh_offset,
+                sh_size, sh_link, sh_info, sh_addralign, sh_entsize)
+
+        def _pack_sym(st_name, st_info, st_other, st_shndx, st_value, st_size):
+            return _struct.pack('<IBBHQQ',
+                st_name, st_info, st_other, st_shndx, st_value, st_size)
+
+        def _align_up(x, a):
+            return (x + a - 1) & ~(a - 1)
+
+        # ------------------------------------------------------------------ #
+        # 1. Collect content sections                                          #
+        # ------------------------------------------------------------------ #
+        def _extract(w_start, w_count):
+            """Return bytes for word range [w_start, w_start+w_count)."""
+            n = w_count * bpw
+            if n == 0:
+                return b''
+            data = bytearray(n)
+            pad = int(self.state.padding) & ((1 << self.state.bts) - 1)
+            if pad:
+                for p in range(w_count):
+                    base = p * bpw
+                    tmp = pad
+                    if self.state.endian == 'little':
+                        for j in range(bpw):
+                            data[base + j] = tmp & 0xff; tmp >>= 8
+                    else:
+                        for j in range(bpw - 1, -1, -1):
+                            data[base + j] = tmp & 0xff; tmp >>= 8
+            for pos, val in buf.items():
+                if pos < w_start or pos >= w_start + w_count:
+                    continue
+                off = (pos - w_start) * bpw
+                tmp = val
+                if self.state.endian == 'little':
+                    for j in range(bpw):
+                        if off + j < n: data[off + j] = tmp & 0xff
+                        tmp >>= 8
+                else:
+                    for j in range(bpw - 1, -1, -1):
+                        if off + j < n: data[off + j] = tmp & 0xff
+                        tmp >>= 8
+            return bytes(data)
+
+        class _CSec:
+            __slots__ = ('name', 'byte_start', 'data', 'byte_size', 'flags')
+            def __init__(self, name, byte_start, data, flags):
+                self.name       = name
+                self.byte_start = byte_start
+                self.data       = data
+                self.byte_size  = len(data)
+                self.flags      = flags
+
+        csecs = []
+        max_w = max(buf.keys(), default=-1)
+
+        if not self.state.sections:
+            # No SECTION directives → everything into .text
+            w_count = max_w + 1 if max_w >= 0 else 0
+            csecs.append(_CSec('.text', 0, _extract(0, w_count), 0x2 | 0x4))
+        else:
+            sec_names = list(self.state.sections.keys())
+            for i, sname in enumerate(sec_names):
+                w0, wn = self.state.sections[sname]
+                if wn == 0:
+                    if i + 1 < len(sec_names):
+                        w1 = self.state.sections[sec_names[i + 1]][0]
+                        wn = max(0, w1 - w0)
+                    else:
+                        wn = max(0, max_w + 1 - w0) if max_w >= w0 else 0
+                byte_start = w0 * bpw
+                data = _extract(w0, wn)
+                uname = sname.upper()
+                if   uname.startswith('.TEXT'):   flags = 0x2 | 0x4
+                elif uname.startswith('.DATA'):   flags = 0x2 | 0x1
+                elif uname.startswith('.RODATA'): flags = 0x2
+                elif uname.startswith('.BSS'):    flags = 0x2 | 0x1
+                else:                             flags = 0x2
+                csecs.append(_CSec(sname, byte_start, data, flags))
+
+        ncs = len(csecs)
+
+        # ------------------------------------------------------------------ #
+        # 2. Collect relocations per content section                           #
+        # ------------------------------------------------------------------ #
+        # Build section-name → section-index (1-based) map
+        sec_name_to_idx = {s.name: i + 1 for i, s in enumerate(csecs)}
+
+        # Group relocations: {content_sec_index(1-based): [(offset, sym_name, type, addend)]}
+        from collections import defaultdict as _defaultdict
+        rela_entries = _defaultdict(list)   # sec_idx → list of (off, sym_name, rtype, addend)
+        for (sname, off, sym_name, rtype, addend) in self.state.relocations:
+            sidx = sec_name_to_idx.get(sname, 0)
+            if sidx:
+                rela_entries[sidx].append((off, sym_name, rtype, addend))
+
+        # Content sections that have at least one relocation → need .rela.X section
+        rela_sec_order = [i + 1 for i, s in enumerate(csecs) if (i + 1) in rela_entries]
+        nrela = len(rela_sec_order)
+
+
+        shstrtab = bytearray(b'\x00')
+        sec_name_offs = []
+        for s in csecs:
+            sec_name_offs.append(len(shstrtab))
+            shstrtab += s.name.encode() + b'\x00'
+        # .rela.X セクション名を追加
+        rela_name_offs = []
+        for sidx in rela_sec_order:
+            rela_name_offs.append(len(shstrtab))
+            shstrtab += ('.rela' + csecs[sidx - 1].name).encode() + b'\x00'
+        symtab_name_off   = len(shstrtab); shstrtab += b'.symtab\x00'
+        strtab_name_off   = len(shstrtab); shstrtab += b'.strtab\x00'
+        shstrtab_name_off = len(shstrtab); shstrtab += b'.shstrtab\x00'
+        shstrtab = bytes(shstrtab)
+
+        # ------------------------------------------------------------------ #
+        # 3. Build symbol table (.symtab) and string table (.strtab)          #
+        # ------------------------------------------------------------------ #
+        def _find_shndx(byte_addr):
+            """Return (elf_section_1based, offset_from_section_start)."""
+            for i, s in enumerate(csecs):
+                if s.byte_start <= byte_addr < s.byte_start + s.byte_size:
+                    return i + 1, byte_addr - s.byte_start
+                # label exactly at section start when size==0
+                if s.byte_size == 0 and byte_addr == s.byte_start:
+                    return i + 1, 0
+            return 0xfff1, byte_addr   # SHN_ABS
+
+        strtab = bytearray(b'\x00')
+        syms   = []
+
+        # null symbol
+        syms.append(_pack_sym(0, 0, 0, 0, 0, 0))
+
+        # section symbols (STB_LOCAL | STT_SECTION = 0x03)
+        for i in range(ncs):
+            syms.append(_pack_sym(0, 0x03, 0, i + 1, 0, 0))
+
+        # local symbols (not in export_labels)
+        export_keys = set(self.state.export_labels.keys())
+        for name, (val, _sec) in sorted(self.state.labels.items()):
+            if name in export_keys:
+                continue
+            byte_addr = val * bpw
+            shndx, sym_val = _find_shndx(byte_addr)
+            name_off = len(strtab); strtab += name.encode() + b'\x00'
+            syms.append(_pack_sym(name_off, 0x00, 0, shndx, sym_val, 0))
+
+        first_global = len(syms)
+
+        # global symbols (export_labels, STB_GLOBAL | STT_NOTYPE = 0x10)
+        for name, (val, _sec) in sorted(self.state.export_labels.items()):
+            byte_addr = val * bpw
+            shndx, sym_val = _find_shndx(byte_addr)
+            name_off = len(strtab); strtab += name.encode() + b'\x00'
+            syms.append(_pack_sym(name_off, 0x10, 0, shndx, sym_val, 0))
+
+        symtab = b''.join(syms)
+        strtab = bytes(strtab)
+
+        # ------------------------------------------------------------------ #
+        # シンボル名 → シンボルテーブルインデックス のマッピングを構築        #
+        # (リロケーションエントリの r_info に使う)                            #
+        # ------------------------------------------------------------------ #
+        sym_name_to_idx = {}
+        _si = 1 + ncs   # null(0) + section syms(1..ncs) を飛ばした位置
+        for name, (val, _sec) in sorted(self.state.labels.items()):
+            if name in export_keys:
+                continue
+            sym_name_to_idx[name] = _si
+            _si += 1
+        for name, (val, _sec) in sorted(self.state.export_labels.items()):
+            sym_name_to_idx[name] = _si
+            _si += 1
+
+        # ------------------------------------------------------------------ #
+        # .rela セクションデータを構築 (Elf64_Rela: offset/info/addend 各8B)  #
+        # ------------------------------------------------------------------ #
+        def _pack_rela(r_offset, r_sym, r_type, r_addend):
+            r_info = (r_sym << 32) | (r_type & 0xffffffff)
+            return _struct.pack('<QQq', r_offset, r_info, r_addend)
+
+        rela_datas = []   # rela_sec_order と同順
+        for sidx in rela_sec_order:
+            entries = rela_entries[sidx]
+            data = b''.join(
+                _pack_rela(off, sym_name_to_idx.get(sn, 0), rtype, addend)
+                for (off, sn, rtype, addend) in entries
+            )
+            rela_datas.append(data)
+
+        # ------------------------------------------------------------------ #
+        # 4. Compute file offsets                                              #
+        # ------------------------------------------------------------------ #
+        offset = 64   # after ELF header
+        sec_offsets = []
+        for s in csecs:
+            offset = _align_up(offset, 16)
+            sec_offsets.append(offset)
+            offset += s.byte_size
+
+        # .rela セクションのファイルオフセット
+        rela_offsets = []
+        for rd in rela_datas:
+            offset = _align_up(offset, 8)
+            rela_offsets.append(offset)
+            offset += len(rd)
+
+        symtab_off  = _align_up(offset, 8); offset = symtab_off + len(symtab)
+        strtab_off  = offset;               offset += len(strtab)
+        shstrtab_off = offset;              offset += len(shstrtab)
+        shdr_off    = _align_up(offset, 8)
+
+        # セクションヘッダ数: null + content + rela + symtab + strtab + shstrtab
+        total_shdrs = 1 + ncs + nrela + 3
+        shstrndx    = ncs + nrela + 3
+        symtab_shidx = ncs + nrela + 1     # .symtab section index
+        strtab_shidx = ncs + nrela + 2     # .strtab section index (= symtab_link)
+        symtab_link = strtab_shidx
+
+        # ------------------------------------------------------------------ #
+        # 5. Write ELF file                                                    #
+        # ------------------------------------------------------------------ #
+        with open(path, 'wb') as f:
+            # ELF header
+            f.write(_pack_ehdr(1, machine, shdr_off, total_shdrs, shstrndx))
+
+            # Content section data
+            for i, s in enumerate(csecs):
+                cur = f.tell()
+                f.write(b'\x00' * (sec_offsets[i] - cur))
+                f.write(s.data)
+
+            # .rela.X セクションデータ
+            for i, rd in enumerate(rela_datas):
+                cur = f.tell()
+                f.write(b'\x00' * (rela_offsets[i] - cur))
+                f.write(rd)
+
+            # .symtab
+            cur = f.tell(); f.write(b'\x00' * (symtab_off - cur))
+            f.write(symtab)
+
+            # .strtab
+            f.write(strtab)
+
+            # .shstrtab
+            f.write(shstrtab)
+
+            # Section header table
+            cur = f.tell(); f.write(b'\x00' * (shdr_off - cur))
+
+            f.write(_pack_shdr(0, 0, 0, 0, 0, 0, 0, 0, 0, 0))  # [0] NULL
+
+            for i, s in enumerate(csecs):                        # [1..ncs] content
+                f.write(_pack_shdr(
+                    sec_name_offs[i], 1, s.flags, 0,
+                    sec_offsets[i], s.byte_size, 0, 0, 16, 0))
+
+            for ri, sidx in enumerate(rela_sec_order):           # .rela.X
+                # sh_flags: SHF_INFO_LINK=0x40
+                f.write(_pack_shdr(
+                    rela_name_offs[ri], 4, 0x40, 0,
+                    rela_offsets[ri], len(rela_datas[ri]),
+                    symtab_shidx, sidx, 8, 24))
+
+            f.write(_pack_shdr(                                   # .symtab
+                symtab_name_off, 2, 0, 0,
+                symtab_off, len(symtab),
+                symtab_link, first_global, 8, 24))
+
+            f.write(_pack_shdr(                                   # .strtab
+                strtab_name_off, 3, 0, 0,
+                strtab_off, len(strtab), 0, 0, 1, 0))
+
+            f.write(_pack_shdr(                                   # .shstrtab
+                shstrtab_name_off, 3, 0, 0,
+                shstrtab_off, len(shstrtab), 0, 0, 1, 0))
+
+        import sys as _sys
+        print(f"elf: wrote {path} ({ncs} section(s), {nrela} rela section(s), {len(syms)} symbol(s))",
+              file=_sys.stderr)
+
     def _build_arg_parser(self):
         """Build and return the argparse.ArgumentParser for axx."""
         import argparse
@@ -2121,6 +2572,13 @@ class Assembler:
         ap.add_argument('-i', dest='impfile', default='',
                         metavar='IMPORT_TSV',
                         help='Import labels from TSV file')
+        ap.add_argument('-r', dest='elf_objfile', default='',
+                        metavar='OBJ_FILE',
+                        help='Write FreeBSD ELF64 relocatable object file (.o)')
+        ap.add_argument('-m', dest='elf_machine', type=int, default=62,
+                        metavar='MACHINE',
+                        help='ELF e_machine value (default 62=EM_X86_64; '
+                             '183=AArch64, 243=RISC-V, 3=i386, 20=PPC, 40=ARM)')
         return ap
 
     def run(self):
@@ -2140,6 +2598,8 @@ class Assembler:
         self.state.expfile      = args.expfile
         self.state.expfile_elf  = args.expfile_elf
         self.state.impfile      = args.impfile
+        self.state.elf_objfile  = args.elf_objfile
+        self.state.elf_machine  = args.elf_machine
 
         # Load pattern file
         self.state.pat = self.pattern_reader.readpat(args.patternfile)
@@ -2214,9 +2674,14 @@ class Assembler:
             self.state.pc = 0
             self.state.pas = 2
             self.state.ln = 1
+            self.state.relocations = []   # pass2 でリロケーションを新規収集
             self.fileassemble(args.sourcefile)
 
         self.binary_writer.flush()
+
+        # --- ELF relocatable object file ---
+        if self.state.elf_objfile:
+            self.write_elf_obj(self.state.elf_objfile, self.state.elf_machine)
 
         # --- Export labels ---
         # -e と -E が同時に指定された場合は警告を出し、両方を別々に出力する。
