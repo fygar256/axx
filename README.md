@@ -18,7 +18,7 @@ Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
 
 C version and Ruby version and Go version are also available. C version is nameded Caxx, Ruby version is named Raxx and Go version is named Gaxx. C and Go version are much faster than Python version and Ruby version.
 
-Paxx and Caxx are newest version , Raxx and Gaxx are version 7.2.
+Paxx is newest version , Caxx is version 7.4.27.0, Raxx and Gaxx are version 7.2.
 
 ## install and execution(assemble) Python version 'Paxx'
 
