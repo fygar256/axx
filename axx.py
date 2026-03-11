@@ -168,13 +168,25 @@ class StringUtils:
     
     @staticmethod
     def remove_comment_asm(l):
-        """Remove ; style comments, but preserve semicolons inside string literals."""
+        """Remove ; style comments, but preserve semicolons inside string literals.
+
+        エスケープされた引用符 \\" は文字列の開始・終了とみなさない。
+        これにより "hello \\"world\\"; not a comment" のような入力で
+        誤ってコメント開始位置がずれる問題を修正。
+        """
         in_string = False
-        for i, ch in enumerate(l):
+        i = 0
+        while i < len(l):
+            ch = l[i]
+            if ch == '\\' and in_string:
+                # エスケープシーケンス: 次の文字をスキップ
+                i += 2
+                continue
             if ch == '"':
                 in_string = not in_string
             elif ch == ';' and not in_string:
                 return l[:i].rstrip()
+            i += 1
         return l.rstrip()
     
     @staticmethod
@@ -933,12 +945,15 @@ class ExpressionEvaluator:
         修正後はスタック方式で開き括弧の種類を積み、対応する閉じ括弧が来たときだけ
         pop する。スタックが空のときに stopchar が現れた場合のみ NUL に置換する。
         これにより `([])`, `[(])` などの混在パターンも正確に処理できる。
+
+        また、パターンファイルで [[/]] を変換した特殊文字 OB(0x90)/CB(0x91) も
+        ブラケットペアとしてスタック追跡の対象に含める（旧実装では未対応だった）。
         """
         # prefix (s[:idx]) はそのままコピー
         result = list(s[:idx])
 
-        # 開き括弧 → 対応する閉じ括弧
-        OPEN_TO_CLOSE = {'(': ')', '[': ']'}
+        # 開き括弧 → 対応する閉じ括弧（OB/CB を追加）
+        OPEN_TO_CLOSE = {'(': ')', '[': ']', OB: CB}
         CLOSE_CHARS   = set(OPEN_TO_CLOSE.values())
 
         stack = []   # 開き括弧を積むスタック
@@ -2029,12 +2044,12 @@ class Assembler:
                 # Using tempfile instead of the fixed name "axx.tmp" prevents races
                 # when multiple axx instances run concurrently.
                 if self.state.stdin_tmp_path is None:
-                    # 初回: 一時ファイルを作成してパスを記録
+                    # 初回のみ: 一時ファイルを作成し stdin を読み込む。
+                    # リラクゼーション2回目以降は stdin が EOF なので読み直さない。
+                    # pas == 1 の条件で毎回読んでいた旧実装のバグを修正。
                     fd, tmp_path = tempfile.mkstemp(prefix="axx_", suffix=".tmp", text=True)
                     os.close(fd)
                     self.state.stdin_tmp_path = tmp_path
-
-                if self.state.pas == 1 or not os.path.exists(self.state.stdin_tmp_path):
                     af = self.file_input_from_stdin()
                     with open(self.state.stdin_tmp_path, "wt") as stdintmp:
                         stdintmp.write(af)
@@ -2181,6 +2196,10 @@ class Assembler:
                 self.state.labels = {}
                 self.state.sections = {}
                 self.state.export_labels = {}
+                # ソース内の .setsym / .clearsym が前回イテレーションで
+                # symbols を変化させている可能性があるため、
+                # パターンファイル読み込み直後の状態（patsymbols）に毎回リセットする。
+                self.state.symbols = dict(self.state.patsymbols)
                 self.fileassemble(args.sourcefile)
 
                 current_pcs = {k: v[0] for k, v in self.state.labels.items()}
