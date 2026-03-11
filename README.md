@@ -806,9 +806,7 @@ LISP machine programs are not assembly language.
 
 ## Items not yet implemented
 
-- Make it compatible with the linker.
-
-・I want to put it to practical use. I only have Linux, so I'll use Linux. The special solution for Linux is to support ELF relocatable object files and make them linkable with ld.
+- Make it compatible with the linker generally.
 
 ・The order of evaluation of pattern files is difficult.
 
