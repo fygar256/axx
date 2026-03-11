@@ -826,7 +826,7 @@ LISP machine programs are not assembly language.
 
 ・Make it possible to take an equation for x in qad(x).
 
-・Now that the core is complete, I think it would be a great system if I prepared a pattern file for axx and added a linker, high-performance macros, optimization functions, and an IDE wrapper, but it would be difficult for an individual to complete such a large project, so please make one. I would be happy if it were put to practical use.
+・Now that the core is complete, I think it would be a great system if I prepared a pattern file for axx and added a high-performance macros, optimization functions, and an IDE wrapper, but it would be difficult for an individual to complete such a large project, so please make one. I would be happy if it were put to practical use.
 
 ### Looking Back
 
