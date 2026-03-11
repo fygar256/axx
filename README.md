@@ -30,7 +30,7 @@ chmod +x axx.py
 sudo cp axx.py /usr/local/bin/paxx
 
 # execution(assemble)
-paxx patternfile.axx [source.s] [-o outfile.bin] [-e expfile.tsv] [-i impfile.tsv]
+paxx patternfile.axx [source.s] [-o outfile.bin] [-e expfile.tsv] [-i impfile.tsv] [-r object.o]
 ```
 
 patternfile.axx --- pattern file
@@ -38,6 +38,7 @@ source.s --- assembly source
 outfile.bin --- raw binary output file
 expfile.tsv --- section and label information export file
 impfile.tsv --- section and label information import file
+object.o --- ELF relocatable object file
 
 #### compile c version 'Caxx'
 
