@@ -192,7 +192,11 @@ class StringUtils:
             ch = l[i]
             if ch == '\\' and in_string:
                 # エスケープシーケンス: 次の文字をスキップ
-                i += 2
+                # 境界チェックを追加
+                if i + 1 < len(l):
+                    i += 2
+                else:
+                    i += 1  # 末尾の孤立したバックスラッシュ
                 continue
             if ch == '"':
                 in_string = not in_string
@@ -223,7 +227,7 @@ class StringUtils:
     
     @staticmethod
     def get_string(l2):
-        """Get quoted string"""
+        """Get quoted string with proper escape sequence handling"""
         idx = 0
         idx = StringUtils.skipspc(l2, idx)
         if l2 == '' or idx >= len(l2) or l2[idx] != '"':
@@ -231,7 +235,24 @@ class StringUtils:
         idx += 1
         s = ""
         while idx < len(l2):
-            if l2[idx] == '"':
+            if l2[idx] == '\\' and idx + 1 < len(l2):
+                # エスケープシーケンスを処理
+                next_char = l2[idx + 1]
+                if next_char == '"':
+                    s += '"'
+                elif next_char == '\\':
+                    s += '\\'
+                elif next_char == 'n':
+                    s += '\n'
+                elif next_char == 't':
+                    s += '\t'
+                elif next_char == 'r':
+                    s += '\r'
+                else:
+                    # その他のエスケープはそのまま保持
+                    s += next_char
+                idx += 2
+            elif l2[idx] == '"':
                 return s
             else:
                 s += l2[idx]
@@ -1132,6 +1153,11 @@ class DirectiveProcessor:
         if len(i) == 0 or i[0] != '.setsym':
             return False
         
+        # 引数チェック: 少なくとも .setsym KEY が必要
+        if len(i) < 2:
+            print(f" error - .setsym directive requires at least a symbol name")
+            return False
+        
         key = StringUtils.upper(i[1])
         if len(i) > 2:
             v, idx = self.expr_eval.expression_pat(i[2], 0)
@@ -1183,6 +1209,11 @@ class DirectiveProcessor:
         if len(i) == 0 or i[0] != ".vliw":
             return False
         
+        # 引数チェック: .vliw には5つのパラメータが必要
+        if len(i) < 5:
+            print(f" error - .vliw directive requires 4 parameters (vliwbits, vliwinstbits, vliwtemplatebits, nop_value), got {len(i)-1}")
+            return False
+        
         v1, idx = self.expr_eval.expression_pat(i[1], 0)
         v2, idx = self.expr_eval.expression_pat(i[2], 0)
         v3, idx = self.expr_eval.expression_pat(i[3], 0)
@@ -1206,6 +1237,11 @@ class DirectiveProcessor:
             return False
         
         if len(i) <= 1 or i[1] == '':
+            return False
+        
+        # 引数チェック: EPIC には少なくとも2つのパラメータが必要
+        if len(i) < 3:
+            print(f" error - EPIC directive requires 2 parameters (indices, pattern), got {len(i)-1}")
             return False
         
         s = i[1]
@@ -2664,12 +2700,26 @@ class Assembler:
 
                 current_pcs = {k: v[0] for k, v in self.state.labels.items()}
                 if current_pcs == self.state._pass1_prev_label_pcs:
+                    if self.state.debug:
+                        print(f"Pass1 relaxation converged after {relax_iter + 1} iteration(s)", file=sys.stderr)
                     break   # 収束
                 self.state._pass1_prev_label_pcs = current_pcs
             else:
-                print("warning: pass1 relaxation did not converge; "
-                      "generated code may have incorrect addresses for "
-                      "variable-length instructions with forward references.")
+                # 収束しなかった場合の詳細情報
+                import sys as _sys
+                print("WARNING: Pass1 relaxation did not converge after {0} iterations.".format(MAX_RELAX), 
+                      file=_sys.stderr)
+                print("         Generated code may have incorrect addresses for", file=_sys.stderr)
+                print("         variable-length instructions with forward references.", file=_sys.stderr)
+                if self.state.debug and self.state._pass1_prev_label_pcs:
+                    # デバッグモードでは変化したラベルを表示
+                    changed = []
+                    for k in current_pcs:
+                        if k in self.state._pass1_prev_label_pcs:
+                            if current_pcs[k] != self.state._pass1_prev_label_pcs[k]:
+                                changed.append(k)
+                    if changed:
+                        print(f"         Labels still changing: {', '.join(changed[:10])}", file=_sys.stderr)
 
             self.state.pc = 0
             self.state.pas = 2
