@@ -2560,7 +2560,7 @@ class Assembler:
                         help='Pattern definition file (.axx)')
         ap.add_argument('sourcefile', nargs='?', default=None,
                         help='Assembly source file (.s). Omit for interactive mode.')
-        ap.add_argument('-o', dest='outfile', default='',
+        ap.add_argument('-b', dest='outfile', default='',
                         metavar='OUTFILE',
                         help='Output binary file')
         ap.add_argument('-e', dest='expfile', default='',
@@ -2572,7 +2572,7 @@ class Assembler:
         ap.add_argument('-i', dest='impfile', default='',
                         metavar='IMPORT_TSV',
                         help='Import labels from TSV file')
-        ap.add_argument('-r', dest='elf_objfile', default='',
+        ap.add_argument('-o', dest='elf_objfile', default='',
                         metavar='OBJ_FILE',
                         help='Write FreeBSD ELF64 relocatable object file (.o)')
         ap.add_argument('-m', dest='elf_machine', type=int, default=62,

@@ -3041,7 +3041,7 @@ int main(int argc, char *argv[]){
     const char *expfile_elf=NULL;
 
     for(int i=1;i<argc;i++){
-        if(strcmp(argv[i],"-o")==0&&i+1<argc){ strncpy(st->outfile,argv[++i],sizeof(st->outfile)-1); }
+        if(strcmp(argv[i],"-b")==0&&i+1<argc){ strncpy(st->outfile,argv[++i],sizeof(st->outfile)-1); }
         else if(strcmp(argv[i],"-e")==0&&i+1<argc){ strncpy(st->expfile,argv[++i],sizeof(st->expfile)-1); }
         else if(strcmp(argv[i],"-E")==0&&i+1<argc){ expfile_elf=argv[++i]; }
         else if(strcmp(argv[i],"-i")==0&&i+1<argc){ strncpy(st->impfile,argv[++i],sizeof(st->impfile)-1); }
