@@ -496,6 +496,24 @@ static void secmap_set(SecMap*m,const char*name,uint256_t start,uint256_t size){
     if(m->count>=m->cap){m->cap*=2;m->order=realloc(m->order,m->cap*sizeof(SecEntry*));}
     m->order[m->count++]=e;
 }
+static void secmap_free(SecMap*m){
+    for(int i=0;i<m->nb;i++){
+        SecEntry*e=m->buckets[i];
+        while(e){SecEntry*n=e->next;free(e->name);free(e);e=n;}
+        m->buckets[i]=NULL;
+    }
+    free(m->buckets); free(m->order);
+    m->buckets=NULL; m->order=NULL; m->count=0; m->cap=0; m->nb=0;
+}
+static void secmap_clear(SecMap*m){
+    for(int i=0;i<m->nb;i++){
+        SecEntry*e=m->buckets[i];
+        while(e){SecEntry*n=e->next;free(e->name);free(e);e=n;}
+        m->buckets[i]=NULL;
+    }
+    m->count=0;
+    /* keep order array but reset length */
+}
 
 /* =========================================================
  * Pattern: each entry has 6 string fields
@@ -668,6 +686,27 @@ typedef struct {
     /* Fix C-6: per-process stdin temp file path (replaces fixed "axx.tmp").
      * NULL until first stdin read; freed and unlinked at the end of run(). */
     char       stdin_tmp_path[512];
+
+    /* ELF relocatable object output (-o / -m options) */
+    char       elf_objfile[512];
+    int        elf_machine;   /* default 62 = EM_X86_64 */
+
+    /* ELF relocation tracking (active during pass2 when elf_objfile is set) */
+    int        elf_tracking;                /* 1 while assembling one instruction */
+    /* dynamic array of (label_name, abs_word_value) refs seen in current insn */
+    struct { char *name; uint64_t val; } *elf_refs;
+    int        elf_refs_len;
+    int        elf_refs_cap;
+    /* accumulated relocations across all of pass2 */
+    struct {
+        char   *section;
+        int64_t sec_offset;
+        char   *sym;
+        int     rtype;
+        int64_t addend;
+    } *relocations;
+    int        reloc_count;
+    int        reloc_cap;
 } AsmState;
 
 static void state_init(AsmState *st) {
@@ -704,6 +743,15 @@ static void state_init(AsmState *st) {
     st->padding = u256_zero();
     st->pass1_size_mode = 0;
     st->stdin_tmp_path[0] = '\0';
+    st->elf_objfile[0] = '\0';
+    st->elf_machine = 62;
+    st->elf_tracking = 0;
+    st->elf_refs = NULL;
+    st->elf_refs_len = 0;
+    st->elf_refs_cap = 0;
+    st->relocations = NULL;
+    st->reloc_count = 0;
+    st->reloc_cap = 0;
 }
 
 /* =========================================================
@@ -1247,7 +1295,21 @@ static void var_put(AsmState *st, char ch, uint256_t v){
 static uint256_t label_get_value(AsmState *st, const char *k){
     st->error_undefined_label=0;
     LabelEntry *e=lmap_find(&st->labels,k);
-    if(e) return e->value;
+    if(e){
+        /* ELF relocation tracking: record label ref during pass2 instruction */
+        if(st->elf_tracking){
+            if(st->elf_refs_len >= st->elf_refs_cap){
+                st->elf_refs_cap = st->elf_refs_cap ? st->elf_refs_cap*2 : 8;
+                st->elf_refs = realloc(st->elf_refs,
+                    st->elf_refs_cap * sizeof(st->elf_refs[0]));
+                if(!st->elf_refs){ perror("realloc"); exit(1); }
+            }
+            st->elf_refs[st->elf_refs_len].name = strdup(k);
+            st->elf_refs[st->elf_refs_len].val  = u256_to_u64(e->value);
+            st->elf_refs_len++;
+        }
+        return e->value;
+    }
     st->error_undefined_label=1;
     /* Fix C-3: in pass1 size-estimation mode return 0 so makeobj() can
      * compute the correct instruction byte count even for forward refs. */
@@ -2858,10 +2920,20 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     }
     st->vcnt=vcnt?vcnt:1;
 
+    /* ELF relocation tracking: activate during pass2 when -o is set */
+    if(st->elf_objfile[0] && st->pas==2){
+        st->elf_tracking=1;
+        for(int ri=0;ri<st->elf_refs_len;ri++) free(st->elf_refs[ri].name);
+        st->elf_refs_len=0;
+    }
+
     IntVec idxs; iv_init(&idxs);
     IntVec objl; iv_init(&objl);
     int new_idx;
     int flag=lineassemble2(asmb,processed,0,&idxs,&objl,&new_idx);
+
+    st->elf_tracking=0;
+
     if(!flag){ iv_free(&idxs); iv_free(&objl); return 0; }
 
     const char *rest=processed+new_idx;
@@ -2869,6 +2941,68 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     int is_vliw_cont=(st->vliwflag && rest[0]=='!'&&rest[1]=='!');
 
     if(!is_vliw_cont){
+        /* ELF relocation detection:
+         * Scan objl for embedded label addresses; zero them and record relocations.
+         * Mirrors axx.py write_elf_obj: for each unique label ref, try 8/4/2 bytes
+         * little-endian, skip if upper half all-zero (likely false positive). */
+        if(st->elf_objfile[0] && st->pas==2 && objl.len>0 && st->elf_refs_len>0){
+            int bpw = (st->bts+7)/8; if(bpw<1) bpw=1;
+            const char *sec_name = st->current_section;
+            SecEntry *se = secmap_find(&st->sections, sec_name);
+            uint64_t sec_start = se ? u256_to_u64(se->start) : 0;
+            uint64_t cur_pc    = u256_to_u64(st->pc);
+
+            /* deduplicate refs by name (first occurrence wins) */
+            for(int ri=0; ri<st->elf_refs_len; ri++){
+                int dup=0;
+                for(int rj=0;rj<ri;rj++)
+                    if(strcmp(st->elf_refs[ri].name, st->elf_refs[rj].name)==0){dup=1;break;}
+                if(dup) continue;
+
+                uint64_t abs_w = st->elf_refs[ri].val;
+                if(abs_w==0) continue; /* zero → likely false positive */
+
+                int found=0;
+                for(int nbytes=8; nbytes>=2 && !found; nbytes/=2){
+                    /* skip if upper half all zero for narrow widths */
+                    if(nbytes<=4){
+                        int allz=1;
+                        for(int b=nbytes/2; b<nbytes; b++)
+                            if(((abs_w>>(8*b))&0xff)!=0){allz=0;break;}
+                        if(allz) continue;
+                    }
+                    uint8_t le[8];
+                    for(int b=0;b<nbytes;b++) le[b]=(uint8_t)((abs_w>>(8*b))&0xff);
+
+                    for(int j=0; j<=objl.len-nbytes && !found; j++){
+                        int eq=1;
+                        for(int b=0;b<nbytes;b++)
+                            if((u256_to_u64(objl.data[j+b])&0xff)!=le[b]){eq=0;break;}
+                        if(!eq) continue;
+
+                        int64_t sec_rel=(int64_t)((cur_pc+(uint64_t)j-sec_start)*(uint64_t)bpw);
+                        for(int b=0;b<nbytes;b++) objl.data[j+b]=u256_zero();
+                        int rtype=(nbytes==8)?1:(nbytes==4)?10:0;
+                        if(rtype!=0){
+                            if(st->reloc_count>=st->reloc_cap){
+                                st->reloc_cap=st->reloc_cap?st->reloc_cap*2:16;
+                                st->relocations=realloc(st->relocations,
+                                    st->reloc_cap*sizeof(st->relocations[0]));
+                                if(!st->relocations){perror("realloc");exit(1);}
+                            }
+                            st->relocations[st->reloc_count].section  =strdup(sec_name);
+                            st->relocations[st->reloc_count].sec_offset=sec_rel;
+                            st->relocations[st->reloc_count].sym       =strdup(st->elf_refs[ri].name);
+                            st->relocations[st->reloc_count].rtype     =rtype;
+                            st->relocations[st->reloc_count].addend    =0;
+                            st->reloc_count++;
+                        }
+                        found=1;
+                    }
+                }
+            }
+        }
+
         for(int ci=0;ci<objl.len;ci++){
             outbin(st,st->pc,objl.data[ci]);
             st->pc=u256_add(st->pc,u256_one());
@@ -2920,6 +3054,288 @@ static char *file_input_from_stdin(void){
     }
     buf[total]=0;
     return buf;
+}
+
+
+/* =========================================================
+ * write_elf_obj: write FreeBSD ELF64 relocatable object file
+ * Mirrors axx.py Assembler.write_elf_obj() exactly.
+ *
+ * File layout:
+ *   ELF header (64 bytes)
+ *   Content sections (16-byte aligned each)
+ *   .rela.X sections (8-byte aligned, 24 bytes/entry)
+ *   .symtab          (8-byte aligned, 24 bytes/entry)
+ *   .strtab
+ *   .shstrtab
+ *   Section header table (8-byte aligned, 64 bytes/entry)
+ * ========================================================= */
+static void write_elf_obj(AsmState *st, const char *path, int machine){
+    int bpw = (st->bts+7)/8; if(bpw<1) bpw=1;
+
+    /* LE write helpers */
+    #define WEO_LE2(p,v) do{uint16_t _v=(uint16_t)(v);memcpy((p),&_v,2);}while(0)
+    #define WEO_LE4(p,v) do{uint32_t _v=(uint32_t)(v);memcpy((p),&_v,4);}while(0)
+    #define WEO_LE8(p,v) do{uint64_t _v=(uint64_t)(v);memcpy((p),&_v,8);}while(0)
+    #define WEO_LE8S(p,v) do{int64_t _v=(int64_t)(v);memcpy((p),&_v,8);}while(0)
+    #define WEO_ALIGN(x,a) (((uint64_t)(x)+((uint64_t)(a)-1))&~((uint64_t)(a)-1))
+
+    /* dynamic byte buffer (starts with one NUL byte) */
+    typedef struct { uint8_t*b; size_t len,cap; } WBB;
+    void wbb_init(WBB*w){ w->b=calloc(1,64); w->len=1; w->cap=64; }
+    void wbb_grow(WBB*w, size_t need){
+        while(w->len+need>w->cap){w->cap*=2;w->b=realloc(w->b,w->cap);if(!w->b){perror("realloc");exit(1);}}
+    }
+    uint32_t wbb_str(WBB*w, const char*s){
+        size_t l=strlen(s)+1; uint32_t off=(uint32_t)w->len;
+        wbb_grow(w,l); memcpy(w->b+w->len,s,l); w->len+=l; return off;
+    }
+    void wbb_app(WBB*w, const void*src, size_t n){
+        wbb_grow(w,n); memcpy(w->b+w->len,src,n); w->len+=n;
+    }
+
+    /* extract word range [w0, w0+wn) as byte array */
+    uint8_t *weo_extract(uint64_t w0, uint64_t wn){
+        uint64_t nb=wn*(uint64_t)bpw;
+        if(!nb) return calloc(1,1);
+        uint8_t *d=calloc(1,(size_t)nb); if(!d){perror("calloc");exit(1);}
+        uint64_t pad=u256_to_u64(st->padding);
+        if(pad){
+            uint64_t mask=(st->bts<64)?((uint64_t)1<<st->bts)-1:(uint64_t)-1; pad&=mask;
+            for(uint64_t wp=0;wp<wn;wp++){
+                uint64_t base=wp*(uint64_t)bpw,tmp=pad;
+                if(!st->endian_big){for(int j=0;j<bpw;j++){d[base+j]=(uint8_t)(tmp&0xff);tmp>>=8;}}
+                else               {for(int j=bpw-1;j>=0;j--){d[base+j]=(uint8_t)(tmp&0xff);tmp>>=8;}}
+            }
+        }
+        for(int bi=0;bi<BUFMAP_NB;bi++)
+            for(BufEntry*be=st->buf.buckets[bi];be;be=be->next){
+                if(be->pos<w0||be->pos>=w0+wn) continue;
+                uint64_t off=(be->pos-w0)*(uint64_t)bpw,tmp=be->val;
+                if(!st->endian_big){for(int j=0;j<bpw;j++){if(off+(uint64_t)j<nb)d[off+j]=(uint8_t)(tmp&0xff);tmp>>=8;}}
+                else               {for(int j=bpw-1;j>=0;j--){if(off+(uint64_t)j<nb)d[off+j]=(uint8_t)(tmp&0xff);tmp>>=8;}}
+            }
+        return d;
+    }
+
+    /* ---- 1. collect content sections ---- */
+    typedef struct{ const char*name; uint64_t bs,bsz,fl; uint8_t*data; } WCS;
+    uint64_t max_w=0; int have_w=0;
+    for(int i=0;i<BUFMAP_NB;i++)
+        for(BufEntry*be=st->buf.buckets[i];be;be=be->next)
+            if(!have_w||be->pos>max_w){max_w=be->pos;have_w=1;}
+
+    int ncs=0; WCS *csecs=NULL;
+    if(st->sections.count==0){
+        ncs=1; csecs=calloc(1,sizeof(WCS));
+        uint64_t wn=have_w?max_w+1:0;
+        csecs[0]=(WCS){".text",0,wn*(uint64_t)bpw,0x2|0x4,weo_extract(0,wn)};
+    } else {
+        ncs=st->sections.count; csecs=calloc((size_t)ncs,sizeof(WCS));
+        for(int i=0;i<ncs;i++){
+            SecEntry *se=st->sections.order[i];
+            uint64_t w0=u256_to_u64(se->start),wsz=u256_to_u64(se->size);
+            if(!wsz){
+                if(i+1<ncs){uint64_t w1=u256_to_u64(st->sections.order[i+1]->start);wsz=w1>w0?w1-w0:0;}
+                else        wsz=(have_w&&max_w>=w0)?max_w+1-w0:0;
+            }
+            char un[64]; int ui=0;
+            for(;se->name[ui]&&ui<63;ui++) un[ui]=(char)axx_upper_char(se->name[ui]); un[ui]=0;
+            uint64_t fl;
+            if     (strncmp(un,".TEXT",5)==0)   fl=0x2|0x4;
+            else if(strncmp(un,".DATA",5)==0)   fl=0x2|0x1;
+            else if(strncmp(un,".RODATA",7)==0) fl=0x2;
+            else if(strncmp(un,".BSS",4)==0)    fl=0x2|0x1;
+            else                                fl=0x2;
+            csecs[i]=(WCS){se->name,w0*(uint64_t)bpw,wsz*(uint64_t)bpw,fl,weo_extract(w0,wsz)};
+        }
+    }
+
+    /* ---- 2. group relocations by content section ---- */
+    typedef struct{ int64_t off; const char*sym; int rtype; int64_t addend; } WRE;
+    typedef struct{ WRE*data; int len,cap; } WRL;
+    WRL *rela_lists=calloc((size_t)ncs,sizeof(WRL));
+    for(int ri=0;ri<st->reloc_count;ri++){
+        int sidx=-1;
+        for(int i=0;i<ncs;i++) if(strcmp(st->relocations[ri].section,csecs[i].name)==0){sidx=i;break;}
+        if(sidx<0) continue;
+        WRL *rl=&rela_lists[sidx];
+        if(rl->len>=rl->cap){rl->cap=rl->cap?rl->cap*2:4;rl->data=realloc(rl->data,rl->cap*sizeof(WRE));}
+        rl->data[rl->len++]=(WRE){st->relocations[ri].sec_offset,st->relocations[ri].sym,
+                                   st->relocations[ri].rtype,st->relocations[ri].addend};
+    }
+    int nrela=0; for(int i=0;i<ncs;i++) if(rela_lists[i].len>0) nrela++;
+    int *rs_idx=calloc((size_t)(nrela?nrela:1),sizeof(int));
+    { int ri2=0; for(int i=0;i<ncs;i++) if(rela_lists[i].len>0) rs_idx[ri2++]=i; }
+
+    /* ---- 3. build shstrtab and strtab ---- */
+    WBB shstr; wbb_init(&shstr);
+    WBB strtab_bb; wbb_init(&strtab_bb);
+
+    uint32_t *sec_noff=calloc((size_t)ncs,sizeof(uint32_t));
+    for(int i=0;i<ncs;i++) sec_noff[i]=wbb_str(&shstr,csecs[i].name);
+    uint32_t *rela_noff=calloc((size_t)(nrela?nrela:1),sizeof(uint32_t));
+    for(int ri2=0;ri2<nrela;ri2++){
+        char rn[256]; snprintf(rn,sizeof(rn),".rela%s",csecs[rs_idx[ri2]].name);
+        rela_noff[ri2]=wbb_str(&shstr,rn);
+    }
+    uint32_t sym_noff  =wbb_str(&shstr,".symtab");
+    uint32_t str_noff  =wbb_str(&shstr,".strtab");
+    uint32_t shstr_noff=wbb_str(&shstr,".shstrtab");
+
+    /* ---- 4. build .symtab ---- */
+    typedef struct{ uint16_t shndx; uint64_t sv; } WSR;
+    WSR weo_shndx(uint64_t ba){
+        for(int i=0;i<ncs;i++){
+            if(csecs[i].bsz>0&&csecs[i].bs<=ba&&ba<csecs[i].bs+csecs[i].bsz)
+                return (WSR){(uint16_t)(i+1),ba-csecs[i].bs};
+            if(!csecs[i].bsz&&ba==csecs[i].bs) return (WSR){(uint16_t)(i+1),0};
+        }
+        return (WSR){0xfff1,ba};
+    }
+    #define WEO_SYMSZ 24
+    WBB symtab_bb; symtab_bb.b=calloc(32,(size_t)WEO_SYMSZ); symtab_bb.len=0; symtab_bb.cap=32*WEO_SYMSZ;
+    int nsyms=0;
+    void weo_sym(uint32_t nm,uint8_t info,uint8_t oth,uint16_t shndx,uint64_t val,uint64_t sz){
+        uint8_t sp[WEO_SYMSZ]={0};
+        WEO_LE4(sp,nm); sp[4]=info; sp[5]=oth; WEO_LE2(sp+6,shndx); WEO_LE8(sp+8,val); WEO_LE8(sp+16,sz);
+        wbb_app(&symtab_bb,sp,WEO_SYMSZ); nsyms++;
+    }
+    typedef struct{const char*name;int idx;} WSNI;
+    WSNI *snimap=calloc((size_t)(st->labels.count+st->export_labels.count+8),sizeof(WSNI));
+    int snimap_len=0;
+
+    weo_sym(0,0,0,0,0,0);                             /* null */
+    for(int i=0;i<ncs;i++) weo_sym(0,0x03,0,(uint16_t)(i+1),0,0); /* section syms */
+
+    /* sort labels and export_labels by name */
+    typedef struct{const char*name;uint64_t val;} WLK;
+    int nl=st->labels.count;
+    WLK *larr=calloc((size_t)(nl?nl:1),sizeof(WLK));
+    {int li=0;for(int bi=0;bi<st->labels.nbuckets;bi++)
+        for(LabelEntry*e=st->labels.buckets[bi];e;e=e->next)
+            larr[li++]=(WLK){e->key,u256_to_u64(e->value)};}
+    int cmp_wlk(const void*a,const void*b){return strcmp(((WLK*)a)->name,((WLK*)b)->name);}
+    qsort(larr,nl,sizeof(WLK),cmp_wlk);
+
+    int ne=st->export_labels.count;
+    WLK *earr=calloc((size_t)(ne?ne:1),sizeof(WLK));
+    {int ei=0;for(int bi=0;bi<st->export_labels.nbuckets;bi++)
+        for(LabelEntry*e=st->export_labels.buckets[bi];e;e=e->next)
+            earr[ei++]=(WLK){e->key,u256_to_u64(e->value)};}
+    qsort(earr,ne,sizeof(WLK),cmp_wlk);
+
+    int weo_isexp(const char*nm){for(int i=0;i<ne;i++)if(!strcmp(earr[i].name,nm))return 1;return 0;}
+
+    for(int i=0;i<nl;i++){           /* local labels */
+        if(weo_isexp(larr[i].name)) continue;
+        WSR sr=weo_shndx(larr[i].val*(uint64_t)bpw);
+        uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
+        snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
+        weo_sym(noff,0x00,0,sr.shndx,sr.sv,0);
+    }
+    int first_global=nsyms;
+    for(int i=0;i<ne;i++){           /* global symbols */
+        WSR sr=weo_shndx(earr[i].val*(uint64_t)bpw);
+        uint32_t noff=wbb_str(&strtab_bb,earr[i].name);
+        snimap[snimap_len++]=(WSNI){earr[i].name,nsyms};
+        weo_sym(noff,0x10,0,sr.shndx,sr.sv,0);
+    }
+
+    int weo_symof(const char*nm){for(int i=0;i<snimap_len;i++)if(!strcmp(snimap[i].name,nm))return snimap[i].idx;return 0;}
+
+    /* ---- 5. build .rela data ---- */
+    uint8_t **rela_bufs=calloc((size_t)(nrela?nrela:1),sizeof(uint8_t*));
+    size_t   *rela_szs =calloc((size_t)(nrela?nrela:1),sizeof(size_t));
+    for(int ri2=0;ri2<nrela;ri2++){
+        WRL *rl=&rela_lists[rs_idx[ri2]];
+        size_t rbs=(size_t)rl->len*24;
+        uint8_t *rb=calloc(1,rbs?rbs:1);
+        for(int ei=0;ei<rl->len;ei++){
+            uint8_t *rp=rb+ei*24;
+            uint64_t rinfo=((uint64_t)weo_symof(rl->data[ei].sym)<<32)|((uint32_t)rl->data[ei].rtype);
+            WEO_LE8(rp,(uint64_t)rl->data[ei].off);
+            WEO_LE8(rp+8,rinfo);
+            WEO_LE8S(rp+16,rl->data[ei].addend);
+        }
+        rela_bufs[ri2]=rb; rela_szs[ri2]=rbs;
+    }
+
+    /* ---- 6. compute file offsets ---- */
+    uint64_t foff=64;
+    uint64_t *sec_fo=calloc((size_t)ncs,sizeof(uint64_t));
+    for(int i=0;i<ncs;i++){foff=WEO_ALIGN(foff,16);sec_fo[i]=foff;foff+=csecs[i].bsz;}
+    uint64_t *rela_fo=calloc((size_t)(nrela?nrela:1),sizeof(uint64_t));
+    for(int ri2=0;ri2<nrela;ri2++){foff=WEO_ALIGN(foff,8);rela_fo[ri2]=foff;foff+=rela_szs[ri2];}
+    uint64_t sym_fo=WEO_ALIGN(foff,8); foff=sym_fo+(uint64_t)nsyms*(uint64_t)WEO_SYMSZ;
+    uint64_t str_fo=foff;     foff+=strtab_bb.len;
+    uint64_t shstr_fo=foff;   foff+=shstr.len;
+    uint64_t shdr_fo=WEO_ALIGN(foff,8);
+
+    int tot_sh=1+ncs+nrela+3;
+    int shstrndx=ncs+nrela+3;
+    int sym_shidx=ncs+nrela+1;
+    int str_shidx=ncs+nrela+2;
+
+    /* ---- 7. write file ---- */
+    FILE *fp=fopen(path,"wb");
+    if(!fp){perror(path);goto weo_done;}
+
+    /* ELF header */
+    {uint8_t eh[64]={0};
+     eh[0]=0x7f;eh[1]='E';eh[2]='L';eh[3]='F';
+     eh[4]=2;eh[5]=1;eh[6]=1;eh[7]=9; /* ELFCLASS64 ELFDATA2LSB EV_CURRENT ELFOSABI_FREEBSD */
+     WEO_LE2(eh+16,1); WEO_LE2(eh+18,(uint16_t)machine); WEO_LE4(eh+20,1);
+     WEO_LE8(eh+40,shdr_fo);
+     WEO_LE2(eh+52,64); WEO_LE2(eh+58,64);
+     WEO_LE2(eh+60,(uint16_t)tot_sh); WEO_LE2(eh+62,(uint16_t)shstrndx);
+     fwrite(eh,1,64,fp);}
+
+    void weo_pad(FILE*f,uint64_t t){long c=ftell(f);while((uint64_t)c<t){fputc(0,f);c++;}}
+
+    for(int i=0;i<ncs;i++){weo_pad(fp,sec_fo[i]);if(csecs[i].bsz)fwrite(csecs[i].data,1,(size_t)csecs[i].bsz,fp);}
+    for(int ri2=0;ri2<nrela;ri2++){weo_pad(fp,rela_fo[ri2]);if(rela_szs[ri2])fwrite(rela_bufs[ri2],1,rela_szs[ri2],fp);}
+    weo_pad(fp,sym_fo); fwrite(symtab_bb.b,1,(size_t)nsyms*(size_t)WEO_SYMSZ,fp);
+    fwrite(strtab_bb.b,1,strtab_bb.len,fp);
+    fwrite(shstr.b,1,shstr.len,fp);
+    weo_pad(fp,shdr_fo);
+
+    void weo_shdr(FILE*f,uint32_t nm,uint32_t ty,uint64_t fl,uint64_t addr,uint64_t off,
+                  uint64_t sz,uint32_t lnk,uint32_t info,uint64_t align,uint64_t entsz){
+        uint8_t sh[64]={0};
+        WEO_LE4(sh,nm);WEO_LE4(sh+4,ty);WEO_LE8(sh+8,fl);WEO_LE8(sh+16,addr);
+        WEO_LE8(sh+24,off);WEO_LE8(sh+32,sz);WEO_LE4(sh+40,lnk);WEO_LE4(sh+44,info);
+        WEO_LE8(sh+48,align);WEO_LE8(sh+56,entsz);
+        fwrite(sh,1,64,f);
+    }
+    weo_shdr(fp,0,0,0,0,0,0,0,0,0,0); /* [0] NULL */
+    for(int i=0;i<ncs;i++)
+        weo_shdr(fp,sec_noff[i],1,csecs[i].fl,0,sec_fo[i],csecs[i].bsz,0,0,16,0);
+    for(int ri2=0;ri2<nrela;ri2++)
+        weo_shdr(fp,rela_noff[ri2],4,0x40,0,rela_fo[ri2],rela_szs[ri2],
+                 (uint32_t)sym_shidx,(uint32_t)(rs_idx[ri2]+1),8,24);
+    weo_shdr(fp,sym_noff,2,0,0,sym_fo,(uint64_t)nsyms*(uint64_t)WEO_SYMSZ,
+             (uint32_t)str_shidx,(uint32_t)first_global,8,(uint64_t)WEO_SYMSZ);
+    weo_shdr(fp,str_noff,3,0,0,str_fo,strtab_bb.len,0,0,1,0);
+    weo_shdr(fp,shstr_noff,3,0,0,shstr_fo,shstr.len,0,0,1,0);
+    fclose(fp);
+    fprintf(stderr,"elf: wrote %s (%d section(s), %d rela section(s), %d symbol(s))\n",
+            path,ncs,nrela,nsyms);
+
+weo_done:
+    for(int i=0;i<ncs;i++) free(csecs[i].data); free(csecs);
+    for(int i=0;i<nrela;i++) free(rela_bufs[i]);
+    free(rela_bufs); free(rela_szs); free(rela_fo); free(rs_idx);
+    for(int i=0;i<ncs;i++) free(rela_lists[i].data); free(rela_lists);
+    free(sec_noff); free(rela_noff);
+    free(shstr.b); free(strtab_bb.b); free(symtab_bb.b);
+    free(sec_fo); free(larr); free(earr); free(snimap);
+    #undef WEO_LE2
+    #undef WEO_LE4
+    #undef WEO_LE8
+    #undef WEO_LE8S
+    #undef WEO_ALIGN
+    #undef WEO_SYMSZ
 }
 
 static void fileassemble(Assembler *asmb, const char *fn){
@@ -3026,7 +3442,7 @@ static int imp_label(Assembler *asmb, const char *l){
  * main
  * ========================================================= */
 static void print_usage(const char *prog){
-    printf("usage: %s patternfile [sourcefile] [-o outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv]\n",prog);
+    printf("usage: %s patternfile [sourcefile] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-m machine]\n",prog);
     printf("axx general assembler programmed and designed by Taisuke Maekawa\n");
 }
 
@@ -3045,6 +3461,8 @@ int main(int argc, char *argv[]){
         else if(strcmp(argv[i],"-e")==0&&i+1<argc){ strncpy(st->expfile,argv[++i],sizeof(st->expfile)-1); }
         else if(strcmp(argv[i],"-E")==0&&i+1<argc){ expfile_elf=argv[++i]; }
         else if(strcmp(argv[i],"-i")==0&&i+1<argc){ strncpy(st->impfile,argv[++i],sizeof(st->impfile)-1); }
+        else if(strcmp(argv[i],"-o")==0&&i+1<argc){ strncpy(st->elf_objfile,argv[++i],sizeof(st->elf_objfile)-1); }
+        else if(strcmp(argv[i],"-m")==0&&i+1<argc){ st->elf_machine=atoi(argv[++i]); }
         else if(argv[i][0]!='-'){
             if(!patternfile) patternfile=argv[i];
             else if(!sourcefile) sourcefile=argv[i];
@@ -3102,6 +3520,9 @@ int main(int argc, char *argv[]){
         for(int relax=0; relax<MAX_RELAX; relax++){
             st->pc=u256_zero(); st->pas=1; st->ln=1;
             lmap_free(&st->labels); lmap_init(&st->labels);
+            /* reset sections and export_labels too (mirrors axx.py run()) */
+            secmap_clear(&st->sections);
+            lmap_free(&st->export_labels); lmap_init(&st->export_labels);
             /* Fix C-N6: reset symbols to the post-pattern-file baseline at the
              * start of every relaxation iteration.  Source-level .setsym /
              * .clearsym directives mutate st->symbols during assembly; without
@@ -3142,10 +3563,20 @@ int main(int argc, char *argv[]){
 #undef MAX_RELAX
 
         st->pc=u256_zero(); st->pas=2; st->ln=1;
+        /* reset relocations before pass2 (mirrors axx.py run()) */
+        for(int ri=0;ri<st->reloc_count;ri++){
+            free(st->relocations[ri].section);
+            free(st->relocations[ri].sym);
+        }
+        st->reloc_count=0;
         fileassemble(asmb,sourcefile);
     }
 
     binary_flush(st);
+
+    /* ELF relocatable object output (-o option) */
+    if(st->elf_objfile[0])
+        write_elf_obj(st, st->elf_objfile, st->elf_machine);
 
     /* Fix #2: -e と -E が同時指定された場合、元のコードは expfile_elf で
      * st->expfile を上書きしてから一回だけ書き出していたため -e ファイルが
