@@ -1,7 +1,7 @@
 MOV EAX,!e   ::   0xb8,e,e>>8,e>>16,e>>24
 MOV EDI,!e   ::   0xbf,e,e>>8,e>>16,e>>24
 MOV EBX,!e   ::   0xbb,e,e>>8,e>>16,e>>24
-MOVABS RSI,!e::   0x48,0xbe,e,e>>8,e>>16,e>>24,e>>32,e>>40,e>>48,e>>56
+MOVABS RSI,!e::   0x48,0xbe,@@[8,*(e,%%)]
 MOV EDX,!e   ::  0xba,e,e>>8,e>>16,e>>24
 SYSCALL     ::   0xf,0x5
 DB e        ::   e
