@@ -1,3 +1,12 @@
+; axx test example hello world.
+; for x86_64 FreeBSD
+;
+; assemble:
+; axx.py hello.axx hello.s -o hello.o
+; ld hello.o -o hello
+; % hello
+; hello, world
+;
 .export _hello,_start,len
 section .text
 _start:
