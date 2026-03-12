@@ -30,7 +30,7 @@ chmod +x axx.py
 sudo cp axx.py /usr/local/bin/paxx
 
 # execution(assemble)
-paxx patternfile.axx [source.s] [-o outfile.bin] [-e expfile.tsv] [-i impfile.tsv] [-r object.o]
+paxx patternfile.axx [source.s] [-b outfile.bin] [-e expfile.tsv] [-i impfile.tsv] [-o object.o]
 ```
 
 patternfile.axx --- pattern file
@@ -48,7 +48,7 @@ object.o --- ELF relocatable object file
 #### sample test of hello world on x86_64 FreeBSD
 
 ```
-% paxx hello.axx hello.s -r hello.o # assemble
+% paxx hello.axx hello.s -o hello.o # assemble
 % ld hello.o -o hello               # link
 % ./hello
 hello, world
