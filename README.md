@@ -83,11 +83,14 @@ It was written in python, so the nickname is Paxx.
 
 Since axx stands for 'Arbirtary eXtended X(cross) assembler'. It also means that I combined the unknown X in 'ASM', which represents the CPU, to create 'AXX'.
 
-The original idea for axx, the name 'AXX', and the prototype written in C were conceived as early as 1986, when I was working part-time at Tokyo Electronics Design during my university days. However, it wasn't until 2024, 38 years later, that I published the working code we know today. The axx pattern file is the meta-language for all assembly languages. While it's a DSL, it doesn't have a specific grammar; instead, it's a pattern language that creates grammar by combining string literals, symbols, expressions, and other elements.
+As early as 1986, the original idea for axx, the name 'AXX', and a prototype written in C were already in existence at Tokyo Electronics Design, where I was working part-time during my university days. However, it wasn't until 2024, 38 years later, that I published working code like the one we see today. It was dormant for 30 years. The axx pattern file is a metalanguage for all imperative assembly languages. It's a DSL, but it doesn't have a specific grammar; it's a pattern language where you create the grammar by combining string literals, symbols, and expressions.
 
 All imperative assembly languages ​​other than EPIC, which have meta-level complexity in machine code, basically reduce to a simple structure: `instruction :: error_patterns :: binary_list`. Further simplification by omitting error checking results in `instruction::binary_list`. Here, axx's binary_list includes complex expression calculations, alignment, and the `;` prefix modifier (which prevents binary output if 0) for practical purposes, but in the minimal model, these do not need to be considered. An instruction is a combination of (string literals, symbols that can be replaced with integer values, integer expressions, and integer factors). Floating-point numbers are also replaced with integer values ​​by bit patterns. This allows processing of any imperative assembly language. However, the binary generation function is not omnipotent, which limits compatible processors, but it can process any processor where instructions and machine code are a one-to-one mapping. It can process Itanium-type EPICs and vliw processors, for example.
+
 Extracting the essential commonalities of the von Neumann architecture
+
 Instruction Set Architecture (ISA) metamodel
+
 Formalization using pattern matching.
 
 # Main text
