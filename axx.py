@@ -2106,13 +2106,17 @@ class Assembler:
             of = len(objl)
 
             # ------------------------------------------------------------------ #
-            # ELF リロケーション検出                                               #
-            # 命令バイト列(objl)の中にラベルの絶対アドレスが埋め込まれているか    #
-            # スキャンし、見つかった箇所をゼロクリアしてリロケーションを記録する。 #
+            # ELF リロケーション検出 (ラベル参照時トラッキング方式)                 #
+            # _elf_label_refs_seen（LabelManager.get_value で参照時に収集済み）     #
+            # を使い、makeobj で生成された objl の各 word 値と厳密一致（objl[j] == abs_w）#
+            # で埋め込みスロットを特定。バイナリバイトスキャンを完全排除し、確率誤検出を  #
+            # ゼロに。従来と同じく pure-label（objl[j] == abs_w）のみ対応。            #
+            #                                                                         #
+            # .bits ディレクティブ（bts）は無視し、常に R_X86_64_64（type=1）を使用   #
+            # （ユーザーリクエスト通り）                                              #
             # ------------------------------------------------------------------ #
             if self.state.elf_objfile and self.state.pas == 2 and objl and self.state._elf_label_refs_seen:
                 bpw_r = max(1, (self.state.bts + 7) // 8)
-                # セクション開始ワードアドレス
                 sec_name_r = self.state.current_section
                 sec_start_w = 0
                 if sec_name_r in self.state.sections:
@@ -2124,32 +2128,18 @@ class Assembler:
                         seen_unique[lname] = lval
                 for lname, abs_w in seen_unique.items():
                     if abs_w == 0:
-                        continue  # ゼロは誤検出の恐れあり → スキップ
-                    found_reloc = False
-                    for nbytes in [8, 4, 2]:
-                        if found_reloc:
-                            break
-                        # リトルエンディアン展開
-                        le = [(abs_w >> (8 * i)) & 0xff for i in range(nbytes)]
-                        # 上位バイトがすべてゼロでも下位バイトに意味がある場合は除く
-                        # (nbytes=2のとき上位が0ならほぼ偶然一致の可能性大 → スキップ)
-                        if nbytes <= 4 and all(b == 0 for b in le[nbytes // 2:]):
-                            continue
-                        for j in range(len(objl) - nbytes + 1):
-                            chunk = [v & 0xff for v in objl[j:j + nbytes]]
-                            if chunk == le:
-                                # 見つかった: セクション相対バイトオフセット
-                                sec_rel = (self.state.pc + j - sec_start_w) * bpw_r
-                                # プレースホルダをゼロクリア
-                                for b in range(nbytes):
-                                    objl[j + b] = 0
-                                # リロケーションタイプ: R_X86_64_64=1, R_X86_64_32=10
-                                rtype = 1 if nbytes == 8 else (10 if nbytes == 4 else 0)
-                                if rtype != 0:
-                                    self.state.relocations.append(
-                                        (sec_name_r, sec_rel, lname, rtype, 0))
-                                found_reloc = True
-                                break
+                        continue
+                    for j in range(len(objl)):
+                        if objl[j] == abs_w:
+                            # 見つかった: セクション相対バイトオフセット
+                            sec_rel = (self.state.pc + j - sec_start_w) * bpw_r
+                            # プレースホルダをゼロクリア（word 全体）
+                            objl[j] = 0
+                            # 常に R_X86_64_64 (type=1)
+                            rtype = 1
+                            self.state.relocations.append(
+                                (sec_name_r, sec_rel, lname, rtype, 0))
+                            # 同一ラベルが複数 word に現れる場合もすべて処理
 
             for cnt in range(of):
                 self.binary_writer.outbin(self.state.pc + cnt, objl[cnt])
