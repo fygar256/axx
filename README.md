@@ -811,7 +811,7 @@ LISP machine programs are not assembly language.
 
 -nan, inf, and -inf processing can only be used in flt{x}, dbl{x}, and qad{x}. Nan, inf, and -inf are first loaded into registers or memory, or constants are taken as operands, and then the processor performs the calculations, so this may be sufficient.
 
-- Use the preprocessor for the macro function. It would be nice if there were more advanced macros.
+- Use a preprocessor for macro functionality. To cover all assembly languages, a high-performance macro processor is needed to translate functional,structured and such high-level assembly language into imperative assembly language.
 
 - For now, when the linker loader specifies option `-i`, it imports labels from the TSV file, and when the option `-e` is specified, the label specified in .export is exported to the file in TSV along with the section/segment to which the label belongs, so this is used.
 
