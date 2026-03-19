@@ -2235,12 +2235,24 @@ class Assembler:
                     groups.append((lname, abs_w, widx, gj - gi))
                     gi = gj
 
+                # アーキテクチャごとのリロケーションタイプ表
+                # {machine: {num_bytes: rtype}}
+                # 未定義サイズは 0 → スキップ
+                _RTYPE_MAP = {
+                    62:  {8: 1,  4: 10, 2: 12, 1: 14},  # EM_X86_64
+                    3:   {4: 1,  2: 2,  1: 7},           # EM_386   (R_386_32/16/8)
+                    40:  {4: 2,  2: 250},                 # EM_ARM   (R_ARM_ABS32/16)
+                    183: {8: 257, 4: 258},                # EM_AARCH64 (R_AARCH64_ABS64/32)
+                    243: {8: 2,  4: 3},                   # EM_RISCV (R_RISCV_64/32)
+                    20:  {4: 1},                          # EM_PPC   (R_PPC_ADDR32)
+                }
+                _rmap = _RTYPE_MAP.get(self.state.elf_machine, {8: 1, 4: 2, 2: 3, 1: 4})
+
                 for lname, abs_w, first_widx, num_words in groups:
                     num_bytes = num_words * bpw_r
-                    # リロケーションタイプ: R_X86_64_64=1, R_X86_64_32=10
-                    rtype = 1 if num_bytes == 8 else (10 if num_bytes == 4 else 0)
+                    rtype = _rmap.get(num_bytes, 0)
                     if rtype == 0:
-                        continue  # 2 バイト以下や中途半端なサイズはスキップ
+                        continue  # このサイズのリロケーションタイプが未定義 → スキップ
                     if first_widx >= len(objl):
                         continue  # 安全ガード
                     # セクション相対バイトオフセット
