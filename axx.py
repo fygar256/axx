@@ -130,6 +130,8 @@ class AssemblerState:
         # None のとき未生成。run() 終了後に cleanup される。
         self.stdin_tmp_path: str | None = None
 
+        # ELF OSABI (FreeBSD==9,Linux==0)
+        self.osabi: int = 9 # default OSABI==9(FreeBSD)
         # ELF relocatable object file output (-r / -m options)
         self.elf_objfile: str = ""
         self.elf_machine: int = 62   # default EM_X86_64
@@ -2457,7 +2459,7 @@ class Assembler:
         # ------------------------------------------------------------------ #
         def _pack_ehdr(e_type, e_machine, e_shoff, e_shnum, e_shstrndx):
             ident = (b'\x7fELF'
-                     + bytes([2, 1, 1, 9])   # class64, LSB, ver1, ELFOSABI_FREEBSD
+                     + bytes([2, 1, 1, self.state.osabi])   # class64, LSB, ver1, ELFOSABI
                      + b'\x00' * 8)
             return ident + _struct.pack('<HHIQQQIHHHHHH',
                 e_type, e_machine,
@@ -2785,6 +2787,9 @@ class Assembler:
                         help='Pattern definition file (.axx)')
         ap.add_argument('sourcefile', nargs='?', default=None,
                         help='Assembly source file (.s). Omit for interactive mode.')
+        ap.add_argument('--osabi', dest='elf_osabi', type=str, default='FreeBSD',
+                        choices=['FreeBSD', 'Linux'],
+                        help='ELF OSABI value (default: FreeBSD)')
         ap.add_argument('-b', dest='outfile', default='',
                         metavar='OUTFILE',
                         help='Output binary file')
@@ -2818,6 +2823,9 @@ class Assembler:
 
         args = ap.parse_args()
 
+        # make osabi table
+        osabitbl = {'Linux':0,'FreeBSD':9}
+
         # --- Apply parsed options to assembler state ---
         self.state.outfile      = args.outfile
         self.state.expfile      = args.expfile
@@ -2825,6 +2833,7 @@ class Assembler:
         self.state.impfile      = args.impfile
         self.state.elf_objfile  = args.elf_objfile
         self.state.elf_machine  = args.elf_machine
+        self.state.osabi        = osabitbl[args.elf_osabi]
 
         # Load pattern file
         self.state.pat = self.pattern_reader.readpat(args.patternfile)

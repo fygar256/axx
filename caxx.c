@@ -630,6 +630,7 @@ typedef struct {
     char outfile[512];
     char expfile[512];
     char impfile[512];
+    int  osabi;
 
     uint256_t pc;
     uint256_t padding;
@@ -749,6 +750,7 @@ static void state_init(AsmState *st) {
     st->endian_big = 0;
     st->pas = 0;
     st->debug = 0;
+    st->osabi = 9;
     st->ln = 0;
     sv_init(&st->fnstack);
     is_init(&st->lnstack);
@@ -3470,7 +3472,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     /* ELF header */
     {uint8_t eh[64]={0};
      eh[0]=0x7f;eh[1]='E';eh[2]='L';eh[3]='F';
-     eh[4]=2;eh[5]=1;eh[6]=1;eh[7]=9; /* ELFCLASS64 ELFDATA2LSB EV_CURRENT ELFOSABI_FREEBSD */
+     eh[4]=2;eh[5]=1;eh[6]=1;eh[7]=st->osabi; /* ELFCLASS64 ELFDATA2LSB EV_CURRENT ELFOSABI */
      WEO_LE2(eh+16,1); WEO_LE2(eh+18,(uint16_t)machine); WEO_LE4(eh+20,1);
      WEO_LE8(eh+40,shdr_fo);
      WEO_LE2(eh+52,64); WEO_LE2(eh+58,64);
@@ -3682,10 +3684,29 @@ static int imp_label(Assembler *asmb, const char *l){
  * main
  * ========================================================= */
 static void print_usage(const char *prog){
-    printf("usage: %s patternfile [sourcefile] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-m machine]\n",prog);
+    printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-m machine]\n",prog);
     printf("axx general assembler programmed and designed by Taisuke Maekawa\n");
 }
 
+typedef struct {
+    char    s[16];
+    int     nu;
+} OSABIENT;
+
+static OSABIENT osabitbl[]={{"Linux",0},{"FreeBSD",9},{"EOTBL",-1}};
+
+int find_osabi( char *osname ) {
+    int idx = 0;
+    while (1) {
+        if (strcmp(osabitbl[idx].s,"EOTBL")==0)
+            return -1;
+        if (strcmp(osabitbl[idx].s,osname)==0)
+            return osabitbl[idx].nu;
+        idx++;
+    }
+}
+
+    
 int main(int argc, char *argv[]){
     if(argc==1){ print_usage(argv[0]); return 0; }
 
@@ -3695,10 +3716,11 @@ int main(int argc, char *argv[]){
 
     const char *patternfile=NULL, *sourcefile=NULL;
     const char *expfile_elf=NULL;
+    char osabistr[16]="FreeBSD"; /* ELF_OSABI Default: FreeBSD */
 
     for(int i=1;i<argc;i++){
-        if(strcmp(argv[i],"-b")==0&&i+1<argc){ strncpy(st->outfile,argv[++i],sizeof(st->outfile)-1); }
-        else if(strcmp(argv[i],"-e")==0&&i+1<argc){ strncpy(st->expfile,argv[++i],sizeof(st->expfile)-1); }
+        if(strcmp(argv[i],"--osabi")==0&&i+1<argc){ strncpy(osabistr,argv[++i],sizeof(osabistr-1)); }
+        else if(strcmp(argv[i],"-b")==0&&i+1<argc){ strncpy(st->outfile,argv[++i],sizeof(st->outfile)-1); }
         else if(strcmp(argv[i],"-E")==0&&i+1<argc){ expfile_elf=argv[++i]; }
         else if(strcmp(argv[i],"-i")==0&&i+1<argc){ strncpy(st->impfile,argv[++i],sizeof(st->impfile)-1); }
         else if(strcmp(argv[i],"-o")==0&&i+1<argc){ strncpy(st->elf_objfile,argv[++i],sizeof(st->elf_objfile)-1); }
@@ -3708,6 +3730,12 @@ int main(int argc, char *argv[]){
             else if(!sourcefile) sourcefile=argv[i];
         }
     }
+
+    int osa = find_osabi(osabistr);
+    if (osa==-1) {
+        osa = find_osabi("FreeBSD"); /* Fall back to Default FreeBSD */
+    }
+    st->osabi = osa;
 
     if(!patternfile){ print_usage(argv[0]); return 1; }
 
