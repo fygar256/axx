@@ -431,6 +431,8 @@ If the concatenation ends with '!!!!', it sets a stop bit.
 
 Labels can be defined from the assembly line in the following way.
 
+Labels defined with `.equ` lose their relocation information and are treated as constants.
+
 ```
 label1:
 label2: .equ 0x10
