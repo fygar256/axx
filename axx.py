@@ -139,8 +139,15 @@ class AssemblerState:
         self.relocations = []
         # _elf_tracking: True while assembling an instruction during pass2 ELF output
         self._elf_tracking = False
-        # _elf_label_refs_seen: label refs collected during current instruction assembly
-        self._elf_label_refs_seen = []  # [(label_name, abs_word_value)]
+        # _elf_label_refs_seen: label refs collected during current instruction assembly.
+        # Each entry: (label_name, abs_word_value, word_idx)
+        # word_idx は makeobj() 内で参照が発生した時点の objl インデックス。
+        # makeobj() の外（パターンマッチやサイズ式評価中）での参照は word_idx = -1 となり
+        # リロケーション生成の対象から除外される。
+        self._elf_label_refs_seen = []  # [(label_name, abs_word_value, word_idx)]
+        # makeobj() が現在生成中のワードインデックス（objl への追加前の len(objl)）。
+        # -1 は makeobj() の外を示すセンチネル値。
+        self._elf_current_word_idx: int = -1
 
 
 class StringUtils:
@@ -551,8 +558,10 @@ class LabelManager:
             self.state.error_undefined_label = True
             return v
         # ELF リロケーション追跡: pass2 でラベル参照をキャプチャ
+        # word_idx = _elf_current_word_idx: makeobj() 内なら >=0、外なら -1(センチネル)
         if self.state._elf_tracking and not self.state.error_undefined_label:
-            self.state._elf_label_refs_seen.append((k, v))
+            self.state._elf_label_refs_seen.append(
+                (k, v, self.state._elf_current_word_idx))
         return v
     
     def put_value(self, k, v, s):
@@ -1623,9 +1632,14 @@ class ObjectGenerator:
             if s[idx] == ';':
                 semicolon = True
                 idx += 1
-            
+
+            # ELF リロケーション追跡: このワードを生成する式評価の開始時点で
+            # 現在のワードインデックス（objl への追加前の長さ）を記録する。
+            # get_value() がこの値を参照して (label, value, word_idx) を記録する。
+            self.state._elf_current_word_idx = len(objl)
+
             x, idx = self.expr_eval.expression_pat(s, idx)
-            
+
             if (semicolon == True and x != 0) or (semicolon == False):
                 objl += [x]
             
@@ -2016,6 +2030,10 @@ class Assembler:
                     if self.pattern_matcher.match0(lin, i[0]) == True:
                         self.directive_proc.error(i[1])
                         objl = self.obj_gen.makeobj(i[2])
+                        # makeobj() 終了後はセンチネルに戻す。
+                        # 以降のサイズ式評価 expression_pat(i[3]) で発生する
+                        # ラベル参照は word_idx=-1 となりリロケーション対象外になる。
+                        self.state._elf_current_word_idx = -1
                         idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                         loopflag = False
                         break
@@ -2040,6 +2058,7 @@ class Assembler:
                 if self.pattern_matcher.match0(lin, i[0]) == True:
                     self.directive_proc.error(i[1])
                     objl = self.obj_gen.makeobj(i[2])
+                    self.state._elf_current_word_idx = -1  # makeobj 後リセット
                     idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                     loopflag = False
                     break
@@ -2094,6 +2113,7 @@ class Assembler:
         if self.state.elf_objfile and self.state.pas == 2:
             self.state._elf_tracking = True
             self.state._elf_label_refs_seen = []
+            self.state._elf_current_word_idx = -1  # makeobj 外はセンチネル -1
 
         idxs, objl, flag, idx = self.lineassemble2(line, 0)
 
@@ -2106,50 +2126,60 @@ class Assembler:
             of = len(objl)
 
             # ------------------------------------------------------------------ #
-            # ELF リロケーション検出                                               #
-            # 命令バイト列(objl)の中にラベルの絶対アドレスが埋め込まれているか    #
-            # スキャンし、見つかった箇所をゼロクリアしてリロケーションを記録する。 #
+            # ELF リロケーション検出（トラッキング方式）                            #
+            #                                                                       #
+            # makeobj() 内で get_value() が呼ばれたとき、(lname, val, word_idx)    #
+            # として _elf_label_refs_seen に記録済み。                              #
+            # word_idx は objl への追加前の len(objl)（=ワード位置）。              #
+            # makeobj() 外（パターンマッチ・サイズ式）の参照は word_idx=-1 のため  #
+            # 無視される。                                                          #
+            # 同一ラベルが連続ワードを占める場合（例: bts=8 で 64bit アドレスを    #
+            # 8 バイトに分割して格納）は連続グループとして1エントリにまとめる。     #
             # ------------------------------------------------------------------ #
             if self.state.elf_objfile and self.state.pas == 2 and objl and self.state._elf_label_refs_seen:
                 bpw_r = max(1, (self.state.bts + 7) // 8)
-                # セクション開始ワードアドレス
                 sec_name_r = self.state.current_section
                 sec_start_w = 0
                 if sec_name_r in self.state.sections:
                     sec_start_w = self.state.sections[sec_name_r][0]
-                # ラベルを重複排除
-                seen_unique = {}
-                for (lname, lval) in self.state._elf_label_refs_seen:
-                    if lname not in seen_unique:
-                        seen_unique[lname] = lval
-                for lname, abs_w in seen_unique.items():
-                    if abs_w == 0:
-                        continue  # ゼロは誤検出の恐れあり → スキップ
-                    found_reloc = False
-                    for nbytes in [8, 4, 2]:
-                        if found_reloc:
-                            break
-                        # リトルエンディアン展開
-                        le = [(abs_w >> (8 * i)) & 0xff for i in range(nbytes)]
-                        # 上位バイトがすべてゼロでも下位バイトに意味がある場合は除く
-                        # (nbytes=2のとき上位が0ならほぼ偶然一致の可能性大 → スキップ)
-                        if nbytes <= 4 and all(b == 0 for b in le[nbytes // 2:]):
-                            continue
-                        for j in range(len(objl) - nbytes + 1):
-                            chunk = [v & 0xff for v in objl[j:j + nbytes]]
-                            if chunk == le:
-                                # 見つかった: セクション相対バイトオフセット
-                                sec_rel = (self.state.pc + j - sec_start_w) * bpw_r
-                                # プレースホルダをゼロクリア
-                                for b in range(nbytes):
-                                    objl[j + b] = 0
-                                # リロケーションタイプ: R_X86_64_64=1, R_X86_64_32=10
-                                rtype = 1 if nbytes == 8 else (10 if nbytes == 4 else 0)
-                                if rtype != 0:
-                                    self.state.relocations.append(
-                                        (sec_name_r, sec_rel, lname, rtype, 0))
-                                found_reloc = True
-                                break
+
+                # word_idx >= 0（makeobj 内の参照）のみを対象とし、ワード順にソート
+                valid_refs = [
+                    (ln, aw, wi)
+                    for (ln, aw, wi) in self.state._elf_label_refs_seen
+                    if wi >= 0
+                ]
+                valid_refs.sort(key=lambda r: r[2])
+
+                # 同一ラベルの連続ワード参照をひとつのリロケーショングループにまとめる
+                # 例: bts=8 で 64bit アドレスを 8 バイトに分割 → 8 連続エントリ → 1 グループ
+                groups = []  # [(lname, abs_w, first_word_idx, num_words)]
+                gi = 0
+                while gi < len(valid_refs):
+                    lname, abs_w, widx = valid_refs[gi]
+                    gj = gi + 1
+                    while (gj < len(valid_refs)
+                           and valid_refs[gj][0] == lname
+                           and valid_refs[gj][2] == widx + (gj - gi)):
+                        gj += 1
+                    groups.append((lname, abs_w, widx, gj - gi))
+                    gi = gj
+
+                for lname, abs_w, first_widx, num_words in groups:
+                    num_bytes = num_words * bpw_r
+                    # リロケーションタイプ: R_X86_64_64=1, R_X86_64_32=10
+                    rtype = 1 if num_bytes == 8 else (10 if num_bytes == 4 else 0)
+                    if rtype == 0:
+                        continue  # 2 バイト以下や中途半端なサイズはスキップ
+                    if first_widx >= len(objl):
+                        continue  # 安全ガード
+                    # セクション相対バイトオフセット
+                    sec_rel = (self.state.pc + first_widx - sec_start_w) * bpw_r
+                    # プレースホルダをゼロクリア
+                    for b in range(num_words):
+                        if first_widx + b < len(objl):
+                            objl[first_widx + b] = 0
+                    self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, 0))
 
             for cnt in range(of):
                 self.binary_writer.outbin(self.state.pc + cnt, objl[cnt])
