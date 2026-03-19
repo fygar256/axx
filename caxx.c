@@ -1198,10 +1198,17 @@ static void fileassemble(Assembler *asmb, const char *fn);
  * ========================================================= */
 struct Assembler {
     AsmState st;
+    /* imp_label: section info parsed from the import TSV file.
+     * Built while reading section lines; used by subsequent label lines
+     * to resolve label -> section membership.
+     * Kept in Assembler (not AsmState) because it belongs to the import
+     * phase only and must not be confused with st.sections (assembly output). */
+    SecMap imp_sections;
 };
 
 static void assembler_init(Assembler *a){
     state_init(&a->st);
+    secmap_init(&a->imp_sections);
 }
 
 /* =========================================================
@@ -3126,8 +3133,42 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                 if(_rtype != 0 && _widx < objl.len){
                     int64_t _sec_rel = (int64_t)((cur_pc + (uint64_t)_widx - sec_start)
                                                   * (uint64_t)bpw);
-                    /* RELA format: keep original bytes (no zero-clear).
-                     * The linker resolves: section_data[r_offset] + r_addend. */
+                    /* RELA addend computation:
+                     *   addend = (value stored in objl word(s)) − (label absolute address)
+                     *
+                     * The old code fixed addend=0.  For a reference like "label+8" the
+                     * assembled word holds label_value+8, but with addend=0 the linker
+                     * writes S+0 (symbol address only) and loses the +8 offset.
+                     *
+                     * Fix: reconstruct the scalar stored in the word group using the
+                     * assembler's current endianness and bts setting, then subtract the
+                     * label's absolute value.  The result is the constant addend that
+                     * must be preserved across relocation. */
+                    int _bts = st->bts;
+                    uint64_t _wmask = (_bts < 64)
+                        ? (((uint64_t)1 << _bts) - 1)
+                        : (uint64_t)-1;
+                    uint64_t _raw_val = 0;
+                    if(!st->endian_big){
+                        /* little-endian: word[0] is least-significant */
+                        for(int _k = 0; _k < _nwords; _k++){
+                            int _wk = _widx + _k;
+                            if(_wk < objl.len){
+                                uint64_t _wv = u256_to_u64(objl.data[_wk]) & _wmask;
+                                _raw_val |= _wv << (_bts * _k);
+                            }
+                        }
+                    } else {
+                        /* big-endian: word[0] is most-significant */
+                        for(int _k = 0; _k < _nwords; _k++){
+                            int _wk = _widx + _k;
+                            if(_wk < objl.len){
+                                uint64_t _wv = u256_to_u64(objl.data[_wk]) & _wmask;
+                                _raw_val = (_raw_val << _bts) | _wv;
+                            }
+                        }
+                    }
+                    int64_t _addend = (int64_t)(_raw_val - _valid[_gi].val);
                     if(st->reloc_count >= st->reloc_cap){
                         st->reloc_cap = st->reloc_cap ? st->reloc_cap*2 : 16;
                         st->relocations = realloc(st->relocations,
@@ -3138,7 +3179,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     st->relocations[st->reloc_count].sec_offset = _sec_rel;
                     st->relocations[st->reloc_count].sym        = strdup(_lname);
                     st->relocations[st->reloc_count].rtype      = _rtype;
-                    st->relocations[st->reloc_count].addend     = 0;
+                    st->relocations[st->reloc_count].addend     = _addend;
                     st->reloc_count++;
                 }
                 _gi = _gj;
@@ -3567,20 +3608,74 @@ static void setpatsymbols(Assembler *asmb){
  * imp_label
  * ========================================================= */
 static int imp_label(Assembler *asmb, const char *l){
-    AsmState *st=&asmb->st;
-    int idx=axx_skipspc(l,0);
-    char section[512];
-    idx=axx_get_label_word(l,idx,st->lwordchars,section,sizeof(section));
-    idx=axx_skipspc(l,idx);
-    char label[512];
-    idx=axx_get_label_word(l,idx,st->lwordchars,label,sizeof(label));
-    if(!label[0]) return 0;
-    idx=axx_skipspc(l,idx);
-    int io;
-    uint256_t v=expr_expression_asm(asmb,l,idx,&io);
-    if(io==idx) return 0;
-    label_put_value(st,label,v,section,0);
-    return 1;
+    /* Parse TSV format produced by WRITE_EXPORT.
+     *
+     * Line formats (tab-separated):
+     *   section_name\tstart_hex\tsize_hex\t[flag]  <- section line (>=3 fields)
+     *   label_name\tvalue_hex                      <- label line  (2 fields)
+     *
+     * The old implementation used axx_skipspc() (space-only skip) together
+     * with axx_get_label_word() and assumed a space-separated
+     * "section label value" layout.  WRITE_EXPORT writes TAB-separated TSV
+     * with section and label information on separate lines, so the old code
+     * never parsed a single line correctly – imp_label always returned 0.
+     *
+     * Fix: split on '\t', distinguish line kind by field count, build a
+     * running imp_sections table for label→section resolution.
+     */
+
+    /* strip trailing CR/LF */
+    char buf[4096];
+    strncpy(buf, l, sizeof(buf)-1); buf[sizeof(buf)-1] = '\0';
+    int blen = (int)strlen(buf);
+    while(blen > 0 && (buf[blen-1]=='\n'||buf[blen-1]=='\r')) buf[--blen] = '\0';
+    if(!buf[0]) return 0;
+
+    /* split on '\t' – at most 5 fields needed */
+    char *fields[5]; int nfields = 0;
+    char *p = buf;
+    while(nfields < 5){
+        fields[nfields++] = p;
+        char *tab = strchr(p, '\t');
+        if(!tab) break;
+        *tab = '\0';
+        p = tab + 1;
+    }
+
+    if(nfields >= 3){
+        /* section line: record start/size for later label->section lookup */
+        const char *sname = fields[0];
+        char *endp;
+        uint64_t start = strtoull(fields[1], &endp, 16);
+        if(endp == fields[1]) return 0;
+        uint64_t size  = strtoull(fields[2], &endp, 16);
+        if(endp == fields[2]) return 0;
+        secmap_set(&asmb->imp_sections, sname,
+                   u256_from_u64(start), u256_from_u64(size));
+        return 1;
+    }
+
+    if(nfields == 2){
+        const char *label = fields[0];
+        if(!label[0]) return 0;
+        char *endp;
+        uint64_t v = strtoull(fields[1], &endp, 16);
+        if(endp == fields[1]) return 0;
+
+        /* determine section by range lookup in previously parsed sections */
+        const char *section = ".text";
+        for(int i = 0; i < asmb->imp_sections.count; i++){
+            SecEntry *se = asmb->imp_sections.order[i];
+            uint64_t s0 = u256_to_u64(se->start);
+            uint64_t sz = u256_to_u64(se->size);
+            if(sz > 0 && v >= s0 && v < s0 + sz){ section = se->name; break; }
+            if(sz == 0 && v == s0)               { section = se->name; break; }
+        }
+        label_put_value(&asmb->st, label, u256_from_u64(v), section, 0);
+        return 1;
+    }
+
+    return 0;
 }
 
 /* =========================================================

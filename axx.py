@@ -2014,6 +2014,10 @@ class Assembler:
         self.vliw_proc = VLIWProcessor(self.state, self.expr_eval, self.binary_writer)
         self.asm_directive_proc = AssemblyDirectiveProcessor(self.state, self.expr_eval, 
                                                              self.binary_writer, self.label_manager, self.parser)
+        # セクション情報の一時記録テーブル（imp_label が使用）。
+        # アセンブリ中に構築される state.sections とは独立した辞書で、
+        # import ファイルの解析中のみ参照される。
+        self._imp_sections: dict = {}  # {sname: (start, size)}
     
     def include_asm(self, l1, l2):
         """Include directive"""
@@ -2257,9 +2261,33 @@ class Assembler:
                         continue  # 安全ガード
                     # セクション相対バイトオフセット
                     sec_rel = (self.state.pc + first_widx - sec_start_w) * bpw_r
-                    # RELA形式: バイト列は元の値をそのまま残す（ゼロクリアしない）。
-                    # リンカは section_data[sec_rel] + r_addend でシンボル値を解決する。
-                    self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, 0))
+
+                    # RELA addend の計算:
+                    #   RELA 形式では r_addend がシンボル参照の定数オフセットを保持する。
+                    #   リンカは "S + A"（S=シンボル最終アドレス, A=addend）でフィールドを
+                    #   上書きするため、addend = (objl に書き込まれた値) - (ラベルの絶対値)
+                    #   とすることで label+N のような式の N が失われなくなる。
+                    #
+                    #   旧実装は addend を常に 0 に固定していたため、label+N の N が
+                    #   リンク後に消え、誤ったアドレスが生成される問題があった。
+                    #
+                    #   複数ワードで1つのアドレスを表す場合（bts=8 で 64bit を 8 バイトに
+                    #   分割するケース等）は、ワード列を結合してスカラ値を復元する。
+                    word_mask = (1 << self.state.bts) - 1
+                    if self.state.endian == 'little':
+                        raw_val = 0
+                        for k in range(num_words):
+                            widx_k = first_widx + k
+                            if widx_k < len(objl):
+                                raw_val |= (int(objl[widx_k]) & word_mask) << (self.state.bts * k)
+                    else:
+                        raw_val = 0
+                        for k in range(num_words):
+                            widx_k = first_widx + k
+                            if widx_k < len(objl):
+                                raw_val = (raw_val << self.state.bts) | (int(objl[widx_k]) & word_mask)
+                    addend = raw_val - abs_w
+                    self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend))
 
             for cnt in range(of):
                 self.binary_writer.outbin(self.state.pc + cnt, objl[cnt])
@@ -2344,20 +2372,58 @@ class Assembler:
         return af
     
     def imp_label(self, l):
-        """Import label"""
-        idx = StringUtils.skipspc(l, 0)
-        section, idx = self.parser.get_label_word(l, idx)
-        idx = StringUtils.skipspc(l, idx)
-        label, idx = self.parser.get_label_word(l, idx)
-        if label == '':
+        """Import label from exported TSV format (produced by _write_export).
+
+        Line formats (tab-separated):
+          section_name  start_hex  size_hex  [flag]   <- section line (≥3 fields, skip)
+          label_name    value_hex                     <- label line (2 fields, import)
+
+        旧実装は "section label value" の空白区切り3トークンを仮定していたが、
+        _write_export が出力するのはタブ区切り TSV であり、フォーマットが
+        根本的に食い違っていた。さらに skipspc() はタブをスキップしないため
+        タブ区切りの先頭フィールド解析も常に失敗していた。
+        修正後は str.split('\\t') で TSV を正しく分割し、フィールド数で行種別を
+        判定する。セクション行は self._imp_sections に記録し、後続のラベル行が
+        セクション名を逆引きできるようにする。
+        """
+        l = l.rstrip('\r\n')
+        if not l:
             return False
-        idx = StringUtils.skipspc(l, idx)
-        v, new_idx = self.expr_eval.expression_asm(l, idx)
-        if new_idx == idx:
-            return False
-        idx = new_idx
-        self.label_manager.put_value(label, v, section)
-        return True
+
+        fields = l.split('\t')
+
+        if len(fields) >= 3:
+            # Section line: record for later label→section mapping.
+            sname = fields[0]
+            try:
+                start = int(fields[1], 16)
+                size  = int(fields[2], 16)
+            except ValueError:
+                return False
+            self._imp_sections[sname] = (start, size)
+            return True
+
+        if len(fields) == 2:
+            label = fields[0]
+            if not label:
+                return False
+            try:
+                v = int(fields[1], 16)
+            except ValueError:
+                return False
+            # Determine section by range lookup in previously parsed section table.
+            section = '.text'
+            for sname, (start, size) in self._imp_sections.items():
+                if size > 0 and start <= v < start + size:
+                    section = sname
+                    break
+                if size == 0 and v == start:
+                    section = sname
+                    break
+            self.label_manager.put_value(label, v, section)
+            return True
+
+        return False
     
     def printaddr(self, pc):
         """Print address"""
