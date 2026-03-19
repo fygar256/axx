@@ -375,6 +375,7 @@ typedef struct LabelEntry {
     char          *key;
     uint256_t      value;
     char          *section;
+    int            is_equ;   /* 1 if defined via .equ – not relocatable */
     struct LabelEntry *next;
 } LabelEntry;
 
@@ -409,15 +410,15 @@ static LabelEntry *lmap_find(LabelMap *m, const char *key) {
     return NULL;
 }
 static int lmap_contains(LabelMap *m, const char *key) { return lmap_find(m,key)!=NULL; }
-static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *sec) {
+static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *sec, int is_equ) {
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
     for(LabelEntry*e=m->buckets[h];e;e=e->next){
         if(strcmp(e->key,key)==0){
-            e->value=val; free(e->section); e->section=strdup(sec); return;
+            e->value=val; free(e->section); e->section=strdup(sec); e->is_equ=is_equ; return;
         }
     }
     LabelEntry *e=calloc(1,sizeof(LabelEntry));
-    e->key=strdup(key); e->value=val; e->section=strdup(sec);
+    e->key=strdup(key); e->value=val; e->section=strdup(sec); e->is_equ=is_equ;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
 }
 static void lmap_delete(LabelMap *m, const char *key) {
@@ -693,10 +694,24 @@ typedef struct {
 
     /* ELF relocation tracking (active during pass2 when elf_objfile is set) */
     int        elf_tracking;                /* 1 while assembling one instruction */
-    /* dynamic array of (label_name, abs_word_value) refs seen in current insn */
-    struct { char *name; uint64_t val; } *elf_refs;
+    /* dynamic array of refs seen in current insn: (name, val, word_idx)
+     * word_idx = index into objl at which the reference was made (-1 = outside makeobj) */
+    struct { char *name; uint64_t val; int word_idx; } *elf_refs;
     int        elf_refs_len;
     int        elf_refs_cap;
+    /* makeobj() word-index sentinel: set to len(objl) before each expr eval,
+     * -1 outside makeobj (sentinel). */
+    int        elf_current_word_idx;
+    /* variable -> label mapping captured during match() !var evaluation.
+     * Indexed by var letter - 'a'.
+     * set=0: unset  set=1: valid  set=-1: conflict (compound expr) */
+    struct {
+        int      set;
+        char    *label_name;
+        uint64_t label_val;
+    }          elf_var_to_label[26];
+    /* current variable being captured by match() !var; '\0' = not capturing */
+    char       elf_capturing_var;
     /* accumulated relocations across all of pass2 */
     struct {
         char   *section;
@@ -749,6 +764,13 @@ static void state_init(AsmState *st) {
     st->elf_refs = NULL;
     st->elf_refs_len = 0;
     st->elf_refs_cap = 0;
+    st->elf_current_word_idx = -1;
+    for(int _vi=0;_vi<26;_vi++){
+        st->elf_var_to_label[_vi].set = 0;
+        st->elf_var_to_label[_vi].label_name = NULL;
+        st->elf_var_to_label[_vi].label_val = 0;
+    }
+    st->elf_capturing_var = '\0';
     st->relocations = NULL;
     st->reloc_count = 0;
     st->reloc_cap = 0;
@@ -1296,17 +1318,40 @@ static uint256_t label_get_value(AsmState *st, const char *k){
     st->error_undefined_label=0;
     LabelEntry *e=lmap_find(&st->labels,k);
     if(e){
-        /* ELF relocation tracking: record label ref during pass2 instruction */
-        if(st->elf_tracking){
-            if(st->elf_refs_len >= st->elf_refs_cap){
-                st->elf_refs_cap = st->elf_refs_cap ? st->elf_refs_cap*2 : 8;
-                st->elf_refs = realloc(st->elf_refs,
-                    st->elf_refs_cap * sizeof(st->elf_refs[0]));
-                if(!st->elf_refs){ perror("realloc"); exit(1); }
+        /* ELF relocation tracking.
+         * .equ-defined labels are absolute constants – never relocatable. */
+        if(st->elf_tracking && !e->is_equ){
+            if(st->elf_capturing_var != '\0'){
+                /* match() is capturing !var: record variable->label mapping.
+                 * If the same var gets two different get_value() calls the
+                 * expression is compound (e.g. label1+label2) – mark invalid. */
+                int vi = (unsigned char)st->elf_capturing_var - 'a';
+                if(vi >= 0 && vi < 26){
+                    if(st->elf_var_to_label[vi].set == 0){
+                        st->elf_var_to_label[vi].set = 1;
+                        free(st->elf_var_to_label[vi].label_name);
+                        st->elf_var_to_label[vi].label_name = strdup(k);
+                        st->elf_var_to_label[vi].label_val = u256_to_u64(e->value);
+                    } else {
+                        /* conflict – compound expression, not directly relocatable */
+                        st->elf_var_to_label[vi].set = -1;
+                        free(st->elf_var_to_label[vi].label_name);
+                        st->elf_var_to_label[vi].label_name = NULL;
+                    }
+                }
+            } else if(st->elf_current_word_idx >= 0){
+                /* Inside makeobj(): direct label reference in object expression */
+                if(st->elf_refs_len >= st->elf_refs_cap){
+                    st->elf_refs_cap = st->elf_refs_cap ? st->elf_refs_cap*2 : 8;
+                    st->elf_refs = realloc(st->elf_refs,
+                        st->elf_refs_cap * sizeof(st->elf_refs[0]));
+                    if(!st->elf_refs){ perror("realloc"); exit(1); }
+                }
+                st->elf_refs[st->elf_refs_len].name     = strdup(k);
+                st->elf_refs[st->elf_refs_len].val      = u256_to_u64(e->value);
+                st->elf_refs[st->elf_refs_len].word_idx = st->elf_current_word_idx;
+                st->elf_refs_len++;
             }
-            st->elf_refs[st->elf_refs_len].name = strdup(k);
-            st->elf_refs[st->elf_refs_len].val  = u256_to_u64(e->value);
-            st->elf_refs_len++;
         }
         return e->value;
     }
@@ -1322,7 +1367,7 @@ static const char *label_get_section(AsmState *st, const char *k){
     st->error_undefined_label=1;
     return "";
 }
-static int label_put_value(AsmState *st, const char *k, uint256_t v, const char *sec){
+static int label_put_value(AsmState *st, const char *k, uint256_t v, const char *sec, int is_equ){
     if(st->pas==1||st->pas==0){
         if(lmap_contains(&st->labels,k)){
             st->error_already_defined=1;
@@ -1343,7 +1388,7 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
         return 0;
     }
     st->error_already_defined=0;
-    lmap_set(&st->labels,k,v,sec);
+    lmap_set(&st->labels,k,v,sec,is_equ);
     return 1;
 }
 static void label_print_all(AsmState *st){
@@ -1498,7 +1543,38 @@ static double xeval(Assembler *asmb, const char *expr_str){
                 char name[512];
                 if(nlen >= sizeof(name)) nlen = sizeof(name)-1;
                 memcpy(name, expr_str+ns, nlen); name[nlen] = '\0';
-                uint256_t lv = label_get_value(&asmb->st, name);
+                LabelEntry *_xe = lmap_find(&asmb->st.labels, name);
+                uint256_t lv = _xe ? _xe->value : u256_zero();
+                if(!_xe) asmb->st.error_undefined_label = 1;
+                /* ELF tracking: same logic as label_get_value, but check is_equ */
+                if(asmb->st.elf_tracking && _xe && !_xe->is_equ){
+                    if(asmb->st.elf_capturing_var != '\0'){
+                        int _vi = (unsigned char)asmb->st.elf_capturing_var - 'a';
+                        if(_vi >= 0 && _vi < 26){
+                            if(asmb->st.elf_var_to_label[_vi].set == 0){
+                                asmb->st.elf_var_to_label[_vi].set = 1;
+                                free(asmb->st.elf_var_to_label[_vi].label_name);
+                                asmb->st.elf_var_to_label[_vi].label_name = strdup(name);
+                                asmb->st.elf_var_to_label[_vi].label_val = u256_to_u64(lv);
+                            } else {
+                                asmb->st.elf_var_to_label[_vi].set = -1;
+                                free(asmb->st.elf_var_to_label[_vi].label_name);
+                                asmb->st.elf_var_to_label[_vi].label_name = NULL;
+                            }
+                        }
+                    } else if(asmb->st.elf_current_word_idx >= 0){
+                        if(asmb->st.elf_refs_len >= asmb->st.elf_refs_cap){
+                            asmb->st.elf_refs_cap = asmb->st.elf_refs_cap ? asmb->st.elf_refs_cap*2 : 8;
+                            asmb->st.elf_refs = realloc(asmb->st.elf_refs,
+                                asmb->st.elf_refs_cap * sizeof(asmb->st.elf_refs[0]));
+                            if(!asmb->st.elf_refs){ perror("realloc"); exit(1); }
+                        }
+                        asmb->st.elf_refs[asmb->st.elf_refs_len].name     = strdup(name);
+                        asmb->st.elf_refs[asmb->st.elf_refs_len].val      = u256_to_u64(lv);
+                        asmb->st.elf_refs[asmb->st.elf_refs_len].word_idx = asmb->st.elf_current_word_idx;
+                        asmb->st.elf_refs_len++;
+                    }
+                }
                 int64_t lvi = (int64_t)u256_to_i64(lv);
                 int written = snprintf(expanded+out, bufcap-out, "%lld", (long long)lvi);
                 if(written > 0) out += (size_t)written;
@@ -1706,6 +1782,23 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         } else {
             x=var_get(st,ch);
             idx++;
+            /* ELF tracking: if inside makeobj and the variable was captured
+             * from a single label by match(), record it as a relocation ref. */
+            if(st->elf_tracking && st->elf_current_word_idx >= 0){
+                int _vi = (unsigned char)ch - 'a';
+                if(_vi >= 0 && _vi < 26 && st->elf_var_to_label[_vi].set == 1){
+                    if(st->elf_refs_len >= st->elf_refs_cap){
+                        st->elf_refs_cap = st->elf_refs_cap ? st->elf_refs_cap*2 : 8;
+                        st->elf_refs = realloc(st->elf_refs,
+                            st->elf_refs_cap * sizeof(st->elf_refs[0]));
+                        if(!st->elf_refs){ perror("realloc"); exit(1); }
+                    }
+                    st->elf_refs[st->elf_refs_len].name     = strdup(st->elf_var_to_label[_vi].label_name);
+                    st->elf_refs[st->elf_refs_len].val      = st->elf_var_to_label[_vi].label_val;
+                    st->elf_refs[st->elf_refs_len].word_idx = st->elf_current_word_idx;
+                    st->elf_refs_len++;
+                }
+            }
         }
     }
     else if(s[idx]&&char_in(s[idx],st->lwordchars)){
@@ -2212,7 +2305,10 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             a=t[idx_t]; idx_t++;
             if(a=='!'){
                 a=t[idx_t]; idx_t++;
+                /* ELF tracking: record which variable is being captured */
+                st->elf_capturing_var = a;
                 uint256_t v=expr_factor(asmb,s,idx_s,&idx_s);
+                st->elf_capturing_var = '\0';
                 var_put(st,a,v);
                 continue;
             } else {
@@ -2224,7 +2320,10 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     stopchar=t[idx_t];
                     idx_t++;
                 }
+                /* ELF tracking: record which variable is being captured */
+                st->elf_capturing_var = a;
                 uint256_t v=expr_expression_esc(asmb,s,idx_s,stopchar,&idx_s);
+                st->elf_capturing_var = '\0';
                 var_put(st,a,v);
                 if(stopchar && s[idx_s]==stopchar) idx_s++;
                 continue;
@@ -2449,6 +2548,8 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         }
         int semicolon=0;
         if(s[idx]==';'){ semicolon=1; idx++; }
+        /* ELF tracking: record word index before evaluating this slot's expression */
+        st->elf_current_word_idx = objl->len;
         int io;
         uint256_t x=expr_expression_pat(asmb,s,idx,&io);
         idx=io;
@@ -2473,6 +2574,9 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         if(s[idx]==','){idx++;continue;}
         break;
     }
+    /* Reset sentinel: ensure elf_current_word_idx is -1 after makeobj regardless
+     * of how the loop exited (normal, break, or future exception path). */
+    st->elf_current_word_idx = -1;
 }
 
 /* =========================================================
@@ -2663,10 +2767,10 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
             /* Bug 7 fix: pass only the expression tail, not the full line */
             const char *expr_tail = l + idx;
             uint256_t u = expr_expression_asm(asmb, expr_tail, 0, &io);
-            label_put_value(st,label,u,st->current_section);
+            label_put_value(st,label,u,st->current_section,1);  /* is_equ=1 */
             out[0]=0; return out;
         } else {
-            label_put_value(st,label,st->pc,st->current_section);
+            label_put_value(st,label,st->pc,st->current_section,0);  /* is_equ=0 */
             strncpy(out,l+lidx,osz-1); out[osz-1]=0; return out;
         }
     }
@@ -2766,7 +2870,7 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
         if(buf[idx]==':') idx++;
         uint256_t v=label_get_value(st,s);
         const char *sec=label_get_section(st,s);
-        lmap_set(&st->export_labels,s,v,sec);
+        lmap_set(&st->export_labels,s,v,sec,0);
         if(buf[idx]==',') idx++;
     }
     return 1;
@@ -2925,6 +3029,15 @@ static int lineassemble(Assembler *asmb, const char *line_in){
         st->elf_tracking=1;
         for(int ri=0;ri<st->elf_refs_len;ri++) free(st->elf_refs[ri].name);
         st->elf_refs_len=0;
+        st->elf_current_word_idx = -1;  /* sentinel: outside makeobj */
+        /* reset var->label mapping for this instruction */
+        for(int _vi=0;_vi<26;_vi++){
+            st->elf_var_to_label[_vi].set = 0;
+            free(st->elf_var_to_label[_vi].label_name);
+            st->elf_var_to_label[_vi].label_name = NULL;
+            st->elf_var_to_label[_vi].label_val = 0;
+        }
+        st->elf_capturing_var = '\0';
     }
 
     IntVec idxs; iv_init(&idxs);
@@ -2941,66 +3054,97 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     int is_vliw_cont=(st->vliwflag && rest[0]=='!'&&rest[1]=='!');
 
     if(!is_vliw_cont){
-        /* ELF relocation detection:
-         * Scan objl for embedded label addresses; zero them and record relocations.
-         * Mirrors axx.py write_elf_obj: for each unique label ref, try 8/4/2 bytes
-         * little-endian, skip if upper half all-zero (likely false positive). */
+        /* ELF relocation detection (tracking method)
+         * Use word_idx recorded during makeobj()/expr_factor1() to locate each
+         * label reference precisely.  No binary scanning – no false positives.
+         *
+         * Architecture-specific relocation type table (machine -> nbytes -> rtype):
+         *   EM_X86_64(62) : 8→R_X86_64_64(1) 4→R_X86_64_32(10) 2→(12) 1→(14)
+         *   EM_386(3)     : 4→1  2→2  1→7
+         *   EM_ARM(40)    : 4→2  2→250
+         *   EM_AARCH64(183): 8→257  4→258
+         *   EM_RISCV(243) : 8→2  4→3
+         *   EM_PPC(20)    : 4→1
+         *   fallback      : 8→1  4→2  2→3  1→4
+         */
         if(st->elf_objfile[0] && st->pas==2 && objl.len>0 && st->elf_refs_len>0){
             int bpw = (st->bts+7)/8; if(bpw<1) bpw=1;
             const char *sec_name = st->current_section;
-            SecEntry *se = secmap_find(&st->sections, sec_name);
-            uint64_t sec_start = se ? u256_to_u64(se->start) : 0;
+            SecEntry *_rse = secmap_find(&st->sections, sec_name);
+            uint64_t sec_start = _rse ? u256_to_u64(_rse->start) : 0;
             uint64_t cur_pc    = u256_to_u64(st->pc);
 
-            /* deduplicate refs by name (first occurrence wins) */
-            for(int ri=0; ri<st->elf_refs_len; ri++){
-                int dup=0;
-                for(int rj=0;rj<ri;rj++)
-                    if(strcmp(st->elf_refs[ri].name, st->elf_refs[rj].name)==0){dup=1;break;}
-                if(dup) continue;
-
-                uint64_t abs_w = st->elf_refs[ri].val;
-                if(abs_w==0) continue; /* zero → likely false positive */
-
-                int found=0;
-                for(int nbytes=8; nbytes>=2 && !found; nbytes/=2){
-                    /* skip if upper half all zero for narrow widths */
-                    if(nbytes<=4){
-                        int allz=1;
-                        for(int b=nbytes/2; b<nbytes; b++)
-                            if(((abs_w>>(8*b))&0xff)!=0){allz=0;break;}
-                        if(allz) continue;
-                    }
-                    uint8_t le[8];
-                    for(int b=0;b<nbytes;b++) le[b]=(uint8_t)((abs_w>>(8*b))&0xff);
-
-                    for(int j=0; j<=objl.len-nbytes && !found; j++){
-                        int eq=1;
-                        for(int b=0;b<nbytes;b++)
-                            if((u256_to_u64(objl.data[j+b])&0xff)!=le[b]){eq=0;break;}
-                        if(!eq) continue;
-
-                        int64_t sec_rel=(int64_t)((cur_pc+(uint64_t)j-sec_start)*(uint64_t)bpw);
-                        for(int b=0;b<nbytes;b++) objl.data[j+b]=u256_zero();
-                        int rtype=(nbytes==8)?1:(nbytes==4)?10:0;
-                        if(rtype!=0){
-                            if(st->reloc_count>=st->reloc_cap){
-                                st->reloc_cap=st->reloc_cap?st->reloc_cap*2:16;
-                                st->relocations=realloc(st->relocations,
-                                    st->reloc_cap*sizeof(st->relocations[0]));
-                                if(!st->relocations){perror("realloc");exit(1);}
-                            }
-                            st->relocations[st->reloc_count].section  =strdup(sec_name);
-                            st->relocations[st->reloc_count].sec_offset=sec_rel;
-                            st->relocations[st->reloc_count].sym       =strdup(st->elf_refs[ri].name);
-                            st->relocations[st->reloc_count].rtype     =rtype;
-                            st->relocations[st->reloc_count].addend    =0;
-                            st->reloc_count++;
-                        }
-                        found=1;
-                    }
+            /* Per-machine rtype lookup */
+            static const struct { int mach; int b8,b4,b2,b1; } _rm[] = {
+                {62,  1, 10, 12, 14},
+                {3,   0,  1,  2,  7},
+                {40,  0,  2,250,  0},
+                {183,257,258,  0,  0},
+                {243, 2,  3,  0,  0},
+                {20,  0,  1,  0,  0},
+                {0,0,0,0,0}
+            };
+            int _rb8=1,_rb4=2,_rb2=3,_rb1=4;  /* fallback */
+            for(int _ri=0; _rm[_ri].mach; _ri++){
+                if(_rm[_ri].mach == st->elf_machine){
+                    _rb8=_rm[_ri].b8; _rb4=_rm[_ri].b4;
+                    _rb2=_rm[_ri].b2; _rb1=_rm[_ri].b1;
+                    break;
                 }
             }
+            #define RTYPE_FOR(nb) ((nb)==8?_rb8:(nb)==4?_rb4:(nb)==2?_rb2:(nb)==1?_rb1:0)
+
+            /* collect refs with valid word_idx (>= 0), sort by word_idx */
+            typedef struct { const char *name; uint64_t val; int word_idx; } _Ref;
+            _Ref *_valid = (_Ref*)malloc((size_t)st->elf_refs_len * sizeof(_Ref));
+            int _nvalid = 0;
+            for(int _ri=0; _ri<st->elf_refs_len; _ri++){
+                if(st->elf_refs[_ri].word_idx >= 0)
+                    _valid[_nvalid++] = (_Ref){st->elf_refs[_ri].name,
+                                              st->elf_refs[_ri].val,
+                                              st->elf_refs[_ri].word_idx};
+            }
+            /* sort by word_idx */
+            int _cmp_ref(const void *_a, const void *_b){
+                return ((_Ref*)_a)->word_idx - ((_Ref*)_b)->word_idx;
+            }
+            qsort(_valid, (size_t)_nvalid, sizeof(_Ref), _cmp_ref);
+
+            /* group consecutive same-label refs into one relocation entry */
+            int _gi = 0;
+            while(_gi < _nvalid){
+                const char *_lname = _valid[_gi].name;
+                int _widx = _valid[_gi].word_idx;
+                int _gj = _gi + 1;
+                while(_gj < _nvalid
+                      && strcmp(_valid[_gj].name, _lname) == 0
+                      && _valid[_gj].word_idx == _widx + (_gj - _gi))
+                    _gj++;
+                int _nwords = _gj - _gi;
+                int _nbytes = _nwords * bpw;
+                int _rtype  = RTYPE_FOR(_nbytes);
+                if(_rtype != 0 && _widx < objl.len){
+                    int64_t _sec_rel = (int64_t)((cur_pc + (uint64_t)_widx - sec_start)
+                                                  * (uint64_t)bpw);
+                    /* RELA format: keep original bytes (no zero-clear).
+                     * The linker resolves: section_data[r_offset] + r_addend. */
+                    if(st->reloc_count >= st->reloc_cap){
+                        st->reloc_cap = st->reloc_cap ? st->reloc_cap*2 : 16;
+                        st->relocations = realloc(st->relocations,
+                            (size_t)st->reloc_cap * sizeof(st->relocations[0]));
+                        if(!st->relocations){ perror("realloc"); exit(1); }
+                    }
+                    st->relocations[st->reloc_count].section   = strdup(sec_name);
+                    st->relocations[st->reloc_count].sec_offset = _sec_rel;
+                    st->relocations[st->reloc_count].sym        = strdup(_lname);
+                    st->relocations[st->reloc_count].rtype      = _rtype;
+                    st->relocations[st->reloc_count].addend     = 0;
+                    st->reloc_count++;
+                }
+                _gi = _gj;
+            }
+            free(_valid);
+            #undef RTYPE_FOR
         }
 
         for(int ci=0;ci<objl.len;ci++){
@@ -3209,12 +3353,12 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int i=0;i<ncs;i++) weo_sym(0,0x03,0,(uint16_t)(i+1),0,0); /* section syms */
 
     /* sort labels and export_labels by name */
-    typedef struct{const char*name;uint64_t val;} WLK;
+    typedef struct{const char*name;uint64_t val;int is_equ;} WLK;
     int nl=st->labels.count;
     WLK *larr=calloc((size_t)(nl?nl:1),sizeof(WLK));
     {int li=0;for(int bi=0;bi<st->labels.nbuckets;bi++)
         for(LabelEntry*e=st->labels.buckets[bi];e;e=e->next)
-            larr[li++]=(WLK){e->key,u256_to_u64(e->value)};}
+            larr[li++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ};}
     int cmp_wlk(const void*a,const void*b){return strcmp(((WLK*)a)->name,((WLK*)b)->name);}
     qsort(larr,nl,sizeof(WLK),cmp_wlk);
 
@@ -3222,21 +3366,22 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     WLK *earr=calloc((size_t)(ne?ne:1),sizeof(WLK));
     {int ei=0;for(int bi=0;bi<st->export_labels.nbuckets;bi++)
         for(LabelEntry*e=st->export_labels.buckets[bi];e;e=e->next)
-            earr[ei++]=(WLK){e->key,u256_to_u64(e->value)};}
+            earr[ei++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ};}
     qsort(earr,ne,sizeof(WLK),cmp_wlk);
 
     int weo_isexp(const char*nm){for(int i=0;i<ne;i++)if(!strcmp(earr[i].name,nm))return 1;return 0;}
 
     for(int i=0;i<nl;i++){           /* local labels */
         if(weo_isexp(larr[i].name)) continue;
-        WSR sr=weo_shndx(larr[i].val*(uint64_t)bpw);
+        /* .equ labels are absolute constants: use SHN_ABS, not section-relative */
+        WSR sr = larr[i].is_equ ? (WSR){0xfff1, larr[i].val} : weo_shndx(larr[i].val*(uint64_t)bpw);
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
         snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
         weo_sym(noff,0x00,0,sr.shndx,sr.sv,0);
     }
     int first_global=nsyms;
     for(int i=0;i<ne;i++){           /* global symbols */
-        WSR sr=weo_shndx(earr[i].val*(uint64_t)bpw);
+        WSR sr = earr[i].is_equ ? (WSR){0xfff1, earr[i].val} : weo_shndx(earr[i].val*(uint64_t)bpw);
         uint32_t noff=wbb_str(&strtab_bb,earr[i].name);
         snimap[snimap_len++]=(WSNI){earr[i].name,nsyms};
         weo_sym(noff,0x10,0,sr.shndx,sr.sv,0);
@@ -3434,7 +3579,7 @@ static int imp_label(Assembler *asmb, const char *l){
     int io;
     uint256_t v=expr_expression_asm(asmb,l,idx,&io);
     if(io==idx) return 0;
-    label_put_value(st,label,v,section);
+    label_put_value(st,label,v,section,0);
     return 1;
 }
 
@@ -3550,7 +3695,7 @@ int main(int argc, char *argv[]){
             lmap_free(&prev_labels); lmap_init(&prev_labels);
             for(int bi=0; bi<st->labels.nbuckets; bi++)
                 for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
-                    lmap_set(&prev_labels, e->key, e->value, e->section);
+                    lmap_set(&prev_labels, e->key, e->value, e->section, e->is_equ);
 
             if(converged) break;
         }
