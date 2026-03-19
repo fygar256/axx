@@ -2543,10 +2543,15 @@ class Assembler:
         export_keys = set(self.state.export_labels.keys())
         for name, *_lentry in sorted(self.state.labels.items()):
             val, _sec = _lentry[0][0], _lentry[0][1]
+            is_equ = len(_lentry[0]) > 2 and _lentry[0][2]
             if name in export_keys:
                 continue
-            byte_addr = val * bpw
-            shndx, sym_val = _find_shndx(byte_addr)
+            if is_equ:
+                # .equ 定義ラベルは絶対値シンボル (SHN_ABS=0xfff1)
+                shndx, sym_val = 0xfff1, val
+            else:
+                byte_addr = val * bpw
+                shndx, sym_val = _find_shndx(byte_addr)
             name_off = len(strtab); strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x00, 0, shndx, sym_val, 0))
 
@@ -2555,8 +2560,12 @@ class Assembler:
         # global symbols (export_labels, STB_GLOBAL | STT_NOTYPE = 0x10)
         for name, *_eentry in sorted(self.state.export_labels.items()):
             val, _sec = _eentry[0][0], _eentry[0][1]
-            byte_addr = val * bpw
-            shndx, sym_val = _find_shndx(byte_addr)
+            is_equ = len(_eentry[0]) > 2 and _eentry[0][2]
+            if is_equ:
+                shndx, sym_val = 0xfff1, val
+            else:
+                byte_addr = val * bpw
+                shndx, sym_val = _find_shndx(byte_addr)
             name_off = len(strtab); strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x10, 0, shndx, sym_val, 0))
 
