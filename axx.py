@@ -713,7 +713,10 @@ class ExpressionEvaluator:
                 val = 0
                 return hex(0)
             # ELF追跡: get_value() と同じ分岐方針で記録する。
-            if self.state._elf_tracking:
+            # .equ 定義ラベルはリロケーション不要なので除外する。
+            _is_equ = (len(self.state.labels.get(label_name, [])) > 2
+                       and self.state.labels[label_name][2])
+            if self.state._elf_tracking and not _is_equ:
                 if self.state._elf_capturing_var is not None:
                     cv = self.state._elf_capturing_var
                     if cv not in self.state._elf_var_to_label:
