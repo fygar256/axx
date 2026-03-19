@@ -139,15 +139,27 @@ class AssemblerState:
         self.relocations = []
         # _elf_tracking: True while assembling an instruction during pass2 ELF output
         self._elf_tracking = False
-        # _elf_label_refs_seen: label refs collected during current instruction assembly.
-        # Each entry: (label_name, abs_word_value, word_idx)
-        # word_idx は makeobj() 内で参照が発生した時点の objl インデックス。
-        # makeobj() の外（パターンマッチやサイズ式評価中）での参照は word_idx = -1 となり
-        # リロケーション生成の対象から除外される。
+
+        # _elf_label_refs_seen: リロケーション候補。各エントリ: (label_name, abs_value, word_idx)
+        # word_idx は makeobj() 内で参照が発生した objl インデックス（0 以上）。
         self._elf_label_refs_seen = []  # [(label_name, abs_word_value, word_idx)]
+
         # makeobj() が現在生成中のワードインデックス（objl への追加前の len(objl)）。
-        # -1 は makeobj() の外を示すセンチネル値。
+        # -1 は makeobj() の外（センチネル値）。
         self._elf_current_word_idx: int = -1
+
+        # _elf_var_to_label: match() で !x がラベルを直接キャプチャしたとき
+        # 変数名 → (label_name, label_value) を記録する辞書。
+        # makeobj() 内で変数を読む際にリロケーション情報の生成に使う。
+        # ラベル値そのものではなく式（label+offset等）でキャプチャした場合は
+        # この辞書には登録しない（_elf_capturing_var が None に戻る前に複数の
+        # get_value() 呼び出しが起きたケースは登録を取り消す）。
+        self._elf_var_to_label: dict = {}  # {var_letter: (label_name, label_value)}
+
+        # _elf_capturing_var: match() が !x 式を評価している最中にセットされる変数名。
+        # get_value() はこれを見て _elf_var_to_label を更新する。
+        # None のとき「キャプチャ中でない」。
+        self._elf_capturing_var: str | None = None
 
 
 class StringUtils:
@@ -557,15 +569,32 @@ class LabelManager:
             v = 0 if self.state._pass1_size_mode else UNDEF
             self.state.error_undefined_label = True
             return v
-        # ELF リロケーション追跡: pass2 でラベル参照をキャプチャ
-        # word_idx = _elf_current_word_idx: makeobj() 内なら >=0、外なら -1(センチネル)
-        if self.state._elf_tracking and not self.state.error_undefined_label:
-            self.state._elf_label_refs_seen.append(
-                (k, v, self.state._elf_current_word_idx))
+        # ELF リロケーション追跡
+        # is_equ=True の定数ラベルはリロケーション不要なので追跡しない
+        _is_equ = len(self.state.labels[k]) > 2 and self.state.labels[k][2]
+        if self.state._elf_tracking and not self.state.error_undefined_label and not _is_equ:
+            if self.state._elf_capturing_var is not None:
+                # match() が !var 式を評価中: 変数→ラベル名の対応を記録。
+                # 1 回の変数キャプチャで get_value() が 2 回以上呼ばれた場合
+                # （複合式: label1 + label2 など）は信頼できないので登録を取り消す。
+                cv = self.state._elf_capturing_var
+                if cv not in self.state._elf_var_to_label:
+                    self.state._elf_var_to_label[cv] = (k, v)
+                else:
+                    # 2 回目以降 → 複合式なのでリロケーション不可としてマーク
+                    self.state._elf_var_to_label[cv] = None
+            elif self.state._elf_current_word_idx >= 0:
+                # makeobj() 内でオブジェクト式がラベルを直接参照
+                self.state._elf_label_refs_seen.append(
+                    (k, v, self.state._elf_current_word_idx))
         return v
     
-    def put_value(self, k, v, s):
-        """Set label value"""
+    def put_value(self, k, v, s, is_equ=False):
+        """Set label value.
+
+        is_equ=True  : .equ で定義された定数ラベル（リロケーション不要）
+        is_equ=False : アドレスラベル（リロケーション対象になり得る）
+        """
         if self.state.pas == 1 or self.state.pas == 0:
             # パス1/インタラクティブ: 同名ラベルの二重定義はエラー
             if k in self.state.labels:
@@ -584,13 +613,14 @@ class LabelManager:
             return False
         
         self.state.error_label_conflict = False
-        self.state.labels[k] = [v, s]
+        self.state.labels[k] = [v, s, is_equ]
         return True
 
     def printlabels(self):
         result = {}
         for key, value in self.state.labels.items():
-            num, section = value
+            num = value[0]
+            section = value[1]
             result[key] = [hex(num), section]
         print(result)
         
@@ -681,6 +711,18 @@ class ExpressionEvaluator:
             except (KeyError, IndexError):
                 self.state.error_undefined_label = True
                 val = 0
+                return hex(0)
+            # ELF追跡: get_value() と同じ分岐方針で記録する。
+            if self.state._elf_tracking:
+                if self.state._elf_capturing_var is not None:
+                    cv = self.state._elf_capturing_var
+                    if cv not in self.state._elf_var_to_label:
+                        self.state._elf_var_to_label[cv] = (label_name, val)
+                    else:
+                        self.state._elf_var_to_label[cv] = None
+                elif self.state._elf_current_word_idx >= 0:
+                    self.state._elf_label_refs_seen.append(
+                        (label_name, val, self.state._elf_current_word_idx))
             return hex(val)
 
         s = re.sub(pattern, replacer, x)
@@ -788,6 +830,16 @@ class ExpressionEvaluator:
             else:
                 x = self.var_manager.get(ch)
                 idx += 1
+                # ELF追跡: makeobj() 内で変数を読んだとき、その変数が
+                # match() でラベルを直接キャプチャしたものであれば
+                # リロケーション候補として記録する。
+                if (self.state._elf_tracking
+                        and self.state._elf_current_word_idx >= 0
+                        and ch in self.state._elf_var_to_label
+                        and self.state._elf_var_to_label[ch] is not None):
+                    lname, lval = self.state._elf_var_to_label[ch]
+                    self.state._elf_label_refs_seen.append(
+                        (lname, lval, self.state._elf_current_word_idx))
         elif idx < len(s) and s[idx] in self.state.lwordchars:
             w, idx_new = self.parser.get_label_word(s, idx)
             if idx != idx_new:
@@ -1392,7 +1444,10 @@ class PatternMatcher:
                 if a == '!':
                     a = t[idx_t]
                     idx_t += 1
+                    # ELF追跡: !!a（factor キャプチャ）
+                    self.state._elf_capturing_var = a
                     v, idx_s = self.expr_eval.factor(s, idx_s)
+                    self.state._elf_capturing_var = None
                     self.var_manager.put(a, v)
                     continue
                 else:
@@ -1404,8 +1459,11 @@ class PatternMatcher:
                         idx_t += 1                                    # skip stopchar in pattern
                     else:
                         stopchar = chr(0)
-                    
+
+                    # ELF追跡: !a（expression キャプチャ）
+                    self.state._elf_capturing_var = a
                     v, idx_s = self.expr_eval.expression_esc(s, idx_s, stopchar)
+                    self.state._elf_capturing_var = None
                     self.var_manager.put(a, v)
                     # consume stopchar from source as well
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
@@ -1616,38 +1674,42 @@ class ObjectGenerator:
         if z:
             return objl
 
-        while True:
-            if idx >= len(s) or s[idx] == chr(0):
+        try:
+            while True:
+                if idx >= len(s) or s[idx] == chr(0):
+                    break
+
+                if s[idx] == ',':
+                    idx += 1
+                    p = self.state.pc + len(objl)
+                    n = self.binary_writer.align_(p)
+                    for i in range(p, n):
+                        objl += [self.state.padding]
+                    continue
+
+                semicolon = False
+                if s[idx] == ';':
+                    semicolon = True
+                    idx += 1
+
+                # ELF リロケーション追跡: このワードを生成する式評価の開始時点で
+                # 現在のワードインデックス（objl への追加前の長さ）を記録する。
+                # get_value() がこの値を参照して (label, value, word_idx) を記録する。
+                self.state._elf_current_word_idx = len(objl)
+
+                x, idx = self.expr_eval.expression_pat(s, idx)
+
+                if (semicolon == True and x != 0) or (semicolon == False):
+                    objl += [x]
+
+                if idx < len(s) and s[idx] == ',':
+                    idx += 1
+                    continue
                 break
-            
-            if s[idx] == ',':
-                idx += 1
-                p = self.state.pc + len(objl)
-                n = self.binary_writer.align_(p)
-                for i in range(p, n):
-                    objl += [self.state.padding]
-                continue
-            
-            semicolon = False
-            if s[idx] == ';':
-                semicolon = True
-                idx += 1
+        finally:
+            # makeobj() を抜けたら必ずセンチネルに戻す（例外安全）
+            self.state._elf_current_word_idx = -1
 
-            # ELF リロケーション追跡: このワードを生成する式評価の開始時点で
-            # 現在のワードインデックス（objl への追加前の長さ）を記録する。
-            # get_value() がこの値を参照して (label, value, word_idx) を記録する。
-            self.state._elf_current_word_idx = len(objl)
-
-            x, idx = self.expr_eval.expression_pat(s, idx)
-
-            if (semicolon == True and x != 0) or (semicolon == False):
-                objl += [x]
-            
-            if idx < len(s) and s[idx] == ',':
-                idx += 1
-                continue
-            break
-        
         return objl
 
 
@@ -1789,10 +1851,12 @@ class AssemblyDirectiveProcessor:
             e, idx = StringUtils.get_param_to_spc(l, idx)
             if e.upper() == '.EQU':
                 u, idx = self.expr_eval.expression_asm(l, idx)
-                self.label_manager.put_value(label, u, self.state.current_section)
+                # is_equ=True: 定数ラベル（.equ 式の結果）はリロケーション対象外
+                self.label_manager.put_value(label, u, self.state.current_section, is_equ=True)
                 return ""
             else:
-                self.label_manager.put_value(label, self.state.pc, self.state.current_section)
+                # is_equ=False: アドレスラベル（リロケーション対象になり得る）
+                self.label_manager.put_value(label, self.state.pc, self.state.current_section, is_equ=False)
                 return l[lidx:]
         return l
     
@@ -2030,10 +2094,9 @@ class Assembler:
                     if self.pattern_matcher.match0(lin, i[0]) == True:
                         self.directive_proc.error(i[1])
                         objl = self.obj_gen.makeobj(i[2])
-                        # makeobj() 終了後はセンチネルに戻す。
-                        # 以降のサイズ式評価 expression_pat(i[3]) で発生する
+                        # makeobj() の finally が _elf_current_word_idx を -1 に
+                        # リセット済み。以降のサイズ式 expression_pat(i[3]) で発生する
                         # ラベル参照は word_idx=-1 となりリロケーション対象外になる。
-                        self.state._elf_current_word_idx = -1
                         idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                         loopflag = False
                         break
@@ -2041,6 +2104,8 @@ class Assembler:
                     if self.state.pas == 1:
                         # Pass1: パターンはマッチしたが forward参照で makeobj が失敗した。
                         # ラベルを 0 と仮定してサイズだけ確定させ、PC を正しく進める。
+                        # makeobj() の finally が _elf_current_word_idx を -1 にリセット
+                        # するため、ここで追加リセットは不要。
                         try:
                             self.state._pass1_size_mode = True
                             objl = self.obj_gen.makeobj(i[2])
@@ -2058,7 +2123,7 @@ class Assembler:
                 if self.pattern_matcher.match0(lin, i[0]) == True:
                     self.directive_proc.error(i[1])
                     objl = self.obj_gen.makeobj(i[2])
-                    self.state._elf_current_word_idx = -1  # makeobj 後リセット
+                    # makeobj() の finally が _elf_current_word_idx を -1 にリセット済み
                     idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                     loopflag = False
                     break
@@ -2113,7 +2178,9 @@ class Assembler:
         if self.state.elf_objfile and self.state.pas == 2:
             self.state._elf_tracking = True
             self.state._elf_label_refs_seen = []
-            self.state._elf_current_word_idx = -1  # makeobj 外はセンチネル -1
+            self.state._elf_current_word_idx = -1    # makeobj 外はセンチネル
+            self.state._elf_var_to_label = {}        # 命令ごとにリセット
+            self.state._elf_capturing_var = None
 
         idxs, objl, flag, idx = self.lineassemble2(line, 0)
 
@@ -2471,7 +2538,8 @@ class Assembler:
 
         # local symbols (not in export_labels)
         export_keys = set(self.state.export_labels.keys())
-        for name, (val, _sec) in sorted(self.state.labels.items()):
+        for name, *_lentry in sorted(self.state.labels.items()):
+            val, _sec = _lentry[0][0], _lentry[0][1]
             if name in export_keys:
                 continue
             byte_addr = val * bpw
@@ -2482,7 +2550,8 @@ class Assembler:
         first_global = len(syms)
 
         # global symbols (export_labels, STB_GLOBAL | STT_NOTYPE = 0x10)
-        for name, (val, _sec) in sorted(self.state.export_labels.items()):
+        for name, *_eentry in sorted(self.state.export_labels.items()):
+            val, _sec = _eentry[0][0], _eentry[0][1]
             byte_addr = val * bpw
             shndx, sym_val = _find_shndx(byte_addr)
             name_off = len(strtab); strtab += name.encode() + b'\x00'
@@ -2497,12 +2566,14 @@ class Assembler:
         # ------------------------------------------------------------------ #
         sym_name_to_idx = {}
         _si = 1 + ncs   # null(0) + section syms(1..ncs) を飛ばした位置
-        for name, (val, _sec) in sorted(self.state.labels.items()):
+        for name, *_lentry in sorted(self.state.labels.items()):
+            val, _sec = _lentry[0][0], _lentry[0][1]
             if name in export_keys:
                 continue
             sym_name_to_idx[name] = _si
             _si += 1
-        for name, (val, _sec) in sorted(self.state.export_labels.items()):
+        for name, *_eentry in sorted(self.state.export_labels.items()):
+            val, _sec = _eentry[0][0], _eentry[0][1]
             sym_name_to_idx[name] = _si
             _si += 1
 
