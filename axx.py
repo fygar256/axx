@@ -2245,10 +2245,8 @@ class Assembler:
                         continue  # 安全ガード
                     # セクション相対バイトオフセット
                     sec_rel = (self.state.pc + first_widx - sec_start_w) * bpw_r
-                    # プレースホルダをゼロクリア
-                    for b in range(num_words):
-                        if first_widx + b < len(objl):
-                            objl[first_widx + b] = 0
+                    # RELA形式: バイト列は元の値をそのまま残す（ゼロクリアしない）。
+                    # リンカは section_data[sec_rel] + r_addend でシンボル値を解決する。
                     self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, 0))
 
             for cnt in range(of):
