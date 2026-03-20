@@ -21,6 +21,7 @@ import tempfile
 # Expression mode constants
 EXP_PAT = 0
 EXP_ASM = 1
+exp_typ = 'i'
 
 # Special bracket characters
 OB = chr(0x90)  # open double bracket
@@ -100,7 +101,7 @@ class AssemblerState:
         self.endian = 'little'
         self.byte = 'yes'
         self.pas = 0
-        self.debug = False
+        self.debug = True
         
         # Current line info
         self.cl = ""
@@ -323,7 +324,15 @@ class Parser:
                     fs += s[idx]
                     idx += 1
             return fs, idx
-    
+
+    def isfloatstr(self,s,idx):
+        sidx=idx
+        v,idx = self.get_floatstr(s,idx)
+        if idx==sidx:
+            return False
+        else:
+            return True
+
     def get_curlb(self, s, idx):
         """Get curly bracket content"""
         idx = StringUtils.skipspc(s, idx)
@@ -342,7 +351,7 @@ class Parser:
                 idx += 1
         
         return f, t, idx
-    
+
     def get_symbol_word(self, s, idx):
         """Get symbol word from position"""
         t = ""
@@ -544,7 +553,6 @@ class VariableManager:
             c = ord(StringUtils.upper(s))
             self.state.vars[c - ord('A')] = int(v)
 
-
 class LabelManager:
     """Manages assembly labels"""
     
@@ -678,7 +686,7 @@ class ExpressionEvaluator:
             x = -x
         elif idx < len(s) and s[idx] == '~':
             x, idx = self.factor(s, idx + 1)
-            x = ~x
+            x = ~int(x)
         elif idx < len(s) and s[idx] == '@':
             x, idx = self.factor(s, idx + 1)
             x = self.nbit(x)
@@ -823,9 +831,12 @@ class ExpressionEvaluator:
                 else:
                     v = float(self.xeval(t, None))
                     x = int.from_bytes(struct.pack('>f', v), "big")
-        elif idx < len(s) and s[idx].isdigit():
-            fs, idx = self.parser.get_intstr(s, idx)
-            x = int(fs)  # int(float(fs)) would lose precision for large integers
+        elif exp_typ=='i' and idx < len(s) and s[idx].isdigit():
+                fs, idx = self.parser.get_intstr(s, idx)
+                x = int(fs)  # int(float(fs)) would lose precision for large integers
+        elif exp_typ=='f' and idx < len(s) and (self.parser.isfloatstr(s,idx)):
+                fs,idx = self.parser.get_floatstr(s,idx)
+                x = float(fs)
         elif (idx < len(s) and self.state.expmode == EXP_PAT and 
               s[idx] in LOWER and idx + 1 < len(s) and s[idx+1] not in LOWER):
             ch = s[idx]
@@ -875,6 +886,12 @@ class ExpressionEvaluator:
                     self.err("Division by 0 error.")
                 else:
                     x //= t
+            elif s[idx] == '/':
+                t, idx = self.term0_0(s, idx + 1)
+                if t == 0:
+                    self.err("Division by 0 error.")
+                else:
+                    x = x / t
             elif s[idx] == '%':
                 t, idx = self.term0_0(s, idx + 1)
                 if t == 0:
@@ -905,9 +922,13 @@ class ExpressionEvaluator:
         while idx < len(s):
             if StringUtils.q(s, '<<', idx):
                 t, idx = self.term1(s, idx + 2)
+                x=int(x)
+                t=int(t)
                 x <<= t
             elif StringUtils.q(s, '>>', idx):
                 t, idx = self.term1(s, idx + 2)
+                x=int(x)
+                t=int(t)
                 x >>= t
             else:
                 break
@@ -1037,6 +1058,7 @@ class ExpressionEvaluator:
         self.state.expmode = EXP_ASM
         return self.expression(self._terminate(s), idx)
     
+
     def expression_esc(self, s, idx, stopchar):
         """Expression with escaped stop character.
 
@@ -1085,6 +1107,13 @@ class ExpressionEvaluator:
 
         replaced = ''.join(result)
         return self.expression(self._terminate(replaced), idx)
+
+    def expression_esc_float(self,s,idx,stopchar):
+        global exp_typ
+        exp_typ='f'
+        v,idx = self.expression_esc(s,idx,stopchar)
+        exp_typ='i'
+        return (v,idx)
 
 
 class BinaryWriter:
@@ -1446,7 +1475,43 @@ class PatternMatcher:
                 idx_t += 1
                 a = t[idx_t]
                 idx_t += 1
-                if a == '!':
+                if a == 'F':
+                    a = t[idx_t]
+                    idx_t = StringUtils.skipspc(t, idx_t+1)
+                    if idx_t < len(t) and t[idx_t] == '\\':
+                        idx_t = StringUtils.skipspc(t, idx_t+1)
+                        stopchar = t[idx_t] if idx_t < len(t) else chr(0)
+                        idx_t += 1                                    # skip stopchar in pattern
+                    else:
+                        stopchar = chr(0)
+
+                    v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+                    v = float(v)
+                    v = int.from_bytes(struct.pack('>f', v), "big")
+                    self.var_manager.put(a, v)
+                    # consume stopchar from source as well
+                    if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
+                        idx_s += 1
+                    continue
+                elif a == 'D':
+                    a = t[idx_t]
+                    idx_t = StringUtils.skipspc(t, idx_t+1)
+                    if idx_t < len(t) and t[idx_t] == '\\':
+                        idx_t = StringUtils.skipspc(t, idx_t+1)
+                        stopchar = t[idx_t] if idx_t < len(t) else chr(0)
+                        idx_t += 1                                    # skip stopchar in pattern
+                    else:
+                        stopchar = chr(0)
+
+                    v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+                    v = float(v)
+                    v = int.from_bytes(struct.pack('>d', v), "big")
+                    self.var_manager.put(a, v)
+                    # consume stopchar from source as well
+                    if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
+                        idx_s += 1
+                    continue
+                elif a == '!':
                     a = t[idx_t]
                     idx_t += 1
                     # ELF追跡: !!a（factor キャプチャ）
