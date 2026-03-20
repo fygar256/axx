@@ -101,7 +101,7 @@ class AssemblerState:
         self.endian = 'little'
         self.byte = 'yes'
         self.pas = 0
-        self.debug = True
+        self.debug = False
         
         # Current line info
         self.cl = ""
