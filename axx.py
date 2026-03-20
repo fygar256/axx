@@ -409,6 +409,14 @@ def endouble(a):
     double_value = struct.unpack('d', struct.pack('Q', a))[0]
     return double_value
 
+def enflt(a):
+    """32ビット整数バイトコードをIEEE754単精度浮動小数点に変換"""
+    return struct.unpack('f', struct.pack('I', int(a) & 0xFFFFFFFF))[0]
+
+def endbl(a):
+    """64ビット整数バイトコードをIEEE754倍精度浮動小数点に変換"""
+    return struct.unpack('d', struct.pack('Q', int(a) & 0xFFFFFFFFFFFFFFFF))[0]
+
 class IEEE754Converter:
     """IEEE 754 floating point conversion utilities"""
     
@@ -743,6 +751,8 @@ class ExpressionEvaluator:
             "__builtins__": {},
             "enfloat": enfloat,
             "endouble": endouble,
+            "enflt": enflt,
+            "endbl": endbl,
         }
         # eval の第3引数にも空辞書を渡すことでローカルスコープも封鎖する。
         # クラス継承チェーン経由のエスケープを防ぐため、
@@ -831,6 +841,18 @@ class ExpressionEvaluator:
                 else:
                     v = float(self.xeval(t, None))
                     x = int.from_bytes(struct.pack('>f', v), "big")
+        elif idx + 5 <= len(s) and s[idx:idx+5] == 'enflt':
+            idx += 5
+            f, t, idx = self.parser.get_curlb(s, idx)
+            if f:
+                v, _ = self.expression(t + chr(0), 0)
+                x = enflt(int(v))
+        elif idx + 5 <= len(s) and s[idx:idx+5] == 'endbl':
+            idx += 5
+            f, t, idx = self.parser.get_curlb(s, idx)
+            if f:
+                v, _ = self.expression(t + chr(0), 0)
+                x = endbl(int(v))
         elif exp_typ=='i' and idx < len(s) and s[idx].isdigit():
                 fs, idx = self.parser.get_intstr(s, idx)
                 x = int(fs)  # int(float(fs)) would lose precision for large integers
@@ -1355,6 +1377,7 @@ class DirectiveProcessor:
         return True
     
     def error(self, s):
+        global exp_typ
         """Process error directive"""
         ss = s.replace(' ', '')
         if ss == "":
@@ -1372,7 +1395,9 @@ class DirectiveProcessor:
                 idx += 1
                 continue
             
+            exp_typ='f'
             u, idxn = self.expr_eval.expression_pat(s, idx)
+            exp_typ='i'
             idx = idxn
             if idx < len(s) and s[idx] == ';':
                 idx += 1
@@ -1507,6 +1532,26 @@ class PatternMatcher:
                     v = float(v)
                     v = int.from_bytes(struct.pack('>d', v), "big")
                     self.var_manager.put(a, v)
+                    # consume stopchar from source as well
+                    if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
+                        idx_s += 1
+                    continue
+                elif a == 'Q':
+                    # !Q<var> : ソースから浮動小数点式を読み取り、
+                    # IEEE754 128ビット(quad)整数ビットパターンとして変数に格納する
+                    a = t[idx_t]
+                    idx_t = StringUtils.skipspc(t, idx_t+1)
+                    if idx_t < len(t) and t[idx_t] == '\\':
+                        idx_t = StringUtils.skipspc(t, idx_t+1)
+                        stopchar = t[idx_t] if idx_t < len(t) else chr(0)
+                        idx_t += 1                                    # skip stopchar in pattern
+                    else:
+                        stopchar = chr(0)
+
+                    v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+                    h = IEEE754Converter.decimal_to_ieee754_128bit_hex(str(float(v)))
+                    x = int(h, 16)
+                    self.var_manager.put(a, x)
                     # consume stopchar from source as well
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
                         idx_s += 1
