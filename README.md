@@ -834,6 +834,22 @@ LISP machine programs are not assembly language.
 
 ・Make it possible to take an equation for x in qad(x).
 
+・Allow floating-point expressions to be specified in pattern files. !F, !D, and !Q will represent float (32-bit), double (64-bit), and quad (128-bit), respectively. → This will enable expression to handle floating-point numbers. Previously, this was done in assembly line as flt{}, dbl{}, qad{}, but now floating-point notation can be embedded in the instruction as part of the pattern language.
+
+For example (double),
+
+```
+movd a,#3.14
+```
+
+This notation can be written.
+
+In that case, the pattern file would be:
+
+```
+MOVD A,#!De :: 0xaa,@@[8,*(e,%%)]
+```
+
 ・Now that the core is made, I think it would be a complete system if I prepared a pattern file for axx and added a high-performance macros, and optimization functionalities, I would be happy if it were put to practical use.
 
 ### Looking Back
