@@ -3719,7 +3719,7 @@ int main(int argc, char *argv[]){
     char osabistr[16]="FreeBSD"; /* ELF_OSABI Default: FreeBSD */
 
     for(int i=1;i<argc;i++){
-        if(strcmp(argv[i],"--osabi")==0&&i+1<argc){ strncpy(osabistr,argv[++i],sizeof(osabistr-1)); }
+        if(strcmp(argv[i],"--osabi")==0&&i+1<argc){ strncpy(osabistr,argv[++i],sizeof(osabistr)-1); }
         else if(strcmp(argv[i],"-b")==0&&i+1<argc){ strncpy(st->outfile,argv[++i],sizeof(st->outfile)-1); }
         else if(strcmp(argv[i],"-E")==0&&i+1<argc){ expfile_elf=argv[++i]; }
         else if(strcmp(argv[i],"-i")==0&&i+1<argc){ strncpy(st->impfile,argv[++i],sizeof(st->impfile)-1); }
