@@ -618,6 +618,7 @@ Operators and precedence are based on Python and are as follows.
 ```
 (expression)         An expression enclosed in parentheses
 #                    An operator that returns the value of a symbol
+enflt{x},endbl{x}    Operators that convert x(byte code) to floating point number.
 flt{x},dbl{x}        Operators that convert x to float and double bytecodes, respectively
 qad(x)               Operators that convert x to a 128-bit floating point number's bytcode. However, in this case, x can only be a constant.
 *(x,y)               yth byte from the lowest value of x (y>=0)
@@ -734,8 +735,6 @@ Because this is a test, the binary is different from the actual code.
 /* test
 .setsym ::a:: 7
 .setsym ::b:: 1
-.setsym ::%% ::7
-.setsym ::||:: 8
 LDF A,!x :: 0x1,@@[16,*(x,%%)]
 
 /* ARM64
@@ -811,7 +810,7 @@ Execution example
 
 ・If no template set for instruction of EPIC, "No template set." error will occur.
 
-・If any of the conditions in error_patterns are met, an error will occur. In that case, the following messages will appear for error codes 0, 1, 2, 5, and 6 (Value out of range, Invalid syntax, Address out of range, Register out of range, Port number out of range). If there are not enough types of errors, add an error message to the source.
+・If any of the conditions in error_patterns are met, an error will occur. In that case, the following messages will appear for error codes 1, 2, 3 , 5, and 6 (Invalid syntax, Address out of range, Value out of range, Register out of range, Port number out of range). If there are not enough types of errors, add an error message to the source.
 
 ## Comments
 
