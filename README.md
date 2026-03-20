@@ -163,11 +163,19 @@ If you write `/*` in a pattern file, the part after `/*` on that line will becom
 
 #### Case Sensitivity, Variables
 
-Uppercase letters in the pattern file's instruction are treated as character constants. Lowercase letters are treated as one-character variables. The value of the symbol at that position from the assembly line is assigned to the variable. If `! lowercase` is used, the value of the expression at that position is assigned, and if `!! lowercase` is used, the value of the factor at that position is assigned, and referenced from error_patterns and binary_list. All unassigned variables are initialized to 0. When referenced from error_patterns and binary_list, `!` is not necessary. All values ​​are referenced in the same way.
+Case Sensitivity and Variables
 
-Lowercase variables are initialized to 0 for each line in the pattern file.
+Uppercase letters in the instruction field of a pattern file are treated as character constants. Lowercase letters are treated as single-character variables. The value of the symbol at that position on the assembly line is assigned to the variable. Using `!lowercase` assigns the value of the integer expression at that position, `!!lowercase` assigns the value of the factor at that position, `!Flowercase` assigns the integer conversion of the 32-bit floating-point expression at that position, and `!Dlowercase` assigns the integer conversion of the 64-bit floating-point expression at that position. These values ​​are then referenced from `error_patterns` and `binary_list`. All unassigned variables have an initial value of 0. `!` is not necessary when referencing from `error_patterns` and `binary_list`. All values ​​are referenced similarly.
 
-From the assembly line, uppercase and lowercase letters are accepted as the same, except for labels and section names.
+
+```
+Uppercase letter: Character constant
+Lowercase letter: Value of the symbol at that position
+!Lowercase letter: Value of an integer expression
+!!Lowercase letter: Value of an integer factor
+!FLowercase letter: Value of a 32-bit floating-point expression
+!DLowercase letter: Value of a 64-bit floating-point expression
+```
 
 
 #### Escape Characters
@@ -483,13 +491,11 @@ it will align to 16 (pad with the bytecode specified by .padding up to an addres
 
 #### Floating point, number notation
 
-For example, suppose you have a processor that includes floating point operands, and `MOVF fa,3.14` loads the float 3.14 into the fa register, with the opcode being 01. In this case, the pattern data is
-
+For example, suppose we have a processor that accepts floating-point numbers as operands. The command `MOVF fa,3.14` loads the `fa` register with the value 3.14 (a 32-bit float), and its opcode is 01. In this case, the pattern data would be:
 ```
-MOVF FA,!d ::0x01,d>>24,d>>16,d>>8,d
+`MOVF FA,!Fd ::0x01,d>>24,d>>16,d>>8,d
 ```
-
-If you pass `movf fa,flt{3.14}` to the assemble line, the binary output will be 0x01,0xc3,0xf5,0x48,0x40. If flt is dbl, it is a double precision floating point, and if it is qad, it is a quadruple precision floating point.
+If we pass `movf fa,3.14` to the assembly line, the binary output will be `0x01,0xc3,0xf5,0x48,0x40`. If `!F` becomes `!D`, it indicates a double-precision floating-point number.
 
 In the current specification, expression can write in flt(x) and dbl(x), and `nan`, `inf`, and `-inf` are not permitted to operate.
 
