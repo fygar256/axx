@@ -177,6 +177,11 @@ Lowercase letter: Value of the symbol at that position
 !DLowercase letter: Value of a 64-bit floating-point expression
 ```
 
+Lowercase variables are all initialized to 0 for each line in the pattern file.
+
+From the assembly line, uppercase and lowercase letters are treated the same, except for labels and section names.
+
+The special variable $$ represents the current location counter.
 
 #### Escape Characters
 
