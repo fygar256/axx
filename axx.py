@@ -40,10 +40,10 @@ ALPHABET = LOWER + CAPITAL
 
 # Error messages
 ERRORS = [
-    "Value out of range.",
+    "",
     "Invalid syntax.",
     "Address out of range.",
-    "",
+    "Value out of range.",
     "",
     "Register out of range.",
     "Port number out of range."
@@ -408,14 +408,6 @@ def enfloat(a):
 def endouble(a):
     double_value = struct.unpack('d', struct.pack('Q', a))[0]
     return double_value
-
-def enflt(a):
-    """32ビット整数バイトコードをIEEE754単精度浮動小数点に変換"""
-    return struct.unpack('f', struct.pack('I', int(a) & 0xFFFFFFFF))[0]
-
-def endbl(a):
-    """64ビット整数バイトコードをIEEE754倍精度浮動小数点に変換"""
-    return struct.unpack('d', struct.pack('Q', int(a) & 0xFFFFFFFFFFFFFFFF))[0]
 
 class IEEE754Converter:
     """IEEE 754 floating point conversion utilities"""
