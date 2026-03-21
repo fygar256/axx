@@ -409,6 +409,12 @@ def endouble(a):
     double_value = struct.unpack('d', struct.pack('Q', a))[0]
     return double_value
 
+# enflt / endbl は enfloat / endouble の別名。
+# factor1() および xeval() の safe_env から参照されるが、
+# これまで定義が存在せず NameError でクラッシュしていた。
+enflt = enfloat
+endbl = endouble
+
 class IEEE754Converter:
     """IEEE 754 floating point conversion utilities"""
     
@@ -2059,7 +2065,12 @@ class AssemblyDirectiveProcessor:
         
         if l2 != '':
             self.state.current_section = l2
-            self.state.sections[l2] = [self.state.pc, 0]
+            # 同名セクションが再宣言された場合（.text→.data→.text など）は
+            # 最初に記録した開始アドレスを保護する。
+            # 旧実装は毎回 [self.state.pc, 0] で上書きしていたため、
+            # ELF セクション開始アドレスや endsection のサイズ計算が狂っていた。
+            if l2 not in self.state.sections:
+                self.state.sections[l2] = [self.state.pc, 0]
         return True
     
     def align_processing(self, l1, l2):
@@ -2194,6 +2205,11 @@ class Assembler:
             lin = StringUtils.reduce_spaces(lin)
             
             if i[0] == '':
+                # 番兵エントリ: マッチせずにループ終端に達したとみなす。
+                # i[3] にはVLIWスロットインデックス式が入っているため、
+                # 評価せずに break すると idxs が初期値 0 のまま返り
+                # VLIWスロット配置が狂う。ここで必ず評価する。
+                idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                 loopflag = False
                 break
             
@@ -2906,7 +2922,7 @@ class Assembler:
                         help='Import labels from TSV file')
         ap.add_argument('-o', dest='elf_objfile', default='',
                         metavar='OBJ_FILE',
-                        help='Write FreeBSD ELF64 relocatable object file (.o)')
+                        help='Write ELF64 relocatable object file (.o)')
         ap.add_argument('-m', dest='elf_machine', type=int, default=62,
                         metavar='MACHINE',
                         help='ELF e_machine value (default 62=EM_X86_64; '
