@@ -21,7 +21,9 @@ import tempfile
 # Expression mode constants
 EXP_PAT = 0
 EXP_ASM = 1
-exp_typ = 'i'
+# exp_typ は後方互換のため残存するが、実際には AssemblerState.exp_typ を使用する。
+# このグローバルは参照されなくなった（修正1対応）。
+exp_typ = 'i'  # deprecated – do not use directly
 
 # Special bracket characters
 OB = chr(0x90)  # open double bracket
@@ -116,6 +118,11 @@ class AssemblerState:
         self.deb1 = ""
         self.deb2 = ""
         
+        # Expression type mode: 'i' = integer, 'f' = float.
+        # スレッドセーフかつ再入安全にするため、モジュールレベルのグローバルではなく
+        # インスタンス変数として保持する。変更箇所では必ず try/finally で元に戻す。
+        self.exp_typ: str = 'i'
+
         # Pass 1 size-estimation mode:
         # True の間は未定義ラベルを UNDEF ではなく 0 として返す。
         # forward参照があっても makeobj がサイズを正しく計算できるようにするため。
@@ -851,10 +858,10 @@ class ExpressionEvaluator:
             if f:
                 v, _ = self.expression(t + chr(0), 0)
                 x = endbl(int(v))
-        elif exp_typ=='i' and idx < len(s) and s[idx].isdigit():
+        elif self.state.exp_typ=='i' and idx < len(s) and s[idx].isdigit():
                 fs, idx = self.parser.get_intstr(s, idx)
                 x = int(fs)  # int(float(fs)) would lose precision for large integers
-        elif exp_typ=='f' and idx < len(s) and (self.parser.isfloatstr(s,idx)):
+        elif self.state.exp_typ=='f' and idx < len(s) and (self.parser.isfloatstr(s,idx)):
                 fs,idx = self.parser.get_floatstr(s,idx)
                 x = float(fs)
         elif (idx < len(s) and self.state.expmode == EXP_PAT and 
@@ -1129,10 +1136,12 @@ class ExpressionEvaluator:
         return self.expression(self._terminate(replaced), idx)
 
     def expression_esc_float(self,s,idx,stopchar):
-        global exp_typ
-        exp_typ='f'
-        v,idx = self.expression_esc(s,idx,stopchar)
-        exp_typ='i'
+        prev = self.state.exp_typ
+        self.state.exp_typ = 'f'
+        try:
+            v,idx = self.expression_esc(s,idx,stopchar)
+        finally:
+            self.state.exp_typ = prev
         return (v,idx)
 
 
@@ -1375,7 +1384,6 @@ class DirectiveProcessor:
         return True
     
     def error(self, s):
-        global exp_typ
         """Process error directive"""
         ss = s.replace(' ', '')
         if ss == "":
@@ -1393,9 +1401,12 @@ class DirectiveProcessor:
                 idx += 1
                 continue
             
-            exp_typ='f'
-            u, idxn = self.expr_eval.expression_pat(s, idx)
-            exp_typ='i'
+            prev_typ = self.expr_eval.state.exp_typ
+            self.expr_eval.state.exp_typ = 'f'
+            try:
+                u, idxn = self.expr_eval.expression_pat(s, idx)
+            finally:
+                self.expr_eval.state.exp_typ = prev_typ
             idx = idxn
             if idx < len(s) and s[idx] == ';':
                 idx += 1
@@ -1627,10 +1638,22 @@ class PatternFileReader:
     def __init__(self, parser):
         self.parser = parser
     
-    def readpat(self, fn):
-        """Read pattern file"""
+    def readpat(self, fn, base_dir=None):
+        """Read pattern file.
+
+        base_dir: 呼び出し元パターンファイルのディレクトリ。
+        None のときはプロセスの CWD を基準にする（トップレベル呼び出し）。
+        相対パスの fn は base_dir（または CWD）を基準に解決する。
+        """
         if fn == '':
             return []
+        
+        # 相対パスを解決する
+        if base_dir and not os.path.isabs(fn):
+            fn = os.path.join(base_dir, fn)
+        
+        # このファイルと同じディレクトリを、再帰的な .INCLUDE の基準にする
+        this_dir = os.path.dirname(os.path.abspath(fn))
         
         p = []
         w = []
@@ -1646,7 +1669,7 @@ class PatternFileReader:
                 l = l.replace('\n', '')
                 l = StringUtils.reduce_spaces(l)
                 
-                ww = self.include_pat(l)
+                ww = self.include_pat(l, this_dir)
                 if ww:
                     w = w + ww
                     continue
@@ -1678,7 +1701,7 @@ class PatternFileReader:
         
         return w
     
-    def include_pat(self, l):
+    def include_pat(self, l, base_dir=None):
         """Include pattern directive.
 
         修正7: 旧実装は StringUtils.skipspc で先頭スペースをスキップして
@@ -1688,6 +1711,8 @@ class PatternFileReader:
         正しく取り出せなかった。
         修正後: l[idx+8:] を使い、スキップ後の先頭位置から 8 文字
         (.INCLUDE) 分進んだ位置からファイル名を読み取る。
+
+        修正5: ファイル名は base_dir を基準に解決する。
         """
         idx = StringUtils.skipspc(l, 0)
         i = l[idx:idx+8]
@@ -1695,7 +1720,7 @@ class PatternFileReader:
         if i != ".INCLUDE":
             return []
         s = StringUtils.get_string(l[idx+8:])
-        w = self.readpat(s)
+        w = self.readpat(s, base_dir)
         return w
 
 
@@ -2135,11 +2160,23 @@ class Assembler:
         self._imp_sections: dict = {}  # {sname: (start, size)}
     
     def include_asm(self, l1, l2):
-        """Include directive"""
+        """Include directive.
+
+        修正5: インクルードパスを現在アセンブル中のファイルのディレクトリを基準に解決する。
+        旧実装はパスをそのまま open() に渡すため、プロセスの CWD と異なる場所にある
+        ソースファイル内の相対パス .INCLUDE が常に失敗していた。
+        stdin や対話モードの場合は解決不能なので CWD 基準のままとする。
+        """
         if StringUtils.upper(l1) != ".INCLUDE":
             return False
         s = StringUtils.get_string(l2)
         if s:
+            # 相対パスを現在ファイルのディレクトリ基準に解決する
+            if not os.path.isabs(s):
+                cur = self.state.current_file
+                if cur and cur not in ("(stdin)", ""):
+                    base = os.path.dirname(os.path.abspath(cur))
+                    s = os.path.join(base, s)
             self.fileassemble(s)
         return True
     
@@ -2574,12 +2611,19 @@ class Assembler:
 
         # ------------------------------------------------------------------ #
         # Helper: pack ELF structures                                          #
+        # エンディアンは state.endian から決定する。                           #
+        #   little → EI_DATA=1 (ELFDATA2LSB), struct prefix '<'              #
+        #   big    → EI_DATA=2 (ELFDATA2MSB), struct prefix '>'              #
         # ------------------------------------------------------------------ #
+        _is_le    = (self.state.endian != 'big')
+        _ei_data  = 1 if _is_le else 2          # EI_DATA byte in e_ident
+        _pk       = '<' if _is_le else '>'      # struct.pack prefix
+
         def _pack_ehdr(e_type, e_machine, e_shoff, e_shnum, e_shstrndx):
             ident = (b'\x7fELF'
-                     + bytes([2, 1, 1, self.state.osabi])   # class64, LSB, ver1, ELFOSABI
+                     + bytes([2, _ei_data, 1, self.state.osabi])  # class64, EI_DATA, ver1, ELFOSABI
                      + b'\x00' * 8)
-            return ident + _struct.pack('<HHIQQQIHHHHHH',
+            return ident + _struct.pack(f'{_pk}HHIQQQIHHHHHH',
                 e_type, e_machine,
                 1,       # e_version
                 0,       # e_entry
@@ -2594,12 +2638,12 @@ class Assembler:
 
         def _pack_shdr(sh_name, sh_type, sh_flags, sh_addr, sh_offset,
                        sh_size, sh_link, sh_info, sh_addralign, sh_entsize):
-            return _struct.pack('<IIQQQQIIQQ',
+            return _struct.pack(f'{_pk}IIQQQQIIQQ',
                 sh_name, sh_type, sh_flags, sh_addr, sh_offset,
                 sh_size, sh_link, sh_info, sh_addralign, sh_entsize)
 
         def _pack_sym(st_name, st_info, st_other, st_shndx, st_value, st_size):
-            return _struct.pack('<IBBHQQ',
+            return _struct.pack(f'{_pk}IBBHQQ',
                 st_name, st_info, st_other, st_shndx, st_value, st_size)
 
         def _align_up(x, a):
@@ -2790,7 +2834,7 @@ class Assembler:
         # ------------------------------------------------------------------ #
         def _pack_rela(r_offset, r_sym, r_type, r_addend):
             r_info = (r_sym << 32) | (r_type & 0xffffffff)
-            return _struct.pack('<QQq', r_offset, r_info, r_addend)
+            return _struct.pack(f'{_pk}QQq', r_offset, r_info, r_addend)
 
         rela_datas = []   # rela_sec_order と同順
         for sidx in rela_sec_order:
