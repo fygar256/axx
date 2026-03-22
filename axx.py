@@ -2789,9 +2789,11 @@ class Assembler:
             if is_equ:
                 # .equ 定義ラベルは絶対値シンボル (SHN_ABS=0xfff1)
                 shndx, sym_val = 0xfff1, val
+
             else:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr)
+
             name_off = len(strtab); strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x00, 0, shndx, sym_val, 0))
 
