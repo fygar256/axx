@@ -18,7 +18,7 @@ Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
 
 GitHub: https://github.com/fygar256/axx_relocatable_elf_generation
 
-C version and Ruby version and Go version are also available. C version is nameded Caxx, Ruby version is named Raxx and Go version is named Gaxx. C and Go version are much faster than Python version and Ruby version.
+C version is also available. C version is nameded Caxx. C version is much faster than Python version.
 
 Paxx is newest version , Caxx is version 7.5.4.2, Raxx and Gaxx are version 7.2.
 
@@ -64,22 +64,6 @@ caxx z80.axx z80.s [ option ] # execution
 ```
 
 Because caxx is written in C, I'm wondering if someone will incorporate this into their toolchain.
-
-##### initialization,build and execution for go version　'Gaxx'
-
-```
-go mod init axx # initialization
-go build -o gaxx gaxx.go # build
-gaxx z80.axx z80.s [option] # execution
-```
-
-##### execution for Ruby version 'Raxx'
-
-```
-chmod +x axx.rb
-sudo cp axx.rb /usr/local/bin/raxx 
-raxx z80.axx z80.s [option] # execution
-```
 
 It was written in python, so the nickname is Paxx.
 
