@@ -488,7 +488,7 @@ For example, suppose we have a processor (such as ARM64) that accepts floating-p
 VMOV.F32 S!n,#!Fd ::0x80|n,d>>24,d>>16,d>>8,d
 ```
 
-If we pass vmov.f32 s0,#3.14 to the assembly line, the binary output will be 0x80,0xc3,0xf5,0x48,0x40. If !F becomes !D, it's a double-precision floating-point number. !Q is a 128-bit floating-point number.
+If we pass `vmov.f32 s0,#3.14` to the assembly line, the binary output will be 0x80,0xc3,0xf5,0x48,0x40. If !F becomes !D, it's a double-precision floating-point number. !Q is a 128-bit floating-point number.
 
 Please prefix binary numbers with '0b'.
 
@@ -832,11 +832,7 @@ LISP machine programs are not assembly language.
 
 ・Now that the core is made, I think it would be a complete system if I prepared a pattern file for axx and added a high-performance macros, and optimization functionalities, I would be happy if it were put to practical use.
 
-### Looking Back
-
-axx has been compiled to allow for the description of all classic and past processors.
-
-### Looking to the Future / axx2 (the next generation of axx) concept. Explanation of pattern files (processor description files). Feature not available now.
+### axx2 (the next generation of axx) concept. Explanation of pattern files (processor description files). Feature not available now.
 
 - Using a more descriptive metalanguage for pattern files would improve readability, eliminate dependency on evaluation order, make control statements easier to write, and make processor description file debugging easier. However, pattern data is more intuitive. Further generalizing the metalanguage and using a descriptive metalanguage for pattern files, adding string literals, string operations, and numeric operations to binary_list, and adding control statements, would enable the generation of intermediate languages ​​and converters between assembly languages. In this case, the binary_list would be renamed object_list, and the pattern file would be renamed processor_specification_file. The metalanguage would be a multi-line description language rather than pattern data. This is feasible. Apparently, someone is currently working on it based on axx. Even in pattern files, you can write macros smartly by setting a='MOV b,c', assigning commands (strings) to character variables (currently lowercase letters, but if you expand this to what we normally call symbols), and writing them in binary_list. Allowing loop structures makes debugging difficult if an infinite loop occurs during processing within axx.py, but allowing evaluation only in pattern files simplifies debugging and allows loop and branch structures. Turing-completeness allows processing of any processor architecture. Lisp machines are also possible in principle. Self-reference checks are required. Use expand(a) to expand. For example, if a='b ; c' b='MOV AX,d' c='JMPC e', the result becomes 'MOV AX,d ; JMPC e'. Use expression(a) to evaluate the expression, and label: to define the label. Keeping labels separate in the processor description file and the assembly file eliminates the need to worry about the same label appearing in both. Meta-processing like EPIC is solved by enumerating variables. Making it a descriptive metalanguage requires drastic rewriting. If the assembler's processor characteristic description file becomes complex, it becomes difficult to make the file compatible with General Disassembler.
 
@@ -846,7 +842,7 @@ If you find a bug, I would appreciate it if you could let me know how　axx　wo
 
 ### Acknowledgements
 
-I would like to express my gratitude to my mentor, Junichi Hamada, and Tokyo Electronics Design, who gave me the problems and hints, the University of Electro-Communications, the computer scientists and engineers, Qiita, Google, IEEE, The Alan Turing Institute and some unforgettable people. Thank you very much.
+I would like to express my gratitude to my mentor, Junichi Hamada, and Tokyo Denshi Sekkei, who gave me the problems and hints, the University of Electro-Communications, the computer scientists and engineers, Qiita, Google, IEEE, The Alan Turing Institute and some unforgettable people. Thank you very much.
 
 ### English is not my mother tongue so this document is translated by google translation. there may be some mistakes and sorry for my broken English.
 
