@@ -153,7 +153,7 @@ Uppercase letters in the instruction field of a pattern file are treated as char
 
 
 ```
-Uppercase letter: Character constant
+Uppercase letter, other symbols and escaped character: Character constant
 Lowercase letter: Value of the symbol at that position
 !Lowercase letter: Value of an integer expression
 !!Lowercase letter: Value of an integer factor
