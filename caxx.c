@@ -658,6 +658,12 @@ typedef struct {
     int        vcnt;
 
     int        expmode;
+    /* exp_typ_float: 0 = integer mode (default), 1 = floating-point mode.
+     * When 1, number literals are parsed as double and arithmetic operations
+     * (+, -, *, /, **) are performed in double precision.  The double value
+     * is carried inside uint256_t.w[0] as a raw bit-cast.
+     * Mirrors axx.py AssemblerState.exp_typ ('i' vs 'f'). */
+    int        exp_typ_float;
     int        error_undefined_label;
     int        error_already_defined;
 
@@ -745,6 +751,7 @@ static void state_init(AsmState *st) {
     st->vliwstop = 0;
     st->vcnt = 1;
     st->expmode = EXP_PAT;
+    st->exp_typ_float = 0;
     st->align = 16;
     st->bts = 8;
     st->endian_big = 0;
@@ -1178,6 +1185,36 @@ static double enfloat_bits(uint64_t a){
 }
 static double endouble_bits(uint64_t a){
     double d; memcpy(&d,&a,8); return d;
+}
+
+/* =========================================================
+ * Float-mode helpers for the expression evaluator.
+ *
+ * When AsmState.exp_typ_float == 1, the expression evaluator carries
+ * double values as raw bit-casts inside uint256_t.w[0].  The two
+ * conversion helpers below perform the bit-cast in both directions.
+ *
+ * axx_isfloatstr() returns 1 when the character at s[idx] can start a
+ * floating-point literal recognised by axx_get_floatstr().  It is used
+ * in expr_factor1() to dispatch between float and integer number parsing,
+ * mirroring axx.py Parser.isfloatstr() / ExpressionEvaluator.factor1().
+ * ========================================================= */
+static inline double u256_to_double(uint256_t v){
+    double d; memcpy(&d, &v.w[0], 8); return d;
+}
+static inline uint256_t double_to_u256(double d){
+    uint256_t r = u256_zero(); memcpy(&r.w[0], &d, 8); return r;
+}
+/* Returns 1 when s[idx] starts a float literal (digit, '.', 'i'nf, 'n'an).
+ * Leading '-' is NOT checked here because unary minus is handled by
+ * expr_factor() before expr_factor1() is ever called. */
+static int axx_isfloatstr(const char *s, int idx){
+    if(!s[idx]) return 0;
+    if(strncmp(s+idx,"inf",3)==0) return 1;
+    if(strncmp(s+idx,"nan",3)==0) return 1;
+    if(is_digit(s[idx])) return 1;
+    if(s[idx]=='.' && is_digit((unsigned char)s[idx+1])) return 1;
+    return 0;
 }
 
 /* =========================================================
@@ -1664,7 +1701,12 @@ static uint256_t expr_factor(Assembler *asmb, const char *s, int idx, int *idx_o
         x=u256_from_i64(st->vcnt); idx+=3;
     } else if(s[idx]=='-'){
         x=expr_factor(asmb,s,idx+1,&idx);
-        x=u256_neg(x);
+        if(asmb->st.exp_typ_float){
+            double d=u256_to_double(x);
+            x=double_to_u256(-d);
+        } else {
+            x=u256_neg(x);
+        }
     } else if(s[idx]=='~'){
         x=expr_factor(asmb,s,idx+1,&idx);
         x=u256_not(x);
@@ -1710,13 +1752,21 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
     else if(idx+4<=slen && strncmp(s+idx,"'\\\\'",4)==0){ x=u256_from_i64('\\'); idx+=4; }
     else if(idx+4<=slen && strncmp(s+idx,"'\\n'",4)==0){ x=u256_from_i64(0x0a); idx+=4; }
     else if(idx+3<=slen && s[idx]=='\'' && s[idx+2]=='\''){ x=u256_from_i64((unsigned char)s[idx+1]); idx+=3; }
-    else if(axx_q(s,slen,"$$",idx)){ idx+=2; x=st->pc; }
+    else if(axx_q(s,slen,"$$",idx)){
+        idx+=2;
+        x=st->pc;
+        /* In float mode, treat PC as an integer-valued double (int→float). */
+        if(asmb->st.exp_typ_float)
+            x=double_to_u256((double)(int64_t)u256_to_u64(x));
+    }
     else if(axx_q(s,slen,"#",idx)){
         idx++;
         char t[512];
         idx=axx_get_symbol_word(s,idx,st->swordchars,t,sizeof(t));
         uint256_t sv;
         if(symbol_get(st,t,&sv)) x=sv; else x=u256_zero();
+        if(asmb->st.exp_typ_float)
+            x=double_to_u256((double)(int64_t)u256_to_u64(x));
     }
     else if(axx_q(s,slen,"0b",idx)){
         idx+=2;
@@ -1744,6 +1794,46 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             if(s[idx]=='}') idx++;
         }
     }
+    /* enflt{expr}: evaluate expr in integer mode, interpret 32 low bits as
+     * IEEE754 float32, return the float value.
+     * Mirrors axx.py factor1():
+     *   v, _ = self.expression(t + chr(0), 0)   # integer mode
+     *   x = enflt(int(v))                        # = enfloat(int(v))
+     * The result is a floating-point value; callers should use this inside
+     * flt{} / dbl{} or in a float-mode context. */
+    else if(idx+5<=slen && strncmp(s+idx,"enflt",5)==0){
+        idx+=5;
+        int f; char t[512];
+        idx=axx_get_curlb(s,idx,&f,t,sizeof(t));
+        if(f){
+            /* Always evaluate inner expression in integer mode */
+            int prev_flt=asmb->st.exp_typ_float;
+            asmb->st.exp_typ_float=0;
+            int io2; uint256_t iv=expr_expression_pat(asmb,t,0,&io2);
+            asmb->st.exp_typ_float=prev_flt;
+            double fval=enfloat_bits(u256_to_u64(iv));
+            /* Return as double bit-cast (float mode value) */
+            x=double_to_u256(fval);
+        }
+    }
+    /* endbl{expr}: evaluate expr in integer mode, interpret 64 bits as
+     * IEEE754 float64, return the double value.
+     * Mirrors axx.py factor1():
+     *   v, _ = self.expression(t + chr(0), 0)   # integer mode
+     *   x = endbl(int(v))                        # = endouble(int(v))  */
+    else if(idx+5<=slen && strncmp(s+idx,"endbl",5)==0){
+        idx+=5;
+        int f; char t[512];
+        idx=axx_get_curlb(s,idx,&f,t,sizeof(t));
+        if(f){
+            int prev_flt=asmb->st.exp_typ_float;
+            asmb->st.exp_typ_float=0;
+            int io2; uint256_t iv=expr_expression_pat(asmb,t,0,&io2);
+            asmb->st.exp_typ_float=prev_flt;
+            double fval=endouble_bits(u256_to_u64(iv));
+            x=double_to_u256(fval);
+        }
+    }
     else if(idx+3<=slen && strncmp(s+idx,"dbl",3)==0){
         idx+=3;
         int f; char t[512];
@@ -1754,7 +1844,13 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             else if(strcmp(t,"inf")==0) bits=0x7ff0000000000000ULL;
             else if(strcmp(t,"-inf")==0) bits=0xfff0000000000000ULL;
             else {
-                double v=xeval(asmb,t);
+                /* Evaluate expression inside braces in float mode using the
+                 * native C expression evaluator (no Python subprocess). */
+                int prev_flt = asmb->st.exp_typ_float;
+                asmb->st.exp_typ_float = 1;
+                int io2; uint256_t fv = expr_expression_pat(asmb,t,0,&io2);
+                asmb->st.exp_typ_float = prev_flt;
+                double v = u256_to_double(fv);
                 memcpy(&bits,&v,8);
             }
             x=u256_from_u64(bits);
@@ -1770,11 +1866,27 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             else if(strcmp(t,"inf")==0) bits=0x7f800000u;
             else if(strcmp(t,"-inf")==0) bits=0xff800000u;
             else {
-                float v=(float)xeval(asmb,t);
+                /* Evaluate expression inside braces in float mode using the
+                 * native C expression evaluator (no Python subprocess). */
+                int prev_flt = asmb->st.exp_typ_float;
+                asmb->st.exp_typ_float = 1;
+                int io2; uint256_t fv = expr_expression_pat(asmb,t,0,&io2);
+                asmb->st.exp_typ_float = prev_flt;
+                float v = (float)u256_to_double(fv);
                 memcpy(&bits,&v,4);
             }
             x=u256_from_u64(bits);
         }
+    }
+    /* Float-mode number literal: parsed by axx_get_floatstr() as a double.
+     * This branch is checked BEFORE the integer branch so that "3.14" is
+     * consumed as a float literal when exp_typ_float == 1.
+     * Mirrors axx.py factor1():
+     *   elif self.state.exp_typ=='f' and isfloatstr(s,idx): x = float(fs) */
+    else if(asmb->st.exp_typ_float && axx_isfloatstr(s,idx)){
+        char fs[64];
+        idx=axx_get_floatstr(s,idx,fs,sizeof(fs));
+        if(fs[0]) x=double_to_u256(strtod(fs,NULL));
     }
     else if(is_digit(s[idx])){
         char fs[64];
@@ -1816,6 +1928,12 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         if(new_idx!=idx){
             idx=new_idx;
             x=label_get_value(st,w);
+            /* In float mode, treat label's integer address as an integer-valued
+             * double (int→float), not as a bit-cast of the address bits.
+             * Mirrors Python: label values are substituted as decimal strings
+             * in xeval(), then parsed as integers before float promotion. */
+            if(asmb->st.exp_typ_float && !st->error_undefined_label)
+                x=double_to_u256((double)(int64_t)u256_to_u64(x));
         }
     }
 
@@ -1829,7 +1947,12 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
     int slen=(int)strlen(s);
     while(idx<slen && axx_q(s,slen,"**",idx)){
         uint256_t t=expr_factor(asmb,s,idx+2,&idx);
-        x=u256_pow(x,t);
+        if(asmb->st.exp_typ_float){
+            double a=u256_to_double(x), b=u256_to_double(t);
+            x=double_to_u256(pow(a,b));
+        } else {
+            x=u256_pow(x,t);
+        }
     }
     *idx_out=idx; return x;
 }
@@ -1838,17 +1961,43 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
     uint256_t x=expr_term0_0(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
     while(idx<slen){
+        int flt=asmb->st.exp_typ_float;
         if(s[idx]=='*'&&s[idx+1]!='*'){
             uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
-            x=u256_mul_signed(x,t);
+            if(flt) x=double_to_u256(u256_to_double(x)*u256_to_double(t));
+            else    x=u256_mul_signed(x,t);
         } else if(axx_q(s,slen,"//",idx)){
+            /* Floor division */
             uint256_t t=expr_term0_0(asmb,s,idx+2,&idx);
-            if(u256_is_zero(t)) printf("Division by 0 error.\n");
-            else x=u256_floordiv(x,t);
+            if(flt){
+                double b=u256_to_double(t);
+                if(b==0.0) printf("Division by 0 error.\n");
+                else x=double_to_u256(floor(u256_to_double(x)/b));
+            } else {
+                if(u256_is_zero(t)) printf("Division by 0 error.\n");
+                else x=u256_floordiv(x,t);
+            }
+        } else if(s[idx]=='/'&&s[idx+1]!='/'){
+            /* True division */
+            uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
+            if(flt){
+                double b=u256_to_double(t);
+                if(b==0.0) printf("Division by 0 error.\n");
+                else x=double_to_u256(u256_to_double(x)/b);
+            } else {
+                if(u256_is_zero(t)) printf("Division by 0 error.\n");
+                else x=u256_floordiv(x,t);
+            }
         } else if(s[idx]=='%'){
             uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
-            if(u256_is_zero(t)) printf("Division by 0 error.\n");
-            else x=u256_mod(x,t);
+            if(flt){
+                double b=u256_to_double(t);
+                if(b==0.0) printf("Division by 0 error.\n");
+                else x=double_to_u256(fmod(u256_to_double(x),b));
+            } else {
+                if(u256_is_zero(t)) printf("Division by 0 error.\n");
+                else x=u256_mod(x,t);
+            }
         } else break;
     }
     *idx_out=idx; return x;
@@ -1858,9 +2007,16 @@ static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_ou
     uint256_t x=expr_term0(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
     while(idx<slen){
-        if(s[idx]=='+'){uint256_t t=expr_term0(asmb,s,idx+1,&idx);x=u256_add(x,t);}
-        else if(s[idx]=='-'){uint256_t t=expr_term0(asmb,s,idx+1,&idx);x=u256_sub(x,t);}
-        else break;
+        int flt=asmb->st.exp_typ_float;
+        if(s[idx]=='+'){
+            uint256_t t=expr_term0(asmb,s,idx+1,&idx);
+            if(flt) x=double_to_u256(u256_to_double(x)+u256_to_double(t));
+            else    x=u256_add(x,t);
+        } else if(s[idx]=='-'){
+            uint256_t t=expr_term0(asmb,s,idx+1,&idx);
+            if(flt) x=double_to_u256(u256_to_double(x)-u256_to_double(t));
+            else    x=u256_sub(x,t);
+        } else break;
     }
     *idx_out=idx; return x;
 }
@@ -1947,13 +2103,32 @@ static uint256_t expr_term7(Assembler *asmb, const char *s, int idx, int *idx_ou
     uint256_t x=expr_term6(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
     while(idx<slen){
-        if(axx_q(s,slen,"<=",idx)){uint256_t t=expr_term6(asmb,s,idx+2,&idx);x=u256_from_i64(u256_le_signed(x,t)?1:0);}
-        else if(s[idx]=='<'&&s[idx+1]!='<'){uint256_t t=expr_term6(asmb,s,idx+1,&idx);x=u256_from_i64(u256_lt_signed(x,t)?1:0);}
-        else if(axx_q(s,slen,">=",idx)){uint256_t t=expr_term6(asmb,s,idx+2,&idx);x=u256_from_i64(u256_ge_signed(x,t)?1:0);}
-        else if(s[idx]=='>'&&s[idx+1]!='>'){uint256_t t=expr_term6(asmb,s,idx+1,&idx);x=u256_from_i64(u256_gt_signed(x,t)?1:0);}
-        else if(axx_q(s,slen,"==",idx)){uint256_t t=expr_term6(asmb,s,idx+2,&idx);x=u256_from_i64(u256_eq(x,t)?1:0);}
-        else if(axx_q(s,slen,"!=",idx)){uint256_t t=expr_term6(asmb,s,idx+2,&idx);x=u256_from_i64(!u256_eq(x,t)?1:0);}
-        else break;
+        int flt=asmb->st.exp_typ_float;
+        if(axx_q(s,slen,"<=",idx)){
+            uint256_t t=expr_term6(asmb,s,idx+2,&idx);
+            x=u256_from_i64(flt ? (u256_to_double(x)<=u256_to_double(t)?1:0)
+                                : (u256_le_signed(x,t)?1:0));
+        } else if(s[idx]=='<'&&s[idx+1]!='<'){
+            uint256_t t=expr_term6(asmb,s,idx+1,&idx);
+            x=u256_from_i64(flt ? (u256_to_double(x)< u256_to_double(t)?1:0)
+                                : (u256_lt_signed(x,t)?1:0));
+        } else if(axx_q(s,slen,">=",idx)){
+            uint256_t t=expr_term6(asmb,s,idx+2,&idx);
+            x=u256_from_i64(flt ? (u256_to_double(x)>=u256_to_double(t)?1:0)
+                                : (u256_ge_signed(x,t)?1:0));
+        } else if(s[idx]=='>'&&s[idx+1]!='>'){
+            uint256_t t=expr_term6(asmb,s,idx+1,&idx);
+            x=u256_from_i64(flt ? (u256_to_double(x)> u256_to_double(t)?1:0)
+                                : (u256_gt_signed(x,t)?1:0));
+        } else if(axx_q(s,slen,"==",idx)){
+            uint256_t t=expr_term6(asmb,s,idx+2,&idx);
+            x=u256_from_i64(flt ? (u256_to_double(x)==u256_to_double(t)?1:0)
+                                : (u256_eq(x,t)?1:0));
+        } else if(axx_q(s,slen,"!=",idx)){
+            uint256_t t=expr_term6(asmb,s,idx+2,&idx);
+            x=u256_from_i64(flt ? (u256_to_double(x)!=u256_to_double(t)?1:0)
+                                : (!u256_eq(x,t)?1:0));
+        } else break;
     }
     *idx_out=idx; return x;
 }
@@ -2209,8 +2384,15 @@ static void dir_error(Assembler *asmb, const char *s){
     while(1){
         if(!buf[idx]) break;
         if(buf[idx]==','){idx++;continue;}
+        /* Python evaluates the condition (u) in float mode, matching:
+         *   self.expr_eval.state.exp_typ = 'f'
+         *   u, idxn = self.expr_eval.expression_pat(s, idx)
+         *   self.expr_eval.state.exp_typ = prev_typ               */
         int io;
+        int prev_flt = st->exp_typ_float;
+        st->exp_typ_float = 1;
         uint256_t u=expr_expression_pat(asmb,buf,idx,&io);
+        st->exp_typ_float = prev_flt;
         idx=io;
         if(buf[idx]==';') idx++;
         uint256_t t=expr_expression_pat(asmb,buf,idx,&io);
@@ -2222,6 +2404,37 @@ static void dir_error(Assembler *asmb, const char *s){
             printf(": \n");
         }
     }
+}
+
+/* -------------------------------------------------------
+ * expr_expression_esc_float():
+ *   Evaluate expression in floating-point mode for !F/!D/!Q pattern capture.
+ *
+ *   Temporarily sets exp_typ_float=1 and calls expr_expression_esc()
+ *   (the native C evaluator) so that number literals are parsed as
+ *   doubles and arithmetic is done in double precision.
+ *
+ *   Mirrors axx.py ExpressionEvaluator.expression_esc_float():
+ *     prev = self.state.exp_typ
+ *     self.state.exp_typ = 'f'
+ *     try:
+ *         v,idx = self.expression_esc(s,idx,stopchar)
+ *     finally:
+ *         self.state.exp_typ = prev
+ *     return (v,idx)
+ *
+ *   Returns the raw double result as a uint256_t bit-cast (w[0] holds
+ *   the IEEE754 bits).  The caller converts to float/double/quad as
+ *   appropriate.
+ * ------------------------------------------------------- */
+static uint256_t expr_expression_esc_float(Assembler *asmb, const char *s,
+                                            int idx, char stopchar, int *idx_out)
+{
+    int prev = asmb->st.exp_typ_float;
+    asmb->st.exp_typ_float = 1;
+    uint256_t r = expr_expression_esc(asmb, s, idx, stopchar, idx_out);
+    asmb->st.exp_typ_float = prev;
+    return r;
 }
 
 /* =========================================================
@@ -2312,7 +2525,45 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
         } else if(a=='!'){
             idx_t++;
             a=t[idx_t]; idx_t++;
-            if(a=='!'){
+            /* --- !F : capture float32 bit-pattern -------------------------
+             *   !F<var>[\stopchar]  reads a float expression from source,
+             *   packs as IEEE754 32-bit and stores the integer bit-pattern.
+             *   Mirrors axx.py match() case a=='F'. */
+            if(a=='F' || a=='D' || a=='Q'){
+                char ftype = a;
+                a = t[idx_t]; idx_t++;          /* variable name (single char) */
+                idx_t = axx_skipspc(t, idx_t);
+                char stopchar = '\0';
+                if(idx_t < tlen && t[idx_t] == '\\'){
+                    idx_t++;                    /* skip '\' */
+                    idx_t = axx_skipspc(t, idx_t);
+                    stopchar = t[idx_t]; idx_t++; /* stopchar, then advance */
+                }
+                /* Evaluate in float mode using the native C evaluator.
+                 * expr_expression_esc_float() returns the double result as a
+                 * uint256_t bit-cast (w[0] holds the IEEE754 double bits). */
+                uint256_t fv = expr_expression_esc_float(asmb, s, idx_s, stopchar, &idx_s);
+                double dv = u256_to_double(fv);
+                /* consume stopchar from source if present */
+                if(stopchar != '\0' && idx_s < (int)strlen(s) && s[idx_s] == stopchar)
+                    idx_s++;
+                if(ftype == 'F'){
+                    /* float32: pack → integer bit-pattern */
+                    float fval = (float)dv;
+                    uint32_t bits; memcpy(&bits, &fval, 4);
+                    var_put(st, a, u256_from_u64((uint64_t)bits));
+                } else if(ftype == 'D'){
+                    /* float64: pack → integer bit-pattern */
+                    uint64_t bits; memcpy(&bits, &dv, 8);
+                    var_put(st, a, u256_from_u64(bits));
+                } else {
+                    /* !Q : IEEE754 128-bit (quad) bit-pattern */
+                    char fstr[64]; snprintf(fstr, sizeof(fstr), "%.17g", dv);
+                    uint256_t qbits = ieee754_128_from_str(fstr);
+                    var_put(st, a, qbits);
+                }
+                continue;
+            } else if(a=='!'){
                 a=t[idx_t]; idx_t++;
                 /* ELF tracking: record which variable is being captured */
                 st->elf_capturing_var = a;
@@ -2795,6 +3046,9 @@ static void asciistr(Assembler *asmb, const char *l2){
         if(l2[idx]=='\\'&&l2[idx+1]=='0'){ ch=0; idx+=2; }
         else if(l2[idx]=='\\'&&l2[idx+1]=='t'){ ch='\t'; idx+=2; }
         else if(l2[idx]=='\\'&&l2[idx+1]=='n'){ ch='\n'; idx+=2; }
+        else if(l2[idx]=='\\'&&l2[idx+1]=='r'){ ch='\r'; idx+=2; }
+        else if(l2[idx]=='\\'&&l2[idx+1]=='\\'){ ch='\\'; idx+=2; }
+        else if(l2[idx]=='\\'&&l2[idx+1]=='"'){ ch='"'; idx+=2; }
         else { ch=(unsigned char)l2[idx]; idx++; }
         outbin(st,st->pc,u256_from_u64(ch));
         st->pc=u256_add(st->pc,u256_one());
@@ -2806,7 +3060,14 @@ static int adir_section(AsmState *st, const char *l, const char *l2){
     if(strcmp(up,"SECTION")!=0 && strcmp(up,"SEGMENT")!=0) return 0;
     if(l2&&l2[0]){
         strncpy(st->current_section,l2,sizeof(st->current_section)-1);
-        secmap_set(&st->sections,l2,st->pc,u256_zero());
+        /* Only record start address the first time a section is declared.
+         * Re-declarations (.text -> .data -> .text) must not overwrite the
+         * original start, otherwise ELF section start / endsection size
+         * calculation would be corrupted.  Mirrors axx.py section_processing:
+         *   if l2 not in self.state.sections:
+         *       self.state.sections[l2] = [self.state.pc, 0]            */
+        if(!secmap_find(&st->sections,l2))
+            secmap_set(&st->sections,l2,st->pc,u256_zero());
     }
     return 1;
 }
@@ -2814,7 +3075,12 @@ static int adir_endsection(AsmState *st, const char *l){
     char up[32]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,"ENDSECTION")!=0 && strcmp(up,"ENDSEGMENT")!=0) return 0;
     SecEntry *e=secmap_find(&st->sections,st->current_section);
-    if(e){ e->size=u256_sub(st->pc,e->start); }
+    if(!e){
+        printf(" error - ENDSECTION without matching SECTION for '%s'.\n",
+               st->current_section);
+        return 1;
+    }
+    e->size=u256_sub(st->pc,e->start);
     return 1;
 }
 static int adir_zero(Assembler *asmb, const char *l, const char *l2){
@@ -3721,6 +3987,7 @@ int main(int argc, char *argv[]){
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--osabi")==0&&i+1<argc){ strncpy(osabistr,argv[++i],sizeof(osabistr)-1); }
         else if(strcmp(argv[i],"-b")==0&&i+1<argc){ strncpy(st->outfile,argv[++i],sizeof(st->outfile)-1); }
+        else if(strcmp(argv[i],"-e")==0&&i+1<argc){ strncpy(st->expfile,argv[++i],sizeof(st->expfile)-1); }
         else if(strcmp(argv[i],"-E")==0&&i+1<argc){ expfile_elf=argv[++i]; }
         else if(strcmp(argv[i],"-i")==0&&i+1<argc){ strncpy(st->impfile,argv[++i],sizeof(st->impfile)-1); }
         else if(strcmp(argv[i],"-o")==0&&i+1<argc){ strncpy(st->elf_objfile,argv[++i],sizeof(st->elf_objfile)-1); }
