@@ -20,7 +20,7 @@ GitHub: https://github.com/fygar256/axx_relocatable_elf_generation
 
 C version is also available. C version is nameded Caxx. Caxx is much faster than Paxx.
 
-Paxx is newest version , Caxx is version 7.5.7.0-stable.
+Paxx is newest version , Caxx is version 7.5.7.
 
 ## install and execution(assemble) Python version 'Paxx'
 
