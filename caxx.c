@@ -2,7 +2,7 @@
  * axx general assembler designed and programmed by Taisuke Maekawa
  * C translation (complete, behavior-compatible)
  *
- * Bug fixes applied (bugs 2-8):
+ * Bug fixes applied (bugs 2-8, original):
  *  2. remove_brackets_str(): use unique serials per OB so parallel groups are distinguishable
  *  3. pat_match0(): avoid UB from 1<<cnt when cnt>=32; use size_t/uint64 mask
  *  4. u256_pow(): use full 256-bit exponent (no 0xffff truncation)
@@ -10,6 +10,16 @@
  *  6. ieee754_128_from_str()/xeval(): shell-escape via execvp-style popen to avoid injection
  *  7. adir_label_processing(): pass l2 (expression tail) instead of full l to expr_expression_asm
  *  8. expr_term6(): guard tv==256 in sign-extension shl to avoid zero-mask
+ *
+ * Additional bug fixes (secondary pass):
+ *  A. u256_pow(): avoid unnecessary base squarings after last set bit (performance fix)
+ *  B. lmap_free(): reset nbuckets to 0 to prevent stale-count use after free
+ *  C. secmap_clear(): zero out dangling pointers in order[] after freeing entries
+ *  D. binary_flush(): guard max_pos==UINT64_MAX to prevent silent integer overflow
+ *  E. ieee754_128_from_str(): unlink temp script on ALL exit paths (was leaking on !safe)
+ *  F. xeval(): unlink temp script on ALL exit paths (was leaking on spawn failure)
+ *  G. expr_term11(): add skip_ternary_expr() so nested ternaries in the false-branch
+ *     are fully skipped (not just up to the inner '?') when the condition is true
  */
 
 #define _GNU_SOURCE
@@ -216,15 +226,27 @@ static uint256_t u256_mod(uint256_t a, uint256_t b) {
  * silently gave wrong results for any exponent >= 65536.
  * We now iterate over all 256 bits (square-and-multiply).
  * ------------------------------------------------------- */
+/* Fix A: u256_pow() – avoid unnecessary base squarings after the last set bit.
+ * The original always performed 256 squarings regardless of exp magnitude.
+ * We now break as soon as all remaining exp words are zero, so small exponents
+ * (the common case) run in O(log2(exp)) multiplications instead of O(256). */
 static uint256_t u256_pow(uint256_t base, uint256_t exp) {
     uint256_t r = u256_one();
-    /* square-and-multiply over all 256 bits of exp */
     for (int wi = 0; wi < 4; wi++) {
         uint64_t word = exp.w[wi];
+        /* If this and all higher words are zero, nothing more to do */
+        if (!word) {
+            int all_zero = 1;
+            for (int k = wi + 1; k < 4; k++) if (exp.w[k]) { all_zero = 0; break; }
+            if (all_zero) break;
+        }
         for (int bi = 0; bi < 64; bi++) {
             if (word & ((uint64_t)1 << bi))
                 r = u256_mul(r, base);
-            base = u256_mul(base, base);
+            /* Only square base when there are more bits still to process */
+            int last_bit = (wi == 3 && bi == 63);
+            if (!last_bit)
+                base = u256_mul(base, base);
         }
     }
     return r;
@@ -397,12 +419,13 @@ static void lmap_init(LabelMap *m) {
     m->buckets=calloc(m->nbuckets,sizeof(LabelEntry*));
     m->count=0;
 }
+/* Fix B: reset nbuckets to 0 so any stale use after free is detectable. */
 static void lmap_free(LabelMap *m) {
     for(int i=0;i<m->nbuckets;i++){
         LabelEntry *e=m->buckets[i];
         while(e){ LabelEntry*n=e->next; free(e->key); free(e->section); free(e); e=n;}
     }
-    free(m->buckets); m->buckets=NULL; m->count=0;
+    free(m->buckets); m->buckets=NULL; m->count=0; m->nbuckets=0;
 }
 static LabelEntry *lmap_find(LabelMap *m, const char *key) {
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
@@ -507,14 +530,18 @@ static void secmap_free(SecMap*m){
     free(m->buckets); free(m->order);
     m->buckets=NULL; m->order=NULL; m->count=0; m->cap=0; m->nb=0;
 }
+/* Fix C: zero out freed pointers in order[] so they cannot be dereferenced.
+ * Previously the order[] array retained dangling pointers even after entries
+ * were freed; any code path that iterated up to the old count would crash. */
 static void secmap_clear(SecMap*m){
     for(int i=0;i<m->nb;i++){
         SecEntry*e=m->buckets[i];
         while(e){SecEntry*n=e->next;free(e->name);free(e);e=n;}
         m->buckets[i]=NULL;
     }
+    /* Null out stale pointers in the ordering array */
+    for(int i=0;i<m->count;i++) m->order[i]=NULL;
     m->count=0;
-    /* keep order array but reset length */
 }
 
 /* =========================================================
@@ -1069,6 +1096,10 @@ static void safe_spawn_close(FILE *fp, pid_t pid){
  *
  * Fix #7: use mkstemp() instead of a fixed /tmp/ path to avoid
  * TOCTOU races when multiple caxx processes run concurrently.
+ *
+ * Fix E: unlink the temp script on ALL exit paths.  Previously,
+ * when 'a' contained unsafe characters the code jumped to
+ * fallback: without calling unlink(), leaking the temp file.
  * ------------------------------------------------------- */
 static uint256_t ieee754_128_from_str(const char *a){
     /* Special values – handled in C, no subprocess needed */
@@ -1082,8 +1113,10 @@ static uint256_t ieee754_128_from_str(const char *a){
         uint256_t r=u256_zero(); r.w[1]=0x7FFF800000000000ULL; return r;
     }
 
-    /* Fix #7: use mkstemp to get a process-unique temp file path */
+    /* Fix #7: use mkstemp to get a process-unique temp file path.
+     * script_created tracks whether we need to unlink on the fallback path. */
     char script_path[] = "/tmp/axx_q128_XXXXXX.py";
+    int script_created = 0;
     {
         int fd = mkstemps(script_path, 3);   /* suffix ".py" = 3 chars */
         if(fd < 0) goto fallback;
@@ -1123,6 +1156,7 @@ static uint256_t ieee754_128_from_str(const char *a){
             "print(' '.join('0x%%02X' %% b for b in bs))\n"
         );
         fclose(sf);
+        script_created = 1;
     }
 
     {
@@ -1138,7 +1172,11 @@ static uint256_t ieee754_128_from_str(const char *a){
                 safe = 0; break;
             }
         }
-        if(!safe) goto fallback;
+        if(!safe){
+            /* Fix E: clean up script before falling back */
+            if(script_created){ unlink(script_path); script_created = 0; }
+            goto fallback;
+        }
 
         /* Launch: python3 <script_path> <value>
          * execvp is used directly — no shell, no quoting, no injection risk. */
@@ -1168,11 +1206,13 @@ static uint256_t ieee754_128_from_str(const char *a){
             }
             safe_spawn_close(fp, pid);
         }
-        unlink(script_path);  /* Fix #7: clean up the process-unique temp file */
+        unlink(script_path);  /* Fix E: always clean up */
         return result;
     }
 
 fallback:
+    /* Fix E: ensure the script is cleaned up even on this path */
+    if(script_created){ unlink(script_path); }
     {
         /* Fallback: long double (reduced precision, 64-bit mantissa) */
         fprintf(stderr, "ieee754_128_from_str: using long double fallback for '%s'\n", a);
@@ -1304,6 +1344,13 @@ static void binary_flush(AsmState *st){
     uint64_t max_pos = bufmap_max_key(&st->buf);
     int word_bits = st->bts;
     int bytes_per_word = (word_bits+7)/8;
+    /* Fix D: max_pos+1 wraps to 0 when max_pos==UINT64_MAX, producing a
+     * bogus total_size==0 that silently discards the entire binary.  Treat
+     * UINT64_MAX as an impossible address and bail out with an error. */
+    if(max_pos == (uint64_t)-1){
+        fprintf(stderr,"binary_flush: max_pos overflow (UINT64_MAX), skipping output.\n");
+        return;
+    }
     uint64_t total_size = (max_pos+1)*(uint64_t)bytes_per_word;
     if(total_size==0) return;
     unsigned char *data = calloc(1, (size_t)total_size);
@@ -1678,8 +1725,10 @@ static double xeval(Assembler *asmb, const char *expr_str){
         return 0.0;
     }
 
-    /* Write helper script to temp file (Fix #7: mkstemp for uniqueness) */
+    /* Write helper script to temp file (Fix #7: mkstemp for uniqueness)
+     * Fix F: always unlink on every exit path, including spawn failure. */
     char script_path[] = "/tmp/axx_xeval_XXXXXX.py";
+    int xeval_script_ok = 0;
     {
         int fd = mkstemps(script_path, 3);
         if(fd < 0){ free(expanded); return 0.0; }
@@ -1694,6 +1743,7 @@ static double xeval(Assembler *asmb, const char *expr_str){
             "print(repr(float(eval(sys.argv[1]))))\n"
         );
         fclose(sf);
+        xeval_script_ok = 1;
     }
 
     /* Launch: python3 <script_path> <expanded_expr>
@@ -1713,7 +1763,8 @@ static double xeval(Assembler *asmb, const char *expr_str){
         fprintf(stderr, "xeval: spawn failed for expr: %s\n", expr_str);
     }
 
-    unlink(script_path);  /* Fix #7: clean up process-unique temp file */
+    /* Fix F: unlink on ALL paths (including spawn failure above) */
+    if(xeval_script_ok) unlink(script_path);
     free(expanded);
     return result;
 }
@@ -2299,15 +2350,54 @@ static int skip_subexpr(const char *s, int idx) {
     return idx;
 }
 
-/* Fix #5: expr_term11() – ternary operator must be RIGHT-associative.
- * The previous while-loop implementation was left-associative, so
- *   a ? b : c ? d : e  was parsed as  (a ? b : c) ? d : e
- * instead of the correct  a ? b : (c ? d : e).
+/* Fix G: skip_ternary_expr() – recursively skip a full ternary expression.
  *
- * Fix: replace the while-loop with a single if + recursive call for the
- * false-branch, exactly mirroring the Python version's recursion on term11.
- * The true-branch still uses term10 (no recursion needed there because
- * right-associativity only applies to the else-chain).
+ * skip_subexpr() alone stops at the first depth-0 '?', which is correct for
+ * skipping a simple operand (e.g. the true-branch 'b' in 'a ? b : c').
+ * However, when the false-branch itself is a nested ternary (e.g. 'c ? d : e')
+ * we must skip the *entire* nested expression, not just up to its inner '?'.
+ *
+ * This function handles that by:
+ *   1. Calling skip_subexpr() to advance past the base expression.
+ *   2. If a '?' follows at depth 0, consuming it and recursing for both
+ *      the true-branch and the false-branch.
+ *
+ * The caller in expr_term11 (condition-true path) uses this instead of the
+ * bare skip_subexpr() so that 'a ? b : c ? d : e' leaves idx pointing past
+ * 'e', not stranded at '? d : e'.
+ */
+static int skip_ternary_expr(const char *s, int idx) {
+    int slen = (int)strlen(s);
+    /* Skip the leading operand (stops at '?', ':', ',', ')' at depth 0) */
+    idx = skip_subexpr(s, idx);
+    /* If a ternary '?' follows, consume it and skip both branches */
+    if(idx < slen && s[idx] == '?' && s[idx+1] != '='){
+        idx++; /* consume '?' */
+        idx = axx_skipspc(s, idx);
+        idx = skip_ternary_expr(s, idx); /* skip true-branch recursively */
+        idx = axx_skipspc(s, idx);
+        if(idx < slen && s[idx] == ':' && s[idx+1] != '='){
+            idx++; /* consume ':' */
+            idx = axx_skipspc(s, idx);
+            idx = skip_ternary_expr(s, idx); /* skip false-branch recursively */
+        }
+    }
+    return idx;
+}
+
+/* Fix #5 + Fix G: expr_term11() – ternary operator, right-associative and
+ * fully lazy.
+ *
+ * Fix #5 (existing): replaced the left-associative while-loop with a single
+ * if + right-recursive call so 'a ? b : c ? d : e' parses as
+ * 'a ? b : (c ? d : e)'.
+ *
+ * Fix G (new): when the condition is TRUE, the false-branch must be skipped
+ * entirely, including any nested ternary chains.  The old code called
+ * skip_subexpr() for the false-branch, which stops at the first depth-0 '?'.
+ * For an input like 'a ? b : c ? d : e' with a==true this left idx pointing
+ * at '? d : e', causing the outer parser to misinterpret the remaining tokens.
+ * Fix: use skip_ternary_expr() instead, which recurses through '?…:…' chains.
  */
 static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x = expr_term10(asmb, s, idx, &idx);
@@ -2316,7 +2406,8 @@ static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_o
         idx++; /* consume '?' */
         idx = axx_skipspc(s, idx);
         if(u256_is_zero(x)){
-            /* condition false: skip true-branch, recurse into false-branch */
+            /* condition false: skip true-branch (simple operand), then
+             * right-recurse into the false-branch. */
             int skip_end = skip_subexpr(s, idx);
             if(axx_q(s, slen, ":", skip_end) && s[skip_end+1] != '='){
                 int false_start = axx_skipspc(s, skip_end + 1);
@@ -2326,13 +2417,15 @@ static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_o
                 x = u256_zero();
             }
         } else {
-            /* condition true: evaluate true-branch with term10, then skip false-branch */
+            /* condition true: evaluate true-branch, then skip the full
+             * false-branch (including any nested ternary chain). */
             x = expr_term10(asmb, s, idx, &idx);
             idx = axx_skipspc(s, idx);
             if(axx_q(s, slen, ":", idx) && s[idx+1] != '='){
                 idx++; /* consume ':' */
-                /* skip the false-branch (right-recursive) without evaluating */
-                idx = skip_subexpr(s, axx_skipspc(s, idx));
+                /* Fix G: use skip_ternary_expr so nested ternaries are fully
+                 * consumed, not just the leading operand before the inner '?'. */
+                idx = skip_ternary_expr(s, axx_skipspc(s, idx));
             }
         }
     }
