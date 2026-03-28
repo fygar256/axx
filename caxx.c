@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <libgen.h>
 #include <sys/wait.h>
 
 /* =========================================================
@@ -616,19 +617,20 @@ static void bufmap_free(BufMap*m){
 #define EXP_ASM  1
 
 static const char *ERRORS_TABLE[] = {
-    "Value out of range.",
-    "Invalid syntax.",
-    "Address out of range.",
-    "",
-    "",
-    "Register out of range.",
-    "Port number out of range."
+    "",                          /* 0 – empty (Python ERRORS[0]) */
+    "Invalid syntax.",           /* 1 */
+    "Address out of range.",     /* 2 */
+    "Value out of range.",       /* 3 */
+    "",                          /* 4 – empty */
+    "Register out of range.",    /* 5 */
+    "Port number out of range."  /* 6 */
 };
 #define ERRORS_COUNT 7
 
 typedef struct {
     char outfile[512];
     char expfile[512];
+    char expfile_elf[512];   /* -E option: ELF-format export TSV */
     char impfile[512];
     int  osabi;
 
@@ -767,6 +769,7 @@ static void state_init(AsmState *st) {
     st->padding = u256_zero();
     st->pass1_size_mode = 0;
     st->stdin_tmp_path[0] = '\0';
+    st->expfile_elf[0] = '\0';
     st->elf_objfile[0] = '\0';
     st->elf_machine = 62;
     st->elf_tracking = 0;
@@ -893,7 +896,19 @@ static void axx_get_string(const char *l2, char *out, size_t osz) {
     if(!l2[idx]||l2[idx]!='"') return;
     idx++;
     size_t n=0;
-    while(l2[idx]&&l2[idx]!='"'&&n<osz-1) out[n++]=l2[idx++];
+    while(l2[idx]&&l2[idx]!='"'&&n<osz-1){
+        if(l2[idx]=='\\'&&l2[idx+1]){
+            char nc=l2[idx+1];
+            if     (nc=='"')  { out[n++]='"';  idx+=2; }
+            else if(nc=='\\') { out[n++]='\\'; idx+=2; }
+            else if(nc=='n')  { out[n++]='\n'; idx+=2; }
+            else if(nc=='t')  { out[n++]='\t'; idx+=2; }
+            else if(nc=='r')  { out[n++]='\r'; idx+=2; }
+            else              { out[n++]=nc;   idx+=2; }
+        } else {
+            out[n++]=l2[idx++];
+        }
+    }
     out[n]=0;
 }
 
@@ -1437,13 +1452,27 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
     lmap_set(&st->labels,k,v,sec,is_equ);
     return 1;
 }
+/* label_print_all: mirrors Python LabelManager.printlabels()
+ *   result = {}
+ *   for key, value in self.state.labels.items():
+ *       num = value[0]; section = value[1]
+ *       result[key] = [hex(num), section]
+ *   print(result)
+ * Output: {'label': ['0xVAL', 'section'], ...} on one line */
 static void label_print_all(AsmState *st){
+    int first=1;
+    printf("{");
     for(int i=0;i<st->labels.nbuckets;i++){
         for(LabelEntry*e=st->labels.buckets[i];e;e=e->next){
-            printf("'%s': [0x%llx, '%s']\n",
-                   e->key,(unsigned long long)u256_to_u64(e->value),e->section);
+            if(!first) printf(", ");
+            printf("'%s': ['0x%llx', '%s']",
+                   e->key,
+                   (unsigned long long)u256_to_u64(e->value),
+                   e->section);
+            first=0;
         }
     }
+    printf("}\n");
 }
 
 /* =========================================================
@@ -1697,8 +1726,10 @@ static uint256_t expr_factor(Assembler *asmb, const char *s, int idx, int *idx_o
 
     if(idx+4<=slen && strncmp(s+idx,"!!!!",4)==0 && st->expmode==EXP_PAT){
         x=u256_from_i64(st->vliwstop); idx+=4;
+        if(asmb->st.exp_typ_float) x=double_to_u256((double)st->vliwstop);
     } else if(idx+3<=slen && strncmp(s+idx,"!!!",3)==0 && st->expmode==EXP_PAT){
         x=u256_from_i64(st->vcnt); idx+=3;
+        if(asmb->st.exp_typ_float) x=double_to_u256((double)st->vcnt);
     } else if(s[idx]=='-'){
         x=expr_factor(asmb,s,idx+1,&idx);
         if(asmb->st.exp_typ_float){
@@ -1709,10 +1740,16 @@ static uint256_t expr_factor(Assembler *asmb, const char *s, int idx, int *idx_o
         }
     } else if(s[idx]=='~'){
         x=expr_factor(asmb,s,idx+1,&idx);
+        /* ~ is bitwise NOT: always integer, same as Python (int only) */
         x=u256_not(x);
     } else if(s[idx]=='@'){
         x=expr_factor(asmb,s,idx+1,&idx);
-        x=u256_from_i64(u256_nbit(x));
+        /* nbit(x) is always integer; in float mode promote to double */
+        int nb = u256_nbit(x);
+        if(asmb->st.exp_typ_float)
+            x=double_to_u256((double)nb);
+        else
+            x=u256_from_i64(nb);
     } else if(s[idx]=='*'){
         if(idx+1<slen && s[idx+1]=='('){
             int i2;
@@ -1747,11 +1784,17 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         x=expr_expression(asmb,s,idx+1,&idx);
         if(s[idx]==')') idx++;
     }
-    else if(idx+4<=slen && strncmp(s+idx,"'\\t'",4)==0){ x=u256_from_i64(0x09); idx+=4; }
-    else if(idx+4<=slen && strncmp(s+idx,"'\\''",4)==0){ x=u256_from_i64('\''); idx+=4; }
-    else if(idx+4<=slen && strncmp(s+idx,"'\\\\'",4)==0){ x=u256_from_i64('\\'); idx+=4; }
-    else if(idx+4<=slen && strncmp(s+idx,"'\\n'",4)==0){ x=u256_from_i64(0x0a); idx+=4; }
-    else if(idx+3<=slen && s[idx]=='\'' && s[idx+2]=='\''){ x=u256_from_i64((unsigned char)s[idx+1]); idx+=3; }
+    else if(idx+4<=slen && strncmp(s+idx,"'\\t'",4)==0){ x=u256_from_i64(0x09); idx+=4;
+        if(asmb->st.exp_typ_float) x=double_to_u256(9.0); }
+    else if(idx+4<=slen && strncmp(s+idx,"'\\''",4)==0){ x=u256_from_i64('\''); idx+=4;
+        if(asmb->st.exp_typ_float) x=double_to_u256((double)'\''); }
+    else if(idx+4<=slen && strncmp(s+idx,"'\\\\'",4)==0){ x=u256_from_i64('\\'); idx+=4;
+        if(asmb->st.exp_typ_float) x=double_to_u256((double)'\\'); }
+    else if(idx+4<=slen && strncmp(s+idx,"'\\n'",4)==0){ x=u256_from_i64(0x0a); idx+=4;
+        if(asmb->st.exp_typ_float) x=double_to_u256(10.0); }
+    else if(idx+3<=slen && s[idx]=='\'' && s[idx+2]=='\''){
+        unsigned char cv=(unsigned char)s[idx+1]; x=u256_from_i64(cv); idx+=3;
+        if(asmb->st.exp_typ_float) x=double_to_u256((double)cv); }
     else if(axx_q(s,slen,"$$",idx)){
         idx+=2;
         x=st->pc;
@@ -1774,6 +1817,9 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             x=u256_add(u256_mul(x,u256_from_u64(2)), u256_from_u64(s[idx]-'0'));
             idx++;
         }
+        /* In float mode, promote integer value to double (Python auto-promotion) */
+        if(asmb->st.exp_typ_float)
+            x=double_to_u256((double)(int64_t)u256_to_i64(x));
     }
     else if(axx_q(s,slen,"0x",idx)){
         idx+=2;
@@ -1783,6 +1829,9 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             x=u256_add(u256_mul(x,u256_from_u64(16)), u256_from_u64((uint64_t)d));
             idx++;
         }
+        /* In float mode, promote integer value to double (Python auto-promotion) */
+        if(asmb->st.exp_typ_float)
+            x=double_to_u256((double)(int64_t)u256_to_i64(x));
     }
     else if(idx+3<=slen && strncmp(s+idx,"qad",3)==0){
         idx+=3;
@@ -1903,6 +1952,24 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         } else {
             x=var_get(st,ch);
             idx++;
+            /* In float mode, promote the variable's stored integer value to
+             * double, matching Python's automatic int→float type promotion.
+             * Exception: if the variable was captured by !F/!D (float bit-
+             * pattern), the value is already stored as a double bit-cast and
+             * must NOT be re-promoted.  We detect this by checking whether the
+             * raw w[0] pattern, when decoded as int64, produces the same double
+             * as when decoded as a double — if different, it's a double already.
+             *
+             * Simpler heuristic: just convert via (double)(int64_t)val.
+             * This is what Python does: all values in the assembler are Python
+             * ints; float mode only changes how *literals* are parsed.  When a
+             * pattern variable is read in float mode it starts as an int and
+             * Python auto-promotes it in any float arithmetic/comparison.
+             * Variables set by !F/!D store integer BIT PATTERNS, not floats;
+             * their bit-patterns happen to be used in integer-mode makeobj, not
+             * in float-mode expressions.  So (double)(int64_t)val is correct. */
+            if(asmb->st.exp_typ_float)
+                x=double_to_u256((double)(int64_t)u256_to_i64(x));
             /* ELF tracking: if inside makeobj and the variable was captured
              * from a single label by match(), record it as a relocation ref. */
             if(st->elf_tracking && st->elf_current_word_idx >= 0){
@@ -2664,30 +2731,64 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
 /* =========================================================
  * PatternFileReader
  * ========================================================= */
-static void readpat(Assembler *asmb, const char *fn);
-static void include_pat(Assembler *asmb, const char *l);
+/* -------------------------------------------------------
+ * axx_resolve_path(): resolve a (possibly relative) filename
+ * against base_dir.  If base_dir is NULL or empty, or fn is
+ * absolute, fn is returned unchanged (copied into out).
+ * Mirrors axx.py readpat() / include_asm() path resolution:
+ *   if base_dir and not os.path.isabs(fn):
+ *       fn = os.path.join(base_dir, fn)
+ * ------------------------------------------------------- */
+static void axx_resolve_path(const char *base_dir, const char *fn,
+                              char *out, size_t osz)
+{
+    if(!fn || !fn[0]){ out[0]='\0'; return; }
+    /* absolute path: use as-is */
+    if(fn[0]=='/' || !base_dir || !base_dir[0]){
+        strncpy(out, fn, osz-1); out[osz-1]='\0'; return;
+    }
+    snprintf(out, osz, "%s/%s", base_dir, fn);
+}
 
-/* Bug 5 fix: include_pat()
- * The original passed `l+8` to axx_get_string(), hard-coding an 8-character
- * skip that is only correct when the line starts at column 0.  When the
- * assembler source has leading whitespace before ".INCLUDE", `idx` holds the
- * actual start position and the filename parser must begin at `l+idx+8`
- * (skip idx leading spaces, then the 8 characters of ".INCLUDE" itself).
- * Without this fix, indented .INCLUDE lines silently fail to load the file. */
-static void include_pat(Assembler *asmb, const char *l){
+/* axx_dir_of(): extract the directory component of path into out.
+ * If path has no directory part (no '/'), out is set to ".". */
+static void axx_dir_of(const char *path, char *out, size_t osz)
+{
+    strncpy(out, path, osz-1); out[osz-1]='\0';
+    /* Use dirname() from libgen.h – it modifies the buffer in-place */
+    char *d = dirname(out);
+    if(d != out) strncpy(out, d, osz-1);
+}
+
+static void readpat(Assembler *asmb, const char *fn);
+static void include_pat(Assembler *asmb, const char *l, const char *base_dir);
+
+/* Bug 5 fix + relative-path fix: include_pat()
+ * Now accepts base_dir (the directory of the calling pattern file) and
+ * resolves the .INCLUDE filename relative to it, exactly as axx.py does:
+ *   this_dir = os.path.dirname(os.path.abspath(fn))
+ *   ww = self.include_pat(l, this_dir)  */
+static void include_pat(Assembler *asmb, const char *l, const char *base_dir){
     int idx=axx_skipspc(l,0);
     char upper8[16]={0};
     for(int i=0;i<8&&l[idx+i];i++) upper8[i]=axx_upper_char(l[idx+i]);
     if(strcmp(upper8,".INCLUDE")!=0) return;
-    char s[512];
-    axx_get_string(l+idx+8,s,sizeof(s));
-    if(s[0]) readpat(asmb,s);
+    char raw[512]; axx_get_string(l+idx+8,raw,sizeof(raw));
+    if(!raw[0]) return;
+    char resolved[1024];
+    axx_resolve_path(base_dir, raw, resolved, sizeof(resolved));
+    readpat(asmb, resolved);
 }
 
 static void readpat(Assembler *asmb, const char *fn){
     if(!fn||!fn[0]) return;
     FILE *f=fopen(fn,"rt");
     if(!f){ fprintf(stderr,"Cannot open pattern file: %s\n",fn); return; }
+
+    /* Compute this file's directory for recursive .INCLUDE resolution */
+    char this_dir[1024];
+    axx_dir_of(fn, this_dir, sizeof(this_dir));
+
     char line[4096];
     while(fgets(line,sizeof(line),f)){
         axx_remove_comment(line);
@@ -2699,7 +2800,7 @@ static void readpat(Assembler *asmb, const char *fn){
         char uline[16]={0};
         int si=axx_skipspc(line,0);
         for(int i=0;i<8&&line[si+i];i++) uline[i]=axx_upper_char(line[si+i]);
-        if(strcmp(uline,".INCLUDE")==0){ include_pat(asmb,line+si); continue; }
+        if(strcmp(uline,".INCLUDE")==0){ include_pat(asmb,line+si,this_dir); continue; }
 
         char fields[8][1024]; int nf=0;
         int idx=0;
@@ -3037,9 +3138,12 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
     strncpy(out,l,osz-1); out[osz-1]=0; return out;
 }
 
-static void asciistr(Assembler *asmb, const char *l2){
+/* asciistr: output quoted string bytes.
+ * Returns 1 if l2 started with '"' (valid quoted string), 0 otherwise.
+ * Mirrors axx.py asciistr() which returns True/False. */
+static int asciistr(Assembler *asmb, const char *l2){
     AsmState *st=&asmb->st;
-    if(!l2[0]||l2[0]!='"') return;
+    if(!l2[0]||l2[0]!='"') return 0;
     int idx=1;
     while(l2[idx]&&l2[idx]!='"'){
         unsigned char ch;
@@ -3053,6 +3157,7 @@ static void asciistr(Assembler *asmb, const char *l2){
         outbin(st,st->pc,u256_from_u64(ch));
         st->pc=u256_add(st->pc,u256_one());
     }
+    return 1;
 }
 
 static int adir_section(AsmState *st, const char *l, const char *l2){
@@ -3098,12 +3203,19 @@ static int adir_zero(Assembler *asmb, const char *l, const char *l2){
 static int adir_ascii(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ASCII")!=0) return 0;
-    asciistr(asmb,l2); return 1;
+    /* Return the result of asciistr: 0 if l2 is not a quoted string.
+     * Mirrors axx.py ascii_processing() which returns asciistr(). */
+    return asciistr(asmb,l2);
 }
 static int adir_asciiz(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ASCIIZ")!=0) return 0;
-    asciistr(asmb,l2);
+    int f=asciistr(asmb,l2);
+    if(!f){
+        if(asmb->st.pas==2||asmb->st.pas==0)
+            printf(" error - .ASCIIZ requires a quoted string.\n");
+        return 0;
+    }
     outbin(&asmb->st,asmb->st.pc,u256_zero());
     asmb->st.pc=u256_add(asmb->st.pc,u256_one());
     return 1;
@@ -3145,7 +3257,12 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
         if(buf[idx]==':') idx++;
         uint256_t v=label_get_value(st,s);
         const char *sec=label_get_section(st,s);
-        lmap_set(&st->export_labels,s,v,sec,0);
+        /* Preserve the is_equ flag so that .equ-defined constants get
+         * SHN_ABS treatment in the ELF symbol table.
+         * Mirrors axx.py export_processing() which stores the full label entry. */
+        LabelEntry *le=lmap_find(&st->labels,s);
+        int is_equ_v = le ? le->is_equ : 0;
+        lmap_set(&st->export_labels,s,v,sec,is_equ_v);
         if(buf[idx]==',') idx++;
     }
     return 1;
@@ -3174,7 +3291,29 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(adir_ascii(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_asciiz(asmb,l,l2)){ *idx_out=idx; return 1; }
     { char up[16]; axx_strupr_to(up,l,sizeof(up));
-      if(strcmp(up,".INCLUDE")==0){ char s[512]; axx_get_string(l2,s,sizeof(s)); if(s[0]) fileassemble(asmb,s); *idx_out=idx; return 1; } }
+      if(strcmp(up,".INCLUDE")==0){
+          char raw[512]; axx_get_string(l2,raw,sizeof(raw));
+          if(raw[0]){
+              /* Resolve relative path against the currently assembling file.
+               * Mirrors axx.py include_asm():
+               *   if not os.path.isabs(s):
+               *       base = os.path.dirname(os.path.abspath(cur))
+               *       s = os.path.join(base, s)  */
+              char resolved[1024];
+              const char *cur = st->current_file;
+              if(cur && cur[0] && strcmp(cur,"(stdin)")!=0 && strcmp(cur,"stdin")!=0){
+                  char dir_buf[1024];
+                  axx_dir_of(cur, dir_buf, sizeof(dir_buf));
+                  axx_resolve_path(dir_buf, raw, resolved, sizeof(resolved));
+              } else {
+                  strncpy(resolved, raw, sizeof(resolved)-1);
+                  resolved[sizeof(resolved)-1]='\0';
+              }
+              fileassemble(asmb,resolved);
+          }
+          *idx_out=idx; return 1;
+      }
+    }
     if(adir_align(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_org(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_labelc(st,l,l2)){ *idx_out=idx; return 1; }
@@ -3184,6 +3323,7 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     int se=0, oerr=0, pln=0;
     int idxs_val=0;
     int loopflag=1;
+    PatEntry *oerr_entry=NULL;   /* pattern entry that caused oerr */
 
     for(int pi=0;pi<st->pat.len;pi++){
         PatEntry *i=&st->pat.data[pi];
@@ -3204,7 +3344,15 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         char lin[8192]; snprintf(lin,sizeof(lin),"%s %s",l,l2);
         axx_reduce_spaces(lin);
 
-        if(!i->f[0][0]){ loopflag=0; break; }
+        if(!i->f[0][0]){
+            /* Sentinel entry (empty pattern field[0]): treat as end-of-match.
+             * Python evaluates i[3] here to capture the VLIW slot index before
+             * breaking, so we must do the same. */
+            int io2;
+            uint256_t idxv2=expr_expression_pat(asmb,i->f[3],0,&io2);
+            idxs_val=(int)u256_to_i64(idxv2);
+            loopflag=0; break;
+        }
 
         st->error_undefined_label=0;
         st->expmode=EXP_ASM;
@@ -3212,19 +3360,19 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         if(pat_match0(asmb,lin,i->f[0])){
             dir_error(asmb,i->f[1]);
             makeobj(asmb,i->f[2],objl_out);
-            /* Fix C-3/C-N3: if pass1 hit an undefined label inside makeobj,
-             * retry with pass1_size_mode=1 (unknown labels → 0) so the
-             * byte-count (and therefore the PC advance) is correct.
-             * The old guard `objl_out->len==0` only retried when ALL elements
-             * were UNDEF.  Now that UNDEF elements are skipped (not break),
-             * objl may be non-empty yet still too short (some elements omitted).
-             * Fix: retry whenever error_undefined_label is set, regardless of
-             * whether objl already has some elements. */
+            /* Pass1: retry with size-mode on forward reference */
             if(st->pas==1 && st->error_undefined_label){
                 st->pass1_size_mode=1;
                 makeobj(asmb,i->f[2],objl_out);
                 st->pass1_size_mode=0;
                 st->error_undefined_label=0;
+            }
+            /* Pass2: if makeobj produced undefined label, that's a hard error
+             * (oerr). Mirrors Python's exception→oerr path for pas==2. */
+            if(st->pas==2 && st->error_undefined_label){
+                oerr=1;
+                oerr_entry=i;
+                loopflag=0; break;
             }
             int io;
             uint256_t idxv=expr_expression_pat(asmb,i->f[3],0,&io);
@@ -3238,7 +3386,20 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(st->pas==2||st->pas==0){
         if(st->error_undefined_label){ printf(" error - undefined label error.\n"); *idx_out=idx; return 0; }
         if(se){ printf(" error - Syntax error.\n"); *idx_out=idx; return 0; }
-        if(oerr){ printf(" ; pat %d error - Illegal syntax in assemble line or pattern line.\n",pln); *idx_out=idx; return 0; }
+        if(oerr){
+            /* Mirrors Python:
+             *   print(f" ; pat {pln} {pl} error - Illegal syntax in assemble line or pattern line.")
+             * pl is the PatEntry (list of 6 strings). */
+            printf(" ; pat %d ['%s', '%s', '%s', '%s', '%s', '%s'] error - Illegal syntax in assemble line or pattern line.\n",
+                   pln,
+                   oerr_entry ? oerr_entry->f[0] : "",
+                   oerr_entry ? oerr_entry->f[1] : "",
+                   oerr_entry ? oerr_entry->f[2] : "",
+                   oerr_entry ? oerr_entry->f[3] : "",
+                   oerr_entry ? oerr_entry->f[4] : "",
+                   oerr_entry ? oerr_entry->f[5] : "");
+            *idx_out=idx; return 0;
+        }
     }
 
     iv_clear(idxs_out);
@@ -3289,12 +3450,16 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     char processed[4096];
     adir_label_processing(asmb,line,processed,sizeof(processed));
 
+    /* vcnt: count of non-empty parts when line is split by '!!'.
+     * Mirrors axx.py: sum(1 for p in line.split('!!') if p != '')
+     * A segment that is entirely spaces still counts (it is not "").
+     * Only a zero-length segment (adjacent '!!' or '!!' at start/end) is skipped. */
     int vcnt=0;
     const char *pp=processed;
     while(1){
-        int has=0;
-        while(*pp&&!(*pp=='!'&&*(pp+1)=='!')){ if(*pp!=' ') has=1; pp++; }
-        if(has) vcnt++;
+        const char *seg_start=pp;
+        while(*pp&&!(*pp=='!'&&*(pp+1)=='!')) pp++;
+        if(pp!=seg_start) vcnt++;   /* segment is non-empty string */
         if(*pp) pp+=2; else break;
     }
     st->vcnt=vcnt?vcnt:1;
@@ -3526,12 +3691,32 @@ static char *file_input_from_stdin(void){
 static void write_elf_obj(AsmState *st, const char *path, int machine){
     int bpw = (st->bts+7)/8; if(bpw<1) bpw=1;
 
-    /* LE write helpers */
-    #define WEO_LE2(p,v) do{uint16_t _v=(uint16_t)(v);memcpy((p),&_v,2);}while(0)
-    #define WEO_LE4(p,v) do{uint32_t _v=(uint32_t)(v);memcpy((p),&_v,4);}while(0)
-    #define WEO_LE8(p,v) do{uint64_t _v=(uint64_t)(v);memcpy((p),&_v,8);}while(0)
-    #define WEO_LE8S(p,v) do{int64_t _v=(int64_t)(v);memcpy((p),&_v,8);}while(0)
+    /* Endianness: mirrors axx.py write_elf_obj():
+     *   _is_le   = (self.state.endian != 'big')
+     *   _ei_data = 1 if _is_le else 2   (ELFDATA2LSB / ELFDATA2MSB)
+     *   _pk      = '<' if _is_le else '>'
+     * The ELF structures (header, shdrs, symtab, rela) must use the same
+     * byte order as the target architecture. */
+    int _is_le  = !st->endian_big;
+    int _ei_data = _is_le ? 1 : 2;   /* EI_DATA: 1=LE, 2=BE */
+
+    /* Endian-aware field write helpers */
+    #define WEO_W2(p,v) do{ uint16_t _v=(uint16_t)(v); \
+        if(_is_le){ (p)[0]=_v&0xff; (p)[1]=(_v>>8)&0xff; } \
+        else      { (p)[1]=_v&0xff; (p)[0]=(_v>>8)&0xff; } }while(0)
+    #define WEO_W4(p,v) do{ uint32_t _v=(uint32_t)(v); \
+        if(_is_le){ (p)[0]=_v&0xff;(p)[1]=(_v>>8)&0xff;(p)[2]=(_v>>16)&0xff;(p)[3]=(_v>>24)&0xff; } \
+        else      { (p)[3]=_v&0xff;(p)[2]=(_v>>8)&0xff;(p)[1]=(_v>>16)&0xff;(p)[0]=(_v>>24)&0xff; } }while(0)
+    #define WEO_W8(p,v) do{ uint64_t _v=(uint64_t)(v); \
+        if(_is_le){ for(int _j=0;_j<8;_j++){(p)[_j]=(uint8_t)(_v&0xff);_v>>=8;} } \
+        else      { for(int _j=7;_j>=0;_j--){(p)[_j]=(uint8_t)(_v&0xff);_v>>=8;} } }while(0)
+    #define WEO_W8S(p,v) WEO_W8(p,(uint64_t)(int64_t)(v))
     #define WEO_ALIGN(x,a) (((uint64_t)(x)+((uint64_t)(a)-1))&~((uint64_t)(a)-1))
+    /* Aliases used in symtab / rela / shdr write code */
+    #define WEO_LE2(p,v)  WEO_W2(p,v)
+    #define WEO_LE4(p,v)  WEO_W4(p,v)
+    #define WEO_LE8(p,v)  WEO_W8(p,v)
+    #define WEO_LE8S(p,v) WEO_W8S(p,v)
 
     /* dynamic byte buffer (starts with one NUL byte) */
     typedef struct { uint8_t*b; size_t len,cap; } WBB;
@@ -3738,7 +3923,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     /* ELF header */
     {uint8_t eh[64]={0};
      eh[0]=0x7f;eh[1]='E';eh[2]='L';eh[3]='F';
-     eh[4]=2;eh[5]=1;eh[6]=1;eh[7]=st->osabi; /* ELFCLASS64 ELFDATA2LSB EV_CURRENT ELFOSABI */
+     eh[4]=2;eh[5]=(uint8_t)_ei_data;eh[6]=1;eh[7]=st->osabi; /* ELFCLASS64 EI_DATA EV_CURRENT ELFOSABI */
      WEO_LE2(eh+16,1); WEO_LE2(eh+18,(uint16_t)machine); WEO_LE4(eh+20,1);
      WEO_LE8(eh+40,shdr_fo);
      WEO_LE2(eh+52,64); WEO_LE2(eh+58,64);
@@ -3784,6 +3969,10 @@ weo_done:
     free(sec_noff); free(rela_noff);
     free(shstr.b); free(strtab_bb.b); free(symtab_bb.b);
     free(sec_fo); free(larr); free(earr); free(snimap);
+    #undef WEO_W2
+    #undef WEO_W4
+    #undef WEO_W8
+    #undef WEO_W8S
     #undef WEO_LE2
     #undef WEO_LE4
     #undef WEO_LE8
@@ -3981,14 +4170,13 @@ int main(int argc, char *argv[]){
     AsmState *st=&asmb->st;
 
     const char *patternfile=NULL, *sourcefile=NULL;
-    const char *expfile_elf=NULL;
     char osabistr[16]="FreeBSD"; /* ELF_OSABI Default: FreeBSD */
 
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--osabi")==0&&i+1<argc){ strncpy(osabistr,argv[++i],sizeof(osabistr)-1); }
         else if(strcmp(argv[i],"-b")==0&&i+1<argc){ strncpy(st->outfile,argv[++i],sizeof(st->outfile)-1); }
         else if(strcmp(argv[i],"-e")==0&&i+1<argc){ strncpy(st->expfile,argv[++i],sizeof(st->expfile)-1); }
-        else if(strcmp(argv[i],"-E")==0&&i+1<argc){ expfile_elf=argv[++i]; }
+        else if(strcmp(argv[i],"-E")==0&&i+1<argc){ strncpy(st->expfile_elf,argv[++i],sizeof(st->expfile_elf)-1); }
         else if(strcmp(argv[i],"-i")==0&&i+1<argc){ strncpy(st->impfile,argv[++i],sizeof(st->impfile)-1); }
         else if(strcmp(argv[i],"-o")==0&&i+1<argc){ strncpy(st->elf_objfile,argv[++i],sizeof(st->elf_objfile)-1); }
         else if(strcmp(argv[i],"-m")==0&&i+1<argc){ st->elf_machine=atoi(argv[++i]); }
@@ -4021,14 +4209,24 @@ int main(int argc, char *argv[]){
         strncpy(st->current_file,"(stdin)",sizeof(st->current_file)-1);
         char line[4096];
         while(1){
-            printf("%016llx >> ",(unsigned long long)u256_to_u64(st->pc));
+            /* Mirrors Python printaddr() + input(">> "):
+             *   print("%016x: " % pc, end='')
+             *   line = input(">> ")                                  */
+            printf("%016llx: >> ",(unsigned long long)u256_to_u64(st->pc));
             fflush(stdout);
             if(!fgets(line,sizeof(line),stdin)) break;
             int ll=(int)strlen(line);
             while(ll>0&&(line[ll-1]=='\n'||line[ll-1]=='\r')) line[--ll]=0;
-            for(int i=0;line[i];i++) if(line[i]=='\\'&&line[i+1]=='\\') { line[i]='\\'; memmove(line+i+1,line+i+2,ll-i-1); ll--; }
+            /* Python: line = line.replace("\\\\", "\\") */
+            for(int i=0;line[i];i++)
+                if(line[i]=='\\'&&line[i+1]=='\\'){
+                    line[i]='\\'; memmove(line+i+1,line+i+2,ll-i-1); ll--;
+                }
+            /* Python: line = line.strip() */
             ll=(int)strlen(line);
             while(ll>0&&line[ll-1]==' ') line[--ll]=0;
+            int start=0; while(line[start]==' ') start++;
+            if(start) memmove(line,line+start,ll-start+1);
             if(!line[0]) continue;
             if(strcmp(line,"?")==0){ label_print_all(st); continue; }
             lineassemble0(asmb,line);
@@ -4087,7 +4285,12 @@ int main(int argc, char *argv[]){
                 for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
                     lmap_set(&prev_labels, e->key, e->value, e->section, e->is_equ);
 
-            if(converged) break;
+            if(converged){
+                if(st->debug)
+                    fprintf(stderr,"Pass1 relaxation converged after %d iteration(s)\n",
+                            relax+1);
+                break;
+            }
         }
         lmap_free(&prev_labels);
 
@@ -4117,10 +4320,10 @@ int main(int argc, char *argv[]){
      * st->expfile を上書きしてから一回だけ書き出していたため -e ファイルが
      * 消えていた。修正: write_export() を分離し、-e と -E をそれぞれ独立して
      * 書き出す。両方指定された場合は警告を表示する。             */
-    if(expfile_elf && st->expfile[0])
+    if(st->expfile_elf[0] && st->expfile[0])
         fprintf(stderr,"warning: both -e '%s' and -E '%s' specified; "
                 "exporting plain format to -e and ELF format to -E separately.\n",
-                st->expfile, expfile_elf);
+                st->expfile, st->expfile_elf);
 
     /* Helper lambda (as a nested function via a local write) */
     #define WRITE_EXPORT(path_, elf_) do { \
@@ -4148,8 +4351,8 @@ int main(int argc, char *argv[]){
         } \
     } while(0)
 
-    if(st->expfile[0])   WRITE_EXPORT(st->expfile, 0);
-    if(expfile_elf)      WRITE_EXPORT(expfile_elf,  1);
+    if(st->expfile[0])     WRITE_EXPORT(st->expfile,     0);
+    if(st->expfile_elf[0]) WRITE_EXPORT(st->expfile_elf, 1);
 
     #undef WRITE_EXPORT
 
