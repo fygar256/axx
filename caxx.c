@@ -18,8 +18,13 @@
  *  D. binary_flush(): guard max_pos==UINT64_MAX to prevent silent integer overflow
  *  E. ieee754_128_from_str(): unlink temp script on ALL exit paths (was leaking on !safe)
  *  F. xeval(): unlink temp script on ALL exit paths (was leaking on spawn failure)
- *  G. expr_term11(): add skip_ternary_expr() so nested ternaries in the false-branch
- *     are fully skipped (not just up to the inner '?') when the condition is true
+ *  G. expr_term11(): add skip_ternary_expr() so nested ternaries in false-branch are
+ *     fully skipped (not just up to the inner '?') when the condition is true
+ *  H. ivv_push(): add NULL-check after realloc (was missing, unlike every other push helper)
+ *  I. binary_flush(): guard total_size > SIZE_MAX before cast to size_t (32-bit heap corruption)
+ *  J. weo_pad(): guard ftell() < 0 to avoid silent padding skip on I/O error
+ *  K. int_cmp(): replace subtraction with branchless 3-way compare to avoid signed overflow
+ *  L. expr_term0(): set x=0 on division by zero (was silently returning the dividend)
  */
 
 #define _GNU_SOURCE
@@ -1353,6 +1358,14 @@ static void binary_flush(AsmState *st){
     }
     uint64_t total_size = (max_pos+1)*(uint64_t)bytes_per_word;
     if(total_size==0) return;
+    /* Fix I: on 32-bit systems SIZE_MAX is ~4 GB.  If total_size exceeds it,
+     * the cast to size_t wraps silently, calloc allocates far too little, and
+     * subsequent writes corrupt the heap.  Fail loudly instead. */
+    if(total_size > (uint64_t)(size_t)-1){
+        fprintf(stderr,"binary_flush: output too large (%llu bytes) for this platform's size_t.\n",
+                (unsigned long long)total_size);
+        return;
+    }
     unsigned char *data = calloc(1, (size_t)total_size);
     if(!data){perror("calloc");return;}
 
@@ -2089,10 +2102,12 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             uint256_t t=expr_term0_0(asmb,s,idx+2,&idx);
             if(flt){
                 double b=u256_to_double(t);
-                if(b==0.0) printf("Division by 0 error.\n");
+                if(b==0.0){ printf("Division by 0 error.\n"); x=double_to_u256(0.0); }
                 else x=double_to_u256(floor(u256_to_double(x)/b));
             } else {
-                if(u256_is_zero(t)) printf("Division by 0 error.\n");
+                /* Fix L: set x=0 on div-by-zero; previously x kept the old
+                 * dividend value, making 'a//0' silently return 'a'. */
+                if(u256_is_zero(t)){ printf("Division by 0 error.\n"); x=u256_zero(); }
                 else x=u256_floordiv(x,t);
             }
         } else if(s[idx]=='/'&&s[idx+1]!='/'){
@@ -2100,20 +2115,22 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
             if(flt){
                 double b=u256_to_double(t);
-                if(b==0.0) printf("Division by 0 error.\n");
+                if(b==0.0){ printf("Division by 0 error.\n"); x=double_to_u256(0.0); }
                 else x=double_to_u256(u256_to_double(x)/b);
             } else {
-                if(u256_is_zero(t)) printf("Division by 0 error.\n");
+                /* Fix L: same as // fix */
+                if(u256_is_zero(t)){ printf("Division by 0 error.\n"); x=u256_zero(); }
                 else x=u256_floordiv(x,t);
             }
         } else if(s[idx]=='%'){
             uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
             if(flt){
                 double b=u256_to_double(t);
-                if(b==0.0) printf("Division by 0 error.\n");
+                if(b==0.0){ printf("Division by 0 error.\n"); x=double_to_u256(0.0); }
                 else x=double_to_u256(fmod(u256_to_double(x),b));
             } else {
-                if(u256_is_zero(t)) printf("Division by 0 error.\n");
+                /* Fix L: same as // fix */
+                if(u256_is_zero(t)){ printf("Division by 0 error.\n"); x=u256_zero(); }
                 else x=u256_mod(x,t);
             }
         } else break;
@@ -3038,8 +3055,15 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
  * ========================================================= */
 typedef struct { IntVec *data; int len; int cap; } IVVec;
 static void ivv_init(IVVec*v){v->data=NULL;v->len=0;v->cap=0;}
+/* Fix H: add NULL check after realloc, matching the guard in iv_push/sv_push.
+ * The original silently continued to &v->data[v->len] after a failed realloc,
+ * producing a NULL-dereference crash on the very next line. */
 static void ivv_push(IVVec*v,IntVec*iv){
-    if(v->len>=v->cap){v->cap=v->cap?v->cap*2:8;v->data=realloc(v->data,v->cap*sizeof(IntVec));}
+    if(v->len>=v->cap){
+        v->cap=v->cap?v->cap*2:8;
+        v->data=realloc(v->data,v->cap*sizeof(IntVec));
+        if(!v->data){perror("realloc");exit(1);}
+    }
     IntVec *dst=&v->data[v->len++]; iv_init(dst); iv_copy(dst,iv);
 }
 static void ivv_free(IVVec*v){
@@ -3047,7 +3071,13 @@ static void ivv_free(IVVec*v){
     free(v->data); ivv_init(v);
 }
 
-static int int_cmp(const void*a,const void*b){ return *(int*)a-*(int*)b; }
+/* Fix K: int_cmp used subtraction (*(int*)a - *(int*)b) which overflows when
+ * a is large-positive and b is large-negative (or vice-versa), producing the
+ * wrong sort order.  Use a branchless 3-way compare instead. */
+static int int_cmp(const void*a,const void*b){
+    int ia=*(const int*)a, ib=*(const int*)b;
+    return (ia > ib) - (ia < ib);
+}
 
 static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVec *objl_in,
                        int idx, int *idx_out){
@@ -4023,7 +4053,15 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
      WEO_LE2(eh+60,(uint16_t)tot_sh); WEO_LE2(eh+62,(uint16_t)shstrndx);
      fwrite(eh,1,64,fp);}
 
-    void weo_pad(FILE*f,uint64_t t){long c=ftell(f);while((uint64_t)c<t){fputc(0,f);c++;}}
+    /* Fix J: if ftell() fails it returns -1 (a negative long).  The original
+     * cast that to uint64_t, yielding UINT64_MAX, which is never < t so the
+     * while-loop exited immediately — silently skipping the required padding
+     * and corrupting the ELF file.  Now we detect the error and abort. */
+    void weo_pad(FILE*f,uint64_t t){
+        long c=ftell(f);
+        if(c < 0){ fprintf(stderr,"weo_pad: ftell failed\n"); return; }
+        while((uint64_t)c<t){fputc(0,f);c++;}
+    }
 
     for(int i=0;i<ncs;i++){weo_pad(fp,sec_fo[i]);if(csecs[i].bsz)fwrite(csecs[i].data,1,(size_t)csecs[i].bsz,fp);}
     for(int ri2=0;ri2<nrela;ri2++){weo_pad(fp,rela_fo[ri2]);if(rela_szs[ri2])fwrite(rela_bufs[ri2],1,rela_szs[ri2],fp);}
