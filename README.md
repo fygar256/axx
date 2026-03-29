@@ -498,7 +498,7 @@ Within flt{} and dbl{}, enfloat(<hexa>} and endouble(<hexa>) can be used. These 
 
 ```
 label0: .equ flt{3.14}
-ldf a,flt{enfloat(LABELS['label0'][0])+1}
+ldf a,flt{enfloat(:'label0')+1}
 ```
 
 Use it like this.
