@@ -629,11 +629,16 @@ static void bufmap_set(BufMap*m, uint64_t pos, uint64_t val){
     BufEntry*e=malloc(sizeof(BufEntry)); e->pos=pos; e->val=val;
     e->next=m->buckets[h]; m->buckets[h]=e;
 }
-static uint64_t bufmap_max_key(BufMap*m){
+/* Fix (new): bufmap_max_key now writes the found flag into *found_out so that
+ * binary_flush can distinguish "no bytes written" from "one byte at position 0".
+ * The old signature returned 0 for both cases, silently writing a one-word file
+ * even when the assembler produced no output at all. */
+static uint64_t bufmap_max_key(BufMap*m, int *found_out){
     uint64_t mx=0; int found=0;
     for(int i=0;i<BUFMAP_NB;i++) for(BufEntry*e=m->buckets[i];e;e=e->next){
         if(!found||e->pos>mx){mx=e->pos;found=1;}
     }
+    if(found_out) *found_out=found;
     return found?mx:0;
 }
 static void bufmap_free(BufMap*m){
@@ -1126,7 +1131,11 @@ static uint256_t ieee754_128_from_str(const char *a){
         int fd = mkstemps(script_path, 3);   /* suffix ".py" = 3 chars */
         if(fd < 0) goto fallback;
         FILE *sf = fdopen(fd, "w");
-        if(!sf){ close(fd); goto fallback; }
+        if(!sf){
+            /* Fix E-2: mkstemps succeeded (file exists) but fdopen failed.
+             * Must unlink before falling back, otherwise the temp file leaks. */
+            close(fd); unlink(script_path); goto fallback;
+        }
         fprintf(sf,
             "import sys\n"
             "from mpmath import mp, mpf, log, floor, power\n"
@@ -1346,7 +1355,12 @@ static void outbin2(AsmState *st, uint256_t a, uint256_t x){
 
 static void binary_flush(AsmState *st){
     if(!st->outfile[0]) return;
-    uint64_t max_pos = bufmap_max_key(&st->buf);
+    int buf_found = 0;
+    uint64_t max_pos = bufmap_max_key(&st->buf, &buf_found);
+    /* Fix (new): if nothing was ever written to the buffer, bail out now.
+     * Previously max_pos==0 was returned for both "empty buffer" and "one word
+     * at position 0", so an empty assembly would create a one-word output file. */
+    if(!buf_found) return;
     int word_bits = st->bts;
     int bytes_per_word = (word_bits+7)/8;
     /* Fix D: max_pos+1 wraps to 0 when max_pos==UINT64_MAX, producing a
@@ -1746,7 +1760,11 @@ static double xeval(Assembler *asmb, const char *expr_str){
         int fd = mkstemps(script_path, 3);
         if(fd < 0){ free(expanded); return 0.0; }
         FILE *sf = fdopen(fd, "w");
-        if(!sf){ close(fd); free(expanded); return 0.0; }
+        if(!sf){
+            /* Fix F-2: mkstemps succeeded (file exists) but fdopen failed.
+             * Must unlink before returning, otherwise the temp file leaks. */
+            close(fd); unlink(script_path); free(expanded); return 0.0;
+        }
         fprintf(sf,
             "import sys, struct\n"
             "def enfloat(x):\n"
@@ -2346,6 +2364,11 @@ static int skip_subexpr(const char *s, int idx) {
     int slen = (int)strlen(s);
     int paren_depth = 0;   /* depth for '(' / ')' */
     int brack_depth = 0;   /* depth for '[' / ']'  – Fix C-N7: was missing    */
+    int ob_depth    = 0;   /* Fix (new): depth for OB_CHAR(0x90) / CB_CHAR(0x91)
+                            * Pattern-file optional groups use these special bracket
+                            * chars.  Skipping without tracking them caused depth-0
+                            * '?' or ':' inside OB…CB groups to be treated as ternary
+                            * delimiters, cutting off the skip too early. */
     while(idx < slen && s[idx]){
         char c = s[idx];
         if(c == '(') { paren_depth++; idx++; }
@@ -2358,10 +2381,17 @@ static int skip_subexpr(const char *s, int idx) {
             if(brack_depth > 0){ brack_depth--; idx++; }
             else break;  /* depth-0 ']': stop */
         }
+        else if(c == OB_CHAR) { ob_depth++; idx++; }
+        else if(c == CB_CHAR) {
+            if(ob_depth > 0){ ob_depth--; idx++; }
+            else break;  /* depth-0 CB_CHAR: stop */
+        }
         /* ':=' is a variable-assignment operator, not a ternary separator.
          * Stop at ':' only when the next character is NOT '='. */
-        else if(paren_depth == 0 && brack_depth == 0 && (c == '?' || c == ',')) break;
-        else if(paren_depth == 0 && brack_depth == 0 && c == ':' && s[idx+1] != '=') break;
+        else if(paren_depth == 0 && brack_depth == 0 && ob_depth == 0
+                && (c == '?' || c == ',')) break;
+        else if(paren_depth == 0 && brack_depth == 0 && ob_depth == 0
+                && c == ':' && s[idx+1] != '=') break;
         else idx++;
     }
     return idx;
@@ -2646,8 +2676,14 @@ static char *remove_brackets_str(const char *s, int *remove_idx, int nr){
     }
     free(stk);
 
-    char *result = malloc(len + 1);
-    memcpy(result, s, len + 1);
+    /* Fix (new): the original used '\x01' as an in-band sentinel inside the
+     * result buffer to mark positions to be deleted.  Any genuine '\x01' byte
+     * in the input (e.g. from an embedded control character) would be silently
+     * stripped even when it was not inside a removed bracket group.
+     *
+     * Fix: use a separate boolean array to track which positions to delete,
+     * so the result buffer is never modified with an in-band sentinel value. */
+    char *del = calloc(len + 1, 1);  /* del[i] = 1 → position i is removed */
     for(int ri = 0; ri < nr; ri++){
         int ridx = remove_idx[ri];
         int start_pos = -1, end_pos = -1;
@@ -2656,12 +2692,12 @@ static char *remove_brackets_str(const char *s, int *remove_idx, int nr){
             if(bps[b].serial == ridx && !bps[b].is_open) end_pos   = bps[b].pos;
         }
         if(start_pos >= 0 && end_pos >= 0)
-            for(int j = start_pos; j <= end_pos; j++) result[j] = '\x01';
+            for(int j = start_pos; j <= end_pos; j++) del[j] = 1;
     }
     char *out = malloc(len + 1); int n = 0;
-    for(int i = 0; i < len; i++) if(result[i] != '\x01') out[n++] = result[i];
+    for(int i = 0; i < len; i++) if(!del[i]) out[n++] = s[i];
     out[n] = 0;
-    free(result); free(bps);
+    free(del); free(bps);
     return out;
 }
 
@@ -2998,9 +3034,15 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
      * large @@[N,…] expansions or deeply nested %% can exceed it. */
     char ep_buf[8192]={0}; int is_empty;
     e_p(s_in,ep_buf,sizeof(ep_buf),&is_empty,asmb);
-    if(strlen(s_in) > sizeof(ep_buf)-16)
-        fprintf(stderr,"warning: makeobj pattern string may have been truncated "
-                        "(len=%zu, buf=%zu)\n", strlen(s_in), sizeof(ep_buf));
+    /* Fix C-8 (corrected): the old check compared strlen(s_in) against the buffer
+     * size, which misses the dangerous case: a short input like "@@[1000,xx]"
+     * expands into a very long output that silently overflows ep_buf.
+     * Fix: compare the actual output length against the buffer capacity.
+     * If e_p filled the buffer completely it almost certainly truncated. */
+    if(strlen(ep_buf) >= sizeof(ep_buf)-16)
+        fprintf(stderr,"warning: makeobj expanded pattern string may have been truncated "
+                        "(expanded_len=%zu, buf=%zu, input='%.64s')\n",
+                        strlen(ep_buf), sizeof(ep_buf), s_in);
     if(is_empty) return;
 
     char s[8192]={0};
@@ -3531,6 +3573,27 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     return 1;
 }
 
+/* =========================================================
+ * ELF relocation reference type and comparator.
+ *
+ * Fix (new): the original code defined both the typedef and the comparator
+ * as a GCC nested function inside lineassemble().  This is:
+ *   (a) non-standard C (GCC extension only – Clang/MSVC reject it), and
+ *   (b) using subtraction for comparison, which overflows when one word_idx
+ *       is large-positive and the other is large-negative (same class of
+ *       bug as the int_cmp() fix K).
+ *
+ * Fix: promote the typedef to file scope and provide a proper static
+ * comparator using the branchless 3-way pattern already used by int_cmp().
+ * ========================================================= */
+typedef struct { const char *name; uint64_t val; int word_idx; } ElfRef;
+
+static int elf_ref_cmp(const void *a, const void *b){
+    int ia = ((const ElfRef *)a)->word_idx;
+    int ib = ((const ElfRef *)b)->word_idx;
+    return (ia > ib) - (ia < ib);   /* branchless 3-way; no overflow */
+}
+
 static int lineassemble(Assembler *asmb, const char *line_in){
     AsmState *st=&asmb->st;
     char line[4096];
@@ -3658,20 +3721,16 @@ static int lineassemble(Assembler *asmb, const char *line_in){
             #define RTYPE_FOR(nb) ((nb)==8?_rb8:(nb)==4?_rb4:(nb)==2?_rb2:(nb)==1?_rb1:0)
 
             /* collect refs with valid word_idx (>= 0), sort by word_idx */
-            typedef struct { const char *name; uint64_t val; int word_idx; } _Ref;
-            _Ref *_valid = (_Ref*)malloc((size_t)st->elf_refs_len * sizeof(_Ref));
+            ElfRef *_valid = (ElfRef*)malloc((size_t)st->elf_refs_len * sizeof(ElfRef));
             int _nvalid = 0;
             for(int _ri=0; _ri<st->elf_refs_len; _ri++){
                 if(st->elf_refs[_ri].word_idx >= 0)
-                    _valid[_nvalid++] = (_Ref){st->elf_refs[_ri].name,
+                    _valid[_nvalid++] = (ElfRef){st->elf_refs[_ri].name,
                                               st->elf_refs[_ri].val,
                                               st->elf_refs[_ri].word_idx};
             }
-            /* sort by word_idx */
-            int _cmp_ref(const void *_a, const void *_b){
-                return ((_Ref*)_a)->word_idx - ((_Ref*)_b)->word_idx;
-            }
-            qsort(_valid, (size_t)_nvalid, sizeof(_Ref), _cmp_ref);
+            /* sort by word_idx – use file-scope elf_ref_cmp (branchless, standard C) */
+            qsort(_valid, (size_t)_nvalid, sizeof(ElfRef), elf_ref_cmp);
 
             /* group consecutive same-label refs into one relocation entry */
             int _gi = 0;
