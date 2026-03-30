@@ -564,7 +564,17 @@ class VariableManager:
         """Set variable value by letter"""
         if StringUtils.upper(s) in CAPITAL:
             c = ord(StringUtils.upper(s))
-            self.state.vars[c - ord('A')] = int(v)
+            # 【バグ修正⑦】旧実装は常に int(v) で切り捨てていた。
+            # !F / !D 経由の値は match() 側で既に IEEE754 整数ビットパターンに
+            # 変換されてから渡されるので int() で問題ない。
+            # しかし exp_typ='f' モードで a:=3.14 のように生の float が渡された
+            # 場合は int(3.14)==3 となり精度が失われる。
+            # 修正: 小数部を持つ float はそのまま保持し、整数値または
+            # 整数値の float（3.0 など）のみ int に変換する。
+            if isinstance(v, float) and not v.is_integer():
+                self.state.vars[c - ord('A')] = v
+            else:
+                self.state.vars[c - ord('A')] = int(v)
 
 class LabelManager:
     """Manages assembly labels"""
@@ -1111,7 +1121,15 @@ class ExpressionEvaluator:
         stack = []   # 開き括弧を積むスタック
 
         for ch in s[idx:]:
-            if ch in OPEN_TO_CLOSE:
+            # 【バグ修正①】深さ0でstopcharに一致するかを最初に確認する。
+            # 旧実装では stopchar が '(' '[' OB のいずれかのとき、
+            # 「開き括弧」として先にスタックに積まれてしまい stopchar として
+            # 機能しなかった。判定順を逆転し、depth==0 && ch==stopchar を
+            # 括弧判定より優先することで全 stopchar を正しく処理できる。
+            if not stack and ch == stopchar:
+                # 深さ0 かつ stopchar → ここで式を終端
+                result.append(chr(0))
+            elif ch in OPEN_TO_CLOSE:
                 # 開き括弧: スタックに積んで出力
                 stack.append(ch)
                 result.append(ch)
@@ -1120,17 +1138,11 @@ class ExpressionEvaluator:
                     # 対応する開き括弧と一致 → ネストを1段抜ける
                     stack.pop()
                     result.append(ch)
-                elif not stack and ch == stopchar:
-                    # 深さ0 かつ stopchar → ここで式を終端
-                    result.append(chr(0))
                 else:
                     # 対応不一致の閉じ括弧（不正な入力）はそのまま出力
                     result.append(ch)
             else:
-                if not stack and ch == stopchar:
-                    result.append(chr(0))
-                else:
-                    result.append(ch)
+                result.append(ch)
 
         replaced = ''.join(result)
         return self.expression(self._terminate(replaced), idx)
@@ -2476,6 +2488,13 @@ class Assembler:
         """Set pattern symbols"""
         for i in pat:
             if self.directive_proc.set_symbol(i):
+                continue
+            # 【バグ修正⑫】旧実装は .setsym しか処理しておらず、パターンファイル内の
+            # .clearsym が patsymbols に反映されなかった。
+            # .clearsym で削除したシンボルがソースアセンブル中ずっと残り続け、
+            # 誤ったシンボル解決が起きていた。
+            # 修正: .clearsym も同ループで処理することで正しく反映される。
+            if self.directive_proc.clear_symbol(i):
                 continue
         self.state.patsymbols.update(self.state.symbols)
     
