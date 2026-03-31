@@ -159,6 +159,7 @@ Lowercase letter: Value of the symbol at that position
 !!Lowercase letter: Value of an integer factor
 !FLowercase letter: Value of a 32-bit floating-point expression
 !DLowercase letter: Value of a 64-bit floating-point expression
+!QLowercase letter: Value of a 64-bit floating-point expression
 ```
 
 Lowercase variables are all initialized to 0 for each line in the pattern file.
