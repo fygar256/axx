@@ -548,6 +548,99 @@ class IEEE754Converter:
         bits = (sign << 127) | (exponent << SIGNIFICAND_BITS) | fraction
         return f"0x{bits:032X}"
 
+    @staticmethod
+    def decimal_eval_expr(text):
+        """四則演算式を Decimal で評価して binary128 の整数ビットパターンを返す。
+
+        対応文法:
+            expr   = term   (('+' | '-') term)*
+            term   = factor (('*' | '/') factor)*
+            factor = '(' expr ')' | ['-'] number
+            number = decimal リテラル (Decimal で解析)
+
+        シンボル・ラベルを含む式（Decimal で解析できない場合）は
+        ValueError を送出する。呼び出し側は except して
+        float モードのフォールバックに切り替える。
+        """
+        getcontext().prec = 60
+        text = text.strip()
+
+        def skip(s, i):
+            while i < len(s) and s[i] in ' \t':
+                i += 1
+            return i
+
+        def parse_number(s, i):
+            i = skip(s, i)
+            neg = False
+            if i < len(s) and s[i] == '-':
+                neg = True
+                i += 1
+                i = skip(s, i)
+            # 符号のみは数値ではない
+            if i >= len(s) or s[i] not in '0123456789.':
+                raise ValueError(f"expected number at {i!r}")
+            start = i
+            while i < len(s) and s[i] in '0123456789.':
+                i += 1
+            if i < len(s) and s[i] in 'eE':
+                i += 1
+                if i < len(s) and s[i] in '+-':
+                    i += 1
+                while i < len(s) and s[i] in '0123456789':
+                    i += 1
+            v = Decimal(s[start:i])
+            return (-v if neg else v), i
+
+        def parse_factor(s, i):
+            i = skip(s, i)
+            if i < len(s) and s[i] == '(':
+                v, i = parse_expr(s, i + 1)
+                i = skip(s, i)
+                if i < len(s) and s[i] == ')':
+                    i += 1
+                return v, i
+            if i < len(s) and s[i] == '-':
+                v, i = parse_factor(s, i + 1)
+                return -v, i
+            if i < len(s) and s[i] == '+':
+                return parse_factor(s, i + 1)
+            return parse_number(s, i)
+
+        def parse_term(s, i):
+            v, i = parse_factor(s, i)
+            while True:
+                i = skip(s, i)
+                if i < len(s) and s[i] == '*':
+                    t, i = parse_factor(s, i + 1)
+                    v *= t
+                elif i < len(s) and s[i] == '/' and (i + 1 >= len(s) or s[i+1] != '/'):
+                    t, i = parse_factor(s, i + 1)
+                    if t == 0:
+                        raise ZeroDivisionError("division by zero in qad{}")
+                    v /= t
+                else:
+                    break
+            return v, i
+
+        def parse_expr(s, i):
+            v, i = parse_term(s, i)
+            while True:
+                i = skip(s, i)
+                if i < len(s) and s[i] == '+':
+                    t, i = parse_term(s, i + 1)
+                    v += t
+                elif i < len(s) and s[i] == '-':
+                    t, i = parse_term(s, i + 1)
+                    v -= t
+                else:
+                    break
+            return v, i
+
+        val, _ = parse_expr(text, 0)
+        # Decimal を文字列に変換して binary128 に変換
+        return IEEE754Converter.decimal_to_ieee754_128bit_hex(str(val))
+
 
 class VariableManager:
     """Manages assembler variables (a-z)"""
@@ -825,11 +918,25 @@ class ExpressionEvaluator:
             idx += 3
             idx = StringUtils.skipspc(s, idx)
             if idx < len(s) and s[idx] == '{':
-                fs, idx = self.parser.get_floatstr(s, idx + 1)
-                h = IEEE754Converter.decimal_to_ieee754_128bit_hex(fs)
-                x = int(h, 16)
-                if idx < len(s) and s[idx] == '}':
-                    idx += 1
+                # get_curlb で {} 内の式テキスト全体を取得（算術式に対応）
+                f, t, idx = self.parser.get_curlb(s, idx)
+                if f:
+                    try:
+                        h = IEEE754Converter.decimal_eval_expr(t)
+                    except (ValueError, ZeroDivisionError):
+                        # シンボル・ラベルなど Decimal 評価できない場合は
+                        # xeval（ラベル置換 + Python eval）で数値を得る。
+                        # ・整数値 → Decimal(int) で完全精度
+                        # ・float 値 → repr() で53bit分の最大桁数を使用
+                        v = self.xeval(t, None)
+                        if isinstance(v, int) or (
+                                isinstance(v, float) and v.is_integer()):
+                            h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
+                                    str(int(v)))
+                        else:
+                            h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
+                                    repr(float(v)))
+                    x = int(h, 16)
         elif idx + 3 <= len(s) and s[idx:idx+3] == 'dbl':
             idx += 3
             f, t, idx = self.parser.get_curlb(s, idx)
@@ -1569,10 +1676,41 @@ class PatternMatcher:
                     else:
                         stopchar = chr(0)
 
-                    v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
-                    h = IEEE754Converter.decimal_to_ieee754_128bit_hex(str(float(v)))
+                    # ソーステキストの開始位置を記録
+                    idx_s_q_start = idx_s
+
+                    # float モードで式の終端位置を検出
+                    v, idx_s_after = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+
+                    # stopchar 手前までのソーステキストを抽出
+                    raw_text = s[idx_s_q_start:idx_s_after]
+                    # stopchar が末尾に含まれていれば除去
+                    if stopchar != chr(0) and raw_text.endswith(stopchar):
+                        raw_text = raw_text[:-1]
+                    raw_text = raw_text.strip()
+
+                    # qad{...} ラッパーを剥がす（!Q qad{3.14*2+1} と書かれた場合）
+                    if raw_text.startswith('qad{') and raw_text.endswith('}'):
+                        raw_text = raw_text[4:-1].strip()
+
+                    try:
+                        h = IEEE754Converter.decimal_eval_expr(raw_text)
+                    except (ValueError, ZeroDivisionError):
+                        # Decimal 評価不能（ラベル参照など）。
+                        # v は expression_esc_float の戻り値（Python int か float）。
+                        # ・整数値 → Decimal(int) で完全精度（ラベルアドレスは整数なので典型的にこちら）
+                        # ・float 値 → repr() で53bit分の最大桁数を使用（精度損失は避けられない）
+                        if isinstance(v, int) or (
+                                isinstance(v, float) and v.is_integer()):
+                            h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
+                                    str(int(v)))
+                        else:
+                            h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
+                                    repr(float(v)))
+
                     x = int(h, 16)
                     self.var_manager.put(a, x)
+                    idx_s = idx_s_after
                     # consume stopchar from source as well
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
                         idx_s += 1
