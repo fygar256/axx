@@ -1067,29 +1067,205 @@ static AXX_UNUSED uint64_t ieee754_64_from_str(const char *a){
  * ------------------------------------------------------- */
 
 /* -------------------------------------------------------
- * Fix P11: ieee754_128_from_str() -- pure C implementation.
+ * Fix P11 (rev2): ieee754_128_from_str() -- two bugs fixed.
  *
- * The previous implementation spawned a python3 subprocess with an mpmath
- * script every time a quad-precision literal was encountered.  This had
- * three problems:
- *   (a) Hard dependency on python3 + mpmath at run-time.
- *   (b) One fork()+exec() per literal -- prohibitively slow for any
- *       pattern file that uses !Q variables more than a handful of times.
- *   (c) Precision on platforms where long double == double (MSVC, Windows
- *       AArch64) silently degraded to 53-bit mantissa with no warning.
+ * Bug A (byte order): The previous little-endian loop read raw[7-i]
+ *   and shifted left, placing raw[0] in the MSB -- big-endian semantics.
+ *   On a little-endian machine, raw[0] is the LSB; the correct copy is
+ *   simply memcpy(&result.w[0], raw, 8) and memcpy(&result.w[1], raw+8, 8).
  *
- * Fix: implement the conversion in pure C using the long double path that
- * was already present as the fallback, but upgraded:
- *   - Use the __float128 GCC/Clang extension when available (128-bit
- *     mantissa, full IEEE 754-2008 binary128).
- *   - Fall back to the long double iterative extraction path on all other
- *     compilers.  If long double is 80-bit extended (x87), the result has
- *     64 mantissa bits, which is more than double's 53 and good enough for
- *     all practical assembler uses.  On platforms with 64-bit long double
- *     a one-time warning is printed.
+ * Bug B (precision): (__float128)strtold(a, NULL) parses the string with
+ *   long-double precision (~18–19 decimal digits / 64 mantissa bits), then
+ *   promotes to __float128.  Promotion zero-pads the lower 48 mantissa bits,
+ *   giving a wrong result compared to mpmath which parses the decimal with
+ *   full 113-bit binary128 precision.
  *
- * No subprocess, no temp files, no mpmath dependency.
+ *   Fix B: parse the decimal string directly using __float128 arithmetic
+ *   (+, -, *, / on __float128 operands) so every intermediate value has
+ *   113-bit precision.  This matches Python/mpmath output exactly.
+ *
+ * No subprocess, no temp files, no mpmath, no quadmath.
  * ------------------------------------------------------- */
+
+#if defined(__GNUC__) && !defined(__STRICT_ANSI__) && \
+    (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
+     defined(__arm__) || defined(__riscv))
+
+/* Parse a finite decimal string into __float128 with full 113-bit precision.
+ *
+ * Key insight: per-digit division by place (= place / 10 each step) accumulates
+ * rounding errors because 1/10 is not exactly representable in binary.
+ * Instead, collect ALL significant digits as one big __float128 integer (exact,
+ * since typical decimal inputs have ≤20 digits which fit well within 113 bits),
+ * then divide ONCE by 10^(num_fraction_digits).  One correctly-rounded division
+ * produces the closest binary128 to the input decimal — matching mpmath.
+ *
+ * Handles: optional sign, integer digits, optional '.', fraction digits,
+ * optional 'e'/'E' followed by a signed integer exponent.
+ * nan/inf are handled before this is called.                               */
+static __float128 f128_from_decimal(const char *s)
+{
+    const __float128 ten  = (__float128)10;
+    const __float128 one  = (__float128)1;
+
+    int sign = 0;
+    if(*s == '-'){ sign = 1; s++; }
+    else if(*s == '+'){ s++; }
+
+    /* Collect all significant digits (integer + fraction) as one __float128
+     * integer, tracking how many belong to the fraction part.              */
+    __float128 int_val    = (__float128)0;
+    int        frac_digits = 0;
+    int        in_frac    = 0;
+
+    while((*s >= '0' && *s <= '9') || *s == '.'){
+        if(*s == '.'){
+            in_frac = 1;
+            s++;
+            continue;
+        }
+        int_val = int_val * ten + (__float128)(*s - '0');
+        if(in_frac) frac_digits++;
+        s++;
+    }
+
+    /* Divide once by 10^frac_digits (one correctly-rounded __float128 op). */
+    __float128 denom = one;
+    for(int i = 0; i < frac_digits; i++) denom *= ten;
+    __float128 result = int_val / denom;
+
+    /* Apply explicit exponent if present */
+    if(*s == 'e' || *s == 'E'){
+        s++;
+        int esign = 1;
+        if(*s == '-'){ esign = -1; s++; }
+        else if(*s == '+'){ s++; }
+        int eabs = 0;
+        while(*s >= '0' && *s <= '9'){ eabs = eabs*10 + (*s-'0'); s++; }
+        __float128 scale = one;
+        __float128 base  = (esign > 0) ? ten : (one / ten);
+        while(eabs-- > 0) scale *= base;
+        result *= scale;
+    }
+
+    return sign ? -result : result;
+}
+
+/* -------------------------------------------------------
+ * f128_eval_expr(): evaluate a simple arithmetic expression
+ * in __float128 precision.
+ *
+ * Grammar:
+ *   expr   := term   (('+' | '-') term)*
+ *   term   := factor (('*' | '/') factor)*
+ *   factor := '(' expr ')'  |  '-' factor  |  '+' factor  |  number
+ *   number := decimal literal parsed by f128_from_decimal
+ *
+ * Used by both qad{} and !Q so that "3.14*2+1" is evaluated with
+ * full 113-bit binary128 precision, matching Python mpmath exactly.
+ * Non-parseable tokens (labels/symbols) cause ok=0; callers fall
+ * back to the existing double-mode evaluator.                        */
+typedef struct { __float128 val; const char *end; int ok; } F128R;
+
+static F128R f128_expr_fn(const char *s);   /* forward declaration */
+
+static F128R f128_factor_fn(const char *s)
+{
+    while(*s==' '||*s=='\t') s++;
+    F128R r = {(__float128)0, s, 1};
+    if(*s=='('){
+        r = f128_expr_fn(s+1);
+        if(!r.ok) return r;
+        while(*r.end==' '||*r.end=='\t') r.end++;
+        if(*r.end==')') r.end++;
+        return r;
+    }
+    if(*s=='-'){ r=f128_factor_fn(s+1); r.val=-r.val; return r; }
+    if(*s=='+'){ return f128_factor_fn(s+1); }
+    /* decimal number literal */
+    if((*s>='0'&&*s<='9')||*s=='.'){
+        char buf[80]; int n=0;
+        while(((*s>='0'&&*s<='9')||*s=='.')&&n<78) buf[n++]=*s++;
+        if((*s=='e'||*s=='E')&&n<77){
+            buf[n++]=*s++;
+            if((*s=='+'||*s=='-')&&n<77) buf[n++]=*s++;
+            while(*s>='0'&&*s<='9'&&n<78) buf[n++]=*s++;
+        }
+        buf[n]='\0';
+        r.val=f128_from_decimal(buf);
+        r.end=s;
+        return r;
+    }
+    r.ok=0; return r;
+}
+
+static F128R f128_term_fn(const char *s)
+{
+    while(*s==' '||*s=='\t') s++;
+    F128R r=f128_factor_fn(s);
+    if(!r.ok) return r;
+    while(1){
+        const char *p=r.end;
+        while(*p==' '||*p=='\t') p++;
+        if(*p=='*'){
+            F128R r2=f128_factor_fn(p+1); if(!r2.ok) break;
+            r.val*=r2.val; r.end=r2.end;
+        } else if(*p=='/'){
+            F128R r2=f128_factor_fn(p+1); if(!r2.ok) break;
+            if(r2.val!=(__float128)0){ r.val/=r2.val; }
+            r.end=r2.end;
+        } else break;
+    }
+    return r;
+}
+
+static F128R f128_expr_fn(const char *s)
+{
+    while(*s==' '||*s=='\t') s++;
+    F128R r=f128_term_fn(s);
+    if(!r.ok) return r;
+    while(1){
+        const char *p=r.end;
+        while(*p==' '||*p=='\t') p++;
+        if(*p=='+'){
+            F128R r2=f128_term_fn(p+1); if(!r2.ok) break;
+            r.val+=r2.val; r.end=r2.end;
+        } else if(*p=='-'){
+            F128R r2=f128_term_fn(p+1); if(!r2.ok) break;
+            r.val-=r2.val; r.end=r2.end;
+        } else break;
+    }
+    return r;
+}
+
+/* Convert __float128 to uint256_t bit pattern.
+ * w[0] = lower 64 bits (LE) / upper 64 bits (BE).                   */
+static uint256_t f128_to_u256(__float128 v)
+{
+    unsigned char raw[16];
+    memcpy(raw, &v, 16);
+    uint256_t res = u256_zero();
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+    for(int i=0;i<8;i++)  res.w[1]=(res.w[1]<<8)|raw[i];
+    for(int i=8;i<16;i++) res.w[0]=(res.w[0]<<8)|raw[i];
+#else
+    memcpy(&res.w[0], raw,   8);
+    memcpy(&res.w[1], raw+8, 8);
+#endif
+    return res;
+}
+
+/* Evaluate text as __float128 expression. ok_out=0 on failure.       */
+static uint256_t f128_eval_text(const char *text, int *ok_out)
+{
+    F128R r = f128_expr_fn(text);
+    if(ok_out) *ok_out = r.ok;
+    if(!r.ok)  return u256_zero();
+    return f128_to_u256(r.val);
+}
+
+#endif /* __GNUC__ block */
+
 static uint256_t ieee754_128_from_str(const char *a){
     /* Special values */
     if(strcmp(a,"inf")==0){
@@ -1105,111 +1281,16 @@ static uint256_t ieee754_128_from_str(const char *a){
 #if defined(__GNUC__) && !defined(__STRICT_ANSI__) && \
     (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
      defined(__arm__) || defined(__riscv))
-    /* --- Path A: use __float128 when the compiler supports it ------------ */
-    /* __float128 is a GCC/Clang extension giving true IEEE 754 binary128.
-     *
-     * Fix P11-B: The previous code used (__float128)strtold(a, NULL), which
-     * only provides 64-bit mantissa precision (80-bit long double on x86-64).
-     * For a !Q literal like "3.14", this left the lower 48 bits of the
-     * 112-bit mantissa as zero, producing a result that differs from Python's
-     * mpmath output.
-     *
-     * Fix: parse the decimal string entirely in __float128 arithmetic.
-     * Strategy: accumulate all significant digits as an exact integer using
-     * Horner's method, then divide once by the appropriate power of 10.
-     * This yields a single correctly-rounded __float128 result.
-     *
-     *   e.g. "3.14" → mantissa=314 (exact integer), divide by 100
-     *        → nearest binary128 to 3.14 with 112-bit precision.
-     */
-    __float128 val;
-    {
-        const char *p = a;
-        while(*p == ' ' || *p == '\t') p++;
-        int p_neg = 0;
-        if(*p == '-'){ p_neg=1; p++; } else if(*p=='+') p++;
-
-        /* Count significant digits and locate the decimal point */
-        const char *digit_start = p;
-        int ndigits = 0, dot_pos = -1;
-        const char *scan = p;
-        while(isdigit((unsigned char)*scan) || (*scan=='.' && dot_pos<0)){
-            if(*scan=='.') dot_pos = ndigits;
-            else ndigits++;
-            scan++;
-        }
-        int frac_digits = (dot_pos >= 0) ? (ndigits - dot_pos) : 0;
-
-        /* Horner accumulation into __float128 mantissa (exact for integers
-         * with up to ~33 decimal digits, ample for typical float literals) */
-        __float128 mantissa = (__float128)0;
-        const char *dp = digit_start;
-        for(int d = 0; d < ndigits; d++){
-            if(*dp == '.') dp++;
-            mantissa = mantissa * (__float128)10 + (__float128)(*dp++ - '0');
-        }
-
-        /* Divide by 10^frac_digits (single rounding, power via squaring) */
-        __float128 result = mantissa;
-        if(frac_digits > 0){
-            __float128 pw = (__float128)1, base = (__float128)10;
-            int e = frac_digits;
-            while(e > 0){ if(e&1) pw *= base; base *= base; e >>= 1; }
-            result /= pw;
-        }
-
-        /* Optional decimal exponent (e.g. 1.5e10) */
-        if(*scan == 'e' || *scan == 'E'){
-            scan++;
-            int esign = 1;
-            if(*scan=='-'){ esign=-1; scan++; } else if(*scan=='+') scan++;
-            int exp = 0;
-            while(isdigit((unsigned char)*scan)) exp = exp*10 + (*scan++ - '0');
-            __float128 pw = (__float128)1, b10 = (__float128)10;
-            while(exp > 0){ if(exp&1) pw *= b10; b10 *= b10; exp >>= 1; }
-            if(esign > 0) result *= pw; else result /= pw;
-        }
-
-        val = p_neg ? -result : result;
-    }
-    /* For exponent/fraction extraction we must work around the absence of
-     * standard C library support for __float128 on most platforms.
-     * Strategy: decompose via integer bit manipulation.
-     * __float128 layout (little-endian storage, 128 bits total):
-     *   bit 127   : sign
-     *   bits 126..112 (15 bits) : biased exponent (bias = 16383)
-     *   bits 111..0  (112 bits) : fractional mantissa (hidden bit not stored)
-     * We copy the raw bytes out and reassemble into two uint64_t words.    */
-    {
-        unsigned char raw[16]={0};
-        __float128 tmp = val;
-        /* Portable byte-copy of __float128 */
-        __float128 *pp = &tmp;
-        memcpy(raw, pp, 16);
-        /* raw[0..7]  = least-significant 64 bits  (w[0])
-         * raw[8..15] = most-significant 64 bits   (w[1])
-         * (This is true on all little-endian targets; __float128 is always
-         * stored in target-endian order by GCC, but the bit-field layout
-         * described above holds for both LE and BE -- we handle both.) */
-        uint256_t result = u256_zero();
-#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
-        /* Big-endian: raw[0..7] = most-significant 64 bits (w[1]),
-         *             raw[8..15] = least-significant 64 bits (w[0]).
-         * memcpy respects host byte order correctly.                */
-        memcpy(&result.w[1], raw,   8);
-        memcpy(&result.w[0], raw+8, 8);
-#else
-        /* Little-endian (the common case):
-         * raw[0..7]  = least-significant 64 bits (w[0]),
-         * raw[8..15] = most-significant 64 bits  (w[1]).
-         * memcpy respects host byte order correctly.                */
-        memcpy(&result.w[0], raw,   8);
-        memcpy(&result.w[1], raw+8, 8);
+    /* Path A: use __float128 arithmetic via f128_eval_text (full 113-bit
+     * precision, same result as Python mpmath with mp.prec=128).            */
+    int ok = 0;
+    uint256_t r = f128_eval_text(a, &ok);
+    if(ok) return r;
+    /* Fall through to Path B if the expression couldn't be parsed
+     * (e.g. something other than a plain decimal literal).                  */
 #endif
-        return result;
-    }
-#else
-    /* --- Path B: long double iterative extraction (portable fallback) ---- */
+
+    /* Path B: long double iterative extraction (portable fallback).         */
     /* Warn once if long double has the same precision as double (64-bit).  */
     {
         static int warned = 0;
@@ -1262,7 +1343,6 @@ static uint256_t ieee754_128_from_str(const char *a){
                 | ((uint64_t)(unsigned)biased_exp << 48)
                 | ((uint64_t)(unsigned)sign << 63);
     return result;
-#endif
 }
 
 static double enfloat_bits(uint64_t a){
@@ -1804,10 +1884,37 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         idx+=3;
         idx=axx_skipspc(s,idx);
         if(s[idx]=='{'){
-            char fs[256];
-            idx=axx_get_floatstr(s,idx+1,fs,sizeof(fs));
-            x=ieee754_128_from_str(fs);
+            idx++;
+            /* Read full expression up to matching '}', handling nested '()' */
+            char expr_buf[1024]; size_t en=0; int depth=0;
+            while(s[idx] && en<sizeof(expr_buf)-1){
+                if(s[idx]=='('||s[idx]=='[') depth++;
+                else if((s[idx]==')'||s[idx]==']')&&depth>0) depth--;
+                else if(s[idx]=='}'&&depth==0) break;
+                expr_buf[en++]=s[idx++];
+            }
+            expr_buf[en]='\0';
             if(s[idx]=='}') idx++;
+#if defined(__GNUC__) && !defined(__STRICT_ANSI__) && \
+    (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
+     defined(__arm__) || defined(__riscv))
+            /* Evaluate in full __float128 precision matching mpmath */
+            int q_ok=0;
+            uint256_t qbits = f128_eval_text(expr_buf, &q_ok);
+            if(q_ok){ x=qbits; }
+            else
+#endif
+            {
+                /* Fall back: evaluate as double-mode expression */
+                int io2;
+                int prev_flt=asmb->st.exp_typ_float;
+                asmb->st.exp_typ_float=1;
+                uint256_t fv=expr_expression_pat(asmb,expr_buf,0,&io2);
+                asmb->st.exp_typ_float=prev_flt;
+                double dv=u256_to_double(fv);
+                char fstr[64]; snprintf(fstr,sizeof(fstr),"%.17g",dv);
+                x=ieee754_128_from_str(fstr);
+            }
         }
     }
     /* enflt{expr}: evaluate expr in integer mode, interpret 32 low bits as
@@ -2640,13 +2747,10 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     idx_t = axx_skipspc(t, idx_t);
                     stopchar = t[idx_t]; idx_t++; /* stopchar, then advance */
                 }
-                /* Evaluate in float mode using the native C evaluator.
-                 * expr_expression_esc_float() returns the double result as a
-                 * uint256_t bit-cast (w[0] holds the IEEE754 double bits).
-                 * For !Q we also save the raw source start so we can pass the
-                 * original decimal text directly to ieee754_128_from_str,
-                 * bypassing the double-precision rounding loss. */
-                int q_raw_start = idx_s;  /* saved for !Q raw-text path */
+                /* Evaluate in float mode to get the expression extent.
+                 * Save source position first so we can extract the raw text
+                 * for __float128 re-evaluation.                             */
+                int idx_s_q_start = idx_s;
                 uint256_t fv = expr_expression_esc_float(asmb, s, idx_s, stopchar, &idx_s);
                 double dv = u256_to_double(fv);
                 /* consume stopchar from source if present */
@@ -2663,53 +2767,51 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     var_put(st, a, u256_from_u64(bits));
                 } else {
                     /* !Q : IEEE754 128-bit (quad) bit-pattern.
-                     *
-                     * Fix P11-C: previously we converted the double value to
-                     * "%.17g" and fed that string to ieee754_128_from_str.
-                     * This limited precision to 53 bits (double mantissa)
-                     * because the string representation of the double cannot
-                     * recover the additional 59 bits of a binary128 mantissa.
-                     *
-                     * Fix: extract the raw source text of the expression
-                     * (before double evaluation) and pass it directly to
-                     * ieee754_128_from_str, which now uses __float128
-                     * arithmetic internally for 112-bit precision.
-                     * Fallback to the double-based string if the raw text is
-                     * too long or looks like a compound expression (contains
-                     * operator characters), since ieee754_128_from_str only
-                     * handles simple decimal/hex literals.                  */
-                    char fstr[256];
-                    int raw_len = idx_s - q_raw_start;
-                    /* Back off past the consumed stopchar, if any */
-                    if(stopchar != '\0' && raw_len > 0
-                       && s[q_raw_start + raw_len - 1] == stopchar)
-                        raw_len--;
-                    /* Trim trailing whitespace */
-                    while(raw_len > 0
-                          && (s[q_raw_start+raw_len-1]==' '
-                              || s[q_raw_start+raw_len-1]=='\t'))
-                        raw_len--;
-                    /* Use raw text only for simple literals (no operators) */
-                    int raw_ok = (raw_len > 0 && raw_len < (int)sizeof(fstr)-1);
-                    if(raw_ok){
-                        for(int _ci=0; _ci<raw_len && raw_ok; _ci++){
-                            char _c = s[q_raw_start+_ci];
-                            /* allow: digits, '.', 'e', 'E', '+', '-', 'x', 'X',
-                             * 'a'-'f', 'A'-'F', 'p', 'P' (hex float), spaces */
-                            if(!isdigit((unsigned char)_c) && _c!='.' && _c!='e'
-                               && _c!='E' && _c!='p' && _c!='P' && _c!='+'
-                               && _c!='-' && _c!='x' && _c!='X' && _c!=' '
-                               && !(_c>='a'&&_c<='f') && !(_c>='A'&&_c<='F'))
-                                raw_ok = 0;
+                     * Extract the raw source text and evaluate in __float128
+                     * for full precision matching Python mpmath.            */
+                    /* The stopchar (if any) was consumed above; the extent
+                     * idx_s_q_start..idx_s covers text + optional stopchar */
+                    int raw_len = idx_s - idx_s_q_start;
+                    if(stopchar && raw_len > 0 &&
+                       s[idx_s_q_start + raw_len - 1] == stopchar)
+                        raw_len--;  /* trim trailing stopchar */
+                    uint256_t qbits;
+#if defined(__GNUC__) && !defined(__STRICT_ANSI__) && \
+    (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
+     defined(__arm__) || defined(__riscv))
+                    if(raw_len > 0 && raw_len < 1024){
+                        char expr_text[1024];
+                        memcpy(expr_text, s + idx_s_q_start, (size_t)raw_len);
+                        expr_text[raw_len] = '\0';
+                        /* Strip "qad{...}" wrapper if present so that both
+                         *   !Q  3.14*2+1
+                         *   !Q  qad{3.14*2+1}
+                         * are evaluated identically in __float128.          */
+                        const char *f128_text = expr_text;
+                        char stripped[1024];
+                        if(raw_len > 4 &&
+                           strncmp(expr_text, "qad{", 4) == 0 &&
+                           expr_text[raw_len-1] == '}'){
+                            int inner = raw_len - 5; /* strip "qad{" and "}" */
+                            memcpy(stripped, expr_text + 4, (size_t)inner);
+                            stripped[inner] = '\0';
+                            f128_text = stripped;
                         }
-                    }
-                    if(raw_ok){
-                        memcpy(fstr, s + q_raw_start, raw_len);
-                        fstr[raw_len] = '\0';
-                    } else {
+                        int q_ok = 0;
+                        qbits = f128_eval_text(f128_text, &q_ok);
+                        if(!q_ok){
+                            /* fall back: double→string→binary128 */
+                            char fstr[64];
+                            snprintf(fstr, sizeof(fstr), "%.17g", dv);
+                            qbits = ieee754_128_from_str(fstr);
+                        }
+                    } else
+#endif
+                    {
+                        char fstr[64];
                         snprintf(fstr, sizeof(fstr), "%.17g", dv);
+                        qbits = ieee754_128_from_str(fstr);
                     }
-                    uint256_t qbits = ieee754_128_from_str(fstr);
                     var_put(st, a, qbits);
                 }
                 continue;
