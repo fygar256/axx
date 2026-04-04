@@ -494,23 +494,6 @@ Please prefix binary numbers with '0b'.
 
 Please prefix hexadecimal numbers with '0x'.
 
-Within flt{} and dbl{}, enfloat(<hexa>} and endouble(<hexa>) can be used. These are the inverse conversions of flt{} and dbl{}, respectively. However, nesting cannot be used. For example, flt{enfloat(flt{3.14})} is not allowed.
-
-```
-label0: .equ flt{3.14}
-ldf a,flt{enfloat(:'label0')+1}
-```
-
-Use it like this.
-
-#### To reference a label in a Python eval expression, use
-
-```
-LABELS['label0'][0]
-```
-
-If it's too complicated to write it like this, you can use a preprocessor to convert `:label` to `LABELS['label'][0]`, for example.
-
 #### string
 
 `.ascii` outputs the bytecode of a string, and `.asciiz` outputs the bytecode of a string with 0x00 at the end.
@@ -604,9 +587,6 @@ Operators and precedence are based on Python and are as follows.
 ```
 (expression)         An expression enclosed in parentheses
 #                    An operator that returns the value of a symbol
-enflt{x},endbl{x}    Operators that convert x(byte code) to floating point number.
-flt{x},dbl{x}        Operators that convert x to float and double bytecodes, respectively
-qad{x}               Operators that convert x to a 128-bit floating point number's bytcode. However, in this case, x can only be a constant.
 *(x,y)               yth byte from the lowest value of x (y>=0)
 -,~                  Negative, bitwise NOT
 'c'                  character code of 'c'
@@ -721,7 +701,7 @@ Because this is a test, the binary is different from the actual code.
 /* test
 .setsym ::a:: 7
 .setsym ::b:: 1
-LDF A,!x :: 0x1,@@[16,*(x,%%)]
+LDQ A,!Qx :: 0x1,@@[16,*(x,%%)]
 
 /* ARM64
 .setsym ::r1 :: 2
@@ -813,8 +793,6 @@ LISP machine programs are not assembly language.
 -Please evaluate, extend, and modify axx. The structure is difficult to understand, but since it is written in Python, it is easy to extend. Please feel free to extend it.
 
 -For now, only constants can be used for quadruple precision floating point numbers. This is the specification of python3. It would be nice if quadruple precision floating point numbers could be handled in python4.
-
--nan, inf, and -inf processing can only be used in flt{x}, dbl{x}, and qad{x}. Nan, inf, and -inf are first loaded into registers or memory, or constants are taken as operands, and then the processor performs the calculations, so this may be sufficient.
 
 - Use a preprocessor for macro functionality. To cover all assembly languages, a high-performance macro processor is needed to translate functional,structured and such high-level assembly language into imperative assembly language.
 
