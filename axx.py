@@ -304,7 +304,17 @@ class Parser:
         return fs, idx
     
     def get_floatstr(self, s, idx):
-        """Get float string from position"""
+        """Get float string from position.
+
+        Fix 11: 単項マイナスは factor() が先に処理するため、
+        factor1() から呼ばれる get_floatstr() で先頭の '-' を
+        再度消費すると二重解釈になる。
+        '-inf' だけは特別扱いとして残す（単項マイナス + inf では
+        factor() の負号処理と組み合わせると正しく動くが、
+        '-inf' という単一トークンとして見た方が自然で、
+        既存の使用箇所すべてでその前提で動いている）。
+        それ以外の数値先頭 '-' は消費しない。
+        """
         if s[idx:idx+4] == '-inf':
             return '-inf', idx + 4
         elif s[idx:idx+3] == 'inf':
@@ -313,10 +323,8 @@ class Parser:
             return 'nan', idx + 3
         else:
             fs = ''
-            # Accept leading minus sign only at the start
-            if idx < len(s) and s[idx] == '-':
-                fs += '-'
-                idx += 1
+            # Fix 11: 先頭の '-' は factor() の単項マイナス処理が担うため
+            # ここでは消費しない（二重解釈を防ぐ）。
             while idx < len(s) and s[idx] in "0123456789.":
                 fs += s[idx]
                 idx += 1
@@ -855,6 +863,47 @@ class ExpressionEvaluator:
             return hex(val)
 
         s = re.sub(pattern, replacer, x)
+
+        # Fix 3: eval() の代わりに AST ウォークによるホワイトリスト検証を行う。
+        # '__builtins__' を空にするだけではクラス継承チェーン経由の
+        # 任意コード実行を防げないため、許可ノード種別を明示的に制限する。
+        import ast as _ast
+
+        _ALLOWED_NODES = (
+            _ast.Expression,
+            _ast.BinOp, _ast.UnaryOp,
+            _ast.Add, _ast.Sub, _ast.Mult, _ast.Div, _ast.FloorDiv,
+            _ast.Mod, _ast.Pow,
+            _ast.BitAnd, _ast.BitOr, _ast.BitXor,
+            _ast.LShift, _ast.RShift,
+            _ast.Invert, _ast.UAdd, _ast.USub,
+            _ast.Constant,
+            _ast.Call, _ast.Name, _ast.Load,
+            _ast.IfExp,
+            _ast.Compare,
+            _ast.Eq, _ast.NotEq, _ast.Lt, _ast.LtE, _ast.Gt, _ast.GtE,
+            _ast.BoolOp, _ast.And, _ast.Or,
+        )
+        _ALLOWED_NAMES = {"enfloat", "endouble", "enflt", "endbl"}
+
+        try:
+            tree = _ast.parse(s, mode='eval')
+        except SyntaxError as e:
+            raise ValueError(f"xeval: parse error in '{s}': {e}")
+
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ALLOWED_NODES):
+                raise ValueError(
+                    f"xeval: disallowed AST node {type(node).__name__} in '{s}'")
+            if isinstance(node, _ast.Name) and node.id not in _ALLOWED_NAMES:
+                raise ValueError(
+                    f"xeval: disallowed name '{node.id}' in '{s}'")
+            if isinstance(node, _ast.Call):
+                if (not isinstance(node.func, _ast.Name)
+                        or node.func.id not in _ALLOWED_NAMES):
+                    raise ValueError(
+                        f"xeval: disallowed function call in '{s}'")
+
         safe_env = {
             "__builtins__": {},
             "enfloat": enfloat,
@@ -862,10 +911,7 @@ class ExpressionEvaluator:
             "enflt": enflt,
             "endbl": endbl,
         }
-        # eval の第3引数にも空辞書を渡すことでローカルスコープも封鎖する。
-        # クラス継承チェーン経由のエスケープを防ぐため、
-        # 評価結果が数値型であることを確認する。
-        result = eval(s, safe_env, {})
+        result = eval(compile(tree, '<xeval>', 'eval'), safe_env, {})
         if not isinstance(result, (int, float, bool)):
             raise ValueError(f"xeval: unsafe result type {type(result)}")
         return result
@@ -894,7 +940,8 @@ class ExpressionEvaluator:
         elif idx+4<len(s) and s[idx:idx+4]=="'\\n'":
             x=0x0a
             idx+=4
-        elif idx+3<len(s) and s[idx]=='\'' and s[idx+2]=='\'':
+        # Fix 4: idx+3 <= len(s) に変更（文字列末尾3文字が 'x' の場合も正しくマッチ）
+        elif idx+3<=len(s) and s[idx]=='\'' and s[idx+2]=='\'':
             x=ord(s[idx+1])
             idx+=3
         elif StringUtils.q(s, '$$', idx):
@@ -1503,14 +1550,20 @@ class DirectiveProcessor:
         return True
     
     def error(self, s):
-        """Process error directive"""
+        """Process error directive.
+
+        Fix 10: error_code はローカル変数に代入するだけで戻り値がなく、
+        呼び出し元でエラーを検知できなかった。
+        戻り値として (triggered: bool, code: int) を返すよう変更する。
+        """
         ss = s.replace(' ', '')
         if ss == "":
-            return
+            return False, 0
         
         s += chr(0)
         idx = 0
         error_code = 0
+        triggered = False
         
         while True:
             ch = s[idx] if idx < len(s) else chr(0)
@@ -1532,11 +1585,15 @@ class DirectiveProcessor:
             t, idx = self.expr_eval.expression_pat(s, idx)
             
             if (self.state.pas == 2 or self.state.pas == 0) and u:
-                print(f"Line {self.state.ln} Error code {t} ", end="")
-                if t >= 0 and t < len(ERRORS):
-                    print(f"{ERRORS[t]}", end='')
+                t_int = int(t)
+                print(f"Line {self.state.ln} Error code {t_int} ", end="")
+                if 0 <= t_int < len(ERRORS):
+                    print(f"{ERRORS[t_int]}", end='')
                 print(": ")
-                error_code = t
+                error_code = t_int
+                triggered = True
+
+        return triggered, error_code
 
 
 class PatternMatcher:
@@ -1626,10 +1683,23 @@ class PatternMatcher:
                     return False
             elif a == '!':
                 idx_t += 1
+                # Fix 1: パターンが '!' で終端している場合の IndexError を防ぐ
+                if idx_t >= len(t):
+                    return False
                 a = t[idx_t]
                 idx_t += 1
+                # Fix 1b: '!' の直後が NUL（番兵）や無効文字の場合は不正パターン
+                # a が chr(0) のまま else 分岐に流れると番兵を消費してループが壊れる
+                if a == chr(0):
+                    return False
                 if a == 'F':
+                    # Fix 2a: !F の変数名取得前に境界チェック
+                    if idx_t >= len(t):
+                        return False
                     a = t[idx_t]
+                    # Fix 2a-2: 変数名が NUL または無効文字なら不正パターン
+                    if a == chr(0) or a not in LOWER:
+                        return False
                     idx_t = StringUtils.skipspc(t, idx_t+1)
                     if idx_t < len(t) and t[idx_t] == '\\':
                         idx_t = StringUtils.skipspc(t, idx_t+1)
@@ -1647,7 +1717,13 @@ class PatternMatcher:
                         idx_s += 1
                     continue
                 elif a == 'D':
+                    # Fix 2b: !D の変数名取得前に境界チェック
+                    if idx_t >= len(t):
+                        return False
                     a = t[idx_t]
+                    # Fix 2b-2: 変数名が NUL または無効文字なら不正パターン
+                    if a == chr(0) or a not in LOWER:
+                        return False
                     idx_t = StringUtils.skipspc(t, idx_t+1)
                     if idx_t < len(t) and t[idx_t] == '\\':
                         idx_t = StringUtils.skipspc(t, idx_t+1)
@@ -1667,7 +1743,13 @@ class PatternMatcher:
                 elif a == 'Q':
                     # !Q<var> : ソースから浮動小数点式を読み取り、
                     # IEEE754 128ビット(quad)整数ビットパターンとして変数に格納する
+                    # Fix 2c: !Q の変数名取得前に境界チェック
+                    if idx_t >= len(t):
+                        return False
                     a = t[idx_t]
+                    # Fix 2c-2: 変数名が NUL または無効文字なら不正パターン
+                    if a == chr(0) or a not in LOWER:
+                        return False
                     idx_t = StringUtils.skipspc(t, idx_t+1)
                     if idx_t < len(t) and t[idx_t] == '\\':
                         idx_t = StringUtils.skipspc(t, idx_t+1)
@@ -1716,7 +1798,13 @@ class PatternMatcher:
                         idx_s += 1
                     continue
                 elif a == '!':
+                    # Fix 2d: !! の変数名取得前に境界チェック
+                    if idx_t >= len(t):
+                        return False
                     a = t[idx_t]
+                    # Fix 2d-2: 変数名が NUL または無効文字なら不正パターン
+                    if a == chr(0) or a not in LOWER:
+                        return False
                     idx_t += 1
                     # ELF追跡: !!a（factor キャプチャ）
                     self.state._elf_capturing_var = a
@@ -1725,6 +1813,10 @@ class PatternMatcher:
                     self.var_manager.put(a, v)
                     continue
                 else:
+                    # Fix 1c: else 分岐の変数名 a も NUL/無効文字チェック
+                    # （'!' の直後に stopchar指定なし の通常キャプチャ）
+                    if a == chr(0) or a not in LOWER:
+                        return False
                     idx_t = StringUtils.skipspc(t, idx_t)
                     if idx_t < len(t) and t[idx_t] == '\\':
                         idx_t += 1                                    # skip '\'
@@ -2086,13 +2178,20 @@ class VLIWProcessor:
                 
                 q = 0
                 if self.state.vliwbits > 0:
-                    bc = vbits - 8
-                    vm = 0xff << bc
-                    for cnt in range(vbits // 8):
-                        self.binary_writer.outbin(self.state.pc + cnt, ((res & vm) >> bc) & 0xff)
-                        bc = bc - 8
-                        vm >>= 8
-                        q += 1
+                    if vbits < 8:
+                        # Fix 6: vbits < 8 では bc = vbits - 8 が負になり
+                        # '0xff << bc' で ValueError が発生する。
+                        # 1バイト未満のワードは下位ビットのみを出力する。
+                        self.binary_writer.outbin(self.state.pc, res & ((1 << vbits) - 1))
+                        q = 1
+                    else:
+                        bc = vbits - 8
+                        vm = 0xff << bc
+                        for cnt in range(vbits // 8):
+                            self.binary_writer.outbin(self.state.pc + cnt, ((res & vm) >> bc) & 0xff)
+                            bc = bc - 8
+                            vm >>= 8
+                            q += 1
                 else:
                     for cnt in range(vbits // 8):
                         self.binary_writer.outbin(self.state.pc + cnt, res & 0xff)
@@ -2358,6 +2457,17 @@ class Assembler:
             return [], [], True, idx
         if self.asm_directive_proc.export_processing(l, l2):
             return [], [], True, idx
+
+        # Fix 9: ソースファイル内の .setsym / .clearsym は lineassemble() 先頭の
+        # "symbols = dict(patsymbols)" リセットによって次行では消えてしまう。
+        # ソースレベルの場合は patsymbols も同時に更新することで永続させる。
+        _i_src = [l, '', l2, '', '', '']
+        if self.directive_proc.set_symbol(_i_src):
+            self.state.patsymbols = dict(self.state.symbols)
+            return [], [], True, idx
+        if self.directive_proc.clear_symbol(_i_src):
+            self.state.patsymbols = dict(self.state.symbols)
+            return [], [], True, idx
         if l == "":
             return [], [], False, idx
         
@@ -2406,8 +2516,13 @@ class Assembler:
             if not self.state.debug:
                 try:
                     if self.pattern_matcher.match0(lin, i[0]) == True:
-                        self.directive_proc.error(i[1])
-                        objl = self.obj_gen.makeobj(i[2])
+                        # Fix 10: error() の戻り値でエラー発生を検知し、
+                        # エラー時はオブジェクト生成をスキップする。
+                        err_triggered, _err_code = self.directive_proc.error(i[1])
+                        if not err_triggered:
+                            objl = self.obj_gen.makeobj(i[2])
+                        else:
+                            objl = []
                         # makeobj() の finally が _elf_current_word_idx を -1 に
                         # リセット済み。以降のサイズ式 expression_pat(i[3]) で発生する
                         # ラベル参照は word_idx=-1 となりリロケーション対象外になる。
@@ -2435,8 +2550,12 @@ class Assembler:
                     break
             else:
                 if self.pattern_matcher.match0(lin, i[0]) == True:
-                    self.directive_proc.error(i[1])
-                    objl = self.obj_gen.makeobj(i[2])
+                    # Fix 10: error() の戻り値でエラー発生を検知する（デバッグモード）
+                    err_triggered, _err_code = self.directive_proc.error(i[1])
+                    if not err_triggered:
+                        objl = self.obj_gen.makeobj(i[2])
+                    else:
+                        objl = []
                     # makeobj() の finally が _elf_current_word_idx を -1 にリセット済み
                     idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                     loopflag = False
@@ -2623,18 +2742,43 @@ class Assembler:
         return f
     
     def setpatsymbols(self, pat):
-        """Set pattern symbols"""
+        """Set pattern symbols.
+
+        Fix 8: 旧実装は state.symbols を破壊的に更新してから
+        patsymbols.update(symbols) していたため、パターンファイル内に
+        '.setsym A 1' → '.clearsym'（全消去）という順序で書かれていると
+        最終的に patsymbols が空になる問題があった。
+        さらに、.clearsym の「全消去」が patsymbols を巻き込む前に
+        update() が起きるかどうかは出現順次第だった。
+
+        修正: 空の辞書から始めてパターンエントリを順に適用し、
+        最後に patsymbols へ代入することで出現順に正しく反映する。
+        state.symbols はアセンブリ中の一時状態なので最後に patsymbols と同期する。
+        """
+        fresh = {}
         for i in pat:
-            if self.directive_proc.set_symbol(i):
+            if i is None:
                 continue
-            # 【バグ修正⑫】旧実装は .setsym しか処理しておらず、パターンファイル内の
-            # .clearsym が patsymbols に反映されなかった。
-            # .clearsym で削除したシンボルがソースアセンブル中ずっと残り続け、
-            # 誤ったシンボル解決が起きていた。
-            # 修正: .clearsym も同ループで処理することで正しく反映される。
-            if self.directive_proc.clear_symbol(i):
+            # .setsym
+            if len(i) > 0 and i[0] == '.setsym':
+                if len(i) >= 2:
+                    key = StringUtils.upper(i[1])
+                    if len(i) > 2:
+                        v, _ = self.expr_eval.expression_pat(i[2], 0)
+                    else:
+                        v = 0
+                    fresh[key] = v
                 continue
-        self.state.patsymbols.update(self.state.symbols)
+            # .clearsym
+            if len(i) > 0 and i[0] == '.clearsym':
+                if len(i) >= 3 and i[2] != '':
+                    key = StringUtils.upper(i[2])
+                    fresh.pop(key, None)
+                else:
+                    fresh = {}
+                continue
+        self.state.patsymbols = fresh
+        self.state.symbols = dict(fresh)
     
     def fileassemble(self, fn):
         """Assemble file"""
@@ -2734,7 +2878,10 @@ class Assembler:
                 if size == 0 and v == start:
                     section = sname
                     break
-            self.label_manager.put_value(label, v, section)
+            # Fix 7: put_value() は pas 状態に応じて二重定義チェックや
+            # 「pass1未定義」エラーを出す。インポートラベルは pas に
+            # 関係なく直接 labels に書き込む（上書き可）。
+            self.state.labels[label] = [v, section, True]  # is_equ=True: リロケーション不要
             return True
 
         return False
@@ -3204,11 +3351,17 @@ class Assembler:
             MAX_RELAX = 8
             self.state._pass1_prev_label_pcs = None
 
+            # Fix 5: リラクゼーションループの先頭で labels = {} にリセットすると
+            # -i オプションでインポートしたラベルも消えてしまう。
+            # インポート済みラベルをスナップショットして毎イテレーション先頭で復元する。
+            _imported_labels = dict(self.state.labels)
+
             for relax_iter in range(MAX_RELAX):
                 self.state.pc = 0
                 self.state.pas = 1
                 self.state.ln = 1
-                self.state.labels = {}
+                # インポートラベルを保持しつつ、前回イテレーションのアドレスラベルをリセット
+                self.state.labels = dict(_imported_labels)
                 self.state.sections = {}
                 self.state.export_labels = {}
                 # ソース内の .setsym / .clearsym が前回イテレーションで
