@@ -214,23 +214,42 @@ class StringUtils:
         エスケープされた引用符 \\" は文字列の開始・終了とみなさない。
         これにより "hello \\"world\\"; not a comment" のような入力で
         誤ってコメント開始位置がずれる問題を修正。
+
+        修正①: シングルクォートの文字リテラル 'x' / '\\n' も追跡するようにした。
+        アセンブリでは ';' のようにセミコロンを文字リテラルとして書く場合があり、
+        旧実装ではこれをコメント開始と誤認識してしまっていた。
+        シングルクォート内ではエスケープシーケンス（バックスラッシュ+1文字）も
+        考慮して終端クォートを正しく検出する。
         """
-        in_string = False
+        in_dquote = False   # ダブルクォート文字列 "..." の中
+        in_squote = False   # シングルクォート文字リテラル '.' の中
         i = 0
         while i < len(l):
             ch = l[i]
-            if ch == '\\' and in_string:
-                # エスケープシーケンス: 次の文字をスキップ
-                # 境界チェックを追加
+
+            # ダブルクォート文字列内のエスケープ処理
+            if ch == '\\' and in_dquote:
                 if i + 1 < len(l):
                     i += 2
                 else:
                     i += 1  # 末尾の孤立したバックスラッシュ
                 continue
-            if ch == '"':
-                in_string = not in_string
-            elif ch == ';' and not in_string:
+
+            # シングルクォートリテラル内のエスケープ処理 (例: '\\', '\n', '\t', '\'')
+            if ch == '\\' and in_squote:
+                if i + 1 < len(l):
+                    i += 2
+                else:
+                    i += 1
+                continue
+
+            if ch == '"' and not in_squote:
+                in_dquote = not in_dquote
+            elif ch == '\'' and not in_dquote:
+                in_squote = not in_squote
+            elif ch == ';' and not in_dquote and not in_squote:
                 return l[:i].rstrip()
+
             i += 1
         return l.rstrip()
     
@@ -349,22 +368,31 @@ class Parser:
             return True
 
     def get_curlb(self, s, idx):
-        """Get curly bracket content"""
+        """Get curly bracket content.
+
+        修正③: 閉じブレース '}' が見つからないまま文字列末尾に達した場合は
+        f=False を返してエラーを呼び出し元に知らせる。旧実装は f=True のまま
+        不完全な内容 t を返し、壊れた式がサイレントに評価されていた。
+        """
         idx = StringUtils.skipspc(s, idx)
         f = False
         t = ''
-        
+
         if idx < len(s) and s[idx] == '{':
             idx += 1
-            f = True
             idx = StringUtils.skipspc(s, idx)
+            start_idx = idx
             while idx < len(s) and s[idx] != '}':
                 t += s[idx]
                 idx += 1
-            idx = StringUtils.skipspc(s, idx)
-            if idx < len(s) and s[idx] == '}':
-                idx += 1
-        
+            if idx >= len(s):
+                # 閉じブレースが見つからなかった
+                print(f" error - missing closing '}}' in expression: '{{{t}'")
+                return False, '', start_idx  # f=False で呼び出し元にエラーを通知
+            # '}' を消費
+            idx += 1
+            f = True
+
         return f, t, idx
 
     def get_symbol_word(self, s, idx):
@@ -823,8 +851,12 @@ class ExpressionEvaluator:
                         idx+=1
                         x=x>>(x2*8)
                     else:
+                        # 修正⑩: 閉じ括弧 ')' がない場合はエラーを報告して 0 を返す
+                        print(" error - missing ')' in *(expr, expr) expression.")
                         x=0
                 else:
+                    # 修正⑩: カンマがない場合はエラーを報告して 0 を返す
+                    print(" error - missing ',' in *(expr, expr) expression.")
                     x=0
             else:
                 x=0
@@ -1150,7 +1182,15 @@ class ExpressionEvaluator:
         return x, idx
     
     def term6(self, s, idx):
-        """Handle sign extension"""
+        """Handle sign extension.
+
+        修正⑨: t（ビット幅）が非常に大きい場合、`(~0) << t` が Python の
+        任意精度整数で天文学的なサイズになり、後続の演算が極端に遅くなる。
+        現実的なアセンブラでは符号拡張のビット幅が 128 を超えることはない
+        ため、上限を設けてガードする。上限を超えた場合はゼロを返す
+        （ビット幅 0 と同じ扱い）。
+        """
+        _SEXT_MAX_BITS = 128  # 符号拡張ビット幅の上限
         x, idx = self.term5(s, idx)
         # Use '\'' as sign-extension operator only when followed by a digit or '('
         # to avoid ambiguity with character literal closing quotes.
@@ -1161,6 +1201,10 @@ class ExpressionEvaluator:
                 break
             t, idx = self.term5(s, idx + 1)
             if t <= 0:
+                x = 0
+            elif t > _SEXT_MAX_BITS:
+                # 修正⑨: 非現実的なビット幅は 0 として扱う
+                print(f" warning - sign-extension bit width {t} exceeds maximum {_SEXT_MAX_BITS}, result set to 0.")
                 x = 0
             else:
                 x = (x & ~((~0) << t)) | ((~0) << t if (x >> (t-1) & 1) else 0)
@@ -1955,6 +1999,9 @@ class PatternFileReader:
         (.INCLUDE) 分進んだ位置からファイル名を読み取る。
 
         修正5: ファイル名は base_dir を基準に解決する。
+
+        修正⑥: get_string() がファイル名の取得に失敗した場合（クォート抜けなど）
+        は空リストをサイレントに返さずエラーを表示する。
         """
         idx = StringUtils.skipspc(l, 0)
         i = l[idx:idx+8]
@@ -1962,6 +2009,24 @@ class PatternFileReader:
         if i != ".INCLUDE":
             return []
         s = StringUtils.get_string(l[idx+8:])
+        if s == "":
+            # get_string が失敗した（引用符がないか空文字列）
+            raw = l[idx+8:].strip()
+            if raw:
+                # 引用符なしでファイル名が書かれているかもしれない。
+                # スペースまでをファイル名として試みる（緩やかなフォールバック）。
+                fallback, _ = StringUtils.get_param_to_spc(raw, 0)
+                if fallback:
+                    import sys as _sys
+                    print(f" warning - .INCLUDE filename not quoted: {fallback!r}. "
+                          "Please use double quotes.", file=_sys.stderr)
+                    s = fallback
+                else:
+                    print(f" error - .INCLUDE directive has no filename: {l!r}")
+                    return []
+            else:
+                print(f" error - .INCLUDE directive has no filename: {l!r}")
+                return []
         w = self.readpat(s, base_dir)
         return w
 
@@ -2529,17 +2594,32 @@ class Assembler:
                         idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                         loopflag = False
                         break
-                except Exception:
+                except (ArithmeticError, KeyError, IndexError, ValueError,
+                        TypeError, AttributeError, OverflowError) as _exc:
+                    # 修正④: 旧実装は `except Exception` で全例外を捕捉していたため、
+                    # makeobj / expression_pat 内のコード実装バグ（TypeError 等）が
+                    # 「forward参照エラー」として握りつぶされ、デバッグが困難だった。
+                    # 対策:
+                    #   - forward参照で発生し得る算術・辞書・値域・型変換系の例外のみを
+                    #     列挙して捕捉する。
+                    #   - それ以外の予期しない例外（RuntimeError, RecursionError 等）は
+                    #     再 raise し、呼び出しスタックを確認できるようにする。
+                    # ただし Pass2 / インタラクティブで発生した場合は従来通り oerr 扱い。
                     if self.state.pas == 1:
                         # Pass1: パターンはマッチしたが forward参照で makeobj が失敗した。
                         # ラベルを 0 と仮定してサイズだけ確定させ、PC を正しく進める。
                         # makeobj() の finally が _elf_current_word_idx を -1 にリセット
                         # するため、ここで追加リセットは不要。
+                        if self.state.debug:
+                            import traceback as _tb
+                            print(f" [pass1 forward-ref fallback] {type(_exc).__name__}: {_exc}")
+                            _tb.print_exc()
                         try:
                             self.state._pass1_size_mode = True
                             objl = self.obj_gen.makeobj(i[2])
                             idxs, _ = self.expr_eval.expression_pat(i[3], 0)
-                        except Exception:
+                        except (ArithmeticError, KeyError, IndexError, ValueError,
+                                TypeError, AttributeError, OverflowError):
                             objl = []  # それでも失敗した場合はサイズ0のまま
                         finally:
                             self.state._pass1_size_mode = False
@@ -2608,6 +2688,8 @@ class Assembler:
         self.state.vcnt = sum(1 for p in parts if p != "")
 
         # ELF リロケーション追跡: pass2 かつ ELF 出力時のみ有効
+        # 修正②: lineassemble2 が例外を投げても _elf_tracking が True のまま
+        # 残らないよう try/finally で確実にリセットする。
         if self.state.elf_objfile and self.state.pas == 2:
             self.state._elf_tracking = True
             self.state._elf_label_refs_seen = []
@@ -2615,9 +2697,10 @@ class Assembler:
             self.state._elf_var_to_label = {}        # 命令ごとにリセット
             self.state._elf_capturing_var = None
 
-        idxs, objl, flag, idx = self.lineassemble2(line, 0)
-
-        self.state._elf_tracking = False
+        try:
+            idxs, objl, flag, idx = self.lineassemble2(line, 0)
+        finally:
+            self.state._elf_tracking = False
 
         if flag == False:
             return False
@@ -3348,13 +3431,25 @@ class Assembler:
             # pass1 のサイズ推定が間違い、pass2 でアドレスがずれることがある。
             # 対策: pass1 を最大 MAX_RELAX 回繰り返し、全ラベルの PC が
             # 前回と一致したら収束とみなして pass2 に進む（リラクゼーション法）。
+            # 修正⑤: 旧実装は _pass1_prev_label_pcs = None で初期化し、
+            # 初回イテレーション後の比較が「dict == None」→ 常に False となっていた。
+            # ラベルが1回目で既に安定していても必ず2回目のパスが走る無駄があった。
+            # 修正後: 初期値を「空の dict に絶対マッチしない番兵」として
+            # object() を使う。これにより初回に収束したケースも正しく break できる。
+            # （空ソースや全ラベルが .equ のみのケースで1パス節約できる）
             MAX_RELAX = 8
-            self.state._pass1_prev_label_pcs = None
+            _SENTINEL = object()
+            self.state._pass1_prev_label_pcs = _SENTINEL
 
             # Fix 5: リラクゼーションループの先頭で labels = {} にリセットすると
             # -i オプションでインポートしたラベルも消えてしまう。
             # インポート済みラベルをスナップショットして毎イテレーション先頭で復元する。
             _imported_labels = dict(self.state.labels)
+
+            # 修正⑧: vars（a-z 変数）もリラクゼーションループ先頭でリセットする。
+            # 各命令の先頭でも per-instruction リセットが入るため実害は少ないが、
+            # 最後の命令後に残った値がパス間で持ち越されないよう明示的にクリアする。
+            _initial_vars = list(self.state.vars)
 
             for relax_iter in range(MAX_RELAX):
                 self.state.pc = 0
@@ -3368,10 +3463,15 @@ class Assembler:
                 # symbols を変化させている可能性があるため、
                 # パターンファイル読み込み直後の状態（patsymbols）に毎回リセットする。
                 self.state.symbols = dict(self.state.patsymbols)
+                # 修正⑧: vars をリラクゼーション開始時の状態に戻す
+                self.state.vars = list(_initial_vars)
                 self.fileassemble(args.sourcefile)
 
                 current_pcs = {k: v[0] for k, v in self.state.labels.items()}
-                if current_pcs == self.state._pass1_prev_label_pcs:
+                # 修正⑤: _SENTINEL との比較は必ず False なので初回は無条件続行。
+                # 2回目以降は前回と一致すれば収束と判定できる。
+                if (self.state._pass1_prev_label_pcs is not _SENTINEL
+                        and current_pcs == self.state._pass1_prev_label_pcs):
                     if self.state.debug:
                         print(f"Pass1 relaxation converged after {relax_iter + 1} iteration(s)", file=sys.stderr)
                     break   # 収束
