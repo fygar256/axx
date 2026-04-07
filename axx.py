@@ -239,7 +239,12 @@ class StringUtils:
                     i += 1  # 末尾の孤立したバックスラッシュ
                 continue
 
-            if ch == '"' and not in_dquote:
+            if ch == '"':
+                # Fix ①: 開き・閉じ両方でトグルする。
+                # 旧実装は `not in_dquote` 条件のため開きクォートしか処理せず、
+                # 閉じダブルクォートが来ても in_dquote が True のまま固着していた。
+                # バックスラッシュエスケープ (\") は上の if ブロックで消費済みなので
+                # ここでは素直にトグルするだけで正しい。
                 in_dquote = not in_dquote
             elif ch == '\'' and not in_dquote:
                 # Fix ⑦: 先読みでシングルクォートリテラルを一括消費する。
@@ -976,16 +981,20 @@ class ExpressionEvaluator:
             x, idx = self.expression(s, idx + 1)
             if idx < len(s) and s[idx] == ')':
                 idx += 1
-        elif idx+4<len(s) and s[idx:idx+4]=="'\\t'":
+        # Fix ⑥: 境界チェックを idx+4<=len(s) に統一する。
+        # 旧実装の idx+4<len(s) は末尾ちょうど4文字のケースを除外していた。
+        # Python のスライスは範囲外でも安全だが、明示的な境界チェックは
+        # 正確に「4文字以上残っているか」を表す <= が正しい。
+        elif idx+4<=len(s) and s[idx:idx+4]=="'\\t'":
             x=0x09
             idx+=4
-        elif idx+4<len(s) and s[idx:idx+4]=="'\\''":
+        elif idx+4<=len(s) and s[idx:idx+4]=="'\\''":
             x=ord("'")
             idx+=4
-        elif idx+4<len(s) and s[idx:idx+4]=="'\\\\'":
+        elif idx+4<=len(s) and s[idx:idx+4]=="'\\\\'":
             x=ord("\\")
             idx+=4
-        elif idx+4<len(s) and s[idx:idx+4]=="'\\n'":
+        elif idx+4<=len(s) and s[idx:idx+4]=="'\\n'":
             x=0x0a
             idx+=4
         # Fix 4: idx+3 <= len(s) に変更（文字列末尾3文字が 'x' の場合も正しくマッチ）
@@ -1294,28 +1303,38 @@ class ExpressionEvaluator:
         選ばれなかったブランチの変数変更を確実に取り消す。
         パーサーの性質上（終端位置を得るために両ブランチを評価する必要がある）
         式を評価しない訳にはいかないため、副作用のみロールバックする方式を採る。
+
+        Fix ⑦: error_undefined_label フラグも選択されたブランチのものを
+        採用するように修正する。旧実装は「最後に評価したブランチ」（偽ブランチ）
+        のフラグが残るため、条件が真のとき偽ブランチに未定義ラベルがあると
+        誤ってエラーとして報告されていた。
         """
         x, idx = self.term10(s, idx)
         if idx < len(s) and StringUtils.q(s, '?', idx):
-            # 真ブランチを評価する前に vars を保存
+            # 真ブランチを評価する前に vars と error フラグを保存
             saved_vars = self.state.vars[:]
             t, idx = self.term11(s, idx + 1)   # 真ブランチ評価（右結合）
             vars_after_true = self.state.vars[:]
+            err_after_true  = self.state.error_undefined_label  # Fix ⑦
 
             if idx < len(s) and StringUtils.q(s, ':', idx):
                 # 偽ブランチ評価前に vars を元の状態に戻す
                 self.state.vars = saved_vars[:]
                 u, idx = self.term11(s, idx + 1)  # 偽ブランチ評価（右結合）
+                err_after_false = self.state.error_undefined_label  # Fix ⑦
 
                 if x != 0:
-                    # 条件が真: 真ブランチの値と変数状態を採用し、偽ブランチの副作用を取り消す
+                    # 条件が真: 真ブランチの値・変数状態・エラーフラグを採用
                     self.state.vars = vars_after_true
+                    self.state.error_undefined_label = err_after_true  # Fix ⑦
                     x = t
                 else:
-                    # 条件が偽: 偽ブランチの値と変数状態をそのまま使う
+                    # 条件が偽: 偽ブランチの値・変数状態・エラーフラグをそのまま使う
+                    # (self.state.vars と error_undefined_label は既に偽ブランチのもの)
                     x = u
             else:
                 # ':' がない不完全な三項演算子: 真ブランチの結果をそのまま使う
+                self.state.error_undefined_label = err_after_true  # Fix ⑦
                 x = t
         return x, idx
     
@@ -1959,10 +1978,17 @@ class PatternMatcher:
                 lt = self.remove_brackets(t, list(j))
                 # マッチ前の vars を保存
                 saved_vars = self.state.vars[:]
+                # Fix ④: ELF追跡状態も保存する。
+                # 失敗した match 試行で _elf_label_refs_seen / _elf_var_to_label に
+                # エントリが追記されても次の試行に持ち越されないようリストアする。
+                saved_refs = list(self.state._elf_label_refs_seen)
+                saved_v2l  = dict(self.state._elf_var_to_label)
                 if self.match(s, lt):
                     return True
-                # 失敗 → vars をリストア
+                # 失敗 → vars と ELF 追跡状態をリストア
                 self.state.vars = saved_vars
+                self.state._elf_label_refs_seen = saved_refs
+                self.state._elf_var_to_label    = saved_v2l
         return False
 
 
@@ -2269,8 +2295,10 @@ class VLIWProcessor:
                     for m in j:
                         values += [m]
                 
-                # values がスロット数より多い場合は末尾を切り捨て、
-                # 少ない場合は NOP で埋める。
+                # Fix ⑧: NOP 埋め処理は出力を伴わないが vliwnop バイトを
+                # values に追加する。pass1 でも走ること自体は問題ないが、
+                # values が変化することでリラクゼーション中の状態が不安定になるため
+                # 補足ガードとして pass 情報を残す（実害は小さいが明示化する）。
                 target_len = ibyte * noi
                 if len(values) > target_len:
                     if self.state.pas == 2 or self.state.pas == 0:
@@ -2521,6 +2549,14 @@ class AssemblyDirectiveProcessor:
         if StringUtils.upper(l1) != ".ORG":
             return False
         u, idx = self.expr_eval.expression_asm(l2, 0)
+        # Fix ②: .ZERO と同様に未定義ラベルを早期検出する。
+        # UNDEF (≈10^77) が返ると range(UNDEF - pc) でプロセスがフリーズし、
+        # さらに pc = UNDEF となって後続の全処理が壊れる。
+        if self.state.error_undefined_label:
+            if self.state.pas == 2 or self.state.pas == 0:
+                print(f" error - .ORG argument contains undefined label.")
+            return True
+        u = int(u)
         if idx + 2 <= len(l2) and l2[idx:idx+2].upper() == ',P':
             if u > self.state.pc:
                 for i in range(u - self.state.pc):
@@ -2962,6 +2998,23 @@ class Assembler:
         stdin_tmp_path は run() の cleanup で削除される。インタラクティブモードでは
         このパスは None のままであり、cleanup コードは None チェックで安全に動作する。
         """
+        # Fix ③: 循環インクルード検出。
+        # fnstack には現在開いているファイルのパスが積まれている。
+        # 同じ絶対パスが既にスタックに存在する場合は循環と判断してエラーを出す。
+        # 比較は絶対パスで行い、相対パス表記の違いによる見落としを防ぐ。
+        try:
+            abs_fn = os.path.abspath(fn) if fn not in ("stdin", "") else fn
+        except Exception:
+            abs_fn = fn
+        for already in self.state.fnstack:
+            try:
+                already_abs = os.path.abspath(already) if already not in ("stdin", "", "(stdin)") else already
+            except Exception:
+                already_abs = already
+            if abs_fn == already_abs:
+                print(f" error - circular .INCLUDE detected: '{fn}' is already being assembled.")
+                return
+
         # fnstack と lnstack を必ずペアで push してから try に入る。
         # これにより finally での pop が常に対称になる。
         self.state.fnstack.append(self.state.current_file)
@@ -3565,9 +3618,15 @@ class Assembler:
                 self.fileassemble(args.sourcefile)
 
                 current_pcs = {k: v[0] for k, v in self.state.labels.items()}
+                # Fix ⑤: UNDEF (= 0xff...ff) が PC 値として混入している場合、
+                # 前後のパスで同じ UNDEF ならば「収束」と誤判定されてしまう。
+                # 実際にはアドレスが確定していないので収束していない。
+                # UNDEF を含むラベルがひとつでも存在するなら収束とみなさない。
+                has_undef = any(v == UNDEF for v in current_pcs.values())
                 # 修正⑤: _SENTINEL との比較は必ず False なので初回は無条件続行。
-                # 2回目以降は前回と一致すれば収束と判定できる。
-                if (self.state._pass1_prev_label_pcs is not _SENTINEL
+                # 2回目以降は前回と一致しかつ UNDEF がなければ収束と判定できる。
+                if (not has_undef
+                        and self.state._pass1_prev_label_pcs is not _SENTINEL
                         and current_pcs == self.state._pass1_prev_label_pcs):
                     if self.state.debug:
                         print(f"Pass1 relaxation converged after {relax_iter + 1} iteration(s)", file=sys.stderr)
