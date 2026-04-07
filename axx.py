@@ -425,14 +425,8 @@ class Parser:
         it is NOT immediately followed by '=' (which would form ':=' – an
         assignment operator rather than a label terminator).
 
-        Fix ④: 旧実装はラベル名を大文字小文字そのままで返していた。
-        一方 get_symbol_word() は StringUtils.upper() で大文字化して返しており、
-        patsymbols との照合も StringUtils.upper() で行っているため、
-        ラベル名だけがケース非統一だった。
-        「foo:」と定義して「FOO」で参照すると別キーとして未定義エラーになる。
-
-        修正: get_symbol_word() と同様に StringUtils.upper() で正規化して返す。
-        これによりラベル名は常に大文字として扱われ、参照側のケースを問わない。
+        ラベル名は大文字・小文字を区別する（case-sensitive）。
+        「foo:」と定義した場合、「FOO」では参照できない。
         """
         t = ""
         if idx < len(s) and (s[idx] == '.' or (s[idx] not in DIGIT and s[idx] in self.state.lwordchars)):
@@ -446,7 +440,7 @@ class Parser:
             if idx < len(s) and s[idx] == ':' and (idx + 1 >= len(s) or s[idx + 1] != '='):
                 idx += 1
 
-        return StringUtils.upper(t), idx
+        return t, idx
     
     def get_params1(self, l, idx):
         """Get parameters separated by ::"""
@@ -791,7 +785,7 @@ class LabelManager:
                 print(f" error - label '{k}' not defined in pass 1.")
                 return False
 
-        if StringUtils.upper(k) in self.state.patsymbols:
+        if k in self.state.patsymbols:
             print(f" error - '{k}' is a pattern file symbol.")
             return False
         
