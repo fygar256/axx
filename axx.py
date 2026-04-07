@@ -215,14 +215,18 @@ class StringUtils:
         これにより "hello \\"world\\"; not a comment" のような入力で
         誤ってコメント開始位置がずれる問題を修正。
 
-        修正①: シングルクォートの文字リテラル 'x' / '\\n' も追跡するようにした。
-        アセンブリでは ';' のようにセミコロンを文字リテラルとして書く場合があり、
-        旧実装ではこれをコメント開始と誤認識してしまっていた。
-        シングルクォート内ではエスケープシーケンス（バックスラッシュ+1文字）も
-        考慮して終端クォートを正しく検出する。
+        Fix ⑦: 旧実装のシングルクォートトグル方式では、'a'b'c' のような
+        連続する文字リテラルが並ぶ入力で in_squote フラグが誤って残留し、
+        後続のセミコロンがコメント開始とみなされない問題があった。
+
+        修正後: トグル方式を廃止し、先読みペア確認方式を採用する。
+        シングルクォートを見つけたら:
+          - '\\x' 形式（エスケープ付き4文字）: 丸ごと消費してスキップ
+          - 'x'   形式（通常3文字）         : 丸ごと消費してスキップ
+          - 対応するクローズクォートが見つからない孤立クォート: そのまま通過
+        これにより 'a'b'c';comment のような入力でも正しくセミコロンを検出できる。
         """
-        in_dquote = False   # ダブルクォート文字列 "..." の中
-        in_squote = False   # シングルクォート文字リテラル '.' の中
+        in_dquote = False
         i = 0
         while i < len(l):
             ch = l[i]
@@ -235,19 +239,22 @@ class StringUtils:
                     i += 1  # 末尾の孤立したバックスラッシュ
                 continue
 
-            # シングルクォートリテラル内のエスケープ処理 (例: '\\', '\n', '\t', '\'')
-            if ch == '\\' and in_squote:
-                if i + 1 < len(l):
-                    i += 2
-                else:
-                    i += 1
-                continue
-
-            if ch == '"' and not in_squote:
+            if ch == '"' and not in_dquote:
                 in_dquote = not in_dquote
             elif ch == '\'' and not in_dquote:
-                in_squote = not in_squote
-            elif ch == ';' and not in_dquote and not in_squote:
+                # Fix ⑦: 先読みでシングルクォートリテラルを一括消費する。
+                j = i + 1
+                if j < len(l) and l[j] == '\\' and j + 2 < len(l) and l[j + 2] == '\'':
+                    # '\x' 形式 (quote + backslash + char + quote) = 4文字消費
+                    i = j + 3
+                    continue
+                elif j < len(l) and j + 1 < len(l) and l[j + 1] == '\'':
+                    # 'x' 形式 (quote + char + quote) = 3文字消費
+                    i = j + 2
+                    continue
+                # 対応するクローズクォートが見当たらない孤立クォート:
+                # コメント除去処理を継続させるためサイレントに通過する
+            elif ch == ';' and not in_dquote:
                 return l[:i].rstrip()
 
             i += 1
@@ -412,6 +419,15 @@ class Parser:
         A trailing ':' is consumed as part of the label definition only when
         it is NOT immediately followed by '=' (which would form ':=' – an
         assignment operator rather than a label terminator).
+
+        Fix ④: 旧実装はラベル名を大文字小文字そのままで返していた。
+        一方 get_symbol_word() は StringUtils.upper() で大文字化して返しており、
+        patsymbols との照合も StringUtils.upper() で行っているため、
+        ラベル名だけがケース非統一だった。
+        「foo:」と定義して「FOO」で参照すると別キーとして未定義エラーになる。
+
+        修正: get_symbol_word() と同様に StringUtils.upper() で正規化して返す。
+        これによりラベル名は常に大文字として扱われ、参照側のケースを問わない。
         """
         t = ""
         if idx < len(s) and (s[idx] == '.' or (s[idx] not in DIGIT and s[idx] in self.state.lwordchars)):
@@ -425,7 +441,7 @@ class Parser:
             if idx < len(s) and s[idx] == ':' and (idx + 1 >= len(s) or s[idx + 1] != '='):
                 idx += 1
 
-        return t, idx
+        return StringUtils.upper(t), idx
     
     def get_params1(self, l, idx):
         """Get parameters separated by ::"""
@@ -1069,16 +1085,21 @@ class ExpressionEvaluator:
             else:
                 x = self.var_manager.get(ch)
                 idx += 1
-                # ELF追跡: makeobj() 内で変数を読んだとき、その変数が
-                # match() でラベルを直接キャプチャしたものであれば
-                # リロケーション候補として記録する。
+                # Fix ⑥: ELF追跡: makeobj() 内で変数を読んだとき、その変数が
+                # match() でラベルを直接キャプチャしたものであればリロケーション候補
+                # として記録する。
+                # 旧実装は expmode==EXP_PAT かつ _elf_current_word_idx>=0 の条件で
+                # _elf_var_to_label を参照していたが、_elf_tracking フラグの確認が
+                # 先行するため tracking が False の場合は辞書参照自体をスキップできる。
+                # またキー存在確認の前に _elf_tracking を先にチェックすることで
+                # 不要な辞書ルックアップを削減する。
                 if (self.state._elf_tracking
-                        and self.state._elf_current_word_idx >= 0
-                        and ch in self.state._elf_var_to_label
-                        and self.state._elf_var_to_label[ch] is not None):
-                    lname, lval = self.state._elf_var_to_label[ch]
-                    self.state._elf_label_refs_seen.append(
-                        (lname, lval, self.state._elf_current_word_idx))
+                        and self.state._elf_current_word_idx >= 0):
+                    entry = self.state._elf_var_to_label.get(ch)
+                    if entry is not None:
+                        lname, lval = entry
+                        self.state._elf_label_refs_seen.append(
+                            (lname, lval, self.state._elf_current_word_idx))
         elif idx < len(s) and s[idx] in self.state.lwordchars:
             w, idx_new = self.parser.get_label_word(s, idx)
             if idx != idx_new:
@@ -1262,13 +1283,40 @@ class ExpressionEvaluator:
         return x, idx
     
     def term11(self, s, idx):
-        """Handle ternary operator (right-associative: a?b:c?d:e => a?b:(c?d:e))"""
+        """Handle ternary operator (right-associative: a?b:c?d:e => a?b:(c?d:e))
+
+        Fix ①: 旧実装は真ブランチ・偽ブランチを必ず両方評価してから
+        条件に応じてどちらの値を返すかを選んでいた。
+        変数代入（a:=expr）などの副作用を含むブランチでは、
+        選ばれなかった側の副作用まで実行されてしまう問題があった。
+
+        修正後: 評価前後で vars をスナップショット/リストアすることで、
+        選ばれなかったブランチの変数変更を確実に取り消す。
+        パーサーの性質上（終端位置を得るために両ブランチを評価する必要がある）
+        式を評価しない訳にはいかないため、副作用のみロールバックする方式を採る。
+        """
         x, idx = self.term10(s, idx)
         if idx < len(s) and StringUtils.q(s, '?', idx):
-            t, idx = self.term11(s, idx + 1)   # 右辺を再帰でterm11に委譲 → 右結合
+            # 真ブランチを評価する前に vars を保存
+            saved_vars = self.state.vars[:]
+            t, idx = self.term11(s, idx + 1)   # 真ブランチ評価（右結合）
+            vars_after_true = self.state.vars[:]
+
             if idx < len(s) and StringUtils.q(s, ':', idx):
-                u, idx = self.term11(s, idx + 1)
-                x = t if x != 0 else u
+                # 偽ブランチ評価前に vars を元の状態に戻す
+                self.state.vars = saved_vars[:]
+                u, idx = self.term11(s, idx + 1)  # 偽ブランチ評価（右結合）
+
+                if x != 0:
+                    # 条件が真: 真ブランチの値と変数状態を採用し、偽ブランチの副作用を取り消す
+                    self.state.vars = vars_after_true
+                    x = t
+                else:
+                    # 条件が偽: 偽ブランチの値と変数状態をそのまま使う
+                    x = u
+            else:
+                # ':' がない不完全な三項演算子: 真ブランチの結果をそのまま使う
+                x = t
         return x, idx
     
     def expression(self, s, idx):
@@ -2129,6 +2177,12 @@ class ObjectGenerator:
                     p = self.state.pc + len(objl)
                     n = self.binary_writer.align_(p)
                     for i in range(p, n):
+                        # Fix ⑤: パディングワードを追加する前に _elf_current_word_idx を
+                        # 更新する。旧実装では更新なしで objl に追加していたため、
+                        # パディング挿入後の式評価で get_value() が記録する word_idx が
+                        # 実際の位置からズレて ELF リロケーションのオフセットが誤った
+                        # 値になっていた。
+                        self.state._elf_current_word_idx = len(objl)
                         objl += [self.state.padding]
                     continue
 
@@ -2191,6 +2245,13 @@ class VLIWProcessor:
             self.state.vliwset = [[[0], "0"]]
         
         vbits = abs(self.state.vliwbits)
+
+        # Fix ③: vliwinstbits が 0 の場合、noi の計算でゼロ除算が発生する。
+        # .vliw ディレクティブで不正な値が渡された場合を想定してガードする。
+        if self.state.vliwinstbits == 0:
+            if self.state.pas == 0 or self.state.pas == 2:
+                print(" error - vliwinstbits is zero; cannot compute instruction slots.")
+            return False
         for k in self.state.vliwset:
             if sorted(k[0]) == sorted(idxlst) or self.state.vliwtemplatebits == 0:
                 im = 2 ** self.state.vliwinstbits - 1
@@ -2369,10 +2430,30 @@ class AssemblyDirectiveProcessor:
         return True
     
     def zero_processing(self, l1, l2):
-        """Zero directive"""
+        """Zero directive
+
+        Fix ②: pass1 でディレクティブの引数に未定義ラベルが含まれると
+        expression_asm() が UNDEF (約10^77) を返す。
+        このまま range(UNDEF) を実行するとプロセスが事実上フリーズする。
+        zero_processing はパターンスキャンの try/except ブロック外で
+        直接呼ばれるため、_pass1_size_mode フォールバックも効かない。
+
+        修正: error_undefined_label フラグを確認して UNDEF を早期検出する。
+        また負値もガードしてエラーを出す。
+        """
         if StringUtils.upper(l1) != ".ZERO":
             return False
         x, idx = self.expr_eval.expression_asm(l2, 0)
+        # 未定義ラベルが含まれる場合は UNDEF が返る → range(UNDEF) でフリーズする
+        if self.state.error_undefined_label:
+            # pass2 なら未定義ラベルエラーとして報告（pass1 はスキップ）
+            if self.state.pas == 2 or self.state.pas == 0:
+                print(f" error - .ZERO argument contains undefined label.")
+            return True
+        x = int(x)
+        if x < 0:
+            print(f" error - .ZERO requires a non-negative count, got {x}.")
+            return True
         for i in range(x):
             self.binary_writer.outbin2(self.state.pc, 0x00)
             self.state.pc += 1
@@ -2864,7 +2945,23 @@ class Assembler:
         self.state.symbols = dict(fresh)
     
     def fileassemble(self, fn):
-        """Assemble file"""
+        """Assemble file.
+
+        Fix ⑧: 旧実装では `fn == "stdin"` という判定の意味と到達経路が
+        コード上不明瞭だった。明示的に文書化する。
+
+        到達経路:
+          - run() のインタラクティブモード (sourcefile is None) では
+            fileassemble() を呼ばない。stdin 入力は lineassemble0() で直接処理。
+          - run() のファイルモードでは args.sourcefile を渡す。
+          - ソース内の .INCLUDE "stdin" ディレクティブが include_asm() 経由で
+            "stdin" という文字列リテラルを渡してくる場合に `fn == "stdin"` が True になる。
+          - その際は stdin 全体を一時ファイルに書き出してから読み直す。
+            リラクゼーション2回目以降は同じ一時ファイルを再利用する。
+
+        stdin_tmp_path は run() の cleanup で削除される。インタラクティブモードでは
+        このパスは None のままであり、cleanup コードは None チェックで安全に動作する。
+        """
         # fnstack と lnstack を必ずペアで push してから try に入る。
         # これにより finally での pop が常に対称になる。
         self.state.fnstack.append(self.state.current_file)
