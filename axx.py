@@ -359,16 +359,26 @@ class Parser:
             while idx < len(s) and s[idx] in "0123456789.":
                 fs += s[idx]
                 idx += 1
-            # Accept exponent part: e/E followed by optional sign and digits
+            # Accept exponent part: e/E followed by optional sign and digits.
+            # 修正: 指数部の数字が続かない場合（'1e', '1e+' など）は
+            # 指数部をなかったことにして idx を巻き戻す。
+            # そのまま float('1e') を呼ぶと ValueError になるため。
             if idx < len(s) and s[idx] in "eE":
+                saved_idx = idx
+                saved_fs  = fs
                 fs += s[idx]
                 idx += 1
                 if idx < len(s) and s[idx] in "+-":
                     fs += s[idx]
                     idx += 1
+                digits_start = idx
                 while idx < len(s) and s[idx] in "0123456789":
                     fs += s[idx]
                     idx += 1
+                if idx == digits_start:
+                    # 数字がひとつもなかった → 指数部を破棄して巻き戻す
+                    fs  = saved_fs
+                    idx = saved_idx
             return fs, idx
 
     def isfloatstr(self,s,idx):
@@ -665,6 +675,12 @@ class IEEE754Converter:
                 if i < len(s) and s[i] == '*':
                     t, i = parse_factor(s, i + 1)
                     v *= t
+                elif i + 1 < len(s) and s[i] == '/' and s[i+1] == '/':
+                    # '//' → floor division（'/' の前に判定する）
+                    t, i = parse_factor(s, i + 2)
+                    if t == 0:
+                        raise ZeroDivisionError("floor division by zero in qad{}")
+                    v = Decimal(int(v // t))
                 elif i < len(s) and s[i] == '/' and (i + 1 >= len(s) or s[i+1] != '/'):
                     t, i = parse_factor(s, i + 1)
                     if t == 0:
@@ -713,9 +729,18 @@ class VariableManager:
             # 変換されてから渡されるので int() で問題ない。
             # しかし exp_typ='f' モードで a:=3.14 のように生の float が渡された
             # 場合は int(3.14)==3 となり精度が失われる。
-            # 修正: 小数部を持つ float はそのまま保持し、整数値または
-            # 整数値の float（3.0 など）のみ int に変換する。
-            if isinstance(v, float) and not v.is_integer():
+            # 修正: Decimal 型も適切に処理する。小数部を持つ値はそのまま保持し、
+            # 整数値のみ int に変換する。
+            if isinstance(v, Decimal):
+                # Decimal → 整数部分のみなら int、そうでなければ float に変換
+                try:
+                    if v == v.to_integral_value() and v.is_finite():
+                        self.state.vars[c - ord('A')] = int(v)
+                    else:
+                        self.state.vars[c - ord('A')] = float(v)
+                except Exception:
+                    self.state.vars[c - ord('A')] = int(v)
+            elif isinstance(v, float) and not v.is_integer():
                 self.state.vars[c - ord('A')] = v
             else:
                 self.state.vars[c - ord('A')] = int(v)
@@ -798,7 +823,10 @@ class LabelManager:
         for key, value in self.state.labels.items():
             num = value[0]
             section = value[1]
-            result[key] = [hex(num), section]
+            # 修正: UNDEF (256ビット整数) をそのまま hex() すると64桁の文字列になり
+            # 視認性がゼロになる。UNDEF は専用の文字列で表示する。
+            num_str = "UNDEF" if num == UNDEF else hex(num)
+            result[key] = [num_str, section]
         print(result)
         
 class SymbolManager:
@@ -826,7 +854,9 @@ class ExpressionEvaluator:
     def nbit(self, l):
         """Count number of bits needed to represent value"""
         b = 0
-        r = abs(l)  # negative values would loop forever with arithmetic right shift
+        # 修正: float が渡された場合 r >>= 1 で TypeError になるため
+        # 事前に int に変換する。abs() の後で int 化することで負値も安全に処理できる。
+        r = int(abs(l))
         while r:
             r >>= 1
             b += 1
@@ -874,7 +904,12 @@ class ExpressionEvaluator:
                     print(" error - missing ',' in *(expr, expr) expression.")
                     x=0
             else:
-                x=0
+                # '*' の後に '(' が続かない場合は *(expr,expr) 構文のミスタイプ。
+                # 旧実装は idx を進めずに x=0 を返していたため、呼び出し元の term0()
+                # が再び '*' を二項演算子として解釈し、0 * (次の式) = 0 となっていた。
+                # '*' を消費せずに抜ければ factor1() へ委譲し、自然にエラーになる。
+                # （factor 冒頭で x=0 が初期値なので何もしなくてよい）
+                pass  # idx は進めない: '*' は term0 側の乗算演算子として処理させる
         else:
             x, idx = self.factor1(s, idx)
         
@@ -1327,9 +1362,18 @@ class ExpressionEvaluator:
                     # (self.state.vars と error_undefined_label は既に偽ブランチのもの)
                     x = u
             else:
-                # ':' がない不完全な三項演算子: 真ブランチの結果をそのまま使う
-                self.state.error_undefined_label = err_after_true  # Fix ⑦
-                x = t
+                # ':' がない不完全な三項演算子: a?b の形式。
+                # 条件が真なら真ブランチを、偽なら 0 を返す。
+                # 旧実装は条件の真偽に関わらず常に t を返していたため、
+                # 条件が偽（x==0）でも真ブランチの値が使われる誤りがあった。
+                if x != 0:
+                    self.state.error_undefined_label = err_after_true  # Fix ⑦
+                    x = t
+                else:
+                    # 条件が偽: 真ブランチの副作用（変数変更）を取り消し、0 を返す
+                    self.state.vars = saved_vars
+                    self.state.error_undefined_label = False
+                    x = 0
         return x, idx
     
     def expression(self, s, idx):
