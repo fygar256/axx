@@ -275,9 +275,20 @@ static uint64_t u256_to_u64(uint256_t a) { return a.w[0]; }
  * left it unchanged and the while-loop ran forever.
  * Fix: use a pure unsigned bit-scan over all 256 bits instead. */
 static int u256_nbit(uint256_t v) {
-    /* Treat v as unsigned magnitude: find 1 + floor(log2(|v|)).
-     * For signed semantics the assembler's @-operator counts bits of abs(v),
-     * so for the minimum value 0x8000...0 we return 256 (the true bit width). */
+    /* Mirrors axx.py nbit(): count bits of abs(v).
+     * abs() is the two's-complement absolute value: negate if the sign bit is set.
+     * Special case: the minimum value (0x8000...0) negates to itself under two's-
+     * complement, so we detect it separately and return 256. */
+    int sign = (int)(v.w[3] >> 63);
+    if(sign){
+        /* Negative: compute abs = -v = ~v + 1 */
+        uint256_t av = u256_neg(v);
+        /* If negation overflowed back to the same value, it was INT256_MIN → 256 bits */
+        if((int)(av.w[3] >> 63)){
+            return 256;
+        }
+        v = av;
+    }
     int b = 0;
     for (int wi = 3; wi >= 0; wi--) {
         if (v.w[wi]) {
@@ -892,21 +903,36 @@ static void axx_remove_comment(char *l) {
 
 static void axx_remove_comment_asm(char *l) {
     /* Fix C-N1: handle backslash-escaped quotes inside string literals.
-     * The original for-loop toggled in_str on every '"', so a \\" inside a
-     * string flipped the flag and caused the ';' that followed to be treated
-     * as a comment start.
-     * Fix: when inside a string, skip the character after any backslash so
-     * that \\" is consumed as an escape sequence rather than a string terminator. */
+     * Fix ⑦: also handle single-quote character literals ('x' and '\x')
+     * so that semicolons inside them are not treated as comment starts.
+     * Strategy: when we encounter a single quote outside a double-quoted
+     * string, perform look-ahead to consume the entire literal:
+     *   '\x' form (4 chars): quote + backslash + char + quote
+     *   'x'  form (3 chars): quote + char + quote
+     * An isolated quote (no matching close) is passed through silently. */
     int in_str=0;
     int i=0;
     while(l[i]){
         if(in_str && l[i]=='\\'){
-            /* escape sequence inside string: skip the next character */
+            /* escape sequence inside double-quoted string: skip next char */
             i++;
             if(l[i]) i++;
             continue;
         }
         if(l[i]=='"'){ in_str=!in_str; i++; continue; }
+        if(l[i]=='\'' && !in_str){
+            /* Fix ⑦: single-quote look-ahead */
+            int j=i+1;
+            if(l[j]=='\\' && l[j+1] && l[j+2]=='\''){
+                /* '\x' form: consume 4 chars */
+                i=j+3; continue;
+            } else if(l[j] && l[j+1]=='\''){
+                /* 'x' form: consume 3 chars */
+                i=j+2; continue;
+            }
+            /* isolated quote: pass through and continue */
+            i++; continue;
+        }
         if(l[i]==';'&&!in_str){
             int j=i-1;
             while(j>=0&&(l[j]==' '||l[j]=='\t')) j--;
@@ -972,11 +998,14 @@ static int axx_get_intstr(const char *s, int idx, char *fs, size_t fsz){
 }
 
 static int axx_get_floatstr(const char *s, int idx, char *fs, size_t fsz){
-    if(strncmp(s+idx,"inf",3)==0){strcpy(fs,"inf");return idx+3;}
+    /* Fix 11: leading '-' is handled by expr_factor() as unary minus;
+     * consuming it here would double-interpret it.  Only '-inf' is kept
+     * as a single special token (axx.py treats '-inf' as one literal). */
     if(strncmp(s+idx,"-inf",4)==0){strcpy(fs,"-inf");return idx+4;}
+    if(strncmp(s+idx,"inf",3)==0){strcpy(fs,"inf");return idx+3;}
     if(strncmp(s+idx,"nan",3)==0){strcpy(fs,"nan");return idx+3;}
     size_t n=0;
-    if(s[idx]=='-'){fs[n++]='-';idx++;}
+    /* NOTE: do NOT consume a leading '-' here (Fix 11). */
     while(s[idx]&&(is_digit(s[idx])||s[idx]=='.')&&n<fsz-1) fs[n++]=s[idx++];
     if((s[idx]=='e'||s[idx]=='E') && n<fsz-1){
         fs[n++]=s[idx++];
@@ -992,14 +1021,19 @@ static int axx_get_curlb(const char *s, int idx, int *f_out, char *t_out, size_t
     *f_out=0; t_out[0]=0;
     if(s[idx]!='{') return idx;
     idx++;
-    *f_out=1;
     idx=axx_skipspc(s,idx);
+    int start_idx=idx;
     size_t n=0;
     while(s[idx]&&s[idx]!='}'&&n<tsz-1) t_out[n++]=s[idx++];
     while(n>0&&t_out[n-1]==' ') n--;
     t_out[n]=0;
-    idx=axx_skipspc(s,idx);
-    if(s[idx]=='}') idx++;
+    if(!s[idx]){
+        /* 修正③: closing '}' not found – report error and return f=0 */
+        printf(" error - missing closing '}' in expression: '{%s'\n", t_out);
+        return start_idx;
+    }
+    idx++; /* consume '}' */
+    *f_out=1;
     return idx;
 }
 
@@ -1370,11 +1404,12 @@ static inline double u256_to_double(uint256_t v){
 static inline uint256_t double_to_u256(double d){
     uint256_t r = u256_zero(); memcpy(&r.w[0], &d, 8); return r;
 }
-/* Returns 1 when s[idx] starts a float literal (digit, '.', 'i'nf, 'n'an).
- * Leading '-' is NOT checked here because unary minus is handled by
- * expr_factor() before expr_factor1() is ever called. */
+/* Returns 1 when s[idx] starts a float literal (digit, '.', 'i'nf, 'n'an, '-inf').
+ * Leading '-' for regular numbers is NOT checked here because unary minus is
+ * handled by expr_factor().  Only '-inf' is kept as a single special token. */
 static int axx_isfloatstr(const char *s, int idx){
     if(!s[idx]) return 0;
+    if(strncmp(s+idx,"-inf",4)==0) return 1;
     if(strncmp(s+idx,"inf",3)==0) return 1;
     if(strncmp(s+idx,"nan",3)==0) return 1;
     if(is_digit(s[idx])) return 1;
@@ -1723,12 +1758,16 @@ static uint256_t expr_expression_esc(Assembler *asmb, const char *s, int idx, ch
 
     for(size_t i = (size_t)idx; i < l; i++){
         char c = s[i];
-        /* Fix C-N5: include OB_CHAR(0x90)/CB_CHAR(0x91) – the special bracket
-         * characters produced by [[/]] in pattern files – in the bracket stack.
-         * The original tracked only '('/')' and '['/']', so expressions inside
-         * OB…CB groups were not shielded from stopchar substitution, causing the
-         * expression termination point to be detected too early. */
-        if(c == '(' || c == '[' || c == OB_CHAR){
+        /* 【バグ修正①】Check depth-0 stopchar BEFORE opening-bracket test.
+         * If stopchar is '(' or '[' or OB_CHAR, the old code pushed it onto
+         * the stack instead of terminating the expression.  By checking
+         * (stkp==0 && c==stopchar) first, any stopchar works correctly.
+         *
+         * Fix C-N5: include OB_CHAR(0x90)/CB_CHAR(0x91) in the bracket stack. */
+        if(stkp == 0 && c == stopchar){
+            /* Depth-0 stopchar → terminate expression */
+            buf[i] = '\0';
+        } else if(c == '(' || c == '[' || c == OB_CHAR){
             /* Opening bracket: push and copy */
             if(stkp < (int)(sizeof(stk)-1)) stk[stkp++] = c;
             buf[i] = c;
@@ -1808,8 +1847,16 @@ static uint256_t expr_factor(Assembler *asmb, const char *s, int idx, int *idx_o
                     idx++;
                     int shift=(int)(u256_to_i64(x2)*8);
                     x=u256_sar(x,shift);
-                } else x=u256_zero();
-            } else x=u256_zero();
+                } else {
+                    /* 修正⑩: missing ')' – report error and return 0 */
+                    printf(" error - missing ')' in *(expr, expr) expression.\n");
+                    x=u256_zero();
+                }
+            } else {
+                /* 修正⑩: missing ',' – report error and return 0 */
+                printf(" error - missing ',' in *(expr, expr) expression.\n");
+                x=u256_zero();
+            }
         } else x=u256_zero();
     } else {
         x=expr_factor1(asmb,s,idx,&idx);
@@ -2213,7 +2260,13 @@ static uint256_t expr_term5(Assembler *asmb, const char *s, int idx, int *idx_ou
  * making the mask all-1s and bypassing the sign extension
  * entirely.  Guard with tv < 256; for tv >= 256 the value
  * already fits and no extension is needed.
+ *
+ * 修正⑨: mirror axx.py term6(): for tv > 128 (_SEXT_MAX_BITS)
+ * emit a warning and return 0 (not a silent no-op).  Bit widths
+ * larger than 128 are unrealistic in an assembler context and
+ * usually indicate a malformed operand.
  * ------------------------------------------------------- */
+#define SEXT_MAX_BITS 128
 static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term5(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
@@ -2224,11 +2277,13 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
         int64_t tv=u256_to_i64(t);
         if(tv<=0){
             x=u256_zero();
-        } else if(tv >= 256){
-            /* Value already occupies <=256 bits; nothing to extend */
-            /* (no-op) */
+        } else if(tv > SEXT_MAX_BITS){
+            /* 修正⑨: 非現実的なビット幅は警告を出して 0 を返す (axx.py term6) */
+            printf(" warning - sign-extension bit width %lld exceeds maximum %d, result set to 0.\n",
+                   (long long)tv, SEXT_MAX_BITS);
+            x=u256_zero();
         } else {
-            /* mask = ~(~0 << tv)  -- safe because 0 < tv < 256 */
+            /* mask = ~(~0 << tv)  -- safe because 0 < tv <= 128 < 256 */
             uint256_t mask = u256_not(u256_shl(u256_not(u256_zero()), (int)tv));
             x = u256_and(x, mask);
             /* sign_bit = (x >> (tv-1)) & 1 */
@@ -2243,6 +2298,7 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
     }
     *idx_out=idx; return x;
 }
+#undef SEXT_MAX_BITS
 
 static uint256_t expr_term7(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term6(asmb,s,idx,&idx);
@@ -2451,21 +2507,40 @@ static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_o
             if(axx_q(s, slen, ":", skip_end) && s[skip_end+1] != '='){
                 int false_start = axx_skipspc(s, skip_end + 1);
                 x = expr_term11(asmb, s, false_start, &idx);  /* right-recursive */
+                /* Fix ⑦: error_undefined_label stays as the false-branch's value
+                 * (already current after the recursive call – no action needed). */
             } else {
                 idx = skip_end;
                 x = u256_zero();
             }
         } else {
-            /* condition true: evaluate true-branch, then skip the full
-             * false-branch (including any nested ternary chain). */
+            /* condition true: snapshot vars, evaluate true-branch, save its state,
+             * restore vars, evaluate false-branch for extent only, then restore.
+             *
+             * Fix ⑦ (axx.py term11): adopt the error_undefined_label flag from
+             * the chosen (true) branch.  The old code let the false-branch's flag
+             * persist, so whenever the false-branch contained an undefined label
+             * the error was spuriously reported even when condition was true. */
+            uint256_t saved_vars[26];
+            memcpy(saved_vars, asmb->st.vars, sizeof(saved_vars));
+
             x = expr_term10(asmb, s, idx, &idx);
+            uint256_t vars_after_true[26];
+            memcpy(vars_after_true, asmb->st.vars, sizeof(vars_after_true));
+            int err_after_true = asmb->st.error_undefined_label;
+
             idx = axx_skipspc(s, idx);
             if(axx_q(s, slen, ":", idx) && s[idx+1] != '='){
                 idx++; /* consume ':' */
+                /* Restore vars to pre-true-branch state before evaluating false */
+                memcpy(asmb->st.vars, saved_vars, sizeof(saved_vars));
                 /* Fix G: use skip_ternary_expr so nested ternaries are fully
                  * consumed, not just the leading operand before the inner '?'. */
                 idx = skip_ternary_expr(s, axx_skipspc(s, idx));
             }
+            /* Restore true-branch vars and error flag (condition was true) */
+            memcpy(asmb->st.vars, vars_after_true, sizeof(vars_after_true));
+            asmb->st.error_undefined_label = err_after_true;
         }
     }
     *idx_out = idx;
@@ -2568,11 +2643,16 @@ static int dir_epic(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-static void dir_error(Assembler *asmb, const char *s){
+/* Fix 10 (axx.py): dir_error() now returns 1 when at least one condition
+ * fired (triggered), 0 otherwise.  The caller uses this to skip makeobj()
+ * when the .error directive raised an error, preventing bad object code from
+ * being emitted.  Mirrors axx.py DirectiveProcessor.error() returning
+ * (triggered: bool, code: int). */
+static int dir_error(Assembler *asmb, const char *s){
     AsmState *st=&asmb->st;
     int has_content=0;
     for(const char*p=s;*p;p++) if(*p!=' '){has_content=1;break;}
-    if(!has_content) return;
+    if(!has_content) return 0;
 
     char buf[4096];
     size_t l=strlen(s);
@@ -2580,6 +2660,7 @@ static void dir_error(Assembler *asmb, const char *s){
     memcpy(buf,s,l); buf[l]='\0';
 
     int idx=0;
+    int triggered=0;
     while(1){
         if(!buf[idx]) break;
         if(buf[idx]==','){idx++;continue;}
@@ -2601,8 +2682,10 @@ static void dir_error(Assembler *asmb, const char *s){
             printf("Line %d Error code %lld ",(int)st->ln,(long long)tc);
             if(tc>=0&&tc<ERRORS_COUNT) printf("%s",ERRORS_TABLE[tc]);
             printf(": \n");
+            triggered=1;
         }
     }
+    return triggered;
 }
 
 /* -------------------------------------------------------
@@ -2895,17 +2978,43 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
         for(int i=0;i<cnt;i++) if(mask & ((uint64_t)1<<i)) ri[nr++]=sl[i];
         char *lt=remove_brackets_str(t,ri,nr);
 
-        /* Fix C-1: snapshot vars before each trial so that failed match
-         * attempts cannot leave partial variable writes visible to the
-         * next attempt (or to the caller after a final failure). */
+        /* Fix C-1 / Fix ④ (axx.py): snapshot vars AND ELF tracking state before
+         * each trial.  Failed match attempts must not leave partial variable
+         * writes or spurious ELF ref entries visible to the next attempt. */
         uint256_t saved_vars[26];
         memcpy(saved_vars, asmb->st.vars, sizeof(saved_vars));
 
+        /* Snapshot ELF refs */
+        int saved_elf_refs_len = asmb->st.elf_refs_len;
+        /* Snapshot elf_var_to_label (set/label_name/label_val per slot) */
+        struct {int set; char *label_name; uint64_t label_val;} saved_vtl[26];
+        for(int vi=0;vi<26;vi++){
+            saved_vtl[vi].set       = asmb->st.elf_var_to_label[vi].set;
+            saved_vtl[vi].label_val = asmb->st.elf_var_to_label[vi].label_val;
+            saved_vtl[vi].label_name = asmb->st.elf_var_to_label[vi].label_name
+                                       ? strdup(asmb->st.elf_var_to_label[vi].label_name)
+                                       : NULL;
+        }
+
         if(pat_match(asmb,s,lt)){
             found=1;
+            /* Free the pre-match snapshot (keep current ELF state) */
+            for(int vi=0;vi<26;vi++) free(saved_vtl[vi].label_name);
         } else {
             /* restore vars on failure */
             memcpy(asmb->st.vars, saved_vars, sizeof(saved_vars));
+            /* restore ELF refs: free any names added during the failed attempt */
+            for(int ri2=saved_elf_refs_len; ri2<asmb->st.elf_refs_len; ri2++)
+                free(asmb->st.elf_refs[ri2].name);
+            asmb->st.elf_refs_len = saved_elf_refs_len;
+            /* restore elf_var_to_label */
+            for(int vi=0;vi<26;vi++){
+                free(asmb->st.elf_var_to_label[vi].label_name);
+                asmb->st.elf_var_to_label[vi].set       = saved_vtl[vi].set;
+                asmb->st.elf_var_to_label[vi].label_val = saved_vtl[vi].label_val;
+                asmb->st.elf_var_to_label[vi].label_name = saved_vtl[vi].label_name;
+                saved_vtl[vi].label_name = NULL; /* ownership transferred */
+            }
         }
         free(lt);
     }
@@ -2958,8 +3067,26 @@ static void include_pat(Assembler *asmb, const char *l, const char *base_dir){
     char upper8[16]={0};
     for(int i=0;i<8&&l[idx+i];i++) upper8[i]=axx_upper_char(l[idx+i]);
     if(strcmp(upper8,".INCLUDE")!=0) return;
-    char raw[512]; axx_get_string(l+idx+8,raw,sizeof(raw));
-    if(!raw[0]) return;
+    /* 修正⑦ (axx.py): use l+idx+8 (not l+8) to skip past any leading spaces */
+    const char *after_kw = l + idx + 8;
+    char raw[512]; axx_get_string(after_kw,raw,sizeof(raw));
+    if(!raw[0]){
+        /* Fix ⑥ (axx.py): don't silently return – try unquoted fallback or error. */
+        char trimmed[512];
+        int ti=axx_skipspc(after_kw,0);
+        int tn=0;
+        while(after_kw[ti]&&after_kw[ti]!=' '&&after_kw[ti]!='\t'&&tn<(int)sizeof(trimmed)-1)
+            trimmed[tn++]=after_kw[ti++];
+        trimmed[tn]=0;
+        if(trimmed[0]){
+            fprintf(stderr," warning - .INCLUDE filename not quoted: '%s'. "
+                           "Please use double quotes.\n", trimmed);
+            strncpy(raw, trimmed, sizeof(raw)-1); raw[sizeof(raw)-1]='\0';
+        } else {
+            fprintf(stderr," error - .INCLUDE directive has no filename: %s\n", l);
+            return;
+        }
+    }
     char resolved[1024];
     axx_resolve_path(base_dir, raw, resolved, sizeof(resolved));
     readpat(asmb, resolved);
@@ -3109,7 +3236,12 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
             idx++;
             uint64_t p=u256_to_u64(st->pc)+(uint64_t)objl->len;
             uint64_t aligned=align_addr(st,p);
-            for(uint64_t ii=p;ii<aligned;ii++) iv_push(objl,st->padding);
+            for(uint64_t ii=p;ii<aligned;ii++){
+                /* Fix ⑤ (axx.py): update elf_current_word_idx before each
+                 * padding push so subsequent label refs get the right word_idx. */
+                st->elf_current_word_idx = (int)objl->len;
+                iv_push(objl,st->padding);
+            }
             continue;
         }
         int semicolon=0;
@@ -3199,6 +3331,16 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
 
     int vbits=(st->vliwbits<0)?-st->vliwbits:st->vliwbits;
     int found=0;
+
+    /* Fix ③ (axx.py): vliwinstbits==0 causes division by zero in noi calculation.
+     * Guard and report an error, matching axx.py VLIWProcessor.vliwprocess(). */
+    if(st->vliwinstbits == 0){
+        if(st->pas==0||st->pas==2)
+            printf(" error - vliwinstbits is zero; cannot compute instruction slots.\n");
+        ivv_free(&objs); free(idxlst);
+        if(idx_out) *idx_out=idx;
+        return 0;
+    }
 
     for(int ki=0;ki<st->vliwset.len;ki++){
         VliwSetEntry *k=&st->vliwset.data[ki];
@@ -3396,7 +3538,18 @@ static int adir_zero(Assembler *asmb, const char *l, const char *l2){
     if(strcmp(up,".ZERO")!=0) return 0;
     int io;
     uint256_t x=expr_expression_asm(asmb,l2,0,&io);
+    /* Fix ②: guard against UNDEF (undefined label) to avoid range(UNDEF) freeze.
+     * Also guard against negative values. Mirrors axx.py zero_processing(). */
+    if(asmb->st.error_undefined_label){
+        if(asmb->st.pas==2||asmb->st.pas==0)
+            printf(" error - .ZERO argument contains undefined label.\n");
+        return 1;
+    }
     int64_t cnt=u256_to_i64(x);
+    if(cnt < 0){
+        printf(" error - .ZERO requires a non-negative count, got %lld.\n", (long long)cnt);
+        return 1;
+    }
     for(int64_t i=0;i<cnt;i++){
         outbin2(&asmb->st,asmb->st.pc,u256_from_u64(0));
         asmb->st.pc=u256_add(asmb->st.pc,u256_one());
@@ -3435,6 +3588,13 @@ static int adir_org(Assembler *asmb, const char *l, const char *l2){
     if(strcmp(up,".ORG")!=0) return 0;
     int io;
     uint256_t u=expr_expression_asm(asmb,l2,0,&io);
+    /* Fix ②: guard against UNDEF to prevent pc being set to 0xffff…ff.
+     * Mirrors axx.py org_processing() which checks error_undefined_label. */
+    if(asmb->st.error_undefined_label){
+        if(asmb->st.pas==2||asmb->st.pas==0)
+            printf(" error - .ORG argument contains undefined label.\n");
+        return 1;
+    }
     if(io+2<=(int)strlen(l2) && axx_upper_char(l2[io])==','&&axx_upper_char(l2[io+1])=='P'){
         if(u256_gt_signed(u,asmb->st.pc)){
             uint64_t from=u256_to_u64(asmb->st.pc);
@@ -3521,6 +3681,59 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(adir_org(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_labelc(st,l,l2)){ *idx_out=idx; return 1; }
     if(adir_export(asmb,l,l2)){ *idx_out=idx; return 1; }
+
+    /* Fix 9 (axx.py): source-level .setsym / .clearsym directives must be
+     * processed here (before the pattern loop) and must also update patsymbols
+     * so that their effect persists across the per-instruction symbols reset
+     * that lineassemble() performs at the top of the loop.
+     *
+     * axx.py lineassemble2():
+     *   _i_src = [l, '', l2, '', '', '']
+     *   if self.directive_proc.set_symbol(_i_src):
+     *       self.state.patsymbols = dict(self.state.symbols)
+     *       return [], [], True, idx
+     *   if self.directive_proc.clear_symbol(_i_src):
+     *       self.state.patsymbols = dict(self.state.symbols)
+     *       return [], [], True, idx
+     */
+    {
+        char lu[16]; axx_strupr_to(lu,l,sizeof(lu));
+        if(strcmp(lu,".SETSYM")==0){
+            /* l2 contains the symbol name (field[1]) and optionally a value (field[2]) */
+            /* Parse: l2 = "NAME [value]" */
+            char sym_name[512]; int sio=0;
+            sio=axx_get_param_to_spc(l2,0,sym_name,sizeof(sym_name));
+            char sym_name_upper[512]; axx_strupr_to(sym_name_upper,sym_name,sizeof(sym_name_upper));
+            uint256_t v=u256_zero();
+            if(l2[sio]){
+                int vio;
+                v=expr_expression_pat(asmb,l2+sio,0,&vio);
+            }
+            smap_set(&asmb->st.symbols,sym_name_upper,v);
+            /* Mirror patsymbols to persist across the per-line symbols reset */
+            smap_clear(&asmb->st.patsymbols);
+            for(int pi2=0; pi2<asmb->st.symbols.nb; pi2++)
+                for(SymEntry *se2=asmb->st.symbols.buckets[pi2]; se2; se2=se2->next)
+                    smap_set(&asmb->st.patsymbols, se2->key, se2->val);
+            *idx_out=idx; return 1;
+        }
+        if(strcmp(lu,".CLEARSYM")==0){
+            if(l2[0]){
+                char sym_name[512]; axx_get_param_to_spc(l2,0,sym_name,sizeof(sym_name));
+                char sym_name_upper[512]; axx_strupr_to(sym_name_upper,sym_name,sizeof(sym_name_upper));
+                smap_delete(&asmb->st.symbols,sym_name_upper);
+            } else {
+                smap_clear(&asmb->st.symbols);
+            }
+            /* Mirror patsymbols */
+            smap_clear(&asmb->st.patsymbols);
+            for(int pi2=0; pi2<asmb->st.symbols.nb; pi2++)
+                for(SymEntry *se2=asmb->st.symbols.buckets[pi2]; se2; se2=se2->next)
+                    smap_set(&asmb->st.patsymbols, se2->key, se2->val);
+            *idx_out=idx; return 1;
+        }
+    }
+
     if(!l[0]){ *idx_out=idx; return 0; }
 
     int se=0, oerr=0, pln=0;
@@ -3561,21 +3774,26 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         st->expmode=EXP_ASM;
 
         if(pat_match0(asmb,lin,i->f[0])){
-            dir_error(asmb,i->f[1]);
-            makeobj(asmb,i->f[2],objl_out);
-            /* Pass1: retry with size-mode on forward reference */
-            if(st->pas==1 && st->error_undefined_label){
-                st->pass1_size_mode=1;
+            /* Fix 10 (axx.py): only call makeobj when dir_error did NOT trigger.
+             * Previously makeobj always ran even if an .error condition fired. */
+            int err_triggered = dir_error(asmb,i->f[1]);
+            if(!err_triggered){
                 makeobj(asmb,i->f[2],objl_out);
-                st->pass1_size_mode=0;
-                st->error_undefined_label=0;
-            }
-            /* Pass2: if makeobj produced undefined label, that's a hard error
-             * (oerr). Mirrors Python's exception→oerr path for pas==2. */
-            if(st->pas==2 && st->error_undefined_label){
-                oerr=1;
-                oerr_entry=i;
-                loopflag=0; break;
+                /* Pass1: retry with size-mode on forward reference */
+                if(st->pas==1 && st->error_undefined_label){
+                    st->pass1_size_mode=1;
+                    makeobj(asmb,i->f[2],objl_out);
+                    st->pass1_size_mode=0;
+                    st->error_undefined_label=0;
+                }
+                /* Pass2: if makeobj produced undefined label, that's a hard error */
+                if(st->pas==2 && st->error_undefined_label){
+                    oerr=1;
+                    oerr_entry=i;
+                    loopflag=0; break;
+                }
+            } else {
+                iv_clear(objl_out);
             }
             int io;
             uint256_t idxv=expr_expression_pat(asmb,i->f[3],0,&io);
@@ -4206,6 +4424,32 @@ weo_done:
 
 static void fileassemble(Assembler *asmb, const char *fn){
     AsmState *st=&asmb->st;
+
+    /* Fix ③ (axx.py): circular .INCLUDE detection.
+     * Compare absolute paths to catch relative-path aliases.
+     * stdin / (stdin) are compared by name only (no realpath). */
+    {
+        int is_stdin_fn = (strcmp(fn,"stdin")==0 || strcmp(fn,"(stdin)")==0);
+        for(int si=0; si<st->fnstack.len; si++){
+            const char *already = st->fnstack.data[si];
+            if(!already || !already[0]) continue;
+            int is_stdin_already = (strcmp(already,"stdin")==0 || strcmp(already,"(stdin)")==0);
+            if(is_stdin_fn && is_stdin_already){
+                printf(" error - circular .INCLUDE detected: '%s' is already being assembled.\n", fn);
+                return;
+            }
+            if(!is_stdin_fn && !is_stdin_already){
+                /* Compare by resolved absolute path */
+                char abs_fn[4096]={0}, abs_al[4096]={0};
+                if(realpath(fn,   abs_fn) && realpath(already, abs_al)
+                   && strcmp(abs_fn, abs_al)==0){
+                    printf(" error - circular .INCLUDE detected: '%s' is already being assembled.\n", fn);
+                    return;
+                }
+            }
+        }
+    }
+
     /* Fix C-10: push is always unconditional; pop must therefore also be
      * unconditional.  Save fn locally so we can replace it with the temp
      * path for stdin without altering the caller's string. */
@@ -4272,16 +4516,51 @@ done:
  * setpatsymbols
  * ========================================================= */
 static void setpatsymbols(Assembler *asmb){
-    for(int pi=0;pi<asmb->st.pat.len;pi++){
+    /* Fix 8 (axx.py): process .setsym AND .clearsym in pattern-file order,
+     * starting from an empty table.  The old code only called dir_set_symbol()
+     * and ignored .clearsym, so a pattern sequence like:
+     *   .setsym A 1
+     *   .clearsym
+     * would still leave A defined.  Also, calling dir_set_symbol() mutated
+     * st->symbols directly and then copied to patsymbols; if .clearsym wiped
+     * st->symbols before the copy, patsymbols ended up empty regardless of what
+     * .setsym defined earlier.
+     *
+     * Fix: build a fresh map by processing entries in order, then assign to
+     * both patsymbols and symbols (mirroring axx.py setpatsymbols()).         */
+    SymMap fresh; smap_init(&fresh);
+
+    for(int pi=0; pi<asmb->st.pat.len; pi++){
         PatEntry *e=&asmb->st.pat.data[pi];
-        dir_set_symbol(asmb,e);
+        if(!e) continue;
+
+        if(strcmp(e->f[0],".setsym")==0){
+            char key[512]; axx_strupr_to(key,e->f[1],sizeof(key));
+            int io;
+            uint256_t v = e->f[2][0] ? expr_expression_pat(asmb,e->f[2],0,&io) : u256_zero();
+            smap_set(&fresh, key, v);
+            continue;
+        }
+        if(strcmp(e->f[0],".clearsym")==0){
+            if(e->f[2][0]){
+                char key[512]; axx_strupr_to(key,e->f[2],sizeof(key));
+                smap_delete(&fresh, key);
+            } else {
+                smap_clear(&fresh);
+            }
+            continue;
+        }
     }
-    smap_free(&asmb->st.patsymbols);
-    smap_init(&asmb->st.patsymbols);
-    for(int i=0;i<asmb->st.symbols.nb;i++){
-        for(SymEntry*e=asmb->st.symbols.buckets[i];e;e=e->next)
-            smap_set(&asmb->st.patsymbols,e->key,e->val);
-    }
+
+    /* Assign fresh to patsymbols and sync symbols */
+    smap_free(&asmb->st.patsymbols); smap_init(&asmb->st.patsymbols);
+    smap_clear(&asmb->st.symbols);
+    for(int i=0; i<fresh.nb; i++)
+        for(SymEntry *e=fresh.buckets[i]; e; e=e->next){
+            smap_set(&asmb->st.patsymbols, e->key, e->val);
+            smap_set(&asmb->st.symbols,    e->key, e->val);
+        }
+    smap_free(&fresh);
 }
 
 /* =========================================================
@@ -4467,15 +4746,40 @@ int main(int argc, char *argv[]){
          * run pass2 once against the stable label table.
          *
          * For fixed-size ISAs the loop converges in one iteration (no change).
+         *
+         * Fix 5  (axx.py): imported labels (-i option) must be restored at the
+         *   start of every iteration; a bare lmap_free+lmap_init discards them.
+         * Fix ⑧ (axx.py): vars (a-z) must be reset to their pre-loop state at
+         *   the start of every iteration.
+         * Fix ⑤ (axx.py): if any label value is UNDEF (0xff…ff) do not consider
+         *   the iteration converged; UNDEF == UNDEF is a false convergence.
+         * Fix ⑥-2 (axx.py): convergence snapshot includes section membership,
+         *   not just PC value.
          */
 #define MAX_RELAX 8
+        /* Fix 5: snapshot imported labels before the relaxation loop so they
+         * can be restored at the start of each iteration. */
+        LabelMap imported_labels;
+        lmap_init(&imported_labels);
+        for(int bi=0; bi<st->labels.nbuckets; bi++)
+            for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
+                lmap_set(&imported_labels, e->key, e->value, e->section, e->is_equ);
+
+        /* Fix ⑧: snapshot initial vars (a-z) */
+        uint256_t initial_vars[26];
+        memcpy(initial_vars, st->vars, sizeof(initial_vars));
+
         LabelMap prev_labels;
         lmap_init(&prev_labels);
         int converged = 0;
 
         for(int relax=0; relax<MAX_RELAX; relax++){
             st->pc=u256_zero(); st->pas=1; st->ln=1;
+            /* Fix 5: restore imported labels instead of starting from empty */
             lmap_free(&st->labels); lmap_init(&st->labels);
+            for(int bi=0; bi<imported_labels.nbuckets; bi++)
+                for(LabelEntry *e=imported_labels.buckets[bi]; e; e=e->next)
+                    lmap_set(&st->labels, e->key, e->value, e->section, e->is_equ);
             /* reset sections and export_labels too (mirrors axx.py run()) */
             secmap_clear(&st->sections);
             lmap_free(&st->export_labels); lmap_init(&st->export_labels);
@@ -4488,19 +4792,34 @@ int main(int argc, char *argv[]){
             for(int pi=0; pi<st->patsymbols.nb; pi++)
                 for(SymEntry *se2=st->patsymbols.buckets[pi]; se2; se2=se2->next)
                     smap_set(&st->symbols, se2->key, se2->val);
+            /* Fix ⑧: restore vars to pre-loop state */
+            memcpy(st->vars, initial_vars, sizeof(st->vars));
             fileassemble(asmb,sourcefile);
 
-            /* Check convergence: all labels same PC as previous iteration */
-            converged = 1;
-            for(int bi=0; bi<st->labels.nbuckets; bi++){
-                for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next){
-                    LabelEntry *p=lmap_find(&prev_labels, e->key);
-                    if(!p || !u256_eq(p->value, e->value)){ converged=0; break; }
+            /* Fix ⑤: if any label is UNDEF, do not treat this as converged.
+             * Fix ⑥-2: convergence check includes section membership as well
+             * as PC value (mirrors axx.py current_pcs = {k: (v[0], v[1]) ...}). */
+            int has_undef = 0;
+            for(int bi=0; bi<st->labels.nbuckets && !has_undef; bi++)
+                for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
+                    if(u256_is_undef(e->value)){ has_undef=1; break; }
+
+            converged = !has_undef ? 1 : 0;
+            if(converged){
+                for(int bi=0; bi<st->labels.nbuckets && converged; bi++){
+                    for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next){
+                        LabelEntry *p=lmap_find(&prev_labels, e->key);
+                        /* Fix ⑥-2: compare both value and section */
+                        if(!p || !u256_eq(p->value, e->value)
+                               || strcmp(p->section ? p->section : "",
+                                         e->section ? e->section : "") != 0){
+                            converged=0; break;
+                        }
+                    }
                 }
-                if(!converged) break;
+                /* Also check no label was removed */
+                if(converged && prev_labels.count != st->labels.count) converged=0;
             }
-            /* Also check no label was removed */
-            if(converged && prev_labels.count != st->labels.count) converged=0;
 
             /* Update prev_labels snapshot */
             lmap_free(&prev_labels); lmap_init(&prev_labels);
@@ -4516,6 +4835,7 @@ int main(int argc, char *argv[]){
             }
         }
         lmap_free(&prev_labels);
+        lmap_free(&imported_labels);
 
         if(!converged)
             fprintf(stderr,"warning: pass1 relaxation did not converge after %d iterations; "
