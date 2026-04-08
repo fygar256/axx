@@ -2734,6 +2734,13 @@ class Assembler:
                             objl = []  # それでも失敗した場合はサイズ0のまま
                         finally:
                             self.state._pass1_size_mode = False
+                            # Fix ⑧-2: _pass1_size_mode 中は get_value() が 0 を返しつつ
+                            # error_undefined_label=True もセットする。フォールバック完了後も
+                            # このフラグが残ったままだと、サイズ式 expression_pat(i[3]) で
+                            # ラベルを参照した場合などに汚染が持ち越される。
+                            # フォールバックは意図的な「未定義を 0 として扱う」処理なので
+                            # 完了後はフラグをクリアする。
+                            self.state.error_undefined_label = False
                         loopflag = False
                     else:
                         oerr = True
@@ -2844,6 +2851,25 @@ class Assembler:
                     if wi >= 0
                 ]
                 valid_refs.sort(key=lambda r: r[2])
+
+                # Fix ④-2: 同一 word_idx に複数の異なるラベルが記録されている場合は
+                # 複合式（label1 + label2 など）とみなし、その word_idx を
+                # リロケーション対象から除外する。
+                # どのシンボルに帰属させるかを一意に決定できないため、
+                # 誤ったリロケーションエントリや重複エントリを生成するより
+                # エントリを生成しない方が安全。
+                _widx_labels: dict = {}  # word_idx -> set of label names
+                for _ln, _aw, _wi in valid_refs:
+                    _widx_labels.setdefault(_wi, set()).add(_ln)
+                _ambiguous_widxs = {
+                    _wi for _wi, _names in _widx_labels.items() if len(_names) > 1
+                }
+                if _ambiguous_widxs:
+                    valid_refs = [
+                        (_ln, _aw, _wi)
+                        for (_ln, _aw, _wi) in valid_refs
+                        if _wi not in _ambiguous_widxs
+                    ]
 
                 # 同一ラベルの連続ワード参照をひとつのリロケーショングループにまとめる
                 # 例: bts=8 で 64bit アドレスを 8 バイトに分割 → 8 連続エントリ → 1 グループ
@@ -3611,12 +3637,17 @@ class Assembler:
                 self.state.vars = list(_initial_vars)
                 self.fileassemble(args.sourcefile)
 
-                current_pcs = {k: v[0] for k, v in self.state.labels.items()}
+                # Fix ⑥-2: 収束スナップショットに PC 値だけでなくセクション帰属も含める。
+                # 旧実装は {label: pc} のみを比較していたため、.section ディレクティブの
+                # 動的切り替えによってラベルのセクション帰属が変動し続けるケースで
+                # PC が安定した時点で収束と誤判定していた。
+                # (pc, section) のペアで比較することで両方が安定して初めて収束と判定する。
+                current_pcs = {k: (v[0], v[1]) for k, v in self.state.labels.items()}
                 # Fix ⑤: UNDEF (= 0xff...ff) が PC 値として混入している場合、
                 # 前後のパスで同じ UNDEF ならば「収束」と誤判定されてしまう。
                 # 実際にはアドレスが確定していないので収束していない。
                 # UNDEF を含むラベルがひとつでも存在するなら収束とみなさない。
-                has_undef = any(v == UNDEF for v in current_pcs.values())
+                has_undef = any(pc == UNDEF for (pc, _sec) in current_pcs.values())
                 # 修正⑤: _SENTINEL との比較は必ず False なので初回は無条件続行。
                 # 2回目以降は前回と一致しかつ UNDEF がなければ収束と判定できる。
                 if (not has_undef
