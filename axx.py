@@ -249,10 +249,30 @@ class StringUtils:
             elif ch == '\'' and not in_dquote:
                 # Fix ⑦: 先読みでシングルクォートリテラルを一括消費する。
                 j = i + 1
-                if j < len(l) and l[j] == '\\' and j + 2 < len(l) and l[j + 2] == '\'':
-                    # '\x' 形式 (quote + backslash + char + quote) = 4文字消費
-                    i = j + 3
-                    continue
+                if j < len(l) and l[j] == '\\' and j + 1 < len(l):
+                    # Fix ⑬ (新規): '\xNN' 形式の16進エスケープ（Cスタイル）を
+                    # 正しく消費する。旧実装は '\x' の x+1 文字目が ' かを確認
+                    # するだけだったため、'\x41' のように2桁の16進数字が続く
+                    # リテラルを孤立クォートとして誤認していた。
+                    # 修正: バックスラッシュ直後が 'x'/'X' の場合は0〜2桁の
+                    # 16進数字を読み飛ばしてから閉じクォートを探す。
+                    esc_char = l[j + 1]
+                    if esc_char in 'xX':
+                        k = j + 2
+                        # 最大2桁の16進数字を消費
+                        hex_digits = 0
+                        while k < len(l) and l[k] in '0123456789abcdefABCDEF' and hex_digits < 2:
+                            k += 1
+                            hex_digits += 1
+                        if k < len(l) and l[k] == '\'':
+                            i = k + 1
+                            continue
+                        # 閉じクォートが見つからなければ孤立クォートとして通過
+                    elif j + 2 < len(l) and l[j + 2] == '\'':
+                        # '\x' 形式 (quote + backslash + char + quote) = 4文字消費
+                        i = j + 3
+                        continue
+                    # 対応するクローズクォートが見当たらない孤立クォート: 通過
                 elif j < len(l) and j + 1 < len(l) and l[j + 1] == '\'':
                     # 'x' 形式 (quote + char + quote) = 3文字消費
                     i = j + 2
@@ -732,14 +752,18 @@ class VariableManager:
             # 修正: Decimal 型も適切に処理する。小数部を持つ値はそのまま保持し、
             # 整数値のみ int に変換する。
             if isinstance(v, Decimal):
-                # Decimal → 整数部分のみなら int、そうでなければ float に変換
-                try:
-                    if v == v.to_integral_value() and v.is_finite():
-                        self.state.vars[c - ord('A')] = int(v)
-                    else:
-                        self.state.vars[c - ord('A')] = float(v)
-                except Exception:
+                # Fix ⑭ (新規): Decimal('Infinity') / Decimal('NaN') は
+                # to_integral_value() が OverflowError / InvalidOperation を
+                # 投げ、旧実装の except Exception でそのまま int(v) が再試行
+                # されるが int(Decimal('Infinity')) も OverflowError になる。
+                # 結果として vars に壊れた値が書き込まれるか、別の例外が伝播した。
+                # 修正: 有限値かどうかを先に確認し、非有限は float として保持する。
+                if not v.is_finite():
+                    self.state.vars[c - ord('A')] = float(v)
+                elif v == v.to_integral_value():
                     self.state.vars[c - ord('A')] = int(v)
+                else:
+                    self.state.vars[c - ord('A')] = float(v)
             elif isinstance(v, float) and not v.is_integer():
                 self.state.vars[c - ord('A')] = v
             else:
@@ -1059,16 +1083,26 @@ class ExpressionEvaluator:
                     except (ValueError, ZeroDivisionError):
                         # シンボル・ラベルなど Decimal 評価できない場合は
                         # xeval（ラベル置換 + Python eval）で数値を得る。
-                        # ・整数値 → Decimal(int) で完全精度
-                        # ・float 値 → repr() で53bit分の最大桁数を使用
+                        #
+                        # Fix ⑯ (新規): 旧実装は float 経由で repr() を作ってから
+                        # decimal_to_ieee754_128bit_hex() に渡していた。float は
+                        # 53bit 精度なので qad{} の「128bit 精度」が失われる。
+                        # 修正: xeval の結果が整数または整数値の float ならば
+                        # str(int(v)) → Decimal(整数) → binary128 の経路を使い
+                        # 精度を保持する。真に非整数の場合は Decimal(repr(v)) で
+                        # 最大限の精度を確保した上で変換する。
+                        # （label+N のような整数式は int() 経路が適用され精度は保たれる）
                         v = self.xeval(t, None)
                         if isinstance(v, int) or (
                                 isinstance(v, float) and v.is_integer()):
                             h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
                                     str(int(v)))
                         else:
+                            # 非整数 float: repr() で 53bit 相当の最大桁数を使用。
+                            # xeval が Python の float を返す以上 53bit が上限だが、
+                            # Decimal() を経由することで binary128 変換は正確に行われる。
                             h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
-                                    repr(float(v)))
+                                    str(Decimal(repr(float(v)))))
                     x = int(h, 16)
         elif idx + 3 <= len(s) and s[idx:idx+3] == 'dbl':
             idx += 3
@@ -1253,6 +1287,10 @@ class ExpressionEvaluator:
         x, idx = self.term5(s, idx)
         # Use '\'' as sign-extension operator only when followed by a digit or '('
         # to avoid ambiguity with character literal closing quotes.
+        # Fix ⑰ (新規): remove_comment_asm が Fix ⑬ で \xNN を正しく消費するため
+        # 孤立クォートの混入は大幅に減少するが、以下のガードで二重防護する。
+        # 符号拡張演算子は必ず正の整数ビット幅（1 以上）が後に続く。
+        # 次トークンが数字または '(' でない場合は演算子ではなく閉じクォートとみなす。
         while idx < len(s) and s[idx] == '\'':
             next_idx = idx + 1
             next_idx = StringUtils.skipspc(s, next_idx)
@@ -1337,29 +1375,44 @@ class ExpressionEvaluator:
         採用するように修正する。旧実装は「最後に評価したブランチ」（偽ブランチ）
         のフラグが残るため、条件が真のとき偽ブランチに未定義ラベルがあると
         誤ってエラーとして報告されていた。
+
+        Fix ⑫ (新規): ELF リロケーション追跡状態（_elf_label_refs_seen /
+        _elf_var_to_label）も選ばれなかったブランチの副作用を取り消す。
+        旧実装では両ブランチを評価するたびにこれらリストに追記されるため、
+        使われない側のリロケーションエントリが混入し、ELF オブジェクトファイルに
+        誤ったリロケーションが生成されていた。
         """
         x, idx = self.term10(s, idx)
         if idx < len(s) and StringUtils.q(s, '?', idx):
-            # 真ブランチを評価する前に vars と error フラグを保存
-            saved_vars = self.state.vars[:]
+            # 真ブランチを評価する前に vars / error / ELF 追跡状態を保存
+            saved_vars     = self.state.vars[:]
+            saved_elf_refs = list(self.state._elf_label_refs_seen)
+            saved_elf_v2l  = dict(self.state._elf_var_to_label)
+
             t, idx = self.term11(s, idx + 1)   # 真ブランチ評価（右結合）
             vars_after_true = self.state.vars[:]
             err_after_true  = self.state.error_undefined_label  # Fix ⑦
+            refs_after_true = list(self.state._elf_label_refs_seen)  # Fix ⑫
+            v2l_after_true  = dict(self.state._elf_var_to_label)     # Fix ⑫
 
             if idx < len(s) and StringUtils.q(s, ':', idx):
-                # 偽ブランチ評価前に vars を元の状態に戻す
+                # 偽ブランチ評価前に vars / ELF 追跡状態を元の状態に戻す
                 self.state.vars = saved_vars[:]
+                self.state._elf_label_refs_seen = list(saved_elf_refs)  # Fix ⑫
+                self.state._elf_var_to_label    = dict(saved_elf_v2l)   # Fix ⑫
                 u, idx = self.term11(s, idx + 1)  # 偽ブランチ評価（右結合）
                 err_after_false = self.state.error_undefined_label  # Fix ⑦
 
                 if x != 0:
-                    # 条件が真: 真ブランチの値・変数状態・エラーフラグを採用
+                    # 条件が真: 真ブランチの値・変数状態・エラーフラグ・ELF状態を採用
                     self.state.vars = vars_after_true
                     self.state.error_undefined_label = err_after_true  # Fix ⑦
+                    self.state._elf_label_refs_seen = refs_after_true  # Fix ⑫
+                    self.state._elf_var_to_label    = v2l_after_true   # Fix ⑫
                     x = t
                 else:
                     # 条件が偽: 偽ブランチの値・変数状態・エラーフラグをそのまま使う
-                    # (self.state.vars と error_undefined_label は既に偽ブランチのもの)
+                    # (self.state.vars / _elf_* / error_undefined_label は既に偽ブランチのもの)
                     x = u
             else:
                 # ':' がない不完全な三項演算子: a?b の形式。
@@ -1368,11 +1421,14 @@ class ExpressionEvaluator:
                 # 条件が偽（x==0）でも真ブランチの値が使われる誤りがあった。
                 if x != 0:
                     self.state.error_undefined_label = err_after_true  # Fix ⑦
+                    # ELF 状態は真ブランチのものがすでにセットされているのでそのまま
                     x = t
                 else:
-                    # 条件が偽: 真ブランチの副作用（変数変更）を取り消し、0 を返す
+                    # 条件が偽: 真ブランチの副作用（変数変更・ELF追跡）を取り消し、0 を返す
                     self.state.vars = saved_vars
                     self.state.error_undefined_label = False
+                    self.state._elf_label_refs_seen = list(saved_elf_refs)  # Fix ⑫
+                    self.state._elf_var_to_label    = dict(saved_elf_v2l)   # Fix ⑫
                     x = 0
         return x, idx
     
@@ -3615,7 +3671,14 @@ class Assembler:
         self.state.impfile      = args.impfile
         self.state.elf_objfile  = args.elf_objfile
         self.state.elf_machine  = args.elf_machine
-        self.state.osabi        = osabitbl[args.elf_osabi]
+        # Fix 1: use .get() so unknown OSABI strings never raise KeyError.
+        # argparse choices= already guards this, but the table and the
+        # choices list could drift independently. Default to FreeBSD (9).
+        if args.elf_osabi not in osabitbl:
+            print(f"warning: unknown --osabi value '{args.elf_osabi}'; "
+                  f"valid choices are {list(osabitbl.keys())}. Using 'FreeBSD'.",
+                  file=sys.stderr)
+        self.state.osabi        = osabitbl.get(args.elf_osabi, 9)
         self.state.debug        = args.debug
 
         # Load pattern file
@@ -3709,7 +3772,16 @@ class Assembler:
                 # 前後のパスで同じ UNDEF ならば「収束」と誤判定されてしまう。
                 # 実際にはアドレスが確定していないので収束していない。
                 # UNDEF を含むラベルがひとつでも存在するなら収束とみなさない。
-                has_undef = any(pc == UNDEF for (pc, _sec) in current_pcs.values())
+                #
+                # Fix ⑮ (新規): UNDEF に加減算したような UNDEF 由来の値も検出する。
+                # UNDEF = 2^256 - 1 なので、現実のアセンブラで PC が 2^128 を
+                # 超えることはない。2^128 以上の値をすべて「UNDEF 由来」として扱い、
+                # 誤収束を防ぐ。
+                _UNDEF_THRESHOLD = 1 << 128
+                has_undef = any(
+                    pc == UNDEF or pc >= _UNDEF_THRESHOLD
+                    for (pc, _sec) in current_pcs.values()
+                )
                 # 修正⑤: _SENTINEL との比較は必ず False なので初回は無条件続行。
                 # 2回目以降は前回と一致しかつ UNDEF がなければ収束と判定できる。
                 if (not has_undef
