@@ -1610,13 +1610,21 @@ class DirectiveProcessor:
         if len(i) == 0 or i[0] != '.bits':
             return False
         
-        if len(i) >= 2 and i[1] == 'big':
-            self.state.endian = 'big'
-        else:
-            self.state.endian = 'little'
+        # Fix ④: エンディアンは 'big' / 'little' が明示指定された場合のみ変更する。
+        # 旧実装は i[1] が 'big' 以外のとき無条件に 'little' に上書きしていたため、
+        # '.bits 16' のようにビット幅だけ指定するとエンディアンが変わってしまっていた。
+        if len(i) >= 2:
+            if i[1].lower() == 'big':
+                self.state.endian = 'big'
+            elif i[1].lower() == 'little':
+                self.state.endian = 'little'
+            # それ以外 (数値等) はビット幅として後続の処理に渡す。エンディアン変更なし。
         
         if len(i) >= 3:
             v, idx = self.expr_eval.expression_pat(i[2], 0)
+        elif len(i) >= 2 and i[1].lower() not in ('big', 'little'):
+            # 引数が1つでエンディアン指定でない場合はそれがビット幅
+            v, idx = self.expr_eval.expression_pat(i[1], 0)
         else:
             v = 8
         self.state.bts = int(v)
@@ -1664,7 +1672,8 @@ class DirectiveProcessor:
         self.state.vliwflag = True
         
         l = []
-        for i in range(self.state.vliwinstbits // 8 + (0 if self.state.vliwinstbits % 8 == 0 else 1)):
+        # Fix ⑦: ループ変数を `_byte_idx` に変更して引数 `i` のシャドウイングを解消する。
+        for _byte_idx in range(self.state.vliwinstbits // 8 + (0 if self.state.vliwinstbits % 8 == 0 else 1)):
             l += [v4 & 0xff]
             v4 >>= 8
         self.state.vliwnop = l
@@ -2490,7 +2499,11 @@ class AssemblyDirectiveProcessor:
                 idx += 1
             v = self.label_manager.get_value(s)
             sec = self.label_manager.get_section(s)
-            self.state.export_labels[s] = [v, sec]
+            # is_equ フラグを labels から取得して export_labels にも保持する。
+            # write_elf_obj() で定数ラベル(SHN_ABS)とアドレスラベルを区別するために必要。
+            _lentry = self.state.labels.get(s, [])
+            is_equ = len(_lentry) > 2 and _lentry[2]
+            self.state.export_labels[s] = [v, sec, is_equ]
             if idx < len(l2) and l2[idx] == ',':
                 idx += 1
         return True
@@ -2750,7 +2763,8 @@ class Assembler:
                         loopflag = False
                         break
                 except (ArithmeticError, KeyError, IndexError, ValueError,
-                        TypeError, AttributeError, OverflowError) as _exc:
+                        TypeError, AttributeError, OverflowError,
+                        RecursionError) as _exc:
                     # 修正④: 旧実装は `except Exception` で全例外を捕捉していたため、
                     # makeobj / expression_pat 内のコード実装バグ（TypeError 等）が
                     # 「forward参照エラー」として握りつぶされ、デバッグが困難だった。
@@ -2774,7 +2788,8 @@ class Assembler:
                             objl = self.obj_gen.makeobj(i[2])
                             idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                         except (ArithmeticError, KeyError, IndexError, ValueError,
-                                TypeError, AttributeError, OverflowError):
+                                TypeError, AttributeError, OverflowError,
+                                RecursionError):
                             objl = []  # それでも失敗した場合はサイズ0のまま
                         finally:
                             self.state._pass1_size_mode = False
@@ -3536,9 +3551,8 @@ class Assembler:
                 shstrtab_name_off, 3, 0, 0,
                 shstrtab_off, len(shstrtab), 0, 0, 1, 0))
 
-        import sys as _sys
         print(f"elf: wrote {path} ({ncs} section(s), {nrela} rela section(s), {len(syms)} symbol(s))",
-              file=_sys.stderr)
+              file=sys.stderr)
 
     def _build_arg_parser(self):
         """Build and return the argparse.ArgumentParser for axx."""
@@ -3574,6 +3588,9 @@ class Assembler:
                         metavar='MACHINE',
                         help='ELF e_machine value (default 62=EM_X86_64; '
                              '183=AArch64, 243=RISC-V, 3=i386, 20=PPC, 40=ARM)')
+        ap.add_argument('-d', '--debug', dest='debug', action='store_true',
+                        default=False,
+                        help='Enable debug output (forward-ref fallback, relaxation log, etc.)')
         return ap
 
     def run(self):
@@ -3599,6 +3616,7 @@ class Assembler:
         self.state.elf_objfile  = args.elf_objfile
         self.state.elf_machine  = args.elf_machine
         self.state.osabi        = osabitbl[args.elf_osabi]
+        self.state.debug        = args.debug
 
         # Load pattern file
         self.state.pat = self.pattern_reader.readpat(args.patternfile)
@@ -3703,11 +3721,10 @@ class Assembler:
                 self.state._pass1_prev_label_pcs = current_pcs
             else:
                 # 収束しなかった場合の詳細情報
-                import sys as _sys
                 print("WARNING: Pass1 relaxation did not converge after {0} iterations.".format(MAX_RELAX), 
-                      file=_sys.stderr)
-                print("         Generated code may have incorrect addresses for", file=_sys.stderr)
-                print("         variable-length instructions with forward references.", file=_sys.stderr)
+                      file=sys.stderr)
+                print("         Generated code may have incorrect addresses for", file=sys.stderr)
+                print("         variable-length instructions with forward references.", file=sys.stderr)
                 if self.state.debug and self.state._pass1_prev_label_pcs:
                     # デバッグモードでは変化したラベルを表示
                     changed = []
@@ -3716,7 +3733,7 @@ class Assembler:
                             if current_pcs[k] != self.state._pass1_prev_label_pcs[k]:
                                 changed.append(k)
                     if changed:
-                        print(f"         Labels still changing: {', '.join(changed[:10])}", file=_sys.stderr)
+                        print(f"         Labels still changing: {', '.join(changed[:10])}", file=sys.stderr)
 
             self.state.pc = 0
             self.state.pas = 2
