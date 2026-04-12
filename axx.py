@@ -432,7 +432,10 @@ class Parser:
             if idx >= len(s):
                 # 閉じブレースが見つからなかった
                 print(f" error - missing closing '}}' in expression: '{{{t}'")
-                return False, '', start_idx  # f=False で呼び出し元にエラーを通知
+                # Fix ④修正: 旧実装は start_idx（'{' 内部）を返していたため、
+                # 呼び出し元パーサーが '{' の中身を後続の式として誤解析していた。
+                # len(s) を返してパースを強制終了させる。
+                return False, '', len(s)
             # '}' を消費
             idx += 1
             f = True
@@ -672,7 +675,13 @@ class IEEE754Converter:
                     i += 1
                 while i < len(s) and s[i] in '0123456789':
                     i += 1
-            v = Decimal(s[start:i])
+            try:
+                v = Decimal(s[start:i])
+            except Exception as _e:
+                # Fix ⑨修正: Decimal() は decimal.InvalidOperation を送出することがあり、
+                # 呼び出し側の except (ValueError, ZeroDivisionError) では補足されず
+                # 伝播してしまう。すべての変換失敗を ValueError に統一する。
+                raise ValueError(f"invalid decimal literal: {s[start:i]!r}") from _e
             return (-v if neg else v), i
 
         def parse_factor(s, i):
@@ -953,6 +962,13 @@ class ExpressionEvaluator:
             except (KeyError, IndexError):
                 self.state.error_undefined_label = True
                 val = 0
+                return hex(0)
+            # Fix ⑤修正: UNDEF (2^256-1) やそれに由来する超大整数が xeval に
+            # 流れ込むと hex() で 64 桁の文字列になり、Python の多倍長整数演算で
+            # 天文学的に遅くなる。2^128 以上は「UNDEF 由来」として 0 に置き換える。
+            _UNDEF_THRESHOLD = 1 << 128
+            if val == UNDEF or (isinstance(val, int) and val >= _UNDEF_THRESHOLD):
+                self.state.error_undefined_label = True
                 return hex(0)
             # ELF追跡: get_value() と同じ分岐方針で記録する。
             # .equ 定義ラベルはリロケーション不要なので除外する。
@@ -1290,6 +1306,11 @@ class ExpressionEvaluator:
         現実的なアセンブラでは符号拡張のビット幅が 128 を超えることはない
         ため、上限を設けてガードする。上限を超えた場合はゼロを返す
         （ビット幅 0 と同じ扱い）。
+
+        Fix ②修正: term0 の '/' 演算が float を返すことがあり、その値が
+        term6 まで伝播すると x >> (t-1) でビット演算できず TypeError になる。
+        また term5 が float の t を返す場合も同様。演算前に明示的に int へ変換する。
+        （term2〜term5 が int(x) を呼んでいるのと同じ方針）
         """
         _SEXT_MAX_BITS = 128  # 符号拡張ビット幅の上限
         x, idx = self.term5(s, idx)
@@ -1305,6 +1326,13 @@ class ExpressionEvaluator:
             if next_idx >= len(s) or (s[next_idx] not in DIGIT and s[next_idx] != '('):
                 break
             t, idx = self.term5(s, idx + 1)
+            # Fix ②: float が来たときの TypeError を防ぐため int に変換する
+            try:
+                x = int(x)
+                t = int(t)
+            except (ValueError, OverflowError):
+                x = 0
+                break
             if t <= 0:
                 x = 0
             elif t > _SEXT_MAX_BITS:
@@ -1551,6 +1579,14 @@ class BinaryWriter:
     def flush(self):
         """バッファをファイルに書き出す"""
         if not self.state.outfile or not self._buffer:
+            return
+
+        # Fix ⑧修正: bts == 0 の場合は bytes_per_word = 0 になり
+        # total_size = 0 → data[base_idx + i] への書き込みで IndexError が発生する。
+        # .bits 0 のような不正な設定を早期検出してエラーを出す。
+        if self.state.bts <= 0:
+            print(f" error - bts (word bit width) is {self.state.bts}; cannot write output.",
+                  file=__import__('sys').stderr)
             return
 
         max_word_pos = max(self._buffer.keys())
@@ -2465,33 +2501,43 @@ class VLIWProcessor:
                     res = (r << self.state.vliwtemplatebits) | templ
                 
                 q = 0
-                if self.state.vliwbits > 0:
-                    if vbits < 8:
-                        # Fix 6: vbits < 8 では bc = vbits - 8 が負になり
-                        # '0xff << bc' で ValueError が発生する。
-                        # 1バイト未満のワードは下位ビットのみを出力する。
-                        self.binary_writer.outbin(self.state.pc, res & ((1 << vbits) - 1))
-                        q = 1
-                    else:
-                        bc = vbits - 8
-                        vm = 0xff << bc
-                        for cnt in range(vbits // 8):
-                            self.binary_writer.outbin(self.state.pc + cnt, ((res & vm) >> bc) & 0xff)
-                            bc = bc - 8
-                            vm >>= 8
-                            q += 1
-                else:
+                # Fix ⑥修正: 旧実装は vliwbits の符号（>0=MSB先頭, <0=LSB先頭）で
+                # バイト出力順を決定しており、state.endian 設定と整合していなかった。
+                # 他のバイト出力系（flush, _extract）はすべて state.endian で分岐している。
+                # 修正後: state.endian を唯一の基準とする。
+                # vliwbits の符号は abs() で絶対値を取り出す用途のみに使用する。
+                if vbits < 8:
+                    # Fix 6: vbits < 8 では bc = vbits - 8 が負になり
+                    # '0xff << bc' で ValueError が発生する。
+                    # 1バイト未満のワードは下位ビットのみを出力する。
+                    self.binary_writer.outbin(self.state.pc, res & ((1 << vbits) - 1))
+                    q = 1
+                elif self.state.endian == 'little':
+                    # リトルエンディアン: LSB から順に書き出す
                     for cnt in range(vbits // 8):
                         self.binary_writer.outbin(self.state.pc + cnt, res & 0xff)
                         res >>= 8
+                        q += 1
+                else:
+                    # ビッグエンディアン: MSB から順に書き出す
+                    bc = vbits - 8
+                    vm = 0xff << bc
+                    for cnt in range(vbits // 8):
+                        self.binary_writer.outbin(self.state.pc + cnt, ((res & vm) >> bc) & 0xff)
+                        bc = bc - 8
+                        vm >>= 8
                         q += 1
                 
                 self.state.pc += q
                 break
         else:
+            # Fix ③修正: 旧実装は pas==0 か pas==2 のときだけ return False していたため、
+            # pas==1 ではエラーを出さず True を返してしまい、Pass1 のサイズ推定が
+            # VLIW テンプレート未定義のまま通過し、Pass2 でアドレスがずれていた。
+            # 修正後: 全 pass で False を返す。Pass1 の try/except が処理する。
             if self.state.pas == 0 or self.state.pas == 2:
                 print(" error - No vliw instruction-set defined.")
-                return False
+            return False
         return True
 
 
@@ -2789,7 +2835,23 @@ class Assembler:
         # Fix 9: ソースファイル内の .setsym / .clearsym は lineassemble() 先頭の
         # "symbols = dict(patsymbols)" リセットによって次行では消えてしまう。
         # ソースレベルの場合は patsymbols も同時に更新することで永続させる。
-        _i_src = [l, '', l2, '', '', '']
+        #
+        # Fix ①修正: 旧実装は _i_src = [l, '', l2, '', '', ''] としていたため、
+        # set_symbol が参照する i[1]（KEY名）が常に '' になっていた。
+        # l2 の最初のトークンを KEY、残りを VALUE として正しく分割する。
+        # .clearsym は i[2] をキー名として参照する（パターンファイルの慣習に合わせた設計）。
+        _l_upper = l.upper()
+        if _l_upper in ('.SETSYM', '.CLEARSYM'):
+            _l2_key, _l2_key_end = StringUtils.get_param_to_spc(l2, 0)
+            _l2_val = l2[_l2_key_end:].strip()
+            if _l_upper == '.SETSYM':
+                # set_symbol: i[0]=cmd, i[1]=KEY, i[2]=VALUE式
+                _i_src = [l, _l2_key, _l2_val, '', '', '']
+            else:
+                # clear_symbol: i[0]=cmd, i[2]=KEY (全消去時は空)
+                _i_src = [l, '', _l2_key, '', '', '']
+        else:
+            _i_src = [l, '', l2, '', '', '']
         if self.directive_proc.set_symbol(_i_src):
             self.state.patsymbols = dict(self.state.symbols)
             return 0, [], True, idx
