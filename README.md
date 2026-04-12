@@ -391,7 +391,7 @@ The next instruction, `AD a,b,c:: ::0x01,0,0,a,b,c::1`, outputs 0x01,0,0,a,b,c t
 
 For example, on Itanium, there are three 41-bit instructions, a group of instructions with a length of 41 * 3 = 123 (bits), plus 5 template bits at the end. If the instruction is not EPIC, set the template bits to 0.
 
-If the number of bundle bits is a negative value, the order of the bytes output in the bundle is reversed. The actual number of bundle bits is the absolute value of the number of bundle bits specified in the parameter. If the number of template bits is a positive number, the template bits are on the right, and if it is a negative number, the template bits are on the left. The number of template bits is an absolute value.
+If the template bit is a positive number, the template bit is placed at the right end; if it is a negative number, the template bit is placed at the left end. The number of bits in the template bit is an absolute value. Specifying `big` for the endianness in the `.bits` directive reverses the byte order of the output compared to the default `little` setting.
 
 In EPIC, error patterns must be explicitly omitted using `:: ::`.
 
