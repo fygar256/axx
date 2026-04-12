@@ -337,6 +337,8 @@ class StringUtils:
             else:
                 s += l2[idx]
                 idx += 1
+        # 末尾まで達したが閉じ引用符がなかった
+        print(f" warning - unterminated string literal: {l2!r}")
         return s
 
 
@@ -1148,7 +1150,7 @@ class ExpressionEvaluator:
         elif self.state.exp_typ=='f' and idx < len(s) and (self.parser.isfloatstr(s,idx)):
                 fs,idx = self.parser.get_floatstr(s,idx)
                 x = float(fs)
-        elif (idx < len(s) and self.state.expmode == EXP_PAT and 
+        elif (idx < len(s) and
               s[idx] in LOWER and idx + 1 < len(s) and s[idx+1] not in LOWER):
             ch = s[idx]
             if idx + 3 <= len(s) and s[idx+1:idx+3] == ':=':
@@ -1207,7 +1209,13 @@ class ExpressionEvaluator:
                 if t == 0:
                     self.err("Division by 0 error.")
                 else:
-                    x = x / t
+                    # 整数同士で割り切れる場合は int のまま返して 53bit float 精度落ちを防ぐ。
+                    # 割り切れない場合（真の実数除算）は float で返す。
+                    if isinstance(x, int) and isinstance(t, int):
+                        q, r = divmod(x, t)
+                        x = q if r == 0 else x / t
+                    else:
+                        x = x / t
             elif s[idx] == '%':
                 t, idx = self.term0_0(s, idx + 1)
                 if t == 0:
@@ -1446,13 +1454,21 @@ class ExpressionEvaluator:
 
     def expression_pat(self, s, idx):
         """Expression in pattern mode"""
+        prev = self.state.expmode
         self.state.expmode = EXP_PAT
-        return self.expression(self._terminate(s), idx)
-    
+        try:
+            return self.expression(self._terminate(s), idx)
+        finally:
+            self.state.expmode = prev
+
     def expression_asm(self, s, idx):
         """Expression in assembly mode"""
+        prev = self.state.expmode
         self.state.expmode = EXP_ASM
-        return self.expression(self._terminate(s), idx)
+        try:
+            return self.expression(self._terminate(s), idx)
+        finally:
+            self.state.expmode = prev
     
 
     def expression_esc(self, s, idx, stopchar):
@@ -1486,8 +1502,11 @@ class ExpressionEvaluator:
             # 機能しなかった。判定順を逆転し、depth==0 && ch==stopchar を
             # 括弧判定より優先することで全 stopchar を正しく処理できる。
             if not stack and ch == stopchar:
-                # 深さ0 かつ stopchar → ここで式を終端
+                # 深さ0 かつ stopchar → ここで式を終端。
+                # NUL を挿入したら残りの文字は追加しない（stopchar 以降が
+                # result に混入すると expression() が誤った位置で継続する）。
                 result.append(chr(0))
+                break
             elif ch in OPEN_TO_CLOSE:
                 # 開き括弧: スタックに積んで出力
                 stack.append(ch)
@@ -1916,7 +1935,7 @@ class PatternMatcher:
                         return False
                     idx_t = StringUtils.skipspc(t, idx_t+1)
                     if idx_t < len(t) and t[idx_t] == '\\':
-                        idx_t = StringUtils.skipspc(t, idx_t+1)
+                        idx_t += 1                                    # skip '\'
                         stopchar = t[idx_t] if idx_t < len(t) else chr(0)
                         idx_t += 1                                    # skip stopchar in pattern
                     else:
@@ -1940,7 +1959,7 @@ class PatternMatcher:
                         return False
                     idx_t = StringUtils.skipspc(t, idx_t+1)
                     if idx_t < len(t) and t[idx_t] == '\\':
-                        idx_t = StringUtils.skipspc(t, idx_t+1)
+                        idx_t += 1                                    # skip '\'
                         stopchar = t[idx_t] if idx_t < len(t) else chr(0)
                         idx_t += 1                                    # skip stopchar in pattern
                     else:
@@ -1966,7 +1985,7 @@ class PatternMatcher:
                         return False
                     idx_t = StringUtils.skipspc(t, idx_t+1)
                     if idx_t < len(t) and t[idx_t] == '\\':
-                        idx_t = StringUtils.skipspc(t, idx_t+1)
+                        idx_t += 1                                    # skip '\'
                         stopchar = t[idx_t] if idx_t < len(t) else chr(0)
                         idx_t += 1                                    # skip stopchar in pattern
                     else:
@@ -2034,7 +2053,6 @@ class PatternMatcher:
                     idx_t = StringUtils.skipspc(t, idx_t)
                     if idx_t < len(t) and t[idx_t] == '\\':
                         idx_t += 1                                    # skip '\'
-                        idx_t = StringUtils.skipspc(t, idx_t)
                         stopchar = t[idx_t] if idx_t < len(t) else chr(0)
                         idx_t += 1                                    # skip stopchar in pattern
                     else:
@@ -2327,8 +2345,21 @@ class ObjectGenerator:
 
                 x, idx = self.expr_eval.expression_pat(s, idx)
 
+                # ';' フラグ付きは「x != 0 のときだけワードを出力する」条件付き出力。
+                # x == 0 でスキップされると objl の長さとパターン側のサイズ式 i[3] が
+                # 食い違う可能性がある。パターン作成者が i[3] を ';' の条件を考慮して
+                # 書くことを前提としており、ここでは整合性の保証はしない。
+                # ELF リロケーション追跡: スキップされたワードの word_idx は使われないが
+                # 念のため _elf_current_word_idx をリセットしておく。
                 if (semicolon == True and x != 0) or (semicolon == False):
                     objl += [x]
+                elif semicolon:
+                    # 条件付きスキップ: ELF 追跡エントリが誤った word_idx で
+                    # 残らないよう、直前に記録されたエントリを取り消す。
+                    self.state._elf_label_refs_seen = [
+                        e for e in self.state._elf_label_refs_seen
+                        if e[2] != self.state._elf_current_word_idx
+                    ]
 
                 if idx < len(s) and s[idx] == ',':
                     idx += 1
@@ -2530,6 +2561,14 @@ class AssemblyDirectiveProcessor:
             elif l2[idx:idx+2] == '\\"':
                 idx += 2
                 ch = '"'
+            elif l2[idx:idx+2] in ('\\x', '\\X'):
+                # \xNN 形式の16進エスケープ（最大2桁）
+                idx += 2
+                hex_str = ''
+                while idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF' and len(hex_str) < 2:
+                    hex_str += l2[idx]
+                    idx += 1
+                ch = chr(int(hex_str, 16)) if hex_str else 'x'
             else:
                 ch = l2[idx]
                 idx += 1
@@ -2727,25 +2766,25 @@ class Assembler:
         l = l.replace(' ', '')
         
         if self.asm_directive_proc.section_processing(l, l2):
-            return [], [], True, idx
+            return 0, [], True, idx
         if self.asm_directive_proc.endsection_processing(l, l2):
-            return [], [], True, idx
+            return 0, [], True, idx
         if self.asm_directive_proc.zero_processing(l, l2):
-            return [], [], True, idx
+            return 0, [], True, idx
         if self.asm_directive_proc.ascii_processing(l, l2):
-            return [], [], True, idx
+            return 0, [], True, idx
         if self.asm_directive_proc.asciiz_processing(l, l2):
-            return [], [], True, idx
+            return 0, [], True, idx
         if self.include_asm(l, l2):
-            return [], [], True, idx
+            return 0, [], True, idx
         if self.asm_directive_proc.align_processing(l, l2):
-            return [], [], True, idx
+            return 0, [], True, idx
         if self.asm_directive_proc.org_processing(l, l2):
-            return [], [], True, idx
+            return 0, [], True, idx
         if self.asm_directive_proc.labelc_processing(l, l2):
-            return [], [], True, idx
+            return 0, [], True, idx
         if self.asm_directive_proc.export_processing(l, l2):
-            return [], [], True, idx
+            return 0, [], True, idx
 
         # Fix 9: ソースファイル内の .setsym / .clearsym は lineassemble() 先頭の
         # "symbols = dict(patsymbols)" リセットによって次行では消えてしまう。
@@ -2753,12 +2792,12 @@ class Assembler:
         _i_src = [l, '', l2, '', '', '']
         if self.directive_proc.set_symbol(_i_src):
             self.state.patsymbols = dict(self.state.symbols)
-            return [], [], True, idx
+            return 0, [], True, idx
         if self.directive_proc.clear_symbol(_i_src):
             self.state.patsymbols = dict(self.state.symbols)
-            return [], [], True, idx
+            return 0, [], True, idx
         if l == "":
-            return [], [], False, idx
+            return 0, [], False, idx
         
         of = 0
         se = False
@@ -2882,13 +2921,13 @@ class Assembler:
         if self.state.pas == 2 or self.state.pas == 0:
             if self.state.error_undefined_label:
                 print(f" error - undefined label error.")
-                return [], [], False, idx
+                return 0, [], False, idx
             if se:
                 print(f" error - Syntax error.")
-                return [], [], False, idx
+                return 0, [], False, idx
             if oerr:
                 print(f" ; pat {pln} {pl} error - Illegal syntax in assemble line or pattern line.")
-                return [], [], False, idx
+                return 0, [], False, idx
         
         return idxs, objl, True, idx
     
@@ -3824,7 +3863,8 @@ class Assembler:
         # 以前は -E が -e をサイレントに上書きしていた。
         if self.state.expfile_elf and self.state.expfile:
             print(f"warning: both -e '{self.state.expfile}' and -E '{self.state.expfile_elf}' specified; "
-                  f"exporting plain format to -e and ELF format to -E separately.")
+                  f"exporting plain format to -e and ELF format to -E separately.",
+                  file=sys.stderr)
 
         def _write_export(path, elf):
             h   = list(self.state.export_labels.items())
