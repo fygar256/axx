@@ -7,7 +7,10 @@ Refactored with OOP design for improved maintainability
 """
 
 from decimal import Decimal, getcontext
-import readline
+try:
+    import readline  # GNU readline (Unix/macOS only; not available on Windows)
+except ImportError:
+    pass  # Gracefully degrade on Windows or environments without readline
 import string
 import subprocess
 import itertools
@@ -939,12 +942,13 @@ class ExpressionEvaluator:
                     print(" error - missing ',' in *(expr, expr) expression.")
                     x=0
             else:
-                # '*' の後に '(' が続かない場合は *(expr,expr) 構文のミスタイプ。
-                # 旧実装は idx を進めずに x=0 を返していたため、呼び出し元の term0()
-                # が再び '*' を二項演算子として解釈し、0 * (次の式) = 0 となっていた。
-                # '*' を消費せずに抜ければ factor1() へ委譲し、自然にエラーになる。
-                # （factor 冒頭で x=0 が初期値なので何もしなくてよい）
-                pass  # idx は進めない: '*' は term0 側の乗算演算子として処理させる
+                # Fix: '*' の後に '(' が続かない場合は *(expr,expr) 構文のミスタイプ。
+                # エラーメッセージを出力し x=0 のまま返す。
+                # idx を進めないため、呼び出し元の term0() が '*' を二項演算子として
+                # 再解釈し 0 * (次の式) = 0 となる（サイレントなセマンティクスは変わらないが
+                # 少なくとも問題を通知する）。
+                print(" error - expected '(' after '*' in *(expr,expr) expression.")
+                # x=0, idx unchanged
         else:
             x, idx = self.factor1(s, idx)
         
@@ -1421,34 +1425,41 @@ class ExpressionEvaluator:
         x, idx = self.term10(s, idx)
         if idx < len(s) and StringUtils.q(s, '?', idx):
             # 真ブランチを評価する前に vars / error / ELF 追跡状態を保存
-            saved_vars     = self.state.vars[:]
-            saved_elf_refs = list(self.state._elf_label_refs_seen)
-            saved_elf_v2l  = dict(self.state._elf_var_to_label)
+            saved_vars              = self.state.vars[:]
+            saved_err_undef         = self.state.error_undefined_label
+            saved_err_conflict      = self.state.error_label_conflict   # Fix: 追加
+            saved_elf_refs          = list(self.state._elf_label_refs_seen)
+            saved_elf_v2l           = dict(self.state._elf_var_to_label)
 
             t, idx = self.term11(s, idx + 1)   # 真ブランチ評価（右結合）
-            vars_after_true = self.state.vars[:]
-            err_after_true  = self.state.error_undefined_label  # Fix ⑦
-            refs_after_true = list(self.state._elf_label_refs_seen)  # Fix ⑫
-            v2l_after_true  = dict(self.state._elf_var_to_label)     # Fix ⑫
+            vars_after_true         = self.state.vars[:]
+            err_after_true          = self.state.error_undefined_label  # Fix ⑦
+            conflict_after_true     = self.state.error_label_conflict   # Fix: 追加
+            refs_after_true         = list(self.state._elf_label_refs_seen)  # Fix ⑫
+            v2l_after_true          = dict(self.state._elf_var_to_label)     # Fix ⑫
 
             if idx < len(s) and StringUtils.q(s, ':', idx):
                 # 偽ブランチ評価前に vars / ELF 追跡状態を元の状態に戻す
-                self.state.vars = saved_vars[:]
-                self.state._elf_label_refs_seen = list(saved_elf_refs)  # Fix ⑫
-                self.state._elf_var_to_label    = dict(saved_elf_v2l)   # Fix ⑫
+                self.state.vars                     = saved_vars[:]
+                self.state.error_undefined_label    = saved_err_undef   # Fix: 追加
+                self.state.error_label_conflict     = saved_err_conflict  # Fix: 追加
+                self.state._elf_label_refs_seen     = list(saved_elf_refs)  # Fix ⑫
+                self.state._elf_var_to_label        = dict(saved_elf_v2l)   # Fix ⑫
                 u, idx = self.term11(s, idx + 1)  # 偽ブランチ評価（右結合）
-                err_after_false = self.state.error_undefined_label  # Fix ⑦
+                err_after_false         = self.state.error_undefined_label  # Fix ⑦
+                conflict_after_false    = self.state.error_label_conflict    # Fix: 追加
 
                 if x != 0:
                     # 条件が真: 真ブランチの値・変数状態・エラーフラグ・ELF状態を採用
-                    self.state.vars = vars_after_true
-                    self.state.error_undefined_label = err_after_true  # Fix ⑦
-                    self.state._elf_label_refs_seen = refs_after_true  # Fix ⑫
-                    self.state._elf_var_to_label    = v2l_after_true   # Fix ⑫
+                    self.state.vars                     = vars_after_true
+                    self.state.error_undefined_label    = err_after_true      # Fix ⑦
+                    self.state.error_label_conflict     = conflict_after_true  # Fix: 追加
+                    self.state._elf_label_refs_seen     = refs_after_true      # Fix ⑫
+                    self.state._elf_var_to_label        = v2l_after_true       # Fix ⑫
                     x = t
                 else:
                     # 条件が偽: 偽ブランチの値・変数状態・エラーフラグをそのまま使う
-                    # (self.state.vars / _elf_* / error_undefined_label は既に偽ブランチのもの)
+                    # (self.state.vars / _elf_* / error_* は既に偽ブランチのもの)
                     x = u
             else:
                 # ':' がない不完全な三項演算子: a?b の形式。
@@ -1456,15 +1467,17 @@ class ExpressionEvaluator:
                 # 旧実装は条件の真偽に関わらず常に t を返していたため、
                 # 条件が偽（x==0）でも真ブランチの値が使われる誤りがあった。
                 if x != 0:
-                    self.state.error_undefined_label = err_after_true  # Fix ⑦
+                    self.state.error_undefined_label    = err_after_true     # Fix ⑦
+                    self.state.error_label_conflict     = conflict_after_true  # Fix: 追加
                     # ELF 状態は真ブランチのものがすでにセットされているのでそのまま
                     x = t
                 else:
                     # 条件が偽: 真ブランチの副作用（変数変更・ELF追跡）を取り消し、0 を返す
-                    self.state.vars = saved_vars
-                    self.state.error_undefined_label = False
-                    self.state._elf_label_refs_seen = list(saved_elf_refs)  # Fix ⑫
-                    self.state._elf_var_to_label    = dict(saved_elf_v2l)   # Fix ⑫
+                    self.state.vars                     = saved_vars
+                    self.state.error_undefined_label    = False
+                    self.state.error_label_conflict     = saved_err_conflict  # Fix: 追加
+                    self.state._elf_label_refs_seen     = list(saved_elf_refs)  # Fix ⑫
+                    self.state._elf_var_to_label        = dict(saved_elf_v2l)   # Fix ⑫
                     x = 0
         return x, idx
     
@@ -1977,7 +1990,14 @@ class PatternMatcher:
                     else:
                         stopchar = chr(0)
 
-                    v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+                    # Fix: expression_esc_float が例外を投げても _elf_capturing_var が
+                    # True のまま残らないよう try/finally でリセットを保証する。
+                    # !F は整数キャプチャではないのでキャプチャ変数は設定不要だが、
+                    # 将来の変更に備えて他ブランチと対称なパターンにしておく。
+                    try:
+                        v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+                    finally:
+                        self.state._elf_capturing_var = None
                     v = float(v)
                     v = int.from_bytes(struct.pack('>f', v), "big")
                     self.var_manager.put(a, v)
@@ -2001,7 +2021,12 @@ class PatternMatcher:
                     else:
                         stopchar = chr(0)
 
-                    v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+                    # Fix: expression_esc_float が例外を投げても _elf_capturing_var が
+                    # True のまま残らないよう try/finally でリセットを保証する。
+                    try:
+                        v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+                    finally:
+                        self.state._elf_capturing_var = None
                     v = float(v)
                     v = int.from_bytes(struct.pack('>d', v), "big")
                     self.var_manager.put(a, v)
@@ -2031,7 +2056,12 @@ class PatternMatcher:
                     idx_s_q_start = idx_s
 
                     # float モードで式の終端位置を検出
-                    v, idx_s_after = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+                    # Fix: expression_esc_float が例外を投げても _elf_capturing_var が残留しないよう
+                    # try/finally で確実に None に戻す。
+                    try:
+                        v, idx_s_after = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+                    finally:
+                        self.state._elf_capturing_var = None
 
                     # stopchar 手前までのソーステキストを抽出
                     raw_text = s[idx_s_q_start:idx_s_after]
@@ -2076,9 +2106,13 @@ class PatternMatcher:
                         return False
                     idx_t += 1
                     # ELF追跡: !!a（factor キャプチャ）
+                    # Fix: factor() が例外を投げても _elf_capturing_var が残留しないよう
+                    # try/finally で確実に None に戻す。
                     self.state._elf_capturing_var = a
-                    v, idx_s = self.expr_eval.factor(s, idx_s)
-                    self.state._elf_capturing_var = None
+                    try:
+                        v, idx_s = self.expr_eval.factor(s, idx_s)
+                    finally:
+                        self.state._elf_capturing_var = None
                     self.var_manager.put(a, v)
                     continue
                 else:
@@ -2095,9 +2129,13 @@ class PatternMatcher:
                         stopchar = chr(0)
 
                     # ELF追跡: !a（expression キャプチャ）
+                    # Fix: expression_esc() が例外を投げても _elf_capturing_var が残留しないよう
+                    # try/finally で確実に None に戻す。
                     self.state._elf_capturing_var = a
-                    v, idx_s = self.expr_eval.expression_esc(s, idx_s, stopchar)
-                    self.state._elf_capturing_var = None
+                    try:
+                        v, idx_s = self.expr_eval.expression_esc(s, idx_s, stopchar)
+                    finally:
+                        self.state._elf_capturing_var = None
                     self.var_manager.put(a, v)
                     # consume stopchar from source as well
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
@@ -2513,19 +2551,26 @@ class VLIWProcessor:
                     self.binary_writer.outbin(self.state.pc, res & ((1 << vbits) - 1))
                     q = 1
                 elif self.state.endian == 'little':
-                    # リトルエンディアン: LSB から順に書き出す
-                    for cnt in range(vbits // 8):
+                    # リトルエンディアン: LSB から順に書き出す。
+                    # Fix: 旧実装は vbits // 8 回しかループしないため、vbits が
+                    # 8 の倍数でない場合（例: 12bit → 1バイトしか書かれず上位 4bit
+                    # が消える）に出力が欠落していた。(vbits + 7) // 8 に修正する。
+                    total_bytes = (vbits + 7) // 8
+                    for cnt in range(total_bytes):
                         self.binary_writer.outbin(self.state.pc + cnt, res & 0xff)
                         res >>= 8
                         q += 1
                 else:
-                    # ビッグエンディアン: MSB から順に書き出す
-                    bc = vbits - 8
-                    vm = 0xff << bc
-                    for cnt in range(vbits // 8):
-                        self.binary_writer.outbin(self.state.pc + cnt, ((res & vm) >> bc) & 0xff)
-                        bc = bc - 8
-                        vm >>= 8
+                    # ビッグエンディアン: MSB から順に書き出す。
+                    # Fix: 旧実装は bc = vbits - 8 を初期シフト量にしていたため、
+                    # vbits が 8 の倍数でないとき bc が途中で負になり ValueError
+                    # が発生した。また vbits // 8 回しかループしないため上位ビットが
+                    # 消失していた。バイト i は (res >> ((total_bytes-1-i)*8)) & 0xff
+                    # で正確に計算できる。
+                    total_bytes = (vbits + 7) // 8
+                    for cnt in range(total_bytes):
+                        shift = (total_bytes - 1 - cnt) * 8
+                        self.binary_writer.outbin(self.state.pc + cnt, (res >> shift) & 0xff)
                         q += 1
                 
                 self.state.pc += q
@@ -3898,7 +3943,7 @@ class Assembler:
                       file=sys.stderr)
                 print("         Generated code may have incorrect addresses for", file=sys.stderr)
                 print("         variable-length instructions with forward references.", file=sys.stderr)
-                if self.state.debug and self.state._pass1_prev_label_pcs:
+                if self.state.debug and isinstance(self.state._pass1_prev_label_pcs, dict):
                     # デバッグモードでは変化したラベルを表示
                     changed = []
                     for k in current_pcs:
