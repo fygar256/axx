@@ -847,6 +847,13 @@ class LabelManager:
                 self.state.error_label_conflict = True
                 print(f" error - label '{k}' not defined in pass 1.")
                 return False
+            # Fix 8: パス1とパス2で is_equ フラグが食い違う場合を検出する。
+            # is_equ が変わるとELFリロケーション追跡の結果が変わるため警告する。
+            old_is_equ = len(self.state.labels[k]) > 2 and self.state.labels[k][2]
+            if old_is_equ != is_equ:
+                print(f" warning - label '{k}' is_equ flag changed between pass 1 "
+                      f"and pass 2 (was {old_is_equ}, now {is_equ}). "
+                      f"ELF relocation output may be incorrect.")
 
         if k in self.state.patsymbols:
             print(f" error - '{k}' is a pattern file symbol.")
@@ -1056,6 +1063,10 @@ class ExpressionEvaluator:
             x, idx = self.expression(s, idx + 1)
             if idx < len(s) and s[idx] == ')':
                 idx += 1
+            else:
+                # Fix 2: 閉じ括弧がない不正な入力を検出して報告する。
+                # 旧実装はエラーなしに続行し、パース位置がずれたまま処理が続いていた。
+                print(" error - missing closing ')' in expression.")
         # Fix ⑥: 境界チェックを idx+4<=len(s) に統一する。
         # 旧実装の idx+4<len(s) は末尾ちょうど4文字のケースを除外していた。
         # Python のスライスは範囲外でも安全だが、明示的な境界チェックは
@@ -1071,6 +1082,27 @@ class ExpressionEvaluator:
             idx+=4
         elif idx+4<=len(s) and s[idx:idx+4]=="'\\n'":
             x=0x0a
+            idx+=4
+        # Fix 12: 4文字エスケープリテラルの追加。旧実装は '\t' '\'' '\\' '\n' しか
+        # ハンドルしておらず、'\0' は ord('\') == 92 として誤解釈されていた。
+        # 一般的なCエスケープシーケンスをすべて網羅する。
+        elif idx+4<=len(s) and s[idx:idx+4]=="'\\0'":
+            x=0x00
+            idx+=4
+        elif idx+4<=len(s) and s[idx:idx+4]=="'\\r'":
+            x=0x0d
+            idx+=4
+        elif idx+4<=len(s) and s[idx:idx+4]=="'\\a'":
+            x=0x07
+            idx+=4
+        elif idx+4<=len(s) and s[idx:idx+4]=="'\\b'":
+            x=0x08
+            idx+=4
+        elif idx+4<=len(s) and s[idx:idx+4]=="'\\f'":
+            x=0x0c
+            idx+=4
+        elif idx+4<=len(s) and s[idx:idx+4]=="'\\v'":
+            x=0x0b
             idx+=4
         # Fix 4: idx+3 <= len(s) に変更（文字列末尾3文字が 'x' の場合も正しくマッチ）
         elif idx+3<=len(s) and s[idx]=='\'' and s[idx+2]=='\'':
@@ -1678,6 +1710,11 @@ class BinaryWriter:
     
     def align_(self, addr):
         """Align address"""
+        # Fix 6/15: state.align == 0（.ALIGN 0 や初期化ミスなど）の場合、
+        # addr % 0 で ZeroDivisionError が発生する。
+        # 0 以下のアライメント値はアライメントなし（そのまま返す）として扱う。
+        if self.state.align <= 0:
+            return addr
         a = addr % self.state.align
         if a == 0:
             return addr
@@ -2251,6 +2288,11 @@ class PatternFileReader:
                     elif len(l) == 6:
                         p = [l[0], l[1], l[2], l[3], l[4], l[5]]
                     else:
+                        # Fix 11: フィールドが7個以上の行はサイレントに切り捨てていた。
+                        # パターンファイルの書き間違い（区切り文字ミス等）を検出するため
+                        # 警告を出力する。
+                        print(f" warning - pattern line has more than 6 fields "
+                              f"(extra fields ignored): {l[6:]!r}")
                         p = [l[0], l[1], l[2], l[3], l[4], l[5]]
                     w.append(p)
         
@@ -2380,6 +2422,13 @@ class ObjectGenerator:
         # Expand @@[] and replace %%
         s,z = self.e_p(s)
         s = self.replace_percent_with_index(s)
+
+        # Fix 10: @@[0,...] の展開結果が空文字列になると、前後のカンマが
+        # 連続（例: "a,,c"）し makeobj のカンマ処理が余分なアライメントパディングを
+        # 挿入する。連続カンマを1つに正規化し、前後の孤立カンマも除去する。
+        while ',,' in s:
+            s = s.replace(',,', ',')
+        s = s.strip(',')
         
         s += chr(0)
         idx = 0
@@ -2468,6 +2517,15 @@ class VLIWProcessor:
                 continue
             elif idx + 2 <= len(line) and line[idx:idx+2] == '!!':
                 idx += 2
+                # Fix 14: VLIW の次スロットを lineassemble2 で処理する際、
+                # ELF追跡状態（_elf_label_refs_seen / _elf_current_word_idx）が
+                # 前スロットの値を引き継いだままになる。スロットをまたいだ
+                # word_idx の混在を防ぐため、呼び出し前にスロット単位でリセットする。
+                # (_elf_tracking フラグ自体は lineassemble() が管理するので触らない)
+                self.state._elf_label_refs_seen = []
+                self.state._elf_current_word_idx = -1
+                self.state._elf_var_to_label = {}
+                self.state._elf_capturing_var = None
                 idxs, objl, flag, idx = lineassemble2_func(line, idx)
                 objs += [objl]
                 idxlst += [idxs]
@@ -2521,11 +2579,20 @@ class VLIWProcessor:
                 
                 for j in range(noi):
                     vv = 0
-                    for i in range(ibyte):
-                        vv <<= 8
-                        if len(values) > cnt:
-                            vv |= values[cnt] & 0xff
-                        cnt += 1
+                    # Fix 4: バイト結合順をエンディアン設定に合わせる。
+                    # 旧実装は常に MSB 先頭（ビッグエンディアン順）で結合していたため、
+                    # state.endian == 'little' の場合に命令フィールドが逆転していた。
+                    if self.state.endian == 'little':
+                        for i in range(ibyte):
+                            if len(values) > cnt:
+                                vv |= (values[cnt] & 0xff) << (8 * i)
+                            cnt += 1
+                    else:
+                        for i in range(ibyte):
+                            vv <<= 8
+                            if len(values) > cnt:
+                                vv |= values[cnt] & 0xff
+                            cnt += 1
                     v1 += [vv & im]
                 
                 r = 0
@@ -2659,7 +2726,14 @@ class AssemblyDirectiveProcessor:
                 while idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF' and len(hex_str) < 2:
                     hex_str += l2[idx]
                     idx += 1
-                ch = chr(int(hex_str, 16)) if hex_str else 'x'
+                # Fix 1: \x の直後に16進数字がない場合はエラーを報告する。
+                # 旧実装はサイレントに 'x' という文字を出力していたため、
+                # 誤ったバイナリが静かに生成されていた。
+                if hex_str:
+                    ch = chr(int(hex_str, 16))
+                else:
+                    print(f" error - '\\x' escape requires at least one hex digit in string: {l2!r}")
+                    ch = '\x00'  # NUL でフォールバック（後続処理を継続させる）
             else:
                 ch = l2[idx]
                 idx += 1
@@ -2749,13 +2823,29 @@ class AssemblyDirectiveProcessor:
             return False
         
         if l2 != '':
+            # Fix 3: セクションを切り替える前に現在セクションの暫定サイズを更新する。
+            # .text → .data → .text のような非連続配置でも、各ブロックの
+            # コンテンツが最終的なサイズ計算から漏れないようにする。
+            # ENDSECTION で正式にサイズが確定している場合（size > 0）は上書きしない。
+            old_sec = self.state.current_section
+            if old_sec in self.state.sections:
+                old_entry = self.state.sections[old_sec]
+                if old_entry[1] == 0:
+                    tentative = self.state.pc - old_entry[0]
+                    if tentative > 0:
+                        old_entry[1] = tentative
+
             self.state.current_section = l2
             # 同名セクションが再宣言された場合（.text→.data→.text など）は
             # 最初に記録した開始アドレスを保護する。
-            # 旧実装は毎回 [self.state.pc, 0] で上書きしていたため、
-            # ELF セクション開始アドレスや endsection のサイズ計算が狂っていた。
+            # ただし再宣言された場合はサイズをリセットして再測定する。
             if l2 not in self.state.sections:
                 self.state.sections[l2] = [self.state.pc, 0]
+            else:
+                # 同一セクションの再宣言: start を最小値として保持し
+                # size は 0 にリセットして再測定させる。
+                existing_start = self.state.sections[l2][0]
+                self.state.sections[l2] = [min(existing_start, self.state.pc), 0]
         return True
     
     def align_processing(self, l1, l2):
@@ -2765,6 +2855,10 @@ class AssemblyDirectiveProcessor:
         
         if l2 != '':
             u, idx = self.expr_eval.expression_asm(l2, 0)
+            # Fix 6: .ALIGN 0 や負値は不正。ゼロ除算を防ぐためここで検証する。
+            if int(u) <= 0:
+                print(f" error - .ALIGN requires a positive value, got {int(u)}.")
+                return True
             self.state.align = int(u)
         
         self.state.pc = self.binary_writer.align_(self.state.pc)
@@ -2891,10 +2985,13 @@ class Assembler:
             _l2_val = l2[_l2_key_end:].strip()
             if _l_upper == '.SETSYM':
                 # set_symbol: i[0]=cmd, i[1]=KEY, i[2]=VALUE式
-                _i_src = [l, _l2_key, _l2_val, '', '', '']
+                # Fix 9: set_symbol/clear_symbol は i[0] を小文字の '.setsym'/'.clearsym'
+                # と比較する。l は get_param_to_spc が返す元の大文字混在のトークンなので
+                # l.lower() を使わないとディレクティブが無視されていた。
+                _i_src = [l.lower(), _l2_key, _l2_val, '', '', '']
             else:
                 # clear_symbol: i[0]=cmd, i[2]=KEY (全消去時は空)
-                _i_src = [l, '', _l2_key, '', '', '']
+                _i_src = [l.lower(), '', _l2_key, '', '', '']
         else:
             _i_src = [l, '', l2, '', '', '']
         if self.directive_proc.set_symbol(_i_src):
@@ -3212,7 +3309,11 @@ class Assembler:
     
     def lineassemble0(self, line):
         """Assemble line with output"""
-        self.state.cl = line.replace('\n', '')
+        # Fix 16: state.cl はデバッグ表示と lineassemble() の処理対象を兼ねる。
+        # \n を除去するだけでなく、呼び出し元（run() 対話モード）が行う
+        # "\\\\" → "\\" の変換も済んでいる前提で受け取る。
+        # ファイルモードの場合は変換なしで受け取るが、それも一貫している。
+        self.state.cl = line.replace('\n', '').replace('\r', '')
         if self.state.pas == 2 or self.state.pas == 0:
             print("%016x " % self.state.pc, end='')
             print(f"{self.state.current_file} {self.state.ln} {self.state.cl} ", end='')
@@ -3395,7 +3496,9 @@ class Assembler:
             # Fix 7: put_value() は pas 状態に応じて二重定義チェックや
             # 「pass1未定義」エラーを出す。インポートラベルは pas に
             # 関係なく直接 labels に書き込む（上書き可）。
-            self.state.labels[label] = [v, section, True]  # is_equ=True: リロケーション不要
+            # Fix 13: is_imported=True を第4フィールドとして記録し、
+            # write_elf_obj() がこれを外部シンボル参照（UND）として扱えるようにする。
+            self.state.labels[label] = [v, section, True, True]  # [val, sec, is_equ, is_imported]
             return True
 
         return False
@@ -3597,27 +3700,40 @@ class Assembler:
         for i in range(ncs):
             syms.append(_pack_sym(0, 0x03, 0, i + 1, 0, 0))
 
-        # local symbols (not in export_labels)
+        # Fix 13: ELF規格では STB_LOCAL シンボルは全て STB_GLOBAL より先でなければ
+        # ならない（symtab の sh_info = first_global_index）。
+        # インポートラベル（is_imported=True）は STB_GLOBAL なので、
+        # ローカル→インポート→エクスポートの順で出力する。
         export_keys = set(self.state.export_labels.keys())
+
+        # ── (1) ローカルシンボル（STB_LOCAL=0x00）────────────────────
         for name, *_lentry in sorted(self.state.labels.items()):
-            val, _sec = _lentry[0][0], _lentry[0][1]
-            is_equ = len(_lentry[0]) > 2 and _lentry[0][2]
-            if name in export_keys:
+            val         = _lentry[0][0]
+            is_equ      = len(_lentry[0]) > 2 and _lentry[0][2]
+            is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
+            if name in export_keys or is_imported:
                 continue
             if is_equ:
-                # .equ 定義ラベルは絶対値シンボル (SHN_ABS=0xfff1)
                 shndx, sym_val = 0xfff1, val
-
             else:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr)
-
             name_off = len(strtab); strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x00, 0, shndx, sym_val, 0))
 
+        # ── first_global マーク ───────────────────────────────────────
         first_global = len(syms)
 
-        # global symbols (export_labels, STB_GLOBAL | STT_NOTYPE = 0x10)
+        # ── (2) インポートシンボル（STB_GLOBAL=0x10, SHN_UNDEF=0）────
+        # -i でインポートした外部ラベル。リンカが外部参照として解決する。
+        for name, *_lentry in sorted(self.state.labels.items()):
+            is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
+            if not is_imported or name in export_keys:
+                continue
+            name_off = len(strtab); strtab += name.encode() + b'\x00'
+            syms.append(_pack_sym(name_off, 0x10, 0, 0, 0, 0))
+
+        # ── (3) エクスポートシンボル（STB_GLOBAL=0x10）───────────────
         for name, *_eentry in sorted(self.state.export_labels.items()):
             val, _sec = _eentry[0][0], _eentry[0][1]
             is_equ = len(_eentry[0]) > 2 and _eentry[0][2]
@@ -3633,19 +3749,30 @@ class Assembler:
         strtab = bytes(strtab)
 
         # ------------------------------------------------------------------ #
-        # シンボル名 → シンボルテーブルインデックス のマッピングを構築        #
-        # (リロケーションエントリの r_info に使う)                            #
+        # シンボル名 → シンボルテーブルインデックスのマッピングを構築          #
+        # syms の出力順 (1)ローカル→(2)インポート→(3)エクスポート に合わせる  #
         # ------------------------------------------------------------------ #
         sym_name_to_idx = {}
         _si = 1 + ncs   # null(0) + section syms(1..ncs) を飛ばした位置
+
+        # (1) ローカル
         for name, *_lentry in sorted(self.state.labels.items()):
-            val, _sec = _lentry[0][0], _lentry[0][1]
-            if name in export_keys:
+            is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
+            if name in export_keys or is_imported:
                 continue
             sym_name_to_idx[name] = _si
             _si += 1
+
+        # (2) インポート
+        for name, *_lentry in sorted(self.state.labels.items()):
+            is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
+            if not is_imported or name in export_keys:
+                continue
+            sym_name_to_idx[name] = _si
+            _si += 1
+
+        # (3) エクスポート
         for name, *_eentry in sorted(self.state.export_labels.items()):
-            val, _sec = _eentry[0][0], _eentry[0][1]
             sym_name_to_idx[name] = _si
             _si += 1
 
@@ -3844,165 +3971,171 @@ class Assembler:
             except OSError:
                 pass
 
-        # --- Assemble ---
-        if args.sourcefile is None:
-            # Interactive / stdin mode (single pass)
-            self.state.pc = 0
-            self.state.pas = 0
-            self.state.ln = 1
-            self.state.current_file = "(stdin)"
-            while True:
-                self.printaddr(self.state.pc)
-                try:
-                    line = input(">> ")
-                    line = line.replace("\\\\", "\\")
-                except EOFError:
-                    break
-                line = line.strip()
-                if line == "":
-                    continue
-                if line == "?":
-                    self.label_manager.printlabels()
-                    continue
-                self.lineassemble0(line)
-        else:
-            # Two-pass file assembly with pass1 relaxation.
-            #
-            # 可変長命令アーキテクチャでは、forward参照ラベルを 0 と仮定した
-            # pass1 のサイズ推定が間違い、pass2 でアドレスがずれることがある。
-            # 対策: pass1 を最大 MAX_RELAX 回繰り返し、全ラベルの PC が
-            # 前回と一致したら収束とみなして pass2 に進む（リラクゼーション法）。
-            # 修正⑤: 旧実装は _pass1_prev_label_pcs = None で初期化し、
-            # 初回イテレーション後の比較が「dict == None」→ 常に False となっていた。
-            # ラベルが1回目で既に安定していても必ず2回目のパスが走る無駄があった。
-            # 修正後: 初期値を「空の dict に絶対マッチしない番兵」として
-            # object() を使う。これにより初回に収束したケースも正しく break できる。
-            # （空ソースや全ラベルが .equ のみのケースで1パス節約できる）
-            MAX_RELAX = 8
-            _SENTINEL = object()
-            self.state._pass1_prev_label_pcs = _SENTINEL
-
-            # Fix 5: リラクゼーションループの先頭で labels = {} にリセットすると
-            # -i オプションでインポートしたラベルも消えてしまう。
-            # インポート済みラベルをスナップショットして毎イテレーション先頭で復元する。
-            _imported_labels = dict(self.state.labels)
-
-            # 修正⑧: vars（a-z 変数）もリラクゼーションループ先頭でリセットする。
-            # 各命令の先頭でも per-instruction リセットが入るため実害は少ないが、
-            # 最後の命令後に残った値がパス間で持ち越されないよう明示的にクリアする。
-            _initial_vars = list(self.state.vars)
-
-            for relax_iter in range(MAX_RELAX):
+        # Fix 5: run() 全体を try/finally で囲み、KeyboardInterrupt や
+        # 予期しない例外で中断された場合にも stdin 用一時ファイルを確実に
+        # 削除する。旧実装はクリーンアップが関数末尾にあるだけで、途中で
+        # 例外が飛ぶと一時ファイルが残り続けていた。
+        try:
+            # --- Assemble ---
+            if args.sourcefile is None:
+                # Interactive / stdin mode (single pass)
                 self.state.pc = 0
-                self.state.pas = 1
+                self.state.pas = 0
                 self.state.ln = 1
-                # インポートラベルを保持しつつ、前回イテレーションのアドレスラベルをリセット
-                self.state.labels = dict(_imported_labels)
-                self.state.sections = {}
-                self.state.export_labels = {}
-                # ソース内の .setsym / .clearsym が前回イテレーションで
-                # symbols を変化させている可能性があるため、
-                # パターンファイル読み込み直後の状態（patsymbols）に毎回リセットする。
-                self.state.symbols = dict(self.state.patsymbols)
-                # 修正⑧: vars をリラクゼーション開始時の状態に戻す
-                self.state.vars = list(_initial_vars)
+                self.state.current_file = "(stdin)"
+                while True:
+                    self.printaddr(self.state.pc)
+                    try:
+                        line = input(">> ")
+                        line = line.replace("\\\\", "\\")
+                    except EOFError:
+                        break
+                    line = line.strip()
+                    if line == "":
+                        continue
+                    if line == "?":
+                        self.label_manager.printlabels()
+                        continue
+                    self.lineassemble0(line)
+            else:
+                # Two-pass file assembly with pass1 relaxation.
+                #
+                # 可変長命令アーキテクチャでは、forward参照ラベルを 0 と仮定した
+                # pass1 のサイズ推定が間違い、pass2 でアドレスがずれることがある。
+                # 対策: pass1 を最大 MAX_RELAX 回繰り返し、全ラベルの PC が
+                # 前回と一致したら収束とみなして pass2 に進む（リラクゼーション法）。
+                # 修正⑤: 旧実装は _pass1_prev_label_pcs = None で初期化し、
+                # 初回イテレーション後の比較が「dict == None」→ 常に False となっていた。
+                # ラベルが1回目で既に安定していても必ず2回目のパスが走る無駄があった。
+                # 修正後: 初期値を「空の dict に絶対マッチしない番兵」として
+                # object() を使う。これにより初回に収束したケースも正しく break できる。
+                # （空ソースや全ラベルが .equ のみのケースで1パス節約できる）
+                MAX_RELAX = 8
+                _SENTINEL = object()
+                self.state._pass1_prev_label_pcs = _SENTINEL
+
+                # Fix 5: リラクゼーションループの先頭で labels = {} にリセットすると
+                # -i オプションでインポートしたラベルも消えてしまう。
+                # インポート済みラベルをスナップショットして毎イテレーション先頭で復元する。
+                _imported_labels = dict(self.state.labels)
+
+                # 修正⑧: vars（a-z 変数）もリラクゼーションループ先頭でリセットする。
+                # 各命令の先頭でも per-instruction リセットが入るため実害は少ないが、
+                # 最後の命令後に残った値がパス間で持ち越されないよう明示的にクリアする。
+                _initial_vars = list(self.state.vars)
+
+                for relax_iter in range(MAX_RELAX):
+                    self.state.pc = 0
+                    self.state.pas = 1
+                    self.state.ln = 1
+                    # インポートラベルを保持しつつ、前回イテレーションのアドレスラベルをリセット
+                    self.state.labels = dict(_imported_labels)
+                    self.state.sections = {}
+                    self.state.export_labels = {}
+                    # ソース内の .setsym / .clearsym が前回イテレーションで
+                    # symbols を変化させている可能性があるため、
+                    # パターンファイル読み込み直後の状態（patsymbols）に毎回リセットする。
+                    self.state.symbols = dict(self.state.patsymbols)
+                    # 修正⑧: vars をリラクゼーション開始時の状態に戻す
+                    self.state.vars = list(_initial_vars)
+                    self.fileassemble(args.sourcefile)
+
+                    # Fix ⑥-2: 収束スナップショットに PC 値だけでなくセクション帰属も含める。
+                    # 旧実装は {label: pc} のみを比較していたため、.section ディレクティブの
+                    # 動的切り替えによってラベルのセクション帰属が変動し続けるケースで
+                    # PC が安定した時点で収束と誤判定していた。
+                    # (pc, section) のペアで比較することで両方が安定して初めて収束と判定する。
+                    current_pcs = {k: (v[0], v[1]) for k, v in self.state.labels.items()}
+                    # Fix ⑤: UNDEF (= 0xff...ff) が PC 値として混入している場合、
+                    # 前後のパスで同じ UNDEF ならば「収束」と誤判定されてしまう。
+                    # 実際にはアドレスが確定していないので収束していない。
+                    # UNDEF を含むラベルがひとつでも存在するなら収束とみなさない。
+                    #
+                    # Fix ⑮ (新規): UNDEF に加減算したような UNDEF 由来の値も検出する。
+                    # UNDEF = 2^256 - 1 なので、現実のアセンブラで PC が 2^128 を
+                    # 超えることはない。2^128 以上の値をすべて「UNDEF 由来」として扱い、
+                    # 誤収束を防ぐ。
+                    _UNDEF_THRESHOLD = 1 << 128
+                    has_undef = any(
+                        pc == UNDEF or pc >= _UNDEF_THRESHOLD
+                        for (pc, _sec) in current_pcs.values()
+                    )
+                    # 修正⑤: _SENTINEL との比較は必ず False なので初回は無条件続行。
+                    # 2回目以降は前回と一致しかつ UNDEF がなければ収束と判定できる。
+                    if (not has_undef
+                            and self.state._pass1_prev_label_pcs is not _SENTINEL
+                            and current_pcs == self.state._pass1_prev_label_pcs):
+                        if self.state.debug:
+                            print(f"Pass1 relaxation converged after {relax_iter + 1} iteration(s)", file=sys.stderr)
+                        break   # 収束
+                    self.state._pass1_prev_label_pcs = current_pcs
+                else:
+                    # 収束しなかった場合の詳細情報
+                    print("WARNING: Pass1 relaxation did not converge after {0} iterations.".format(MAX_RELAX), 
+                          file=sys.stderr)
+                    print("         Generated code may have incorrect addresses for", file=sys.stderr)
+                    print("         variable-length instructions with forward references.", file=sys.stderr)
+                    if self.state.debug and isinstance(self.state._pass1_prev_label_pcs, dict):
+                        # デバッグモードでは変化したラベルを表示
+                        changed = []
+                        for k in current_pcs:
+                            if k in self.state._pass1_prev_label_pcs:
+                                if current_pcs[k] != self.state._pass1_prev_label_pcs[k]:
+                                    changed.append(k)
+                        if changed:
+                            print(f"         Labels still changing: {', '.join(changed[:10])}", file=sys.stderr)
+
+                self.state.pc = 0
+                self.state.pas = 2
+                self.state.ln = 1
+                self.state.relocations = []   # pass2 でリロケーションを新規収集
                 self.fileassemble(args.sourcefile)
 
-                # Fix ⑥-2: 収束スナップショットに PC 値だけでなくセクション帰属も含める。
-                # 旧実装は {label: pc} のみを比較していたため、.section ディレクティブの
-                # 動的切り替えによってラベルのセクション帰属が変動し続けるケースで
-                # PC が安定した時点で収束と誤判定していた。
-                # (pc, section) のペアで比較することで両方が安定して初めて収束と判定する。
-                current_pcs = {k: (v[0], v[1]) for k, v in self.state.labels.items()}
-                # Fix ⑤: UNDEF (= 0xff...ff) が PC 値として混入している場合、
-                # 前後のパスで同じ UNDEF ならば「収束」と誤判定されてしまう。
-                # 実際にはアドレスが確定していないので収束していない。
-                # UNDEF を含むラベルがひとつでも存在するなら収束とみなさない。
-                #
-                # Fix ⑮ (新規): UNDEF に加減算したような UNDEF 由来の値も検出する。
-                # UNDEF = 2^256 - 1 なので、現実のアセンブラで PC が 2^128 を
-                # 超えることはない。2^128 以上の値をすべて「UNDEF 由来」として扱い、
-                # 誤収束を防ぐ。
-                _UNDEF_THRESHOLD = 1 << 128
-                has_undef = any(
-                    pc == UNDEF or pc >= _UNDEF_THRESHOLD
-                    for (pc, _sec) in current_pcs.values()
-                )
-                # 修正⑤: _SENTINEL との比較は必ず False なので初回は無条件続行。
-                # 2回目以降は前回と一致しかつ UNDEF がなければ収束と判定できる。
-                if (not has_undef
-                        and self.state._pass1_prev_label_pcs is not _SENTINEL
-                        and current_pcs == self.state._pass1_prev_label_pcs):
-                    if self.state.debug:
-                        print(f"Pass1 relaxation converged after {relax_iter + 1} iteration(s)", file=sys.stderr)
-                    break   # 収束
-                self.state._pass1_prev_label_pcs = current_pcs
-            else:
-                # 収束しなかった場合の詳細情報
-                print("WARNING: Pass1 relaxation did not converge after {0} iterations.".format(MAX_RELAX), 
+            self.binary_writer.flush()
+
+            # --- ELF relocatable object file ---
+            if self.state.elf_objfile:
+                self.write_elf_obj(self.state.elf_objfile, self.state.elf_machine)
+
+            # --- Export labels ---
+            # -e と -E が同時に指定された場合は警告を出し、両方を別々に出力する。
+            # 以前は -E が -e をサイレントに上書きしていた。
+            if self.state.expfile_elf and self.state.expfile:
+                print(f"warning: both -e '{self.state.expfile}' and -E '{self.state.expfile_elf}' specified; "
+                      f"exporting plain format to -e and ELF format to -E separately.",
                       file=sys.stderr)
-                print("         Generated code may have incorrect addresses for", file=sys.stderr)
-                print("         variable-length instructions with forward references.", file=sys.stderr)
-                if self.state.debug and isinstance(self.state._pass1_prev_label_pcs, dict):
-                    # デバッグモードでは変化したラベルを表示
-                    changed = []
-                    for k in current_pcs:
-                        if k in self.state._pass1_prev_label_pcs:
-                            if current_pcs[k] != self.state._pass1_prev_label_pcs[k]:
-                                changed.append(k)
-                    if changed:
-                        print(f"         Labels still changing: {', '.join(changed[:10])}", file=sys.stderr)
 
-            self.state.pc = 0
-            self.state.pas = 2
-            self.state.ln = 1
-            self.state.relocations = []   # pass2 でリロケーションを新規収集
-            self.fileassemble(args.sourcefile)
+            def _write_export(path, elf):
+                h   = list(self.state.export_labels.items())
+                key = list(self.state.sections.keys())
+                with open(path, 'wt') as label_file:
+                    for i in key:
+                        if i == '.text' and elf == 1:
+                            flag = 'AX'
+                        elif i == '.data' and elf == 1:
+                            flag = 'WA'
+                        else:
+                            flag = ''
+                        start = self.state.sections[i][0]
+                        label_file.write(
+                            f"{i}\t{start:#x}\t{self.state.sections[i][1]:#x}\t{flag}\n"
+                        )
+                    for i in h:
+                        label_file.write(f"{i[0]}\t{i[1][0]:#x}\n")
 
-        self.binary_writer.flush()
+            if self.state.expfile:
+                _write_export(self.state.expfile, elf=0)
+            if self.state.expfile_elf:
+                _write_export(self.state.expfile_elf, elf=1)
 
-        # --- ELF relocatable object file ---
-        if self.state.elf_objfile:
-            self.write_elf_obj(self.state.elf_objfile, self.state.elf_machine)
-
-        # --- Export labels ---
-        # -e と -E が同時に指定された場合は警告を出し、両方を別々に出力する。
-        # 以前は -E が -e をサイレントに上書きしていた。
-        if self.state.expfile_elf and self.state.expfile:
-            print(f"warning: both -e '{self.state.expfile}' and -E '{self.state.expfile_elf}' specified; "
-                  f"exporting plain format to -e and ELF format to -E separately.",
-                  file=sys.stderr)
-
-        def _write_export(path, elf):
-            h   = list(self.state.export_labels.items())
-            key = list(self.state.sections.keys())
-            with open(path, 'wt') as label_file:
-                for i in key:
-                    if i == '.text' and elf == 1:
-                        flag = 'AX'
-                    elif i == '.data' and elf == 1:
-                        flag = 'WA'
-                    else:
-                        flag = ''
-                    start = self.state.sections[i][0]
-                    label_file.write(
-                        f"{i}\t{start:#x}\t{self.state.sections[i][1]:#x}\t{flag}\n"
-                    )
-                for i in h:
-                    label_file.write(f"{i[0]}\t{i[1][0]:#x}\n")
-
-        if self.state.expfile:
-            _write_export(self.state.expfile, elf=0)
-        if self.state.expfile_elf:
-            _write_export(self.state.expfile_elf, elf=1)
-
-        # stdin 用一時ファイルをクリーンアップ
-        if self.state.stdin_tmp_path and os.path.exists(self.state.stdin_tmp_path):
-            try:
-                os.remove(self.state.stdin_tmp_path)
-            except OSError:
-                pass
-            self.state.stdin_tmp_path = None
+        finally:
+            # Fix 5: KeyboardInterrupt や未捕捉例外でも一時ファイルを確実に削除する。
+            if self.state.stdin_tmp_path and os.path.exists(self.state.stdin_tmp_path):
+                try:
+                    os.remove(self.state.stdin_tmp_path)
+                except OSError:
+                    pass
+                self.state.stdin_tmp_path = None
 
 
 def main():
