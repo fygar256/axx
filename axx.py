@@ -860,7 +860,13 @@ class LabelManager:
             return False
         
         self.state.error_label_conflict = False
-        self.state.labels[k] = [v, s, is_equ]
+        # Fix 1 (new): is_imported フラグ（第4要素）を保持する。
+        # imp_label() が [v, sec, True, True] の4要素で登録したラベルを
+        # put_value() が3要素リストで上書きすると is_imported が失われ、
+        # write_elf_obj() がインポートラベルをローカルシンボルに格下げしてしまう。
+        existing = self.state.labels.get(k)
+        is_imported = (existing is not None and len(existing) > 3 and existing[3])
+        self.state.labels[k] = [v, s, is_equ, is_imported]
         return True
 
     def printlabels(self):
@@ -1068,9 +1074,6 @@ class ExpressionEvaluator:
                 # 旧実装はエラーなしに続行し、パース位置がずれたまま処理が続いていた。
                 print(" error - missing closing ')' in expression.")
         # Fix ⑥: 境界チェックを idx+4<=len(s) に統一する。
-        # 旧実装の idx+4<len(s) は末尾ちょうど4文字のケースを除外していた。
-        # Python のスライスは範囲外でも安全だが、明示的な境界チェックは
-        # 正確に「4文字以上残っているか」を表す <= が正しい。
         elif idx+4<=len(s) and s[idx:idx+4]=="'\\t'":
             x=0x09
             idx+=4
@@ -1083,9 +1086,6 @@ class ExpressionEvaluator:
         elif idx+4<=len(s) and s[idx:idx+4]=="'\\n'":
             x=0x0a
             idx+=4
-        # Fix 12: 4文字エスケープリテラルの追加。旧実装は '\t' '\'' '\\' '\n' しか
-        # ハンドルしておらず、'\0' は ord('\') == 92 として誤解釈されていた。
-        # 一般的なCエスケープシーケンスをすべて網羅する。
         elif idx+4<=len(s) and s[idx:idx+4]=="'\\0'":
             x=0x00
             idx+=4
@@ -1104,8 +1104,12 @@ class ExpressionEvaluator:
         elif idx+4<=len(s) and s[idx:idx+4]=="'\\v'":
             x=0x0b
             idx+=4
-        # Fix 4: idx+3 <= len(s) に変更（文字列末尾3文字が 'x' の場合も正しくマッチ）
-        elif idx+3<=len(s) and s[idx]=='\'' and s[idx+2]=='\'':
+        # Fix 3 (new): 4文字エスケープリテラルをすべて上で処理してから
+        # 3文字一般リテラル 'x' を処理する。これにより '\0' '\r' などが
+        # バックスラッシュをそのまま ord('\\')=92 として返す誤りを防ぐ。
+        # 3文字判定は「s[idx+1] がバックスラッシュでない」ことを確認してから行う。
+        # Fix 4 (original): idx+3 <= len(s) に変更（末尾3文字も正しくマッチ）
+        elif idx+3<=len(s) and s[idx]=='\'' and s[idx+1] != '\\' and s[idx+2]=='\'':
             x=ord(s[idx+1])
             idx+=3
         elif StringUtils.q(s, '$$', idx):
@@ -1240,7 +1244,25 @@ class ExpressionEvaluator:
         x, idx = self.factor(s, idx)
         while idx < len(s) and StringUtils.q(s, '**', idx):
             t, idx = self.factor(s, idx + 2)
-            x = x ** t
+            # Fix 4 (new): 指数の安全チェック。
+            # ① t が負 → Python では float になり後続ビット演算が TypeError になる。
+            #   整数 x の場合は 0 を返す（x**(-n) は実数だがアセンブラ文脈では無意味）。
+            # ② t が非常に大きな整数 → メモリと時間を天文学的に消費する。
+            #   現実的なアセンブラで指数が 1024 を超えることはないため上限を設ける。
+            _EXP_MAX = 1024
+            try:
+                t_int = int(t)
+            except (ValueError, OverflowError):
+                t_int = 0
+            if t_int < 0:
+                self.err("Negative exponent in ** expression; result set to 0.")
+                x = 0
+                break
+            if t_int > _EXP_MAX:
+                self.err(f"Exponent {t_int} exceeds maximum {_EXP_MAX} in ** expression; result set to 0.")
+                x = 0
+                break
+            x = x ** t_int
         return x, idx
     
     def term0(self, s, idx):
@@ -1254,12 +1276,19 @@ class ExpressionEvaluator:
                 t, idx = self.term0_0(s, idx + 2)
                 if t == 0:
                     self.err("Division by 0 error.")
+                    # Fix 1 (new): ゼロ除算時は x を 0 に確定して while を抜ける。
+                    # 旧実装は err() が -1 を返すだけで例外を投げないため、x が前の値の
+                    # まま while ループが継続し、誤った値が後続の演算に伝播していた。
+                    x = 0
+                    break
                 else:
                     x //= t
             elif s[idx] == '/':
                 t, idx = self.term0_0(s, idx + 1)
                 if t == 0:
                     self.err("Division by 0 error.")
+                    x = 0
+                    break
                 else:
                     # 整数同士で割り切れる場合は int のまま返して 53bit float 精度落ちを防ぐ。
                     # 割り切れない場合（真の実数除算）は float で返す。
@@ -1272,6 +1301,8 @@ class ExpressionEvaluator:
                 t, idx = self.term0_0(s, idx + 1)
                 if t == 0:
                     self.err("Division by 0 error.")
+                    x = 0
+                    break
                 else:
                     x = x % t
             else:
@@ -1796,8 +1827,15 @@ class DirectiveProcessor:
         if len(i) == 0 or i[0] != '.padding':
             return False
         
-        if len(i) >= 3:
+        # Fix 6 (new): パターン行のフィールド配置は
+        #   i[0]=cmd, i[1]=error式, i[2]=obj式（padding値）
+        # だが、省略形 `.padding :: value` では i[1]='value', i[2] が欠如する。
+        # 旧実装は i[2] だけ見ていたため省略形では常に v=0 になっていた。
+        # 修正: i[2] が存在する場合は i[2] を、そうでなければ i[1] を値として読む。
+        if len(i) >= 3 and i[2] != '':
             v, idx = self.expr_eval.expression_pat(i[2], 0)
+        elif len(i) >= 2 and i[1] != '':
+            v, idx = self.expr_eval.expression_pat(i[1], 0)
         else:
             v = 0
         self.state.padding = int(v)
@@ -2180,9 +2218,15 @@ class PatternMatcher:
                     continue
             elif a in LOWER:
                 idx_t += 1
+                prev_idx_s = idx_s
                 w, idx_s = self.parser.get_symbol_word(s, idx_s)
                 v = self.symbol_manager.get(w)
                 if v == "":
+                    return False
+                # Fix 5 (new): get_symbol_word がソース位置を進めなかった場合
+                # （ソース側が空白やNULなど）、continue するとループが止まらなくなる。
+                # idx_s が変化しなければマッチ失敗として扱う。
+                if idx_s == prev_idx_s:
                     return False
                 self.var_manager.put(a, v)
                 continue
@@ -2392,7 +2436,12 @@ class ObjectGenerator:
                         comma_pos = i
                     i += 1
                 
-                if comma_pos > 0:
+                # Fix 4 (new): comma_pos > 0 では expr_start==0 のとき（パターン行の
+                # 先頭が @@[ の場合）でもカンマがあれば正しく展開できるはずが、
+                # comma_pos==0 を除外してしまっていた。
+                # 正しくは「カンマが式の開始位置より後にある」こと、つまり
+                # comma_pos >= expr_start かつ comma_pos > 0 かつ式が空でないこと。
+                if comma_pos > 0 and comma_pos >= expr_start:
                     expr = pattern[expr_start:comma_pos]
                     rep_pattern = pattern[comma_pos+1:i]
                     
@@ -2701,6 +2750,9 @@ class AssemblyDirectiveProcessor:
         idx += 1
         
         while idx < len(l2) and not l2[idx]=='"':
+            # Fix 5 (new): ch=None をセンチネルとして使い、エラー時は outbin をスキップ。
+            # None のまま下まで到達した場合はバイトを出力しない。
+            ch = None
             if l2[idx:idx+2] == '\\0':
                 idx += 2
                 ch = chr(0)
@@ -2713,7 +2765,7 @@ class AssemblyDirectiveProcessor:
             elif l2[idx:idx+2] == '\\r':
                 idx += 2
                 ch = '\r'
-            elif l2[idx:idx+2] == '\\\\'  :
+            elif l2[idx:idx+2] == '\\\\':
                 idx += 2
                 ch = '\\'
             elif l2[idx:idx+2] == '\\"':
@@ -2726,19 +2778,21 @@ class AssemblyDirectiveProcessor:
                 while idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF' and len(hex_str) < 2:
                     hex_str += l2[idx]
                     idx += 1
-                # Fix 1: \x の直後に16進数字がない場合はエラーを報告する。
-                # 旧実装はサイレントに 'x' という文字を出力していたため、
-                # 誤ったバイナリが静かに生成されていた。
                 if hex_str:
                     ch = chr(int(hex_str, 16))
                 else:
+                    # Fix 5: \x の直後に16進数字がない場合、エラーを報告して
+                    # ディレクティブ全体を失敗扱いにする（return False）。
+                    # ch=None のままループを続けると後続の文字が出力されてしまい、
+                    # バイナリが部分的に変化する問題があった。
                     print(f" error - '\\x' escape requires at least one hex digit in string: {l2!r}")
-                    ch = '\x00'  # NUL でフォールバック（後続処理を継続させる）
+                    return False
             else:
                 ch = l2[idx]
                 idx += 1
-            self.binary_writer.outbin(self.state.pc, ord(ch))
-            self.state.pc += 1
+            if ch is not None:
+                self.binary_writer.outbin(self.state.pc, ord(ch))
+                self.state.pc += 1
         return True
     
     def export_processing(self, l1, l2):
@@ -2823,10 +2877,7 @@ class AssemblyDirectiveProcessor:
             return False
         
         if l2 != '':
-            # Fix 3: セクションを切り替える前に現在セクションの暫定サイズを更新する。
-            # .text → .data → .text のような非連続配置でも、各ブロックの
-            # コンテンツが最終的なサイズ計算から漏れないようにする。
-            # ENDSECTION で正式にサイズが確定している場合（size > 0）は上書きしない。
+            # Fix 3 (original): セクションを切り替える前に現在セクションの暫定サイズを更新する。
             old_sec = self.state.current_section
             if old_sec in self.state.sections:
                 old_entry = self.state.sections[old_sec]
@@ -2836,16 +2887,19 @@ class AssemblyDirectiveProcessor:
                         old_entry[1] = tentative
 
             self.state.current_section = l2
-            # 同名セクションが再宣言された場合（.text→.data→.text など）は
-            # 最初に記録した開始アドレスを保護する。
-            # ただし再宣言された場合はサイズをリセットして再測定する。
             if l2 not in self.state.sections:
                 self.state.sections[l2] = [self.state.pc, 0]
             else:
-                # 同一セクションの再宣言: start を最小値として保持し
-                # size は 0 にリセットして再測定させる。
+                # Fix 2 (new): 同一セクションの再宣言時、ENDSECTION で確定済みのサイズ
+                # （size > 0）を Fix 3 のリセット処理が消してしまう問題を修正する。
+                # 再宣言された場合は start を最小値として保持するが、
+                # size はすでに ENDSECTION で確定していれば（> 0）リセットしない。
+                # まだ未確定（== 0）のときだけリセットして再測定させる。
                 existing_start = self.state.sections[l2][0]
-                self.state.sections[l2] = [min(existing_start, self.state.pc), 0]
+                existing_size  = self.state.sections[l2][1]
+                new_start = min(existing_start, self.state.pc)
+                # ENDSECTION 確定済みサイズは保護する
+                self.state.sections[l2] = [new_start, existing_size]
         return True
     
     def align_processing(self, l1, l2):
@@ -2888,6 +2942,12 @@ class AssemblyDirectiveProcessor:
                 print(f" error - .ORG argument contains undefined label.")
             return True
         u = int(u)
+        # Fix 3 (new): 負のアドレスは不正。PC が負になると outbin・align_ で
+        # 負のインデックスが生じ、バイナリ出力が壊れる。
+        if u < 0:
+            if self.state.pas == 2 or self.state.pas == 0:
+                print(f" error - .ORG address must be non-negative, got {u}.")
+            return True
         if idx + 2 <= len(l2) and l2[idx:idx+2].upper() == ',P':
             if u > self.state.pc:
                 for i in range(u - self.state.pc):
@@ -2956,9 +3016,18 @@ class Assembler:
             return 0, [], True, idx
         if self.asm_directive_proc.zero_processing(l, l2):
             return 0, [], True, idx
-        if self.asm_directive_proc.ascii_processing(l, l2):
+        # Fix 2 (new): ascii_processing / asciiz_processing は
+        # ① ディレクティブ名が一致しない → False（次のディレクティブへ）
+        # ② ディレクティブ名は一致したが内容エラー → False（asciistr が False を返す）
+        # の2通りで False を返す。旧実装は両方を「ディレクティブ不一致」として扱い、
+        # エラー時にパターンスキャンへ落ちて誤った「構文エラー」が報告されていた。
+        # 修正: ディレクティブ名が一致するかどうかを先に確認してから戻り値を判定する。
+        _l_upper = StringUtils.upper(l)
+        if _l_upper == '.ASCII':
+            self.asm_directive_proc.ascii_processing(l, l2)
             return 0, [], True, idx
-        if self.asm_directive_proc.asciiz_processing(l, l2):
+        if _l_upper == '.ASCIIZ':
+            self.asm_directive_proc.asciiz_processing(l, l2)
             return 0, [], True, idx
         if self.include_asm(l, l2):
             return 0, [], True, idx
@@ -3137,7 +3206,10 @@ class Assembler:
     
     def lineassemble(self, line):
         """Assemble single line"""
-        line = line.replace('\t', ' ').replace('\n', '')
+        # Fix 6 (new): \r は lineassemble0 で除去されるが、.INCLUDE 経由など
+        # lineassemble() が直接呼ばれる経路では \r が残る場合がある。
+        # ここでも除去して入力を確実に正規化する。
+        line = line.replace('\t', ' ').replace('\n', '').replace('\r', '')
         line = StringUtils.reduce_spaces(line)
         line = StringUtils.remove_comment_asm(line)
         if line == '':
@@ -3681,14 +3753,34 @@ class Assembler:
         # 3. Build symbol table (.symtab) and string table (.strtab)          #
         # ------------------------------------------------------------------ #
         def _find_shndx(byte_addr):
-            """Return (elf_section_1based, offset_from_section_start)."""
+            """Return (elf_section_1based, value_within_section).
+
+            Fix 7 (new): byte_addr == 0 のとき、すべてのセクションが
+            byte_start > 0 であると範囲外になり SHN_ABS(0xfff1) が返っていた。
+            アドレス 0 のラベルは先頭セクションの先頭に属するとみなすのが正しい。
+            また byte_size == 0 のセクションが複数あるケースでも
+            byte_addr == byte_start の最初の一致を返す。
+            """
+            # まず通常の範囲チェック（byte_size > 0 のセクションを優先）
             for i, s in enumerate(csecs):
-                if s.byte_start <= byte_addr < s.byte_start + s.byte_size:
+                if s.byte_size > 0 and s.byte_start <= byte_addr < s.byte_start + s.byte_size:
                     return i + 1, byte_addr - s.byte_start
-                # label exactly at section start when size==0
+            # サイズ 0 セクションの先頭一致
+            for i, s in enumerate(csecs):
                 if s.byte_size == 0 and byte_addr == s.byte_start:
                     return i + 1, 0
-            return 0xfff1, byte_addr   # SHN_ABS
+            # Fix 7: 範囲外の場合、最もアドレスが近い（かつ byte_addr 以下の）
+            # セクションに帰属させる。これにより byte_addr==0 でも先頭セクションに
+            # 正しく帰属し、SHN_ABS への誤フォールバックを防ぐ。
+            if csecs:
+                best_i = 0
+                best_start = csecs[0].byte_start
+                for i, s in enumerate(csecs):
+                    if s.byte_start <= byte_addr and s.byte_start >= best_start:
+                        best_i = i
+                        best_start = s.byte_start
+                return best_i + 1, byte_addr - csecs[best_i].byte_start
+            return 0xfff1, byte_addr   # SHN_ABS（セクションが一切ない場合のみ）
 
         strtab = bytearray(b'\x00')
         syms   = []
@@ -3954,28 +4046,27 @@ class Assembler:
         self.state.osabi        = osabitbl.get(args.elf_osabi, 9)
         self.state.debug        = args.debug
 
-        # Load pattern file
-        self.state.pat = self.pattern_reader.readpat(args.patternfile)
-        self.setpatsymbols(self.state.pat)
-
-        # Import labels
-        if self.state.impfile:
-            with open(self.state.impfile, 'rt') as label_file:
-                for l in label_file:
-                    self.imp_label(l)
-
-        # Remove stale output file before writing
-        if self.state.outfile:
-            try:
-                os.remove(self.state.outfile)
-            except OSError:
-                pass
-
-        # Fix 5: run() 全体を try/finally で囲み、KeyboardInterrupt や
-        # 予期しない例外で中断された場合にも stdin 用一時ファイルを確実に
-        # 削除する。旧実装はクリーンアップが関数末尾にあるだけで、途中で
-        # 例外が飛ぶと一時ファイルが残り続けていた。
+        # Fix 5 (original) + Fix 8 (new): run() 全体を try/finally で囲む。
+        # Fix 8: readpat や impfile open もここに含めることで、パターンファイルや
+        # インポートファイルの読み込み中に例外が起きた場合も finally が確実に実行される。
         try:
+            # Load pattern file
+            self.state.pat = self.pattern_reader.readpat(args.patternfile)
+            self.setpatsymbols(self.state.pat)
+
+            # Import labels
+            if self.state.impfile:
+                with open(self.state.impfile, 'rt') as label_file:
+                    for l in label_file:
+                        self.imp_label(l)
+
+            # Remove stale output file before writing
+            if self.state.outfile:
+                try:
+                    os.remove(self.state.outfile)
+                except OSError:
+                    pass
+
             # --- Assemble ---
             if args.sourcefile is None:
                 # Interactive / stdin mode (single pass)
