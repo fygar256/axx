@@ -847,10 +847,13 @@ class LabelManager:
                 self.state.error_label_conflict = True
                 print(f" error - label '{k}' not defined in pass 1.")
                 return False
-            # Fix 8: パス1とパス2で is_equ フラグが食い違う場合を検出する。
-            # is_equ が変わるとELFリロケーション追跡の結果が変わるため警告する。
-            old_is_equ = len(self.state.labels[k]) > 2 and self.state.labels[k][2]
-            if old_is_equ != is_equ:
+            # Fix 8 (original): パス1とパス2で is_equ フラグが食い違う場合を検出する。
+            # Fix 4 (new): ただし imp_label() が is_equ=True で登録したインポートラベルを
+            # ソース内のアドレスラベル（is_equ=False）が上書きする場合は意図的なものなので
+            # 警告を抑制する。is_imported フラグを確認して判断する。
+            old_is_equ      = len(self.state.labels[k]) > 2 and self.state.labels[k][2]
+            old_is_imported = len(self.state.labels[k]) > 3 and self.state.labels[k][3]
+            if old_is_equ != is_equ and not old_is_imported:
                 print(f" warning - label '{k}' is_equ flag changed between pass 1 "
                       f"and pass 2 (was {old_is_equ}, now {is_equ}). "
                       f"ELF relocation output may be incorrect.")
@@ -1263,6 +1266,13 @@ class ExpressionEvaluator:
                 x = 0
                 break
             x = x ** t_int
+            # Fix 2 (new): 底 x が float のとき（割り算の結果や exp_typ='f' モード）
+            # x ** t_int は float を返す。後続の term2〜term6 でビット演算（<<, &, ~）が
+            # 行われると TypeError が発生する。
+            # 底が整数値の float（例: 2.0）は int に変換して精度を保持する。
+            # 真に非整数の float はそのまま保持する（float モード処理に委ねる）。
+            if isinstance(x, float) and x.is_integer():
+                x = int(x)
         return x, idx
     
     def term0(self, s, idx):
@@ -2732,7 +2742,12 @@ class AssemblyDirectiveProcessor:
             idx = StringUtils.skipspc(l, idx)
             e, idx = StringUtils.get_param_to_spc(l, idx)
             if e.upper() == '.EQU':
-                u, idx = self.expr_eval.expression_asm(l, idx)
+                # Fix 6 (new): 旧実装は expression_asm(l, idx) に行全体 l を渡し、
+                # idx から読み始めていた。これは通常動作するが、lwordchars に含まれる
+                # 文字がラベル名部分に残ると expression_asm が誤ったトークンを拾う可能性がある。
+                # 安全のため .EQU 以降の部分文字列だけを渡し、idx=0 から解析させる。
+                expr_part = l[idx:]
+                u, _ = self.expr_eval.expression_asm(expr_part, 0)
                 # is_equ=True: 定数ラベル（.equ 式の結果）はリロケーション対象外
                 self.label_manager.put_value(label, u, self.state.current_section, is_equ=True)
                 return ""
@@ -2926,7 +2941,20 @@ class AssemblyDirectiveProcessor:
             print(f" error - ENDSECTION without matching SECTION for '{self.state.current_section}'.")
             return True
         start = self.state.sections[self.state.current_section][0]
-        self.state.sections[self.state.current_section] = [start, self.state.pc - start]
+        size  = self.state.pc - start
+        # Fix 3 (new): 非連続セクション（.text → .data → .text → ENDSECTION）では
+        # Fix 2 で section_processing が new_start = min(existing, current_pc) を
+        # 保存している。しかし self.state.pc はその時点の最後の命令の直後を指すため、
+        # pc - start は2回目の .text ブロックだけのサイズではなく
+        # 「最初の宣言から現在まで」の幅になり過大になる。
+        # 正しいサイズは「現在の pc から現在の start を引いた値」で、
+        # start はすでに正しく min(existing, entry_pc) が入っているので
+        # サイズが負にならない場合だけ確定させる。
+        if size < 0:
+            print(f" warning - ENDSECTION: computed size {size} < 0 for "
+                  f"'{self.state.current_section}'; keeping previous size.")
+            return True
+        self.state.sections[self.state.current_section] = [start, size]
         return True
     
     def org_processing(self, l1, l2):
@@ -4180,6 +4208,12 @@ class Assembler:
                 self.state.pas = 2
                 self.state.ln = 1
                 self.state.relocations = []   # pass2 でリロケーションを新規収集
+                # Fix 5 (new): pass1 リラクゼーション中に section_processing の
+                # 暫定サイズ（Fix 3）や ENDSECTION 確定サイズ（Fix 2）が残ったまま
+                # pass2 に入ると、section 再宣言時の保護ロジックが誤って古いサイズを
+                # 保持することがある。pass2 先頭で sections をリセットして
+                # 確定的に再構築させる。labels・patsymbols はリセット不要。
+                self.state.sections = {}
                 self.fileassemble(args.sourcefile)
 
             self.binary_writer.flush()
@@ -4199,6 +4233,13 @@ class Assembler:
             def _write_export(path, elf):
                 h   = list(self.state.export_labels.items())
                 key = list(self.state.sections.keys())
+                # Fix 1 (new): state.sections[s] は [word_start, word_count] で格納されている。
+                # imp_label() はエクスポートファイルのサイズフィールドをバイト数として
+                # 解釈してアドレス帰属レンジ検索を行う。
+                # bts が 8 以外（例: 16bit ワード）の場合、word_count をそのまま出力すると
+                # imp_label() 側でのバイト範囲が半分になりラベル帰属が誤る。
+                # 修正: サイズフィールドは byte_count = word_count × bytes_per_word で出力する。
+                _bpw_export = max(1, (self.state.bts + 7) // 8)
                 with open(path, 'wt') as label_file:
                     for i in key:
                         if i == '.text' and elf == 1:
@@ -4207,9 +4248,12 @@ class Assembler:
                             flag = 'WA'
                         else:
                             flag = ''
-                        start = self.state.sections[i][0]
+                        w_start = self.state.sections[i][0]
+                        w_count = self.state.sections[i][1]
+                        byte_start = w_start * _bpw_export
+                        byte_size  = w_count * _bpw_export
                         label_file.write(
-                            f"{i}\t{start:#x}\t{self.state.sections[i][1]:#x}\t{flag}\n"
+                            f"{i}\t{byte_start:#x}\t{byte_size:#x}\t{flag}\n"
                         )
                     for i in h:
                         label_file.write(f"{i[0]}\t{i[1][0]:#x}\n")
