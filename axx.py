@@ -838,9 +838,20 @@ class LabelManager:
         if self.state.pas == 1 or self.state.pas == 0:
             # パス1/インタラクティブ: 同名ラベルの二重定義はエラー
             if k in self.state.labels:
-                self.state.error_label_conflict = True
-                print(f" error - label already defined.")
-                return False
+                # Fix 3 (new): インポートラベル（is_imported=True）と同名のソースラベルを
+                # 定義しようとした場合、インポートラベルはリラクゼーション先頭で
+                # _imported_labels から復元されるため「既存ラベル」として検出される。
+                # しかしソースラベルによるインポートラベルの上書きは正当な操作なので
+                # エラーにせず警告のみ出して続行する。
+                existing = self.state.labels[k]
+                old_is_imported = len(existing) > 3 and existing[3]
+                if old_is_imported:
+                    # インポートラベルの上書き：警告のみ（エラーにしない）
+                    pass
+                else:
+                    self.state.error_label_conflict = True
+                    print(f" error - label already defined.")
+                    return False
         elif self.state.pas == 2:
             # パス2: パス1で登録されていないラベルが新出現した場合はエラー
             if k not in self.state.labels:
@@ -2892,29 +2903,50 @@ class AssemblyDirectiveProcessor:
             return False
         
         if l2 != '':
-            # Fix 3 (original): セクションを切り替える前に現在セクションの暫定サイズを更新する。
+            # Fix 3 (original) / Fix 4 (new): セクションを切り替える前に現在セクションの
+            # 暫定サイズを更新する。暫定サイズは entry_pc（第3要素）からの差分で計算する。
+            # 旧実装は word_start（第1要素）からの全体幅を使っていたため、非連続セクションで
+            # 過大なサイズが書き込まれていた。
+            #
+            # Bugfix（暫定サイズ累積方式）:
+            # 旧実装は old_entry[1] == 0 のときだけ暫定サイズを書き込んでいた。
+            # ENDSECTION なしでセクションを複数回行き来すると、2回目以降のブロック分が
+            # 加算されず、最初のブロックのサイズのみが記録される問題があった。
+            # 修正後: sections エントリの第4要素 confirmed (bool) で
+            # ENDSECTION 確定済みサイズと暫定サイズを区別する。
+            #   confirmed=False : 暫定サイズ（累積更新可）
+            #   confirmed=True  : ENDSECTION 確定済み（上書き禁止）
             old_sec = self.state.current_section
             if old_sec in self.state.sections:
                 old_entry = self.state.sections[old_sec]
-                if old_entry[1] == 0:
-                    tentative = self.state.pc - old_entry[0]
+                _confirmed = len(old_entry) > 3 and old_entry[3]
+                if not _confirmed:
+                    # 暫定サイズ: 今回ブロック分を累積加算する
+                    _entry_pc = old_entry[2] if len(old_entry) > 2 else old_entry[0]
+                    tentative = self.state.pc - _entry_pc
                     if tentative > 0:
-                        old_entry[1] = tentative
+                        old_entry[1] += tentative
 
             self.state.current_section = l2
             if l2 not in self.state.sections:
-                self.state.sections[l2] = [self.state.pc, 0]
+                # [word_start, word_count, entry_pc, confirmed]
+                # entry_pc: このセクションに「今」入った時点の PC。
+                # ENDSECTION でのサイズ計算に使う。
+                # confirmed=False: まだ ENDSECTION で確定していない。
+                self.state.sections[l2] = [self.state.pc, 0, self.state.pc, False]
             else:
                 # Fix 2 (new): 同一セクションの再宣言時、ENDSECTION で確定済みのサイズ
-                # （size > 0）を Fix 3 のリセット処理が消してしまう問題を修正する。
-                # 再宣言された場合は start を最小値として保持するが、
-                # size はすでに ENDSECTION で確定していれば（> 0）リセットしない。
-                # まだ未確定（== 0）のときだけリセットして再測定させる。
-                existing_start = self.state.sections[l2][0]
-                existing_size  = self.state.sections[l2][1]
+                # （confirmed=True）を Fix 3 のリセット処理が消してしまう問題を修正する。
+                # start を最小値として保持し、confirmed=True なら size は保護する。
+                # entry_pc を「今回の宣言時 PC」に更新することで、
+                # ENDSECTION が「今回入ってから現在まで」の正しい差分を計算できる。
+                existing_start     = self.state.sections[l2][0]
+                existing_size      = self.state.sections[l2][1]
+                existing_confirmed = len(self.state.sections[l2]) > 3 and self.state.sections[l2][3]
                 new_start = min(existing_start, self.state.pc)
-                # ENDSECTION 確定済みサイズは保護する
-                self.state.sections[l2] = [new_start, existing_size]
+                # confirmed=True の確定済みサイズは保護する
+                # entry_pc は今回の宣言時 PC に更新
+                self.state.sections[l2] = [new_start, existing_size, self.state.pc, existing_confirmed]
         return True
     
     def align_processing(self, l1, l2):
@@ -2940,21 +2972,25 @@ class AssemblyDirectiveProcessor:
         if self.state.current_section not in self.state.sections:
             print(f" error - ENDSECTION without matching SECTION for '{self.state.current_section}'.")
             return True
-        start = self.state.sections[self.state.current_section][0]
-        size  = self.state.pc - start
-        # Fix 3 (new): 非連続セクション（.text → .data → .text → ENDSECTION）では
-        # Fix 2 で section_processing が new_start = min(existing, current_pc) を
-        # 保存している。しかし self.state.pc はその時点の最後の命令の直後を指すため、
-        # pc - start は2回目の .text ブロックだけのサイズではなく
-        # 「最初の宣言から現在まで」の幅になり過大になる。
-        # 正しいサイズは「現在の pc から現在の start を引いた値」で、
-        # start はすでに正しく min(existing, entry_pc) が入っているので
-        # サイズが負にならない場合だけ確定させる。
-        if size < 0:
-            print(f" warning - ENDSECTION: computed size {size} < 0 for "
+        entry = self.state.sections[self.state.current_section]
+        start = entry[0]
+        # Fix 2 (new): 非連続セクション（.text → .data → .text → ENDSECTION）で
+        # pc - start を使うと「最初の宣言 PC から現在まで」の幅になり過大になる。
+        # section_processing が entry_pc（第3要素）に「今回の宣言時 PC」を記録しているので
+        # それを使って「今回のブロック分」だけのサイズを計算する。
+        # 累積サイズ = 既存の確定サイズ + 今回のブロック分
+        entry_pc = entry[2] if len(entry) > 2 else start
+        block_size = self.state.pc - entry_pc
+        if block_size < 0:
+            print(f" warning - ENDSECTION: computed block size {block_size} < 0 for "
                   f"'{self.state.current_section}'; keeping previous size.")
             return True
-        self.state.sections[self.state.current_section] = [start, size]
+        # 既存の確定済みサイズに今回のブロック分を加算して確定させる。
+        # 初回（re-declaration なし）は entry[1]==0 なのでそのまま block_size になる。
+        new_size = entry[1] + block_size
+        # Bugfix: confirmed=True を第4要素として設定し、ENDSECTION 確定済みであることを記録する。
+        # section_processing の暫定サイズ更新はこのフラグを見て上書きを抑止する。
+        self.state.sections[self.state.current_section] = [start, new_size, entry_pc, True]
         return True
     
     def org_processing(self, l1, l2):
@@ -3598,7 +3634,10 @@ class Assembler:
             # 関係なく直接 labels に書き込む（上書き可）。
             # Fix 13: is_imported=True を第4フィールドとして記録し、
             # write_elf_obj() がこれを外部シンボル参照（UND）として扱えるようにする。
-            self.state.labels[label] = [v, section, True, True]  # [val, sec, is_equ, is_imported]
+            # Bugfix: is_equ は False が正しい。インポートラベルはアドレスラベルであり、
+            # 定数ラベル（.equ）ではない。True にすると _write_export() でバイト変換が
+            # スキップされ、ELF 出力でも SHN_ABS 扱いになって誤ったシンボルになる。
+            self.state.labels[label] = [v, section, False, True]  # [val, sec, is_equ, is_imported]
             return True
 
         return False
@@ -3724,7 +3763,11 @@ class Assembler:
         else:
             sec_names = list(self.state.sections.keys())
             for i, sname in enumerate(sec_names):
-                w0, wn = self.state.sections[sname]
+                # Bugfix: sections entry は [word_start, word_count, entry_pc, confirmed(opt)]
+                # の3〜4要素リストなので、2変数へのアンパックは ValueError になる。
+                # インデックス参照に変更する。
+                w0 = self.state.sections[sname][0]
+                wn = self.state.sections[sname][1]
                 if wn == 0:
                     if i + 1 < len(sec_names):
                         w1 = self.state.sections[sec_names[i + 1]][0]
@@ -4256,7 +4299,13 @@ class Assembler:
                             f"{i}\t{byte_start:#x}\t{byte_size:#x}\t{flag}\n"
                         )
                     for i in h:
-                        label_file.write(f"{i[0]}\t{i[1][0]:#x}\n")
+                        # Fix 1 (new) / Fix 5 (new): ラベルアドレス i[1][0] はワード単位の PC 値。
+                        # imp_label() はバイトアドレスとして読み込んでセクション帰属を
+                        # レンジ検索するため、bpw を掛けてバイト変換してから出力する。
+                        # ただし is_equ=True の定数ラベルは絶対値なので変換しない。
+                        lbl_is_equ = len(i[1]) > 2 and i[1][2]
+                        lbl_addr = i[1][0] if lbl_is_equ else i[1][0] * _bpw_export
+                        label_file.write(f"{i[0]}\t{lbl_addr:#x}\n")
 
             if self.state.expfile:
                 _write_export(self.state.expfile, elf=0)
