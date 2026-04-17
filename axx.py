@@ -190,8 +190,8 @@ class StringUtils:
     
     @staticmethod
     def skipspc(s, idx):
-        """Skip spaces in string"""
-        while idx < len(s) and s[idx] == ' ':
+        """Skip spaces and tabs in string"""
+        while idx < len(s) and s[idx] in ' \t':
             idx += 1
         return idx
     
@@ -875,7 +875,7 @@ class LabelManager:
         
         self.state.error_label_conflict = False
         # Fix 1 (new): is_imported フラグ（第4要素）を保持する。
-        # imp_label() が [v, sec, True, True] の4要素で登録したラベルを
+        # imp_label() が [v, sec, False, True] の4要素で登録したラベルを
         # put_value() が3要素リストで上書きすると is_imported が失われ、
         # write_elf_obj() がインポートラベルをローカルシンボルに格下げしてしまう。
         existing = self.state.labels.get(k)
@@ -2457,12 +2457,13 @@ class ObjectGenerator:
                         comma_pos = i
                     i += 1
                 
-                # Fix 4 (new): comma_pos > 0 では expr_start==0 のとき（パターン行の
-                # 先頭が @@[ の場合）でもカンマがあれば正しく展開できるはずが、
-                # comma_pos==0 を除外してしまっていた。
-                # 正しくは「カンマが式の開始位置より後にある」こと、つまり
-                # comma_pos >= expr_start かつ comma_pos > 0 かつ式が空でないこと。
-                if comma_pos > 0 and comma_pos >= expr_start:
+                # Bugfix: 旧コメントは「comma_pos > 0」が不要と指摘していたが
+                # 実装は直していなかった。`comma_pos >= 0` が正しい条件。
+                # -1 は「カンマ未発見」を意味し、0 はパターン先頭にカンマが
+                # ある合法なケース（@@[,pattern] で式が空 → n=0 として展開しない）。
+                # comma_pos >= expr_start だけで「カンマが式開始位置より後にある」
+                # ことを保証できるため、二重条件は不要だった。
+                if comma_pos >= 0 and comma_pos >= expr_start:
                     expr = pattern[expr_start:comma_pos]
                     rep_pattern = pattern[comma_pos+1:i]
                     
@@ -2587,15 +2588,18 @@ class VLIWProcessor:
                 continue
             elif idx + 2 <= len(line) and line[idx:idx+2] == '!!':
                 idx += 2
-                # Fix 14: VLIW の次スロットを lineassemble2 で処理する際、
-                # ELF追跡状態（_elf_label_refs_seen / _elf_current_word_idx）が
-                # 前スロットの値を引き継いだままになる。スロットをまたいだ
-                # word_idx の混在を防ぐため、呼び出し前にスロット単位でリセットする。
-                # (_elf_tracking フラグ自体は lineassemble() が管理するので触らない)
-                self.state._elf_label_refs_seen = []
-                self.state._elf_current_word_idx = -1
-                self.state._elf_var_to_label = {}
-                self.state._elf_capturing_var = None
+                # Bugfix: 旧実装は次スロット処理前に _elf_label_refs_seen を [] に
+                # リセットしていた。これにより最初のスロットで収集した ELF 追跡データが
+                # 消えてしまっていた。
+                #
+                # 実際には lineassemble() の finally ブロックが lineassemble2() 返却直後に
+                # _elf_tracking = False にするため、2スロット目以降の lineassemble2_func
+                # 呼び出しは _elf_tracking=False の状態で動作し、新たな追跡データは
+                # 追加されない。そのため「スロット間の word_idx 混在」の危険はなく、
+                # リセットは不要（かつ有害）だった。
+                #
+                # _elf_current_word_idx は makeobj() の finally が -1 に戻すので
+                # ここでリセットしなくて構わない。_elf_capturing_var も同様。
                 idxs, objl, flag, idx = lineassemble2_func(line, idx)
                 objs += [objl]
                 idxlst += [idxs]
@@ -2641,8 +2645,22 @@ class VLIWProcessor:
                         print(f"warning-VLIW:{len(values)} values exceed slot capacity {target_len},truncating.")
                     values = values[:target_len]
                 else:
-                    for i in range(target_len - len(values)):
+                    # Bugfix: 旧実装は `range(target_len - len(values))` 回 vliwnop を追加
+                    # していたが、vliwnop は ibyte 個のリストなので1回の追加で ibyte 個増える。
+                    # 結果として (target_len - len(values)) * ibyte 個追加され、
+                    # values が target_len の ibyte 倍まで膨れ上がっていた。
+                    # その後の `values[:target_len]` 切り捨てで長さは戻るが、
+                    # 内容は NOP ではなく命令バイトの繰り返しになるため誤ったバイナリが生成された。
+                    #
+                    # 正しい実装: 不足スロット数 = (target_len - len(values)) // ibyte 回追加。
+                    # 端数バイト（ibyte で割り切れない不足分）は 0x00 で埋める。
+                    _deficit = target_len - len(values)
+                    _full_nops, _remainder = divmod(_deficit, ibyte) if ibyte > 0 else (0, _deficit)
+                    for _ in range(_full_nops):
                         values += self.state.vliwnop
+                    # 端数: vliwnop の先頭バイトで埋める（ibyte が割り切れない異常ケース）
+                    if _remainder > 0:
+                        values += (self.state.vliwnop + [0] * _remainder)[:_remainder]
                 
                 v1 = []
                 cnt = 0
@@ -2916,16 +2934,25 @@ class AssemblyDirectiveProcessor:
             # ENDSECTION 確定済みサイズと暫定サイズを区別する。
             #   confirmed=False : 暫定サイズ（累積更新可）
             #   confirmed=True  : ENDSECTION 確定済み（上書き禁止）
+            #
+            # Bugfix2: AssemblerState の初期 current_section (".text") は
+            # sections 辞書に登録されていない。最初の SECTION ディレクティブより前に
+            # 命令を出力すると、その分が sections に記録されず write_elf_obj() で
+            # ELF に含まれなくなる。
+            # 修正: old_sec が sections 未登録の場合は、PC=0 から現在までのデータを
+            # 初期エントリとして登録してから暫定サイズを更新する。
             old_sec = self.state.current_section
-            if old_sec in self.state.sections:
-                old_entry = self.state.sections[old_sec]
-                _confirmed = len(old_entry) > 3 and old_entry[3]
-                if not _confirmed:
-                    # 暫定サイズ: 今回ブロック分を累積加算する
-                    _entry_pc = old_entry[2] if len(old_entry) > 2 else old_entry[0]
-                    tentative = self.state.pc - _entry_pc
-                    if tentative > 0:
-                        old_entry[1] += tentative
+            if old_sec not in self.state.sections:
+                # まだ登録されていない初期セクション: word_start=0, entry_pc=0 で作成
+                self.state.sections[old_sec] = [0, 0, 0, False]
+            old_entry = self.state.sections[old_sec]
+            _confirmed = len(old_entry) > 3 and old_entry[3]
+            if not _confirmed:
+                # 暫定サイズ: 今回ブロック分を累積加算する
+                _entry_pc = old_entry[2] if len(old_entry) > 2 else old_entry[0]
+                tentative = self.state.pc - _entry_pc
+                if tentative > 0:
+                    old_entry[1] += tentative
 
             self.state.current_section = l2
             if l2 not in self.state.sections:
@@ -2990,7 +3017,14 @@ class AssemblyDirectiveProcessor:
         new_size = entry[1] + block_size
         # Bugfix: confirmed=True を第4要素として設定し、ENDSECTION 確定済みであることを記録する。
         # section_processing の暫定サイズ更新はこのフラグを見て上書きを抑止する。
-        self.state.sections[self.state.current_section] = [start, new_size, entry_pc, True]
+        #
+        # Bugfix2（entry_pc 更新）: confirmed=True のまま entry_pc が古い値に残ると、
+        # その後に同一セクションへ再入して ENDSECTION する際に
+        # section_processing が entry_pc を今回の PC に更新するが（else ブランチ）、
+        # ENDSECTION は entry_pc を使って block_size を計算するため問題ない。
+        # ただし ENDSECTION 直後に next SECTION が来ず再度 ENDSECTION が来た場合、
+        # entry_pc が現在 PC を指すよう今の PC で更新しておくことで二重カウントを防ぐ。
+        self.state.sections[self.state.current_section] = [start, new_size, self.state.pc, True]
         return True
     
     def org_processing(self, l1, l2):
@@ -4127,8 +4161,24 @@ class Assembler:
 
             # Import labels
             if self.state.impfile:
+                # Bugfix: 旧実装は imp_label() を1行ずつ逐次呼び出していたため、
+                # TSVファイルでセクション行（3フィールド以上）がラベル行より後に
+                # 来るとき _imp_sections がまだ空で、ラベルが全て '.text' に
+                # 帰属されてしまっていた。
+                # 修正: 2パス読み込みを行う。
+                #   パス1: セクション行だけを処理して _imp_sections を構築する。
+                #   パス2: ラベル行を処理する（_imp_sections が完成している状態）。
                 with open(self.state.impfile, 'rt') as label_file:
-                    for l in label_file:
+                    raw_lines = label_file.readlines()
+                # Pass 1: section lines (3+ fields)
+                for l in raw_lines:
+                    fields = l.rstrip('\r\n').split('\t')
+                    if len(fields) >= 3:
+                        self.imp_label(l)
+                # Pass 2: label lines (2 fields)
+                for l in raw_lines:
+                    fields = l.rstrip('\r\n').split('\t')
+                    if len(fields) == 2:
                         self.imp_label(l)
 
             # Remove stale output file before writing
@@ -4217,10 +4267,18 @@ class Assembler:
                     # UNDEF = 2^256 - 1 なので、現実のアセンブラで PC が 2^128 を
                     # 超えることはない。2^128 以上の値をすべて「UNDEF 由来」として扱い、
                     # 誤収束を防ぐ。
+                    #
+                    # Bugfix: is_equ=True の定数ラベル（.equ で定義された整数定数）は
+                    # PC 値ではなく任意精度の整数値を保持する。
+                    # qad{} や 0x10000...（128bit超）のような大きな定数を .equ で定義すると
+                    # UNDEF_THRESHOLD を超えて has_undef=True になり、毎回収束しなくなる。
+                    # 修正: アドレスラベル（is_equ=False）の値のみを UNDEF チェックする。
                     _UNDEF_THRESHOLD = 1 << 128
                     has_undef = any(
-                        pc == UNDEF or pc >= _UNDEF_THRESHOLD
-                        for (pc, _sec) in current_pcs.values()
+                        pc == UNDEF or (isinstance(pc, int) and pc >= _UNDEF_THRESHOLD)
+                        for k, (pc, _sec) in current_pcs.items()
+                        # is_equ=True の定数ラベルは除外（任意の大きさの整数値を持てる）
+                        if not (len(self.state.labels[k]) > 2 and self.state.labels[k][2])
                     )
                     # 修正⑤: _SENTINEL との比較は必ず False なので初回は無条件続行。
                     # 2回目以降は前回と一致しかつ UNDEF がなければ収束と判定できる。
