@@ -1132,7 +1132,17 @@ class ExpressionEvaluator:
         elif StringUtils.q(s, '#', idx):
             idx += 1
             t, idx = self.parser.get_symbol_word(s, idx)
-            x = self.symbol_manager.get(t)
+            _sym_val = self.symbol_manager.get(t)
+            # Bugfix: symbol_manager.get() は未定義シンボルに "" (空文字列) を返す。
+            # "" が x に代入されると後続の算術演算（term0 等）で TypeError が発生し、
+            # 「パターンマッチ失敗」として誤報告されていた。
+            # 修正: 未定義シンボル（"" のまま）は 0 として扱いエラーを明示する。
+            if _sym_val == "":
+                if self.state.pas == 2 or self.state.pas == 0:
+                    print(f" error - undefined symbol: '#{t}'")
+                x = 0
+            else:
+                x = _sym_val
         elif StringUtils.q(s, '0b', idx):
             idx += 2
             while idx < len(s) and s[idx] in "01":
@@ -1143,7 +1153,11 @@ class ExpressionEvaluator:
             while idx < len(s) and StringUtils.upper(s[idx]) in XDIGIT:
                 x = 16 * x + int(s[idx].lower(), 16)
                 idx += 1
-        elif idx + 3 <= len(s) and s[idx:idx+3] == 'qad':
+        elif (idx + 3 <= len(s) and s[idx:idx+3] == 'qad'
+              # Bugfix: 'qad' の後（スペース可）に '{' が続く場合のみキーワードとして扱う。
+              # これがないと 'qad_label' や 'qadrant' のようなラベル名が
+              # qad キーワードブランチに誤って入り、ラベル値が 0 になるサイレントバグが起きる。
+              and (lambda _j=StringUtils.skipspc(s, idx + 3): _j < len(s) and s[_j] == '{')()):
             idx += 3
             idx = StringUtils.skipspc(s, idx)
             if idx < len(s) and s[idx] == '{':
@@ -1176,7 +1190,9 @@ class ExpressionEvaluator:
                             h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
                                     str(Decimal(repr(float(v)))))
                     x = int(h, 16)
-        elif idx + 3 <= len(s) and s[idx:idx+3] == 'dbl':
+        elif (idx + 3 <= len(s) and s[idx:idx+3] == 'dbl'
+              # Bugfix: 'dbl' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
+              and (lambda _j=StringUtils.skipspc(s, idx + 3): _j < len(s) and s[_j] == '{')()):
             idx += 3
             f, t, idx = self.parser.get_curlb(s, idx)
             if f:
@@ -1189,7 +1205,9 @@ class ExpressionEvaluator:
                 else:
                     v = float(self.xeval(t, None))
                     x = int.from_bytes(struct.pack('>d', v), "big")
-        elif idx + 3 <= len(s) and s[idx:idx+3] == 'flt':
+        elif (idx + 3 <= len(s) and s[idx:idx+3] == 'flt'
+              # Bugfix: 'flt' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
+              and (lambda _j=StringUtils.skipspc(s, idx + 3): _j < len(s) and s[_j] == '{')()):
             idx += 3
             f, t, idx = self.parser.get_curlb(s, idx)
             if f:
@@ -1202,18 +1220,27 @@ class ExpressionEvaluator:
                 else:
                     v = float(self.xeval(t, None))
                     x = int.from_bytes(struct.pack('>f', v), "big")
-        elif idx + 5 <= len(s) and s[idx:idx+5] == 'enflt':
+        elif (idx + 5 <= len(s) and s[idx:idx+5] == 'enflt'
+              # Bugfix: 'enflt' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
+              and (lambda _j=StringUtils.skipspc(s, idx + 5): _j < len(s) and s[_j] == '{')()):
             idx += 5
             f, t, idx = self.parser.get_curlb(s, idx)
             if f:
                 v, _ = self.expression(t + chr(0), 0)
-                x = enflt(int(v))
-        elif idx + 5 <= len(s) and s[idx:idx+5] == 'endbl':
+                # Bugfix: v が UNDEF (256bit 整数) のとき struct.pack('I', v) は
+                # struct.error を送出する。struct.error は lineassemble2 の
+                # except リストに含まれないため未捕捉のままクラッシュしていた。
+                # 修正: 0〜2^32-1 の範囲にマスクしてから渡す。
+                x = enflt(int(v) & 0xFFFFFFFF)
+        elif (idx + 5 <= len(s) and s[idx:idx+5] == 'endbl'
+              # Bugfix: 'endbl' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
+              and (lambda _j=StringUtils.skipspc(s, idx + 5): _j < len(s) and s[_j] == '{')()):
             idx += 5
             f, t, idx = self.parser.get_curlb(s, idx)
             if f:
                 v, _ = self.expression(t + chr(0), 0)
-                x = endbl(int(v))
+                # Bugfix: enflt と同様に 64bit にマスクしてから渡す。
+                x = endbl(int(v) & 0xFFFFFFFFFFFFFFFF)
         elif self.state.exp_typ=='i' and idx < len(s) and s[idx].isdigit():
                 fs, idx = self.parser.get_intstr(s, idx)
                 x = int(fs)  # int(float(fs)) would lose precision for large integers
@@ -3230,7 +3257,7 @@ class Assembler:
                         break
                 except (ArithmeticError, KeyError, IndexError, ValueError,
                         TypeError, AttributeError, OverflowError,
-                        RecursionError) as _exc:
+                        RecursionError, struct.error) as _exc:
                     # 修正④: 旧実装は `except Exception` で全例外を捕捉していたため、
                     # makeobj / expression_pat 内のコード実装バグ（TypeError 等）が
                     # 「forward参照エラー」として握りつぶされ、デバッグが困難だった。
@@ -3240,6 +3267,9 @@ class Assembler:
                     #   - それ以外の予期しない例外（RuntimeError, RecursionError 等）は
                     #     再 raise し、呼び出しスタックを確認できるようにする。
                     # ただし Pass2 / インタラクティブで発生した場合は従来通り oerr 扱い。
+                    # Bugfix: struct.error (struct.pack の範囲外エラー) は上記リストに
+                    # 含まれていなかったため、enflt/endbl に UNDEF が渡った場合などに
+                    # 未捕捉のままクラッシュしていた。struct.error を追加する。
                     if self.state.pas == 1:
                         # Pass1: パターンはマッチしたが forward参照で makeobj が失敗した。
                         # ラベルを 0 と仮定してサイズだけ確定させ、PC を正しく進める。
@@ -3255,7 +3285,7 @@ class Assembler:
                             idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                         except (ArithmeticError, KeyError, IndexError, ValueError,
                                 TypeError, AttributeError, OverflowError,
-                                RecursionError):
+                                RecursionError, struct.error):
                             objl = []  # それでも失敗した場合はサイズ0のまま
                         finally:
                             self.state._pass1_size_mode = False
@@ -3330,8 +3360,30 @@ class Assembler:
         # 順次適用するため、ここでの明示的クリアは不要。
         # patsymbols ベースラインは上記 4a で設定済み。
         
-        parts = line.split("!!")
-        self.state.vcnt = sum(1 for p in parts if p != "")
+        # VLIW スロット数カウント: ソース行を '!!' で分割したパート数を vcnt とする。
+        # Bugfix: .ASCII "hello!!world" のように文字列リテラル内に '!!' が含まれると
+        # vcnt が過大にカウントされ、VLIW パターンの !!! (vcnt 参照) が誤った値を返す。
+        # 修正: remove_comment_asm と同様の引用符追跡ロジックで、
+        # ダブルクォート文字列の外側にある '!!' だけを数える。
+        _vcnt = 0
+        _in_dq = False
+        _vi = 0
+        _vline = line
+        while _vi < len(_vline):
+            _vc = _vline[_vi]
+            if _vc == '\\' and _in_dq:
+                _vi += 2; continue
+            if _vc == '"':
+                _in_dq = not _in_dq
+            elif not _in_dq and _vline[_vi:_vi+2] == '!!':
+                _vcnt += 1
+                _vi += 2; continue
+            _vi += 1
+        # 最後のスロット（末尾 '!!' より後の部分）を加算
+        # 分割方式: N個の '!!' があれば N+1 個の部分があるが空文字列は除外
+        # → 行全体が空でなければ少なくとも1スロット存在する
+        _vparts_count = _vcnt + 1 if line.strip() else 0
+        self.state.vcnt = _vparts_count
 
         # ELF リロケーション追跡: pass2 かつ ELF 出力時のみ有効
         # 修正②: lineassemble2 が例外を投げても _elf_tracking が True のまま
@@ -3978,6 +4030,16 @@ class Assembler:
         # ------------------------------------------------------------------ #
         def _pack_rela(r_offset, r_sym, r_type, r_addend):
             r_info = (r_sym << 32) | (r_type & 0xffffffff)
+            # Bugfix: r_addend は Elf64_Sxword（符号付き64bit）なので
+            # struct.pack('q', ...) に渡せる範囲は -2^63 〜 2^63-1。
+            # addend = raw_val - abs_w の計算でこの範囲を超えると struct.error が発生する。
+            # 修正: 64bit符号付き整数に丸めてからパックする。
+            _S64_MAX =  (1 << 63) - 1
+            _S64_MIN = -(1 << 63)
+            if r_addend > _S64_MAX:
+                r_addend = _S64_MAX
+            elif r_addend < _S64_MIN:
+                r_addend = _S64_MIN
             return _struct.pack(f'{_pk}QQq', r_offset, r_info, r_addend)
 
         rela_datas = []   # rela_sec_order と同順
