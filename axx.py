@@ -1226,21 +1226,52 @@ class ExpressionEvaluator:
             idx += 5
             f, t, idx = self.parser.get_curlb(s, idx)
             if f:
+                # Bugfix3 (false positive): expression() を呼ぶ前に
+                # error_undefined_label をリセットすることで、
+                # enflt{} の中身が定数のとき誤エラーが出なくなる。
+                #
+                # Bugfix4 (side effect of Bugfix3): リセット前の状態（外側の式で
+                # 既に検出した未定義ラベル情報）を保存し、内側の式の結果と OR 合成して
+                # 復元する。こうすることで "undef_label + enflt{1.5}" のように
+                # enflt{} より先に未定義ラベルが評価されたケースでも、
+                # 外側の error_undefined_label=True が消えずに残る。
+                _outer_undef = self.state.error_undefined_label
+                self.state.error_undefined_label = False
                 v, _ = self.expression(t + chr(0), 0)
-                # Bugfix: v が UNDEF (256bit 整数) のとき struct.pack('I', v) は
-                # struct.error を送出する。struct.error は lineassemble2 の
-                # except リストに含まれないため未捕捉のままクラッシュしていた。
-                # 修正: 0〜2^32-1 の範囲にマスクしてから渡す。
-                x = enflt(int(v) & 0xFFFFFFFF)
+                _inner_undef = self.state.error_undefined_label
+                # 外側と内側の未定義ラベルを OR 合成して伝播させる
+                self.state.error_undefined_label = _outer_undef or _inner_undef
+                # Bugfix (struct.error): v が UNDEF (256bit 整数) のとき struct.pack('I', v) は
+                # struct.error を送出する。修正: 0〜2^32-1 の範囲にマスクしてから渡す。
+                # Bugfix2 (silent NaN): UNDEF をマスクすると 0xFFFFFFFF → NaN になり
+                # エラーメッセージなしに誤った浮動小数点値が格納されていた。
+                # 修正: 未定義ラベル検出時は 0 を使ってエラーを明示する。
+                if _inner_undef:
+                    if self.state.pas == 2 or self.state.pas == 0:
+                        print(" error - enflt{}: expression contains undefined label.")
+                    x = enflt(0)
+                else:
+                    x = enflt(int(v) & 0xFFFFFFFF)
         elif (idx + 5 <= len(s) and s[idx:idx+5] == 'endbl'
               # Bugfix: 'endbl' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
               and (lambda _j=StringUtils.skipspc(s, idx + 5): _j < len(s) and s[_j] == '{')()):
             idx += 5
             f, t, idx = self.parser.get_curlb(s, idx)
             if f:
+                # Bugfix3/4: enflt と同様に外側の状態を保存し、内側の結果と OR 合成する。
+                _outer_undef = self.state.error_undefined_label
+                self.state.error_undefined_label = False
                 v, _ = self.expression(t + chr(0), 0)
-                # Bugfix: enflt と同様に 64bit にマスクしてから渡す。
-                x = endbl(int(v) & 0xFFFFFFFFFFFFFFFF)
+                _inner_undef = self.state.error_undefined_label
+                self.state.error_undefined_label = _outer_undef or _inner_undef
+                # Bugfix (struct.error): v が UNDEF のとき struct.pack('Q', v) がクラッシュする。
+                # Bugfix2 (silent NaN): enflt と同様に未定義ラベル時は 0 を使いエラーを明示する。
+                if _inner_undef:
+                    if self.state.pas == 2 or self.state.pas == 0:
+                        print(" error - endbl{}: expression contains undefined label.")
+                    x = endbl(0)
+                else:
+                    x = endbl(int(v) & 0xFFFFFFFFFFFFFFFF)
         elif self.state.exp_typ=='i' and idx < len(s) and s[idx].isdigit():
                 fs, idx = self.parser.get_intstr(s, idx)
                 x = int(fs)  # int(float(fs)) would lose precision for large integers
@@ -3360,30 +3391,78 @@ class Assembler:
         # 順次適用するため、ここでの明示的クリアは不要。
         # patsymbols ベースラインは上記 4a で設定済み。
         
-        # VLIW スロット数カウント: ソース行を '!!' で分割したパート数を vcnt とする。
-        # Bugfix: .ASCII "hello!!world" のように文字列リテラル内に '!!' が含まれると
+        # VLIW スロット数カウント: ソース行を '!!' で分割した「非空パート数」を vcnt とする。
+        # Bugfix (Fix L): .ASCII "hello!!world" のように文字列リテラル内に '!!' が含まれると
         # vcnt が過大にカウントされ、VLIW パターンの !!! (vcnt 参照) が誤った値を返す。
-        # 修正: remove_comment_asm と同様の引用符追跡ロジックで、
-        # ダブルクォート文字列の外側にある '!!' だけを数える。
-        _vcnt = 0
-        _in_dq = False
+        # 修正: ダブルクォート文字列の外側にある '!!' だけを区切りとして分割し、
+        # 旧実装（split("!!") して非空要素を数える）と同じセマンティクスを保つ。
+        #
+        # Bugfix2 (Fix L 副作用): 前回の修正は '!!' カウント+1 方式だったため、
+        # 行末または行頭に '!!' がある場合に空パートが余分にカウントされ
+        # 旧実装より vcnt が1以上多くなっていた。
+        # 修正: 分割後の各パートが空でないもの（!= ''）を数えることで旧実装と一致させる。
+        #
+        # Bugfix3: シングルクォート文字リテラル '!!' 内の !! も誤カウントされていた。
+        # 修正: remove_comment_asm の Fix ⑦ と同様の先読みペア確認方式を採用する。
+        _vparts = []
+        _vpart_buf = []
+        _in_dq_v = False
         _vi = 0
-        _vline = line
-        while _vi < len(_vline):
-            _vc = _vline[_vi]
-            if _vc == '\\' and _in_dq:
-                _vi += 2; continue
+        while _vi < len(line):
+            _vc = line[_vi]
+            # ダブルクォート内のバックスラッシュエスケープを消費
+            if _vc == '\\' and _in_dq_v:
+                _vpart_buf.append(_vc)
+                if _vi + 1 < len(line):
+                    _vpart_buf.append(line[_vi + 1])
+                _vi += 2
+                continue
             if _vc == '"':
-                _in_dq = not _in_dq
-            elif not _in_dq and _vline[_vi:_vi+2] == '!!':
-                _vcnt += 1
-                _vi += 2; continue
+                _in_dq_v = not _in_dq_v
+                _vpart_buf.append(_vc)
+            elif _vc == "'" and not _in_dq_v:
+                # シングルクォートリテラルを先読みで丸ごと消費する（Fix ⑦ 方式）
+                # 消費できた場合は !! を区切りとして認識しない
+                _j = _vi + 1
+                _sq_consumed = False
+                if _j < len(line) and line[_j] == '\\' and _j + 1 < len(line):
+                    _esc = line[_j + 1]
+                    if _esc in 'xX':
+                        # '\xNN' 形式: 16進数字を最大2桁読んでから閉じクォートを探す
+                        _k = _j + 2
+                        _nd = 0
+                        while _k < len(line) and line[_k] in '0123456789abcdefABCDEF' and _nd < 2:
+                            _k += 1
+                            _nd += 1
+                        if _k < len(line) and line[_k] == "'":
+                            _vpart_buf.extend(list(line[_vi:_k + 1]))
+                            _vi = _k + 1
+                            _sq_consumed = True
+                    elif _j + 2 < len(line) and line[_j + 2] == "'":
+                        # '\x' 形式（4文字）を消費
+                        _vpart_buf.extend(list(line[_vi:_j + 3]))
+                        _vi = _j + 3
+                        _sq_consumed = True
+                elif _j < len(line) and _j + 1 < len(line) and line[_j + 1] == "'":
+                    # 'x' 形式（3文字）を消費
+                    _vpart_buf.extend(list(line[_vi:_j + 2]))
+                    _vi = _j + 2
+                    _sq_consumed = True
+                if not _sq_consumed:
+                    # 対応する閉じクォートが見つからない孤立クォート: そのまま通過
+                    _vpart_buf.append(_vc)
+                    _vi += 1
+                continue
+            elif not _in_dq_v and line[_vi:_vi+2] == '!!':
+                _vparts.append(''.join(_vpart_buf))
+                _vpart_buf = []
+                _vi += 2
+                continue
+            else:
+                _vpart_buf.append(_vc)
             _vi += 1
-        # 最後のスロット（末尾 '!!' より後の部分）を加算
-        # 分割方式: N個の '!!' があれば N+1 個の部分があるが空文字列は除外
-        # → 行全体が空でなければ少なくとも1スロット存在する
-        _vparts_count = _vcnt + 1 if line.strip() else 0
-        self.state.vcnt = _vparts_count
+        _vparts.append(''.join(_vpart_buf))
+        self.state.vcnt = sum(1 for _p in _vparts if _p != '')
 
         # ELF リロケーション追跡: pass2 かつ ELF 出力時のみ有効
         # 修正②: lineassemble2 が例外を投げても _elf_tracking が True のまま
@@ -3936,7 +4015,17 @@ class Assembler:
                     if s.byte_start <= byte_addr and s.byte_start >= best_start:
                         best_i = i
                         best_start = s.byte_start
-                return best_i + 1, byte_addr - csecs[best_i].byte_start
+                # Bugfix: byte_addr が全セクションの開始アドレスより小さいとき、
+                # ループ内の条件 s.byte_start <= byte_addr が一度も成立せず
+                # best_i=0, best_start=csecs[0].byte_start のまま残る。
+                # この場合 byte_addr - csecs[best_i].byte_start が負になり、
+                # _pack_sym の struct.pack('Q', negative) で struct.error が発生する。
+                # 修正: sym_val は 0 以上を保証する。負になる場合は先頭セクションの
+                # 先頭（オフセット 0）に帰属させる（アドレス解決は最善努力）。
+                sym_val = byte_addr - csecs[best_i].byte_start
+                if sym_val < 0:
+                    sym_val = 0
+                return best_i + 1, sym_val
             return 0xfff1, byte_addr   # SHN_ABS（セクションが一切ない場合のみ）
 
         strtab = bytearray(b'\x00')
