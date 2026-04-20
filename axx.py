@@ -323,18 +323,35 @@ class StringUtils:
                 next_char = l2[idx + 1]
                 if next_char == '"':
                     s += '"'
+                    idx += 2
                 elif next_char == '\\':
                     s += '\\'
+                    idx += 2
                 elif next_char == 'n':
                     s += '\n'
+                    idx += 2
                 elif next_char == 't':
                     s += '\t'
+                    idx += 2
                 elif next_char == 'r':
                     s += '\r'
+                    idx += 2
+                elif next_char in 'xX':
+                    # Fix: \xNN 形式の16進エスケープ（asciistr と同様の処理）
+                    idx += 2
+                    hex_str = ''
+                    while idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF' and len(hex_str) < 2:
+                        hex_str += l2[idx]
+                        idx += 1
+                    if hex_str:
+                        s += chr(int(hex_str, 16))
+                    else:
+                        # \x の後に16進数字がない場合はそのまま保持
+                        s += 'x'
                 else:
                     # その他のエスケープはそのまま保持
                     s += next_char
-                idx += 2
+                    idx += 2
             elif l2[idx] == '"':
                 return s
             else:
@@ -720,6 +737,13 @@ class IEEE754Converter:
                     if t == 0:
                         raise ZeroDivisionError("division by zero in qad{}")
                     v /= t
+                elif i < len(s) and s[i] == '%':
+                    # Fix: '%' (modulo) が未実装だったため qad{N%M} が ValueError を
+                    # 送出し float フォールバックで 128bit 精度が失われていた。
+                    t, i = parse_factor(s, i + 1)
+                    if t == 0:
+                        raise ZeroDivisionError("modulo by zero in qad{}")
+                    v = Decimal(int(v) % int(t))
                 else:
                     break
             return v, i
@@ -959,7 +983,15 @@ class ExpressionEvaluator:
                     x2,idx = self.expression(s,idx+1)
                     if idx<len(s) and s[idx] == ')':
                         idx+=1
-                        x=x>>(x2*8)
+                        # Fix: x2 が負のとき x2*8 < 0 → ValueError: negative shift count。
+                        # ガード: 負またはゼロのシフト量は 0 シフト（x をそのまま返す）として扱う。
+                        shift_amount = int(x2) * 8
+                        if shift_amount < 0:
+                            if self.state.pas == 2 or self.state.pas == 0:
+                                print(" error - negative byte-extract offset in *(expr, expr).")
+                            x = 0
+                        else:
+                            x = x >> shift_amount
                     else:
                         # 修正⑩: 閉じ括弧 ')' がない場合はエラーを報告して 0 を返す
                         print(" error - missing ')' in *(expr, expr) expression.")
@@ -983,7 +1015,26 @@ class ExpressionEvaluator:
         return x, idx
 
     def xeval(self, x, _=None):
-        escaped = re.escape(self.state.lwordchars)
+        # Fix: re.escape() の結果を文字クラス [..] 内に埋め込むと、
+        # .labelc で lwordchars に ']' '\\' '^'(先頭) '-'(中間) が追加されたとき
+        # re.error が発生する。文字クラス内で安全なエスケープを行う専用関数を使う。
+        def _cc_escape(chars):
+            """文字クラス [...] の中で安全なエスケープ文字列を生成する。"""
+            out = []
+            for c in chars:
+                if c == '\\':
+                    out.append('\\\\')
+                elif c == ']':
+                    out.append('\\]')
+                elif c == '^':
+                    out.append('\\^')
+                elif c == '-':
+                    out.append('\\-')
+                else:
+                    out.append(re.escape(c))
+            return ''.join(out)
+
+        escaped = _cc_escape(self.state.lwordchars)
         pattern = rf":([{escaped}]+)(?=[^{escaped}]|$)"
 
         def replacer(match):
@@ -1279,7 +1330,7 @@ class ExpressionEvaluator:
                 fs,idx = self.parser.get_floatstr(s,idx)
                 x = float(fs)
         elif (idx < len(s) and
-              s[idx] in LOWER and idx + 1 < len(s) and s[idx+1] not in LOWER):
+              s[idx] in LOWER and (idx + 1 >= len(s) or s[idx+1] not in self.state.lwordchars)):
             ch = s[idx]
             if idx + 3 <= len(s) and s[idx+1:idx+3] == ':=':
                 x, idx = self.expression(s, idx + 3)
@@ -1616,7 +1667,10 @@ class ExpressionEvaluator:
                 else:
                     # 条件が偽: 真ブランチの副作用（変数変更・ELF追跡）を取り消し、0 を返す
                     self.state.vars                     = saved_vars
-                    self.state.error_undefined_label    = False
+                    # Fix: 旧実装は False をハードコードしていたため、条件式の評価中に
+                    # 検出された未定義ラベルフラグ（saved_err_undef）が消えてしまっていた。
+                    # 正しくは「真ブランチ評価前の状態」= saved_err_undef に戻す。
+                    self.state.error_undefined_label    = saved_err_undef
                     self.state.error_label_conflict     = saved_err_conflict  # Fix: 追加
                     self.state._elf_label_refs_seen     = list(saved_elf_refs)  # Fix ⑫
                     self.state._elf_var_to_label        = dict(saved_elf_v2l)   # Fix ⑫
@@ -1727,6 +1781,10 @@ class BinaryWriter:
     
     def _store(self, position, word_val):
         """ワード単位でバッファに格納"""
+        # Fix: bts <= 0 はマスクが 0 になりデータが全ゼロになる。
+        # fwrite でもガードしているが、将来の直接呼び出し経路に備えて二重防護する。
+        if self.state.bts <= 0:
+            return
         # 11ビットなら 0x7ff でマスクして格納
         mask = (1 << self.state.bts) - 1
         self._buffer[position] = word_val & mask
@@ -1795,6 +1853,10 @@ class BinaryWriter:
 
     def fwrite(self, position, x, prt):
         """1ワードをバッファへ書き込み"""
+        # Fix: bts <= 0 の場合はマスクが 0 になりデータが全ゼロになる。
+        # flush() にはガードがあるが fwrite 自体には なかったので早期リターンする。
+        if self.state.bts <= 0:
+            return 0
         # デバッグ表示用のマスク
         mask = (1 << self.state.bts) - 1
         val = x & mask
@@ -2110,7 +2172,7 @@ class PatternMatcher:
                     continue
                 else:
                     return False
-            elif a.isupper():
+            elif a in CAPITAL:   # Fix: isupper() はUnicode大文字も含むため CAPITAL で限定
                 if a == b.upper():
                     idx_s += 1
                     idx_t += 1
@@ -2359,6 +2421,8 @@ class PatternFileReader:
         base_dir: 呼び出し元パターンファイルのディレクトリ。
         None のときはプロセスの CWD を基準にする（トップレベル呼び出し）。
         相対パスの fn は base_dir（または CWD）を基準に解決する。
+
+        戻り値: パターンエントリのリスト。ファイルが存在しない・読めない場合は例外を伝播する。
         """
         if fn == '':
             return []
@@ -2385,7 +2449,7 @@ class PatternFileReader:
                 l = StringUtils.reduce_spaces(l)
                 
                 ww = self.include_pat(l, this_dir)
-                if ww:
+                if ww is not None:   # Fix: None=非.INCLUDE行, []=空/エラー, list=パターン
                     w = w + ww
                     continue
                 else:
@@ -2436,12 +2500,18 @@ class PatternFileReader:
 
         修正⑥: get_string() がファイル名の取得に失敗した場合（クォート抜けなど）
         は空リストをサイレントに返さずエラーを表示する。
+
+        Fix (new): 旧実装は戻り値が [] のとき「.INCLUDE 行でない」と「空ファイルを
+        インクルード」の両方を区別できず、後者のとき .INCLUDE 行が通常パターンとして
+        再解析される問題があった。
+        修正: .INCLUDE にマッチしなかった場合は None を返し、呼び出し元で None と
+        空リストを区別する。マッチして空ファイルだった場合は [] を返す。
         """
         idx = StringUtils.skipspc(l, 0)
         i = l[idx:idx+8]
         i = i.upper()
         if i != ".INCLUDE":
-            return []
+            return None   # Fix: マッチなしは None で返す（空リストと区別）
         s = StringUtils.get_string(l[idx+8:])
         if s == "":
             # get_string が失敗した（引用符がないか空文字列）
@@ -2457,12 +2527,12 @@ class PatternFileReader:
                     s = fallback
                 else:
                     print(f" error - .INCLUDE directive has no filename: {l!r}")
-                    return []
+                    return []   # マッチしたがエラー → 空リスト
             else:
                 print(f" error - .INCLUDE directive has no filename: {l!r}")
-                return []
+                return []   # マッチしたがエラー → 空リスト
         w = self.readpat(s, base_dir)
-        return w
+        return w   # 空ファイルなら [] だが呼び出し元で区別される
 
 
 class ObjectGenerator:
@@ -2527,8 +2597,23 @@ class ObjectGenerator:
                     
                     # Evaluate expression
                     n, idx = self.expr_eval.expression_pat(expr, 0)
+                    # Fix: 未定義ラベルや UNDEF 由来の巨大値が n に入ると
+                    # range(int(UNDEF)) が実質無限ループになりプロセスがハングする。
+                    # error_undefined_label フラグと現実的な上限でガードする。
+                    _N_MAX = 1 << 24  # 16M 回展開は非現実的
+                    if self.state.error_undefined_label:
+                        n = 0  # forward参照は 0 扱いにしてサイズ推定を続ける
+                    try:
+                        n_int = int(n)
+                    except (ValueError, OverflowError):
+                        n_int = 0
+                    if n_int > _N_MAX:
+                        if self.state.pas == 2 or self.state.pas == 0:
+                            print(f" error - @@[n,...]: repeat count {n_int} exceeds maximum {_N_MAX}.")
+                        n_int = 0
                     # Expand pattern n times
-                    if int(n) > 0:
+                    if n_int > 0:
+                        n = n_int  # 以降は検証済みの整数を使う
                         has_content = True
                         for j in range(int(n)):
                             if j > 0:
