@@ -14,7 +14,7 @@ FreeBSD terminal
 
 Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
 
-# Relocatable ELF creation examination of axx
+# Relocatable ELF creation of axx
 
 GitHub: https://github.com/fygar256/axx_relocatable_elf_generation
 
