@@ -943,9 +943,18 @@ class ExpressionEvaluator:
     def nbit(self, l):
         """Count number of bits needed to represent value"""
         b = 0
+        # Fix: float('inf') や float('nan') を int() に渡すと OverflowError が発生する。
+        # 非有限の float は 0 ビットとして扱いエラーを防ぐ。
+        if isinstance(l, float) and not l == l:   # NaN check (NaN != NaN)
+            return 0
+        if isinstance(l, float) and (l == float('inf') or l == float('-inf')):
+            return 0
         # 修正: float が渡された場合 r >>= 1 で TypeError になるため
         # 事前に int に変換する。abs() の後で int 化することで負値も安全に処理できる。
-        r = int(abs(l))
+        try:
+            r = int(abs(l))
+        except (OverflowError, ValueError):
+            return 0
         while r:
             r >>= 1
             b += 1
@@ -1459,13 +1468,29 @@ class ExpressionEvaluator:
         while idx < len(s):
             if StringUtils.q(s, '<<', idx):
                 t, idx = self.term1(s, idx + 2)
-                x=int(x)
-                t=int(t)
+                try:
+                    x = int(x)
+                    t = int(t)
+                except (ValueError, OverflowError):
+                    x = 0; break
+                # Fix: 負のシフト量は ValueError になる。ガードして 0 を返す。
+                if t < 0:
+                    if self.state.pas == 2 or self.state.pas == 0:
+                        print(f" error - negative shift count ({t}) in << expression.")
+                    x = 0; break
                 x <<= t
             elif StringUtils.q(s, '>>', idx):
                 t, idx = self.term1(s, idx + 2)
-                x=int(x)
-                t=int(t)
+                try:
+                    x = int(x)
+                    t = int(t)
+                except (ValueError, OverflowError):
+                    x = 0; break
+                # Fix: 負のシフト量は ValueError になる。ガードして 0 を返す。
+                if t < 0:
+                    if self.state.pas == 2 or self.state.pas == 0:
+                        print(f" error - negative shift count ({t}) in >> expression.")
+                    x = 0; break
                 x >>= t
             else:
                 break
@@ -2053,6 +2078,11 @@ class DirectiveProcessor:
         Fix 10: error_code はローカル変数に代入するだけで戻り値がなく、
         呼び出し元でエラーを検知できなかった。
         戻り値として (triggered: bool, code: int) を返すよう変更する。
+
+        Fix (new): expression_pat がパース不能な文字（')' など）に当たると
+        idx を進めないまま返すため、while True ループが永遠に抜けられない
+        無限ループになっていた。各イテレーションで idx が進んだかを確認し、
+        進まなかった場合は残りをスキップして終了する。
         """
         ss = s.replace(' ', '')
         if ss == "":
@@ -2071,6 +2101,7 @@ class DirectiveProcessor:
                 idx += 1
                 continue
             
+            idx_before = idx   # Fix: 進捗チェック用に保存
             prev_typ = self.expr_eval.state.exp_typ
             self.expr_eval.state.exp_typ = 'f'
             try:
@@ -2082,6 +2113,11 @@ class DirectiveProcessor:
                 idx += 1
             t, idx = self.expr_eval.expression_pat(s, idx)
             
+            # Fix: idx が全く進まなかった → パース不能文字で無限ループになる。
+            # 残りの文字を読み飛ばして終了する。
+            if idx <= idx_before:
+                break
+
             if (self.state.pas == 2 or self.state.pas == 0) and u:
                 t_int = int(t)
                 print(f"Line {self.state.ln} Error code {t_int} ", end="")
