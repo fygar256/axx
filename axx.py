@@ -981,7 +981,14 @@ class ExpressionEvaluator:
             x = -x
         elif idx < len(s) and s[idx] == '~':
             x, idx = self.factor(s, idx + 1)
-            x = ~int(x)
+            # Fix: x が float('inf') / float('nan') のとき int(x) が OverflowError になる。
+            # nbit() と同じ方針: 非有限の float は 0 として扱う。
+            try:
+                x = ~int(x)
+            except (OverflowError, ValueError):
+                if self.state.pas == 2 or self.state.pas == 0:
+                    print(f" error - cannot apply bitwise NOT (~) to non-finite float value.")
+                x = 0
         elif idx < len(s) and s[idx] == '@':
             x, idx = self.factor(s, idx + 1)
             x = self.nbit(x)
@@ -1465,6 +1472,10 @@ class ExpressionEvaluator:
     def term2(self, s, idx):
         """Handle bit shifts"""
         x, idx = self.term1(s, idx)
+        # Fix: ** 演算子と同様に、シフト量に現実的な上限を設ける。
+        # 上限なしだと 1<<100000000 のような式で 120MB の巨大整数が即座に作られる。
+        # 現実のアセンブラで 65536 ビット超のシフトは非現実的。
+        _SHIFT_MAX = 65536
         while idx < len(s):
             if StringUtils.q(s, '<<', idx):
                 t, idx = self.term1(s, idx + 2)
@@ -1478,6 +1489,11 @@ class ExpressionEvaluator:
                     if self.state.pas == 2 or self.state.pas == 0:
                         print(f" error - negative shift count ({t}) in << expression.")
                     x = 0; break
+                # Fix: 過大なシフト量は巨大整数を作りメモリを大量消費する。
+                if t > _SHIFT_MAX:
+                    if self.state.pas == 2 or self.state.pas == 0:
+                        print(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in << expression.")
+                    x = 0; break
                 x <<= t
             elif StringUtils.q(s, '>>', idx):
                 t, idx = self.term1(s, idx + 2)
@@ -1490,6 +1506,9 @@ class ExpressionEvaluator:
                 if t < 0:
                     if self.state.pas == 2 or self.state.pas == 0:
                         print(f" error - negative shift count ({t}) in >> expression.")
+                    x = 0; break
+                # >> は右シフトなので大きな値でもメモリ問題は起きないが統一性のためガードする。
+                if t > _SHIFT_MAX:
                     x = 0; break
                 x >>= t
             else:
