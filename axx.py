@@ -1000,14 +1000,21 @@ class ExpressionEvaluator:
                     if idx<len(s) and s[idx] == ')':
                         idx+=1
                         # Fix: x2 が負のとき x2*8 < 0 → ValueError: negative shift count。
-                        # ガード: 負またはゼロのシフト量は 0 シフト（x をそのまま返す）として扱う。
-                        shift_amount = int(x2) * 8
-                        if shift_amount < 0:
+                        # Fix(new): x2 が float('inf')/nan のとき int(x2) → OverflowError。
+                        # 両方をまとめて try/except でガードする。
+                        try:
+                            shift_amount = int(x2) * 8
+                        except (OverflowError, ValueError):
                             if self.state.pas == 2 or self.state.pas == 0:
-                                print(" error - negative byte-extract offset in *(expr, expr).")
+                                print(" error - non-finite byte-extract offset in *(expr, expr).")
                             x = 0
                         else:
-                            x = x >> shift_amount
+                            if shift_amount < 0:
+                                if self.state.pas == 2 or self.state.pas == 0:
+                                    print(" error - negative byte-extract offset in *(expr, expr).")
+                                x = 0
+                            else:
+                                x = x >> shift_amount
                     else:
                         # 修正⑩: 閉じ括弧 ')' がない場合はエラーを報告して 0 を返す
                         print(" error - missing ')' in *(expr, expr) expression.")
@@ -1829,6 +1836,9 @@ class BinaryWriter:
         # fwrite でもガードしているが、将来の直接呼び出し経路に備えて二重防護する。
         if self.state.bts <= 0:
             return
+        # Fix(new): 負のアドレスは bytearray インデックス計算を壊す。早期リターンする。
+        if position < 0:
+            return
         # 11ビットなら 0x7ff でマスクして格納
         mask = (1 << self.state.bts) - 1
         self._buffer[position] = word_val & mask
@@ -1846,13 +1856,23 @@ class BinaryWriter:
                   file=__import__('sys').stderr)
             return
 
-        max_word_pos = max(self._buffer.keys())
+        # Fix(new): 負のキーが混入している場合はスキップして安全に処理する。
+        # _store でもガードしているが、旧バージョンのバッファが持ち越された場合への防護。
+        valid_buffer = {k: v for k, v in self._buffer.items() if k >= 0}
+        if not valid_buffer:
+            return
+
+        max_word_pos = max(valid_buffer.keys())
         
         # 1ワードあたりに必要なバイト数を計算 (例: 11bit -> 2bytes)
         word_bits = self.state.bts
         bytes_per_word = (word_bits + 7) // 8
         
         total_size = (max_word_pos + 1) * bytes_per_word
+
+        # Fix(new): total_size が 0 以下になる場合（全キーが負など）は書き出しスキップ。
+        if total_size <= 0:
+            return
 
         # 修正8: .padding で設定した state.padding 値で全ワードを初期化してから
         # 実際に書き込まれたワードで上書きする。
@@ -1875,7 +1895,7 @@ class BinaryWriter:
                             data[base_idx + i] = tmp & 0xff
                         tmp >>= 8
 
-        for pos, val in self._buffer.items():
+        for pos, val in valid_buffer.items():
             # 書き込み先のバイト位置を特定
             base_idx = pos * bytes_per_word
             
