@@ -21,6 +21,12 @@ import math
 import re
 import tempfile
 
+# Pass1 リラクゼーションの初期比較用番兵オブジェクト。
+# モジュールレベルで1度だけ生成することで、run() を複数回呼び出しても
+# 同一オブジェクトとの `is not` 比較が常に正しく機能する。
+_RELAXATION_SENTINEL = object()
+
+
 # Expression mode constants
 EXP_PAT = 0
 EXP_ASM = 1
@@ -133,7 +139,8 @@ class AssemblerState:
 
         # リラクゼーション用: 直前のpass1でのラベルアドレス記録
         # {label_name: pc_value} の辞書。収束判定に使う。
-        self._pass1_prev_label_pcs = None
+        # モジュールレベルの番兵で初期化することで run() 複数回呼び出しも安全。
+        self._pass1_prev_label_pcs = _RELAXATION_SENTINEL
 
         # stdin 入力を保持する一時ファイルパス。
         # 固定名 "axx.tmp" の代わりに tempfile で生成したパスを使うことで
@@ -196,6 +203,42 @@ class StringUtils:
         return idx
     
     @staticmethod
+    def skip_squote_literal(s, i):
+        """シングルクォートリテラルを先読みで消費する共通ヘルパー。
+
+        Fix 5 (DRY): remove_comment_asm と vcnt カウントループに同一ロジックが
+        重複していた。どちらもこのメソッドを呼び出すことで一元管理する。
+
+        消費できた場合は消費後の idx を返す。
+        消費できなかった（孤立クォート）場合は i+1 を返す（クォート自体を読み飛ばす）。
+        消費したかどうかは (戻り値 > i + 1) で判定できる。
+
+        対応パターン:
+          '\\xNN'  ← 16進エスケープ (0〜2桁)
+          '\\x'    ← 4文字エスケープ (backslash + char + closeq)
+          'x'      ← 通常3文字リテラル
+        """
+        j = i + 1
+        if j < len(s) and s[j] == '\\' and j + 1 < len(s):
+            esc_char = s[j + 1]
+            if esc_char in 'xX':
+                k = j + 2
+                hex_digits = 0
+                while k < len(s) and s[k] in '0123456789abcdefABCDEF' and hex_digits < 2:
+                    k += 1
+                    hex_digits += 1
+                if k < len(s) and s[k] == '\'':
+                    return k + 1          # '\xNN' 消費成功
+                # 閉じクォートが見つからない → 孤立クォート
+            elif j + 2 < len(s) and s[j + 2] == '\'':
+                return j + 3              # '\x' 4文字消費成功
+            # 対応クローズクォートなし → 孤立クォート
+        elif j < len(s) and j + 1 < len(s) and s[j + 1] == '\'':
+            return j + 2                  # 'x' 3文字消費成功
+        # 孤立クォート: クォート文字そのものだけ読み飛ばす
+        return i + 1
+    
+    @staticmethod
     def reduce_spaces(text):
         """Reduce multiple spaces to single space"""
         return re.sub(r'\s{2,}', ' ', text)
@@ -250,42 +293,18 @@ class StringUtils:
                 # ここでは素直にトグルするだけで正しい。
                 in_dquote = not in_dquote
             elif ch == '\'' and not in_dquote:
-                # Fix ⑦: 先読みでシングルクォートリテラルを一括消費する。
-                j = i + 1
-                if j < len(l) and l[j] == '\\' and j + 1 < len(l):
-                    # Fix ⑬ (新規): '\xNN' 形式の16進エスケープ（Cスタイル）を
-                    # 正しく消費する。旧実装は '\x' の x+1 文字目が ' かを確認
-                    # するだけだったため、'\x41' のように2桁の16進数字が続く
-                    # リテラルを孤立クォートとして誤認していた。
-                    # 修正: バックスラッシュ直後が 'x'/'X' の場合は0〜2桁の
-                    # 16進数字を読み飛ばしてから閉じクォートを探す。
-                    esc_char = l[j + 1]
-                    if esc_char in 'xX':
-                        k = j + 2
-                        # 最大2桁の16進数字を消費
-                        hex_digits = 0
-                        while k < len(l) and l[k] in '0123456789abcdefABCDEF' and hex_digits < 2:
-                            k += 1
-                            hex_digits += 1
-                        if k < len(l) and l[k] == '\'':
-                            i = k + 1
-                            continue
-                        # 閉じクォートが見つからなければ孤立クォートとして通過
-                    elif j + 2 < len(l) and l[j + 2] == '\'':
-                        # '\x' 形式 (quote + backslash + char + quote) = 4文字消費
-                        i = j + 3
-                        continue
-                    # 対応するクローズクォートが見当たらない孤立クォート: 通過
-                elif j < len(l) and j + 1 < len(l) and l[j + 1] == '\'':
-                    # 'x' 形式 (quote + char + quote) = 3文字消費
-                    i = j + 2
-                    continue
-                # 対応するクローズクォートが見当たらない孤立クォート:
-                # コメント除去処理を継続させるためサイレントに通過する
+                # Fix 5 (DRY): 共通ヘルパーでシングルクォートリテラルを消費する。
+                i = StringUtils.skip_squote_literal(l, i)
+                continue
             elif ch == ';' and not in_dquote:
                 return l[:i].rstrip()
 
             i += 1
+        # Fix 4: ループを抜けた時点で in_dquote=True なら未終端ダブルクォート文字列。
+        # 行内のセミコロンはコメントとして扱われていないため出力に残る。
+        # 問題をユーザーに知らせるために警告を出す。
+        if in_dquote:
+            print(f" warning - unterminated string literal in line: {l!r}")
         return l.rstrip()
     
     @staticmethod
@@ -343,6 +362,11 @@ class StringUtils:
                     while idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF' and len(hex_str) < 2:
                         hex_str += l2[idx]
                         idx += 1
+                    # Fix 9: 3桁以上の16進数字が続く場合、余剰桁はそのまま文字列として
+                    # 出力されるためユーザーが気づきにくい。警告を出す。
+                    if idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF':
+                        print(f" warning - '\\x' escape takes at most 2 hex digits; "
+                              f"extra digit(s) treated as literal characters in: {l2!r}")
                     if hex_str:
                         s += chr(int(hex_str, 16))
                     else:
@@ -515,11 +539,20 @@ class Parser:
         return s.rstrip(' \t'), idx
 
 def enfloat(a):
-    float_value = struct.unpack('f', struct.pack('I', a))[0]
+    # Fix: a が 0〜2^32-1 の範囲外のとき struct.pack('I', a) は struct.error になる。
+    # 呼び出し元でマスクしているが念のため二重ガードする。
+    try:
+        float_value = struct.unpack('f', struct.pack('I', int(a) & 0xFFFFFFFF))[0]
+    except (struct.error, OverflowError, ValueError):
+        float_value = 0.0
     return float_value
 
 def endouble(a):
-    double_value = struct.unpack('d', struct.pack('Q', a))[0]
+    # Fix: a が 0〜2^64-1 の範囲外のとき struct.pack('Q', a) は struct.error になる。
+    try:
+        double_value = struct.unpack('d', struct.pack('Q', int(a) & 0xFFFFFFFFFFFFFFFF))[0]
+    except (struct.error, OverflowError, ValueError):
+        double_value = 0.0
     return double_value
 
 # enflt / endbl は enfloat / endouble の別名。
@@ -638,6 +671,18 @@ class IEEE754Converter:
                 normalized *= 2
 
             biased_exp = exp_unbiased + BIAS
+
+            # Fix: 非常に大きな数値（例: Decimal('1e100000')）は biased_exp が
+            # 最大指数 (1<<EXPONENT_BITS)-1 を超えて Infinity になる。
+            # 最大有限指数を超えた場合は +Infinity として扱う。
+            _MAX_EXP = (1 << EXPONENT_BITS) - 1
+            if biased_exp >= _MAX_EXP:
+                # Overflow → Infinity
+                sign_bit = sign
+                exponent = _MAX_EXP
+                fraction = 0
+                bits = (sign_bit << 127) | (exponent << SIGNIFICAND_BITS) | fraction
+                return f"0x{bits:032X}"
 
             if biased_exp <= 0:
                 # サブノーマル数
@@ -805,7 +850,12 @@ class VariableManager:
             elif isinstance(v, float) and not v.is_integer():
                 self.state.vars[c - ord('A')] = v
             else:
-                self.state.vars[c - ord('A')] = int(v)
+                # Fix: float('inf') / float('nan') / Decimal('Infinity') などは
+                # int() が OverflowError / ValueError になる。非有限値はそのまま保持。
+                try:
+                    self.state.vars[c - ord('A')] = int(v)
+                except (OverflowError, ValueError):
+                    self.state.vars[c - ord('A')] = v
 
 class LabelManager:
     """Manages assembly labels"""
@@ -912,9 +962,16 @@ class LabelManager:
         for key, value in self.state.labels.items():
             num = value[0]
             section = value[1]
-            # 修正: UNDEF (256ビット整数) をそのまま hex() すると64桁の文字列になり
-            # 視認性がゼロになる。UNDEF は専用の文字列で表示する。
-            num_str = "UNDEF" if num == UNDEF else hex(num)
+            # UNDEF (256ビット整数) は専用文字列、float は repr()、int は hex() で表示。
+            if num == UNDEF:
+                num_str = "UNDEF"
+            elif isinstance(num, float):
+                num_str = repr(num)
+            else:
+                try:
+                    num_str = hex(int(num))
+                except (TypeError, ValueError, OverflowError):
+                    num_str = repr(num)
             result[key] = [num_str, section]
         print(result)
         
@@ -977,10 +1034,23 @@ class ExpressionEvaluator:
             x = self.state.vcnt
             idx += 3
         elif idx < len(s) and s[idx] == '-':
-            x, idx = self.factor(s, idx + 1)
+            # Fix: 深くネストした単項マイナス（例: ----x）は RecursionError になりうる。
+            # Python のデフォルト再帰限界は ~1000 であり、悪意あるまたは誤った入力で
+            # クラッシュする。try/except で安全に 0 を返す。
+            try:
+                x, idx = self.factor(s, idx + 1)
+            except RecursionError:
+                if self.state.pas == 2 or self.state.pas == 0:
+                    print(" error - expression nesting too deep (RecursionError) in unary '-'.")
+                return 0, idx
             x = -x
         elif idx < len(s) and s[idx] == '~':
-            x, idx = self.factor(s, idx + 1)
+            try:
+                x, idx = self.factor(s, idx + 1)
+            except RecursionError:
+                if self.state.pas == 2 or self.state.pas == 0:
+                    print(" error - expression nesting too deep (RecursionError) in unary '~'.")
+                return 0, idx
             # Fix: x が float('inf') / float('nan') のとき int(x) が OverflowError になる。
             # nbit() と同じ方針: 非有限の float は 0 として扱う。
             try:
@@ -990,7 +1060,12 @@ class ExpressionEvaluator:
                     print(f" error - cannot apply bitwise NOT (~) to non-finite float value.")
                 x = 0
         elif idx < len(s) and s[idx] == '@':
-            x, idx = self.factor(s, idx + 1)
+            try:
+                x, idx = self.factor(s, idx + 1)
+            except RecursionError:
+                if self.state.pas == 2 or self.state.pas == 0:
+                    print(" error - expression nesting too deep (RecursionError) in unary '@'.")
+                return 0, idx
             x = self.nbit(x)
         elif idx < len(s) and s[idx] == '*':
             if idx+1<len(s) and s[idx+1] == '(':
@@ -1032,8 +1107,18 @@ class ExpressionEvaluator:
                 print(" error - expected '(' after '*' in *(expr,expr) expression.")
                 # x=0, idx unchanged
         else:
+            prev_idx = idx
             x, idx = self.factor1(s, idx)
-        
+            # Fix 2: factor1 が何も消費せず (idx 不変) かつ NUL でも終端でもない位置で
+            # 停止した場合、未知トークンがサイレントに 0 になっている。
+            # pass2/対話モードのみ警告を出す（pass1 は forward 参照で頻繁に発生するため抑制）。
+            if (idx == prev_idx
+                    and idx < len(s)
+                    and s[idx] not in (chr(0), ',', ')', ']', CB, ' ', '\t')
+                    and (self.state.pas == 2 or self.state.pas == 0)):
+                print(f" warning - unrecognized token at position {idx} in expression: "
+                      f"{s[idx:idx+8]!r} (treated as 0)")
+
         idx = StringUtils.skipspc(s, idx)
         return x, idx
 
@@ -1089,7 +1174,14 @@ class ExpressionEvaluator:
                 elif self.state._elf_current_word_idx >= 0:
                     self.state._elf_label_refs_seen.append(
                         (label_name, val, self.state._elf_current_word_idx))
-            return hex(val)
+            # Fix 1: val が float の場合 hex() は TypeError になる。
+            # exp_typ='f' モードで定義された .equ ラベルは float を持ちうる。
+            # 非有限 float (inf/nan) および OverflowError も安全に処理する。
+            try:
+                return hex(int(val))
+            except (TypeError, ValueError, OverflowError):
+                self.state.error_undefined_label = True
+                return hex(0)
 
         s = re.sub(pattern, replacer, x)
 
@@ -1237,7 +1329,10 @@ class ExpressionEvaluator:
             if idx < len(s) and s[idx] == '{':
                 # get_curlb で {} 内の式テキスト全体を取得（算術式に対応）
                 f, t, idx = self.parser.get_curlb(s, idx)
-                if f:
+                if not f:
+                    # get_curlb は既にエラーを表示済み。x=0 のまま返る。
+                    pass
+                elif f:
                     try:
                         h = IEEE754Converter.decimal_eval_expr(t)
                     except (ValueError, ZeroDivisionError):
@@ -1277,8 +1372,15 @@ class ExpressionEvaluator:
                 elif t == '-inf':
                     x = 0xfff0000000000000
                 else:
-                    v = float(self.xeval(t, None))
-                    x = int.from_bytes(struct.pack('>d', v), "big")
+                    # Fix: xeval が UNDEF 由来の巨大整数を返すと float() / struct.pack で
+                    # OverflowError / struct.error が発生する。
+                    try:
+                        v = float(self.xeval(t, None))
+                        x = int.from_bytes(struct.pack('>d', v), "big")
+                    except (OverflowError, ValueError, struct.error):
+                        if self.state.pas == 2 or self.state.pas == 0:
+                            print(f" error - dbl{{}}: cannot convert expression to float64; using 0.")
+                        x = 0
         elif (idx + 3 <= len(s) and s[idx:idx+3] == 'flt'
               # Bugfix: 'flt' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
               and (lambda _j=StringUtils.skipspc(s, idx + 3): _j < len(s) and s[_j] == '{')()):
@@ -1292,8 +1394,15 @@ class ExpressionEvaluator:
                 elif t == '-inf':
                     x = 0xff800000
                 else:
-                    v = float(self.xeval(t, None))
-                    x = int.from_bytes(struct.pack('>f', v), "big")
+                    # Fix: xeval が UNDEF 由来の巨大整数を返すと float() / struct.pack で
+                    # OverflowError / struct.error が発生する。
+                    try:
+                        v = float(self.xeval(t, None))
+                        x = int.from_bytes(struct.pack('>f', v), "big")
+                    except (OverflowError, ValueError, struct.error):
+                        if self.state.pas == 2 or self.state.pas == 0:
+                            print(f" error - flt{{}}: cannot convert expression to float32; using 0.")
+                        x = 0
         elif (idx + 5 <= len(s) and s[idx:idx+5] == 'enflt'
               # Bugfix: 'enflt' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
               and (lambda _j=StringUtils.skipspc(s, idx + 5): _j < len(s) and s[_j] == '{')()):
@@ -1325,7 +1434,13 @@ class ExpressionEvaluator:
                         print(" error - enflt{}: expression contains undefined label.")
                     x = enflt(0)
                 else:
-                    x = enflt(int(v) & 0xFFFFFFFF)
+                    # Fix: v が float('inf')/nan のとき int(v) は OverflowError になる。
+                    try:
+                        x = enflt(int(v) & 0xFFFFFFFF)
+                    except (OverflowError, ValueError):
+                        if self.state.pas == 2 or self.state.pas == 0:
+                            print(" error - enflt{}: non-finite float value; using 0.")
+                        x = enflt(0)
         elif (idx + 5 <= len(s) and s[idx:idx+5] == 'endbl'
               # Bugfix: 'endbl' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
               and (lambda _j=StringUtils.skipspc(s, idx + 5): _j < len(s) and s[_j] == '{')()):
@@ -1345,13 +1460,24 @@ class ExpressionEvaluator:
                         print(" error - endbl{}: expression contains undefined label.")
                     x = endbl(0)
                 else:
-                    x = endbl(int(v) & 0xFFFFFFFFFFFFFFFF)
+                    # Fix: v が float('inf')/nan のとき int(v) は OverflowError になる。
+                    try:
+                        x = endbl(int(v) & 0xFFFFFFFFFFFFFFFF)
+                    except (OverflowError, ValueError):
+                        if self.state.pas == 2 or self.state.pas == 0:
+                            print(" error - endbl{}: non-finite float value; using 0.")
+                        x = endbl(0)
         elif self.state.exp_typ=='i' and idx < len(s) and s[idx].isdigit():
                 fs, idx = self.parser.get_intstr(s, idx)
                 x = int(fs)  # int(float(fs)) would lose precision for large integers
         elif self.state.exp_typ=='f' and idx < len(s) and (self.parser.isfloatstr(s,idx)):
                 fs,idx = self.parser.get_floatstr(s,idx)
-                x = float(fs)
+                # Fix: get_floatstr が空文字列を返した場合（例: 小数点のみ '.'）は
+                # float('') が ValueError になる。0.0 として扱う。
+                try:
+                    x = float(fs) if fs else 0.0
+                except ValueError:
+                    x = 0.0
         elif (idx < len(s) and
               s[idx] in LOWER and (idx + 1 >= len(s) or s[idx+1] not in self.state.lwordchars)):
             ch = s[idx]
@@ -1522,12 +1648,21 @@ class ExpressionEvaluator:
                 break
         return x, idx
     
+    def _safe_int(self, v, op_name):
+        """float/Decimal を安全に int に変換する。非有限値はエラーを出して 0 を返す。"""
+        try:
+            return int(v)
+        except (OverflowError, ValueError):
+            if self.state.pas == 2 or self.state.pas == 0:
+                print(f" error - non-finite value {v!r} in bitwise '{op_name}' operation; treated as 0.")
+            return 0
+
     def term3(self, s, idx):
         """Handle bitwise AND"""
         x, idx = self.term2(s, idx)
         while idx < len(s) and s[idx] == '&' and (idx + 1 >= len(s) or s[idx+1] != '&'):
             t, idx = self.term2(s, idx + 1)
-            x = int(x) & int(t)
+            x = self._safe_int(x, '&') & self._safe_int(t, '&')
         return x, idx
     
     def term4(self, s, idx):
@@ -1535,7 +1670,7 @@ class ExpressionEvaluator:
         x, idx = self.term3(s, idx)
         while idx < len(s) and s[idx] == '|' and (idx + 1 >= len(s) or s[idx+1] != '|'):
             t, idx = self.term3(s, idx + 1)
-            x = int(x) | int(t)
+            x = self._safe_int(x, '|') | self._safe_int(t, '|')
         return x, idx
     
     def term5(self, s, idx):
@@ -1543,7 +1678,7 @@ class ExpressionEvaluator:
         x, idx = self.term4(s, idx)
         while idx < len(s) and s[idx] == '^':
             t, idx = self.term4(s, idx + 1)
-            x = int(x) ^ int(t)
+            x = self._safe_int(x, '^') ^ self._safe_int(t, '^')
         return x, idx
     
     def term6(self, s, idx):
@@ -1668,63 +1803,59 @@ class ExpressionEvaluator:
         """
         x, idx = self.term10(s, idx)
         if idx < len(s) and StringUtils.q(s, '?', idx):
-            # 真ブランチを評価する前に vars / error / ELF 追跡状態を保存
+            # Fix 6: 両ブランチを評価してから副作用をロールバックする方式は
+            # ネストが深いほどスナップショットのコピーコストが増大する。
+            # _elf_label_refs_seen は list コピーが高コストになりうるため、
+            # スナップショット時点の長さを記録し、ロールバックはスライスで行う。
             saved_vars              = self.state.vars[:]
             saved_err_undef         = self.state.error_undefined_label
-            saved_err_conflict      = self.state.error_label_conflict   # Fix: 追加
-            saved_elf_refs          = list(self.state._elf_label_refs_seen)
+            saved_err_conflict      = self.state.error_label_conflict
+            saved_elf_refs_len      = len(self.state._elf_label_refs_seen)   # Fix 6
             saved_elf_v2l           = dict(self.state._elf_var_to_label)
 
             t, idx = self.term11(s, idx + 1)   # 真ブランチ評価（右結合）
             vars_after_true         = self.state.vars[:]
-            err_after_true          = self.state.error_undefined_label  # Fix ⑦
-            conflict_after_true     = self.state.error_label_conflict   # Fix: 追加
+            err_after_true          = self.state.error_undefined_label
+            conflict_after_true     = self.state.error_label_conflict
             refs_after_true         = list(self.state._elf_label_refs_seen)  # Fix ⑫
             v2l_after_true          = dict(self.state._elf_var_to_label)     # Fix ⑫
 
             if idx < len(s) and StringUtils.q(s, ':', idx):
                 # 偽ブランチ評価前に vars / ELF 追跡状態を元の状態に戻す
                 self.state.vars                     = saved_vars[:]
-                self.state.error_undefined_label    = saved_err_undef   # Fix: 追加
-                self.state.error_label_conflict     = saved_err_conflict  # Fix: 追加
-                self.state._elf_label_refs_seen     = list(saved_elf_refs)  # Fix ⑫
-                self.state._elf_var_to_label        = dict(saved_elf_v2l)   # Fix ⑫
+                self.state.error_undefined_label    = saved_err_undef
+                self.state.error_label_conflict     = saved_err_conflict
+                # Fix 6: スライスで saved 長さまで切り戻す（新規コピー不要）
+                del self.state._elf_label_refs_seen[saved_elf_refs_len:]
+                self.state._elf_var_to_label        = dict(saved_elf_v2l)
                 u, idx = self.term11(s, idx + 1)  # 偽ブランチ評価（右結合）
-                err_after_false         = self.state.error_undefined_label  # Fix ⑦
-                conflict_after_false    = self.state.error_label_conflict    # Fix: 追加
+                err_after_false         = self.state.error_undefined_label
+                conflict_after_false    = self.state.error_label_conflict
 
                 if x != 0:
                     # 条件が真: 真ブランチの値・変数状態・エラーフラグ・ELF状態を採用
                     self.state.vars                     = vars_after_true
-                    self.state.error_undefined_label    = err_after_true      # Fix ⑦
-                    self.state.error_label_conflict     = conflict_after_true  # Fix: 追加
-                    self.state._elf_label_refs_seen     = refs_after_true      # Fix ⑫
-                    self.state._elf_var_to_label        = v2l_after_true       # Fix ⑫
+                    self.state.error_undefined_label    = err_after_true
+                    self.state.error_label_conflict     = conflict_after_true
+                    self.state._elf_label_refs_seen     = refs_after_true
+                    self.state._elf_var_to_label        = v2l_after_true
                     x = t
                 else:
                     # 条件が偽: 偽ブランチの値・変数状態・エラーフラグをそのまま使う
-                    # (self.state.vars / _elf_* / error_* は既に偽ブランチのもの)
                     x = u
             else:
                 # ':' がない不完全な三項演算子: a?b の形式。
-                # 条件が真なら真ブランチを、偽なら 0 を返す。
-                # 旧実装は条件の真偽に関わらず常に t を返していたため、
-                # 条件が偽（x==0）でも真ブランチの値が使われる誤りがあった。
                 if x != 0:
-                    self.state.error_undefined_label    = err_after_true     # Fix ⑦
-                    self.state.error_label_conflict     = conflict_after_true  # Fix: 追加
-                    # ELF 状態は真ブランチのものがすでにセットされているのでそのまま
+                    self.state.error_undefined_label    = err_after_true
+                    self.state.error_label_conflict     = conflict_after_true
                     x = t
                 else:
-                    # 条件が偽: 真ブランチの副作用（変数変更・ELF追跡）を取り消し、0 を返す
+                    # 条件が偽: 真ブランチの副作用を取り消し、0 を返す
                     self.state.vars                     = saved_vars
-                    # Fix: 旧実装は False をハードコードしていたため、条件式の評価中に
-                    # 検出された未定義ラベルフラグ（saved_err_undef）が消えてしまっていた。
-                    # 正しくは「真ブランチ評価前の状態」= saved_err_undef に戻す。
                     self.state.error_undefined_label    = saved_err_undef
-                    self.state.error_label_conflict     = saved_err_conflict  # Fix: 追加
-                    self.state._elf_label_refs_seen     = list(saved_elf_refs)  # Fix ⑫
-                    self.state._elf_var_to_label        = dict(saved_elf_v2l)   # Fix ⑫
+                    self.state.error_label_conflict     = saved_err_conflict
+                    del self.state._elf_label_refs_seen[saved_elf_refs_len:]  # Fix 6
+                    self.state._elf_var_to_label        = dict(saved_elf_v2l)
                     x = 0
         return x, idx
     
@@ -1874,26 +2005,34 @@ class BinaryWriter:
         if total_size <= 0:
             return
 
+        # Fix: total_size が非常に大きい場合（例: .ORG で PC を巨大値にセット後に出力）
+        # bytearray(total_size) がメモリ不足でクラッシュする。現実的な上限を設ける。
+        _MAX_OUTPUT_BYTES = 1 << 30  # 1 GB
+        if total_size > _MAX_OUTPUT_BYTES:
+            print(f" error - output size {total_size} bytes exceeds maximum {_MAX_OUTPUT_BYTES}. "
+                  f"Check for incorrect .ORG or address values.",
+                  file=__import__('sys').stderr)
+            return
+
         # 修正8: .padding で設定した state.padding 値で全ワードを初期化してから
         # 実際に書き込まれたワードで上書きする。
-        # 旧実装は bytearray(total_size) でゼロ初期化のみ行い padding を無視していた。
-        # ROM の未使用領域を 0xFF で埋める用途などで誤った出力が生成されていた。
-        data = bytearray(total_size)
+        # Fix (perf): 1ワードのバイトパターンを bytes で構築してから *repeat で
+        # 全バッファを一括初期化する。Python ループより大幅に速い。
         pad_val = int(self.state.padding) & ((1 << word_bits) - 1)
         if pad_val != 0:
-            for pos in range(max_word_pos + 1):
-                base_idx = pos * bytes_per_word
-                tmp = pad_val
-                if self.state.endian == 'little':
-                    for i in range(bytes_per_word):
-                        if base_idx + i < total_size:
-                            data[base_idx + i] = tmp & 0xff
-                        tmp >>= 8
-                else:
-                    for i in range(bytes_per_word - 1, -1, -1):
-                        if base_idx + i < total_size:
-                            data[base_idx + i] = tmp & 0xff
-                        tmp >>= 8
+            tmp = pad_val
+            if self.state.endian == 'little':
+                pad_bytes = bytes([(tmp >> (8 * i)) & 0xff for i in range(bytes_per_word)])
+            else:
+                pad_bytes = bytes([(tmp >> (8 * (bytes_per_word - 1 - i))) & 0xff
+                                   for i in range(bytes_per_word)])
+            data = bytearray(pad_bytes * (max_word_pos + 1))
+            # total_size と実際のバイト数が一致することを確認（truncate/extend）
+            if len(data) != total_size:
+                data = bytearray(data[:total_size]) if len(data) > total_size \
+                       else data + bytearray(total_size - len(data))
+        else:
+            data = bytearray(total_size)
 
         for pos, val in valid_buffer.items():
             # 書き込み先のバイト位置を特定
@@ -1936,13 +2075,20 @@ class BinaryWriter:
     def outbin2(self, a, x):
         """Output binary without printing"""
         if self.state.pas == 2 or self.state.pas == 0:
-            self.fwrite(a, int(x), 0)
+            try:
+                self.fwrite(a, int(x), 0)
+            except (OverflowError, ValueError):
+                if self.state.pas == 2 or self.state.pas == 0:
+                    print(f" error - non-finite value {x!r} cannot be written as binary word.")
 
-    
     def outbin(self, a, x):
         """Output binary with printing"""
         if self.state.pas == 2 or self.state.pas == 0:
-            self.fwrite(a, int(x), 1)
+            try:
+                self.fwrite(a, int(x), 1)
+            except (OverflowError, ValueError):
+                if self.state.pas == 2 or self.state.pas == 0:
+                    print(f" error - non-finite value {x!r} cannot be written as binary word.")
     
     def align_(self, addr):
         """Align address"""
@@ -2017,14 +2163,19 @@ class DirectiveProcessor:
                 self.state.endian = 'little'
             # それ以外 (数値等) はビット幅として後続の処理に渡す。エンディアン変更なし。
         
+        # Fix 3: エンディアン指定のみ (.bits big / .bits little) の場合は
+        # bts を変更しない。旧実装は else: v=8 で無条件に 8 に上書きしていた。
+        v = None
         if len(i) >= 3:
             v, idx = self.expr_eval.expression_pat(i[2], 0)
         elif len(i) >= 2 and i[1].lower() not in ('big', 'little'):
             # 引数が1つでエンディアン指定でない場合はそれがビット幅
             v, idx = self.expr_eval.expression_pat(i[1], 0)
-        else:
-            v = 8
-        self.state.bts = int(v)
+        if v is not None:
+            try:
+                self.state.bts = int(v)
+            except (OverflowError, ValueError):
+                print(f" error - .bits: non-finite bit width value.")
         return True
     
     def paddingp(self, i):
@@ -2043,7 +2194,10 @@ class DirectiveProcessor:
             v, idx = self.expr_eval.expression_pat(i[1], 0)
         else:
             v = 0
-        self.state.padding = int(v)
+        try:
+            self.state.padding = int(v)
+        except (OverflowError, ValueError):
+            print(f" error - .padding: non-finite or invalid value; padding unchanged.")
         return True
     
     def symbolc(self, i):
@@ -2069,10 +2223,15 @@ class DirectiveProcessor:
         v2, idx = self.expr_eval.expression_pat(i[2], 0)
         v3, idx = self.expr_eval.expression_pat(i[3], 0)
         v4, idx = self.expr_eval.expression_pat(i[4], 0)
-        
-        self.state.vliwbits = int(v1)
-        self.state.vliwinstbits = int(v2)
-        self.state.vliwtemplatebits = int(v3)
+
+        # Fix: v1/v2/v3 が非有限 float のとき int() は OverflowError になる。
+        try:
+            self.state.vliwbits        = int(v1)
+            self.state.vliwinstbits    = int(v2)
+            self.state.vliwtemplatebits = int(v3)
+        except (OverflowError, ValueError):
+            print(f" error - .vliw: non-finite parameter value.")
+            return False
         self.state.vliwflag = True
         
         l = []
@@ -2145,12 +2304,16 @@ class DirectiveProcessor:
             self.expr_eval.state.exp_typ = 'f'
             try:
                 u, idxn = self.expr_eval.expression_pat(s, idx)
+                idx = idxn
+                if idx < len(s) and s[idx] == ';':
+                    idx += 1
+                # Fix 8: エラーコード式（t）も同じ exp_typ='f' コンテキストで評価する。
+                # 旧実装は u の評価後に exp_typ を元に戻してから t を評価していたため、
+                # expmode/exp_typ の混在状態が生じ、整数リテラルのコードが float 解析に
+                # 切り替わらないケースがあった。
+                t, idx = self.expr_eval.expression_pat(s, idx)
             finally:
                 self.expr_eval.state.exp_typ = prev_typ
-            idx = idxn
-            if idx < len(s) and s[idx] == ';':
-                idx += 1
-            t, idx = self.expr_eval.expression_pat(s, idx)
             
             # Fix: idx が全く進まなかった → パース不能文字で無限ループになる。
             # 残りの文字を読み飛ばして終了する。
@@ -2289,8 +2452,15 @@ class PatternMatcher:
                         v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
                     finally:
                         self.state._elf_capturing_var = None
-                    v = float(v)
-                    v = int.from_bytes(struct.pack('>f', v), "big")
+                    # Fix: UNDEF や非有限値が渡ると float() や struct.pack で
+                    # OverflowError / struct.error が発生する。安全に 0 にフォールバック。
+                    try:
+                        v = float(v)
+                        v = int.from_bytes(struct.pack('>f', v), "big")
+                    except (OverflowError, ValueError, struct.error):
+                        if self.state.pas == 2 or self.state.pas == 0:
+                            print(f" error - !F: cannot convert value to float32; using 0.")
+                        v = 0
                     self.var_manager.put(a, v)
                     # consume stopchar from source as well
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
@@ -2318,8 +2488,15 @@ class PatternMatcher:
                         v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
                     finally:
                         self.state._elf_capturing_var = None
-                    v = float(v)
-                    v = int.from_bytes(struct.pack('>d', v), "big")
+                    # Fix: UNDEF や非有限値が渡ると float() や struct.pack で
+                    # OverflowError / struct.error が発生する。安全に 0 にフォールバック。
+                    try:
+                        v = float(v)
+                        v = int.from_bytes(struct.pack('>d', v), "big")
+                    except (OverflowError, ValueError, struct.error):
+                        if self.state.pas == 2 or self.state.pas == 0:
+                            print(f" error - !D: cannot convert value to float64; using 0.")
+                        v = 0
                     self.var_manager.put(a, v)
                     # consume stopchar from source as well
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
@@ -2464,6 +2641,16 @@ class PatternMatcher:
         cnt = t.count(OB)
         sl = [_ + 1 for _ in range(cnt)]
 
+        # Fix: cnt が大きいとき組み合わせ数は 2^cnt になり事実上無限ループになる。
+        # 現実のパターンファイルで [[]] が 20 を超えることはないため上限を設ける。
+        _MAX_OPT_GROUPS = 20
+        if cnt > _MAX_OPT_GROUPS:
+            if self.state.pas == 2 or self.state.pas == 0:
+                print(f" warning - pattern has {cnt} optional groups (max {_MAX_OPT_GROUPS}); "
+                      f"truncating to avoid combinatorial explosion.")
+            sl = sl[:_MAX_OPT_GROUPS]
+            cnt = _MAX_OPT_GROUPS
+
         for i in range(len(sl) + 1):
             ll = list(itertools.combinations(sl, i))
             for j in ll:
@@ -2490,7 +2677,7 @@ class PatternFileReader:
     def __init__(self, parser):
         self.parser = parser
     
-    def readpat(self, fn, base_dir=None):
+    def readpat(self, fn, base_dir=None, _depth=0):
         """Read pattern file.
 
         base_dir: 呼び出し元パターンファイルのディレクトリ。
@@ -2500,6 +2687,12 @@ class PatternFileReader:
         戻り値: パターンエントリのリスト。ファイルが存在しない・読めない場合は例外を伝播する。
         """
         if fn == '':
+            return []
+
+        # Fix: 深い .INCLUDE ネストは RecursionError になる。現実的な上限を設ける。
+        _MAX_PAT_DEPTH = 50
+        if _depth > _MAX_PAT_DEPTH:
+            print(f" error - pattern .INCLUDE nesting exceeds {_MAX_PAT_DEPTH}: '{fn}'")
             return []
         
         # 相対パスを解決する
@@ -2523,7 +2716,7 @@ class PatternFileReader:
                 l = l.replace('\n', '')
                 l = StringUtils.reduce_spaces(l)
                 
-                ww = self.include_pat(l, this_dir)
+                ww = self.include_pat(l, this_dir, _depth=_depth + 1)
                 if ww is not None:   # Fix: None=非.INCLUDE行, []=空/エラー, list=パターン
                     w = w + ww
                     continue
@@ -2560,7 +2753,7 @@ class PatternFileReader:
         
         return w
     
-    def include_pat(self, l, base_dir=None):
+    def include_pat(self, l, base_dir=None, _depth=0):
         """Include pattern directive.
 
         修正7: 旧実装は StringUtils.skipspc で先頭スペースをスキップして
@@ -2606,7 +2799,7 @@ class PatternFileReader:
             else:
                 print(f" error - .INCLUDE directive has no filename: {l!r}")
                 return []   # マッチしたがエラー → 空リスト
-        w = self.readpat(s, base_dir)
+        w = self.readpat(s, base_dir, _depth=_depth)
         return w   # 空ファイルなら [] だが呼び出し元で区別される
 
 
@@ -2995,6 +3188,9 @@ class AssemblyDirectiveProcessor:
                 # 安全のため .EQU 以降の部分文字列だけを渡し、idx=0 から解析させる。
                 expr_part = l[idx:]
                 u, _ = self.expr_eval.expression_asm(expr_part, 0)
+                # Fix: pass2/対話モードで .EQU の式に未定義ラベルが残っていたらエラー報告。
+                if self.state.error_undefined_label and (self.state.pas == 2 or self.state.pas == 0):
+                    print(f" error - .EQU '{label}': expression contains undefined label.")
                 # is_equ=True: 定数ラベル（.equ 式の結果）はリロケーション対象外
                 self.label_manager.put_value(label, u, self.state.current_section, is_equ=True)
                 return ""
@@ -3055,6 +3251,9 @@ class AssemblyDirectiveProcessor:
             if ch is not None:
                 self.binary_writer.outbin(self.state.pc, ord(ch))
                 self.state.pc += 1
+        # Fix: 閉じダブルクォートが見つからずループを抜けた場合は警告する
+        if idx >= len(l2):
+            print(f" warning - unterminated string literal in .ASCII/.ASCIIZ: {l2!r}")
         return True
     
     def export_processing(self, l1, l2):
@@ -3105,9 +3304,20 @@ class AssemblyDirectiveProcessor:
             if self.state.pas == 2 or self.state.pas == 0:
                 print(f" error - .ZERO argument contains undefined label.")
             return True
-        x = int(x)
+        try:
+            x = int(x)
+        except (OverflowError, ValueError):
+            if self.state.pas == 2 or self.state.pas == 0:
+                print(f" error - .ZERO argument is non-finite or invalid.")
+            return True
         if x < 0:
             print(f" error - .ZERO requires a non-negative count, got {x}.")
+            return True
+        # Fix: 上限ガード（UNDEF 由来の巨大値でのフリーズ防止）
+        _ZERO_MAX = 1 << 28  # 256MB 超は非現実的
+        if x > _ZERO_MAX:
+            if self.state.pas == 2 or self.state.pas == 0:
+                print(f" error - .ZERO count {x} exceeds maximum {_ZERO_MAX}.")
             return True
         for i in range(x):
             self.binary_writer.outbin2(self.state.pc, 0x00)
@@ -3202,10 +3412,16 @@ class AssemblyDirectiveProcessor:
         if l2 != '':
             u, idx = self.expr_eval.expression_asm(l2, 0)
             # Fix 6: .ALIGN 0 や負値は不正。ゼロ除算を防ぐためここで検証する。
-            if int(u) <= 0:
-                print(f" error - .ALIGN requires a positive value, got {int(u)}.")
+            # Fix: u が float('inf')/nan の場合も int() で OverflowError になるためガード。
+            try:
+                u_int = int(u)
+            except (OverflowError, ValueError):
+                print(f" error - .ALIGN argument is non-finite or invalid.")
                 return True
-            self.state.align = int(u)
+            if u_int <= 0:
+                print(f" error - .ALIGN requires a positive value, got {u_int}.")
+                return True
+            self.state.align = u_int
         
         self.state.pc = self.binary_writer.align_(self.state.pc)
         return True
@@ -3257,16 +3473,26 @@ class AssemblyDirectiveProcessor:
             if self.state.pas == 2 or self.state.pas == 0:
                 print(f" error - .ORG argument contains undefined label.")
             return True
-        u = int(u)
-        # Fix 3 (new): 負のアドレスは不正。PC が負になると outbin・align_ で
-        # 負のインデックスが生じ、バイナリ出力が壊れる。
+        try:
+            u = int(u)
+        except (OverflowError, ValueError):
+            if self.state.pas == 2 or self.state.pas == 0:
+                print(f" error - .ORG argument is non-finite or invalid.")
+            return True
         if u < 0:
             if self.state.pas == 2 or self.state.pas == 0:
                 print(f" error - .ORG address must be non-negative, got {u}.")
             return True
         if idx + 2 <= len(l2) and l2[idx:idx+2].upper() == ',P':
             if u > self.state.pc:
-                for i in range(u - self.state.pc):
+                # Fix: 巨大なジャンプでフリーズしないよう上限ガード
+                _ORG_FILL_MAX = 1 << 28
+                fill_count = u - self.state.pc
+                if fill_count > _ORG_FILL_MAX:
+                    if self.state.pas == 2 or self.state.pas == 0:
+                        print(f" error - .ORG ,P fill count {fill_count} exceeds maximum {_ORG_FILL_MAX}.")
+                    return True
+                for i in range(fill_count):
                     self.binary_writer.outbin2(i + self.state.pc, self.state.padding)
         self.state.pc = u
         return True
@@ -3581,37 +3807,11 @@ class Assembler:
                 _in_dq_v = not _in_dq_v
                 _vpart_buf.append(_vc)
             elif _vc == "'" and not _in_dq_v:
-                # シングルクォートリテラルを先読みで丸ごと消費する（Fix ⑦ 方式）
-                # 消費できた場合は !! を区切りとして認識しない
-                _j = _vi + 1
-                _sq_consumed = False
-                if _j < len(line) and line[_j] == '\\' and _j + 1 < len(line):
-                    _esc = line[_j + 1]
-                    if _esc in 'xX':
-                        # '\xNN' 形式: 16進数字を最大2桁読んでから閉じクォートを探す
-                        _k = _j + 2
-                        _nd = 0
-                        while _k < len(line) and line[_k] in '0123456789abcdefABCDEF' and _nd < 2:
-                            _k += 1
-                            _nd += 1
-                        if _k < len(line) and line[_k] == "'":
-                            _vpart_buf.extend(list(line[_vi:_k + 1]))
-                            _vi = _k + 1
-                            _sq_consumed = True
-                    elif _j + 2 < len(line) and line[_j + 2] == "'":
-                        # '\x' 形式（4文字）を消費
-                        _vpart_buf.extend(list(line[_vi:_j + 3]))
-                        _vi = _j + 3
-                        _sq_consumed = True
-                elif _j < len(line) and _j + 1 < len(line) and line[_j + 1] == "'":
-                    # 'x' 形式（3文字）を消費
-                    _vpart_buf.extend(list(line[_vi:_j + 2]))
-                    _vi = _j + 2
-                    _sq_consumed = True
-                if not _sq_consumed:
-                    # 対応する閉じクォートが見つからない孤立クォート: そのまま通過
-                    _vpart_buf.append(_vc)
-                    _vi += 1
+                # Fix 5 (DRY): 共通ヘルパーでシングルクォートリテラルを消費する。
+                _new_vi = StringUtils.skip_squote_literal(line, _vi)
+                # 消費した文字をバッファに記録（このパートが空でないことを保証するため）
+                _vpart_buf.extend(list(line[_vi:_new_vi]))
+                _vi = _new_vi
                 continue
             elif not _in_dq_v and line[_vi:_vi+2] == '!!':
                 _vparts.append(''.join(_vpart_buf))
@@ -3845,6 +4045,13 @@ class Assembler:
         # fnstack には現在開いているファイルのパスが積まれている。
         # 同じ絶対パスが既にスタックに存在する場合は循環と判断してエラーを出す。
         # 比較は絶対パスで行い、相対パス表記の違いによる見落としを防ぐ。
+
+        # Fix: 非循環でも深いネストは Python の再帰限界でクラッシュする。
+        # 現実的な上限 (100段) を設けてエラーを出す。
+        _MAX_INCLUDE_DEPTH = 100
+        if len(self.state.fnstack) >= _MAX_INCLUDE_DEPTH:
+            print(f" error - .INCLUDE nesting depth exceeds {_MAX_INCLUDE_DEPTH}: '{fn}'")
+            return
         try:
             abs_fn = os.path.abspath(fn) if fn not in ("stdin", "") else fn
         except Exception:
@@ -4534,8 +4741,10 @@ class Assembler:
                 # object() を使う。これにより初回に収束したケースも正しく break できる。
                 # （空ソースや全ラベルが .equ のみのケースで1パス節約できる）
                 MAX_RELAX = 8
-                _SENTINEL = object()
-                self.state._pass1_prev_label_pcs = _SENTINEL
+                # Fix 7: _SENTINEL をモジュールレベル定数に変更。
+                # ローカルの object() では run() を複数回呼び出したとき
+                # 前回の state._pass1_prev_label_pcs と比較できなくなる。
+                self.state._pass1_prev_label_pcs = _RELAXATION_SENTINEL
 
                 # Fix 5: リラクゼーションループの先頭で labels = {} にリセットすると
                 # -i オプションでインポートしたラベルも消えてしまう。
@@ -4591,10 +4800,10 @@ class Assembler:
                         # is_equ=True の定数ラベルは除外（任意の大きさの整数値を持てる）
                         if not (len(self.state.labels[k]) > 2 and self.state.labels[k][2])
                     )
-                    # 修正⑤: _SENTINEL との比較は必ず False なので初回は無条件続行。
+                    # 修正⑤: _RELAXATION_SENTINEL との比較は必ず False なので初回は無条件続行。
                     # 2回目以降は前回と一致しかつ UNDEF がなければ収束と判定できる。
                     if (not has_undef
-                            and self.state._pass1_prev_label_pcs is not _SENTINEL
+                            and self.state._pass1_prev_label_pcs is not _RELAXATION_SENTINEL
                             and current_pcs == self.state._pass1_prev_label_pcs):
                         if self.state.debug:
                             print(f"Pass1 relaxation converged after {relax_iter + 1} iteration(s)", file=sys.stderr)
@@ -4662,8 +4871,13 @@ class Assembler:
                             flag = ''
                         w_start = self.state.sections[i][0]
                         w_count = self.state.sections[i][1]
-                        byte_start = w_start * _bpw_export
-                        byte_size  = w_count * _bpw_export
+                        # Fix: w_start / w_count が float のケースに備えて int に変換する。
+                        try:
+                            byte_start = int(w_start) * _bpw_export
+                            byte_size  = int(w_count) * _bpw_export
+                        except (OverflowError, ValueError, TypeError):
+                            byte_start = 0
+                            byte_size  = 0
                         label_file.write(
                             f"{i}\t{byte_start:#x}\t{byte_size:#x}\t{flag}\n"
                         )
@@ -4673,7 +4887,14 @@ class Assembler:
                         # レンジ検索するため、bpw を掛けてバイト変換してから出力する。
                         # ただし is_equ=True の定数ラベルは絶対値なので変換しない。
                         lbl_is_equ = len(i[1]) > 2 and i[1][2]
-                        lbl_addr = i[1][0] if lbl_is_equ else i[1][0] * _bpw_export
+                        lbl_addr_raw = i[1][0] if lbl_is_equ else i[1][0] * _bpw_export
+                        # Fix: lbl_addr が float のとき {:#x} は TypeError になる。
+                        # .equ ラベルは float 値を持ちうるので int に変換する。
+                        # 非有限 float は 0 に置き換えてエラーを避ける。
+                        try:
+                            lbl_addr = int(lbl_addr_raw)
+                        except (OverflowError, ValueError, TypeError):
+                            lbl_addr = 0
                         label_file.write(f"{i[0]}\t{lbl_addr:#x}\n")
 
             if self.state.expfile:
