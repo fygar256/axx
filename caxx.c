@@ -422,7 +422,8 @@ typedef struct LabelEntry {
     char          *key;
     uint256_t      value;
     char          *section;
-    int            is_equ;   /* 1 if defined via .equ – not relocatable */
+    int            is_equ;       /* 1 if defined via .equ – not relocatable */
+    int            is_imported;  /* 1 if declared via .EXTERN – STB_GLOBAL/SHN_UNDEF in ELF */
     struct LabelEntry *next;
 } LabelEntry;
 
@@ -462,11 +463,46 @@ static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *se
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
     for(LabelEntry*e=m->buckets[h];e;e=e->next){
         if(strcmp(e->key,key)==0){
-            e->value=val; free(e->section); e->section=strdup(sec); e->is_equ=is_equ; return;
+            e->value=val; free(e->section); e->section=strdup(sec); e->is_equ=is_equ;
+            /* preserve is_imported when updating an existing entry */
+            return;
         }
     }
     LabelEntry *e=calloc(1,sizeof(LabelEntry));
-    e->key=strdup(key); e->value=val; e->section=strdup(sec); e->is_equ=is_equ;
+    e->key=strdup(key); e->value=val; e->section=strdup(sec);
+    e->is_equ=is_equ; e->is_imported=0;
+    e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
+}
+/* Set a label as an imported external symbol (.EXTERN).
+ * Mirrors axx.py: labels[s] = [0, '.text', False, True] */
+static void lmap_set_imported(LabelMap *m, const char *key, uint256_t val, const char *sec) {
+    uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
+    for(LabelEntry*e=m->buckets[h];e;e=e->next){
+        if(strcmp(e->key,key)==0){
+            e->value=val; free(e->section); e->section=strdup(sec);
+            e->is_equ=0; e->is_imported=1;
+            return;
+        }
+    }
+    LabelEntry *e=calloc(1,sizeof(LabelEntry));
+    e->key=strdup(key); e->value=val; e->section=strdup(sec);
+    e->is_equ=0; e->is_imported=1;
+    e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
+}
+/* Copy all label fields including is_imported. Used for relaxation snapshots. */
+static void lmap_set_full(LabelMap *m, const char *key, uint256_t val,
+                          const char *sec, int is_equ, int is_imported) {
+    uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
+    for(LabelEntry*e=m->buckets[h];e;e=e->next){
+        if(strcmp(e->key,key)==0){
+            e->value=val; free(e->section); e->section=strdup(sec);
+            e->is_equ=is_equ; e->is_imported=is_imported;
+            return;
+        }
+    }
+    LabelEntry *e=calloc(1,sizeof(LabelEntry));
+    e->key=strdup(key); e->value=val; e->section=strdup(sec);
+    e->is_equ=is_equ; e->is_imported=is_imported;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
 }
 static AXX_UNUSED void lmap_delete(LabelMap *m, const char *key) {
@@ -975,12 +1011,28 @@ static void axx_get_string(const char *l2, char *out, size_t osz) {
             else if(nc=='n')  { out[n++]='\n'; idx+=2; }
             else if(nc=='t')  { out[n++]='\t'; idx+=2; }
             else if(nc=='r')  { out[n++]='\r'; idx+=2; }
+            else if(nc=='x'||nc=='X'){
+                /* Fix (axx.py port): \xNN hex escape – consume up to 2 hex digits. */
+                idx+=2;
+                char hex[3]; int hn=0;
+                while(l2[idx]&&is_xdigit_upper(axx_upper_char(l2[idx]))&&hn<2)
+                    hex[hn++]=l2[idx++];
+                hex[hn]=0;
+                if(hn>0){
+                    out[n++]=(char)(int)strtol(hex,NULL,16);
+                } else {
+                    /* \x with no hex digits: output literal 'x' */
+                    if(n<osz-1) out[n++]='x';
+                }
+            }
             else              { out[n++]=nc;   idx+=2; }
         } else {
             out[n++]=l2[idx++];
         }
     }
     out[n]=0;
+    if(!l2[idx])
+        printf(" warning - unterminated string literal: %s\n", l2);
 }
 
 /* =========================================================
@@ -1008,9 +1060,19 @@ static int axx_get_floatstr(const char *s, int idx, char *fs, size_t fsz){
     /* NOTE: do NOT consume a leading '-' here (Fix 11). */
     while(s[idx]&&(is_digit(s[idx])||s[idx]=='.')&&n<fsz-1) fs[n++]=s[idx++];
     if((s[idx]=='e'||s[idx]=='E') && n<fsz-1){
+        /* Fix (axx.py port): roll back exponent part when no digits follow 'e'/'E'.
+         * e.g. "1e" or "1e+" would produce an invalid float string – discard. */
+        int saved_idx = idx;
+        size_t saved_n = n;
         fs[n++]=s[idx++];
         if((s[idx]=='+'||s[idx]=='-')&&n<fsz-1) fs[n++]=s[idx++];
+        int digits_start = idx;
         while(s[idx]&&is_digit(s[idx])&&n<fsz-1) fs[n++]=s[idx++];
+        if(idx == digits_start){
+            /* no digits after exponent marker: discard and roll back */
+            idx = saved_idx;
+            n   = saved_n;
+        }
     }
     fs[n]=0;
     return idx;
@@ -1022,15 +1084,15 @@ static int axx_get_curlb(const char *s, int idx, int *f_out, char *t_out, size_t
     if(s[idx]!='{') return idx;
     idx++;
     idx=axx_skipspc(s,idx);
-    int start_idx=idx;
     size_t n=0;
     while(s[idx]&&s[idx]!='}'&&n<tsz-1) t_out[n++]=s[idx++];
     while(n>0&&t_out[n-1]==' ') n--;
     t_out[n]=0;
     if(!s[idx]){
-        /* 修正③: closing '}' not found – report error and return f=0 */
+        /* 修正③: closing '}' not found – report error.
+         * axx.py returns len(s) to force parse termination (not start_idx). */
         printf(" error - missing closing '}' in expression: '{%s'\n", t_out);
-        return start_idx;
+        return (int)strlen(s);
     }
     idx++; /* consume '}' */
     *f_out=1;
@@ -3609,7 +3671,8 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     if(st->pas!=2&&st->pas!=0) return 0;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
-    if(strcmp(up,".EXPORT")!=0) return 0;
+    /* axx.py export_processing(): handles both .EXPORT and .GLOBAL */
+    if(strcmp(up,".EXPORT")!=0 && strcmp(up,".GLOBAL")!=0) return 0;
     char buf[4096]; strncpy(buf,l2,sizeof(buf)-1); buf[sizeof(buf)-1]=0;
     int idx=0; int blen=(int)strlen(buf);
     while(idx<blen&&buf[idx]){
@@ -3626,6 +3689,40 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
         LabelEntry *le=lmap_find(&st->labels,s);
         int is_equ_v = le ? le->is_equ : 0;
         lmap_set(&st->export_labels,s,v,sec,is_equ_v);
+        if(buf[idx]==',') idx++;
+    }
+    return 1;
+}
+
+/* axx.py extern_processing():
+ * .EXTERN label [, label ...]
+ * Declares external (undefined) symbols.  Each name is registered in
+ * st->labels as an imported label (is_imported=1, value=0, section=".text")
+ * so that references do NOT raise "undefined label" errors, and
+ * write_elf_obj() emits the symbol as STB_GLOBAL / SHN_UNDEF.
+ * If the label is already locally defined (.EXTERN is processed in all passes
+ * to support forward references in the pass1 relaxation loop). */
+static int adir_extern(Assembler *asmb, const char *l, const char *l2){
+    AsmState *st=&asmb->st;
+    char up[16]; axx_strupr_to(up,l,sizeof(up));
+    if(strcmp(up,".EXTERN")!=0) return 0;
+    char buf[4096]; strncpy(buf,l2,sizeof(buf)-1); buf[sizeof(buf)-1]=0;
+    int idx=0; int blen=(int)strlen(buf);
+    while(idx<blen&&buf[idx]){
+        idx=axx_skipspc(buf,idx);
+        char s[512];
+        idx=axx_get_label_word(buf,idx,st->lwordchars,s,sizeof(s));
+        if(!s[0]) break;
+        if(buf[idx]==':') idx++;
+        /* Only register if NOT already locally defined.
+         * A locally defined label has is_imported==0 (or absent). */
+        LabelEntry *existing=lmap_find(&st->labels,s);
+        int is_locally_defined = (existing && !existing->is_imported);
+        if(!is_locally_defined){
+            /* [value=0, section=".text", is_equ=0, is_imported=1] */
+            lmap_set_imported(&st->labels, s, u256_zero(), ".text");
+        }
+        idx=axx_skipspc(buf,idx);
         if(buf[idx]==',') idx++;
     }
     return 1;
@@ -3680,6 +3777,7 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(adir_align(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_org(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_labelc(st,l,l2)){ *idx_out=idx; return 1; }
+    if(adir_extern(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_export(asmb,l,l2)){ *idx_out=idx; return 1; }
 
     /* Fix 9 (axx.py): source-level .setsym / .clearsym directives must be
@@ -4278,12 +4376,12 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int i=0;i<ncs;i++) weo_sym(0,0x03,0,(uint16_t)(i+1),0,0); /* section syms */
 
     /* sort labels and export_labels by name */
-    typedef struct{const char*name;uint64_t val;int is_equ;} WLK;
+    typedef struct{const char*name;uint64_t val;int is_equ;int is_imported;} WLK;
     int nl=st->labels.count;
     WLK *larr=calloc((size_t)(nl?nl:1),sizeof(WLK));
     {int li=0;for(int bi=0;bi<st->labels.nbuckets;bi++)
         for(LabelEntry*e=st->labels.buckets[bi];e;e=e->next)
-            larr[li++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ};}
+            larr[li++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,e->is_imported};}
     int cmp_wlk(const void*a,const void*b){return strcmp(((WLK*)a)->name,((WLK*)b)->name);}
     qsort(larr,nl,sizeof(WLK),cmp_wlk);
 
@@ -4291,13 +4389,15 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     WLK *earr=calloc((size_t)(ne?ne:1),sizeof(WLK));
     {int ei=0;for(int bi=0;bi<st->export_labels.nbuckets;bi++)
         for(LabelEntry*e=st->export_labels.buckets[bi];e;e=e->next)
-            earr[ei++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ};}
+            earr[ei++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,0};}
     qsort(earr,ne,sizeof(WLK),cmp_wlk);
 
     int weo_isexp(const char*nm){for(int i=0;i<ne;i++)if(!strcmp(earr[i].name,nm))return 1;return 0;}
 
-    for(int i=0;i<nl;i++){           /* local labels */
+    /* (1) Local labels: not exported, not imported → STB_LOCAL (0x00) */
+    for(int i=0;i<nl;i++){
         if(weo_isexp(larr[i].name)) continue;
+        if(larr[i].is_imported) continue;   /* imported: emitted below as STB_GLOBAL/SHN_UNDEF */
         /* .equ labels are absolute constants: use SHN_ABS, not section-relative */
         WSR sr = larr[i].is_equ ? (WSR){0xfff1, larr[i].val} : weo_shndx(larr[i].val*(uint64_t)bpw);
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
@@ -4305,7 +4405,17 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         weo_sym(noff,0x00,0,sr.shndx,sr.sv,0);
     }
     int first_global=nsyms;
-    for(int i=0;i<ne;i++){           /* global symbols */
+    /* (2) Imported symbols (.EXTERN): STB_GLOBAL (0x10) / SHN_UNDEF (0)
+     * Mirrors axx.py: syms.append(_pack_sym(name_off, 0x10, 0, 0, 0, 0)) */
+    for(int i=0;i<nl;i++){
+        if(!larr[i].is_imported) continue;
+        if(weo_isexp(larr[i].name)) continue;
+        uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
+        snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
+        weo_sym(noff,0x10,0,0,0,0);   /* SHN_UNDEF=0, value=0 */
+    }
+    /* (3) Export labels → STB_GLOBAL (0x10) */
+    for(int i=0;i<ne;i++){
         WSR sr = earr[i].is_equ ? (WSR){0xfff1, earr[i].val} : weo_shndx(earr[i].val*(uint64_t)bpw);
         uint32_t noff=wbb_str(&strtab_bb,earr[i].name);
         snimap[snimap_len++]=(WSNI){earr[i].name,nsyms};
@@ -4763,7 +4873,8 @@ int main(int argc, char *argv[]){
         lmap_init(&imported_labels);
         for(int bi=0; bi<st->labels.nbuckets; bi++)
             for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
-                lmap_set(&imported_labels, e->key, e->value, e->section, e->is_equ);
+                lmap_set_full(&imported_labels, e->key, e->value, e->section,
+                              e->is_equ, e->is_imported);
 
         /* Fix ⑧: snapshot initial vars (a-z) */
         uint256_t initial_vars[26];
@@ -4779,7 +4890,8 @@ int main(int argc, char *argv[]){
             lmap_free(&st->labels); lmap_init(&st->labels);
             for(int bi=0; bi<imported_labels.nbuckets; bi++)
                 for(LabelEntry *e=imported_labels.buckets[bi]; e; e=e->next)
-                    lmap_set(&st->labels, e->key, e->value, e->section, e->is_equ);
+                    lmap_set_full(&st->labels, e->key, e->value, e->section,
+                                  e->is_equ, e->is_imported);
             /* reset sections and export_labels too (mirrors axx.py run()) */
             secmap_clear(&st->sections);
             lmap_free(&st->export_labels); lmap_init(&st->export_labels);
@@ -4798,11 +4910,21 @@ int main(int argc, char *argv[]){
 
             /* Fix ⑤: if any label is UNDEF, do not treat this as converged.
              * Fix ⑥-2: convergence check includes section membership as well
-             * as PC value (mirrors axx.py current_pcs = {k: (v[0], v[1]) ...}). */
+             * as PC value (mirrors axx.py current_pcs = {k: (v[0], v[1]) ...}).
+             * Fix ⑮ (axx.py port): values >= 2^128 are also treated as UNDEF-derived.
+             *   UNDEF = 2^256-1; UNDEF+offset etc. produce huge but not all-ones values.
+             *   In practice no real assembler PC exceeds 2^128, so treat anything
+             *   that large as an unresolved forward-reference (mirrors axx.py
+             *   _UNDEF_THRESHOLD = 1 << 128 logic).
+             *   is_equ labels hold arbitrary integer constants and are excluded
+             *   from this check (they may legitimately be large). */
             int has_undef = 0;
             for(int bi=0; bi<st->labels.nbuckets && !has_undef; bi++)
-                for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
-                    if(u256_is_undef(e->value)){ has_undef=1; break; }
+                for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next){
+                    if(e->is_equ) continue;
+                    if(u256_is_undef(e->value)){  has_undef=1; break; }
+                    if(e->value.w[2] || e->value.w[3]){ has_undef=1; break; }
+                }
 
             converged = !has_undef ? 1 : 0;
             if(converged){
@@ -4825,7 +4947,8 @@ int main(int argc, char *argv[]){
             lmap_free(&prev_labels); lmap_init(&prev_labels);
             for(int bi=0; bi<st->labels.nbuckets; bi++)
                 for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
-                    lmap_set(&prev_labels, e->key, e->value, e->section, e->is_equ);
+                    lmap_set_full(&prev_labels, e->key, e->value, e->section,
+                                  e->is_equ, e->is_imported);
 
             if(converged){
                 if(st->debug)
@@ -4850,6 +4973,10 @@ int main(int argc, char *argv[]){
             free(st->relocations[ri].sym);
         }
         st->reloc_count=0;
+        /* Fix 5 (new) (axx.py port): reset sections before pass2 so stale
+         * provisional sizes from pass1 do not carry over.  labels and
+         * patsymbols do NOT need resetting here (only sections). */
+        secmap_clear(&st->sections);
         fileassemble(asmb,sourcefile);
     }
 
@@ -4869,6 +4996,15 @@ int main(int argc, char *argv[]){
                 st->expfile, st->expfile_elf);
 
     /* Helper lambda (as a nested function via a local write) */
+    /* Fix (axx.py port):
+     *   1. Section start/size are stored in word units; imp_label() expects byte
+     *      units.  Multiply by bytes-per-word (_bpw_export) before writing.
+     *   2. Label addresses are also word-unit PCs; convert to bytes.
+     *      Exception: is_equ=1 labels are absolute constants, not PCs – no conversion.
+     *   Mirrors axx.py _write_export() / _bpw_export logic. */
+    int _bpw_export = ((st->bts + 7) / 8);
+    if(_bpw_export < 1) _bpw_export = 1;
+
     #define WRITE_EXPORT(path_, elf_) do { \
         FILE *lf=fopen((path_),"wt"); \
         if(lf){ \
@@ -4879,15 +5015,25 @@ int main(int argc, char *argv[]){
                     if(strcmp(e->name,".text")==0) flag="AX"; \
                     else if(strcmp(e->name,".data")==0) flag="WA"; \
                 } \
+                unsigned long long byte_start = \
+                    (unsigned long long)u256_to_u64(e->start) * (unsigned long long)_bpw_export; \
+                unsigned long long byte_size  = \
+                    (unsigned long long)u256_to_u64(e->size)  * (unsigned long long)_bpw_export; \
                 fprintf(lf,"%s\t0x%llx\t0x%llx\t%s\n", \
-                        e->name, \
-                        (unsigned long long)u256_to_u64(e->start), \
-                        (unsigned long long)u256_to_u64(e->size), \
-                        flag); \
+                        e->name, byte_start, byte_size, flag); \
             } \
             for(int i=0;i<st->export_labels.nbuckets;i++){ \
                 for(LabelEntry*e=st->export_labels.buckets[i];e;e=e->next){ \
-                    fprintf(lf,"%s\t0x%llx\n",e->key,(unsigned long long)u256_to_u64(e->value)); \
+                    unsigned long long lbl_addr; \
+                    if(e->is_equ){ \
+                        /* absolute constant: output as-is */ \
+                        lbl_addr=(unsigned long long)u256_to_u64(e->value); \
+                    } else { \
+                        /* PC (word units) → byte address */ \
+                        lbl_addr=(unsigned long long)u256_to_u64(e->value) \
+                                 *(unsigned long long)_bpw_export; \
+                    } \
+                    fprintf(lf,"%s\t0x%llx\n",e->key,lbl_addr); \
                 } \
             } \
             fclose(lf); \
