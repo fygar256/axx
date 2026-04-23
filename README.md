@@ -519,6 +519,24 @@ The following command exports a label along with section/segment information. On
 .export label
 ```
 
+#### .global
+
+Pass a label to an external source.
+
+```
+.global label
+```
+
+#### .extern
+
+Declares the loading of an external label.
+
+```
+.extern label
+```
+
+.global and .extern are processed by the ELF relocatable object file output feature.
+
 #### section
 
 The following command allows you to specify a section/segment.
