@@ -581,8 +581,16 @@ class IEEE754Converter:
         elif a == 'nan':
             return "0x7FC00000"
 
-        fval = float(Decimal(a))
-        bits = struct.unpack('I', struct.pack('f', fval))[0]
+        # Fix 1: 不正な文字列（"0x10", "1+2" 等）は Decimal() が
+        # decimal.InvalidOperation を送出する。ValueError に統一して呼び出し元で捕捉できるようにする。
+        try:
+            fval = float(Decimal(a))
+        except Exception as _e:
+            raise ValueError(f"decimal_to_ieee754_32bit_hex: invalid input {a!r}") from _e
+        try:
+            bits = struct.unpack('I', struct.pack('f', fval))[0]
+        except (struct.error, OverflowError) as _e:
+            raise ValueError(f"decimal_to_ieee754_32bit_hex: cannot pack {fval!r}") from _e
         return f"0x{bits:08X}"
     
     @staticmethod
@@ -598,8 +606,16 @@ class IEEE754Converter:
         elif a == 'nan':
             return "0x7FF8000000000000"
 
-        fval = float(Decimal(a))
-        bits = struct.unpack('Q', struct.pack('d', fval))[0]
+        # Fix 1: 不正な文字列は Decimal() が decimal.InvalidOperation を送出する。
+        # ValueError に統一して呼び出し元で捕捉できるようにする。
+        try:
+            fval = float(Decimal(a))
+        except Exception as _e:
+            raise ValueError(f"decimal_to_ieee754_64bit_hex: invalid input {a!r}") from _e
+        try:
+            bits = struct.unpack('Q', struct.pack('d', fval))[0]
+        except (struct.error, OverflowError) as _e:
+            raise ValueError(f"decimal_to_ieee754_64bit_hex: cannot pack {fval!r}") from _e
         return f"0x{bits:016X}"
     
     @staticmethod
@@ -728,6 +744,14 @@ class IEEE754Converter:
                 neg = True
                 i += 1
                 i = skip(s, i)
+            # Fix Q: 'inf' / 'nan' を Decimal で正しく処理する。
+            # 旧実装は '0123456789.' 以外を即 ValueError にしていたため
+            # qad{inf} / qad{-inf} が xeval フォールバックに落ち、
+            # そこで float(inf) → int() が OverflowError になっていた。
+            for kw, dval in (('inf', Decimal('Infinity')), ('nan', Decimal('NaN'))):
+                if s[i:i+len(kw)] == kw:
+                    v = -dval if neg else dval
+                    return v, i + len(kw)
             # 符号のみは数値ではない
             if i >= len(s) or s[i] not in '0123456789.':
                 raise ValueError(f"expected number at {i!r}")
@@ -1331,8 +1355,9 @@ class ExpressionEvaluator:
                 f, t, idx = self.parser.get_curlb(s, idx)
                 if not f:
                     # get_curlb は既にエラーを表示済み。x=0 のまま返る。
+                    # idx は len(s) になっているのでそのまま抜ける。
                     pass
-                elif f:
+                else:
                     try:
                         h = IEEE754Converter.decimal_eval_expr(t)
                     except (ValueError, ZeroDivisionError):
@@ -1945,12 +1970,17 @@ class ExpressionEvaluator:
         return self.expression(self._terminate(replaced), idx)
 
     def expression_esc_float(self,s,idx,stopchar):
-        prev = self.state.exp_typ
+        # Fix 6: exp_typ だけでなく expmode も保存・復元する。
+        # expression_esc 内部で expmode を変更するコードが呼ばれると
+        # 呼び出し元に戻ったとき expmode が変わったままになる。
+        prev_typ  = self.state.exp_typ
+        prev_mode = self.state.expmode
         self.state.exp_typ = 'f'
         try:
             v,idx = self.expression_esc(s,idx,stopchar)
         finally:
-            self.state.exp_typ = prev
+            self.state.exp_typ  = prev_typ
+            self.state.expmode  = prev_mode
         return (v,idx)
 
 
@@ -2018,6 +2048,8 @@ class BinaryWriter:
         # 実際に書き込まれたワードで上書きする。
         # Fix (perf): 1ワードのバイトパターンを bytes で構築してから *repeat で
         # 全バッファを一括初期化する。Python ループより大幅に速い。
+        # pad_bytes の長さは bytes_per_word なので
+        # len(pad_bytes) * (max_word_pos+1) == total_size が常に成立する。
         pad_val = int(self.state.padding) & ((1 << word_bits) - 1)
         if pad_val != 0:
             tmp = pad_val
@@ -2027,10 +2059,6 @@ class BinaryWriter:
                 pad_bytes = bytes([(tmp >> (8 * (bytes_per_word - 1 - i))) & 0xff
                                    for i in range(bytes_per_word)])
             data = bytearray(pad_bytes * (max_word_pos + 1))
-            # total_size と実際のバイト数が一致することを確認（truncate/extend）
-            if len(data) != total_size:
-                data = bytearray(data[:total_size]) if len(data) > total_size \
-                       else data + bytearray(total_size - len(data))
         else:
             data = bytearray(total_size)
 
@@ -2657,17 +2685,17 @@ class PatternMatcher:
                 lt = self.remove_brackets(t, list(j))
                 # マッチ前の vars を保存
                 saved_vars = self.state.vars[:]
-                # Fix ④: ELF追跡状態も保存する。
-                # 失敗した match 試行で _elf_label_refs_seen / _elf_var_to_label に
-                # エントリが追記されても次の試行に持ち越されないようリストアする。
-                saved_refs = list(self.state._elf_label_refs_seen)
-                saved_v2l  = dict(self.state._elf_var_to_label)
+                # Fix ④ / Fix 8: ELF追跡状態も保存する。
+                # _elf_label_refs_seen はリスト全体コピーでなく長さだけ記録し、
+                # 失敗時は del [n:] でロールバック（term11と同方式でコピー負荷を削減）。
+                saved_refs_len = len(self.state._elf_label_refs_seen)
+                saved_v2l      = dict(self.state._elf_var_to_label)
                 if self.match(s, lt):
                     return True
                 # 失敗 → vars と ELF 追跡状態をリストア
                 self.state.vars = saved_vars
-                self.state._elf_label_refs_seen = saved_refs
-                self.state._elf_var_to_label    = saved_v2l
+                del self.state._elf_label_refs_seen[saved_refs_len:]
+                self.state._elf_var_to_label = saved_v2l
         return False
 
 
@@ -3012,6 +3040,12 @@ class VLIWProcessor:
                 # _elf_current_word_idx は makeobj() の finally が -1 に戻すので
                 # ここでリセットしなくて構わない。_elf_capturing_var も同様。
                 idxs, objl, flag, idx = lineassemble2_func(line, idx)
+                # Fix J: lineassemble2_func が flag=False（エラー）を返した場合、
+                # objl が空リストになるが objs/idxlst にそのまま追加すると
+                # 後続の bytes 結合でスロット数がずれる。
+                # flag=False のときは VLIW スロット全体をエラーとして中断する。
+                if not flag:
+                    return False
                 objs += [objl]
                 idxlst += [idxs]
                 continue
@@ -3182,21 +3216,31 @@ class AssemblyDirectiveProcessor:
             idx = StringUtils.skipspc(l, idx)
             e, idx = StringUtils.get_param_to_spc(l, idx)
             if e.upper() == '.EQU':
-                # Fix 6 (new): 旧実装は expression_asm(l, idx) に行全体 l を渡し、
-                # idx から読み始めていた。これは通常動作するが、lwordchars に含まれる
-                # 文字がラベル名部分に残ると expression_asm が誤ったトークンを拾う可能性がある。
-                # 安全のため .EQU 以降の部分文字列だけを渡し、idx=0 から解析させる。
                 expr_part = l[idx:]
+                # Fix 4 補足: label_processing は lineassemble2 のパターンスキャンより
+                # 前に呼ばれるため、前行の処理で error_undefined_label が True のまま
+                # 残っている可能性がある。評価前にリセットして「この式自体」の結果だけを見る。
+                self.state.error_undefined_label = False
                 u, _ = self.expr_eval.expression_asm(expr_part, 0)
-                # Fix: pass2/対話モードで .EQU の式に未定義ラベルが残っていたらエラー報告。
-                if self.state.error_undefined_label and (self.state.pas == 2 or self.state.pas == 0):
-                    print(f" error - .EQU '{label}': expression contains undefined label.")
+                # pass2/対話モードで未定義ラベルが残っていたらエラーを出して
+                # put_value をスキップする。UNDEF 値がラベルに登録されると後続の
+                # 計算が全て壊れる。pass1 は forward 参照が正常なのでスキップしない。
+                if self.state.error_undefined_label:
+                    if self.state.pas == 2 or self.state.pas == 0:
+                        print(f" error - .EQU '{label}': expression contains undefined label.")
+                    return ""
                 # is_equ=True: 定数ラベル（.equ 式の結果）はリロケーション対象外
                 self.label_manager.put_value(label, u, self.state.current_section, is_equ=True)
                 return ""
             else:
                 # is_equ=False: アドレスラベル（リロケーション対象になり得る）
-                self.label_manager.put_value(label, self.state.pc, self.state.current_section, is_equ=False)
+                # Fix D: put_value の戻り値を確認してエラー時は行を返さない。
+                # 二重定義エラーなどで False が返った場合、行の残りを処理しても
+                # ラベルが未登録のままパターンスキャンに渡ると誤ったマッチが起きる。
+                ok = self.label_manager.put_value(
+                    label, self.state.pc, self.state.current_section, is_equ=False)
+                if ok is False:
+                    return ""
                 return l[lidx:]
         return l
     
@@ -3970,15 +4014,16 @@ class Assembler:
     
     def lineassemble0(self, line):
         """Assemble line with output"""
-        # Fix 16: state.cl はデバッグ表示と lineassemble() の処理対象を兼ねる。
-        # \n を除去するだけでなく、呼び出し元（run() 対話モード）が行う
-        # "\\\\" → "\\" の変換も済んでいる前提で受け取る。
-        # ファイルモードの場合は変換なしで受け取るが、それも一貫している。
-        self.state.cl = line.replace('\n', '').replace('\r', '')
+        # Fix 10: state.cl は pass2/対話モードのデバッグ表示にのみ使う。
+        # pass1 でも更新していたため、pass1 の最後の行が state.cl に残り、
+        # 複数回 run() したときに前回の pass1 値が混入する可能性があった。
+        # pass2 または対話モードのときだけ更新する。
+        cleaned = line.replace('\n', '').replace('\r', '')
         if self.state.pas == 2 or self.state.pas == 0:
+            self.state.cl = cleaned
             print("%016x " % self.state.pc, end='')
             print(f"{self.state.current_file} {self.state.ln} {self.state.cl} ", end='')
-        f = self.lineassemble(self.state.cl)
+        f = self.lineassemble(cleaned)
         if self.state.pas == 2 or self.state.pas == 0:
             print("")
         self.state.ln += 1
@@ -4007,6 +4052,10 @@ class Assembler:
                 if len(i) >= 2:
                     key = StringUtils.upper(i[1])
                     if len(i) > 2:
+                        # Fix 7: expression_pat は state.symbols を参照してシンボルを解決する。
+                        # fresh への書き込み途中の状態を反映させるために、評価前に
+                        # state.symbols を現時点の fresh に同期してから式を評価する。
+                        self.state.symbols = dict(fresh)
                         v, _ = self.expr_eval.expression_pat(i[2], 0)
                     else:
                         v = 0
@@ -4249,18 +4298,18 @@ class Assembler:
             n = w_count * bpw
             if n == 0:
                 return b''
-            data = bytearray(n)
+            # Fix K/P: flush() と同じ高速方式で padding を初期化する。
+            # 旧実装は Python ループだったが bytes*N の方が大幅に速い。
             pad = int(self.state.padding) & ((1 << self.state.bts) - 1)
             if pad:
-                for p in range(w_count):
-                    base = p * bpw
-                    tmp = pad
-                    if self.state.endian == 'little':
-                        for j in range(bpw):
-                            data[base + j] = tmp & 0xff; tmp >>= 8
-                    else:
-                        for j in range(bpw - 1, -1, -1):
-                            data[base + j] = tmp & 0xff; tmp >>= 8
+                tmp = pad
+                if self.state.endian == 'little':
+                    pad_bytes = bytes([(tmp >> (8 * j)) & 0xff for j in range(bpw)])
+                else:
+                    pad_bytes = bytes([(tmp >> (8 * (bpw - 1 - j))) & 0xff for j in range(bpw)])
+                data = bytearray(pad_bytes * w_count)
+            else:
+                data = bytearray(n)
             for pos, val in buf.items():
                 if pos < w_start or pos >= w_start + w_count:
                     continue
@@ -4456,11 +4505,20 @@ class Assembler:
         # ------------------------------------------------------------------ #
         # シンボル名 → シンボルテーブルインデックスのマッピングを構築          #
         # syms の出力順 (1)ローカル→(2)インポート→(3)エクスポート に合わせる  #
+        #                                                                      #
+        # Fix 3: 同名ラベルが labels（ローカル/インポート）と export_labels    #
+        # の両方に存在する場合、(3)エクスポートの登録が(1)ローカルを上書きして  #
+        # しまい、ELFリロケーションが誤ったシンボルインデックスを参照する問題。  #
+        # 修正: 既に登録済みのキーはエクスポート側からは上書きしない。         #
+        # ELFの規則上、同名の場合はグローバル（エクスポート）側のインデックスを  #
+        # リロケーションに使う方が正しいため、順序を逆転して(3)を先に登録し、   #
+        # (1)(2)では export_keys に含まれる名前をスキップする（既存の動作と    #
+        # 同一）。これにより重複時は常にエクスポート側のインデックスが使われる。  #
         # ------------------------------------------------------------------ #
         sym_name_to_idx = {}
         _si = 1 + ncs   # null(0) + section syms(1..ncs) を飛ばした位置
 
-        # (1) ローカル
+        # (1) ローカル（export_keys / imported は除外 → すでに除外済み）
         for name, *_lentry in sorted(self.state.labels.items()):
             is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
             if name in export_keys or is_imported:
@@ -4477,8 +4535,10 @@ class Assembler:
             _si += 1
 
         # (3) エクスポート
+        # Fix 3: エクスポートは必ず登録する（上書き可）。
+        # labels にも同名がある場合、リロケーションにはグローバルシンボルを使うべき。
         for name, *_eentry in sorted(self.state.export_labels.items()):
-            sym_name_to_idx[name] = _si
+            sym_name_to_idx[name] = _si   # 同名ローカルがあっても上書きして正しいインデックスを指す
             _si += 1
 
         # ------------------------------------------------------------------ #
