@@ -3301,10 +3301,15 @@ class AssemblyDirectiveProcessor:
         return True
     
     def export_processing(self, l1, l2):
-        """Export directive"""
+        """Export / Global directive.
+        .EXPORT label  -- mark label(s) as globally visible (ELF STB_GLOBAL)
+        .GLOBAL label  -- alias for .EXPORT (GAS/NASM compatible syntax)
+        Both directives are only active during pass2 and interactive mode.
+        """
         if not (self.state.pas == 2 or self.state.pas == 0):
             return False
-        if StringUtils.upper(l1) != ".EXPORT":
+        _l1u = StringUtils.upper(l1)
+        if _l1u != ".EXPORT" and _l1u != ".GLOBAL":
             return False
         
         idx = 0
@@ -3505,6 +3510,53 @@ class AssemblyDirectiveProcessor:
         self.state.sections[self.state.current_section] = [start, new_size, self.state.pc, True]
         return True
     
+    def extern_processing(self, l1, l2):
+        """Extern directive.
+        .EXTERN label [, label ...]
+
+        Declares one or more external (undefined) symbols.  Each name is
+        registered in state.labels as an imported label
+        (is_imported=True, value=0, section='.text') so that:
+          - References to the symbol do NOT raise "undefined label" errors.
+          - write_elf_obj() emits the symbol as STB_GLOBAL / SHN_UNDEF,
+            allowing the linker to resolve it from another object file.
+
+        If the label is already defined locally in the current source
+        (is_imported=False), .EXTERN has no effect -- the local definition
+        takes precedence, just like GAS / NASM behaviour.
+
+        .EXTERN is processed in all passes (pass1, pass2, interactive) so
+        that forward references to external symbols work correctly during
+        the pass1 relaxation loop.
+        """
+        if StringUtils.upper(l1) != ".EXTERN":
+            return False
+        idx = 0
+        l2 = l2 + chr(0)
+        while idx < len(l2) and l2[idx] != chr(0):
+            idx = StringUtils.skipspc(l2, idx)
+            s, idx = self.parser.get_label_word(l2, idx)
+            if s == "":
+                break
+            # Consume optional trailing ':' in the label token
+            if idx < len(l2) and l2[idx] == ':':
+                idx += 1
+            # Only register if the label is not already locally defined.
+            # A locally defined label has is_imported==False (or absent).
+            existing = self.state.labels.get(s)
+            is_locally_defined = (
+                existing is not None
+                and not (len(existing) > 3 and existing[3])
+            )
+            if not is_locally_defined:
+                # [value, section, is_equ, is_imported]
+                self.state.labels[s] = [0, '.text', False, True]
+            # Support comma-separated list:  .extern foo, bar, baz
+            idx = StringUtils.skipspc(l2, idx)
+            if idx < len(l2) and l2[idx] == ',':
+                idx += 1
+        return True
+
     def org_processing(self, l1, l2):
         """ORG directive"""
         if StringUtils.upper(l1) != ".ORG":
@@ -3623,7 +3675,9 @@ class Assembler:
             return 0, [], True, idx
         if self.asm_directive_proc.labelc_processing(l, l2):
             return 0, [], True, idx
-        if self.asm_directive_proc.export_processing(l, l2):
+        if self.asm_directive_proc.extern_processing(l, l2):
+            return 0, [], True, idx
+        if self.asm_directive_proc.export_processing(l, l2):  # handles .EXPORT and .GLOBAL
             return 0, [], True, idx
 
         # Fix 9: ソースファイル内の .setsym / .clearsym は lineassemble() 先頭の
