@@ -778,7 +778,12 @@ class IEEE754Converter:
         def parse_factor(s, i):
             i = skip(s, i)
             if i < len(s) and s[i] == '(':
-                v, i = parse_expr(s, i + 1)
+                # Fix 2 (修正): '(' ブランチも深いネストで RecursionError が発生する。
+                # '-' / '+' ブランチは Fix 1 で修正済みだったが、括弧ブランチは未対処だった。
+                try:
+                    v, i = parse_expr(s, i + 1)
+                except RecursionError:
+                    raise ValueError("decimal_eval_expr: expression nesting too deep")
                 i = skip(s, i)
                 if i < len(s) and s[i] == ')':
                     i += 1
@@ -3695,13 +3700,20 @@ class Assembler:
         # 修正: ディレクティブ名が一致するかどうかを先に確認してから戻り値を判定する。
         _l_upper = StringUtils.upper(l)
         if _l_upper == '.ASCII':
-            # Fix 4 (new): ascii_processing の戻り値を確認してエラーを検知する。
-            # 旧実装は戻り値を無視して常に True（正常）を返していたため、
-            # asciistr() がエラーで False を返しても後続処理が正常に見えていた。
-            self.asm_directive_proc.ascii_processing(l, l2)
+            # Fix 4 (実装修正): ascii_processing の戻り値を実際に検査する。
+            # コメントには「戻り値を確認する」と書いてあったが、戻り値を変数に
+            # 受けておらず常に True を返していたため、asciistr() がエラーで
+            # False を返してもバイナリへの書き込みが抜けたまま正常に見えていた。
+            # 修正: 戻り値が False のときも True を返す（パターンスキャンへ落とさない）が、
+            # エラーメッセージを出力してユーザーに知らせる。
+            _ok = self.asm_directive_proc.ascii_processing(l, l2)
+            if not _ok and (self.state.pas == 2 or self.state.pas == 0):
+                print(f" error - .ASCII: failed to process string argument: {l2!r}")
             return 0, [], True, idx
         if _l_upper == '.ASCIIZ':
-            self.asm_directive_proc.asciiz_processing(l, l2)
+            _ok = self.asm_directive_proc.asciiz_processing(l, l2)
+            if not _ok and (self.state.pas == 2 or self.state.pas == 0):
+                print(f" error - .ASCIIZ: failed to process string argument: {l2!r}")
             return 0, [], True, idx
         if self.include_asm(l, l2):
             return 0, [], True, idx
@@ -4085,14 +4097,24 @@ class Assembler:
                             widx_k = first_widx + k
                             if widx_k < len(objl):
                                 raw_val = (raw_val << self.state.bts) | (int(objl[widx_k]) & word_mask)
-                    # Fix 3 (new): abs_w が UNDEF (= 2^256-1) または UNDEF 由来の
+                    # Fix 3 (修正): abs_w が UNDEF (= 2^256-1) または UNDEF 由来の
                     # 超大整数の場合、addend = raw_val - abs_w が天文学的な負数になり
                     # struct.pack('q', addend) が struct.error でクラッシュする。
-                    # UNDEF 由来の値を含むリロケーションエントリは生成しない。
+                    # さらに abs_w が float('inf') / float('nan') の場合、
+                    # isinstance(abs_w, int) が False になりガードをすり抜けて
+                    # raw_val - float('inf') = -inf が addend になり struct.error になる。
+                    # 修正: int 以外（float 含む）も明示的に弾く。
                     _UNDEF_THRESHOLD = 1 << 128
-                    if abs_w == UNDEF or (isinstance(abs_w, int) and abs_w >= _UNDEF_THRESHOLD):
+                    _skip_reloc = False
+                    if isinstance(abs_w, float):
+                        import math as _math
+                        if not _math.isfinite(abs_w):
+                            _skip_reloc = True
+                    elif abs_w == UNDEF or (isinstance(abs_w, int) and abs_w >= _UNDEF_THRESHOLD):
+                        _skip_reloc = True
+                    if _skip_reloc:
                         if self.state.debug:
-                            print(f" [elf] skipping reloc for '{lname}': UNDEF label value",
+                            print(f" [elf] skipping reloc for '{lname}': invalid label value {abs_w!r}",
                                   file=sys.stderr)
                         continue
                     addend = raw_val - abs_w

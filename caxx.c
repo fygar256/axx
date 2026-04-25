@@ -3408,10 +3408,10 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         VliwSetEntry *k=&st->vliwset.data[ki];
         int *sorted_k=malloc(k->nidxs*sizeof(int));
         memcpy(sorted_k,k->idxs,k->nidxs*sizeof(int));
-        qsort(sorted_k,k->nidxs,sizeof(int),int_cmp);
+        // qsort(sorted_k,k->nidxs,sizeof(int),int_cmp);
         int *sorted_l=malloc(nidxlst*sizeof(int));
         memcpy(sorted_l,idxlst,nidxlst*sizeof(int));
-        qsort(sorted_l,nidxlst,sizeof(int),int_cmp);
+        // qsort(sorted_l,nidxlst,sizeof(int),int_cmp);
         int match=(k->nidxs==nidxlst && memcmp(sorted_k,sorted_l,k->nidxs*sizeof(int))==0);
         free(sorted_k); free(sorted_l);
         if(!match && st->vliwtemplatebits!=0) continue;
