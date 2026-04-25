@@ -302,9 +302,10 @@ class StringUtils:
             i += 1
         # Fix 4: ループを抜けた時点で in_dquote=True なら未終端ダブルクォート文字列。
         # 行内のセミコロンはコメントとして扱われていないため出力に残る。
-        # 問題をユーザーに知らせるために警告を出す。
+        # Fix 7 (new): 警告を stdout ではなく stderr に出力する。
+        # バイナリ出力をパイプで受け取っている場合に stdout が汚染されないようにする。
         if in_dquote:
-            print(f" warning - unterminated string literal in line: {l!r}")
+            print(f" warning - unterminated string literal in line: {l!r}", file=sys.stderr)
         return l.rstrip()
     
     @staticmethod
@@ -382,7 +383,8 @@ class StringUtils:
                 s += l2[idx]
                 idx += 1
         # 末尾まで達したが閉じ引用符がなかった
-        print(f" warning - unterminated string literal: {l2!r}")
+        # Fix 7 (new): 警告を stderr に出力する（stdout 汚染防止）。
+        print(f" warning - unterminated string literal: {l2!r}", file=sys.stderr)
         return s
 
 
@@ -782,10 +784,18 @@ class IEEE754Converter:
                     i += 1
                 return v, i
             if i < len(s) and s[i] == '-':
-                v, i = parse_factor(s, i + 1)
+                # Fix 1: 深いネストで RecursionError が発生する可能性がある。
+                # ValueError に変換して呼び出し元の except で捕捉できるようにする。
+                try:
+                    v, i = parse_factor(s, i + 1)
+                except RecursionError:
+                    raise ValueError("decimal_eval_expr: expression nesting too deep")
                 return -v, i
             if i < len(s) and s[i] == '+':
-                return parse_factor(s, i + 1)
+                try:
+                    return parse_factor(s, i + 1)
+                except RecursionError:
+                    raise ValueError("decimal_eval_expr: expression nesting too deep")
             return parse_number(s, i)
 
         def parse_term(s, i):
@@ -982,6 +992,9 @@ class LabelManager:
         return True
 
     def printlabels(self):
+        # Fix 8 (new): ラベル一覧を stdout ではなく stderr に出力する。
+        # バイナリ出力をパイプで受け取っている場合に stdout が汚染されないようにする。
+        # また Python の辞書 repr() の代わりに1行1ラベルの可読フォーマットで出力する。
         result = {}
         for key, value in self.state.labels.items():
             num = value[0]
@@ -997,7 +1010,8 @@ class LabelManager:
                 except (TypeError, ValueError, OverflowError):
                     num_str = repr(num)
             result[key] = [num_str, section]
-        print(result)
+        for k, v in sorted(result.items()):
+            print(f"  {k:40s}  {v[0]}  ({v[1]})", file=sys.stderr)
         
 class SymbolManager:
     """Manages assembler symbols"""
@@ -1871,8 +1885,16 @@ class ExpressionEvaluator:
             else:
                 # ':' がない不完全な三項演算子: a?b の形式。
                 if x != 0:
+                    # 条件が真: 真ブランチの値・変数状態・エラーフラグ・ELF状態を採用
+                    # Fix ⑫ (修正): 旧実装は ELF 追跡状態（_elf_label_refs_seen /
+                    # _elf_var_to_label）の復元が漏れていた。真ブランチ評価後に
+                    # refs_after_true / v2l_after_true を採用することで
+                    # 誤ったリロケーションエントリの混入を防ぐ。
+                    self.state.vars                     = vars_after_true
                     self.state.error_undefined_label    = err_after_true
                     self.state.error_label_conflict     = conflict_after_true
+                    self.state._elf_label_refs_seen     = refs_after_true
+                    self.state._elf_var_to_label        = v2l_after_true
                     x = t
                 else:
                     # 条件が偽: 真ブランチの副作用を取り消し、0 を返す
@@ -2007,6 +2029,13 @@ class BinaryWriter:
     def flush(self):
         """バッファをファイルに書き出す"""
         if not self.state.outfile or not self._buffer:
+            return
+
+        # Fix 6 (new): bts == 0 の場合は bytes_per_word = 0 になり出力が空になる。
+        # サイレントな空ファイル生成を防ぐため、明示的に警告を出して早期リターンする。
+        if self.state.bts <= 0:
+            print(f" warning - flush: bts={self.state.bts} is invalid (<=0); "
+                  f"output file '{self.state.outfile}' will be empty.", file=sys.stderr)
             return
 
         # Fix ⑧修正: bts == 0 の場合は bytes_per_word = 0 になり
@@ -3064,7 +3093,11 @@ class VLIWProcessor:
                 print(" error - vliwinstbits is zero; cannot compute instruction slots.")
             return False
         for k in self.state.vliwset:
-            if sorted(k[0]) == sorted(idxlst) or self.state.vliwtemplatebits == 0:
+            # Fix 5 (new): 旧実装は sorted(k[0]) == sorted(idxlst) で比較していたため
+            # スロット順序が無視され、スロット1→2 の命令とスロット2→1 の命令が
+            # 同じテンプレートにマッチしてしまい、順序依存テンプレートで誤バイナリが生成された。
+            # 修正: list 同士を直接比較することで順序を保持した照合を行う。
+            if list(k[0]) == list(idxlst) or self.state.vliwtemplatebits == 0:
                 im = 2 ** self.state.vliwinstbits - 1
                 tm = 2 ** abs(self.state.vliwtemplatebits) - 1
                 pm = 2 ** vbits - 1
@@ -3662,6 +3695,9 @@ class Assembler:
         # 修正: ディレクティブ名が一致するかどうかを先に確認してから戻り値を判定する。
         _l_upper = StringUtils.upper(l)
         if _l_upper == '.ASCII':
+            # Fix 4 (new): ascii_processing の戻り値を確認してエラーを検知する。
+            # 旧実装は戻り値を無視して常に True（正常）を返していたため、
+            # asciistr() がエラーで False を返しても後続処理が正常に見えていた。
             self.asm_directive_proc.ascii_processing(l, l2)
             return 0, [], True, idx
         if _l_upper == '.ASCIIZ':
@@ -4049,6 +4085,16 @@ class Assembler:
                             widx_k = first_widx + k
                             if widx_k < len(objl):
                                 raw_val = (raw_val << self.state.bts) | (int(objl[widx_k]) & word_mask)
+                    # Fix 3 (new): abs_w が UNDEF (= 2^256-1) または UNDEF 由来の
+                    # 超大整数の場合、addend = raw_val - abs_w が天文学的な負数になり
+                    # struct.pack('q', addend) が struct.error でクラッシュする。
+                    # UNDEF 由来の値を含むリロケーションエントリは生成しない。
+                    _UNDEF_THRESHOLD = 1 << 128
+                    if abs_w == UNDEF or (isinstance(abs_w, int) and abs_w >= _UNDEF_THRESHOLD):
+                        if self.state.debug:
+                            print(f" [elf] skipping reloc for '{lname}': UNDEF label value",
+                                  file=sys.stderr)
+                        continue
                     addend = raw_val - abs_w
                     self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend))
 
