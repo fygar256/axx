@@ -142,6 +142,10 @@ class AssemblerState:
         # モジュールレベルの番兵で初期化することで run() 複数回呼び出しも安全。
         self._pass1_prev_label_pcs = _RELAXATION_SENTINEL
 
+        # 標準出力へのリスト出力: True のときのみ lineassemble0 がリストを stdout に出力する。
+        # False（デフォルト）のときはエラー/警告のみ表示し、バイナリ出力は通常通り行う。
+        self.verbose: bool = False
+
         # stdin 入力を保持する一時ファイルパス。
         # 固定名 "axx.tmp" の代わりに tempfile で生成したパスを使うことで
         # 複数インスタンスの同時実行時の競合を防ぐ。
@@ -2146,8 +2150,11 @@ class BinaryWriter:
     def outbin(self, a, x):
         """Output binary with printing"""
         if self.state.pas == 2 or self.state.pas == 0:
+            # -v オプション対応: ファイルアセンブル時 (pas==2) は verbose のときのみ hex 表示。
+            # 対話モード (pas==0) は常に表示する。
+            _prt = 1 if ((self.state.pas == 2 and self.state.verbose) or self.state.pas == 0) else 0
             try:
-                self.fwrite(a, int(x), 1)
+                self.fwrite(a, int(x), _prt)
             except (OverflowError, ValueError):
                 if self.state.pas == 2 or self.state.pas == 0:
                     print(f" error - non-finite value {x!r} cannot be written as binary word.")
@@ -3421,11 +3428,15 @@ class AssemblyDirectiveProcessor:
         """ASCIIZ directive"""
         if StringUtils.upper(l1) != ".ASCIIZ":
             return False
-        f = self.asciistr(l2)
-        if not f:
+        # Bug修正: asciistr() が文字列バイトを出力する。
+        # 旧コードは f = self.asciistr(l2) の戻り値(bool)だけ見て
+        # 文字列本体をスキップし、0x00 のみ書いていた。
+        # 修正: asciistr() で文字列を出力した後、ヌル終端を追加する。
+        if not self.asciistr(l2):
             if self.state.pas == 2 or self.state.pas == 0:
                 print(f" error - .ASCIIZ requires a quoted string.")
             return False
+        # ヌル終端を追加 (asciistr はヌルを書かない)
         self.binary_writer.outbin(self.state.pc, 0x00)
         self.state.pc += 1
         return True
@@ -3549,50 +3560,64 @@ class AssemblyDirectiveProcessor:
         return True
     
     def extern_processing(self, l1, l2):
-        """Extern directive.
-        .EXTERN label [, label ...]
-
-        Declares one or more external (undefined) symbols.  Each name is
-        registered in state.labels as an imported label
-        (is_imported=True, value=0, section='.text') so that:
-          - References to the symbol do NOT raise "undefined label" errors.
-          - write_elf_obj() emits the symbol as STB_GLOBAL / SHN_UNDEF,
-            allowing the linker to resolve it from another object file.
-
-        If the label is already defined locally in the current source
-        (is_imported=False), .EXTERN has no effect -- the local definition
-        takes precedence, just like GAS / NASM behaviour.
-
-        .EXTERN is processed in all passes (pass1, pass2, interactive) so
-        that forward references to external symbols work correctly during
-        the pass1 relaxation loop.
+        """Extern directive with optional reloc type override.
+        .EXTERN label::plt32 [, label2::gotpcrel, ...]
         """
         if StringUtils.upper(l1) != ".EXTERN":
             return False
+
         idx = 0
         l2 = l2 + chr(0)
         while idx < len(l2) and l2[idx] != chr(0):
             idx = StringUtils.skipspc(l2, idx)
-            s, idx = self.parser.get_label_word(l2, idx)
-            if s == "":
+            label_part, idx = self.parser.get_label_word(l2, idx)
+            if not label_part:
                 break
-            # Consume optional trailing ':' in the label token
+
+            # get_label_word はラベル終端の ':' を1文字消費する。
+            # '.extern foo::plt32' では最初の ':' が消費され idx は2番目の ':'
+            # を指すため、'::' チェックが ':' + 次文字になりマッチしない。
+            # 直前文字が ':' かつ現在位置も ':' なら1文字戻して '::' を正しく検出する。
+            if idx > 0 and l2[idx - 1] == ':' and idx < len(l2) and l2[idx] == ':':
+                idx -= 1  # ':' 消費を巻き戻して '::' を先頭から検出できるようにする
+
+            # デフォルトは PC32 (R_X86_64_PC32=2)。
+            # .extern label::plt32 のように明示指定した場合はそちらを優先する。
+            reloc_type = 2  # default PC32
+            if idx < len(l2) and l2[idx:idx+2] == '::':
+                idx += 2
+                rt_start = idx
+                while idx < len(l2) and l2[idx] not in ' \t,:' + chr(0):
+                    idx += 1
+                rt_str = l2[rt_start:idx].strip().lower()
+
+                if rt_str:
+                    rtype_map = {
+                        'abs32': 1, 'abs64': 1,
+                        'plt32': 4,           # ← これが重要
+                        'gotpcrel': 9,
+                        'pc32': 2, 'rel32': 2,
+                        'abs16': 12, 'abs8': 14,
+                    }
+                    reloc_type = rtype_map.get(rt_str)
+                    if reloc_type is None:
+                        print(f" warning - unknown reloc type '{rt_str}' in .EXTERN", file=sys.stderr)
+
             if idx < len(l2) and l2[idx] == ':':
                 idx += 1
-            # Only register if the label is not already locally defined.
-            # A locally defined label has is_imported==False (or absent).
-            existing = self.state.labels.get(s)
-            is_locally_defined = (
-                existing is not None
-                and not (len(existing) > 3 and existing[3])
-            )
-            if not is_locally_defined:
-                # [value, section, is_equ, is_imported]
-                self.state.labels[s] = [0, '.text', False, True]
-            # Support comma-separated list:  .extern foo, bar, baz
+
+            # ラベル登録（5要素形式を確実に）
+            existing = self.state.labels.get(label_part)
+            if existing is None or not (len(existing) > 3 and existing[3]):
+                self.state.labels[label_part] = [0, '.text', False, True, reloc_type]
+            elif len(existing) >= 5:
+                if reloc_type is not None:
+                    existing[4] = reloc_type   # 上書き
+
             idx = StringUtils.skipspc(l2, idx)
             if idx < len(l2) and l2[idx] == ',':
                 idx += 1
+
         return True
 
     def org_processing(self, l1, l2):
@@ -3990,17 +4015,8 @@ class Assembler:
         
         if self.state.vliwflag == False or (idx >= len(line) or line[idx:idx+2] != '!!'):
             of = len(objl)
-
             # ------------------------------------------------------------------ #
-            # ELF リロケーション検出（トラッキング方式）                            #
-            #                                                                       #
-            # makeobj() 内で get_value() が呼ばれたとき、(lname, val, word_idx)    #
-            # として _elf_label_refs_seen に記録済み。                              #
-            # word_idx は objl への追加前の len(objl)（=ワード位置）。              #
-            # makeobj() 外（パターンマッチ・サイズ式）の参照は word_idx=-1 のため  #
-            # 無視される。                                                          #
-            # 同一ラベルが連続ワードを占める場合（例: bts=8 で 64bit アドレスを    #
-            # 8 バイトに分割して格納）は連続グループとして1エントリにまとめる。     #
+            # ELF リロケーション検出（トラッキング方式）
             # ------------------------------------------------------------------ #
             if self.state.elf_objfile and self.state.pas == 2 and objl and self.state._elf_label_refs_seen:
                 bpw_r = max(1, (self.state.bts + 7) // 8)
@@ -4009,115 +4025,82 @@ class Assembler:
                 if sec_name_r in self.state.sections:
                     sec_start_w = self.state.sections[sec_name_r][0]
 
-                # word_idx >= 0（makeobj 内の参照）のみを対象とし、ワード順にソート
-                valid_refs = [
-                    (ln, aw, wi)
-                    for (ln, aw, wi) in self.state._elf_label_refs_seen
-                    if wi >= 0
-                ]
+                valid_refs = [(ln, aw, wi) for (ln, aw, wi) in self.state._elf_label_refs_seen if wi >= 0]
                 valid_refs.sort(key=lambda r: r[2])
 
-                # Fix ④-2: 同一 word_idx に複数の異なるラベルが記録されている場合は
-                # 複合式（label1 + label2 など）とみなし、その word_idx を
-                # リロケーション対象から除外する。
-                # どのシンボルに帰属させるかを一意に決定できないため、
-                # 誤ったリロケーションエントリや重複エントリを生成するより
-                # エントリを生成しない方が安全。
-                _widx_labels: dict = {}  # word_idx -> set of label names
-                for _ln, _aw, _wi in valid_refs:
+                # 複合式除外
+                _widx_labels = {}
+                for _ln, _, _wi in valid_refs:
                     _widx_labels.setdefault(_wi, set()).add(_ln)
-                _ambiguous_widxs = {
-                    _wi for _wi, _names in _widx_labels.items() if len(_names) > 1
-                }
-                if _ambiguous_widxs:
-                    valid_refs = [
-                        (_ln, _aw, _wi)
-                        for (_ln, _aw, _wi) in valid_refs
-                        if _wi not in _ambiguous_widxs
-                    ]
+                _ambiguous = {_wi for _wi, ns in _widx_labels.items() if len(ns) > 1}
+                valid_refs = [r for r in valid_refs if r[2] not in _ambiguous]
 
-                # 同一ラベルの連続ワード参照をひとつのリロケーショングループにまとめる
-                # 例: bts=8 で 64bit アドレスを 8 バイトに分割 → 8 連続エントリ → 1 グループ
-                groups = []  # [(lname, abs_w, first_word_idx, num_words)]
+                # グループ化
+                groups = []
                 gi = 0
                 while gi < len(valid_refs):
                     lname, abs_w, widx = valid_refs[gi]
                     gj = gi + 1
-                    while (gj < len(valid_refs)
-                           and valid_refs[gj][0] == lname
-                           and valid_refs[gj][2] == widx + (gj - gi)):
+                    while gj < len(valid_refs) and valid_refs[gj][0] == lname and valid_refs[gj][2] == widx + (gj - gi):
                         gj += 1
                     groups.append((lname, abs_w, widx, gj - gi))
                     gi = gj
 
-                # アーキテクチャごとのリロケーションタイプ表
-                # {machine: {num_bytes: rtype}}
-                # 未定義サイズは 0 → スキップ
-                _RTYPE_MAP = {
-                    62:  {8: 1,  4: 10, 2: 12, 1: 14},  # EM_X86_64
-                    3:   {4: 1,  2: 2,  1: 7},           # EM_386   (R_386_32/16/8)
-                    40:  {4: 2,  2: 250},                 # EM_ARM   (R_ARM_ABS32/16)
-                    183: {8: 257, 4: 258},                # EM_AARCH64 (R_AARCH64_ABS64/32)
-                    243: {8: 2,  4: 3},                   # EM_RISCV (R_RISCV_64/32)
-                    20:  {4: 1},                          # EM_PPC   (R_PPC_ADDR32)
-                }
-                _rmap = _RTYPE_MAP.get(self.state.elf_machine, {8: 1, 4: 2, 2: 3, 1: 4})
+                # R_X86_64_64=1, R_X86_64_PC32=2, R_X86_64_16=12, R_X86_64_8=14
+                # 4バイト: PC32(2) を使用。x86-64 では 4バイトフィールドは
+                # RIP相対(LEA/JMP/CALL 等)が主流で R_X86_64_32(10,絶対)は
+                # ほぼ使われない。絶対参照が必要なら .extern label::abs32 で明示する。
+                _rmap = {8: 1, 4: 2, 2: 12, 1: 14}  # x86_64 デフォルト
 
                 for lname, abs_w, first_widx, num_words in groups:
                     num_bytes = num_words * bpw_r
-                    rtype = _rmap.get(num_bytes, 0)
-                    if rtype == 0:
-                        continue  # このサイズのリロケーションタイプが未定義 → スキップ
-                    if first_widx >= len(objl):
-                        continue  # 安全ガード
-                    # セクション相対バイトオフセット
+
+                    # === 最優先で .extern の override を取得 ===
+                    rtype = 0
+                    lentry = self.state.labels.get(lname)
+                    if lentry and len(lentry) > 4 and lentry[4] is not None:
+                        rtype = lentry[4]          # plt32 → 4 がここで取れるはず
+                    else:
+                        rtype = _rmap.get(num_bytes, 0)
+
+                    if rtype == 0 or first_widx >= len(objl):
+                        continue
+
                     sec_rel = (self.state.pc + first_widx - sec_start_w) * bpw_r
 
-                    # RELA addend の計算:
-                    #   RELA 形式では r_addend がシンボル参照の定数オフセットを保持する。
-                    #   リンカは "S + A"（S=シンボル最終アドレス, A=addend）でフィールドを
-                    #   上書きするため、addend = (objl に書き込まれた値) - (ラベルの絶対値)
-                    #   とすることで label+N のような式の N が失われなくなる。
-                    #
-                    #   旧実装は addend を常に 0 に固定していたため、label+N の N が
-                    #   リンク後に消え、誤ったアドレスが生成される問題があった。
-                    #
-                    #   複数ワードで1つのアドレスを表す場合（bts=8 で 64bit を 8 バイトに
-                    #   分割するケース等）は、ワード列を結合してスカラ値を復元する。
+                    # raw_val (addend計算用)
                     word_mask = (1 << self.state.bts) - 1
+                    raw_val = 0
                     if self.state.endian == 'little':
-                        raw_val = 0
                         for k in range(num_words):
                             widx_k = first_widx + k
                             if widx_k < len(objl):
                                 raw_val |= (int(objl[widx_k]) & word_mask) << (self.state.bts * k)
                     else:
-                        raw_val = 0
                         for k in range(num_words):
                             widx_k = first_widx + k
                             if widx_k < len(objl):
                                 raw_val = (raw_val << self.state.bts) | (int(objl[widx_k]) & word_mask)
-                    # Fix 3 (修正): abs_w が UNDEF (= 2^256-1) または UNDEF 由来の
-                    # 超大整数の場合、addend = raw_val - abs_w が天文学的な負数になり
-                    # struct.pack('q', addend) が struct.error でクラッシュする。
-                    # さらに abs_w が float('inf') / float('nan') の場合、
-                    # isinstance(abs_w, int) が False になりガードをすり抜けて
-                    # raw_val - float('inf') = -inf が addend になり struct.error になる。
-                    # 修正: int 以外（float 含む）も明示的に弾く。
-                    _UNDEF_THRESHOLD = 1 << 128
-                    _skip_reloc = False
-                    if isinstance(abs_w, float):
-                        import math as _math
-                        if not _math.isfinite(abs_w):
-                            _skip_reloc = True
-                    elif abs_w == UNDEF or (isinstance(abs_w, int) and abs_w >= _UNDEF_THRESHOLD):
-                        _skip_reloc = True
-                    if _skip_reloc:
-                        if self.state.debug:
-                            print(f" [elf] skipping reloc for '{lname}': invalid label value {abs_w!r}",
-                                  file=sys.stderr)
+
+                    # UNDEFガード
+                    if (isinstance(abs_w, float) and not math.isfinite(abs_w)) or \
+                       abs_w == UNDEF or (isinstance(abs_w, int) and abs_w >= (1 << 128)):
                         continue
-                    addend = raw_val - abs_w
+
+                    # Bug1修正: raw_val をフィールド幅（num_bytes*8 bit）から符号拡張する。
+                    # 例: 0xFFFFFFFC は int32 で -4 だが Python int では 4294967292 になり
+                    # addend が PLT32/PC32 の許容範囲 [-2^31, 2^31-1] を大幅に超える。
+                    _field_bits = num_bytes * 8
+                    if 0 < _field_bits < 64 and raw_val >= (1 << (_field_bits - 1)):
+                        raw_val -= (1 << _field_bits)
+
+                    # Bug2修正: RELA addend の正しい定義は A = field_signed + P - S_assembled
+                    # ここで P = フィールドのセクション内バイトオフセット (= sec_rel)。
+                    # 旧コード `raw_val - abs_w` は P を加算していなかったため、
+                    # リンカが計算する S + A - P が assembler の意図した値にならなかった。
+                    # 例: CALL rel32 (printf=0, pc_E8=N, sec_rel=N+1)
+                    #   field_signed = -(N+5), addend = -(N+5) + (N+1) - 0 = -4 ✓
+                    addend = raw_val + sec_rel - abs_w
                     self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend))
 
             for cnt in range(of):
@@ -4140,13 +4123,17 @@ class Assembler:
         # pass1 でも更新していたため、pass1 の最後の行が state.cl に残り、
         # 複数回 run() したときに前回の pass1 値が混入する可能性があった。
         # pass2 または対話モードのときだけ更新する。
+        #
+        # -v オプション対応: ファイルアセンブル時 (pas==2) はリスト出力を
+        # verbose フラグで制御する。対話モード (pas==0) は常に出力する。
         cleaned = line.replace('\n', '').replace('\r', '')
-        if self.state.pas == 2 or self.state.pas == 0:
+        _show = (self.state.pas == 2 and self.state.verbose) or self.state.pas == 0
+        if _show:
             self.state.cl = cleaned
             print("%016x " % self.state.pc, end='')
             print(f"{self.state.current_file} {self.state.ln} {self.state.cl} ", end='')
         f = self.lineassemble(cleaned)
-        if self.state.pas == 2 or self.state.pas == 0:
+        if _show:
             print("")
         self.state.ln += 1
         return f
@@ -4814,6 +4801,9 @@ class Assembler:
                         metavar='MACHINE',
                         help='ELF e_machine value (default 62=EM_X86_64; '
                              '183=AArch64, 243=RISC-V, 3=i386, 20=PPC, 40=ARM)')
+        ap.add_argument('-v', '--verbose', dest='verbose', action='store_true',
+                        default=False,
+                        help='Verbose: print assembly listing to stdout (default: silent)')
         ap.add_argument('-d', '--debug', dest='debug', action='store_true',
                         default=False,
                         help='Enable debug output (forward-ref fallback, relaxation log, etc.)')
@@ -4849,6 +4839,7 @@ class Assembler:
                   f"valid choices are {list(osabitbl.keys())}. Using 'FreeBSD'.",
                   file=sys.stderr)
         self.state.osabi        = osabitbl.get(args.elf_osabi, 9)
+        self.state.verbose      = args.verbose
         self.state.debug        = args.debug
 
         # Fix 5 (original) + Fix 8 (new): run() 全体を try/finally で囲む。
@@ -4946,6 +4937,10 @@ class Assembler:
                     self.state.labels = dict(_imported_labels)
                     self.state.sections = {}
                     self.state.export_labels = {}
+                    # Bug修正: current_section をリセットしないと、前イテレーション末尾の
+                    # セクション (例: '.data') が次イテレーション先頭の old_sec になり、
+                    # section .text 処理時に '.data' が pc=0 で誤登録される。
+                    self.state.current_section = '.text'
                     # ソース内の .setsym / .clearsym が前回イテレーションで
                     # symbols を変化させている可能性があるため、
                     # パターンファイル読み込み直後の状態（patsymbols）に毎回リセットする。
@@ -4953,6 +4948,18 @@ class Assembler:
                     # 修正⑧: vars をリラクゼーション開始時の状態に戻す
                     self.state.vars = list(_initial_vars)
                     self.fileassemble(args.sourcefile)
+
+                    # Bug修正: pass1でも最終セクションのサイズを確定する。
+                    # section_processing は切り替え時のみ旧セクションを更新するため
+                    # ファイル末尾のセクションが size=0 になる。
+                    _last_sec1 = self.state.current_section
+                    if _last_sec1 in self.state.sections:
+                        _e1 = self.state.sections[_last_sec1]
+                        if not (len(_e1) > 3 and _e1[3]):
+                            _ep1 = _e1[2] if len(_e1) > 2 else _e1[0]
+                            _blk1 = self.state.pc - _ep1
+                            if _blk1 > 0:
+                                _e1[1] += _blk1
 
                     # Fix ⑥-2: 収束スナップショットに PC 値だけでなくセクション帰属も含める。
                     # 旧実装は {label: pc} のみを比較していたため、.section ディレクティブの
@@ -5017,7 +5024,22 @@ class Assembler:
                 # 保持することがある。pass2 先頭で sections をリセットして
                 # 確定的に再構築させる。labels・patsymbols はリセット不要。
                 self.state.sections = {}
+                self.state.current_section = '.text'  # Bug修正: pass2前にリセット
                 self.fileassemble(args.sourcefile)
+
+                # Bug修正: section_processing は「セクション切り替え時」に
+                # 旧セクションのサイズを更新する。ファイル末尾の最終セクションは
+                # 切り替えが発生しないため size=0 のままになる。
+                # fileassemble 完了後に current_section を明示的に確定する。
+                _last_sec = self.state.current_section
+                if _last_sec in self.state.sections:
+                    _e = self.state.sections[_last_sec]
+                    _confirmed = len(_e) > 3 and _e[3]
+                    if not _confirmed:
+                        _entry_pc = _e[2] if len(_e) > 2 else _e[0]
+                        _block = self.state.pc - _entry_pc
+                        if _block > 0:
+                            _e[1] += _block
 
             self.binary_writer.flush()
 
@@ -5036,12 +5058,6 @@ class Assembler:
             def _write_export(path, elf):
                 h   = list(self.state.export_labels.items())
                 key = list(self.state.sections.keys())
-                # Fix 1 (new): state.sections[s] は [word_start, word_count] で格納されている。
-                # imp_label() はエクスポートファイルのサイズフィールドをバイト数として
-                # 解釈してアドレス帰属レンジ検索を行う。
-                # bts が 8 以外（例: 16bit ワード）の場合、word_count をそのまま出力すると
-                # imp_label() 側でのバイト範囲が半分になりラベル帰属が誤る。
-                # 修正: サイズフィールドは byte_count = word_count × bytes_per_word で出力する。
                 _bpw_export = max(1, (self.state.bts + 7) // 8)
                 with open(path, 'wt') as label_file:
                     for i in key:
@@ -5053,7 +5069,6 @@ class Assembler:
                             flag = ''
                         w_start = self.state.sections[i][0]
                         w_count = self.state.sections[i][1]
-                        # Fix: w_start / w_count が float のケースに備えて int に変換する。
                         try:
                             byte_start = int(w_start) * _bpw_export
                             byte_size  = int(w_count) * _bpw_export
@@ -5064,20 +5079,28 @@ class Assembler:
                             f"{i}\t{byte_start:#x}\t{byte_size:#x}\t{flag}\n"
                         )
                     for i in h:
-                        # Fix 1 (new) / Fix 5 (new): ラベルアドレス i[1][0] はワード単位の PC 値。
-                        # imp_label() はバイトアドレスとして読み込んでセクション帰属を
-                        # レンジ検索するため、bpw を掛けてバイト変換してから出力する。
-                        # ただし is_equ=True の定数ラベルは絶対値なので変換しない。
                         lbl_is_equ = len(i[1]) > 2 and i[1][2]
                         lbl_addr_raw = i[1][0] if lbl_is_equ else i[1][0] * _bpw_export
-                        # Fix: lbl_addr が float のとき {:#x} は TypeError になる。
-                        # .equ ラベルは float 値を持ちうるので int に変換する。
-                        # 非有限 float は 0 に置き換えてエラーを避ける。
                         try:
                             lbl_addr = int(lbl_addr_raw)
                         except (OverflowError, ValueError, TypeError):
                             lbl_addr = 0
-                        label_file.write(f"{i[0]}\t{lbl_addr:#x}\n")
+                        
+                        # Fix: reloc_type_override を出力に含める
+                        reloc_type_str = ''
+                        lentry = self.state.labels.get(i[0], [])
+                        if len(lentry) > 4 and lentry[4] is not None:
+                            # Reverse lookup: rtype value → name
+                            _RTYPE_REVERSE = {
+                                2: 'pc32', 4: 'plt32', 9: 'gotpcrel',
+                                1: 'abs64', 10: 'abs32', 16: 'rel32'
+                            }
+                            reloc_type_str = _RTYPE_REVERSE.get(lentry[4], '')
+                            if reloc_type_str:
+                                reloc_type_str = f'::{reloc_type_str}'
+                        
+                        label_file.write(f"{i[0]}{reloc_type_str}\t{lbl_addr:#x}\n")
+                
 
             if self.state.expfile:
                 _write_export(self.state.expfile, elf=0)
