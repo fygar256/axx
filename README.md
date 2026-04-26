@@ -496,11 +496,11 @@ Please prefix hexadecimal numbers with '0x'.
 
 #### string
 
-`.ascii` outputs the bytecode of a string, and `.asciiz` outputs the bytecode of a string with 0x00 at the end.
+`.ascii` outputs the bytecode of a string, and `.asciz` outputs the bytecode of a string with 0x00 at the end.
 
 ```
 .ascii "sample1"
-.asciiz "sample2"
+.asciz "sample2"
 ```
 
 ### Fill with 0x00
@@ -537,30 +537,30 @@ Declares the loading of an external label.
 
 .global and .extern are processed by the ELF relocatable object file output feature.
 
-#### section
+#### .section
 
 The following command allows you to specify a section/segment.
 
 ```
-section .text
+.section .text
 or
-segment .text
+.segment .text
 ```
 
-Currently, section and segment have the same meaning.
+Currently, .section and .segment have the same meaning.
 
 #### section sort
 
 For example,
 
 ```
-section .text
+.section .text
 ld a,9
-section .data
+.section .data
 .asciiz "test1"
-section .text
+.section .text
 ld b,9
-section .data
+.section .data
 db 0x12
 ```
 
@@ -569,11 +569,11 @@ If you do this, the text will be arranged exactly as it is, so use section sort 
 https://qiita.com/fygar256/items/fd590cab2078a4e8b866
 
 ```
-section .text
+.section .text
 ld a,9
 ld b,9
-section .data
-.asciiz "test1"
+.section .data
+.asciz "test1"
 db 0x12
 ```
 #### include
