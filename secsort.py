@@ -43,7 +43,7 @@ def readsections(fn):
             l=l.strip()
 
             (sec,idx)=get_label_word(l,0)
-            if sec.upper()=="SECTION" or sec.upper()=="SEGMENT":
+            if sec.upper()==".SECTION" or sec.upper()==".SEGMENT":
                 (secname,idx)=get_label_word(l,idx)
                 if secname==current_section:
                     continue
@@ -81,7 +81,7 @@ def writesections():
     l=list(sections.items())
     for i in l:
         (a,b)=i
-        print("section    ",a)
+        print(".section    ",a)
         for k in b:
             print(k)
 
