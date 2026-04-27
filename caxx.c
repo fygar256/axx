@@ -422,8 +422,9 @@ typedef struct LabelEntry {
     char          *key;
     uint256_t      value;
     char          *section;
-    int            is_equ;       /* 1 if defined via .equ – not relocatable */
-    int            is_imported;  /* 1 if declared via .EXTERN – STB_GLOBAL/SHN_UNDEF in ELF */
+    int            is_equ;              /* 1 if defined via .equ – not relocatable */
+    int            is_imported;         /* 1 if declared via .EXTERN – STB_GLOBAL/SHN_UNDEF in ELF */
+    int            reloc_type_override; /* -1 = not set; otherwise ELF relocation type from .EXTERN label::rtype */
     struct LabelEntry *next;
 } LabelEntry;
 
@@ -470,39 +471,42 @@ static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *se
     }
     LabelEntry *e=calloc(1,sizeof(LabelEntry));
     e->key=strdup(key); e->value=val; e->section=strdup(sec);
-    e->is_equ=is_equ; e->is_imported=0;
+    e->is_equ=is_equ; e->is_imported=0; e->reloc_type_override=-1;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
 }
 /* Set a label as an imported external symbol (.EXTERN).
- * Mirrors axx.py: labels[s] = [0, '.text', False, True] */
-static void lmap_set_imported(LabelMap *m, const char *key, uint256_t val, const char *sec) {
+ * Mirrors axx.py: labels[s] = [0, '.text', False, True, reloc_type] */
+static void lmap_set_imported(LabelMap *m, const char *key, uint256_t val, const char *sec, int reloc_type) {
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
     for(LabelEntry*e=m->buckets[h];e;e=e->next){
         if(strcmp(e->key,key)==0){
             e->value=val; free(e->section); e->section=strdup(sec);
             e->is_equ=0; e->is_imported=1;
+            if(reloc_type >= 0) e->reloc_type_override=reloc_type;
             return;
         }
     }
     LabelEntry *e=calloc(1,sizeof(LabelEntry));
     e->key=strdup(key); e->value=val; e->section=strdup(sec);
-    e->is_equ=0; e->is_imported=1;
+    e->is_equ=0; e->is_imported=1; e->reloc_type_override=reloc_type;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
 }
-/* Copy all label fields including is_imported. Used for relaxation snapshots. */
+/* Copy all label fields including is_imported and reloc_type_override. Used for relaxation snapshots. */
 static void lmap_set_full(LabelMap *m, const char *key, uint256_t val,
-                          const char *sec, int is_equ, int is_imported) {
+                          const char *sec, int is_equ, int is_imported, int reloc_type_override) {
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
     for(LabelEntry*e=m->buckets[h];e;e=e->next){
         if(strcmp(e->key,key)==0){
             e->value=val; free(e->section); e->section=strdup(sec);
             e->is_equ=is_equ; e->is_imported=is_imported;
+            e->reloc_type_override=reloc_type_override;
             return;
         }
     }
     LabelEntry *e=calloc(1,sizeof(LabelEntry));
     e->key=strdup(key); e->value=val; e->section=strdup(sec);
     e->is_equ=is_equ; e->is_imported=is_imported;
+    e->reloc_type_override=reloc_type_override;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
 }
 static AXX_UNUSED void lmap_delete(LabelMap *m, const char *key) {
@@ -760,6 +764,14 @@ typedef struct {
     int        exp_typ_float;
     int        error_undefined_label;
     int        error_already_defined;
+
+    /* pc_instr_start: binary_list中の$$が命令先頭アドレスを指すように、
+     * makeobj呼び出し前にst->pcの値を保存する。makeobj内のexpression評価では
+     * st->pcではなくst->pc_instr_startを$$として使う。 */
+    uint256_t  pc_instr_start;
+    /* in_binary_list: makeobj実行中は1。$$がpc_instr_startを返すのは
+     * binary_list評価中のみ。.equなど他のコンテキストでは$$=現在のPC。 */
+    int        in_binary_list;
 
     int        align;
     int        bts;
@@ -1091,7 +1103,7 @@ static int axx_get_curlb(const char *s, int idx, int *f_out, char *t_out, size_t
     if(!s[idx]){
         /* 修正③: closing '}' not found – report error.
          * axx.py returns len(s) to force parse termination (not start_idx). */
-        printf(" error - missing closing '}' in expression: '{%s'\n", t_out);
+        fprintf(stderr," error - missing closing '}' in expression: '{%s'\n", t_out);
         return (int)strlen(s);
     }
     idx++; /* consume '}' */
@@ -1539,7 +1551,7 @@ static void fwrite_word(AsmState *st, uint64_t position, uint256_t x, int prt){
 
 static void outbin(AsmState *st, uint256_t a, uint256_t x){
     if(st->pas==2||st->pas==0)
-        fwrite_word(st, u256_to_u64(a), x, 1);
+        fwrite_word(st, u256_to_u64(a), x, (st->pas==0)||st->debug);
 }
 static void outbin2(AsmState *st, uint256_t a, uint256_t x){
     if(st->pas==2||st->pas==0)
@@ -1699,20 +1711,20 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
     if(st->pas==1||st->pas==0){
         if(lmap_contains(&st->labels,k)){
             st->error_already_defined=1;
-            printf(" error - label already defined.\n");
+            fprintf(stderr," error - label already defined.\n");
             return 0;
         }
     } else if(st->pas==2){
         if(!lmap_contains(&st->labels,k)){
             st->error_already_defined=1;
-            printf(" error - label '%s' not defined in pass 1.\n",k);
+            fprintf(stderr," error - label '%s' not defined in pass 1.\n",k);
             return 0;
         }
     }
     char uk[512]; axx_strupr_to(uk,k,sizeof(uk));
     uint256_t dummy;
     if(smap_get(&st->patsymbols,uk,&dummy)){
-        printf(" error - '%s' is a pattern file symbol.\n",k);
+        fprintf(stderr," error - '%s' is a pattern file symbol.\n",k);
         return 0;
     }
     st->error_already_defined=0;
@@ -1911,12 +1923,12 @@ static uint256_t expr_factor(Assembler *asmb, const char *s, int idx, int *idx_o
                     x=u256_sar(x,shift);
                 } else {
                     /* 修正⑩: missing ')' – report error and return 0 */
-                    printf(" error - missing ')' in *(expr, expr) expression.\n");
+                    fprintf(stderr," error - missing ')' in *(expr, expr) expression.\n");
                     x=u256_zero();
                 }
             } else {
                 /* 修正⑩: missing ',' – report error and return 0 */
-                printf(" error - missing ',' in *(expr, expr) expression.\n");
+                fprintf(stderr," error - missing ',' in *(expr, expr) expression.\n");
                 x=u256_zero();
             }
         } else x=u256_zero();
@@ -1953,7 +1965,9 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         if(asmb->st.exp_typ_float) x=double_to_u256((double)cv); }
     else if(axx_q(s,slen,"$$",idx)){
         idx+=2;
-        x=st->pc;
+        /* binary_list中(makeobj内)では命令先頭アドレスpc_instr_startを返す。
+         * .equなど他のコンテキストでは現在のPC(st->pc)を返す。 */
+        x = st->in_binary_list ? st->pc_instr_start : st->pc;
         /* In float mode, treat PC as an integer-valued double (int→float). */
         if(asmb->st.exp_typ_float)
             x=double_to_u256((double)(int64_t)u256_to_u64(x));
@@ -2741,9 +2755,9 @@ static int dir_error(Assembler *asmb, const char *s){
         idx=io;
         if((st->pas==2||st->pas==0)&&!u256_is_zero(u)){
             int64_t tc=u256_to_i64(t);
-            printf("Line %d Error code %lld ",(int)st->ln,(long long)tc);
-            if(tc>=0&&tc<ERRORS_COUNT) printf("%s",ERRORS_TABLE[tc]);
-            printf(": \n");
+            fprintf(stderr,"Line %d Error code %lld ",(int)st->ln,(long long)tc);
+            if(tc>=0&&tc<ERRORS_COUNT) fprintf(stderr,"%s",ERRORS_TABLE[tc]);
+            fprintf(stderr,": \n");
             triggered=1;
         }
     }
@@ -3234,6 +3248,9 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
                 int rl=i-comma_pos-1; if(rl>=(int)sizeof(rep_pat)) rl=sizeof(rep_pat)-1;
                 memcpy(rep_pat,pattern+comma_pos+1,rl);
                 int io;
+                /* 修正: 直前の処理でerror_undefined_labelが残っていると
+                 * nrep=0と誤判定されるため、評価前にリセットする。 */
+                asmb->st.error_undefined_label = 0;
                 uint256_t nv=expr_expression_pat(asmb,expr_part,0,&io);
                 int64_t nrep=u256_to_i64(nv);
                 if(nrep>0){
@@ -3286,6 +3303,11 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
 
     int slen = (int)strlen(s);
 
+    /* binary_list評価中フラグ: $$がpc_instr_startを返すのはこの期間のみ */
+    st->in_binary_list = 1;
+    /* e_p/replace_percent前処理の残留フラグをリセット */
+    st->error_undefined_label = 0;
+
     /* Fix P9: use a separate logical index for ELF word tracking so that
      * UNDEF-skipped elements do not cause subsequent elements to inherit a
      * stale/duplicate word_idx (the old code used objl->len which does not
@@ -3295,25 +3317,28 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     while(1){
         if(idx>=slen||s[idx]=='\0') break;
         if(s[idx]==','){
+            /* 修正: ','はセパレータのみ。alignment paddingは挿入しない。
+             * 旧コードはcommaごとにalign_addr()でパディングを入れていたが、
+             * binary_listパターン内の','はフィールド区切りであって
+             * アライメント指示ではない。 */
             idx++;
-            uint64_t p=u256_to_u64(st->pc)+(uint64_t)objl->len;
-            uint64_t aligned=align_addr(st,p);
-            for(uint64_t ii=p;ii<aligned;ii++){
-                /* Fix ⑤ (axx.py): update elf_current_word_idx before each
-                 * padding push so subsequent label refs get the right word_idx. */
-                st->elf_current_word_idx = (int)objl->len;
-                iv_push(objl,st->padding);
-            }
             continue;
         }
         int semicolon=0;
         if(s[idx]==';'){ semicolon=1; idx++; }
         st->elf_current_word_idx = logical_word_idx;
+        /* pass==1では常にpass1_size_modeで評価する。
+         * 未定義ラベル(EXTERN等)がある場合でも0として扱い、
+         * @@[8,*(e,%%)]のような式でも8バイト分のサイズが正しく計上される。
+         * pass==2/0では通常通りerror_undefined_labelフラグで判定する。 */
+        if(st->pas==1) st->pass1_size_mode=1;
+        st->error_undefined_label = 0;
         int io;
         uint256_t x=expr_expression_pat(asmb,s,idx,&io);
+        if(st->pas==1){ st->pass1_size_mode=0; st->error_undefined_label=0; }
         idx=io;
         logical_word_idx++;
-        if(u256_is_undef(x)){
+        if(st->error_undefined_label){
             if(s[idx]==','){idx++;continue;}
             continue;
         }
@@ -3322,6 +3347,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         break;
     }
     st->elf_current_word_idx = -1;
+    st->in_binary_list = 0;
     free(s);
 }
 
@@ -3398,7 +3424,7 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
      * Guard and report an error, matching axx.py VLIWProcessor.vliwprocess(). */
     if(st->vliwinstbits == 0){
         if(st->pas==0||st->pas==2)
-            printf(" error - vliwinstbits is zero; cannot compute instruction slots.\n");
+            fprintf(stderr," error - vliwinstbits is zero; cannot compute instruction slots.\n");
         ivv_free(&objs); free(idxlst);
         if(idx_out) *idx_out=idx;
         return 0;
@@ -3430,7 +3456,7 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         int target_len=ibyte*noi;
         if(values.len > target_len){
             if(st->pas==2||st->pas==0)
-                printf("warning-VLIW:%d values exceed slot capacity %d,truncating.\n",values.len,target_len);
+                fprintf(stderr,"warning-VLIW:%d values exceed slot capacity %d,truncating.\n",values.len,target_len);
             values.len=target_len;
         } else {
             int needed=target_len-values.len;
@@ -3485,7 +3511,7 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
     }
 
     if(!found && (st->pas==0||st->pas==2))
-        printf(" error - No vliw instruction-set defined.\n");
+        fprintf(stderr," error - No vliw instruction-set defined.\n");
 
     ivv_free(&objs); free(idxlst);
     *idx_out=idx;
@@ -3569,15 +3595,9 @@ static int asciistr(Assembler *asmb, const char *l2){
 
 static int adir_section(AsmState *st, const char *l, const char *l2){
     char up[32]; axx_strupr_to(up,l,sizeof(up));
-    if(strcmp(up,"SECTION")!=0 && strcmp(up,"SEGMENT")!=0) return 0;
+    if(strcmp(up,".SECTION")!=0 && strcmp(up,".SEGMENT")!=0) return 0;
     if(l2&&l2[0]){
         snprintf(st->current_section, sizeof(st->current_section), "%s", l2);
-        /* Only record start address the first time a section is declared.
-         * Re-declarations (.text -> .data -> .text) must not overwrite the
-         * original start, otherwise ELF section start / endsection size
-         * calculation would be corrupted.  Mirrors axx.py section_processing:
-         *   if l2 not in self.state.sections:
-         *       self.state.sections[l2] = [self.state.pc, 0]            */
         if(!secmap_find(&st->sections,l2))
             secmap_set(&st->sections,l2,st->pc,u256_zero());
     }
@@ -3585,10 +3605,10 @@ static int adir_section(AsmState *st, const char *l, const char *l2){
 }
 static int adir_endsection(AsmState *st, const char *l){
     char up[32]; axx_strupr_to(up,l,sizeof(up));
-    if(strcmp(up,"ENDSECTION")!=0 && strcmp(up,"ENDSEGMENT")!=0) return 0;
+    if(strcmp(up,".ENDSECTION")!=0 && strcmp(up,".ENDSEGMENT")!=0) return 0;
     SecEntry *e=secmap_find(&st->sections,st->current_section);
     if(!e){
-        printf(" error - ENDSECTION without matching SECTION for '%s'.\n",
+        fprintf(stderr," error - .ENDSECTION without matching .SECTION for '%s'.\n",
                st->current_section);
         return 1;
     }
@@ -3604,12 +3624,12 @@ static int adir_zero(Assembler *asmb, const char *l, const char *l2){
      * Also guard against negative values. Mirrors axx.py zero_processing(). */
     if(asmb->st.error_undefined_label){
         if(asmb->st.pas==2||asmb->st.pas==0)
-            printf(" error - .ZERO argument contains undefined label.\n");
+            fprintf(stderr," error - .ZERO argument contains undefined label.\n");
         return 1;
     }
     int64_t cnt=u256_to_i64(x);
     if(cnt < 0){
-        printf(" error - .ZERO requires a non-negative count, got %lld.\n", (long long)cnt);
+        fprintf(stderr," error - .ZERO requires a non-negative count, got %lld.\n", (long long)cnt);
         return 1;
     }
     for(int64_t i=0;i<cnt;i++){
@@ -3627,11 +3647,11 @@ static int adir_ascii(Assembler *asmb, const char *l, const char *l2){
 }
 static int adir_asciiz(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
-    if(strcmp(up,".ASCIIZ")!=0) return 0;
+    if(strcmp(up,".ASCIZ")!=0) return 0;
     int f=asciistr(asmb,l2);
     if(!f){
         if(asmb->st.pas==2||asmb->st.pas==0)
-            printf(" error - .ASCIIZ requires a quoted string.\n");
+            fprintf(stderr," error - .ASCIZ requires a quoted string.\n");
         return 0;
     }
     outbin(&asmb->st,asmb->st.pc,u256_zero());
@@ -3654,7 +3674,7 @@ static int adir_org(Assembler *asmb, const char *l, const char *l2){
      * Mirrors axx.py org_processing() which checks error_undefined_label. */
     if(asmb->st.error_undefined_label){
         if(asmb->st.pas==2||asmb->st.pas==0)
-            printf(" error - .ORG argument contains undefined label.\n");
+            fprintf(stderr," error - .ORG argument contains undefined label.\n");
         return 1;
     }
     if(io+2<=(int)strlen(l2) && axx_upper_char(l2[io])==','&&axx_upper_char(l2[io+1])=='P'){
@@ -3695,13 +3715,15 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
 }
 
 /* axx.py extern_processing():
- * .EXTERN label [, label ...]
+ * .EXTERN label [::rtype] [, label [::rtype] ...]
  * Declares external (undefined) symbols.  Each name is registered in
  * st->labels as an imported label (is_imported=1, value=0, section=".text")
  * so that references do NOT raise "undefined label" errors, and
  * write_elf_obj() emits the symbol as STB_GLOBAL / SHN_UNDEF.
  * If the label is already locally defined (.EXTERN is processed in all passes
- * to support forward references in the pass1 relaxation loop). */
+ * to support forward references in the pass1 relaxation loop).
+ * Optional ::rtype suffix (e.g. ::plt32) overrides the ELF relocation type
+ * for references to this symbol.  Mirrors axx.py extern_processing(). */
 static int adir_extern(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
@@ -3710,17 +3732,52 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
     int idx=0; int blen=(int)strlen(buf);
     while(idx<blen&&buf[idx]){
         idx=axx_skipspc(buf,idx);
-        char s[512];
+        char s[512]; s[0]=0;
         idx=axx_get_label_word(buf,idx,st->lwordchars,s,sizeof(s));
         if(!s[0]) break;
-        if(buf[idx]==':') idx++;
+        /* axx.py: get_label_word consumes a trailing ':'; if the consumed char
+         * was the first ':' of '::' we need to step back so '::' is detected. */
+        if(idx > 0 && buf[idx-1]==':' && idx < blen && buf[idx]==':')
+            idx--;  /* back up to expose '::' */
+        /* Parse optional ::rtype suffix (default PC32 = 2) */
+        int reloc_type = 2;  /* default R_X86_64_PC32 */
+        if(idx+1 < blen && buf[idx]==':' && buf[idx+1]==':'){
+            idx += 2;
+            int rt_start = idx;
+            while(idx < blen && buf[idx]!=' ' && buf[idx]!='\t'
+                  && buf[idx]!=',' && buf[idx]!=':' && buf[idx]!='\0')
+                idx++;
+            char rt_str[64]={0};
+            int rt_len = idx - rt_start;
+            if(rt_len > 0 && rt_len < (int)sizeof(rt_str)-1){
+                memcpy(rt_str, buf+rt_start, (size_t)rt_len);
+                rt_str[rt_len]=0;
+                /* lower-case for comparison */
+                for(int _ci=0;rt_str[_ci];_ci++)
+                    if(rt_str[_ci]>='A'&&rt_str[_ci]<='Z') rt_str[_ci]+=32;
+                /* rtype_map mirrors axx.py extern_processing() */
+                int rtype = -1;
+                if(strcmp(rt_str,"abs32")==0||strcmp(rt_str,"abs64")==0) rtype=1;
+                else if(strcmp(rt_str,"plt32")==0) rtype=4;
+                else if(strcmp(rt_str,"gotpcrel")==0) rtype=9;
+                else if(strcmp(rt_str,"pc32")==0||strcmp(rt_str,"rel32")==0) rtype=2;
+                else if(strcmp(rt_str,"abs16")==0) rtype=12;
+                else if(strcmp(rt_str,"abs8")==0)  rtype=14;
+                if(rtype < 0)
+                    fprintf(stderr," warning - unknown reloc type '%s' in .EXTERN\n", rt_str);
+                else
+                    reloc_type = rtype;
+            }
+        }
+        if(idx < blen && buf[idx]==':') idx++;
         /* Only register if NOT already locally defined.
          * A locally defined label has is_imported==0 (or absent). */
         LabelEntry *existing=lmap_find(&st->labels,s);
         int is_locally_defined = (existing && !existing->is_imported);
         if(!is_locally_defined){
-            /* [value=0, section=".text", is_equ=0, is_imported=1] */
-            lmap_set_imported(&st->labels, s, u256_zero(), ".text");
+            lmap_set_imported(&st->labels, s, u256_zero(), ".text", reloc_type);
+        } else if(existing && reloc_type >= 0) {
+            existing->reloc_type_override = reloc_type;
         }
         idx=axx_skipspc(buf,idx);
         if(buf[idx]==',') idx++;
@@ -3876,15 +3933,13 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
              * Previously makeobj always ran even if an .error condition fired. */
             int err_triggered = dir_error(asmb,i->f[1]);
             if(!err_triggered){
+                /* binary_list中の$$が命令先頭アドレスを指すように、
+                 * makeobj呼び出し前にst->pcを保存する。 */
+                st->pc_instr_start = st->pc;
                 makeobj(asmb,i->f[2],objl_out);
-                /* Pass1: retry with size-mode on forward reference */
-                if(st->pas==1 && st->error_undefined_label){
-                    st->pass1_size_mode=1;
-                    makeobj(asmb,i->f[2],objl_out);
-                    st->pass1_size_mode=0;
-                    st->error_undefined_label=0;
-                }
-                /* Pass2: if makeobj produced undefined label, that's a hard error */
+                /* Pass1ではmakeobj内でpass1_size_modeを使うため、
+                 * ここでのretryは不要。error_undefined_labelはmakeobj内でクリア済み。
+                 * Pass2: if makeobj produced undefined label, that's a hard error */
                 if(st->pas==2 && st->error_undefined_label){
                     oerr=1;
                     oerr_entry=i;
@@ -3903,8 +3958,8 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(loopflag){ se=1; pln=0; }
 
     if(st->pas==2||st->pas==0){
-        if(st->error_undefined_label){ printf(" error - undefined label error.\n"); *idx_out=idx; return 0; }
-        if(se){ printf(" error - Syntax error.\n"); *idx_out=idx; return 0; }
+        if(st->error_undefined_label){ fprintf(stderr," error - undefined label error.\n"); *idx_out=idx; return 0; }
+        if(se){ fprintf(stderr," error - Syntax error.\n"); *idx_out=idx; return 0; }
         if(oerr){
             /* Mirrors Python:
              *   print(f" ; pat {pln} {pl} error - Illegal syntax in assemble line or pattern line.")
@@ -4044,16 +4099,20 @@ static int lineassemble(Assembler *asmb, const char *line_in){
             uint64_t sec_start = _rse ? u256_to_u64(_rse->start) : 0;
             uint64_t cur_pc    = u256_to_u64(st->pc);
 
-            /* Per-machine rtype lookup */
-            static const struct { int mach; int b8,b4,b2,b1; } _rm[] = {
-                {62,  1, 10, 12, 14},
-                {3,   0,  1,  2,  7},
-                {40,  0,  2,250,  0},
-                {183,257,258,  0,  0},
-                {243, 2,  3,  0,  0},
-                {20,  0,  1,  0,  0},
-                {0,0,0,0,0}
-            };
+        /* Per-machine rtype lookup.
+         * axx.py: _rmap = {8:1, 4:2, 2:12, 1:14} for x86_64.
+         * RIP相対(LEA/JMP/CALL)が主流なので 4バイトは R_X86_64_PC32(2)。
+         * R_X86_64_32(10,絶対)はほとんど使わない。
+         * Bug修正: 旧コードは x86_64の4バイトに10(絶対)を使っていた → 2(PC32)に修正。 */
+        static const struct { int mach; int b8,b4,b2,b1; } _rm[] = {
+            {62,  1,  2, 12, 14},   /* EM_X86_64: 8→64(1) 4→PC32(2) 2→16(12) 1→8(14) */
+            {3,   0,  1,  2,  7},   /* EM_386 */
+            {40,  0,  2,250,  0},   /* EM_ARM */
+            {183,257,258,  0,  0},  /* EM_AARCH64 */
+            {243, 2,  3,  0,  0},   /* EM_RISCV */
+            {20,  0,  1,  0,  0},   /* EM_PPC */
+            {0,0,0,0,0}
+        };
             int _rb8=1,_rb4=2,_rb2=3,_rb1=4;  /* fallback */
             for(int _ri=0; _rm[_ri].mach; _ri++){
                 if(_rm[_ri].mach == st->elf_machine){
@@ -4088,7 +4147,15 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     _gj++;
                 int _nwords = _gj - _gi;
                 int _nbytes = _nwords * bpw;
-                int _rtype  = RTYPE_FOR(_nbytes);
+                /* axx.py: check .EXTERN reloc_type_override first, then fall back to default */
+                int _rtype = 0;
+                {
+                    LabelEntry *_le = lmap_find(&st->labels, _lname);
+                    if(_le && _le->reloc_type_override >= 0)
+                        _rtype = _le->reloc_type_override;
+                    else
+                        _rtype = RTYPE_FOR(_nbytes);
+                }
                 if(_rtype != 0 && _widx < objl.len){
                     int64_t _sec_rel = (int64_t)((cur_pc + (uint64_t)_widx - sec_start)
                                                   * (uint64_t)bpw);
@@ -4127,7 +4194,29 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                             }
                         }
                     }
-                    int64_t _addend = (int64_t)(_raw_val - _valid[_gi].val);
+                    /* addend の計算:
+                     * ELF PC相対リロケーション (PC32/PLT32等) では、リンカが
+                     * フィールドに S+A-P を書き込む。実行時に CPU は
+                     * rip(=P+num_bytes) + field を計算するので
+                     * target = S+A+num_bytes。target=S にするには A=-num_bytes。
+                     *
+                     * これは pattern が *(s-$$-5,%%) でも *(s-$$,%%) でも同じ。
+                     * パターン内の補正値は raw_val に吸収されるが addend には無関係。
+                     *
+                     * 絶対リロケーション (ABS64/ABS32等) ではリンカが S+A を書く。
+                     * target = S+A = assembled_sym+offset なので A = raw_val - abs_w。 */
+                    int64_t _addend;
+                    {
+                        /* PC相対型: 2=PC32, 3=GOT32, 4=PLT32, 9=GOTPCREL, 12=PC16, 14=PC8 */
+                        static const int _pcrel[] = {2,3,4,9,12,14,0};
+                        int _is_pcrel = 0;
+                        for(int _pi=0; _pcrel[_pi]; _pi++)
+                            if(_rtype == _pcrel[_pi]){ _is_pcrel=1; break; }
+                        if(_is_pcrel)
+                            _addend = -(int64_t)_nbytes;
+                        else
+                            _addend = (int64_t)_raw_val - (int64_t)_valid[_gi].val;
+                    }
                     if(st->reloc_count >= st->reloc_cap){
                         st->reloc_cap = st->reloc_cap ? st->reloc_cap*2 : 16;
                         st->relocations = realloc(st->relocations,
@@ -4170,12 +4259,15 @@ static int lineassemble0(Assembler *asmb, const char *line){
     int l=(int)strlen(st->cl);
     while(l>0&&(st->cl[l-1]=='\n'||st->cl[l-1]=='\r')) st->cl[--l]=0;
 
-    if(st->pas==2||st->pas==0){
+    /* -v (verbose/debug) フラグが立っているときだけリスト出力する。
+     * 対話モード (pas==0) は常に出力する。                         */
+    int show = (st->pas==0) || ((st->pas==2) && st->debug);
+    if(show){
         printf("%016llx %s %d %s ",(unsigned long long)u256_to_u64(st->pc),
                st->current_file, st->ln, st->cl);
     }
     int f=lineassemble(asmb,st->cl);
-    if(st->pas==2||st->pas==0) printf("\n");
+    if(show) printf("\n");
     st->ln++;
     return f;
 }
@@ -4545,7 +4637,7 @@ static void fileassemble(Assembler *asmb, const char *fn){
             if(!already || !already[0]) continue;
             int is_stdin_already = (strcmp(already,"stdin")==0 || strcmp(already,"(stdin)")==0);
             if(is_stdin_fn && is_stdin_already){
-                printf(" error - circular .INCLUDE detected: '%s' is already being assembled.\n", fn);
+                fprintf(stderr," error - circular .INCLUDE detected: '%s' is already being assembled.\n", fn);
                 return;
             }
             if(!is_stdin_fn && !is_stdin_already){
@@ -4553,7 +4645,7 @@ static void fileassemble(Assembler *asmb, const char *fn){
                 char abs_fn[4096]={0}, abs_al[4096]={0};
                 if(realpath(fn,   abs_fn) && realpath(already, abs_al)
                    && strcmp(abs_fn, abs_al)==0){
-                    printf(" error - circular .INCLUDE detected: '%s' is already being assembled.\n", fn);
+                    fprintf(stderr," error - circular .INCLUDE detected: '%s' is already being assembled.\n", fn);
                     return;
                 }
             }
@@ -4751,7 +4843,7 @@ static int imp_label(Assembler *asmb, const char *l){
  * main
  * ========================================================= */
 static void print_usage(const char *prog){
-    printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-m machine]\n",prog);
+    printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-m machine] [-v]\n",prog);
     printf("axx general assembler programmed and designed by Taisuke Maekawa\n");
 }
 
@@ -4792,6 +4884,7 @@ int main(int argc, char *argv[]){
         else if(strcmp(argv[i],"-i")==0&&i+1<argc){ strncpy(st->impfile,argv[++i],sizeof(st->impfile)-1); }
         else if(strcmp(argv[i],"-o")==0&&i+1<argc){ strncpy(st->elf_objfile,argv[++i],sizeof(st->elf_objfile)-1); }
         else if(strcmp(argv[i],"-m")==0&&i+1<argc){ st->elf_machine=atoi(argv[++i]); }
+        else if(strcmp(argv[i],"-v")==0){ st->debug=1; }
         else if(argv[i][0]!='-'){
             if(!patternfile) patternfile=argv[i];
             else if(!sourcefile) sourcefile=argv[i];
@@ -4874,7 +4967,7 @@ int main(int argc, char *argv[]){
         for(int bi=0; bi<st->labels.nbuckets; bi++)
             for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
                 lmap_set_full(&imported_labels, e->key, e->value, e->section,
-                              e->is_equ, e->is_imported);
+                              e->is_equ, e->is_imported, e->reloc_type_override);
 
         /* Fix ⑧: snapshot initial vars (a-z) */
         uint256_t initial_vars[26];
@@ -4891,9 +4984,13 @@ int main(int argc, char *argv[]){
             for(int bi=0; bi<imported_labels.nbuckets; bi++)
                 for(LabelEntry *e=imported_labels.buckets[bi]; e; e=e->next)
                     lmap_set_full(&st->labels, e->key, e->value, e->section,
-                                  e->is_equ, e->is_imported);
+                                  e->is_equ, e->is_imported, e->reloc_type_override);
             /* reset sections and export_labels too (mirrors axx.py run()) */
             secmap_clear(&st->sections);
+            /* Bug修正(axx.py port): reset current_section so that the previous
+             * iteration's trailing section (.data etc.) does not become old_sec
+             * at the next iteration's start and get wrongly registered at pc=0. */
+            strcpy(st->current_section, ".text");
             lmap_free(&st->export_labels); lmap_init(&st->export_labels);
             /* Fix C-N6: reset symbols to the post-pattern-file baseline at the
              * start of every relaxation iteration.  Source-level .setsym /
@@ -4948,7 +5045,7 @@ int main(int argc, char *argv[]){
             for(int bi=0; bi<st->labels.nbuckets; bi++)
                 for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
                     lmap_set_full(&prev_labels, e->key, e->value, e->section,
-                                  e->is_equ, e->is_imported);
+                                  e->is_equ, e->is_imported, e->reloc_type_override);
 
             if(converged){
                 if(st->debug)
@@ -4977,6 +5074,9 @@ int main(int argc, char *argv[]){
          * provisional sizes from pass1 do not carry over.  labels and
          * patsymbols do NOT need resetting here (only sections). */
         secmap_clear(&st->sections);
+        /* Bug修正(axx.py port): reset current_section before pass2 (mirrors
+         * axx.py: self.state.current_section = '.text' before pass2 fileassemble). */
+        strcpy(st->current_section, ".text");
         fileassemble(asmb,sourcefile);
     }
 
@@ -5026,14 +5126,27 @@ int main(int argc, char *argv[]){
                 for(LabelEntry*e=st->export_labels.buckets[i];e;e=e->next){ \
                     unsigned long long lbl_addr; \
                     if(e->is_equ){ \
-                        /* absolute constant: output as-is */ \
                         lbl_addr=(unsigned long long)u256_to_u64(e->value); \
                     } else { \
-                        /* PC (word units) → byte address */ \
                         lbl_addr=(unsigned long long)u256_to_u64(e->value) \
                                  *(unsigned long long)_bpw_export; \
                     } \
-                    fprintf(lf,"%s\t0x%llx\n",e->key,lbl_addr); \
+                    /* axx.py: emit ::reloc_type suffix if reloc_type_override is set. \
+                     * _RTYPE_REVERSE mirrors axx.py _write_export() logic. */ \
+                    const char *_rtype_sfx=""; \
+                    LabelEntry *_full=lmap_find(&st->labels,e->key); \
+                    if(_full && _full->reloc_type_override>=0){ \
+                        switch(_full->reloc_type_override){ \
+                            case 1:  _rtype_sfx="::abs64";    break; \
+                            case 2:  _rtype_sfx="::pc32";     break; \
+                            case 4:  _rtype_sfx="::plt32";    break; \
+                            case 9:  _rtype_sfx="::gotpcrel"; break; \
+                            case 10: _rtype_sfx="::abs32";    break; \
+                            case 16: _rtype_sfx="::rel32";    break; \
+                            default: _rtype_sfx=""; break; \
+                        } \
+                    } \
+                    fprintf(lf,"%s%s\t0x%llx\n",e->key,_rtype_sfx,lbl_addr); \
                 } \
             } \
             fclose(lf); \

@@ -74,6 +74,13 @@ class AssemblerState:
         # Program counter and padding
         self.pc = 0
         self.padding = 0
+        # pc_instr_start: binary_list中の$$が命令先頭アドレスを指すように、
+        # makeobj呼び出し前にself.state.pcの値を保存する。
+        self.pc_instr_start = 0
+        # _in_binary_list: makeobj実行中はTrue。$$がpc_instr_startを
+        # 返すのはbinary_list評価中のみ。.equなど他のコンテキストでは
+        # $$=現在のPC (self.state.pc) を返す。
+        self._in_binary_list = False
         
         # Character sets for parsing
         self.lwordchars = DIGIT + ALPHABET + "_."
@@ -922,8 +929,11 @@ class LabelManager:
         try:
             v = self.state.labels[k][0]
         except (KeyError, IndexError):
-            # Pass1 サイズ推定モード中は 0 を返す（値は不正だがリスト長=命令サイズは正しく求まる）
-            v = 0 if self.state._pass1_size_mode else UNDEF
+            if self.state._pass1_size_mode:
+                # Pass1 サイズ推定モード中は 0 を返す。
+                # error_undefined_label は False のまま（Trueにするとmakeobjがスキップする）。
+                return 0
+            v = UNDEF
             self.state.error_undefined_label = True
             return v
         # ELF リロケーション追跡
@@ -1341,7 +1351,9 @@ class ExpressionEvaluator:
             idx+=3
         elif StringUtils.q(s, '$$', idx):
             idx += 2
-            x = self.state.pc
+            # binary_list中(makeobj内)では命令先頭アドレスpc_instr_startを返す。
+            # .equなど他のコンテキストでは現在のPC(self.state.pc)を返す。
+            x = self.state.pc_instr_start if self.state._in_binary_list else self.state.pc
         elif StringUtils.q(s, '#', idx):
             idx += 1
             t, idx = self.parser.get_symbol_word(s, idx)
@@ -2933,6 +2945,9 @@ class ObjectGenerator:
                     rep_pattern = pattern[comma_pos+1:i]
                     
                     # Evaluate expression
+                    # 修正: 直前の処理でerror_undefined_labelが残っている場合に
+                    # n=0と誤判定されるのを防ぐため、評価前にリセットする。
+                    self.state.error_undefined_label = False
                     n, idx = self.expr_eval.expression_pat(expr, 0)
                     # Fix: 未定義ラベルや UNDEF 由来の巨大値が n に入ると
                     # range(int(UNDEF)) が実質無限ループになりプロセスがハングする。
@@ -2974,13 +2989,10 @@ class ObjectGenerator:
         s,z = self.e_p(s)
         s = self.replace_percent_with_index(s)
 
-        # Fix 10: @@[0,...] の展開結果が空文字列になると、前後のカンマが
-        # 連続（例: "a,,c"）し makeobj のカンマ処理が余分なアライメントパディングを
-        # 挿入する。連続カンマを1つに正規化し、前後の孤立カンマも除去する。
-        while ',,' in s:
-            s = s.replace(',,', ',')
-        s = s.strip(',')
-        
+        # 修正: ','の正規化（,,→,, strip(',')）を抑制する。
+        # ','はbinary_listのセパレータであり、アライメント指示ではない。
+        # @@[0,...]が空展開されても余分な処理は行わない。
+
         s += chr(0)
         idx = 0
         objl = []
@@ -2988,23 +3000,18 @@ class ObjectGenerator:
         if z:
             return objl
 
+        self.state._in_binary_list = True
+        # e_p/replace_percent_with_index は前処理。ここで一度リセットしておき、
+        # 直前の処理の残留フラグがループ内の判定を汚染しないようにする。
+        self.state.error_undefined_label = False
         try:
             while True:
                 if idx >= len(s) or s[idx] == chr(0):
                     break
 
                 if s[idx] == ',':
+                    # 修正: ','はセパレータのみ。アライメントパディングは挿入しない。
                     idx += 1
-                    p = self.state.pc + len(objl)
-                    n = self.binary_writer.align_(p)
-                    for i in range(p, n):
-                        # Fix ⑤: パディングワードを追加する前に _elf_current_word_idx を
-                        # 更新する。旧実装では更新なしで objl に追加していたため、
-                        # パディング挿入後の式評価で get_value() が記録する word_idx が
-                        # 実際の位置からズレて ELF リロケーションのオフセットが誤った
-                        # 値になっていた。
-                        self.state._elf_current_word_idx = len(objl)
-                        objl += [self.state.padding]
                     continue
 
                 semicolon = False
@@ -3012,24 +3019,21 @@ class ObjectGenerator:
                     semicolon = True
                     idx += 1
 
-                # ELF リロケーション追跡: このワードを生成する式評価の開始時点で
-                # 現在のワードインデックス（objl への追加前の長さ）を記録する。
-                # get_value() がこの値を参照して (label, value, word_idx) を記録する。
                 self.state._elf_current_word_idx = len(objl)
 
+                # pass==1では常に_pass1_size_modeで評価する。
+                # 未定義ラベル(EXTERN等)があっても0として扱い、
+                # @@[8,*(e,%%)]のような式でも8バイト分が正しく計上される。
+                if self.state.pas == 1:
+                    self.state._pass1_size_mode = True
                 x, idx = self.expr_eval.expression_pat(s, idx)
+                if self.state.pas == 1:
+                    self.state._pass1_size_mode = False
+                    self.state.error_undefined_label = False
 
-                # ';' フラグ付きは「x != 0 のときだけワードを出力する」条件付き出力。
-                # x == 0 でスキップされると objl の長さとパターン側のサイズ式 i[3] が
-                # 食い違う可能性がある。パターン作成者が i[3] を ';' の条件を考慮して
-                # 書くことを前提としており、ここでは整合性の保証はしない。
-                # ELF リロケーション追跡: スキップされたワードの word_idx は使われないが
-                # 念のため _elf_current_word_idx をリセットしておく。
                 if (semicolon == True and x != 0) or (semicolon == False):
                     objl += [x]
                 elif semicolon:
-                    # 条件付きスキップ: ELF 追跡エントリが誤った word_idx で
-                    # 残らないよう、直前に記録されたエントリを取り消す。
                     self.state._elf_label_refs_seen = [
                         e for e in self.state._elf_label_refs_seen
                         if e[2] != self.state._elf_current_word_idx
@@ -3042,6 +3046,9 @@ class ObjectGenerator:
         finally:
             # makeobj() を抜けたら必ずセンチネルに戻す（例外安全）
             self.state._elf_current_word_idx = -1
+            self.state._in_binary_list = False
+            if self.state.pas == 1:
+                self.state._pass1_size_mode = False
 
         return objl
 
@@ -3342,7 +3349,7 @@ class AssemblyDirectiveProcessor:
                 self.state.pc += 1
         # Fix: 閉じダブルクォートが見つからずループを抜けた場合は警告する
         if idx >= len(l2):
-            print(f" warning - unterminated string literal in .ASCII/.ASCIIZ: {l2!r}")
+            print(f" warning - unterminated string literal in .ASCII/.ASCIZ: {l2!r}")
         return True
     
     def export_processing(self, l1, l2):
@@ -3425,8 +3432,8 @@ class AssemblyDirectiveProcessor:
         return self.asciistr(l2)
     
     def asciiz_processing(self, l1, l2):
-        """ASCIIZ directive"""
-        if StringUtils.upper(l1) != ".ASCIIZ":
+        """ASCIZ directive"""
+        if StringUtils.upper(l1) != ".ASCIZ":
             return False
         # Bug修正: asciistr() が文字列バイトを出力する。
         # 旧コードは f = self.asciistr(l2) の戻り値(bool)だけ見て
@@ -3434,7 +3441,7 @@ class AssemblyDirectiveProcessor:
         # 修正: asciistr() で文字列を出力した後、ヌル終端を追加する。
         if not self.asciistr(l2):
             if self.state.pas == 2 or self.state.pas == 0:
-                print(f" error - .ASCIIZ requires a quoted string.")
+                print(f" error - .ASCIZ requires a quoted string.")
             return False
         # ヌル終端を追加 (asciistr はヌルを書かない)
         self.binary_writer.outbin(self.state.pc, 0x00)
@@ -3443,7 +3450,7 @@ class AssemblyDirectiveProcessor:
     
     def section_processing(self, l1, l2):
         """Section directive"""
-        if StringUtils.upper(l1) != "SECTION" and StringUtils.upper(l1) != "SEGMENT":
+        if StringUtils.upper(l1) != ".SECTION" and StringUtils.upper(l1) != ".SEGMENT":
             return False
         
         if l2 != '':
@@ -3526,10 +3533,10 @@ class AssemblyDirectiveProcessor:
     
     def endsection_processing(self, l1, l2):
         """End section directive"""
-        if StringUtils.upper(l1) != "ENDSECTION" and StringUtils.upper(l1) != "ENDSEGMENT":
+        if StringUtils.upper(l1) != ".ENDSECTION" and StringUtils.upper(l1) != ".ENDSEGMENT":
             return False
         if self.state.current_section not in self.state.sections:
-            print(f" error - ENDSECTION without matching SECTION for '{self.state.current_section}'.")
+            print(f" error - .ENDSECTION without matching .SECTION for '{self.state.current_section}'.")
             return True
         entry = self.state.sections[self.state.current_section]
         start = entry[0]
@@ -3735,10 +3742,10 @@ class Assembler:
             if not _ok and (self.state.pas == 2 or self.state.pas == 0):
                 print(f" error - .ASCII: failed to process string argument: {l2!r}")
             return 0, [], True, idx
-        if _l_upper == '.ASCIIZ':
+        if _l_upper == '.ASCIZ':
             _ok = self.asm_directive_proc.asciiz_processing(l, l2)
             if not _ok and (self.state.pas == 2 or self.state.pas == 0):
-                print(f" error - .ASCIIZ: failed to process string argument: {l2!r}")
+                print(f" error - .ASCIZ: failed to process string argument: {l2!r}")
             return 0, [], True, idx
         if self.include_asm(l, l2):
             return 0, [], True, idx
@@ -3834,6 +3841,8 @@ class Assembler:
                         # エラー時はオブジェクト生成をスキップする。
                         err_triggered, _err_code = self.directive_proc.error(i[1])
                         if not err_triggered:
+                            # binary_list中の$$が命令先頭アドレスを指すように保存
+                            self.state.pc_instr_start = self.state.pc
                             objl = self.obj_gen.makeobj(i[2])
                         else:
                             objl = []
@@ -3894,6 +3903,8 @@ class Assembler:
                     # Fix 10: error() の戻り値でエラー発生を検知する（デバッグモード）
                     err_triggered, _err_code = self.directive_proc.error(i[1])
                     if not err_triggered:
+                        # binary_list中の$$が命令先頭アドレスを指すように保存
+                        self.state.pc_instr_start = self.state.pc
                         objl = self.obj_gen.makeobj(i[2])
                     else:
                         objl = []
@@ -4094,13 +4105,24 @@ class Assembler:
                     if 0 < _field_bits < 64 and raw_val >= (1 << (_field_bits - 1)):
                         raw_val -= (1 << _field_bits)
 
-                    # Bug2修正: RELA addend の正しい定義は A = field_signed + P - S_assembled
-                    # ここで P = フィールドのセクション内バイトオフセット (= sec_rel)。
-                    # 旧コード `raw_val - abs_w` は P を加算していなかったため、
-                    # リンカが計算する S + A - P が assembler の意図した値にならなかった。
-                    # 例: CALL rel32 (printf=0, pc_E8=N, sec_rel=N+1)
-                    #   field_signed = -(N+5), addend = -(N+5) + (N+1) - 0 = -4 ✓
-                    addend = raw_val + sec_rel - abs_w
+                    # addend の計算:
+                    # ELF PC相対リロケーション (PC32/PLT32等) では、リンカが
+                    # フィールドに「S + A - P」を書き込む。実行時に CPU は
+                    # rip (= P + num_bytes) + field_value を計算するので、
+                    # target = rip + field = S + A - P + P + num_bytes = S + A + num_bytes。
+                    # target = S にしたいので A = -num_bytes = -4 (4バイトフィールドの場合)。
+                    #
+                    # これは pattern が *(s-$$-5,%%) でも *(s-$$,%%) でも同じ。
+                    # パターン内の補正値は pc_instr_start との差として raw_val に入るが、
+                    # addend にとっては関係なく常に -num_bytes。
+                    #
+                    # 絶対リロケーション (ABS64/ABS32 等) ではリンカが「S + A」を書き込む。
+                    # target = S + A = assembled_sym + offset なので A = raw_val - abs_w。
+                    _pc_rel_types = {2, 3, 4, 9, 12, 14}  # PC32,GOT32,PLT32,GOTPCREL,PC16,PC8
+                    if rtype in _pc_rel_types:
+                        addend = -num_bytes
+                    else:
+                        addend = raw_val - abs_w
                     self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend))
 
             for cnt in range(of):
@@ -4581,6 +4603,9 @@ class Assembler:
             else:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr)
+            # struct.pack('Q') は [0, 2^64-1] のみ受け付ける。
+            # val が負値や 2^64 超の Python int になり得るため uint64 にマスクする。
+            sym_val = int(sym_val) & 0xFFFFFFFFFFFFFFFF
             name_off = len(strtab); strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x00, 0, shndx, sym_val, 0))
 
@@ -4605,6 +4630,8 @@ class Assembler:
             else:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr)
+            # struct.pack('Q') は [0, 2^64-1] のみ受け付ける。uint64 にマスクする。
+            sym_val = int(sym_val) & 0xFFFFFFFFFFFFFFFF
             name_off = len(strtab); strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x10, 0, shndx, sym_val, 0))
 
