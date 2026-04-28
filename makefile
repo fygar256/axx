@@ -1,7 +1,7 @@
 all: caxx paxx
 
 caxx: caxx.c
-	cc -o caxx caxx.c -lm -O2
+	gcc -o caxx caxx.c -lm -O2
 	sudo cp caxx /usr/local/bin/caxx
 paxx: axx.py
 	sudo cp axx.py paxx
