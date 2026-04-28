@@ -1,9 +1,9 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 import sys
 
 pas=0
 current_section=".text"
-sections={ '.text' :['']}
+sections={ '.text' :[]}
 capital="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 lower="abcdefghijklmnopqrstuvwxyz"
 digit='0123456789'
@@ -50,6 +50,9 @@ def readsections(fn):
                 else:
                     current_section=secname
                     continue
+            elif sec.upper()==".ENDSECTION":
+                    current_section=".text"
+                    continue
             elif sec.upper()==".LABELC":
                 idx=skipspc(l,idx)
                 ss=""
@@ -84,6 +87,7 @@ def writesections():
         print(".section    ",a)
         for k in b:
             print(k)
+        print(".endsection")
 
 if __name__=='__main__':
     readsections(sys.argv[1])
