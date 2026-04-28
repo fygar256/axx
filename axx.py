@@ -3588,9 +3588,21 @@ class AssemblyDirectiveProcessor:
             if idx > 0 and l2[idx - 1] == ':' and idx < len(l2) and l2[idx] == ':':
                 idx -= 1  # ':' 消費を巻き戻して '::' を先頭から検出できるようにする
 
-            # デフォルトは PC32 (R_X86_64_PC32=2)。
+            # デフォルトリロケーション型をアーキテクチャから決定する。
             # .extern label::plt32 のように明示指定した場合はそちらを優先する。
-            reloc_type = 2  # default PC32
+            _em_ext = self.state.elf_machine
+            if _em_ext == 3:          # i386: R_386_PC32=2
+                reloc_type = 2
+            elif _em_ext == 40:       # ARM: R_ARM_REL32=3
+                reloc_type = 3
+            elif _em_ext == 183:      # AArch64: R_AARCH64_PREL32=261
+                reloc_type = 261
+            elif _em_ext == 243:      # RISC-V: R_RISCV_32=1
+                reloc_type = 1
+            elif _em_ext == 20:       # PPC: R_PPC_REL32=26
+                reloc_type = 26
+            else:                     # x86-64 (62) およびその他: R_X86_64_PC32=2
+                reloc_type = 2
             if idx < len(l2) and l2[idx:idx+2] == '::':
                 idx += 2
                 rt_start = idx
@@ -3600,11 +3612,23 @@ class AssemblyDirectiveProcessor:
 
                 if rt_str:
                     rtype_map = {
-                        'abs32': 1, 'abs64': 1,
-                        'plt32': 4,           # ← これが重要
-                        'gotpcrel': 9,
-                        'pc32': 2, 'rel32': 2,
-                        'abs16': 12, 'abs8': 14,
+                        # 絶対リロケーション
+                        'abs64':  1,   # R_X86_64_64      – 64bit 絶対アドレス
+                        'abs32':  10,  # R_X86_64_32      – 32bit ゼロ拡張絶対アドレス
+                        'abs32s': 11,  # R_X86_64_32S     – 32bit 符号拡張絶対アドレス
+                        'abs16':  12,  # R_X86_64_16      – 16bit 絶対アドレス
+                        'abs8':   14,  # R_X86_64_8       –  8bit 絶対アドレス
+                        # PC相対リロケーション
+                        'pc32':   2,   # R_X86_64_PC32    – 32bit PC相対
+                        'rel32':  2,   # R_X86_64_PC32    – pc32 の別名
+                        'plt32':  4,   # R_X86_64_PLT32   – PLT経由32bit PC相対
+                        'pc16':   13,  # R_X86_64_PC16    – 16bit PC相対
+                        'pc8':    15,  # R_X86_64_PC8     –  8bit PC相対
+                        'pc64':   24,  # R_X86_64_PC64    – 64bit PC相対
+                        # GOT相対リロケーション
+                        'got32':    3, # R_X86_64_GOT32      – GOTエントリへの32bit参照
+                        'gotpcrel': 9, # R_X86_64_GOTPCREL   – GOTエントリへのPC相対32bit参照
+                        'got64':   27, # R_X86_64_GOT64      – GOTエントリへの64bit参照
                     }
                     reloc_type = rtype_map.get(rt_str)
                     if reloc_type is None:
@@ -4057,11 +4081,58 @@ class Assembler:
                     groups.append((lname, abs_w, widx, gj - gi))
                     gi = gj
 
-                # R_X86_64_64=1, R_X86_64_PC32=2, R_X86_64_16=12, R_X86_64_8=14
-                # 4バイト: PC32(2) を使用。x86-64 では 4バイトフィールドは
-                # RIP相対(LEA/JMP/CALL 等)が主流で R_X86_64_32(10,絶対)は
-                # ほぼ使われない。絶対参照が必要なら .extern label::abs32 で明示する。
-                _rmap = {8: 1, 4: 2, 2: 12, 1: 14}  # x86_64 デフォルト
+                # アーキテクチャ別デフォルトリロケーション型マップ
+                # キー: フィールドサイズ（バイト数） → ELF リロケーション型番号
+                # 4バイトはアーキテクチャごとの主流型を使用。
+                # 絶対参照が必要な場合は .extern label::abs32 等で明示する。
+                _em = self.state.elf_machine
+                if _em == 3:
+                    # EM_386 (i386)
+                    # R_386_32=1(ABS), R_386_PC32=2(PC相対), R_386_16=20, R_386_8=22
+                    _rmap = {4: 2, 2: 20, 1: 22}          # 4バイトはPC相対(CALL/JMP主流)
+                elif _em == 20:
+                    # EM_PPC (PowerPC 32bit)
+                    # R_PPC_ADDR32=1, R_PPC_REL32=26, R_PPC_ADDR16=4, R_PPC_ADDR8=0(無し)
+                    _rmap = {4: 26, 2: 4}                  # 4バイトはPC相対
+                elif _em == 40:
+                    # EM_ARM
+                    # R_ARM_ABS32=2, R_ARM_REL32=3, R_ARM_ABS16=4, R_ARM_ABS8=8
+                    _rmap = {4: 3, 2: 4, 1: 8}             # 4バイトはPC相対(ARM主流)
+                elif _em == 183:
+                    # EM_AARCH64
+                    # R_AARCH64_ABS64=257, R_AARCH64_PREL32=261, R_AARCH64_ABS16=259
+                    # R_AARCH64_PREL64=260, R_AARCH64_PREL16=262
+                    _rmap = {8: 257, 4: 261, 2: 262}       # 8バイト=ABS64, 4/2バイト=PC相対
+                elif _em == 243:
+                    # EM_RISCV
+                    # R_RISCV_64=2, R_RISCV_32=1, R_RISCV_ADD32=35, R_RISCV_ADD16=34, R_RISCV_ADD8=33
+                    _rmap = {8: 2, 4: 1, 2: 34, 1: 33}    # 基本的に絶対アドレス
+                else:
+                    # EM_X86_64 (62) およびその他
+                    # R_X86_64_64=1(ABS64), R_X86_64_PC32=2(PC相対32), R_X86_64_16=12(ABS16), R_X86_64_8=14(ABS8)
+                    # 4バイト: PC32(2) を使用。x86-64 では 4バイトフィールドは
+                    # RIP相対(LEA/JMP/CALL 等)が主流で R_X86_64_32(10,絶対)は
+                    # ほぼ使われない。絶対参照が必要なら .extern label::abs32 で明示する。
+                    _rmap = {8: 1, 4: 2, 2: 12, 1: 14}    # x86_64 デフォルト
+
+                # PC相対リロケーション型の集合（アーキテクチャを横断して全列挙）
+                # addend = -num_bytes を適用するもの。絶対型はリストに含めない。
+                _pc_rel_types_all = {
+                    # x86-64
+                    2, 3, 4, 9, 13, 15, 24,
+                    # i386
+                    # R_386_PC32=2(共通), R_386_PC16=13(共通), R_386_PC8=23
+                    23,
+                    # ARM
+                    # R_ARM_REL32=3(共通), R_ARM_PC24=1
+                    1,
+                    # AArch64
+                    # R_AARCH64_PREL64=260, R_AARCH64_PREL32=261, R_AARCH64_PREL16=262
+                    260, 261, 262,
+                    # PPC
+                    # R_PPC_REL24=10, R_PPC_REL32=26
+                    10, 26,
+                }
 
                 for lname, abs_w, first_widx, num_words in groups:
                     num_bytes = num_words * bpw_r
@@ -4118,8 +4189,10 @@ class Assembler:
                     #
                     # 絶対リロケーション (ABS64/ABS32 等) ではリンカが「S + A」を書き込む。
                     # target = S + A = assembled_sym + offset なので A = raw_val - abs_w。
-                    _pc_rel_types = {2, 3, 4, 9, 12, 14}  # PC32,GOT32,PLT32,GOTPCREL,PC16,PC8
-                    if rtype in _pc_rel_types:
+                    # PC相対リロケーション型の集合。
+                    # 12=R_X86_64_16 と 14=R_X86_64_8 は「絶対」アドレスリロケーションなので
+                    # 含めない。PC相対の 16/8bit は 13=R_X86_64_PC16, 15=R_X86_64_PC8。
+                    if rtype in _pc_rel_types_all:
                         addend = -num_bytes
                     else:
                         addend = raw_val - abs_w
@@ -5119,8 +5192,22 @@ class Assembler:
                         if len(lentry) > 4 and lentry[4] is not None:
                             # Reverse lookup: rtype value → name
                             _RTYPE_REVERSE = {
-                                2: 'pc32', 4: 'plt32', 9: 'gotpcrel',
-                                1: 'abs64', 10: 'abs32', 16: 'rel32'
+                                # 絶対リロケーション
+                                1:  'abs64',   # R_X86_64_64
+                                10: 'abs32',   # R_X86_64_32
+                                11: 'abs32s',  # R_X86_64_32S
+                                12: 'abs16',   # R_X86_64_16
+                                14: 'abs8',    # R_X86_64_8
+                                # PC相対リロケーション
+                                2:  'pc32',    # R_X86_64_PC32
+                                4:  'plt32',   # R_X86_64_PLT32
+                                13: 'pc16',    # R_X86_64_PC16
+                                15: 'pc8',     # R_X86_64_PC8
+                                24: 'pc64',    # R_X86_64_PC64
+                                # GOT相対リロケーション
+                                3:  'got32',   # R_X86_64_GOT32
+                                9:  'gotpcrel', # R_X86_64_GOTPCREL
+                                27: 'got64',   # R_X86_64_GOT64
                             }
                             reloc_type_str = _RTYPE_REVERSE.get(lentry[4], '')
                             if reloc_type_str:
