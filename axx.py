@@ -7,7 +7,7 @@ Refactored with OOP design for improved maintainability
 """
 
 from decimal import Decimal, getcontext
-try:
+try:  # patched
     import readline  # GNU readline (Unix/macOS only; not available on Windows)
 except ImportError:
     pass  # Gracefully degrade on Windows or environments without readline
@@ -167,7 +167,7 @@ class AssemblerState:
 
         # ELF relocation tracking
         # relocations: list of (section_name, sec_rel_byte_offset, sym_name, reloc_type, addend)
-        self.relocations = []
+        self.relocations = []  # (section, offset, symbol, type, addend)
         # _elf_tracking: True while assembling an instruction during pass2 ELF output
         self._elf_tracking = False
 
@@ -554,7 +554,7 @@ class Parser:
 def enfloat(a):
     # Fix: a が 0〜2^32-1 の範囲外のとき struct.pack('I', a) は struct.error になる。
     # 呼び出し元でマスクしているが念のため二重ガードする。
-    try:
+    try:  # patched
         float_value = struct.unpack('f', struct.pack('I', int(a) & 0xFFFFFFFF))[0]
     except (struct.error, OverflowError, ValueError):
         float_value = 0.0
@@ -562,7 +562,7 @@ def enfloat(a):
 
 def endouble(a):
     # Fix: a が 0〜2^64-1 の範囲外のとき struct.pack('Q', a) は struct.error になる。
-    try:
+    try:  # patched
         double_value = struct.unpack('d', struct.pack('Q', int(a) & 0xFFFFFFFFFFFFFFFF))[0]
     except (struct.error, OverflowError, ValueError):
         double_value = 0.0
@@ -596,11 +596,11 @@ class IEEE754Converter:
 
         # Fix 1: 不正な文字列（"0x10", "1+2" 等）は Decimal() が
         # decimal.InvalidOperation を送出する。ValueError に統一して呼び出し元で捕捉できるようにする。
-        try:
+        try:  # patched
             fval = float(Decimal(a))
         except Exception as _e:
             raise ValueError(f"decimal_to_ieee754_32bit_hex: invalid input {a!r}") from _e
-        try:
+        try:  # patched
             bits = struct.unpack('I', struct.pack('f', fval))[0]
         except (struct.error, OverflowError) as _e:
             raise ValueError(f"decimal_to_ieee754_32bit_hex: cannot pack {fval!r}") from _e
@@ -952,7 +952,7 @@ class LabelManager:
                     self.state._elf_var_to_label[cv] = None
             elif self.state._elf_current_word_idx >= 0:
                 # makeobj() 内でオブジェクト式がラベルを直接参照
-                self.state._elf_label_refs_seen.append(
+                self.state._elf_label_refs_seen.append(  # patched for abs64
                     (k, v, self.state._elf_current_word_idx))
         return v
     
@@ -1080,104 +1080,114 @@ class ExpressionEvaluator:
         return -1
     
     def factor(self, s, idx):
-        """Parse factor in expression"""
-        idx = StringUtils.skipspc(s, idx)
-        x = 0
-        
-        if idx + 4 <= len(s) and s[idx:idx+4] == '!!!!' and self.state.expmode == EXP_PAT:
-            x = self.state.vliwstop
-            idx += 4
-        elif idx + 3 <= len(s) and s[idx:idx+3] == '!!!' and self.state.expmode == EXP_PAT:
-            x = self.state.vcnt
-            idx += 3
-        elif idx < len(s) and s[idx] == '-':
-            # Fix: 深くネストした単項マイナス（例: ----x）は RecursionError になりうる。
-            # Python のデフォルト再帰限界は ~1000 であり、悪意あるまたは誤った入力で
-            # クラッシュする。try/except で安全に 0 を返す。
-            try:
-                x, idx = self.factor(s, idx + 1)
-            except RecursionError:
-                if self.state.pas == 2 or self.state.pas == 0:
-                    print(" error - expression nesting too deep (RecursionError) in unary '-'.")
-                return 0, idx
-            x = -x
-        elif idx < len(s) and s[idx] == '~':
-            try:
-                x, idx = self.factor(s, idx + 1)
-            except RecursionError:
-                if self.state.pas == 2 or self.state.pas == 0:
-                    print(" error - expression nesting too deep (RecursionError) in unary '~'.")
-                return 0, idx
-            # Fix: x が float('inf') / float('nan') のとき int(x) が OverflowError になる。
-            # nbit() と同じ方針: 非有限の float は 0 として扱う。
-            try:
-                x = ~int(x)
-            except (OverflowError, ValueError):
-                if self.state.pas == 2 or self.state.pas == 0:
-                    print(f" error - cannot apply bitwise NOT (~) to non-finite float value.")
-                x = 0
-        elif idx < len(s) and s[idx] == '@':
-            try:
-                x, idx = self.factor(s, idx + 1)
-            except RecursionError:
-                if self.state.pas == 2 or self.state.pas == 0:
-                    print(" error - expression nesting too deep (RecursionError) in unary '@'.")
-                return 0, idx
-            x = self.nbit(x)
-        elif idx < len(s) and s[idx] == '*':
-            if idx+1<len(s) and s[idx+1] == '(':
-                x, idx = self.expression(s,idx+2)
-                if idx<len(s) and s[idx] == ',':
-                    x2,idx = self.expression(s,idx+1)
-                    if idx<len(s) and s[idx] == ')':
-                        idx+=1
-                        # Fix: x2 が負のとき x2*8 < 0 → ValueError: negative shift count。
-                        # Fix(new): x2 が float('inf')/nan のとき int(x2) → OverflowError。
-                        # 両方をまとめて try/except でガードする。
-                        try:
-                            shift_amount = int(x2) * 8
-                        except (OverflowError, ValueError):
-                            if self.state.pas == 2 or self.state.pas == 0:
-                                print(" error - non-finite byte-extract offset in *(expr, expr).")
-                            x = 0
-                        else:
-                            if shift_amount < 0:
+        # === セグフォ対策: 再帰制限 ===
+        if getattr(self, '_recursion_depth', 0) > 250:
+            if self.state.pas in (2, 0):
+                print(" error - recursion too deep (segfault prevented)")
+            return 0, idx
+        self._recursion_depth = getattr(self, '_recursion_depth', 0) + 1
+        try:
+            """Parse factor in expression"""
+            idx = StringUtils.skipspc(s, idx)
+            x = 0
+            
+            if idx + 4 <= len(s) and s[idx:idx+4] == '!!!!' and self.state.expmode == EXP_PAT:
+                x = self.state.vliwstop
+                idx += 4
+            elif idx + 3 <= len(s) and s[idx:idx+3] == '!!!' and self.state.expmode == EXP_PAT:
+                x = self.state.vcnt
+                idx += 3
+            elif idx < len(s) and s[idx] == '-':
+                # Fix: 深くネストした単項マイナス（例: ----x）は RecursionError になりうる。
+                # Python のデフォルト再帰限界は ~1000 であり、悪意あるまたは誤った入力で
+                # クラッシュする。try/except で安全に 0 を返す。
+                try:
+                    x, idx = self.factor(s, idx + 1)
+                except RecursionError:
+                    if self.state.pas == 2 or self.state.pas == 0:
+                        print(" error - expression nesting too deep (RecursionError) in unary '-'.")
+                    return 0, idx
+                x = -x
+            elif idx < len(s) and s[idx] == '~':
+                try:
+                    x, idx = self.factor(s, idx + 1)
+                except RecursionError:
+                    if self.state.pas == 2 or self.state.pas == 0:
+                        print(" error - expression nesting too deep (RecursionError) in unary '~'.")
+                    return 0, idx
+                # Fix: x が float('inf') / float('nan') のとき int(x) が OverflowError になる。
+                # nbit() と同じ方針: 非有限の float は 0 として扱う。
+                try:
+                    x = ~int(x)
+                except (OverflowError, ValueError):
+                    if self.state.pas == 2 or self.state.pas == 0:
+                        print(f" error - cannot apply bitwise NOT (~) to non-finite float value.")
+                    x = 0
+            elif idx < len(s) and s[idx] == '@':
+                try:
+                    x, idx = self.factor(s, idx + 1)
+                except RecursionError:
+                    if self.state.pas == 2 or self.state.pas == 0:
+                        print(" error - expression nesting too deep (RecursionError) in unary '@'.")
+                    return 0, idx
+                x = self.nbit(x)
+            elif idx < len(s) and s[idx] == '*':
+                if idx+1<len(s) and s[idx+1] == '(':
+                    x, idx = self.expression(s,idx+2)
+                    if idx<len(s) and s[idx] == ',':
+                        x2,idx = self.expression(s,idx+1)
+                        if idx<len(s) and s[idx] == ')':
+                            idx+=1
+                            # Fix: x2 が負のとき x2*8 < 0 → ValueError: negative shift count。
+                            # Fix(new): x2 が float('inf')/nan のとき int(x2) → OverflowError。
+                            # 両方をまとめて try/except でガードする。
+                            try:
+                                shift_amount = int(x2) * 8
+                            except (OverflowError, ValueError):
                                 if self.state.pas == 2 or self.state.pas == 0:
-                                    print(" error - negative byte-extract offset in *(expr, expr).")
+                                    print(" error - non-finite byte-extract offset in *(expr, expr).")
                                 x = 0
                             else:
-                                x = x >> shift_amount
+                                if shift_amount < 0:
+                                    if self.state.pas == 2 or self.state.pas == 0:
+                                        print(" error - negative byte-extract offset in *(expr, expr).")
+                                    x = 0
+                                else:
+                                    x = x >> shift_amount
+                        else:
+                            # 修正⑩: 閉じ括弧 ')' がない場合はエラーを報告して 0 を返す
+                            print(" error - missing ')' in *(expr, expr) expression.")
+                            x=0
                     else:
-                        # 修正⑩: 閉じ括弧 ')' がない場合はエラーを報告して 0 を返す
-                        print(" error - missing ')' in *(expr, expr) expression.")
+                        # 修正⑩: カンマがない場合はエラーを報告して 0 を返す
+                        print(" error - missing ',' in *(expr, expr) expression.")
                         x=0
                 else:
-                    # 修正⑩: カンマがない場合はエラーを報告して 0 を返す
-                    print(" error - missing ',' in *(expr, expr) expression.")
-                    x=0
+                    # Fix: '*' の後に '(' が続かない場合は *(expr,expr) 構文のミスタイプ。
+                    # エラーメッセージを出力し x=0 のまま返す。
+                    # idx を進めないため、呼び出し元の term0() が '*' を二項演算子として
+                    # 再解釈し 0 * (次の式) = 0 となる（サイレントなセマンティクスは変わらないが
+                    # 少なくとも問題を通知する）。
+                    print(" error - expected '(' after '*' in *(expr,expr) expression.")
+                    # x=0, idx unchanged
             else:
-                # Fix: '*' の後に '(' が続かない場合は *(expr,expr) 構文のミスタイプ。
-                # エラーメッセージを出力し x=0 のまま返す。
-                # idx を進めないため、呼び出し元の term0() が '*' を二項演算子として
-                # 再解釈し 0 * (次の式) = 0 となる（サイレントなセマンティクスは変わらないが
-                # 少なくとも問題を通知する）。
-                print(" error - expected '(' after '*' in *(expr,expr) expression.")
-                # x=0, idx unchanged
-        else:
-            prev_idx = idx
-            x, idx = self.factor1(s, idx)
-            # Fix 2: factor1 が何も消費せず (idx 不変) かつ NUL でも終端でもない位置で
-            # 停止した場合、未知トークンがサイレントに 0 になっている。
-            # pass2/対話モードのみ警告を出す（pass1 は forward 参照で頻繁に発生するため抑制）。
-            if (idx == prev_idx
-                    and idx < len(s)
-                    and s[idx] not in (chr(0), ',', ')', ']', CB, ' ', '\t')
-                    and (self.state.pas == 2 or self.state.pas == 0)):
-                print(f" warning - unrecognized token at position {idx} in expression: "
-                      f"{s[idx:idx+8]!r} (treated as 0)")
+                prev_idx = idx
+                x, idx = self.factor1(s, idx)
+                # Fix 2: factor1 が何も消費せず (idx 不変) かつ NUL でも終端でもない位置で
+                # 停止した場合、未知トークンがサイレントに 0 になっている。
+                # pass2/対話モードのみ警告を出す（pass1 は forward 参照で頻繁に発生するため抑制）。
+                if (idx == prev_idx
+                        and idx < len(s)
+                        and s[idx] not in (chr(0), ',', ')', ']', CB, ' ', '\t')
+                        and (self.state.pas == 2 or self.state.pas == 0)):
+                    print(f" warning - unrecognized token at position {idx} in expression: "
+                          f"{s[idx:idx+8]!r} (treated as 0)")
 
-        idx = StringUtils.skipspc(s, idx)
-        return x, idx
+            idx = StringUtils.skipspc(s, idx)
+            return x, idx
+        finally:
+            if hasattr(self, '_recursion_depth'):
+                self._recursion_depth -= 1
 
     def xeval(self, x, _=None):
         # Fix: re.escape() の結果を文字クラス [..] 内に埋め込むと、
@@ -1229,7 +1239,7 @@ class ExpressionEvaluator:
                     else:
                         self.state._elf_var_to_label[cv] = None
                 elif self.state._elf_current_word_idx >= 0:
-                    self.state._elf_label_refs_seen.append(
+                    self.state._elf_label_refs_seen.append(  # patched for abs64
                         (label_name, val, self.state._elf_current_word_idx))
             # Fix 1: val が float の場合 hex() は TypeError になる。
             # exp_typ='f' モードで定義された .equ ラベルは float を持ちうる。
@@ -1560,7 +1570,7 @@ class ExpressionEvaluator:
                     entry = self.state._elf_var_to_label.get(ch)
                     if entry is not None:
                         lname, lval = entry
-                        self.state._elf_label_refs_seen.append(
+                        self.state._elf_label_refs_seen.append(  # patched for abs64
                             (lname, lval, self.state._elf_current_word_idx))
         elif idx < len(s) and s[idx] in self.state.lwordchars:
             w, idx_new = self.parser.get_label_word(s, idx)
@@ -2956,7 +2966,7 @@ class ObjectGenerator:
                     if self.state.error_undefined_label:
                         n = 0  # forward参照は 0 扱いにしてサイズ推定を続ける
                     try:
-                        n_int = int(n)
+                        n_int = min(max(0, int(n or 0)), 1<<20)  # prevent huge repeat
                     except (ValueError, OverflowError):
                         n_int = 0
                     if n_int > _N_MAX:
@@ -3588,9 +3598,21 @@ class AssemblyDirectiveProcessor:
             if idx > 0 and l2[idx - 1] == ':' and idx < len(l2) and l2[idx] == ':':
                 idx -= 1  # ':' 消費を巻き戻して '::' を先頭から検出できるようにする
 
-            # デフォルトは PC32 (R_X86_64_PC32=2)。
+            # デフォルトリロケーション型をアーキテクチャから決定する。
             # .extern label::plt32 のように明示指定した場合はそちらを優先する。
-            reloc_type = 2  # default PC32
+            _em_ext = self.state.elf_machine
+            if _em_ext == 3:          # i386: R_386_PC32=2
+                reloc_type = 2
+            elif _em_ext == 40:       # ARM: R_ARM_REL32=3
+                reloc_type = 3
+            elif _em_ext == 183:      # AArch64: R_AARCH64_PREL32=261
+                reloc_type = 261
+            elif _em_ext == 243:      # RISC-V: R_RISCV_32=1
+                reloc_type = 1
+            elif _em_ext == 20:       # PPC: R_PPC_REL32=26
+                reloc_type = 26
+            else:                     # x86-64 (62) およびその他: R_X86_64_PC32=2
+                reloc_type = 2
             if idx < len(l2) and l2[idx:idx+2] == '::':
                 idx += 2
                 rt_start = idx
@@ -3600,13 +3622,29 @@ class AssemblyDirectiveProcessor:
 
                 if rt_str:
                     rtype_map = {
-                        'abs32': 1, 'abs64': 1,
-                        'plt32': 4,           # ← これが重要
-                        'gotpcrel': 9,
-                        'pc32': 2, 'rel32': 2,
-                        'abs16': 12, 'abs8': 14,
+                        # 絶対リロケーション
+                        'abs64':  1,   # R_X86_64_64   # R_X86_64_64      – 64bit 絶対アドレス
+                        'abs32':  10,  # R_X86_64_32      – 32bit ゼロ拡張絶対アドレス
+                        'abs32s': 11,  # R_X86_64_32S     – 32bit 符号拡張絶対アドレス
+                        'abs16':  12,  # R_X86_64_16      – 16bit 絶対アドレス
+                        'abs8':   14,  # R_X86_64_8       –  8bit 絶対アドレス
+                        # PC相対リロケーション
+                        'pc32':   2,   # R_X86_64_PC32    – 32bit PC相対
+                        'rel32':  2,   # R_X86_64_PC32    – pc32 の別名
+                        'plt32':  4,   # R_X86_64_PLT32   – PLT経由32bit PC相対
+                        'pc16':   13,  # R_X86_64_PC16    – 16bit PC相対
+                        'pc8':    15,  # R_X86_64_PC8     –  8bit PC相対
+                        'pc64':   24,  # R_X86_64_PC64    – 64bit PC相対
+                        # GOT相対リロケーション
+                        'got32':    3, # R_X86_64_GOT32      – GOTエントリへの32bit参照
+                        'gotpcrel': 9, # R_X86_64_GOTPCREL   – GOTエントリへのPC相対32bit参照
+                        'got64':   27, # R_X86_64_GOT64      – GOTエントリへの64bit参照
                     }
                     reloc_type = rtype_map.get(rt_str)
+                if reloc_type is None and "abs" in rt_str.lower():
+                    reloc_type = 1  # R_X86_64_64
+                    if reloc_type is None and 'abs64' in rt_str.lower():
+                        reloc_type = 1
                     if reloc_type is None:
                         print(f" warning - unknown reloc type '{rt_str}' in .EXTERN", file=sys.stderr)
 
@@ -4032,11 +4070,12 @@ class Assembler:
             if self.state.elf_objfile and self.state.pas == 2 and objl and self.state._elf_label_refs_seen:
                 bpw_r = max(1, (self.state.bts + 7) // 8)
                 sec_name_r = self.state.current_section
-                sec_start_w = 0
+                sec_start_w = self.state.sections.get(sec_name_r, [0])[0] if sec_name_r in self.state.sections else 0
                 if sec_name_r in self.state.sections:
                     sec_start_w = self.state.sections[sec_name_r][0]
 
-                valid_refs = [(ln, aw, wi) for (ln, aw, wi) in self.state._elf_label_refs_seen if wi >= 0]
+                valid_refs = [(ln, aw, wi) for (ln, aw, wi) in self.state._elf_label_refs_seen 
+                     if 0 <= wi < len(objl) and wi < len(objl) if objl]
                 valid_refs.sort(key=lambda r: r[2])
 
                 # 複合式除外
@@ -4057,11 +4096,58 @@ class Assembler:
                     groups.append((lname, abs_w, widx, gj - gi))
                     gi = gj
 
-                # R_X86_64_64=1, R_X86_64_PC32=2, R_X86_64_16=12, R_X86_64_8=14
-                # 4バイト: PC32(2) を使用。x86-64 では 4バイトフィールドは
-                # RIP相対(LEA/JMP/CALL 等)が主流で R_X86_64_32(10,絶対)は
-                # ほぼ使われない。絶対参照が必要なら .extern label::abs32 で明示する。
-                _rmap = {8: 1, 4: 2, 2: 12, 1: 14}  # x86_64 デフォルト
+                # アーキテクチャ別デフォルトリロケーション型マップ
+                # キー: フィールドサイズ（バイト数） → ELF リロケーション型番号
+                # 4バイトはアーキテクチャごとの主流型を使用。
+                # 絶対参照が必要な場合は .extern label::abs32 等で明示する。
+                _em = self.state.elf_machine
+                if _em == 3:
+                    # EM_386 (i386)
+                    # R_386_32=1(ABS), R_386_PC32=2(PC相対), R_386_16=20, R_386_8=22
+                    _rmap = {4: 2, 2: 20, 1: 22}          # 4バイトはPC相対(CALL/JMP主流)
+                elif _em == 20:
+                    # EM_PPC (PowerPC 32bit)
+                    # R_PPC_ADDR32=1, R_PPC_REL32=26, R_PPC_ADDR16=4, R_PPC_ADDR8=0(無し)
+                    _rmap = {4: 26, 2: 4}                  # 4バイトはPC相対
+                elif _em == 40:
+                    # EM_ARM
+                    # R_ARM_ABS32=2, R_ARM_REL32=3, R_ARM_ABS16=4, R_ARM_ABS8=8
+                    _rmap = {4: 3, 2: 4, 1: 8}             # 4バイトはPC相対(ARM主流)
+                elif _em == 183:
+                    # EM_AARCH64
+                    # R_AARCH64_ABS64=257, R_AARCH64_PREL32=261, R_AARCH64_ABS16=259
+                    # R_AARCH64_PREL64=260, R_AARCH64_PREL16=262
+                    _rmap = {8: 257, 4: 261, 2: 262}       # 8バイト=ABS64, 4/2バイト=PC相対
+                elif _em == 243:
+                    # EM_RISCV
+                    # R_RISCV_64=2, R_RISCV_32=1, R_RISCV_ADD32=35, R_RISCV_ADD16=34, R_RISCV_ADD8=33
+                    _rmap = {8: 2, 4: 1, 2: 34, 1: 33}    # 基本的に絶対アドレス
+                else:
+                    # EM_X86_64 (62) およびその他
+                    # R_X86_64_64=1(ABS64), R_X86_64_PC32=2(PC相対32), R_X86_64_16=12(ABS16), R_X86_64_8=14(ABS8)
+                    # 4バイト: PC32(2) を使用。x86-64 では 4バイトフィールドは
+                    # RIP相対(LEA/JMP/CALL 等)が主流で R_X86_64_32(10,絶対)は
+                    # ほぼ使われない。絶対参照が必要なら .extern label::abs32 で明示する。
+                    _rmap = {8: 1, 4: 2, 2: 12, 1: 14}    # x86_64 デフォルト
+
+                # PC相対リロケーション型の集合（アーキテクチャを横断して全列挙）
+                # addend = -num_bytes を適用するもの。絶対型はリストに含めない。
+                _pc_rel_types_all = {
+                    # x86-64
+                    2, 3, 4, 9, 13, 15, 24,
+                    # i386
+                    # R_386_PC32=2(共通), R_386_PC16=13(共通), R_386_PC8=23
+                    23,
+                    # ARM
+                    # R_ARM_REL32=3(共通), R_ARM_PC24=1
+                    1,
+                    # AArch64
+                    # R_AARCH64_PREL64=260, R_AARCH64_PREL32=261, R_AARCH64_PREL16=262
+                    260, 261, 262,
+                    # PPC
+                    # R_PPC_REL24=10, R_PPC_REL32=26
+                    10, 26,
+                }
 
                 for lname, abs_w, first_widx, num_words in groups:
                     num_bytes = num_words * bpw_r
@@ -4118,12 +4204,14 @@ class Assembler:
                     #
                     # 絶対リロケーション (ABS64/ABS32 等) ではリンカが「S + A」を書き込む。
                     # target = S + A = assembled_sym + offset なので A = raw_val - abs_w。
-                    _pc_rel_types = {2, 3, 4, 9, 12, 14}  # PC32,GOT32,PLT32,GOTPCREL,PC16,PC8
-                    if rtype in _pc_rel_types:
+                    # PC相対リロケーション型の集合。
+                    # 12=R_X86_64_16 と 14=R_X86_64_8 は「絶対」アドレスリロケーションなので
+                    # 含めない。PC相対の 16/8bit は 13=R_X86_64_PC16, 15=R_X86_64_PC8。
+                    if rtype in _pc_rel_types_all:
                         addend = -num_bytes
                     else:
                         addend = raw_val - abs_w
-                    self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend))
+                    self.state.relocations.append  # patched((sec_name_r, sec_rel, lname, rtype, addend))
 
             for cnt in range(of):
                 self.binary_writer.outbin(self.state.pc + cnt, objl[cnt])
@@ -4699,7 +4787,7 @@ class Assembler:
             entries = rela_entries[sidx]
             data = b''.join(
                 _pack_rela(off, sym_name_to_idx.get(sn, 0), rtype, addend)
-                for (off, sn, rtype, addend) in entries
+                for (off, sn, rtype, addend) in entries if rtype is not None
             )
             rela_datas.append(data)
 
@@ -5119,8 +5207,22 @@ class Assembler:
                         if len(lentry) > 4 and lentry[4] is not None:
                             # Reverse lookup: rtype value → name
                             _RTYPE_REVERSE = {
-                                2: 'pc32', 4: 'plt32', 9: 'gotpcrel',
-                                1: 'abs64', 10: 'abs32', 16: 'rel32'
+                                # 絶対リロケーション
+                                1:  'abs64',   # R_X86_64_64
+                                10: 'abs32',   # R_X86_64_32
+                                11: 'abs32s',  # R_X86_64_32S
+                                12: 'abs16',   # R_X86_64_16
+                                14: 'abs8',    # R_X86_64_8
+                                # PC相対リロケーション
+                                2:  'pc32',    # R_X86_64_PC32
+                                4:  'plt32',   # R_X86_64_PLT32
+                                13: 'pc16',    # R_X86_64_PC16
+                                15: 'pc8',     # R_X86_64_PC8
+                                24: 'pc64',    # R_X86_64_PC64
+                                # GOT相対リロケーション
+                                3:  'got32',   # R_X86_64_GOT32
+                                9:  'gotpcrel', # R_X86_64_GOTPCREL
+                                27: 'got64',   # R_X86_64_GOT64
                             }
                             reloc_type_str = _RTYPE_REVERSE.get(lentry[4], '')
                             if reloc_type_str:

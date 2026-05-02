@@ -3739,8 +3739,15 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
          * was the first ':' of '::' we need to step back so '::' is detected. */
         if(idx > 0 && buf[idx-1]==':' && idx < blen && buf[idx]==':')
             idx--;  /* back up to expose '::' */
-        /* Parse optional ::rtype suffix (default PC32 = 2) */
-        int reloc_type = 2;  /* default R_X86_64_PC32 */
+        /* Parse optional ::rtype suffix.
+         * デフォルトリロケーション型はアーキテクチャに応じて選択する。 */
+        int _em_ext = st->elf_machine;
+        int reloc_type;
+        if     (_em_ext ==  40) reloc_type =   3;  /* ARM:     R_ARM_REL32       */
+        else if(_em_ext == 183) reloc_type = 261;  /* AArch64: R_AARCH64_PREL32  */
+        else if(_em_ext == 243) reloc_type =   1;  /* RISC-V:  R_RISCV_32        */
+        else if(_em_ext ==  20) reloc_type =  26;  /* PPC:     R_PPC_REL32       */
+        else                    reloc_type =   2;  /* x86-64/i386: PC32 (デフォルト) */
         if(idx+1 < blen && buf[idx]==':' && buf[idx+1]==':'){
             idx += 2;
             int rt_start = idx;
@@ -3755,14 +3762,27 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
                 /* lower-case for comparison */
                 for(int _ci=0;rt_str[_ci];_ci++)
                     if(rt_str[_ci]>='A'&&rt_str[_ci]<='Z') rt_str[_ci]+=32;
-                /* rtype_map mirrors axx.py extern_processing() */
+                /* rtype_map: mirrors axx.py extern_processing() (fixed & extended).
+                 * Bug修正: 旧コードは abs32→1(R_X86_64_64) だった。
+                 *          正しくは abs32→10(R_X86_64_32), abs64→1(R_X86_64_64)。 */
                 int rtype = -1;
-                if(strcmp(rt_str,"abs32")==0||strcmp(rt_str,"abs64")==0) rtype=1;
-                else if(strcmp(rt_str,"plt32")==0) rtype=4;
-                else if(strcmp(rt_str,"gotpcrel")==0) rtype=9;
-                else if(strcmp(rt_str,"pc32")==0||strcmp(rt_str,"rel32")==0) rtype=2;
-                else if(strcmp(rt_str,"abs16")==0) rtype=12;
-                else if(strcmp(rt_str,"abs8")==0)  rtype=14;
+                /* 絶対リロケーション */
+                if     (strcmp(rt_str,"abs64" )==0) rtype= 1;  /* R_X86_64_64    – 64bit絶対 */
+                else if(strcmp(rt_str,"abs32" )==0) rtype=10;  /* R_X86_64_32    – 32bit ゼロ拡張絶対 */
+                else if(strcmp(rt_str,"abs32s")==0) rtype=11;  /* R_X86_64_32S   – 32bit 符号拡張絶対 */
+                else if(strcmp(rt_str,"abs16" )==0) rtype=12;  /* R_X86_64_16    – 16bit絶対 */
+                else if(strcmp(rt_str,"abs8"  )==0) rtype=14;  /* R_X86_64_8     –  8bit絶対 */
+                /* PC相対リロケーション */
+                else if(strcmp(rt_str,"pc32"  )==0
+                     || strcmp(rt_str,"rel32" )==0) rtype= 2;  /* R_X86_64_PC32  – 32bit PC相対 */
+                else if(strcmp(rt_str,"plt32" )==0) rtype= 4;  /* R_X86_64_PLT32 – PLT経由32bit PC相対 */
+                else if(strcmp(rt_str,"pc16"  )==0) rtype=13;  /* R_X86_64_PC16  – 16bit PC相対 */
+                else if(strcmp(rt_str,"pc8"   )==0) rtype=15;  /* R_X86_64_PC8   –  8bit PC相対 */
+                else if(strcmp(rt_str,"pc64"  )==0) rtype=24;  /* R_X86_64_PC64  – 64bit PC相対 */
+                /* GOT相対リロケーション */
+                else if(strcmp(rt_str,"got32"   )==0) rtype= 3; /* R_X86_64_GOT32    – GOTエントリ32bit */
+                else if(strcmp(rt_str,"gotpcrel")==0) rtype= 9; /* R_X86_64_GOTPCREL – GOT PC相対32bit */
+                else if(strcmp(rt_str,"got64"   )==0) rtype=27; /* R_X86_64_GOT64    – GOTエントリ64bit */
                 if(rtype < 0)
                     fprintf(stderr," warning - unknown reloc type '%s' in .EXTERN\n", rt_str);
                 else
@@ -4083,15 +4103,18 @@ static int lineassemble(Assembler *asmb, const char *line_in){
          * Use word_idx recorded during makeobj()/expr_factor1() to locate each
          * label reference precisely.  No binary scanning – no false positives.
          *
-         * Architecture-specific relocation type table (machine -> nbytes -> rtype):
-         *   EM_X86_64(62) : 8→R_X86_64_64(1) 4→R_X86_64_32(10) 2→(12) 1→(14)
-         *   EM_386(3)     : 4→1  2→2  1→7
-         *   EM_ARM(40)    : 4→2  2→250
-         *   EM_AARCH64(183): 8→257  4→258
-         *   EM_RISCV(243) : 8→2  4→3
-         *   EM_PPC(20)    : 4→1
+         * Architecture-specific default relocation type table (machine → nbytes → rtype):
+         *   EM_X86_64(62) : 8→R_X86_64_64(1)   4→R_X86_64_PC32(2)   2→R_X86_64_16(12)  1→R_X86_64_8(14)
+         *   EM_386(3)     : 4→R_386_PC32(2)     2→R_386_16(20)       1→R_386_8(22)
+         *   EM_ARM(40)    : 4→R_ARM_REL32(3)    2→R_ARM_ABS16(4)     1→R_ARM_ABS8(8)
+         *   EM_AARCH64(183): 8→R_AARCH64_ABS64(257) 4→R_AARCH64_PREL32(261) 2→R_AARCH64_PREL16(262)
+         *   EM_RISCV(243) : 8→R_RISCV_64(2)    4→R_RISCV_32(1)      2→R_RISCV_ADD16(34) 1→R_RISCV_ADD8(33)
+         *   EM_PPC(20)    : 4→R_PPC_REL32(26)  2→R_PPC_ADDR16(4)
          *   fallback      : 8→1  4→2  2→3  1→4
-         */
+         *
+         * 4-byte default is PC-relative for x86-64/i386/ARM/AArch64/PPC because
+         * CALL/JMP/BL are the dominant 4-byte symbol references in code sections.
+         * Use .EXTERN label::abs32 (or abs32s/abs64 etc.) to force absolute. */
         if(st->elf_objfile[0] && st->pas==2 && objl.len>0 && st->elf_refs_len>0){
             int bpw = (st->bts+7)/8; if(bpw<1) bpw=1;
             const char *sec_name = st->current_section;
@@ -4100,17 +4123,26 @@ static int lineassemble(Assembler *asmb, const char *line_in){
             uint64_t cur_pc    = u256_to_u64(st->pc);
 
         /* Per-machine rtype lookup.
-         * axx.py: _rmap = {8:1, 4:2, 2:12, 1:14} for x86_64.
-         * RIP相対(LEA/JMP/CALL)が主流なので 4バイトは R_X86_64_PC32(2)。
-         * R_X86_64_32(10,絶対)はほとんど使わない。
-         * Bug修正: 旧コードは x86_64の4バイトに10(絶対)を使っていた → 2(PC32)に修正。 */
+         * 4-byte is PC-relative (CALL/JMP主流) for most architectures.
+         * Absolute variants: use .EXTERN label::abs32 / ::abs64 etc. to force. */
         static const struct { int mach; int b8,b4,b2,b1; } _rm[] = {
-            {62,  1,  2, 12, 14},   /* EM_X86_64: 8→64(1) 4→PC32(2) 2→16(12) 1→8(14) */
-            {3,   0,  1,  2,  7},   /* EM_386 */
-            {40,  0,  2,250,  0},   /* EM_ARM */
-            {183,257,258,  0,  0},  /* EM_AARCH64 */
-            {243, 2,  3,  0,  0},   /* EM_RISCV */
-            {20,  0,  1,  0,  0},   /* EM_PPC */
+            /* EM_X86_64: 8→R_X86_64_64(1) 4→R_X86_64_PC32(2) 2→R_X86_64_16(12) 1→R_X86_64_8(14) */
+            {62,  1,  2, 12, 14},
+            /* EM_386: 4→R_386_PC32(2) 2→R_386_16(20) 1→R_386_8(22)
+             * Bug修正: 旧コードは b4=1(ABS32),b2=2(PC32を16bit扱い),b1=7(非存在) だった */
+            {3,   0,  2, 20, 22},
+            /* EM_ARM: 4→R_ARM_REL32(3) 2→R_ARM_ABS16(4) 1→R_ARM_ABS8(8)
+             * Bug修正: 旧コードは b4=2(ABS32),b2=250(非標準),b1=0 だった */
+            {40,  0,  3,  4,  8},
+            /* EM_AARCH64: 8→R_AARCH64_ABS64(257) 4→R_AARCH64_PREL32(261) 2→R_AARCH64_PREL16(262)
+             * Bug修正: 旧コードは b4=258(ABS32),b2=0 だった */
+            {183,257,261,262,  0},
+            /* EM_RISCV: 8→R_RISCV_64(2) 4→R_RISCV_32(1) 2→R_RISCV_ADD16(34) 1→R_RISCV_ADD8(33)
+             * Bug修正: 旧コードは b4=3(R_RISCV_RELATIVE=動的リンカ専用),b2=0,b1=0 だった */
+            {243, 2,  1, 34, 33},
+            /* EM_PPC: 4→R_PPC_REL32(26) 2→R_PPC_ADDR16(4)
+             * Bug修正: 旧コードは b4=1(ADDR32=絶対),b2=0 だった */
+            {20,  0, 26,  4,  0},
             {0,0,0,0,0}
         };
             int _rb8=1,_rb4=2,_rb2=3,_rb1=4;  /* fallback */
@@ -4207,8 +4239,32 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                      * target = S+A = assembled_sym+offset なので A = raw_val - abs_w。 */
                     int64_t _addend;
                     {
-                        /* PC相対型: 2=PC32, 3=GOT32, 4=PLT32, 9=GOTPCREL, 12=PC16, 14=PC8 */
-                        static const int _pcrel[] = {2,3,4,9,12,14,0};
+                    /* PC相対リロケーション型の一覧（全アーキテクチャ横断）。
+                     * addend = -num_bytes を適用するものをここに列挙する。
+                     * 絶対型（12=R_X86_64_16, 14=R_X86_64_8 等）は含めない。
+                     *
+                     * Bug修正: 旧コードは 12(R_X86_64_16=絶対) と 14(R_X86_64_8=絶対) を
+                     * PC相対として扱っており、addend が -num_bytes に誤計算されていた。
+                     * 正しい PC相対 16/8bit は 13(R_X86_64_PC16) / 15(R_X86_64_PC8)。
+                     *
+                     * 各アーキテクチャの PC相対型:
+                     *   x86-64 : 2(PC32), 3(GOT32), 4(PLT32), 9(GOTPCREL),
+                     *            13(PC16), 15(PC8), 24(PC64)
+                     *   i386   : 23(R_386_PC8)  ※2(R_386_PC32)はx86-64と共通
+                     *   ARM    : 3(R_ARM_REL32) ※x86-64 GOT32と番号共有だが問題なし
+                     *   AArch64: 260(PREL64), 261(PREL32), 262(PREL16)
+                     *   PPC    : 10(R_PPC_REL24), 26(R_PPC_REL32)               */
+                    static const int _pcrel[] = {
+                        /* x86-64 */
+                        2, 3, 4, 9, 13, 15, 24,
+                        /* i386 */
+                        23,
+                        /* AArch64 */
+                        260, 261, 262,
+                        /* PPC */
+                        10, 26,
+                        0   /* sentinel */
+                    };
                         int _is_pcrel = 0;
                         for(int _pi=0; _pcrel[_pi]; _pi++)
                             if(_rtype == _pcrel[_pi]){ _is_pcrel=1; break; }
@@ -5132,17 +5188,29 @@ int main(int argc, char *argv[]){
                                  *(unsigned long long)_bpw_export; \
                     } \
                     /* axx.py: emit ::reloc_type suffix if reloc_type_override is set. \
-                     * _RTYPE_REVERSE mirrors axx.py _write_export() logic. */ \
+                     * _RTYPE_REVERSE: rtype番号 → 文字列名。\
+                     * Bug修正: 旧コードの case 16 は R_X86_64_DTPMOD64 であり \
+                     * "rel32" とは無関係。削除し、欠落していた全型を追加する。 */ \
                     const char *_rtype_sfx=""; \
                     LabelEntry *_full=lmap_find(&st->labels,e->key); \
                     if(_full && _full->reloc_type_override>=0){ \
                         switch(_full->reloc_type_override){ \
-                            case 1:  _rtype_sfx="::abs64";    break; \
-                            case 2:  _rtype_sfx="::pc32";     break; \
-                            case 4:  _rtype_sfx="::plt32";    break; \
-                            case 9:  _rtype_sfx="::gotpcrel"; break; \
-                            case 10: _rtype_sfx="::abs32";    break; \
-                            case 16: _rtype_sfx="::rel32";    break; \
+                            /* 絶対リロケーション */ \
+                            case  1: _rtype_sfx="::abs64";    break; /* R_X86_64_64  */ \
+                            case 10: _rtype_sfx="::abs32";    break; /* R_X86_64_32  */ \
+                            case 11: _rtype_sfx="::abs32s";   break; /* R_X86_64_32S */ \
+                            case 12: _rtype_sfx="::abs16";    break; /* R_X86_64_16  */ \
+                            case 14: _rtype_sfx="::abs8";     break; /* R_X86_64_8   */ \
+                            /* PC相対リロケーション */ \
+                            case  2: _rtype_sfx="::pc32";     break; /* R_X86_64_PC32    */ \
+                            case  4: _rtype_sfx="::plt32";    break; /* R_X86_64_PLT32   */ \
+                            case 13: _rtype_sfx="::pc16";     break; /* R_X86_64_PC16    */ \
+                            case 15: _rtype_sfx="::pc8";      break; /* R_X86_64_PC8     */ \
+                            case 24: _rtype_sfx="::pc64";     break; /* R_X86_64_PC64    */ \
+                            /* GOT相対リロケーション */ \
+                            case  3: _rtype_sfx="::got32";    break; /* R_X86_64_GOT32   */ \
+                            case  9: _rtype_sfx="::gotpcrel"; break; /* R_X86_64_GOTPCREL*/ \
+                            case 27: _rtype_sfx="::got64";    break; /* R_X86_64_GOT64   */ \
                             default: _rtype_sfx=""; break; \
                         } \
                     } \
