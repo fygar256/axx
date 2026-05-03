@@ -1695,10 +1695,13 @@ static uint256_t label_get_value(AsmState *st, const char *k){
         }
         return e->value;
     }
-    st->error_undefined_label=1;
-    /* Fix C-3: in pass1 size-estimation mode return 0 so makeobj() can
-     * compute the correct instruction byte count even for forward refs. */
-    return st->pass1_size_mode ? u256_zero() : UNDEF_VAL();
+    st->error_undefined_label = 1;
+    if(st->pass1_size_mode) return u256_zero();
+    if(st->pas == 2 || st->pas == 0){          // pass1 は forward ref 多発のため表示しない
+        fprintf(stderr, " error - Label undefined: '%s'  [%s:%d]\n",
+            k, st->current_file, (int)st->ln);
+    }
+    return UNDEF_VAL();
 }
 static const char *label_get_section(AsmState *st, const char *k){
     st->error_undefined_label=0;
@@ -3978,8 +3981,12 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(loopflag){ se=1; pln=0; }
 
     if(st->pas==2||st->pas==0){
-        if(st->error_undefined_label){ fprintf(stderr," error - undefined label error.\n"); *idx_out=idx; return 0; }
-        if(se){ fprintf(stderr," error - Syntax error.\n"); *idx_out=idx; return 0; }
+        if(st->error_undefined_label)
+            fprintf(stderr, " error - Undefined label in expression.  [%s:%d]\n",
+                st->current_file, (int)st->ln);
+        if(se)
+            fprintf(stderr, " error - Syntax error.  [%s:%d]\n",
+                st->current_file, (int)st->ln);
         if(oerr){
             /* Mirrors Python:
              *   print(f" ; pat {pln} {pl} error - Illegal syntax in assemble line or pattern line.")
