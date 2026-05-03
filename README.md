@@ -149,7 +149,7 @@ If you write `/*` in a pattern file, the part after `/*` on that line will becom
 
 Case Sensitivity and Variables
 
-Uppercase letters in the instruction field of a pattern file are treated as character constants. Lowercase letters are treated as single-character variables. The value of the symbol at that position on the assembly line is assigned to the variable. Using `!lowercase` assigns the value of the integer expression at that position, `!!lowercase` assigns the value of the factor at that position, `!Flowercase` assigns a bit pattern of integer conversion of the 32-bit floating-point expression at that position, and `!Dlowercase` assigns a bit pattern of integer conversion of the 64-bit floating-point expression at that position. These values ​​are then referenced from `error_patterns` and `binary_list`. All unassigned variables have an initial value of 0. `!` is not necessary when referencing from `error_patterns` and `binary_list`. All values ​​are referenced similarly.
+Uppercase letters in the instruction field of a pattern file are treated as character constants. Lowercase letters are treated as single-character variables. The value of the symbol at that position on the assembly line is assigned to the variable. Using `!lowercase` assigns the value of the integer expression at that position, `!!lowercase` assigns the value of the factor at that position, `!Flowercase` assigns a bit pattern of integer conversion of the 32-bit floating-point expression at that position, `!Dlowercase` assigns a bit pattern of integer conversion of the 64-bit floating-point expression and `!Qlowercase` assingns a bit pattern of integer conversion of the 128-bit floating point expression at that position. These values ​​are then referenced from `error_patterns` and `binary_list`. All unassigned variables have an initial value of 0. `!` is not necessary when referencing from `error_patterns` and `binary_list`. All values ​​are referenced similarly.
 
 
 ```
@@ -159,6 +159,7 @@ Lowercase letter: Value of the symbol at that position
 !!Lowercase letter: Value of an integer factor
 !FLowercase letter: Value of a 32-bit floating-point expression
 !DLowercase letter: Value of a 64-bit floating-point expression
+!QLowercase letter: Value of a 128-bit floating-point expression
 ```
 
 Lowercase variables are all initialized to 0 for each line in the pattern file.
