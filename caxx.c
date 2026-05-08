@@ -465,7 +465,11 @@ static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *se
     for(LabelEntry*e=m->buckets[h];e;e=e->next){
         if(strcmp(e->key,key)==0){
             e->value=val; free(e->section); e->section=strdup(sec); e->is_equ=is_equ;
-            /* preserve is_imported when updating an existing entry */
+            /* axx.py fix: ::reloctype を省略した場合は旧エントリの reloc_type_override を
+             * 引き継がず -1 にリセットする。reloc_type が必要な場合は呼び出し側が
+             * lmap_set_reloc_type() で明示的に設定する。
+             * is_imported は .EXTERN が独立して管理するので保持する。 */
+            e->reloc_type_override = -1;
             return;
         }
     }
@@ -473,6 +477,12 @@ static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *se
     e->key=strdup(key); e->value=val; e->section=strdup(sec);
     e->is_equ=is_equ; e->is_imported=0; e->reloc_type_override=-1;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
+}
+/* lmap_set の直後に reloc_type_override を設定するヘルパー。
+ * label_put_value() が ::reloctype 付き .equ から呼ぶ。 */
+static void lmap_set_reloc_type(LabelMap *m, const char *key, int reloc_type) {
+    LabelEntry *e = lmap_find(m, key);
+    if(e) e->reloc_type_override = reloc_type;
 }
 /* Set a label as an imported external symbol (.EXTERN).
  * Mirrors axx.py: labels[s] = [0, '.text', False, True, reloc_type] */
@@ -764,6 +774,11 @@ typedef struct {
     int        exp_typ_float;
     int        error_undefined_label;
     int        error_already_defined;
+    /* axx.py port: パターンマッチ試行中フラグ。
+     * match0() → match() → expression キャプチャ → label_get_value() の経路で
+     * 失敗試行中のラベル未定義エラー表示を抑制する。
+     * match0() が True を返した後の makeobj() 呼び出し前に 0 に戻す。 */
+    int        in_match_attempt;
 
     /* pc_instr_start: binary_list中の$$が命令先頭アドレスを指すように、
      * makeobj呼び出し前にst->pcの値を保存する。makeobj内のexpression評価では
@@ -1659,8 +1674,11 @@ static uint256_t label_get_value(AsmState *st, const char *k){
     LabelEntry *e=lmap_find(&st->labels,k);
     if(e){
         /* ELF relocation tracking.
-         * .equ-defined labels are absolute constants – never relocatable. */
-        if(st->elf_tracking && !e->is_equ){
+         * .equ-defined labels は原則として絶対定数であり追跡しない。
+         * ただし .equ $$::reloctype のように reloc_type_override が設定されている場合は
+         * アドレスラベルと同様に追跡してリロケーションを生成する必要がある。 */
+        int _equ_has_reloc = e->is_equ && (e->reloc_type_override >= 0);
+        if(st->elf_tracking && (!e->is_equ || _equ_has_reloc)){
             if(st->elf_capturing_var != '\0'){
                 /* match() is capturing !var: record variable->label mapping.
                  * If the same var gets two different get_value() calls the
@@ -1697,7 +1715,10 @@ static uint256_t label_get_value(AsmState *st, const char *k){
     }
     st->error_undefined_label = 1;
     if(st->pass1_size_mode) return u256_zero();
-    if(st->pas == 2 || st->pas == 0){          // pass1 は forward ref 多発のため表示しない
+    /* in_match_attempt が 1 のときはパターンマッチ試行中であり、
+     * このラベル参照は後に別パターンに差し替えられる可能性があるためエラーを表示しない。
+     * （例: OUT (!n),A が OUT (C),E を試みる際に !n キャプチャで C がラベル評価される。） */
+    if(!st->in_match_attempt && (st->pas == 2 || st->pas == 0)){
         fprintf(stderr, " error - Label undefined: '%s'  [%s:%d]\n",
             k, st->current_file, (int)st->ln);
     }
@@ -1710,7 +1731,7 @@ static const char *label_get_section(AsmState *st, const char *k){
     st->error_undefined_label=1;
     return "";
 }
-static int label_put_value(AsmState *st, const char *k, uint256_t v, const char *sec, int is_equ){
+static int label_put_value(AsmState *st, const char *k, uint256_t v, const char *sec, int is_equ, int reloc_type){
     if(st->pas==1||st->pas==0){
         if(lmap_contains(&st->labels,k)){
             st->error_already_defined=1;
@@ -1731,7 +1752,11 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
         return 0;
     }
     st->error_already_defined=0;
+    /* lmap_set は reloc_type_override を -1 にリセットする（旧値を引き継がない）。
+     * ::reloctype が明示指定された場合のみ直後に設定する。 */
     lmap_set(&st->labels,k,v,sec,is_equ);
+    if(reloc_type >= 0)
+        lmap_set_reloc_type(&st->labels, k, reloc_type);
     return 1;
 }
 /* label_print_all: mirrors Python LabelManager.printlabels()
@@ -3561,13 +3586,44 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
         char ue[256]; axx_strupr_to(ue,e,sizeof(ue));
         if(strcmp(ue,".EQU")==0){
             int io;
-            /* Bug 7 fix: pass only the expression tail, not the full line */
+            /* axx.py fix: .EQU で ::reloctype 構文をサポートする。
+             *   label: .equ <式>::<reloctype>  → reloc_type_override を設定
+             *   label: .equ <式>              → reloc_type_override = -1（情報なし）
+             * ::reloctype を省略すると label_put_value が -1 を渡し lmap_set が
+             * 旧エントリの reloc_type_override をリセットする。 */
             const char *expr_tail = l + idx;
+            int reloc_type = -1;
+            /* expr_tail に '::' が含まれるか検索 */
+            const char *dcolon = strstr(expr_tail, "::");
+            char expr_buf[1024];
+            if(dcolon){
+                /* 式部分をコピー */
+                size_t elen = (size_t)(dcolon - expr_tail);
+                if(elen >= sizeof(expr_buf)) elen = sizeof(expr_buf)-1;
+                memcpy(expr_buf, expr_tail, elen); expr_buf[elen] = '\0';
+                expr_tail = expr_buf;
+                /* reloctype 文字列 */
+                const char *rt_str = dcolon + 2;
+                char rt_lc[64]; int ri=0;
+                while(rt_str[ri] && ri < 63){ rt_lc[ri]=(char)tolower((unsigned char)rt_str[ri]); ri++; }
+                rt_lc[ri]='\0';
+                static const struct{ const char*name; int rtype; } _rmap[]={
+                    {"abs64",1},{"abs32",10},{"abs32s",11},{"abs16",12},{"abs8",14},
+                    {"pc32",2},{"plt32",4},{"pc16",13},{"pc8",15},{"pc64",24},
+                    {"got32",3},{"gotpcrel",9},{"got64",27},{NULL,0}
+                };
+                for(int mi=0; _rmap[mi].name; mi++){
+                    if(strcmp(rt_lc, _rmap[mi].name)==0){ reloc_type=_rmap[mi].rtype; break; }
+                }
+                if(reloc_type < 0)
+                    fprintf(stderr," warning - unknown reloctype '%s' in .EQU\n", rt_lc);
+            }
+            /* Bug 7 fix: pass only the expression tail, not the full line */
             uint256_t u = expr_expression_asm(asmb, expr_tail, 0, &io);
-            label_put_value(st,label,u,st->current_section,1);  /* is_equ=1 */
+            label_put_value(st,label,u,st->current_section,1,reloc_type);  /* is_equ=1 */
             out[0]=0; return out;
         } else {
-            label_put_value(st,label,st->pc,st->current_section,0);  /* is_equ=0 */
+            label_put_value(st,label,st->pc,st->current_section,0,-1);  /* is_equ=0 */
             strncpy(out,l+lidx,osz-1); out[osz-1]=0; return out;
         }
     }
@@ -3951,7 +4007,14 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         st->error_undefined_label=0;
         st->expmode=EXP_ASM;
 
-        if(pat_match0(asmb,lin,i->f[0])){
+        /* パターンマッチ試行中はラベル未定義エラーの表示を抑制する。
+         * (例: OUT (!n),A が OUT (C),E を試みると !n キャプチャで
+         *  C がラベルとして評価され false-positive エラーが出る。) */
+        st->in_match_attempt = 1;
+        int _match_ok = pat_match0(asmb,lin,i->f[0]);
+        st->in_match_attempt = 0;
+
+        if(_match_ok){
             /* Fix 10 (axx.py): only call makeobj when dir_error did NOT trigger.
              * Previously makeobj always ran even if an .error condition fired. */
             int err_triggered = dir_error(asmb,i->f[1]);
@@ -4190,10 +4253,30 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                 int _rtype = 0;
                 {
                     LabelEntry *_le = lmap_find(&st->labels, _lname);
-                    if(_le && _le->reloc_type_override >= 0)
-                        _rtype = _le->reloc_type_override;
-                    else
+                    if(_le && _le->reloc_type_override >= 0){
+                        int _rt_ov = _le->reloc_type_override;
+                        /* ローカルラベル（非インポート）の場合、reloc_type が要求する
+                         * フィールド幅と実際のフィールド幅が一致しなければ override を無視する。
+                         * 例: abs64(8バイト) を 4バイトの CALL フィールドに適用すると
+                         * 隣接バイトを破壊してセグフォルトを引き起こす。
+                         * 外部ラベル（is_imported）はリンカが補正するため常に適用する。 */
+                        static const struct{ int rtype; int bytes; } _fw[]={
+                            {1,8},{24,8},{27,8},   /* abs64, pc64, got64 */
+                            {10,4},{11,4},{2,4},{4,4},{3,4},{9,4}, /* abs32,abs32s,pc32,plt32,got32,gotpcrel */
+                            {12,2},{13,2},          /* abs16, pc16 */
+                            {14,1},{15,1},          /* abs8, pc8 */
+                            {0,0}
+                        };
+                        int _expected = 0;
+                        for(int _fi=0; _fw[_fi].rtype; _fi++)
+                            if(_fw[_fi].rtype == _rt_ov){ _expected=_fw[_fi].bytes; break; }
+                        if(_le->is_imported || _expected == 0 || _expected == _nbytes)
+                            _rtype = _rt_ov;
+                        else
+                            _rtype = RTYPE_FOR(_nbytes);  /* フィールド幅不一致 → デフォルト */
+                    } else {
                         _rtype = RTYPE_FOR(_nbytes);
+                    }
                 }
                 if(_rtype != 0 && _widx < objl.len){
                     int64_t _sec_rel = (int64_t)((cur_pc + (uint64_t)_widx - sec_start)
@@ -4531,20 +4614,23 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int i=0;i<ncs;i++) weo_sym(0,0x03,0,(uint16_t)(i+1),0,0); /* section syms */
 
     /* sort labels and export_labels by name */
-    typedef struct{const char*name;uint64_t val;int is_equ;int is_imported;} WLK;
+    typedef struct{const char*name;uint64_t val;int is_equ;int is_imported;int reloc_type_override;} WLK;
     int nl=st->labels.count;
     WLK *larr=calloc((size_t)(nl?nl:1),sizeof(WLK));
     {int li=0;for(int bi=0;bi<st->labels.nbuckets;bi++)
         for(LabelEntry*e=st->labels.buckets[bi];e;e=e->next)
-            larr[li++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,e->is_imported};}
+            larr[li++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,e->is_imported,e->reloc_type_override};}
     int cmp_wlk(const void*a,const void*b){return strcmp(((WLK*)a)->name,((WLK*)b)->name);}
     qsort(larr,nl,sizeof(WLK),cmp_wlk);
 
     int ne=st->export_labels.count;
     WLK *earr=calloc((size_t)(ne?ne:1),sizeof(WLK));
     {int ei=0;for(int bi=0;bi<st->export_labels.nbuckets;bi++)
-        for(LabelEntry*e=st->export_labels.buckets[bi];e;e=e->next)
-            earr[ei++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,0};}
+        for(LabelEntry*e=st->export_labels.buckets[bi];e;e=e->next){
+            /* export_labels には reloc_type_override が保存されないため labels から引く */
+            LabelEntry *_fl=lmap_find(&st->labels,e->key);
+            int _rto = _fl ? _fl->reloc_type_override : -1;
+            earr[ei++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,0,_rto};}}
     qsort(earr,ne,sizeof(WLK),cmp_wlk);
 
     int weo_isexp(const char*nm){for(int i=0;i<ne;i++)if(!strcmp(earr[i].name,nm))return 1;return 0;}
@@ -4553,8 +4639,12 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int i=0;i<nl;i++){
         if(weo_isexp(larr[i].name)) continue;
         if(larr[i].is_imported) continue;   /* imported: emitted below as STB_GLOBAL/SHN_UNDEF */
-        /* .equ labels are absolute constants: use SHN_ABS, not section-relative */
-        WSR sr = larr[i].is_equ ? (WSR){0xfff1, larr[i].val} : weo_shndx(larr[i].val*(uint64_t)bpw);
+        /* .equ+::reloctype のラベルはアドレスラベルとしてセクション相対シンボルで出力する。
+         * reloc_type_override のない純粋な .equ 定数のみ SHN_ABS とする。 */
+        int _equ_has_reloc = larr[i].is_equ && (larr[i].reloc_type_override >= 0);
+        WSR sr = (larr[i].is_equ && !_equ_has_reloc)
+                 ? (WSR){0xfff1, larr[i].val}
+                 : weo_shndx(larr[i].val*(uint64_t)bpw);
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
         snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
         weo_sym(noff,0x00,0,sr.shndx,sr.sv,0);
@@ -4571,7 +4661,10 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     }
     /* (3) Export labels → STB_GLOBAL (0x10) */
     for(int i=0;i<ne;i++){
-        WSR sr = earr[i].is_equ ? (WSR){0xfff1, earr[i].val} : weo_shndx(earr[i].val*(uint64_t)bpw);
+        int _equ_has_reloc = earr[i].is_equ && (earr[i].reloc_type_override >= 0);
+        WSR sr = (earr[i].is_equ && !_equ_has_reloc)
+                 ? (WSR){0xfff1, earr[i].val}
+                 : weo_shndx(earr[i].val*(uint64_t)bpw);
         uint32_t noff=wbb_str(&strtab_bb,earr[i].name);
         snimap[snimap_len++]=(WSNI){earr[i].name,nsyms};
         weo_sym(noff,0x10,0,sr.shndx,sr.sv,0);
@@ -4895,7 +4988,7 @@ static int imp_label(Assembler *asmb, const char *l){
             if(sz > 0 && v >= s0 && v < s0 + sz){ section = se->name; break; }
             if(sz == 0 && v == s0)               { section = se->name; break; }
         }
-        label_put_value(&asmb->st, label, u256_from_u64(v), section, 0);
+        label_put_value(&asmb->st, label, u256_from_u64(v), section, 0, -1);
         return 1;
     }
 

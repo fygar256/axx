@@ -1,5 +1,5 @@
     .ORG 0
-    .asciiz "test"
+    .asciz "test"
     INC (IX)
     INC (IY)
     INC (IX+0x56)

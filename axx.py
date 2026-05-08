@@ -112,6 +112,11 @@ class AssemblerState:
         self.expmode = EXP_PAT
         self.error_undefined_label = False
         self.error_label_conflict = False
+        # パターンマッチ試行中フラグ。
+        # match0() → match() → expression_esc() → label_get_value() の経路で
+        # 失敗中のマッチ試行がラベル未定義エラーを出力しないよう抑制する。
+        # マッチが成功した後の makeobj() 評価では False に戻す。
+        self._in_match_attempt = False
         
         # Assembly configuration
         self.align = 16
@@ -944,7 +949,10 @@ class LabelManager:
             self.state.error_undefined_label = True
             # pass2 または単パスモード（pas==0）のときだけエラーを表示する。
             # pass1 では forward reference が多発するため表示しない。
-            if self.state.pas == 2 or self.state.pas == 0:
+            # _in_match_attempt が True のときはパターンマッチ試行中であり、
+            # このラベル参照は後に別パターンに差し替えられる可能性があるため
+            # エラーを出力しない（OUT (C),E で OUT (!n),A を試みる際などに発生する）。
+            if not self.state._in_match_attempt and (self.state.pas == 2 or self.state.pas == 0):
                 _fn = self.state.current_file or ""
                 _ln = self.state.ln
                 print(f" error - Label undefined: '{k}'"
@@ -3868,7 +3876,13 @@ class Assembler:
             self.state.expmode=EXP_ASM
             if not self.state.debug:
                 try:
-                    if self.pattern_matcher.match0(lin, i[0]) == True:
+                    # パターンマッチ試行中はラベル未定義エラーの表示を抑制する。
+                    # （例: OUT (!n),A が OUT (C),E を試みると !n キャプチャで
+                    #   C がラベルとして評価され false-positive エラーが出る。）
+                    self.state._in_match_attempt = True
+                    _match_result = self.pattern_matcher.match0(lin, i[0])
+                    self.state._in_match_attempt = False
+                    if _match_result == True:
                         # Fix 10: error() の戻り値でエラー発生を検知し、
                         # エラー時はオブジェクト生成をスキップする。
                         err_triggered, _err_code = self.directive_proc.error(i[1])
@@ -3887,6 +3901,7 @@ class Assembler:
                 except (ArithmeticError, KeyError, IndexError, ValueError,
                         TypeError, AttributeError, OverflowError,
                         RecursionError, struct.error) as _exc:
+                    self.state._in_match_attempt = False  # 例外時も確実にクリア
                     # 修正④: 旧実装は `except Exception` で全例外を捕捉していたため、
                     # makeobj / expression_pat 内のコード実装バグ（TypeError 等）が
                     # 「forward参照エラー」として握りつぶされ、デバッグが困難だった。
@@ -3931,7 +3946,10 @@ class Assembler:
                         loopflag = False
                     break
             else:
-                if self.pattern_matcher.match0(lin, i[0]) == True:
+                self.state._in_match_attempt = True
+                _match_result_dbg = self.pattern_matcher.match0(lin, i[0])
+                self.state._in_match_attempt = False
+                if _match_result_dbg == True:
                     # Fix 10: error() の戻り値でエラー発生を検知する（デバッグモード）
                     err_triggered, _err_code = self.directive_proc.error(i[1])
                     if not err_triggered:
