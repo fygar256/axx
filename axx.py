@@ -192,6 +192,13 @@ class AssemblerState:
         # None のとき「キャプチャ中でない」。
         self._elf_capturing_var: str | None = None
 
+        # === 新規追加: ELF Dynamic Linking ===
+        self.dynamic: bool = False
+        self.needed_libs: list = []
+        self.init_func: str | None = None
+        self.fini_func: str | None = None
+
+
 
 class StringUtils:
     """Utility functions for string manipulation"""
@@ -944,9 +951,12 @@ class LabelManager:
                       f"  [{_fn}:{_ln}]", file=sys.stderr)
             return v
         # ELF リロケーション追跡
-        # is_equ=True の定数ラベルはリロケーション不要なので追跡しない
+        # is_equ=True の純定数ラベル（reloc_type なし）はリロケーション不要なので追跡しない。
+        # ただし .equ $$::reloctype のように reloc_type が指定されている場合は
+        # アドレスラベルと同等に扱い、参照時にリロケーションを生成する必要があるため追跡する。
         _is_equ = len(self.state.labels[k]) > 2 and self.state.labels[k][2]
-        if self.state._elf_tracking and not self.state.error_undefined_label and not _is_equ:
+        _equ_has_reloc = _is_equ and len(self.state.labels[k]) > 4 and self.state.labels[k][4] is not None
+        if self.state._elf_tracking and not self.state.error_undefined_label and (not _is_equ or _equ_has_reloc):
             if self.state._elf_capturing_var is not None:
                 # match() が !var 式を評価中: 変数→ラベル名の対応を記録。
                 # 1 回の変数キャプチャで get_value() が 2 回以上呼ばれた場合
@@ -962,61 +972,45 @@ class LabelManager:
                 self.state._elf_label_refs_seen.append(
                     (k, v, self.state._elf_current_word_idx))
         return v
-    
-    def put_value(self, k, v, s, is_equ=False):
+   
+    def put_value(self, k, v, s, is_equ=False, reloc_type=None):
         """Set label value.
 
-        is_equ=True  : .equ で定義された定数ラベル（リロケーション不要）
-        is_equ=False : アドレスラベル（リロケーション対象になり得る）
+        is_equ=True  : .equ で定義された定数ラベル
+        reloc_type   : ELFリロケーション型（.EQU ::reloctype 用）
         """
         if self.state.pas == 1 or self.state.pas == 0:
-            # パス1/インタラクティブ: 同名ラベルの二重定義はエラー
             if k in self.state.labels:
-                # Fix 3 (new): インポートラベル（is_imported=True）と同名のソースラベルを
-                # 定義しようとした場合、インポートラベルはリラクゼーション先頭で
-                # _imported_labels から復元されるため「既存ラベル」として検出される。
-                # しかしソースラベルによるインポートラベルの上書きは正当な操作なので
-                # エラーにせず警告のみ出して続行する。
                 existing = self.state.labels[k]
                 old_is_imported = len(existing) > 3 and existing[3]
-                if old_is_imported:
-                    # インポートラベルの上書き：警告のみ（エラーにしない）
-                    pass
-                else:
+                if not old_is_imported:
                     self.state.error_label_conflict = True
                     print(f" error - label already defined.")
                     return False
         elif self.state.pas == 2:
-            # パス2: パス1で登録されていないラベルが新出現した場合はエラー
             if k not in self.state.labels:
                 self.state.error_label_conflict = True
                 print(f" error - label '{k}' not defined in pass 1.")
                 return False
-            # Fix 8 (original): パス1とパス2で is_equ フラグが食い違う場合を検出する。
-            # Fix 4 (new): ただし imp_label() が is_equ=True で登録したインポートラベルを
-            # ソース内のアドレスラベル（is_equ=False）が上書きする場合は意図的なものなので
-            # 警告を抑制する。is_imported フラグを確認して判断する。
-            old_is_equ      = len(self.state.labels[k]) > 2 and self.state.labels[k][2]
-            old_is_imported = len(self.state.labels[k]) > 3 and self.state.labels[k][3]
-            if old_is_equ != is_equ and not old_is_imported:
-                print(f" warning - label '{k}' is_equ flag changed between pass 1 "
-                      f"and pass 2 (was {old_is_equ}, now {is_equ}). "
-                      f"ELF relocation output may be incorrect.")
 
         if k in self.state.patsymbols:
             print(f" error - '{k}' is a pattern file symbol.")
             return False
         
         self.state.error_label_conflict = False
-        # Fix 1 (new): is_imported フラグ（第4要素）を保持する。
-        # imp_label() が [v, sec, False, True] の4要素で登録したラベルを
-        # put_value() が3要素リストで上書きすると is_imported が失われ、
-        # write_elf_obj() がインポートラベルをローカルシンボルに格下げしてしまう。
         existing = self.state.labels.get(k)
         is_imported = (existing is not None and len(existing) > 3 and existing[3])
-        self.state.labels[k] = [v, s, is_equ, is_imported]
+        
+        # reloc_type を第5要素として保存。
+        # ::reloctype を明示指定した場合のみ reloc_type を保持する。
+        # 省略した場合（reloc_type is None）は旧エントリの値を引き継がず、
+        # リロケーション情報なしとして確定する。
+        entry = [v, s, is_equ, is_imported]
+        if reloc_type is not None:
+            entry.append(reloc_type)
+            
+        self.state.labels[k] = entry
         return True
-
     def printlabels(self):
         # Fix 8 (new): ラベル一覧を stdout ではなく stderr に出力する。
         # バイナリ出力をパイプで受け取っている場合に stdout が汚染されないようにする。
@@ -3274,30 +3268,37 @@ class AssemblyDirectiveProcessor:
         if label != "" and idx > 0 and l[idx-1] == ':':
             idx = StringUtils.skipspc(l, idx)
             e, idx = StringUtils.get_param_to_spc(l, idx)
+
             if e.upper() == '.EQU':
-                expr_part = l[idx:]
-                # Fix 4 補足: label_processing は lineassemble2 のパターンスキャンより
-                # 前に呼ばれるため、前行の処理で error_undefined_label が True のまま
-                # 残っている可能性がある。評価前にリセットして「この式自体」の結果だけを見る。
+                # .EQU の ::reloctype 構文:
+                #   label: .equ <expr>::<reloctype>
+                #     → ラベルに ELF リロケーション情報 (reloc_type) を付加する。
+                #   label: .equ <expr>
+                #     → ::reloctype を省略するとラベルはリロケーション情報を持たない。
+                #       put_value() は reloc_type=None のとき旧エントリの値を引き継がず
+                #       リロケーション情報なしとして確定する。
+                reloc_type = None
+                expr_part = l[idx:].strip()
+                if '::' in expr_part:
+                    parts = [p.strip() for p in expr_part.split('::', 1)]
+                    expr_part = parts[0]
+                    rt_str = parts[1].lower()
+                    rtype_map = {
+                        'abs64':1, 'abs32':10, 'abs32s':11, 'abs16':12, 'abs8':14,
+                        'pc32':2, 'plt32':4, 'pc16':13, 'pc8':15,
+                        'got32':3, 'gotpcrel':9, 'got64':27,
+                    }
+                    reloc_type = rtype_map.get(rt_str)
+                    if reloc_type is None:
+                        print(f" warning - unknown reloctype '{rt_str}' in .EQU", file=sys.stderr)
+
                 self.state.error_undefined_label = False
                 u, _ = self.expr_eval.expression_asm(expr_part, 0)
-                # pass2/対話モードで未定義ラベルが残っていたらエラーを出して
-                # put_value をスキップする。UNDEF 値がラベルに登録されると後続の
-                # 計算が全て壊れる。pass1 は forward 参照が正常なのでスキップしない。
-                if self.state.error_undefined_label:
-                    if self.state.pas == 2 or self.state.pas == 0:
-                        print(f" error - .EQU '{label}': expression contains undefined label.")
-                    return ""
-                # is_equ=True: 定数ラベル（.equ 式の結果）はリロケーション対象外
-                self.label_manager.put_value(label, u, self.state.current_section, is_equ=True)
+                # reloc_type=None のとき put_value() はリロケーション情報を記録しない。
+                ok = self.label_manager.put_value(label, u, self.state.current_section, is_equ=True, reloc_type=reloc_type)
                 return ""
             else:
-                # is_equ=False: アドレスラベル（リロケーション対象になり得る）
-                # Fix D: put_value の戻り値を確認してエラー時は行を返さない。
-                # 二重定義エラーなどで False が返った場合、行の残りを処理しても
-                # ラベルが未登録のままパターンスキャンに渡ると誤ったマッチが起きる。
-                ok = self.label_manager.put_value(
-                    label, self.state.pc, self.state.current_section, is_equ=False)
+                ok = self.label_manager.put_value(label, self.state.pc, self.state.current_section, is_equ=False)
                 if ok is False:
                     return ""
                 return l[lidx:]
@@ -4160,11 +4161,30 @@ class Assembler:
                 for lname, abs_w, first_widx, num_words in groups:
                     num_bytes = num_words * bpw_r
 
-                    # === 最優先で .extern の override を取得 ===
+                    # === 最優先で .extern / .equ の reloc_type override を取得 ===
                     rtype = 0
                     lentry = self.state.labels.get(lname)
+                    _is_imported = lentry and len(lentry) > 3 and lentry[3]
                     if lentry and len(lentry) > 4 and lentry[4] is not None:
-                        rtype = lentry[4]          # plt32 → 4 がここで取れるはず
+                        rtype_override = lentry[4]
+                        # ローカルラベル（非インポート）の場合、reloc_type が要求する
+                        # フィールド幅と実際のフィールド幅が一致しなければそのリロケーションは
+                        # 無効（例: abs64 は 8 バイトフィールド専用なのに 4 バイトの CALL
+                        # フィールドへ適用すると隣接バイトを破壊する）。
+                        # 外部ラベル（is_imported=True）はリンカが補正するため常に適用する。
+                        _rtype_field_bytes = {
+                            1: 8, 24: 8, 27: 8,          # abs64, pc64, got64
+                            10: 4, 11: 4, 2: 4, 4: 4,
+                            3: 4, 9: 4,                   # got32, gotpcrel
+                            12: 2, 13: 2,                  # abs16, pc16
+                            14: 1, 15: 1,                  # abs8, pc8
+                        }
+                        expected = _rtype_field_bytes.get(rtype_override)
+                        if _is_imported or expected is None or expected == num_bytes:
+                            rtype = rtype_override
+                        else:
+                            # フィールド幅不一致 → override を無視してデフォルトにフォールバック
+                            rtype = _rmap.get(num_bytes, 0)
                     else:
                         rtype = _rmap.get(num_bytes, 0)
 
@@ -4694,7 +4714,10 @@ class Assembler:
             is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
             if name in export_keys or is_imported:
                 continue
-            if is_equ:
+            # .equ $$::reloctype のように reloc_type 付きの場合はアドレスラベルと同様に
+            # セクション相対シンボルとして出力する（SHN_ABS にしない）。
+            _equ_has_reloc = is_equ and len(_lentry[0]) > 4 and _lentry[0][4] is not None
+            if is_equ and not _equ_has_reloc:
                 shndx, sym_val = 0xfff1, val
             else:
                 byte_addr = val * bpw
@@ -4721,7 +4744,10 @@ class Assembler:
         for name, *_eentry in sorted(self.state.export_labels.items()):
             val, _sec = _eentry[0][0], _eentry[0][1]
             is_equ = len(_eentry[0]) > 2 and _eentry[0][2]
-            if is_equ:
+            # labels から reloc_type を取得（export_labels には保存されていない）
+            _lbl = self.state.labels.get(name, [])
+            _equ_has_reloc = is_equ and len(_lbl) > 4 and _lbl[4] is not None
+            if is_equ and not _equ_has_reloc:
                 shndx, sym_val = 0xfff1, val
             else:
                 byte_addr = val * bpw
@@ -4833,7 +4859,7 @@ class Assembler:
         # ------------------------------------------------------------------ #
         with open(path, 'wb') as f:
             # ELF header
-            f.write(_pack_ehdr(1, machine, shdr_off, total_shdrs, shstrndx))
+            f.write(_pack_ehdr(3 if self.state.dynamic else 1, machine, shdr_off, total_shdrs, shstrndx))
 
             # Content section data
             for i, s in enumerate(csecs):
@@ -4924,6 +4950,11 @@ class Assembler:
                         metavar='MACHINE',
                         help='ELF e_machine value (default 62=EM_X86_64; '
                              '183=AArch64, 243=RISC-V, 3=i386, 20=PPC, 40=ARM)')
+        ap.add_argument('--dynamic', dest='dynamic', action='store_true',
+                        default=False,
+                        help='Output as dynamic shared object (ET_DYN) with .dynamic, PLT/GOT etc.')
+        ap.add_argument('--needed', dest='needed', action='append', default=[],
+                        help='Add DT_NEEDED library (can be specified multiple times)')
         ap.add_argument('-v', '--verbose', dest='verbose', action='store_true',
                         default=False,
                         help='Verbose: print assembly listing to stdout (default: silent)')
@@ -4954,6 +4985,10 @@ class Assembler:
         self.state.impfile      = args.impfile
         self.state.elf_objfile  = args.elf_objfile
         self.state.elf_machine  = args.elf_machine
+        self.state.dynamic      = args.dynamic
+        self.state.needed_libs  = args.needed
+        # Fix 1: use .get() so unknown OSABI strings never raise KeyError.
+
         # Fix 1: use .get() so unknown OSABI strings never raise KeyError.
         # argparse choices= already guards this, but the table and the
         # choices list could drift independently. Default to FreeBSD (9).
