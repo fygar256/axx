@@ -3519,7 +3519,10 @@ class AssemblyDirectiveProcessor:
                 existing_start     = self.state.sections[l2][0]
                 existing_size      = self.state.sections[l2][1]
                 existing_confirmed = len(self.state.sections[l2]) > 3 and self.state.sections[l2][3]
-                new_start = min(existing_start, self.state.pc)
+                if existing_start==0 or self.state.pc==0:
+                    new_start = max(existing_start, self.state.pc)
+                else:
+                    new_start = min(existing_start, self.state.pc)
                 # confirmed=True の確定済みサイズは保護する
                 # entry_pc は今回の宣言時 PC に更新
                 self.state.sections[l2] = [new_start, existing_size, self.state.pc, existing_confirmed]
@@ -4142,7 +4145,7 @@ class Assembler:
                     # 4バイト: PC32(2) を使用。x86-64 では 4バイトフィールドは
                     # RIP相対(LEA/JMP/CALL 等)が主流で R_X86_64_32(10,絶対)は
                     # ほぼ使われない。絶対参照が必要なら .extern label::abs32 で明示する。
-                    _rmap = {8: 1, 4: 2, 2: 12, 1: 14}    # x86_64 デフォルト
+                    _rmap = {8: 1, 4: 2, 2: 12, 1: 14}    # x86_64 デフォルト (PC32)
 
                 # PC相対リロケーション型の集合（アーキテクチャ別）
                 # addend = -num_bytes を適用するもの。絶対型は含めない。
@@ -4253,10 +4256,18 @@ class Assembler:
                     # PC相対リロケーション型の集合。
                     # 12=R_X86_64_16 と 14=R_X86_64_8 は「絶対」アドレスリロケーションなので
                     # 含めない。PC相対の 16/8bit は 13=R_X86_64_PC16, 15=R_X86_64_PC8。
+                    abs_w_bytes = int(abs_w) * bpw_r
+
                     if rtype in _pc_rel_types_all:
-                        addend = -num_bytes
+
+                        P_asm_bytes = (self.state.pc + first_widx) * bpw_r
+
+                        addend = raw_val - abs_w_bytes + P_asm_bytes
+
                     else:
-                        addend = raw_val - abs_w
+
+                        addend = raw_val - abs_w_bytes
+
                     self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend))
 
             for cnt in range(of):
