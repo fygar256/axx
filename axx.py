@@ -3519,8 +3519,16 @@ class AssemblyDirectiveProcessor:
                 existing_start     = self.state.sections[l2][0]
                 existing_size      = self.state.sections[l2][1]
                 existing_confirmed = len(self.state.sections[l2]) > 3 and self.state.sections[l2][3]
-                if existing_start==0 or self.state.pc==0:
-                    new_start = max(existing_start, self.state.pc)
+                # Bug fix: word_count==0 かつ未確定のエントリは、他セクション宣言時に
+                # old_sec として自動生成されたダミーエントリである。
+                # このとき existing_start は生成時の PC (多くの場合 0) であり、
+                # 実際にセクションへ再入する現在の PC より小さいことがある。
+                # min() でダミーの 0 が残ると、write_elf_obj でのデータ抽出・
+                # シンボル値・リロケーションオフセット計算が全て誤った値になる。
+                # ダミーエントリ（word_count==0 かつ confirmed==False）の場合は
+                # 現在の PC を word_start として採用し、min() を適用しない。
+                if existing_size == 0 and not existing_confirmed:
+                    new_start = self.state.pc
                 else:
                     new_start = min(existing_start, self.state.pc)
                 # confirmed=True の確定済みサイズは保護する
