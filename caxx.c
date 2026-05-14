@@ -578,7 +578,14 @@ static void smap_clear(SymMap*m){
 /* =========================================================
  * Section map: string -> [start uint256_t, size uint256_t]
  * ========================================================= */
-typedef struct SecEntry { char*name; uint256_t start; uint256_t size; struct SecEntry*next; } SecEntry;
+typedef struct SecEntry {
+    char       *name;
+    uint256_t   start;
+    uint256_t   size;
+    uint256_t   entry_pc;   /* PC at last section entry (for incremental size update) */
+    int         confirmed;  /* 1 = size set by .ENDSECTION, do not overwrite */
+    struct SecEntry *next;
+} SecEntry;
 typedef struct { SecEntry**buckets; int nb; SecEntry**order; int count; int cap; } SecMap;
 static void secmap_init(SecMap*m){m->nb=16;m->buckets=calloc(m->nb,sizeof(SecEntry*));m->count=0;m->cap=16;m->order=calloc(m->cap,sizeof(SecEntry*));}
 static SecEntry *secmap_find(SecMap*m,const char*name){
@@ -591,6 +598,7 @@ static void secmap_set(SecMap*m,const char*name,uint256_t start,uint256_t size){
     if(e){e->start=start;e->size=size;return;}
     uint32_t h=hash_str(name)%(uint32_t)m->nb;
     e=calloc(1,sizeof(SecEntry)); e->name=strdup(name); e->start=start; e->size=size;
+    e->entry_pc=start; e->confirmed=0;
     e->next=m->buckets[h]; m->buckets[h]=e;
     if(m->count>=m->cap){m->cap*=2;m->order=realloc(m->order,m->cap*sizeof(SecEntry*));}
     m->order[m->count++]=e;
@@ -617,6 +625,16 @@ static void secmap_clear(SecMap*m){
     for(int i=0;i<m->count;i++) m->order[i]=NULL;
     m->count=0;
 }
+
+/* Finalize the current (last) section's size after fileassemble() completes.
+ * Mirrors axx.py run():
+ *   _last_sec = self.state.current_section
+ *   if _last_sec in self.state.sections:
+ *       _e = self.state.sections[_last_sec]
+ *       if not _confirmed: _e[1] += (pc - entry_pc)
+ * Must be called after every fileassemble() — relaxation passes and pass2. */
+/* Note: AsmState is defined later; this function is defined after AsmState below. */
+/* Forward declaration: */
 
 /* =========================================================
  * Pattern: each entry has 6 string fields
@@ -851,6 +869,20 @@ typedef struct {
     int        reloc_count;
     int        reloc_cap;
 } AsmState;
+
+/* Finalize the current (last) section's size after fileassemble() completes.
+ * adir_section() only updates the OLD section on switch; the final section is
+ * never switched away from and stays at size=0.
+ * Mirrors axx.py run() post-fileassemble logic for both pass1 and pass2. */
+static void secmap_finalize_current(AsmState *st){
+    SecEntry *e = secmap_find(&st->sections, st->current_section);
+    if(!e) return;
+    if(e->confirmed) return;   /* already confirmed by ENDSECTION */
+    uint256_t delta = u256_sub(st->pc, e->entry_pc);
+    if(u256_lt_signed(delta, u256_zero())) return;   /* negative delta: skip */
+    e->size = u256_add(e->size, delta);
+    e->entry_pc = st->pc;   /* prevent double-counting on re-call */
+}
 
 static void state_init(AsmState *st) {
     memset(st, 0, sizeof(*st));
@@ -1988,7 +2020,21 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         if(asmb->st.exp_typ_float) x=double_to_u256((double)'\\'); }
     else if(idx+4<=slen && strncmp(s+idx,"'\\n'",4)==0){ x=u256_from_i64(0x0a); idx+=4;
         if(asmb->st.exp_typ_float) x=double_to_u256(10.0); }
-    else if(idx+3<=slen && s[idx]=='\'' && s[idx+2]=='\''){
+    else if(idx+4<=slen && strncmp(s+idx,"'\\0'",4)==0){ x=u256_from_i64(0x00); idx+=4;
+        if(asmb->st.exp_typ_float) x=double_to_u256(0.0); }
+    else if(idx+4<=slen && strncmp(s+idx,"'\\r'",4)==0){ x=u256_from_i64(0x0d); idx+=4;
+        if(asmb->st.exp_typ_float) x=double_to_u256(13.0); }
+    else if(idx+4<=slen && strncmp(s+idx,"'\\a'",4)==0){ x=u256_from_i64(0x07); idx+=4;
+        if(asmb->st.exp_typ_float) x=double_to_u256(7.0); }
+    else if(idx+4<=slen && strncmp(s+idx,"'\\b'",4)==0){ x=u256_from_i64(0x08); idx+=4;
+        if(asmb->st.exp_typ_float) x=double_to_u256(8.0); }
+    else if(idx+4<=slen && strncmp(s+idx,"'\\f'",4)==0){ x=u256_from_i64(0x0c); idx+=4;
+        if(asmb->st.exp_typ_float) x=double_to_u256(12.0); }
+    else if(idx+4<=slen && strncmp(s+idx,"'\\v'",4)==0){ x=u256_from_i64(0x0b); idx+=4;
+        if(asmb->st.exp_typ_float) x=double_to_u256(11.0); }
+    /* Fix: 3-char 'x' literal: only when s[idx+1] is NOT backslash (so '\x' forms above
+     * are not double-consumed). Mirrors axx.py factor1() Fix 3 guard. */
+    else if(idx+3<=slen && s[idx]=='\'' && s[idx+1] != '\\' && s[idx+2]=='\''){
         unsigned char cv=(unsigned char)s[idx+1]; x=u256_from_i64(cv); idx+=3;
         if(asmb->st.exp_typ_float) x=double_to_u256((double)cv); }
     else if(axx_q(s,slen,"$$",idx)){
@@ -2031,7 +2077,11 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         if(asmb->st.exp_typ_float)
             x=double_to_u256((double)(int64_t)u256_to_i64(x));
     }
-    else if(idx+3<=slen && strncmp(s+idx,"qad",3)==0){
+    /* Fix: guard all keyword tokens (qad/dbl/flt/enflt/endbl) so labels like
+     * qad_foo, dbl_val, etc. are NOT consumed as keywords.
+     * Mirrors axx.py factor1(): only treat as keyword when '{' follows (after spaces). */
+    else if(idx+3<=slen && strncmp(s+idx,"qad",3)==0 &&
+            ({ int _j=axx_skipspc(s,idx+3); _j<slen && s[_j]=='{'; })){
         idx+=3;
         idx=axx_skipspc(s,idx);
         if(s[idx]=='{'){
@@ -2075,7 +2125,8 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
      *   x = enflt(int(v))                        # = enfloat(int(v))
      * The result is a floating-point value; callers should use this inside
      * flt{} / dbl{} or in a float-mode context. */
-    else if(idx+5<=slen && strncmp(s+idx,"enflt",5)==0){
+    else if(idx+5<=slen && strncmp(s+idx,"enflt",5)==0 &&
+            ({ int _j=axx_skipspc(s,idx+5); _j<slen && s[_j]=='{'; })){
         idx+=5;
         int f; char t[512];
         idx=axx_get_curlb(s,idx,&f,t,sizeof(t));
@@ -2095,7 +2146,8 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
      * Mirrors axx.py factor1():
      *   v, _ = self.expression(t + chr(0), 0)   # integer mode
      *   x = endbl(int(v))                        # = endouble(int(v))  */
-    else if(idx+5<=slen && strncmp(s+idx,"endbl",5)==0){
+    else if(idx+5<=slen && strncmp(s+idx,"endbl",5)==0 &&
+            ({ int _j=axx_skipspc(s,idx+5); _j<slen && s[_j]=='{'; })){
         idx+=5;
         int f; char t[512];
         idx=axx_get_curlb(s,idx,&f,t,sizeof(t));
@@ -2108,7 +2160,8 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             x=double_to_u256(fval);
         }
     }
-    else if(idx+3<=slen && strncmp(s+idx,"dbl",3)==0){
+    else if(idx+3<=slen && strncmp(s+idx,"dbl",3)==0 &&
+            ({ int _j=axx_skipspc(s,idx+3); _j<slen && s[_j]=='{'; })){
         idx+=3;
         int f; char t[512];
         idx=axx_get_curlb(s,idx,&f,t,sizeof(t));
@@ -2130,7 +2183,8 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             x=u256_from_u64(bits);
         }
     }
-    else if(idx+3<=slen && strncmp(s+idx,"flt",3)==0){
+    else if(idx+3<=slen && strncmp(s+idx,"flt",3)==0 &&
+            ({ int _j=axx_skipspc(s,idx+3); _j<slen && s[_j]=='{'; })){
         idx+=3;
         int f; char t[512];
         idx=axx_get_curlb(s,idx,&f,t,sizeof(t));
@@ -3370,7 +3424,22 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
             if(s[idx]==','){idx++;continue;}
             continue;
         }
-        if(semicolon?!u256_is_zero(x):1) iv_push(objl,x);
+        if(semicolon?!u256_is_zero(x):1){
+            iv_push(objl,x);
+        } else if(semicolon){
+            /* semicolon && x==0: element suppressed; remove any ELF refs recorded
+             * at this word_idx to avoid generating spurious relocations.
+             * Mirrors axx.py makeobj(): self.state._elf_label_refs_seen = [e for e in ... if e[2] != idx] */
+            int cur_widx = logical_word_idx - 1;
+            int wi2 = 0;
+            for(int ri2 = 0; ri2 < st->elf_refs_len; ri2++){
+                if(st->elf_refs[ri2].word_idx != cur_widx)
+                    st->elf_refs[wi2++] = st->elf_refs[ri2];
+                else
+                    free(st->elf_refs[ri2].name);
+            }
+            st->elf_refs_len = wi2;
+        }
         if(s[idx]==','){idx++;continue;}
         break;
     }
@@ -3656,9 +3725,76 @@ static int adir_section(AsmState *st, const char *l, const char *l2){
     char up[32]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".SECTION")!=0 && strcmp(up,".SEGMENT")!=0) return 0;
     if(l2&&l2[0]){
+        /* Fix: mirror axx.py section_processing():
+         * 1. Before switching, register the OLD section if not already registered,
+         *    so sections appear in the order they are first WRITTEN TO (not declared).
+         * 2. Update the old section's tentative size (if not confirmed by ENDSECTION).
+         * 3. Register or update the NEW section, preserving confirmed sizes. */
+        const char *old_sec = st->current_section;
+
+        /* If old section is not yet registered, create it with start=0 entry_pc=0.
+         * This handles the initial ".text" that is active before any .SECTION directive. */
+        if(!secmap_find(&st->sections, old_sec)){
+            SecEntry *ne = calloc(1, sizeof(SecEntry));
+            ne->name = strdup(old_sec);
+            ne->start = u256_zero();
+            ne->size  = u256_zero();
+            ne->entry_pc = u256_zero();
+            ne->confirmed = 0;
+            uint32_t h = hash_str(old_sec) % (uint32_t)st->sections.nb;
+            ne->next = st->sections.buckets[h];
+            st->sections.buckets[h] = ne;
+            if(st->sections.count >= st->sections.cap){
+                st->sections.cap *= 2;
+                st->sections.order = realloc(st->sections.order,
+                                             st->sections.cap * sizeof(SecEntry*));
+            }
+            st->sections.order[st->sections.count++] = ne;
+        }
+        /* Update old section's tentative size (cumulative) unless confirmed by ENDSECTION */
+        {
+            SecEntry *oe = secmap_find(&st->sections, old_sec);
+            if(oe && !oe->confirmed){
+                uint256_t delta = u256_sub(st->pc, oe->entry_pc);
+                if(!u256_lt_signed(delta, u256_zero()))   /* delta >= 0 */
+                    oe->size = u256_add(oe->size, delta);
+                /* entry_pc will be updated on re-entry */
+            }
+        }
+
+        /* Switch to new section */
         snprintf(st->current_section, sizeof(st->current_section), "%s", l2);
-        if(!secmap_find(&st->sections,l2))
-            secmap_set(&st->sections,l2,st->pc,u256_zero());
+
+        SecEntry *ne = secmap_find(&st->sections, l2);
+        if(!ne){
+            /* First visit: register new section at current pc */
+            uint32_t h = hash_str(l2) % (uint32_t)st->sections.nb;
+            ne = calloc(1, sizeof(SecEntry));
+            ne->name = strdup(l2);
+            ne->start = st->pc;
+            ne->size  = u256_zero();
+            ne->entry_pc = st->pc;
+            ne->confirmed = 0;
+            ne->next = st->sections.buckets[h];
+            st->sections.buckets[h] = ne;
+            if(st->sections.count >= st->sections.cap){
+                st->sections.cap *= 2;
+                st->sections.order = realloc(st->sections.order,
+                                             st->sections.cap * sizeof(SecEntry*));
+            }
+            st->sections.order[st->sections.count++] = ne;
+        } else {
+            /* Re-entry: update entry_pc so next ENDSECTION measures from here.
+             * If confirmed, keep size unchanged. If not confirmed and size==0,
+             * this was a dummy entry created as old_sec — update start. */
+            if(u256_is_zero(ne->size) && !ne->confirmed){
+                ne->start = st->pc;
+            } else if(!ne->confirmed){
+                /* multi-block: keep the minimum start */
+                if(u256_lt_signed(st->pc, ne->start)) ne->start = st->pc;
+            }
+            ne->entry_pc = st->pc;
+        }
     }
     return 1;
 }
@@ -3671,7 +3807,12 @@ static int adir_endsection(AsmState *st, const char *l){
                st->current_section);
         return 1;
     }
-    e->size=u256_sub(st->pc,e->start);
+    /* Confirmed size: measure from entry_pc (last re-entry) to current pc.
+     * Mirrors axx.py endsection_processing() using entry_pc for accuracy. */
+    uint256_t delta = u256_sub(st->pc, e->entry_pc);
+    if(!u256_lt_signed(delta, u256_zero()))
+        e->size = u256_add(e->size, delta);
+    e->confirmed = 1;
     return 1;
 }
 static int adir_zero(Assembler *asmb, const char *l, const char *l2){
@@ -4131,15 +4272,49 @@ static int lineassemble(Assembler *asmb, const char *line_in){
         }
     }
 
-    int vcnt=0;
-    const char *pp=processed;
-    while(1){
-        const char *seg_start=pp;
-        while(*pp&&!(*pp=='!'&&*(pp+1)=='!')) pp++;
-        if(pp!=seg_start) vcnt++;
-        if(*pp) pp+=2; else break;
+    /* Fix: vcnt !! counting must ignore !! inside double-quoted strings and
+     * single-quote char literals. Mirrors axx.py lineassemble() Bugfix L/L2/L3. */
+    {
+        int _vcnt = 0;
+        const char *_pp = processed;
+        int _in_dq = 0;
+        int _has_content = 0;
+        while(*_pp){
+            char _c = *_pp;
+            /* backslash escape inside double-quoted string */
+            if(_c == '\\' && _in_dq){
+                _pp++;
+                if(*_pp) _pp++;
+                _has_content = 1;
+                continue;
+            }
+            if(_c == '"'){
+                _in_dq = !_in_dq;
+                _pp++; _has_content = 1;
+                continue;
+            }
+            /* single-quote char literal: consume without counting */
+            if(_c == '\'' && !_in_dq){
+                /* look-ahead: '\x' (4-chars) or 'x' (3-chars) */
+                if(_pp[1] == '\\' && _pp[2] && _pp[3] == '\''){
+                    _pp += 4; _has_content = 1; continue;
+                } else if(_pp[1] && _pp[2] == '\''){
+                    _pp += 3; _has_content = 1; continue;
+                }
+                _pp++; _has_content = 1;
+                continue;
+            }
+            if(!_in_dq && _pp[0] == '!' && _pp[1] == '!'){
+                if(_has_content){ _vcnt++; _has_content = 0; }
+                _pp += 2;
+                continue;
+            }
+            if(_c != ' ') _has_content = 1;
+            _pp++;
+        }
+        if(_has_content) _vcnt++;
+        st->vcnt = _vcnt ? _vcnt : 1;
     }
-    st->vcnt=vcnt?vcnt:1;
 
     if(st->elf_objfile[0] && st->pas==2){
         st->elf_tracking=1;
@@ -4329,35 +4504,38 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                      * target = S+A = assembled_sym+offset なので A = raw_val - abs_w。 */
                     int64_t _addend;
                     {
-                    /* PC相対リロケーション型の一覧（全アーキテクチャ横断）。
-                     * addend = -num_bytes を適用するものをここに列挙する。
-                     * 絶対型（12=R_X86_64_16, 14=R_X86_64_8 等）は含めない。
-                     *
-                     * Bug修正: 旧コードは 12(R_X86_64_16=絶対) と 14(R_X86_64_8=絶対) を
-                     * PC相対として扱っており、addend が -num_bytes に誤計算されていた。
-                     * 正しい PC相対 16/8bit は 13(R_X86_64_PC16) / 15(R_X86_64_PC8)。
-                     *
-                     * 各アーキテクチャの PC相対型:
-                     *   x86-64 : 2(PC32), 3(GOT32), 4(PLT32), 9(GOTPCREL),
-                     *            13(PC16), 15(PC8), 24(PC64)
-                     *   i386   : 23(R_386_PC8)  ※2(R_386_PC32)はx86-64と共通
-                     *   ARM    : 3(R_ARM_REL32) ※x86-64 GOT32と番号共有だが問題なし
-                     *   AArch64: 260(PREL64), 261(PREL32), 262(PREL16)
-                     *   PPC    : 10(R_PPC_REL24), 26(R_PPC_REL32)               */
-                    static const int _pcrel[] = {
-                        /* x86-64 */
-                        2, 3, 4, 9, 13, 15, 24,
-                        /* i386 */
-                        23,
-                        /* AArch64 */
-                        260, 261, 262,
-                        /* PPC */
-                        10, 26,
-                        0   /* sentinel */
-                    };
-                        int _is_pcrel = 0;
-                        for(int _pi=0; _pcrel[_pi]; _pi++)
-                            if(_rtype == _pcrel[_pi]){ _is_pcrel=1; break; }
+                    /* PC相対リロケーション型はアーキテクチャ別に定義する。
+                     * 全アーキテクチャ共通リストにすると番号衝突が発生する。
+                     * 例: PPC R_PPC_REL24=10 と x86-64 R_X86_64_32=10(絶対) が衝突 →
+                     *     x86-64 で abs32 が誤って PC相対と判定され addend=-4 になるバグ。
+                     * Mirrors axx.py: _pc_rel_types_all はマシン別に分岐して定義。 */
+                    int _is_pcrel = 0;
+                    {
+                        /* Machine-specific PC-relative relocation type sets.
+                         * Only set _is_pcrel=1 if _rtype is in the set for THIS machine. */
+                        int _em_cur = st->elf_machine;
+                        if(_em_cur == 3){         /* EM_386 */
+                            /* R_386_PC32=2, R_386_PC16=13, R_386_PC8=23 */
+                            _is_pcrel = (_rtype==2||_rtype==13||_rtype==23);
+                        } else if(_em_cur == 40){ /* EM_ARM */
+                            /* R_ARM_PC24=1, R_ARM_REL32=3 */
+                            _is_pcrel = (_rtype==1||_rtype==3);
+                        } else if(_em_cur == 183){/* EM_AARCH64 */
+                            /* R_AARCH64_PREL64=260, PREL32=261, PREL16=262 */
+                            _is_pcrel = (_rtype==260||_rtype==261||_rtype==262);
+                        } else if(_em_cur == 20){ /* EM_PPC */
+                            /* R_PPC_REL24=10, R_PPC_REL32=26 */
+                            _is_pcrel = (_rtype==10||_rtype==26);
+                        } else if(_em_cur == 243){/* EM_RISCV: all absolute */
+                            _is_pcrel = 0;
+                        } else {                  /* EM_X86_64(62) and others */
+                            /* R_X86_64_PC32=2, GOT32=3, PLT32=4, GOTPCREL=9,
+                             * PC16=13, PC8=15, PC64=24.
+                             * Note: 10=R_X86_64_32 is ABSOLUTE – NOT included. */
+                            _is_pcrel = (_rtype==2||_rtype==3||_rtype==4||_rtype==9
+                                        ||_rtype==13||_rtype==15||_rtype==24);
+                        }
+                    }
                         if(_is_pcrel)
                             _addend = -(int64_t)_nbytes;
                         else
@@ -5161,6 +5339,12 @@ int main(int argc, char *argv[]){
             memcpy(st->vars, initial_vars, sizeof(st->vars));
             fileassemble(asmb,sourcefile);
 
+            /* Bug修正(axx.py port): finalize the last section's size.
+             * adir_section() only updates old_sec when switching sections, so the
+             * final (trailing) section never gets its size updated.
+             * Mirrors axx.py run(): _blk1 = pc - entry_pc; _e1[1] += _blk1 */
+            secmap_finalize_current(st);
+
             /* Fix ⑤: if any label is UNDEF, do not treat this as converged.
              * Fix ⑥-2: convergence check includes section membership as well
              * as PC value (mirrors axx.py current_pcs = {k: (v[0], v[1]) ...}).
@@ -5234,6 +5418,12 @@ int main(int argc, char *argv[]){
          * axx.py: self.state.current_section = '.text' before pass2 fileassemble). */
         strcpy(st->current_section, ".text");
         fileassemble(asmb,sourcefile);
+
+        /* Bug修正(axx.py port): finalize the last section's size after pass2.
+         * Mirrors axx.py run():
+         *   _last_sec = self.state.current_section
+         *   if not _confirmed: _e[1] += (pc - entry_pc) */
+        secmap_finalize_current(st);
     }
 
     binary_flush(st);
