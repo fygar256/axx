@@ -4224,11 +4224,14 @@ class Assembler:
                     # RISC-V は基本的に絶対アドレス型のみ
                     _pc_rel_types_all = set()
                 else:               # EM_X86_64 (62) およびその他
-                    # R_X86_64_PC32=2, R_X86_64_GOT32=3, R_X86_64_PLT32=4,
+                    # R_X86_64_PC32=2, R_X86_64_PLT32=4,
                     # R_X86_64_GOTPCREL=9, R_X86_64_PC16=13, R_X86_64_PC8=15,
                     # R_X86_64_PC64=24
                     # ※ 1=R_X86_64_64 は絶対型なので含めない
-                    _pc_rel_types_all = {2, 3, 4, 9, 13, 15, 24}
+                    # ※ 3=R_X86_64_GOT32 は「G + A」（GOT基底相対・絶対型）であり
+                    #   PC相対ではないため除外する。PC相対の GOT 参照は
+                    #   9=R_X86_64_GOTPCREL (G + GOT + A - P) を使うこと。
+                    _pc_rel_types_all = {2, 4, 9, 13, 15, 24}
 
                 for lname, abs_w, first_widx, num_words in groups:
                     num_bytes = num_words * bpw_r
@@ -4845,13 +4848,13 @@ class Assembler:
         # syms の出力順 (1)ローカル→(2)インポート→(3)エクスポート に合わせる  #
         #                                                                      #
         # Fix 3: 同名ラベルが labels（ローカル/インポート）と export_labels    #
-        # の両方に存在する場合、(3)エクスポートの登録が(1)ローカルを上書きして  #
-        # しまい、ELFリロケーションが誤ったシンボルインデックスを参照する問題。  #
-        # 修正: 既に登録済みのキーはエクスポート側からは上書きしない。         #
-        # ELFの規則上、同名の場合はグローバル（エクスポート）側のインデックスを  #
-        # リロケーションに使う方が正しいため、順序を逆転して(3)を先に登録し、   #
-        # (1)(2)では export_keys に含まれる名前をスキップする（既存の動作と    #
-        # 同一）。これにより重複時は常にエクスポート側のインデックスが使われる。  #
+        # の両方に存在する場合、ELF リロケーションには STB_GLOBAL（エクスポート）#
+        # 側のシンボルインデックスを使わなければならない。                      #
+        # 実装方針: (1)(2) のループでは export_keys に含まれる名前をスキップし、 #
+        # (3) のループで必ずエクスポートシンボルのインデックスを登録する。      #
+        # これにより重複時は常にエクスポート側のインデックスが参照される。      #
+        # ※ (1)(2) が export_keys をスキップするため、(3) での代入は           #
+        #   実質的に新規登録（上書きではない）になる。                          #
         # ------------------------------------------------------------------ #
         sym_name_to_idx = {}
         _si = 1 + ncs   # null(0) + section syms(1..ncs) を飛ばした位置
@@ -4969,8 +4972,13 @@ class Assembler:
             f.write(_pack_shdr(0, 0, 0, 0, 0, 0, 0, 0, 0, 0))  # [0] NULL
 
             for i, s in enumerate(csecs):                        # [1..ncs] content
+                # Fix: .bss は SHT_NOBITS (8)、それ以外は SHT_PROGBITS (1)。
+                # ELF 仕様上 SHT_NOBITS セクションはファイル領域を持たない（sh_size は
+                # 実際のバイト数だが sh_offset/ファイルデータは不使用）ため、
+                # リンカ・ローダーが正しくゼロ初期化できる。
+                _sh_type_i = 8 if s.name.upper().startswith('.BSS') else 1
                 f.write(_pack_shdr(
-                    sec_name_offs[i], 1, s.flags, 0,
+                    sec_name_offs[i], _sh_type_i, s.flags, 0,
                     sec_offsets[i], s.byte_size, 0, 0, 16, 0))
 
             for ri, sidx in enumerate(rela_sec_order):           # .rela.X
