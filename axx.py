@@ -77,6 +77,10 @@ class AssemblerState:
         # pc_instr_start: binary_list中の$$が命令先頭アドレスを指すように、
         # makeobj呼び出し前にself.state.pcの値を保存する。
         self.pc_instr_start = 0
+        # pc_instr_end: binary_list中の$.が命令の次のアドレスを指す。
+        # makeobj呼び出し前にサイズプローブを実行して確定する。
+        # (例: 7バイト命令なら pc_instr_end = pc_instr_start + 7)
+        self.pc_instr_end = 0
         # _in_binary_list: makeobj実行中はTrue。$$がpc_instr_startを
         # 返すのはbinary_list評価中のみ。.equなど他のコンテキストでは
         # $$=現在のPC (self.state.pc) を返す。
@@ -1363,6 +1367,12 @@ class ExpressionEvaluator:
             # binary_list中(makeobj内)では命令先頭アドレスpc_instr_startを返す。
             # .equなど他のコンテキストでは現在のPC(self.state.pc)を返す。
             x = self.state.pc_instr_start if self.state._in_binary_list else self.state.pc
+        elif StringUtils.q(s, '$.', idx):
+            idx += 2
+            # $.は常に「その命令の次のアドレス」を返す。
+            # binary_list中/外・pass0(対話モード)を問わず pc_instr_end を返す。
+            # pc_instr_end はパターンマッチ確定直後のサイズプローブで設定済み。
+            x = self.state.pc_instr_end
         elif StringUtils.q(s, '#', idx):
             idx += 1
             t, idx = self.parser.get_symbol_word(s, idx)
@@ -3894,12 +3904,29 @@ class Assembler:
                     _match_result = self.pattern_matcher.match0(lin, i[0])
                     self.state._in_match_attempt = False
                     if _match_result == True:
+                        # $$/$. のために命令先頭・末尾アドレスを事前確定する。
+                        # error条件式 i[1] でも $. を参照できるよう error() より前に実施。
+                        self.state.pc_instr_start = self.state.pc
+                        self.state.pc_instr_end   = self.state.pc_instr_start  # プローブ中の暫定値
+                        _probe_sm_saved    = self.state._pass1_size_mode
+                        _probe_refs_len    = len(self.state._elf_label_refs_seen)
+                        _probe_widx_saved  = self.state._elf_current_word_idx
+                        self.state._pass1_size_mode = True
+                        try:
+                            _probe_objl = self.obj_gen.makeobj(i[2])
+                            self.state.pc_instr_end = self.state.pc_instr_start + len(_probe_objl)
+                        except Exception:
+                            pass  # プローブ失敗時は暫定値(pc_instr_start)のまま
+                        finally:
+                            self.state._pass1_size_mode = _probe_sm_saved
+                            del self.state._elf_label_refs_seen[_probe_refs_len:]
+                            self.state._elf_current_word_idx = _probe_widx_saved
+                            self.state.error_undefined_label = False
                         # Fix 10: error() の戻り値でエラー発生を検知し、
                         # エラー時はオブジェクト生成をスキップする。
                         err_triggered, _err_code = self.directive_proc.error(i[1])
                         if not err_triggered:
-                            # binary_list中の$$が命令先頭アドレスを指すように保存
-                            self.state.pc_instr_start = self.state.pc
+                            # pc_instr_start は上のプローブブロックで設定済み
                             objl = self.obj_gen.makeobj(i[2])
                         else:
                             objl = []
@@ -3961,11 +3988,27 @@ class Assembler:
                 _match_result_dbg = self.pattern_matcher.match0(lin, i[0])
                 self.state._in_match_attempt = False
                 if _match_result_dbg == True:
+                    # $$/$. のために命令先頭・末尾アドレスを事前確定する（デバッグモード）。
+                    self.state.pc_instr_start = self.state.pc
+                    self.state.pc_instr_end   = self.state.pc_instr_start
+                    _probe_sm_saved_d   = self.state._pass1_size_mode
+                    _probe_refs_len_d   = len(self.state._elf_label_refs_seen)
+                    _probe_widx_saved_d = self.state._elf_current_word_idx
+                    self.state._pass1_size_mode = True
+                    try:
+                        _probe_objl_d = self.obj_gen.makeobj(i[2])
+                        self.state.pc_instr_end = self.state.pc_instr_start + len(_probe_objl_d)
+                    except Exception:
+                        pass
+                    finally:
+                        self.state._pass1_size_mode = _probe_sm_saved_d
+                        del self.state._elf_label_refs_seen[_probe_refs_len_d:]
+                        self.state._elf_current_word_idx = _probe_widx_saved_d
+                        self.state.error_undefined_label = False
                     # Fix 10: error() の戻り値でエラー発生を検知する（デバッグモード）
                     err_triggered, _err_code = self.directive_proc.error(i[1])
                     if not err_triggered:
-                        # binary_list中の$$が命令先頭アドレスを指すように保存
-                        self.state.pc_instr_start = self.state.pc
+                        # pc_instr_start は上のプローブブロックで設定済み
                         objl = self.obj_gen.makeobj(i[2])
                     else:
                         objl = []
