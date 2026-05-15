@@ -802,6 +802,10 @@ typedef struct {
      * makeobj呼び出し前にst->pcの値を保存する。makeobj内のexpression評価では
      * st->pcではなくst->pc_instr_startを$$として使う。 */
     uint256_t  pc_instr_start;
+    /* pc_instr_end: $.が返す「命令末尾(次命令の先頭)アドレス」。
+     * パターンマッチ確定後・error()/makeobj()呼び出し前のサイズプローブで確定する。
+     * binary_list中/外・pass0(対話モード)を問わず常にこの値を返す。 */
+    uint256_t  pc_instr_end;
     /* in_binary_list: makeobj実行中は1。$$がpc_instr_startを返すのは
      * binary_list評価中のみ。.equなど他のコンテキストでは$$=現在のPC。 */
     int        in_binary_list;
@@ -918,6 +922,8 @@ static void state_init(AsmState *st) {
     bufmap_init(&st->buf);
     st->pc = u256_zero();
     st->padding = u256_zero();
+    st->pc_instr_start = u256_zero();
+    st->pc_instr_end   = u256_zero();
     st->pass1_size_mode = 0;
     st->stdin_tmp_path[0] = '\0';
     st->expfile_elf[0] = '\0';
@@ -2043,6 +2049,15 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
          * .equなど他のコンテキストでは現在のPC(st->pc)を返す。 */
         x = st->in_binary_list ? st->pc_instr_start : st->pc;
         /* In float mode, treat PC as an integer-valued double (int→float). */
+        if(asmb->st.exp_typ_float)
+            x=double_to_u256((double)(int64_t)u256_to_u64(x));
+    }
+    else if(axx_q(s,slen,"$.",idx)){
+        idx+=2;
+        /* $.は常に「その命令の次のアドレス」を返す。
+         * binary_list中/外・pass0(対話モード)を問わず pc_instr_end を返す。
+         * pc_instr_end はパターンマッチ確定直後のサイズプローブで設定済み。 */
+        x = st->pc_instr_end;
         if(asmb->st.exp_typ_float)
             x=double_to_u256((double)(int64_t)u256_to_u64(x));
     }
@@ -4156,13 +4171,35 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         st->in_match_attempt = 0;
 
         if(_match_ok){
+            /* $$/$. のために命令先頭・末尾アドレスを事前確定する。
+             * error条件式 i->f[1] でも $. を参照できるよう dir_error() より前に実施。 */
+            st->pc_instr_start = st->pc;
+            st->pc_instr_end   = st->pc_instr_start;  /* プローブ中の暫定値 */
+            {
+                int _probe_sm_saved  = st->pass1_size_mode;
+                int _probe_refs_len  = st->elf_refs_len;
+                int _probe_widx_saved = st->elf_current_word_idx;
+                st->pass1_size_mode = 1;
+                IntVec _probe_objl; iv_init(&_probe_objl);
+                /* プローブ中はerror_undefined_labelが汚染しないよう保護 */
+                int _probe_err_undef_saved = st->error_undefined_label;
+                st->error_undefined_label = 0;
+                makeobj(asmb, i->f[2], &_probe_objl);
+                /* pc_instr_end = 命令先頭 + 命令バイト数 */
+                uint256_t _probe_sz = u256_from_i64((int64_t)_probe_objl.len);
+                st->pc_instr_end = u256_add(st->pc_instr_start, _probe_sz);
+                iv_free(&_probe_objl);
+                /* ELFトラッキング状態をプローブ前に巻き戻す */
+                st->elf_refs_len        = _probe_refs_len;
+                st->elf_current_word_idx = _probe_widx_saved;
+                st->pass1_size_mode     = _probe_sm_saved;
+                st->error_undefined_label = _probe_err_undef_saved;
+            }
             /* Fix 10 (axx.py): only call makeobj when dir_error did NOT trigger.
              * Previously makeobj always ran even if an .error condition fired. */
             int err_triggered = dir_error(asmb,i->f[1]);
             if(!err_triggered){
-                /* binary_list中の$$が命令先頭アドレスを指すように、
-                 * makeobj呼び出し前にst->pcを保存する。 */
-                st->pc_instr_start = st->pc;
+                /* pc_instr_start は上のプローブブロックで設定済み */
                 makeobj(asmb,i->f[2],objl_out);
                 /* Pass1ではmakeobj内でpass1_size_modeを使うため、
                  * ここでのretryは不要。error_undefined_labelはmakeobj内でクリア済み。
@@ -4529,10 +4566,13 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         } else if(_em_cur == 243){/* EM_RISCV: all absolute */
                             _is_pcrel = 0;
                         } else {                  /* EM_X86_64(62) and others */
-                            /* R_X86_64_PC32=2, GOT32=3, PLT32=4, GOTPCREL=9,
+                            /* R_X86_64_PC32=2, PLT32=4, GOTPCREL=9,
                              * PC16=13, PC8=15, PC64=24.
-                             * Note: 10=R_X86_64_32 is ABSOLUTE – NOT included. */
-                            _is_pcrel = (_rtype==2||_rtype==3||_rtype==4||_rtype==9
+                             * Note: 10=R_X86_64_32 is ABSOLUTE – NOT included.
+                             * Note: 3=R_X86_64_GOT32 is G+A (GOT-base-relative,
+                             *   ABSOLUTE) – NOT PC-relative. PC-relative GOT
+                             *   access uses 9=R_X86_64_GOTPCREL (G+GOT+A-P). */
+                            _is_pcrel = (_rtype==2||_rtype==4||_rtype==9
                                         ||_rtype==13||_rtype==15||_rtype==24);
                         }
                     }
@@ -4868,9 +4908,23 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     }
 
     /* ---- 6. compute file offsets ---- */
+    /* Fix 1B: SHT_NOBITS (.bss) sections must NOT consume file space.
+     * ELF spec: "A section of type SHT_NOBITS occupies no space in the file."
+     * We record sh_offset = current foff (any valid offset is fine; linkers
+     * ignore it for NOBITS) but do NOT advance foff past the section data.
+     * weo_isno() mirrors the same .bss test used in the section-header loop. */
+    int weo_isno(int i){
+        char _n[64]; int _j=0;
+        for(;csecs[i].name[_j]&&_j<63;_j++) _n[_j]=(char)axx_upper_char(csecs[i].name[_j]);
+        _n[_j]=0;
+        return strncmp(_n,".BSS",4)==0;
+    }
     uint64_t foff=64;
     uint64_t *sec_fo=calloc((size_t)ncs,sizeof(uint64_t));
-    for(int i=0;i<ncs;i++){foff=WEO_ALIGN(foff,16);sec_fo[i]=foff;foff+=csecs[i].bsz;}
+    for(int i=0;i<ncs;i++){
+        foff=WEO_ALIGN(foff,16); sec_fo[i]=foff;
+        if(!weo_isno(i)) foff+=csecs[i].bsz;  /* NOBITS: offset recorded, no file bytes */
+    }
     uint64_t *rela_fo=calloc((size_t)(nrela?nrela:1),sizeof(uint64_t));
     for(int ri2=0;ri2<nrela;ri2++){foff=WEO_ALIGN(foff,8);rela_fo[ri2]=foff;foff+=rela_szs[ri2];}
     uint64_t sym_fo=WEO_ALIGN(foff,8); foff=sym_fo+(uint64_t)nsyms*(uint64_t)WEO_SYMSZ;
@@ -4907,7 +4961,11 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         while((uint64_t)c<t){fputc(0,f);c++;}
     }
 
-    for(int i=0;i<ncs;i++){weo_pad(fp,sec_fo[i]);if(csecs[i].bsz)fwrite(csecs[i].data,1,(size_t)csecs[i].bsz,fp);}
+    for(int i=0;i<ncs;i++){
+        weo_pad(fp,sec_fo[i]);
+        /* NOBITS sections (.bss) have no file bytes — skip fwrite. */
+        if(!weo_isno(i) && csecs[i].bsz) fwrite(csecs[i].data,1,(size_t)csecs[i].bsz,fp);
+    }
     for(int ri2=0;ri2<nrela;ri2++){weo_pad(fp,rela_fo[ri2]);if(rela_szs[ri2])fwrite(rela_bufs[ri2],1,rela_szs[ri2],fp);}
     weo_pad(fp,sym_fo); fwrite(symtab_bb.b,1,(size_t)nsyms*(size_t)WEO_SYMSZ,fp);
     fwrite(strtab_bb.b,1,strtab_bb.len,fp);
@@ -4923,8 +4981,17 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         fwrite(sh,1,64,f);
     }
     weo_shdr(fp,0,0,0,0,0,0,0,0,0,0); /* [0] NULL */
-    for(int i=0;i<ncs;i++)
-        weo_shdr(fp,sec_noff[i],1,csecs[i].fl,0,sec_fo[i],csecs[i].bsz,0,0,16,0);
+    for(int i=0;i<ncs;i++){
+        /* Fix: .bss は SHT_NOBITS (8)、それ以外は SHT_PROGBITS (1)。
+         * ELF 仕様上 SHT_NOBITS セクションはファイル領域を持たない（sh_size は
+         * 実際のバイト数を保持するがファイルデータは書かれない）ため、
+         * リンカ・ローダーが正しくゼロ初期化できる。 */
+        char _un[64]; int _ui=0;
+        for(;csecs[i].name[_ui]&&_ui<63;_ui++) _un[_ui]=(char)axx_upper_char(csecs[i].name[_ui]);
+        _un[_ui]=0;
+        uint32_t _sh_type = (strncmp(_un,".BSS",4)==0) ? 8 : 1;
+        weo_shdr(fp,sec_noff[i],_sh_type,csecs[i].fl,0,sec_fo[i],csecs[i].bsz,0,0,16,0);
+    }
     for(int ri2=0;ri2<nrela;ri2++)
         weo_shdr(fp,rela_noff[ri2],4,0x40,0,rela_fo[ri2],rela_szs[ri2],
                  (uint32_t)sym_shidx,(uint32_t)(rs_idx[ri2]+1),8,24);
