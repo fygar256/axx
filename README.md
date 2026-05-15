@@ -600,6 +600,8 @@ One special factor is `!!!`, which represents the number of commands connected b
 
 The special variable is '$$', which represents the current location counter.
 
+The special variable '$.' returns the starting address of the instruction following that instruction.
+
 And there's %%, which returns the number of times %% appears (index starting from 0).
 
 Since the assembly line expressions and pattern data expressions call the same functions, they work almost the same. Variables in lowercase cannot be referenced from the assembly line.
