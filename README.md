@@ -10,7 +10,7 @@ GENERAL ASSEMBLER 'axx.py'
 
 FreeBSD terminal
 
-# Original article in Japanee
+# Original article in Japanese
 
 Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
 
