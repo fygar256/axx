@@ -3410,6 +3410,39 @@ class AssemblyDirectiveProcessor:
                 idx += 1
         return True
     
+    def resv_processing(self, l1, l2):
+        """Reserve directive - advance PC by N without writing bytes to output buffer.
+
+        .RESV N は N ワード分だけ PC を前進させるが、出力バッファへは何も書き込まない。
+        .bss セクションのような未初期化データ領域の確保に使用する。
+        出力ファイル上の対応するバイトは flush() 時に padding 値（デフォルト0）で埋められる。
+
+        Fix ①: .ZERO と同様に未定義ラベルと負値をガードする。
+        """
+        if StringUtils.upper(l1) != '.RESV':
+            return False
+        x, idx = self.expr_eval.expression_asm(l2, 0)
+        if self.state.error_undefined_label:
+            if self.state.pas == 2 or self.state.pas == 0:
+                print(f" error - .RESV argument contains undefined label.")
+            return True
+        try:
+            x = int(x)
+        except (OverflowError, ValueError):
+            if self.state.pas == 2 or self.state.pas == 0:
+                print(f" error - .RESV argument is non-finite or invalid.")
+            return True
+        if x < 0:
+            print(f" error - .RESV requires a non-negative count, got {x}.")
+            return True
+        _RESV_MAX = 1 << 28  # 256MB 超は非現実的
+        if x > _RESV_MAX:
+            if self.state.pas == 2 or self.state.pas == 0:
+                print(f" error - .RESV count {x} exceeds maximum {_RESV_MAX}.")
+            return True
+        self.state.pc += x
+        return True
+
     def zero_processing(self, l1, l2):
         """Zero directive
 
@@ -3782,6 +3815,8 @@ class Assembler:
         if self.asm_directive_proc.section_processing(l, l2):
             return 0, [], True, idx
         if self.asm_directive_proc.endsection_processing(l, l2):
+            return 0, [], True, idx
+        if self.asm_directive_proc.resv_processing(l, l2):
             return 0, [], True, idx
         if self.asm_directive_proc.zero_processing(l, l2):
             return 0, [], True, idx

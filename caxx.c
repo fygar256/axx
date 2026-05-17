@@ -3830,6 +3830,41 @@ static int adir_endsection(AsmState *st, const char *l){
     e->confirmed = 1;
     return 1;
 }
+static int adir_resv(Assembler *asmb, const char *l, const char *l2){
+    /* .RESV N  -- reserve N words: advance PC by N without writing bytes.
+     *
+     * Mirrors axx.py AssemblyDirectiveProcessor.resv_processing():
+     *   pc += N
+     * The corresponding range in the output file is filled with the padding
+     * value (default 0) at binary_flush() time, because BufMap entries are
+     * absent for the reserved region and the calloc / pad logic handles it.
+     *
+     * Guards: undefined label, negative count, unreasonably large count.
+     * Mirrors axx.py .ZERO guards (Fix ②). */
+    char up[16]; axx_strupr_to(up,l,sizeof(up));
+    if(strcmp(up,".RESV")!=0) return 0;
+    int io;
+    uint256_t x=expr_expression_asm(asmb,l2,0,&io);
+    if(asmb->st.error_undefined_label){
+        if(asmb->st.pas==2||asmb->st.pas==0)
+            fprintf(stderr," error - .RESV argument contains undefined label.\n");
+        return 1;
+    }
+    int64_t cnt=u256_to_i64(x);
+    if(cnt < 0){
+        fprintf(stderr," error - .RESV requires a non-negative count, got %lld.\n",(long long)cnt);
+        return 1;
+    }
+    /* 256 MB guard (same as .ZERO) */
+    if(cnt > (int64_t)(1 << 28)){
+        if(asmb->st.pas==2||asmb->st.pas==0)
+            fprintf(stderr," error - .RESV count %lld exceeds maximum %d.\n",
+                    (long long)cnt, 1<<28);
+        return 1;
+    }
+    asmb->st.pc = u256_add(asmb->st.pc, u256_from_u64((uint64_t)cnt));
+    return 1;
+}
 static int adir_zero(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ZERO")!=0) return 0;
@@ -4039,6 +4074,7 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
 
     if(adir_section(st,l,l2)){ *idx_out=idx; return 1; }
     if(adir_endsection(st,l)){ *idx_out=idx; return 1; }
+    if(adir_resv(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_zero(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_ascii(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_asciiz(asmb,l,l2)){ *idx_out=idx; return 1; }
