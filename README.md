@@ -6,6 +6,10 @@ slide: false
 ---
 GENERAL ASSEMBLER 'axx.py'
 
+C version is also available. C version is nameded Caxx. Caxx is much faster than Paxx.
+
+Paxx is newest version. Due to Paxx version upgrades, updates to caxx may be delayed.
+
 # Test environment
 
 FreeBSD terminal
@@ -17,10 +21,6 @@ Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
 # Relocatable ELF creation of axx
 
 GitHub: https://github.com/fygar256/axx_relocatable_elf_generation
-
-C version is also available. C version is nameded Caxx. Caxx is much faster than Paxx.
-
-Paxx is newest version. Due to Paxx version upgrades, updates to caxx may be delayed.
 
 # Demonstration of brainfuck interpreter that assembled with axx
 
