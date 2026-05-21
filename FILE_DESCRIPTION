@@ -19,7 +19,6 @@ hello.bin                           binary file of hello world for x86_64
 hello.s                             assembly file of x86_64 hello world
 hello.tsv                           export file of x86_64 hello world
 imp.tsv                             import file
-rel                                 script to make elf
 secsort.py                          execution file of section sort
 test.axx                            test pattern file of some CPUs 
 test.s                              test assemble file of some CPUs
