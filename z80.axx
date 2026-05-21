@@ -1,5 +1,5 @@
 /*
-/* z80.axx z80 patternfile
+/* z80.axx z80 full patternfile
 /*
 DEC IY :: 0xfd,0x2b
 DEC IX :: 0xdd,0x2b
