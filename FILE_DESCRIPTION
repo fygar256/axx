@@ -27,4 +27,5 @@ z80.axx                             pattern file for Z80
 z80.s                               test assemble file for Z80
 vliw.axx                            test pattern file for vliw
 vliw.s                              test assembly file for vliw
+x86_64.axx                          pattern file for x86_64
 itanium.axx                         test pattern file for itanium
