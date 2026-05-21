@@ -806,8 +806,6 @@ Execution example
 
 ## Comments
 
--Sorry for the original notation.
-
 -I know it's a ridiculous request, but quantum computers and LISP machines are not supported.
 
 The assembly language of quantum computers is called quantum assembly, and is not assembly language.
