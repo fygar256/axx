@@ -1,0 +1,35 @@
+3個のコマンドを実行しました, ファイルを読み取りました完成しました。全823行のフルカバー版 x86_64.axx です。
+
+収録内容まとめ
+セクション            主な内容 
+レジスタ定義          RAX〜R15 (64/32/16/8bit)、XMM0〜15、YMM0〜15
+MOV                   r64/r32/r16/r8、即値、RIP相対、[b]、[b+disp]、SIB
+MOVSX/MOVZX/MOVSXD    全サイズ組み合わせ
+PUSH/POP              r64、imm32/8
+LEA                   RIP相対、[b]、[b+disp] disp8/32
+算術                  ADD/ADC/SUB/SBB/CMP/MUL/IMUL/DIV/IDIV/INC/DEC/NEG/NOT (64/32/16/8bit)
+論理                  AND/OR/XOR/NOT/TEST (全サイズ、reg/mem/imm)
+シフト         ROL/ROR/RCL/RCR/SHL/SHR/SAR (imm8/CL/1、全サイズ)、SHLD/SHRD
+ビット操作     BSF/BSR/BT/BTS/BTR/BTC/BSWAP/POPCNT/LZCNT/TZCNT
+XCHG/CMPXCHG/XADD     CMPXCHG8B/16B含む
+LOCK プレフィックス   INC/DEC/ADD/SUB/AND/OR/XOR/XADD/CMPXCHG/BTS/BTR/BTC
+条件分岐              Jcc near(32bit) / short(8bit)、全エイリアス
+SETCC / CMOV          全条件コード、reg/mem両形式
+文字列命令            MOVS/CMPS/SCAS/STOS/LODS (B/W/D/Q)、REP/REPE/REPNE
+LOOP/JRCXZ            LOOPE/LOOPNE含む
+フラグ操作            CLC/STC/CMC/CLD/STD/CLI/STI/LAHF/SAHF
+CBW系                 CBW/CWDE/CDQE/CWD/CDQ/CQO
+システム              NOP/PAUSE/HLT/SYSCALL/INT/CPUID/RDTSC/RDMSR/WRMSR…
+メモリバリア          LFENCE/MFENCE/SFENCE/CLFLUSH/PREFETCH系
+x87 FPU               FLD/FST/FADD/FSUB/FMUL/FDIV/FSQRT/FILD/FISTP/FXSAVE…
+IN/OUT                AL/AX/EAX × DX/imm8
+CR/DR/セグメント      CR0/CR3/CR4、DR0〜DR7、FS/GS
+システム管理          LGDT/LIDT/LLDT/SWAPGS/VMx系/MONITOR/MWAIT…
+SSE2                  MOVSD/SS/APD/APS/DQA/DQU、スカラー/パックド算術、整数演算、比較、変換、シャッフル
+SSSE3                 PSHUFB/PHADDW/PABSB/PALIGNR…
+SSE4.1/4.2            PBLENDW/ROUNDSS/PCMPESTRI/PCMPISTRI/DPPS…
+AES-NI                AESENC/AESDEC/AESIMC/AESKEYGENASSIST/PCLMULQDQ
+AVX (VEX 3バイト)     128bit/256bit VMOV/算術/比較/変換/シャッフル/整数/AES
+FMA3                  VFMADD/VFMSUB/VFNMADD の 132/213/231 全変形
+BMI1/BMI2             ANDN/BEXTR/BLSI/BLSMSK/BLSR/BZHI/MULX/PDEP/PEXT/RORX/SARX/SHLX/SHRX
+データ定義DB/DW/DD/DQ
