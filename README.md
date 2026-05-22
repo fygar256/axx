@@ -290,6 +290,20 @@ You can specify characters other than numbers and uppercase and lowercase letter
 
 The default is letters + numbers + `'_%$-~&|'`.
 
+#### Symbol check
+
+```
+.check::x::r1,r2,r3
+```
+
+If you set this to, an error will occur if a symbol other than r1,r2, orr3 appears at the position of x.
+
+To remove .check,use 
+
+```
+.clrcheck::x
+```
+
 #### Pattern order
 
 Pattern files are evaluated from top to bottom, so the pattern placed first takes precedence. Special patterns should be placed first, and general patterns should be placed last. Like below.
