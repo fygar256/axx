@@ -98,6 +98,7 @@ class AssemblerState:
         self.labels = {}
         self.sections = {}
         self.symbols = {}
+        self.checksym = {}
         self.patsymbols = {}
         self.export_labels = {}
         self.pat = []
@@ -254,9 +255,11 @@ class StringUtils:
                 while k < len(s) and s[k] in '0123456789abcdefABCDEF' and hex_digits < 2:
                     k += 1
                     hex_digits += 1
-                if k < len(s) and s[k] == '\'':
+                # Fix: hex_digits == 0 のとき（'\x' の直後が閉じクォート）は
+                # 無効なエスケープ。誤消費を防ぐため孤立クォート扱いにする。
+                if hex_digits > 0 and k < len(s) and s[k] == '\'':
                     return k + 1          # '\xNN' 消費成功
-                # 閉じクォートが見つからない → 孤立クォート
+                # 閉じクォートが見つからない、またはhex桁が0個 → 孤立クォート
             elif j + 2 < len(s) and s[j + 2] == '\'':
                 return j + 3              # '\x' 4文字消費成功
             # 対応クローズクォートなし → 孤立クォート
@@ -394,7 +397,8 @@ class StringUtils:
                     # 出力されるためユーザーが気づきにくい。警告を出す。
                     if idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF':
                         print(f" warning - '\\x' escape takes at most 2 hex digits; "
-                              f"extra digit(s) treated as literal characters in: {l2!r}")
+                              f"extra digit(s) treated as literal characters in: {l2!r}",
+                              file=sys.stderr)
                     if hex_str:
                         s += chr(int(hex_str, 16))
                     else:
@@ -956,7 +960,7 @@ class LabelManager:
             # _in_match_attempt が True のときはパターンマッチ試行中であり、
             # このラベル参照は後に別パターンに差し替えられる可能性があるため
             # エラーを出力しない（OUT (C),E で OUT (!n),A を試みる際などに発生する）。
-            if not self.state._in_match_attempt and (self.state.pas == 2 or self.state.pas == 0):
+            if (True or not self.state._in_match_attempt) and (self.state.pas == 2 or self.state.pas == 0):
                 _fn = self.state.current_file or ""
                 _ln = self.state.ln
                 print(f" error - Label undefined: '{k}'"
@@ -1294,6 +1298,14 @@ class ExpressionEvaluator:
                         or node.func.id not in _ALLOWED_NAMES):
                     raise ValueError(
                         f"xeval: disallowed function call in '{s}'")
+                # Fix: キーワード引数・スター引数は許可しない（許可形式は enfloat(expr) のみ）
+                if node.keywords or node.starargs if hasattr(node, 'starargs') else node.keywords:
+                    raise ValueError(
+                        f"xeval: keyword/star arguments not allowed in '{s}'")
+                # Fix: 引数の個数を1個に制限する（enfloat/endouble は1引数関数）
+                if len(node.args) != 1:
+                    raise ValueError(
+                        f"xeval: function '{node.func.id}' requires exactly 1 argument in '{s}'")
 
         safe_env = {
             "__builtins__": {},
@@ -1302,7 +1314,19 @@ class ExpressionEvaluator:
             "enflt": enflt,
             "endbl": endbl,
         }
-        result = eval(compile(tree, '<xeval>', 'eval'), safe_env, {})
+
+        # Fix: 深くネストした関数呼び出し（enfloat(enfloat(...))）による RecursionError を
+        # 防ぐため、eval に渡す前に再帰深さ上限を一時的に制限する。
+        # sys.getrecursionlimit() の 1/4 を上限とし、通常の式評価に支障がない範囲で抑える。
+        _orig_limit = sys.getrecursionlimit()
+        _safe_limit = max(200, _orig_limit // 4)
+        sys.setrecursionlimit(_safe_limit)
+        try:
+            result = eval(compile(tree, '<xeval>', 'eval'), safe_env, {})
+        except RecursionError:
+            raise ValueError(f"xeval: expression nesting too deep in '{s}'")
+        finally:
+            sys.setrecursionlimit(_orig_limit)
         if not isinstance(result, (int, float, bool)):
             raise ValueError(f"xeval: unsafe result type {type(result)}")
         return result
@@ -1891,13 +1915,20 @@ class ExpressionEvaluator:
             saved_err_conflict      = self.state.error_label_conflict
             saved_elf_refs_len      = len(self.state._elf_label_refs_seen)   # Fix 6
             saved_elf_v2l           = dict(self.state._elf_var_to_label)
+            # Fix: _pass1_size_mode / _in_match_attempt も選択されたブランチの
+            # 状態を採用する。旧実装ではこれらが選ばれなかったブランチの値で
+            # 残留し、後続の評価が誤った動作をする可能性があった。
+            saved_pass1_size_mode   = self.state._pass1_size_mode
+            saved_in_match_attempt  = self.state._in_match_attempt
 
             t, idx = self.term11(s, idx + 1)   # 真ブランチ評価（右結合）
-            vars_after_true         = self.state.vars[:]
-            err_after_true          = self.state.error_undefined_label
-            conflict_after_true     = self.state.error_label_conflict
-            refs_after_true         = list(self.state._elf_label_refs_seen)  # Fix ⑫
-            v2l_after_true          = dict(self.state._elf_var_to_label)     # Fix ⑫
+            vars_after_true              = self.state.vars[:]
+            err_after_true               = self.state.error_undefined_label
+            conflict_after_true          = self.state.error_label_conflict
+            refs_after_true              = list(self.state._elf_label_refs_seen)  # Fix ⑫
+            v2l_after_true               = dict(self.state._elf_var_to_label)     # Fix ⑫
+            pass1_size_mode_after_true   = self.state._pass1_size_mode
+            in_match_attempt_after_true  = self.state._in_match_attempt
 
             if idx < len(s) and StringUtils.q(s, ':', idx):
                 # 偽ブランチ評価前に vars / ELF 追跡状態を元の状態に戻す
@@ -1907,6 +1938,8 @@ class ExpressionEvaluator:
                 # Fix 6: スライスで saved 長さまで切り戻す（新規コピー不要）
                 del self.state._elf_label_refs_seen[saved_elf_refs_len:]
                 self.state._elf_var_to_label        = dict(saved_elf_v2l)
+                self.state._pass1_size_mode         = saved_pass1_size_mode
+                self.state._in_match_attempt        = saved_in_match_attempt
                 u, idx = self.term11(s, idx + 1)  # 偽ブランチ評価（右結合）
                 err_after_false         = self.state.error_undefined_label
                 conflict_after_false    = self.state.error_label_conflict
@@ -1918,6 +1951,8 @@ class ExpressionEvaluator:
                     self.state.error_label_conflict     = conflict_after_true
                     self.state._elf_label_refs_seen     = refs_after_true
                     self.state._elf_var_to_label        = v2l_after_true
+                    self.state._pass1_size_mode         = pass1_size_mode_after_true
+                    self.state._in_match_attempt        = in_match_attempt_after_true
                     x = t
                 else:
                     # 条件が偽: 偽ブランチの値・変数状態・エラーフラグをそのまま使う
@@ -1935,6 +1970,8 @@ class ExpressionEvaluator:
                     self.state.error_label_conflict     = conflict_after_true
                     self.state._elf_label_refs_seen     = refs_after_true
                     self.state._elf_var_to_label        = v2l_after_true
+                    self.state._pass1_size_mode         = pass1_size_mode_after_true
+                    self.state._in_match_attempt        = in_match_attempt_after_true
                     x = t
                 else:
                     # 条件が偽: 真ブランチの副作用を取り消し、0 を返す
@@ -1943,6 +1980,8 @@ class ExpressionEvaluator:
                     self.state.error_label_conflict     = saved_err_conflict
                     del self.state._elf_label_refs_seen[saved_elf_refs_len:]  # Fix 6
                     self.state._elf_var_to_label        = dict(saved_elf_v2l)
+                    self.state._pass1_size_mode         = saved_pass1_size_mode
+                    self.state._in_match_attempt        = saved_in_match_attempt
                     x = 0
         return x, idx
     
@@ -2071,19 +2110,12 @@ class BinaryWriter:
         if not self.state.outfile or not self._buffer:
             return
 
-        # Fix 6 (new): bts == 0 の場合は bytes_per_word = 0 になり出力が空になる。
-        # サイレントな空ファイル生成を防ぐため、明示的に警告を出して早期リターンする。
-        if self.state.bts <= 0:
-            print(f" warning - flush: bts={self.state.bts} is invalid (<=0); "
-                  f"output file '{self.state.outfile}' will be empty.", file=sys.stderr)
-            return
-
-        # Fix ⑧修正: bts == 0 の場合は bytes_per_word = 0 になり
-        # total_size = 0 → data[base_idx + i] への書き込みで IndexError が発生する。
+        # bts == 0 の場合は bytes_per_word = 0 になり出力が空になる。
+        # また total_size = 0 → data[base_idx + i] への書き込みで IndexError が発生する。
         # .bits 0 のような不正な設定を早期検出してエラーを出す。
         if self.state.bts <= 0:
-            print(f" error - bts (word bit width) is {self.state.bts}; cannot write output.",
-                  file=__import__('sys').stderr)
+            print(f" error - flush: bts={self.state.bts} is invalid (<=0); "
+                  f"output file '{self.state.outfile}' will be empty.", file=sys.stderr)
             return
 
         # Fix(new): 負のキーが混入している場合はスキップして安全に処理する。
@@ -2247,6 +2279,36 @@ class DirectiveProcessor:
             v = 0
         self.state.symbols[key] = v
         return True
+
+    def check(self, i):
+        """Set check directive"""
+        if len(i) == 0 or i[0] != '.check':
+            return False
+        
+        if len(i) < 3:
+            print(f" error - .check directive requires at least a variable name and symbol name(s)")
+            return False
+        
+        key = i[1]
+        l=i[2].split(',')
+        l = [sx.upper() for sx in l]
+        self.state.checksym[key] = l
+        return True
+
+    def clrcheck(self, i):
+        """clear check directive"""
+        if len(i) == 0 or i[0] != '.clrcheck':
+            return False
+        
+        if len(i) < 2:
+            print(f" error - .clearcheck directive requires at least a variable name")
+            return False
+        
+        key = i[1]
+        self.state.checksym.pop(key, None)
+        return True
+    
+    
     
     def bits(self, i):
         """Bits directive"""
@@ -2511,7 +2573,9 @@ class PatternMatcher:
                 else:
                     return False
             elif a in CAPITAL:   # Fix: isupper() はUnicode大文字も含むため CAPITAL で限定
-                if a == b.upper():
+                # Fix: b.upper() は非ASCII文字（例: ß→SS）で複数文字になりうるため
+                # StringUtils.upper() を使って ASCII 範囲のみ大文字化する。
+                if a == StringUtils.upper(b):
                     idx_s += 1
                     idx_t += 1
                     continue
@@ -2713,6 +2777,9 @@ class PatternMatcher:
                 idx_t += 1
                 prev_idx_s = idx_s
                 w, idx_s = self.parser.get_symbol_word(s, idx_s)
+                if a in self.state.checksym:
+                    if w.upper() not in self.state.checksym[a]:
+                        return False
                 v = self.symbol_manager.get(w)
                 if v == "":
                     return False
@@ -2742,12 +2809,13 @@ class PatternMatcher:
         sl = [_ + 1 for _ in range(cnt)]
 
         # Fix: cnt が大きいとき組み合わせ数は 2^cnt になり事実上無限ループになる。
-        # 現実のパターンファイルで [[]] が 20 を超えることはないため上限を設ける。
-        _MAX_OPT_GROUPS = 20
+        # 2^20 = 約100万回の match() 呼び出しになるため上限を 12（2^12=4096回）に
+        # 引き下げて性能 DoS を防ぐ。現実のパターンファイルで [[]] が 12 を超えることは
+        # まずない。警告は stdout 汚染防止のため stderr に出力する。
+        _MAX_OPT_GROUPS = 12
         if cnt > _MAX_OPT_GROUPS:
-            if self.state.pas == 2 or self.state.pas == 0:
-                print(f" warning - pattern has {cnt} optional groups (max {_MAX_OPT_GROUPS}); "
-                      f"truncating to avoid combinatorial explosion.")
+            print(f" warning - pattern has {cnt} optional groups (max {_MAX_OPT_GROUPS}); "
+                  f"truncating to avoid combinatorial explosion.", file=sys.stderr)
             sl = sl[:_MAX_OPT_GROUPS]
             cnt = _MAX_OPT_GROUPS
 
@@ -3043,12 +3111,16 @@ class ObjectGenerator:
                 # pass==1では常に_pass1_size_modeで評価する。
                 # 未定義ラベル(EXTERN等)があっても0として扱い、
                 # @@[8,*(e,%%)]のような式でも8バイト分が正しく計上される。
+                # Fix: expression_pat() が例外を投げても _pass1_size_mode が True の
+                # まま残留しないよう try/finally で確実に False に戻す。
                 if self.state.pas == 1:
                     self.state._pass1_size_mode = True
-                x, idx = self.expr_eval.expression_pat(s, idx)
-                if self.state.pas == 1:
-                    self.state._pass1_size_mode = False
-                    self.state.error_undefined_label = False
+                try:
+                    x, idx = self.expr_eval.expression_pat(s, idx)
+                finally:
+                    if self.state.pas == 1:
+                        self.state._pass1_size_mode = False
+                        self.state.error_undefined_label = False
 
                 if (semicolon == True and x != 0) or (semicolon == False):
                     objl += [x]
@@ -3928,6 +4000,8 @@ class Assembler:
             
             if i is None: continue
             if self.directive_proc.set_symbol(i): continue
+            if self.directive_proc.check(i): continue
+            if self.directive_proc.clrcheck(i): continue
             if self.directive_proc.clear_symbol(i): continue
             if self.directive_proc.paddingp(i): continue
             if self.directive_proc.bits(i): continue
