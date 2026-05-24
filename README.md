@@ -544,7 +544,7 @@ Declares the loading of an external label.
 
 You can specify a section/segment as shown below.
 
-``
+```
 .section .text
 or
 .segment .text
