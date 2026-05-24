@@ -330,7 +330,7 @@ The default is `little`, and it defaults to `little` even if not specified.
 
 This allows you to include a file.
 
-``
+```
 .include "file.axx"
 ```
 
@@ -344,7 +344,7 @@ LEAQ r, [ s + t * !h \+ !i ] :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
 
 This example processes an assembly line like `leaq rax,[rax+rbx*(2+2)+0x40]` for x86_64.
 
-``
+```
 LEAQ r,(s+t*!!h+!!i) :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
 ```
 
