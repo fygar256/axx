@@ -190,7 +190,7 @@ A symbol can be an alphabet, a number, or a sequence of symbols.
 
 To define symbol2 with symbol1, you would write it as follows:
 
-``
+```
 .setsym ::symbol1 ::1
 .setsym ::symbol2 ::#symbol1
 ```
