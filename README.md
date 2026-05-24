@@ -116,8 +116,7 @@ In axx, assembly language source files and lines input from standard input are n
 
 The execution platform is also independent of any specific processing system. It is designed to ignore chr(13) at the end of lines in DOS files. It should work on any processing system that runs Python.
 
-This version only includes the core assembler, so it does not support practical features such as optimization, advanced macros, and debuggers that are available in dedicated assemblers. For practical functionality, use a preprocessor for macros.　Since this is not an IDE, use an external debugger. Optimization is not supported. I believe it has basic functionality, so please apply it. The current version is not practical enough.
-
+This version only includes the core assembler, so it does not support practical features such as optimization and advanced macros that are available in dedicated assemblers. For practical functionality, use a preprocessor for macros. Optimization is not supported. I believe it has basic functionality, so please apply it. The current version is not practical enough.
 
 # Explanation
 
