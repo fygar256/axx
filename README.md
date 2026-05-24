@@ -237,7 +237,7 @@ In this case, the C in ADD A,C becomes 1, and the C in RET C becomes 3.
 
 Symbols are cleared using .clearsym.
 
-``
+```
 .clearsym::ax
 ```
 
@@ -251,7 +251,7 @@ To clear all symbols, do not specify any arguments.
 
 You can determine the character set used for symbols from within the pattern file.
 
-``
+```
 .symbolc::<characters>
 ```
 
