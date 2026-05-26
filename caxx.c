@@ -2246,6 +2246,45 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         } else {
             x=var_get(st,ch);
             idx++;
+            /* Fix (axx.py port): detect UNDEF values in pattern variables during
+             * makeobj evaluation.
+             *
+             * When in_match_attempt=1, label_get_value() suppresses its error
+             * output and stores UNDEF (0xff…ff) in the variable via var_put().
+             * makeobj() later reads the variable through var_get() — NOT through
+             * label_get_value() — so error_undefined_label is never set and no
+             * error is emitted even though the assembled word is garbage.
+             *
+             * Fix: when NOT in a match attempt, NOT in pass1_size_mode, and in
+             * pass2 or interactive mode, check whether the variable holds UNDEF
+             * (0xff…ff) or an UNDEF-derived value (>= 2^128, which can arise from
+             * arithmetic on UNDEF).  If so, set error_undefined_label and emit
+             * the error, matching the behaviour of label_get_value() for directly
+             * referenced undefined labels.
+             *
+             * Mirrors the identical fix applied to axx.py factor1():
+             *   _UNDEF_THRESHOLD = 1 << 128
+             *   if (not _in_match_attempt and not _pass1_size_mode
+             *           and (pas==2 or pas==0)
+             *           and (x == UNDEF or x >= _UNDEF_THRESHOLD)):
+             *       error_undefined_label = True
+             *       print(" error - Label undefined: variable … ")
+             */
+            if(!st->in_match_attempt
+               && !st->pass1_size_mode
+               && (st->pas == 2 || st->pas == 0)){
+                int _is_undef = u256_is_undef(x);
+                /* Values >= 2^128 (w[2] or w[3] non-zero) are UNDEF-derived
+                 * (e.g. UNDEF+offset, UNDEF*2, etc.) and equally invalid. */
+                int _is_undef_derived = (!_is_undef && (x.w[2] || x.w[3]));
+                if(_is_undef || _is_undef_derived){
+                    st->error_undefined_label = 1;
+                    fprintf(stderr,
+                        " error - Label undefined: variable '%c' contains undefined value"
+                        "  [%s:%d]\n",
+                        ch, st->current_file, (int)st->ln);
+                }
+            }
             /* In float mode, promote the variable's stored integer value to
              * double, matching Python's automatic int→float type promotion.
              * Exception: if the variable was captured by !F/!D (float bit-
