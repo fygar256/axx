@@ -1566,6 +1566,22 @@ class ExpressionEvaluator:
             else:
                 x = self.var_manager.get(ch)
                 idx += 1
+                # Fix: パターンマッチ中 (_in_match_attempt=True) に未定義ラベルを
+                # キャプチャした場合、get_value() のエラー出力はフラグにより抑制されるが
+                # 変数には UNDEF が格納される。makeobj() がその変数を読む際に get_value()
+                # を経由しないため、従来は error_undefined_label がセットされず、
+                # UNDEF 値がエラーなしでそのまま出力されていた。
+                # 修正: _in_match_attempt=False かつ pass2/対話モード かつ
+                # _pass1_size_mode=False (プローブ中でない) のとき、
+                # 変数値が UNDEF 由来であればエラーを発生させる。
+                _UNDEF_THRESHOLD = 1 << 128
+                if (not self.state._in_match_attempt
+                        and not self.state._pass1_size_mode
+                        and (self.state.pas == 2 or self.state.pas == 0)
+                        and (x == UNDEF or (isinstance(x, int) and x >= _UNDEF_THRESHOLD))):
+                    self.state.error_undefined_label = True
+                    print(f" error - Label undefined: variable '{ch}' contains undefined value"
+                          f"  [{self.state.current_file}:{self.state.ln}]", file=sys.stderr)
                 # Fix ⑥: ELF追跡: makeobj() 内で変数を読んだとき、その変数が
                 # match() でラベルを直接キャプチャしたものであればリロケーション候補
                 # として記録する。
