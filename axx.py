@@ -1190,6 +1190,7 @@ class ExpressionEvaluator:
             # Fix 2: factor1 が何も消費せず (idx 不変) かつ NUL でも終端でもない位置で
             # 停止した場合、未知トークンがサイレントに 0 になっている。
             # pass2/対話モードのみ警告を出す（pass1 は forward 参照で頻繁に発生するため抑制）。
+            """
             if (idx == prev_idx
                     and idx < len(s)
                     and s[idx] not in (chr(0), ',', ')', ']', CB, ' ', '\t')
@@ -1197,6 +1198,7 @@ class ExpressionEvaluator:
                 print(f" warning - unrecognized token at position {idx} in expression: "
                       f"{s[idx:idx+8]!r} (treated as 0)")
 
+            """
         idx = StringUtils.skipspc(s, idx)
         return x, idx
 
