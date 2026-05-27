@@ -872,6 +872,13 @@ typedef struct {
     } *relocations;
     int        reloc_count;
     int        reloc_cap;
+
+    /* .check 拘束条件テーブル (変数 a-z に対応する 26 要素配列)。
+     * check_constraints[i] は変数 'a'+i に対する許可シンボル名の StrVec。
+     * 空 StrVec (len==0) はその変数に拘束なし。
+     * .check::x::sym1,sym2,... で登録、.clrcheck::x で解除。
+     * マッチ成功後・makeobj 前に dir_check_eval() が検証する。          */
+    StrVec     check_constraints[26];
 } AsmState;
 
 /* Finalize the current (last) section's size after fileassemble() completes.
@@ -943,6 +950,9 @@ static void state_init(AsmState *st) {
     st->relocations = NULL;
     st->reloc_count = 0;
     st->reloc_cap = 0;
+    /* .check 拘束テーブルは memset で既にゼロ初期化済みだが、
+     * sv_init() と同等であることを明示的に保証する。              */
+    for(int _ci=0; _ci<26; _ci++) sv_init(&st->check_constraints[_ci]);
 }
 
 /* =========================================================
@@ -2855,6 +2865,123 @@ static int dir_epic(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* =========================================================
+ * .check / .clrcheck ディレクティブ (パターンファイル専用)
+ *
+ * dir_check():
+ *   PatEntry フィールド配置:
+ *     f[0] = ".check"
+ *     f[1] = 変数名 (小文字1文字, e.g. "x")
+ *     f[2] = 許可シンボル名をカンマ区切りで列挙 (e.g. "R0,R1,R2")
+ *   当該変数に対する拘束を st->check_constraints[var-'a'] に登録する。
+ *   既存の拘束は上書きされる。
+ *
+ * dir_clrcheck():
+ *   PatEntry フィールド配置:
+ *     f[0] = ".clrcheck"
+ *     f[1] = 変数名 (省略時は全変数の拘束を解除)
+ *   対象変数の拘束を解除する。
+ *
+ * dir_check_eval():
+ *   マッチ成功後・makeobj 前に呼び出す。
+ *   登録済みの全拘束を評価し、1つでも違反があれば pas==2/0 でエラーを
+ *   stderr に出力して 1 を返す（呼び出し元が makeobj をスキップする）。
+ * ========================================================= */
+static int dir_check(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".check") != 0) return 0;
+    const char *var_str = e->f[1];
+    if(!var_str[0]){
+        fprintf(stderr, " error - .check: variable name is not specified.\n");
+        return 1;
+    }
+    char var = (char)tolower((unsigned char)var_str[0]);
+    if(var < 'a' || var > 'z' || var_str[1] != '\0'){
+        fprintf(stderr,
+            " error - .check: variable should be a lower case letter ('%s').\n",
+            var_str);
+        return 1;
+    }
+    int idx = var - 'a';
+    /* Clear existing constraint for this variable */
+    sv_free(&asmb->st.check_constraints[idx]);
+    sv_init(&asmb->st.check_constraints[idx]);
+    /* Parse comma-separated symbol names from f[2]; store uppercased */
+    const char *p = e->f[2];
+    while(*p){
+        while(*p == ' ' || *p == '\t') p++;
+        if(!*p) break;
+        char buf[512]; int j = 0;
+        while(*p && *p != ',' && j < (int)sizeof(buf)-1)
+            buf[j++] = (char)toupper((unsigned char)*p++);
+        buf[j] = '\0';
+        /* trim trailing spaces */
+        while(j > 0 && (buf[j-1] == ' ' || buf[j-1] == '\t')) buf[--j] = '\0';
+        if(j > 0) sv_push(&asmb->st.check_constraints[idx], buf);
+        if(*p == ',') p++;
+    }
+    return 1;
+}
+
+static int dir_clrcheck(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".clrcheck") != 0) return 0;
+    const char *var_str = e->f[1];
+    if(var_str[0]){
+        char var = (char)tolower((unsigned char)var_str[0]);
+        if(var < 'a' || var > 'z' || var_str[1] != '\0'){
+            fprintf(stderr,
+                " error - .clrcheck: variable should be a lower case letter ('%s').\n",
+                var_str);
+            return 1;
+        }
+        int idx = var - 'a';
+        sv_free(&asmb->st.check_constraints[idx]);
+        sv_init(&asmb->st.check_constraints[idx]);
+    } else {
+        /* No variable specified: clear all constraints */
+        for(int i = 0; i < 26; i++){
+            sv_free(&asmb->st.check_constraints[i]);
+            sv_init(&asmb->st.check_constraints[i]);
+        }
+    }
+    return 1;
+}
+
+/* Evaluate all registered .check constraints after a successful pattern match.
+ * Mirrors axx.py DirectiveProcessor.check_constraints_eval().
+ * Returns 1 if any constraint violated (error printed in pas==2/0), 0 if all OK. */
+static int dir_check_eval(Assembler *asmb){
+    AsmState *st = &asmb->st;
+    int violated = 0;
+    for(int vi = 0; vi < 26; vi++){
+        StrVec *cv = &st->check_constraints[vi];
+        if(cv->len == 0) continue;              /* no constraint for this var */
+        uint256_t val = st->vars[vi];
+        /* val must equal the value of at least one allowed symbol */
+        int ok = 0;
+        for(int si = 0; si < cv->len && !ok; si++){
+            uint256_t sym_val;
+            if(smap_get(&st->symbols, cv->data[si], &sym_val) && u256_eq(val, sym_val))
+                ok = 1;
+        }
+        if(!ok){
+            violated = 1;
+            if(st->pas == 2 || st->pas == 0){
+                char var_name[2]; var_name[0] = (char)('a' + vi); var_name[1] = '\0';
+                /* Build allowed symbol list for the error message */
+                char sym_list[1024]; sym_list[0] = '\0';
+                for(int si = 0; si < cv->len; si++){
+                    if(si > 0) strncat(sym_list, ", ", sizeof(sym_list)-strlen(sym_list)-1);
+                    strncat(sym_list, cv->data[si], sizeof(sym_list)-strlen(sym_list)-1);
+                }
+                fprintf(stderr,
+                    " error - .check: the value of variable '%s' is not any of [%s].  [%s:%d]\n",
+                    var_name, sym_list, st->current_file, st->ln);
+            }
+        }
+    }
+    return violated;
+}
+
 /* Fix 10 (axx.py): dir_error() now returns 1 when at least one condition
  * fired (triggered), 0 otherwise.  The caller uses this to skip makeobj()
  * when the .error directive raised an error, preventing bad object code from
@@ -4236,6 +4363,8 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         if(dir_symbolc(asmb,i)) continue;
         if(dir_epic(asmb,i)) continue;
         if(dir_vliwp(asmb,i)) continue;
+        if(dir_check(asmb,i)) continue;
+        if(dir_clrcheck(asmb,i)) continue;
 
         int lw=0; for(int fi=0;fi<PAT_FIELDS;fi++) if(i->f[fi][0]) lw++;
         if(lw==0) continue;
@@ -4290,7 +4419,11 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
             }
             /* Fix 10 (axx.py): only call makeobj when dir_error did NOT trigger.
              * Previously makeobj always ran even if an .error condition fired. */
+            /* .check 拘束条件の検証（プローブ完了後・makeobj 前）
+             * Mirrors axx.py: _check_violated = directive_proc.check_constraints_eval() */
+            int _check_violated = dir_check_eval(asmb);
             int err_triggered = dir_error(asmb,i->f[1]);
+            if(_check_violated) err_triggered = 1;
             if(!err_triggered){
                 /* pc_instr_start は上のプローブブロックで設定済み */
                 makeobj(asmb,i->f[2],objl_out);

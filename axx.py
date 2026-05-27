@@ -207,6 +207,14 @@ class AssemblerState:
         self.init_func: str | None = None
         self.fini_func: str | None = None
 
+        # .check 拘束条件テーブル。
+        # パターンファイルの `.check::x::sym1,sym2,...` で登録される。
+        # {変数名(小文字1文字) → 許可シンボル名リスト(大文字正規化)} の辞書。
+        # マッチ成功後・makeobj 前に検証し、変数値が許可リスト中の
+        # いずれかのシンボル値と一致しない場合はエラーを出力してコード生成を抑止する。
+        # `.clrcheck::x` で当該変数の拘束を解除（引数省略時は全解除）。
+        self.check_constraints: dict = {}  # {str: list[str]}
+
 
 
 class StringUtils:
@@ -2222,10 +2230,12 @@ class BinaryWriter:
 class DirectiveProcessor:
     """Processes assembler directives"""
     
-    def __init__(self, state, expr_eval, binary_writer):
+    def __init__(self, state, expr_eval, binary_writer, symbol_manager=None, parser=None):
         self.state = state
         self.expr_eval = expr_eval
         self.binary_writer = binary_writer
+        self.symbol_manager = symbol_manager
+        self.parser = parser
     
     def add_avoiding_dup(self, l, e):
         """Add element to list avoiding duplicates"""
@@ -2446,6 +2456,417 @@ class DirectiveProcessor:
                 triggered = True
 
         return triggered, error_code
+
+    def check_processing(self, i):
+        """.check ディレクティブ (パターンファイル専用)。
+        書式: .check::var::sym1,sym2,...
+          var  : 小文字1文字の変数名（パターン中の !x などで捕捉される変数）。
+          sym* : シンボルテーブルに登録済みのシンボル名（カンマ区切り）。
+        マッチ成功後・makeobj 前に check_constraints_eval() が評価する。
+        変数 var の値がいずれのシンボル値とも一致しない場合はエラーを出力し、
+        コード生成を抑止する。同一変数に対して既に登録済みの拘束は上書きされる。
+        """
+        if len(i) == 0 or i[0] != '.check':
+            return False
+        if len(i) < 2 or not i[1].strip():
+            print(" error - .check: variable name is not specified.", file=sys.stderr)
+            return True
+        var = i[1].strip().lower()
+        if len(var) != 1 or var not in LOWER:
+            print(f" error - .check: variable should be a lower case letter ('{i[1]}').",
+                  file=sys.stderr)
+            return True
+        syms = []
+        if len(i) >= 3 and i[2]:
+            syms = [s.strip().upper() for s in i[2].split(',') if s.strip()]
+        self.state.check_constraints[var] = syms
+        return True
+
+    def clrcheck_processing(self, i):
+        """.clrcheck ディレクティブ (パターンファイル専用)。
+        書式: .clrcheck::var
+          var : 小文字1文字の変数名。省略時は全変数の拘束を解除する。
+        対象変数の .check 拘束をテーブルから削除する。
+        """
+        if len(i) == 0 or i[0] != '.clrcheck':
+            return False
+        if len(i) >= 2 and i[1].strip():
+            var = i[1].strip().lower()
+            if len(var) == 1 and var in LOWER:
+                self.state.check_constraints.pop(var, None)
+            else:
+                print(f" error - .clrcheck: variable should be a lower case letter ('{i[1]}').",
+                      file=sys.stderr)
+        else:
+            self.state.check_constraints.clear()
+        return True
+
+    def check_constraints_eval(self):
+        """パターンマッチ成功直後に登録済み .check 拘束を全て検証する。
+        1つでも拘束違反があれば pass2/対話モードでエラーを出力し True を返す。
+        呼び出し元は戻り値が True のとき makeobj をスキップする。
+        """
+        if not self.state.check_constraints:
+            return False
+        violated = False
+        _loc = f"  [{self.state.current_file}:{self.state.ln}]"
+        for var, syms in self.state.check_constraints.items():
+            if not syms:
+                continue
+            # 変数値を直接 state.vars から取得（VariableManager 経由でも同等）
+            val = self.state.vars[ord(var) - ord('a')]
+            # 許可値リスト: シンボルテーブル（大文字正規化済み）を参照
+            allowed = []
+            for sname in syms:
+                sv = self.state.symbols.get(sname, "")
+                if sv != "":
+                    allowed.append(sv)
+            # 1つでも一致すれば OK
+            if any(val == a for a in allowed):
+                continue
+            # 不一致 → エラー
+            if self.state.pas == 2 or self.state.pas == 0:
+                sym_list = ', '.join(syms)
+                print(f" error - .check: variable '{var}'={val} is not any of [{sym_list}]. {_loc}",
+                      file=sys.stderr)
+            violated = True
+        return violated
+    """Handles pattern matching for assembly instructions"""
+    
+    def __init__(self, state, expr_eval, var_manager, symbol_manager, parser):
+        self.state = state
+        self.expr_eval = expr_eval
+        self.var_manager = var_manager
+        self.symbol_manager = symbol_manager
+        self.parser = parser
+    
+    def remove_brackets(self, s, l):
+        """Remove specified bracket pairs.
+
+        修正3: 旧実装はネスト深度 (open_count) をグループIDとして使っていた。
+        これだと兄弟関係にある [[A]] [[B]] は両方 open_count==1 になり、
+        個別に指定できなかった。
+
+        修正後: OB を見るたびに単調増加するシリアル番号を割り当て、
+        スタックで対応する CB と紐付ける。
+        remove_brackets(t, [1,3]) は「シリアル1番と3番のグループを除去せよ」
+        という意味になり、どの兄弟でも正しく個別指定できる。
+        match0 が渡す l のシリアルは 1-origin の連番 (sl = [1,2,...,cnt]) なので
+        この変更と完全に対応している。
+        """
+        # --- シリアル番号と文字位置の対応表を構築 ---
+        serial = 0          # 次に割り当てるシリアル
+        stack = []          # (serial, open_pos) のスタック
+        bracket_pairs = {}  # serial -> (open_pos, close_pos)
+
+        for i, char in enumerate(s):
+            if char == OB:
+                serial += 1
+                stack.append((serial, i))
+            elif char == CB:
+                if stack:
+                    ser, open_pos = stack.pop()
+                    bracket_pairs[ser] = (open_pos, i)
+
+        # --- l に含まれるシリアルのグループを除去 ---
+        result = list(s)
+        for index in l:
+            if index in bracket_pairs:
+                start_pos, end_pos = bracket_pairs[index]
+                for j in range(start_pos, end_pos + 1):
+                    result[j] = ''
+
+        return ''.join(result)
+    
+    def match(self, s, t):
+        """Match assembly line against pattern"""
+        self.state.deb1 = s
+        self.state.deb2 = t
+        
+        t = t.replace(OB, '').replace(CB, '')
+        idx_s = 0
+        idx_t = 0
+        idx_s = StringUtils.skipspc(s, idx_s)
+        idx_t = StringUtils.skipspc(t, idx_t)
+        s += chr(0)
+        t += chr(0)
+        
+        while True:
+            idx_s = StringUtils.skipspc(s, idx_s)
+            idx_t = StringUtils.skipspc(t, idx_t)
+            b = s[idx_s]
+            a = t[idx_t]
+            
+            if a == chr(0) and b == chr(0):
+                return True
+            
+            if a == '\\':
+                idx_t += 1
+                if idx_t < len(t) and t[idx_t] == b:
+                    idx_t += 1
+                    idx_s += 1
+                    continue
+                else:
+                    return False
+            elif a in CAPITAL:   # Fix: isupper() はUnicode大文字も含むため CAPITAL で限定
+                if a == b.upper():
+                    idx_s += 1
+                    idx_t += 1
+                    continue
+                else:
+                    return False
+            elif a == '!':
+                idx_t += 1
+                # Fix 1: パターンが '!' で終端している場合の IndexError を防ぐ
+                if idx_t >= len(t):
+                    return False
+                a = t[idx_t]
+                idx_t += 1
+                # Fix 1b: '!' の直後が NUL（番兵）や無効文字の場合は不正パターン
+                # a が chr(0) のまま else 分岐に流れると番兵を消費してループが壊れる
+                if a == chr(0):
+                    return False
+                if a == 'F':
+                    # Fix 2a: !F の変数名取得前に境界チェック
+                    if idx_t >= len(t):
+                        return False
+                    a = t[idx_t]
+                    # Fix 2a-2: 変数名が NUL または無効文字なら不正パターン
+                    if a == chr(0) or a not in LOWER:
+                        return False
+                    idx_t = StringUtils.skipspc(t, idx_t+1)
+                    if idx_t < len(t) and t[idx_t] == '\\':
+                        idx_t += 1                                    # skip '\'
+                        stopchar = t[idx_t] if idx_t < len(t) else chr(0)
+                        idx_t += 1                                    # skip stopchar in pattern
+                    else:
+                        stopchar = chr(0)
+
+                    # Fix: expression_esc_float が例外を投げても _elf_capturing_var が
+                    # True のまま残らないよう try/finally でリセットを保証する。
+                    # !F は整数キャプチャではないのでキャプチャ変数は設定不要だが、
+                    # 将来の変更に備えて他ブランチと対称なパターンにしておく。
+                    try:
+                        v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+                    finally:
+                        self.state._elf_capturing_var = None
+                    # Fix: UNDEF や非有限値が渡ると float() や struct.pack で
+                    # OverflowError / struct.error が発生する。安全に 0 にフォールバック。
+                    try:
+                        v = float(v)
+                        v = int.from_bytes(struct.pack('>f', v), "big")
+                    except (OverflowError, ValueError, struct.error):
+                        if self.state.pas == 2 or self.state.pas == 0:
+                            print(f" error - !F: cannot convert value to float32; using 0.")
+                        v = 0
+                    self.var_manager.put(a, v)
+                    # consume stopchar from source as well
+                    if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
+                        idx_s += 1
+                    continue
+                elif a == 'D':
+                    # Fix 2b: !D の変数名取得前に境界チェック
+                    if idx_t >= len(t):
+                        return False
+                    a = t[idx_t]
+                    # Fix 2b-2: 変数名が NUL または無効文字なら不正パターン
+                    if a == chr(0) or a not in LOWER:
+                        return False
+                    idx_t = StringUtils.skipspc(t, idx_t+1)
+                    if idx_t < len(t) and t[idx_t] == '\\':
+                        idx_t += 1                                    # skip '\'
+                        stopchar = t[idx_t] if idx_t < len(t) else chr(0)
+                        idx_t += 1                                    # skip stopchar in pattern
+                    else:
+                        stopchar = chr(0)
+
+                    # Fix: expression_esc_float が例外を投げても _elf_capturing_var が
+                    # True のまま残らないよう try/finally でリセットを保証する。
+                    try:
+                        v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+                    finally:
+                        self.state._elf_capturing_var = None
+                    # Fix: UNDEF や非有限値が渡ると float() や struct.pack で
+                    # OverflowError / struct.error が発生する。安全に 0 にフォールバック。
+                    try:
+                        v = float(v)
+                        v = int.from_bytes(struct.pack('>d', v), "big")
+                    except (OverflowError, ValueError, struct.error):
+                        if self.state.pas == 2 or self.state.pas == 0:
+                            print(f" error - !D: cannot convert value to float64; using 0.")
+                        v = 0
+                    self.var_manager.put(a, v)
+                    # consume stopchar from source as well
+                    if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
+                        idx_s += 1
+                    continue
+                elif a == 'Q':
+                    # !Q<var> : ソースから浮動小数点式を読み取り、
+                    # IEEE754 128ビット(quad)整数ビットパターンとして変数に格納する
+                    # Fix 2c: !Q の変数名取得前に境界チェック
+                    if idx_t >= len(t):
+                        return False
+                    a = t[idx_t]
+                    # Fix 2c-2: 変数名が NUL または無効文字なら不正パターン
+                    if a == chr(0) or a not in LOWER:
+                        return False
+                    idx_t = StringUtils.skipspc(t, idx_t+1)
+                    if idx_t < len(t) and t[idx_t] == '\\':
+                        idx_t += 1                                    # skip '\'
+                        stopchar = t[idx_t] if idx_t < len(t) else chr(0)
+                        idx_t += 1                                    # skip stopchar in pattern
+                    else:
+                        stopchar = chr(0)
+
+                    # ソーステキストの開始位置を記録
+                    idx_s_q_start = idx_s
+
+                    # float モードで式の終端位置を検出
+                    # Fix: expression_esc_float が例外を投げても _elf_capturing_var が残留しないよう
+                    # try/finally で確実に None に戻す。
+                    try:
+                        v, idx_s_after = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
+                    finally:
+                        self.state._elf_capturing_var = None
+
+                    # stopchar 手前までのソーステキストを抽出
+                    raw_text = s[idx_s_q_start:idx_s_after]
+                    # stopchar が末尾に含まれていれば除去
+                    if stopchar != chr(0) and raw_text.endswith(stopchar):
+                        raw_text = raw_text[:-1]
+                    raw_text = raw_text.strip()
+
+                    # qad{...} ラッパーを剥がす（!Q qad{3.14*2+1} と書かれた場合）
+                    if raw_text.startswith('qad{') and raw_text.endswith('}'):
+                        raw_text = raw_text[4:-1].strip()
+
+                    try:
+                        h = IEEE754Converter.decimal_eval_expr(raw_text)
+                    except (ValueError, ZeroDivisionError):
+                        # Decimal 評価不能（ラベル参照など）。
+                        # v は expression_esc_float の戻り値（Python int か float）。
+                        # ・整数値 → Decimal(int) で完全精度（ラベルアドレスは整数なので典型的にこちら）
+                        # ・float 値 → repr() で53bit分の最大桁数を使用（精度損失は避けられない）
+                        if isinstance(v, int) or (
+                                isinstance(v, float) and v.is_integer()):
+                            h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
+                                    str(int(v)))
+                        else:
+                            h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
+                                    repr(float(v)))
+
+                    x = int(h, 16)
+                    self.var_manager.put(a, x)
+                    idx_s = idx_s_after
+                    # consume stopchar from source as well
+                    if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
+                        idx_s += 1
+                    continue
+                elif a == '!':
+                    # Fix 2d: !! の変数名取得前に境界チェック
+                    if idx_t >= len(t):
+                        return False
+                    a = t[idx_t]
+                    # Fix 2d-2: 変数名が NUL または無効文字なら不正パターン
+                    if a == chr(0) or a not in LOWER:
+                        return False
+                    idx_t += 1
+                    # ELF追跡: !!a（factor キャプチャ）
+                    # Fix: factor() が例外を投げても _elf_capturing_var が残留しないよう
+                    # try/finally で確実に None に戻す。
+                    self.state._elf_capturing_var = a
+                    try:
+                        v, idx_s = self.expr_eval.factor(s, idx_s)
+                    finally:
+                        self.state._elf_capturing_var = None
+                    self.var_manager.put(a, v)
+                    continue
+                else:
+                    # Fix 1c: else 分岐の変数名 a も NUL/無効文字チェック
+                    # （'!' の直後に stopchar指定なし の通常キャプチャ）
+                    if a == chr(0) or a not in LOWER:
+                        return False
+                    idx_t = StringUtils.skipspc(t, idx_t)
+                    if idx_t < len(t) and t[idx_t] == '\\':
+                        idx_t += 1                                    # skip '\'
+                        stopchar = t[idx_t] if idx_t < len(t) else chr(0)
+                        idx_t += 1                                    # skip stopchar in pattern
+                    else:
+                        stopchar = chr(0)
+
+                    # ELF追跡: !a（expression キャプチャ）
+                    # Fix: expression_esc() が例外を投げても _elf_capturing_var が残留しないよう
+                    # try/finally で確実に None に戻す。
+                    self.state._elf_capturing_var = a
+                    try:
+                        v, idx_s = self.expr_eval.expression_esc(s, idx_s, stopchar)
+                    finally:
+                        self.state._elf_capturing_var = None
+                    self.var_manager.put(a, v)
+                    # consume stopchar from source as well
+                    if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
+                        idx_s += 1
+                    continue
+            elif a in LOWER:
+                idx_t += 1
+                prev_idx_s = idx_s
+                w, idx_s = self.parser.get_symbol_word(s, idx_s)
+                v = self.symbol_manager.get(w)
+                if v == "":
+                    return False
+                # Fix 5 (new): get_symbol_word がソース位置を進めなかった場合
+                # （ソース側が空白やNULなど）、continue するとループが止まらなくなる。
+                # idx_s が変化しなければマッチ失敗として扱う。
+                if idx_s == prev_idx_s:
+                    return False
+                self.var_manager.put(a, v)
+                continue
+            elif a == b:
+                idx_t += 1
+                idx_s += 1
+                continue
+            else:
+                return False
+    
+    def match0(self, s, t):
+        """Match with optional bracket combinations.
+
+        各 match() 試行の前に vars をスナップショットし、
+        マッチ失敗した試行で書き込まれた変数値を必ずリストアする。
+        これにより、失敗した組み合わせの副作用が次の試行に持ち越されない。
+        """
+        t = t.replace('[[', OB).replace(']]', CB)
+        cnt = t.count(OB)
+        sl = [_ + 1 for _ in range(cnt)]
+
+        # Fix: cnt が大きいとき組み合わせ数は 2^cnt になり事実上無限ループになる。
+        # 現実のパターンファイルで [[]] が 20 を超えることはないため上限を設ける。
+        _MAX_OPT_GROUPS = 20
+        if cnt > _MAX_OPT_GROUPS:
+            if self.state.pas == 2 or self.state.pas == 0:
+                print(f" warning - pattern has {cnt} optional groups (max {_MAX_OPT_GROUPS}); "
+                      f"truncating to avoid combinatorial explosion.")
+            sl = sl[:_MAX_OPT_GROUPS]
+            cnt = _MAX_OPT_GROUPS
+
+        for i in range(len(sl) + 1):
+            ll = list(itertools.combinations(sl, i))
+            for j in ll:
+                lt = self.remove_brackets(t, list(j))
+                # マッチ前の vars を保存
+                saved_vars = self.state.vars[:]
+                # Fix ④ / Fix 8: ELF追跡状態も保存する。
+                # _elf_label_refs_seen はリスト全体コピーでなく長さだけ記録し、
+                # 失敗時は del [n:] でロールバック（term11と同方式でコピー負荷を削減）。
+                saved_refs_len = len(self.state._elf_label_refs_seen)
+                saved_v2l      = dict(self.state._elf_var_to_label)
+                if self.match(s, lt):
+                    return True
+                # 失敗 → vars と ELF 追跡状態をリストア
+                self.state.vars = saved_vars
+                del self.state._elf_label_refs_seen[saved_refs_len:]
+                self.state._elf_var_to_label = saved_v2l
+        return False
 
 
 class PatternMatcher:
@@ -2785,7 +3206,6 @@ class PatternMatcher:
                 del self.state._elf_label_refs_seen[saved_refs_len:]
                 self.state._elf_var_to_label = saved_v2l
         return False
-
 
 class PatternFileReader:
     """Reads and processes pattern files"""
@@ -3786,7 +4206,8 @@ class Assembler:
         self.expr_eval = ExpressionEvaluator(self.state, self.var_manager, 
                                             self.label_manager, self.symbol_manager, self.parser)
         self.binary_writer = BinaryWriter(self.state)
-        self.directive_proc = DirectiveProcessor(self.state, self.expr_eval, self.binary_writer)
+        self.directive_proc = DirectiveProcessor(self.state, self.expr_eval, self.binary_writer,
+                                                  self.symbol_manager, self.parser)
         self.pattern_matcher = PatternMatcher(self.state, self.expr_eval, self.var_manager, 
                                              self.symbol_manager, self.parser)
         self.pattern_reader = PatternFileReader(self.parser)
@@ -3927,6 +4348,8 @@ class Assembler:
             if self.directive_proc.symbolc(i): continue
             if self.directive_proc.epic(i): continue
             if self.directive_proc.vliwp(i): continue
+            if self.directive_proc.check_processing(i): continue
+            if self.directive_proc.clrcheck_processing(i): continue
             
             lw = len([_ for _ in i if _])
             if lw == 0: continue
@@ -3975,7 +4398,11 @@ class Assembler:
                             self.state.error_undefined_label = False
                         # Fix 10: error() の戻り値でエラー発生を検知し、
                         # エラー時はオブジェクト生成をスキップする。
+                        # .check 拘束条件の検証（プローブ完了後・makeobj 前）
+                        _check_violated = self.directive_proc.check_constraints_eval()
                         err_triggered, _err_code = self.directive_proc.error(i[1])
+                        if _check_violated:
+                            err_triggered = True
                         if not err_triggered:
                             # pc_instr_start は上のプローブブロックで設定済み
                             objl = self.obj_gen.makeobj(i[2])
@@ -4057,7 +4484,11 @@ class Assembler:
                         self.state._elf_current_word_idx = _probe_widx_saved_d
                         self.state.error_undefined_label = False
                     # Fix 10: error() の戻り値でエラー発生を検知する（デバッグモード）
+                    # .check 拘束条件の検証（プローブ完了後・makeobj 前）
+                    _check_violated_dbg = self.directive_proc.check_constraints_eval()
                     err_triggered, _err_code = self.directive_proc.error(i[1])
+                    if _check_violated_dbg:
+                        err_triggered = True
                     if not err_triggered:
                         # pc_instr_start は上のプローブブロックで設定済み
                         objl = self.obj_gen.makeobj(i[2])
