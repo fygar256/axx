@@ -504,13 +504,10 @@ Use the prefix `0x` for hexadecimal numbers.
 
 #### reserve
 
-Each reserves n words. Simply increment the location counter by n*size.
+Each reserves n bytes. Simply increment the location counter by n.
 
 ```
 .resb n ; reserve n bytes
-.resw n ; reserve n words
-.resd n ; reserve n double words
-.resq n ; reserve n quadruple words
 ```
 
 #### export
