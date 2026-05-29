@@ -8,7 +8,7 @@
      SSE4.2: CRC32 (64/32/8bit src)
      RDRAND / RDSEED (64/32/16bit)
      MOVBE (load/store, 64/32bit)
-     SIB scale=1: [b+r*1] 全パターン
+     SIB scale=1: [b+r] 全パターン
      ALU store方向: ADD/SUB/AND/OR/XOR [b+r*scale],s
 
    アドレッシングモード一覧:
