@@ -815,7 +815,7 @@ $ axx.py test.axx test.s
 
 * Creating axx pattern files is difficult with a large ISA, and since the specifications are fixed, I hope that AI can handle this. While assemblers were originally created to make machine code easier for humans to understand, in today's world where AI writes code, a generalized assembler for both assembly language and computers would be beneficial.
 
-* I disliked the massive, complex, and existential nature of LLVM, so I aimed for a simple, beautiful, and essential structure. However, due to circumstances, I used AI too much in the coding, resulting in complex code. I regret this. Is this how programming is these days? Even so, I believe the purity of the design philosophy remains.
+* I don' like the massive, complex, and existential nature of LLVM, so I aimed for a simple, beautiful, and essential structure. However, due to circumstances, I used AI too much in the coding, resulting in complex code. I regret this. Is this how programming is these days? Even so, I believe the purity of the design philosophy remains.
 
 
 ### Unimplemented Items
