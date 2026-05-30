@@ -1,3 +1,4 @@
+There are some lacks in x86_64.axx still.
 完成しました。セグメントアドレッシングとEVEXを除いたカバー版 x86_64.axx です。
 
 収録内容まとめ
