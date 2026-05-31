@@ -4,7 +4,6 @@ tags: Terminal Python general assembler
 author: fygar256
 slide: false
 ---
-GENERAL ASSEMBLER 'axx.py'
 
 C version is also available. C version is nameded Caxx. Caxx is much faster than Paxx.
 
@@ -26,13 +25,13 @@ GitHub: https://github.com/fygar256/axx_relocatable_elf_generation
 
 https://github.com/fygar256/brainfuck_interpreter_for_axx_on_freebsd_of_x86_64
 
----
-title: Generalized Assembler 'axx General Assembler'
-tags: Terminal Python general assembler
-author: fygar256
-slide: false
----
-GENERAL ASSEMBLER 'axx.py'
+# Pattern file for practical use
+
+x86_64.axx, z80.axx, 8048.axx
+
+the other pattern files are for tests.
+
+# GENERAL ASSEMBLER 'axx.py'
 
 Since it's written in Python, the nickname is Paxx. axx is an abbreviation for 'Arbitrary eXtended X(cross) assembler'. It also means that 'AXX' was created by superimposing X, which is an unknown CPU, onto 'ASM'.
 
