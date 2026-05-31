@@ -1,8 +1,7 @@
 /* ========================================
-   x86_64 完全パターンファイル for axx  v6.0
+   x86_64 完全パターンファイル for axx  v7.0
    全アドレッシングモード対応版
 
-   追加 (v6.0):
      SSE3: ADDSUBPD/PS, HADDPD/PS, HSUBPD/PS, MOVDDUP,
            MOVSLDUP, MOVSHDUP, LDDQU, MONITOR, MWAIT
      SSE4.2: CRC32 (64/32/8bit src)
