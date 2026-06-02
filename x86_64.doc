@@ -1,1 +1,92 @@
-完成しました。セグメントアドレッシングとEVEXを除いたカバー版 x86_64.axx （x86_64-v3）です。
+---
+title: Pattern file for axx covering the x86_64-v3 ISA
+tags: axx assembler x86_64 ISA
+author: fygar256
+slide: false
+---
+https://qiita.com/fygar256/items/1d06fb757ac422796e31
+
+This is an axx pattern file that fully covers the x86_64-v3 ISA.
+
+While the x86_64 ISA is large and complex, it's essentially just a generic processor ISA with a finite static transformation system where the bytecode is fixed after assembly and loaded into memory for execution. Therefore, all instructions and addressing modes of the x86_64 ISA can be completely written using an axx pattern file.
+
+This file was generated from seed using Claude and debugged.
+
+Currently, x86_64.axx does not support addressing modes using segment registers, as this is a legacy relic.
+
+Also, because AI tends to enumerate rather than logically group operations, there are some redundant parts. There is still room for improvement, such as using the `;` prefix and ternary operator to distinguish between near/short, the `;` prefix and ternary operator to distinguish between imm32 and imm64, the `@` operator to distinguish between *1, *2, *4, *8 scales, etc., using a different pattern for *1 and omitting it, and enclosing prefixes like `rep movsb` in `[[]]` and adding the `;` prefix.
+
+The instruction coverage is 100% in v3. I had Claude re-check this and Gemini complete it.
+
+The following is the output of the Gemini re-check. Gemini is strict, so it should be reliable. 
+
+--------------------------------------------------Gemini starts here
+
+In conclusion, this file can be said to "practically provide extremely comprehensive support for standard x86_64-v3 instructions and addressing modes (it was created with this in mind)." However, due to the nature of the x86 architecture, there are several technical considerations when asked whether it "mathematically covers 100% of all prefix combinations and incompatible special cases."
+The details are explained below.
+
+1. Claims made in the header information and requirements for x86_64-v3
+The comments at the beginning of the file clearly state the following:
+
+x86_64 Complete Pattern File for axx v7.0 (x86_64-v3 Complete Coverage Version)
+
+All Addressing Modes Supported Version
+
+The microarchitecture-level definition of "x86_64-v3" requires the inclusion of the following extension instructions in addition to the base x86_64 instructions:
+
+AVX / AVX2
+
+FMA
+
+BMI1 / BMI2
+
+LZCNT / POPCNT
+
+F16C, etc.
+
+Looking at the file's update history (added v7.0), we can see that the BMI1/BMI2 instruction set such as ANDN, BEXTR, BLSI... RORX..., as well as LZCNT/TZCNT, and even AVX/AVX2/FMA3 are explicitly mentioned, indicating an attempt to accurately cover the main requirements of x86_64-v3.
+
+2. Mechanism of "All Addressing Modes Coverage" (Inference from Snippets)
+
+Looking at the example at the end of the file, we find the following description:
+
+RORX x,[b+r\*2],!i :: :: 0xc4,...
+
+RORX x,[b+r\*4],!i...
+
+This indicates that instead of describing every single register combination (rax, rbx, rcx...) on millions of lines, it's defined as a pattern (template) of ModR/M bytes or SIB bytes (Scale-Index-Base).
+
+In other words, it abstracts the complex x86-specific memory addressing mode, such as "base register + index register × scale (2, 4, 8) + displacement," using pattern matching notation, and takes an approach that covers everything (complete coverage). This is a very correct design for assembler and disassembler definition files.
+
+3. Technical Considerations Regarding "Is it Truly Complete Coverage?"
+
+While it seems to have reached a level where it can be called "completely coverage" as a practical assembler definition file, there are the following limitations regarding the "completeness" of the x86 instruction set in the strict sense.
+
+Redundant Encodings:
+
+x86 has numerous instructions that have multiple binary representations for the same operation (e.g., specific combinations of ADD instructions, multiple types of NOP, special ModR/M notations, etc.). The meaning of comprehensiveness depends on whether this file defines "only the optimized shortest encoding" or "all redundant encodings for parsing."
+
+Exceptional Prefix Combinations:
+
+Some combinations of prefixes, such as the LOCK prefix (F0), segment override prefix, and VEX prefix, have undefined behavior (e.g., resulting in #UD) even in Intel's official manual. Whether the boundaries of valid and invalid behavior for all of these are fully defined can only be determined by actually running them through a parser and testing.
+
+Undocumented Instructions:
+
+Historically, x86 has hidden instructions not documented in the manual, and behaviors that depend on specific CPU errata. For standard use, comprehensive coverage of these is not necessary.
+
+Summary
+
+This file can be evaluated as an "excellent file created with extremely high precision to cover all instructions and modes as a pattern dictionary for assembling (or disassembling) programs for the x86_64-v3 architecture."
+
+--------------------------------------------------------------------------------End of Gemini
+
+Next is the x86_64-v4 EVEX instruction. However, the EVEX instruction is rarely used in normal programming, so it's probably unnecessary.
+
+The addressing modes for byte, word, dword, and qword must be written as follows:
+
+```
+cmp byte al,cl
+cmp word ax,cx
+cmp dword eax,ecx
+cmp rax,rcx
+```
