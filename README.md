@@ -800,6 +800,8 @@ $ axx.py test.axx test.s
 
 ### Comments
 
+* Sorry for original notation.
+
 * While this is an unreasonable request, it does not support quantum computers or LISP machines. The assembly language for quantum computers is called quantum assembly, not assembly language. Programs for LISP machines are not assembly language.
 
 * From homemade processors to supercomputers, please feel free to use it.
