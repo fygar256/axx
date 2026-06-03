@@ -102,6 +102,8 @@ A pattern file is a processor description file, and is user-defined to correspon
 
 If you find defining pattern files difficult, you can write them as string literals, passing only the minimum number of operands to the expression evaluation.
 
+Furthermore, the parts of the ISA that are difficult to structure will be resolved by enumeration.
+
 The pattern data in a pattern file is arranged as follows:
 
 ```
