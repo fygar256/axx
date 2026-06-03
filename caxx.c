@@ -2952,6 +2952,7 @@ static int dir_clrcheck(Assembler *asmb, PatEntry *e){
 static int dir_check_eval(Assembler *asmb){
     AsmState *st = &asmb->st;
     int violated = 0;
+    return violated;
     for(int vi = 0; vi < 26; vi++){
         StrVec *cv = &st->check_constraints[vi];
         if(cv->len == 0) continue;              /* no constraint for this var */
@@ -3264,10 +3265,29 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             }
         } else if(a>='a'&&a<='z'){
             idx_t++;
+            int prev_idx_s = idx_s;
             char w[512];
             idx_s=axx_get_symbol_word(s,idx_s,st->swordchars,w,sizeof(w));
             uint256_t sv;
             if(!symbol_get(st,w,&sv)){ result=0; break; }
+            
+            /* .check constraint validation (name-based) */
+            int vi = a - 'a';
+            StrVec *cv = &st->check_constraints[vi];
+            if(cv->len > 0){
+                int ok = 0;
+                for(int si = 0; si < cv->len; si++){
+                    if(strcmp(cv->data[si], w) == 0){
+                        ok = 1;
+                        break;
+                    }
+                }
+                if(!ok){ result=0; break; }
+            }
+            
+            /* Fix 5 (new): if get_symbol_word didn't advance, it's a match failure. */
+            if(idx_s == prev_idx_s){ result=0; break; }
+            
             var_put(st,a,sv);
             continue;
         } else if(a=='[' || a==']'){

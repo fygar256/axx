@@ -2517,6 +2517,7 @@ class DirectiveProcessor:
                 continue
             # 変数値を直接 state.vars から取得（VariableManager 経由でも同等）
             val = self.state.vars[ord(var) - ord('a')]
+            print("###",var,val,"###")
             # 許可値リスト: シンボルテーブル（大文字正規化済み）を参照
             allowed = []
             for sname in syms:
@@ -2819,6 +2820,8 @@ class PatternMatcher:
                 w, idx_s = self.parser.get_symbol_word(s, idx_s)
                 v = self.symbol_manager.get(w)
                 if v == "":
+                    return False
+                if a in self.state.check_constraints and w not in self.state.check_constraints[a]:
                     return False
                 # Fix 5 (new): get_symbol_word がソース位置を進めなかった場合
                 # （ソース側が空白やNULなど）、continue するとループが止まらなくなる。
@@ -4066,7 +4069,8 @@ class Assembler:
                         # Fix 10: error() の戻り値でエラー発生を検知し、
                         # エラー時はオブジェクト生成をスキップする。
                         # .check 拘束条件の検証（プローブ完了後・makeobj 前）
-                        _check_violated = self.directive_proc.check_constraints_eval()
+                        _check_violated = False
+                        ###_check_violated = self.directive_proc.check_constraints_eval()
                         err_triggered, _err_code = self.directive_proc.error(i[1])
                         if _check_violated:
                             err_triggered = True
@@ -4152,7 +4156,8 @@ class Assembler:
                         self.state.error_undefined_label = False
                     # Fix 10: error() の戻り値でエラー発生を検知する（デバッグモード）
                     # .check 拘束条件の検証（プローブ完了後・makeobj 前）
-                    _check_violated_dbg = self.directive_proc.check_constraints_eval()
+                    _check_violated_dbg = False
+                    ###_check_violated_dbg = self.directive_proc.check_constraints_eval()
                     err_triggered, _err_code = self.directive_proc.error(i[1])
                     if _check_violated_dbg:
                         err_triggered = True
