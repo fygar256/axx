@@ -3380,8 +3380,13 @@ class AssemblyDirectiveProcessor:
                         print(f" warning - unknown reloctype '{rt_str}' in .EQU", file=sys.stderr)
 
                 self.state.error_undefined_label = False
-                u, _ = self.expr_eval.expression_asm(expr_part, 0)
-                # reloc_type=None のとき put_value() はリロケーション情報を記録しない。
+                saved_mode = self.state._pass1_size_mode
+                if self.state.pas == 1:
+                    self.state._pass1_size_mode = True
+                try:
+                    u, _ = self.expr_eval.expression_asm(expr_part, 0)
+                finally:
+                    self.state._pass1_size_mode = saved_mode
                 ok = self.label_manager.put_value(label, u, self.state.current_section, is_equ=True, reloc_type=reloc_type)
                 return ""
             else:
