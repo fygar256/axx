@@ -5795,26 +5795,29 @@ int main(int argc, char *argv[]){
                      * Bug修正: 旧コードの case 16 は R_X86_64_DTPMOD64 であり \
                      * "rel32" とは無関係。削除し、欠落していた全型を追加する。 */ \
                     const char *_rtype_sfx=""; \
-                    LabelEntry *_full=lmap_find(&st->labels,e->key); \
-                    if(_full && _full->reloc_type_override>=0){ \
-                        switch(_full->reloc_type_override){ \
-                            /* 絶対リロケーション */ \
-                            case  1: _rtype_sfx="::abs64";    break; /* R_X86_64_64  */ \
-                            case 10: _rtype_sfx="::abs32";    break; /* R_X86_64_32  */ \
-                            case 11: _rtype_sfx="::abs32s";   break; /* R_X86_64_32S */ \
-                            case 12: _rtype_sfx="::abs16";    break; /* R_X86_64_16  */ \
-                            case 14: _rtype_sfx="::abs8";     break; /* R_X86_64_8   */ \
-                            /* PC相対リロケーション */ \
-                            case  2: _rtype_sfx="::pc32";     break; /* R_X86_64_PC32    */ \
-                            case  4: _rtype_sfx="::plt32";    break; /* R_X86_64_PLT32   */ \
-                            case 13: _rtype_sfx="::pc16";     break; /* R_X86_64_PC16    */ \
-                            case 15: _rtype_sfx="::pc8";      break; /* R_X86_64_PC8     */ \
-                            case 24: _rtype_sfx="::pc64";     break; /* R_X86_64_PC64    */ \
-                            /* GOT相対リロケーション */ \
-                            case  3: _rtype_sfx="::got32";    break; /* R_X86_64_GOT32   */ \
-                            case  9: _rtype_sfx="::gotpcrel"; break; /* R_X86_64_GOTPCREL*/ \
-                            case 27: _rtype_sfx="::got64";    break; /* R_X86_64_GOT64   */ \
-                            default: _rtype_sfx=""; break; \
+                    /* elf_==1 の場合のみリロケーション情報を付加する */ \
+                    if(elf_){ \
+                        LabelEntry *_full=lmap_find(&st->labels,e->key); \
+                        if(_full && _full->reloc_type_override>=0){ \
+                            switch(_full->reloc_type_override){ \
+                                /* 絶対リロケーション */ \
+                                case  1: _rtype_sfx="::abs64";    break; /* R_X86_64_64  */ \
+                                case 10: _rtype_sfx="::abs32";    break; /* R_X86_64_32  */ \
+                                case 11: _rtype_sfx="::abs32s";   break; /* R_X86_64_32S */ \
+                                case 12: _rtype_sfx="::abs16";    break; /* R_X86_64_16  */ \
+                                case 14: _rtype_sfx="::abs8";     break; /* R_X86_64_8   */ \
+                                /* PC相対リロケーション */ \
+                                case  2: _rtype_sfx="::pc32";     break; /* R_X86_64_PC32    */ \
+                                case  4: _rtype_sfx="::plt32";    break; /* R_X86_64_PLT32   */ \
+                                case 13: _rtype_sfx="::pc16";     break; /* R_X86_64_PC16    */ \
+                                case 15: _rtype_sfx="::pc8";      break; /* R_X86_64_PC8     */ \
+                                case 24: _rtype_sfx="::pc64";     break; /* R_X86_64_PC64    */ \
+                                /* GOT相対リロケーション */ \
+                                case  3: _rtype_sfx="::got32";    break; /* R_X86_64_GOT32   */ \
+                                case  9: _rtype_sfx="::gotpcrel"; break; /* R_X86_64_GOTPCREL*/ \
+                                case 27: _rtype_sfx="::got64";    break; /* R_X86_64_GOT64   */ \
+                                default: _rtype_sfx=""; break; \
+                            } \
                         } \
                     } \
                     fprintf(lf,"%s%s\t0x%llx\n",e->key,_rtype_sfx,lbl_addr); \
