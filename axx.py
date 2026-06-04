@@ -2464,9 +2464,6 @@ class DirectiveProcessor:
         書式: .check::var::sym1,sym2,...
           var  : 小文字1文字の変数名（パターン中の !x などで捕捉される変数）。
           sym* : シンボルテーブルに登録済みのシンボル名（カンマ区切り）。
-        マッチ成功後・makeobj 前に check_constraints_eval() が評価する。
-        変数 var の値がいずれのシンボル値とも一致しない場合はエラーを出力し、
-        コード生成を抑止する。同一変数に対して既に登録済みの拘束は上書きされる。
         """
         if len(i) == 0 or i[0] != '.check':
             return False
@@ -2502,40 +2499,6 @@ class DirectiveProcessor:
         else:
             self.state.check_constraints.clear()
         return True
-
-    def check_constraints_eval(self):
-        """パターンマッチ成功直後に登録済み .check 拘束を全て検証する。
-        1つでも拘束違反があれば pass2/対話モードでエラーを出力し True を返す。
-        呼び出し元は戻り値が True のとき makeobj をスキップする。
-        """
-        if not self.state.check_constraints:
-            return False
-        violated = False
-        _loc = f"  [{self.state.current_file}:{self.state.ln}]"
-        for var, syms in self.state.check_constraints.items():
-            if not syms:
-                continue
-            # 変数値を直接 state.vars から取得（VariableManager 経由でも同等）
-            val = self.state.vars[ord(var) - ord('a')]
-            print("###",var,val,"###")
-            # 許可値リスト: シンボルテーブル（大文字正規化済み）を参照
-            allowed = []
-            for sname in syms:
-                sv = self.state.symbols.get(sname, "")
-                if sv != "":
-                    allowed.append(sv)
-            # 1つでも一致すれば OK
-            if any(val == a for a in allowed):
-                continue
-            # 不一致 → エラー
-            if self.state.pas == 2 or self.state.pas == 0:
-                sym_list = ', '.join(syms)
-                print(f" error - .check: variable '{var}'={val} is not any of [{sym_list}]. {_loc}",
-                      file=sys.stderr)
-            violated = True
-        return violated
-
-
 
 class PatternMatcher:
     """Handles pattern matching for assembly instructions"""
@@ -4070,7 +4033,6 @@ class Assembler:
                         # エラー時はオブジェクト生成をスキップする。
                         # .check 拘束条件の検証（プローブ完了後・makeobj 前）
                         _check_violated = False
-                        ###_check_violated = self.directive_proc.check_constraints_eval()
                         err_triggered, _err_code = self.directive_proc.error(i[1])
                         if _check_violated:
                             err_triggered = True
@@ -4157,7 +4119,6 @@ class Assembler:
                     # Fix 10: error() の戻り値でエラー発生を検知する（デバッグモード）
                     # .check 拘束条件の検証（プローブ完了後・makeobj 前）
                     _check_violated_dbg = False
-                    ###_check_violated_dbg = self.directive_proc.check_constraints_eval()
                     err_triggered, _err_code = self.directive_proc.error(i[1])
                     if _check_violated_dbg:
                         err_triggered = True
@@ -5486,32 +5447,33 @@ class Assembler:
                         except (OverflowError, ValueError, TypeError):
                             lbl_addr = 0
                         
-                        # Fix: reloc_type_override を出力に含める
                         reloc_type_str = ''
-                        lentry = self.state.labels.get(i[0], [])
-                        if len(lentry) > 4 and lentry[4] is not None:
-                            # Reverse lookup: rtype value → name
-                            _RTYPE_REVERSE = {
-                                # 絶対リロケーション
-                                1:  'abs64',   # R_X86_64_64
-                                10: 'abs32',   # R_X86_64_32
-                                11: 'abs32s',  # R_X86_64_32S
-                                12: 'abs16',   # R_X86_64_16
-                                14: 'abs8',    # R_X86_64_8
-                                # PC相対リロケーション
-                                2:  'pc32',    # R_X86_64_PC32
-                                4:  'plt32',   # R_X86_64_PLT32
-                                13: 'pc16',    # R_X86_64_PC16
-                                15: 'pc8',     # R_X86_64_PC8
-                                24: 'pc64',    # R_X86_64_PC64
-                                # GOT相対リロケーション
-                                3:  'got32',   # R_X86_64_GOT32
-                                9:  'gotpcrel', # R_X86_64_GOTPCREL
-                                27: 'got64',   # R_X86_64_GOT64
-                            }
-                            reloc_type_str = _RTYPE_REVERSE.get(lentry[4], '')
-                            if reloc_type_str:
-                                reloc_type_str = f'::{reloc_type_str}'
+                        # elf=1 の場合のみリロケーション情報を付加する
+                        if elf == 1:
+                            lentry = self.state.labels.get(i[0], [])
+                            if len(lentry) > 4 and lentry[4] is not None:
+                                # Reverse lookup: rtype value → name
+                                _RTYPE_REVERSE = {
+                                    # 絶対リロケーション
+                                    1:  'abs64',   # R_X86_64_64
+                                    10: 'abs32',   # R_X86_64_32
+                                    11: 'abs32s',  # R_X86_64_32S
+                                    12: 'abs16',   # R_X86_64_16
+                                    14: 'abs8',    # R_X86_64_8
+                                    # PC相対リロケーション
+                                    2:  'pc32',    # R_X86_64_PC32
+                                    4:  'plt32',   # R_X86_64_PLT32
+                                    13: 'pc16',    # R_X86_64_PC16
+                                    15: 'pc8',     # R_X86_64_PC8
+                                    24: 'pc64',    # R_X86_64_PC64
+                                    # GOT相対リロケーション
+                                    3:  'got32',   # R_X86_64_GOT32
+                                    9:  'gotpcrel', # R_X86_64_GOTPCREL
+                                    27: 'got64',   # R_X86_64_GOT64
+                                }
+                                reloc_type_str = _RTYPE_REVERSE.get(lentry[4], '')
+                                if reloc_type_str:
+                                    reloc_type_str = f'::{reloc_type_str}'
                         
                         label_file.write(f"{i[0]}{reloc_type_str}\t{lbl_addr:#x}\n")
                 
