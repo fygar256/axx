@@ -3888,8 +3888,16 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
                 if(reloc_type < 0)
                     fprintf(stderr," warning - unknown reloctype '%s' in .EQU\n", rt_lc);
             }
-            /* Bug 7 fix: pass only the expression tail, not the full line */
-            uint256_t u = expr_expression_asm(asmb, expr_tail, 0, &io);
+
+            /* === ここが修正箇所：.equ 内の forward reference を pass1 で正しく扱う === */
+            uint256_t u;
+            int saved_mode = st->pass1_size_mode;
+            if(st->pas == 1)
+                st->pass1_size_mode = 1;   /* forward ref を 0 として扱う */
+            u = expr_expression_asm(asmb, expr_tail, 0, &io);
+            st->pass1_size_mode = saved_mode;
+            /* ====================================================================== */
+
             label_put_value(st,label,u,st->current_section,1,reloc_type);  /* is_equ=1 */
             out[0]=0; return out;
         } else {
