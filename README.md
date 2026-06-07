@@ -98,7 +98,7 @@ Relocatable object output works on FreeBSD, x86_64.
 
 ## Explanation of Pattern Files
 
-A pattern file is a processor description file, and is user-defined to correspond to individual processors. It is a kind of metalanguage for machine code and assembly language.
+A pattern file is a processor description file, and is user-defined to correspond to individual processors. It is a kind of metalanguage for machine code and assembly language. The DSL for pattern files is the basic ISADL (ISA Description Language).
 
 If you find defining pattern files difficult, you can write them as string literals, passing only the minimum number of operands to the expression evaluation.
 
