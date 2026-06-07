@@ -29,6 +29,8 @@ https://github.com/fygar256/brainfuck_interpreter_for_axx_on_freebsd_of_x86_64
 
 x86_64.axx, z80.axx, 8048.axx
 
+https://github.com/fygar256/x86_64_pattern_file_for_axx
+
 the other pattern files are for tests.
 
 # GENERAL ASSEMBLER 'axx.py'
