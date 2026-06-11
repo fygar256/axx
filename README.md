@@ -7,6 +7,10 @@ slide: false
 
 C version is also available. C version is nameded Caxx. Caxx is much faster than Paxx.
 
+caxx compile:
+
+`gcc caxx.c -o caxx -lm -O2`
+
 Paxx is newest version. Due to Paxx version upgrades, updates to caxx may be delayed.
 
 # Test environment
