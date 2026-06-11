@@ -96,6 +96,8 @@ expfile.tsv --- Section label information export file
 impfile.tsv --- Section label information import file
 object.o ---- ELF relocatable object file
 
+Currently, object file output is only available as a special solution for ELF64 for x86_64.
+
 Relocatable object output works on FreeBSD and Linux, x86_64.
 
 Usage:
