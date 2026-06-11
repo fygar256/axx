@@ -45,7 +45,7 @@ It extracts the essential commonalities of the von Neumann architecture, metamod
 
 # Test Environment
 
-FreeBSD terminal
+FreeBSD,Linux terminal
 
 # Text
 
@@ -96,7 +96,38 @@ expfile.tsv --- Section label information export file
 impfile.tsv --- Section label information import file
 object.o ---- ELF relocatable object file
 
-Relocatable object output works on FreeBSD, x86_64.
+Relocatable object output works on FreeBSD and Linux, x86_64.
+
+Usage:
+
+```
+usage: axx [-h] [--osabi {FreeBSD,Linux}] [-b OUTFILE] [-e EXPORT_TSV] [-E EXPORT_ELF_TSV] [-i IMPORT_TSV]
+           [-o OBJ_FILE] [-m MACHINE] [--dynamic] [--needed NEEDED] [-v] [-d] [-g]
+           patternfile [sourcefile]
+
+axx general assembler programmed and designed by Taisuke Maekawa
+
+positional arguments:
+  patternfile           Pattern definition file (.axx)
+  sourcefile            Assembly source file (.s). Omit for interactive mode.
+
+options:
+  -h, --help            show this help message and exit
+  --osabi {FreeBSD,Linux}
+                        ELF OSABI value (default: FreeBSD)
+  -b OUTFILE            Output binary file
+  -e EXPORT_TSV         Export labels to TSV file (plain format)
+  -E EXPORT_ELF_TSV     Export labels to TSV file (ELF section flags format)
+  -i IMPORT_TSV         Import labels from TSV file
+  -o OBJ_FILE           Write ELF64 relocatable object file (.o)
+  -m MACHINE            ELF e_machine value (default 62=EM_X86_64; 183=AArch64, 243=RISC-V, 3=i386, 20=PPC, 40=ARM)
+  --dynamic             Output as dynamic shared object (ET_DYN) with .dynamic, PLT/GOT etc.
+  --needed NEEDED       Add DT_NEEDED library (can be specified multiple times)
+  -v, --verbose         Verbose: print assembly listing to stdout (default: silent)
+  -d, --debug           Enable debug output (forward-ref fallback, relaxation log, etc.)
+  -g, --gen-debug       Generate DWARF debug information (.debug_info/.debug_abbrev/.debug_line) in the ELF object so
+                        that gdb/lldb can do source-level debugging. Effective only together with -o.
+```
 
 ## Explanation of Pattern Files
 
