@@ -842,6 +842,18 @@ typedef struct {
     char       elf_objfile[512];
     int        elf_machine;   /* default 62 = EM_X86_64 */
 
+    /* DWARF debug info generation (-g).
+     * When gen_debug && elf_objfile is set, write_elf_obj() emits
+     * .debug_abbrev / .debug_info / .debug_line (+ .rela.debug_*). */
+    int        gen_debug;
+    /* line_map: during pass2, for every assembly line that emits bytes we
+     * record (section, word_pc_at_line_start, file, line). It is the source
+     * data for the DWARF .debug_line line-number program. Reset at pass2
+     * start; section/file strings are strdup'd and freed in run(). */
+    struct { char *section; uint64_t word_pc; char *file; int line; } *line_map;
+    int        line_map_len;
+    int        line_map_cap;
+
     /* ELF relocation tracking (active during pass2 when elf_objfile is set) */
     int        elf_tracking;                /* 1 while assembling one instruction */
     /* dynamic array of refs seen in current insn: (name, val, word_idx)
@@ -936,6 +948,10 @@ static void state_init(AsmState *st) {
     st->expfile_elf[0] = '\0';
     st->elf_objfile[0] = '\0';
     st->elf_machine = 62;
+    st->gen_debug = 0;
+    st->line_map = NULL;
+    st->line_map_len = 0;
+    st->line_map_cap = 0;
     st->elf_tracking = 0;
     st->elf_refs = NULL;
     st->elf_refs_len = 0;
@@ -4870,6 +4886,24 @@ static int lineassemble(Assembler *asmb, const char *line_in){
             #undef RTYPE_FOR
         }
 
+        /* DWARF .debug_line: record (section, word_pc, file, line) for every
+         * byte-producing line during pass2. The VLIW branch below is excluded
+         * (instruction/byte boundaries are not 1:1 there). st->ln is the line
+         * currently being assembled (lineassemble0 increments it afterwards). */
+        if(st->gen_debug && st->pas==2 && objl.len>0){
+            if(st->line_map_len >= st->line_map_cap){
+                st->line_map_cap = st->line_map_cap ? st->line_map_cap*2 : 64;
+                st->line_map = realloc(st->line_map,
+                    (size_t)st->line_map_cap * sizeof(st->line_map[0]));
+                if(!st->line_map){ perror("realloc"); exit(1); }
+            }
+            st->line_map[st->line_map_len].section = strdup(st->current_section);
+            st->line_map[st->line_map_len].word_pc = u256_to_u64(st->pc);
+            st->line_map[st->line_map_len].file    = strdup(st->current_file);
+            st->line_map[st->line_map_len].line    = (int)st->ln;
+            st->line_map_len++;
+        }
+
         for(int ci=0;ci<objl.len;ci++){
             outbin(st,st->pc,objl.data[ci]);
             st->pc=u256_add(st->pc,u256_one());
@@ -5177,6 +5211,194 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         rela_bufs[ri2]=rb; rela_szs[ri2]=rbs;
     }
 
+    /* ---- 5b. build DWARF debug sections (-g) ----
+     * Mirrors the axx.py _build_dwarf_sections() port:
+     *   dbg_prog : SHT_PROGBITS  .debug_abbrev / .debug_info / .debug_line
+     *   dbg_rela : SHT_RELA      .rela.debug_info / .rela.debug_line
+     * Debug sections are appended AFTER .shstrtab so e_shstrndx / .symtab /
+     * .strtab indices are unchanged. Addresses are 8 bytes and relocated
+     * against the content section symbol (sym index == content index),
+     * carrying the in-section byte offset as the addend. Single CU, so
+     * DW_AT_stmt_list and abbrev_offset are 0 (no relocation needed).
+     * Strings are inline (DW_FORM_string), so no .debug_str is required. */
+    typedef struct { const char *name; uint8_t *data; size_t len; } DSEC;
+    typedef struct { const char *name; int target; uint8_t *data; size_t len; } DREL;
+    DSEC dbg_prog[3]; int n_dbg_prog=0;
+    DREL dbg_rela[2]; int n_dbg_rela=0;
+    for(int _i=0;_i<3;_i++){ dbg_prog[_i]=(DSEC){NULL,NULL,0}; }
+    for(int _i=0;_i<2;_i++){ dbg_rela[_i]=(DREL){NULL,0,NULL,0}; }
+
+    if(st->gen_debug && st->line_map_len>0){
+        /* growable raw byte buffer */
+        typedef struct { uint8_t*b; size_t len,cap; } RB;
+        void rb_init(RB*r){ r->b=malloc(64); r->len=0; r->cap=64; if(!r->b){perror("malloc");exit(1);} }
+        void rb_need(RB*r,size_t n){ while(r->len+n>r->cap){ r->cap*=2; r->b=realloc(r->b,r->cap); if(!r->b){perror("realloc");exit(1);} } }
+        void rb_u8(RB*r,uint8_t v){ rb_need(r,1); r->b[r->len++]=v; }
+        void rb_app(RB*r,const void*s,size_t n){ rb_need(r,n); memcpy(r->b+r->len,s,n); r->len+=n; }
+        void rb_cstr(RB*r,const char*s){ rb_app(r,s,strlen(s)+1); }
+        void rb_uleb(RB*r,uint64_t v){ for(;;){ uint8_t b=(uint8_t)(v&0x7f); v>>=7; if(v) rb_u8(r,(uint8_t)(b|0x80)); else { rb_u8(r,b); break; } } }
+        void rb_sleb(RB*r,int64_t v){ for(;;){ uint8_t b=(uint8_t)(v&0x7f); v>>=7; if((v==0&&!(b&0x40))||(v==-1&&(b&0x40))){ rb_u8(r,b); break; } else rb_u8(r,(uint8_t)(b|0x80)); } }
+        void rb_w2(RB*r,uint16_t v){ uint8_t t[2]; WEO_W2(t,v); rb_app(r,t,2); }
+        void rb_w4(RB*r,uint32_t v){ uint8_t t[4]; WEO_W4(t,v); rb_app(r,t,4); }
+        void rb_w8(RB*r,uint64_t v){ uint8_t t[8]; WEO_W8(t,v); rb_app(r,t,8); }
+
+        /* relocation accumulator for debug sections */
+        typedef struct { uint64_t off; int sym; int rtype; int64_t addend; } DRE;
+        typedef struct { DRE*d; int len,cap; } DRV;
+        void drv_add(DRV*v,uint64_t off,int sym,int rtype,int64_t add){
+            if(v->len>=v->cap){ v->cap=v->cap?v->cap*2:8; v->d=realloc(v->d,(size_t)v->cap*sizeof(DRE)); if(!v->d){perror("realloc");exit(1);} }
+            v->d[v->len++]=(DRE){off,sym,rtype,add};
+        }
+
+        /* 64-bit absolute relocation type per arch (R_<arch>_64 semantics) */
+        int abs64 = (machine==183)?257 : (machine==243)?2 : 1; /* aarch64 / riscv / else(x86_64) */
+
+        /* ---- .debug_abbrev ---- */
+        RB abv; rb_init(&abv);
+        rb_uleb(&abv,1); rb_uleb(&abv,0x11); rb_u8(&abv,1);   /* compile_unit, children */
+        rb_uleb(&abv,0x25);rb_uleb(&abv,0x08);  /* producer  DW_FORM_string  */
+        rb_uleb(&abv,0x13);rb_uleb(&abv,0x05);  /* language  DW_FORM_data2   */
+        rb_uleb(&abv,0x03);rb_uleb(&abv,0x08);  /* name      DW_FORM_string  */
+        rb_uleb(&abv,0x1b);rb_uleb(&abv,0x08);  /* comp_dir  DW_FORM_string  */
+        rb_uleb(&abv,0x11);rb_uleb(&abv,0x01);  /* low_pc    DW_FORM_addr    */
+        rb_uleb(&abv,0x12);rb_uleb(&abv,0x07);  /* high_pc   DW_FORM_data8   */
+        rb_uleb(&abv,0x10);rb_uleb(&abv,0x17);  /* stmt_list DW_FORM_sec_offset */
+        rb_uleb(&abv,0);rb_uleb(&abv,0);
+        rb_uleb(&abv,2); rb_uleb(&abv,0x0a); rb_u8(&abv,0);   /* label, no children */
+        rb_uleb(&abv,0x03);rb_uleb(&abv,0x08);  /* name   DW_FORM_string */
+        rb_uleb(&abv,0x11);rb_uleb(&abv,0x01);  /* low_pc DW_FORM_addr   */
+        rb_uleb(&abv,0);rb_uleb(&abv,0);
+        rb_uleb(&abv,0);                          /* end of abbrev table */
+
+        /* ---- primary section for CU low_pc/high_pc ---- */
+        int primary_idx=0; uint64_t primary_size=0;
+        for(int i=0;i<ncs;i++) if(strcmp(csecs[i].name,st->line_map[0].section)==0){ primary_idx=i+1; break; }
+        if(primary_idx==0 && ncs>0) primary_idx=1;
+        if(primary_idx>0) primary_size=csecs[primary_idx-1].bsz;
+
+        char cwd[1024]; if(!getcwd(cwd,sizeof(cwd))) strcpy(cwd,".");
+        const char *cu_name = st->line_map[0].file[0]?st->line_map[0].file:"(source)";
+        const char *producer = "axx general assembler (C, DWARF4)";
+
+        /* ---- .debug_info ---- */
+        DRV info_relas={0,0,0};
+        RB die; rb_init(&die);
+        rb_uleb(&die,1);
+        rb_cstr(&die,producer);
+        rb_w2(&die,0x8001);            /* DW_LANG_Mips_Assembler */
+        rb_cstr(&die,cu_name);
+        rb_cstr(&die,cwd);
+        if(primary_idx>0) drv_add(&info_relas,die.len,primary_idx,abs64,0);
+        rb_w8(&die,0);                 /* low_pc (relocated) */
+        rb_w8(&die,primary_size);      /* high_pc (data8)    */
+        rb_w4(&die,0);                 /* stmt_list = 0      */
+        for(int i=0;i<nl;i++){
+            if(larr[i].is_equ || larr[i].is_imported) continue;
+            WSR sr = weo_shndx(larr[i].val*(uint64_t)bpw);
+            if(sr.shndx==0xfff1) continue;           /* not in a content section */
+            rb_uleb(&die,2);
+            rb_cstr(&die,larr[i].name);
+            drv_add(&info_relas,die.len,(int)sr.shndx,abs64,(int64_t)sr.sv);
+            rb_w8(&die,0);
+        }
+        rb_uleb(&die,0);               /* terminate CU children */
+        RB info; rb_init(&info);
+        rb_w4(&info,(uint32_t)(2+4+1+die.len)); /* unit_length */
+        rb_w2(&info,4);                          /* version */
+        rb_w4(&info,0);                          /* debug_abbrev_offset */
+        rb_u8(&info,8);                          /* address_size */
+        size_t info_prefix=info.len;             /* 4+2+4+1 = 11 */
+        rb_app(&info,die.b,die.len);
+        free(die.b);
+
+        /* ---- .debug_line (DWARF v4) ---- */
+        DRV line_relas={0,0,0};
+        const char **files=calloc((size_t)st->line_map_len,sizeof(char*)); int nfiles=0;
+        int *row_file=calloc((size_t)st->line_map_len,sizeof(int));
+        for(int i=0;i<st->line_map_len;i++){
+            const char *fn=st->line_map[i].file[0]?st->line_map[i].file:"(source)";
+            int fi=0; for(;fi<nfiles;fi++) if(strcmp(files[fi],fn)==0) break;
+            if(fi==nfiles) files[nfiles++]=fn;
+            row_file[i]=fi+1; /* 1-based */
+        }
+        RB hb; rb_init(&hb);
+        rb_u8(&hb,1);  /* minimum_instruction_length */
+        rb_u8(&hb,1);  /* maximum_operations_per_instruction (v4) */
+        rb_u8(&hb,1);  /* default_is_stmt */
+        rb_u8(&hb,(uint8_t)(int8_t)-5); /* line_base */
+        rb_u8(&hb,14); /* line_range */
+        rb_u8(&hb,13); /* opcode_base */
+        { static const uint8_t sol[12]={0,1,1,1,1,0,0,0,1,0,0,1}; rb_app(&hb,sol,12); }
+        rb_u8(&hb,0);  /* include_directories: none + terminator */
+        for(int fi=0;fi<nfiles;fi++){ rb_cstr(&hb,files[fi]); rb_uleb(&hb,0);rb_uleb(&hb,0);rb_uleb(&hb,0); }
+        rb_u8(&hb,0);  /* end of file_names */
+
+        typedef struct { uint64_t wpc; int file; int line; } LROW;
+        int lrow_cmp(const void*a,const void*b){ uint64_t x=((const LROW*)a)->wpc,y=((const LROW*)b)->wpc; return x<y?-1:(x>y?1:0); }
+        RB prog; rb_init(&prog);
+        size_t prog_base = 4+2+4+hb.len;   /* program offset within .debug_line */
+        for(int s=0;s<ncs;s++){
+            int cnt=0;
+            for(int i=0;i<st->line_map_len;i++) if(strcmp(st->line_map[i].section,csecs[s].name)==0) cnt++;
+            if(cnt==0) continue;
+            LROW *rows=calloc((size_t)cnt,sizeof(LROW)); int k=0;
+            for(int i=0;i<st->line_map_len;i++) if(strcmp(st->line_map[i].section,csecs[s].name)==0){
+                rows[k].wpc=st->line_map[i].word_pc; rows[k].file=row_file[i]; rows[k].line=st->line_map[i].line; k++;
+            }
+            qsort(rows,(size_t)cnt,sizeof(LROW),lrow_cmp);
+            uint64_t secbase=csecs[s].bs;
+            uint64_t first_off = rows[0].wpc*(uint64_t)bpw - secbase;
+            rb_u8(&prog,0); rb_uleb(&prog,1+8); rb_u8(&prog,2);   /* DW_LNE_set_address */
+            drv_add(&line_relas, prog_base+prog.len, s+1, abs64, (int64_t)first_off);
+            rb_w8(&prog,0);
+            uint64_t cur_off=first_off; int cur_line=1, cur_file=1;
+            for(int i=0;i<cnt;i++){
+                uint64_t boff = rows[i].wpc*(uint64_t)bpw - secbase;
+                if(rows[i].file!=cur_file){ rb_u8(&prog,4); rb_uleb(&prog,(uint64_t)rows[i].file); cur_file=rows[i].file; }
+                if(rows[i].line!=cur_line){ rb_u8(&prog,3); rb_sleb(&prog,(int64_t)rows[i].line-cur_line); cur_line=rows[i].line; }
+                if(boff>cur_off){ rb_u8(&prog,2); rb_uleb(&prog,boff-cur_off); cur_off=boff; }
+                rb_u8(&prog,1); /* DW_LNS_copy */
+            }
+            uint64_t end_off=csecs[s].bsz;
+            if(end_off>cur_off){ rb_u8(&prog,2); rb_uleb(&prog,end_off-cur_off); }
+            rb_u8(&prog,0); rb_uleb(&prog,1); rb_u8(&prog,1); /* DW_LNE_end_sequence */
+            free(rows);
+        }
+        free(files); free(row_file);
+
+        RB line; rb_init(&line);
+        rb_w4(&line,(uint32_t)(2+4+hb.len+prog.len)); /* unit_length */
+        rb_w2(&line,4);                                /* version */
+        rb_w4(&line,(uint32_t)hb.len);                 /* header_length */
+        rb_app(&line,hb.b,hb.len);
+        rb_app(&line,prog.b,prog.len);
+        free(hb.b); free(prog.b);
+
+        /* pack Elf64_Rela payloads */
+        uint8_t* pack_relas(DRV*v,size_t*outlen){
+            size_t n=(size_t)v->len*24; uint8_t*b=calloc(1,n?n:1);
+            for(int i=0;i<v->len;i++){
+                uint8_t*p=b+(size_t)i*24;
+                uint64_t rinfo=((uint64_t)v->d[i].sym<<32)|((uint32_t)v->d[i].rtype);
+                WEO_LE8(p,v->d[i].off); WEO_LE8(p+8,rinfo); WEO_LE8S(p+16,v->d[i].addend);
+            }
+            *outlen=n; return b;
+        }
+
+        dbg_prog[n_dbg_prog++]=(DSEC){".debug_abbrev",abv.b,abv.len};
+        int info_pi=n_dbg_prog; dbg_prog[n_dbg_prog++]=(DSEC){".debug_info",info.b,info.len};
+        int line_pi=n_dbg_prog; dbg_prog[n_dbg_prog++]=(DSEC){".debug_line",line.b,line.len};
+        for(int i=0;i<info_relas.len;i++) info_relas.d[i].off += info_prefix;
+        if(info_relas.len>0){ size_t L; uint8_t*B=pack_relas(&info_relas,&L); dbg_rela[n_dbg_rela++]=(DREL){".rela.debug_info",info_pi,B,L}; }
+        if(line_relas.len>0){ size_t L; uint8_t*B=pack_relas(&line_relas,&L); dbg_rela[n_dbg_rela++]=(DREL){".rela.debug_line",line_pi,B,L}; }
+        free(info_relas.d); free(line_relas.d);
+    }
+    /* add debug section names to shstrtab (must be before offset computation) */
+    uint32_t dbg_prog_noff[3]={0,0,0};
+    uint32_t dbg_rela_noff[2]={0,0};
+    for(int i=0;i<n_dbg_prog;i++) dbg_prog_noff[i]=wbb_str(&shstr,dbg_prog[i].name);
+    for(int i=0;i<n_dbg_rela;i++) dbg_rela_noff[i]=wbb_str(&shstr,dbg_rela[i].name);
+
     /* ---- 6. compute file offsets ---- */
     /* Fix 1B: SHT_NOBITS (.bss) sections must NOT consume file space.
      * ELF spec: "A section of type SHT_NOBITS occupies no space in the file."
@@ -5200,10 +5422,17 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     uint64_t sym_fo=WEO_ALIGN(foff,8); foff=sym_fo+(uint64_t)nsyms*(uint64_t)WEO_SYMSZ;
     uint64_t str_fo=foff;     foff+=strtab_bb.len;
     uint64_t shstr_fo=foff;   foff+=shstr.len;
+    /* DWARF debug section offsets (placed after .shstrtab) */
+    uint64_t dbg_prog_fo[3]={0,0,0};
+    for(int i=0;i<n_dbg_prog;i++){ foff=WEO_ALIGN(foff,1); dbg_prog_fo[i]=foff; foff+=dbg_prog[i].len; }
+    uint64_t dbg_rela_fo[2]={0,0};
+    for(int i=0;i<n_dbg_rela;i++){ foff=WEO_ALIGN(foff,8); dbg_rela_fo[i]=foff; foff+=dbg_rela[i].len; }
     uint64_t shdr_fo=WEO_ALIGN(foff,8);
 
-    int tot_sh=1+ncs+nrela+3;
-    int shstrndx=ncs+nrela+3;
+    int ndbg=n_dbg_prog+n_dbg_rela;
+    int tot_sh=1+ncs+nrela+3+ndbg;
+    int shstrndx=ncs+nrela+3;          /* .shstrtab index is unchanged */
+    int dbg_base=ncs+nrela+3;          /* debug sections follow .shstrtab */
     int sym_shidx=ncs+nrela+1;
     int str_shidx=ncs+nrela+2;
 
@@ -5240,6 +5469,9 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     weo_pad(fp,sym_fo); fwrite(symtab_bb.b,1,(size_t)nsyms*(size_t)WEO_SYMSZ,fp);
     fwrite(strtab_bb.b,1,strtab_bb.len,fp);
     fwrite(shstr.b,1,shstr.len,fp);
+    /* DWARF debug section data (PROGBITS then RELA) */
+    for(int i=0;i<n_dbg_prog;i++){ weo_pad(fp,dbg_prog_fo[i]); if(dbg_prog[i].len) fwrite(dbg_prog[i].data,1,dbg_prog[i].len,fp); }
+    for(int i=0;i<n_dbg_rela;i++){ weo_pad(fp,dbg_rela_fo[i]); if(dbg_rela[i].len) fwrite(dbg_rela[i].data,1,dbg_rela[i].len,fp); }
     weo_pad(fp,shdr_fo);
 
     void weo_shdr(FILE*f,uint32_t nm,uint32_t ty,uint64_t fl,uint64_t addr,uint64_t off,
@@ -5269,9 +5501,15 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
              (uint32_t)str_shidx,(uint32_t)first_global,8,(uint64_t)WEO_SYMSZ);
     weo_shdr(fp,str_noff,3,0,0,str_fo,strtab_bb.len,0,0,1,0);
     weo_shdr(fp,shstr_noff,3,0,0,shstr_fo,shstr.len,0,0,1,0);
+    /* DWARF debug section headers (PROGBITS then RELA). */
+    for(int i=0;i<n_dbg_prog;i++)
+        weo_shdr(fp,dbg_prog_noff[i],1,0,0,dbg_prog_fo[i],dbg_prog[i].len,0,0,1,0);
+    for(int i=0;i<n_dbg_rela;i++)
+        weo_shdr(fp,dbg_rela_noff[i],4,0x40,0,dbg_rela_fo[i],dbg_rela[i].len,
+                 (uint32_t)sym_shidx,(uint32_t)(dbg_base+1+dbg_rela[i].target),8,24);
     fclose(fp);
-    fprintf(stderr,"elf: wrote %s (%d section(s), %d rela section(s), %d symbol(s))\n",
-            path,ncs,nrela,nsyms);
+    fprintf(stderr,"elf: wrote %s (%d section(s), %d rela section(s), %d symbol(s)%s)\n",
+            path,ncs,nrela,nsyms, n_dbg_prog?", +DWARF debug":"");
 
 weo_done:
     for(int i=0;i<ncs;i++) free(csecs[i].data);
@@ -5283,6 +5521,8 @@ weo_done:
     free(sec_noff); free(rela_noff);
     free(shstr.b); free(strtab_bb.b); free(symtab_bb.b);
     free(sec_fo); free(larr); free(earr); free(snimap);
+    for(int i=0;i<n_dbg_prog;i++) free(dbg_prog[i].data);
+    for(int i=0;i<n_dbg_rela;i++) free(dbg_rela[i].data);
     #undef WEO_W2
     #undef WEO_W4
     #undef WEO_W8
@@ -5556,6 +5796,7 @@ int main(int argc, char *argv[]){
         else if(strcmp(argv[i],"-o")==0&&i+1<argc){ strncpy(st->elf_objfile,argv[++i],sizeof(st->elf_objfile)-1); }
         else if(strcmp(argv[i],"-m")==0&&i+1<argc){ st->elf_machine=atoi(argv[++i]); }
         else if(strcmp(argv[i],"-v")==0){ st->debug=1; }
+        else if(strcmp(argv[i],"-g")==0||strcmp(argv[i],"--gen-debug")==0){ st->gen_debug=1; }
         else if(argv[i][0]!='-'){
             if(!patternfile) patternfile=argv[i];
             else if(!sourcefile) sourcefile=argv[i];
@@ -5747,6 +5988,12 @@ int main(int argc, char *argv[]){
             free(st->relocations[ri].sym);
         }
         st->reloc_count=0;
+        /* reset DWARF line map before pass2 (only pass2 fills it) */
+        for(int _li=0;_li<st->line_map_len;_li++){
+            free(st->line_map[_li].section);
+            free(st->line_map[_li].file);
+        }
+        st->line_map_len=0;
         /* Fix 5 (new) (axx.py port): reset sections before pass2 so stale
          * provisional sizes from pass1 do not carry over.  labels and
          * patsymbols do NOT need resetting here (only sections). */
@@ -5861,6 +6108,14 @@ int main(int argc, char *argv[]){
         unlink(st->stdin_tmp_path);
         st->stdin_tmp_path[0] = '\0';
     }
+
+    /* Free the DWARF line map (strdup'd section/file strings + array). */
+    for(int _li=0;_li<st->line_map_len;_li++){
+        free(st->line_map[_li].section);
+        free(st->line_map[_li].file);
+    }
+    free(st->line_map);
+    st->line_map=NULL; st->line_map_len=0; st->line_map_cap=0;
 
     return 0;
 }
