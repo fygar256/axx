@@ -207,6 +207,17 @@ class AssemblerState:
         self.init_func: str | None = None
         self.fini_func: str | None = None
 
+        # === 新規追加: DWARF デバッグ情報生成 (-g) ===
+        # gen_debug が True かつ ELF 出力 (-o) のとき、write_elf_obj() が
+        # .debug_abbrev / .debug_info / .debug_line セクション（および対応する
+        # .rela.debug_info / .rela.debug_line）を生成する。
+        self.gen_debug: bool = False
+        # line_map: pass2 で各「バイトを生成したアセンブリ行」について
+        #   (section_name, word_pc_at_line_start, file_name, line_number)
+        # を記録する。DWARF .debug_line の行番号プログラムの元データになる。
+        # pass2 開始時にクリアされ、pass2 中の行アセンブルでのみ追記される。
+        self.line_map: list = []
+
         # .check 拘束条件テーブル。
         # パターンファイルの `.check::x::sym1,sym2,...` で登録される。
         # {変数名(小文字1文字) → 許可シンボル名リスト(大文字正規化)} の辞書。
@@ -4460,6 +4471,19 @@ class Assembler:
 
                     self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend))
 
+            # ------------------------------------------------------------------ #
+            # DWARF .debug_line 用: 行→アドレス対応の記録                          #
+            # バイトを生成した行 (of > 0) について、行開始時の word-PC・現在の     #
+            # セクション・ファイル・行番号を line_map に追記する。VLIW 経路        #
+            # (下の else 節) は対象外（命令境界とバイト長の対応が単純でないため）。 #
+            # self.state.ln は lineassemble0() で本行アセンブル後に +1 されるので、 #
+            # ここでは「現在アセンブル中の行番号」を正しく指す。                    #
+            # ------------------------------------------------------------------ #
+            if self.state.gen_debug and self.state.pas == 2 and of > 0:
+                self.state.line_map.append(
+                    (self.state.current_section, self.state.pc,
+                     self.state.current_file, self.state.ln))
+
             for cnt in range(of):
                 self.binary_writer.outbin(self.state.pc + cnt, objl[cnt])
             self.state.pc += of
@@ -4693,6 +4717,300 @@ class Assembler:
         """Print address"""
         print("%016x: " % pc, end='')
 
+    def _build_dwarf_sections(self, csecs, sec_name_to_idx, bpw, machine):
+        """Build DWARF v4 debug sections for an ELF64 relocatable object.
+
+        Returns (prog_sections, rela_list):
+          prog_sections : list of (name, data) for SHT_PROGBITS debug sections,
+                          in this fixed order:
+                              .debug_abbrev, .debug_info, .debug_line
+          rela_list     : list of (rela_name, target_name, rela_data) for the
+                          .rela.debug_info / .rela.debug_line relocation sections.
+
+        Returns ([], []) when debug generation is disabled or there is nothing
+        to describe (no emitted lines).
+
+        Design notes / limitations (intentionally kept simple but valid):
+          * One compilation unit (CU) only. DW_AT_stmt_list and the CU's
+            debug_abbrev_offset are therefore 0 and need no relocation.
+          * Addresses are 8 bytes (the container is always ELFCLASS64 here).
+            Each DW_AT_low_pc / DW_LNE_set_address operand is relocated against
+            the *section symbol* (STT_SECTION) of the content section it lives
+            in, with the in-section byte offset carried in r_addend. Section
+            symbols occupy symtab indices 1..ncs in csecs order, so the symbol
+            index of a content section equals its 1-based section index.
+          * All strings are stored inline (DW_FORM_string), so no .debug_str
+            section / relocations are required.
+          * The line program emits one sequence per content section that
+            contains code, each bounded by DW_LNE_end_sequence at the section
+            end. Rows are sorted by address.
+        """
+        line_map = self.state.line_map
+        if not self.state.gen_debug or not line_map:
+            return [], []
+
+        import struct as _struct
+        _pk = '<' if self.state.endian != 'big' else '>'
+
+        # --- 64-bit absolute relocation type per architecture --------------- #
+        # 8-byte DWARF address fields → R_<arch>_64-equivalent (S + A).
+        _abs64_map = {
+            62:  1,    # EM_X86_64  → R_X86_64_64
+            183: 257,  # EM_AARCH64 → R_AARCH64_ABS64
+            243: 2,    # EM_RISCV   → R_RISCV_64
+        }
+        abs64 = _abs64_map.get(machine, 1)  # default to R_X86_64_64 semantics
+
+        # ---- LEB128 encoders ---------------------------------------------- #
+        def _uleb(v):
+            out = bytearray()
+            v = int(v)
+            while True:
+                b = v & 0x7f
+                v >>= 7
+                if v:
+                    out.append(b | 0x80)
+                else:
+                    out.append(b)
+                    return bytes(out)
+
+        def _sleb(v):
+            out = bytearray()
+            v = int(v)
+            while True:
+                b = v & 0x7f
+                v >>= 7
+                if (v == 0 and not (b & 0x40)) or (v == -1 and (b & 0x40)):
+                    out.append(b)
+                    return bytes(out)
+                out.append(b | 0x80)
+
+        # ---- content-section lookup helpers -------------------------------- #
+        # name → csec, and a byte-address → (1-based content idx, in-sec offset)
+        csec_by_name = {s.name: s for s in csecs}
+
+        def _addr_to_sec(byte_addr):
+            """Return (content_idx_1based, in_section_byte_offset) or (None, 0)."""
+            for i, s in enumerate(csecs):
+                if s.byte_size > 0 and s.byte_start <= byte_addr < s.byte_start + s.byte_size:
+                    return i + 1, byte_addr - s.byte_start
+            for i, s in enumerate(csecs):
+                if s.byte_size == 0 and byte_addr == s.byte_start:
+                    return i + 1, 0
+            return None, 0
+
+        # ================================================================== #
+        # .debug_abbrev                                                       #
+        # ================================================================== #
+        # abbrev 1: DW_TAG_compile_unit (children)                            #
+        # abbrev 2: DW_TAG_label        (no children)                         #
+        DW_TAG_compile_unit = 0x11
+        DW_TAG_label        = 0x0a
+        DW_CHILDREN_yes, DW_CHILDREN_no = 1, 0
+        # attributes
+        DW_AT_name, DW_AT_low_pc, DW_AT_high_pc = 0x03, 0x11, 0x12
+        DW_AT_language, DW_AT_comp_dir = 0x13, 0x1b
+        DW_AT_producer, DW_AT_stmt_list = 0x25, 0x10
+        # forms
+        DW_FORM_addr, DW_FORM_data2, DW_FORM_data8 = 0x01, 0x05, 0x07
+        DW_FORM_string, DW_FORM_sec_offset = 0x08, 0x17
+
+        abbrev = bytearray()
+        # abbrev 1
+        abbrev += _uleb(1) + _uleb(DW_TAG_compile_unit) + bytes([DW_CHILDREN_yes])
+        for at, fm in ((DW_AT_producer, DW_FORM_string),
+                       (DW_AT_language, DW_FORM_data2),
+                       (DW_AT_name, DW_FORM_string),
+                       (DW_AT_comp_dir, DW_FORM_string),
+                       (DW_AT_low_pc, DW_FORM_addr),
+                       (DW_AT_high_pc, DW_FORM_data8),
+                       (DW_AT_stmt_list, DW_FORM_sec_offset)):
+            abbrev += _uleb(at) + _uleb(fm)
+        abbrev += _uleb(0) + _uleb(0)
+        # abbrev 2
+        abbrev += _uleb(2) + _uleb(DW_TAG_label) + bytes([DW_CHILDREN_no])
+        for at, fm in ((DW_AT_name, DW_FORM_string),
+                       (DW_AT_low_pc, DW_FORM_addr)):
+            abbrev += _uleb(at) + _uleb(fm)
+        abbrev += _uleb(0) + _uleb(0)
+        # end of abbrev table
+        abbrev += _uleb(0)
+        abbrev = bytes(abbrev)
+
+        # ================================================================== #
+        # Primary code section (for CU low_pc/high_pc) = section of 1st row   #
+        # ================================================================== #
+        primary_sec = line_map[0][0]
+        primary_idx = sec_name_to_idx.get(primary_sec)
+        if primary_idx is None:
+            # Fallback: first content section.
+            primary_idx = 1 if csecs else None
+        primary_csec = csecs[primary_idx - 1] if primary_idx else None
+        primary_size = primary_csec.byte_size if primary_csec else 0
+
+        producer = "axx general assembler (DWARF4)"
+        comp_dir = os.getcwd()
+        cu_name = line_map[0][2] or "(source)"
+
+        # ================================================================== #
+        # .debug_info                                                        #
+        # ================================================================== #
+        info_relas = []   # (offset_in_debug_info, sym_idx, rtype, addend)
+        die = bytearray()
+        # --- CU DIE (abbrev 1) ---
+        die += _uleb(1)
+        die += producer.encode() + b'\x00'
+        die += _struct.pack(f'{_pk}H', 0x8001)   # DW_LANG_Mips_Assembler
+        die += cu_name.encode() + b'\x00'
+        die += comp_dir.encode() + b'\x00'
+        # low_pc (addr, reloc against primary section symbol, addend 0)
+        if primary_idx:
+            info_relas.append((len(die), primary_idx, abs64, 0))
+        die += b'\x00' * 8
+        # high_pc (data8 = size of primary section; constant, no reloc)
+        die += _struct.pack(f'{_pk}Q', primary_size & 0xFFFFFFFFFFFFFFFF)
+        # stmt_list (sec_offset = 0 → start of the single CU's line program)
+        die += _struct.pack(f'{_pk}I', 0)
+        # --- label DIEs (abbrev 2) ---
+        for name, *_rest in sorted(self.state.labels.items()):
+            entry = _rest[0]
+            val = entry[0]
+            is_equ = len(entry) > 2 and entry[2]
+            is_imported = len(entry) > 3 and entry[3]
+            if is_equ or is_imported:
+                continue   # constants and external refs are not address labels
+            try:
+                byte_addr = int(val) * bpw
+            except (TypeError, ValueError, OverflowError):
+                continue
+            sidx, off = _addr_to_sec(byte_addr)
+            if sidx is None:
+                continue
+            die += _uleb(2)
+            die += name.encode() + b'\x00'
+            info_relas.append((len(die), sidx, abs64, off))
+            die += b'\x00' * 8
+        # terminate CU children
+        die += _uleb(0)
+
+        # CU header: unit_length(4) version(2) abbrev_off(4) addr_size(1) + die
+        info_body = (_struct.pack(f'{_pk}H', 4)           # version
+                     + _struct.pack(f'{_pk}I', 0)          # debug_abbrev_offset (single CU)
+                     + bytes([8])                          # address_size
+                     + bytes(die))
+        debug_info = _struct.pack(f'{_pk}I', len(info_body)) + info_body
+        # The CU header occupies 4 bytes before info_body; low_pc/label reloc
+        # offsets recorded above were relative to `die`, so shift them by the
+        # header prefix length (4 + len(version+abbrev_off+addr_size) = 4+7).
+        _info_prefix = 4 + 2 + 4 + 1
+        info_relas = [(_info_prefix + o, s, t, a) for (o, s, t, a) in info_relas]
+
+        # ================================================================== #
+        # .debug_line  (DWARF v4)                                            #
+        # ================================================================== #
+        # File-name table (1-based indices).
+        files = []
+        file_idx = {}
+        for (_sec, _wpc, fn, _ln) in line_map:
+            fn = fn or "(source)"
+            if fn not in file_idx:
+                files.append(fn)
+                file_idx[fn] = len(files)   # 1-based
+
+        # Line-program header body (everything counted by header_length).
+        hbody = bytearray()
+        hbody += bytes([1])                       # minimum_instruction_length
+        hbody += bytes([1])                       # maximum_operations_per_instruction (v4)
+        hbody += bytes([1])                       # default_is_stmt
+        hbody += _struct.pack('b', -5)            # line_base (signed)
+        hbody += bytes([14])                      # line_range
+        hbody += bytes([13])                      # opcode_base
+        hbody += bytes([0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1])  # std_opcode_lengths[1..12]
+        hbody += b'\x00'                          # include_directories: (none) + terminator
+        for fn in files:                          # file_names
+            hbody += fn.encode() + b'\x00' + _uleb(0) + _uleb(0) + _uleb(0)
+        hbody += b'\x00'                          # end of file_names
+
+        # Group rows by content section, sorted by address.
+        from collections import defaultdict as _dd
+        rows_by_sec = _dd(list)
+        for (sec, wpc, fn, ln) in line_map:
+            sidx = sec_name_to_idx.get(sec)
+            if sidx is None:
+                continue
+            rows_by_sec[sidx].append((wpc, file_idx.get(fn or "(source)", 1), ln))
+
+        line_relas = []   # (offset_in_debug_line, sym_idx, rtype, addend)
+        prog = bytearray()
+        # Program byte offset within the whole .debug_line section:
+        #   unit_length(4) + version(2) + header_length(4) + len(hbody)
+        prog_base = 4 + 2 + 4 + len(hbody)
+
+        for sidx in sorted(rows_by_sec.keys()):
+            rows = sorted(rows_by_sec[sidx], key=lambda r: r[0])
+            csec = csecs[sidx - 1]
+            w0 = csec.byte_start // bpw if bpw else 0
+            first_off = (rows[0][0] - w0) * bpw
+            # DW_LNE_set_address (extended opcode)
+            prog += b'\x00' + _uleb(1 + 8) + b'\x02'   # len = subop + 8-byte addr
+            line_relas.append((prog_base + len(prog), sidx, abs64, first_off))
+            prog += b'\x00' * 8
+            cur_off = first_off
+            cur_line = 1
+            cur_file = 1
+            for (wpc, fidx, ln) in rows:
+                byte_off = (wpc - w0) * bpw
+                if fidx != cur_file:
+                    prog += bytes([4]) + _uleb(fidx)   # DW_LNS_set_file
+                    cur_file = fidx
+                if ln != cur_line:
+                    prog += bytes([3]) + _sleb(ln - cur_line)  # DW_LNS_advance_line
+                    cur_line = ln
+                if byte_off > cur_off:
+                    prog += bytes([2]) + _uleb(byte_off - cur_off)  # DW_LNS_advance_pc
+                    cur_off = byte_off
+                prog += bytes([1])                     # DW_LNS_copy (append row)
+            # advance to section end, then end the sequence
+            end_off = csec.byte_size
+            if end_off > cur_off:
+                prog += bytes([2]) + _uleb(end_off - cur_off)
+            prog += b'\x00' + _uleb(1) + b'\x01'       # DW_LNE_end_sequence
+
+        line_body = (_struct.pack(f'{_pk}H', 4)            # version
+                     + _struct.pack(f'{_pk}I', len(hbody)) # header_length
+                     + bytes(hbody)
+                     + bytes(prog))
+        debug_line = _struct.pack(f'{_pk}I', len(line_body)) + line_body
+
+        # ================================================================== #
+        # Pack relocation section payloads (Elf64_Rela: 8+8+8)                #
+        # ================================================================== #
+        def _pack_relas(entries):
+            out = bytearray()
+            _S64_MAX, _S64_MIN = (1 << 63) - 1, -(1 << 63)
+            for (off, sym, rtype, addend) in entries:
+                r_info = (sym << 32) | (rtype & 0xffffffff)
+                a = addend
+                if a > _S64_MAX:
+                    a = _S64_MAX
+                elif a < _S64_MIN:
+                    a = _S64_MIN
+                out += _struct.pack(f'{_pk}QQq', off, r_info, a)
+            return bytes(out)
+
+        prog_sections = [
+            ('.debug_abbrev', abbrev),
+            ('.debug_info',   debug_info),
+            ('.debug_line',   debug_line),
+        ]
+        rela_list = []
+        if info_relas:
+            rela_list.append(('.rela.debug_info', '.debug_info', _pack_relas(info_relas)))
+        if line_relas:
+            rela_list.append(('.rela.debug_line', '.debug_line', _pack_relas(line_relas)))
+
+        return prog_sections, rela_list
+
     def write_elf_obj(self, path: str, machine: int = 62) -> None:
         """Write a FreeBSD ELF64 relocatable object file (.o).
 
@@ -4851,6 +5169,15 @@ class Assembler:
         rela_sec_order = [i + 1 for i, s in enumerate(csecs) if (i + 1) in rela_entries]
         nrela = len(rela_sec_order)
 
+        # ------------------------------------------------------------------ #
+        # DWARF デバッグセクションを構築する (-g 指定時のみ非空)。            #
+        # これらは既存セクション (.shstrtab まで) の「後ろ」に追加するため、 #
+        # e_shstrndx / .symtab / .strtab のセクションインデックスは不変。     #
+        #   dbg_prog : [(name, data)]            … SHT_PROGBITS               #
+        #   dbg_rela : [(rela_name, target_name, data)] … SHT_RELA           #
+        # ------------------------------------------------------------------ #
+        dbg_prog, dbg_rela = self._build_dwarf_sections(
+            csecs, sec_name_to_idx, bpw, machine)
 
         shstrtab = bytearray(b'\x00')
         sec_name_offs = []
@@ -4865,7 +5192,17 @@ class Assembler:
         symtab_name_off   = len(shstrtab); shstrtab += b'.symtab\x00'
         strtab_name_off   = len(shstrtab); shstrtab += b'.strtab\x00'
         shstrtab_name_off = len(shstrtab); shstrtab += b'.shstrtab\x00'
+        # DWARF デバッグセクション名（PROGBITS → RELA の順）
+        dbg_prog_name_offs = []
+        for (dname, _ddata) in dbg_prog:
+            dbg_prog_name_offs.append(len(shstrtab))
+            shstrtab += dname.encode() + b'\x00'
+        dbg_rela_name_offs = []
+        for (rname, _tname, _rdata) in dbg_rela:
+            dbg_rela_name_offs.append(len(shstrtab))
+            shstrtab += rname.encode() + b'\x00'
         shstrtab = bytes(shstrtab)
+
 
         # ------------------------------------------------------------------ #
         # 3. Build symbol table (.symtab) and string table (.strtab)          #
@@ -5064,11 +5401,33 @@ class Assembler:
         symtab_off  = _align_up(offset, 8); offset = symtab_off + len(symtab)
         strtab_off  = offset;               offset += len(strtab)
         shstrtab_off = offset;              offset += len(shstrtab)
+
+        # ------------------------------------------------------------------ #
+        # DWARF デバッグセクションのファイルオフセットと最終インデックス      #
+        # （.shstrtab の後ろに配置する）。                                    #
+        #   dbg_prog : SHT_PROGBITS, addralign 1                              #
+        #   dbg_rela : SHT_RELA,     addralign 8                              #
+        # ------------------------------------------------------------------ #
+        base_idx = ncs + nrela + 3            # index of .shstrtab
+        dbg_prog_offsets = []
+        dbg_prog_shndx = {}                   # name → section index
+        for i, (dname, ddata) in enumerate(dbg_prog):
+            offset = _align_up(offset, 1)
+            dbg_prog_offsets.append(offset)
+            dbg_prog_shndx[dname] = base_idx + 1 + i
+            offset += len(ddata)
+        dbg_rela_offsets = []
+        for i, (rname, tname, rdata) in enumerate(dbg_rela):
+            offset = _align_up(offset, 8)
+            dbg_rela_offsets.append(offset)
+            offset += len(rdata)
+
         shdr_off    = _align_up(offset, 8)
 
-        # セクションヘッダ数: null + content + rela + symtab + strtab + shstrtab
-        total_shdrs = 1 + ncs + nrela + 3
-        shstrndx    = ncs + nrela + 3
+        ndbg = len(dbg_prog) + len(dbg_rela)
+        # セクションヘッダ数: null + content + rela + symtab + strtab + shstrtab + debug
+        total_shdrs = 1 + ncs + nrela + 3 + ndbg
+        shstrndx    = ncs + nrela + 3         # .shstrtab は位置不変
         symtab_shidx = ncs + nrela + 1     # .symtab section index
         strtab_shidx = ncs + nrela + 2     # .strtab section index (= symtab_link)
         symtab_link = strtab_shidx
@@ -5101,6 +5460,16 @@ class Assembler:
 
             # .shstrtab
             f.write(shstrtab)
+
+            # DWARF デバッグセクションデータ（PROGBITS → RELA の順）
+            for i, (dname, ddata) in enumerate(dbg_prog):
+                cur = f.tell()
+                f.write(b'\x00' * (dbg_prog_offsets[i] - cur))
+                f.write(ddata)
+            for i, (rname, tname, rdata) in enumerate(dbg_rela):
+                cur = f.tell()
+                f.write(b'\x00' * (dbg_rela_offsets[i] - cur))
+                f.write(rdata)
 
             # Section header table
             cur = f.tell(); f.write(b'\x00' * (shdr_off - cur))
@@ -5137,7 +5506,23 @@ class Assembler:
                 shstrtab_name_off, 3, 0, 0,
                 shstrtab_off, len(shstrtab), 0, 0, 1, 0))
 
-        print(f"elf: wrote {path} ({ncs} section(s), {nrela} rela section(s), {len(syms)} symbol(s))",
+            # DWARF デバッグセクションヘッダ（PROGBITS → RELA の順）。
+            # PROGBITS: sh_type=1, flags=0, link=0, info=0, align=1, entsize=0
+            for i, (dname, ddata) in enumerate(dbg_prog):
+                f.write(_pack_shdr(
+                    dbg_prog_name_offs[i], 1, 0, 0,
+                    dbg_prog_offsets[i], len(ddata), 0, 0, 1, 0))
+            # RELA: sh_type=4, flags=SHF_INFO_LINK(0x40), link=.symtab,
+            #       info=対象デバッグセクションのインデックス, align=8, entsize=24
+            for i, (rname, tname, rdata) in enumerate(dbg_rela):
+                f.write(_pack_shdr(
+                    dbg_rela_name_offs[i], 4, 0x40, 0,
+                    dbg_rela_offsets[i], len(rdata),
+                    symtab_shidx, dbg_prog_shndx.get(tname, 0), 8, 24))
+
+        _dbg_msg = f", {len(dbg_prog)} debug section(s)" if dbg_prog else ""
+        print(f"elf: wrote {path} ({ncs} section(s), {nrela} rela section(s), "
+              f"{len(syms)} symbol(s){_dbg_msg})",
               file=sys.stderr)
 
     def _build_arg_parser(self):
@@ -5185,6 +5570,11 @@ class Assembler:
         ap.add_argument('-d', '--debug', dest='debug', action='store_true',
                         default=False,
                         help='Enable debug output (forward-ref fallback, relaxation log, etc.)')
+        ap.add_argument('-g', '--gen-debug', dest='gen_debug', action='store_true',
+                        default=False,
+                        help='Generate DWARF debug information (.debug_info/.debug_abbrev/'
+                             '.debug_line) in the ELF object so that gdb/lldb can do '
+                             'source-level debugging. Effective only together with -o.')
         return ap
 
     def run(self):
@@ -5223,6 +5613,7 @@ class Assembler:
         self.state.osabi        = osabitbl.get(args.elf_osabi, 9)
         self.state.verbose      = args.verbose
         self.state.debug        = args.debug
+        self.state.gen_debug    = args.gen_debug
 
         # Fix 5 (original) + Fix 8 (new): run() 全体を try/finally で囲む。
         # Fix 8: readpat や impfile open もここに含めることで、パターンファイルや
@@ -5400,6 +5791,7 @@ class Assembler:
                 self.state.pas = 2
                 self.state.ln = 1
                 self.state.relocations = []   # pass2 でリロケーションを新規収集
+                self.state.line_map = []      # pass2 で DWARF 行情報を新規収集
                 # Fix 5 (new): pass1 リラクゼーション中に section_processing の
                 # 暫定サイズ（Fix 3）や ENDSECTION 確定サイズ（Fix 2）が残ったまま
                 # pass2 に入ると、section 再宣言時の保護ロジックが誤って古いサイズを
