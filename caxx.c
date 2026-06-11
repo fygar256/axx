@@ -4976,6 +4976,177 @@ static char *file_input_from_stdin(void){
  *   .shstrtab
  *   Section header table (8-byte aligned, 64 bytes/entry)
  * ========================================================= */
+
+/* =====================================================================
+ * ELF/DWARF writer helpers (file scope).
+ *
+ * These were previously GCC *nested functions* defined inside
+ * write_elf_obj().  Nested functions are a GNU C extension and are NOT
+ * supported by clang (the default `cc` on FreeBSD/macOS), so they are
+ * lifted to file scope here, with the formerly-captured local variables
+ * passed as explicit parameters.  This lets the file build with a plain
+ * standard C compiler (cc/clang) as well as gcc.
+ * ===================================================================== */
+
+/* dynamic byte buffer (string tables start with a leading NUL byte) */
+typedef struct { uint8_t*b; size_t len,cap; } WBB;
+/* one content (output) section */
+typedef struct { const char*name; uint64_t bs,bsz,fl; uint8_t*data; } WCS;
+/* (section index, value-within-section) result of weo_shndx() */
+typedef struct { uint16_t shndx; uint64_t sv; } WSR;
+/* relocation entry / per-section list */
+typedef struct { int64_t off; const char*sym; int rtype; int64_t addend; } WRE;
+typedef struct { WRE*data; int len,cap; } WRL;
+/* symbol-name -> symtab-index map entry */
+typedef struct { const char*name; int idx; } WSNI;
+/* label record used for sorting */
+typedef struct { const char*name; uint64_t val; int is_equ; int is_imported; int reloc_type_override; } WLK;
+/* DWARF section descriptors */
+typedef struct { const char *name; uint8_t *data; size_t len; } DSEC;
+typedef struct { const char *name; int target; uint8_t *data; size_t len; } DREL;
+/* DWARF raw byte buffer, relocation accumulator, and line-row */
+typedef struct { uint8_t*b; size_t len,cap; } RB;
+typedef struct { uint64_t off; int sym; int rtype; int64_t addend; } DRE;
+typedef struct { DRE*d; int len,cap; } DRV;
+typedef struct { uint64_t wpc; int file; int line; } LROW;
+
+/* endian-aware integer writers (is_le: 1=little, 0=big) */
+static void weo_w2(uint8_t*p,uint16_t v,int is_le){
+    if(is_le){ p[0]=v&0xff; p[1]=(v>>8)&0xff; }
+    else     { p[1]=v&0xff; p[0]=(v>>8)&0xff; }
+}
+static void weo_w4(uint8_t*p,uint32_t v,int is_le){
+    if(is_le){ p[0]=v&0xff;p[1]=(v>>8)&0xff;p[2]=(v>>16)&0xff;p[3]=(v>>24)&0xff; }
+    else     { p[3]=v&0xff;p[2]=(v>>8)&0xff;p[1]=(v>>16)&0xff;p[0]=(v>>24)&0xff; }
+}
+static void weo_w8(uint8_t*p,uint64_t v,int is_le){
+    if(is_le){ for(int j=0;j<8;j++){p[j]=(uint8_t)(v&0xff);v>>=8;} }
+    else     { for(int j=7;j>=0;j--){p[j]=(uint8_t)(v&0xff);v>>=8;} }
+}
+static void weo_w8s(uint8_t*p,int64_t v,int is_le){ weo_w8(p,(uint64_t)v,is_le); }
+
+/* WBB dynamic byte buffer helpers */
+static void wbb_init(WBB*w){ w->b=calloc(1,64); w->len=1; w->cap=64; }
+static void wbb_grow(WBB*w, size_t need){
+    while(w->len+need>w->cap){w->cap*=2;w->b=realloc(w->b,w->cap);if(!w->b){perror("realloc");exit(1);}}
+}
+static uint32_t wbb_str(WBB*w, const char*s){
+    size_t l=strlen(s)+1; uint32_t off=(uint32_t)w->len;
+    wbb_grow(w,l); memcpy(w->b+w->len,s,l); w->len+=l; return off;
+}
+static void wbb_app(WBB*w, const void*src, size_t n){
+    wbb_grow(w,n); memcpy(w->b+w->len,src,n); w->len+=n;
+}
+
+/* extract word range [w0, w0+wn) of the binary image as a byte array */
+static uint8_t *weo_extract(AsmState*st,int bpw,uint64_t w0,uint64_t wn){
+    uint64_t nb=wn*(uint64_t)bpw;
+    if(!nb) return calloc(1,1);
+    uint8_t *d=calloc(1,(size_t)nb); if(!d){perror("calloc");exit(1);}
+    uint64_t pad=u256_to_u64(st->padding);
+    if(pad){
+        uint64_t mask=(st->bts<64)?((uint64_t)1<<st->bts)-1:(uint64_t)-1; pad&=mask;
+        for(uint64_t wp=0;wp<wn;wp++){
+            uint64_t base=wp*(uint64_t)bpw,tmp=pad;
+            if(!st->endian_big){for(int j=0;j<bpw;j++){d[base+j]=(uint8_t)(tmp&0xff);tmp>>=8;}}
+            else               {for(int j=bpw-1;j>=0;j--){d[base+j]=(uint8_t)(tmp&0xff);tmp>>=8;}}
+        }
+    }
+    for(int bi=0;bi<BUFMAP_NB;bi++)
+        for(BufEntry*be=st->buf.buckets[bi];be;be=be->next){
+            if(be->pos<w0||be->pos>=w0+wn) continue;
+            uint64_t off=(be->pos-w0)*(uint64_t)bpw,tmp=be->val;
+            if(!st->endian_big){for(int j=0;j<bpw;j++){if(off+(uint64_t)j<nb)d[off+j]=(uint8_t)(tmp&0xff);tmp>>=8;}}
+            else               {for(int j=bpw-1;j>=0;j--){if(off+(uint64_t)j<nb)d[off+j]=(uint8_t)(tmp&0xff);tmp>>=8;}}
+        }
+    return d;
+}
+
+/* byte-address -> (1-based content section index, in-section offset) */
+static WSR weo_shndx(WCS*csecs,int ncs,uint64_t ba){
+    for(int i=0;i<ncs;i++){
+        if(csecs[i].bsz>0&&csecs[i].bs<=ba&&ba<csecs[i].bs+csecs[i].bsz)
+            return (WSR){(uint16_t)(i+1),ba-csecs[i].bs};
+        if(!csecs[i].bsz&&ba==csecs[i].bs) return (WSR){(uint16_t)(i+1),0};
+    }
+    return (WSR){0xfff1,ba};
+}
+
+/* append one Elf64_Sym (24 bytes) to the symtab buffer */
+static void weo_sym(WBB*symtab_bb,int*nsyms,int is_le,
+                    uint32_t nm,uint8_t info,uint8_t oth,uint16_t shndx,uint64_t val,uint64_t sz){
+    uint8_t sp[24]={0};
+    weo_w4(sp,nm,is_le); sp[4]=info; sp[5]=oth; weo_w2(sp+6,shndx,is_le);
+    weo_w8(sp+8,val,is_le); weo_w8(sp+16,sz,is_le);
+    wbb_app(symtab_bb,sp,24); (*nsyms)++;
+}
+
+/* qsort comparator for WLK label records (by name) */
+static int cmp_wlk(const void*a,const void*b){ return strcmp(((const WLK*)a)->name,((const WLK*)b)->name); }
+
+/* is name present in the export array? */
+static int weo_isexp(WLK*earr,int ne,const char*nm){
+    for(int i=0;i<ne;i++) if(!strcmp(earr[i].name,nm)) return 1; return 0;
+}
+
+/* symbol name -> symtab index */
+static int weo_symof(WSNI*snimap,int snimap_len,const char*nm){
+    for(int i=0;i<snimap_len;i++) if(!strcmp(snimap[i].name,nm)) return snimap[i].idx; return 0;
+}
+
+/* is content section i a .bss (SHT_NOBITS)? */
+static int weo_isno(WCS*csecs,int i){
+    char _n[64]; int _j=0;
+    for(;csecs[i].name[_j]&&_j<63;_j++) _n[_j]=(char)axx_upper_char(csecs[i].name[_j]);
+    _n[_j]=0;
+    return strncmp(_n,".BSS",4)==0;
+}
+
+/* pad file with zero bytes up to absolute offset t */
+static void weo_pad(FILE*f,uint64_t t){
+    long c=ftell(f);
+    if(c < 0){ fprintf(stderr,"weo_pad: ftell failed\n"); return; }
+    while((uint64_t)c<t){fputc(0,f);c++;}
+}
+
+/* write one Elf64_Shdr (64 bytes) */
+static void weo_shdr(FILE*f,int is_le,uint32_t nm,uint32_t ty,uint64_t fl,uint64_t addr,uint64_t off,
+                     uint64_t sz,uint32_t lnk,uint32_t info,uint64_t align,uint64_t entsz){
+    uint8_t sh[64]={0};
+    weo_w4(sh,nm,is_le);weo_w4(sh+4,ty,is_le);weo_w8(sh+8,fl,is_le);weo_w8(sh+16,addr,is_le);
+    weo_w8(sh+24,off,is_le);weo_w8(sh+32,sz,is_le);weo_w4(sh+40,lnk,is_le);weo_w4(sh+44,info,is_le);
+    weo_w8(sh+48,align,is_le);weo_w8(sh+56,entsz,is_le);
+    fwrite(sh,1,64,f);
+}
+
+/* ---- DWARF raw-buffer helpers ---- */
+static void rb_init(RB*r){ r->b=malloc(64); r->len=0; r->cap=64; if(!r->b){perror("malloc");exit(1);} }
+static void rb_need(RB*r,size_t n){ while(r->len+n>r->cap){ r->cap*=2; r->b=realloc(r->b,r->cap); if(!r->b){perror("realloc");exit(1);} } }
+static void rb_u8(RB*r,uint8_t v){ rb_need(r,1); r->b[r->len++]=v; }
+static void rb_app(RB*r,const void*s,size_t n){ rb_need(r,n); memcpy(r->b+r->len,s,n); r->len+=n; }
+static void rb_cstr(RB*r,const char*s){ rb_app(r,s,strlen(s)+1); }
+static void rb_uleb(RB*r,uint64_t v){ for(;;){ uint8_t b=(uint8_t)(v&0x7f); v>>=7; if(v) rb_u8(r,(uint8_t)(b|0x80)); else { rb_u8(r,b); break; } } }
+static void rb_sleb(RB*r,int64_t v){ for(;;){ uint8_t b=(uint8_t)(v&0x7f); v>>=7; if((v==0&&!(b&0x40))||(v==-1&&(b&0x40))){ rb_u8(r,b); break; } else rb_u8(r,(uint8_t)(b|0x80)); } }
+static void rb_w2(RB*r,uint16_t v,int is_le){ uint8_t t[2]; weo_w2(t,v,is_le); rb_app(r,t,2); }
+static void rb_w4(RB*r,uint32_t v,int is_le){ uint8_t t[4]; weo_w4(t,v,is_le); rb_app(r,t,4); }
+static void rb_w8(RB*r,uint64_t v,int is_le){ uint8_t t[8]; weo_w8(t,v,is_le); rb_app(r,t,8); }
+static void drv_add(DRV*v,uint64_t off,int sym,int rtype,int64_t add){
+    if(v->len>=v->cap){ v->cap=v->cap?v->cap*2:8; v->d=realloc(v->d,(size_t)v->cap*sizeof(DRE)); if(!v->d){perror("realloc");exit(1);} }
+    v->d[v->len++]=(DRE){off,sym,rtype,add};
+}
+/* pack a DRV of relocations into Elf64_Rela payload bytes */
+static uint8_t* dwarf_pack_relas(DRV*v,size_t*outlen,int is_le){
+    size_t n=(size_t)v->len*24; uint8_t*b=calloc(1,n?n:1);
+    for(int i=0;i<v->len;i++){
+        uint8_t*p=b+(size_t)i*24;
+        uint64_t rinfo=((uint64_t)v->d[i].sym<<32)|((uint32_t)v->d[i].rtype);
+        weo_w8(p,v->d[i].off,is_le); weo_w8(p+8,rinfo,is_le); weo_w8s(p+16,v->d[i].addend,is_le);
+    }
+    *outlen=n; return b;
+}
+/* qsort comparator for DWARF line rows (by address) */
+static int lrow_cmp(const void*a,const void*b){ uint64_t x=((const LROW*)a)->wpc,y=((const LROW*)b)->wpc; return x<y?-1:(x>y?1:0); }
+
 static void write_elf_obj(AsmState *st, const char *path, int machine){
     int bpw = (st->bts+7)/8; if(bpw<1) bpw=1;
 
@@ -5007,45 +5178,10 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     #define WEO_LE8S(p,v) WEO_W8S(p,v)
 
     /* dynamic byte buffer (starts with one NUL byte) */
-    typedef struct { uint8_t*b; size_t len,cap; } WBB;
-    void wbb_init(WBB*w){ w->b=calloc(1,64); w->len=1; w->cap=64; }
-    void wbb_grow(WBB*w, size_t need){
-        while(w->len+need>w->cap){w->cap*=2;w->b=realloc(w->b,w->cap);if(!w->b){perror("realloc");exit(1);}}
-    }
-    uint32_t wbb_str(WBB*w, const char*s){
-        size_t l=strlen(s)+1; uint32_t off=(uint32_t)w->len;
-        wbb_grow(w,l); memcpy(w->b+w->len,s,l); w->len+=l; return off;
-    }
-    void wbb_app(WBB*w, const void*src, size_t n){
-        wbb_grow(w,n); memcpy(w->b+w->len,src,n); w->len+=n;
-    }
 
     /* extract word range [w0, w0+wn) as byte array */
-    uint8_t *weo_extract(uint64_t w0, uint64_t wn){
-        uint64_t nb=wn*(uint64_t)bpw;
-        if(!nb) return calloc(1,1);
-        uint8_t *d=calloc(1,(size_t)nb); if(!d){perror("calloc");exit(1);}
-        uint64_t pad=u256_to_u64(st->padding);
-        if(pad){
-            uint64_t mask=(st->bts<64)?((uint64_t)1<<st->bts)-1:(uint64_t)-1; pad&=mask;
-            for(uint64_t wp=0;wp<wn;wp++){
-                uint64_t base=wp*(uint64_t)bpw,tmp=pad;
-                if(!st->endian_big){for(int j=0;j<bpw;j++){d[base+j]=(uint8_t)(tmp&0xff);tmp>>=8;}}
-                else               {for(int j=bpw-1;j>=0;j--){d[base+j]=(uint8_t)(tmp&0xff);tmp>>=8;}}
-            }
-        }
-        for(int bi=0;bi<BUFMAP_NB;bi++)
-            for(BufEntry*be=st->buf.buckets[bi];be;be=be->next){
-                if(be->pos<w0||be->pos>=w0+wn) continue;
-                uint64_t off=(be->pos-w0)*(uint64_t)bpw,tmp=be->val;
-                if(!st->endian_big){for(int j=0;j<bpw;j++){if(off+(uint64_t)j<nb)d[off+j]=(uint8_t)(tmp&0xff);tmp>>=8;}}
-                else               {for(int j=bpw-1;j>=0;j--){if(off+(uint64_t)j<nb)d[off+j]=(uint8_t)(tmp&0xff);tmp>>=8;}}
-            }
-        return d;
-    }
 
     /* ---- 1. collect content sections ---- */
-    typedef struct{ const char*name; uint64_t bs,bsz,fl; uint8_t*data; } WCS;
     uint64_t max_w=0; int have_w=0;
     for(int i=0;i<BUFMAP_NB;i++)
         for(BufEntry*be=st->buf.buckets[i];be;be=be->next)
@@ -5055,7 +5191,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     if(st->sections.count==0){
         ncs=1; csecs=calloc(1,sizeof(WCS));
         uint64_t wn=have_w?max_w+1:0;
-        csecs[0]=(WCS){".text",0,wn*(uint64_t)bpw,0x2|0x4,weo_extract(0,wn)};
+        csecs[0]=(WCS){".text",0,wn*(uint64_t)bpw,0x2|0x4,weo_extract(st,bpw,0,wn)};
     } else {
         ncs=st->sections.count; csecs=calloc((size_t)ncs,sizeof(WCS));
         for(int i=0;i<ncs;i++){
@@ -5074,13 +5210,11 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
             else if(strncmp(un,".RODATA",7)==0) fl=0x2;
             else if(strncmp(un,".BSS",4)==0)    fl=0x2|0x1;
             else                                fl=0x2;
-            csecs[i]=(WCS){se->name,w0*(uint64_t)bpw,wsz*(uint64_t)bpw,fl,weo_extract(w0,wsz)};
+            csecs[i]=(WCS){se->name,w0*(uint64_t)bpw,wsz*(uint64_t)bpw,fl,weo_extract(st,bpw,w0,wsz)};
         }
     }
 
     /* ---- 2. group relocations by content section ---- */
-    typedef struct{ int64_t off; const char*sym; int rtype; int64_t addend; } WRE;
-    typedef struct{ WRE*data; int len,cap; } WRL;
     WRL *rela_lists=calloc((size_t)ncs,sizeof(WRL));
     for(int ri=0;ri<st->reloc_count;ri++){
         int sidx=-1;
@@ -5111,38 +5245,21 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     uint32_t shstr_noff=wbb_str(&shstr,".shstrtab");
 
     /* ---- 4. build .symtab ---- */
-    typedef struct{ uint16_t shndx; uint64_t sv; } WSR;
-    WSR weo_shndx(uint64_t ba){
-        for(int i=0;i<ncs;i++){
-            if(csecs[i].bsz>0&&csecs[i].bs<=ba&&ba<csecs[i].bs+csecs[i].bsz)
-                return (WSR){(uint16_t)(i+1),ba-csecs[i].bs};
-            if(!csecs[i].bsz&&ba==csecs[i].bs) return (WSR){(uint16_t)(i+1),0};
-        }
-        return (WSR){0xfff1,ba};
-    }
     #define WEO_SYMSZ 24
     WBB symtab_bb; symtab_bb.b=calloc(32,(size_t)WEO_SYMSZ); symtab_bb.len=0; symtab_bb.cap=32*WEO_SYMSZ;
     int nsyms=0;
-    void weo_sym(uint32_t nm,uint8_t info,uint8_t oth,uint16_t shndx,uint64_t val,uint64_t sz){
-        uint8_t sp[WEO_SYMSZ]={0};
-        WEO_LE4(sp,nm); sp[4]=info; sp[5]=oth; WEO_LE2(sp+6,shndx); WEO_LE8(sp+8,val); WEO_LE8(sp+16,sz);
-        wbb_app(&symtab_bb,sp,WEO_SYMSZ); nsyms++;
-    }
-    typedef struct{const char*name;int idx;} WSNI;
     WSNI *snimap=calloc((size_t)(st->labels.count+st->export_labels.count+8),sizeof(WSNI));
     int snimap_len=0;
 
-    weo_sym(0,0,0,0,0,0);                             /* null */
-    for(int i=0;i<ncs;i++) weo_sym(0,0x03,0,(uint16_t)(i+1),0,0); /* section syms */
+    weo_sym(&symtab_bb,&nsyms,_is_le,0,0,0,0,0,0);                             /* null */
+    for(int i=0;i<ncs;i++) weo_sym(&symtab_bb,&nsyms,_is_le,0,0x03,0,(uint16_t)(i+1),0,0); /* section syms */
 
     /* sort labels and export_labels by name */
-    typedef struct{const char*name;uint64_t val;int is_equ;int is_imported;int reloc_type_override;} WLK;
     int nl=st->labels.count;
     WLK *larr=calloc((size_t)(nl?nl:1),sizeof(WLK));
     {int li=0;for(int bi=0;bi<st->labels.nbuckets;bi++)
         for(LabelEntry*e=st->labels.buckets[bi];e;e=e->next)
             larr[li++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,e->is_imported,e->reloc_type_override};}
-    int cmp_wlk(const void*a,const void*b){return strcmp(((WLK*)a)->name,((WLK*)b)->name);}
     qsort(larr,nl,sizeof(WLK),cmp_wlk);
 
     int ne=st->export_labels.count;
@@ -5155,44 +5272,42 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
             earr[ei++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,0,_rto};}}
     qsort(earr,ne,sizeof(WLK),cmp_wlk);
 
-    int weo_isexp(const char*nm){for(int i=0;i<ne;i++)if(!strcmp(earr[i].name,nm))return 1;return 0;}
 
     /* (1) Local labels: not exported, not imported → STB_LOCAL (0x00) */
     for(int i=0;i<nl;i++){
-        if(weo_isexp(larr[i].name)) continue;
+        if(weo_isexp(earr,ne,larr[i].name)) continue;
         if(larr[i].is_imported) continue;   /* imported: emitted below as STB_GLOBAL/SHN_UNDEF */
         /* .equ+::reloctype のラベルはアドレスラベルとしてセクション相対シンボルで出力する。
          * reloc_type_override のない純粋な .equ 定数のみ SHN_ABS とする。 */
         int _equ_has_reloc = larr[i].is_equ && (larr[i].reloc_type_override >= 0);
         WSR sr = (larr[i].is_equ && !_equ_has_reloc)
                  ? (WSR){0xfff1, larr[i].val}
-                 : weo_shndx(larr[i].val*(uint64_t)bpw);
+                 : weo_shndx(csecs,ncs,larr[i].val*(uint64_t)bpw);
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
         snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
-        weo_sym(noff,0x00,0,sr.shndx,sr.sv,0);
+        weo_sym(&symtab_bb,&nsyms,_is_le,noff,0x00,0,sr.shndx,sr.sv,0);
     }
     int first_global=nsyms;
     /* (2) Imported symbols (.EXTERN): STB_GLOBAL (0x10) / SHN_UNDEF (0)
      * Mirrors axx.py: syms.append(_pack_sym(name_off, 0x10, 0, 0, 0, 0)) */
     for(int i=0;i<nl;i++){
         if(!larr[i].is_imported) continue;
-        if(weo_isexp(larr[i].name)) continue;
+        if(weo_isexp(earr,ne,larr[i].name)) continue;
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
         snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
-        weo_sym(noff,0x10,0,0,0,0);   /* SHN_UNDEF=0, value=0 */
+        weo_sym(&symtab_bb,&nsyms,_is_le,noff,0x10,0,0,0,0);   /* SHN_UNDEF=0, value=0 */
     }
     /* (3) Export labels → STB_GLOBAL (0x10) */
     for(int i=0;i<ne;i++){
         int _equ_has_reloc = earr[i].is_equ && (earr[i].reloc_type_override >= 0);
         WSR sr = (earr[i].is_equ && !_equ_has_reloc)
                  ? (WSR){0xfff1, earr[i].val}
-                 : weo_shndx(earr[i].val*(uint64_t)bpw);
+                 : weo_shndx(csecs,ncs,earr[i].val*(uint64_t)bpw);
         uint32_t noff=wbb_str(&strtab_bb,earr[i].name);
         snimap[snimap_len++]=(WSNI){earr[i].name,nsyms};
-        weo_sym(noff,0x10,0,sr.shndx,sr.sv,0);
+        weo_sym(&symtab_bb,&nsyms,_is_le,noff,0x10,0,sr.shndx,sr.sv,0);
     }
 
-    int weo_symof(const char*nm){for(int i=0;i<snimap_len;i++)if(!strcmp(snimap[i].name,nm))return snimap[i].idx;return 0;}
 
     /* ---- 5. build .rela data ---- */
     uint8_t **rela_bufs=calloc((size_t)(nrela?nrela:1),sizeof(uint8_t*));
@@ -5203,7 +5318,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         uint8_t *rb=calloc(1,rbs?rbs:1);
         for(int ei=0;ei<rl->len;ei++){
             uint8_t *rp=rb+ei*24;
-            uint64_t rinfo=((uint64_t)weo_symof(rl->data[ei].sym)<<32)|((uint32_t)rl->data[ei].rtype);
+            uint64_t rinfo=((uint64_t)weo_symof(snimap,snimap_len,rl->data[ei].sym)<<32)|((uint32_t)rl->data[ei].rtype);
             WEO_LE8(rp,(uint64_t)rl->data[ei].off);
             WEO_LE8(rp+8,rinfo);
             WEO_LE8S(rp+16,rl->data[ei].addend);
@@ -5221,8 +5336,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
      * carrying the in-section byte offset as the addend. Single CU, so
      * DW_AT_stmt_list and abbrev_offset are 0 (no relocation needed).
      * Strings are inline (DW_FORM_string), so no .debug_str is required. */
-    typedef struct { const char *name; uint8_t *data; size_t len; } DSEC;
-    typedef struct { const char *name; int target; uint8_t *data; size_t len; } DREL;
     DSEC dbg_prog[3]; int n_dbg_prog=0;
     DREL dbg_rela[2]; int n_dbg_rela=0;
     for(int _i=0;_i<3;_i++){ dbg_prog[_i]=(DSEC){NULL,NULL,0}; }
@@ -5230,25 +5343,8 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
 
     if(st->gen_debug && st->line_map_len>0){
         /* growable raw byte buffer */
-        typedef struct { uint8_t*b; size_t len,cap; } RB;
-        void rb_init(RB*r){ r->b=malloc(64); r->len=0; r->cap=64; if(!r->b){perror("malloc");exit(1);} }
-        void rb_need(RB*r,size_t n){ while(r->len+n>r->cap){ r->cap*=2; r->b=realloc(r->b,r->cap); if(!r->b){perror("realloc");exit(1);} } }
-        void rb_u8(RB*r,uint8_t v){ rb_need(r,1); r->b[r->len++]=v; }
-        void rb_app(RB*r,const void*s,size_t n){ rb_need(r,n); memcpy(r->b+r->len,s,n); r->len+=n; }
-        void rb_cstr(RB*r,const char*s){ rb_app(r,s,strlen(s)+1); }
-        void rb_uleb(RB*r,uint64_t v){ for(;;){ uint8_t b=(uint8_t)(v&0x7f); v>>=7; if(v) rb_u8(r,(uint8_t)(b|0x80)); else { rb_u8(r,b); break; } } }
-        void rb_sleb(RB*r,int64_t v){ for(;;){ uint8_t b=(uint8_t)(v&0x7f); v>>=7; if((v==0&&!(b&0x40))||(v==-1&&(b&0x40))){ rb_u8(r,b); break; } else rb_u8(r,(uint8_t)(b|0x80)); } }
-        void rb_w2(RB*r,uint16_t v){ uint8_t t[2]; WEO_W2(t,v); rb_app(r,t,2); }
-        void rb_w4(RB*r,uint32_t v){ uint8_t t[4]; WEO_W4(t,v); rb_app(r,t,4); }
-        void rb_w8(RB*r,uint64_t v){ uint8_t t[8]; WEO_W8(t,v); rb_app(r,t,8); }
 
         /* relocation accumulator for debug sections */
-        typedef struct { uint64_t off; int sym; int rtype; int64_t addend; } DRE;
-        typedef struct { DRE*d; int len,cap; } DRV;
-        void drv_add(DRV*v,uint64_t off,int sym,int rtype,int64_t add){
-            if(v->len>=v->cap){ v->cap=v->cap?v->cap*2:8; v->d=realloc(v->d,(size_t)v->cap*sizeof(DRE)); if(!v->d){perror("realloc");exit(1);} }
-            v->d[v->len++]=(DRE){off,sym,rtype,add};
-        }
 
         /* 64-bit absolute relocation type per arch (R_<arch>_64 semantics) */
         int abs64 = (machine==183)?257 : (machine==243)?2 : 1; /* aarch64 / riscv / else(x86_64) */
@@ -5285,27 +5381,27 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         RB die; rb_init(&die);
         rb_uleb(&die,1);
         rb_cstr(&die,producer);
-        rb_w2(&die,0x8001);            /* DW_LANG_Mips_Assembler */
+        rb_w2(&die,0x8001,_is_le);            /* DW_LANG_Mips_Assembler */
         rb_cstr(&die,cu_name);
         rb_cstr(&die,cwd);
         if(primary_idx>0) drv_add(&info_relas,die.len,primary_idx,abs64,0);
-        rb_w8(&die,0);                 /* low_pc (relocated) */
-        rb_w8(&die,primary_size);      /* high_pc (data8)    */
-        rb_w4(&die,0);                 /* stmt_list = 0      */
+        rb_w8(&die,0,_is_le);                 /* low_pc (relocated) */
+        rb_w8(&die,primary_size,_is_le);      /* high_pc (data8)    */
+        rb_w4(&die,0,_is_le);                 /* stmt_list = 0      */
         for(int i=0;i<nl;i++){
             if(larr[i].is_equ || larr[i].is_imported) continue;
-            WSR sr = weo_shndx(larr[i].val*(uint64_t)bpw);
+            WSR sr = weo_shndx(csecs,ncs,larr[i].val*(uint64_t)bpw);
             if(sr.shndx==0xfff1) continue;           /* not in a content section */
             rb_uleb(&die,2);
             rb_cstr(&die,larr[i].name);
             drv_add(&info_relas,die.len,(int)sr.shndx,abs64,(int64_t)sr.sv);
-            rb_w8(&die,0);
+            rb_w8(&die,0,_is_le);
         }
         rb_uleb(&die,0);               /* terminate CU children */
         RB info; rb_init(&info);
-        rb_w4(&info,(uint32_t)(2+4+1+die.len)); /* unit_length */
-        rb_w2(&info,4);                          /* version */
-        rb_w4(&info,0);                          /* debug_abbrev_offset */
+        rb_w4(&info,(uint32_t)(2+4+1+die.len),_is_le); /* unit_length */
+        rb_w2(&info,4,_is_le);                          /* version */
+        rb_w4(&info,0,_is_le);                          /* debug_abbrev_offset */
         rb_u8(&info,8);                          /* address_size */
         size_t info_prefix=info.len;             /* 4+2+4+1 = 11 */
         rb_app(&info,die.b,die.len);
@@ -5333,8 +5429,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         for(int fi=0;fi<nfiles;fi++){ rb_cstr(&hb,files[fi]); rb_uleb(&hb,0);rb_uleb(&hb,0);rb_uleb(&hb,0); }
         rb_u8(&hb,0);  /* end of file_names */
 
-        typedef struct { uint64_t wpc; int file; int line; } LROW;
-        int lrow_cmp(const void*a,const void*b){ uint64_t x=((const LROW*)a)->wpc,y=((const LROW*)b)->wpc; return x<y?-1:(x>y?1:0); }
         RB prog; rb_init(&prog);
         size_t prog_base = 4+2+4+hb.len;   /* program offset within .debug_line */
         for(int s=0;s<ncs;s++){
@@ -5350,7 +5444,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
             uint64_t first_off = rows[0].wpc*(uint64_t)bpw - secbase;
             rb_u8(&prog,0); rb_uleb(&prog,1+8); rb_u8(&prog,2);   /* DW_LNE_set_address */
             drv_add(&line_relas, prog_base+prog.len, s+1, abs64, (int64_t)first_off);
-            rb_w8(&prog,0);
+            rb_w8(&prog,0,_is_le);
             uint64_t cur_off=first_off; int cur_line=1, cur_file=1;
             for(int i=0;i<cnt;i++){
                 uint64_t boff = rows[i].wpc*(uint64_t)bpw - secbase;
@@ -5367,30 +5461,21 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         free(files); free(row_file);
 
         RB line; rb_init(&line);
-        rb_w4(&line,(uint32_t)(2+4+hb.len+prog.len)); /* unit_length */
-        rb_w2(&line,4);                                /* version */
-        rb_w4(&line,(uint32_t)hb.len);                 /* header_length */
+        rb_w4(&line,(uint32_t)(2+4+hb.len+prog.len),_is_le); /* unit_length */
+        rb_w2(&line,4,_is_le);                                /* version */
+        rb_w4(&line,(uint32_t)hb.len,_is_le);                 /* header_length */
         rb_app(&line,hb.b,hb.len);
         rb_app(&line,prog.b,prog.len);
         free(hb.b); free(prog.b);
 
         /* pack Elf64_Rela payloads */
-        uint8_t* pack_relas(DRV*v,size_t*outlen){
-            size_t n=(size_t)v->len*24; uint8_t*b=calloc(1,n?n:1);
-            for(int i=0;i<v->len;i++){
-                uint8_t*p=b+(size_t)i*24;
-                uint64_t rinfo=((uint64_t)v->d[i].sym<<32)|((uint32_t)v->d[i].rtype);
-                WEO_LE8(p,v->d[i].off); WEO_LE8(p+8,rinfo); WEO_LE8S(p+16,v->d[i].addend);
-            }
-            *outlen=n; return b;
-        }
 
         dbg_prog[n_dbg_prog++]=(DSEC){".debug_abbrev",abv.b,abv.len};
         int info_pi=n_dbg_prog; dbg_prog[n_dbg_prog++]=(DSEC){".debug_info",info.b,info.len};
         int line_pi=n_dbg_prog; dbg_prog[n_dbg_prog++]=(DSEC){".debug_line",line.b,line.len};
         for(int i=0;i<info_relas.len;i++) info_relas.d[i].off += info_prefix;
-        if(info_relas.len>0){ size_t L; uint8_t*B=pack_relas(&info_relas,&L); dbg_rela[n_dbg_rela++]=(DREL){".rela.debug_info",info_pi,B,L}; }
-        if(line_relas.len>0){ size_t L; uint8_t*B=pack_relas(&line_relas,&L); dbg_rela[n_dbg_rela++]=(DREL){".rela.debug_line",line_pi,B,L}; }
+        if(info_relas.len>0){ size_t L; uint8_t*B=dwarf_pack_relas(&info_relas,&L,_is_le); dbg_rela[n_dbg_rela++]=(DREL){".rela.debug_info",info_pi,B,L}; }
+        if(line_relas.len>0){ size_t L; uint8_t*B=dwarf_pack_relas(&line_relas,&L,_is_le); dbg_rela[n_dbg_rela++]=(DREL){".rela.debug_line",line_pi,B,L}; }
         free(info_relas.d); free(line_relas.d);
     }
     /* add debug section names to shstrtab (must be before offset computation) */
@@ -5404,18 +5489,12 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
      * ELF spec: "A section of type SHT_NOBITS occupies no space in the file."
      * We record sh_offset = current foff (any valid offset is fine; linkers
      * ignore it for NOBITS) but do NOT advance foff past the section data.
-     * weo_isno() mirrors the same .bss test used in the section-header loop. */
-    int weo_isno(int i){
-        char _n[64]; int _j=0;
-        for(;csecs[i].name[_j]&&_j<63;_j++) _n[_j]=(char)axx_upper_char(csecs[i].name[_j]);
-        _n[_j]=0;
-        return strncmp(_n,".BSS",4)==0;
-    }
+     * weo_isno(csecs,) mirrors the same .bss test used in the section-header loop. */
     uint64_t foff=64;
     uint64_t *sec_fo=calloc((size_t)ncs,sizeof(uint64_t));
     for(int i=0;i<ncs;i++){
         foff=WEO_ALIGN(foff,16); sec_fo[i]=foff;
-        if(!weo_isno(i)) foff+=csecs[i].bsz;  /* NOBITS: offset recorded, no file bytes */
+        if(!weo_isno(csecs,i)) foff+=csecs[i].bsz;  /* NOBITS: offset recorded, no file bytes */
     }
     uint64_t *rela_fo=calloc((size_t)(nrela?nrela:1),sizeof(uint64_t));
     for(int ri2=0;ri2<nrela;ri2++){foff=WEO_ALIGN(foff,8);rela_fo[ri2]=foff;foff+=rela_szs[ri2];}
@@ -5454,16 +5533,11 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
      * cast that to uint64_t, yielding UINT64_MAX, which is never < t so the
      * while-loop exited immediately — silently skipping the required padding
      * and corrupting the ELF file.  Now we detect the error and abort. */
-    void weo_pad(FILE*f,uint64_t t){
-        long c=ftell(f);
-        if(c < 0){ fprintf(stderr,"weo_pad: ftell failed\n"); return; }
-        while((uint64_t)c<t){fputc(0,f);c++;}
-    }
 
     for(int i=0;i<ncs;i++){
         weo_pad(fp,sec_fo[i]);
         /* NOBITS sections (.bss) have no file bytes — skip fwrite. */
-        if(!weo_isno(i) && csecs[i].bsz) fwrite(csecs[i].data,1,(size_t)csecs[i].bsz,fp);
+        if(!weo_isno(csecs,i) && csecs[i].bsz) fwrite(csecs[i].data,1,(size_t)csecs[i].bsz,fp);
     }
     for(int ri2=0;ri2<nrela;ri2++){weo_pad(fp,rela_fo[ri2]);if(rela_szs[ri2])fwrite(rela_bufs[ri2],1,rela_szs[ri2],fp);}
     weo_pad(fp,sym_fo); fwrite(symtab_bb.b,1,(size_t)nsyms*(size_t)WEO_SYMSZ,fp);
@@ -5474,15 +5548,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int i=0;i<n_dbg_rela;i++){ weo_pad(fp,dbg_rela_fo[i]); if(dbg_rela[i].len) fwrite(dbg_rela[i].data,1,dbg_rela[i].len,fp); }
     weo_pad(fp,shdr_fo);
 
-    void weo_shdr(FILE*f,uint32_t nm,uint32_t ty,uint64_t fl,uint64_t addr,uint64_t off,
-                  uint64_t sz,uint32_t lnk,uint32_t info,uint64_t align,uint64_t entsz){
-        uint8_t sh[64]={0};
-        WEO_LE4(sh,nm);WEO_LE4(sh+4,ty);WEO_LE8(sh+8,fl);WEO_LE8(sh+16,addr);
-        WEO_LE8(sh+24,off);WEO_LE8(sh+32,sz);WEO_LE4(sh+40,lnk);WEO_LE4(sh+44,info);
-        WEO_LE8(sh+48,align);WEO_LE8(sh+56,entsz);
-        fwrite(sh,1,64,f);
-    }
-    weo_shdr(fp,0,0,0,0,0,0,0,0,0,0); /* [0] NULL */
+    weo_shdr(fp,_is_le,0,0,0,0,0,0,0,0,0,0); /* [0] NULL */
     for(int i=0;i<ncs;i++){
         /* Fix: .bss は SHT_NOBITS (8)、それ以外は SHT_PROGBITS (1)。
          * ELF 仕様上 SHT_NOBITS セクションはファイル領域を持たない（sh_size は
@@ -5492,20 +5558,20 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         for(;csecs[i].name[_ui]&&_ui<63;_ui++) _un[_ui]=(char)axx_upper_char(csecs[i].name[_ui]);
         _un[_ui]=0;
         uint32_t _sh_type = (strncmp(_un,".BSS",4)==0) ? 8 : 1;
-        weo_shdr(fp,sec_noff[i],_sh_type,csecs[i].fl,0,sec_fo[i],csecs[i].bsz,0,0,16,0);
+        weo_shdr(fp,_is_le,sec_noff[i],_sh_type,csecs[i].fl,0,sec_fo[i],csecs[i].bsz,0,0,16,0);
     }
     for(int ri2=0;ri2<nrela;ri2++)
-        weo_shdr(fp,rela_noff[ri2],4,0x40,0,rela_fo[ri2],rela_szs[ri2],
+        weo_shdr(fp,_is_le,rela_noff[ri2],4,0x40,0,rela_fo[ri2],rela_szs[ri2],
                  (uint32_t)sym_shidx,(uint32_t)(rs_idx[ri2]+1),8,24);
-    weo_shdr(fp,sym_noff,2,0,0,sym_fo,(uint64_t)nsyms*(uint64_t)WEO_SYMSZ,
+    weo_shdr(fp,_is_le,sym_noff,2,0,0,sym_fo,(uint64_t)nsyms*(uint64_t)WEO_SYMSZ,
              (uint32_t)str_shidx,(uint32_t)first_global,8,(uint64_t)WEO_SYMSZ);
-    weo_shdr(fp,str_noff,3,0,0,str_fo,strtab_bb.len,0,0,1,0);
-    weo_shdr(fp,shstr_noff,3,0,0,shstr_fo,shstr.len,0,0,1,0);
+    weo_shdr(fp,_is_le,str_noff,3,0,0,str_fo,strtab_bb.len,0,0,1,0);
+    weo_shdr(fp,_is_le,shstr_noff,3,0,0,shstr_fo,shstr.len,0,0,1,0);
     /* DWARF debug section headers (PROGBITS then RELA). */
     for(int i=0;i<n_dbg_prog;i++)
-        weo_shdr(fp,dbg_prog_noff[i],1,0,0,dbg_prog_fo[i],dbg_prog[i].len,0,0,1,0);
+        weo_shdr(fp,_is_le,dbg_prog_noff[i],1,0,0,dbg_prog_fo[i],dbg_prog[i].len,0,0,1,0);
     for(int i=0;i<n_dbg_rela;i++)
-        weo_shdr(fp,dbg_rela_noff[i],4,0x40,0,dbg_rela_fo[i],dbg_rela[i].len,
+        weo_shdr(fp,_is_le,dbg_rela_noff[i],4,0x40,0,dbg_rela_fo[i],dbg_rela[i].len,
                  (uint32_t)sym_shidx,(uint32_t)(dbg_base+1+dbg_rela[i].target),8,24);
     fclose(fp);
     fprintf(stderr,"elf: wrote %s (%d section(s), %d rela section(s), %d symbol(s)%s)\n",
@@ -5754,27 +5820,8 @@ static int imp_label(Assembler *asmb, const char *l){
  * main
  * ========================================================= */
 static void print_usage(const char *prog){
-printf("usage: caxx [-h] [--osabi {FreeBSD,Linux}] [-b OUTFILE] [-e EXPORT_TSV] [-E EXPORT_ELF_TSV] [-i IMPORT_TSV] [-o OBJ_FILE] [-m MACHINE] [--dynamic] [--needed NEEDED] [-v] [-d] [-g] patternfile [sourcefile]\n\n");
-printf("axx general assembler programmed and designed by Taisuke Maekawa\n\n");
-printf("positional arguments:\n");
-printf("  patternfile           Pattern definition file (.axx)\n");
-printf("  sourcefile            Assembly source file (.s). Omit for interactive mode.\n\n");
-printf("options:\n");
-printf("  -h, --help            show this help message and exit\n");
-printf("  --osabi {FreeBSD,Linux}\n");
-printf("                        ELF OSABI value (default: FreeBSD)\n");
-printf("  -b OUTFILE            Output binary file\n");
-printf("  -e EXPORT_TSV         Export labels to TSV file (plain format)\n");
-printf("  -E EXPORT_ELF_TSV     Export labels to TSV file (ELF section flags format)\n");
-printf("  -i IMPORT_TSV         Import labels from TSV file\n");
-printf("  -o OBJ_FILE           Write ELF64 relocatable object file (.o)\n");
-printf("  -m MACHINE            ELF e_machine value (default 62=EM_X86_64; 183=AArch64, 243=RISC-V, 3=i386, 20=PPC, 40=ARM)\n");
-printf("  --dynamic             Output as dynamic shared object (ET_DYN) with .dynamic, PLT/GOT etc.\n");
-printf("  --needed NEEDED       Add DT_NEEDED library (can be specified multiple times)\n");
-printf("  -v, --verbose         Verbose: print assembly listing to stdout (default: silent)\n");
-printf("  -d, --debug           Enable debug output (forward-ref fallback, relaxation log, etc.)\n");
-printf("  -g, --gen-debug       Generate DWARF debug information (.debug_info/.debug_abbrev/.debug_line) in the ELF object so\n");
-printf("                        that gdb/lldb can do source-level debugging. Effective only together with -o.\n");
+    printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-m machine] [-v]\n",prog);
+    printf("axx general assembler programmed and designed by Taisuke Maekawa\n");
 }
 
 typedef struct {
