@@ -2486,17 +2486,25 @@ class DirectiveProcessor:
         書式: .clrcheck::var
           var : 小文字1文字の変数名。省略時は全変数の拘束を解除する。
         対象変数の .check 拘束をテーブルから削除する。
+
+        仕様: 変数名はフィールド2 (i[2]) を参照する。
+        readpat のフィールドマッピングにより `.clrcheck::var` 形式
+        （2フィールド）は i[1]='' / i[2]='var' となるため、
+        .setsym 等と同様に引数はフィールド2 に格納される。
+        i[2] が空の場合は引数省略とみなし全拘束を解除する。
         """
         if len(i) == 0 or i[0] != '.clrcheck':
             return False
-        if len(i) >= 2 and i[1].strip():
-            var = i[1].strip().lower()
+        var_field = i[2].strip() if len(i) >= 3 and i[2] else ''
+        if var_field:
+            var = var_field.lower()
             if len(var) == 1 and var in LOWER:
                 self.state.check_constraints.pop(var, None)
             else:
-                print(f" error - .clrcheck: variable should be a lower case letter ('{i[1]}').",
+                print(f" error - .clrcheck: variable should be a lower case letter ('{var_field}').",
                       file=sys.stderr)
         else:
+            # 引数なし: 全 .check 拘束条件を解除する。
             self.state.check_constraints.clear()
         return True
 
@@ -4168,6 +4176,14 @@ class Assembler:
         line = StringUtils.remove_comment_asm(line)
         if line == '':
             return False
+
+        # アセンブリ行を1行処理するたびに .check 拘束条件を全解除する。
+        # パターンファイルの .check ディレクティブはパターン走査ループ
+        # (lineassemble2 内の `for i in self.state.pat`) の中で再登録される。
+        # 行ごとにここでクリアしておくことで、パターン走査が当該行のために
+        # 再登録した .check 拘束のみが有効になり、前行の走査で蓄積された
+        # 残留拘束が次行へ持ち越されない。
+        self.state.check_constraints.clear()
 
         # 修正4a: .EQU 式はパターンファイル由来のシンボル（レジスタ名など）を
         # 参照できるべきだが、前行のパターンスキャンで蓄積された
