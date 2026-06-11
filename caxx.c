@@ -5754,8 +5754,27 @@ static int imp_label(Assembler *asmb, const char *l){
  * main
  * ========================================================= */
 static void print_usage(const char *prog){
-    printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-m machine] [-v]\n",prog);
-    printf("axx general assembler programmed and designed by Taisuke Maekawa\n");
+printf("usage: caxx [-h] [--osabi {FreeBSD,Linux}] [-b OUTFILE] [-e EXPORT_TSV] [-E EXPORT_ELF_TSV] [-i IMPORT_TSV] [-o OBJ_FILE] [-m MACHINE] [--dynamic] [--needed NEEDED] [-v] [-d] [-g] patternfile [sourcefile]\n\n");
+printf("axx general assembler programmed and designed by Taisuke Maekawa\n\n");
+printf("positional arguments:\n");
+printf("  patternfile           Pattern definition file (.axx)\n");
+printf("  sourcefile            Assembly source file (.s). Omit for interactive mode.\n\n");
+printf("options:\n");
+printf("  -h, --help            show this help message and exit\n");
+printf("  --osabi {FreeBSD,Linux}\n");
+printf("                        ELF OSABI value (default: FreeBSD)\n");
+printf("  -b OUTFILE            Output binary file\n");
+printf("  -e EXPORT_TSV         Export labels to TSV file (plain format)\n");
+printf("  -E EXPORT_ELF_TSV     Export labels to TSV file (ELF section flags format)\n");
+printf("  -i IMPORT_TSV         Import labels from TSV file\n");
+printf("  -o OBJ_FILE           Write ELF64 relocatable object file (.o)\n");
+printf("  -m MACHINE            ELF e_machine value (default 62=EM_X86_64; 183=AArch64, 243=RISC-V, 3=i386, 20=PPC, 40=ARM)\n");
+printf("  --dynamic             Output as dynamic shared object (ET_DYN) with .dynamic, PLT/GOT etc.\n");
+printf("  --needed NEEDED       Add DT_NEEDED library (can be specified multiple times)\n");
+printf("  -v, --verbose         Verbose: print assembly listing to stdout (default: silent)\n");
+printf("  -d, --debug           Enable debug output (forward-ref fallback, relaxation log, etc.)\n");
+printf("  -g, --gen-debug       Generate DWARF debug information (.debug_info/.debug_abbrev/.debug_line) in the ELF object so\n");
+printf("                        that gdb/lldb can do source-level debugging. Effective only together with -o.\n");
 }
 
 typedef struct {
