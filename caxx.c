@@ -2924,7 +2924,12 @@ static int dir_check(Assembler *asmb, PatEntry *e){
 
 static int dir_clrcheck(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".clrcheck") != 0) return 0;
-    const char *var_str = e->f[1];
+    /* 仕様: 変数名はフィールド2 (f[2]) を参照する。
+     * readpat のフィールドマッピングにより `.clrcheck::var` 形式
+     * （2フィールド）は f[1]="" / f[2]="var" となるため、
+     * .setsym 等と同様に引数はフィールド2 に格納される。
+     * f[2] が空の場合は引数省略とみなし全拘束を解除する。 */
+    const char *var_str = e->f[2];
     if(var_str[0]){
         char var = (char)tolower((unsigned char)var_str[0]);
         if(var < 'a' || var > 'z' || var_str[1] != '\0'){
@@ -4539,6 +4544,17 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     axx_reduce_spaces(line);
     axx_remove_comment_asm(line);
     if(!line[0]){ free(line); return 0; }
+
+    /* アセンブリ行を1行処理するたびに .check 拘束条件を全解除する。
+     * パターンファイルの .check ディレクティブはパターン走査ループ
+     * (lineassemble2 内のパターン探索) の中で再登録される。行ごとに
+     * ここでクリアしておくことで、パターン走査が当該行のために再登録した
+     * .check 拘束のみが有効になり、前行の走査で蓄積された残留拘束が
+     * 次行へ持ち越されない。 */
+    for(int _ci = 0; _ci < 26; _ci++){
+        sv_free(&asmb->st.check_constraints[_ci]);
+        sv_init(&asmb->st.check_constraints[_ci]);
+    }
 
     smap_clear(&asmb->st.symbols);
     for(int pi=0; pi<asmb->st.patsymbols.nb; pi++)
