@@ -413,7 +413,7 @@ class StringUtils:
                     # 出力されるためユーザーが気づきにくい。警告を出す。
                     if idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF':
                         print(f" warning - '\\x' escape takes at most 2 hex digits; "
-                              f"extra digit(s) treated as literal characters in: {l2!r}")
+                              f"extra digit(s) treated as literal characters in: {l2!r}", file=sys.stderr)
                     if hex_str:
                         s += chr(int(hex_str, 16))
                     else:
@@ -523,7 +523,7 @@ class Parser:
                 idx += 1
             if idx >= len(s):
                 # 閉じブレースが見つからなかった
-                print(f" error - missing closing '}}' in expression: '{{{t}'")
+                print(f" error - missing closing '}}' in expression: '{{{t}'", file=sys.stderr)
                 # Fix ④修正: 旧実装は start_idx（'{' 内部）を返していたため、
                 # 呼び出し元パーサーが '{' の中身を後続の式として誤解析していた。
                 # len(s) を返してパースを強制終了させる。
@@ -1016,16 +1016,16 @@ class LabelManager:
                 old_is_imported = len(existing) > 3 and existing[3]
                 if not old_is_imported:
                     self.state.error_label_conflict = True
-                    print(f" error - label already defined.")
+                    print(f" error - label already defined.", file=sys.stderr)
                     return False
         elif self.state.pas == 2:
             if k not in self.state.labels:
                 self.state.error_label_conflict = True
-                print(f" error - label '{k}' not defined in pass 1.")
+                print(f" error - label '{k}' not defined in pass 1.", file=sys.stderr)
                 return False
 
         if k in self.state.patsymbols:
-            print(f" error - '{k}' is a pattern file symbol.")
+            print(f" error - '{k}' is a pattern file symbol.", file=sys.stderr)
             return False
         
         self.state.error_label_conflict = False
@@ -1108,7 +1108,7 @@ class ExpressionEvaluator:
     
     def err(self, m):
         """Print error message"""
-        print(m)
+        print(m, file=sys.stderr)
         return -1
     
     def factor(self, s, idx):
@@ -1130,7 +1130,7 @@ class ExpressionEvaluator:
                 x, idx = self.factor(s, idx + 1)
             except RecursionError:
                 if self.state.pas == 2 or self.state.pas == 0:
-                    print(" error - expression nesting too deep (RecursionError) in unary '-'.")
+                    print(" error - expression nesting too deep (RecursionError) in unary '-'.", file=sys.stderr)
                 return 0, idx
             x = -x
         elif idx < len(s) and s[idx] == '~':
@@ -1138,7 +1138,7 @@ class ExpressionEvaluator:
                 x, idx = self.factor(s, idx + 1)
             except RecursionError:
                 if self.state.pas == 2 or self.state.pas == 0:
-                    print(" error - expression nesting too deep (RecursionError) in unary '~'.")
+                    print(" error - expression nesting too deep (RecursionError) in unary '~'.", file=sys.stderr)
                 return 0, idx
             # Fix: x が float('inf') / float('nan') のとき int(x) が OverflowError になる。
             # nbit() と同じ方針: 非有限の float は 0 として扱う。
@@ -1146,14 +1146,14 @@ class ExpressionEvaluator:
                 x = ~int(x)
             except (OverflowError, ValueError):
                 if self.state.pas == 2 or self.state.pas == 0:
-                    print(f" error - cannot apply bitwise NOT (~) to non-finite float value.")
+                    print(f" error - cannot apply bitwise NOT (~) to non-finite float value.", file=sys.stderr)
                 x = 0
         elif idx < len(s) and s[idx] == '@':
             try:
                 x, idx = self.factor(s, idx + 1)
             except RecursionError:
                 if self.state.pas == 2 or self.state.pas == 0:
-                    print(" error - expression nesting too deep (RecursionError) in unary '@'.")
+                    print(" error - expression nesting too deep (RecursionError) in unary '@'.", file=sys.stderr)
                 return 0, idx
             x = self.nbit(x)
         elif idx < len(s) and s[idx] == '*':
@@ -1170,22 +1170,22 @@ class ExpressionEvaluator:
                             shift_amount = int(x2) * 8
                         except (OverflowError, ValueError):
                             if self.state.pas == 2 or self.state.pas == 0:
-                                print(" error - non-finite byte-extract offset in *(expr, expr).")
+                                print(" error - non-finite byte-extract offset in *(expr, expr).", file=sys.stderr)
                             x = 0
                         else:
                             if shift_amount < 0:
                                 if self.state.pas == 2 or self.state.pas == 0:
-                                    print(" error - negative byte-extract offset in *(expr, expr).")
+                                    print(" error - negative byte-extract offset in *(expr, expr).", file=sys.stderr)
                                 x = 0
                             else:
                                 x = x >> shift_amount
                     else:
                         # 修正⑩: 閉じ括弧 ')' がない場合はエラーを報告して 0 を返す
-                        print(" error - missing ')' in *(expr, expr) expression.")
+                        print(" error - missing ')' in *(expr, expr) expression.", file=sys.stderr)
                         x=0
                 else:
                     # 修正⑩: カンマがない場合はエラーを報告して 0 を返す
-                    print(" error - missing ',' in *(expr, expr) expression.")
+                    print(" error - missing ',' in *(expr, expr) expression.", file=sys.stderr)
                     x=0
             else:
                 # Fix: '*' の後に '(' が続かない場合は *(expr,expr) 構文のミスタイプ。
@@ -1193,7 +1193,7 @@ class ExpressionEvaluator:
                 # idx を進めないため、呼び出し元の term0() が '*' を二項演算子として
                 # 再解釈し 0 * (次の式) = 0 となる（サイレントなセマンティクスは変わらないが
                 # 少なくとも問題を通知する）。
-                print(" error - expected '(' after '*' in *(expr,expr) expression.")
+                print(" error - expected '(' after '*' in *(expr,expr) expression.", file=sys.stderr)
                 # x=0, idx unchanged
         else:
             prev_idx = idx
@@ -1343,7 +1343,7 @@ class ExpressionEvaluator:
             else:
                 # Fix 2: 閉じ括弧がない不正な入力を検出して報告する。
                 # 旧実装はエラーなしに続行し、パース位置がずれたまま処理が続いていた。
-                print(" error - missing closing ')' in expression.")
+                print(" error - missing closing ')' in expression.", file=sys.stderr)
         # Fix ⑥: 境界チェックを idx+4<=len(s) に統一する。
         elif idx+4<=len(s) and s[idx:idx+4]=="'\\t'":
             x=0x09
@@ -1404,7 +1404,7 @@ class ExpressionEvaluator:
             # 修正: 未定義シンボル（"" のまま）は 0 として扱いエラーを明示する。
             if _sym_val == "":
                 if self.state.pas == 2 or self.state.pas == 0:
-                    print(f" error - undefined symbol: '#{t}'")
+                    print(f" error - undefined symbol: '#{t}'", file=sys.stderr)
                 x = 0
             else:
                 x = _sym_val
@@ -1479,7 +1479,7 @@ class ExpressionEvaluator:
                         x = int.from_bytes(struct.pack('>d', v), "big")
                     except (OverflowError, ValueError, struct.error):
                         if self.state.pas == 2 or self.state.pas == 0:
-                            print(f" error - dbl{{}}: cannot convert expression to float64; using 0.")
+                            print(f" error - dbl{{}}: cannot convert expression to float64; using 0.", file=sys.stderr)
                         x = 0
         elif (idx + 3 <= len(s) and s[idx:idx+3] == 'flt'
               # Bugfix: 'flt' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
@@ -1501,7 +1501,7 @@ class ExpressionEvaluator:
                         x = int.from_bytes(struct.pack('>f', v), "big")
                     except (OverflowError, ValueError, struct.error):
                         if self.state.pas == 2 or self.state.pas == 0:
-                            print(f" error - flt{{}}: cannot convert expression to float32; using 0.")
+                            print(f" error - flt{{}}: cannot convert expression to float32; using 0.", file=sys.stderr)
                         x = 0
         elif (idx + 5 <= len(s) and s[idx:idx+5] == 'enflt'
               # Bugfix: 'enflt' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
@@ -1531,7 +1531,7 @@ class ExpressionEvaluator:
                 # 修正: 未定義ラベル検出時は 0 を使ってエラーを明示する。
                 if _inner_undef:
                     if self.state.pas == 2 or self.state.pas == 0:
-                        print(" error - enflt{}: expression contains undefined label.")
+                        print(" error - enflt{}: expression contains undefined label.", file=sys.stderr)
                     x = enflt(0)
                 else:
                     # Fix: v が float('inf')/nan のとき int(v) は OverflowError になる。
@@ -1539,7 +1539,7 @@ class ExpressionEvaluator:
                         x = enflt(int(v) & 0xFFFFFFFF)
                     except (OverflowError, ValueError):
                         if self.state.pas == 2 or self.state.pas == 0:
-                            print(" error - enflt{}: non-finite float value; using 0.")
+                            print(" error - enflt{}: non-finite float value; using 0.", file=sys.stderr)
                         x = enflt(0)
         elif (idx + 5 <= len(s) and s[idx:idx+5] == 'endbl'
               # Bugfix: 'endbl' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
@@ -1557,7 +1557,7 @@ class ExpressionEvaluator:
                 # Bugfix2 (silent NaN): enflt と同様に未定義ラベル時は 0 を使いエラーを明示する。
                 if _inner_undef:
                     if self.state.pas == 2 or self.state.pas == 0:
-                        print(" error - endbl{}: expression contains undefined label.")
+                        print(" error - endbl{}: expression contains undefined label.", file=sys.stderr)
                     x = endbl(0)
                 else:
                     # Fix: v が float('inf')/nan のとき int(v) は OverflowError になる。
@@ -1565,7 +1565,7 @@ class ExpressionEvaluator:
                         x = endbl(int(v) & 0xFFFFFFFFFFFFFFFF)
                     except (OverflowError, ValueError):
                         if self.state.pas == 2 or self.state.pas == 0:
-                            print(" error - endbl{}: non-finite float value; using 0.")
+                            print(" error - endbl{}: non-finite float value; using 0.", file=sys.stderr)
                         x = endbl(0)
         elif self.state.exp_typ=='i' and idx < len(s) and s[idx].isdigit():
                 fs, idx = self.parser.get_intstr(s, idx)
@@ -1736,12 +1736,12 @@ class ExpressionEvaluator:
                 # Fix: 負のシフト量は ValueError になる。ガードして 0 を返す。
                 if t < 0:
                     if self.state.pas == 2 or self.state.pas == 0:
-                        print(f" error - negative shift count ({t}) in << expression.")
+                        print(f" error - negative shift count ({t}) in << expression.", file=sys.stderr)
                     x = 0; break
                 # Fix: 過大なシフト量は巨大整数を作りメモリを大量消費する。
                 if t > _SHIFT_MAX:
                     if self.state.pas == 2 or self.state.pas == 0:
-                        print(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in << expression.")
+                        print(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in << expression.", file=sys.stderr)
                     x = 0; break
                 x <<= t
             elif StringUtils.q(s, '>>', idx):
@@ -1754,7 +1754,7 @@ class ExpressionEvaluator:
                 # Fix: 負のシフト量は ValueError になる。ガードして 0 を返す。
                 if t < 0:
                     if self.state.pas == 2 or self.state.pas == 0:
-                        print(f" error - negative shift count ({t}) in >> expression.")
+                        print(f" error - negative shift count ({t}) in >> expression.", file=sys.stderr)
                     x = 0; break
                 # >> は右シフトなので大きな値でもメモリ問題は起きないが統一性のためガードする。
                 if t > _SHIFT_MAX:
@@ -1770,7 +1770,7 @@ class ExpressionEvaluator:
             return int(v)
         except (OverflowError, ValueError):
             if self.state.pas == 2 or self.state.pas == 0:
-                print(f" error - non-finite value {v!r} in bitwise '{op_name}' operation; treated as 0.")
+                print(f" error - non-finite value {v!r} in bitwise '{op_name}' operation; treated as 0.", file=sys.stderr)
             return 0
 
     def term3(self, s, idx):
@@ -1836,7 +1836,7 @@ class ExpressionEvaluator:
                 x = 0
             elif t > _SEXT_MAX_BITS:
                 # 修正⑨: 非現実的なビット幅は 0 として扱う
-                print(f" warning - sign-extension bit width {t} exceeds maximum {_SEXT_MAX_BITS}, result set to 0.")
+                print(f" warning - sign-extension bit width {t} exceeds maximum {_SEXT_MAX_BITS}, result set to 0.", file=sys.stderr)
                 x = 0
             else:
                 x = (x & ~((~0) << t)) | ((~0) << t if (x >> (t-1) & 1) else 0)
@@ -2213,7 +2213,7 @@ class BinaryWriter:
                 self.fwrite(a, int(x), 0)
             except (OverflowError, ValueError):
                 if self.state.pas == 2 or self.state.pas == 0:
-                    print(f" error - non-finite value {x!r} cannot be written as binary word.")
+                    print(f" error - non-finite value {x!r} cannot be written as binary word.", file=sys.stderr)
 
     def outbin(self, a, x):
         """Output binary with printing"""
@@ -2225,7 +2225,7 @@ class BinaryWriter:
                 self.fwrite(a, int(x), _prt)
             except (OverflowError, ValueError):
                 if self.state.pas == 2 or self.state.pas == 0:
-                    print(f" error - non-finite value {x!r} cannot be written as binary word.")
+                    print(f" error - non-finite value {x!r} cannot be written as binary word.", file=sys.stderr)
     
     def align_(self, addr):
         """Align address"""
@@ -2276,7 +2276,7 @@ class DirectiveProcessor:
         
         # 引数チェック: 少なくとも .setsym KEY が必要
         if len(i) < 2:
-            print(f" error - .setsym directive requires at least a symbol name")
+            print(f" error - .setsym directive requires at least a symbol name", file=sys.stderr)
             return False
         
         key = StringUtils.upper(i[1])
@@ -2314,7 +2314,7 @@ class DirectiveProcessor:
             try:
                 self.state.bts = int(v)
             except (OverflowError, ValueError):
-                print(f" error - .bits: non-finite bit width value.")
+                print(f" error - .bits: non-finite bit width value.", file=sys.stderr)
         return True
     
     def paddingp(self, i):
@@ -2336,7 +2336,7 @@ class DirectiveProcessor:
         try:
             self.state.padding = int(v)
         except (OverflowError, ValueError):
-            print(f" error - .padding: non-finite or invalid value; padding unchanged.")
+            print(f" error - .padding: non-finite or invalid value; padding unchanged.", file=sys.stderr)
         return True
     
     def symbolc(self, i):
@@ -2355,7 +2355,7 @@ class DirectiveProcessor:
         
         # 引数チェック: .vliw には5つのパラメータが必要
         if len(i) < 5:
-            print(f" error - .vliw directive requires 4 parameters (vliwbits, vliwinstbits, vliwtemplatebits, nop_value), got {len(i)-1}")
+            print(f" error - .vliw directive requires 4 parameters (vliwbits, vliwinstbits, vliwtemplatebits, nop_value), got {len(i)-1}", file=sys.stderr)
             return False
         
         v1, idx = self.expr_eval.expression_pat(i[1], 0)
@@ -2369,7 +2369,7 @@ class DirectiveProcessor:
             self.state.vliwinstbits    = int(v2)
             self.state.vliwtemplatebits = int(v3)
         except (OverflowError, ValueError):
-            print(f" error - .vliw: non-finite parameter value.")
+            print(f" error - .vliw: non-finite parameter value.", file=sys.stderr)
             return False
         self.state.vliwflag = True
         
@@ -2391,7 +2391,7 @@ class DirectiveProcessor:
         
         # 引数チェック: EPIC には少なくとも2つのパラメータが必要
         if len(i) < 3:
-            print(f" error - EPIC directive requires 2 parameters (indices, pattern), got {len(i)-1}")
+            print(f" error - EPIC directive requires 2 parameters (indices, pattern), got {len(i)-1}", file=sys.stderr)
             return False
         
         s = i[1]
@@ -2461,10 +2461,10 @@ class DirectiveProcessor:
 
             if (self.state.pas == 2 or self.state.pas == 0) and u:
                 t_int = int(t)
-                print(f"Line {self.state.ln} Error code {t_int} ", end="")
+                print(f"Line {self.state.ln} Error code {t_int} ", end="", file=sys.stderr)
                 if 0 <= t_int < len(ERRORS):
-                    print(f"{ERRORS[t_int]}", end='')
-                print(": ")
+                    print(f"{ERRORS[t_int]}", end='', file=sys.stderr)
+                print(": ", file=sys.stderr)
                 error_code = t_int
                 triggered = True
 
@@ -2646,7 +2646,7 @@ class PatternMatcher:
                         v = int.from_bytes(struct.pack('>f', v), "big")
                     except (OverflowError, ValueError, struct.error):
                         if self.state.pas == 2 or self.state.pas == 0:
-                            print(f" error - !F: cannot convert value to float32; using 0.")
+                            print(f" error - !F: cannot convert value to float32; using 0.", file=sys.stderr)
                         v = 0
                     self.var_manager.put(a, v)
                     # consume stopchar from source as well
@@ -2682,7 +2682,7 @@ class PatternMatcher:
                         v = int.from_bytes(struct.pack('>d', v), "big")
                     except (OverflowError, ValueError, struct.error):
                         if self.state.pas == 2 or self.state.pas == 0:
-                            print(f" error - !D: cannot convert value to float64; using 0.")
+                            print(f" error - !D: cannot convert value to float64; using 0.", file=sys.stderr)
                         v = 0
                     self.var_manager.put(a, v)
                     # consume stopchar from source as well
@@ -2836,7 +2836,7 @@ class PatternMatcher:
         if cnt > _MAX_OPT_GROUPS:
             if self.state.pas == 2 or self.state.pas == 0:
                 print(f" warning - pattern has {cnt} optional groups (max {_MAX_OPT_GROUPS}); "
-                      f"truncating to avoid combinatorial explosion.")
+                      f"truncating to avoid combinatorial explosion.", file=sys.stderr)
             sl = sl[:_MAX_OPT_GROUPS]
             cnt = _MAX_OPT_GROUPS
 
@@ -2880,7 +2880,7 @@ class PatternFileReader:
         # Fix: 深い .INCLUDE ネストは RecursionError になる。現実的な上限を設ける。
         _MAX_PAT_DEPTH = 50
         if _depth > _MAX_PAT_DEPTH:
-            print(f" error - pattern .INCLUDE nesting exceeds {_MAX_PAT_DEPTH}: '{fn}'")
+            print(f" error - pattern .INCLUDE nesting exceeds {_MAX_PAT_DEPTH}: '{fn}'", file=sys.stderr)
             return []
         
         # 相対パスを解決する
@@ -2935,7 +2935,7 @@ class PatternFileReader:
                         # パターンファイルの書き間違い（区切り文字ミス等）を検出するため
                         # 警告を出力する。
                         print(f" warning - pattern line has more than 6 fields "
-                              f"(extra fields ignored): {l[6:]!r}")
+                              f"(extra fields ignored): {l[6:]!r}", file=sys.stderr)
                         p = [l[0], l[1], l[2], l[3], l[4], l[5]]
                     w.append(p)
         
@@ -2982,10 +2982,10 @@ class PatternFileReader:
                           "Please use double quotes.", file=_sys.stderr)
                     s = fallback
                 else:
-                    print(f" error - .INCLUDE directive has no filename: {l!r}")
+                    print(f" error - .INCLUDE directive has no filename: {l!r}", file=sys.stderr)
                     return []   # マッチしたがエラー → 空リスト
             else:
-                print(f" error - .INCLUDE directive has no filename: {l!r}")
+                print(f" error - .INCLUDE directive has no filename: {l!r}", file=sys.stderr)
                 return []   # マッチしたがエラー → 空リスト
         w = self.readpat(s, base_dir, _depth=_depth)
         return w   # 空ファイルなら [] だが呼び出し元で区別される
@@ -3068,7 +3068,7 @@ class ObjectGenerator:
                         n_int = 0
                     if n_int > _N_MAX:
                         if self.state.pas == 2 or self.state.pas == 0:
-                            print(f" error - @@[n,...]: repeat count {n_int} exceeds maximum {_N_MAX}.")
+                            print(f" error - @@[n,...]: repeat count {n_int} exceeds maximum {_N_MAX}.", file=sys.stderr)
                         n_int = 0
                     # Expand pattern n times
                     if n_int > 0:
@@ -3216,7 +3216,7 @@ class VLIWProcessor:
         # .vliw ディレクティブで不正な値が渡された場合を想定してガードする。
         if self.state.vliwinstbits == 0:
             if self.state.pas == 0 or self.state.pas == 2:
-                print(" error - vliwinstbits is zero; cannot compute instruction slots.")
+                print(" error - vliwinstbits is zero; cannot compute instruction slots.", file=sys.stderr)
             return False
         for k in self.state.vliwset:
             # Fix 5 (new): 旧実装は sorted(k[0]) == sorted(idxlst) で比較していたため
@@ -3246,7 +3246,7 @@ class VLIWProcessor:
                 target_len = ibyte * noi
                 if len(values) > target_len:
                     if self.state.pas == 2 or self.state.pas == 0:
-                        print(f"warning-VLIW:{len(values)} values exceed slot capacity {target_len},truncating.")
+                        print(f"warning-VLIW:{len(values)} values exceed slot capacity {target_len},truncating.", file=sys.stderr)
                     values = values[:target_len]
                 else:
                     # Bugfix: 旧実装は `range(target_len - len(values))` 回 vliwnop を追加
@@ -3340,7 +3340,7 @@ class VLIWProcessor:
             # VLIW テンプレート未定義のまま通過し、Pass2 でアドレスがずれていた。
             # 修正後: 全 pass で False を返す。Pass1 の try/except が処理する。
             if self.state.pas == 0 or self.state.pas == 2:
-                print(" error - No vliw instruction-set defined.")
+                print(" error - No vliw instruction-set defined.", file=sys.stderr)
             return False
         return True
 
@@ -3458,7 +3458,7 @@ class AssemblyDirectiveProcessor:
                     # ディレクティブ全体を失敗扱いにする（return False）。
                     # ch=None のままループを続けると後続の文字が出力されてしまい、
                     # バイナリが部分的に変化する問題があった。
-                    print(f" error - '\\x' escape requires at least one hex digit in string: {l2!r}")
+                    print(f" error - '\\x' escape requires at least one hex digit in string: {l2!r}", file=sys.stderr)
                     return False
             else:
                 ch = l2[idx]
@@ -3468,7 +3468,7 @@ class AssemblyDirectiveProcessor:
                 self.state.pc += 1
         # Fix: 閉じダブルクォートが見つからずループを抜けた場合は警告する
         if idx >= len(l2):
-            print(f" warning - unterminated string literal in .ASCII/.ASCIZ: {l2!r}")
+            print(f" warning - unterminated string literal in .ASCII/.ASCIZ: {l2!r}", file=sys.stderr)
         return True
     
     def export_processing(self, l1, l2):
@@ -3517,21 +3517,21 @@ class AssemblyDirectiveProcessor:
         x, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
             if self.state.pas == 2 or self.state.pas == 0:
-                print(f" error - .RESB argument contains undefined label.")
+                print(f" error - .RESB argument contains undefined label.", file=sys.stderr)
             return True
         try:
             x = int(x)
         except (OverflowError, ValueError):
             if self.state.pas == 2 or self.state.pas == 0:
-                print(f" error - .RESB argument is non-finite or invalid.")
+                print(f" error - .RESB argument is non-finite or invalid.", file=sys.stderr)
             return True
         if x < 0:
-            print(f" error - .RESB requires a non-negative count, got {x}.")
+            print(f" error - .RESB requires a non-negative count, got {x}.", file=sys.stderr)
             return True
         _RESB_MAX = 1 << 28  # 256MB 超は非現実的
         if x > _RESB_MAX:
             if self.state.pas == 2 or self.state.pas == 0:
-                print(f" error - .RESB count {x} exceeds maximum {_RESB_MAX}.")
+                print(f" error - .RESB count {x} exceeds maximum {_RESB_MAX}.", file=sys.stderr)
             return True
         self.state.pc += x
         return True
@@ -3555,22 +3555,22 @@ class AssemblyDirectiveProcessor:
         if self.state.error_undefined_label:
             # pass2 なら未定義ラベルエラーとして報告（pass1 はスキップ）
             if self.state.pas == 2 or self.state.pas == 0:
-                print(f" error - .ZERO argument contains undefined label.")
+                print(f" error - .ZERO argument contains undefined label.", file=sys.stderr)
             return True
         try:
             x = int(x)
         except (OverflowError, ValueError):
             if self.state.pas == 2 or self.state.pas == 0:
-                print(f" error - .ZERO argument is non-finite or invalid.")
+                print(f" error - .ZERO argument is non-finite or invalid.", file=sys.stderr)
             return True
         if x < 0:
-            print(f" error - .ZERO requires a non-negative count, got {x}.")
+            print(f" error - .ZERO requires a non-negative count, got {x}.", file=sys.stderr)
             return True
         # Fix: 上限ガード（UNDEF 由来の巨大値でのフリーズ防止）
         _ZERO_MAX = 1 << 28  # 256MB 超は非現実的
         if x > _ZERO_MAX:
             if self.state.pas == 2 or self.state.pas == 0:
-                print(f" error - .ZERO count {x} exceeds maximum {_ZERO_MAX}.")
+                print(f" error - .ZERO count {x} exceeds maximum {_ZERO_MAX}.", file=sys.stderr)
             return True
         for i in range(x):
             self.binary_writer.outbin2(self.state.pc, 0x00)
@@ -3593,7 +3593,7 @@ class AssemblyDirectiveProcessor:
         # 修正: asciistr() で文字列を出力した後、ヌル終端を追加する。
         if not self.asciistr(l2):
             if self.state.pas == 2 or self.state.pas == 0:
-                print(f" error - .ASCIZ requires a quoted string.")
+                print(f" error - .ASCIZ requires a quoted string.", file=sys.stderr)
             return False
         # ヌル終端を追加 (asciistr はヌルを書かない)
         self.binary_writer.outbin(self.state.pc, 0x00)
@@ -3684,10 +3684,10 @@ class AssemblyDirectiveProcessor:
             try:
                 u_int = int(u)
             except (OverflowError, ValueError):
-                print(f" error - .ALIGN argument is non-finite or invalid.")
+                print(f" error - .ALIGN argument is non-finite or invalid.", file=sys.stderr)
                 return True
             if u_int <= 0:
-                print(f" error - .ALIGN requires a positive value, got {u_int}.")
+                print(f" error - .ALIGN requires a positive value, got {u_int}.", file=sys.stderr)
                 return True
             self.state.align = u_int
         
@@ -3699,7 +3699,7 @@ class AssemblyDirectiveProcessor:
         if StringUtils.upper(l1) != ".ENDSECTION" and StringUtils.upper(l1) != ".ENDSEGMENT":
             return False
         if self.state.current_section not in self.state.sections:
-            print(f" error - .ENDSECTION without matching .SECTION for '{self.state.current_section}'.")
+            print(f" error - .ENDSECTION without matching .SECTION for '{self.state.current_section}'.", file=sys.stderr)
             return True
         entry = self.state.sections[self.state.current_section]
         start = entry[0]
@@ -3712,7 +3712,7 @@ class AssemblyDirectiveProcessor:
         block_size = self.state.pc - entry_pc
         if block_size < 0:
             print(f" warning - ENDSECTION: computed block size {block_size} < 0 for "
-                  f"'{self.state.current_section}'; keeping previous size.")
+                  f"'{self.state.current_section}'; keeping previous size.", file=sys.stderr)
             return True
         # 既存の確定済みサイズに今回のブロック分を加算して確定させる。
         # 初回（re-declaration なし）は entry[1]==0 なのでそのまま block_size になる。
@@ -3824,17 +3824,17 @@ class AssemblyDirectiveProcessor:
         # さらに pc = UNDEF となって後続の全処理が壊れる。
         if self.state.error_undefined_label:
             if self.state.pas == 2 or self.state.pas == 0:
-                print(f" error - .ORG argument contains undefined label.")
+                print(f" error - .ORG argument contains undefined label.", file=sys.stderr)
             return True
         try:
             u = int(u)
         except (OverflowError, ValueError):
             if self.state.pas == 2 or self.state.pas == 0:
-                print(f" error - .ORG argument is non-finite or invalid.")
+                print(f" error - .ORG argument is non-finite or invalid.", file=sys.stderr)
             return True
         if u < 0:
             if self.state.pas == 2 or self.state.pas == 0:
-                print(f" error - .ORG address must be non-negative, got {u}.")
+                print(f" error - .ORG address must be non-negative, got {u}.", file=sys.stderr)
             return True
         if idx + 2 <= len(l2) and l2[idx:idx+2].upper() == ',P':
             if u > self.state.pc:
@@ -3843,7 +3843,7 @@ class AssemblyDirectiveProcessor:
                 fill_count = u - self.state.pc
                 if fill_count > _ORG_FILL_MAX:
                     if self.state.pas == 2 or self.state.pas == 0:
-                        print(f" error - .ORG ,P fill count {fill_count} exceeds maximum {_ORG_FILL_MAX}.")
+                        print(f" error - .ORG ,P fill count {fill_count} exceeds maximum {_ORG_FILL_MAX}.", file=sys.stderr)
                     return True
                 for i in range(fill_count):
                     self.binary_writer.outbin2(i + self.state.pc, self.state.padding)
@@ -3930,12 +3930,12 @@ class Assembler:
             # エラーメッセージを出力してユーザーに知らせる。
             _ok = self.asm_directive_proc.ascii_processing(l, l2)
             if not _ok and (self.state.pas == 2 or self.state.pas == 0):
-                print(f" error - .ASCII: failed to process string argument: {l2!r}")
+                print(f" error - .ASCII: failed to process string argument: {l2!r}", file=sys.stderr)
             return 0, [], True, idx
         if _l_upper == '.ASCIZ':
             _ok = self.asm_directive_proc.asciiz_processing(l, l2)
             if not _ok and (self.state.pas == 2 or self.state.pas == 0):
-                print(f" error - .ASCIZ: failed to process string argument: {l2!r}")
+                print(f" error - .ASCIZ: failed to process string argument: {l2!r}", file=sys.stderr)
             return 0, [], True, idx
         if self.include_asm(l, l2):
             return 0, [], True, idx
@@ -4094,7 +4094,7 @@ class Assembler:
                         # するため、ここで追加リセットは不要。
                         if self.state.debug:
                             import traceback as _tb
-                            print(f" [pass1 forward-ref fallback] {type(_exc).__name__}: {_exc}")
+                            print(f" [pass1 forward-ref fallback] {type(_exc).__name__}: {_exc}", file=sys.stderr)
                             _tb.print_exc()
                         try:
                             self.state._pass1_size_mode = True
@@ -4493,7 +4493,7 @@ class Assembler:
                 vflag = self.vliw_proc.vliwprocess(line, idxs, objl, flag, idx, self.lineassemble2)
             except Exception:
                 if self.state.pas == 0 or self.state.pas == 2:
-                    print(" error - Some error(s) in vliw definition.")
+                    print(" error - Some error(s) in vliw definition.", file=sys.stderr)
             return vflag
         
         return True
@@ -4589,7 +4589,7 @@ class Assembler:
         # 現実的な上限 (100段) を設けてエラーを出す。
         _MAX_INCLUDE_DEPTH = 100
         if len(self.state.fnstack) >= _MAX_INCLUDE_DEPTH:
-            print(f" error - .INCLUDE nesting depth exceeds {_MAX_INCLUDE_DEPTH}: '{fn}'")
+            print(f" error - .INCLUDE nesting depth exceeds {_MAX_INCLUDE_DEPTH}: '{fn}'", file=sys.stderr)
             return
         try:
             abs_fn = os.path.abspath(fn) if fn not in ("stdin", "") else fn
@@ -4601,7 +4601,7 @@ class Assembler:
             except Exception:
                 already_abs = already
             if abs_fn == already_abs:
-                print(f" error - circular .INCLUDE detected: '{fn}' is already being assembled.")
+                print(f" error - circular .INCLUDE detected: '{fn}' is already being assembled.", file=sys.stderr)
                 return
 
         # fnstack と lnstack を必ずペアで push してから try に入る。

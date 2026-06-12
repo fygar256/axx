@@ -1123,7 +1123,7 @@ static void axx_get_string(const char *l2, char *out, size_t osz) {
     }
     out[n]=0;
     if(!l2[idx])
-        printf(" warning - unterminated string literal: %s\n", l2);
+        fprintf(stderr, " warning - unterminated string literal: %s\n", l2);
 }
 
 /* =========================================================
@@ -1832,18 +1832,18 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
  * Output: {'label': ['0xVAL', 'section'], ...} on one line */
 static void label_print_all(AsmState *st){
     int first=1;
-    printf("{");
+    fprintf(stderr, "{");
     for(int i=0;i<st->labels.nbuckets;i++){
         for(LabelEntry*e=st->labels.buckets[i];e;e=e->next){
-            if(!first) printf(", ");
-            printf("'%s': ['0x%llx', '%s']",
+            if(!first) fprintf(stderr, ", ");
+            fprintf(stderr, "'%s': ['0x%llx', '%s']",
                    e->key,
                    (unsigned long long)u256_to_u64(e->value),
                    e->section);
             first=0;
         }
     }
-    printf("}\n");
+    fprintf(stderr, "}\n");
 }
 
 /* =========================================================
@@ -2397,12 +2397,12 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             uint256_t t=expr_term0_0(asmb,s,idx+2,&idx);
             if(flt){
                 double b=u256_to_double(t);
-                if(b==0.0){ printf("Division by 0 error.\n"); x=double_to_u256(0.0); }
+                if(b==0.0){ fprintf(stderr, "Division by 0 error.\n"); x=double_to_u256(0.0); }
                 else x=double_to_u256(floor(u256_to_double(x)/b));
             } else {
                 /* Fix L: set x=0 on div-by-zero; previously x kept the old
                  * dividend value, making 'a//0' silently return 'a'. */
-                if(u256_is_zero(t)){ printf("Division by 0 error.\n"); x=u256_zero(); }
+                if(u256_is_zero(t)){ fprintf(stderr, "Division by 0 error.\n"); x=u256_zero(); }
                 else x=u256_floordiv(x,t);
             }
         } else if(s[idx]=='/'&&s[idx+1]!='/'){
@@ -2410,22 +2410,22 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
             if(flt){
                 double b=u256_to_double(t);
-                if(b==0.0){ printf("Division by 0 error.\n"); x=double_to_u256(0.0); }
+                if(b==0.0){ fprintf(stderr, "Division by 0 error.\n"); x=double_to_u256(0.0); }
                 else x=double_to_u256(u256_to_double(x)/b);
             } else {
                 /* Fix L: same as // fix */
-                if(u256_is_zero(t)){ printf("Division by 0 error.\n"); x=u256_zero(); }
+                if(u256_is_zero(t)){ fprintf(stderr, "Division by 0 error.\n"); x=u256_zero(); }
                 else x=u256_floordiv(x,t);
             }
         } else if(s[idx]=='%'){
             uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
             if(flt){
                 double b=u256_to_double(t);
-                if(b==0.0){ printf("Division by 0 error.\n"); x=double_to_u256(0.0); }
+                if(b==0.0){ fprintf(stderr, "Division by 0 error.\n"); x=double_to_u256(0.0); }
                 else x=double_to_u256(fmod(u256_to_double(x),b));
             } else {
                 /* Fix L: same as // fix */
-                if(u256_is_zero(t)){ printf("Division by 0 error.\n"); x=u256_zero(); }
+                if(u256_is_zero(t)){ fprintf(stderr, "Division by 0 error.\n"); x=u256_zero(); }
                 else x=u256_mod(x,t);
             }
         } else break;
@@ -2517,7 +2517,7 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
             x=u256_zero();
         } else if(tv > SEXT_MAX_BITS){
             /* 修正⑨: 非現実的なビット幅は警告を出して 0 を返す (axx.py term6) */
-            printf(" warning - sign-extension bit width %lld exceeds maximum %d, result set to 0.\n",
+            fprintf(stderr, " warning - sign-extension bit width %lld exceeds maximum %d, result set to 0.\n",
                    (long long)tv, SEXT_MAX_BITS);
             x=u256_zero();
         } else {
@@ -4507,7 +4507,7 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
             /* Mirrors Python:
              *   print(f" ; pat {pln} {pl} error - Illegal syntax in assemble line or pattern line.")
              * pl is the PatEntry (list of 6 strings). */
-            printf(" ; pat %d ['%s', '%s', '%s', '%s', '%s', '%s'] error - Illegal syntax in assemble line or pattern line.\n",
+            fprintf(stderr, " ; pat %d ['%s', '%s', '%s', '%s', '%s', '%s'] error - Illegal syntax in assemble line or pattern line.\n",
                    pln,
                    oerr_entry ? oerr_entry->f[0] : "",
                    oerr_entry ? oerr_entry->f[1] : "",
