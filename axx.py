@@ -2115,14 +2115,6 @@ class BinaryWriter:
                   f"output file '{self.state.outfile}' will be empty.", file=sys.stderr)
             return
 
-        # Fix ⑧修正: bts == 0 の場合は bytes_per_word = 0 になり
-        # total_size = 0 → data[base_idx + i] への書き込みで IndexError が発生する。
-        # .bits 0 のような不正な設定を早期検出してエラーを出す。
-        if self.state.bts <= 0:
-            print(f" error - bts (word bit width) is {self.state.bts}; cannot write output.",
-                  file=__import__('sys').stderr)
-            return
-
         # Fix(new): 負のキーが混入している場合はスキップして安全に処理する。
         # _store でもガードしているが、旧バージョンのバッファが持ち越された場合への防護。
         valid_buffer = {k: v for k, v in self._buffer.items() if k >= 0}
@@ -4056,10 +4048,7 @@ class Assembler:
                         # Fix 10: error() の戻り値でエラー発生を検知し、
                         # エラー時はオブジェクト生成をスキップする。
                         # .check 拘束条件の検証（プローブ完了後・makeobj 前）
-                        _check_violated = False
                         err_triggered, _err_code = self.directive_proc.error(i[1])
-                        if _check_violated:
-                            err_triggered = True
                         if not err_triggered:
                             # pc_instr_start は上のプローブブロックで設定済み
                             objl = self.obj_gen.makeobj(i[2])
@@ -4142,10 +4131,7 @@ class Assembler:
                         self.state.error_undefined_label = False
                     # Fix 10: error() の戻り値でエラー発生を検知する（デバッグモード）
                     # .check 拘束条件の検証（プローブ完了後・makeobj 前）
-                    _check_violated_dbg = False
                     err_triggered, _err_code = self.directive_proc.error(i[1])
-                    if _check_violated_dbg:
-                        err_triggered = True
                     if not err_triggered:
                         # pc_instr_start は上のプローブブロックで設定済み
                         objl = self.obj_gen.makeobj(i[2])

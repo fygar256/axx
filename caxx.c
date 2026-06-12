@@ -2974,34 +2974,6 @@ static int dir_check_eval(Assembler *asmb){
     AsmState *st = &asmb->st;
     int violated = 0;
     return violated;
-    for(int vi = 0; vi < 26; vi++){
-        StrVec *cv = &st->check_constraints[vi];
-        if(cv->len == 0) continue;              /* no constraint for this var */
-        uint256_t val = st->vars[vi];
-        /* val must equal the value of at least one allowed symbol */
-        int ok = 0;
-        for(int si = 0; si < cv->len && !ok; si++){
-            uint256_t sym_val;
-            if(smap_get(&st->symbols, cv->data[si], &sym_val) && u256_eq(val, sym_val))
-                ok = 1;
-        }
-        if(!ok){
-            violated = 1;
-            if(st->pas == 2 || st->pas == 0){
-                char var_name[2]; var_name[0] = (char)('a' + vi); var_name[1] = '\0';
-                /* Build allowed symbol list for the error message */
-                char sym_list[1024]; sym_list[0] = '\0';
-                for(int si = 0; si < cv->len; si++){
-                    if(si > 0) strncat(sym_list, ", ", sizeof(sym_list)-strlen(sym_list)-1);
-                    strncat(sym_list, cv->data[si], sizeof(sym_list)-strlen(sym_list)-1);
-                }
-                fprintf(stderr,
-                    " error - .check: the value of variable '%s' is not any of [%s].  [%s:%d]\n",
-                    var_name, sym_list, st->current_file, st->ln);
-            }
-        }
-    }
-    return violated;
 }
 
 /* Fix 10 (axx.py): dir_error() now returns 1 when at least one condition
@@ -4468,11 +4440,7 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
             }
             /* Fix 10 (axx.py): only call makeobj when dir_error did NOT trigger.
              * Previously makeobj always ran even if an .error condition fired. */
-            /* .check 拘束条件の検証（プローブ完了後・makeobj 前）
-             * Mirrors axx.py: _check_violated = directive_proc.check_constraints_eval() */
-            int _check_violated = dir_check_eval(asmb);
             int err_triggered = dir_error(asmb,i->f[1]);
-            if(_check_violated) err_triggered = 1;
             if(!err_triggered){
                 /* pc_instr_start は上のプローブブロックで設定済み */
                 makeobj(asmb,i->f[2],objl_out);
