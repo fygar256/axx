@@ -6,7 +6,7 @@ axx general assembler designed and programmed by Taisuke Maekawa
 Refactored with OOP design for improved maintainability
 """
 
-from decimal import Decimal, getcontext
+from decimal import Decimal, getcontext, localcontext
 try:
     import readline  # GNU readline (Unix/macOS only; not available on Windows)
 except ImportError:
@@ -41,6 +41,35 @@ CB = chr(0x91)  # close double bracket
 # Constants
 UNDEF = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 VAR_UNDEF = 0
+
+# B修正: UNDEF 由来値の検出を一元化し、閾値を引き上げる。
+#
+# 設計上 UNDEF (=2^256-1) は「未定義ラベル」を表す番兵として整数値に重畳されている。
+# UNDEF に対する加減算（UNDEF - base, UNDEF + disp 等）は 2^256 近傍の巨大値となり、
+# これらも「未定義由来」として 0 扱いすべきである。
+#
+# 旧実装は閾値 2^128 を使っていたが、これは「正当に計算され得る大きな値」と衝突する:
+# axx は最大 256bit 値・128bit 浮動小数点(quad)を扱うため、2^128 以上の正当な定数/即値が
+# 存在し得る。それらが誤って「未定義」と判定され 0 に潰れる危険があった。
+#
+# 修正: 閾値を 2^192 に引き上げる。アドレスは 64bit に収まり、quad 即値も < 2^128 なので、
+# 正当な値が 2^192 に達することは現実的にない。一方 UNDEF(2^256-1) および
+# UNDEF±変位・base-UNDEF（≈±2^256）はすべて閾値を超えるため確実に捕捉できる。
+# 符号付き両側を見るため abs() で判定する。
+#
+# 注: これは依然ヒューリスティックである。原理的に厳密な解決は「未定義」を
+# 数値に重畳するのをやめ専用の未定義型/フラグで伝播させる設計変更（大規模）だが、
+# 本修正は誤検出を実用上ゼロまで下げる範囲で現実的な改善を行う。
+_UNDEF_DERIVED_THRESHOLD = 1 << 192
+
+def _is_undef_derived(v):
+    """v が UNDEF そのもの、または UNDEF 由来の巨大値かを判定する。"""
+    if v == UNDEF:
+        return True
+    if isinstance(v, int):
+        # bool は int 部分型だが Python の abs(True)=1 で誤検出しないので問題ない
+        return abs(v) >= _UNDEF_DERIVED_THRESHOLD
+    return False
 
 # Character sets
 CAPITAL = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -157,6 +186,17 @@ class AssemblerState:
         # {label_name: pc_value} の辞書。収束判定に使う。
         # モジュールレベルの番兵で初期化することで run() 複数回呼び出しも安全。
         self._pass1_prev_label_pcs = _RELAXATION_SENTINEL
+
+        # A修正: 前反復で確定した「ラベル名→値」の辞書。
+        # 旧実装はリラクゼーション各反復の先頭で labels を imported のみへ全リセットし、
+        # かつ pass1 の前方参照を 0(サイズプローブ)／UNDEF(本処理) として評価していた。
+        # その結果、前方参照のサイズ推定が反復間で一切変化せず、リラクゼーションが
+        # 実質的に機能していなかった（前方分岐の最適長へ収束しない）。
+        # 修正: 前反復で確定したラベル値をここに保持し、現反復で「まだ定義前」の
+        # 前方参照に対しては 0/UNDEF ではなくこの推定値を返す（get_value 参照）。
+        # これにより error 条件（短形式/長形式の選択）が現実的な変位で評価され、
+        # 反復を重ねるごとに真のレイアウトへ収束する。初回反復は空（推定値なし）。
+        self._relax_prev_values = {}
 
         # 標準出力へのリスト出力: True のときのみ lineassemble0 がリストを stdout に出力する。
         # False（デフォルト）のときはエラー/警告のみ表示し、バイナリ出力は通常通り行う。
@@ -670,18 +710,22 @@ class IEEE754Converter:
     def decimal_to_ieee754_128bit_hex(a):
         """Convert decimal to IEEE 754 128-bit (binary128 / quad) hex.
 
-        Python's struct does not support binary128, so we implement the
-        conversion with the Decimal module at high precision.
-        The binary exponent is found by integer bit-length of the scaled
-        integer approximation, which avoids any float-precision loss.
-        Precision is set to 60 digits to cover the 112-bit significand
-        (~34 significant decimal digits) with rounding headroom.
+        D7修正: 旧実装は getcontext().prec をグローバルに 60 へ書き換えたまま
+        復元していなかった。これはプロセス全体の Decimal 既定精度を恒久的に
+        変えてしまい、他のコンテキスト（および将来のマルチスレッド/再入）に
+        副作用を残す。localcontext() を使い、この変換中だけ精度 60 を適用して
+        終了時に自動復元する。
         """
+        with localcontext() as _ctx:
+            _ctx.prec = 60  # 112ビット仮数部(約34桁)を十分カバー
+            return IEEE754Converter._decimal_to_ieee754_128bit_hex_impl(a)
+
+    @staticmethod
+    def _decimal_to_ieee754_128bit_hex_impl(a):
+        """decimal_to_ieee754_128bit_hex の本体（localcontext 内で呼ばれる）。"""
         BIAS = 16383
         SIGNIFICAND_BITS = 112
         EXPONENT_BITS = 15
-
-        getcontext().prec = 60  # 112ビット仮数部(約34桁)を十分カバー
 
         if a == 'inf':
             a = 'Infinity'
@@ -776,8 +820,16 @@ class IEEE754Converter:
         シンボル・ラベルを含む式（Decimal で解析できない場合）は
         ValueError を送出する。呼び出し側は except して
         float モードのフォールバックに切り替える。
+
+        D7修正: prec=60 を localcontext() に閉じ込め、グローバル汚染を防ぐ。
         """
-        getcontext().prec = 60
+        with localcontext() as _ctx:
+            _ctx.prec = 60
+            return IEEE754Converter._decimal_eval_expr_impl(text)
+
+    @staticmethod
+    def _decimal_eval_expr_impl(text):
+        """decimal_eval_expr の本体（localcontext 内で呼ばれる）。"""
         text = text.strip()
 
         def skip(s, i):
@@ -964,8 +1016,18 @@ class LabelManager:
         try:
             v = self.state.labels[k][0]
         except (KeyError, IndexError):
+            # A修正: pass1 で現反復未定義のラベル（前方参照）は、前反復で確定した
+            # 値があればそれを推定値として返す。これにより:
+            #   (1) リラクゼーションが前方参照の最適長へ実際に収束するようになる。
+            #   (2) サイズプローブ(size_mode=True/旧0)と本処理(size_mode=False/旧UNDEF)で
+            #       前方参照の値が食い違う問題（指摘2）が解消され、両者が同じ推定値を見る。
+            # 推定値が手に入る場合は error_undefined_label を立てない（確からしい値なので
+            # makeobj を正常に進めてよい）。pass2(pas==2)ではこの分岐は使わず、
+            # 真に未定義のラベルは従来どおりエラーになる。
+            if self.state.pas == 1 and k in self.state._relax_prev_values:
+                return self.state._relax_prev_values[k]
             if self.state._pass1_size_mode:
-                # Pass1 サイズ推定モード中は 0 を返す。
+                # Pass1 サイズ推定モード中で前反復値も無い（初回反復の前方参照）→ 0。
                 # error_undefined_label は False のまま（Trueにするとmakeobjがスキップする）。
                 return 0
             v = UNDEF
@@ -1244,11 +1306,9 @@ class ExpressionEvaluator:
                 self.state.error_undefined_label = True
                 val = 0
                 return hex(0)
-            # Fix ⑤修正: UNDEF (2^256-1) やそれに由来する超大整数が xeval に
-            # 流れ込むと hex() で 64 桁の文字列になり、Python の多倍長整数演算で
-            # 天文学的に遅くなる。2^128 以上は「UNDEF 由来」として 0 に置き換える。
-            _UNDEF_THRESHOLD = 1 << 128
-            if val == UNDEF or (isinstance(val, int) and val >= _UNDEF_THRESHOLD):
+            # B修正: UNDEF 由来の巨大整数（UNDEF そのもの・UNDEF±変位等）を 0 に置換し、
+            # 未定義フラグを立てる。閾値判定は _is_undef_derived に一元化（2^192）。
+            if _is_undef_derived(val):
                 self.state.error_undefined_label = True
                 return hex(0)
             # ELF追跡: get_value() と同じ分岐方針で記録する。
@@ -1276,54 +1336,113 @@ class ExpressionEvaluator:
 
         s = re.sub(pattern, replacer, x)
 
-        # Fix 3: eval() の代わりに AST ウォークによるホワイトリスト検証を行う。
-        # '__builtins__' を空にするだけではクラス継承チェーン経由の
-        # 任意コード実行を防げないため、許可ノード種別を明示的に制限する。
+        # D9修正: eval() を完全に除去する。
+        # 旧実装は AST をホワイトリスト検証した「後」に compile()+eval() で実行して
+        # いた。検証により任意コード実行は防がれていたが、eval を使う限り
+        # 「検証漏れ＝即コード実行」という脆い構造が残る。
+        # ここでは検証済みノードのみを直接解釈する小さな再帰インタプリタに置き換え、
+        # eval を一切呼ばない。演算意味は旧 eval と同一（'/' は float, '//' は floor）。
+        # 不許可ノードに遭遇したら ValueError を送出するので、検証と評価が一体化する。
         import ast as _ast
 
-        _ALLOWED_NODES = (
-            _ast.Expression,
-            _ast.BinOp, _ast.UnaryOp,
-            _ast.Add, _ast.Sub, _ast.Mult, _ast.Div, _ast.FloorDiv,
-            _ast.Mod, _ast.Pow,
-            _ast.BitAnd, _ast.BitOr, _ast.BitXor,
-            _ast.LShift, _ast.RShift,
-            _ast.Invert, _ast.UAdd, _ast.USub,
-            _ast.Constant,
-            _ast.Call, _ast.Name, _ast.Load,
-            _ast.IfExp,
-            _ast.Compare,
-            _ast.Eq, _ast.NotEq, _ast.Lt, _ast.LtE, _ast.Gt, _ast.GtE,
-            _ast.BoolOp, _ast.And, _ast.Or,
-        )
-        _ALLOWED_NAMES = {"enfloat", "endouble", "enflt", "endbl"}
+        _ALLOWED_FUNCS = {
+            "enfloat": enfloat, "endouble": endouble,
+            "enflt": enflt, "endbl": endbl,
+        }
 
         try:
             tree = _ast.parse(s, mode='eval')
         except SyntaxError as e:
             raise ValueError(f"xeval: parse error in '{s}': {e}")
 
-        for node in _ast.walk(tree):
-            if not isinstance(node, _ALLOWED_NODES):
-                raise ValueError(
-                    f"xeval: disallowed AST node {type(node).__name__} in '{s}'")
-            if isinstance(node, _ast.Name) and node.id not in _ALLOWED_NAMES:
-                raise ValueError(
-                    f"xeval: disallowed name '{node.id}' in '{s}'")
+        def _ev(node):
+            if isinstance(node, _ast.Expression):
+                return _ev(node.body)
+            if isinstance(node, _ast.Constant):
+                if isinstance(node.value, (int, float, bool)):
+                    return node.value
+                raise ValueError(f"xeval: disallowed constant {node.value!r} in '{s}'")
+            if isinstance(node, _ast.BinOp):
+                l = _ev(node.left)
+                r = _ev(node.right)
+                op = node.op
+                if isinstance(op, _ast.Add):      return l + r
+                if isinstance(op, _ast.Sub):      return l - r
+                if isinstance(op, _ast.Mult):     return l * r
+                if isinstance(op, _ast.Div):      return l / r
+                if isinstance(op, _ast.FloorDiv): return l // r
+                if isinstance(op, _ast.Mod):      return l % r
+                if isinstance(op, _ast.Pow):
+                    # 巨大指数による資源枯渇(DoS)を防ぐ（term0_0 と同じ上限 1024）。
+                    if isinstance(r, int) and r > 1024:
+                        raise ValueError("xeval: exponent exceeds 1024")
+                    return l ** r
+                if isinstance(op, _ast.BitAnd):   return l & r
+                if isinstance(op, _ast.BitOr):    return l | r
+                if isinstance(op, _ast.BitXor):   return l ^ r
+                if isinstance(op, _ast.LShift):
+                    # 巨大シフト量による資源枯渇を防ぐ。
+                    if isinstance(r, int) and r > 4096:
+                        raise ValueError("xeval: shift count exceeds 4096")
+                    return l << r
+                if isinstance(op, _ast.RShift):   return l >> r
+                raise ValueError(f"xeval: disallowed operator {type(op).__name__} in '{s}'")
+            if isinstance(node, _ast.UnaryOp):
+                v = _ev(node.operand)
+                op = node.op
+                if isinstance(op, _ast.UAdd):   return +v
+                if isinstance(op, _ast.USub):   return -v
+                if isinstance(op, _ast.Invert): return ~v
+                raise ValueError(f"xeval: disallowed unary operator {type(op).__name__} in '{s}'")
+            if isinstance(node, _ast.BoolOp):
+                if isinstance(node.op, _ast.And):
+                    res = True
+                    for vn in node.values:
+                        res = _ev(vn)
+                        if not res:
+                            return res
+                    return res
+                if isinstance(node.op, _ast.Or):
+                    res = False
+                    for vn in node.values:
+                        res = _ev(vn)
+                        if res:
+                            return res
+                    return res
+                raise ValueError(f"xeval: disallowed bool operator in '{s}'")
+            if isinstance(node, _ast.Compare):
+                left = _ev(node.left)
+                for cop, comp in zip(node.ops, node.comparators):
+                    right = _ev(comp)
+                    if   isinstance(cop, _ast.Eq):    ok = left == right
+                    elif isinstance(cop, _ast.NotEq): ok = left != right
+                    elif isinstance(cop, _ast.Lt):    ok = left <  right
+                    elif isinstance(cop, _ast.LtE):   ok = left <= right
+                    elif isinstance(cop, _ast.Gt):    ok = left >  right
+                    elif isinstance(cop, _ast.GtE):   ok = left >= right
+                    else:
+                        raise ValueError(f"xeval: disallowed comparison in '{s}'")
+                    if not ok:
+                        return False
+                    left = right
+                return True
+            if isinstance(node, _ast.IfExp):
+                return _ev(node.body) if _ev(node.test) else _ev(node.orelse)
             if isinstance(node, _ast.Call):
                 if (not isinstance(node.func, _ast.Name)
-                        or node.func.id not in _ALLOWED_NAMES):
-                    raise ValueError(
-                        f"xeval: disallowed function call in '{s}'")
+                        or node.func.id not in _ALLOWED_FUNCS):
+                    raise ValueError(f"xeval: disallowed function call in '{s}'")
+                if node.keywords:
+                    raise ValueError(f"xeval: keyword arguments not allowed in '{s}'")
+                args = [_ev(a) for a in node.args]
+                return _ALLOWED_FUNCS[node.func.id](*args)
+            if isinstance(node, _ast.Name):
+                # 関数名以外の裸の識別子は許可しない（Call 経路でのみ Name を消費する）。
+                raise ValueError(f"xeval: disallowed name '{node.id}' in '{s}'")
+            raise ValueError(
+                f"xeval: disallowed AST node {type(node).__name__} in '{s}'")
 
-        safe_env = {
-            "__builtins__": {},
-            "enfloat": enfloat,
-            "endouble": endouble,
-            "enflt": enflt,
-            "endbl": endbl,
-        }
-        result = eval(compile(tree, '<xeval>', 'eval'), safe_env, {})
+        result = _ev(tree)
         if not isinstance(result, (int, float, bool)):
             raise ValueError(f"xeval: unsafe result type {type(result)}")
         return result
@@ -1595,11 +1714,11 @@ class ExpressionEvaluator:
                 # 修正: _in_match_attempt=False かつ pass2/対話モード かつ
                 # _pass1_size_mode=False (プローブ中でない) のとき、
                 # 変数値が UNDEF 由来であればエラーを発生させる。
-                _UNDEF_THRESHOLD = 1 << 128
+                # B修正: 閾値判定を _is_undef_derived に一元化（2^192）。
                 if (not self.state._in_match_attempt
                         and not self.state._pass1_size_mode
                         and (self.state.pas == 2 or self.state.pas == 0)
-                        and (x == UNDEF or (isinstance(x, int) and x >= _UNDEF_THRESHOLD))):
+                        and _is_undef_derived(x)):
                     self.state.error_undefined_label = True
                     print(f" error - Label undefined: variable '{ch}' contains undefined value"
                           f"  [{self.state.current_file}:{self.state.ln}]", file=sys.stderr)
@@ -1985,9 +2104,22 @@ class ExpressionEvaluator:
     
     def expression(self, s, idx):
         """Main expression evaluator (internal, s must already be NUL-terminated)"""
-        idx = StringUtils.skipspc(s, idx)
-        x, idx = self.term11(s, idx)
-        return x, idx
+        # C修正: 旧実装は factor の単項 -,~,@ でのみ RecursionError を捕捉しており、
+        # 括弧式 '(' → expression（factor1 経由）、enflt{}/endbl{}、[] ブラケット等の
+        # 深いネストは未保護で、lineassemble2 の外（.equ 評価など）では
+        # 未捕捉の RecursionError でクラッシュし得た。
+        # 全公開エントリ（expression_pat/asm/esc/esc_float）と factor1 からの
+        # 再帰呼び出しはすべてこの expression() を通過するため、ここで一元的に
+        # 捕捉すれば全経路を保護できる。ハンドラ内では一切再帰しないので安全。
+        try:
+            idx0 = StringUtils.skipspc(s, idx)
+            x, idx0 = self.term11(s, idx0)
+            return x, idx0
+        except RecursionError:
+            if self.state.pas == 2 or self.state.pas == 0:
+                print(" error - expression nesting too deep (RecursionError).",
+                      file=sys.stderr)
+            return 0, idx
 
     def _terminate(self, s):
         """Return s with a single NUL sentinel appended (idempotent)."""
@@ -2857,12 +2989,17 @@ class PatternFileReader:
     def __init__(self, parser):
         self.parser = parser
     
-    def readpat(self, fn, base_dir=None, _depth=0):
+    def readpat(self, fn, base_dir=None, _depth=0, _chain=None):
         """Read pattern file.
 
         base_dir: 呼び出し元パターンファイルのディレクトリ。
         None のときはプロセスの CWD を基準にする（トップレベル呼び出し）。
         相対パスの fn は base_dir（または CWD）を基準に解決する。
+
+        _chain: D8修正。現在の .INCLUDE 連鎖中にある各ファイルの実パス(realpath)集合。
+        A→B→A のような循環インクルードを検出するために使う。
+        旧実装は深度上限(50)のみで循環を検出できず、循環があると同じファイルを
+        50回読み直してから停止していた（無駄かつ誤動作）。
 
         戻り値: パターンエントリのリスト。ファイルが存在しない・読めない場合は例外を伝播する。
         """
@@ -2878,6 +3015,18 @@ class PatternFileReader:
         # 相対パスを解決する
         if base_dir and not os.path.isabs(fn):
             fn = os.path.join(base_dir, fn)
+
+        # D8修正: 循環インクルード検出。
+        # realpath はシンボリックリンク・'./'・'..' を正規化するので、
+        # 異なる表記でも同一ファイルを確実に同定できる。
+        _real = os.path.realpath(fn)
+        if _chain is None:
+            _chain = frozenset()
+        if _real in _chain:
+            print(f" error - circular pattern .INCLUDE detected: '{fn}' "
+                  f"(already in include chain). Skipped.", file=sys.stderr)
+            return []
+        _chain = _chain | {_real}
         
         # このファイルと同じディレクトリを、再帰的な .INCLUDE の基準にする
         this_dir = os.path.dirname(os.path.abspath(fn))
@@ -2896,7 +3045,7 @@ class PatternFileReader:
                 l = l.replace('\n', '')
                 l = StringUtils.reduce_spaces(l)
                 
-                ww = self.include_pat(l, this_dir, _depth=_depth + 1)
+                ww = self.include_pat(l, this_dir, _depth=_depth + 1, _chain=_chain)
                 if ww is not None:   # Fix: None=非.INCLUDE行, []=空/エラー, list=パターン
                     w = w + ww
                     continue
@@ -2933,7 +3082,7 @@ class PatternFileReader:
         
         return w
     
-    def include_pat(self, l, base_dir=None, _depth=0):
+    def include_pat(self, l, base_dir=None, _depth=0, _chain=None):
         """Include pattern directive.
 
         修正7: 旧実装は StringUtils.skipspc で先頭スペースをスキップして
@@ -2979,7 +3128,7 @@ class PatternFileReader:
             else:
                 print(f" error - .INCLUDE directive has no filename: {l!r}", file=sys.stderr)
                 return []   # マッチしたがエラー → 空リスト
-        w = self.readpat(s, base_dir, _depth=_depth)
+        w = self.readpat(s, base_dir, _depth=_depth, _chain=_chain)
         return w   # 空ファイルなら [] だが呼び出し元で区別される
 
 
@@ -4415,9 +4564,9 @@ class Assembler:
                             if widx_k < len(objl):
                                 raw_val = (raw_val << self.state.bts) | (int(objl[widx_k]) & word_mask)
 
-                    # UNDEFガード
+                    # UNDEFガード（B修正: 閾値判定を _is_undef_derived に一元化）
                     if (isinstance(abs_w, float) and not math.isfinite(abs_w)) or \
-                       abs_w == UNDEF or (isinstance(abs_w, int) and abs_w >= (1 << 128)):
+                       _is_undef_derived(abs_w):
                         continue
 
                     # Bug1修正: raw_val をフィールド幅（num_bytes*8 bit）から符号拡張する。
@@ -5672,11 +5821,13 @@ class Assembler:
                 # 修正後: 初期値を「空の dict に絶対マッチしない番兵」として
                 # object() を使う。これにより初回に収束したケースも正しく break できる。
                 # （空ソースや全ラベルが .equ のみのケースで1パス節約できる）
-                MAX_RELAX = 8
+                MAX_RELAX = 16   # A修正: 前方参照が実際に収束するようになったため余裕を持たせる
                 # Fix 7: _SENTINEL をモジュールレベル定数に変更。
                 # ローカルの object() では run() を複数回呼び出したとき
                 # 前回の state._pass1_prev_label_pcs と比較できなくなる。
                 self.state._pass1_prev_label_pcs = _RELAXATION_SENTINEL
+                # A修正: 前反復ラベル値テーブルを初期化（初回反復は推定値なし）。
+                self.state._relax_prev_values = {}
 
                 # Fix 5: リラクゼーションループの先頭で labels = {} にリセットすると
                 # -i オプションでインポートしたラベルも消えてしまう。
@@ -5721,33 +5872,25 @@ class Assembler:
                                 _e1[1] += _blk1
 
                     # Fix ⑥-2: 収束スナップショットに PC 値だけでなくセクション帰属も含める。
-                    # 旧実装は {label: pc} のみを比較していたため、.section ディレクティブの
-                    # 動的切り替えによってラベルのセクション帰属が変動し続けるケースで
-                    # PC が安定した時点で収束と誤判定していた。
                     # (pc, section) のペアで比較することで両方が安定して初めて収束と判定する。
                     current_pcs = {k: (v[0], v[1]) for k, v in self.state.labels.items()}
-                    # Fix ⑤: UNDEF (= 0xff...ff) が PC 値として混入している場合、
-                    # 前後のパスで同じ UNDEF ならば「収束」と誤判定されてしまう。
-                    # 実際にはアドレスが確定していないので収束していない。
-                    # UNDEF を含むラベルがひとつでも存在するなら収束とみなさない。
-                    #
-                    # Fix ⑮ (新規): UNDEF に加減算したような UNDEF 由来の値も検出する。
-                    # UNDEF = 2^256 - 1 なので、現実のアセンブラで PC が 2^128 を
-                    # 超えることはない。2^128 以上の値をすべて「UNDEF 由来」として扱い、
-                    # 誤収束を防ぐ。
-                    #
-                    # Bugfix: is_equ=True の定数ラベル（.equ で定義された整数定数）は
-                    # PC 値ではなく任意精度の整数値を保持する。
-                    # qad{} や 0x10000...（128bit超）のような大きな定数を .equ で定義すると
-                    # UNDEF_THRESHOLD を超えて has_undef=True になり、毎回収束しなくなる。
-                    # 修正: アドレスラベル（is_equ=False）の値のみを UNDEF チェックする。
-                    _UNDEF_THRESHOLD = 1 << 128
+                    # UNDEF 由来の値が PC に混入しているうちは収束とみなさない。
+                    # （前後の反復で同じ UNDEF だと誤って「収束」と判定してしまうため。）
+                    # B修正: 判定を _is_undef_derived に一元化（閾値 2^192）。
+                    # is_equ=True の定数ラベルは任意精度の整数値を持てるので除外する。
                     has_undef = any(
-                        pc == UNDEF or (isinstance(pc, int) and pc >= _UNDEF_THRESHOLD)
+                        _is_undef_derived(pc)
                         for k, (pc, _sec) in current_pcs.items()
-                        # is_equ=True の定数ラベルは除外（任意の大きさの整数値を持てる）
                         if not (len(self.state.labels[k]) > 2 and self.state.labels[k][2])
                     )
+                    # A修正: 次反復の前方参照推定に使うため、今反復で確定した
+                    # 全ラベル値（アドレス・定数とも）を保存する。
+                    # UNDEF 由来の値は推定に使うと有害なので保存しない（前方参照は
+                    # その分 0/前々回値にフォールバックする）。
+                    self.state._relax_prev_values = {
+                        k: v[0] for k, v in self.state.labels.items()
+                        if not _is_undef_derived(v[0])
+                    }
                     # 修正⑤: _RELAXATION_SENTINEL との比較は必ず False なので初回は無条件続行。
                     # 2回目以降は前回と一致しかつ UNDEF がなければ収束と判定できる。
                     if (not has_undef
@@ -5772,6 +5915,16 @@ class Assembler:
                                     changed.append(k)
                         if changed:
                             print(f"         Labels still changing: {', '.join(changed[:10])}", file=sys.stderr)
+
+                # A修正(指摘3): pass1↔pass2 整合チェック用に、pass1 で確定した
+                # ラベルアドレス(is_equ=False のもの)をスナップショットしておく。
+                # pass2 完了後にこの値と pass2 のアドレスを突き合わせ、ずれがあれば
+                # 「リラクゼーション未収束によりアドレスが確定していない」ことを
+                # 明示的なエラーとして報告する（旧実装は無検査で silent miscompile だった）。
+                _pass1_final_addrs = {
+                    k: v[0] for k, v in self.state.labels.items()
+                    if not (len(v) > 2 and v[2])   # is_equ 定数は対象外（アドレスではない）
+                }
 
                 self.state.pc = 0
                 self.state.pas = 2
@@ -5800,6 +5953,31 @@ class Assembler:
                         _block = self.state.pc - _entry_pc
                         if _block > 0:
                             _e[1] += _block
+
+                # A修正(指摘3): pass1↔pass2 アドレス整合チェック（安全網）。
+                # pass2 のラベルアドレスが pass1 確定値と食い違う場合、出力バイナリの
+                # アドレスは信頼できない。旧実装はこれを一切検査せず誤ったバイナリを
+                # 黙って出力していた。ここで差分を検出し、ラベル名を挙げて報告する。
+                _drift = []
+                for k, p2 in ((kk, vv[0]) for kk, vv in self.state.labels.items()
+                              if not (len(vv) > 2 and vv[2])):
+                    p1 = _pass1_final_addrs.get(k)
+                    if p1 is not None and p1 != p2 and not _is_undef_derived(p2):
+                        _drift.append((k, p1, p2))
+                if _drift:
+                    print(" error - address mismatch between pass1 and pass2 "
+                          f"({len(_drift)} label(s)); output addresses are UNRELIABLE.",
+                          file=sys.stderr)
+                    print("         This usually means pass1 relaxation did not fully "
+                          "converge for variable-length forward references.", file=sys.stderr)
+                    for k, p1, p2 in _drift[:10]:
+                        try:
+                            print(f"           {k}: pass1=0x{int(p1):X} pass2=0x{int(p2):X}",
+                                  file=sys.stderr)
+                        except (TypeError, ValueError):
+                            print(f"           {k}: pass1={p1!r} pass2={p2!r}", file=sys.stderr)
+                    if len(_drift) > 10:
+                        print(f"           ... and {len(_drift) - 10} more.", file=sys.stderr)
 
             self.binary_writer.flush()
 
