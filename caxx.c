@@ -39,6 +39,7 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <libgen.h>
+#include <limits.h>
 #include <sys/wait.h>
 
 /* Portability helper: suppress -Wunused-function for API utilities that are
@@ -306,6 +307,20 @@ static int u256_nbit(uint256_t v) {
 /* UNDEF = 0xfff...f (256 bits) */
 static uint256_t UNDEF_VAL(void) { return u256_not(u256_zero()); }
 static int u256_is_undef(uint256_t a) { return u256_eq(a, UNDEF_VAL()); }
+/* B (axx.py port): centralized "UNDEF-derived" detection.
+ * Python raised the threshold from 2^128 to 2^192:
+ *   axx legitimately handles up to 256-bit values and 128-bit (quad) floats,
+ *   so values >= 2^128 can occur legitimately and must NOT be mistaken for
+ *   undefined. Real addresses fit in 64 bits and quad immediates are < 2^128,
+ *   so no legitimate value reaches 2^192, while UNDEF (2^256-1) and
+ *   UNDEF +/- displacement (~2^256) all have the top 64-bit word (w[3]) set.
+ * Using the existing unsigned convention of this file (w[3] != 0  <=>  >= 2^192),
+ * this matches axx.py's `v == UNDEF or abs(v) >= 2^192` for the dominant
+ * (large-positive, near-2^256) UNDEF-derived case. */
+static int u256_is_undef_derived(uint256_t a) {
+    if (u256_is_undef(a)) return 1;
+    return a.w[3] != 0;          /* unsigned >= 2^192 */
+}
 
 /* =========================================================
  * Dynamic string
@@ -815,6 +830,11 @@ typedef struct {
     int        endian_big;
     int        pas;
     int        debug;
+    /* 互換(axx.py port): axx.py は verbose(-v: pass2のhexリスト出力) と
+     * debug(-d: リラクゼーション収束等のデバッグ出力) を別フラグとして持つ。
+     * C版は両者を debug に統合し -v に割り当てていたため挙動が非互換だった。
+     * verbose を分離して axx.py に一致させる。 */
+    int        verbose;
 
     char       cl[4096];
     int        ln;
@@ -891,6 +911,25 @@ typedef struct {
      * .check::x::sym1,sym2,... で登録、.clrcheck::x で解除。
      * マッチ成功後・makeobj 前に dir_check_eval() が検証する。          */
     StrVec     check_constraints[26];
+
+    /* C (axx.py port): expression recursion depth guard.
+     * C has no exceptions; unbounded recursion (deeply nested parentheses or
+     * unary operators) would overflow the native stack and segfault.
+     * expr_factor() increments this on entry and decrements on exit, returning
+     * 0 once EXPR_MAX_DEPTH is exceeded. */
+    int        expr_depth;
+
+    /* A (axx.py port): pass1 relaxation previous-iteration label values.
+     * Points to the previous iteration's label snapshot during pass1 so that
+     * forward references return a realistic estimate (their prior address)
+     * instead of 0/UNDEF. This lets relaxation actually converge to the
+     * optimal variable-length layout. NULL outside the pass1 relaxation loop. */
+    LabelMap  *relax_prev;
+
+    /* D8 (axx.py port): pattern-file .INCLUDE chain (canonical paths) for
+     * circular-include detection, plus the current nesting depth. */
+    char      *pat_include_chain[64];
+    int        pat_include_depth;
 } AsmState;
 
 /* Finalize the current (last) section's size after fileassemble() completes.
@@ -1630,7 +1669,7 @@ static void fwrite_word(AsmState *st, uint64_t position, uint256_t x, int prt){
 
 static void outbin(AsmState *st, uint256_t a, uint256_t x){
     if(st->pas==2||st->pas==0)
-        fwrite_word(st, u256_to_u64(a), x, (st->pas==0)||st->debug);
+        fwrite_word(st, u256_to_u64(a), x, (st->pas==0)||st->verbose);
 }
 static void outbin2(AsmState *st, uint256_t a, uint256_t x){
     if(st->pas==2||st->pas==0)
@@ -1777,6 +1816,19 @@ static uint256_t label_get_value(AsmState *st, const char *k){
         }
         return e->value;
     }
+    /* A (axx.py port): pass1 forward reference uses the previous relaxation
+     * iteration's resolved address as an estimate. This (1) lets relaxation
+     * actually converge for variable-length forward branches and (2) makes the
+     * size-probe and the error-condition see the same realistic displacement.
+     * An estimate is trusted (no error_undefined_label) so makeobj proceeds.
+     * pass2 (pas==2) never takes this path, so a truly undefined label still
+     * errors there. UNDEF-derived estimates are ignored (treated as no estimate). */
+    if(st->pas == 1 && st->relax_prev){
+        LabelEntry *pe = lmap_find(st->relax_prev, k);
+        if(pe && !u256_is_undef_derived(pe->value)){
+            return pe->value;
+        }
+    }
     st->error_undefined_label = 1;
     if(st->pass1_size_mode) return u256_zero();
     /* in_match_attempt が 1 のときはパターンマッチ試行中であり、
@@ -1857,7 +1909,12 @@ static int symbol_get(AsmState *st, const char *w, uint256_t *out){
 /* =========================================================
  * Expression evaluator
  * ========================================================= */
+/* C (axx.py port): max expression recursion depth. Each nesting level consumes
+ * several C stack frames; 500 is far beyond any real assembler expression yet
+ * safely under typical 8MB stack limits. */
+#define EXPR_MAX_DEPTH 500
 static uint256_t expr_factor(Assembler *asmb, const char *s, int idx, int *idx_out);
+static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_out);
@@ -1971,6 +2028,24 @@ static uint256_t expr_expression_esc(Assembler *asmb, const char *s, int idx, ch
  * the assembler's own expression evaluator in float mode.                    */
 
 static uint256_t expr_factor(Assembler *asmb, const char *s, int idx, int *idx_out){
+    /* C (axx.py port): recursion depth guard. expr_factor is the hub through
+     * which all recursion passes (unary -,~,@ recurse into expr_factor; '('
+     * recurses expr_factor1 -> expr_expression -> ... -> expr_factor), so
+     * guarding here protects every nested-expression path from a native stack
+     * overflow. Mirrors axx.py's factor/_factor_impl split. */
+    AsmState *st=&asmb->st;
+    if(st->expr_depth >= EXPR_MAX_DEPTH){
+        if(st->pas==2 || st->pas==0)
+            fprintf(stderr," error - expression nesting too deep.\n");
+        if(idx_out) *idx_out = idx;
+        return u256_zero();
+    }
+    st->expr_depth++;
+    uint256_t r = expr_factor_impl(asmb,s,idx,idx_out);
+    st->expr_depth--;
+    return r;
+}
+static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *idx_out){
     AsmState *st=&asmb->st;
     idx=axx_skipspc(s,idx);
     uint256_t x=u256_zero();
@@ -2299,11 +2374,8 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             if(!st->in_match_attempt
                && !st->pass1_size_mode
                && (st->pas == 2 || st->pas == 0)){
-                int _is_undef = u256_is_undef(x);
-                /* Values >= 2^128 (w[2] or w[3] non-zero) are UNDEF-derived
-                 * (e.g. UNDEF+offset, UNDEF*2, etc.) and equally invalid. */
-                int _is_undef_derived = (!_is_undef && (x.w[2] || x.w[3]));
-                if(_is_undef || _is_undef_derived){
+                /* B (axx.py port): centralized detection, threshold raised to 2^192. */
+                if(u256_is_undef_derived(x)){
                     st->error_undefined_label = 1;
                     fprintf(stderr,
                         " error - Label undefined: variable '%c' contains undefined value"
@@ -2644,6 +2716,13 @@ static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_o
  *   ','  – object-list separator in makeobj  ← Bug fix: was missing,
  *            causing ";z?0xf3:0,0xa4" to skip "0,0xa4" as the false
  *            branch instead of stopping at the comma.
+ *   ';'  – 互換修正(axx.py port): error-field "condition;code" separator and
+ *            makeobj conditional-byte prefix. The evaluating path (expr_term9/10)
+ *            naturally stops at ';' because it is not an operator, but the SKIP
+ *            path did not, so a short-circuited '||'/'&&' RHS in an error
+ *            condition (e.g. "(a)>5||(a)<0;1") skipped PAST ";1", making
+ *            dir_error() read error code 0 instead of 1. axx.py's parser stops
+ *            at ';' in both paths; matching that here restores compatibility.
  * ')' at depth 0 stops because we are inside a caller's parentheses.
  */
 static int skip_subexpr(const char *s, int idx) {
@@ -2675,7 +2754,7 @@ static int skip_subexpr(const char *s, int idx) {
         /* ':=' is a variable-assignment operator, not a ternary separator.
          * Stop at ':' only when the next character is NOT '='. */
         else if(paren_depth == 0 && brack_depth == 0 && ob_depth == 0
-                && (c == '?' || c == ',')) break;
+                && (c == '?' || c == ',' || c == ';')) break;
         else if(paren_depth == 0 && brack_depth == 0 && ob_depth == 0
                 && c == ':' && s[idx+1] != '=') break;
         else idx++;
@@ -3446,8 +3525,42 @@ static void include_pat(Assembler *asmb, const char *l, const char *base_dir){
 
 static void readpat(Assembler *asmb, const char *fn){
     if(!fn||!fn[0]) return;
+
+    /* D8 (axx.py port): pattern .INCLUDE depth limit + circular-include detection.
+     * The Python original limited nesting to 50 and (after the recent fix)
+     * detects cycles via a chain of canonical paths. The C port previously had
+     * NEITHER, so a self-including pattern file would recurse until it crashed
+     * (native stack overflow) instead of stopping cleanly. */
+    enum { MAX_PAT_DEPTH = 50 };
+    if(asmb->st.pat_include_depth > MAX_PAT_DEPTH){
+        fprintf(stderr," error - pattern .INCLUDE nesting exceeds %d: '%s'\n",
+                MAX_PAT_DEPTH, fn);
+        return;
+    }
+    /* Canonicalize for reliable cycle keys (resolves symlinks / './' / '..'). */
+    char real[PATH_MAX];
+    if(!realpath(fn, real)){
+        /* file may be unreadable; fall back to the raw name as the cycle key */
+        strncpy(real, fn, sizeof(real)-1); real[sizeof(real)-1]='\0';
+    }
+    for(int i=0;i<asmb->st.pat_include_depth;i++){
+        if(asmb->st.pat_include_chain[i]
+           && strcmp(asmb->st.pat_include_chain[i], real)==0){
+            fprintf(stderr," error - circular pattern .INCLUDE detected: '%s' "
+                    "(already in include chain). Skipped.\n", fn);
+            return;
+        }
+    }
+
     FILE *f=fopen(fn,"rt");
     if(!f){ fprintf(stderr,"Cannot open pattern file: %s\n",fn); return; }
+
+    /* push this file onto the include chain */
+    if(asmb->st.pat_include_depth < (int)(sizeof(asmb->st.pat_include_chain)
+                                          / sizeof(asmb->st.pat_include_chain[0]))){
+        asmb->st.pat_include_chain[asmb->st.pat_include_depth] = strdup(real);
+    }
+    asmb->st.pat_include_depth++;
 
     /* Compute this file's directory for recursive .INCLUDE resolution */
     char this_dir[1024];
@@ -3485,6 +3598,14 @@ static void readpat(Assembler *asmb, const char *fn){
         else if(nf>=6){ for(int i=0;i<6;i++) pat_set(pe,i,fields[i]); }
     }
     fclose(f);
+    /* D8: pop this file off the include chain */
+    asmb->st.pat_include_depth--;
+    if(asmb->st.pat_include_depth >= 0
+       && asmb->st.pat_include_depth < (int)(sizeof(asmb->st.pat_include_chain)
+                                             / sizeof(asmb->st.pat_include_chain[0]))){
+        free(asmb->st.pat_include_chain[asmb->st.pat_include_depth]);
+        asmb->st.pat_include_chain[asmb->st.pat_include_depth] = NULL;
+    }
 }
 
 /* =========================================================
@@ -4895,9 +5016,9 @@ static int lineassemble0(Assembler *asmb, const char *line){
     int l=(int)strlen(st->cl);
     while(l>0&&(st->cl[l-1]=='\n'||st->cl[l-1]=='\r')) st->cl[--l]=0;
 
-    /* -v (verbose/debug) フラグが立っているときだけリスト出力する。
+    /* -v (verbose) フラグが立っているときだけリスト出力する（axx.py の verbose）。
      * 対話モード (pas==0) は常に出力する。                         */
-    int show = (st->pas==0) || ((st->pas==2) && st->debug);
+    int show = (st->pas==0) || ((st->pas==2) && st->verbose);
     if(show){
         printf("%016llx %s %d %s ",(unsigned long long)u256_to_u64(st->pc),
                st->current_file, st->ln, st->cl);
@@ -5829,7 +5950,8 @@ int main(int argc, char *argv[]){
         else if(strcmp(argv[i],"-i")==0&&i+1<argc){ strncpy(st->impfile,argv[++i],sizeof(st->impfile)-1); }
         else if(strcmp(argv[i],"-o")==0&&i+1<argc){ strncpy(st->elf_objfile,argv[++i],sizeof(st->elf_objfile)-1); }
         else if(strcmp(argv[i],"-m")==0&&i+1<argc){ st->elf_machine=atoi(argv[++i]); }
-        else if(strcmp(argv[i],"-v")==0){ st->debug=1; }
+        else if(strcmp(argv[i],"-v")==0||strcmp(argv[i],"--verbose")==0){ st->verbose=1; }
+        else if(strcmp(argv[i],"-d")==0||strcmp(argv[i],"--debug")==0){ st->debug=1; }
         else if(strcmp(argv[i],"-g")==0||strcmp(argv[i],"--gen-debug")==0){ st->gen_debug=1; }
         else if(argv[i][0]!='-'){
             if(!patternfile) patternfile=argv[i];
@@ -5905,7 +6027,7 @@ int main(int argc, char *argv[]){
          * Fix ⑥-2 (axx.py): convergence snapshot includes section membership,
          *   not just PC value.
          */
-#define MAX_RELAX 8
+#define MAX_RELAX 16   /* A (axx.py port): relaxation now actually iterates; allow more headroom */
         /* Fix 5: snapshot imported labels before the relaxation loop so they
          * can be restored at the start of each iteration. */
         LabelMap imported_labels;
@@ -5922,6 +6044,13 @@ int main(int argc, char *argv[]){
         LabelMap prev_labels;
         lmap_init(&prev_labels);
         int converged = 0;
+
+        /* A (axx.py port): expose the previous-iteration snapshot to
+         * label_get_value() so pass1 forward references resolve to their prior
+         * address. prev_labels is updated at the END of each iteration, so at
+         * the START of iteration N it holds iteration N-1's values (empty on
+         * the first iteration => forward refs fall back to 0/UNDEF, correct). */
+        st->relax_prev = &prev_labels;
 
         for(int relax=0; relax<MAX_RELAX; relax++){
             st->pc=u256_zero(); st->pas=1; st->ln=1;
@@ -5971,8 +6100,7 @@ int main(int argc, char *argv[]){
             for(int bi=0; bi<st->labels.nbuckets && !has_undef; bi++)
                 for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next){
                     if(e->is_equ) continue;
-                    if(u256_is_undef(e->value)){  has_undef=1; break; }
-                    if(e->value.w[2] || e->value.w[3]){ has_undef=1; break; }
+                    if(u256_is_undef_derived(e->value)){ has_undef=1; break; }
                 }
 
             converged = !has_undef ? 1 : 0;
@@ -6006,8 +6134,20 @@ int main(int argc, char *argv[]){
                 break;
             }
         }
+        /* A (axx.py port, 指摘3): snapshot pass1-final addresses (is_equ=0 only)
+         * for the pass1<->pass2 consistency check performed after pass2. */
+        LabelMap pass1_final;
+        lmap_init(&pass1_final);
+        for(int bi=0; bi<st->labels.nbuckets; bi++)
+            for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
+                if(!e->is_equ)
+                    lmap_set_full(&pass1_final, e->key, e->value, e->section,
+                                  e->is_equ, e->is_imported, e->reloc_type_override);
+
         lmap_free(&prev_labels);
         lmap_free(&imported_labels);
+        /* A: relaxation is done; pass2 must NOT consult the (now-freed) snapshot. */
+        st->relax_prev = NULL;
 
         if(!converged)
             fprintf(stderr,"warning: pass1 relaxation did not converge after %d iterations; "
@@ -6042,6 +6182,46 @@ int main(int argc, char *argv[]){
          *   _last_sec = self.state.current_section
          *   if not _confirmed: _e[1] += (pc - entry_pc) */
         secmap_finalize_current(st);
+
+        /* A (axx.py port, 指摘3): pass1<->pass2 address consistency check (safety net).
+         * If any non-.equ label's pass2 address differs from its pass1-final
+         * address, the emitted binary's addresses are unreliable (relaxation did
+         * not fully converge). The old code emitted such a binary silently.
+         * Two passes: first count all drifts (so the header can include the
+         * count, matching axx.py exactly), then print up to 10 details. */
+        {
+            int drift_count = 0;
+            for(int bi=0; bi<st->labels.nbuckets; bi++)
+                for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next){
+                    if(e->is_equ) continue;
+                    if(u256_is_undef_derived(e->value)) continue;
+                    LabelEntry *p = lmap_find(&pass1_final, e->key);
+                    if(p && !u256_eq(p->value, e->value)) drift_count++;
+                }
+            if(drift_count){
+                fprintf(stderr," error - address mismatch between pass1 and pass2 "
+                    "(%d label(s)); output addresses are UNRELIABLE.\n", drift_count);
+                fprintf(stderr,"         This usually means pass1 relaxation did "
+                    "not fully converge for variable-length forward references.\n");
+                int shown = 0;
+                for(int bi=0; bi<st->labels.nbuckets && shown<10; bi++)
+                    for(LabelEntry *e=st->labels.buckets[bi]; e && shown<10; e=e->next){
+                        if(e->is_equ) continue;
+                        if(u256_is_undef_derived(e->value)) continue;
+                        LabelEntry *p = lmap_find(&pass1_final, e->key);
+                        if(p && !u256_eq(p->value, e->value)){
+                            fprintf(stderr,"           %s: pass1=0x%llX pass2=0x%llX\n",
+                                e->key,
+                                (unsigned long long)u256_to_u64(p->value),
+                                (unsigned long long)u256_to_u64(e->value));
+                            shown++;
+                        }
+                    }
+                if(drift_count > 10)
+                    fprintf(stderr,"           ... and %d more.\n", drift_count - 10);
+            }
+        }
+        lmap_free(&pass1_final);
     }
 
     binary_flush(st);
