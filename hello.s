@@ -14,7 +14,7 @@ _hello:
         mov     eax, 4      ; sys_write (04)
         mov     edi, 1      ; stdout    (01)
         mov     edx,len     ; length    (13)
-        movabs  rsi,msg     ; address
+        mov     rsi,msg     ; address
         syscall
         mov     edi, 0      ; return 0
         mov     eax, 1
