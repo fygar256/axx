@@ -15,7 +15,7 @@ Paxx is newest version. Due to Paxx version upgrades, updates to caxx may be del
 
 # Test environment
 
-FreeBSD terminal
+FreeBSD,Linux terminal
 
 # Original article in Japanese
 
@@ -47,9 +47,6 @@ All imperative assembly languages, except for EPIC/VLIW which have meta-level co
 
 It extracts the essential commonalities of the von Neumann architecture, metamodels the instruction set architecture (ISA), and formalizes it using pattern matching.
 
-# Test Environment
-
-FreeBSD,Linux terminal
 
 # Text
 
