@@ -68,8 +68,8 @@ JT1     1
 JZ      1
 JMP     1
 JMPP    @A
-MOVD    P1,A
-movd    A,P1
+MOVD    P4,A
+movd    A,P4
 MOVP    A,@A
 MOVP3   A,@A
 MOVX    A,@R1
