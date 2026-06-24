@@ -124,8 +124,6 @@ options:
   -i IMPORT_TSV         Import labels from TSV file
   -o OBJ_FILE           Write ELF64 relocatable object file (.o)
   -m MACHINE            ELF e_machine value (default 62=EM_X86_64; 183=AArch64, 243=RISC-V, 3=i386, 20=PPC, 40=ARM)
-  --dynamic             Output as dynamic shared object (ET_DYN) with .dynamic, PLT/GOT etc.
-  --needed NEEDED       Add DT_NEEDED library (can be specified multiple times)
   -v, --verbose         Verbose: print assembly listing to stdout (default: silent)
   -d, --debug           Enable debug output (forward-ref fallback, relaxation log, etc.)
   -g, --gen-debug       Generate DWARF debug information (.debug_info/.debug_abbrev/.debug_line) in the ELF object so
