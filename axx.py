@@ -241,9 +241,6 @@ class AssemblerState:
         # None のとき「キャプチャ中でない」。
         self._elf_capturing_var: str | None = None
 
-        # === 新規追加: ELF Dynamic Linking ===
-        self.dynamic: bool = False
-        self.needed_libs: list = []
         self.init_func: str | None = None
         self.fini_func: str | None = None
 
@@ -5520,7 +5517,7 @@ class Assembler:
         # ------------------------------------------------------------------ #
         with open(path, 'wb') as f:
             # ELF header
-            f.write(_pack_ehdr(3 if self.state.dynamic else 1, machine, shdr_off, total_shdrs, shstrndx))
+            f.write(_pack_ehdr(1, machine, shdr_off, total_shdrs, shstrndx))
 
             # Content section data
             for i, s in enumerate(csecs):
@@ -5642,11 +5639,6 @@ class Assembler:
                         metavar='MACHINE',
                         help='ELF e_machine value (default 62=EM_X86_64; '
                              '183=AArch64, 243=RISC-V, 3=i386, 20=PPC, 40=ARM)')
-        ap.add_argument('--dynamic', dest='dynamic', action='store_true',
-                        default=False,
-                        help='Output as dynamic shared object (ET_DYN) with .dynamic, PLT/GOT etc.')
-        ap.add_argument('--needed', dest='needed', action='append', default=[],
-                        help='Add DT_NEEDED library (can be specified multiple times)')
         ap.add_argument('-v', '--verbose', dest='verbose', action='store_true',
                         default=False,
                         help='Verbose: print assembly listing to stdout (default: silent)')
@@ -5682,9 +5674,6 @@ class Assembler:
         self.state.impfile      = args.impfile
         self.state.elf_objfile  = args.elf_objfile
         self.state.elf_machine  = args.elf_machine
-        self.state.dynamic      = args.dynamic
-        self.state.needed_libs  = args.needed
-        # Fix 1: use .get() so unknown OSABI strings never raise KeyError.
 
         # Fix 1: use .get() so unknown OSABI strings never raise KeyError.
         # argparse choices= already guards this, but the table and the
