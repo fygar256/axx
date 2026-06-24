@@ -909,7 +909,7 @@ typedef struct {
      * check_constraints[i] は変数 'a'+i に対する許可シンボル名の StrVec。
      * 空 StrVec (len==0) はその変数に拘束なし。
      * .check::x::sym1,sym2,... で登録、.clrcheck::x で解除。
-     * マッチ成功後・makeobj 前に dir_check_eval() が検証する。          */
+     * マッチ成功後・makeobj 前に pat_match() 内でインライン検証する。    */
     StrVec     check_constraints[26];
 
     /* C (axx.py port): expression recursion depth guard.
@@ -2527,9 +2527,17 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
     uint256_t x=expr_term1(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
     while(idx<slen){
-        if(axx_q(s,slen,"<<",idx)){uint256_t t=expr_term1(asmb,s,idx+2,&idx);x=u256_shl(x,(int)u256_to_i64(t));}
-        else if(axx_q(s,slen,">>",idx)){uint256_t t=expr_term1(asmb,s,idx+2,&idx);x=u256_sar(x,(int)u256_to_i64(t));}
-        else break;
+        if(axx_q(s,slen,"<<",idx)){
+            uint256_t t=expr_term1(asmb,s,idx+2,&idx);
+            int64_t sv=u256_to_i64(t);
+            if(sv<0){ if(asmb->st.pas==2||asmb->st.pas==0) fprintf(stderr," error - negative shift count.\n"); x=u256_zero(); }
+            else x=u256_shl(x,(int)sv);
+        } else if(axx_q(s,slen,">>",idx)){
+            uint256_t t=expr_term1(asmb,s,idx+2,&idx);
+            int64_t sv=u256_to_i64(t);
+            if(sv<0){ if(asmb->st.pas==2||asmb->st.pas==0) fprintf(stderr," error - negative shift count.\n"); x=u256_zero(); }
+            else x=u256_sar(x,(int)sv);
+        } else break;
     }
     *idx_out=idx; return x;
 }
@@ -3044,15 +3052,6 @@ static int dir_clrcheck(Assembler *asmb, PatEntry *e){
         }
     }
     return 1;
-}
-
-/* Evaluate all registered .check constraints after a successful pattern match.
- * Mirrors axx.py DirectiveProcessor.check_constraints_eval().
- * Returns 1 if any constraint violated (error printed in pas==2/0), 0 if all OK. */
-static int dir_check_eval(Assembler *asmb){
-    AsmState *st = &asmb->st;
-    int violated = 0;
-    return violated;
 }
 
 /* Fix 10 (axx.py): dir_error() now returns 1 when at least one condition
@@ -3846,10 +3845,10 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         VliwSetEntry *k=&st->vliwset.data[ki];
         int *sorted_k=malloc(k->nidxs*sizeof(int));
         memcpy(sorted_k,k->idxs,k->nidxs*sizeof(int));
-        // qsort(sorted_k,k->nidxs,sizeof(int),int_cmp);
+        qsort(sorted_k,k->nidxs,sizeof(int),int_cmp);
         int *sorted_l=malloc(nidxlst*sizeof(int));
         memcpy(sorted_l,idxlst,nidxlst*sizeof(int));
-        // qsort(sorted_l,nidxlst,sizeof(int),int_cmp);
+        qsort(sorted_l,nidxlst,sizeof(int),int_cmp);
         int match=(k->nidxs==nidxlst && memcmp(sorted_k,sorted_l,k->nidxs*sizeof(int))==0);
         free(sorted_k); free(sorted_l);
         if(!match && st->vliwtemplatebits!=0) continue;
@@ -5175,12 +5174,14 @@ static int cmp_wlk(const void*a,const void*b){ return strcmp(((const WLK*)a)->na
 
 /* is name present in the export array? */
 static int weo_isexp(WLK*earr,int ne,const char*nm){
-    for(int i=0;i<ne;i++) if(!strcmp(earr[i].name,nm)) return 1; return 0;
+    for(int i=0;i<ne;i++) if(!strcmp(earr[i].name,nm)) return 1;
+    return 0;
 }
 
 /* symbol name -> symtab index */
 static int weo_symof(WSNI*snimap,int snimap_len,const char*nm){
-    for(int i=0;i<snimap_len;i++) if(!strcmp(snimap[i].name,nm)) return snimap[i].idx; return 0;
+    for(int i=0;i<snimap_len;i++) if(!strcmp(snimap[i].name,nm)) return snimap[i].idx;
+    return 0;
 }
 
 /* is content section i a .bss (SHT_NOBITS)? */
@@ -5764,8 +5765,9 @@ static void fileassemble(Assembler *asmb, const char *fn){
     f=fopen(fn,"rt");
     if(!f){ fprintf(stderr,"Cannot open: %s\n",fn); goto done; }
     {
-        char line[4096];
-        while(fgets(line,sizeof(line),f)) lineassemble0(asmb,line);
+        char *line=NULL; size_t lcap=0;
+        while(getline(&line,&lcap,f)!=-1) lineassemble0(asmb,line);
+        free(line);
     }
     fclose(f);
 
@@ -5972,7 +5974,7 @@ int main(int argc, char *argv[]){
 
     if(st->impfile[0]){
         FILE *lf=fopen(st->impfile,"rt");
-        if(lf){ char l[4096]; while(fgets(l,sizeof(l),lf)) imp_label(asmb,l); fclose(lf); }
+        if(lf){ char *l=NULL; size_t lc=0; while(getline(&l,&lc,lf)!=-1) imp_label(asmb,l); free(l); fclose(lf); }
     }
 
     if(st->outfile[0]) remove(st->outfile);
@@ -5980,14 +5982,14 @@ int main(int argc, char *argv[]){
     if(!sourcefile){
         st->pc=u256_zero(); st->pas=0; st->ln=1;
         strncpy(st->current_file,"(stdin)",sizeof(st->current_file)-1);
-        char line[4096];
+        char *line=NULL; size_t lcap=0;
         while(1){
             /* Mirrors Python printaddr() + input(">> "):
              *   print("%016x: " % pc, end='')
              *   line = input(">> ")                                  */
             printf("%016llx: >> ",(unsigned long long)u256_to_u64(st->pc));
             fflush(stdout);
-            if(!fgets(line,sizeof(line),stdin)) break;
+            if(getline(&line,&lcap,stdin)==-1) break;
             int ll=(int)strlen(line);
             while(ll>0&&(line[ll-1]=='\n'||line[ll-1]=='\r')) line[--ll]=0;
             /* Python: line = line.replace("\\\\", "\\") */
@@ -6004,6 +6006,7 @@ int main(int argc, char *argv[]){
             if(strcmp(line,"?")==0){ label_print_all(st); continue; }
             lineassemble0(asmb,line);
         }
+        free(line);
     } else {
         /* Fix C-3: pass1 relaxation loop.
          *

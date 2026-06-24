@@ -11,7 +11,7 @@ try:
     import readline  # GNU readline (Unix/macOS only; not available on Windows)
 except ImportError:
     pass  # Gracefully degrade on Windows or environments without readline
-import string
+import ast
 import subprocess
 import itertools
 import struct
@@ -1263,15 +1263,12 @@ class ExpressionEvaluator:
             # Fix 2: factor1 が何も消費せず (idx 不変) かつ NUL でも終端でもない位置で
             # 停止した場合、未知トークンがサイレントに 0 になっている。
             # pass2/対話モードのみ警告を出す（pass1 は forward 参照で頻繁に発生するため抑制）。
-            """
             if (idx == prev_idx
                     and idx < len(s)
                     and s[idx] not in (chr(0), ',', ')', ']', CB, ' ', '\t')
                     and (self.state.pas == 2 or self.state.pas == 0)):
                 print(f" warning - unrecognized token at position {idx} in expression: "
-                      f"{s[idx:idx+8]!r} (treated as 0)")
-
-            """
+                      f"{s[idx:idx+8]!r} (treated as 0)", file=sys.stderr)
         idx = StringUtils.skipspc(s, idx)
         return x, idx
 
@@ -1343,66 +1340,64 @@ class ExpressionEvaluator:
         # ここでは検証済みノードのみを直接解釈する小さな再帰インタプリタに置き換え、
         # eval を一切呼ばない。演算意味は旧 eval と同一（'/' は float, '//' は floor）。
         # 不許可ノードに遭遇したら ValueError を送出するので、検証と評価が一体化する。
-        import ast as _ast
-
         _ALLOWED_FUNCS = {
             "enfloat": enfloat, "endouble": endouble,
             "enflt": enflt, "endbl": endbl,
         }
 
         try:
-            tree = _ast.parse(s, mode='eval')
+            tree = ast.parse(s, mode='eval')
         except SyntaxError as e:
             raise ValueError(f"xeval: parse error in '{s}': {e}")
 
         def _ev(node):
-            if isinstance(node, _ast.Expression):
+            if isinstance(node, ast.Expression):
                 return _ev(node.body)
-            if isinstance(node, _ast.Constant):
+            if isinstance(node, ast.Constant):
                 if isinstance(node.value, (int, float, bool)):
                     return node.value
                 raise ValueError(f"xeval: disallowed constant {node.value!r} in '{s}'")
-            if isinstance(node, _ast.BinOp):
+            if isinstance(node, ast.BinOp):
                 l = _ev(node.left)
                 r = _ev(node.right)
                 op = node.op
-                if isinstance(op, _ast.Add):      return l + r
-                if isinstance(op, _ast.Sub):      return l - r
-                if isinstance(op, _ast.Mult):     return l * r
-                if isinstance(op, _ast.Div):      return l / r
-                if isinstance(op, _ast.FloorDiv): return l // r
-                if isinstance(op, _ast.Mod):      return l % r
-                if isinstance(op, _ast.Pow):
+                if isinstance(op, ast.Add):      return l + r
+                if isinstance(op, ast.Sub):      return l - r
+                if isinstance(op, ast.Mult):     return l * r
+                if isinstance(op, ast.Div):      return l / r
+                if isinstance(op, ast.FloorDiv): return l // r
+                if isinstance(op, ast.Mod):      return l % r
+                if isinstance(op, ast.Pow):
                     # 巨大指数による資源枯渇(DoS)を防ぐ（term0_0 と同じ上限 1024）。
                     if isinstance(r, int) and r > 1024:
                         raise ValueError("xeval: exponent exceeds 1024")
                     return l ** r
-                if isinstance(op, _ast.BitAnd):   return l & r
-                if isinstance(op, _ast.BitOr):    return l | r
-                if isinstance(op, _ast.BitXor):   return l ^ r
-                if isinstance(op, _ast.LShift):
-                    # 巨大シフト量による資源枯渇を防ぐ。
-                    if isinstance(r, int) and r > 4096:
-                        raise ValueError("xeval: shift count exceeds 4096")
+                if isinstance(op, ast.BitAnd):   return l & r
+                if isinstance(op, ast.BitOr):    return l | r
+                if isinstance(op, ast.BitXor):   return l ^ r
+                if isinstance(op, ast.LShift):
+                    # 巨大シフト量による資源枯渇を防ぐ（term2 の _SHIFT_MAX=65536 と統一）。
+                    if isinstance(r, int) and r > 65536:
+                        raise ValueError("xeval: shift count exceeds 65536")
                     return l << r
-                if isinstance(op, _ast.RShift):   return l >> r
+                if isinstance(op, ast.RShift):   return l >> r
                 raise ValueError(f"xeval: disallowed operator {type(op).__name__} in '{s}'")
-            if isinstance(node, _ast.UnaryOp):
+            if isinstance(node, ast.UnaryOp):
                 v = _ev(node.operand)
                 op = node.op
-                if isinstance(op, _ast.UAdd):   return +v
-                if isinstance(op, _ast.USub):   return -v
-                if isinstance(op, _ast.Invert): return ~v
+                if isinstance(op, ast.UAdd):   return +v
+                if isinstance(op, ast.USub):   return -v
+                if isinstance(op, ast.Invert): return ~v
                 raise ValueError(f"xeval: disallowed unary operator {type(op).__name__} in '{s}'")
-            if isinstance(node, _ast.BoolOp):
-                if isinstance(node.op, _ast.And):
+            if isinstance(node, ast.BoolOp):
+                if isinstance(node.op, ast.And):
                     res = True
                     for vn in node.values:
                         res = _ev(vn)
                         if not res:
                             return res
                     return res
-                if isinstance(node.op, _ast.Or):
+                if isinstance(node.op, ast.Or):
                     res = False
                     for vn in node.values:
                         res = _ev(vn)
@@ -1410,33 +1405,33 @@ class ExpressionEvaluator:
                             return res
                     return res
                 raise ValueError(f"xeval: disallowed bool operator in '{s}'")
-            if isinstance(node, _ast.Compare):
+            if isinstance(node, ast.Compare):
                 left = _ev(node.left)
                 for cop, comp in zip(node.ops, node.comparators):
                     right = _ev(comp)
-                    if   isinstance(cop, _ast.Eq):    ok = left == right
-                    elif isinstance(cop, _ast.NotEq): ok = left != right
-                    elif isinstance(cop, _ast.Lt):    ok = left <  right
-                    elif isinstance(cop, _ast.LtE):   ok = left <= right
-                    elif isinstance(cop, _ast.Gt):    ok = left >  right
-                    elif isinstance(cop, _ast.GtE):   ok = left >= right
+                    if   isinstance(cop, ast.Eq):    ok = left == right
+                    elif isinstance(cop, ast.NotEq): ok = left != right
+                    elif isinstance(cop, ast.Lt):    ok = left <  right
+                    elif isinstance(cop, ast.LtE):   ok = left <= right
+                    elif isinstance(cop, ast.Gt):    ok = left >  right
+                    elif isinstance(cop, ast.GtE):   ok = left >= right
                     else:
                         raise ValueError(f"xeval: disallowed comparison in '{s}'")
                     if not ok:
                         return False
                     left = right
                 return True
-            if isinstance(node, _ast.IfExp):
+            if isinstance(node, ast.IfExp):
                 return _ev(node.body) if _ev(node.test) else _ev(node.orelse)
-            if isinstance(node, _ast.Call):
-                if (not isinstance(node.func, _ast.Name)
+            if isinstance(node, ast.Call):
+                if (not isinstance(node.func, ast.Name)
                         or node.func.id not in _ALLOWED_FUNCS):
                     raise ValueError(f"xeval: disallowed function call in '{s}'")
                 if node.keywords:
                     raise ValueError(f"xeval: keyword arguments not allowed in '{s}'")
                 args = [_ev(a) for a in node.args]
                 return _ALLOWED_FUNCS[node.func.id](*args)
-            if isinstance(node, _ast.Name):
+            if isinstance(node, ast.Name):
                 # 関数名以外の裸の識別子は許可しない（Call 経路でのみ Name を消費する）。
                 raise ValueError(f"xeval: disallowed name '{node.id}' in '{s}'")
             raise ValueError(
@@ -2960,7 +2955,8 @@ class PatternMatcher:
         if cnt > _MAX_OPT_GROUPS:
             if self.state.pas == 2 or self.state.pas == 0:
                 print(f" warning - pattern has {cnt} optional groups (max {_MAX_OPT_GROUPS}); "
-                      f"truncating to avoid combinatorial explosion.", file=sys.stderr)
+                      f"first {_MAX_OPT_GROUPS} are treated as optional, "
+                      f"remainder are always included.", file=sys.stderr)
             sl = sl[:_MAX_OPT_GROUPS]
             cnt = _MAX_OPT_GROUPS
 
@@ -3279,7 +3275,7 @@ class ObjectGenerator:
                     self.state._pass1_size_mode = False
                     self.state.error_undefined_label = False
 
-                if (semicolon == True and x != 0) or (semicolon == False):
+                if not semicolon or x != 0:
                     objl += [x]
                 elif semicolon:
                     self.state._elf_label_refs_seen = [
@@ -4167,118 +4163,35 @@ class Assembler:
             self.state.error_undefined_label = False
             
             self.state.expmode=EXP_ASM
-            if not self.state.debug:
-                try:
-                    # パターンマッチ試行中はラベル未定義エラーの表示を抑制する。
-                    # （例: OUT (!n),A が OUT (C),E を試みると !n キャプチャで
-                    #   C がラベルとして評価され false-positive エラーが出る。）
-                    self.state._in_match_attempt = True
-                    _match_result = self.pattern_matcher.match0(lin, i[0])
-                    self.state._in_match_attempt = False
-                    if _match_result == True:
-                        # $$/$. のために命令先頭・末尾アドレスを事前確定する。
-                        # error条件式 i[1] でも $. を参照できるよう error() より前に実施。
-                        self.state.pc_instr_start = self.state.pc
-                        self.state.pc_instr_end   = self.state.pc_instr_start  # プローブ中の暫定値
-                        _probe_sm_saved    = self.state._pass1_size_mode
-                        _probe_refs_len    = len(self.state._elf_label_refs_seen)
-                        _probe_widx_saved  = self.state._elf_current_word_idx
-                        self.state._pass1_size_mode = True
-                        try:
-                            _probe_objl = self.obj_gen.makeobj(i[2])
-                            self.state.pc_instr_end = self.state.pc_instr_start + len(_probe_objl)
-                        except Exception:
-                            pass  # プローブ失敗時は暫定値(pc_instr_start)のまま
-                        finally:
-                            self.state._pass1_size_mode = _probe_sm_saved
-                            del self.state._elf_label_refs_seen[_probe_refs_len:]
-                            self.state._elf_current_word_idx = _probe_widx_saved
-                            self.state.error_undefined_label = False
-                        # Fix 10: error() の戻り値でエラー発生を検知し、
-                        # エラー時はオブジェクト生成をスキップする。
-                        # .check 拘束条件の検証（プローブ完了後・makeobj 前）
-                        err_triggered, _err_code = self.directive_proc.error(i[1])
-                        if not err_triggered:
-                            # pc_instr_start は上のプローブブロックで設定済み
-                            objl = self.obj_gen.makeobj(i[2])
-                        else:
-                            objl = []
-                        # makeobj() の finally が _elf_current_word_idx を -1 に
-                        # リセット済み。以降のサイズ式 expression_pat(i[3]) で発生する
-                        # ラベル参照は word_idx=-1 となりリロケーション対象外になる。
-                        idxs, _ = self.expr_eval.expression_pat(i[3], 0)
-                        loopflag = False
-                        break
-                except (ArithmeticError, KeyError, IndexError, ValueError,
-                        TypeError, AttributeError, OverflowError,
-                        RecursionError, struct.error) as _exc:
-                    self.state._in_match_attempt = False  # 例外時も確実にクリア
-                    # 修正④: 旧実装は `except Exception` で全例外を捕捉していたため、
-                    # makeobj / expression_pat 内のコード実装バグ（TypeError 等）が
-                    # 「forward参照エラー」として握りつぶされ、デバッグが困難だった。
-                    # 対策:
-                    #   - forward参照で発生し得る算術・辞書・値域・型変換系の例外のみを
-                    #     列挙して捕捉する。
-                    #   - それ以外の予期しない例外（RuntimeError, RecursionError 等）は
-                    #     再 raise し、呼び出しスタックを確認できるようにする。
-                    # ただし Pass2 / インタラクティブで発生した場合は従来通り oerr 扱い。
-                    # Bugfix: struct.error (struct.pack の範囲外エラー) は上記リストに
-                    # 含まれていなかったため、enflt/endbl に UNDEF が渡った場合などに
-                    # 未捕捉のままクラッシュしていた。struct.error を追加する。
-                    if self.state.pas == 1:
-                        # Pass1: パターンはマッチしたが forward参照で makeobj が失敗した。
-                        # ラベルを 0 と仮定してサイズだけ確定させ、PC を正しく進める。
-                        # makeobj() の finally が _elf_current_word_idx を -1 にリセット
-                        # するため、ここで追加リセットは不要。
-                        if self.state.debug:
-                            import traceback as _tb
-                            print(f" [pass1 forward-ref fallback] {type(_exc).__name__}: {_exc}", file=sys.stderr)
-                            _tb.print_exc()
-                        try:
-                            self.state._pass1_size_mode = True
-                            objl = self.obj_gen.makeobj(i[2])
-                            idxs, _ = self.expr_eval.expression_pat(i[3], 0)
-                        except (ArithmeticError, KeyError, IndexError, ValueError,
-                                TypeError, AttributeError, OverflowError,
-                                RecursionError, struct.error):
-                            objl = []  # それでも失敗した場合はサイズ0のまま
-                        finally:
-                            self.state._pass1_size_mode = False
-                            # Fix ⑧-2: _pass1_size_mode 中は get_value() が 0 を返しつつ
-                            # error_undefined_label=True もセットする。フォールバック完了後も
-                            # このフラグが残ったままだと、サイズ式 expression_pat(i[3]) で
-                            # ラベルを参照した場合などに汚染が持ち越される。
-                            # フォールバックは意図的な「未定義を 0 として扱う」処理なので
-                            # 完了後はフラグをクリアする。
-                            self.state.error_undefined_label = False
-                        loopflag = False
-                    else:
-                        oerr = True
-                        loopflag = False
-                    break
-            else:
+            # debug/非debug 共通パス。debug 時は except 内でトレースバックを追加出力する。
+            try:
+                # パターンマッチ試行中はラベル未定義エラーの表示を抑制する。
+                # （例: OUT (!n),A が OUT (C),E を試みると !n キャプチャで
+                #   C がラベルとして評価され false-positive エラーが出る。）
                 self.state._in_match_attempt = True
-                _match_result_dbg = self.pattern_matcher.match0(lin, i[0])
+                _match_result = self.pattern_matcher.match0(lin, i[0])
                 self.state._in_match_attempt = False
-                if _match_result_dbg == True:
-                    # $$/$. のために命令先頭・末尾アドレスを事前確定する（デバッグモード）。
+                if _match_result is True:
+                    # $$/$. のために命令先頭・末尾アドレスを事前確定する。
+                    # error条件式 i[1] でも $. を参照できるよう error() より前に実施。
                     self.state.pc_instr_start = self.state.pc
-                    self.state.pc_instr_end   = self.state.pc_instr_start
-                    _probe_sm_saved_d   = self.state._pass1_size_mode
-                    _probe_refs_len_d   = len(self.state._elf_label_refs_seen)
-                    _probe_widx_saved_d = self.state._elf_current_word_idx
+                    self.state.pc_instr_end   = self.state.pc_instr_start  # プローブ中の暫定値
+                    _probe_sm_saved    = self.state._pass1_size_mode
+                    _probe_refs_len    = len(self.state._elf_label_refs_seen)
+                    _probe_widx_saved  = self.state._elf_current_word_idx
                     self.state._pass1_size_mode = True
                     try:
-                        _probe_objl_d = self.obj_gen.makeobj(i[2])
-                        self.state.pc_instr_end = self.state.pc_instr_start + len(_probe_objl_d)
+                        _probe_objl = self.obj_gen.makeobj(i[2])
+                        self.state.pc_instr_end = self.state.pc_instr_start + len(_probe_objl)
                     except Exception:
-                        pass
+                        pass  # プローブ失敗時は暫定値(pc_instr_start)のまま
                     finally:
-                        self.state._pass1_size_mode = _probe_sm_saved_d
-                        del self.state._elf_label_refs_seen[_probe_refs_len_d:]
-                        self.state._elf_current_word_idx = _probe_widx_saved_d
+                        self.state._pass1_size_mode = _probe_sm_saved
+                        del self.state._elf_label_refs_seen[_probe_refs_len:]
+                        self.state._elf_current_word_idx = _probe_widx_saved
                         self.state.error_undefined_label = False
-                    # Fix 10: error() の戻り値でエラー発生を検知する（デバッグモード）
+                    # Fix 10: error() の戻り値でエラー発生を検知し、
+                    # エラー時はオブジェクト生成をスキップする。
                     # .check 拘束条件の検証（プローブ完了後・makeobj 前）
                     err_triggered, _err_code = self.directive_proc.error(i[1])
                     if not err_triggered:
@@ -4286,12 +4199,47 @@ class Assembler:
                         objl = self.obj_gen.makeobj(i[2])
                     else:
                         objl = []
-                    # makeobj() の finally が _elf_current_word_idx を -1 にリセット済み
+                    # makeobj() の finally が _elf_current_word_idx を -1 に
+                    # リセット済み。以降のサイズ式 expression_pat(i[3]) で発生する
+                    # ラベル参照は word_idx=-1 となりリロケーション対象外になる。
                     idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                     loopflag = False
                     break
+            except (ArithmeticError, KeyError, IndexError, ValueError,
+                    TypeError, AttributeError, OverflowError,
+                    struct.error) as _exc:
+                self.state._in_match_attempt = False  # 例外時も確実にクリア
+                # 修正④: forward参照で発生し得る算術・辞書・値域・型変換系の例外のみを
+                # 列挙して捕捉する。RecursionError など予期しない例外は再 raise して
+                # 呼び出しスタックを確認できるようにする。
+                # ただし Pass2 / インタラクティブで発生した場合は従来通り oerr 扱い。
+                if self.state.pas == 1:
+                    # Pass1: パターンはマッチしたが forward参照で makeobj が失敗した。
+                    # ラベルを 0 と仮定してサイズだけ確定させ、PC を正しく進める。
+                    # makeobj() の finally が _elf_current_word_idx を -1 にリセット
+                    # するため、ここで追加リセットは不要。
+                    if self.state.debug:
+                        import traceback as _tb
+                        print(f" [pass1 forward-ref fallback] {type(_exc).__name__}: {_exc}", file=sys.stderr)
+                        _tb.print_exc()
+                    try:
+                        self.state._pass1_size_mode = True
+                        objl = self.obj_gen.makeobj(i[2])
+                        idxs, _ = self.expr_eval.expression_pat(i[3], 0)
+                    except (ArithmeticError, KeyError, IndexError, ValueError,
+                            TypeError, AttributeError, OverflowError,
+                            struct.error):
+                        objl = []  # それでも失敗した場合はサイズ0のまま
+                    finally:
+                        self.state._pass1_size_mode = False
+                        self.state.error_undefined_label = False
+                    loopflag = False
+                else:
+                    oerr = True
+                    loopflag = False
+                break
         
-        if loopflag == True:
+        if loopflag:
             se = True
             pln = 0
             pl = ""
@@ -4410,10 +4358,10 @@ class Assembler:
         finally:
             self.state._elf_tracking = False
 
-        if flag == False:
+        if not flag:
             return False
-        
-        if self.state.vliwflag == False or (idx >= len(line) or line[idx:idx+2] != '!!'):
+
+        if not self.state.vliwflag or (idx >= len(line) or line[idx:idx+2] != '!!'):
             of = len(objl)
             # ------------------------------------------------------------------ #
             # ELF リロケーション検出（トラッキング方式）
@@ -5725,7 +5673,7 @@ class Assembler:
         args = ap.parse_args()
 
         # make osabi table
-        osabitbl = {'Linux':0,'FreeBSD':9}
+        osabitbl = {'Linux':0,'linux':0,'FreeBSD':9,'freebsd':9}
 
         # --- Apply parsed options to assembler state ---
         self.state.outfile      = args.outfile
