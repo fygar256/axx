@@ -1,7 +1,0 @@
-.setsym::EAX::0
-.setsym::EDI::7
-.setsym::EDX::2
-MOV r,!e   ::   0xb8|r,e,e>>8,e>>16,e>>24
-MOVABS RSI,!e::   0x48,0xbe,@@[8,*(e,%%)]
-SYSCALL     ::   0xf,0x5
-DB e        ::   e
