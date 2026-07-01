@@ -105,8 +105,7 @@ Usage:
 
 ```
 usage: axx [-h] [--osabi {FreeBSD,Linux}] [-b OUTFILE] [-e EXPORT_TSV] [-E EXPORT_ELF_TSV] [-i IMPORT_TSV]
-           [-o OBJ_FILE] [-m MACHINE] [--dynamic] [--needed NEEDED] [-v] [-d] [-g]
-           patternfile [sourcefile]
+           [-o OBJ_FILE] [-m MACHINE] [-v] [-d] [-g] patternfile [sourcefile]
 
 axx general assembler programmed and designed by Taisuke Maekawa
 
