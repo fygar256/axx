@@ -3384,10 +3384,17 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
  * Bug 3 fix: pat_match0() – undefined behaviour from 1<<cnt
  * When cnt >= 32, (1<<cnt) is UB in C (signed int overflow).
  *
- * Fix: use uint64_t for the mask.  We also cap cnt at 63 to
- * stay within uint64_t range; patterns with >= 64 optional
- * groups are pathological and were broken before anyway.
- * ------------------------------------------------------- */
+ * Fix: use uint64_t for the mask.
+ *
+ * 破綻点修正: 上記のuint64_t化だけでは、2^cnt通りの組合せを全探索する
+ * コストそのものは解消されない。axx.py 版は "現実のパターンファイルで
+ * [[]] が20を超えることはない" という前提で _MAX_OPT_GROUPS=20 を上限に
+ * 設定している（2^20 ≈ 100万通りが実用上の上限）。
+ * このCポートは「uint64_tに収まる」という理由だけでcnt<=63を許容して
+ * いたが、2^63通りは事実上無限であり、axx.pyでは即座に処理される
+ * cnt=18程度のパターンでも、この上限のせいでハングし続ける
+ * （実測: cnt=18でCコード0.6秒 vs cnt=24で30秒超）。
+ * axx.py と同じ実用上限20に揃える。 */
 static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
     char *t=malloc(strlen(t_orig)+1);
     strcpy(t,t_orig);
@@ -3402,8 +3409,17 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
 
     int cnt=0; for(const char*p=t;*p;p++) if(*p==OB_CHAR) cnt++;
 
-    /* Cap at 63 to keep the uint64_t bitmask valid */
-    if(cnt > 63) cnt = 63;
+    /* axx.py の _MAX_OPT_GROUPS と同じ実用上限。2^20 ≈ 100万通りに
+     * 抑えることで、超過分は「常に含む」扱いにして事実上無限の
+     * 組合せ爆発によるハングを防ぐ。 */
+    enum { MAX_OPT_GROUPS = 20 };
+    if(cnt > MAX_OPT_GROUPS){
+        fprintf(stderr,
+                " warning - pattern has %d optional groups (max %d); "
+                "first %d are treated as optional, remainder are always included.\n",
+                cnt, MAX_OPT_GROUPS, MAX_OPT_GROUPS);
+        cnt = MAX_OPT_GROUPS;
+    }
 
     int *sl=malloc((cnt+1)*sizeof(int));
     for(int i=0;i<cnt;i++) sl[i]=i+1;   /* serials 1..cnt */
@@ -4170,14 +4186,14 @@ static int adir_resX(Assembler *asmb, const char *l, const char *l2,
                 directive,(long long)cnt);
         return 1;
     }
-    /* 256 MB guard (same as .ZERO): applied to the final word-unit count */
-    int64_t total = cnt * (int64_t)mul;
-    if(total > (int64_t)(1 << 28)){
+    /* 256 MB guard: check before multiplying to avoid signed overflow */
+    if(cnt > (int64_t)(1 << 28) / (int64_t)mul){
         if(asmb->st.pas==2||asmb->st.pas==0)
-            fprintf(stderr," error - %s count %lld (x%llu = %lld words) exceeds maximum %d.\n",
-                    directive,(long long)cnt,(unsigned long long)mul,(long long)total,1<<28);
+            fprintf(stderr," error - %s count %lld (x%llu) exceeds maximum %d words.\n",
+                    directive,(long long)cnt,(unsigned long long)mul,1<<28);
         return 1;
     }
+    int64_t total = cnt * (int64_t)mul;
     asmb->st.pc = u256_add(asmb->st.pc, u256_from_u64((uint64_t)total));
     return 1;
 }
@@ -5357,21 +5373,23 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int i=0;i<ncs;i++) weo_sym(&symtab_bb,&nsyms,_is_le,0,0x03,0,(uint16_t)(i+1),0,0); /* section syms */
 
     /* sort labels and export_labels by name */
-    int nl=st->labels.count;
-    WLK *larr=calloc((size_t)(nl?nl:1),sizeof(WLK));
-    {int li=0;for(int bi=0;bi<st->labels.nbuckets;bi++)
-        for(LabelEntry*e=st->labels.buckets[bi];e;e=e->next)
-            larr[li++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,e->is_imported,e->reloc_type_override};}
+    int nl=0;
+    WLK *larr=calloc((size_t)(st->labels.count?st->labels.count:1),sizeof(WLK));
+    {for(int bi=0;bi<st->labels.nbuckets;bi++)
+        for(LabelEntry*e=st->labels.buckets[bi];e;e=e->next){
+            if(u256_is_undef_derived(e->value)) continue;
+            larr[nl++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,e->is_imported,e->reloc_type_override};}}
     qsort(larr,nl,sizeof(WLK),cmp_wlk);
 
-    int ne=st->export_labels.count;
-    WLK *earr=calloc((size_t)(ne?ne:1),sizeof(WLK));
-    {int ei=0;for(int bi=0;bi<st->export_labels.nbuckets;bi++)
+    int ne=0;
+    WLK *earr=calloc((size_t)(st->export_labels.count?st->export_labels.count:1),sizeof(WLK));
+    {for(int bi=0;bi<st->export_labels.nbuckets;bi++)
         for(LabelEntry*e=st->export_labels.buckets[bi];e;e=e->next){
+            if(u256_is_undef_derived(e->value)) continue;
             /* export_labels には reloc_type_override が保存されないため labels から引く */
             LabelEntry *_fl=lmap_find(&st->labels,e->key);
             int _rto = _fl ? _fl->reloc_type_override : -1;
-            earr[ei++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,0,_rto};}}
+            earr[ne++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,0,_rto};}}
     qsort(earr,ne,sizeof(WLK),cmp_wlk);
 
 
