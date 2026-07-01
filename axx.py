@@ -1263,6 +1263,7 @@ class ExpressionEvaluator:
             if (idx == prev_idx
                     and idx < len(s)
                     and s[idx] not in (chr(0), ',', ')', ']', CB, ' ', '\t')
+                    and not self.state._in_match_attempt
                     and (self.state.pas == 2 or self.state.pas == 0)):
                 print(f" warning - unrecognized token at position {idx} in expression: "
                       f"{s[idx:idx+8]!r} (treated as 0)", file=sys.stderr)
