@@ -1559,17 +1559,28 @@ class ExpressionEvaluator:
                         # 精度を保持する。真に非整数の場合は Decimal(repr(v)) で
                         # 最大限の精度を確保した上で変換する。
                         # （label+N のような整数式は int() 経路が適用され精度は保たれる）
-                        v = self.xeval(t, None)
-                        if isinstance(v, int) or (
-                                isinstance(v, float) and v.is_integer()):
-                            h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
-                                    str(int(v)))
+                        #
+                        # Fix (破綻点1): xeval() は裸の識別子（':' なしの名前）や
+                        # 不正な Python 構文に対して ValueError を送出する。
+                        # dbl{}/flt{} と同様に (ValueError, TypeError) を捕捉して
+                        # エラーメッセージを出力し h=0 にフォールバックする。
+                        try:
+                            v = self.xeval(t, None)
+                        except (ValueError, TypeError):
+                            if self.state.pas == 2 or self.state.pas == 0:
+                                print(f" error - qad{{}}: cannot evaluate expression '{t}'; using 0.", file=sys.stderr)
+                            h = '0' * 32
                         else:
-                            # 非整数 float: repr() で 53bit 相当の最大桁数を使用。
-                            # xeval が Python の float を返す以上 53bit が上限だが、
-                            # Decimal() を経由することで binary128 変換は正確に行われる。
-                            h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
-                                    str(Decimal(repr(float(v)))))
+                            if isinstance(v, int) or (
+                                    isinstance(v, float) and v.is_integer()):
+                                h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
+                                        str(int(v)))
+                            else:
+                                # 非整数 float: repr() で 53bit 相当の最大桁数を使用。
+                                # xeval が Python の float を返す以上 53bit が上限だが、
+                                # Decimal() を経由することで binary128 変換は正確に行われる。
+                                h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
+                                        str(Decimal(repr(float(v)))))
                     x = int(h, 16)
         elif (idx + 3 <= len(s) and s[idx:idx+3] == 'dbl'
               # Bugfix: 'dbl' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
@@ -1586,10 +1597,12 @@ class ExpressionEvaluator:
                 else:
                     # Fix: xeval が UNDEF 由来の巨大整数を返すと float() / struct.pack で
                     # OverflowError / struct.error が発生する。
+                    # Fix (破綻点2): xeval() が float & int などの型不整合演算で
+                    # TypeError を送出する場合も同じく捕捉してフォールバックする。
                     try:
                         v = float(self.xeval(t, None))
                         x = int.from_bytes(struct.pack('>d', v), "big")
-                    except (OverflowError, ValueError, struct.error):
+                    except (OverflowError, ValueError, TypeError, struct.error):
                         if self.state.pas == 2 or self.state.pas == 0:
                             print(f" error - dbl{{}}: cannot convert expression to float64; using 0.", file=sys.stderr)
                         x = 0
@@ -1608,10 +1621,12 @@ class ExpressionEvaluator:
                 else:
                     # Fix: xeval が UNDEF 由来の巨大整数を返すと float() / struct.pack で
                     # OverflowError / struct.error が発生する。
+                    # Fix (破綻点2): xeval() が float & int などの型不整合演算で
+                    # TypeError を送出する場合も同じく捕捉してフォールバックする。
                     try:
                         v = float(self.xeval(t, None))
                         x = int.from_bytes(struct.pack('>f', v), "big")
-                    except (OverflowError, ValueError, struct.error):
+                    except (OverflowError, ValueError, TypeError, struct.error):
                         if self.state.pas == 2 or self.state.pas == 0:
                             print(f" error - flt{{}}: cannot convert expression to float32; using 0.", file=sys.stderr)
                         x = 0
@@ -5516,7 +5531,15 @@ class Assembler:
         # ------------------------------------------------------------------ #
         # 5. Write ELF file                                                    #
         # ------------------------------------------------------------------ #
-        with open(path, 'wb') as f:
+        # Fix (破綻点3): open() が失敗した場合（ディレクトリ不在・権限不足・
+        # ディスク満杯など）は OSError を捕捉してクリーンなエラーメッセージを
+        # 出力してリターンする。Python トレースバックでクラッシュさせない。
+        try:
+            _elf_file = open(path, 'wb')
+        except OSError as _e:
+            print(f" error - cannot create ELF output file '{path}': {_e}", file=sys.stderr)
+            return
+        with _elf_file as f:
             # ELF header
             f.write(_pack_ehdr(1, machine, shdr_off, total_shdrs, shstrndx))
 
@@ -5957,6 +5980,11 @@ class Assembler:
                     for i in h:
                         lbl_is_equ = len(i[1]) > 2 and i[1][2]
                         lbl_addr_raw = i[1][0] if lbl_is_equ else i[1][0] * _bpw_export
+                        # Fix (破綻点4): UNDEF 由来の巨大値（未定義ラベル）はエクスポート
+                        # しない。get_value() でエラーメッセージは既に出力済みのため、
+                        # ここでは黙ってスキップするだけでよい。
+                        if _is_undef_derived(i[1][0]):
+                            continue
                         try:
                             lbl_addr = int(lbl_addr_raw)
                         except (OverflowError, ValueError, TypeError):
