@@ -469,6 +469,7 @@ static void lmap_free(LabelMap *m) {
     free(m->buckets); m->buckets=NULL; m->count=0; m->nbuckets=0;
 }
 static LabelEntry *lmap_find(LabelMap *m, const char *key) {
+    if(!m->nbuckets) return NULL;
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
     for(LabelEntry*e=m->buckets[h];e;e=e->next)
         if(strcmp(e->key,key)==0) return e;
@@ -476,6 +477,7 @@ static LabelEntry *lmap_find(LabelMap *m, const char *key) {
 }
 static int lmap_contains(LabelMap *m, const char *key) { return lmap_find(m,key)!=NULL; }
 static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *sec, int is_equ) {
+    if(!m->nbuckets) return;
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
     for(LabelEntry*e=m->buckets[h];e;e=e->next){
         if(strcmp(e->key,key)==0){
@@ -615,7 +617,12 @@ static void secmap_set(SecMap*m,const char*name,uint256_t start,uint256_t size){
     e=calloc(1,sizeof(SecEntry)); e->name=strdup(name); e->start=start; e->size=size;
     e->entry_pc=start; e->confirmed=0;
     e->next=m->buckets[h]; m->buckets[h]=e;
-    if(m->count>=m->cap){m->cap*=2;m->order=realloc(m->order,m->cap*sizeof(SecEntry*));}
+    if(m->count>=m->cap){
+        m->cap*=2;
+        SecEntry**tmp=realloc(m->order,m->cap*sizeof(SecEntry*));
+        if(!tmp){perror("realloc");exit(1);}
+        m->order=tmp;
+    }
     m->order[m->count++]=e;
 }
 static AXX_UNUSED void secmap_free(SecMap*m){
@@ -728,7 +735,7 @@ static void bufmap_init(BufMap*m){ memset(m->buckets,0,sizeof(m->buckets)); }
 static void bufmap_set(BufMap*m, uint64_t pos, uint64_t val){
     uint32_t h=(uint32_t)(pos % BUFMAP_NB);
     for(BufEntry*e=m->buckets[h];e;e=e->next) if(e->pos==pos){e->val=val;return;}
-    BufEntry*e=malloc(sizeof(BufEntry)); e->pos=pos; e->val=val;
+    BufEntry*e=malloc(sizeof(BufEntry)); if(!e){perror("malloc");exit(1);} e->pos=pos; e->val=val;
     e->next=m->buckets[h]; m->buckets[h]=e;
 }
 /* Fix (new): bufmap_max_key now writes the found flag into *found_out so that
@@ -4068,8 +4075,10 @@ static int adir_section(AsmState *st, const char *l, const char *l2){
             st->sections.buckets[h] = ne;
             if(st->sections.count >= st->sections.cap){
                 st->sections.cap *= 2;
-                st->sections.order = realloc(st->sections.order,
-                                             st->sections.cap * sizeof(SecEntry*));
+                SecEntry**_tmp=realloc(st->sections.order,
+                                      st->sections.cap * sizeof(SecEntry*));
+                if(!_tmp){perror("realloc");exit(1);}
+                st->sections.order=_tmp;
             }
             st->sections.order[st->sections.count++] = ne;
         }
@@ -4101,8 +4110,10 @@ static int adir_section(AsmState *st, const char *l, const char *l2){
             st->sections.buckets[h] = ne;
             if(st->sections.count >= st->sections.cap){
                 st->sections.cap *= 2;
-                st->sections.order = realloc(st->sections.order,
-                                             st->sections.cap * sizeof(SecEntry*));
+                SecEntry**_tmp=realloc(st->sections.order,
+                                      st->sections.cap * sizeof(SecEntry*));
+                if(!_tmp){perror("realloc");exit(1);}
+                st->sections.order=_tmp;
             }
             st->sections.order[st->sections.count++] = ne;
         } else {
@@ -4813,6 +4824,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
 
             /* collect refs with valid word_idx (>= 0), sort by word_idx */
             ElfRef *_valid = (ElfRef*)malloc((size_t)st->elf_refs_len * sizeof(ElfRef));
+            if(!_valid){perror("malloc");exit(1);}
             int _nvalid = 0;
             for(int _ri=0; _ri<st->elf_refs_len; _ri++){
                 if(st->elf_refs[_ri].word_idx >= 0)
