@@ -2592,7 +2592,10 @@ class DirectiveProcessor:
                 break
 
             if (self.state.pas == 2 or self.state.pas == 0) and u:
-                t_int = int(t)
+                try:
+                    t_int = int(t)
+                except (OverflowError, ValueError):
+                    t_int = 0
                 print(f"Line {self.state.ln} Error code {t_int} ", end="", file=sys.stderr)
                 if 0 <= t_int < len(ERRORS):
                     print(f"{ERRORS[t_int]}", end='', file=sys.stderr)
@@ -5395,6 +5398,8 @@ class Assembler:
         # ── (3) エクスポートシンボル（STB_GLOBAL=0x10）───────────────
         for name, *_eentry in sorted(self.state.export_labels.items()):
             val, _sec = _eentry[0][0], _eentry[0][1]
+            if _is_undef_derived(val):
+                continue
             is_equ = len(_eentry[0]) > 2 and _eentry[0][2]
             # labels から reloc_type を取得（export_labels には保存されていない）
             _lbl = self.state.labels.get(name, [])

@@ -5323,7 +5323,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         for(int i=0;i<ncs;i++) if(strcmp(st->relocations[ri].section,csecs[i].name)==0){sidx=i;break;}
         if(sidx<0) continue;
         WRL *rl=&rela_lists[sidx];
-        if(rl->len>=rl->cap){rl->cap=rl->cap?rl->cap*2:4;rl->data=realloc(rl->data,rl->cap*sizeof(WRE));}
+        if(rl->len>=rl->cap){rl->cap=rl->cap?rl->cap*2:4;rl->data=realloc(rl->data,rl->cap*sizeof(WRE));if(!rl->data){perror("realloc");exit(1);}}
         rl->data[rl->len++]=(WRE){st->relocations[ri].sec_offset,st->relocations[ri].sym,
                                    st->relocations[ri].rtype,st->relocations[ri].addend};
     }
@@ -6283,6 +6283,7 @@ int main(int argc, char *argv[]){
             } \
             for(int i=0;i<st->export_labels.nbuckets;i++){ \
                 for(LabelEntry*e=st->export_labels.buckets[i];e;e=e->next){ \
+                    if(u256_is_undef_derived(e->value)) continue; \
                     unsigned long long lbl_addr; \
                     if(e->is_equ){ \
                         lbl_addr=(unsigned long long)u256_to_u64(e->value); \
