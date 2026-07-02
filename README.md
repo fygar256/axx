@@ -333,7 +333,7 @@ LD A,(HL)
 LD A,r
 ```
 
-Additionally, register name evaluation must be placed before expression evaluation.
+Additionally, register name evaluation must be placed before expression evaluation. This is because register names must be treated as register names before being treated as (undefined) labels.
 
 ```
 LD A,r
