@@ -322,36 +322,6 @@ MOV t,!a ::0xb8|t,a,a>>8
 
 This allows you to write it as (mov al,0x12,mov bl,0x12) and (mov ax,0x1234,mov bx,0x1234).
 
-#### Pattern Order
-
-Pattern files are evaluated from top to bottom, so patterns placed earlier take precedence.
-
-Place specific patterns first and general patterns later, as shown below:
-
-```
-LD A,(HL)
-LD A,r
-```
-
-Additionally, register name evaluation must be placed before expression evaluation. This is because register names must be treated as register names before being treated as (undefined) labels.
-
-```
-LD A,r
-LD A,!e
-```
-
-For three operands, you must write them in the following order—much like a brute-force enumeration of 3-bit combinations where a register is represented as 0 and an expression as 1. Otherwise, shadowing may occur.
-
-```
-CMD x,y,z    /*000
-CMD x,y,!c   /*001
-CMD x,!b,z   /*010
-CMD x,!b,!c  /*011
-CMD !a,y,z   /*100
-CMD !a,y,!c  /*101
-CMD !a,!b,z  /*110
-CMD !a,!b,!c /*111
-```
 
 #### Double Braces
 
@@ -835,8 +805,6 @@ $ axx.py test.axx test.s
 
 
 ### Unimplemented Items
-
-* Since the order in which pattern files are evaluated matters, I want to ensure the system works regardless of the order.
 
 * Now that the core is complete, adding pattern files to axx, along with high-performance macros and optimization features, would create a magnificent system. However, such a large project is difficult for an individual to complete, so I hope someone will create it. It would be great if it could be put into practical use.
 
