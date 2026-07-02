@@ -324,11 +324,20 @@ This allows you to write it as (mov al,0x12,mov bl,0x12) and (mov ax,0x1234,mov 
 
 #### Pattern Order
 
-Pattern files are evaluated from top to bottom, so those placed earlier take precedence. Special patterns should be placed first, and general patterns later. As shown below.
+Pattern files are evaluated from top to bottom, so patterns placed earlier take precedence.
+
+Place specific patterns first and general patterns later, as shown below:
 
 ```
 LD A,(HL)
-LD A,e
+LD A,r
+```
+
+Additionally, register name evaluation must be placed before expression evaluation.
+
+```
+LD A,r
+LD A,!e
 ```
 
 #### Double Braces
