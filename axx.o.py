@@ -2663,10 +2663,6 @@ class PatternMatcher:
         self.var_manager = var_manager
         self.symbol_manager = symbol_manager
         self.parser = parser
-        # 順序非依存マッチング用: 直近の match()/match0() 成功時の具体度スコア。
-        # (式キャプチャ数, シンボルキャプチャ数, -リテラル一致文字数) のタプル。
-        self.last_score = None
-        self.last_match_score = None
     
     def remove_brackets(self, s, l):
         """Remove specified bracket pairs.
@@ -2707,23 +2703,10 @@ class PatternMatcher:
         return ''.join(result)
     
     def match(self, s, t):
-        """Match assembly line against pattern.
-
-        順序非依存マッチングのため、マッチ成功時に「具体度スコア」を
-        self.last_score に格納する。スコアはタプル
-            (式キャプチャ数, シンボルキャプチャ数, -リテラル一致文字数)
-        で、小さいほど具体的（優先度が高い）:
-          - リテラルのみ  LD A,(HL)  → (0, 0, -n)   最優先
-          - シンボル捕捉  LD A,r     → (0, 1, -n)
-          - 式キャプチャ  LD A,!e    → (1, 0, -n)   最後
-        """
+        """Match assembly line against pattern"""
         self.state.deb1 = s
         self.state.deb2 = t
-
-        n_expr = 0   # !e / !!e / !F / !D / !Q キャプチャ数
-        n_sym = 0    # 小文字シンボルプレースホルダ一致数
-        n_lit = 0    # リテラル一致文字数
-
+        
         t = t.replace(OB, '').replace(CB, '')
         idx_s = 0
         idx_t = 0
@@ -2739,8 +2722,6 @@ class PatternMatcher:
             a = t[idx_t]
             
             if a == chr(0) and b == chr(0):
-                # 順序非依存選択用の具体度スコアを確定
-                self.last_score = (n_expr, n_sym, -n_lit)
                 return True
             
             if a == '\\':
@@ -2748,7 +2729,6 @@ class PatternMatcher:
                 if idx_t < len(t) and t[idx_t] == b:
                     idx_t += 1
                     idx_s += 1
-                    n_lit += 1
                     continue
                 else:
                     return False
@@ -2756,12 +2736,10 @@ class PatternMatcher:
                 if a == b.upper():
                     idx_s += 1
                     idx_t += 1
-                    n_lit += 1
                     continue
                 else:
                     return False
             elif a == '!':
-                n_expr += 1
                 idx_t += 1
                 # Fix 1: パターンが '!' で終端している場合の IndexError を防ぐ
                 if idx_t >= len(t):
@@ -2968,12 +2946,10 @@ class PatternMatcher:
                 if idx_s == prev_idx_s:
                     return False
                 self.var_manager.put(a, v)
-                n_sym += 1
                 continue
             elif a == b:
                 idx_t += 1
                 idx_s += 1
-                n_lit += 1
                 continue
             else:
                 return False
@@ -3012,8 +2988,6 @@ class PatternMatcher:
                 saved_refs_len = len(self.state._elf_label_refs_seen)
                 saved_v2l      = dict(self.state._elf_var_to_label)
                 if self.match(s, lt):
-                    # 採用された [[...]] 組み合わせでのスコアを公開する
-                    self.last_match_score = self.last_score
                     return True
                 # 失敗 → vars と ELF 追跡状態をリストア
                 self.state.vars = saved_vars
@@ -4169,80 +4143,12 @@ class Assembler:
         idxs = 0
         objl = []
         loopflag = True
-
-        # ---- 順序非依存パターン選択 (order-independent pattern matching) ----
-        # 旧実装は「ファイル中で最初にマッチしたパターン」を採用していたため、
-        # LD A,(HL) / LD A,r / LD A,!e のようなパターン群はファイル内の出現順に
-        # 依存していた（例: LD A,!e が先にあると LD A,(HL) の (HL) が式として
-        # 捕捉されてしまう）。
-        #
-        # 新実装は全パターンを走査し、マッチしたものの中から具体度スコア
-        #     (式キャプチャ数, シンボルキャプチャ数, -リテラル一致文字数)
-        # が最小（=最も具体的）なパターンを採用する。優先順位は
-        #     リテラル完全一致 > シンボル(小文字)一致 > 式キャプチャ(!e等)
-        # となり、同点の場合はファイル内で先に出現したパターンを採用する
-        # （従来動作との互換性を保つ）。
-        #
-        # ディレクティブ (.setsym / .check / .bits 等) はファイル順に効果を持つ
-        # ため走査中は従来通り逐次適用し、マッチ成功時点のディレクティブ状態を
-        # スナップショットとして保存する。採用パターンのオブジェクト生成は
-        # 走査完了後にそのスナップショットを復元してから行うので、
-        # 「そのパターン位置までのディレクティブが適用された状態で生成する」
-        # という従来のセマンティクスが保たれる。
-        best = None              # 最良マッチのスナップショット (dict)
-        hit_sentinel = False     # 番兵エントリ i[0]=='' に到達したか
-        first_match_exc = None   # 走査中に例外を出した最初のパターン (診断用)
-
-        _DIR_SCALAR_FIELDS = ('endian', 'bts', 'padding', 'swordchars',
-                              'vliwbits', 'vliwinstbits', 'vliwtemplatebits',
-                              'vliwflag')
-
-        def _snap_dirstate():
-            """ディレクティブが変更し得る状態のスナップショットを取る。"""
-            snap = {f: getattr(self.state, f) for f in _DIR_SCALAR_FIELDS}
-            # コンテナはコピーする。symbols/check_constraints の値は
-            # 置換されるのみでin-place変更されないため浅いコピーで十分。
-            snap['symbols'] = dict(self.state.symbols)
-            snap['check_constraints'] = dict(self.state.check_constraints)
-            snap['vliwnop'] = list(self.state.vliwnop)
-            snap['vliwset'] = list(self.state.vliwset)
-            return snap
-
-        def _restore_dirstate(snap):
-            """_snap_dirstate() のスナップショットを復元する。"""
-            for f in _DIR_SCALAR_FIELDS:
-                setattr(self.state, f, snap[f])
-            self.state.symbols = dict(snap['symbols'])
-            self.state.check_constraints = dict(snap['check_constraints'])
-            self.state.vliwnop = list(snap['vliwnop'])
-            self.state.vliwset = list(snap['vliwset'])
-
-        def _lead_caps(pat_text):
-            """パターン先頭のリテラル大文字列（ニーモニック部）を空白抜きで返す。
-
-            match() の CAPITAL 分岐は「パターンの大文字は入力と大文字小文字を
-            無視して完全一致、空白は両側で読み飛ばし」なので、この前置部分が
-            入力行と一致しないパターンは match0() を呼ぶまでもなく不成立と
-            判定できる（結果を変えない純粋な高速化）。
-            大文字・空白以外の文字（!, 小文字, 記号, [[ 等）が現れた時点で打ち切る。
-            """
-            p = []
-            for ch in pat_text:
-                if ch in CAPITAL:
-                    p.append(ch)
-                elif ch == ' ':
-                    continue
-                else:
-                    break
-            return ''.join(p)
-
+        
         for i in self.state.pat:
             pln += 1
             pl = i
-            # 高速化: 旧実装の `for a in LOWER: var_manager.put(a, VAR_UNDEF)` と
-            # 完全に等価（vars は A-Z の26要素リスト、VAR_UNDEF=int 0）。
-            # put() 26回呼び出しの文字列処理コストを排除する。
-            self.state.vars = [VAR_UNDEF] * 26
+            for a in LOWER:
+                self.var_manager.put(a, VAR_UNDEF)
             
             if i is None: continue
             if self.directive_proc.set_symbol(i): continue
@@ -4262,146 +4168,63 @@ class Assembler:
             lin = StringUtils.reduce_spaces(lin)
             
             if i[0] == '':
-                # 番兵エントリ: パターン走査の終端。
+                # 番兵エントリ: マッチせずにループ終端に達したとみなす。
                 # i[3] にはVLIWスロットインデックス式が入っているため、
-                # マッチが1つも無い場合はここで必ず評価する
-                # （評価せずに break すると idxs が初期値 0 のまま返り
-                #   VLIWスロット配置が狂う）。
-                # マッチ済み (best あり) の場合は採用パターンの i[3] を
-                # 生成ステージで評価するのでここでは評価しない。
-                hit_sentinel = True
-                if best is None:
-                    idxs, _ = self.expr_eval.expression_pat(i[3], 0)
+                # 評価せずに break すると idxs が初期値 0 のまま返り
+                # VLIWスロット配置が狂う。ここで必ず評価する。
+                idxs, _ = self.expr_eval.expression_pat(i[3], 0)
+                loopflag = False
                 break
             
-            # 事前フィルタ: パターン先頭のニーモニック部が入力と一致しなければ
-            # match0() を試行せずスキップする（結果は変わらない・高速化のみ）。
-            _pfx = _lead_caps(i[0])
-            if _pfx:
-                _k = 0
-                _ok = True
-                for _ch in lin:
-                    if _ch == ' ':
-                        continue
-                    if _ch.upper() != _pfx[_k]:
-                        _ok = False
-                        break
-                    _k += 1
-                    if _k == len(_pfx):
-                        break
-                if _k < len(_pfx):
-                    _ok = False  # 入力行が前置部分より短い
-                if not _ok:
-                    continue
-
             self.state.error_undefined_label = False
             
             self.state.expmode=EXP_ASM
-
-            # マッチ試行の副作用（キャプチャ変数・ELF追跡状態）を巻き戻せるよう保存。
-            saved_vars = self.state.vars[:]
-            saved_refs_len = len(self.state._elf_label_refs_seen)
-            saved_v2l = dict(self.state._elf_var_to_label)
-
+            # debug/非debug 共通パス。debug 時は except 内でトレースバックを追加出力する。
             try:
                 # パターンマッチ試行中はラベル未定義エラーの表示を抑制する。
                 # （例: OUT (!n),A が OUT (C),E を試みると !n キャプチャで
                 #   C がラベルとして評価され false-positive エラーが出る。）
                 self.state._in_match_attempt = True
                 _match_result = self.pattern_matcher.match0(lin, i[0])
-            except (ArithmeticError, KeyError, IndexError, ValueError,
-                    TypeError, AttributeError, OverflowError,
-                    struct.error):
-                # 順序非依存化: マッチ試行中の例外は「このパターンは不成立」として
-                # 扱い、他のパターンの走査を妨げない。診断のため最初に例外を出した
-                # パターンだけ記録し、最終的に何もマッチしなかった場合に報告する。
-                # RecursionError など列挙外の例外は従来通り再 raise される。
-                _match_result = False
-                if first_match_exc is None:
-                    first_match_exc = (pln, pl)
-            finally:
-                self.state._in_match_attempt = False  # 例外時も確実にクリア
-
-            if _match_result is True:
-                score = self.pattern_matcher.last_match_score
-                if best is None or score < best['score']:
-                    best = {
-                        'score': score,
-                        'pln':   pln,
-                        'pat':   i,
-                        # マッチで確定したキャプチャ変数と ELF 追跡状態
-                        'vars':  self.state.vars[:],
-                        'refs':  self.state._elf_label_refs_seen[saved_refs_len:],
-                        'v2l':   dict(self.state._elf_var_to_label),
-                        # このパターン位置までのディレクティブ状態
-                        'dir':   _snap_dirstate(),
-                    }
-                # 副作用を巻き戻して走査を継続する
-                # （より具体的なパターンが後方にあるかもしれない）。
-                self.state.vars = saved_vars
-                del self.state._elf_label_refs_seen[saved_refs_len:]
-                self.state._elf_var_to_label = saved_v2l
-
-                # 最適化: リテラルのみのマッチ (式・シンボルキャプチャ 0) は
-                # これ以上具体的なパターンが存在し得ないため走査を打ち切る。
-                # （同一行にマッチするリテラルのみのパターン同士は
-                #   リテラル一致文字数も必ず等しいので、先出現優先も保たれる。）
-                if score[0] == 0 and score[1] == 0:
+                self.state._in_match_attempt = False
+                if _match_result is True:
+                    # $$/$. のために命令先頭・末尾アドレスを事前確定する。
+                    # error条件式 i[1] でも $. を参照できるよう error() より前に実施。
+                    self.state.pc_instr_start = self.state.pc
+                    self.state.pc_instr_end   = self.state.pc_instr_start  # プローブ中の暫定値
+                    _probe_sm_saved    = self.state._pass1_size_mode
+                    _probe_refs_len    = len(self.state._elf_label_refs_seen)
+                    _probe_widx_saved  = self.state._elf_current_word_idx
+                    self.state._pass1_size_mode = True
+                    try:
+                        _probe_objl = self.obj_gen.makeobj(i[2])
+                        self.state.pc_instr_end = self.state.pc_instr_start + len(_probe_objl)
+                    except Exception:
+                        pass  # プローブ失敗時は暫定値(pc_instr_start)のまま
+                    finally:
+                        self.state._pass1_size_mode = _probe_sm_saved
+                        del self.state._elf_label_refs_seen[_probe_refs_len:]
+                        self.state._elf_current_word_idx = _probe_widx_saved
+                        self.state.error_undefined_label = False
+                    # Fix 10: error() の戻り値でエラー発生を検知し、
+                    # エラー時はオブジェクト生成をスキップする。
+                    # .check 拘束条件の検証（プローブ完了後・makeobj 前）
+                    err_triggered, _err_code = self.directive_proc.error(i[1])
+                    if not err_triggered:
+                        # pc_instr_start は上のプローブブロックで設定済み
+                        objl = self.obj_gen.makeobj(i[2])
+                    else:
+                        objl = []
+                    # makeobj() の finally が _elf_current_word_idx を -1 に
+                    # リセット済み。以降のサイズ式 expression_pat(i[3]) で発生する
+                    # ラベル参照は word_idx=-1 となりリロケーション対象外になる。
+                    idxs, _ = self.expr_eval.expression_pat(i[3], 0)
+                    loopflag = False
                     break
-
-            self.state.error_undefined_label = False
-
-        # ---- 採用パターンでのオブジェクト生成ステージ ----
-        if best is not None:
-            i = best['pat']
-            pln = best['pln']
-            pl = i
-            loopflag = False
-
-            # マッチ成功時点の状態を復元する。
-            _restore_dirstate(best['dir'])
-            self.state.vars = best['vars'][:]
-            self.state._elf_label_refs_seen.extend(best['refs'])
-            self.state._elf_var_to_label = dict(best['v2l'])
-            self.state.error_undefined_label = False
-            self.state.expmode = EXP_ASM
-
-            # debug/非debug 共通パス。debug 時は except 内でトレースバックを追加出力する。
-            try:
-                # $$/$. のために命令先頭・末尾アドレスを事前確定する。
-                # error条件式 i[1] でも $. を参照できるよう error() より前に実施。
-                self.state.pc_instr_start = self.state.pc
-                self.state.pc_instr_end   = self.state.pc_instr_start  # プローブ中の暫定値
-                _probe_sm_saved    = self.state._pass1_size_mode
-                _probe_refs_len    = len(self.state._elf_label_refs_seen)
-                _probe_widx_saved  = self.state._elf_current_word_idx
-                self.state._pass1_size_mode = True
-                try:
-                    _probe_objl = self.obj_gen.makeobj(i[2])
-                    self.state.pc_instr_end = self.state.pc_instr_start + len(_probe_objl)
-                except Exception:
-                    pass  # プローブ失敗時は暫定値(pc_instr_start)のまま
-                finally:
-                    self.state._pass1_size_mode = _probe_sm_saved
-                    del self.state._elf_label_refs_seen[_probe_refs_len:]
-                    self.state._elf_current_word_idx = _probe_widx_saved
-                    self.state.error_undefined_label = False
-                # Fix 10: error() の戻り値でエラー発生を検知し、
-                # エラー時はオブジェクト生成をスキップする。
-                # .check 拘束条件の検証（プローブ完了後・makeobj 前）
-                err_triggered, _err_code = self.directive_proc.error(i[1])
-                if not err_triggered:
-                    # pc_instr_start は上のプローブブロックで設定済み
-                    objl = self.obj_gen.makeobj(i[2])
-                else:
-                    objl = []
-                # makeobj() の finally が _elf_current_word_idx を -1 に
-                # リセット済み。以降のサイズ式 expression_pat(i[3]) で発生する
-                # ラベル参照は word_idx=-1 となりリロケーション対象外になる。
-                idxs, _ = self.expr_eval.expression_pat(i[3], 0)
             except (ArithmeticError, KeyError, IndexError, ValueError,
                     TypeError, AttributeError, OverflowError,
                     struct.error) as _exc:
+                self.state._in_match_attempt = False  # 例外時も確実にクリア
                 # 修正④: forward参照で発生し得る算術・辞書・値域・型変換系の例外のみを
                 # 列挙して捕捉する。RecursionError など予期しない例外は再 raise して
                 # 呼び出しスタックを確認できるようにする。
@@ -4426,19 +4249,12 @@ class Assembler:
                     finally:
                         self.state._pass1_size_mode = False
                         self.state.error_undefined_label = False
+                    loopflag = False
                 else:
                     oerr = True
-        elif hit_sentinel:
-            # 番兵に到達し、かつ何もマッチしなかった。
-            # 従来通り構文エラーとはせず、番兵で評価した idxs を返す。
-            loopflag = False
-        elif first_match_exc is not None:
-            # 何もマッチせず、走査中に例外を出したパターンがあった場合は
-            # 従来同様パターン行を示すエラーとして報告する。
-            pln, pl = first_match_exc
-            oerr = True
-            loopflag = False
-
+                    loopflag = False
+                break
+        
         if loopflag:
             se = True
             pln = 0

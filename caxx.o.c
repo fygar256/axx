@@ -820,13 +820,6 @@ typedef struct {
      * match0() が True を返した後の makeobj() 呼び出し前に 0 に戻す。 */
     int        in_match_attempt;
 
-    /* 順序非依存マッチング (axx.py port): 直近の pat_match() 成功時の
-     * 具体度スコア。(式キャプチャ数, シンボルキャプチャ数, リテラル一致文字数)。
-     * lineassemble2() が全パターン走査後に最も具体的なマッチを選ぶために使う。 */
-    int        match_score_expr;
-    int        match_score_sym;
-    int        match_score_lit;
-
     /* pc_instr_start: binary_list中の$$が命令先頭アドレスを指すように、
      * makeobj呼び出し前にst->pcの値を保存する。makeobj内のexpression評価では
      * st->pcではなくst->pc_instr_startを$$として使う。 */
@@ -3224,35 +3217,21 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
     int tlen=(int)strlen(t);
     int result=0;
 
-    /* 順序非依存マッチング用の具体度カウンタ (axx.py port)。
-     * スコアは (n_expr, n_sym, -n_lit) の辞書式比較で小さいほど具体的:
-     *   リテラルのみ  LD A,(HL)  →  最優先
-     *   シンボル捕捉  LD A,r     →  次点
-     *   式キャプチャ  LD A,!e    →  最後                                  */
-    int n_expr=0, n_sym=0, n_lit=0;
-
     while(1){
         idx_s=axx_skipspc(s,idx_s);
         idx_t=axx_skipspc(t,idx_t);
         char b=s[idx_s], a=t[idx_t];
 
-        if(a=='\0'&&b=='\0'){
-            result=1;
-            st->match_score_expr = n_expr;
-            st->match_score_sym  = n_sym;
-            st->match_score_lit  = n_lit;
-            break;
-        }
+        if(a=='\0'&&b=='\0'){ result=1; break; }
 
         if(a=='\\'){
             idx_t++;
-            if(idx_t<tlen && t[idx_t]==b){ idx_t++; idx_s++; n_lit++; continue; }
+            if(idx_t<tlen && t[idx_t]==b){ idx_t++; idx_s++; continue; }
             else { result=0; break; }
         } else if(a>='A'&&a<='Z'){
-            if(a==axx_upper_char(b)){ idx_s++; idx_t++; n_lit++; continue; }
+            if(a==axx_upper_char(b)){ idx_s++; idx_t++; continue; }
             else { result=0; break; }
         } else if(a=='!'){
-            n_expr++;
             idx_t++;
             a=t[idx_t]; idx_t++;
             /* --- !F : capture float32 bit-pattern -------------------------
@@ -3388,14 +3367,13 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             if(idx_s == prev_idx_s){ result=0; break; }
             
             var_put(st,a,sv);
-            n_sym++;
             continue;
         } else if(a=='[' || a==']'){
             idx_t++;
             idx_s=axx_skipspc(s,idx_s);
-            if(s[idx_s]==a){ idx_s++; n_lit++; continue; }
+            if(s[idx_s]==a){ idx_s++; continue; }
             else { result=0; break; }
-        } else if(a==b){ idx_t++; idx_s++; n_lit++; continue; }
+        } else if(a==b){ idx_t++; idx_s++; continue; }
         else { result=0; break; }
     }
     free(s); free(t);
@@ -4429,204 +4407,6 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
 /* =========================================================
  * Main assembly loop
  * ========================================================= */
-/* =========================================================
- * 順序非依存パターン選択 (order-independent pattern matching)
- *
- * 旧実装は「ファイル中で最初にマッチしたパターン」を採用していたため、
- * LD A,(HL) / LD A,r / LD A,!e のようなパターン群はファイル内の出現順に
- * 依存していた（例: LD A,!e が先にあると LD A,(HL) の (HL) が式として
- * 捕捉されてしまう）。
- *
- * 新実装は全パターンを走査し、マッチしたものの中から具体度スコア
- *     (式キャプチャ数, シンボルキャプチャ数, -リテラル一致文字数)
- * が最小（=最も具体的）なパターンを採用する。優先順位は
- *     リテラル完全一致 > シンボル(小文字)一致 > 式キャプチャ(!e等)
- * となり、同点の場合はファイル内で先に出現したパターンを採用する
- * （従来動作との互換性を保つ）。
- *
- * ディレクティブ (.setsym / .check / .bits 等) はファイル順に効果を持つ
- * ため走査中は従来通り逐次適用し、マッチ成功時点のディレクティブ状態を
- * BestMatch にスナップショットとして保存する。採用パターンのオブジェクト
- * 生成は走査完了後にそのスナップショットを復元してから行うので、
- * 「そのパターン位置までのディレクティブが適用された状態で生成する」
- * という従来のセマンティクスが保たれる。
- *
- * 注: すべてファイルスコープの static 関数で実装する（ネスト関数不使用）。
- * ========================================================= */
-typedef struct {
-    int       valid;
-    int       score_expr, score_sym, score_lit;
-    int       pln;
-    PatEntry *pat;
-    /* マッチで確定したキャプチャ変数 */
-    uint256_t vars[26];
-    /* マッチ中に追加された ELF 参照の差分（name は strdup 所有） */
-    struct { char *name; uint64_t val; int word_idx; } *refs;
-    int       refs_len;
-    /* elf_var_to_label のスナップショット（label_name は strdup 所有） */
-    struct { int set; char *label_name; uint64_t label_val; } vtl[26];
-    /* --- このパターン位置までのディレクティブ状態 --- */
-    SymMap    symbols;
-    StrVec    check_constraints[26];
-    char      swordchars[256];
-    uint256_t padding;
-    int       bts;
-    int       endian_big;
-    int       vliwbits, vliwinstbits, vliwtemplatebits, vliwflag;
-    IntVec    vliwnop;
-    VliwSet   vliwset;
-} BestMatch;
-
-static void best_init(BestMatch *b){
-    memset(b, 0, sizeof(*b));
-}
-
-static void best_free(BestMatch *b){
-    if(!b->valid){ memset(b, 0, sizeof(*b)); return; }
-    for(int i=0;i<b->refs_len;i++) free(b->refs[i].name);
-    free(b->refs);
-    for(int i=0;i<26;i++) free(b->vtl[i].label_name);
-    smap_free(&b->symbols);
-    for(int i=0;i<26;i++) sv_free(&b->check_constraints[i]);
-    iv_free(&b->vliwnop);
-    vset_free(&b->vliwset);
-    memset(b, 0, sizeof(*b));
-}
-
-/* スコア (e1,s1,-l1) < (e2,s2,-l2) の辞書式比較。1 なら左辺がより具体的。 */
-static int score_less(int e1,int s1,int l1, int e2,int s2,int l2){
-    if(e1 != e2) return e1 < e2;
-    if(s1 != s2) return s1 < s2;
-    return l1 > l2;   /* リテラル一致文字数は多いほど具体的 */
-}
-
-/* 現在のマッチ結果とディレクティブ状態を best にスナップショットする。
- * saved_refs_len はマッチ試行直前の elf_refs_len（差分抽出用）。 */
-static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
-                         int saved_refs_len){
-    best_free(b);
-    b->valid      = 1;
-    b->score_expr = st->match_score_expr;
-    b->score_sym  = st->match_score_sym;
-    b->score_lit  = st->match_score_lit;
-    b->pln        = pln;
-    b->pat        = pat;
-    memcpy(b->vars, st->vars, sizeof(b->vars));
-
-    /* マッチで追加された ELF 参照の差分を複製 */
-    b->refs_len = st->elf_refs_len - saved_refs_len;
-    b->refs = NULL;
-    if(b->refs_len > 0){
-        b->refs = malloc((size_t)b->refs_len * sizeof(b->refs[0]));
-        if(!b->refs){ perror("malloc"); exit(1); }
-        for(int i=0;i<b->refs_len;i++){
-            b->refs[i].name = st->elf_refs[saved_refs_len+i].name
-                              ? strdup(st->elf_refs[saved_refs_len+i].name) : NULL;
-            b->refs[i].val      = st->elf_refs[saved_refs_len+i].val;
-            b->refs[i].word_idx = st->elf_refs[saved_refs_len+i].word_idx;
-        }
-    }
-    /* elf_var_to_label のスナップショット */
-    for(int i=0;i<26;i++){
-        b->vtl[i].set       = st->elf_var_to_label[i].set;
-        b->vtl[i].label_val = st->elf_var_to_label[i].label_val;
-        b->vtl[i].label_name = st->elf_var_to_label[i].label_name
-                               ? strdup(st->elf_var_to_label[i].label_name) : NULL;
-    }
-    /* ディレクティブ状態 */
-    smap_init(&b->symbols);
-    for(int bi=0; bi<st->symbols.nb; bi++)
-        for(SymEntry *e=st->symbols.buckets[bi]; e; e=e->next)
-            smap_set(&b->symbols, e->key, e->val);
-    for(int i=0;i<26;i++){
-        sv_init(&b->check_constraints[i]);
-        for(int j=0;j<st->check_constraints[i].len;j++)
-            sv_push(&b->check_constraints[i], st->check_constraints[i].data[j]);
-    }
-    memcpy(b->swordchars, st->swordchars, sizeof(b->swordchars));
-    b->padding          = st->padding;
-    b->bts              = st->bts;
-    b->endian_big       = st->endian_big;
-    b->vliwbits         = st->vliwbits;
-    b->vliwinstbits     = st->vliwinstbits;
-    b->vliwtemplatebits = st->vliwtemplatebits;
-    b->vliwflag         = st->vliwflag;
-    iv_init(&b->vliwnop);
-    iv_copy(&b->vliwnop, &st->vliwnop);
-    vset_init(&b->vliwset);
-    for(int i=0;i<st->vliwset.len;i++)
-        vset_add(&b->vliwset, st->vliwset.data[i].idxs,
-                 st->vliwset.data[i].nidxs, st->vliwset.data[i].templ);
-}
-
-/* best に保存したディレクティブ状態を st に復元する。 */
-static void best_restore_dirstate(AsmState *st, const BestMatch *b){
-    smap_clear(&st->symbols);
-    for(int bi=0; bi<b->symbols.nb; bi++)
-        for(SymEntry *e=b->symbols.buckets[bi]; e; e=e->next)
-            smap_set(&st->symbols, e->key, e->val);
-    for(int i=0;i<26;i++){
-        sv_free(&st->check_constraints[i]);
-        for(int j=0;j<b->check_constraints[i].len;j++)
-            sv_push(&st->check_constraints[i], b->check_constraints[i].data[j]);
-    }
-    memcpy(st->swordchars, b->swordchars, sizeof(st->swordchars));
-    st->padding          = b->padding;
-    st->bts              = b->bts;
-    st->endian_big       = b->endian_big;
-    st->vliwbits         = b->vliwbits;
-    st->vliwinstbits     = b->vliwinstbits;
-    st->vliwtemplatebits = b->vliwtemplatebits;
-    st->vliwflag         = b->vliwflag;
-    iv_copy(&st->vliwnop, &b->vliwnop);
-    vset_clear(&st->vliwset);
-    for(int i=0;i<b->vliwset.len;i++)
-        vset_add(&st->vliwset, b->vliwset.data[i].idxs,
-                 b->vliwset.data[i].nidxs, b->vliwset.data[i].templ);
-}
-
-/* st->elf_refs に1件追加する（name は strdup 複製）。 */
-static void elf_refs_push_copy(AsmState *st, const char *name,
-                               uint64_t val, int word_idx){
-    if(st->elf_refs_len >= st->elf_refs_cap){
-        st->elf_refs_cap = st->elf_refs_cap ? st->elf_refs_cap*2 : 8;
-        st->elf_refs = realloc(st->elf_refs,
-            st->elf_refs_cap * sizeof(st->elf_refs[0]));
-        if(!st->elf_refs){ perror("realloc"); exit(1); }
-    }
-    st->elf_refs[st->elf_refs_len].name     = name ? strdup(name) : NULL;
-    st->elf_refs[st->elf_refs_len].val      = val;
-    st->elf_refs[st->elf_refs_len].word_idx = word_idx;
-    st->elf_refs_len++;
-}
-
-/* 事前フィルタ: パターン先頭のリテラル大文字列（ニーモニック部）が
- * 入力行と一致するかを判定する。pat_match() の大文字分岐は
- * 「パターンの大文字は入力と大文字小文字を無視して完全一致、空白は
- * 両側で読み飛ばし」なので、この前置部分が一致しないパターンは
- * pat_match0() を呼ぶまでもなく不成立と判定できる
- * （結果を変えない純粋な高速化）。
- * 大文字・空白以外の文字（!, 小文字, 記号, [[ 等）が現れた時点で
- * 前置部分を打ち切る。前置部分が空ならフィルタ不可として 1 を返す。 */
-static int pat_prefix_matches(const char *pat, const char *lin){
-    char pfx[64];
-    int np = 0;
-    for(const char *p = pat; *p && np < (int)sizeof(pfx)-1; p++){
-        if(*p >= 'A' && *p <= 'Z') pfx[np++] = *p;
-        else if(*p == ' ') continue;
-        else break;
-    }
-    if(np == 0) return 1;   /* フィルタ不可: 常に pat_match0 を試行 */
-    int k = 0;
-    for(const char *q = lin; *q; q++){
-        if(*q == ' ') continue;
-        if(axx_upper_char(*q) != pfx[k]) return 0;
-        k++;
-        if(k == np) return 1;
-    }
-    return 0;   /* 入力行が前置部分より短い */
-}
-
 static int lineassemble2(Assembler *asmb, const char *line, int idx,
                          IntVec *idxs_out, IntVec *objl_out, int *idx_out){
     AsmState *st=&asmb->st;
@@ -4738,9 +4518,6 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     int idxs_val=0;
     int loopflag=1;
     PatEntry *oerr_entry=NULL;   /* pattern entry that caused oerr */
-    int hit_sentinel=0;          /* 番兵エントリ f[0]=="" に到達したか */
-    BestMatch best;
-    best_init(&best);
 
     for(int pi=0;pi<st->pat.len;pi++){
         PatEntry *i=&st->pat.data[pi];
@@ -4764,40 +4541,17 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         axx_reduce_spaces(lin);
 
         if(!i->f[0][0]){
-            /* 番兵エントリ: パターン走査の終端。
-             * f[3] にはVLIWスロットインデックス式が入っているため、
-             * マッチが1つも無い場合はここで必ず評価する。
-             * マッチ済み (best.valid) の場合は採用パターンの f[3] を
-             * 生成ステージで評価するのでここでは評価しない。 */
-            hit_sentinel=1;
-            if(!best.valid){
-                int io2;
-                uint256_t idxv2=expr_expression_pat(asmb,i->f[3],0,&io2);
-                idxs_val=(int)u256_to_i64(idxv2);
-            }
-            break;
+            /* Sentinel entry (empty pattern field[0]): treat as end-of-match.
+             * Python evaluates i[3] here to capture the VLIW slot index before
+             * breaking, so we must do the same. */
+            int io2;
+            uint256_t idxv2=expr_expression_pat(asmb,i->f[3],0,&io2);
+            idxs_val=(int)u256_to_i64(idxv2);
+            loopflag=0; break;
         }
-
-        /* 事前フィルタ: 先頭ニーモニック不一致のパターンはスキップする
-         * （結果は変わらない・高速化のみ）。 */
-        if(!pat_prefix_matches(i->f[0], lin)) continue;
 
         st->error_undefined_label=0;
         st->expmode=EXP_ASM;
-
-        /* マッチ試行の副作用（キャプチャ変数・ELF追跡状態）を
-         * 巻き戻せるよう保存する。 */
-        uint256_t saved_vars[26];
-        memcpy(saved_vars, st->vars, sizeof(saved_vars));
-        int saved_refs_len = st->elf_refs_len;
-        struct { int set; char *label_name; uint64_t label_val; } saved_vtl[26];
-        for(int vi=0;vi<26;vi++){
-            saved_vtl[vi].set        = st->elf_var_to_label[vi].set;
-            saved_vtl[vi].label_val  = st->elf_var_to_label[vi].label_val;
-            saved_vtl[vi].label_name = st->elf_var_to_label[vi].label_name
-                                       ? strdup(st->elf_var_to_label[vi].label_name)
-                                       : NULL;
-        }
 
         /* パターンマッチ試行中はラベル未定義エラーの表示を抑制する。
          * (例: OUT (!n),A が OUT (C),E を試みると !n キャプチャで
@@ -4807,118 +4561,53 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         st->in_match_attempt = 0;
 
         if(_match_ok){
-            /* より具体的なマッチなら候補を更新する（同点は先出現優先）。 */
-            if(!best.valid ||
-               score_less(st->match_score_expr, st->match_score_sym,
-                          st->match_score_lit,
-                          best.score_expr, best.score_sym, best.score_lit)){
-                best_capture(st, &best, i, pln, saved_refs_len);
+            /* $$/$. のために命令先頭・末尾アドレスを事前確定する。
+             * error条件式 i->f[1] でも $. を参照できるよう dir_error() より前に実施。 */
+            st->pc_instr_start = st->pc;
+            st->pc_instr_end   = st->pc_instr_start;  /* プローブ中の暫定値 */
+            {
+                int _probe_sm_saved  = st->pass1_size_mode;
+                int _probe_refs_len  = st->elf_refs_len;
+                int _probe_widx_saved = st->elf_current_word_idx;
+                st->pass1_size_mode = 1;
+                IntVec _probe_objl; iv_init(&_probe_objl);
+                /* プローブ中はerror_undefined_labelが汚染しないよう保護 */
+                int _probe_err_undef_saved = st->error_undefined_label;
+                st->error_undefined_label = 0;
+                makeobj(asmb, i->f[2], &_probe_objl);
+                /* pc_instr_end = 命令先頭 + 命令バイト数 */
+                uint256_t _probe_sz = u256_from_i64((int64_t)_probe_objl.len);
+                st->pc_instr_end = u256_add(st->pc_instr_start, _probe_sz);
+                iv_free(&_probe_objl);
+                /* ELFトラッキング状態をプローブ前に巻き戻す */
+                st->elf_refs_len        = _probe_refs_len;
+                st->elf_current_word_idx = _probe_widx_saved;
+                st->pass1_size_mode     = _probe_sm_saved;
+                st->error_undefined_label = _probe_err_undef_saved;
             }
-            /* 副作用を巻き戻して走査を継続する
-             * （より具体的なパターンが後方にあるかもしれない）。 */
-            memcpy(st->vars, saved_vars, sizeof(saved_vars));
-            for(int ri2=saved_refs_len; ri2<st->elf_refs_len; ri2++)
-                free(st->elf_refs[ri2].name);
-            st->elf_refs_len = saved_refs_len;
-            for(int vi=0;vi<26;vi++){
-                free(st->elf_var_to_label[vi].label_name);
-                st->elf_var_to_label[vi].set        = saved_vtl[vi].set;
-                st->elf_var_to_label[vi].label_val  = saved_vtl[vi].label_val;
-                st->elf_var_to_label[vi].label_name = saved_vtl[vi].label_name;
-                saved_vtl[vi].label_name = NULL;   /* 所有権移動 */
+            /* Fix 10 (axx.py): only call makeobj when dir_error did NOT trigger.
+             * Previously makeobj always ran even if an .error condition fired. */
+            int err_triggered = dir_error(asmb,i->f[1]);
+            if(!err_triggered){
+                /* pc_instr_start は上のプローブブロックで設定済み */
+                makeobj(asmb,i->f[2],objl_out);
+                /* Pass1ではmakeobj内でpass1_size_modeを使うため、
+                 * ここでのretryは不要。error_undefined_labelはmakeobj内でクリア済み。
+                 * Pass2: if makeobj produced undefined label, that's a hard error */
+                if(st->pas==2 && st->error_undefined_label){
+                    oerr=1;
+                    oerr_entry=i;
+                    loopflag=0; break;
+                }
+            } else {
+                iv_clear(objl_out);
             }
-            st->error_undefined_label=0;
-
-            /* 最適化: リテラルのみのマッチ (式・シンボルキャプチャ 0) は
-             * これ以上具体的なパターンが存在し得ないため走査を打ち切る。
-             * （同一行にマッチするリテラルのみのパターン同士は
-             *   リテラル一致文字数も必ず等しいので、先出現優先も保たれる。）*/
-            if(best.score_expr==0 && best.score_sym==0) break;
-        } else {
-            /* pat_match0 は失敗時に内部で状態を復元済み。
-             * 保存用に複製した label_name を解放する。 */
-            for(int vi=0;vi<26;vi++) free(saved_vtl[vi].label_name);
-            st->error_undefined_label=0;
-        }
-    }
-
-    /* ---- 採用パターンでのオブジェクト生成ステージ ---- */
-    if(best.valid){
-        PatEntry *i = best.pat;
-        pln = best.pln;
-        loopflag = 0;
-
-        /* マッチ成功時点のディレクティブ状態・キャプチャ変数・
-         * ELF追跡状態を復元する。 */
-        best_restore_dirstate(st, &best);
-        memcpy(st->vars, best.vars, sizeof(st->vars));
-        for(int ri2=0; ri2<best.refs_len; ri2++)
-            elf_refs_push_copy(st, best.refs[ri2].name,
-                               best.refs[ri2].val, best.refs[ri2].word_idx);
-        for(int vi=0;vi<26;vi++){
-            free(st->elf_var_to_label[vi].label_name);
-            st->elf_var_to_label[vi].set        = best.vtl[vi].set;
-            st->elf_var_to_label[vi].label_val  = best.vtl[vi].label_val;
-            st->elf_var_to_label[vi].label_name = best.vtl[vi].label_name
-                                                  ? strdup(best.vtl[vi].label_name)
-                                                  : NULL;
-        }
-        st->error_undefined_label = 0;
-        st->expmode = EXP_ASM;
-
-        /* $$/$. のために命令先頭・末尾アドレスを事前確定する。
-         * error条件式 i->f[1] でも $. を参照できるよう dir_error() より前に実施。 */
-        st->pc_instr_start = st->pc;
-        st->pc_instr_end   = st->pc_instr_start;  /* プローブ中の暫定値 */
-        {
-            int _probe_sm_saved  = st->pass1_size_mode;
-            int _probe_refs_len  = st->elf_refs_len;
-            int _probe_widx_saved = st->elf_current_word_idx;
-            st->pass1_size_mode = 1;
-            IntVec _probe_objl; iv_init(&_probe_objl);
-            /* プローブ中はerror_undefined_labelが汚染しないよう保護 */
-            int _probe_err_undef_saved = st->error_undefined_label;
-            st->error_undefined_label = 0;
-            makeobj(asmb, i->f[2], &_probe_objl);
-            /* pc_instr_end = 命令先頭 + 命令バイト数 */
-            uint256_t _probe_sz = u256_from_i64((int64_t)_probe_objl.len);
-            st->pc_instr_end = u256_add(st->pc_instr_start, _probe_sz);
-            iv_free(&_probe_objl);
-            /* ELFトラッキング状態をプローブ前に巻き戻す */
-            for(int ri2=_probe_refs_len; ri2<st->elf_refs_len; ri2++)
-                free(st->elf_refs[ri2].name);
-            st->elf_refs_len        = _probe_refs_len;
-            st->elf_current_word_idx = _probe_widx_saved;
-            st->pass1_size_mode     = _probe_sm_saved;
-            st->error_undefined_label = _probe_err_undef_saved;
-        }
-        /* Fix 10 (axx.py): only call makeobj when dir_error did NOT trigger.
-         * Previously makeobj always ran even if an .error condition fired. */
-        int err_triggered = dir_error(asmb,i->f[1]);
-        if(!err_triggered){
-            /* pc_instr_start は上のプローブブロックで設定済み */
-            makeobj(asmb,i->f[2],objl_out);
-            /* Pass1ではmakeobj内でpass1_size_modeを使うため、
-             * ここでのretryは不要。error_undefined_labelはmakeobj内でクリア済み。
-             * Pass2: if makeobj produced undefined label, that's a hard error */
-            if(st->pas==2 && st->error_undefined_label){
-                oerr=1;
-                oerr_entry=i;
-            }
-        } else {
-            iv_clear(objl_out);
-        }
-        if(!oerr){
             int io;
             uint256_t idxv=expr_expression_pat(asmb,i->f[3],0,&io);
             idxs_val=(int)u256_to_i64(idxv);
+            loopflag=0; break;
         }
-    } else if(hit_sentinel){
-        /* 番兵に到達し、かつ何もマッチしなかった。
-         * 従来通り構文エラーとはせず、番兵で評価した idxs を返す。 */
-        loopflag=0;
     }
-    best_free(&best);
 
     if(loopflag){ se=1; pln=0; }
 
