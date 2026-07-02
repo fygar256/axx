@@ -340,6 +340,19 @@ LD A,r
 LD A,!e
 ```
 
+For three operands, you must write them in the following order—much like a brute-force enumeration of 3-bit combinations where a register is represented as 0 and an expression as 1. Otherwise, shadowing may occur.
+
+```
+CMD x,y,z    /*000
+CMD x,y,!c   /*001
+CMD x,!b,z   /*010
+CMD x,!b,!c  /*011
+CMD !a,y,z   /*100
+CMD !a,y,!c  /*101
+CMD !a,!b,z  /*110
+CMD !a,!b,!c /*111
+```
+
 #### Double Braces
 
 Optional parts within the instruction can be enclosed in double brackets. This shows the z80 `inc (ix)` instruction.
