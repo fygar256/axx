@@ -836,7 +836,7 @@ $ axx.py test.axx test.s
 
 ### Unimplemented Items
 
-* Difficulty in determining the order of pattern file evaluation.
+* Since the order in which pattern files are evaluated matters, I want to ensure the system works regardless of the order.
 
 * Now that the core is complete, adding pattern files to axx, along with high-performance macros and optimization features, would create a magnificent system. However, such a large project is difficult for an individual to complete, so I hope someone will create it. It would be great if it could be put into practical use.
 
