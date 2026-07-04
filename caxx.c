@@ -3225,10 +3225,15 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
     int result=0;
 
     /* 順序非依存マッチング用の具体度カウンタ (axx.py port)。
-     * スコアは (n_expr, n_sym, -n_lit) の辞書式比較で小さいほど具体的:
+     * スコアは (n_expr, -n_lit, n_sym) の辞書式比較で小さいほど具体的:
      *   リテラルのみ  LD A,(HL)  →  最優先
      *   シンボル捕捉  LD A,r     →  次点
-     *   式キャプチャ  LD A,!e    →  最後                                  */
+     *   式キャプチャ  LD A,!e    →  最後
+     * 修正: 第2キーをシンボル数からリテラル一致文字数に変更 (axx.py と同期)。
+     * 旧順序では式キャプチャ数が同じ2パターンのうちシンボル数の少ない方が
+     * リテラル一致がどれほど多くても勝ってしまい、`ld a,(iy+9)` で
+     * LD A,(!n) が LD s,(IY[[+!d]]) に勝って iy+9 が式に飲み込まれ、
+     * 未定義ラベル iy のエラーになっていた。                              */
     int n_expr=0, n_sym=0, n_lit=0;
 
     while(1){
@@ -4493,11 +4498,12 @@ static void best_free(BestMatch *b){
     memset(b, 0, sizeof(*b));
 }
 
-/* スコア (e1,s1,-l1) < (e2,s2,-l2) の辞書式比較。1 なら左辺がより具体的。 */
+/* スコア (e1,-l1,s1) < (e2,-l2,s2) の辞書式比較。1 なら左辺がより具体的。
+ * 修正: リテラル一致文字数をシンボル数より優先する (axx.py と同期)。 */
 static int score_less(int e1,int s1,int l1, int e2,int s2,int l2){
     if(e1 != e2) return e1 < e2;
-    if(s1 != s2) return s1 < s2;
-    return l1 > l2;   /* リテラル一致文字数は多いほど具体的 */
+    if(l1 != l2) return l1 > l2;   /* リテラル一致文字数は多いほど具体的 */
+    return s1 < s2;
 }
 
 /* 現在のマッチ結果とディレクティブ状態を best にスナップショットする。
