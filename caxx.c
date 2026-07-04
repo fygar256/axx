@@ -5495,14 +5495,34 @@ static uint8_t *weo_extract(AsmState*st,int bpw,uint64_t w0,uint64_t wn){
     return d;
 }
 
-/* byte-address -> (1-based content section index, in-section offset) */
+/* byte-address -> (1-based content section index, in-section offset)
+ *
+ * axx.py の _find_shndx() (Fix 7) 相当のフォールバックを追加。
+ * 旧実装は「start <= addr < start+size」の通常範囲にも
+ * 「size==0 かつ addr==start」にも一致しないアドレスを即座に
+ * SHN_ABS(0xfff1) としていた。これにより、ファイル末尾（セクション終端＝
+ * start+size ちょうど）に置かれたラベル（サイズマーカーなど、よくあるパターン）が
+ * axx.py では .text セクション相対シンボルとして出力されるのに対し、
+ * caxx.c では誤って絶対シンボル扱いになっていた。
+ * 修正: 通常範囲に一致しない場合、addr 以下で最も開始アドレスが近い
+ * セクションに帰属させる（best-effort）。セクションが1つも無い場合のみ
+ * SHN_ABS を返す。 */
 static WSR weo_shndx(WCS*csecs,int ncs,uint64_t ba){
     for(int i=0;i<ncs;i++){
         if(csecs[i].bsz>0&&csecs[i].bs<=ba&&ba<csecs[i].bs+csecs[i].bsz)
             return (WSR){(uint16_t)(i+1),ba-csecs[i].bs};
         if(!csecs[i].bsz&&ba==csecs[i].bs) return (WSR){(uint16_t)(i+1),0};
     }
-    return (WSR){0xfff1,ba};
+    if(ncs>0){
+        int best_i=0; uint64_t best_start=csecs[0].bs;
+        for(int i=0;i<ncs;i++){
+            if(csecs[i].bs<=ba && csecs[i].bs>=best_start){ best_i=i; best_start=csecs[i].bs; }
+        }
+        uint64_t sv = ba - csecs[best_i].bs;   /* ba < csecs[best_i].bs のときは 0 側に丸める */
+        if(ba < csecs[best_i].bs) sv = 0;
+        return (WSR){(uint16_t)(best_i+1), sv};
+    }
+    return (WSR){0xfff1,ba};   /* SHN_ABS（セクションが一切ない場合のみ） */
 }
 
 /* append one Elf64_Sym (24 bytes) to the symtab buffer */
