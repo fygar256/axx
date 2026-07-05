@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
-# cython: language_level=3
 
 """
 axx general assembler designed and programmed by Taisuke Maekawa
 Refactored with OOP design for improved maintainability
+
+axxは特定のCPUに固定されたアセンブラではなく、命令のニーモニックと
+バイナリエンコーディングの対応関係を「パターン定義ファイル(.axx)」に
+テキストで記述することで、任意の命令セット(x86_64, ARM64, Z80, VLIW風の
+独自ISA等)に対応できる汎用アセンブラである。
+
+    axx.py <パターンファイル.axx> <ソースファイル.s> -o <出力.o>
+
+全体の処理の流れは Assembler.run() を参照。詳しい設計の概説は
+axx.abs.txt にまとめてある。
 """
 
 from decimal import Decimal, getcontext, localcontext
 try:
-    import readline  # GNU readline (Unix/macOS only; not available on Windows)
+    import readline  # 対話モードの行編集用(Windows等では無くても動く)
 except ImportError:
-    pass  # Gracefully degrade on Windows or environments without readline
+    pass
 import ast
 import subprocess
 import itertools
@@ -21,45 +30,29 @@ import math
 import re
 import tempfile
 
-# Pass1 リラクゼーションの初期比較用番兵オブジェクト。
-# モジュールレベルで1度だけ生成することで、run() を複数回呼び出しても
-# 同一オブジェクトとの `is not` 比較が常に正しく機能する。
+# run()を複数回呼んでもリラクゼーション収束判定が正しく動くよう、
+# モジュールレベルで一度だけ生成する「未確定」を表す番兵オブジェクト。
 _RELAXATION_SENTINEL = object()
 
 
-# Expression mode constants
+# 式評価モード: パターンファイル中の式(EXP_PAT)かソース中の式(EXP_ASM)かを区別する。
 EXP_PAT = 0
 EXP_ASM = 1
-# exp_typ は後方互換のため残存するが、実際には AssemblerState.exp_typ を使用する。
-# このグローバルは参照されなくなった（修正1対応）。
-exp_typ = 'i'  # deprecated – do not use directly
+exp_typ = 'i'  # 未使用(後方互換のためだけに残存)。実体はAssemblerState.exp_typ。
 
-# Special bracket characters
-OB = chr(0x90)  # open double bracket
-CB = chr(0x91)  # close double bracket
+# [[ ... ]] オプショナルグループを表す内部専用の制御文字(通常の文字とは衝突しない)。
+OB = chr(0x90)  # open  [[
+CB = chr(0x91)  # close ]]
 
-# Constants
+# 「未定義ラベル」を表す番兵値(2^256-1)。ラベル値は整数として扱われるため、
+# 専用の型ではなくこの巨大な数値に重畳する設計になっている。
 UNDEF = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 VAR_UNDEF = 0
 
-# B修正: UNDEF 由来値の検出を一元化し、閾値を引き上げる。
-#
-# 設計上 UNDEF (=2^256-1) は「未定義ラベル」を表す番兵として整数値に重畳されている。
-# UNDEF に対する加減算（UNDEF - base, UNDEF + disp 等）は 2^256 近傍の巨大値となり、
-# これらも「未定義由来」として 0 扱いすべきである。
-#
-# 旧実装は閾値 2^128 を使っていたが、これは「正当に計算され得る大きな値」と衝突する:
-# axx は最大 256bit 値・128bit 浮動小数点(quad)を扱うため、2^128 以上の正当な定数/即値が
-# 存在し得る。それらが誤って「未定義」と判定され 0 に潰れる危険があった。
-#
-# 修正: 閾値を 2^192 に引き上げる。アドレスは 64bit に収まり、quad 即値も < 2^128 なので、
-# 正当な値が 2^192 に達することは現実的にない。一方 UNDEF(2^256-1) および
-# UNDEF±変位・base-UNDEF（≈±2^256）はすべて閾値を超えるため確実に捕捉できる。
-# 符号付き両側を見るため abs() で判定する。
-#
-# 注: これは依然ヒューリスティックである。原理的に厳密な解決は「未定義」を
-# 数値に重畳するのをやめ専用の未定義型/フラグで伝播させる設計変更（大規模）だが、
-# 本修正は誤検出を実用上ゼロまで下げる範囲で現実的な改善を行う。
+# UNDEFへの加減算(UNDEF-base, UNDEF+disp等)も2^256近傍の巨大値になるため、
+# 「未定義由来」の値として検出する必要がある。axxが扱う最大値は256bit整数・
+# 128bit浮動小数点(quad)なので、正当な定数は2^128未満に収まる。閾値を2^192に
+# 取ることで、正当な大きい定数とUNDEF由来の値を確実に区別できる。
 _UNDEF_DERIVED_THRESHOLD = 1 << 192
 
 def _is_undef_derived(v):
@@ -67,18 +60,17 @@ def _is_undef_derived(v):
     if v == UNDEF:
         return True
     if isinstance(v, int):
-        # bool は int 部分型だが Python の abs(True)=1 で誤検出しないので問題ない
         return abs(v) >= _UNDEF_DERIVED_THRESHOLD
     return False
 
-# Character sets
 CAPITAL = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 LOWER = "abcdefghijklmnopqrstuvwxyz"
 DIGIT = '0123456789'
 XDIGIT = "0123456789ABCDEF"
 ALPHABET = LOWER + CAPITAL
 
-# Error messages
+# ERRORS[n] は .error::n::cond のようにパターンファイルからエラーコード番号
+# 指定で参照される定型メッセージ。
 ERRORS = [
     "",
     "Invalid syntax.",
@@ -91,47 +83,41 @@ ERRORS = [
 
 
 class AssemblerState:
-    """Global state container for the assembler"""
-    
+    """アセンブラ全体で共有される状態(PC・ラベル表・セクション・パス番号等)を
+    1つにまとめたコンテナ。各種Manager/Processorクラスはこれを介して協調する。
+    """
+
     def __init__(self):
-        # File paths
+        # コマンドラインオプションで指定される入出力ファイルパス
         self.outfile = ""
         self.expfile = ""
         self.expfile_elf = ""
         self.impfile = ""
-        
-        # Program counter and padding
-        self.pc = 0
+
+        self.pc = 0             # 現在のプログラムカウンタ(次に書き込むアドレス)
         self.padding = 0
-        # pc_instr_start: binary_list中の$$が命令先頭アドレスを指すように、
-        # makeobj呼び出し前にself.state.pcの値を保存する。
+        # $$ / $. の評価に使う: makeobj()呼び出し前に命令の開始・終了アドレスを
+        # 確定しておく。$$は_in_binary_list中のみpc_instr_startを返し、
+        # それ以外の文脈(.equ等)ではself.pcを返す。
         self.pc_instr_start = 0
-        # pc_instr_end: binary_list中の$.が命令の次のアドレスを指す。
-        # makeobj呼び出し前にサイズプローブを実行して確定する。
-        # (例: 7バイト命令なら pc_instr_end = pc_instr_start + 7)
         self.pc_instr_end = 0
-        # _in_binary_list: makeobj実行中はTrue。$$がpc_instr_startを
-        # 返すのはbinary_list評価中のみ。.equなど他のコンテキストでは
-        # $$=現在のPC (self.state.pc) を返す。
-        self._in_binary_list = False
-        
-        # Character sets for parsing
+        self._in_binary_list = False  # makeobj()実行中かどうか
+
+        # ラベル名・シンボル名として使える文字集合
         self.lwordchars = DIGIT + ALPHABET + "_."
         self.swordchars = DIGIT + ALPHABET + "_%$-~&|"
-        
-        # Current context
+
         self.current_section = ".text"
         self.current_file = ""
-        
-        # Data structures
-        self.labels = {}
-        self.sections = {}
-        self.symbols = {}
-        self.patsymbols = {}
+
+        self.labels = {}          # {ラベル名: [値, セクション, is_equ, is_imported, reloc_type?]}
+        self.sections = {}        # {セクション名: [開始pc, サイズ, ...]}
+        self.symbols = {}         # .setsymで登録された現在有効なシンボル
+        self.patsymbols = {}      # パターンファイル読込み直後のシンボル(ソース側.setsymの復元用)
         self.export_labels = {}
-        self.pat = []
-        
-        # VLIW configuration
+        self.pat = []              # パターンファイルの全エントリ(PatternFileReaderが構築)
+
+        # VLIW/EPICパケット設定(.vliw::vbits::instbits::templatebits::nopで設定)
         self.vliwinstbits = 41
         self.vliwnop = []
         self.vliwbits = 128
@@ -140,133 +126,86 @@ class AssemblerState:
         self.vliwtemplatebits = 0x00
         self.vliwstop = 0
         self.vcnt = 1
-        
-        # Expression mode and errors
+
         self.expmode = EXP_PAT
         self.error_undefined_label = False
         self.error_label_conflict = False
-        # パターンマッチ試行中フラグ。
-        # match0() → match() → expression_esc() → label_get_value() の経路で
-        # 失敗中のマッチ試行がラベル未定義エラーを出力しないよう抑制する。
-        # マッチが成功した後の makeobj() 評価では False に戻す。
+        # match0()→match()→expression_esc()の経路でパターンマッチ試行中に
+        # ラベル未定義エラーを出さないための抑制フラグ。マッチが不成立でも
+        # 他の候補パターンを試すだけなので、この時点でのエラー表示は不要。
         self._in_match_attempt = False
-        
-        # Assembly configuration
+
         self.align = 16
         self.bts = 8
         self.endian = 'little'
         self.byte = 'yes'
-        self.pas = 0
+        self.pas = 0             # 現在のパス番号: 0=対話モード, 1=Pass1, 2=Pass2
         self.debug = False
-        
-        # Current line info
-        self.cl = ""
-        self.ln = 0
-        self.fnstack = []
-        self.lnstack = []
-        
-        # Variables (a-z)
-        self.vars = [VAR_UNDEF for i in range(26)]
-        
-        # Debug strings
-        self.deb1 = ""
-        self.deb2 = ""
-        
-        # Expression type mode: 'i' = integer, 'f' = float.
-        # スレッドセーフかつ再入安全にするため、モジュールレベルのグローバルではなく
-        # インスタンス変数として保持する。変更箇所では必ず try/finally で元に戻す。
-        self.exp_typ: str = 'i'
 
-        # Pass 1 size-estimation mode:
-        # True の間は未定義ラベルを UNDEF ではなく 0 として返す。
-        # forward参照があっても makeobj がサイズを正しく計算できるようにするため。
+        self.cl = ""              # 現在処理中のソース行(デバッグ表示用)
+        self.ln = 0               # 現在の行番号
+        self.fnstack = []         # .INCLUDEのネスト用ファイル名スタック
+        self.lnstack = []
+
+        self.vars = [VAR_UNDEF for i in range(26)]  # パターンマッチで束縛される変数 a-z
+
+        self.deb1 = ""            # デバッグ用: 直前のmatch()呼び出しの引数(ソース行/パターン)
+        self.deb2 = ""
+
+        self.exp_typ: str = 'i'   # 式評価の型モード('i'=整数, 'f'=浮動小数点)
+
+        # True の間、未定義の前方参照ラベルはUNDEFではなく0を返す
+        # (Pass1のサイズ見積もり専用モード)。
         self._pass1_size_mode = False
 
-        # リラクゼーション用: 直前のpass1でのラベルアドレス記録
-        # {label_name: pc_value} の辞書。収束判定に使う。
-        # モジュールレベルの番兵で初期化することで run() 複数回呼び出しも安全。
+        # 直前のPass1反復で確定した「ラベル名→(pc,section)」。全ラベルが
+        # 前回と一致すればリラクゼーション収束とみなす(run()参照)。
         self._pass1_prev_label_pcs = _RELAXATION_SENTINEL
 
-        # A修正: 前反復で確定した「ラベル名→値」の辞書。
-        # 旧実装はリラクゼーション各反復の先頭で labels を imported のみへ全リセットし、
-        # かつ pass1 の前方参照を 0(サイズプローブ)／UNDEF(本処理) として評価していた。
-        # その結果、前方参照のサイズ推定が反復間で一切変化せず、リラクゼーションが
-        # 実質的に機能していなかった（前方分岐の最適長へ収束しない）。
-        # 修正: 前反復で確定したラベル値をここに保持し、現反復で「まだ定義前」の
-        # 前方参照に対しては 0/UNDEF ではなくこの推定値を返す（get_value 参照）。
-        # これにより error 条件（短形式/長形式の選択）が現実的な変位で評価され、
-        # 反復を重ねるごとに真のレイアウトへ収束する。初回反復は空（推定値なし）。
+        # 直前のPass1反復で確定した「ラベル名→値」。可変長命令アーキテクチャでは
+        # 前方参照ラベルの値で命令サイズが変わるため、未確定の前方参照には
+        # この推定値を返して反復ごとに真のレイアウトへ収束させる(get_value参照)。
         self._relax_prev_values = {}
 
-        # 標準出力へのリスト出力: True のときのみ lineassemble0 がリストを stdout に出力する。
-        # False（デフォルト）のときはエラー/警告のみ表示し、バイナリ出力は通常通り行う。
         self.verbose: bool = False
 
-        # stdin 入力を保持する一時ファイルパス。
-        # 固定名 "axx.tmp" の代わりに tempfile で生成したパスを使うことで
-        # 複数インスタンスの同時実行時の競合を防ぐ。
-        # None のとき未生成。run() 終了後に cleanup される。
+        # stdin入力を保持する一時ファイルのパス(tempfileで生成、run()終了後に削除)。
         self.stdin_tmp_path: str | None = None
 
-        # ELF OSABI (FreeBSD==9,Linux==0)
-        self.osabi: int = 9 # default OSABI==9(FreeBSD)
-        # ELF relocatable object file output (-r / -m options)
+        # ELF出力設定
+        self.osabi: int = 9       # 9=FreeBSD, 0=Linux
         self.elf_objfile: str = ""
-        self.elf_machine: int = 62   # default EM_X86_64
+        self.elf_machine: int = 62  # 既定はEM_X86_64
 
-        # ELF relocation tracking
-        # relocations: list of (section_name, sec_rel_byte_offset, sym_name, reloc_type, addend)
+        # ELFリロケーション追跡用。_elf_tracking=Trueの間(Pass2のELF出力時)、
+        # makeobj()内でラベルを参照するたびに_elf_label_refs_seen /
+        # _elf_var_to_labelへ記録し、write_elf_obj()が.rela.*セクションを構築する。
         self.relocations = []
-        # _elf_tracking: True while assembling an instruction during pass2 ELF output
         self._elf_tracking = False
-
-        # _elf_label_refs_seen: リロケーション候補。各エントリ: (label_name, abs_value, word_idx)
-        # word_idx は makeobj() 内で参照が発生した objl インデックス（0 以上）。
-        self._elf_label_refs_seen = []  # [(label_name, abs_word_value, word_idx)]
-
-        # makeobj() が現在生成中のワードインデックス（objl への追加前の len(objl)）。
-        # -1 は makeobj() の外（センチネル値）。
-        self._elf_current_word_idx: int = -1
-
-        # _elf_var_to_label: match() で !x がラベルを直接キャプチャしたとき
-        # 変数名 → (label_name, label_value) を記録する辞書。
-        # makeobj() 内で変数を読む際にリロケーション情報の生成に使う。
-        # ラベル値そのものではなく式（label+offset等）でキャプチャした場合は
-        # この辞書には登録しない（_elf_capturing_var が None に戻る前に複数の
-        # get_value() 呼び出しが起きたケースは登録を取り消す）。
-        self._elf_var_to_label: dict = {}  # {var_letter: (label_name, label_value)}
-
-        # _elf_capturing_var: match() が !x 式を評価している最中にセットされる変数名。
-        # get_value() はこれを見て _elf_var_to_label を更新する。
-        # None のとき「キャプチャ中でない」。
-        self._elf_capturing_var: str | None = None
+        self._elf_label_refs_seen = []       # [(label_name, abs_value, word_idx)]
+        self._elf_current_word_idx: int = -1  # makeobj()が生成中のバイトインデックス(-1=範囲外)
+        self._elf_var_to_label: dict = {}     # {変数名: (label_name, label_value)} (!x直接キャプチャ時)
+        self._elf_capturing_var: str | None = None  # match()が!xを評価中の変数名
 
         self.init_func: str | None = None
         self.fini_func: str | None = None
 
-        # === 新規追加: DWARF デバッグ情報生成 (-g) ===
-        # gen_debug が True かつ ELF 出力 (-o) のとき、write_elf_obj() が
-        # .debug_abbrev / .debug_info / .debug_line セクション（および対応する
-        # .rela.debug_info / .rela.debug_line）を生成する。
+        # DWARFデバッグ情報生成(-g)用。gen_debug=Trueかつ-o指定時、
+        # write_elf_obj()が.debug_info/.debug_abbrev/.debug_lineを生成する。
         self.gen_debug: bool = False
-        # line_map: pass2 で各「バイトを生成したアセンブリ行」について
-        #   (section_name, word_pc_at_line_start, file_name, line_number)
-        # を記録する。DWARF .debug_line の行番号プログラムの元データになる。
-        # pass2 開始時にクリアされ、pass2 中の行アセンブルでのみ追記される。
-        self.line_map: list = []
+        self.line_map: list = []  # Pass2で記録する (section, pc, file, line) のリスト
 
-        # .check 拘束条件テーブル。
-        # パターンファイルの `.check::x::sym1,sym2,...` で登録される。
-        # {変数名(小文字1文字) → 許可シンボル名リスト(大文字正規化)} の辞書。
-        # マッチ成功後・makeobj 前に検証し、変数値が許可リスト中の
-        # いずれかのシンボル値と一致しない場合はエラーを出力してコード生成を抑止する。
-        # `.clrcheck::x` で当該変数の拘束を解除（引数省略時は全解除）。
-        self.check_constraints: dict = {}  # {str: list[str]}
+        # .check::x::sym1,sym2,... で登録される拘束条件。
+        # {変数名: 許可シンボル名リスト}。マッチ成功後・makeobj前に検証し、
+        # 変数の値がリスト外ならエラーにする。.clrcheckで解除する。
+        self.check_constraints: dict = {}
 
 
 
 class StringUtils:
-    """Utility functions for string manipulation"""
+    """パターンファイル・ソースファイルの行を扱う低レベル文字列ユーティリティ
+    (空白スキップ、コメント除去、引用符/エスケープ処理等)。全メソッドがstatic。
+    """
     
     @staticmethod
     def upper(s):
@@ -288,9 +227,7 @@ class StringUtils:
     @staticmethod
     def skip_squote_literal(s, i):
         """シングルクォートリテラルを先読みで消費する共通ヘルパー。
-
-        Fix 5 (DRY): remove_comment_asm と vcnt カウントループに同一ロジックが
-        重複していた。どちらもこのメソッドを呼び出すことで一元管理する。
+        remove_comment_asm など複数箇所から呼ばれる一元化ロジック。
 
         消費できた場合は消費後の idx を返す。
         消費できなかった（孤立クォート）場合は i+1 を返す（クォート自体を読み飛ばす）。
@@ -311,14 +248,11 @@ class StringUtils:
                     k += 1
                     hex_digits += 1
                 if k < len(s) and s[k] == '\'':
-                    return k + 1          # '\xNN' 消費成功
-                # 閉じクォートが見つからない → 孤立クォート
+                    return k + 1
             elif j + 2 < len(s) and s[j + 2] == '\'':
-                return j + 3              # '\x' 4文字消費成功
-            # 対応クローズクォートなし → 孤立クォート
+                return j + 3
         elif j < len(s) and j + 1 < len(s) and s[j + 1] == '\'':
-            return j + 2                  # 'x' 3文字消費成功
-        # 孤立クォート: クォート文字そのものだけ読み飛ばす
+            return j + 2
         return i + 1
     
     @staticmethod
@@ -340,53 +274,33 @@ class StringUtils:
     def remove_comment_asm(l):
         """Remove ; style comments, but preserve semicolons inside string literals.
 
-        エスケープされた引用符 \\" は文字列の開始・終了とみなさない。
-        これにより "hello \\"world\\"; not a comment" のような入力で
-        誤ってコメント開始位置がずれる問題を修正。
-
-        Fix ⑦: 旧実装のシングルクォートトグル方式では、'a'b'c' のような
-        連続する文字リテラルが並ぶ入力で in_squote フラグが誤って残留し、
-        後続のセミコロンがコメント開始とみなされない問題があった。
-
-        修正後: トグル方式を廃止し、先読みペア確認方式を採用する。
-        シングルクォートを見つけたら:
-          - '\\x' 形式（エスケープ付き4文字）: 丸ごと消費してスキップ
-          - 'x'   形式（通常3文字）         : 丸ごと消費してスキップ
-          - 対応するクローズクォートが見つからない孤立クォート: そのまま通過
-        これにより 'a'b'c';comment のような入力でも正しくセミコロンを検出できる。
+        ダブルクォート文字列中の ";" はコメント開始とみなさない。エスケープされた
+        引用符 \\" は文字列の開始・終了として数えない。シングルクォート文字
+        リテラル('a', '\\x41'等)は skip_squote_literal() で丸ごと消費してから
+        走査を続けるため、'a'b'c';comment のように文字リテラルが連続していても
+        後続のセミコロンを正しくコメント開始として検出できる。
         """
         in_dquote = False
         i = 0
         while i < len(l):
             ch = l[i]
 
-            # ダブルクォート文字列内のエスケープ処理
             if ch == '\\' and in_dquote:
                 if i + 1 < len(l):
                     i += 2
                 else:
-                    i += 1  # 末尾の孤立したバックスラッシュ
+                    i += 1
                 continue
 
             if ch == '"':
-                # Fix ①: 開き・閉じ両方でトグルする。
-                # 旧実装は `not in_dquote` 条件のため開きクォートしか処理せず、
-                # 閉じダブルクォートが来ても in_dquote が True のまま固着していた。
-                # バックスラッシュエスケープ (\") は上の if ブロックで消費済みなので
-                # ここでは素直にトグルするだけで正しい。
                 in_dquote = not in_dquote
             elif ch == '\'' and not in_dquote:
-                # Fix 5 (DRY): 共通ヘルパーでシングルクォートリテラルを消費する。
                 i = StringUtils.skip_squote_literal(l, i)
                 continue
             elif ch == ';' and not in_dquote:
                 return l[:i].rstrip()
 
             i += 1
-        # Fix 4: ループを抜けた時点で in_dquote=True なら未終端ダブルクォート文字列。
-        # 行内のセミコロンはコメントとして扱われていないため出力に残る。
-        # Fix 7 (new): 警告を stdout ではなく stderr に出力する。
-        # バイナリ出力をパイプで受け取っている場合に stdout が汚染されないようにする。
         if in_dquote:
             print(f" warning - unterminated string literal in line: {l!r}", file=sys.stderr)
         return l.rstrip()
@@ -422,7 +336,6 @@ class StringUtils:
         s = ""
         while idx < len(l2):
             if l2[idx] == '\\' and idx + 1 < len(l2):
-                # エスケープシーケンスを処理
                 next_char = l2[idx + 1]
                 if next_char == '"':
                     s += '"'
@@ -440,24 +353,19 @@ class StringUtils:
                     s += '\r'
                     idx += 2
                 elif next_char in 'xX':
-                    # Fix: \xNN 形式の16進エスケープ（asciistr と同様の処理）
                     idx += 2
                     hex_str = ''
                     while idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF' and len(hex_str) < 2:
                         hex_str += l2[idx]
                         idx += 1
-                    # Fix 9: 3桁以上の16進数字が続く場合、余剰桁はそのまま文字列として
-                    # 出力されるためユーザーが気づきにくい。警告を出す。
                     if idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF':
                         print(f" warning - '\\x' escape takes at most 2 hex digits; "
                               f"extra digit(s) treated as literal characters in: {l2!r}", file=sys.stderr)
                     if hex_str:
                         s += chr(int(hex_str, 16))
                     else:
-                        # \x の後に16進数字がない場合はそのまま保持
                         s += 'x'
                 else:
-                    # その他のエスケープはそのまま保持
                     s += next_char
                     idx += 2
             elif l2[idx] == '"':
@@ -465,15 +373,16 @@ class StringUtils:
             else:
                 s += l2[idx]
                 idx += 1
-        # 末尾まで達したが閉じ引用符がなかった
-        # Fix 7 (new): 警告を stderr に出力する（stdout 汚染防止）。
         print(f" warning - unterminated string literal: {l2!r}", file=sys.stderr)
         return s
 
 
 class Parser:
-    """Parser for extracting tokens and strings from assembly code"""
-    
+    """アセンブリ行から数値・シンボル名・ラベル名・波括弧式などの
+    トークンを切り出す。get_symbol_word()とget_label_word()の
+    大文字小文字の扱いの違いに注意(下記docstring参照)。
+    """
+
     def __init__(self, state):
         self.state = state
     
@@ -488,14 +397,9 @@ class Parser:
     def get_floatstr(self, s, idx):
         """Get float string from position.
 
-        Fix 11: 単項マイナスは factor() が先に処理するため、
-        factor1() から呼ばれる get_floatstr() で先頭の '-' を
-        再度消費すると二重解釈になる。
-        '-inf' だけは特別扱いとして残す（単項マイナス + inf では
-        factor() の負号処理と組み合わせると正しく動くが、
-        '-inf' という単一トークンとして見た方が自然で、
-        既存の使用箇所すべてでその前提で動いている）。
-        それ以外の数値先頭 '-' は消費しない。
+        単項マイナスは呼び出し元のfactor()が処理するため、ここで数値先頭の
+        '-' を消費すると二重解釈になる。ただし '-inf' だけは1トークンとして
+        特別扱いする(呼び出し箇所すべてがその前提で動く)。
         """
         if s[idx:idx+4] == '-inf':
             return '-inf', idx + 4
@@ -505,15 +409,9 @@ class Parser:
             return 'nan', idx + 3
         else:
             fs = ''
-            # Fix 11: 先頭の '-' は factor() の単項マイナス処理が担うため
-            # ここでは消費しない（二重解釈を防ぐ）。
             while idx < len(s) and s[idx] in "0123456789.":
                 fs += s[idx]
                 idx += 1
-            # Accept exponent part: e/E followed by optional sign and digits.
-            # 修正: 指数部の数字が続かない場合（'1e', '1e+' など）は
-            # 指数部をなかったことにして idx を巻き戻す。
-            # そのまま float('1e') を呼ぶと ValueError になるため。
             if idx < len(s) and s[idx] in "eE":
                 saved_idx = idx
                 saved_fs  = fs
@@ -527,7 +425,6 @@ class Parser:
                     fs += s[idx]
                     idx += 1
                 if idx == digits_start:
-                    # 数字がひとつもなかった → 指数部を破棄して巻き戻す
                     fs  = saved_fs
                     idx = saved_idx
             return fs, idx
@@ -543,9 +440,8 @@ class Parser:
     def get_curlb(self, s, idx):
         """Get curly bracket content.
 
-        修正③: 閉じブレース '}' が見つからないまま文字列末尾に達した場合は
-        f=False を返してエラーを呼び出し元に知らせる。旧実装は f=True のまま
-        不完全な内容 t を返し、壊れた式がサイレントに評価されていた。
+        閉じブレース '}' が見つからないまま文字列末尾に達した場合は f=False を
+        返してエラーを呼び出し元に知らせる(壊れた式をサイレントに評価しない)。
         """
         idx = StringUtils.skipspc(s, idx)
         f = False
@@ -559,20 +455,20 @@ class Parser:
                 t += s[idx]
                 idx += 1
             if idx >= len(s):
-                # 閉じブレースが見つからなかった
                 print(f" error - missing closing '}}' in expression: '{{{t}'", file=sys.stderr)
-                # Fix ④修正: 旧実装は start_idx（'{' 内部）を返していたため、
-                # 呼び出し元パーサーが '{' の中身を後続の式として誤解析していた。
-                # len(s) を返してパースを強制終了させる。
                 return False, '', len(s)
-            # '}' を消費
             idx += 1
             f = True
 
         return f, t, idx
 
     def get_symbol_word(self, s, idx):
-        """Get symbol word from position"""
+        """Get symbol word from position.
+
+        戻り値は大文字に正規化する(.setsymシンボル/レジスタ名は大文字小文字を
+        区別しないため)。ラベル名を大文字小文字区別で扱うget_label_word()とは
+        対照的で、この違いがパターンマッチ時の具体度スコアの前提になっている。
+        """
         t = ""
         if idx < len(s) and s[idx] not in DIGIT and s[idx] in self.state.swordchars:
             t = s[idx]
@@ -600,7 +496,6 @@ class Parser:
                 t += s[idx]
                 idx += 1
 
-            # Consume ':' only when it is a label terminator, not part of ':='
             if idx < len(s) and s[idx] == ':' and (idx + 1 >= len(s) or s[idx + 1] != '='):
                 idx += 1
 
@@ -624,8 +519,6 @@ class Parser:
         return s.rstrip(' \t'), idx
 
 def enfloat(a):
-    # Fix: a が 0〜2^32-1 の範囲外のとき struct.pack('I', a) は struct.error になる。
-    # 呼び出し元でマスクしているが念のため二重ガードする。
     try:
         float_value = struct.unpack('f', struct.pack('I', int(a) & 0xFFFFFFFF))[0]
     except (struct.error, OverflowError, ValueError):
@@ -633,21 +526,20 @@ def enfloat(a):
     return float_value
 
 def endouble(a):
-    # Fix: a が 0〜2^64-1 の範囲外のとき struct.pack('Q', a) は struct.error になる。
     try:
         double_value = struct.unpack('d', struct.pack('Q', int(a) & 0xFFFFFFFFFFFFFFFF))[0]
     except (struct.error, OverflowError, ValueError):
         double_value = 0.0
     return double_value
 
-# enflt / endbl は enfloat / endouble の別名。
-# factor1() および xeval() の safe_env から参照されるが、
-# これまで定義が存在せず NameError でクラッシュしていた。
 enflt = enfloat
 endbl = endouble
 
 class IEEE754Converter:
-    """IEEE 754 floating point conversion utilities"""
+    """10進の数値/文字列をIEEE754の32/64/128bitビットパターン(16進文字列)に
+    変換する。dbl{}/flt{}/qad{} リテラル記法から呼ばれる。128bit(quad)は
+    Pythonのfloatが53bit精度しかないためDecimalで直接ビット演算する。
+    """
     
     @staticmethod
     def decimal_to_ieee754_32bit_hex(a):
@@ -666,8 +558,6 @@ class IEEE754Converter:
         elif a == 'nan':
             return "0x7FC00000"
 
-        # Fix 1: 不正な文字列（"0x10", "1+2" 等）は Decimal() が
-        # decimal.InvalidOperation を送出する。ValueError に統一して呼び出し元で捕捉できるようにする。
         try:
             fval = float(Decimal(a))
         except Exception as _e:
@@ -691,8 +581,6 @@ class IEEE754Converter:
         elif a == 'nan':
             return "0x7FF8000000000000"
 
-        # Fix 1: 不正な文字列は Decimal() が decimal.InvalidOperation を送出する。
-        # ValueError に統一して呼び出し元で捕捉できるようにする。
         try:
             fval = float(Decimal(a))
         except Exception as _e:
@@ -707,14 +595,11 @@ class IEEE754Converter:
     def decimal_to_ieee754_128bit_hex(a):
         """Convert decimal to IEEE 754 128-bit (binary128 / quad) hex.
 
-        D7修正: 旧実装は getcontext().prec をグローバルに 60 へ書き換えたまま
-        復元していなかった。これはプロセス全体の Decimal 既定精度を恒久的に
-        変えてしまい、他のコンテキスト（および将来のマルチスレッド/再入）に
-        副作用を残す。localcontext() を使い、この変換中だけ精度 60 を適用して
-        終了時に自動復元する。
+        localcontext()でこの変換中だけDecimalの精度を60桁に上げる
+        (プロセス全体の既定精度に副作用を残さないため)。
         """
         with localcontext() as _ctx:
-            _ctx.prec = 60  # 112ビット仮数部(約34桁)を十分カバー
+            _ctx.prec = 60
             return IEEE754Converter._decimal_to_ieee754_128bit_hex_impl(a)
 
     @staticmethod
@@ -754,20 +639,15 @@ class IEEE754Converter:
 
             two = Decimal(2)
 
-            # 2進指数を純粋なDecimal演算で求める:
-            #   d に 2^SIGNIFICAND_BITS を掛けて整数化し、
-            #   そのbit長から指数を逆算する。float変換は一切使わない。
             scaled = int(d * (two ** SIGNIFICAND_BITS))
             if scaled == 0:
                 exp_unbiased = -(BIAS - 1)
             else:
-                # bit_length() - 1 = floor(log2(scaled))
                 exp_unbiased = scaled.bit_length() - 1 - SIGNIFICAND_BITS
 
             scale = two ** exp_unbiased
             normalized = d / scale
 
-            # 念のため境界を確認・微調整
             while normalized >= 2:
                 exp_unbiased += 1
                 normalized /= 2
@@ -777,12 +657,8 @@ class IEEE754Converter:
 
             biased_exp = exp_unbiased + BIAS
 
-            # Fix: 非常に大きな数値（例: Decimal('1e100000')）は biased_exp が
-            # 最大指数 (1<<EXPONENT_BITS)-1 を超えて Infinity になる。
-            # 最大有限指数を超えた場合は +Infinity として扱う。
             _MAX_EXP = (1 << EXPONENT_BITS) - 1
             if biased_exp >= _MAX_EXP:
-                # Overflow → Infinity
                 sign_bit = sign
                 exponent = _MAX_EXP
                 fraction = 0
@@ -790,13 +666,11 @@ class IEEE754Converter:
                 return f"0x{bits:032X}"
 
             if biased_exp <= 0:
-                # サブノーマル数
                 exponent = 0
                 shift = two ** (1 - BIAS - SIGNIFICAND_BITS)
                 fraction = int(d / shift + Decimal('0.5'))
             else:
                 exponent = biased_exp
-                # 仮数部ビット（最近接丸め）
                 fraction = int((normalized - 1) * (two ** SIGNIFICAND_BITS) + Decimal('0.5'))
 
             fraction &= (1 << SIGNIFICAND_BITS) - 1
@@ -818,7 +692,7 @@ class IEEE754Converter:
         ValueError を送出する。呼び出し側は except して
         float モードのフォールバックに切り替える。
 
-        D7修正: prec=60 を localcontext() に閉じ込め、グローバル汚染を防ぐ。
+        prec=60はlocalcontext()に閉じ込め、グローバル精度設定を汚染しない。
         """
         with localcontext() as _ctx:
             _ctx.prec = 60
@@ -841,15 +715,10 @@ class IEEE754Converter:
                 neg = True
                 i += 1
                 i = skip(s, i)
-            # Fix Q: 'inf' / 'nan' を Decimal で正しく処理する。
-            # 旧実装は '0123456789.' 以外を即 ValueError にしていたため
-            # qad{inf} / qad{-inf} が xeval フォールバックに落ち、
-            # そこで float(inf) → int() が OverflowError になっていた。
             for kw, dval in (('inf', Decimal('Infinity')), ('nan', Decimal('NaN'))):
                 if s[i:i+len(kw)] == kw:
                     v = -dval if neg else dval
                     return v, i + len(kw)
-            # 符号のみは数値ではない
             if i >= len(s) or s[i] not in '0123456789.':
                 raise ValueError(f"expected number at {i!r}")
             start = i
@@ -864,17 +733,12 @@ class IEEE754Converter:
             try:
                 v = Decimal(s[start:i])
             except Exception as _e:
-                # Fix ⑨修正: Decimal() は decimal.InvalidOperation を送出することがあり、
-                # 呼び出し側の except (ValueError, ZeroDivisionError) では補足されず
-                # 伝播してしまう。すべての変換失敗を ValueError に統一する。
                 raise ValueError(f"invalid decimal literal: {s[start:i]!r}") from _e
             return (-v if neg else v), i
 
         def parse_factor(s, i):
             i = skip(s, i)
             if i < len(s) and s[i] == '(':
-                # Fix 2 (修正): '(' ブランチも深いネストで RecursionError が発生する。
-                # '-' / '+' ブランチは Fix 1 で修正済みだったが、括弧ブランチは未対処だった。
                 try:
                     v, i = parse_expr(s, i + 1)
                 except RecursionError:
@@ -884,8 +748,6 @@ class IEEE754Converter:
                     i += 1
                 return v, i
             if i < len(s) and s[i] == '-':
-                # Fix 1: 深いネストで RecursionError が発生する可能性がある。
-                # ValueError に変換して呼び出し元の except で捕捉できるようにする。
                 try:
                     v, i = parse_factor(s, i + 1)
                 except RecursionError:
@@ -906,7 +768,6 @@ class IEEE754Converter:
                     t, i = parse_factor(s, i + 1)
                     v *= t
                 elif i + 1 < len(s) and s[i] == '/' and s[i+1] == '/':
-                    # '//' → floor division（'/' の前に判定する）
                     t, i = parse_factor(s, i + 2)
                     if t == 0:
                         raise ZeroDivisionError("floor division by zero in qad{}")
@@ -917,8 +778,6 @@ class IEEE754Converter:
                         raise ZeroDivisionError("division by zero in qad{}")
                     v /= t
                 elif i < len(s) and s[i] == '%':
-                    # Fix: '%' (modulo) が未実装だったため qad{N%M} が ValueError を
-                    # 送出し float フォールバックで 128bit 精度が失われていた。
                     t, i = parse_factor(s, i + 1)
                     if t == 0:
                         raise ZeroDivisionError("modulo by zero in qad{}")
@@ -942,12 +801,14 @@ class IEEE754Converter:
             return v, i
 
         val, _ = parse_expr(text, 0)
-        # Decimal を文字列に変換して binary128 に変換
         return IEEE754Converter.decimal_to_ieee754_128bit_hex(str(val))
 
 
 class VariableManager:
-    """Manages assembler variables (a-z)"""
+    """パターンマッチで束縛される一時変数 a-z (state.vars、26要素の配列)を管理する。
+    !e/!!e/d のようなパターンキャプチャがマッチ中にput()で書き込み、
+    エンコーディング欄の式評価がget()で読み出す。
+    """
     
     def __init__(self, state):
         self.state = state
@@ -958,23 +819,16 @@ class VariableManager:
         return self.state.vars[c - ord('A')]
     
     def put(self, s, v):
-        """Set variable value by letter"""
+        """Set variable value by letter.
+
+        !F/!D経由の値はmatch()側で既にIEEE754整数ビットパターンに変換済み
+        なのでint()でよいが、exp_typ='f'モードで生のfloat/Decimalが渡された
+        場合はint()で切り捨てず、小数部を持つ値・非有限値(inf/nan)は
+        そのままfloatとして保持する。
+        """
         if StringUtils.upper(s) in CAPITAL:
             c = ord(StringUtils.upper(s))
-            # 【バグ修正⑦】旧実装は常に int(v) で切り捨てていた。
-            # !F / !D 経由の値は match() 側で既に IEEE754 整数ビットパターンに
-            # 変換されてから渡されるので int() で問題ない。
-            # しかし exp_typ='f' モードで a:=3.14 のように生の float が渡された
-            # 場合は int(3.14)==3 となり精度が失われる。
-            # 修正: Decimal 型も適切に処理する。小数部を持つ値はそのまま保持し、
-            # 整数値のみ int に変換する。
             if isinstance(v, Decimal):
-                # Fix ⑭ (新規): Decimal('Infinity') / Decimal('NaN') は
-                # to_integral_value() が OverflowError / InvalidOperation を
-                # 投げ、旧実装の except Exception でそのまま int(v) が再試行
-                # されるが int(Decimal('Infinity')) も OverflowError になる。
-                # 結果として vars に壊れた値が書き込まれるか、別の例外が伝播した。
-                # 修正: 有限値かどうかを先に確認し、非有限は float として保持する。
                 if not v.is_finite():
                     self.state.vars[c - ord('A')] = float(v)
                 elif v == v.to_integral_value():
@@ -984,19 +838,21 @@ class VariableManager:
             elif isinstance(v, float) and not v.is_integer():
                 self.state.vars[c - ord('A')] = v
             else:
-                # Fix: float('inf') / float('nan') / Decimal('Infinity') などは
-                # int() が OverflowError / ValueError になる。非有限値はそのまま保持。
                 try:
                     self.state.vars[c - ord('A')] = int(v)
                 except (OverflowError, ValueError):
                     self.state.vars[c - ord('A')] = v
 
 class LabelManager:
-    """Manages assembly labels"""
-    
+    """ソースコード中のラベル(アドレス・.equ定数)のアドレス・値・セクション
+    帰属を管理する。state.labels の各エントリは
+    [値, セクション, is_equ, is_imported, reloc_type?] のリスト。
+    ラベル名は大文字小文字を区別する(SymbolManagerと対照的)。
+    """
+
     def __init__(self, state):
         self.state = state
-    
+
     def get_section(self, k):
         """Get label section"""
         self.state.error_undefined_label = False
@@ -1006,59 +862,49 @@ class LabelManager:
             v = UNDEF
             self.state.error_undefined_label = True
         return v
-    
+
     def get_value(self, k):
-        """Get label value"""
+        """Get label value.
+
+        未定義(前方参照)の場合の扱いは3通り:
+          1) pass1で前回反復の確定値があればそれを推定値として返す
+             (可変長命令のサイズがリラクゼーションで真の値へ収束していく)。
+          2) サイズ見積もり専用モード(_pass1_size_mode)中は0を返す。
+          3) それ以外は真に未定義としてUNDEFを返し、エラーを報告する
+             (ただしパターンマッチ試行中は後で別候補に置き換わるため抑制する)。
+        """
         self.state.error_undefined_label = False
         try:
             v = self.state.labels[k][0]
         except (KeyError, IndexError):
-            # A修正: pass1 で現反復未定義のラベル（前方参照）は、前反復で確定した
-            # 値があればそれを推定値として返す。これにより:
-            #   (1) リラクゼーションが前方参照の最適長へ実際に収束するようになる。
-            #   (2) サイズプローブ(size_mode=True/旧0)と本処理(size_mode=False/旧UNDEF)で
-            #       前方参照の値が食い違う問題（指摘2）が解消され、両者が同じ推定値を見る。
-            # 推定値が手に入る場合は error_undefined_label を立てない（確からしい値なので
-            # makeobj を正常に進めてよい）。pass2(pas==2)ではこの分岐は使わず、
-            # 真に未定義のラベルは従来どおりエラーになる。
             if self.state.pas == 1 and k in self.state._relax_prev_values:
                 return self.state._relax_prev_values[k]
             if self.state._pass1_size_mode:
-                # Pass1 サイズ推定モード中で前反復値も無い（初回反復の前方参照）→ 0。
-                # error_undefined_label は False のまま（Trueにするとmakeobjがスキップする）。
                 return 0
             v = UNDEF
             self.state.error_undefined_label = True
-            # pass2 または単パスモード（pas==0）のときだけエラーを表示する。
-            # pass1 では forward reference が多発するため表示しない。
-            # _in_match_attempt が True のときはパターンマッチ試行中であり、
-            # このラベル参照は後に別パターンに差し替えられる可能性があるため
-            # エラーを出力しない（OUT (C),E で OUT (!n),A を試みる際などに発生する）。
             if not self.state._in_match_attempt and (self.state.pas == 2 or self.state.pas == 0):
                 _fn = self.state.current_file or ""
                 _ln = self.state.ln
                 print(f" error - Label undefined: '{k}'"
                       f"  [{_fn}:{_ln}]", file=sys.stderr)
             return v
-        # ELF リロケーション追跡
-        # is_equ=True の純定数ラベル（reloc_type なし）はリロケーション不要なので追跡しない。
-        # ただし .equ $$::reloctype のように reloc_type が指定されている場合は
-        # アドレスラベルと同等に扱い、参照時にリロケーションを生成する必要があるため追跡する。
+        # ELFリロケーション追跡: .equ定数(reloc_type指定なし)はリロケーション不要
+        # なので除外し、それ以外のアドレスラベル参照だけを記録する。
         _is_equ = len(self.state.labels[k]) > 2 and self.state.labels[k][2]
         _equ_has_reloc = _is_equ and len(self.state.labels[k]) > 4 and self.state.labels[k][4] is not None
         if self.state._elf_tracking and not self.state.error_undefined_label and (not _is_equ or _equ_has_reloc):
             if self.state._elf_capturing_var is not None:
-                # match() が !var 式を評価中: 変数→ラベル名の対応を記録。
-                # 1 回の変数キャプチャで get_value() が 2 回以上呼ばれた場合
-                # （複合式: label1 + label2 など）は信頼できないので登録を取り消す。
+                # match()が!x式を評価中: 変数名→ラベルの対応を記録する。
+                # 同じ変数への2回目以降の書き込みは複合式(label1+label2等)を
+                # 意味するのでリロケーション不可としてNoneにする。
                 cv = self.state._elf_capturing_var
                 if cv not in self.state._elf_var_to_label:
                     self.state._elf_var_to_label[cv] = (k, v)
                 else:
-                    # 2 回目以降 → 複合式なのでリロケーション不可としてマーク
                     self.state._elf_var_to_label[cv] = None
             elif self.state._elf_current_word_idx >= 0:
-                # makeobj() 内でオブジェクト式がラベルを直接参照
+                # makeobj()内でオブジェクトコード式が直接ラベルを参照している
                 self.state._elf_label_refs_seen.append(
                     (k, v, self.state._elf_current_word_idx))
         return v
@@ -1091,10 +937,6 @@ class LabelManager:
         existing = self.state.labels.get(k)
         is_imported = (existing is not None and len(existing) > 3 and existing[3])
         
-        # reloc_type を第5要素として保存。
-        # ::reloctype を明示指定した場合のみ reloc_type を保持する。
-        # 省略した場合（reloc_type is None）は旧エントリの値を引き継がず、
-        # リロケーション情報なしとして確定する。
         entry = [v, s, is_equ, is_imported]
         if reloc_type is not None:
             entry.append(reloc_type)
@@ -1102,14 +944,10 @@ class LabelManager:
         self.state.labels[k] = entry
         return True
     def printlabels(self):
-        # Fix 8 (new): ラベル一覧を stdout ではなく stderr に出力する。
-        # バイナリ出力をパイプで受け取っている場合に stdout が汚染されないようにする。
-        # また Python の辞書 repr() の代わりに1行1ラベルの可読フォーマットで出力する。
         result = {}
         for key, value in self.state.labels.items():
             num = value[0]
             section = value[1]
-            # UNDEF (256ビット整数) は専用文字列、float は repr()、int は hex() で表示。
             if num == UNDEF:
                 num_str = "UNDEF"
             elif isinstance(num, float):
@@ -1124,20 +962,36 @@ class LabelManager:
             print(f"  {k:40s}  {v[0]}  ({v[1]})", file=sys.stderr)
         
 class SymbolManager:
-    """Manages assembler symbols"""
-    
+    """.setsymで登録される固定シンボル(主にレジスタ名などのエンコーディング用
+    定数)を管理する。get()は大文字小文字を無視して解決する
+    (LabelManagerのラベル名は逆に大文字小文字を区別する)。
+    """
+
     def __init__(self, state):
         self.state = state
-    
+
     def get(self, w):
-        """Get symbol value"""
+        """Get symbol value. 未登録なら空文字列を返す(呼び出し元で判定する)。"""
         w = w.upper()
         return self.state.symbols.get(w, "")
 
 
 class ExpressionEvaluator:
-    """Evaluates mathematical expressions"""
-    
+    """パターンファイル・ソースファイル中の算術式を評価する再帰下降パーサ。
+
+    優先順位の低い演算子から高い演算子へ、term0_0 -> term0 -> term1 -> ... ->
+    term11 -> factor -> factor1 の順に1段ずつ処理を委譲する連鎖になっている
+    (各termNメソッドが1つの優先順位レベルに対応する)。expression()が
+    公開エントリポイントで、term11から始まる呼び出し連鎖全体をここで一括して
+    RecursionError から保護している(深い再帰は"expression nesting too deep"
+    エラーとして安全に打ち切る)。
+
+    factor()/factor1()はリテラル・$$/$./#sym・0x.../文字リテラル・
+    qad{}/dbl{}/flt{}等の浮動小数点記法・ラベル参照など「これ以上分解できない
+    最小単位」を読み取る最下層。xeval()はqad{}等の中で使われる、eval()を
+    一切呼ばない安全なミニ評価器(下記docstring参照)。
+    """
+
     def __init__(self, state, var_manager, label_manager, symbol_manager, parser):
         self.state = state
         self.var_manager = var_manager
@@ -1148,14 +1002,10 @@ class ExpressionEvaluator:
     def nbit(self, l):
         """Count number of bits needed to represent value"""
         b = 0
-        # Fix: float('inf') や float('nan') を int() に渡すと OverflowError が発生する。
-        # 非有限の float は 0 ビットとして扱いエラーを防ぐ。
-        if isinstance(l, float) and not l == l:   # NaN check (NaN != NaN)
+        if isinstance(l, float) and not l == l:
             return 0
         if isinstance(l, float) and (l == float('inf') or l == float('-inf')):
             return 0
-        # 修正: float が渡された場合 r >>= 1 で TypeError になるため
-        # 事前に int に変換する。abs() の後で int 化することで負値も安全に処理できる。
         try:
             r = int(abs(l))
         except (OverflowError, ValueError):
@@ -1171,20 +1021,20 @@ class ExpressionEvaluator:
         return -1
     
     def factor(self, s, idx):
-        """Parse factor in expression"""
+        """Parse factor in expression: 単項演算子(-,~,@)・*(expr,expr)の
+        バイト抽出・VLIWの!!!(スロット番号)/!!!!(ストップビット)を処理し、
+        それ以外はfactor1()(リテラル・$$/$./ラベル等)に委譲する。
+        """
         idx = StringUtils.skipspc(s, idx)
         x = 0
-        
+
         if idx + 4 <= len(s) and s[idx:idx+4] == '!!!!' and self.state.expmode == EXP_PAT:
-            x = self.state.vliwstop
+            x = self.state.vliwstop  # VLIWパケットのストップビット値
             idx += 4
         elif idx + 3 <= len(s) and s[idx:idx+3] == '!!!' and self.state.expmode == EXP_PAT:
-            x = self.state.vcnt
+            x = self.state.vcnt  # 現在のVLIWスロット番号(0起算)
             idx += 3
         elif idx < len(s) and s[idx] == '-':
-            # Fix: 深くネストした単項マイナス（例: ----x）は RecursionError になりうる。
-            # Python のデフォルト再帰限界は ~1000 であり、悪意あるまたは誤った入力で
-            # クラッシュする。try/except で安全に 0 を返す。
             try:
                 x, idx = self.factor(s, idx + 1)
             except RecursionError:
@@ -1199,8 +1049,6 @@ class ExpressionEvaluator:
                 if self.state.pas == 2 or self.state.pas == 0:
                     print(" error - expression nesting too deep (RecursionError) in unary '~'.", file=sys.stderr)
                 return 0, idx
-            # Fix: x が float('inf') / float('nan') のとき int(x) が OverflowError になる。
-            # nbit() と同じ方針: 非有限の float は 0 として扱う。
             try:
                 x = ~int(x)
             except (OverflowError, ValueError):
@@ -1222,9 +1070,6 @@ class ExpressionEvaluator:
                     x2,idx = self.expression(s,idx+1)
                     if idx<len(s) and s[idx] == ')':
                         idx+=1
-                        # Fix: x2 が負のとき x2*8 < 0 → ValueError: negative shift count。
-                        # Fix(new): x2 が float('inf')/nan のとき int(x2) → OverflowError。
-                        # 両方をまとめて try/except でガードする。
                         try:
                             shift_amount = int(x2) * 8
                         except (OverflowError, ValueError):
@@ -1239,27 +1084,16 @@ class ExpressionEvaluator:
                             else:
                                 x = x >> shift_amount
                     else:
-                        # 修正⑩: 閉じ括弧 ')' がない場合はエラーを報告して 0 を返す
                         print(" error - missing ')' in *(expr, expr) expression.", file=sys.stderr)
                         x=0
                 else:
-                    # 修正⑩: カンマがない場合はエラーを報告して 0 を返す
                     print(" error - missing ',' in *(expr, expr) expression.", file=sys.stderr)
                     x=0
             else:
-                # Fix: '*' の後に '(' が続かない場合は *(expr,expr) 構文のミスタイプ。
-                # エラーメッセージを出力し x=0 のまま返す。
-                # idx を進めないため、呼び出し元の term0() が '*' を二項演算子として
-                # 再解釈し 0 * (次の式) = 0 となる（サイレントなセマンティクスは変わらないが
-                # 少なくとも問題を通知する）。
                 print(" error - expected '(' after '*' in *(expr,expr) expression.", file=sys.stderr)
-                # x=0, idx unchanged
         else:
             prev_idx = idx
             x, idx = self.factor1(s, idx)
-            # Fix 2: factor1 が何も消費せず (idx 不変) かつ NUL でも終端でもない位置で
-            # 停止した場合、未知トークンがサイレントに 0 になっている。
-            # pass2/対話モードのみ警告を出す（pass1 は forward 参照で頻繁に発生するため抑制）。
             if (idx == prev_idx
                     and idx < len(s)
                     and s[idx] not in (chr(0), ',', ')', ']', CB, ' ', '\t')
@@ -1271,9 +1105,14 @@ class ExpressionEvaluator:
         return x, idx
 
     def xeval(self, x, _=None):
-        # Fix: re.escape() の結果を文字クラス [..] 内に埋め込むと、
-        # .labelc で lwordchars に ']' '\\' '^'(先頭) '-'(中間) が追加されたとき
-        # re.error が発生する。文字クラス内で安全なエスケープを行う専用関数を使う。
+        """qad{}/dbl{}/flt{}リテラル記法内の式を評価するミニ評価器。
+
+        eval()は一切呼ばず、ASTを解析して許可されたノード種別だけを直接
+        解釈する再帰インタプリタとして実装している(検証と評価を分離すると
+        「検証漏れ=即コード実行」の脆さが残るため、両者を一体化してある)。
+        演算の意味はPythonのeval()と同一('/'はfloat、'//'はfloor)。
+        許可されていないノードに遭遇したらValueErrorを送出する。
+        """
         def _cc_escape(chars):
             """文字クラス [...] の中で安全なエスケープ文字列を生成する。"""
             out = []
@@ -1301,13 +1140,9 @@ class ExpressionEvaluator:
                 self.state.error_undefined_label = True
                 val = 0
                 return hex(0)
-            # B修正: UNDEF 由来の巨大整数（UNDEF そのもの・UNDEF±変位等）を 0 に置換し、
-            # 未定義フラグを立てる。閾値判定は _is_undef_derived に一元化（2^192）。
             if _is_undef_derived(val):
                 self.state.error_undefined_label = True
                 return hex(0)
-            # ELF追跡: get_value() と同じ分岐方針で記録する。
-            # .equ 定義ラベルはリロケーション不要なので除外する。
             _is_equ = (len(self.state.labels.get(label_name, [])) > 2
                        and self.state.labels[label_name][2])
             if self.state._elf_tracking and not _is_equ:
@@ -1320,9 +1155,6 @@ class ExpressionEvaluator:
                 elif self.state._elf_current_word_idx >= 0:
                     self.state._elf_label_refs_seen.append(
                         (label_name, val, self.state._elf_current_word_idx))
-            # Fix 1: val が float の場合 hex() は TypeError になる。
-            # exp_typ='f' モードで定義された .equ ラベルは float を持ちうる。
-            # 非有限 float (inf/nan) および OverflowError も安全に処理する。
             try:
                 return hex(int(val))
             except (TypeError, ValueError, OverflowError):
@@ -1331,13 +1163,6 @@ class ExpressionEvaluator:
 
         s = re.sub(pattern, replacer, x)
 
-        # D9修正: eval() を完全に除去する。
-        # 旧実装は AST をホワイトリスト検証した「後」に compile()+eval() で実行して
-        # いた。検証により任意コード実行は防がれていたが、eval を使う限り
-        # 「検証漏れ＝即コード実行」という脆い構造が残る。
-        # ここでは検証済みノードのみを直接解釈する小さな再帰インタプリタに置き換え、
-        # eval を一切呼ばない。演算意味は旧 eval と同一（'/' は float, '//' は floor）。
-        # 不許可ノードに遭遇したら ValueError を送出するので、検証と評価が一体化する。
         _ALLOWED_FUNCS = {
             "enfloat": enfloat, "endouble": endouble,
             "enflt": enflt, "endbl": endbl,
@@ -1366,7 +1191,6 @@ class ExpressionEvaluator:
                 if isinstance(op, ast.FloorDiv): return l // r
                 if isinstance(op, ast.Mod):      return l % r
                 if isinstance(op, ast.Pow):
-                    # 巨大指数による資源枯渇(DoS)を防ぐ（term0_0 と同じ上限 1024）。
                     if isinstance(r, int) and r > 1024:
                         raise ValueError("xeval: exponent exceeds 1024")
                     return l ** r
@@ -1374,7 +1198,6 @@ class ExpressionEvaluator:
                 if isinstance(op, ast.BitOr):    return l | r
                 if isinstance(op, ast.BitXor):   return l ^ r
                 if isinstance(op, ast.LShift):
-                    # 巨大シフト量による資源枯渇を防ぐ（term2 の _SHIFT_MAX=65536 と統一）。
                     if isinstance(r, int) and r > 65536:
                         raise ValueError("xeval: shift count exceeds 65536")
                     return l << r
@@ -1430,7 +1253,6 @@ class ExpressionEvaluator:
                 args = [_ev(a) for a in node.args]
                 return _ALLOWED_FUNCS[node.func.id](*args)
             if isinstance(node, ast.Name):
-                # 関数名以外の裸の識別子は許可しない（Call 経路でのみ Name を消費する）。
                 raise ValueError(f"xeval: disallowed name '{node.id}' in '{s}'")
             raise ValueError(
                 f"xeval: disallowed AST node {type(node).__name__} in '{s}'")
@@ -1441,7 +1263,10 @@ class ExpressionEvaluator:
         return result
 
     def factor1(self, s, idx):
-        """Parse primary factor"""
+        """Parse primary factor: '(' expr ')'、文字リテラル('A','\\n'等)、
+        $$(命令先頭アドレス)、$.(命令の次のアドレス)、#sym(パターンシンボル値)、
+        0x.../0b...、qad{}等の浮動小数点記法、それ以外はラベル参照、を判定する。
+        """
         x = 0
         idx = StringUtils.skipspc(s, idx)
         
@@ -1453,10 +1278,7 @@ class ExpressionEvaluator:
             if idx < len(s) and s[idx] == ')':
                 idx += 1
             else:
-                # Fix 2: 閉じ括弧がない不正な入力を検出して報告する。
-                # 旧実装はエラーなしに続行し、パース位置がずれたまま処理が続いていた。
                 print(" error - missing closing ')' in expression.", file=sys.stderr)
-        # Fix ⑥: 境界チェックを idx+4<=len(s) に統一する。
         elif idx+4<=len(s) and s[idx:idx+4]=="'\\t'":
             x=0x09
             idx+=4
@@ -1487,33 +1309,19 @@ class ExpressionEvaluator:
         elif idx+4<=len(s) and s[idx:idx+4]=="'\\v'":
             x=0x0b
             idx+=4
-        # Fix 3 (new): 4文字エスケープリテラルをすべて上で処理してから
-        # 3文字一般リテラル 'x' を処理する。これにより '\0' '\r' などが
-        # バックスラッシュをそのまま ord('\\')=92 として返す誤りを防ぐ。
-        # 3文字判定は「s[idx+1] がバックスラッシュでない」ことを確認してから行う。
-        # Fix 4 (original): idx+3 <= len(s) に変更（末尾3文字も正しくマッチ）
         elif idx+3<=len(s) and s[idx]=='\'' and s[idx+1] != '\\' and s[idx+2]=='\'':
             x=ord(s[idx+1])
             idx+=3
         elif StringUtils.q(s, '$$', idx):
             idx += 2
-            # binary_list中(makeobj内)では命令先頭アドレスpc_instr_startを返す。
-            # .equなど他のコンテキストでは現在のPC(self.state.pc)を返す。
             x = self.state.pc_instr_start if self.state._in_binary_list else self.state.pc
         elif StringUtils.q(s, '$.', idx):
             idx += 2
-            # $.は常に「その命令の次のアドレス」を返す。
-            # binary_list中/外・pass0(対話モード)を問わず pc_instr_end を返す。
-            # pc_instr_end はパターンマッチ確定直後のサイズプローブで設定済み。
             x = self.state.pc_instr_end
         elif StringUtils.q(s, '#', idx):
             idx += 1
             t, idx = self.parser.get_symbol_word(s, idx)
             _sym_val = self.symbol_manager.get(t)
-            # Bugfix: symbol_manager.get() は未定義シンボルに "" (空文字列) を返す。
-            # "" が x に代入されると後続の算術演算（term0 等）で TypeError が発生し、
-            # 「パターンマッチ失敗」として誤報告されていた。
-            # 修正: 未定義シンボル（"" のまま）は 0 として扱いエラーを明示する。
             if _sym_val == "":
                 if self.state.pas == 2 or self.state.pas == 0:
                     print(f" error - undefined symbol: '#{t}'", file=sys.stderr)
@@ -1531,39 +1339,17 @@ class ExpressionEvaluator:
                 x = 16 * x + int(s[idx].lower(), 16)
                 idx += 1
         elif (idx + 3 <= len(s) and s[idx:idx+3] == 'qad'
-              # Bugfix: 'qad' の後（スペース可）に '{' が続く場合のみキーワードとして扱う。
-              # これがないと 'qad_label' や 'qadrant' のようなラベル名が
-              # qad キーワードブランチに誤って入り、ラベル値が 0 になるサイレントバグが起きる。
               and (lambda _j=StringUtils.skipspc(s, idx + 3): _j < len(s) and s[_j] == '{')()):
             idx += 3
             idx = StringUtils.skipspc(s, idx)
             if idx < len(s) and s[idx] == '{':
-                # get_curlb で {} 内の式テキスト全体を取得（算術式に対応）
                 f, t, idx = self.parser.get_curlb(s, idx)
                 if not f:
-                    # get_curlb は既にエラーを表示済み。x=0 のまま返る。
-                    # idx は len(s) になっているのでそのまま抜ける。
                     pass
                 else:
                     try:
                         h = IEEE754Converter.decimal_eval_expr(t)
                     except (ValueError, ZeroDivisionError):
-                        # シンボル・ラベルなど Decimal 評価できない場合は
-                        # xeval（ラベル置換 + Python eval）で数値を得る。
-                        #
-                        # Fix ⑯ (新規): 旧実装は float 経由で repr() を作ってから
-                        # decimal_to_ieee754_128bit_hex() に渡していた。float は
-                        # 53bit 精度なので qad{} の「128bit 精度」が失われる。
-                        # 修正: xeval の結果が整数または整数値の float ならば
-                        # str(int(v)) → Decimal(整数) → binary128 の経路を使い
-                        # 精度を保持する。真に非整数の場合は Decimal(repr(v)) で
-                        # 最大限の精度を確保した上で変換する。
-                        # （label+N のような整数式は int() 経路が適用され精度は保たれる）
-                        #
-                        # Fix (破綻点1): xeval() は裸の識別子（':' なしの名前）や
-                        # 不正な Python 構文に対して ValueError を送出する。
-                        # dbl{}/flt{} と同様に (ValueError, TypeError) を捕捉して
-                        # エラーメッセージを出力し h=0 にフォールバックする。
                         try:
                             v = self.xeval(t, None)
                         except (ValueError, TypeError):
@@ -1576,14 +1362,10 @@ class ExpressionEvaluator:
                                 h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
                                         str(int(v)))
                             else:
-                                # 非整数 float: repr() で 53bit 相当の最大桁数を使用。
-                                # xeval が Python の float を返す以上 53bit が上限だが、
-                                # Decimal() を経由することで binary128 変換は正確に行われる。
                                 h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
                                         str(Decimal(repr(float(v)))))
                     x = int(h, 16)
         elif (idx + 3 <= len(s) and s[idx:idx+3] == 'dbl'
-              # Bugfix: 'dbl' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
               and (lambda _j=StringUtils.skipspc(s, idx + 3): _j < len(s) and s[_j] == '{')()):
             idx += 3
             f, t, idx = self.parser.get_curlb(s, idx)
@@ -1595,10 +1377,6 @@ class ExpressionEvaluator:
                 elif t == '-inf':
                     x = 0xfff0000000000000
                 else:
-                    # Fix: xeval が UNDEF 由来の巨大整数を返すと float() / struct.pack で
-                    # OverflowError / struct.error が発生する。
-                    # Fix (破綻点2): xeval() が float & int などの型不整合演算で
-                    # TypeError を送出する場合も同じく捕捉してフォールバックする。
                     try:
                         v = float(self.xeval(t, None))
                         x = int.from_bytes(struct.pack('>d', v), "big")
@@ -1607,7 +1385,6 @@ class ExpressionEvaluator:
                             print(f" error - dbl{{}}: cannot convert expression to float64; using 0.", file=sys.stderr)
                         x = 0
         elif (idx + 3 <= len(s) and s[idx:idx+3] == 'flt'
-              # Bugfix: 'flt' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
               and (lambda _j=StringUtils.skipspc(s, idx + 3): _j < len(s) and s[_j] == '{')()):
             idx += 3
             f, t, idx = self.parser.get_curlb(s, idx)
@@ -1619,10 +1396,6 @@ class ExpressionEvaluator:
                 elif t == '-inf':
                     x = 0xff800000
                 else:
-                    # Fix: xeval が UNDEF 由来の巨大整数を返すと float() / struct.pack で
-                    # OverflowError / struct.error が発生する。
-                    # Fix (破綻点2): xeval() が float & int などの型不整合演算で
-                    # TypeError を送出する場合も同じく捕捉してフォールバックする。
                     try:
                         v = float(self.xeval(t, None))
                         x = int.from_bytes(struct.pack('>f', v), "big")
@@ -1631,37 +1404,20 @@ class ExpressionEvaluator:
                             print(f" error - flt{{}}: cannot convert expression to float32; using 0.", file=sys.stderr)
                         x = 0
         elif (idx + 5 <= len(s) and s[idx:idx+5] == 'enflt'
-              # Bugfix: 'enflt' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
               and (lambda _j=StringUtils.skipspc(s, idx + 5): _j < len(s) and s[_j] == '{')()):
             idx += 5
             f, t, idx = self.parser.get_curlb(s, idx)
             if f:
-                # Bugfix3 (false positive): expression() を呼ぶ前に
-                # error_undefined_label をリセットすることで、
-                # enflt{} の中身が定数のとき誤エラーが出なくなる。
-                #
-                # Bugfix4 (side effect of Bugfix3): リセット前の状態（外側の式で
-                # 既に検出した未定義ラベル情報）を保存し、内側の式の結果と OR 合成して
-                # 復元する。こうすることで "undef_label + enflt{1.5}" のように
-                # enflt{} より先に未定義ラベルが評価されたケースでも、
-                # 外側の error_undefined_label=True が消えずに残る。
                 _outer_undef = self.state.error_undefined_label
                 self.state.error_undefined_label = False
                 v, _ = self.expression(t + chr(0), 0)
                 _inner_undef = self.state.error_undefined_label
-                # 外側と内側の未定義ラベルを OR 合成して伝播させる
                 self.state.error_undefined_label = _outer_undef or _inner_undef
-                # Bugfix (struct.error): v が UNDEF (256bit 整数) のとき struct.pack('I', v) は
-                # struct.error を送出する。修正: 0〜2^32-1 の範囲にマスクしてから渡す。
-                # Bugfix2 (silent NaN): UNDEF をマスクすると 0xFFFFFFFF → NaN になり
-                # エラーメッセージなしに誤った浮動小数点値が格納されていた。
-                # 修正: 未定義ラベル検出時は 0 を使ってエラーを明示する。
                 if _inner_undef:
                     if self.state.pas == 2 or self.state.pas == 0:
                         print(" error - enflt{}: expression contains undefined label.", file=sys.stderr)
                     x = enflt(0)
                 else:
-                    # Fix: v が float('inf')/nan のとき int(v) は OverflowError になる。
                     try:
                         x = enflt(int(v) & 0xFFFFFFFF)
                     except (OverflowError, ValueError):
@@ -1669,25 +1425,20 @@ class ExpressionEvaluator:
                             print(" error - enflt{}: non-finite float value; using 0.", file=sys.stderr)
                         x = enflt(0)
         elif (idx + 5 <= len(s) and s[idx:idx+5] == 'endbl'
-              # Bugfix: 'endbl' 前置ラベル名誤解析防止。'{' が続く場合のみキーワード扱い。
               and (lambda _j=StringUtils.skipspc(s, idx + 5): _j < len(s) and s[_j] == '{')()):
             idx += 5
             f, t, idx = self.parser.get_curlb(s, idx)
             if f:
-                # Bugfix3/4: enflt と同様に外側の状態を保存し、内側の結果と OR 合成する。
                 _outer_undef = self.state.error_undefined_label
                 self.state.error_undefined_label = False
                 v, _ = self.expression(t + chr(0), 0)
                 _inner_undef = self.state.error_undefined_label
                 self.state.error_undefined_label = _outer_undef or _inner_undef
-                # Bugfix (struct.error): v が UNDEF のとき struct.pack('Q', v) がクラッシュする。
-                # Bugfix2 (silent NaN): enflt と同様に未定義ラベル時は 0 を使いエラーを明示する。
                 if _inner_undef:
                     if self.state.pas == 2 or self.state.pas == 0:
                         print(" error - endbl{}: expression contains undefined label.", file=sys.stderr)
                     x = endbl(0)
                 else:
-                    # Fix: v が float('inf')/nan のとき int(v) は OverflowError になる。
                     try:
                         x = endbl(int(v) & 0xFFFFFFFFFFFFFFFF)
                     except (OverflowError, ValueError):
@@ -1696,11 +1447,9 @@ class ExpressionEvaluator:
                         x = endbl(0)
         elif self.state.exp_typ=='i' and idx < len(s) and s[idx].isdigit():
                 fs, idx = self.parser.get_intstr(s, idx)
-                x = int(fs)  # int(float(fs)) would lose precision for large integers
+                x = int(fs)
         elif self.state.exp_typ=='f' and idx < len(s) and (self.parser.isfloatstr(s,idx)):
                 fs,idx = self.parser.get_floatstr(s,idx)
-                # Fix: get_floatstr が空文字列を返した場合（例: 小数点のみ '.'）は
-                # float('') が ValueError になる。0.0 として扱う。
                 try:
                     x = float(fs) if fs else 0.0
                 except ValueError:
@@ -1714,15 +1463,6 @@ class ExpressionEvaluator:
             else:
                 x = self.var_manager.get(ch)
                 idx += 1
-                # Fix: パターンマッチ中 (_in_match_attempt=True) に未定義ラベルを
-                # キャプチャした場合、get_value() のエラー出力はフラグにより抑制されるが
-                # 変数には UNDEF が格納される。makeobj() がその変数を読む際に get_value()
-                # を経由しないため、従来は error_undefined_label がセットされず、
-                # UNDEF 値がエラーなしでそのまま出力されていた。
-                # 修正: _in_match_attempt=False かつ pass2/対話モード かつ
-                # _pass1_size_mode=False (プローブ中でない) のとき、
-                # 変数値が UNDEF 由来であればエラーを発生させる。
-                # B修正: 閾値判定を _is_undef_derived に一元化（2^192）。
                 if (not self.state._in_match_attempt
                         and not self.state._pass1_size_mode
                         and (self.state.pas == 2 or self.state.pas == 0)
@@ -1730,14 +1470,6 @@ class ExpressionEvaluator:
                     self.state.error_undefined_label = True
                     print(f" error - Label undefined: variable '{ch}' contains undefined value"
                           f"  [{self.state.current_file}:{self.state.ln}]", file=sys.stderr)
-                # Fix ⑥: ELF追跡: makeobj() 内で変数を読んだとき、その変数が
-                # match() でラベルを直接キャプチャしたものであればリロケーション候補
-                # として記録する。
-                # 旧実装は expmode==EXP_PAT かつ _elf_current_word_idx>=0 の条件で
-                # _elf_var_to_label を参照していたが、_elf_tracking フラグの確認が
-                # 先行するため tracking が False の場合は辞書参照自体をスキップできる。
-                # またキー存在確認の前に _elf_tracking を先にチェックすることで
-                # 不要な辞書ルックアップを削減する。
                 if (self.state._elf_tracking
                         and self.state._elf_current_word_idx >= 0):
                     entry = self.state._elf_var_to_label.get(ch)
@@ -1759,11 +1491,6 @@ class ExpressionEvaluator:
         x, idx = self.factor(s, idx)
         while idx < len(s) and StringUtils.q(s, '**', idx):
             t, idx = self.factor(s, idx + 2)
-            # Fix 4 (new): 指数の安全チェック。
-            # ① t が負 → Python では float になり後続ビット演算が TypeError になる。
-            #   整数 x の場合は 0 を返す（x**(-n) は実数だがアセンブラ文脈では無意味）。
-            # ② t が非常に大きな整数 → メモリと時間を天文学的に消費する。
-            #   現実的なアセンブラで指数が 1024 を超えることはないため上限を設ける。
             _EXP_MAX = 1024
             try:
                 t_int = int(t)
@@ -1778,11 +1505,6 @@ class ExpressionEvaluator:
                 x = 0
                 break
             x = x ** t_int
-            # Fix 2 (new): 底 x が float のとき（割り算の結果や exp_typ='f' モード）
-            # x ** t_int は float を返す。後続の term2〜term6 でビット演算（<<, &, ~）が
-            # 行われると TypeError が発生する。
-            # 底が整数値の float（例: 2.0）は int に変換して精度を保持する。
-            # 真に非整数の float はそのまま保持する（float モード処理に委ねる）。
             if isinstance(x, float) and x.is_integer():
                 x = int(x)
         return x, idx
@@ -1798,9 +1520,6 @@ class ExpressionEvaluator:
                 t, idx = self.term0_0(s, idx + 2)
                 if t == 0:
                     self.err("Division by 0 error.")
-                    # Fix 1 (new): ゼロ除算時は x を 0 に確定して while を抜ける。
-                    # 旧実装は err() が -1 を返すだけで例外を投げないため、x が前の値の
-                    # まま while ループが継続し、誤った値が後続の演算に伝播していた。
                     x = 0
                     break
                 else:
@@ -1812,8 +1531,6 @@ class ExpressionEvaluator:
                     x = 0
                     break
                 else:
-                    # 整数同士で割り切れる場合は int のまま返して 53bit float 精度落ちを防ぐ。
-                    # 割り切れない場合（真の実数除算）は float で返す。
                     if isinstance(x, int) and isinstance(t, int):
                         q, r = divmod(x, t)
                         x = q if r == 0 else x / t
@@ -1848,9 +1565,6 @@ class ExpressionEvaluator:
     def term2(self, s, idx):
         """Handle bit shifts"""
         x, idx = self.term1(s, idx)
-        # Fix: ** 演算子と同様に、シフト量に現実的な上限を設ける。
-        # 上限なしだと 1<<100000000 のような式で 120MB の巨大整数が即座に作られる。
-        # 現実のアセンブラで 65536 ビット超のシフトは非現実的。
         _SHIFT_MAX = 65536
         while idx < len(s):
             if StringUtils.q(s, '<<', idx):
@@ -1860,12 +1574,10 @@ class ExpressionEvaluator:
                     t = int(t)
                 except (ValueError, OverflowError):
                     x = 0; break
-                # Fix: 負のシフト量は ValueError になる。ガードして 0 を返す。
                 if t < 0:
                     if self.state.pas == 2 or self.state.pas == 0:
                         print(f" error - negative shift count ({t}) in << expression.", file=sys.stderr)
                     x = 0; break
-                # Fix: 過大なシフト量は巨大整数を作りメモリを大量消費する。
                 if t > _SHIFT_MAX:
                     if self.state.pas == 2 or self.state.pas == 0:
                         print(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in << expression.", file=sys.stderr)
@@ -1878,12 +1590,10 @@ class ExpressionEvaluator:
                     t = int(t)
                 except (ValueError, OverflowError):
                     x = 0; break
-                # Fix: 負のシフト量は ValueError になる。ガードして 0 を返す。
                 if t < 0:
                     if self.state.pas == 2 or self.state.pas == 0:
                         print(f" error - negative shift count ({t}) in >> expression.", file=sys.stderr)
                     x = 0; break
-                # >> は右シフトなので大きな値でもメモリ問題は起きないが統一性のためガードする。
                 if t > _SHIFT_MAX:
                     x = 0; break
                 x >>= t
@@ -1938,21 +1648,14 @@ class ExpressionEvaluator:
         また term5 が float の t を返す場合も同様。演算前に明示的に int へ変換する。
         （term2〜term5 が int(x) を呼んでいるのと同じ方針）
         """
-        _SEXT_MAX_BITS = 128  # 符号拡張ビット幅の上限
+        _SEXT_MAX_BITS = 128
         x, idx = self.term5(s, idx)
-        # Use '\'' as sign-extension operator only when followed by a digit or '('
-        # to avoid ambiguity with character literal closing quotes.
-        # Fix ⑰ (新規): remove_comment_asm が Fix ⑬ で \xNN を正しく消費するため
-        # 孤立クォートの混入は大幅に減少するが、以下のガードで二重防護する。
-        # 符号拡張演算子は必ず正の整数ビット幅（1 以上）が後に続く。
-        # 次トークンが数字または '(' でない場合は演算子ではなく閉じクォートとみなす。
         while idx < len(s) and s[idx] == '\'':
             next_idx = idx + 1
             next_idx = StringUtils.skipspc(s, next_idx)
             if next_idx >= len(s) or (s[next_idx] not in DIGIT and s[next_idx] != '('):
                 break
             t, idx = self.term5(s, idx + 1)
-            # Fix ②: float が来たときの TypeError を防ぐため int に変換する
             try:
                 x = int(x)
                 t = int(t)
@@ -1962,7 +1665,6 @@ class ExpressionEvaluator:
             if t <= 0:
                 x = 0
             elif t > _SEXT_MAX_BITS:
-                # 修正⑨: 非現実的なビット幅は 0 として扱う
                 print(f" warning - sign-extension bit width {t} exceeds maximum {_SEXT_MAX_BITS}, result set to 0.", file=sys.stderr)
                 x = 0
             else:
@@ -2046,37 +1748,30 @@ class ExpressionEvaluator:
         """
         x, idx = self.term10(s, idx)
         if idx < len(s) and StringUtils.q(s, '?', idx):
-            # Fix 6: 両ブランチを評価してから副作用をロールバックする方式は
-            # ネストが深いほどスナップショットのコピーコストが増大する。
-            # _elf_label_refs_seen は list コピーが高コストになりうるため、
-            # スナップショット時点の長さを記録し、ロールバックはスライスで行う。
             saved_vars              = self.state.vars[:]
             saved_err_undef         = self.state.error_undefined_label
             saved_err_conflict      = self.state.error_label_conflict
-            saved_elf_refs_len      = len(self.state._elf_label_refs_seen)   # Fix 6
+            saved_elf_refs_len      = len(self.state._elf_label_refs_seen)
             saved_elf_v2l           = dict(self.state._elf_var_to_label)
 
-            t, idx = self.term11(s, idx + 1)   # 真ブランチ評価（右結合）
+            t, idx = self.term11(s, idx + 1)
             vars_after_true         = self.state.vars[:]
             err_after_true          = self.state.error_undefined_label
             conflict_after_true     = self.state.error_label_conflict
-            refs_after_true         = list(self.state._elf_label_refs_seen)  # Fix ⑫
-            v2l_after_true          = dict(self.state._elf_var_to_label)     # Fix ⑫
+            refs_after_true         = list(self.state._elf_label_refs_seen)
+            v2l_after_true          = dict(self.state._elf_var_to_label)
 
             if idx < len(s) and StringUtils.q(s, ':', idx):
-                # 偽ブランチ評価前に vars / ELF 追跡状態を元の状態に戻す
                 self.state.vars                     = saved_vars[:]
                 self.state.error_undefined_label    = saved_err_undef
                 self.state.error_label_conflict     = saved_err_conflict
-                # Fix 6: スライスで saved 長さまで切り戻す（新規コピー不要）
                 del self.state._elf_label_refs_seen[saved_elf_refs_len:]
                 self.state._elf_var_to_label        = dict(saved_elf_v2l)
-                u, idx = self.term11(s, idx + 1)  # 偽ブランチ評価（右結合）
+                u, idx = self.term11(s, idx + 1)
                 err_after_false         = self.state.error_undefined_label
                 conflict_after_false    = self.state.error_label_conflict
 
                 if x != 0:
-                    # 条件が真: 真ブランチの値・変数状態・エラーフラグ・ELF状態を採用
                     self.state.vars                     = vars_after_true
                     self.state.error_undefined_label    = err_after_true
                     self.state.error_label_conflict     = conflict_after_true
@@ -2084,16 +1779,9 @@ class ExpressionEvaluator:
                     self.state._elf_var_to_label        = v2l_after_true
                     x = t
                 else:
-                    # 条件が偽: 偽ブランチの値・変数状態・エラーフラグをそのまま使う
                     x = u
             else:
-                # ':' がない不完全な三項演算子: a?b の形式。
                 if x != 0:
-                    # 条件が真: 真ブランチの値・変数状態・エラーフラグ・ELF状態を採用
-                    # Fix ⑫ (修正): 旧実装は ELF 追跡状態（_elf_label_refs_seen /
-                    # _elf_var_to_label）の復元が漏れていた。真ブランチ評価後に
-                    # refs_after_true / v2l_after_true を採用することで
-                    # 誤ったリロケーションエントリの混入を防ぐ。
                     self.state.vars                     = vars_after_true
                     self.state.error_undefined_label    = err_after_true
                     self.state.error_label_conflict     = conflict_after_true
@@ -2101,24 +1789,16 @@ class ExpressionEvaluator:
                     self.state._elf_var_to_label        = v2l_after_true
                     x = t
                 else:
-                    # 条件が偽: 真ブランチの副作用を取り消し、0 を返す
                     self.state.vars                     = saved_vars
                     self.state.error_undefined_label    = saved_err_undef
                     self.state.error_label_conflict     = saved_err_conflict
-                    del self.state._elf_label_refs_seen[saved_elf_refs_len:]  # Fix 6
+                    del self.state._elf_label_refs_seen[saved_elf_refs_len:]
                     self.state._elf_var_to_label        = dict(saved_elf_v2l)
                     x = 0
         return x, idx
     
     def expression(self, s, idx):
         """Main expression evaluator (internal, s must already be NUL-terminated)"""
-        # C修正: 旧実装は factor の単項 -,~,@ でのみ RecursionError を捕捉しており、
-        # 括弧式 '(' → expression（factor1 経由）、enflt{}/endbl{}、[] ブラケット等の
-        # 深いネストは未保護で、lineassemble2 の外（.equ 評価など）では
-        # 未捕捉の RecursionError でクラッシュし得た。
-        # 全公開エントリ（expression_pat/asm/esc/esc_float）と factor1 からの
-        # 再帰呼び出しはすべてこの expression() を通過するため、ここで一元的に
-        # 捕捉すれば全経路を保護できる。ハンドラ内では一切再帰しないので安全。
         try:
             idx0 = StringUtils.skipspc(s, idx)
             x, idx0 = self.term11(s, idx0)
@@ -2169,38 +1849,25 @@ class ExpressionEvaluator:
         また、パターンファイルで [[/]] を変換した特殊文字 OB(0x90)/CB(0x91) も
         ブラケットペアとしてスタック追跡の対象に含める（旧実装では未対応だった）。
         """
-        # prefix (s[:idx]) はそのままコピー
         result = list(s[:idx])
 
-        # 開き括弧 → 対応する閉じ括弧（OB/CB を追加）
         OPEN_TO_CLOSE = {'(': ')', '[': ']', OB: CB}
         CLOSE_CHARS   = set(OPEN_TO_CLOSE.values())
 
-        stack = []   # 開き括弧を積むスタック
+        stack = []
 
         for ch in s[idx:]:
-            # 【バグ修正①】深さ0でstopcharに一致するかを最初に確認する。
-            # 旧実装では stopchar が '(' '[' OB のいずれかのとき、
-            # 「開き括弧」として先にスタックに積まれてしまい stopchar として
-            # 機能しなかった。判定順を逆転し、depth==0 && ch==stopchar を
-            # 括弧判定より優先することで全 stopchar を正しく処理できる。
             if not stack and ch == stopchar:
-                # 深さ0 かつ stopchar → ここで式を終端。
-                # NUL を挿入したら残りの文字は追加しない（stopchar 以降が
-                # result に混入すると expression() が誤った位置で継続する）。
                 result.append(chr(0))
                 break
             elif ch in OPEN_TO_CLOSE:
-                # 開き括弧: スタックに積んで出力
                 stack.append(ch)
                 result.append(ch)
             elif ch in CLOSE_CHARS:
                 if stack and OPEN_TO_CLOSE.get(stack[-1]) == ch:
-                    # 対応する開き括弧と一致 → ネストを1段抜ける
                     stack.pop()
                     result.append(ch)
                 else:
-                    # 対応不一致の閉じ括弧（不正な入力）はそのまま出力
                     result.append(ch)
             else:
                 result.append(ch)
@@ -2209,9 +1876,6 @@ class ExpressionEvaluator:
         return self.expression(self._terminate(replaced), idx)
 
     def expression_esc_float(self,s,idx,stopchar):
-        # Fix 6: exp_typ だけでなく expmode も保存・復元する。
-        # expression_esc 内部で expmode を変更するコードが呼ばれると
-        # 呼び出し元に戻ったとき expmode が変わったままになる。
         prev_typ  = self.state.exp_typ
         prev_mode = self.state.expmode
         self.state.exp_typ = 'f'
@@ -2224,22 +1888,22 @@ class ExpressionEvaluator:
 
 
 class BinaryWriter:
-    """Handles binary output to files"""
-    
+    """-b オプション用の素のバイナリファイル出力(ELFではなくワード単位の
+    フラットバイナリ)。ワード位置→値の疎な辞書としてバッファし、flush()で
+    まとめてバイト列に展開してファイルへ書く。ELFオブジェクト出力は
+    Assembler.write_elf_obj() が別途担当する。
+    """
+
     def __init__(self, state):
         self.state = state
-        self._buffer = {}   # {position: byte_value} のランダムアクセスバッファ
-    
+        self._buffer = {}
+
     def _store(self, position, word_val):
         """ワード単位でバッファに格納"""
-        # Fix: bts <= 0 はマスクが 0 になりデータが全ゼロになる。
-        # fwrite でもガードしているが、将来の直接呼び出し経路に備えて二重防護する。
         if self.state.bts <= 0:
             return
-        # Fix(new): 負のアドレスは bytearray インデックス計算を壊す。早期リターンする。
         if position < 0:
             return
-        # 11ビットなら 0x7ff でマスクして格納
         mask = (1 << self.state.bts) - 1
         self._buffer[position] = word_val & mask
     
@@ -2248,46 +1912,32 @@ class BinaryWriter:
         if not self.state.outfile or not self._buffer:
             return
 
-        # Fix 6 (new): bts == 0 の場合は bytes_per_word = 0 になり出力が空になる。
-        # サイレントな空ファイル生成を防ぐため、明示的に警告を出して早期リターンする。
         if self.state.bts <= 0:
             print(f" warning - flush: bts={self.state.bts} is invalid (<=0); "
                   f"output file '{self.state.outfile}' will be empty.", file=sys.stderr)
             return
 
-        # Fix(new): 負のキーが混入している場合はスキップして安全に処理する。
-        # _store でもガードしているが、旧バージョンのバッファが持ち越された場合への防護。
         valid_buffer = {k: v for k, v in self._buffer.items() if k >= 0}
         if not valid_buffer:
             return
 
         max_word_pos = max(valid_buffer.keys())
         
-        # 1ワードあたりに必要なバイト数を計算 (例: 11bit -> 2bytes)
         word_bits = self.state.bts
         bytes_per_word = (word_bits + 7) // 8
         
         total_size = (max_word_pos + 1) * bytes_per_word
 
-        # Fix(new): total_size が 0 以下になる場合（全キーが負など）は書き出しスキップ。
         if total_size <= 0:
             return
 
-        # Fix: total_size が非常に大きい場合（例: .ORG で PC を巨大値にセット後に出力）
-        # bytearray(total_size) がメモリ不足でクラッシュする。現実的な上限を設ける。
-        _MAX_OUTPUT_BYTES = 1 << 30  # 1 GB
+        _MAX_OUTPUT_BYTES = 1 << 30
         if total_size > _MAX_OUTPUT_BYTES:
             print(f" error - output size {total_size} bytes exceeds maximum {_MAX_OUTPUT_BYTES}. "
                   f"Check for incorrect .ORG or address values.",
                   file=__import__('sys').stderr)
             return
 
-        # 修正8: .padding で設定した state.padding 値で全ワードを初期化してから
-        # 実際に書き込まれたワードで上書きする。
-        # Fix (perf): 1ワードのバイトパターンを bytes で構築してから *repeat で
-        # 全バッファを一括初期化する。Python ループより大幅に速い。
-        # pad_bytes の長さは bytes_per_word なので
-        # len(pad_bytes) * (max_word_pos+1) == total_size が常に成立する。
         pad_val = int(self.state.padding) & ((1 << word_bits) - 1)
         if pad_val != 0:
             tmp = pad_val
@@ -2301,10 +1951,8 @@ class BinaryWriter:
             data = bytearray(total_size)
 
         for pos, val in valid_buffer.items():
-            # 書き込み先のバイト位置を特定
             base_idx = pos * bytes_per_word
             
-            # エンディアンに基づいてバイト列に変換
             temp_val = val
             if self.state.endian == 'little':
                 for i in range(bytes_per_word):
@@ -2322,21 +1970,18 @@ class BinaryWriter:
 
     def fwrite(self, position, x, prt):
         """1ワードをバッファへ書き込み"""
-        # Fix: bts <= 0 の場合はマスクが 0 になりデータが全ゼロになる。
-        # flush() にはガードがあるが fwrite 自体には なかったので早期リターンする。
         if self.state.bts <= 0:
             return 0
-        # デバッグ表示用のマスク
         mask = (1 << self.state.bts) - 1
         val = x & mask
         
         if prt:
             b = self.state.bts
-            colm = (b + 3) // 4  # bビットを16進表示するのに必要な桁数（切り上げ）
+            colm = (b + 3) // 4
             print(f" 0x{val:0{colm}x}", end='')
 
         self._store(position, val)
-        return 1 # 1ワード書き込んだことを返す
+        return 1
 
     def outbin2(self, a, x):
         """Output binary without printing"""
@@ -2350,8 +1995,6 @@ class BinaryWriter:
     def outbin(self, a, x):
         """Output binary with printing"""
         if self.state.pas == 2 or self.state.pas == 0:
-            # -v オプション対応: ファイルアセンブル時 (pas==2) は verbose のときのみ hex 表示。
-            # 対話モード (pas==0) は常に表示する。
             _prt = 1 if ((self.state.pas == 2 and self.state.verbose) or self.state.pas == 0) else 0
             try:
                 self.fwrite(a, int(x), _prt)
@@ -2361,9 +2004,6 @@ class BinaryWriter:
     
     def align_(self, addr):
         """Align address"""
-        # Fix 6/15: state.align == 0（.ALIGN 0 や初期化ミスなど）の場合、
-        # addr % 0 で ZeroDivisionError が発生する。
-        # 0 以下のアライメント値はアライメントなし（そのまま返す）として扱う。
         if self.state.align <= 0:
             return addr
         a = addr % self.state.align
@@ -2373,8 +2013,16 @@ class BinaryWriter:
 
 
 class DirectiveProcessor:
-    """Processes assembler directives"""
-    
+    """パターンファイル(.axx)内のディレクティブ(.setsym/.clearsym/.bits/
+    .padding/.symbolc/.vliw/epic/.check/.clrcheck等)を処理する。
+
+    各メソッドは「このディレクティブに該当するか」を i[0](パターンエントリの
+    最初のフィールド)で判定し、該当しなければ何もせずFalseを返す。
+    Assembler.lineassemble2()のパターン走査ループが全メソッドを順に試す
+    ことで、ディレクティブ行を通常の命令パターンとして誤ってマッチさせない
+    ようにしている。
+    """
+
     def __init__(self, state, expr_eval, binary_writer, symbol_manager=None, parser=None):
         self.state = state
         self.expr_eval = expr_eval
@@ -2394,7 +2042,7 @@ class DirectiveProcessor:
             return False
         
         if len(i) >= 3 and i[2] != '':
-            key = StringUtils.upper(i[2]) # This is an abbreviation for field 1, so this is OK.
+            key = StringUtils.upper(i[2])
             self.state.symbols.pop(key, None)
         else:
             self.state.symbols = {}
@@ -2406,7 +2054,6 @@ class DirectiveProcessor:
         if len(i) == 0 or i[0] != '.setsym':
             return False
         
-        # 引数チェック: 少なくとも .setsym KEY が必要
         if len(i) < 2:
             print(f" error - .setsym directive requires at least a symbol name", file=sys.stderr)
             return False
@@ -2424,23 +2071,16 @@ class DirectiveProcessor:
         if len(i) == 0 or i[0] != '.bits':
             return False
         
-        # Fix ④: エンディアンは 'big' / 'little' が明示指定された場合のみ変更する。
-        # 旧実装は i[1] が 'big' 以外のとき無条件に 'little' に上書きしていたため、
-        # '.bits 16' のようにビット幅だけ指定するとエンディアンが変わってしまっていた。
         if len(i) >= 2:
             if i[1].lower() == 'big':
                 self.state.endian = 'big'
             elif i[1].lower() == 'little':
                 self.state.endian = 'little'
-            # それ以外 (数値等) はビット幅として後続の処理に渡す。エンディアン変更なし。
         
-        # Fix 3: エンディアン指定のみ (.bits big / .bits little) の場合は
-        # bts を変更しない。旧実装は else: v=8 で無条件に 8 に上書きしていた。
         v = None
         if len(i) >= 3:
             v, idx = self.expr_eval.expression_pat(i[2], 0)
         elif len(i) >= 2 and i[1].lower() not in ('big', 'little'):
-            # 引数が1つでエンディアン指定でない場合はそれがビット幅
             v, idx = self.expr_eval.expression_pat(i[1], 0)
         if v is not None:
             try:
@@ -2454,11 +2094,6 @@ class DirectiveProcessor:
         if len(i) == 0 or i[0] != '.padding':
             return False
         
-        # Fix 6 (new): パターン行のフィールド配置は
-        #   i[0]=cmd, i[1]=error式, i[2]=obj式（padding値）
-        # だが、省略形 `.padding :: value` では i[1]='value', i[2] が欠如する。
-        # 旧実装は i[2] だけ見ていたため省略形では常に v=0 になっていた。
-        # 修正: i[2] が存在する場合は i[2] を、そうでなければ i[1] を値として読む。
         if len(i) >= 3 and i[2] != '':
             v, idx = self.expr_eval.expression_pat(i[2], 0)
         elif len(i) >= 2 and i[1] != '':
@@ -2485,7 +2120,6 @@ class DirectiveProcessor:
         if len(i) == 0 or i[0] != ".vliw":
             return False
         
-        # 引数チェック: .vliw には5つのパラメータが必要
         if len(i) < 5:
             print(f" error - .vliw directive requires 4 parameters (vliwbits, vliwinstbits, vliwtemplatebits, nop_value), got {len(i)-1}", file=sys.stderr)
             return False
@@ -2495,7 +2129,6 @@ class DirectiveProcessor:
         v3, idx = self.expr_eval.expression_pat(i[3], 0)
         v4, idx = self.expr_eval.expression_pat(i[4], 0)
 
-        # Fix: v1/v2/v3 が非有限 float のとき int() は OverflowError になる。
         try:
             self.state.vliwbits        = int(v1)
             self.state.vliwinstbits    = int(v2)
@@ -2506,7 +2139,6 @@ class DirectiveProcessor:
         self.state.vliwflag = True
         
         l = []
-        # Fix ⑦: ループ変数を `_byte_idx` に変更して引数 `i` のシャドウイングを解消する。
         for _byte_idx in range(self.state.vliwinstbits // 8 + (0 if self.state.vliwinstbits % 8 == 0 else 1)):
             l += [v4 & 0xff]
             v4 >>= 8
@@ -2521,7 +2153,6 @@ class DirectiveProcessor:
         if len(i) <= 1 or i[1] == '':
             return False
         
-        # 引数チェック: EPIC には少なくとも2つのパラメータが必要
         if len(i) < 3:
             print(f" error - EPIC directive requires 2 parameters (indices, pattern), got {len(i)-1}", file=sys.stderr)
             return False
@@ -2542,16 +2173,14 @@ class DirectiveProcessor:
         return True
     
     def error(self, s):
-        """Process error directive.
+        """パターンファイルのエラー条件欄(第2フィールド)を処理する。
 
-        Fix 10: error_code はローカル変数に代入するだけで戻り値がなく、
-        呼び出し元でエラーを検知できなかった。
-        戻り値として (triggered: bool, code: int) を返すよう変更する。
+        書式: cond1;code1, cond2;code2, ... の "cond;code" 組をカンマ区切りで
+        並べる。condが真ならcodeをERRORSの索引としてエラーメッセージを
+        表示する。戻り値は (triggered: bool, 最後に発火したerror_code)。
 
-        Fix (new): expression_pat がパース不能な文字（')' など）に当たると
-        idx を進めないまま返すため、while True ループが永遠に抜けられない
-        無限ループになっていた。各イテレーションで idx が進んだかを確認し、
-        進まなかった場合は残りをスキップして終了する。
+        expression_pat()がパース不能な文字で止まりidxが進まない場合は
+        無限ループを避けるためそこで走査を打ち切る。
         """
         ss = s.replace(' ', '')
         if ss == "":
@@ -2570,7 +2199,7 @@ class DirectiveProcessor:
                 idx += 1
                 continue
             
-            idx_before = idx   # Fix: 進捗チェック用に保存
+            idx_before = idx
             prev_typ = self.expr_eval.state.exp_typ
             self.expr_eval.state.exp_typ = 'f'
             try:
@@ -2578,16 +2207,10 @@ class DirectiveProcessor:
                 idx = idxn
                 if idx < len(s) and s[idx] == ';':
                     idx += 1
-                # Fix 8: エラーコード式（t）も同じ exp_typ='f' コンテキストで評価する。
-                # 旧実装は u の評価後に exp_typ を元に戻してから t を評価していたため、
-                # expmode/exp_typ の混在状態が生じ、整数リテラルのコードが float 解析に
-                # 切り替わらないケースがあった。
                 t, idx = self.expr_eval.expression_pat(s, idx)
             finally:
                 self.expr_eval.state.exp_typ = prev_typ
             
-            # Fix: idx が全く進まなかった → パース不能文字で無限ループになる。
-            # 残りの文字を読み飛ばして終了する。
             if idx <= idx_before:
                 break
 
@@ -2650,12 +2273,26 @@ class DirectiveProcessor:
                 print(f" error - .clrcheck: variable should be a lower case letter ('{var_field}').",
                       file=sys.stderr)
         else:
-            # 引数なし: 全 .check 拘束条件を解除する。
             self.state.check_constraints.clear()
         return True
 
 class PatternMatcher:
-    """Handles pattern matching for assembly instructions"""
+    """パターン定義ファイルの1エントリ(マッチパターン文字列)とソース行を
+    照合する。match()が実際の照合ロジック、match0()が[[ ]]オプショナル
+    グループの全組合せを試す上位ラッパー。
+
+    マッチパターン中の特殊トークン(matchの実装を参照):
+        大文字リテラル   入力と大文字小文字を無視して完全一致
+        \\x              次の1文字だけをリテラルとして扱う(エスケープ)
+        小文字1文字      レジスタ名などの「シンボル」として.setsymの値を
+                         大文字小文字無視で解決する(SymbolManager)
+        !x               任意の算術式を読み取り変数xに束縛する
+                         (ラベル参照は大文字小文字を区別する)
+        !!x              factor()単体(式の最初の項のみ)を読み取り束縛する
+        !Fx/!Dx/!Qx      浮動小数点式を読み取りIEEE754の32/64/128bit
+                         ビットパターンとして整数化して束縛する
+        [[ ... ]]        オプショナルグループ(match0が全組合せを試す)
+    """
     
     def __init__(self, state, expr_eval, var_manager, symbol_manager, parser):
         self.state = state
@@ -2663,29 +2300,22 @@ class PatternMatcher:
         self.var_manager = var_manager
         self.symbol_manager = symbol_manager
         self.parser = parser
-        # 順序非依存マッチング用: 直近の match()/match0() 成功時の具体度スコア。
-        # (式キャプチャ数, シンボルキャプチャ数, -リテラル一致文字数) のタプル。
         self.last_score = None
         self.last_match_score = None
     
     def remove_brackets(self, s, l):
-        """Remove specified bracket pairs.
+        """Remove specified [[ ]] bracket-pair groups from pattern string s.
 
-        修正3: 旧実装はネスト深度 (open_count) をグループIDとして使っていた。
-        これだと兄弟関係にある [[A]] [[B]] は両方 open_count==1 になり、
-        個別に指定できなかった。
-
-        修正後: OB を見るたびに単調増加するシリアル番号を割り当て、
-        スタックで対応する CB と紐付ける。
-        remove_brackets(t, [1,3]) は「シリアル1番と3番のグループを除去せよ」
-        という意味になり、どの兄弟でも正しく個別指定できる。
-        match0 が渡す l のシリアルは 1-origin の連番 (sl = [1,2,...,cnt]) なので
-        この変更と完全に対応している。
+        OB(開き)が現れるたびに単調増加するシリアル番号を割り当て、スタックで
+        対応するCB(閉じ)と紐付ける。これにより [[A]] [[B]] のような兄弟関係の
+        グループも別々のシリアル番号を持ち、remove_brackets(t, [1,3]) のように
+        「シリアル1番と3番のグループだけ除去する」という個別指定ができる
+        (ネスト深度だけをIDにすると兄弟グループを区別できないため)。
+        match0() が渡す l は1起算の連番 [1,2,...,cnt] になっている。
         """
-        # --- シリアル番号と文字位置の対応表を構築 ---
-        serial = 0          # 次に割り当てるシリアル
-        stack = []          # (serial, open_pos) のスタック
-        bracket_pairs = {}  # serial -> (open_pos, close_pos)
+        serial = 0
+        stack = []
+        bracket_pairs = {}
 
         for i, char in enumerate(s):
             if char == OB:
@@ -2696,7 +2326,6 @@ class PatternMatcher:
                     ser, open_pos = stack.pop()
                     bracket_pairs[ser] = (open_pos, i)
 
-        # --- l に含まれるシリアルのグループを除去 ---
         result = list(s)
         for index in l:
             if index in bracket_pairs:
@@ -2709,30 +2338,31 @@ class PatternMatcher:
     def match(self, s, t):
         """Match assembly line against pattern.
 
-        順序非依存マッチングのため、マッチ成功時に「具体度スコア」を
-        self.last_score に格納する。スコアはタプル
-            (式キャプチャ数, -リテラル一致文字数, シンボルキャプチャ数)
-        で、小さいほど具体的（優先度が高い）:
+        1つのソース行に複数のパターンが構文的にマッチしうる場合に備え、
+        マッチ成功時は「具体度スコア」を self.last_score に格納する
+        (呼び出し元がスコアの異なる複数の成功マッチを比較し、最も具体的な
+        ものを採用する。順序非依存マッチングについては
+        Assembler.lineassemble2() 参照)。
+
+        スコアはタプル (式キャプチャ数, -リテラル一致文字数, シンボル
+        キャプチャ数) で、値が小さいほど具体的(優先度が高い):
           - リテラルのみ  LD A,(HL)  → (0, -n, 0)   最優先
           - シンボル捕捉  LD A,r     → (0, -n, 1)
           - 式キャプチャ  LD A,!e    → (1, -n, 0)   最後
 
-        修正: 第2キーをシンボル数からリテラル一致文字数に変更した。
-        旧順序 (n_expr, n_sym, -n_lit) では、式キャプチャ数が同じ2パターン
-        のうちシンボル数の少ない方が、リテラル一致がどれほど多くても必ず
-        勝ってしまった。例: `ld a,(iy+9)` に対して
-            LD A,(!n)        → (1, 0, -6)   ← 旧順序ではこちらが採用
-            LD s,(IY[[+!d]]) → (1, 1, -8)
-        となり、`iy+9` が式として !n に飲み込まれ、未定義ラベル iy の
-        エラーになっていた。IY をリテラルで一致させたパターンの方が
-        明らかに具体的なので、リテラル一致文字数を優先する。
+        第2キーにリテラル一致文字数(シンボル数ではなく)を採用しているのが
+        重要な点: 式キャプチャ数が同点の2パターンでは、リテラル一致文字数が
+        多い方を優先しないと、例えば `ld a,(iy+9)` において
+        `LD A,(!n)`(iyまるごと式として飲み込む)が
+        `LD s,(IY[[+!d]])`(IYをリテラルで一致させる、より具体的なパターン)
+        より先に採用されてしまい、iyが未定義ラベルとしてエラーになる。
         """
         self.state.deb1 = s
         self.state.deb2 = t
 
-        n_expr = 0   # !e / !!e / !F / !D / !Q キャプチャ数
-        n_sym = 0    # 小文字シンボルプレースホルダ一致数
-        n_lit = 0    # リテラル一致文字数
+        n_expr = 0
+        n_sym = 0
+        n_lit = 0
 
         t = t.replace(OB, '').replace(CB, '')
         idx_s = 0
@@ -2749,7 +2379,6 @@ class PatternMatcher:
             a = t[idx_t]
             
             if a == chr(0) and b == chr(0):
-                # 順序非依存選択用の具体度スコアを確定
                 self.last_score = (n_expr, -n_lit, n_sym)
                 return True
             
@@ -2762,7 +2391,7 @@ class PatternMatcher:
                     continue
                 else:
                     return False
-            elif a in CAPITAL:   # Fix: isupper() はUnicode大文字も含むため CAPITAL で限定
+            elif a in CAPITAL:
                 if a == b.upper():
                     idx_s += 1
                     idx_t += 1
@@ -2773,41 +2402,30 @@ class PatternMatcher:
             elif a == '!':
                 n_expr += 1
                 idx_t += 1
-                # Fix 1: パターンが '!' で終端している場合の IndexError を防ぐ
                 if idx_t >= len(t):
                     return False
                 a = t[idx_t]
                 idx_t += 1
-                # Fix 1b: '!' の直後が NUL（番兵）や無効文字の場合は不正パターン
-                # a が chr(0) のまま else 分岐に流れると番兵を消費してループが壊れる
                 if a == chr(0):
                     return False
                 if a == 'F':
-                    # Fix 2a: !F の変数名取得前に境界チェック
                     if idx_t >= len(t):
                         return False
                     a = t[idx_t]
-                    # Fix 2a-2: 変数名が NUL または無効文字なら不正パターン
                     if a == chr(0) or a not in LOWER:
                         return False
                     idx_t = StringUtils.skipspc(t, idx_t+1)
                     if idx_t < len(t) and t[idx_t] == '\\':
-                        idx_t += 1                                    # skip '\'
+                        idx_t += 1
                         stopchar = t[idx_t] if idx_t < len(t) else chr(0)
-                        idx_t += 1                                    # skip stopchar in pattern
+                        idx_t += 1
                     else:
                         stopchar = chr(0)
 
-                    # Fix: expression_esc_float が例外を投げても _elf_capturing_var が
-                    # True のまま残らないよう try/finally でリセットを保証する。
-                    # !F は整数キャプチャではないのでキャプチャ変数は設定不要だが、
-                    # 将来の変更に備えて他ブランチと対称なパターンにしておく。
                     try:
                         v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
                     finally:
                         self.state._elf_capturing_var = None
-                    # Fix: UNDEF や非有限値が渡ると float() や struct.pack で
-                    # OverflowError / struct.error が発生する。安全に 0 にフォールバック。
                     try:
                         v = float(v)
                         v = int.from_bytes(struct.pack('>f', v), "big")
@@ -2816,34 +2434,27 @@ class PatternMatcher:
                             print(f" error - !F: cannot convert value to float32; using 0.", file=sys.stderr)
                         v = 0
                     self.var_manager.put(a, v)
-                    # consume stopchar from source as well
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
                         idx_s += 1
                     continue
                 elif a == 'D':
-                    # Fix 2b: !D の変数名取得前に境界チェック
                     if idx_t >= len(t):
                         return False
                     a = t[idx_t]
-                    # Fix 2b-2: 変数名が NUL または無効文字なら不正パターン
                     if a == chr(0) or a not in LOWER:
                         return False
                     idx_t = StringUtils.skipspc(t, idx_t+1)
                     if idx_t < len(t) and t[idx_t] == '\\':
-                        idx_t += 1                                    # skip '\'
+                        idx_t += 1
                         stopchar = t[idx_t] if idx_t < len(t) else chr(0)
-                        idx_t += 1                                    # skip stopchar in pattern
+                        idx_t += 1
                     else:
                         stopchar = chr(0)
 
-                    # Fix: expression_esc_float が例外を投げても _elf_capturing_var が
-                    # True のまま残らないよう try/finally でリセットを保証する。
                     try:
                         v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
                     finally:
                         self.state._elf_capturing_var = None
-                    # Fix: UNDEF や非有限値が渡ると float() や struct.pack で
-                    # OverflowError / struct.error が発生する。安全に 0 にフォールバック。
                     try:
                         v = float(v)
                         v = int.from_bytes(struct.pack('>d', v), "big")
@@ -2852,57 +2463,41 @@ class PatternMatcher:
                             print(f" error - !D: cannot convert value to float64; using 0.", file=sys.stderr)
                         v = 0
                     self.var_manager.put(a, v)
-                    # consume stopchar from source as well
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
                         idx_s += 1
                     continue
                 elif a == 'Q':
-                    # !Q<var> : ソースから浮動小数点式を読み取り、
-                    # IEEE754 128ビット(quad)整数ビットパターンとして変数に格納する
-                    # Fix 2c: !Q の変数名取得前に境界チェック
                     if idx_t >= len(t):
                         return False
                     a = t[idx_t]
-                    # Fix 2c-2: 変数名が NUL または無効文字なら不正パターン
                     if a == chr(0) or a not in LOWER:
                         return False
                     idx_t = StringUtils.skipspc(t, idx_t+1)
                     if idx_t < len(t) and t[idx_t] == '\\':
-                        idx_t += 1                                    # skip '\'
+                        idx_t += 1
                         stopchar = t[idx_t] if idx_t < len(t) else chr(0)
-                        idx_t += 1                                    # skip stopchar in pattern
+                        idx_t += 1
                     else:
                         stopchar = chr(0)
 
-                    # ソーステキストの開始位置を記録
                     idx_s_q_start = idx_s
 
-                    # float モードで式の終端位置を検出
-                    # Fix: expression_esc_float が例外を投げても _elf_capturing_var が残留しないよう
-                    # try/finally で確実に None に戻す。
                     try:
                         v, idx_s_after = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
                     finally:
                         self.state._elf_capturing_var = None
 
-                    # stopchar 手前までのソーステキストを抽出
                     raw_text = s[idx_s_q_start:idx_s_after]
-                    # stopchar が末尾に含まれていれば除去
                     if stopchar != chr(0) and raw_text.endswith(stopchar):
                         raw_text = raw_text[:-1]
                     raw_text = raw_text.strip()
 
-                    # qad{...} ラッパーを剥がす（!Q qad{3.14*2+1} と書かれた場合）
                     if raw_text.startswith('qad{') and raw_text.endswith('}'):
                         raw_text = raw_text[4:-1].strip()
 
                     try:
                         h = IEEE754Converter.decimal_eval_expr(raw_text)
                     except (ValueError, ZeroDivisionError):
-                        # Decimal 評価不能（ラベル参照など）。
-                        # v は expression_esc_float の戻り値（Python int か float）。
-                        # ・整数値 → Decimal(int) で完全精度（ラベルアドレスは整数なので典型的にこちら）
-                        # ・float 値 → repr() で53bit分の最大桁数を使用（精度損失は避けられない）
                         if isinstance(v, int) or (
                                 isinstance(v, float) and v.is_integer()):
                             h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
@@ -2914,22 +2509,16 @@ class PatternMatcher:
                     x = int(h, 16)
                     self.var_manager.put(a, x)
                     idx_s = idx_s_after
-                    # consume stopchar from source as well
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
                         idx_s += 1
                     continue
                 elif a == '!':
-                    # Fix 2d: !! の変数名取得前に境界チェック
                     if idx_t >= len(t):
                         return False
                     a = t[idx_t]
-                    # Fix 2d-2: 変数名が NUL または無効文字なら不正パターン
                     if a == chr(0) or a not in LOWER:
                         return False
                     idx_t += 1
-                    # ELF追跡: !!a（factor キャプチャ）
-                    # Fix: factor() が例外を投げても _elf_capturing_var が残留しないよう
-                    # try/finally で確実に None に戻す。
                     self.state._elf_capturing_var = a
                     try:
                         v, idx_s = self.expr_eval.factor(s, idx_s)
@@ -2938,28 +2527,22 @@ class PatternMatcher:
                     self.var_manager.put(a, v)
                     continue
                 else:
-                    # Fix 1c: else 分岐の変数名 a も NUL/無効文字チェック
-                    # （'!' の直後に stopchar指定なし の通常キャプチャ）
                     if a == chr(0) or a not in LOWER:
                         return False
                     idx_t = StringUtils.skipspc(t, idx_t)
                     if idx_t < len(t) and t[idx_t] == '\\':
-                        idx_t += 1                                    # skip '\'
+                        idx_t += 1
                         stopchar = t[idx_t] if idx_t < len(t) else chr(0)
-                        idx_t += 1                                    # skip stopchar in pattern
+                        idx_t += 1
                     else:
                         stopchar = chr(0)
 
-                    # ELF追跡: !a（expression キャプチャ）
-                    # Fix: expression_esc() が例外を投げても _elf_capturing_var が残留しないよう
-                    # try/finally で確実に None に戻す。
                     self.state._elf_capturing_var = a
                     try:
                         v, idx_s = self.expr_eval.expression_esc(s, idx_s, stopchar)
                     finally:
                         self.state._elf_capturing_var = None
                     self.var_manager.put(a, v)
-                    # consume stopchar from source as well
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
                         idx_s += 1
                     continue
@@ -2972,9 +2555,6 @@ class PatternMatcher:
                     return False
                 if a in self.state.check_constraints and w not in self.state.check_constraints[a]:
                     return False
-                # Fix 5 (new): get_symbol_word がソース位置を進めなかった場合
-                # （ソース側が空白やNULなど）、continue するとループが止まらなくなる。
-                # idx_s が変化しなければマッチ失敗として扱う。
                 if idx_s == prev_idx_s:
                     return False
                 self.var_manager.put(a, v)
@@ -2991,16 +2571,19 @@ class PatternMatcher:
     def match0(self, s, t):
         """Match with optional bracket combinations.
 
-        各 match() 試行の前に vars をスナップショットし、
-        マッチ失敗した試行で書き込まれた変数値を必ずリストアする。
-        これにより、失敗した組み合わせの副作用が次の試行に持ち越されない。
+        [[ ]]で囲まれた各グループを「含む/含まない」の全2^cnt通りの組合せで
+        match()を試す。各試行の前にvarsをスナップショットし、失敗した試行の
+        副作用(変数書き込み・ELF追跡記録)を必ずリストアしてから次の組合せを
+        試すので、失敗した組み合わせの影響が後続の試行に漏れない。
+
+        cntが大きいと2^cnt通りの全探索が非現実的な時間になるため、実用上
+        20個を超えることはないという前提で_MAX_OPT_GROUPSを設け、超過分は
+        「常に含む」扱いにして組合せ爆発を防ぐ。
         """
         t = t.replace('[[', OB).replace(']]', CB)
         cnt = t.count(OB)
         sl = [_ + 1 for _ in range(cnt)]
 
-        # Fix: cnt が大きいとき組み合わせ数は 2^cnt になり事実上無限ループになる。
-        # 現実のパターンファイルで [[]] が 20 を超えることはないため上限を設ける。
         _MAX_OPT_GROUPS = 20
         if cnt > _MAX_OPT_GROUPS:
             if self.state.pas == 2 or self.state.pas == 0:
@@ -3014,29 +2597,26 @@ class PatternMatcher:
             ll = list(itertools.combinations(sl, i))
             for j in ll:
                 lt = self.remove_brackets(t, list(j))
-                # マッチ前の vars を保存
                 saved_vars = self.state.vars[:]
-                # Fix ④ / Fix 8: ELF追跡状態も保存する。
-                # _elf_label_refs_seen はリスト全体コピーでなく長さだけ記録し、
-                # 失敗時は del [n:] でロールバック（term11と同方式でコピー負荷を削減）。
                 saved_refs_len = len(self.state._elf_label_refs_seen)
                 saved_v2l      = dict(self.state._elf_var_to_label)
                 if self.match(s, lt):
-                    # 採用された [[...]] 組み合わせでのスコアを公開する
                     self.last_match_score = self.last_score
                     return True
-                # 失敗 → vars と ELF 追跡状態をリストア
                 self.state.vars = saved_vars
                 del self.state._elf_label_refs_seen[saved_refs_len:]
                 self.state._elf_var_to_label = saved_v2l
         return False
 
 class PatternFileReader:
-    """Reads and processes pattern files"""
-    
+    """パターン定義ファイル(.axx)を読み込み、"::"区切りで最大6フィールドの
+    パターンエントリのリストに変換する。.INCLUDEディレクティブによる
+    再帰的な読み込み(循環検出・深度上限つき)にも対応する。
+    """
+
     def __init__(self, parser):
         self.parser = parser
-    
+
     def readpat(self, fn, base_dir=None, _depth=0, _chain=None):
         """Read pattern file.
 
@@ -3044,29 +2624,23 @@ class PatternFileReader:
         None のときはプロセスの CWD を基準にする（トップレベル呼び出し）。
         相対パスの fn は base_dir（または CWD）を基準に解決する。
 
-        _chain: D8修正。現在の .INCLUDE 連鎖中にある各ファイルの実パス(realpath)集合。
-        A→B→A のような循環インクルードを検出するために使う。
-        旧実装は深度上限(50)のみで循環を検出できず、循環があると同じファイルを
-        50回読み直してから停止していた（無駄かつ誤動作）。
+        _chain: 現在の .INCLUDE 連鎖中にある各ファイルの実パス(realpath)集合。
+        A→B→A のような循環インクルードを検出するために使う(深度上限だけでは
+        循環を検出できず、同じファイルを上限回数まで無駄に読み直してしまう)。
 
         戻り値: パターンエントリのリスト。ファイルが存在しない・読めない場合は例外を伝播する。
         """
         if fn == '':
             return []
 
-        # Fix: 深い .INCLUDE ネストは RecursionError になる。現実的な上限を設ける。
         _MAX_PAT_DEPTH = 50
         if _depth > _MAX_PAT_DEPTH:
             print(f" error - pattern .INCLUDE nesting exceeds {_MAX_PAT_DEPTH}: '{fn}'", file=sys.stderr)
             return []
         
-        # 相対パスを解決する
         if base_dir and not os.path.isabs(fn):
             fn = os.path.join(base_dir, fn)
 
-        # D8修正: 循環インクルード検出。
-        # realpath はシンボリックリンク・'./'・'..' を正規化するので、
-        # 異なる表記でも同一ファイルを確実に同定できる。
         _real = os.path.realpath(fn)
         if _chain is None:
             _chain = frozenset()
@@ -3076,7 +2650,6 @@ class PatternFileReader:
             return []
         _chain = _chain | {_real}
         
-        # このファイルと同じディレクトリを、再帰的な .INCLUDE の基準にする
         this_dir = os.path.dirname(os.path.abspath(fn))
         
         p = []
@@ -3094,7 +2667,7 @@ class PatternFileReader:
                 l = StringUtils.reduce_spaces(l)
                 
                 ww = self.include_pat(l, this_dir, _depth=_depth + 1, _chain=_chain)
-                if ww is not None:   # Fix: None=非.INCLUDE行, []=空/エラー, list=パターン
+                if ww is not None:
                     w = w + ww
                     continue
                 else:
@@ -3120,9 +2693,6 @@ class PatternFileReader:
                     elif len(l) == 6:
                         p = [l[0], l[1], l[2], l[3], l[4], l[5]]
                     else:
-                        # Fix 11: フィールドが7個以上の行はサイレントに切り捨てていた。
-                        # パターンファイルの書き間違い（区切り文字ミス等）を検出するため
-                        # 警告を出力する。
                         print(f" warning - pattern line has more than 6 fields "
                               f"(extra fields ignored): {l[6:]!r}", file=sys.stderr)
                         p = [l[0], l[1], l[2], l[3], l[4], l[5]]
@@ -3156,14 +2726,11 @@ class PatternFileReader:
         i = l[idx:idx+8]
         i = i.upper()
         if i != ".INCLUDE":
-            return None   # Fix: マッチなしは None で返す（空リストと区別）
+            return None
         s = StringUtils.get_string(l[idx+8:])
         if s == "":
-            # get_string が失敗した（引用符がないか空文字列）
             raw = l[idx+8:].strip()
             if raw:
-                # 引用符なしでファイル名が書かれているかもしれない。
-                # スペースまでをファイル名として試みる（緩やかなフォールバック）。
                 fallback, _ = StringUtils.get_param_to_spc(raw, 0)
                 if fallback:
                     import sys as _sys
@@ -3172,24 +2739,33 @@ class PatternFileReader:
                     s = fallback
                 else:
                     print(f" error - .INCLUDE directive has no filename: {l!r}", file=sys.stderr)
-                    return []   # マッチしたがエラー → 空リスト
+                    return []
             else:
                 print(f" error - .INCLUDE directive has no filename: {l!r}", file=sys.stderr)
-                return []   # マッチしたがエラー → 空リスト
+                return []
         w = self.readpat(s, base_dir, _depth=_depth, _chain=_chain)
-        return w   # 空ファイルなら [] だが呼び出し元で区別される
+        return w
 
 
 class ObjectGenerator:
-    """Generates object code from expressions"""
-    
+    """採用パターンのエンコーディング欄(第3フィールド)からオブジェクトコード
+    (バイト値のリスト)を生成する。makeobj()が本体で、前処理として
+    e_p()が@@[n,pattern]の繰り返し展開、replace_percent_with_index()が
+    %%の連番置換を行う。
+    """
+
     def __init__(self, state, expr_eval, binary_writer):
         self.state = state
         self.expr_eval = expr_eval
         self.binary_writer = binary_writer
-    
+
     def replace_percent_with_index(self, s):
-        """Replace %% with sequential numbers starting from 0"""
+        """Replace %% with sequential numbers starting from 0.
+
+        @@[4,*(e,%%)] の展開結果 *(e,0),*(e,1),*(e,2),*(e,3) のように、
+        繰り返し生成されたコピーの各バイトが何バイト目かを埋め込むために使う。
+        '%0' はカウンタを0にリセットする(複数の@@[]が並ぶ場合に使用)。
+        """
         count = 0
         result = []
         i = 0
@@ -3207,13 +2783,17 @@ class ObjectGenerator:
         return ''.join(result)
 
     def e_p(self, pattern):
-        """Expand @@[n,pattern] syntax"""
+        """Expand @@[n,pattern] syntax.
+
+        @@[n,expr] は expr を n 回カンマ区切りで並べたものに展開する
+        (nは式の中で%%を使い各コピーのバイト位置を参照できる)。例えば
+        @@[4,*(e,%%)] は4バイトのリトルエンディアン整数展開に使われる。
+        """
         result = []
         has_content = False
         i = 0
         while i < len(pattern):
             if i + 3 <= len(pattern) and pattern[i:i+3] == '@@[':
-                # @@[ found
                 i += 3
                 depth = 1
                 expr_start = i
@@ -3230,27 +2810,15 @@ class ObjectGenerator:
                         comma_pos = i
                     i += 1
                 
-                # Bugfix: 旧コメントは「comma_pos > 0」が不要と指摘していたが
-                # 実装は直していなかった。`comma_pos >= 0` が正しい条件。
-                # -1 は「カンマ未発見」を意味し、0 はパターン先頭にカンマが
-                # ある合法なケース（@@[,pattern] で式が空 → n=0 として展開しない）。
-                # comma_pos >= expr_start だけで「カンマが式開始位置より後にある」
-                # ことを保証できるため、二重条件は不要だった。
                 if comma_pos >= 0 and comma_pos >= expr_start:
                     expr = pattern[expr_start:comma_pos]
                     rep_pattern = pattern[comma_pos+1:i]
                     
-                    # Evaluate expression
-                    # 修正: 直前の処理でerror_undefined_labelが残っている場合に
-                    # n=0と誤判定されるのを防ぐため、評価前にリセットする。
                     self.state.error_undefined_label = False
                     n, idx = self.expr_eval.expression_pat(expr, 0)
-                    # Fix: 未定義ラベルや UNDEF 由来の巨大値が n に入ると
-                    # range(int(UNDEF)) が実質無限ループになりプロセスがハングする。
-                    # error_undefined_label フラグと現実的な上限でガードする。
-                    _N_MAX = 1 << 24  # 16M 回展開は非現実的
+                    _N_MAX = 1 << 24
                     if self.state.error_undefined_label:
-                        n = 0  # forward参照は 0 扱いにしてサイズ推定を続ける
+                        n = 0
                     try:
                         n_int = int(n)
                     except (ValueError, OverflowError):
@@ -3259,16 +2827,15 @@ class ObjectGenerator:
                         if self.state.pas == 2 or self.state.pas == 0:
                             print(f" error - @@[n,...]: repeat count {n_int} exceeds maximum {_N_MAX}.", file=sys.stderr)
                         n_int = 0
-                    # Expand pattern n times
                     if n_int > 0:
-                        n = n_int  # 以降は検証済みの整数を使う
+                        n = n_int
                         has_content = True
                         for j in range(int(n)):
                             if j > 0:
                                 result.append(',')
                             result.append(rep_pattern)
                     
-                    i += 1  # Skip closing ]
+                    i += 1
                 else:
                     result.append('@@[')
                     has_content = True
@@ -3280,14 +2847,18 @@ class ObjectGenerator:
         return ''.join(result), not has_content
 
     def makeobj(self, s):
-        """Make object code from expression string"""
-        # Expand @@[] and replace %%
+        """Make object code from expression string.
+
+        エンコーディング欄はカンマ区切りの式の並びで、各式が1バイト(または
+        1ワード)を生成する。先頭が ';' の要素は「値が0ならバイト自体を省略
+        する」特殊扱いで、例えばx86_64のREXプレフィックスのように条件次第で
+        存在したりしなかったりするバイトの表現に使われる
+        (;((d&8)?0x41:0) は d&8 が真のときだけ0x41を出力し、偽のときは
+        バイトを丸ごと省く)。
+        """
         s,z = self.e_p(s)
         s = self.replace_percent_with_index(s)
 
-        # 修正: ','の正規化（,,→,, strip(',')）を抑制する。
-        # ','はbinary_listのセパレータであり、アライメント指示ではない。
-        # @@[0,...]が空展開されても余分な処理は行わない。
 
         s += chr(0)
         idx = 0
@@ -3297,8 +2868,6 @@ class ObjectGenerator:
             return objl
 
         self.state._in_binary_list = True
-        # e_p/replace_percent_with_index は前処理。ここで一度リセットしておき、
-        # 直前の処理の残留フラグがループ内の判定を汚染しないようにする。
         self.state.error_undefined_label = False
         try:
             while True:
@@ -3306,7 +2875,6 @@ class ObjectGenerator:
                     break
 
                 if s[idx] == ',':
-                    # 修正: ','はセパレータのみ。アライメントパディングは挿入しない。
                     idx += 1
                     continue
 
@@ -3317,9 +2885,6 @@ class ObjectGenerator:
 
                 self.state._elf_current_word_idx = len(objl)
 
-                # pass==1では常に_pass1_size_modeで評価する。
-                # 未定義ラベル(EXTERN等)があっても0として扱い、
-                # @@[8,*(e,%%)]のような式でも8バイト分が正しく計上される。
                 if self.state.pas == 1:
                     self.state._pass1_size_mode = True
                 x, idx = self.expr_eval.expression_pat(s, idx)
@@ -3340,7 +2905,6 @@ class ObjectGenerator:
                     continue
                 break
         finally:
-            # makeobj() を抜けたら必ずセンチネルに戻す（例外安全）
             self.state._elf_current_word_idx = -1
             self.state._in_binary_list = False
             if self.state.pas == 1:
@@ -3350,15 +2914,27 @@ class ObjectGenerator:
 
 
 class VLIWProcessor:
-    """Handles VLIW instruction processing"""
-    
+    """VLIW(Very Long Instruction Word)パケットの組み立てを行う。
+    .vliw::vbits::instbits::templatebits::nop で定義される固定ビット幅の
+    パケットに、"!!"区切りの複数命令スロットとテンプレートビットを
+    詰め込んで1つの固定長パケットにパックする。
+    """
+
     def __init__(self, state, expr_eval, binary_writer):
         self.state = state
         self.expr_eval = expr_eval
         self.binary_writer = binary_writer
-    
+
     def vliwprocess(self, line, idxs, objl, flag, idx, lineassemble2_func):
-        """Process VLIW instruction"""
+        """Process VLIW instruction.
+
+        ソース行を"!!"で区切って各スロットを再帰的にlineassemble2_func()で
+        アセンブルし(objs=各スロットのバイト列、idxlst=各スロットの
+        パターンインデックス)、スロットの組合せに合うepicテンプレート
+        (state.vliwset)を探して、テンプレートビット+各スロットのバイト列を
+        vbitsビット幅のパケットに結合する。スロット不足分はvliwnop
+        (NOPバイト列)で埋め、超過分は切り詰めて警告する。
+        """
         objs = [objl]
         idxlst = [idxs]
         self.state.vliwstop = 0
@@ -3371,23 +2947,7 @@ class VLIWProcessor:
                 continue
             elif idx + 2 <= len(line) and line[idx:idx+2] == '!!':
                 idx += 2
-                # Bugfix: 旧実装は次スロット処理前に _elf_label_refs_seen を [] に
-                # リセットしていた。これにより最初のスロットで収集した ELF 追跡データが
-                # 消えてしまっていた。
-                #
-                # 実際には lineassemble() の finally ブロックが lineassemble2() 返却直後に
-                # _elf_tracking = False にするため、2スロット目以降の lineassemble2_func
-                # 呼び出しは _elf_tracking=False の状態で動作し、新たな追跡データは
-                # 追加されない。そのため「スロット間の word_idx 混在」の危険はなく、
-                # リセットは不要（かつ有害）だった。
-                #
-                # _elf_current_word_idx は makeobj() の finally が -1 に戻すので
-                # ここでリセットしなくて構わない。_elf_capturing_var も同様。
                 idxs, objl, flag, idx = lineassemble2_func(line, idx)
-                # Fix J: lineassemble2_func が flag=False（エラー）を返した場合、
-                # objl が空リストになるが objs/idxlst にそのまま追加すると
-                # 後続の bytes 結合でスロット数がずれる。
-                # flag=False のときは VLIW スロット全体をエラーとして中断する。
                 if not flag:
                     return False
                 objs += [objl]
@@ -3401,17 +2961,11 @@ class VLIWProcessor:
         
         vbits = abs(self.state.vliwbits)
 
-        # Fix ③: vliwinstbits が 0 の場合、noi の計算でゼロ除算が発生する。
-        # .vliw ディレクティブで不正な値が渡された場合を想定してガードする。
         if self.state.vliwinstbits == 0:
             if self.state.pas == 0 or self.state.pas == 2:
                 print(" error - vliwinstbits is zero; cannot compute instruction slots.", file=sys.stderr)
             return False
         for k in self.state.vliwset:
-            # Fix 5 (new): 旧実装は sorted(k[0]) == sorted(idxlst) で比較していたため
-            # スロット順序が無視され、スロット1→2 の命令とスロット2→1 の命令が
-            # 同じテンプレートにマッチしてしまい、順序依存テンプレートで誤バイナリが生成された。
-            # 修正: list 同士を直接比較することで順序を保持した照合を行う。
             if list(k[0]) == list(idxlst) or self.state.vliwtemplatebits == 0:
                 im = 2 ** self.state.vliwinstbits - 1
                 tm = 2 ** abs(self.state.vliwtemplatebits) - 1
@@ -3428,30 +2982,16 @@ class VLIWProcessor:
                     for m in j:
                         values += [m]
                 
-                # Fix ⑧: NOP 埋め処理は出力を伴わないが vliwnop バイトを
-                # values に追加する。pass1 でも走ること自体は問題ないが、
-                # values が変化することでリラクゼーション中の状態が不安定になるため
-                # 補足ガードとして pass 情報を残す（実害は小さいが明示化する）。
                 target_len = ibyte * noi
                 if len(values) > target_len:
                     if self.state.pas == 2 or self.state.pas == 0:
                         print(f"warning-VLIW:{len(values)} values exceed slot capacity {target_len},truncating.", file=sys.stderr)
                     values = values[:target_len]
                 else:
-                    # Bugfix: 旧実装は `range(target_len - len(values))` 回 vliwnop を追加
-                    # していたが、vliwnop は ibyte 個のリストなので1回の追加で ibyte 個増える。
-                    # 結果として (target_len - len(values)) * ibyte 個追加され、
-                    # values が target_len の ibyte 倍まで膨れ上がっていた。
-                    # その後の `values[:target_len]` 切り捨てで長さは戻るが、
-                    # 内容は NOP ではなく命令バイトの繰り返しになるため誤ったバイナリが生成された。
-                    #
-                    # 正しい実装: 不足スロット数 = (target_len - len(values)) // ibyte 回追加。
-                    # 端数バイト（ibyte で割り切れない不足分）は 0x00 で埋める。
                     _deficit = target_len - len(values)
                     _full_nops, _remainder = divmod(_deficit, ibyte) if ibyte > 0 else (0, _deficit)
                     for _ in range(_full_nops):
                         values += self.state.vliwnop
-                    # 端数: vliwnop の先頭バイトで埋める（ibyte が割り切れない異常ケース）
                     if _remainder > 0:
                         values += (self.state.vliwnop + [0] * _remainder)[:_remainder]
                 
@@ -3460,9 +3000,6 @@ class VLIWProcessor:
                 
                 for j in range(noi):
                     vv = 0
-                    # Fix 4: バイト結合順をエンディアン設定に合わせる。
-                    # 旧実装は常に MSB 先頭（ビッグエンディアン順）で結合していたため、
-                    # state.endian == 'little' の場合に命令フィールドが逆転していた。
                     if self.state.endian == 'little':
                         for i in range(ibyte):
                             if len(values) > cnt:
@@ -3487,34 +3024,16 @@ class VLIWProcessor:
                     res = (r << self.state.vliwtemplatebits) | templ
                 
                 q = 0
-                # Fix ⑥修正: 旧実装は vliwbits の符号（>0=MSB先頭, <0=LSB先頭）で
-                # バイト出力順を決定しており、state.endian 設定と整合していなかった。
-                # 他のバイト出力系（flush, _extract）はすべて state.endian で分岐している。
-                # 修正後: state.endian を唯一の基準とする。
-                # vliwbits の符号は abs() で絶対値を取り出す用途のみに使用する。
                 if vbits < 8:
-                    # Fix 6: vbits < 8 では bc = vbits - 8 が負になり
-                    # '0xff << bc' で ValueError が発生する。
-                    # 1バイト未満のワードは下位ビットのみを出力する。
                     self.binary_writer.outbin(self.state.pc, res & ((1 << vbits) - 1))
                     q = 1
                 elif self.state.endian == 'little':
-                    # リトルエンディアン: LSB から順に書き出す。
-                    # Fix: 旧実装は vbits // 8 回しかループしないため、vbits が
-                    # 8 の倍数でない場合（例: 12bit → 1バイトしか書かれず上位 4bit
-                    # が消える）に出力が欠落していた。(vbits + 7) // 8 に修正する。
                     total_bytes = (vbits + 7) // 8
                     for cnt in range(total_bytes):
                         self.binary_writer.outbin(self.state.pc + cnt, res & 0xff)
                         res >>= 8
                         q += 1
                 else:
-                    # ビッグエンディアン: MSB から順に書き出す。
-                    # Fix: 旧実装は bc = vbits - 8 を初期シフト量にしていたため、
-                    # vbits が 8 の倍数でないとき bc が途中で負になり ValueError
-                    # が発生した。また vbits // 8 回しかループしないため上位ビットが
-                    # 消失していた。バイト i は (res >> ((total_bytes-1-i)*8)) & 0xff
-                    # で正確に計算できる。
                     total_bytes = (vbits + 7) // 8
                     for cnt in range(total_bytes):
                         shift = (total_bytes - 1 - cnt) * 8
@@ -3524,10 +3043,6 @@ class VLIWProcessor:
                 self.state.pc += q
                 break
         else:
-            # Fix ③修正: 旧実装は pas==0 か pas==2 のときだけ return False していたため、
-            # pas==1 ではエラーを出さず True を返してしまい、Pass1 のサイズ推定が
-            # VLIW テンプレート未定義のまま通過し、Pass2 でアドレスがずれていた。
-            # 修正後: 全 pass で False を返す。Pass1 の try/except が処理する。
             if self.state.pas == 0 or self.state.pas == 2:
                 print(" error - No vliw instruction-set defined.", file=sys.stderr)
             return False
@@ -3535,15 +3050,20 @@ class VLIWProcessor:
 
 
 class AssemblyDirectiveProcessor:
-    """Processes assembly-level directives"""
-    
+    """ソースファイル(.s)側のディレクティブ(.section/.ascii/.align/.extern/
+    .export・.global/.org/ラベル定義等)を処理する。DirectiveProcessorが
+    パターンファイル側を担当するのと対になるクラス。各メソッドは
+    「このディレクティブに該当するか」を判定し、該当しなければFalseを返す
+    (Assembler.lineassemble2()が順に試す)。
+    """
+
     def __init__(self, state, expr_eval, binary_writer, label_manager, parser):
         self.state = state
         self.expr_eval = expr_eval
         self.binary_writer = binary_writer
         self.label_manager = label_manager
         self.parser = parser
-    
+
     def labelc_processing(self, l, ll):
         """Label characters directive"""
         if l.upper() != '.LABELC':
@@ -3551,9 +3071,12 @@ class AssemblyDirectiveProcessor:
         if ll:
             self.state.lwordchars = ALPHABET + DIGIT + ll
         return True
-    
+
     def label_processing(self, l):
-        """Process label definitions"""
+        """Process label definitions: "label:" (アドレスラベル) と
+        "label: .equ expr[::reloctype]" (定数ラベル、reloctypeでELF
+        リロケーション型を明示指定可能)の両方をここで処理する。
+        """
         if l == "":
             return ""
         
@@ -3565,19 +3088,13 @@ class AssemblyDirectiveProcessor:
             e, idx = StringUtils.get_param_to_spc(l, idx)
 
             if e.upper() == '.EQU':
-                # .EQU の ::reloctype 構文:
-                #   label: .equ <expr>::<reloctype>
-                #     → ラベルに ELF リロケーション情報 (reloc_type) を付加する。
-                #   label: .equ <expr>
-                #     → ::reloctype を省略するとラベルはリロケーション情報を持たない。
-                #       put_value() は reloc_type=None のとき旧エントリの値を引き継がず
-                #       リロケーション情報なしとして確定する。
                 reloc_type = None
                 expr_part = l[idx:].strip()
                 if '::' in expr_part:
                     parts = [p.strip() for p in expr_part.split('::', 1)]
                     expr_part = parts[0]
                     rt_str = parts[1].lower()
+                    # x86_64 ELFリロケーション型名 → R_X86_64_* 数値コード
                     rtype_map = {
                         'abs64':1, 'abs32':10, 'abs32s':11, 'abs16':12, 'abs8':14,
                         'pc32':2, 'plt32':4, 'pc16':13, 'pc8':15,
@@ -3612,8 +3129,6 @@ class AssemblyDirectiveProcessor:
         idx += 1
         
         while idx < len(l2) and not l2[idx]=='"':
-            # Fix 5 (new): ch=None をセンチネルとして使い、エラー時は outbin をスキップ。
-            # None のまま下まで到達した場合はバイトを出力しない。
             ch = None
             if l2[idx:idx+2] == '\\0':
                 idx += 2
@@ -3634,7 +3149,6 @@ class AssemblyDirectiveProcessor:
                 idx += 2
                 ch = '"'
             elif l2[idx:idx+2] in ('\\x', '\\X'):
-                # \xNN 形式の16進エスケープ（最大2桁）
                 idx += 2
                 hex_str = ''
                 while idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF' and len(hex_str) < 2:
@@ -3643,10 +3157,6 @@ class AssemblyDirectiveProcessor:
                 if hex_str:
                     ch = chr(int(hex_str, 16))
                 else:
-                    # Fix 5: \x の直後に16進数字がない場合、エラーを報告して
-                    # ディレクティブ全体を失敗扱いにする（return False）。
-                    # ch=None のままループを続けると後続の文字が出力されてしまい、
-                    # バイナリが部分的に変化する問題があった。
                     print(f" error - '\\x' escape requires at least one hex digit in string: {l2!r}", file=sys.stderr)
                     return False
             else:
@@ -3655,7 +3165,6 @@ class AssemblyDirectiveProcessor:
             if ch is not None:
                 self.binary_writer.outbin(self.state.pc, ord(ch))
                 self.state.pc += 1
-        # Fix: 閉じダブルクォートが見つからずループを抜けた場合は警告する
         if idx >= len(l2):
             print(f" warning - unterminated string literal in .ASCII/.ASCIZ: {l2!r}", file=sys.stderr)
         return True
@@ -3683,8 +3192,6 @@ class AssemblyDirectiveProcessor:
                 idx += 1
             v = self.label_manager.get_value(s)
             sec = self.label_manager.get_section(s)
-            # is_equ フラグを labels から取得して export_labels にも保持する。
-            # write_elf_obj() で定数ラベル(SHN_ABS)とアドレスラベルを区別するために必要。
             _lentry = self.state.labels.get(s, [])
             is_equ = len(_lentry) > 2 and _lentry[2]
             self.state.export_labels[s] = [v, sec, is_equ]
@@ -3717,7 +3224,7 @@ class AssemblyDirectiveProcessor:
         if x < 0:
             print(f" error - .RESB requires a non-negative count, got {x}.", file=sys.stderr)
             return True
-        _RESB_MAX = 1 << 28  # 256MB 超は非現実的
+        _RESB_MAX = 1 << 28
         if x > _RESB_MAX:
             if self.state.pas == 2 or self.state.pas == 0:
                 print(f" error - .RESB count {x} exceeds maximum {_RESB_MAX}.", file=sys.stderr)
@@ -3740,9 +3247,7 @@ class AssemblyDirectiveProcessor:
         if StringUtils.upper(l1) != ".ZERO":
             return False
         x, idx = self.expr_eval.expression_asm(l2, 0)
-        # 未定義ラベルが含まれる場合は UNDEF が返る → range(UNDEF) でフリーズする
         if self.state.error_undefined_label:
-            # pass2 なら未定義ラベルエラーとして報告（pass1 はスキップ）
             if self.state.pas == 2 or self.state.pas == 0:
                 print(f" error - .ZERO argument contains undefined label.", file=sys.stderr)
             return True
@@ -3755,8 +3260,7 @@ class AssemblyDirectiveProcessor:
         if x < 0:
             print(f" error - .ZERO requires a non-negative count, got {x}.", file=sys.stderr)
             return True
-        # Fix: 上限ガード（UNDEF 由来の巨大値でのフリーズ防止）
-        _ZERO_MAX = 1 << 28  # 256MB 超は非現実的
+        _ZERO_MAX = 1 << 28
         if x > _ZERO_MAX:
             if self.state.pas == 2 or self.state.pas == 0:
                 print(f" error - .ZERO count {x} exceeds maximum {_ZERO_MAX}.", file=sys.stderr)
@@ -3776,53 +3280,32 @@ class AssemblyDirectiveProcessor:
         """ASCIZ directive"""
         if StringUtils.upper(l1) != ".ASCIZ":
             return False
-        # Bug修正: asciistr() が文字列バイトを出力する。
-        # 旧コードは f = self.asciistr(l2) の戻り値(bool)だけ見て
-        # 文字列本体をスキップし、0x00 のみ書いていた。
-        # 修正: asciistr() で文字列を出力した後、ヌル終端を追加する。
         if not self.asciistr(l2):
             if self.state.pas == 2 or self.state.pas == 0:
                 print(f" error - .ASCIZ requires a quoted string.", file=sys.stderr)
             return False
-        # ヌル終端を追加 (asciistr はヌルを書かない)
         self.binary_writer.outbin(self.state.pc, 0x00)
         self.state.pc += 1
         return True
     
     def section_processing(self, l1, l2):
-        """Section directive"""
+        """Section directive.
+
+        state.sections[名前] は [開始pc, 確定済みサイズ, 直近の再入pc, confirmed]
+        のリスト。同じセクションに複数回出入りできるため(.text→.data→.text等)、
+        セクションを離れるたびに「今回の滞在分」を確定済みサイズへ加算し、
+        再入時のpcを記録しておく。confirmedはENDSECTIONで最終確定したことを示す。
+        """
         if StringUtils.upper(l1) != ".SECTION" and StringUtils.upper(l1) != ".SEGMENT":
             return False
         
         if l2 != '':
-            # Fix 3 (original) / Fix 4 (new): セクションを切り替える前に現在セクションの
-            # 暫定サイズを更新する。暫定サイズは entry_pc（第3要素）からの差分で計算する。
-            # 旧実装は word_start（第1要素）からの全体幅を使っていたため、非連続セクションで
-            # 過大なサイズが書き込まれていた。
-            #
-            # Bugfix（暫定サイズ累積方式）:
-            # 旧実装は old_entry[1] == 0 のときだけ暫定サイズを書き込んでいた。
-            # ENDSECTION なしでセクションを複数回行き来すると、2回目以降のブロック分が
-            # 加算されず、最初のブロックのサイズのみが記録される問題があった。
-            # 修正後: sections エントリの第4要素 confirmed (bool) で
-            # ENDSECTION 確定済みサイズと暫定サイズを区別する。
-            #   confirmed=False : 暫定サイズ（累積更新可）
-            #   confirmed=True  : ENDSECTION 確定済み（上書き禁止）
-            #
-            # Bugfix2: AssemblerState の初期 current_section (".text") は
-            # sections 辞書に登録されていない。最初の SECTION ディレクティブより前に
-            # 命令を出力すると、その分が sections に記録されず write_elf_obj() で
-            # ELF に含まれなくなる。
-            # 修正: old_sec が sections 未登録の場合は、PC=0 から現在までのデータを
-            # 初期エントリとして登録してから暫定サイズを更新する。
             old_sec = self.state.current_section
             if old_sec not in self.state.sections:
-                # まだ登録されていない初期セクション: word_start=0, entry_pc=0 で作成
                 self.state.sections[old_sec] = [0, 0, 0, False]
             old_entry = self.state.sections[old_sec]
             _confirmed = len(old_entry) > 3 and old_entry[3]
             if not _confirmed:
-                # 暫定サイズ: 今回ブロック分を累積加算する
                 _entry_pc = old_entry[2] if len(old_entry) > 2 else old_entry[0]
                 tentative = self.state.pc - _entry_pc
                 if tentative > 0:
@@ -3830,34 +3313,15 @@ class AssemblyDirectiveProcessor:
 
             self.state.current_section = l2
             if l2 not in self.state.sections:
-                # [word_start, word_count, entry_pc, confirmed]
-                # entry_pc: このセクションに「今」入った時点の PC。
-                # ENDSECTION でのサイズ計算に使う。
-                # confirmed=False: まだ ENDSECTION で確定していない。
                 self.state.sections[l2] = [self.state.pc, 0, self.state.pc, False]
             else:
-                # Fix 2 (new): 同一セクションの再宣言時、ENDSECTION で確定済みのサイズ
-                # （confirmed=True）を Fix 3 のリセット処理が消してしまう問題を修正する。
-                # start を最小値として保持し、confirmed=True なら size は保護する。
-                # entry_pc を「今回の宣言時 PC」に更新することで、
-                # ENDSECTION が「今回入ってから現在まで」の正しい差分を計算できる。
                 existing_start     = self.state.sections[l2][0]
                 existing_size      = self.state.sections[l2][1]
                 existing_confirmed = len(self.state.sections[l2]) > 3 and self.state.sections[l2][3]
-                # Bug fix: word_count==0 かつ未確定のエントリは、他セクション宣言時に
-                # old_sec として自動生成されたダミーエントリである。
-                # このとき existing_start は生成時の PC (多くの場合 0) であり、
-                # 実際にセクションへ再入する現在の PC より小さいことがある。
-                # min() でダミーの 0 が残ると、write_elf_obj でのデータ抽出・
-                # シンボル値・リロケーションオフセット計算が全て誤った値になる。
-                # ダミーエントリ（word_count==0 かつ confirmed==False）の場合は
-                # 現在の PC を word_start として採用し、min() を適用しない。
                 if existing_size == 0 and not existing_confirmed:
                     new_start = self.state.pc
                 else:
                     new_start = min(existing_start, self.state.pc)
-                # confirmed=True の確定済みサイズは保護する
-                # entry_pc は今回の宣言時 PC に更新
                 self.state.sections[l2] = [new_start, existing_size, self.state.pc, existing_confirmed]
         return True
     
@@ -3868,8 +3332,6 @@ class AssemblyDirectiveProcessor:
         
         if l2 != '':
             u, idx = self.expr_eval.expression_asm(l2, 0)
-            # Fix 6: .ALIGN 0 や負値は不正。ゼロ除算を防ぐためここで検証する。
-            # Fix: u が float('inf')/nan の場合も int() で OverflowError になるためガード。
             try:
                 u_int = int(u)
             except (OverflowError, ValueError):
@@ -3892,29 +3354,13 @@ class AssemblyDirectiveProcessor:
             return True
         entry = self.state.sections[self.state.current_section]
         start = entry[0]
-        # Fix 2 (new): 非連続セクション（.text → .data → .text → ENDSECTION）で
-        # pc - start を使うと「最初の宣言 PC から現在まで」の幅になり過大になる。
-        # section_processing が entry_pc（第3要素）に「今回の宣言時 PC」を記録しているので
-        # それを使って「今回のブロック分」だけのサイズを計算する。
-        # 累積サイズ = 既存の確定サイズ + 今回のブロック分
         entry_pc = entry[2] if len(entry) > 2 else start
         block_size = self.state.pc - entry_pc
         if block_size < 0:
             print(f" warning - ENDSECTION: computed block size {block_size} < 0 for "
                   f"'{self.state.current_section}'; keeping previous size.", file=sys.stderr)
             return True
-        # 既存の確定済みサイズに今回のブロック分を加算して確定させる。
-        # 初回（re-declaration なし）は entry[1]==0 なのでそのまま block_size になる。
         new_size = entry[1] + block_size
-        # Bugfix: confirmed=True を第4要素として設定し、ENDSECTION 確定済みであることを記録する。
-        # section_processing の暫定サイズ更新はこのフラグを見て上書きを抑止する。
-        #
-        # Bugfix2（entry_pc 更新）: confirmed=True のまま entry_pc が古い値に残ると、
-        # その後に同一セクションへ再入して ENDSECTION する際に
-        # section_processing が entry_pc を今回の PC に更新するが（else ブランチ）、
-        # ENDSECTION は entry_pc を使って block_size を計算するため問題ない。
-        # ただし ENDSECTION 直後に next SECTION が来ず再度 ENDSECTION が来た場合、
-        # entry_pc が現在 PC を指すよう今の PC で更新しておくことで二重カウントを防ぐ。
         self.state.sections[self.state.current_section] = [start, new_size, self.state.pc, True]
         return True
     
@@ -3933,27 +3379,21 @@ class AssemblyDirectiveProcessor:
             if not label_part:
                 break
 
-            # get_label_word はラベル終端の ':' を1文字消費する。
-            # '.extern foo::plt32' では最初の ':' が消費され idx は2番目の ':'
-            # を指すため、'::' チェックが ':' + 次文字になりマッチしない。
-            # 直前文字が ':' かつ現在位置も ':' なら1文字戻して '::' を正しく検出する。
             if idx > 0 and l2[idx - 1] == ':' and idx < len(l2) and l2[idx] == ':':
-                idx -= 1  # ':' 消費を巻き戻して '::' を先頭から検出できるようにする
+                idx -= 1
 
-            # デフォルトリロケーション型をアーキテクチャから決定する。
-            # .extern label::plt32 のように明示指定した場合はそちらを優先する。
             _em_ext = self.state.elf_machine
-            if _em_ext == 3:          # i386: R_386_PC32=2
+            if _em_ext == 3:
                 reloc_type = 2
-            elif _em_ext == 40:       # ARM: R_ARM_REL32=3
+            elif _em_ext == 40:
                 reloc_type = 3
-            elif _em_ext == 183:      # AArch64: R_AARCH64_PREL32=261
+            elif _em_ext == 183:
                 reloc_type = 261
-            elif _em_ext == 243:      # RISC-V: R_RISCV_32=1
+            elif _em_ext == 243:
                 reloc_type = 1
-            elif _em_ext == 20:       # PPC: R_PPC_REL32=26
+            elif _em_ext == 20:
                 reloc_type = 26
-            else:                     # x86-64 (62) およびその他: R_X86_64_PC32=2
+            else:
                 reloc_type = 2
             if idx < len(l2) and l2[idx:idx+2] == '::':
                 idx += 2
@@ -3964,23 +3404,20 @@ class AssemblyDirectiveProcessor:
 
                 if rt_str:
                     rtype_map = {
-                        # 絶対リロケーション
-                        'abs64':  1,   # R_X86_64_64      – 64bit 絶対アドレス
-                        'abs32':  10,  # R_X86_64_32      – 32bit ゼロ拡張絶対アドレス
-                        'abs32s': 11,  # R_X86_64_32S     – 32bit 符号拡張絶対アドレス
-                        'abs16':  12,  # R_X86_64_16      – 16bit 絶対アドレス
-                        'abs8':   14,  # R_X86_64_8       –  8bit 絶対アドレス
-                        # PC相対リロケーション
-                        'pc32':   2,   # R_X86_64_PC32    – 32bit PC相対
-                        'rel32':  2,   # R_X86_64_PC32    – pc32 の別名
-                        'plt32':  4,   # R_X86_64_PLT32   – PLT経由32bit PC相対
-                        'pc16':   13,  # R_X86_64_PC16    – 16bit PC相対
-                        'pc8':    15,  # R_X86_64_PC8     –  8bit PC相対
-                        'pc64':   24,  # R_X86_64_PC64    – 64bit PC相対
-                        # GOT相対リロケーション
-                        'got32':    3, # R_X86_64_GOT32      – GOTエントリへの32bit参照
-                        'gotpcrel': 9, # R_X86_64_GOTPCREL   – GOTエントリへのPC相対32bit参照
-                        'got64':   27, # R_X86_64_GOT64      – GOTエントリへの64bit参照
+                        'abs64':  1,
+                        'abs32':  10,
+                        'abs32s': 11,
+                        'abs16':  12,
+                        'abs8':   14,
+                        'pc32':   2,
+                        'rel32':  2,
+                        'plt32':  4,
+                        'pc16':   13,
+                        'pc8':    15,
+                        'pc64':   24,
+                        'got32':    3,
+                        'gotpcrel': 9,
+                        'got64':   27,
                     }
                     reloc_type = rtype_map.get(rt_str)
                     if reloc_type is None:
@@ -3989,13 +3426,12 @@ class AssemblyDirectiveProcessor:
             if idx < len(l2) and l2[idx] == ':':
                 idx += 1
 
-            # ラベル登録（5要素形式を確実に）
             existing = self.state.labels.get(label_part)
             if existing is None or not (len(existing) > 3 and existing[3]):
                 self.state.labels[label_part] = [0, '.text', False, True, reloc_type]
             elif len(existing) >= 5:
                 if reloc_type is not None:
-                    existing[4] = reloc_type   # 上書き
+                    existing[4] = reloc_type
 
             idx = StringUtils.skipspc(l2, idx)
             if idx < len(l2) and l2[idx] == ',':
@@ -4008,9 +3444,6 @@ class AssemblyDirectiveProcessor:
         if StringUtils.upper(l1) != ".ORG":
             return False
         u, idx = self.expr_eval.expression_asm(l2, 0)
-        # Fix ②: .ZERO と同様に未定義ラベルを早期検出する。
-        # UNDEF (≈10^77) が返ると range(UNDEF - pc) でプロセスがフリーズし、
-        # さらに pc = UNDEF となって後続の全処理が壊れる。
         if self.state.error_undefined_label:
             if self.state.pas == 2 or self.state.pas == 0:
                 print(f" error - .ORG argument contains undefined label.", file=sys.stderr)
@@ -4027,7 +3460,6 @@ class AssemblyDirectiveProcessor:
             return True
         if idx + 2 <= len(l2) and l2[idx:idx+2].upper() == ',P':
             if u > self.state.pc:
-                # Fix: 巨大なジャンプでフリーズしないよう上限ガード
                 _ORG_FILL_MAX = 1 << 28
                 fill_count = u - self.state.pc
                 if fill_count > _ORG_FILL_MAX:
@@ -4041,8 +3473,15 @@ class AssemblyDirectiveProcessor:
 
 
 class Assembler:
-    """Main assembler class"""
-    
+    """アセンブラ全体の制御クラス。他の全Manager/Processorクラスを束ね、
+    run()がコマンドライン引数の解釈から2パス+リラクゼーション方式の
+    アセンブル、ELF/バイナリ出力までを統括する。
+
+    ソース1行の処理は lineassemble2()(パターン選択+オブジェクト生成) ->
+    lineassemble()(ラベル定義・アドレス確定) -> lineassemble0()(1行全体の
+    エントリポイント、undo可能な形で状態を確定) という3層構造になっている。
+    """
+
     def __init__(self):
         self.state = AssemblerState()
         self.parser = Parser(self.state)
@@ -4061,24 +3500,19 @@ class Assembler:
         self.vliw_proc = VLIWProcessor(self.state, self.expr_eval, self.binary_writer)
         self.asm_directive_proc = AssemblyDirectiveProcessor(self.state, self.expr_eval, 
                                                              self.binary_writer, self.label_manager, self.parser)
-        # セクション情報の一時記録テーブル（imp_label が使用）。
-        # アセンブリ中に構築される state.sections とは独立した辞書で、
-        # import ファイルの解析中のみ参照される。
-        self._imp_sections: dict = {}  # {sname: (start, size)}
+        self._imp_sections: dict = {}
     
     def include_asm(self, l1, l2):
         """Include directive.
 
-        修正5: インクルードパスを現在アセンブル中のファイルのディレクトリを基準に解決する。
-        旧実装はパスをそのまま open() に渡すため、プロセスの CWD と異なる場所にある
-        ソースファイル内の相対パス .INCLUDE が常に失敗していた。
-        stdin や対話モードの場合は解決不能なので CWD 基準のままとする。
+        相対パスの.INCLUDEは、現在アセンブル中のファイルのディレクトリを
+        基準に解決する(プロセスのCWDではなく)。stdin/対話モードの場合は
+        基準ディレクトリが定まらないためCWD基準のままになる。
         """
         if StringUtils.upper(l1) != ".INCLUDE":
             return False
         s = StringUtils.get_string(l2)
         if s:
-            # 相対パスを現在ファイルのディレクトリ基準に解決する
             if not os.path.isabs(s):
                 cur = self.state.current_file
                 if cur and cur not in ("(stdin)", ""):
@@ -4088,7 +3522,16 @@ class Assembler:
         return True
     
     def lineassemble2(self, line, idx):
-        """Assemble line (phase 2)"""
+        """Assemble line (phase 2).
+
+        1行の処理は大きく2段階:
+          (1) ディレクティブ判定 — .section/.ascii/.align/.setsym等の
+              各処理メソッドを順に試し、該当すればそこで処理して返る。
+          (2) 命令パターンの選択 — どのディレクティブにも該当しなければ、
+              パターンファイルの全エントリを走査して最も具体的にマッチする
+              パターンを選び、そのエンコーディングでオブジェクトコードを
+              生成する(詳細は下の走査ループのコメント参照)。
+        """
         l, idx = StringUtils.get_param_to_spc(line, idx)
         l2, idx = StringUtils.get_param_to_eon(line, idx)
         l = l.rstrip()
@@ -4103,20 +3546,8 @@ class Assembler:
             return 0, [], True, idx
         if self.asm_directive_proc.zero_processing(l, l2):
             return 0, [], True, idx
-        # Fix 2 (new): ascii_processing / asciiz_processing は
-        # ① ディレクティブ名が一致しない → False（次のディレクティブへ）
-        # ② ディレクティブ名は一致したが内容エラー → False（asciistr が False を返す）
-        # の2通りで False を返す。旧実装は両方を「ディレクティブ不一致」として扱い、
-        # エラー時にパターンスキャンへ落ちて誤った「構文エラー」が報告されていた。
-        # 修正: ディレクティブ名が一致するかどうかを先に確認してから戻り値を判定する。
         _l_upper = StringUtils.upper(l)
         if _l_upper == '.ASCII':
-            # Fix 4 (実装修正): ascii_processing の戻り値を実際に検査する。
-            # コメントには「戻り値を確認する」と書いてあったが、戻り値を変数に
-            # 受けておらず常に True を返していたため、asciistr() がエラーで
-            # False を返してもバイナリへの書き込みが抜けたまま正常に見えていた。
-            # 修正: 戻り値が False のときも True を返す（パターンスキャンへ落とさない）が、
-            # エラーメッセージを出力してユーザーに知らせる。
             _ok = self.asm_directive_proc.ascii_processing(l, l2)
             if not _ok and (self.state.pas == 2 or self.state.pas == 0):
                 print(f" error - .ASCII: failed to process string argument: {l2!r}", file=sys.stderr)
@@ -4136,29 +3567,16 @@ class Assembler:
             return 0, [], True, idx
         if self.asm_directive_proc.extern_processing(l, l2):
             return 0, [], True, idx
-        if self.asm_directive_proc.export_processing(l, l2):  # handles .EXPORT and .GLOBAL
+        if self.asm_directive_proc.export_processing(l, l2):
             return 0, [], True, idx
 
-        # Fix 9: ソースファイル内の .setsym / .clearsym は lineassemble() 先頭の
-        # "symbols = dict(patsymbols)" リセットによって次行では消えてしまう。
-        # ソースレベルの場合は patsymbols も同時に更新することで永続させる。
-        #
-        # Fix ①修正: 旧実装は _i_src = [l, '', l2, '', '', ''] としていたため、
-        # set_symbol が参照する i[1]（KEY名）が常に '' になっていた。
-        # l2 の最初のトークンを KEY、残りを VALUE として正しく分割する。
-        # .clearsym は i[2] をキー名として参照する（パターンファイルの慣習に合わせた設計）。
         _l_upper = l.upper()
         if _l_upper in ('.SETSYM', '.CLEARSYM'):
             _l2_key, _l2_key_end = StringUtils.get_param_to_spc(l2, 0)
             _l2_val = l2[_l2_key_end:].strip()
             if _l_upper == '.SETSYM':
-                # set_symbol: i[0]=cmd, i[1]=KEY, i[2]=VALUE式
-                # Fix 9: set_symbol/clear_symbol は i[0] を小文字の '.setsym'/'.clearsym'
-                # と比較する。l は get_param_to_spc が返す元の大文字混在のトークンなので
-                # l.lower() を使わないとディレクティブが無視されていた。
                 _i_src = [l.lower(), _l2_key, _l2_val, '', '', '']
             else:
-                # clear_symbol: i[0]=cmd, i[2]=KEY (全消去時は空)
                 _i_src = [l.lower(), '', _l2_key, '', '', '']
         else:
             _i_src = [l, '', l2, '', '', '']
@@ -4180,28 +3598,23 @@ class Assembler:
         objl = []
         loopflag = True
 
-        # ---- 順序非依存パターン選択 (order-independent pattern matching) ----
-        # 旧実装は「ファイル中で最初にマッチしたパターン」を採用していたため、
-        # LD A,(HL) / LD A,r / LD A,!e のようなパターン群はファイル内の出現順に
-        # 依存していた（例: LD A,!e が先にあると LD A,(HL) の (HL) が式として
-        # 捕捉されてしまう）。
+        # ---- 順序非依存パターン選択 ----
+        # 1つのソース行に複数のパターンが構文的にマッチしうる場合(例:
+        # "CALL rax" は "CALL !e"(式キャプチャ)にも "CALL d"(レジスタ)にも
+        # 一致しうる)、パターンファイル中の全エントリを走査し、マッチした
+        # ものの中から PatternMatcher.match() が返す具体度スコアが最小
+        # (=最も具体的)なものを採用する。同点ならファイル内で先に出現した
+        # ものを採用する。
         #
-        # 新実装は全パターンを走査し、マッチしたものの中から具体度スコア
-        #     (式キャプチャ数, シンボルキャプチャ数, -リテラル一致文字数)
-        # が最小（=最も具体的）なパターンを採用する。優先順位は
-        #     リテラル完全一致 > シンボル(小文字)一致 > 式キャプチャ(!e等)
-        # となり、同点の場合はファイル内で先に出現したパターンを採用する
-        # （従来動作との互換性を保つ）。
-        #
-        # ディレクティブ (.setsym / .check / .bits 等) はファイル順に効果を持つ
-        # ため走査中は従来通り逐次適用し、マッチ成功時点のディレクティブ状態を
-        # スナップショットとして保存する。採用パターンのオブジェクト生成は
-        # 走査完了後にそのスナップショットを復元してから行うので、
-        # 「そのパターン位置までのディレクティブが適用された状態で生成する」
-        # という従来のセマンティクスが保たれる。
-        best = None              # 最良マッチのスナップショット (dict)
-        hit_sentinel = False     # 番兵エントリ i[0]=='' に到達したか
-        first_match_exc = None   # 走査中に例外を出した最初のパターン (診断用)
+        # ディレクティブ(.setsym等)はパターン走査中も出現順に副作用を適用
+        # し続ける必要があるため、マッチ成功時点のディレクティブ状態を
+        # _snap_dirstate() でスナップショットしておき、最終的に採用された
+        # パターンのオブジェクト生成時にそのスナップショットを復元する
+        # (「そのパターン位置までのディレクティブが適用された状態で生成する」
+        # というセマンティクスを保つため)。
+        best = None              # 現時点の最良マッチ(スナップショットdict)
+        hit_sentinel = False     # 番兵エントリ(i[0]=='')に到達したか
+        first_match_exc = None   # 診断用: 走査中に最初に例外を出したパターン
 
         _DIR_SCALAR_FIELDS = ('endian', 'bts', 'padding', 'swordchars',
                               'vliwbits', 'vliwinstbits', 'vliwtemplatebits',
@@ -4210,8 +3623,6 @@ class Assembler:
         def _snap_dirstate():
             """ディレクティブが変更し得る状態のスナップショットを取る。"""
             snap = {f: getattr(self.state, f) for f in _DIR_SCALAR_FIELDS}
-            # コンテナはコピーする。symbols/check_constraints の値は
-            # 置換されるのみでin-place変更されないため浅いコピーで十分。
             snap['symbols'] = dict(self.state.symbols)
             snap['check_constraints'] = dict(self.state.check_constraints)
             snap['vliwnop'] = list(self.state.vliwnop)
@@ -4249,9 +3660,6 @@ class Assembler:
         for i in self.state.pat:
             pln += 1
             pl = i
-            # 高速化: 旧実装の `for a in LOWER: var_manager.put(a, VAR_UNDEF)` と
-            # 完全に等価（vars は A-Z の26要素リスト、VAR_UNDEF=int 0）。
-            # put() 26回呼び出しの文字列処理コストを排除する。
             self.state.vars = [VAR_UNDEF] * 26
             
             if i is None: continue
@@ -4272,20 +3680,11 @@ class Assembler:
             lin = StringUtils.reduce_spaces(lin)
             
             if i[0] == '':
-                # 番兵エントリ: パターン走査の終端。
-                # i[3] にはVLIWスロットインデックス式が入っているため、
-                # マッチが1つも無い場合はここで必ず評価する
-                # （評価せずに break すると idxs が初期値 0 のまま返り
-                #   VLIWスロット配置が狂う）。
-                # マッチ済み (best あり) の場合は採用パターンの i[3] を
-                # 生成ステージで評価するのでここでは評価しない。
                 hit_sentinel = True
                 if best is None:
                     idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                 break
             
-            # 事前フィルタ: パターン先頭のニーモニック部が入力と一致しなければ
-            # match0() を試行せずスキップする（結果は変わらない・高速化のみ）。
             _pfx = _lead_caps(i[0])
             if _pfx:
                 _k = 0
@@ -4300,7 +3699,7 @@ class Assembler:
                     if _k == len(_pfx):
                         break
                 if _k < len(_pfx):
-                    _ok = False  # 入力行が前置部分より短い
+                    _ok = False
                 if not _ok:
                     continue
 
@@ -4308,29 +3707,24 @@ class Assembler:
             
             self.state.expmode=EXP_ASM
 
-            # マッチ試行の副作用（キャプチャ変数・ELF追跡状態）を巻き戻せるよう保存。
             saved_vars = self.state.vars[:]
             saved_refs_len = len(self.state._elf_label_refs_seen)
             saved_v2l = dict(self.state._elf_var_to_label)
 
             try:
-                # パターンマッチ試行中はラベル未定義エラーの表示を抑制する。
-                # （例: OUT (!n),A が OUT (C),E を試みると !n キャプチャで
-                #   C がラベルとして評価され false-positive エラーが出る。）
                 self.state._in_match_attempt = True
                 _match_result = self.pattern_matcher.match0(lin, i[0])
             except (ArithmeticError, KeyError, IndexError, ValueError,
                     TypeError, AttributeError, OverflowError,
                     struct.error):
-                # 順序非依存化: マッチ試行中の例外は「このパターンは不成立」として
-                # 扱い、他のパターンの走査を妨げない。診断のため最初に例外を出した
-                # パターンだけ記録し、最終的に何もマッチしなかった場合に報告する。
-                # RecursionError など列挙外の例外は従来通り再 raise される。
+                # 順序非依存化の一環: マッチ試行中の例外は「このパターンは
+                # 不成立」として扱い、他パターンの走査を継続する。
+                # RecursionError等ここに列挙されない例外は再送出される。
                 _match_result = False
                 if first_match_exc is None:
                     first_match_exc = (pln, pl)
             finally:
-                self.state._in_match_attempt = False  # 例外時も確実にクリア
+                self.state._in_match_attempt = False
 
             if _match_result is True:
                 score = self.pattern_matcher.last_match_score
@@ -4339,38 +3733,30 @@ class Assembler:
                         'score': score,
                         'pln':   pln,
                         'pat':   i,
-                        # マッチで確定したキャプチャ変数と ELF 追跡状態
                         'vars':  self.state.vars[:],
                         'refs':  self.state._elf_label_refs_seen[saved_refs_len:],
                         'v2l':   dict(self.state._elf_var_to_label),
-                        # このパターン位置までのディレクティブ状態
                         'dir':   _snap_dirstate(),
                     }
-                # 副作用を巻き戻して走査を継続する
-                # （より具体的なパターンが後方にあるかもしれない）。
+                # 副作用を巻き戻して走査を続ける(より具体的なパターンが
+                # ファイル内の後方にあるかもしれないため)。
                 self.state.vars = saved_vars
                 del self.state._elf_label_refs_seen[saved_refs_len:]
                 self.state._elf_var_to_label = saved_v2l
 
-                # 最適化: リテラルのみのマッチ (式・シンボルキャプチャ 0) は
-                # これ以上具体的なパターンが存在し得ないため走査を打ち切る。
-                # （同一行にマッチするリテラルのみのパターン同士は
-                #   リテラル一致文字数も必ず等しいので、先出現優先も保たれる。）
-                # スコアタプルは (n_expr, -n_lit, n_sym) なので
-                # 式キャプチャ数は score[0]、シンボル数は score[2]。
+                # リテラル・シンボルキャプチャのみ(式キャプチャ0個)のマッチは
+                # これ以上具体的なパターンがあり得ないため走査を打ち切る高速化。
                 if score[0] == 0 and score[2] == 0:
                     break
 
             self.state.error_undefined_label = False
 
-        # ---- 採用パターンでのオブジェクト生成ステージ ----
         if best is not None:
             i = best['pat']
             pln = best['pln']
             pl = i
             loopflag = False
 
-            # マッチ成功時点の状態を復元する。
             _restore_dirstate(best['dir'])
             self.state.vars = best['vars'][:]
             self.state._elf_label_refs_seen.extend(best['refs'])
@@ -4378,12 +3764,9 @@ class Assembler:
             self.state.error_undefined_label = False
             self.state.expmode = EXP_ASM
 
-            # debug/非debug 共通パス。debug 時は except 内でトレースバックを追加出力する。
             try:
-                # $$/$. のために命令先頭・末尾アドレスを事前確定する。
-                # error条件式 i[1] でも $. を参照できるよう error() より前に実施。
                 self.state.pc_instr_start = self.state.pc
-                self.state.pc_instr_end   = self.state.pc_instr_start  # プローブ中の暫定値
+                self.state.pc_instr_end   = self.state.pc_instr_start
                 _probe_sm_saved    = self.state._pass1_size_mode
                 _probe_refs_len    = len(self.state._elf_label_refs_seen)
                 _probe_widx_saved  = self.state._elf_current_word_idx
@@ -4392,37 +3775,22 @@ class Assembler:
                     _probe_objl = self.obj_gen.makeobj(i[2])
                     self.state.pc_instr_end = self.state.pc_instr_start + len(_probe_objl)
                 except Exception:
-                    pass  # プローブ失敗時は暫定値(pc_instr_start)のまま
+                    pass
                 finally:
                     self.state._pass1_size_mode = _probe_sm_saved
                     del self.state._elf_label_refs_seen[_probe_refs_len:]
                     self.state._elf_current_word_idx = _probe_widx_saved
                     self.state.error_undefined_label = False
-                # Fix 10: error() の戻り値でエラー発生を検知し、
-                # エラー時はオブジェクト生成をスキップする。
-                # .check 拘束条件の検証（プローブ完了後・makeobj 前）
                 err_triggered, _err_code = self.directive_proc.error(i[1])
                 if not err_triggered:
-                    # pc_instr_start は上のプローブブロックで設定済み
                     objl = self.obj_gen.makeobj(i[2])
                 else:
                     objl = []
-                # makeobj() の finally が _elf_current_word_idx を -1 に
-                # リセット済み。以降のサイズ式 expression_pat(i[3]) で発生する
-                # ラベル参照は word_idx=-1 となりリロケーション対象外になる。
                 idxs, _ = self.expr_eval.expression_pat(i[3], 0)
             except (ArithmeticError, KeyError, IndexError, ValueError,
                     TypeError, AttributeError, OverflowError,
                     struct.error) as _exc:
-                # 修正④: forward参照で発生し得る算術・辞書・値域・型変換系の例外のみを
-                # 列挙して捕捉する。RecursionError など予期しない例外は再 raise して
-                # 呼び出しスタックを確認できるようにする。
-                # ただし Pass2 / インタラクティブで発生した場合は従来通り oerr 扱い。
                 if self.state.pas == 1:
-                    # Pass1: パターンはマッチしたが forward参照で makeobj が失敗した。
-                    # ラベルを 0 と仮定してサイズだけ確定させ、PC を正しく進める。
-                    # makeobj() の finally が _elf_current_word_idx を -1 にリセット
-                    # するため、ここで追加リセットは不要。
                     if self.state.debug:
                         import traceback as _tb
                         print(f" [pass1 forward-ref fallback] {type(_exc).__name__}: {_exc}", file=sys.stderr)
@@ -4434,19 +3802,15 @@ class Assembler:
                     except (ArithmeticError, KeyError, IndexError, ValueError,
                             TypeError, AttributeError, OverflowError,
                             struct.error):
-                        objl = []  # それでも失敗した場合はサイズ0のまま
+                        objl = []
                     finally:
                         self.state._pass1_size_mode = False
                         self.state.error_undefined_label = False
                 else:
                     oerr = True
         elif hit_sentinel:
-            # 番兵に到達し、かつ何もマッチしなかった。
-            # 従来通り構文エラーとはせず、番兵で評価した idxs を返す。
             loopflag = False
         elif first_match_exc is not None:
-            # 何もマッチせず、走査中に例外を出したパターンがあった場合は
-            # 従来同様パターン行を示すエラーとして報告する。
             pln, pl = first_match_exc
             oerr = True
             loopflag = False
@@ -4459,8 +3823,6 @@ class Assembler:
         if self.state.pas == 2 or self.state.pas == 0:
             _loc = f"  [{self.state.current_file}:{self.state.ln}]"
             if self.state.error_undefined_label:
-                # get_value() で個別ラベル名は既に表示済み。
-                # ここでは行レベルのサマリだけ出す。
                 print(f" error - Undefined label in expression.{_loc}", file=sys.stderr)
                 return 0, [], False, idx
             if se:
@@ -4473,61 +3835,36 @@ class Assembler:
         return idxs, objl, True, idx
     
     def lineassemble(self, line):
-        """Assemble single line"""
-        # Fix 6 (new): \r は lineassemble0 で除去されるが、.INCLUDE 経由など
-        # lineassemble() が直接呼ばれる経路では \r が残る場合がある。
-        # ここでも除去して入力を確実に正規化する。
+        """Assemble single line.
+
+        1行分の前処理をしてlineassemble2()を呼び、結果をVLIWパケットの
+        1スロットとしてvliw_proc.vliwprocess()へ渡すか、通常の単一命令として
+        バイナリへ書き出すかを振り分ける。前処理には: コメント除去、
+        ラベル定義の消費(label_processing)、"!!"区切りでのVLIWスロット数
+        (vcnt)の事前カウント、ELFリロケーション追跡の開始/終了が含まれる。
+        """
         line = line.replace('\t', ' ').replace('\n', '').replace('\r', '')
         line = StringUtils.reduce_spaces(line)
         line = StringUtils.remove_comment_asm(line)
         if line == '':
             return False
 
-        # アセンブリ行を1行処理するたびに .check 拘束条件を全解除する。
-        # パターンファイルの .check ディレクティブはパターン走査ループ
-        # (lineassemble2 内の `for i in self.state.pat`) の中で再登録される。
-        # 行ごとにここでクリアしておくことで、パターン走査が当該行のために
-        # 再登録した .check 拘束のみが有効になり、前行の走査で蓄積された
-        # 残留拘束が次行へ持ち越されない。
         self.state.check_constraints.clear()
 
-        # 修正4a: .EQU 式はパターンファイル由来のシンボル（レジスタ名など）を
-        # 参照できるべきだが、前行のパターンスキャンで蓄積された
-        # 位置依存 .setsym の残留値には依存すべきでない。
-        # そのため label_processing (= .EQU 評価) の前に symbols を
-        # patsymbols ベースラインにリセットしてから評価する。
         self.state.symbols = dict(self.state.patsymbols)
 
         line = self.asm_directive_proc.label_processing(line)
 
-        # 修正4b: 旧実装は clear_symbol([".clearsym","",...]) で symbols={} に
-        # 空クリアしていた。これでは patsymbols に定義されたシンボルまで
-        # 消えてしまい、lineassemble2 内のパターンスキャンが再構築する前の
-        # .setsym 参照が失敗する。
-        # 修正後: lineassemble2 の先頭でパターンスキャンが .setsym を
-        # 順次適用するため、ここでの明示的クリアは不要。
-        # patsymbols ベースラインは上記 4a で設定済み。
-        
-        # VLIW スロット数カウント: ソース行を '!!' で分割した「非空パート数」を vcnt とする。
-        # Bugfix (Fix L): .ASCII "hello!!world" のように文字列リテラル内に '!!' が含まれると
-        # vcnt が過大にカウントされ、VLIW パターンの !!! (vcnt 参照) が誤った値を返す。
-        # 修正: ダブルクォート文字列の外側にある '!!' だけを区切りとして分割し、
-        # 旧実装（split("!!") して非空要素を数える）と同じセマンティクスを保つ。
-        #
-        # Bugfix2 (Fix L 副作用): 前回の修正は '!!' カウント+1 方式だったため、
-        # 行末または行頭に '!!' がある場合に空パートが余分にカウントされ
-        # 旧実装より vcnt が1以上多くなっていた。
-        # 修正: 分割後の各パートが空でないもの（!= ''）を数えることで旧実装と一致させる。
-        #
-        # Bugfix3: シングルクォート文字リテラル '!!' 内の !! も誤カウントされていた。
-        # 修正: remove_comment_asm の Fix ⑦ と同様の先読みペア確認方式を採用する。
+        # "!!"(VLIWスロット区切り)で行を分割し、空でないスロット数を数える
+        # (!!!が参照するstate.vcntを、実際のマッチ前に確定させておく必要がある)。
+        # ダブルクォート文字列中や'a'のような文字リテラル中の"!!"は
+        # 区切りとして扱わない。
         _vparts = []
         _vpart_buf = []
         _in_dq_v = False
         _vi = 0
         while _vi < len(line):
             _vc = line[_vi]
-            # ダブルクォート内のバックスラッシュエスケープを消費
             if _vc == '\\' and _in_dq_v:
                 _vpart_buf.append(_vc)
                 if _vi + 1 < len(line):
@@ -4538,9 +3875,7 @@ class Assembler:
                 _in_dq_v = not _in_dq_v
                 _vpart_buf.append(_vc)
             elif _vc == "'" and not _in_dq_v:
-                # Fix 5 (DRY): 共通ヘルパーでシングルクォートリテラルを消費する。
                 _new_vi = StringUtils.skip_squote_literal(line, _vi)
-                # 消費した文字をバッファに記録（このパートが空でないことを保証するため）
                 _vpart_buf.extend(list(line[_vi:_new_vi]))
                 _vi = _new_vi
                 continue
@@ -4555,14 +3890,11 @@ class Assembler:
         _vparts.append(''.join(_vpart_buf))
         self.state.vcnt = sum(1 for _p in _vparts if _p != '')
 
-        # ELF リロケーション追跡: pass2 かつ ELF 出力時のみ有効
-        # 修正②: lineassemble2 が例外を投げても _elf_tracking が True のまま
-        # 残らないよう try/finally で確実にリセットする。
         if self.state.elf_objfile and self.state.pas == 2:
             self.state._elf_tracking = True
             self.state._elf_label_refs_seen = []
-            self.state._elf_current_word_idx = -1    # makeobj 外はセンチネル
-            self.state._elf_var_to_label = {}        # 命令ごとにリセット
+            self.state._elf_current_word_idx = -1
+            self.state._elf_var_to_label = {}
             self.state._elf_capturing_var = None
 
         try:
@@ -4575,9 +3907,6 @@ class Assembler:
 
         if not self.state.vliwflag or (idx >= len(line) or line[idx:idx+2] != '!!'):
             of = len(objl)
-            # ------------------------------------------------------------------ #
-            # ELF リロケーション検出（トラッキング方式）
-            # ------------------------------------------------------------------ #
             if self.state.elf_objfile and self.state.pas == 2 and objl and self.state._elf_label_refs_seen:
                 bpw_r = max(1, (self.state.bts + 7) // 8)
                 sec_name_r = self.state.current_section
@@ -4588,14 +3917,12 @@ class Assembler:
                 valid_refs = [(ln, aw, wi) for (ln, aw, wi) in self.state._elf_label_refs_seen if wi >= 0]
                 valid_refs.sort(key=lambda r: r[2])
 
-                # 複合式除外
                 _widx_labels = {}
                 for _ln, _, _wi in valid_refs:
                     _widx_labels.setdefault(_wi, set()).add(_ln)
                 _ambiguous = {_wi for _wi, ns in _widx_labels.items() if len(ns) > 1}
                 valid_refs = [r for r in valid_refs if r[2] not in _ambiguous]
 
-                # グループ化
                 groups = []
                 gi = 0
                 while gi < len(valid_refs):
@@ -4606,101 +3933,53 @@ class Assembler:
                     groups.append((lname, abs_w, widx, gj - gi))
                     gi = gj
 
-                # アーキテクチャ別デフォルトリロケーション型マップ
-                # キー: フィールドサイズ（バイト数） → ELF リロケーション型番号
-                # 4バイトはアーキテクチャごとの主流型を使用。
-                # 絶対参照が必要な場合は .extern label::abs32 等で明示する。
                 _em = self.state.elf_machine
                 if _em == 3:
-                    # EM_386 (i386)
-                    # R_386_32=1(ABS), R_386_PC32=2(PC相対), R_386_16=20, R_386_8=22
-                    _rmap = {4: 2, 2: 20, 1: 22}          # 4バイトはPC相対(CALL/JMP主流)
+                    _rmap = {4: 2, 2: 20, 1: 22}
                 elif _em == 20:
-                    # EM_PPC (PowerPC 32bit)
-                    # R_PPC_ADDR32=1, R_PPC_REL32=26, R_PPC_ADDR16=4, R_PPC_ADDR8=0(無し)
-                    _rmap = {4: 26, 2: 4}                  # 4バイトはPC相対
+                    _rmap = {4: 26, 2: 4}
                 elif _em == 40:
-                    # EM_ARM
-                    # R_ARM_ABS32=2, R_ARM_REL32=3, R_ARM_ABS16=4, R_ARM_ABS8=8
-                    _rmap = {4: 3, 2: 4, 1: 8}             # 4バイトはPC相対(ARM主流)
+                    _rmap = {4: 3, 2: 4, 1: 8}
                 elif _em == 183:
-                    # EM_AARCH64
-                    # R_AARCH64_ABS64=257, R_AARCH64_PREL32=261, R_AARCH64_ABS16=259
-                    # R_AARCH64_PREL64=260, R_AARCH64_PREL16=262
-                    _rmap = {8: 257, 4: 261, 2: 262}       # 8バイト=ABS64, 4/2バイト=PC相対
+                    _rmap = {8: 257, 4: 261, 2: 262}
                 elif _em == 243:
-                    # EM_RISCV
-                    # R_RISCV_64=2, R_RISCV_32=1, R_RISCV_ADD32=35, R_RISCV_ADD16=34, R_RISCV_ADD8=33
-                    _rmap = {8: 2, 4: 1, 2: 34, 1: 33}    # 基本的に絶対アドレス
+                    _rmap = {8: 2, 4: 1, 2: 34, 1: 33}
                 else:
-                    # EM_X86_64 (62) およびその他
-                    # R_X86_64_64=1(ABS64), R_X86_64_PC32=2(PC相対32), R_X86_64_16=12(ABS16), R_X86_64_8=14(ABS8)
-                    # 4バイト: PC32(2) を使用。x86-64 では 4バイトフィールドは
-                    # RIP相対(LEA/JMP/CALL 等)が主流で R_X86_64_32(10,絶対)は
-                    # ほぼ使われない。絶対参照が必要なら .extern label::abs32 で明示する。
-                    _rmap = {8: 1, 4: 2, 2: 12, 1: 14}    # x86_64 デフォルト (PC32)
+                    _rmap = {8: 1, 4: 2, 2: 12, 1: 14}
 
-                # PC相対リロケーション型の集合（アーキテクチャ別）
-                # addend = -num_bytes を適用するもの。絶対型は含めない。
-                #
-                # 【重要】アーキテクチャをまたいで単一セットにすると番号衝突が発生する。
-                # 例: R_X86_64_64=1(絶対) vs R_ARM_PC24=1(PC相対)
-                # → x86-64 で 1 が PC相対と誤判定され、MOVABS の 8バイトフィールドに
-                #   addend=-8 が設定されてしまう（実際に発生したバグ）。
-                # マシン番号ごとに PC相対型セットを定義することで衝突を防ぐ。
                 _em_r = self.state.elf_machine
-                if _em_r == 3:      # EM_386
-                    # R_386_PC32=2, R_386_PC16=13, R_386_PC8=23
+                if _em_r == 3:
                     _pc_rel_types_all = {2, 13, 23}
-                elif _em_r == 40:   # EM_ARM
-                    # R_ARM_PC24=1, R_ARM_REL32=3
-                    # ※ 1=R_ARM_PC24 は ARM 専用。x86-64 の 1(ABS64) と衝突するため分離必須。
+                elif _em_r == 40:
                     _pc_rel_types_all = {1, 3}
-                elif _em_r == 183:  # EM_AARCH64
-                    # R_AARCH64_PREL64=260, R_AARCH64_PREL32=261, R_AARCH64_PREL16=262
+                elif _em_r == 183:
                     _pc_rel_types_all = {260, 261, 262}
-                elif _em_r == 20:   # EM_PPC
-                    # R_PPC_REL24=10, R_PPC_REL32=26
+                elif _em_r == 20:
                     _pc_rel_types_all = {10, 26}
-                elif _em_r == 243:  # EM_RISCV
-                    # RISC-V は基本的に絶対アドレス型のみ
+                elif _em_r == 243:
                     _pc_rel_types_all = set()
-                else:               # EM_X86_64 (62) およびその他
-                    # R_X86_64_PC32=2, R_X86_64_PLT32=4,
-                    # R_X86_64_GOTPCREL=9, R_X86_64_PC16=13, R_X86_64_PC8=15,
-                    # R_X86_64_PC64=24
-                    # ※ 1=R_X86_64_64 は絶対型なので含めない
-                    # ※ 3=R_X86_64_GOT32 は「G + A」（GOT基底相対・絶対型）であり
-                    #   PC相対ではないため除外する。PC相対の GOT 参照は
-                    #   9=R_X86_64_GOTPCREL (G + GOT + A - P) を使うこと。
+                else:
                     _pc_rel_types_all = {2, 4, 9, 13, 15, 24}
 
                 for lname, abs_w, first_widx, num_words in groups:
                     num_bytes = num_words * bpw_r
 
-                    # === 最優先で .extern / .equ の reloc_type override を取得 ===
                     rtype = 0
                     lentry = self.state.labels.get(lname)
                     _is_imported = lentry and len(lentry) > 3 and lentry[3]
                     if lentry and len(lentry) > 4 and lentry[4] is not None:
                         rtype_override = lentry[4]
-                        # ローカルラベル（非インポート）の場合、reloc_type が要求する
-                        # フィールド幅と実際のフィールド幅が一致しなければそのリロケーションは
-                        # 無効（例: abs64 は 8 バイトフィールド専用なのに 4 バイトの CALL
-                        # フィールドへ適用すると隣接バイトを破壊する）。
-                        # 外部ラベル（is_imported=True）はリンカが補正するため常に適用する。
                         _rtype_field_bytes = {
-                            1: 8, 24: 8, 27: 8,          # abs64, pc64, got64
+                            1: 8, 24: 8, 27: 8,
                             10: 4, 11: 4, 2: 4, 4: 4,
-                            3: 4, 9: 4,                   # got32, gotpcrel
-                            12: 2, 13: 2,                  # abs16, pc16
-                            14: 1, 15: 1,                  # abs8, pc8
+                            3: 4, 9: 4,
+                            12: 2, 13: 2,
+                            14: 1, 15: 1,
                         }
                         expected = _rtype_field_bytes.get(rtype_override)
                         if _is_imported or expected is None or expected == num_bytes:
                             rtype = rtype_override
                         else:
-                            # フィールド幅不一致 → override を無視してデフォルトにフォールバック
                             rtype = _rmap.get(num_bytes, 0)
                     else:
                         rtype = _rmap.get(num_bytes, 0)
@@ -4710,7 +3989,6 @@ class Assembler:
 
                     sec_rel = (self.state.pc + first_widx - sec_start_w) * bpw_r
 
-                    # raw_val (addend計算用)
                     word_mask = (1 << self.state.bts) - 1
                     raw_val = 0
                     if self.state.endian == 'little':
@@ -4724,34 +4002,14 @@ class Assembler:
                             if widx_k < len(objl):
                                 raw_val = (raw_val << self.state.bts) | (int(objl[widx_k]) & word_mask)
 
-                    # UNDEFガード（B修正: 閾値判定を _is_undef_derived に一元化）
                     if (isinstance(abs_w, float) and not math.isfinite(abs_w)) or \
                        _is_undef_derived(abs_w):
                         continue
 
-                    # Bug1修正: raw_val をフィールド幅（num_bytes*8 bit）から符号拡張する。
-                    # 例: 0xFFFFFFFC は int32 で -4 だが Python int では 4294967292 になり
-                    # addend が PLT32/PC32 の許容範囲 [-2^31, 2^31-1] を大幅に超える。
                     _field_bits = num_bytes * 8
                     if 0 < _field_bits < 64 and raw_val >= (1 << (_field_bits - 1)):
                         raw_val -= (1 << _field_bits)
 
-                    # addend の計算:
-                    # ELF PC相対リロケーション (PC32/PLT32等) では、リンカが
-                    # フィールドに「S + A - P」を書き込む。実行時に CPU は
-                    # rip (= P + num_bytes) + field_value を計算するので、
-                    # target = rip + field = S + A - P + P + num_bytes = S + A + num_bytes。
-                    # target = S にしたいので A = -num_bytes = -4 (4バイトフィールドの場合)。
-                    #
-                    # これは pattern が *(s-$$-5,%%) でも *(s-$$,%%) でも同じ。
-                    # パターン内の補正値は pc_instr_start との差として raw_val に入るが、
-                    # addend にとっては関係なく常に -num_bytes。
-                    #
-                    # 絶対リロケーション (ABS64/ABS32 等) ではリンカが「S + A」を書き込む。
-                    # target = S + A = assembled_sym + offset なので A = raw_val - abs_w。
-                    # PC相対リロケーション型の集合。
-                    # 12=R_X86_64_16 と 14=R_X86_64_8 は「絶対」アドレスリロケーションなので
-                    # 含めない。PC相対の 16/8bit は 13=R_X86_64_PC16, 15=R_X86_64_PC8。
                     abs_w_bytes = int(abs_w) * bpw_r
 
                     if rtype in _pc_rel_types_all:
@@ -4766,14 +4024,6 @@ class Assembler:
 
                     self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend))
 
-            # ------------------------------------------------------------------ #
-            # DWARF .debug_line 用: 行→アドレス対応の記録                          #
-            # バイトを生成した行 (of > 0) について、行開始時の word-PC・現在の     #
-            # セクション・ファイル・行番号を line_map に追記する。VLIW 経路        #
-            # (下の else 節) は対象外（命令境界とバイト長の対応が単純でないため）。 #
-            # self.state.ln は lineassemble0() で本行アセンブル後に +1 されるので、 #
-            # ここでは「現在アセンブル中の行番号」を正しく指す。                    #
-            # ------------------------------------------------------------------ #
             if self.state.gen_debug and self.state.pas == 2 and of > 0:
                 self.state.line_map.append(
                     (self.state.current_section, self.state.pc,
@@ -4795,13 +4045,6 @@ class Assembler:
     
     def lineassemble0(self, line):
         """Assemble line with output"""
-        # Fix 10: state.cl は pass2/対話モードのデバッグ表示にのみ使う。
-        # pass1 でも更新していたため、pass1 の最後の行が state.cl に残り、
-        # 複数回 run() したときに前回の pass1 値が混入する可能性があった。
-        # pass2 または対話モードのときだけ更新する。
-        #
-        # -v オプション対応: ファイルアセンブル時 (pas==2) はリスト出力を
-        # verbose フラグで制御する。対話モード (pas==0) は常に出力する。
         cleaned = line.replace('\n', '').replace('\r', '')
         _show = (self.state.pas == 2 and self.state.verbose) or self.state.pas == 0
         if _show:
@@ -4817,36 +4060,26 @@ class Assembler:
     def setpatsymbols(self, pat):
         """Set pattern symbols.
 
-        Fix 8: 旧実装は state.symbols を破壊的に更新してから
-        patsymbols.update(symbols) していたため、パターンファイル内に
-        '.setsym A 1' → '.clearsym'（全消去）という順序で書かれていると
-        最終的に patsymbols が空になる問題があった。
-        さらに、.clearsym の「全消去」が patsymbols を巻き込む前に
-        update() が起きるかどうかは出現順次第だった。
-
-        修正: 空の辞書から始めてパターンエントリを順に適用し、
-        最後に patsymbols へ代入することで出現順に正しく反映する。
-        state.symbols はアセンブリ中の一時状態なので最後に patsymbols と同期する。
+        パターンファイル中の.setsym/.clearsymを出現順に空の辞書へ適用して
+        state.patsymbolsを確定する(ソースファイル側で.setsym/.clearsymが
+        現れるとstate.symbolsは一時的に変化するが、次の行の先頭で必ず
+        patsymbolsから復元されるので、パターンファイル由来のシンボルだけが
+        永続する)。
         """
         fresh = {}
         for i in pat:
             if i is None:
                 continue
-            # .setsym
             if len(i) > 0 and i[0] == '.setsym':
                 if len(i) >= 2:
                     key = StringUtils.upper(i[1])
                     if len(i) > 2:
-                        # Fix 7: expression_pat は state.symbols を参照してシンボルを解決する。
-                        # fresh への書き込み途中の状態を反映させるために、評価前に
-                        # state.symbols を現時点の fresh に同期してから式を評価する。
                         self.state.symbols = dict(fresh)
                         v, _ = self.expr_eval.expression_pat(i[2], 0)
                     else:
                         v = 0
                     fresh[key] = v
                 continue
-            # .clearsym
             if len(i) > 0 and i[0] == '.clearsym':
                 if len(i) >= 3 and i[2] != '':
                     key = StringUtils.upper(i[2])
@@ -4860,28 +4093,14 @@ class Assembler:
     def fileassemble(self, fn):
         """Assemble file.
 
-        Fix ⑧: 旧実装では `fn == "stdin"` という判定の意味と到達経路が
-        コード上不明瞭だった。明示的に文書化する。
-
-        到達経路:
-          - run() のインタラクティブモード (sourcefile is None) では
-            fileassemble() を呼ばない。stdin 入力は lineassemble0() で直接処理。
-          - run() のファイルモードでは args.sourcefile を渡す。
-          - ソース内の .INCLUDE "stdin" ディレクティブが include_asm() 経由で
-            "stdin" という文字列リテラルを渡してくる場合に `fn == "stdin"` が True になる。
-          - その際は stdin 全体を一時ファイルに書き出してから読み直す。
-            リラクゼーション2回目以降は同じ一時ファイルを再利用する。
-
-        stdin_tmp_path は run() の cleanup で削除される。インタラクティブモードでは
-        このパスは None のままであり、cleanup コードは None チェックで安全に動作する。
+        fn == "stdin" になるのは、ソース内で .INCLUDE "stdin" と書かれ、
+        include_asm() 経由でこの文字列リテラルがそのまま渡ってきた場合のみ
+        (run() のインタラクティブモードではfileassemble()自体を呼ばず、
+        stdin入力はlineassemble0()で直接処理する)。この場合はstdin全体を
+        一時ファイル(stdin_tmp_path、run()終了時に削除)に書き出してから
+        読み直し、リラクゼーション2回目以降は同じ一時ファイルを再利用する。
         """
-        # Fix ③: 循環インクルード検出。
-        # fnstack には現在開いているファイルのパスが積まれている。
-        # 同じ絶対パスが既にスタックに存在する場合は循環と判断してエラーを出す。
-        # 比較は絶対パスで行い、相対パス表記の違いによる見落としを防ぐ。
 
-        # Fix: 非循環でも深いネストは Python の再帰限界でクラッシュする。
-        # 現実的な上限 (100段) を設けてエラーを出す。
         _MAX_INCLUDE_DEPTH = 100
         if len(self.state.fnstack) >= _MAX_INCLUDE_DEPTH:
             print(f" error - .INCLUDE nesting depth exceeds {_MAX_INCLUDE_DEPTH}: '{fn}'", file=sys.stderr)
@@ -4899,8 +4118,6 @@ class Assembler:
                 print(f" error - circular .INCLUDE detected: '{fn}' is already being assembled.", file=sys.stderr)
                 return
 
-        # fnstack と lnstack を必ずペアで push してから try に入る。
-        # これにより finally での pop が常に対称になる。
         self.state.fnstack.append(self.state.current_file)
         self.state.lnstack.append(self.state.ln)
         self.state.current_file = fn
@@ -4908,14 +4125,7 @@ class Assembler:
 
         try:
             if fn == "stdin":
-                # Pass 1 (pas==1): read stdin and write to a per-instance temp file.
-                # Pass 2 (pas==2) and relaxation iterations: re-use the same temp file.
-                # Using tempfile instead of the fixed name "axx.tmp" prevents races
-                # when multiple axx instances run concurrently.
                 if self.state.stdin_tmp_path is None:
-                    # 初回のみ: 一時ファイルを作成し stdin を読み込む。
-                    # リラクゼーション2回目以降は stdin が EOF なので読み直さない。
-                    # pas == 1 の条件で毎回読んでいた旧実装のバグを修正。
                     fd, tmp_path = tempfile.mkstemp(prefix="axx_", suffix=".tmp", text=True)
                     os.close(fd)
                     self.state.stdin_tmp_path = tmp_path
@@ -4930,7 +4140,6 @@ class Assembler:
             for i in af:
                 self.lineassemble0(i)
         finally:
-            # push は try の前で必ず成功しているので、無条件で pop する。
             self.state.current_file = self.state.fnstack.pop()
             self.state.ln = self.state.lnstack.pop()
     
@@ -4940,9 +4149,8 @@ class Assembler:
         af = ""
         while True:
             line = sys.stdin.readline()
-            if line == '':   # EOF: readline() returns '' only at EOF
+            if line == '':
                 break
-            # Normalize line endings but keep the newline so line numbers match
             af += line.replace('\r', '')
         return af
     
@@ -4950,16 +4158,13 @@ class Assembler:
         """Import label from exported TSV format (produced by _write_export).
 
         Line formats (tab-separated):
-          section_name  start_hex  size_hex  [flag]   <- section line (≥3 fields, skip)
-          label_name    value_hex                     <- label line (2 fields, import)
+          section_name  start_hex  size_hex  [flag]   <- section line (≥3 fields)
+          label_name    value_hex                     <- label line (2 fields)
 
-        旧実装は "section label value" の空白区切り3トークンを仮定していたが、
-        _write_export が出力するのはタブ区切り TSV であり、フォーマットが
-        根本的に食い違っていた。さらに skipspc() はタブをスキップしないため
-        タブ区切りの先頭フィールド解析も常に失敗していた。
-        修正後は str.split('\\t') で TSV を正しく分割し、フィールド数で行種別を
-        判定する。セクション行は self._imp_sections に記録し、後続のラベル行が
-        セクション名を逆引きできるようにする。
+        フィールド数で行種別を判定する。セクション行はself._imp_sectionsに
+        記録し、後続のラベル行がアドレス値からセクション名を逆引きできる
+        ようにする(呼び出し元のrun()はセクション行を先に全て読み込んでから
+        ラベル行を処理する2パス方式で、この逆引き表を確実に完成させる)。
         """
         l = l.rstrip('\r\n')
         if not l:
@@ -4968,7 +4173,6 @@ class Assembler:
         fields = l.split('\t')
 
         if len(fields) >= 3:
-            # Section line: record for later label→section mapping.
             sname = fields[0]
             try:
                 start = int(fields[1], 16)
@@ -4986,7 +4190,6 @@ class Assembler:
                 v = int(fields[1], 16)
             except ValueError:
                 return False
-            # Determine section by range lookup in previously parsed section table.
             section = '.text'
             for sname, (start, size) in self._imp_sections.items():
                 if size > 0 and start <= v < start + size:
@@ -4995,15 +4198,7 @@ class Assembler:
                 if size == 0 and v == start:
                     section = sname
                     break
-            # Fix 7: put_value() は pas 状態に応じて二重定義チェックや
-            # 「pass1未定義」エラーを出す。インポートラベルは pas に
-            # 関係なく直接 labels に書き込む（上書き可）。
-            # Fix 13: is_imported=True を第4フィールドとして記録し、
-            # write_elf_obj() がこれを外部シンボル参照（UND）として扱えるようにする。
-            # Bugfix: is_equ は False が正しい。インポートラベルはアドレスラベルであり、
-            # 定数ラベル（.equ）ではない。True にすると _write_export() でバイト変換が
-            # スキップされ、ELF 出力でも SHN_ABS 扱いになって誤ったシンボルになる。
-            self.state.labels[label] = [v, section, False, True]  # [val, sec, is_equ, is_imported]
+            self.state.labels[label] = [v, section, False, True]
             return True
 
         return False
@@ -5047,16 +4242,13 @@ class Assembler:
         import struct as _struct
         _pk = '<' if self.state.endian != 'big' else '>'
 
-        # --- 64-bit absolute relocation type per architecture --------------- #
-        # 8-byte DWARF address fields → R_<arch>_64-equivalent (S + A).
         _abs64_map = {
-            62:  1,    # EM_X86_64  → R_X86_64_64
-            183: 257,  # EM_AARCH64 → R_AARCH64_ABS64
-            243: 2,    # EM_RISCV   → R_RISCV_64
+            62:  1,
+            183: 257,
+            243: 2,
         }
-        abs64 = _abs64_map.get(machine, 1)  # default to R_X86_64_64 semantics
+        abs64 = _abs64_map.get(machine, 1)
 
-        # ---- LEB128 encoders ---------------------------------------------- #
         def _uleb(v):
             out = bytearray()
             v = int(v)
@@ -5080,8 +4272,6 @@ class Assembler:
                     return bytes(out)
                 out.append(b | 0x80)
 
-        # ---- content-section lookup helpers -------------------------------- #
-        # name → csec, and a byte-address → (1-based content idx, in-sec offset)
         csec_by_name = {s.name: s for s in csecs}
 
         def _addr_to_sec(byte_addr):
@@ -5094,24 +4284,16 @@ class Assembler:
                     return i + 1, 0
             return None, 0
 
-        # ================================================================== #
-        # .debug_abbrev                                                       #
-        # ================================================================== #
-        # abbrev 1: DW_TAG_compile_unit (children)                            #
-        # abbrev 2: DW_TAG_label        (no children)                         #
         DW_TAG_compile_unit = 0x11
         DW_TAG_label        = 0x0a
         DW_CHILDREN_yes, DW_CHILDREN_no = 1, 0
-        # attributes
         DW_AT_name, DW_AT_low_pc, DW_AT_high_pc = 0x03, 0x11, 0x12
         DW_AT_language, DW_AT_comp_dir = 0x13, 0x1b
         DW_AT_producer, DW_AT_stmt_list = 0x25, 0x10
-        # forms
         DW_FORM_addr, DW_FORM_data2, DW_FORM_data8 = 0x01, 0x05, 0x07
         DW_FORM_string, DW_FORM_sec_offset = 0x08, 0x17
 
         abbrev = bytearray()
-        # abbrev 1
         abbrev += _uleb(1) + _uleb(DW_TAG_compile_unit) + bytes([DW_CHILDREN_yes])
         for at, fm in ((DW_AT_producer, DW_FORM_string),
                        (DW_AT_language, DW_FORM_data2),
@@ -5122,23 +4304,17 @@ class Assembler:
                        (DW_AT_stmt_list, DW_FORM_sec_offset)):
             abbrev += _uleb(at) + _uleb(fm)
         abbrev += _uleb(0) + _uleb(0)
-        # abbrev 2
         abbrev += _uleb(2) + _uleb(DW_TAG_label) + bytes([DW_CHILDREN_no])
         for at, fm in ((DW_AT_name, DW_FORM_string),
                        (DW_AT_low_pc, DW_FORM_addr)):
             abbrev += _uleb(at) + _uleb(fm)
         abbrev += _uleb(0) + _uleb(0)
-        # end of abbrev table
         abbrev += _uleb(0)
         abbrev = bytes(abbrev)
 
-        # ================================================================== #
-        # Primary code section (for CU low_pc/high_pc) = section of 1st row   #
-        # ================================================================== #
         primary_sec = line_map[0][0]
         primary_idx = sec_name_to_idx.get(primary_sec)
         if primary_idx is None:
-            # Fallback: first content section.
             primary_idx = 1 if csecs else None
         primary_csec = csecs[primary_idx - 1] if primary_idx else None
         primary_size = primary_csec.byte_size if primary_csec else 0
@@ -5147,33 +4323,25 @@ class Assembler:
         comp_dir = os.getcwd()
         cu_name = line_map[0][2] or "(source)"
 
-        # ================================================================== #
-        # .debug_info                                                        #
-        # ================================================================== #
-        info_relas = []   # (offset_in_debug_info, sym_idx, rtype, addend)
+        info_relas = []
         die = bytearray()
-        # --- CU DIE (abbrev 1) ---
         die += _uleb(1)
         die += producer.encode() + b'\x00'
-        die += _struct.pack(f'{_pk}H', 0x8001)   # DW_LANG_Mips_Assembler
+        die += _struct.pack(f'{_pk}H', 0x8001)
         die += cu_name.encode() + b'\x00'
         die += comp_dir.encode() + b'\x00'
-        # low_pc (addr, reloc against primary section symbol, addend 0)
         if primary_idx:
             info_relas.append((len(die), primary_idx, abs64, 0))
         die += b'\x00' * 8
-        # high_pc (data8 = size of primary section; constant, no reloc)
         die += _struct.pack(f'{_pk}Q', primary_size & 0xFFFFFFFFFFFFFFFF)
-        # stmt_list (sec_offset = 0 → start of the single CU's line program)
         die += _struct.pack(f'{_pk}I', 0)
-        # --- label DIEs (abbrev 2) ---
         for name, *_rest in sorted(self.state.labels.items()):
             entry = _rest[0]
             val = entry[0]
             is_equ = len(entry) > 2 and entry[2]
             is_imported = len(entry) > 3 and entry[3]
             if is_equ or is_imported:
-                continue   # constants and external refs are not address labels
+                continue
             try:
                 byte_addr = int(val) * bpw
             except (TypeError, ValueError, OverflowError):
@@ -5185,48 +4353,37 @@ class Assembler:
             die += name.encode() + b'\x00'
             info_relas.append((len(die), sidx, abs64, off))
             die += b'\x00' * 8
-        # terminate CU children
         die += _uleb(0)
 
-        # CU header: unit_length(4) version(2) abbrev_off(4) addr_size(1) + die
-        info_body = (_struct.pack(f'{_pk}H', 4)           # version
-                     + _struct.pack(f'{_pk}I', 0)          # debug_abbrev_offset (single CU)
-                     + bytes([8])                          # address_size
+        info_body = (_struct.pack(f'{_pk}H', 4)
+                     + _struct.pack(f'{_pk}I', 0)
+                     + bytes([8])
                      + bytes(die))
         debug_info = _struct.pack(f'{_pk}I', len(info_body)) + info_body
-        # The CU header occupies 4 bytes before info_body; low_pc/label reloc
-        # offsets recorded above were relative to `die`, so shift them by the
-        # header prefix length (4 + len(version+abbrev_off+addr_size) = 4+7).
         _info_prefix = 4 + 2 + 4 + 1
         info_relas = [(_info_prefix + o, s, t, a) for (o, s, t, a) in info_relas]
 
-        # ================================================================== #
-        # .debug_line  (DWARF v4)                                            #
-        # ================================================================== #
-        # File-name table (1-based indices).
         files = []
         file_idx = {}
         for (_sec, _wpc, fn, _ln) in line_map:
             fn = fn or "(source)"
             if fn not in file_idx:
                 files.append(fn)
-                file_idx[fn] = len(files)   # 1-based
+                file_idx[fn] = len(files)
 
-        # Line-program header body (everything counted by header_length).
         hbody = bytearray()
-        hbody += bytes([1])                       # minimum_instruction_length
-        hbody += bytes([1])                       # maximum_operations_per_instruction (v4)
-        hbody += bytes([1])                       # default_is_stmt
-        hbody += _struct.pack('b', -5)            # line_base (signed)
-        hbody += bytes([14])                      # line_range
-        hbody += bytes([13])                      # opcode_base
-        hbody += bytes([0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1])  # std_opcode_lengths[1..12]
-        hbody += b'\x00'                          # include_directories: (none) + terminator
-        for fn in files:                          # file_names
+        hbody += bytes([1])
+        hbody += bytes([1])
+        hbody += bytes([1])
+        hbody += _struct.pack('b', -5)
+        hbody += bytes([14])
+        hbody += bytes([13])
+        hbody += bytes([0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1])
+        hbody += b'\x00'
+        for fn in files:
             hbody += fn.encode() + b'\x00' + _uleb(0) + _uleb(0) + _uleb(0)
-        hbody += b'\x00'                          # end of file_names
+        hbody += b'\x00'
 
-        # Group rows by content section, sorted by address.
         from collections import defaultdict as _dd
         rows_by_sec = _dd(list)
         for (sec, wpc, fn, ln) in line_map:
@@ -5235,10 +4392,8 @@ class Assembler:
                 continue
             rows_by_sec[sidx].append((wpc, file_idx.get(fn or "(source)", 1), ln))
 
-        line_relas = []   # (offset_in_debug_line, sym_idx, rtype, addend)
+        line_relas = []
         prog = bytearray()
-        # Program byte offset within the whole .debug_line section:
-        #   unit_length(4) + version(2) + header_length(4) + len(hbody)
         prog_base = 4 + 2 + 4 + len(hbody)
 
         for sidx in sorted(rows_by_sec.keys()):
@@ -5246,8 +4401,7 @@ class Assembler:
             csec = csecs[sidx - 1]
             w0 = csec.byte_start // bpw if bpw else 0
             first_off = (rows[0][0] - w0) * bpw
-            # DW_LNE_set_address (extended opcode)
-            prog += b'\x00' + _uleb(1 + 8) + b'\x02'   # len = subop + 8-byte addr
+            prog += b'\x00' + _uleb(1 + 8) + b'\x02'
             line_relas.append((prog_base + len(prog), sidx, abs64, first_off))
             prog += b'\x00' * 8
             cur_off = first_off
@@ -5256,30 +4410,26 @@ class Assembler:
             for (wpc, fidx, ln) in rows:
                 byte_off = (wpc - w0) * bpw
                 if fidx != cur_file:
-                    prog += bytes([4]) + _uleb(fidx)   # DW_LNS_set_file
+                    prog += bytes([4]) + _uleb(fidx)
                     cur_file = fidx
                 if ln != cur_line:
-                    prog += bytes([3]) + _sleb(ln - cur_line)  # DW_LNS_advance_line
+                    prog += bytes([3]) + _sleb(ln - cur_line)
                     cur_line = ln
                 if byte_off > cur_off:
-                    prog += bytes([2]) + _uleb(byte_off - cur_off)  # DW_LNS_advance_pc
+                    prog += bytes([2]) + _uleb(byte_off - cur_off)
                     cur_off = byte_off
-                prog += bytes([1])                     # DW_LNS_copy (append row)
-            # advance to section end, then end the sequence
+                prog += bytes([1])
             end_off = csec.byte_size
             if end_off > cur_off:
                 prog += bytes([2]) + _uleb(end_off - cur_off)
-            prog += b'\x00' + _uleb(1) + b'\x01'       # DW_LNE_end_sequence
+            prog += b'\x00' + _uleb(1) + b'\x01'
 
-        line_body = (_struct.pack(f'{_pk}H', 4)            # version
-                     + _struct.pack(f'{_pk}I', len(hbody)) # header_length
+        line_body = (_struct.pack(f'{_pk}H', 4)
+                     + _struct.pack(f'{_pk}I', len(hbody))
                      + bytes(hbody)
                      + bytes(prog))
         debug_line = _struct.pack(f'{_pk}I', len(line_body)) + line_body
 
-        # ================================================================== #
-        # Pack relocation section payloads (Elf64_Rela: 8+8+8)                #
-        # ================================================================== #
         def _pack_relas(entries):
             out = bytearray()
             _S64_MAX, _S64_MIN = (1 << 63) - 1, -(1 << 63)
@@ -5327,32 +4477,26 @@ class Assembler:
         import struct as _struct
 
         bpw = max(1, (self.state.bts + 7) // 8)
-        buf = self.binary_writer._buffer   # {word_pos: word_val}
+        buf = self.binary_writer._buffer
 
-        # ------------------------------------------------------------------ #
-        # Helper: pack ELF structures                                          #
-        # エンディアンは state.endian から決定する。                           #
-        #   little → EI_DATA=1 (ELFDATA2LSB), struct prefix '<'              #
-        #   big    → EI_DATA=2 (ELFDATA2MSB), struct prefix '>'              #
-        # ------------------------------------------------------------------ #
         _is_le    = (self.state.endian != 'big')
-        _ei_data  = 1 if _is_le else 2          # EI_DATA byte in e_ident
-        _pk       = '<' if _is_le else '>'      # struct.pack prefix
+        _ei_data  = 1 if _is_le else 2
+        _pk       = '<' if _is_le else '>'
 
         def _pack_ehdr(e_type, e_machine, e_shoff, e_shnum, e_shstrndx):
             ident = (b'\x7fELF'
-                     + bytes([2, _ei_data, 1, self.state.osabi])  # class64, EI_DATA, ver1, ELFOSABI
+                     + bytes([2, _ei_data, 1, self.state.osabi])
                      + b'\x00' * 8)
             return ident + _struct.pack(f'{_pk}HHIQQQIHHHHHH',
                 e_type, e_machine,
-                1,       # e_version
-                0,       # e_entry
-                0,       # e_phoff
+                1,
+                0,
+                0,
                 e_shoff,
-                0,       # e_flags
-                64,      # e_ehsize
-                0, 0,    # phentsize, phnum
-                64,      # e_shentsize
+                0,
+                64,
+                0, 0,
+                64,
                 e_shnum,
                 e_shstrndx)
 
@@ -5369,16 +4513,11 @@ class Assembler:
         def _align_up(x, a):
             return (x + a - 1) & ~(a - 1)
 
-        # ------------------------------------------------------------------ #
-        # 1. Collect content sections                                          #
-        # ------------------------------------------------------------------ #
         def _extract(w_start, w_count):
             """Return bytes for word range [w_start, w_start+w_count)."""
             n = w_count * bpw
             if n == 0:
                 return b''
-            # Fix K/P: flush() と同じ高速方式で padding を初期化する。
-            # 旧実装は Python ループだったが bytes*N の方が大幅に速い。
             pad = int(self.state.padding) & ((1 << self.state.bts) - 1)
             if pad:
                 tmp = pad
@@ -5417,15 +4556,11 @@ class Assembler:
         max_w = max(buf.keys(), default=-1)
 
         if not self.state.sections:
-            # No SECTION directives → everything into .text
             w_count = max_w + 1 if max_w >= 0 else 0
             csecs.append(_CSec('.text', 0, _extract(0, w_count), 0x2 | 0x4))
         else:
             sec_names = list(self.state.sections.keys())
             for i, sname in enumerate(sec_names):
-                # Bugfix: sections entry は [word_start, word_count, entry_pc, confirmed(opt)]
-                # の3〜4要素リストなので、2変数へのアンパックは ValueError になる。
-                # インデックス参照に変更する。
                 w0 = self.state.sections[sname][0]
                 wn = self.state.sections[sname][1]
                 if wn == 0:
@@ -5446,31 +4581,18 @@ class Assembler:
 
         ncs = len(csecs)
 
-        # ------------------------------------------------------------------ #
-        # 2. Collect relocations per content section                           #
-        # ------------------------------------------------------------------ #
-        # Build section-name → section-index (1-based) map
         sec_name_to_idx = {s.name: i + 1 for i, s in enumerate(csecs)}
 
-        # Group relocations: {content_sec_index(1-based): [(offset, sym_name, type, addend)]}
         from collections import defaultdict as _defaultdict
-        rela_entries = _defaultdict(list)   # sec_idx → list of (off, sym_name, rtype, addend)
+        rela_entries = _defaultdict(list)
         for (sname, off, sym_name, rtype, addend) in self.state.relocations:
             sidx = sec_name_to_idx.get(sname, 0)
             if sidx:
                 rela_entries[sidx].append((off, sym_name, rtype, addend))
 
-        # Content sections that have at least one relocation → need .rela.X section
         rela_sec_order = [i + 1 for i, s in enumerate(csecs) if (i + 1) in rela_entries]
         nrela = len(rela_sec_order)
 
-        # ------------------------------------------------------------------ #
-        # DWARF デバッグセクションを構築する (-g 指定時のみ非空)。            #
-        # これらは既存セクション (.shstrtab まで) の「後ろ」に追加するため、 #
-        # e_shstrndx / .symtab / .strtab のセクションインデックスは不変。     #
-        #   dbg_prog : [(name, data)]            … SHT_PROGBITS               #
-        #   dbg_rela : [(rela_name, target_name, data)] … SHT_RELA           #
-        # ------------------------------------------------------------------ #
         dbg_prog, dbg_rela = self._build_dwarf_sections(
             csecs, sec_name_to_idx, bpw, machine)
 
@@ -5479,7 +4601,6 @@ class Assembler:
         for s in csecs:
             sec_name_offs.append(len(shstrtab))
             shstrtab += s.name.encode() + b'\x00'
-        # .rela.X セクション名を追加
         rela_name_offs = []
         for sidx in rela_sec_order:
             rela_name_offs.append(len(shstrtab))
@@ -5487,7 +4608,6 @@ class Assembler:
         symtab_name_off   = len(shstrtab); shstrtab += b'.symtab\x00'
         strtab_name_off   = len(shstrtab); shstrtab += b'.strtab\x00'
         shstrtab_name_off = len(shstrtab); shstrtab += b'.shstrtab\x00'
-        # DWARF デバッグセクション名（PROGBITS → RELA の順）
         dbg_prog_name_offs = []
         for (dname, _ddata) in dbg_prog:
             dbg_prog_name_offs.append(len(shstrtab))
@@ -5499,9 +4619,6 @@ class Assembler:
         shstrtab = bytes(shstrtab)
 
 
-        # ------------------------------------------------------------------ #
-        # 3. Build symbol table (.symtab) and string table (.strtab)          #
-        # ------------------------------------------------------------------ #
         def _find_shndx(byte_addr):
             """Return (elf_section_1based, value_within_section).
 
@@ -5511,17 +4628,12 @@ class Assembler:
             また byte_size == 0 のセクションが複数あるケースでも
             byte_addr == byte_start の最初の一致を返す。
             """
-            # まず通常の範囲チェック（byte_size > 0 のセクションを優先）
             for i, s in enumerate(csecs):
                 if s.byte_size > 0 and s.byte_start <= byte_addr < s.byte_start + s.byte_size:
                     return i + 1, byte_addr - s.byte_start
-            # サイズ 0 セクションの先頭一致
             for i, s in enumerate(csecs):
                 if s.byte_size == 0 and byte_addr == s.byte_start:
                     return i + 1, 0
-            # Fix 7: 範囲外の場合、最もアドレスが近い（かつ byte_addr 以下の）
-            # セクションに帰属させる。これにより byte_addr==0 でも先頭セクションに
-            # 正しく帰属し、SHN_ABS への誤フォールバックを防ぐ。
             if csecs:
                 best_i = 0
                 best_start = csecs[0].byte_start
@@ -5529,61 +4641,40 @@ class Assembler:
                     if s.byte_start <= byte_addr and s.byte_start >= best_start:
                         best_i = i
                         best_start = s.byte_start
-                # Bugfix: byte_addr が全セクションの開始アドレスより小さいとき、
-                # ループ内の条件 s.byte_start <= byte_addr が一度も成立せず
-                # best_i=0, best_start=csecs[0].byte_start のまま残る。
-                # この場合 byte_addr - csecs[best_i].byte_start が負になり、
-                # _pack_sym の struct.pack('Q', negative) で struct.error が発生する。
-                # 修正: sym_val は 0 以上を保証する。負になる場合は先頭セクションの
-                # 先頭（オフセット 0）に帰属させる（アドレス解決は最善努力）。
                 sym_val = byte_addr - csecs[best_i].byte_start
                 if sym_val < 0:
                     sym_val = 0
                 return best_i + 1, sym_val
-            return 0xfff1, byte_addr   # SHN_ABS（セクションが一切ない場合のみ）
+            return 0xfff1, byte_addr
 
         strtab = bytearray(b'\x00')
         syms   = []
 
-        # null symbol
         syms.append(_pack_sym(0, 0, 0, 0, 0, 0))
 
-        # section symbols (STB_LOCAL | STT_SECTION = 0x03)
         for i in range(ncs):
             syms.append(_pack_sym(0, 0x03, 0, i + 1, 0, 0))
 
-        # Fix 13: ELF規格では STB_LOCAL シンボルは全て STB_GLOBAL より先でなければ
-        # ならない（symtab の sh_info = first_global_index）。
-        # インポートラベル（is_imported=True）は STB_GLOBAL なので、
-        # ローカル→インポート→エクスポートの順で出力する。
         export_keys = set(self.state.export_labels.keys())
 
-        # ── (1) ローカルシンボル（STB_LOCAL=0x00）────────────────────
         for name, *_lentry in sorted(self.state.labels.items()):
             val         = _lentry[0][0]
             is_equ      = len(_lentry[0]) > 2 and _lentry[0][2]
             is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
             if name in export_keys or is_imported:
                 continue
-            # .equ $$::reloctype のように reloc_type 付きの場合はアドレスラベルと同様に
-            # セクション相対シンボルとして出力する（SHN_ABS にしない）。
             _equ_has_reloc = is_equ and len(_lentry[0]) > 4 and _lentry[0][4] is not None
             if is_equ and not _equ_has_reloc:
                 shndx, sym_val = 0xfff1, val
             else:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr)
-            # struct.pack('Q') は [0, 2^64-1] のみ受け付ける。
-            # val が負値や 2^64 超の Python int になり得るため uint64 にマスクする。
             sym_val = int(sym_val) & 0xFFFFFFFFFFFFFFFF
             name_off = len(strtab); strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x00, 0, shndx, sym_val, 0))
 
-        # ── first_global マーク ───────────────────────────────────────
         first_global = len(syms)
 
-        # ── (2) インポートシンボル（STB_GLOBAL=0x10, SHN_UNDEF=0）────
-        # -i でインポートした外部ラベル。リンカが外部参照として解決する。
         for name, *_lentry in sorted(self.state.labels.items()):
             is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
             if not is_imported or name in export_keys:
@@ -5591,13 +4682,11 @@ class Assembler:
             name_off = len(strtab); strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x10, 0, 0, 0, 0))
 
-        # ── (3) エクスポートシンボル（STB_GLOBAL=0x10）───────────────
         for name, *_eentry in sorted(self.state.export_labels.items()):
             val, _sec = _eentry[0][0], _eentry[0][1]
             if _is_undef_derived(val):
                 continue
             is_equ = len(_eentry[0]) > 2 and _eentry[0][2]
-            # labels から reloc_type を取得（export_labels には保存されていない）
             _lbl = self.state.labels.get(name, [])
             _equ_has_reloc = is_equ and len(_lbl) > 4 and _lbl[4] is not None
             if is_equ and not _equ_has_reloc:
@@ -5605,7 +4694,6 @@ class Assembler:
             else:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr)
-            # struct.pack('Q') は [0, 2^64-1] のみ受け付ける。uint64 にマスクする。
             sym_val = int(sym_val) & 0xFFFFFFFFFFFFFFFF
             name_off = len(strtab); strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x10, 0, shndx, sym_val, 0))
@@ -5613,23 +4701,9 @@ class Assembler:
         symtab = b''.join(syms)
         strtab = bytes(strtab)
 
-        # ------------------------------------------------------------------ #
-        # シンボル名 → シンボルテーブルインデックスのマッピングを構築          #
-        # syms の出力順 (1)ローカル→(2)インポート→(3)エクスポート に合わせる  #
-        #                                                                      #
-        # Fix 3: 同名ラベルが labels（ローカル/インポート）と export_labels    #
-        # の両方に存在する場合、ELF リロケーションには STB_GLOBAL（エクスポート）#
-        # 側のシンボルインデックスを使わなければならない。                      #
-        # 実装方針: (1)(2) のループでは export_keys に含まれる名前をスキップし、 #
-        # (3) のループで必ずエクスポートシンボルのインデックスを登録する。      #
-        # これにより重複時は常にエクスポート側のインデックスが参照される。      #
-        # ※ (1)(2) が export_keys をスキップするため、(3) での代入は           #
-        #   実質的に新規登録（上書きではない）になる。                          #
-        # ------------------------------------------------------------------ #
         sym_name_to_idx = {}
-        _si = 1 + ncs   # null(0) + section syms(1..ncs) を飛ばした位置
+        _si = 1 + ncs
 
-        # (1) ローカル（export_keys / imported は除外 → すでに除外済み）
         for name, *_lentry in sorted(self.state.labels.items()):
             is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
             if name in export_keys or is_imported:
@@ -5637,7 +4711,6 @@ class Assembler:
             sym_name_to_idx[name] = _si
             _si += 1
 
-        # (2) インポート
         for name, *_lentry in sorted(self.state.labels.items()):
             is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
             if not is_imported or name in export_keys:
@@ -5645,22 +4718,12 @@ class Assembler:
             sym_name_to_idx[name] = _si
             _si += 1
 
-        # (3) エクスポート
-        # Fix 3: エクスポートは必ず登録する（上書き可）。
-        # labels にも同名がある場合、リロケーションにはグローバルシンボルを使うべき。
         for name, *_eentry in sorted(self.state.export_labels.items()):
-            sym_name_to_idx[name] = _si   # 同名ローカルがあっても上書きして正しいインデックスを指す
+            sym_name_to_idx[name] = _si
             _si += 1
 
-        # ------------------------------------------------------------------ #
-        # .rela セクションデータを構築 (Elf64_Rela: offset/info/addend 各8B)  #
-        # ------------------------------------------------------------------ #
         def _pack_rela(r_offset, r_sym, r_type, r_addend):
             r_info = (r_sym << 32) | (r_type & 0xffffffff)
-            # Bugfix: r_addend は Elf64_Sxword（符号付き64bit）なので
-            # struct.pack('q', ...) に渡せる範囲は -2^63 〜 2^63-1。
-            # addend = raw_val - abs_w の計算でこの範囲を超えると struct.error が発生する。
-            # 修正: 64bit符号付き整数に丸めてからパックする。
             _S64_MAX =  (1 << 63) - 1
             _S64_MIN = -(1 << 63)
             if r_addend > _S64_MAX:
@@ -5669,7 +4732,7 @@ class Assembler:
                 r_addend = _S64_MIN
             return _struct.pack(f'{_pk}QQq', r_offset, r_info, r_addend)
 
-        rela_datas = []   # rela_sec_order と同順
+        rela_datas = []
         for sidx in rela_sec_order:
             entries = rela_entries[sidx]
             data = b''.join(
@@ -5678,17 +4741,13 @@ class Assembler:
             )
             rela_datas.append(data)
 
-        # ------------------------------------------------------------------ #
-        # 4. Compute file offsets                                              #
-        # ------------------------------------------------------------------ #
-        offset = 64   # after ELF header
+        offset = 64
         sec_offsets = []
         for s in csecs:
             offset = _align_up(offset, 16)
             sec_offsets.append(offset)
             offset += s.byte_size
 
-        # .rela セクションのファイルオフセット
         rela_offsets = []
         for rd in rela_datas:
             offset = _align_up(offset, 8)
@@ -5699,15 +4758,9 @@ class Assembler:
         strtab_off  = offset;               offset += len(strtab)
         shstrtab_off = offset;              offset += len(shstrtab)
 
-        # ------------------------------------------------------------------ #
-        # DWARF デバッグセクションのファイルオフセットと最終インデックス      #
-        # （.shstrtab の後ろに配置する）。                                    #
-        #   dbg_prog : SHT_PROGBITS, addralign 1                              #
-        #   dbg_rela : SHT_RELA,     addralign 8                              #
-        # ------------------------------------------------------------------ #
-        base_idx = ncs + nrela + 3            # index of .shstrtab
+        base_idx = ncs + nrela + 3
         dbg_prog_offsets = []
-        dbg_prog_shndx = {}                   # name → section index
+        dbg_prog_shndx = {}
         for i, (dname, ddata) in enumerate(dbg_prog):
             offset = _align_up(offset, 1)
             dbg_prog_offsets.append(offset)
@@ -5722,51 +4775,37 @@ class Assembler:
         shdr_off    = _align_up(offset, 8)
 
         ndbg = len(dbg_prog) + len(dbg_rela)
-        # セクションヘッダ数: null + content + rela + symtab + strtab + shstrtab + debug
         total_shdrs = 1 + ncs + nrela + 3 + ndbg
-        shstrndx    = ncs + nrela + 3         # .shstrtab は位置不変
-        symtab_shidx = ncs + nrela + 1     # .symtab section index
-        strtab_shidx = ncs + nrela + 2     # .strtab section index (= symtab_link)
+        shstrndx    = ncs + nrela + 3
+        symtab_shidx = ncs + nrela + 1
+        strtab_shidx = ncs + nrela + 2
         symtab_link = strtab_shidx
 
-        # ------------------------------------------------------------------ #
-        # 5. Write ELF file                                                    #
-        # ------------------------------------------------------------------ #
-        # Fix (破綻点3): open() が失敗した場合（ディレクトリ不在・権限不足・
-        # ディスク満杯など）は OSError を捕捉してクリーンなエラーメッセージを
-        # 出力してリターンする。Python トレースバックでクラッシュさせない。
         try:
             _elf_file = open(path, 'wb')
         except OSError as _e:
             print(f" error - cannot create ELF output file '{path}': {_e}", file=sys.stderr)
             return
         with _elf_file as f:
-            # ELF header
             f.write(_pack_ehdr(1, machine, shdr_off, total_shdrs, shstrndx))
 
-            # Content section data
             for i, s in enumerate(csecs):
                 cur = f.tell()
                 f.write(b'\x00' * (sec_offsets[i] - cur))
                 f.write(s.data)
 
-            # .rela.X セクションデータ
             for i, rd in enumerate(rela_datas):
                 cur = f.tell()
                 f.write(b'\x00' * (rela_offsets[i] - cur))
                 f.write(rd)
 
-            # .symtab
             cur = f.tell(); f.write(b'\x00' * (symtab_off - cur))
             f.write(symtab)
 
-            # .strtab
             f.write(strtab)
 
-            # .shstrtab
             f.write(shstrtab)
 
-            # DWARF デバッグセクションデータ（PROGBITS → RELA の順）
             for i, (dname, ddata) in enumerate(dbg_prog):
                 cur = f.tell()
                 f.write(b'\x00' * (dbg_prog_offsets[i] - cur))
@@ -5776,49 +4815,39 @@ class Assembler:
                 f.write(b'\x00' * (dbg_rela_offsets[i] - cur))
                 f.write(rdata)
 
-            # Section header table
             cur = f.tell(); f.write(b'\x00' * (shdr_off - cur))
 
-            f.write(_pack_shdr(0, 0, 0, 0, 0, 0, 0, 0, 0, 0))  # [0] NULL
+            f.write(_pack_shdr(0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
-            for i, s in enumerate(csecs):                        # [1..ncs] content
-                # Fix: .bss は SHT_NOBITS (8)、それ以外は SHT_PROGBITS (1)。
-                # ELF 仕様上 SHT_NOBITS セクションはファイル領域を持たない（sh_size は
-                # 実際のバイト数だが sh_offset/ファイルデータは不使用）ため、
-                # リンカ・ローダーが正しくゼロ初期化できる。
+            for i, s in enumerate(csecs):
                 _sh_type_i = 8 if s.name.upper().startswith('.BSS') else 1
                 f.write(_pack_shdr(
                     sec_name_offs[i], _sh_type_i, s.flags, 0,
                     sec_offsets[i], s.byte_size, 0, 0, 16, 0))
 
-            for ri, sidx in enumerate(rela_sec_order):           # .rela.X
-                # sh_flags: SHF_INFO_LINK=0x40
+            for ri, sidx in enumerate(rela_sec_order):
                 f.write(_pack_shdr(
                     rela_name_offs[ri], 4, 0x40, 0,
                     rela_offsets[ri], len(rela_datas[ri]),
                     symtab_shidx, sidx, 8, 24))
 
-            f.write(_pack_shdr(                                   # .symtab
+            f.write(_pack_shdr(
                 symtab_name_off, 2, 0, 0,
                 symtab_off, len(symtab),
                 symtab_link, first_global, 8, 24))
 
-            f.write(_pack_shdr(                                   # .strtab
+            f.write(_pack_shdr(
                 strtab_name_off, 3, 0, 0,
                 strtab_off, len(strtab), 0, 0, 1, 0))
 
-            f.write(_pack_shdr(                                   # .shstrtab
+            f.write(_pack_shdr(
                 shstrtab_name_off, 3, 0, 0,
                 shstrtab_off, len(shstrtab), 0, 0, 1, 0))
 
-            # DWARF デバッグセクションヘッダ（PROGBITS → RELA の順）。
-            # PROGBITS: sh_type=1, flags=0, link=0, info=0, align=1, entsize=0
             for i, (dname, ddata) in enumerate(dbg_prog):
                 f.write(_pack_shdr(
                     dbg_prog_name_offs[i], 1, 0, 0,
                     dbg_prog_offsets[i], len(ddata), 0, 0, 1, 0))
-            # RELA: sh_type=4, flags=SHF_INFO_LINK(0x40), link=.symtab,
-            #       info=対象デバッグセクションのインデックス, align=8, entsize=24
             for i, (rname, tname, rdata) in enumerate(dbg_rela):
                 f.write(_pack_shdr(
                     dbg_rela_name_offs[i], 4, 0x40, 0,
@@ -5878,21 +4907,26 @@ class Assembler:
         return ap
 
     def run(self):
-        """Main assembly process"""
+        """Main assembly process.
+
+        全体の流れ: (1)パターンファイル読込み (2)-iラベルインポート
+        (3-a)ソースファイル省略時は対話モード(1パス) (3-b)指定時は
+        Pass1をリラクゼーション収束するまで繰り返してからPass2を1回実行する
+        2パス方式 (4)ELF/バイナリ出力。可変長命令アーキテクチャでは前方参照
+        ラベルの値で命令サイズが変わるため、単純な2パスでは不十分であり、
+        Pass1を繰り返して真のレイアウトへ収束させる必要がある(詳細は
+        下のリラクゼーションループのコメント参照)。
+        """
         ap = self._build_arg_parser()
 
-        # argparse prints help and exits when no arguments are given,
-        # but we want a custom usage message and a clean return instead.
         if len(sys.argv) == 1:
             ap.print_help()
             return
 
         args = ap.parse_args()
 
-        # make osabi table
         osabitbl = {'Linux':0,'linux':0,'FreeBSD':9,'freebsd':9}
 
-        # --- Apply parsed options to assembler state ---
         self.state.outfile      = args.outfile
         self.state.expfile      = args.expfile
         self.state.expfile_elf  = args.expfile_elf
@@ -5900,9 +4934,6 @@ class Assembler:
         self.state.elf_objfile  = args.elf_objfile
         self.state.elf_machine  = args.elf_machine
 
-        # Fix 1: use .get() so unknown OSABI strings never raise KeyError.
-        # argparse choices= already guards this, but the table and the
-        # choices list could drift independently. Default to FreeBSD (9).
         if args.elf_osabi not in osabitbl:
             print(f"warning: unknown --osabi value '{args.elf_osabi}'; "
                   f"valid choices are {list(osabitbl.keys())}. Using 'FreeBSD'.",
@@ -5912,46 +4943,33 @@ class Assembler:
         self.state.debug        = args.debug
         self.state.gen_debug    = args.gen_debug
 
-        # Fix 5 (original) + Fix 8 (new): run() 全体を try/finally で囲む。
-        # Fix 8: readpat や impfile open もここに含めることで、パターンファイルや
-        # インポートファイルの読み込み中に例外が起きた場合も finally が確実に実行される。
         try:
-            # Load pattern file
             self.state.pat = self.pattern_reader.readpat(args.patternfile)
             self.setpatsymbols(self.state.pat)
 
-            # Import labels
             if self.state.impfile:
-                # Bugfix: 旧実装は imp_label() を1行ずつ逐次呼び出していたため、
-                # TSVファイルでセクション行（3フィールド以上）がラベル行より後に
-                # 来るとき _imp_sections がまだ空で、ラベルが全て '.text' に
-                # 帰属されてしまっていた。
-                # 修正: 2パス読み込みを行う。
-                #   パス1: セクション行だけを処理して _imp_sections を構築する。
-                #   パス2: ラベル行を処理する（_imp_sections が完成している状態）。
+                # 2パス読込み: セクション行(≥3フィールド)を先に全て処理して
+                # self._imp_sectionsを完成させてから、ラベル行(2フィールド)を
+                # 処理する。順序を混在させるとラベルのセクション逆引きが
+                # まだ登録されていないセクションを参照してしまう。
                 with open(self.state.impfile, 'rt') as label_file:
                     raw_lines = label_file.readlines()
-                # Pass 1: section lines (3+ fields)
                 for l in raw_lines:
                     fields = l.rstrip('\r\n').split('\t')
                     if len(fields) >= 3:
                         self.imp_label(l)
-                # Pass 2: label lines (2 fields)
                 for l in raw_lines:
                     fields = l.rstrip('\r\n').split('\t')
                     if len(fields) == 2:
                         self.imp_label(l)
 
-            # Remove stale output file before writing
             if self.state.outfile:
                 try:
                     os.remove(self.state.outfile)
                 except OSError:
                     pass
 
-            # --- Assemble ---
             if args.sourcefile is None:
-                # Interactive / stdin mode (single pass)
                 self.state.pc = 0
                 self.state.pas = 0
                 self.state.ln = 1
@@ -5971,59 +4989,35 @@ class Assembler:
                         continue
                     self.lineassemble0(line)
             else:
-                # Two-pass file assembly with pass1 relaxation.
-                #
-                # 可変長命令アーキテクチャでは、forward参照ラベルを 0 と仮定した
-                # pass1 のサイズ推定が間違い、pass2 でアドレスがずれることがある。
-                # 対策: pass1 を最大 MAX_RELAX 回繰り返し、全ラベルの PC が
-                # 前回と一致したら収束とみなして pass2 に進む（リラクゼーション法）。
-                # 修正⑤: 旧実装は _pass1_prev_label_pcs = None で初期化し、
-                # 初回イテレーション後の比較が「dict == None」→ 常に False となっていた。
-                # ラベルが1回目で既に安定していても必ず2回目のパスが走る無駄があった。
-                # 修正後: 初期値を「空の dict に絶対マッチしない番兵」として
-                # object() を使う。これにより初回に収束したケースも正しく break できる。
-                # （空ソースや全ラベルが .equ のみのケースで1パス節約できる）
-                MAX_RELAX = 16   # A修正: 前方参照が実際に収束するようになったため余裕を持たせる
-                # Fix 7: _SENTINEL をモジュールレベル定数に変更。
-                # ローカルの object() では run() を複数回呼び出したとき
-                # 前回の state._pass1_prev_label_pcs と比較できなくなる。
+                # ---- リラクゼーション法によるPass1の反復 ----
+                # 可変長命令アーキテクチャでは、前方参照ラベルの値によって
+                # 命令の符号化サイズ(短形式/長形式)が変わりうる。単純に
+                # 前方参照を0と仮定してPass1を1回やるだけでは、Pass2で
+                # アドレスがずれる可能性がある。そこでPass1を最大MAX_RELAX回
+                # 繰り返し、全ラベルのPC・所属セクションが前回反復と一致
+                # したら収束とみなしてPass2に進む。前回反復の確定値は
+                # state._relax_prev_valuesに保持し、まだ未確定な前方参照の
+                # 推定値としてLabelManager.get_value()が返す。
+                MAX_RELAX = 16
                 self.state._pass1_prev_label_pcs = _RELAXATION_SENTINEL
-                # A修正: 前反復ラベル値テーブルを初期化（初回反復は推定値なし）。
                 self.state._relax_prev_values = {}
 
-                # Fix 5: リラクゼーションループの先頭で labels = {} にリセットすると
-                # -i オプションでインポートしたラベルも消えてしまう。
-                # インポート済みラベルをスナップショットして毎イテレーション先頭で復元する。
                 _imported_labels = dict(self.state.labels)
 
-                # 修正⑧: vars（a-z 変数）もリラクゼーションループ先頭でリセットする。
-                # 各命令の先頭でも per-instruction リセットが入るため実害は少ないが、
-                # 最後の命令後に残った値がパス間で持ち越されないよう明示的にクリアする。
                 _initial_vars = list(self.state.vars)
 
                 for relax_iter in range(MAX_RELAX):
                     self.state.pc = 0
                     self.state.pas = 1
                     self.state.ln = 1
-                    # インポートラベルを保持しつつ、前回イテレーションのアドレスラベルをリセット
                     self.state.labels = dict(_imported_labels)
                     self.state.sections = {}
                     self.state.export_labels = {}
-                    # Bug修正: current_section をリセットしないと、前イテレーション末尾の
-                    # セクション (例: '.data') が次イテレーション先頭の old_sec になり、
-                    # section .text 処理時に '.data' が pc=0 で誤登録される。
                     self.state.current_section = '.text'
-                    # ソース内の .setsym / .clearsym が前回イテレーションで
-                    # symbols を変化させている可能性があるため、
-                    # パターンファイル読み込み直後の状態（patsymbols）に毎回リセットする。
                     self.state.symbols = dict(self.state.patsymbols)
-                    # 修正⑧: vars をリラクゼーション開始時の状態に戻す
                     self.state.vars = list(_initial_vars)
                     self.fileassemble(args.sourcefile)
 
-                    # Bug修正: pass1でも最終セクションのサイズを確定する。
-                    # section_processing は切り替え時のみ旧セクションを更新するため
-                    # ファイル末尾のセクションが size=0 になる。
                     _last_sec1 = self.state.current_section
                     if _last_sec1 in self.state.sections:
                         _e1 = self.state.sections[_last_sec1]
@@ -6033,43 +5027,34 @@ class Assembler:
                             if _blk1 > 0:
                                 _e1[1] += _blk1
 
-                    # Fix ⑥-2: 収束スナップショットに PC 値だけでなくセクション帰属も含める。
-                    # (pc, section) のペアで比較することで両方が安定して初めて収束と判定する。
+                    # 収束判定: 全ラベルの(pc, セクション)が前回反復と完全一致すれば
+                    # 収束とみなす。UNDEF由来の値が混ざっている間は収束とみなさない
+                    # (前後の反復でたまたま同じUNDEFが並ぶ誤判定を避けるため)。
                     current_pcs = {k: (v[0], v[1]) for k, v in self.state.labels.items()}
-                    # UNDEF 由来の値が PC に混入しているうちは収束とみなさない。
-                    # （前後の反復で同じ UNDEF だと誤って「収束」と判定してしまうため。）
-                    # B修正: 判定を _is_undef_derived に一元化（閾値 2^192）。
-                    # is_equ=True の定数ラベルは任意精度の整数値を持てるので除外する。
                     has_undef = any(
                         _is_undef_derived(pc)
                         for k, (pc, _sec) in current_pcs.items()
                         if not (len(self.state.labels[k]) > 2 and self.state.labels[k][2])
                     )
-                    # A修正: 次反復の前方参照推定に使うため、今反復で確定した
-                    # 全ラベル値（アドレス・定数とも）を保存する。
-                    # UNDEF 由来の値は推定に使うと有害なので保存しない（前方参照は
-                    # その分 0/前々回値にフォールバックする）。
+                    # 次反復の前方参照推定に使う値を保存する(UNDEF由来は保存しない、
+                    # 前方参照はその分0または前々回値にフォールバックする)。
                     self.state._relax_prev_values = {
                         k: v[0] for k, v in self.state.labels.items()
                         if not _is_undef_derived(v[0])
                     }
-                    # 修正⑤: _RELAXATION_SENTINEL との比較は必ず False なので初回は無条件続行。
-                    # 2回目以降は前回と一致しかつ UNDEF がなければ収束と判定できる。
                     if (not has_undef
                             and self.state._pass1_prev_label_pcs is not _RELAXATION_SENTINEL
                             and current_pcs == self.state._pass1_prev_label_pcs):
                         if self.state.debug:
                             print(f"Pass1 relaxation converged after {relax_iter + 1} iteration(s)", file=sys.stderr)
-                        break   # 収束
+                        break
                     self.state._pass1_prev_label_pcs = current_pcs
                 else:
-                    # 収束しなかった場合の詳細情報
                     print("WARNING: Pass1 relaxation did not converge after {0} iterations.".format(MAX_RELAX), 
                           file=sys.stderr)
                     print("         Generated code may have incorrect addresses for", file=sys.stderr)
                     print("         variable-length instructions with forward references.", file=sys.stderr)
                     if self.state.debug and isinstance(self.state._pass1_prev_label_pcs, dict):
-                        # デバッグモードでは変化したラベルを表示
                         changed = []
                         for k in current_pcs:
                             if k in self.state._pass1_prev_label_pcs:
@@ -6078,34 +5063,26 @@ class Assembler:
                         if changed:
                             print(f"         Labels still changing: {', '.join(changed[:10])}", file=sys.stderr)
 
-                # A修正(指摘3): pass1↔pass2 整合チェック用に、pass1 で確定した
-                # ラベルアドレス(is_equ=False のもの)をスナップショットしておく。
-                # pass2 完了後にこの値と pass2 のアドレスを突き合わせ、ずれがあれば
-                # 「リラクゼーション未収束によりアドレスが確定していない」ことを
-                # 明示的なエラーとして報告する（旧実装は無検査で silent miscompile だった）。
+                # Pass1↔Pass2整合チェックの安全網用に、Pass1で確定したラベル
+                # アドレス(is_equ=Falseのもの、つまり定数ではなくアドレス)を
+                # スナップショットしておく。Pass2完了後にこれと突き合わせ、
+                # ずれがあれば「リラクゼーション未収束のためアドレスが確定
+                # していない」ことを明示的なエラーとして報告する
+                # (検査なしで誤ったバイナリを黙って出力しないため)。
                 _pass1_final_addrs = {
                     k: v[0] for k, v in self.state.labels.items()
-                    if not (len(v) > 2 and v[2])   # is_equ 定数は対象外（アドレスではない）
+                    if not (len(v) > 2 and v[2])
                 }
 
                 self.state.pc = 0
                 self.state.pas = 2
                 self.state.ln = 1
-                self.state.relocations = []   # pass2 でリロケーションを新規収集
-                self.state.line_map = []      # pass2 で DWARF 行情報を新規収集
-                # Fix 5 (new): pass1 リラクゼーション中に section_processing の
-                # 暫定サイズ（Fix 3）や ENDSECTION 確定サイズ（Fix 2）が残ったまま
-                # pass2 に入ると、section 再宣言時の保護ロジックが誤って古いサイズを
-                # 保持することがある。pass2 先頭で sections をリセットして
-                # 確定的に再構築させる。labels・patsymbols はリセット不要。
+                self.state.relocations = []
+                self.state.line_map = []
                 self.state.sections = {}
-                self.state.current_section = '.text'  # Bug修正: pass2前にリセット
+                self.state.current_section = '.text'
                 self.fileassemble(args.sourcefile)
 
-                # Bug修正: section_processing は「セクション切り替え時」に
-                # 旧セクションのサイズを更新する。ファイル末尾の最終セクションは
-                # 切り替えが発生しないため size=0 のままになる。
-                # fileassemble 完了後に current_section を明示的に確定する。
                 _last_sec = self.state.current_section
                 if _last_sec in self.state.sections:
                     _e = self.state.sections[_last_sec]
@@ -6116,10 +5093,6 @@ class Assembler:
                         if _block > 0:
                             _e[1] += _block
 
-                # A修正(指摘3): pass1↔pass2 アドレス整合チェック（安全網）。
-                # pass2 のラベルアドレスが pass1 確定値と食い違う場合、出力バイナリの
-                # アドレスは信頼できない。旧実装はこれを一切検査せず誤ったバイナリを
-                # 黙って出力していた。ここで差分を検出し、ラベル名を挙げて報告する。
                 _drift = []
                 for k, p2 in ((kk, vv[0]) for kk, vv in self.state.labels.items()
                               if not (len(vv) > 2 and vv[2])):
@@ -6143,13 +5116,9 @@ class Assembler:
 
             self.binary_writer.flush()
 
-            # --- ELF relocatable object file ---
             if self.state.elf_objfile:
                 self.write_elf_obj(self.state.elf_objfile, self.state.elf_machine)
 
-            # --- Export labels ---
-            # -e と -E が同時に指定された場合は警告を出し、両方を別々に出力する。
-            # 以前は -E が -e をサイレントに上書きしていた。
             if self.state.expfile_elf and self.state.expfile:
                 print(f"warning: both -e '{self.state.expfile}' and -E '{self.state.expfile_elf}' specified; "
                       f"exporting plain format to -e and ELF format to -E separately.",
@@ -6181,9 +5150,6 @@ class Assembler:
                     for i in h:
                         lbl_is_equ = len(i[1]) > 2 and i[1][2]
                         lbl_addr_raw = i[1][0] if lbl_is_equ else i[1][0] * _bpw_export
-                        # Fix (破綻点4): UNDEF 由来の巨大値（未定義ラベル）はエクスポート
-                        # しない。get_value() でエラーメッセージは既に出力済みのため、
-                        # ここでは黙ってスキップするだけでよい。
                         if _is_undef_derived(i[1][0]):
                             continue
                         try:
@@ -6192,28 +5158,23 @@ class Assembler:
                             lbl_addr = 0
                         
                         reloc_type_str = ''
-                        # elf=1 の場合のみリロケーション情報を付加する
                         if elf == 1:
                             lentry = self.state.labels.get(i[0], [])
                             if len(lentry) > 4 and lentry[4] is not None:
-                                # Reverse lookup: rtype value → name
                                 _RTYPE_REVERSE = {
-                                    # 絶対リロケーション
-                                    1:  'abs64',   # R_X86_64_64
-                                    10: 'abs32',   # R_X86_64_32
-                                    11: 'abs32s',  # R_X86_64_32S
-                                    12: 'abs16',   # R_X86_64_16
-                                    14: 'abs8',    # R_X86_64_8
-                                    # PC相対リロケーション
-                                    2:  'pc32',    # R_X86_64_PC32
-                                    4:  'plt32',   # R_X86_64_PLT32
-                                    13: 'pc16',    # R_X86_64_PC16
-                                    15: 'pc8',     # R_X86_64_PC8
-                                    24: 'pc64',    # R_X86_64_PC64
-                                    # GOT相対リロケーション
-                                    3:  'got32',   # R_X86_64_GOT32
-                                    9:  'gotpcrel', # R_X86_64_GOTPCREL
-                                    27: 'got64',   # R_X86_64_GOT64
+                                    1:  'abs64',
+                                    10: 'abs32',
+                                    11: 'abs32s',
+                                    12: 'abs16',
+                                    14: 'abs8',
+                                    2:  'pc32',
+                                    4:  'plt32',
+                                    13: 'pc16',
+                                    15: 'pc8',
+                                    24: 'pc64',
+                                    3:  'got32',
+                                    9:  'gotpcrel',
+                                    27: 'got64',
                                 }
                                 reloc_type_str = _RTYPE_REVERSE.get(lentry[4], '')
                                 if reloc_type_str:
@@ -6228,7 +5189,6 @@ class Assembler:
                 _write_export(self.state.expfile_elf, elf=1)
 
         finally:
-            # Fix 5: KeyboardInterrupt や未捕捉例外でも一時ファイルを確実に削除する。
             if self.state.stdin_tmp_path and os.path.exists(self.state.stdin_tmp_path):
                 try:
                     os.remove(self.state.stdin_tmp_path)
