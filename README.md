@@ -70,7 +70,7 @@ This version only covers the core parts of the assembler, so it does not support
 
 Because pattern files and source files are separated, it's possible to generate machine code for a different processor from the source code of one instruction set, provided you don't consider the effort involved in coding. It's also possible to generate machine code for different processors from a common language. Writing multiple instruction codes in the pattern data's binary_list functions as a macro, but it's not very elegant. This allows you to write a simple compiler.
 
-`axx` reads assembler pattern data from the first argument and assembles the source file (second argument) based on that pattern data. During this process, the pattern data is matched line by line from top to bottom against each assembly line, and the binary_list of matching patterns is output as the result. If the second argument is omitted, the source is input from the terminal (standard input).
+axx reads assembler pattern data from the first argument and assembles the source file specified in the second argument based on that data. During this process, the pattern data is matched to the assembly lines one by one, and the `binary_list` of any matching pattern is output to the result. While the definition of directives within the pattern file is order-dependent, the patterns themselves are not. If the second argument is omitted, the source input is read from the terminal (standard input).
 
 The result is output as text to standard output, and if the -o option is specified, a binary file is output to the current directory. The -e option outputs the labels specified in `.export` along with section/segment information to a file in TSV format.
 
