@@ -1247,10 +1247,26 @@ static int axx_get_symbol_word(const char *s, int idx, const char *swordchars, c
     t_out[0]=0;
     if(!s[idx]||is_digit(s[idx])||!char_in(s[idx],swordchars)) return idx;
     size_t n=0;
+    /* Fix: idx must always advance over the *entire* word in the source,
+     * even once the output buffer is full. Previously the loop condition
+     * "n<tsz-1" also gated idx's advance, so a word longer than tsz-1
+     * bytes left its unconsumed tail in the source string, causing the
+     * remainder to be misparsed as a following token (idx/n desync).
+     * Writing into t_out and advancing idx are now independent: t_out is
+     * truncated (with a warning) but idx always reflects the true word end,
+     * matching axx.py's unbounded get_symbol_word(). */
+    int truncated = 0;
     t_out[n++]=s[idx++];
-    while(s[idx]&&char_in(s[idx],swordchars)&&n<tsz-1) t_out[n++]=s[idx++];
+    while(s[idx]&&char_in(s[idx],swordchars)){
+        if(n<tsz-1) t_out[n++]=s[idx];
+        else truncated = 1;
+        idx++;
+    }
     t_out[n]=0;
     axx_strupr(t_out);
+    if(truncated){
+        fprintf(stderr,"warning - symbol name truncated to %zu characters\n", tsz-1);
+    }
     return idx;
 }
 
@@ -1259,9 +1275,19 @@ static int axx_get_label_word(const char *s, int idx, const char *lwordchars, ch
     if(!s[idx]) return idx;
     if(s[idx]!='.'&&(is_digit(s[idx])||!char_in(s[idx],lwordchars))) return idx;
     size_t n=0;
+    /* Fix: same idx/n desync as axx_get_symbol_word above; idx now always
+     * advances over the full label word regardless of buffer capacity. */
+    int truncated = 0;
     t_out[n++]=s[idx++];
-    while(s[idx]&&char_in(s[idx],lwordchars)&&n<tsz-1) t_out[n++]=s[idx++];
+    while(s[idx]&&char_in(s[idx],lwordchars)){
+        if(n<tsz-1) t_out[n++]=s[idx];
+        else truncated = 1;
+        idx++;
+    }
     t_out[n]=0;
+    if(truncated){
+        fprintf(stderr,"warning - label name truncated to %zu characters\n", tsz-1);
+    }
     if(s[idx]==':'&&s[idx+1]!='=') idx++;
     return idx;
 }
@@ -3236,9 +3262,28 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
      * 未定義ラベル iy のエラーになっていた。                              */
     int n_expr=0, n_sym=0, n_lit=0;
 
+    /* 直前に消費したパターン文字が英数字リテラルだったか(単語境界判定用) */
+    int prev_alnum=0;
+
     while(1){
+        /* 単語境界ルール(axx.py側と同期): アセンブリ行側の空白は「トークン
+         * の区切り」として扱う。以前はここで無条件に axx_skipspc() を両側に
+         * かけていたため、空白がマッチに一切影響せず、例えば `jl exit_error`
+         * がパターン `JLE !a` にマッチしてしまっていた(JLの後の空白を飛ばして
+         * exit_errorの先頭'e'がパターンの'E'に食われ、!aが'xit_error'を捕捉
+         * して未定義エラーになる)。
+         * 空白スキップ自体は従来どおり行うが、「行側に空白があった」
+         * 「パターン側に空白があった」を記録しておき、英数字リテラル同士の
+         * 連続(=1つの単語)の途中で行側だけに空白があった場合はマッチ失敗と
+         * する。カンマ・括弧など英数字以外の前後の空白は従来どおり自由
+         * (互換性維持)。 */
+        int s_sp = (s[idx_s]==' '||s[idx_s]=='\t');
+        int t_sp = (t[idx_t]==' '||t[idx_t]=='\t');
         idx_s=axx_skipspc(s,idx_s);
         idx_t=axx_skipspc(t,idx_t);
+        /* 行側だけに空白があった位置は単語境界。パターン側にも空白が
+         * あればパターンもそこで単語が切れているので境界違反にならない。 */
+        int word_break = s_sp && !t_sp;
         char b=s[idx_s], a=t[idx_t];
 
         if(a=='\0'&&b=='\0'){
@@ -3251,12 +3296,26 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
 
         if(a=='\\'){
             idx_t++;
-            if(idx_t<tlen && t[idx_t]==b){ idx_t++; idx_s++; n_lit++; continue; }
+            if(idx_t<tlen && t[idx_t]==b){
+                int lit_alnum = isalnum((unsigned char)t[idx_t]) ? 1 : 0;
+                if(lit_alnum && prev_alnum && word_break){ result=0; break; }
+                idx_t++; idx_s++; n_lit++;
+                prev_alnum = lit_alnum;
+                continue;
+            }
             else { result=0; break; }
         } else if(a>='A'&&a<='Z'){
-            if(a==axx_upper_char(b)){ idx_s++; idx_t++; n_lit++; continue; }
+            if(a==axx_upper_char(b)){
+                /* 英数字リテラルの連続途中に行側の空白は入れない
+                 * (JLE が 'jl e...' にマッチするのを防ぐ) */
+                if(prev_alnum && word_break){ result=0; break; }
+                idx_s++; idx_t++; n_lit++;
+                prev_alnum=1;
+                continue;
+            }
             else { result=0; break; }
         } else if(a=='!'){
+            prev_alnum=0;
             n_expr++;
             idx_t++;
             a=t[idx_t]; idx_t++;
@@ -3368,6 +3427,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 continue;
             }
         } else if(a>='a'&&a<='z'){
+            prev_alnum=0;
             idx_t++;
             int prev_idx_s = idx_s;
             char w[512];
@@ -3396,11 +3456,20 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             n_sym++;
             continue;
         } else if(a=='[' || a==']'){
+            prev_alnum=0;
             idx_t++;
             idx_s=axx_skipspc(s,idx_s);
             if(s[idx_s]==a){ idx_s++; n_lit++; continue; }
             else { result=0; break; }
-        } else if(a==b){ idx_t++; idx_s++; n_lit++; continue; }
+        } else if(a==b){
+            /* 数字リテラル等も英数字リテラル連続の一部として扱う
+             * (パターン 'R1' が行 'r 1' にマッチしないように) */
+            int lit_alnum = isalnum((unsigned char)a) ? 1 : 0;
+            if(lit_alnum && prev_alnum && word_break){ result=0; break; }
+            idx_t++; idx_s++; n_lit++;
+            prev_alnum = lit_alnum;
+            continue;
+        }
         else { result=0; break; }
     }
     free(s); free(t);
@@ -3615,8 +3684,15 @@ static void readpat(Assembler *asmb, const char *fn){
     char this_dir[1024];
     axx_dir_of(fn, this_dir, sizeof(this_dir));
 
-    char line[4096];
-    while(fgets(line,sizeof(line),f)){
+    /* Fix: pattern files were read with a fixed 4096-byte fgets() buffer,
+     * so any single logical line at or beyond that length was silently
+     * split into two lines (fgets() just returns without a trailing '\n'
+     * and the remainder is picked up on the next call as if it were a
+     * separate line) -- no error, no warning. fileassemble() already reads
+     * source files via getline() with no length limit; do the same here
+     * so pattern files have the same guarantee as source files. */
+    char *line=NULL; size_t lcap=0;
+    while(getline(&line,&lcap,f)!=-1){
         axx_remove_comment(line);
         for(char*p=line;*p;p++){ if(*p=='\t') *p=' '; if(*p=='\r') *p=' '; }
         int l=(int)strlen(line);
@@ -3646,6 +3722,7 @@ static void readpat(Assembler *asmb, const char *fn){
         else if(nf==5){ for(int i=0;i<5;i++) pat_set(pe,i,fields[i]); }
         else if(nf>=6){ for(int i=0;i<6;i++) pat_set(pe,i,fields[i]); }
     }
+    free(line);
     fclose(f);
     /* D8: pop this file off the include chain */
     asmb->st.pat_include_depth--;
@@ -4766,7 +4843,13 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         int lw=0; for(int fi=0;fi<PAT_FIELDS;fi++) if(i->f[fi][0]) lw++;
         if(lw==0) continue;
 
-        char lin[8192]; snprintf(lin,sizeof(lin),"%s %s",l,l2);
+        /* Fix: l2(オペランド部)が空のとき "%s %s" は末尾に余分な空白を
+         * 残してしまい、空白の有無を厳密に見るようになった pat_match() で
+         * 「NOP」のようなオペランド無しパターンが不一致になってしまう。
+         * l2が空の場合は区切りの空白を入れない(axx.py側と同期)。 */
+        char lin[8192];
+        if(l2[0]) snprintf(lin,sizeof(lin),"%s %s",l,l2);
+        else      snprintf(lin,sizeof(lin),"%s",l);
         axx_reduce_spaces(lin);
 
         if(!i->f[0][0]){
@@ -6304,6 +6387,7 @@ int find_osabi( char *osname ) {
 int main(int argc, char *argv[]){
     if(argc==1){ print_usage(argv[0]); return 0; }
 
+    int exit_code = 0;
     Assembler *asmb=calloc(1,sizeof(Assembler));
     assembler_init(asmb);
     AsmState *st=&asmb->st;
@@ -6519,10 +6603,18 @@ int main(int argc, char *argv[]){
         /* A: relaxation is done; pass2 must NOT consult the (now-freed) snapshot. */
         st->relax_prev = NULL;
 
-        if(!converged)
-            fprintf(stderr,"warning: pass1 relaxation did not converge after %d iterations; "
-                    "addresses may be incorrect for variable-length instructions "
+        if(!converged){
+            /* Fix: 収束しなかった場合は単なる警告ではなく致命的エラーとする。
+             * 収束前提のPass2アドレスは信頼できないため、Pass2実行・出力書き込み
+             * を行わずここで打ち切る(誤ったバイナリを黙って出力しないため)。 */
+            fprintf(stderr," error - Pass1 relaxation did not converge after %d iterations; "
+                    "addresses would be incorrect for variable-length instructions "
                     "with forward references.\n", MAX_RELAX);
+            fprintf(stderr,"         Aborting: no output file written.\n");
+            lmap_free(&pass1_final);
+            exit_code = 1;
+            goto cleanup;
+        }
 #undef MAX_RELAX
 
         st->pc=u256_zero(); st->pas=2; st->ln=1;
@@ -6589,6 +6681,13 @@ int main(int argc, char *argv[]){
                     }
                 if(drift_count > 10)
                     fprintf(stderr,"           ... and %d more.\n", drift_count - 10);
+                /* Fix: 従来はエラー表示のみで出力を続けていたため、アドレスが
+                 * 不正なオブジェクトファイルがそのまま生成されていた。ここで
+                 * 中断し、出力ファイルを書かない。 */
+                fprintf(stderr,"         Aborting: no output file written.\n");
+                lmap_free(&pass1_final);
+                exit_code = 1;
+                goto cleanup;
             }
         }
         lmap_free(&pass1_final);
@@ -6689,6 +6788,7 @@ int main(int argc, char *argv[]){
     #undef WRITE_EXPORT
 
     /* Fix C-6: clean up the per-process stdin temp file if one was created. */
+cleanup:
     if(st->stdin_tmp_path[0]){
         unlink(st->stdin_tmp_path);
         st->stdin_tmp_path[0] = '\0';
@@ -6702,5 +6802,5 @@ int main(int argc, char *argv[]){
     free(st->line_map);
     st->line_map=NULL; st->line_map_len=0; st->line_map_cap=0;
 
-    return 0;
+    return exit_code;
 }

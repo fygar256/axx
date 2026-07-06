@@ -2372,9 +2372,28 @@ class PatternMatcher:
         s += chr(0)
         t += chr(0)
         
+        # 直前に消費したパターン文字が英数字リテラルだったか(単語境界判定用)
+        prev_alnum = False
+
         while True:
+            # 単語境界ルール: アセンブリ行側の空白は「トークンの区切り」として
+            # 扱う。以前はここで無条件に skipspc() を両側にかけていたため、
+            # 空白がマッチに一切影響せず、例えば `jl exit_error` がパターン
+            # `JLE !a` にマッチしてしまっていた(JLの後の空白を飛ばして
+            # exit_errorの先頭'e'がパターンの'E'に食われ、!aが'xit_error'を
+            # 捕捉して未定義エラーになる)。
+            # ここでは空白スキップ自体は従来どおり行うが、「行側に空白が
+            # あった」「パターン側に空白があった」を記録しておき、英数字
+            # リテラル同士の連続(=1つの単語)の途中で行側だけに空白が
+            # あった場合はマッチ失敗とする。カンマ・括弧など英数字以外の
+            # 前後の空白は従来どおり自由(互換性維持)。
+            s_sp = idx_s < len(s) and s[idx_s] in ' \t'
+            t_sp = idx_t < len(t) and t[idx_t] in ' \t'
             idx_s = StringUtils.skipspc(s, idx_s)
             idx_t = StringUtils.skipspc(t, idx_t)
+            # 行側だけに空白があった位置は単語境界。パターン側にも空白が
+            # あればパターンもそこで単語が切れているので境界違反にならない。
+            word_break = s_sp and not t_sp
             b = s[idx_s]
             a = t[idx_t]
             
@@ -2385,21 +2404,31 @@ class PatternMatcher:
             if a == '\\':
                 idx_t += 1
                 if idx_t < len(t) and t[idx_t] == b:
+                    lit_alnum = t[idx_t].isalnum()
+                    if lit_alnum and prev_alnum and word_break:
+                        return False
                     idx_t += 1
                     idx_s += 1
                     n_lit += 1
+                    prev_alnum = lit_alnum
                     continue
                 else:
                     return False
             elif a in CAPITAL:
                 if a == b.upper():
+                    # 英数字リテラルの連続途中に行側の空白は入れない
+                    # (JLE が 'jl e...' にマッチするのを防ぐ)
+                    if prev_alnum and word_break:
+                        return False
                     idx_s += 1
                     idx_t += 1
                     n_lit += 1
+                    prev_alnum = True
                     continue
                 else:
                     return False
             elif a == '!':
+                prev_alnum = False
                 n_expr += 1
                 idx_t += 1
                 if idx_t >= len(t):
@@ -2547,6 +2576,7 @@ class PatternMatcher:
                         idx_s += 1
                     continue
             elif a in LOWER:
+                prev_alnum = False
                 idx_t += 1
                 prev_idx_s = idx_s
                 w, idx_s = self.parser.get_symbol_word(s, idx_s)
@@ -2561,9 +2591,15 @@ class PatternMatcher:
                 n_sym += 1
                 continue
             elif a == b:
+                # 数字リテラル等も英数字リテラル連続の一部として扱う
+                # (パターン 'R1' が行 'r 1' にマッチしないように)
+                lit_alnum = a.isalnum()
+                if lit_alnum and prev_alnum and word_break:
+                    return False
                 idx_t += 1
                 idx_s += 1
                 n_lit += 1
+                prev_alnum = lit_alnum
                 continue
             else:
                 return False
@@ -3676,7 +3712,11 @@ class Assembler:
             lw = len([_ for _ in i if _])
             if lw == 0: continue
             
-            lin = l + ' ' + l2
+            # Fix: l2(オペランド部)が空のとき l + ' ' + l2 は末尾に余分な
+            # 空白を残してしまい、空白の有無を厳密に見るようになった
+            # match() で「NOP」のようなオペランド無しパターンが不一致に
+            # なってしまう。l2が空の場合は区切りの空白を入れない。
+            lin = (l + ' ' + l2) if l2 else l
             lin = StringUtils.reduce_spaces(lin)
             
             if i[0] == '':
@@ -4921,7 +4961,7 @@ class Assembler:
 
         if len(sys.argv) == 1:
             ap.print_help()
-            return
+            return True
 
         args = ap.parse_args()
 
@@ -5050,11 +5090,16 @@ class Assembler:
                         break
                     self.state._pass1_prev_label_pcs = current_pcs
                 else:
-                    print("WARNING: Pass1 relaxation did not converge after {0} iterations.".format(MAX_RELAX), 
+                    # Fix: 収束しなかった場合は単なる警告ではなく致命的エラーとする。
+                    # 収束前提のPass2アドレスは信頼できないため、以降のPass2実行・
+                    # 出力書き込みを行わずここで打ち切る(誤ったバイナリを黙って
+                    # 出力しないため)。
+                    print(" error - Pass1 relaxation did not converge after {0} iterations.".format(MAX_RELAX),
                           file=sys.stderr)
-                    print("         Generated code may have incorrect addresses for", file=sys.stderr)
+                    print("         Generated code would have incorrect addresses for", file=sys.stderr)
                     print("         variable-length instructions with forward references.", file=sys.stderr)
-                    if self.state.debug and isinstance(self.state._pass1_prev_label_pcs, dict):
+                    print("         Aborting: no output file written.", file=sys.stderr)
+                    if isinstance(self.state._pass1_prev_label_pcs, dict):
                         changed = []
                         for k in current_pcs:
                             if k in self.state._pass1_prev_label_pcs:
@@ -5062,6 +5107,7 @@ class Assembler:
                                     changed.append(k)
                         if changed:
                             print(f"         Labels still changing: {', '.join(changed[:10])}", file=sys.stderr)
+                    return False
 
                 # Pass1↔Pass2整合チェックの安全網用に、Pass1で確定したラベル
                 # アドレス(is_equ=Falseのもの、つまり定数ではなくアドレス)を
@@ -5113,6 +5159,8 @@ class Assembler:
                             print(f"           {k}: pass1={p1!r} pass2={p2!r}", file=sys.stderr)
                     if len(_drift) > 10:
                         print(f"           ... and {len(_drift) - 10} more.", file=sys.stderr)
+                    print("         Aborting: no output file written.", file=sys.stderr)
+                    return False
 
             self.binary_writer.flush()
 
@@ -5196,13 +5244,15 @@ class Assembler:
                     pass
                 self.state.stdin_tmp_path = None
 
+        return True
+
 
 def main():
     """Main entry point"""
     assembler = Assembler()
-    assembler.run()
+    return assembler.run()
 
 
 if __name__ == '__main__':
-    main()
-    exit(0)
+    ok = main()
+    exit(0 if ok else 1)
