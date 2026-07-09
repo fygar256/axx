@@ -29,6 +29,7 @@ import os
 import math
 import re
 import tempfile
+import uuid
 
 # run()を複数回呼んでもリラクゼーション収束判定が正しく動くよう、
 # モジュールレベルで一度だけ生成する「未確定」を表す番兵オブジェクト。
@@ -44,23 +45,40 @@ exp_typ = 'i'  # 未使用(後方互換のためだけに残存)。実体はAsse
 OB = chr(0x90)  # open  [[
 CB = chr(0x91)  # close ]]
 
-# 「未定義ラベル」を表す番兵値(2^256-1)。ラベル値は整数として扱われるため、
-# 専用の型ではなくこの巨大な数値に重畳する設計になっている。
-UNDEF = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+# 「未定義ラベル」を表す番兵値。ラベル値は整数として扱われるため、専用の型
+# ではなくこの巨大な数値に重畳する設計になっている(UNDEF-base, UNDEF+disp
+# のような算術がそのまま「未定義由来」の巨大値として伝播する)。
+#
+# 注意: これは値の大きさに基づくヒューリスティックであり、型で保証された
+# ものではない。.bits::N やパターン中の *(e,idx) バイト抽出でユーザーが
+# 定義できる即値幅には上限が実装上存在しないため、原理的には
+# UNDEF/_UNDEF_DERIVED_THRESHOLD 以上に大きい正当な値と衝突しうる。
+# ただし現実のISA定義(64bit〜せいぜい256bit幅)よりは十分大きい値を
+# 閾値に取ることで、実用上遭遇しない安全域を確保している。桁が本当に
+# 必要になった場合は _is_undef_derived() 内の警告が発火するので、その
+# 時点で型安全なUNDEF表現への置き換えを検討すること。
+UNDEF = (1 << 1024) - 1
 VAR_UNDEF = 0
 
-# UNDEFへの加減算(UNDEF-base, UNDEF+disp等)も2^256近傍の巨大値になるため、
-# 「未定義由来」の値として検出する必要がある。axxが扱う最大値は256bit整数・
-# 128bit浮動小数点(quad)なので、正当な定数は2^128未満に収まる。閾値を2^192に
-# 取ることで、正当な大きい定数とUNDEF由来の値を確実に区別できる。
-_UNDEF_DERIVED_THRESHOLD = 1 << 192
+_UNDEF_DERIVED_THRESHOLD = 1 << 768
+# ここを超える正当な値は「現実のISAでは事実上あり得ない」が「理論上あり得ない」
+# わけではないので、閾値に接近してきたら一度だけ警告して気づけるようにする。
+_UNDEF_SANE_CEILING = 1 << 256
+_undef_ceiling_warned = False
 
 def _is_undef_derived(v):
     """v が UNDEF そのもの、または UNDEF 由来の巨大値かを判定する。"""
+    global _undef_ceiling_warned
     if v == UNDEF:
         return True
     if isinstance(v, int):
-        return abs(v) >= _UNDEF_DERIVED_THRESHOLD
+        av = abs(v)
+        if _UNDEF_SANE_CEILING <= av < _UNDEF_DERIVED_THRESHOLD and not _undef_ceiling_warned:
+            _undef_ceiling_warned = True
+            print(" warning - a value larger than 2**256 was computed; the UNDEF-sentinel "
+                  "heuristic may misclassify very large legitimate values as undefined.",
+                  file=sys.stderr)
+        return av >= _UNDEF_DERIVED_THRESHOLD
     return False
 
 CAPITAL = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -82,9 +100,101 @@ ERRORS = [
 ]
 
 
+class VLIWState:
+    """VLIW/EPICパケット関連の設定・実行時状態
+    (.vliw::vbits::instbits::templatebits::nopディレクティブで設定される)。
+
+    以前はAssemblerStateに8個のvliw*フィールドとして平坦に持たれており、
+    「VLIWパケット」という1つのまとまった概念であることがコードから
+    読み取りにくかった。単独のクラスとして切り出すことで、この単位で
+    構築・初期化・単体テストができるようにする。
+    """
+
+    def __init__(self):
+        self.instbits = 41
+        self.nop = []
+        self.bits = 128
+        self.slotset = []
+        self.flag = False
+        self.templatebits = 0x00
+        self.stop = 0
+        self.cnt = 1
+
+
+class ElfState:
+    """ELF出力設定・Pass2実行中のリロケーション追跡状態をまとめたクラス。
+
+    _elf_tracking/_elf_label_refs_seen/_elf_current_word_idx/
+    _elf_var_to_label/_elf_capturing_var は元々AssemblerStateに直接ぶら
+    下がる独立フラグ・辞書群で、「ELF出力に関わる一群の状態」であることが
+    名前の先頭アンダースコアと"_elf_"接頭辞だけで示されていた。1つの
+    クラスにまとめることで、ELF関連コード(write_elf_obj()等)が扱う
+    状態の範囲を型として明示する。
+    """
+
+    def __init__(self):
+        self.osabi: int = 9       # 9=FreeBSD, 0=Linux
+        self.objfile: str = ""
+        self.machine: int = 62    # 既定はEM_X86_64
+
+        # ELFリロケーション追跡用。tracking=Trueの間(Pass2のELF出力時)、
+        # makeobj()内でラベルを参照するたびにlabel_refs_seen /
+        # var_to_labelへ記録し、write_elf_obj()が.rela.*セクションを構築する。
+        self.relocations = []
+        self.tracking = False
+        self.label_refs_seen = []       # [(label_name, abs_value, word_idx)]
+        self.current_word_idx: int = -1  # makeobj()が生成中のバイトインデックス(-1=範囲外)
+        self.var_to_label: dict = {}     # {変数名: (label_name, label_value)} (!x直接キャプチャ時)
+        self.capturing_var: str | None = None  # match()が!xを評価中の変数名
+
+        # DWARFデバッグ情報生成(-g)用。gen_debug=Trueかつ-o指定時、
+        # write_elf_obj()が.debug_info/.debug_abbrev/.debug_lineを生成する。
+        self.gen_debug: bool = False
+        self.line_map: list = []  # Pass2で記録する (section, pc, file, line) のリスト
+
+
+class RelaxationState:
+    """Pass1/Pass2の進行状況とリラクゼーション収束判定に使う状態。
+
+    pas(現在のパス番号)を軸に、Pass1のサイズ見積もりモード・前回反復の
+    確定値・組合せ予算警告済みフラグなど、run()のリラクゼーションループと
+    LabelManager.get_value()が協調するために必要な状態をまとめる。
+    """
+
+    def __init__(self):
+        self.pas = 0             # 現在のパス番号: 0=対話モード, 1=Pass1, 2=Pass2
+
+        # True の間、未定義の前方参照ラベルはUNDEFではなく0を返す
+        # (Pass1のサイズ見積もり専用モード)。
+        self.pass1_size_mode = False
+
+        # 直前のPass1反復で確定した「ラベル名→(pc,section)」。全ラベルが
+        # 前回と一致すればリラクゼーション収束とみなす(run()参照)。
+        self.pass1_prev_label_pcs = _RELAXATION_SENTINEL
+
+        # 直前のPass1反復で確定した「ラベル名→値」。可変長命令アーキテクチャでは
+        # 前方参照ラベルの値で命令サイズが変わるため、未確定の前方参照には
+        # この推定値を返して反復ごとに真のレイアウトへ収束させる(get_value参照)。
+        self.relax_prev_values = {}
+
+        # PatternMatcher.match0()の組合せ数予算(_MAX_COMBINATIONS)を
+        # 使い切ったことを警告済みかどうか。実行全体で1度だけ警告すれば
+        # 十分なため(パターンファイル中の同じ問題箇所で行ごとに繰り返し
+        # 警告してもノイズにしかならない)、ここに保持する。
+        self.combo_budget_warned = False
+
+
 class AssemblerState:
     """アセンブラ全体で共有される状態(PC・ラベル表・セクション・パス番号等)を
     1つにまとめたコンテナ。各種Manager/Processorクラスはこれを介して協調する。
+
+    VLIW・ELF・リラクゼーションの3系統は関連フィールドが多く凝集度が高い
+    ため、それぞれVLIWState/ElfState/RelaxationStateへ切り出してある
+    (self.vliw/self.elf/self.relax)。既存コードは全て`self.state.vliwbits`
+    のようなフラットな属性アクセスに依存しているため、後方互換の
+    プロパティ(下記)を介して同じ書き方のまま新しいサブオブジェクトへ
+    転送する。新規コードはself.state.vliw.bitsのように直接サブオブジェクト
+    を参照してよい。
     """
 
     def __init__(self):
@@ -118,14 +228,7 @@ class AssemblerState:
         self.pat = []              # パターンファイルの全エントリ(PatternFileReaderが構築)
 
         # VLIW/EPICパケット設定(.vliw::vbits::instbits::templatebits::nopで設定)
-        self.vliwinstbits = 41
-        self.vliwnop = []
-        self.vliwbits = 128
-        self.vliwset = []
-        self.vliwflag = False
-        self.vliwtemplatebits = 0x00
-        self.vliwstop = 0
-        self.vcnt = 1
+        self.vliw = VLIWState()
 
         self.expmode = EXP_PAT
         self.error_undefined_label = False
@@ -139,7 +242,6 @@ class AssemblerState:
         self.bts = 8
         self.endian = 'little'
         self.byte = 'yes'
-        self.pas = 0             # 現在のパス番号: 0=対話モード, 1=Pass1, 2=Pass2
         self.debug = False
 
         self.cl = ""              # 現在処理中のソース行(デバッグ表示用)
@@ -154,52 +256,80 @@ class AssemblerState:
 
         self.exp_typ: str = 'i'   # 式評価の型モード('i'=整数, 'f'=浮動小数点)
 
-        # True の間、未定義の前方参照ラベルはUNDEFではなく0を返す
-        # (Pass1のサイズ見積もり専用モード)。
-        self._pass1_size_mode = False
-
-        # 直前のPass1反復で確定した「ラベル名→(pc,section)」。全ラベルが
-        # 前回と一致すればリラクゼーション収束とみなす(run()参照)。
-        self._pass1_prev_label_pcs = _RELAXATION_SENTINEL
-
-        # 直前のPass1反復で確定した「ラベル名→値」。可変長命令アーキテクチャでは
-        # 前方参照ラベルの値で命令サイズが変わるため、未確定の前方参照には
-        # この推定値を返して反復ごとに真のレイアウトへ収束させる(get_value参照)。
-        self._relax_prev_values = {}
+        # Pass1/Pass2の進行状況とリラクゼーション収束判定に使う状態
+        self.relax = RelaxationState()
 
         self.verbose: bool = False
 
         # stdin入力を保持する一時ファイルのパス(tempfileで生成、run()終了後に削除)。
         self.stdin_tmp_path: str | None = None
 
-        # ELF出力設定
-        self.osabi: int = 9       # 9=FreeBSD, 0=Linux
-        self.elf_objfile: str = ""
-        self.elf_machine: int = 62  # 既定はEM_X86_64
-
-        # ELFリロケーション追跡用。_elf_tracking=Trueの間(Pass2のELF出力時)、
-        # makeobj()内でラベルを参照するたびに_elf_label_refs_seen /
-        # _elf_var_to_labelへ記録し、write_elf_obj()が.rela.*セクションを構築する。
-        self.relocations = []
-        self._elf_tracking = False
-        self._elf_label_refs_seen = []       # [(label_name, abs_value, word_idx)]
-        self._elf_current_word_idx: int = -1  # makeobj()が生成中のバイトインデックス(-1=範囲外)
-        self._elf_var_to_label: dict = {}     # {変数名: (label_name, label_value)} (!x直接キャプチャ時)
-        self._elf_capturing_var: str | None = None  # match()が!xを評価中の変数名
+        # ELF出力設定・Pass2実行中のリロケーション追跡状態
+        self.elf = ElfState()
 
         self.init_func: str | None = None
         self.fini_func: str | None = None
-
-        # DWARFデバッグ情報生成(-g)用。gen_debug=Trueかつ-o指定時、
-        # write_elf_obj()が.debug_info/.debug_abbrev/.debug_lineを生成する。
-        self.gen_debug: bool = False
-        self.line_map: list = []  # Pass2で記録する (section, pc, file, line) のリスト
 
         # .check::x::sym1,sym2,... で登録される拘束条件。
         # {変数名: 許可シンボル名リスト}。マッチ成功後・makeobj前に検証し、
         # 変数の値がリスト外ならエラーにする。.clrcheckで解除する。
         self.check_constraints: dict = {}
 
+    def should_report_errors(self):
+        """ユーザー向けエラーメッセージを表示すべきパスかどうか。
+
+        pas==0(対話モード)とpas==2(Pass2、最終確定パス)でのみ表示する。
+        pas==1(Pass1)は前方参照未確定などが多く発生する見積もり専用の
+        反復なので、ここでのエラー表示は抑制する。新しいpas値を追加する
+        場合はこのメソッド1箇所を直せばよい(以前はこの条件式が47箇所に
+        直書きで重複しており、修正漏れの温床になっていた)。
+        """
+        return self.pas == 2 or self.pas == 0
+
+    # ---- 後方互換プロパティ ----
+    # vliw/elf/relaxサブオブジェクトへ切り出す前は self.state.vliwbits の
+    # ようなフラットな属性として直接読み書きされていた。ファイル全体で
+    # 600箇所以上ある既存の参照を書き換えずに済ませるため、旧属性名を
+    # 新しいサブオブジェクト属性へ転送するプロパティを(旧名 -> (サブ
+    # オブジェクト名, 新属性名))の対応表から機械的に生成する。新規コードは
+    # self.state.vliw.bits のようにサブオブジェクトを直接参照してよい。
+    _FORWARDED_ATTRS = {
+        'pas':                   ('relax', 'pas'),
+        '_pass1_size_mode':      ('relax', 'pass1_size_mode'),
+        '_pass1_prev_label_pcs': ('relax', 'pass1_prev_label_pcs'),
+        '_relax_prev_values':    ('relax', 'relax_prev_values'),
+        '_combo_budget_warned':  ('relax', 'combo_budget_warned'),
+
+        'vliwinstbits':     ('vliw', 'instbits'),
+        'vliwnop':          ('vliw', 'nop'),
+        'vliwbits':         ('vliw', 'bits'),
+        'vliwset':          ('vliw', 'slotset'),
+        'vliwflag':         ('vliw', 'flag'),
+        'vliwtemplatebits': ('vliw', 'templatebits'),
+        'vliwstop':         ('vliw', 'stop'),
+        'vcnt':             ('vliw', 'cnt'),
+
+        'osabi':                  ('elf', 'osabi'),
+        'elf_objfile':            ('elf', 'objfile'),
+        'elf_machine':            ('elf', 'machine'),
+        'relocations':            ('elf', 'relocations'),
+        '_elf_tracking':          ('elf', 'tracking'),
+        '_elf_label_refs_seen':   ('elf', 'label_refs_seen'),
+        '_elf_current_word_idx':  ('elf', 'current_word_idx'),
+        '_elf_var_to_label':      ('elf', 'var_to_label'),
+        '_elf_capturing_var':     ('elf', 'capturing_var'),
+        'gen_debug':              ('elf', 'gen_debug'),
+        'line_map':               ('elf', 'line_map'),
+    }
+    for _old_name, (_sub_name, _sub_attr) in _FORWARDED_ATTRS.items():
+        def _make_forward(_sub_name=_sub_name, _sub_attr=_sub_attr):
+            def _getter(self):
+                return getattr(getattr(self, _sub_name), _sub_attr)
+            def _setter(self, value):
+                setattr(getattr(self, _sub_name), _sub_attr, value)
+            return property(_getter, _setter)
+        locals()[_old_name] = _make_forward()
+    del _old_name, _sub_name, _sub_attr, _make_forward
 
 
 class StringUtils:
@@ -365,6 +495,27 @@ class StringUtils:
                         s += chr(int(hex_str, 16))
                     else:
                         s += 'x'
+                elif next_char in 'uU':
+                    # \x は1バイト(0〜0xFF)までしか表現できないため、.INCLUDE等
+                    # バイト単位出力の制約を受けない文字列(ファイルパス等)向けに
+                    # \uXXXX(4桁)・\UXXXXXXXX(8桁)の任意コードポイント表記を
+                    # 追加する(Python/Cの慣習に合わせた桁数)。
+                    _ndigits = 4 if next_char == 'u' else 8
+                    idx += 2
+                    hex_str = ''
+                    while idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF' and len(hex_str) < _ndigits:
+                        hex_str += l2[idx]
+                        idx += 1
+                    if len(hex_str) == _ndigits:
+                        try:
+                            s += chr(int(hex_str, 16))
+                        except (ValueError, OverflowError):
+                            print(f" warning - invalid \\{next_char} escape in: {l2!r}", file=sys.stderr)
+                            s += next_char
+                    else:
+                        print(f" warning - '\\{next_char}' escape requires {_ndigits} hex digits; "
+                              f"treated as literal characters in: {l2!r}", file=sys.stderr)
+                        s += next_char + hex_str
                 else:
                     s += next_char
                     idx += 2
@@ -883,7 +1034,7 @@ class LabelManager:
                 return 0
             v = UNDEF
             self.state.error_undefined_label = True
-            if not self.state._in_match_attempt and (self.state.pas == 2 or self.state.pas == 0):
+            if not self.state._in_match_attempt and (self.state.should_report_errors()):
                 _fn = self.state.current_file or ""
                 _ln = self.state.ln
                 print(f" error - Label undefined: '{k}'"
@@ -1038,7 +1189,7 @@ class ExpressionEvaluator:
             try:
                 x, idx = self.factor(s, idx + 1)
             except RecursionError:
-                if self.state.pas == 2 or self.state.pas == 0:
+                if self.state.should_report_errors():
                     print(" error - expression nesting too deep (RecursionError) in unary '-'.", file=sys.stderr)
                 return 0, idx
             x = -x
@@ -1046,20 +1197,20 @@ class ExpressionEvaluator:
             try:
                 x, idx = self.factor(s, idx + 1)
             except RecursionError:
-                if self.state.pas == 2 or self.state.pas == 0:
+                if self.state.should_report_errors():
                     print(" error - expression nesting too deep (RecursionError) in unary '~'.", file=sys.stderr)
                 return 0, idx
             try:
                 x = ~int(x)
             except (OverflowError, ValueError):
-                if self.state.pas == 2 or self.state.pas == 0:
+                if self.state.should_report_errors():
                     print(f" error - cannot apply bitwise NOT (~) to non-finite float value.", file=sys.stderr)
                 x = 0
         elif idx < len(s) and s[idx] == '@':
             try:
                 x, idx = self.factor(s, idx + 1)
             except RecursionError:
-                if self.state.pas == 2 or self.state.pas == 0:
+                if self.state.should_report_errors():
                     print(" error - expression nesting too deep (RecursionError) in unary '@'.", file=sys.stderr)
                 return 0, idx
             x = self.nbit(x)
@@ -1073,12 +1224,12 @@ class ExpressionEvaluator:
                         try:
                             shift_amount = int(x2) * 8
                         except (OverflowError, ValueError):
-                            if self.state.pas == 2 or self.state.pas == 0:
+                            if self.state.should_report_errors():
                                 print(" error - non-finite byte-extract offset in *(expr, expr).", file=sys.stderr)
                             x = 0
                         else:
                             if shift_amount < 0:
-                                if self.state.pas == 2 or self.state.pas == 0:
+                                if self.state.should_report_errors():
                                     print(" error - negative byte-extract offset in *(expr, expr).", file=sys.stderr)
                                 x = 0
                             else:
@@ -1098,7 +1249,7 @@ class ExpressionEvaluator:
                     and idx < len(s)
                     and s[idx] not in (chr(0), ',', ')', ']', CB, ' ', '\t')
                     and not self.state._in_match_attempt
-                    and (self.state.pas == 2 or self.state.pas == 0)):
+                    and (self.state.should_report_errors())):
                 print(f" warning - unrecognized token at position {idx} in expression: "
                       f"{s[idx:idx+8]!r} (treated as 0)", file=sys.stderr)
         idx = StringUtils.skipspc(s, idx)
@@ -1132,17 +1283,30 @@ class ExpressionEvaluator:
         escaped = _cc_escape(self.state.lwordchars)
         pattern = rf":([{escaped}]+)(?=[^{escaped}]|$)"
 
+        # ラベル参照 ":labelname" は、値をそのままhexリテラル文字列として
+        # ソーステキストに埋め込むのではなく、一意なプレースホルダ識別子に
+        # 置き換えてから ast.parse() する。lwordchars はユーザーが
+        # .labelc::で自由に変更できるため、値を直接文字列として埋め込む
+        # 旧方式は隣接トークンとの意図しない結合(例: 前の文字と連結して
+        # 別のPython字句になる)を生みやすかった。プレースホルダ方式なら
+        # 実際の値は _label_values 経由でast.Name評価時に解決するだけなので、
+        # テキスト置換とPython構文の間に取り違えの余地がなくなる。
+        _tag = "_AXXLBL_" + uuid.uuid4().hex
+        _label_values = {}
+
         def replacer(match):
             label_name = match.group(1)
+            placeholder = f"{_tag}{len(_label_values)}"
             try:
                 val = self.state.labels[label_name][0]
             except (KeyError, IndexError):
                 self.state.error_undefined_label = True
-                val = 0
-                return hex(0)
+                _label_values[placeholder] = 0
+                return placeholder
             if _is_undef_derived(val):
                 self.state.error_undefined_label = True
-                return hex(0)
+                _label_values[placeholder] = 0
+                return placeholder
             _is_equ = (len(self.state.labels.get(label_name, [])) > 2
                        and self.state.labels[label_name][2])
             if self.state._elf_tracking and not _is_equ:
@@ -1156,10 +1320,11 @@ class ExpressionEvaluator:
                     self.state._elf_label_refs_seen.append(
                         (label_name, val, self.state._elf_current_word_idx))
             try:
-                return hex(int(val))
+                _label_values[placeholder] = int(val)
             except (TypeError, ValueError, OverflowError):
                 self.state.error_undefined_label = True
-                return hex(0)
+                _label_values[placeholder] = 0
+            return placeholder
 
         s = re.sub(pattern, replacer, x)
 
@@ -1253,6 +1418,8 @@ class ExpressionEvaluator:
                 args = [_ev(a) for a in node.args]
                 return _ALLOWED_FUNCS[node.func.id](*args)
             if isinstance(node, ast.Name):
+                if node.id in _label_values:
+                    return _label_values[node.id]
                 raise ValueError(f"xeval: disallowed name '{node.id}' in '{s}'")
             raise ValueError(
                 f"xeval: disallowed AST node {type(node).__name__} in '{s}'")
@@ -1323,7 +1490,7 @@ class ExpressionEvaluator:
             t, idx = self.parser.get_symbol_word(s, idx)
             _sym_val = self.symbol_manager.get(t)
             if _sym_val == "":
-                if self.state.pas == 2 or self.state.pas == 0:
+                if self.state.should_report_errors():
                     print(f" error - undefined symbol: '#{t}'", file=sys.stderr)
                 x = 0
             else:
@@ -1353,7 +1520,7 @@ class ExpressionEvaluator:
                         try:
                             v = self.xeval(t, None)
                         except (ValueError, TypeError):
-                            if self.state.pas == 2 or self.state.pas == 0:
+                            if self.state.should_report_errors():
                                 print(f" error - qad{{}}: cannot evaluate expression '{t}'; using 0.", file=sys.stderr)
                             h = '0' * 32
                         else:
@@ -1381,7 +1548,7 @@ class ExpressionEvaluator:
                         v = float(self.xeval(t, None))
                         x = int.from_bytes(struct.pack('>d', v), "big")
                     except (OverflowError, ValueError, TypeError, struct.error):
-                        if self.state.pas == 2 or self.state.pas == 0:
+                        if self.state.should_report_errors():
                             print(f" error - dbl{{}}: cannot convert expression to float64; using 0.", file=sys.stderr)
                         x = 0
         elif (idx + 3 <= len(s) and s[idx:idx+3] == 'flt'
@@ -1400,7 +1567,7 @@ class ExpressionEvaluator:
                         v = float(self.xeval(t, None))
                         x = int.from_bytes(struct.pack('>f', v), "big")
                     except (OverflowError, ValueError, TypeError, struct.error):
-                        if self.state.pas == 2 or self.state.pas == 0:
+                        if self.state.should_report_errors():
                             print(f" error - flt{{}}: cannot convert expression to float32; using 0.", file=sys.stderr)
                         x = 0
         elif (idx + 5 <= len(s) and s[idx:idx+5] == 'enflt'
@@ -1414,14 +1581,14 @@ class ExpressionEvaluator:
                 _inner_undef = self.state.error_undefined_label
                 self.state.error_undefined_label = _outer_undef or _inner_undef
                 if _inner_undef:
-                    if self.state.pas == 2 or self.state.pas == 0:
+                    if self.state.should_report_errors():
                         print(" error - enflt{}: expression contains undefined label.", file=sys.stderr)
                     x = enflt(0)
                 else:
                     try:
                         x = enflt(int(v) & 0xFFFFFFFF)
                     except (OverflowError, ValueError):
-                        if self.state.pas == 2 or self.state.pas == 0:
+                        if self.state.should_report_errors():
                             print(" error - enflt{}: non-finite float value; using 0.", file=sys.stderr)
                         x = enflt(0)
         elif (idx + 5 <= len(s) and s[idx:idx+5] == 'endbl'
@@ -1435,14 +1602,14 @@ class ExpressionEvaluator:
                 _inner_undef = self.state.error_undefined_label
                 self.state.error_undefined_label = _outer_undef or _inner_undef
                 if _inner_undef:
-                    if self.state.pas == 2 or self.state.pas == 0:
+                    if self.state.should_report_errors():
                         print(" error - endbl{}: expression contains undefined label.", file=sys.stderr)
                     x = endbl(0)
                 else:
                     try:
                         x = endbl(int(v) & 0xFFFFFFFFFFFFFFFF)
                     except (OverflowError, ValueError):
-                        if self.state.pas == 2 or self.state.pas == 0:
+                        if self.state.should_report_errors():
                             print(" error - endbl{}: non-finite float value; using 0.", file=sys.stderr)
                         x = endbl(0)
         elif self.state.exp_typ=='i' and idx < len(s) and s[idx].isdigit():
@@ -1465,7 +1632,7 @@ class ExpressionEvaluator:
                 idx += 1
                 if (not self.state._in_match_attempt
                         and not self.state._pass1_size_mode
-                        and (self.state.pas == 2 or self.state.pas == 0)
+                        and (self.state.should_report_errors())
                         and _is_undef_derived(x)):
                     self.state.error_undefined_label = True
                     print(f" error - Label undefined: variable '{ch}' contains undefined value"
@@ -1533,7 +1700,22 @@ class ExpressionEvaluator:
                 else:
                     if isinstance(x, int) and isinstance(t, int):
                         q, r = divmod(x, t)
-                        x = q if r == 0 else x / t
+                        if r == 0:
+                            x = q
+                        else:
+                            # 割り切れない場合はPythonのfloat(53bit仮数)に
+                            # 変換するため、オペランドがfloatで正確に表現
+                            # できる整数域(2**53)を超えていると精度が黙って
+                            # 失われる。ラベル値同士の割り算等、大きな整数を
+                            # 扱いうる文脈で発生するため、検出できる場合は
+                            # 警告して気づけるようにする(値そのものは従来
+                            # 通りfloatにフォールバックする)。
+                            if ((abs(x) >= (1 << 53) or abs(t) >= (1 << 53))
+                                    and self.state.should_report_errors()):
+                                print(f" warning - dividing large integers ({x} / {t}) that do "
+                                      f"not divide evenly loses precision when converted to a "
+                                      f"float; result may not be exact.", file=sys.stderr)
+                            x = x / t
                     else:
                         x = x / t
             elif s[idx] == '%':
@@ -1575,11 +1757,11 @@ class ExpressionEvaluator:
                 except (ValueError, OverflowError):
                     x = 0; break
                 if t < 0:
-                    if self.state.pas == 2 or self.state.pas == 0:
+                    if self.state.should_report_errors():
                         print(f" error - negative shift count ({t}) in << expression.", file=sys.stderr)
                     x = 0; break
                 if t > _SHIFT_MAX:
-                    if self.state.pas == 2 or self.state.pas == 0:
+                    if self.state.should_report_errors():
                         print(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in << expression.", file=sys.stderr)
                     x = 0; break
                 x <<= t
@@ -1591,7 +1773,7 @@ class ExpressionEvaluator:
                 except (ValueError, OverflowError):
                     x = 0; break
                 if t < 0:
-                    if self.state.pas == 2 or self.state.pas == 0:
+                    if self.state.should_report_errors():
                         print(f" error - negative shift count ({t}) in >> expression.", file=sys.stderr)
                     x = 0; break
                 if t > _SHIFT_MAX:
@@ -1606,7 +1788,7 @@ class ExpressionEvaluator:
         try:
             return int(v)
         except (OverflowError, ValueError):
-            if self.state.pas == 2 or self.state.pas == 0:
+            if self.state.should_report_errors():
                 print(f" error - non-finite value {v!r} in bitwise '{op_name}' operation; treated as 0.", file=sys.stderr)
             return 0
 
@@ -1804,7 +1986,7 @@ class ExpressionEvaluator:
             x, idx0 = self.term11(s, idx0)
             return x, idx0
         except RecursionError:
-            if self.state.pas == 2 or self.state.pas == 0:
+            if self.state.should_report_errors():
                 print(" error - expression nesting too deep (RecursionError).",
                       file=sys.stderr)
             return 0, idx
@@ -1985,21 +2167,21 @@ class BinaryWriter:
 
     def outbin2(self, a, x):
         """Output binary without printing"""
-        if self.state.pas == 2 or self.state.pas == 0:
+        if self.state.should_report_errors():
             try:
                 self.fwrite(a, int(x), 0)
             except (OverflowError, ValueError):
-                if self.state.pas == 2 or self.state.pas == 0:
+                if self.state.should_report_errors():
                     print(f" error - non-finite value {x!r} cannot be written as binary word.", file=sys.stderr)
 
     def outbin(self, a, x):
         """Output binary with printing"""
-        if self.state.pas == 2 or self.state.pas == 0:
+        if self.state.should_report_errors():
             _prt = 1 if ((self.state.pas == 2 and self.state.verbose) or self.state.pas == 0) else 0
             try:
                 self.fwrite(a, int(x), _prt)
             except (OverflowError, ValueError):
-                if self.state.pas == 2 or self.state.pas == 0:
+                if self.state.should_report_errors():
                     print(f" error - non-finite value {x!r} cannot be written as binary word.", file=sys.stderr)
     
     def align_(self, addr):
@@ -2214,7 +2396,7 @@ class DirectiveProcessor:
             if idx <= idx_before:
                 break
 
-            if (self.state.pas == 2 or self.state.pas == 0) and u:
+            if (self.state.should_report_errors()) and u:
                 try:
                     t_int = int(t)
                 except (OverflowError, ValueError):
@@ -2459,7 +2641,7 @@ class PatternMatcher:
                         v = float(v)
                         v = int.from_bytes(struct.pack('>f', v), "big")
                     except (OverflowError, ValueError, struct.error):
-                        if self.state.pas == 2 or self.state.pas == 0:
+                        if self.state.should_report_errors():
                             print(f" error - !F: cannot convert value to float32; using 0.", file=sys.stderr)
                         v = 0
                     self.var_manager.put(a, v)
@@ -2488,7 +2670,7 @@ class PatternMatcher:
                         v = float(v)
                         v = int.from_bytes(struct.pack('>d', v), "big")
                     except (OverflowError, ValueError, struct.error):
-                        if self.state.pas == 2 or self.state.pas == 0:
+                        if self.state.should_report_errors():
                             print(f" error - !D: cannot convert value to float64; using 0.", file=sys.stderr)
                         v = 0
                     self.var_manager.put(a, v)
@@ -2604,6 +2786,15 @@ class PatternMatcher:
             else:
                 return False
     
+    # match0()の全探索が1回のマッチ試行で消費してよい組合せ数の上限。
+    # _MAX_OPT_GROUPS(グループ数の上限)だけでは cnt=20 でも
+    # 2**20 ≈ 100万通りに達しうるため、グループ数とは別に「このマッチが
+    # 不成立と分かるまでに試す組合せの総数」自体にも予算を設け、パターン
+    # ファイルの記述次第で1行のアセンブルが数分単位で止まってしまう
+    # 事態を防ぐ。予算を使い切った場合は「不成立」として安全側に倒す
+    # (誤ったマッチを返すことはない)。
+    _MAX_COMBINATIONS = 1 << 16
+
     def match0(self, s, t):
         """Match with optional bracket combinations.
 
@@ -2614,7 +2805,9 @@ class PatternMatcher:
 
         cntが大きいと2^cnt通りの全探索が非現実的な時間になるため、実用上
         20個を超えることはないという前提で_MAX_OPT_GROUPSを設け、超過分は
-        「常に含む」扱いにして組合せ爆発を防ぐ。
+        「常に含む」扱いにして組合せ爆発を防ぐ。それでも cnt=20 では
+        2**20通りに達しうるため、_MAX_COMBINATIONSで総試行回数にも
+        予算を設けて安全に打ち切る。
         """
         t = t.replace('[[', OB).replace(']]', CB)
         cnt = t.count(OB)
@@ -2622,16 +2815,26 @@ class PatternMatcher:
 
         _MAX_OPT_GROUPS = 20
         if cnt > _MAX_OPT_GROUPS:
-            if self.state.pas == 2 or self.state.pas == 0:
+            if self.state.should_report_errors():
                 print(f" warning - pattern has {cnt} optional groups (max {_MAX_OPT_GROUPS}); "
                       f"first {_MAX_OPT_GROUPS} are treated as optional, "
                       f"remainder are always included.", file=sys.stderr)
             sl = sl[:_MAX_OPT_GROUPS]
             cnt = _MAX_OPT_GROUPS
 
+        _tried = 0
         for i in range(len(sl) + 1):
             ll = list(itertools.combinations(sl, i))
             for j in ll:
+                _tried += 1
+                if _tried > self._MAX_COMBINATIONS:
+                    if self.state.should_report_errors() and not self.state._combo_budget_warned:
+                        self.state._combo_budget_warned = True
+                        print(f" warning - a pattern with {cnt} optional group(s) exceeded the "
+                              f"{self._MAX_COMBINATIONS}-combination match budget and was treated "
+                              f"as non-matching; consider splitting it into multiple explicit "
+                              f"pattern entries.", file=sys.stderr)
+                    return False
                 lt = self.remove_brackets(t, list(j))
                 saved_vars = self.state.vars[:]
                 saved_refs_len = len(self.state._elf_label_refs_seen)
@@ -2860,7 +3063,7 @@ class ObjectGenerator:
                     except (ValueError, OverflowError):
                         n_int = 0
                     if n_int > _N_MAX:
-                        if self.state.pas == 2 or self.state.pas == 0:
+                        if self.state.should_report_errors():
                             print(f" error - @@[n,...]: repeat count {n_int} exceeds maximum {_N_MAX}.", file=sys.stderr)
                         n_int = 0
                     if n_int > 0:
@@ -3020,7 +3223,7 @@ class VLIWProcessor:
                 
                 target_len = ibyte * noi
                 if len(values) > target_len:
-                    if self.state.pas == 2 or self.state.pas == 0:
+                    if self.state.should_report_errors():
                         print(f"warning-VLIW:{len(values)} values exceed slot capacity {target_len},truncating.", file=sys.stderr)
                     values = values[:target_len]
                 else:
@@ -3158,12 +3361,22 @@ class AssemblyDirectiveProcessor:
         return l
     
     def asciistr(self, l2):
-        """Process ASCII string"""
+        """Process ASCII string.
+
+        出力は1文字=1ワード(既定bts=8なら1バイト)の決め打ちであり、
+        ord(ch)がワード幅を超える文字はBinaryWriter.fwrite()内で
+        黙ってマスクされ、異なる値が書き込まれてしまう(例: bts=8で
+        'あ'(0x3042)を書くと下位バイト0x42のみが残り、警告なしに
+        文字化けする)。ここで一度だけ警告を出し、気づけるようにする。
+        """
         idx = 0
         if l2 == '' or l2[idx] != '"':
             return False
         idx += 1
-        
+
+        _word_mask = (1 << self.state.bts) - 1 if self.state.bts > 0 else 0xFF
+        _truncated = False
+
         while idx < len(l2) and not l2[idx]=='"':
             ch = None
             if l2[idx:idx+2] == '\\0':
@@ -3195,14 +3408,37 @@ class AssemblyDirectiveProcessor:
                 else:
                     print(f" error - '\\x' escape requires at least one hex digit in string: {l2!r}", file=sys.stderr)
                     return False
+            elif l2[idx:idx+2] in ('\\u', '\\U'):
+                _ndigits = 4 if l2[idx:idx+2] == '\\u' else 8
+                idx += 2
+                hex_str = ''
+                while idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF' and len(hex_str) < _ndigits:
+                    hex_str += l2[idx]
+                    idx += 1
+                if len(hex_str) == _ndigits:
+                    try:
+                        ch = chr(int(hex_str, 16))
+                    except (ValueError, OverflowError):
+                        print(f" error - invalid \\u/\\U escape in string: {l2!r}", file=sys.stderr)
+                        return False
+                else:
+                    print(f" error - '\\{'u' if _ndigits == 4 else 'U'}' escape requires "
+                          f"{_ndigits} hex digits in string: {l2!r}", file=sys.stderr)
+                    return False
             else:
                 ch = l2[idx]
                 idx += 1
             if ch is not None:
+                if ord(ch) > _word_mask:
+                    _truncated = True
                 self.binary_writer.outbin(self.state.pc, ord(ch))
                 self.state.pc += 1
         if idx >= len(l2):
             print(f" warning - unterminated string literal in .ASCII/.ASCIZ: {l2!r}", file=sys.stderr)
+        if _truncated and self.state.should_report_errors():
+            print(f" warning - .ASCII/.ASCIZ: one or more characters exceed the output word "
+                  f"width ({self.state.bts} bit(s)) and were truncated (high bits discarded): "
+                  f"{l2!r}", file=sys.stderr)
         return True
     
     def export_processing(self, l1, l2):
@@ -3211,7 +3447,7 @@ class AssemblyDirectiveProcessor:
         .GLOBAL label  -- alias for .EXPORT (GAS/NASM compatible syntax)
         Both directives are only active during pass2 and interactive mode.
         """
-        if not (self.state.pas == 2 or self.state.pas == 0):
+        if not (self.state.should_report_errors()):
             return False
         _l1u = StringUtils.upper(l1)
         if _l1u != ".EXPORT" and _l1u != ".GLOBAL":
@@ -3248,13 +3484,13 @@ class AssemblyDirectiveProcessor:
             return False
         x, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
-            if self.state.pas == 2 or self.state.pas == 0:
+            if self.state.should_report_errors():
                 print(f" error - .RESB argument contains undefined label.", file=sys.stderr)
             return True
         try:
             x = int(x)
         except (OverflowError, ValueError):
-            if self.state.pas == 2 or self.state.pas == 0:
+            if self.state.should_report_errors():
                 print(f" error - .RESB argument is non-finite or invalid.", file=sys.stderr)
             return True
         if x < 0:
@@ -3262,7 +3498,7 @@ class AssemblyDirectiveProcessor:
             return True
         _RESB_MAX = 1 << 28
         if x > _RESB_MAX:
-            if self.state.pas == 2 or self.state.pas == 0:
+            if self.state.should_report_errors():
                 print(f" error - .RESB count {x} exceeds maximum {_RESB_MAX}.", file=sys.stderr)
             return True
         self.state.pc += x
@@ -3284,13 +3520,13 @@ class AssemblyDirectiveProcessor:
             return False
         x, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
-            if self.state.pas == 2 or self.state.pas == 0:
+            if self.state.should_report_errors():
                 print(f" error - .ZERO argument contains undefined label.", file=sys.stderr)
             return True
         try:
             x = int(x)
         except (OverflowError, ValueError):
-            if self.state.pas == 2 or self.state.pas == 0:
+            if self.state.should_report_errors():
                 print(f" error - .ZERO argument is non-finite or invalid.", file=sys.stderr)
             return True
         if x < 0:
@@ -3298,7 +3534,7 @@ class AssemblyDirectiveProcessor:
             return True
         _ZERO_MAX = 1 << 28
         if x > _ZERO_MAX:
-            if self.state.pas == 2 or self.state.pas == 0:
+            if self.state.should_report_errors():
                 print(f" error - .ZERO count {x} exceeds maximum {_ZERO_MAX}.", file=sys.stderr)
             return True
         for i in range(x):
@@ -3317,7 +3553,7 @@ class AssemblyDirectiveProcessor:
         if StringUtils.upper(l1) != ".ASCIZ":
             return False
         if not self.asciistr(l2):
-            if self.state.pas == 2 or self.state.pas == 0:
+            if self.state.should_report_errors():
                 print(f" error - .ASCIZ requires a quoted string.", file=sys.stderr)
             return False
         self.binary_writer.outbin(self.state.pc, 0x00)
@@ -3481,17 +3717,17 @@ class AssemblyDirectiveProcessor:
             return False
         u, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
-            if self.state.pas == 2 or self.state.pas == 0:
+            if self.state.should_report_errors():
                 print(f" error - .ORG argument contains undefined label.", file=sys.stderr)
             return True
         try:
             u = int(u)
         except (OverflowError, ValueError):
-            if self.state.pas == 2 or self.state.pas == 0:
+            if self.state.should_report_errors():
                 print(f" error - .ORG argument is non-finite or invalid.", file=sys.stderr)
             return True
         if u < 0:
-            if self.state.pas == 2 or self.state.pas == 0:
+            if self.state.should_report_errors():
                 print(f" error - .ORG address must be non-negative, got {u}.", file=sys.stderr)
             return True
         if idx + 2 <= len(l2) and l2[idx:idx+2].upper() == ',P':
@@ -3499,7 +3735,7 @@ class AssemblyDirectiveProcessor:
                 _ORG_FILL_MAX = 1 << 28
                 fill_count = u - self.state.pc
                 if fill_count > _ORG_FILL_MAX:
-                    if self.state.pas == 2 or self.state.pas == 0:
+                    if self.state.should_report_errors():
                         print(f" error - .ORG ,P fill count {fill_count} exceeds maximum {_ORG_FILL_MAX}.", file=sys.stderr)
                     return True
                 for i in range(fill_count):
@@ -3585,12 +3821,12 @@ class Assembler:
         _l_upper = StringUtils.upper(l)
         if _l_upper == '.ASCII':
             _ok = self.asm_directive_proc.ascii_processing(l, l2)
-            if not _ok and (self.state.pas == 2 or self.state.pas == 0):
+            if not _ok and (self.state.should_report_errors()):
                 print(f" error - .ASCII: failed to process string argument: {l2!r}", file=sys.stderr)
             return 0, [], True, idx
         if _l_upper == '.ASCIZ':
             _ok = self.asm_directive_proc.asciiz_processing(l, l2)
-            if not _ok and (self.state.pas == 2 or self.state.pas == 0):
+            if not _ok and (self.state.should_report_errors()):
                 print(f" error - .ASCIZ: failed to process string argument: {l2!r}", file=sys.stderr)
             return 0, [], True, idx
         if self.include_asm(l, l2):
@@ -3651,6 +3887,12 @@ class Assembler:
         best = None              # 現時点の最良マッチ(スナップショットdict)
         hit_sentinel = False     # 番兵エントリ(i[0]=='')に到達したか
         first_match_exc = None   # 診断用: 走査中に最初に例外を出したパターン
+        # 診断用: マッチ成立の有無によらず、走査中に例外を出した全パターンを
+        # 記録しておく。他のパターンが結果的にマッチしてもこれらの例外は
+        # サイレントに握りつぶされるため、-v/--debug時にだけ警告として
+        # 表示し、パターンファイルの潜在バグに気づけるようにする
+        # (デフォルト動作・出力は一切変えない)。
+        exc_log = []
 
         _DIR_SCALAR_FIELDS = ('endian', 'bts', 'padding', 'swordchars',
                               'vliwbits', 'vliwinstbits', 'vliwtemplatebits',
@@ -3756,13 +3998,14 @@ class Assembler:
                 _match_result = self.pattern_matcher.match0(lin, i[0])
             except (ArithmeticError, KeyError, IndexError, ValueError,
                     TypeError, AttributeError, OverflowError,
-                    struct.error):
+                    struct.error) as _pat_exc:
                 # 順序非依存化の一環: マッチ試行中の例外は「このパターンは
                 # 不成立」として扱い、他パターンの走査を継続する。
                 # RecursionError等ここに列挙されない例外は再送出される。
                 _match_result = False
                 if first_match_exc is None:
                     first_match_exc = (pln, pl)
+                exc_log.append((pln, pl, type(_pat_exc).__name__, str(_pat_exc)))
             finally:
                 self.state._in_match_attempt = False
 
@@ -3790,6 +4033,19 @@ class Assembler:
                     break
 
             self.state.error_undefined_label = False
+
+        if best is not None and exc_log and (self.state.verbose or self.state.debug):
+            # 採用されたパターン以外にも、走査中に例外で不成立になった候補が
+            # あったことを知らせる(通常運転では何も表示しない診断情報)。
+            # 意図したパターンが例外で弾かれ、別の意図しないパターンが
+            # マッチしてしまう不具合はエラーなしで進んでしまうため、
+            # パターンファイル作者が気づけるようにするための可視化。
+            _other_plns = sorted({e[0] for e in exc_log if e[0] != best['pln']})
+            if _other_plns:
+                print(f" warning - {len(_other_plns)} other candidate pattern(s) at line(s) "
+                      f"{_other_plns} raised an exception during matching and were skipped "
+                      f"in favor of pattern line {best['pln']}.  "
+                      f"[{self.state.current_file}:{self.state.ln}]", file=sys.stderr)
 
         if best is not None:
             i = best['pat']
@@ -3860,7 +4116,7 @@ class Assembler:
             pln = 0
             pl = ""
         
-        if self.state.pas == 2 or self.state.pas == 0:
+        if self.state.should_report_errors():
             _loc = f"  [{self.state.current_file}:{self.state.ln}]"
             if self.state.error_undefined_label:
                 print(f" error - Undefined label in expression.{_loc}", file=sys.stderr)
@@ -5041,6 +5297,12 @@ class Assembler:
                 MAX_RELAX = 16
                 self.state._pass1_prev_label_pcs = _RELAXATION_SENTINEL
                 self.state._relax_prev_values = {}
+                # 直前の1回との一致だけを見ていると、周期2以上で振動する
+                # レイアウト(A→B→A→B→...)をMAX_RELAX回使い切るまで検出
+                # できない。見てきた全レイアウトを記録しておき、以前に
+                # 見たものへ戻ったら(周期が何であれ)その時点で振動として
+                # 検出し、明確なエラーで打ち切る。
+                _seen_pcs_history = {}   # frozenset(current_pcs.items()) -> 検出時のrelax_iter(1始まり)
 
                 _imported_labels = dict(self.state.labels)
 
@@ -5082,12 +5344,23 @@ class Assembler:
                         k: v[0] for k, v in self.state.labels.items()
                         if not _is_undef_derived(v[0])
                     }
-                    if (not has_undef
-                            and self.state._pass1_prev_label_pcs is not _RELAXATION_SENTINEL
-                            and current_pcs == self.state._pass1_prev_label_pcs):
-                        if self.state.debug:
-                            print(f"Pass1 relaxation converged after {relax_iter + 1} iteration(s)", file=sys.stderr)
-                        break
+                    if not has_undef:
+                        _pcs_key = frozenset(current_pcs.items())
+                        _first_seen = _seen_pcs_history.get(_pcs_key)
+                        if _first_seen is not None:
+                            _cycle_len = (relax_iter + 1) - _first_seen
+                            if _cycle_len == 1:
+                                if self.state.debug:
+                                    print(f"Pass1 relaxation converged after {relax_iter + 1} iteration(s)", file=sys.stderr)
+                                break
+                            else:
+                                print(f" error - Pass1 relaxation is oscillating with period "
+                                      f"{_cycle_len} (the instruction layout at iteration "
+                                      f"{relax_iter + 1} is identical to iteration {_first_seen}); "
+                                      f"it will never converge by simple repetition.", file=sys.stderr)
+                                print("         Aborting: no output file written.", file=sys.stderr)
+                                return False
+                        _seen_pcs_history[_pcs_key] = relax_iter + 1
                     self.state._pass1_prev_label_pcs = current_pcs
                 else:
                     # Fix: 収束しなかった場合は単なる警告ではなく致命的エラーとする。

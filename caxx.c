@@ -316,9 +316,32 @@ static int u256_is_undef(uint256_t a) { return u256_eq(a, UNDEF_VAL()); }
  *   UNDEF +/- displacement (~2^256) all have the top 64-bit word (w[3]) set.
  * Using the existing unsigned convention of this file (w[3] != 0  <=>  >= 2^192),
  * this matches axx.py's `v == UNDEF or abs(v) >= 2^192` for the dominant
- * (large-positive, near-2^256) UNDEF-derived case. */
+ * (large-positive, near-2^256) UNDEF-derived case.
+ *
+ * 破綻点修正2 (axx.py port, ただし本質的な制約あり):
+ * axx.pyは任意精度整数なので、番兵UNDEFを2^1024級まで押し上げて実用上
+ * 衝突しない安全域を作れた。しかしこのCポートの値は本物の固定幅256bit
+ * 整数(uint256_t)であり、型自体が256bitを超える値を表現できないため、
+ * 同じ手は使えない。つまり[2^192, 2^256)の範囲(値域の上位1/4)にある
+ * 正当な256bit定数(例: 全ビット1のビットマスクや256bit表現の-1)は、
+ * 現状のヒューリスティックでは原理的にUNDEF由来と誤判定されうる。
+ * この誤判定を型レベルで完全に無くすには値の表現方法自体を変える必要が
+ * あり(全呼び出し箇所に影響する非常に大規模な変更になる)、このセッション
+ * の修正範囲を超える。ここでは最低限、実際にその境界値域に達したことを
+ * 検出できる場合に一度だけ警告し、無警告での誤判定を防ぐに留める。 */
 static int u256_is_undef_derived(uint256_t a) {
     if (u256_is_undef(a)) return 1;
+    if (a.w[3] != 0) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    " warning - a value >= 2**192 was computed and is being treated as "
+                    "UNDEF-derived; this heuristic cannot distinguish it from a genuine "
+                    "large 256-bit constant (e.g. an all-ones bitmask) because uint256_t "
+                    "has no headroom beyond 256 bits for a true out-of-band sentinel.\n");
+        }
+    }
     return a.w[3] != 0;          /* unsigned >= 2^192 */
 }
 
@@ -944,7 +967,20 @@ typedef struct {
      * circular-include detection, plus the current nesting depth. */
     char      *pat_include_chain[64];
     int        pat_include_depth;
+
+    /* 破綻点修正5 (axx.py port): pat_match0()の組合せ数予算を使い切った
+     * ことを警告済みかどうか。実行全体で1度だけ警告すれば十分。 */
+    int        combo_budget_warned;
 } AsmState;
+
+/* 破綻点修正7 (axx.py port): 「ユーザー向けエラーを表示すべきパスか」の
+ * 判定 (pas==0:対話モード, pas==2:Pass2) が全体で16箇所に条件式として
+ * 直書きされており、新しいpas値を追加する際の修正漏れの温床になって
+ * いた。1箇所のヘルパーに集約する(axx.py側のAssemblerState.should_report_errors()
+ * と対応)。 */
+static inline int should_report_errors(const AsmState *st) {
+    return st->pas == 2 || st->pas == 0;
+}
 
 /* Finalize the current (last) section's size after fileassemble() completes.
  * adir_section() only updates the OLD section on switch; the final section is
@@ -1708,11 +1744,11 @@ static void fwrite_word(AsmState *st, uint64_t position, uint256_t x, int prt){
 }
 
 static void outbin(AsmState *st, uint256_t a, uint256_t x){
-    if(st->pas==2||st->pas==0)
+    if(should_report_errors(st))
         fwrite_word(st, u256_to_u64(a), x, (st->pas==0)||st->verbose);
 }
 static void outbin2(AsmState *st, uint256_t a, uint256_t x){
-    if(st->pas==2||st->pas==0)
+    if(should_report_errors(st))
         fwrite_word(st, u256_to_u64(a), x, 0);
 }
 
@@ -1874,7 +1910,7 @@ static uint256_t label_get_value(AsmState *st, const char *k){
     /* in_match_attempt が 1 のときはパターンマッチ試行中であり、
      * このラベル参照は後に別パターンに差し替えられる可能性があるためエラーを表示しない。
      * （例: OUT (!n),A が OUT (C),E を試みる際に !n キャプチャで C がラベル評価される。） */
-    if(!st->in_match_attempt && (st->pas == 2 || st->pas == 0)){
+    if(!st->in_match_attempt && should_report_errors(st)){
         fprintf(stderr, " error - Label undefined: '%s'  [%s:%d]\n",
             k, st->current_file, (int)st->ln);
     }
@@ -2075,7 +2111,7 @@ static uint256_t expr_factor(Assembler *asmb, const char *s, int idx, int *idx_o
      * overflow. Mirrors axx.py's factor/_factor_impl split. */
     AsmState *st=&asmb->st;
     if(st->expr_depth >= EXPR_MAX_DEPTH){
-        if(st->pas==2 || st->pas==0)
+        if(should_report_errors(st))
             fprintf(stderr," error - expression nesting too deep.\n");
         if(idx_out) *idx_out = idx;
         return u256_zero();
@@ -2413,7 +2449,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
              */
             if(!st->in_match_attempt
                && !st->pass1_size_mode
-               && (st->pas == 2 || st->pas == 0)){
+               && should_report_errors(st)){
                 /* B (axx.py port): centralized detection, threshold raised to 2^192. */
                 if(u256_is_undef_derived(x)){
                     st->error_undefined_label = 1;
@@ -2570,12 +2606,12 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
         if(axx_q(s,slen,"<<",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
             int64_t sv=u256_to_i64(t);
-            if(sv<0){ if(asmb->st.pas==2||asmb->st.pas==0) fprintf(stderr," error - negative shift count.\n"); x=u256_zero(); }
+            if(sv<0){ if(should_report_errors(&asmb->st)) fprintf(stderr," error - negative shift count.\n"); x=u256_zero(); }
             else x=u256_shl(x,(int)sv);
         } else if(axx_q(s,slen,">>",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
             int64_t sv=u256_to_i64(t);
-            if(sv<0){ if(asmb->st.pas==2||asmb->st.pas==0) fprintf(stderr," error - negative shift count.\n"); x=u256_zero(); }
+            if(sv<0){ if(should_report_errors(&asmb->st)) fprintf(stderr," error - negative shift count.\n"); x=u256_zero(); }
             else x=u256_sar(x,(int)sv);
         } else break;
     }
@@ -3128,7 +3164,7 @@ static int dir_error(Assembler *asmb, const char *s){
         if(buf[idx]==';') idx++;
         uint256_t t=expr_expression_pat(asmb,buf,idx,&io);
         idx=io;
-        if((st->pas==2||st->pas==0)&&!u256_is_zero(u)){
+        if((should_report_errors(st))&&!u256_is_zero(u)){
             int64_t tc=u256_to_i64(t);
             fprintf(stderr,"Line %d Error code %lld ",(int)st->ln,(long long)tc);
             if(tc>=0&&tc<ERRORS_COUNT) fprintf(stderr,"%s",ERRORS_TABLE[tc]);
@@ -3520,9 +3556,28 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
     int *sl=malloc((cnt+1)*sizeof(int));
     for(int i=0;i<cnt;i++) sl[i]=i+1;   /* serials 1..cnt */
 
+    /* 破綻点修正5 (axx.py port): MAX_OPT_GROUPS=20 だけではcnt=20で
+     * 2^20 ≈ 100万通りに達しうる。グループ数の上限とは別に、1回の
+     * pat_match0()呼び出しが試してよい組合せの総数にも予算を設け、
+     * 予算を使い切ったら「不成立」として安全側に倒す(誤ったマッチを
+     * 返すことはない)。 */
+    const uint64_t MAX_COMBINATIONS = (uint64_t)1 << 16;
+    uint64_t tried = 0;
+
     int found=0;
     uint64_t total = (uint64_t)1 << cnt; /* 2^cnt subsets; safe for cnt<=63 */
     for(uint64_t mask=0; mask<total && !found; mask++){
+        if(++tried > MAX_COMBINATIONS){
+            if(!asmb->st.combo_budget_warned){
+                asmb->st.combo_budget_warned = 1;
+                fprintf(stderr,
+                        " warning - a pattern with %d optional group(s) exceeded the "
+                        "%llu-combination match budget and was treated as non-matching; "
+                        "consider splitting it into multiple explicit pattern entries.\n",
+                        cnt, (unsigned long long)MAX_COMBINATIONS);
+            }
+            break;
+        }
         int ri[64]; int nr=0;
         for(int i=0;i<cnt;i++) if(mask & ((uint64_t)1<<i)) ri[nr++]=sl[i];
         char *lt=remove_brackets_str(t,ri,nr);
@@ -3961,7 +4016,7 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
     /* Fix ③ (axx.py): vliwinstbits==0 causes division by zero in noi calculation.
      * Guard and report an error, matching axx.py VLIWProcessor.vliwprocess(). */
     if(st->vliwinstbits == 0){
-        if(st->pas==0||st->pas==2)
+        if(should_report_errors(st))
             fprintf(stderr," error - vliwinstbits is zero; cannot compute instruction slots.\n");
         ivv_free(&objs); free(idxlst);
         if(idx_out) *idx_out=idx;
@@ -3993,7 +4048,7 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         int noi=(vbits-at)/st->vliwinstbits;
         int target_len=ibyte*noi;
         if(values.len > target_len){
-            if(st->pas==2||st->pas==0)
+            if(should_report_errors(st))
                 fprintf(stderr,"warning-VLIW:%d values exceed slot capacity %d,truncating.\n",values.len,target_len);
             values.len=target_len;
         } else {
@@ -4048,7 +4103,7 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         found=1; break;
     }
 
-    if(!found && (st->pas==0||st->pas==2))
+    if(!found && (should_report_errors(st)))
         fprintf(stderr," error - No vliw instruction-set defined.\n");
 
     ivv_free(&objs); free(idxlst);
@@ -4280,7 +4335,7 @@ static int adir_resX(Assembler *asmb, const char *l, const char *l2,
     int io;
     uint256_t x=expr_expression_asm(asmb,l2,0,&io);
     if(asmb->st.error_undefined_label){
-        if(asmb->st.pas==2||asmb->st.pas==0)
+        if(should_report_errors(&asmb->st))
             fprintf(stderr," error - %s argument contains undefined label.\n",directive);
         return 1;
     }
@@ -4292,7 +4347,7 @@ static int adir_resX(Assembler *asmb, const char *l, const char *l2,
     }
     /* 256 MB guard: check before multiplying to avoid signed overflow */
     if(cnt > (int64_t)(1 << 28) / (int64_t)mul){
-        if(asmb->st.pas==2||asmb->st.pas==0)
+        if(should_report_errors(&asmb->st))
             fprintf(stderr," error - %s count %lld (x%llu) exceeds maximum %d words.\n",
                     directive,(long long)cnt,(unsigned long long)mul,1<<28);
         return 1;
@@ -4326,7 +4381,7 @@ static int adir_zero(Assembler *asmb, const char *l, const char *l2){
     /* Fix ②: guard against UNDEF (undefined label) to avoid range(UNDEF) freeze.
      * Also guard against negative values. Mirrors axx.py zero_processing(). */
     if(asmb->st.error_undefined_label){
-        if(asmb->st.pas==2||asmb->st.pas==0)
+        if(should_report_errors(&asmb->st))
             fprintf(stderr," error - .ZERO argument contains undefined label.\n");
         return 1;
     }
@@ -4353,7 +4408,7 @@ static int adir_asciiz(Assembler *asmb, const char *l, const char *l2){
     if(strcmp(up,".ASCIZ")!=0) return 0;
     int f=asciistr(asmb,l2);
     if(!f){
-        if(asmb->st.pas==2||asmb->st.pas==0)
+        if(should_report_errors(&asmb->st))
             fprintf(stderr," error - .ASCIZ requires a quoted string.\n");
         return 0;
     }
@@ -4376,7 +4431,7 @@ static int adir_org(Assembler *asmb, const char *l, const char *l2){
     /* Fix ②: guard against UNDEF to prevent pc being set to 0xffff…ff.
      * Mirrors axx.py org_processing() which checks error_undefined_label. */
     if(asmb->st.error_undefined_label){
-        if(asmb->st.pas==2||asmb->st.pas==0)
+        if(should_report_errors(&asmb->st))
             fprintf(stderr," error - .ORG argument contains undefined label.\n");
         return 1;
     }
@@ -5011,7 +5066,7 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
 
     if(loopflag){ se=1; pln=0; }
 
-    if(st->pas==2||st->pas==0){
+    if(should_report_errors(st)){
         if(st->error_undefined_label)
             fprintf(stderr, " error - Undefined label in expression.  [%s:%d]\n",
                 st->current_file, (int)st->ln);
@@ -6365,6 +6420,32 @@ static void print_usage(const char *prog){
     printf("axx general assembler programmed and designed by Taisuke Maekawa\n");
 }
 
+/* 破綻点修正6 (axx.py port): Pass1リラクゼーションの振動検出。
+ * 直前の1回とだけ比較していると、周期2以上で振動するレイアウト
+ * (A→B→A→B→...)をMAX_RELAX回使い切るまで検出できない。過去に見た
+ * 全レイアウトの履歴(history[])と比較し、以前に見たものへ戻ったら
+ * その時点で振動として検出する。比較基準は既存の収束判定と同じ
+ * (エントリ数が一致し、全ラベルの値・所属セクションが一致)。 */
+static int label_maps_equal(LabelMap *a, LabelMap *b) {
+    if (a->count != b->count) return 0;
+    for (int bi = 0; bi < a->nbuckets; bi++)
+        for (LabelEntry *e = a->buckets[bi]; e; e = e->next) {
+            LabelEntry *p = lmap_find(b, e->key);
+            if (!p || !u256_eq(p->value, e->value)
+                   || strcmp(p->section ? p->section : "",
+                             e->section ? e->section : "") != 0)
+                return 0;
+        }
+    return 1;
+}
+static void label_map_copy_from(LabelMap *dst, LabelMap *src) {
+    lmap_init(dst);
+    for (int bi = 0; bi < src->nbuckets; bi++)
+        for (LabelEntry *e = src->buckets[bi]; e; e = e->next)
+            lmap_set_full(dst, e->key, e->value, e->section,
+                          e->is_equ, e->is_imported, e->reloc_type_override);
+}
+
 typedef struct {
     char    s[16];
     int     nu;
@@ -6499,6 +6580,10 @@ int main(int argc, char *argv[]){
         lmap_init(&prev_labels);
         int converged = 0;
 
+        /* 破綻点修正6: 振動検出用のレイアウト履歴(label_maps_equal参照)。 */
+        LabelMap history[MAX_RELAX];
+        int history_count = 0;
+
         /* A (axx.py port): expose the previous-iteration snapshot to
          * label_get_value() so pass1 forward references resolve to their prior
          * address. prev_labels is updated at the END of each iteration, so at
@@ -6557,24 +6642,42 @@ int main(int argc, char *argv[]){
                     if(u256_is_undef_derived(e->value)){ has_undef=1; break; }
                 }
 
-            converged = !has_undef ? 1 : 0;
-            if(converged){
-                for(int bi=0; bi<st->labels.nbuckets && converged; bi++){
-                    for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next){
-                        LabelEntry *p=lmap_find(&prev_labels, e->key);
-                        /* Fix ⑥-2: compare both value and section */
-                        if(!p || !u256_eq(p->value, e->value)
-                               || strcmp(p->section ? p->section : "",
-                                         e->section ? e->section : "") != 0){
-                            converged=0; break;
-                        }
-                    }
+            /* 破綻点修正6: 直前の1回だけでなく、履歴中の全レイアウトと比較する。
+             * cycle_len==1なら従来通りの単純収束、2以上なら振動として検出し、
+             * MAX_RELAX回を待たずに明確なエラーで打ち切る(誤ったバイナリを
+             * 黙って出力しないため)。 */
+            converged = 0;
+            if(!has_undef){
+                int first_seen = -1;
+                for(int hi=0; hi<history_count; hi++){
+                    if(label_maps_equal(&st->labels, &history[hi])){ first_seen = hi; break; }
                 }
-                /* Also check no label was removed */
-                if(converged && prev_labels.count != st->labels.count) converged=0;
+                if(first_seen >= 0){
+                    int cycle_len = history_count - first_seen;
+                    if(cycle_len == 1){
+                        converged = 1;
+                    } else {
+                        fprintf(stderr,
+                            " error - Pass1 relaxation is oscillating with period %d "
+                            "(the instruction layout at iteration %d is identical to "
+                            "iteration %d); it will never converge by simple repetition.\n",
+                            cycle_len, relax+1, first_seen+1);
+                        fprintf(stderr,"         Aborting: no output file written.\n");
+                        for(int hi=0; hi<history_count; hi++) lmap_free(&history[hi]);
+                        lmap_free(&prev_labels);
+                        lmap_free(&imported_labels);
+                        st->relax_prev = NULL;
+                        exit_code = 1;
+                        goto cleanup;
+                    }
+                } else {
+                    label_map_copy_from(&history[history_count], &st->labels);
+                    history_count++;
+                }
             }
 
-            /* Update prev_labels snapshot */
+            /* Update prev_labels snapshot (label_get_value()の前方参照推定用。
+             * 振動検出のhistory[]とは別目的なので、こちらは従来通り毎回更新する)。 */
             lmap_free(&prev_labels); lmap_init(&prev_labels);
             for(int bi=0; bi<st->labels.nbuckets; bi++)
                 for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
@@ -6588,6 +6691,7 @@ int main(int argc, char *argv[]){
                 break;
             }
         }
+        for(int hi=0; hi<history_count; hi++) lmap_free(&history[hi]);
         /* A (axx.py port, 指摘3): snapshot pass1-final addresses (is_equ=0 only)
          * for the pass1<->pass2 consistency check performed after pass2. */
         LabelMap pass1_final;
