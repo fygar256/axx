@@ -1085,9 +1085,15 @@ class LabelManager:
             return False
         
         self.state.error_label_conflict = False
-        existing = self.state.labels.get(k)
-        is_imported = (existing is not None and len(existing) > 3 and existing[3])
-        
+        # put_value()は「このラベルに実際の値を設定する」呼び出しであり、
+        # 常にラベルの輸入(.EXTERN)状態を終了させる。以前は既存エントリの
+        # is_imported をそのまま引き継いでいたため、.EXTERN で仮登録した後
+        # に同名ラベルをローカルで定義しても is_imported=True が残り続け、
+        # write_elf_obj() がそのシンボルを永久にSTB_GLOBAL/SHN_UNDEFとして
+        # 出力してしまうバグがあった(ローカルに正しい値を持つのにELF上では
+        # 未定義シンボルのままになる)。
+        is_imported = False
+
         entry = [v, s, is_equ, is_imported]
         if reloc_type is not None:
             entry.append(reloc_type)
@@ -1519,7 +1525,12 @@ class ExpressionEvaluator:
                     except (ValueError, ZeroDivisionError):
                         try:
                             v = self.xeval(t, None)
-                        except (ValueError, TypeError):
+                        except (ValueError, TypeError, OverflowError):
+                            # dbl{}/flt{}の姉妹分岐(下記)と同様にOverflowErrorも
+                            # 捕捉する。xeval()内のPow演算(l**r)はfloatの指数
+                            # 部が大きいとOverflowErrorを送出しうるため、これが
+                            # 無ければ"qad{2.0**2000.0}"のような何の変哲もない
+                            # ソース1行でアセンブラ全体がクラッシュしていた。
                             if self.state.should_report_errors():
                                 print(f" error - qad{{}}: cannot evaluate expression '{t}'; using 0.", file=sys.stderr)
                             h = '0' * 32
@@ -1659,6 +1670,9 @@ class ExpressionEvaluator:
         while idx < len(s) and StringUtils.q(s, '**', idx):
             t, idx = self.factor(s, idx + 2)
             _EXP_MAX = 1024
+            _EXP_RESULT_MAX_BITS = 1 << 20  # 約100万ビット(約128KB)。256bit整数・
+            # 128bit浮動小数点しか正規に扱わないこのアセンブラにとって、単一の
+            # **演算の結果としては十分すぎるほど大きい上限。
             try:
                 t_int = int(t)
             except (ValueError, OverflowError):
@@ -1671,7 +1685,27 @@ class ExpressionEvaluator:
                 self.err(f"Exponent {t_int} exceeds maximum {_EXP_MAX} in ** expression; result set to 0.")
                 x = 0
                 break
-            x = x ** t_int
+            # 破綻点修正: 個々の指数は_EXP_MAX以下でも、"2**1024**1024**1024"
+            # のように**を連鎖させると、底xが前回の演算で既に巨大化しており、
+            # 積み上がった結果のビット数はここでは検査されないまま指数的に
+            # 爆発しうる(単体の除算が浮動小数点へフォールバックした場合の
+            # x**大きな指数もOverflowErrorで無防備にクラッシュしていた)。
+            # ここで実際に**を計算する前に結果のビット数を見積もって弾く。
+            try:
+                _base_bits = abs(x).bit_length() if isinstance(x, int) else 1024
+            except (TypeError, ValueError, OverflowError):
+                _base_bits = 1024
+            if _base_bits * max(t_int, 1) > _EXP_RESULT_MAX_BITS:
+                self.err(f"** result would exceed {_EXP_RESULT_MAX_BITS} bits "
+                         f"(chained exponentiation); result set to 0.")
+                x = 0
+                break
+            try:
+                x = x ** t_int
+            except OverflowError:
+                self.err("** result is too large to represent as a float; result set to 0.")
+                x = 0
+                break
             if isinstance(x, float) and x.is_integer():
                 x = int(x)
         return x, idx
@@ -2318,8 +2352,23 @@ class DirectiveProcessor:
         except (OverflowError, ValueError):
             print(f" error - .vliw: non-finite parameter value.", file=sys.stderr)
             return False
+
+        # 破綻点修正: lineassemble2()はソース1行ごとにパターンファイル全体を
+        # 再スキャンするため、.vliwディレクティブに出会うたびにこのvliwp()が
+        # 呼ばれ、直後のNOPバイト列構築ループがvliwinstbits//8回実行される。
+        # vliwinstbitsは本来ちいさな命令幅(既存の実例では41や128)を表す値
+        # だが、上限チェックが無いため桁を書き間違える(例: 80000000)と
+        # ソース1行あたり数秒かかる処理がソース行数分積み上がり、通常サイズの
+        # ソースファイルでも事実上ハングする。実在するVLIW/EPIC ISAの命令幅
+        # よりはるかに大きい値を上限としておけば、正当な用途には影響しない。
+        _VLIW_INSTBITS_MAX = 8192
+        if not (0 <= self.state.vliwinstbits <= _VLIW_INSTBITS_MAX):
+            print(f" error - .vliw: vliwinstbits {self.state.vliwinstbits} is out of range "
+                  f"(must be 0-{_VLIW_INSTBITS_MAX}).", file=sys.stderr)
+            return False
+
         self.state.vliwflag = True
-        
+
         l = []
         for _byte_idx in range(self.state.vliwinstbits // 8 + (0 if self.state.vliwinstbits % 8 == 0 else 1)):
             l += [v4 & 0xff]
@@ -2824,8 +2873,12 @@ class PatternMatcher:
 
         _tried = 0
         for i in range(len(sl) + 1):
-            ll = list(itertools.combinations(sl, i))
-            for j in ll:
+            # itertools.combinations()は遅延評価のイテレータなので、list()で
+            # 包んでいた旧実装はこのサイズiの組合せ全件をメモリに展開してから
+            # ループしていた(_MAX_COMBINATIONS予算のチェックはループ内側で
+            # 行われるため、予算超過が判明する前に無駄な生成コストを払って
+            # いた)。直接イテレートすることで、予算に達し次第すぐに打ち切れる。
+            for j in itertools.combinations(sl, i):
                 _tried += 1
                 if _tried > self._MAX_COMBINATIONS:
                     if self.state.should_report_errors() and not self.state._combo_budget_warned:
@@ -3201,7 +3254,7 @@ class VLIWProcessor:
         vbits = abs(self.state.vliwbits)
 
         if self.state.vliwinstbits == 0:
-            if self.state.pas == 0 or self.state.pas == 2:
+            if self.state.should_report_errors():
                 print(" error - vliwinstbits is zero; cannot compute instruction slots.", file=sys.stderr)
             return False
         for k in self.state.vliwset:
@@ -3282,7 +3335,7 @@ class VLIWProcessor:
                 self.state.pc += q
                 break
         else:
-            if self.state.pas == 0 or self.state.pas == 2:
+            if self.state.should_report_errors():
                 print(" error - No vliw instruction-set defined.", file=sys.stderr)
             return False
         return True
@@ -3494,7 +3547,8 @@ class AssemblyDirectiveProcessor:
                 print(f" error - .RESB argument is non-finite or invalid.", file=sys.stderr)
             return True
         if x < 0:
-            print(f" error - .RESB requires a non-negative count, got {x}.", file=sys.stderr)
+            if self.state.should_report_errors():
+                print(f" error - .RESB requires a non-negative count, got {x}.", file=sys.stderr)
             return True
         _RESB_MAX = 1 << 28
         if x > _RESB_MAX:
@@ -3530,7 +3584,8 @@ class AssemblyDirectiveProcessor:
                 print(f" error - .ZERO argument is non-finite or invalid.", file=sys.stderr)
             return True
         if x < 0:
-            print(f" error - .ZERO requires a non-negative count, got {x}.", file=sys.stderr)
+            if self.state.should_report_errors():
+                print(f" error - .ZERO requires a non-negative count, got {x}.", file=sys.stderr)
             return True
         _ZERO_MAX = 1 << 28
         if x > _ZERO_MAX:
@@ -3607,10 +3662,12 @@ class AssemblyDirectiveProcessor:
             try:
                 u_int = int(u)
             except (OverflowError, ValueError):
-                print(f" error - .ALIGN argument is non-finite or invalid.", file=sys.stderr)
+                if self.state.should_report_errors():
+                    print(f" error - .ALIGN argument is non-finite or invalid.", file=sys.stderr)
                 return True
             if u_int <= 0:
-                print(f" error - .ALIGN requires a positive value, got {u_int}.", file=sys.stderr)
+                if self.state.should_report_errors():
+                    print(f" error - .ALIGN requires a positive value, got {u_int}.", file=sys.stderr)
                 return True
             self.state.align = u_int
         
@@ -3699,10 +3756,19 @@ class AssemblyDirectiveProcessor:
                 idx += 1
 
             existing = self.state.labels.get(label_part)
-            if existing is None or not (len(existing) > 3 and existing[3]):
+            # 破綻点修正: 「存在しないか、importプレースホルダでない」を
+            # まとめて「プレースホルダとして初期化してよい」と判定していたため、
+            # 既にローカルで実体を持つラベル(is_imported=False, 正しい値・
+            # セクションを保持)に対して後から.EXTERNを書くと、その定義を
+            # [0, '.text', False, True, reloc_type] で丸ごと上書きしてしまい、
+            # 正しく定義済みのシンボルが値0のimportプレースホルダに戻って
+            # しまっていた。存在しない場合のみ新規プレースホルダを作り、
+            # 既にローカル定義済みの場合は一切手を触れない。
+            if existing is None:
                 self.state.labels[label_part] = [0, '.text', False, True, reloc_type]
-            elif len(existing) >= 5:
-                if reloc_type is not None:
+            elif len(existing) > 3 and existing[3]:
+                # 既存エントリがimportプレースホルダの場合のみreloc_typeを更新する
+                if len(existing) >= 5 and reloc_type is not None:
                     existing[4] = reloc_type
 
             idx = StringUtils.skipspc(l2, idx)
@@ -4332,9 +4398,16 @@ class Assembler:
             vflag = False
             try:
                 vflag = self.vliw_proc.vliwprocess(line, idxs, objl, flag, idx, self.lineassemble2)
-            except Exception:
-                if self.state.pas == 0 or self.state.pas == 2:
+            except Exception as _vliw_exc:
+                if self.state.should_report_errors():
                     print(" error - Some error(s) in vliw definition.", file=sys.stderr)
+                    # 項目1(パターンマッチ例外の可視化)と同じ理由: この広範な
+                    # exceptは「VLIW定義のバグ」を無条件に握りつぶし、原因が
+                    # 一切わからないまま処理を続けてしまう。-v/--debug時だけ
+                    # 実際の例外の型・内容を表示し、パターンファイル作者が
+                    # 原因を特定できるようにする(デフォルト出力は変えない)。
+                    if self.state.verbose or self.state.debug:
+                        print(f"   ({type(_vliw_exc).__name__}: {_vliw_exc})", file=sys.stderr)
             return vflag
         
         return True
@@ -4482,6 +4555,31 @@ class Assembler:
             label = fields[0]
             if not label:
                 return False
+            # 破綻点修正: _write_export()はreloc_type付きラベルを
+            # "labelname::reloctype" という1フィールドで書き出すが
+            # (例: "myconst::abs64")、ここではその"::"を一切分離せず
+            # フィールド全体をラベル名としてそのまま取り込んでいたため、
+            # インポート後は本来の"myconst"とは無関係な、実体の無い
+            # "myconst::abs64"という名前のグローバル未定義シンボルが
+            # 紛れ込み、かつ肝心のreloc_type情報はインポート後に
+            # 失われていた。ここで"::"を分離し、reloc_typeも
+            # ラベルエントリの5番目の要素として保持する。
+            reloc_type = None
+            if '::' in label:
+                label, rt_str = label.split('::', 1)
+                rtype_map = {
+                    'abs64':  1,  'abs32':  10, 'abs32s': 11,
+                    'abs16':  12, 'abs8':   14, 'pc32':   2,
+                    'rel32':  2,  'plt32':  4,  'pc16':   13,
+                    'pc8':    15, 'pc64':   24, 'got32':    3,
+                    'gotpcrel': 9, 'got64':   27,
+                }
+                reloc_type = rtype_map.get(rt_str.lower())
+                if reloc_type is None:
+                    print(f" warning - unknown reloc type '{rt_str}' for imported label '{label}'",
+                          file=sys.stderr)
+            if not label:
+                return False
             try:
                 v = int(fields[1], 16)
             except ValueError:
@@ -4494,7 +4592,10 @@ class Assembler:
                 if size == 0 and v == start:
                     section = sname
                     break
-            self.state.labels[label] = [v, section, False, True]
+            entry = [v, section, False, True]
+            if reloc_type is not None:
+                entry.append(reloc_type)
+            self.state.labels[label] = entry
             return True
 
         return False
@@ -4569,9 +4670,20 @@ class Assembler:
                 out.append(b | 0x80)
 
         csec_by_name = {s.name: s for s in csecs}
+        _csec_idx_by_name = {s.name: i + 1 for i, s in enumerate(csecs)}
 
-        def _addr_to_sec(byte_addr):
-            """Return (content_idx_1based, in_section_byte_offset) or (None, 0)."""
+        def _addr_to_sec(byte_addr, sec_name=None):
+            """Return (content_idx_1based, in_section_byte_offset) or (None, 0).
+
+            破綻点修正: write_elf_obj._find_shndx()と同じ理由で、ラベルが
+            セクション境界ちょうどにあるとアドレスだけからの逆引きでは
+            誤ったセクションに帰属してしまう。ラベル自身が保持する本来の
+            セクション名が分かっている場合はそれを最優先で使う。
+            """
+            if sec_name is not None:
+                _idx = _csec_idx_by_name.get(sec_name)
+                if _idx is not None:
+                    return _idx, byte_addr - csecs[_idx - 1].byte_start
             for i, s in enumerate(csecs):
                 if s.byte_size > 0 and s.byte_start <= byte_addr < s.byte_start + s.byte_size:
                     return i + 1, byte_addr - s.byte_start
@@ -4642,7 +4754,7 @@ class Assembler:
                 byte_addr = int(val) * bpw
             except (TypeError, ValueError, OverflowError):
                 continue
-            sidx, off = _addr_to_sec(byte_addr)
+            sidx, off = _addr_to_sec(byte_addr, entry[1])
             if sidx is None:
                 continue
             die += _uleb(2)
@@ -4915,7 +5027,7 @@ class Assembler:
         shstrtab = bytes(shstrtab)
 
 
-        def _find_shndx(byte_addr):
+        def _find_shndx(byte_addr, sec_name=None):
             """Return (elf_section_1based, value_within_section).
 
             Fix 7 (new): byte_addr == 0 のとき、すべてのセクションが
@@ -4923,7 +5035,22 @@ class Assembler:
             アドレス 0 のラベルは先頭セクションの先頭に属するとみなすのが正しい。
             また byte_size == 0 のセクションが複数あるケースでも
             byte_addr == byte_start の最初の一致を返す。
+
+            破綻点修正: 以前はアドレスの範囲(半開区間 [start, start+size))
+            だけからセクションを逆引きしていたため、ラベルがセクション境界
+            ちょうど(前セクションの終端 == 次セクションの先頭)にあると、
+            本来のセクションではなく次のセクションに誤って帰属していた
+            (例: ".text"末尾の"_etext"的なラベルが".data"のシンボルとして
+            出力される)。ラベル自身が保持する本来のセクション名(sec_name、
+            LabelManager.put_value()で記録済み)が分かっている場合は、
+            それを最優先で使う。名前が見つからない場合のみ、従来通り
+            アドレスからの逆引きにフォールバックする。
             """
+            if sec_name is not None:
+                _idx = sec_name_to_idx.get(sec_name)
+                if _idx is not None:
+                    _s = csecs[_idx - 1]
+                    return _idx, byte_addr - _s.byte_start
             for i, s in enumerate(csecs):
                 if s.byte_size > 0 and s.byte_start <= byte_addr < s.byte_start + s.byte_size:
                     return i + 1, byte_addr - s.byte_start
@@ -4955,6 +5082,7 @@ class Assembler:
 
         for name, *_lentry in sorted(self.state.labels.items()):
             val         = _lentry[0][0]
+            _lsec       = _lentry[0][1]
             is_equ      = len(_lentry[0]) > 2 and _lentry[0][2]
             is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
             if name in export_keys or is_imported:
@@ -4964,7 +5092,7 @@ class Assembler:
                 shndx, sym_val = 0xfff1, val
             else:
                 byte_addr = val * bpw
-                shndx, sym_val = _find_shndx(byte_addr)
+                shndx, sym_val = _find_shndx(byte_addr, _lsec)
             sym_val = int(sym_val) & 0xFFFFFFFFFFFFFFFF
             name_off = len(strtab); strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x00, 0, shndx, sym_val, 0))
@@ -4989,7 +5117,7 @@ class Assembler:
                 shndx, sym_val = 0xfff1, val
             else:
                 byte_addr = val * bpw
-                shndx, sym_val = _find_shndx(byte_addr)
+                shndx, sym_val = _find_shndx(byte_addr, _sec)
             sym_val = int(sym_val) & 0xFFFFFFFFFFFFFFFF
             name_off = len(strtab); strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x10, 0, shndx, sym_val, 0))
@@ -5228,6 +5356,15 @@ class Assembler:
         self.state.expfile_elf  = args.expfile_elf
         self.state.impfile      = args.impfile
         self.state.elf_objfile  = args.elf_objfile
+        # e_machine はELFヘッダ中でunsigned short(0-65535)としてpackされる
+        # (write_elf_obj._pack_ehdr参照)。範囲外の値をここで弾かないと、
+        # 出力ファイルを既にopen('wb')で作成/切り詰めた後にstruct.errorで
+        # 未捕捉のままクラッシュし、0バイトの壊れた.oファイルが残ってしまう。
+        if not (0 <= args.elf_machine <= 0xFFFF):
+            print(f" error - -m/--machine value {args.elf_machine} is out of range "
+                  f"(must be 0-65535, ELF e_machine is an unsigned 16-bit field).",
+                  file=sys.stderr)
+            return False
         self.state.elf_machine  = args.elf_machine
 
         if args.elf_osabi not in osabitbl:

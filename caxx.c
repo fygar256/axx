@@ -508,7 +508,18 @@ static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *se
             /* axx.py fix: ::reloctype を省略した場合は旧エントリの reloc_type_override を
              * 引き継がず -1 にリセットする。reloc_type が必要な場合は呼び出し側が
              * lmap_set_reloc_type() で明示的に設定する。
-             * is_imported は .EXTERN が独立して管理するので保持する。 */
+             *
+             * 破綻点修正 (axx.py port): is_imported は以前「.EXTERNが独立して
+             * 管理するので保持する」として引き継いでいたが、これはバグだった。
+             * lmap_set() は「この名前に実際の値を設定する」呼び出しであり、
+             * .EXTERNで仮登録された名前(is_imported=1)がローカルで実定義
+             * されたときは、その時点で輸入(import)状態を終了させなければ
+             * ならない。保持し続けると、write_elf_obj() がこのシンボルを
+             * 永久にSTB_GLOBAL/SHN_UNDEFとして出力し、ローカルに正しい値を
+             * 持つのにELF上では未定義シンボルのままになる
+             * (label_put_value() 側でも .EXTERN プレースホルダの上書きを
+             * 許可するよう対応済み)。 */
+            e->is_imported = 0;
             e->reloc_type_override = -1;
             return;
         }
@@ -1925,7 +1936,14 @@ static const char *label_get_section(AsmState *st, const char *k){
 }
 static int label_put_value(AsmState *st, const char *k, uint256_t v, const char *sec, int is_equ, int reloc_type){
     if(st->pas==1||st->pas==0){
-        if(lmap_contains(&st->labels,k)){
+        LabelEntry *_existing = lmap_find(&st->labels,k);
+        /* 破綻点修正 (axx.py port): .EXTERNで仮登録された名前(is_imported=1)は
+         * まだ実体を持たないプレースホルダなので、同名のローカル定義で
+         * 上書きすることを許可する(axx.py側の put_value() と同じ仕様)。
+         * 従来はis_imported を無視して無条件に「既に定義済み」エラーに
+         * していたため、.EXTERN後に同名をローカル定義する正当なパターンが
+         * 常に失敗していた。 */
+        if(_existing && !_existing->is_imported){
             st->error_already_defined=1;
             fprintf(stderr," error - label already defined.\n");
             return 0;
@@ -3013,6 +3031,18 @@ static int dir_vliwp(Assembler *asmb, PatEntry *e){
     asmb->st.vliwbits=(int)u256_to_i64(v1);
     asmb->st.vliwinstbits=(int)u256_to_i64(v2);
     asmb->st.vliwtemplatebits=(int)u256_to_i64(v3);
+    /* 破綻点修正 (axx.py port): ソース1行ごとにパターンファイル全体が
+     * 再スキャンされる設計のため(lineassemble2相当のメインループ参照)、
+     * .vliwディレクティブに出会うたびにdir_vliwp()が呼ばれ、直後のNOP
+     * バイト列構築ループがvliwinstbits/8回実行される。vliwinstbitsは
+     * 本来ちいさな命令幅を表す値だが上限チェックが無いため、桁を書き
+     * 間違える(例: 80000000)とソース1行あたり数秒かかる処理が行数分
+     * 積み上がり、通常サイズのソースファイルでも事実上ハングする。 */
+    if(asmb->st.vliwinstbits < 0 || asmb->st.vliwinstbits > 8192){
+        fprintf(stderr," error - .vliw: vliwinstbits %d is out of range (must be 0-8192).\n",
+                asmb->st.vliwinstbits);
+        return 1;
+    }
     asmb->st.vliwflag=1;
     iv_clear(&asmb->st.vliwnop);
     uint64_t v4v=u256_to_u64(v4);
@@ -4341,8 +4371,9 @@ static int adir_resX(Assembler *asmb, const char *l, const char *l2,
     }
     int64_t cnt=u256_to_i64(x);
     if(cnt < 0){
-        fprintf(stderr," error - %s requires a non-negative count, got %lld.\n",
-                directive,(long long)cnt);
+        if(should_report_errors(&asmb->st))
+            fprintf(stderr," error - %s requires a non-negative count, got %lld.\n",
+                    directive,(long long)cnt);
         return 1;
     }
     /* 256 MB guard: check before multiplying to avoid signed overflow */
@@ -4387,7 +4418,8 @@ static int adir_zero(Assembler *asmb, const char *l, const char *l2){
     }
     int64_t cnt=u256_to_i64(x);
     if(cnt < 0){
-        fprintf(stderr," error - .ZERO requires a non-negative count, got %lld.\n", (long long)cnt);
+        if(should_report_errors(&asmb->st))
+            fprintf(stderr," error - .ZERO requires a non-negative count, got %lld.\n", (long long)cnt);
         return 1;
     }
     for(int64_t i=0;i<cnt;i++){
@@ -4419,7 +4451,21 @@ static int adir_asciiz(Assembler *asmb, const char *l, const char *l2){
 static int adir_align(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ALIGN")!=0) return 0;
-    if(l2&&l2[0]){ int io; uint256_t u=expr_expression_asm(asmb,l2,0,&io); asmb->st.align=(int)u256_to_i64(u); }
+    if(l2&&l2[0]){
+        int io; uint256_t u=expr_expression_asm(asmb,l2,0,&io);
+        int64_t u_int=u256_to_i64(u);
+        /* 破綻点修正 (axx.py port): 値の検証が一切なかったため、".ALIGN 0"が
+         * align_addr()内の"addr % st->align"でゼロ除算を起こし、SIGFPEで
+         * 即座にクラッシュしていた(axx.py側は元々 u_int<=0 をエラーとして
+         * 弾いており、Cポートだけこのガードが欠落していた)。 */
+        if(u_int <= 0){
+            if(should_report_errors(&asmb->st))
+                fprintf(stderr," error - .ALIGN requires a positive value, got %lld.\n",
+                        (long long)u_int);
+            return 1;
+        }
+        asmb->st.align=(int)u_int;
+    }
     asmb->st.pc=u256_from_u64(align_addr(&asmb->st,u256_to_u64(asmb->st.pc)));
     return 1;
 }
@@ -5571,7 +5617,7 @@ typedef struct { WRE*data; int len,cap; } WRL;
 /* symbol-name -> symtab-index map entry */
 typedef struct { const char*name; int idx; } WSNI;
 /* label record used for sorting */
-typedef struct { const char*name; uint64_t val; int is_equ; int is_imported; int reloc_type_override; } WLK;
+typedef struct { const char*name; uint64_t val; int is_equ; int is_imported; int reloc_type_override; const char*section; } WLK;
 /* DWARF section descriptors */
 typedef struct { const char *name; uint8_t *data; size_t len; } DSEC;
 typedef struct { const char *name; int target; uint8_t *data; size_t len; } DREL;
@@ -5645,7 +5691,21 @@ static uint8_t *weo_extract(AsmState*st,int bpw,uint64_t w0,uint64_t wn){
  * 修正: 通常範囲に一致しない場合、addr 以下で最も開始アドレスが近い
  * セクションに帰属させる（best-effort）。セクションが1つも無い場合のみ
  * SHN_ABS を返す。 */
-static WSR weo_shndx(WCS*csecs,int ncs,uint64_t ba){
+/* 破綻点修正 (axx.py port): ラベルがセクション境界ちょうど(前セクションの
+ * 終端 == 次セクションの先頭)にあると、アドレスだけからの逆引きでは
+ * 半開区間 [start, start+size) の判定により誤って次のセクションに
+ * 帰属してしまう(例: ".text"末尾の終端マーカーラベルが".data"の
+ * シンボルとして出力される)。ラベル自身が保持する本来のセクション名
+ * (sec_name)が分かっている場合はそれを最優先で使う。名前が一致する
+ * セクションが無い場合のみ、従来通りアドレスからの逆引きにフォール
+ * バックする。sec_name==NULLのときは従来通りアドレスのみで判定する。 */
+static WSR weo_shndx(WCS*csecs,int ncs,uint64_t ba,const char*sec_name){
+    if(sec_name){
+        for(int i=0;i<ncs;i++){
+            if(strcmp(csecs[i].name,sec_name)==0)
+                return (WSR){(uint16_t)(i+1), ba-csecs[i].bs};
+        }
+    }
     for(int i=0;i<ncs;i++){
         if(csecs[i].bsz>0&&csecs[i].bs<=ba&&ba<csecs[i].bs+csecs[i].bsz)
             return (WSR){(uint16_t)(i+1),ba-csecs[i].bs};
@@ -5853,7 +5913,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     {for(int bi=0;bi<st->labels.nbuckets;bi++)
         for(LabelEntry*e=st->labels.buckets[bi];e;e=e->next){
             if(u256_is_undef_derived(e->value)) continue;
-            larr[nl++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,e->is_imported,e->reloc_type_override};}}
+            larr[nl++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,e->is_imported,e->reloc_type_override,e->section};}}
     qsort(larr,nl,sizeof(WLK),cmp_wlk);
 
     int ne=0;
@@ -5864,7 +5924,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
             /* export_labels には reloc_type_override が保存されないため labels から引く */
             LabelEntry *_fl=lmap_find(&st->labels,e->key);
             int _rto = _fl ? _fl->reloc_type_override : -1;
-            earr[ne++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,0,_rto};}}
+            earr[ne++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,0,_rto,e->section};}}
     qsort(earr,ne,sizeof(WLK),cmp_wlk);
 
 
@@ -5877,7 +5937,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         int _equ_has_reloc = larr[i].is_equ && (larr[i].reloc_type_override >= 0);
         WSR sr = (larr[i].is_equ && !_equ_has_reloc)
                  ? (WSR){0xfff1, larr[i].val}
-                 : weo_shndx(csecs,ncs,larr[i].val*(uint64_t)bpw);
+                 : weo_shndx(csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section);
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
         snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
         weo_sym(&symtab_bb,&nsyms,_is_le,noff,0x00,0,sr.shndx,sr.sv,0);
@@ -5897,7 +5957,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         int _equ_has_reloc = earr[i].is_equ && (earr[i].reloc_type_override >= 0);
         WSR sr = (earr[i].is_equ && !_equ_has_reloc)
                  ? (WSR){0xfff1, earr[i].val}
-                 : weo_shndx(csecs,ncs,earr[i].val*(uint64_t)bpw);
+                 : weo_shndx(csecs,ncs,earr[i].val*(uint64_t)bpw,earr[i].section);
         uint32_t noff=wbb_str(&strtab_bb,earr[i].name);
         snimap[snimap_len++]=(WSNI){earr[i].name,nsyms};
         weo_sym(&symtab_bb,&nsyms,_is_le,noff,0x10,0,sr.shndx,sr.sv,0);
@@ -5985,7 +6045,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         rb_w4(&die,0,_is_le);                 /* stmt_list = 0      */
         for(int i=0;i<nl;i++){
             if(larr[i].is_equ || larr[i].is_imported) continue;
-            WSR sr = weo_shndx(csecs,ncs,larr[i].val*(uint64_t)bpw);
+            WSR sr = weo_shndx(csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section);
             if(sr.shndx==0xfff1) continue;           /* not in a content section */
             rb_uleb(&die,2);
             rb_cstr(&die,larr[i].name);
@@ -6390,7 +6450,39 @@ static int imp_label(Assembler *asmb, const char *l){
     }
 
     if(nfields == 2){
-        const char *label = fields[0];
+        char labelbuf[512];
+        strncpy(labelbuf, fields[0], sizeof(labelbuf)-1); labelbuf[sizeof(labelbuf)-1]='\0';
+        const char *label = labelbuf;
+        if(!label[0]) return 0;
+        /* 破綻点修正 (axx.py port): WRITE_EXPORTはreloc_type付きラベルを
+         * "labelname::reloctype" という1フィールドで書き出す(例:
+         * "myconst::abs64")が、ここではその"::"を一切分離せず
+         * フィールド全体をラベル名としてそのまま取り込んでいたため、
+         * インポート後は本来の"myconst"とは無関係な、実体の無い
+         * "myconst::abs64"という名前のグローバル未定義シンボルが
+         * 紛れ込み、かつ肝心のreloc_type情報はインポート後に
+         * 失われていた(常に-1固定で label_put_value に渡していた)。 */
+        int reloc_type = -1;
+        char *sep = strstr(labelbuf, "::");
+        if(sep){
+            *sep = '\0';
+            const char *rt_str = sep + 2;
+                 if(strcmp(rt_str,"abs64" )==0) reloc_type= 1;
+            else if(strcmp(rt_str,"abs32" )==0) reloc_type=10;
+            else if(strcmp(rt_str,"abs32s")==0) reloc_type=11;
+            else if(strcmp(rt_str,"abs16" )==0) reloc_type=12;
+            else if(strcmp(rt_str,"abs8"  )==0) reloc_type=14;
+            else if(strcmp(rt_str,"pc32"  )==0) reloc_type= 2;
+            else if(strcmp(rt_str,"plt32" )==0) reloc_type= 4;
+            else if(strcmp(rt_str,"pc16"  )==0) reloc_type=13;
+            else if(strcmp(rt_str,"pc8"   )==0) reloc_type=15;
+            else if(strcmp(rt_str,"pc64"  )==0) reloc_type=24;
+            else if(strcmp(rt_str,"got32" )==0) reloc_type= 3;
+            else if(strcmp(rt_str,"gotpcrel")==0) reloc_type=9;
+            else if(strcmp(rt_str,"got64" )==0) reloc_type=27;
+            else fprintf(stderr," warning - unknown reloc type '%s' for imported label '%s'\n",
+                         rt_str, label);
+        }
         if(!label[0]) return 0;
         char *endp;
         uint64_t v = strtoull(fields[1], &endp, 16);
@@ -6405,7 +6497,7 @@ static int imp_label(Assembler *asmb, const char *l){
             if(sz > 0 && v >= s0 && v < s0 + sz){ section = se->name; break; }
             if(sz == 0 && v == s0)               { section = se->name; break; }
         }
-        label_put_value(&asmb->st, label, u256_from_u64(v), section, 0, -1);
+        label_put_value(&asmb->st, label, u256_from_u64(v), section, 0, reloc_type);
         return 1;
     }
 
@@ -6483,7 +6575,21 @@ int main(int argc, char *argv[]){
         else if(strcmp(argv[i],"-E")==0&&i+1<argc){ strncpy(st->expfile_elf,argv[++i],sizeof(st->expfile_elf)-1); }
         else if(strcmp(argv[i],"-i")==0&&i+1<argc){ strncpy(st->impfile,argv[++i],sizeof(st->impfile)-1); }
         else if(strcmp(argv[i],"-o")==0&&i+1<argc){ strncpy(st->elf_objfile,argv[++i],sizeof(st->elf_objfile)-1); }
-        else if(strcmp(argv[i],"-m")==0&&i+1<argc){ st->elf_machine=atoi(argv[++i]); }
+        else if(strcmp(argv[i],"-m")==0&&i+1<argc){
+            int _mval = atoi(argv[++i]);
+            /* 破綻点修正 (axx.py port): e_machine はELFヘッダ中で16bitフィールド
+             * としてpackされる(WEO_W2)。範囲外の値は例外こそ出ないが
+             * (Cの(uint16_t)キャストは黙ってラップアラウンドする)、
+             * ユーザーが意図しない全く別のmachine値のELFファイルが
+             * "正常終了"のふりをして出力されてしまう。CLIの時点で弾く。 */
+            if(_mval < 0 || _mval > 0xFFFF){
+                fprintf(stderr, " error - -m/--machine value %d is out of range "
+                        "(must be 0-65535, ELF e_machine is an unsigned 16-bit field).\n",
+                        _mval);
+                return 1;
+            }
+            st->elf_machine = _mval;
+        }
         else if(strcmp(argv[i],"-v")==0||strcmp(argv[i],"--verbose")==0){ st->verbose=1; }
         else if(strcmp(argv[i],"-d")==0||strcmp(argv[i],"--debug")==0){ st->debug=1; }
         else if(strcmp(argv[i],"-g")==0||strcmp(argv[i],"--gen-debug")==0){ st->gen_debug=1; }
