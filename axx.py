@@ -275,6 +275,21 @@ class AssemblerState:
         # 変数の値がリスト外ならエラーにする。.clrcheckで解除する。
         self.check_constraints: dict = {}
 
+        # 各セクションへの訪問記録: (セクション名, 開始pc, ワード数) のリスト、
+        # 時系列順。同じセクションに複数回出入りする(.text→.data→.text等)と、
+        # そのセクションの真の内容はグローバルpc空間上で不連続な複数の断片に
+        # 分かれる。write_elf_obj()はこれを使って各断片を訪問順に連結し、
+        # アドレス→セクション内オフセットの変換も正しく行う。
+        self.section_ranges: list = []
+
+        # .EQU(reloc_type指定なし)の式評価中にset()を入れておくと、
+        # LabelManager.get_value()が参照したラベルの所属セクションをここに
+        # 記録する(None のときは何もしない)。異なるセクションのラベルを
+        # 跨いで演算すると、結果はリンク時のセクション配置に依存する定数に
+        # なってしまうにもかかわらずリロケーションが一切生成されないため、
+        # label_processing()がこれを見て警告するために使う。
+        self._equ_sections_touched = None
+
     def should_report_errors(self):
         """ユーザー向けエラーメッセージを表示すべきパスかどうか。
 
@@ -437,10 +452,20 @@ class StringUtils:
     
     @staticmethod
     def get_param_to_spc(s, idx):
-        """Get parameter up to space"""
+        """Get parameter up to space (or the VLIW slot separator "!!").
+
+        破綻点修正: "!!"は常にVLIWスロット区切り/終端マーカーとして予約
+        されている(get_param_to_eon()・expression評価器の!!!/!!!!処理を
+        参照)。以前はここで空白のみを境界とみなしていたため、オペランドを
+        持たない命令(NOP等)をVLIWスロットとして"nop!!!!"のように空白なしで
+        書くと、"!!!!"ごとニーモニックとして取り込まれてマッチに失敗し、
+        しかもそのスロットは0バイトのまま(エラーは出るが終了コード0で
+        ビルドは"成功"し)後続コードのアドレスが黙ってずれるという実害の
+        大きい不具合があった。
+        """
         t = ""
         idx = StringUtils.skipspc(s, idx)
-        while idx < len(s) and s[idx] != ' ':
+        while idx < len(s) and s[idx] != ' ' and s[idx:idx+2] != '!!':
             t += s[idx]
             idx += 1
         return t, idx
@@ -1040,6 +1065,8 @@ class LabelManager:
                 print(f" error - Label undefined: '{k}'"
                       f"  [{_fn}:{_ln}]", file=sys.stderr)
             return v
+        if self.state._equ_sections_touched is not None:
+            self.state._equ_sections_touched.add(self.state.labels[k][1])
         # ELFリロケーション追跡: .equ定数(reloc_type指定なし)はリロケーション不要
         # なので除外し、それ以外のアドレスラベル参照だけを記録する。
         _is_equ = len(self.state.labels[k]) > 2 and self.state.labels[k][2]
@@ -3269,7 +3296,18 @@ class VLIWProcessor:
                 nob = vbits // 8 + (0 if vbits % 8 == 0 else 1)
                 ibyte = self.state.vliwinstbits // 8 + (0 if self.state.vliwinstbits % 8 == 0 else 1)
                 noi = (vbits - abs(self.state.vliwtemplatebits)) // self.state.vliwinstbits
-                
+                # 破綻点修正: vliwtemplatebitsがvliwbitsを超える(パケット幅より
+                # テンプレート自体が大きい)矛盾した.vliw定義では、noiが負に
+                # なりrange(noi)が空になって、命令スロットの内容が silentに
+                # 失われたまま(エラーも警告もなく)何らかのパケットが出力
+                # されてしまう。noiが0以下の場合は明確なエラーとして打ち切る。
+                if noi <= 0:
+                    if self.state.should_report_errors():
+                        print(f" error - .vliw: vliwtemplatebits ({self.state.vliwtemplatebits}) "
+                              f"leaves no room for instruction slots in a {vbits}-bit packet "
+                              f"(vliwinstbits={self.state.vliwinstbits}).", file=sys.stderr)
+                    return False
+
                 for j in objs:
                     for m in j:
                         values += [m]
@@ -3400,10 +3438,29 @@ class AssemblyDirectiveProcessor:
                 saved_mode = self.state._pass1_size_mode
                 if self.state.pas == 1:
                     self.state._pass1_size_mode = True
+                # 破綻点修正: reloc_type未指定の.EQUで異なるセクションの
+                # ラベルを跨いで演算すると(例: label_in_text - label_in_data)、
+                # 結果はアセンブラが暗黙に仮定する「連続配置」でのみ正しい
+                # 値になり、リロケーションが一切生成されないためリンカが
+                # セクションを別配置にした瞬間に無警告で不正な定数になる。
+                # 参照したラベルの所属セクションを記録し、2つ以上の異なる
+                # セクションに跨っていたら警告する。
+                _track_sections = reloc_type is None
+                if _track_sections:
+                    self.state._equ_sections_touched = set()
                 try:
                     u, _ = self.expr_eval.expression_asm(expr_part, 0)
                 finally:
                     self.state._pass1_size_mode = saved_mode
+                    _touched = self.state._equ_sections_touched
+                    self.state._equ_sections_touched = None
+                if (_track_sections and _touched and len(_touched) > 1
+                        and self.state.should_report_errors()):
+                    print(f" warning - .EQU '{label}': expression combines labels from "
+                          f"multiple sections ({', '.join(sorted(_touched))}) without an "
+                          f"explicit ::reloctype; the resulting constant assumes a specific "
+                          f"section layout and will NOT be relocated by the linker.",
+                          file=sys.stderr)
                 ok = self.label_manager.put_value(label, u, self.state.current_section, is_equ=True, reloc_type=reloc_type)
                 return ""
             else:
@@ -3622,10 +3679,19 @@ class AssemblyDirectiveProcessor:
         のリスト。同じセクションに複数回出入りできるため(.text→.data→.text等)、
         セクションを離れるたびに「今回の滞在分」を確定済みサイズへ加算し、
         再入時のpcを記録しておく。confirmedはENDSECTIONで最終確定したことを示す。
+
+        state.section_ranges は (セクション名, 開始pc, ワード数) の訪問記録を
+        時系列順に保持するリスト。同じセクションに複数回出入りすると、その
+        セクションの真のバイト列はグローバルpc空間上で不連続な複数の断片に
+        分かれる。write_elf_obj()はこの記録を使って各断片を訪問順に連結し、
+        アドレス→セクション内オフセットの変換も断片ごとの累積オフセットを
+        使って正しく計算する(単一の開始pc+サイズという連続領域の前提を
+        置かないことで、間に他セクションを挟んでの再入を正しく扱えるように
+        している)。
         """
         if StringUtils.upper(l1) != ".SECTION" and StringUtils.upper(l1) != ".SEGMENT":
             return False
-        
+
         if l2 != '':
             old_sec = self.state.current_section
             if old_sec not in self.state.sections:
@@ -3637,6 +3703,7 @@ class AssemblyDirectiveProcessor:
                 tentative = self.state.pc - _entry_pc
                 if tentative > 0:
                     old_entry[1] += tentative
+                    self.state.section_ranges.append((old_sec, _entry_pc, tentative))
 
             self.state.current_section = l2
             if l2 not in self.state.sections:
@@ -3690,6 +3757,8 @@ class AssemblyDirectiveProcessor:
                   f"'{self.state.current_section}'; keeping previous size.", file=sys.stderr)
             return True
         new_size = entry[1] + block_size
+        if block_size > 0:
+            self.state.section_ranges.append((self.state.current_section, entry_pc, block_size))
         self.state.sections[self.state.current_section] = [start, new_size, self.state.pc, True]
         return True
     
@@ -4272,9 +4341,20 @@ class Assembler:
             if self.state.elf_objfile and self.state.pas == 2 and objl and self.state._elf_label_refs_seen:
                 bpw_r = max(1, (self.state.bts + 7) // 8)
                 sec_name_r = self.state.current_section
-                sec_start_w = 0
+                # 破綻点修正: 以前は sec_start_w をこのセクションの「最初の
+                # 訪問の開始pc」とし、sec_rel = pc - sec_start_w としていた。
+                # これはセクションに複数回出入りする(.text→.data→.text等)と、
+                # 2回目以降の訪問のオフセットが正しく計算できない(間に挟まった
+                # 他セクションのぶんだけずれる)。現在オープン中の訪問より前に
+                # 完了した訪問の累積ワード数(_sentry[1]、離脱時に加算済み)に、
+                # 今回の訪問内でのオフセット(pc - 今回の entry_pc)を足すことで、
+                # 断片を跨いだ正しいセクション内相対位置を計算する。
+                _completed_words = 0
+                _entry_pc_cur = 0
                 if sec_name_r in self.state.sections:
-                    sec_start_w = self.state.sections[sec_name_r][0]
+                    _sentry = self.state.sections[sec_name_r]
+                    _completed_words = _sentry[1]
+                    _entry_pc_cur = _sentry[2] if len(_sentry) > 2 else _sentry[0]
 
                 valid_refs = [(ln, aw, wi) for (ln, aw, wi) in self.state._elf_label_refs_seen if wi >= 0]
                 valid_refs.sort(key=lambda r: r[2])
@@ -4327,6 +4407,7 @@ class Assembler:
                     num_bytes = num_words * bpw_r
 
                     rtype = 0
+                    _rtype_is_default_guess = False
                     lentry = self.state.labels.get(lname)
                     _is_imported = lentry and len(lentry) > 3 and lentry[3]
                     if lentry and len(lentry) > 4 and lentry[4] is not None:
@@ -4343,13 +4424,15 @@ class Assembler:
                             rtype = rtype_override
                         else:
                             rtype = _rmap.get(num_bytes, 0)
+                            _rtype_is_default_guess = True
                     else:
                         rtype = _rmap.get(num_bytes, 0)
+                        _rtype_is_default_guess = True
 
                     if rtype == 0 or first_widx >= len(objl):
                         continue
 
-                    sec_rel = (self.state.pc + first_widx - sec_start_w) * bpw_r
+                    sec_rel = (_completed_words + (self.state.pc + first_widx - _entry_pc_cur)) * bpw_r
 
                     word_mask = (1 << self.state.bts) - 1
                     raw_val = 0
@@ -4373,6 +4456,22 @@ class Assembler:
                         raw_val -= (1 << _field_bits)
 
                     abs_w_bytes = int(abs_w) * bpw_r
+
+                    # 破綻点修正: rtypeがreloc_typeの明示指定なしにバイト幅
+                    # だけから推測された場合(_rtype_is_default_guess)、その
+                    # 推測がたまたまPC相対型に landing しても、実際に
+                    # エンコードされた値(raw_val)がラベルの絶対アドレス
+                    # そのもの(abs_w_bytes)と厳密に一致するなら、それは
+                    # 減算を伴わない絶対参照(例: "DD label")であることの
+                    # 明確な証拠になる。真にPC相対な参照(call/jmp rel32等)
+                    # ではraw_valが絶対アドレスとぴったり一致することは
+                    # 実質あり得ないため、この場合だけ絶対型に読み替える
+                    # (x86_64のデフォルト表でのみ確認済み: 4バイト幅は
+                    # R_X86_64_PC32(2)ではなくR_X86_64_32(10)にすべき)。
+                    if (_rtype_is_default_guess and rtype in _pc_rel_types_all
+                            and raw_val == abs_w_bytes and self.state.elf_machine not in (3, 20, 40, 183, 243)):
+                        _rmap_abs_default = {8: 1, 4: 10, 2: 12, 1: 14}
+                        rtype = _rmap_abs_default.get(num_bytes, rtype)
 
                     if rtype in _pc_rel_types_all:
 
@@ -4604,6 +4703,40 @@ class Assembler:
         """Print address"""
         print("%016x: " % pc, end='')
 
+    def _section_word_ranges(self, name):
+        """セクション name の訪問範囲(ワード単位の(開始, 長さ)タプルの
+        リスト)を時系列順に返す。同じセクションに複数回出入りすると
+        (.text→.data→.text等)、真の内容はグローバルpc空間上で不連続な
+        複数の断片に分かれるため、self.state.section_rangesの記録を使う。
+        記録が無い場合(通常は来ないはずだが保険)はstate.sectionsの
+        単一範囲にフォールバックする。
+        """
+        ranges = [(rs, rl) for (rn, rs, rl) in self.state.section_ranges if rn == name]
+        if ranges:
+            return ranges
+        entry = self.state.sections.get(name)
+        if entry and entry[1] > 0:
+            return [(entry[0], entry[1])]
+        return []
+
+    def _addr_to_word_offset(self, name, word_pc):
+        """word_pc がセクション name 内のどこに対応するか、断片を跨いだ
+        累積ワードオフセットを返す。属さない場合は None。
+
+        上限は閉区間(<=)で判定する: セクション末尾ちょうど(そのセクションの
+        最後に書かれたバイトの1つ先)を指す「終端マーカー」ラベル
+        (_etext的なもの)は正当なイディオムであり、name(呼び出し元が
+        ラベル自身の所属セクションとして渡す)がこのセクションである以上、
+        境界値を除外する理由はない。断片同士が隣接していても、境界点は
+        どちらの断片から見ても同じ累積オフセットに解決されるため問題ない。
+        """
+        cum = 0
+        for rs, rl in self._section_word_ranges(name):
+            if rs <= word_pc <= rs + rl:
+                return cum + (word_pc - rs)
+            cum += rl
+        return None
+
     def _build_dwarf_sections(self, csecs, sec_name_to_idx, bpw, machine):
         """Build DWARF v4 debug sections for an ELF64 relocatable object.
 
@@ -4675,21 +4808,24 @@ class Assembler:
         def _addr_to_sec(byte_addr, sec_name=None):
             """Return (content_idx_1based, in_section_byte_offset) or (None, 0).
 
-            破綻点修正: write_elf_obj._find_shndx()と同じ理由で、ラベルが
-            セクション境界ちょうどにあるとアドレスだけからの逆引きでは
-            誤ったセクションに帰属してしまう。ラベル自身が保持する本来の
-            セクション名が分かっている場合はそれを最優先で使う。
+            破綻点修正: セクションの真の内容は複数回の出入り(.text→.data→
+            .text等)で複数の断片に分かれうるため、単純な
+            addr - section_start では断片2つ目以降のアドレスが正しく
+            オフセットに変換できない。self._addr_to_word_offset()で
+            断片を跨いだ累積オフセットを計算する。ラベル自身が保持する
+            本来のセクション名が分かっている場合はそれを最優先で使う。
             """
+            word_pc = byte_addr // bpw if bpw else 0
             if sec_name is not None:
                 _idx = _csec_idx_by_name.get(sec_name)
                 if _idx is not None:
-                    return _idx, byte_addr - csecs[_idx - 1].byte_start
+                    _woff = self._addr_to_word_offset(sec_name, word_pc)
+                    if _woff is not None:
+                        return _idx, _woff * bpw
             for i, s in enumerate(csecs):
-                if s.byte_size > 0 and s.byte_start <= byte_addr < s.byte_start + s.byte_size:
-                    return i + 1, byte_addr - s.byte_start
-            for i, s in enumerate(csecs):
-                if s.byte_size == 0 and byte_addr == s.byte_start:
-                    return i + 1, 0
+                _woff = self._addr_to_word_offset(s.name, word_pc)
+                if _woff is not None:
+                    return i + 1, _woff * bpw
             return None, 0
 
         DW_TAG_compile_unit = 0x11
@@ -4807,8 +4943,15 @@ class Assembler:
         for sidx in sorted(rows_by_sec.keys()):
             rows = sorted(rows_by_sec[sidx], key=lambda r: r[0])
             csec = csecs[sidx - 1]
-            w0 = csec.byte_start // bpw if bpw else 0
-            first_off = (rows[0][0] - w0) * bpw
+            # 破綻点修正: セクションが複数回の出入りで複数の断片に分かれて
+            # いる場合、単純な (wpc - section_start) では2つ目以降の断片の
+            # アドレスが正しいオフセットにならない。断片を跨いだ累積
+            # オフセットを使う(該当する断片が見つからない場合は0に
+            # フォールバックし、DWARF生成自体はクラッシュさせない)。
+            def _woff(wpc, _name=csec.name):
+                _o = self._addr_to_word_offset(_name, wpc)
+                return _o if _o is not None else 0
+            first_off = _woff(rows[0][0]) * bpw
             prog += b'\x00' + _uleb(1 + 8) + b'\x02'
             line_relas.append((prog_base + len(prog), sidx, abs64, first_off))
             prog += b'\x00' * 8
@@ -4816,7 +4959,7 @@ class Assembler:
             cur_line = 1
             cur_file = 1
             for (wpc, fidx, ln) in rows:
-                byte_off = (wpc - w0) * bpw
+                byte_off = _woff(wpc) * bpw
                 if fidx != cur_file:
                     prog += bytes([4]) + _uleb(fidx)
                     cur_file = fidx
@@ -4969,16 +5112,15 @@ class Assembler:
         else:
             sec_names = list(self.state.sections.keys())
             for i, sname in enumerate(sec_names):
-                w0 = self.state.sections[sname][0]
-                wn = self.state.sections[sname][1]
-                if wn == 0:
-                    if i + 1 < len(sec_names):
-                        w1 = self.state.sections[sec_names[i + 1]][0]
-                        wn = max(0, w1 - w0)
-                    else:
-                        wn = max(0, max_w + 1 - w0) if max_w >= w0 else 0
+                # 破綻点修正: セクションに複数回出入りした場合(.text→.data→
+                # .text等)、真の内容はグローバルpc空間上で不連続な複数の
+                # 断片になる。_section_word_ranges()が返す全断片を訪問順に
+                # 連結することで、間に他セクションを挟んでの再入を正しく
+                # 扱える(単一の開始位置+サイズという連続領域は仮定しない)。
+                ranges = self._section_word_ranges(sname)
+                w0 = ranges[0][0] if ranges else self.state.sections[sname][0]
                 byte_start = w0 * bpw
-                data = _extract(w0, wn)
+                data = b''.join(_extract(rs, rl) for rs, rl in ranges)
                 uname = sname.upper()
                 if   uname.startswith('.TEXT'):   flags = 0x2 | 0x4
                 elif uname.startswith('.DATA'):   flags = 0x2 | 0x1
@@ -5046,17 +5188,17 @@ class Assembler:
             それを最優先で使う。名前が見つからない場合のみ、従来通り
             アドレスからの逆引きにフォールバックする。
             """
+            word_pc = byte_addr // bpw if bpw else 0
             if sec_name is not None:
                 _idx = sec_name_to_idx.get(sec_name)
                 if _idx is not None:
-                    _s = csecs[_idx - 1]
-                    return _idx, byte_addr - _s.byte_start
+                    _woff = self._addr_to_word_offset(sec_name, word_pc)
+                    if _woff is not None:
+                        return _idx, _woff * bpw
             for i, s in enumerate(csecs):
-                if s.byte_size > 0 and s.byte_start <= byte_addr < s.byte_start + s.byte_size:
-                    return i + 1, byte_addr - s.byte_start
-            for i, s in enumerate(csecs):
-                if s.byte_size == 0 and byte_addr == s.byte_start:
-                    return i + 1, 0
+                _woff = self._addr_to_word_offset(s.name, word_pc)
+                if _woff is not None:
+                    return i + 1, _woff * bpw
             if csecs:
                 best_i = 0
                 best_start = csecs[0].byte_start
@@ -5455,6 +5597,7 @@ class Assembler:
                     self.state.current_section = '.text'
                     self.state.symbols = dict(self.state.patsymbols)
                     self.state.vars = list(_initial_vars)
+                    self.state.section_ranges = []
                     self.fileassemble(args.sourcefile)
 
                     _last_sec1 = self.state.current_section
@@ -5465,6 +5608,7 @@ class Assembler:
                             _blk1 = self.state.pc - _ep1
                             if _blk1 > 0:
                                 _e1[1] += _blk1
+                                self.state.section_ranges.append((_last_sec1, _ep1, _blk1))
 
                     # 収束判定: 全ラベルの(pc, セクション)が前回反復と完全一致すれば
                     # 収束とみなす。UNDEF由来の値が混ざっている間は収束とみなさない
@@ -5537,6 +5681,7 @@ class Assembler:
                 self.state.line_map = []
                 self.state.sections = {}
                 self.state.current_section = '.text'
+                self.state.section_ranges = []
                 self.fileassemble(args.sourcefile)
 
                 _last_sec = self.state.current_section
@@ -5548,6 +5693,7 @@ class Assembler:
                         _block = self.state.pc - _entry_pc
                         if _block > 0:
                             _e[1] += _block
+                            self.state.section_ranges.append((_last_sec, _entry_pc, _block))
 
                 _drift = []
                 for k, p2 in ((kk, vv[0]) for kk, vv in self.state.labels.items()

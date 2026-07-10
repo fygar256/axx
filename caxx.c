@@ -331,18 +331,34 @@ static int u256_is_undef(uint256_t a) { return u256_eq(a, UNDEF_VAL()); }
  * 検出できる場合に一度だけ警告し、無警告での誤判定を防ぐに留める。 */
 static int u256_is_undef_derived(uint256_t a) {
     if (u256_is_undef(a)) return 1;
-    if (a.w[3] != 0) {
+    /* 破綻点修正: 以前は符号なしのまま w[3]!=0 (>=2^192) だけを見ていたため、
+     * "全く普通の負の値" が軒並み誤判定されていた。uint256_tには符号の
+     * 概念が無く、負の値は二の補数表現で符号拡張されるため、上位ワードが
+     * 全て1になる点で「巨大な符号なし値」と見分けが付かない。例えば
+     * ".equ 0-1"(-1)は全ビット1になり、これはUNDEF自体の値と完全に一致
+     * するため u256_is_undef() で検出され、".equ 3-8"(-5)のような他の
+     * 小さな負の値も w[3]!=0 の網に掛かって無警告でシンボルテーブルから
+     * 消えていた(axx.pyは任意精度の符号付き整数なので abs(v) で正しく
+     * 小さいと判定できるが、Cでは符号付き解釈の絶対値を計算して初めて
+     * 同じ判定になる)。ここで符号付き絶対値を計算してから閾値と比較する
+     * ことで、-1 以外の負の値(実用上ほぼ全て)を正しく「未定義由来ではない」
+     * と判定できるようにする。値が厳密に-1(=UNDEFのビットパターンそのもの)
+     * である場合だけは、型の値域に本質的な制約があるため区別できない。 */
+    int sign = (int)(a.w[3] >> 63);
+    uint256_t av = sign ? u256_neg(a) : a;
+    if (av.w[3] != 0) {
         static int warned = 0;
         if (!warned) {
             warned = 1;
             fprintf(stderr,
-                    " warning - a value >= 2**192 was computed and is being treated as "
-                    "UNDEF-derived; this heuristic cannot distinguish it from a genuine "
-                    "large 256-bit constant (e.g. an all-ones bitmask) because uint256_t "
-                    "has no headroom beyond 256 bits for a true out-of-band sentinel.\n");
+                    " warning - a value whose signed absolute magnitude is >= 2**192 was "
+                    "computed and is being treated as UNDEF-derived; this heuristic cannot "
+                    "distinguish it from a genuine large 256-bit constant (e.g. an all-ones "
+                    "bitmask) because uint256_t has no headroom beyond 256 bits for a true "
+                    "out-of-band sentinel.\n");
         }
     }
-    return a.w[3] != 0;          /* unsigned >= 2^192 */
+    return av.w[3] != 0;          /* signed absolute value >= 2^192 */
 }
 
 /* =========================================================
@@ -682,6 +698,53 @@ static void secmap_clear(SecMap*m){
     m->count=0;
 }
 
+/* 破綻点修正 (axx.py port): 各セクションへの訪問記録(名前, 開始pc,
+ * ワード数)を時系列順に保持する。同じセクションに複数回出入りすると
+ * (.text→.data→.text等)、真の内容はグローバルpc空間上で不連続な複数の
+ * 断片に分かれる。write_elf_obj()相当のコードはこれを使って各断片を
+ * 訪問順に連結し、アドレス→セクション内オフセットの変換も断片ごとの
+ * 累積オフセットを使って正しく計算する。 */
+typedef struct { char *name; uint256_t start; uint256_t len; } SecRange;
+typedef struct { SecRange *data; int len; int cap; } SecRangeVec;
+AXX_UNUSED static void secrangevec_init(SecRangeVec*v){v->data=NULL;v->len=0;v->cap=0;}
+static void secrangevec_push(SecRangeVec*v, const char*name, uint256_t start, uint256_t len){
+    if(v->len>=v->cap){
+        v->cap = v->cap ? v->cap*2 : 8;
+        SecRange *_tmp = realloc(v->data, (size_t)v->cap*sizeof(SecRange));
+        if(!_tmp){ perror("realloc"); exit(1); }
+        v->data = _tmp;
+    }
+    v->data[v->len].name = strdup(name);
+    v->data[v->len].start = start;
+    v->data[v->len].len = len;
+    v->len++;
+}
+static void secrangevec_clear(SecRangeVec*v){
+    for(int i=0;i<v->len;i++) free(v->data[i].name);
+    v->len = 0;
+}
+AXX_UNUSED static void secrangevec_free(SecRangeVec*v){
+    secrangevec_clear(v);
+    free(v->data); v->data=NULL; v->cap=0;
+}
+/* word_pc がセクション name 内のどこに対応するか、断片を跨いだ累積ワード
+ * オフセットを返す。属さない場合は -1 を返す(u256_to_i64(-1)と衝突しない
+ * ようcallerはint型で受ける)。上限は閉区間(<=)で判定する: セクション末尾
+ * ちょうど(そのセクションの最後に書かれたバイトの1つ先)を指す「終端
+ * マーカー」ラベル(_etext的なもの)は正当なイディオムなので、境界値を
+ * 除外する理由はない。 */
+static int64_t addr_to_word_offset(SecRangeVec*ranges, const char*name, uint64_t word_pc){
+    uint64_t cum = 0;
+    for(int i=0;i<ranges->len;i++){
+        if(strcmp(ranges->data[i].name,name)!=0) continue;
+        uint64_t rs = u256_to_u64(ranges->data[i].start);
+        uint64_t rl = u256_to_u64(ranges->data[i].len);
+        if(word_pc >= rs && word_pc <= rs+rl) return (int64_t)(cum + (word_pc-rs));
+        cum += rl;
+    }
+    return -1;
+}
+
 /* Finalize the current (last) section's size after fileassemble() completes.
  * Mirrors axx.py run():
  *   _last_sec = self.state.current_section
@@ -982,6 +1045,21 @@ typedef struct {
     /* 破綻点修正5 (axx.py port): pat_match0()の組合せ数予算を使い切った
      * ことを警告済みかどうか。実行全体で1度だけ警告すれば十分。 */
     int        combo_budget_warned;
+
+    /* 破綻点修正 (axx.py port): 各セクションへの訪問記録(SecRangeVec参照)。
+     * write_elf_obj相当のELF出力コードがこれを使って複数回の出入りで
+     * 生じた不連続な断片を正しく連結・アドレス変換する。 */
+    SecRangeVec section_ranges;
+
+    /* 破綻点修正 (axx.py port): .EQU(reloc_type指定なし)の式評価中に1に
+     * しておくと、label_get_value()が参照したラベルの所属セクションを
+     * ここに記録する(tracking=0のときは何もしない)。異なるセクションの
+     * ラベルを跨いで演算すると、結果はリンク時のセクション配置に依存する
+     * 定数になってしまうにもかかわらずリロケーションが一切生成されない
+     * ため、adir_label_processing()がこれを見て警告する。 */
+    int        equ_section_tracking;
+    char       equ_first_section[64];
+    int        equ_multi_section;
 } AsmState;
 
 /* 破綻点修正7 (axx.py port): 「ユーザー向けエラーを表示すべきパスか」の
@@ -1004,7 +1082,18 @@ static void secmap_finalize_current(AsmState *st){
     uint256_t delta = u256_sub(st->pc, e->entry_pc);
     if(u256_lt_signed(delta, u256_zero())) return;   /* negative delta: skip */
     e->size = u256_add(e->size, delta);
+    if(!u256_is_zero(delta))
+        secrangevec_push(&st->section_ranges, st->current_section, e->entry_pc, delta);
     e->entry_pc = st->pc;   /* prevent double-counting on re-call */
+}
+
+/* DWARF .debug_line生成用の小さなヘルパー: word_pc をセクションsec_name内の
+ * バイトオフセットに変換する(断片を跨いだ累積オフセット)。該当する断片が
+ * 見つからない場合は0にフォールバックする(DWARF生成自体をクラッシュ
+ * させないため)。 */
+static uint64_t dwarf_word_offset(AsmState *st, const char *sec_name, uint64_t word_pc, int bpw){
+    int64_t o = addr_to_word_offset(&st->section_ranges, sec_name, word_pc);
+    return (uint64_t)(o >= 0 ? o : 0) * (uint64_t)bpw;
 }
 
 static void state_init(AsmState *st) {
@@ -1172,9 +1261,16 @@ static void axx_remove_comment_asm(char *l) {
 }
 
 static int axx_get_param_to_spc(const char *s, int idx, char *t, size_t tsz) {
+    /* 破綻点修正 (axx.py port): "!!"は常にVLIWスロット区切り/終端マーカー
+     * として予約されている。以前は空白のみを境界とみなしていたため、
+     * オペランドを持たない命令(NOP等)をVLIWスロットとして空白なしで
+     * "nop!!!!"のように書くと、"!!!!"ごとニーモニックとして取り込まれて
+     * マッチに失敗していた(NOPのエンコード値がたまたまvliwnopの穴埋め値と
+     * 同じ0x00だったため出力バイトはたまたま一致していたが、"Syntax error"
+     * が誤って報告され、エンコードが異なる命令では実際にバイト列が壊れる)。 */
     idx=axx_skipspc(s,idx);
     size_t n=0;
-    while(s[idx]&&s[idx]!=' '&&n<tsz-1) t[n++]=s[idx++];
+    while(s[idx]&&s[idx]!=' '&&!(s[idx]=='!'&&s[idx+1]=='!')&&n<tsz-1) t[n++]=s[idx++];
     t[n]=0;
     return idx;
 }
@@ -1863,6 +1959,15 @@ static uint256_t label_get_value(AsmState *st, const char *k){
     st->error_undefined_label=0;
     LabelEntry *e=lmap_find(&st->labels,k);
     if(e){
+        if(st->equ_section_tracking){
+            const char *sec = e->section ? e->section : "";
+            if(!st->equ_first_section[0]){
+                strncpy(st->equ_first_section, sec, sizeof(st->equ_first_section)-1);
+                st->equ_first_section[sizeof(st->equ_first_section)-1]='\0';
+            } else if(strcmp(st->equ_first_section, sec) != 0){
+                st->equ_multi_section = 1;
+            }
+        }
         /* ELF relocation tracking.
          * .equ-defined labels は原則として絶対定数であり追跡しない。
          * ただし .equ $$::reloctype のように reloc_type_override が設定されている場合は
@@ -4076,6 +4181,22 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
 
         int ibyte=st->vliwinstbits/8+(st->vliwinstbits%8?1:0);
         int noi=(vbits-at)/st->vliwinstbits;
+        /* 破綻点修正 (axx.py port): vliwtemplatebits(at)がvbitsを超える
+         * (パケット幅よりテンプレート自体が大きい)矛盾した.vliw定義では、
+         * noiが負になりtarget_lenも負になって、以降のfor(j=0;j<noi;j++)相当
+         * のループが実質空になり、命令スロットの内容が無警告のまま失われた
+         * 状態で何らかのパケットが出力されてしまう。noiが0以下の場合は
+         * 明確なエラーで打ち切る。 */
+        if(noi <= 0){
+            if(should_report_errors(st))
+                fprintf(stderr," error - .vliw: vliwtemplatebits (%d) leaves no room for "
+                        "instruction slots in a %d-bit packet (vliwinstbits=%d).\n",
+                        st->vliwtemplatebits, vbits, st->vliwinstbits);
+            iv_free(&values);
+            ivv_free(&objs); free(idxlst);
+            if(idx_out) *idx_out=idx;
+            return 0;
+        }
         int target_len=ibyte*noi;
         if(values.len > target_len){
             if(should_report_errors(st))
@@ -4219,8 +4340,30 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
             int saved_mode = st->pass1_size_mode;
             if(st->pas == 1)
                 st->pass1_size_mode = 1;   /* forward ref を 0 として扱う */
+            /* 破綻点修正 (axx.py port): reloc_type未指定の.EQUで異なる
+             * セクションのラベルを跨いで演算すると(例: a_in_text -
+             * b_in_data)、結果はアセンブラが暗黙に仮定する「連続配置」
+             * でのみ正しい値になり、リロケーションが一切生成されない
+             * ため、リンカがセクションを別配置にした瞬間に無警告で
+             * 不正な定数になる。参照したラベルの所属セクションを記録し、
+             * 2つ以上の異なるセクションに跨っていたら警告する。 */
+            int track_sections = (reloc_type < 0);
+            if(track_sections){
+                st->equ_section_tracking = 1;
+                st->equ_first_section[0] = '\0';
+                st->equ_multi_section = 0;
+            }
             u = expr_expression_asm(asmb, expr_tail, 0, &io);
             st->pass1_size_mode = saved_mode;
+            if(track_sections){
+                st->equ_section_tracking = 0;
+                if(st->equ_multi_section && should_report_errors(st)){
+                    fprintf(stderr, " warning - .EQU '%s': expression combines labels from "
+                            "multiple sections without an explicit ::reloctype; the resulting "
+                            "constant assumes a specific section layout and will NOT be "
+                            "relocated by the linker.\n", label);
+                }
+            }
             /* ====================================================================== */
 
             label_put_value(st,label,u,st->current_section,1,reloc_type);  /* is_equ=1 */
@@ -4292,8 +4435,11 @@ static int adir_section(AsmState *st, const char *l, const char *l2){
             SecEntry *oe = secmap_find(&st->sections, old_sec);
             if(oe && !oe->confirmed){
                 uint256_t delta = u256_sub(st->pc, oe->entry_pc);
-                if(!u256_lt_signed(delta, u256_zero()))   /* delta >= 0 */
+                if(!u256_lt_signed(delta, u256_zero())){   /* delta >= 0 */
                     oe->size = u256_add(oe->size, delta);
+                    if(!u256_is_zero(delta))
+                        secrangevec_push(&st->section_ranges, old_sec, oe->entry_pc, delta);
+                }
                 /* entry_pc will be updated on re-entry */
             }
         }
@@ -4325,6 +4471,7 @@ static int adir_section(AsmState *st, const char *l, const char *l2){
             /* Re-entry: update entry_pc so next ENDSECTION measures from here.
              * If confirmed, keep size unchanged. If not confirmed and size==0,
              * this was a dummy entry created as old_sec — update start. */
+
             if(u256_is_zero(ne->size) && !ne->confirmed){
                 ne->start = st->pc;
             } else if(!ne->confirmed){
@@ -4348,8 +4495,11 @@ static int adir_endsection(AsmState *st, const char *l){
     /* Confirmed size: measure from entry_pc (last re-entry) to current pc.
      * Mirrors axx.py endsection_processing() using entry_pc for accuracy. */
     uint256_t delta = u256_sub(st->pc, e->entry_pc);
-    if(!u256_lt_signed(delta, u256_zero()))
+    if(!u256_lt_signed(delta, u256_zero())){
         e->size = u256_add(e->size, delta);
+        if(!u256_is_zero(delta))
+            secrangevec_push(&st->section_ranges, st->current_section, e->entry_pc, delta);
+    }
     e->confirmed = 1;
     return 1;
 }
@@ -5303,7 +5453,16 @@ static int lineassemble(Assembler *asmb, const char *line_in){
             int bpw = (st->bts+7)/8; if(bpw<1) bpw=1;
             const char *sec_name = st->current_section;
             SecEntry *_rse = secmap_find(&st->sections, sec_name);
-            uint64_t sec_start = _rse ? u256_to_u64(_rse->start) : 0;
+            /* 破綻点修正 (axx.py port): 以前は sec_start をこのセクションの
+             * 「最初の訪問の開始pc」とし、sec_rel = pc - sec_start として
+             * いた。これはセクションに複数回出入りする(.text→.data→.text等)
+             * と、2回目以降の訪問のオフセットが正しく計算できない(間に
+             * 挟まった他セクションのぶんだけずれる)。現在オープン中の訪問
+             * より前に完了した訪問の累積ワード数(_rse->size、離脱時に
+             * 加算済み)に、今回の訪問内でのオフセット(pc - entry_pc)を
+             * 足すことで、断片を跨いだ正しいセクション内相対位置を計算する。 */
+            uint64_t sec_completed_words = _rse ? u256_to_u64(_rse->size) : 0;
+            uint64_t sec_entry_pc_cur    = _rse ? u256_to_u64(_rse->entry_pc) : 0;
             uint64_t cur_pc    = u256_to_u64(st->pc);
 
         /* Per-machine rtype lookup.
@@ -5366,6 +5525,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                 int _nbytes = _nwords * bpw;
                 /* axx.py: check .EXTERN reloc_type_override first, then fall back to default */
                 int _rtype = 0;
+                int _rtype_is_default_guess = 0;
                 {
                     LabelEntry *_le = lmap_find(&st->labels, _lname);
                     if(_le && _le->reloc_type_override >= 0){
@@ -5387,14 +5547,18 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                             if(_fw[_fi].rtype == _rt_ov){ _expected=_fw[_fi].bytes; break; }
                         if(_le->is_imported || _expected == 0 || _expected == _nbytes)
                             _rtype = _rt_ov;
-                        else
+                        else {
                             _rtype = RTYPE_FOR(_nbytes);  /* フィールド幅不一致 → デフォルト */
+                            _rtype_is_default_guess = 1;
+                        }
                     } else {
                         _rtype = RTYPE_FOR(_nbytes);
+                        _rtype_is_default_guess = 1;
                     }
                 }
                 if(_rtype != 0 && _widx < objl.len){
-                    int64_t _sec_rel = (int64_t)((cur_pc + (uint64_t)_widx - sec_start)
+                    int64_t _sec_rel = (int64_t)((sec_completed_words +
+                                                   (cur_pc + (uint64_t)_widx - sec_entry_pc_cur))
                                                   * (uint64_t)bpw);
                     /* RELA addend computation:
                      *   addend = (value stored in objl word(s)) − (label absolute address)
@@ -5431,6 +5595,25 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                             }
                         }
                     }
+                    /* 破綻点修正 (axx.py port): _rtype がreloc_type明示指定なしに
+                     * バイト幅だけから推測された場合(_rtype_is_default_guess)、
+                     * その推測がたまたまPC相対型に landing しても、実際に
+                     * エンコードされた値(_raw_val)がラベルの絶対アドレス
+                     * そのもの(_valid[_gi].val)と厳密に一致するなら、それは
+                     * 減算を伴わない絶対参照(例: "DD label")であることの
+                     * 明確な証拠になる。真にPC相対な参照(call/jmp rel32等)
+                     * ではraw_valが絶対アドレスとぴったり一致することは
+                     * 実質あり得ないため、この場合だけ絶対型に読み替える
+                     * (x86_64のデフォルト表でのみ確認済み: 4バイト幅は
+                     * R_X86_64_PC32(2)ではなくR_X86_64_32(10)にすべき)。 */
+                    if(_rtype_is_default_guess && _rtype == 2 && _nbytes == 4
+                       && st->elf_machine != 3 && st->elf_machine != 40
+                       && st->elf_machine != 183 && st->elf_machine != 20
+                       && st->elf_machine != 243
+                       && _raw_val == (uint64_t)_valid[_gi].val){
+                        _rtype = 10; /* R_X86_64_32: absolute 32-bit */
+                    }
+
                     /* addend の計算:
                      * ELF PC相対リロケーション (PC32/PLT32等) では、リンカが
                      * フィールドに S+A-P を書き込む。実行時に CPU は
@@ -5679,6 +5862,34 @@ static uint8_t *weo_extract(AsmState*st,int bpw,uint64_t w0,uint64_t wn){
     return d;
 }
 
+/* 破綻点修正 (axx.py port): セクションが複数回の出入り(.text→.data→.text等)
+ * で複数の断片に分かれている場合、単一の(start,size)によるweo_extract()
+ * だけでは真の内容を正しく取り出せない(2つ目以降の断片の位置に別
+ * セクションのバイトが来てしまう)。st->section_ranges に記録された、この
+ * セクションに属する全ての断片を訪問順に連結する。 */
+static uint8_t *weo_extract_ranges(AsmState*st, int bpw, const char*name, uint64_t *out_nb){
+    uint64_t total_words = 0;
+    for(int i=0;i<st->section_ranges.len;i++)
+        if(strcmp(st->section_ranges.data[i].name,name)==0)
+            total_words += u256_to_u64(st->section_ranges.data[i].len);
+    uint64_t nb = total_words*(uint64_t)bpw;
+    if(!nb){ *out_nb=0; return calloc(1,1); }
+    uint8_t *d = malloc((size_t)nb);
+    if(!d){ perror("malloc"); exit(1); }
+    uint64_t off=0;
+    for(int i=0;i<st->section_ranges.len;i++){
+        if(strcmp(st->section_ranges.data[i].name,name)!=0) continue;
+        uint64_t rs = u256_to_u64(st->section_ranges.data[i].start);
+        uint64_t rl = u256_to_u64(st->section_ranges.data[i].len);
+        uint8_t *chunk = weo_extract(st,bpw,rs,rl);
+        memcpy(d+off, chunk, (size_t)(rl*(uint64_t)bpw));
+        free(chunk);
+        off += rl*(uint64_t)bpw;
+    }
+    *out_nb = nb;
+    return d;
+}
+
 /* byte-address -> (1-based content section index, in-section offset)
  *
  * axx.py の _find_shndx() (Fix 7) 相当のフォールバックを追加。
@@ -5699,17 +5910,25 @@ static uint8_t *weo_extract(AsmState*st,int bpw,uint64_t w0,uint64_t wn){
  * (sec_name)が分かっている場合はそれを最優先で使う。名前が一致する
  * セクションが無い場合のみ、従来通りアドレスからの逆引きにフォール
  * バックする。sec_name==NULLのときは従来通りアドレスのみで判定する。 */
-static WSR weo_shndx(WCS*csecs,int ncs,uint64_t ba,const char*sec_name){
+static WSR weo_shndx(WCS*csecs,int ncs,uint64_t ba,const char*sec_name,
+                      SecRangeVec*ranges,int bpw){
+    /* 破綻点修正 (axx.py port): セクションの真の内容は複数回の出入り
+     * (.text→.data→.text等)で複数の断片に分かれうるため、単純な
+     * ba - csecs[i].bs では断片2つ目以降のアドレスが正しいオフセットに
+     * ならない。addr_to_word_offset()で断片を跨いだ累積オフセットを
+     * 計算する(戻り値-1は「このセクションに属さない」の意味)。 */
+    uint64_t word_pc = bpw ? ba/(uint64_t)bpw : 0;
     if(sec_name){
         for(int i=0;i<ncs;i++){
-            if(strcmp(csecs[i].name,sec_name)==0)
-                return (WSR){(uint16_t)(i+1), ba-csecs[i].bs};
+            if(strcmp(csecs[i].name,sec_name)==0){
+                int64_t woff = addr_to_word_offset(ranges, sec_name, word_pc);
+                if(woff >= 0) return (WSR){(uint16_t)(i+1), (uint64_t)woff*(uint64_t)bpw};
+            }
         }
     }
     for(int i=0;i<ncs;i++){
-        if(csecs[i].bsz>0&&csecs[i].bs<=ba&&ba<csecs[i].bs+csecs[i].bsz)
-            return (WSR){(uint16_t)(i+1),ba-csecs[i].bs};
-        if(!csecs[i].bsz&&ba==csecs[i].bs) return (WSR){(uint16_t)(i+1),0};
+        int64_t woff = addr_to_word_offset(ranges, csecs[i].name, word_pc);
+        if(woff >= 0) return (WSR){(uint16_t)(i+1), (uint64_t)woff*(uint64_t)bpw};
     }
     if(ncs>0){
         int best_i=0; uint64_t best_start=csecs[0].bs;
@@ -5849,11 +6068,12 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         ncs=st->sections.count; csecs=calloc((size_t)ncs,sizeof(WCS));
         for(int i=0;i<ncs;i++){
             SecEntry *se=st->sections.order[i];
-            uint64_t w0=u256_to_u64(se->start),wsz=u256_to_u64(se->size);
-            if(!wsz){
-                if(i+1<ncs){uint64_t w1=u256_to_u64(st->sections.order[i+1]->start);wsz=w1>w0?w1-w0:0;}
-                else        wsz=(have_w&&max_w>=w0)?max_w+1-w0:0;
-            }
+            uint64_t w0=u256_to_u64(se->start);
+            /* 破綻点修正 (axx.py port): セクションの真のバイト数・内容は
+             * section_ranges に記録された全断片から得る(旧来の「次の
+             * セクションの開始位置から借用してサイズを推定する」フォール
+             * バックは、複数回出入りする設計では単一連続領域を仮定してしまい
+             * 誤りだったため廃止)。 */
             char un[64]; int ui=0;
             for(;se->name[ui]&&ui<63;ui++) un[ui]=(char)axx_upper_char(se->name[ui]);
             un[ui]=0;
@@ -5863,7 +6083,9 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
             else if(strncmp(un,".RODATA",7)==0) fl=0x2;
             else if(strncmp(un,".BSS",4)==0)    fl=0x2|0x1;
             else                                fl=0x2;
-            csecs[i]=(WCS){se->name,w0*(uint64_t)bpw,wsz*(uint64_t)bpw,fl,weo_extract(st,bpw,w0,wsz)};
+            uint64_t _nb;
+            uint8_t *_data = weo_extract_ranges(st, bpw, se->name, &_nb);
+            csecs[i]=(WCS){se->name,w0*(uint64_t)bpw,_nb,fl,_data};
         }
     }
 
@@ -5937,7 +6159,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         int _equ_has_reloc = larr[i].is_equ && (larr[i].reloc_type_override >= 0);
         WSR sr = (larr[i].is_equ && !_equ_has_reloc)
                  ? (WSR){0xfff1, larr[i].val}
-                 : weo_shndx(csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section);
+                 : weo_shndx(csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section,&st->section_ranges,bpw);
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
         snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
         weo_sym(&symtab_bb,&nsyms,_is_le,noff,0x00,0,sr.shndx,sr.sv,0);
@@ -5957,7 +6179,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         int _equ_has_reloc = earr[i].is_equ && (earr[i].reloc_type_override >= 0);
         WSR sr = (earr[i].is_equ && !_equ_has_reloc)
                  ? (WSR){0xfff1, earr[i].val}
-                 : weo_shndx(csecs,ncs,earr[i].val*(uint64_t)bpw,earr[i].section);
+                 : weo_shndx(csecs,ncs,earr[i].val*(uint64_t)bpw,earr[i].section,&st->section_ranges,bpw);
         uint32_t noff=wbb_str(&strtab_bb,earr[i].name);
         snimap[snimap_len++]=(WSNI){earr[i].name,nsyms};
         weo_sym(&symtab_bb,&nsyms,_is_le,noff,0x10,0,sr.shndx,sr.sv,0);
@@ -6045,7 +6267,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         rb_w4(&die,0,_is_le);                 /* stmt_list = 0      */
         for(int i=0;i<nl;i++){
             if(larr[i].is_equ || larr[i].is_imported) continue;
-            WSR sr = weo_shndx(csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section);
+            WSR sr = weo_shndx(csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section,&st->section_ranges,bpw);
             if(sr.shndx==0xfff1) continue;           /* not in a content section */
             rb_uleb(&die,2);
             rb_cstr(&die,larr[i].name);
@@ -6095,14 +6317,18 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
                 rows[k].wpc=st->line_map[i].word_pc; rows[k].file=row_file[i]; rows[k].line=st->line_map[i].line; k++;
             }
             qsort(rows,(size_t)cnt,sizeof(LROW),lrow_cmp);
-            uint64_t secbase=csecs[s].bs;
-            uint64_t first_off = rows[0].wpc*(uint64_t)bpw - secbase;
+            /* 破綻点修正 (axx.py port): セクションが複数回の出入りで複数の
+             * 断片に分かれている場合、単純な (wpc*bpw - secbase) では
+             * 2つ目以降の断片のアドレスが正しいオフセットにならない。
+             * addr_to_word_offset()で断片を跨いだ累積オフセットを使う
+             * (該当する断片が見つからない場合は0にフォールバックする)。 */
+            uint64_t first_off = dwarf_word_offset(st, csecs[s].name, rows[0].wpc, bpw);
             rb_u8(&prog,0); rb_uleb(&prog,1+8); rb_u8(&prog,2);   /* DW_LNE_set_address */
             drv_add(&line_relas, prog_base+prog.len, s+1, abs64, (int64_t)first_off);
             rb_w8(&prog,0,_is_le);
             uint64_t cur_off=first_off; int cur_line=1, cur_file=1;
             for(int i=0;i<cnt;i++){
-                uint64_t boff = rows[i].wpc*(uint64_t)bpw - secbase;
+                uint64_t boff = dwarf_word_offset(st, csecs[s].name, rows[i].wpc, bpw);
                 if(rows[i].file!=cur_file){ rb_u8(&prog,4); rb_uleb(&prog,(uint64_t)rows[i].file); cur_file=rows[i].file; }
                 if(rows[i].line!=cur_line){ rb_u8(&prog,3); rb_sleb(&prog,(int64_t)rows[i].line-cur_line); cur_line=rows[i].line; }
                 if(boff>cur_off){ rb_u8(&prog,2); rb_uleb(&prog,boff-cur_off); cur_off=boff; }
@@ -6707,6 +6933,7 @@ int main(int argc, char *argv[]){
                                   e->is_equ, e->is_imported, e->reloc_type_override);
             /* reset sections and export_labels too (mirrors axx.py run()) */
             secmap_clear(&st->sections);
+            secrangevec_clear(&st->section_ranges);
             /* Bug修正(axx.py port): reset current_section so that the previous
              * iteration's trailing section (.data etc.) does not become old_sec
              * at the next iteration's start and get wrongly registered at pc=0. */
@@ -6844,6 +7071,7 @@ int main(int argc, char *argv[]){
          * provisional sizes from pass1 do not carry over.  labels and
          * patsymbols do NOT need resetting here (only sections). */
         secmap_clear(&st->sections);
+        secrangevec_clear(&st->section_ranges);
         /* Bug修正(axx.py port): reset current_section before pass2 (mirrors
          * axx.py: self.state.current_section = '.text' before pass2 fileassemble). */
         strcpy(st->current_section, ".text");
