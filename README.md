@@ -72,7 +72,7 @@ Because pattern files and source files are separated, it's possible to generate 
 
 axx reads assembler pattern data from the first argument and assembles the source file specified in the second argument based on that data. During this process, the pattern data is matched to the assembly lines one by one, and the `binary_list` of any matching pattern is output to the result. While the definition of directives within the pattern file is order-dependent, the patterns themselves are not. If the second argument is omitted, the source input is read from the terminal (standard input).
 
-The result is output as text to standard output, and if the -o option is specified, a binary file is output to the current directory. The -e option outputs the labels specified in `.export` along with section/segment information to a file in TSV format.
+The result is output as text to standard output if the -v option is present; a binary file is written to the current directory if an argument is specified with the -b option; and an ELF64 object file is produced if the -o option is used. The -e option outputs labels specified via .export—along with section/segment information—to a file in TSV format.
 
 In `axx`, lines input from assembly language source files or standard input are called assembly lines.
 
