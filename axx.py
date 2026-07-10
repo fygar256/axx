@@ -2210,6 +2210,7 @@ class BinaryWriter:
                         
         with open(self.state.outfile, 'wb') as f:
             f.write(data)
+        print(f"wrote raw binary {self.state.outfile} ({len(data)} bytes)", file=sys.stderr)
 
     def fwrite(self, position, x, prt):
         """1ワードをバッファへ書き込み"""

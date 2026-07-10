@@ -1936,6 +1936,7 @@ static void binary_flush(AsmState *st){
     if(!fp){perror(st->outfile);free(data);return;}
     fwrite(data,1,(size_t)total_size,fp);
     fclose(fp);
+    fprintf(stderr,"wrote raw binary %s (%llu bytes)\n",st->outfile,(unsigned long long)total_size);
     free(data);
 }
 
