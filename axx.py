@@ -222,8 +222,8 @@ class AssemblerState:
 
         self.labels = {}          # {ラベル名: [値, セクション, is_equ, is_imported, reloc_type?]}
         self.sections = {}        # {セクション名: [開始pc, サイズ, ...]}
-        self.symbols = {}         # .setsymで登録された現在有効なシンボル
-        self.patsymbols = {}      # パターンファイル読込み直後のシンボル(ソース側.setsymの復元用)
+        self.symbols = {}         # .setsymで登録された現在有効なシンボル(パターンファイル由来のみ)
+        self.patsymbols = {}      # パターンファイル読込み直後のシンボル(各行冒頭でsymbolsの復元元)
         self.export_labels = {}
         self.pat = []              # パターンファイルの全エントリ(PatternFileReaderが構築)
 
@@ -2284,24 +2284,24 @@ class DirectiveProcessor:
         """Clear symbol directive"""
         if len(i) == 0 or i[0] != '.clearsym':
             return False
-        
+
         if len(i) >= 3 and i[2] != '':
             key = StringUtils.upper(i[2])
             self.state.symbols.pop(key, None)
         else:
             self.state.symbols = {}
-        
+
         return True
-    
+
     def set_symbol(self, i):
         """Set symbol directive"""
         if len(i) == 0 or i[0] != '.setsym':
             return False
-        
+
         if len(i) < 2:
             print(f" error - .setsym directive requires at least a symbol name", file=sys.stderr)
             return False
-        
+
         key = StringUtils.upper(i[1])
         if len(i) > 2:
             v, idx = self.expr_eval.expression_pat(i[2], 0)
@@ -3267,6 +3267,26 @@ class VLIWProcessor:
                 continue
             elif idx + 2 <= len(line) and line[idx:idx+2] == '!!':
                 idx += 2
+                # 破綻点修正: VLIWスロットの内容が".section"/".endsection"/
+                # ".INCLUDE"等のディレクティブだった場合、lineassemble2_func()
+                # (=lineassemble2())はそれを即座に処理してしまう。しかし
+                # このパケット全体のバイトはまだ書き込まれておらず、
+                # state.pcもパケット先頭のままである(self.state.pc += q は
+                # パケット全体の組み立てが終わった後に1回だけ行われる)。
+                # そのため.sectionが行うセクション切替え等の副作用は誤った
+                # (パケット末尾ではなく先頭の)pcを基準に記録されてしまい、
+                # 検出困難な形でこのパケットや後続バイトがセクション取り違え
+                # により出力から消える/誤配置される事故になっていた。
+                # ディレクティブはVLIWスロットの内容として意味を持たない
+                # (スロットは命令エンコードのためのものである)ため、
+                # 明確なエラーとして打ち切る。
+                _slot_peek = line[idx:].lstrip()
+                if _slot_peek.startswith('.'):
+                    if self.state.should_report_errors():
+                        print(" error - directives (e.g. .section/.endsection/.INCLUDE) "
+                              "are not allowed inside VLIW slots (the packet's PC has not "
+                              "advanced yet at this point in the packet).", file=sys.stderr)
+                    return False
                 idxs, objl, flag, idx = lineassemble2_func(line, idx)
                 if not flag:
                     return False
@@ -3908,7 +3928,7 @@ class Assembler:
         self.vliw_proc = VLIWProcessor(self.state, self.expr_eval, self.binary_writer)
         self.asm_directive_proc = AssemblyDirectiveProcessor(self.state, self.expr_eval, 
                                                              self.binary_writer, self.label_manager, self.parser)
-        self._imp_sections: dict = {}
+        self._imp_sections: dict = {}  # {name: [(start, size), ...]} (断片ごとの複数範囲)
     
     def include_asm(self, l1, l2):
         """Include directive.
@@ -3921,7 +3941,14 @@ class Assembler:
             return False
         s = StringUtils.get_string(l2)
         if s:
-            if not os.path.isabs(s):
+            # 破綻点修正: s(インクルード対象)が特殊マーカー文字列"stdin"
+            # そのものである場合、これはfileassemble()がfn=="stdin"を
+            # 厳密一致で見て「標準入力を読み込む」特別扱いをするための
+            # リテラルマーカーであり、実在するファイルパスではない。
+            # 相対パス解決でbaseディレクトリと結合してしまうと
+            # fn=="stdin"の厳密一致が壊れ、存在しないファイル
+            # ".../stdin" を開こうとしてFileNotFoundErrorになっていた。
+            if s != "stdin" and not os.path.isabs(s):
                 cur = self.state.current_file
                 if cur and cur not in ("(stdin)", ""):
                     base = os.path.dirname(os.path.abspath(cur))
@@ -3978,22 +4005,12 @@ class Assembler:
         if self.asm_directive_proc.export_processing(l, l2):
             return 0, [], True, idx
 
-        _l_upper = l.upper()
-        if _l_upper in ('.SETSYM', '.CLEARSYM'):
-            _l2_key, _l2_key_end = StringUtils.get_param_to_spc(l2, 0)
-            _l2_val = l2[_l2_key_end:].strip()
-            if _l_upper == '.SETSYM':
-                _i_src = [l.lower(), _l2_key, _l2_val, '', '', '']
-            else:
-                _i_src = [l.lower(), '', _l2_key, '', '', '']
-        else:
-            _i_src = [l, '', l2, '', '', '']
-        if self.directive_proc.set_symbol(_i_src):
-            self.state.patsymbols = dict(self.state.symbols)
-            return 0, [], True, idx
-        if self.directive_proc.clear_symbol(_i_src):
-            self.state.patsymbols = dict(self.state.symbols)
-            return 0, [], True, idx
+        # 撤廃: ソース側(.sファイル)からの.setsym/.clearsymは廃止した。
+        # シンボル(レジスタ名等のエンコード値)はパターンファイル(.axx)側
+        # でのみ定義するものとし、ソース側からの上書きは受け付けない。
+        # ソース中に.setsym/.clearsymと書いても、以下のパターンマッチング
+        # ループに委ねられ、該当パターンが無いため通常の
+        # 未知命令/構文エラーとして報告される。
         if l == "":
             return 0, [], False, idx
         
@@ -4648,7 +4665,13 @@ class Assembler:
                 size  = int(fields[2], 16)
             except ValueError:
                 return False
-            self._imp_sections[sname] = (start, size)
+            # 破綻点修正: セクションに複数回出入りした場合、_write_export()は
+            # 断片ごとに複数行を書き出すようになった。以前はここで同名の
+            # セクション行が来るたびに辞書エントリを上書きしてしまい、
+            # 最後の断片以外の範囲情報が失われていた(結果として、その
+            # セクションの前半に定義されたラベルの所属セクション判定が
+            # 狂う)。断片のリストとして蓄積する。
+            self._imp_sections.setdefault(sname, []).append((start, size))
             return True
 
         if len(fields) == 2:
@@ -4685,12 +4708,22 @@ class Assembler:
             except ValueError:
                 return False
             section = '.text'
-            for sname, (start, size) in self._imp_sections.items():
-                if size > 0 and start <= v < start + size:
-                    section = sname
-                    break
-                if size == 0 and v == start:
-                    section = sname
+            # 破綻点修正: セクション再入で複数の断片に分かれている場合、
+            # いずれかの断片に値が収まっていればそのセクションとみなす
+            # (単一の(start,size)だけを見ていた以前の実装は、2回目以降の
+            # 断片に定義されたラベルの所属セクションを誤判定していた)。
+            _found = False
+            for sname, _ranges in self._imp_sections.items():
+                for (start, size) in _ranges:
+                    if size > 0 and start <= v < start + size:
+                        section = sname
+                        _found = True
+                        break
+                    if size == 0 and v == start:
+                        section = sname
+                        _found = True
+                        break
+                if _found:
                     break
             entry = [v, section, False, True]
             if reloc_type is not None:
@@ -5438,9 +5471,15 @@ class Assembler:
                         help='Pattern definition file (.axx)')
         ap.add_argument('sourcefile', nargs='?', default=None,
                         help='Assembly source file (.s). Omit for interactive mode.')
+        # 破綻点修正: choices=['FreeBSD','Linux']はargparseレベルで大文字小文字を
+        # 完全一致要求するため、'freebsd'/'linux'のような小文字表記は
+        # argparseの時点でexit code 2のエラーになり、この直後で行っている
+        # osabitbl(小文字も許容する辞書)を使った大文字小文字非依存の
+        # 判定と、不明値に対する warning+fallback ロジックが完全に
+        # 到達不能なデッドコードになっていた。choices制約を外し、
+        # osabitbl側の判定に委ねる。
         ap.add_argument('--osabi', dest='elf_osabi', type=str, default='FreeBSD',
-                        choices=['FreeBSD', 'Linux'],
-                        help='ELF OSABI value (default: FreeBSD)')
+                        help='ELF OSABI value (default: FreeBSD; FreeBSD/Linux, case-insensitive)')
         ap.add_argument('-b', dest='outfile', default='',
                         metavar='OUTFILE',
                         help='Output binary file')
@@ -5741,17 +5780,29 @@ class Assembler:
                             flag = 'WA'
                         else:
                             flag = ''
-                        w_start = self.state.sections[i][0]
-                        w_count = self.state.sections[i][1]
-                        try:
-                            byte_start = int(w_start) * _bpw_export
-                            byte_size  = int(w_count) * _bpw_export
-                        except (OverflowError, ValueError, TypeError):
-                            byte_start = 0
-                            byte_size  = 0
-                        label_file.write(
-                            f"{i}\t{byte_start:#x}\t{byte_size:#x}\t{flag}\n"
-                        )
+                        # 破綻点修正: セクションが複数回出入りした場合
+                        # (.text→.data→.text等)、真の訪問範囲は複数の断片に
+                        # 分かれる。以前は state.sections[i] の
+                        # (最小開始pc, 累積サイズ)を単一の範囲として書き出して
+                        # いたため、2回目以降の断片の実際のpc位置を全く
+                        # カバーしない不正な範囲になり、-iでインポートした
+                        # 際にラベルの所属セクションを誤判定する原因に
+                        # なっていた(imp_label()の範囲照合はエクスポート側の
+                        # 範囲が実際の訪問と一致していることが前提)。断片
+                        # ごとに個別の行として書き出す。
+                        ranges = [(rs, rl) for (rn, rs, rl) in self.state.section_ranges if rn == i]
+                        if not ranges:
+                            ranges = [(self.state.sections[i][0], self.state.sections[i][1])]
+                        for (w_start, w_count) in ranges:
+                            try:
+                                byte_start = int(w_start) * _bpw_export
+                                byte_size  = int(w_count) * _bpw_export
+                            except (OverflowError, ValueError, TypeError):
+                                byte_start = 0
+                                byte_size  = 0
+                            label_file.write(
+                                f"{i}\t{byte_start:#x}\t{byte_size:#x}\t{flag}\n"
+                            )
                     for i in h:
                         lbl_is_equ = len(i[1]) > 2 and i[1][2]
                         lbl_addr_raw = i[1][0] if lbl_is_equ else i[1][0] * _bpw_export

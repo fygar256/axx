@@ -1816,13 +1816,18 @@ struct Assembler {
      * Built while reading section lines; used by subsequent label lines
      * to resolve label -> section membership.
      * Kept in Assembler (not AsmState) because it belongs to the import
-     * phase only and must not be confused with st.sections (assembly output). */
-    SecMap imp_sections;
+     * phase only and must not be confused with st.sections (assembly output).
+     * 破綻点修正 (axx.py port): SecMap(secmap_set)は同名キーの2回目の
+     * set()が1回目を上書きするため、再入セクションの断片ごとに複数行
+     * 書き出されるようになったTSVを読むと、名前ごとに最後の断片しか
+     * 残らず、それ以前の断片に定義されたラベルの所属セクションを
+     * 誤判定していた。SecRangeVec(重複キー可・追記のみ)に変更する。 */
+    SecRangeVec imp_sections;
 };
 
 static void assembler_init(Assembler *a){
     state_init(&a->st);
-    secmap_init(&a->imp_sections);
+    secrangevec_init(&a->imp_sections);
 }
 
 /* =========================================================
@@ -4128,11 +4133,40 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         if(idx+4<=slen && strncmp(line+idx,"!!!!",4)==0){ idx+=4; st->vliwstop=1; continue; }
         else if(idx+2<=slen && strncmp(line+idx,"!!",2)==0){
             idx+=2;
+            /* 破綻点修正 (axx.py port): VLIWスロットの内容が".section"/
+             * ".endsection"/".INCLUDE"等のディレクティブだった場合、
+             * lineassemble2()はそれを即座に処理してしまう。しかしこの
+             * パケット全体のバイトはまだ書き込まれておらず、st->pcも
+             * パケット先頭のままである(st->pc += q はパケット全体の
+             * 組み立てが終わった後に1回だけ行われる)。そのため.section
+             * が行うセクション切替え等の副作用は誤った(パケット末尾では
+             * なく先頭の)pcを基準に記録されてしまい、検出困難な形で
+             * このパケットや後続バイトがセクション取り違えにより出力から
+             * 消える/誤配置される事故になっていた。ディレクティブは
+             * VLIWスロットの内容として意味を持たないため、明確なエラー
+             * として打ち切る。 */
+            { int _peek=idx; while(_peek<slen && (line[_peek]==' '||line[_peek]=='\t')) _peek++;
+              if(_peek<slen && line[_peek]=='.'){
+                  if(should_report_errors(st))
+                      fprintf(stderr," error - directives (e.g. .section/.endsection/.INCLUDE) "
+                              "are not allowed inside VLIW slots (the packet's PC has not "
+                              "advanced yet at this point in the packet).\n");
+                  ivv_free(&objs); free(idxlst);
+                  if(idx_out) *idx_out=idx;
+                  return 0;
+              }
+            }
             IntVec new_idxs; iv_init(&new_idxs);
             IntVec new_objl; iv_init(&new_objl);
             int new_idx;
-            lineassemble2(asmb,line,idx,&new_idxs,&new_objl,&new_idx);
+            int _slot_ok = lineassemble2(asmb,line,idx,&new_idxs,&new_objl,&new_idx);
             idx=new_idx;
+            if(!_slot_ok){
+                iv_free(&new_idxs); iv_free(&new_objl);
+                ivv_free(&objs); free(idxlst);
+                if(idx_out) *idx_out=idx;
+                return 0;
+            }
             ivv_push(&objs,&new_objl);
             for(int i=0;i<new_idxs.len;i++) if(nidxlst<256) idxlst[nidxlst++]=(int)u256_to_i64(new_idxs.data[i]);
             iv_free(&new_idxs); iv_free(&new_objl);
@@ -4996,7 +5030,16 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
                *       s = os.path.join(base, s)  */
               char resolved[1024];
               const char *cur = st->current_file;
-              if(cur && cur[0] && strcmp(cur,"(stdin)")!=0 && strcmp(cur,"stdin")!=0){
+              /* 破綻点修正 (axx.py port): raw(インクルード対象)が特殊
+               * マーカー文字列"stdin"そのものである場合、fileassemble()が
+               * fn=="stdin"を厳密一致で見て標準入力を読み込む特別扱いを
+               * するためのリテラルマーカーであり、実在するファイルパス
+               * ではない。base_dirと結合してしまうと厳密一致が壊れ、
+               * 存在しないファイルを開こうとして失敗していた。 */
+              if(strcmp(raw,"stdin")==0){
+                  strncpy(resolved, raw, sizeof(resolved)-1);
+                  resolved[sizeof(resolved)-1]='\0';
+              } else if(cur && cur[0] && strcmp(cur,"(stdin)")!=0 && strcmp(cur,"stdin")!=0){
                   char dir_buf[1024];
                   axx_dir_of(cur, dir_buf, sizeof(dir_buf));
                   axx_resolve_path(dir_buf, raw, resolved, sizeof(resolved));
@@ -5015,57 +5058,12 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(adir_extern(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_export(asmb,l,l2)){ *idx_out=idx; return 1; }
 
-    /* Fix 9 (axx.py): source-level .setsym / .clearsym directives must be
-     * processed here (before the pattern loop) and must also update patsymbols
-     * so that their effect persists across the per-instruction symbols reset
-     * that lineassemble() performs at the top of the loop.
-     *
-     * axx.py lineassemble2():
-     *   _i_src = [l, '', l2, '', '', '']
-     *   if self.directive_proc.set_symbol(_i_src):
-     *       self.state.patsymbols = dict(self.state.symbols)
-     *       return [], [], True, idx
-     *   if self.directive_proc.clear_symbol(_i_src):
-     *       self.state.patsymbols = dict(self.state.symbols)
-     *       return [], [], True, idx
-     */
-    {
-        char lu[16]; axx_strupr_to(lu,l,sizeof(lu));
-        if(strcmp(lu,".SETSYM")==0){
-            /* l2 contains the symbol name (field[1]) and optionally a value (field[2]) */
-            /* Parse: l2 = "NAME [value]" */
-            char sym_name[512]; int sio=0;
-            sio=axx_get_param_to_spc(l2,0,sym_name,sizeof(sym_name));
-            char sym_name_upper[512]; axx_strupr_to(sym_name_upper,sym_name,sizeof(sym_name_upper));
-            uint256_t v=u256_zero();
-            if(l2[sio]){
-                int vio;
-                v=expr_expression_pat(asmb,l2+sio,0,&vio);
-            }
-            smap_set(&asmb->st.symbols,sym_name_upper,v);
-            /* Mirror patsymbols to persist across the per-line symbols reset */
-            smap_clear(&asmb->st.patsymbols);
-            for(int pi2=0; pi2<asmb->st.symbols.nb; pi2++)
-                for(SymEntry *se2=asmb->st.symbols.buckets[pi2]; se2; se2=se2->next)
-                    smap_set(&asmb->st.patsymbols, se2->key, se2->val);
-            *idx_out=idx; return 1;
-        }
-        if(strcmp(lu,".CLEARSYM")==0){
-            if(l2[0]){
-                char sym_name[512]; axx_get_param_to_spc(l2,0,sym_name,sizeof(sym_name));
-                char sym_name_upper[512]; axx_strupr_to(sym_name_upper,sym_name,sizeof(sym_name_upper));
-                smap_delete(&asmb->st.symbols,sym_name_upper);
-            } else {
-                smap_clear(&asmb->st.symbols);
-            }
-            /* Mirror patsymbols */
-            smap_clear(&asmb->st.patsymbols);
-            for(int pi2=0; pi2<asmb->st.symbols.nb; pi2++)
-                for(SymEntry *se2=asmb->st.symbols.buckets[pi2]; se2; se2=se2->next)
-                    smap_set(&asmb->st.patsymbols, se2->key, se2->val);
-            *idx_out=idx; return 1;
-        }
-    }
+    /* 撤廃: ソース側(.sファイル)からの.setsym/.clearsymは廃止した。
+     * シンボル(レジスタ名等のエンコード値)はパターンファイル(.axx)側
+     * でのみ定義するものとし、ソース側からの上書きは受け付けない。
+     * ソース中に.setsym/.clearsymと書いても、以下のパターンマッチング
+     * ループに委ねられ、該当パターンが無いため通常の
+     * 未知命令/構文エラーとして報告される。 */
 
     if(!l[0]){ *idx_out=idx; return 0; }
 
@@ -6671,8 +6669,8 @@ static int imp_label(Assembler *asmb, const char *l){
         if(endp == fields[1]) return 0;
         uint64_t size  = strtoull(fields[2], &endp, 16);
         if(endp == fields[2]) return 0;
-        secmap_set(&asmb->imp_sections, sname,
-                   u256_from_u64(start), u256_from_u64(size));
+        secrangevec_push(&asmb->imp_sections, sname,
+                          u256_from_u64(start), u256_from_u64(size));
         return 1;
     }
 
@@ -6715,16 +6713,27 @@ static int imp_label(Assembler *asmb, const char *l){
         uint64_t v = strtoull(fields[1], &endp, 16);
         if(endp == fields[1]) return 0;
 
-        /* determine section by range lookup in previously parsed sections */
+        /* determine section by range lookup in previously parsed sections.
+         * 破綻点修正 (axx.py port): imp_sectionsがSecRangeVec(断片ごと
+         * 複数エントリ可)になったため、同名の全断片を単純に線形走査
+         * すれば、再入セクションの2回目以降の断片も正しく拾える。 */
         const char *section = ".text";
-        for(int i = 0; i < asmb->imp_sections.count; i++){
-            SecEntry *se = asmb->imp_sections.order[i];
+        for(int i = 0; i < asmb->imp_sections.len; i++){
+            SecRange *se = &asmb->imp_sections.data[i];
             uint64_t s0 = u256_to_u64(se->start);
-            uint64_t sz = u256_to_u64(se->size);
+            uint64_t sz = u256_to_u64(se->len);
             if(sz > 0 && v >= s0 && v < s0 + sz){ section = se->name; break; }
             if(sz == 0 && v == s0)               { section = se->name; break; }
         }
-        label_put_value(&asmb->st, label, u256_from_u64(v), section, 0, reloc_type);
+        /* 破綻点修正 (axx.py port): label_put_value() 経由(→lmap_set())
+         * では is_imported が常に0にリセットされ、インポートしたラベルが
+         * ELF出力上「このファイル内でローカルに実定義された値」として
+         * 書き出されてしまい、本来リンク時に解決されるべき外部シンボルが
+         * 誤ったローカル値のまま固定されるバグがあった(axx.py側は
+         * self.state.labels[label] = [v, section, False, True] と直接
+         * 代入しis_imported=Trueにしている)。.EXTERN と同じ経路である
+         * lmap_set_imported() を使い、is_imported=1 として登録する。 */
+        lmap_set_imported(&asmb->st.labels, label, u256_from_u64(v), section, reloc_type);
         return 1;
     }
 
@@ -6770,7 +6779,13 @@ typedef struct {
     int     nu;
 } OSABIENT;
 
-static OSABIENT osabitbl[]={{"Linux",0},{"FreeBSD",9},{"EOTBL",-1}};
+/* 破綻点修正 (axx.py port): 小文字表記("linux"/"freebsd")のエントリが
+ * 無かったため、find_osabi()は大文字小文字完全一致のみで判定し、
+ * 未知値扱いになった場合は警告も出さずに黙ってFreeBSD(デフォルトと
+ * 同じ値)へフォールバックしていた。既定値がたまたまFreeBSDのため、
+ * "--osabi linux"のように小文字でLinuxを明示指定したつもりが、
+ * ユーザに一切気づかれないままFreeBSDとして出力される事故になっていた。 */
+static OSABIENT osabitbl[]={{"Linux",0},{"linux",0},{"FreeBSD",9},{"freebsd",9},{"EOTBL",-1}};
 
 int find_osabi( char *osname ) {
     int idx = 0;
@@ -6828,6 +6843,9 @@ int main(int argc, char *argv[]){
 
     int osa = find_osabi(osabistr);
     if (osa==-1) {
+        fprintf(stderr, "warning: unknown --osabi value '%s'; "
+                "valid choices are Linux/linux/FreeBSD/freebsd. Using 'FreeBSD'.\n",
+                osabistr);
         osa = find_osabi("FreeBSD"); /* Fall back to Default FreeBSD */
     }
     st->osabi = osa;
@@ -6941,10 +6959,11 @@ int main(int argc, char *argv[]){
             strcpy(st->current_section, ".text");
             lmap_free(&st->export_labels); lmap_init(&st->export_labels);
             /* Fix C-N6: reset symbols to the post-pattern-file baseline at the
-             * start of every relaxation iteration.  Source-level .setsym /
-             * .clearsym directives mutate st->symbols during assembly; without
-             * this reset their effects accumulate across iterations, producing
-             * non-deterministic symbol tables on the 2nd and later passes. */
+             * start of every relaxation iteration (patsymbols is immutable
+             * after the initial setpatsymbols() call now that source-level
+             * .setsym/.clearsym has been removed; only symbols needs
+             * resetting here, since the per-line pattern-file replay
+             * mutates it during matching). */
             smap_clear(&st->symbols);
             for(int pi=0; pi<st->patsymbols.nb; pi++)
                 for(SymEntry *se2=st->patsymbols.buckets[pi]; se2; se2=se2->next)
@@ -7070,7 +7089,10 @@ int main(int argc, char *argv[]){
         st->line_map_len=0;
         /* Fix 5 (new) (axx.py port): reset sections before pass2 so stale
          * provisional sizes from pass1 do not carry over.  labels and
-         * patsymbols do NOT need resetting here (only sections). */
+         * patsymbols do NOT need resetting here (only sections): symbols
+         * are only ever set by the pattern file (source-level .setsym/
+         * .clearsym has been removed), so patsymbols is immutable after
+         * the initial setpatsymbols() call and needs no per-pass reset. */
         secmap_clear(&st->sections);
         secrangevec_clear(&st->section_ranges);
         /* Bug修正(axx.py port): reset current_section before pass2 (mirrors
@@ -7167,12 +7189,34 @@ int main(int argc, char *argv[]){
                     if(strcmp(e->name,".text")==0) flag="AX"; \
                     else if(strcmp(e->name,".data")==0) flag="WA"; \
                 } \
-                unsigned long long byte_start = \
-                    (unsigned long long)u256_to_u64(e->start) * (unsigned long long)_bpw_export; \
-                unsigned long long byte_size  = \
-                    (unsigned long long)u256_to_u64(e->size)  * (unsigned long long)_bpw_export; \
-                fprintf(lf,"%s\t0x%llx\t0x%llx\t%s\n", \
-                        e->name, byte_start, byte_size, flag); \
+                /* 破綻点修正 (axx.py port): セクションが複数回出入り \
+                 * した場合(.text→.data→.text等)、真の訪問範囲は複数の \
+                 * 断片に分かれる。以前はst->sections[i]の(最小開始pc, \
+                 * 累積サイズ)を単一の範囲として書き出していたため、 \
+                 * 2回目以降の断片の実際のpc位置を全くカバーしない \
+                 * 不正な範囲になり、-iでインポートした際にラベルの \
+                 * 所属セクションを誤判定する原因になっていた。 \
+                 * st->section_rangesから断片ごとに個別の行を書き出す。 */ \
+                int _wrote_any = 0; \
+                for(int j=0;j<st->section_ranges.len;j++){ \
+                    SecRange *sr=&st->section_ranges.data[j]; \
+                    if(strcmp(sr->name,e->name)!=0) continue; \
+                    unsigned long long byte_start = \
+                        (unsigned long long)u256_to_u64(sr->start) * (unsigned long long)_bpw_export; \
+                    unsigned long long byte_size  = \
+                        (unsigned long long)u256_to_u64(sr->len)  * (unsigned long long)_bpw_export; \
+                    fprintf(lf,"%s\t0x%llx\t0x%llx\t%s\n", \
+                            e->name, byte_start, byte_size, flag); \
+                    _wrote_any = 1; \
+                } \
+                if(!_wrote_any){ \
+                    unsigned long long byte_start = \
+                        (unsigned long long)u256_to_u64(e->start) * (unsigned long long)_bpw_export; \
+                    unsigned long long byte_size  = \
+                        (unsigned long long)u256_to_u64(e->size)  * (unsigned long long)_bpw_export; \
+                    fprintf(lf,"%s\t0x%llx\t0x%llx\t%s\n", \
+                            e->name, byte_start, byte_size, flag); \
+                } \
             } \
             for(int i=0;i<st->export_labels.nbuckets;i++){ \
                 for(LabelEntry*e=st->export_labels.buckets[i];e;e=e->next){ \
