@@ -21,7 +21,6 @@ try:
 except ImportError:
     pass
 import ast
-import subprocess
 import itertools
 import struct
 import sys
@@ -178,10 +177,18 @@ class RelaxationState:
         self.relax_prev_values = {}
 
         # PatternMatcher.match0()の組合せ数予算(_MAX_COMBINATIONS)を
-        # 使い切ったことを警告済みかどうか。実行全体で1度だけ警告すれば
-        # 十分なため(パターンファイル中の同じ問題箇所で行ごとに繰り返し
-        # 警告してもノイズにしかならない)、ここに保持する。
-        self.combo_budget_warned = False
+        # 使い切ったことを警告済みかどうか。
+        #
+        # 破綻点修正: 以前はプログラム全体で1個のboolフラグだったため、
+        # パターンファイル中の複数箇所(異なる行/異なるパターン)でそれぞれ
+        # 組合せ爆発が起きても、最初の1箇所しか警告が出ず、2箇所目以降は
+        # 「なぜか非マッチ扱いになる」原因がユーザーから見えなくなっていた。
+        # (current_file, line, pattern_text)の組をキーにした集合にすることで、
+        # 「同じ箇所での繰り返し警告はノイズなので1回に抑える」という当初の
+        # 意図は保ったまま、異なる箇所ではそれぞれ独立して1回ずつ警告できる
+        # ようにする。
+        self.combo_budget_warned = set()
+
 
 
 class AssemblerState:
@@ -3011,8 +3018,18 @@ class PatternMatcher:
             for j in itertools.combinations(sl, i):
                 _tried += 1
                 if _tried > self._MAX_COMBINATIONS:
-                    if self.state.should_report_errors() and not self.state._combo_budget_warned:
-                        self.state._combo_budget_warned = True
+                    # 破綻点修正: 警告済みかどうかを「現在のファイル・行・
+                    # パターン文字列」の組で判定する。これにより、同じ箇所
+                    # (同じ行の同じパターン)への繰り返し警告は1回に抑えつつ、
+                    # パターンファイル中の別の箇所で予算超過が起きた場合は
+                    # そちらも独立して1回警告できる(以前はプログラム全体で
+                    # 1回しか警告が出ず、2箇所目以降は原因不明のまま
+                    # 「非マッチ」として静かに扱われていた)。
+                    _warn_key = (getattr(self.state, 'current_file', None),
+                                 getattr(self.state, 'ln', None), t)
+                    if (self.state.should_report_errors()
+                            and _warn_key not in self.state._combo_budget_warned):
+                        self.state._combo_budget_warned.add(_warn_key)
                         print(f" warning - a pattern with {cnt} optional group(s) exceeded the "
                               f"{self._MAX_COMBINATIONS}-combination match budget and was treated "
                               f"as non-matching; consider splitting it into multiple explicit "
@@ -3076,7 +3093,11 @@ class PatternFileReader:
         
         p = []
         w = []
-        with open(fn, "rt") as f:
+        # 破綻点修正: encoding未指定だとlocale.getpreferredencoding()に依存する
+        # (Windows等ではUTF-8以外になりうる)。パターンファイルの説明・コメントは
+        # 日本語等の非ASCII文字を含みうるため、明示的にUTF-8を指定して
+        # ロケール依存の文字化け/UnicodeDecodeErrorを防ぐ。
+        with open(fn, "rt", encoding="utf-8") as f:
             while True:
                 l = f.readline()
                 if not l:
@@ -4750,11 +4771,15 @@ class Assembler:
                     os.close(fd)
                     self.state.stdin_tmp_path = tmp_path
                     af = self.file_input_from_stdin()
-                    with open(self.state.stdin_tmp_path, "wt") as stdintmp:
+                    with open(self.state.stdin_tmp_path, "wt", encoding="utf-8") as stdintmp:
                         stdintmp.write(af)
                 fn = self.state.stdin_tmp_path
             
-            with open(fn, "rt") as f:
+            # 破綻点修正: encoding未指定だとlocale.getpreferredencoding()に依存する
+            # (Windows等ではUTF-8以外になりうる)。ソース/インクルードファイルは
+            # 日本語等の非ASCII文字のコメントを含みうるため、明示的にUTF-8を
+            # 指定してロケール依存の文字化け/UnicodeDecodeErrorを防ぐ。
+            with open(fn, "rt", encoding="utf-8") as f:
                 af = f.readlines()
             
             for i in af:
@@ -5701,7 +5726,7 @@ class Assembler:
                 # self._imp_sectionsを完成させてから、ラベル行(2フィールド)を
                 # 処理する。順序を混在させるとラベルのセクション逆引きが
                 # まだ登録されていないセクションを参照してしまう。
-                with open(self.state.impfile, 'rt') as label_file:
+                with open(self.state.impfile, 'rt', encoding="utf-8") as label_file:
                     raw_lines = label_file.readlines()
                 for l in raw_lines:
                     fields = l.rstrip('\r\n').split('\t')
@@ -5906,7 +5931,7 @@ class Assembler:
                 h   = list(self.state.export_labels.items())
                 key = list(self.state.sections.keys())
                 _bpw_export = max(1, (self.state.bts + 7) // 8)
-                with open(path, 'wt') as label_file:
+                with open(path, 'wt', encoding="utf-8") as label_file:
                     for i in key:
                         if i == '.text' and elf == 1:
                             flag = 'AX'

@@ -1043,8 +1043,19 @@ typedef struct {
     int        pat_include_depth;
 
     /* 破綻点修正5 (axx.py port): pat_match0()の組合せ数予算を使い切った
-     * ことを警告済みかどうか。実行全体で1度だけ警告すれば十分。 */
-    int        combo_budget_warned;
+     * ことを警告済みかどうか。
+     *
+     * 破綻点修正 (再修正): 以前は単一のint(0/1)フラグだったため、パターン
+     * ファイル中の複数箇所で組合せ爆発が起きても最初の1箇所しか警告が出ず、
+     * 2箇所目以降は原因不明のまま「非マッチ」として静かに扱われていた
+     * (axx.py側の同種の問題と合わせて修正)。ファイル名+行番号の組を
+     * 最大64件までキャッシュし、「同じ箇所での繰り返し警告は1回に抑える」
+     * という当初の意図を保ったまま、異なる箇所ではそれぞれ独立して1回ずつ
+     * 警告できるようにする。キャッシュが溢れた場合は安全側(警告を出す側)
+     * に倒す。 */
+    char       combo_budget_warned_file[64][512];
+    int        combo_budget_warned_line[64];
+    int        combo_budget_warned_count;
 
     /* 破綻点修正 (axx.py port): 各セクションへの訪問記録(SecRangeVec参照)。
      * write_elf_obj相当のELF出力コードがこれを使って複数回の出入りで
@@ -3791,8 +3802,23 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
     uint64_t total = (uint64_t)1 << cnt; /* 2^cnt subsets; safe for cnt<=63 */
     for(uint64_t mask=0; mask<total && !found; mask++){
         if(++tried > MAX_COMBINATIONS){
-            if(!asmb->st.combo_budget_warned){
-                asmb->st.combo_budget_warned = 1;
+            int _already_warned = 0;
+            for(int _wi=0; _wi<asmb->st.combo_budget_warned_count; _wi++){
+                if(asmb->st.combo_budget_warned_line[_wi] == asmb->st.ln &&
+                   strcmp(asmb->st.combo_budget_warned_file[_wi], asmb->st.current_file) == 0){
+                    _already_warned = 1;
+                    break;
+                }
+            }
+            if(!_already_warned){
+                if(asmb->st.combo_budget_warned_count <
+                        (int)(sizeof(asmb->st.combo_budget_warned_line)/sizeof(int))){
+                    int _wi = asmb->st.combo_budget_warned_count++;
+                    strncpy(asmb->st.combo_budget_warned_file[_wi], asmb->st.current_file,
+                            sizeof(asmb->st.combo_budget_warned_file[_wi])-1);
+                    asmb->st.combo_budget_warned_file[_wi][sizeof(asmb->st.combo_budget_warned_file[_wi])-1]=0;
+                    asmb->st.combo_budget_warned_line[_wi] = asmb->st.ln;
+                }
                 fprintf(stderr,
                         " warning - a pattern with %d optional group(s) exceeded the "
                         "%llu-combination match budget and was treated as non-matching; "
