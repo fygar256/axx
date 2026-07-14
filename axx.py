@@ -1029,6 +1029,27 @@ class LabelManager:
     def __init__(self, state):
         self.state = state
 
+    def _section_relative_offset(self, name, word_pc):
+        """word_pc(生のグローバルpc)がセクションnameの断片群のどこに
+        対応するか、断片を跨いだ累積ワードオフセットを返す(属さない/
+        解決できない場合はNone)。
+
+        Assembler._addr_to_word_offset()/_section_word_ranges()と全く
+        同じロジックだが、LabelManagerはAssemblerへの参照を持たないため
+        ここに複製する(必要とするのはself.stateのみ)。
+        """
+        ranges = [(rs, rl) for (rn, rs, rl) in self.state.section_ranges if rn == name]
+        if not ranges:
+            entry = self.state.sections.get(name)
+            if entry and entry[1] > 0:
+                ranges = [(entry[0], entry[1])]
+        cum = 0
+        for rs, rl in ranges:
+            if rs <= word_pc <= rs + rl:
+                return cum + (word_pc - rs)
+            cum += rl
+        return None
+
     def get_section(self, k):
         """Get label section"""
         self.state.error_undefined_label = False
@@ -1066,7 +1087,24 @@ class LabelManager:
                       f"  [{_fn}:{_ln}]", file=sys.stderr)
             return v
         if self.state._equ_sections_touched is not None:
-            self.state._equ_sections_touched.add(self.state.labels[k][1])
+            _sec = self.state.labels[k][1]
+            self.state._equ_sections_touched.add(_sec)
+            # 破綻点修正: reloc_type未指定の.EQUは最終的な定数として
+            # そのままバイナリに焼き込まれ、後からリンカが補正すること
+            # はない。一方ラベルの値は「アセンブル全体を通した生の
+            # グローバルpc」で保持されており、同じセクションに複数回
+            # 出入りした場合(.text→.data→.text等)、出力ファイル上では
+            # 断片が詰めて連結されるのに対し生pcは間に挟まった他
+            # セクション分だけ余分にズレたままになる。そのため
+            # 「同じセクション内の2ラベルの差分」のような計算が、
+            # セクション再入があると無警告で誤った値になっていた
+            # (異なるセクションをまたぐケースは直後の警告で検出できるが、
+            # 同一セクション名の別断片をまたぐケースは検出できない上に
+            # 値自体も誤っていた)。実際の出力ファイルでの位置である
+            # セクション内相対オフセットに変換してから使う。
+            _adj = self._section_relative_offset(_sec, v)
+            if _adj is not None:
+                v = _adj
         # ELFリロケーション追跡: .equ定数(reloc_type指定なし)はリロケーション不要
         # なので除外し、それ以外のアドレスラベル参照だけを記録する。
         _is_equ = len(self.state.labels[k]) > 2 and self.state.labels[k][2]

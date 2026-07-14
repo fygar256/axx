@@ -1096,6 +1096,31 @@ static uint64_t dwarf_word_offset(AsmState *st, const char *sec_name, uint64_t w
     return (uint64_t)(o >= 0 ? o : 0) * (uint64_t)bpw;
 }
 
+/* 破綻点修正 (axx.py port): .EQU(reloc_type未指定)は最終的な定数として
+ * そのままバイナリに焼き込まれ、後からリンカが補正することはない。一方
+ * ラベルの値は「アセンブル全体を通した生のグローバルpc」で保持されて
+ * おり、同じセクションに複数回出入りした場合(.text→.data→.text等)、
+ * 出力ファイル上では断片が詰めて連結されるのに対し生pcは間に挟まった
+ * 他セクション分だけ余分にズレたままになる。そのため「同じセクション内
+ * の2ラベルの差分」のような計算が、セクション再入があると無警告で
+ * 誤った値になっていた。実際の出力ファイルでの位置であるセクション内
+ * 相対オフセットに変換する。section_rangesにまだ記録が無い場合(参照
+ * している時点でまだ開いている現在のセクション)はst->sectionsの
+ * (開始, 現在までのサイズ)にフォールバックする(axx.pyの
+ * _section_word_ranges()と同じ)。解決できない場合は元の値をそのまま
+ * 返す合図として-1を返す。 */
+static int64_t equ_section_relative_offset(AsmState *st, const char *sec_name, uint64_t word_pc){
+    int64_t o = addr_to_word_offset(&st->section_ranges, sec_name, word_pc);
+    if(o >= 0) return o;
+    SecEntry *e = secmap_find(&st->sections, sec_name);
+    if(e){
+        uint64_t rs = u256_to_u64(e->start);
+        uint64_t rl = u256_to_u64(e->size);
+        if(rl > 0 && word_pc >= rs && word_pc <= rs+rl) return (int64_t)(word_pc - rs);
+    }
+    return -1;
+}
+
 static void state_init(AsmState *st) {
     memset(st, 0, sizeof(*st));
     strcpy(st->lwordchars, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_.");
@@ -1965,6 +1990,7 @@ static uint256_t label_get_value(AsmState *st, const char *k){
     st->error_undefined_label=0;
     LabelEntry *e=lmap_find(&st->labels,k);
     if(e){
+        uint256_t ret_val = e->value;
         if(st->equ_section_tracking){
             const char *sec = e->section ? e->section : "";
             if(!st->equ_first_section[0]){
@@ -1973,6 +1999,8 @@ static uint256_t label_get_value(AsmState *st, const char *k){
             } else if(strcmp(st->equ_first_section, sec) != 0){
                 st->equ_multi_section = 1;
             }
+            int64_t _adj = equ_section_relative_offset(st, sec, u256_to_u64(e->value));
+            if(_adj >= 0) ret_val = u256_from_u64((uint64_t)_adj);
         }
         /* ELF relocation tracking.
          * .equ-defined labels は原則として絶対定数であり追跡しない。
@@ -2012,7 +2040,7 @@ static uint256_t label_get_value(AsmState *st, const char *k){
                 st->elf_refs_len++;
             }
         }
-        return e->value;
+        return ret_val;
     }
     /* A (axx.py port): pass1 forward reference uses the previous relaxation
      * iteration's resolved address as an estimate. This (1) lets relaxation
