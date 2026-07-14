@@ -5714,6 +5714,27 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                             }
                         }
                     }
+                    /* 破綻点修正 (axx.py port): _raw_valはフィールド幅の生の
+                     * ビットパターンをuint64_tにそのまま集めただけで、一度も
+                     * 符号拡張されていなかった。axx.py側は
+                     * "if raw_val >= (1<<(field_bits-1)): raw_val -= (1<<field_bits)"
+                     * でフィールド幅基準の符号付き値に変換してから
+                     * addend計算(raw_val - abs_w_bytes)に使っているが、
+                     * caxx.cはこの変換が無いままint64_tにキャストしていたため、
+                     * 埋め込み済みフィールド値の最上位ビットが立っている場合
+                     * (例: 1バイト幅で0xfc=符号付き-4)、符号なしの
+                     * 大きな正数(252)としてそのままaddend計算に使われ、
+                     * PC相対でない(絶対)リロケーションのaddendが誤って
+                     * 計算されていた。uint64_t上で2の補数表現になるよう
+                     * 減算しておけば、後続のint64_tへのキャストで正しく
+                     * 符号付き値として解釈される。 */
+                    {
+                        int _field_bits = _nbytes * 8;
+                        if(_field_bits > 0 && _field_bits < 64
+                           && _raw_val >= ((uint64_t)1 << (_field_bits - 1))){
+                            _raw_val -= ((uint64_t)1 << _field_bits);
+                        }
+                    }
                     /* 破綻点修正 (axx.py port): _rtype がreloc_type明示指定なしに
                      * バイト幅だけから推測された場合(_rtype_is_default_guess)、
                      * その推測がたまたまPC相対型に landing しても、実際に
