@@ -1112,11 +1112,19 @@ static uint64_t dwarf_word_offset(AsmState *st, const char *sec_name, uint64_t w
 static int64_t equ_section_relative_offset(AsmState *st, const char *sec_name, uint64_t word_pc){
     int64_t o = addr_to_word_offset(&st->section_ranges, sec_name, word_pc);
     if(o >= 0) return o;
+    /* 破綻点修正 (axx.py port): $$(現在pc)は、命令をエンコード中の「今
+     * まさに開いていてまだ.ENDSECTION/セクション切替で確定していない
+     * 断片」を指すことがほとんどだが、その断片はまだsection_rangesに
+     * 乗っていない。size>0(=既に確定済みの累積サイズがある)を要求する
+     * だけでは、現在オープン中の断片の途中にあるword_pcを解決できず
+     * -1を返してしまい、$$を使うPC相対エンコード式が常に補正不能に
+     * なっていた。entry_pc(直近の再入位置)以降かどうかを追加でチェック
+     * し、確定済み累積(e->size)にその断片内オフセットを足して返す。 */
     SecEntry *e = secmap_find(&st->sections, sec_name);
     if(e){
-        uint64_t rs = u256_to_u64(e->start);
-        uint64_t rl = u256_to_u64(e->size);
-        if(rl > 0 && word_pc >= rs && word_pc <= rs+rl) return (int64_t)(word_pc - rs);
+        uint64_t entry_pc = u256_to_u64(e->entry_pc);
+        uint64_t completed = u256_to_u64(e->size);
+        if(word_pc >= entry_pc) return (int64_t)(completed + (word_pc - entry_pc));
     }
     return -1;
 }
@@ -1991,14 +1999,38 @@ static uint256_t label_get_value(AsmState *st, const char *k){
     LabelEntry *e=lmap_find(&st->labels,k);
     if(e){
         uint256_t ret_val = e->value;
+        const char *sec = e->section ? e->section : "";
         if(st->equ_section_tracking){
-            const char *sec = e->section ? e->section : "";
             if(!st->equ_first_section[0]){
                 strncpy(st->equ_first_section, sec, sizeof(st->equ_first_section)-1);
                 st->equ_first_section[sizeof(st->equ_first_section)-1]='\0';
             } else if(strcmp(st->equ_first_section, sec) != 0){
                 st->equ_multi_section = 1;
             }
+            int64_t _adj = equ_section_relative_offset(st, sec, u256_to_u64(e->value));
+            if(_adj >= 0) ret_val = u256_from_u64((uint64_t)_adj);
+        } else if(st->in_binary_list && strcmp(sec, st->current_section) == 0){
+            /* 破綻点修正 (axx.py port): .EQU以外でも、命令エンコード式
+             * (パターンファイルの$$/ラベル参照の組合せ、例: z80の
+             * "JR !e :: 0x18,e-$$-2")は生のグローバルpcで計算されており、
+             * 同じセクションへの再入で生じるズレの影響を受けていた
+             * (上の.EQUと同じ根本原因)。$$は常に現在セクション内の値
+             * なので、参照ラベルが現在セクションと同じ場合に限り、両者を
+             * 同じ基準(セクション内相対オフセット)に揃える。異なる
+             * セクションを参照する場合は、既存のELFリロケーション機構が
+             * 別途正しく処理するためここでは変更しない。
+             *
+             * 破綻点修正2 (重大): st->in_binary_list の条件を追加した。
+             * これが無いと、reloc_type付き.EQU(例:
+             * "tape_a: .equ tape::abs32")が同じセクション内のアドレス
+             * ラベル(tape)を参照した際にもこの変換が誤って適用され、
+             * tape_a の値が「tapeの生pc」ではなく「セクション先頭からの
+             * 相対オフセット」に壊されてしまっていた(bf.sで実際に
+             * 発生・確認済み: tape_a が0になり、[tape_a+r15] SIB
+             * アドレッシングが.textの先頭を指してbus errorでクラッシュ
+             * した)。reloc_type付き.EQUやその他の通常の式評価
+             * (in_binary_list=0)では、ラベルの生の値をそのまま維持
+             * しなければならない。 */
             int64_t _adj = equ_section_relative_offset(st, sec, u256_to_u64(e->value));
             if(_adj >= 0) ret_val = u256_from_u64((uint64_t)_adj);
         }
@@ -2382,6 +2414,24 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         /* binary_list中(makeobj内)では命令先頭アドレスpc_instr_startを返す。
          * .equなど他のコンテキストでは現在のPC(st->pc)を返す。 */
         x = st->in_binary_list ? st->pc_instr_start : st->pc;
+        /* 破綻点修正 (axx.py port): $$は常に現在セクション(current_section)
+         * 内の生グローバルpcだった。同じセクションへの再入があると、ラベル
+         * 参照(label_get_value(), 同じセクションの場合はセクション内相対
+         * オフセットへ変換済み)と単位が食い違い、"e-$$-2"のようなPC相対
+         * エンコード式(z80のJR等)が誤った値になっていた。$$も同じ
+         * セクション内相対オフセットに揃える。
+         *
+         * 破綻点修正2 (重大): ただしこの変換は、命令のバイト列を組み立てて
+         * いる最中(in_binary_list、makeobj())か、reloc_type未指定の.EQU式
+         * 評価中(equ_section_tracking)に限定する。これら以外(reloc_type
+         * 付き.EQUの右辺など)で$$が使われる場合、その値は「生のpc」の
+         * まま維持されるべきであり、無条件に変換すると別の破綻点を生む
+         * (label_get_value()の同種の条件分岐を参照。bf.sのtape_aが
+         * 壊れてbus errorになった実例で確認済み)。 */
+        if(st->in_binary_list || st->equ_section_tracking){
+            int64_t _adj = equ_section_relative_offset(st, st->current_section, u256_to_u64(x));
+            if(_adj >= 0) x = u256_from_u64((uint64_t)_adj);
+        }
         /* In float mode, treat PC as an integer-valued double (int→float). */
         if(asmb->st.exp_typ_float)
             x=double_to_u256((double)(int64_t)u256_to_u64(x));
@@ -2392,6 +2442,10 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
          * binary_list中/外・pass0(対話モード)を問わず pc_instr_end を返す。
          * pc_instr_end はパターンマッチ確定直後のサイズプローブで設定済み。 */
         x = st->pc_instr_end;
+        if(st->in_binary_list || st->equ_section_tracking){
+            int64_t _adj = equ_section_relative_offset(st, st->current_section, u256_to_u64(x));
+            if(_adj >= 0) x = u256_from_u64((uint64_t)_adj);
+        }
         if(asmb->st.exp_typ_float)
             x=double_to_u256((double)(int64_t)u256_to_u64(x));
     }
@@ -4542,6 +4596,18 @@ static int adir_section(AsmState *st, const char *l, const char *l2){
                 if(u256_lt_signed(st->pc, ne->start)) ne->start = st->pc;
             }
             ne->entry_pc = st->pc;
+            /* 破綻点修正 (axx.py port): confirmedを前回訪問終了時の値の
+             * ままにしていたため、以前.ENDSECTIONで確定済み(confirmed=1)
+             * だったセクションに再入すると、今回の訪問が一度も.ENDSECTION
+             * で閉じられていないのにconfirmed=1のままになっていた。この
+             * 状態でファイル末尾までこのセクションが再度閉じられずに
+             * 終わると、secmap_finalize_current()(ファイル末尾で開いた
+             * ままの最終セクションを確定する処理)がconfirmed=1を見て
+             * 「既に確定済み」と誤認し、今回の訪問分のバイト列が
+             * section_rangesに一切登録されないまま(=最終出力から丸ごと
+             * 欠落したまま)出力されていた。再入は必ず新しい未確定の訪問
+             * なので、confirmedは0にリセットする。 */
+            ne->confirmed = 0;
         }
     }
     return 1;

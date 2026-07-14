@@ -1034,20 +1034,32 @@ class LabelManager:
         対応するか、断片を跨いだ累積ワードオフセットを返す(属さない/
         解決できない場合はNone)。
 
-        Assembler._addr_to_word_offset()/_section_word_ranges()と全く
+        Assembler._addr_to_word_offset()/_section_word_ranges()とほぼ
         同じロジックだが、LabelManagerはAssemblerへの参照を持たないため
         ここに複製する(必要とするのはself.stateのみ)。
+
+        破綻点修正: $$(現在pc)は、命令をエンコード中の「今まさに開いていて
+        まだ.ENDSECTION/セクション切替で確定していない断片」を指すことが
+        ほとんどだが、その断片はまだsection_rangesに乗っておらず、
+        state.sections[name][1](確定済み累積サイズ)にも今回分は反映され
+        ていない。そのため単純にAssembler側と同じロジックのままだと$$の
+        位置を解決できずNoneを返し、$$を使うPC相対エンコード式(例:
+        z80の"JR !e :: 0x18,e-$$-2")がセクション再入後は常に補正不能に
+        なっていた。section_rangesで見つからない場合、「現在オープン中の
+        断片の開始位置(entry_pc)以降か」を追加でチェックし、確定済み
+        累積(cum)にその断片内オフセットを足して返す。
         """
         ranges = [(rs, rl) for (rn, rs, rl) in self.state.section_ranges if rn == name]
-        if not ranges:
-            entry = self.state.sections.get(name)
-            if entry and entry[1] > 0:
-                ranges = [(entry[0], entry[1])]
         cum = 0
         for rs, rl in ranges:
             if rs <= word_pc <= rs + rl:
                 return cum + (word_pc - rs)
             cum += rl
+        entry = self.state.sections.get(name)
+        if entry:
+            entry_pc = entry[2] if len(entry) > 2 else entry[0]
+            if word_pc >= entry_pc:
+                return cum + (word_pc - entry_pc)
         return None
 
     def get_section(self, k):
@@ -1086,8 +1098,8 @@ class LabelManager:
                 print(f" error - Label undefined: '{k}'"
                       f"  [{_fn}:{_ln}]", file=sys.stderr)
             return v
+        _sec = self.state.labels[k][1]
         if self.state._equ_sections_touched is not None:
-            _sec = self.state.labels[k][1]
             self.state._equ_sections_touched.add(_sec)
             # 破綻点修正: reloc_type未指定の.EQUは最終的な定数として
             # そのままバイナリに焼き込まれ、後からリンカが補正すること
@@ -1102,6 +1114,34 @@ class LabelManager:
             # 同一セクション名の別断片をまたぐケースは検出できない上に
             # 値自体も誤っていた)。実際の出力ファイルでの位置である
             # セクション内相対オフセットに変換してから使う。
+            _adj = self._section_relative_offset(_sec, v)
+            if _adj is not None:
+                v = _adj
+        elif self.state._in_binary_list and _sec == self.state.current_section:
+            # 破綻点修正: .EQU以外でも、命令エンコード式(パターンファイルの
+            # $$/ラベル参照の組合せ、例: z80の "JR !e :: 0x18,e-$$-2")は
+            # 生のグローバルpcで計算されており、同じセクションへの再入で
+            # 生じるズレの影響を受けていた(上と同じ根本原因)。$$は常に
+            # 現在セクション内の値なので、参照ラベルが現在セクションと
+            # 同じ場合に限り、両者を同じ基準(セクション内相対オフセット)に
+            # 揃える。異なるセクションを参照する場合は、既存のELF
+            # リロケーション機構が別途正しく処理するためここでは変更しない
+            # (变更すると生pc前提の相対値推定ヒューリスティックと整合しなく
+            # なる可能性がある)。
+            #
+            # 破綻点修正2 (重大): 上記の条件に self.state._in_binary_list を
+            # 追加した。これが無いと、reloc_type付き.EQU
+            # (例: "tape_a: .equ tape::abs32")が同じセクション内の
+            # アドレスラベル(tape)を参照した際にもこの変換が誤って適用され、
+            # tape_a の値が「tapeの生pc」ではなく「セクション先頭からの
+            # 相対オフセット」に壊されてしまっていた(bf.sで実際に発生:
+            # tape_a が本来のtapeのアドレスではなく0になり、[tape_a+r15]
+            # SIBアドレッシングが.textの先頭(エントリポイント)を指してしまい
+            # 実行時にbus errorでクラッシュした)。reloc_type付き.EQUや
+            # その他の通常の式評価(_in_binary_list=False)では、ラベルの
+            # 生の値をそのまま維持しなければならない。$$/ラベルの
+            # セクション内相対化は、makeobj()が命令のバイト列を組み立てて
+            # いる最中(_in_binary_list=True)だけに限定する。
             _adj = self._section_relative_offset(_sec, v)
             if _adj is not None:
                 v = _adj
@@ -1552,10 +1592,34 @@ class ExpressionEvaluator:
             idx+=3
         elif StringUtils.q(s, '$$', idx):
             idx += 2
-            x = self.state.pc_instr_start if self.state._in_binary_list else self.state.pc
+            _raw = self.state.pc_instr_start if self.state._in_binary_list else self.state.pc
+            # 破綻点修正: $$は常に現在セクション(state.current_section)内の
+            # 生グローバルpcだった。同じセクションへの再入があると、ラベル
+            # 参照(get_value(), 同じセクションの場合はセクション内相対
+            # オフセットへ変換済み)と単位が食い違い、"e-$$-2"のような
+            # PC相対エンコード式(z80のJR等)が誤った値になっていた。$$も
+            # 同じセクション内相対オフセットに揃える。
+            #
+            # 破綻点修正2 (重大): ただしこの変換は、命令のバイト列を組み立てて
+            # いる最中(_in_binary_list=True、makeobj())か、reloc_type未指定の
+            # .EQU式評価中(_equ_sections_touched is not None)に限定する。
+            # これらのコンテキスト以外(reloc_type付き.EQUの右辺など)で
+            # $$が使われる場合、その値は「生のpc」のまま維持されるべきで
+            # あり、無条件に変換すると別の破綻点を生む(get_value()の
+            # 同種の条件分岐を参照)。
+            if self.state._in_binary_list or self.state._equ_sections_touched is not None:
+                _adj = self.label_manager._section_relative_offset(self.state.current_section, _raw)
+                x = _adj if _adj is not None else _raw
+            else:
+                x = _raw
         elif StringUtils.q(s, '$.', idx):
             idx += 2
-            x = self.state.pc_instr_end
+            _raw = self.state.pc_instr_end
+            if self.state._in_binary_list or self.state._equ_sections_touched is not None:
+                _adj = self.label_manager._section_relative_offset(self.state.current_section, _raw)
+                x = _adj if _adj is not None else _raw
+            else:
+                x = _raw
         elif StringUtils.q(s, '#', idx):
             idx += 1
             t, idx = self.parser.get_symbol_word(s, idx)
@@ -3775,7 +3839,21 @@ class AssemblyDirectiveProcessor:
                     new_start = self.state.pc
                 else:
                     new_start = min(existing_start, self.state.pc)
-                self.state.sections[l2] = [new_start, existing_size, self.state.pc, existing_confirmed]
+                # 破綻点修正: 再入時にconfirmedをexisting_confirmed(前回訪問の
+                # 終了時の値)のまま引き継いでいたため、以前.ENDSECTIONで
+                # 確定済み(confirmed=True)だったセクションに再入すると、
+                # 今回の訪問がまだ一度もENDSECTIONで閉じられていないにも
+                # 関わらずconfirmed=Trueのままになっていた。この状態で
+                # ファイル末尾までこのセクションが再度閉じられずに終わると、
+                # Pass1/Pass2末尾の「開いたままの最終セクションを確定する」
+                # 処理がconfirmed=Trueを見て「既に確定済み」と誤認し、今回の
+                # 訪問分のバイト列がsection_rangesに一切登録されないまま
+                # (=最終出力から丸ごと欠落したまま)ファイルが書き出されて
+                # いた。再入は必ず新しい未確定の訪問なので、confirmedは
+                # Falseにリセットする(このセクションが再度.ENDSECTIONで
+                # 閉じられるか、ファイル末尾の確定処理で閉じられたときに
+                # 初めてTrueに戻る)。
+                self.state.sections[l2] = [new_start, existing_size, self.state.pc, False]
         return True
     
     def align_processing(self, l1, l2):
@@ -4531,7 +4609,25 @@ class Assembler:
 
                     if rtype in _pc_rel_types_all:
 
-                        P_asm_bytes = (self.state.pc + first_widx) * bpw_r
+                        # 破綻点修正: raw_val(埋め込み済みのフィールド値)は、
+                        # パターン式が$$/$.を使っていた場合、命令エンコード中
+                        # (_in_binary_list=True)はセクション内相対オフセットに
+                        # 変換された値を使って計算されている(get_value()/
+                        # $$・$.の同種修正を参照)。P_asm_bytesは常に生の
+                        # グローバルpcのままだったため、セクションがpc=0から
+                        # 始まらない場合(.rodataや.dataが.textより前にある
+                        # 等、ごく普通の配置)、raw_valとP_asm_bytesの基準が
+                        # 食い違い、addendが誤って計算されていた
+                        # (got.s + foo.c の実例で確認: GOTPCREL relocationの
+                        # addendが正しい-4ではなく+7になり、実行時にリンカが
+                        # 誤ったGOTエントリ位置を書き込んでsegmentation
+                        # faultになった)。raw_val計算時と同じ基準に揃える
+                        # ため、P_asm_bytesにも同じセクション内相対変換を
+                        # 適用する。
+                        _P_raw = (self.state.pc + first_widx) * bpw_r
+                        _P_adj = self.label_manager._section_relative_offset(
+                            self.state.current_section, self.state.pc + first_widx)
+                        P_asm_bytes = _P_adj * bpw_r if _P_adj is not None else _P_raw
 
                         addend = raw_val - abs_w_bytes + P_asm_bytes
 
