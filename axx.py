@@ -3895,8 +3895,26 @@ class AssemblyDirectiveProcessor:
                     print(f" error - .ALIGN requires a positive value, got {u_int}.", file=sys.stderr)
                 return True
             self.state.align = u_int
-        
-        self.state.pc = self.binary_writer.align_(self.state.pc)
+
+        # 破綻点修正: align_()はstate.pc(生のグローバルpc)をそのまま境界に
+        # 揃えていたが、境界判定に本来使うべきなのは出力ファイル上の
+        # 実際の位置であるセクション内相対オフセットである。同じセクション
+        # への再入があると、間に挟まった他セクション分だけ生pcと
+        # セクション内相対オフセットがズレるため、生pc基準ではたまたま
+        # 境界に乗っていても実際の出力上では境界からズレたままになり、
+        # 逆に生pc基準では境界からズレていても実際は既に境界上、といった
+        # 無警告の不整合が起きていた(例: 断片1が3バイト、間に.dataを挟んで
+        # 再入した直後に.align 4しても、生pcがたまたま4の倍数だと
+        # パディングが一切追加されず、実際の出力上では4バイト境界に
+        # 乗らないラベルができてしまう)。セクション内相対オフセット基準で
+        # 必要なパディング量を計算し、そのパディング量をそのまま生pcにも
+        # 加算する(パディング量そのものは生pc・セクション内相対のどちら
+        # から見ても同じだけズレるので、量だけ揃えれば両方正しくなる)。
+        _sec_rel = self.label_manager._section_relative_offset(
+            self.state.current_section, self.state.pc)
+        _base = _sec_rel if _sec_rel is not None else self.state.pc
+        _padding = self.binary_writer.align_(_base) - _base
+        self.state.pc += _padding
         return True
     
     def endsection_processing(self, l1, l2):

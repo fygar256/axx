@@ -4771,7 +4771,23 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
         }
         asmb->st.align=(int)u_int;
     }
-    asmb->st.pc=u256_from_u64(align_addr(&asmb->st,u256_to_u64(asmb->st.pc)));
+    /* 破綻点修正 (axx.py port): align_addr()はstate.pc(生のグローバルpc)を
+     * そのまま境界に揃えていたが、境界判定に本来使うべきなのは出力
+     * ファイル上の実際の位置であるセクション内相対オフセットである。
+     * 同じセクションへの再入があると、間に挟まった他セクション分だけ
+     * 生pcとセクション内相対オフセットがズレるため、生pc基準では
+     * たまたま境界に乗っていても実際の出力上では境界からズレたままに
+     * なる無警告の不整合が起きていた。セクション内相対オフセット基準で
+     * 必要なパディング量を計算し、そのパディング量をそのまま生pcにも
+     * 加算する。 */
+    {
+        uint64_t _raw = u256_to_u64(asmb->st.pc);
+        int64_t _adj = equ_section_relative_offset(&asmb->st, asmb->st.current_section, _raw);
+        uint64_t _base = (_adj >= 0) ? (uint64_t)_adj : _raw;
+        uint64_t _aligned_base = align_addr(&asmb->st, _base);
+        uint64_t _padding = _aligned_base - _base;
+        asmb->st.pc = u256_from_u64(_raw + _padding);
+    }
     return 1;
 }
 static int adir_org(Assembler *asmb, const char *l, const char *l2){
