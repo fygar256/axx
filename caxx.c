@@ -911,6 +911,13 @@ typedef struct {
     int        exp_typ_float;
     int        error_undefined_label;
     int        error_already_defined;
+    /* axx.py port (bugfix): persistent, never auto-reset per-line, unlike
+     * error_undefined_label/error_already_defined above. Set once and left
+     * set for the rest of the run whenever a user-facing " error - ..." is
+     * actually reported during assembly. main() checks this after pass2 to
+     * refuse to write output for a build that printed errors, instead of
+     * silently exiting 0 with incomplete/wrong bytes. */
+    int        had_error;
     /* axx.py port: パターンマッチ試行中フラグ。
      * match0() → match() → expression キャプチャ → label_get_value() の経路で
      * 失敗試行中のラベル未定義エラー表示を抑制する。
@@ -1089,7 +1096,14 @@ static inline int should_report_errors(const AsmState *st) {
 static void secmap_finalize_current(AsmState *st){
     SecEntry *e = secmap_find(&st->sections, st->current_section);
     if(!e) return;
-    if(e->confirmed) return;   /* already confirmed by ENDSECTION */
+    /* Bugfix (axx.py port): do NOT skip just because `confirmed` is set.
+     * entry_pc is always advanced to the current pc at the moment a
+     * fragment is flushed (here or in adir_endsection()/adir_section()),
+     * so a fresh delta of 0 already makes this a safe no-op post-ENDSECTION.
+     * But if more code ran in this section *after* that ENDSECTION (with no
+     * intervening .SECTION), entry_pc is still behind pc and `confirmed`
+     * would incorrectly suppress flushing that trailing fragment, silently
+     * dropping it from section_ranges/the final output. */
     uint256_t delta = u256_sub(st->pc, e->entry_pc);
     if(u256_lt_signed(delta, u256_zero())) return;   /* negative delta: skip */
     e->size = u256_add(e->size, delta);
@@ -2127,12 +2141,14 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
          * 常に失敗していた。 */
         if(_existing && !_existing->is_imported){
             st->error_already_defined=1;
+            st->had_error=1;
             fprintf(stderr," error - label already defined.\n");
             return 0;
         }
     } else if(st->pas==2){
         if(!lmap_contains(&st->labels,k)){
             st->error_already_defined=1;
+            st->had_error=1;
             fprintf(stderr," error - label '%s' not defined in pass 1.\n",k);
             return 0;
         }
@@ -2140,6 +2156,7 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
     char uk[512]; axx_strupr_to(uk,k,sizeof(uk));
     uint256_t dummy;
     if(smap_get(&st->patsymbols,uk,&dummy)){
+        st->had_error=1;
         fprintf(stderr," error - '%s' is a pattern file symbol.\n",k);
         return 0;
     }
@@ -4573,10 +4590,19 @@ static int adir_section(AsmState *st, const char *l, const char *l2){
             }
             st->sections.order[st->sections.count++] = ne;
         }
-        /* Update old section's tentative size (cumulative) unless confirmed by ENDSECTION */
+        /* Update old section's tentative size (cumulative).
+         * Bugfix (axx.py port): this used to skip entirely when
+         * oe->confirmed was set (i.e. the old section was already closed by
+         * .ENDSECTION). That gate is unnecessary for avoiding double-counting
+         * -- entry_pc is already advanced to pc at every flush point, so the
+         * delta below is naturally 0 right after a matching .ENDSECTION --
+         * and it actively drops any code that ran in old_sec *after* that
+         * .ENDSECTION but before this .SECTION switch, since that content's
+         * nonzero delta never got flushed anywhere. Relying on the delta
+         * alone (below) handles both cases correctly. */
         {
             SecEntry *oe = secmap_find(&st->sections, old_sec);
-            if(oe && !oe->confirmed){
+            if(oe){
                 uint256_t delta = u256_sub(st->pc, oe->entry_pc);
                 if(!u256_lt_signed(delta, u256_zero())){   /* delta >= 0 */
                     oe->size = u256_add(oe->size, delta);
@@ -4655,6 +4681,16 @@ static int adir_endsection(AsmState *st, const char *l){
         if(!u256_is_zero(delta))
             secrangevec_push(&st->section_ranges, st->current_section, e->entry_pc, delta);
     }
+    /* Bugfix (axx.py port): advance entry_pc to the current pc, mirroring
+     * axx.py endsection_processing()'s
+     *   self.state.sections[...] = [start, new_size, self.state.pc, True]
+     * Without this, entry_pc is left pointing at the START of the fragment
+     * just closed. adir_section()'s old-section-close logic and
+     * secmap_finalize_current() no longer gate on `confirmed` (that gate
+     * used to hide this), so leaving entry_pc stale would make either of
+     * them recompute the exact same [entry_pc, pc) span again later and
+     * double-count/double-push this fragment's bytes. */
+    e->entry_pc = st->pc;
     e->confirmed = 1;
     return 1;
 }
@@ -5398,12 +5434,28 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(loopflag){ se=1; pln=0; }
 
     if(should_report_errors(st)){
-        if(st->error_undefined_label)
+        /* Bugfix (axx.py port): each of these three conditions must abort
+         * this line (return 0) the same way `oerr` below already does.
+         * Previously only `oerr` returned early; the undefined-label and
+         * syntax-error branches printed their message but then fell through
+         * to the success path at the bottom of this function, so the caller
+         * (lineassemble()) treated the line as successfully assembled --
+         * e.g. a genuinely undefined label reference (reachable in
+         * interactive/pas==0 mode, where the pas==2-gated oerr conversion
+         * below never triggers) printed "Undefined label" yet still
+         * returned 1 with whatever bytes makeobj() happened to produce. */
+        if(st->error_undefined_label){
             fprintf(stderr, " error - Undefined label in expression.  [%s:%d]\n",
                 st->current_file, (int)st->ln);
-        if(se)
+            st->had_error=1;
+            *idx_out=idx; return 0;
+        }
+        if(se){
             fprintf(stderr, " error - Syntax error.  [%s:%d]\n",
                 st->current_file, (int)st->ln);
+            st->had_error=1;
+            *idx_out=idx; return 0;
+        }
         if(oerr){
             /* Mirrors Python:
              *   print(f" ; pat {pln} {pl} error - Illegal syntax in assemble line or pattern line.")
@@ -5416,6 +5468,7 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
                    oerr_entry ? oerr_entry->f[3] : "",
                    oerr_entry ? oerr_entry->f[4] : "",
                    oerr_entry ? oerr_entry->f[5] : "");
+            st->had_error=1;
             *idx_out=idx; return 0;
         }
     }
@@ -7309,6 +7362,21 @@ int main(int argc, char *argv[]){
             }
         }
         lmap_free(&pass1_final);
+
+        /* Bugfix (axx.py port): a genuine per-line error during pass2
+         * (undefined label, syntax error, illegal pattern match, label
+         * conflict) must abort the build instead of silently writing a
+         * shorter/wrong binary and exiting 0. Previously fileassemble()'s
+         * per-line return values were discarded entirely and no run-wide
+         * error state existed, so main() always reached this point and
+         * wrote output regardless of errors printed above. */
+        if(st->had_error){
+            fprintf(stderr," error - one or more errors were reported during assembly; "
+                    "output would be incomplete or wrong.\n");
+            fprintf(stderr,"         Aborting: no output file written.\n");
+            exit_code = 1;
+            goto cleanup;
+        }
     }
 
     binary_flush(st);

@@ -249,6 +249,14 @@ class AssemblerState:
         self.error_undefined_label = False
         self.error_label_conflict = False
 
+        # Persistent (never auto-reset per-line, unlike error_undefined_label/
+        # error_label_conflict above): set once and left set for the rest of
+        # the run whenever a user-facing " error - ..." is actually reported
+        # during assembly. run() checks this after Pass 2 to refuse to write
+        # output for a build that printed errors, instead of silently
+        # succeeding with incomplete/wrong bytes.
+        self.had_error = False
+
         # True while PatternMatcher is trying a candidate pattern that hasn't
         # been chosen yet; suppresses "undefined label" errors for references
         # that only exist because of a not-yet-rejected trial match.
@@ -1137,15 +1145,18 @@ class LabelManager:
                 old_is_imported = len(existing) > 3 and existing[3]
                 if not old_is_imported:
                     self.state.error_label_conflict = True
+                    self.state.had_error = True
                     print(f" error - label already defined.", file=sys.stderr)
                     return False
         elif self.state.pas == 2:
             if k not in self.state.labels:
                 self.state.error_label_conflict = True
+                self.state.had_error = True
                 print(f" error - label '{k}' not defined in pass 1.", file=sys.stderr)
                 return False
 
         if k in self.state.patsymbols:
+            self.state.had_error = True
             print(f" error - '{k}' is a pattern file symbol.", file=sys.stderr)
             return False
 
@@ -3646,8 +3657,12 @@ class AssemblyDirectiveProcessor:
         last time this section was entered) and appends `(old_sec, entry_pc,
         length)` to `state.section_ranges` — the record `_section_relative_offset`
         walks to translate a raw pc into its position in the final concatenated
-        output. Skips this if the section was already closed by a matching
-        `.ENDSECTION` (`_confirmed`), since that already recorded the fragment.
+        output. This is naturally a no-op (tentative == 0) if the section was
+        already closed by a matching `.ENDSECTION`, which advances `entry_pc`
+        to the current pc as it records the fragment -- but if more code ran
+        in this section *after* that `.ENDSECTION` (with no intervening
+        `.SECTION`), `entry_pc` is still behind `pc` and that trailing
+        fragment is correctly flushed here too, rather than being dropped.
         `state.sections[name] = [start_pc, cumulative_size, entry_pc, confirmed]`
         tracks each section's first-seen start, total bytes across all its
         fragments, and this fragment's start; re-entering a section takes the
@@ -3661,13 +3676,11 @@ class AssemblyDirectiveProcessor:
             if old_sec not in self.state.sections:
                 self.state.sections[old_sec] = [0, 0, 0, False]
             old_entry = self.state.sections[old_sec]
-            _confirmed = len(old_entry) > 3 and old_entry[3]
-            if not _confirmed:
-                _entry_pc = old_entry[2] if len(old_entry) > 2 else old_entry[0]
-                tentative = self.state.pc - _entry_pc
-                if tentative > 0:
-                    old_entry[1] += tentative
-                    self.state.section_ranges.append((old_sec, _entry_pc, tentative))
+            _entry_pc = old_entry[2] if len(old_entry) > 2 else old_entry[0]
+            tentative = self.state.pc - _entry_pc
+            if tentative > 0:
+                old_entry[1] += tentative
+                self.state.section_ranges.append((old_sec, _entry_pc, tentative))
 
             self.state.current_section = l2
             if l2 not in self.state.sections:
@@ -3725,9 +3738,15 @@ class AssemblyDirectiveProcessor:
     def endsection_processing(self, l1, l2):
         """`.ENDSECTION`/`.ENDSEGMENT` — explicitly close out the current
         section's fragment (see `section_processing`'s docstring for the
-        `section_ranges`/`confirmed` mechanics), marking it `confirmed=True`
-        so a later plain `.SECTION` re-entry into the same name doesn't
-        double-count this fragment's bytes."""
+        `section_ranges` mechanics) and advance this section's `entry_pc` to
+        the current pc, so a later plain `.SECTION` re-entry into the same
+        name computes an empty (zero-length) delta instead of re-flushing
+        this same fragment. Also marks `confirmed=True`, consulted only by
+        `section_processing`'s re-entry logic to pick the section's overall
+        start address -- it no longer gates whether a fragment gets flushed,
+        so any code that runs after `.ENDSECTION` but before the next
+        `.SECTION` still has its bytes correctly recorded rather than
+        silently dropped."""
         if StringUtils.upper(l1) != ".ENDSECTION" and StringUtils.upper(l1) != ".ENDSEGMENT":
             return False
         if self.state.current_section not in self.state.sections:
@@ -4240,12 +4259,15 @@ class Assembler:
         if self.state.should_report_errors():
             _loc = f"  [{self.state.current_file}:{self.state.ln}]"
             if self.state.error_undefined_label:
+                self.state.had_error = True
                 print(f" error - Undefined label in expression.{_loc}", file=sys.stderr)
                 return 0, [], False, idx
             if se:
+                self.state.had_error = True
                 print(f" error - Syntax error.{_loc}", file=sys.stderr)
                 return 0, [], False, idx
             if oerr:
+                self.state.had_error = True
                 print(f" ; pat {pln} {pl} error - Illegal syntax in assemble line or pattern line.{_loc}", file=sys.stderr)
                 return 0, [], False, idx
         
@@ -5591,12 +5613,11 @@ class Assembler:
                     _last_sec1 = self.state.current_section
                     if _last_sec1 in self.state.sections:
                         _e1 = self.state.sections[_last_sec1]
-                        if not (len(_e1) > 3 and _e1[3]):
-                            _ep1 = _e1[2] if len(_e1) > 2 else _e1[0]
-                            _blk1 = self.state.pc - _ep1
-                            if _blk1 > 0:
-                                _e1[1] += _blk1
-                                self.state.section_ranges.append((_last_sec1, _ep1, _blk1))
+                        _ep1 = _e1[2] if len(_e1) > 2 else _e1[0]
+                        _blk1 = self.state.pc - _ep1
+                        if _blk1 > 0:
+                            _e1[1] += _blk1
+                            self.state.section_ranges.append((_last_sec1, _ep1, _blk1))
 
 
                     # A label whose value is still UNDEF-derived means some
@@ -5670,13 +5691,11 @@ class Assembler:
                 _last_sec = self.state.current_section
                 if _last_sec in self.state.sections:
                     _e = self.state.sections[_last_sec]
-                    _confirmed = len(_e) > 3 and _e[3]
-                    if not _confirmed:
-                        _entry_pc = _e[2] if len(_e) > 2 else _e[0]
-                        _block = self.state.pc - _entry_pc
-                        if _block > 0:
-                            _e[1] += _block
-                            self.state.section_ranges.append((_last_sec, _entry_pc, _block))
+                    _entry_pc = _e[2] if len(_e) > 2 else _e[0]
+                    _block = self.state.pc - _entry_pc
+                    if _block > 0:
+                        _e[1] += _block
+                        self.state.section_ranges.append((_last_sec, _entry_pc, _block))
 
                 # Sanity check: Pass 1's converged addresses should exactly match
                 # what Pass 2 actually computes; any mismatch means relaxation
@@ -5702,6 +5721,12 @@ class Assembler:
                             print(f"           {k}: pass1={p1!r} pass2={p2!r}", file=sys.stderr)
                     if len(_drift) > 10:
                         print(f"           ... and {len(_drift) - 10} more.", file=sys.stderr)
+                    print("         Aborting: no output file written.", file=sys.stderr)
+                    return False
+
+                if self.state.had_error:
+                    print(" error - one or more errors were reported during assembly; "
+                          "output would be incomplete or wrong.", file=sys.stderr)
                     print("         Aborting: no output file written.", file=sys.stderr)
                     return False
 
