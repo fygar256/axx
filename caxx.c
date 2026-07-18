@@ -1019,6 +1019,9 @@ typedef struct {
         char   *sym;
         int     rtype;
         int64_t addend;
+        int     nbytes;  /* encoded field byte width; needed for REL (non-RELA)
+                           * targets to patch the addend directly into the
+                           * relocated field's bytes -- see write_elf_obj(). */
     } *relocations;
     int        reloc_count;
     int        reloc_cap;
@@ -1087,6 +1090,206 @@ typedef struct {
  * と対応)。 */
 static inline int should_report_errors(const AsmState *st) {
     return st->pas == 2 || st->pas == 0;
+}
+
+/* =========================================================
+ * ELF_MACHINES: consolidated per-e_machine relocation tables.
+ *
+ * axx.py port: this mirrors axx.py's ELF_MACHINES dict (top of axx.py)
+ * exactly -- same architectures, same relocation-type numbers, same
+ * width-guess/pc-relative/named-override/dwarf_abs/is_rela semantics. It
+ * replaces what used to be 8 independently-maintained scattered
+ * tables/branches in this file (the `.EQU`/`.EXTERN`/`-i` import/`-E`
+ * export named-reloctype maps, the width->rtype `_rm[]` table, the
+ * PC-relative classification branch, the absolute-rtype reclassification
+ * guard, and the DWARF abs64 ternary) -- a 12th architecture now only
+ * needs one new entry here instead of edits at 8 call sites.
+ *
+ * `named` is `{symbolic name usable in a "::name" override: reloc type,
+ * expected encoded field byte width}` -- the single source of truth for
+ * `.EXTERN`/`.EQU`/the `-i` import syntax's `::reloctype` overrides *and*
+ * the reverse lookup `-E` export uses to print a symbolic name; the width
+ * is what an override's field-width sanity check validates against.
+ *
+ * `is_rela` says whether this machine's psABI stores relocation addends
+ * explicitly (RELA: separate addend field, `.rela.NAME` sections, SHT_RELA)
+ * or implicitly (REL: no addend field -- baked directly into the relocated
+ * field's bytes instead, `.rel.NAME` sections, SHT_REL). i386's REL
+ * convention was confirmed against a real `gcc -m32`-produced object file;
+ * the rest are this port's best-effort read of documented psABI
+ * conventions, unverified against a real cross-linker for either file --
+ * flag any that turn out wrong.
+ * ========================================================= */
+typedef struct { const char *name; int rtype; int width; } ElfNamedReloc;
+
+typedef struct {
+    int         machine;
+    const char *name;
+    int         elfclass;      /* 1 = ELFCLASS32, 2 = ELFCLASS64 */
+    int         is_rela;       /* 1 = RELA (explicit addend), 0 = REL (implicit) */
+    int         extern_default;
+    int         dwarf_abs;
+    /* Default-guess reloc type for an auto-detected label reference of
+     * this many encoded bytes, when no explicit `::reloctype` override was
+     * given; 0 = no entry for that width (no relocation emitted). */
+    int         wg8, wg4, wg2, wg1;
+    const int  *pc_rel;        /* reloc-type numbers that are PC-relative */
+    int         pc_rel_n;
+    const ElfNamedReloc *named; /* name==NULL terminated */
+} ElfMachineInfo;
+
+static const int _pcrel_i386[]    = {2, 13, 21, 23};
+static const int _pcrel_m68k[]    = {4, 5, 6};
+static const int _pcrel_ppc32[]   = {10, 26};
+static const int _pcrel_ppc64[]   = {10, 26, 44};
+static const int _pcrel_s390x[]   = {5, 16, 23};
+static const int _pcrel_arm[]     = {1, 3};
+static const int _pcrel_sh[]      = {2};
+static const int _pcrel_sparcv9[] = {4, 5, 6, 46};
+static const int _pcrel_x86_64[]  = {2, 4, 9, 13, 15, 24};
+static const int _pcrel_aarch64[] = {260, 261, 262};
+
+static const ElfNamedReloc _named_i386[] = {
+    {"abs32", 1, 4}, {"pc32", 2, 4}, {"rel32", 2, 4},
+    {"got32", 3, 4}, {"plt32", 4, 4},
+    {"gotoff", 9, 4}, {"gotpc", 10, 4},
+    {"abs16", 20, 2}, {"pc16", 21, 2},
+    {"abs8", 22, 1}, {"pc8", 23, 1},
+    {NULL, 0, 0},
+};
+static const ElfNamedReloc _named_m68k[] = {
+    {"abs32", 1, 4}, {"abs16", 2, 2}, {"abs8", 3, 1},
+    {"pc32", 4, 4}, {"rel32", 4, 4},
+    {"pc16", 5, 2}, {"pc8", 6, 1},
+    {NULL, 0, 0},
+};
+static const ElfNamedReloc _named_ppc32[] = {
+    {"abs32", 1, 4}, {"abs16", 3, 2}, {"abs16lo", 4, 2},
+    {"abs16hi", 5, 2}, {"abs16ha", 6, 2},
+    {"pc32", 26, 4}, {"rel32", 26, 4},
+    {"pc24", 10, 4}, {"rel24", 10, 4},
+    {NULL, 0, 0},
+};
+static const ElfNamedReloc _named_ppc64[] = {
+    {"abs64", 38, 8}, {"abs32", 1, 4},
+    {"abs16", 3, 2}, {"abs16lo", 4, 2},
+    {"abs16hi", 5, 2}, {"abs16ha", 6, 2},
+    {"pc64", 44, 8}, {"rel64", 44, 8},
+    {"pc32", 26, 4}, {"rel32", 26, 4},
+    {"pc24", 10, 4}, {"rel24", 10, 4},
+    {NULL, 0, 0},
+};
+static const ElfNamedReloc _named_s390x[] = {
+    {"abs64", 22, 8}, {"abs32", 4, 4}, {"abs16", 3, 2}, {"abs8", 1, 1},
+    {"pc64", 23, 8}, {"pc32", 5, 4}, {"rel32", 5, 4}, {"pc16", 16, 2},
+    {NULL, 0, 0},
+};
+static const ElfNamedReloc _named_arm[] = {
+    {"abs32", 2, 4}, {"pc24", 1, 4},
+    {"pc32", 3, 4}, {"rel32", 3, 4},
+    {"abs16", 5, 2}, {"abs12", 6, 4}, {"abs8", 8, 1},
+    {NULL, 0, 0},
+};
+static const ElfNamedReloc _named_sh[] = {
+    {"abs32", 1, 4}, {"pc32", 2, 4}, {"rel32", 2, 4},
+    {NULL, 0, 0},
+};
+static const ElfNamedReloc _named_sparcv9[] = {
+    {"abs64", 32, 8}, {"abs32", 3, 4}, {"abs16", 2, 2}, {"abs8", 1, 1},
+    {"pc64", 46, 8}, {"rel64", 46, 8},
+    {"pc32", 6, 4}, {"rel32", 6, 4},
+    {"pc16", 5, 2}, {"pc8", 4, 1},
+    {NULL, 0, 0},
+};
+static const ElfNamedReloc _named_x86_64[] = {
+    {"abs64", 1, 8}, {"abs32", 10, 4}, {"abs32s", 11, 4},
+    {"abs16", 12, 2}, {"abs8", 14, 1},
+    {"pc32", 2, 4}, {"rel32", 2, 4}, {"plt32", 4, 4},
+    {"pc16", 13, 2}, {"pc8", 15, 1}, {"pc64", 24, 8},
+    {"got32", 3, 4}, {"gotpcrel", 9, 4}, {"got64", 27, 8},
+    {NULL, 0, 0},
+};
+static const ElfNamedReloc _named_aarch64[] = {
+    {"abs64", 257, 8}, {"abs32", 258, 4}, {"abs16", 259, 2},
+    {"pc64", 260, 8}, {"rel64", 260, 8},
+    {"pc32", 261, 4}, {"rel32", 261, 4},
+    {"pc16", 262, 2}, {"rel16", 262, 2},
+    {NULL, 0, 0},
+};
+static const ElfNamedReloc _named_riscv[] = {
+    /* abs16/abs8 (34/33) reproduce this assembler's pre-existing
+     * width-guess numbering as-is; unlike the other entries here they are
+     * not independently confirmed against psABI documentation (RISC-V's
+     * base spec does not define a plain absolute 16-/8-bit relocation the
+     * way most other ISAs do) -- treat those two specifically as
+     * low-confidence. */
+    {"abs64", 2, 8}, {"abs32", 1, 4}, {"abs16", 34, 2}, {"abs8", 33, 1},
+    {NULL, 0, 0},
+};
+
+static const ElfMachineInfo ELF_MACHINES[] = {
+    /* EM_386: confirmed REL (not RELA) against a real `gcc -m32` object. */
+    {3,   "i386",      1, 0, 2,   1,   0,  2, 20, 22, _pcrel_i386,    4, _named_i386},
+    {4,   "m68k",       1, 1, 4,   1,   0,  4,  2,  3, _pcrel_m68k,    3, _named_m68k},
+    {20,  "PowerPC",    1, 1, 26,  1,   0, 26,  4,  0, _pcrel_ppc32,   2, _named_ppc32},
+    {21,  "PowerPC64",  2, 1, 26,  38,  38,26,  4,  0, _pcrel_ppc64,   3, _named_ppc64},
+    {22,  "s390x",      2, 1, 5,   22,  22, 5,  3,  1, _pcrel_s390x,   3, _named_s390x},
+    {40,  "ARM",        1, 0, 3,   2,   0,  3,  4,  8, _pcrel_arm,     2, _named_arm},
+    {42,  "SuperH",     1, 1, 2,   1,   0,  2,  0,  0, _pcrel_sh,      1, _named_sh},
+    {43,  "SPARCV9",    2, 1, 6,   32,  32,  6,  2,  1, _pcrel_sparcv9, 4, _named_sparcv9},
+    {62,  "x86-64",     2, 1, 2,   1,   1,  2, 12, 14, _pcrel_x86_64,  6, _named_x86_64},
+    {183, "AArch64",    2, 1, 261, 257, 257,261,262,  0, _pcrel_aarch64, 3, _named_aarch64},
+    {243, "RISC-V",     2, 1, 1,   2,   2,  1, 34, 33, NULL,           0, _named_riscv},
+};
+#define ELF_MACHINES_N ((int)(sizeof(ELF_MACHINES)/sizeof(ELF_MACHINES[0])))
+
+static const ElfMachineInfo *elf_machine_find(int machine){
+    for(int i=0;i<ELF_MACHINES_N;i++)
+        if(ELF_MACHINES[i].machine == machine) return &ELF_MACHINES[i];
+    return NULL;
+}
+
+/* {name}::reloctype -> reloc type number, or -1 if unknown for this machine. */
+static int elf_machine_named(const ElfMachineInfo *m, const char *name){
+    if(!m) return -1;
+    for(int i=0; m->named[i].name; i++)
+        if(strcasecmp(m->named[i].name, name)==0) return m->named[i].rtype;
+    return -1;
+}
+
+/* reloc type number -> its first matching symbolic name, or NULL. */
+static const char *elf_machine_reverse(const ElfMachineInfo *m, int rtype){
+    if(!m) return NULL;
+    for(int i=0; m->named[i].name; i++)
+        if(m->named[i].rtype == rtype) return m->named[i].name;
+    return NULL;
+}
+
+/* reloc type number -> its expected encoded field byte width, or 0 if
+ * this machine has no named entry for that number (override validation
+ * then can't check it and accepts it as-is, mirroring axx.py). */
+static int elf_machine_reloc_bytes(const ElfMachineInfo *m, int rtype){
+    if(!m) return 0;
+    for(int i=0; m->named[i].name; i++)
+        if(m->named[i].rtype == rtype) return m->named[i].width;
+    return 0;
+}
+
+static int elf_machine_is_pcrel(const ElfMachineInfo *m, int rtype){
+    if(!m) return 0;
+    for(int i=0;i<m->pc_rel_n;i++) if(m->pc_rel[i]==rtype) return 1;
+    return 0;
+}
+
+static int elf_machine_width_guess(const ElfMachineInfo *m, int nbytes){
+    if(!m) return 0;
+    switch(nbytes){
+        case 8: return m->wg8;
+        case 4: return m->wg4;
+        case 2: return m->wg2;
+        case 1: return m->wg1;
+        default: return 0;
+    }
 }
 
 /* Finalize the current (last) section's size after fileassemble() completes.
@@ -4551,16 +4754,10 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
                 char rt_lc[64]; int ri=0;
                 while(rt_str[ri] && ri < 63){ rt_lc[ri]=(char)tolower((unsigned char)rt_str[ri]); ri++; }
                 rt_lc[ri]='\0';
-                static const struct{ const char*name; int rtype; } _rmap[]={
-                    {"abs64",1},{"abs32",10},{"abs32s",11},{"abs16",12},{"abs8",14},
-                    {"pc32",2},{"plt32",4},{"pc16",13},{"pc8",15},{"pc64",24},
-                    {"got32",3},{"gotpcrel",9},{"got64",27},{NULL,0}
-                };
-                for(int mi=0; _rmap[mi].name; mi++){
-                    if(strcmp(rt_lc, _rmap[mi].name)==0){ reloc_type=_rmap[mi].rtype; break; }
-                }
+                reloc_type = elf_machine_named(elf_machine_find(st->elf_machine), rt_lc);
                 if(reloc_type < 0)
-                    fprintf(stderr," warning - unknown reloctype '%s' in .EQU\n", rt_lc);
+                    fprintf(stderr," warning - unknown reloctype '%s' in .EQU for machine %d\n",
+                            rt_lc, st->elf_machine);
             }
 
             /* === ここが修正箇所：.equ 内の forward reference を pass1 で正しく扱う === */
@@ -4968,15 +5165,11 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
          * was the first ':' of '::' we need to step back so '::' is detected. */
         if(idx > 0 && buf[idx-1]==':' && idx < blen && buf[idx]==':')
             idx--;  /* back up to expose '::' */
-        /* Parse optional ::rtype suffix.
-         * デフォルトリロケーション型はアーキテクチャに応じて選択する。 */
-        int _em_ext = st->elf_machine;
-        int reloc_type;
-        if     (_em_ext ==  40) reloc_type =   3;  /* ARM:     R_ARM_REL32       */
-        else if(_em_ext == 183) reloc_type = 261;  /* AArch64: R_AARCH64_PREL32  */
-        else if(_em_ext == 243) reloc_type =   1;  /* RISC-V:  R_RISCV_32        */
-        else if(_em_ext ==  20) reloc_type =  26;  /* PPC:     R_PPC_REL32       */
-        else                    reloc_type =   2;  /* x86-64/i386: PC32 (デフォルト) */
+        /* Parse optional ::rtype suffix. Default relocation type and the
+         * ::name -> reloc-type-number lookup both come from ELF_MACHINES
+         * (axx.py port: single source of truth, see its definition above). */
+        const ElfMachineInfo *_mtbl_ext = elf_machine_find(st->elf_machine);
+        int reloc_type = _mtbl_ext ? _mtbl_ext->extern_default : 2;
         if(idx+1 < blen && buf[idx]==':' && buf[idx+1]==':'){
             idx += 2;
             int rt_start = idx;
@@ -4991,29 +5184,10 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
                 /* lower-case for comparison */
                 for(int _ci=0;rt_str[_ci];_ci++)
                     if(rt_str[_ci]>='A'&&rt_str[_ci]<='Z') rt_str[_ci]+=32;
-                /* rtype_map: mirrors axx.py extern_processing() (fixed & extended).
-                 * Bug修正: 旧コードは abs32→1(R_X86_64_64) だった。
-                 *          正しくは abs32→10(R_X86_64_32), abs64→1(R_X86_64_64)。 */
-                int rtype = -1;
-                /* 絶対リロケーション */
-                if     (strcmp(rt_str,"abs64" )==0) rtype= 1;  /* R_X86_64_64    – 64bit絶対 */
-                else if(strcmp(rt_str,"abs32" )==0) rtype=10;  /* R_X86_64_32    – 32bit ゼロ拡張絶対 */
-                else if(strcmp(rt_str,"abs32s")==0) rtype=11;  /* R_X86_64_32S   – 32bit 符号拡張絶対 */
-                else if(strcmp(rt_str,"abs16" )==0) rtype=12;  /* R_X86_64_16    – 16bit絶対 */
-                else if(strcmp(rt_str,"abs8"  )==0) rtype=14;  /* R_X86_64_8     –  8bit絶対 */
-                /* PC相対リロケーション */
-                else if(strcmp(rt_str,"pc32"  )==0
-                     || strcmp(rt_str,"rel32" )==0) rtype= 2;  /* R_X86_64_PC32  – 32bit PC相対 */
-                else if(strcmp(rt_str,"plt32" )==0) rtype= 4;  /* R_X86_64_PLT32 – PLT経由32bit PC相対 */
-                else if(strcmp(rt_str,"pc16"  )==0) rtype=13;  /* R_X86_64_PC16  – 16bit PC相対 */
-                else if(strcmp(rt_str,"pc8"   )==0) rtype=15;  /* R_X86_64_PC8   –  8bit PC相対 */
-                else if(strcmp(rt_str,"pc64"  )==0) rtype=24;  /* R_X86_64_PC64  – 64bit PC相対 */
-                /* GOT相対リロケーション */
-                else if(strcmp(rt_str,"got32"   )==0) rtype= 3; /* R_X86_64_GOT32    – GOTエントリ32bit */
-                else if(strcmp(rt_str,"gotpcrel")==0) rtype= 9; /* R_X86_64_GOTPCREL – GOT PC相対32bit */
-                else if(strcmp(rt_str,"got64"   )==0) rtype=27; /* R_X86_64_GOT64    – GOTエントリ64bit */
+                int rtype = elf_machine_named(_mtbl_ext, rt_str);
                 if(rtype < 0)
-                    fprintf(stderr," warning - unknown reloc type '%s' in .EXTERN\n", rt_str);
+                    fprintf(stderr," warning - unknown reloc type '%s' in .EXTERN for machine %d\n",
+                            rt_str, st->elf_machine);
                 else
                     reloc_type = rtype;
             }
@@ -5721,38 +5895,14 @@ static int lineassemble(Assembler *asmb, const char *line_in){
             uint64_t sec_entry_pc_cur    = _rse ? u256_to_u64(_rse->entry_pc) : 0;
             uint64_t cur_pc    = u256_to_u64(st->pc);
 
-        /* Per-machine rtype lookup.
-         * 4-byte is PC-relative (CALL/JMP主流) for most architectures.
-         * Absolute variants: use .EXTERN label::abs32 / ::abs64 etc. to force. */
-        static const struct { int mach; int b8,b4,b2,b1; } _rm[] = {
-            /* EM_X86_64: 8→R_X86_64_64(1) 4→R_X86_64_PC32(2) 2→R_X86_64_16(12) 1→R_X86_64_8(14) */
-            {62,  1,  2, 12, 14},
-            /* EM_386: 4→R_386_PC32(2) 2→R_386_16(20) 1→R_386_8(22)
-             * Bug修正: 旧コードは b4=1(ABS32),b2=2(PC32を16bit扱い),b1=7(非存在) だった */
-            {3,   0,  2, 20, 22},
-            /* EM_ARM: 4→R_ARM_REL32(3) 2→R_ARM_ABS16(4) 1→R_ARM_ABS8(8)
-             * Bug修正: 旧コードは b4=2(ABS32),b2=250(非標準),b1=0 だった */
-            {40,  0,  3,  4,  8},
-            /* EM_AARCH64: 8→R_AARCH64_ABS64(257) 4→R_AARCH64_PREL32(261) 2→R_AARCH64_PREL16(262)
-             * Bug修正: 旧コードは b4=258(ABS32),b2=0 だった */
-            {183,257,261,262,  0},
-            /* EM_RISCV: 8→R_RISCV_64(2) 4→R_RISCV_32(1) 2→R_RISCV_ADD16(34) 1→R_RISCV_ADD8(33)
-             * Bug修正: 旧コードは b4=3(R_RISCV_RELATIVE=動的リンカ専用),b2=0,b1=0 だった */
-            {243, 2,  1, 34, 33},
-            /* EM_PPC: 4→R_PPC_REL32(26) 2→R_PPC_ADDR16(4)
-             * Bug修正: 旧コードは b4=1(ADDR32=絶対),b2=0 だった */
-            {20,  0, 26,  4,  0},
-            {0,0,0,0,0}
-        };
-            int _rb8=1,_rb4=2,_rb2=3,_rb1=4;  /* fallback */
-            for(int _ri=0; _rm[_ri].mach; _ri++){
-                if(_rm[_ri].mach == st->elf_machine){
-                    _rb8=_rm[_ri].b8; _rb4=_rm[_ri].b4;
-                    _rb2=_rm[_ri].b2; _rb1=_rm[_ri].b1;
-                    break;
-                }
-            }
-            #define RTYPE_FOR(nb) ((nb)==8?_rb8:(nb)==4?_rb4:(nb)==2?_rb2:(nb)==1?_rb1:0)
+        /* Per-machine rtype lookup: ELF_MACHINES' width_guess (axx.py port,
+         * see ELF_MACHINES' definition above -- single source of truth,
+         * replacing what used to be a table hand-duplicated at this call
+         * site). 4-byte is PC-relative (CALL/JMP主流) for most
+         * architectures; absolute variants: use .EXTERN label::abs32 /
+         * ::abs64 etc. to force. */
+            const ElfMachineInfo *_mtbl_rm = elf_machine_find(st->elf_machine);
+            #define RTYPE_FOR(nb) elf_machine_width_guess(_mtbl_rm, (nb))
 
             /* collect refs with valid word_idx (>= 0), sort by word_idx */
             ElfRef *_valid = (ElfRef*)malloc((size_t)st->elf_refs_len * sizeof(ElfRef));
@@ -5816,16 +5966,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                          * 例: abs64(8バイト) を 4バイトの CALL フィールドに適用すると
                          * 隣接バイトを破壊してセグフォルトを引き起こす。
                          * 外部ラベル（is_imported）はリンカが補正するため常に適用する。 */
-                        static const struct{ int rtype; int bytes; } _fw[]={
-                            {1,8},{24,8},{27,8},   /* abs64, pc64, got64 */
-                            {10,4},{11,4},{2,4},{4,4},{3,4},{9,4}, /* abs32,abs32s,pc32,plt32,got32,gotpcrel */
-                            {12,2},{13,2},          /* abs16, pc16 */
-                            {14,1},{15,1},          /* abs8, pc8 */
-                            {0,0}
-                        };
-                        int _expected = 0;
-                        for(int _fi=0; _fw[_fi].rtype; _fi++)
-                            if(_fw[_fi].rtype == _rt_ov){ _expected=_fw[_fi].bytes; break; }
+                        int _expected = elf_machine_reloc_bytes(_mtbl_rm, _rt_ov);
                         if(_le->is_imported || _expected == 0 || _expected == _nbytes)
                             _rtype = _rt_ov;
                         else {
@@ -5934,10 +6075,14 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                      * 実質あり得ないため、この場合だけ絶対型に読み替える
                      * (x86_64のデフォルト表でのみ確認済み: 4バイト幅は
                      * R_X86_64_PC32(2)ではなくR_X86_64_32(10)にすべき)。 */
+                    /* axx.py port: kept x86_64-only after ELF_MACHINES
+                     * consolidation (was already excluded for 3/40/183/20/
+                     * 243 before; now explicit rather than an exclusion
+                     * list, so newly-added architectures don't silently
+                     * inherit a heuristic never validated for them --
+                     * mirrors axx.py's `self.state.elf_machine == 62` guard). */
                     if(_rtype_is_default_guess && _rtype == 2 && _nbytes == 4
-                       && st->elf_machine != 3 && st->elf_machine != 40
-                       && st->elf_machine != 183 && st->elf_machine != 20
-                       && st->elf_machine != 243
+                       && st->elf_machine == 62
                        && (int64_t)_raw_val == _abs_w_bytes){
                         _rtype = 10; /* R_X86_64_32: absolute 32-bit */
                     }
@@ -5972,36 +6117,9 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                      * 例: PPC R_PPC_REL24=10 と x86-64 R_X86_64_32=10(絶対) が衝突 →
                      *     x86-64 で abs32 が誤って PC相対と判定され addend=-4 になるバグ。
                      * Mirrors axx.py: _pc_rel_types_all はマシン別に分岐して定義。 */
-                    int _is_pcrel = 0;
-                    {
-                        /* Machine-specific PC-relative relocation type sets.
-                         * Only set _is_pcrel=1 if _rtype is in the set for THIS machine. */
-                        int _em_cur = st->elf_machine;
-                        if(_em_cur == 3){         /* EM_386 */
-                            /* R_386_PC32=2, R_386_PC16=13, R_386_PC8=23 */
-                            _is_pcrel = (_rtype==2||_rtype==13||_rtype==23);
-                        } else if(_em_cur == 40){ /* EM_ARM */
-                            /* R_ARM_PC24=1, R_ARM_REL32=3 */
-                            _is_pcrel = (_rtype==1||_rtype==3);
-                        } else if(_em_cur == 183){/* EM_AARCH64 */
-                            /* R_AARCH64_PREL64=260, PREL32=261, PREL16=262 */
-                            _is_pcrel = (_rtype==260||_rtype==261||_rtype==262);
-                        } else if(_em_cur == 20){ /* EM_PPC */
-                            /* R_PPC_REL24=10, R_PPC_REL32=26 */
-                            _is_pcrel = (_rtype==10||_rtype==26);
-                        } else if(_em_cur == 243){/* EM_RISCV: all absolute */
-                            _is_pcrel = 0;
-                        } else {                  /* EM_X86_64(62) and others */
-                            /* R_X86_64_PC32=2, PLT32=4, GOTPCREL=9,
-                             * PC16=13, PC8=15, PC64=24.
-                             * Note: 10=R_X86_64_32 is ABSOLUTE – NOT included.
-                             * Note: 3=R_X86_64_GOT32 is G+A (GOT-base-relative,
-                             *   ABSOLUTE) – NOT PC-relative. PC-relative GOT
-                             *   access uses 9=R_X86_64_GOTPCREL (G+GOT+A-P). */
-                            _is_pcrel = (_rtype==2||_rtype==4||_rtype==9
-                                        ||_rtype==13||_rtype==15||_rtype==24);
-                        }
-                    }
+                    /* Machine-specific PC-relative relocation-type set, from
+                     * ELF_MACHINES (axx.py port: single source of truth). */
+                    int _is_pcrel = elf_machine_is_pcrel(_mtbl_rm, _rtype);
                         if(_is_pcrel)
                             _addend = (int64_t)_raw_val - _abs_w_bytes + _sec_rel;
                         else
@@ -6018,6 +6136,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     st->relocations[st->reloc_count].sym        = strdup(_lname);
                     st->relocations[st->reloc_count].rtype      = _rtype;
                     st->relocations[st->reloc_count].addend     = _addend;
+                    st->relocations[st->reloc_count].nbytes     = _nbytes;
                     st->reloc_count++;
                 }
                 _gi = _gj;
@@ -6135,7 +6254,7 @@ typedef struct { const char*name; uint64_t bs,bsz,fl; uint8_t*data; } WCS;
 /* (section index, value-within-section) result of weo_shndx() */
 typedef struct { uint16_t shndx; uint64_t sv; } WSR;
 /* relocation entry / per-section list */
-typedef struct { int64_t off; const char*sym; int rtype; int64_t addend; } WRE;
+typedef struct { int64_t off; const char*sym; int rtype; int64_t addend; int nbytes; } WRE;
 typedef struct { WRE*data; int len,cap; } WRL;
 /* symbol-name -> symtab-index map entry */
 typedef struct { const char*name; int idx; } WSNI;
@@ -6282,13 +6401,24 @@ static WSR weo_shndx(WCS*csecs,int ncs,uint64_t ba,const char*sec_name,
     return (WSR){0xfff1,ba};   /* SHN_ABS（セクションが一切ない場合のみ） */
 }
 
-/* append one Elf64_Sym (24 bytes) to the symtab buffer */
-static void weo_sym(WBB*symtab_bb,int*nsyms,int is_le,
+/* Append one Elf64_Sym (24 bytes) or Elf32_Sym (16 bytes) to the symtab
+ * buffer. axx.py port note: Elf32_Sym's field ORDER (not just width)
+ * differs from Elf64_Sym -- name/value/size/info/other/shndx instead of
+ * name/info/other/shndx/value/size. */
+static void weo_sym(WBB*symtab_bb,int*nsyms,int is_le,int is_elf64,
                     uint32_t nm,uint8_t info,uint8_t oth,uint16_t shndx,uint64_t val,uint64_t sz){
-    uint8_t sp[24]={0};
-    weo_w4(sp,nm,is_le); sp[4]=info; sp[5]=oth; weo_w2(sp+6,shndx,is_le);
-    weo_w8(sp+8,val,is_le); weo_w8(sp+16,sz,is_le);
-    wbb_app(symtab_bb,sp,24); (*nsyms)++;
+    if(is_elf64){
+        uint8_t sp[24]={0};
+        weo_w4(sp,nm,is_le); sp[4]=info; sp[5]=oth; weo_w2(sp+6,shndx,is_le);
+        weo_w8(sp+8,val,is_le); weo_w8(sp+16,sz,is_le);
+        wbb_app(symtab_bb,sp,24);
+    } else {
+        uint8_t sp[16]={0};
+        weo_w4(sp,nm,is_le); weo_w4(sp+4,(uint32_t)val,is_le); weo_w4(sp+8,(uint32_t)sz,is_le);
+        sp[12]=info; sp[13]=oth; weo_w2(sp+14,shndx,is_le);
+        wbb_app(symtab_bb,sp,16);
+    }
+    (*nsyms)++;
 }
 
 /* qsort comparator for WLK label records (by name) */
@@ -6321,14 +6451,22 @@ static void weo_pad(FILE*f,uint64_t t){
     while((uint64_t)c<t){fputc(0,f);c++;}
 }
 
-/* write one Elf64_Shdr (64 bytes) */
-static void weo_shdr(FILE*f,int is_le,uint32_t nm,uint32_t ty,uint64_t fl,uint64_t addr,uint64_t off,
+/* write one Elf64_Shdr (64 bytes) or Elf32_Shdr (40 bytes) */
+static void weo_shdr(FILE*f,int is_le,int is_elf64,uint32_t nm,uint32_t ty,uint64_t fl,uint64_t addr,uint64_t off,
                      uint64_t sz,uint32_t lnk,uint32_t info,uint64_t align,uint64_t entsz){
-    uint8_t sh[64]={0};
-    weo_w4(sh,nm,is_le);weo_w4(sh+4,ty,is_le);weo_w8(sh+8,fl,is_le);weo_w8(sh+16,addr,is_le);
-    weo_w8(sh+24,off,is_le);weo_w8(sh+32,sz,is_le);weo_w4(sh+40,lnk,is_le);weo_w4(sh+44,info,is_le);
-    weo_w8(sh+48,align,is_le);weo_w8(sh+56,entsz,is_le);
-    fwrite(sh,1,64,f);
+    if(is_elf64){
+        uint8_t sh[64]={0};
+        weo_w4(sh,nm,is_le);weo_w4(sh+4,ty,is_le);weo_w8(sh+8,fl,is_le);weo_w8(sh+16,addr,is_le);
+        weo_w8(sh+24,off,is_le);weo_w8(sh+32,sz,is_le);weo_w4(sh+40,lnk,is_le);weo_w4(sh+44,info,is_le);
+        weo_w8(sh+48,align,is_le);weo_w8(sh+56,entsz,is_le);
+        fwrite(sh,1,64,f);
+    } else {
+        uint8_t sh[40]={0};
+        weo_w4(sh,nm,is_le);weo_w4(sh+4,ty,is_le);weo_w4(sh+8,(uint32_t)fl,is_le);weo_w4(sh+12,(uint32_t)addr,is_le);
+        weo_w4(sh+16,(uint32_t)off,is_le);weo_w4(sh+20,(uint32_t)sz,is_le);weo_w4(sh+24,lnk,is_le);weo_w4(sh+28,info,is_le);
+        weo_w4(sh+32,(uint32_t)align,is_le);weo_w4(sh+36,(uint32_t)entsz,is_le);
+        fwrite(sh,1,40,f);
+    }
 }
 
 /* ---- DWARF raw-buffer helpers ---- */
@@ -6370,6 +6508,16 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
      * byte order as the target architecture. */
     int _is_le  = !st->endian_big;
     int _ei_data = _is_le ? 1 : 2;   /* EI_DATA: 1=LE, 2=BE */
+
+    /* axx.py port: ELF class (32/64-bit) and RELA-vs-REL convention both
+     * come from ELF_MACHINES (single source of truth, see its definition
+     * near the top of this file). Falls back to 64-bit/RELA if `machine`
+     * somehow isn't in the table -- shouldn't happen since -m is validated
+     * against it at CLI parse time, but write_elf_obj() has no other
+     * caller-independent way to fail loudly here. */
+    const ElfMachineInfo *_mtbl_w = elf_machine_find(machine);
+    int _is_elf64 = !_mtbl_w || _mtbl_w->elfclass == 2;
+    int _is_rela_w = !_mtbl_w || _mtbl_w->is_rela;
 
     /* Endian-aware field write helpers */
     #define WEO_W2(p,v) do{ uint16_t _v=(uint16_t)(v); \
@@ -6438,8 +6586,35 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         WRL *rl=&rela_lists[sidx];
         if(rl->len>=rl->cap){rl->cap=rl->cap?rl->cap*2:4;rl->data=realloc(rl->data,rl->cap*sizeof(WRE));if(!rl->data){perror("realloc");exit(1);}}
         rl->data[rl->len++]=(WRE){st->relocations[ri].sec_offset,st->relocations[ri].sym,
-                                   st->relocations[ri].rtype,st->relocations[ri].addend};
+                                   st->relocations[ri].rtype,st->relocations[ri].addend,
+                                   st->relocations[ri].nbytes};
     }
+
+    /* axx.py port: REL-style target (ELF_MACHINES' is_rela==0, e.g. i386,
+     * ARM(32)) has no addend field in the relocation entry at all -- the
+     * addend must instead be baked directly into the relocated field's
+     * bytes (a REL consumer reads it back as the implicit addend). The
+     * bytes there right now hold the *originally encoded* field value, not
+     * the RELA-style addend `pat_match`/the reloc-collection code above
+     * computed; patch them here before the section data is written out. */
+    if(!_is_rela_w){
+        for(int i=0;i<ncs;i++){
+            WRL *rl=&rela_lists[i];
+            for(int ei=0;ei<rl->len;ei++){
+                int64_t off = rl->data[ei].off;
+                int nb = rl->data[ei].nbytes;
+                if(nb<=0 || off<0 || (uint64_t)(off+nb) > csecs[i].bsz) continue;
+                uint64_t field = (uint64_t)rl->data[ei].addend & ((nb>=8)?~(uint64_t)0:(((uint64_t)1<<(nb*8))-1));
+                uint8_t *dp = csecs[i].data + off;
+                if(_is_le){
+                    for(int j=0;j<nb;j++){ dp[j]=(uint8_t)(field&0xff); field>>=8; }
+                } else {
+                    for(int j=nb-1;j>=0;j--){ dp[j]=(uint8_t)(field&0xff); field>>=8; }
+                }
+            }
+        }
+    }
+
     int nrela=0; for(int i=0;i<ncs;i++) if(rela_lists[i].len>0) nrela++;
     int *rs_idx=calloc((size_t)(nrela?nrela:1),sizeof(int));
     { int ri2=0; for(int i=0;i<ncs;i++) if(rela_lists[i].len>0) rs_idx[ri2++]=i; }
@@ -6452,7 +6627,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int i=0;i<ncs;i++) sec_noff[i]=wbb_str(&shstr,csecs[i].name);
     uint32_t *rela_noff=calloc((size_t)(nrela?nrela:1),sizeof(uint32_t));
     for(int ri2=0;ri2<nrela;ri2++){
-        char rn[256]; snprintf(rn,sizeof(rn),".rela%s",csecs[rs_idx[ri2]].name);
+        char rn[256]; snprintf(rn,sizeof(rn),"%s%s",_is_rela_w?".rela":".rel",csecs[rs_idx[ri2]].name);
         rela_noff[ri2]=wbb_str(&shstr,rn);
     }
     uint32_t sym_noff  =wbb_str(&shstr,".symtab");
@@ -6460,14 +6635,14 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     uint32_t shstr_noff=wbb_str(&shstr,".shstrtab");
 
     /* ---- 4. build .symtab ---- */
-    #define WEO_SYMSZ 24
+    int WEO_SYMSZ = _is_elf64 ? 24 : 16;
     WBB symtab_bb; symtab_bb.b=calloc(32,(size_t)WEO_SYMSZ); symtab_bb.len=0; symtab_bb.cap=32*WEO_SYMSZ;
     int nsyms=0;
     WSNI *snimap=calloc((size_t)(st->labels.count+st->export_labels.count+8),sizeof(WSNI));
     int snimap_len=0;
 
-    weo_sym(&symtab_bb,&nsyms,_is_le,0,0,0,0,0,0);                             /* null */
-    for(int i=0;i<ncs;i++) weo_sym(&symtab_bb,&nsyms,_is_le,0,0x03,0,(uint16_t)(i+1),0,0); /* section syms */
+    weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,0,0,0,0,0,0);                             /* null */
+    for(int i=0;i<ncs;i++) weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,0,0x03,0,(uint16_t)(i+1),0,0); /* section syms */
 
     /* sort labels and export_labels by name */
     int nl=0;
@@ -6502,7 +6677,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
                  : weo_shndx(csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section,&st->section_ranges,bpw);
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
         snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
-        weo_sym(&symtab_bb,&nsyms,_is_le,noff,0x00,0,sr.shndx,sr.sv,0);
+        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,0x00,0,sr.shndx,sr.sv,0);
     }
     int first_global=nsyms;
     /* (2) Imported symbols (.EXTERN): STB_GLOBAL (0x10) / SHN_UNDEF (0)
@@ -6512,7 +6687,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         if(weo_isexp(earr,ne,larr[i].name)) continue;
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
         snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
-        weo_sym(&symtab_bb,&nsyms,_is_le,noff,0x10,0,0,0,0);   /* SHN_UNDEF=0, value=0 */
+        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,0x10,0,0,0,0);   /* SHN_UNDEF=0, value=0 */
     }
     /* (3) Export labels → STB_GLOBAL (0x10) */
     for(int i=0;i<ne;i++){
@@ -6522,23 +6697,41 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
                  : weo_shndx(csecs,ncs,earr[i].val*(uint64_t)bpw,earr[i].section,&st->section_ranges,bpw);
         uint32_t noff=wbb_str(&strtab_bb,earr[i].name);
         snimap[snimap_len++]=(WSNI){earr[i].name,nsyms};
-        weo_sym(&symtab_bb,&nsyms,_is_le,noff,0x10,0,sr.shndx,sr.sv,0);
+        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,0x10,0,sr.shndx,sr.sv,0);
     }
 
 
-    /* ---- 5. build .rela data ---- */
+    /* ---- 5. build .rela/.rel data ----
+     * axx.py port: entry size and layout depend on both ELF class and the
+     * RELA-vs-REL convention --
+     *   Elf64_Rela (24B): offset(8) info(8, sym<<32|type) addend(8)
+     *   Elf32_Rela (12B): offset(4) info(4, sym<<8|type)  addend(4)
+     *   Elf64_Rel  (16B): offset(8) info(8, sym<<32|type)  -- no addend
+     *   Elf32_Rel  ( 8B): offset(4) info(4, sym<<8|type)   -- no addend
+     * (REL's implicit addend was already patched into the section bytes
+     * above; every relocation-type number used for a 32-bit-class machine
+     * fits in 8 bits, so Elf32's info packing never truncates in practice.) */
+    int _reloc_entsz = _is_elf64 ? (_is_rela_w?24:16) : (_is_rela_w?12:8);
     uint8_t **rela_bufs=calloc((size_t)(nrela?nrela:1),sizeof(uint8_t*));
     size_t   *rela_szs =calloc((size_t)(nrela?nrela:1),sizeof(size_t));
     for(int ri2=0;ri2<nrela;ri2++){
         WRL *rl=&rela_lists[rs_idx[ri2]];
-        size_t rbs=(size_t)rl->len*24;
+        size_t rbs=(size_t)rl->len*(size_t)_reloc_entsz;
         uint8_t *rb=calloc(1,rbs?rbs:1);
         for(int ei=0;ei<rl->len;ei++){
-            uint8_t *rp=rb+ei*24;
-            uint64_t rinfo=((uint64_t)weo_symof(snimap,snimap_len,rl->data[ei].sym)<<32)|((uint32_t)rl->data[ei].rtype);
-            WEO_LE8(rp,(uint64_t)rl->data[ei].off);
-            WEO_LE8(rp+8,rinfo);
-            WEO_LE8S(rp+16,rl->data[ei].addend);
+            uint8_t *rp=rb+ei*_reloc_entsz;
+            int sym = weo_symof(snimap,snimap_len,rl->data[ei].sym);
+            if(_is_elf64){
+                uint64_t rinfo=((uint64_t)sym<<32)|((uint32_t)rl->data[ei].rtype);
+                WEO_LE8(rp,(uint64_t)rl->data[ei].off);
+                WEO_LE8(rp+8,rinfo);
+                if(_is_rela_w) WEO_LE8S(rp+16,rl->data[ei].addend);
+            } else {
+                uint32_t rinfo=((uint32_t)(sym&0xffffff)<<8)|((uint8_t)rl->data[ei].rtype);
+                WEO_LE4(rp,(uint32_t)rl->data[ei].off);
+                WEO_LE4(rp+4,rinfo);
+                if(_is_rela_w) WEO_LE4(rp+8,(uint32_t)rl->data[ei].addend);
+            }
         }
         rela_bufs[ri2]=rb; rela_szs[ri2]=rbs;
     }
@@ -6558,13 +6751,25 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int _i=0;_i<3;_i++){ dbg_prog[_i]=(DSEC){NULL,NULL,0}; }
     for(int _i=0;_i<2;_i++){ dbg_rela[_i]=(DREL){NULL,0,NULL,0}; }
 
-    if(st->gen_debug && st->line_map_len>0){
+    const ElfMachineInfo *_mtbl_dbg = elf_machine_find(machine);
+    if(st->gen_debug && st->line_map_len>0 && (!_mtbl_dbg || _mtbl_dbg->elfclass != 2)){
+        /* This DWARF builder hardcodes 8-byte (DW_FORM_addr) addresses
+         * throughout, which is only correct for a 64-bit target -- mirrors
+         * axx.py's _build_dwarf_sections() early-return for the same
+         * reason. Emitting it for a 32-bit machine would produce
+         * structurally-wrong-width DWARF instead of just incomplete DWARF,
+         * so refuse rather than silently corrupt it. */
+        fprintf(stderr," warning - DWARF debug info (-g) is not yet supported for "
+                "32-bit targets (machine %d); skipping debug sections.\n", machine);
+    }
+    if(st->gen_debug && st->line_map_len>0 && _mtbl_dbg && _mtbl_dbg->elfclass == 2){
         /* growable raw byte buffer */
 
         /* relocation accumulator for debug sections */
 
-        /* 64-bit absolute relocation type per arch (R_<arch>_64 semantics) */
-        int abs64 = (machine==183)?257 : (machine==243)?2 : 1; /* aarch64 / riscv / else(x86_64) */
+        /* 64-bit absolute relocation type per arch, from ELF_MACHINES
+         * (axx.py port: single source of truth). */
+        int abs64 = _mtbl_dbg->dwarf_abs;
 
         /* ---- .debug_abbrev ---- */
         RB abv; rb_init(&abv);
@@ -6711,7 +6916,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
      * We record sh_offset = current foff (any valid offset is fine; linkers
      * ignore it for NOBITS) but do NOT advance foff past the section data.
      * weo_isno(csecs,) mirrors the same .bss test used in the section-header loop. */
-    uint64_t foff=64;
+    uint64_t foff=_is_elf64?64:52;
     uint64_t *sec_fo=calloc((size_t)ncs,sizeof(uint64_t));
     for(int i=0;i<ncs;i++){
         foff=WEO_ALIGN(foff,16); sec_fo[i]=foff;
@@ -6740,15 +6945,31 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     FILE *fp=fopen(path,"wb");
     if(!fp){perror(path);goto weo_done;}
 
-    /* ELF header */
-    {uint8_t eh[64]={0};
-     eh[0]=0x7f;eh[1]='E';eh[2]='L';eh[3]='F';
-     eh[4]=2;eh[5]=(uint8_t)_ei_data;eh[6]=1;eh[7]=st->osabi; /* ELFCLASS64 EI_DATA EV_CURRENT ELFOSABI */
-     WEO_LE2(eh+16,1); WEO_LE2(eh+18,(uint16_t)machine); WEO_LE4(eh+20,1);
-     WEO_LE8(eh+40,shdr_fo);
-     WEO_LE2(eh+52,64); WEO_LE2(eh+58,64);
-     WEO_LE2(eh+60,(uint16_t)tot_sh); WEO_LE2(eh+62,(uint16_t)shstrndx);
-     fwrite(eh,1,64,fp);}
+    /* ELF header: Elf64_Ehdr (64 bytes) or Elf32_Ehdr (52 bytes). Both share
+     * the same 16-byte e_ident and the same e_type/e_machine/e_version
+     * layout at offset 16, but diverge from e_entry onward -- Elf32 packs
+     * e_entry/e_phoff/e_shoff as 4-byte fields instead of Elf64's 8-byte
+     * ones, shifting every field after it. axx.py port: mirrors axx.py
+     * write_elf_obj()'s _pack_ehdr(). */
+    if(_is_elf64){
+        uint8_t eh[64]={0};
+        eh[0]=0x7f;eh[1]='E';eh[2]='L';eh[3]='F';
+        eh[4]=2;eh[5]=(uint8_t)_ei_data;eh[6]=1;eh[7]=st->osabi; /* ELFCLASS64 EI_DATA EV_CURRENT ELFOSABI */
+        WEO_LE2(eh+16,1); WEO_LE2(eh+18,(uint16_t)machine); WEO_LE4(eh+20,1);
+        WEO_LE8(eh+40,shdr_fo);
+        WEO_LE2(eh+52,64); WEO_LE2(eh+58,64);
+        WEO_LE2(eh+60,(uint16_t)tot_sh); WEO_LE2(eh+62,(uint16_t)shstrndx);
+        fwrite(eh,1,64,fp);
+    } else {
+        uint8_t eh[52]={0};
+        eh[0]=0x7f;eh[1]='E';eh[2]='L';eh[3]='F';
+        eh[4]=1;eh[5]=(uint8_t)_ei_data;eh[6]=1;eh[7]=st->osabi; /* ELFCLASS32 EI_DATA EV_CURRENT ELFOSABI */
+        WEO_LE2(eh+16,1); WEO_LE2(eh+18,(uint16_t)machine); WEO_LE4(eh+20,1);
+        WEO_LE4(eh+32,(uint32_t)shdr_fo);
+        WEO_LE2(eh+40,52); WEO_LE2(eh+46,40);
+        WEO_LE2(eh+48,(uint16_t)tot_sh); WEO_LE2(eh+50,(uint16_t)shstrndx);
+        fwrite(eh,1,52,fp);
+    }
 
     /* Fix J: if ftell() fails it returns -1 (a negative long).  The original
      * cast that to uint64_t, yielding UINT64_MAX, which is never < t so the
@@ -6769,7 +6990,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int i=0;i<n_dbg_rela;i++){ weo_pad(fp,dbg_rela_fo[i]); if(dbg_rela[i].len) fwrite(dbg_rela[i].data,1,dbg_rela[i].len,fp); }
     weo_pad(fp,shdr_fo);
 
-    weo_shdr(fp,_is_le,0,0,0,0,0,0,0,0,0,0); /* [0] NULL */
+    weo_shdr(fp,_is_le,_is_elf64,0,0,0,0,0,0,0,0,0,0); /* [0] NULL */
     for(int i=0;i<ncs;i++){
         /* Fix: .bss は SHT_NOBITS (8)、それ以外は SHT_PROGBITS (1)。
          * ELF 仕様上 SHT_NOBITS セクションはファイル領域を持たない（sh_size は
@@ -6779,24 +7000,28 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         for(;csecs[i].name[_ui]&&_ui<63;_ui++) _un[_ui]=(char)axx_upper_char(csecs[i].name[_ui]);
         _un[_ui]=0;
         uint32_t _sh_type = (strncmp(_un,".BSS",4)==0) ? 8 : 1;
-        weo_shdr(fp,_is_le,sec_noff[i],_sh_type,csecs[i].fl,0,sec_fo[i],csecs[i].bsz,0,0,16,0);
+        weo_shdr(fp,_is_le,_is_elf64,sec_noff[i],_sh_type,csecs[i].fl,0,sec_fo[i],csecs[i].bsz,0,0,16,0);
     }
+    {
+    uint32_t _word_align = _is_elf64?8:4;
+    uint32_t _rel_sh_type = _is_rela_w?4:9;   /* SHT_RELA : SHT_REL */
     for(int ri2=0;ri2<nrela;ri2++)
-        weo_shdr(fp,_is_le,rela_noff[ri2],4,0x40,0,rela_fo[ri2],rela_szs[ri2],
-                 (uint32_t)sym_shidx,(uint32_t)(rs_idx[ri2]+1),8,24);
-    weo_shdr(fp,_is_le,sym_noff,2,0,0,sym_fo,(uint64_t)nsyms*(uint64_t)WEO_SYMSZ,
-             (uint32_t)str_shidx,(uint32_t)first_global,8,(uint64_t)WEO_SYMSZ);
-    weo_shdr(fp,_is_le,str_noff,3,0,0,str_fo,strtab_bb.len,0,0,1,0);
-    weo_shdr(fp,_is_le,shstr_noff,3,0,0,shstr_fo,shstr.len,0,0,1,0);
+        weo_shdr(fp,_is_le,_is_elf64,rela_noff[ri2],_rel_sh_type,0x40,0,rela_fo[ri2],rela_szs[ri2],
+                 (uint32_t)sym_shidx,(uint32_t)(rs_idx[ri2]+1),_word_align,(uint64_t)_reloc_entsz);
+    weo_shdr(fp,_is_le,_is_elf64,sym_noff,2,0,0,sym_fo,(uint64_t)nsyms*(uint64_t)WEO_SYMSZ,
+             (uint32_t)str_shidx,(uint32_t)first_global,_word_align,(uint64_t)WEO_SYMSZ);
+    }
+    weo_shdr(fp,_is_le,_is_elf64,str_noff,3,0,0,str_fo,strtab_bb.len,0,0,1,0);
+    weo_shdr(fp,_is_le,_is_elf64,shstr_noff,3,0,0,shstr_fo,shstr.len,0,0,1,0);
     /* DWARF debug section headers (PROGBITS then RELA). */
     for(int i=0;i<n_dbg_prog;i++)
-        weo_shdr(fp,_is_le,dbg_prog_noff[i],1,0,0,dbg_prog_fo[i],dbg_prog[i].len,0,0,1,0);
+        weo_shdr(fp,_is_le,_is_elf64,dbg_prog_noff[i],1,0,0,dbg_prog_fo[i],dbg_prog[i].len,0,0,1,0);
     for(int i=0;i<n_dbg_rela;i++)
-        weo_shdr(fp,_is_le,dbg_rela_noff[i],4,0x40,0,dbg_rela_fo[i],dbg_rela[i].len,
+        weo_shdr(fp,_is_le,_is_elf64,dbg_rela_noff[i],4,0x40,0,dbg_rela_fo[i],dbg_rela[i].len,
                  (uint32_t)sym_shidx,(uint32_t)(dbg_base+1+dbg_rela[i].target),8,24);
     fclose(fp);
-    fprintf(stderr,"elf: wrote %s (%d section(s), %d rela section(s), %d symbol(s)%s)\n",
-            path,ncs,nrela,nsyms, n_dbg_prog?", +DWARF debug":"");
+    fprintf(stderr,"elf: wrote %s (%d section(s), %d %s section(s), %d symbol(s)%s)\n",
+            path,ncs,nrela,_is_rela_w?"rela":"rel",nsyms, n_dbg_prog?", +DWARF debug":"");
 
 weo_done:
     for(int i=0;i<ncs;i++) free(csecs[i].data);
@@ -6819,7 +7044,6 @@ weo_done:
     #undef WEO_LE8
     #undef WEO_LE8S
     #undef WEO_ALIGN
-    #undef WEO_SYMSZ
 }
 
 static void fileassemble(Assembler *asmb, const char *fn){
@@ -7071,21 +7295,10 @@ static int imp_label(Assembler *asmb, const char *l){
         if(sep){
             *sep = '\0';
             const char *rt_str = sep + 2;
-                 if(strcmp(rt_str,"abs64" )==0) reloc_type= 1;
-            else if(strcmp(rt_str,"abs32" )==0) reloc_type=10;
-            else if(strcmp(rt_str,"abs32s")==0) reloc_type=11;
-            else if(strcmp(rt_str,"abs16" )==0) reloc_type=12;
-            else if(strcmp(rt_str,"abs8"  )==0) reloc_type=14;
-            else if(strcmp(rt_str,"pc32"  )==0) reloc_type= 2;
-            else if(strcmp(rt_str,"plt32" )==0) reloc_type= 4;
-            else if(strcmp(rt_str,"pc16"  )==0) reloc_type=13;
-            else if(strcmp(rt_str,"pc8"   )==0) reloc_type=15;
-            else if(strcmp(rt_str,"pc64"  )==0) reloc_type=24;
-            else if(strcmp(rt_str,"got32" )==0) reloc_type= 3;
-            else if(strcmp(rt_str,"gotpcrel")==0) reloc_type=9;
-            else if(strcmp(rt_str,"got64" )==0) reloc_type=27;
-            else fprintf(stderr," warning - unknown reloc type '%s' for imported label '%s'\n",
-                         rt_str, label);
+            reloc_type = elf_machine_named(elf_machine_find(asmb->st.elf_machine), rt_str);
+            if(reloc_type < 0)
+                fprintf(stderr," warning - unknown reloc type '%s' for imported label '%s'\n",
+                        rt_str, label);
         }
         if(!label[0]) return 0;
         char *endp;
@@ -7217,15 +7430,24 @@ int main(int argc, char *argv[]){
         else if(strcmp(argv[i],"-o")==0&&i+1<argc){ strncpy(st->elf_objfile,argv[++i],sizeof(st->elf_objfile)-1); }
         else if(strcmp(argv[i],"-m")==0&&i+1<argc){
             int _mval = atoi(argv[++i]);
-            /* 破綻点修正 (axx.py port): e_machine はELFヘッダ中で16bitフィールド
-             * としてpackされる(WEO_W2)。範囲外の値は例外こそ出ないが
-             * (Cの(uint16_t)キャストは黙ってラップアラウンドする)、
-             * ユーザーが意図しない全く別のmachine値のELFファイルが
-             * "正常終了"のふりをして出力されてしまう。CLIの時点で弾く。 */
-            if(_mval < 0 || _mval > 0xFFFF){
-                fprintf(stderr, " error - -m/--machine value %d is out of range "
-                        "(must be 0-65535, ELF e_machine is an unsigned 16-bit field).\n",
-                        _mval);
+            /* axx.py port: reject any machine number ELF_MACHINES doesn't
+             * know correct relocation numbering for, rather than accepting
+             * any 16-bit value and silently falling back to x86_64-shaped
+             * relocations for an unrecognized one (that used to be this
+             * check's only job -- range-only, no whitelist -- mirrors
+             * axx.py's `args.elf_machine not in ELF_MACHINES` check). */
+            if(!elf_machine_find(_mval)){
+                char _known[512]; int _kn=0;
+                for(int _mi=0; _mi<ELF_MACHINES_N && _kn < (int)sizeof(_known)-40; _mi++){
+                    _kn += snprintf(_known+_kn, sizeof(_known)-(size_t)_kn, "%s%d (%s)",
+                                     _mi?", ":"", ELF_MACHINES[_mi].machine, ELF_MACHINES[_mi].name);
+                }
+                fprintf(stderr, " error - -m/--machine value %d is not a supported ELF "
+                        "e_machine number. axx only knows correct relocation-type "
+                        "numbering for: %s. Refusing to guess/fall back to x86_64 "
+                        "numbering for an unrecognized machine, since that would "
+                        "silently mislabel every relocation in the output.\n",
+                        _mval, _known);
                 return 1;
             }
             st->elf_machine = _mval;
@@ -7641,34 +7863,16 @@ int main(int argc, char *argv[]){
                         lbl_addr=(unsigned long long)u256_to_u64(e->value) \
                                  *(unsigned long long)_bpw_export; \
                     } \
-                    /* axx.py: emit ::reloc_type suffix if reloc_type_override is set. \
-                     * _RTYPE_REVERSE: rtype番号 → 文字列名。\
-                     * Bug修正: 旧コードの case 16 は R_X86_64_DTPMOD64 であり \
-                     * "rel32" とは無関係。削除し、欠落していた全型を追加する。 */ \
-                    const char *_rtype_sfx=""; \
-                    /* elf_==1 の場合のみリロケーション情報を付加する */ \
+                    /* axx.py: emit ::reloc_type suffix if reloc_type_override is set, \
+                     * looking up the symbolic name from ELF_MACHINES (axx.py port: \
+                     * single source of truth, was a hardcoded x86_64-only switch). */ \
+                    char _rtype_sfx[80]=""; \
                     if(elf_){ \
                         LabelEntry *_full=lmap_find(&st->labels,e->key); \
                         if(_full && _full->reloc_type_override>=0){ \
-                            switch(_full->reloc_type_override){ \
-                                /* 絶対リロケーション */ \
-                                case  1: _rtype_sfx="::abs64";    break; /* R_X86_64_64  */ \
-                                case 10: _rtype_sfx="::abs32";    break; /* R_X86_64_32  */ \
-                                case 11: _rtype_sfx="::abs32s";   break; /* R_X86_64_32S */ \
-                                case 12: _rtype_sfx="::abs16";    break; /* R_X86_64_16  */ \
-                                case 14: _rtype_sfx="::abs8";     break; /* R_X86_64_8   */ \
-                                /* PC相対リロケーション */ \
-                                case  2: _rtype_sfx="::pc32";     break; /* R_X86_64_PC32    */ \
-                                case  4: _rtype_sfx="::plt32";    break; /* R_X86_64_PLT32   */ \
-                                case 13: _rtype_sfx="::pc16";     break; /* R_X86_64_PC16    */ \
-                                case 15: _rtype_sfx="::pc8";      break; /* R_X86_64_PC8     */ \
-                                case 24: _rtype_sfx="::pc64";     break; /* R_X86_64_PC64    */ \
-                                /* GOT相対リロケーション */ \
-                                case  3: _rtype_sfx="::got32";    break; /* R_X86_64_GOT32   */ \
-                                case  9: _rtype_sfx="::gotpcrel"; break; /* R_X86_64_GOTPCREL*/ \
-                                case 27: _rtype_sfx="::got64";    break; /* R_X86_64_GOT64   */ \
-                                default: _rtype_sfx=""; break; \
-                            } \
+                            const char *_nm=elf_machine_reverse(elf_machine_find(st->elf_machine), \
+                                                                 _full->reloc_type_override); \
+                            if(_nm) snprintf(_rtype_sfx,sizeof(_rtype_sfx),"::%s",_nm); \
                         } \
                     } \
                     fprintf(lf,"%s%s\t0x%llx\n",e->key,_rtype_sfx,lbl_addr); \

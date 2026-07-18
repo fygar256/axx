@@ -120,6 +120,236 @@ ERRORS = [
 ]
 
 
+# ELF e_machine relocation-numbering tables: everything this assembler needs
+# to emit correct ELF32/ELF64 relocatable objects for one target
+# architecture, keyed by e_machine number and selected via `-m`/`--machine`.
+#
+# `width_guess` {encoded-field-byte-width: reloc type} picks a relocation
+# type from an auto-detected label reference with no explicit `::reloctype`
+# override, mirroring real assemblers' convention that a field the same
+# width as a native call/jmp displacement (traditionally 4 bytes, even on
+# 64-bit targets) most likely IS one, while other widths most likely hold an
+# absolute address/data reference -- this convention is deliberately kept
+# per-architecture rather than derived, since it encodes "the common case for
+# this width on this ISA", not a fact about the relocation numbers.
+#
+# `pc_rel` is the set of relocation-type numbers that are PC-relative (vs.
+# absolute) for this machine, consulted when deciding the addend formula.
+#
+# `named` is `{symbolic name usable in a "::name" override: (reloc type,
+# expected encoded field byte width)}` -- the single source of truth for
+# `.EXTERN`/`.EQU`/the `-i` import-file syntax's `::reloctype` overrides
+# *and* the reverse lookup `-E` export uses to print a symbolic name; the
+# per-name width is what `::reloctype`'s field-width sanity check
+# (`_elf_machine_reloc_bytes`) validates an override against, so it can never
+# drift out of sync with that check the way three independently-maintained
+# copies of the same table previously could (see git history/prior audits).
+#
+# `extern_default` is the relocation type a bare `.EXTERN label` (no
+# `::reloctype`) gets. `dwarf_abs` is the relocation type representing an
+# absolute native-pointer-width address, used for DWARF `.debug_info`/
+# `.debug_line` address relocations (`-g`); DWARF generation on a 32-bit
+# target is not yet implemented (see `_build_dwarf_sections`) so this is
+# presently only consulted for `elfclass == 2` machines.
+#
+# Confidence note: x86_64(62)/i386(3)/ARM(40)/AArch64(183)/PowerPC(20)/
+# RISC-V(243) reproduce this assembler's original, already-in-use numbering
+# exactly (a handful of small additions -- e.g. i386's real R_386_PC16=21 --
+# were made only where needed so a new `::name` override resolves to a
+# working relocation; nothing an existing pattern file already relied on was
+# renumbered). The remaining architectures (PowerPC64, S/390(x), SPARCV9,
+# SuperH, M68K) are new and use well-established psABI relocation numbers
+# from documentation, cross-checked where possible (i386's numbers were
+# verified against a real `gcc -m32`-produced object file); none of them
+# have been exercised against a real cross-linker for these architectures,
+# so treat them as "best effort, structurally valid" rather than
+# field-proven, and report back any discrepancy found in practice.
+#
+# `is_rela` says whether this machine's psABI stores relocation addends
+# explicitly (RELA: a separate addend field per entry, `.rela.NAME`
+# sections, SHT_RELA) or implicitly (REL: no addend field at all --
+# `.rel.NAME` sections, SHT_REL -- the addend instead lives baked directly
+# into the relocated field's bytes, and the linker reads-modifies-writes
+# it). This matters at the byte level, not just the section name: for a REL
+# machine, `write_elf_obj` must patch the *already-encoded* field bytes to
+# hold the addend value that would otherwise have gone in RELA's addend
+# field, since nothing else will ever record that value once the .o is
+# written (see `write_elf_obj`'s REL patching pass). i386's REL convention
+# was confirmed against a real `gcc -m32`-produced object earlier in this
+# file's development. The rest are this assembler's best-effort read of
+# publicly documented psABI conventions, similarly unverified against a
+# real cross-linker -- flag any that turn out wrong.
+_ELF_MACHINE_RAW = {
+    3: dict(     # EM_386 (i386)
+        name='i386', elfclass=1, is_rela=False,   # confirmed via `gcc -m32`
+        width_guess={4: 2, 2: 20, 1: 22},
+        pc_rel={2, 13, 21, 23},
+        extern_default=2,
+        named={
+            'abs32': (1, 4), 'pc32': (2, 4), 'rel32': (2, 4),
+            'got32': (3, 4), 'plt32': (4, 4),
+            'gotoff': (9, 4), 'gotpc': (10, 4),
+            'abs16': (20, 2), 'pc16': (21, 2),
+            'abs8': (22, 1), 'pc8': (23, 1),
+        },
+        dwarf_abs=1,
+    ),
+    4: dict(     # EM_68K (M68K)
+        name='m68k', elfclass=1, is_rela=True,
+        width_guess={4: 4, 2: 2, 1: 3},
+        pc_rel={4, 5, 6},
+        extern_default=4,
+        named={
+            'abs32': (1, 4), 'abs16': (2, 2), 'abs8': (3, 1),
+            'pc32': (4, 4), 'rel32': (4, 4),
+            'pc16': (5, 2), 'pc8': (6, 1),
+        },
+        dwarf_abs=1,
+    ),
+    20: dict(    # EM_PPC (PowerPC 32-bit)
+        name='PowerPC', elfclass=1, is_rela=True,
+        width_guess={4: 26, 2: 4},
+        pc_rel={10, 26},
+        extern_default=26,
+        named={
+            'abs32': (1, 4), 'abs16': (3, 2), 'abs16lo': (4, 2),
+            'abs16hi': (5, 2), 'abs16ha': (6, 2),
+            'pc32': (26, 4), 'rel32': (26, 4),
+            'pc24': (10, 4), 'rel24': (10, 4),
+        },
+        dwarf_abs=1,
+    ),
+    21: dict(    # EM_PPC64
+        name='PowerPC64', elfclass=2, is_rela=True,
+        width_guess={8: 38, 4: 26, 2: 4},
+        pc_rel={10, 26, 44},
+        extern_default=26,
+        named={
+            'abs64': (38, 8), 'abs32': (1, 4),
+            'abs16': (3, 2), 'abs16lo': (4, 2),
+            'abs16hi': (5, 2), 'abs16ha': (6, 2),
+            'pc64': (44, 8), 'rel64': (44, 8),
+            'pc32': (26, 4), 'rel32': (26, 4),
+            'pc24': (10, 4), 'rel24': (10, 4),
+        },
+        dwarf_abs=38,
+    ),
+    22: dict(    # EM_S390 (s390x)
+        name='s390x', elfclass=2, is_rela=True,
+        width_guess={8: 22, 4: 5, 2: 3, 1: 1},
+        pc_rel={5, 16, 23},
+        extern_default=5,
+        named={
+            'abs64': (22, 8), 'abs32': (4, 4), 'abs16': (3, 2), 'abs8': (1, 1),
+            'pc64': (23, 8), 'pc32': (5, 4), 'rel32': (5, 4), 'pc16': (16, 2),
+        },
+        dwarf_abs=22,
+    ),
+    40: dict(    # EM_ARM (32-bit)
+        name='ARM', elfclass=1, is_rela=False,
+        width_guess={4: 3, 2: 4, 1: 8},
+        pc_rel={1, 3},
+        extern_default=3,
+        named={
+            'abs32': (2, 4), 'pc24': (1, 4),
+            'pc32': (3, 4), 'rel32': (3, 4),
+            'abs16': (5, 2), 'abs12': (6, 4), 'abs8': (8, 1),
+        },
+        dwarf_abs=2,
+    ),
+    42: dict(    # EM_SH (SuperH)
+        name='SuperH', elfclass=1, is_rela=True,
+        width_guess={4: 2},
+        pc_rel={2},
+        extern_default=2,
+        named={'abs32': (1, 4), 'pc32': (2, 4), 'rel32': (2, 4)},
+        dwarf_abs=1,
+    ),
+    43: dict(    # EM_SPARCV9
+        name='SPARCV9', elfclass=2, is_rela=True,
+        width_guess={8: 32, 4: 6, 2: 2, 1: 1},
+        pc_rel={4, 5, 6, 46},
+        extern_default=6,
+        named={
+            'abs64': (32, 8), 'abs32': (3, 4), 'abs16': (2, 2), 'abs8': (1, 1),
+            'pc64': (46, 8), 'rel64': (46, 8),
+            'pc32': (6, 4), 'rel32': (6, 4),
+            'pc16': (5, 2), 'pc8': (4, 1),
+        },
+        dwarf_abs=32,
+    ),
+    62: dict(    # EM_X86_64
+        name='x86-64', elfclass=2, is_rela=True,
+        width_guess={8: 1, 4: 2, 2: 12, 1: 14},
+        pc_rel={2, 4, 9, 13, 15, 24},
+        extern_default=2,
+        named={
+            'abs64': (1, 8), 'abs32': (10, 4), 'abs32s': (11, 4),
+            'abs16': (12, 2), 'abs8': (14, 1),
+            'pc32': (2, 4), 'rel32': (2, 4), 'plt32': (4, 4),
+            'pc16': (13, 2), 'pc8': (15, 1), 'pc64': (24, 8),
+            'got32': (3, 4), 'gotpcrel': (9, 4), 'got64': (27, 8),
+        },
+        dwarf_abs=1,
+    ),
+    183: dict(   # EM_AARCH64
+        name='AArch64', elfclass=2, is_rela=True,
+        width_guess={8: 257, 4: 261, 2: 262},
+        pc_rel={260, 261, 262},
+        extern_default=261,
+        named={
+            'abs64': (257, 8), 'abs32': (258, 4), 'abs16': (259, 2),
+            'pc64': (260, 8), 'rel64': (260, 8),
+            'pc32': (261, 4), 'rel32': (261, 4),
+            'pc16': (262, 2), 'rel16': (262, 2),
+        },
+        dwarf_abs=257,
+    ),
+    243: dict(   # EM_RISCV (RV64)
+        name='RISC-V', elfclass=2, is_rela=True,
+        width_guess={8: 2, 4: 1, 2: 34, 1: 33},
+        pc_rel=set(),
+        extern_default=1,
+        named={
+            # abs16/abs8 (34/33) reproduce this assembler's pre-existing
+            # width-guess numbering as-is; unlike the other entries in this
+            # table they are not independently confirmed against psABI
+            # documentation (RISC-V's base spec does not define a plain
+            # absolute 16-/8-bit relocation the way most other ISAs do), so
+            # treat those two specifically as low-confidence.
+            'abs64': (2, 8), 'abs32': (1, 4), 'abs16': (34, 2), 'abs8': (33, 1),
+        },
+        dwarf_abs=2,
+    ),
+}
+
+
+def _build_elf_machine_tables(raw):
+    """Expand `_ELF_MACHINE_RAW`'s `named` dict of `{name: (reloc_type,
+    width)}` into the two derived views the rest of the assembler actually
+    looks up by: a plain `{name: reloc_type}` map for parsing a `::name`
+    override, and its reverse `{reloc_type: name}` for `-E` export, plus
+    `reloc_bytes` = `{reloc_type: width}` for validating an override against
+    the field it's attached to. Deriving all three from one source (instead
+    of maintaining them as separate hand-written tables, as this file used
+    to) means they can't independently drift out of sync."""
+    out = {}
+    for machine, entry in raw.items():
+        named_types = {name: rt for name, (rt, _w) in entry['named'].items()}
+        reloc_bytes = {rt: w for (rt, w) in entry['named'].values()}
+        reverse = {}
+        for name, rt in named_types.items():
+            reverse.setdefault(rt, name)
+        out[machine] = dict(entry,
+                             named=named_types,
+                             reloc_bytes=reloc_bytes,
+                             reverse=reverse)
+    return out
+
+
+ELF_MACHINES = _build_elf_machine_tables(_ELF_MACHINE_RAW)
+
+
 class VLIWState:
     """Configuration and in-progress state for VLIW/EPIC-style instruction
     packing, set up by the pattern file's .vliw directive and consumed while
@@ -3514,14 +3744,11 @@ class AssemblyDirectiveProcessor:
                     expr_part = parts[0]
                     rt_str = parts[1].lower()
 
-                    rtype_map = {
-                        'abs64':1, 'abs32':10, 'abs32s':11, 'abs16':12, 'abs8':14,
-                        'pc32':2, 'plt32':4, 'pc16':13, 'pc8':15,
-                        'got32':3, 'gotpcrel':9, 'got64':27,
-                    }
-                    reloc_type = rtype_map.get(rt_str)
+                    _mach_tbl = ELF_MACHINES.get(self.state.elf_machine)
+                    reloc_type = _mach_tbl['named'].get(rt_str) if _mach_tbl else None
                     if reloc_type is None:
-                        print(f" warning - unknown reloctype '{rt_str}' in .EQU", file=sys.stderr)
+                        print(f" warning - unknown reloctype '{rt_str}' in .EQU"
+                              f" for machine {self.state.elf_machine}", file=sys.stderr)
 
                 self.state.error_undefined_label = False
                 saved_mode = self.state._pass1_size_mode
@@ -3883,18 +4110,8 @@ class AssemblyDirectiveProcessor:
                 idx -= 1
 
             _em_ext = self.state.elf_machine
-            if _em_ext == 3:
-                reloc_type = 2
-            elif _em_ext == 40:
-                reloc_type = 3
-            elif _em_ext == 183:
-                reloc_type = 261
-            elif _em_ext == 243:
-                reloc_type = 1
-            elif _em_ext == 20:
-                reloc_type = 26
-            else:
-                reloc_type = 2
+            _mach_tbl_ext = ELF_MACHINES.get(_em_ext)
+            reloc_type = _mach_tbl_ext['extern_default'] if _mach_tbl_ext else 2
             if idx < len(l2) and l2[idx:idx+2] == '::':
                 idx += 2
                 rt_start = idx
@@ -3903,25 +4120,10 @@ class AssemblyDirectiveProcessor:
                 rt_str = l2[rt_start:idx].strip().lower()
 
                 if rt_str:
-                    rtype_map = {
-                        'abs64':  1,
-                        'abs32':  10,
-                        'abs32s': 11,
-                        'abs16':  12,
-                        'abs8':   14,
-                        'pc32':   2,
-                        'rel32':  2,
-                        'plt32':  4,
-                        'pc16':   13,
-                        'pc8':    15,
-                        'pc64':   24,
-                        'got32':    3,
-                        'gotpcrel': 9,
-                        'got64':   27,
-                    }
-                    reloc_type = rtype_map.get(rt_str)
+                    reloc_type = _mach_tbl_ext['named'].get(rt_str) if _mach_tbl_ext else None
                     if reloc_type is None:
-                        print(f" warning - unknown reloc type '{rt_str}' in .EXTERN", file=sys.stderr)
+                        print(f" warning - unknown reloc type '{rt_str}' in .EXTERN"
+                              f" for machine {_em_ext}", file=sys.stderr)
 
             if idx < len(l2) and l2[idx] == ':':
                 idx += 1
@@ -4503,33 +4705,13 @@ class Assembler:
                     groups.append((lname, abs_w, widx, gj - gi))
                     gi = gj
 
-                _em = self.state.elf_machine
-                if _em == 3:
-                    _rmap = {4: 2, 2: 20, 1: 22}
-                elif _em == 20:
-                    _rmap = {4: 26, 2: 4}
-                elif _em == 40:
-                    _rmap = {4: 3, 2: 4, 1: 8}
-                elif _em == 183:
-                    _rmap = {8: 257, 4: 261, 2: 262}
-                elif _em == 243:
-                    _rmap = {8: 2, 4: 1, 2: 34, 1: 33}
-                else:
-                    _rmap = {8: 1, 4: 2, 2: 12, 1: 14}
-
-                _em_r = self.state.elf_machine
-                if _em_r == 3:
-                    _pc_rel_types_all = {2, 13, 23}
-                elif _em_r == 40:
-                    _pc_rel_types_all = {1, 3}
-                elif _em_r == 183:
-                    _pc_rel_types_all = {260, 261, 262}
-                elif _em_r == 20:
-                    _pc_rel_types_all = {10, 26}
-                elif _em_r == 243:
-                    _pc_rel_types_all = set()
-                else:
-                    _pc_rel_types_all = {2, 4, 9, 13, 15, 24}
+                # ELF_MACHINE_TABLE (near top of file) is the single source
+                # of truth for all of this machine's relocation numbering;
+                # -m/--machine is validated against it at startup, so a
+                # lookup miss here can't happen for a completed run.
+                _mach_tbl_la = ELF_MACHINES[self.state.elf_machine]
+                _rmap = _mach_tbl_la['width_guess']
+                _pc_rel_types_all = _mach_tbl_la['pc_rel']
 
                 for lname, abs_w, first_widx, num_words in groups:
                     num_bytes = num_words * bpw_r
@@ -4540,14 +4722,7 @@ class Assembler:
                     _is_imported = lentry and len(lentry) > 3 and lentry[3]
                     if lentry and len(lentry) > 4 and lentry[4] is not None:
                         rtype_override = lentry[4]
-                        _rtype_field_bytes = {
-                            1: 8, 24: 8, 27: 8,
-                            10: 4, 11: 4, 2: 4, 4: 4,
-                            3: 4, 9: 4,
-                            12: 2, 13: 2,
-                            14: 1, 15: 1,
-                        }
-                        expected = _rtype_field_bytes.get(rtype_override)
+                        expected = _mach_tbl_la['reloc_bytes'].get(rtype_override)
                         if _is_imported or expected is None or expected == num_bytes:
                             rtype = rtype_override
                         else:
@@ -4606,8 +4781,13 @@ class Assembler:
                     # address (rather than a small displacement) is actually an
                     # absolute reference that only guessed a pc-relative reloc type
                     # from its byte width; reclassify to the matching abs type.
+                    # Kept x86_64-only (as before consolidation): the other
+                    # registered architectures' width_guess tables were built
+                    # and validated without this extra reclassification step,
+                    # so extending it to them would be a behavior change this
+                    # pass deliberately avoids (see ELF_MACHINES' docstring).
                     if (_rtype_is_default_guess and rtype in _pc_rel_types_all
-                            and raw_val == abs_w_bytes and self.state.elf_machine not in (3, 20, 40, 183, 243)):
+                            and raw_val == abs_w_bytes and self.state.elf_machine == 62):
                         _rmap_abs_default = {8: 1, 4: 10, 2: 12, 1: 14}
                         rtype = _rmap_abs_default.get(num_bytes, rtype)
 
@@ -4633,7 +4813,7 @@ class Assembler:
                         # Absolute reference: no instruction-address term needed.
                         addend = raw_val - abs_w_bytes
 
-                    self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend))
+                    self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend, num_bytes))
 
             if self.state.gen_debug and self.state.pas == 2 and of > 0:
                 self.state.line_map.append(
@@ -4829,14 +5009,8 @@ class Assembler:
             reloc_type = None
             if '::' in label:
                 label, rt_str = label.split('::', 1)
-                rtype_map = {
-                    'abs64':  1,  'abs32':  10, 'abs32s': 11,
-                    'abs16':  12, 'abs8':   14, 'pc32':   2,
-                    'rel32':  2,  'plt32':  4,  'pc16':   13,
-                    'pc8':    15, 'pc64':   24, 'got32':    3,
-                    'gotpcrel': 9, 'got64':   27,
-                }
-                reloc_type = rtype_map.get(rt_str.lower())
+                _mach_tbl_imp = ELF_MACHINES.get(self.state.elf_machine)
+                reloc_type = _mach_tbl_imp['named'].get(rt_str.lower()) if _mach_tbl_imp else None
                 if reloc_type is None:
                     print(f" warning - unknown reloc type '{rt_str}' for imported label '{label}'",
                           file=sys.stderr)
@@ -4943,15 +5117,23 @@ class Assembler:
         if not self.state.gen_debug or not line_map:
             return [], []
 
+        _mach_tbl_dw = ELF_MACHINES.get(machine)
+        if _mach_tbl_dw is None or _mach_tbl_dw['elfclass'] != 2:
+            # This DWARF builder hardcodes 8-byte (DW_FORM_addr) addresses
+            # throughout (compile-unit low_pc/high_pc, label DIEs, the line
+            # program's extended-opcode address op), which is only correct
+            # for a 64-bit target. Emitting it for a 32-bit machine would
+            # produce structurally-wrong-width DWARF instead of just
+            # incomplete DWARF, so refuse rather than silently corrupt it.
+            print(f" warning - DWARF debug info (-g) is not yet supported for "
+                  f"32-bit targets (machine {machine}); skipping debug sections.",
+                  file=sys.stderr)
+            return [], []
+
         import struct as _struct
         _pk = '<' if self.state.endian != 'big' else '>'
 
-        _abs64_map = {
-            62:  1,
-            183: 257,
-            243: 2,
-        }
-        abs64 = _abs64_map.get(machine, 1)
+        abs64 = _mach_tbl_dw['dwarf_abs']
 
         def _uleb(v):
             """DWARF unsigned LEB128 encoding."""
@@ -5193,18 +5375,29 @@ class Assembler:
         return prog_sections, rela_list
 
     def write_elf_obj(self, path: str, machine: int = 62) -> None:
-        """Emit an ELF64 relocatable object file (`.o`) at `path`: builds one
-        output section per distinct section name seen (`_CSec`, extracting its
-        bytes from the sparse `binary_writer._buffer` via `_extract`),
-        appends DWARF debug sections from `_build_dwarf_sections` if enabled,
-        builds the symbol table (locals, then exported/extern globals) and
-        `.rela.*` sections for `state.relocations` plus any DWARF relocations,
-        and writes the ELF header/section headers/`.shstrtab`/`.strtab`/
-        `.symtab` framing around it all. No linking is done here — relocation
-        addends were already computed correctly for the *final* object-file
-        section layout back in `lineassemble`/`_build_dwarf_sections`; this
-        method's job is purely to serialize sections/symbols/relocations to
-        the ELF64 on-disk format."""
+        """Emit an ELF32 or ELF64 relocatable object file (`.o`) at `path`
+        (ELF class selected by `ELF_MACHINES[machine]['elfclass']`): builds
+        one output section per distinct section name seen (`_CSec`,
+        extracting its bytes from the sparse `binary_writer._buffer` via
+        `_extract`), appends DWARF debug sections from `_build_dwarf_sections`
+        if enabled (64-bit targets only -- see that method), builds the
+        symbol table (locals, then exported/extern globals) and `.rela.*`
+        sections for `state.relocations` plus any DWARF relocations, and
+        writes the ELF header/section headers/`.shstrtab`/`.strtab`/
+        `.symtab` framing around it all. No linking is done here —
+        relocation addends were already computed correctly for the *final*
+        object-file section layout back in `lineassemble`/
+        `_build_dwarf_sections`; this method's job is purely to serialize
+        sections/symbols/relocations to the on-disk ELF format.
+
+        Emits RELA (`.rela.*`, explicit per-entry addend) or REL (`.rel.*`,
+        no addend field -- the addend is instead baked directly into the
+        relocated field's bytes) according to `ELF_MACHINES[machine]['is_rela']`,
+        matching each target's real psABI convention (i386 and ARM(32) use
+        REL; everything else in this table uses RELA). For a REL target,
+        the byte-patching pass right after `rela_entries` is built below
+        overwrites each relocated field with the addend value, since
+        nothing else would otherwise record it once the .o is written."""
         import struct as _struct
 
         bpw = max(1, (self.state.bts + 7) // 8)
@@ -5214,36 +5407,65 @@ class Assembler:
         _ei_data  = 1 if _is_le else 2
         _pk       = '<' if _is_le else '>'
 
+        _elfclass  = ELF_MACHINES.get(machine, {}).get('elfclass', 2)
+        _is_elf64  = (_elfclass == 2)
+        _ehdr_size = 64 if _is_elf64 else 52
+        _word_mask = 0xFFFFFFFFFFFFFFFF if _is_elf64 else 0xFFFFFFFF
+
         def _pack_ehdr(e_type, e_machine, e_shoff, e_shnum, e_shstrndx):
-            """Pack the 64-byte Elf64_Ehdr (section-header-only layout: no
+            """Pack the Elf64_Ehdr/Elf32_Ehdr (section-header-only layout: no
             program headers, entry point 0 — this is a relocatable object)."""
             ident = (b'\x7fELF'
-                     + bytes([2, _ei_data, 1, self.state.osabi])
+                     + bytes([2 if _is_elf64 else 1, _ei_data, 1, self.state.osabi])
                      + b'\x00' * 8)
-            return ident + _struct.pack(f'{_pk}HHIQQQIHHHHHH',
-                e_type, e_machine,
-                1,
-                0,
-                0,
-                e_shoff,
-                0,
-                64,
-                0, 0,
-                64,
-                e_shnum,
-                e_shstrndx)
+            if _is_elf64:
+                return ident + _struct.pack(f'{_pk}HHIQQQIHHHHHH',
+                    e_type, e_machine,
+                    1,
+                    0,
+                    0,
+                    e_shoff,
+                    0,
+                    _ehdr_size,
+                    0, 0,
+                    64,
+                    e_shnum,
+                    e_shstrndx)
+            else:
+                return ident + _struct.pack(f'{_pk}HHIIIIIHHHHHH',
+                    e_type, e_machine,
+                    1,
+                    0,
+                    0,
+                    e_shoff,
+                    0,
+                    _ehdr_size,
+                    0, 0,
+                    40,
+                    e_shnum,
+                    e_shstrndx)
 
         def _pack_shdr(sh_name, sh_type, sh_flags, sh_addr, sh_offset,
                        sh_size, sh_link, sh_info, sh_addralign, sh_entsize):
-            """Pack one Elf64_Shdr section header."""
-            return _struct.pack(f'{_pk}IIQQQQIIQQ',
+            """Pack one Elf64_Shdr/Elf32_Shdr section header."""
+            if _is_elf64:
+                return _struct.pack(f'{_pk}IIQQQQIIQQ',
+                    sh_name, sh_type, sh_flags, sh_addr, sh_offset,
+                    sh_size, sh_link, sh_info, sh_addralign, sh_entsize)
+            return _struct.pack(f'{_pk}IIIIIIIIII',
                 sh_name, sh_type, sh_flags, sh_addr, sh_offset,
                 sh_size, sh_link, sh_info, sh_addralign, sh_entsize)
 
         def _pack_sym(st_name, st_info, st_other, st_shndx, st_value, st_size):
-            """Pack one Elf64_Sym symbol table entry."""
-            return _struct.pack(f'{_pk}IBBHQQ',
-                st_name, st_info, st_other, st_shndx, st_value, st_size)
+            """Pack one Elf64_Sym/Elf32_Sym symbol table entry. Field ORDER
+            (not just field width) differs between the two: Elf64_Sym is
+            name/info/other/shndx/value/size, but Elf32_Sym is
+            name/value/size/info/other/shndx."""
+            if _is_elf64:
+                return _struct.pack(f'{_pk}IBBHQQ',
+                    st_name, st_info, st_other, st_shndx, st_value, st_size)
+            return _struct.pack(f'{_pk}IIIBBH',
+                st_name, st_value, st_size, st_info, st_other, st_shndx)
 
         def _align_up(x, a):
             return (x + a - 1) & ~(a - 1)
@@ -5323,12 +5545,36 @@ class Assembler:
 
         sec_name_to_idx = {s.name: i + 1 for i, s in enumerate(csecs)}
 
+        _mach_tbl_w = ELF_MACHINES.get(machine, {})
+        _is_rela = _mach_tbl_w.get('is_rela', True)
+
         from collections import defaultdict as _defaultdict
         rela_entries = _defaultdict(list)
-        for (sname, off, sym_name, rtype, addend) in self.state.relocations:
+        for (sname, off, sym_name, rtype, addend, nbytes) in self.state.relocations:
             sidx = sec_name_to_idx.get(sname, 0)
             if sidx:
-                rela_entries[sidx].append((off, sym_name, rtype, addend))
+                rela_entries[sidx].append((off, sym_name, rtype, addend, nbytes))
+
+        if not _is_rela:
+            # REL-style target (see ELF_MACHINES' `is_rela` docstring): there
+            # is no addend field in the relocation entry, so the addend
+            # `lineassemble` computed must be baked directly into the
+            # relocated field's bytes instead of the *originally encoded*
+            # value (raw_val) that's there now -- a REL consumer reads that
+            # field back as the implicit addend.
+            for sidx, entries in rela_entries.items():
+                csec = csecs[sidx - 1]
+                patched = bytearray(csec.data)
+                for (off, _sym_name, _rtype, addend, nbytes) in entries:
+                    field = addend & ((1 << (nbytes * 8)) - 1)
+                    if self.state.endian == 'little':
+                        field_bytes = bytes((field >> (8 * j)) & 0xff for j in range(nbytes))
+                    else:
+                        field_bytes = bytes((field >> (8 * (nbytes - 1 - j))) & 0xff
+                                             for j in range(nbytes))
+                    if 0 <= off and off + nbytes <= len(patched):
+                        patched[off:off + nbytes] = field_bytes
+                csec.data = bytes(patched)
 
         rela_sec_order = [i + 1 for i, s in enumerate(csecs) if (i + 1) in rela_entries]
         nrela = len(rela_sec_order)
@@ -5341,10 +5587,11 @@ class Assembler:
         for s in csecs:
             sec_name_offs.append(len(shstrtab))
             shstrtab += s.name.encode() + b'\x00'
+        _rela_prefix = '.rela' if _is_rela else '.rel'
         rela_name_offs = []
         for sidx in rela_sec_order:
             rela_name_offs.append(len(shstrtab))
-            shstrtab += ('.rela' + csecs[sidx - 1].name).encode() + b'\x00'
+            shstrtab += (_rela_prefix + csecs[sidx - 1].name).encode() + b'\x00'
         symtab_name_off   = len(shstrtab); shstrtab += b'.symtab\x00'
         strtab_name_off   = len(shstrtab); shstrtab += b'.strtab\x00'
         shstrtab_name_off = len(shstrtab); shstrtab += b'.shstrtab\x00'
@@ -5421,7 +5668,7 @@ class Assembler:
             else:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr, _lsec)
-            sym_val = int(sym_val) & 0xFFFFFFFFFFFFFFFF
+            sym_val = int(sym_val) & _word_mask
             name_off = len(strtab); strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x00, 0, shndx, sym_val, 0))
 
@@ -5446,7 +5693,7 @@ class Assembler:
             else:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr, _sec)
-            sym_val = int(sym_val) & 0xFFFFFFFFFFFFFFFF
+            sym_val = int(sym_val) & _word_mask
             name_off = len(strtab); strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x10, 0, shndx, sym_val, 0))
 
@@ -5474,30 +5721,62 @@ class Assembler:
             sym_name_to_idx[name] = _si
             _si += 1
 
+        _RELA_ENTSIZE = 24 if _is_elf64 else 12
+        _REL_ENTSIZE  = 16 if _is_elf64 else 8
+        _REL_ENTSIZE_ACTIVE = _RELA_ENTSIZE if _is_rela else _REL_ENTSIZE
+
         def _pack_rela(r_offset, r_sym, r_type, r_addend):
-            r_info = (r_sym << 32) | (r_type & 0xffffffff)
-            _S64_MAX =  (1 << 63) - 1
-            _S64_MIN = -(1 << 63)
-            if r_addend > _S64_MAX:
-                r_addend = _S64_MAX
-            elif r_addend < _S64_MIN:
-                r_addend = _S64_MIN
-            return _struct.pack(f'{_pk}QQq', r_offset, r_info, r_addend)
+            """Pack one Elf64_Rela/Elf32_Rela record (explicit addend).
+            r_info's bit layout differs between the two classes -- Elf64
+            packs a 32-bit sym index and a 32-bit type into 64 bits
+            (`sym<<32 | type`), but Elf32 packs an only-24-bit sym index and
+            an 8-bit type into 32 bits (`sym<<8 | type`); every
+            relocation-type number this assembler uses for a 32-bit-class
+            machine fits in 8 bits (see ELF_MACHINES), so no truncation
+            happens in practice."""
+            if _is_elf64:
+                r_info = (r_sym << 32) | (r_type & 0xffffffff)
+                _MAX, _MIN = (1 << 63) - 1, -(1 << 63)
+                if r_addend > _MAX: r_addend = _MAX
+                elif r_addend < _MIN: r_addend = _MIN
+                return _struct.pack(f'{_pk}QQq', r_offset, r_info, r_addend)
+            r_info = ((r_sym & 0xffffff) << 8) | (r_type & 0xff)
+            _MAX, _MIN = (1 << 31) - 1, -(1 << 31)
+            if r_addend > _MAX: r_addend = _MAX
+            elif r_addend < _MIN: r_addend = _MIN
+            return _struct.pack(f'{_pk}IIi', r_offset, r_info, r_addend)
+
+        def _pack_rel(r_offset, r_sym, r_type):
+            """Pack one Elf64_Rel/Elf32_Rel record: same r_info layout as
+            _pack_rela's, but with no addend field at all -- the addend was
+            already patched directly into the section's bytes above."""
+            if _is_elf64:
+                r_info = (r_sym << 32) | (r_type & 0xffffffff)
+                return _struct.pack(f'{_pk}QQ', r_offset, r_info)
+            r_info = ((r_sym & 0xffffff) << 8) | (r_type & 0xff)
+            return _struct.pack(f'{_pk}II', r_offset, r_info)
 
         rela_datas = []
         for sidx in rela_sec_order:
             entries = rela_entries[sidx]
-            data = b''.join(
-                _pack_rela(off, sym_name_to_idx.get(sn, 0), rtype, addend)
-                for (off, sn, rtype, addend) in entries
-            )
+            if _is_rela:
+                data = b''.join(
+                    _pack_rela(off, sym_name_to_idx.get(sn, 0), rtype, addend)
+                    for (off, sn, rtype, addend, _nbytes) in entries
+                )
+            else:
+                data = b''.join(
+                    _pack_rel(off, sym_name_to_idx.get(sn, 0), rtype)
+                    for (off, sn, rtype, _addend, _nbytes) in entries
+                )
             rela_datas.append(data)
 
         # File layout: Ehdr, then section data (16-byte aligned), rela data
-        # (8-byte aligned), symtab, strtab, shstrtab, DWARF sections/relas,
-        # then the section header table itself (shdr_off) — a conventional
-        # ELF64 relocatable-object layout that any standard linker can read.
-        offset = 64
+        # (8-byte aligned), symtab, strtab, shstrtab, DWARF sections/relas
+        # (64-bit targets only), then the section header table itself
+        # (shdr_off) — a conventional ELF32/ELF64 relocatable-object layout
+        # that any standard linker can read.
+        offset = _ehdr_size
         sec_offsets = []
         for s in csecs:
             offset = _align_up(offset, 16)
@@ -5581,16 +5860,19 @@ class Assembler:
                     sec_name_offs[i], _sh_type_i, s.flags, 0,
                     sec_offsets[i], s.byte_size, 0, 0, 16, 0))
 
+            _word_align = 8 if _is_elf64 else 4
+            _sym_entsize = 24 if _is_elf64 else 16
+            _rela_sh_type = 4 if _is_rela else 9   # SHT_RELA : SHT_REL
             for ri, sidx in enumerate(rela_sec_order):
                 f.write(_pack_shdr(
-                    rela_name_offs[ri], 4, 0x40, 0,
+                    rela_name_offs[ri], _rela_sh_type, 0x40, 0,
                     rela_offsets[ri], len(rela_datas[ri]),
-                    symtab_shidx, sidx, 8, 24))
+                    symtab_shidx, sidx, _word_align, _REL_ENTSIZE_ACTIVE))
 
             f.write(_pack_shdr(
                 symtab_name_off, 2, 0, 0,
                 symtab_off, len(symtab),
-                symtab_link, first_global, 8, 24))
+                symtab_link, first_global, _word_align, _sym_entsize))
 
             f.write(_pack_shdr(
                 strtab_name_off, 3, 0, 0,
@@ -5611,7 +5893,8 @@ class Assembler:
                     symtab_shidx, dbg_prog_shndx.get(tname, 0), 8, 24))
 
         _dbg_msg = f", {len(dbg_prog)} debug section(s)" if dbg_prog else ""
-        print(f"elf: wrote {path} ({ncs} section(s), {nrela} rela section(s), "
+        _reloc_kind = "rela" if _is_rela else "rel"
+        print(f"elf: wrote {path} ({ncs} section(s), {nrela} {_reloc_kind} section(s), "
               f"{len(syms)} symbol(s){_dbg_msg})",
               file=sys.stderr)
 
@@ -5651,8 +5934,14 @@ class Assembler:
                         help='Write ELF64 relocatable object file (.o)')
         ap.add_argument('-m', dest='elf_machine', type=int, default=62,
                         metavar='MACHINE',
-                        help='ELF e_machine value (default 62=EM_X86_64; '
-                             '183=AArch64, 243=RISC-V, 3=i386, 20=PPC, 40=ARM)')
+                        help='ELF e_machine value (default 62=EM_X86_64). '
+                             'Must be one of the architectures axx has '
+                             'relocation-numbering support for -- see '
+                             'ELF_MACHINES near the top of this file for the '
+                             'full list (currently: 3=i386, 4=M68K, '
+                             '20=PowerPC, 21=PowerPC64, 22=s390x, 40=ARM, '
+                             '42=SuperH, 43=SPARCV9, 62=x86-64, '
+                             '183=AArch64, 243=RISC-V)')
         ap.add_argument('-v', '--verbose', dest='verbose', action='store_true',
                         default=False,
                         help='Verbose: print assembly listing to stdout (default: silent)')
@@ -5711,9 +6000,13 @@ class Assembler:
         self.state.elf_objfile  = args.elf_objfile
 
 
-        if not (0 <= args.elf_machine <= 0xFFFF):
-            print(f" error - -m/--machine value {args.elf_machine} is out of range "
-                  f"(must be 0-65535, ELF e_machine is an unsigned 16-bit field).",
+        if args.elf_machine not in ELF_MACHINES:
+            _known = ', '.join(f"{m} ({ELF_MACHINES[m]['name']})" for m in sorted(ELF_MACHINES))
+            print(f" error - -m/--machine value {args.elf_machine} is not a supported "
+                  f"ELF e_machine number. axx only knows correct relocation-type "
+                  f"numbering for: {_known}. Refusing to guess/fall back to x86_64 "
+                  f"numbering for an unrecognized machine, since that would silently "
+                  f"mislabel every relocation in the output.",
                   file=sys.stderr)
             return False
         self.state.elf_machine  = args.elf_machine
@@ -5974,22 +6267,8 @@ class Assembler:
                         if elf == 1:
                             lentry = self.state.labels.get(i[0], [])
                             if len(lentry) > 4 and lentry[4] is not None:
-                                _RTYPE_REVERSE = {
-                                    1:  'abs64',
-                                    10: 'abs32',
-                                    11: 'abs32s',
-                                    12: 'abs16',
-                                    14: 'abs8',
-                                    2:  'pc32',
-                                    4:  'plt32',
-                                    13: 'pc16',
-                                    15: 'pc8',
-                                    24: 'pc64',
-                                    3:  'got32',
-                                    9:  'gotpcrel',
-                                    27: 'got64',
-                                }
-                                reloc_type_str = _RTYPE_REVERSE.get(lentry[4], '')
+                                _mach_tbl_exp = ELF_MACHINES.get(self.state.elf_machine)
+                                reloc_type_str = _mach_tbl_exp['reverse'].get(lentry[4], '') if _mach_tbl_exp else ''
                                 if reloc_type_str:
                                     reloc_type_str = f'::{reloc_type_str}'
                         
