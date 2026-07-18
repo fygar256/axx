@@ -2400,11 +2400,38 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
     return x;
 }
 
+/* Parse a C-style '\xHH' character literal (1-2 hex digits) at s[idx]
+ * (pointing at the opening quote). Fix (axx.py port): expr_factor1() below
+ * hand-lists a fixed set of '\t'/'\''/'\\'/... escapes plus a generic 3-char
+ * 'x' literal, but had no case for '\xHH' -- so e.g. "MOV '\x41'" (meant to
+ * be equivalent to "MOV 'A'") failed with a syntax error even though it's a
+ * form axx documents/recognizes elsewhere (skip_squote_literal handling in
+ * axx.py; the C comment-stripper here also tolerates a bare backslash before
+ * a quoted-out ';'). Returns 1 and sets *val/*out_idx on success, 0 (idx
+ * unchanged) otherwise so the caller can fall through to other literal forms. */
+static int parse_hex_char_literal(const char *s, int idx, int slen, int *val, int *out_idx){
+    if(!(idx+3<=slen && s[idx]=='\'' && s[idx+1]=='\\' && (s[idx+2]=='x'||s[idx+2]=='X')))
+        return 0;
+    int j = idx+3;
+    int v = 0, ndig = 0;
+    while(j<slen && ndig<2 && is_xdigit_upper(axx_upper_char(s[j]))){
+        char c = axx_upper_char(s[j]);
+        v = v*16 + (is_digit(c) ? c-'0' : c-'A'+10);
+        j++; ndig++;
+    }
+    if(ndig>0 && j<slen && s[j]=='\''){
+        *val=v; *out_idx=j+1; return 1;
+    }
+    return 0;
+}
+
 static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_out){
     AsmState *st=&asmb->st;
     uint256_t x=u256_zero();
     idx=axx_skipspc(s,idx);
     int slen=(int)strlen(s);
+    int _hexlit_val=0, _hexlit_end=idx;
+    int _hexlit_ok = parse_hex_char_literal(s, idx, slen, &_hexlit_val, &_hexlit_end);
 
     if(idx>=slen||s[idx]=='\0'){ *idx_out=idx; return x; }
 
@@ -2432,6 +2459,8 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         if(asmb->st.exp_typ_float) x=double_to_u256(12.0); }
     else if(idx+4<=slen && strncmp(s+idx,"'\\v'",4)==0){ x=u256_from_i64(0x0b); idx+=4;
         if(asmb->st.exp_typ_float) x=double_to_u256(11.0); }
+    else if(_hexlit_ok){ x=u256_from_i64(_hexlit_val); idx=_hexlit_end;
+        if(asmb->st.exp_typ_float) x=double_to_u256((double)_hexlit_val); }
     /* Fix: 3-char 'x' literal: only when s[idx+1] is NOT backslash (so '\x' forms above
      * are not double-consumed). Mirrors axx.py factor1() Fix 3 guard. */
     else if(idx+3<=slen && s[idx]=='\'' && s[idx+1] != '\\' && s[idx+2]=='\''){
@@ -3221,9 +3250,17 @@ static uint256_t expr_expression(Assembler *asmb, const char *s, int idx, int *i
  * ========================================================= */
 static int dir_set_symbol(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".setsym")!=0) return 0;
-    char key[512]; axx_strupr_to(key,e->f[1],sizeof(key));
+    /* Bugfix (axx.py port): readpat()'s field mapping puts a lone
+     * ".setsym::NAME" argument (2 fields) in f[2], not f[1] -- only the
+     * 3-field ".setsym::NAME::value" form uses f[1] for the name (same
+     * quirk dir_clrcheck already accounts for). This used to always read
+     * the name from f[1], so the name-only form stored an empty-string key
+     * and evaluated the name itself as an (undefined-label) expression. */
+    const char *name_field = e->f[1][0] ? e->f[1] : e->f[2];
+    const char *value_field = e->f[1][0] ? e->f[2] : "";
+    char key[512]; axx_strupr_to(key,name_field,sizeof(key));
     int io;
-    uint256_t v = e->f[2][0] ? expr_expression_pat(asmb,e->f[2],0,&io) : u256_zero();
+    uint256_t v = value_field[0] ? expr_expression_pat(asmb,value_field,0,&io) : u256_zero();
     smap_set(&asmb->st.symbols,key,v);
     return 1;
 }
@@ -3343,7 +3380,14 @@ static int dir_epic(Assembler *asmb, PatEntry *e){
  * ========================================================= */
 static int dir_check(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".check") != 0) return 0;
-    const char *var_str = e->f[1];
+    /* Bugfix (axx.py port): same readpat() field-mapping quirk fixed in
+     * dir_set_symbol()/dir_clrcheck() -- a var-only ".check::c" line (2
+     * fields) puts "c" in f[2], not f[1]; only the 3-field
+     * ".check::c::LIST" form uses f[1] for the var and f[2] for the list.
+     * This used to always read the var from f[1], so the list-less form
+     * always hit the "not specified" error below. */
+    const char *var_str  = e->f[1][0] ? e->f[1] : e->f[2];
+    const char *syms_str = e->f[1][0] ? e->f[2] : "";
     if(!var_str[0]){
         fprintf(stderr, " error - .check: variable name is not specified.\n");
         return 1;
@@ -3359,8 +3403,8 @@ static int dir_check(Assembler *asmb, PatEntry *e){
     /* Clear existing constraint for this variable */
     sv_free(&asmb->st.check_constraints[idx]);
     sv_init(&asmb->st.check_constraints[idx]);
-    /* Parse comma-separated symbol names from f[2]; store uppercased */
-    const char *p = e->f[2];
+    /* Parse comma-separated symbol names from syms_str; store uppercased */
+    const char *p = syms_str;
     while(*p){
         while(*p == ' ' || *p == '\t') p++;
         if(!*p) break;
@@ -6912,9 +6956,14 @@ static void setpatsymbols(Assembler *asmb){
         if(!e) continue;
 
         if(strcmp(e->f[0],".setsym")==0){
-            char key[512]; axx_strupr_to(key,e->f[1],sizeof(key));
+            /* Same readpat() 2-field-vs-3-field indexing quirk fixed in
+             * dir_set_symbol() above: a name-only ".setsym::FOO" line puts
+             * "FOO" in f[2], not f[1]. */
+            const char *name_field = e->f[1][0] ? e->f[1] : e->f[2];
+            const char *value_field = e->f[1][0] ? e->f[2] : "";
+            char key[512]; axx_strupr_to(key,name_field,sizeof(key));
             int io;
-            uint256_t v = e->f[2][0] ? expr_expression_pat(asmb,e->f[2],0,&io) : u256_zero();
+            uint256_t v = value_field[0] ? expr_expression_pat(asmb,value_field,0,&io) : u256_zero();
             smap_set(&fresh, key, v);
             continue;
         }

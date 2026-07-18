@@ -416,6 +416,29 @@ class StringUtils:
         return i + 1
 
     @staticmethod
+    def parse_hex_char_literal(s, idx):
+        """Parse a C-style '\\xHH' character literal (1-2 hex digits)
+        starting at idx (pointing at the opening quote). Mirrors the
+        \\x-escape branch of skip_squote_literal() above, which already
+        recognizes this form well enough to not mistake a quoted ';' for a
+        comment -- but ExpressionEvaluator.factor1() had no matching case to
+        actually evaluate one, so e.g. "MOV '\\x41'" (equivalent to "MOV 'A'")
+        failed with a syntax error. Returns (True, value, new_idx) on
+        success, or (False, 0, idx) unchanged if this isn't a well-formed
+        \\x literal, so the caller can fall through to other literal forms."""
+        if not (idx + 3 <= len(s) and s[idx] == "'" and s[idx + 1] == '\\'
+                and s[idx + 2] in 'xX'):
+            return False, 0, idx
+        j = idx + 3
+        hex_digits = ''
+        while j < len(s) and s[j] in '0123456789abcdefABCDEF' and len(hex_digits) < 2:
+            hex_digits += s[j]
+            j += 1
+        if hex_digits and j < len(s) and s[j] == "'":
+            return True, int(hex_digits, 16), j + 1
+        return False, 0, idx
+
+    @staticmethod
     def reduce_spaces(text):
         """Collapse runs of whitespace to a single space."""
         return re.sub(r'\s{2,}', ' ', text)
@@ -1564,6 +1587,8 @@ class ExpressionEvaluator:
         elif idx+4<=len(s) and s[idx:idx+4]=="'\\v'":
             x=0x0b
             idx+=4
+        elif (_hexlit := StringUtils.parse_hex_char_literal(s, idx))[0]:
+            x, idx = _hexlit[1], _hexlit[2]
         elif idx+3<=len(s) and s[idx]=='\'' and s[idx+1] != '\\' and s[idx+2]=='\'':
             x=ord(s[idx+1])
             idx+=3
@@ -2378,13 +2403,29 @@ class DirectiveProcessor:
         if len(i) == 0 or i[0] != '.setsym':
             return False
 
-        if len(i) < 2:
+        # readpat() pads every directive line to a fixed 6-field list, and
+        # for a line with only ONE `::`-separated argument it lands that
+        # argument in i[2], not i[1] (its indexing is built for
+        # pattern-definition lines, whose 2-field form is "mnemonic ::
+        # encoding" with an implicit empty operand-syntax field in between).
+        # So a name-only ".setsym::FOO" is a 2-field line with the name in
+        # i[2]; only the 3-field ".setsym::FOO::value" form puts it in i[1].
+        # Bugfix: this method used to always read the name from i[1] and
+        # always evaluate i[2] as the value expression, so the name-only
+        # form stored an empty-string key and reported "Label undefined"
+        # for the name (misread as a value expression).
+        if i[1]:
+            key = StringUtils.upper(i[1])
+            value_field = i[2]
+        elif i[2]:
+            key = StringUtils.upper(i[2])
+            value_field = ''
+        else:
             print(f" error - .setsym directive requires at least a symbol name", file=sys.stderr)
             return False
 
-        key = StringUtils.upper(i[1])
-        if len(i) > 2:
-            v, idx = self.expr_eval.expression_pat(i[2], 0)
+        if value_field:
+            v, idx = self.expr_eval.expression_pat(value_field, 0)
         else:
             v = 0
         self.state.symbols[key] = v
@@ -2461,14 +2502,21 @@ class DirectiveProcessor:
             self.state.vliwtemplatebits = int(v3)
         except (OverflowError, ValueError):
             print(f" error - .vliw: non-finite parameter value.", file=sys.stderr)
-            return False
+            # Bugfix: this directive line (i[0] == '.vliw') was already
+            # claimed above; returning False here (instead of True, like
+            # every other directive's error path) told the caller's dispatch
+            # chain this line was NOT handled, so it fell through and got
+            # retried as an ordinary instruction pattern against every
+            # subsequent source line for the rest of the assembly --
+            # spamming this error once per source line instead of once.
+            return True
 
 
         _VLIW_INSTBITS_MAX = 8192
         if not (0 <= self.state.vliwinstbits <= _VLIW_INSTBITS_MAX):
             print(f" error - .vliw: vliwinstbits {self.state.vliwinstbits} is out of range "
                   f"(must be 0-{_VLIW_INSTBITS_MAX}).", file=sys.stderr)
-            return False
+            return True
 
         self.state.vliwflag = True
 
@@ -2568,17 +2616,26 @@ class DirectiveProcessor:
         "any symbol", callers consult `state.check_constraints` directly."""
         if len(i) == 0 or i[0] != '.check':
             return False
-        if len(i) < 2 or not i[1].strip():
+        # Same readpat() 2-field-vs-3-field indexing quirk as .setsym (see
+        # its comment above): a var-only ".check::c" line puts "c" in i[2],
+        # not i[1] -- only the 3-field ".check::c::LIST" form puts the var
+        # in i[1]. Bugfix: this method used to always read the var from
+        # i[1], so the list-less form always hit the "not specified" error.
+        if i[1].strip():
+            var_field, syms_field = i[1], i[2]
+        elif i[2].strip():
+            var_field, syms_field = i[2], ''
+        else:
             print(" error - .check: variable name is not specified.", file=sys.stderr)
             return True
-        var = i[1].strip().lower()
+        var = var_field.strip().lower()
         if len(var) != 1 or var not in LOWER:
-            print(f" error - .check: variable should be a lower case letter ('{i[1]}').",
+            print(f" error - .check: variable should be a lower case letter ('{var_field}').",
                   file=sys.stderr)
             return True
         syms = []
-        if len(i) >= 3 and i[2]:
-            syms = [s.strip().upper() for s in i[2].split(',') if s.strip()]
+        if syms_field:
+            syms = [s.strip().upper() for s in syms_field.split(',') if s.strip()]
         self.state.check_constraints[var] = syms
         return True
 
@@ -4637,14 +4694,18 @@ class Assembler:
             if i is None:
                 continue
             if len(i) > 0 and i[0] == '.setsym':
-                if len(i) >= 2:
+                # Same readpat() 2-field-vs-3-field indexing quirk fixed in
+                # DirectiveProcessor.set_symbol(): a name-only ".setsym::FOO"
+                # line puts "FOO" in i[2], not i[1] (only the 3-field
+                # ".setsym::FOO::value" form uses i[1] for the name).
+                if len(i) >= 2 and i[1]:
                     key = StringUtils.upper(i[1])
-                    if len(i) > 2:
-                        self.state.symbols = dict(fresh)
-                        v, _ = self.expr_eval.expression_pat(i[2], 0)
-                    else:
-                        v = 0
+                    self.state.symbols = dict(fresh)
+                    v, _ = self.expr_eval.expression_pat(i[2], 0)
                     fresh[key] = v
+                elif len(i) >= 3 and i[2]:
+                    key = StringUtils.upper(i[2])
+                    fresh[key] = 0
                 continue
             if len(i) > 0 and i[0] == '.clearsym':
                 if len(i) >= 3 and i[2] != '':
@@ -4853,7 +4914,16 @@ class Assembler:
         """Convert a raw global word-pc within section `name` to its word
         offset in the final concatenated section, by walking `_section_word_ranges`
         and accumulating prior fragments' lengths. Returns None if `word_pc`
-        doesn't fall in any recorded fragment of this section."""
+        doesn't fall in any recorded fragment of this section.
+
+        If `.SECTION`/`.SEGMENT` was never used at all this run, `state.sections`
+        stays empty and no fragments were ever recorded -- write_elf_obj's own
+        `not self.state.sections` branch treats that case as one single implicit
+        section starting at word 0, so the raw word_pc already IS the correct
+        section-relative offset; mirror that here instead of returning None
+        (which previously made every DWARF address collapse to 0)."""
+        if not self.state.sections:
+            return word_pc
         cum = 0
         for rs, rl in self._section_word_ranges(name):
             if rs <= word_pc <= rs + rl:
