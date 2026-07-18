@@ -844,9 +844,24 @@ class IEEE754Converter:
                 exponent = 0
                 shift = two ** (1 - BIAS - SIGNIFICAND_BITS)
                 fraction = int(d / shift + Decimal('0.5'))
+                if fraction >= (1 << SIGNIFICAND_BITS):
+                    # Rounded up past the largest subnormal into the
+                    # smallest normal value (2**(1-BIAS)).
+                    exponent = 1
+                    fraction = 0
             else:
                 exponent = biased_exp
                 fraction = int((normalized - 1) * (two ** SIGNIFICAND_BITS) + Decimal('0.5'))
+                if fraction >= (1 << SIGNIFICAND_BITS):
+                    # Mantissa rounded up to 2**SIGNIFICAND_BITS (e.g. a
+                    # value a hair below a power of two): carry into the
+                    # exponent instead of silently wrapping the fraction
+                    # back to 0 while leaving the exponent one power of
+                    # two too low. If this pushes the exponent to
+                    # _MAX_EXP, exponent=_MAX_EXP/fraction=0 is exactly
+                    # the correct infinity encoding.
+                    fraction = 0
+                    exponent += 1
 
             fraction &= (1 << SIGNIFICAND_BITS) - 1
 
@@ -1699,6 +1714,28 @@ class ExpressionEvaluator:
                         if self.state.should_report_errors():
                             print(" error - endbl{}: non-finite float value; using 0.", file=sys.stderr)
                         x = endbl(0)
+        elif idx + 4 <= len(s) and s[idx:idx+4] == 'not(':
+            # not(expr): logical negation, written as a call-like form rather
+            # than a prefix operator so it reads unambiguously in pattern
+            # text. Handled here (factor1(), the base of the precedence
+            # chain) rather than at some higher termN level, so that its
+            # result is just an ordinary atom to every operator above it
+            # (+, -, comparisons, &&, ||, ?:) on EITHER side -- e.g.
+            # "not(0)+5" must mean "(not(0))+5", not "not(0+5)". Bugfix:
+            # this used to live in term8 (between term7 comparisons and
+            # term9 &&), which meant only operators ABOVE term8 (&&, ||,
+            # ternary) got a chance to combine with its result via their own
+            # while-loops; anything BELOW term8 (comparisons, +/-, etc.) is
+            # only ever invoked while parsing a fresh left-hand operand, so
+            # a trailing "+5" after "not(0)" was silently left unconsumed
+            # by the level that used to handle it, and unnoticed here.
+            x, idx = self.expression(s, idx + 4)
+            idx = StringUtils.skipspc(s, idx)
+            if idx < len(s) and s[idx] == ')':
+                idx += 1
+            else:
+                print(" error - missing closing ')' in not(...) expression.", file=sys.stderr)
+            x = 0 if x else 1
         elif self.state.exp_typ=='i' and idx < len(s) and s[idx].isdigit():
                 fs, idx = self.parser.get_intstr(s, idx)
                 x = int(fs)
@@ -1980,14 +2017,16 @@ class ExpressionEvaluator:
         return x, idx
     
     def term8(self, s, idx):
-        """not(expr) : logical negation, written as a call-like form rather
-        than a prefix operator so it reads unambiguously in pattern text."""
-        if idx + 4 <= len(s) and s[idx:idx+4] == 'not(':
-            x, idx = self.expression(s, idx + 3)
-            x = 0 if x else 1
-        else:
-            x, idx = self.term7(s, idx)
-        return x, idx
+        """Placeholder level between term7 (comparisons) and term9 (&&).
+        `not(expr)` used to be special-cased here, but that meant only
+        operators ABOVE this level (&&, ||, ternary) could combine with its
+        result; anything below (comparisons, +/-, etc.) is only ever invoked
+        while parsing a fresh left-hand operand, so e.g. "not(0)+5" silently
+        dropped the "+5". `not(...)` is now handled in factor1() instead,
+        the base of the chain, so its result is an ordinary atom to every
+        operator on either side. See ExpressionEvaluator's class docstring
+        for the term0_0..term11 chain."""
+        return self.term7(s, idx)
 
     def term9(self, s, idx):
         """&& (logical AND)."""
@@ -4367,6 +4406,26 @@ class Assembler:
                 valid_refs = [(ln, aw, wi) for (ln, aw, wi) in self.state._elf_label_refs_seen if wi >= 0]
                 valid_refs.sort(key=lambda r: r[2])
 
+                # Bugfix: the same label can be captured into the same output
+                # word twice (e.g. two pattern variables both bound to the
+                # same source operand, as in a hypothetical "DIFF L,L").
+                # Left unchecked, both identical (label, word_idx) entries
+                # survive the ambiguity filter just below (which only fires
+                # when DIFFERENT labels collide at the same widx) and then
+                # form two separate single-word groups anchored at the same
+                # widx, emitting a duplicate/non-conformant .rela entry at
+                # the same offset. De-duplicate exact (label, widx) repeats
+                # first, keeping only the first occurrence.
+                _seen_ln_wi = set()
+                _deduped_refs = []
+                for _r in valid_refs:
+                    _key = (_r[0], _r[2])
+                    if _key in _seen_ln_wi:
+                        continue
+                    _seen_ln_wi.add(_key)
+                    _deduped_refs.append(_r)
+                valid_refs = _deduped_refs
+
                 # If two different labels were both recorded against the same
                 # word index (e.g. a combined expression like `label1-label2`),
                 # we can't attribute that word to a single relocation target,
@@ -4468,8 +4527,20 @@ class Assembler:
                     # from the field width before using it in the addend formula
                     # below — an unsigned interpretation here would corrupt every
                     # negative displacement's addend.
-                    _field_bits = num_bytes * 8
-                    if 0 < _field_bits < 64 and raw_val >= (1 << (_field_bits - 1)):
+                    #
+                    # Bugfix: this must be the TRUE encoded bit width
+                    # (num_words * state.bts), not the byte-rounded
+                    # num_bytes*8. raw_val was built above using word_mask =
+                    # (1<<state.bts)-1, so for a word size that isn't a
+                    # multiple of 8 (e.g. .bits::11), num_bytes*8 is larger
+                    # than the actual field (16 vs. 11 bits), so raw_val
+                    # (which never exceeds 2**bts-1) could never reach the
+                    # byte-rounded halfway point and negative values were
+                    # never sign-extended -- corrupting the addend by
+                    # exactly 2**bts for every negative pc-relative/relocated
+                    # value on such targets.
+                    _field_bits = num_words * self.state.bts
+                    if _field_bits > 0 and raw_val >= (1 << (_field_bits - 1)):
                         raw_val -= (1 << _field_bits)
 
                     abs_w_bytes = int(abs_w) * bpw_r
@@ -4551,7 +4622,16 @@ class Assembler:
         once up front, building `state.patsymbols` — the symbol-table baseline
         that `lineassemble` resets `state.symbols` to before each source line
         (mid-file `.setsym`/`.clearsym` encountered during actual matching can
-        still further adjust it for subsequent lines within the same pass)."""
+        still further adjust it for subsequent lines within the same pass).
+
+        Also applies a `.bits` directive as soon as it's seen, the same way,
+        so `state.bts`/`state.endian` already reflect the pattern file's real
+        word width by the time `run()` processes a `-i` label-import file
+        (which happens right after this call, before any source line is
+        assembled) — `.bits` is normally only applied lazily while scanning
+        `state.pat` during actual line assembly (see `lineassemble2`), which
+        would otherwise leave `state.bts` at its default (8) during import,
+        corrupting the bytes-per-word conversion `imp_label()` needs."""
         fresh = {}
         for i in pat:
             if i is None:
@@ -4573,6 +4653,9 @@ class Assembler:
                 else:
                     fresh = {}
                 continue
+            if len(i) > 0 and i[0] == '.bits':
+                self.directive_proc.bits(i)
+                continue
         self.state.patsymbols = fresh
         self.state.symbols = dict(fresh)
     
@@ -4586,6 +4669,7 @@ class Assembler:
         _MAX_INCLUDE_DEPTH = 100
         if len(self.state.fnstack) >= _MAX_INCLUDE_DEPTH:
             print(f" error - .INCLUDE nesting depth exceeds {_MAX_INCLUDE_DEPTH}: '{fn}'", file=sys.stderr)
+            self.state.had_error = True
             return
         try:
             abs_fn = os.path.abspath(fn) if fn not in ("stdin", "") else fn
@@ -4598,9 +4682,21 @@ class Assembler:
                 already_abs = already
             if abs_fn == already_abs:
                 print(f" error - circular .INCLUDE detected: '{fn}' is already being assembled.", file=sys.stderr)
+                self.state.had_error = True
                 return
 
-        self.state.fnstack.append(self.state.current_file)
+        # Bugfix: push `fn` itself (the file about to be entered), not the
+        # caller's current_file. fnstack must contain the exact stack of
+        # files currently open so the cycle check above can see a file that
+        # re-includes ITSELF directly (`.INCLUDE` of its own name): pushing
+        # the caller's file instead left `fn` absent from fnstack for its
+        # first (direct) re-entry, so a self-including file got assembled
+        # twice -- duplicating its emitted bytes at wrong addresses -- before
+        # the cycle was finally caught one level deeper. current_file/ln are
+        # restored from locals in `finally` instead, decoupling that concern
+        # from the cycle-detection stack.
+        _caller_file = self.state.current_file
+        self.state.fnstack.append(fn)
         self.state.lnstack.append(self.state.ln)
         self.state.current_file = fn
         self.state.ln = 1
@@ -4615,15 +4711,16 @@ class Assembler:
                     with open(self.state.stdin_tmp_path, "wt", encoding="utf-8") as stdintmp:
                         stdintmp.write(af)
                 fn = self.state.stdin_tmp_path
-            
+
 
             with open(fn, "rt", encoding="utf-8") as f:
                 af = f.readlines()
-            
+
             for i in af:
                 self.lineassemble0(i)
         finally:
-            self.state.current_file = self.state.fnstack.pop()
+            self.state.fnstack.pop()
+            self.state.current_file = _caller_file
             self.state.ln = self.state.lnstack.pop()
     
     def file_input_from_stdin(self):
@@ -4704,7 +4801,27 @@ class Assembler:
                         break
                 if _found:
                     break
-            entry = [v, section, False, True]
+
+            # Bugfix: `_write_export()` (see `_write_export`'s `lbl_addr`
+            # computation) writes non-.EQU label addresses in BYTES
+            # (word_value * bpw), matching the ELF st_value convention. But
+            # `state.labels[k][0]` is used everywhere else in this file
+            # (ELF st_value, DWARF addresses, $$/$. pc-relative math, ...)
+            # as a raw WORD pc, which those consumers themselves multiply by
+            # bpw as needed. Storing the byte-scaled `v` here directly,
+            # unconverted, double-counted bpw for every reference to an
+            # imported label whenever bpw != 1 (state.bts not a multiple of
+            # 8) -- e.g. a label imported at byte offset 4 on a 16-bit-word
+            # target (bpw=2) was silently treated as word offset 4 (byte 8)
+            # instead of the correct word offset 2. Section-membership
+            # comparisons above intentionally still use the byte-scaled `v`
+            # against `_imp_sections`' byte-scaled ranges (both exported by
+            # the same `_write_export()`, so they're mutually consistent);
+            # only the value finally stored needs converting back to words.
+            bpw = max(1, (self.state.bts + 7) // 8)
+            v_words = v // bpw
+
+            entry = [v_words, section, False, True]
             if reloc_type is not None:
                 entry.append(reloc_type)
             self.state.labels[label] = entry

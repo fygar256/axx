@@ -2637,6 +2637,28 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             x=u256_from_u64(bits);
         }
     }
+    else if(idx+4<=slen && axx_q(s,slen,"not(",idx)){
+        /* not(expr): logical negation, written as a call-like form rather
+         * than a prefix operator so it reads unambiguously in pattern text.
+         * Bugfix (mirrors the identical fix applied to axx.py
+         * ExpressionEvaluator.factor1()/term8()): this used to be handled
+         * in expr_term8() (between expr_term7 comparisons and expr_term9
+         * &&), calling expr_expression() starting at the '(' itself. That
+         * re-entered the ENTIRE term-chain, so after the matching ')' was
+         * consumed, the surrounding term7/term9/term10/term11 layers of
+         * that SAME re-entrant call kept consuming any trailing operator
+         * (+, -, comparisons, &&, ||, ?:) as if it were still part of
+         * not()'s argument -- e.g. "not(0)+5" evaluated as "not(0+5)".
+         * Handling it here instead (expr_factor1, the base of the
+         * precedence chain) makes its result an ordinary atom to every
+         * operator above it on EITHER side, exactly like the plain '('
+         * grouping case just above. */
+        x=expr_expression(asmb,s,idx+4,&idx);
+        idx=axx_skipspc(s,idx);
+        if(idx<slen && s[idx]==')') idx++;
+        else fprintf(stderr," error - missing closing ')' in not(...) expression.\n");
+        x=u256_from_i64(u256_is_zero(x)?1:0);
+    }
     /* Float-mode number literal: parsed by axx_get_floatstr() as a double.
      * This branch is checked BEFORE the integer branch so that "3.14" is
      * consumed as a float literal when exp_typ_float == 1.
@@ -2967,13 +2989,15 @@ static uint256_t expr_term7(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
+/* Placeholder level between expr_term7 (comparisons) and expr_term9 (&&).
+ * `not(expr)` used to be special-cased here, but that meant only operators
+ * ABOVE this level (&&, ||, ternary) could combine with its result; anything
+ * below (comparisons, +/-, etc.) is only ever invoked while parsing a fresh
+ * left-hand operand, so e.g. "not(0)+5" silently dropped the "+5". `not(...)`
+ * is now handled in expr_factor1() instead, the base of the chain, so its
+ * result is an ordinary atom to every operator on either side. Mirrors the
+ * identical fix applied to axx.py ExpressionEvaluator.term8(). */
 static uint256_t expr_term8(Assembler *asmb, const char *s, int idx, int *idx_out){
-    int slen=(int)strlen(s);
-    if(idx+4<=slen && axx_q(s,slen,"not(",idx)){
-        uint256_t x=expr_expression(asmb,s,idx+3,&idx);
-        *idx_out=idx;
-        return u256_from_i64(u256_is_zero(x)?1:0);
-    }
     return expr_term7(asmb,s,idx,idx_out);
 }
 
@@ -5699,6 +5723,31 @@ static int lineassemble(Assembler *asmb, const char *line_in){
             /* sort by word_idx – use file-scope elf_ref_cmp (branchless, standard C) */
             qsort(_valid, (size_t)_nvalid, sizeof(ElfRef), elf_ref_cmp);
 
+            /* Bugfix (axx.py port): the same label can be captured into the
+             * same output word twice (e.g. two pattern variables both bound
+             * to the same source operand, as in a hypothetical "DIFF L,L").
+             * Left unchecked, both identical (name, word_idx) entries survive
+             * here and the grouping loop below -- which only extends a group
+             * when the NEXT entry's word_idx is exactly one past the
+             * previous -- ends up forming two separate single-word groups
+             * both anchored at the same word_idx, emitting a duplicate/
+             * non-conformant .rela entry at the same offset. De-duplicate
+             * exact (name, word_idx) repeats first, keeping only the first
+             * occurrence (array is already sorted by word_idx, so repeats
+             * for the same label are adjacent). */
+            {
+                int _w2 = 0;
+                for(int _r2 = 0; _r2 < _nvalid; _r2++){
+                    if(_w2 > 0
+                       && _valid[_r2].word_idx == _valid[_w2-1].word_idx
+                       && strcmp(_valid[_r2].name, _valid[_w2-1].name) == 0)
+                        continue;
+                    if(_w2 != _r2) _valid[_w2] = _valid[_r2];
+                    _w2++;
+                }
+                _nvalid = _w2;
+            }
+
             /* group consecutive same-label refs into one relocation entry */
             int _gi = 0;
             while(_gi < _nvalid){
@@ -5798,17 +5847,43 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                      * 減算しておけば、後続のint64_tへのキャストで正しく
                      * 符号付き値として解釈される。 */
                     {
-                        int _field_bits = _nbytes * 8;
+                        /* Bugfix (axx.py port): this must be the TRUE encoded
+                         * bit width (_nwords * _bts), not the byte-rounded
+                         * _nbytes*8. _raw_val was built above using _wmask =
+                         * (1<<_bts)-1, so for a word size that isn't a
+                         * multiple of 8 (e.g. .bits::11), _nbytes*8 is larger
+                         * than the actual field (16 vs. 11 bits); _raw_val
+                         * (which never exceeds 2**_bts-1) could then never
+                         * reach the byte-rounded halfway point, so negative
+                         * values were never sign-extended -- corrupting the
+                         * addend by exactly 2**_bts for every negative
+                         * pc-relative/relocated value on such targets.
+                         * Mirrors the identical fix applied to axx.py
+                         * lineassemble(): _field_bits = num_words*state.bts. */
+                        int _field_bits = _nwords * _bts;
                         if(_field_bits > 0 && _field_bits < 64
                            && _raw_val >= ((uint64_t)1 << (_field_bits - 1))){
                             _raw_val -= ((uint64_t)1 << _field_bits);
                         }
                     }
+                    /* Bugfix (axx.py port): abs_w must be converted to BYTE
+                     * units (abs_w * bpw) before comparing/subtracting
+                     * against _raw_val (which is already a byte-field
+                     * value once bts spans more than one byte's worth of
+                     * addressing). `_valid[_gi].val` is the label's raw
+                     * stored value in WORDS (mirrors axx.py's `abs_w`), so
+                     * for any target where bpw != 1 (bts > 8), comparing/
+                     * subtracting it directly against _raw_val without this
+                     * scaling silently produced wrong results. This was
+                     * masked in all prior byte-addressable (bts==8, bpw==1)
+                     * test cases, where scaling by 1 is a no-op. */
+                    int64_t _abs_w_bytes = (int64_t)_valid[_gi].val * (int64_t)bpw;
+
                     /* 破綻点修正 (axx.py port): _rtype がreloc_type明示指定なしに
                      * バイト幅だけから推測された場合(_rtype_is_default_guess)、
                      * その推測がたまたまPC相対型に landing しても、実際に
                      * エンコードされた値(_raw_val)がラベルの絶対アドレス
-                     * そのもの(_valid[_gi].val)と厳密に一致するなら、それは
+                     * そのもの(_abs_w_bytes)と厳密に一致するなら、それは
                      * 減算を伴わない絶対参照(例: "DD label")であることの
                      * 明確な証拠になる。真にPC相対な参照(call/jmp rel32等)
                      * ではraw_valが絶対アドレスとぴったり一致することは
@@ -5819,21 +5894,33 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                        && st->elf_machine != 3 && st->elf_machine != 40
                        && st->elf_machine != 183 && st->elf_machine != 20
                        && st->elf_machine != 243
-                       && _raw_val == (uint64_t)_valid[_gi].val){
+                       && (int64_t)_raw_val == _abs_w_bytes){
                         _rtype = 10; /* R_X86_64_32: absolute 32-bit */
                     }
 
-                    /* addend の計算:
-                     * ELF PC相対リロケーション (PC32/PLT32等) では、リンカが
-                     * フィールドに S+A-P を書き込む。実行時に CPU は
-                     * rip(=P+num_bytes) + field を計算するので
-                     * target = S+A+num_bytes。target=S にするには A=-num_bytes。
+                    /* addend の計算 (axx.py port bugfix):
+                     * 旧コードはPC相対の場合を「フィールド = ターゲット -
+                     * (命令アドレス+フィールドサイズ)」という特定の規約
+                     * (x86のCALL/JMP rel32のような、命令末尾基準の相対
+                     * アドレシング)に固定的に決め打ちし、addend=-num_bytes
+                     * という定数式を使っていた。axxは任意のISA(Z80のJR等、
+                     * 命令先頭基準で相対値を計算するパターンも含む)を
+                     * パターンファイルだけでターゲットにできる汎用アセンブラ
+                     * であり、この決め打ちはパターンが実際に採用している
+                     * $$規約と食い違う場合(例: "JMP !d :: (d-$$)"のように
+                     * 命令先頭基準の場合)、addendを誤って計算していた
+                     * (x86のCALL rel32のような命令末尾基準の規約とたまたま
+                     * 一致するケースでしか正しい値にならなかった)。
                      *
-                     * これは pattern が *(s-$$-5,%%) でも *(s-$$,%%) でも同じ。
-                     * パターン内の補正値は raw_val に吸収されるが addend には無関係。
-                     *
-                     * 絶対リロケーション (ABS64/ABS32等) ではリンカが S+A を書く。
-                     * target = S+A = assembled_sym+offset なので A = raw_val - abs_w。 */
+                     * axx.pyのlineassemble()と同じ、raw_val・ラベルの絶対値・
+                     * 命令自身のアドレス(P)から汎用的に再構成する式に統一する:
+                     *   PC相対: addend = raw_val - abs_w_bytes + P
+                     *   絶対  : addend = raw_val - abs_w_bytes
+                     * Pは「このリロケーション参照が実際に埋め込まれている
+                     * ワードのセクション相対バイトアドレス」であり、これは
+                     * 数バイト下で r_offset として使っている _sec_rel と
+                     * 全く同じ値(同じ pc+_widx から計算される)なので、
+                     * そのまま再利用する。 */
                     int64_t _addend;
                     {
                     /* PC相対リロケーション型はアーキテクチャ別に定義する。
@@ -5872,9 +5959,9 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         }
                     }
                         if(_is_pcrel)
-                            _addend = -(int64_t)_nbytes;
+                            _addend = (int64_t)_raw_val - _abs_w_bytes + _sec_rel;
                         else
-                            _addend = (int64_t)_raw_val - (int64_t)_valid[_gi].val;
+                            _addend = (int64_t)_raw_val - _abs_w_bytes;
                     }
                     if(st->reloc_count >= st->reloc_cap){
                         st->reloc_cap = st->reloc_cap ? st->reloc_cap*2 : 16;
@@ -6705,6 +6792,7 @@ static void fileassemble(Assembler *asmb, const char *fn){
             int is_stdin_already = (strcmp(already,"stdin")==0 || strcmp(already,"(stdin)")==0);
             if(is_stdin_fn && is_stdin_already){
                 fprintf(stderr," error - circular .INCLUDE detected: '%s' is already being assembled.\n", fn);
+                st->had_error=1;
                 return;
             }
             if(!is_stdin_fn && !is_stdin_already){
@@ -6713,16 +6801,30 @@ static void fileassemble(Assembler *asmb, const char *fn){
                 if(realpath(fn,   abs_fn) && realpath(already, abs_al)
                    && strcmp(abs_fn, abs_al)==0){
                     fprintf(stderr," error - circular .INCLUDE detected: '%s' is already being assembled.\n", fn);
+                    st->had_error=1;
                     return;
                 }
             }
         }
     }
 
-    /* Fix C-10: push is always unconditional; pop must therefore also be
-     * unconditional.  Save fn locally so we can replace it with the temp
-     * path for stdin without altering the caller's string. */
-    sv_push(&st->fnstack, st->current_file);
+    /* Bugfix (axx.py port): push `fn` itself (the file about to be entered)
+     * onto fnstack, not the caller's current_file. fnstack must contain the
+     * exact stack of files currently open so the cycle check above can see
+     * a file that re-includes ITSELF directly (`.INCLUDE` of its own name):
+     * pushing the caller's file instead left `fn` absent from fnstack for
+     * its first (direct) re-entry, so a self-including file got assembled
+     * twice -- duplicating its emitted bytes at wrong addresses -- before
+     * the cycle was finally caught one level deeper. current_file is saved
+     * in a local and restored from there in `done:` below instead, so
+     * fnstack purely tracks "files currently open" for cycle detection.
+     *
+     * Fix C-10 (still applies): push is always unconditional; pop must
+     * therefore also be unconditional. */
+    char _caller_file[512];
+    strncpy(_caller_file, st->current_file, sizeof(_caller_file)-1);
+    _caller_file[sizeof(_caller_file)-1] = '\0';
+    sv_push(&st->fnstack, fn);
     is_push(&st->lnstack, st->ln);
     strncpy(st->current_file,fn,sizeof(st->current_file)-1);
     st->ln=1;
@@ -6775,9 +6877,14 @@ done:
     free(stdin_buf);
     /* Fix C-10: pop unconditionally to mirror the unconditional push above.
      * The original guarded the pop with (fnstack.len>0) which could silently
-     * leave current_file/ln unrestored if the stack was somehow empty. */
-    strncpy(st->current_file, st->fnstack.data[st->fnstack.len-1],
-            sizeof(st->current_file)-1);
+     * leave current_file/ln unrestored if the stack was somehow empty.
+     * Bugfix (axx.py port): restore current_file from `_caller_file` (saved
+     * before the push above), not from fnstack's top -- fnstack now holds
+     * `fn` itself (needed so the cycle check above can see direct
+     * self-includes), not the caller's file, so reading it here would
+     * incorrectly "restore" current_file back to `fn`. */
+    strncpy(st->current_file, _caller_file, sizeof(st->current_file)-1);
+    st->current_file[sizeof(st->current_file)-1] = '\0';
     sv_pop(&st->fnstack);
     st->ln = is_pop(&st->lnstack);
 }
@@ -6818,6 +6925,19 @@ static void setpatsymbols(Assembler *asmb){
             } else {
                 smap_clear(&fresh);
             }
+            continue;
+        }
+        /* Bugfix (axx.py port): apply `.bits` as soon as it's seen here, the
+         * same way, so `st->bts`/`st->endian_big` already reflect the
+         * pattern file's real word width by the time `main()` processes a
+         * `-i` label-import file (which happens right after this call,
+         * before any source line is assembled). `.bits` is normally only
+         * applied lazily while scanning `st->pat` during actual line
+         * assembly (inside lineassemble2()'s directive dispatch), which
+         * would otherwise leave st->bts at its default (8) during import,
+         * corrupting the bytes-per-word conversion imp_label() needs. */
+        if(strcmp(e->f[0],".bits")==0){
+            dir_bits(asmb, e);
             continue;
         }
     }
@@ -6943,6 +7063,25 @@ static int imp_label(Assembler *asmb, const char *l){
          * self.state.labels[label] = [v, section, False, True] と直接
          * 代入しis_imported=Trueにしている)。.EXTERN と同じ経路である
          * lmap_set_imported() を使い、is_imported=1 として登録する。 */
+        /* Bugfix (axx.py port): WRITE_EXPORT writes non-.EQU label addresses
+         * in BYTES (word_value * bpw, matching the ELF st_value convention;
+         * see the WRITE_EXPORT macro's byte_start/lbl_addr computation).
+         * But every other consumer of a label's stored value (ELF st_value,
+         * DWARF addresses, $$/$. pc-relative math, ...) treats it as a raw
+         * WORD pc and multiplies by bpw itself. Storing `v` here unconverted
+         * double-counted bpw for every reference to an imported label
+         * whenever bpw != 1 (st->bts not a multiple of 8) -- e.g. a label
+         * imported at byte offset 4 on a 16-bit-word target (bpw=2) was
+         * silently treated as word offset 4 (byte 8) instead of the correct
+         * word offset 2. The section-membership lookup just above
+         * intentionally still compares the byte-scaled `v` against
+         * imp_sections' byte-scaled ranges (both written by the same
+         * WRITE_EXPORT, so mutually consistent); only the value finally
+         * stored needs converting back to words. */
+        {
+            int _bpw = (asmb->st.bts+7)/8; if(_bpw<1) _bpw=1;
+            v /= (uint64_t)_bpw;
+        }
         lmap_set_imported(&asmb->st.labels, label, u256_from_u64(v), section, reloc_type);
         return 1;
     }
