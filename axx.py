@@ -28,12 +28,13 @@ account for the other sections interleaved before it.
 """
 
 
-from decimal import Decimal, getcontext, localcontext
+from decimal import Decimal, localcontext
 try:
-    import readline
+    import readline  # noqa: F401  (side effect: line editing for input())
 except ImportError:
     pass
 import ast
+import functools
 import itertools
 import struct
 import sys
@@ -83,6 +84,7 @@ _UNDEF_DERIVED_THRESHOLD = 1 << 768
 _UNDEF_SANE_CEILING = 1 << 256
 _undef_ceiling_warned = False
 
+
 def _is_undef_derived(v):
     """True if v is UNDEF itself, or so large it must have propagated from
     an UNDEF value through arithmetic (e.g. UNDEF - 4). Warns once (not per
@@ -101,6 +103,25 @@ def _is_undef_derived(v):
                   file=sys.stderr)
         return av >= _UNDEF_DERIVED_THRESHOLD
     return False
+
+
+@functools.lru_cache(maxsize=None)
+def _lead_caps(pat_text):
+    """Cheap prefilter: extract a pattern's leading run of literal capital
+    letters (skipping spaces) so obviously-mismatched patterns can be
+    skipped before paying for full match0() (which is combinatorial in
+    the number of optional groups). Pattern text is immutable once the
+    pattern file is read, so results are memoized."""
+    p = []
+    for ch in pat_text:
+        if ch in CAPITAL:
+            p.append(ch)
+        elif ch == ' ':
+            continue
+        else:
+            break
+    return ''.join(p)
+
 
 CAPITAL = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 LOWER = "abcdefghijklmnopqrstuvwxyz"
@@ -393,6 +414,13 @@ class ElfState:
         self.gen_debug: bool = False  # -g flag: also emit DWARF line-number info
         self.line_map: list = []
 
+        # {encoded-field-byte-width: reloc type}, set from the source file's
+        # `.reloctype` directive. Overrides ELF_MACHINES[machine]['width_guess']
+        # on a per-width basis for auto-detected (no explicit ::reloctype)
+        # label references; see AssemblyDirectiveProcessor.reloctype_processing
+        # and its use at the width_guess lookup in ObjectGenerator.makeobj().
+        self.reloctype_override: dict = {}
+
 
 class RelaxationState:
     """State specific to the Pass 1 relaxation loop, which re-assembles the
@@ -579,6 +607,7 @@ class AssemblerState:
         '_elf_capturing_var':     ('elf', 'capturing_var'),
         'gen_debug':              ('elf', 'gen_debug'),
         'line_map':               ('elf', 'line_map'),
+        'reloctype_override':     ('elf', 'reloctype_override'),
     }
     # Build one `property` per entry in _FORWARDED_ATTRS and inject it into
     # this class body (this loop runs once, at class-definition time, not
@@ -590,6 +619,7 @@ class AssemblerState:
         def _make_forward(_sub_name=_sub_name, _sub_attr=_sub_attr):
             def _getter(self):
                 return getattr(getattr(self, _sub_name), _sub_attr)
+
             def _setter(self, value):
                 setattr(getattr(self, _sub_name), _sub_attr, value)
             return property(_getter, _setter)
@@ -604,16 +634,20 @@ class StringUtils:
     source-file tokenizers. Static methods only: none of this depends on
     assembler state."""
 
+    # a-z -> A-Z only; str.upper() would also touch non-ASCII (e.g. 'ß'->'SS'),
+    # which this deliberately does not.
+    _ASCII_UPPER = str.maketrans(LOWER, CAPITAL)
+
     @staticmethod
     def upper(s):
         """Uppercase only ASCII lowercase letters, leaving everything else
         (digits, punctuation, non-ASCII) untouched."""
-        return ''.join(c.upper() if c in LOWER else c for c in s)
+        return s.translate(StringUtils._ASCII_UPPER)
 
     @staticmethod
     def q(s, t, idx):
         """Case-insensitive "does s at idx start with t" check."""
-        return StringUtils.upper(s[idx:idx+len(t)]) == StringUtils.upper(t)
+        return StringUtils.upper(s[idx:idx + len(t)]) == StringUtils.upper(t)
 
     @staticmethod
     def skipspc(s, idx):
@@ -668,10 +702,12 @@ class StringUtils:
             return True, int(hex_digits, 16), j + 1
         return False, 0, idx
 
+    _SPACE_RUNS = re.compile(r'\s{2,}')
+
     @staticmethod
     def reduce_spaces(text):
         """Collapse runs of whitespace to a single space."""
-        return re.sub(r'\s{2,}', ' ', text)
+        return StringUtils._SPACE_RUNS.sub(' ', text)
 
     @staticmethod
     def remove_comment(l):
@@ -679,7 +715,7 @@ class StringUtils:
         marker matters here, the rest of the line is discarded)."""
         idx = 0
         while idx < len(l):
-            if l[idx:idx+2] == '/*':
+            if l[idx:idx + 2] == '/*':
                 return "" if idx == 0 else l[0:idx]
             idx += 1
         return l
@@ -715,7 +751,7 @@ class StringUtils:
         if in_dquote:
             print(f" warning - unterminated string literal in line: {l!r}", file=sys.stderr)
         return l.rstrip()
-    
+
     @staticmethod
     def get_param_to_spc(s, idx):
         """Read one whitespace-delimited token, stopping early at a "!!"
@@ -723,7 +759,7 @@ class StringUtils:
         slot's content."""
         t = ""
         idx = StringUtils.skipspc(s, idx)
-        while idx < len(s) and s[idx] != ' ' and s[idx:idx+2] != '!!':
+        while idx < len(s) and s[idx] != ' ' and s[idx:idx + 2] != '!!':
             t += s[idx]
             idx += 1
         return t, idx
@@ -734,7 +770,7 @@ class StringUtils:
         VLIW slot separator."""
         t = ""
         idx = StringUtils.skipspc(s, idx)
-        while idx < len(s) and s[idx:idx+2] != '!!':
+        while idx < len(s) and s[idx:idx + 2] != '!!':
             t += s[idx]
             idx += 1
         return t, idx
@@ -783,7 +819,6 @@ class StringUtils:
                     else:
                         s += 'x'
                 elif next_char in 'uU':
-
 
                     _ndigits = 4 if next_char == 'u' else 8
                     idx += 2
@@ -836,11 +871,11 @@ class Parser:
         Backtracks to just the mantissa if an 'e'/'E' isn't followed by any
         exponent digits, so "2e" parses as "2" rather than consuming a
         dangling exponent marker."""
-        if s[idx:idx+4] == '-inf':
+        if s[idx:idx + 4] == '-inf':
             return '-inf', idx + 4
-        elif s[idx:idx+3] == 'inf':
+        elif s[idx:idx + 3] == 'inf':
             return 'inf', idx + 3
-        elif s[idx:idx+3] == 'nan':
+        elif s[idx:idx + 3] == 'nan':
             return 'nan', idx + 3
         else:
             fs = ''
@@ -864,11 +899,11 @@ class Parser:
                     idx = saved_idx
             return fs, idx
 
-    def isfloatstr(self,s,idx):
+    def isfloatstr(self, s, idx):
         """Whether a float literal starts at idx, without consuming it."""
-        sidx=idx
-        v,idx = self.get_floatstr(s,idx)
-        if idx==sidx:
+        sidx = idx
+        v, idx = self.get_floatstr(s, idx)
+        if idx == sidx:
             return False
         else:
             return True
@@ -886,7 +921,6 @@ class Parser:
         if idx < len(s) and s[idx] == '{':
             idx += 1
             idx = StringUtils.skipspc(s, idx)
-            start_idx = idx
             while idx < len(s) and s[idx] != '}':
                 t += s[idx]
                 idx += 1
@@ -911,7 +945,7 @@ class Parser:
                 t += s[idx]
                 idx += 1
         return StringUtils.upper(t), idx
-    
+
     def get_label_word(self, s, idx):
         """Read a label/directive name (case preserved, unlike symbols),
         using state.lwordchars, and additionally consume a trailing ':' that
@@ -941,13 +975,14 @@ class Parser:
 
         s = ""
         while idx < len(l):
-            if l[idx:idx+2] == '::':
+            if l[idx:idx + 2] == '::':
                 idx += 2
                 break
             else:
                 s += l[idx]
                 idx += 1
         return s.rstrip(' \t'), idx
+
 
 def enfloat(a):
     """Reinterpret a's low 32 bits as an IEEE-754 single-precision float
@@ -958,6 +993,7 @@ def enfloat(a):
         float_value = 0.0
     return float_value
 
+
 def endouble(a):
     """Reinterpret a's low 64 bits as an IEEE-754 double."""
     try:
@@ -966,8 +1002,10 @@ def endouble(a):
         double_value = 0.0
     return double_value
 
+
 enflt = enfloat
 endbl = endouble
+
 
 class IEEE754Converter:
     """Converts a decimal string (or 'inf'/'-inf'/'nan') to its IEEE-754 bit
@@ -1015,7 +1053,7 @@ class IEEE754Converter:
         except (struct.error, OverflowError) as _e:
             raise ValueError(f"decimal_to_ieee754_64bit_hex: cannot pack {fval!r}") from _e
         return f"0x{bits:016X}"
-    
+
     @staticmethod
     def decimal_to_ieee754_128bit_hex(a):
         with localcontext() as _ctx:
@@ -1148,7 +1186,7 @@ class IEEE754Converter:
                 i += 1
                 i = skip(s, i)
             for kw, dval in (('inf', Decimal('Infinity')), ('nan', Decimal('NaN'))):
-                if s[i:i+len(kw)] == kw:
+                if s[i:i + len(kw)] == kw:
                     v = -dval if neg else dval
                     return v, i + len(kw)
             if i >= len(s) or s[i] not in '0123456789.':
@@ -1199,12 +1237,12 @@ class IEEE754Converter:
                 if i < len(s) and s[i] == '*':
                     t, i = parse_factor(s, i + 1)
                     v *= t
-                elif i + 1 < len(s) and s[i] == '/' and s[i+1] == '/':
+                elif i + 1 < len(s) and s[i] == '/' and s[i + 1] == '/':
                     t, i = parse_factor(s, i + 2)
                     if t == 0:
                         raise ZeroDivisionError("floor division by zero in qad{}")
                     v = Decimal(int(v // t))
-                elif i < len(s) and s[i] == '/' and (i + 1 >= len(s) or s[i+1] != '/'):
+                elif i < len(s) and s[i] == '/' and (i + 1 >= len(s) or s[i + 1] != '/'):
                     t, i = parse_factor(s, i + 1)
                     if t == 0:
                         raise ZeroDivisionError("division by zero in qad{}")
@@ -1269,6 +1307,7 @@ class VariableManager:
                     self.state.vars[c - ord('A')] = int(v)
                 except (OverflowError, ValueError):
                     self.state.vars[c - ord('A')] = v
+
 
 class LabelManager:
     """Owns state.labels: name -> [value, section, is_equ, is_imported,
@@ -1414,7 +1453,7 @@ class LabelManager:
                 if not old_is_imported:
                     self.state.error_label_conflict = True
                     self.state.had_error = True
-                    print(f" error - label already defined.", file=sys.stderr)
+                    print(" error - label already defined.", file=sys.stderr)
                     return False
         elif self.state.pas == 2:
             if k not in self.state.labels:
@@ -1458,7 +1497,8 @@ class LabelManager:
             result[key] = [num_str, section]
         for k, v in sorted(result.items()):
             print(f"  {k:40s}  {v[0]}  ({v[1]})", file=sys.stderr)
-        
+
+
 class SymbolManager:
     """Owns state.symbols: the pattern file's .setsym-defined symbols
     (register names, etc.), looked up case-insensitively (unlike labels)."""
@@ -1516,13 +1556,13 @@ class ExpressionEvaluator:
         idx = StringUtils.skipspc(s, idx)
         x = 0
 
-        if idx + 4 <= len(s) and s[idx:idx+4] == '!!!!' and self.state.expmode == EXP_PAT:
+        if idx + 4 <= len(s) and s[idx:idx + 4] == '!!!!' and self.state.expmode == EXP_PAT:
             # End-of-VLIW-packet marker, valid only inside a pattern's own
             # encoding expression (EXP_PAT): whether this packet was closed
             # with "!!!!" (state.vliwstop, set by VLIWProcessor).
             x = self.state.vliwstop
             idx += 4
-        elif idx + 3 <= len(s) and s[idx:idx+3] == '!!!' and self.state.expmode == EXP_PAT:
+        elif idx + 3 <= len(s) and s[idx:idx + 3] == '!!!' and self.state.expmode == EXP_PAT:
             # "!!!" evaluates to the current VLIW slot count (state.vcnt),
             # also pattern-file-only.
             x = self.state.vcnt
@@ -1546,7 +1586,7 @@ class ExpressionEvaluator:
                 x = ~int(x)
             except (OverflowError, ValueError):
                 if self.state.should_report_errors():
-                    print(f" error - cannot apply bitwise NOT (~) to non-finite float value.", file=sys.stderr)
+                    print(" error - cannot apply bitwise NOT (~) to non-finite float value.", file=sys.stderr)
                 x = 0
         elif idx < len(s) and s[idx] == '@':
             try:
@@ -1561,12 +1601,12 @@ class ExpressionEvaluator:
             # (0=least-significant) from `value`, used by patterns that need
             # to split a multi-byte computed value across several encoded
             # bytes.
-            if idx+1<len(s) and s[idx+1] == '(':
-                x, idx = self.expression(s,idx+2)
-                if idx<len(s) and s[idx] == ',':
-                    x2,idx = self.expression(s,idx+1)
-                    if idx<len(s) and s[idx] == ')':
-                        idx+=1
+            if idx + 1 < len(s) and s[idx + 1] == '(':
+                x, idx = self.expression(s, idx + 2)
+                if idx < len(s) and s[idx] == ',':
+                    x2, idx = self.expression(s, idx + 1)
+                    if idx < len(s) and s[idx] == ')':
+                        idx += 1
                         try:
                             shift_amount = int(x2) * 8
                         except (OverflowError, ValueError):
@@ -1582,10 +1622,10 @@ class ExpressionEvaluator:
                                 x = x >> shift_amount
                     else:
                         print(" error - missing ')' in *(expr, expr) expression.", file=sys.stderr)
-                        x=0
+                        x = 0
                 else:
                     print(" error - missing ',' in *(expr, expr) expression.", file=sys.stderr)
-                    x=0
+                    x = 0
             else:
                 print(" error - expected '(' after '*' in *(expr,expr) expression.", file=sys.stderr)
         else:
@@ -1597,7 +1637,7 @@ class ExpressionEvaluator:
                     and not self.state._in_match_attempt
                     and (self.state.should_report_errors())):
                 print(f" warning - unrecognized token at position {idx} in expression: "
-                      f"{s[idx:idx+8]!r} (treated as 0)", file=sys.stderr)
+                      f"{s[idx:idx + 8]!r} (treated as 0)", file=sys.stderr)
         idx = StringUtils.skipspc(s, idx)
         return x, idx
 
@@ -1629,7 +1669,6 @@ class ExpressionEvaluator:
 
         escaped = _cc_escape(self.state.lwordchars)
         pattern = rf":([{escaped}]+)(?=[^{escaped}]|$)"
-
 
         _tag = "_AXXLBL_" + uuid.uuid4().hex
         _label_values = {}
@@ -1689,31 +1728,44 @@ class ExpressionEvaluator:
                 l = _ev(node.left)
                 r = _ev(node.right)
                 op = node.op
-                if isinstance(op, ast.Add):      return l + r
-                if isinstance(op, ast.Sub):      return l - r
-                if isinstance(op, ast.Mult):     return l * r
-                if isinstance(op, ast.Div):      return l / r
-                if isinstance(op, ast.FloorDiv): return l // r
-                if isinstance(op, ast.Mod):      return l % r
+                if isinstance(op, ast.Add):
+                    return l + r
+                if isinstance(op, ast.Sub):
+                    return l - r
+                if isinstance(op, ast.Mult):
+                    return l * r
+                if isinstance(op, ast.Div):
+                    return l / r
+                if isinstance(op, ast.FloorDiv):
+                    return l // r
+                if isinstance(op, ast.Mod):
+                    return l % r
                 if isinstance(op, ast.Pow):
                     if isinstance(r, int) and r > 1024:
                         raise ValueError("xeval: exponent exceeds 1024")
                     return l ** r
-                if isinstance(op, ast.BitAnd):   return l & r
-                if isinstance(op, ast.BitOr):    return l | r
-                if isinstance(op, ast.BitXor):   return l ^ r
+                if isinstance(op, ast.BitAnd):
+                    return l & r
+                if isinstance(op, ast.BitOr):
+                    return l | r
+                if isinstance(op, ast.BitXor):
+                    return l ^ r
                 if isinstance(op, ast.LShift):
                     if isinstance(r, int) and r > 65536:
                         raise ValueError("xeval: shift count exceeds 65536")
                     return l << r
-                if isinstance(op, ast.RShift):   return l >> r
+                if isinstance(op, ast.RShift):
+                    return l >> r
                 raise ValueError(f"xeval: disallowed operator {type(op).__name__} in '{s}'")
             if isinstance(node, ast.UnaryOp):
                 v = _ev(node.operand)
                 op = node.op
-                if isinstance(op, ast.UAdd):   return +v
-                if isinstance(op, ast.USub):   return -v
-                if isinstance(op, ast.Invert): return ~v
+                if isinstance(op, ast.UAdd):
+                    return +v
+                if isinstance(op, ast.USub):
+                    return -v
+                if isinstance(op, ast.Invert):
+                    return ~v
                 raise ValueError(f"xeval: disallowed unary operator {type(op).__name__} in '{s}'")
             if isinstance(node, ast.BoolOp):
                 if isinstance(node.op, ast.And):
@@ -1735,12 +1787,18 @@ class ExpressionEvaluator:
                 left = _ev(node.left)
                 for cop, comp in zip(node.ops, node.comparators):
                     right = _ev(comp)
-                    if   isinstance(cop, ast.Eq):    ok = left == right
-                    elif isinstance(cop, ast.NotEq): ok = left != right
-                    elif isinstance(cop, ast.Lt):    ok = left <  right
-                    elif isinstance(cop, ast.LtE):   ok = left <= right
-                    elif isinstance(cop, ast.Gt):    ok = left >  right
-                    elif isinstance(cop, ast.GtE):   ok = left >= right
+                    if   isinstance(cop, ast.Eq):
+                        ok = left == right
+                    elif isinstance(cop, ast.NotEq):
+                        ok = left != right
+                    elif isinstance(cop, ast.Lt):
+                        ok = left <  right
+                    elif isinstance(cop, ast.LtE):
+                        ok = left <= right
+                    elif isinstance(cop, ast.Gt):
+                        ok = left >  right
+                    elif isinstance(cop, ast.GtE):
+                        ok = left >= right
                     else:
                         raise ValueError(f"xeval: disallowed comparison in '{s}'")
                     if not ok:
@@ -1787,45 +1845,44 @@ class ExpressionEvaluator:
                 idx += 1
             else:
                 print(" error - missing closing ')' in expression.", file=sys.stderr)
-        elif idx+4<=len(s) and s[idx:idx+4]=="'\\t'":
-            x=0x09
-            idx+=4
-        elif idx+4<=len(s) and s[idx:idx+4]=="'\\''":
-            x=ord("'")
-            idx+=4
-        elif idx+4<=len(s) and s[idx:idx+4]=="'\\\\'":
-            x=ord("\\")
-            idx+=4
-        elif idx+4<=len(s) and s[idx:idx+4]=="'\\n'":
-            x=0x0a
-            idx+=4
-        elif idx+4<=len(s) and s[idx:idx+4]=="'\\0'":
-            x=0x00
-            idx+=4
-        elif idx+4<=len(s) and s[idx:idx+4]=="'\\r'":
-            x=0x0d
-            idx+=4
-        elif idx+4<=len(s) and s[idx:idx+4]=="'\\a'":
-            x=0x07
-            idx+=4
-        elif idx+4<=len(s) and s[idx:idx+4]=="'\\b'":
-            x=0x08
-            idx+=4
-        elif idx+4<=len(s) and s[idx:idx+4]=="'\\f'":
-            x=0x0c
-            idx+=4
-        elif idx+4<=len(s) and s[idx:idx+4]=="'\\v'":
-            x=0x0b
-            idx+=4
+        elif idx + 4 <= len(s) and s[idx:idx + 4] == "'\\t'":
+            x = 0x09
+            idx += 4
+        elif idx + 4 <= len(s) and s[idx:idx + 4] == "'\\''":
+            x = ord("'")
+            idx += 4
+        elif idx + 4 <= len(s) and s[idx:idx + 4] == "'\\\\'":
+            x = ord("\\")
+            idx += 4
+        elif idx + 4 <= len(s) and s[idx:idx + 4] == "'\\n'":
+            x = 0x0a
+            idx += 4
+        elif idx + 4 <= len(s) and s[idx:idx + 4] == "'\\0'":
+            x = 0x00
+            idx += 4
+        elif idx + 4 <= len(s) and s[idx:idx + 4] == "'\\r'":
+            x = 0x0d
+            idx += 4
+        elif idx + 4 <= len(s) and s[idx:idx + 4] == "'\\a'":
+            x = 0x07
+            idx += 4
+        elif idx + 4 <= len(s) and s[idx:idx + 4] == "'\\b'":
+            x = 0x08
+            idx += 4
+        elif idx + 4 <= len(s) and s[idx:idx + 4] == "'\\f'":
+            x = 0x0c
+            idx += 4
+        elif idx + 4 <= len(s) and s[idx:idx + 4] == "'\\v'":
+            x = 0x0b
+            idx += 4
         elif (_hexlit := StringUtils.parse_hex_char_literal(s, idx))[0]:
             x, idx = _hexlit[1], _hexlit[2]
-        elif idx+3<=len(s) and s[idx]=='\'' and s[idx+1] != '\\' and s[idx+2]=='\'':
-            x=ord(s[idx+1])
-            idx+=3
+        elif idx + 3 <= len(s) and s[idx] == '\'' and s[idx + 1] != '\\' and s[idx + 2] == '\'':
+            x = ord(s[idx + 1])
+            idx += 3
         elif StringUtils.q(s, '$$', idx):
             idx += 2
             _raw = self.state.pc_instr_start if self.state._in_binary_list else self.state.pc
-
 
             if self.state._in_binary_list or self.state._equ_sections_touched is not None:
                 _adj = self.label_manager._section_relative_offset(self.state.current_section, _raw)
@@ -1860,7 +1917,7 @@ class ExpressionEvaluator:
             while idx < len(s) and StringUtils.upper(s[idx]) in XDIGIT:
                 x = 16 * x + int(s[idx].lower(), 16)
                 idx += 1
-        elif (idx + 3 <= len(s) and s[idx:idx+3] == 'qad'
+        elif (idx + 3 <= len(s) and s[idx:idx + 3] == 'qad'
               and (lambda _j=StringUtils.skipspc(s, idx + 3): _j < len(s) and s[_j] == '{')()):
             idx += 3
             idx = StringUtils.skipspc(s, idx)
@@ -1876,7 +1933,6 @@ class ExpressionEvaluator:
                             v = self.xeval(t, None)
                         except (ValueError, TypeError, OverflowError):
 
-
                             if self.state.should_report_errors():
                                 print(f" error - qad{{}}: cannot evaluate expression '{t}'; using 0.", file=sys.stderr)
                             h = '0' * 32
@@ -1889,7 +1945,7 @@ class ExpressionEvaluator:
                                 h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
                                         str(Decimal(repr(float(v)))))
                     x = int(h, 16)
-        elif (idx + 3 <= len(s) and s[idx:idx+3] == 'dbl'
+        elif (idx + 3 <= len(s) and s[idx:idx + 3] == 'dbl'
               and (lambda _j=StringUtils.skipspc(s, idx + 3): _j < len(s) and s[_j] == '{')()):
             idx += 3
             f, t, idx = self.parser.get_curlb(s, idx)
@@ -1906,9 +1962,9 @@ class ExpressionEvaluator:
                         x = int.from_bytes(struct.pack('>d', v), "big")
                     except (OverflowError, ValueError, TypeError, struct.error):
                         if self.state.should_report_errors():
-                            print(f" error - dbl{{}}: cannot convert expression to float64; using 0.", file=sys.stderr)
+                            print(" error - dbl{}: cannot convert expression to float64; using 0.", file=sys.stderr)
                         x = 0
-        elif (idx + 3 <= len(s) and s[idx:idx+3] == 'flt'
+        elif (idx + 3 <= len(s) and s[idx:idx + 3] == 'flt'
               and (lambda _j=StringUtils.skipspc(s, idx + 3): _j < len(s) and s[_j] == '{')()):
             idx += 3
             f, t, idx = self.parser.get_curlb(s, idx)
@@ -1925,9 +1981,9 @@ class ExpressionEvaluator:
                         x = int.from_bytes(struct.pack('>f', v), "big")
                     except (OverflowError, ValueError, TypeError, struct.error):
                         if self.state.should_report_errors():
-                            print(f" error - flt{{}}: cannot convert expression to float32; using 0.", file=sys.stderr)
+                            print(" error - flt{}: cannot convert expression to float32; using 0.", file=sys.stderr)
                         x = 0
-        elif (idx + 5 <= len(s) and s[idx:idx+5] == 'enflt'
+        elif (idx + 5 <= len(s) and s[idx:idx + 5] == 'enflt'
               and (lambda _j=StringUtils.skipspc(s, idx + 5): _j < len(s) and s[_j] == '{')()):
             idx += 5
             f, t, idx = self.parser.get_curlb(s, idx)
@@ -1948,7 +2004,7 @@ class ExpressionEvaluator:
                         if self.state.should_report_errors():
                             print(" error - enflt{}: non-finite float value; using 0.", file=sys.stderr)
                         x = enflt(0)
-        elif (idx + 5 <= len(s) and s[idx:idx+5] == 'endbl'
+        elif (idx + 5 <= len(s) and s[idx:idx + 5] == 'endbl'
               and (lambda _j=StringUtils.skipspc(s, idx + 5): _j < len(s) and s[_j] == '{')()):
             idx += 5
             f, t, idx = self.parser.get_curlb(s, idx)
@@ -1969,7 +2025,7 @@ class ExpressionEvaluator:
                         if self.state.should_report_errors():
                             print(" error - endbl{}: non-finite float value; using 0.", file=sys.stderr)
                         x = endbl(0)
-        elif idx + 4 <= len(s) and s[idx:idx+4] == 'not(':
+        elif idx + 4 <= len(s) and s[idx:idx + 4] == 'not(':
             # not(expr): logical negation, written as a call-like form rather
             # than a prefix operator so it reads unambiguously in pattern
             # text. Handled here (factor1(), the base of the precedence
@@ -1991,19 +2047,19 @@ class ExpressionEvaluator:
             else:
                 print(" error - missing closing ')' in not(...) expression.", file=sys.stderr)
             x = 0 if x else 1
-        elif self.state.exp_typ=='i' and idx < len(s) and s[idx].isdigit():
+        elif self.state.exp_typ == 'i' and idx < len(s) and s[idx].isdigit():
                 fs, idx = self.parser.get_intstr(s, idx)
                 x = int(fs)
-        elif self.state.exp_typ=='f' and idx < len(s) and (self.parser.isfloatstr(s,idx)):
-                fs,idx = self.parser.get_floatstr(s,idx)
+        elif self.state.exp_typ == 'f' and idx < len(s) and (self.parser.isfloatstr(s, idx)):
+                fs, idx = self.parser.get_floatstr(s, idx)
                 try:
                     x = float(fs) if fs else 0.0
                 except ValueError:
                     x = 0.0
         elif (idx < len(s) and
-              s[idx] in LOWER and (idx + 1 >= len(s) or s[idx+1] not in self.state.lwordchars)):
+              s[idx] in LOWER and (idx + 1 >= len(s) or s[idx + 1] not in self.state.lwordchars)):
             ch = s[idx]
-            if idx + 3 <= len(s) and s[idx+1:idx+3] == ':=':
+            if idx + 3 <= len(s) and s[idx + 1:idx + 3] == ':=':
                 x, idx = self.expression(s, idx + 3)
                 self.var_manager.put(ch, x)
             else:
@@ -2028,10 +2084,10 @@ class ExpressionEvaluator:
             if idx != idx_new:
                 idx = idx_new
                 x = self.label_manager.get_value(w)
-        
+
         idx = StringUtils.skipspc(s, idx)
         return x, idx
-    
+
     def term0_0(self, s, idx):
         """Highest-precedence binary operator: ** (exponentiation). Capped
         both on the exponent itself and on the estimated result bit-length,
@@ -2056,7 +2112,6 @@ class ExpressionEvaluator:
                 x = 0
                 break
 
-
             try:
                 _base_bits = abs(x).bit_length() if isinstance(x, int) else 1024
             except (TypeError, ValueError, OverflowError):
@@ -2075,7 +2130,7 @@ class ExpressionEvaluator:
             if isinstance(x, float) and x.is_integer():
                 x = int(x)
         return x, idx
-    
+
     def term0(self, s, idx):
         """*, //, /, % (multiplication/division/modulo). Integer / falls
         back to float division only when the operands don't divide evenly,
@@ -2083,7 +2138,7 @@ class ExpressionEvaluator:
         guard against division by zero."""
         x, idx = self.term0_0(s, idx)
         while idx < len(s):
-            if s[idx] == '*' and (idx + 1 >= len(s) or s[idx+1] != '*'):
+            if s[idx] == '*' and (idx + 1 >= len(s) or s[idx + 1] != '*'):
                 t, idx = self.term0_0(s, idx + 1)
                 x *= t
             elif StringUtils.q(s, '//', idx):
@@ -2107,7 +2162,6 @@ class ExpressionEvaluator:
                             x = q
                         else:
 
-
                             if ((abs(x) >= (1 << 53) or abs(t) >= (1 << 53))
                                     and self.state.should_report_errors()):
                                 print(f" warning - dividing large integers ({x} / {t}) that do "
@@ -2127,7 +2181,7 @@ class ExpressionEvaluator:
             else:
                 break
         return x, idx
-    
+
     def term1(self, s, idx):
         """+, - (addition/subtraction)."""
         x, idx = self.term0(s, idx)
@@ -2141,7 +2195,7 @@ class ExpressionEvaluator:
             else:
                 break
         return x, idx
-    
+
     def term2(self, s, idx):
         """<<, >> (bit shift). Shift count is capped and rejected if
         negative, both to avoid a pathologically slow/huge big-integer
@@ -2155,15 +2209,18 @@ class ExpressionEvaluator:
                     x = int(x)
                     t = int(t)
                 except (ValueError, OverflowError):
-                    x = 0; break
+                    x = 0
+                    break
                 if t < 0:
                     if self.state.should_report_errors():
                         print(f" error - negative shift count ({t}) in << expression.", file=sys.stderr)
-                    x = 0; break
+                    x = 0
+                    break
                 if t > _SHIFT_MAX:
                     if self.state.should_report_errors():
                         print(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in << expression.", file=sys.stderr)
-                    x = 0; break
+                    x = 0
+                    break
                 x <<= t
             elif StringUtils.q(s, '>>', idx):
                 t, idx = self.term1(s, idx + 2)
@@ -2171,18 +2228,21 @@ class ExpressionEvaluator:
                     x = int(x)
                     t = int(t)
                 except (ValueError, OverflowError):
-                    x = 0; break
+                    x = 0
+                    break
                 if t < 0:
                     if self.state.should_report_errors():
                         print(f" error - negative shift count ({t}) in >> expression.", file=sys.stderr)
-                    x = 0; break
+                    x = 0
+                    break
                 if t > _SHIFT_MAX:
-                    x = 0; break
+                    x = 0
+                    break
                 x >>= t
             else:
                 break
         return x, idx
-    
+
     def _safe_int(self, v, op_name):
         try:
             return int(v)
@@ -2194,7 +2254,7 @@ class ExpressionEvaluator:
     def term3(self, s, idx):
         """& (bitwise AND), but not && (logical AND, handled by term9)."""
         x, idx = self.term2(s, idx)
-        while idx < len(s) and s[idx] == '&' and (idx + 1 >= len(s) or s[idx+1] != '&'):
+        while idx < len(s) and s[idx] == '&' and (idx + 1 >= len(s) or s[idx + 1] != '&'):
             t, idx = self.term2(s, idx + 1)
             x = self._safe_int(x, '&') & self._safe_int(t, '&')
         return x, idx
@@ -2202,7 +2262,7 @@ class ExpressionEvaluator:
     def term4(self, s, idx):
         """| (bitwise OR), but not || (logical OR, handled by term10)."""
         x, idx = self.term3(s, idx)
-        while idx < len(s) and s[idx] == '|' and (idx + 1 >= len(s) or s[idx+1] != '|'):
+        while idx < len(s) and s[idx] == '|' and (idx + 1 >= len(s) or s[idx + 1] != '|'):
             t, idx = self.term3(s, idx + 1)
             x = self._safe_int(x, '|') | self._safe_int(t, '|')
         return x, idx
@@ -2242,9 +2302,9 @@ class ExpressionEvaluator:
                 print(f" warning - sign-extension bit width {t} exceeds maximum {_SEXT_MAX_BITS}, result set to 0.", file=sys.stderr)
                 x = 0
             else:
-                x = (x & ~((~0) << t)) | ((~0) << t if (x >> (t-1) & 1) else 0)
+                x = (x & ~((~0) << t)) | ((~0) << t if (x >> (t - 1) & 1) else 0)
         return x, idx
-    
+
     def term7(self, s, idx):
         """Comparison operators (<=, <, >=, >, ==, !=), each yielding 1/0."""
         x, idx = self.term6(s, idx)
@@ -2270,7 +2330,7 @@ class ExpressionEvaluator:
             else:
                 break
         return x, idx
-    
+
     def term8(self, s, idx):
         """Placeholder level between term7 (comparisons) and term9 (&&).
         `not(expr)` used to be special-cased here, but that meant only
@@ -2298,7 +2358,7 @@ class ExpressionEvaluator:
             t, idx = self.term9(s, idx + 2)
             x = 1 if x or t else 0
         return x, idx
-    
+
     def term11(self, s, idx):
         """cond ? true_expr : false_expr (ternary), the lowest-precedence
         construct and the only right-associative one (hence its own level
@@ -2337,8 +2397,6 @@ class ExpressionEvaluator:
                 del self.state._elf_label_refs_seen[saved_elf_refs_len:]
                 self.state._elf_var_to_label        = dict(saved_elf_v2l)
                 u, idx = self.term11(s, idx + 1)
-                err_after_false         = self.state.error_undefined_label
-                conflict_after_false    = self.state.error_label_conflict
 
                 if x != 0:
                     self.state.vars                     = vars_after_true
@@ -2365,7 +2423,7 @@ class ExpressionEvaluator:
                     self.state._elf_var_to_label        = dict(saved_elf_v2l)
                     x = 0
         return x, idx
-    
+
     def expression(self, s, idx):
         """Public entry point: parse one full expression starting at idx,
         guarding the whole term0-term11 recursive-descent chain against a
@@ -2443,16 +2501,16 @@ class ExpressionEvaluator:
         replaced = ''.join(result)
         return self.expression(self._terminate(replaced), idx)
 
-    def expression_esc_float(self,s,idx,stopchar):
+    def expression_esc_float(self, s, idx, stopchar):
         prev_typ  = self.state.exp_typ
         prev_mode = self.state.expmode
         self.state.exp_typ = 'f'
         try:
-            v,idx = self.expression_esc(s,idx,stopchar)
+            v, idx = self.expression_esc(s, idx, stopchar)
         finally:
             self.state.exp_typ  = prev_typ
             self.state.expmode  = prev_mode
-        return (v,idx)
+        return (v, idx)
 
 
 class BinaryWriter:
@@ -2493,10 +2551,10 @@ class BinaryWriter:
             return
 
         max_word_pos = max(valid_buffer.keys())
-        
+
         word_bits = self.state.bts
         bytes_per_word = (word_bits + 7) // 8
-        
+
         total_size = (max_word_pos + 1) * bytes_per_word
 
         if total_size <= 0:
@@ -2523,7 +2581,7 @@ class BinaryWriter:
 
         for pos, val in valid_buffer.items():
             base_idx = pos * bytes_per_word
-            
+
             temp_val = val
             if self.state.endian == 'little':
                 for i in range(bytes_per_word):
@@ -2535,7 +2593,7 @@ class BinaryWriter:
                     if base_idx + i < total_size:
                         data[base_idx + i] = temp_val & 0xff
                         temp_val >>= 8
-                        
+
         with open(self.state.outfile, 'wb') as f:
             f.write(data)
         print(f"wrote raw binary {self.state.outfile} ({len(data)} bytes)", file=sys.stderr)
@@ -2651,7 +2709,7 @@ class DirectiveProcessor:
             key = StringUtils.upper(i[2])
             value_field = ''
         else:
-            print(f" error - .setsym directive requires at least a symbol name", file=sys.stderr)
+            print(" error - .setsym directive requires at least a symbol name", file=sys.stderr)
             return False
 
         if value_field:
@@ -2660,18 +2718,18 @@ class DirectiveProcessor:
             v = 0
         self.state.symbols[key] = v
         return True
-    
+
     def bits(self, i):
         """`.bits [big|little] [width]` — set endianness and/or default word width."""
         if len(i) == 0 or i[0] != '.bits':
             return False
-        
+
         if len(i) >= 2:
             if i[1].lower() == 'big':
                 self.state.endian = 'big'
             elif i[1].lower() == 'little':
                 self.state.endian = 'little'
-        
+
         v = None
         if len(i) >= 3:
             v, idx = self.expr_eval.expression_pat(i[2], 0)
@@ -2681,14 +2739,14 @@ class DirectiveProcessor:
             try:
                 self.state.bts = int(v)
             except (OverflowError, ValueError):
-                print(f" error - .bits: non-finite bit width value.", file=sys.stderr)
+                print(" error - .bits: non-finite bit width value.", file=sys.stderr)
         return True
-    
+
     def paddingp(self, i):
         """`.padding value` — set the fill byte/word used to pad unemitted bits."""
         if len(i) == 0 or i[0] != '.padding':
             return False
-        
+
         if len(i) >= 3 and i[2] != '':
             v, idx = self.expr_eval.expression_pat(i[2], 0)
         elif len(i) >= 2 and i[1] != '':
@@ -2698,9 +2756,9 @@ class DirectiveProcessor:
         try:
             self.state.padding = int(v)
         except (OverflowError, ValueError):
-            print(f" error - .padding: non-finite or invalid value; padding unchanged.", file=sys.stderr)
+            print(" error - .padding: non-finite or invalid value; padding unchanged.", file=sys.stderr)
         return True
-    
+
     def symbolc(self, i):
         """`.symbolc extrachars` — extend the character set allowed in symbol words."""
         if len(i) == 0 or i[0] != '.symbolc':
@@ -2718,9 +2776,9 @@ class DirectiveProcessor:
             return False
 
         if len(i) < 5:
-            print(f" error - .vliw directive requires 4 parameters (vliwbits, vliwinstbits, vliwtemplatebits, nop_value), got {len(i)-1}", file=sys.stderr)
+            print(f" error - .vliw directive requires 4 parameters (vliwbits, vliwinstbits, vliwtemplatebits, nop_value), got {len(i) - 1}", file=sys.stderr)
             return False
-        
+
         v1, idx = self.expr_eval.expression_pat(i[1], 0)
         v2, idx = self.expr_eval.expression_pat(i[2], 0)
         v3, idx = self.expr_eval.expression_pat(i[3], 0)
@@ -2731,7 +2789,7 @@ class DirectiveProcessor:
             self.state.vliwinstbits    = int(v2)
             self.state.vliwtemplatebits = int(v3)
         except (OverflowError, ValueError):
-            print(f" error - .vliw: non-finite parameter value.", file=sys.stderr)
+            print(" error - .vliw: non-finite parameter value.", file=sys.stderr)
             # Bugfix: this directive line (i[0] == '.vliw') was already
             # claimed above; returning False here (instead of True, like
             # every other directive's error path) told the caller's dispatch
@@ -2740,7 +2798,6 @@ class DirectiveProcessor:
             # subsequent source line for the rest of the assembly --
             # spamming this error once per source line instead of once.
             return True
-
 
         _VLIW_INSTBITS_MAX = 8192
         if not (0 <= self.state.vliwinstbits <= _VLIW_INSTBITS_MAX):
@@ -2756,7 +2813,7 @@ class DirectiveProcessor:
             v4 >>= 8
         self.state.vliwnop = l
         return True
-    
+
     def epic(self, i):
         """`EPIC slot_indices pattern` — register an EPIC-style multi-slot pattern:
         `slot_indices` is a comma-separated list of expressions giving which
@@ -2769,9 +2826,9 @@ class DirectiveProcessor:
             return False
 
         if len(i) < 3:
-            print(f" error - EPIC directive requires 2 parameters (indices, pattern), got {len(i)-1}", file=sys.stderr)
+            print(f" error - EPIC directive requires 2 parameters (indices, pattern), got {len(i) - 1}", file=sys.stderr)
             return False
-        
+
         s = i[1]
         idxs = []
         idx = 0
@@ -2782,11 +2839,11 @@ class DirectiveProcessor:
                 idx += 1
                 continue
             break
-        
+
         s2 = i[2]
         self.state.vliwset = self.add_avoiding_dup(self.state.vliwset, [idxs, s2])
         return True
-    
+
     def error(self, s):
         """Evaluate a pattern-file `.ERROR condition;code, ...` field: for each
         `condition;code` pair, if `condition` is truthy and errors are currently
@@ -2796,12 +2853,12 @@ class DirectiveProcessor:
         ss = s.replace(' ', '')
         if ss == "":
             return False, 0
-        
+
         s += chr(0)
         idx = 0
         error_code = 0
         triggered = False
-        
+
         while True:
             ch = s[idx] if idx < len(s) else chr(0)
             if ch == chr(0):
@@ -2809,7 +2866,7 @@ class DirectiveProcessor:
             if ch == ',':
                 idx += 1
                 continue
-            
+
             idx_before = idx
             prev_typ = self.expr_eval.state.exp_typ
             self.expr_eval.state.exp_typ = 'f'
@@ -2821,7 +2878,7 @@ class DirectiveProcessor:
                 t, idx = self.expr_eval.expression_pat(s, idx)
             finally:
                 self.expr_eval.state.exp_typ = prev_typ
-            
+
             if idx <= idx_before:
                 break
 
@@ -2885,6 +2942,7 @@ class DirectiveProcessor:
             self.state.check_constraints.clear()
         return True
 
+
 class PatternMatcher:
     """Matches one source-line-fragment `s` against one pattern-file syntax
     template `t`, binding pattern variables (`!x`) to symbols/expression values
@@ -2935,7 +2993,7 @@ class PatternMatcher:
                     result[j] = ''
 
         return ''.join(result)
-    
+
     def match(self, s, t):
         """Try to match source fragment `s` against pattern `t` (with any
         remaining OB/CB optional-group markers stripped — `match0` has already
@@ -2965,27 +3023,24 @@ class PatternMatcher:
         idx_t = StringUtils.skipspc(t, idx_t)
         s += chr(0)
         t += chr(0)
-        
 
         prev_alnum = False
 
         while True:
-
 
             s_sp = idx_s < len(s) and s[idx_s] in ' \t'
             t_sp = idx_t < len(t) and t[idx_t] in ' \t'
             idx_s = StringUtils.skipspc(s, idx_s)
             idx_t = StringUtils.skipspc(t, idx_t)
 
-
             word_break = s_sp and not t_sp
             b = s[idx_s]
             a = t[idx_t]
-            
+
             if a == chr(0) and b == chr(0):
                 self.last_score = (n_expr, -n_lit, n_sym)
                 return True
-            
+
             if a == '\\':
                 idx_t += 1
                 if idx_t < len(t) and t[idx_t] == b:
@@ -3001,7 +3056,6 @@ class PatternMatcher:
                     return False
             elif a in CAPITAL:
                 if a == b.upper():
-
 
                     if prev_alnum and word_break:
                         return False
@@ -3029,7 +3083,7 @@ class PatternMatcher:
                     a = t[idx_t]
                     if a == chr(0) or a not in LOWER:
                         return False
-                    idx_t = StringUtils.skipspc(t, idx_t+1)
+                    idx_t = StringUtils.skipspc(t, idx_t + 1)
                     if idx_t < len(t) and t[idx_t] == '\\':
                         idx_t += 1
                         stopchar = t[idx_t] if idx_t < len(t) else chr(0)
@@ -3046,7 +3100,7 @@ class PatternMatcher:
                         v = int.from_bytes(struct.pack('>f', v), "big")
                     except (OverflowError, ValueError, struct.error):
                         if self.state.should_report_errors():
-                            print(f" error - !F: cannot convert value to float32; using 0.", file=sys.stderr)
+                            print(" error - !F: cannot convert value to float32; using 0.", file=sys.stderr)
                         v = 0
                     self.var_manager.put(a, v)
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
@@ -3059,7 +3113,7 @@ class PatternMatcher:
                     a = t[idx_t]
                     if a == chr(0) or a not in LOWER:
                         return False
-                    idx_t = StringUtils.skipspc(t, idx_t+1)
+                    idx_t = StringUtils.skipspc(t, idx_t + 1)
                     if idx_t < len(t) and t[idx_t] == '\\':
                         idx_t += 1
                         stopchar = t[idx_t] if idx_t < len(t) else chr(0)
@@ -3076,7 +3130,7 @@ class PatternMatcher:
                         v = int.from_bytes(struct.pack('>d', v), "big")
                     except (OverflowError, ValueError, struct.error):
                         if self.state.should_report_errors():
-                            print(f" error - !D: cannot convert value to float64; using 0.", file=sys.stderr)
+                            print(" error - !D: cannot convert value to float64; using 0.", file=sys.stderr)
                         v = 0
                     self.var_manager.put(a, v)
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
@@ -3090,7 +3144,7 @@ class PatternMatcher:
                     a = t[idx_t]
                     if a == chr(0) or a not in LOWER:
                         return False
-                    idx_t = StringUtils.skipspc(t, idx_t+1)
+                    idx_t = StringUtils.skipspc(t, idx_t + 1)
                     if idx_t < len(t) and t[idx_t] == '\\':
                         idx_t += 1
                         stopchar = t[idx_t] if idx_t < len(t) else chr(0)
@@ -3185,7 +3239,6 @@ class PatternMatcher:
                 continue
             elif a == b:
 
-
                 lit_alnum = a.isalnum()
                 if lit_alnum and prev_alnum and word_break:
                     return False
@@ -3196,7 +3249,6 @@ class PatternMatcher:
                 continue
             else:
                 return False
-    
 
     _MAX_COMBINATIONS = 1 << 16
 
@@ -3224,11 +3276,9 @@ class PatternMatcher:
         _tried = 0
         for i in range(len(sl) + 1):
 
-
             for j in itertools.combinations(sl, i):
                 _tried += 1
                 if _tried > self._MAX_COMBINATIONS:
-
 
                     _warn_key = (getattr(self.state, 'current_file', None),
                                  getattr(self.state, 'ln', None), t)
@@ -3252,6 +3302,7 @@ class PatternMatcher:
                 self.state._elf_var_to_label = saved_v2l
         return False
 
+
 class PatternFileReader:
     """Reads a `.axx` pattern file into a list of 6-field pattern-line records
     (`[mnemonic, size_field, syntax, object_field, extra1, extra2]`), handling
@@ -3271,7 +3322,7 @@ class PatternFileReader:
         if _depth > _MAX_PAT_DEPTH:
             print(f" error - pattern .INCLUDE nesting exceeds {_MAX_PAT_DEPTH}: '{fn}'", file=sys.stderr)
             return []
-        
+
         if base_dir and not os.path.isabs(fn):
             fn = os.path.join(base_dir, fn)
 
@@ -3283,25 +3334,24 @@ class PatternFileReader:
                   f"(already in include chain). Skipped.", file=sys.stderr)
             return []
         _chain = _chain | {_real}
-        
+
         this_dir = os.path.dirname(os.path.abspath(fn))
-        
+
         p = []
         w = []
-
 
         with open(fn, "rt", encoding="utf-8") as f:
             while True:
                 l = f.readline()
                 if not l:
                     break
-                
+
                 l = StringUtils.remove_comment(l)
                 l = l.replace('\t', ' ')
                 l = l.replace(chr(13), '')
                 l = l.replace('\n', '')
                 l = StringUtils.reduce_spaces(l)
-                
+
                 ww = self.include_pat(l, this_dir, _depth=_depth + 1, _chain=_chain)
                 if ww is not None:
                     w = w + ww
@@ -3315,7 +3365,7 @@ class PatternFileReader:
                         if len(l) <= idx:
                             break
                     l = r
-                    
+
                     if len(l) == 1:
                         p = [l[0], '', '', '', '', '']
                     elif len(l) == 2:
@@ -3333,21 +3383,21 @@ class PatternFileReader:
                               f"(extra fields ignored): {l[6:]!r}", file=sys.stderr)
                         p = [l[0], l[1], l[2], l[3], l[4], l[5]]
                     w.append(p)
-        
+
         return w
-    
+
     def include_pat(self, l, base_dir=None, _depth=0, _chain=None):
         """If line `l` is a `.INCLUDE "file"` directive, recursively read and
         return that file's pattern lines; otherwise return None so the caller
         parses `l` as an ordinary pattern-file line."""
         idx = StringUtils.skipspc(l, 0)
-        i = l[idx:idx+8]
+        i = l[idx:idx + 8]
         i = i.upper()
         if i != ".INCLUDE":
             return None
-        s = StringUtils.get_string(l[idx+8:])
+        s = StringUtils.get_string(l[idx + 8:])
         if s == "":
-            raw = l[idx+8:].strip()
+            raw = l[idx + 8:].strip()
             if raw:
                 fallback, _ = StringUtils.get_param_to_spc(raw, 0)
                 if fallback:
@@ -3383,11 +3433,11 @@ class ObjectGenerator:
         result = []
         i = 0
         while i < len(s):
-            if i + 1 < len(s) and s[i:i+2] == '%%':
+            if i + 1 < len(s) and s[i:i + 2] == '%%':
                 result.append(str(count))
                 count += 1
                 i += 2
-            elif i+1<len(s) and s[i:i+2] == "%0":
+            elif i + 1 < len(s) and s[i:i + 2] == "%0":
                 count = 0
                 i += 2
             else:
@@ -3406,12 +3456,12 @@ class ObjectGenerator:
         has_content = False
         i = 0
         while i < len(pattern):
-            if i + 3 <= len(pattern) and pattern[i:i+3] == '@@[':
+            if i + 3 <= len(pattern) and pattern[i:i + 3] == '@@[':
                 i += 3
                 depth = 1
                 expr_start = i
                 comma_pos = -1
-                
+
                 while i < len(pattern) and depth > 0:
                     if pattern[i] == '[':
                         depth += 1
@@ -3422,11 +3472,11 @@ class ObjectGenerator:
                     elif pattern[i] == ',' and depth == 1 and comma_pos == -1:
                         comma_pos = i
                     i += 1
-                
+
                 if comma_pos >= 0 and comma_pos >= expr_start:
                     expr = pattern[expr_start:comma_pos]
-                    rep_pattern = pattern[comma_pos+1:i]
-                    
+                    rep_pattern = pattern[comma_pos + 1:i]
+
                     self.state.error_undefined_label = False
                     n, idx = self.expr_eval.expression_pat(expr, 0)
                     _N_MAX = 1 << 24
@@ -3447,7 +3497,7 @@ class ObjectGenerator:
                             if j > 0:
                                 result.append(',')
                             result.append(rep_pattern)
-                    
+
                     i += 1
                 else:
                     result.append('@@[')
@@ -3456,7 +3506,7 @@ class ObjectGenerator:
                 result.append(pattern[i])
                 has_content = True
                 i += 1
-        
+
         return ''.join(result), not has_content
 
     def makeobj(self, s):
@@ -3471,9 +3521,8 @@ class ObjectGenerator:
         0, the word (and any relocation reference recorded for it) is dropped
         rather than emitted — used by patterns that only emit an optional
         prefix/suffix word when its value is nonzero."""
-        s,z = self.e_p(s)
+        s, z = self.e_p(s)
         s = self.replace_percent_with_index(s)
-
 
         s += chr(0)
         idx = 0
@@ -3556,16 +3605,15 @@ class VLIWProcessor:
         objs = [objl]
         idxlst = [idxs]
         self.state.vliwstop = 0
-        
+
         while True:
             idx = StringUtils.skipspc(line, idx)
-            if idx + 4 <= len(line) and line[idx:idx+4] == '!!!!':
+            if idx + 4 <= len(line) and line[idx:idx + 4] == '!!!!':
                 idx += 4
                 self.state.vliwstop = 1
                 continue
-            elif idx + 2 <= len(line) and line[idx:idx+2] == '!!':
+            elif idx + 2 <= len(line) and line[idx:idx + 2] == '!!':
                 idx += 2
-
 
                 _slot_peek = line[idx:].lstrip()
                 if _slot_peek.startswith('.'):
@@ -3582,10 +3630,10 @@ class VLIWProcessor:
                 continue
             else:
                 break
-        
+
         if self.state.vliwtemplatebits == 0:
             self.state.vliwset = [[[0], "0"]]
-        
+
         vbits = abs(self.state.vliwbits)
 
         if self.state.vliwinstbits == 0:
@@ -3599,12 +3647,10 @@ class VLIWProcessor:
                 pm = 2 ** vbits - 1
                 x, idx = self.expr_eval.expression_pat(k[1], 0)
                 templ = x & tm
-                
+
                 values = []
-                nob = vbits // 8 + (0 if vbits % 8 == 0 else 1)
                 ibyte = self.state.vliwinstbits // 8 + (0 if self.state.vliwinstbits % 8 == 0 else 1)
                 noi = (vbits - abs(self.state.vliwtemplatebits)) // self.state.vliwinstbits
-
 
                 if noi <= 0:
                     if self.state.should_report_errors():
@@ -3616,7 +3662,7 @@ class VLIWProcessor:
                 for j in objs:
                     for m in j:
                         values += [m]
-                
+
                 target_len = ibyte * noi
                 if len(values) > target_len:
                     if self.state.should_report_errors():
@@ -3629,10 +3675,10 @@ class VLIWProcessor:
                         values += self.state.vliwnop
                     if _remainder > 0:
                         values += (self.state.vliwnop + [0] * _remainder)[:_remainder]
-                
+
                 v1 = []
                 cnt = 0
-                
+
                 for j in range(noi):
                     vv = 0
                     if self.state.endian == 'little':
@@ -3647,19 +3693,19 @@ class VLIWProcessor:
                                 vv |= values[cnt] & 0xff
                             cnt += 1
                     v1 += [vv & im]
-                
+
                 r = 0
                 for v in v1:
                     r = (r << self.state.vliwinstbits) | v
                 r = r & pm
-                
+
                 if self.state.vliwtemplatebits < 0:
                     # Negative width: template occupies the packet's high bits.
                     res = r | (templ << (vbits - abs(self.state.vliwtemplatebits)))
                 else:
                     # Positive width: template occupies the low bits.
                     res = (r << self.state.vliwtemplatebits) | templ
-                
+
                 q = 0
                 if vbits < 8:
                     self.binary_writer.outbin(self.state.pc, res & ((1 << vbits) - 1))
@@ -3676,7 +3722,7 @@ class VLIWProcessor:
                         shift = (total_bytes - 1 - cnt) * 8
                         self.binary_writer.outbin(self.state.pc + cnt, (res >> shift) & 0xff)
                         q += 1
-                
+
                 self.state.pc += q
                 break
         else:
@@ -3727,7 +3773,7 @@ class AssemblyDirectiveProcessor:
         label, idx = self.parser.get_label_word(l, 0)
         lidx = idx
 
-        if label != "" and idx > 0 and l[idx-1] == ':':
+        if label != "" and idx > 0 and l[idx - 1] == ':':
             idx = StringUtils.skipspc(l, idx)
             e, idx = StringUtils.get_param_to_spc(l, idx)
 
@@ -3754,7 +3800,6 @@ class AssemblyDirectiveProcessor:
                 saved_mode = self.state._pass1_size_mode
                 if self.state.pas == 1:
                     self.state._pass1_size_mode = True
-
 
                 # Only a reloc_type-LESS .EQU (no `::reloctype`) gets its referenced
                 # labels' values converted to section-relative offsets (see
@@ -3786,7 +3831,7 @@ class AssemblyDirectiveProcessor:
                     return ""
                 return l[lidx:]
         return l
-    
+
     def asciistr(self, l2):
         """Emit a quoted string literal's bytes one at a time via `binary_writer.outbin`
         (advancing `state.pc`), decoding `\\0`/`\\t`/`\\n`/`\\r`/`\\\\`/`\\"` and
@@ -3801,27 +3846,27 @@ class AssemblyDirectiveProcessor:
         _word_mask = (1 << self.state.bts) - 1 if self.state.bts > 0 else 0xFF
         _truncated = False
 
-        while idx < len(l2) and not l2[idx]=='"':
+        while idx < len(l2) and not l2[idx] == '"':
             ch = None
-            if l2[idx:idx+2] == '\\0':
+            if l2[idx:idx + 2] == '\\0':
                 idx += 2
                 ch = chr(0)
-            elif l2[idx:idx+2] == '\\t':
+            elif l2[idx:idx + 2] == '\\t':
                 idx += 2
                 ch = '\t'
-            elif l2[idx:idx+2] == '\\n':
+            elif l2[idx:idx + 2] == '\\n':
                 idx += 2
                 ch = '\n'
-            elif l2[idx:idx+2] == '\\r':
+            elif l2[idx:idx + 2] == '\\r':
                 idx += 2
                 ch = '\r'
-            elif l2[idx:idx+2] == '\\\\':
+            elif l2[idx:idx + 2] == '\\\\':
                 idx += 2
                 ch = '\\'
-            elif l2[idx:idx+2] == '\\"':
+            elif l2[idx:idx + 2] == '\\"':
                 idx += 2
                 ch = '"'
-            elif l2[idx:idx+2] in ('\\x', '\\X'):
+            elif l2[idx:idx + 2] in ('\\x', '\\X'):
                 idx += 2
                 hex_str = ''
                 while idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF' and len(hex_str) < 2:
@@ -3832,8 +3877,8 @@ class AssemblyDirectiveProcessor:
                 else:
                     print(f" error - '\\x' escape requires at least one hex digit in string: {l2!r}", file=sys.stderr)
                     return False
-            elif l2[idx:idx+2] in ('\\u', '\\U'):
-                _ndigits = 4 if l2[idx:idx+2] == '\\u' else 8
+            elif l2[idx:idx + 2] in ('\\u', '\\U'):
+                _ndigits = 4 if l2[idx:idx + 2] == '\\u' else 8
                 idx += 2
                 hex_str = ''
                 while idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF' and len(hex_str) < _ndigits:
@@ -3864,7 +3909,7 @@ class AssemblyDirectiveProcessor:
                   f"width ({self.state.bts} bit(s)) and were truncated (high bits discarded): "
                   f"{l2!r}", file=sys.stderr)
         return True
-    
+
     def export_processing(self, l1, l2):
         """`.EXPORT`/`.GLOBAL label, ...` — mark labels for inclusion in the
         output ELF symbol table (`state.export_labels`), snapshotting each
@@ -3876,7 +3921,7 @@ class AssemblyDirectiveProcessor:
         _l1u = StringUtils.upper(l1)
         if _l1u != ".EXPORT" and _l1u != ".GLOBAL":
             return False
-        
+
         idx = 0
         l2 += chr(0)
         while idx < len(l2) and l2[idx] != chr(0):
@@ -3894,7 +3939,7 @@ class AssemblyDirectiveProcessor:
             if idx < len(l2) and l2[idx] == ',':
                 idx += 1
         return True
-    
+
     def resb_processing(self, l1, l2):
         """`.RESB count` — reserve `count` bytes without writing them (e.g. for
         `.bss`); just advances `state.pc`, capped at `_RESB_MAX` to catch a
@@ -3904,13 +3949,13 @@ class AssemblyDirectiveProcessor:
         x, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
             if self.state.should_report_errors():
-                print(f" error - .RESB argument contains undefined label.", file=sys.stderr)
+                print(" error - .RESB argument contains undefined label.", file=sys.stderr)
             return True
         try:
             x = int(x)
         except (OverflowError, ValueError):
             if self.state.should_report_errors():
-                print(f" error - .RESB argument is non-finite or invalid.", file=sys.stderr)
+                print(" error - .RESB argument is non-finite or invalid.", file=sys.stderr)
             return True
         if x < 0:
             if self.state.should_report_errors():
@@ -3932,13 +3977,13 @@ class AssemblyDirectiveProcessor:
         x, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
             if self.state.should_report_errors():
-                print(f" error - .ZERO argument contains undefined label.", file=sys.stderr)
+                print(" error - .ZERO argument contains undefined label.", file=sys.stderr)
             return True
         try:
             x = int(x)
         except (OverflowError, ValueError):
             if self.state.should_report_errors():
-                print(f" error - .ZERO argument is non-finite or invalid.", file=sys.stderr)
+                print(" error - .ZERO argument is non-finite or invalid.", file=sys.stderr)
             return True
         if x < 0:
             if self.state.should_report_errors():
@@ -3953,7 +3998,7 @@ class AssemblyDirectiveProcessor:
             self.binary_writer.outbin2(self.state.pc, 0x00)
             self.state.pc += 1
         return True
-    
+
     def ascii_processing(self, l1, l2):
         """`.ASCII "text"` — emit the string's bytes with no terminator."""
         if StringUtils.upper(l1) != ".ASCII":
@@ -3966,12 +4011,12 @@ class AssemblyDirectiveProcessor:
             return False
         if not self.asciistr(l2):
             if self.state.should_report_errors():
-                print(f" error - .ASCIZ requires a quoted string.", file=sys.stderr)
+                print(" error - .ASCIZ requires a quoted string.", file=sys.stderr)
             return False
         self.binary_writer.outbin(self.state.pc, 0x00)
         self.state.pc += 1
         return True
-    
+
     def section_processing(self, l1, l2):
         """`.SECTION`/`.SEGMENT name` — switch the current output section.
         Before switching, closes out the fragment of `old_sec` we were just
@@ -4017,10 +4062,9 @@ class AssemblyDirectiveProcessor:
                 else:
                     new_start = min(existing_start, self.state.pc)
 
-
                 self.state.sections[l2] = [new_start, existing_size, self.state.pc, False]
         return True
-    
+
     def align_processing(self, l1, l2):
         """`.ALIGN [boundary]` — pad up to the next multiple of `boundary`
         (or the previously-set alignment if omitted). Padding must be computed
@@ -4042,7 +4086,7 @@ class AssemblyDirectiveProcessor:
                 u_int = int(u)
             except (OverflowError, ValueError):
                 if self.state.should_report_errors():
-                    print(f" error - .ALIGN argument is non-finite or invalid.", file=sys.stderr)
+                    print(" error - .ALIGN argument is non-finite or invalid.", file=sys.stderr)
                 return True
             if u_int <= 0:
                 if self.state.should_report_errors():
@@ -4050,14 +4094,13 @@ class AssemblyDirectiveProcessor:
                 return True
             self.state.align = u_int
 
-
         _sec_rel = self.label_manager._section_relative_offset(
             self.state.current_section, self.state.pc)
         _base = _sec_rel if _sec_rel is not None else self.state.pc
         _padding = self.binary_writer.align_(_base) - _base
         self.state.pc += _padding
         return True
-    
+
     def endsection_processing(self, l1, l2):
         """`.ENDSECTION`/`.ENDSEGMENT` — explicitly close out the current
         section's fragment (see `section_processing`'s docstring for the
@@ -4088,7 +4131,7 @@ class AssemblyDirectiveProcessor:
             self.state.section_ranges.append((self.state.current_section, entry_pc, block_size))
         self.state.sections[self.state.current_section] = [start, new_size, self.state.pc, True]
         return True
-    
+
     def extern_processing(self, l1, l2):
         """`.EXTERN label[::reloctype], ...` — declare an externally-defined
         symbol, choosing a machine-appropriate default relocation type (looked
@@ -4112,7 +4155,7 @@ class AssemblyDirectiveProcessor:
             _em_ext = self.state.elf_machine
             _mach_tbl_ext = ELF_MACHINES.get(_em_ext)
             reloc_type = _mach_tbl_ext['extern_default'] if _mach_tbl_ext else 2
-            if idx < len(l2) and l2[idx:idx+2] == '::':
+            if idx < len(l2) and l2[idx:idx + 2] == '::':
                 idx += 2
                 rt_start = idx
                 while idx < len(l2) and l2[idx] not in ' \t,:' + chr(0):
@@ -4130,7 +4173,6 @@ class AssemblyDirectiveProcessor:
 
             existing = self.state.labels.get(label_part)
 
-
             if existing is None:
                 self.state.labels[label_part] = [0, '.text', False, True, reloc_type]
             elif len(existing) > 3 and existing[3]:
@@ -4144,6 +4186,81 @@ class AssemblyDirectiveProcessor:
 
         return True
 
+    def reloctype_processing(self, l1, l2):
+        """`.RELOCTYPE name8,name16,name32,name64` -- from the source file,
+        override the machine's default relocation type that ObjectGenerator
+        picks (via ELF_MACHINES[machine]['width_guess']) for an
+        auto-detected label reference of a given encoded field width, i.e.
+        one with no explicit `::reloctype` suffix on its label (see
+        `.EXTERN`/`.EQU ::reloctype` for that per-label form instead).
+
+        The four comma-separated positions correspond, in order, to encoded
+        field widths of 1, 2, 4, and 8 bytes. Fewer than four may be given;
+        trailing positions are simply left at the machine's built-in
+        default. A blank position (two consecutive commas, or a trailing
+        comma) also leaves that width's mapping untouched, so a single width
+        can be overridden without having to respecify the others -- e.g.
+        `.reloctype pc8,pc16,pc32,abs64` sets all four, while
+        `.reloctype ,,,abs64` only changes the 8-byte (64-bit) width.
+
+        Each name must be one of the target machine's registered
+        `::reloctype` names (the same set `.EXTERN`/`.EQU` accept, e.g.
+        `pc8`/`pc16`/`pc32`/`pc64`/`abs8`/`abs16`/`abs32`/`abs64`/`plt32`/
+        `got32`/... depending on -m/--machine) and its registered width must
+        equal the position it's given in; a name that doesn't exist for this
+        machine, or whose width doesn't match its position, is rejected with
+        a warning and that position's previous mapping (built-in default, or
+        an earlier `.reloctype` for the same width) is left in place.
+
+        Repeated `.reloctype` directives accumulate: only the widths named
+        in the *latest* directive are touched, earlier overrides for other
+        widths remain active. `.reloctype` with no arguments at all is a
+        no-op (equivalent to omitting the directive).
+
+        This is a whole-file, order-independent setting (like `-m` itself,
+        which selects the table `.reloctype` names are validated against) --
+        it is not scoped to a `.section` or to lines following it only; the
+        override applies to every subsequent auto-detected relocation for
+        the rest of the assembly, in both Pass 1 and Pass 2, until changed
+        by another `.reloctype`."""
+        if StringUtils.upper(l1) != ".RELOCTYPE":
+            return False
+
+        _mach_tbl_rt = ELF_MACHINES.get(self.state.elf_machine)
+        if _mach_tbl_rt is None:
+            print(f" warning - .RELOCTYPE: no relocation table for machine "
+                  f"{self.state.elf_machine}", file=sys.stderr)
+            return True
+
+        _widths = (1, 2, 4, 8)
+        _parts = l2.split(',') if l2 else []
+        for _i, _raw_name in enumerate(_parts):
+            if _i >= len(_widths):
+                print(" warning - .RELOCTYPE: too many arguments (only "
+                      "4 widths -- 8/16/32/64-bit -- are supported)",
+                      file=sys.stderr)
+                break
+            _name = _raw_name.strip().lower()
+            if not _name:
+                continue
+            _rtype = _mach_tbl_rt['named'].get(_name)
+            if _rtype is None:
+                print(f" warning - unknown reloc type '{_name}' in "
+                      f".RELOCTYPE for machine {self.state.elf_machine}",
+                      file=sys.stderr)
+                continue
+            _expected_width = _widths[_i]
+            _actual_width = _mach_tbl_rt['reloc_bytes'].get(_rtype)
+            if _actual_width is not None and _actual_width != _expected_width:
+                print(f" warning - .RELOCTYPE: '{_name}' is a "
+                      f"{_actual_width * 8}-bit relocation type, but was given "
+                      f"in the {_expected_width * 8}-bit position; ignored",
+                      file=sys.stderr)
+                continue
+            self.state.reloctype_override[_expected_width] = _rtype
+
+        return True
+
     def org_processing(self, l1, l2):
         """`.ORG address[,P]` — jump the pc to an absolute address. The `,P`
         suffix additionally pads the output with `state.padding` bytes to fill
@@ -4154,19 +4271,19 @@ class AssemblyDirectiveProcessor:
         u, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
             if self.state.should_report_errors():
-                print(f" error - .ORG argument contains undefined label.", file=sys.stderr)
+                print(" error - .ORG argument contains undefined label.", file=sys.stderr)
             return True
         try:
             u = int(u)
         except (OverflowError, ValueError):
             if self.state.should_report_errors():
-                print(f" error - .ORG argument is non-finite or invalid.", file=sys.stderr)
+                print(" error - .ORG argument is non-finite or invalid.", file=sys.stderr)
             return True
         if u < 0:
             if self.state.should_report_errors():
                 print(f" error - .ORG address must be non-negative, got {u}.", file=sys.stderr)
             return True
-        if idx + 2 <= len(l2) and l2[idx:idx+2].upper() == ',P':
+        if idx + 2 <= len(l2) and l2[idx:idx + 2].upper() == ',P':
             if u > self.state.pc:
                 _ORG_FILL_MAX = 1 << 28
                 fill_count = u - self.state.pc
@@ -4199,20 +4316,20 @@ class Assembler:
         self.var_manager = VariableManager(self.state)
         self.label_manager = LabelManager(self.state)
         self.symbol_manager = SymbolManager(self.state)
-        self.expr_eval = ExpressionEvaluator(self.state, self.var_manager, 
+        self.expr_eval = ExpressionEvaluator(self.state, self.var_manager,
                                             self.label_manager, self.symbol_manager, self.parser)
         self.binary_writer = BinaryWriter(self.state)
         self.directive_proc = DirectiveProcessor(self.state, self.expr_eval, self.binary_writer,
                                                   self.symbol_manager, self.parser)
-        self.pattern_matcher = PatternMatcher(self.state, self.expr_eval, self.var_manager, 
+        self.pattern_matcher = PatternMatcher(self.state, self.expr_eval, self.var_manager,
                                              self.symbol_manager, self.parser)
         self.pattern_reader = PatternFileReader(self.parser)
         self.obj_gen = ObjectGenerator(self.state, self.expr_eval, self.binary_writer)
         self.vliw_proc = VLIWProcessor(self.state, self.expr_eval, self.binary_writer)
-        self.asm_directive_proc = AssemblyDirectiveProcessor(self.state, self.expr_eval, 
+        self.asm_directive_proc = AssemblyDirectiveProcessor(self.state, self.expr_eval,
                                                              self.binary_writer, self.label_manager, self.parser)
         self._imp_sections: dict = {}
-    
+
     def include_asm(self, l1, l2):
         """`.INCLUDE "file"` (source-side) — recursively assemble `file` in
         place, resolving a relative path against the including file's directory."""
@@ -4221,7 +4338,6 @@ class Assembler:
         s = StringUtils.get_string(l2)
         if s:
 
-
             if s != "stdin" and not os.path.isabs(s):
                 cur = self.state.current_file
                 if cur and cur not in ("(stdin)", ""):
@@ -4229,7 +4345,7 @@ class Assembler:
                     s = os.path.join(base, s)
             self.fileassemble(s)
         return True
-    
+
     def lineassemble2(self, line, idx):
         """Assemble one instruction starting at `line[idx:]` (used both for a
         whole non-VLIW source line and for one slot of a VLIW packet).
@@ -4279,7 +4395,7 @@ class Assembler:
         l = l.rstrip()
         l2 = l2.rstrip()
         l = l.replace(' ', '')
-        
+
         if self.asm_directive_proc.section_processing(l, l2):
             return 0, [], True, idx
         if self.asm_directive_proc.endsection_processing(l, l2):
@@ -4309,14 +4425,14 @@ class Assembler:
             return 0, [], True, idx
         if self.asm_directive_proc.extern_processing(l, l2):
             return 0, [], True, idx
+        if self.asm_directive_proc.reloctype_processing(l, l2):
+            return 0, [], True, idx
         if self.asm_directive_proc.export_processing(l, l2):
             return 0, [], True, idx
 
-
         if l == "":
             return 0, [], False, idx
-        
-        of = 0
+
         se = False
         oerr = False
         pln = 0
@@ -4325,11 +4441,9 @@ class Assembler:
         objl = []
         loopflag = True
 
-
         best = None
         hit_sentinel = False
         first_match_exc = None
-
 
         exc_log = []
 
@@ -4358,50 +4472,46 @@ class Assembler:
             self.state.vliwnop = list(snap['vliwnop'])
             self.state.vliwset = list(snap['vliwset'])
 
-        # Cheap prefilter: extract a pattern's leading run of literal capital
-        # letters (skipping spaces) so obviously-mismatched patterns can be
-        # skipped before paying for full match0() (which is combinatorial in
-        # the number of optional groups).
-        def _lead_caps(pat_text):
-            p = []
-            for ch in pat_text:
-                if ch in CAPITAL:
-                    p.append(ch)
-                elif ch == ' ':
-                    continue
-                else:
-                    break
-            return ''.join(p)
 
         for i in self.state.pat:
             pln += 1
             pl = i
             self.state.vars = [VAR_UNDEF] * 26
-            
-            if i is None: continue
-            if self.directive_proc.set_symbol(i): continue
-            if self.directive_proc.clear_symbol(i): continue
-            if self.directive_proc.paddingp(i): continue
-            if self.directive_proc.bits(i): continue
-            if self.directive_proc.symbolc(i): continue
-            if self.directive_proc.epic(i): continue
-            if self.directive_proc.vliwp(i): continue
-            if self.directive_proc.check_processing(i): continue
-            if self.directive_proc.clrcheck_processing(i): continue
-            
+
+            if i is None:
+                continue
+            if self.directive_proc.set_symbol(i):
+                continue
+            if self.directive_proc.clear_symbol(i):
+                continue
+            if self.directive_proc.paddingp(i):
+                continue
+            if self.directive_proc.bits(i):
+                continue
+            if self.directive_proc.symbolc(i):
+                continue
+            if self.directive_proc.epic(i):
+                continue
+            if self.directive_proc.vliwp(i):
+                continue
+            if self.directive_proc.check_processing(i):
+                continue
+            if self.directive_proc.clrcheck_processing(i):
+                continue
+
             lw = len([_ for _ in i if _])
-            if lw == 0: continue
-            
+            if lw == 0:
+                continue
 
             lin = (l + ' ' + l2) if l2 else l
             lin = StringUtils.reduce_spaces(lin)
-            
+
             if i[0] == '':
                 hit_sentinel = True
                 if best is None:
                     idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                 break
-            
+
             _pfx = _lead_caps(i[0])
             if _pfx:
                 _k = 0
@@ -4421,8 +4531,8 @@ class Assembler:
                     continue
 
             self.state.error_undefined_label = False
-            
-            self.state.expmode=EXP_ASM
+
+            self.state.expmode = EXP_ASM
 
             saved_vars = self.state.vars[:]
             saved_refs_len = len(self.state._elf_label_refs_seen)
@@ -4434,7 +4544,6 @@ class Assembler:
             except (ArithmeticError, KeyError, IndexError, ValueError,
                     TypeError, AttributeError, OverflowError,
                     struct.error) as _pat_exc:
-
 
                 _match_result = False
                 if first_match_exc is None:
@@ -4456,11 +4565,9 @@ class Assembler:
                         'dir':   _snap_dirstate(),
                     }
 
-
                 self.state.vars = saved_vars
                 del self.state._elf_label_refs_seen[saved_refs_len:]
                 self.state._elf_var_to_label = saved_v2l
-
 
                 if score[0] == 0 and score[2] == 0:
                     break
@@ -4468,7 +4575,6 @@ class Assembler:
             self.state.error_undefined_label = False
 
         if best is not None and exc_log and (self.state.verbose or self.state.debug):
-
 
             _other_plns = sorted({e[0] for e in exc_log if e[0] != best['pln']})
             if _other_plns:
@@ -4553,7 +4659,7 @@ class Assembler:
             se = True
             pln = 0
             pl = ""
-        
+
         if self.state.should_report_errors():
             _loc = f"  [{self.state.current_file}:{self.state.ln}]"
             if self.state.error_undefined_label:
@@ -4568,9 +4674,9 @@ class Assembler:
                 self.state.had_error = True
                 print(f" ; pat {pln} {pl} error - Illegal syntax in assemble line or pattern line.{_loc}", file=sys.stderr)
                 return 0, [], False, idx
-        
+
         return idxs, objl, True, idx
-    
+
     def lineassemble(self, line):
         """Assemble one full source line: strip comments, apply any leading
         `label:`/`.EQU`, split VLIW slots (`!!`-separated, tracked in
@@ -4601,7 +4707,6 @@ class Assembler:
 
         line = self.asm_directive_proc.label_processing(line)
 
-
         _vparts = []
         _vpart_buf = []
         _in_dq_v = False
@@ -4622,7 +4727,7 @@ class Assembler:
                 _vpart_buf.extend(list(line[_vi:_new_vi]))
                 _vi = _new_vi
                 continue
-            elif not _in_dq_v and line[_vi:_vi+2] == '!!':
+            elif not _in_dq_v and line[_vi:_vi + 2] == '!!':
                 _vparts.append(''.join(_vpart_buf))
                 _vpart_buf = []
                 _vi += 2
@@ -4648,12 +4753,11 @@ class Assembler:
         if not flag:
             return False
 
-        if not self.state.vliwflag or (idx >= len(line) or line[idx:idx+2] != '!!'):
+        if not self.state.vliwflag or (idx >= len(line) or line[idx:idx + 2] != '!!'):
             of = len(objl)
             if self.state.elf_objfile and self.state.pas == 2 and objl and self.state._elf_label_refs_seen:
                 bpw_r = max(1, (self.state.bts + 7) // 8)
                 sec_name_r = self.state.current_section
-
 
                 _completed_words = 0
                 _entry_pc_cur = 0
@@ -4710,7 +4814,10 @@ class Assembler:
                 # -m/--machine is validated against it at startup, so a
                 # lookup miss here can't happen for a completed run.
                 _mach_tbl_la = ELF_MACHINES[self.state.elf_machine]
-                _rmap = _mach_tbl_la['width_guess']
+                # A `.reloctype` directive in the source file overrides the
+                # machine's built-in per-width default on a per-width basis;
+                # widths it didn't touch keep falling back to width_guess.
+                _rmap = {**_mach_tbl_la['width_guess'], **self.state.reloctype_override}
                 _pc_rel_types_all = _mach_tbl_la['pc_rel']
 
                 for lname, abs_w, first_widx, num_words in groups:
@@ -4847,13 +4954,12 @@ class Assembler:
                 if self.state.should_report_errors():
                     print(" error - Some error(s) in vliw definition.", file=sys.stderr)
 
-
                     if self.state.verbose or self.state.debug:
                         print(f"   ({type(_vliw_exc).__name__}: {_vliw_exc})", file=sys.stderr)
             return vflag
-        
+
         return True
-    
+
     def lineassemble0(self, line):
         """Wrapper around `lineassemble` that additionally echoes each source
         line (with its resolved pc) when in verbose/listing mode (pass 2 with
@@ -4869,7 +4975,7 @@ class Assembler:
             print("")
         self.state.ln += 1
         return f
-    
+
     def setpatsymbols(self, pat):
         """Pre-scan the whole pattern file's `.setsym`/`.clearsym` directives
         once up front, building `state.patsymbols` — the symbol-table baseline
@@ -4915,7 +5021,7 @@ class Assembler:
                 continue
         self.state.patsymbols = fresh
         self.state.symbols = dict(fresh)
-    
+
     def fileassemble(self, fn):
         """Assemble source file `fn` line by line (or `state.stdin_tmp_path`'s
         cached copy of stdin, so stdin can be read once and reused across
@@ -4969,7 +5075,6 @@ class Assembler:
                         stdintmp.write(af)
                 fn = self.state.stdin_tmp_path
 
-
             with open(fn, "rt", encoding="utf-8") as f:
                 af = f.readlines()
 
@@ -4979,7 +5084,7 @@ class Assembler:
             self.state.fnstack.pop()
             self.state.current_file = _caller_file
             self.state.ln = self.state.lnstack.pop()
-    
+
     def file_input_from_stdin(self):
         """Slurp all of stdin (used once, then cached to a temp file by
         `fileassemble` so both assembly passes can re-read the same input)."""
@@ -4990,7 +5095,7 @@ class Assembler:
                 break
             af += line.replace('\r', '')
         return af
-    
+
     def imp_label(self, l):
         """Parse one line of a `--import` label file: either a 3-field section
         record (`name\\tstart_hex\\tsize_hex`, accumulated into `_imp_sections`
@@ -5012,7 +5117,6 @@ class Assembler:
             except ValueError:
                 return False
 
-
             self._imp_sections.setdefault(sname, []).append((start, size))
             return True
 
@@ -5020,7 +5124,6 @@ class Assembler:
             label = fields[0]
             if not label:
                 return False
-
 
             reloc_type = None
             if '::' in label:
@@ -5037,7 +5140,6 @@ class Assembler:
             except ValueError:
                 return False
             section = '.text'
-
 
             _found = False
             for sname, _ranges in self._imp_sections.items():
@@ -5079,7 +5181,7 @@ class Assembler:
             return True
 
         return False
-    
+
     def printaddr(self, pc):
         """Print a 16-hex-digit address prefix (verbose/listing mode)."""
         print("%016x: " % pc, end='')
@@ -5176,7 +5278,6 @@ class Assembler:
                     return bytes(out)
                 out.append(b | 0x80)
 
-        csec_by_name = {s.name: s for s in csecs}
         _csec_idx_by_name = {s.name: i + 1 for i, s in enumerate(csecs)}
 
         def _addr_to_sec(byte_addr, sec_name=None):
@@ -5327,7 +5428,6 @@ class Assembler:
         for sidx in sorted(rows_by_sec.keys()):
             rows = sorted(rows_by_sec[sidx], key=lambda r: r[0])
             csec = csecs[sidx - 1]
-
 
             def _woff(wpc, _name=csec.name):
                 _o = self._addr_to_word_offset(_name, wpc)
@@ -5512,17 +5612,20 @@ class Assembler:
                 tmp = val
                 if self.state.endian == 'little':
                     for j in range(bpw):
-                        if off + j < n: data[off + j] = tmp & 0xff
+                        if off + j < n:
+                            data[off + j] = tmp & 0xff
                         tmp >>= 8
                 else:
                     for j in range(bpw - 1, -1, -1):
-                        if off + j < n: data[off + j] = tmp & 0xff
+                        if off + j < n:
+                            data[off + j] = tmp & 0xff
                         tmp >>= 8
             return bytes(data)
 
         class _CSec:
             """One finished output section's name, extracted byte data, and ELF flags."""
             __slots__ = ('name', 'byte_start', 'data', 'byte_size', 'flags')
+
             def __init__(self, name, byte_start, data, flags):
                 self.name       = name
                 self.byte_start = byte_start
@@ -5544,17 +5647,21 @@ class Assembler:
             sec_names = list(self.state.sections.keys())
             for i, sname in enumerate(sec_names):
 
-
                 ranges = self._section_word_ranges(sname)
                 w0 = ranges[0][0] if ranges else self.state.sections[sname][0]
                 byte_start = w0 * bpw
                 data = b''.join(_extract(rs, rl) for rs, rl in ranges)
                 uname = sname.upper()
-                if   uname.startswith('.TEXT'):   flags = 0x2 | 0x4
-                elif uname.startswith('.DATA'):   flags = 0x2 | 0x1
-                elif uname.startswith('.RODATA'): flags = 0x2
-                elif uname.startswith('.BSS'):    flags = 0x2 | 0x1
-                else:                             flags = 0x2
+                if   uname.startswith('.TEXT'):
+                    flags = 0x2 | 0x4
+                elif uname.startswith('.DATA'):
+                    flags = 0x2 | 0x1
+                elif uname.startswith('.RODATA'):
+                    flags = 0x2
+                elif uname.startswith('.BSS'):
+                    flags = 0x2 | 0x1
+                else:
+                    flags = 0x2
                 csecs.append(_CSec(sname, byte_start, data, flags))
 
         ncs = len(csecs)
@@ -5608,9 +5715,12 @@ class Assembler:
         for sidx in rela_sec_order:
             rela_name_offs.append(len(shstrtab))
             shstrtab += (_rela_prefix + csecs[sidx - 1].name).encode() + b'\x00'
-        symtab_name_off   = len(shstrtab); shstrtab += b'.symtab\x00'
-        strtab_name_off   = len(shstrtab); shstrtab += b'.strtab\x00'
-        shstrtab_name_off = len(shstrtab); shstrtab += b'.shstrtab\x00'
+        symtab_name_off   = len(shstrtab)
+        shstrtab += b'.symtab\x00'
+        strtab_name_off   = len(shstrtab)
+        shstrtab += b'.strtab\x00'
+        shstrtab_name_off = len(shstrtab)
+        shstrtab += b'.shstrtab\x00'
         dbg_prog_name_offs = []
         for (dname, _ddata) in dbg_prog:
             dbg_prog_name_offs.append(len(shstrtab))
@@ -5620,7 +5730,6 @@ class Assembler:
             dbg_rela_name_offs.append(len(shstrtab))
             shstrtab += rname.encode() + b'\x00'
         shstrtab = bytes(shstrtab)
-
 
         def _find_shndx(byte_addr, sec_name=None):
             """Resolve a raw byte address (with a section-name hint when known)
@@ -5685,7 +5794,8 @@ class Assembler:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr, _lsec)
             sym_val = int(sym_val) & _word_mask
-            name_off = len(strtab); strtab += name.encode() + b'\x00'
+            name_off = len(strtab)
+            strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x00, 0, shndx, sym_val, 0))
 
         first_global = len(syms)
@@ -5694,7 +5804,8 @@ class Assembler:
             is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
             if not is_imported or name in export_keys:
                 continue
-            name_off = len(strtab); strtab += name.encode() + b'\x00'
+            name_off = len(strtab)
+            strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x10, 0, 0, 0, 0))
 
         for name, *_eentry in sorted(self.state.export_labels.items()):
@@ -5710,7 +5821,8 @@ class Assembler:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr, _sec)
             sym_val = int(sym_val) & _word_mask
-            name_off = len(strtab); strtab += name.encode() + b'\x00'
+            name_off = len(strtab)
+            strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, 0x10, 0, shndx, sym_val, 0))
 
         symtab = b''.join(syms)
@@ -5753,13 +5865,17 @@ class Assembler:
             if _is_elf64:
                 r_info = (r_sym << 32) | (r_type & 0xffffffff)
                 _MAX, _MIN = (1 << 63) - 1, -(1 << 63)
-                if r_addend > _MAX: r_addend = _MAX
-                elif r_addend < _MIN: r_addend = _MIN
+                if r_addend > _MAX:
+                    r_addend = _MAX
+                elif r_addend < _MIN:
+                    r_addend = _MIN
                 return _struct.pack(f'{_pk}QQq', r_offset, r_info, r_addend)
             r_info = ((r_sym & 0xffffff) << 8) | (r_type & 0xff)
             _MAX, _MIN = (1 << 31) - 1, -(1 << 31)
-            if r_addend > _MAX: r_addend = _MAX
-            elif r_addend < _MIN: r_addend = _MIN
+            if r_addend > _MAX:
+                r_addend = _MAX
+            elif r_addend < _MIN:
+                r_addend = _MIN
             return _struct.pack(f'{_pk}IIi', r_offset, r_info, r_addend)
 
         def _pack_rel(r_offset, r_sym, r_type):
@@ -5805,9 +5921,12 @@ class Assembler:
             rela_offsets.append(offset)
             offset += len(rd)
 
-        symtab_off  = _align_up(offset, 8); offset = symtab_off + len(symtab)
-        strtab_off  = offset;               offset += len(strtab)
-        shstrtab_off = offset;              offset += len(shstrtab)
+        symtab_off  = _align_up(offset, 8)
+        offset = symtab_off + len(symtab)
+        strtab_off  = offset
+        offset += len(strtab)
+        shstrtab_off = offset
+        offset += len(shstrtab)
 
         base_idx = ncs + nrela + 3
         dbg_prog_offsets = []
@@ -5850,7 +5969,8 @@ class Assembler:
                 f.write(b'\x00' * (rela_offsets[i] - cur))
                 f.write(rd)
 
-            cur = f.tell(); f.write(b'\x00' * (symtab_off - cur))
+            cur = f.tell()
+            f.write(b'\x00' * (symtab_off - cur))
             f.write(symtab)
 
             f.write(strtab)
@@ -5866,7 +5986,8 @@ class Assembler:
                 f.write(b'\x00' * (dbg_rela_offsets[i] - cur))
                 f.write(rdata)
 
-            cur = f.tell(); f.write(b'\x00' * (shdr_off - cur))
+            cur = f.tell()
+            f.write(b'\x00' * (shdr_off - cur))
 
             f.write(_pack_shdr(0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
@@ -5929,7 +6050,6 @@ class Assembler:
                         help='Pattern definition file (.axx)')
         ap.add_argument('sourcefile', nargs='?', default=None,
                         help='Assembly source file (.s). Omit for interactive mode.')
-
 
         ap.add_argument('--osabi', dest='elf_osabi', type=str, default='FreeBSD',
                         help='ELF OSABI value (default: FreeBSD; FreeBSD/Linux, case-insensitive)')
@@ -6007,14 +6127,13 @@ class Assembler:
 
         args = ap.parse_args()
 
-        osabitbl = {'Linux':0,'linux':0,'FreeBSD':9,'freebsd':9}
+        osabitbl = {'Linux': 0, 'linux': 0, 'FreeBSD': 9, 'freebsd': 9}
 
         self.state.outfile      = args.outfile
         self.state.expfile      = args.expfile
         self.state.expfile_elf  = args.expfile_elf
         self.state.impfile      = args.impfile
         self.state.elf_objfile  = args.elf_objfile
-
 
         if args.elf_machine not in ELF_MACHINES:
             _known = ', '.join(f"{m} ({ELF_MACHINES[m]['name']})" for m in sorted(ELF_MACHINES))
@@ -6041,7 +6160,6 @@ class Assembler:
             self.setpatsymbols(self.state.pat)
 
             if self.state.impfile:
-
 
                 with open(self.state.impfile, 'rt', encoding="utf-8") as label_file:
                     raw_lines = label_file.readlines()
@@ -6081,11 +6199,9 @@ class Assembler:
                     self.lineassemble0(line)
             else:
 
-
                 MAX_RELAX = 16
                 self.state._pass1_prev_label_pcs = _RELAXATION_SENTINEL
                 self.state._relax_prev_values = {}
-
 
                 _seen_pcs_history = {}
 
@@ -6115,7 +6231,6 @@ class Assembler:
                             _e1[1] += _blk1
                             self.state.section_ranges.append((_last_sec1, _ep1, _blk1))
 
-
                     # A label whose value is still UNDEF-derived means some
                     # forward reference hasn't resolved yet this iteration;
                     # convergence can't be judged from PCs alone until that
@@ -6126,7 +6241,6 @@ class Assembler:
                         for k, (pc, _sec) in current_pcs.items()
                         if not (len(self.state.labels[k]) > 2 and self.state.labels[k][2])
                     )
-
 
                     self.state._relax_prev_values = {
                         k: v[0] for k, v in self.state.labels.items()
@@ -6152,7 +6266,6 @@ class Assembler:
                     self.state._pass1_prev_label_pcs = current_pcs
                 else:
 
-
                     print(" error - Pass1 relaxation did not converge after {0} iterations.".format(MAX_RELAX),
                           file=sys.stderr)
                     print("         Generated code would have incorrect addresses for", file=sys.stderr)
@@ -6167,7 +6280,6 @@ class Assembler:
                         if changed:
                             print(f"         Labels still changing: {', '.join(changed[:10])}", file=sys.stderr)
                     return False
-
 
                 _pass1_final_addrs = {
                     k: v[0] for k, v in self.state.labels.items()
@@ -6255,7 +6367,6 @@ class Assembler:
                         else:
                             flag = ''
 
-
                         ranges = [(rs, rl) for (rn, rs, rl) in self.state.section_ranges if rn == i]
                         if not ranges:
                             ranges = [(self.state.sections[i][0], self.state.sections[i][1])]
@@ -6278,7 +6389,7 @@ class Assembler:
                             lbl_addr = int(lbl_addr_raw)
                         except (OverflowError, ValueError, TypeError):
                             lbl_addr = 0
-                        
+
                         reloc_type_str = ''
                         if elf == 1:
                             lentry = self.state.labels.get(i[0], [])
@@ -6287,9 +6398,8 @@ class Assembler:
                                 reloc_type_str = _mach_tbl_exp['reverse'].get(lentry[4], '') if _mach_tbl_exp else ''
                                 if reloc_type_str:
                                     reloc_type_str = f'::{reloc_type_str}'
-                        
+
                         label_file.write(f"{i[0]}{reloc_type_str}\t{lbl_addr:#x}\n")
-                
 
             if self.state.expfile:
                 _write_export(self.state.expfile, elf=0)

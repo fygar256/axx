@@ -1026,6 +1026,15 @@ typedef struct {
     int        reloc_count;
     int        reloc_cap;
 
+    /* Source-file `.RELOCTYPE` directive: per-encoded-field-width override
+     * of this machine's built-in default width-guess reloc type
+     * (elf_machine_width_guess()). Index 0/1/2/3 corresponds to encoded
+     * field widths of 1/2/4/8 bytes; -1 = not overridden (fall back to the
+     * machine's built-in wg1/wg2/wg4/wg8). Mirrors axx.py's
+     * state.reloctype_override dict; see adir_reloctype() and its
+     * consultation at the RTYPE_FOR() width-guess lookup. */
+    int        reloctype_override[4];
+
     /* .check 拘束条件テーブル (変数 a-z に対応する 26 要素配列)。
      * check_constraints[i] は変数 'a'+i に対する許可シンボル名の StrVec。
      * 空 StrVec (len==0) はその変数に拘束なし。
@@ -1292,6 +1301,24 @@ static int elf_machine_width_guess(const ElfMachineInfo *m, int nbytes){
     }
 }
 
+/* Like elf_machine_width_guess(), but first consults the source file's
+ * `.RELOCTYPE` directive override (st->reloctype_override), if any was set
+ * for this width; falls back to the machine's built-in default otherwise.
+ * Mirrors axx.py's `{**width_guess, **state.reloctype_override}` merge at
+ * the same call site (ObjectGenerator.makeobj()). */
+static int reloctype_for(const AsmState *st, const ElfMachineInfo *m, int nbytes){
+    int idx;
+    switch(nbytes){
+        case 1: idx=0; break;
+        case 2: idx=1; break;
+        case 4: idx=2; break;
+        case 8: idx=3; break;
+        default: idx=-1; break;
+    }
+    if(idx>=0 && st->reloctype_override[idx]>=0) return st->reloctype_override[idx];
+    return elf_machine_width_guess(m, nbytes);
+}
+
 /* Finalize the current (last) section's size after fileassemble() completes.
  * adir_section() only updates the OLD section on switch; the final section is
  * never switched away from and stays at size=0.
@@ -1416,6 +1443,7 @@ static void state_init(AsmState *st) {
     st->relocations = NULL;
     st->reloc_count = 0;
     st->reloc_cap = 0;
+    for(int _rti=0; _rti<4; _rti++) st->reloctype_override[_rti] = -1;
     /* .check 拘束テーブルは memset で既にゼロ初期化済みだが、
      * sv_init() と同等であることを明示的に保証する。              */
     for(int _ci=0; _ci<26; _ci++) sv_init(&st->check_constraints[_ci]);
@@ -5208,6 +5236,93 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
     return 1;
 }
 
+/* axx.py reloctype_processing() port:
+ * .RELOCTYPE name8,name16,name32,name64
+ * Overrides, per encoded-field byte width, the default relocation type
+ * that the auto-detect path (RTYPE_FOR() / elf_machine_width_guess())
+ * picks for a label reference with no explicit `::reloctype` suffix on its
+ * own label (that per-label form is still `.EXTERN`/`.EQU ::reloctype`).
+ *
+ * The four comma-separated positions correspond, in order, to encoded
+ * field widths of 1, 2, 4, and 8 bytes. Fewer than four may be given, and a
+ * blank position (two consecutive commas, or a trailing comma) leaves that
+ * width's mapping untouched -- e.g. `.reloctype ,,,abs64` only changes the
+ * 8-byte width. Each name must be registered for the target machine
+ * (the same set `.EXTERN`/`.EQU` accept) and its registered width must
+ * match the position it's given in; otherwise it's rejected with a warning
+ * and that position keeps its previous mapping (built-in default, or an
+ * earlier `.reloctype` for the same width). Repeated `.RELOCTYPE`
+ * directives accumulate: only the widths named in the latest directive are
+ * touched. This is a whole-file, order-independent setting, like axx.py's
+ * counterpart -- it applies to every subsequent auto-detected relocation
+ * for the rest of the assembly (both passes) until changed again. */
+static int adir_reloctype(Assembler *asmb, const char *l, const char *l2){
+    AsmState *st=&asmb->st;
+    char up[16]; axx_strupr_to(up,l,sizeof(up));
+    if(strcmp(up,".RELOCTYPE")!=0) return 0;
+
+    const ElfMachineInfo *_mtbl_rt = elf_machine_find(st->elf_machine);
+    if(!_mtbl_rt){
+        fprintf(stderr," warning - .RELOCTYPE: no relocation table for machine %d\n",
+                st->elf_machine);
+        return 1;
+    }
+    static const int _widths[4] = {1, 2, 4, 8};
+
+    char buf[4096]; strncpy(buf,l2,sizeof(buf)-1); buf[sizeof(buf)-1]=0;
+    int blen=(int)strlen(buf);
+    int idx=0, pos=0;
+    while(idx<=blen){
+        int tok_start = idx;
+        while(idx<blen && buf[idx]!=',') idx++;
+        int tok_len = idx - tok_start;
+
+        if(pos >= 4){
+            if(tok_len > 0)
+                fprintf(stderr," warning - .RELOCTYPE: too many arguments "
+                        "(only 4 widths -- 8/16/32/64-bit -- are supported)\n");
+            break;
+        }
+
+        char name[64]={0};
+        /* trim surrounding spaces/tabs, lower-case, bounds-checked copy */
+        int a=tok_start, b=idx;
+        while(a<b && (buf[a]==' '||buf[a]=='\t')) a++;
+        while(b>a && (buf[b-1]==' '||buf[b-1]=='\t')) b--;
+        int nlen = b - a;
+        if(nlen > 0 && nlen < (int)sizeof(name)-1){
+            memcpy(name, buf+a, (size_t)nlen);
+            name[nlen]=0;
+            for(int _ci=0; name[_ci]; _ci++)
+                if(name[_ci]>='A' && name[_ci]<='Z') name[_ci]+=32;
+        }
+
+        if(name[0]){
+            int rtype = elf_machine_named(_mtbl_rt, name);
+            if(rtype < 0){
+                fprintf(stderr," warning - unknown reloc type '%s' in "
+                        ".RELOCTYPE for machine %d\n", name, st->elf_machine);
+            } else {
+                int expected_width = _widths[pos];
+                int actual_width = elf_machine_reloc_bytes(_mtbl_rt, rtype);
+                if(actual_width != 0 && actual_width != expected_width){
+                    fprintf(stderr," warning - .RELOCTYPE: '%s' is a %d-bit "
+                            "relocation type, but was given in the %d-bit "
+                            "position; ignored\n",
+                            name, actual_width*8, expected_width*8);
+                } else {
+                    st->reloctype_override[pos] = rtype;
+                }
+            }
+        }
+
+        pos++;
+        if(idx>=blen) break;
+        idx++;  /* skip ',' */
+    }
+    return 1;
+}
+
 /* =========================================================
  * Main assembly loop
  * ========================================================= */
@@ -5470,6 +5585,7 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(adir_org(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_labelc(st,l,l2)){ *idx_out=idx; return 1; }
     if(adir_extern(asmb,l,l2)){ *idx_out=idx; return 1; }
+    if(adir_reloctype(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_export(asmb,l,l2)){ *idx_out=idx; return 1; }
 
     /* 撤廃: ソース側(.sファイル)からの.setsym/.clearsymは廃止した。
@@ -5902,7 +6018,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
          * architectures; absolute variants: use .EXTERN label::abs32 /
          * ::abs64 etc. to force. */
             const ElfMachineInfo *_mtbl_rm = elf_machine_find(st->elf_machine);
-            #define RTYPE_FOR(nb) elf_machine_width_guess(_mtbl_rm, (nb))
+            #define RTYPE_FOR(nb) reloctype_for(st, _mtbl_rm, (nb))
 
             /* collect refs with valid word_idx (>= 0), sort by word_idx */
             ElfRef *_valid = (ElfRef*)malloc((size_t)st->elf_refs_len * sizeof(ElfRef));
