@@ -1,10 +1,10 @@
-# axx: Generalizing Imperative Assembly Languages ​​— Design and Implementation of a Universal Assembler Using a Free-Syntax Pattern Language
+# axx: Generalizing Imperative Assembly Languages ​​— Design and Implementation of a General Assembler Using a Free-Syntax Pattern Language
 
 **An introductory paper on axx.py by Taisuke Maekawa (fygar256)**
 
 ## Abstract
 
-axx (Arbitrary eXtended X assembler) is a universal assembler that breaks away from the traditional paradigm of implementing dedicated assemblers for individual processors. It is built upon the insight that all imperative assembly languages ​​can be reduced to a single pattern format: `instruction :: error_patterns :: binary_list`. This paper introduces the core innovations of axx—a free-syntax pattern language, character-by-character matching without a tokenizer, order-independent pattern matching based on specificity scores, and intentional Turing incompleteness—and demonstrates how extensions such as VLIW/EPIC support and ELF64 relocatable object output are seamlessly realized atop this minimal core. Additionally, the paper discusses the positioning of axx within the historical lineage of meta-assemblers and its significance in an era where AI generates pattern files.
+axx (Arbitrary eXtended X assembler) is a general assembler that breaks away from the traditional paradigm of implementing dedicated assemblers for individual processors. It is built upon the insight that all imperative assembly languages ​​can be reduced to a single pattern format: `instruction :: error_patterns :: binary_list`. This paper introduces the core innovations of axx—a free-syntax pattern language, character-by-character matching without a tokenizer, order-independent pattern matching based on specificity scores, and intentional Turing incompleteness—and demonstrates how extensions such as VLIW/EPIC support and ELF64 relocatable object output are seamlessly realized atop this minimal core. Additionally, the paper discusses the positioning of axx within the historical lineage of meta-assemblers and its significance in an era where AI generates pattern files.
 
 ## 1. Introduction
 
