@@ -5961,13 +5961,22 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     LabelEntry *_le = lmap_find(&st->labels, _lname);
                     if(_le && _le->reloc_type_override >= 0){
                         int _rt_ov = _le->reloc_type_override;
-                        /* ローカルラベル（非インポート）の場合、reloc_type が要求する
-                         * フィールド幅と実際のフィールド幅が一致しなければ override を無視する。
-                         * 例: abs64(8バイト) を 4バイトの CALL フィールドに適用すると
-                         * 隣接バイトを破壊してセグフォルトを引き起こす。
-                         * 外部ラベル（is_imported）はリンカが補正するため常に適用する。 */
+                        /* reloc_type が要求するフィールド幅と実際のフィールド幅が
+                         * 一致しなければ override を無視する。例: abs64(8バイト) を
+                         * 4バイトの CALL フィールドに適用すると隣接バイトを破壊して
+                         * セグフォルトを引き起こす。
+                         * Bugfix (axx.py port): 以前は is_imported (.EXTERN で
+                         * 宣言されたラベルは常にtrue) の場合このチェックを
+                         * 無条件にスキップしていた。`.EXTERN foo`(型指定なし)は
+                         * 常にマシンのデフォルトreloc型(例: x86_64なら4バイト幅の
+                         * PC32)を記録するため、1バイト幅の短縮ジャンプ(Jcc rel8)
+                         * のような狭いフィールドで参照されると、実際のフィールド幅
+                         * と食い違ったまま常に適用されてしまい、リンク時に後続の
+                         * 命令バイトまで巻き込んで破壊するrelocationが生成されて
+                         * いた。is_imported かどうかに関わらず幅チェックを適用する
+                         * (axx.pyのlineassemble()と同じ修正)。 */
                         int _expected = elf_machine_reloc_bytes(_mtbl_rm, _rt_ov);
-                        if(_le->is_imported || _expected == 0 || _expected == _nbytes)
+                        if(_expected == 0 || _expected == _nbytes)
                             _rtype = _rt_ov;
                         else {
                             _rtype = RTYPE_FOR(_nbytes);  /* フィールド幅不一致 → デフォルト */

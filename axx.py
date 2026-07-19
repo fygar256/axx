@@ -4723,7 +4723,23 @@ class Assembler:
                     if lentry and len(lentry) > 4 and lentry[4] is not None:
                         rtype_override = lentry[4]
                         expected = _mach_tbl_la['reloc_bytes'].get(rtype_override)
-                        if _is_imported or expected is None or expected == num_bytes:
+                        # Bugfix: this used to also trust the override
+                        # unconditionally whenever `_is_imported` (true for
+                        # every `.EXTERN` label, not just `-i`-imported
+                        # ones), skipping the width check entirely. Since
+                        # `.EXTERN` without an explicit `::type` always
+                        # records the machine's extern_default (e.g. a
+                        # 4-byte PC32-style type on x86_64) regardless of
+                        # the field actually encoded, *any* narrow-field
+                        # reference to a plain `.EXTERN`'d symbol (e.g. a
+                        # 1-byte `Jcc rel8` to an extern label) got a
+                        # relocation type wider than its field -- a linker
+                        # applying it per the ELF spec overwrites whatever
+                        # bytes follow. The width check must apply
+                        # uniformly regardless of is_imported; only an
+                        # unknown/unregistered reloc type (expected is
+                        # None) still passes through unchecked.
+                        if expected is None or expected == num_bytes:
                             rtype = rtype_override
                         else:
                             rtype = _rmap.get(num_bytes, 0)
