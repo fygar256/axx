@@ -1949,7 +1949,7 @@ class ExpressionEvaluator:
                     except (ValueError, ZeroDivisionError):
                         try:
                             v = self.xeval(t, None)
-                        except (ValueError, TypeError, OverflowError):
+                        except (ValueError, TypeError, OverflowError, ZeroDivisionError):
 
                             if self.state.should_report_errors():
                                 print(f" error - qad{{}}: cannot evaluate expression '{t}'; using 0.", file=sys.stderr)
@@ -1978,7 +1978,7 @@ class ExpressionEvaluator:
                     try:
                         v = float(self.xeval(t, None))
                         x = int.from_bytes(struct.pack('>d', v), "big")
-                    except (OverflowError, ValueError, TypeError, struct.error):
+                    except (OverflowError, ValueError, TypeError, struct.error, ZeroDivisionError):
                         if self.state.should_report_errors():
                             print(" error - dbl{}: cannot convert expression to float64; using 0.", file=sys.stderr)
                         x = 0
@@ -1997,7 +1997,7 @@ class ExpressionEvaluator:
                     try:
                         v = float(self.xeval(t, None))
                         x = int.from_bytes(struct.pack('>f', v), "big")
-                    except (OverflowError, ValueError, TypeError, struct.error):
+                    except (OverflowError, ValueError, TypeError, struct.error, ZeroDivisionError):
                         if self.state.should_report_errors():
                             print(" error - flt{}: cannot convert expression to float32; using 0.", file=sys.stderr)
                         x = 0
@@ -2162,7 +2162,14 @@ class ExpressionEvaluator:
             elif StringUtils.q(s, '//', idx):
                 t, idx = self.term0_0(s, idx + 2)
                 if t == 0:
-                    self.err("Division by 0 error.")
+                    # Bugfix: self.err() here used to print a bare
+                    # "Division by 0 error." with no " error -" prefix and
+                    # no had_error, so a division-by-zero in an ordinary
+                    # instruction operand silently produced a plausible-
+                    # looking 0 with a build that still reported success.
+                    if self.state.should_report_errors():
+                        print(" error - Division by 0 error.", file=sys.stderr)
+                        self.state.had_error = True
                     x = 0
                     break
                 else:
@@ -2170,7 +2177,9 @@ class ExpressionEvaluator:
             elif s[idx] == '/':
                 t, idx = self.term0_0(s, idx + 1)
                 if t == 0:
-                    self.err("Division by 0 error.")
+                    if self.state.should_report_errors():
+                        print(" error - Division by 0 error.", file=sys.stderr)
+                        self.state.had_error = True
                     x = 0
                     break
                 else:
@@ -2191,7 +2200,9 @@ class ExpressionEvaluator:
             elif s[idx] == '%':
                 t, idx = self.term0_0(s, idx + 1)
                 if t == 0:
-                    self.err("Division by 0 error.")
+                    if self.state.should_report_errors():
+                        print(" error - Division by 0 error.", file=sys.stderr)
+                        self.state.had_error = True
                     x = 0
                     break
                 else:
@@ -2728,6 +2739,7 @@ class DirectiveProcessor:
             value_field = ''
         else:
             print(" error - .setsym directive requires at least a symbol name", file=sys.stderr)
+            self.state.had_error = True
             return False
 
         if value_field:
@@ -2758,6 +2770,7 @@ class DirectiveProcessor:
                 self.state.bts = int(v)
             except (OverflowError, ValueError):
                 print(" error - .bits: non-finite bit width value.", file=sys.stderr)
+                self.state.had_error = True
         return True
 
     def paddingp(self, i):
@@ -2775,6 +2788,7 @@ class DirectiveProcessor:
             self.state.padding = int(v)
         except (OverflowError, ValueError):
             print(" error - .padding: non-finite or invalid value; padding unchanged.", file=sys.stderr)
+            self.state.had_error = True
         return True
 
     def symbolc(self, i):
@@ -2808,6 +2822,7 @@ class DirectiveProcessor:
             self.state.vliwtemplatebits = int(v3)
         except (OverflowError, ValueError):
             print(" error - .vliw: non-finite parameter value.", file=sys.stderr)
+            self.state.had_error = True
             # Bugfix: this directive line (i[0] == '.vliw') was already
             # claimed above; returning False here (instead of True, like
             # every other directive's error path) told the caller's dispatch
@@ -2821,6 +2836,7 @@ class DirectiveProcessor:
         if not (0 <= self.state.vliwinstbits <= _VLIW_INSTBITS_MAX):
             print(f" error - .vliw: vliwinstbits {self.state.vliwinstbits} is out of range "
                   f"(must be 0-{_VLIW_INSTBITS_MAX}).", file=sys.stderr)
+            self.state.had_error = True
             return True
 
         self.state.vliwflag = True
@@ -2845,6 +2861,7 @@ class DirectiveProcessor:
 
         if len(i) < 3:
             print(f" error - EPIC directive requires 2 parameters (indices, pattern), got {len(i) - 1}", file=sys.stderr)
+            self.state.had_error = True
             return False
 
         s = i[1]
@@ -2938,11 +2955,13 @@ class DirectiveProcessor:
             var_field, syms_field = i[2], ''
         else:
             print(" error - .check: variable name is not specified.", file=sys.stderr)
+            self.state.had_error = True
             return True
         var = var_field.strip().lower()
         if len(var) != 1 or var not in LOWER:
             print(f" error - .check: variable should be a lower case letter ('{var_field}').",
                   file=sys.stderr)
+            self.state.had_error = True
             return True
         syms = []
         if syms_field:
@@ -2962,6 +2981,7 @@ class DirectiveProcessor:
             else:
                 print(f" error - .clrcheck: variable should be a lower case letter ('{var_field}').",
                       file=sys.stderr)
+                self.state.had_error = True
         else:
             self.state.check_constraints.clear()
         return True
@@ -3859,6 +3879,17 @@ class AssemblyDirectiveProcessor:
                           f"explicit ::reloctype; the resulting constant assumes a specific "
                           f"section layout and will NOT be relocated by the linker.",
                           file=sys.stderr)
+                # Bugfix: an undefined label referenced by this .EQU's
+                # expression used to go completely unnoticed here -- no
+                # print, no had_error -- silently baking the UNDEF sentinel
+                # (or 0, during pass1's size-probe mode) into `label`'s
+                # value as if it were a legitimate constant. Mirrors the
+                # same check every other directive that evaluates an
+                # expression already performs (.ORG/.RESB/.ZERO).
+                if self.state.error_undefined_label and self.state.should_report_errors():
+                    print(f" error - .EQU '{label}': expression contains undefined label.",
+                          file=sys.stderr)
+                    self.state.had_error = True
                 ok = self.label_manager.put_value(label, u, self.state.current_section, is_equ=True, reloc_type=reloc_type)
                 return ""
             else:
@@ -3990,21 +4021,25 @@ class AssemblyDirectiveProcessor:
         if self.state.error_undefined_label:
             if self.state.should_report_errors():
                 print(" error - .RESB argument contains undefined label.", file=sys.stderr)
+                self.state.had_error = True
             return True
         try:
             x = int(x)
         except (OverflowError, ValueError):
             if self.state.should_report_errors():
                 print(" error - .RESB argument is non-finite or invalid.", file=sys.stderr)
+                self.state.had_error = True
             return True
         if x < 0:
             if self.state.should_report_errors():
                 print(f" error - .RESB requires a non-negative count, got {x}.", file=sys.stderr)
+                self.state.had_error = True
             return True
         _RESB_MAX = 1 << 28
         if x > _RESB_MAX:
             if self.state.should_report_errors():
                 print(f" error - .RESB count {x} exceeds maximum {_RESB_MAX}.", file=sys.stderr)
+                self.state.had_error = True
             return True
         self.state.pc += x
         return True
@@ -4021,21 +4056,25 @@ class AssemblyDirectiveProcessor:
         if self.state.error_undefined_label:
             if self.state.should_report_errors():
                 print(" error - .ZERO argument contains undefined label.", file=sys.stderr)
+                self.state.had_error = True
             return True
         try:
             x = int(x)
         except (OverflowError, ValueError):
             if self.state.should_report_errors():
                 print(" error - .ZERO argument is non-finite or invalid.", file=sys.stderr)
+                self.state.had_error = True
             return True
         if x < 0:
             if self.state.should_report_errors():
                 print(f" error - .ZERO requires a non-negative count, got {x}.", file=sys.stderr)
+                self.state.had_error = True
             return True
         _ZERO_MAX = 1 << 28
         if x > _ZERO_MAX:
             if self.state.should_report_errors():
                 print(f" error - .ZERO count {x} exceeds maximum {_ZERO_MAX}.", file=sys.stderr)
+                self.state.had_error = True
             return True
         for i in range(x):
             self.binary_writer.outbin2(self.state.pc, 0x00)
@@ -4055,6 +4094,7 @@ class AssemblyDirectiveProcessor:
         if not self.asciistr(l2):
             if self.state.should_report_errors():
                 print(" error - .ASCIZ requires a quoted string.", file=sys.stderr)
+                self.state.had_error = True
             return False
         self.binary_writer.outbin(self.state.pc, 0x00)
         self.state.pc += 1
@@ -4124,16 +4164,31 @@ class AssemblyDirectiveProcessor:
             return False
 
         if l2 != '':
+            # Bugfix: this directive never checked error_undefined_label at
+            # all -- an undefined label as the boundary argument evaluated
+            # to the UNDEF sentinel (an enormous but finite integer), which
+            # then sailed past the `u_int <= 0` guard (it's huge and
+            # positive) and got assigned directly to state.align, silently
+            # corrupting all subsequent .ALIGN padding computations. Same
+            # reset-before-evaluate-then-check pattern as .ORG/.RESB/.ZERO.
+            self.state.error_undefined_label = False
             u, idx = self.expr_eval.expression_asm(l2, 0)
+            if self.state.error_undefined_label:
+                if self.state.should_report_errors():
+                    print(" error - .ALIGN argument contains undefined label.", file=sys.stderr)
+                    self.state.had_error = True
+                return True
             try:
                 u_int = int(u)
             except (OverflowError, ValueError):
                 if self.state.should_report_errors():
                     print(" error - .ALIGN argument is non-finite or invalid.", file=sys.stderr)
+                    self.state.had_error = True
                 return True
             if u_int <= 0:
                 if self.state.should_report_errors():
                     print(f" error - .ALIGN requires a positive value, got {u_int}.", file=sys.stderr)
+                    self.state.had_error = True
                 return True
             self.state.align = u_int
 
@@ -4160,6 +4215,7 @@ class AssemblyDirectiveProcessor:
             return False
         if self.state.current_section not in self.state.sections:
             print(f" error - .ENDSECTION without matching .SECTION for '{self.state.current_section}'.", file=sys.stderr)
+            self.state.had_error = True
             return True
         entry = self.state.sections[self.state.current_section]
         start = entry[0]
@@ -4318,16 +4374,19 @@ class AssemblyDirectiveProcessor:
         if self.state.error_undefined_label:
             if self.state.should_report_errors():
                 print(" error - .ORG argument contains undefined label.", file=sys.stderr)
+                self.state.had_error = True
             return True
         try:
             u = int(u)
         except (OverflowError, ValueError):
             if self.state.should_report_errors():
                 print(" error - .ORG argument is non-finite or invalid.", file=sys.stderr)
+                self.state.had_error = True
             return True
         if u < 0:
             if self.state.should_report_errors():
                 print(f" error - .ORG address must be non-negative, got {u}.", file=sys.stderr)
+                self.state.had_error = True
             return True
         if idx + 2 <= len(l2) and l2[idx:idx + 2].upper() == ',P':
             if u > self.state.pc:
@@ -4336,6 +4395,7 @@ class AssemblyDirectiveProcessor:
                 if fill_count > _ORG_FILL_MAX:
                     if self.state.should_report_errors():
                         print(f" error - .ORG ,P fill count {fill_count} exceeds maximum {_ORG_FILL_MAX}.", file=sys.stderr)
+                        self.state.had_error = True
                     return True
                 for i in range(fill_count):
                     self.binary_writer.outbin2(i + self.state.pc, self.state.padding)
@@ -4455,11 +4515,13 @@ class Assembler:
             _ok = self.asm_directive_proc.ascii_processing(l, l2)
             if not _ok and (self.state.should_report_errors()):
                 print(f" error - .ASCII: failed to process string argument: {l2!r}", file=sys.stderr)
+                self.state.had_error = True
             return 0, [], True, idx
         if _l_upper == '.ASCIZ':
             _ok = self.asm_directive_proc.asciiz_processing(l, l2)
             if not _ok and (self.state.should_report_errors()):
                 print(f" error - .ASCIZ: failed to process string argument: {l2!r}", file=sys.stderr)
+                self.state.had_error = True
             return 0, [], True, idx
         if self.include_asm(l, l2):
             return 0, [], True, idx

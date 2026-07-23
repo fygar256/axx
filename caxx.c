@@ -3070,9 +3070,23 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                 } else {
                     int io2;
                     int prev_flt=asmb->st.exp_typ_float;
+                    /* Bugfix: this fallback tier doesn't exist in axx.py at
+                     * all (its qad{}/dbl{}/flt{} handlers only ever call
+                     * xeval(), never a general evaluator) -- it's a C-only
+                     * robustness addition for bodies xeval() can't parse.
+                     * Since axx.py never fails the whole build over what
+                     * happens inside qad{}/dbl{}/flt{}'s own evaluation
+                     * (e.g. "qad{1/0}" just prints its own message and uses
+                     * 0, exit 0), this fallback must not be able to set
+                     * had_error either -- otherwise a div-by-zero inside it
+                     * (which expr_term0() now correctly flags as a build
+                     * failure for ordinary operands) would abort a build
+                     * that axx.py completes successfully. */
+                    int _prior_had_error=asmb->st.had_error;
                     asmb->st.exp_typ_float=1;
                     uint256_t fv=expr_expression_pat(asmb,expr_buf,0,&io2);
                     asmb->st.exp_typ_float=prev_flt;
+                    asmb->st.had_error=_prior_had_error;
                     double dv=u256_to_double(fv);
                     char fstr[64]; snprintf(fstr,sizeof(fstr),"%.17g",dv);
                     x=ieee754_128_from_str(fstr);
@@ -3145,10 +3159,18 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                 if(xeval_eval(asmb, t, &xv)){
                     memcpy(&bits,&xv,8);
                 } else {
+                    /* Bugfix: see the identical comment in qad{}'s fallback
+                     * above -- this native-evaluator tier is C-only and
+                     * must not be able to set had_error, or a div-by-zero
+                     * inside it would abort a build axx.py completes
+                     * successfully (dbl{1/0} just prints its own message
+                     * and uses 0 there). */
                     int prev_flt = asmb->st.exp_typ_float;
+                    int _prior_had_error = asmb->st.had_error;
                     asmb->st.exp_typ_float = 1;
                     int io2; uint256_t fv = expr_expression_pat(asmb,t,0,&io2);
                     asmb->st.exp_typ_float = prev_flt;
+                    asmb->st.had_error = _prior_had_error;
                     double v = u256_to_double(fv);
                     memcpy(&bits,&v,8);
                 }
@@ -3189,10 +3211,14 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     float v = (float)xv;
                     memcpy(&bits,&v,4);
                 } else {
+                    /* Bugfix: see qad{}'s fallback comment above -- must
+                     * not let this C-only tier set had_error. */
                     int prev_flt = asmb->st.exp_typ_float;
+                    int _prior_had_error = asmb->st.had_error;
                     asmb->st.exp_typ_float = 1;
                     int io2; uint256_t fv = expr_expression_pat(asmb,t,0,&io2);
                     asmb->st.exp_typ_float = prev_flt;
+                    asmb->st.had_error = _prior_had_error;
                     float v = (float)u256_to_double(fv);
                     memcpy(&bits,&v,4);
                 }
@@ -3371,12 +3397,29 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             uint256_t t=expr_term0_0(asmb,s,idx+2,&idx);
             if(flt){
                 double b=u256_to_double(t);
-                if(b==0.0){ fprintf(stderr, "Division by 0 error.\n"); x=double_to_u256(0.0); }
+                if(b==0.0){
+                    /* Bugfix (axx.py port): this used to print a bare
+                     * "Division by 0 error." with no " error -" prefix and
+                     * no had_error, so a division-by-zero in an ordinary
+                     * instruction operand silently produced a plausible-
+                     * looking 0 with a build that still reported success. */
+                    if(should_report_errors(&asmb->st)){
+                        fprintf(stderr," error - Division by 0 error.\n");
+                        asmb->st.had_error = 1;
+                    }
+                    x=double_to_u256(0.0);
+                }
                 else x=double_to_u256(floor(u256_to_double(x)/b));
             } else {
                 /* Fix L: set x=0 on div-by-zero; previously x kept the old
                  * dividend value, making 'a//0' silently return 'a'. */
-                if(u256_is_zero(t)){ fprintf(stderr, "Division by 0 error.\n"); x=u256_zero(); }
+                if(u256_is_zero(t)){
+                    if(should_report_errors(&asmb->st)){
+                        fprintf(stderr," error - Division by 0 error.\n");
+                        asmb->st.had_error = 1;
+                    }
+                    x=u256_zero();
+                }
                 else x=u256_floordiv(x,t);
             }
         } else if(s[idx]=='/'&&s[idx+1]!='/'){
@@ -3384,22 +3427,56 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
             if(flt){
                 double b=u256_to_double(t);
-                if(b==0.0){ fprintf(stderr, "Division by 0 error.\n"); x=double_to_u256(0.0); }
+                if(b==0.0){
+                    /* Bugfix (axx.py port): this used to print a bare
+                     * "Division by 0 error." with no " error -" prefix and
+                     * no had_error, so a division-by-zero in an ordinary
+                     * instruction operand silently produced a plausible-
+                     * looking 0 with a build that still reported success. */
+                    if(should_report_errors(&asmb->st)){
+                        fprintf(stderr," error - Division by 0 error.\n");
+                        asmb->st.had_error = 1;
+                    }
+                    x=double_to_u256(0.0);
+                }
                 else x=double_to_u256(u256_to_double(x)/b);
             } else {
                 /* Fix L: same as // fix */
-                if(u256_is_zero(t)){ fprintf(stderr, "Division by 0 error.\n"); x=u256_zero(); }
+                if(u256_is_zero(t)){
+                    if(should_report_errors(&asmb->st)){
+                        fprintf(stderr," error - Division by 0 error.\n");
+                        asmb->st.had_error = 1;
+                    }
+                    x=u256_zero();
+                }
                 else x=u256_floordiv(x,t);
             }
         } else if(s[idx]=='%'){
             uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
             if(flt){
                 double b=u256_to_double(t);
-                if(b==0.0){ fprintf(stderr, "Division by 0 error.\n"); x=double_to_u256(0.0); }
+                if(b==0.0){
+                    /* Bugfix (axx.py port): this used to print a bare
+                     * "Division by 0 error." with no " error -" prefix and
+                     * no had_error, so a division-by-zero in an ordinary
+                     * instruction operand silently produced a plausible-
+                     * looking 0 with a build that still reported success. */
+                    if(should_report_errors(&asmb->st)){
+                        fprintf(stderr," error - Division by 0 error.\n");
+                        asmb->st.had_error = 1;
+                    }
+                    x=double_to_u256(0.0);
+                }
                 else x=double_to_u256(fmod(u256_to_double(x),b));
             } else {
                 /* Fix L: same as // fix */
-                if(u256_is_zero(t)){ fprintf(stderr, "Division by 0 error.\n"); x=u256_zero(); }
+                if(u256_is_zero(t)){
+                    if(should_report_errors(&asmb->st)){
+                        fprintf(stderr," error - Division by 0 error.\n");
+                        asmb->st.had_error = 1;
+                    }
+                    x=u256_zero();
+                }
                 else x=u256_mod(x,t);
             }
         } else break;
@@ -3859,6 +3936,7 @@ static int dir_vliwp(Assembler *asmb, PatEntry *e){
     if(asmb->st.vliwinstbits < 0 || asmb->st.vliwinstbits > 8192){
         fprintf(stderr," error - .vliw: vliwinstbits %d is out of range (must be 0-8192).\n",
                 asmb->st.vliwinstbits);
+        asmb->st.had_error = 1;
         return 1;
     }
     asmb->st.vliwflag=1;
@@ -3933,6 +4011,7 @@ static int dir_check(Assembler *asmb, PatEntry *e){
     const char *syms_str = e->f[1][0] ? e->f[2] : "";
     if(!var_str[0]){
         fprintf(stderr, " error - .check: variable name is not specified.\n");
+        asmb->st.had_error = 1;
         return 1;
     }
     char var = (char)tolower((unsigned char)var_str[0]);
@@ -3940,6 +4019,7 @@ static int dir_check(Assembler *asmb, PatEntry *e){
         fprintf(stderr,
             " error - .check: variable should be a lower case letter ('%s').\n",
             var_str);
+        asmb->st.had_error = 1;
         return 1;
     }
     int idx = var - 'a';
@@ -3977,6 +4057,7 @@ static int dir_clrcheck(Assembler *asmb, PatEntry *e){
             fprintf(stderr,
                 " error - .clrcheck: variable should be a lower case letter ('%s').\n",
                 var_str);
+            asmb->st.had_error = 1;
             return 1;
         }
         int idx = var - 'a';
@@ -5141,6 +5222,18 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
                             "relocated by the linker.\n", label);
                 }
             }
+            /* Bugfix (axx.py port): an undefined label referenced by this
+             * .EQU's expression used to go completely unnoticed here -- no
+             * print, no had_error -- silently baking the UNDEF sentinel
+             * (or 0, during pass1's size-probe mode) into `label`'s value
+             * as if it were a legitimate constant. Mirrors the same check
+             * every other directive that evaluates an expression already
+             * performs (.ORG/.RESB/.ZERO/.ALIGN). */
+            if(st->error_undefined_label && should_report_errors(st)){
+                fprintf(stderr, " error - .EQU '%s': expression contains undefined label.\n",
+                        label);
+                st->had_error = 1;
+            }
             /* ====================================================================== */
 
             label_put_value(st,label,u,st->current_section,1,reloc_type);  /* is_equ=1 */
@@ -5288,6 +5381,7 @@ static int adir_endsection(AsmState *st, const char *l){
     if(!e){
         fprintf(stderr," error - .ENDSECTION without matching .SECTION for '%s'.\n",
                st->current_section);
+        st->had_error = 1;
         return 1;
     }
     /* Confirmed size: measure from entry_pc (last re-entry) to current pc.
@@ -5327,22 +5421,28 @@ static int adir_resX(Assembler *asmb, const char *l, const char *l2,
     int io;
     uint256_t x=expr_expression_asm(asmb,l2,0,&io);
     if(asmb->st.error_undefined_label){
-        if(should_report_errors(&asmb->st))
+        if(should_report_errors(&asmb->st)){
             fprintf(stderr," error - %s argument contains undefined label.\n",directive);
+            asmb->st.had_error = 1;
+        }
         return 1;
     }
     int64_t cnt=u256_to_i64(x);
     if(cnt < 0){
-        if(should_report_errors(&asmb->st))
+        if(should_report_errors(&asmb->st)){
             fprintf(stderr," error - %s requires a non-negative count, got %lld.\n",
                     directive,(long long)cnt);
+            asmb->st.had_error = 1;
+        }
         return 1;
     }
     /* 256 MB guard: check before multiplying to avoid signed overflow */
     if(cnt > (int64_t)(1 << 28) / (int64_t)mul){
-        if(should_report_errors(&asmb->st))
+        if(should_report_errors(&asmb->st)){
             fprintf(stderr," error - %s count %lld (x%llu) exceeds maximum %d words.\n",
                     directive,(long long)cnt,(unsigned long long)mul,1<<28);
+            asmb->st.had_error = 1;
+        }
         return 1;
     }
     int64_t total = cnt * (int64_t)mul;
@@ -5376,14 +5476,18 @@ static int adir_zero(Assembler *asmb, const char *l, const char *l2){
     /* Fix ②: guard against UNDEF (undefined label) to avoid range(UNDEF) freeze.
      * Also guard against negative values. Mirrors axx.py zero_processing(). */
     if(asmb->st.error_undefined_label){
-        if(should_report_errors(&asmb->st))
+        if(should_report_errors(&asmb->st)){
             fprintf(stderr," error - .ZERO argument contains undefined label.\n");
+            asmb->st.had_error = 1;
+        }
         return 1;
     }
     int64_t cnt=u256_to_i64(x);
     if(cnt < 0){
-        if(should_report_errors(&asmb->st))
+        if(should_report_errors(&asmb->st)){
             fprintf(stderr," error - .ZERO requires a non-negative count, got %lld.\n", (long long)cnt);
+            asmb->st.had_error = 1;
+        }
         return 1;
     }
     for(int64_t i=0;i<cnt;i++){
@@ -5404,8 +5508,10 @@ static int adir_asciiz(Assembler *asmb, const char *l, const char *l2){
     if(strcmp(up,".ASCIZ")!=0) return 0;
     int f=asciistr(asmb,l2);
     if(!f){
-        if(should_report_errors(&asmb->st))
+        if(should_report_errors(&asmb->st)){
             fprintf(stderr," error - .ASCIZ requires a quoted string.\n");
+            asmb->st.had_error = 1;
+        }
         return 0;
     }
     outbin(&asmb->st,asmb->st.pc,u256_zero());
@@ -5416,16 +5522,33 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ALIGN")!=0) return 0;
     if(l2&&l2[0]){
+        /* Bugfix (axx.py port): this never checked error_undefined_label
+         * at all -- an undefined label as the boundary argument evaluated
+         * to the UNDEF sentinel (an enormous but finite value), which then
+         * sailed past the `u_int <= 0` guard below (it's huge and
+         * positive) and got assigned directly to st->align, silently
+         * corrupting all subsequent .ALIGN padding computations. Same
+         * reset-before-evaluate-then-check pattern as .ORG/.RESB/.ZERO. */
+        asmb->st.error_undefined_label = 0;
         int io; uint256_t u=expr_expression_asm(asmb,l2,0,&io);
+        if(asmb->st.error_undefined_label){
+            if(should_report_errors(&asmb->st)){
+                fprintf(stderr," error - .ALIGN argument contains undefined label.\n");
+                asmb->st.had_error = 1;
+            }
+            return 1;
+        }
         int64_t u_int=u256_to_i64(u);
         /* 破綻点修正 (axx.py port): 値の検証が一切なかったため、".ALIGN 0"が
          * align_addr()内の"addr % st->align"でゼロ除算を起こし、SIGFPEで
          * 即座にクラッシュしていた(axx.py側は元々 u_int<=0 をエラーとして
          * 弾いており、Cポートだけこのガードが欠落していた)。 */
         if(u_int <= 0){
-            if(should_report_errors(&asmb->st))
+            if(should_report_errors(&asmb->st)){
                 fprintf(stderr," error - .ALIGN requires a positive value, got %lld.\n",
                         (long long)u_int);
+                asmb->st.had_error = 1;
+            }
             return 1;
         }
         asmb->st.align=(int)u_int;
@@ -5459,8 +5582,10 @@ static int adir_org(Assembler *asmb, const char *l, const char *l2){
     /* Fix ②: guard against UNDEF to prevent pc being set to 0xffff…ff.
      * Mirrors axx.py org_processing() which checks error_undefined_label. */
     if(asmb->st.error_undefined_label){
-        if(should_report_errors(&asmb->st))
+        if(should_report_errors(&asmb->st)){
             fprintf(stderr," error - .ORG argument contains undefined label.\n");
+            asmb->st.had_error = 1;
+        }
         return 1;
     }
     if(io+2<=(int)strlen(l2) && axx_upper_char(l2[io])==','&&axx_upper_char(l2[io+1])=='P'){
