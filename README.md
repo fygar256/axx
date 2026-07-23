@@ -66,9 +66,9 @@ Thinking Machines - Massively parallel
 
 The execution platform is also independent of specific systems. It ignores `chr(13)` at the end of lines in DOS files. It should work on any system that runs Python.
 
-This version only covers the core parts of the assembler, so it does not support practical features such as optimizations found in dedicated assemblers, or high-performance macros that convert structured/functional assembly to instructional assembly. For practical features, please use the macro processor. Optimization is not supported. Basic functions are present, so please adapt them. The current version lacks practicality.
+This version only covers the core parts of the assembler. macro processor is built in but, it does not support practical features such as optimizations found in dedicated assemblers, or high-performance macros that convert structured/functional assembly to instructional assembly. For practical features, Basic functions are present, so please adapt them. The current version lacks practicality.
 
-Because pattern files and source files are separated, it's possible to generate machine code for a different processor from the source code of one instruction set, provided you don't consider the effort involved in coding. It's also possible to generate machine code for different processors from a common language. Writing multiple instruction codes in the pattern data's binary_list functions as a macro, but it's not very elegant. This allows you to write a simple compiler.
+Because pattern files and source files are separated, it's possible to generate machine code for a different processor from the source code of one instruction set, provided you don't consider the effort involved in coding. It's also possible to generate machine code for different processors from a common language. 
 
 axx reads assembler pattern data from the first argument and assembles the source file specified in the second argument based on that data. During this process, the pattern data is matched against the assembly lines one by one, and the `binary_list` of any matching pattern is output to the result. While the definition of directives within the pattern file is order-dependent, the patterns themselves are not. If the second argument is omitted, the source input is read from the terminal (standard input).
 
@@ -795,7 +795,7 @@ $ axx.py test.axx test.s
 
 * Currently, only quadruple-precision floating-point numbers can be handled as constants. This is due to the Python 3 specification. It would be great if Python 4 could handle quadruple-precision floating-point numbers.
 
-* Macro functionality requires a macro processor. To cover all assembly languages, a high-performance macro processor is needed to translate high-level assembly languages ​​such as functional and structured assembly languages ​​into imperative assembly language.
+*  Macro functionality is builtin but to cover all assembly languages, a high-performance macro processor is needed to translate high-level assembly languages ​​such as functional and structured assembly languages ​​into imperative assembly language.
 
 * Specifying the `-i` option imports labels from a TSV file. Specifying the `-e` option exports the labels specified in `.export`, along with the section/segment to which they belong, to a TSV file.
 
