@@ -3604,10 +3604,17 @@ static int dir_epic(Assembler *asmb, PatEntry *e){
  *     f[1] = 変数名 (省略時は全変数の拘束を解除)
  *   対象変数の拘束を解除する。
  *
- * dir_check_eval():
- *   マッチ成功後・makeobj 前に呼び出す。
- *   登録済みの全拘束を評価し、1つでも違反があれば pas==2/0 でエラーを
- *   stderr に出力して 1 を返す（呼び出し元が makeobj をスキップする）。
+ * 適用範囲についての訂正 (axx.py port): 拘束の実際の評価は
+ * pat_match() 内 `a>='a'&&a<='z'` 分岐 (このファイル内の該当箇所を
+ * 参照) 1箇所のみで行われ、パターンテンプレート中の素の小文字1文字
+ * (例: "MOV a,b" の a のように、ソース上の .setsym シンボル語に直接
+ * マッチする形) にのみ効く。"!x" 形式(任意の式を捕捉する)で束縛された
+ * 変数には一切適用されない -- !x は数値を計算する式であり、リストと
+ * 比較すべき単一の「シンボル名」が存在しないため。以前このコメントが
+ * 言及していた独立した dir_check_eval() 関数は実装として存在せず
+ * (grep しても本コメント以外に出現しない)、拘束評価は上記の pat_match()
+ * 内インライン処理がそのまま最終的な適用箇所である。axx.pyの
+ * check_processing() のdocstringも同じ誤りがあったため合わせて訂正した。
  * ========================================================= */
 static int dir_check(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".check") != 0) return 0;
@@ -7620,11 +7627,15 @@ int main(int argc, char *argv[]){
             if(getline(&line,&lcap,stdin)==-1) break;
             int ll=(int)strlen(line);
             while(ll>0&&(line[ll-1]=='\n'||line[ll-1]=='\r')) line[--ll]=0;
-            /* Python: line = line.replace("\\\\", "\\") */
-            for(int i=0;line[i];i++)
-                if(line[i]=='\\'&&line[i+1]=='\\'){
-                    line[i]='\\'; memmove(line+i+1,line+i+2,ll-i-1); ll--;
-                }
+            /* Bugfix (axx.py port): this used to also do an extra
+             * "replace('\\\\','\\')" pass here, mirroring what was (also
+             * buggily) in axx.py. That pre-collapsed backslash pairs
+             * BEFORE the line ever reached the normal string-literal
+             * escape processing (.ASCII/asciistr etc.), which already
+             * correctly interprets '\\' as one escaped backslash --
+             * double-processing it silently produced different bytes in
+             * interactive/stdin mode than the identical line assembled
+             * from a file would. Removed; both modes now agree. */
             /* Python: line = line.strip() */
             ll=(int)strlen(line);
             while(ll>0&&line[ll-1]==' ') line[--ll]=0;

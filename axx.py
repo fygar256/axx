@@ -2897,10 +2897,16 @@ class DirectiveProcessor:
         return triggered, error_code
 
     def check_processing(self, i):
-        """`.check var [ALLOWED,SYMS,...]` — restrict which symbol names the
-        lower-case pattern variable `var` (bound via a `!x` field) may match to;
-        an empty list means "no restriction has been set" is not the same as
-        "any symbol", callers consult `state.check_constraints` directly."""
+        """`.check var [ALLOWED,SYMS,...]` — restrict which `.setsym` symbol
+        names the lower-case pattern-template letter `var` (a *bare* operand
+        letter matched directly against a source symbol word, e.g. the `a`
+        in a template like `MOV a,b` -- NOT a `!x`-style captured
+        expression, which can evaluate to an arbitrary value and has no
+        single "symbol name" to check against a list; see the sole
+        enforcement site, ExpressionEvaluator/PatternMatcher's `elif a in
+        LOWER:` branch) may match to. An empty list means "no restriction
+        has been set" is not the same as "any symbol", callers consult
+        `state.check_constraints` directly."""
         if len(i) == 0 or i[0] != '.check':
             return False
         # Same readpat() 2-field-vs-3-field indexing quirk as .setsym (see
@@ -6187,7 +6193,6 @@ class Assembler:
                     self.printaddr(self.state.pc)
                     try:
                         line = input(">> ")
-                        line = line.replace("\\\\", "\\")
                     except EOFError:
                         break
                     line = line.strip()
