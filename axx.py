@@ -1591,6 +1591,7 @@ class ExpressionEvaluator:
             except RecursionError:
                 if self.state.should_report_errors():
                     print(" error - expression nesting too deep (RecursionError) in unary '-'.", file=sys.stderr)
+                    self.state.had_error = True
                 return 0, idx
             x = -x
         elif idx < len(s) and s[idx] == '~':
@@ -1599,12 +1600,14 @@ class ExpressionEvaluator:
             except RecursionError:
                 if self.state.should_report_errors():
                     print(" error - expression nesting too deep (RecursionError) in unary '~'.", file=sys.stderr)
+                    self.state.had_error = True
                 return 0, idx
             try:
                 x = ~int(x)
             except (OverflowError, ValueError):
                 if self.state.should_report_errors():
                     print(" error - cannot apply bitwise NOT (~) to non-finite float value.", file=sys.stderr)
+                    self.state.had_error = True
                 x = 0
         elif idx < len(s) and s[idx] == '@':
             try:
@@ -1612,6 +1615,7 @@ class ExpressionEvaluator:
             except RecursionError:
                 if self.state.should_report_errors():
                     print(" error - expression nesting too deep (RecursionError) in unary '@'.", file=sys.stderr)
+                    self.state.had_error = True
                 return 0, idx
             x = self.nbit(x)
         elif idx < len(s) and s[idx] == '*':
@@ -1630,22 +1634,39 @@ class ExpressionEvaluator:
                         except (OverflowError, ValueError):
                             if self.state.should_report_errors():
                                 print(" error - non-finite byte-extract offset in *(expr, expr).", file=sys.stderr)
+                                self.state.had_error = True
                             x = 0
                         else:
                             if shift_amount < 0:
                                 if self.state.should_report_errors():
                                     print(" error - negative byte-extract offset in *(expr, expr).", file=sys.stderr)
+                                    self.state.had_error = True
                                 x = 0
                             else:
                                 x = x >> shift_amount
                     else:
-                        print(" error - missing ')' in *(expr, expr) expression.", file=sys.stderr)
+                        # Bugfix: these three *(expr,expr) syntax-error
+                        # prints (missing ')', missing ',', missing '(')
+                        # used to be completely unconditional -- not even
+                        # gated by should_report_errors() like every other
+                        # diagnostic in the file, so they fired on every
+                        # pattern-match trial pass, and never set
+                        # had_error, so a malformed *(...) silently left a
+                        # 0 baked into the object file with a "successful"
+                        # build.
+                        if self.state.should_report_errors():
+                            print(" error - missing ')' in *(expr, expr) expression.", file=sys.stderr)
+                            self.state.had_error = True
                         x = 0
                 else:
-                    print(" error - missing ',' in *(expr, expr) expression.", file=sys.stderr)
+                    if self.state.should_report_errors():
+                        print(" error - missing ',' in *(expr, expr) expression.", file=sys.stderr)
+                        self.state.had_error = True
                     x = 0
             else:
-                print(" error - expected '(' after '*' in *(expr,expr) expression.", file=sys.stderr)
+                if self.state.should_report_errors():
+                    print(" error - expected '(' after '*' in *(expr,expr) expression.", file=sys.stderr)
+                    self.state.had_error = True
         else:
             prev_idx = idx
             x, idx = self.factor1(s, idx)
@@ -1862,7 +1883,14 @@ class ExpressionEvaluator:
             if idx < len(s) and s[idx] == ')':
                 idx += 1
             else:
-                print(" error - missing closing ')' in expression.", file=sys.stderr)
+                # Bugfix: unconditional print (no should_report_errors()
+                # gate, unlike every other diagnostic here) and no
+                # had_error -- a malformed "(...)" grouping anywhere in
+                # any expression silently produced a 0 with a "successful"
+                # build.
+                if self.state.should_report_errors():
+                    print(" error - missing closing ')' in expression.", file=sys.stderr)
+                    self.state.had_error = True
         elif idx + 4 <= len(s) and s[idx:idx + 4] == "'\\t'":
             x = 0x09
             idx += 4
@@ -1922,6 +1950,7 @@ class ExpressionEvaluator:
             if _sym_val == "":
                 if self.state.should_report_errors():
                     print(f" error - undefined symbol: '#{t}'", file=sys.stderr)
+                    self.state.had_error = True
                 x = 0
             else:
                 x = _sym_val
@@ -1953,6 +1982,7 @@ class ExpressionEvaluator:
 
                             if self.state.should_report_errors():
                                 print(f" error - qad{{}}: cannot evaluate expression '{t}'; using 0.", file=sys.stderr)
+                                self.state.had_error = True
                             h = '0' * 32
                         else:
                             if isinstance(v, int) or (
@@ -1981,6 +2011,7 @@ class ExpressionEvaluator:
                     except (OverflowError, ValueError, TypeError, struct.error, ZeroDivisionError):
                         if self.state.should_report_errors():
                             print(" error - dbl{}: cannot convert expression to float64; using 0.", file=sys.stderr)
+                            self.state.had_error = True
                         x = 0
         elif (idx + 3 <= len(s) and s[idx:idx + 3] == 'flt'
               and (lambda _j=StringUtils.skipspc(s, idx + 3): _j < len(s) and s[_j] == '{')()):
@@ -2000,6 +2031,7 @@ class ExpressionEvaluator:
                     except (OverflowError, ValueError, TypeError, struct.error, ZeroDivisionError):
                         if self.state.should_report_errors():
                             print(" error - flt{}: cannot convert expression to float32; using 0.", file=sys.stderr)
+                            self.state.had_error = True
                         x = 0
         elif (idx + 5 <= len(s) and s[idx:idx + 5] == 'enflt'
               and (lambda _j=StringUtils.skipspc(s, idx + 5): _j < len(s) and s[_j] == '{')()):
@@ -2063,7 +2095,13 @@ class ExpressionEvaluator:
             if idx < len(s) and s[idx] == ')':
                 idx += 1
             else:
-                print(" error - missing closing ')' in not(...) expression.", file=sys.stderr)
+                # Bugfix: unconditional print (no should_report_errors()
+                # gate, unlike every other diagnostic here) and no
+                # had_error -- a malformed "not(..." grouping silently
+                # produced a "successful" build.
+                if self.state.should_report_errors():
+                    print(" error - missing closing ')' in not(...) expression.", file=sys.stderr)
+                    self.state.had_error = True
             x = 0 if x else 1
         elif self.state.exp_typ == 'i' and idx < len(s) and s[idx].isdigit():
                 fs, idx = self.parser.get_intstr(s, idx)
@@ -2121,12 +2159,23 @@ class ExpressionEvaluator:
                 t_int = int(t)
             except (ValueError, OverflowError):
                 t_int = 0
+            # Bugfix: these four self.err() calls used to print with no
+            # " error - " prefix (breaking the convention every other
+            # diagnostic in the file follows), no should_report_errors()
+            # gating (so they'd also fire redundantly on every pattern-match
+            # trial/relaxation pass, not just the final reporting pass), and
+            # never set had_error -- so a malformed "**" expression silently
+            # evaluated to 0 with a clean, successful build.
             if t_int < 0:
-                self.err("Negative exponent in ** expression; result set to 0.")
+                if self.state.should_report_errors():
+                    print(" error - Negative exponent in ** expression; result set to 0.", file=sys.stderr)
+                    self.state.had_error = True
                 x = 0
                 break
             if t_int > _EXP_MAX:
-                self.err(f"Exponent {t_int} exceeds maximum {_EXP_MAX} in ** expression; result set to 0.")
+                if self.state.should_report_errors():
+                    print(f" error - Exponent {t_int} exceeds maximum {_EXP_MAX} in ** expression; result set to 0.", file=sys.stderr)
+                    self.state.had_error = True
                 x = 0
                 break
 
@@ -2135,14 +2184,18 @@ class ExpressionEvaluator:
             except (TypeError, ValueError, OverflowError):
                 _base_bits = 1024
             if _base_bits * max(t_int, 1) > _EXP_RESULT_MAX_BITS:
-                self.err(f"** result would exceed {_EXP_RESULT_MAX_BITS} bits "
-                         f"(chained exponentiation); result set to 0.")
+                if self.state.should_report_errors():
+                    print(f" error - ** result would exceed {_EXP_RESULT_MAX_BITS} bits "
+                          f"(chained exponentiation); result set to 0.", file=sys.stderr)
+                    self.state.had_error = True
                 x = 0
                 break
             try:
                 x = x ** t_int
             except OverflowError:
-                self.err("** result is too large to represent as a float; result set to 0.")
+                if self.state.should_report_errors():
+                    print(" error - ** result is too large to represent as a float; result set to 0.", file=sys.stderr)
+                    self.state.had_error = True
                 x = 0
                 break
             if isinstance(x, float) and x.is_integer():
@@ -2243,11 +2296,13 @@ class ExpressionEvaluator:
                 if t < 0:
                     if self.state.should_report_errors():
                         print(f" error - negative shift count ({t}) in << expression.", file=sys.stderr)
+                        self.state.had_error = True
                     x = 0
                     break
                 if t > _SHIFT_MAX:
                     if self.state.should_report_errors():
                         print(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in << expression.", file=sys.stderr)
+                        self.state.had_error = True
                     x = 0
                     break
                 x <<= t
@@ -2262,9 +2317,18 @@ class ExpressionEvaluator:
                 if t < 0:
                     if self.state.should_report_errors():
                         print(f" error - negative shift count ({t}) in >> expression.", file=sys.stderr)
+                        self.state.had_error = True
                     x = 0
                     break
                 if t > _SHIFT_MAX:
+                    # Bugfix: this branch used to silently zero the result
+                    # with NO diagnostic at all (unlike its << sibling just
+                    # above, which at least printed a message) -- an
+                    # oversized right-shift produced a plausible-looking 0
+                    # with a clean build and exit code 0.
+                    if self.state.should_report_errors():
+                        print(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in >> expression.", file=sys.stderr)
+                        self.state.had_error = True
                     x = 0
                     break
                 x >>= t
@@ -2278,6 +2342,11 @@ class ExpressionEvaluator:
         except (OverflowError, ValueError):
             if self.state.should_report_errors():
                 print(f" error - non-finite value {v!r} in bitwise '{op_name}' operation; treated as 0.", file=sys.stderr)
+                # Bugfix: this correctly-formatted, correctly-gated error
+                # print never set had_error, so a non-finite operand
+                # reaching &/|/^ silently became 0 with a clean, successful
+                # build despite a real " error - ..." having been printed.
+                self.state.had_error = True
             return 0
 
     def term3(self, s, idx):
@@ -2328,7 +2397,14 @@ class ExpressionEvaluator:
             if t <= 0:
                 x = 0
             elif t > _SEXT_MAX_BITS:
-                print(f" warning - sign-extension bit width {t} exceeds maximum {_SEXT_MAX_BITS}, result set to 0.", file=sys.stderr)
+                # Bugfix: unconditional print, unlike every other warning/
+                # error in the file (not should_report_errors()-gated) --
+                # fired redundantly on every pattern-match trial pass.
+                # Still just a warning (deliberately zeroes the result,
+                # like other precision-loss warnings elsewhere), so
+                # had_error is intentionally NOT set here.
+                if self.state.should_report_errors():
+                    print(f" warning - sign-extension bit width {t} exceeds maximum {_SEXT_MAX_BITS}, result set to 0.", file=sys.stderr)
                 x = 0
             else:
                 x = (x & ~((~0) << t)) | ((~0) << t if (x >> (t - 1) & 1) else 0)
@@ -3544,6 +3620,18 @@ class ObjectGenerator:
 
                     i += 1
                 else:
+                    # Bugfix: a malformed @@[...] group with no top-level
+                    # comma (e.g. a pattern-file typo like "@@[4*3]" instead
+                    # of "@@[4,3]") used to silently discard everything
+                    # between "@@[" and the matched (or missing) "]" here,
+                    # replacing it with the bare literal "@@[" and giving no
+                    # indication anything was wrong -- the caller's
+                    # expression parser then just saw a stray "[]" and
+                    # reported an unrelated generic "unrecognized token"
+                    # warning, if anything at all.
+                    if self.state.should_report_errors():
+                        print(" error - @@[...]: missing ',' separating count and pattern.", file=sys.stderr)
+                        self.state.had_error = True
                     result.append('@@[')
                     has_content = True
             else:

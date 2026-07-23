@@ -1910,8 +1910,20 @@ static F128R f128_term_fn(const char *s)
             r.val*=r2.val; r.end=r2.end;
         } else if(*p=='/'){
             F128R r2=f128_factor_fn(p+1); if(!r2.ok) break;
-            if(r2.val!=(__float128)0){ r.val/=r2.val; }
-            r.end=r2.end;
+            if(r2.val!=(__float128)0){ r.val/=r2.val; r.end=r2.end; }
+            else {
+                /* Bugfix: mirrors axx.py's decimal_eval_expr(), whose
+                 * Decimal arithmetic raises DivisionByZero (a
+                 * ZeroDivisionError subclass) for e.g. "1/0" -- its caller
+                 * (qad{}) catches that and falls through to xeval(). This
+                 * used to silently skip the division, leaving `r.val`
+                 * unchanged (e.g. "1/0" evaluated to 1, not a failure) and
+                 * never falling through. Fail the whole parse instead, so
+                 * the caller's existing fallback chain (xeval_eval(), then
+                 * the native-evaluator tier) runs, exactly like axx.py. */
+                r.ok=0;
+                return r;
+            }
         } else break;
     }
     return r;
@@ -1957,6 +1969,17 @@ static uint256_t f128_to_u256(__float128 v)
 static uint256_t f128_eval_text(const char *text, int *ok_out)
 {
     F128R r = f128_expr_fn(text);
+    if(r.ok){
+        /* Bugfix: mirrors axx.py's decimal_eval_expr(), whose Decimal
+         * arithmetic raises DivisionByZero (a ZeroDivisionError subclass)
+         * for e.g. "1/0", which its caller (qad{}) catches and falls
+         * through to xeval(). IEEE754 __float128 division instead
+         * silently produces infinity with no exception, so without this
+         * check "qad{1/0}" would succeed here with a bogus infinite
+         * result instead of falling through like axx.py does. */
+        double dcheck = (double)r.val;
+        if(!isfinite(dcheck)) r.ok = 0;
+    }
     if(ok_out) *ok_out = r.ok;
     if(!r.ok)  return u256_zero();
     return f128_to_u256(r.val);
@@ -2815,8 +2838,14 @@ static uint256_t expr_factor(Assembler *asmb, const char *s, int idx, int *idx_o
      * overflow. Mirrors axx.py's factor/_factor_impl split. */
     AsmState *st=&asmb->st;
     if(st->expr_depth >= EXPR_MAX_DEPTH){
-        if(should_report_errors(st))
+        /* Bugfix: mirrors axx.py's RecursionError handlers in unary
+         * -/~/@ -- gated correctly but never set had_error, so an
+         * expression nested too deep printed a real error yet still
+         * produced a "successful" exit 0 build. */
+        if(should_report_errors(st)){
             fprintf(stderr," error - expression nesting too deep.\n");
+            st->had_error = 1;
+        }
         if(idx_out) *idx_out = idx;
         return u256_zero();
     }
@@ -2866,19 +2895,50 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
                 uint256_t x2=expr_expression(asmb,s,idx+1,&i3); idx=i3;
                 if(s[idx]==')'){
                     idx++;
-                    int shift=(int)(u256_to_i64(x2)*8);
-                    x=u256_sar(x,shift);
+                    int64_t offset=u256_to_i64(x2);
+                    if(offset<0){
+                        /* Bugfix: mirrors axx.py's "negative byte-extract
+                         * offset in *(expr, expr)" diagnostic, which
+                         * didn't exist in C at all. */
+                        if(should_report_errors(st)){
+                            fprintf(stderr," error - negative byte-extract offset in *(expr, expr).\n");
+                            st->had_error = 1;
+                        }
+                        x=u256_zero();
+                    } else {
+                        int shift=(int)(offset*8);
+                        x=u256_sar(x,shift);
+                    }
                 } else {
-                    /* 修正⑩: missing ')' – report error and return 0 */
-                    fprintf(stderr," error - missing ')' in *(expr, expr) expression.\n");
+                    /* 修正⑩: missing ')' – report error and return 0.
+                     * Bugfix: this print used to be completely unconditional
+                     * (no should_report_errors() gate, unlike every other
+                     * diagnostic in the file) and never set had_error. */
+                    if(should_report_errors(st)){
+                        fprintf(stderr," error - missing ')' in *(expr, expr) expression.\n");
+                        st->had_error = 1;
+                    }
                     x=u256_zero();
                 }
             } else {
-                /* 修正⑩: missing ',' – report error and return 0 */
-                fprintf(stderr," error - missing ',' in *(expr, expr) expression.\n");
+                /* 修正⑩: missing ',' – report error and return 0.
+                 * Bugfix: same ungated/no-had_error issue as above. */
+                if(should_report_errors(st)){
+                    fprintf(stderr," error - missing ',' in *(expr, expr) expression.\n");
+                    st->had_error = 1;
+                }
                 x=u256_zero();
             }
-        } else x=u256_zero();
+        } else {
+            /* Bugfix: mirrors axx.py's "expected '(' after '*'" diagnostic,
+             * which didn't exist in C at all -- "*1,2)" (missing '(' after
+             * '*') silently returned 0 with zero diagnostic. */
+            if(should_report_errors(st)){
+                fprintf(stderr," error - expected '(' after '*' in *(expr,expr) expression.\n");
+                st->had_error = 1;
+            }
+            x=u256_zero();
+        }
     } else {
         x=expr_factor1(asmb,s,idx,&idx);
     }
@@ -2925,6 +2985,17 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
     if(s[idx]=='('){
         x=expr_expression(asmb,s,idx+1,&idx);
         if(s[idx]==')') idx++;
+        else {
+            /* axx.py port: mirrors ExpressionEvaluator.factor1()'s
+             * "missing closing ')' in expression" diagnostic, which didn't
+             * exist in C at all -- a malformed "(..." grouping anywhere in
+             * any expression silently kept whatever value was computed
+             * inside with zero diagnostic. */
+            if(should_report_errors(st)){
+                fprintf(stderr," error - missing closing ')' in expression.\n");
+                st->had_error = 1;
+            }
+        }
     }
     else if(idx+4<=slen && strncmp(s+idx,"'\\t'",4)==0){ x=u256_from_i64(0x09); idx+=4;
         if(asmb->st.exp_typ_float) x=double_to_u256(9.0); }
@@ -2998,7 +3069,18 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         char t[512];
         idx=axx_get_symbol_word(s,idx,st->swordchars,t,sizeof(t));
         uint256_t sv;
-        if(symbol_get(st,t,&sv)) x=sv; else x=u256_zero();
+        if(symbol_get(st,t,&sv)) x=sv;
+        else {
+            /* axx.py port: mirrors ExpressionEvaluator.factor1()'s
+             * "undefined symbol" diagnostic, which didn't exist in C at
+             * all -- an undefined "#symbol" reference silently became 0
+             * with zero diagnostic. */
+            if(should_report_errors(st)){
+                fprintf(stderr," error - undefined symbol: '#%s'\n", t);
+                st->had_error = 1;
+            }
+            x=u256_zero();
+        }
         if(asmb->st.exp_typ_float)
             x=double_to_u256((double)(int64_t)u256_to_u64(x));
     }
@@ -3068,28 +3150,46 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     char fstr[64]; snprintf(fstr,sizeof(fstr),"%.17g",xv);
                     x=ieee754_128_from_str(fstr);
                 } else {
+                    /* This fallback tier doesn't exist in axx.py (its
+                     * qad{}/dbl{}/flt{} handlers only ever call xeval());
+                     * it's a C-only robustness addition covering grammar
+                     * xeval_eval() intentionally doesn't parse (and/or/not,
+                     * comparisons, ternary -- axx.py's real xeval() supports
+                     * these via ast.parse(), but xeval_eval() deliberately
+                     * doesn't, see its own doc comment). Bugfix: axx.py's
+                     * qad{} now reports " error - qad{}: cannot evaluate
+                     * ...; using 0." and sets had_error whenever its xeval()
+                     * raises (e.g. "qad{1/0}") -- previously this fallback
+                     * silently absorbed the same failure (e.g. a
+                     * div-by-zero re-encountered inside expr_expression_pat)
+                     * with no diagnostic and no had_error, diverging from
+                     * axx.py's now-correct abort behavior. Distinguish
+                     * "xeval_eval() couldn't parse the grammar but the
+                     * fallback computed a clean value" (still silent, no
+                     * error -- matches axx.py's real xeval() succeeding on
+                     * and/or/not/comparisons/ternary) from "the fallback
+                     * itself hit a real error" (now reported, matching
+                     * axx.py's failure path) by checking whether the
+                     * fallback call itself newly set had_error. */
                     int io2;
                     int prev_flt=asmb->st.exp_typ_float;
-                    /* Bugfix: this fallback tier doesn't exist in axx.py at
-                     * all (its qad{}/dbl{}/flt{} handlers only ever call
-                     * xeval(), never a general evaluator) -- it's a C-only
-                     * robustness addition for bodies xeval() can't parse.
-                     * Since axx.py never fails the whole build over what
-                     * happens inside qad{}/dbl{}/flt{}'s own evaluation
-                     * (e.g. "qad{1/0}" just prints its own message and uses
-                     * 0, exit 0), this fallback must not be able to set
-                     * had_error either -- otherwise a div-by-zero inside it
-                     * (which expr_term0() now correctly flags as a build
-                     * failure for ordinary operands) would abort a build
-                     * that axx.py completes successfully. */
                     int _prior_had_error=asmb->st.had_error;
                     asmb->st.exp_typ_float=1;
                     uint256_t fv=expr_expression_pat(asmb,expr_buf,0,&io2);
                     asmb->st.exp_typ_float=prev_flt;
+                    int _fallback_errored = asmb->st.had_error && !_prior_had_error;
                     asmb->st.had_error=_prior_had_error;
-                    double dv=u256_to_double(fv);
-                    char fstr[64]; snprintf(fstr,sizeof(fstr),"%.17g",dv);
-                    x=ieee754_128_from_str(fstr);
+                    if(_fallback_errored){
+                        if(should_report_errors(&asmb->st)){
+                            fprintf(stderr," error - qad{}: cannot evaluate expression '%s'; using 0.\n", expr_buf);
+                            asmb->st.had_error = 1;
+                        }
+                        x=u256_zero();
+                    } else {
+                        double dv=u256_to_double(fv);
+                        char fstr[64]; snprintf(fstr,sizeof(fstr),"%.17g",dv);
+                        x=ieee754_128_from_str(fstr);
+                    }
                 }
             }
         }
@@ -3159,20 +3259,30 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                 if(xeval_eval(asmb, t, &xv)){
                     memcpy(&bits,&xv,8);
                 } else {
-                    /* Bugfix: see the identical comment in qad{}'s fallback
-                     * above -- this native-evaluator tier is C-only and
-                     * must not be able to set had_error, or a div-by-zero
-                     * inside it would abort a build axx.py completes
-                     * successfully (dbl{1/0} just prints its own message
-                     * and uses 0 there). */
+                    /* Bugfix: see the detailed comment in qad{}'s fallback
+                     * above -- distinguish "xeval_eval() couldn't parse the
+                     * grammar but the fallback computed cleanly" (silent,
+                     * matches axx.py's real xeval() succeeding on and/or/
+                     * not/comparisons/ternary) from "the fallback itself
+                     * hit a real error" (now reported + had_error, matching
+                     * axx.py's dbl{} failure path, e.g. "dbl{1/0}"). */
                     int prev_flt = asmb->st.exp_typ_float;
                     int _prior_had_error = asmb->st.had_error;
                     asmb->st.exp_typ_float = 1;
                     int io2; uint256_t fv = expr_expression_pat(asmb,t,0,&io2);
                     asmb->st.exp_typ_float = prev_flt;
+                    int _fallback_errored = asmb->st.had_error && !_prior_had_error;
                     asmb->st.had_error = _prior_had_error;
-                    double v = u256_to_double(fv);
-                    memcpy(&bits,&v,8);
+                    if(_fallback_errored){
+                        if(should_report_errors(&asmb->st)){
+                            fprintf(stderr," error - dbl{}: cannot convert expression to float64; using 0.\n");
+                            asmb->st.had_error = 1;
+                        }
+                        bits = 0;
+                    } else {
+                        double v = u256_to_double(fv);
+                        memcpy(&bits,&v,8);
+                    }
                 }
             }
             /* Bugfix: dbl{}'s result is conceptually an INTEGER (the
@@ -3211,16 +3321,28 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     float v = (float)xv;
                     memcpy(&bits,&v,4);
                 } else {
-                    /* Bugfix: see qad{}'s fallback comment above -- must
-                     * not let this C-only tier set had_error. */
+                    /* Bugfix: see qad{}'s fallback comment above --
+                     * distinguish a clean fallback success (silent) from
+                     * the fallback itself hitting a real error (now
+                     * reported + had_error, matching axx.py's flt{}
+                     * failure path). */
                     int prev_flt = asmb->st.exp_typ_float;
                     int _prior_had_error = asmb->st.had_error;
                     asmb->st.exp_typ_float = 1;
                     int io2; uint256_t fv = expr_expression_pat(asmb,t,0,&io2);
                     asmb->st.exp_typ_float = prev_flt;
+                    int _fallback_errored = asmb->st.had_error && !_prior_had_error;
                     asmb->st.had_error = _prior_had_error;
-                    float v = (float)u256_to_double(fv);
-                    memcpy(&bits,&v,4);
+                    if(_fallback_errored){
+                        if(should_report_errors(&asmb->st)){
+                            fprintf(stderr," error - flt{}: cannot convert expression to float32; using 0.\n");
+                            asmb->st.had_error = 1;
+                        }
+                        bits = 0;
+                    } else {
+                        float v = (float)u256_to_double(fv);
+                        memcpy(&bits,&v,4);
+                    }
                 }
             }
             /* See dbl{}'s comment above: same integer-vs-float-mode
@@ -3247,7 +3369,15 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         x=expr_expression(asmb,s,idx+4,&idx);
         idx=axx_skipspc(s,idx);
         if(idx<slen && s[idx]==')') idx++;
-        else fprintf(stderr," error - missing closing ')' in not(...) expression.\n");
+        else {
+            /* Bugfix: this print used to be completely unconditional (no
+             * should_report_errors() gate, unlike every other diagnostic
+             * in the file) and never set had_error. */
+            if(should_report_errors(st)){
+                fprintf(stderr," error - missing closing ')' in not(...) expression.\n");
+                st->had_error = 1;
+            }
+        }
         x=u256_from_i64(u256_is_zero(x)?1:0);
     }
     /* Float-mode number literal: parsed by axx_get_floatstr() as a double.
@@ -3377,6 +3507,43 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
             double a=u256_to_double(x), b=u256_to_double(t);
             x=double_to_u256(pow(a,b));
         } else {
+            /* axx.py port: mirrors ExpressionEvaluator.term0_0()'s exponent/
+             * result-size caps. Bugfix: this used to call u256_pow()
+             * directly with no guards at all -- a negative exponent (e.g.
+             * "2**-1") got reinterpreted as a huge unsigned 256-bit
+             * magnitude and squared through all 256 bits, silently
+             * producing a wrapped garbage result instead of axx.py's
+             * "negative exponent -> 0, error" behavior; a legitimately
+             * huge exponent had no cap at all, unlike Python's _EXP_MAX. */
+            const int64_t EXP_MAX = 1024;
+            const int64_t EXP_RESULT_MAX_BITS = 1 << 20;
+            int64_t t_int = u256_to_i64(t);
+            if(t_int < 0){
+                if(should_report_errors(&asmb->st)){
+                    fprintf(stderr," error - Negative exponent in ** expression; result set to 0.\n");
+                    asmb->st.had_error = 1;
+                }
+                x = u256_zero();
+                break;
+            }
+            if(t_int > EXP_MAX){
+                if(should_report_errors(&asmb->st)){
+                    fprintf(stderr," error - Exponent %lld exceeds maximum %lld in ** expression; result set to 0.\n",(long long)t_int,(long long)EXP_MAX);
+                    asmb->st.had_error = 1;
+                }
+                x = u256_zero();
+                break;
+            }
+            int64_t base_bits = u256_nbit(x);
+            int64_t exp_factor = t_int > 1 ? t_int : 1;
+            if(base_bits * exp_factor > EXP_RESULT_MAX_BITS){
+                if(should_report_errors(&asmb->st)){
+                    fprintf(stderr," error - ** result would exceed %lld bits (chained exponentiation); result set to 0.\n",(long long)EXP_RESULT_MAX_BITS);
+                    asmb->st.had_error = 1;
+                }
+                x = u256_zero();
+                break;
+            }
             x=u256_pow(x,t);
         }
     }
@@ -3505,20 +3672,70 @@ static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_ou
 static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term1(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
+    /* axx.py port: mirrors ExpressionEvaluator.term2()'s _SHIFT_MAX cap and
+     * had_error convention. Bugfix: this used to have no overflow cap at
+     * all, and neither branch's negative-shift-count error set had_error
+     * -- an error print with a build that still exited 0. */
+    const int64_t SHIFT_MAX = 65536;
     while(idx<slen){
         if(axx_q(s,slen,"<<",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
             int64_t sv=u256_to_i64(t);
-            if(sv<0){ if(should_report_errors(&asmb->st)) fprintf(stderr," error - negative shift count.\n"); x=u256_zero(); }
-            else x=u256_shl(x,(int)sv);
+            if(sv<0){
+                if(should_report_errors(&asmb->st)){
+                    fprintf(stderr," error - negative shift count (%lld) in << expression.\n",(long long)sv);
+                    asmb->st.had_error = 1;
+                }
+                x=u256_zero();
+            } else if(sv>SHIFT_MAX){
+                if(should_report_errors(&asmb->st)){
+                    fprintf(stderr," error - shift count %lld exceeds maximum %lld in << expression.\n",(long long)sv,(long long)SHIFT_MAX);
+                    asmb->st.had_error = 1;
+                }
+                x=u256_zero();
+            } else x=u256_shl(x,(int)sv);
         } else if(axx_q(s,slen,">>",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
             int64_t sv=u256_to_i64(t);
-            if(sv<0){ if(should_report_errors(&asmb->st)) fprintf(stderr," error - negative shift count.\n"); x=u256_zero(); }
-            else x=u256_sar(x,(int)sv);
+            if(sv<0){
+                if(should_report_errors(&asmb->st)){
+                    fprintf(stderr," error - negative shift count (%lld) in >> expression.\n",(long long)sv);
+                    asmb->st.had_error = 1;
+                }
+                x=u256_zero();
+            } else if(sv>SHIFT_MAX){
+                /* Bugfix: this branch used to silently zero the result
+                 * with NO diagnostic at all (unlike << above), mirroring
+                 * the identical fix applied to axx.py's term2(). */
+                if(should_report_errors(&asmb->st)){
+                    fprintf(stderr," error - shift count %lld exceeds maximum %lld in >> expression.\n",(long long)sv,(long long)SHIFT_MAX);
+                    asmb->st.had_error = 1;
+                }
+                x=u256_zero();
+            } else x=u256_sar(x,(int)sv);
         } else break;
     }
     *idx_out=idx; return x;
+}
+
+/* axx.py port: mirrors ExpressionEvaluator._safe_int(), used by
+ * term3/term4/term5 (&, |, ^) to guard against a non-finite float-mode
+ * operand reaching a bitwise operator. Bugfix: this check didn't exist in
+ * C at all -- a non-finite value (e.g. from "inf" under a !Fx/!Dx capture)
+ * silently participated in u256_and/or/xor's raw bit-pattern operation
+ * with zero diagnostic and no had_error, unlike axx.py's _safe_int(). */
+static uint256_t expr_safe_bitwise_operand(Assembler *asmb, uint256_t v, const char *op_name){
+    if(asmb->st.exp_typ_float){
+        double d = u256_to_double(v);
+        if(!isfinite(d)){
+            if(should_report_errors(&asmb->st)){
+                fprintf(stderr," error - non-finite value %g in bitwise '%s' operation; treated as 0.\n", d, op_name);
+                asmb->st.had_error = 1;
+            }
+            return u256_zero();
+        }
+    }
+    return v;
 }
 
 static uint256_t expr_term3(Assembler *asmb, const char *s, int idx, int *idx_out){
@@ -3526,7 +3743,7 @@ static uint256_t expr_term3(Assembler *asmb, const char *s, int idx, int *idx_ou
     int slen=(int)strlen(s);
     while(idx<slen && s[idx]=='&' && s[idx+1]!='&'){
         uint256_t t=expr_term2(asmb,s,idx+1,&idx);
-        x=u256_and(x,t);
+        x=u256_and(expr_safe_bitwise_operand(asmb,x,"&"),expr_safe_bitwise_operand(asmb,t,"&"));
     }
     *idx_out=idx; return x;
 }
@@ -3536,7 +3753,7 @@ static uint256_t expr_term4(Assembler *asmb, const char *s, int idx, int *idx_ou
     int slen=(int)strlen(s);
     while(idx<slen && s[idx]=='|' && s[idx+1]!='|'){
         uint256_t t=expr_term3(asmb,s,idx+1,&idx);
-        x=u256_or(x,t);
+        x=u256_or(expr_safe_bitwise_operand(asmb,x,"|"),expr_safe_bitwise_operand(asmb,t,"|"));
     }
     *idx_out=idx; return x;
 }
@@ -3546,7 +3763,7 @@ static uint256_t expr_term5(Assembler *asmb, const char *s, int idx, int *idx_ou
     int slen=(int)strlen(s);
     while(idx<slen && s[idx]=='^'){
         uint256_t t=expr_term4(asmb,s,idx+1,&idx);
-        x=u256_xor(x,t);
+        x=u256_xor(expr_safe_bitwise_operand(asmb,x,"^"),expr_safe_bitwise_operand(asmb,t,"^"));
     }
     *idx_out=idx; return x;
 }
@@ -3575,9 +3792,16 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
         if(tv<=0){
             x=u256_zero();
         } else if(tv > SEXT_MAX_BITS){
-            /* 修正⑨: 非現実的なビット幅は警告を出して 0 を返す (axx.py term6) */
-            fprintf(stderr, " warning - sign-extension bit width %lld exceeds maximum %d, result set to 0.\n",
-                   (long long)tv, SEXT_MAX_BITS);
+            /* 修正⑨: 非現実的なビット幅は警告を出して 0 を返す (axx.py term6)
+             * Bugfix: this print used to be completely unconditional (no
+             * should_report_errors() gate, unlike every other diagnostic),
+             * firing redundantly on every pattern-match trial pass. Still
+             * just a warning (deliberately zeroes the result), so
+             * had_error is intentionally NOT set, mirroring axx.py. */
+            if(should_report_errors(&asmb->st)){
+                fprintf(stderr, " warning - sign-extension bit width %lld exceeds maximum %d, result set to 0.\n",
+                       (long long)tv, SEXT_MAX_BITS);
+            }
             x=u256_zero();
         } else {
             /* mask = ~(~0 << tv)  -- safe because 0 < tv <= 128 < 256 */
@@ -4798,6 +5022,15 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
                 }
                 i++;
             } else {
+                /* Bugfix (mirrors axx.py ObjectGenerator.e_p()): a malformed
+                 * @@[...] group with no top-level comma (e.g. a pattern-file
+                 * typo like "@@[4*3]" instead of "@@[4,3]") used to silently
+                 * discard everything between "@@[" and the matched (or
+                 * missing) "]" here with no diagnostic at all. */
+                if(should_report_errors(&asmb->st)){
+                    fprintf(stderr," error - @@[...]: missing ',' separating count and pattern.\n");
+                    asmb->st.had_error = 1;
+                }
                 if(n+3<osz){ out[n++]='@'; out[n++]='@'; out[n++]='['; has_content=1; }
             }
         } else { out[n++]=pattern[i++]; has_content=1; }
