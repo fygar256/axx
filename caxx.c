@@ -2251,7 +2251,18 @@ static void var_put(AsmState *st, char ch, uint256_t v){
  * LabelManager
  * ========================================================= */
 static uint256_t label_get_value(AsmState *st, const char *k){
-    st->error_undefined_label=0;
+    /* Bugfix (axx.py port): this used to unconditionally clear
+     * error_undefined_label here on every call, clobbering the signal
+     * from an EARLIER label reference in the same compound expression
+     * (e.g. "undefined_label + defined_label": the first operand's lookup
+     * correctly sets the flag, but the second operand's lookup --
+     * succeeding -- reset it right back to 0, since none of the
+     * expr_termN() binary-operator levels save/restore or OR-merge the
+     * flag around each operand). Only ever SET it (on failure, below);
+     * never clear it here on success, so it correctly accumulates for the
+     * whole expression. Top-level callers that need a "fresh" check
+     * (.ORG/.RESB/.ZERO/etc.) reset it themselves immediately before
+     * evaluating their own expression. */
     LabelEntry *e=lmap_find(&st->labels,k);
     if(e){
         uint256_t ret_val = e->value;
@@ -2355,7 +2366,8 @@ static uint256_t label_get_value(AsmState *st, const char *k){
     return UNDEF_VAL();
 }
 static const char *label_get_section(AsmState *st, const char *k){
-    st->error_undefined_label=0;
+    /* Same fix as label_get_value() above: only ever set the flag, never
+     * clear it on success. */
     LabelEntry *e=lmap_find(&st->labels,k);
     if(e) return e->section;
     st->error_undefined_label=1;
@@ -2428,6 +2440,250 @@ static void label_print_all(AsmState *st){
 static int symbol_get(AsmState *st, const char *w, uint256_t *out){
     char uw[512]; axx_strupr_to(uw,w,sizeof(uw));
     return smap_get(&st->symbols,uw,out);
+}
+
+/* =========================================================
+ * xeval: qad{}/dbl{}/flt{} float-notation expression evaluator.
+ *
+ * axx.py port: mirrors axx.py's xeval() -- a SEPARATE, restricted
+ * arithmetic-expression language (not the general expr_expression()
+ * grammar used everywhere else in this file), used only to evaluate
+ * qad{}/dbl{}/flt{} bodies. Supports +,-,*,/,//,%,**, &,|,^,<<,>>, unary
+ * +,-,~, parentheses, ":labelname" label-value references, and calls to
+ * enfloat/endouble/enflt/endbl (bit-reinterpret an integer as a float).
+ * Values are represented as `double` throughout, matching how axx.py's
+ * xeval() duck-types int/float together for this use case.
+ *
+ * Was previously entirely unimplemented in the C port: flt{}/dbl{}/qad{}
+ * fell back to running the raw body text through the general expression
+ * evaluator, which has no notion of ":label" or enfloat(...)-style calls
+ * at all -- "enfloat" parsed as an (always-undefined) bare label
+ * reference and ":label" mostly got silently dropped, producing a wrong
+ * numeric result with no diagnostic. That silent-wrong-answer bug is
+ * exactly what motivated implementing this properly instead of just
+ * working around the symptom.
+ *
+ * Scope note: axx.py's xeval() also allows and/or/not, chained
+ * comparisons, and a Python `a if b else c` ternary (it parses the whole
+ * Python expression grammar via ast.parse). Those are not reproduced
+ * here -- they don't serve xeval()'s actual purpose (building a
+ * float32/float64/binary128 bit pattern from label values and
+ * constants), and no shipped .axx pattern file relies on them there.
+ * Extend the same way (see xeval_primary()/xeval_term()) if real usage
+ * turns up.
+ * ========================================================= */
+typedef struct { const char *s; int i; int len; int ok; Assembler *asmb; } XEP;
+
+static double xeval_expr(XEP *p);
+
+static void xeval_skip(XEP *p){
+    while(p->i<p->len && (p->s[p->i]==' '||p->s[p->i]=='\t')) p->i++;
+}
+
+/* NUMBER | ":labelname" | NAME '(' expr ')' | '(' expr ')' */
+static double xeval_primary(XEP *p){
+    xeval_skip(p);
+    if(!p->ok || p->i>=p->len){ p->ok=0; return 0; }
+    char c = p->s[p->i];
+    if(c=='('){
+        p->i++;
+        double v = xeval_expr(p);
+        xeval_skip(p);
+        if(p->i<p->len && p->s[p->i]==')') p->i++;
+        else p->ok=0;
+        return v;
+    }
+    if(c==':'){
+        p->i++;
+        int start=p->i;
+        while(p->i<p->len && (isalnum((unsigned char)p->s[p->i])||p->s[p->i]=='_'||p->s[p->i]=='.')) p->i++;
+        if(p->i==start){ p->ok=0; return 0; }
+        char name[512]; int n=p->i-start; if(n>(int)sizeof(name)-1) n=(int)sizeof(name)-1;
+        memcpy(name,p->s+start,(size_t)n); name[n]='\0';
+        /* Direct label-table lookup (mirrors axx.py xeval()'s replacer(),
+         * which reads self.state.labels[...] directly rather than going
+         * through get_value()/label_get_value() -- deliberately, so a
+         * failed lookup here only sets error_undefined_label without
+         * also printing its own "Label undefined" message; the outer
+         * caller (whatever ends up checking the flag) is what reports
+         * it, exactly once, if it's still set once evaluation finishes. */
+        AsmState *st=&p->asmb->st;
+        LabelEntry *e = lmap_find(&st->labels, name);
+        if(!e || u256_is_undef_derived(e->value)){
+            st->error_undefined_label = 1;
+            return 0;
+        }
+        return (double)u256_to_i64(e->value);
+    }
+    if(isalpha((unsigned char)c) || c=='_'){
+        int start=p->i;
+        while(p->i<p->len && (isalnum((unsigned char)p->s[p->i])||p->s[p->i]=='_')) p->i++;
+        char name[64]; int n=p->i-start; if(n>(int)sizeof(name)-1) n=(int)sizeof(name)-1;
+        memcpy(name,p->s+start,(size_t)n); name[n]='\0';
+        xeval_skip(p);
+        if(p->i>=p->len || p->s[p->i]!='('){
+            /* xeval() only allows bare names that are label placeholders
+             * (handled above via ':') or calls to the 4 allowed
+             * functions; anything else is a disallowed name in axx.py. */
+            p->ok=0; return 0;
+        }
+        p->i++;
+        double arg = xeval_expr(p);
+        xeval_skip(p);
+        if(p->i<p->len && p->s[p->i]==')') p->i++;
+        else { p->ok=0; return 0; }
+        if(strcmp(name,"enfloat")==0 || strcmp(name,"enflt")==0)
+            return enfloat_bits((uint64_t)(int64_t)arg);
+        if(strcmp(name,"endouble")==0 || strcmp(name,"endbl")==0)
+            return endouble_bits((uint64_t)(int64_t)arg);
+        p->ok=0; return 0;
+    }
+    if(isdigit((unsigned char)c) || c=='.'){
+        int start=p->i;
+        while(p->i<p->len && (isdigit((unsigned char)p->s[p->i])||p->s[p->i]=='.')) p->i++;
+        if(p->i<p->len && (p->s[p->i]=='e'||p->s[p->i]=='E')){
+            int save=p->i;
+            p->i++;
+            if(p->i<p->len && (p->s[p->i]=='+'||p->s[p->i]=='-')) p->i++;
+            if(p->i<p->len && isdigit((unsigned char)p->s[p->i])){
+                while(p->i<p->len && isdigit((unsigned char)p->s[p->i])) p->i++;
+            } else p->i=save;
+        }
+        char buf[80]; int n=p->i-start; if(n>(int)sizeof(buf)-1) n=(int)sizeof(buf)-1;
+        memcpy(buf,p->s+start,(size_t)n); buf[n]='\0';
+        return atof(buf);
+    }
+    p->ok=0; return 0;
+}
+
+static double xeval_unary(XEP *p);
+
+/* primary ('**' unary)?  -- right-associative, exponent may itself be unary
+ * (so "2**-1" parses), matching Python's ** precedence/associativity. */
+static double xeval_power(XEP *p){
+    double base = xeval_primary(p);
+    xeval_skip(p);
+    if(p->ok && p->i+1<p->len && p->s[p->i]=='*' && p->s[p->i+1]=='*'){
+        p->i+=2;
+        double e = xeval_unary(p);
+        return pow(base, e);
+    }
+    return base;
+}
+
+/* ('+'|'-'|'~') unary | power */
+static double xeval_unary(XEP *p){
+    xeval_skip(p);
+    if(p->ok && p->i<p->len && p->s[p->i]=='+'){ p->i++; return xeval_unary(p); }
+    if(p->ok && p->i<p->len && p->s[p->i]=='-'){ p->i++; return -xeval_unary(p); }
+    if(p->ok && p->i<p->len && p->s[p->i]=='~'){
+        p->i++;
+        double v = xeval_unary(p);
+        return (double)(~(int64_t)v);
+    }
+    return xeval_power(p);
+}
+
+/* unary (('//'|'/'|'%'|'*') unary)*  -- '//' checked before '/' */
+static double xeval_term(XEP *p){
+    double v = xeval_unary(p);
+    while(p->ok){
+        xeval_skip(p);
+        if(p->i+1<p->len && p->s[p->i]=='/' && p->s[p->i+1]=='/'){
+            p->i+=2; double t=xeval_unary(p);
+            if(t==0){ p->ok=0; break; }
+            v = floor(v/t);
+        } else if(p->i<p->len && p->s[p->i]=='/'){
+            p->i++; double t=xeval_unary(p);
+            if(t==0){ p->ok=0; break; }
+            v /= t;
+        } else if(p->i<p->len && p->s[p->i]=='%'){
+            p->i++; double t=xeval_unary(p);
+            if(t==0){ p->ok=0; break; }
+            v = v - floor(v/t)*t;
+        } else if(p->i<p->len && p->s[p->i]=='*'
+                  && !(p->i+1<p->len && p->s[p->i+1]=='*')){
+            p->i++; v *= xeval_unary(p);
+        } else break;
+    }
+    return v;
+}
+
+/* term (('+'|'-') term)* */
+static double xeval_addsub(XEP *p){
+    double v = xeval_term(p);
+    while(p->ok){
+        xeval_skip(p);
+        if(p->i<p->len && p->s[p->i]=='+'){ p->i++; v += xeval_term(p); }
+        else if(p->i<p->len && p->s[p->i]=='-'){ p->i++; v -= xeval_term(p); }
+        else break;
+    }
+    return v;
+}
+
+/* addsub (('<<'|'>>') addsub)* */
+static double xeval_shift(XEP *p){
+    double v = xeval_addsub(p);
+    while(p->ok){
+        xeval_skip(p);
+        if(p->i+1<p->len && p->s[p->i]=='<' && p->s[p->i+1]=='<'){
+            p->i+=2; double t=xeval_addsub(p);
+            v = (double)((int64_t)v << (int64_t)t);
+        } else if(p->i+1<p->len && p->s[p->i]=='>' && p->s[p->i+1]=='>'){
+            p->i+=2; double t=xeval_addsub(p);
+            v = (double)((int64_t)v >> (int64_t)t);
+        } else break;
+    }
+    return v;
+}
+
+/* shift ('&' shift)* */
+static double xeval_band(XEP *p){
+    double v = xeval_shift(p);
+    while(p->ok){
+        xeval_skip(p);
+        if(p->i<p->len && p->s[p->i]=='&'){ p->i++; v = (double)((int64_t)v & (int64_t)xeval_shift(p)); }
+        else break;
+    }
+    return v;
+}
+
+/* band ('^' band)* */
+static double xeval_bxor(XEP *p){
+    double v = xeval_band(p);
+    while(p->ok){
+        xeval_skip(p);
+        if(p->i<p->len && p->s[p->i]=='^'){ p->i++; v = (double)((int64_t)v ^ (int64_t)xeval_band(p)); }
+        else break;
+    }
+    return v;
+}
+
+/* bxor ('|' bxor)* */
+static double xeval_expr(XEP *p){
+    double v = xeval_bxor(p);
+    while(p->ok){
+        xeval_skip(p);
+        if(p->i<p->len && p->s[p->i]=='|'){ p->i++; v = (double)((int64_t)v | (int64_t)xeval_bxor(p)); }
+        else break;
+    }
+    return v;
+}
+
+/* Evaluate `text` (a qad{}/dbl{}/flt{} body) as an xeval expression.
+ * Returns 1 and sets *out on success, 0 on a genuine parse/syntax error
+ * (mirrors axx.py xeval() raising ValueError -- callers report their own
+ * "cannot convert expression" message in that case). An undefined
+ * ":label" reference is NOT a parse error: it returns 1 with *out=0, and
+ * the caller finds out via st->error_undefined_label (set above),
+ * exactly like axx.py's xeval(). */
+static int xeval_eval(Assembler *asmb, const char *text, double *out){
+    XEP p; p.s=text; p.i=0; p.len=(int)strlen(text); p.ok=1; p.asmb=asmb;
+    double v = xeval_expr(&p);
+    xeval_skip(&p);
+    if(!p.ok || p.i<p.len) return 0;
+    *out = v;
+    return 1;
 }
 
 /* =========================================================
@@ -2797,15 +3053,30 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             else
 #endif
             {
-                /* Fall back: evaluate as double-mode expression */
-                int io2;
-                int prev_flt=asmb->st.exp_typ_float;
-                asmb->st.exp_typ_float=1;
-                uint256_t fv=expr_expression_pat(asmb,expr_buf,0,&io2);
-                asmb->st.exp_typ_float=prev_flt;
-                double dv=u256_to_double(fv);
-                char fstr[64]; snprintf(fstr,sizeof(fstr),"%.17g",dv);
-                x=ieee754_128_from_str(fstr);
+                /* axx.py port: f128_eval_text() only handles pure
+                 * arithmetic (no labels/functions), mirroring
+                 * decimal_eval_expr() on the Python side -- try xeval()
+                 * next (":label" references, enfloat/endouble/enflt/
+                 * endbl calls), matching axx.py's qad{} handler, which
+                 * falls back from decimal_eval_expr() to xeval() before
+                 * giving up. Only fall further back to the general
+                 * expression evaluator (no label/function support
+                 * either, but historically what this file did) if even
+                 * that fails to parse. */
+                double xv;
+                if(xeval_eval(asmb, expr_buf, &xv)){
+                    char fstr[64]; snprintf(fstr,sizeof(fstr),"%.17g",xv);
+                    x=ieee754_128_from_str(fstr);
+                } else {
+                    int io2;
+                    int prev_flt=asmb->st.exp_typ_float;
+                    asmb->st.exp_typ_float=1;
+                    uint256_t fv=expr_expression_pat(asmb,expr_buf,0,&io2);
+                    asmb->st.exp_typ_float=prev_flt;
+                    double dv=u256_to_double(fv);
+                    char fstr[64]; snprintf(fstr,sizeof(fstr),"%.17g",dv);
+                    x=ieee754_128_from_str(fstr);
+                }
             }
         }
     }
@@ -2862,16 +3133,41 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             else if(strcmp(t,"inf")==0) bits=0x7ff0000000000000ULL;
             else if(strcmp(t,"-inf")==0) bits=0xfff0000000000000ULL;
             else {
-                /* Evaluate expression inside braces in float mode using the
-                 * native C expression evaluator (no Python subprocess). */
-                int prev_flt = asmb->st.exp_typ_float;
-                asmb->st.exp_typ_float = 1;
-                int io2; uint256_t fv = expr_expression_pat(asmb,t,0,&io2);
-                asmb->st.exp_typ_float = prev_flt;
-                double v = u256_to_double(fv);
-                memcpy(&bits,&v,8);
+                /* axx.py port: dbl{} always evaluates its body via
+                 * xeval() (":label" refs, enfloat/endouble/enflt/endbl
+                 * calls) -- it never falls back to the general
+                 * expression grammar, which doesn't understand either of
+                 * those. Only fall back here (native C evaluator, no
+                 * label/function support) if xeval() can't parse the
+                 * body at all, for robustness on anything relying on
+                 * plain arithmetic this port's xeval() doesn't cover. */
+                double xv;
+                if(xeval_eval(asmb, t, &xv)){
+                    memcpy(&bits,&xv,8);
+                } else {
+                    int prev_flt = asmb->st.exp_typ_float;
+                    asmb->st.exp_typ_float = 1;
+                    int io2; uint256_t fv = expr_expression_pat(asmb,t,0,&io2);
+                    asmb->st.exp_typ_float = prev_flt;
+                    double v = u256_to_double(fv);
+                    memcpy(&bits,&v,8);
+                }
             }
-            x=u256_from_u64(bits);
+            /* Bugfix: dbl{}'s result is conceptually an INTEGER (the
+             * float64 bit-pattern, matching axx.py's plain Python int),
+             * usable directly in an integer-mode encoding expression --
+             * but in float mode this file represents every uint256_t
+             * "value" as the bit-cast of a C double (see u256_to_double()/
+             * double_to_u256(), and the identical promotion already done
+             * for 0x.../0b... literals just above in this same function).
+             * Storing `bits` via u256_from_u64() unconditionally left a
+             * float-mode consumer's later u256_to_double() call
+             * bit-reinterpreting the raw integer bits as if they were
+             * already an encoded double -- garbage in every realistic
+             * case (e.g. dbl{}/flt{} nested inside a !D/!F capture, which
+             * evaluates its source text in float mode) instead of the
+             * intended numeric value. */
+            x = asmb->st.exp_typ_float ? double_to_u256((double)bits) : u256_from_u64(bits);
         }
     }
     else if(idx+3<=slen && strncmp(s+idx,"flt",3)==0 &&
@@ -2885,16 +3181,25 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             else if(strcmp(t,"inf")==0) bits=0x7f800000u;
             else if(strcmp(t,"-inf")==0) bits=0xff800000u;
             else {
-                /* Evaluate expression inside braces in float mode using the
-                 * native C expression evaluator (no Python subprocess). */
-                int prev_flt = asmb->st.exp_typ_float;
-                asmb->st.exp_typ_float = 1;
-                int io2; uint256_t fv = expr_expression_pat(asmb,t,0,&io2);
-                asmb->st.exp_typ_float = prev_flt;
-                float v = (float)u256_to_double(fv);
-                memcpy(&bits,&v,4);
+                /* See dbl{}'s comment just above: xeval() first, native
+                 * evaluator only as a fallback for anything xeval() can't
+                 * parse. */
+                double xv;
+                if(xeval_eval(asmb, t, &xv)){
+                    float v = (float)xv;
+                    memcpy(&bits,&v,4);
+                } else {
+                    int prev_flt = asmb->st.exp_typ_float;
+                    asmb->st.exp_typ_float = 1;
+                    int io2; uint256_t fv = expr_expression_pat(asmb,t,0,&io2);
+                    asmb->st.exp_typ_float = prev_flt;
+                    float v = (float)u256_to_double(fv);
+                    memcpy(&bits,&v,4);
+                }
             }
-            x=u256_from_u64(bits);
+            /* See dbl{}'s comment above: same integer-vs-float-mode
+             * value-representation fix. */
+            x = asmb->st.exp_typ_float ? double_to_u256((double)bits) : u256_from_u64(bits);
         }
     }
     else if(idx+4<=slen && axx_q(s,slen,"not(",idx)){
@@ -4455,8 +4760,18 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
 
     /* binary_list評価中フラグ: $$がpc_instr_startを返すのはこの期間のみ */
     st->in_binary_list = 1;
-    /* e_p/replace_percent前処理の残留フラグをリセット */
+    /* Bugfix (axx.py port): this used to unconditionally clear
+     * error_undefined_label here, discarding any "undefined label" status
+     * the caller had already established BEFORE calling makeobj() -- in
+     * particular, a !x-captured pattern variable's value is computed once
+     * during trial pattern-matching (label_get_value() calls happen
+     * there, not here), so if that capture referenced an undefined label,
+     * the only trace of it is the flag the caller carries into this call.
+     * Save it and OR it back in at the end (see any_undef below) instead
+     * of dropping it on the floor. */
+    int _prior_undef = st->error_undefined_label;
     st->error_undefined_label = 0;
+    int any_undef = 0;
 
     /* Fix P9: use a separate logical index for ELF word tracking so that
      * UNDEF-skipped elements do not cause subsequent elements to inherit a
@@ -4489,6 +4804,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         idx=io;
         logical_word_idx++;
         if(st->error_undefined_label){
+            any_undef = 1;
             if(s[idx]==','){idx++;continue;}
             continue;
         }
@@ -4513,6 +4829,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     }
     st->elf_current_word_idx = -1;
     st->in_binary_list = 0;
+    st->error_undefined_label = any_undef || _prior_undef;
     free(s);
 }
 
@@ -5003,6 +5320,10 @@ static int adir_resX(Assembler *asmb, const char *l, const char *l2,
                      const char *directive, uint64_t mul){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,directive)!=0) return 0;
+    /* label_get_value() no longer clears this for us on a successful
+     * lookup (see its Bugfix comment); reset before evaluating for a
+     * fresh check. */
+    asmb->st.error_undefined_label = 0;
     int io;
     uint256_t x=expr_expression_asm(asmb,l2,0,&io);
     if(asmb->st.error_undefined_label){
@@ -5048,6 +5369,8 @@ static int adir_resq(Assembler *asmb, const char *l, const char *l2){
 static int adir_zero(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ZERO")!=0) return 0;
+    /* See adir_resX()'s comment: reset before evaluating for a fresh check. */
+    asmb->st.error_undefined_label = 0;
     int io;
     uint256_t x=expr_expression_asm(asmb,l2,0,&io);
     /* Fix ②: guard against UNDEF (undefined label) to avoid range(UNDEF) freeze.
@@ -5129,6 +5452,8 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
 static int adir_org(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ORG")!=0) return 0;
+    /* See adir_resX()'s comment: reset before evaluating for a fresh check. */
+    asmb->st.error_undefined_label = 0;
     int io;
     uint256_t u=expr_expression_asm(asmb,l2,0,&io);
     /* Fix ②: guard against UNDEF to prevent pc being set to 0xffff…ff.
@@ -5379,6 +5704,14 @@ typedef struct {
     int       vliwbits, vliwinstbits, vliwtemplatebits, vliwflag;
     IntVec    vliwnop;
     VliwSet   vliwset;
+    /* Bugfix (axx.py port): a !x-captured pattern variable's value is
+     * computed once during THIS trial match (label_get_value() calls
+     * happen inside pat_match0() above, not later), so if that capture
+     * referenced an undefined label, this flag is the only record of it.
+     * Without saving/restoring it here, it was always discarded before
+     * the real makeobj() call and the final "Undefined label in
+     * expression" check downstream could ever see it. */
+    int       error_undefined_label;
 } BestMatch;
 
 static void best_init(BestMatch *b){
@@ -5416,6 +5749,7 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
     b->score_lit  = st->match_score_lit;
     b->pln        = pln;
     b->pat        = pat;
+    b->error_undefined_label = st->error_undefined_label;
     memcpy(b->vars, st->vars, sizeof(b->vars));
 
     /* マッチで追加された ELF 参照の差分を複製 */
@@ -5739,7 +6073,11 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
                                                   ? strdup(best.vtl[vi].label_name)
                                                   : NULL;
         }
-        st->error_undefined_label = 0;
+        /* Bugfix (axx.py port): restore (not hard-reset) so a !x-captured
+         * pattern variable's undefined-label status from the winning
+         * trial match (saved on `best` above) survives into the probe/
+         * real makeobj() calls below instead of being discarded here. */
+        st->error_undefined_label = best.error_undefined_label;
         st->expmode = EXP_ASM;
 
         /* $$/$. のために命令先頭・末尾アドレスを事前確定する。

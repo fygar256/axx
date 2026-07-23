@@ -1353,7 +1353,9 @@ class LabelManager:
         return None
 
     def get_section(self, k):
-        self.state.error_undefined_label = False
+        # Same fix as get_value() above: only ever set the flag, never
+        # clear it on success, so it doesn't clobber a sibling lookup's
+        # earlier failure within the same expression.
         try:
             v = self.state.labels[k][1]
         except (KeyError, IndexError):
@@ -1386,7 +1388,23 @@ class LabelManager:
         *unrelated* section, or generic expression evaluation outside both
         of the above) gets the raw stored value untouched.
         """
-        self.state.error_undefined_label = False
+        # Bugfix: this used to unconditionally reset error_undefined_label
+        # to False here, on every single lookup. That clobbers the signal
+        # from an EARLIER label reference in the same compound expression
+        # (e.g. "undefined_label + defined_label": the first operand's
+        # lookup correctly sets the flag, but the second operand's lookup
+        # -- succeeding -- reset it right back to False, since none of the
+        # binary-operator levels (term0..term11) save/restore or OR-merge
+        # the flag around each operand). The net effect: only the LAST
+        # label reference evaluated in an expression determined whether
+        # ".ORG"/".RESB"/".ZERO"/the main instruction-encoding check ever
+        # saw an undefined-label error at all -- an expression referencing
+        # one undefined and one defined label could silently encode as if
+        # correct, with no error printed. Only ever SET the flag (on
+        # failure) here; never clear it on success, so it correctly
+        # accumulates for the whole expression. Top-level callers that
+        # need a "fresh" check (.ORG/.RESB/.ZERO/etc.) reset it themselves
+        # immediately before evaluating their own expression.
         try:
             v = self.state.labels[k][0]
         except (KeyError, IndexError):
@@ -3538,6 +3556,17 @@ class ObjectGenerator:
             return objl
 
         self.state._in_binary_list = True
+        # Bugfix: this used to unconditionally reset error_undefined_label
+        # to False here, discarding any "undefined label" status the
+        # caller had already established BEFORE calling makeobj() -- in
+        # particular, a `!x`-captured pattern variable's value is computed
+        # once during trial pattern-matching (get_value() calls happen
+        # there, not here), so if that capture referenced an undefined
+        # label, the only trace of it is the error_undefined_label flag the
+        # caller carries into this call. Save it and OR it back in once
+        # this call's own (correctly self-contained, comma-word-list-local)
+        # tracking is done, instead of just dropping it on the floor.
+        _prior_undef = self.state.error_undefined_label
         self.state.error_undefined_label = False
         try:
             while True:
@@ -3579,6 +3608,7 @@ class ObjectGenerator:
             self.state._in_binary_list = False
             if self.state.pas == 1:
                 self.state._pass1_size_mode = False
+            self.state.error_undefined_label = self.state.error_undefined_label or _prior_undef
 
         return objl
 
@@ -3952,6 +3982,10 @@ class AssemblyDirectiveProcessor:
         runaway/misparsed count."""
         if StringUtils.upper(l1) != '.RESB':
             return False
+        # get_value() no longer clears this on a successful lookup (see its
+        # Bugfix comment), so callers that want a fresh per-evaluation
+        # check must reset it themselves right before evaluating.
+        self.state.error_undefined_label = False
         x, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
             if self.state.should_report_errors():
@@ -3980,6 +4014,9 @@ class AssemblyDirectiveProcessor:
         to the output (rather than just skipping pc), capped at `_ZERO_MAX`."""
         if StringUtils.upper(l1) != ".ZERO":
             return False
+        # See resb_processing()'s comment: get_value() no longer resets
+        # this for us, so reset before evaluating for a fresh check.
+        self.state.error_undefined_label = False
         x, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
             if self.state.should_report_errors():
@@ -4274,6 +4311,9 @@ class AssemblyDirectiveProcessor:
         bytes written for the skipped region."""
         if StringUtils.upper(l1) != ".ORG":
             return False
+        # See resb_processing()'s comment: get_value() no longer resets
+        # this for us, so reset before evaluating for a fresh check.
+        self.state.error_undefined_label = False
         u, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
             if self.state.should_report_errors():
@@ -4569,6 +4609,20 @@ class Assembler:
                         'refs':  self.state._elf_label_refs_seen[saved_refs_len:],
                         'v2l':   dict(self.state._elf_var_to_label),
                         'dir':   _snap_dirstate(),
+                        # Bugfix: a `!x`-captured pattern variable's value is
+                        # computed once here, during this trial match (e.g.
+                        # "!e" capturing "undefined_label*0 + deflab" into a
+                        # plain int stored in state.vars) -- makeobj() later
+                        # just reads that already-computed int back and never
+                        # calls get_value() again for it. Without saving
+                        # this flag here, the unconditional reset a few
+                        # lines below (and again once the winning pattern is
+                        # re-applied) always erased it before the final
+                        # "Undefined label in expression" check downstream
+                        # could ever see it, so an instruction whose only
+                        # undefined-label reference was inside a `!x`
+                        # capture silently encoded as if correct.
+                        'error_undefined_label': self.state.error_undefined_label,
                     }
 
                 self.state.vars = saved_vars
@@ -4599,7 +4653,7 @@ class Assembler:
             self.state.vars = best['vars'][:]
             self.state._elf_label_refs_seen.extend(best['refs'])
             self.state._elf_var_to_label = dict(best['v2l'])
-            self.state.error_undefined_label = False
+            self.state.error_undefined_label = best.get('error_undefined_label', False)
             self.state.expmode = EXP_ASM
 
             try:
@@ -4622,7 +4676,11 @@ class Assembler:
                     self.state._pass1_size_mode = _probe_sm_saved
                     del self.state._elf_label_refs_seen[_probe_refs_len:]
                     self.state._elf_current_word_idx = _probe_widx_saved
-                    self.state.error_undefined_label = False
+                    # Restore (not hard-reset) so the real makeobj() call
+                    # just below still sees the winning pattern's captured
+                    # undefined-label status (see the 'error_undefined_label'
+                    # key saved on `best` above) rather than losing it here.
+                    self.state.error_undefined_label = best.get('error_undefined_label', False)
                 err_triggered, _err_code = self.directive_proc.error(i[1])
                 if not err_triggered:
                     objl = self.obj_gen.makeobj(i[2])
