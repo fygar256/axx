@@ -925,7 +925,16 @@ class Parser:
                 t += s[idx]
                 idx += 1
             if idx >= len(s):
-                print(f" error - missing closing '}}' in expression: '{{{t}'", file=sys.stderr)
+                # Bugfix: this used to be completely unconditional (no
+                # should_report_errors() gate, unlike every other
+                # diagnostic in the file -- fired redundantly on every
+                # pattern-match trial pass) and never set had_error, so a
+                # malformed "qad{"/"dbl{"/"flt{"/"enflt{"/"endbl{" body
+                # missing its closing '}' silently produced a 0 with a
+                # "successful" build.
+                if self.state.should_report_errors():
+                    print(f" error - missing closing '}}' in expression: '{{{t}'", file=sys.stderr)
+                    self.state.had_error = True
                 return False, '', len(s)
             idx += 1
             f = True
@@ -1471,18 +1480,33 @@ class LabelManager:
                 if not old_is_imported:
                     self.state.error_label_conflict = True
                     self.state.had_error = True
+                    # NOTE: intentionally NOT gated by should_report_errors()
+                    # -- that helper excludes pas==1 by design (Pass 1
+                    # relaxation), and there is no equivalent re-check for a
+                    # genuine duplicate label during Pass 2 (its own check
+                    # just above tests the opposite condition: a label
+                    # MISSING from pass 1, not a duplicate WITHIN a pass).
+                    # Gating this would silently swallow the only diagnostic
+                    # a real duplicate-label error ever gets outside
+                    # interactive mode. This does still print once per
+                    # pass-1 relaxation iteration (up to MAX_RELAX=16x) for
+                    # the same duplicate -- cosmetic stderr noise, not a
+                    # correctness bug (had_error is already set once,
+                    # correctly aborting the build either way).
                     print(" error - label already defined.", file=sys.stderr)
                     return False
         elif self.state.pas == 2:
             if k not in self.state.labels:
                 self.state.error_label_conflict = True
                 self.state.had_error = True
-                print(f" error - label '{k}' not defined in pass 1.", file=sys.stderr)
+                if self.state.should_report_errors():
+                    print(f" error - label '{k}' not defined in pass 1.", file=sys.stderr)
                 return False
 
         if k in self.state.patsymbols:
             self.state.had_error = True
-            print(f" error - '{k}' is a pattern file symbol.", file=sys.stderr)
+            if self.state.should_report_errors():
+                print(f" error - '{k}' is a pattern file symbol.", file=sys.stderr)
             return False
 
         self.state.error_label_conflict = False
@@ -2046,6 +2070,7 @@ class ExpressionEvaluator:
                 if _inner_undef:
                     if self.state.should_report_errors():
                         print(" error - enflt{}: expression contains undefined label.", file=sys.stderr)
+                        self.state.had_error = True
                     x = enflt(0)
                 else:
                     try:
@@ -2053,6 +2078,7 @@ class ExpressionEvaluator:
                     except (OverflowError, ValueError):
                         if self.state.should_report_errors():
                             print(" error - enflt{}: non-finite float value; using 0.", file=sys.stderr)
+                            self.state.had_error = True
                         x = enflt(0)
         elif (idx + 5 <= len(s) and s[idx:idx + 5] == 'endbl'
               and (lambda _j=StringUtils.skipspc(s, idx + 5): _j < len(s) and s[_j] == '{')()):
@@ -2067,6 +2093,7 @@ class ExpressionEvaluator:
                 if _inner_undef:
                     if self.state.should_report_errors():
                         print(" error - endbl{}: expression contains undefined label.", file=sys.stderr)
+                        self.state.had_error = True
                     x = endbl(0)
                 else:
                     try:
@@ -2074,6 +2101,7 @@ class ExpressionEvaluator:
                     except (OverflowError, ValueError):
                         if self.state.should_report_errors():
                             print(" error - endbl{}: non-finite float value; using 0.", file=sys.stderr)
+                            self.state.had_error = True
                         x = endbl(0)
         elif idx + 4 <= len(s) and s[idx:idx + 4] == 'not(':
             # not(expr): logical negation, written as a call-like form rather
@@ -3221,6 +3249,7 @@ class PatternMatcher:
                     except (OverflowError, ValueError, struct.error):
                         if self.state.should_report_errors():
                             print(" error - !F: cannot convert value to float32; using 0.", file=sys.stderr)
+                            self.state.had_error = True
                         v = 0
                     self.var_manager.put(a, v)
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
@@ -3251,6 +3280,7 @@ class PatternMatcher:
                     except (OverflowError, ValueError, struct.error):
                         if self.state.should_report_errors():
                             print(" error - !D: cannot convert value to float64; using 0.", file=sys.stderr)
+                            self.state.had_error = True
                         v = 0
                     self.var_manager.put(a, v)
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
@@ -3765,6 +3795,7 @@ class VLIWProcessor:
                         print(" error - directives (e.g. .section/.endsection/.INCLUDE) "
                               "are not allowed inside VLIW slots (the packet's PC has not "
                               "advanced yet at this point in the packet).", file=sys.stderr)
+                        self.state.had_error = True
                     return False
                 idxs, objl, flag, idx = lineassemble2_func(line, idx)
                 if not flag:
@@ -3783,6 +3814,7 @@ class VLIWProcessor:
         if self.state.vliwinstbits == 0:
             if self.state.should_report_errors():
                 print(" error - vliwinstbits is zero; cannot compute instruction slots.", file=sys.stderr)
+                self.state.had_error = True
             return False
         for k in self.state.vliwset:
             if list(k[0]) == list(idxlst) or self.state.vliwtemplatebits == 0:
@@ -3801,6 +3833,7 @@ class VLIWProcessor:
                         print(f" error - .vliw: vliwtemplatebits ({self.state.vliwtemplatebits}) "
                               f"leaves no room for instruction slots in a {vbits}-bit packet "
                               f"(vliwinstbits={self.state.vliwinstbits}).", file=sys.stderr)
+                        self.state.had_error = True
                     return False
 
                 for j in objs:
@@ -3872,6 +3905,7 @@ class VLIWProcessor:
         else:
             if self.state.should_report_errors():
                 print(" error - No vliw instruction-set defined.", file=sys.stderr)
+                self.state.had_error = True
             return False
         return True
 
@@ -4491,6 +4525,1298 @@ class AssemblyDirectiveProcessor:
         return True
 
 
+# ===========================================================================
+# Macro preprocessor layer
+# ===========================================================================
+#
+# A source-to-source stage that runs over the raw source lines *before* the
+# assembler proper sees them (see `Assembler.fileassemble`).  It is kept
+# deliberately independent of the assembler's own expression evaluator,
+# label table, section state and program counter:
+#
+#   * The macro layer has its own value space (Python ints and strings) and
+#     its own variable namespace, so it can never observe a label whose value
+#     is still unknown, and can never observe a *different* value on a later
+#     relaxation pass.  Expansion is therefore a pure function of the source
+#     text, which is what lets `fileassemble()` simply re-run it on every
+#     Pass 1 relaxation iteration and on Pass 2 and hand the assembler
+#     byte-identical input every time.
+#
+#   * Conversely, nothing in the macro layer can read `.equ` symbols, labels
+#     or `$`/`$$`.  That is a design decision, not an omission: allowing it
+#     would make expansion pass-dependent, and could make the *number* of
+#     emitted source lines differ between passes -- something the relaxation
+#     loop has no way to converge on.
+#
+# Syntax (every statement starts with `!` as the first non-blank character of
+# a line; `{` opens a block at the end of a header line, and a line whose
+# first non-blank character is `}` closes one):
+#
+#     !def name(p1, p2, ...) {        macro / compile-time function
+#         ...
+#         !return expr                (optional; also an early exit)
+#     }
+#
+#     !if expr !then {
+#         ...
+#     } !elif expr !then {
+#         ...
+#     } !else {
+#         ...
+#     }
+#
+#     !while expr {
+#         ...
+#         !break / !continue
+#     }
+#
+#     !set name = expr                assign (innermost scope that has it)
+#     !local name [= expr]            declare in the current scope
+#     !undef name
+#     !name(a, b, ...)                expand a macro as a statement
+#     !include "file"                 macro-time textual include
+#     !error expr / !warning expr / !echo expr
+#
+# Inside an ordinary (non-`!`) line, `!{expr}` is replaced by the textual
+# value of `expr`, and `!{expr:fmt}` applies a Python format spec
+# (`!{n:04x}`).  Write `\!{` for a literal `!{`.
+#
+# Backward compatibility: a `!`-line is only intercepted when the word after
+# the `!` is one of the keywords above, the name of an already-defined macro,
+# or is immediately followed by `(`.  `!!` (VLIW slot separator) is never
+# touched, and a `}` line is only treated as a block close when a block is
+# actually open.  `--no-macro` disables the whole layer.
+# ===========================================================================
+
+
+# Recursion / runaway guards.  These exist so a mistake in a macro produces a
+# diagnostic instead of hanging the assembler or exhausting memory.
+_MACRO_MAX_DEPTH = 200
+_MACRO_MAX_ITER = 1000000
+_MACRO_MAX_LINES = 2000000
+_MACRO_MAX_INCLUDE_DEPTH = 64
+
+# Statement keywords.  A line starting with `!` is only intercepted when the
+# word after `!` is one of these or the name of an already-defined macro;
+# anything else is passed through untouched, so a pattern file that defines a
+# mnemonic beginning with `!` keeps working.
+_MACRO_KEYWORDS = frozenset((
+    'if', 'then', 'else', 'elif', 'while', 'def', 'return', 'set', 'local',
+    'break', 'continue', 'error', 'warning', 'echo', 'include', 'undef',
+))
+
+
+class MacroError(Exception):
+    """A macro-layer error.  `msg` is already fully formatted (with source
+    position); `MacroPreprocessor.expand()` turns it into a normal axx error
+    message on stderr."""
+
+    def __init__(self, msg):
+        super().__init__(msg)
+        self.msg = msg
+
+
+class _MacroBreak(Exception):
+    pass
+
+
+class _MacroContinue(Exception):
+    pass
+
+
+class _MacroReturn(Exception):
+    def __init__(self, value):
+        super().__init__(value)
+        self.value = value
+
+
+class _MacroFunc:
+    """One `!def`: parameter names plus the already-parsed body."""
+
+    __slots__ = ('name', 'params', 'defaults', 'body', 'pos')
+
+    def __init__(self, name, params, defaults, body, pos):
+        self.name = name
+        self.params = params
+        self.defaults = defaults
+        self.body = body
+        self.pos = pos
+
+
+def _fmt_pos(pos):
+    """`(file, lineno)` -> the `file:line` prefix used in diagnostics."""
+    return f"{pos[0]}:{pos[1]}"
+
+
+def _strip_comment(text):
+    """Remove a `;` comment from a macro *statement* line, respecting string
+    and character literals.  Ordinary (passed-through) source lines are never
+    touched here -- the assembler strips their comments itself, and the
+    listing output is expected to still show them."""
+    quote = ''
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == '\\':
+                i += 2
+                continue
+            if c == quote:
+                quote = ''
+        elif c in '"\'':
+            quote = c
+        elif c == ';':
+            return text[:i].rstrip()
+        i += 1
+    return text.rstrip()
+
+
+# ---------------------------------------------------------------------------
+# Expression evaluation
+# ---------------------------------------------------------------------------
+
+class _ExprParser:
+    """Recursive-descent evaluator for one macro-time expression.
+
+    Values are Python `int` or `str`.  Comparisons and the logical operators
+    yield 0/1.  `+` concatenates when either side is a string.  Precedence
+    follows C, with a ternary `?:` at the top."""
+
+    def __init__(self, text, pp, pos):
+        self.s = text
+        self.i = 0
+        self.pp = pp
+        self.pos = pos
+
+    # -- lexical helpers ---------------------------------------------------
+
+    def err(self, msg):
+        raise MacroError(f"{_fmt_pos(self.pos)}: macro expression: {msg} in {self.s!r}")
+
+    def skip(self):
+        while self.i < len(self.s) and self.s[self.i] in ' \t':
+            self.i += 1
+
+    def peek(self, n=1):
+        self.skip()
+        return self.s[self.i:self.i + n]
+
+    def eat(self, tok):
+        """Consume `tok` if it is next; return True if it was."""
+        self.skip()
+        if self.s.startswith(tok, self.i):
+            # An operator must not be the prefix of a longer operator, and a
+            # word operator must not be the prefix of an identifier.
+            if tok[-1].isalpha():
+                j = self.i + len(tok)
+                if j < len(self.s) and (self.s[j].isalnum() or self.s[j] == '_'):
+                    return False
+            self.i += len(tok)
+            return True
+        return False
+
+    def expect(self, tok):
+        if not self.eat(tok):
+            self.err(f"expected {tok!r}")
+
+    def at_end(self):
+        self.skip()
+        return self.i >= len(self.s)
+
+    # -- grammar -----------------------------------------------------------
+
+    def parse(self):
+        v = self.ternary()
+        if not self.at_end():
+            self.err(f"unexpected trailing text {self.s[self.i:]!r}")
+        return v
+
+    def ternary(self):
+        c = self.logic_or()
+        if self.eat('?'):
+            a = self.ternary()
+            self.expect(':')
+            b = self.ternary()
+            return a if _truth(c) else b
+        return c
+
+    def logic_or(self):
+        v = self.logic_and()
+        while self.eat('||'):
+            r = self.logic_and()
+            v = 1 if (_truth(v) or _truth(r)) else 0
+        return v
+
+    def logic_and(self):
+        v = self.bit_or()
+        while self.eat('&&'):
+            r = self.bit_or()
+            v = 1 if (_truth(v) and _truth(r)) else 0
+        return v
+
+    def bit_or(self):
+        v = self.bit_xor()
+        while True:
+            self.skip()
+            if self.s.startswith('||', self.i):
+                break
+            if self.eat('|'):
+                v = _as_int(self, v) | _as_int(self, self.bit_xor())
+            else:
+                break
+        return v
+
+    def bit_xor(self):
+        v = self.bit_and()
+        while self.eat('^'):
+            v = _as_int(self, v) ^ _as_int(self, self.bit_and())
+        return v
+
+    def bit_and(self):
+        v = self.equality()
+        while True:
+            self.skip()
+            if self.s.startswith('&&', self.i):
+                break
+            if self.eat('&'):
+                v = _as_int(self, v) & _as_int(self, self.equality())
+            else:
+                break
+        return v
+
+    def equality(self):
+        v = self.relational()
+        while True:
+            if self.eat('=='):
+                v = 1 if _cmp_eq(v, self.relational()) else 0
+            elif self.eat('!='):
+                v = 0 if _cmp_eq(v, self.relational()) else 1
+            else:
+                return v
+
+    def relational(self):
+        v = self.shift()
+        while True:
+            self.skip()
+            if self.s.startswith('<<', self.i) or self.s.startswith('>>', self.i):
+                return v
+            if self.eat('<='):
+                v = 1 if _cmp_lt_eq(self, v, self.shift(), True) else 0
+            elif self.eat('>='):
+                v = 1 if _cmp_lt_eq(self, self.shift(), v, True) else 0
+            elif self.eat('<'):
+                v = 1 if _cmp_lt_eq(self, v, self.shift(), False) else 0
+            elif self.eat('>'):
+                v = 1 if _cmp_lt_eq(self, self.shift(), v, False) else 0
+            else:
+                return v
+
+    def shift(self):
+        v = self.additive()
+        while True:
+            if self.eat('<<'):
+                r = _as_int(self, self.additive())
+                if r < 0 or r > 4096:
+                    self.err("shift count out of range")
+                v = _as_int(self, v) << r
+            elif self.eat('>>'):
+                r = _as_int(self, self.additive())
+                if r < 0 or r > 4096:
+                    self.err("shift count out of range")
+                v = _as_int(self, v) >> r
+            else:
+                return v
+
+    def additive(self):
+        v = self.multiplicative()
+        while True:
+            self.skip()
+            if self.s.startswith('+', self.i):
+                self.i += 1
+                r = self.multiplicative()
+                if isinstance(v, str) or isinstance(r, str):
+                    v = _as_str(v) + _as_str(r)
+                else:
+                    v = v + r
+            elif self.s.startswith('-', self.i):
+                self.i += 1
+                v = _as_int(self, v) - _as_int(self, self.multiplicative())
+            else:
+                return v
+
+    def multiplicative(self):
+        v = self.unary()
+        while True:
+            self.skip()
+            if self.s.startswith('*', self.i):
+                self.i += 1
+                r = self.unary()
+                if isinstance(v, str) and isinstance(r, int):
+                    v = v * max(0, r)
+                elif isinstance(v, int) and isinstance(r, str):
+                    v = r * max(0, v)
+                else:
+                    v = _as_int(self, v) * _as_int(self, r)
+            elif self.s.startswith('/', self.i):
+                self.i += 1
+                r = _as_int(self, self.unary())
+                if r == 0:
+                    self.err("division by zero")
+                v = _c_div(_as_int(self, v), r)
+            elif self.s.startswith('%', self.i):
+                self.i += 1
+                r = _as_int(self, self.unary())
+                if r == 0:
+                    self.err("modulo by zero")
+                v = _c_mod(_as_int(self, v), r)
+            else:
+                return v
+
+    def unary(self):
+        self.skip()
+        if self.eat('!'):
+            return 0 if _truth(self.unary()) else 1
+        if self.eat('~'):
+            return ~_as_int(self, self.unary())
+        if self.eat('-'):
+            return -_as_int(self, self.unary())
+        if self.eat('+'):
+            return self.unary()
+        return self.primary()
+
+    def primary(self):
+        self.skip()
+        if self.i >= len(self.s):
+            self.err("unexpected end of expression")
+        c = self.s[self.i]
+
+        if c == '(':
+            self.i += 1
+            v = self.ternary()
+            self.expect(')')
+            return v
+
+        if c == '"':
+            return self.read_string('"')
+
+        if c == "'":
+            t = self.read_string("'")
+            if len(t) == 1:
+                return ord(t)
+            return t
+
+        if c.isdigit():
+            return self.read_number()
+
+        if c == '_' or c.isalpha():
+            name = self.read_ident()
+            if name == 'defined':
+                self.expect('(')
+                inner = self.read_ident()
+                self.expect(')')
+                return 1 if self.pp.is_defined(inner) else 0
+            if self.peek() == '(':
+                self.i += 1
+                args = []
+                if self.peek() == ')':
+                    self.i += 1
+                else:
+                    while True:
+                        args.append(self.ternary())
+                        if self.eat(','):
+                            continue
+                        self.expect(')')
+                        break
+                return self.pp.call_value(name, args, self.pos)
+            return self.pp.lookup(name, self.pos)
+
+        self.err(f"unexpected character {c!r}")
+
+    def read_ident(self):
+        self.skip()
+        j = self.i
+        while j < len(self.s) and (self.s[j].isalnum() or self.s[j] == '_'):
+            j += 1
+        if j == self.i:
+            self.err("expected a name")
+        name = self.s[self.i:j]
+        self.i = j
+        return name
+
+    def read_number(self):
+        s = self.s
+        j = self.i
+        if s.startswith('0x', j) or s.startswith('0X', j):
+            k = j + 2
+            while k < len(s) and (s[k] in '0123456789abcdefABCDEF_'):
+                k += 1
+            txt, base = s[j + 2:k], 16
+        elif s.startswith('0b', j) or s.startswith('0B', j):
+            k = j + 2
+            while k < len(s) and s[k] in '01_':
+                k += 1
+            txt, base = s[j + 2:k], 2
+        elif s.startswith('0o', j) or s.startswith('0O', j):
+            k = j + 2
+            while k < len(s) and s[k] in '01234567_':
+                k += 1
+            txt, base = s[j + 2:k], 8
+        else:
+            k = j
+            while k < len(s) and (s[k].isdigit() or s[k] == '_'):
+                k += 1
+            txt, base = s[j:k], 10
+        txt = txt.replace('_', '')
+        if txt == '':
+            self.err("malformed number")
+        self.i = k
+        try:
+            return int(txt, base)
+        except ValueError:
+            self.err("malformed number")
+
+    def read_string(self, q):
+        s = self.s
+        j = self.i + 1
+        out = []
+        while j < len(s):
+            ch = s[j]
+            if ch == '\\' and j + 1 < len(s):
+                nxt = s[j + 1]
+                out.append({'n': '\n', 't': '\t', 'r': '\r', '0': '\0',
+                            '\\': '\\', '"': '"', "'": "'"}.get(nxt, nxt))
+                j += 2
+                continue
+            if ch == q:
+                self.i = j + 1
+                return ''.join(out)
+            out.append(ch)
+            j += 1
+        self.err("unterminated string literal")
+
+
+def _truth(v):
+    if isinstance(v, str):
+        return v != ''
+    return v != 0
+
+
+def _as_int(p, v):
+    if isinstance(v, str):
+        p.err(f"expected an integer, got the string {v!r}")
+    return v
+
+
+def _as_str(v):
+    return v if isinstance(v, str) else str(v)
+
+
+def _cmp_eq(a, b):
+    if isinstance(a, str) != isinstance(b, str):
+        return False
+    return a == b
+
+
+def _cmp_lt_eq(p, a, b, or_equal):
+    if isinstance(a, str) != isinstance(b, str):
+        p.err("cannot order a string against an integer")
+    return (a <= b) if or_equal else (a < b)
+
+
+def _c_div(a, b):
+    """C-style truncating division, so `-7/2 == -3` as an assembly programmer
+    would expect, rather than Python's floor semantics."""
+    q = abs(a) // abs(b)
+    return q if (a >= 0) == (b >= 0) else -q
+
+
+def _c_mod(a, b):
+    return a - _c_div(a, b) * b
+
+
+# ---------------------------------------------------------------------------
+# The preprocessor itself
+# ---------------------------------------------------------------------------
+
+class MacroPreprocessor:
+    """Expands the `!`-prefixed macro layer of a source file.
+
+    `expand(lines, filename)` takes the raw lines of one source file and
+    returns a list of `(text, filename, lineno)` triples, where `lineno` is
+    the *original* source line the emitted text came from, so assembler
+    diagnostics and DWARF line records keep pointing at real source.
+
+    A single instance is reused for the whole assembly so that macros defined
+    in one file stay visible in files it macro-includes; `reset()` clears
+    everything and must be called at the start of every assembly pass, since
+    expansion has to produce exactly the same text on each pass."""
+
+    def __init__(self, state=None):
+        self.state = state
+        self.reset()
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def reset(self):
+        self.enabled = True
+        self.had_error = False
+        self._reported = set()
+        self.reset_pass()
+
+    def reset_pass(self):
+        """Clear everything the macro layer accumulates while expanding a
+        source tree, but keep the CLI-level `enabled` flag.  Called at the
+        start of every assembly pass (including every Pass 1 relaxation
+        iteration), because the assembler re-reads the source from scratch
+        each time and expansion must produce identical text on each of them."""
+        self.funcs = {}
+        # Names seen by `!def` during *parsing*.  Kept separate from `funcs`
+        # (which only gets an entry once the `!def` is actually executed) so
+        # that a macro defined inside a `!if` branch that is not taken is
+        # still recognised as a statement keyword while parsing, without
+        # `defined()` claiming it exists or a call to it silently expanding
+        # to nothing.
+        self.declared = set()
+        self.globals = {}
+        self.scopes = [self.globals]
+        self.out = []
+        self.depth = 0
+        self.uid = 0
+        self.include_stack = []
+
+    # -- variable / function environment -----------------------------------
+
+    def scope(self):
+        return self.scopes[-1]
+
+    def lookup(self, name, pos):
+        for sc in reversed(self.scopes):
+            if name in sc:
+                return sc[name]
+        if name in self.funcs:
+            raise MacroError(f"{_fmt_pos(pos)}: macro '{name}' used as a variable "
+                             f"(call it as '{name}(...)')")
+        raise MacroError(f"{_fmt_pos(pos)}: undefined macro variable '{name}'")
+
+    def is_defined(self, name):
+        if name in self.funcs:
+            return True
+        return any(name in sc for sc in self.scopes)
+
+    def assign(self, name, value):
+        for sc in reversed(self.scopes):
+            if name in sc:
+                sc[name] = value
+                return
+        self.scope()[name] = value
+
+    # -- expression entry points -------------------------------------------
+
+    def eval(self, text, pos):
+        text = text.strip()
+        if text == '':
+            raise MacroError(f"{_fmt_pos(pos)}: empty macro expression")
+        return _ExprParser(text, self, pos).parse()
+
+    def call_value(self, name, args, pos):
+        """A call appearing inside an expression: the macro's `!return` value
+        is the result, and the macro must not emit any text."""
+        if name in _BUILTINS:
+            return _BUILTINS[name](self, args, pos)
+        if name not in self.funcs:
+            raise MacroError(f"{_fmt_pos(pos)}: call to undefined macro '{name}'")
+        mark = len(self.out)
+        value = self.invoke(self.funcs[name], args, pos)
+        if len(self.out) != mark:
+            emitted = self.out[mark]
+            del self.out[mark:]
+            raise MacroError(f"{_fmt_pos(pos)}: macro '{name}' emits source text "
+                             f"({emitted[0].strip()!r}) but was called from inside an "
+                             f"expression, where there is nowhere to put it")
+        return value
+
+    def invoke(self, fn, args, pos):
+        """Bind arguments, run the body in a fresh scope, return the
+        `!return` value (0 if the body falls off the end)."""
+        nreq = len(fn.params) - sum(1 for d in fn.defaults if d is not None)
+        if len(args) > len(fn.params) or len(args) < nreq:
+            raise MacroError(f"{_fmt_pos(pos)}: macro '{fn.name}' takes "
+                             f"{nreq}..{len(fn.params)} argument(s), got {len(args)}")
+        if self.depth >= _MACRO_MAX_DEPTH:
+            raise MacroError(f"{_fmt_pos(pos)}: macro recursion deeper than "
+                             f"{_MACRO_MAX_DEPTH} while expanding '{fn.name}'")
+
+        local = {}
+        for k, pname in enumerate(fn.params):
+            if k < len(args):
+                local[pname] = args[k]
+            else:
+                local[pname] = self.eval(fn.defaults[k], pos)
+        self.uid += 1
+        local['__id__'] = self.uid
+        local['__name__'] = fn.name
+
+        self.scopes.append(local)
+        self.depth += 1
+        try:
+            self.exec_block(fn.body)
+        except _MacroReturn as r:
+            return r.value
+        finally:
+            self.depth -= 1
+            self.scopes.pop()
+        return 0
+
+    # -- text interpolation ------------------------------------------------
+
+    def interpolate(self, text, pos):
+        """Replace every `!{expr}` / `!{expr:fmt}` in an ordinary source line."""
+        if '!{' not in text:
+            return text
+        out = []
+        i = 0
+        n = len(text)
+        while i < n:
+            if text[i] == '\\' and text.startswith('!{', i + 1):
+                out.append('!{')
+                i += 3
+                continue
+            if not text.startswith('!{', i):
+                out.append(text[i])
+                i += 1
+                continue
+            j = i + 2
+            depth = 1
+            quote = ''
+            while j < n:
+                c = text[j]
+                if quote:
+                    if c == '\\':
+                        j += 2
+                        continue
+                    if c == quote:
+                        quote = ''
+                elif c in '"\'':
+                    quote = c
+                elif c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if j >= n:
+                raise MacroError(f"{_fmt_pos(pos)}: unterminated '!{{' in line")
+            body = text[i + 2:j]
+            out.append(self.format_value(body, pos))
+            i = j + 1
+        return ''.join(out)
+
+    def format_value(self, body, pos):
+        """Evaluate one `!{...}` body, honouring a trailing `:format-spec`."""
+        spec = None
+        quote = ''
+        par = 0
+        for k, c in enumerate(body):
+            if quote:
+                if c == '\\':
+                    continue
+                if c == quote:
+                    quote = ''
+                continue
+            if c in '"\'':
+                quote = c
+            elif c in '([':
+                par += 1
+            elif c in ')]':
+                par -= 1
+            elif c == ':' and par == 0:
+                # A ':' at nesting level 0 that is not part of a '?:' ternary
+                # introduces the format spec.  '?' before it means ternary.
+                if '?' in body[:k]:
+                    continue
+                spec = body[k + 1:].strip()
+                body = body[:k]
+                break
+        v = self.eval(body, pos)
+        if spec:
+            try:
+                if isinstance(v, str) and spec[-1:] in ('d', 'x', 'X', 'o', 'b'):
+                    raise ValueError
+                return format(v, spec)
+            except (ValueError, TypeError):
+                raise MacroError(f"{_fmt_pos(pos)}: bad format spec ':{spec}' "
+                                 f"for value {v!r}")
+        return _as_str(v)
+
+    # -- parsing -----------------------------------------------------------
+
+    @staticmethod
+    def statement_word(text):
+        """If `text` is a `!`-statement line, return the word after the `!`
+        (lower-cased) and the rest of the line; otherwise `(None, None)`."""
+        t = text.lstrip()
+        if not t.startswith('!') or t.startswith('!!'):
+            return None, None
+        j = 1
+        while j < len(t) and (t[j].isalnum() or t[j] == '_'):
+            j += 1
+        if j == 1:
+            return None, None
+        return t[1:j], t[j:]
+
+    def parse_block(self, lines, i, depth):
+        """Parse statements until the `}` that closes the enclosing block.
+
+        Returns `(nodes, i)` where `lines[i]` is that `}` line (or `i ==
+        len(lines)` at top level).  A `}` seen at `depth == 0` is not a block
+        terminator and is passed through as ordinary text, so source that
+        legitimately starts a line with `}` is unaffected."""
+        nodes = []
+        n = len(lines)
+        while i < n:
+            text, fn, ln = lines[i]
+            pos = (fn, ln)
+            stripped = text.strip()
+
+            if stripped.startswith('}') and depth > 0:
+                return nodes, i
+
+            word, rest = self.statement_word(_strip_comment(text))
+            if word is None:
+                nodes.append(('text', text, pos))
+                i += 1
+                continue
+
+            lw = word.lower()
+            if lw not in _MACRO_KEYWORDS and word not in self.funcs \
+                    and word not in self.declared and not self.looks_like_call(rest):
+                nodes.append(('text', text, pos))
+                i += 1
+                continue
+
+            if lw == 'if':
+                node, i = self.parse_if(lines, i, depth)
+                nodes.append(node)
+                continue
+            if lw == 'while':
+                node, i = self.parse_while(lines, i, depth)
+                nodes.append(node)
+                continue
+            if lw == 'def':
+                node, i = self.parse_def(lines, i, depth)
+                nodes.append(node)
+                continue
+            if lw in ('else', 'elif', 'then'):
+                raise MacroError(f"{_fmt_pos(pos)}: '!{word}' without a matching '!if'")
+            nodes.append(self.parse_simple(lw, word, rest, pos))
+            i += 1
+        if depth > 0:
+            fn, ln = (lines[-1][1], lines[-1][2]) if lines else ('?', 0)
+            raise MacroError(f"{fn}:{ln}: unexpected end of file: a macro block "
+                             f"opened with '{{' is never closed")
+        return nodes, i
+
+    @staticmethod
+    def looks_like_call(rest):
+        """`!name(...)` with nothing but the call on the line."""
+        r = rest.strip()
+        return r.startswith('(')
+
+    def parse_simple(self, lw, word, rest, pos):
+        if lw == 'set':
+            if '=' not in rest:
+                raise MacroError(f"{_fmt_pos(pos)}: '!set' needs 'name = expression'")
+            name, expr = rest.split('=', 1)
+            return ('set', name.strip(), expr, pos)
+        if lw == 'local':
+            if '=' in rest:
+                name, expr = rest.split('=', 1)
+                return ('local', name.strip(), expr, pos)
+            return ('local', rest.strip(), None, pos)
+        if lw == 'undef':
+            return ('undef', rest.strip(), pos)
+        if lw == 'return':
+            return ('return', rest.strip() or None, pos)
+        if lw == 'break':
+            return ('break', pos)
+        if lw == 'continue':
+            return ('continue', pos)
+        if lw in ('error', 'warning', 'echo'):
+            return (lw, rest.strip(), pos)
+        if lw == 'include':
+            return ('include', rest.strip(), pos)
+        # A macro call used as a statement.
+        return ('call', word, rest.strip(), pos)
+
+    def parse_header(self, text, kw, pos):
+        """Split a `!if expr !then {` / `!while expr {` header into the
+        expression text, checking that the line really opens a block."""
+        t = text.strip()
+        body = t[len(kw) + 1:]
+        if not body.rstrip().endswith('{'):
+            raise MacroError(f"{_fmt_pos(pos)}: '!{kw}' header must end with '{{'")
+        body = body.rstrip()[:-1]
+        if kw == 'if' or kw == 'elif':
+            low = body.lower()
+            k = low.rfind('!then')
+            if k < 0:
+                raise MacroError(f"{_fmt_pos(pos)}: '!{kw}' needs '!then' before '{{'")
+            body = body[:k]
+        return body.strip()
+
+    def parse_if(self, lines, i, depth):
+        text, fn, ln = lines[i]
+        pos = (fn, ln)
+        cond = self.parse_header(_strip_comment(text), 'if', pos)
+        arms = []
+        else_body = None
+        while True:
+            body, i = self.parse_block(lines, i + 1, depth + 1)
+            arms.append((cond, body))
+            if i >= len(lines):
+                raise MacroError(f"{_fmt_pos(pos)}: '!if' block is never closed with '}}'")
+            close, cfn, cln = lines[i]
+            cpos = (cfn, cln)
+            tail = _strip_comment(close).strip()[1:].strip()
+            if tail == '' or tail.startswith(';'):
+                return ('if', arms, else_body, pos), i + 1
+            w, rest = self.statement_word(tail)
+            if w is None:
+                raise MacroError(f"{_fmt_pos(cpos)}: unexpected text after '}}': {tail!r}")
+            if w.lower() == 'elif':
+                cond = self.parse_header(tail, 'elif', cpos)
+                continue
+            if w.lower() == 'else':
+                r = rest.strip()
+                if r.startswith('!if'):
+                    cond = self.parse_header(r, 'if', cpos)
+                    continue
+                if not r.startswith('{'):
+                    raise MacroError(f"{_fmt_pos(cpos)}: '!else' must be followed by '{{'")
+                else_body, i = self.parse_block(lines, i + 1, depth + 1)
+                if i >= len(lines):
+                    raise MacroError(f"{_fmt_pos(cpos)}: '!else' block is never closed")
+                trailer = _strip_comment(lines[i][0]).strip()[1:].strip()
+                if trailer and not trailer.startswith(';'):
+                    raise MacroError(f"{lines[i][1]}:{lines[i][2]}: unexpected text "
+                                     f"after '}}': {trailer!r}")
+                return ('if', arms, else_body, pos), i + 1
+            raise MacroError(f"{_fmt_pos(cpos)}: unexpected '!{w}' after '}}'")
+
+    def parse_while(self, lines, i, depth):
+        text, fn, ln = lines[i]
+        pos = (fn, ln)
+        cond = self.parse_header(_strip_comment(text), 'while', pos)
+        body, i = self.parse_block(lines, i + 1, depth + 1)
+        if i >= len(lines):
+            raise MacroError(f"{_fmt_pos(pos)}: '!while' block is never closed with '}}'")
+        trailer = _strip_comment(lines[i][0]).strip()[1:].strip()
+        if trailer and not trailer.startswith(';'):
+            raise MacroError(f"{lines[i][1]}:{lines[i][2]}: unexpected text after "
+                             f"'}}': {trailer!r}")
+        return ('while', cond, body, pos), i + 1
+
+    def parse_def(self, lines, i, depth):
+        text, fn, ln = lines[i]
+        pos = (fn, ln)
+        t = _strip_comment(text).strip()[4:].strip()
+        if not t.rstrip().endswith('{'):
+            raise MacroError(f"{_fmt_pos(pos)}: '!def' header must end with '{{'")
+        t = t.rstrip()[:-1].strip()
+        if '(' not in t or not t.endswith(')'):
+            raise MacroError(f"{_fmt_pos(pos)}: '!def' needs 'name(p1, p2, ...)'")
+        name, plist = t.split('(', 1)
+        name = name.strip()
+        plist = plist[:-1].strip()
+        if not name or not (name[0].isalpha() or name[0] == '_') \
+                or not all(c.isalnum() or c == '_' for c in name):
+            raise MacroError(f"{_fmt_pos(pos)}: bad macro name {name!r}")
+        if name.lower() in _MACRO_KEYWORDS or name in _BUILTINS:
+            raise MacroError(f"{_fmt_pos(pos)}: '{name}' is a reserved macro name")
+        params, defaults = [], []
+        if plist:
+            for p in plist.split(','):
+                p = p.strip()
+                if '=' in p:
+                    pn, dv = p.split('=', 1)
+                    params.append(pn.strip())
+                    defaults.append(dv.strip())
+                else:
+                    params.append(p)
+                    defaults.append(None)
+                if not params[-1] or not (params[-1][0].isalpha() or params[-1][0] == '_'):
+                    raise MacroError(f"{_fmt_pos(pos)}: bad parameter name "
+                                     f"{params[-1]!r} in '!def {name}'")
+        seen = None
+        for k, p in enumerate(params):
+            if defaults[k] is None and seen:
+                raise MacroError(f"{_fmt_pos(pos)}: parameter '{p}' without a default "
+                                 f"follows '{seen}' which has one")
+            if defaults[k] is not None:
+                seen = p
+
+        # Register the name *before* parsing the body so a recursive call
+        # inside the body is recognised as a statement call rather than
+        # passed through to the assembler as ordinary text.
+        self.declared.add(name)
+        body, i = self.parse_block(lines, i + 1, depth + 1)
+        if i >= len(lines):
+            raise MacroError(f"{_fmt_pos(pos)}: '!def {name}' block is never closed")
+        trailer = _strip_comment(lines[i][0]).strip()[1:].strip()
+        if trailer and not trailer.startswith(';'):
+            raise MacroError(f"{lines[i][1]}:{lines[i][2]}: unexpected text after "
+                             f"'}}': {trailer!r}")
+        return ('def', _MacroFunc(name, params, defaults, body, pos), pos), i + 1
+
+    # -- execution ---------------------------------------------------------
+
+    def emit(self, text, pos):
+        if len(self.out) >= _MACRO_MAX_LINES:
+            raise MacroError(f"{_fmt_pos(pos)}: macro expansion produced more than "
+                             f"{_MACRO_MAX_LINES} lines; assuming a runaway macro")
+        self.out.append((text, pos[0], pos[1]))
+
+    def exec_block(self, nodes):
+        for node in nodes:
+            self.exec_node(node)
+
+    def exec_node(self, node):
+        kind = node[0]
+
+        if kind == 'text':
+            _, text, pos = node
+            self.emit(self.interpolate(text, pos), pos)
+            return
+
+        if kind == 'if':
+            _, arms, else_body, _pos = node
+            for cond, body in arms:
+                if _truth(self.eval(cond, _pos)):
+                    self.exec_block(body)
+                    return
+            if else_body is not None:
+                self.exec_block(else_body)
+            return
+
+        if kind == 'while':
+            _, cond, body, pos = node
+            count = 0
+            while _truth(self.eval(cond, pos)):
+                count += 1
+                if count > _MACRO_MAX_ITER:
+                    raise MacroError(f"{_fmt_pos(pos)}: '!while' ran more than "
+                                     f"{_MACRO_MAX_ITER} iterations; assuming it "
+                                     f"never terminates")
+                try:
+                    self.exec_block(body)
+                except _MacroContinue:
+                    continue
+                except _MacroBreak:
+                    break
+            return
+
+        if kind == 'def':
+            _, fn, pos = node
+            prev = self.funcs.get(fn.name)
+            if prev is not None and prev.body and prev.pos != fn.pos:
+                self.warn(f"{_fmt_pos(pos)}: macro '{fn.name}' redefined "
+                          f"(previous definition at {_fmt_pos(prev.pos)})")
+            self.funcs[fn.name] = fn
+            return
+
+        if kind == 'set':
+            _, name, expr, pos = node
+            self.assign(name, self.eval(expr, pos))
+            return
+
+        if kind == 'local':
+            _, name, expr, pos = node
+            self.scope()[name] = self.eval(expr, pos) if expr is not None else 0
+            return
+
+        if kind == 'undef':
+            _, name, pos = node
+            self.funcs.pop(name, None)
+            for sc in reversed(self.scopes):
+                if name in sc:
+                    del sc[name]
+                    break
+            return
+
+        if kind == 'call':
+            _, name, argtext, pos = node
+            if name not in self.funcs:
+                raise MacroError(f"{_fmt_pos(pos)}: call to undefined macro '{name}'")
+            args = self.parse_args(argtext, pos)
+            self.invoke(self.funcs[name], args, pos)
+            return
+
+        if kind == 'return':
+            _, expr, pos = node
+            raise _MacroReturn(self.eval(expr, pos) if expr else 0)
+
+        if kind == 'break':
+            raise _MacroBreak()
+
+        if kind == 'continue':
+            raise _MacroContinue()
+
+        if kind == 'error':
+            _, expr, pos = node
+            raise MacroError(f"{_fmt_pos(pos)}: {_as_str(self.eval(expr, pos))}")
+
+        if kind == 'warning':
+            _, expr, pos = node
+            self.warn(f"{_fmt_pos(pos)}: {_as_str(self.eval(expr, pos))}")
+            return
+
+        if kind == 'echo':
+            _, expr, pos = node
+            # Emit once per assembly, not once per relaxation iteration:
+            # Pass 1 may re-expand the source up to sixteen times.  Pass 2
+            # (`pas == 2`) and interactive/listing mode (`pas == 0`) each run
+            # exactly once, so restricting output to those gives the user
+            # exactly one copy of each `!echo`.
+            if self.state is None or getattr(self.state, 'pas', 2) != 1:
+                print(_as_str(self.eval(expr, pos)), file=sys.stderr)
+            else:
+                self.eval(expr, pos)
+            return
+
+        if kind == 'include':
+            _, expr, pos = node
+            self.do_include(self.eval(expr, pos), pos)
+            return
+
+        raise MacroError(f"internal: unknown macro node {kind!r}")
+
+    def parse_args(self, argtext, pos):
+        t = argtext.strip()
+        if t.startswith(';') or t == '':
+            return []
+        if not t.startswith('('):
+            raise MacroError(f"{_fmt_pos(pos)}: macro call needs parentheses")
+        p = _ExprParser(t, self, pos)
+        p.expect('(')
+        args = []
+        if p.peek() == ')':
+            p.i += 1
+        else:
+            while True:
+                args.append(p.ternary())
+                if p.eat(','):
+                    continue
+                p.expect(')')
+                break
+        rest = p.s[p.i:].strip()
+        if rest and not rest.startswith(';'):
+            raise MacroError(f"{_fmt_pos(pos)}: unexpected text after macro call: "
+                             f"{rest!r}")
+        return args
+
+    def do_include(self, name, pos):
+        if not isinstance(name, str):
+            raise MacroError(f"{_fmt_pos(pos)}: '!include' needs a file name string")
+        path = name
+        if not os.path.isabs(path):
+            base = os.path.dirname(os.path.abspath(pos[0])) if pos[0] else ''
+            if base:
+                path = os.path.join(base, path)
+        try:
+            real = os.path.abspath(path)
+        except OSError:
+            real = path
+        if real in self.include_stack:
+            raise MacroError(f"{_fmt_pos(pos)}: circular '!include' of {name!r}")
+        if len(self.include_stack) >= _MACRO_MAX_INCLUDE_DEPTH:
+            raise MacroError(f"{_fmt_pos(pos)}: '!include' nested deeper than "
+                             f"{_MACRO_MAX_INCLUDE_DEPTH}")
+        try:
+            with open(path, 'rt', encoding='utf-8') as f:
+                raw = f.readlines()
+        except OSError as e:
+            raise MacroError(f"{_fmt_pos(pos)}: cannot '!include' {name!r}: {e}")
+        lines = [(t.rstrip('\r\n'), name, k + 1) for k, t in enumerate(raw)]
+        self.include_stack.append(real)
+        try:
+            nodes, _ = self.parse_block(lines, 0, 0)
+            self.exec_block(nodes)
+        finally:
+            self.include_stack.pop()
+
+    # -- diagnostics -------------------------------------------------------
+
+    def warn(self, msg):
+        if msg in self._reported:
+            return
+        self._reported.add(msg)
+        print(f" warning - {msg}", file=sys.stderr)
+
+    def fail(self, msg):
+        # Pass 1 re-reads (and so re-expands) the whole source on every
+        # relaxation iteration, and Pass 2 reads it once more; without this
+        # de-duplication a single macro error would be printed up to
+        # seventeen times.  `_reported` is cleared by `reset()`, not by
+        # `reset_pass()`, so it survives for the whole run.
+        if msg not in self._reported:
+            self._reported.add(msg)
+            print(f" error - {msg}", file=sys.stderr)
+        self.had_error = True
+        if self.state is not None:
+            self.state.had_error = True
+
+    # -- public entry point ------------------------------------------------
+
+    def contains_macros(self, raw):
+        """Cheap pre-filter: a file with no `!` at all cannot use the macro
+        layer, so it is handed back untouched with no parsing at all."""
+        for t in raw:
+            if '!' in t or t.lstrip().startswith('}'):
+                return True
+        return False
+
+    def expand(self, raw, filename):
+        """Expand one source file.  `raw` is a list of lines (newline included
+        or not); returns a list of `(text, filename, lineno)`."""
+        lines = [(t.rstrip('\r\n'), filename, k + 1) for k, t in enumerate(raw)]
+        if not self.enabled or not self.contains_macros([t for t, _, _ in lines]):
+            return lines
+        # A macro error is fatal for the whole run, and Pass 1 would otherwise
+        # re-expand (and re-hit) it on every relaxation iteration -- which for
+        # a runaway `!while` means paying the full iteration limit sixteen
+        # times over.  Once expansion has failed, stop trying.
+        if self.had_error:
+            return []
+        saved_out = self.out
+        self.out = []
+        try:
+            nodes, _ = self.parse_block(lines, 0, 0)
+            self.exec_block(nodes)
+            result = self.out
+        except MacroError as e:
+            self.fail(e.msg)
+            result = []
+        except _MacroReturn:
+            self.fail(f"{filename}: '!return' outside a macro definition")
+            result = []
+        except (_MacroBreak, _MacroContinue):
+            self.fail(f"{filename}: '!break'/'!continue' outside a '!while' loop")
+            result = []
+        except RecursionError:
+            self.fail(f"{filename}: macro expansion recursed too deeply")
+            result = []
+        finally:
+            self.out = saved_out
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Builtin macro-time functions
+# ---------------------------------------------------------------------------
+
+def _bi_check(pp, args, pos, name, lo, hi=None):
+    hi = lo if hi is None else hi
+    if not (lo <= len(args) <= hi):
+        raise MacroError(f"{_fmt_pos(pos)}: {name}() takes {lo}..{hi} argument(s), "
+                         f"got {len(args)}")
+
+
+def _bi_len(pp, a, pos):
+    _bi_check(pp, a, pos, 'len', 1)
+    return len(a[0]) if isinstance(a[0], str) else len(str(a[0]))
+
+
+def _bi_hex(pp, a, pos):
+    _bi_check(pp, a, pos, 'hex', 1, 2)
+    v = a[0]
+    if isinstance(v, str):
+        raise MacroError(f"{_fmt_pos(pos)}: hex() needs an integer")
+    width = a[1] if len(a) > 1 else 0
+    neg = v < 0
+    s = format(abs(v), 'x')
+    if isinstance(width, int) and width > len(s):
+        s = '0' * (width - len(s)) + s
+    return ('-' if neg else '') + s
+
+
+def _bi_str(pp, a, pos):
+    _bi_check(pp, a, pos, 'str', 1)
+    return _as_str(a[0])
+
+
+def _bi_int(pp, a, pos):
+    _bi_check(pp, a, pos, 'int', 1, 2)
+    if isinstance(a[0], int):
+        return a[0]
+    base = a[1] if len(a) > 1 else 0
+    try:
+        return int(a[0].strip(), base)
+    except ValueError:
+        raise MacroError(f"{_fmt_pos(pos)}: int({a[0]!r}) is not a number")
+
+
+def _bi_upper(pp, a, pos):
+    _bi_check(pp, a, pos, 'upper', 1)
+    return _as_str(a[0]).upper()
+
+
+def _bi_lower(pp, a, pos):
+    _bi_check(pp, a, pos, 'lower', 1)
+    return _as_str(a[0]).lower()
+
+
+def _bi_substr(pp, a, pos):
+    _bi_check(pp, a, pos, 'substr', 2, 3)
+    s = _as_str(a[0])
+    start = a[1]
+    if not isinstance(start, int):
+        raise MacroError(f"{_fmt_pos(pos)}: substr() index must be an integer")
+    if len(a) > 2:
+        if not isinstance(a[2], int):
+            raise MacroError(f"{_fmt_pos(pos)}: substr() length must be an integer")
+        return s[start:start + a[2]]
+    return s[start:]
+
+
+def _bi_abs(pp, a, pos):
+    _bi_check(pp, a, pos, 'abs', 1)
+    if isinstance(a[0], str):
+        raise MacroError(f"{_fmt_pos(pos)}: abs() needs an integer")
+    return abs(a[0])
+
+
+def _bi_min(pp, a, pos):
+    _bi_check(pp, a, pos, 'min', 1, 64)
+    return min(a)
+
+
+def _bi_max(pp, a, pos):
+    _bi_check(pp, a, pos, 'max', 1, 64)
+    return max(a)
+
+
+def _bi_uid(pp, a, pos):
+    _bi_check(pp, a, pos, 'uid', 0)
+    pp.uid += 1
+    return pp.uid
+
+
+_BUILTINS = {
+    'len': _bi_len,
+    'hex': _bi_hex,
+    'str': _bi_str,
+    'int': _bi_int,
+    'upper': _bi_upper,
+    'lower': _bi_lower,
+    'substr': _bi_substr,
+    'abs': _bi_abs,
+    'min': _bi_min,
+    'max': _bi_max,
+    'uid': _bi_uid,
+}
+
+
 class Assembler:
     """Top-level driver: owns one `AssemblerState` plus all the collaborator
     objects (parser, expression evaluator, label/symbol/variable managers,
@@ -4522,6 +5848,7 @@ class Assembler:
         self.vliw_proc = VLIWProcessor(self.state, self.expr_eval, self.binary_writer)
         self.asm_directive_proc = AssemblyDirectiveProcessor(self.state, self.expr_eval,
                                                              self.binary_writer, self.label_manager, self.parser)
+        self.macro_proc = MacroPreprocessor(self.state)
         self._imp_sections: dict = {}
 
     def include_asm(self, l1, l2):
@@ -5167,6 +6494,7 @@ class Assembler:
             except Exception as _vliw_exc:
                 if self.state.should_report_errors():
                     print(" error - Some error(s) in vliw definition.", file=sys.stderr)
+                    self.state.had_error = True
 
                     if self.state.verbose or self.state.debug:
                         print(f"   ({type(_vliw_exc).__name__}: {_vliw_exc})", file=sys.stderr)
@@ -5243,6 +6571,16 @@ class Assembler:
         for circular-`.INCLUDE` detection and for restoring `current_file`/`ln`
         on return."""
 
+        # Entering the top-level source file means a new assembly pass has
+        # begun (Pass 1 re-reads the whole file on every relaxation
+        # iteration, then Pass 2 reads it once more).  The macro layer must
+        # start from a clean slate each time so that expansion is textually
+        # identical on every pass; macro state is deliberately NOT reset for
+        # a nested `.INCLUDE`, so a macro defined before the include stays
+        # visible inside it.
+        if not self.state.fnstack:
+            self.macro_proc.reset_pass()
+
         _MAX_INCLUDE_DEPTH = 100
         if len(self.state.fnstack) >= _MAX_INCLUDE_DEPTH:
             print(f" error - .INCLUDE nesting depth exceeds {_MAX_INCLUDE_DEPTH}: '{fn}'", file=sys.stderr)
@@ -5292,8 +6630,16 @@ class Assembler:
             with open(fn, "rt", encoding="utf-8") as f:
                 af = f.readlines()
 
-            for i in af:
-                self.lineassemble0(i)
+            # Macro-expand before assembling.  `expand()` returns
+            # (text, file, lineno) triples where `lineno` is the ORIGINAL
+            # source line the text came from (inside a macro body, the line
+            # of that body line in the file that defined it), so assembler
+            # diagnostics, the `-v` listing and DWARF line records all keep
+            # pointing at real source rather than at expansion offsets.
+            for _mtext, _mfile, _mln in self.macro_proc.expand(af, self.state.current_file):
+                self.state.current_file = _mfile
+                self.state.ln = _mln
+                self.lineassemble0(_mtext)
         finally:
             self.state.fnstack.pop()
             self.state.current_file = _caller_file
@@ -6168,7 +7514,16 @@ class Assembler:
         try:
             _elf_file = open(path, 'wb')
         except OSError as _e:
-            print(f" error - cannot create ELF output file '{path}': {_e}", file=sys.stderr)
+            # Bugfix: this used to be unconditional (no should_report_errors()
+            # gate) and never set had_error, and run() (the only caller)
+            # never checked write_elf_obj()'s return value either -- so a
+            # failure to even open the output file (e.g. a nonexistent
+            # directory in the -o path) printed a clear error yet still
+            # exited 0 with no file written, silently breaking any build
+            # system that only checks the exit code.
+            if self.state.should_report_errors():
+                print(f" error - cannot create ELF output file '{path}': {_e}", file=sys.stderr)
+                self.state.had_error = True
             return
         with _elf_file as f:
             f.write(_pack_ehdr(1, machine, shdr_off, total_shdrs, shstrndx))
@@ -6303,7 +7658,53 @@ class Assembler:
                         help='Generate DWARF debug information (.debug_info/.debug_abbrev/'
                              '.debug_line) in the ELF object so that gdb/lldb can do '
                              'source-level debugging. Effective only together with -o.')
+        ap.add_argument('--no-macro', dest='no_macro', action='store_true',
+                        default=False,
+                        help='Disable the macro preprocessor layer (!if/!while/!def/'
+                             '!return/!set and !{...} interpolation), so the source is '
+                             'handed to the assembler exactly as written.')
+        ap.add_argument('-P', '--macro-expand', dest='macro_expand', nargs='?',
+                        const='-', default=None, metavar='FILE',
+                        help='Macro-expand the source file and write the resulting '
+                             'assembly to FILE (or stdout if FILE is omitted or "-") '
+                             'without assembling it. Useful for debugging macros.')
         return ap
+
+    def _macro_expand_only(self, sourcefile, dest):
+        """`-P/--macro-expand`: run only the macro layer over `sourcefile` and
+        write the expanded assembly to `dest` ("-" = stdout), then stop.
+
+        Each emitted line keeps a trailing origin marker in a comment so a
+        macro-generated line can be traced back to the body line that
+        produced it. Note that `.INCLUDE`d files are NOT followed here (they
+        are pulled in by the assembler, not by this layer); `!include`d files
+        are, since those are expanded by the macro layer itself."""
+        self.macro_proc.reset_pass()
+        try:
+            with open(sourcefile, "rt", encoding="utf-8") as f:
+                raw = f.readlines()
+        except OSError as e:
+            print(f" error - cannot open source file '{sourcefile}': {e}", file=sys.stderr)
+            return False
+
+        expanded = self.macro_proc.expand(raw, sourcefile)
+        if self.macro_proc.had_error or self.state.had_error:
+            return False
+
+        out = []
+        for text, fname, ln in expanded:
+            out.append(f"{text}\n")
+        data = ''.join(out)
+        if dest in ('-', ''):
+            sys.stdout.write(data)
+        else:
+            try:
+                with open(dest, "wt", encoding="utf-8") as f:
+                    f.write(data)
+            except OSError as e:
+                print(f" error - cannot write '{dest}': {e}", file=sys.stderr)
+                return False
+        return True
 
     def run(self):
         """Top-level entry point (called from `main()`). Parses CLI args, then:
@@ -6368,6 +7769,13 @@ class Assembler:
         self.state.verbose      = args.verbose
         self.state.debug        = args.debug
         self.state.gen_debug    = args.gen_debug
+        self.macro_proc.enabled = not args.no_macro
+
+        if args.macro_expand is not None:
+            if args.sourcefile is None:
+                print(" error - -P/--macro-expand needs a source file.", file=sys.stderr)
+                return False
+            return self._macro_expand_only(args.sourcefile, args.macro_expand)
 
         try:
             self.state.pat = self.pattern_reader.readpat(args.patternfile)
@@ -6555,6 +7963,11 @@ class Assembler:
 
             if self.state.elf_objfile:
                 self.write_elf_obj(self.state.elf_objfile, self.state.elf_machine)
+                if self.state.had_error:
+                    print(" error - one or more errors were reported during assembly; "
+                          "output would be incomplete or wrong.", file=sys.stderr)
+                    print("         Aborting: no output file written.", file=sys.stderr)
+                    return False
 
             if self.state.expfile_elf and self.state.expfile:
                 print(f"warning: both -e '{self.state.expfile}' and -E '{self.state.expfile_elf}' specified; "

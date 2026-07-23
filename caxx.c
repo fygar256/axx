@@ -7874,8 +7874,1774 @@ weo_done:
     #undef WEO_ALIGN
 }
 
+/* ===========================================================================
+ * Macro preprocessor layer  (port of axx.py's MacroPreprocessor)
+ * ===========================================================================
+ *
+ * A source-to-source stage that runs over the raw source lines *before* the
+ * assembler proper sees them (see fileassemble()). It is kept deliberately
+ * independent of the assembler's own expression evaluator, label table,
+ * section state and program counter:
+ *
+ *   * The macro layer has its own value space (int64 and strings) and its own
+ *     variable namespace, so it can never observe a label whose value is
+ *     still unknown, and can never observe a *different* value on a later
+ *     relaxation pass. Expansion is therefore a pure function of the source
+ *     text, which is what lets fileassemble() simply re-run it on every
+ *     Pass 1 relaxation iteration and on Pass 2 and hand the assembler
+ *     byte-identical input every time.
+ *
+ *   * Conversely, nothing in the macro layer can read .EQU symbols, labels or
+ *     $$/$. . That is a design decision, not an omission: allowing it would
+ *     make expansion pass-dependent, and could make the *number* of emitted
+ *     source lines differ between passes -- something the relaxation loop has
+ *     no way to converge on.
+ *
+ * Syntax (every statement starts with '!' as the first non-blank character of
+ * a line; '{' opens a block at the end of a header line, and a line whose
+ * first non-blank character is '}' closes one):
+ *
+ *     !def name(p1, p2, ...) {        macro / compile-time function
+ *         ...
+ *         !return expr                (optional; also an early exit)
+ *     }
+ *
+ *     !if expr !then {
+ *         ...
+ *     } !elif expr !then {
+ *         ...
+ *     } !else {
+ *         ...
+ *     }
+ *
+ *     !while expr {
+ *         ...
+ *         !break / !continue
+ *     }
+ *
+ *     !set name = expr                assign (innermost scope that has it)
+ *     !local name [= expr]            declare in the current scope
+ *     !undef name
+ *     !name(a, b, ...)                expand a macro as a statement
+ *     !include "file"                 macro-time textual include
+ *     !error expr / !warning expr / !echo expr
+ *
+ * Inside an ordinary (non-'!') line, !{expr} is replaced by the textual value
+ * of expr, and !{expr:fmt} applies a format spec (!{n:04x}). Write \!{ for a
+ * literal !{ .
+ *
+ * Backward compatibility: a '!'-line is only intercepted when the word after
+ * the '!' is one of the keywords above, the name of an already-defined macro,
+ * or is immediately followed by '('. "!!" (VLIW slot separator) is never
+ * touched, and a '}' line is only treated as a block close when a block is
+ * actually open. --no-macro disables the whole layer.
+ *
+ * Divergence from axx.py worth knowing: Python's macro values are arbitrary-
+ * precision integers; here they are int64. Macro-time arithmetic that
+ * overflows 64 bits is the one place the two implementations can differ.
+ * Everything the macro layer emits is plain source text, so this cannot
+ * affect the assembler's own 256-bit expression evaluation.
+ * =========================================================================== */
+
+#include <setjmp.h>
+
+enum {
+    MACRO_MAX_DEPTH          = 200,
+    MACRO_MAX_INCLUDE_DEPTH  = 64,
+    MACRO_MAX_SCOPES         = 256,
+    MACRO_MAX_ARGS           = 64
+};
+#define MACRO_MAX_ITER   1000000L
+#define MACRO_MAX_LINES  2000000L
+/* Hard cap on the macro layer's arena. Expansion is a pure text transform, so
+ * a runaway string-building loop is the only way to reach this; failing with
+ * a diagnostic beats being OOM-killed. */
+#define MACRO_MAX_ARENA  ((size_t)512*1024*1024)
+
+/* ---------------------------------------------------------------------------
+ * Bump arena.
+ *
+ * Every string, AST node and expanded line the macro layer produces is
+ * allocated here and released in one go by macro_reset_pass(), which runs at
+ * the start of each assembly pass. That removes any need for per-node
+ * ownership rules in a stage that is re-run up to seventeen times per build.
+ * Scopes are the one exception: they are strictly stack-disciplined, so they
+ * use malloc/free and do not accumulate across a long loop.
+ * ------------------------------------------------------------------------- */
+typedef struct MArenaBlk { struct MArenaBlk *next; size_t used, cap; char *data; } MArenaBlk;
+typedef struct { MArenaBlk *head; size_t total; } MArena;
+
+typedef struct MacroPP MacroPP;
+static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...);
+
+typedef struct { int is_str; long long i; char *s; } MVal;
+
+typedef struct { char *text; const char *file; int line; } MLine;
+typedef struct { MLine *d; int len, cap; } MLineVec;
+
+typedef enum {
+    MN_TEXT, MN_IF, MN_WHILE, MN_DEF, MN_SET, MN_LOCAL, MN_UNDEF,
+    MN_CALL, MN_RETURN, MN_BREAK, MN_CONTINUE, MN_ERROR, MN_WARNING,
+    MN_ECHO, MN_INCLUDE
+} MNKind;
+
+typedef struct MNode MNode;
+typedef struct { MNode **d; int len, cap; } MBlock;
+
+struct MNode {
+    MNKind      kind;
+    const char *file;
+    int         line;
+    char       *a;          /* text / name / expression */
+    char       *b;          /* second expression (!set / !local) */
+    /* !if */
+    char      **conds;
+    MBlock     *arms;
+    int         narms;
+    MBlock     *elsebody;   /* NULL when there is no !else */
+    /* !while / !def */
+    MBlock     *body;
+    /* !def */
+    char      **params;
+    char      **defaults;   /* entry is NULL when the parameter has no default */
+    int         nparams;
+};
+
+typedef struct {
+    char   *name;
+    char  **params;
+    char  **defaults;
+    int     nparams;
+    MBlock *body;
+    const char *file;
+    int     line;
+    int     defined;        /* 0 while only parse-time-declared */
+} MFunc;
+
+typedef struct { char **names; MVal *vals; int len, cap; } MScope;
+
+typedef enum { MCTL_NONE = 0, MCTL_BREAK, MCTL_CONTINUE, MCTL_RETURN } MCtl;
+
+struct MacroPP {
+    Assembler *asmb;
+    MArena     arena;
+
+    MFunc     *funcs;
+    int        nfuncs, cfuncs;
+    char     **declared;    /* names seen by !def during parsing */
+    int        ndecl, cdecl;
+
+    MScope    *scopes[MACRO_MAX_SCOPES];
+    int        nscopes;
+
+    MLineVec  *out;         /* current expansion target */
+    int        depth;       /* macro-call recursion depth */
+    long long  uid;
+    long       nemitted;
+
+    char      *inc_stack[MACRO_MAX_INCLUDE_DEPTH];
+    int        ninc;
+
+    MCtl       ctl;
+    MVal       retval;
+
+    int        enabled;
+    int        had_error;
+
+    /* Reported diagnostics, so a single macro error is printed once per run
+     * rather than once per relaxation iteration. Cleared only by
+     * macro_init()/macro_free(), never by macro_reset_pass(). */
+    char     **reported;
+    int        nreported, creported;
+
+    jmp_buf    jb;
+    int        jb_active;
+};
+
+/* ---- arena ---------------------------------------------------------------- */
+
+static void *marena_alloc(MArena *a, size_t n){
+    n = (n + 15) & ~(size_t)15;
+    if(a->head && a->head->cap - a->head->used >= n){
+        void *p = a->head->data + a->head->used;
+        a->head->used += n;
+        return p;
+    }
+    size_t cap = n > 65536 ? n : 65536;
+    MArenaBlk *b = malloc(sizeof(MArenaBlk));
+    if(!b){ perror("malloc"); exit(1); }
+    b->data = malloc(cap);
+    if(!b->data){ perror("malloc"); exit(1); }
+    b->cap = cap; b->used = n; b->next = a->head;
+    a->head = b;
+    a->total += cap;
+    return b->data;
+}
+static void marena_reset(MArena *a){
+    MArenaBlk *b = a->head;
+    while(b){ MArenaBlk *n = b->next; free(b->data); free(b); b = n; }
+    a->head = NULL; a->total = 0;
+}
+static char *marena_strndup(MArena *a, const char *s, size_t n){
+    char *p = marena_alloc(a, n + 1);
+    memcpy(p, s, n); p[n] = '\0';
+    return p;
+}
+static char *marena_strdup(MArena *a, const char *s){
+    return marena_strndup(a, s, strlen(s));
+}
+
+/* ---- small growable containers (arena-backed) ----------------------------- */
+
+static void mblock_push(MacroPP *mp, MBlock *b, MNode *n){
+    if(b->len >= b->cap){
+        int nc = b->cap ? b->cap * 2 : 8;
+        MNode **nd = marena_alloc(&mp->arena, (size_t)nc * sizeof(MNode*));
+        if(b->len) memcpy(nd, b->d, (size_t)b->len * sizeof(MNode*));
+        b->d = nd; b->cap = nc;
+    }
+    b->d[b->len++] = n;
+}
+static void mlinevec_push(MacroPP *mp, MLineVec *v, char *text, const char *file, int line){
+    if(v->len >= v->cap){
+        int nc = v->cap ? v->cap * 2 : 64;
+        MLine *nd = marena_alloc(&mp->arena, (size_t)nc * sizeof(MLine));
+        if(v->len) memcpy(nd, v->d, (size_t)v->len * sizeof(MLine));
+        v->d = nd; v->cap = nc;
+    }
+    v->d[v->len].text = text;
+    v->d[v->len].file = file;
+    v->d[v->len].line = line;
+    v->len++;
+}
+
+/* ---- lifecycle ------------------------------------------------------------ */
+
+static void macro_init(MacroPP *mp, Assembler *asmb){
+    memset(mp, 0, sizeof(*mp));
+    mp->asmb = asmb;
+    mp->enabled = 1;
+}
+static void macro_reset_pass(MacroPP *mp){
+    for(int i = 0; i < mp->nscopes; i++){
+        free(mp->scopes[i]->names);
+        free(mp->scopes[i]->vals);
+        free(mp->scopes[i]);
+    }
+    mp->nscopes = 0;
+    marena_reset(&mp->arena);
+    mp->funcs = NULL;   mp->nfuncs = mp->cfuncs = 0;
+    mp->declared = NULL; mp->ndecl = mp->cdecl = 0;
+    mp->out = NULL;
+    mp->depth = 0;
+    mp->uid = 0;
+    mp->nemitted = 0;
+    mp->ninc = 0;
+    mp->ctl = MCTL_NONE;
+    mp->retval.is_str = 0; mp->retval.i = 0; mp->retval.s = NULL;
+    mp->jb_active = 0;
+    /* Globals scope */
+    MScope *g = calloc(1, sizeof(MScope));
+    if(!g){ perror("calloc"); exit(1); }
+    mp->scopes[mp->nscopes++] = g;
+}
+static void macro_free(MacroPP *mp){
+    macro_reset_pass(mp);
+    for(int i = 0; i < mp->nscopes; i++){
+        free(mp->scopes[i]->names); free(mp->scopes[i]->vals); free(mp->scopes[i]);
+    }
+    mp->nscopes = 0;
+    for(int i = 0; i < mp->nreported; i++) free(mp->reported[i]);
+    free(mp->reported); mp->reported = NULL; mp->nreported = mp->creported = 0;
+    marena_reset(&mp->arena);
+}
+
+/* ---- diagnostics ---------------------------------------------------------- */
+
+/* Returns 1 the first time msg is seen, 0 afterwards. Pass 1 re-expands the
+ * whole source on every relaxation iteration, so without this a single macro
+ * error would be printed up to seventeen times. */
+static int m_first_report(MacroPP *mp, const char *msg){
+    for(int i = 0; i < mp->nreported; i++)
+        if(strcmp(mp->reported[i], msg) == 0) return 0;
+    if(mp->nreported >= mp->creported){
+        mp->creported = mp->creported ? mp->creported * 2 : 16;
+        char **t = realloc(mp->reported, (size_t)mp->creported * sizeof(char*));
+        if(!t){ perror("realloc"); exit(1); }
+        mp->reported = t;
+    }
+    mp->reported[mp->nreported++] = strdup(msg);
+    return 1;
+}
+
+static void m_warn(MacroPP *mp, const char *file, int line, const char *fmt, ...){
+    char body[1024];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+    char msg[1200];
+    snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
+    if(m_first_report(mp, msg))
+        fprintf(stderr, " warning - %s\n", msg);
+}
+
+/* Abort the current expansion. Never returns: it longjmps back to
+ * macro_expand()'s setjmp, which reports the message and yields no lines. */
+static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...){
+    char body[1024];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+    char msg[1200];
+    snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
+    if(m_first_report(mp, msg))
+        fprintf(stderr, " error - %s\n", msg);
+    mp->had_error = 1;
+    if(mp->asmb) mp->asmb->st.had_error = 1;
+    if(mp->jb_active) longjmp(mp->jb, 1);
+    exit(1);
+}
+
+/* ---- values --------------------------------------------------------------- */
+
+static MVal mv_int(long long v){ MVal r; r.is_str = 0; r.i = v; r.s = NULL; return r; }
+static MVal mv_str(char *s){ MVal r; r.is_str = 1; r.i = 0; r.s = s; return r; }
+static int  mv_truth(MVal v){ return v.is_str ? (v.s && v.s[0]) : (v.i != 0); }
+
+static char *mv_to_text(MacroPP *mp, MVal v){
+    if(v.is_str) return v.s ? v.s : (char*)"";
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", v.i);
+    return marena_strdup(&mp->arena, buf);
+}
+static long long mv_need_int(MacroPP *mp, MVal v, const char *file, int line){
+    if(v.is_str) m_fail(mp, file, line, "macro expression: expected an integer, got the string \"%s\"", v.s ? v.s : "");
+    return v.i;
+}
+/* C-style truncating division, so -7/2 == -3 as an assembly programmer would
+ * expect (and matching axx.py's macro layer, which does the same). */
+static long long m_cdiv(long long a, long long b){
+    long long q = (a < 0 ? -a : a) / (b < 0 ? -b : b);
+    return ((a >= 0) == (b >= 0)) ? q : -q;
+}
+static long long m_cmod(long long a, long long b){ return a - m_cdiv(a, b) * b; }
+
+/* ---- variable environment -------------------------------------------------- */
+
+static MScope *m_scope(MacroPP *mp){ return mp->scopes[mp->nscopes - 1]; }
+
+static MVal *m_scope_find(MScope *sc, const char *name){
+    for(int i = 0; i < sc->len; i++)
+        if(strcmp(sc->names[i], name) == 0) return &sc->vals[i];
+    return NULL;
+}
+static void m_scope_set(MScope *sc, char *name, MVal v){
+    MVal *p = m_scope_find(sc, name);
+    if(p){ *p = v; return; }
+    if(sc->len >= sc->cap){
+        sc->cap = sc->cap ? sc->cap * 2 : 8;
+        sc->names = realloc(sc->names, (size_t)sc->cap * sizeof(char*));
+        sc->vals  = realloc(sc->vals,  (size_t)sc->cap * sizeof(MVal));
+        if(!sc->names || !sc->vals){ perror("realloc"); exit(1); }
+    }
+    sc->names[sc->len] = name;
+    sc->vals[sc->len]  = v;
+    sc->len++;
+}
+static void m_scope_del(MScope *sc, const char *name){
+    for(int i = 0; i < sc->len; i++)
+        if(strcmp(sc->names[i], name) == 0){
+            for(int j = i; j < sc->len - 1; j++){
+                sc->names[j] = sc->names[j+1];
+                sc->vals[j]  = sc->vals[j+1];
+            }
+            sc->len--;
+            return;
+        }
+}
+
+static MFunc *m_func_find(MacroPP *mp, const char *name){
+    for(int i = 0; i < mp->nfuncs; i++)
+        if(strcmp(mp->funcs[i].name, name) == 0) return &mp->funcs[i];
+    return NULL;
+}
+static MFunc *m_func_add(MacroPP *mp, const char *name){
+    if(mp->nfuncs >= mp->cfuncs){
+        int nc = mp->cfuncs ? mp->cfuncs * 2 : 16;
+        MFunc *nd = marena_alloc(&mp->arena, (size_t)nc * sizeof(MFunc));
+        memset(nd, 0, (size_t)nc * sizeof(MFunc));
+        if(mp->nfuncs) memcpy(nd, mp->funcs, (size_t)mp->nfuncs * sizeof(MFunc));
+        mp->funcs = nd; mp->cfuncs = nc;
+    }
+    MFunc *f = &mp->funcs[mp->nfuncs++];
+    memset(f, 0, sizeof(*f));
+    f->name = marena_strdup(&mp->arena, name);
+    return f;
+}
+static int m_declared(MacroPP *mp, const char *name){
+    for(int i = 0; i < mp->ndecl; i++)
+        if(strcmp(mp->declared[i], name) == 0) return 1;
+    return 0;
+}
+static void m_declare(MacroPP *mp, const char *name){
+    if(m_declared(mp, name)) return;
+    if(mp->ndecl >= mp->cdecl){
+        int nc = mp->cdecl ? mp->cdecl * 2 : 16;
+        char **nd = marena_alloc(&mp->arena, (size_t)nc * sizeof(char*));
+        if(mp->ndecl) memcpy(nd, mp->declared, (size_t)mp->ndecl * sizeof(char*));
+        mp->declared = nd; mp->cdecl = nc;
+    }
+    mp->declared[mp->ndecl++] = marena_strdup(&mp->arena, name);
+}
+
+static int m_is_defined(MacroPP *mp, const char *name){
+    if(m_func_find(mp, name)) return 1;
+    for(int i = mp->nscopes - 1; i >= 0; i--)
+        if(m_scope_find(mp->scopes[i], name)) return 1;
+    return 0;
+}
+static MVal m_lookup(MacroPP *mp, const char *name, const char *file, int line){
+    for(int i = mp->nscopes - 1; i >= 0; i--){
+        MVal *p = m_scope_find(mp->scopes[i], name);
+        if(p) return *p;
+    }
+    if(m_func_find(mp, name))
+        m_fail(mp, file, line, "macro '%s' used as a variable (call it as '%s(...)')", name, name);
+    m_fail(mp, file, line, "undefined macro variable '%s'", name);
+    return mv_int(0);
+}
+static void m_assign(MacroPP *mp, const char *name, MVal v){
+    for(int i = mp->nscopes - 1; i >= 0; i--){
+        MVal *p = m_scope_find(mp->scopes[i], name);
+        if(p){ *p = v; return; }
+    }
+    m_scope_set(m_scope(mp), marena_strdup(&mp->arena, name), v);
+}
+
+/* ---- expression evaluator --------------------------------------------------
+ * Recursive descent over one macro-time expression. Values are int64 or
+ * string; comparisons and the logical operators yield 0/1; '+' concatenates
+ * when either side is a string. Precedence follows C with a ternary on top.
+ * ------------------------------------------------------------------------- */
+
+typedef struct { const char *s; int i; MacroPP *mp; const char *file; int line; } MEP;
+
+static MVal mep_ternary(MEP *p);
+static MVal m_call_value(MacroPP *mp, const char *name, MVal *args, int nargs,
+                         const char *file, int line);
+
+static void mep_skip(MEP *p){ while(p->s[p->i] == ' ' || p->s[p->i] == '\t') p->i++; }
+
+static int mep_eat(MEP *p, const char *tok){
+    mep_skip(p);
+    size_t n = strlen(tok);
+    if(strncmp(p->s + p->i, tok, n) != 0) return 0;
+    p->i += (int)n;
+    return 1;
+}
+static void mep_expect(MEP *p, const char *tok){
+    if(!mep_eat(p, tok))
+        m_fail(p->mp, p->file, p->line, "macro expression: expected '%s' in \"%s\"", tok, p->s);
+}
+static char mep_peek(MEP *p){ mep_skip(p); return p->s[p->i]; }
+
+static char *mep_ident(MEP *p){
+    mep_skip(p);
+    int j = p->i;
+    while(p->s[j] && (isalnum((unsigned char)p->s[j]) || p->s[j] == '_')) j++;
+    if(j == p->i)
+        m_fail(p->mp, p->file, p->line, "macro expression: expected a name in \"%s\"", p->s);
+    char *r = marena_strndup(&p->mp->arena, p->s + p->i, (size_t)(j - p->i));
+    p->i = j;
+    return r;
+}
+
+static MVal mep_number(MEP *p){
+    const char *s = p->s;
+    int j = p->i, base = 10, start;
+    if(s[j] == '0' && (s[j+1] == 'x' || s[j+1] == 'X')){ base = 16; j += 2; }
+    else if(s[j] == '0' && (s[j+1] == 'b' || s[j+1] == 'B')){ base = 2; j += 2; }
+    else if(s[j] == '0' && (s[j+1] == 'o' || s[j+1] == 'O')){ base = 8; j += 2; }
+    start = j;
+    long long v = 0;
+    int ndig = 0;
+    while(s[j]){
+        char c = s[j];
+        int d;
+        if(c == '_'){ j++; continue; }
+        if(c >= '0' && c <= '9') d = c - '0';
+        else if(c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if(c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else break;
+        if(d >= base) break;
+        v = v * base + d;
+        ndig++; j++;
+    }
+    if(ndig == 0 || j == start)
+        m_fail(p->mp, p->file, p->line, "macro expression: malformed number in \"%s\"", p->s);
+    p->i = j;
+    return mv_int(v);
+}
+
+static char *mep_string(MEP *p, char q, int *len_out){
+    const char *s = p->s;
+    int j = p->i + 1;
+    /* Worst case the unescaped text is as long as the source text. */
+    char *buf = marena_alloc(&p->mp->arena, strlen(s) + 1);
+    int n = 0;
+    while(s[j]){
+        char c = s[j];
+        if(c == '\\' && s[j+1]){
+            char e = s[j+1];
+            char out;
+            switch(e){
+                case 'n': out = '\n'; break;
+                case 't': out = '\t'; break;
+                case 'r': out = '\r'; break;
+                case '0': out = '\0'; break;
+                default:  out = e;    break;
+            }
+            buf[n++] = out; j += 2; continue;
+        }
+        if(c == q){ buf[n] = '\0'; p->i = j + 1; if(len_out) *len_out = n; return buf; }
+        buf[n++] = c; j++;
+    }
+    m_fail(p->mp, p->file, p->line, "macro expression: unterminated string literal in \"%s\"", p->s);
+    return NULL;
+}
+
+static MVal mep_primary(MEP *p){
+    mep_skip(p);
+    char c = p->s[p->i];
+    if(!c) m_fail(p->mp, p->file, p->line, "macro expression: unexpected end of \"%s\"", p->s);
+
+    if(c == '('){
+        p->i++;
+        MVal v = mep_ternary(p);
+        mep_expect(p, ")");
+        return v;
+    }
+    if(c == '"'){
+        int n = 0;
+        char *t = mep_string(p, '"', &n);
+        return mv_str(t);
+    }
+    if(c == '\''){
+        int n = 0;
+        char *t = mep_string(p, '\'', &n);
+        if(n == 1) return mv_int((unsigned char)t[0]);
+        return mv_str(t);
+    }
+    if(isdigit((unsigned char)c)) return mep_number(p);
+
+    if(c == '_' || isalpha((unsigned char)c)){
+        char *name = mep_ident(p);
+        if(strcmp(name, "defined") == 0){
+            mep_expect(p, "(");
+            char *inner = mep_ident(p);
+            mep_expect(p, ")");
+            return mv_int(m_is_defined(p->mp, inner) ? 1 : 0);
+        }
+        if(mep_peek(p) == '('){
+            p->i++;
+            MVal args[MACRO_MAX_ARGS];
+            int nargs = 0;
+            if(mep_peek(p) == ')') p->i++;
+            else {
+                for(;;){
+                    if(nargs >= MACRO_MAX_ARGS)
+                        m_fail(p->mp, p->file, p->line, "macro call '%s': too many arguments", name);
+                    args[nargs++] = mep_ternary(p);
+                    if(mep_eat(p, ",")) continue;
+                    mep_expect(p, ")");
+                    break;
+                }
+            }
+            return m_call_value(p->mp, name, args, nargs, p->file, p->line);
+        }
+        return m_lookup(p->mp, name, p->file, p->line);
+    }
+    m_fail(p->mp, p->file, p->line, "macro expression: unexpected character '%c' in \"%s\"", c, p->s);
+    return mv_int(0);
+}
+
+static MVal mep_unary(MEP *p){
+    mep_skip(p);
+    if(p->s[p->i] == '!' && p->s[p->i+1] != '='){ p->i++; return mv_int(mv_truth(mep_unary(p)) ? 0 : 1); }
+    if(p->s[p->i] == '~'){ p->i++; return mv_int(~mv_need_int(p->mp, mep_unary(p), p->file, p->line)); }
+    if(p->s[p->i] == '-'){ p->i++; return mv_int(-mv_need_int(p->mp, mep_unary(p), p->file, p->line)); }
+    if(p->s[p->i] == '+'){ p->i++; return mep_unary(p); }
+    return mep_primary(p);
+}
+
+static MVal mep_mul(MEP *p){
+    MVal v = mep_unary(p);
+    for(;;){
+        mep_skip(p);
+        char c = p->s[p->i];
+        if(c == '*'){
+            p->i++;
+            MVal r = mep_unary(p);
+            if(v.is_str && !r.is_str){
+                long long n = r.i < 0 ? 0 : r.i;
+                size_t l = strlen(v.s);
+                if(n * (long long)l > 16*1024*1024)
+                    m_fail(p->mp, p->file, p->line, "macro expression: string repetition too large");
+                char *b = marena_alloc(&p->mp->arena, (size_t)n * l + 1);
+                b[0] = '\0';
+                for(long long k = 0; k < n; k++) memcpy(b + (size_t)k*l, v.s, l);
+                b[(size_t)n*l] = '\0';
+                v = mv_str(b);
+            } else if(!v.is_str && r.is_str){
+                MVal t = v; v = r; r = t;
+                long long n = r.i < 0 ? 0 : r.i;
+                size_t l = strlen(v.s);
+                char *b = marena_alloc(&p->mp->arena, (size_t)n * l + 1);
+                for(long long k = 0; k < n; k++) memcpy(b + (size_t)k*l, v.s, l);
+                b[(size_t)n*l] = '\0';
+                v = mv_str(b);
+            } else {
+                v = mv_int(mv_need_int(p->mp, v, p->file, p->line) *
+                           mv_need_int(p->mp, r, p->file, p->line));
+            }
+        } else if(c == '/'){
+            p->i++;
+            long long r = mv_need_int(p->mp, mep_unary(p), p->file, p->line);
+            if(r == 0) m_fail(p->mp, p->file, p->line, "macro expression: division by zero");
+            v = mv_int(m_cdiv(mv_need_int(p->mp, v, p->file, p->line), r));
+        } else if(c == '%'){
+            p->i++;
+            long long r = mv_need_int(p->mp, mep_unary(p), p->file, p->line);
+            if(r == 0) m_fail(p->mp, p->file, p->line, "macro expression: modulo by zero");
+            v = mv_int(m_cmod(mv_need_int(p->mp, v, p->file, p->line), r));
+        } else return v;
+    }
+}
+
+static MVal mep_add(MEP *p){
+    MVal v = mep_mul(p);
+    for(;;){
+        mep_skip(p);
+        char c = p->s[p->i];
+        if(c == '+'){
+            p->i++;
+            MVal r = mep_mul(p);
+            if(v.is_str || r.is_str){
+                char *a = mv_to_text(p->mp, v), *b = mv_to_text(p->mp, r);
+                size_t la = strlen(a), lb = strlen(b);
+                char *t = marena_alloc(&p->mp->arena, la + lb + 1);
+                memcpy(t, a, la); memcpy(t + la, b, lb + 1);
+                v = mv_str(t);
+            } else v = mv_int(v.i + r.i);
+        } else if(c == '-'){
+            p->i++;
+            v = mv_int(mv_need_int(p->mp, v, p->file, p->line) -
+                       mv_need_int(p->mp, mep_mul(p), p->file, p->line));
+        } else return v;
+    }
+}
+
+static MVal mep_shift(MEP *p){
+    MVal v = mep_add(p);
+    for(;;){
+        mep_skip(p);
+        if(p->s[p->i] == '<' && p->s[p->i+1] == '<'){
+            p->i += 2;
+            long long n = mv_need_int(p->mp, mep_add(p), p->file, p->line);
+            if(n < 0 || n > 63) m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range");
+            v = mv_int(mv_need_int(p->mp, v, p->file, p->line) << n);
+        } else if(p->s[p->i] == '>' && p->s[p->i+1] == '>'){
+            p->i += 2;
+            long long n = mv_need_int(p->mp, mep_add(p), p->file, p->line);
+            if(n < 0 || n > 63) m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range");
+            v = mv_int(mv_need_int(p->mp, v, p->file, p->line) >> n);
+        } else return v;
+    }
+}
+
+static int m_order(MEP *p, MVal a, MVal b, int or_equal){
+    if(a.is_str != b.is_str)
+        m_fail(p->mp, p->file, p->line, "macro expression: cannot order a string against an integer");
+    if(a.is_str){
+        int c = strcmp(a.s ? a.s : "", b.s ? b.s : "");
+        return or_equal ? (c <= 0) : (c < 0);
+    }
+    return or_equal ? (a.i <= b.i) : (a.i < b.i);
+}
+
+static MVal mep_rel(MEP *p){
+    MVal v = mep_shift(p);
+    for(;;){
+        mep_skip(p);
+        if(p->s[p->i] == '<' && p->s[p->i+1] == '<') return v;
+        if(p->s[p->i] == '>' && p->s[p->i+1] == '>') return v;
+        if(mep_eat(p, "<="))      v = mv_int(m_order(p, v, mep_shift(p), 1));
+        else if(mep_eat(p, ">=")) { MVal r = mep_shift(p); v = mv_int(m_order(p, r, v, 1)); }
+        else if(mep_eat(p, "<"))  v = mv_int(m_order(p, v, mep_shift(p), 0));
+        else if(mep_eat(p, ">"))  { MVal r = mep_shift(p); v = mv_int(m_order(p, r, v, 0)); }
+        else return v;
+    }
+}
+
+static int m_equal(MVal a, MVal b){
+    if(a.is_str != b.is_str) return 0;
+    if(a.is_str) return strcmp(a.s ? a.s : "", b.s ? b.s : "") == 0;
+    return a.i == b.i;
+}
+
+static MVal mep_eq(MEP *p){
+    MVal v = mep_rel(p);
+    for(;;){
+        if(mep_eat(p, "=="))      v = mv_int(m_equal(v, mep_rel(p)) ? 1 : 0);
+        else if(mep_eat(p, "!=")) v = mv_int(m_equal(v, mep_rel(p)) ? 0 : 1);
+        else return v;
+    }
+}
+
+static MVal mep_band(MEP *p){
+    MVal v = mep_eq(p);
+    for(;;){
+        mep_skip(p);
+        if(p->s[p->i] == '&' && p->s[p->i+1] != '&'){
+            p->i++;
+            v = mv_int(mv_need_int(p->mp, v, p->file, p->line) &
+                       mv_need_int(p->mp, mep_eq(p), p->file, p->line));
+        } else return v;
+    }
+}
+static MVal mep_bxor(MEP *p){
+    MVal v = mep_band(p);
+    for(;;){
+        mep_skip(p);
+        if(p->s[p->i] == '^'){
+            p->i++;
+            v = mv_int(mv_need_int(p->mp, v, p->file, p->line) ^
+                       mv_need_int(p->mp, mep_band(p), p->file, p->line));
+        } else return v;
+    }
+}
+static MVal mep_bor(MEP *p){
+    MVal v = mep_bxor(p);
+    for(;;){
+        mep_skip(p);
+        if(p->s[p->i] == '|' && p->s[p->i+1] != '|'){
+            p->i++;
+            v = mv_int(mv_need_int(p->mp, v, p->file, p->line) |
+                       mv_need_int(p->mp, mep_bxor(p), p->file, p->line));
+        } else return v;
+    }
+}
+static MVal mep_land(MEP *p){
+    MVal v = mep_bor(p);
+    while(mep_eat(p, "&&")){
+        MVal r = mep_bor(p);
+        v = mv_int((mv_truth(v) && mv_truth(r)) ? 1 : 0);
+    }
+    return v;
+}
+static MVal mep_lor(MEP *p){
+    MVal v = mep_land(p);
+    while(mep_eat(p, "||")){
+        MVal r = mep_land(p);
+        v = mv_int((mv_truth(v) || mv_truth(r)) ? 1 : 0);
+    }
+    return v;
+}
+static MVal mep_ternary(MEP *p){
+    MVal c = mep_lor(p);
+    mep_skip(p);
+    if(p->s[p->i] == '?'){
+        p->i++;
+        MVal a = mep_ternary(p);
+        mep_expect(p, ":");
+        MVal b = mep_ternary(p);
+        return mv_truth(c) ? a : b;
+    }
+    return c;
+}
+
+static MVal m_eval(MacroPP *mp, const char *text, const char *file, int line){
+    while(*text == ' ' || *text == '\t') text++;
+    if(!*text) m_fail(mp, file, line, "empty macro expression");
+    MEP p; p.s = text; p.i = 0; p.mp = mp; p.file = file; p.line = line;
+    MVal v = mep_ternary(&p);
+    mep_skip(&p);
+    if(p.s[p.i])
+        m_fail(mp, file, line, "macro expression: unexpected trailing text \"%s\"", p.s + p.i);
+    return v;
+}
+
+/* ---- builtins -------------------------------------------------------------- */
+
+static void m_bi_argc(MacroPP *mp, const char *name, int n, int lo, int hi,
+                      const char *file, int line){
+    if(n < lo || n > hi)
+        m_fail(mp, file, line, "%s() takes %d..%d argument(s), got %d", name, lo, hi, n);
+}
+
+static int m_builtin(MacroPP *mp, const char *name, MVal *a, int n,
+                     const char *file, int line, MVal *out){
+    if(strcmp(name, "len") == 0){
+        m_bi_argc(mp, "len", n, 1, 1, file, line);
+        *out = mv_int((long long)strlen(mv_to_text(mp, a[0])));
+        return 1;
+    }
+    if(strcmp(name, "str") == 0){
+        m_bi_argc(mp, "str", n, 1, 1, file, line);
+        *out = mv_str(mv_to_text(mp, a[0]));
+        return 1;
+    }
+    if(strcmp(name, "hex") == 0){
+        m_bi_argc(mp, "hex", n, 1, 2, file, line);
+        long long v = mv_need_int(mp, a[0], file, line);
+        long long w = (n > 1) ? mv_need_int(mp, a[1], file, line) : 0;
+        if(w < 0 || w > 64) w = 0;
+        char buf[80];
+        unsigned long long uv = (v < 0) ? (unsigned long long)(-v) : (unsigned long long)v;
+        snprintf(buf, sizeof(buf), "%s%0*llx", v < 0 ? "-" : "", (int)w, uv);
+        *out = mv_str(marena_strdup(&mp->arena, buf));
+        return 1;
+    }
+    if(strcmp(name, "int") == 0){
+        m_bi_argc(mp, "int", n, 1, 2, file, line);
+        if(!a[0].is_str){ *out = a[0]; return 1; }
+        int base = (n > 1) ? (int)mv_need_int(mp, a[1], file, line) : 0;
+        errno = 0;
+        char *end = NULL;
+        long long v = strtoll(a[0].s ? a[0].s : "", &end, base);
+        while(end && (*end == ' ' || *end == '\t')) end++;
+        if(!end || end == a[0].s || *end)
+            m_fail(mp, file, line, "int(\"%s\") is not a number", a[0].s ? a[0].s : "");
+        *out = mv_int(v);
+        return 1;
+    }
+    if(strcmp(name, "upper") == 0 || strcmp(name, "lower") == 0){
+        m_bi_argc(mp, name, n, 1, 1, file, line);
+        char *t = marena_strdup(&mp->arena, mv_to_text(mp, a[0]));
+        for(char *q = t; *q; q++)
+            *q = (name[0] == 'u') ? (char)toupper((unsigned char)*q)
+                                  : (char)tolower((unsigned char)*q);
+        *out = mv_str(t);
+        return 1;
+    }
+    if(strcmp(name, "substr") == 0){
+        m_bi_argc(mp, "substr", n, 2, 3, file, line);
+        char *t = mv_to_text(mp, a[0]);
+        long long l = (long long)strlen(t);
+        long long st = mv_need_int(mp, a[1], file, line);
+        if(st < 0) st = 0;
+        if(st > l) st = l;
+        long long cnt = (n > 2) ? mv_need_int(mp, a[2], file, line) : l - st;
+        if(cnt < 0) cnt = 0;
+        if(st + cnt > l) cnt = l - st;
+        *out = mv_str(marena_strndup(&mp->arena, t + st, (size_t)cnt));
+        return 1;
+    }
+    if(strcmp(name, "abs") == 0){
+        m_bi_argc(mp, "abs", n, 1, 1, file, line);
+        long long v = mv_need_int(mp, a[0], file, line);
+        *out = mv_int(v < 0 ? -v : v);
+        return 1;
+    }
+    if(strcmp(name, "min") == 0 || strcmp(name, "max") == 0){
+        m_bi_argc(mp, name, n, 1, MACRO_MAX_ARGS, file, line);
+        MVal best = a[0];
+        MEP dummy; dummy.mp = mp; dummy.file = file; dummy.line = line; dummy.s = ""; dummy.i = 0;
+        for(int k = 1; k < n; k++){
+            int lt = m_order(&dummy, a[k], best, 0);
+            if((name[1] == 'i') ? lt : !lt && !m_equal(a[k], best)) best = a[k];
+        }
+        *out = best;
+        return 1;
+    }
+    if(strcmp(name, "uid") == 0){
+        m_bi_argc(mp, "uid", n, 0, 0, file, line);
+        *out = mv_int(++mp->uid);
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- macro invocation ------------------------------------------------------ */
+
+static void m_exec_block(MacroPP *mp, MBlock *b);
+
+static MVal m_invoke(MacroPP *mp, MFunc *f, MVal *args, int nargs,
+                     const char *file, int line){
+    int nreq = 0;
+    for(int i = 0; i < f->nparams; i++) if(!f->defaults[i]) nreq++;
+    if(nargs > f->nparams || nargs < nreq)
+        m_fail(mp, file, line, "macro '%s' takes %d..%d argument(s), got %d",
+               f->name, nreq, f->nparams, nargs);
+    if(mp->depth >= MACRO_MAX_DEPTH)
+        m_fail(mp, file, line, "macro recursion deeper than %d while expanding '%s'",
+               MACRO_MAX_DEPTH, f->name);
+    if(mp->nscopes >= MACRO_MAX_SCOPES)
+        m_fail(mp, file, line, "macro scope nesting too deep");
+
+    MScope *sc = calloc(1, sizeof(MScope));
+    if(!sc){ perror("calloc"); exit(1); }
+
+    /* Defaults are evaluated in the caller's scope, matching the order the
+     * arguments themselves were evaluated in. */
+    MVal bound[MACRO_MAX_ARGS];
+    for(int i = 0; i < f->nparams; i++)
+        bound[i] = (i < nargs) ? args[i] : m_eval(mp, f->defaults[i], file, line);
+
+    mp->scopes[mp->nscopes++] = sc;
+    for(int i = 0; i < f->nparams; i++)
+        m_scope_set(sc, f->params[i], bound[i]);
+    mp->uid++;
+    m_scope_set(sc, marena_strdup(&mp->arena, "__id__"), mv_int(mp->uid));
+    m_scope_set(sc, marena_strdup(&mp->arena, "__name__"),
+                mv_str(marena_strdup(&mp->arena, f->name)));
+
+    mp->depth++;
+    m_exec_block(mp, f->body);
+    mp->depth--;
+
+    mp->nscopes--;
+    free(sc->names); free(sc->vals); free(sc);
+
+    MVal r = mv_int(0);
+    if(mp->ctl == MCTL_RETURN){ r = mp->retval; mp->ctl = MCTL_NONE; }
+    return r;
+}
+
+/* A call appearing inside an expression: the macro's !return value is the
+ * result, and the macro must not emit any source text (there would be nowhere
+ * to put it). */
+static MVal m_call_value(MacroPP *mp, const char *name, MVal *args, int nargs,
+                         const char *file, int line){
+    MVal out;
+    if(m_builtin(mp, name, args, nargs, file, line, &out)) return out;
+    MFunc *f = m_func_find(mp, name);
+    if(!f || !f->defined)
+        m_fail(mp, file, line, "call to undefined macro '%s'", name);
+    int mark = mp->out ? mp->out->len : 0;
+    MVal v = m_invoke(mp, f, args, nargs, file, line);
+    if(mp->out && mp->out->len != mark){
+        char *emitted = mp->out->d[mark].text;
+        mp->out->len = mark;
+        m_fail(mp, file, line,
+               "macro '%s' emits source text (\"%s\") but was called from inside an "
+               "expression, where there is nowhere to put it", name, emitted);
+    }
+    return v;
+}
+
+/* ---- text interpolation ---------------------------------------------------- */
+
+/* Evaluate one !{...} body, honouring a trailing :format-spec. */
+static char *m_format_value(MacroPP *mp, const char *body, const char *file, int line){
+    int len = (int)strlen(body);
+    int spec_at = -1;
+    char quote = 0;
+    int par = 0, seen_q = 0;
+    for(int k = 0; k < len; k++){
+        char c = body[k];
+        if(quote){
+            if(c == '\\'){ k++; continue; }
+            if(c == quote) quote = 0;
+            continue;
+        }
+        if(c == '"' || c == '\'') quote = c;
+        else if(c == '(' || c == '[') par++;
+        else if(c == ')' || c == ']') par--;
+        else if(c == '?' && par == 0) seen_q = 1;
+        else if(c == ':' && par == 0 && !seen_q){ spec_at = k; break; }
+    }
+    char *expr = (spec_at >= 0) ? marena_strndup(&mp->arena, body, (size_t)spec_at)
+                                : (char*)body;
+    const char *spec = (spec_at >= 0) ? body + spec_at + 1 : NULL;
+    MVal v = m_eval(mp, expr, file, line);
+    if(!spec || !*spec) return mv_to_text(mp, v);
+
+    /* Format spec: [0][width][d|x|X|o|b|c|s] -- the subset of Python's spec
+     * that is meaningful for generating assembly text. */
+    while(*spec == ' ') spec++;
+    int zero = 0, width = 0;
+    if(*spec == '0'){ zero = 1; spec++; }
+    while(isdigit((unsigned char)*spec)){ width = width * 10 + (*spec - '0'); spec++; }
+    char conv = *spec ? *spec : 'd';
+    if(spec[0] && spec[1])
+        m_fail(mp, file, line, "unsupported format spec in !{...}");
+    if(width < 0 || width > 256)
+        m_fail(mp, file, line, "format width out of range in !{...}");
+
+    if(conv == 's'){
+        char *t = mv_to_text(mp, v);
+        int l = (int)strlen(t);
+        if(l >= width) return t;
+        char *b = marena_alloc(&mp->arena, (size_t)width + 1);
+        memset(b, ' ', (size_t)(width - l));
+        memcpy(b + (width - l), t, (size_t)l + 1);
+        return b;
+    }
+    long long iv = mv_need_int(mp, v, file, line);
+    char digits[128];
+    int n = 0, neg = 0;
+    unsigned long long uv;
+    if(conv == 'c'){
+        char *b = marena_alloc(&mp->arena, 2);
+        b[0] = (char)iv; b[1] = '\0';
+        return b;
+    }
+    if(iv < 0){ neg = 1; uv = (unsigned long long)(-iv); } else uv = (unsigned long long)iv;
+    switch(conv){
+        case 'd': n = snprintf(digits, sizeof(digits), "%llu", uv); break;
+        case 'x': n = snprintf(digits, sizeof(digits), "%llx", uv); break;
+        case 'X': n = snprintf(digits, sizeof(digits), "%llX", uv); break;
+        case 'o': n = snprintf(digits, sizeof(digits), "%llo", uv); break;
+        case 'b': {
+            char tmp[80]; int t = 0;
+            if(uv == 0) tmp[t++] = '0';
+            while(uv){ tmp[t++] = (char)('0' + (uv & 1)); uv >>= 1; }
+            for(int k = 0; k < t; k++) digits[k] = tmp[t-1-k];
+            digits[t] = '\0'; n = t;
+            break;
+        }
+        default:
+            m_fail(mp, file, line, "unknown format conversion '%c' in !{...}", conv);
+    }
+    int total = n + neg;
+    int pad = (width > total) ? width - total : 0;
+    char *b = marena_alloc(&mp->arena, (size_t)(total + pad) + 1);
+    int o = 0;
+    if(zero){
+        if(neg) b[o++] = '-';
+        for(int k = 0; k < pad; k++) b[o++] = '0';
+    } else {
+        for(int k = 0; k < pad; k++) b[o++] = ' ';
+        if(neg) b[o++] = '-';
+    }
+    memcpy(b + o, digits, (size_t)n + 1);
+    return b;
+}
+
+/* Replace every !{expr} / !{expr:fmt} in an ordinary source line. */
+static char *m_interpolate(MacroPP *mp, const char *text, const char *file, int line){
+    if(!strstr(text, "!{")) return (char*)text;
+    size_t cap = strlen(text) + 256, n = 0;
+    char *out = malloc(cap);
+    if(!out){ perror("malloc"); exit(1); }
+    int i = 0, len = (int)strlen(text);
+    while(i < len){
+        if(text[i] == '\\' && text[i+1] == '!' && text[i+2] == '{'){
+            if(n + 3 >= cap){ cap *= 2; out = realloc(out, cap); }
+            out[n++] = '!'; out[n++] = '{';
+            i += 3; continue;
+        }
+        if(!(text[i] == '!' && text[i+1] == '{')){
+            if(n + 2 >= cap){ cap *= 2; out = realloc(out, cap); if(!out){perror("realloc");exit(1);} }
+            out[n++] = text[i++];
+            continue;
+        }
+        int j = i + 2, depth = 1;
+        char quote = 0;
+        while(j < len){
+            char c = text[j];
+            if(quote){
+                if(c == '\\'){ j += 2; continue; }
+                if(c == quote) quote = 0;
+            } else if(c == '"' || c == '\'') quote = c;
+            else if(c == '{') depth++;
+            else if(c == '}'){ if(--depth == 0) break; }
+            j++;
+        }
+        if(j >= len){
+            free(out);
+            m_fail(mp, file, line, "unterminated '!{' in line");
+        }
+        char *body = marena_strndup(&mp->arena, text + i + 2, (size_t)(j - i - 2));
+        char *val;
+        /* m_format_value may longjmp; the malloc'd buffer would leak, so hand
+         * it to the arena first by copying what we have so far is unnecessary
+         * -- instead just make sure the failure path frees it. */
+        {
+            char *saved = out;
+            out = NULL;
+            val = m_format_value(mp, body, file, line);
+            out = saved;
+        }
+        size_t vl = strlen(val);
+        while(n + vl + 1 >= cap){ cap *= 2; out = realloc(out, cap); if(!out){perror("realloc");exit(1);} }
+        memcpy(out + n, val, vl);
+        n += vl;
+        i = j + 1;
+    }
+    out[n] = '\0';
+    char *r = marena_strndup(&mp->arena, out, n);
+    free(out);
+    return r;
+}
+
+/* ---- line/statement helpers ------------------------------------------------ */
+
+/* Remove a ';' comment from a macro *statement* line, respecting string and
+ * character literals. Ordinary (passed-through) source lines are never touched
+ * here: the assembler strips their comments itself, and the listing output is
+ * expected to still show them. */
+static char *m_strip_comment(MacroPP *mp, const char *text){
+    int i = 0; char quote = 0;
+    while(text[i]){
+        char c = text[i];
+        if(quote){
+            if(c == '\\'){ i += 2; continue; }
+            if(c == quote) quote = 0;
+        } else if(c == '"' || c == '\'') quote = c;
+        else if(c == ';') break;
+        i++;
+    }
+    while(i > 0 && (text[i-1] == ' ' || text[i-1] == '\t')) i--;
+    return marena_strndup(&mp->arena, text, (size_t)i);
+}
+
+static const char *m_lstrip(const char *s){
+    while(*s == ' ' || *s == '\t') s++;
+    return s;
+}
+static char *m_rstrip(MacroPP *mp, const char *s){
+    size_t n = strlen(s);
+    while(n > 0 && (s[n-1] == ' ' || s[n-1] == '\t')) n--;
+    return marena_strndup(&mp->arena, s, n);
+}
+static char *m_trim(MacroPP *mp, const char *s){ return m_rstrip(mp, m_lstrip(s)); }
+
+/* If text is a '!'-statement line, write the word after the '!' into word[]
+ * and return a pointer to the rest of the line; otherwise return NULL. "!!"
+ * (the VLIW slot separator) is never a statement. */
+static const char *m_statement_word(const char *text, char *word, size_t wsz){
+    const char *t = m_lstrip(text);
+    if(t[0] != '!' || t[1] == '!') return NULL;
+    size_t j = 1;
+    while(t[j] && (isalnum((unsigned char)t[j]) || t[j] == '_')) j++;
+    if(j == 1) return NULL;
+    size_t n = j - 1;
+    if(n >= wsz) n = wsz - 1;
+    memcpy(word, t + 1, n); word[n] = '\0';
+    return t + j;
+}
+
+static int m_is_keyword(const char *w){
+    static const char *kw[] = { "if","then","else","elif","while","def","return",
+                                "set","local","break","continue","error","warning",
+                                "echo","include","undef", NULL };
+    for(int i = 0; kw[i]; i++) if(strcasecmp(w, kw[i]) == 0) return 1;
+    return 0;
+}
+
+/* ---- parser ---------------------------------------------------------------- */
+
+typedef struct { MLine *d; int n; } MSrc;
+
+static MBlock *m_parse_block(MacroPP *mp, MSrc *src, int *ip, int depth);
+
+static MNode *m_node(MacroPP *mp, MNKind k, const char *file, int line){
+    MNode *n = marena_alloc(&mp->arena, sizeof(MNode));
+    memset(n, 0, sizeof(*n));
+    n->kind = k; n->file = file; n->line = line;
+    return n;
+}
+
+/* Split a "!if expr !then {" / "!while expr {" header into its expression,
+ * checking that the line really opens a block. */
+static char *m_parse_header(MacroPP *mp, const char *text, const char *kw,
+                            const char *file, int line){
+    char *t = m_trim(mp, text);
+    size_t kl = strlen(kw) + 1;             /* '!' + keyword */
+    if(strlen(t) < kl) m_fail(mp, file, line, "malformed '!%s' header", kw);
+    char *body = m_rstrip(mp, t + kl);
+    size_t bl = strlen(body);
+    if(bl == 0 || body[bl-1] != '{')
+        m_fail(mp, file, line, "'!%s' header must end with '{'", kw);
+    body[bl-1] = '\0';
+    if(strcmp(kw, "if") == 0 || strcmp(kw, "elif") == 0){
+        /* find the LAST "!then" outside quotes */
+        int at = -1; char quote = 0;
+        for(int k = 0; body[k]; k++){
+            char c = body[k];
+            if(quote){ if(c == '\\'){ k++; continue; } if(c == quote) quote = 0; continue; }
+            if(c == '"' || c == '\'') quote = c;
+            else if(c == '!' && strncasecmp(body + k, "!then", 5) == 0) at = k;
+        }
+        if(at < 0) m_fail(mp, file, line, "'!%s' needs '!then' before '{'", kw);
+        body[at] = '\0';
+    }
+    return m_trim(mp, body);
+}
+
+static MNode *m_parse_if(MacroPP *mp, MSrc *src, int *ip, int depth){
+    const char *file = src->d[*ip].file;
+    int line = src->d[*ip].line;
+    MNode *n = m_node(mp, MN_IF, file, line);
+    char *cond = m_parse_header(mp, m_strip_comment(mp, src->d[*ip].text), "if", file, line);
+
+    int cap = 4;
+    n->conds = marena_alloc(&mp->arena, (size_t)cap * sizeof(char*));
+    n->arms  = marena_alloc(&mp->arena, (size_t)cap * sizeof(MBlock));
+    memset(n->arms, 0, (size_t)cap * sizeof(MBlock));
+
+    for(;;){
+        (*ip)++;
+        MBlock *body = m_parse_block(mp, src, ip, depth + 1);
+        if(n->narms >= cap){
+            int nc = cap * 2;
+            char **nc2 = marena_alloc(&mp->arena, (size_t)nc * sizeof(char*));
+            MBlock *na = marena_alloc(&mp->arena, (size_t)nc * sizeof(MBlock));
+            memset(na, 0, (size_t)nc * sizeof(MBlock));
+            memcpy(nc2, n->conds, (size_t)n->narms * sizeof(char*));
+            memcpy(na, n->arms, (size_t)n->narms * sizeof(MBlock));
+            n->conds = nc2; n->arms = na; cap = nc;
+        }
+        n->conds[n->narms] = cond;
+        n->arms[n->narms]  = *body;
+        n->narms++;
+
+        if(*ip >= src->n)
+            m_fail(mp, file, line, "'!if' block is never closed with '}'");
+        const char *cfile = src->d[*ip].file;
+        int cline = src->d[*ip].line;
+        char *close = m_trim(mp, m_strip_comment(mp, src->d[*ip].text));
+        const char *tail = m_lstrip(close + 1);      /* skip the '}' */
+        if(!*tail){ (*ip)++; return n; }
+
+        char w[64];
+        const char *rest = m_statement_word(tail, w, sizeof(w));
+        if(!rest) m_fail(mp, cfile, cline, "unexpected text after '}': %s", tail);
+
+        if(strcasecmp(w, "elif") == 0){
+            cond = m_parse_header(mp, tail, "elif", cfile, cline);
+            continue;
+        }
+        if(strcasecmp(w, "else") == 0){
+            const char *r = m_lstrip(rest);
+            if(r[0] == '!' && strncasecmp(r, "!if", 3) == 0){
+                cond = m_parse_header(mp, r, "if", cfile, cline);
+                continue;
+            }
+            if(r[0] != '{')
+                m_fail(mp, cfile, cline, "'!else' must be followed by '{'");
+            (*ip)++;
+            n->elsebody = m_parse_block(mp, src, ip, depth + 1);
+            if(*ip >= src->n)
+                m_fail(mp, cfile, cline, "'!else' block is never closed");
+            char *c2 = m_trim(mp, m_strip_comment(mp, src->d[*ip].text));
+            if(*m_lstrip(c2 + 1))
+                m_fail(mp, src->d[*ip].file, src->d[*ip].line,
+                       "unexpected text after '}': %s", m_lstrip(c2 + 1));
+            (*ip)++;
+            return n;
+        }
+        m_fail(mp, cfile, cline, "unexpected '!%s' after '}'", w);
+    }
+}
+
+static MNode *m_parse_while(MacroPP *mp, MSrc *src, int *ip, int depth){
+    const char *file = src->d[*ip].file;
+    int line = src->d[*ip].line;
+    MNode *n = m_node(mp, MN_WHILE, file, line);
+    n->a = m_parse_header(mp, m_strip_comment(mp, src->d[*ip].text), "while", file, line);
+    (*ip)++;
+    n->body = m_parse_block(mp, src, ip, depth + 1);
+    if(*ip >= src->n)
+        m_fail(mp, file, line, "'!while' block is never closed with '}'");
+    char *c2 = m_trim(mp, m_strip_comment(mp, src->d[*ip].text));
+    if(*m_lstrip(c2 + 1))
+        m_fail(mp, src->d[*ip].file, src->d[*ip].line,
+               "unexpected text after '}': %s", m_lstrip(c2 + 1));
+    (*ip)++;
+    return n;
+}
+
+static MNode *m_parse_def(MacroPP *mp, MSrc *src, int *ip, int depth){
+    const char *file = src->d[*ip].file;
+    int line = src->d[*ip].line;
+    MNode *n = m_node(mp, MN_DEF, file, line);
+
+    char *t = m_trim(mp, m_strip_comment(mp, src->d[*ip].text));
+    if(strlen(t) < 4) m_fail(mp, file, line, "malformed '!def'");
+    t = m_rstrip(mp, t + 4);
+    size_t tl = strlen(t);
+    if(tl == 0 || t[tl-1] != '{')
+        m_fail(mp, file, line, "'!def' header must end with '{'");
+    t[tl-1] = '\0';
+    t = m_trim(mp, t);
+    char *op = strchr(t, '(');
+    tl = strlen(t);
+    if(!op || tl == 0 || t[tl-1] != ')')
+        m_fail(mp, file, line, "'!def' needs 'name(p1, p2, ...)'");
+    t[tl-1] = '\0';
+    char *plist = op + 1;
+    *op = '\0';
+    char *name = m_trim(mp, t);
+    if(!name[0] || !(isalpha((unsigned char)name[0]) || name[0] == '_'))
+        m_fail(mp, file, line, "bad macro name '%s'", name);
+    for(char *q = name; *q; q++)
+        if(!(isalnum((unsigned char)*q) || *q == '_'))
+            m_fail(mp, file, line, "bad macro name '%s'", name);
+    if(m_is_keyword(name))
+        m_fail(mp, file, line, "'%s' is a reserved macro name", name);
+    {   /* builtins are reserved too */
+        MVal probe; MVal noargs[1];
+        (void)probe; (void)noargs;
+        static const char *bi[] = {"len","str","hex","int","upper","lower",
+                                   "substr","abs","min","max","uid","defined",NULL};
+        for(int k = 0; bi[k]; k++)
+            if(strcmp(name, bi[k]) == 0)
+                m_fail(mp, file, line, "'%s' is a reserved macro name", name);
+    }
+    n->a = name;
+
+    int cap = 8;
+    n->params   = marena_alloc(&mp->arena, (size_t)cap * sizeof(char*));
+    n->defaults = marena_alloc(&mp->arena, (size_t)cap * sizeof(char*));
+    plist = m_trim(mp, plist);
+    if(plist[0]){
+        char *p = plist;
+        while(1){
+            char *comma = strchr(p, ',');
+            char *one = comma ? m_trim(mp, marena_strndup(&mp->arena, p, (size_t)(comma - p)))
+                              : m_trim(mp, p);
+            if(n->nparams >= cap){
+                int nc = cap * 2;
+                char **np = marena_alloc(&mp->arena, (size_t)nc * sizeof(char*));
+                char **nd = marena_alloc(&mp->arena, (size_t)nc * sizeof(char*));
+                memcpy(np, n->params,   (size_t)n->nparams * sizeof(char*));
+                memcpy(nd, n->defaults, (size_t)n->nparams * sizeof(char*));
+                n->params = np; n->defaults = nd; cap = nc;
+            }
+            char *eq = strchr(one, '=');
+            if(eq){
+                *eq = '\0';
+                n->params[n->nparams]   = m_trim(mp, one);
+                n->defaults[n->nparams] = m_trim(mp, eq + 1);
+            } else {
+                n->params[n->nparams]   = one;
+                n->defaults[n->nparams] = NULL;
+            }
+            char *pn = n->params[n->nparams];
+            if(!pn[0] || !(isalpha((unsigned char)pn[0]) || pn[0] == '_'))
+                m_fail(mp, file, line, "bad parameter name '%s' in '!def %s'", pn, name);
+            n->nparams++;
+            if(!comma) break;
+            p = comma + 1;
+        }
+    }
+    {   /* a parameter without a default may not follow one that has one */
+        const char *seen = NULL;
+        for(int k = 0; k < n->nparams; k++){
+            if(!n->defaults[k] && seen)
+                m_fail(mp, file, line,
+                       "parameter '%s' without a default follows '%s' which has one",
+                       n->params[k], seen);
+            if(n->defaults[k]) seen = n->params[k];
+        }
+    }
+
+    /* Register the name *before* parsing the body so a recursive call inside
+     * the body is recognised as a statement call rather than passed through to
+     * the assembler as ordinary text. */
+    m_declare(mp, name);
+
+    (*ip)++;
+    n->body = m_parse_block(mp, src, ip, depth + 1);
+    if(*ip >= src->n)
+        m_fail(mp, file, line, "'!def %s' block is never closed", name);
+    char *c2 = m_trim(mp, m_strip_comment(mp, src->d[*ip].text));
+    if(*m_lstrip(c2 + 1))
+        m_fail(mp, src->d[*ip].file, src->d[*ip].line,
+               "unexpected text after '}': %s", m_lstrip(c2 + 1));
+    (*ip)++;
+    return n;
+}
+
+static MNode *m_parse_simple(MacroPP *mp, const char *w, const char *rest,
+                             const char *file, int line){
+    if(strcasecmp(w, "set") == 0 || strcasecmp(w, "local") == 0){
+        MNode *n = m_node(mp, strcasecmp(w, "set") == 0 ? MN_SET : MN_LOCAL, file, line);
+        const char *eq = strchr(rest, '=');
+        if(!eq){
+            if(n->kind == MN_SET)
+                m_fail(mp, file, line, "'!set' needs 'name = expression'");
+            n->a = m_trim(mp, rest);
+            n->b = NULL;
+        } else {
+            n->a = m_trim(mp, marena_strndup(&mp->arena, rest, (size_t)(eq - rest)));
+            n->b = m_trim(mp, eq + 1);
+        }
+        if(!n->a[0]) m_fail(mp, file, line, "'!%s' needs a variable name", w);
+        return n;
+    }
+    if(strcasecmp(w, "undef") == 0){
+        MNode *n = m_node(mp, MN_UNDEF, file, line);
+        n->a = m_trim(mp, rest);
+        return n;
+    }
+    if(strcasecmp(w, "return") == 0){
+        MNode *n = m_node(mp, MN_RETURN, file, line);
+        char *t = m_trim(mp, rest);
+        n->a = t[0] ? t : NULL;
+        return n;
+    }
+    if(strcasecmp(w, "break") == 0)    return m_node(mp, MN_BREAK, file, line);
+    if(strcasecmp(w, "continue") == 0) return m_node(mp, MN_CONTINUE, file, line);
+    if(strcasecmp(w, "error") == 0 || strcasecmp(w, "warning") == 0 ||
+       strcasecmp(w, "echo") == 0 || strcasecmp(w, "include") == 0){
+        MNKind k = (strcasecmp(w, "error") == 0)   ? MN_ERROR :
+                   (strcasecmp(w, "warning") == 0) ? MN_WARNING :
+                   (strcasecmp(w, "echo") == 0)    ? MN_ECHO : MN_INCLUDE;
+        MNode *n = m_node(mp, k, file, line);
+        n->a = m_trim(mp, rest);
+        return n;
+    }
+    /* macro call used as a statement */
+    MNode *n = m_node(mp, MN_CALL, file, line);
+    n->a = marena_strdup(&mp->arena, w);
+    n->b = m_trim(mp, rest);
+    return n;
+}
+
+/* Parse statements until the '}' that closes the enclosing block. On return
+ * *ip indexes that '}' line (or src->n at top level). A '}' seen at depth 0 is
+ * not a block terminator and is passed through as ordinary text, so source
+ * that legitimately starts a line with '}' is unaffected. */
+static MBlock *m_parse_block(MacroPP *mp, MSrc *src, int *ip, int depth){
+    MBlock *b = marena_alloc(&mp->arena, sizeof(MBlock));
+    memset(b, 0, sizeof(*b));
+    while(*ip < src->n){
+        const char *text = src->d[*ip].text;
+        const char *file = src->d[*ip].file;
+        int line = src->d[*ip].line;
+
+        if(depth > 0 && m_lstrip(text)[0] == '}') return b;
+
+        char w[64];
+        const char *rest = m_statement_word(m_strip_comment(mp, text), w, sizeof(w));
+        if(!rest){
+            MNode *n = m_node(mp, MN_TEXT, file, line);
+            n->a = (char*)text;
+            mblock_push(mp, b, n);
+            (*ip)++;
+            continue;
+        }
+        int is_call_syntax = (m_lstrip(rest)[0] == '(');
+        if(!m_is_keyword(w) && !m_declared(mp, w) && !is_call_syntax){
+            MNode *n = m_node(mp, MN_TEXT, file, line);
+            n->a = (char*)text;
+            mblock_push(mp, b, n);
+            (*ip)++;
+            continue;
+        }
+        if(strcasecmp(w, "if") == 0){        mblock_push(mp, b, m_parse_if(mp, src, ip, depth)); continue; }
+        if(strcasecmp(w, "while") == 0){     mblock_push(mp, b, m_parse_while(mp, src, ip, depth)); continue; }
+        if(strcasecmp(w, "def") == 0){       mblock_push(mp, b, m_parse_def(mp, src, ip, depth)); continue; }
+        if(strcasecmp(w, "else") == 0 || strcasecmp(w, "elif") == 0 || strcasecmp(w, "then") == 0)
+            m_fail(mp, file, line, "'!%s' without a matching '!if'", w);
+        mblock_push(mp, b, m_parse_simple(mp, w, rest, file, line));
+        (*ip)++;
+    }
+    if(depth > 0){
+        const char *f = src->n ? src->d[src->n-1].file : "?";
+        int l = src->n ? src->d[src->n-1].line : 0;
+        m_fail(mp, f, l, "unexpected end of file: a macro block opened with '{' is never closed");
+    }
+    return b;
+}
+
+/* ---- execution -------------------------------------------------------------- */
+
+static void m_do_include(MacroPP *mp, const char *name, const char *file, int line);
+
+static void m_parse_args(MacroPP *mp, const char *argtext, MVal *args, int *nargs,
+                         const char *file, int line){
+    *nargs = 0;
+    const char *t = m_lstrip(argtext);
+    if(!*t) return;
+    if(*t != '(') m_fail(mp, file, line, "macro call needs parentheses");
+    MEP p; p.s = t; p.i = 0; p.mp = mp; p.file = file; p.line = line;
+    mep_expect(&p, "(");
+    if(mep_peek(&p) == ')') p.i++;
+    else {
+        for(;;){
+            if(*nargs >= MACRO_MAX_ARGS)
+                m_fail(mp, file, line, "macro call: too many arguments");
+            args[(*nargs)++] = mep_ternary(&p);
+            if(mep_eat(&p, ",")) continue;
+            mep_expect(&p, ")");
+            break;
+        }
+    }
+    mep_skip(&p);
+    if(p.s[p.i])
+        m_fail(mp, file, line, "unexpected text after macro call: \"%s\"", p.s + p.i);
+}
+
+static void m_emit(MacroPP *mp, char *text, const char *file, int line){
+    if(mp->nemitted >= MACRO_MAX_LINES)
+        m_fail(mp, file, line, "macro expansion produced more than %ld lines; "
+               "assuming a runaway macro", MACRO_MAX_LINES);
+    if(mp->arena.total > MACRO_MAX_ARENA)
+        m_fail(mp, file, line, "macro expansion used more than %zu bytes; "
+               "assuming a runaway macro", (size_t)MACRO_MAX_ARENA);
+    mp->nemitted++;
+    mlinevec_push(mp, mp->out, text, file, line);
+}
+
+static void m_exec_node(MacroPP *mp, MNode *n){
+    switch(n->kind){
+    case MN_TEXT:
+        m_emit(mp, m_interpolate(mp, n->a, n->file, n->line), n->file, n->line);
+        return;
+
+    case MN_IF:
+        for(int k = 0; k < n->narms; k++){
+            if(mv_truth(m_eval(mp, n->conds[k], n->file, n->line))){
+                m_exec_block(mp, &n->arms[k]);
+                return;
+            }
+        }
+        if(n->elsebody) m_exec_block(mp, n->elsebody);
+        return;
+
+    case MN_WHILE: {
+        long count = 0;
+        while(mv_truth(m_eval(mp, n->a, n->file, n->line))){
+            if(++count > MACRO_MAX_ITER)
+                m_fail(mp, n->file, n->line,
+                       "'!while' ran more than %ld iterations; assuming it never terminates",
+                       MACRO_MAX_ITER);
+            m_exec_block(mp, n->body);
+            if(mp->ctl == MCTL_CONTINUE){ mp->ctl = MCTL_NONE; continue; }
+            if(mp->ctl == MCTL_BREAK){ mp->ctl = MCTL_NONE; break; }
+            if(mp->ctl == MCTL_RETURN) return;
+        }
+        return;
+    }
+
+    case MN_DEF: {
+        MFunc *prev = m_func_find(mp, n->a);
+        if(prev && prev->defined && !(prev->file == n->file && prev->line == n->line))
+            m_warn(mp, n->file, n->line, "macro '%s' redefined (previous definition at %s:%d)",
+                   n->a, prev->file, prev->line);
+        MFunc *f = prev ? prev : m_func_add(mp, n->a);
+        f->params   = n->params;
+        f->defaults = n->defaults;
+        f->nparams  = n->nparams;
+        f->body     = n->body;
+        f->file     = n->file;
+        f->line     = n->line;
+        f->defined  = 1;
+        return;
+    }
+
+    case MN_SET:
+        m_assign(mp, n->a, m_eval(mp, n->b, n->file, n->line));
+        return;
+
+    case MN_LOCAL:
+        m_scope_set(m_scope(mp), marena_strdup(&mp->arena, n->a),
+                    n->b ? m_eval(mp, n->b, n->file, n->line) : mv_int(0));
+        return;
+
+    case MN_UNDEF: {
+        for(int i = 0; i < mp->nfuncs; i++)
+            if(strcmp(mp->funcs[i].name, n->a) == 0){ mp->funcs[i].defined = 0; break; }
+        for(int i = mp->nscopes - 1; i >= 0; i--)
+            if(m_scope_find(mp->scopes[i], n->a)){ m_scope_del(mp->scopes[i], n->a); break; }
+        return;
+    }
+
+    case MN_CALL: {
+        MFunc *f = m_func_find(mp, n->a);
+        if(!f || !f->defined)
+            m_fail(mp, n->file, n->line, "call to undefined macro '%s'", n->a);
+        MVal args[MACRO_MAX_ARGS];
+        int nargs = 0;
+        m_parse_args(mp, n->b, args, &nargs, n->file, n->line);
+        m_invoke(mp, f, args, nargs, n->file, n->line);
+        return;
+    }
+
+    case MN_RETURN:
+        mp->retval = n->a ? m_eval(mp, n->a, n->file, n->line) : mv_int(0);
+        mp->ctl = MCTL_RETURN;
+        return;
+
+    case MN_BREAK:    mp->ctl = MCTL_BREAK;    return;
+    case MN_CONTINUE: mp->ctl = MCTL_CONTINUE; return;
+
+    case MN_ERROR: {
+        MVal v = m_eval(mp, n->a, n->file, n->line);
+        m_fail(mp, n->file, n->line, "%s", mv_to_text(mp, v));
+        return;
+    }
+    case MN_WARNING: {
+        MVal v = m_eval(mp, n->a, n->file, n->line);
+        m_warn(mp, n->file, n->line, "%s", mv_to_text(mp, v));
+        return;
+    }
+    case MN_ECHO: {
+        MVal v = m_eval(mp, n->a, n->file, n->line);
+        /* Emit once per assembly, not once per relaxation iteration: Pass 1
+         * may re-expand the source up to sixteen times, while Pass 2 (pas==2)
+         * and interactive/listing mode (pas==0) each run exactly once. */
+        if(!mp->asmb || mp->asmb->st.pas != 1)
+            fprintf(stderr, "%s\n", mv_to_text(mp, v));
+        return;
+    }
+    case MN_INCLUDE: {
+        MVal v = m_eval(mp, n->a, n->file, n->line);
+        if(!v.is_str) m_fail(mp, n->file, n->line, "'!include' needs a file name string");
+        m_do_include(mp, v.s, n->file, n->line);
+        return;
+    }
+    }
+}
+
+static void m_exec_block(MacroPP *mp, MBlock *b){
+    for(int i = 0; i < b->len; i++){
+        m_exec_node(mp, b->d[i]);
+        if(mp->ctl != MCTL_NONE) return;
+    }
+}
+
+/* ---- reading and expanding -------------------------------------------------- */
+
+static void m_read_lines(MacroPP *mp, FILE *f, const char *display, MSrc *out){
+    int cap = 256, n = 0;
+    MLine *d = marena_alloc(&mp->arena, (size_t)cap * sizeof(MLine));
+    char *line = NULL; size_t lcap = 0;
+    ssize_t r;
+    char *name = marena_strdup(&mp->arena, display);
+    while((r = getline(&line, &lcap, f)) != -1){
+        while(r > 0 && (line[r-1] == '\n' || line[r-1] == '\r')) line[--r] = '\0';
+        if(n >= cap){
+            int nc = cap * 2;
+            MLine *nd = marena_alloc(&mp->arena, (size_t)nc * sizeof(MLine));
+            memcpy(nd, d, (size_t)n * sizeof(MLine));
+            d = nd; cap = nc;
+        }
+        d[n].text = marena_strndup(&mp->arena, line, (size_t)r);
+        d[n].file = name;
+        d[n].line = n + 1;
+        n++;
+    }
+    free(line);
+    out->d = d; out->n = n;
+}
+
+static void m_do_include(MacroPP *mp, const char *name, const char *file, int line){
+    char path[1024];
+    if(name[0] == '/'){
+        snprintf(path, sizeof(path), "%s", name);
+    } else {
+        char dir[1024];
+        axx_dir_of(file && file[0] ? file : ".", dir, sizeof(dir));
+        axx_resolve_path(dir, name, path, sizeof(path));
+    }
+    char real[PATH_MAX];
+    if(!realpath(path, real)){ snprintf(real, sizeof(real), "%s", path); }
+    for(int i = 0; i < mp->ninc; i++)
+        if(strcmp(mp->inc_stack[i], real) == 0)
+            m_fail(mp, file, line, "circular '!include' of \"%s\"", name);
+    if(mp->ninc >= MACRO_MAX_INCLUDE_DEPTH)
+        m_fail(mp, file, line, "'!include' nested deeper than %d", MACRO_MAX_INCLUDE_DEPTH);
+
+    FILE *f = fopen(path, "rt");
+    if(!f) m_fail(mp, file, line, "cannot '!include' \"%s\": %s", name, strerror(errno));
+
+    MSrc src;
+    m_read_lines(mp, f, name, &src);
+    fclose(f);
+
+    mp->inc_stack[mp->ninc++] = marena_strdup(&mp->arena, real);
+    int ip = 0;
+    MBlock *b = m_parse_block(mp, &src, &ip, 0);
+    m_exec_block(mp, b);
+    mp->ninc--;
+}
+
+/* Cheap pre-filter: a file with no '!' and no line starting with '}' cannot
+ * use the macro layer, so it is handed back untouched with no parsing at all. */
+static int m_contains_macros(MSrc *src){
+    for(int i = 0; i < src->n; i++){
+        if(strchr(src->d[i].text, '!')) return 1;
+        if(m_lstrip(src->d[i].text)[0] == '}') return 1;
+    }
+    return 0;
+}
+
+/* Expand one already-open source file. `display` is the name diagnostics and
+ * DWARF line records should use. The returned lines carry the ORIGINAL source
+ * position they came from (inside a macro body, the line of that body line in
+ * the file that defined it). */
+static MLineVec macro_expand(MacroPP *mp, FILE *f, const char *display){
+    MLineVec result;
+    memset(&result, 0, sizeof(result));
+
+    MSrc src;
+    m_read_lines(mp, f, display, &src);
+
+    if(!mp->enabled || !m_contains_macros(&src)){
+        for(int i = 0; i < src.n; i++)
+            mlinevec_push(mp, &result, src.d[i].text, src.d[i].file, src.d[i].line);
+        return result;
+    }
+    /* A macro error is fatal for the whole run, and Pass 1 would otherwise
+     * re-expand (and re-hit) it on every relaxation iteration -- which for a
+     * runaway '!while' means paying the full iteration limit sixteen times
+     * over. Once expansion has failed, stop trying. */
+    if(mp->had_error) return result;
+
+    MLineVec *saved_out = mp->out;
+    int saved_depth = mp->depth, saved_scopes = mp->nscopes;
+    jmp_buf saved_jb;
+    int saved_active = mp->jb_active;
+    if(saved_active) memcpy(saved_jb, mp->jb, sizeof(jmp_buf));
+
+    mp->out = &result;
+    mp->jb_active = 1;
+    if(setjmp(mp->jb) == 0){
+        int ip = 0;
+        MBlock *b = m_parse_block(mp, &src, &ip, 0);
+        m_exec_block(mp, b);
+        if(mp->ctl == MCTL_RETURN)
+            m_fail(mp, display, 0, "'!return' outside a macro definition");
+        if(mp->ctl == MCTL_BREAK || mp->ctl == MCTL_CONTINUE)
+            m_fail(mp, display, 0, "'!break'/'!continue' outside a '!while' loop");
+    } else {
+        /* m_fail() already reported; unwind whatever was left half-built. */
+        memset(&result, 0, sizeof(result));
+        while(mp->nscopes > saved_scopes){
+            MScope *sc = mp->scopes[--mp->nscopes];
+            free(sc->names); free(sc->vals); free(sc);
+        }
+        mp->depth = saved_depth;
+        mp->ctl = MCTL_NONE;
+    }
+
+    mp->jb_active = saved_active;
+    if(saved_active) memcpy(mp->jb, saved_jb, sizeof(jmp_buf));
+    mp->out = saved_out;
+    return result;
+}
+
+/* The single macro-preprocessor instance. main() creates exactly one
+ * Assembler, so a file-static instance is enough and keeps the change to
+ * struct Assembler (and every function that takes one) at zero. */
+static MacroPP g_macro;
+
 static void fileassemble(Assembler *asmb, const char *fn){
     AsmState *st=&asmb->st;
+
+    /* Entering the top-level source file means a new assembly pass has begun
+     * (Pass 1 re-reads the whole file on every relaxation iteration, then
+     * Pass 2 reads it once more). The macro layer must start from a clean
+     * slate each time so that expansion is textually identical on every pass;
+     * macro state is deliberately NOT reset for a nested .INCLUDE, so a macro
+     * defined before the include stays visible inside it. */
+    if(st->fnstack.len == 0) macro_reset_pass(&g_macro);
 
     /* Fix ③ (axx.py): circular .INCLUDE detection.
      * Compare absolute paths to catch relative-path aliases.
@@ -7963,11 +9729,21 @@ static void fileassemble(Assembler *asmb, const char *fn){
     f=fopen(fn,"rt");
     if(!f){ fprintf(stderr,"Cannot open: %s\n",fn); goto done; }
     {
-        char *line=NULL; size_t lcap=0;
-        while(getline(&line,&lcap,f)!=-1) lineassemble0(asmb,line);
-        free(line);
+        /* Macro-expand before assembling. macro_expand() returns
+         * (text, file, line) triples where `line` is the ORIGINAL source line
+         * the text came from, so assembler diagnostics, the -v listing and
+         * DWARF line records all keep pointing at real source rather than at
+         * expansion offsets. */
+        MLineVec _mexp = macro_expand(&g_macro, f, st->current_file);
+        fclose(f); f=NULL;
+        for(int _mi=0; _mi<_mexp.len; _mi++){
+            strncpy(st->current_file, _mexp.d[_mi].file, sizeof(st->current_file)-1);
+            st->current_file[sizeof(st->current_file)-1]='\0';
+            st->ln = _mexp.d[_mi].line;
+            lineassemble0(asmb, _mexp.d[_mi].text);
+        }
     }
-    fclose(f);
+    if(f) fclose(f);
 
 done:
     free(stdin_buf);
@@ -8183,7 +9959,9 @@ static int imp_label(Assembler *asmb, const char *l){
  * main
  * ========================================================= */
 static void print_usage(const char *prog){
-    printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-m machine] [-v]\n",prog);
+    printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-m machine] [-v] [-g] [--no-macro] [-P [file]]\n",prog);
+    printf("  --no-macro   disable the macro preprocessor layer (!if/!while/!def/!return/!set and !{...})\n");
+    printf("  -P [file]    macro-expand the source and write it out (stdout if file is omitted), then stop\n");
     printf("axx general assembler programmed and designed by Taisuke Maekawa\n");
 }
 
@@ -8245,9 +10023,11 @@ int main(int argc, char *argv[]){
     Assembler *asmb=calloc(1,sizeof(Assembler));
     assembler_init(asmb);
     AsmState *st=&asmb->st;
+    macro_init(&g_macro, asmb);
 
     const char *patternfile=NULL, *sourcefile=NULL;
     char osabistr[16]="FreeBSD"; /* ELF_OSABI Default: FreeBSD */
+    const char *macro_expand_dest=NULL;   /* -P: "-" = stdout */
 
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--osabi")==0&&i+1<argc){ strncpy(osabistr,argv[++i],sizeof(osabistr)-1); }
@@ -8283,6 +10063,16 @@ int main(int argc, char *argv[]){
         else if(strcmp(argv[i],"-v")==0||strcmp(argv[i],"--verbose")==0){ st->verbose=1; }
         else if(strcmp(argv[i],"-d")==0||strcmp(argv[i],"--debug")==0){ st->debug=1; }
         else if(strcmp(argv[i],"-g")==0||strcmp(argv[i],"--gen-debug")==0){ st->gen_debug=1; }
+        else if(strcmp(argv[i],"--no-macro")==0){ g_macro.enabled=0; }
+        else if(strcmp(argv[i],"-P")==0||strcmp(argv[i],"--macro-expand")==0){
+            /* Optional argument: consume the next token only when it is not
+             * another option and not the (still unseen) positional source
+             * file -- i.e. only when both positionals are already in hand. */
+            if(i+1<argc && argv[i+1][0]!='-' && patternfile && sourcefile)
+                macro_expand_dest=argv[++i];
+            else
+                macro_expand_dest="-";
+        }
         else if(argv[i][0]!='-'){
             if(!patternfile) patternfile=argv[i];
             else if(!sourcefile) sourcefile=argv[i];
@@ -8309,6 +10099,38 @@ int main(int argc, char *argv[]){
     }
 
     if(st->outfile[0]) remove(st->outfile);
+
+    /* -P/--macro-expand: run only the macro layer over the source file and
+     * write the expanded assembly out, then stop. Note that .INCLUDEd files
+     * are NOT followed here (they are pulled in by the assembler, not by this
+     * layer); !included files are, since those are expanded by the macro
+     * layer itself. */
+    if(macro_expand_dest){
+        if(!sourcefile){
+            fprintf(stderr," error - -P/--macro-expand needs a source file.\n");
+            exit_code=1; goto cleanup;
+        }
+        FILE *mf=fopen(sourcefile,"rt");
+        if(!mf){
+            fprintf(stderr," error - cannot open source file '%s': %s\n",
+                    sourcefile, strerror(errno));
+            exit_code=1; goto cleanup;
+        }
+        macro_reset_pass(&g_macro);
+        MLineVec mv=macro_expand(&g_macro, mf, sourcefile);
+        fclose(mf);
+        if(g_macro.had_error || st->had_error){ exit_code=1; goto cleanup; }
+        FILE *of = (strcmp(macro_expand_dest,"-")==0) ? stdout
+                                                      : fopen(macro_expand_dest,"wt");
+        if(!of){
+            fprintf(stderr," error - cannot write '%s': %s\n",
+                    macro_expand_dest, strerror(errno));
+            exit_code=1; goto cleanup;
+        }
+        for(int _mi=0;_mi<mv.len;_mi++) fprintf(of,"%s\n",mv.d[_mi].text);
+        if(of!=stdout) fclose(of);
+        goto cleanup;
+    }
 
     if(!sourcefile){
         st->pc=u256_zero(); st->pas=0; st->ln=1;
@@ -8733,6 +10555,8 @@ cleanup:
     }
     free(st->line_map);
     st->line_map=NULL; st->line_map_len=0; st->line_map_cap=0;
+
+    macro_free(&g_macro);
 
     return exit_code;
 }
