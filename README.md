@@ -767,6 +767,13 @@ $ axx.py test.axx test.s
 0000000000000014 test.s 6 rep movsb 0xf3 0xa4
 0000000000000016 test.s 7 movsb 0xa4
 ```
+
+This is what an AArch64 logical immediate looks like. This is likely the most complex example.
+
+```
+AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v)?2:((v&0xf)*0x1111111111111111==v)?4:((v&0xff)*0x0101010101010101==v)?8:((v&0xffff)*0x1000100010001==v)?16:((v&0xffffffff)*0x100000001==v)?32:64)*0,;(m:=(1<<e)-1)*0,;(y:=v&m)*0,;(t:=@(y^(y-1))-1)*0,;(u:=y>>t)*0,;(w:=(y^m)==0?1:y^m)*0,;(p:=@(w^(w-1))-1)*0,;(q:=w>>p)*0,;(c:=((u+1)&u)==0)*0,;(b:=c?@u:e-@q)*0,
+ ;(r:=c?(e-t)&(e-1):(e-(p+@q))&(e-1))*0,;(s:=((0-2*e)&0x7f)|(b-1))*0,;(z:=(1<<31)|(0x24<<23)|((((s>>6)&1)^1)<<22)|(r<<16)|((s&0x3f)<<10)|(n<<5)|d)*0,@@[4,z>>(%%*8)]
+```
 ### errors
 
 - If a label conflicts with a symbol in the pattern file, an "is a pattern file symbol" error occurs.
