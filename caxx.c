@@ -4115,7 +4115,10 @@ static int dir_clear_symbol(Assembler *asmb, PatEntry *e){
 
 static int dir_bits(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".bits")!=0) return 0;
-    asmb->st.endian_big=(strcmp(e->f[1],"big")==0);
+    /* axx.py 側は i[1].lower() で比較しているので大文字小文字を区別しない。
+     * C 版も strcasecmp に揃える (".bits::BIG::16" が axx.py では big、
+     * C では little になっていた)。 */
+    asmb->st.endian_big=(strcasecmp(e->f[1],"big")==0);
     int io;
     uint256_t v = e->f[2][0] ? expr_expression_pat(asmb,e->f[2],0,&io) : u256_from_i64(8);
     asmb->st.bts=(int)u256_to_i64(v);
@@ -5307,11 +5310,25 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         IntVec v1; iv_init(&v1);
         int cnt2=0;
         uint256_t im=u256_sub(u256_shl(u256_one(),st->vliwinstbits),u256_one());
+        /* スロット内のバイト組み立ては .bits のエンディアン指定に従う
+         * (axx.py VLIWProcessor.vliwprocess() と同一)。従来の C 版は
+         * st->endian_big を無視して常に big-endian で組み立てていた。 */
         for(int j=0;j<noi;j++){
             uint256_t vv=u256_zero();
-            for(int ii=0;ii<ibyte;ii++){
-                vv=u256_shl(vv,8);
-                if(values.len>cnt2) vv=u256_or(vv,u256_and(values.data[cnt2++],u256_from_u64(0xff)));
+            if(!st->endian_big){
+                /* little-endian: values[cnt2] が最下位バイト */
+                for(int ii=0;ii<ibyte;ii++){
+                    if(values.len>cnt2)
+                        vv=u256_or(vv,u256_shl(u256_and(values.data[cnt2],u256_from_u64(0xff)),8*ii));
+                    cnt2++;
+                }
+            } else {
+                /* big-endian: values[cnt2] が最上位バイト */
+                for(int ii=0;ii<ibyte;ii++){
+                    vv=u256_shl(vv,8);
+                    if(values.len>cnt2) vv=u256_or(vv,u256_and(values.data[cnt2],u256_from_u64(0xff)));
+                    cnt2++;
+                }
             }
             iv_push(&v1,u256_and(vv,im));
         }
@@ -5324,26 +5341,34 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         /* res: combine instruction words with template bits.
          * vliwtemplatebits<0 means template is placed at the MSB side;
          * otherwise template is placed at the LSB side.
-         * This computation does not depend on the sign of vliwbits
-         * (that only affects the byte-output order below). */
+         * vliwbits の符号はパケット幅の絶対値取得にしか使わない
+         * (axx.py も vbits = abs(vliwbits))。出力バイト順は下の
+         * st->endian_big が決める。 */
         uint256_t res;
         if(st->vliwtemplatebits<0) res=u256_or(r,u256_shl(templ,(int)(vbits-at)));
         else res=u256_or(u256_shl(r,at),templ);
 
+        /* パケットのバイト出力順は .bits のエンディアン指定に従う
+         * (axx.py VLIWProcessor.vliwprocess() と同一)。従来の C 版は
+         * vliwbits の符号で big/little を選んでいたため、.bits を書かない
+         * パターンファイルでは axx.py とスロット並びが逆転していた。
+         * バイト数も vbits/8 (切り捨て) から (vbits+7)/8 (切り上げ) に
+         * 変更し、8 の倍数でないパケット幅の端数バイトが落ちないようにした。
+         * u256_sar は算術シフトだが、取り出した後に 0xff でマスクする
+         * ため符号拡張ビットは結果に混入しない。 */
         int q=0;
         uint64_t pc64=u256_to_u64(st->pc);
-        if(st->vliwbits>0){
-            int bc=vbits-8;
-            for(int c2=0;c2<vbits/8;c2++){
-                uint256_t byte_v=u256_and(u256_sar(res,bc),u256_from_u64(0xff));
-                outbin(st,u256_from_u64(pc64+c2),byte_v);
-                bc-=8; q++;
-            }
+        if(vbits<8){
+            uint256_t vmask=u256_sub(u256_shl(u256_one(),vbits),u256_one());
+            outbin(st,u256_from_u64(pc64),u256_and(res,vmask));
+            q=1;
         } else {
-            for(int c2=0;c2<vbits/8;c2++){
-                uint256_t byte_v=u256_and(res,u256_from_u64(0xff));
-                outbin(st,u256_from_u64(pc64+c2),byte_v);
-                res=u256_sar(res,8); q++;
+            int total_bytes=(vbits+7)/8;
+            for(int c2=0;c2<total_bytes;c2++){
+                int shift = st->endian_big ? (total_bytes-1-c2)*8 : c2*8;
+                uint256_t byte_v=u256_and(u256_sar(res,shift),u256_from_u64(0xff));
+                outbin(st,u256_from_u64(pc64+(uint64_t)c2),byte_v);
+                q++;
             }
         }
         st->pc=u256_add(st->pc,u256_from_u64((uint64_t)q));
