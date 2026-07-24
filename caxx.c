@@ -856,6 +856,16 @@ static AXX_UNUSED void bufmap_free(BufMap*m){
  * ========================================================= */
 #define OB_CHAR  ((char)0x90)
 #define CB_CHAR  ((char)0x91)
+/* axx.py port: sentinels standing in for a genuine (unescaped) source-line
+ * VLIW "!!" slot separator / "!!!!" stop marker, once axx_resolve_vliw_
+ * escapes() has told them apart from a "\!\!"-escaped literal "!!" earlier
+ * in the SAME left-to-right pass. Every later, independent scan for a VLIW
+ * boundary looks for these instead of raw "!!"/"!!!!" text, so a
+ * resolved-but-literal "!!" from an escape can never be re-interpreted as
+ * a real separator by a later pass with no memory of which "!!" was
+ * escaped. Mirrors axx.py's VLIW_SEP/VLIW_STOP. */
+#define VLIW_SEP_CHAR  ((char)0x92)
+#define VLIW_STOP_CHAR ((char)0x93)
 #define EXP_PAT  0
 #define EXP_ASM  1
 
@@ -1514,39 +1524,111 @@ static void axx_remove_comment_asm(char *l) {
      * string, perform look-ahead to consume the entire literal:
      *   '\x' form (4 chars): quote + backslash + char + quote
      *   'x'  form (3 chars): quote + char + quote
-     * An isolated quote (no matching close) is passed through silently. */
+     * An isolated quote (no matching close) is passed through silently.
+     *
+     * Bugfix (axx.py port): a backslash-escaped "\;" outside quotes is now
+     * resolved to a literal ';' (backslash stripped) instead of starting a
+     * comment, so a genuine ';' can appear unquoted in source text. Since
+     * this shrinks the string, the function now does an in-place
+     * read(i)/write(w) compaction rather than only ever advancing a single
+     * cursor -- w is always <= i, so writing behind the read cursor into
+     * the same buffer is safe. */
     int in_str=0;
-    int i=0;
+    int i=0, w=0;
     while(l[i]){
         if(in_str && l[i]=='\\'){
-            /* escape sequence inside double-quoted string: skip next char */
-            i++;
-            if(l[i]) i++;
+            /* escape sequence inside double-quoted string: copy verbatim */
+            l[w++]=l[i++];
+            if(l[i]) l[w++]=l[i++];
             continue;
         }
-        if(l[i]=='"'){ in_str=!in_str; i++; continue; }
+        if(!in_str && l[i]=='\\' && l[i+1]==';'){
+            l[w++]=';';
+            i+=2;
+            continue;
+        }
+        if(l[i]=='"'){ in_str=!in_str; l[w++]=l[i++]; continue; }
         if(l[i]=='\'' && !in_str){
             /* Fix ⑦: single-quote look-ahead */
             int j=i+1;
             if(l[j]=='\\' && l[j+1] && l[j+2]=='\''){
                 /* '\x' form: consume 4 chars */
-                i=j+3; continue;
+                while(i<j+3) l[w++]=l[i++];
+                continue;
             } else if(l[j] && l[j+1]=='\''){
                 /* 'x' form: consume 3 chars */
-                i=j+2; continue;
+                while(i<j+2) l[w++]=l[i++];
+                continue;
             }
             /* isolated quote: pass through and continue */
-            i++; continue;
+            l[w++]=l[i++]; continue;
         }
         if(l[i]==';'&&!in_str){
-            int j=i-1;
+            int j=w-1;
             while(j>=0&&(l[j]==' '||l[j]=='\t')) j--;
             l[j+1]=0; return;
         }
-        i++;
+        l[w++]=l[i++];
     }
-    int j=(int)strlen(l)-1;
+    l[w]=0;
+    int j=w-1;
     while(j>=0&&(l[j]==' '||l[j]=='\t'||l[j]=='\n'||l[j]=='\r')) l[j--]=0;
+}
+
+static void axx_resolve_vliw_escapes(char *l) {
+    /* axx.py port: mirrors StringUtils.resolve_vliw_escapes(). Resolves
+     * "\!" escapes into a literal '!' (backslash stripped), and replaces
+     * genuine (unescaped) VLIW "!!"/"!!!!" separators with the
+     * VLIW_SEP_CHAR/VLIW_STOP_CHAR sentinels -- in a single left-to-right
+     * pass together with the separator detection itself, so a "\!\!"
+     * (meaning a literal "!!") can never be mistaken for a real separator
+     * by any LATER, independent scan that has no memory of which "!!" was
+     * escaped (axx_lineassemble()'s post-match check, vliwprocess()'s own
+     * slot-scanning, axx_get_param_to_spc()/axx_get_param_to_eon()).
+     * Called after axx_remove_comment_asm() has already resolved any "\;"
+     * escape and stripped the real comment, so this only needs to handle
+     * "\!". Skips "..." strings and 'x' char literals unchanged, same as
+     * axx_remove_comment_asm(). In-place read(i)/write(w) compaction,
+     * safe since every substitution here is length-preserving or
+     * shrinking (w <= i always). */
+    int in_str=0;
+    int i=0, w=0;
+    while(l[i]){
+        if(in_str && l[i]=='\\'){
+            l[w++]=l[i++];
+            if(l[i]) l[w++]=l[i++];
+            continue;
+        }
+        if(!in_str && l[i]=='\\' && l[i+1]=='!'){
+            l[w++]='!';
+            i+=2;
+            continue;
+        }
+        if(l[i]=='"'){ in_str=!in_str; l[w++]=l[i++]; continue; }
+        if(l[i]=='\'' && !in_str){
+            int j=i+1;
+            if(l[j]=='\\' && l[j+1] && l[j+2]=='\''){
+                while(i<j+3) l[w++]=l[i++];
+                continue;
+            } else if(l[j] && l[j+1]=='\''){
+                while(i<j+2) l[w++]=l[i++];
+                continue;
+            }
+            l[w++]=l[i++]; continue;
+        }
+        if(!in_str && l[i]=='!'&&l[i+1]=='!'&&l[i+2]=='!'&&l[i+3]=='!'){
+            l[w++]=VLIW_STOP_CHAR;
+            i+=4;
+            continue;
+        }
+        if(!in_str && l[i]=='!'&&l[i+1]=='!'){
+            l[w++]=VLIW_SEP_CHAR;
+            i+=2;
+            continue;
+        }
+        l[w++]=l[i++];
+    }
+    l[w]=0;
 }
 
 static int axx_get_param_to_spc(const char *s, int idx, char *t, size_t tsz) {
@@ -1556,18 +1638,27 @@ static int axx_get_param_to_spc(const char *s, int idx, char *t, size_t tsz) {
      * "nop!!!!"のように書くと、"!!!!"ごとニーモニックとして取り込まれて
      * マッチに失敗していた(NOPのエンコード値がたまたまvliwnopの穴埋め値と
      * 同じ0x00だったため出力バイトはたまたま一致していたが、"Syntax error"
-     * が誤って報告され、エンコードが異なる命令では実際にバイト列が壊れる)。 */
+     * が誤って報告され、エンコードが異なる命令では実際にバイト列が壊れる)。
+     *
+     * Bugfix (axx.py port): now stops at the VLIW_SEP_CHAR/VLIW_STOP_CHAR
+     * sentinels instead of raw "!!"/"!!!!" text. By the time a source line
+     * reaches here, axx_resolve_vliw_escapes() has already replaced every
+     * genuine separator with a sentinel -- any raw "!!" still present is a
+     * resolved "\!\!" escape and must be read as ordinary literal text,
+     * not treated as a second, phantom boundary. */
     idx=axx_skipspc(s,idx);
     size_t n=0;
-    while(s[idx]&&s[idx]!=' '&&!(s[idx]=='!'&&s[idx+1]=='!')&&n<tsz-1) t[n++]=s[idx++];
+    while(s[idx]&&s[idx]!=' '&&s[idx]!=VLIW_SEP_CHAR&&s[idx]!=VLIW_STOP_CHAR&&n<tsz-1) t[n++]=s[idx++];
     t[n]=0;
     return idx;
 }
 
 static int axx_get_param_to_eon(const char *s, int idx, char *t, size_t tsz) {
+    /* Bugfix (axx.py port): stops at the VLIW_SEP_CHAR/VLIW_STOP_CHAR
+     * sentinel instead of raw "!!" text -- see axx_get_param_to_spc(). */
     idx=axx_skipspc(s,idx);
     size_t n=0;
-    while(s[idx]&&!(s[idx]=='!'&&s[idx+1]=='!')&&n<tsz-1) t[n++]=s[idx++];
+    while(s[idx]&&s[idx]!=VLIW_SEP_CHAR&&s[idx]!=VLIW_STOP_CHAR&&n<tsz-1) t[n++]=s[idx++];
     while(n>0&&(t[n-1]==' '||t[n-1]=='\t')) n--;
     t[n]=0;
     return idx;
@@ -1654,7 +1745,7 @@ static int axx_get_floatstr(const char *s, int idx, char *fs, size_t fsz){
     return idx;
 }
 
-static int axx_get_curlb(const char *s, int idx, int *f_out, char *t_out, size_t tsz){
+static int axx_get_curlb(AsmState *st, const char *s, int idx, int *f_out, char *t_out, size_t tsz){
     idx=axx_skipspc(s,idx);
     *f_out=0; t_out[0]=0;
     if(s[idx]!='{') return idx;
@@ -1666,8 +1757,17 @@ static int axx_get_curlb(const char *s, int idx, int *f_out, char *t_out, size_t
     t_out[n]=0;
     if(!s[idx]){
         /* 修正③: closing '}' not found – report error.
-         * axx.py returns len(s) to force parse termination (not start_idx). */
-        fprintf(stderr," error - missing closing '}' in expression: '{%s'\n", t_out);
+         * axx.py returns len(s) to force parse termination (not start_idx).
+         * Bugfix (axx.py port): this used to be completely unconditional
+         * (no should_report_errors() gate, unlike every other diagnostic
+         * in the file -- fired redundantly on every pattern-match trial
+         * pass) and never set had_error, so a malformed "qad{"/"dbl{"/
+         * "flt{"/"enflt{"/"endbl{" body missing its closing '}' silently
+         * produced a 0 with a "successful" build. */
+        if(should_report_errors(st)){
+            fprintf(stderr," error - missing closing '}' in expression: '{%s'\n", t_out);
+            st->had_error = 1;
+        }
         return (int)strlen(s);
     }
     idx++; /* consume '}' */
@@ -2408,6 +2508,18 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
         if(_existing && !_existing->is_imported){
             st->error_already_defined=1;
             st->had_error=1;
+            /* NOTE (axx.py port): intentionally NOT gated by
+             * should_report_errors() -- that helper excludes pas==1 by
+             * design (Pass 1 relaxation), and there is no equivalent
+             * re-check for a genuine duplicate label during Pass 2 (its
+             * own check just below tests the opposite condition: a label
+             * MISSING from pass 1, not a duplicate WITHIN a pass). Gating
+             * this would silently swallow the only diagnostic a real
+             * duplicate-label error ever gets outside interactive mode.
+             * This does still print once per pass-1 relaxation iteration
+             * for the same duplicate -- cosmetic stderr noise, not a
+             * correctness bug (had_error is already set once, correctly
+             * aborting the build either way). */
             fprintf(stderr," error - label already defined.\n");
             return 0;
         }
@@ -2415,7 +2527,8 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
         if(!lmap_contains(&st->labels,k)){
             st->error_already_defined=1;
             st->had_error=1;
-            fprintf(stderr," error - label '%s' not defined in pass 1.\n",k);
+            if(should_report_errors(st))
+                fprintf(stderr," error - label '%s' not defined in pass 1.\n",k);
             return 0;
         }
     }
@@ -2423,7 +2536,8 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
     uint256_t dummy;
     if(smap_get(&st->patsymbols,uk,&dummy)){
         st->had_error=1;
-        fprintf(stderr," error - '%s' is a pattern file symbol.\n",k);
+        if(should_report_errors(st))
+            fprintf(stderr," error - '%s' is a pattern file symbol.\n",k);
         return 0;
     }
     st->error_already_defined=0;
@@ -3205,7 +3319,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             ({ int _j=axx_skipspc(s,idx+5); _j<slen && s[_j]=='{'; })){
         idx+=5;
         int f; char t[512];
-        idx=axx_get_curlb(s,idx,&f,t,sizeof(t));
+        idx=axx_get_curlb(&asmb->st,s,idx,&f,t,sizeof(t));
         if(f){
             /* Always evaluate inner expression in integer mode */
             int prev_flt=asmb->st.exp_typ_float;
@@ -3226,7 +3340,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             ({ int _j=axx_skipspc(s,idx+5); _j<slen && s[_j]=='{'; })){
         idx+=5;
         int f; char t[512];
-        idx=axx_get_curlb(s,idx,&f,t,sizeof(t));
+        idx=axx_get_curlb(&asmb->st,s,idx,&f,t,sizeof(t));
         if(f){
             int prev_flt=asmb->st.exp_typ_float;
             asmb->st.exp_typ_float=0;
@@ -3240,7 +3354,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             ({ int _j=axx_skipspc(s,idx+3); _j<slen && s[_j]=='{'; })){
         idx+=3;
         int f; char t[512];
-        idx=axx_get_curlb(s,idx,&f,t,sizeof(t));
+        idx=axx_get_curlb(&asmb->st,s,idx,&f,t,sizeof(t));
         if(f){
             uint64_t bits;
             if(strcmp(t,"nan")==0) bits=0x7ff8000000000000ULL;
@@ -3306,7 +3420,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             ({ int _j=axx_skipspc(s,idx+3); _j<slen && s[_j]=='{'; })){
         idx+=3;
         int f; char t[512];
-        idx=axx_get_curlb(s,idx,&f,t,sizeof(t));
+        idx=axx_get_curlb(&asmb->st,s,idx,&f,t,sizeof(t));
         if(f){
             uint32_t bits;
             if(strcmp(t,"nan")==0) bits=0x7fc00000u;
@@ -4549,12 +4663,36 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 if(stopchar != '\0' && idx_s < (int)strlen(s) && s[idx_s] == stopchar)
                     idx_s++;
                 if(ftype == 'F'){
-                    /* float32: pack → integer bit-pattern */
+                    /* float32: pack → integer bit-pattern.
+                     * Bugfix (axx.py port): mirrors match()'s !F capture,
+                     * whose struct.pack('>f', v) raises OverflowError for a
+                     * FINITE value outside float32 range (e.g. 1e300) --
+                     * the C (float)dv cast instead silently produces
+                     * +/-Infinity with no diagnostic. Detect that by
+                     * comparing finiteness before/after the narrowing
+                     * cast: only report an error when dv was finite but
+                     * fval isn't (a genuine overflow-on-narrowing) -- a
+                     * dv that was ALREADY +/-inf/nan (e.g. a legitimate
+                     * "ldd a,-inf") must pass through unchanged, exactly
+                     * like Python's struct.pack, which does NOT raise for
+                     * an already-infinite/nan input. */
                     float fval = (float)dv;
+                    if(isfinite(dv) && !isfinite(fval)){
+                        if(should_report_errors(st)){
+                            fprintf(stderr," error - !F: cannot convert value to float32; using 0.\n");
+                            st->had_error = 1;
+                        }
+                        fval = 0.0f;
+                    }
                     uint32_t bits; memcpy(&bits, &fval, 4);
                     var_put(st, a, u256_from_u64((uint64_t)bits));
                 } else if(ftype == 'D'){
-                    /* float64: pack → integer bit-pattern */
+                    /* float64: pack → integer bit-pattern. Unlike !F, a
+                     * double->double capture has no narrowing step that
+                     * could newly overflow a finite value to infinity, so
+                     * (unlike !F) there is no analogous error condition to
+                     * detect here -- dv (finite or a legitimate inf/nan)
+                     * passes through unchanged, matching axx.py's !D. */
                     uint64_t bits; memcpy(&bits, &dv, 8);
                     var_put(st, a, u256_from_u64(bits));
                 } else {
@@ -5195,9 +5333,12 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
     int slen=(int)strlen(line);
     while(1){
         idx=axx_skipspc(line,idx);
-        if(idx+4<=slen && strncmp(line+idx,"!!!!",4)==0){ idx+=4; st->vliwstop=1; continue; }
-        else if(idx+2<=slen && strncmp(line+idx,"!!",2)==0){
-            idx+=2;
+        /* Bugfix (axx.py port): checks the VLIW_SEP_CHAR/VLIW_STOP_CHAR
+         * sentinel instead of raw "!!"/"!!!!" text -- see
+         * axx_resolve_vliw_escapes(). */
+        if(idx<slen && line[idx]==VLIW_STOP_CHAR){ idx+=1; st->vliwstop=1; continue; }
+        else if(idx<slen && line[idx]==VLIW_SEP_CHAR){
+            idx+=1;
             /* 破綻点修正 (axx.py port): VLIWスロットの内容が".section"/
              * ".endsection"/".INCLUDE"等のディレクティブだった場合、
              * lineassemble2()はそれを即座に処理してしまう。しかしこの
@@ -5212,10 +5353,12 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
              * として打ち切る。 */
             { int _peek=idx; while(_peek<slen && (line[_peek]==' '||line[_peek]=='\t')) _peek++;
               if(_peek<slen && line[_peek]=='.'){
-                  if(should_report_errors(st))
+                  if(should_report_errors(st)){
                       fprintf(stderr," error - directives (e.g. .section/.endsection/.INCLUDE) "
                               "are not allowed inside VLIW slots (the packet's PC has not "
                               "advanced yet at this point in the packet).\n");
+                      st->had_error = 1;
+                  }
                   ivv_free(&objs); free(idxlst);
                   if(idx_out) *idx_out=idx;
                   return 0;
@@ -5251,8 +5394,10 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
     /* Fix ③ (axx.py): vliwinstbits==0 causes division by zero in noi calculation.
      * Guard and report an error, matching axx.py VLIWProcessor.vliwprocess(). */
     if(st->vliwinstbits == 0){
-        if(should_report_errors(st))
+        if(should_report_errors(st)){
             fprintf(stderr," error - vliwinstbits is zero; cannot compute instruction slots.\n");
+            st->had_error = 1;
+        }
         ivv_free(&objs); free(idxlst);
         if(idx_out) *idx_out=idx;
         return 0;
@@ -5288,10 +5433,12 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
          * 状態で何らかのパケットが出力されてしまう。noiが0以下の場合は
          * 明確なエラーで打ち切る。 */
         if(noi <= 0){
-            if(should_report_errors(st))
+            if(should_report_errors(st)){
                 fprintf(stderr," error - .vliw: vliwtemplatebits (%d) leaves no room for "
                         "instruction slots in a %d-bit packet (vliwinstbits=%d).\n",
                         st->vliwtemplatebits, vbits, st->vliwinstbits);
+                st->had_error = 1;
+            }
             iv_free(&values);
             ivv_free(&objs); free(idxlst);
             if(idx_out) *idx_out=idx;
@@ -5376,8 +5523,10 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         found=1; break;
     }
 
-    if(!found && (should_report_errors(st)))
+    if(!found && (should_report_errors(st))){
         fprintf(stderr," error - No vliw instruction-set defined.\n");
+        st->had_error = 1;
+    }
 
     ivv_free(&objs); free(idxlst);
     *idx_out=idx;
@@ -6600,6 +6749,14 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     axx_reduce_spaces(line);
     axx_remove_comment_asm(line);
     if(!line[0]){ free(line); return 0; }
+    /* Resolve '\!' escapes and replace genuine "!!"/"!!!!" VLIW separators
+     * with sentinels -- see axx_resolve_vliw_escapes()'s comment for why
+     * this must happen once, up front, rather than by each of the several
+     * places below that check for a VLIW boundary independently checking
+     * for raw "!!" text themselves. Safe in this same (never-growing)
+     * buffer: axx_remove_comment_asm() and axx_resolve_vliw_escapes() are
+     * both length-preserving-or-shrinking in-place compactions. */
+    axx_resolve_vliw_escapes(line);
 
     /* アセンブリ行を1行処理するたびに .check 拘束条件を全解除する。
      * パターンファイルの .check ディレクティブはパターン走査ループ
@@ -6636,44 +6793,24 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     }
 
     /* Fix: vcnt !! counting must ignore !! inside double-quoted strings and
-     * single-quote char literals. Mirrors axx.py lineassemble() Bugfix L/L2/L3. */
+     * single-quote char literals. Mirrors axx.py lineassemble() Bugfix L/L2/L3.
+     * Bugfix (axx.py port): now counts the VLIW_SEP_CHAR/VLIW_STOP_CHAR
+     * sentinels instead of scanning for raw "!!" text -- axx_resolve_vliw_
+     * escapes() has already told genuine separators (now sentinels) apart
+     * from a resolved "\!\!" escape (now bare, literal "!!" text) earlier
+     * in the pipeline, so this no longer needs its own quote-tracking
+     * (sentinels never appear inside quotes/char-literals in the first
+     * place) and, critically, no longer risks re-matching a resolved
+     * escaped "!!" as a phantom separator. */
     {
         int _vcnt = 0;
-        const char *_pp = processed;
-        int _in_dq = 0;
         int _has_content = 0;
-        while(*_pp){
-            char _c = *_pp;
-            /* backslash escape inside double-quoted string */
-            if(_c == '\\' && _in_dq){
-                _pp++;
-                if(*_pp) _pp++;
-                _has_content = 1;
-                continue;
-            }
-            if(_c == '"'){
-                _in_dq = !_in_dq;
-                _pp++; _has_content = 1;
-                continue;
-            }
-            /* single-quote char literal: consume without counting */
-            if(_c == '\'' && !_in_dq){
-                /* look-ahead: '\x' (4-chars) or 'x' (3-chars) */
-                if(_pp[1] == '\\' && _pp[2] && _pp[3] == '\''){
-                    _pp += 4; _has_content = 1; continue;
-                } else if(_pp[1] && _pp[2] == '\''){
-                    _pp += 3; _has_content = 1; continue;
-                }
-                _pp++; _has_content = 1;
-                continue;
-            }
-            if(!_in_dq && _pp[0] == '!' && _pp[1] == '!'){
+        for(const char *_pp = processed; *_pp; _pp++){
+            if(*_pp == VLIW_SEP_CHAR || *_pp == VLIW_STOP_CHAR){
                 if(_has_content){ _vcnt++; _has_content = 0; }
-                _pp += 2;
                 continue;
             }
-            if(_c != ' ') _has_content = 1;
-            _pp++;
+            if(*_pp != ' ') _has_content = 1;
         }
         if(_has_content) _vcnt++;
         st->vcnt = _vcnt ? _vcnt : 1;
@@ -6704,7 +6841,9 @@ static int lineassemble(Assembler *asmb, const char *line_in){
 
     const char *rest=processed+new_idx;
     while(*rest==' ') rest++;
-    int is_vliw_cont=(st->vliwflag && rest[0]=='!'&&rest[1]=='!');
+    /* Bugfix (axx.py port): checks the VLIW_SEP_CHAR/VLIW_STOP_CHAR
+     * sentinel instead of raw "!!" text -- see axx_resolve_vliw_escapes(). */
+    int is_vliw_cont=(st->vliwflag && (rest[0]==VLIW_SEP_CHAR||rest[0]==VLIW_STOP_CHAR));
 
     if(!is_vliw_cont){
         /* ELF relocation detection (tracking method)
@@ -7796,7 +7935,20 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
 
     /* ---- 7. write file ---- */
     FILE *fp=fopen(path,"wb");
-    if(!fp){perror(path);goto weo_done;}
+    if(!fp){
+        /* Bugfix (axx.py port): this used to just perror() (unconditional,
+         * no should_report_errors() gate) and never set had_error, and the
+         * caller never checked for failure either -- so a failure to even
+         * open the output file (e.g. a nonexistent directory in the -o
+         * path) printed a message yet still exited 0 with no file written,
+         * silently breaking any build system that only checks the exit
+         * code. */
+        if(should_report_errors(st)){
+            fprintf(stderr," error - cannot create ELF output file '%s': %s\n", path, strerror(errno));
+            st->had_error = 1;
+        }
+        goto weo_done;
+    }
 
     /* ELF header: Elf64_Ehdr (64 bytes) or Elf32_Ehdr (52 bytes). Both share
      * the same 16-byte e_ident and the same e_type/e_machine/e_version
@@ -10471,8 +10623,16 @@ int main(int argc, char *argv[]){
     binary_flush(st);
 
     /* ELF relocatable object output (-o option) */
-    if(st->elf_objfile[0])
+    if(st->elf_objfile[0]){
         write_elf_obj(st, st->elf_objfile, st->elf_machine);
+        if(st->had_error){
+            fprintf(stderr," error - one or more errors were reported during assembly; "
+                    "output would be incomplete or wrong.\n");
+            fprintf(stderr,"         Aborting: no output file written.\n");
+            exit_code = 1;
+            goto cleanup;
+        }
+    }
 
     /* Fix #2: -e と -E が同時指定された場合、元のコードは expfile_elf で
      * st->expfile を上書きしてから一回だけ書き出していたため -e ファイルが

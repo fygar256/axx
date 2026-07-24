@@ -63,6 +63,18 @@ exp_typ = 'i'
 OB = chr(0x90)
 CB = chr(0x91)
 
+# Placeholder characters standing in for a genuine (unescaped) source-line
+# VLIW "!!" slot separator / "!!!!" stop marker, once StringUtils.
+# resolve_vliw_escapes() has told them apart from a "\!\!"-escaped literal
+# "!!" earlier in the SAME left-to-right pass. Every later, independent scan
+# for a VLIW boundary (lineassemble()'s post-match check, VLIWProcessor.
+# vliwprocess()'s own slot-scanning) looks for these sentinels instead of
+# raw "!!"/"!!!!" text, so a resolved-but-literal "!!" coming from an escape
+# can never be re-interpreted as a real separator by a later pass that has
+# no memory of which "!!" was escaped.
+VLIW_SEP = chr(0x92)
+VLIW_STOP = chr(0x93)
+
 
 # UNDEF is deliberately an enormous (but finite) integer rather than None/NaN:
 # label values flow through ordinary arithmetic (label+4, label-$$, etc.), and
@@ -724,53 +736,142 @@ class StringUtils:
     def remove_comment_asm(l):
         """Strip a source-line ';' comment, but only outside string/char
         literals: a ';' inside "..." or a 'x' character literal is real
-        content, not a comment start. Tracks double-quote state directly and
-        delegates single-quote literals to skip_squote_literal() since those
-        can contain escapes (\\x41) that a naive quote-toggle would misparse."""
+        content, not a comment start. A backslash-escaped '\\;' outside
+        quotes is resolved to a literal ';' (backslash stripped) instead of
+        starting a comment, so a genuine ';' can appear unquoted in source
+        text. Tracks double-quote state directly and delegates single-quote
+        literals to skip_squote_literal() since those can contain escapes
+        (\\x41) that a naive quote-toggle would misparse."""
         in_dquote = False
+        out = []
         i = 0
-        while i < len(l):
+        n = len(l)
+        while i < n:
             ch = l[i]
 
             if ch == '\\' and in_dquote:
-                if i + 1 < len(l):
+                if i + 1 < n:
+                    out.append(l[i:i + 2])
                     i += 2
                 else:
+                    out.append(ch)
                     i += 1
+                continue
+
+            if not in_dquote and ch == '\\' and i + 1 < n and l[i + 1] == ';':
+                out.append(';')
+                i += 2
                 continue
 
             if ch == '"':
                 in_dquote = not in_dquote
             elif ch == '\'' and not in_dquote:
-                i = StringUtils.skip_squote_literal(l, i)
+                j = StringUtils.skip_squote_literal(l, i)
+                out.append(l[i:j])
+                i = j
                 continue
             elif ch == ';' and not in_dquote:
-                return l[:i].rstrip()
+                return ''.join(out).rstrip()
 
+            out.append(ch)
             i += 1
         if in_dquote:
             print(f" warning - unterminated string literal in line: {l!r}", file=sys.stderr)
-        return l.rstrip()
+        return ''.join(out).rstrip()
+
+    @staticmethod
+    def resolve_vliw_escapes(l):
+        """Resolve source-line '\\!' escapes into a literal '!' (backslash
+        stripped), and replace genuine (unescaped) VLIW "!!"/"!!!!"
+        separators with the VLIW_SEP/VLIW_STOP sentinel characters.
+
+        This must happen in a single left-to-right pass together with the
+        separator detection itself: if "\\!\\!" (meaning a literal "!!")
+        were first resolved into two bare '!' characters and the boundary
+        decision made afterward by a separate, later scan, that later scan
+        would have no way to tell those two resolved characters apart from
+        a genuine "!!" separator -- it has no memory of which "!!" came
+        from an escape. Doing both here, once, and having every later VLIW
+        boundary check (lineassemble()'s post-match check, VLIWProcessor.
+        vliwprocess()'s own slot-scanning, StringUtils.get_param_to_spc()/
+        get_param_to_eon()) look for the sentinel instead of raw "!!" text
+        sidesteps the ambiguity entirely.
+
+        Only called on source lines, after remove_comment_asm() has already
+        resolved any '\\;' escape and stripped the real comment -- so this
+        function only needs to handle '\\!'. Skips "..." strings and 'x'
+        char literals unchanged, same as remove_comment_asm()."""
+        out = []
+        in_dquote = False
+        i = 0
+        n = len(l)
+        while i < n:
+            ch = l[i]
+
+            if ch == '\\' and in_dquote:
+                if i + 1 < n:
+                    out.append(l[i:i + 2])
+                    i += 2
+                else:
+                    out.append(ch)
+                    i += 1
+                continue
+
+            if not in_dquote and ch == '\\' and i + 1 < n and l[i + 1] == '!':
+                out.append('!')
+                i += 2
+                continue
+
+            if ch == '"':
+                in_dquote = not in_dquote
+                out.append(ch)
+                i += 1
+                continue
+            if ch == '\'' and not in_dquote:
+                j = StringUtils.skip_squote_literal(l, i)
+                out.append(l[i:j])
+                i = j
+                continue
+
+            if not in_dquote and l[i:i + 4] == '!!!!':
+                out.append(VLIW_STOP)
+                i += 4
+                continue
+            if not in_dquote and l[i:i + 2] == '!!':
+                out.append(VLIW_SEP)
+                i += 2
+                continue
+
+            out.append(ch)
+            i += 1
+        return ''.join(out)
 
     @staticmethod
     def get_param_to_spc(s, idx):
-        """Read one whitespace-delimited token, stopping early at a "!!"
-        VLIW slot separator so a token never accidentally swallows the next
-        slot's content."""
+        """Read one whitespace-delimited token, stopping early at a
+        VLIW_SEP/VLIW_STOP sentinel (a genuine, unescaped "!!"/"!!!!" VLIW
+        slot separator in a source line -- see resolve_vliw_escapes()) so a
+        token never accidentally swallows the next slot's content.
+
+        Deliberately does NOT also stop at raw "!!" text: on a source line,
+        resolve_vliw_escapes() has already turned every genuine separator
+        into a sentinel by the time this runs, so any raw "!!" still
+        present is a resolved '\\!\\!' escape and must be read as ordinary
+        literal text, not treated as a second, phantom boundary."""
         t = ""
         idx = StringUtils.skipspc(s, idx)
-        while idx < len(s) and s[idx] != ' ' and s[idx:idx + 2] != '!!':
+        while idx < len(s) and s[idx] != ' ' and s[idx] not in (VLIW_SEP, VLIW_STOP):
             t += s[idx]
             idx += 1
         return t, idx
 
     @staticmethod
     def get_param_to_eon(s, idx):
-        """Read the rest of the line (spaces included), stopping at a "!!"
-        VLIW slot separator."""
+        """Read the rest of the line (spaces included), stopping at a
+        VLIW_SEP/VLIW_STOP sentinel (see get_param_to_spc())."""
         t = ""
         idx = StringUtils.skipspc(s, idx)
-        while idx < len(s) and s[idx:idx + 2] != '!!':
+        while idx < len(s) and s[idx] not in (VLIW_SEP, VLIW_STOP):
             t += s[idx]
             idx += 1
         return t, idx
@@ -3782,12 +3883,12 @@ class VLIWProcessor:
 
         while True:
             idx = StringUtils.skipspc(line, idx)
-            if idx + 4 <= len(line) and line[idx:idx + 4] == '!!!!':
-                idx += 4
+            if idx < len(line) and line[idx] == VLIW_STOP:
+                idx += 1
                 self.state.vliwstop = 1
                 continue
-            elif idx + 2 <= len(line) and line[idx:idx + 2] == '!!':
-                idx += 2
+            elif idx < len(line) and line[idx] == VLIW_SEP:
+                idx += 1
 
                 _slot_peek = line[idx:].lstrip()
                 if _slot_peek.startswith('.'):
@@ -6241,6 +6342,12 @@ class Assembler:
         line = StringUtils.remove_comment_asm(line)
         if line == '':
             return False
+        # Resolve '\!' escapes and replace genuine "!!"/"!!!!" VLIW
+        # separators with sentinels -- see resolve_vliw_escapes()'s
+        # docstring for why this must happen once, up front, rather than
+        # by each of the several places below that check for a VLIW
+        # boundary independently checking for raw "!!" text themselves.
+        line = StringUtils.resolve_vliw_escapes(line)
 
         self.state.check_constraints.clear()
 
@@ -6248,35 +6355,10 @@ class Assembler:
 
         line = self.asm_directive_proc.label_processing(line)
 
-        _vparts = []
-        _vpart_buf = []
-        _in_dq_v = False
-        _vi = 0
-        while _vi < len(line):
-            _vc = line[_vi]
-            if _vc == '\\' and _in_dq_v:
-                _vpart_buf.append(_vc)
-                if _vi + 1 < len(line):
-                    _vpart_buf.append(line[_vi + 1])
-                _vi += 2
-                continue
-            if _vc == '"':
-                _in_dq_v = not _in_dq_v
-                _vpart_buf.append(_vc)
-            elif _vc == "'" and not _in_dq_v:
-                _new_vi = StringUtils.skip_squote_literal(line, _vi)
-                _vpart_buf.extend(list(line[_vi:_new_vi]))
-                _vi = _new_vi
-                continue
-            elif not _in_dq_v and line[_vi:_vi + 2] == '!!':
-                _vparts.append(''.join(_vpart_buf))
-                _vpart_buf = []
-                _vi += 2
-                continue
-            else:
-                _vpart_buf.append(_vc)
-            _vi += 1
-        _vparts.append(''.join(_vpart_buf))
+        # Sentinels never appear inside quotes/char-literals (resolve_vliw_
+        # escapes() already skipped those), so counting vcnt no longer
+        # needs its own quote-tracking.
+        _vparts = line.replace(VLIW_STOP, VLIW_SEP).split(VLIW_SEP)
         self.state.vcnt = sum(1 for _p in _vparts if _p != '')
 
         if self.state.elf_objfile and self.state.pas == 2:
@@ -6294,7 +6376,7 @@ class Assembler:
         if not flag:
             return False
 
-        if not self.state.vliwflag or (idx >= len(line) or line[idx:idx + 2] != '!!'):
+        if not self.state.vliwflag or (idx >= len(line) or line[idx] not in (VLIW_SEP, VLIW_STOP)):
             of = len(objl)
             if self.state.elf_objfile and self.state.pas == 2 and objl and self.state._elf_label_refs_seen:
                 bpw_r = max(1, (self.state.bts + 7) // 8)
