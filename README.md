@@ -25,7 +25,7 @@ Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
 
 GitHub: https://github.com/fygar256/axx_relocatable_elf_generation
 
-# Demonstration of brainfuck interpreter that assembled with axx
+# Demonstration of brainfuck interpreter that assembled by axx (with macro)
 
 https://github.com/fygar256/brainfuck_interpreter_for_axx_on_freebsd_of_x86_64
 
