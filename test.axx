@@ -3,9 +3,9 @@
 .setsym ::b:: 1
 .setsym ::%% ::7
 .setsym ::||:: 8
-LDF A,!x :: 0x1,x,*(x,1),*(x,2),*(x,3)
-LDD A,!x :: 0x1,@@[8,*(x,%%)]
-LDQ A,!x :: 0x1,x,x>>8,x>>16,x>>24,x>>32,x>>40,x>>48,x>>56,x>>64,x>>72,x>>80,x>>88,x>>96,x>>104,x>>112,x>>120
+LDF A,!Fx :: 0x1,x,*(x,1),*(x,2),*(x,3)
+LDD A,!Dx :: 0x1,@@[8,*(x,%%)]
+LDQ A,!Qx :: 0x1,@@[16,*(x,%%)]
 LDR A,[ [ !x ] ]:: ~~0x3?3:0,x,x>>8
 LD\! A,B::0xcd
 
@@ -16,7 +16,9 @@ LD\! A,B::0xcd
 .setsym ::lsl:: 6
 VMOV.F32 S!n,#!Fd::0x80|n,d>>24,d>>16,d>>8,d
 ADD w, x, y z #!d :: 0x88,d
-ADD x, y, !e :: 0x91,x,y,e
+.check ::q::r1,r2
+ADD q, y, !e :: 0x91,q,y,e
+.clrcheck::q
 
 /* A64FX
 .setsym ::v0 :: 0
@@ -27,7 +29,8 @@ ST1 {x.4S},\[y\] :: 0x01,x,y,0
 .setsym ::$s5 ::21
 .setsym ::$v0 ::2
 .setsym ::$a0 ::4
-ADDI x,y,!d :: (e:=(0x20000000|(y<<21)|(x<<16)|d&0xffff))>>24,e>>16,e>>8,e
+ADDI x,y,!d :: @@[4,*(e:=(0x20000000|(y<<21)|(x<<16)|d&0xffff),(3-%%))]
+e>>16,e>>8,e
 
 /* x86_64
 .setsym ::rax:: 0
