@@ -3820,12 +3820,56 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
+/* --- double <-> 256-bit integer conversion for float-mode bitwise ops ---
+ *
+ * In float mode a value is carried as the raw IEEE-754 bit pattern of a
+ * double (see u256_to_double / double_to_u256).  The bitwise operators must
+ * therefore convert to an integer *value* before operating, exactly as
+ * axx.py's _safe_int() does with int(v).                                  */
+
+/* Python int(): truncate toward zero. */
+static uint256_t double_trunc_to_u256(double d){
+    const double LIMB = 18446744073709551616.0;   /* 2^64 */
+    int neg = (d < 0.0);
+    double a = neg ? -d : d;
+    a = floor(a);
+    uint256_t r = u256_zero();
+    for(int i = 0; i < 4 && a >= 1.0; i++){
+        r.w[i] = (uint64_t)fmod(a, LIMB);
+        a = floor(a / LIMB);
+    }
+    return neg ? u256_neg(r) : r;
+}
+
+/* Two's-complement 256-bit integer -> double (inexact above 2^53, which is
+ * inherent to float mode's double representation). */
+static double u256_int_to_double(uint256_t v){
+    const double LIMB = 18446744073709551616.0;   /* 2^64 */
+    int neg = (int)((v.w[3] >> 63) & 1u);
+    uint256_t m = neg ? u256_neg(v) : v;
+    double d = 0.0;
+    for(int i = 3; i >= 0; i--) d = d * LIMB + (double)m.w[i];
+    return neg ? -d : d;
+}
+
 /* axx.py port: mirrors ExpressionEvaluator._safe_int(), used by
  * term3/term4/term5 (&, |, ^) to guard against a non-finite float-mode
- * operand reaching a bitwise operator. Bugfix: this check didn't exist in
- * C at all -- a non-finite value (e.g. from "inf" under a !Fx/!Dx capture)
- * silently participated in u256_and/or/xor's raw bit-pattern operation
- * with zero diagnostic and no had_error, unlike axx.py's _safe_int(). */
+ * operand reaching a bitwise operator.
+ *
+ * Bugfix 1: this check didn't exist in C at all -- a non-finite value
+ * (e.g. from "inf" under a !Fx/!Dx capture) silently participated in
+ * u256_and/or/xor's raw bit-pattern operation with zero diagnostic and no
+ * had_error, unlike axx.py's _safe_int().
+ *
+ * Bugfix 2: even for finite values the operand was returned unchanged, so
+ * u256_and/or/xor combined the *IEEE-754 bit patterns* rather than the
+ * numeric values.  axx.py evaluates error_patterns in float mode, so a
+ * condition such as
+ *     VMOVAPS x,y :: (x|y)>=0x100;5 :: ...
+ * with x=1, y=2 computed
+ *     0x3FF0000000000000 | 0x4000000000000000 == 0x7FF0000000000000
+ * i.e. +inf instead of 3, and the error fired on every 128-bit VEX
+ * instruction.  axx.py returned 3.  Convert to an integer first. */
 static uint256_t expr_safe_bitwise_operand(Assembler *asmb, uint256_t v, const char *op_name){
     if(asmb->st.exp_typ_float){
         double d = u256_to_double(v);
@@ -3836,7 +3880,16 @@ static uint256_t expr_safe_bitwise_operand(Assembler *asmb, uint256_t v, const c
             }
             return u256_zero();
         }
+        return double_trunc_to_u256(d);
     }
+    return v;
+}
+
+/* Re-encode the integer result of a bitwise operation for the current mode.
+ * In float mode every value in flight is a double bit pattern, so the
+ * integer produced by u256_and/or/xor must be converted back. */
+static uint256_t expr_bitwise_result(Assembler *asmb, uint256_t v){
+    if(asmb->st.exp_typ_float) return double_to_u256(u256_int_to_double(v));
     return v;
 }
 
@@ -3845,7 +3898,7 @@ static uint256_t expr_term3(Assembler *asmb, const char *s, int idx, int *idx_ou
     int slen=(int)strlen(s);
     while(idx<slen && s[idx]=='&' && s[idx+1]!='&'){
         uint256_t t=expr_term2(asmb,s,idx+1,&idx);
-        x=u256_and(expr_safe_bitwise_operand(asmb,x,"&"),expr_safe_bitwise_operand(asmb,t,"&"));
+        x=expr_bitwise_result(asmb,u256_and(expr_safe_bitwise_operand(asmb,x,"&"),expr_safe_bitwise_operand(asmb,t,"&")));
     }
     *idx_out=idx; return x;
 }
@@ -3855,7 +3908,7 @@ static uint256_t expr_term4(Assembler *asmb, const char *s, int idx, int *idx_ou
     int slen=(int)strlen(s);
     while(idx<slen && s[idx]=='|' && s[idx+1]!='|'){
         uint256_t t=expr_term3(asmb,s,idx+1,&idx);
-        x=u256_or(expr_safe_bitwise_operand(asmb,x,"|"),expr_safe_bitwise_operand(asmb,t,"|"));
+        x=expr_bitwise_result(asmb,u256_or(expr_safe_bitwise_operand(asmb,x,"|"),expr_safe_bitwise_operand(asmb,t,"|")));
     }
     *idx_out=idx; return x;
 }
@@ -3865,7 +3918,7 @@ static uint256_t expr_term5(Assembler *asmb, const char *s, int idx, int *idx_ou
     int slen=(int)strlen(s);
     while(idx<slen && s[idx]=='^'){
         uint256_t t=expr_term4(asmb,s,idx+1,&idx);
-        x=u256_xor(expr_safe_bitwise_operand(asmb,x,"^"),expr_safe_bitwise_operand(asmb,t,"^"));
+        x=expr_bitwise_result(asmb,u256_xor(expr_safe_bitwise_operand(asmb,x,"^"),expr_safe_bitwise_operand(asmb,t,"^")));
     }
     *idx_out=idx; return x;
 }
