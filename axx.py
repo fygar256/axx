@@ -2241,7 +2241,16 @@ class ExpressionEvaluator:
                     x = float(fs) if fs else 0.0
                 except ValueError:
                     x = 0.0
-        elif (idx < len(s) and
+        # Pattern capture variables (!a-!z) only exist while an encoding
+        # expression from the pattern file is being evaluated (EXP_PAT).
+        # In assembly-source context (EXP_ASM) a bare lowercase letter is an
+        # ordinary user label, so this branch must not run there -- otherwise
+        # it consumes the name before the label lookup below ever sees it and
+        # silently yields the (unset) variable's value, i.e. 0, with no
+        # diagnostic.  Bugfix: the expmode test used to be missing, so every
+        # single-character lowercase label reference assembled to 0 while the
+        # label itself was still defined and exported correctly.
+        elif (idx < len(s) and self.state.expmode == EXP_PAT and
               s[idx] in LOWER and (idx + 1 >= len(s) or s[idx + 1] not in self.state.lwordchars)):
             ch = s[idx]
             if idx + 3 <= len(s) and s[idx + 1:idx + 3] == ':=':

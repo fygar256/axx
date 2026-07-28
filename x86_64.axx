@@ -617,7 +617,12 @@ MOV QWORD [b+!o],!i     ::  ::  0x48|((b&8)>>3),0xc7,0x80|(b&7),;(((b&7)==4)?0x2
 MOV QWORD d,[!s\+r]      ::  ::  0x48|((d&8)>>1)|((r&8)>>3),0x8b,0x04|((d&7)<<3),((r&7)<<3)|5,@@[4,*(s,%%)]
 
 /* ====================== MOVSX / MOVZX / MOVSXD ====================== */
-MOVSXD d,s              ::  ::  0x48|((d&8)>>1)|((s&8)>>3),0x63,0xc0|((d&7)<<3)|(s&7)
+/* MOVSXD's source operand is a 32-bit register, so it must be checked
+   against the 32-bit set.  It used to be written with 's', which is
+   constrained to the 64-bit registers -- that rejected the correct
+   'MOVSXD RAX,ECX' and accepted the bogus 'MOVSXD RAX,RCX'.
+   'f' is already constrained to EAX..R15D and encodes identically. */
+MOVSXD d,f              ::  ::  0x48|((d&8)>>1)|((f&8)>>3),0x63,0xc0|((d&7)<<3)|(f&7)
 MOVSXD d,[b]            ::  ::  0x48|((d&8)>>1)|((b&8)>>3),0x63,(((b&7)==5)?0x40:0)|((d&7)<<3)|(b&7),;(((b&7)==4)?0x24:0),@@[((b&7)==5),0x00]
 MOVSXD d,[b+!o]B        ::  ::  0x48|((d&8)>>1)|((b&8)>>3),0x63,0x40|((d&7)<<3)|(b&7),;(((b&7)==4)?0x24:0),(o&0xff)
 MOVSXD d,[b+r*1]            ::  ::0x48|((d&8)>>1)|((b&8)>>3)|((r&8)>>2),0x63,(((b&7)==5)?0x40:0)|0x04|((d&7)<<3),(0x00|((r&7)<<3)|(b&7)),@@[((b&7)==5),0x00]
