@@ -103,7 +103,8 @@ Relocatable object output works on FreeBSD and Linux, x86_64.
 
 Usage:
 
-```usage: axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV] [-E EXPORT_ELF_TSV] [-i IMPORT_TSV] [-o OBJ_FILE]
+```
+usage: axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV] [-E EXPORT_ELF_TSV] [-i IMPORT_TSV] [-o OBJ_FILE]
            [-m MACHINE] [-v] [-d] [-g] [--no-macro] [-P [FILE]]
            patternfile [sourcefile]
 
