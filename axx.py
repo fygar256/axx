@@ -4230,11 +4230,16 @@ class AssemblyDirectiveProcessor:
                 idx += 1
         return True
 
+    _RES_UNITS = {'.RESB': 1, '.RESW': 2, '.RESD': 4, '.RESQ': 8}
+
     def resb_processing(self, l1, l2):
-        """`.RESB count` — reserve `count` bytes without writing them (e.g. for
-        `.bss`); just advances `state.pc`, capped at `_RESB_MAX` to catch a
-        runaway/misparsed count."""
-        if StringUtils.upper(l1) != '.RESB':
+        """`.RESB/.RESW/.RESD/.RESQ count` — reserve `count` units (x1/x2/x4/x8)
+        without writing them (e.g. for `.bss`); just advances `state.pc`,
+        capped at `_RESB_MAX` to catch a runaway/misparsed count.
+        Mirrors caxx.c adir_resX()."""
+        _directive = StringUtils.upper(l1)
+        _mul = self._RES_UNITS.get(_directive)
+        if _mul is None:
             return False
         # get_value() no longer clears this on a successful lookup (see its
         # Bugfix comment), so callers that want a fresh per-evaluation
@@ -4243,28 +4248,29 @@ class AssemblyDirectiveProcessor:
         x, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
             if self.state.should_report_errors():
-                print(" error - .RESB argument contains undefined label.", file=sys.stderr)
+                print(f" error - {_directive} argument contains undefined label.", file=sys.stderr)
                 self.state.had_error = True
             return True
         try:
             x = int(x)
         except (OverflowError, ValueError):
             if self.state.should_report_errors():
-                print(" error - .RESB argument is non-finite or invalid.", file=sys.stderr)
+                print(f" error - {_directive} argument is non-finite or invalid.", file=sys.stderr)
                 self.state.had_error = True
             return True
         if x < 0:
             if self.state.should_report_errors():
-                print(f" error - .RESB requires a non-negative count, got {x}.", file=sys.stderr)
+                print(f" error - {_directive} requires a non-negative count, got {x}.", file=sys.stderr)
                 self.state.had_error = True
             return True
         _RESB_MAX = 1 << 28
-        if x > _RESB_MAX:
+        if x > _RESB_MAX // _mul:
             if self.state.should_report_errors():
-                print(f" error - .RESB count {x} exceeds maximum {_RESB_MAX}.", file=sys.stderr)
+                print(f" error - {_directive} count {x} (x{_mul}) exceeds maximum "
+                      f"{_RESB_MAX} words.", file=sys.stderr)
                 self.state.had_error = True
             return True
-        self.state.pc += x
+        self.state.pc += x * _mul
         return True
 
     def zero_processing(self, l1, l2):
@@ -7788,6 +7794,35 @@ class Assembler:
                 return False
         return True
 
+    @staticmethod
+    def _normalise_macro_expand_argv(argv):
+        """`-P/--macro-expand` takes an optional argument, which argparse would
+        greedily fill with the next positional (so `axx.py -P pat.axx src.s`
+        loses the pattern file).  Mirror caxx.c's rule instead: consume the
+        following token only when both positionals are already in hand."""
+        _with_arg = {'--osabi', '-b', '-e', '-E', '-i', '-o', '-m'}
+        out, positional, i = [], 0, 0
+        while i < len(argv):
+            a = argv[i]
+            if a in _with_arg and i + 1 < len(argv):
+                out += [a, argv[i + 1]]
+                i += 2
+                continue
+            if a in ('-P', '--macro-expand'):
+                if (i + 1 < len(argv) and not argv[i + 1].startswith('-')
+                        and positional >= 2):
+                    out += [a, argv[i + 1]]
+                    i += 2
+                else:
+                    out += [a, '-']
+                    i += 1
+                continue
+            if not a.startswith('-'):
+                positional += 1
+            out.append(a)
+            i += 1
+        return out
+
     def run(self):
         """Top-level entry point (called from `main()`). Parses CLI args, then:
 
@@ -7822,7 +7857,7 @@ class Assembler:
             ap.print_help()
             return True
 
-        args = ap.parse_args()
+        args = ap.parse_args(self._normalise_macro_expand_argv(sys.argv[1:]))
 
         osabitbl = {'Linux': 0, 'linux': 0, 'FreeBSD': 9, 'freebsd': 9}
 

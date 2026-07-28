@@ -660,21 +660,9 @@ static SecEntry *secmap_find(SecMap*m,const char*name){
     for(SecEntry*e=m->buckets[h];e;e=e->next) if(strcmp(e->name,name)==0)return e;
     return NULL;
 }
-static void secmap_set(SecMap*m,const char*name,uint256_t start,uint256_t size){
-    SecEntry*e=secmap_find(m,name);
-    if(e){e->start=start;e->size=size;return;}
-    uint32_t h=hash_str(name)%(uint32_t)m->nb;
-    e=calloc(1,sizeof(SecEntry)); e->name=strdup(name); e->start=start; e->size=size;
-    e->entry_pc=start; e->confirmed=0;
-    e->next=m->buckets[h]; m->buckets[h]=e;
-    if(m->count>=m->cap){
-        m->cap*=2;
-        SecEntry**tmp=realloc(m->order,m->cap*sizeof(SecEntry*));
-        if(!tmp){perror("realloc");exit(1);}
-        m->order=tmp;
-    }
-    m->order[m->count++]=e;
-}
+/* secmap_set() was defined here but never called; removed to keep the
+ * -Wall build warning-free.  secmap_find()/secmap_get() remain in use. */
+
 static AXX_UNUSED void secmap_free(SecMap*m){
     for(int i=0;i<m->nb;i++){
         SecEntry*e=m->buckets[i];
@@ -2229,7 +2217,7 @@ struct Assembler {
      * to resolve label -> section membership.
      * Kept in Assembler (not AsmState) because it belongs to the import
      * phase only and must not be confused with st.sections (assembly output).
-     * 破綻点修正 (axx.py port): SecMap(secmap_set)は同名キーの2回目の
+     * 破綻点修正 (axx.py port): SecMap(secmap_get)は同名キーの2回目の
      * set()が1回目を上書きするため、再入セクションの断片ごとに複数行
      * 書き出されるようになったTSVを読むと、名前ごとに最後の断片しか
      * 残らず、それ以前の断片に定義されたラベルの所属セクションを
@@ -3068,7 +3056,7 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
  * be equivalent to "MOV 'A'") failed with a syntax error even though it's a
  * form axx documents/recognizes elsewhere (skip_squote_literal handling in
  * axx.py; the C comment-stripper here also tolerates a bare backslash before
- * a quoted-out ';'). Returns 1 and sets *val/*out_idx on success, 0 (idx
+ * a quoted-out ';'). Returns 1 and sets *val / *out_idx on success, 0 (idx
  * unchanged) otherwise so the caller can fall through to other literal forms. */
 static int parse_hex_char_literal(const char *s, int idx, int slen, int *val, int *out_idx){
     if(!(idx+3<=slen && s[idx]=='\'' && s[idx+1]=='\\' && (s[idx+2]=='x'||s[idx+2]=='X')))
@@ -4888,9 +4876,9 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
                 if(asmb->st.combo_budget_warned_count <
                         (int)(sizeof(asmb->st.combo_budget_warned_line)/sizeof(int))){
                     int _wi = asmb->st.combo_budget_warned_count++;
-                    strncpy(asmb->st.combo_budget_warned_file[_wi], asmb->st.current_file,
-                            sizeof(asmb->st.combo_budget_warned_file[_wi])-1);
-                    asmb->st.combo_budget_warned_file[_wi][sizeof(asmb->st.combo_budget_warned_file[_wi])-1]=0;
+                    snprintf(asmb->st.combo_budget_warned_file[_wi],
+                             sizeof(asmb->st.combo_budget_warned_file[_wi]),
+                             "%s", asmb->st.current_file);
                     asmb->st.combo_budget_warned_line[_wi] = asmb->st.ln;
                 }
                 fprintf(stderr,
@@ -10241,6 +10229,10 @@ int main(int argc, char *argv[]){
         else if(strcmp(argv[i],"-d")==0||strcmp(argv[i],"--debug")==0){ st->debug=1; }
         else if(strcmp(argv[i],"-g")==0||strcmp(argv[i],"--gen-debug")==0){ st->gen_debug=1; }
         else if(strcmp(argv[i],"--no-macro")==0){ g_macro.enabled=0; }
+        else if(strncmp(argv[i],"--macro-expand=",15)==0){
+            macro_expand_dest=argv[i]+15;
+            if(!*macro_expand_dest) macro_expand_dest="-";
+        }
         else if(strcmp(argv[i],"-P")==0||strcmp(argv[i],"--macro-expand")==0){
             /* Optional argument: consume the next token only when it is not
              * another option and not the (still unseen) positional source
@@ -10253,6 +10245,18 @@ int main(int argc, char *argv[]){
         else if(argv[i][0]!='-'){
             if(!patternfile) patternfile=argv[i];
             else if(!sourcefile) sourcefile=argv[i];
+            else{
+                fprintf(stderr,"error: unexpected extra argument '%s'.\n",argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+        else{
+            /* Unknown option: fail loudly rather than silently ignoring it,
+             * matching axx.py (argparse) behaviour. */
+            fprintf(stderr,"error: unknown option '%s'.\n",argv[i]);
+            print_usage(argv[0]);
+            return 1;
         }
     }
 

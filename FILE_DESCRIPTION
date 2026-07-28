@@ -25,5 +25,11 @@ z80.axx                             pattern file for Z80
 z80.s                               test assemble file for Z80
 vliw.axx                            test pattern file for vliw
 vliw.s                              test assembly file for vliw
-x86_64.axx                          pattern file for x86_64　covered except segment addressing and EVEX.
+x86_64.axx                          pattern file for x86_64 (includes segment addressing, AVX/AVX2, BMI1/BMI2, x87 and EVEX/AVX-512)
 itanium.axx                         test pattern file for itanium
+MACRO.md                            macro layer reference (Japanese)
+macro_en.md                         macro layer reference (English)
+axx_introduction_paper.md           introduction paper (Japanese)
+axx_introduction_paper_en.md        introduction paper (English)
+makefile                            build/install rules for caxx and paxx
+x86_64.doc                          notes on the x86_64 pattern file

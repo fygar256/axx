@@ -424,7 +424,7 @@ LOD d,[!e]:: :: 0x00,0x01,0,d,e,e>>8::2
 
 Written as above, ``!!!!` represents a stop bit. ``EPIC::1,2::0x8|!!!!` represents a set of EPIC instructions, a bitwise OR code of a bundle of instructions at indices 1 and 2, with a template of 0x8 and a stop bit. The following instruction, `AD a,b,c:: ::0x01,0,0,a,b,c::1`, outputs 0x01,0,0,a,b,c without error checking using ADD instructions r1,r2,r3, with an index code of 1. The instruction `LOD d,[!e]:: :: 0x00,0x01,0,d,e,e>>8::2` stores the contents of [!e] in the LOAD instruction r4, outputs 0,1,0,0xd,e (lower 8 bits) and e (upper 8 bits) without error checking, with an index code of 2. This sample is for testing purposes and differs from actual bytecode.
 
-The parameter specified in .viw must match the number of bytes represented by the pattern: (Bundle bit count - Template bit count divided by 8 (bits)) + (1 if there is a remainder, 0 otherwise). In EPIC, error patterns must be explicitly specified using `:: ::`.
+The parameter specified in .vliw must match the number of bytes represented by the pattern: (Bundle bit count - Template bit count divided by 8 (bits)) + (1 if there is a remainder, 0 otherwise). In EPIC, error patterns must be explicitly specified using `:: ::`.
 
 #### For non-EPIC VLIW
 
@@ -545,10 +545,15 @@ Use the prefix `0x` for hexadecimal numbers.
 
 #### reserve
 
-Each reserves n bytes. Simply increment the location counter by n.
+Each reserves storage without emitting bytes. Simply increment the location
+counter. `.resb` counts bytes; `.resw`, `.resd` and `.resq` count 2-, 4- and
+8-byte units respectively.
 
 ```
 .resb n ; reserve n bytes
+.resw n ; reserve n words       (n*2 bytes)
+.resd n ; reserve n doublewords (n*4 bytes)
+.resq n ; reserve n quadwords   (n*8 bytes)
 ```
 
 #### export
@@ -578,6 +583,26 @@ Declares the loading of an external label.
 
 .global and .extern are processed by the ELF relocatable object file output function.
 
+#### Section-related directives
+
+In addition to `.section`/`.segment` below, the following are accepted:
+
+```
+.bss                ; switch to the .bss section
+.rodata             ; switch to the .rodata section
+.endsection         ; end the current section
+.endsegment         ; end the current segment
+```
+
+#### .reloctype
+
+Overrides the machine's default width-guess relocation type for
+auto-detected label references in the current source file.
+
+```
+.reloctype name8,name16,name32,name64
+```
+
 #### .section
 
 You can specify a section/segment as shown below.
@@ -598,7 +623,7 @@ For example,
 .section .text
 ld a,9
 .section .data
-.asciiz "test1"
+.asciz "test1"
 .section .text
 ld b,9
 .section .data
