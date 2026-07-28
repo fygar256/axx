@@ -103,9 +103,9 @@ Relocatable object output works on FreeBSD and Linux, x86_64.
 
 Usage:
 
-```
-usage: axx [-h] [--osabi {FreeBSD,Linux}] [-b OUTFILE] [-e EXPORT_TSV] [-E EXPORT_ELF_TSV] [-i IMPORT_TSV]
-           [-o OBJ_FILE] [-m MACHINE] [-v] [-d] [-g] patternfile [sourcefile]
+```usage: axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV] [-E EXPORT_ELF_TSV] [-i IMPORT_TSV] [-o OBJ_FILE]
+           [-m MACHINE] [-v] [-d] [-g] [--no-macro] [-P [FILE]]
+           patternfile [sourcefile]
 
 axx general assembler programmed and designed by Taisuke Maekawa
 
@@ -115,18 +115,25 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  --osabi {FreeBSD,Linux}
-                        ELF OSABI value (default: FreeBSD)
+  --osabi ELF_OSABI     ELF OSABI value (default: FreeBSD; FreeBSD/Linux, case-insensitive)
   -b OUTFILE            Output binary file
   -e EXPORT_TSV         Export labels to TSV file (plain format)
   -E EXPORT_ELF_TSV     Export labels to TSV file (ELF section flags format)
   -i IMPORT_TSV         Import labels from TSV file
   -o OBJ_FILE           Write ELF64 relocatable object file (.o)
-  -m MACHINE            ELF e_machine value (default 62=EM_X86_64; 183=AArch64, 243=RISC-V, 3=i386, 20=PPC, 40=ARM)
+  -m MACHINE            ELF e_machine value (default 62=EM_X86_64). Must be one of the architectures axx has
+                        relocation-numbering support for -- see ELF_MACHINES near the top of this file for the full
+                        list (currently: 3=i386, 4=M68K, 20=PowerPC, 21=PowerPC64, 22=s390x, 40=ARM, 42=SuperH,
+                        43=SPARCV9, 62=x86-64, 183=AArch64, 243=RISC-V)
   -v, --verbose         Verbose: print assembly listing to stdout (default: silent)
   -d, --debug           Enable debug output (forward-ref fallback, relaxation log, etc.)
   -g, --gen-debug       Generate DWARF debug information (.debug_info/.debug_abbrev/.debug_line) in the ELF object so
                         that gdb/lldb can do source-level debugging. Effective only together with -o.
+  --no-macro            Disable the macro preprocessor layer (!if/!while/!def/!return/!set and !{...} interpolation),
+                        so the source is handed to the assembler exactly as written.
+  -P [FILE], --macro-expand [FILE]
+                        Macro-expand the source file and write the resulting assembly to FILE (or stdout if FILE is
+                        omitted or "-") without assembling it. Useful for debugging macros.
 ```
 
 ## Explanation of Pattern Files
