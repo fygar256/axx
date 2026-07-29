@@ -61,6 +61,20 @@ static void axx_diagf(int set_error, int force, const char *fmt, ...);
  * ========================================================= */
 typedef struct { uint64_t w[4]; } uint256_t;
 
+/* PatVar: a pattern-variable (a-z) slot: the captured value plus a genuine
+ * provenance flag (is_undef) recording whether this value came from an
+ * actually-failed label lookup, as opposed to merely being numerically
+ * equal to the UNDEF sentinel (see UNDEF_VAL()/u256_is_undef_derived()
+ * below for why the numeric value alone cannot be trusted to tell these
+ * apart -- most notably, a legitimate immediate of exactly -1 is bit-
+ * identical to UNDEF in this fixed-width 256-bit two's-complement type).
+ * Bundling the flag into the same struct as the value means every existing
+ * whole-array memcpy() of vars[26] (trial-match save/restore, best-match
+ * snapshot/restore, macro !if/!while scoping, etc.) automatically carries
+ * the provenance flag along with the value with no further changes needed
+ * at those call sites. */
+typedef struct { uint256_t val; int is_undef; } PatVar;
+
 static uint256_t u256_zero(void) {
     uint256_t r; memset(&r,0,sizeof(r)); return r;
 }
@@ -960,7 +974,7 @@ typedef struct {
     StrVec     fnstack;
     IStack     lnstack;
 
-    uint256_t  vars[26];
+    PatVar     vars[26];
 
     char deb1[4096];
     char deb2[4096];
@@ -1511,7 +1525,7 @@ static void state_init(AsmState *st) {
     st->ln = 0;
     sv_init(&st->fnstack);
     is_init(&st->lnstack);
-    for(int i=0;i<26;i++) st->vars[i]=u256_zero();
+    for(int i=0;i<26;i++){ st->vars[i].val=u256_zero(); st->vars[i].is_undef=0; }
     bufmap_init(&st->buf);
     st->pc = u256_zero();
     st->padding = u256_zero();
@@ -2448,12 +2462,29 @@ static void binary_flush(AsmState *st){
  * ========================================================= */
 static uint256_t var_get(AsmState *st, char ch){
     ch=(char)axx_upper_char(ch);
-    if(ch>='A'&&ch<='Z') return st->vars[ch-'A'];
+    if(ch>='A'&&ch<='Z') return st->vars[ch-'A'].val;
     return u256_zero();
+}
+/* Whether the variable's currently-stored value genuinely came from a
+ * failed label lookup (see PatVar's comment above) -- NOT a check on the
+ * numeric value itself. */
+static int var_get_is_undef(AsmState *st, char ch){
+    ch=(char)axx_upper_char(ch);
+    if(ch>='A'&&ch<='Z') return st->vars[ch-'A'].is_undef;
+    return 0;
 }
 static void var_put(AsmState *st, char ch, uint256_t v){
     ch=(char)axx_upper_char(ch);
-    if(ch>='A'&&ch<='Z') st->vars[ch-'A']=v;
+    if(ch>='A'&&ch<='Z'){ st->vars[ch-'A'].val=v; st->vars[ch-'A'].is_undef=0; }
+}
+/* var_put_tagged: like var_put(), but also records genuine provenance
+ * (is_undef) alongside the value, so a later read of this same variable
+ * can tell a legitimate value that merely equals the UNDEF bit pattern
+ * (e.g. -1) apart from a value that really did come from an unresolved
+ * label reference. */
+static void var_put_tagged(AsmState *st, char ch, uint256_t v, int is_undef){
+    ch=(char)axx_upper_char(ch);
+    if(ch>='A'&&ch<='Z'){ st->vars[ch-'A'].val=v; st->vars[ch-'A'].is_undef=is_undef; }
 }
 
 /* =========================================================
@@ -3589,8 +3620,17 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
     else if(st->expmode==EXP_PAT && is_lower(s[idx]) && (s[idx+1]=='\0'||!is_lower(s[idx+1]))){
         char ch=s[idx];
         if(idx+3<=slen && s[idx+1]==':'&&s[idx+2]=='='){
+            /* Isolate whether resolving a label DURING this specific
+             * right-hand-side expression genuinely failed, so the
+             * assigned variable's provenance flag reflects only this
+             * expression -- not whatever error_undefined_label happened
+             * to hold beforehand (see PatVar's comment above). */
+            int _assign_prior_eul = st->error_undefined_label;
+            st->error_undefined_label = 0;
             x=expr_expression(asmb,s,idx+3,&idx);
-            var_put(st,ch,x);
+            int _assign_this_undef = st->error_undefined_label;
+            st->error_undefined_label = _assign_prior_eul || _assign_this_undef;
+            var_put_tagged(st,ch,x,_assign_this_undef);
         } else {
             x=var_get(st,ch);
             idx++;
@@ -3598,31 +3638,71 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
              * makeobj evaluation.
              *
              * When in_match_attempt=1, label_get_value() suppresses its error
-             * output and stores UNDEF (0xff…ff) in the variable via var_put().
+             * *output* (but still sets error_undefined_label — see below)
+             * and stores UNDEF (0xff…ff) in the variable via var_put().
              * makeobj() later reads the variable through var_get() — NOT through
-             * label_get_value() — so error_undefined_label is never set and no
-             * error is emitted even though the assembled word is garbage.
+             * label_get_value() — so without this check no error would be
+             * emitted here even though the assembled word is garbage.
              *
-             * Fix: when NOT in a match attempt, NOT in pass1_size_mode, and in
-             * pass2 or interactive mode, check whether the variable holds UNDEF
-             * (0xff…ff) or an UNDEF-derived value (>= 2^128, which can arise from
-             * arithmetic on UNDEF).  If so, set error_undefined_label and emit
-             * the error, matching the behaviour of label_get_value() for directly
-             * referenced undefined labels.
+             * Bugfix (2026-07-29): this used to detect the condition by
+             * inspecting the VALUE (u256_is_undef_derived(x): x == UNDEF or
+             * abs(x) >= 2^192, mirroring axx.py's factor1() which does the
+             * analogous check against its own UNDEF = (1<<1024)-1 sentinel).
+             * That works in axx.py because Python ints are arbitrary-
+             * precision, so a legitimate small negative number (e.g. -1)
+             * can never collide with a 1024-bit sentinel. But uint256_t
+             * here is a FIXED 256-bit two's-complement type, and UNDEF is
+             * defined as all 256 bits set (see UNDEF_VAL() above) — which
+             * is bit-for-bit IDENTICAL to the legitimate value -1 (any
+             * negative number's two's-complement sign-extension fills all
+             * higher words with 1s; for -1 specifically that includes the
+             * low word too, so the whole 256 bits end up as 1). So a
+             * perfectly ordinary immediate like "mov rax, -1" or
+             * "cmp reg, -1" was being misreported as an undefined label
+             * and aborted the whole assembly (see u256_is_undef_derived()'s
+             * own comment above, which already documented this exact
+             * unavoidable-by-value-inspection collision and deferred a
+             * proper fix as out of scope for that session).
              *
-             * Mirrors the identical fix applied to axx.py factor1():
-             *   _UNDEF_THRESHOLD = 1 << 128
-             *   if (not _in_match_attempt and not _pass1_size_mode
-             *           and (pas==2 or pas==0)
-             *           and (x == UNDEF or x >= _UNDEF_THRESHOLD)):
-             *       error_undefined_label = True
-             *       print(" error - Label undefined: variable … ")
-             */
+             * Fix: check genuine PROVENANCE (PatVar.is_undef — see its
+             * definition above) instead of the value's bit pattern.
+             * is_undef is set on a variable ONLY at the point it is bound
+             * (var_put_tagged(), in the '!'-capture and ":="-assignment
+             * branches below) by asking "did resolving a label anywhere
+             * inside THIS specific captured expression actually fail?"
+             * (via a local save/reset/restore of error_undefined_label
+             * around just that one expression evaluation) — never by
+             * inspecting the resulting number. A legitimate expression that
+             * merely evaluates to -1 (whether a bare literal or e.g.
+             * "definedlabel - definedlabel - 1") never touches a failing
+             * label_get_value() call, so is_undef stays 0 for it; a
+             * genuinely unresolved reference sets is_undef=1 regardless of
+             * what numeric value UNDEF happens to decay to. This flag
+             * naturally survives the trial-match rollback / best-match
+             * snapshot-restore / macro !if/!while save-restore, because
+             * PatVar bundles it with the value itself, so every existing
+             * whole-array vars[26] memcpy() already carries it along.
+             *
+             * makeobj() resets error_undefined_label to 0 before
+             * evaluating each binary_list element and only accumulates
+             * "any_undef" from what becomes 1 during that one element's
+             * evaluation (it never re-derives anything from a variable's
+             * stored value on its own, since reading a variable here goes
+             * through var_get() rather than label_get_value()) — so this
+             * check must re-set error_undefined_label=1 itself whenever
+             * is_undef is found true, or the failure would silently vanish
+             * and produce garbage bytes instead of an error.
+             *
+             * (Note: the check below is keyed on `ch` specifically —
+             * var_get_is_undef(st, ch), not any instruction-wide flag — so
+             * even when a single element's expression combines more than
+             * one captured variable and only one of them is genuinely
+             * undefined, the letter this prints correctly names that one
+             * variable and not whichever happens to be read first.) */
             if(!st->in_match_attempt
                && !st->pass1_size_mode
                && should_report_errors(st)){
-                /* B (axx.py port): centralized detection, threshold raised to 2^192. */
-                if(u256_is_undef_derived(x)){
+                if(var_get_is_undef(st, ch)){
                     st->error_undefined_label = 1;
                     axx_diagf(0, 0, " error - Label undefined: variable '%c' contains undefined value"
                                "  [%s:%d]\n",
@@ -4278,11 +4358,11 @@ static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_o
              * the chosen (true) branch.  The old code let the false-branch's flag
              * persist, so whenever the false-branch contained an undefined label
              * the error was spuriously reported even when condition was true. */
-            uint256_t saved_vars[26];
+            PatVar    saved_vars[26];
             memcpy(saved_vars, asmb->st.vars, sizeof(saved_vars));
 
             x = expr_term10(asmb, s, idx, &idx);
-            uint256_t vars_after_true[26];
+            PatVar    vars_after_true[26];
             memcpy(vars_after_true, asmb->st.vars, sizeof(vars_after_true));
             int err_after_true = asmb->st.error_undefined_label;
 
@@ -4863,9 +4943,17 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 a=t[idx_t]; idx_t++;
                 /* ELF tracking: record which variable is being captured */
                 st->elf_capturing_var = a;
+                /* Isolate whether resolving a label DURING this specific
+                 * captured expression genuinely failed (see PatVar's
+                 * comment above), independent of whatever
+                 * error_undefined_label happened to hold going in. */
+                int _cap_prior_eul = st->error_undefined_label;
+                st->error_undefined_label = 0;
                 uint256_t v=expr_factor(asmb,s,idx_s,&idx_s);
+                int _cap_this_undef = st->error_undefined_label;
+                st->error_undefined_label = _cap_prior_eul || _cap_this_undef;
                 st->elf_capturing_var = '\0';
-                var_put(st,a,v);
+                var_put_tagged(st,a,v,_cap_this_undef);
                 continue;
             } else {
                 idx_t=axx_skipspc(t,idx_t);
@@ -4878,9 +4966,14 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 }
                 /* ELF tracking: record which variable is being captured */
                 st->elf_capturing_var = a;
+                /* Same isolation as the '!' branch above. */
+                int _cap_prior_eul2 = st->error_undefined_label;
+                st->error_undefined_label = 0;
                 uint256_t v=expr_expression_esc(asmb,s,idx_s,stopchar,&idx_s);
+                int _cap_this_undef2 = st->error_undefined_label;
+                st->error_undefined_label = _cap_prior_eul2 || _cap_this_undef2;
                 st->elf_capturing_var = '\0';
-                var_put(st,a,v);
+                var_put_tagged(st,a,v,_cap_this_undef2);
                 if(stopchar && s[idx_s]==stopchar) idx_s++;
                 continue;
             }
@@ -5020,7 +5113,7 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
         /* Fix C-1 / Fix ④ (axx.py): snapshot vars AND ELF tracking state before
          * each trial.  Failed match attempts must not leave partial variable
          * writes or spurious ELF ref entries visible to the next attempt. */
-        uint256_t saved_vars[26];
+        PatVar    saved_vars[26];
         memcpy(saved_vars, asmb->st.vars, sizeof(saved_vars));
 
         /* Snapshot ELF refs */
@@ -6316,7 +6409,7 @@ typedef struct {
     int       pln;
     PatEntry *pat;
     /* マッチで確定したキャプチャ変数 */
-    uint256_t vars[26];
+    PatVar    vars[26];
     /* マッチ中に追加された ELF 参照の差分（name は strdup 所有） */
     struct { char *name; uint64_t val; int word_idx; } *refs;
     int       refs_len;
@@ -6585,7 +6678,7 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     for(int pi=0;pi<st->pat.len;pi++){
         PatEntry *i=&st->pat.data[pi];
         pln++;
-        for(int vi=0;vi<26;vi++) st->vars[vi]=u256_zero();
+        for(int vi=0;vi<26;vi++){ st->vars[vi].val=u256_zero(); st->vars[vi].is_undef=0; }
 
         if(dir_set_symbol(asmb,i)) continue;
         if(dir_clear_symbol(asmb,i)) continue;
@@ -6633,7 +6726,7 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
 
         /* マッチ試行の副作用（キャプチャ変数・ELF追跡状態）を
          * 巻き戻せるよう保存する。 */
-        uint256_t saved_vars[26];
+        PatVar    saved_vars[26];
         memcpy(saved_vars, st->vars, sizeof(saved_vars));
         int saved_refs_len = st->elf_refs_len;
         struct { int set; char *label_name; uint64_t label_val; } saved_vtl[26];
@@ -10507,7 +10600,7 @@ int main(int argc, char *argv[]){
                               e->is_equ, e->is_imported, e->reloc_type_override);
 
         /* Fix ⑧: snapshot initial vars (a-z) */
-        uint256_t initial_vars[26];
+        PatVar    initial_vars[26];
         memcpy(initial_vars, st->vars, sizeof(initial_vars));
 
         LabelMap prev_labels;
