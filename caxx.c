@@ -496,6 +496,18 @@ typedef struct LabelEntry {
     int            is_equ;              /* 1 if defined via .equ – not relocatable */
     int            is_imported;         /* 1 if declared via .EXTERN – STB_GLOBAL/SHN_UNDEF in ELF */
     int            reloc_type_override; /* -1 = not set; otherwise ELF relocation type from .EXTERN label::rtype */
+    /* is_undef: genuine provenance flag, same idea as PatVar.is_undef above --
+     * true only when this label's stored value was itself computed from a
+     * .equ expression that actually hit error_undefined_label (a real failed
+     * reference somewhere in its RHS), never derived from the bit pattern of
+     * `value` alone. This exists because a legitimate .equ constant that
+     * happens to equal exactly -1 (e.g. ".equ 0-1") is bit-identical to
+     * UNDEF_VAL() in this fixed-width 256-bit type, so callers that need to
+     * know "is this label really undefined" must consult this flag instead
+     * of comparing `value` to UNDEF_VAL()/u256_is_undef_derived(). Defaults
+     * to 0 (calloc), which is correct for address labels (value is always a
+     * concrete pc, never undef-derived) and imported/.EXTERN placeholders. */
+    int            is_undef;
     struct LabelEntry *next;
 } LabelEntry;
 
@@ -532,12 +544,12 @@ static LabelEntry *lmap_find(LabelMap *m, const char *key) {
     return NULL;
 }
 static int lmap_contains(LabelMap *m, const char *key) { return lmap_find(m,key)!=NULL; }
-static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *sec, int is_equ) {
+static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *sec, int is_equ, int is_undef) {
     if(!m->nbuckets) return;
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
     for(LabelEntry*e=m->buckets[h];e;e=e->next){
         if(strcmp(e->key,key)==0){
-            e->value=val; free(e->section); e->section=strdup(sec); e->is_equ=is_equ;
+            e->value=val; free(e->section); e->section=strdup(sec); e->is_equ=is_equ; e->is_undef=is_undef;
             /* axx.py fix: ::reloctype を省略した場合は旧エントリの reloc_type_override を
              * 引き継がず -1 にリセットする。reloc_type が必要な場合は呼び出し側が
              * lmap_set_reloc_type() で明示的に設定する。
@@ -559,7 +571,7 @@ static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *se
     }
     LabelEntry *e=calloc(1,sizeof(LabelEntry));
     e->key=strdup(key); e->value=val; e->section=strdup(sec);
-    e->is_equ=is_equ; e->is_imported=0; e->reloc_type_override=-1;
+    e->is_equ=is_equ; e->is_imported=0; e->reloc_type_override=-1; e->is_undef=is_undef;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
 }
 /* lmap_set の直後に reloc_type_override を設定するヘルパー。
@@ -575,25 +587,27 @@ static void lmap_set_imported(LabelMap *m, const char *key, uint256_t val, const
     for(LabelEntry*e=m->buckets[h];e;e=e->next){
         if(strcmp(e->key,key)==0){
             e->value=val; free(e->section); e->section=strdup(sec);
-            e->is_equ=0; e->is_imported=1;
+            e->is_equ=0; e->is_imported=1; e->is_undef=0;
             if(reloc_type >= 0) e->reloc_type_override=reloc_type;
             return;
         }
     }
     LabelEntry *e=calloc(1,sizeof(LabelEntry));
     e->key=strdup(key); e->value=val; e->section=strdup(sec);
-    e->is_equ=0; e->is_imported=1; e->reloc_type_override=reloc_type;
+    e->is_equ=0; e->is_imported=1; e->reloc_type_override=reloc_type; e->is_undef=0;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
 }
 /* Copy all label fields including is_imported and reloc_type_override. Used for relaxation snapshots. */
 static void lmap_set_full(LabelMap *m, const char *key, uint256_t val,
-                          const char *sec, int is_equ, int is_imported, int reloc_type_override) {
+                          const char *sec, int is_equ, int is_imported, int reloc_type_override,
+                          int is_undef) {
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
     for(LabelEntry*e=m->buckets[h];e;e=e->next){
         if(strcmp(e->key,key)==0){
             e->value=val; free(e->section); e->section=strdup(sec);
             e->is_equ=is_equ; e->is_imported=is_imported;
             e->reloc_type_override=reloc_type_override;
+            e->is_undef=is_undef;
             return;
         }
     }
@@ -601,6 +615,7 @@ static void lmap_set_full(LabelMap *m, const char *key, uint256_t val,
     e->key=strdup(key); e->value=val; e->section=strdup(sec);
     e->is_equ=is_equ; e->is_imported=is_imported;
     e->reloc_type_override=reloc_type_override;
+    e->is_undef=is_undef;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
 }
 static AXX_UNUSED void lmap_delete(LabelMap *m, const char *key) {
@@ -2590,7 +2605,13 @@ static uint256_t label_get_value(AsmState *st, const char *k){
      * errors there. UNDEF-derived estimates are ignored (treated as no estimate). */
     if(st->pas == 1 && st->relax_prev){
         LabelEntry *pe = lmap_find(st->relax_prev, k);
-        if(pe && !u256_is_undef_derived(pe->value)){
+        /* Bugfix: was !u256_is_undef_derived(pe->value), which wrongly
+         * discarded a previous-iteration estimate that happened to be a
+         * legitimate -1 (bit-identical to UNDEF_VAL() in this fixed-width
+         * type). is_undef is propagated into every relax_prev snapshot via
+         * lmap_set_full(), so this is a safe drop-in replacement -- see
+         * LabelEntry.is_undef. */
+        if(pe && !pe->is_undef){
             return pe->value;
         }
     }
@@ -2613,7 +2634,7 @@ static const char *label_get_section(AsmState *st, const char *k){
     st->error_undefined_label=1;
     return "";
 }
-static int label_put_value(AsmState *st, const char *k, uint256_t v, const char *sec, int is_equ, int reloc_type){
+static int label_put_value(AsmState *st, const char *k, uint256_t v, const char *sec, int is_equ, int reloc_type, int is_undef){
     if(st->pas==1||st->pas==0){
         LabelEntry *_existing = lmap_find(&st->labels,k);
         /* 破綻点修正 (axx.py port): .EXTERNで仮登録された名前(is_imported=1)は
@@ -2660,7 +2681,7 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
     st->error_already_defined=0;
     /* lmap_set は reloc_type_override を -1 にリセットする（旧値を引き継がない）。
      * ::reloctype が明示指定された場合のみ直後に設定する。 */
-    lmap_set(&st->labels,k,v,sec,is_equ);
+    lmap_set(&st->labels,k,v,sec,is_equ,is_undef);
     if(reloc_type >= 0)
         lmap_set_reloc_type(&st->labels, k, reloc_type);
     return 1;
@@ -2763,7 +2784,22 @@ static double xeval_primary(XEP *p){
          * it, exactly once, if it's still set once evaluation finishes. */
         AsmState *st=&p->asmb->st;
         LabelEntry *e = lmap_find(&st->labels, name);
-        if(!e || u256_is_undef_derived(e->value)){
+        /* Bugfix: this used to also treat u256_is_undef_derived(e->value) as
+         * undefined -- i.e. flag any label whose stored value happened to be
+         * bit-identical to UNDEF_VAL(). axx.py's xeval() can safely compare
+         * against its UNDEF sentinel because it is an arbitrary-precision
+         * integer far outside any realistic value's range, so the comparison
+         * never has a false positive there. This C port's UNDEF_VAL() is
+         * merely the all-ones 256-bit pattern, which is exactly the two's-
+         * complement representation of a perfectly legitimate -1 -- so
+         * ":label" referencing a real, defined label such as
+         * "label: .equ 0-1" was wrongly reported as undefined here. Genuine
+         * undefined-ness is now tracked via e->is_undef (set only when the
+         * label's own defining expression actually failed a lookup -- see
+         * LabelEntry.is_undef / label_put_value()'s is_undef argument),
+         * so a label that is simply present and not undef-derived is used
+         * as-is regardless of what its bit pattern looks like. */
+        if(!e || e->is_undef){
             st->error_undefined_label = 1;
             return 0;
         }
@@ -5842,10 +5878,18 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
             }
             /* ====================================================================== */
 
-            label_put_value(st,label,u,st->current_section,1,reloc_type);  /* is_equ=1 */
+            /* is_undef provenance (see LabelEntry.is_undef): st->error_undefined_label
+             * right here reflects whether evaluating THIS .equ's own expression (the
+             * expr_expression_asm() call above) actually hit a failed label lookup --
+             * exactly the same signal the diagnostic just above already relies on.
+             * A plain constant like ".equ 0-1" never touches a label lookup, so this
+             * is 0 for it even though its stored value is bit-identical to UNDEF_VAL();
+             * only a genuinely-failed reference (e.g. aliasing an undefined label)
+             * sets it. */
+            label_put_value(st,label,u,st->current_section,1,reloc_type,st->error_undefined_label);  /* is_equ=1 */
             out[0]=0; return out;
         } else {
-            label_put_value(st,label,st->pc,st->current_section,0,-1);  /* is_equ=0 */
+            label_put_value(st,label,st->pc,st->current_section,0,-1,0);  /* is_equ=0; address labels (st->pc) are never undef-derived */
             strncpy(out,l+lidx,osz-1); out[osz-1]=0; return out;
         }
     }
@@ -6215,7 +6259,8 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
          * Mirrors axx.py export_processing() which stores the full label entry. */
         LabelEntry *le=lmap_find(&st->labels,s);
         int is_equ_v = le ? le->is_equ : 0;
-        lmap_set(&st->export_labels,s,v,sec,is_equ_v);
+        int is_undef_v = le ? le->is_undef : 0;
+        lmap_set(&st->export_labels,s,v,sec,is_equ_v,is_undef_v);
         if(buf[idx]==',') idx++;
     }
     return 1;
@@ -7853,7 +7898,12 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     WLK *larr=calloc((size_t)(st->labels.count?st->labels.count:1),sizeof(WLK));
     {for(int bi=0;bi<st->labels.nbuckets;bi++)
         for(LabelEntry*e=st->labels.buckets[bi];e;e=e->next){
-            if(u256_is_undef_derived(e->value)) continue;
+            /* Bugfix: was u256_is_undef_derived(e->value), which wrongly
+             * excludes any legitimately-defined label whose value happens
+             * to be exactly -1 (bit-identical to UNDEF_VAL() in this
+             * fixed-width type -- see LabelEntry.is_undef). Use the genuine
+             * provenance flag instead so such labels are correctly emitted. */
+            if(e->is_undef) continue;
             larr[nl++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,e->is_imported,e->reloc_type_override,e->section};}}
     qsort(larr,nl,sizeof(WLK),cmp_wlk);
 
@@ -7861,7 +7911,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     WLK *earr=calloc((size_t)(st->export_labels.count?st->export_labels.count:1),sizeof(WLK));
     {for(int bi=0;bi<st->export_labels.nbuckets;bi++)
         for(LabelEntry*e=st->export_labels.buckets[bi];e;e=e->next){
-            if(u256_is_undef_derived(e->value)) continue;
+            if(e->is_undef) continue;  /* same fix as labels[] above -- see LabelEntry.is_undef */
             /* export_labels には reloc_type_override が保存されないため labels から引く */
             LabelEntry *_fl=lmap_find(&st->labels,e->key);
             int _rto = _fl ? _fl->reloc_type_override : -1;
@@ -10374,7 +10424,7 @@ static void label_map_copy_from(LabelMap *dst, LabelMap *src) {
     for (int bi = 0; bi < src->nbuckets; bi++)
         for (LabelEntry *e = src->buckets[bi]; e; e = e->next)
             lmap_set_full(dst, e->key, e->value, e->section,
-                          e->is_equ, e->is_imported, e->reloc_type_override);
+                          e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
 }
 
 typedef struct {
@@ -10597,7 +10647,7 @@ int main(int argc, char *argv[]){
         for(int bi=0; bi<st->labels.nbuckets; bi++)
             for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
                 lmap_set_full(&imported_labels, e->key, e->value, e->section,
-                              e->is_equ, e->is_imported, e->reloc_type_override);
+                              e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
 
         /* Fix ⑧: snapshot initial vars (a-z) */
         PatVar    initial_vars[26];
@@ -10625,7 +10675,7 @@ int main(int argc, char *argv[]){
             for(int bi=0; bi<imported_labels.nbuckets; bi++)
                 for(LabelEntry *e=imported_labels.buckets[bi]; e; e=e->next)
                     lmap_set_full(&st->labels, e->key, e->value, e->section,
-                                  e->is_equ, e->is_imported, e->reloc_type_override);
+                                  e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
             /* reset sections and export_labels too (mirrors axx.py run()) */
             secmap_clear(&st->sections);
             secrangevec_clear(&st->section_ranges);
@@ -10663,7 +10713,21 @@ int main(int argc, char *argv[]){
              *   that large as an unresolved forward-reference (mirrors axx.py
              *   _UNDEF_THRESHOLD = 1 << 128 logic).
              *   is_equ labels hold arbitrary integer constants and are excluded
-             *   from this check (they may legitimately be large). */
+             *   from this check (they may legitimately be large).
+             *
+             * NOTE: this loop already skips is_equ labels above, so every
+             * entry reaching the check below is an address label (value is
+             * always a concrete `st->pc`, which never legitimately equals -1
+             * or any other huge value). It intentionally keeps the bit-
+             * pattern test (u256_is_undef_derived) rather than e->is_undef:
+             * the two ask different questions -- e->is_undef records whether
+             * a .equ's *defining expression* failed, whereas this needs "is
+             * this address label's pc still an unresolved placeholder from an
+             * earlier relaxation iteration", which address labels never carry
+             * an is_undef flag for at all (it's hard-coded 0 at
+             * label_put_value()'s address-label call site). Swapping this to
+             * e->is_undef would make has_undef never fire and silently break
+             * relaxation convergence detection. */
             int has_undef = 0;
             for(int bi=0; bi<st->labels.nbuckets && !has_undef; bi++)
                 for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next){
@@ -10710,7 +10774,7 @@ int main(int argc, char *argv[]){
             for(int bi=0; bi<st->labels.nbuckets; bi++)
                 for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
                     lmap_set_full(&prev_labels, e->key, e->value, e->section,
-                                  e->is_equ, e->is_imported, e->reloc_type_override);
+                                  e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
 
             if(converged){
                 if(st->debug)
@@ -10728,7 +10792,7 @@ int main(int argc, char *argv[]){
             for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
                 if(!e->is_equ)
                     lmap_set_full(&pass1_final, e->key, e->value, e->section,
-                                  e->is_equ, e->is_imported, e->reloc_type_override);
+                                  e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
 
         lmap_free(&prev_labels);
         lmap_free(&imported_labels);
@@ -10918,7 +10982,7 @@ int main(int argc, char *argv[]){
             } \
             for(int i=0;i<st->export_labels.nbuckets;i++){ \
                 for(LabelEntry*e=st->export_labels.buckets[i];e;e=e->next){ \
-                    if(u256_is_undef_derived(e->value)) continue; \
+                    if(e->is_undef) continue; /* same fix as write_elf_obj()'s .symtab loop -- see LabelEntry.is_undef */ \
                     unsigned long long lbl_addr; \
                     if(e->is_equ){ \
                         lbl_addr=(unsigned long long)u256_to_u64(e->value); \
