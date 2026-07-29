@@ -4561,6 +4561,14 @@ static int dir_error(Assembler *asmb, const char *s){
             if(tc>=0&&tc<ERRORS_COUNT) fprintf(stderr,"%s",ERRORS_TABLE[tc]);
             fprintf(stderr,": \n");
             triggered=1;
+            /* A triggered guard makes the caller skip makeobj(), so this
+             * instruction contributes no object bytes and the output would be
+             * silently short.  Latch had_error -- as every other error path
+             * does via diag(set_error=1) -- so the run aborts with a non-zero
+             * exit status instead of writing a wrong binary that a makefile
+             * would happily hand to the linker.  Mirrors axx.py
+             * DirectiveProcessor.error(). */
+            st->had_error=1;
         }
     }
     return triggered;

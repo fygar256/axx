@@ -3194,6 +3194,13 @@ class DirectiveProcessor:
                 print(": ", file=sys.stderr)
                 error_code = t_int
                 triggered = True
+                # A triggered guard makes the caller emit no object bytes for
+                # this instruction (objl = [] at the call site), so the output
+                # would be silently short.  Latch had_error -- as every other
+                # error path does via diag(set_error=True) -- so run() aborts
+                # with a non-zero exit status instead of writing a wrong
+                # binary that a makefile would happily hand to the linker.
+                self.state.had_error = True
 
         return triggered, error_code
 
