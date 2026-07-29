@@ -1,0 +1,246 @@
+/* =====================================================================
+/*  6502.axx -- MOS Technology 6502 full pattern file for axx
+/*
+/*  Covers all 151 official opcodes (56 mnemonics x 13 addressing modes).
+/*  Undocumented/illegal opcodes are intentionally not included.
+/*
+/*  Syntax accepted (standard 6502 notation):
+/*     LDA #$41          immediate
+/*     LDA $10           zero page   -- chosen automatically when value <= $FF
+/*     LDA $0400         absolute
+/*     LDA $10,X         zero page,X
+/*     LDA $0400,X       absolute,X
+/*     LDA $0400,Y       absolute,Y
+/*     LDA ($20,X)       (indirect,X)
+/*     LDA ($20),Y       (indirect),Y
+/*     JMP ($1234)       indirect
+/*     ASL A / ASL       accumulator
+/*     BNE label         relative
+/*
+/*  Forcing the addressing mode
+/*  ---------------------------
+/*  axx does not optimise instruction length by itself, so the zero-page /
+/*  absolute choice above is made inside the pattern by a ternary on the
+/*  operand value.  A forward label is unknown on the first relaxation pass,
+/*  so its instruction may change length between passes; axx re-runs pass 1
+/*  until the addresses stop moving, and refuses to write output if they
+/*  never settle.  When you want to pin the form down yourself:
+/*
+/*     LDA <$0010        force zero page (2 bytes)   -- error if operand > $FF
+/*     LDA >$0010        force absolute  (3 bytes)
+/*     STA <label,X      force zero page,X
+/*     STA >label,X      force absolute,X
+/*
+/*  Numbers use axx expression syntax (0x41 / 65 / 0b1000001), not $41.
+/*  Use  .org $c000  ->  .org 0xc000.
+/*
+/*  Error codes raised by this file
+/*     2  Address out of range   (operand does not fit the forced/only form,
+/*                                or a branch target is further than -128..+127)
+/*     3  Value out of range     (immediate operand > $FF)
+/* ===================================================================== */
+
+
+/* ---------- implied / register ---------- */
+BRK                       ::             :: 0x00
+CLC                       ::             :: 0x18
+CLD                       ::             :: 0xd8
+CLI                       ::             :: 0x58
+CLV                       ::             :: 0xb8
+DEX                       ::             :: 0xca
+DEY                       ::             :: 0x88
+INX                       ::             :: 0xe8
+INY                       ::             :: 0xc8
+NOP                       ::             :: 0xea
+PHA                       ::             :: 0x48
+PHP                       ::             :: 0x08
+PLA                       ::             :: 0x68
+PLP                       ::             :: 0x28
+RTI                       ::             :: 0x40
+RTS                       ::             :: 0x60
+SEC                       ::             :: 0x38
+SED                       ::             :: 0xf8
+SEI                       ::             :: 0x78
+TAX                       ::             :: 0xaa
+TAY                       ::             :: 0xa8
+TSX                       ::             :: 0xba
+TXA                       ::             :: 0x8a
+TXS                       ::             :: 0x9a
+TYA                       ::             :: 0x98
+
+/* ---------- accumulator shift/rotate + read-modify-write ---------- */
+ASL A                     ::             :: 0x0a
+ASL                       ::             :: 0x0a
+ASL <!v,X                 :: v>0xff;2    :: 0x16,v
+ASL >!v,X                 ::             :: 0x1e,@@[2,*(v,%%)]
+ASL !v,X                  ::             :: (v>0xff)?0x1e:0x16,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+ASL <!v                   :: v>0xff;2    :: 0x06,v
+ASL >!v                   ::             :: 0x0e,@@[2,*(v,%%)]
+ASL !v                    ::             :: (v>0xff)?0x0e:0x06,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+DEC <!v,X                 :: v>0xff;2    :: 0xd6,v
+DEC >!v,X                 ::             :: 0xde,@@[2,*(v,%%)]
+DEC !v,X                  ::             :: (v>0xff)?0xde:0xd6,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+DEC <!v                   :: v>0xff;2    :: 0xc6,v
+DEC >!v                   ::             :: 0xce,@@[2,*(v,%%)]
+DEC !v                    ::             :: (v>0xff)?0xce:0xc6,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+INC <!v,X                 :: v>0xff;2    :: 0xf6,v
+INC >!v,X                 ::             :: 0xfe,@@[2,*(v,%%)]
+INC !v,X                  ::             :: (v>0xff)?0xfe:0xf6,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+INC <!v                   :: v>0xff;2    :: 0xe6,v
+INC >!v                   ::             :: 0xee,@@[2,*(v,%%)]
+INC !v                    ::             :: (v>0xff)?0xee:0xe6,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+LSR A                     ::             :: 0x4a
+LSR                       ::             :: 0x4a
+LSR <!v,X                 :: v>0xff;2    :: 0x56,v
+LSR >!v,X                 ::             :: 0x5e,@@[2,*(v,%%)]
+LSR !v,X                  ::             :: (v>0xff)?0x5e:0x56,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+LSR <!v                   :: v>0xff;2    :: 0x46,v
+LSR >!v                   ::             :: 0x4e,@@[2,*(v,%%)]
+LSR !v                    ::             :: (v>0xff)?0x4e:0x46,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+ROL A                     ::             :: 0x2a
+ROL                       ::             :: 0x2a
+ROL <!v,X                 :: v>0xff;2    :: 0x36,v
+ROL >!v,X                 ::             :: 0x3e,@@[2,*(v,%%)]
+ROL !v,X                  ::             :: (v>0xff)?0x3e:0x36,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+ROL <!v                   :: v>0xff;2    :: 0x26,v
+ROL >!v                   ::             :: 0x2e,@@[2,*(v,%%)]
+ROL !v                    ::             :: (v>0xff)?0x2e:0x26,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+ROR A                     ::             :: 0x6a
+ROR                       ::             :: 0x6a
+ROR <!v,X                 :: v>0xff;2    :: 0x76,v
+ROR >!v,X                 ::             :: 0x7e,@@[2,*(v,%%)]
+ROR !v,X                  ::             :: (v>0xff)?0x7e:0x76,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+ROR <!v                   :: v>0xff;2    :: 0x66,v
+ROR >!v                   ::             :: 0x6e,@@[2,*(v,%%)]
+ROR !v                    ::             :: (v>0xff)?0x6e:0x66,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+
+/* ---------- accumulator group (8 addressing modes) ---------- */
+ADC #!v                   :: v>0xff;3    :: 0x69,v
+ADC (!v,X)                :: v>0xff;2    :: 0x61,v
+ADC (!v),Y                :: v>0xff;2    :: 0x71,v
+ADC <!v,X                 :: v>0xff;2    :: 0x75,v
+ADC >!v,X                 ::             :: 0x7d,@@[2,*(v,%%)]
+ADC !v,X                  ::             :: (v>0xff)?0x7d:0x75,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+ADC !v,Y                  ::             :: 0x79,@@[2,*(v,%%)]
+ADC <!v                   :: v>0xff;2    :: 0x65,v
+ADC >!v                   ::             :: 0x6d,@@[2,*(v,%%)]
+ADC !v                    ::             :: (v>0xff)?0x6d:0x65,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+AND #!v                   :: v>0xff;3    :: 0x29,v
+AND (!v,X)                :: v>0xff;2    :: 0x21,v
+AND (!v),Y                :: v>0xff;2    :: 0x31,v
+AND <!v,X                 :: v>0xff;2    :: 0x35,v
+AND >!v,X                 ::             :: 0x3d,@@[2,*(v,%%)]
+AND !v,X                  ::             :: (v>0xff)?0x3d:0x35,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+AND !v,Y                  ::             :: 0x39,@@[2,*(v,%%)]
+AND <!v                   :: v>0xff;2    :: 0x25,v
+AND >!v                   ::             :: 0x2d,@@[2,*(v,%%)]
+AND !v                    ::             :: (v>0xff)?0x2d:0x25,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+CMP #!v                   :: v>0xff;3    :: 0xc9,v
+CMP (!v,X)                :: v>0xff;2    :: 0xc1,v
+CMP (!v),Y                :: v>0xff;2    :: 0xd1,v
+CMP <!v,X                 :: v>0xff;2    :: 0xd5,v
+CMP >!v,X                 ::             :: 0xdd,@@[2,*(v,%%)]
+CMP !v,X                  ::             :: (v>0xff)?0xdd:0xd5,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+CMP !v,Y                  ::             :: 0xd9,@@[2,*(v,%%)]
+CMP <!v                   :: v>0xff;2    :: 0xc5,v
+CMP >!v                   ::             :: 0xcd,@@[2,*(v,%%)]
+CMP !v                    ::             :: (v>0xff)?0xcd:0xc5,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+EOR #!v                   :: v>0xff;3    :: 0x49,v
+EOR (!v,X)                :: v>0xff;2    :: 0x41,v
+EOR (!v),Y                :: v>0xff;2    :: 0x51,v
+EOR <!v,X                 :: v>0xff;2    :: 0x55,v
+EOR >!v,X                 ::             :: 0x5d,@@[2,*(v,%%)]
+EOR !v,X                  ::             :: (v>0xff)?0x5d:0x55,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+EOR !v,Y                  ::             :: 0x59,@@[2,*(v,%%)]
+EOR <!v                   :: v>0xff;2    :: 0x45,v
+EOR >!v                   ::             :: 0x4d,@@[2,*(v,%%)]
+EOR !v                    ::             :: (v>0xff)?0x4d:0x45,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+LDA #!v                   :: v>0xff;3    :: 0xa9,v
+LDA (!v,X)                :: v>0xff;2    :: 0xa1,v
+LDA (!v),Y                :: v>0xff;2    :: 0xb1,v
+LDA <!v,X                 :: v>0xff;2    :: 0xb5,v
+LDA >!v,X                 ::             :: 0xbd,@@[2,*(v,%%)]
+LDA !v,X                  ::             :: (v>0xff)?0xbd:0xb5,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+LDA !v,Y                  ::             :: 0xb9,@@[2,*(v,%%)]
+LDA <!v                   :: v>0xff;2    :: 0xa5,v
+LDA >!v                   ::             :: 0xad,@@[2,*(v,%%)]
+LDA !v                    ::             :: (v>0xff)?0xad:0xa5,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+ORA #!v                   :: v>0xff;3    :: 0x09,v
+ORA (!v,X)                :: v>0xff;2    :: 0x01,v
+ORA (!v),Y                :: v>0xff;2    :: 0x11,v
+ORA <!v,X                 :: v>0xff;2    :: 0x15,v
+ORA >!v,X                 ::             :: 0x1d,@@[2,*(v,%%)]
+ORA !v,X                  ::             :: (v>0xff)?0x1d:0x15,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+ORA !v,Y                  ::             :: 0x19,@@[2,*(v,%%)]
+ORA <!v                   :: v>0xff;2    :: 0x05,v
+ORA >!v                   ::             :: 0x0d,@@[2,*(v,%%)]
+ORA !v                    ::             :: (v>0xff)?0x0d:0x05,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+SBC #!v                   :: v>0xff;3    :: 0xe9,v
+SBC (!v,X)                :: v>0xff;2    :: 0xe1,v
+SBC (!v),Y                :: v>0xff;2    :: 0xf1,v
+SBC <!v,X                 :: v>0xff;2    :: 0xf5,v
+SBC >!v,X                 ::             :: 0xfd,@@[2,*(v,%%)]
+SBC !v,X                  ::             :: (v>0xff)?0xfd:0xf5,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+SBC !v,Y                  ::             :: 0xf9,@@[2,*(v,%%)]
+SBC <!v                   :: v>0xff;2    :: 0xe5,v
+SBC >!v                   ::             :: 0xed,@@[2,*(v,%%)]
+SBC !v                    ::             :: (v>0xff)?0xed:0xe5,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+STA (!v,X)                :: v>0xff;2    :: 0x81,v
+STA (!v),Y                :: v>0xff;2    :: 0x91,v
+STA <!v,X                 :: v>0xff;2    :: 0x95,v
+STA >!v,X                 ::             :: 0x9d,@@[2,*(v,%%)]
+STA !v,X                  ::             :: (v>0xff)?0x9d:0x95,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+STA !v,Y                  ::             :: 0x99,@@[2,*(v,%%)]
+STA <!v                   :: v>0xff;2    :: 0x85,v
+STA >!v                   ::             :: 0x8d,@@[2,*(v,%%)]
+STA !v                    ::             :: (v>0xff)?0x8d:0x85,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+
+/* ---------- index registers, compares, BIT, jumps ---------- */
+BIT <!v                   :: v>0xff;2    :: 0x24,v
+BIT >!v                   ::             :: 0x2c,@@[2,*(v,%%)]
+BIT !v                    ::             :: (v>0xff)?0x2c:0x24,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+CPX #!v                   :: v>0xff;3    :: 0xe0,v
+CPX <!v                   :: v>0xff;2    :: 0xe4,v
+CPX >!v                   ::             :: 0xec,@@[2,*(v,%%)]
+CPX !v                    ::             :: (v>0xff)?0xec:0xe4,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+CPY #!v                   :: v>0xff;3    :: 0xc0,v
+CPY <!v                   :: v>0xff;2    :: 0xc4,v
+CPY >!v                   ::             :: 0xcc,@@[2,*(v,%%)]
+CPY !v                    ::             :: (v>0xff)?0xcc:0xc4,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+JMP (!v)                  ::             :: 0x6c,@@[2,*(v,%%)]
+JMP !v                    ::             :: 0x4c,@@[2,*(v,%%)]
+JSR !v                    ::             :: 0x20,@@[2,*(v,%%)]
+LDX #!v                   :: v>0xff;3    :: 0xa2,v
+LDX <!v,Y                 :: v>0xff;2    :: 0xb6,v
+LDX >!v,Y                 ::             :: 0xbe,@@[2,*(v,%%)]
+LDX !v,Y                  ::             :: (v>0xff)?0xbe:0xb6,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+LDX <!v                   :: v>0xff;2    :: 0xa6,v
+LDX >!v                   ::             :: 0xae,@@[2,*(v,%%)]
+LDX !v                    ::             :: (v>0xff)?0xae:0xa6,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+LDY #!v                   :: v>0xff;3    :: 0xa0,v
+LDY <!v,X                 :: v>0xff;2    :: 0xb4,v
+LDY >!v,X                 ::             :: 0xbc,@@[2,*(v,%%)]
+LDY !v,X                  ::             :: (v>0xff)?0xbc:0xb4,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+LDY <!v                   :: v>0xff;2    :: 0xa4,v
+LDY >!v                   ::             :: 0xac,@@[2,*(v,%%)]
+LDY !v                    ::             :: (v>0xff)?0xac:0xa4,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+STX !v,Y                  :: v>0xff;2    :: 0x96,v
+STX <!v                   :: v>0xff;2    :: 0x86,v
+STX >!v                   ::             :: 0x8e,@@[2,*(v,%%)]
+STX !v                    ::             :: (v>0xff)?0x8e:0x86,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+STY !v,X                  :: v>0xff;2    :: 0x94,v
+STY <!v                   :: v>0xff;2    :: 0x84,v
+STY >!v                   ::             :: 0x8c,@@[2,*(v,%%)]
+STY !v                    ::             :: (v>0xff)?0x8c:0x84,v&0xff,;((v>0xff)?((v>>8)&0xff):0)
+
+/* ---------- relative branches ---------- */
+/* $$ is the location counter at the start of this instruction; the
+/* displacement is measured from the byte after the operand ($$+2). */
+BCC !e                    :: (e-$$-2)>127||(e-$$-2)<-128;2:: 0x90,(e-$$-2)&0xff
+BCS !e                    :: (e-$$-2)>127||(e-$$-2)<-128;2:: 0xb0,(e-$$-2)&0xff
+BEQ !e                    :: (e-$$-2)>127||(e-$$-2)<-128;2:: 0xf0,(e-$$-2)&0xff
+BMI !e                    :: (e-$$-2)>127||(e-$$-2)<-128;2:: 0x30,(e-$$-2)&0xff
+BNE !e                    :: (e-$$-2)>127||(e-$$-2)<-128;2:: 0xd0,(e-$$-2)&0xff
+BPL !e                    :: (e-$$-2)>127||(e-$$-2)<-128;2:: 0x10,(e-$$-2)&0xff
+BVC !e                    :: (e-$$-2)>127||(e-$$-2)<-128;2:: 0x50,(e-$$-2)&0xff
+BVS !e                    :: (e-$$-2)>127||(e-$$-2)<-128;2:: 0x70,(e-$$-2)&0xff
