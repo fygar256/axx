@@ -51,6 +51,37 @@ import uuid
 _RELAXATION_SENTINEL = object()
 
 
+# The assembler instance currently running, published by AssemblerState so
+# that the module-level static helpers below (StringUtils, _is_undef_derived,
+# ...) can reach the same diagnostic funnel every method-level call site uses.
+# Without this they would have to print directly and would silently bypass the
+# _in_match_attempt / should_report_errors() gates -- exactly the leak the
+# funnel exists to make impossible.
+_ACTIVE_STATE = None
+
+
+def diag(text, set_error=True, force=False):
+    """Module-level entry point to AssemblerState.diag().
+
+    Used by the static helpers that hold no `state` reference.  If no
+    assembler is running (unit tests, import-time use) the message is printed
+    unconditionally, since there is no pass or match context to gate on.
+    """
+    st = _ACTIVE_STATE
+    if st is None:
+        print(text, file=sys.stderr)
+        return True
+    return st.diag(text, set_error=set_error, force=force)
+
+
+def diag_error(msg, force=False):
+    return diag(f" error - {msg}", set_error=True, force=force)
+
+
+def diag_warning(msg, force=False):
+    return diag(f" warning - {msg}", set_error=False, force=force)
+
+
 EXP_PAT = 0
 EXP_ASM = 1
 exp_typ = 'i'
@@ -110,9 +141,8 @@ def _is_undef_derived(v):
         av = abs(v)
         if _UNDEF_SANE_CEILING <= av < _UNDEF_DERIVED_THRESHOLD and not _undef_ceiling_warned:
             _undef_ceiling_warned = True
-            print(" warning - a value larger than 2**256 was computed; the UNDEF-sentinel "
-                  "heuristic may misclassify very large legitimate values as undefined.",
-                  file=sys.stderr)
+            diag(" warning - a value larger than 2**256 was computed; the UNDEF-sentinel "
+                 "heuristic may misclassify very large legitimate values as undefined.", set_error=False)
         return av >= _UNDEF_DERIVED_THRESHOLD
     return False
 
@@ -480,6 +510,14 @@ class AssemblerState:
     """
 
     def __init__(self):
+        # Publish this instance so the module-level diag() bridge can reach
+        # the same funnel from the static helpers.
+        global _ACTIVE_STATE
+        _ACTIVE_STATE = self
+
+        # Diagnostics buffered for the candidate pattern currently being
+        # tried; None when not inside a match attempt.
+        self._diag_pending = None
 
         self.outfile = ""
         self.expfile = ""       # -e: plain-text label export path
@@ -581,6 +619,95 @@ class AssemblerState:
         # if the expression silently assumes a fixed relative layout between
         # sections (see AssemblyDirectiveProcessor.label_processing()).
         self._equ_sections_touched = None
+
+    # ---------------------------------------------------------------
+    # Diagnostic funnel
+    # ---------------------------------------------------------------
+    # Every user-facing " error - " / " warning - " message in this file
+    # goes through diag() below.  Both suppression rules live here, and
+    # ONLY here, so that a new call site physically cannot forget one.
+    #
+    # Historical note -- why this exists:
+    #   Each diagnostic used to inline its own guard, and the two guards
+    #   were forgotten independently at different sites.  Three separate
+    #   real bugs came out of that single structural weakness:
+    #     * a single-character lowercase label reference assembled to 0;
+    #     * a malformed "**" / "not(" expression built cleanly;
+    #     * "#"-prefixed immediates (6502, 68000, ARM, MIPS, ...) aborted
+    #       the build, because the *losing* candidate patterns complained
+    #       about a "#" they were never meant to parse -- while the
+    #       winning pattern had already produced correct bytes.
+    #   Centralising the guards turns "remember to write two conditions"
+    #   into "call one method", which is not a class of mistake any more.
+
+    def diag(self, text, set_error=True, force=False):
+        """Emit one diagnostic line, subject to the two global gates.
+
+        text       complete message line, e.g. " error - undefined symbol".
+        set_error  also latch state.had_error, so the run aborts output.
+        force      bypass both gates; for diagnostics raised outside
+                   assembly proper (CLI/usage, pattern-file loading, the
+                   end-of-run summary) which have no pass or match context.
+
+        Gate 1 -- _in_match_attempt.  While the pattern matcher is *trying*
+        candidate patterns, a failure is how matching works, not an error.
+        A candidate that cannot parse the operand must stay silent and let
+        the next one run.
+
+        Gate 2 -- should_report_errors().  Outside interactive mode and the
+        final Pass 2, an "undefined label" is usually just not-resolved-YET
+        during relaxation, so reporting it would be a false alarm.
+
+        Returns True if the line was actually printed.
+        """
+        if not force:
+            if self._in_match_attempt:
+                # DEFER, don't discard.  A candidate pattern's diagnostics are
+                # only meaningful if that candidate ends up winning: the loser
+                # that could not parse a "#" immediate must stay silent, but
+                # the winner that hit a real "Division by 0" must still be
+                # reported -- and for a `!x`-captured operand the expression is
+                # evaluated *only* during the trial, so simply dropping the
+                # message would lose the error for good.  The match loop keeps
+                # the winning candidate's buffer and replays it.
+                if self._diag_pending is not None:
+                    self._diag_pending.append((text, set_error))
+                return False
+            if not self.should_report_errors():
+                return False
+        print(text, file=sys.stderr)
+        if set_error:
+            self.had_error = True
+        return True
+
+    def diag_capture_begin(self):
+        """Start buffering diagnostics raised by one candidate pattern."""
+        self._diag_pending = []
+
+    def diag_capture_take(self):
+        """Stop buffering and hand back this candidate's diagnostics."""
+        out = self._diag_pending if self._diag_pending is not None else []
+        self._diag_pending = None
+        return out
+
+    def diag_replay(self, items):
+        """Emit the winning candidate's buffered diagnostics, under the
+        ordinary should_report_errors() gate."""
+        for text, set_error in items:
+            if self.should_report_errors():
+                print(text, file=sys.stderr)
+                if set_error:
+                    self.had_error = True
+
+    def diag_error(self, msg, force=False):
+        """Preferred entry point for new code: prefixes " error - " and
+        latches had_error."""
+        return self.diag(f" error - {msg}", set_error=True, force=force)
+
+    def diag_warning(self, msg, force=False):
+        """Preferred entry point for new code: prefixes " warning - " and
+        does NOT latch had_error."""
+        return self.diag(f" warning - {msg}", set_error=False, force=force)
 
     def should_report_errors(self):
         """Whether user-facing errors should be printed right now: only in
@@ -776,7 +903,7 @@ class StringUtils:
             out.append(ch)
             i += 1
         if in_dquote:
-            print(f" warning - unterminated string literal in line: {l!r}", file=sys.stderr)
+            diag(f" warning - unterminated string literal in line: {l!r}", set_error=False)
         return ''.join(out).rstrip()
 
     @staticmethod
@@ -913,8 +1040,8 @@ class StringUtils:
                         hex_str += l2[idx]
                         idx += 1
                     if idx < len(l2) and l2[idx] in '0123456789abcdefABCDEF':
-                        print(f" warning - '\\x' escape takes at most 2 hex digits; "
-                              f"extra digit(s) treated as literal characters in: {l2!r}", file=sys.stderr)
+                        diag(f" warning - '\\x' escape takes at most 2 hex digits; "
+                             f"extra digit(s) treated as literal characters in: {l2!r}", set_error=False)
                     if hex_str:
                         s += chr(int(hex_str, 16))
                     else:
@@ -931,11 +1058,11 @@ class StringUtils:
                         try:
                             s += chr(int(hex_str, 16))
                         except (ValueError, OverflowError):
-                            print(f" warning - invalid \\{next_char} escape in: {l2!r}", file=sys.stderr)
+                            diag(f" warning - invalid \\{next_char} escape in: {l2!r}", set_error=False)
                             s += next_char
                     else:
-                        print(f" warning - '\\{next_char}' escape requires {_ndigits} hex digits; "
-                              f"treated as literal characters in: {l2!r}", file=sys.stderr)
+                        diag(f" warning - '\\{next_char}' escape requires {_ndigits} hex digits; "
+                             f"treated as literal characters in: {l2!r}", set_error=False)
                         s += next_char + hex_str
                 else:
                     s += next_char
@@ -945,7 +1072,7 @@ class StringUtils:
             else:
                 s += l2[idx]
                 idx += 1
-        print(f" warning - unterminated string literal: {l2!r}", file=sys.stderr)
+        diag(f" warning - unterminated string literal: {l2!r}", set_error=False)
         return s
 
 
@@ -1033,9 +1160,7 @@ class Parser:
                 # malformed "qad{"/"dbl{"/"flt{"/"enflt{"/"endbl{" body
                 # missing its closing '}' silently produced a 0 with a
                 # "successful" build.
-                if self.state.should_report_errors():
-                    print(f" error - missing closing '}}' in expression: '{{{t}'", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(f" error - missing closing '}}' in expression: '{{{t}'", set_error=True)
                 return False, '', len(s)
             idx += 1
             f = True
@@ -1527,8 +1652,8 @@ class LabelManager:
             if not self.state._in_match_attempt and (self.state.should_report_errors()):
                 _fn = self.state.current_file or ""
                 _ln = self.state.ln
-                print(f" error - Label undefined: '{k}'"
-                      f"  [{_fn}:{_ln}]", file=sys.stderr)
+                self.state.diag(f" error - Label undefined: '{k}'"
+                     f"  [{_fn}:{_ln}]", set_error=False)
             return v
         _sec = self.state.labels[k][1]
         if self.state._equ_sections_touched is not None:
@@ -1594,20 +1719,18 @@ class LabelManager:
                     # the same duplicate -- cosmetic stderr noise, not a
                     # correctness bug (had_error is already set once,
                     # correctly aborting the build either way).
-                    print(" error - label already defined.", file=sys.stderr)
+                    self.state.diag(" error - label already defined.", set_error=False)
                     return False
         elif self.state.pas == 2:
             if k not in self.state.labels:
                 self.state.error_label_conflict = True
                 self.state.had_error = True
-                if self.state.should_report_errors():
-                    print(f" error - label '{k}' not defined in pass 1.", file=sys.stderr)
+                self.state.diag(f" error - label '{k}' not defined in pass 1.", set_error=False)
                 return False
 
         if k in self.state.patsymbols:
             self.state.had_error = True
-            if self.state.should_report_errors():
-                print(f" error - '{k}' is a pattern file symbol.", file=sys.stderr)
+            self.state.diag(f" error - '{k}' is a pattern file symbol.", set_error=False)
             return False
 
         self.state.error_label_conflict = False
@@ -1714,33 +1837,25 @@ class ExpressionEvaluator:
             try:
                 x, idx = self.factor(s, idx + 1)
             except RecursionError:
-                if self.state.should_report_errors():
-                    print(" error - expression nesting too deep (RecursionError) in unary '-'.", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(" error - expression nesting too deep (RecursionError) in unary '-'.", set_error=True)
                 return 0, idx
             x = -x
         elif idx < len(s) and s[idx] == '~':
             try:
                 x, idx = self.factor(s, idx + 1)
             except RecursionError:
-                if self.state.should_report_errors():
-                    print(" error - expression nesting too deep (RecursionError) in unary '~'.", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(" error - expression nesting too deep (RecursionError) in unary '~'.", set_error=True)
                 return 0, idx
             try:
                 x = ~int(x)
             except (OverflowError, ValueError):
-                if self.state.should_report_errors():
-                    print(" error - cannot apply bitwise NOT (~) to non-finite float value.", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(" error - cannot apply bitwise NOT (~) to non-finite float value.", set_error=True)
                 x = 0
         elif idx < len(s) and s[idx] == '@':
             try:
                 x, idx = self.factor(s, idx + 1)
             except RecursionError:
-                if self.state.should_report_errors():
-                    print(" error - expression nesting too deep (RecursionError) in unary '@'.", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(" error - expression nesting too deep (RecursionError) in unary '@'.", set_error=True)
                 return 0, idx
             x = self.nbit(x)
         elif idx < len(s) and s[idx] == '*':
@@ -1757,15 +1872,11 @@ class ExpressionEvaluator:
                         try:
                             shift_amount = int(x2) * 8
                         except (OverflowError, ValueError):
-                            if self.state.should_report_errors():
-                                print(" error - non-finite byte-extract offset in *(expr, expr).", file=sys.stderr)
-                                self.state.had_error = True
+                            self.state.diag(" error - non-finite byte-extract offset in *(expr, expr).", set_error=True)
                             x = 0
                         else:
                             if shift_amount < 0:
-                                if self.state.should_report_errors():
-                                    print(" error - negative byte-extract offset in *(expr, expr).", file=sys.stderr)
-                                    self.state.had_error = True
+                                self.state.diag(" error - negative byte-extract offset in *(expr, expr).", set_error=True)
                                 x = 0
                             else:
                                 x = x >> shift_amount
@@ -1779,19 +1890,13 @@ class ExpressionEvaluator:
                         # had_error, so a malformed *(...) silently left a
                         # 0 baked into the object file with a "successful"
                         # build.
-                        if self.state.should_report_errors():
-                            print(" error - missing ')' in *(expr, expr) expression.", file=sys.stderr)
-                            self.state.had_error = True
+                        self.state.diag(" error - missing ')' in *(expr, expr) expression.", set_error=True)
                         x = 0
                 else:
-                    if self.state.should_report_errors():
-                        print(" error - missing ',' in *(expr, expr) expression.", file=sys.stderr)
-                        self.state.had_error = True
+                    self.state.diag(" error - missing ',' in *(expr, expr) expression.", set_error=True)
                     x = 0
             else:
-                if self.state.should_report_errors():
-                    print(" error - expected '(' after '*' in *(expr,expr) expression.", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(" error - expected '(' after '*' in *(expr,expr) expression.", set_error=True)
         else:
             prev_idx = idx
             x, idx = self.factor1(s, idx)
@@ -1800,8 +1905,8 @@ class ExpressionEvaluator:
                     and s[idx] not in (chr(0), ',', ')', ']', CB, ' ', '\t')
                     and not self.state._in_match_attempt
                     and (self.state.should_report_errors())):
-                print(f" warning - unrecognized token at position {idx} in expression: "
-                      f"{s[idx:idx + 8]!r} (treated as 0)", file=sys.stderr)
+                self.state.diag(f" warning - unrecognized token at position {idx} in expression: "
+                     f"{s[idx:idx + 8]!r} (treated as 0)", set_error=False)
         idx = StringUtils.skipspc(s, idx)
         return x, idx
 
@@ -2013,9 +2118,7 @@ class ExpressionEvaluator:
                 # had_error -- a malformed "(...)" grouping anywhere in
                 # any expression silently produced a 0 with a "successful"
                 # build.
-                if self.state.should_report_errors():
-                    print(" error - missing closing ')' in expression.", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(" error - missing closing ')' in expression.", set_error=True)
         elif idx + 4 <= len(s) and s[idx:idx + 4] == "'\\t'":
             x = 0x09
             idx += 4
@@ -2073,9 +2176,7 @@ class ExpressionEvaluator:
             t, idx = self.parser.get_symbol_word(s, idx)
             _sym_val = self.symbol_manager.get(t)
             if _sym_val == "":
-                if self.state.should_report_errors():
-                    print(f" error - undefined symbol: '#{t}'", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(f" error - undefined symbol: '#{t}'", set_error=True)
                 x = 0
             else:
                 x = _sym_val
@@ -2105,9 +2206,7 @@ class ExpressionEvaluator:
                             v = self.xeval(t, None)
                         except (ValueError, TypeError, OverflowError, ZeroDivisionError):
 
-                            if self.state.should_report_errors():
-                                print(f" error - qad{{}}: cannot evaluate expression '{t}'; using 0.", file=sys.stderr)
-                                self.state.had_error = True
+                            self.state.diag(f" error - qad{{}}: cannot evaluate expression '{t}'; using 0.", set_error=True)
                             h = '0' * 32
                         else:
                             if isinstance(v, int) or (
@@ -2134,9 +2233,7 @@ class ExpressionEvaluator:
                         v = float(self.xeval(t, None))
                         x = int.from_bytes(struct.pack('>d', v), "big")
                     except (OverflowError, ValueError, TypeError, struct.error, ZeroDivisionError):
-                        if self.state.should_report_errors():
-                            print(" error - dbl{}: cannot convert expression to float64; using 0.", file=sys.stderr)
-                            self.state.had_error = True
+                        self.state.diag(" error - dbl{}: cannot convert expression to float64; using 0.", set_error=True)
                         x = 0
         elif (idx + 3 <= len(s) and s[idx:idx + 3] == 'flt'
               and (lambda _j=StringUtils.skipspc(s, idx + 3): _j < len(s) and s[_j] == '{')()):
@@ -2154,9 +2251,7 @@ class ExpressionEvaluator:
                         v = float(self.xeval(t, None))
                         x = int.from_bytes(struct.pack('>f', v), "big")
                     except (OverflowError, ValueError, TypeError, struct.error, ZeroDivisionError):
-                        if self.state.should_report_errors():
-                            print(" error - flt{}: cannot convert expression to float32; using 0.", file=sys.stderr)
-                            self.state.had_error = True
+                        self.state.diag(" error - flt{}: cannot convert expression to float32; using 0.", set_error=True)
                         x = 0
         elif (idx + 5 <= len(s) and s[idx:idx + 5] == 'enflt'
               and (lambda _j=StringUtils.skipspc(s, idx + 5): _j < len(s) and s[_j] == '{')()):
@@ -2169,17 +2264,13 @@ class ExpressionEvaluator:
                 _inner_undef = self.state.error_undefined_label
                 self.state.error_undefined_label = _outer_undef or _inner_undef
                 if _inner_undef:
-                    if self.state.should_report_errors():
-                        print(" error - enflt{}: expression contains undefined label.", file=sys.stderr)
-                        self.state.had_error = True
+                    self.state.diag(" error - enflt{}: expression contains undefined label.", set_error=True)
                     x = enflt(0)
                 else:
                     try:
                         x = enflt(int(v) & 0xFFFFFFFF)
                     except (OverflowError, ValueError):
-                        if self.state.should_report_errors():
-                            print(" error - enflt{}: non-finite float value; using 0.", file=sys.stderr)
-                            self.state.had_error = True
+                        self.state.diag(" error - enflt{}: non-finite float value; using 0.", set_error=True)
                         x = enflt(0)
         elif (idx + 5 <= len(s) and s[idx:idx + 5] == 'endbl'
               and (lambda _j=StringUtils.skipspc(s, idx + 5): _j < len(s) and s[_j] == '{')()):
@@ -2192,17 +2283,13 @@ class ExpressionEvaluator:
                 _inner_undef = self.state.error_undefined_label
                 self.state.error_undefined_label = _outer_undef or _inner_undef
                 if _inner_undef:
-                    if self.state.should_report_errors():
-                        print(" error - endbl{}: expression contains undefined label.", file=sys.stderr)
-                        self.state.had_error = True
+                    self.state.diag(" error - endbl{}: expression contains undefined label.", set_error=True)
                     x = endbl(0)
                 else:
                     try:
                         x = endbl(int(v) & 0xFFFFFFFFFFFFFFFF)
                     except (OverflowError, ValueError):
-                        if self.state.should_report_errors():
-                            print(" error - endbl{}: non-finite float value; using 0.", file=sys.stderr)
-                            self.state.had_error = True
+                        self.state.diag(" error - endbl{}: non-finite float value; using 0.", set_error=True)
                         x = endbl(0)
         elif idx + 4 <= len(s) and s[idx:idx + 4] == 'not(':
             # not(expr): logical negation, written as a call-like form rather
@@ -2228,9 +2315,7 @@ class ExpressionEvaluator:
                 # gate, unlike every other diagnostic here) and no
                 # had_error -- a malformed "not(..." grouping silently
                 # produced a "successful" build.
-                if self.state.should_report_errors():
-                    print(" error - missing closing ')' in not(...) expression.", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(" error - missing closing ')' in not(...) expression.", set_error=True)
             x = 0 if x else 1
         elif self.state.exp_typ == 'i' and idx < len(s) and s[idx].isdigit():
                 fs, idx = self.parser.get_intstr(s, idx)
@@ -2264,8 +2349,8 @@ class ExpressionEvaluator:
                         and (self.state.should_report_errors())
                         and _is_undef_derived(x)):
                     self.state.error_undefined_label = True
-                    print(f" error - Label undefined: variable '{ch}' contains undefined value"
-                          f"  [{self.state.current_file}:{self.state.ln}]", file=sys.stderr)
+                    self.state.diag(f" error - Label undefined: variable '{ch}' contains undefined value"
+                         f"  [{self.state.current_file}:{self.state.ln}]", set_error=False)
                 if (self.state._elf_tracking
                         and self.state._elf_current_word_idx >= 0):
                     entry = self.state._elf_var_to_label.get(ch)
@@ -2305,15 +2390,11 @@ class ExpressionEvaluator:
             # never set had_error -- so a malformed "**" expression silently
             # evaluated to 0 with a clean, successful build.
             if t_int < 0:
-                if self.state.should_report_errors():
-                    print(" error - Negative exponent in ** expression; result set to 0.", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(" error - Negative exponent in ** expression; result set to 0.", set_error=True)
                 x = 0
                 break
             if t_int > _EXP_MAX:
-                if self.state.should_report_errors():
-                    print(f" error - Exponent {t_int} exceeds maximum {_EXP_MAX} in ** expression; result set to 0.", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(f" error - Exponent {t_int} exceeds maximum {_EXP_MAX} in ** expression; result set to 0.", set_error=True)
                 x = 0
                 break
 
@@ -2322,18 +2403,14 @@ class ExpressionEvaluator:
             except (TypeError, ValueError, OverflowError):
                 _base_bits = 1024
             if _base_bits * max(t_int, 1) > _EXP_RESULT_MAX_BITS:
-                if self.state.should_report_errors():
-                    print(f" error - ** result would exceed {_EXP_RESULT_MAX_BITS} bits "
-                          f"(chained exponentiation); result set to 0.", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(f" error - ** result would exceed {_EXP_RESULT_MAX_BITS} bits "
+                         f"(chained exponentiation); result set to 0.", set_error=True)
                 x = 0
                 break
             try:
                 x = x ** t_int
             except OverflowError:
-                if self.state.should_report_errors():
-                    print(" error - ** result is too large to represent as a float; result set to 0.", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(" error - ** result is too large to represent as a float; result set to 0.", set_error=True)
                 x = 0
                 break
             if isinstance(x, float) and x.is_integer():
@@ -2358,9 +2435,7 @@ class ExpressionEvaluator:
                     # no had_error, so a division-by-zero in an ordinary
                     # instruction operand silently produced a plausible-
                     # looking 0 with a build that still reported success.
-                    if self.state.should_report_errors():
-                        print(" error - Division by 0 error.", file=sys.stderr)
-                        self.state.had_error = True
+                    self.state.diag(" error - Division by 0 error.", set_error=True)
                     x = 0
                     break
                 else:
@@ -2368,9 +2443,7 @@ class ExpressionEvaluator:
             elif s[idx] == '/':
                 t, idx = self.term0_0(s, idx + 1)
                 if t == 0:
-                    if self.state.should_report_errors():
-                        print(" error - Division by 0 error.", file=sys.stderr)
-                        self.state.had_error = True
+                    self.state.diag(" error - Division by 0 error.", set_error=True)
                     x = 0
                     break
                 else:
@@ -2382,18 +2455,16 @@ class ExpressionEvaluator:
 
                             if ((abs(x) >= (1 << 53) or abs(t) >= (1 << 53))
                                     and self.state.should_report_errors()):
-                                print(f" warning - dividing large integers ({x} / {t}) that do "
-                                      f"not divide evenly loses precision when converted to a "
-                                      f"float; result may not be exact.", file=sys.stderr)
+                                self.state.diag(f" warning - dividing large integers ({x} / {t}) that do "
+                                     f"not divide evenly loses precision when converted to a "
+                                     f"float; result may not be exact.", set_error=False)
                             x = x / t
                     else:
                         x = x / t
             elif s[idx] == '%':
                 t, idx = self.term0_0(s, idx + 1)
                 if t == 0:
-                    if self.state.should_report_errors():
-                        print(" error - Division by 0 error.", file=sys.stderr)
-                        self.state.had_error = True
+                    self.state.diag(" error - Division by 0 error.", set_error=True)
                     x = 0
                     break
                 else:
@@ -2432,15 +2503,11 @@ class ExpressionEvaluator:
                     x = 0
                     break
                 if t < 0:
-                    if self.state.should_report_errors():
-                        print(f" error - negative shift count ({t}) in << expression.", file=sys.stderr)
-                        self.state.had_error = True
+                    self.state.diag(f" error - negative shift count ({t}) in << expression.", set_error=True)
                     x = 0
                     break
                 if t > _SHIFT_MAX:
-                    if self.state.should_report_errors():
-                        print(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in << expression.", file=sys.stderr)
-                        self.state.had_error = True
+                    self.state.diag(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in << expression.", set_error=True)
                     x = 0
                     break
                 x <<= t
@@ -2453,9 +2520,7 @@ class ExpressionEvaluator:
                     x = 0
                     break
                 if t < 0:
-                    if self.state.should_report_errors():
-                        print(f" error - negative shift count ({t}) in >> expression.", file=sys.stderr)
-                        self.state.had_error = True
+                    self.state.diag(f" error - negative shift count ({t}) in >> expression.", set_error=True)
                     x = 0
                     break
                 if t > _SHIFT_MAX:
@@ -2464,9 +2529,7 @@ class ExpressionEvaluator:
                     # above, which at least printed a message) -- an
                     # oversized right-shift produced a plausible-looking 0
                     # with a clean build and exit code 0.
-                    if self.state.should_report_errors():
-                        print(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in >> expression.", file=sys.stderr)
-                        self.state.had_error = True
+                    self.state.diag(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in >> expression.", set_error=True)
                     x = 0
                     break
                 x >>= t
@@ -2479,7 +2542,7 @@ class ExpressionEvaluator:
             return int(v)
         except (OverflowError, ValueError):
             if self.state.should_report_errors():
-                print(f" error - non-finite value {v!r} in bitwise '{op_name}' operation; treated as 0.", file=sys.stderr)
+                self.state.diag(f" error - non-finite value {v!r} in bitwise '{op_name}' operation; treated as 0.", set_error=False)
                 # Bugfix: this correctly-formatted, correctly-gated error
                 # print never set had_error, so a non-finite operand
                 # reaching &/|/^ silently became 0 with a clean, successful
@@ -2541,8 +2604,7 @@ class ExpressionEvaluator:
                 # Still just a warning (deliberately zeroes the result,
                 # like other precision-loss warnings elsewhere), so
                 # had_error is intentionally NOT set here.
-                if self.state.should_report_errors():
-                    print(f" warning - sign-extension bit width {t} exceeds maximum {_SEXT_MAX_BITS}, result set to 0.", file=sys.stderr)
+                self.state.diag(f" warning - sign-extension bit width {t} exceeds maximum {_SEXT_MAX_BITS}, result set to 0.", set_error=False)
                 x = 0
             else:
                 x = (x & ~((~0) << t)) | ((~0) << t if (x >> (t - 1) & 1) else 0)
@@ -2677,9 +2739,7 @@ class ExpressionEvaluator:
             x, idx0 = self.term11(s, idx0)
             return x, idx0
         except RecursionError:
-            if self.state.should_report_errors():
-                print(" error - expression nesting too deep (RecursionError).",
-                      file=sys.stderr)
+            self.state.diag(" error - expression nesting too deep (RecursionError).", set_error=False)
             return 0, idx
 
     def _terminate(self, s):
@@ -2785,8 +2845,8 @@ class BinaryWriter:
             return
 
         if self.state.bts <= 0:
-            print(f" warning - flush: bts={self.state.bts} is invalid (<=0); "
-                  f"output file '{self.state.outfile}' will be empty.", file=sys.stderr)
+            self.state.diag(f" warning - flush: bts={self.state.bts} is invalid (<=0); "
+                 f"output file '{self.state.outfile}' will be empty.", set_error=False)
             return
 
         valid_buffer = {k: v for k, v in self._buffer.items() if k >= 0}
@@ -2805,9 +2865,9 @@ class BinaryWriter:
 
         _MAX_OUTPUT_BYTES = 1 << 30
         if total_size > _MAX_OUTPUT_BYTES:
-            print(f" error - output size {total_size} bytes exceeds maximum {_MAX_OUTPUT_BYTES}. "
-                  f"Check for incorrect .ORG or address values.",
-                  file=__import__('sys').stderr)
+            self.state.diag(f" error - output size {total_size} bytes exceeds maximum "
+                            f"{_MAX_OUTPUT_BYTES}. Check for incorrect .ORG or address "
+                            f"values.", set_error=False, force=True)
             return
 
         pad_val = int(self.state.padding) & ((1 << word_bits) - 1)
@@ -2864,8 +2924,7 @@ class BinaryWriter:
             try:
                 self.fwrite(a, int(x), 0)
             except (OverflowError, ValueError):
-                if self.state.should_report_errors():
-                    print(f" error - non-finite value {x!r} cannot be written as binary word.", file=sys.stderr)
+                self.state.diag(f" error - non-finite value {x!r} cannot be written as binary word.", set_error=False)
 
     def outbin(self, a, x):
         """Write a word, echoing it in hex only when that's actually
@@ -2876,8 +2935,7 @@ class BinaryWriter:
             try:
                 self.fwrite(a, int(x), _prt)
             except (OverflowError, ValueError):
-                if self.state.should_report_errors():
-                    print(f" error - non-finite value {x!r} cannot be written as binary word.", file=sys.stderr)
+                self.state.diag(f" error - non-finite value {x!r} cannot be written as binary word.", set_error=False)
 
     def align_(self, addr):
         """Round addr up to the next multiple of state.align (no-op if
@@ -2952,8 +3010,7 @@ class DirectiveProcessor:
             key = StringUtils.upper(i[2])
             value_field = ''
         else:
-            print(" error - .setsym directive requires at least a symbol name", file=sys.stderr)
-            self.state.had_error = True
+            self.state.diag(" error - .setsym directive requires at least a symbol name", set_error=True)
             return False
 
         if value_field:
@@ -2983,8 +3040,7 @@ class DirectiveProcessor:
             try:
                 self.state.bts = int(v)
             except (OverflowError, ValueError):
-                print(" error - .bits: non-finite bit width value.", file=sys.stderr)
-                self.state.had_error = True
+                self.state.diag(" error - .bits: non-finite bit width value.", set_error=True)
         return True
 
     def paddingp(self, i):
@@ -3001,8 +3057,7 @@ class DirectiveProcessor:
         try:
             self.state.padding = int(v)
         except (OverflowError, ValueError):
-            print(" error - .padding: non-finite or invalid value; padding unchanged.", file=sys.stderr)
-            self.state.had_error = True
+            self.state.diag(" error - .padding: non-finite or invalid value; padding unchanged.", set_error=True)
         return True
 
     def symbolc(self, i):
@@ -3022,7 +3077,7 @@ class DirectiveProcessor:
             return False
 
         if len(i) < 5:
-            print(f" error - .vliw directive requires 4 parameters (vliwbits, vliwinstbits, vliwtemplatebits, nop_value), got {len(i) - 1}", file=sys.stderr)
+            self.state.diag(f" error - .vliw directive requires 4 parameters (vliwbits, vliwinstbits, vliwtemplatebits, nop_value), got {len(i) - 1}", set_error=False)
             return False
 
         v1, idx = self.expr_eval.expression_pat(i[1], 0)
@@ -3035,8 +3090,7 @@ class DirectiveProcessor:
             self.state.vliwinstbits    = int(v2)
             self.state.vliwtemplatebits = int(v3)
         except (OverflowError, ValueError):
-            print(" error - .vliw: non-finite parameter value.", file=sys.stderr)
-            self.state.had_error = True
+            self.state.diag(" error - .vliw: non-finite parameter value.", set_error=True)
             # Bugfix: this directive line (i[0] == '.vliw') was already
             # claimed above; returning False here (instead of True, like
             # every other directive's error path) told the caller's dispatch
@@ -3048,9 +3102,8 @@ class DirectiveProcessor:
 
         _VLIW_INSTBITS_MAX = 8192
         if not (0 <= self.state.vliwinstbits <= _VLIW_INSTBITS_MAX):
-            print(f" error - .vliw: vliwinstbits {self.state.vliwinstbits} is out of range "
-                  f"(must be 0-{_VLIW_INSTBITS_MAX}).", file=sys.stderr)
-            self.state.had_error = True
+            self.state.diag(f" error - .vliw: vliwinstbits {self.state.vliwinstbits} is out of range "
+                 f"(must be 0-{_VLIW_INSTBITS_MAX}).", set_error=True)
             return True
 
         self.state.vliwflag = True
@@ -3074,8 +3127,7 @@ class DirectiveProcessor:
             return False
 
         if len(i) < 3:
-            print(f" error - EPIC directive requires 2 parameters (indices, pattern), got {len(i) - 1}", file=sys.stderr)
-            self.state.had_error = True
+            self.state.diag(f" error - EPIC directive requires 2 parameters (indices, pattern), got {len(i) - 1}", set_error=True)
             return False
 
         s = i[1]
@@ -3168,14 +3220,11 @@ class DirectiveProcessor:
         elif i[2].strip():
             var_field, syms_field = i[2], ''
         else:
-            print(" error - .check: variable name is not specified.", file=sys.stderr)
-            self.state.had_error = True
+            self.state.diag(" error - .check: variable name is not specified.", set_error=True)
             return True
         var = var_field.strip().lower()
         if len(var) != 1 or var not in LOWER:
-            print(f" error - .check: variable should be a lower case letter ('{var_field}').",
-                  file=sys.stderr)
-            self.state.had_error = True
+            self.state.diag(f" error - .check: variable should be a lower case letter ('{var_field}').", set_error=True)
             return True
         syms = []
         if syms_field:
@@ -3193,9 +3242,7 @@ class DirectiveProcessor:
             if len(var) == 1 and var in LOWER:
                 self.state.check_constraints.pop(var, None)
             else:
-                print(f" error - .clrcheck: variable should be a lower case letter ('{var_field}').",
-                      file=sys.stderr)
-                self.state.had_error = True
+                self.state.diag(f" error - .clrcheck: variable should be a lower case letter ('{var_field}').", set_error=True)
         else:
             self.state.check_constraints.clear()
         return True
@@ -3357,9 +3404,7 @@ class PatternMatcher:
                         v = float(v)
                         v = int.from_bytes(struct.pack('>f', v), "big")
                     except (OverflowError, ValueError, struct.error):
-                        if self.state.should_report_errors():
-                            print(" error - !F: cannot convert value to float32; using 0.", file=sys.stderr)
-                            self.state.had_error = True
+                        self.state.diag(" error - !F: cannot convert value to float32; using 0.", set_error=True)
                         v = 0
                     self.var_manager.put(a, v)
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
@@ -3388,9 +3433,7 @@ class PatternMatcher:
                         v = float(v)
                         v = int.from_bytes(struct.pack('>d', v), "big")
                     except (OverflowError, ValueError, struct.error):
-                        if self.state.should_report_errors():
-                            print(" error - !D: cannot convert value to float64; using 0.", file=sys.stderr)
-                            self.state.had_error = True
+                        self.state.diag(" error - !D: cannot convert value to float64; using 0.", set_error=True)
                         v = 0
                     self.var_manager.put(a, v)
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
@@ -3526,10 +3569,9 @@ class PatternMatcher:
 
         _MAX_OPT_GROUPS = 20
         if cnt > _MAX_OPT_GROUPS:
-            if self.state.should_report_errors():
-                print(f" warning - pattern has {cnt} optional groups (max {_MAX_OPT_GROUPS}); "
-                      f"first {_MAX_OPT_GROUPS} are treated as optional, "
-                      f"remainder are always included.", file=sys.stderr)
+            self.state.diag(f" warning - pattern has {cnt} optional groups (max {_MAX_OPT_GROUPS}); "
+                     f"first {_MAX_OPT_GROUPS} are treated as optional, "
+                     f"remainder are always included.", set_error=False)
             sl = sl[:_MAX_OPT_GROUPS]
             cnt = _MAX_OPT_GROUPS
 
@@ -3545,10 +3587,10 @@ class PatternMatcher:
                     if (self.state.should_report_errors()
                             and _warn_key not in self.state._combo_budget_warned):
                         self.state._combo_budget_warned.add(_warn_key)
-                        print(f" warning - a pattern with {cnt} optional group(s) exceeded the "
-                              f"{self._MAX_COMBINATIONS}-combination match budget and was treated "
-                              f"as non-matching; consider splitting it into multiple explicit "
-                              f"pattern entries.", file=sys.stderr)
+                        self.state.diag(f" warning - a pattern with {cnt} optional group(s) exceeded the "
+                             f"{self._MAX_COMBINATIONS}-combination match budget and was treated "
+                             f"as non-matching; consider splitting it into multiple explicit "
+                             f"pattern entries.", set_error=False)
                     return False
                 lt = self.remove_brackets(t, list(j))
                 saved_vars = self.state.vars[:]
@@ -3580,7 +3622,7 @@ class PatternFileReader:
 
         _MAX_PAT_DEPTH = 50
         if _depth > _MAX_PAT_DEPTH:
-            print(f" error - pattern .INCLUDE nesting exceeds {_MAX_PAT_DEPTH}: '{fn}'", file=sys.stderr)
+            diag(f" error - pattern .INCLUDE nesting exceeds {_MAX_PAT_DEPTH}: '{fn}'", set_error=False)
             return []
 
         if base_dir and not os.path.isabs(fn):
@@ -3590,8 +3632,8 @@ class PatternFileReader:
         if _chain is None:
             _chain = frozenset()
         if _real in _chain:
-            print(f" error - circular pattern .INCLUDE detected: '{fn}' "
-                  f"(already in include chain). Skipped.", file=sys.stderr)
+            diag(f" error - circular pattern .INCLUDE detected: '{fn}' "
+                 f"(already in include chain). Skipped.", set_error=False)
             return []
         _chain = _chain | {_real}
 
@@ -3639,8 +3681,8 @@ class PatternFileReader:
                     elif len(l) == 6:
                         p = [l[0], l[1], l[2], l[3], l[4], l[5]]
                     else:
-                        print(f" warning - pattern line has more than 6 fields "
-                              f"(extra fields ignored): {l[6:]!r}", file=sys.stderr)
+                        diag(f" warning - pattern line has more than 6 fields "
+                             f"(extra fields ignored): {l[6:]!r}", set_error=False)
                         p = [l[0], l[1], l[2], l[3], l[4], l[5]]
                     w.append(p)
 
@@ -3661,15 +3703,14 @@ class PatternFileReader:
             if raw:
                 fallback, _ = StringUtils.get_param_to_spc(raw, 0)
                 if fallback:
-                    import sys as _sys
-                    print(f" warning - .INCLUDE filename not quoted: {fallback!r}. "
-                          "Please use double quotes.", file=_sys.stderr)
+                    diag(f" warning - .INCLUDE filename not quoted: {fallback!r}. "
+                         "Please use double quotes.", set_error=False)
                     s = fallback
                 else:
-                    print(f" error - .INCLUDE directive has no filename: {l!r}", file=sys.stderr)
+                    diag(f" error - .INCLUDE directive has no filename: {l!r}", set_error=False)
                     return []
             else:
-                print(f" error - .INCLUDE directive has no filename: {l!r}", file=sys.stderr)
+                diag(f" error - .INCLUDE directive has no filename: {l!r}", set_error=False)
                 return []
         w = self.readpat(s, base_dir, _depth=_depth, _chain=_chain)
         return w
@@ -3747,8 +3788,7 @@ class ObjectGenerator:
                     except (ValueError, OverflowError):
                         n_int = 0
                     if n_int > _N_MAX:
-                        if self.state.should_report_errors():
-                            print(f" error - @@[n,...]: repeat count {n_int} exceeds maximum {_N_MAX}.", file=sys.stderr)
+                        self.state.diag(f" error - @@[n,...]: repeat count {n_int} exceeds maximum {_N_MAX}.", set_error=False)
                         n_int = 0
                     if n_int > 0:
                         n = n_int
@@ -3769,9 +3809,7 @@ class ObjectGenerator:
                     # expression parser then just saw a stray "[]" and
                     # reported an unrelated generic "unrecognized token"
                     # warning, if anything at all.
-                    if self.state.should_report_errors():
-                        print(" error - @@[...]: missing ',' separating count and pattern.", file=sys.stderr)
-                        self.state.had_error = True
+                    self.state.diag(" error - @@[...]: missing ',' separating count and pattern.", set_error=True)
                     result.append('@@[')
                     has_content = True
             else:
@@ -3901,11 +3939,9 @@ class VLIWProcessor:
 
                 _slot_peek = line[idx:].lstrip()
                 if _slot_peek.startswith('.'):
-                    if self.state.should_report_errors():
-                        print(" error - directives (e.g. .section/.endsection/.INCLUDE) "
-                              "are not allowed inside VLIW slots (the packet's PC has not "
-                              "advanced yet at this point in the packet).", file=sys.stderr)
-                        self.state.had_error = True
+                    self.state.diag(" error - directives (e.g. .section/.endsection/.INCLUDE) "
+                             "are not allowed inside VLIW slots (the packet's PC has not "
+                             "advanced yet at this point in the packet).", set_error=True)
                     return False
                 idxs, objl, flag, idx = lineassemble2_func(line, idx)
                 if not flag:
@@ -3922,9 +3958,7 @@ class VLIWProcessor:
         vbits = abs(self.state.vliwbits)
 
         if self.state.vliwinstbits == 0:
-            if self.state.should_report_errors():
-                print(" error - vliwinstbits is zero; cannot compute instruction slots.", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(" error - vliwinstbits is zero; cannot compute instruction slots.", set_error=True)
             return False
         for k in self.state.vliwset:
             if list(k[0]) == list(idxlst) or self.state.vliwtemplatebits == 0:
@@ -3939,11 +3973,9 @@ class VLIWProcessor:
                 noi = (vbits - abs(self.state.vliwtemplatebits)) // self.state.vliwinstbits
 
                 if noi <= 0:
-                    if self.state.should_report_errors():
-                        print(f" error - .vliw: vliwtemplatebits ({self.state.vliwtemplatebits}) "
-                              f"leaves no room for instruction slots in a {vbits}-bit packet "
-                              f"(vliwinstbits={self.state.vliwinstbits}).", file=sys.stderr)
-                        self.state.had_error = True
+                    self.state.diag(f" error - .vliw: vliwtemplatebits ({self.state.vliwtemplatebits}) "
+                             f"leaves no room for instruction slots in a {vbits}-bit packet "
+                             f"(vliwinstbits={self.state.vliwinstbits}).", set_error=True)
                     return False
 
                 for j in objs:
@@ -3952,8 +3984,7 @@ class VLIWProcessor:
 
                 target_len = ibyte * noi
                 if len(values) > target_len:
-                    if self.state.should_report_errors():
-                        print(f"warning-VLIW:{len(values)} values exceed slot capacity {target_len},truncating.", file=sys.stderr)
+                    self.state.diag(f"warning-VLIW:{len(values)} values exceed slot capacity {target_len},truncating.", set_error=False)
                     values = values[:target_len]
                 else:
                     _deficit = target_len - len(values)
@@ -4013,9 +4044,7 @@ class VLIWProcessor:
                 self.state.pc += q
                 break
         else:
-            if self.state.should_report_errors():
-                print(" error - No vliw instruction-set defined.", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(" error - No vliw instruction-set defined.", set_error=True)
             return False
         return True
 
@@ -4081,8 +4110,8 @@ class AssemblyDirectiveProcessor:
                     _mach_tbl = ELF_MACHINES.get(self.state.elf_machine)
                     reloc_type = _mach_tbl['named'].get(rt_str) if _mach_tbl else None
                     if reloc_type is None:
-                        print(f" warning - unknown reloctype '{rt_str}' in .EQU"
-                              f" for machine {self.state.elf_machine}", file=sys.stderr)
+                        self.state.diag(f" warning - unknown reloctype '{rt_str}' in .EQU"
+                             f" for machine {self.state.elf_machine}", set_error=False)
 
                 self.state.error_undefined_label = False
                 saved_mode = self.state._pass1_size_mode
@@ -4106,11 +4135,10 @@ class AssemblyDirectiveProcessor:
                     self.state._equ_sections_touched = None
                 if (_track_sections and _touched and len(_touched) > 1
                         and self.state.should_report_errors()):
-                    print(f" warning - .EQU '{label}': expression combines labels from "
-                          f"multiple sections ({', '.join(sorted(_touched))}) without an "
-                          f"explicit ::reloctype; the resulting constant assumes a specific "
-                          f"section layout and will NOT be relocated by the linker.",
-                          file=sys.stderr)
+                    self.state.diag(f" warning - .EQU '{label}': expression combines labels from "
+                         f"multiple sections ({', '.join(sorted(_touched))}) without an "
+                         f"explicit ::reloctype; the resulting constant assumes a specific "
+                         f"section layout and will NOT be relocated by the linker.", set_error=False)
                 # Bugfix: an undefined label referenced by this .EQU's
                 # expression used to go completely unnoticed here -- no
                 # print, no had_error -- silently baking the UNDEF sentinel
@@ -4119,9 +4147,7 @@ class AssemblyDirectiveProcessor:
                 # same check every other directive that evaluates an
                 # expression already performs (.ORG/.RESB/.ZERO).
                 if self.state.error_undefined_label and self.state.should_report_errors():
-                    print(f" error - .EQU '{label}': expression contains undefined label.",
-                          file=sys.stderr)
-                    self.state.had_error = True
+                    self.state.diag(f" error - .EQU '{label}': expression contains undefined label.", set_error=True)
                 ok = self.label_manager.put_value(label, u, self.state.current_section, is_equ=True, reloc_type=reloc_type)
                 return ""
             else:
@@ -4174,7 +4200,7 @@ class AssemblyDirectiveProcessor:
                 if hex_str:
                     ch = chr(int(hex_str, 16))
                 else:
-                    print(f" error - '\\x' escape requires at least one hex digit in string: {l2!r}", file=sys.stderr)
+                    self.state.diag(f" error - '\\x' escape requires at least one hex digit in string: {l2!r}", set_error=False)
                     return False
             elif l2[idx:idx + 2] in ('\\u', '\\U'):
                 _ndigits = 4 if l2[idx:idx + 2] == '\\u' else 8
@@ -4187,11 +4213,11 @@ class AssemblyDirectiveProcessor:
                     try:
                         ch = chr(int(hex_str, 16))
                     except (ValueError, OverflowError):
-                        print(f" error - invalid \\u/\\U escape in string: {l2!r}", file=sys.stderr)
+                        self.state.diag(f" error - invalid \\u/\\U escape in string: {l2!r}", set_error=False)
                         return False
                 else:
-                    print(f" error - '\\{'u' if _ndigits == 4 else 'U'}' escape requires "
-                          f"{_ndigits} hex digits in string: {l2!r}", file=sys.stderr)
+                    self.state.diag(f" error - '\\{'u' if _ndigits == 4 else 'U'}' escape requires "
+                         f"{_ndigits} hex digits in string: {l2!r}", set_error=False)
                     return False
             else:
                 ch = l2[idx]
@@ -4202,11 +4228,11 @@ class AssemblyDirectiveProcessor:
                 self.binary_writer.outbin(self.state.pc, ord(ch))
                 self.state.pc += 1
         if idx >= len(l2):
-            print(f" warning - unterminated string literal in .ASCII/.ASCIZ: {l2!r}", file=sys.stderr)
+            self.state.diag(f" warning - unterminated string literal in .ASCII/.ASCIZ: {l2!r}", set_error=False)
         if _truncated and self.state.should_report_errors():
-            print(f" warning - .ASCII/.ASCIZ: one or more characters exceed the output word "
-                  f"width ({self.state.bts} bit(s)) and were truncated (high bits discarded): "
-                  f"{l2!r}", file=sys.stderr)
+            self.state.diag(f" warning - .ASCII/.ASCIZ: one or more characters exceed the output word "
+                 f"width ({self.state.bts} bit(s)) and were truncated (high bits discarded): "
+                 f"{l2!r}", set_error=False)
         return True
 
     def export_processing(self, l1, l2):
@@ -4256,28 +4282,20 @@ class AssemblyDirectiveProcessor:
         self.state.error_undefined_label = False
         x, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
-            if self.state.should_report_errors():
-                print(f" error - {_directive} argument contains undefined label.", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(f" error - {_directive} argument contains undefined label.", set_error=True)
             return True
         try:
             x = int(x)
         except (OverflowError, ValueError):
-            if self.state.should_report_errors():
-                print(f" error - {_directive} argument is non-finite or invalid.", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(f" error - {_directive} argument is non-finite or invalid.", set_error=True)
             return True
         if x < 0:
-            if self.state.should_report_errors():
-                print(f" error - {_directive} requires a non-negative count, got {x}.", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(f" error - {_directive} requires a non-negative count, got {x}.", set_error=True)
             return True
         _RESB_MAX = 1 << 28
         if x > _RESB_MAX // _mul:
-            if self.state.should_report_errors():
-                print(f" error - {_directive} count {x} (x{_mul}) exceeds maximum "
-                      f"{_RESB_MAX} words.", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(f" error - {_directive} count {x} (x{_mul}) exceeds maximum "
+                     f"{_RESB_MAX} words.", set_error=True)
             return True
         self.state.pc += x * _mul
         return True
@@ -4292,27 +4310,19 @@ class AssemblyDirectiveProcessor:
         self.state.error_undefined_label = False
         x, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
-            if self.state.should_report_errors():
-                print(" error - .ZERO argument contains undefined label.", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(" error - .ZERO argument contains undefined label.", set_error=True)
             return True
         try:
             x = int(x)
         except (OverflowError, ValueError):
-            if self.state.should_report_errors():
-                print(" error - .ZERO argument is non-finite or invalid.", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(" error - .ZERO argument is non-finite or invalid.", set_error=True)
             return True
         if x < 0:
-            if self.state.should_report_errors():
-                print(f" error - .ZERO requires a non-negative count, got {x}.", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(f" error - .ZERO requires a non-negative count, got {x}.", set_error=True)
             return True
         _ZERO_MAX = 1 << 28
         if x > _ZERO_MAX:
-            if self.state.should_report_errors():
-                print(f" error - .ZERO count {x} exceeds maximum {_ZERO_MAX}.", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(f" error - .ZERO count {x} exceeds maximum {_ZERO_MAX}.", set_error=True)
             return True
         for i in range(x):
             self.binary_writer.outbin2(self.state.pc, 0x00)
@@ -4330,9 +4340,7 @@ class AssemblyDirectiveProcessor:
         if StringUtils.upper(l1) != ".ASCIZ":
             return False
         if not self.asciistr(l2):
-            if self.state.should_report_errors():
-                print(" error - .ASCIZ requires a quoted string.", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(" error - .ASCIZ requires a quoted string.", set_error=True)
             return False
         self.binary_writer.outbin(self.state.pc, 0x00)
         self.state.pc += 1
@@ -4412,21 +4420,15 @@ class AssemblyDirectiveProcessor:
             self.state.error_undefined_label = False
             u, idx = self.expr_eval.expression_asm(l2, 0)
             if self.state.error_undefined_label:
-                if self.state.should_report_errors():
-                    print(" error - .ALIGN argument contains undefined label.", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(" error - .ALIGN argument contains undefined label.", set_error=True)
                 return True
             try:
                 u_int = int(u)
             except (OverflowError, ValueError):
-                if self.state.should_report_errors():
-                    print(" error - .ALIGN argument is non-finite or invalid.", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(" error - .ALIGN argument is non-finite or invalid.", set_error=True)
                 return True
             if u_int <= 0:
-                if self.state.should_report_errors():
-                    print(f" error - .ALIGN requires a positive value, got {u_int}.", file=sys.stderr)
-                    self.state.had_error = True
+                self.state.diag(f" error - .ALIGN requires a positive value, got {u_int}.", set_error=True)
                 return True
             self.state.align = u_int
 
@@ -4452,16 +4454,15 @@ class AssemblyDirectiveProcessor:
         if StringUtils.upper(l1) != ".ENDSECTION" and StringUtils.upper(l1) != ".ENDSEGMENT":
             return False
         if self.state.current_section not in self.state.sections:
-            print(f" error - .ENDSECTION without matching .SECTION for '{self.state.current_section}'.", file=sys.stderr)
-            self.state.had_error = True
+            self.state.diag(f" error - .ENDSECTION without matching .SECTION for '{self.state.current_section}'.", set_error=True)
             return True
         entry = self.state.sections[self.state.current_section]
         start = entry[0]
         entry_pc = entry[2] if len(entry) > 2 else start
         block_size = self.state.pc - entry_pc
         if block_size < 0:
-            print(f" warning - ENDSECTION: computed block size {block_size} < 0 for "
-                  f"'{self.state.current_section}'; keeping previous size.", file=sys.stderr)
+            self.state.diag(f" warning - ENDSECTION: computed block size {block_size} < 0 for "
+                 f"'{self.state.current_section}'; keeping previous size.", set_error=False)
             return True
         new_size = entry[1] + block_size
         if block_size > 0:
@@ -4502,8 +4503,8 @@ class AssemblyDirectiveProcessor:
                 if rt_str:
                     reloc_type = _mach_tbl_ext['named'].get(rt_str) if _mach_tbl_ext else None
                     if reloc_type is None:
-                        print(f" warning - unknown reloc type '{rt_str}' in .EXTERN"
-                              f" for machine {_em_ext}", file=sys.stderr)
+                        self.state.diag(f" warning - unknown reloc type '{rt_str}' in .EXTERN"
+                             f" for machine {_em_ext}", set_error=False)
 
             if idx < len(l2) and l2[idx] == ':':
                 idx += 1
@@ -4565,34 +4566,31 @@ class AssemblyDirectiveProcessor:
 
         _mach_tbl_rt = ELF_MACHINES.get(self.state.elf_machine)
         if _mach_tbl_rt is None:
-            print(f" warning - .RELOCTYPE: no relocation table for machine "
-                  f"{self.state.elf_machine}", file=sys.stderr)
+            self.state.diag(f" warning - .RELOCTYPE: no relocation table for machine "
+                 f"{self.state.elf_machine}", set_error=False)
             return True
 
         _widths = (1, 2, 4, 8)
         _parts = l2.split(',') if l2 else []
         for _i, _raw_name in enumerate(_parts):
             if _i >= len(_widths):
-                print(" warning - .RELOCTYPE: too many arguments (only "
-                      "4 widths -- 8/16/32/64-bit -- are supported)",
-                      file=sys.stderr)
+                self.state.diag(" warning - .RELOCTYPE: too many arguments (only "
+                     "4 widths -- 8/16/32/64-bit -- are supported)", set_error=False)
                 break
             _name = _raw_name.strip().lower()
             if not _name:
                 continue
             _rtype = _mach_tbl_rt['named'].get(_name)
             if _rtype is None:
-                print(f" warning - unknown reloc type '{_name}' in "
-                      f".RELOCTYPE for machine {self.state.elf_machine}",
-                      file=sys.stderr)
+                self.state.diag(f" warning - unknown reloc type '{_name}' in "
+                     f".RELOCTYPE for machine {self.state.elf_machine}", set_error=False)
                 continue
             _expected_width = _widths[_i]
             _actual_width = _mach_tbl_rt['reloc_bytes'].get(_rtype)
             if _actual_width is not None and _actual_width != _expected_width:
-                print(f" warning - .RELOCTYPE: '{_name}' is a "
-                      f"{_actual_width * 8}-bit relocation type, but was given "
-                      f"in the {_expected_width * 8}-bit position; ignored",
-                      file=sys.stderr)
+                self.state.diag(f" warning - .RELOCTYPE: '{_name}' is a "
+                     f"{_actual_width * 8}-bit relocation type, but was given "
+                     f"in the {_expected_width * 8}-bit position; ignored", set_error=False)
                 continue
             self.state.reloctype_override[_expected_width] = _rtype
 
@@ -4610,30 +4608,22 @@ class AssemblyDirectiveProcessor:
         self.state.error_undefined_label = False
         u, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
-            if self.state.should_report_errors():
-                print(" error - .ORG argument contains undefined label.", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(" error - .ORG argument contains undefined label.", set_error=True)
             return True
         try:
             u = int(u)
         except (OverflowError, ValueError):
-            if self.state.should_report_errors():
-                print(" error - .ORG argument is non-finite or invalid.", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(" error - .ORG argument is non-finite or invalid.", set_error=True)
             return True
         if u < 0:
-            if self.state.should_report_errors():
-                print(f" error - .ORG address must be non-negative, got {u}.", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(f" error - .ORG address must be non-negative, got {u}.", set_error=True)
             return True
         if idx + 2 <= len(l2) and l2[idx:idx + 2].upper() == ',P':
             if u > self.state.pc:
                 _ORG_FILL_MAX = 1 << 28
                 fill_count = u - self.state.pc
                 if fill_count > _ORG_FILL_MAX:
-                    if self.state.should_report_errors():
-                        print(f" error - .ORG ,P fill count {fill_count} exceeds maximum {_ORG_FILL_MAX}.", file=sys.stderr)
-                        self.state.had_error = True
+                    self.state.diag(f" error - .ORG ,P fill count {fill_count} exceeds maximum {_ORG_FILL_MAX}.", set_error=True)
                     return True
                 for i in range(fill_count):
                     self.binary_writer.outbin2(i + self.state.pc, self.state.padding)
@@ -5767,7 +5757,7 @@ class MacroPreprocessor:
         if msg in self._reported:
             return
         self._reported.add(msg)
-        print(f" warning - {msg}", file=sys.stderr)
+        diag(f" warning - {msg}", set_error=False)
 
     def fail(self, msg):
         # Pass 1 re-reads (and so re-expands) the whole source on every
@@ -5777,7 +5767,7 @@ class MacroPreprocessor:
         # `reset_pass()`, so it survives for the whole run.
         if msg not in self._reported:
             self._reported.add(msg)
-            print(f" error - {msg}", file=sys.stderr)
+            self.state.diag(f" error - {msg}", set_error=False)
         self.had_error = True
         if self.state is not None:
             self.state.had_error = True
@@ -6045,14 +6035,12 @@ class Assembler:
         if _l_upper == '.ASCII':
             _ok = self.asm_directive_proc.ascii_processing(l, l2)
             if not _ok and (self.state.should_report_errors()):
-                print(f" error - .ASCII: failed to process string argument: {l2!r}", file=sys.stderr)
-                self.state.had_error = True
+                self.state.diag(f" error - .ASCII: failed to process string argument: {l2!r}", set_error=True)
             return 0, [], True, idx
         if _l_upper == '.ASCIZ':
             _ok = self.asm_directive_proc.asciiz_processing(l, l2)
             if not _ok and (self.state.should_report_errors()):
-                print(f" error - .ASCIZ: failed to process string argument: {l2!r}", file=sys.stderr)
-                self.state.had_error = True
+                self.state.diag(f" error - .ASCIZ: failed to process string argument: {l2!r}", set_error=True)
             return 0, [], True, idx
         if self.include_asm(l, l2):
             return 0, [], True, idx
@@ -6177,8 +6165,10 @@ class Assembler:
             saved_refs_len = len(self.state._elf_label_refs_seen)
             saved_v2l = dict(self.state._elf_var_to_label)
 
+            _cand_diags = []
             try:
                 self.state._in_match_attempt = True
+                self.state.diag_capture_begin()
                 _match_result = self.pattern_matcher.match0(lin, i[0])
             except (ArithmeticError, KeyError, IndexError, ValueError,
                     TypeError, AttributeError, OverflowError,
@@ -6190,6 +6180,7 @@ class Assembler:
                 exc_log.append((pln, pl, type(_pat_exc).__name__, str(_pat_exc)))
             finally:
                 self.state._in_match_attempt = False
+                _cand_diags = self.state.diag_capture_take()
 
             if _match_result is True:
                 score = self.pattern_matcher.last_match_score
@@ -6216,6 +6207,7 @@ class Assembler:
                         # undefined-label reference was inside a `!x`
                         # capture silently encoded as if correct.
                         'error_undefined_label': self.state.error_undefined_label,
+                        'diags': _cand_diags,
                     }
 
                 self.state.vars = saved_vars
@@ -6231,10 +6223,10 @@ class Assembler:
 
             _other_plns = sorted({e[0] for e in exc_log if e[0] != best['pln']})
             if _other_plns:
-                print(f" warning - {len(_other_plns)} other candidate pattern(s) at line(s) "
-                      f"{_other_plns} raised an exception during matching and were skipped "
-                      f"in favor of pattern line {best['pln']}.  "
-                      f"[{self.state.current_file}:{self.state.ln}]", file=sys.stderr)
+                self.state.diag(f" warning - {len(_other_plns)} other candidate pattern(s) at line(s) "
+                     f"{_other_plns} raised an exception during matching and were skipped "
+                     f"in favor of pattern line {best['pln']}.  "
+                     f"[{self.state.current_file}:{self.state.ln}]", set_error=False)
 
         if best is not None:
             i = best['pat']
@@ -6247,6 +6239,7 @@ class Assembler:
             self.state._elf_label_refs_seen.extend(best['refs'])
             self.state._elf_var_to_label = dict(best['v2l'])
             self.state.error_undefined_label = best.get('error_undefined_label', False)
+            self.state.diag_replay(best.get('diags', ()))
             self.state.expmode = EXP_ASM
 
             try:
@@ -6321,15 +6314,15 @@ class Assembler:
             _loc = f"  [{self.state.current_file}:{self.state.ln}]"
             if self.state.error_undefined_label:
                 self.state.had_error = True
-                print(f" error - Undefined label in expression.{_loc}", file=sys.stderr)
+                self.state.diag(f" error - Undefined label in expression.{_loc}", set_error=False)
                 return 0, [], False, idx
             if se:
                 self.state.had_error = True
-                print(f" error - Syntax error.{_loc}", file=sys.stderr)
+                self.state.diag(f" error - Syntax error.{_loc}", set_error=False)
                 return 0, [], False, idx
             if oerr:
                 self.state.had_error = True
-                print(f" ; pat {pln} {pl} error - Illegal syntax in assemble line or pattern line.{_loc}", file=sys.stderr)
+                self.state.diag(f" ; pat {pln} {pl} error - Illegal syntax in assemble line or pattern line.{_loc}", set_error=False)
                 return 0, [], False, idx
 
         return idxs, objl, True, idx
@@ -6590,8 +6583,7 @@ class Assembler:
                 vflag = self.vliw_proc.vliwprocess(line, idxs, objl, flag, idx, self.lineassemble2)
             except Exception as _vliw_exc:
                 if self.state.should_report_errors():
-                    print(" error - Some error(s) in vliw definition.", file=sys.stderr)
-                    self.state.had_error = True
+                    self.state.diag(" error - Some error(s) in vliw definition.", set_error=True)
 
                     if self.state.verbose or self.state.debug:
                         print(f"   ({type(_vliw_exc).__name__}: {_vliw_exc})", file=sys.stderr)
@@ -6680,8 +6672,7 @@ class Assembler:
 
         _MAX_INCLUDE_DEPTH = 100
         if len(self.state.fnstack) >= _MAX_INCLUDE_DEPTH:
-            print(f" error - .INCLUDE nesting depth exceeds {_MAX_INCLUDE_DEPTH}: '{fn}'", file=sys.stderr)
-            self.state.had_error = True
+            self.state.diag(f" error - .INCLUDE nesting depth exceeds {_MAX_INCLUDE_DEPTH}: '{fn}'", set_error=True)
             return
         try:
             abs_fn = os.path.abspath(fn) if fn not in ("stdin", "") else fn
@@ -6693,8 +6684,7 @@ class Assembler:
             except Exception:
                 already_abs = already
             if abs_fn == already_abs:
-                print(f" error - circular .INCLUDE detected: '{fn}' is already being assembled.", file=sys.stderr)
-                self.state.had_error = True
+                self.state.diag(f" error - circular .INCLUDE detected: '{fn}' is already being assembled.", set_error=True)
                 return
 
         # Bugfix: push `fn` itself (the file about to be entered), not the
@@ -6788,8 +6778,7 @@ class Assembler:
                 _mach_tbl_imp = ELF_MACHINES.get(self.state.elf_machine)
                 reloc_type = _mach_tbl_imp['named'].get(rt_str.lower()) if _mach_tbl_imp else None
                 if reloc_type is None:
-                    print(f" warning - unknown reloc type '{rt_str}' for imported label '{label}'",
-                          file=sys.stderr)
+                    self.state.diag(f" warning - unknown reloc type '{rt_str}' for imported label '{label}'", set_error=False)
             if not label:
                 return False
             try:
@@ -6900,9 +6889,8 @@ class Assembler:
             # for a 64-bit target. Emitting it for a 32-bit machine would
             # produce structurally-wrong-width DWARF instead of just
             # incomplete DWARF, so refuse rather than silently corrupt it.
-            print(f" warning - DWARF debug info (-g) is not yet supported for "
-                  f"32-bit targets (machine {machine}); skipping debug sections.",
-                  file=sys.stderr)
+            self.state.diag(f" warning - DWARF debug info (-g) is not yet supported for "
+                 f"32-bit targets (machine {machine}); skipping debug sections.", set_error=False)
             return [], []
 
         import struct as _struct
@@ -7618,9 +7606,7 @@ class Assembler:
             # directory in the -o path) printed a clear error yet still
             # exited 0 with no file written, silently breaking any build
             # system that only checks the exit code.
-            if self.state.should_report_errors():
-                print(f" error - cannot create ELF output file '{path}': {_e}", file=sys.stderr)
-                self.state.had_error = True
+            self.state.diag(f" error - cannot create ELF output file '{path}': {_e}", set_error=True)
             return
         with _elf_file as f:
             f.write(_pack_ehdr(1, machine, shdr_off, total_shdrs, shstrndx))
@@ -7781,7 +7767,7 @@ class Assembler:
             with open(sourcefile, "rt", encoding="utf-8") as f:
                 raw = f.readlines()
         except OSError as e:
-            print(f" error - cannot open source file '{sourcefile}': {e}", file=sys.stderr)
+            self.state.diag(f" error - cannot open source file '{sourcefile}': {e}", set_error=False, force=True)
             return False
 
         expanded = self.macro_proc.expand(raw, sourcefile)
@@ -7799,7 +7785,7 @@ class Assembler:
                 with open(dest, "wt", encoding="utf-8") as f:
                     f.write(data)
             except OSError as e:
-                print(f" error - cannot write '{dest}': {e}", file=sys.stderr)
+                self.state.diag(f" error - cannot write '{dest}': {e}", set_error=False, force=True)
                 return False
         return True
 
@@ -7878,12 +7864,11 @@ class Assembler:
 
         if args.elf_machine not in ELF_MACHINES:
             _known = ', '.join(f"{m} ({ELF_MACHINES[m]['name']})" for m in sorted(ELF_MACHINES))
-            print(f" error - -m/--machine value {args.elf_machine} is not a supported "
-                  f"ELF e_machine number. axx only knows correct relocation-type "
-                  f"numbering for: {_known}. Refusing to guess/fall back to x86_64 "
-                  f"numbering for an unrecognized machine, since that would silently "
-                  f"mislabel every relocation in the output.",
-                  file=sys.stderr)
+            self.state.diag(f" error - -m/--machine value {args.elf_machine} is not a supported "
+                 f"ELF e_machine number. axx only knows correct relocation-type "
+                 f"numbering for: {_known}. Refusing to guess/fall back to x86_64 "
+                 f"numbering for an unrecognized machine, since that would silently "
+                 f"mislabel every relocation in the output.", set_error=False, force=True)
             return False
         self.state.elf_machine  = args.elf_machine
 
@@ -7899,7 +7884,7 @@ class Assembler:
 
         if args.macro_expand is not None:
             if args.sourcefile is None:
-                print(" error - -P/--macro-expand needs a source file.", file=sys.stderr)
+                self.state.diag(" error - -P/--macro-expand needs a source file.", set_error=False, force=True)
                 return False
             return self._macro_expand_only(args.sourcefile, args.macro_expand)
 
@@ -8003,18 +7988,17 @@ class Assembler:
                                     print(f"Pass1 relaxation converged after {relax_iter + 1} iteration(s)", file=sys.stderr)
                                 break
                             else:
-                                print(f" error - Pass1 relaxation is oscillating with period "
-                                      f"{_cycle_len} (the instruction layout at iteration "
-                                      f"{relax_iter + 1} is identical to iteration {_first_seen}); "
-                                      f"it will never converge by simple repetition.", file=sys.stderr)
+                                self.state.diag(f" error - Pass1 relaxation is oscillating with period "
+                                     f"{_cycle_len} (the instruction layout at iteration "
+                                     f"{relax_iter + 1} is identical to iteration {_first_seen}); "
+                                     f"it will never converge by simple repetition.", set_error=False, force=True)
                                 print("         Aborting: no output file written.", file=sys.stderr)
                                 return False
                         _seen_pcs_history[_pcs_key] = relax_iter + 1
                     self.state._pass1_prev_label_pcs = current_pcs
                 else:
 
-                    print(" error - Pass1 relaxation did not converge after {0} iterations.".format(MAX_RELAX),
-                          file=sys.stderr)
+                    self.state.diag(" error - Pass1 relaxation did not converge after {0} iterations.".format(MAX_RELAX), set_error=False, force=True)
                     print("         Generated code would have incorrect addresses for", file=sys.stderr)
                     print("         variable-length instructions with forward references.", file=sys.stderr)
                     print("         Aborting: no output file written.", file=sys.stderr)
@@ -8063,9 +8047,9 @@ class Assembler:
                     if p1 is not None and p1 != p2 and not _is_undef_derived(p2):
                         _drift.append((k, p1, p2))
                 if _drift:
-                    print(" error - address mismatch between pass1 and pass2 "
-                          f"({len(_drift)} label(s)); output addresses are UNRELIABLE.",
-                          file=sys.stderr)
+                    self.state.diag(" error - address mismatch between pass1 and pass2 "
+                                    f"({len(_drift)} label(s)); output addresses are "
+                                    f"UNRELIABLE.", set_error=False, force=True)
                     print("         This usually means pass1 relaxation did not fully "
                           "converge for variable-length forward references.", file=sys.stderr)
                     for k, p1, p2 in _drift[:10]:
@@ -8080,8 +8064,8 @@ class Assembler:
                     return False
 
                 if self.state.had_error:
-                    print(" error - one or more errors were reported during assembly; "
-                          "output would be incomplete or wrong.", file=sys.stderr)
+                    self.state.diag(" error - one or more errors were reported during assembly; "
+                         "output would be incomplete or wrong.", set_error=False, force=True)
                     print("         Aborting: no output file written.", file=sys.stderr)
                     return False
 
@@ -8090,8 +8074,8 @@ class Assembler:
             if self.state.elf_objfile:
                 self.write_elf_obj(self.state.elf_objfile, self.state.elf_machine)
                 if self.state.had_error:
-                    print(" error - one or more errors were reported during assembly; "
-                          "output would be incomplete or wrong.", file=sys.stderr)
+                    self.state.diag(" error - one or more errors were reported during assembly; "
+                         "output would be incomplete or wrong.", set_error=False, force=True)
                     print("         Aborting: no output file written.", file=sys.stderr)
                     return False
 

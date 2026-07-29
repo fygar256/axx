@@ -37,6 +37,10 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdarg.h>
+
+/* 診断ファネル前方宣言 (定義は should_report_errors() の直後)。
+ * このファイルの " error - " / " warning - " はすべてこれを通る。 */
+static void axx_diagf(int set_error, int force, const char *fmt, ...);
 #include <unistd.h>
 #include <libgen.h>
 #include <limits.h>
@@ -350,12 +354,11 @@ static int u256_is_undef_derived(uint256_t a) {
         static int warned = 0;
         if (!warned) {
             warned = 1;
-            fprintf(stderr,
-                    " warning - a value whose signed absolute magnitude is >= 2**192 was "
-                    "computed and is being treated as UNDEF-derived; this heuristic cannot "
-                    "distinguish it from a genuine large 256-bit constant (e.g. an all-ones "
-                    "bitmask) because uint256_t has no headroom beyond 256 bits for a true "
-                    "out-of-band sentinel.\n");
+            axx_diagf(0, 0, " warning - a value whose signed absolute magnitude is >= 2**192 was "
+                       "computed and is being treated as UNDEF-derived; this heuristic cannot "
+                       "distinguish it from a genuine large 256-bit constant (e.g. an all-ones "
+                       "bitmask) because uint256_t has no headroom beyond 256 bits for a true "
+                       "out-of-band sentinel.\n");
         }
     }
     return av.w[3] != 0;          /* signed absolute value >= 2^192 */
@@ -1088,6 +1091,15 @@ typedef struct {
     int        equ_section_tracking;
     char       equ_first_section[64];
     int        equ_multi_section;
+
+    /* 診断ファネル (axx.py の AssemblerState._diag_pending と対応)。
+     * パターンマッチ試行中に出た診断はここに退避され、勝った候補の分だけ
+     * あとで再生される。負けた候補の分は捨てられる。 */
+    char     **diag_pending;
+    int       *diag_pending_seterr;
+    int        diag_pending_len;
+    int        diag_pending_cap;
+    int        diag_capturing;
 } AsmState;
 
 /* 破綻点修正7 (axx.py port): 「ユーザー向けエラーを表示すべきパスか」の
@@ -1097,6 +1109,90 @@ typedef struct {
  * と対応)。 */
 static inline int should_report_errors(const AsmState *st) {
     return st->pas == 2 || st->pas == 0;
+}
+
+/* =========================================================
+ * 診断ファネル (axx.py の AssemblerState.diag() と 1:1 対応)
+ *
+ * このファイルの " error - " / " warning - " はすべて axx_diagf() を通る。
+ * 抑止条件をここ 1 箇所にまとめてあるので、新しい呼び出し箇所が
+ * 条件を書き忘れることが構造的に起きない。
+ *
+ * 経緯: 以前は各箇所が個別に if(...) を書いており、書き忘れから
+ *   ・1 文字小文字ラベル参照が 0 になる
+ *   ・"#" 前置の即値 (6502/68000/ARM/MIPS…) でビルドが中断する
+ * という別々のバグが出た。
+ *
+ * 抑止条件 1: in_match_attempt
+ *   マッチ試行中の失敗はマッチングの正常動作であってエラーではない。
+ *   ただし捨てずに退避する — !x キャプチャの式は試行中にしか評価
+ *   されないため、勝った候補の本物のエラーまで消えてしまう。
+ * 抑止条件 2: should_report_errors()
+ *   pass1 の未定義ラベルは「まだ解決していない」だけのことが多い。
+ * ========================================================= */
+
+static AsmState *g_active_state = NULL;   /* 現在走っているアセンブラ */
+
+static void diag_pending_push(AsmState *st, const char *text, int set_error){
+    if(st->diag_pending_len >= st->diag_pending_cap){
+        int nc = st->diag_pending_cap ? st->diag_pending_cap*2 : 8;
+        char **nt = realloc(st->diag_pending, (size_t)nc*sizeof(char*));
+        int   *ns = realloc(st->diag_pending_seterr, (size_t)nc*sizeof(int));
+        if(!nt || !ns){ free(nt); free(ns); return; }   /* 診断は best-effort */
+        st->diag_pending = nt; st->diag_pending_seterr = ns;
+        st->diag_pending_cap = nc;
+    }
+    char *cp = strdup(text);
+    if(!cp) return;
+    st->diag_pending[st->diag_pending_len]        = cp;
+    st->diag_pending_seterr[st->diag_pending_len] = set_error;
+    st->diag_pending_len++;
+}
+
+static void diag_capture_begin(AsmState *st){
+    for(int i=0;i<st->diag_pending_len;i++) free(st->diag_pending[i]);
+    st->diag_pending_len = 0;
+    st->diag_capturing   = 1;
+}
+
+/* 退避中の診断を呼び出し側へ渡す（所有権も渡す）。*/
+static void diag_capture_take(AsmState *st, char ***texts, int **seterr, int *n){
+    *texts  = st->diag_pending;
+    *seterr = st->diag_pending_seterr;
+    *n      = st->diag_pending_len;
+    st->diag_pending        = NULL;
+    st->diag_pending_seterr = NULL;
+    st->diag_pending_len    = 0;
+    st->diag_pending_cap    = 0;
+    st->diag_capturing      = 0;
+}
+
+static void diag_replay(AsmState *st, char **texts, int *seterr, int n){
+    for(int i=0;i<n;i++){
+        if(should_report_errors(st)){
+            fputs(texts[i], stderr);
+            if(seterr[i]) st->had_error = 1;
+        }
+    }
+}
+
+static void axx_diagf(int set_error, int force, const char *fmt, ...){
+    AsmState *st = g_active_state;
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    if(st && !force){
+        if(st->in_match_attempt){
+            if(st->diag_capturing) diag_pending_push(st, buf, set_error);
+            return;
+        }
+        if(!should_report_errors(st)) return;
+    }
+    fputs(buf, stderr);
+    if(st && set_error) st->had_error = 1;
 }
 
 /* =========================================================
@@ -1384,6 +1480,9 @@ static int64_t equ_section_relative_offset(AsmState *st, const char *sec_name, u
 
 static void state_init(AsmState *st) {
     memset(st, 0, sizeof(*st));
+    /* 診断ファネルから参照できるよう、走行中の state を公開する
+     * (axx.py の _ACTIVE_STATE に対応)。 */
+    g_active_state = st;
     strcpy(st->lwordchars, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_.");
     strcpy(st->swordchars, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_%$-~&|");
     strcpy(st->current_section, ".text");
@@ -1687,7 +1786,7 @@ static void axx_get_string(const char *l2, char *out, size_t osz) {
     }
     out[n]=0;
     if(!l2[idx])
-        fprintf(stderr, " warning - unterminated string literal: %s\n", l2);
+        axx_diagf(0, 0, " warning - unterminated string literal: %s\n", l2);
 }
 
 /* =========================================================
@@ -1753,8 +1852,7 @@ static int axx_get_curlb(AsmState *st, const char *s, int idx, int *f_out, char 
          * "flt{"/"enflt{"/"endbl{" body missing its closing '}' silently
          * produced a 0 with a "successful" build. */
         if(should_report_errors(st)){
-            fprintf(stderr," error - missing closing '}' in expression: '{%s'\n", t_out);
-            st->had_error = 1;
+            axx_diagf(1, 0, " error - missing closing '}' in expression: '{%s'\n", t_out);
         }
         return (int)strlen(s);
     }
@@ -2471,8 +2569,8 @@ static uint256_t label_get_value(AsmState *st, const char *k){
      * このラベル参照は後に別パターンに差し替えられる可能性があるためエラーを表示しない。
      * （例: OUT (!n),A が OUT (C),E を試みる際に !n キャプチャで C がラベル評価される。） */
     if(!st->in_match_attempt && should_report_errors(st)){
-        fprintf(stderr, " error - Label undefined: '%s'  [%s:%d]\n",
-            k, st->current_file, (int)st->ln);
+        axx_diagf(0, 0, " error - Label undefined: '%s'  [%s:%d]\n",
+                   k, st->current_file, (int)st->ln);
     }
     return UNDEF_VAL();
 }
@@ -2508,7 +2606,7 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
              * for the same duplicate -- cosmetic stderr noise, not a
              * correctness bug (had_error is already set once, correctly
              * aborting the build either way). */
-            fprintf(stderr," error - label already defined.\n");
+            axx_diagf(0, 0, " error - label already defined.\n");
             return 0;
         }
     } else if(st->pas==2){
@@ -2516,7 +2614,7 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
             st->error_already_defined=1;
             st->had_error=1;
             if(should_report_errors(st))
-                fprintf(stderr," error - label '%s' not defined in pass 1.\n",k);
+                axx_diagf(0, 0, " error - label '%s' not defined in pass 1.\n",k);
             return 0;
         }
     }
@@ -2525,7 +2623,7 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
     if(smap_get(&st->patsymbols,uk,&dummy)){
         st->had_error=1;
         if(should_report_errors(st))
-            fprintf(stderr," error - '%s' is a pattern file symbol.\n",k);
+            axx_diagf(0, 0, " error - '%s' is a pattern file symbol.\n",k);
         return 0;
     }
     st->error_already_defined=0;
@@ -2945,8 +3043,7 @@ static uint256_t expr_factor(Assembler *asmb, const char *s, int idx, int *idx_o
          * expression nested too deep printed a real error yet still
          * produced a "successful" exit 0 build. */
         if(should_report_errors(st)){
-            fprintf(stderr," error - expression nesting too deep.\n");
-            st->had_error = 1;
+            axx_diagf(1, 0, " error - expression nesting too deep.\n");
         }
         if(idx_out) *idx_out = idx;
         return u256_zero();
@@ -3003,8 +3100,7 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
                          * offset in *(expr, expr)" diagnostic, which
                          * didn't exist in C at all. */
                         if(should_report_errors(st)){
-                            fprintf(stderr," error - negative byte-extract offset in *(expr, expr).\n");
-                            st->had_error = 1;
+                            axx_diagf(1, 0, " error - negative byte-extract offset in *(expr, expr).\n");
                         }
                         x=u256_zero();
                     } else {
@@ -3017,8 +3113,7 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
                      * (no should_report_errors() gate, unlike every other
                      * diagnostic in the file) and never set had_error. */
                     if(should_report_errors(st)){
-                        fprintf(stderr," error - missing ')' in *(expr, expr) expression.\n");
-                        st->had_error = 1;
+                        axx_diagf(1, 0, " error - missing ')' in *(expr, expr) expression.\n");
                     }
                     x=u256_zero();
                 }
@@ -3026,8 +3121,7 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
                 /* 修正⑩: missing ',' – report error and return 0.
                  * Bugfix: same ungated/no-had_error issue as above. */
                 if(should_report_errors(st)){
-                    fprintf(stderr," error - missing ',' in *(expr, expr) expression.\n");
-                    st->had_error = 1;
+                    axx_diagf(1, 0, " error - missing ',' in *(expr, expr) expression.\n");
                 }
                 x=u256_zero();
             }
@@ -3036,8 +3130,7 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
              * which didn't exist in C at all -- "*1,2)" (missing '(' after
              * '*') silently returned 0 with zero diagnostic. */
             if(should_report_errors(st)){
-                fprintf(stderr," error - expected '(' after '*' in *(expr,expr) expression.\n");
-                st->had_error = 1;
+                axx_diagf(1, 0, " error - expected '(' after '*' in *(expr,expr) expression.\n");
             }
             x=u256_zero();
         }
@@ -3094,8 +3187,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
              * any expression silently kept whatever value was computed
              * inside with zero diagnostic. */
             if(should_report_errors(st)){
-                fprintf(stderr," error - missing closing ')' in expression.\n");
-                st->had_error = 1;
+                axx_diagf(1, 0, " error - missing closing ')' in expression.\n");
             }
         }
     }
@@ -3178,8 +3270,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
              * all -- an undefined "#symbol" reference silently became 0
              * with zero diagnostic. */
             if(should_report_errors(st)){
-                fprintf(stderr," error - undefined symbol: '#%s'\n", t);
-                st->had_error = 1;
+                axx_diagf(1, 0, " error - undefined symbol: '#%s'\n", t);
             }
             x=u256_zero();
         }
@@ -3283,8 +3374,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     asmb->st.had_error=_prior_had_error;
                     if(_fallback_errored){
                         if(should_report_errors(&asmb->st)){
-                            fprintf(stderr," error - qad{}: cannot evaluate expression '%s'; using 0.\n", expr_buf);
-                            asmb->st.had_error = 1;
+                            axx_diagf(1, 0, " error - qad{}: cannot evaluate expression '%s'; using 0.\n", expr_buf);
                         }
                         x=u256_zero();
                     } else {
@@ -3377,8 +3467,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     asmb->st.had_error = _prior_had_error;
                     if(_fallback_errored){
                         if(should_report_errors(&asmb->st)){
-                            fprintf(stderr," error - dbl{}: cannot convert expression to float64; using 0.\n");
-                            asmb->st.had_error = 1;
+                            axx_diagf(1, 0, " error - dbl{}: cannot convert expression to float64; using 0.\n");
                         }
                         bits = 0;
                     } else {
@@ -3437,8 +3526,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     asmb->st.had_error = _prior_had_error;
                     if(_fallback_errored){
                         if(should_report_errors(&asmb->st)){
-                            fprintf(stderr," error - flt{}: cannot convert expression to float32; using 0.\n");
-                            asmb->st.had_error = 1;
+                            axx_diagf(1, 0, " error - flt{}: cannot convert expression to float32; using 0.\n");
                         }
                         bits = 0;
                     } else {
@@ -3476,8 +3564,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
              * should_report_errors() gate, unlike every other diagnostic
              * in the file) and never set had_error. */
             if(should_report_errors(st)){
-                fprintf(stderr," error - missing closing ')' in not(...) expression.\n");
-                st->had_error = 1;
+                axx_diagf(1, 0, " error - missing closing ')' in not(...) expression.\n");
             }
         }
         x=u256_from_i64(u256_is_zero(x)?1:0);
@@ -3537,10 +3624,9 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                 /* B (axx.py port): centralized detection, threshold raised to 2^192. */
                 if(u256_is_undef_derived(x)){
                     st->error_undefined_label = 1;
-                    fprintf(stderr,
-                        " error - Label undefined: variable '%c' contains undefined value"
-                        "  [%s:%d]\n",
-                        ch, st->current_file, (int)st->ln);
+                    axx_diagf(0, 0, " error - Label undefined: variable '%c' contains undefined value"
+                               "  [%s:%d]\n",
+                               ch, st->current_file, (int)st->ln);
                 }
             }
             /* In float mode, promote the variable's stored integer value to
@@ -3622,16 +3708,14 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
             int64_t t_int = u256_to_i64(t);
             if(t_int < 0){
                 if(should_report_errors(&asmb->st)){
-                    fprintf(stderr," error - Negative exponent in ** expression; result set to 0.\n");
-                    asmb->st.had_error = 1;
+                    axx_diagf(1, 0, " error - Negative exponent in ** expression; result set to 0.\n");
                 }
                 x = u256_zero();
                 break;
             }
             if(t_int > EXP_MAX){
                 if(should_report_errors(&asmb->st)){
-                    fprintf(stderr," error - Exponent %lld exceeds maximum %lld in ** expression; result set to 0.\n",(long long)t_int,(long long)EXP_MAX);
-                    asmb->st.had_error = 1;
+                    axx_diagf(1, 0, " error - Exponent %lld exceeds maximum %lld in ** expression; result set to 0.\n",(long long)t_int,(long long)EXP_MAX);
                 }
                 x = u256_zero();
                 break;
@@ -3640,8 +3724,7 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
             int64_t exp_factor = t_int > 1 ? t_int : 1;
             if(base_bits * exp_factor > EXP_RESULT_MAX_BITS){
                 if(should_report_errors(&asmb->st)){
-                    fprintf(stderr," error - ** result would exceed %lld bits (chained exponentiation); result set to 0.\n",(long long)EXP_RESULT_MAX_BITS);
-                    asmb->st.had_error = 1;
+                    axx_diagf(1, 0, " error - ** result would exceed %lld bits (chained exponentiation); result set to 0.\n",(long long)EXP_RESULT_MAX_BITS);
                 }
                 x = u256_zero();
                 break;
@@ -3673,8 +3756,7 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
                      * instruction operand silently produced a plausible-
                      * looking 0 with a build that still reported success. */
                     if(should_report_errors(&asmb->st)){
-                        fprintf(stderr," error - Division by 0 error.\n");
-                        asmb->st.had_error = 1;
+                        axx_diagf(1, 0, " error - Division by 0 error.\n");
                     }
                     x=double_to_u256(0.0);
                 }
@@ -3684,8 +3766,7 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
                  * dividend value, making 'a//0' silently return 'a'. */
                 if(u256_is_zero(t)){
                     if(should_report_errors(&asmb->st)){
-                        fprintf(stderr," error - Division by 0 error.\n");
-                        asmb->st.had_error = 1;
+                        axx_diagf(1, 0, " error - Division by 0 error.\n");
                     }
                     x=u256_zero();
                 }
@@ -3703,8 +3784,7 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
                      * instruction operand silently produced a plausible-
                      * looking 0 with a build that still reported success. */
                     if(should_report_errors(&asmb->st)){
-                        fprintf(stderr," error - Division by 0 error.\n");
-                        asmb->st.had_error = 1;
+                        axx_diagf(1, 0, " error - Division by 0 error.\n");
                     }
                     x=double_to_u256(0.0);
                 }
@@ -3713,8 +3793,7 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
                 /* Fix L: same as // fix */
                 if(u256_is_zero(t)){
                     if(should_report_errors(&asmb->st)){
-                        fprintf(stderr," error - Division by 0 error.\n");
-                        asmb->st.had_error = 1;
+                        axx_diagf(1, 0, " error - Division by 0 error.\n");
                     }
                     x=u256_zero();
                 }
@@ -3731,8 +3810,7 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
                      * instruction operand silently produced a plausible-
                      * looking 0 with a build that still reported success. */
                     if(should_report_errors(&asmb->st)){
-                        fprintf(stderr," error - Division by 0 error.\n");
-                        asmb->st.had_error = 1;
+                        axx_diagf(1, 0, " error - Division by 0 error.\n");
                     }
                     x=double_to_u256(0.0);
                 }
@@ -3741,8 +3819,7 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
                 /* Fix L: same as // fix */
                 if(u256_is_zero(t)){
                     if(should_report_errors(&asmb->st)){
-                        fprintf(stderr," error - Division by 0 error.\n");
-                        asmb->st.had_error = 1;
+                        axx_diagf(1, 0, " error - Division by 0 error.\n");
                     }
                     x=u256_zero();
                 }
@@ -3785,14 +3862,12 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
             int64_t sv=u256_to_i64(t);
             if(sv<0){
                 if(should_report_errors(&asmb->st)){
-                    fprintf(stderr," error - negative shift count (%lld) in << expression.\n",(long long)sv);
-                    asmb->st.had_error = 1;
+                    axx_diagf(1, 0, " error - negative shift count (%lld) in << expression.\n",(long long)sv);
                 }
                 x=u256_zero();
             } else if(sv>SHIFT_MAX){
                 if(should_report_errors(&asmb->st)){
-                    fprintf(stderr," error - shift count %lld exceeds maximum %lld in << expression.\n",(long long)sv,(long long)SHIFT_MAX);
-                    asmb->st.had_error = 1;
+                    axx_diagf(1, 0, " error - shift count %lld exceeds maximum %lld in << expression.\n",(long long)sv,(long long)SHIFT_MAX);
                 }
                 x=u256_zero();
             } else x=u256_shl(x,(int)sv);
@@ -3801,8 +3876,7 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
             int64_t sv=u256_to_i64(t);
             if(sv<0){
                 if(should_report_errors(&asmb->st)){
-                    fprintf(stderr," error - negative shift count (%lld) in >> expression.\n",(long long)sv);
-                    asmb->st.had_error = 1;
+                    axx_diagf(1, 0, " error - negative shift count (%lld) in >> expression.\n",(long long)sv);
                 }
                 x=u256_zero();
             } else if(sv>SHIFT_MAX){
@@ -3810,8 +3884,7 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
                  * with NO diagnostic at all (unlike << above), mirroring
                  * the identical fix applied to axx.py's term2(). */
                 if(should_report_errors(&asmb->st)){
-                    fprintf(stderr," error - shift count %lld exceeds maximum %lld in >> expression.\n",(long long)sv,(long long)SHIFT_MAX);
-                    asmb->st.had_error = 1;
+                    axx_diagf(1, 0, " error - shift count %lld exceeds maximum %lld in >> expression.\n",(long long)sv,(long long)SHIFT_MAX);
                 }
                 x=u256_zero();
             } else x=u256_sar(x,(int)sv);
@@ -3875,8 +3948,7 @@ static uint256_t expr_safe_bitwise_operand(Assembler *asmb, uint256_t v, const c
         double d = u256_to_double(v);
         if(!isfinite(d)){
             if(should_report_errors(&asmb->st)){
-                fprintf(stderr," error - non-finite value %g in bitwise '%s' operation; treated as 0.\n", d, op_name);
-                asmb->st.had_error = 1;
+                axx_diagf(1, 0, " error - non-finite value %g in bitwise '%s' operation; treated as 0.\n", d, op_name);
             }
             return u256_zero();
         }
@@ -3954,8 +4026,8 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
              * just a warning (deliberately zeroes the result), so
              * had_error is intentionally NOT set, mirroring axx.py. */
             if(should_report_errors(&asmb->st)){
-                fprintf(stderr, " warning - sign-extension bit width %lld exceeds maximum %d, result set to 0.\n",
-                       (long long)tv, SEXT_MAX_BITS);
+                axx_diagf(0, 0, " warning - sign-extension bit width %lld exceeds maximum %d, result set to 0.\n",
+                           (long long)tv, SEXT_MAX_BITS);
             }
             x=u256_zero();
         } else {
@@ -4316,9 +4388,8 @@ static int dir_vliwp(Assembler *asmb, PatEntry *e){
      * 間違える(例: 80000000)とソース1行あたり数秒かかる処理が行数分
      * 積み上がり、通常サイズのソースファイルでも事実上ハングする。 */
     if(asmb->st.vliwinstbits < 0 || asmb->st.vliwinstbits > 8192){
-        fprintf(stderr," error - .vliw: vliwinstbits %d is out of range (must be 0-8192).\n",
-                asmb->st.vliwinstbits);
-        asmb->st.had_error = 1;
+        axx_diagf(1, 0, " error - .vliw: vliwinstbits %d is out of range (must be 0-8192).\n",
+                   asmb->st.vliwinstbits);
         return 1;
     }
     asmb->st.vliwflag=1;
@@ -4392,16 +4463,13 @@ static int dir_check(Assembler *asmb, PatEntry *e){
     const char *var_str  = e->f[1][0] ? e->f[1] : e->f[2];
     const char *syms_str = e->f[1][0] ? e->f[2] : "";
     if(!var_str[0]){
-        fprintf(stderr, " error - .check: variable name is not specified.\n");
-        asmb->st.had_error = 1;
+        axx_diagf(1, 0, " error - .check: variable name is not specified.\n");
         return 1;
     }
     char var = (char)tolower((unsigned char)var_str[0]);
     if(var < 'a' || var > 'z' || var_str[1] != '\0'){
-        fprintf(stderr,
-            " error - .check: variable should be a lower case letter ('%s').\n",
-            var_str);
-        asmb->st.had_error = 1;
+        axx_diagf(1, 0, " error - .check: variable should be a lower case letter ('%s').\n",
+                   var_str);
         return 1;
     }
     int idx = var - 'a';
@@ -4436,10 +4504,8 @@ static int dir_clrcheck(Assembler *asmb, PatEntry *e){
     if(var_str[0]){
         char var = (char)tolower((unsigned char)var_str[0]);
         if(var < 'a' || var > 'z' || var_str[1] != '\0'){
-            fprintf(stderr,
-                " error - .clrcheck: variable should be a lower case letter ('%s').\n",
-                var_str);
-            asmb->st.had_error = 1;
+            axx_diagf(1, 0, " error - .clrcheck: variable should be a lower case letter ('%s').\n",
+                       var_str);
             return 1;
         }
         int idx = var - 'a';
@@ -4720,8 +4786,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     float fval = (float)dv;
                     if(isfinite(dv) && !isfinite(fval)){
                         if(should_report_errors(st)){
-                            fprintf(stderr," error - !F: cannot convert value to float32; using 0.\n");
-                            st->had_error = 1;
+                            axx_diagf(1, 0, " error - !F: cannot convert value to float32; using 0.\n");
                         }
                         fval = 0.0f;
                     }
@@ -4895,10 +4960,9 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
      * 組合せ爆発によるハングを防ぐ。 */
     enum { MAX_OPT_GROUPS = 20 };
     if(cnt > MAX_OPT_GROUPS){
-        fprintf(stderr,
-                " warning - pattern has %d optional groups (max %d); "
-                "first %d are treated as optional, remainder are always included.\n",
-                cnt, MAX_OPT_GROUPS, MAX_OPT_GROUPS);
+        axx_diagf(0, 0, " warning - pattern has %d optional groups (max %d); "
+                   "first %d are treated as optional, remainder are always included.\n",
+                   cnt, MAX_OPT_GROUPS, MAX_OPT_GROUPS);
         cnt = MAX_OPT_GROUPS;
     }
 
@@ -4934,11 +4998,10 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
                              "%s", asmb->st.current_file);
                     asmb->st.combo_budget_warned_line[_wi] = asmb->st.ln;
                 }
-                fprintf(stderr,
-                        " warning - a pattern with %d optional group(s) exceeded the "
-                        "%llu-combination match budget and was treated as non-matching; "
-                        "consider splitting it into multiple explicit pattern entries.\n",
-                        cnt, (unsigned long long)MAX_COMBINATIONS);
+                axx_diagf(0, 0, " warning - a pattern with %d optional group(s) exceeded the "
+                           "%llu-combination match budget and was treated as non-matching; "
+                           "consider splitting it into multiple explicit pattern entries.\n",
+                           cnt, (unsigned long long)MAX_COMBINATIONS);
             }
             break;
         }
@@ -5047,11 +5110,11 @@ static void include_pat(Assembler *asmb, const char *l, const char *base_dir){
             trimmed[tn++]=after_kw[ti++];
         trimmed[tn]=0;
         if(trimmed[0]){
-            fprintf(stderr," warning - .INCLUDE filename not quoted: '%s'. "
-                           "Please use double quotes.\n", trimmed);
+            axx_diagf(0, 0, " warning - .INCLUDE filename not quoted: '%s'. "
+                       "Please use double quotes.\n", trimmed);
             strncpy(raw, trimmed, sizeof(raw)-1); raw[sizeof(raw)-1]='\0';
         } else {
-            fprintf(stderr," error - .INCLUDE directive has no filename: %s\n", l);
+            axx_diagf(0, 0, " error - .INCLUDE directive has no filename: %s\n", l);
             return;
         }
     }
@@ -5070,8 +5133,8 @@ static void readpat(Assembler *asmb, const char *fn){
      * (native stack overflow) instead of stopping cleanly. */
     enum { MAX_PAT_DEPTH = 50 };
     if(asmb->st.pat_include_depth > MAX_PAT_DEPTH){
-        fprintf(stderr," error - pattern .INCLUDE nesting exceeds %d: '%s'\n",
-                MAX_PAT_DEPTH, fn);
+        axx_diagf(0, 0, " error - pattern .INCLUDE nesting exceeds %d: '%s'\n",
+                   MAX_PAT_DEPTH, fn);
         return;
     }
     /* Canonicalize for reliable cycle keys (resolves symlinks / './' / '..'). */
@@ -5083,8 +5146,8 @@ static void readpat(Assembler *asmb, const char *fn){
     for(int i=0;i<asmb->st.pat_include_depth;i++){
         if(asmb->st.pat_include_chain[i]
            && strcmp(asmb->st.pat_include_chain[i], real)==0){
-            fprintf(stderr," error - circular pattern .INCLUDE detected: '%s' "
-                    "(already in include chain). Skipped.\n", fn);
+            axx_diagf(0, 0, " error - circular pattern .INCLUDE detected: '%s' "
+                       "(already in include chain). Skipped.\n", fn);
             return;
         }
     }
@@ -5210,8 +5273,7 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
                  * discard everything between "@@[" and the matched (or
                  * missing) "]" here with no diagnostic at all. */
                 if(should_report_errors(&asmb->st)){
-                    fprintf(stderr," error - @@[...]: missing ',' separating count and pattern.\n");
-                    asmb->st.had_error = 1;
+                    axx_diagf(1, 0, " error - @@[...]: missing ',' separating count and pattern.\n");
                 }
                 if(n+3<osz){ out[n++]='@'; out[n++]='@'; out[n++]='['; has_content=1; }
             }
@@ -5395,10 +5457,9 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
             { int _peek=idx; while(_peek<slen && (line[_peek]==' '||line[_peek]=='\t')) _peek++;
               if(_peek<slen && line[_peek]=='.'){
                   if(should_report_errors(st)){
-                      fprintf(stderr," error - directives (e.g. .section/.endsection/.INCLUDE) "
-                              "are not allowed inside VLIW slots (the packet's PC has not "
-                              "advanced yet at this point in the packet).\n");
-                      st->had_error = 1;
+                      axx_diagf(1, 0, " error - directives (e.g. .section/.endsection/.INCLUDE) "
+                                 "are not allowed inside VLIW slots (the packet's PC has not "
+                                 "advanced yet at this point in the packet).\n");
                   }
                   ivv_free(&objs); free(idxlst);
                   if(idx_out) *idx_out=idx;
@@ -5436,8 +5497,7 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
      * Guard and report an error, matching axx.py VLIWProcessor.vliwprocess(). */
     if(st->vliwinstbits == 0){
         if(should_report_errors(st)){
-            fprintf(stderr," error - vliwinstbits is zero; cannot compute instruction slots.\n");
-            st->had_error = 1;
+            axx_diagf(1, 0, " error - vliwinstbits is zero; cannot compute instruction slots.\n");
         }
         ivv_free(&objs); free(idxlst);
         if(idx_out) *idx_out=idx;
@@ -5475,10 +5535,9 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
          * 明確なエラーで打ち切る。 */
         if(noi <= 0){
             if(should_report_errors(st)){
-                fprintf(stderr," error - .vliw: vliwtemplatebits (%d) leaves no room for "
-                        "instruction slots in a %d-bit packet (vliwinstbits=%d).\n",
-                        st->vliwtemplatebits, vbits, st->vliwinstbits);
-                st->had_error = 1;
+                axx_diagf(1, 0, " error - .vliw: vliwtemplatebits (%d) leaves no room for "
+                           "instruction slots in a %d-bit packet (vliwinstbits=%d).\n",
+                           st->vliwtemplatebits, vbits, st->vliwinstbits);
             }
             iv_free(&values);
             ivv_free(&objs); free(idxlst);
@@ -5565,8 +5624,7 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
     }
 
     if(!found && (should_report_errors(st))){
-        fprintf(stderr," error - No vliw instruction-set defined.\n");
-        st->had_error = 1;
+        axx_diagf(1, 0, " error - No vliw instruction-set defined.\n");
     }
 
     ivv_free(&objs); free(idxlst);
@@ -5637,8 +5695,8 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
                 rt_lc[ri]='\0';
                 reloc_type = elf_machine_named(elf_machine_find(st->elf_machine), rt_lc);
                 if(reloc_type < 0)
-                    fprintf(stderr," warning - unknown reloctype '%s' in .EQU for machine %d\n",
-                            rt_lc, st->elf_machine);
+                    axx_diagf(0, 0, " warning - unknown reloctype '%s' in .EQU for machine %d\n",
+                               rt_lc, st->elf_machine);
             }
 
             /* === ここが修正箇所：.equ 内の forward reference を pass1 で正しく扱う === */
@@ -5664,10 +5722,10 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
             if(track_sections){
                 st->equ_section_tracking = 0;
                 if(st->equ_multi_section && should_report_errors(st)){
-                    fprintf(stderr, " warning - .EQU '%s': expression combines labels from "
-                            "multiple sections without an explicit ::reloctype; the resulting "
-                            "constant assumes a specific section layout and will NOT be "
-                            "relocated by the linker.\n", label);
+                    axx_diagf(0, 0, " warning - .EQU '%s': expression combines labels from "
+                               "multiple sections without an explicit ::reloctype; the resulting "
+                               "constant assumes a specific section layout and will NOT be "
+                               "relocated by the linker.\n", label);
                 }
             }
             /* Bugfix (axx.py port): an undefined label referenced by this
@@ -5678,9 +5736,8 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
              * every other directive that evaluates an expression already
              * performs (.ORG/.RESB/.ZERO/.ALIGN). */
             if(st->error_undefined_label && should_report_errors(st)){
-                fprintf(stderr, " error - .EQU '%s': expression contains undefined label.\n",
-                        label);
-                st->had_error = 1;
+                axx_diagf(1, 0, " error - .EQU '%s': expression contains undefined label.\n",
+                           label);
             }
             /* ====================================================================== */
 
@@ -5827,9 +5884,8 @@ static int adir_endsection(AsmState *st, const char *l){
     if(strcmp(up,".ENDSECTION")!=0 && strcmp(up,".ENDSEGMENT")!=0) return 0;
     SecEntry *e=secmap_find(&st->sections,st->current_section);
     if(!e){
-        fprintf(stderr," error - .ENDSECTION without matching .SECTION for '%s'.\n",
-               st->current_section);
-        st->had_error = 1;
+        axx_diagf(1, 0, " error - .ENDSECTION without matching .SECTION for '%s'.\n",
+                   st->current_section);
         return 1;
     }
     /* Confirmed size: measure from entry_pc (last re-entry) to current pc.
@@ -5870,26 +5926,23 @@ static int adir_resX(Assembler *asmb, const char *l, const char *l2,
     uint256_t x=expr_expression_asm(asmb,l2,0,&io);
     if(asmb->st.error_undefined_label){
         if(should_report_errors(&asmb->st)){
-            fprintf(stderr," error - %s argument contains undefined label.\n",directive);
-            asmb->st.had_error = 1;
+            axx_diagf(1, 0, " error - %s argument contains undefined label.\n",directive);
         }
         return 1;
     }
     int64_t cnt=u256_to_i64(x);
     if(cnt < 0){
         if(should_report_errors(&asmb->st)){
-            fprintf(stderr," error - %s requires a non-negative count, got %lld.\n",
-                    directive,(long long)cnt);
-            asmb->st.had_error = 1;
+            axx_diagf(1, 0, " error - %s requires a non-negative count, got %lld.\n",
+                       directive,(long long)cnt);
         }
         return 1;
     }
     /* 256 MB guard: check before multiplying to avoid signed overflow */
     if(cnt > (int64_t)(1 << 28) / (int64_t)mul){
         if(should_report_errors(&asmb->st)){
-            fprintf(stderr," error - %s count %lld (x%llu) exceeds maximum %d words.\n",
-                    directive,(long long)cnt,(unsigned long long)mul,1<<28);
-            asmb->st.had_error = 1;
+            axx_diagf(1, 0, " error - %s count %lld (x%llu) exceeds maximum %d words.\n",
+                       directive,(long long)cnt,(unsigned long long)mul,1<<28);
         }
         return 1;
     }
@@ -5925,16 +5978,14 @@ static int adir_zero(Assembler *asmb, const char *l, const char *l2){
      * Also guard against negative values. Mirrors axx.py zero_processing(). */
     if(asmb->st.error_undefined_label){
         if(should_report_errors(&asmb->st)){
-            fprintf(stderr," error - .ZERO argument contains undefined label.\n");
-            asmb->st.had_error = 1;
+            axx_diagf(1, 0, " error - .ZERO argument contains undefined label.\n");
         }
         return 1;
     }
     int64_t cnt=u256_to_i64(x);
     if(cnt < 0){
         if(should_report_errors(&asmb->st)){
-            fprintf(stderr," error - .ZERO requires a non-negative count, got %lld.\n", (long long)cnt);
-            asmb->st.had_error = 1;
+            axx_diagf(1, 0, " error - .ZERO requires a non-negative count, got %lld.\n", (long long)cnt);
         }
         return 1;
     }
@@ -5957,8 +6008,7 @@ static int adir_asciiz(Assembler *asmb, const char *l, const char *l2){
     int f=asciistr(asmb,l2);
     if(!f){
         if(should_report_errors(&asmb->st)){
-            fprintf(stderr," error - .ASCIZ requires a quoted string.\n");
-            asmb->st.had_error = 1;
+            axx_diagf(1, 0, " error - .ASCIZ requires a quoted string.\n");
         }
         return 0;
     }
@@ -5981,8 +6031,7 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
         int io; uint256_t u=expr_expression_asm(asmb,l2,0,&io);
         if(asmb->st.error_undefined_label){
             if(should_report_errors(&asmb->st)){
-                fprintf(stderr," error - .ALIGN argument contains undefined label.\n");
-                asmb->st.had_error = 1;
+                axx_diagf(1, 0, " error - .ALIGN argument contains undefined label.\n");
             }
             return 1;
         }
@@ -5993,9 +6042,8 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
          * 弾いており、Cポートだけこのガードが欠落していた)。 */
         if(u_int <= 0){
             if(should_report_errors(&asmb->st)){
-                fprintf(stderr," error - .ALIGN requires a positive value, got %lld.\n",
-                        (long long)u_int);
-                asmb->st.had_error = 1;
+                axx_diagf(1, 0, " error - .ALIGN requires a positive value, got %lld.\n",
+                           (long long)u_int);
             }
             return 1;
         }
@@ -6031,8 +6079,7 @@ static int adir_org(Assembler *asmb, const char *l, const char *l2){
      * Mirrors axx.py org_processing() which checks error_undefined_label. */
     if(asmb->st.error_undefined_label){
         if(should_report_errors(&asmb->st)){
-            fprintf(stderr," error - .ORG argument contains undefined label.\n");
-            asmb->st.had_error = 1;
+            axx_diagf(1, 0, " error - .ORG argument contains undefined label.\n");
         }
         return 1;
     }
@@ -6119,8 +6166,8 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
                     if(rt_str[_ci]>='A'&&rt_str[_ci]<='Z') rt_str[_ci]+=32;
                 int rtype = elf_machine_named(_mtbl_ext, rt_str);
                 if(rtype < 0)
-                    fprintf(stderr," warning - unknown reloc type '%s' in .EXTERN for machine %d\n",
-                            rt_str, st->elf_machine);
+                    axx_diagf(0, 0, " warning - unknown reloc type '%s' in .EXTERN for machine %d\n",
+                               rt_str, st->elf_machine);
                 else
                     reloc_type = rtype;
             }
@@ -6168,8 +6215,8 @@ static int adir_reloctype(Assembler *asmb, const char *l, const char *l2){
 
     const ElfMachineInfo *_mtbl_rt = elf_machine_find(st->elf_machine);
     if(!_mtbl_rt){
-        fprintf(stderr," warning - .RELOCTYPE: no relocation table for machine %d\n",
-                st->elf_machine);
+        axx_diagf(0, 0, " warning - .RELOCTYPE: no relocation table for machine %d\n",
+                   st->elf_machine);
         return 1;
     }
     static const int _widths[4] = {1, 2, 4, 8};
@@ -6184,8 +6231,8 @@ static int adir_reloctype(Assembler *asmb, const char *l, const char *l2){
 
         if(pos >= 4){
             if(tok_len > 0)
-                fprintf(stderr," warning - .RELOCTYPE: too many arguments "
-                        "(only 4 widths -- 8/16/32/64-bit -- are supported)\n");
+                axx_diagf(0, 0, " warning - .RELOCTYPE: too many arguments "
+                           "(only 4 widths -- 8/16/32/64-bit -- are supported)\n");
             break;
         }
 
@@ -6205,16 +6252,16 @@ static int adir_reloctype(Assembler *asmb, const char *l, const char *l2){
         if(name[0]){
             int rtype = elf_machine_named(_mtbl_rt, name);
             if(rtype < 0){
-                fprintf(stderr," warning - unknown reloc type '%s' in "
-                        ".RELOCTYPE for machine %d\n", name, st->elf_machine);
+                axx_diagf(0, 0, " warning - unknown reloc type '%s' in "
+                           ".RELOCTYPE for machine %d\n", name, st->elf_machine);
             } else {
                 int expected_width = _widths[pos];
                 int actual_width = elf_machine_reloc_bytes(_mtbl_rt, rtype);
                 if(actual_width != 0 && actual_width != expected_width){
-                    fprintf(stderr," warning - .RELOCTYPE: '%s' is a %d-bit "
-                            "relocation type, but was given in the %d-bit "
-                            "position; ignored\n",
-                            name, actual_width*8, expected_width*8);
+                    axx_diagf(0, 0, " warning - .RELOCTYPE: '%s' is a %d-bit "
+                               "relocation type, but was given in the %d-bit "
+                               "position; ignored\n",
+                               name, actual_width*8, expected_width*8);
                 } else {
                     st->reloctype_override[pos] = rtype;
                 }
@@ -6285,6 +6332,11 @@ typedef struct {
      * the real makeobj() call and the final "Undefined label in
      * expression" check downstream could ever see it. */
     int       error_undefined_label;
+
+    /* この候補がマッチ試行中に出した診断（勝ったときだけ再生する）。 */
+    char    **diags;
+    int      *diag_seterr;
+    int       diags_len;
 } BestMatch;
 
 static void best_init(BestMatch *b){
@@ -6292,6 +6344,9 @@ static void best_init(BestMatch *b){
 }
 
 static void best_free(BestMatch *b){
+    for(int i=0;i<b->diags_len;i++) free(b->diags[i]);
+    free(b->diags); free(b->diag_seterr);
+    b->diags = NULL; b->diag_seterr = NULL; b->diags_len = 0;
     if(!b->valid){ memset(b, 0, sizeof(*b)); return; }
     for(int i=0;i<b->refs_len;i++) free(b->refs[i].name);
     free(b->refs);
@@ -6586,8 +6641,16 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
          * (例: OUT (!n),A が OUT (C),E を試みると !n キャプチャで
          *  C がラベルとして評価され false-positive エラーが出る。) */
         st->in_match_attempt = 1;
+        diag_capture_begin(st);
         int _match_ok = pat_match0(asmb,lin,i->f[0]);
         st->in_match_attempt = 0;
+        char **_cand_diags = NULL; int *_cand_seterr = NULL; int _cand_ndiag = 0;
+        diag_capture_take(st, &_cand_diags, &_cand_seterr, &_cand_ndiag);
+        if(!_match_ok){                     /* 落選候補の診断は捨てる */
+            for(int di=0; di<_cand_ndiag; di++) free(_cand_diags[di]);
+            free(_cand_diags); free(_cand_seterr);
+            _cand_diags = NULL; _cand_seterr = NULL; _cand_ndiag = 0;
+        }
 
         if(_match_ok){
             /* より具体的なマッチなら候補を更新する（同点は先出現優先）。 */
@@ -6596,7 +6659,14 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
                           st->match_score_lit,
                           best.score_expr, best.score_sym, best.score_lit)){
                 best_capture(st, &best, i, pln, saved_refs_len);
+                best.diags       = _cand_diags;
+                best.diag_seterr = _cand_seterr;
+                best.diags_len   = _cand_ndiag;
+                _cand_diags = NULL; _cand_seterr = NULL; _cand_ndiag = 0;
             }
+            for(int di=0; di<_cand_ndiag; di++) free(_cand_diags[di]);
+            free(_cand_diags); free(_cand_seterr);
+            _cand_diags = NULL; _cand_seterr = NULL; _cand_ndiag = 0;
             /* 副作用を巻き戻して走査を継続する
              * （より具体的なパターンが後方にあるかもしれない）。 */
             memcpy(st->vars, saved_vars, sizeof(saved_vars));
@@ -6651,6 +6721,8 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
          * trial match (saved on `best` above) survives into the probe/
          * real makeobj() calls below instead of being discarded here. */
         st->error_undefined_label = best.error_undefined_label;
+        /* 勝った候補がマッチ試行中に出した診断をここで再生する。 */
+        diag_replay(st, best.diags, best.diag_seterr, best.diags_len);
         st->expmode = EXP_ASM;
 
         /* $$/$. のために命令先頭・末尾アドレスを事前確定する。
@@ -6721,15 +6793,13 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
          * below never triggers) printed "Undefined label" yet still
          * returned 1 with whatever bytes makeobj() happened to produce. */
         if(st->error_undefined_label){
-            fprintf(stderr, " error - Undefined label in expression.  [%s:%d]\n",
-                st->current_file, (int)st->ln);
-            st->had_error=1;
+            axx_diagf(1, 0, " error - Undefined label in expression.  [%s:%d]\n",
+                       st->current_file, (int)st->ln);
             *idx_out=idx; return 0;
         }
         if(se){
-            fprintf(stderr, " error - Syntax error.  [%s:%d]\n",
-                st->current_file, (int)st->ln);
-            st->had_error=1;
+            axx_diagf(1, 0, " error - Syntax error.  [%s:%d]\n",
+                       st->current_file, (int)st->ln);
             *idx_out=idx; return 0;
         }
         if(oerr){
@@ -7792,8 +7862,8 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
          * reason. Emitting it for a 32-bit machine would produce
          * structurally-wrong-width DWARF instead of just incomplete DWARF,
          * so refuse rather than silently corrupt it. */
-        fprintf(stderr," warning - DWARF debug info (-g) is not yet supported for "
-                "32-bit targets (machine %d); skipping debug sections.\n", machine);
+        axx_diagf(0, 0, " warning - DWARF debug info (-g) is not yet supported for "
+                   "32-bit targets (machine %d); skipping debug sections.\n", machine);
     }
     if(st->gen_debug && st->line_map_len>0 && _mtbl_dbg && _mtbl_dbg->elfclass == 2){
         /* growable raw byte buffer */
@@ -7985,8 +8055,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
          * silently breaking any build system that only checks the exit
          * code. */
         if(should_report_errors(st)){
-            fprintf(stderr," error - cannot create ELF output file '%s': %s\n", path, strerror(errno));
-            st->had_error = 1;
+            axx_diagf(1, 0, " error - cannot create ELF output file '%s': %s\n", path, strerror(errno));
         }
         goto weo_done;
     }
@@ -8400,7 +8469,7 @@ static void m_warn(MacroPP *mp, const char *file, int line, const char *fmt, ...
     char msg[1200];
     snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
     if(m_first_report(mp, msg))
-        fprintf(stderr, " warning - %s\n", msg);
+        axx_diagf(0, 0, " warning - %s\n", msg);
 }
 
 /* Abort the current expansion. Never returns: it longjmps back to
@@ -8413,7 +8482,7 @@ static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...
     char msg[1200];
     snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
     if(m_first_report(mp, msg))
-        fprintf(stderr, " error - %s\n", msg);
+        axx_diagf(0, 0, " error - %s\n", msg);
     mp->had_error = 1;
     if(mp->asmb) mp->asmb->st.had_error = 1;
     if(mp->jb_active) longjmp(mp->jb, 1);
@@ -9871,8 +9940,7 @@ static void fileassemble(Assembler *asmb, const char *fn){
             if(!already || !already[0]) continue;
             int is_stdin_already = (strcmp(already,"stdin")==0 || strcmp(already,"(stdin)")==0);
             if(is_stdin_fn && is_stdin_already){
-                fprintf(stderr," error - circular .INCLUDE detected: '%s' is already being assembled.\n", fn);
-                st->had_error=1;
+                axx_diagf(1, 0, " error - circular .INCLUDE detected: '%s' is already being assembled.\n", fn);
                 return;
             }
             if(!is_stdin_fn && !is_stdin_already){
@@ -9880,8 +9948,7 @@ static void fileassemble(Assembler *asmb, const char *fn){
                 char abs_fn[4096]={0}, abs_al[4096]={0};
                 if(realpath(fn,   abs_fn) && realpath(already, abs_al)
                    && strcmp(abs_fn, abs_al)==0){
-                    fprintf(stderr," error - circular .INCLUDE detected: '%s' is already being assembled.\n", fn);
-                    st->had_error=1;
+                    axx_diagf(1, 0, " error - circular .INCLUDE detected: '%s' is already being assembled.\n", fn);
                     return;
                 }
             }
@@ -10119,8 +10186,8 @@ static int imp_label(Assembler *asmb, const char *l){
             const char *rt_str = sep + 2;
             reloc_type = elf_machine_named(elf_machine_find(asmb->st.elf_machine), rt_str);
             if(reloc_type < 0)
-                fprintf(stderr," warning - unknown reloc type '%s' for imported label '%s'\n",
-                        rt_str, label);
+                axx_diagf(0, 0, " warning - unknown reloc type '%s' for imported label '%s'\n",
+                           rt_str, label);
         }
         if(!label[0]) return 0;
         char *endp;
@@ -10268,12 +10335,12 @@ int main(int argc, char *argv[]){
                     _kn += snprintf(_known+_kn, sizeof(_known)-(size_t)_kn, "%s%d (%s)",
                                      _mi?", ":"", ELF_MACHINES[_mi].machine, ELF_MACHINES[_mi].name);
                 }
-                fprintf(stderr, " error - -m/--machine value %d is not a supported ELF "
-                        "e_machine number. axx only knows correct relocation-type "
-                        "numbering for: %s. Refusing to guess/fall back to x86_64 "
-                        "numbering for an unrecognized machine, since that would "
-                        "silently mislabel every relocation in the output.\n",
-                        _mval, _known);
+                axx_diagf(0, 0, " error - -m/--machine value %d is not a supported ELF "
+                           "e_machine number. axx only knows correct relocation-type "
+                           "numbering for: %s. Refusing to guess/fall back to x86_64 "
+                           "numbering for an unrecognized machine, since that would "
+                           "silently mislabel every relocation in the output.\n",
+                           _mval, _known);
                 return 1;
             }
             st->elf_machine = _mval;
@@ -10341,13 +10408,13 @@ int main(int argc, char *argv[]){
      * layer itself. */
     if(macro_expand_dest){
         if(!sourcefile){
-            fprintf(stderr," error - -P/--macro-expand needs a source file.\n");
+            axx_diagf(0, 0, " error - -P/--macro-expand needs a source file.\n");
             exit_code=1; goto cleanup;
         }
         FILE *mf=fopen(sourcefile,"rt");
         if(!mf){
-            fprintf(stderr," error - cannot open source file '%s': %s\n",
-                    sourcefile, strerror(errno));
+            axx_diagf(0, 0, " error - cannot open source file '%s': %s\n",
+                       sourcefile, strerror(errno));
             exit_code=1; goto cleanup;
         }
         macro_reset_pass(&g_macro);
@@ -10357,8 +10424,8 @@ int main(int argc, char *argv[]){
         FILE *of = (strcmp(macro_expand_dest,"-")==0) ? stdout
                                                       : fopen(macro_expand_dest,"wt");
         if(!of){
-            fprintf(stderr," error - cannot write '%s': %s\n",
-                    macro_expand_dest, strerror(errno));
+            axx_diagf(0, 0, " error - cannot write '%s': %s\n",
+                       macro_expand_dest, strerror(errno));
             exit_code=1; goto cleanup;
         }
         for(int _mi=0;_mi<mv.len;_mi++) fprintf(of,"%s\n",mv.d[_mi].text);
@@ -10518,11 +10585,10 @@ int main(int argc, char *argv[]){
                     if(cycle_len == 1){
                         converged = 1;
                     } else {
-                        fprintf(stderr,
-                            " error - Pass1 relaxation is oscillating with period %d "
-                            "(the instruction layout at iteration %d is identical to "
-                            "iteration %d); it will never converge by simple repetition.\n",
-                            cycle_len, relax+1, first_seen+1);
+                        axx_diagf(0, 0, " error - Pass1 relaxation is oscillating with period %d "
+                                   "(the instruction layout at iteration %d is identical to "
+                                   "iteration %d); it will never converge by simple repetition.\n",
+                                   cycle_len, relax+1, first_seen+1);
                         fprintf(stderr,"         Aborting: no output file written.\n");
                         for(int hi=0; hi<history_count; hi++) lmap_free(&history[hi]);
                         lmap_free(&prev_labels);
@@ -10572,9 +10638,9 @@ int main(int argc, char *argv[]){
             /* Fix: 収束しなかった場合は単なる警告ではなく致命的エラーとする。
              * 収束前提のPass2アドレスは信頼できないため、Pass2実行・出力書き込み
              * を行わずここで打ち切る(誤ったバイナリを黙って出力しないため)。 */
-            fprintf(stderr," error - Pass1 relaxation did not converge after %d iterations; "
-                    "addresses would be incorrect for variable-length instructions "
-                    "with forward references.\n", MAX_RELAX);
+            axx_diagf(0, 0, " error - Pass1 relaxation did not converge after %d iterations; "
+                       "addresses would be incorrect for variable-length instructions "
+                       "with forward references.\n", MAX_RELAX);
             fprintf(stderr,"         Aborting: no output file written.\n");
             lmap_free(&pass1_final);
             exit_code = 1;
@@ -10630,8 +10696,8 @@ int main(int argc, char *argv[]){
                     if(p && !u256_eq(p->value, e->value)) drift_count++;
                 }
             if(drift_count){
-                fprintf(stderr," error - address mismatch between pass1 and pass2 "
-                    "(%d label(s)); output addresses are UNRELIABLE.\n", drift_count);
+                axx_diagf(0, 0, " error - address mismatch between pass1 and pass2 "
+                           "(%d label(s)); output addresses are UNRELIABLE.\n", drift_count);
                 fprintf(stderr,"         This usually means pass1 relaxation did "
                     "not fully converge for variable-length forward references.\n");
                 int shown = 0;
@@ -10669,8 +10735,8 @@ int main(int argc, char *argv[]){
          * error state existed, so main() always reached this point and
          * wrote output regardless of errors printed above. */
         if(st->had_error){
-            fprintf(stderr," error - one or more errors were reported during assembly; "
-                    "output would be incomplete or wrong.\n");
+            axx_diagf(0, 0, " error - one or more errors were reported during assembly; "
+                       "output would be incomplete or wrong.\n");
             fprintf(stderr,"         Aborting: no output file written.\n");
             exit_code = 1;
             goto cleanup;
@@ -10683,8 +10749,8 @@ int main(int argc, char *argv[]){
     if(st->elf_objfile[0]){
         write_elf_obj(st, st->elf_objfile, st->elf_machine);
         if(st->had_error){
-            fprintf(stderr," error - one or more errors were reported during assembly; "
-                    "output would be incomplete or wrong.\n");
+            axx_diagf(0, 0, " error - one or more errors were reported during assembly; "
+                       "output would be incomplete or wrong.\n");
             fprintf(stderr,"         Aborting: no output file written.\n");
             exit_code = 1;
             goto cleanup;
