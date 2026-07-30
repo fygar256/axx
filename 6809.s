@@ -22,6 +22,7 @@
 ;   python3 axx.py 6809.axx sample6809.s -b sample6809.bin -v
 ; ============================================================
 
+dpreg:  .equ    0
         .org    0x8000
 
 start:
