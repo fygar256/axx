@@ -43,12 +43,24 @@
 /*     LDA [n,PCR] / [<n,PCR] / [>n,PCR]     indirect PC-relative forms
 /*     LDA [$1234]        extended indirect (fixed 2-byte address)
 /*
+/*  Data definition:
+/*     FCB v / FCB v,w / FCB v,w,x / FCB v,w,x,y     1 byte each
+/*     FDB v / FDB v,w                               2 bytes each (big-endian)
+/*
 /*  Numbers use axx expression syntax (0x10 / 16 / 0b10000), not $10.
 /*
 /*  Register lists for PSHS/PULS/PSHU/PULU accept any of the 8 valid
-/*  register names in any order and any combination, e.g.:
+/*  register names in any order and any combination, plus D as the
+/*  conventional shorthand for A,B (postbyte bits 0x06), e.g.:
 /*     PSHS A,B,X,Y       PULU CC,D,U is invalid (U can't appear on
-/*                        its own U-stack; use PULU CC,D,S instead)
+/*     PSHS D,X           its own U-stack; use PULU CC,D,S instead)
+/*
+/*  NOTE ON FORCED INDEXED OFFSETS -- this file's < / > / >> differ from
+/*  the Motorola/A09/lwasm convention.  Here < is 5-bit, > is 8-bit and
+/*  >> is 16-bit; those assemblers use < for 8-bit and > for 16-bit and
+/*  have no 5-bit forcing syntax.  Source ported from them must have its
+/*  forced indexed offsets rewritten (plain "n,r" auto-selects the
+/*  shortest form and is portable either way).
 /*
 /*  Error codes raised by this file
 /*     2  Address out of range (forced addressing mode operand too big)
@@ -119,14 +131,15 @@ EXG p,q :: 0x1E,(p<<4)|q
 .setsym::Y::0x20
 .setsym::U::0x40
 .setsym::PC::0x80
-.check::a::CC,A,B,DP,X,Y,U,PC
-.check::b::CC,A,B,DP,X,Y,U,PC
-.check::c::CC,A,B,DP,X,Y,U,PC
-.check::d::CC,A,B,DP,X,Y,U,PC
-.check::e::CC,A,B,DP,X,Y,U,PC
-.check::f::CC,A,B,DP,X,Y,U,PC
-.check::g::CC,A,B,DP,X,Y,U,PC
-.check::h::CC,A,B,DP,X,Y,U,PC
+.setsym::D::0x06
+.check::a::CC,A,B,D,DP,X,Y,U,PC
+.check::b::CC,A,B,D,DP,X,Y,U,PC
+.check::c::CC,A,B,D,DP,X,Y,U,PC
+.check::d::CC,A,B,D,DP,X,Y,U,PC
+.check::e::CC,A,B,D,DP,X,Y,U,PC
+.check::f::CC,A,B,D,DP,X,Y,U,PC
+.check::g::CC,A,B,D,DP,X,Y,U,PC
+.check::h::CC,A,B,D,DP,X,Y,U,PC
 PSHS a[[,b]][[,c]][[,d]][[,e]][[,f]][[,g]][[,h]] :: :: 0x34,a|b|c|d|e|f|g|h
 PULS a[[,b]][[,c]][[,d]][[,e]][[,f]][[,g]][[,h]] :: :: 0x35,a|b|c|d|e|f|g|h
 .clrcheck::a
@@ -147,14 +160,15 @@ PULS a[[,b]][[,c]][[,d]][[,e]][[,f]][[,g]][[,h]] :: :: 0x35,a|b|c|d|e|f|g|h
 .setsym::Y::0x20
 .setsym::S::0x40
 .setsym::PC::0x80
-.check::a::CC,A,B,DP,X,Y,S,PC
-.check::b::CC,A,B,DP,X,Y,S,PC
-.check::c::CC,A,B,DP,X,Y,S,PC
-.check::d::CC,A,B,DP,X,Y,S,PC
-.check::e::CC,A,B,DP,X,Y,S,PC
-.check::f::CC,A,B,DP,X,Y,S,PC
-.check::g::CC,A,B,DP,X,Y,S,PC
-.check::h::CC,A,B,DP,X,Y,S,PC
+.setsym::D::0x06
+.check::a::CC,A,B,D,DP,X,Y,S,PC
+.check::b::CC,A,B,D,DP,X,Y,S,PC
+.check::c::CC,A,B,D,DP,X,Y,S,PC
+.check::d::CC,A,B,D,DP,X,Y,S,PC
+.check::e::CC,A,B,D,DP,X,Y,S,PC
+.check::f::CC,A,B,D,DP,X,Y,S,PC
+.check::g::CC,A,B,D,DP,X,Y,S,PC
+.check::h::CC,A,B,D,DP,X,Y,S,PC
 PSHU a[[,b]][[,c]][[,d]][[,e]][[,f]][[,g]][[,h]] :: :: 0x36,a|b|c|d|e|f|g|h
 PULU a[[,b]][[,c]][[,d]][[,e]][[,f]][[,g]][[,h]] :: :: 0x37,a|b|c|d|e|f|g|h
 .clrcheck::a
@@ -2030,5 +2044,9 @@ CMPS [!v] :: :: 0x11,0xAC,0x9F,(v>>8)&0xff,v&0xff
    suppression idiom cannot distinguish "slot absent" from "slot
    present with value 0" for an arbitrary data list. */
 FCB !v :: :: v&0xff
+FCB !v,!w :: :: v&0xff,0x100|(w&0xff)
+FCB !v,!w,!x :: :: v&0xff,0x100|(w&0xff),0x100|(x&0xff)
+FCB !v,!w,!x,!y :: :: v&0xff,0x100|(w&0xff),0x100|(x&0xff),0x100|(y&0xff)
 FDB !v :: :: (v>>8)&0xff,v&0xff
+FDB !v,!w :: :: (v>>8)&0xff,0x100|(v&0xff),0x100|((w>>8)&0xff),0x100|(w&0xff)
 
