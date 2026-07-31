@@ -45,6 +45,10 @@ Integer literals: `10` / `0x1f` / `0b1010` / `0o17` (underscores allowed).
 `len(s)` `hex(v[,digits])` `str(v)` `int(s[,base])` `upper(s)` `lower(s)`
 `substr(s,start[,length])` `abs(v)` `min(...)` `max(...)` `uid()` `defined(name)`
 
+`substr()` clamps its start and length to the string. A negative start means
+the beginning (0), *not* Python-style indexing from the end; a negative length
+is treated as 0.
+
 ## Implicit Variables in Macros
 
 | Name | Content |

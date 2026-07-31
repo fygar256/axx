@@ -8663,7 +8663,8 @@ static void m_warn(MacroPP *mp, const char *file, int line, const char *fmt, ...
     char msg[1200];
     snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
     if(m_first_report(mp, msg))
-        axx_diagf(0, 0, " warning - %s\n", msg);
+        /* force=1: same reason as m_fail() below. */
+        axx_diagf(0, 1, " warning - %s\n", msg);
 }
 
 /* Abort the current expansion. Never returns: it longjmps back to
@@ -8676,7 +8677,13 @@ static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...
     char msg[1200];
     snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
     if(m_first_report(mp, msg))
-        axx_diagf(0, 0, " error - %s\n", msg);
+        /* force=1: macro expansion runs inside Pass 1, whose diagnostics are
+         * normally gated off because an unresolved label there is not yet an
+         * error.  A macro error is deterministic and will never resolve, so
+         * without the force the user saw only the generic "one or more errors
+         * were reported during assembly" -- no file, no line, no reason.
+         * m_first_report() already stops it repeating once per iteration. */
+        axx_diagf(0, 1, " error - %s\n", msg);
     mp->had_error = 1;
     if(mp->asmb) mp->asmb->st.had_error = 1;
     if(mp->jb_active) longjmp(mp->jb, 1);
@@ -10019,7 +10026,10 @@ static void m_do_include(MacroPP *mp, const char *name, const char *file, int li
     } else {
         char dir[1024];
         axx_dir_of(file && file[0] ? file : ".", dir, sizeof(dir));
-        axx_resolve_path(dir, name, path, sizeof(path));
+        if(dir[0] == '.' && dir[1] == '\0')
+            snprintf(path, sizeof(path), "%s", name);
+        else
+            axx_resolve_path(dir, name, path, sizeof(path));
     }
     char real[PATH_MAX];
     if(!realpath(path, real)){ snprintf(real, sizeof(real), "%s", path); }
@@ -10033,7 +10043,9 @@ static void m_do_include(MacroPP *mp, const char *name, const char *file, int li
     if(!f) m_fail(mp, file, line, "cannot '!include' \"%s\": %s", name, strerror(errno));
 
     MSrc src;
-    m_read_lines(mp, f, name, &src);
+    /* Tag the included lines with the *resolved* path, not the string as
+     * written: a nested '!include' inside this file resolves against it. */
+    m_read_lines(mp, f, path, &src);
     fclose(f);
 
     mp->inc_stack[mp->ninc++] = marena_strdup(&mp->arena, real);
