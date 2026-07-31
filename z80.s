@@ -73,13 +73,13 @@
     ADC A,(IY+0x12)
     ADC A,E
     ADC A,0x56
-    SUB A,(HL)
-    SUB A,(IX)
-    SUB A,(IY)
-    SUB A,(IX+0x12)
-    SUB A,(IY+0x12)
-    SUB A,E
-    SUB A,0x56
+    SUB (HL)
+    SUB (IX)
+    SUB (IY)
+    SUB (IX+0x12)
+    SUB (IY+0x12)
+    SUB E
+    SUB 0x56
     SBC A,(HL)
     SBC A,(IX)
     SBC A,(IY)
@@ -87,34 +87,34 @@
     SBC A,(IY+0x12)
     SBC A,E
     SBC A,0x56
-    AND A,(HL)
-    AND A,(IX)
-    AND A,(IY)
-    AND A,(IX+3)
-    AND A,(IY+3)
-    AND A,E
-    AND A,0x56
-    OR A,(HL)
-    OR A,(IX)
-    OR A,(IY)
-    OR A,(IX+0x12)
-    OR A,(IY+0x12)
-    OR A,E
-    OR A,0x56
-    XOR A,(HL)
-    XOR A,(IX)
-    XOR A,(IY)
-    XOR A,(IX+0x12)
-    XOR A,(IY+0x12)
-    XOR A,E
-    XOR A,0x56
-    CP A,(HL)
-    CP A,(IX)
-    CP A,(IY)
-    CP A,(IX+0x12)
-    CP A,(IY+0x12)
-    CP A,E
-    CP A,0x56
+    AND (HL)
+    AND (IX)
+    AND (IY)
+    AND (IX+3)
+    AND (IY+3)
+    AND E
+    AND 0x56
+    OR (HL)
+    OR (IX)
+    OR (IY)
+    OR (IX+0x12)
+    OR (IY+0x12)
+    OR E
+    OR 0x56
+    XOR (HL)
+    XOR (IX)
+    XOR (IY)
+    XOR (IX+0x12)
+    XOR (IY+0x12)
+    XOR E
+    XOR 0x56
+    CP (HL)
+    CP (IX)
+    CP (IY)
+    CP (IX+0x12)
+    CP (IY+0x12)
+    CP E
+    CP 0x56
     INC HL
     INC IY
     INC IX
