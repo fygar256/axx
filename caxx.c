@@ -1086,6 +1086,13 @@ typedef struct {
      * optimal variable-length layout. NULL outside the pass1 relaxation loop. */
     LabelMap  *relax_prev;
 
+    /* Nonzero only during the FIRST relaxation iteration. While set, a label
+     * that has no value yet (a forward reference, with no previous-iteration
+     * estimate to fall back on) is estimated as "right here", i.e. the address
+     * of the instruction currently being encoded. See label_get_value() for
+     * why the loop needs an optimistic seed rather than the UNDEF sentinel. */
+    int        relax_optimistic;
+
     /* D8 (axx.py port): pattern-file .INCLUDE chain (canonical paths) for
      * circular-include detection, plus the current nesting depth. */
     char      *pat_include_chain[64];
@@ -2614,6 +2621,42 @@ static uint256_t label_get_value(AsmState *st, const char *k){
         if(pe && !pe->is_undef){
             return pe->value;
         }
+    }
+    if(st->pas == 1 && st->relax_optimistic){
+        /* First relaxation iteration: this label is a forward reference and
+         * there is no previous-iteration estimate yet.
+         *
+         * Falling through to UNDEF_VAL() here would hand the pattern's
+         * size-selecting expression a meaningless value (all-bits-1, i.e. -1
+         * when the expression compares it as a signed displacement), so which
+         * encoding length comes out first depends on nothing but the current
+         * .ORG. Every later iteration only ever sees displacements computed
+         * from that arbitrary first layout, so a long encoding that happens to
+         * be self-consistent stays put even when a short one would also have
+         * been self-consistent -- the loop settles on whichever fixed point
+         * the initial guess fell into rather than on the smallest one.
+         * (Concretely, for a PC-relative operand whose displacement lands
+         * exactly on the 8-bit boundary, both the short and the long encoding
+         * are stable, and which one is produced varied with .ORG.)
+         *
+         * Estimating an unknown forward label as the address of the
+         * instruction being encoded makes every displacement come out as small
+         * as it possibly could be, so iteration 1 lays the program out with
+         * every variable-length instruction at its shortest form. Label
+         * addresses can then only move forward from iteration to iteration, so
+         * encodings only ever grow, and the loop converges on the SMALLEST
+         * self-consistent layout -- which is both what an assembler should
+         * emit and what makes the result independent of the starting guess.
+         *
+         * The flag is still set: an estimate is not a definition, and a
+         * genuinely undefined label must still be reported. Pass 1 never
+         * reports (see should_report_errors()), and pass 2 -- which never
+         * takes this branch -- does.
+         *
+         * This mirrors AssemblerState.relax_optimistic in axx.py; the two
+         * implementations must agree byte for byte. */
+        st->error_undefined_label = 1;
+        return st->pc;
     }
     st->error_undefined_label = 1;
     if(st->pass1_size_mode) return u256_zero();
@@ -10669,6 +10712,10 @@ int main(int argc, char *argv[]){
         st->relax_prev = &prev_labels;
 
         for(int relax=0; relax<MAX_RELAX; relax++){
+            /* Only the first iteration has no previous-iteration estimates to
+             * work from; from the second onwards every forward reference
+             * resolves through relax_prev. */
+            st->relax_optimistic = (relax == 0);
             st->pc=u256_zero(); st->pas=1; st->ln=1;
             /* Fix 5: restore imported labels instead of starting from empty */
             lmap_free(&st->labels); lmap_init(&st->labels);
@@ -10750,7 +10797,13 @@ int main(int argc, char *argv[]){
                     if(cycle_len == 1){
                         converged = 1;
                     } else {
-                        axx_diagf(0, 0, " error - Pass1 relaxation is oscillating with period %d "
+                        /* force=1: this fires during pass 1, which
+                         * should_report_errors() normally suppresses, so
+                         * without it the user only ever saw the bare
+                         * "Aborting: no output file written." line with no
+                         * reason attached. axx.py passes force=True at the
+                         * matching call site. */
+                        axx_diagf(0, 1, " error - Pass1 relaxation is oscillating with period %d "
                                    "(the instruction layout at iteration %d is identical to "
                                    "iteration %d); it will never converge by simple repetition.\n",
                                    cycle_len, relax+1, first_seen+1);
@@ -10798,12 +10851,16 @@ int main(int argc, char *argv[]){
         lmap_free(&imported_labels);
         /* A: relaxation is done; pass2 must NOT consult the (now-freed) snapshot. */
         st->relax_prev = NULL;
+        /* ...nor the first-iteration optimistic seed (pass 2 must report a
+         * genuinely undefined label, not silently estimate it). */
+        st->relax_optimistic = 0;
 
         if(!converged){
             /* Fix: 収束しなかった場合は単なる警告ではなく致命的エラーとする。
              * 収束前提のPass2アドレスは信頼できないため、Pass2実行・出力書き込み
              * を行わずここで打ち切る(誤ったバイナリを黙って出力しないため)。 */
-            axx_diagf(0, 0, " error - Pass1 relaxation did not converge after %d iterations; "
+            /* force=1 for the same reason as the oscillation diagnostic above. */
+            axx_diagf(0, 1, " error - Pass1 relaxation did not converge after %d iterations; "
                        "addresses would be incorrect for variable-length instructions "
                        "with forward references.\n", MAX_RELAX);
             fprintf(stderr,"         Aborting: no output file written.\n");

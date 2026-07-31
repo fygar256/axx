@@ -3,7 +3,7 @@
 /*
 /*  `dpreg` definition is mandatory; using it without a definition results
 /*  in an "undefined symbol" error. Conversely, by specifying `dpreg: .equ 0`,
-/*   ou can use source code written for `dp=0` exactly as it is.
+/*  you can use source code written for `dp=0` exactly as it is.
 /*
 /*  Covers the complete official MC6809 instruction set: all inherent,
 /*  immediate, direct, extended, indexed (all 5 basic types x indirect,
@@ -13,6 +13,66 @@
 /*  opcodes (e.g. the reset-vector-only 0x3E) are intentionally not
 /*  included, matching the existing 6502.axx house convention.
 /*
+/*
+/*  ============================= SYNTAX =============================
+/*
+/*  Direct/extended addressing.  This file tracks the direct page
+/*  register through the source symbol `dpreg`, which the source MUST
+/*  define, e.g.  `dpreg: .equ 0x20`.  Use `dpreg: .equ 0` for the
+/*  usual DP=reset-value convention:
+/*
+/*     LDA $10            direct   (auto: chosen when (v>>8)&0xff == dpreg)
+/*     LDA $1000          extended (auto: chosen otherwise)
+/*     LDA <$10           force direct   (low byte is used; error only if
+/*                        the operand does not fit in 16 bits)
+/*     LDA >$10           force extended (always a 2-byte address)
+/*
+/*  Indexed addressing.  r stands for one of X, Y, U, S:
+/*
+/*     LDA ,r             zero offset               LDA [,r]    indirect
+/*     LDA ,r+            post-increment by 1        (no indirect form)
+/*     LDA ,r++           post-increment by 2        LDA [,r++]  indirect
+/*     LDA ,-r            pre-decrement by 1          (no indirect form)
+/*     LDA ,--r           pre-decrement by 2         LDA [,--r]  indirect
+/*     LDA A,r / B,r / D,r     accumulator offset     [A,r] / [B,r] / [D,r] indirect
+/*     LDA n,r            constant offset, auto-picks the shortest of
+/*                        5-bit (-16..15, no extra byte) / 8-bit
+/*                        (-128..127, +1 byte) / 16-bit (+2 bytes)
+/*     LDA [n,r]          indirect constant offset, auto 8-bit/16-bit
+/*                        (indirect has no 5-bit form on real hardware)
+/*     LDA <<n,r          force 5-bit offset    (error if out of range)
+/*     LDA <n,r           force 8-bit offset    (error if out of range)
+/*     LDA >n,r           force 16-bit offset
+/*     LDA [<n,r] / [>n,r]    force 8-bit / 16-bit indirect offset
+/*     LDA n,PCR          8-bit-or-16-bit auto PC-relative offset
+/*     LDA <n,PCR / >n,PCR    force 8-bit / 16-bit PC-relative
+/*     LDA [n,PCR] / [<n,PCR] / [>n,PCR]     indirect PC-relative forms
+/*     LDA [$1234]        extended indirect (fixed 2-byte address)
+/*
+/*  The forced-offset prefixes <<, < and > follow the lwasm / asm6809
+/*  convention (< = 8-bit, > = 16-bit, << = 5-bit which those assemblers
+/*  spell as <<  or cannot force at all).  Note this differs from the
+/*  older revisions of THIS file, where < meant 5-bit and > meant 8-bit.
+/*
+/*  Data definition:
+/*     FCB v[,w[,x[,y[,z[,i[,j[,k]]]]]]]   up to 8 values, 1 byte each
+/*     FDB v[,w[,x[,y]]]                   up to 4 values, 2 bytes each
+/*                                         (big-endian, Motorola order)
+/*
+/*  Numbers use axx expression syntax (0x10 / 16 / 0b10000), not $10.
+/*
+/*  Register lists for PSHS/PULS/PSHU/PULU accept any of the 8 valid
+/*  register names in any order and any combination, plus D as the
+/*  conventional shorthand for A,B (postbyte bits 0x06), e.g.:
+/*     PSHS A,B,X,Y       PSHU/PULU reject U and PSHS/PULS reject S,
+/*     PSHS D,X           because a stack pointer cannot be pushed on
+/*                        its own stack (some assemblers silently accept
+/*                        it and encode the OTHER stack pointer).
+/*
+/*  Error codes raised by this file
+/*     2  Address out of range (forced addressing mode operand too big)
+/*     3  Value out of range   (immediate operand too big)
+/* ===================================================================== */
 
 /* ---------- inherent (no operand) ---------- */
 NOP :: 0x12
@@ -1985,15 +2045,23 @@ CMPS [!e,PCR] :: :: 0x11,0xAC,(t:=((e-$$-4)>=-128&&(e-$$-4)<=127)?1:2)*0+((t==1)
 CMPS [!v] :: :: 0x11,0xAC,0x9F,(v>>8)&0xff,v&0xff
 
 /* ---------- assembler pseudo-ops for data definition ---------- */
-/* single value per line only -- deliberately NOT using the
+/* One pattern per element count, deliberately NOT using the
    comma-optional-group trick used for PSHS/PULS above, because a
    real data byte/word of value 0 must never be suppressed, and the
    suppression idiom cannot distinguish "slot absent" from "slot
-   present with value 0" for an arbitrary data list. */
+   present with value 0" for an arbitrary data list.  The 0x100| flag
+   on every element after the first forces emission even when the
+   value is 0, which is exactly what a data list needs. */
 FCB !v :: :: v&0xff
 FCB !v,!w :: :: v&0xff,0x100|(w&0xff)
 FCB !v,!w,!x :: :: v&0xff,0x100|(w&0xff),0x100|(x&0xff)
 FCB !v,!w,!x,!y :: :: v&0xff,0x100|(w&0xff),0x100|(x&0xff),0x100|(y&0xff)
+FCB !v,!w,!x,!y,!z :: :: v&0xff,0x100|(w&0xff),0x100|(x&0xff),0x100|(y&0xff),0x100|(z&0xff)
+FCB !v,!w,!x,!y,!z,!i :: :: v&0xff,0x100|(w&0xff),0x100|(x&0xff),0x100|(y&0xff),0x100|(z&0xff),0x100|(i&0xff)
+FCB !v,!w,!x,!y,!z,!i,!j :: :: v&0xff,0x100|(w&0xff),0x100|(x&0xff),0x100|(y&0xff),0x100|(z&0xff),0x100|(i&0xff),0x100|(j&0xff)
+FCB !v,!w,!x,!y,!z,!i,!j,!k :: :: v&0xff,0x100|(w&0xff),0x100|(x&0xff),0x100|(y&0xff),0x100|(z&0xff),0x100|(i&0xff),0x100|(j&0xff),0x100|(k&0xff)
 FDB !v :: :: (v>>8)&0xff,v&0xff
 FDB !v,!w :: :: (v>>8)&0xff,0x100|(v&0xff),0x100|((w>>8)&0xff),0x100|(w&0xff)
+FDB !v,!w,!x :: :: (v>>8)&0xff,0x100|(v&0xff),0x100|((w>>8)&0xff),0x100|(w&0xff),0x100|((x>>8)&0xff),0x100|(x&0xff)
+FDB !v,!w,!x,!y :: :: (v>>8)&0xff,0x100|(v&0xff),0x100|((w>>8)&0xff),0x100|(w&0xff),0x100|((x>>8)&0xff),0x100|(x&0xff),0x100|((y>>8)&0xff),0x100|(y&0xff)
 

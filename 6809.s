@@ -22,7 +22,10 @@
 ;   python3 axx.py 6809.axx sample6809.s -b sample6809.bin -v
 ; ============================================================
 
-dpreg:  .equ    0
+; DPレジスタの想定値。6809.axx の direct/extended 自動選択に必須。
+; リセット値のまま使う通常のプログラムでは 0 を指定する。
+dpreg:  .equ    0x00
+
         .org    0x8000
 
 start:

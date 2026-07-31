@@ -490,6 +490,14 @@ class RelaxationState:
         # rather than being flatly undefined mid-relaxation.
         self.relax_prev_values = {}
 
+        # True only during the FIRST relaxation iteration. While set, a label
+        # that has no value yet (a forward reference, with no estimate from a
+        # previous iteration to fall back on) is estimated as "right here",
+        # i.e. the address of the instruction currently being encoded. See
+        # label_get_value() for why the loop needs an optimistic seed rather
+        # than the UNDEF sentinel.
+        self.relax_optimistic = False
+
         # Which (file, line) pairs have already been warned about exhausting
         # the pattern-matching combination budget, so the warning fires once
         # per site instead of once per relaxation iteration.
@@ -724,6 +732,7 @@ class AssemblerState:
         '_pass1_size_mode':      ('relax', 'pass1_size_mode'),
         '_pass1_prev_label_pcs': ('relax', 'pass1_prev_label_pcs'),
         '_relax_prev_values':    ('relax', 'relax_prev_values'),
+        '_relax_optimistic':     ('relax', 'relax_optimistic'),
         '_combo_budget_warned':  ('relax', 'combo_budget_warned'),
 
         'vliwinstbits':     ('vliw', 'instbits'),
@@ -1645,6 +1654,40 @@ class LabelManager:
         except (KeyError, IndexError):
             if self.state.pas == 1 and k in self.state._relax_prev_values:
                 return self.state._relax_prev_values[k]
+            if self.state.pas == 1 and self.state._relax_optimistic:
+                # First relaxation iteration: this label is a forward
+                # reference and there is no previous-iteration estimate yet.
+                #
+                # Falling through to UNDEF here would hand the pattern's
+                # size-selecting expression a meaningless huge value, so
+                # every range test ("does this displacement fit in 8 bits?")
+                # fails and the instruction starts out at its LONGEST form.
+                # The later iterations only ever see displacements computed
+                # from that inflated layout, so a long encoding that is
+                # self-consistent stays put even when a short one would also
+                # have been self-consistent -- the loop settles on whichever
+                # fixed point the initial guess happened to fall into rather
+                # than on the smallest one. (Concretely, for a PC-relative
+                # operand whose displacement lands exactly on the 8-bit
+                # boundary, both the short and the long encoding are stable,
+                # and the pessimistic seed always picks the long one.)
+                #
+                # Estimating an unknown forward label as the address of the
+                # instruction being encoded makes every displacement come out
+                # as small as it possibly could be, so iteration 1 lays the
+                # program out with every variable-length instruction at its
+                # shortest form. Label addresses can then only move forward
+                # from iteration to iteration, so encodings only ever grow,
+                # and the loop converges on the SMALLEST self-consistent
+                # layout -- which is both what an assembler should emit and
+                # what makes the result independent of the starting guess.
+                #
+                # The flag is still set: an estimate is not a definition, and
+                # a genuinely undefined label must still be reported. Pass 1
+                # never reports (see should_report_errors()), and Pass 2 --
+                # which never takes this branch -- does.
+                self.state.error_undefined_label = True
+                return self.state.pc
             if self.state._pass1_size_mode:
                 return 0
             v = UNDEF
@@ -7941,6 +7984,7 @@ class Assembler:
                 MAX_RELAX = 16
                 self.state._pass1_prev_label_pcs = _RELAXATION_SENTINEL
                 self.state._relax_prev_values = {}
+                self.state._relax_optimistic = False
 
                 _seen_pcs_history = {}
 
@@ -7949,6 +7993,10 @@ class Assembler:
                 _initial_vars = list(self.state.vars)
 
                 for relax_iter in range(MAX_RELAX):
+                    # Only the first iteration has no previous-iteration
+                    # estimates to work from; from the second onwards every
+                    # forward reference resolves through _relax_prev_values.
+                    self.state._relax_optimistic = (relax_iter == 0)
                     self.state.pc = 0
                     self.state.pas = 1
                     self.state.ln = 1
@@ -8018,6 +8066,11 @@ class Assembler:
                         if changed:
                             print(f"         Labels still changing: {', '.join(changed[:10])}", file=sys.stderr)
                     return False
+
+                # Relaxation is done; Pass 2 must NOT consult the first-
+                # iteration optimistic seed (it has to report a genuinely
+                # undefined label rather than silently estimating it).
+                self.state._relax_optimistic = False
 
                 _pass1_final_addrs = {
                     k: v[0] for k, v in self.state.labels.items()
