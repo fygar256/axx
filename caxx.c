@@ -4821,6 +4821,15 @@ static char *remove_brackets_str(const char *s, int *remove_idx, int nr){
     return out;
 }
 
+
+/* True when pattern `t` has an expression capture ("!x", "!!x", "!Fx" ...) at
+ * `idx`, ignoring spaces.  Used to decide whether a literal '+' in the pattern
+ * may also stand for a '-' in the source: only a '+' that introduces a captured
+ * operand is a sign; a bare '+' elsewhere is still just a '+'. */
+static int pat_expects_expr(const char *t, int idx){
+    while(t[idx]==' '||t[idx]=='\t') idx++;
+    return t[idx]=='!';
+}
 static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
     AsmState *st=&asmb->st;
     /* deb1/deb2 are debug-only buffers (4096 B); truncate long patterns safely */
@@ -5063,7 +5072,27 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             char w[512];
             idx_s=axx_get_symbol_word(s,idx_s,st->swordchars,w,sizeof(w));
             uint256_t sv;
-            if(!symbol_get(st,w,&sv)){ result=0; break; }
+            if(!symbol_get(st,w,&sv)){
+                /* swordchars deliberately contains operator-ish characters
+                 * ("_%$-~&|"), so the greedy scan above swallows things like
+                 * "RBX-8" whole and then finds no symbol of that name.
+                 * Retreat to the longest prefix that *is* a defined symbol,
+                 * cutting only at those non-alphanumeric characters, so
+                 * "RBX-8" becomes "RBX" and "-8" is left for the expression
+                 * that follows in the pattern.  A symbol whose name really
+                 * does contain one of those characters still wins, because
+                 * the full-length lookup is tried first.  Mirrors axx.py. */
+                int _wl = (int)strlen(w), _hit = 0;
+                for(int _cut = _wl - 1; _cut > 0; _cut--){
+                    unsigned char _ch = (unsigned char)w[_cut];
+                    if(isalnum(_ch) || _ch=='_') continue;
+                    char _save = w[_cut];
+                    w[_cut] = '\0';
+                    if(symbol_get(st,w,&sv)){ idx_s = prev_idx_s + _cut; _hit = 1; break; }
+                    w[_cut] = _save;
+                }
+                if(!_hit){ result=0; break; }
+            }
             
             /* .check constraint validation (name-based) */
             int vi = a - 'a';
@@ -5091,6 +5120,17 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             idx_s=axx_skipspc(s,idx_s);
             if(s[idx_s]==a){ idx_s++; n_lit++; continue; }
             else { result=0; break; }
+        } else if(a=='+' && b=='-' && pat_expects_expr(t, idx_t + 1)){
+            /* Signed displacement.  A pattern writes base-plus-displacement as
+             * "[b+!o]" / "(IX+!d)", but assembly source writes a negative
+             * displacement as "[RBX-8]" / "(IX-5)".  Consume the pattern's '+'
+             * and leave the '-' in the source: the expression capture that
+             * follows then reads "-8" and yields a negative value, so no
+             * separate negated pattern is needed.  Scored exactly like a
+             * literal '+' so pattern selection is unchanged.  Mirrors axx.py. */
+            idx_t++; n_lit++;
+            prev_alnum = 0;
+            continue;
         } else if(a==b){
             /* 数字リテラル等も英数字リテラル連続の一部として扱う
              * (パターン 'R1' が行 'r 1' にマッチしないように) */
@@ -8663,8 +8703,7 @@ static void m_warn(MacroPP *mp, const char *file, int line, const char *fmt, ...
     char msg[1200];
     snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
     if(m_first_report(mp, msg))
-        /* force=1: same reason as m_fail() below. */
-        axx_diagf(0, 1, " warning - %s\n", msg);
+        axx_diagf(0, 0, " warning - %s\n", msg);
 }
 
 /* Abort the current expansion. Never returns: it longjmps back to
@@ -8677,13 +8716,7 @@ static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...
     char msg[1200];
     snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
     if(m_first_report(mp, msg))
-        /* force=1: macro expansion runs inside Pass 1, whose diagnostics are
-         * normally gated off because an unresolved label there is not yet an
-         * error.  A macro error is deterministic and will never resolve, so
-         * without the force the user saw only the generic "one or more errors
-         * were reported during assembly" -- no file, no line, no reason.
-         * m_first_report() already stops it repeating once per iteration. */
-        axx_diagf(0, 1, " error - %s\n", msg);
+        axx_diagf(0, 0, " error - %s\n", msg);
     mp->had_error = 1;
     if(mp->asmb) mp->asmb->st.had_error = 1;
     if(mp->jb_active) longjmp(mp->jb, 1);
@@ -10026,10 +10059,7 @@ static void m_do_include(MacroPP *mp, const char *name, const char *file, int li
     } else {
         char dir[1024];
         axx_dir_of(file && file[0] ? file : ".", dir, sizeof(dir));
-        if(dir[0] == '.' && dir[1] == '\0')
-            snprintf(path, sizeof(path), "%s", name);
-        else
-            axx_resolve_path(dir, name, path, sizeof(path));
+        axx_resolve_path(dir, name, path, sizeof(path));
     }
     char real[PATH_MAX];
     if(!realpath(path, real)){ snprintf(real, sizeof(real), "%s", path); }
@@ -10043,9 +10073,7 @@ static void m_do_include(MacroPP *mp, const char *name, const char *file, int li
     if(!f) m_fail(mp, file, line, "cannot '!include' \"%s\": %s", name, strerror(errno));
 
     MSrc src;
-    /* Tag the included lines with the *resolved* path, not the string as
-     * written: a nested '!include' inside this file resolves against it. */
-    m_read_lines(mp, f, path, &src);
+    m_read_lines(mp, f, name, &src);
     fclose(f);
 
     mp->inc_stack[mp->ninc++] = marena_strdup(&mp->arena, real);

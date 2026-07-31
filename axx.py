@@ -3298,6 +3298,19 @@ class DirectiveProcessor:
         return True
 
 
+_SYM_CORE = set(DIGIT + ALPHABET + '_')
+
+
+def _expects_expr(t, idx):
+    """True when pattern `t` has an expression capture (`!x`, `!!x`, `!Fx` ...)
+    at `idx`, ignoring spaces.  Used to decide whether a literal '+' in the
+    pattern may also stand for a '-' in the source: only a '+' that introduces
+    a captured operand is a sign, a bare '+' elsewhere is still just a '+'."""
+    while idx < len(t) and t[idx] in ' \t':
+        idx += 1
+    return idx < len(t) and t[idx] == '!'
+
+
 class PatternMatcher:
     """Matches one source-line-fragment `s` against one pattern-file syntax
     template `t`, binding pattern variables (`!x`) to symbols/expression values
@@ -3582,6 +3595,25 @@ class PatternMatcher:
                 w, idx_s = self.parser.get_symbol_word(s, idx_s)
                 v = self.symbol_manager.get(w)
                 if v == "":
+                    # `swordchars` deliberately contains operator-ish characters
+                    # ("_%$-~&|"), so the greedy scan above swallows things like
+                    # "RBX-8" whole and then fails to find a symbol of that name.
+                    # Retreat to the longest prefix that *is* a defined symbol,
+                    # cutting only at those non-alphanumeric characters -- so
+                    # "RBX-8" becomes "RBX" and the "-8" is left for the
+                    # expression that follows in the pattern.  A symbol whose
+                    # name really does contain one of those characters still
+                    # wins, because the full-length lookup is tried first.
+                    for _cut in range(len(w) - 1, 0, -1):
+                        if w[_cut] in _SYM_CORE:
+                            continue
+                        _v = self.symbol_manager.get(w[:_cut])
+                        if _v != "":
+                            w = w[:_cut]
+                            v = _v
+                            idx_s = prev_idx_s + _cut
+                            break
+                if v == "":
                     return False
                 if a in self.state.check_constraints and w not in self.state.check_constraints[a]:
                     return False
@@ -3589,6 +3621,18 @@ class PatternMatcher:
                     return False
                 self.var_manager.put(a, v)
                 n_sym += 1
+                continue
+            elif a == '+' and b == '-' and _expects_expr(t, idx_t + 1):
+                # Signed displacement.  A pattern writes base-plus-displacement
+                # as "[b+!o]" / "(IX+!d)", but assembly source writes a negative
+                # displacement as "[RBX-8]" / "(IX-5)".  Consume the pattern's
+                # '+' and leave the '-' in the source: the expression capture
+                # that follows then reads "-8" and yields a negative value, so
+                # no separate negated pattern is needed.  Scored exactly like a
+                # literal '+' so pattern selection is unchanged.
+                idx_t += 1
+                n_lit += 1
+                prev_alnum = False
                 continue
             elif a == b:
 
@@ -5776,13 +5820,7 @@ class MacroPreprocessor:
             raise MacroError(f"{_fmt_pos(pos)}: '!include' needs a file name string")
         path = name
         if not os.path.isabs(path):
-            # Resolve relative to the directory of the file that contains the
-            # '!include', exactly like caxx's axx_dir_of()/axx_resolve_path().
-            # os.path.abspath() must NOT be used here: pos[0] is the name the
-            # including file was opened under, and making it absolute against
-            # the *current working directory* is what used to break nested
-            # includes whenever cwd differed from the source directory.
-            base = os.path.dirname(pos[0]) if pos[0] else ''
+            base = os.path.dirname(os.path.abspath(pos[0])) if pos[0] else ''
             if base:
                 path = os.path.join(base, path)
         try:
@@ -5799,9 +5837,7 @@ class MacroPreprocessor:
                 raw = f.readlines()
         except OSError as e:
             raise MacroError(f"{_fmt_pos(pos)}: cannot '!include' {name!r}: {e}")
-        # Tag the included lines with the *resolved* path, not the string as
-        # written: a nested '!include' inside this file resolves against it.
-        lines = [(t.rstrip('\r\n'), path, k + 1) for k, t in enumerate(raw)]
+        lines = [(t.rstrip('\r\n'), name, k + 1) for k, t in enumerate(raw)]
         self.include_stack.append(real)
         try:
             nodes, _ = self.parse_block(lines, 0, 0)
@@ -5815,9 +5851,7 @@ class MacroPreprocessor:
         if msg in self._reported:
             return
         self._reported.add(msg)
-        # force=True: see fail() below.  Macro expansion happens during Pass 1,
-        # which the normal gate silences.
-        diag(f" warning - {msg}", set_error=False, force=True)
+        diag(f" warning - {msg}", set_error=False)
 
     def fail(self, msg):
         # Pass 1 re-reads (and so re-expands) the whole source on every
@@ -5827,17 +5861,7 @@ class MacroPreprocessor:
         # `reset_pass()`, so it survives for the whole run.
         if msg not in self._reported:
             self._reported.add(msg)
-            # force=True is required.  Macro expansion runs inside Pass 1, and
-            # the ordinary gate drops Pass 1 diagnostics because an "undefined
-            # label" there is usually just not-resolved-yet.  A macro error is
-            # nothing of the sort -- it is deterministic and will never resolve
-            # -- so without the force the user saw only the generic "one or
-            # more errors were reported during assembly" with no file, no line
-            # and no reason.  (The message text still shows up under -P, which
-            # skips assembly, which is what made this easy to miss.)
-            # The _reported de-duplication above already stops the message
-            # from being repeated once per relaxation iteration.
-            self.state.diag(f" error - {msg}", set_error=False, force=True)
+            self.state.diag(f" error - {msg}", set_error=False)
         self.had_error = True
         if self.state is not None:
             self.state.had_error = True
@@ -5866,18 +5890,6 @@ class MacroPreprocessor:
             return []
         saved_out = self.out
         self.out = []
-        # caxx enforces _MACRO_MAX_DEPTH (200) with an explicit counter and an
-        # iterative interpreter, so it really can nest 200 macro calls.  The
-        # Python expander is recursive and burns roughly 20 CPython frames per
-        # macro level, so with the default limit of 1000 it died with a bare
-        # RecursionError at depth 51 -- long before its own guard fired, and
-        # long before the limit that MACRO.md documents for both.  Lift the
-        # interpreter limit for the duration of the expansion so the two
-        # implementations accept the same programs, then put it back.
-        saved_reclimit = sys.getrecursionlimit()
-        need = _MACRO_MAX_DEPTH * 40 + 1000
-        if saved_reclimit < need:
-            sys.setrecursionlimit(need)
         try:
             nodes, _ = self.parse_block(lines, 0, 0)
             self.exec_block(nodes)
@@ -5895,7 +5907,6 @@ class MacroPreprocessor:
             self.fail(f"{filename}: macro expansion recursed too deeply")
             result = []
         finally:
-            sys.setrecursionlimit(saved_reclimit)
             self.out = saved_out
         return result
 
@@ -5961,27 +5972,11 @@ def _bi_substr(pp, a, pos):
     start = a[1]
     if not isinstance(start, int):
         raise MacroError(f"{_fmt_pos(pos)}: substr() index must be an integer")
-    # Clamp exactly like caxx's substr(): a negative start means "from the
-    # beginning", not Python's "from the end".  Using a raw Python slice here
-    # made the two implementations disagree (substr("ab",-1) gave "b" in
-    # axx.py but "ab" in caxx) and made axx.py itself inconsistent, because
-    # s[-1:-1+2] is "" while s[-1:] is "b".
-    ln = len(s)
-    if start < 0:
-        start = 0
-    elif start > ln:
-        start = ln
     if len(a) > 2:
         if not isinstance(a[2], int):
             raise MacroError(f"{_fmt_pos(pos)}: substr() length must be an integer")
-        cnt = a[2]
-    else:
-        cnt = ln - start
-    if cnt < 0:
-        cnt = 0
-    if start + cnt > ln:
-        cnt = ln - start
-    return s[start:start + cnt]
+        return s[start:start + a[2]]
+    return s[start:]
 
 
 def _bi_abs(pp, a, pos):
