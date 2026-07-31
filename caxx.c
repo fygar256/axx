@@ -3032,6 +3032,10 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
 static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_out);
+/* Forward declarations: expr_term2() needs the float-mode helpers that are
+ * defined further down alongside expr_term3(). */
+static uint256_t expr_safe_bitwise_operand(Assembler *asmb, uint256_t v, const char *op_name);
+static uint256_t expr_bitwise_result(Assembler *asmb, uint256_t v);
 static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term3(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term4(Assembler *asmb, const char *s, int idx, int *idx_out);
@@ -4018,7 +4022,15 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
     while(idx<slen){
         if(axx_q(s,slen,"<<",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
-            int64_t sv=u256_to_i64(t);
+            /* Bugfix: shifts need the same float-mode handling that
+             * expr_term3()'s bitwise operators already got.  In float mode
+             * every value in flight is a double bit pattern, so both the
+             * shifted value and the shift count arrived here as IEEE-754
+             * patterns: an error_pattern such as "(a>>8)&7" read the count 8
+             * as 0x4020000000000000 and reported "shift count ... exceeds
+             * maximum".  axx.py evaluates the same expression numerically,
+             * so the two implementations disagreed. */
+            int64_t sv=u256_to_i64(expr_safe_bitwise_operand(asmb,t,"<<"));
             if(sv<0){
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - negative shift count (%lld) in << expression.\n",(long long)sv);
@@ -4029,10 +4041,11 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
                     axx_diagf(1, 0, " error - shift count %lld exceeds maximum %lld in << expression.\n",(long long)sv,(long long)SHIFT_MAX);
                 }
                 x=u256_zero();
-            } else x=u256_shl(x,(int)sv);
+            } else x=expr_bitwise_result(asmb,u256_shl(expr_safe_bitwise_operand(asmb,x,"<<"),(int)sv));
         } else if(axx_q(s,slen,">>",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
-            int64_t sv=u256_to_i64(t);
+            /* Bugfix: see the "<<" branch above. */
+            int64_t sv=u256_to_i64(expr_safe_bitwise_operand(asmb,t,">>"));
             if(sv<0){
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - negative shift count (%lld) in >> expression.\n",(long long)sv);
@@ -4046,7 +4059,7 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
                     axx_diagf(1, 0, " error - shift count %lld exceeds maximum %lld in >> expression.\n",(long long)sv,(long long)SHIFT_MAX);
                 }
                 x=u256_zero();
-            } else x=u256_sar(x,(int)sv);
+            } else x=expr_bitwise_result(asmb,u256_sar(expr_safe_bitwise_operand(asmb,x,">>"),(int)sv));
         } else break;
     }
     *idx_out=idx; return x;
@@ -8703,7 +8716,8 @@ static void m_warn(MacroPP *mp, const char *file, int line, const char *fmt, ...
     char msg[1200];
     snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
     if(m_first_report(mp, msg))
-        axx_diagf(0, 0, " warning - %s\n", msg);
+        /* force=1: same reason as m_fail() below. */
+        axx_diagf(0, 1, " warning - %s\n", msg);
 }
 
 /* Abort the current expansion. Never returns: it longjmps back to
@@ -8716,7 +8730,13 @@ static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...
     char msg[1200];
     snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
     if(m_first_report(mp, msg))
-        axx_diagf(0, 0, " error - %s\n", msg);
+        /* force=1: macro expansion runs inside Pass 1, whose diagnostics are
+         * normally gated off because an unresolved label there is not yet an
+         * error.  A macro error is deterministic and will never resolve, so
+         * without the force the user saw only the generic "one or more errors
+         * were reported during assembly" -- no file, no line, no reason.
+         * m_first_report() already stops it repeating once per iteration. */
+        axx_diagf(0, 1, " error - %s\n", msg);
     mp->had_error = 1;
     if(mp->asmb) mp->asmb->st.had_error = 1;
     if(mp->jb_active) longjmp(mp->jb, 1);
@@ -10059,7 +10079,10 @@ static void m_do_include(MacroPP *mp, const char *name, const char *file, int li
     } else {
         char dir[1024];
         axx_dir_of(file && file[0] ? file : ".", dir, sizeof(dir));
-        axx_resolve_path(dir, name, path, sizeof(path));
+        if(dir[0] == '.' && dir[1] == '\0')
+            snprintf(path, sizeof(path), "%s", name);
+        else
+            axx_resolve_path(dir, name, path, sizeof(path));
     }
     char real[PATH_MAX];
     if(!realpath(path, real)){ snprintf(real, sizeof(real), "%s", path); }
@@ -10073,7 +10096,9 @@ static void m_do_include(MacroPP *mp, const char *name, const char *file, int li
     if(!f) m_fail(mp, file, line, "cannot '!include' \"%s\": %s", name, strerror(errno));
 
     MSrc src;
-    m_read_lines(mp, f, name, &src);
+    /* Tag the included lines with the *resolved* path, not the string as
+     * written: a nested '!include' inside this file resolves against it. */
+    m_read_lines(mp, f, path, &src);
     fclose(f);
 
     mp->inc_stack[mp->ninc++] = marena_strdup(&mp->arena, real);
