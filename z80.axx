@@ -41,16 +41,23 @@ INC (IX[[+!d]]) ::d>127;3,d<-128;3:: 0xdd,0x34,d
 .setsym ::HL:: 2
 .setsym ::SP:: 3
 .setsym ::AF:: 3
+.check::s::BC,DE,HL,SP
 ADD HL,s :: s<<4|0x09
 ADC HL,s :: 0xed,s<<4|0x4a
 SBC HL,s :: 0xed,s<<4|0x42
+.clrcheck::s
+.check::s::BC,DE,SP
 ADD IX,s :: 0xdd,0x09|s<<4
 ADD IY,s :: 0xfd,0x09|s<<4
+.clrcheck::s
 ADD IX,IX :: 0xdd,0x29
 ADD IY,IY :: 0xfd,0x29
+.check::s::BC,DE,HL,SP
 INC s :: s<<4|0x03
 DEC s :: s<<4|0x0b
+.clrcheck::s
 
+.check::s::B,C,D,E,H,L,A
 LD (IY[[+!d]]),s ::d>127;3,d<-128;3:: 0xfd,s|0x70,d
 LD (IX[[+!d]]),s ::d>127;3,d<-128;3:: 0xdd,s|0x70,d
 LD s,(IX[[+!d]]) ::d>127;3,d<-128;3:: 0xdd,0x46|(s<<3),d
@@ -98,16 +105,22 @@ LD DE,!d :: 0x11,d&0xff,d>>8
 LD BC,!d :: 0x01,d&0xff,d>>8
 LD SP,!d :: 0x31,d&0xff,d>>8
 LD HL,!d :: 0x21,d&0xff,d>>8
+.check::t::B,C,D,E,H,L,A
 LD s,t :: 0x40|(s<<3)|t
+.clrcheck::t
 LD s,!d :: (s<<3)|0x6,d
+.clrcheck::s
 
+.check::s::BC,DE,HL,AF
 PUSH s :: 0xc5|(s<<4)
 PUSH IX :: 0xdd,0xe5
 PUSH IY :: 0xfd,0xe5
 POP s :: 0xc1|(s<<4)
 POP IX :: 0xdd,0xe1
 POP IY :: 0xfd,0xe1
+.clrcheck::s
 
+.check::s::B,C,D,E,H,L,A
 ADD A,(HL) :: 0x86
 ADD A,(IX[[+!d]]) ::d>127;3,d<-128;3:: 0xdd,0x86,d
 ADD A,(IY[[+!d]]) ::d>127;3,d<-128;3:: 0xfd,0x86,d
@@ -280,6 +293,7 @@ OUTI :: 0xed,0xa3
 OTIR :: 0xed,0xb3
 OUTD :: 0xed,0xab
 OTDR :: 0xed,0xbb
+.clrcheck::s
 
 
 .setsym ::NZ:: 0
@@ -294,6 +308,7 @@ OTDR :: 0xed,0xbb
 JP (HL) :: 0xe9
 JP (IX) :: 0xdd,0xe9
 JP (IY) :: 0xfd,0xe9
+.check::s::NZ,Z,NC,C,PO,PE,P,M
 JP s,!d :: 0xc2|s<<3,d&0xff,d>>8
 JP !d :: 0xc3,d&0xff,d>>8
 JR NZ,!e :: 0x20,e-$$-2
@@ -306,6 +321,7 @@ DJNZ !e :: 0x10,e-$$-2
 CALL s,!d :: 0xc4|s<<3,d&0xff,d>>8
 CALL !d :: 0xcd,d&0xff,d>>8
 RET s :: 0xc0|s<<3
+.clrcheck::s
 RET :: 0xc9
 RETI :: 0xed,0x4d
 RETN :: 0xed,0x45
