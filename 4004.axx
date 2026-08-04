@@ -1,0 +1,140 @@
+/* =====================================================================
+/*  4004.axx -- Intel 4004 pattern file (complete official instruction set)
+/*
+/*  Covers all 46 documented 4004 instructions (239 defined opcodes out
+/*  of 256 -- opcodes 0x01-0x0F and 0xFE-0xFF are unused/reserved and
+/*  intentionally not accepted). Verified against three independent
+/*  sources that agree byte-for-byte on every opcode: the original
+/*  Intel MCS-4 Assembly Language Programming Manual (Dec 1973,
+/*  Appendix B instruction machine codes), the Pyntel4004 project's
+/*  opcode table (a from-scratch, independently tested Python
+/*  implementation), and the widely cited pastraiser.com opcode chart.
+/*
+/*  ============================= SYNTAX =============================
+/*
+/*  The 4004 has sixteen 4-bit index registers. Per the Intel manual,
+/*  these are referenced two different ways depending on the
+/*  instruction:
+/*
+/*    - Individually, by a plain integer 0-15 (INC/ADD/SUB/LD/XCH/ISZ):
+/*        INC 5        ADD 12        XCH 0
+/*
+/*    - As one of 8 register PAIRS (registers 2n/2n+1), written with
+/*      the Intel manual's own "nP" notation, n=0-7 (FIM/SRC/FIN/JIN):
+/*        FIM 2P,254   SRC 0P        JIN 7P
+/*
+/*  Unlike the 1973 manual (which separates operands with a blank, e.g.
+/*  "FIM 2P 254"), this file uses a comma between operands, matching
+/*  every other pattern file in this repository (6502.axx/z80.axx/
+/*  6809.axx/8048.axx/8080.axx all use commas, none use bare spaces).
+/*
+/*  JCN's condition is a plain 0-15 value, exactly as documented ("JCN
+/*  CN ADDR", condition bits C1(invert) C2(ACC=0) C3(CY=1) C4(TEST=0)
+/*  packed 0001 C1C2C3C4 -- see the manual's section 3.7.3). The six
+/*  single-bit condition names commonly seen in other 4004 references
+/*  (JNT/JC/JZ/JT/JNC/JNZ, condition values 1/2/4/9/10/12) are provided
+/*  here too as convenience aliases -- they are NOT part of Intel's own
+/*  mnemonic set (the 1973 manual only ever uses "JCN n,addr", assigning
+/*  names to conditions via its EQU pseudo-op if at all), but they are
+/*  in wide informal use, so both forms are accepted.
+/*
+/*  JCN/ISZ addresses are 8-bit and same-page only: the assembled byte
+/*  holds just the low 8 bits, and the omitted high bits are supplied
+/*  at run time from the CURRENT instruction's own page (not the
+/*  target's). Writing an address on a different page therefore
+/*  assembles silently to the wrong target -- exactly the class of bug
+/*  already found and fixed in 8048.axx's page-crossing branches -- so
+/*  both patterns here reject a target page (a>>8) that differs from
+/*  the current page ($$>>8). JUN/JMS take a full 12-bit address and
+/*  are page-independent, per the manual's own explicit recommendation
+/*  that only JUN/JMS be used to cross page boundaries.
+/*
+/*  All operands that get OR'd/shifted directly into the opcode byte
+/*  (register 0-15, register-pair index 0-7, JCN condition 0-15, LDM/
+/*  BBL data 0-15) are range-checked with a strict 0..max bound, not
+/*  the single-sided "allow negative wraparound" idiom used for plain
+/*  standalone immediate bytes elsewhere in this repository (6502.axx/
+/*  8080.axx): a raw negative value OR'd into a shifted opcode field
+/*  would corrupt bits outside that field, so negative input is
+/*  rejected outright here rather than silently mis-encoded. This
+/*  matches the manual's own operand examples, all of which are plain
+/*  non-negative integers for these fields.
+/*
+
+NOP :: 0x00
+
+/* --- Index register instructions: INC (individual), FIN (pair) --- */
+INC !r ::r>15;5,r<0;5:: 0x60|r
+FIN !pP ::p>7;5,p<0;5:: 0x30|p<<1
+
+/* --- Register-pair instructions: FIM/SRC/JIN, "nP" notation --- */
+FIM !pP,!d ::p>7;5,p<0;5,d>0xff;3,d<0;3:: 0x20|p<<1,d
+SRC !pP ::p>7;5,p<0;5:: 0x21|p<<1
+JIN !pP ::p>7;5,p<0;5:: 0x31|p<<1
+
+/* --- Index register to accumulator instructions --- */
+ADD !r ::r>15;5,r<0;5:: 0x80|r
+SUB !r ::r>15;5,r<0;5:: 0x90|r
+LD  !r ::r>15;5,r<0;5:: 0xa0|r
+XCH !r ::r>15;5,r<0;5:: 0xb0|r
+
+/* --- Accumulator group instructions (no operand) --- */
+CLB :: 0xf0
+CLC :: 0xf1
+IAC :: 0xf2
+CMC :: 0xf3
+CMA :: 0xf4
+RAL :: 0xf5
+RAR :: 0xf6
+TCC :: 0xf7
+DAC :: 0xf8
+TCS :: 0xf9
+STC :: 0xfa
+DAA :: 0xfb
+KBP :: 0xfc
+
+/* --- Immediate instructions --- */
+LDM !d ::d>15;3,d<0;3:: 0xd0|d
+
+/* --- Transfer of control instructions --- */
+JUN !a ::a>0xfff;2,a<0;2:: 0x40|(a>>8),a&0xff
+JMS !a ::a>0xfff;2,a<0;2:: 0x50|(a>>8),a&0xff
+
+JCN !c,!a ::c>15;3,c<0;3,a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x10|c,a&0xff
+ISZ !r,!a ::r>15;5,r<0;5,a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x70|r,a&0xff
+
+/* Single-bit JCN condition aliases (common informal convention -- see
+/* the SYNTAX note above; not part of Intel's own mnemonic set). */
+JNT !a ::a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x11,a&0xff
+JC  !a ::a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x12,a&0xff
+JZ  !a ::a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x14,a&0xff
+JT  !a ::a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x19,a&0xff
+JNC !a ::a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x1a,a&0xff
+JNZ !a ::a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x1c,a&0xff
+
+/* --- Subroutine linkage --- */
+BBL !d ::d>15;3,d<0;3:: 0xc0|d
+
+/* --- Memory selection --- */
+DCL :: 0xfd
+
+/* --- Input/Output and RAM instructions --- */
+WRM :: 0xe0
+WMP :: 0xe1
+WRR :: 0xe2
+WPM :: 0xe3
+WR0 :: 0xe4
+WR1 :: 0xe5
+WR2 :: 0xe6
+WR3 :: 0xe7
+SBM :: 0xe8
+RDM :: 0xe9
+RDR :: 0xea
+ADM :: 0xeb
+RD0 :: 0xec
+RD1 :: 0xed
+RD2 :: 0xee
+RD3 :: 0xef
+
+/* --- Convenience data byte, matching 8048.axx/x86_64.axx's DB --- */
+DB !v ::v>0xff;3,v<0;3:: v
