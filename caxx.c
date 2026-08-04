@@ -921,6 +921,18 @@ typedef struct {
     SymMap     symbols;
     SymMap     patsymbols;
     LabelMap   export_labels;
+    /* Bugfix (axx.py port): export_labels is a hash map, so iterating its
+     * buckets directly (as WRITE_EXPORT used to) visits labels in hash
+     * order, not the `.export`/`.global` declaration order axx.py's dict
+     * (`self.state.export_labels`, insertion-ordered) produces. The two
+     * implementations' -e/-E TSV output therefore listed the same labels
+     * in different order -- harmless for the labels the file re-imports
+     * by name, but a real, silent divergence from the project's own
+     * same-output goal for a documented, tool-consumed file. Track
+     * declaration order separately here (deduped, since .export/.global
+     * is processed every relaxation pass like .EXTERN) and have
+     * WRITE_EXPORT walk this instead of the bucket array. */
+    StrVec     export_order;
     PatVec     pat;
 
     int        vliwinstbits;
@@ -1527,6 +1539,7 @@ static void state_init(AsmState *st) {
     smap_init(&st->symbols);
     smap_init(&st->patsymbols);
     lmap_init(&st->export_labels);
+    sv_init(&st->export_order);
     pv_init(&st->pat);
     st->vliwinstbits = 41;
     iv_init(&st->vliwnop);
@@ -6356,6 +6369,12 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
         LabelEntry *le=lmap_find(&st->labels,s);
         int is_equ_v = le ? le->is_equ : 0;
         int is_undef_v = le ? le->is_undef : 0;
+        if(!lmap_find(&st->export_labels,s)){
+            /* first time this name is exported (this pass or any earlier
+             * one, since export_labels was just freshly reset) -- record
+             * declaration order before lmap_set() creates the entry. */
+            sv_push(&st->export_order, s);
+        }
         lmap_set(&st->export_labels,s,v,sec,is_equ_v,is_undef_v);
         if(buf[idx]==',') idx++;
     }
@@ -6415,14 +6434,27 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
             }
         }
         if(idx < blen && buf[idx]==':') idx++;
-        /* Only register if NOT already locally defined.
-         * A locally defined label has is_imported==0 (or absent). */
+        /* Bugfix (axx.py port): the previous check only distinguished
+         * "locally defined" (is_imported==0) from everything else, so a
+         * label already registered by a `-i` import (is_imported==1, with
+         * a real non-zero value from imp_label()) fell into the same
+         * "not locally defined" branch as a genuinely-never-seen label and
+         * got re-registered via lmap_set_imported() with value u256_zero(),
+         * silently clobbering the imported value back to 0 -- the exact
+         * split-build workflow (`-i impfile.tsv` + `.EXTERN` for the same
+         * names) the import file's own comment ("for split builds") exists
+         * for. axx.py's extern_processing() avoids this by branching on
+         * three states (never seen / already imported / locally defined)
+         * instead of two; mirror that here: only a never-seen label gets
+         * value-initialized, an already-imported label only has its
+         * reloc_type possibly updated (value untouched), and a locally
+         * defined label is left alone entirely (matching axx.py, which
+         * does not update reloc_type_override for non-imported labels). */
         LabelEntry *existing=lmap_find(&st->labels,s);
-        int is_locally_defined = (existing && !existing->is_imported);
-        if(!is_locally_defined){
+        if(!existing){
             lmap_set_imported(&st->labels, s, u256_zero(), ".text", reloc_type);
-        } else if(existing && reloc_type >= 0) {
-            existing->reloc_type_override = reloc_type;
+        } else if(existing->is_imported){
+            if(reloc_type >= 0) existing->reloc_type_override = reloc_type;
         }
         idx=axx_skipspc(buf,idx);
         if(buf[idx]==',') idx++;
@@ -10796,6 +10828,7 @@ int main(int argc, char *argv[]){
              * at the next iteration's start and get wrongly registered at pc=0. */
             strcpy(st->current_section, ".text");
             lmap_free(&st->export_labels); lmap_init(&st->export_labels);
+            sv_free(&st->export_order);
             /* Fix C-N6: reset symbols to the post-pattern-file baseline at the
              * start of every relaxation iteration (patsymbols is immutable
              * after the initial setpatsymbols() call now that source-level
@@ -11102,9 +11135,10 @@ int main(int argc, char *argv[]){
                             e->name, byte_start, byte_size, flag); \
                 } \
             } \
-            for(int i=0;i<st->export_labels.nbuckets;i++){ \
-                for(LabelEntry*e=st->export_labels.buckets[i];e;e=e->next){ \
-                    if(e->is_undef) continue; /* same fix as write_elf_obj()'s .symtab loop -- see LabelEntry.is_undef */ \
+            for(int i=0;i<st->export_order.len;i++){ \
+                LabelEntry*e=lmap_find(&st->export_labels, st->export_order.data[i]); \
+                { \
+                    if(!e || e->is_undef) continue; /* same fix as write_elf_obj()'s .symtab loop -- see LabelEntry.is_undef */ \
                     unsigned long long lbl_addr; \
                     if(e->is_equ){ \
                         lbl_addr=(unsigned long long)u256_to_u64(e->value); \
