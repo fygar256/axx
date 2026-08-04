@@ -5947,6 +5947,37 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
 
             /* === ここが修正箇所：.equ 内の forward reference を pass1 で正しく扱う === */
             uint256_t u;
+            /* Bugfix (axx.py port, missing in caxx): label_get_value() only
+             * ever SETS error_undefined_label, never clears it (see its own
+             * comment), so a stale 1 left over from an EARLIER, unrelated
+             * forward reference in this same pass (e.g. an instruction a few
+             * lines above referencing a label not yet defined) survives
+             * unchanged into THIS .EQU's own evaluation below. Every other
+             * directive that evaluates an expression (.ORG/.RESB/.RESW/
+             * .RESD/.RESQ/.ZERO/.ALIGN) already resets the flag immediately
+             * before its own expr_expression_asm() call "for a fresh check";
+             * .EQU was the one directive missing it, and axx.py's port
+             * (adir_label_processing / equ_processing) already has this
+             * exact reset at the equivalent point.
+             *
+             * Without it, a perfectly well-defined ".equ" line (e.g. `buffer:
+             * .equ 0x0200`, no label references at all) gets its is_undef
+             * provenance incorrectly poisoned to 1 by the stale flag, purely
+             * because something earlier in the same top-to-bottom sweep
+             * happened to forward-reference an as-yet-undefined label. That
+             * poisoned is_undef then defeats the relax_prev forward-reference
+             * estimate on the NEXT relaxation iteration (label_get_value()
+             * requires `!pe->is_undef` before trusting a relax_prev hit), so
+             * any later expression forward-referencing this .EQU symbol (or
+             * an .EQU chained to it, e.g. `total: .equ buffer+0x40` written
+             * before `buffer`'s own definition) converges on a stable but
+             * wrong value instead of the correct one -- silently, since
+             * pass1 errors are never reported. Confirmed via a minimal
+             * repro against 8080.axx: STA/LDA of a forward-declared
+             * `total: .equ buffer+0x40` (with `buffer` defined even later)
+             * emitted the wrong high address byte in caxx while axx.py
+             * (which has this reset) emitted the correct one. */
+            st->error_undefined_label = 0;
             int saved_mode = st->pass1_size_mode;
             if(st->pas == 1)
                 st->pass1_size_mode = 1;   /* forward ref を 0 として扱う */

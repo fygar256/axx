@@ -1,0 +1,195 @@
+/* =====================================================================
+/*  8080.axx -- Intel 8080 pattern file (complete official instruction set)
+/*
+/*  Covers all 78 documented 8080 instruction types / 244 opcodes: data
+/*  transfer (MOV/MVI/LXI/LDA/STA/LHLD/SHLD/LDAX/STAX/XCHG), arithmetic
+/*  (ADD/ADI/ADC/ACI/SUB/SUI/SBB/SBI/INR/DCR/INX/DCX/DAD/DAA), logical
+/*  (ANA/ANI/ORA/ORI/XRA/XRI/CMP/CPI/RLC/RRC/RAL/RAR/CMA/CMC/STC), branch
+/*  (JMP/Jccc/CALL/Cccc/RET/Rccc/RST/PCHL), and stack/IO/control
+/*  (PUSH/POP/XTHL/SPHL/IN/OUT/EI/DI/HLT/NOP). Opcodes cross-checked
+/*  against techheap/dunfield 8080 references and the Intel 8080
+/*  Assembly Language Programming Manual. Undocumented opcodes are
+/*  intentionally not included, matching the 6502.axx/6809.axx house
+/*  convention.
+/*
+/*  ============================= SYNTAX =============================
+/*
+/*  8-bit registers are B,C,D,E,H,L,A. `M` means "memory referenced
+/*  through the H:L pair", e.g. MOV A,M / MOV M,A / INR M / MVI M,5.
+/*
+/*  Register pairs use the FIRST letter of the pair only, per standard
+/*  8080 syntax -- B means BC, D means DE, H means HL:
+/*
+/*     LXI  B,0x1234   INX  D    DAD  H    DCX  SP
+/*     PUSH H          POP  D    PUSH PSW  POP  PSW   (PSW = flags:A)
+/*
+/*  LDAX/STAX only accept B or D (indirect load/store through BC or DE
+/*  -- the 8080 has no indirect addressing through HL or SP for these).
+/*
+/*  Conditions are fused directly into the mnemonic with no separate
+/*  operand token, so each of the 8 conditions is its own instruction
+/*  (this is the opposite convention from Z80, which writes "JP cc,a"):
+/*
+/*     JMP/JNZ/JZ/JNC/JC/JPO/JPE/JP/JM   addr
+/*     CALL/CNZ/CZ/CNC/CC/CPO/CPE/CP/CM  addr
+/*     RET/RNZ/RZ/RNC/RC/RPO/RPE/RP/RM
+/*
+/*  All jump/call targets and LDA/STA/LHLD/SHLD addresses are 16-bit,
+/*  encoded little-endian (low byte first). Immediate operands to
+/*  MVI/ADI/ACI/SUI/SBI/ANI/XRI/ORI/CPI, RST, and IN/OUT ports are
+/*  range-checked (values are still accepted as either 0..0xff or, for
+/*  the byte-wide ones, as a negative two's-complement equivalent,
+/*  since only the upper bound is enforced -- matching the 6502.axx/
+/*  x86_64.axx idiom for plain immediates).
+/*
+
+/* ---------------------------------------------------------------------
+/*  8-bit register group: MOV / MVI / INR / DCR / ADD / ADC / SUB / SBB /
+/*  ANA / XRA / ORA / CMP, plus their M (memory-via-HL) and immediate
+/*  forms, plus the no-operand accumulator/flag instructions.
+/* ---------------------------------------------------------------------
+.setsym ::B::0
+.setsym ::C::1
+.setsym ::D::2
+.setsym ::E::3
+.setsym ::H::4
+.setsym ::L::5
+.setsym ::A::7
+.check::d::B,C,D,E,H,L,A
+.check::s::B,C,D,E,H,L,A
+MOV d,s :: 0x40|d<<3|s
+MOV d,M :: 0x46|d<<3
+MOV M,s :: 0x70|s
+MVI d,!i ::i>0xff;3:: 0x06|d<<3,i
+
+INR d :: 0x04|d<<3
+DCR d :: 0x05|d<<3
+
+ADD s :: 0x80|s
+ADC s :: 0x88|s
+SUB s :: 0x90|s
+SBB s :: 0x98|s
+ANA s :: 0xa0|s
+XRA s :: 0xa8|s
+ORA s :: 0xb0|s
+CMP s :: 0xb8|s
+.clrcheck::d
+.clrcheck::s
+
+MVI M,!i ::i>0xff;3:: 0x36,i
+INR M :: 0x34
+DCR M :: 0x35
+ADD M :: 0x86
+ADC M :: 0x8e
+SUB M :: 0x96
+SBB M :: 0x9e
+ANA M :: 0xa6
+XRA M :: 0xae
+ORA M :: 0xb6
+CMP M :: 0xbe
+
+ADI !i ::i>0xff;3:: 0xc6,i
+ACI !i ::i>0xff;3:: 0xce,i
+SUI !i ::i>0xff;3:: 0xd6,i
+SBI !i ::i>0xff;3:: 0xde,i
+ANI !i ::i>0xff;3:: 0xe6,i
+XRI !i ::i>0xff;3:: 0xee,i
+ORI !i ::i>0xff;3:: 0xf6,i
+CPI !i ::i>0xff;3:: 0xfe,i
+
+DAA :: 0x27
+RLC :: 0x07
+RRC :: 0x0f
+RAL :: 0x17
+RAR :: 0x1f
+CMA :: 0x2f
+CMC :: 0x3f
+STC :: 0x37
+HLT :: 0x76
+NOP :: 0x00
+
+/* ---------------------------------------------------------------------
+/*  Register-pair group. `r` is redefined here (B=0,D=1,H=2,SP=3) --
+/*  note this differs from the 8-bit-register values above for B/D/H,
+/*  which is fine because axx patterns capture the symbol values active
+/*  at the point each line is written, not a single global mapping.
+/* ---------------------------------------------------------------------
+.setsym ::B::0
+.setsym ::D::1
+.setsym ::H::2
+.setsym ::SP::3
+.check::r::B,D,H,SP
+LXI r,!n ::n>0xffff;2:: 0x01|r<<4,n&0xff,n>>8
+INX r :: 0x03|r<<4
+DCX r :: 0x0b|r<<4
+DAD r :: 0x09|r<<4
+.clrcheck::r
+
+.check::r::B,D
+LDAX r :: 0x0a|r<<4
+STAX r :: 0x02|r<<4
+.clrcheck::r
+
+/* PSW (flags:A) shares r=3 with SP -- valid because PUSH/POP and
+/* LXI/INX/DCX/DAD/LDAX/STAX never share a single .check list, so no
+/* line can ever accept both SP and PSW as if they meant the same thing. */
+.setsym ::PSW::3
+.check::r::B,D,H,PSW
+PUSH r :: 0xc5|r<<4
+POP r :: 0xc1|r<<4
+.clrcheck::r
+
+XCHG :: 0xeb
+XTHL :: 0xe3
+SPHL :: 0xf9
+PCHL :: 0xe9
+
+LDA !n ::n>0xffff;2:: 0x3a,n&0xff,n>>8
+STA !n ::n>0xffff;2:: 0x32,n&0xff,n>>8
+LHLD !n ::n>0xffff;2:: 0x2a,n&0xff,n>>8
+SHLD !n ::n>0xffff;2:: 0x22,n&0xff,n>>8
+
+/* ---------------------------------------------------------------------
+/*  Branch group. Every condition is a distinct literal mnemonic (see
+/*  the SYNTAX note above) rather than a parameterised operand, so each
+/*  needs its own line with its own pre-computed opcode:
+/*    Jccc = 0xC2|(ccc<<3)   Cccc = 0xC4|(ccc<<3)   Rccc = 0xC0|(ccc<<3)
+/*    ccc: NZ=0 Z=1 NC=2 C=3 PO=4 PE=5 P=6 M=7
+/* ---------------------------------------------------------------------
+JMP !n ::n>0xffff;2:: 0xc3,n&0xff,n>>8
+JNZ !n ::n>0xffff;2:: 0xc2,n&0xff,n>>8
+JZ  !n ::n>0xffff;2:: 0xca,n&0xff,n>>8
+JNC !n ::n>0xffff;2:: 0xd2,n&0xff,n>>8
+JC  !n ::n>0xffff;2:: 0xda,n&0xff,n>>8
+JPO !n ::n>0xffff;2:: 0xe2,n&0xff,n>>8
+JPE !n ::n>0xffff;2:: 0xea,n&0xff,n>>8
+JP  !n ::n>0xffff;2:: 0xf2,n&0xff,n>>8
+JM  !n ::n>0xffff;2:: 0xfa,n&0xff,n>>8
+
+CALL !n ::n>0xffff;2:: 0xcd,n&0xff,n>>8
+CNZ !n ::n>0xffff;2:: 0xc4,n&0xff,n>>8
+CZ  !n ::n>0xffff;2:: 0xcc,n&0xff,n>>8
+CNC !n ::n>0xffff;2:: 0xd4,n&0xff,n>>8
+CC  !n ::n>0xffff;2:: 0xdc,n&0xff,n>>8
+CPO !n ::n>0xffff;2:: 0xe4,n&0xff,n>>8
+CPE !n ::n>0xffff;2:: 0xec,n&0xff,n>>8
+CP  !n ::n>0xffff;2:: 0xf4,n&0xff,n>>8
+CM  !n ::n>0xffff;2:: 0xfc,n&0xff,n>>8
+
+RET :: 0xc9
+RNZ :: 0xc0
+RZ  :: 0xc8
+RNC :: 0xd0
+RC  :: 0xd8
+RPO :: 0xe0
+RPE :: 0xe8
+RP  :: 0xf0
+RM  :: 0xf8
+
+RST !n ::n>7;3,n<0;3:: 0xc7|(n<<3)
+
+IN !p ::p>0xff;6:: 0xdb,p
+OUT !p ::p>0xff;6:: 0xd3,p
+
+EI :: 0xfb
+DI :: 0xf3
