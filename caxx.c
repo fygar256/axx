@@ -8729,6 +8729,15 @@ struct MacroPP {
     int        enabled;
     int        had_error;
 
+    /* A malloc'd (not arena) buffer currently being built by a caller that
+     * is about to call into code which can longjmp via m_fail() -- e.g.
+     * m_interpolate()'s growable `out` buffer while it calls
+     * m_format_value(). Registered here so m_fail() can free it before
+     * unwinding; otherwise the buffer's only pointer lives in a stack frame
+     * that longjmp discards without running its cleanup, leaking it. NULL
+     * whenever no such buffer is in flight. */
+    char      *pending_buf;
+
     /* 1 when this instance expands *pattern* files (.axx) rather than source
      * files. Two things change: the comment marker on a macro statement line
      * becomes a slash-star sequence instead of ';' (see m_strip_comment), and
@@ -8895,6 +8904,7 @@ static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...
         axx_diagf(0, 1, " error - %s\n", msg);
     mp->had_error = 1;
     if(mp->asmb) mp->asmb->st.had_error = 1;
+    if(mp->pending_buf){ free(mp->pending_buf); mp->pending_buf = NULL; }
     if(mp->jb_active) longjmp(mp->jb, 1);
     exit(1);
 }
@@ -9728,10 +9738,20 @@ static char *m_fmt_int(MacroPP *mp, long long iv, MFmt *f, int *err){
     if(type == 'c'){
         if(f->sign || f->alt || f->group || f->has_prec){ *err = 1; return NULL; }
         if(iv < 0 || iv > 0x10FFFF){ *err = 1; return NULL; }
+        /* U+0000 is valid in Python (chr(0)) but is not representable here:
+         * the whole !{...} expansion pipeline (m_interpolate and friends)
+         * copies through NUL-terminated C strings via strlen(), so a literal
+         * NUL byte would silently truncate the line instead of being
+         * embedded. Rejecting it loudly is safer than emitting a silently
+         * short/wrong line -- see caxx-only known-limitation note below. */
+        if(iv == 0){ *err = 1; return NULL; }
         char buf[8];
         int n = m_utf8((unsigned long)iv, buf);
         buf[n] = '\0';
-        return m_fmt_pad(mp, "", buf, f, '<');
+        /* Python right-aligns 'c' like every other integer presentation
+         * type by default (format(65,'5c') == '    A'); only string ('s')
+         * defaults to left. */
+        return m_fmt_pad(mp, "", buf, f, '>');
     }
     if(f->group == ',' && strchr("xXob", type)){ *err = 1; return NULL; }
     if(f->group && type == 'n'){ *err = 1; return NULL; }
@@ -9814,7 +9834,13 @@ static char *m_fmt_int(MacroPP *mp, long long iv, MFmt *f, int *err){
     const char *tail = digits + intlen;
 
     int want = intlen;
-    if(f->zeropad && !f->align){
+    /* Python's trigger for this is the *resolved* alignment/fill being
+     * '=' and '0' -- not merely "the '0' shorthand was used with no
+     * explicit align". '0=20,d' (explicit align) grows the digit count
+     * exactly like '020,d' (implicit) does; '*=20,d' (align '=' but a
+     * non-'0' fill) and '0<20,d' (fill '0' but align '<') do not. */
+    char eff_align = f->align ? f->align : (f->zeropad ? '=' : '>');
+    if(eff_align == '=' && f->fill == '0'){
         /* Zero padding happens *inside* the grouping, and Python grows the
          * digit count until the grouped form reaches the requested width
          * (overshooting it when no digit count lands on it exactly). */
@@ -9925,15 +9951,13 @@ static char *m_interpolate(MacroPP *mp, const char *text, const char *file, int 
         }
         char *body = marena_strndup(&mp->arena, text + i + 2, (size_t)(j - i - 2));
         char *val;
-        /* m_format_value may longjmp; the malloc'd buffer would leak, so hand
-         * it to the arena first by copying what we have so far is unnecessary
-         * -- instead just make sure the failure path frees it. */
-        {
-            char *saved = out;
-            out = NULL;
-            val = m_format_value(mp, body, file, line);
-            out = saved;
-        }
+        /* m_format_value may longjmp via m_fail(). Register `out` so m_fail()
+         * can free it before unwinding past this frame -- setting a local
+         * variable here would do nothing, since longjmp skips straight past
+         * any code that would restore or use it. */
+        mp->pending_buf = out;
+        val = m_format_value(mp, body, file, line);
+        mp->pending_buf = NULL;
         size_t vl = strlen(val);
         while(n + vl + 1 >= cap){ cap *= 2; out = realloc(out, cap); if(!out){perror("realloc");exit(1);} }
         memcpy(out + n, val, vl);
