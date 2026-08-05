@@ -3,6 +3,14 @@ File description
 ```
 8048.axx                            pattern file for 8048 CPU
 8048.s                              test assemble file for 8048 CPU
+6809.axx                            pattern file for 6809 CPU
+6809.s                              test assemble file for 6809
+6502.axx                            pattern file for 6502
+6502.s                              test assemblee file for 6502
+8080.axx                            pattern file for 8080
+8080.s                              test assemble file for 8080
+4004.axx                            pattern file for 4004
+4004.s                              test assemble file for 4004
 LICENSE                             license
 README.md                           readme
 URL_to_newest_article_in_Japanese   as it is
@@ -25,7 +33,8 @@ z80.axx                             pattern file for Z80
 z80.s                               test assemble file for Z80
 vliw.axx                            test pattern file for vliw
 vliw.s                              test assembly file for vliw
-x86_64.axx                          pattern file for x86_64 (includes segment addressing, AVX/AVX2, BMI1/BMI2, x87 and EVEX/AVX-512)
+x86_64.axx                          pattern file for x86_64-v3 (includes segment addressing, AVX/AVX2, BMI1/BMI2, x87 and EVEX/AVX-512)
+x86_64m.axx                         pattern file for x86_64-v3 with macro
 itanium.axx                         test pattern file for itanium
 MACRO.md                            macro layer reference (Japanese)
 macro_en.md                         macro layer reference (English)
