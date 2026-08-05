@@ -3702,10 +3702,19 @@ class PatternMatcher:
 class PatternFileReader:
     """Reads a `.axx` pattern file into a list of 6-field pattern-line records
     (`[mnemonic, size_field, syntax, object_field, extra1, extra2]`), handling
-    `.INCLUDE` recursively with cycle/depth protection."""
+    `.INCLUDE` recursively with cycle/depth protection.
 
-    def __init__(self, parser):
+    Pattern files go through the same `!`-macro layer as source files, via a
+    dedicated `MacroPreprocessor` running in `pat_mode`.  It is a *separate*
+    instance from the source-side one on purpose: the two namespaces never
+    see each other, so a pattern file cannot change how a source file
+    expands (and vice versa), and the per-pass reset the source layer needs
+    cannot wipe macros that were defined while reading the pattern file."""
+
+    def __init__(self, parser, macro_proc=None):
         self.parser = parser
+        self.macro_proc = macro_proc if macro_proc is not None \
+            else MacroPreprocessor(None, pat_mode=True)
 
     def readpat(self, fn, base_dir=None, _depth=0, _chain=None):
         """Read and parse pattern file `fn`. `_chain` is the set of already-open
@@ -3736,49 +3745,57 @@ class PatternFileReader:
         p = []
         w = []
 
+        # The macro layer runs over the raw text of the pattern file before
+        # any of the pattern-line parsing below, exactly as it does for
+        # source files: a macro may therefore generate whole pattern lines,
+        # or a `.INCLUDE` directive.  Macro state is reset only for the
+        # top-level pattern file, so macros defined there stay visible inside
+        # everything it `.INCLUDE`s.
+        if _depth == 0:
+            self.macro_proc.reset_pass()
+
         with open(fn, "rt", encoding="utf-8") as f:
-            while True:
-                l = f.readline()
-                if not l:
-                    break
+            raw_lines = f.readlines()
 
-                l = StringUtils.remove_comment(l)
-                l = l.replace('\t', ' ')
-                l = l.replace(chr(13), '')
-                l = l.replace('\n', '')
-                l = StringUtils.reduce_spaces(l)
+        for l, _mfile, _mln in self.macro_proc.expand(raw_lines, fn):
 
-                ww = self.include_pat(l, this_dir, _depth=_depth + 1, _chain=_chain)
-                if ww is not None:
-                    w = w + ww
-                    continue
+            l = StringUtils.remove_comment(l)
+            l = l.replace('\t', ' ')
+            l = l.replace(chr(13), '')
+            l = l.replace('\n', '')
+            l = StringUtils.reduce_spaces(l)
+
+            ww = self.include_pat(l, this_dir, _depth=_depth + 1, _chain=_chain)
+            if ww is not None:
+                w = w + ww
+                continue
+            else:
+                r = []
+                idx = 0
+                while True:
+                    s, idx = self.parser.get_params1(l, idx)
+                    r += [s]
+                    if len(l) <= idx:
+                        break
+                l = r
+
+                if len(l) == 1:
+                    p = [l[0], '', '', '', '', '']
+                elif len(l) == 2:
+                    p = [l[0], '', l[1], '', '', '']
+                elif len(l) == 3:
+                    p = [l[0], l[1], l[2], '', '', '']
+                elif len(l) == 4:
+                    p = [l[0], l[1], l[2], l[3], '', '']
+                elif len(l) == 5:
+                    p = [l[0], l[1], l[2], l[3], l[4], '']
+                elif len(l) == 6:
+                    p = [l[0], l[1], l[2], l[3], l[4], l[5]]
                 else:
-                    r = []
-                    idx = 0
-                    while True:
-                        s, idx = self.parser.get_params1(l, idx)
-                        r += [s]
-                        if len(l) <= idx:
-                            break
-                    l = r
-
-                    if len(l) == 1:
-                        p = [l[0], '', '', '', '', '']
-                    elif len(l) == 2:
-                        p = [l[0], '', l[1], '', '', '']
-                    elif len(l) == 3:
-                        p = [l[0], l[1], l[2], '', '', '']
-                    elif len(l) == 4:
-                        p = [l[0], l[1], l[2], l[3], '', '']
-                    elif len(l) == 5:
-                        p = [l[0], l[1], l[2], l[3], l[4], '']
-                    elif len(l) == 6:
-                        p = [l[0], l[1], l[2], l[3], l[4], l[5]]
-                    else:
-                        diag(f" warning - pattern line has more than 6 fields "
-                             f"(extra fields ignored): {l[6:]!r}", set_error=False)
-                        p = [l[0], l[1], l[2], l[3], l[4], l[5]]
-                    w.append(p)
+                    diag(f" warning - pattern line has more than 6 fields "
+                         f"(extra fields ignored): {l[6:]!r}", set_error=False)
+                    p = [l[0], l[1], l[2], l[3], l[4], l[5]]
+                w.append(p)
 
         return w
 
@@ -4848,11 +4865,18 @@ def _fmt_pos(pos):
     return f"{pos[0]}:{pos[1]}"
 
 
-def _strip_comment(text):
+def _strip_comment(text, pat_mode=False):
     """Remove a `;` comment from a macro *statement* line, respecting string
     and character literals.  Ordinary (passed-through) source lines are never
     touched here -- the assembler strips their comments itself, and the
-    listing output is expected to still show them."""
+    listing output is expected to still show them.
+
+    `pat_mode` switches to the pattern-file comment convention: a comment
+    starts at `/*` and runs to the end of the line, and `;` is NOT a comment
+    marker.  That distinction matters because `;` separates the error-code
+    suffix of a pattern's error field (`v>0xff;2`), so treating it as a
+    comment start would silently truncate macro statements that build
+    pattern lines."""
     quote = ''
     i = 0
     while i < len(text):
@@ -4865,6 +4889,9 @@ def _strip_comment(text):
                 quote = ''
         elif c in '"\'':
             quote = c
+        elif pat_mode:
+            if c == '/' and text[i + 1:i + 2] == '*':
+                return text[:i].rstrip()
         elif c == ';':
             return text[:i].rstrip()
         i += 1
@@ -5251,8 +5278,16 @@ class MacroPreprocessor:
     everything and must be called at the start of every assembly pass, since
     expansion has to produce exactly the same text on each pass."""
 
-    def __init__(self, state=None):
+    def __init__(self, state=None, pat_mode=False):
         self.state = state
+        # `pat_mode` makes this instance expand *pattern* files (`.axx`)
+        # rather than source files.  Two things change: the comment marker on
+        # macro statement lines becomes `/*` (see `_strip_comment`), and the
+        # layer is only engaged when the file really contains a macro
+        # construct (see `has_macro_constructs`), because in a pattern file a
+        # bare `!` is the pattern-variable sigil (`LD A,!d`) and so appears on
+        # almost every line.
+        self.pat_mode = pat_mode
         self.reset()
 
     # -- lifecycle ---------------------------------------------------------
@@ -5482,7 +5517,7 @@ class MacroPreprocessor:
             if stripped.startswith('}') and depth > 0:
                 return nodes, i
 
-            word, rest = self.statement_word(_strip_comment(text))
+            word, rest = self.statement_word(_strip_comment(text, self.pat_mode))
             if word is None:
                 nodes.append(('text', text, pos))
                 i += 1
@@ -5568,7 +5603,7 @@ class MacroPreprocessor:
     def parse_if(self, lines, i, depth):
         text, fn, ln = lines[i]
         pos = (fn, ln)
-        cond = self.parse_header(_strip_comment(text), 'if', pos)
+        cond = self.parse_header(_strip_comment(text, self.pat_mode), 'if', pos)
         arms = []
         else_body = None
         while True:
@@ -5578,7 +5613,7 @@ class MacroPreprocessor:
                 raise MacroError(f"{_fmt_pos(pos)}: '!if' block is never closed with '}}'")
             close, cfn, cln = lines[i]
             cpos = (cfn, cln)
-            tail = _strip_comment(close).strip()[1:].strip()
+            tail = _strip_comment(close, self.pat_mode).strip()[1:].strip()
             if tail == '' or tail.startswith(';'):
                 return ('if', arms, else_body, pos), i + 1
             w, rest = self.statement_word(tail)
@@ -5597,7 +5632,7 @@ class MacroPreprocessor:
                 else_body, i = self.parse_block(lines, i + 1, depth + 1)
                 if i >= len(lines):
                     raise MacroError(f"{_fmt_pos(cpos)}: '!else' block is never closed")
-                trailer = _strip_comment(lines[i][0]).strip()[1:].strip()
+                trailer = _strip_comment(lines[i][0], self.pat_mode).strip()[1:].strip()
                 if trailer and not trailer.startswith(';'):
                     raise MacroError(f"{lines[i][1]}:{lines[i][2]}: unexpected text "
                                      f"after '}}': {trailer!r}")
@@ -5607,11 +5642,11 @@ class MacroPreprocessor:
     def parse_while(self, lines, i, depth):
         text, fn, ln = lines[i]
         pos = (fn, ln)
-        cond = self.parse_header(_strip_comment(text), 'while', pos)
+        cond = self.parse_header(_strip_comment(text, self.pat_mode), 'while', pos)
         body, i = self.parse_block(lines, i + 1, depth + 1)
         if i >= len(lines):
             raise MacroError(f"{_fmt_pos(pos)}: '!while' block is never closed with '}}'")
-        trailer = _strip_comment(lines[i][0]).strip()[1:].strip()
+        trailer = _strip_comment(lines[i][0], self.pat_mode).strip()[1:].strip()
         if trailer and not trailer.startswith(';'):
             raise MacroError(f"{lines[i][1]}:{lines[i][2]}: unexpected text after "
                              f"'}}': {trailer!r}")
@@ -5620,7 +5655,7 @@ class MacroPreprocessor:
     def parse_def(self, lines, i, depth):
         text, fn, ln = lines[i]
         pos = (fn, ln)
-        t = _strip_comment(text).strip()[4:].strip()
+        t = _strip_comment(text, self.pat_mode).strip()[4:].strip()
         if not t.rstrip().endswith('{'):
             raise MacroError(f"{_fmt_pos(pos)}: '!def' header must end with '{{'")
         t = t.rstrip()[:-1].strip()
@@ -5663,7 +5698,7 @@ class MacroPreprocessor:
         body, i = self.parse_block(lines, i + 1, depth + 1)
         if i >= len(lines):
             raise MacroError(f"{_fmt_pos(pos)}: '!def {name}' block is never closed")
-        trailer = _strip_comment(lines[i][0]).strip()[1:].strip()
+        trailer = _strip_comment(lines[i][0], self.pat_mode).strip()[1:].strip()
         if trailer and not trailer.startswith(';'):
             raise MacroError(f"{lines[i][1]}:{lines[i][2]}: unexpected text after "
                              f"'}}': {trailer!r}")
@@ -5896,11 +5931,53 @@ class MacroPreprocessor:
                 return True
         return False
 
+    @staticmethod
+    def has_interpolation(t):
+        """True when `t` contains an unescaped `!{` interpolation."""
+        i = t.find('!{')
+        while i >= 0:
+            if i == 0 or t[i - 1] != '\\':
+                return True
+            i = t.find('!{', i + 2)
+        return False
+
+    def has_macro_constructs(self, raw):
+        """Strict pre-filter used for *pattern* files.
+
+        `contains_macros()` engages the layer as soon as a `!` appears
+        anywhere, which is the right call for source files but useless for a
+        pattern file: there `!` introduces a pattern variable (`ADD A,!d`) and
+        so occurs on nearly every line.  This variant asks the narrower
+        question the interception rule in `parse_block()` actually cares
+        about -- is there a line that would really be taken as a macro
+        statement, an unescaped `!{...}` interpolation, or a block-closing
+        `}`?  A pattern file that uses no macros therefore skips parsing
+        entirely and is handed to the pattern reader byte-for-byte as
+        written, which is what keeps every existing `.axx` file unaffected."""
+        for t in raw:
+            s = t.lstrip()
+            if s.startswith('}'):
+                return True
+            if self.has_interpolation(t):
+                return True
+            word, rest = self.statement_word(s)
+            if word is None:
+                continue
+            if word.lower() in _MACRO_KEYWORDS or word in self.funcs \
+                    or word in self.declared or self.looks_like_call(rest):
+                return True
+        return False
+
     def expand(self, raw, filename):
         """Expand one source file.  `raw` is a list of lines (newline included
         or not); returns a list of `(text, filename, lineno)`."""
         lines = [(t.rstrip('\r\n'), filename, k + 1) for k, t in enumerate(raw)]
-        if not self.enabled or not self.contains_macros([t for t, _, _ in lines]):
+        if not self.enabled:
+            return lines
+        texts = [t for t, _, _ in lines]
+        engaged = (self.has_macro_constructs(texts) if self.pat_mode
+                   else self.contains_macros(texts))
+        if not engaged:
             return lines
         # A macro error is fatal for the whole run, and Pass 1 would otherwise
         # re-expand (and re-hit) it on every relaxation iteration -- which for
@@ -6092,7 +6169,14 @@ class Assembler:
                                                   self.symbol_manager, self.parser)
         self.pattern_matcher = PatternMatcher(self.state, self.expr_eval, self.var_manager,
                                              self.symbol_manager, self.parser)
-        self.pattern_reader = PatternFileReader(self.parser)
+        # Separate macro-preprocessor instances for the two kinds of input:
+        # `pat_macro_proc` expands pattern files (`.axx`) and is reset once,
+        # when the pattern file is read; `macro_proc` expands source files
+        # and is reset at the start of every assembly pass.  Keeping the
+        # namespaces apart means a pattern file's macros can never change how
+        # a source file expands, and the per-pass reset can never wipe them.
+        self.pat_macro_proc = MacroPreprocessor(self.state, pat_mode=True)
+        self.pattern_reader = PatternFileReader(self.parser, self.pat_macro_proc)
         self.obj_gen = ObjectGenerator(self.state, self.expr_eval, self.binary_writer)
         self.vliw_proc = VLIWProcessor(self.state, self.expr_eval, self.binary_writer)
         self.asm_directive_proc = AssemblyDirectiveProcessor(self.state, self.expr_eval,
@@ -7894,6 +7978,12 @@ class Assembler:
                         help='Macro-expand the source file and write the resulting '
                              'assembly to FILE (or stdout if FILE is omitted or "-") '
                              'without assembling it. Useful for debugging macros.')
+        ap.add_argument('-p', '--macro-expand-pattern', dest='macro_expand_pattern',
+                        nargs='?', const='-', default=None, metavar='FILE',
+                        help='The pattern-file counterpart of -P: macro-expand the '
+                             'pattern file and write the resulting pattern text to '
+                             'FILE (or stdout if FILE is omitted or "-") without '
+                             'assembling. Useful for debugging pattern-file macros.')
         return ap
 
     def _macro_expand_only(self, sourcefile, dest):
@@ -7932,6 +8022,40 @@ class Assembler:
                 return False
         return True
 
+    def _pat_macro_expand_only(self, patternfile, dest):
+        """`-p/--macro-expand-pattern`: run only the macro layer over the pattern
+        file and write the expanded pattern text to `dest` ("-" = stdout),
+        then stop.
+
+        `.INCLUDE`d pattern files are NOT followed here (the pattern reader
+        pulls those in, not this layer); `!include`d ones are, since those are
+        expanded by the macro layer itself."""
+        self.pat_macro_proc.reset_pass()
+        try:
+            with open(patternfile, "rt", encoding="utf-8") as f:
+                raw = f.readlines()
+        except OSError as e:
+            self.state.diag(f" error - cannot open pattern file '{patternfile}': {e}",
+                            set_error=False, force=True)
+            return False
+
+        expanded = self.pat_macro_proc.expand(raw, patternfile)
+        if self.pat_macro_proc.had_error or self.state.had_error:
+            return False
+
+        data = ''.join(text + "\n" for text, _fname, _ln in expanded)
+        if dest in ('-', ''):
+            sys.stdout.write(data)
+        else:
+            try:
+                with open(dest, "wt", encoding="utf-8") as f:
+                    f.write(data)
+            except OSError as e:
+                self.state.diag(f" error - cannot write '{dest}': {e}",
+                                set_error=False, force=True)
+                return False
+        return True
+
     @staticmethod
     def _normalise_macro_expand_argv(argv):
         """`-P/--macro-expand` takes an optional argument, which argparse would
@@ -7946,7 +8070,7 @@ class Assembler:
                 out += [a, argv[i + 1]]
                 i += 2
                 continue
-            if a in ('-P', '--macro-expand'):
+            if a in ('-P', '--macro-expand', '-p', '--macro-expand-pattern'):
                 if (i + 1 < len(argv) and not argv[i + 1].startswith('-')
                         and positional >= 2):
                     out += [a, argv[i + 1]]
@@ -8024,6 +8148,11 @@ class Assembler:
         self.state.debug        = args.debug
         self.state.gen_debug    = args.gen_debug
         self.macro_proc.enabled = not args.no_macro
+        self.pat_macro_proc.enabled = not args.no_macro
+
+        if args.macro_expand_pattern is not None:
+            return self._pat_macro_expand_only(args.patternfile,
+                                               args.macro_expand_pattern)
 
         if args.macro_expand is not None:
             if args.sourcefile is None:

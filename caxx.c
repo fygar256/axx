@@ -5395,6 +5395,13 @@ static void axx_dir_of(const char *path, char *out, size_t osz)
 static void readpat(Assembler *asmb, const char *fn);
 static void include_pat(Assembler *asmb, const char *l, const char *base_dir);
 
+/* Defined after the macro layer (see pat_macro_expand there). Pattern files
+ * go through the same '!'-macro layer as source files, so a macro may
+ * generate whole pattern lines -- or a .INCLUDE directive. */
+static char **pat_macro_expand(FILE *f, const char *display, int *nlines);
+static void pat_macro_expand_free(char **v, int n);
+static void macro_reset_pass_pattern(void);
+
 /* Bug 5 fix + relative-path fix: include_pat()
  * Now accepts base_dir (the directory of the calling pattern file) and
  * resolves the .INCLUDE filename relative to it, exactly as axx.py does:
@@ -5473,15 +5480,31 @@ static void readpat(Assembler *asmb, const char *fn){
     char this_dir[1024];
     axx_dir_of(fn, this_dir, sizeof(this_dir));
 
-    /* Fix: pattern files were read with a fixed 4096-byte fgets() buffer,
-     * so any single logical line at or beyond that length was silently
-     * split into two lines (fgets() just returns without a trailing '\n'
-     * and the remainder is picked up on the next call as if it were a
-     * separate line) -- no error, no warning. fileassemble() already reads
-     * source files via getline() with no length limit; do the same here
-     * so pattern files have the same guarantee as source files. */
-    char *line=NULL; size_t lcap=0;
-    while(getline(&line,&lcap,f)!=-1){
+    /* Macro-expand the whole pattern file first, then parse the resulting
+     * lines. Macro state is reset only for the top-level pattern file (depth
+     * 0 at entry), so macros defined there stay visible inside everything it
+     * .INCLUDEs -- the same rule the source side uses for its own .INCLUDE.
+     *
+     * The previous getline() loop is gone, but its guarantee is kept:
+     * m_read_lines() inside the macro layer also reads with getline(), so a
+     * pattern line still has no length limit (an earlier fix; a fixed 4096-
+     * byte fgets() buffer used to split long lines silently). */
+    if(asmb->st.pat_include_depth == 1) macro_reset_pass_pattern();
+
+    int nexp = 0;
+    char **exp = pat_macro_expand(f, fn, &nexp);
+    fclose(f);
+    f = NULL;
+
+    char *line = NULL; size_t lcap = 0;
+    for(int li = 0; li < nexp; li++){
+        size_t need = strlen(exp[li]) + 1;
+        if(need > lcap){
+            char *nl = realloc(line, need);
+            if(!nl){ perror("realloc"); exit(1); }
+            line = nl; lcap = need;
+        }
+        memcpy(line, exp[li], need);
         axx_remove_comment(line);
         for(char*p=line;*p;p++){ if(*p=='\t') *p=' '; if(*p=='\r') *p=' '; }
         int l=(int)strlen(line);
@@ -5512,7 +5535,7 @@ static void readpat(Assembler *asmb, const char *fn){
         else if(nf>=6){ for(int i=0;i<6;i++) pat_set(pe,i,fields[i]); }
     }
     free(line);
-    fclose(f);
+    pat_macro_expand_free(exp, nexp);
     /* D8: pop this file off the include chain */
     asmb->st.pat_include_depth--;
     if(asmb->st.pat_include_depth >= 0
@@ -8706,6 +8729,15 @@ struct MacroPP {
     int        enabled;
     int        had_error;
 
+    /* 1 when this instance expands *pattern* files (.axx) rather than source
+     * files. Two things change: the comment marker on a macro statement line
+     * becomes a slash-star sequence instead of ';' (see m_strip_comment), and
+     * the layer is only engaged when the file really contains a macro construct (see
+     * m_has_macro_constructs), because in a pattern file a bare '!' is the
+     * pattern-variable sigil and so appears on almost every line. Set by
+     * macro_init_pattern(); never cleared by macro_reset_pass(). */
+    int        pat_mode;
+
     /* Reported diagnostics, so a single macro error is printed once per run
      * rather than once per relaxation iteration. Cleared only by
      * macro_init()/macro_free(), never by macro_reset_pass(). */
@@ -9646,7 +9678,13 @@ static char *m_interpolate(MacroPP *mp, const char *text, const char *file, int 
 /* Remove a ';' comment from a macro *statement* line, respecting string and
  * character literals. Ordinary (passed-through) source lines are never touched
  * here: the assembler strips their comments itself, and the listing output is
- * expected to still show them. */
+ * expected to still show them.
+ *
+ * In pattern mode (mp->pat_mode) the pattern-file convention applies instead:
+ * a comment starts at a slash-star sequence and runs to the end of the line,
+ * and ';' is NOT a comment marker. That matters because ';' separates the error-code
+ * suffix of a pattern's error field (v>0xff;2), so treating it as a comment
+ * start would silently truncate macro statements that build pattern lines. */
 static char *m_strip_comment(MacroPP *mp, const char *text){
     int i = 0; char quote = 0;
     while(text[i]){
@@ -9655,6 +9693,9 @@ static char *m_strip_comment(MacroPP *mp, const char *text){
             if(c == '\\'){ i += 2; continue; }
             if(c == quote) quote = 0;
         } else if(c == '"' || c == '\'') quote = c;
+        else if(mp->pat_mode){
+            if(c == '/' && text[i+1] == '*') break;
+        }
         else if(c == ';') break;
         i++;
     }
@@ -10242,6 +10283,38 @@ static int m_contains_macros(MSrc *src){
     return 0;
 }
 
+/* True when text contains an unescaped "!{" interpolation. */
+static int m_has_interpolation(const char *t){
+    for(const char *p = strstr(t, "!{"); p; p = strstr(p + 2, "!{"))
+        if(p == t || p[-1] != '\\') return 1;
+    return 0;
+}
+
+/* Strict pre-filter used for *pattern* files.
+ *
+ * m_contains_macros() engages the layer as soon as a '!' appears anywhere,
+ * which is the right call for source files but useless for a pattern file:
+ * there '!' introduces a pattern variable (ADD A,!d) and so occurs on nearly
+ * every line. This variant asks the narrower question the interception rule
+ * in m_parse_block() actually cares about -- is there a line that would
+ * really be taken as a macro statement, an unescaped "!{...}" interpolation,
+ * or a block-closing '}'? A pattern file that uses no macros therefore skips
+ * parsing entirely and reaches the pattern reader byte-for-byte as written,
+ * which is what keeps every existing .axx file unaffected. */
+static int m_has_macro_constructs(MacroPP *mp, MSrc *src){
+    for(int i = 0; i < src->n; i++){
+        const char *t = src->d[i].text;
+        if(m_lstrip(t)[0] == '}') return 1;
+        if(m_has_interpolation(t)) return 1;
+        char w[64];
+        const char *rest = m_statement_word(t, w, sizeof(w));
+        if(!rest) continue;
+        if(m_is_keyword(w) || m_declared(mp, w) || m_lstrip(rest)[0] == '(')
+            return 1;
+    }
+    return 0;
+}
+
 /* Expand one already-open source file. `display` is the name diagnostics and
  * DWARF line records should use. The returned lines carry the ORIGINAL source
  * position they came from (inside a macro body, the line of that body line in
@@ -10253,7 +10326,9 @@ static MLineVec macro_expand(MacroPP *mp, FILE *f, const char *display){
     MSrc src;
     m_read_lines(mp, f, display, &src);
 
-    if(!mp->enabled || !m_contains_macros(&src)){
+    if(!mp->enabled
+       || !(mp->pat_mode ? m_has_macro_constructs(mp, &src)
+                         : m_contains_macros(&src))){
         for(int i = 0; i < src.n; i++)
             mlinevec_push(mp, &result, src.d[i].text, src.d[i].file, src.d[i].line);
         return result;
@@ -10301,6 +10376,50 @@ static MLineVec macro_expand(MacroPP *mp, FILE *f, const char *display){
  * Assembler, so a file-static instance is enough and keeps the change to
  * struct Assembler (and every function that takes one) at zero. */
 static MacroPP g_macro;
+
+/* The pattern-file macro-preprocessor instance.
+ *
+ * Deliberately separate from g_macro: the two namespaces never see each
+ * other, so a pattern file's macros cannot change how a source file expands
+ * (and vice versa), and the per-pass macro_reset_pass() that fileassemble()
+ * needs cannot wipe macros defined while reading the pattern file. */
+static MacroPP g_pat_macro;
+
+static void macro_init_pattern(Assembler *asmb){
+    macro_init(&g_pat_macro, asmb);
+    g_pat_macro.pat_mode = 1;
+}
+
+/* Reset the pattern-side macro namespace. Called by readpat() when it enters
+ * the top-level pattern file, so a second readpat() would start clean. */
+static void macro_reset_pass_pattern(void){
+    macro_reset_pass(&g_pat_macro);
+}
+
+/* readpat() is defined long before the macro layer, and MLineVec is an
+ * anonymous struct type that cannot be forward-declared, so the pattern
+ * reader reaches the layer through this narrow wrapper instead: it expands
+ * the already-open pattern file and hands back a plain NUL-terminated array
+ * of line texts. The strings are copied out of the arena because readpat()
+ * rewrites each line in place while parsing it. */
+static char **pat_macro_expand(FILE *f, const char *display, int *nlines){
+    MLineVec v = macro_expand(&g_pat_macro, f, display);
+    char **out = malloc(sizeof(char*) * (size_t)(v.len + 1));
+    if(!out){ perror("malloc"); exit(1); }
+    for(int i = 0; i < v.len; i++){
+        out[i] = strdup(v.d[i].text ? v.d[i].text : "");
+        if(!out[i]){ perror("strdup"); exit(1); }
+    }
+    out[v.len] = NULL;
+    *nlines = v.len;
+    return out;
+}
+
+static void pat_macro_expand_free(char **v, int n){
+    if(!v) return;
+    for(int i = 0; i < n; i++) free(v[i]);
+    free(v);
+}
 
 static void fileassemble(Assembler *asmb, const char *fn){
     AsmState *st=&asmb->st;
@@ -10692,10 +10811,12 @@ int main(int argc, char *argv[]){
     assembler_init(asmb);
     AsmState *st=&asmb->st;
     macro_init(&g_macro, asmb);
+    macro_init_pattern(asmb);
 
     const char *patternfile=NULL, *sourcefile=NULL;
     char osabistr[16]="FreeBSD"; /* ELF_OSABI Default: FreeBSD */
     const char *macro_expand_dest=NULL;   /* -P: "-" = stdout */
+    const char *pat_macro_expand_dest=NULL; /* -p: "-" = stdout */
 
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--osabi")==0&&i+1<argc){ strncpy(osabistr,argv[++i],sizeof(osabistr)-1); }
@@ -10731,7 +10852,21 @@ int main(int argc, char *argv[]){
         else if(strcmp(argv[i],"-v")==0||strcmp(argv[i],"--verbose")==0){ st->verbose=1; }
         else if(strcmp(argv[i],"-d")==0||strcmp(argv[i],"--debug")==0){ st->debug=1; }
         else if(strcmp(argv[i],"-g")==0||strcmp(argv[i],"--gen-debug")==0){ st->gen_debug=1; }
-        else if(strcmp(argv[i],"--no-macro")==0){ g_macro.enabled=0; }
+        else if(strcmp(argv[i],"--no-macro")==0){ g_macro.enabled=0; g_pat_macro.enabled=0; }
+        else if(strncmp(argv[i],"--macro-expand-pattern=",23)==0){
+            pat_macro_expand_dest=argv[i]+23;
+            if(!*pat_macro_expand_dest) pat_macro_expand_dest="-";
+        }
+        else if(strcmp(argv[i],"-p")==0||strcmp(argv[i],"--macro-expand-pattern")==0){
+            /* Same optional-argument rule as -P: consume the next token only
+             * when it is not another option and both positionals are already
+             * in hand, so "-p pat.axx" keeps pat.axx as the pattern file
+             * rather than eating it as the destination. */
+            if(i+1<argc && argv[i+1][0]!='-' && patternfile && sourcefile)
+                pat_macro_expand_dest=argv[++i];
+            else
+                pat_macro_expand_dest="-";
+        }
         else if(strncmp(argv[i],"--macro-expand=",15)==0){
             macro_expand_dest=argv[i]+15;
             if(!*macro_expand_dest) macro_expand_dest="-";
@@ -10783,6 +10918,40 @@ int main(int argc, char *argv[]){
     }
 
     if(st->outfile[0]) remove(st->outfile);
+
+    /* -p/--macro-expand-pattern: the pattern-file counterpart of -P. Runs only
+     * the macro layer over the pattern file and writes the expanded pattern
+     * text out, then stops. .INCLUDEd pattern files are NOT followed (the
+     * pattern reader pulls those in, not this layer); !included ones are. */
+    if(pat_macro_expand_dest){
+        if(!patternfile){
+            axx_diagf(0, 0, " error - -p/--macro-expand-pattern needs a pattern file.\n");
+            exit_code=1; goto cleanup;
+        }
+        FILE *pf=fopen(patternfile,"rt");
+        if(!pf){
+            axx_diagf(0, 0, " error - cannot open pattern file '%s': %s\n",
+                       patternfile, strerror(errno));
+            exit_code=1; goto cleanup;
+        }
+        macro_reset_pass_pattern();
+        int _pn=0;
+        char **_pv=pat_macro_expand(pf, patternfile, &_pn);
+        if(g_pat_macro.had_error || st->had_error){
+            pat_macro_expand_free(_pv,_pn); exit_code=1; goto cleanup;
+        }
+        FILE *of = (strcmp(pat_macro_expand_dest,"-")==0) ? stdout
+                                                          : fopen(pat_macro_expand_dest,"wt");
+        if(!of){
+            axx_diagf(0, 0, " error - cannot write '%s': %s\n",
+                       pat_macro_expand_dest, strerror(errno));
+            pat_macro_expand_free(_pv,_pn); exit_code=1; goto cleanup;
+        }
+        for(int _pi=0;_pi<_pn;_pi++) fprintf(of,"%s\n",_pv[_pi]);
+        if(of!=stdout) fclose(of);
+        pat_macro_expand_free(_pv,_pn);
+        goto cleanup;
+    }
 
     /* -P/--macro-expand: run only the macro layer over the source file and
      * write the expanded assembly out, then stop. Note that .INCLUDEd files
@@ -11278,6 +11447,7 @@ cleanup:
     st->line_map=NULL; st->line_map_len=0; st->line_map_cap=0;
 
     macro_free(&g_macro);
+    macro_free(&g_pat_macro);
 
     return exit_code;
 }

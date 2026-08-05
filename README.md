@@ -132,7 +132,7 @@ Usage:
 
 ```
 usage: axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV] [-E EXPORT_ELF_TSV] [-i IMPORT_TSV] [-o OBJ_FILE]
-           [-m MACHINE] [-v] [-d] [-g] [--no-macro] [-P [FILE]]
+           [-m MACHINE] [-v] [-d] [-g] [--no-macro] [-P [FILE]] [-p [FILE]]
            patternfile [sourcefile]
 
 axx general assembler programmed and designed by Taisuke Maekawa
@@ -162,6 +162,10 @@ options:
   -P [FILE], --macro-expand [FILE]
                         Macro-expand the source file and write the resulting assembly to FILE (or stdout if FILE is
                         omitted or "-") without assembling it. Useful for debugging macros.
+  -p [FILE], --macro-expand-pattern [FILE]
+                        The pattern-file counterpart of -P: macro-expand the pattern file and write the resulting
+                        pattern text to FILE (or stdout if FILE is omitted or "-") without assembling. Useful for
+                        debugging pattern-file macros.
 ```
 
 ### Differences in the C version's command line
@@ -1131,9 +1135,46 @@ is treated as 0.
 | Option | Meaning |
 |---|---|
 | `--no-macro` | Completely disable the macro layer |
-| `-P [FILE]`, `--macro-expand [FILE]` | Output only the expanded result and exit (defaults to stdout) |
+| `-P [FILE]`, `--macro-expand [FILE]` | Output only the expanded source and exit (defaults to stdout) |
+| `-p [FILE]`, `--macro-expand-pattern [FILE]` | Output only the expanded pattern file and exit (defaults to stdout) |
 
-caxx.c uses the same option names. To allow the filename to be omitted, the `-P` option in the C version interprets the subsequent argument as the output destination only when placed after both the pattern file and the source file have been specified (e.g., `caxx pat.axx src.s -P out.s`).
+caxx.c uses the same option names. To allow the filename to be omitted, the `-P` option in the C version interprets the subsequent argument as the output destination only when placed after both the pattern file and the source file have been specified (e.g., `caxx pat.axx src.s -P out.s`). `-p` follows the same rule. `--no-macro` disables both the source-side and the pattern-side layer.
+
+#### Macros in Pattern Files
+
+Pattern files (`.axx`) go through the same macro layer as source files. An instruction table tends to consist of rows of the same shape that differ only in a register number or an opcode, so those rows can be generated instead of written out by hand:
+
+```
+!def alu(name, base) {          /* pattern-file comment syntax, on a statement line
+!local r = 0
+!while r < 8 {
+!{name} A,R!{r} :: 0x!{base + r:02x}
+!set r = r + 1
+}
+}
+!alu("ADD", 0x80)
+!alu("SUB", 0x90)
+```
+
+The error field can be generated too, so a range check written once is applied to every generated row:
+
+```
+!def imm(name, op) {
+!{name} A,!v :: v>0xff;2,v<0;2 :: 0x!{op:02x},v
+}
+!imm("ADDI", 0xc6)
+!imm("SUBI", 0xd6)
+```
+
+Only three things differ from the source side; the syntax, the built-in functions and the runaway guards are all the same.
+
+1. **A separate namespace.** The pattern side and the source side have independent macro environments and cannot see each other's macros or variables. A pattern file's macros can therefore never change how a source file expands, and the per-pass reset the source side performs during relaxation can never wipe macros defined while reading the pattern file.
+2. **Comments on statement lines start with a slash-star sequence**, matching pattern-file convention. `;` is not a comment marker there, because it separates the error-code suffix of a pattern's error field (`v>0xff;2`).
+3. **A stricter engage condition.** In a pattern file `!` is the pattern-variable sigil (`ADD A,!d`), so it appears on nearly every line. The layer is therefore engaged only when a line would really be taken as a macro statement, or contains an unescaped `!{...}`, or starts with `}`. A pattern file that uses no macros skips the layer entirely: every pattern file shipped with axx expands to itself byte-for-byte and assembles in the same time as before.
+
+`.INCLUDE` on the pattern side is processed *after* macro expansion, so a macro can generate the `.INCLUDE` line itself. Each `.INCLUDE`d pattern file is macro-expanded in turn, inheriting the macros defined by the top-level pattern file.
+
+Use `-p` to see the generated pattern text without assembling.
 
 #### Backward Compatibility
 
@@ -1144,7 +1185,7 @@ VLIW-specific `!!` and `!F` / `!D` / `!Q` constructs remain untouched.
 
 #### Limitations
 
-- Assembler-level `.INCLUDE` directives bypass the macro layer; use `!include` to import macro definition files.
+- Source-side `.INCLUDE` directives bypass the macro layer; use `!include` to import macro definition files. (Pattern-side `.INCLUDE` does run the included file through the macro layer.)
 - Constructs like `!{a ? b : c:04x}` (combining a ternary operator with format specifiers) cannot currently be parsed.
 - Interactive mode (when no source file is specified) bypasses the macro layer.
 
