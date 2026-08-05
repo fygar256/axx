@@ -9529,6 +9529,322 @@ static MVal m_call_value(MacroPP *mp, const char *name, MVal *args, int nargs,
 
 /* ---- text interpolation ---------------------------------------------------- */
 
+/* ---- format spec (Python format mini-language) ----------------------------
+ *
+ * axx.py hands `!{expr:spec}` straight to Python's format(), so Python's
+ * mini-language IS the specification (MACRO.md and README both say so). This
+ * used to accept only `[0][width][type]`, which made caxx reject specs that
+ * axx.py formatted happily -- alignment, sign, '#', grouping and the float
+ * types all failed. The grammar implemented here is Python's:
+ *
+ *     [[fill]align][sign][z][#][0][width][grouping][.precision][type]
+ *     align     ::= "<" | ">" | "=" | "^"
+ *     sign      ::= "+" | "-" | " "
+ *     grouping  ::= "," | "_"
+ *     type      ::= b c d e E f F g G n o s x X %
+ *
+ * with the same validity rules Python enforces (no precision on integer
+ * types, no ',' with 'x'/'o'/'b'/'c'/'n', no sign or '#' on strings, and so
+ * on). Anything Python rejects is rejected here with the identical message
+ * axx.py produces, so the two implementations agree on failures too.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    char fill;
+    char align;      /* 0 = unspecified */
+    char sign;       /* 0 = unspecified (behaves as '-') */
+    int  has_fill;   /* an explicit fill character was given */
+    int  zcoerce;    /* 'z' */
+    int  alt;        /* '#' */
+    int  zeropad;    /* leading '0' before the width */
+    int  width;
+    char group;      /* 0, ',' or '_' */
+    int  has_prec;
+    int  prec;
+    char type;       /* 0 = unspecified */
+} MFmt;
+
+static int m_is_align(char c){
+    return c == '<' || c == '>' || c == '=' || c == '^';
+}
+
+/* Parse `spec`. Returns 0 when the spec is malformed. */
+static int m_fmt_parse(const char *spec, MFmt *f){
+    memset(f, 0, sizeof(*f));
+    f->fill = ' ';
+    const char *p = spec;
+    if(p[0] && p[1] && m_is_align(p[1])){
+        f->fill = p[0]; f->align = p[1]; f->has_fill = 1; p += 2;
+    }
+    else if(p[0] && m_is_align(p[0])){ f->align = p[0]; p++; }
+    if(*p == '+' || *p == '-' || *p == ' '){ f->sign = *p; p++; }
+    if(*p == 'z'){ f->zcoerce = 1; p++; }
+    if(*p == '#'){ f->alt = 1; p++; }
+    if(*p == '0'){
+        /* A leading '0' always means fill='0'; it additionally implies
+         * sign-aware '=' alignment only when no alignment was given. */
+        f->zeropad = 1;
+        if(!f->has_fill) f->fill = '0';
+        p++;
+    }
+    while(isdigit((unsigned char)*p)){
+        f->width = f->width * 10 + (*p - '0');
+        if(f->width > 1000000) return 0;
+        p++;
+    }
+    if(*p == ',' || *p == '_'){ f->group = *p; p++; }
+    if(*p == '.'){
+        p++;
+        if(!isdigit((unsigned char)*p)) return 0;
+        f->has_prec = 1;
+        while(isdigit((unsigned char)*p)){
+            f->prec = f->prec * 10 + (*p - '0');
+            if(f->prec > 1000000) return 0;
+            p++;
+        }
+    }
+    if(*p){
+        if(!strchr("bcdeEfFgGnosxX%", *p)) return 0;
+        f->type = *p;
+        p++;
+    }
+    return *p == '\0';
+}
+
+/* Length of `n` digits once `group` separators every `iv` digits are added. */
+static int m_group_len(int n, int iv){
+    return n + (n - 1) / iv;
+}
+
+/* Write `digits` (n of them, already zero-extended to the wanted length)
+ * into out[] inserting a separator every `iv` digits. Returns the length. */
+static int m_group_emit(char *out, const char *digits, int n, int iv, char sep){
+    int lead = n % iv;
+    if(lead == 0) lead = iv;
+    int o = 0, i = 0;
+    for(int k = 0; k < lead; k++) out[o++] = digits[i++];
+    while(i < n){
+        out[o++] = sep;
+        for(int k = 0; k < iv; k++) out[o++] = digits[i++];
+    }
+    out[o] = '\0';
+    return o;
+}
+
+/* Number of code points in a UTF-8 string. Python measures width and
+ * precision in characters, so a multi-byte result from `!{n:c}` (or a
+ * non-ASCII string value) must not be counted byte-wise here. */
+static int m_utf8_len(const char *s){
+    int n = 0;
+    for(const unsigned char *p = (const unsigned char*)s; *p; p++)
+        if((*p & 0xc0) != 0x80) n++;
+    return n;
+}
+
+/* Byte offset of the `n`-th code point (or the whole length if shorter). */
+static size_t m_utf8_off(const char *s, int n){
+    const unsigned char *p = (const unsigned char*)s;
+    size_t i = 0;
+    int seen = 0;
+    while(p[i]){
+        if((p[i] & 0xc0) != 0x80){
+            if(seen == n) return i;
+            seen++;
+        }
+        i++;
+    }
+    return i;
+}
+
+/* Pad `head` (sign + any 0x/0o/0b prefix) plus `body` out to f->width. */
+static char *m_fmt_pad(MacroPP *mp, const char *head, const char *body,
+                       MFmt *f, char defalign){
+    int hl = (int)strlen(head), bl = (int)strlen(body);
+    int total = m_utf8_len(head) + m_utf8_len(body);   /* width is in chars */
+    char align = f->align ? f->align : defalign;
+    if(total >= f->width){
+        char *r = marena_alloc(&mp->arena, (size_t)total + 1);
+        memcpy(r, head, (size_t)hl);
+        memcpy(r + hl, body, (size_t)bl + 1);
+        return r;
+    }
+    int pad = f->width - total;
+    char *r = marena_alloc(&mp->arena, (size_t)(hl + bl + pad) + 1);
+    int o = 0;
+    if(align == '='){
+        memcpy(r, head, (size_t)hl); o = hl;
+        for(int k = 0; k < pad; k++) r[o++] = f->fill;
+        memcpy(r + o, body, (size_t)bl); o += bl;
+    } else if(align == '<'){
+        memcpy(r, head, (size_t)hl); o = hl;
+        memcpy(r + o, body, (size_t)bl); o += bl;
+        for(int k = 0; k < pad; k++) r[o++] = f->fill;
+    } else if(align == '^'){
+        int left = pad / 2, right = pad - left;
+        for(int k = 0; k < left; k++) r[o++] = f->fill;
+        memcpy(r + o, head, (size_t)hl); o += hl;
+        memcpy(r + o, body, (size_t)bl); o += bl;
+        for(int k = 0; k < right; k++) r[o++] = f->fill;
+    } else {                                   /* '>' */
+        for(int k = 0; k < pad; k++) r[o++] = f->fill;
+        memcpy(r + o, head, (size_t)hl); o += hl;
+        memcpy(r + o, body, (size_t)bl); o += bl;
+    }
+    r[o] = '\0';
+    return r;
+}
+
+/* UTF-8 encode one code point, so `!{65:c}` and `!{255:c}` produce the same
+ * bytes axx.py does (Python yields a str, which the expander writes as UTF-8;
+ * caxx used to emit the raw byte and disagreed for anything above U+007F). */
+static int m_utf8(unsigned long cp, char *out){
+    if(cp < 0x80){ out[0] = (char)cp; return 1; }
+    if(cp < 0x800){
+        out[0] = (char)(0xc0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3f));
+        return 2;
+    }
+    if(cp < 0x10000){
+        out[0] = (char)(0xe0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        out[2] = (char)(0x80 | (cp & 0x3f));
+        return 3;
+    }
+    out[0] = (char)(0xf0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
+    out[3] = (char)(0x80 | (cp & 0x3f));
+    return 4;
+}
+
+/* Format an integer. Sets *err on anything Python would reject. */
+static char *m_fmt_int(MacroPP *mp, long long iv, MFmt *f, int *err){
+    char type = f->type ? f->type : 'd';
+    int isfloat = (type=='e'||type=='E'||type=='f'||type=='F'
+                   ||type=='g'||type=='G'||type=='%');
+    if(type == 's'){ *err = 1; return NULL; }
+    if(!isfloat && f->has_prec){ *err = 1; return NULL; }      /* precision */
+    if(!isfloat && f->zcoerce){ *err = 1; return NULL; }       /* 'z' */
+    if(type == 'c'){
+        if(f->sign || f->alt || f->group || f->has_prec){ *err = 1; return NULL; }
+        if(iv < 0 || iv > 0x10FFFF){ *err = 1; return NULL; }
+        char buf[8];
+        int n = m_utf8((unsigned long)iv, buf);
+        buf[n] = '\0';
+        return m_fmt_pad(mp, "", buf, f, '<');
+    }
+    if(f->group == ',' && strchr("xXob", type)){ *err = 1; return NULL; }
+    if(f->group && type == 'n'){ *err = 1; return NULL; }
+
+    int neg = 0;
+    char head[8]; int hn = 0;
+    char digits[512];
+    int nd = 0;
+    const char *prefix = "";
+
+    if(isfloat){
+        double d = (double)iv;
+        int prec = f->has_prec ? f->prec : 6;
+        char conv = type;
+        if(type == '%'){ d *= 100.0; conv = 'f'; }
+        if(d < 0){ neg = 1; d = -d; }
+        char cfmt[16];
+        /* '#' keeps the decimal point (and, for g/G, the trailing zeros)
+         * exactly as Python's alternate form does. */
+        snprintf(cfmt, sizeof(cfmt), "%%%s.%d%c", f->alt ? "#" : "", prec, conv);
+        nd = snprintf(digits, sizeof(digits), cfmt, d);
+        if(type == '%'){ digits[nd++] = '%'; digits[nd] = '\0'; }
+    } else {
+        unsigned long long uv;
+        if(iv < 0){ neg = 1; uv = (unsigned long long)(-(iv + 1)) + 1ULL; }
+        else uv = (unsigned long long)iv;
+        switch(type){
+            case 'd': case 'n':
+                nd = snprintf(digits, sizeof(digits), "%llu", uv); break;
+            case 'x':
+                nd = snprintf(digits, sizeof(digits), "%llx", uv);
+                if(f->alt) prefix = "0x";
+                break;
+            case 'X':
+                nd = snprintf(digits, sizeof(digits), "%llX", uv);
+                if(f->alt) prefix = "0X";
+                break;
+            case 'o':
+                nd = snprintf(digits, sizeof(digits), "%llo", uv);
+                if(f->alt) prefix = "0o";
+                break;
+            case 'b': {
+                char tmp[80]; int t = 0;
+                if(uv == 0) tmp[t++] = '0';
+                while(uv){ tmp[t++] = (char)('0' + (uv & 1)); uv >>= 1; }
+                for(int k = 0; k < t; k++) digits[k] = tmp[t-1-k];
+                digits[t] = '\0'; nd = t;
+                if(f->alt) prefix = "0b";
+                break;
+            }
+            default: *err = 1; return NULL;
+        }
+    }
+
+    if(neg) head[hn++] = '-';
+    else if(f->sign == '+') head[hn++] = '+';
+    else if(f->sign == ' ') head[hn++] = ' ';
+    head[hn] = '\0';
+
+    char headbuf[16];
+    snprintf(headbuf, sizeof(headbuf), "%s%s", head, prefix);
+
+    if(!f->group)
+        return m_fmt_pad(mp, headbuf, digits, f,
+                         (f->zeropad && !f->align) ? '=' : '>');
+
+    /* Grouping. The digits that get separators are the leading run of the
+     * body (for a float that is the part before the '.'). */
+    int iv_step = strchr("xXob", type) ? 4 : 3;
+    int intlen;
+    if(isfloat){
+        /* stop at the '.' or the exponent: only the integer part is grouped */
+        intlen = 0;
+        while(intlen < nd && isdigit((unsigned char)digits[intlen])) intlen++;
+    } else {
+        /* the whole body is one run of digits -- and for x/X/o/b those
+         * "digits" include a-f, which isdigit() does not accept */
+        intlen = nd;
+    }
+    const char *tail = digits + intlen;
+
+    int want = intlen;
+    if(f->zeropad && !f->align){
+        /* Zero padding happens *inside* the grouping, and Python grows the
+         * digit count until the grouped form reaches the requested width
+         * (overshooting it when no digit count lands on it exactly). */
+        int avail = f->width - (int)strlen(headbuf) - (int)strlen(tail);
+        while(m_group_len(want, iv_step) < avail) want++;
+    }
+    if(want > 400){ *err = 1; return NULL; }
+
+    char padded[512];
+    int lead = want - intlen;
+    for(int k = 0; k < lead; k++) padded[k] = '0';
+    memcpy(padded + lead, digits, (size_t)intlen);
+    char grouped[1024];
+    int gl = m_group_emit(grouped, padded, want, iv_step, f->group);
+    snprintf(grouped + gl, sizeof(grouped) - (size_t)gl, "%s", tail);
+    return m_fmt_pad(mp, headbuf, grouped, f,
+                     (f->zeropad && !f->align) ? '=' : '>');
+}
+
+/* Format a string. Sets *err on anything Python would reject. */
+static char *m_fmt_str(MacroPP *mp, const char *s, MFmt *f, int *err){
+    if(f->type && f->type != 's'){ *err = 1; return NULL; }
+    if(f->sign || f->alt || f->group || f->zcoerce){ *err = 1; return NULL; }
+    if(f->align == '='){ *err = 1; return NULL; }
+    char *body = (char*)s;
+    if(f->has_prec && f->prec < m_utf8_len(s))
+        body = marena_strndup(&mp->arena, s, m_utf8_off(s, f->prec));
+    return m_fmt_pad(mp, "", body, f, '<');
+}
+
 /* Evaluate one !{...} body, honouring a trailing :format-spec. */
 static char *m_format_value(MacroPP *mp, const char *body, const char *file, int line){
     int len = (int)strlen(body);
@@ -9552,68 +9868,25 @@ static char *m_format_value(MacroPP *mp, const char *body, const char *file, int
                                 : (char*)body;
     const char *spec = (spec_at >= 0) ? body + spec_at + 1 : NULL;
     MVal v = m_eval(mp, expr, file, line);
-    if(!spec || !*spec) return mv_to_text(mp, v);
-
-    /* Format spec: [0][width][d|x|X|o|b|c|s] -- the subset of Python's spec
-     * that is meaningful for generating assembly text. */
+    if(!spec) return mv_to_text(mp, v);
     while(*spec == ' ') spec++;
-    int zero = 0, width = 0;
-    if(*spec == '0'){ zero = 1; spec++; }
-    while(isdigit((unsigned char)*spec)){ width = width * 10 + (*spec - '0'); spec++; }
-    char conv = *spec ? *spec : 'd';
-    if(spec[0] && spec[1])
-        m_fail(mp, file, line, "unsupported format spec in !{...}");
-    if(width < 0 || width > 256)
-        m_fail(mp, file, line, "format width out of range in !{...}");
+    if(!*spec) return mv_to_text(mp, v);
 
-    if(conv == 's'){
-        char *t = mv_to_text(mp, v);
-        int l = (int)strlen(t);
-        if(l >= width) return t;
-        char *b = marena_alloc(&mp->arena, (size_t)width + 1);
-        memset(b, ' ', (size_t)(width - l));
-        memcpy(b + (width - l), t, (size_t)l + 1);
-        return b;
+    MFmt f;
+    int err = 0;
+    char *out = NULL;
+    if(!m_fmt_parse(spec, &f)) err = 1;
+    else if(v.is_str) out = m_fmt_str(mp, v.s ? v.s : "", &f, &err);
+    else out = m_fmt_int(mp, v.i, &f, &err);
+    if(err || !out){
+        /* Same wording axx.py produces when format() raises, so a bad spec
+         * reads identically whichever implementation the user ran. */
+        if(v.is_str)
+            m_fail(mp, file, line, "bad format spec ':%s' for value '%s'",
+                   spec, v.s ? v.s : "");
+        m_fail(mp, file, line, "bad format spec ':%s' for value %lld", spec, v.i);
     }
-    long long iv = mv_need_int(mp, v, file, line);
-    char digits[128];
-    int n = 0, neg = 0;
-    unsigned long long uv;
-    if(conv == 'c'){
-        char *b = marena_alloc(&mp->arena, 2);
-        b[0] = (char)iv; b[1] = '\0';
-        return b;
-    }
-    if(iv < 0){ neg = 1; uv = (unsigned long long)(-iv); } else uv = (unsigned long long)iv;
-    switch(conv){
-        case 'd': n = snprintf(digits, sizeof(digits), "%llu", uv); break;
-        case 'x': n = snprintf(digits, sizeof(digits), "%llx", uv); break;
-        case 'X': n = snprintf(digits, sizeof(digits), "%llX", uv); break;
-        case 'o': n = snprintf(digits, sizeof(digits), "%llo", uv); break;
-        case 'b': {
-            char tmp[80]; int t = 0;
-            if(uv == 0) tmp[t++] = '0';
-            while(uv){ tmp[t++] = (char)('0' + (uv & 1)); uv >>= 1; }
-            for(int k = 0; k < t; k++) digits[k] = tmp[t-1-k];
-            digits[t] = '\0'; n = t;
-            break;
-        }
-        default:
-            m_fail(mp, file, line, "unknown format conversion '%c' in !{...}", conv);
-    }
-    int total = n + neg;
-    int pad = (width > total) ? width - total : 0;
-    char *b = marena_alloc(&mp->arena, (size_t)(total + pad) + 1);
-    int o = 0;
-    if(zero){
-        if(neg) b[o++] = '-';
-        for(int k = 0; k < pad; k++) b[o++] = '0';
-    } else {
-        for(int k = 0; k < pad; k++) b[o++] = ' ';
-        if(neg) b[o++] = '-';
-    }
-    memcpy(b + o, digits, (size_t)n + 1);
-    return b;
+    return out;
 }
 
 /* Replace every !{expr} / !{expr:fmt} in an ordinary source line. */

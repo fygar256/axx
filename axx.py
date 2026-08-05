@@ -5479,7 +5479,10 @@ class MacroPreprocessor:
                 if isinstance(v, str) and spec[-1:] in ('d', 'x', 'X', 'o', 'b'):
                     raise ValueError
                 return format(v, spec)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
+                # OverflowError comes from `!{n:c}` with n outside the Unicode
+                # range; without it that reached the user as a raw Python
+                # traceback instead of a macro diagnostic.
                 raise MacroError(f"{_fmt_pos(pos)}: bad format spec ':{spec}' "
                                  f"for value {v!r}")
         return _as_str(v)
