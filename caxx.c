@@ -2803,22 +2803,48 @@ static int symbol_get(AsmState *st, const char *w, uint256_t *out){
  * Extend the same way (see xeval_primary()/xeval_term()) if real usage
  * turns up.
  * ========================================================= */
+/* Reconstruct the full two's-complement magnitude of a 256-bit label value
+ * as a long double, instead of silently truncating to just the low 64 bits
+ * (as u256_to_i64() does). Exact for values that fit within long double's
+ * ~64-bit mantissa (e.g. any dbl{} 64-bit bit pattern); as accurate as long
+ * double allows for wider qad{} (128-bit) bit patterns -- still a large
+ * improvement over reading back 0 for values whose significant bits sit
+ * above bit 63. */
+static long double u256_to_long_double(uint256_t v){
+    int neg = (int)((v.w[3] >> 63) & 1);
+    uint256_t m = v;
+    if(neg){
+        uint64_t carry = 1;
+        for(int i=0;i<4;i++){
+            uint64_t inv = ~m.w[i];
+            uint64_t sum = inv + carry;
+            carry = (sum < inv) ? 1u : 0u;
+            m.w[i] = sum;
+        }
+    }
+    long double r = 0.0L;
+    for(int i=3;i>=0;i--){
+        r = r * 18446744073709551616.0L + (long double)m.w[i];
+    }
+    return neg ? -r : r;
+}
+
 typedef struct { const char *s; int i; int len; int ok; Assembler *asmb; } XEP;
 
-static double xeval_expr(XEP *p);
+static long double xeval_expr(XEP *p);
 
 static void xeval_skip(XEP *p){
     while(p->i<p->len && (p->s[p->i]==' '||p->s[p->i]=='\t')) p->i++;
 }
 
 /* NUMBER | ":labelname" | NAME '(' expr ')' | '(' expr ')' */
-static double xeval_primary(XEP *p){
+static long double xeval_primary(XEP *p){
     xeval_skip(p);
     if(!p->ok || p->i>=p->len){ p->ok=0; return 0; }
     char c = p->s[p->i];
     if(c=='('){
         p->i++;
-        double v = xeval_expr(p);
+        long double v = xeval_expr(p);
         xeval_skip(p);
         if(p->i<p->len && p->s[p->i]==')') p->i++;
         else p->ok=0;
@@ -2859,7 +2885,7 @@ static double xeval_primary(XEP *p){
             st->error_undefined_label = 1;
             return 0;
         }
-        return (double)u256_to_i64(e->value);
+        return u256_to_long_double(e->value);
     }
     if(isalpha((unsigned char)c) || c=='_'){
         int start=p->i;
@@ -2874,7 +2900,7 @@ static double xeval_primary(XEP *p){
             p->ok=0; return 0;
         }
         p->i++;
-        double arg = xeval_expr(p);
+        long double arg = xeval_expr(p);
         xeval_skip(p);
         if(p->i<p->len && p->s[p->i]==')') p->i++;
         else { p->ok=0; return 0; }
@@ -2902,49 +2928,49 @@ static double xeval_primary(XEP *p){
     p->ok=0; return 0;
 }
 
-static double xeval_unary(XEP *p);
+static long double xeval_unary(XEP *p);
 
 /* primary ('**' unary)?  -- right-associative, exponent may itself be unary
  * (so "2**-1" parses), matching Python's ** precedence/associativity. */
-static double xeval_power(XEP *p){
-    double base = xeval_primary(p);
+static long double xeval_power(XEP *p){
+    long double base = xeval_primary(p);
     xeval_skip(p);
     if(p->ok && p->i+1<p->len && p->s[p->i]=='*' && p->s[p->i+1]=='*'){
         p->i+=2;
-        double e = xeval_unary(p);
+        long double e = xeval_unary(p);
         return pow(base, e);
     }
     return base;
 }
 
 /* ('+'|'-'|'~') unary | power */
-static double xeval_unary(XEP *p){
+static long double xeval_unary(XEP *p){
     xeval_skip(p);
     if(p->ok && p->i<p->len && p->s[p->i]=='+'){ p->i++; return xeval_unary(p); }
     if(p->ok && p->i<p->len && p->s[p->i]=='-'){ p->i++; return -xeval_unary(p); }
     if(p->ok && p->i<p->len && p->s[p->i]=='~'){
         p->i++;
-        double v = xeval_unary(p);
-        return (double)(~(int64_t)v);
+        long double v = xeval_unary(p);
+        return (long double)(~(int64_t)v);
     }
     return xeval_power(p);
 }
 
 /* unary (('//'|'/'|'%'|'*') unary)*  -- '//' checked before '/' */
-static double xeval_term(XEP *p){
-    double v = xeval_unary(p);
+static long double xeval_term(XEP *p){
+    long double v = xeval_unary(p);
     while(p->ok){
         xeval_skip(p);
         if(p->i+1<p->len && p->s[p->i]=='/' && p->s[p->i+1]=='/'){
-            p->i+=2; double t=xeval_unary(p);
+            p->i+=2; long double t=xeval_unary(p);
             if(t==0){ p->ok=0; break; }
             v = floor(v/t);
         } else if(p->i<p->len && p->s[p->i]=='/'){
-            p->i++; double t=xeval_unary(p);
+            p->i++; long double t=xeval_unary(p);
             if(t==0){ p->ok=0; break; }
             v /= t;
         } else if(p->i<p->len && p->s[p->i]=='%'){
-            p->i++; double t=xeval_unary(p);
+            p->i++; long double t=xeval_unary(p);
             if(t==0){ p->ok=0; break; }
             v = v - floor(v/t)*t;
         } else if(p->i<p->len && p->s[p->i]=='*'
@@ -2956,8 +2982,8 @@ static double xeval_term(XEP *p){
 }
 
 /* term (('+'|'-') term)* */
-static double xeval_addsub(XEP *p){
-    double v = xeval_term(p);
+static long double xeval_addsub(XEP *p){
+    long double v = xeval_term(p);
     while(p->ok){
         xeval_skip(p);
         if(p->i<p->len && p->s[p->i]=='+'){ p->i++; v += xeval_term(p); }
@@ -2968,49 +2994,49 @@ static double xeval_addsub(XEP *p){
 }
 
 /* addsub (('<<'|'>>') addsub)* */
-static double xeval_shift(XEP *p){
-    double v = xeval_addsub(p);
+static long double xeval_shift(XEP *p){
+    long double v = xeval_addsub(p);
     while(p->ok){
         xeval_skip(p);
         if(p->i+1<p->len && p->s[p->i]=='<' && p->s[p->i+1]=='<'){
-            p->i+=2; double t=xeval_addsub(p);
-            v = (double)((int64_t)v << (int64_t)t);
+            p->i+=2; long double t=xeval_addsub(p);
+            v = (long double)((int64_t)v << (int64_t)t);
         } else if(p->i+1<p->len && p->s[p->i]=='>' && p->s[p->i+1]=='>'){
-            p->i+=2; double t=xeval_addsub(p);
-            v = (double)((int64_t)v >> (int64_t)t);
+            p->i+=2; long double t=xeval_addsub(p);
+            v = (long double)((int64_t)v >> (int64_t)t);
         } else break;
     }
     return v;
 }
 
 /* shift ('&' shift)* */
-static double xeval_band(XEP *p){
-    double v = xeval_shift(p);
+static long double xeval_band(XEP *p){
+    long double v = xeval_shift(p);
     while(p->ok){
         xeval_skip(p);
-        if(p->i<p->len && p->s[p->i]=='&'){ p->i++; v = (double)((int64_t)v & (int64_t)xeval_shift(p)); }
+        if(p->i<p->len && p->s[p->i]=='&'){ p->i++; v = (long double)((int64_t)v & (int64_t)xeval_shift(p)); }
         else break;
     }
     return v;
 }
 
 /* band ('^' band)* */
-static double xeval_bxor(XEP *p){
-    double v = xeval_band(p);
+static long double xeval_bxor(XEP *p){
+    long double v = xeval_band(p);
     while(p->ok){
         xeval_skip(p);
-        if(p->i<p->len && p->s[p->i]=='^'){ p->i++; v = (double)((int64_t)v ^ (int64_t)xeval_band(p)); }
+        if(p->i<p->len && p->s[p->i]=='^'){ p->i++; v = (long double)((int64_t)v ^ (int64_t)xeval_band(p)); }
         else break;
     }
     return v;
 }
 
 /* bxor ('|' bxor)* */
-static double xeval_expr(XEP *p){
-    double v = xeval_bxor(p);
+static long double xeval_expr(XEP *p){
+    long double v = xeval_bxor(p);
     while(p->ok){
         xeval_skip(p);
-        if(p->i<p->len && p->s[p->i]=='|'){ p->i++; v = (double)((int64_t)v | (int64_t)xeval_bxor(p)); }
+        if(p->i<p->len && p->s[p->i]=='|'){ p->i++; v = (long double)((int64_t)v | (int64_t)xeval_bxor(p)); }
         else break;
     }
     return v;
@@ -3025,10 +3051,10 @@ static double xeval_expr(XEP *p){
  * exactly like axx.py's xeval(). */
 static int xeval_eval(Assembler *asmb, const char *text, double *out){
     XEP p; p.s=text; p.i=0; p.len=(int)strlen(text); p.ok=1; p.asmb=asmb;
-    double v = xeval_expr(&p);
+    long double v = xeval_expr(&p);
     xeval_skip(&p);
     if(!p.ok || p.i<p.len) return 0;
-    *out = v;
+    *out = (double)v;
     return 1;
 }
 
@@ -3445,6 +3471,24 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             }
             expr_buf[en]='\0';
             if(s[idx]=='}') idx++;
+            /* Bugfix: qad{inf}/qad{-inf}/qad{nan} silently produced an
+             * all-zero (positive-zero) bit pattern instead of the correct
+             * binary128 special value. ieee754_128_from_str() already
+             * handles these three tokens correctly (see its "Special
+             * values" check), but nothing on this path ever called it with
+             * the literal token -- f128_eval_text() only parses numeric
+             * arithmetic and fails on "inf"/"nan", and xeval_eval() below
+             * only recognises NUMBER / ":label" / call syntax, so both
+             * silently fail to parse and execution fell through to a
+             * default of 0. dbl{}/flt{} already guard against this with an
+             * explicit strcmp() before evaluating (see the dbl{} handler
+             * just below); qad{} was missing the equivalent check. */
+            if(strcmp(expr_buf,"inf")==0 || strcmp(expr_buf,"-inf")==0 ||
+               strcmp(expr_buf,"nan")==0){
+                x=ieee754_128_from_str(expr_buf);
+            }
+            else
+            {
 #if defined(__GNUC__) && !defined(__STRICT_ANSI__) && \
     (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
      defined(__arm__) || defined(__riscv))
@@ -3510,6 +3554,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                         x=ieee754_128_from_str(fstr);
                     }
                 }
+            }
             }
         }
     }
@@ -5038,10 +5083,26 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                         int q_ok = 0;
                         qbits = f128_eval_text(f128_text, &q_ok);
                         if(!q_ok){
-                            /* fall back: double→string→binary128 */
-                            char fstr[64];
-                            snprintf(fstr, sizeof(fstr), "%.17g", dv);
-                            qbits = ieee754_128_from_str(fstr);
+                            /* Bugfix: "inf"/"-inf"/"nan" tokens reach here
+                             * (f128_eval_text only parses arithmetic and
+                             * fails on them), and the double→string
+                             * fallback below is unusable for them: dv came
+                             * from u256_to_double(fv), which reads only the
+                             * low 64 bits of the (possibly 128-bit qad{})
+                             * value -- for a genuine binary128 inf/nan the
+                             * significant bits live in the upper word, so
+                             * dv silently reads back as 0.0 and the special
+                             * value is lost. Handle the three tokens
+                             * directly instead of falling through. */
+                            if(strcmp(f128_text,"inf")==0 || strcmp(f128_text,"-inf")==0 ||
+                               strcmp(f128_text,"nan")==0){
+                                qbits = ieee754_128_from_str(f128_text);
+                            } else {
+                                /* fall back: double→string→binary128 */
+                                char fstr[64];
+                                snprintf(fstr, sizeof(fstr), "%.17g", dv);
+                                qbits = ieee754_128_from_str(fstr);
+                            }
                         }
                     } else
 #endif
