@@ -10858,11 +10858,13 @@ int main(int argc, char *argv[]){
             if(!*pat_macro_expand_dest) pat_macro_expand_dest="-";
         }
         else if(strcmp(argv[i],"-p")==0||strcmp(argv[i],"--macro-expand-pattern")==0){
-            /* Same optional-argument rule as -P: consume the next token only
-             * when it is not another option and both positionals are already
-             * in hand, so "-p pat.axx" keeps pat.axx as the pattern file
-             * rather than eating it as the destination. */
-            if(i+1<argc && argv[i+1][0]!='-' && patternfile && sourcefile)
+            /* Optional argument, same shape as -P but keyed on the pattern
+             * file alone: -p never needs a source file, so requiring one just
+             * to name an output file would be a trap. Consume the next token
+             * only when it is not another option and the pattern file is
+             * already in hand, so "-p pat.axx" still keeps pat.axx as the
+             * pattern file rather than eating it as the destination. */
+            if(i+1<argc && argv[i+1][0]!='-' && patternfile)
                 pat_macro_expand_dest=argv[++i];
             else
                 pat_macro_expand_dest="-";

@@ -1103,6 +1103,31 @@ The opening `{` must appear at the end of the header line, and the closing `}` a
 |---|---|
 | `!{expr}` | Expand value to text |
 | `!{expr:04x}` | Apply Python-style formatting |
+
+The format spec is Python's format mini-language. Both implementations
+implement the same grammar, and agree on which specs are accepted, which are
+rejected, and the wording of the resulting error.
+
+```
+[[fill]align][sign][z][#][0][width][grouping][.precision][type]
+  align     ::= "<" | ">" | "=" | "^"
+  sign      ::= "+" | "-" | " "
+  grouping  ::= "," | "_"
+  type      ::= b c d e E f F g G n o s x X %
+```
+
+`!{255:#06x}` gives `0x00ff`, `!{1234567:,d}` gives `1,234,567`, `!{255:*^9b}`
+gives `*11111111*`, `!{255:.2f}` gives `255.00`. Python's restrictions apply
+too: no precision on integer types, no `,` with `x`/`X`/`o`/`b`/`c`/`n`, no
+sign or `#` on a string.
+
+Both implementations strip whitespace around the spec before interpreting it,
+so Python's space-as-sign form (`!{5: d}`, which Python renders as `' 5'`) is
+the one thing that cannot be expressed; it behaves like `!{5:d}`.
+
+**Known difference**: `!{0:c}` (code point 0) yields a NUL character from
+axx.py, but an empty string from caxx, which cannot carry a NUL inside a C
+string.
 | `\!{` | Literal `!{` |
 
 #### Values and Operators

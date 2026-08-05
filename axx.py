@@ -8071,8 +8071,12 @@ class Assembler:
                 i += 2
                 continue
             if a in ('-P', '--macro-expand', '-p', '--macro-expand-pattern'):
+                # `-p` only ever needs the pattern file, so it may take its
+                # optional FILE as soon as that one positional is in hand;
+                # `-P` expands a source file and so waits for both.
+                need = 1 if a in ('-p', '--macro-expand-pattern') else 2
                 if (i + 1 < len(argv) and not argv[i + 1].startswith('-')
-                        and positional >= 2):
+                        and positional >= need):
                     out += [a, argv[i + 1]]
                     i += 2
                 else:
