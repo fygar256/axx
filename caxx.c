@@ -11043,9 +11043,10 @@ static int imp_label(Assembler *asmb, const char *l){
  * main
  * ========================================================= */
 static void print_usage(const char *prog){
-    printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-m machine] [-v] [-g] [--no-macro] [-P [file]]\n",prog);
+    printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-m machine] [-v] [-d] [-g] [--no-macro] [-P [file]] [-p [file]]\n",prog);
     printf("  --no-macro   disable the macro preprocessor layer (!if/!while/!def/!return/!set and !{...})\n");
     printf("  -P [file]    macro-expand the source and write it out (stdout if file is omitted), then stop\n");
+    printf("  -p [file]    macro-expand the pattern file and write it out (stdout if file is omitted), then stop\n");
     printf("axx general assembler programmed and designed by Taisuke Maekawa\n");
 }
 

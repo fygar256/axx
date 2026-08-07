@@ -7783,12 +7783,21 @@ class Assembler:
         # (64-bit targets only), then the section header table itself
         # (shdr_off) — a conventional ELF32/ELF64 relocatable-object layout
         # that any standard linker can read.
+        # SHT_NOBITS (.bss) sections must NOT consume file space.
+        # ELF spec: "A section of type SHT_NOBITS occupies no space in the
+        # file."  We record sh_offset = current offset (any valid offset is
+        # fine; linkers ignore it for NOBITS) but do NOT advance past the
+        # section data.  Mirrors caxx.c's weo_isno()/"Fix 1B".
+        def _is_nobits(s):
+            return s.name.upper().startswith('.BSS')
+
         offset = _ehdr_size
         sec_offsets = []
         for s in csecs:
             offset = _align_up(offset, 16)
             sec_offsets.append(offset)
-            offset += s.byte_size
+            if not _is_nobits(s):
+                offset += s.byte_size
 
         rela_offsets = []
         for rd in rela_datas:
@@ -7844,7 +7853,9 @@ class Assembler:
             for i, s in enumerate(csecs):
                 cur = f.tell()
                 f.write(b'\x00' * (sec_offsets[i] - cur))
-                f.write(s.data)
+                # NOBITS sections (.bss) have no file bytes — skip the write.
+                if not _is_nobits(s):
+                    f.write(s.data)
 
             for i, rd in enumerate(rela_datas):
                 cur = f.tell()
@@ -7874,7 +7885,7 @@ class Assembler:
             f.write(_pack_shdr(0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
             for i, s in enumerate(csecs):
-                _sh_type_i = 8 if s.name.upper().startswith('.BSS') else 1
+                _sh_type_i = 8 if _is_nobits(s) else 1
                 f.write(_pack_shdr(
                     sec_name_offs[i], _sh_type_i, s.flags, 0,
                     sec_offsets[i], s.byte_size, 0, 0, 16, 0))
