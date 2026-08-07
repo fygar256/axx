@@ -8738,6 +8738,18 @@ struct MacroPP {
      * whenever no such buffer is in flight. */
     char      *pending_buf;
 
+    /* The full text of the macro expression currently being evaluated by the
+     * innermost still-executing m_eval() call, so error sites that only have
+     * `mp` (not the MEP parse cursor `p`) -- e.g. mv_need_int(), reached from
+     * deep inside a builtin -- can still report "... in '<expr>'" the way
+     * axx.py's _ExprParser.err() always does (it wraps every message with
+     * `in {self.s!r}` because `self.s` is an instance field, visible from
+     * anywhere in that class). Saved/restored around each m_eval() call so
+     * nesting (e.g. a default-parameter expression evaluated while still
+     * inside an outer call's argument list) unwinds correctly. NULL outside
+     * any m_eval() call. */
+    const char *cur_expr;
+
     /* 1 when this instance expands *pattern* files (.axx) rather than source
      * files. Two things change: the comment marker on a macro statement line
      * becomes a slash-star sequence instead of ';' (see m_strip_comment), and
@@ -8879,7 +8891,11 @@ static void m_warn(MacroPP *mp, const char *file, int line, const char *fmt, ...
     vsnprintf(body, sizeof(body), fmt, ap);
     va_end(ap);
     char msg[1200];
-    snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
+    /* line<0 means "no line number" (axx.py's _fmt_pos()-less top-level
+     * messages, e.g. fail(f"{filename}: '!return' outside a macro
+     * definition") -- no ":<line>" at all, not even ":0"). */
+    if(line < 0) snprintf(msg, sizeof(msg), "%s: %s", file ? file : "?", body);
+    else snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
     if(m_first_report(mp, msg))
         /* force=1: same reason as m_fail() below. */
         axx_diagf(0, 1, " warning - %s\n", msg);
@@ -8893,7 +8909,8 @@ static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...
     vsnprintf(body, sizeof(body), fmt, ap);
     va_end(ap);
     char msg[1200];
-    snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
+    if(line < 0) snprintf(msg, sizeof(msg), "%s: %s", file ? file : "?", body);
+    else snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
     if(m_first_report(mp, msg))
         /* force=1: macro expansion runs inside Pass 1, whose diagnostics are
          * normally gated off because an unresolved label there is not yet an
@@ -8909,6 +8926,41 @@ static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...
     exit(1);
 }
 
+/* ---- diagnostics: Python-style repr() for diagnostic message parity ------- */
+
+/* Renders `s` the way Python's repr() renders a str, so a caxx diagnostic
+ * quoting a piece of macro source text reads identically to the axx.py
+ * diagnostic for the same input (both implementations' macro-expression
+ * errors are meant to match byte-for-byte -- see MacroError/_ExprParser.err()
+ * on the Python side). Matches CPython's unicode_repr() quote-choice rule:
+ * prefer '...', but switch to "..." when the text contains a "'" and no '"'
+ * (avoids escaping the common case of an apostrophe in ordinary text).
+ * Escapes backslash, the chosen quote, and \n/\t/\r the same way repr() does;
+ * other control bytes become \xNN. Truncates (without a trailing partial
+ * escape) if `out` is too small -- diagnostic text, not round-tripped. */
+static void m_pyrepr(const char *s, char *out, size_t outsz){
+    if(outsz < 3){ if(outsz) out[0] = '\0'; return; }
+    int has_sq = strchr(s, '\'') != NULL;
+    int has_dq = strchr(s, '"') != NULL;
+    char q = (has_sq && !has_dq) ? '"' : '\'';
+    size_t o = 0;
+    out[o++] = q;
+    for(const unsigned char *p = (const unsigned char*)s; *p; p++){
+        unsigned char c = *p;
+        if(o + 6 >= outsz) break; /* leave room for worst-case \xNN + closing quote + NUL */
+        if(c == '\\' || c == (unsigned char)q){ out[o++] = '\\'; out[o++] = (char)c; }
+        else if(c == '\n'){ out[o++] = '\\'; out[o++] = 'n'; }
+        else if(c == '\t'){ out[o++] = '\\'; out[o++] = 't'; }
+        else if(c == '\r'){ out[o++] = '\\'; out[o++] = 'r'; }
+        else if(c < 0x20 || c == 0x7f){
+            int nn = snprintf(out + o, outsz - o, "\\x%02x", c);
+            o += (nn > 0) ? (size_t)nn : 0;
+        } else out[o++] = (char)c;
+    }
+    out[o++] = q;
+    out[o] = '\0';
+}
+
 /* ---- values --------------------------------------------------------------- */
 
 static MVal mv_int(long long v){ MVal r; r.is_str = 0; r.i = v; r.s = NULL; return r; }
@@ -8922,7 +8974,18 @@ static char *mv_to_text(MacroPP *mp, MVal v){
     return marena_strdup(&mp->arena, buf);
 }
 static long long mv_need_int(MacroPP *mp, MVal v, const char *file, int line){
-    if(v.is_str) m_fail(mp, file, line, "macro expression: expected an integer, got the string \"%s\"", v.s ? v.s : "");
+    if(v.is_str){
+        /* axx.py: _as_int() -> p.err(f"expected an integer, got the string
+         * {v!r}") -- routed through _ExprParser.err(), which always appends
+         * "in {self.s!r}". This call site only has `mp` (it is reached from
+         * deep inside builtins, not the MEP parse cursor), so the enclosing
+         * expression text comes from mp->cur_expr (see its declaration). */
+        char vr[600], er[600];
+        m_pyrepr(v.s ? v.s : "", vr, sizeof(vr));
+        if(mp->cur_expr) m_pyrepr(mp->cur_expr, er, sizeof(er));
+        else { er[0] = '?'; er[1] = '\0'; }
+        m_fail(mp, file, line, "macro expression: expected an integer, got the string %s in %s", vr, er);
+    }
     return v.i;
 }
 /* C-style truncating division, so -7/2 == -3 as an assembly programmer would
@@ -9047,8 +9110,13 @@ static int mep_eat(MEP *p, const char *tok){
     return 1;
 }
 static void mep_expect(MEP *p, const char *tok){
-    if(!mep_eat(p, tok))
-        m_fail(p->mp, p->file, p->line, "macro expression: expected '%s' in \"%s\"", tok, p->s);
+    if(!mep_eat(p, tok)){
+        /* axx.py: self.err(f"expected {tok!r}") -> "... expected ')' in '...'" */
+        char tokr[16], sr[600];
+        m_pyrepr(tok, tokr, sizeof(tokr));
+        m_pyrepr(p->s, sr, sizeof(sr));
+        m_fail(p->mp, p->file, p->line, "macro expression: expected %s in %s", tokr, sr);
+    }
 }
 static char mep_peek(MEP *p){ mep_skip(p); return p->s[p->i]; }
 
@@ -9056,8 +9124,11 @@ static char *mep_ident(MEP *p){
     mep_skip(p);
     int j = p->i;
     while(p->s[j] && (isalnum((unsigned char)p->s[j]) || p->s[j] == '_')) j++;
-    if(j == p->i)
-        m_fail(p->mp, p->file, p->line, "macro expression: expected a name in \"%s\"", p->s);
+    if(j == p->i){
+        /* axx.py: self.err("expected a name") */
+        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        m_fail(p->mp, p->file, p->line, "macro expression: expected a name in %s", sr);
+    }
     char *r = marena_strndup(&p->mp->arena, p->s + p->i, (size_t)(j - p->i));
     p->i = j;
     return r;
@@ -9084,8 +9155,11 @@ static MVal mep_number(MEP *p){
         v = v * base + d;
         ndig++; j++;
     }
-    if(ndig == 0 || j == start)
-        m_fail(p->mp, p->file, p->line, "macro expression: malformed number in \"%s\"", p->s);
+    if(ndig == 0 || j == start){
+        /* axx.py: self.err("malformed number") */
+        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        m_fail(p->mp, p->file, p->line, "macro expression: malformed number in %s", sr);
+    }
     p->i = j;
     return mv_int(v);
 }
@@ -9113,14 +9187,22 @@ static char *mep_string(MEP *p, char q, int *len_out){
         if(c == q){ buf[n] = '\0'; p->i = j + 1; if(len_out) *len_out = n; return buf; }
         buf[n++] = c; j++;
     }
-    m_fail(p->mp, p->file, p->line, "macro expression: unterminated string literal in \"%s\"", p->s);
+    {
+        /* axx.py: self.err("unterminated string literal") */
+        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        m_fail(p->mp, p->file, p->line, "macro expression: unterminated string literal in %s", sr);
+    }
     return NULL;
 }
 
 static MVal mep_primary(MEP *p){
     mep_skip(p);
     char c = p->s[p->i];
-    if(!c) m_fail(p->mp, p->file, p->line, "macro expression: unexpected end of \"%s\"", p->s);
+    if(!c){
+        /* axx.py: self.err("unexpected end of expression") */
+        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        m_fail(p->mp, p->file, p->line, "macro expression: unexpected end of expression in %s", sr);
+    }
 
     if(c == '('){
         p->i++;
@@ -9168,7 +9250,13 @@ static MVal mep_primary(MEP *p){
         }
         return m_lookup(p->mp, name, p->file, p->line);
     }
-    m_fail(p->mp, p->file, p->line, "macro expression: unexpected character '%c' in \"%s\"", c, p->s);
+    {
+        /* axx.py: self.err(f"unexpected character {c!r}") */
+        char cbuf[2] = { c, 0 }, cr[16], sr[600];
+        m_pyrepr(cbuf, cr, sizeof(cr));
+        m_pyrepr(p->s, sr, sizeof(sr));
+        m_fail(p->mp, p->file, p->line, "macro expression: unexpected character %s in %s", cr, sr);
+    }
     return mv_int(0);
 }
 
@@ -9192,8 +9280,10 @@ static MVal mep_mul(MEP *p){
             if(v.is_str && !r.is_str){
                 long long n = r.i < 0 ? 0 : r.i;
                 size_t l = strlen(v.s);
-                if(n * (long long)l > 16*1024*1024)
-                    m_fail(p->mp, p->file, p->line, "macro expression: string repetition too large");
+                if(n * (long long)l > 16*1024*1024){
+                    char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+                    m_fail(p->mp, p->file, p->line, "macro expression: string repetition too large in %s", sr);
+                }
                 char *b = marena_alloc(&p->mp->arena, (size_t)n * l + 1);
                 b[0] = '\0';
                 for(long long k = 0; k < n; k++) memcpy(b + (size_t)k*l, v.s, l);
@@ -9214,12 +9304,18 @@ static MVal mep_mul(MEP *p){
         } else if(c == '/'){
             p->i++;
             long long r = mv_need_int(p->mp, mep_unary(p), p->file, p->line);
-            if(r == 0) m_fail(p->mp, p->file, p->line, "macro expression: division by zero");
+            if(r == 0){
+                char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+                m_fail(p->mp, p->file, p->line, "macro expression: division by zero in %s", sr);
+            }
             v = mv_int(m_cdiv(mv_need_int(p->mp, v, p->file, p->line), r));
         } else if(c == '%'){
             p->i++;
             long long r = mv_need_int(p->mp, mep_unary(p), p->file, p->line);
-            if(r == 0) m_fail(p->mp, p->file, p->line, "macro expression: modulo by zero");
+            if(r == 0){
+                char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+                m_fail(p->mp, p->file, p->line, "macro expression: modulo by zero in %s", sr);
+            }
             v = mv_int(m_cmod(mv_need_int(p->mp, v, p->file, p->line), r));
         } else return v;
     }
@@ -9255,20 +9351,28 @@ static MVal mep_shift(MEP *p){
         if(p->s[p->i] == '<' && p->s[p->i+1] == '<'){
             p->i += 2;
             long long n = mv_need_int(p->mp, mep_add(p), p->file, p->line);
-            if(n < 0 || n > 63) m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range");
+            if(n < 0 || n > 63){
+                char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+                m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range in %s", sr);
+            }
             v = mv_int(mv_need_int(p->mp, v, p->file, p->line) << n);
         } else if(p->s[p->i] == '>' && p->s[p->i+1] == '>'){
             p->i += 2;
             long long n = mv_need_int(p->mp, mep_add(p), p->file, p->line);
-            if(n < 0 || n > 63) m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range");
+            if(n < 0 || n > 63){
+                char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+                m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range in %s", sr);
+            }
             v = mv_int(mv_need_int(p->mp, v, p->file, p->line) >> n);
         } else return v;
     }
 }
 
 static int m_order(MEP *p, MVal a, MVal b, int or_equal){
-    if(a.is_str != b.is_str)
-        m_fail(p->mp, p->file, p->line, "macro expression: cannot order a string against an integer");
+    if(a.is_str != b.is_str){
+        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        m_fail(p->mp, p->file, p->line, "macro expression: cannot order a string against an integer in %s", sr);
+    }
     if(a.is_str){
         int c = strcmp(a.s ? a.s : "", b.s ? b.s : "");
         return or_equal ? (c <= 0) : (c < 0);
@@ -9370,11 +9474,24 @@ static MVal mep_ternary(MEP *p){
 static MVal m_eval(MacroPP *mp, const char *text, const char *file, int line){
     while(*text == ' ' || *text == '\t') text++;
     if(!*text) m_fail(mp, file, line, "empty macro expression");
+    /* Save/restore around this call so a nested m_eval() (e.g. a default-
+     * parameter expression evaluated mid-parse of an outer call's argument
+     * list) doesn't leave mp->cur_expr pointing at the wrong expression once
+     * it returns -- see the field's declaration in struct MacroPP. */
+    const char *saved_cur_expr = mp->cur_expr;
+    mp->cur_expr = text;
     MEP p; p.s = text; p.i = 0; p.mp = mp; p.file = file; p.line = line;
     MVal v = mep_ternary(&p);
     mep_skip(&p);
-    if(p.s[p.i])
-        m_fail(mp, file, line, "macro expression: unexpected trailing text \"%s\"", p.s + p.i);
+    if(p.s[p.i]){
+        /* axx.py: self.err(f"unexpected trailing text {self.s[self.i:]!r}")
+         * -> "... unexpected trailing text '<tail>' in '<full>'" */
+        char tailr[600], sr[600];
+        m_pyrepr(p.s + p.i, tailr, sizeof(tailr));
+        m_pyrepr(p.s, sr, sizeof(sr));
+        m_fail(mp, file, line, "macro expression: unexpected trailing text %s in %s", tailr, sr);
+    }
+    mp->cur_expr = saved_cur_expr;
     return v;
 }
 
@@ -9530,9 +9647,17 @@ static MVal m_call_value(MacroPP *mp, const char *name, MVal *args, int nargs,
     if(mp->out && mp->out->len != mark){
         char *emitted = mp->out->d[mark].text;
         mp->out->len = mark;
+        /* axx.py: emitted[0].strip()!r} -- strip whitespace before repr(). */
+        char *e0 = emitted, *e1;
+        while(*e0==' '||*e0=='\t'||*e0=='\n'||*e0=='\r'||*e0=='\f'||*e0=='\v') e0++;
+        e1 = e0 + strlen(e0);
+        while(e1 > e0 && (e1[-1]==' '||e1[-1]=='\t'||e1[-1]=='\n'||e1[-1]=='\r'||e1[-1]=='\f'||e1[-1]=='\v')) e1--;
+        char stripped[600]; size_t sl = (size_t)(e1-e0); if(sl>=sizeof(stripped)) sl=sizeof(stripped)-1;
+        memcpy(stripped, e0, sl); stripped[sl]='\0';
+        char er[600]; m_pyrepr(stripped, er, sizeof(er));
         m_fail(mp, file, line,
-               "macro '%s' emits source text (\"%s\") but was called from inside an "
-               "expression, where there is nowhere to put it", name, emitted);
+               "macro '%s' emits source text (%s) but was called from inside an "
+               "expression, where there is nowhere to put it", name, er);
     }
     return v;
 }
@@ -10649,9 +10774,9 @@ static MLineVec macro_expand(MacroPP *mp, FILE *f, const char *display){
         MBlock *b = m_parse_block(mp, &src, &ip, 0);
         m_exec_block(mp, b);
         if(mp->ctl == MCTL_RETURN)
-            m_fail(mp, display, 0, "'!return' outside a macro definition");
+            m_fail(mp, display, -1, "'!return' outside a macro definition");
         if(mp->ctl == MCTL_BREAK || mp->ctl == MCTL_CONTINUE)
-            m_fail(mp, display, 0, "'!break'/'!continue' outside a '!while' loop");
+            m_fail(mp, display, -1, "'!break'/'!continue' outside a '!while' loop");
     } else {
         /* m_fail() already reported; unwind whatever was left half-built. */
         memset(&result, 0, sizeof(result));
