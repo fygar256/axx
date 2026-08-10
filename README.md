@@ -541,6 +541,22 @@ LEAQ r,(s+t*!!h+!!i) :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
 
 This example is used in cases like `leaq rax,(rax+rbx*(2+2)+0x40)`.
 
+#### Index Displacement Matching for Negative Values
+
+For example, in the following case:
+
+```
+mov rax,[rbp-8]
+```
+
+It matches the following pattern:
+
+```
+MOV RAX,[RBP+!e]
+```
+
+This occurs because when the pattern matcher encounters a '-' in the source, it matches the '-' against the '+' in the pattern; it then skips over the '+' in the pattern and passes the expression starting with '-' directly to the next stage of expression evaluation.
+
 ## VLIW Processor
 
 #### .vliw Directive
