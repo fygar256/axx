@@ -41,6 +41,7 @@
 /* 診断ファネル前方宣言 (定義は should_report_errors() の直後)。
  * このファイルの " error - " / " warning - " はすべてこれを通る。 */
 static void axx_diagf(int set_error, int force, const char *fmt, ...);
+static void m_pyrepr(const char *s, char *out, size_t outsz);
 #include <unistd.h>
 #include <libgen.h>
 #include <limits.h>
@@ -243,6 +244,25 @@ static uint256_t u256_floordiv(uint256_t a, uint256_t b) {
         q = u256_neg(q);
         if (!u256_is_zero(rem)) q = u256_sub(q, u256_one());
     }
+    return q;
+}
+/* Truncating division (toward zero), the C/gas sense of '/'.
+ *
+ * u256_floordiv() rounds toward negative infinity, which is what '//' means.
+ * expr_term0() used to call it for '/' as well, so the two operators were
+ * indistinguishable in integer mode: "(0-7)/2" produced -4 where axx.py
+ * produced -3.  Keeping '/' truncating restores the distinction the operator
+ * table draws between "division" and "integer division", and does it without
+ * routing integer operands through a double (which would cap exact results at
+ * 53 bits inside a 256-bit evaluator). */
+static uint256_t u256_truncdiv(uint256_t a, uint256_t b) {
+    if (u256_is_zero(b)) { fprintf(stderr,"Division by zero\n"); return u256_zero(); }
+    int sa = (int)(a.w[3]>>63);
+    int sb = (int)(b.w[3]>>63);
+    uint256_t ua = sa ? u256_neg(a) : a;
+    uint256_t ub = sb ? u256_neg(b) : b;
+    uint256_t q = u256_udiv(ua, ub);
+    if (sa != sb) q = u256_neg(q);
     return q;
 }
 /* Python modulo */
@@ -1668,7 +1688,14 @@ static void axx_remove_comment_asm(char *l) {
      * this shrinks the string, the function now does an in-place
      * read(i)/write(w) compaction rather than only ever advancing a single
      * cursor -- w is always <= i, so writing behind the read cursor into
-     * the same buffer is safe. */
+     * the same buffer is safe.
+     *
+     * Bugfix (axx.py port): axx.py's StringUtils.delete_comment() warns when
+     * a line ends while still inside a double-quoted string; this returned
+     * quietly, so `.ascii "abc` (no closing quote) emitted bytes with no
+     * notice from caxx while axx.py warned.  The message quotes the original
+     * text, so keep a copy before the in-place compaction below. */
+    char *orig = strdup(l);
     int in_str=0;
     int i=0, w=0;
     while(l[i]){
@@ -1702,13 +1729,18 @@ static void axx_remove_comment_asm(char *l) {
         if(l[i]==';'&&!in_str){
             int j=w-1;
             while(j>=0&&(l[j]==' '||l[j]=='\t')) j--;
-            l[j+1]=0; return;
+            l[j+1]=0; free(orig); return;
         }
         l[w++]=l[i++];
     }
     l[w]=0;
     int j=w-1;
     while(j>=0&&(l[j]==' '||l[j]=='\t'||l[j]=='\n'||l[j]=='\r')) l[j--]=0;
+    if(in_str){
+        char r[1024]; m_pyrepr(orig?orig:"", r, sizeof(r));
+        axx_diagf(0, 0, " warning - unterminated string literal in line: %s\n", r);
+    }
+    free(orig);
 }
 
 static void axx_resolve_vliw_escapes(char *l) {
@@ -4068,7 +4100,7 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
                     }
                     x=u256_zero();
                 }
-                else x=u256_floordiv(x,t);
+                else x=u256_truncdiv(x,t);
             }
         } else if(s[idx]=='%'){
             uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
@@ -4085,7 +4117,18 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
                     }
                     x=double_to_u256(0.0);
                 }
-                else x=double_to_u256(fmod(u256_to_double(x),b));
+                else {
+                    /* '%' is floored in axx (u256_mod() below is built on
+                     * u256_floordiv(), and axx.py uses Python's '%'), so the
+                     * remainder has to take the sign of the divisor.  Plain
+                     * fmod() takes the sign of the dividend, which made the
+                     * float mode used for error patterns disagree with both
+                     * the integer mode next to it and axx.py: "(0-7)%2" came
+                     * out -1 here and +1 there. */
+                    double r=fmod(u256_to_double(x),b);
+                    if(r!=0.0 && ((r<0.0)!=(b<0.0))) r+=b;
+                    x=double_to_u256(r);
+                }
             } else {
                 /* Fix L: same as // fix */
                 if(u256_is_zero(t)){
@@ -6173,21 +6216,82 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
 /* asciistr: output quoted string bytes.
  * Returns 1 if l2 started with '"' (valid quoted string), 0 otherwise.
  * Mirrors axx.py asciistr() which returns True/False. */
+/* asciistr: emit the characters of a quoted string, one output word each.
+ *
+ * Bugfix (axx.py port): only \0 \t \n \r \\ \" were recognised here.  axx.py's
+ * asciistr() also takes \x/\X (1-2 hex digits), \u (exactly 4) and \U (exactly
+ * 8), so `.ascii "A\x42\u0043"` produced 'A','B','C' there and the literal
+ * text 'A','\','x','4','2',... here -- silently, with no diagnostic and a
+ * different byte count.  The two length/word-width diagnostics axx.py emits
+ * (unterminated literal, character wider than the output word) were missing
+ * as well.  A malformed \x/\u/\U returns 0, which the .ASCII/.ASCIZ callers
+ * turn into an error, again matching axx.py. */
 static int asciistr(Assembler *asmb, const char *l2){
     AsmState *st=&asmb->st;
     if(!l2[0]||l2[0]!='"') return 0;
     int idx=1;
+    uint64_t word_mask = (st->bts > 0)
+                       ? ((st->bts < 64) ? (((uint64_t)1 << st->bts) - 1) : (uint64_t)-1)
+                       : 0xFFu;
+    int truncated = 0;
     while(l2[idx]&&l2[idx]!='"'){
-        unsigned char ch;
+        uint32_t ch;
         if(l2[idx]=='\\'&&l2[idx+1]=='0'){ ch=0; idx+=2; }
         else if(l2[idx]=='\\'&&l2[idx+1]=='t'){ ch='\t'; idx+=2; }
         else if(l2[idx]=='\\'&&l2[idx+1]=='n'){ ch='\n'; idx+=2; }
         else if(l2[idx]=='\\'&&l2[idx+1]=='r'){ ch='\r'; idx+=2; }
         else if(l2[idx]=='\\'&&l2[idx+1]=='\\'){ ch='\\'; idx+=2; }
         else if(l2[idx]=='\\'&&l2[idx+1]=='"'){ ch='"'; idx+=2; }
-        else { ch=(unsigned char)l2[idx]; idx++; }
-        outbin(st,st->pc,u256_from_u64(ch));
+        else if(l2[idx]=='\\'&&(l2[idx+1]=='x'||l2[idx+1]=='X')){
+            idx+=2;
+            char hx[3]; int hn=0;
+            while(l2[idx]&&is_xdigit_upper(axx_upper_char(l2[idx]))&&hn<2)
+                hx[hn++]=l2[idx++];
+            hx[hn]=0;
+            if(hn==0){
+                char r[1024]; m_pyrepr(l2, r, sizeof(r));
+                axx_diagf(0, 0, " error - '\\x' escape requires at least one hex digit in string: %s\n", r);
+                return 0;
+            }
+            ch=(uint32_t)strtoul(hx,NULL,16);
+        }
+        else if(l2[idx]=='\\'&&(l2[idx+1]=='u'||l2[idx+1]=='U')){
+            int want = (l2[idx+1]=='u') ? 4 : 8;
+            char uc = l2[idx+1];
+            idx+=2;
+            char hx[9]; int hn=0;
+            while(l2[idx]&&is_xdigit_upper(axx_upper_char(l2[idx]))&&hn<want)
+                hx[hn++]=l2[idx++];
+            hx[hn]=0;
+            if(hn!=want){
+                char r[1024]; m_pyrepr(l2, r, sizeof(r));
+                axx_diagf(0, 0, " error - '\\%c' escape requires %d hex digits in string: %s\n",
+                          uc, want, r);
+                return 0;
+            }
+            unsigned long cp = strtoul(hx,NULL,16);
+            /* Python's chr() rejects anything above U+10FFFF. */
+            if(cp > 0x10FFFFul){
+                char r[1024]; m_pyrepr(l2, r, sizeof(r));
+                axx_diagf(0, 0, " error - invalid \\u/\\U escape in string: %s\n", r);
+                return 0;
+            }
+            ch=(uint32_t)cp;
+        }
+        else { ch=(uint32_t)(unsigned char)l2[idx]; idx++; }
+        if((uint64_t)ch > word_mask) truncated = 1;
+        outbin(st,st->pc,u256_from_u64((uint64_t)ch));
         st->pc=u256_add(st->pc,u256_one());
+    }
+    if(!l2[idx]){
+        char r[1024]; m_pyrepr(l2, r, sizeof(r));
+        axx_diagf(0, 0, " warning - unterminated string literal in .ASCII/.ASCIZ: %s\n", r);
+    }
+    if(truncated && should_report_errors(st)){
+        char r[1024]; m_pyrepr(l2, r, sizeof(r));
+        axx_diagf(0, 0, " warning - .ASCII/.ASCIZ: one or more characters exceed the output word "
+                        "width (%d bit(s)) and were truncated (high bits discarded): %s\n",
+                  st->bts, r);
     }
     return 1;
 }
@@ -6954,8 +7058,28 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(adir_resd(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_resq(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_zero(asmb,l,l2)){ *idx_out=idx; return 1; }
-    if(adir_ascii(asmb,l,l2)){ *idx_out=idx; return 1; }
-    if(adir_asciiz(asmb,l,l2)){ *idx_out=idx; return 1; }
+    /* Bugfix (axx.py port): axx.py dispatches on the directive name and, when
+     * the string argument does not parse, reports
+     * "  error - .ASCII: failed to process string argument: '...'".  Falling
+     * through to the generic "Syntax error" here left the two implementations
+     * with different diagnostics for the same input. */
+    {
+        char _adup[16]; axx_strupr_to(_adup,l,sizeof(_adup));
+        if(strcmp(_adup,".ASCII")==0){
+            if(!adir_ascii(asmb,l,l2) && should_report_errors(&asmb->st)){
+                char r[1024]; m_pyrepr(l2?l2:"", r, sizeof(r));
+                axx_diagf(1, 0, " error - .ASCII: failed to process string argument: %s\n", r);
+            }
+            *idx_out=idx; return 1;
+        }
+        if(strcmp(_adup,".ASCIZ")==0){
+            if(!adir_asciiz(asmb,l,l2) && should_report_errors(&asmb->st)){
+                char r[1024]; m_pyrepr(l2?l2:"", r, sizeof(r));
+                axx_diagf(1, 0, " error - .ASCIZ: failed to process string argument: %s\n", r);
+            }
+            *idx_out=idx; return 1;
+        }
+    }
     { char up[16]; axx_strupr_to(up,l,sizeof(up));
       if(strcmp(up,".INCLUDE")==0){
           char raw[512]; axx_get_string(l2,raw,sizeof(raw));

@@ -2498,18 +2498,19 @@ class ExpressionEvaluator:
                     x = 0
                     break
                 else:
-                    if isinstance(x, int) and isinstance(t, int):
-                        q, r = divmod(x, t)
-                        if r == 0:
-                            x = q
-                        else:
-
-                            if ((abs(x) >= (1 << 53) or abs(t) >= (1 << 53))
-                                    and self.state.should_report_errors()):
-                                self.state.diag(f" warning - dividing large integers ({x} / {t}) that do "
-                                     f"not divide evenly loses precision when converted to a "
-                                     f"float; result may not be exact.", set_error=False)
-                            x = x / t
+                    if (self.state.exp_typ == 'i'
+                            and isinstance(x, int) and isinstance(t, int)):
+                        # Integer '/' truncates toward zero and stays an int.
+                        # It used to fall back to float division whenever the
+                        # operands did not divide evenly, which (a) made the
+                        # result disagree with caxx.c, (b) let a float leak
+                        # into the rest of the expression -- "(7/2)*2" gave 7,
+                        # "(7/2)==3" was false and "(1/2)" was true -- and
+                        # (c) lost precision above 2**53, which the warning
+                        # below this used to be about.  '//' still floors, so
+                        # the two operators stay distinct.
+                        q = abs(x) // abs(t)
+                        x = -q if (x < 0) != (t < 0) else q
                     else:
                         x = x / t
             elif s[idx] == '%':
