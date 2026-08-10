@@ -1771,7 +1771,15 @@ class LabelManager:
                 self.state.diag(f" error - label '{k}' not defined in pass 1.", set_error=False)
                 return False
 
-        if k in self.state.patsymbols:
+        # patsymbols is keyed by the uppercased name (setpatsymbols() runs every
+        # .setsym name through StringUtils.upper()), and pattern-symbol matching
+        # is case-insensitive, so the collision test has to uppercase the label
+        # name too.  Testing the raw key let any lowercase or mixed-case label
+        # that shadows a pattern symbol slip through: with z80.axx, "c: .equ
+        # 0x99" was accepted and the token `c` then resolved as the register in
+        # one instruction and as the label in the next, with no diagnostic.
+        # caxx.c already uppercases here (axx_strupr_to() into `uk`).
+        if StringUtils.upper(k) in self.state.patsymbols:
             self.state.had_error = True
             self.state.diag(f" error - '{k}' is a pattern file symbol.", set_error=False)
             return False
