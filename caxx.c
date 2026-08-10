@@ -2742,27 +2742,77 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
         lmap_set_reloc_type(&st->labels, k, reloc_type);
     return 1;
 }
+/* u256_to_pyhex: render a stored label value the way Python's hex(int(num))
+ * does -- lowercase, no leading zeros, and a leading '-' for negative values
+ * ("-0x5", not the unsigned two's-complement expansion "0xffff...fb").
+ *
+ * Label values are held two's complement in uint256_t, so the top bit of w[3]
+ * is the sign, the same reading u256_cmp_signed() gives these words elsewhere
+ * in this file.  The previous printer went through u256_to_u64(), which keeps
+ * only w[0]: that turned ".equ 0-5" into 0xfffffffffffffffb and silently
+ * printed 0x0 for any value whose significant bits sat above bit 63
+ * (".equ 1<<80").
+ *
+ * Residual limit (pre-existing, from the 256-bit storage rather than from this
+ * function): Python holds label values as unbounded ints, so -1 and 2**256-1
+ * are distinct there while both are all-ones here.  Values at or above 2**255
+ * are therefore reported as their negative counterparts.  Ordinary address and
+ * .equ arithmetic never reaches that range. */
+static void u256_to_pyhex(uint256_t a, char *out, size_t outsz){
+    char buf[80]; size_t n=0; int neg=0;
+    if((a.w[3]>>63)&1ULL){ neg=1; a=u256_neg(a); }
+    int hi=3; while(hi>0 && a.w[hi]==0) hi--;
+    n += (size_t)snprintf(buf+n,sizeof(buf)-n,"%llx",(unsigned long long)a.w[hi]);
+    for(int i=hi-1;i>=0;i--)
+        n += (size_t)snprintf(buf+n,sizeof(buf)-n,"%016llx",(unsigned long long)a.w[i]);
+    snprintf(out,outsz,"%s0x%s",neg?"-":"",buf);
+}
+
+static int label_key_cmp(const void *pa, const void *pb){
+    const LabelEntry *a = *(const LabelEntry *const *)pa;
+    const LabelEntry *b = *(const LabelEntry *const *)pb;
+    return strcmp(a->key, b->key);
+}
+
 /* label_print_all: mirrors Python LabelManager.printlabels()
- *   result = {}
  *   for key, value in self.state.labels.items():
  *       num = value[0]; section = value[1]
- *       result[key] = [hex(num), section]
- *   print(result)
- * Output: {'label': ['0xVAL', 'section'], ...} on one line */
+ *       num_str = "UNDEF" if num == UNDEF else hex(int(num))
+ *       result[key] = [num_str, section]
+ *   for k, v in sorted(result.items()):
+ *       print(f"  {k:40s}  {v[0]}  ({v[1]})", file=sys.stderr)
+ *
+ * One line per label, sorted by name.  The comment block that used to sit here
+ * quoted an older printlabels() that dumped the raw dict on one line; axx.py
+ * was rewritten (sorted output, aligned columns, UNDEF handling) and this port
+ * was never brought along.  Only the interactive "?" command reaches this
+ * function, and no sample in the tree runs interactively, so the divergence
+ * never showed up in the sample-by-sample byte comparison.
+ *
+ * UNDEF is taken from the entry's is_undef provenance flag rather than by
+ * comparing value against the all-ones sentinel.  Python can afford the value
+ * test because its UNDEF is (1<<1024)-1, distinct from -1; here the two are
+ * bit-identical, so a legitimate ".equ 0-1" would otherwise be reported as
+ * undefined -- the same collision LabelEntry.is_undef was introduced to
+ * settle. */
 static void label_print_all(AsmState *st){
-    int first=1;
-    fprintf(stderr, "{");
-    for(int i=0;i<st->labels.nbuckets;i++){
-        for(LabelEntry*e=st->labels.buckets[i];e;e=e->next){
-            if(!first) fprintf(stderr, ", ");
-            fprintf(stderr, "'%s': ['0x%llx', '%s']",
-                   e->key,
-                   (unsigned long long)u256_to_u64(e->value),
-                   e->section);
-            first=0;
-        }
+    int n=0;
+    for(int i=0;i<st->labels.nbuckets;i++)
+        for(LabelEntry*e=st->labels.buckets[i];e;e=e->next) n++;
+    if(n==0) return;                 /* Python's loop prints nothing for {} */
+    LabelEntry **v=(LabelEntry**)malloc(sizeof(LabelEntry*)*(size_t)n);
+    if(!v) return;
+    int k=0;
+    for(int i=0;i<st->labels.nbuckets;i++)
+        for(LabelEntry*e=st->labels.buckets[i];e;e=e->next) v[k++]=e;
+    qsort(v,(size_t)n,sizeof(LabelEntry*),label_key_cmp);
+    for(int i=0;i<n;i++){
+        char val[80];
+        if(v[i]->is_undef) snprintf(val,sizeof(val),"UNDEF");
+        else u256_to_pyhex(v[i]->value,val,sizeof(val));
+        fprintf(stderr,"  %-40s  %s  (%s)\n",v[i]->key,val,v[i]->section);
     }
-    fprintf(stderr, "}\n");
+    free(v);
 }
 
 /* =========================================================
