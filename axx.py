@@ -2917,9 +2917,11 @@ class BinaryWriter:
 
         _MAX_OUTPUT_BYTES = 1 << 30
         if total_size > _MAX_OUTPUT_BYTES:
+            # Fix: set_error was False, so this reported an error and then
+            # exited 0 with no output file -- a build script saw success.
             self.state.diag(f" error - output size {total_size} bytes exceeds maximum "
                             f"{_MAX_OUTPUT_BYTES}. Check for incorrect .ORG or address "
-                            f"values.", set_error=False, force=True)
+                            f"values.", set_error=True, force=True)
             return
 
         pad_val = int(self.state.padding) & ((1 << word_bits) - 1)
@@ -3763,8 +3765,15 @@ class PatternFileReader:
         if _depth == 0:
             self.macro_proc.reset_pass()
 
-        with open(fn, "rt", encoding="utf-8") as f:
-            raw_lines = f.readlines()
+        # Fix: same unguarded-open problem as fileassemble() -- a missing
+        # pattern file, or a pattern-side `.INCLUDE` of one, raised a raw
+        # FileNotFoundError traceback instead of a diagnostic.
+        try:
+            with open(fn, "rt", encoding="utf-8") as f:
+                raw_lines = f.readlines()
+        except OSError as e:
+            diag(f" error - cannot open pattern file '{fn}': {e}", set_error=True)
+            return []
 
         for l, _mfile, _mln in self.macro_proc.expand(raw_lines, fn):
 
@@ -6953,8 +6962,21 @@ class Assembler:
                         stdintmp.write(af)
                 fn = self.state.stdin_tmp_path
 
-            with open(fn, "rt", encoding="utf-8") as f:
-                af = f.readlines()
+            # Fix: this open() was unguarded, so a mistyped `.INCLUDE
+            # "utils.s"` (or a missing top-level source file) escaped as an
+            # unhandled FileNotFoundError traceback rather than an assembler
+            # diagnostic -- no file:line, and a Python stack dump in place of
+            # the message.  `.INCLUDE` of a directory raised IsADirectoryError
+            # the same way.  caxx had the mirror-image problem (it printed a
+            # bare line and carried on), so both sides are now brought to the
+            # wording -P/-p already used.
+            try:
+                with open(fn, "rt", encoding="utf-8") as f:
+                    af = f.readlines()
+            except OSError as e:
+                self.state.diag(f" error - cannot open source file '{fn}': {e}",
+                                set_error=True)
+                return
 
             # Macro-expand before assembling.  `expand()` returns
             # (text, file, lineno) triples where `lineno` is the ORIGINAL
@@ -8193,8 +8215,17 @@ class Assembler:
 
             if self.state.impfile:
 
-                with open(self.state.impfile, 'rt', encoding="utf-8") as label_file:
-                    raw_lines = label_file.readlines()
+                # Fix: unguarded open() -- a missing -i file raised a raw
+                # traceback here (and caxx ignored the failure in complete
+                # silence, emitting a binary in which every imported symbol
+                # resolved to 0).
+                try:
+                    with open(self.state.impfile, 'rt', encoding="utf-8") as label_file:
+                        raw_lines = label_file.readlines()
+                except OSError as e:
+                    self.state.diag(f" error - cannot open import file "
+                                    f"'{self.state.impfile}': {e}", set_error=True)
+                    return False
                 for l in raw_lines:
                     fields = l.rstrip('\r\n').split('\t')
                     if len(fields) >= 3:
@@ -8379,6 +8410,13 @@ class Assembler:
                     return False
 
             self.binary_writer.flush()
+
+            # Fix: flush() can itself report an error (output size over
+            # _MAX_OUTPUT_BYTES), in which case no binary is written -- but
+            # nothing looked at had_error afterwards, so axx.py exited 0 and
+            # a build script saw a successful run that produced no file.
+            if self.state.had_error:
+                return False
 
             if self.state.elf_objfile:
                 self.write_elf_obj(self.state.elf_objfile, self.state.elf_machine)

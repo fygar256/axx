@@ -43,6 +43,7 @@
 static void axx_diagf(int set_error, int force, const char *fmt, ...);
 static void m_pyrepr(const char *s, char *out, size_t outsz);
 #include <unistd.h>
+#include <sys/stat.h>
 #include <libgen.h>
 #include <limits.h>
 #include <sys/wait.h>
@@ -61,6 +62,7 @@ static void m_pyrepr(const char *s, char *out, size_t outsz);
  * Python's UNDEF = 0xffff...ff (256 bits of 1s)
  * ========================================================= */
 typedef struct { uint64_t w[4]; } uint256_t;
+static void u256_to_pydec(uint256_t a, char *out, size_t outsz);
 
 /* PatVar: a pattern-variable (a-z) slot: the captured value plus a genuine
  * provenance flag (is_undef) recording whether this value came from an
@@ -925,6 +927,11 @@ typedef struct {
     char expfile[512];
     char expfile_elf[512];   /* -E option: ELF-format export TSV */
     char impfile[512];
+    /* Largest program counter seen beyond the 64-bit range BufMap positions
+     * use; binary_flush() turns this into axx.py's "output size ... exceeds
+     * maximum" error. */
+    uint256_t pc_overflow_max;
+    int       pc_overflow_set;
     int  osabi;
 
     uint256_t pc;
@@ -1005,7 +1012,14 @@ typedef struct {
      * binary_list評価中のみ。.equなど他のコンテキストでは$$=現在のPC。 */
     int        in_binary_list;
 
-    int        align;
+    /* Fix: was `int`.  ".ALIGN 1<<32" (or any value that is a non-zero
+     * multiple of 2**32 below 2**64) truncated to 0 on assignment, slipping
+     * past the "must be positive" guard, and align_addr()'s "addr % align"
+     * then killed the assembler outright with SIGFPE -- a plain source-level
+     * typo crashed caxx.  Values like 0x100000001 truncated to 1 instead and
+     * aligned silently wrongly.  axx.py keeps this as an unbounded int, so
+     * int64_t restores parity for every value the 64-bit pc can reach. */
+    uint256_t  align;
     int        bts;
     int        endian_big;
     int        pas;
@@ -1261,6 +1275,55 @@ static void axx_diagf(int set_error, int force, const char *fmt, ...){
     }
     fputs(buf, stderr);
     if(st && set_error) st->had_error = 1;
+}
+
+/* Open an input file for reading and report a real assembler diagnostic if
+ * that fails.
+ *
+ * Fix: the three input-open sites below (the source file / .INCLUDE target,
+ * the pattern file and the `-i` import TSV) each used a bare
+ *     if(!f){ fprintf(stderr,"Cannot open: %s\n",fn); ... }
+ * or, for `-i`, silently ignored the failure.  None of them set had_error,
+ * so a mistyped `.INCLUDE "utils.s"` printed a line on stderr (once per
+ * pass), assembled the rest of the file anyway, wrote the resulting
+ * *silently truncated* binary and exited with status 0 -- a make(1) rule or
+ * CI step saw a successful build.  A missing `-i` file was not reported at
+ * all.  axx.py refuses in all three cases, so this was also a C/Python
+ * parity break.
+ *
+ * Two further points this fixes:
+ *   - glibc's fopen() SUCCEEDS on a directory in "r" mode (only the reads
+ *     fail, with EISDIR), so `.INCLUDE "somedir"` used to be swallowed
+ *     completely, with no message at all.  stat() it first.
+ *   - the message wording and had_error handling now match what -P/-p
+ *     already did ("cannot open source file '<f>': <reason>"), and going
+ *     through axx_diagf() means it is printed once rather than once per
+ *     relaxation pass. */
+/* Render an errno the way Python renders str(OSError):
+ *     [Errno 2] No such file or directory: 'missing.s'
+ * so the C and Python diagnostics for an unopenable file are identical.
+ * (The two pre-existing -P/-p messages used bare strerror() and so already
+ * differed from axx.py's wording; they now go through this too.) */
+static void axx_oserr_str(const char *fn, int err, char *out, size_t osz){
+    char q[1024]; m_pyrepr(fn ? fn : "", q, sizeof(q));
+    snprintf(out, osz, "[Errno %d] %s: %s", err, strerror(err), q);
+}
+
+static FILE *axx_open_input(const char *fn, const char *what){
+    char eb[1200];
+    struct stat sb;
+    if(stat(fn, &sb)==0 && S_ISDIR(sb.st_mode)){
+        axx_oserr_str(fn, EISDIR, eb, sizeof(eb));
+        axx_diagf(1, 0, " error - cannot open %s '%s': %s\n", what, fn, eb);
+        return NULL;
+    }
+    FILE *f = fopen(fn, "rt");
+    if(!f){
+        axx_oserr_str(fn, errno, eb, sizeof(eb));
+        axx_diagf(1, 0, " error - cannot open %s '%s': %s\n", what, fn, eb);
+        return NULL;
+    }
+    return f;
 }
 
 /* =========================================================
@@ -1571,7 +1634,7 @@ static void state_init(AsmState *st) {
     st->vcnt = 1;
     st->expmode = EXP_PAT;
     st->exp_typ_float = 0;
-    st->align = 16;
+    st->align = u256_from_u64(16);
     st->bts = 8;
     st->endian_big = 0;
     st->pas = 0;
@@ -2412,10 +2475,22 @@ static void assembler_init(Assembler *a){
 /* =========================================================
  * BinaryWriter helpers
  * ========================================================= */
+/* Fix: st->align used to be an `int`, so ".ALIGN 1<<32" truncated to 0 on
+ * assignment, slipped past adir_align()'s "must be positive" guard and made
+ * this "addr % align" kill the assembler with SIGFPE -- a plain source-level
+ * typo crashed caxx outright.  Values like 0x100000001 truncated to 1 and
+ * aligned silently wrongly instead.  axx.py holds the boundary as an
+ * unbounded int, so it is kept full-width here too and the arithmetic is
+ * done in 256-bit. */
+static uint256_t align_addr256(AsmState *st, uint256_t addr){
+    if(u256_is_zero(st->align)) return addr;
+    uint256_t q = u256_udiv(addr, st->align);
+    uint256_t a = u256_sub(addr, u256_mul(q, st->align));
+    if(u256_is_zero(a)) return addr;
+    return u256_add(addr, u256_sub(st->align, a));
+}
 static uint64_t align_addr(AsmState *st, uint64_t addr){
-    uint64_t a=addr%(uint64_t)st->align;
-    if(a==0) return addr;
-    return addr+(uint64_t)st->align-a;
+    return u256_to_u64(align_addr256(st, u256_from_u64(addr)));
 }
 
 static void outbin_store(AsmState *st, uint64_t position, uint256_t word_val){
@@ -2453,15 +2528,55 @@ static void binary_flush(AsmState *st){
     if(!buf_found) return;
     int word_bits = st->bts;
     int bytes_per_word = (word_bits+7)/8;
+    /* Fix (axx.py port): a pc past 2**64 was previously only a warning, and
+     * the position was silently truncated to its low 64 bits -- ".org 1<<70"
+     * wrapped to 0 and produced a 1-byte file with exit status 0, while
+     * axx.py refused.  The size is computed from the recorded full-width pc
+     * because by now the buffer positions have already been truncated. */
+    if(st->pc_overflow_set){
+        uint256_t _tot = u256_mul(u256_add(st->pc_overflow_max, u256_from_u64(1)),
+                                  u256_from_u64((uint64_t)bytes_per_word));
+        char _tb[96]; u256_to_pydec(_tot, _tb, sizeof(_tb));
+        axx_diagf(1, 1, " error - output size %s bytes exceeds maximum %llu."
+                        " Check for incorrect .ORG or address values.\n",
+                  _tb, (unsigned long long)((uint64_t)1<<30));
+        return;
+    }
     /* Fix D: max_pos+1 wraps to 0 when max_pos==UINT64_MAX, producing a
      * bogus total_size==0 that silently discards the entire binary.  Treat
      * UINT64_MAX as an impossible address and bail out with an error. */
     if(max_pos == (uint64_t)-1){
-        fprintf(stderr,"binary_flush: max_pos overflow (UINT64_MAX), skipping output.\n");
+        /* Fix (axx.py port): report this with the same wording and the same
+         * size figure axx.py's flush() uses, instead of an internal-sounding
+         * message, and set had_error so the exit status is non-zero.  The
+         * size does not fit in uint64_t (it is exactly 2**64 * bytes_per_word
+         * here), so it is computed in 256-bit. */
+        uint256_t _tot = u256_mul(u256_shl(u256_from_u64(1), 64),
+                                  u256_from_u64((uint64_t)bytes_per_word));
+        char _tb[96]; u256_to_pydec(_tot, _tb, sizeof(_tb));
+        axx_diagf(1, 1, " error - output size %s bytes exceeds maximum %llu."
+                        " Check for incorrect .ORG or address values.\n",
+                  _tb, (unsigned long long)((uint64_t)1<<30));
         return;
     }
     uint64_t total_size = (max_pos+1)*(uint64_t)bytes_per_word;
     if(total_size==0) return;
+    /* Fix (axx.py port, BinaryWriter.flush()'s _MAX_OUTPUT_BYTES): cap the
+     * output size at 1 GiB and report it as an assembly error.  Without this
+     * a mistaken ".org 1<<70" produced only a "program counter exceeds
+     * 64-bit range" warning, then wrote a 1-byte file (the truncated address
+     * wrapped to 0) and exited 0, while axx.py refused and wrote nothing --
+     * a silent byte-level divergence between the two implementations. */
+    {
+        const uint64_t MAX_OUTPUT_BYTES = (uint64_t)1<<30;
+        if(total_size > MAX_OUTPUT_BYTES){
+            axx_diagf(1, 1, " error - output size %llu bytes exceeds maximum %llu."
+                            " Check for incorrect .ORG or address values.\n",
+                      (unsigned long long)total_size,
+                      (unsigned long long)MAX_OUTPUT_BYTES);
+            return;
+        }
+    }
     /* Fix I: on 32-bit systems SIZE_MAX is ~4 GB.  If total_size exceeds it,
      * the cast to size_t wraps silently, calloc allocates far too little, and
      * subsequent writes corrupt the heap.  Fail loudly instead. */
@@ -2798,6 +2913,35 @@ static void u256_to_pyhex(uint256_t a, char *out, size_t outsz){
     for(int i=hi-1;i>=0;i--)
         n += (size_t)snprintf(buf+n,sizeof(buf)-n,"%016llx",(unsigned long long)a.w[i]);
     snprintf(out,outsz,"%s0x%s",neg?"-":"",buf);
+}
+
+/* u256_to_pydec: render a 256-bit value the way Python's str(int(num)) does --
+ * plain decimal, no leading zeros, a leading '-' for negative values.
+ *
+ * Needed because diagnostics that quote a value back to the user (".ORG
+ * address must be non-negative, got -8.") have to match axx.py's wording,
+ * and every existing printer here either loses the high words
+ * (u256_to_i64() keeps only w[0]) or prints hex (u256_to_pyhex()).
+ *
+ * The same residual limit as u256_to_pyhex() applies: values at or above
+ * 2**255 are reported as their negative counterparts, since the two are
+ * bit-identical in 256-bit storage. */
+static void u256_to_pydec(uint256_t a, char *out, size_t outsz){
+    char buf[96]; int n=0; int neg=0;
+    if((a.w[3]>>63)&1ULL){ neg=1; a=u256_neg(a); }
+    if(u256_is_zero(a)){ snprintf(out,outsz,"0"); return; }
+    uint256_t ten = u256_from_u64(10);
+    while(!u256_is_zero(a) && n < (int)sizeof(buf)-1){
+        uint256_t q = u256_udiv(a, ten);
+        uint256_t r = u256_sub(a, u256_mul(q, ten));
+        buf[n++] = (char)('0' + (int)(r.w[0] & 0xf));
+        a = q;
+    }
+    char rev[96]; int m=0;
+    if(neg) rev[m++]='-';
+    while(n>0 && m < (int)sizeof(rev)-1) rev[m++] = buf[--n];
+    rev[m]='\0';
+    snprintf(out,outsz,"%s",rev);
 }
 
 static int label_key_cmp(const void *pa, const void *pb){
@@ -5559,8 +5703,8 @@ static void readpat(Assembler *asmb, const char *fn){
         }
     }
 
-    FILE *f=fopen(fn,"rt");
-    if(!f){ fprintf(stderr,"Cannot open pattern file: %s\n",fn); return; }
+    FILE *f=axx_open_input(fn, "pattern file");
+    if(!f) return;
 
     /* push this file onto the include chain */
     if(asmb->st.pat_include_depth < (int)(sizeof(asmb->st.pat_include_chain)
@@ -6558,19 +6702,22 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
             }
             return 1;
         }
-        int64_t u_int=u256_to_i64(u);
+
         /* 破綻点修正 (axx.py port): 値の検証が一切なかったため、".ALIGN 0"が
          * align_addr()内の"addr % st->align"でゼロ除算を起こし、SIGFPEで
          * 即座にクラッシュしていた(axx.py側は元々 u_int<=0 をエラーとして
          * 弾いており、Cポートだけこのガードが欠落していた)。 */
-        if(u_int <= 0){
+        /* Fix: the sign/zero test read only the low 64 bits (u256_to_i64),
+         * so ".ALIGN 1<<64" was rejected as "0" where axx.py accepted the
+         * real value.  Test the full 256-bit value. */
+        if(u256_is_zero(u) || ((u.w[3]>>63)&1ULL)){
             if(should_report_errors(&asmb->st)){
-                axx_diagf(1, 0, " error - .ALIGN requires a positive value, got %lld.\n",
-                           (long long)u_int);
+                char _ab[96]; u256_to_pydec(u, _ab, sizeof(_ab));
+                axx_diagf(1, 0, " error - .ALIGN requires a positive value, got %s.\n", _ab);
             }
             return 1;
         }
-        asmb->st.align=(int)u_int;
+        asmb->st.align=u;
     }
     /* 破綻点修正 (axx.py port): align_addr()はstate.pc(生のグローバルpc)を
      * そのまま境界に揃えていたが、境界判定に本来使うべきなのは出力
@@ -6585,15 +6732,17 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
         uint64_t _raw = u256_to_u64(asmb->st.pc);
         int64_t _adj = equ_section_relative_offset(&asmb->st, asmb->st.current_section, _raw);
         uint64_t _base = (_adj >= 0) ? (uint64_t)_adj : _raw;
-        uint64_t _aligned_base = align_addr(&asmb->st, _base);
-        uint64_t _padding = _aligned_base - _base;
-        asmb->st.pc = u256_from_u64(_raw + _padding);
+        uint256_t _aligned_base = align_addr256(&asmb->st, u256_from_u64(_base));
+        uint256_t _padding = u256_sub(_aligned_base, u256_from_u64(_base));
+        asmb->st.pc = u256_add(u256_from_u64(_raw), _padding);
     }
     return 1;
 }
 static int adir_org(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ORG")!=0) return 0;
+    /* axx.py org_processing()'s _ORG_FILL_MAX. */
+    const uint64_t ORG_FILL_MAX = (uint64_t)1<<28;
     /* See adir_resX()'s comment: reset before evaluating for a fresh check. */
     asmb->st.error_undefined_label = 0;
     int io;
@@ -6606,8 +6755,38 @@ static int adir_org(Assembler *asmb, const char *l, const char *l2){
         }
         return 1;
     }
+    /* Fix (axx.py port, org_processing()): reject a negative address.
+     * Without this the value wrapped round to 2**256-1; the pc then read
+     * back as 0xffffffffffffffff, which produced only a "program counter
+     * exceeds 64-bit range" warning followed by "binary_flush: max_pos
+     * overflow, skipping output" -- and caxx still exited 0, so `.org -1`
+     * (or `.org x` with a negative .equ) looked like a successful build
+     * that had merely produced no file.  With a slightly different negative
+     * value it instead attempted a ~2**64-byte calloc(). */
+    if((u.w[3]>>63)&1ULL){
+        if(should_report_errors(&asmb->st)){
+            char nb[96]; u256_to_pydec(u, nb, sizeof(nb));
+            axx_diagf(1, 0, " error - .ORG address must be non-negative, got %s.\n", nb);
+        }
+        return 1;
+    }
     if(io+2<=(int)strlen(l2) && axx_upper_char(l2[io])==','&&axx_upper_char(l2[io+1])=='P'){
         if(u256_gt_signed(u,asmb->st.pc)){
+            /* Fix (axx.py port): cap the fill count at _ORG_FILL_MAX (1<<28),
+             * the same limit axx.py's org_processing() applies.  The loop
+             * below runs (to-from) times, so `.org 0x10000001,P` -- one byte
+             * over the limit, and an easy typo -- ran for over three minutes
+             * without finishing while axx.py rejected it immediately, and a
+             * larger value simply never terminates. */
+            uint256_t _span = u256_sub(u, asmb->st.pc);
+            if(u256_gt_signed(_span, u256_from_u64(ORG_FILL_MAX))){
+                if(should_report_errors(&asmb->st)){
+                    char sb2[96]; u256_to_pydec(_span, sb2, sizeof(sb2));
+                    axx_diagf(1, 0, " error - .ORG ,P fill count %s exceeds maximum %llu.\n",
+                              sb2, (unsigned long long)ORG_FILL_MAX);
+                }
+                return 1;
+            }
             uint64_t from=u256_to_u64(asmb->st.pc);
             uint64_t to=u256_to_u64(u);
             for(uint64_t i=from;i<to;i++) outbin2(&asmb->st,u256_from_u64(i),asmb->st.padding);
@@ -7101,8 +7280,26 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
                   strncpy(resolved, raw, sizeof(resolved)-1);
                   resolved[sizeof(resolved)-1]='\0';
               } else if(cur && cur[0] && strcmp(cur,"(stdin)")!=0 && strcmp(cur,"stdin")!=0){
-                  char dir_buf[1024];
-                  axx_dir_of(cur, dir_buf, sizeof(dir_buf));
+                  /* Fix: axx.py uses os.path.dirname(os.path.abspath(cur)),
+                   * i.e. an ABSOLUTE base directory; this used the raw
+                   * (usually relative) name, so the resolved path -- which
+                   * ends up in diagnostics and in the .INCLUDE cycle stack --
+                   * read "./nosuch.s" where axx.py said "/full/path/nosuch.s".
+                   * Same file either way, different message text. */
+                  char abs_buf[1024], dir_buf[1024];
+                  if(cur[0]=='/'){
+                      strncpy(abs_buf, cur, sizeof(abs_buf)-1);
+                      abs_buf[sizeof(abs_buf)-1]='\0';
+                  } else {
+                      char cwd_buf[1024];
+                      if(getcwd(cwd_buf, sizeof(cwd_buf)))
+                          snprintf(abs_buf, sizeof(abs_buf), "%s/%s", cwd_buf, cur);
+                      else {
+                          strncpy(abs_buf, cur, sizeof(abs_buf)-1);
+                          abs_buf[sizeof(abs_buf)-1]='\0';
+                      }
+                  }
+                  axx_dir_of(abs_buf, dir_buf, sizeof(dir_buf));
                   axx_resolve_path(dir_buf, raw, resolved, sizeof(resolved));
               } else {
                   strncpy(resolved, raw, sizeof(resolved)-1);
@@ -7455,14 +7652,26 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     adir_label_processing(asmb, line, processed, lin_len + 2);
     free(line);
 
-    /* Fix P10: warn when PC exceeds the uint64_t range used by BufMap.       */
+    /* Fix P10: warn when PC exceeds the uint64_t range used by BufMap.
+     *
+     * Fix (axx.py port): this used to be a *warning* only, so the pc was
+     * silently truncated to its low 64 bits and assembly carried on -- for
+     * ".org 1<<70" the truncated position wrapped to 0 and caxx cheerfully
+     * wrote a 1-byte file and exited 0, where axx.py refused with
+     * "output size ... exceeds maximum 1073741824".  Anything past
+     * _MAX_OUTPUT_BYTES cannot produce a valid file either way, so raise it
+     * to an error with axx.py's wording (the size is computed from the full
+     * 256-bit pc, which is why it is not just a binary_flush() check: by
+     * then the position has already been truncated). */
     if(st->pc.w[1]||st->pc.w[2]||st->pc.w[3]){
-        static int pc_warned = 0;
-        if(!pc_warned){
-            fprintf(stderr,"warning: program counter exceeds 64-bit range "
-                           "(0x%llx…); binary output positions truncated to 64 bits.\n",
-                           (unsigned long long)st->pc.w[1]);
-            pc_warned = 1;
+        /* Record the largest out-of-range pc seen; binary_flush() reports it.
+         * axx.py raises this from BinaryWriter.flush(), after assembly has
+         * finished, so reporting it here would put the message (and the
+         * "Aborting: no output file written." footer) in a different place
+         * in the output. */
+        if(!st->pc_overflow_set || u256_gt_signed(st->pc, st->pc_overflow_max)){
+            st->pc_overflow_max = st->pc;
+            st->pc_overflow_set = 1;
         }
     }
 
@@ -11109,8 +11318,8 @@ static void fileassemble(Assembler *asmb, const char *fn){
         fn=st->stdin_tmp_path;
     }
 
-    f=fopen(fn,"rt");
-    if(!f){ fprintf(stderr,"Cannot open: %s\n",fn); goto done; }
+    f=axx_open_input(fn, "source file");
+    if(!f) goto done;
     {
         /* Macro-expand before assembling. macro_expand() returns
          * (text, file, line) triples where `line` is the ORIGINAL source line
@@ -11512,8 +11721,12 @@ int main(int argc, char *argv[]){
     setpatsymbols(asmb);
 
     if(st->impfile[0]){
-        FILE *lf=fopen(st->impfile,"rt");
-        if(lf){ char *l=NULL; size_t lc=0; while(getline(&l,&lc,lf)!=-1) imp_label(asmb,l); free(l); fclose(lf); }
+        /* Fix: a missing/unreadable -i import file used to be ignored in
+         * complete silence, producing a binary in which every imported
+         * symbol resolved to 0.  Report it (axx.py port). */
+        FILE *lf=axx_open_input(st->impfile, "import file");
+        if(!lf){ exit_code=1; goto cleanup; }
+        { char *l=NULL; size_t lc=0; while(getline(&l,&lc,lf)!=-1) imp_label(asmb,l); free(l); fclose(lf); }
     }
 
     if(st->outfile[0]) remove(st->outfile);
@@ -11529,8 +11742,9 @@ int main(int argc, char *argv[]){
         }
         FILE *pf=fopen(patternfile,"rt");
         if(!pf){
-            axx_diagf(0, 0, " error - cannot open pattern file '%s': %s\n",
-                       patternfile, strerror(errno));
+            { char eb[1200]; axx_oserr_str(patternfile, errno, eb, sizeof(eb));
+              axx_diagf(0, 0, " error - cannot open pattern file '%s': %s\n",
+                        patternfile, eb); }
             exit_code=1; goto cleanup;
         }
         macro_reset_pass_pattern();
@@ -11564,8 +11778,9 @@ int main(int argc, char *argv[]){
         }
         FILE *mf=fopen(sourcefile,"rt");
         if(!mf){
-            axx_diagf(0, 0, " error - cannot open source file '%s': %s\n",
-                       sourcefile, strerror(errno));
+            { char eb[1200]; axx_oserr_str(sourcefile, errno, eb, sizeof(eb));
+              axx_diagf(0, 0, " error - cannot open source file '%s': %s\n",
+                        sourcefile, eb); }
             exit_code=1; goto cleanup;
         }
         macro_reset_pass(&g_macro);
@@ -11924,6 +12139,12 @@ int main(int argc, char *argv[]){
     }
 
     binary_flush(st);
+
+    /* Fix (axx.py port): binary_flush() can itself report an error (output
+     * size over the 1 GiB cap), in which case no binary is written -- but
+     * nothing looked at had_error afterwards, so caxx exited 0 and a build
+     * script saw a successful run that had produced no file. */
+    if(st->had_error){ exit_code = 1; goto cleanup; }
 
     /* ELF relocatable object output (-o option) */
     if(st->elf_objfile[0]){
