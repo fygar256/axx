@@ -10246,13 +10246,16 @@ static char *m_fmt_int(MacroPP *mp, long long iv, MFmt *f, int *err){
     if(type == 'c'){
         if(f->sign || f->alt || f->group || f->has_prec){ *err = 1; return NULL; }
         if(iv < 0 || iv > 0x10FFFF){ *err = 1; return NULL; }
-        /* U+0000 is valid in Python (chr(0)) but is not representable here:
-         * the whole !{...} expansion pipeline (m_interpolate and friends)
-         * copies through NUL-terminated C strings via strlen(), so a literal
-         * NUL byte would silently truncate the line instead of being
-         * embedded. Rejecting it loudly is safer than emitting a silently
-         * short/wrong line -- see caxx-only known-limitation note below. */
-        if(iv == 0){ *err = 1; return NULL; }
+        /* U+0000 is valid in Python (chr(0)) but cannot be embedded here as
+         * a raw NUL byte: the whole !{...} expansion pipeline (m_interpolate
+         * and friends), and the source-line handling beyond it, copies
+         * through NUL-terminated C strings via strlen()/*p-style scans, so
+         * a literal NUL byte would be mistaken for end-of-line by whatever
+         * reads the expanded line next (confirmed: it breaks the .ASCII/
+         * .ASCIZ quoted-string scanner specifically). Rendering it as an
+         * empty string is a deliberate, documented caxx-only difference
+         * from axx.py's chr(0), not an oversight. */
+        if(iv == 0) return m_fmt_pad(mp, "", "", f, '>');
         char buf[8];
         int n = m_utf8((unsigned long)iv, buf);
         buf[n] = '\0';
