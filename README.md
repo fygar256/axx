@@ -86,7 +86,7 @@ Thinking Machines - Massively parallel
 
 The execution platform is also independent of specific systems. It ignores `chr(13)` at the end of lines in DOS files. It should work on any system that runs Python.
 
-This version only covers the core parts of the assembler. macro processor is built in but, it does not support practical features such as optimizations found in dedicated assemblers, or high-performance macros that convert structured/functional assembly to instructional assembly. For practical features, Basic functions are present, so please adapt them. The current version lacks practicality.
+axx does not support practical features such as the optimizations found in specialized assemblers, or high-level macros that translate structured or functional assembly constructs into imperative assembly. However, it does include standard macro capabilities. Since the basic functionality is present, you can adapt it for more advanced use cases.
 
 Because pattern files and source files are separated, it's possible to generate machine code for a different processor from the source code of one instruction set, provided you don't consider the effort involved in coding. It's also possible to generate machine code for different processors from a common language. 
 
