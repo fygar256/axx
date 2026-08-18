@@ -1571,7 +1571,24 @@ static void secmap_finalize_current(AsmState *st){
  * バイトオフセットに変換する(断片を跨いだ累積オフセット)。該当する断片が
  * 見つからない場合は0にフォールバックする(DWARF生成自体をクラッシュ
  * させないため)。 */
+/* 破綻点修正 (axx.py port): axx.pyの_addr_to_word_offset()は
+ * 「.SECTION/.SEGMENTが一度も使われずst->sections(st->sectionsに相当する
+ * self.state.sections)が空のままなら、write_elf_objの
+ * 'not self.state.sections'分岐がその場合を単一の暗黙セクション(word 0
+ * 起点)として扱うのに合わせ、生word_pcをそのままセクション内オフセット
+ * として返す」という特例を持つ(このコメント自体がaxx.py側に残る「以前は
+ * これによりDWARFアドレスが全て0に潰れていた」という記述)。caxx.cの
+ * addr_to_word_offset()側にはこの特例が移植されておらず、.SECTIONを
+ * 一度も使わないソース(6809.s/z80.s/8080.s等、暗黙の既定.textのみで
+ * 書かれた通常のファイル)では st->sections が常に空のため
+ * addr_to_word_offset()が全行で-1(未検出)を返し続け、結果として
+ * DWARF .debug_lineの行番号プログラムが最初の1行を除き全てアドレス
+ *据え置き(advance-pcオペコードが実質発行されない)という壊れた出力に
+ * なっていた(実機確認: caxxで-g付き .o を作ると、6809/z80/8080の
+ * いずれも該当セクションの全命令が実質アドレス0にマップされ、gdb等の
+ * ソースレベルデバッグが機能しない)。axx.pyと同じ特例をここに追加する。 */
 static uint64_t dwarf_word_offset(AsmState *st, const char *sec_name, uint64_t word_pc, int bpw){
+    if(st->sections.count == 0) return word_pc * (uint64_t)bpw;
     int64_t o = addr_to_word_offset(&st->section_ranges, sec_name, word_pc);
     return (uint64_t)(o >= 0 ? o : 0) * (uint64_t)bpw;
 }
