@@ -5948,6 +5948,22 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
                     free(st->elf_refs[ri2].name);
             }
             st->elf_refs_len = wi2;
+            /* Bugfix: a suppressed field (e.g. the conditional REX-prefix
+             * word in "MOV f,!e" for a register <8, which needs no REX)
+             * consumes no objl slot, so it must not permanently consume a
+             * logical_word_idx slot either -- otherwise every later field
+             * in this same binary_list is recorded one word past its real
+             * position in objl, corrupting the ELF relocation offset (and,
+             * downstream, the abs-vs-pcrel type inference that compares
+             * the recorded word's value against the label's address).
+             * Mirrors axx.py's makeobj(), which sets
+             * _elf_current_word_idx = len(objl) fresh before each field
+             * and so self-corrects automatically whenever a field is not
+             * appended. This is independent of the any_undef/"continue"
+             * path above (P9), which is unaffected: pass 2 either
+             * resolves the label and pushes normally, or assembly aborts
+             * with an error and no ELF output is written either way. */
+            logical_word_idx--;
         }
         if(s[idx]==','){idx++;continue;}
         break;
@@ -6902,7 +6918,20 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
         if(!existing){
             lmap_set_imported(&st->labels, s, u256_zero(), ".text", reloc_type);
         } else if(existing->is_imported){
-            if(reloc_type >= 0) existing->reloc_type_override = reloc_type;
+            /* axx.py port: extern_processing() only overwrites an already-
+             * present reloc-type slot (`len(existing) >= 5`). For a label
+             * that was `-i`-imported via a plain (no `::type`) TSV line,
+             * imp_label() never appended that 5th list element, so even an
+             * explicit `.EXTERN label::type` here is a silent no-op for
+             * such a label -- verified against axx.py directly (an
+             * `::plt32` override on a plain-imported label is dropped;
+             * the same override on a never-before-seen label applies
+             * normally). Mirror this exactly rather than "fixing" it into
+             * applying unconditionally: only update reloc_type_override
+             * if it is already >= 0 (set by an earlier `::type`, on the
+             * `-i` line itself or a still-earlier `.EXTERN`). */
+            if(reloc_type >= 0 && existing->reloc_type_override >= 0)
+                existing->reloc_type_override = reloc_type;
         }
         idx=axx_skipspc(buf,idx);
         if(buf[idx]==',') idx++;
