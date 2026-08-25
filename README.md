@@ -32,7 +32,7 @@ GitHub: https://github.com/fygar256/axx_relocatable_elf_generation
 
 https://github.com/fygar256/brainfuck_interpreter_for_axx_on_freebsd_of_x86_64
 
-# Pattern file for practical use
+# Pattern files for practical use
 
 x86_64.axx, x86_64m.axx, 68000.axx, z80.axx, 8080.axx, 8048.axx, 6502.axx, 6809.axx, and 4004.axx are for practical use.
 
