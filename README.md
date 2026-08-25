@@ -42,17 +42,23 @@ the other pattern files are for tests.
 
 The bundled files and their matching test sources are:
 
-| Pattern file | Patterns | Test source | Note |
-|---|---|---|---|
-| x86_64.axx | approx. 23900 | hello.s | segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512 |
-| 6809.axx | approx. 1950 | 6809.s | |
-| z80.axx | approx. 280 | z80.s | |
-| 6502.axx | approx. 190 | 6502.s | |
-| 8048.axx | approx. 95 | 8048.s | |
-| test.axx | approx. 40 | test.s | fragments of several ISAs, for testing only |
-| bf.axx | 9 | bf.s | brainfuck virtual CPU |
-| vliw.axx | 9 | vliw.s | non-EPIC VLIW, for testing only |
-| itanium.axx | 12 | (none) | EPIC sketch, incomplete and not exercised by any test source |
+| Pattern file (.axx) | Size | Approx. pattern count (`::` lines) | Matching source (.s) | Description / Notes |
+|---------------------|------|------------------------------------|----------------------|---------------------|
+| **x86_64.axx** | 3.9 MB | ~23,923 | **hello.s** | x86_64-v3 (segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512). Large practical pattern set. README explicitly states that `x86_64.axx` uses `hello.s` |
+| **x86_64m.axx** | 935 KB | ~5,787 | **hello.s** (or macro-enabled sources) | x86_64-v3 with macros. Also used in demos such as the Brainfuck interpreter |
+| **6809.axx** | 125 KB | ~1,950 | **6809.s** | Motorola 6809 |
+| **68000.axx** | 41 KB | ~378 | **68000.s** | Motorola 68000 (present in the repository; not listed in the older FILE_DESCRIPTION) |
+| **6502.axx** | 15 KB | ~192 | **6502.s** | MOS 6502 |
+| **z80.axx** | 7.5 KB | ~283 | **z80.s** | Zilog Z80 |
+| **8048.axx** | 6.4 KB | ~95 | **8048.s** | Intel 8048 |
+| **8080.axx** | 6.0 KB | ~113 | **8080.s** | Intel 8080 |
+| **4004.axx** | 5.4 KB | ~53 | **4004.s** | Intel 4004 |
+| **test.axx** | 1.1 KB | ~40 | **test.s** | Test-only pattern file containing fragments of several ISAs |
+| **itanium.axx** | 281 B | ~12 | **vliw.s** | Itanium (EPIC) sketch. Incomplete; no accompanying test source |
+| **vliw.axx** | 178 B | ~9 | **vliw.s** | Non-EPIC VLIW (test only) |
+| **bf.axx** | 128 B | ~9 | **bf.s** | Brainfuck virtual CPU (hello-world style test) |
+
+
 
 Note that `x86_64.axx` uses the source `hello.s`, not a file named
 `x86_64.s`.
