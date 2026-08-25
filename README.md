@@ -34,7 +34,7 @@ https://github.com/fygar256/brainfuck_interpreter_for_axx_on_freebsd_of_x86_64
 
 # Pattern file for practical use
 
-x86_64.axx, z80.axx, 8080.axx, 8048.axx, 6502.axx, 6809.axx, 4004.axx
+x86_64.axx, x86_64m.axx, z80.axx, 8080.axx, 8048.axx, 6502.axx, 6809.axx, 4004.axx
 
 https://github.com/fygar256/x86_64_pattern_file_for_axx
 
@@ -1044,8 +1044,7 @@ $ axx.py test.axx test.s -v
 0000000000000063 test.s 18 ldf a,flt{enfloat(:label)*2}  0x01 0xec 0x91 0x81 0x4e
 ```
 
-This is what an AArch64 logical immediate looks like. This is likely the most complex example.
-
+This is what an AArch64 logical immediate looks like. This is likely the most complex example. Logical immediates and the like can be consolidated into a single entity using macros.
 ```
 AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v)?2:((v&0xf)*0x1111111111111111==v)?4:((v&0xff)*0x0101010101010101==v)?8:((v&0xffff)*0x1000100010001==v)?16:((v&0xffffffff)*0x100000001==v)?32:64)*0,;(m:=(1<<e)-1)*0,;(y:=v&m)*0,;(t:=@(y^(y-1))-1)*0,;(u:=y>>t)*0,;(w:=(y^m)==0?1:y^m)*0,;(p:=@(w^(w-1))-1)*0,;(q:=w>>p)*0,;(c:=((u+1)&u)==0)*0,;(b:=c?@u:e-@q)*0,
  ;(r:=c?(e-t)&(e-1):(e-(p+@q))&(e-1))*0,;(s:=((0-2*e)&0x7f)|(b-1))*0,;(z:=(1<<31)|(0x24<<23)|((((s>>6)&1)^1)<<22)|(r<<16)|((s&0x3f)<<10)|(n<<5)|d)*0,@@[4,z>>(%%*8)]
