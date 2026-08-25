@@ -5803,17 +5803,31 @@ static void readpat(Assembler *asmb, const char *fn){
 /* =========================================================
  * ObjectGenerator
  * ========================================================= */
-static void replace_percent_with_index(const char *s, char *out, size_t osz){
-    int count=0,i=0; size_t n=0;
-    while(s[i]&&n<osz-1){
+/* [Bug: %%-growth-truncation 修正]
+ * "%%" (2文字) は連番カウンタの10進表記に置き換わるが、カウンタが2桁を
+ * 超えると出力は入力より長くなる（例: "%%"の100回目以降は"100"のように
+ * 3文字以上）。呼び出し元が固定マージンでバッファを確保していると、
+ * @@[n,%%] のようなリピートで n が100を超えたあたりから無警告で末尾が
+ * 切り詰められる（axx.py 側は無制限長の文字列なので発生しない）。
+ * この関数自身に切り詰めが起きたかどうかを返させ、呼び出し元で
+ * バッファを拡大して再試行できるようにする。 */
+static int replace_percent_with_index(const char *s, char *out, size_t osz){
+    int count=0,i=0; size_t n=0; int truncated=0;
+    while(s[i]){
         if(s[i]=='%'&&s[i+1]=='%'){
             char num[16]; snprintf(num,sizeof(num),"%d",count++);
-            for(const char*p=num;*p&&n<osz-1;) out[n++]=*p++;
+            for(const char*p=num;*p;p++){
+                if(n<osz-1) out[n++]=*p; else truncated=1;
+            }
             i+=2;
         } else if(s[i]=='%'&&s[i+1]=='0'){ count=0; i+=2; }
-        else { out[n++]=s[i++]; }
+        else {
+            if(n<osz-1) out[n++]=s[i]; else truncated=1;
+            i++;
+        }
     }
-    out[n]=0;
+    if(n<osz) out[n]=0; else if(osz>0) out[osz-1]=0;
+    return truncated;
 }
 
 static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assembler *asmb){
@@ -5892,10 +5906,23 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     }
     if(is_empty){ free(ep_buf); return; }
 
+    /* [Bug: %%-growth-truncation 修正] "%%"が2桁超の連番に置き換わって
+     * 入力より長くなるケースに備え、ep_buf側と同じ「切り詰め検出→倍にして
+     * 再試行」方式にする（固定+64マージンでは @@[n,%%] の n が100を超える
+     * あたりから無警告で末尾が欠落していた）。 */
     size_t s_cap = strlen(ep_buf) + 64;
-    char *s = malloc(s_cap);
-    if(!s){ perror("malloc"); free(ep_buf); return; }
-    replace_percent_with_index(ep_buf, s, s_cap);
+    char *s = NULL;
+    while(1){
+        s = realloc(s, s_cap);
+        if(!s){ perror("malloc"); free(ep_buf); return; }
+        int truncated = replace_percent_with_index(ep_buf, s, s_cap);
+        if(!truncated) break;
+        s_cap *= 2;
+        if(s_cap > (size_t)256*1024*1024){
+            fprintf(stderr,"makeobj: expanded %%%% index text too large (>256 MB), truncating.\n");
+            break;
+        }
+    }
     free(ep_buf);
 
     int slen = (int)strlen(s);
