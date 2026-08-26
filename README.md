@@ -130,14 +130,15 @@ expfile.tsv --- Section label information export file
 impfile.tsv --- Section label information import file
 object.o ---- ELF relocatable object file
 
-Currently, object file output is only available as a special solution for ELF64 for x86_64.
+Currently, object file output supports both ELF64 and ELF32 relocatable objects (see `-f`, below). ELF class (32/64-bit) is selected independently of the target machine (`-m`) via `-f`, and defaults to ELF64.
 
 Relocatable object output works on FreeBSD and Linux, x86_64.
 
 Usage:
 
 ```
-usage: axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV] [-E EXPORT_ELF_TSV] [-i IMPORT_TSV] [-o OBJ_FILE]
+usage: axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV]
+           [-E EXPORT_ELF_TSV] [-i IMPORT_TSV] [-o OBJ_FILE] [-f {32,64}]
            [-m MACHINE] [-v] [-d] [-g] [--no-macro] [-P [FILE]] [-p [FILE]]
            patternfile [sourcefile]
 
@@ -154,7 +155,12 @@ options:
   -e EXPORT_TSV         Export labels to TSV file (plain format)
   -E EXPORT_ELF_TSV     Export labels to TSV file (ELF section flags format)
   -i IMPORT_TSV         Import labels from TSV file
-  -o OBJ_FILE           Write ELF64 relocatable object file (.o)
+  -o OBJ_FILE           Write ELF relocatable object file (.o); class selected by -f (default: ELF64)
+  -f {32,64}            ELF class for -o output: 64 for ELF64/ELFCLASS64, 32 for ELF32/ELFCLASS32
+                        (default: 64). Independent of -m/--machine; a value that does not match the
+                        selected machine's conventional class (e.g. -m 62 -f 32, the real x32 ABI's
+                        EM_X86_64-in-ELFCLASS32 layout) is honored, with a warning. -g/--gen-debug
+                        DWARF output currently requires 64.
   -m MACHINE            ELF e_machine value (default 62=EM_X86_64). Must be one of the architectures axx has
                         relocation-numbering support for -- see ELF_MACHINES near the top of this file for the full
                         list (currently: 3=i386, 4=M68K, 20=PowerPC, 21=PowerPC64, 22=s390x, 40=ARM, 42=SuperH,

@@ -1055,6 +1055,11 @@ typedef struct {
     /* ELF relocatable object output (-o / -m options) */
     char       elf_objfile[512];
     int        elf_machine;   /* default 62 = EM_X86_64 */
+    /* -f {32,64}: ELF class for -o output (1=ELFCLASS32, 2=ELFCLASS64;
+     * default 2/ELF64). Independent of elf_machine -- write_elf_obj() uses
+     * this, not elf_machine's own ->elfclass, as the class actually written
+     * to disk (mirrors axx.py's state.elf_class). */
+    int        elf_class;
 
     /* DWARF debug info generation (-g).
      * When gen_debug && elf_objfile is set, write_elf_obj() emits
@@ -1671,6 +1676,7 @@ static void state_init(AsmState *st) {
     st->expfile_elf[0] = '\0';
     st->elf_objfile[0] = '\0';
     st->elf_machine = 62;
+    st->elf_class = 2;   /* -f default: ELF64/ELFCLASS64 */
     st->gen_debug = 0;
     st->line_map = NULL;
     st->line_map_len = 0;
@@ -8457,15 +8463,34 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     int _is_le  = !st->endian_big;
     int _ei_data = _is_le ? 1 : 2;   /* EI_DATA: 1=LE, 2=BE */
 
-    /* axx.py port: ELF class (32/64-bit) and RELA-vs-REL convention both
-     * come from ELF_MACHINES (single source of truth, see its definition
-     * near the top of this file). Falls back to 64-bit/RELA if `machine`
-     * somehow isn't in the table -- shouldn't happen since -m is validated
-     * against it at CLI parse time, but write_elf_obj() has no other
-     * caller-independent way to fail loudly here. */
+    /* axx.py port: RELA-vs-REL convention comes from ELF_MACHINES (single
+     * source of truth, see its definition near the top of this file).
+     * Falls back to RELA if `machine` somehow isn't in the table --
+     * shouldn't happen since -m is validated against it at CLI parse time,
+     * but write_elf_obj() has no other caller-independent way to fail
+     * loudly here. */
     const ElfMachineInfo *_mtbl_w = elf_machine_find(machine);
-    int _is_elf64 = !_mtbl_w || _mtbl_w->elfclass == 2;
     int _is_rela_w = !_mtbl_w || _mtbl_w->is_rela;
+
+    /* ELF class (32/64-bit container) is selected independently of the
+     * target machine, via -f/--format (default: ELF64/st->elf_class==2).
+     * This is deliberately NOT the same thing as _mtbl_w->elfclass any
+     * more -- that field still records each architecture's *conventional*
+     * class (used only for the mismatch warning below), but st->elf_class
+     * is the sole authority actually written to disk, so combinations like
+     * `-m 62 -f 32` (EM_X86_64 in an ELFCLASS32 container -- the real x32
+     * ABI's layout) are fully supported rather than silently forced back
+     * to the machine's usual class. Mirrors axx.py write_elf_obj(). */
+    int _native_elfclass = _mtbl_w ? _mtbl_w->elfclass : 2;
+    int _elfclass = st->elf_class ? st->elf_class : _native_elfclass;
+    if(_elfclass != _native_elfclass){
+        axx_diagf(0, 0, " warning - -f forced ELF%s for machine %d, whose "
+                   "conventional class is ELF%s; writing a non-default "
+                   "(but well-formed) combination.\n",
+                   _elfclass==2 ? "64" : "32", machine,
+                   _native_elfclass==2 ? "64" : "32");
+    }
+    int _is_elf64 = (_elfclass == 2);
 
     /* Endian-aware field write helpers */
     #define WEO_W2(p,v) do{ uint16_t _v=(uint16_t)(v); \
@@ -8705,7 +8730,13 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int _i=0;_i<2;_i++){ dbg_rela[_i]=(DREL){NULL,0,NULL,0}; }
 
     const ElfMachineInfo *_mtbl_dbg = elf_machine_find(machine);
-    if(st->gen_debug && st->line_map_len>0 && (!_mtbl_dbg || _mtbl_dbg->elfclass != 2)){
+    /* Use the *effective* class (native class, unless overridden by -f),
+     * not just _mtbl_dbg->elfclass -- what actually gets written to disk
+     * above (_elfclass/_is_elf64) is what must be 64-bit here. A 64-bit
+     * machine forced down to ELF32 via `-f 32` (e.g. `-m 62 -f 32`) hits
+     * this guard too, since these 8-byte addresses would be just as
+     * structurally wrong in that ELFCLASS32 container. */
+    if(st->gen_debug && st->line_map_len>0 && (!_mtbl_dbg || !_is_elf64)){
         /* This DWARF builder hardcodes 8-byte (DW_FORM_addr) addresses
          * throughout, which is only correct for a 64-bit target -- mirrors
          * axx.py's _build_dwarf_sections() early-return for the same
@@ -8713,9 +8744,10 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
          * structurally-wrong-width DWARF instead of just incomplete DWARF,
          * so refuse rather than silently corrupt it. */
         axx_diagf(0, 0, " warning - DWARF debug info (-g) is not yet supported for "
-                   "32-bit targets (machine %d); skipping debug sections.\n", machine);
+                   "32-bit ELF output (machine %d, effective ELF class %d); "
+                   "skipping debug sections.\n", machine, _elfclass);
     }
-    if(st->gen_debug && st->line_map_len>0 && _mtbl_dbg && _mtbl_dbg->elfclass == 2){
+    if(st->gen_debug && st->line_map_len>0 && _mtbl_dbg && _is_elf64){
         /* growable raw byte buffer */
 
         /* relocation accumulator for debug sections */
@@ -11627,7 +11659,7 @@ static int imp_label(Assembler *asmb, const char *l){
  * main
  * ========================================================= */
 static void print_usage(const char *prog){
-    printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-m machine] [-v] [-d] [-g] [--no-macro] [-P [file]] [-p [file]]\n",prog);
+    printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-f {32,64}] [-m machine] [-v] [-d] [-g] [--no-macro] [-P [file]] [-p [file]]\n",prog);
     printf("  --no-macro   disable the macro preprocessor layer (!if/!while/!def/!return/!set and !{...})\n");
     printf("  -P [file]    macro-expand the source and write it out (stdout if file is omitted), then stop\n");
     printf("  -p [file]    macro-expand the pattern file and write it out (stdout if file is omitted), then stop\n");
@@ -11707,6 +11739,17 @@ int main(int argc, char *argv[]){
         else if(strcmp(argv[i],"-E")==0&&i+1<argc){ strncpy(st->expfile_elf,argv[++i],sizeof(st->expfile_elf)-1); }
         else if(strcmp(argv[i],"-i")==0&&i+1<argc){ strncpy(st->impfile,argv[++i],sizeof(st->impfile)-1); }
         else if(strcmp(argv[i],"-o")==0&&i+1<argc){ strncpy(st->elf_objfile,argv[++i],sizeof(st->elf_objfile)-1); }
+        else if(strcmp(argv[i],"-f")==0&&i+1<argc){
+            /* -f {32,64}: ELF class for -o output, independent of -m.
+             * Mirrors axx.py's `-f`/argparse choices=(32,64) check. */
+            const char *_fs = argv[++i];
+            if(strcmp(_fs,"64")==0){ st->elf_class = 2; }
+            else if(strcmp(_fs,"32")==0){ st->elf_class = 1; }
+            else {
+                axx_diagf(0, 0, " error - -f: invalid choice: %s (choose from 32, 64)\n", _fs);
+                return 1;
+            }
+        }
         else if(strcmp(argv[i],"-m")==0&&i+1<argc){
             int _mval = atoi(argv[++i]);
             /* axx.py port: reject any machine number ELF_MACHINES doesn't

@@ -16,9 +16,11 @@ High-level pipeline (see Assembler.run() near the bottom of this file):
      variable-length instructions (e.g. short vs. near jumps) converge to
      their final size.
   3. Pass 2: re-run the source one final time with addresses now known,
-     emitting the actual object bytes and (if requested) ELF64 relocatable
-     object output, DWARF line-number info, and an export/import label file
-     for splitting a program across multiple invocations.
+     emitting the actual object bytes and (if requested) ELF relocatable
+     object output (ELF64 by default, or ELF32 via -f 32; see
+     Assembler.write_elf_obj()), DWARF line-number info, and an
+     export/import label file for splitting a program across multiple
+     invocations.
 
 Sections are tracked as a sequence of (name, start_pc, length) fragments
 rather than one contiguous range per name, because a source file can leave a
@@ -440,6 +442,15 @@ class ElfState:
         self.osabi: int = 9      # ELF e_ident[EI_OSABI]; default 9 = FreeBSD
         self.objfile: str = ""
         self.machine: int = 62   # ELF e_machine; default 62 = EM_X86_64
+        self.elf_class: int = 2  # ELF e_ident[EI_CLASS]; 1 = ELFCLASS32, 2 =
+                                  # ELFCLASS64. Set via -f/--format (default
+                                  # 64). This is now the sole authority for
+                                  # which ELF class write_elf_obj()/
+                                  # _build_dwarf_sections() emit -- it is
+                                  # applied even when it does not match
+                                  # ELF_MACHINES[machine]['elfclass'] (e.g.
+                                  # `-m 62 -f 32`, mirroring the real x32
+                                  # ABI's EM_X86_64-in-ELFCLASS32 combo).
 
         self.relocations = []
         self.tracking = False    # True only during Pass 2 while writing an ELF object
@@ -747,6 +758,7 @@ class AssemblerState:
         'osabi':                  ('elf', 'osabi'),
         'elf_objfile':            ('elf', 'objfile'),
         'elf_machine':            ('elf', 'machine'),
+        'elf_class':              ('elf', 'elf_class'),
         'relocations':            ('elf', 'relocations'),
         '_elf_tracking':          ('elf', 'tracking'),
         '_elf_label_refs_seen':   ('elf', 'label_refs_seen'),
@@ -7143,7 +7155,15 @@ class Assembler:
             return [], []
 
         _mach_tbl_dw = ELF_MACHINES.get(machine)
-        if _mach_tbl_dw is None or _mach_tbl_dw['elfclass'] != 2:
+        # The *effective* class (native class, unless overridden by -f) is
+        # what actually gets written to disk in write_elf_obj() -- so that,
+        # not just the machine's conventional class, is what must be 2 here.
+        # A 64-bit machine forced down to ELF32 via `-f 32` (e.g. `-m 62
+        # -f 32`) hits this guard too, since this builder's 8-byte addresses
+        # would be just as structurally wrong in that ELFCLASS32 container.
+        _native_dw   = _mach_tbl_dw['elfclass'] if _mach_tbl_dw else 2
+        _eff_class_dw = getattr(self.state, 'elf_class', None) or _native_dw
+        if _mach_tbl_dw is None or _eff_class_dw != 2:
             # This DWARF builder hardcodes 8-byte (DW_FORM_addr) addresses
             # throughout (compile-unit low_pc/high_pc, label DIEs, the line
             # program's extended-opcode address op), which is only correct
@@ -7151,7 +7171,8 @@ class Assembler:
             # produce structurally-wrong-width DWARF instead of just
             # incomplete DWARF, so refuse rather than silently corrupt it.
             self.state.diag(f" warning - DWARF debug info (-g) is not yet supported for "
-                 f"32-bit targets (machine {machine}); skipping debug sections.", set_error=False)
+                 f"32-bit ELF output (machine {machine}, effective ELF class "
+                 f"{_eff_class_dw}); skipping debug sections.", set_error=False)
             return [], []
 
         import struct as _struct
@@ -7398,7 +7419,9 @@ class Assembler:
 
     def write_elf_obj(self, path: str, machine: int = 62) -> None:
         """Emit an ELF32 or ELF64 relocatable object file (`.o`) at `path`
-        (ELF class selected by `ELF_MACHINES[machine]['elfclass']`): builds
+        (ELF class selected by `state.elf_class`, i.e. -f/--format on the
+        CLI -- default ELF64/ELFCLASS64, independent of `machine`; see the
+        `_native_elfclass`/`_elfclass` split just below): builds
         one output section per distinct section name seen (`_CSec`,
         extracting its bytes from the sparse `binary_writer._buffer` via
         `_extract`), appends DWARF debug sections from `_build_dwarf_sections`
@@ -7429,7 +7452,25 @@ class Assembler:
         _ei_data  = 1 if _is_le else 2
         _pk       = '<' if _is_le else '>'
 
-        _elfclass  = ELF_MACHINES.get(machine, {}).get('elfclass', 2)
+        # ELF class (32/64-bit container) is now selected independently of
+        # the target machine, via -f/--format (default: ELF64). This is
+        # deliberately NOT the same thing as ELF_MACHINES[machine]['elfclass']
+        # any more -- that field still records each architecture's
+        # *conventional* class (used only for the mismatch warning below and
+        # as the fallback for machines this build predates), but -f is now
+        # the sole authority actually written to disk, so combinations like
+        # `-m 62 -f 32` (EM_X86_64 in an ELFCLASS32 container -- the real
+        # x32 ABI's layout) are fully supported rather than silently
+        # forced back to the machine's usual class.
+        _native_elfclass = ELF_MACHINES.get(machine, {}).get('elfclass', 2)
+        _elfclass  = getattr(self.state, 'elf_class', None) or _native_elfclass
+        if _elfclass != _native_elfclass:
+            self.state.diag(
+                f" warning - -f forced ELF{'64' if _elfclass == 2 else '32'} for "
+                f"machine {machine}, whose conventional class is "
+                f"ELF{'64' if _native_elfclass == 2 else '32'}; writing a "
+                f"non-default (but well-formed) combination.",
+                set_error=False)
         _is_elf64  = (_elfclass == 2)
         _ehdr_size = 64 if _is_elf64 else 52
         _word_mask = 0xFFFFFFFFFFFFFFFF if _is_elf64 else 0xFFFFFFFF
@@ -7961,9 +8002,11 @@ class Assembler:
 
     def _build_arg_parser(self):
         """Build the `argparse` CLI: `axx.py patternfile [sourcefile] [options]`,
-        with `-o` selecting ELF64 object output (vs. `-b` for raw binary),
-        `-e`/`-E`/`-i` for label export/import, `-m` for target machine, and
-        `-g` for DWARF debug info generation (only meaningful with `-o`)."""
+        with `-o` selecting ELF object output (vs. `-b` for raw binary),
+        `-f` choosing the ELF class (32/64, default 64), `-e`/`-E`/`-i` for
+        label export/import, `-m` for target machine, and `-g` for DWARF
+        debug info generation (only meaningful with `-o`, and currently
+        64-bit only -- see `_build_dwarf_sections`)."""
         import argparse
         ap = argparse.ArgumentParser(
             prog='axx',
@@ -7991,7 +8034,17 @@ class Assembler:
                         help='Import labels from TSV file')
         ap.add_argument('-o', dest='elf_objfile', default='',
                         metavar='OBJ_FILE',
-                        help='Write ELF64 relocatable object file (.o)')
+                        help='Write ELF relocatable object file (.o); class '
+                             'selected by -f (default: ELF64)')
+        ap.add_argument('-f', dest='elf_format', type=int, default=64,
+                        choices=(32, 64), metavar='{32,64}',
+                        help='ELF class for -o output: 64 for ELF64/ELFCLASS64, '
+                             '32 for ELF32/ELFCLASS32 (default: 64). Independent '
+                             'of -m/--machine; a value that does not match the '
+                             'selected machine\'s conventional class (e.g. '
+                             '-m 62 -f 32, the real x32 ABI\'s EM_X86_64-in-'
+                             'ELFCLASS32 layout) is honored, with a warning. '
+                             '-g/--gen-debug DWARF output currently requires 64.')
         ap.add_argument('-m', dest='elf_machine', type=int, default=62,
                         metavar='MACHINE',
                         help='ELF e_machine value (default 62=EM_X86_64). '
@@ -8187,6 +8240,11 @@ class Assembler:
                  f"mislabel every relocation in the output.", set_error=False, force=True)
             return False
         self.state.elf_machine  = args.elf_machine
+
+        # -f {32,64}: ELF class for -o output, independent of -m. argparse's
+        # choices=(32, 64) already rejects anything else, so this is just
+        # the 64/32 -> ELFCLASS64/ELFCLASS32 (2/1) mapping.
+        self.state.elf_class    = 2 if args.elf_format == 64 else 1
 
         if args.elf_osabi not in osabitbl:
             print(f"warning: unknown --osabi value '{args.elf_osabi}'; "
