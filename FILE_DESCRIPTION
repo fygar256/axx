@@ -5,6 +5,8 @@ File description
 8048.s                              test assemble file for 8048 CPU
 6809.axx                            pattern file for 6809 CPU
 6809.s                              test assemble file for 6809
+68000.axx                           pattern file for 68000 CPU
+68000.s                             test assemble file for 68000
 6502.axx                            pattern file for 6502
 6502.s                              test assemblee file for 6502
 8080.axx                            pattern file for 8080
@@ -22,7 +24,6 @@ axxgirl.png                         mascot character picture file
 bf.axx                              pattern file for brainfuck virtual CPU system
 bf.s                                hello world test assemble file for brainfuck virtual CPU
 format_of_exp_imp_file              format description for export/import file
-hello.bin                           binary file of hello world for x86_64
 hello.s                             assembly file of x86_64 hello world. use x86_64.axx
 hello.tsv                           export file of x86_64 hello world
 imp.tsv                             import file
@@ -41,4 +42,3 @@ macro_en.md                         macro layer reference (English)
 axx_introduction_paper.md           introduction paper (Japanese)
 axx_introduction_paper_en.md        introduction paper (English)
 makefile                            build/install rules for caxx and paxx
-x86_64.doc                          notes on the x86_64 pattern file

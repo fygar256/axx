@@ -132,7 +132,7 @@ object.o ---- ELF relocatable object file
 
 Currently, object file output supports both ELF64 and ELF32 relocatable objects (see `-f`, below). ELF class (32/64-bit) is selected independently of the target machine (`-m`) via `-f`, and defaults to ELF64.
 
-Relocatable object output works on FreeBSD and Linux, x86_64.
+Relocatable object output works on FreeBSD and Linux (see `--osabi`). It is not limited to x86_64: `-m` currently has relocation-numbering support for i386, M68K, PowerPC, PowerPC64, s390x, ARM, SuperH, SPARCV9, x86-64, AArch64, and RISC-V, and `-f` selects ELF32 or ELF64 independently of the chosen machine (defaulting to ELF64, with a warning if the combination is non-conventional for that machine). `-g`/`--gen-debug` DWARF output currently requires ELF64.
 
 Usage:
 
