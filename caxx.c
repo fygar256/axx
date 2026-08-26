@@ -8041,6 +8041,42 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         _rtype = 10; /* R_X86_64_32: absolute 32-bit */
                     }
 
+                    /* M68K (machine 4) 用の双方向再分類 (axx.pyの対応する修正の
+                     * Cポート版)。68000.axx では同じフィールド幅が、PC相対の
+                     * 分岐/DBcc/BSR変位("e-($$+2))"で計算)と、絶対参照
+                     * (「CMPI.W #label,d0」等の即値、および「JSR label」の
+                     * 絶対ロングEAオペランド)の両方に使われるため、
+                     * width_guessの幅だけによる静的なデフォルト推測では
+                     * 区別できない。実物の m68k-linux-gnu-ld で確認済み:
+                     * 修正前はゼロ番地以外にリンクすると分岐先が全て壊れ、
+                     * 「JSR label」は常に絶対アドレス0へ飛ぶ命令になっていた。
+                     * axx.py側の同名の修正と同じロジック: 実際にフィールドへ
+                     * 焼き込まれた値(_raw_val)が、ラベルの生の絶対アドレス
+                     * (_abs_w_bytes)と一致するかどうかで判定する。 */
+                    if(_rtype_is_default_guess && st->elf_machine == 4){
+                        int _is_pcrel_guess_m68k = elf_machine_is_pcrel(_mtbl_rm, _rtype);
+                        if(_is_pcrel_guess_m68k && (int64_t)_raw_val == _abs_w_bytes){
+                            /* 推測はPC相対(pc32)だったが、焼き込み値は
+                             * ラベルの絶対アドレスそのもの -> 本当は絶対参照
+                             * (JSR/JMP/LEA/PEAの絶対ロングEA)。 */
+                            switch(_nbytes){
+                                case 4: _rtype = 1; break; /* R_68K_32 */
+                                case 2: _rtype = 2; break; /* R_68K_16 */
+                                case 1: _rtype = 3; break; /* R_68K_8 */
+                            }
+                        } else if(!_is_pcrel_guess_m68k && (int64_t)_raw_val != _abs_w_bytes){
+                            /* 推測は絶対(abs16/abs8)だったが、焼き込み値は
+                             * ラベルの絶対アドレスと一致しない小さな差分値
+                             * -> target-PCとして計算されたPC相対変位
+                             * (Bcc/DBcc/BSR)。 */
+                            switch(_nbytes){
+                                case 4: _rtype = 4; break; /* R_68K_PC32 */
+                                case 2: _rtype = 5; break; /* R_68K_PC16 */
+                                case 1: _rtype = 6; break; /* R_68K_PC8 */
+                            }
+                        }
+                    }
+
                     /* addend の計算 (axx.py port bugfix):
                      * 旧コードはPC相対の場合を「フィールド = ターゲット -
                      * (命令アドレス+フィールドサイズ)」という特定の規約

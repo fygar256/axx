@@ -6805,6 +6805,37 @@ class Assembler:
                         _rmap_abs_default = {8: 1, 4: 10, 2: 12, 1: 14}
                         rtype = _rmap_abs_default.get(num_bytes, rtype)
 
+                    # M68K (machine 4): width_guess alone can't disambiguate a
+                    # byte/word/long-width field, since on this target the SAME
+                    # width holds both PC-relative branch/DBcc/BSR displacements
+                    # (68000.axx computes these as "e-($$+2)") and absolute
+                    # references (byte/word immediates like "CMPI.W #label,d0",
+                    # and the 4-byte absolute-long EA operand of e.g.
+                    # "JSR label"). width_guess's static per-width default
+                    # (abs for 1/2 bytes, pc32 for 4) is right for immediates
+                    # and JSR's counterpart wrong, and wrong for branches --
+                    # confirmed against a real m68k-linux-gnu-ld: linking the
+                    # unpatched output at a non-zero base corrupted every
+                    # branch target and made "JSR label" always jump to
+                    # absolute address 0 regardless of where label actually
+                    # ended up. Resolved the same way as the x86_64 rule just
+                    # above: compare the value already baked into the field
+                    # against the label's raw absolute address.
+                    if _rtype_is_default_guess and self.state.elf_machine == 4:
+                        _m68k_abs_default = {4: 1, 2: 2, 1: 3}   # abs32/abs16/abs8
+                        _m68k_pc_default = {4: 4, 2: 5, 1: 6}    # pc32/pc16/pc8
+                        if rtype in _pc_rel_types_all and raw_val == abs_w_bytes:
+                            # Guessed pc-relative (JSR/JMP/LEA/PEA's absolute-long
+                            # EA, 4 bytes), but the baked field IS the label's raw
+                            # address rather than a computed delta -> really absolute.
+                            rtype = _m68k_abs_default.get(num_bytes, rtype)
+                        elif rtype not in _pc_rel_types_all and raw_val != abs_w_bytes:
+                            # Guessed absolute (Bcc/DBcc/BSR's word/byte-width
+                            # field), but the baked value is a small delta, not
+                            # the label's address -> it was computed as
+                            # target-PC, so it's really PC-relative.
+                            rtype = _m68k_pc_default.get(num_bytes, rtype)
+
                     if rtype in _pc_rel_types_all:
                         # addend = raw_val - abs_w_bytes + P, where P is this
                         # instruction word's own address. P MUST be expressed in
