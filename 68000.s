@@ -74,3 +74,13 @@ loop:
     bne.w   loop
     bcc     loop
     bsr.w   start
+
+    movem.l d0 d2 a0 a2,-(sp)
+    movem.l (sp)+,d0 d2 a0 a2
+    movem.w d0 d1 d2 d3 d4 d5 d6 d7 a0 a1 a2 a3 a4 a5 a6,-(sp)
+    movem.l d2 d3 d4 d5 d6 d7,-(sp)
+    movem.l (sp)+,d2 d3 d4 d5 d6 d7
+    movem.l a5,(a0)
+    movem.w d0 a7,(0x400).w
+    movem.l #0x3f00,-(sp)
+    movem.l (sp)+,#0x00fc
