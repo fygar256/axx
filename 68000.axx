@@ -1,3 +1,4 @@
+.bits::big::8
 /* ============================================================
 /* m68k.axx -- Motorola MC68000 full pattern file for axx
 /*
@@ -704,27 +705,20 @@ EXG a,b :: :: (0xC148|(a<<9)|b)>>8,(0xC148|(a<<9)|b)
 EXG s,b :: :: (0xC188|(s<<9)|b)>>8,(0xC188|(s<<9)|b)
 EXG a,d :: :: (0xC188|(d<<9)|a)>>8,(0xC188|(d<<9)|a)
 
-/* Optional add-on: MOVEM with a register list.
-/*   .include "m68k.axx"
-/*   .include "m68k-movem-list.axx"
-/* Include this AFTER m68k.axx -- it redefines D0-D7/A0-A7 to mask bits,
-/* and axx directives are positional, so patterns above are unaffected. */
-
 /* ================= MOVEM with a register list =================
-/* The list is matched with nested [[ ]] optional groups.  A variable that
-/* finds no register keeps its initial value 0, so OR-ing all sixteen builds
-/* the mask.  Nesting (rather than sixteen independent groups) keeps the
-/* match linear instead of 2**16.
-/*     MOVEM.L D0 D2 A0 A2,-(SP)
-/*     MOVEM.L (SP)+,D0 D2 A0 A2
-/* The numeric mask form MOVEM.L #0x3F00,-(SP) is still accepted.
+/* Register-list form without [[ ]] optional groups (axx expands every
+/* subset of optional groups, so 16 nested optionals is 2**16 matches and
+/* hangs).  Instead we emit one explicit pattern per list length 1..16.
 /*
-/* D0-D7/A0-A7 are redefined to mask bits here, so the base register number
-/* of the effective address is recovered with @ (position of the most
-/* significant bit).  Directives are positional in axx, so every pattern
-/* above keeps the ordinary numeric register values. */
+/* Load (mem->regs, normal mask D0=bit0..A7=bit15):
+/*   (An)+  (An)  d16(An)  (xxx).W  (xxx).L  d16(PC)
+/* Store (regs->mem, reversed mask for -(An) transfer order):
+/*   (An)  -(An)  d16(An)  (xxx).W  (xxx).L
+/* Indexed modes: use the numeric-mask form MOVEM.L #mask,<ea>.
+/* Base An recovered with @: (@a-9) normal, (8-@a) reversed.
+/* ============================================================ */
 
-/* --- normal mask order --- */
+/* --- load: normal mask --- */
 .setsym::D0::0x0001
 .setsym::D1::0x0002
 .setsym::D2::0x0004
@@ -759,10 +753,200 @@ EXG a,d :: :: (0xC188|(d<<9)|a)>>8,(0xC188|(d<<9)|a)
 .check::y::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP
 .check::z::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP
 .check::a::A0,A1,A2,A3,A4,A5,A6,A7,SP
-MOVEM.W (a)+,[[ k[[ l[[ m[[ n[[ o[[ p[[ q[[ r[[ s[[ t[[ u[[ v[[ w[[ x[[ y[[ z]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]] :: :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
-MOVEM.L (a)+,[[ k[[ l[[ m[[ n[[ o[[ p[[ q[[ r[[ s[[ t[[ u[[ v[[ w[[ x[[ y[[ z]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]] :: :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
+MOVEM.W (a)+,k l m n o p q r s t u v w x y z ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
+MOVEM.W (a),k l m n o p q r s t u v w x y z ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
+MOVEM.W !f(a),k l m n o p q r s t u v w x y z :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>8,f
+MOVEM.W (!f).W,k l m n o p q r s t u v w x y z :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>8,f
+MOVEM.W (!f).L,k l m n o p q r s t u v w x y z ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l m n o p q r s t u v w x y z ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k l m n o p q r s t u v w x y ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)
+MOVEM.W (a),k l m n o p q r s t u v w x y ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)
+MOVEM.W !f(a),k l m n o p q r s t u v w x y :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y),f>>8,f
+MOVEM.W (!f).W,k l m n o p q r s t u v w x y :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y),f>>8,f
+MOVEM.W (!f).L,k l m n o p q r s t u v w x y ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l m n o p q r s t u v w x y ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k l m n o p q r s t u v w x ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x)
+MOVEM.W (a),k l m n o p q r s t u v w x ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x)
+MOVEM.W !f(a),k l m n o p q r s t u v w x :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x),f>>8,f
+MOVEM.W (!f).W,k l m n o p q r s t u v w x :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x),f>>8,f
+MOVEM.W (!f).L,k l m n o p q r s t u v w x ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l m n o p q r s t u v w x ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k l m n o p q r s t u v w ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w)
+MOVEM.W (a),k l m n o p q r s t u v w ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w)
+MOVEM.W !f(a),k l m n o p q r s t u v w :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w),f>>8,f
+MOVEM.W (!f).W,k l m n o p q r s t u v w :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w),f>>8,f
+MOVEM.W (!f).L,k l m n o p q r s t u v w ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l m n o p q r s t u v w ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k l m n o p q r s t u v ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v)
+MOVEM.W (a),k l m n o p q r s t u v ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v)
+MOVEM.W !f(a),k l m n o p q r s t u v :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v),f>>8,f
+MOVEM.W (!f).W,k l m n o p q r s t u v :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v),f>>8,f
+MOVEM.W (!f).L,k l m n o p q r s t u v ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l m n o p q r s t u v ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k l m n o p q r s t u ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u)
+MOVEM.W (a),k l m n o p q r s t u ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u)
+MOVEM.W !f(a),k l m n o p q r s t u :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u),f>>8,f
+MOVEM.W (!f).W,k l m n o p q r s t u :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u),f>>8,f
+MOVEM.W (!f).L,k l m n o p q r s t u ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l m n o p q r s t u ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k l m n o p q r s t ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t)
+MOVEM.W (a),k l m n o p q r s t ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t)
+MOVEM.W !f(a),k l m n o p q r s t :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t),f>>8,f
+MOVEM.W (!f).W,k l m n o p q r s t :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t),f>>8,f
+MOVEM.W (!f).L,k l m n o p q r s t ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l m n o p q r s t ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k l m n o p q r s ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s)
+MOVEM.W (a),k l m n o p q r s ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s)
+MOVEM.W !f(a),k l m n o p q r s :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s),f>>8,f
+MOVEM.W (!f).W,k l m n o p q r s :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s),f>>8,f
+MOVEM.W (!f).L,k l m n o p q r s ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l m n o p q r s ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k l m n o p q r ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r)
+MOVEM.W (a),k l m n o p q r ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r)
+MOVEM.W !f(a),k l m n o p q r :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r),f>>8,f
+MOVEM.W (!f).W,k l m n o p q r :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r),f>>8,f
+MOVEM.W (!f).L,k l m n o p q r ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l m n o p q r ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k l m n o p q ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q)
+MOVEM.W (a),k l m n o p q ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q)
+MOVEM.W !f(a),k l m n o p q :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q),f>>8,f
+MOVEM.W (!f).W,k l m n o p q :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q),f>>8,f
+MOVEM.W (!f).L,k l m n o p q ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l m n o p q ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k l m n o p ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p)
+MOVEM.W (a),k l m n o p ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p)
+MOVEM.W !f(a),k l m n o p :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p),f>>8,f
+MOVEM.W (!f).W,k l m n o p :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p),f>>8,f
+MOVEM.W (!f).L,k l m n o p ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l m n o p ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k l m n o ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m|n|o)>>8,(k|l|m|n|o)
+MOVEM.W (a),k l m n o ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l|m|n|o)>>8,(k|l|m|n|o)
+MOVEM.W !f(a),k l m n o :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l|m|n|o)>>8,(k|l|m|n|o),f>>8,f
+MOVEM.W (!f).W,k l m n o :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l|m|n|o)>>8,(k|l|m|n|o),f>>8,f
+MOVEM.W (!f).L,k l m n o ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l|m|n|o)>>8,(k|l|m|n|o),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l m n o ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l|m|n|o)>>8,(k|l|m|n|o),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k l m n ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m|n)>>8,(k|l|m|n)
+MOVEM.W (a),k l m n ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l|m|n)>>8,(k|l|m|n)
+MOVEM.W !f(a),k l m n :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l|m|n)>>8,(k|l|m|n),f>>8,f
+MOVEM.W (!f).W,k l m n :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l|m|n)>>8,(k|l|m|n),f>>8,f
+MOVEM.W (!f).L,k l m n ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l|m|n)>>8,(k|l|m|n),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l m n ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l|m|n)>>8,(k|l|m|n),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k l m ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l|m)>>8,(k|l|m)
+MOVEM.W (a),k l m ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l|m)>>8,(k|l|m)
+MOVEM.W !f(a),k l m :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l|m)>>8,(k|l|m),f>>8,f
+MOVEM.W (!f).W,k l m :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l|m)>>8,(k|l|m),f>>8,f
+MOVEM.W (!f).L,k l m ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l|m)>>8,(k|l|m),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l m ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l|m)>>8,(k|l|m),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k l ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k|l)>>8,(k|l)
+MOVEM.W (a),k l ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k|l)>>8,(k|l)
+MOVEM.W !f(a),k l :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k|l)>>8,(k|l),f>>8,f
+MOVEM.W (!f).W,k l :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k|l)>>8,(k|l),f>>8,f
+MOVEM.W (!f).L,k l ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k|l)>>8,(k|l),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k l ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k|l)>>8,(k|l),(f-($$+2))>>8,(f-($$+2))
+MOVEM.W (a)+,k ::  :: (0x4C80|(0x18|(@a-9)))>>8,(0x4C80|(0x18|(@a-9))),(k)>>8,(k)
+MOVEM.W (a),k ::  :: (0x4C80|(0x10|(@a-9)))>>8,(0x4C80|(0x10|(@a-9))),(k)>>8,(k)
+MOVEM.W !f(a),k :: f>32767;3,f<-32768;3 :: (0x4C80|(0x28|(@a-9)))>>8,(0x4C80|(0x28|(@a-9))),(k)>>8,(k),f>>8,f
+MOVEM.W (!f).W,k :: f>65535;3,f<-32768;3 :: (0x4C80|0x38)>>8,(0x4C80|0x38),(k)>>8,(k),f>>8,f
+MOVEM.W (!f).L,k ::  :: (0x4C80|0x39)>>8,(0x4C80|0x39),(k)>>8,(k),f>>24,f>>16,f>>8,f
+MOVEM.W !f(PC),k ::  :: (0x4C80|0x3A)>>8,(0x4C80|0x3A),(k)>>8,(k),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l m n o p q r s t u v w x y z ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
+MOVEM.L (a),k l m n o p q r s t u v w x y z ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
+MOVEM.L !f(a),k l m n o p q r s t u v w x y z :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>8,f
+MOVEM.L (!f).W,k l m n o p q r s t u v w x y z :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>8,f
+MOVEM.L (!f).L,k l m n o p q r s t u v w x y z ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l m n o p q r s t u v w x y z ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l m n o p q r s t u v w x y ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)
+MOVEM.L (a),k l m n o p q r s t u v w x y ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)
+MOVEM.L !f(a),k l m n o p q r s t u v w x y :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y),f>>8,f
+MOVEM.L (!f).W,k l m n o p q r s t u v w x y :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y),f>>8,f
+MOVEM.L (!f).L,k l m n o p q r s t u v w x y ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l m n o p q r s t u v w x y ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l m n o p q r s t u v w x ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x)
+MOVEM.L (a),k l m n o p q r s t u v w x ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x)
+MOVEM.L !f(a),k l m n o p q r s t u v w x :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x),f>>8,f
+MOVEM.L (!f).W,k l m n o p q r s t u v w x :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x),f>>8,f
+MOVEM.L (!f).L,k l m n o p q r s t u v w x ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l m n o p q r s t u v w x ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l m n o p q r s t u v w ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w)
+MOVEM.L (a),k l m n o p q r s t u v w ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w)
+MOVEM.L !f(a),k l m n o p q r s t u v w :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w),f>>8,f
+MOVEM.L (!f).W,k l m n o p q r s t u v w :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w),f>>8,f
+MOVEM.L (!f).L,k l m n o p q r s t u v w ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l m n o p q r s t u v w ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l m n o p q r s t u v ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v)
+MOVEM.L (a),k l m n o p q r s t u v ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v)
+MOVEM.L !f(a),k l m n o p q r s t u v :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v),f>>8,f
+MOVEM.L (!f).W,k l m n o p q r s t u v :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v),f>>8,f
+MOVEM.L (!f).L,k l m n o p q r s t u v ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l m n o p q r s t u v ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l m n o p q r s t u ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u)
+MOVEM.L (a),k l m n o p q r s t u ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u)
+MOVEM.L !f(a),k l m n o p q r s t u :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u),f>>8,f
+MOVEM.L (!f).W,k l m n o p q r s t u :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u),f>>8,f
+MOVEM.L (!f).L,k l m n o p q r s t u ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l m n o p q r s t u ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l m n o p q r s t ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t)
+MOVEM.L (a),k l m n o p q r s t ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t)
+MOVEM.L !f(a),k l m n o p q r s t :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t),f>>8,f
+MOVEM.L (!f).W,k l m n o p q r s t :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t),f>>8,f
+MOVEM.L (!f).L,k l m n o p q r s t ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l m n o p q r s t ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l m n o p q r s ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s)
+MOVEM.L (a),k l m n o p q r s ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s)
+MOVEM.L !f(a),k l m n o p q r s :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s),f>>8,f
+MOVEM.L (!f).W,k l m n o p q r s :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s),f>>8,f
+MOVEM.L (!f).L,k l m n o p q r s ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l m n o p q r s ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l m n o p q r ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r)
+MOVEM.L (a),k l m n o p q r ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r)
+MOVEM.L !f(a),k l m n o p q r :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r),f>>8,f
+MOVEM.L (!f).W,k l m n o p q r :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r),f>>8,f
+MOVEM.L (!f).L,k l m n o p q r ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l m n o p q r ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l m n o p q ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q)
+MOVEM.L (a),k l m n o p q ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q)
+MOVEM.L !f(a),k l m n o p q :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q),f>>8,f
+MOVEM.L (!f).W,k l m n o p q :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q),f>>8,f
+MOVEM.L (!f).L,k l m n o p q ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l m n o p q ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l m n o p ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p)
+MOVEM.L (a),k l m n o p ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p)
+MOVEM.L !f(a),k l m n o p :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p),f>>8,f
+MOVEM.L (!f).W,k l m n o p :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p),f>>8,f
+MOVEM.L (!f).L,k l m n o p ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l m n o p ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l m n o ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m|n|o)>>8,(k|l|m|n|o)
+MOVEM.L (a),k l m n o ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l|m|n|o)>>8,(k|l|m|n|o)
+MOVEM.L !f(a),k l m n o :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l|m|n|o)>>8,(k|l|m|n|o),f>>8,f
+MOVEM.L (!f).W,k l m n o :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l|m|n|o)>>8,(k|l|m|n|o),f>>8,f
+MOVEM.L (!f).L,k l m n o ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l|m|n|o)>>8,(k|l|m|n|o),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l m n o ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l|m|n|o)>>8,(k|l|m|n|o),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l m n ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m|n)>>8,(k|l|m|n)
+MOVEM.L (a),k l m n ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l|m|n)>>8,(k|l|m|n)
+MOVEM.L !f(a),k l m n :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l|m|n)>>8,(k|l|m|n),f>>8,f
+MOVEM.L (!f).W,k l m n :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l|m|n)>>8,(k|l|m|n),f>>8,f
+MOVEM.L (!f).L,k l m n ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l|m|n)>>8,(k|l|m|n),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l m n ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l|m|n)>>8,(k|l|m|n),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l m ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l|m)>>8,(k|l|m)
+MOVEM.L (a),k l m ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l|m)>>8,(k|l|m)
+MOVEM.L !f(a),k l m :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l|m)>>8,(k|l|m),f>>8,f
+MOVEM.L (!f).W,k l m :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l|m)>>8,(k|l|m),f>>8,f
+MOVEM.L (!f).L,k l m ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l|m)>>8,(k|l|m),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l m ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l|m)>>8,(k|l|m),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k l ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k|l)>>8,(k|l)
+MOVEM.L (a),k l ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k|l)>>8,(k|l)
+MOVEM.L !f(a),k l :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k|l)>>8,(k|l),f>>8,f
+MOVEM.L (!f).W,k l :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k|l)>>8,(k|l),f>>8,f
+MOVEM.L (!f).L,k l ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k|l)>>8,(k|l),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k l ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k|l)>>8,(k|l),(f-($$+2))>>8,(f-($$+2))
+MOVEM.L (a)+,k ::  :: (0x4CC0|(0x18|(@a-9)))>>8,(0x4CC0|(0x18|(@a-9))),(k)>>8,(k)
+MOVEM.L (a),k ::  :: (0x4CC0|(0x10|(@a-9)))>>8,(0x4CC0|(0x10|(@a-9))),(k)>>8,(k)
+MOVEM.L !f(a),k :: f>32767;3,f<-32768;3 :: (0x4CC0|(0x28|(@a-9)))>>8,(0x4CC0|(0x28|(@a-9))),(k)>>8,(k),f>>8,f
+MOVEM.L (!f).W,k :: f>65535;3,f<-32768;3 :: (0x4CC0|0x38)>>8,(0x4CC0|0x38),(k)>>8,(k),f>>8,f
+MOVEM.L (!f).L,k ::  :: (0x4CC0|0x39)>>8,(0x4CC0|0x39),(k)>>8,(k),f>>24,f>>16,f>>8,f
+MOVEM.L !f(PC),k ::  :: (0x4CC0|0x3A)>>8,(0x4CC0|0x3A),(k)>>8,(k),(f-($$+2))>>8,(f-($$+2))
 
-/* --- reversed mask order, for -(An) --- */
+/* --- store: reversed mask --- */
 .setsym::D0::0x8000
 .setsym::D1::0x4000
 .setsym::D2::0x2000
@@ -797,5 +981,163 @@ MOVEM.L (a)+,[[ k[[ l[[ m[[ n[[ o[[ p[[ q[[ r[[ s[[ t[[ u[[ v[[ w[[ x[[ y[[ z]]]
 .check::y::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP
 .check::z::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP
 .check::a::A0,A1,A2,A3,A4,A5,A6,A7,SP
-MOVEM.W[[ k[[ l[[ m[[ n[[ o[[ p[[ q[[ r[[ s[[ t[[ u[[ v[[ w[[ x[[ y[[ z]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],-(a) :: :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
-MOVEM.L[[ k[[ l[[ m[[ n[[ o[[ p[[ q[[ r[[ s[[ t[[ u[[ v[[ w[[ x[[ y[[ z]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],-(a) :: :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
+MOVEM.W k l m n o p q r s t u v w x y z,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
+MOVEM.W k l m n o p q r s t u v w x y z,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
+MOVEM.W k l m n o p q r s t u v w x y z,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>8,f
+MOVEM.W k l m n o p q r s t u v w x y z,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>8,f
+MOVEM.W k l m n o p q r s t u v w x y z,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>24,f>>16,f>>8,f
+MOVEM.W k l m n o p q r s t u v w x y,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)
+MOVEM.W k l m n o p q r s t u v w x y,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)
+MOVEM.W k l m n o p q r s t u v w x y,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y),f>>8,f
+MOVEM.W k l m n o p q r s t u v w x y,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y),f>>8,f
+MOVEM.W k l m n o p q r s t u v w x y,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y),f>>24,f>>16,f>>8,f
+MOVEM.W k l m n o p q r s t u v w x,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x)
+MOVEM.W k l m n o p q r s t u v w x,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x)
+MOVEM.W k l m n o p q r s t u v w x,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x),f>>8,f
+MOVEM.W k l m n o p q r s t u v w x,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x),f>>8,f
+MOVEM.W k l m n o p q r s t u v w x,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x),f>>24,f>>16,f>>8,f
+MOVEM.W k l m n o p q r s t u v w,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w)
+MOVEM.W k l m n o p q r s t u v w,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w)
+MOVEM.W k l m n o p q r s t u v w,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w),f>>8,f
+MOVEM.W k l m n o p q r s t u v w,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w),f>>8,f
+MOVEM.W k l m n o p q r s t u v w,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w),f>>24,f>>16,f>>8,f
+MOVEM.W k l m n o p q r s t u v,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v)
+MOVEM.W k l m n o p q r s t u v,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v)
+MOVEM.W k l m n o p q r s t u v,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v),f>>8,f
+MOVEM.W k l m n o p q r s t u v,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v),f>>8,f
+MOVEM.W k l m n o p q r s t u v,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v),f>>24,f>>16,f>>8,f
+MOVEM.W k l m n o p q r s t u,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u)
+MOVEM.W k l m n o p q r s t u,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u)
+MOVEM.W k l m n o p q r s t u,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u),f>>8,f
+MOVEM.W k l m n o p q r s t u,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u),f>>8,f
+MOVEM.W k l m n o p q r s t u,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u),f>>24,f>>16,f>>8,f
+MOVEM.W k l m n o p q r s t,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t)
+MOVEM.W k l m n o p q r s t,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t)
+MOVEM.W k l m n o p q r s t,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t),f>>8,f
+MOVEM.W k l m n o p q r s t,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t),f>>8,f
+MOVEM.W k l m n o p q r s t,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t),f>>24,f>>16,f>>8,f
+MOVEM.W k l m n o p q r s,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s)
+MOVEM.W k l m n o p q r s,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s)
+MOVEM.W k l m n o p q r s,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s),f>>8,f
+MOVEM.W k l m n o p q r s,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s),f>>8,f
+MOVEM.W k l m n o p q r s,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s),f>>24,f>>16,f>>8,f
+MOVEM.W k l m n o p q r,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r)
+MOVEM.W k l m n o p q r,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r)
+MOVEM.W k l m n o p q r,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r),f>>8,f
+MOVEM.W k l m n o p q r,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r),f>>8,f
+MOVEM.W k l m n o p q r,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r),f>>24,f>>16,f>>8,f
+MOVEM.W k l m n o p q,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q)
+MOVEM.W k l m n o p q,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q)
+MOVEM.W k l m n o p q,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q),f>>8,f
+MOVEM.W k l m n o p q,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q),f>>8,f
+MOVEM.W k l m n o p q,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q),f>>24,f>>16,f>>8,f
+MOVEM.W k l m n o p,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p)
+MOVEM.W k l m n o p,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p)
+MOVEM.W k l m n o p,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p),f>>8,f
+MOVEM.W k l m n o p,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p),f>>8,f
+MOVEM.W k l m n o p,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p),f>>24,f>>16,f>>8,f
+MOVEM.W k l m n o,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l|m|n|o)>>8,(k|l|m|n|o)
+MOVEM.W k l m n o,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m|n|o)>>8,(k|l|m|n|o)
+MOVEM.W k l m n o,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l|m|n|o)>>8,(k|l|m|n|o),f>>8,f
+MOVEM.W k l m n o,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l|m|n|o)>>8,(k|l|m|n|o),f>>8,f
+MOVEM.W k l m n o,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l|m|n|o)>>8,(k|l|m|n|o),f>>24,f>>16,f>>8,f
+MOVEM.W k l m n,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l|m|n)>>8,(k|l|m|n)
+MOVEM.W k l m n,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m|n)>>8,(k|l|m|n)
+MOVEM.W k l m n,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l|m|n)>>8,(k|l|m|n),f>>8,f
+MOVEM.W k l m n,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l|m|n)>>8,(k|l|m|n),f>>8,f
+MOVEM.W k l m n,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l|m|n)>>8,(k|l|m|n),f>>24,f>>16,f>>8,f
+MOVEM.W k l m,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l|m)>>8,(k|l|m)
+MOVEM.W k l m,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l|m)>>8,(k|l|m)
+MOVEM.W k l m,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l|m)>>8,(k|l|m),f>>8,f
+MOVEM.W k l m,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l|m)>>8,(k|l|m),f>>8,f
+MOVEM.W k l m,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l|m)>>8,(k|l|m),f>>24,f>>16,f>>8,f
+MOVEM.W k l,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k|l)>>8,(k|l)
+MOVEM.W k l,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k|l)>>8,(k|l)
+MOVEM.W k l,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k|l)>>8,(k|l),f>>8,f
+MOVEM.W k l,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k|l)>>8,(k|l),f>>8,f
+MOVEM.W k l,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k|l)>>8,(k|l),f>>24,f>>16,f>>8,f
+MOVEM.W k,(a) ::  :: (0x4880|(0x10|(8-@a)))>>8,(0x4880|(0x10|(8-@a))),(k)>>8,(k)
+MOVEM.W k,-(a) ::  :: (0x4880|(0x20|(8-@a)))>>8,(0x4880|(0x20|(8-@a))),(k)>>8,(k)
+MOVEM.W k,!f(a) :: f>32767;3,f<-32768;3 :: (0x4880|(0x28|(8-@a)))>>8,(0x4880|(0x28|(8-@a))),(k)>>8,(k),f>>8,f
+MOVEM.W k,(!f).W :: f>65535;3,f<-32768;3 :: (0x4880|0x38)>>8,(0x4880|0x38),(k)>>8,(k),f>>8,f
+MOVEM.W k,(!f).L ::  :: (0x4880|0x39)>>8,(0x4880|0x39),(k)>>8,(k),f>>24,f>>16,f>>8,f
+MOVEM.L k l m n o p q r s t u v w x y z,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
+MOVEM.L k l m n o p q r s t u v w x y z,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
+MOVEM.L k l m n o p q r s t u v w x y z,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>8,f
+MOVEM.L k l m n o p q r s t u v w x y z,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>8,f
+MOVEM.L k l m n o p q r s t u v w x y z,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>24,f>>16,f>>8,f
+MOVEM.L k l m n o p q r s t u v w x y,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)
+MOVEM.L k l m n o p q r s t u v w x y,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)
+MOVEM.L k l m n o p q r s t u v w x y,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y),f>>8,f
+MOVEM.L k l m n o p q r s t u v w x y,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y),f>>8,f
+MOVEM.L k l m n o p q r s t u v w x y,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y),f>>24,f>>16,f>>8,f
+MOVEM.L k l m n o p q r s t u v w x,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x)
+MOVEM.L k l m n o p q r s t u v w x,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x)
+MOVEM.L k l m n o p q r s t u v w x,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x),f>>8,f
+MOVEM.L k l m n o p q r s t u v w x,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x),f>>8,f
+MOVEM.L k l m n o p q r s t u v w x,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w|x)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x),f>>24,f>>16,f>>8,f
+MOVEM.L k l m n o p q r s t u v w,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w)
+MOVEM.L k l m n o p q r s t u v w,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w)
+MOVEM.L k l m n o p q r s t u v w,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w),f>>8,f
+MOVEM.L k l m n o p q r s t u v w,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w),f>>8,f
+MOVEM.L k l m n o p q r s t u v w,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w),f>>24,f>>16,f>>8,f
+MOVEM.L k l m n o p q r s t u v,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v)
+MOVEM.L k l m n o p q r s t u v,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v)
+MOVEM.L k l m n o p q r s t u v,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v),f>>8,f
+MOVEM.L k l m n o p q r s t u v,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v),f>>8,f
+MOVEM.L k l m n o p q r s t u v,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l|m|n|o|p|q|r|s|t|u|v)>>8,(k|l|m|n|o|p|q|r|s|t|u|v),f>>24,f>>16,f>>8,f
+MOVEM.L k l m n o p q r s t u,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u)
+MOVEM.L k l m n o p q r s t u,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u)
+MOVEM.L k l m n o p q r s t u,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u),f>>8,f
+MOVEM.L k l m n o p q r s t u,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u),f>>8,f
+MOVEM.L k l m n o p q r s t u,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l|m|n|o|p|q|r|s|t|u)>>8,(k|l|m|n|o|p|q|r|s|t|u),f>>24,f>>16,f>>8,f
+MOVEM.L k l m n o p q r s t,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t)
+MOVEM.L k l m n o p q r s t,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t)
+MOVEM.L k l m n o p q r s t,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t),f>>8,f
+MOVEM.L k l m n o p q r s t,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t),f>>8,f
+MOVEM.L k l m n o p q r s t,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l|m|n|o|p|q|r|s|t)>>8,(k|l|m|n|o|p|q|r|s|t),f>>24,f>>16,f>>8,f
+MOVEM.L k l m n o p q r s,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s)
+MOVEM.L k l m n o p q r s,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s)
+MOVEM.L k l m n o p q r s,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s),f>>8,f
+MOVEM.L k l m n o p q r s,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s),f>>8,f
+MOVEM.L k l m n o p q r s,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l|m|n|o|p|q|r|s)>>8,(k|l|m|n|o|p|q|r|s),f>>24,f>>16,f>>8,f
+MOVEM.L k l m n o p q r,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r)
+MOVEM.L k l m n o p q r,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r)
+MOVEM.L k l m n o p q r,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r),f>>8,f
+MOVEM.L k l m n o p q r,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r),f>>8,f
+MOVEM.L k l m n o p q r,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l|m|n|o|p|q|r)>>8,(k|l|m|n|o|p|q|r),f>>24,f>>16,f>>8,f
+MOVEM.L k l m n o p q,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q)
+MOVEM.L k l m n o p q,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q)
+MOVEM.L k l m n o p q,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q),f>>8,f
+MOVEM.L k l m n o p q,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q),f>>8,f
+MOVEM.L k l m n o p q,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l|m|n|o|p|q)>>8,(k|l|m|n|o|p|q),f>>24,f>>16,f>>8,f
+MOVEM.L k l m n o p,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p)
+MOVEM.L k l m n o p,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p)
+MOVEM.L k l m n o p,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p),f>>8,f
+MOVEM.L k l m n o p,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p),f>>8,f
+MOVEM.L k l m n o p,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l|m|n|o|p)>>8,(k|l|m|n|o|p),f>>24,f>>16,f>>8,f
+MOVEM.L k l m n o,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l|m|n|o)>>8,(k|l|m|n|o)
+MOVEM.L k l m n o,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m|n|o)>>8,(k|l|m|n|o)
+MOVEM.L k l m n o,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l|m|n|o)>>8,(k|l|m|n|o),f>>8,f
+MOVEM.L k l m n o,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l|m|n|o)>>8,(k|l|m|n|o),f>>8,f
+MOVEM.L k l m n o,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l|m|n|o)>>8,(k|l|m|n|o),f>>24,f>>16,f>>8,f
+MOVEM.L k l m n,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l|m|n)>>8,(k|l|m|n)
+MOVEM.L k l m n,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m|n)>>8,(k|l|m|n)
+MOVEM.L k l m n,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l|m|n)>>8,(k|l|m|n),f>>8,f
+MOVEM.L k l m n,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l|m|n)>>8,(k|l|m|n),f>>8,f
+MOVEM.L k l m n,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l|m|n)>>8,(k|l|m|n),f>>24,f>>16,f>>8,f
+MOVEM.L k l m,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l|m)>>8,(k|l|m)
+MOVEM.L k l m,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l|m)>>8,(k|l|m)
+MOVEM.L k l m,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l|m)>>8,(k|l|m),f>>8,f
+MOVEM.L k l m,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l|m)>>8,(k|l|m),f>>8,f
+MOVEM.L k l m,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l|m)>>8,(k|l|m),f>>24,f>>16,f>>8,f
+MOVEM.L k l,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k|l)>>8,(k|l)
+MOVEM.L k l,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k|l)>>8,(k|l)
+MOVEM.L k l,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k|l)>>8,(k|l),f>>8,f
+MOVEM.L k l,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k|l)>>8,(k|l),f>>8,f
+MOVEM.L k l,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k|l)>>8,(k|l),f>>24,f>>16,f>>8,f
+MOVEM.L k,(a) ::  :: (0x48C0|(0x10|(8-@a)))>>8,(0x48C0|(0x10|(8-@a))),(k)>>8,(k)
+MOVEM.L k,-(a) ::  :: (0x48C0|(0x20|(8-@a)))>>8,(0x48C0|(0x20|(8-@a))),(k)>>8,(k)
+MOVEM.L k,!f(a) :: f>32767;3,f<-32768;3 :: (0x48C0|(0x28|(8-@a)))>>8,(0x48C0|(0x28|(8-@a))),(k)>>8,(k),f>>8,f
+MOVEM.L k,(!f).W :: f>65535;3,f<-32768;3 :: (0x48C0|0x38)>>8,(0x48C0|0x38),(k)>>8,(k),f>>8,f
+MOVEM.L k,(!f).L ::  :: (0x48C0|0x39)>>8,(0x48C0|0x39),(k)>>8,(k),f>>24,f>>16,f>>8,f
