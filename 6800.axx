@@ -1,0 +1,422 @@
+/* =====================================================================
+/*  6800.axx -- Motorola MC6800 full pattern file for axx
+/*
+/*  Covers the complete official MC6800 instruction set: all 51
+/*  inherent (1-byte) opcodes, the 15 short (8-bit) relative branches
+/*  plus BSR, the accumulator-A and accumulator-B groups (immediate /
+/*  direct / indexed / extended), the memory read-modify-write group
+/*  (NEG/COM/LSR/ROR/ASR/ASL(LSL)/ROL/DEC/INC/TST/CLR/JMP -- indexed
+/*  and extended only, the MC6800 has no direct-page form of these),
+/*  JSR (indexed/extended only), and the 16-bit CPX/LDS/STS/LDX/STX
+/*  group. 197 opcodes in total. Undocumented/illegal opcodes (e.g.
+/*  the HCF-behaving 0x9D/0xDD, or the partial-STA 0x87/0x8F/0xC7/0xCF)
+/*  are intentionally not included, matching the existing 6502.axx /
+/*  6809.axx house convention.
+/*
+/*  Mnemonics use the widely-used single-token form (LDAA, LDAB, STAA,
+/*  STAB, ...) found in most modern MC6800 cross-assemblers, not the
+/*  older two-token "LDA A" form used by Motorola's original resident
+/*  assembler.
+/*
+/*  ============================= SYNTAX =============================
+/*
+/*  Immediate / direct / extended / indexed (accumulator-A shown, B is
+/*  identical in form):
+/*
+/*     LDAA #$41          immediate (8-bit; CPX/LDS/LDX take a 16-bit
+/*                        immediate instead, e.g. LDX #$1234)
+/*     LDAA $10           direct    (auto: chosen when value <= $FF)
+/*     LDAA $1000         extended  (auto: chosen otherwise)
+/*     LDAA <$10          force direct    (error if operand > $FF)
+/*     LDAA >$10          force extended  (always a 2-byte address)
+/*     LDAA 5,X           indexed -- unsigned 8-bit offset from X only;
+/*                        the MC6800 has a single index register and no
+/*                        indirect/auto-inc/auto-dec indexed forms (all
+/*                        of those are 6809 additions)
+/*     LDAA ,X            indexed with an offset of 0
+/*
+/*  axx does not optimise instruction length by itself, so the direct /
+/*  extended choice above is made inside the pattern by a ternary on the
+/*  operand value. A forward label is unknown on the first relaxation
+/*  pass, so its instruction may change length between passes; axx
+/*  re-runs pass 1 until the addresses stop moving, and refuses to write
+/*  output if they never settle.
+/*
+/*  Memory read-modify-write groups have NO direct-page form on real
+/*  MC6800 hardware -- only indexed and extended exist (plus separate
+/*  inherent opcodes for the accumulator forms, e.g. NEGA/NEGB):
+/*
+/*     NEG 5,X            indexed
+/*     NEG $1000          extended (always 3 bytes; there is no
+/*                        direct/extended auto-choice to make here)
+/*     NEG >$1000         extended, forced explicitly (same encoding;
+/*                        accepted for symmetry with the accumulator
+/*                        groups below)
+/*     NEG <$10           always an error (error code 1) -- there is
+/*                        no direct-page form to force here; this is
+/*                        defined on purpose so the typo is caught
+/*                        instead of silently mis-assembling (axx's
+/*                        expression grammar also treats a leading
+/*                        unmatched `<`/`>` as the comparison operator,
+/*                        so an undefined `<`/`>` prefix elsewhere would
+/*                        otherwise silently parse as `0 < value` and
+/*                        emit a 0 operand rather than raising an error)
+/*     NEGA / NEGB         accumulator forms (inherent, 1 byte)
+/*
+/*  Relative branches (including BSR) are 2 bytes; the displacement is
+/*  measured from the address of the byte after the instruction ($$+2):
+/*
+/*     BEQ label
+/*     BSR sub
+/*
+/*  Aliases provided for convenience, matching common assembler usage:
+/*     LSL / LSLA / LSLB    same opcodes as ASL / ASLA / ASLB
+/*     BHS                  same opcode as BCC (branch if C=0)
+/*     BLO                  same opcode as BCS (branch if C=1)
+/*
+/*  Data definition (numbers use axx expression syntax, 0x10 / 16 /
+/*  0b10000, not $10):
+/*     FCB v[,w[,x[,y[,z[,i[,j[,k]]]]]]]   up to 8 values, 1 byte each
+/*     FDB v[,w[,x[,y]]]                   up to 4 values, 2 bytes each
+/*                                         (big-endian, Motorola order)
+/*     RMB !n                              reserve n bytes, filled with
+/*                                         0x00 in the binary output.
+/*                                         For a true no-output
+/*                                         reservation (e.g. inside a
+/*                                         .bss section) use axx's
+/*                                         built-in `.resb n` instead.
+/*  There is no FCC directive here (axx has no generic delimited-
+/*  string operand capture outside its built-in directives); use the
+/*  built-in `.ascii "text"` / `.asciz "text"` directives for strings.
+/*
+/*  Error codes raised by this file
+/*     1  Invalid syntax        (only from NEG/COM/.../JMP/JSR `<value`,
+/*        which has no addressing mode to mean -- see above)
+/*     2  Address out of range  (indexed offset > 8 bits, forced direct
+/*        operand > $FF, or forced/computed extended address > $FFFF)
+/*     3  Value out of range    (immediate operand too big)
+/* ===================================================================== */
+
+/* ---------- inherent (no operand) ---------- */
+NOP :: 0x01
+TAP :: 0x06
+TPA :: 0x07
+INX :: 0x08
+DEX :: 0x09
+CLV :: 0x0A
+SEV :: 0x0B
+CLC :: 0x0C
+SEC :: 0x0D
+CLI :: 0x0E
+SEI :: 0x0F
+SBA :: 0x10
+CBA :: 0x11
+TAB :: 0x16
+TBA :: 0x17
+DAA :: 0x19
+ABA :: 0x1B
+TSX :: 0x30
+INS :: 0x31
+PULA :: 0x32
+PULB :: 0x33
+DES :: 0x34
+TXS :: 0x35
+PSHA :: 0x36
+PSHB :: 0x37
+RTS :: 0x39
+RTI :: 0x3B
+WAI :: 0x3E
+SWI :: 0x3F
+
+/* ---------- inherent accumulator shift/rotate/test group ---------- */
+NEGA :: 0x40
+COMA :: 0x43
+LSRA :: 0x44
+RORA :: 0x46
+ASRA :: 0x47
+ASLA :: 0x48
+LSLA :: 0x48
+ROLA :: 0x49
+DECA :: 0x4A
+INCA :: 0x4C
+TSTA :: 0x4D
+CLRA :: 0x4F
+NEGB :: 0x50
+COMB :: 0x53
+LSRB :: 0x54
+RORB :: 0x56
+ASRB :: 0x57
+ASLB :: 0x58
+LSLB :: 0x58
+ROLB :: 0x59
+DECB :: 0x5A
+INCB :: 0x5C
+TSTB :: 0x5D
+CLRB :: 0x5F
+
+/* ---------- short (8-bit) relative branches, including BSR ---------- */
+/* $$ is the location counter at the start of this instruction; the
+/* displacement is measured from the byte after the operand ($$+2). */
+BRA !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x20,(e-$$-2)&0xff
+BHI !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x22,(e-$$-2)&0xff
+BLS !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x23,(e-$$-2)&0xff
+BCC !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x24,(e-$$-2)&0xff
+BHS !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x24,(e-$$-2)&0xff
+BCS !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x25,(e-$$-2)&0xff
+BLO !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x25,(e-$$-2)&0xff
+BNE !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x26,(e-$$-2)&0xff
+BEQ !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x27,(e-$$-2)&0xff
+BVC !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x28,(e-$$-2)&0xff
+BVS !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x29,(e-$$-2)&0xff
+BPL !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x2A,(e-$$-2)&0xff
+BMI !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x2B,(e-$$-2)&0xff
+BGE !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x2C,(e-$$-2)&0xff
+BLT !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x2D,(e-$$-2)&0xff
+BGT !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x2E,(e-$$-2)&0xff
+BLE !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x2F,(e-$$-2)&0xff
+BSR !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x8D,(e-$$-2)&0xff
+
+/* ---------- memory read-modify-write group: indexed / extended only ---------- */
+/* No direct-page form exists for this group on real MC6800 hardware. */
+NEG [[!v]],X :: v>0xff||v<0;2 :: 0x60,v&0xff
+NEG <!v :: 1;1 :: 0x60,v&0xff
+NEG >!v :: v>0xffff||v<0;2 :: 0x70,(v>>8)&0xff,v&0xff
+NEG !v :: v>0xffff||v<0;2 :: 0x70,(v>>8)&0xff,v&0xff
+COM [[!v]],X :: v>0xff||v<0;2 :: 0x63,v&0xff
+COM <!v :: 1;1 :: 0x63,v&0xff
+COM >!v :: v>0xffff||v<0;2 :: 0x73,(v>>8)&0xff,v&0xff
+COM !v :: v>0xffff||v<0;2 :: 0x73,(v>>8)&0xff,v&0xff
+LSR [[!v]],X :: v>0xff||v<0;2 :: 0x64,v&0xff
+LSR <!v :: 1;1 :: 0x64,v&0xff
+LSR >!v :: v>0xffff||v<0;2 :: 0x74,(v>>8)&0xff,v&0xff
+LSR !v :: v>0xffff||v<0;2 :: 0x74,(v>>8)&0xff,v&0xff
+ROR [[!v]],X :: v>0xff||v<0;2 :: 0x66,v&0xff
+ROR <!v :: 1;1 :: 0x66,v&0xff
+ROR >!v :: v>0xffff||v<0;2 :: 0x76,(v>>8)&0xff,v&0xff
+ROR !v :: v>0xffff||v<0;2 :: 0x76,(v>>8)&0xff,v&0xff
+ASR [[!v]],X :: v>0xff||v<0;2 :: 0x67,v&0xff
+ASR <!v :: 1;1 :: 0x67,v&0xff
+ASR >!v :: v>0xffff||v<0;2 :: 0x77,(v>>8)&0xff,v&0xff
+ASR !v :: v>0xffff||v<0;2 :: 0x77,(v>>8)&0xff,v&0xff
+ASL [[!v]],X :: v>0xff||v<0;2 :: 0x68,v&0xff
+ASL <!v :: 1;1 :: 0x68,v&0xff
+ASL >!v :: v>0xffff||v<0;2 :: 0x78,(v>>8)&0xff,v&0xff
+ASL !v :: v>0xffff||v<0;2 :: 0x78,(v>>8)&0xff,v&0xff
+LSL [[!v]],X :: v>0xff||v<0;2 :: 0x68,v&0xff
+LSL <!v :: 1;1 :: 0x68,v&0xff
+LSL >!v :: v>0xffff||v<0;2 :: 0x78,(v>>8)&0xff,v&0xff
+LSL !v :: v>0xffff||v<0;2 :: 0x78,(v>>8)&0xff,v&0xff
+ROL [[!v]],X :: v>0xff||v<0;2 :: 0x69,v&0xff
+ROL <!v :: 1;1 :: 0x69,v&0xff
+ROL >!v :: v>0xffff||v<0;2 :: 0x79,(v>>8)&0xff,v&0xff
+ROL !v :: v>0xffff||v<0;2 :: 0x79,(v>>8)&0xff,v&0xff
+DEC [[!v]],X :: v>0xff||v<0;2 :: 0x6A,v&0xff
+DEC <!v :: 1;1 :: 0x6A,v&0xff
+DEC >!v :: v>0xffff||v<0;2 :: 0x7A,(v>>8)&0xff,v&0xff
+DEC !v :: v>0xffff||v<0;2 :: 0x7A,(v>>8)&0xff,v&0xff
+INC [[!v]],X :: v>0xff||v<0;2 :: 0x6C,v&0xff
+INC <!v :: 1;1 :: 0x6C,v&0xff
+INC >!v :: v>0xffff||v<0;2 :: 0x7C,(v>>8)&0xff,v&0xff
+INC !v :: v>0xffff||v<0;2 :: 0x7C,(v>>8)&0xff,v&0xff
+TST [[!v]],X :: v>0xff||v<0;2 :: 0x6D,v&0xff
+TST <!v :: 1;1 :: 0x6D,v&0xff
+TST >!v :: v>0xffff||v<0;2 :: 0x7D,(v>>8)&0xff,v&0xff
+TST !v :: v>0xffff||v<0;2 :: 0x7D,(v>>8)&0xff,v&0xff
+CLR [[!v]],X :: v>0xff||v<0;2 :: 0x6F,v&0xff
+CLR <!v :: 1;1 :: 0x6F,v&0xff
+CLR >!v :: v>0xffff||v<0;2 :: 0x7F,(v>>8)&0xff,v&0xff
+CLR !v :: v>0xffff||v<0;2 :: 0x7F,(v>>8)&0xff,v&0xff
+JMP [[!v]],X :: v>0xff||v<0;2 :: 0x6E,v&0xff
+JMP <!v :: 1;1 :: 0x6E,v&0xff
+JMP >!v :: v>0xffff||v<0;2 :: 0x7E,(v>>8)&0xff,v&0xff
+JMP !v :: v>0xffff||v<0;2 :: 0x7E,(v>>8)&0xff,v&0xff
+
+/* ---------- JSR: indexed / extended only ---------- */
+JSR [[!v]],X :: v>0xff||v<0;2 :: 0xAD,v&0xff
+JSR <!v :: 1;1 :: 0xAD,v&0xff
+JSR >!v :: v>0xffff||v<0;2 :: 0xBD,(v>>8)&0xff,v&0xff
+JSR !v :: v>0xffff||v<0;2 :: 0xBD,(v>>8)&0xff,v&0xff
+
+/* ---------- accumulator A group: immediate / direct / indexed / extended ---------- */
+SUBA #!v :: v>0xff||v<0;3 :: 0x80,v&0xff
+SUBA [[!v]],X :: v>0xff||v<0;2 :: 0xA0,v&0xff
+SUBA <!v :: v>0xff||v<0;2 :: 0x90,v&0xff
+SUBA >!v :: v>0xffff||v<0;2 :: 0xB0,(v>>8)&0xff,v&0xff
+SUBA !v :: :: (v>0xff)?0xB0:0x90,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+CMPA #!v :: v>0xff||v<0;3 :: 0x81,v&0xff
+CMPA [[!v]],X :: v>0xff||v<0;2 :: 0xA1,v&0xff
+CMPA <!v :: v>0xff||v<0;2 :: 0x91,v&0xff
+CMPA >!v :: v>0xffff||v<0;2 :: 0xB1,(v>>8)&0xff,v&0xff
+CMPA !v :: :: (v>0xff)?0xB1:0x91,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+SBCA #!v :: v>0xff||v<0;3 :: 0x82,v&0xff
+SBCA [[!v]],X :: v>0xff||v<0;2 :: 0xA2,v&0xff
+SBCA <!v :: v>0xff||v<0;2 :: 0x92,v&0xff
+SBCA >!v :: v>0xffff||v<0;2 :: 0xB2,(v>>8)&0xff,v&0xff
+SBCA !v :: :: (v>0xff)?0xB2:0x92,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+ANDA #!v :: v>0xff||v<0;3 :: 0x84,v&0xff
+ANDA [[!v]],X :: v>0xff||v<0;2 :: 0xA4,v&0xff
+ANDA <!v :: v>0xff||v<0;2 :: 0x94,v&0xff
+ANDA >!v :: v>0xffff||v<0;2 :: 0xB4,(v>>8)&0xff,v&0xff
+ANDA !v :: :: (v>0xff)?0xB4:0x94,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+BITA #!v :: v>0xff||v<0;3 :: 0x85,v&0xff
+BITA [[!v]],X :: v>0xff||v<0;2 :: 0xA5,v&0xff
+BITA <!v :: v>0xff||v<0;2 :: 0x95,v&0xff
+BITA >!v :: v>0xffff||v<0;2 :: 0xB5,(v>>8)&0xff,v&0xff
+BITA !v :: :: (v>0xff)?0xB5:0x95,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+LDAA #!v :: v>0xff||v<0;3 :: 0x86,v&0xff
+LDAA [[!v]],X :: v>0xff||v<0;2 :: 0xA6,v&0xff
+LDAA <!v :: v>0xff||v<0;2 :: 0x96,v&0xff
+LDAA >!v :: v>0xffff||v<0;2 :: 0xB6,(v>>8)&0xff,v&0xff
+LDAA !v :: :: (v>0xff)?0xB6:0x96,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+EORA #!v :: v>0xff||v<0;3 :: 0x88,v&0xff
+EORA [[!v]],X :: v>0xff||v<0;2 :: 0xA8,v&0xff
+EORA <!v :: v>0xff||v<0;2 :: 0x98,v&0xff
+EORA >!v :: v>0xffff||v<0;2 :: 0xB8,(v>>8)&0xff,v&0xff
+EORA !v :: :: (v>0xff)?0xB8:0x98,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+ADCA #!v :: v>0xff||v<0;3 :: 0x89,v&0xff
+ADCA [[!v]],X :: v>0xff||v<0;2 :: 0xA9,v&0xff
+ADCA <!v :: v>0xff||v<0;2 :: 0x99,v&0xff
+ADCA >!v :: v>0xffff||v<0;2 :: 0xB9,(v>>8)&0xff,v&0xff
+ADCA !v :: :: (v>0xff)?0xB9:0x99,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+ORAA #!v :: v>0xff||v<0;3 :: 0x8A,v&0xff
+ORAA [[!v]],X :: v>0xff||v<0;2 :: 0xAA,v&0xff
+ORAA <!v :: v>0xff||v<0;2 :: 0x9A,v&0xff
+ORAA >!v :: v>0xffff||v<0;2 :: 0xBA,(v>>8)&0xff,v&0xff
+ORAA !v :: :: (v>0xff)?0xBA:0x9A,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+ADDA #!v :: v>0xff||v<0;3 :: 0x8B,v&0xff
+ADDA [[!v]],X :: v>0xff||v<0;2 :: 0xAB,v&0xff
+ADDA <!v :: v>0xff||v<0;2 :: 0x9B,v&0xff
+ADDA >!v :: v>0xffff||v<0;2 :: 0xBB,(v>>8)&0xff,v&0xff
+ADDA !v :: :: (v>0xff)?0xBB:0x9B,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+/* ---------- STAA: direct / indexed / extended (no immediate) ---------- */
+STAA [[!v]],X :: v>0xff||v<0;2 :: 0xA7,v&0xff
+STAA <!v :: v>0xff||v<0;2 :: 0x97,v&0xff
+STAA >!v :: v>0xffff||v<0;2 :: 0xB7,(v>>8)&0xff,v&0xff
+STAA !v :: :: (v>0xff)?0xB7:0x97,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+/* ---------- accumulator B group: immediate / direct / indexed / extended ---------- */
+SUBB #!v :: v>0xff||v<0;3 :: 0xC0,v&0xff
+SUBB [[!v]],X :: v>0xff||v<0;2 :: 0xE0,v&0xff
+SUBB <!v :: v>0xff||v<0;2 :: 0xD0,v&0xff
+SUBB >!v :: v>0xffff||v<0;2 :: 0xF0,(v>>8)&0xff,v&0xff
+SUBB !v :: :: (v>0xff)?0xF0:0xD0,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+CMPB #!v :: v>0xff||v<0;3 :: 0xC1,v&0xff
+CMPB [[!v]],X :: v>0xff||v<0;2 :: 0xE1,v&0xff
+CMPB <!v :: v>0xff||v<0;2 :: 0xD1,v&0xff
+CMPB >!v :: v>0xffff||v<0;2 :: 0xF1,(v>>8)&0xff,v&0xff
+CMPB !v :: :: (v>0xff)?0xF1:0xD1,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+SBCB #!v :: v>0xff||v<0;3 :: 0xC2,v&0xff
+SBCB [[!v]],X :: v>0xff||v<0;2 :: 0xE2,v&0xff
+SBCB <!v :: v>0xff||v<0;2 :: 0xD2,v&0xff
+SBCB >!v :: v>0xffff||v<0;2 :: 0xF2,(v>>8)&0xff,v&0xff
+SBCB !v :: :: (v>0xff)?0xF2:0xD2,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+ANDB #!v :: v>0xff||v<0;3 :: 0xC4,v&0xff
+ANDB [[!v]],X :: v>0xff||v<0;2 :: 0xE4,v&0xff
+ANDB <!v :: v>0xff||v<0;2 :: 0xD4,v&0xff
+ANDB >!v :: v>0xffff||v<0;2 :: 0xF4,(v>>8)&0xff,v&0xff
+ANDB !v :: :: (v>0xff)?0xF4:0xD4,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+BITB #!v :: v>0xff||v<0;3 :: 0xC5,v&0xff
+BITB [[!v]],X :: v>0xff||v<0;2 :: 0xE5,v&0xff
+BITB <!v :: v>0xff||v<0;2 :: 0xD5,v&0xff
+BITB >!v :: v>0xffff||v<0;2 :: 0xF5,(v>>8)&0xff,v&0xff
+BITB !v :: :: (v>0xff)?0xF5:0xD5,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+LDAB #!v :: v>0xff||v<0;3 :: 0xC6,v&0xff
+LDAB [[!v]],X :: v>0xff||v<0;2 :: 0xE6,v&0xff
+LDAB <!v :: v>0xff||v<0;2 :: 0xD6,v&0xff
+LDAB >!v :: v>0xffff||v<0;2 :: 0xF6,(v>>8)&0xff,v&0xff
+LDAB !v :: :: (v>0xff)?0xF6:0xD6,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+EORB #!v :: v>0xff||v<0;3 :: 0xC8,v&0xff
+EORB [[!v]],X :: v>0xff||v<0;2 :: 0xE8,v&0xff
+EORB <!v :: v>0xff||v<0;2 :: 0xD8,v&0xff
+EORB >!v :: v>0xffff||v<0;2 :: 0xF8,(v>>8)&0xff,v&0xff
+EORB !v :: :: (v>0xff)?0xF8:0xD8,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+ADCB #!v :: v>0xff||v<0;3 :: 0xC9,v&0xff
+ADCB [[!v]],X :: v>0xff||v<0;2 :: 0xE9,v&0xff
+ADCB <!v :: v>0xff||v<0;2 :: 0xD9,v&0xff
+ADCB >!v :: v>0xffff||v<0;2 :: 0xF9,(v>>8)&0xff,v&0xff
+ADCB !v :: :: (v>0xff)?0xF9:0xD9,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+ORAB #!v :: v>0xff||v<0;3 :: 0xCA,v&0xff
+ORAB [[!v]],X :: v>0xff||v<0;2 :: 0xEA,v&0xff
+ORAB <!v :: v>0xff||v<0;2 :: 0xDA,v&0xff
+ORAB >!v :: v>0xffff||v<0;2 :: 0xFA,(v>>8)&0xff,v&0xff
+ORAB !v :: :: (v>0xff)?0xFA:0xDA,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+ADDB #!v :: v>0xff||v<0;3 :: 0xCB,v&0xff
+ADDB [[!v]],X :: v>0xff||v<0;2 :: 0xEB,v&0xff
+ADDB <!v :: v>0xff||v<0;2 :: 0xDB,v&0xff
+ADDB >!v :: v>0xffff||v<0;2 :: 0xFB,(v>>8)&0xff,v&0xff
+ADDB !v :: :: (v>0xff)?0xFB:0xDB,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+/* ---------- STAB: direct / indexed / extended (no immediate) ---------- */
+STAB [[!v]],X :: v>0xff||v<0;2 :: 0xE7,v&0xff
+STAB <!v :: v>0xff||v<0;2 :: 0xD7,v&0xff
+STAB >!v :: v>0xffff||v<0;2 :: 0xF7,(v>>8)&0xff,v&0xff
+STAB !v :: :: (v>0xff)?0xF7:0xD7,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+/* ---------- 16-bit group: CPX / LDS / STS / LDX / STX ---------- */
+CPX #!v :: v>0xffff||v<0;3 :: 0x8C,(v>>8)&0xff,v&0xff
+CPX [[!v]],X :: v>0xff||v<0;2 :: 0xAC,v&0xff
+CPX <!v :: v>0xff||v<0;2 :: 0x9C,v&0xff
+CPX >!v :: v>0xffff||v<0;2 :: 0xBC,(v>>8)&0xff,v&0xff
+CPX !v :: :: (v>0xff)?0xBC:0x9C,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+LDS #!v :: v>0xffff||v<0;3 :: 0x8E,(v>>8)&0xff,v&0xff
+LDS [[!v]],X :: v>0xff||v<0;2 :: 0xAE,v&0xff
+LDS <!v :: v>0xff||v<0;2 :: 0x9E,v&0xff
+LDS >!v :: v>0xffff||v<0;2 :: 0xBE,(v>>8)&0xff,v&0xff
+LDS !v :: :: (v>0xff)?0xBE:0x9E,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+STS [[!v]],X :: v>0xff||v<0;2 :: 0xAF,v&0xff
+STS <!v :: v>0xff||v<0;2 :: 0x9F,v&0xff
+STS >!v :: v>0xffff||v<0;2 :: 0xBF,(v>>8)&0xff,v&0xff
+STS !v :: :: (v>0xff)?0xBF:0x9F,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+LDX #!v :: v>0xffff||v<0;3 :: 0xCE,(v>>8)&0xff,v&0xff
+LDX [[!v]],X :: v>0xff||v<0;2 :: 0xEE,v&0xff
+LDX <!v :: v>0xff||v<0;2 :: 0xDE,v&0xff
+LDX >!v :: v>0xffff||v<0;2 :: 0xFE,(v>>8)&0xff,v&0xff
+LDX !v :: :: (v>0xff)?0xFE:0xDE,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+STX [[!v]],X :: v>0xff||v<0;2 :: 0xEF,v&0xff
+STX <!v :: v>0xff||v<0;2 :: 0xDF,v&0xff
+STX >!v :: v>0xffff||v<0;2 :: 0xFF,(v>>8)&0xff,v&0xff
+STX !v :: :: (v>0xff)?0xFF:0xDF,;((v>0xff)?((v>>8)&0xff):0),v&0xff
+
+/* ---------- assembler pseudo-ops for data definition ---------- */
+/* One pattern per element count, deliberately NOT using the
+   comma-optional-group trick used elsewhere, because a real data
+   byte/word of value 0 must never be suppressed, and the suppression
+   idiom cannot distinguish "slot absent" from "slot present with
+   value 0" for an arbitrary data list. The 0x100| flag on every
+   element after the first forces emission even when the value is 0. */
+FCB !v :: :: v&0xff
+FCB !v,!w :: :: v&0xff,0x100|(w&0xff)
+FCB !v,!w,!x :: :: v&0xff,0x100|(w&0xff),0x100|(x&0xff)
+FCB !v,!w,!x,!y :: :: v&0xff,0x100|(w&0xff),0x100|(x&0xff),0x100|(y&0xff)
+FCB !v,!w,!x,!y,!z :: :: v&0xff,0x100|(w&0xff),0x100|(x&0xff),0x100|(y&0xff),0x100|(z&0xff)
+FCB !v,!w,!x,!y,!z,!i :: :: v&0xff,0x100|(w&0xff),0x100|(x&0xff),0x100|(y&0xff),0x100|(z&0xff),0x100|(i&0xff)
+FCB !v,!w,!x,!y,!z,!i,!j :: :: v&0xff,0x100|(w&0xff),0x100|(x&0xff),0x100|(y&0xff),0x100|(z&0xff),0x100|(i&0xff),0x100|(j&0xff)
+FCB !v,!w,!x,!y,!z,!i,!j,!k :: :: v&0xff,0x100|(w&0xff),0x100|(x&0xff),0x100|(y&0xff),0x100|(z&0xff),0x100|(i&0xff),0x100|(j&0xff),0x100|(k&0xff)
+FDB !v :: :: (v>>8)&0xff,v&0xff
+FDB !v,!w :: :: (v>>8)&0xff,0x100|(v&0xff),0x100|((w>>8)&0xff),0x100|(w&0xff)
+FDB !v,!w,!x :: :: (v>>8)&0xff,0x100|(v&0xff),0x100|((w>>8)&0xff),0x100|(w&0xff),0x100|((x>>8)&0xff),0x100|(x&0xff)
+FDB !v,!w,!x,!y :: :: (v>>8)&0xff,0x100|(v&0xff),0x100|((w>>8)&0xff),0x100|(w&0xff),0x100|((x>>8)&0xff),0x100|(x&0xff),0x100|((y>>8)&0xff),0x100|(y&0xff)
+RMB !n :: n<0;2 :: @@[n,0x00]
