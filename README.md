@@ -5,7 +5,7 @@ author: fygar256
 slide: false
 ---
 
-C version is also available. The C version is named Caxx. Caxx is much faster than Paxx.
+A C version is also available, named Caxx. Caxx is much faster than Paxx.
 
 caxx compile:
 
@@ -65,7 +65,7 @@ Note that `x86_64.axx` uses the source `hello.s`, not a file named
 
 # GENERAL ASSEMBLER 'axx.py'
 
-Since it's written in Python, the nickname is Paxx. axx is an abbreviation for 'Arbitrary eXtended X(cross) assembler'. It also means that 'AXX' was created by superimposing X, which is an unknown CPU, onto 'ASM'.
+Since it's written in Python, the nickname is Paxx. axx is an abbreviation for "Arbitrary eXtended X(cross) assembler." The name also comes from superimposing an X — representing an unknown CPU — onto "ASM."
 
 The core ideas, the name "AXX," and a prototype written in C already existed back in 1986—conceived during my university days while working part-time at Tokyo Denshi Sekkei—but it wasn't until 2024, after rediscovering the original program listing 38 years later and rewriting it in Python, that I finally released the functional code as it exists today. The `instruction` in the axx pattern file is the meta-language for all imperative assembly languages. Although it's a DSL, it doesn't really have a defined grammar; it's a free syntax language (pattern language) where you create your own grammar by combining string literals, symbols, and expressions.
 
@@ -256,7 +256,7 @@ label3	2
 
 ## Explanation of Pattern Files
 
-A pattern file is a processor description file, and is user-defined to correspond to individual processors. It is a kind of metalanguage for machine code and assembly language. The DSL for pattern files is the basic ISADL (ISA Description Language).
+A pattern file is a processor description file, user-defined to correspond to an individual processor. It is a kind of metalanguage for machine code and assembly language. The DSL used for pattern files is a basic ISADL (ISA Description Language).
 
 If you find defining pattern files difficult, you can write them as string literals, passing only the minimum number of operands to the expression evaluation.
 
@@ -453,7 +453,7 @@ range error.
 .check::x::r1,r2,r3
 ```
 
-If you set this, an error will occur if a symbol other than r1,r2, orr3 appears at the position of x.
+If you set this, an error will occur if a symbol other than r1, r2, or r3 appears at the position of x.
 
 To clear .check, use
 
@@ -1284,9 +1284,9 @@ NOP
 
 ### Comments
 
-* Sorry for original notation.
+* Apologies for the unconventional notation.
 
-* While this is an unreasonable request, it does not support quantum computers or LISP machines. The assembly language for quantum computers is called quantum assembly, not assembly language. Programs for LISP machines are not assembly language.
+* It may be an unreasonable thing to ask for, but axx does not support quantum computers or LISP machines. The assembly language for quantum computers is called quantum assembly, not assembly language, and programs for LISP machines are not assembly language either.
 
 * From homemade processors to supercomputers, please feel free to use it.
 
@@ -1294,7 +1294,7 @@ NOP
 
 * Currently, only quadruple-precision floating-point numbers can be handled as constants. This is due to the Python 3 specification. It would be great if Python 4 could handle quadruple-precision floating-point numbers.
 
-*  Macro functionality is builtin but to cover all assembly languages, a high-performance macro processor is needed to translate high-level assembly languages such as functional and structured assembly languages into imperative assembly language.
+* Macro functionality is built in, but to cover all assembly languages, a high-performance macro processor is needed to translate high-level assembly constructs — such as functional and structured assembly languages — into imperative assembly language.
 
 * Specifying the `-i` option imports labels from a TSV file. Specifying the `-e` option exports the labels specified in `.export`, along with the section/segment to which they belong, to a TSV file.
 
@@ -1303,20 +1303,20 @@ NOP
 ### Unimplemented Items
 
 * If one were to prepare pattern files for axx and add advanced structured macros and optimization features, it would become a truly impressive system; however, since it is difficult for a single individual to cover the full range of structured assembly-style macros, I hope someone else will take on the task. I would be delighted to see this realized.
-* 
+
 ### axx2 (the next generation of axx) concept. Explanation of pattern files (processor description files). Feature not available now.
 
 - Using a more descriptive metalanguage for pattern files would improve readability, eliminate dependency on evaluation order, make control statements easier to write, and make processor description file debugging easier. However, pattern data is more intuitive. Further generalizing the metalanguage and using a descriptive metalanguage for pattern files, adding string literals, string operations, and numeric operations to binary_list, and adding control statements, would enable the generation of intermediate languages and converters between assembly languages. In this case, the binary_list would be renamed object_list, and the pattern file would be renamed processor_specification_file. The metalanguage would be a multi-line description language rather than pattern data. This is feasible. Apparently, someone is currently working on it based on axx. Even in pattern files, you can write macros smartly by setting a='MOV b,c', assigning commands (strings) to character variables (currently lowercase letters, but if you expand this to what we normally call symbols), and writing them in binary_list. Allowing loop structures makes debugging difficult if an infinite loop occurs during processing within axx.py, but allowing evaluation only in pattern files simplifies debugging and allows loop and branch structures. Turing-completeness allows processing of any processor architecture. Lisp machines are also possible in principle. Self-reference checks are required. Use expand(a) to expand. For example, if a='b ; c' b='MOV AX,d' c='JMPC e', the result becomes 'MOV AX,d ; JMPC e'. Use expression(a) to evaluate the expression, and label: to define the label. Keeping labels separate in the processor description file and the assembly file eliminates the need to worry about the same label appearing in both. Meta-processing like EPIC is solved by enumerating variables. Making it a descriptive metalanguage requires drastic rewriting. If the assembler's processor characteristic description file becomes complex, it becomes difficult to make the file compatible with General Disassembler.
 
 ### Request
 
-If you find a bug, I would appreciate it if you could let me know how axx won't work.
+If you find a bug, I would appreciate it if you could let me know what isn't working in axx.
 
 ### Acknowledgements
 
 I would like to express my gratitude to my mentor, Junichi Hamada, and Tokyo Denshi Sekkei, who gave me the problems and hints, the University of Electro-Communications, the computer scientists and engineers, Qiita, Google, IEEE, The Alan Turing Institute and some unforgettable people. I received a passing grade from Emeritus professor Kameda of the Information Processing Society of Japan. Thank you very much.
 
-### English is not my mother tongue so this document is translated by google translation. there may be some mistakes and sorry for my broken English.
+### English is not my mother tongue, so this document was translated with Google Translate. There may be some mistakes, and I apologize for my broken English.
 
 ### Mascot Character
 
