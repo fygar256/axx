@@ -8470,17 +8470,37 @@ static void rb_sleb(RB*r,int64_t v){ for(;;){ uint8_t b=(uint8_t)(v&0x7f); v>>=7
 static void rb_w2(RB*r,uint16_t v,int is_le){ uint8_t t[2]; weo_w2(t,v,is_le); rb_app(r,t,2); }
 static void rb_w4(RB*r,uint32_t v,int is_le){ uint8_t t[4]; weo_w4(t,v,is_le); rb_app(r,t,4); }
 static void rb_w8(RB*r,uint64_t v,int is_le){ uint8_t t[8]; weo_w8(t,v,is_le); rb_app(r,t,8); }
+/* Write one address-sized (4 or 8 byte) unsigned field -- used for every
+ * DW_FORM_addr field and the DW_LNE_set_address operand, whose width must
+ * track the CU's address_size (4 for a 32-bit target, 8 for 64-bit). */
+static void rb_waddr(RB*r,uint64_t v,int addr_sz,int is_le){
+    if(addr_sz==8) rb_w8(r,v,is_le); else rb_w4(r,(uint32_t)v,is_le);
+}
 static void drv_add(DRV*v,uint64_t off,int sym,int rtype,int64_t add){
     if(v->len>=v->cap){ v->cap=v->cap?v->cap*2:8; v->d=realloc(v->d,(size_t)v->cap*sizeof(DRE)); if(!v->d){perror("realloc");exit(1);} }
     v->d[v->len++]=(DRE){off,sym,rtype,add};
 }
-/* pack a DRV of relocations into Elf64_Rela payload bytes */
-static uint8_t* dwarf_pack_relas(DRV*v,size_t*outlen,int is_le){
-    size_t n=(size_t)v->len*24; uint8_t*b=calloc(1,n?n:1);
+/* Pack a DRV of DWARF address relocations into Elf64_Rela/Elf32_Rela
+ * (explicit addend) or Elf64_Rel/Elf32_Rel (no addend field -- already
+ * baked into the section bytes by the caller) payload bytes, matching the
+ * exact on-disk convention write_elf_obj() uses for ordinary code
+ * relocations against the same machine/class (see _reloc_entsz and the
+ * rela_bufs loop above): Elf64 r_info is sym<<32|type, Elf32 r_info is
+ * (sym&0xffffff)<<8|type. */
+static uint8_t* dwarf_pack_relocs(DRV*v,size_t*outlen,int is_le,int is_elf64,int is_rela){
+    size_t entsz = is_elf64 ? (is_rela?24:16) : (is_rela?12:8);
+    size_t n=(size_t)v->len*entsz; uint8_t*b=calloc(1,n?n:1);
     for(int i=0;i<v->len;i++){
-        uint8_t*p=b+(size_t)i*24;
-        uint64_t rinfo=((uint64_t)v->d[i].sym<<32)|((uint32_t)v->d[i].rtype);
-        weo_w8(p,v->d[i].off,is_le); weo_w8(p+8,rinfo,is_le); weo_w8s(p+16,v->d[i].addend,is_le);
+        uint8_t*p=b+(size_t)i*entsz;
+        if(is_elf64){
+            uint64_t rinfo=((uint64_t)v->d[i].sym<<32)|((uint32_t)v->d[i].rtype);
+            weo_w8(p,v->d[i].off,is_le); weo_w8(p+8,rinfo,is_le);
+            if(is_rela) weo_w8s(p+16,v->d[i].addend,is_le);
+        } else {
+            uint32_t rinfo=((uint32_t)(v->d[i].sym&0xffffff)<<8)|((uint8_t)v->d[i].rtype);
+            weo_w4(p,(uint32_t)v->d[i].off,is_le); weo_w4(p+4,rinfo,is_le);
+            if(is_rela) weo_w4(p+8,(uint32_t)v->d[i].addend,is_le);
+        }
     }
     *outlen=n; return b;
 }
@@ -8766,30 +8786,31 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int _i=0;_i<2;_i++){ dbg_rela[_i]=(DREL){NULL,0,NULL,0}; }
 
     const ElfMachineInfo *_mtbl_dbg = elf_machine_find(machine);
-    /* Use the *effective* class (native class, unless overridden by -f),
-     * not just _mtbl_dbg->elfclass -- what actually gets written to disk
-     * above (_elfclass/_is_elf64) is what must be 64-bit here. A 64-bit
-     * machine forced down to ELF32 via `-f 32` (e.g. `-m 62 -f 32`) hits
-     * this guard too, since these 8-byte addresses would be just as
-     * structurally wrong in that ELFCLASS32 container. */
-    if(st->gen_debug && st->line_map_len>0 && (!_mtbl_dbg || !_is_elf64)){
-        /* This DWARF builder hardcodes 8-byte (DW_FORM_addr) addresses
-         * throughout, which is only correct for a 64-bit target -- mirrors
-         * axx.py's _build_dwarf_sections() early-return for the same
-         * reason. Emitting it for a 32-bit machine would produce
-         * structurally-wrong-width DWARF instead of just incomplete DWARF,
-         * so refuse rather than silently corrupt it. */
-        axx_diagf(0, 0, " warning - DWARF debug info (-g) is not yet supported for "
-                   "32-bit ELF output (machine %d, effective ELF class %d); "
-                   "skipping debug sections.\n", machine, _elfclass);
+    if(st->gen_debug && st->line_map_len>0 && !_mtbl_dbg){
+        /* Unknown machine: no dwarf_abs/is_rela entry to build correct
+         * relocations against, so there's nothing safe to emit. */
+        axx_diagf(0, 0, " warning - DWARF debug info (-g) is not supported for "
+                   "unknown machine %d; skipping debug sections.\n", machine);
     }
-    if(st->gen_debug && st->line_map_len>0 && _mtbl_dbg && _is_elf64){
+    if(st->gen_debug && st->line_map_len>0 && _mtbl_dbg){
         /* growable raw byte buffer */
 
         /* relocation accumulator for debug sections */
 
-        /* 64-bit absolute relocation type per arch, from ELF_MACHINES
-         * (axx.py port: single source of truth). */
+        /* addr_sz/is_rela_dbg select the on-disk address width and the
+         * RELA-vs-REL framing exactly the way _is_elf64/_is_rela_w already
+         * do for ordinary code relocations above -- DWARF's address
+         * relocations are just more absolute relocations against section
+         * symbols, sized and shaped to match the *effective* class (native
+         * class, unless overridden by -f) that actually gets written to
+         * disk, same as everywhere else in this function. */
+        int addr_sz = _is_elf64 ? 8 : 4;
+        int is_rela_dbg = _is_rela_w;
+
+        /* absolute relocation type per arch, from ELF_MACHINES (axx.py
+         * port: single source of truth) -- already the *native pointer
+         * width* reloc (abs32 for a 32-bit-class machine, abs64 for a
+         * 64-bit-class one), so no separate 32-bit variant is needed. */
         int abs64 = _mtbl_dbg->dwarf_abs;
 
         /* ---- .debug_abbrev ---- */
@@ -8828,7 +8849,11 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         rb_cstr(&die,cu_name);
         rb_cstr(&die,cwd);
         if(primary_idx>0) drv_add(&info_relas,die.len,primary_idx,abs64,0);
-        rb_w8(&die,0,_is_le);                 /* low_pc (relocated) */
+        rb_waddr(&die,0,addr_sz,_is_le);      /* low_pc (relocated; addend
+                                                * is always 0 here, so the
+                                                * RELA placeholder and the
+                                                * REL real value are the
+                                                * same bytes either way) */
         rb_w8(&die,primary_size,_is_le);      /* high_pc (data8)    */
         rb_w4(&die,0,_is_le);                 /* stmt_list = 0      */
         for(int i=0;i<nl;i++){
@@ -8838,14 +8863,17 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
             rb_uleb(&die,2);
             rb_cstr(&die,larr[i].name);
             drv_add(&info_relas,die.len,(int)sr.shndx,abs64,(int64_t)sr.sv);
-            rb_w8(&die,0,_is_le);
+            /* RELA: zero placeholder, real value lives in the relocation
+             * entry's addend. REL: no addend field exists, so the value
+             * must be baked into the field itself. */
+            rb_waddr(&die,is_rela_dbg?0:sr.sv,addr_sz,_is_le);
         }
         rb_uleb(&die,0);               /* terminate CU children */
         RB info; rb_init(&info);
         rb_w4(&info,(uint32_t)(2+4+1+die.len),_is_le); /* unit_length */
         rb_w2(&info,4,_is_le);                          /* version */
         rb_w4(&info,0,_is_le);                          /* debug_abbrev_offset */
-        rb_u8(&info,8);                          /* address_size */
+        rb_u8(&info,(uint8_t)addr_sz);           /* address_size */
         size_t info_prefix=info.len;             /* 4+2+4+1 = 11 */
         rb_app(&info,die.b,die.len);
         free(die.b);
@@ -8889,9 +8917,9 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
              * addr_to_word_offset()で断片を跨いだ累積オフセットを使う
              * (該当する断片が見つからない場合は0にフォールバックする)。 */
             uint64_t first_off = dwarf_word_offset(st, csecs[s].name, rows[0].wpc, bpw);
-            rb_u8(&prog,0); rb_uleb(&prog,1+8); rb_u8(&prog,2);   /* DW_LNE_set_address */
+            rb_u8(&prog,0); rb_uleb(&prog,1+(uint64_t)addr_sz); rb_u8(&prog,2);   /* DW_LNE_set_address */
             drv_add(&line_relas, prog_base+prog.len, s+1, abs64, (int64_t)first_off);
-            rb_w8(&prog,0,_is_le);
+            rb_waddr(&prog,is_rela_dbg?0:first_off,addr_sz,_is_le);
             uint64_t cur_off=first_off; int cur_line=1, cur_file=1;
             for(int i=0;i<cnt;i++){
                 uint64_t boff = dwarf_word_offset(st, csecs[s].name, rows[i].wpc, bpw);
@@ -8921,8 +8949,8 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         int info_pi=n_dbg_prog; dbg_prog[n_dbg_prog++]=(DSEC){".debug_info",info.b,info.len};
         int line_pi=n_dbg_prog; dbg_prog[n_dbg_prog++]=(DSEC){".debug_line",line.b,line.len};
         for(int i=0;i<info_relas.len;i++) info_relas.d[i].off += info_prefix;
-        if(info_relas.len>0){ size_t L; uint8_t*B=dwarf_pack_relas(&info_relas,&L,_is_le); dbg_rela[n_dbg_rela++]=(DREL){".rela.debug_info",info_pi,B,L}; }
-        if(line_relas.len>0){ size_t L; uint8_t*B=dwarf_pack_relas(&line_relas,&L,_is_le); dbg_rela[n_dbg_rela++]=(DREL){".rela.debug_line",line_pi,B,L}; }
+        if(info_relas.len>0){ size_t L; uint8_t*B=dwarf_pack_relocs(&info_relas,&L,_is_le,_is_elf64,is_rela_dbg); dbg_rela[n_dbg_rela++]=(DREL){is_rela_dbg?".rela.debug_info":".rel.debug_info",info_pi,B,L}; }
+        if(line_relas.len>0){ size_t L; uint8_t*B=dwarf_pack_relocs(&line_relas,&L,_is_le,_is_elf64,is_rela_dbg); dbg_rela[n_dbg_rela++]=(DREL){is_rela_dbg?".rela.debug_line":".rel.debug_line",line_pi,B,L}; }
         free(info_relas.d); free(line_relas.d);
     }
     /* add debug section names to shstrtab (must be before offset computation) */
@@ -9046,12 +9074,20 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     }
     weo_shdr(fp,_is_le,_is_elf64,str_noff,3,0,0,str_fo,strtab_bb.len,0,0,1,0);
     weo_shdr(fp,_is_le,_is_elf64,shstr_noff,3,0,0,shstr_fo,shstr.len,0,0,1,0);
-    /* DWARF debug section headers (PROGBITS then RELA). */
+    /* DWARF debug section headers (PROGBITS then RELA/REL) -- same
+     * SHT_RELA/SHT_REL, alignment and entsize convention as the ordinary
+     * code-relocation sections above (_rel_sh_type/_word_align/
+     * _reloc_entsz), since the DWARF builder packed these relocations
+     * against the same machine/class. */
     for(int i=0;i<n_dbg_prog;i++)
         weo_shdr(fp,_is_le,_is_elf64,dbg_prog_noff[i],1,0,0,dbg_prog_fo[i],dbg_prog[i].len,0,0,1,0);
+    {
+    uint32_t _dbg_word_align = _is_elf64?8:4;
+    uint32_t _dbg_rel_sh_type = _is_rela_w?4:9;   /* SHT_RELA : SHT_REL */
     for(int i=0;i<n_dbg_rela;i++)
-        weo_shdr(fp,_is_le,_is_elf64,dbg_rela_noff[i],4,0x40,0,dbg_rela_fo[i],dbg_rela[i].len,
-                 (uint32_t)sym_shidx,(uint32_t)(dbg_base+1+dbg_rela[i].target),8,24);
+        weo_shdr(fp,_is_le,_is_elf64,dbg_rela_noff[i],_dbg_rel_sh_type,0x40,0,dbg_rela_fo[i],dbg_rela[i].len,
+                 (uint32_t)sym_shidx,(uint32_t)(dbg_base+1+dbg_rela[i].target),_dbg_word_align,(uint64_t)_reloc_entsz);
+    }
     fclose(fp);
     fprintf(stderr,"elf: wrote %s (%d section(s), %d %s section(s), %d symbol(s)%s)\n",
             path,ncs,nrela,_is_rela_w?"rela":"rel",nsyms, n_dbg_prog?", +DWARF debug":"");

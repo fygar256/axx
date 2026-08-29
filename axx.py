@@ -213,9 +213,8 @@ ERRORS = [
 # `extern_default` is the relocation type a bare `.EXTERN label` (no
 # `::reloctype`) gets. `dwarf_abs` is the relocation type representing an
 # absolute native-pointer-width address, used for DWARF `.debug_info`/
-# `.debug_line` address relocations (`-g`); DWARF generation on a 32-bit
-# target is not yet implemented (see `_build_dwarf_sections`) so this is
-# presently only consulted for `elfclass == 2` machines.
+# `.debug_line` address relocations (`-g`); `_build_dwarf_sections` uses
+# this for both 32- and 64-bit targets, sized to the effective ELF class.
 #
 # Confidence note: x86_64(62)/i386(3)/ARM(40)/AArch64(183)/PowerPC(20)/
 # RISC-V(243) reproduce this assembler's original, already-in-use numbering
@@ -7188,26 +7187,40 @@ class Assembler:
         _mach_tbl_dw = ELF_MACHINES.get(machine)
         # The *effective* class (native class, unless overridden by -f) is
         # what actually gets written to disk in write_elf_obj() -- so that,
-        # not just the machine's conventional class, is what must be 2 here.
+        # not just the machine's conventional class, is what decides the
+        # address width (`addr_sz`) every address-sized field below uses.
         # A 64-bit machine forced down to ELF32 via `-f 32` (e.g. `-m 62
-        # -f 32`) hits this guard too, since this builder's 8-byte addresses
-        # would be just as structurally wrong in that ELFCLASS32 container.
+        # -f 32`), or a 32-bit machine forced up to ELF64, is honored the
+        # same way write_elf_obj() honors it for ordinary sections.
         _native_dw   = _mach_tbl_dw['elfclass'] if _mach_tbl_dw else 2
         _eff_class_dw = getattr(self.state, 'elf_class', None) or _native_dw
-        if _mach_tbl_dw is None or _eff_class_dw != 2:
-            # This DWARF builder hardcodes 8-byte (DW_FORM_addr) addresses
-            # throughout (compile-unit low_pc/high_pc, label DIEs, the line
-            # program's extended-opcode address op), which is only correct
-            # for a 64-bit target. Emitting it for a 32-bit machine would
-            # produce structurally-wrong-width DWARF instead of just
-            # incomplete DWARF, so refuse rather than silently corrupt it.
-            self.state.diag(f" warning - DWARF debug info (-g) is not yet supported for "
-                 f"32-bit ELF output (machine {machine}, effective ELF class "
-                 f"{_eff_class_dw}); skipping debug sections.", set_error=False)
+        if _mach_tbl_dw is None:
+            # Unknown machine: no dwarf_abs/is_rela entry to build correct
+            # relocations against, so there's nothing safe to emit.
+            self.state.diag(f" warning - DWARF debug info (-g) is not supported for "
+                 f"unknown machine {machine}; skipping debug sections.", set_error=False)
             return [], []
 
         import struct as _struct
         _pk = '<' if self.state.endian != 'big' else '>'
+
+        # is_elf64_dw/addr_sz select the on-disk address width (DW_FORM_addr
+        # size, DW_LNE_set_address operand size, CU header address_size);
+        # is_rela_dw selects RELA (explicit per-entry addend, `.rela.debug_*`)
+        # vs REL (addend baked into the field bytes, `.rel.debug_*`) framing,
+        # exactly mirroring write_elf_obj's `_is_elf64`/`_is_rela` for
+        # ordinary code relocations -- DWARF's address relocations are just
+        # more absolute relocations against section symbols, so they follow
+        # the same per-target psABI convention as everything else in the
+        # object file.
+        is_elf64_dw = (_eff_class_dw == 2)
+        addr_sz = 8 if is_elf64_dw else 4
+        is_rela_dw = _mach_tbl_dw.get('is_rela', True)
+
+        def _pack_addr(v):
+            """Pack one address-sized (`addr_sz` bytes) unsigned field."""
+            v &= (1 << (addr_sz * 8)) - 1
+            return _struct.pack(f'{_pk}I', v) if addr_sz == 4 else _struct.pack(f'{_pk}Q', v)
 
         abs64 = _mach_tbl_dw['dwarf_abs']
 
@@ -7314,7 +7327,9 @@ class Assembler:
         die += comp_dir.encode() + b'\x00'
         if primary_idx:
             info_relas.append((len(die), primary_idx, abs64, 0))
-        die += b'\x00' * 8
+        die += _pack_addr(0)  # low_pc: addend is always 0 here, so the
+                               # RELA placeholder and the REL real value
+                               # (both 0) are the same bytes either way.
         die += _struct.pack(f'{_pk}Q', primary_size & 0xFFFFFFFFFFFFFFFF)
         die += _struct.pack(f'{_pk}I', 0)
         for name, *_rest in sorted(self.state.labels.items()):
@@ -7334,12 +7349,15 @@ class Assembler:
             die += _uleb(2)
             die += name.encode() + b'\x00'
             info_relas.append((len(die), sidx, abs64, off))
-            die += b'\x00' * 8
+            die += _pack_addr(0 if is_rela_dw else off)  # RELA: placeholder,
+                               # real value lives in the relocation entry's
+                               # addend. REL: no addend field exists, so the
+                               # value must be baked into the field itself.
         die += _uleb(0)
 
         info_body = (_struct.pack(f'{_pk}H', 4)
                      + _struct.pack(f'{_pk}I', 0)
-                     + bytes([8])
+                     + bytes([addr_sz])
                      + bytes(die))
         debug_info = _struct.pack(f'{_pk}I', len(info_body)) + info_body
         _info_prefix = 4 + 2 + 4 + 1
@@ -7391,9 +7409,9 @@ class Assembler:
                 _o = self._addr_to_word_offset(_name, wpc)
                 return _o if _o is not None else 0
             first_off = _woff(rows[0][0]) * bpw
-            prog += b'\x00' + _uleb(1 + 8) + b'\x02'
+            prog += b'\x00' + _uleb(1 + addr_sz) + b'\x02'
             line_relas.append((prog_base + len(prog), sidx, abs64, first_off))
-            prog += b'\x00' * 8
+            prog += _pack_addr(0 if is_rela_dw else first_off)
             cur_off = first_off
             cur_line = 1
             cur_file = 1
@@ -7420,19 +7438,35 @@ class Assembler:
                      + bytes(prog))
         debug_line = _struct.pack(f'{_pk}I', len(line_body)) + line_body
 
-        def _pack_relas(entries):
+        def _pack_dbg_relocs(entries):
             """Pack `(offset, symbol_idx, reloc_type, addend)` tuples into raw
-            Elf64_Rela records, clamping the addend to signed-64 range."""
+            Elf64_Rela/Elf32_Rela (explicit addend) or Elf64_Rel/Elf32_Rel (no
+            addend field -- already baked into the section bytes above)
+            records, selected by `is_elf64_dw`/`is_rela_dw` exactly the way
+            write_elf_obj's `_pack_rela`/`_pack_rel` select for ordinary code
+            relocations against the same target."""
             out = bytearray()
-            _S64_MAX, _S64_MIN = (1 << 63) - 1, -(1 << 63)
-            for (off, sym, rtype, addend) in entries:
-                r_info = (sym << 32) | (rtype & 0xffffffff)
-                a = addend
-                if a > _S64_MAX:
-                    a = _S64_MAX
-                elif a < _S64_MIN:
-                    a = _S64_MIN
-                out += _struct.pack(f'{_pk}QQq', off, r_info, a)
+            if is_rela_dw:
+                if is_elf64_dw:
+                    _MAX, _MIN = (1 << 63) - 1, -(1 << 63)
+                    for (off, sym, rtype, addend) in entries:
+                        r_info = (sym << 32) | (rtype & 0xffffffff)
+                        a = min(_MAX, max(_MIN, addend))
+                        out += _struct.pack(f'{_pk}QQq', off, r_info, a)
+                else:
+                    _MAX, _MIN = (1 << 31) - 1, -(1 << 31)
+                    for (off, sym, rtype, addend) in entries:
+                        r_info = ((sym & 0xffffff) << 8) | (rtype & 0xff)
+                        a = min(_MAX, max(_MIN, addend))
+                        out += _struct.pack(f'{_pk}IIi', off, r_info, a)
+            else:
+                for (off, sym, rtype, _addend) in entries:
+                    if is_elf64_dw:
+                        r_info = (sym << 32) | (rtype & 0xffffffff)
+                        out += _struct.pack(f'{_pk}QQ', off, r_info)
+                    else:
+                        r_info = ((sym & 0xffffff) << 8) | (rtype & 0xff)
+                        out += _struct.pack(f'{_pk}II', off, r_info)
             return bytes(out)
 
         prog_sections = [
@@ -7440,11 +7474,12 @@ class Assembler:
             ('.debug_info',   debug_info),
             ('.debug_line',   debug_line),
         ]
+        _dbg_prefix = '.rela' if is_rela_dw else '.rel'
         rela_list = []
         if info_relas:
-            rela_list.append(('.rela.debug_info', '.debug_info', _pack_relas(info_relas)))
+            rela_list.append((f'{_dbg_prefix}.debug_info', '.debug_info', _pack_dbg_relocs(info_relas)))
         if line_relas:
-            rela_list.append(('.rela.debug_line', '.debug_line', _pack_relas(line_relas)))
+            rela_list.append((f'{_dbg_prefix}.debug_line', '.debug_line', _pack_dbg_relocs(line_relas)))
 
         return prog_sections, rela_list
 
@@ -7456,7 +7491,7 @@ class Assembler:
         one output section per distinct section name seen (`_CSec`,
         extracting its bytes from the sparse `binary_writer._buffer` via
         `_extract`), appends DWARF debug sections from `_build_dwarf_sections`
-        if enabled (64-bit targets only -- see that method), builds the
+        if enabled (32- and 64-bit targets -- see that method), builds the
         symbol table (locals, then exported/extern globals) and `.rela.*`
         sections for `state.relocations` plus any DWARF relocations, and
         writes the ELF header/section headers/`.shstrtab`/`.strtab`/
@@ -7883,7 +7918,7 @@ class Assembler:
 
         # File layout: Ehdr, then section data (16-byte aligned), rela data
         # (8-byte aligned), symtab, strtab, shstrtab, DWARF sections/relas
-        # (64-bit targets only), then the section header table itself
+        # (32- and 64-bit targets), then the section header table itself
         # (shdr_off) — a conventional ELF32/ELF64 relocatable-object layout
         # that any standard linker can read.
         # SHT_NOBITS (.bss) sections must NOT consume file space.
@@ -8020,10 +8055,16 @@ class Assembler:
                     dbg_prog_name_offs[i], 1, 0, 0,
                     dbg_prog_offsets[i], len(ddata), 0, 0, 1, 0))
             for i, (rname, tname, rdata) in enumerate(dbg_rela):
+                # Same SHT_RELA/SHT_REL, alignment and entsize convention as
+                # the ordinary code-relocation sections above (_rela_sh_type/
+                # _word_align/_REL_ENTSIZE_ACTIVE) -- _build_dwarf_sections
+                # packed these DWARF relocations against the same machine/
+                # class, so they share the same on-disk record format.
                 f.write(_pack_shdr(
-                    dbg_rela_name_offs[i], 4, 0x40, 0,
+                    dbg_rela_name_offs[i], _rela_sh_type, 0x40, 0,
                     dbg_rela_offsets[i], len(rdata),
-                    symtab_shidx, dbg_prog_shndx.get(tname, 0), 8, 24))
+                    symtab_shidx, dbg_prog_shndx.get(tname, 0),
+                    _word_align, _REL_ENTSIZE_ACTIVE))
 
         _dbg_msg = f", {len(dbg_prog)} debug section(s)" if dbg_prog else ""
         _reloc_kind = "rela" if _is_rela else "rel"
@@ -8036,8 +8077,8 @@ class Assembler:
         with `-o` selecting ELF object output (vs. `-b` for raw binary),
         `-f` choosing the ELF class (32/64, default 64), `-e`/`-E`/`-i` for
         label export/import, `-m` for target machine, and `-g` for DWARF
-        debug info generation (only meaningful with `-o`, and currently
-        64-bit only -- see `_build_dwarf_sections`)."""
+        debug info generation (only meaningful with `-o`; supports both
+        32- and 64-bit ELF output -- see `_build_dwarf_sections`)."""
         import argparse
         ap = argparse.ArgumentParser(
             prog='axx',
@@ -8075,7 +8116,7 @@ class Assembler:
                              'selected machine\'s conventional class (e.g. '
                              '-m 62 -f 32, the real x32 ABI\'s EM_X86_64-in-'
                              'ELFCLASS32 layout) is honored, with a warning. '
-                             '-g/--gen-debug DWARF output currently requires 64.')
+                             '-g/--gen-debug DWARF output supports both 32 and 64.')
         ap.add_argument('-m', dest='elf_machine', type=int, default=62,
                         metavar='MACHINE',
                         help='ELF e_machine value (default 62=EM_X86_64). '
