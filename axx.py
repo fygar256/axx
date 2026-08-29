@@ -1,38 +1,38 @@
 #!/usr/bin/env python3
-"""axx: a general-purpose, pattern-file-driven assembler.
+"""axx — パターンファイル駆動の汎用アセンブラ。
 
-Unlike a conventional assembler that hardcodes one instruction set, axx reads
-an instruction-set description (a ".axx" pattern file) that maps mnemonic
-syntax to binary encodings, and applies it to an assembly source file. This
-lets the same engine target arbitrary ISAs (x86_64, ARM64, Z80, VLIW/EPIC
-architectures, ...) just by swapping the pattern file.
+通常のアセンブラが特定の命令セットをコードに埋め込むのに対し、axx は
+命令セットの仕様を外部のテキストファイル（`.axx` パターンファイル）から
+読み込む。パターンファイルは「ニーモニックの書式 → バイナリエンコーディング」
+の対応を1行1エントリで記述したもので、これを差し替えるだけで同じエンジンが
+任意の ISA（x86_64 / ARM64 / Z80 / VLIW・EPIC 等）を扱える。
 
-High-level pipeline (see Assembler.run() near the bottom of this file):
-  1. Read and parse the pattern file (PatternFileReader) into a list of
-     pattern entries (mnemonic template -> encoding expression, plus
-     directives like .setsym/.bits/.vliw that configure the assembler).
-  2. Pass 1: run the source through the pattern matcher repeatedly
-     ("relaxation") until label addresses stop changing, so that
-     variable-length instructions (e.g. short vs. near jumps) converge to
-     their final size.
-  3. Pass 2: re-run the source one final time with addresses now known,
-     emitting the actual object bytes and (if requested) ELF relocatable
-     object output (ELF64 by default, or ELF32 via -f 32; see
-     Assembler.write_elf_obj()), DWARF line-number info, and an
-     export/import label file for splitting a program across multiple
-     invocations.
+    axx.py <パターンファイル.axx> <ソース.s> -o <出力.o>
 
-Sections are tracked as a sequence of (name, start_pc, length) fragments
-rather than one contiguous range per name, because a source file can leave a
-section and re-enter it later (e.g. .text -> .data -> .text); the true
-section-relative position of anything defined in a later fragment must
-account for the other sections interleaved before it.
+全体の流れ（Assembler.run() が入口）:
+
+  1. パターンファイル読み込み        PatternFileReader.readpat()
+       `.INCLUDE` を再帰展開し、各行を "::" 区切りで最大6フィールドに分解する。
+  2. マクロ展開                      MacroPreprocessor.expand()
+       `!if` / `!while` / `!def` 等の行指向マクロを先に潰しておく。
+  3. パス1（サイズ収束）             最大 MAX_RELAX 回反復
+       前方参照ラベルの値が確定しないと命令長が決まらない（可変長命令）ため、
+       「前回の反復で得た値」を推定値として使い、全ラベルのアドレスが前回と
+       一致するまで繰り返す。これをリラクゼーションと呼ぶ。
+  4. パス2（コード生成）             1回のみ
+       確定したアドレスで実際のバイト列と ELF リロケーションを生成する。
+       パス1とパス2でアドレスがずれていたら明示的にエラーにする（誤ったバイナリを
+       黙って出力しない安全策）。
+  5. 出力                            ELF オブジェクト / 生バイナリ / ラベル TSV
+
+対になる C 移植版が同じディレクトリの caxx.c にあり、両者は同一の入力に対して
+同一のバイト列を出すことを目標に保守されている。
 """
 
 
 from decimal import Decimal, localcontext
 try:
-    import readline  # noqa: F401  (side effect: line editing for input())
+    import readline
 except ImportError:
     pass
 import ast
@@ -47,27 +47,25 @@ import tempfile
 import uuid
 
 
-# Marks the "no previous relaxation pass yet" state, distinct from any real
-# label-address snapshot (which is always a plain dict), so the first Pass 1
-# iteration can be told apart from later ones without a separate flag.
+# パス1のリラクゼーション中、「まだ一度も値が確定していない」ことを
+# 「値が 0 である」と区別するための番兵。None や 0 を使うと、正当に 0 番地に
+# あるラベルと区別できなくなる。
 _RELAXATION_SENTINEL = object()
 
 
-# The assembler instance currently running, published by AssemblerState so
-# that the module-level static helpers below (StringUtils, _is_undef_derived,
-# ...) can reach the same diagnostic funnel every method-level call site uses.
-# Without this they would have to print directly and would silently bypass the
-# _in_match_attempt / should_report_errors() gates -- exactly the leak the
-# funnel exists to make impossible.
+# 現在動作中の AssemblerState。モジュール関数の diag() から参照される。
+# 「エラーを今表示してよいパスか（パス2か対話モードか）」の判定と had_error の
+# 設定は AssemblerState 側が持っているため、状態を持たない場所から診断を出す
+# ときの橋渡しとして使う。
 _ACTIVE_STATE = None
 
 
 def diag(text, set_error=True, force=False):
-    """Module-level entry point to AssemblerState.diag().
+    """診断メッセージを1本化して出す入口。
 
-    Used by the static helpers that hold no `state` reference.  If no
-    assembler is running (unit tests, import-time use) the message is printed
-    unconditionally, since there is no pass or match context to gate on.
+    状態がまだ無い（起動直後など）ときは素直に stderr へ出し、そうでなければ
+    AssemblerState.diag() に委譲して「表示してよいパスか」の判定と had_error の
+    設定を任せる。set_error=True なら、表示された時点でビルドは失敗扱いになる。
     """
     st = _ACTIVE_STATE
     if st is None:
@@ -77,65 +75,55 @@ def diag(text, set_error=True, force=False):
 
 
 def diag_error(msg, force=False):
+    """" error - ..." 形式のエラー。表示されるとビルドは失敗（出力を書かない）。"""
     return diag(f" error - {msg}", set_error=True, force=force)
 
 
 def diag_warning(msg, force=False):
+    """" warning - ..." 形式の警告。表示されてもビルドは継続する。"""
     return diag(f" warning - {msg}", set_error=False, force=force)
 
 
+# 式を評価している文脈。パターンファイル側の式か、アセンブリソース側の式かで
+# 使える記法（`!!!` 等のパターン専用トークン）が変わる。
 EXP_PAT = 0
 EXP_ASM = 1
-exp_typ = 'i'
+exp_typ = 'i'          # 'i'=整数モード / 'f'=浮動小数点モード
 
 
-# Placeholder characters standing in for the pattern-file bracket escapes
-# "[[" / "]]" once they've been substituted out of a line, so the rest of the
-# parser can treat them as ordinary single characters instead of two-char
-# sequences.
+# パターン中の "[[" / "]]"（省略可能グループ）を1文字に潰した内部表現。
+# 2文字のままだと以降の走査が全て2文字先読みを強いられるため、
+# 印字不可能な1文字に置き換えてから扱う。
 OB = chr(0x90)
 CB = chr(0x91)
 
-# Placeholder characters standing in for a genuine (unescaped) source-line
-# VLIW "!!" slot separator / "!!!!" stop marker, once StringUtils.
-# resolve_vliw_escapes() has told them apart from a "\!\!"-escaped literal
-# "!!" earlier in the SAME left-to-right pass. Every later, independent scan
-# for a VLIW boundary (lineassemble()'s post-match check, VLIWProcessor.
-# vliwprocess()'s own slot-scanning) looks for these sentinels instead of
-# raw "!!"/"!!!!" text, so a resolved-but-literal "!!" coming from an escape
-# can never be re-interpreted as a real separator by a later pass that has
-# no memory of which "!!" was escaped.
+# ソース行の「本物の」VLIW スロット区切り "!!" / 終端 "!!!!" を1文字に潰した内部表現。
+# `\!\!` とエスケープされた「文字としての !!」と区別するために使う。
+# 詳しくは StringUtils.resolve_vliw_escapes() を参照。
 VLIW_SEP = chr(0x92)
 VLIW_STOP = chr(0x93)
 
 
-# UNDEF is deliberately an enormous (but finite) integer rather than None/NaN:
-# label values flow through ordinary arithmetic (label+4, label-$$, etc.), and
-# using a real integer lets "undefined" propagate through +,-,*,... without
-# every call site having to special-case a non-numeric sentinel. Any
-# real-world label/expression value should stay far below
-# _UNDEF_DERIVED_THRESHOLD, so a result that lands at or above it is treated
-# as "derived from an undefined value" (see _is_undef_derived below).
+# 未定義ラベルの値を表す番兵。None ではなく巨大な整数にしてあるのは、
+# ラベル値が `label+4` や `label-$$` のように普通の算術に流れ込むため。
+# 整数にしておけば例外を出さずに「未定義性」が計算結果へ伝播していく。
 UNDEF = (1 << 1024) - 1
 VAR_UNDEF = 0
 
+# UNDEF から算術で派生した値を「未定義由来」と判定する閾値。
+# UNDEF そのものと完全一致しなくても（UNDEF+4 等）、この大きさなら未定義由来とみなす。
 _UNDEF_DERIVED_THRESHOLD = 1 << 768
 
 
-# Below this, a huge value is assumed to be legitimate (e.g. a 256-bit
-# constant); at/above it we start treating it as UNDEF-derived. The gap
-# between the two thresholds is just a buffer so the one-time warning below
-# fires before a value could plausibly reach _UNDEF_DERIVED_THRESHOLD.
+# axx は 256bit 整数・128bit 浮動小数点まで正当に扱うため、2**256 程度までは
+# 本物の値でありうる。その帯域に入った値については、上の閾値ヒューリスティックが
+# 誤判定しうることを一度だけ警告する。
 _UNDEF_SANE_CEILING = 1 << 256
 _undef_ceiling_warned = False
 
 
 def _is_undef_derived(v):
-    """True if v is UNDEF itself, or so large it must have propagated from
-    an UNDEF value through arithmetic (e.g. UNDEF - 4). Warns once (not per
-    occurrence) if a value is large enough to be suspicious but still below
-    the derived-from-UNDEF threshold, since that could mean a real huge
-    constant is about to be misclassified."""
+    """値が UNDEF（未定義ラベル）に由来するか判定する。"""
     global _undef_ceiling_warned
     if v == UNDEF:
         return True
@@ -151,11 +139,12 @@ def _is_undef_derived(v):
 
 @functools.lru_cache(maxsize=None)
 def _lead_caps(pat_text):
-    """Cheap prefilter: extract a pattern's leading run of literal capital
-    letters (skipping spaces) so obviously-mismatched patterns can be
-    skipped before paying for full match0() (which is combinatorial in
-    the number of optional groups). Pattern text is immutable once the
-    pattern file is read, so results are memoized."""
+    """パターン先頭の連続する大文字（＝ニーモニック部分）を取り出す。
+
+    パターン照合は1行につき数千個のパターンを試すため、本格的な照合に入る前の
+    足切りに使う。ソース行の先頭がこの文字列で始まっていなければ、そのパターンは
+    絶対にマッチしないので即座に捨てられる。結果は lru_cache で使い回す。
+    """
     p = []
     for ch in pat_text:
         if ch in CAPITAL:
@@ -167,6 +156,8 @@ def _lead_caps(pat_text):
     return ''.join(p)
 
 
+# パターン記法の基本規約: 大文字＝そのまま照合するリテラル（ニーモニック）、
+# 小文字＝.setsym で定義されたシンボル（レジスタ名等）を取るプレースホルダ。
 CAPITAL = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 LOWER = "abcdefghijklmnopqrstuvwxyz"
 DIGIT = '0123456789'
@@ -174,6 +165,8 @@ XDIGIT = "0123456789ABCDEF"
 ALPHABET = LOWER + CAPITAL
 
 
+# パターンファイルの第2フィールド（エラー条件）が返す番号 → メッセージ。
+# 例: `ADD A,R!n :: n>7;5 :: ...` は n>7 のとき番号5（レジスタ範囲外）を報告する。
 ERRORS = [
     "",
     "Invalid syntax.",
@@ -185,67 +178,31 @@ ERRORS = [
 ]
 
 
-# ELF e_machine relocation-numbering tables: everything this assembler needs
-# to emit correct ELF32/ELF64 relocatable objects for one target
-# architecture, keyed by e_machine number and selected via `-m`/`--machine`.
+# ---------------------------------------------------------------------------
+# アーキテクチャ別 ELF 情報テーブル
 #
-# `width_guess` {encoded-field-byte-width: reloc type} picks a relocation
-# type from an auto-detected label reference with no explicit `::reloctype`
-# override, mirroring real assemblers' convention that a field the same
-# width as a native call/jmp displacement (traditionally 4 bytes, even on
-# 64-bit targets) most likely IS one, while other widths most likely hold an
-# absolute address/data reference -- this convention is deliberately kept
-# per-architecture rather than derived, since it encodes "the common case for
-# this width on this ISA", not a fact about the relocation numbers.
+# キーは ELF ヘッダの e_machine 値（-m オプションで指定する番号）。
+# 各エントリの意味:
 #
-# `pc_rel` is the set of relocation-type numbers that are PC-relative (vs.
-# absolute) for this machine, consulted when deciding the addend formula.
+#   elfclass       1=ELF32 / 2=ELF64。ヘッダ・シンボル・リロケーション各構造体の
+#                  サイズとフィールド並びが変わる（Elf32_Sym と Elf64_Sym は
+#                  幅だけでなくフィールドの順序自体が異なる点に注意）。
+#   is_rela        True=RELA（加数を専用フィールドに持つ）/ False=REL（加数を
+#                  命令バイト列自体に埋め込む）。i386 と ARM(32) だけが REL。
+#   width_guess    リロケーション対象フィールドのバイト幅 → 既定のリロケーション型。
+#                  ソース側が `::型名` を明示しなかったときに使う。
+#   pc_rel         PC 相対のリロケーション型番号の集合。加数の計算に命令アドレスを
+#                  含める必要があるかどうかの判定に使う。
+#   extern_default `.extern` で宣言された外部シンボル参照の既定型。
+#   named          ソースに書ける記号名（`label::pc32` 等）→ (型番号, バイト幅)。
+#   dwarf_abs      DWARF セクション内の絶対アドレス参照に使う型番号。
 #
-# `named` is `{symbolic name usable in a "::name" override: (reloc type,
-# expected encoded field byte width)}` -- the single source of truth for
-# `.EXTERN`/`.EQU`/the `-i` import-file syntax's `::reloctype` overrides
-# *and* the reverse lookup `-E` export uses to print a symbolic name; the
-# per-name width is what `::reloctype`'s field-width sanity check
-# (`_elf_machine_reloc_bytes`) validates an override against, so it can never
-# drift out of sync with that check the way three independently-maintained
-# copies of the same table previously could (see git history/prior audits).
-#
-# `extern_default` is the relocation type a bare `.EXTERN label` (no
-# `::reloctype`) gets. `dwarf_abs` is the relocation type representing an
-# absolute native-pointer-width address, used for DWARF `.debug_info`/
-# `.debug_line` address relocations (`-g`); `_build_dwarf_sections` uses
-# this for both 32- and 64-bit targets, sized to the effective ELF class.
-#
-# Confidence note: x86_64(62)/i386(3)/ARM(40)/AArch64(183)/PowerPC(20)/
-# RISC-V(243) reproduce this assembler's original, already-in-use numbering
-# exactly (a handful of small additions -- e.g. i386's real R_386_PC16=21 --
-# were made only where needed so a new `::name` override resolves to a
-# working relocation; nothing an existing pattern file already relied on was
-# renumbered). The remaining architectures (PowerPC64, S/390(x), SPARCV9,
-# SuperH, M68K) are new and use well-established psABI relocation numbers
-# from documentation, cross-checked where possible (i386's numbers were
-# verified against a real `gcc -m32`-produced object file); none of them
-# have been exercised against a real cross-linker for these architectures,
-# so treat them as "best effort, structurally valid" rather than
-# field-proven, and report back any discrepancy found in practice.
-#
-# `is_rela` says whether this machine's psABI stores relocation addends
-# explicitly (RELA: a separate addend field per entry, `.rela.NAME`
-# sections, SHT_RELA) or implicitly (REL: no addend field at all --
-# `.rel.NAME` sections, SHT_REL -- the addend instead lives baked directly
-# into the relocated field's bytes, and the linker reads-modifies-writes
-# it). This matters at the byte level, not just the section name: for a REL
-# machine, `write_elf_obj` must patch the *already-encoded* field bytes to
-# hold the addend value that would otherwise have gone in RELA's addend
-# field, since nothing else will ever record that value once the .o is
-# written (see `write_elf_obj`'s REL patching pass). i386's REL convention
-# was confirmed against a real `gcc -m32`-produced object earlier in this
-# file's development. The rest are this assembler's best-effort read of
-# publicly documented psABI conventions, similarly unverified against a
-# real cross-linker -- flag any that turn out wrong.
+# reloc_bytes（型番号→幅）と reverse（型番号→名前）は named から自動生成される。
+# 下の _build_elf_machine_tables() を参照。
+# ---------------------------------------------------------------------------
 _ELF_MACHINE_RAW = {
-    3: dict(     # EM_386 (i386)
-        name='i386', elfclass=1, is_rela=False,   # confirmed via `gcc -m32`
+    3: dict(
+        name='i386', elfclass=1, is_rela=False,
         width_guess={4: 2, 2: 20, 1: 22},
         pc_rel={2, 13, 21, 23},
         extern_default=2,
@@ -258,7 +215,7 @@ _ELF_MACHINE_RAW = {
         },
         dwarf_abs=1,
     ),
-    4: dict(     # EM_68K (M68K)
+    4: dict(
         name='m68k', elfclass=1, is_rela=True,
         width_guess={4: 4, 2: 2, 1: 3},
         pc_rel={4, 5, 6},
@@ -270,7 +227,7 @@ _ELF_MACHINE_RAW = {
         },
         dwarf_abs=1,
     ),
-    20: dict(    # EM_PPC (PowerPC 32-bit)
+    20: dict(
         name='PowerPC', elfclass=1, is_rela=True,
         width_guess={4: 26, 2: 4},
         pc_rel={10, 26},
@@ -283,7 +240,7 @@ _ELF_MACHINE_RAW = {
         },
         dwarf_abs=1,
     ),
-    21: dict(    # EM_PPC64
+    21: dict(
         name='PowerPC64', elfclass=2, is_rela=True,
         width_guess={8: 38, 4: 26, 2: 4},
         pc_rel={10, 26, 44},
@@ -298,7 +255,7 @@ _ELF_MACHINE_RAW = {
         },
         dwarf_abs=38,
     ),
-    22: dict(    # EM_S390 (s390x)
+    22: dict(
         name='s390x', elfclass=2, is_rela=True,
         width_guess={8: 22, 4: 5, 2: 3, 1: 1},
         pc_rel={5, 16, 23},
@@ -309,7 +266,7 @@ _ELF_MACHINE_RAW = {
         },
         dwarf_abs=22,
     ),
-    40: dict(    # EM_ARM (32-bit)
+    40: dict(
         name='ARM', elfclass=1, is_rela=False,
         width_guess={4: 3, 2: 4, 1: 8},
         pc_rel={1, 3},
@@ -321,7 +278,7 @@ _ELF_MACHINE_RAW = {
         },
         dwarf_abs=2,
     ),
-    42: dict(    # EM_SH (SuperH)
+    42: dict(
         name='SuperH', elfclass=1, is_rela=True,
         width_guess={4: 2},
         pc_rel={2},
@@ -329,7 +286,7 @@ _ELF_MACHINE_RAW = {
         named={'abs32': (1, 4), 'pc32': (2, 4), 'rel32': (2, 4)},
         dwarf_abs=1,
     ),
-    43: dict(    # EM_SPARCV9
+    43: dict(
         name='SPARCV9', elfclass=2, is_rela=True,
         width_guess={8: 32, 4: 6, 2: 2, 1: 1},
         pc_rel={4, 5, 6, 46},
@@ -342,7 +299,7 @@ _ELF_MACHINE_RAW = {
         },
         dwarf_abs=32,
     ),
-    62: dict(    # EM_X86_64
+    62: dict(
         name='x86-64', elfclass=2, is_rela=True,
         width_guess={8: 1, 4: 2, 2: 12, 1: 14},
         pc_rel={2, 4, 9, 13, 15, 24},
@@ -356,7 +313,7 @@ _ELF_MACHINE_RAW = {
         },
         dwarf_abs=1,
     ),
-    183: dict(   # EM_AARCH64
+    183: dict(
         name='AArch64', elfclass=2, is_rela=True,
         width_guess={8: 257, 4: 261, 2: 262},
         pc_rel={260, 261, 262},
@@ -369,18 +326,12 @@ _ELF_MACHINE_RAW = {
         },
         dwarf_abs=257,
     ),
-    243: dict(   # EM_RISCV (RV64)
+    243: dict(
         name='RISC-V', elfclass=2, is_rela=True,
         width_guess={8: 2, 4: 1, 2: 34, 1: 33},
         pc_rel=set(),
         extern_default=1,
         named={
-            # abs16/abs8 (34/33) reproduce this assembler's pre-existing
-            # width-guess numbering as-is; unlike the other entries in this
-            # table they are not independently confirmed against psABI
-            # documentation (RISC-V's base spec does not define a plain
-            # absolute 16-/8-bit relocation the way most other ISAs do), so
-            # treat those two specifically as low-confidence.
             'abs64': (2, 8), 'abs32': (1, 4), 'abs16': (34, 2), 'abs8': (33, 1),
         },
         dwarf_abs=2,
@@ -389,14 +340,18 @@ _ELF_MACHINE_RAW = {
 
 
 def _build_elf_machine_tables(raw):
-    """Expand `_ELF_MACHINE_RAW`'s `named` dict of `{name: (reloc_type,
-    width)}` into the two derived views the rest of the assembler actually
-    looks up by: a plain `{name: reloc_type}` map for parsing a `::name`
-    override, and its reverse `{reloc_type: name}` for `-E` export, plus
-    `reloc_bytes` = `{reloc_type: width}` for validating an override against
-    the field it's attached to. Deriving all three from one source (instead
-    of maintaining them as separate hand-written tables, as this file used
-    to) means they can't independently drift out of sync."""
+    """_ELF_MACHINE_RAW から派生ビューを作って完成形のテーブルを返す。
+
+    `named` は "名前 → (型番号, バイト幅)" という1つの表に情報をまとめてあるが、
+    実際に引きたい向きは3通りあるので、ここで展開しておく:
+
+      named       名前 → 型番号          （ソースの `::pc32` を解決する）
+      reloc_bytes 型番号 → バイト幅      （加数の計算に必要）
+      reverse     型番号 → 名前          （-E での TSV 書き出しに使う）
+
+    reverse は setdefault なので、同じ型番号に別名が複数ある場合（`pc32` と
+    `rel32` が同じ型番号を指す等）は先に書いた方が正式名として採用される。
+    """
     out = {}
     for machine, entry in raw.items():
         named_types = {name: rt for name, (rt, _w) in entry['named'].items()}
@@ -411,208 +366,177 @@ def _build_elf_machine_tables(raw):
     return out
 
 
+# 対応アーキテクチャ: i386(3) m68k(4) PowerPC(20) PowerPC64(21) s390x(22)
+# ARM(40) SuperH(42) SPARCV9(43) x86-64(62) AArch64(183) RISC-V(243)
 ELF_MACHINES = _build_elf_machine_tables(_ELF_MACHINE_RAW)
 
 
 class VLIWState:
-    """Configuration and in-progress state for VLIW/EPIC-style instruction
-    packing, set up by the pattern file's .vliw directive and consumed while
-    assembling one "!!"-separated slot group into a single fixed-width
-    packet (see VLIWProcessor.vliwprocess())."""
+    """VLIW / EPIC パケット組み立ての設定と作業状態。
+
+    パターンファイルの `.vliw::<パケット幅>::<命令幅>::<テンプレート幅>::<NOP値>`
+    ディレクティブで設定され、1行に `!!` で区切って並べた複数命令を1つの固定幅
+    パケットに詰め込むために使う。
+    """
 
     def __init__(self):
-        self.instbits = 41       # bit width of one instruction slot within a packet
-        self.nop = []            # filler bytes used to pad an under-full packet
-        self.bits = 128          # total packet width in bits
-        self.slotset = []        # valid slot-count -> template-bits mappings from .vliw
-        self.flag = False        # True once a .vliw directive has configured VLIW mode
-        self.templatebits = 0x00 # width of the packet's template/opcode field
-        self.stop = 0            # set when "!!!!" (end-of-packet marker) is seen
-        self.cnt = 1
+        self.instbits = 41        # 命令スロト1個のビット幅
+        self.nop = []             # スロットが余ったときに詰める NOP のバイト列
+        self.bits = 128           # パケット全体のビット幅
+        self.slotset = []         # EPIC: スロットの組み合わせ → テンプレート値
+        self.flag = False         # .vliw が宣言済みか
+        self.templatebits = 0x00  # テンプレートフィールドのビット幅
+                                  # （負ならパケットの上位側に配置する）
+        self.stop = 0             # この行が `!!!!`（ストップビット）で終わったか
+        self.cnt = 1              # この行に含まれるスロット数
 
 
 class ElfState:
-    """ELF64 relocatable object-file output state: what to write, and the
-    bookkeeping needed to notice "this instruction's operand is actually a
-    label reference" while Pass 2 emits object bytes, so a relocation entry
-    can be generated for it instead of (or in addition to) a resolved value."""
+    """ELF オブジェクト出力（-o）に関わる設定と、パス2で集める情報。"""
 
     def __init__(self):
-        self.osabi: int = 9      # ELF e_ident[EI_OSABI]; default 9 = FreeBSD
-        self.objfile: str = ""
-        self.machine: int = 62   # ELF e_machine; default 62 = EM_X86_64
-        self.elf_class: int = 2  # ELF e_ident[EI_CLASS]; 1 = ELFCLASS32, 2 =
-                                  # ELFCLASS64. Set via -f/--format (default
-                                  # 64). This is now the sole authority for
-                                  # which ELF class write_elf_obj()/
-                                  # _build_dwarf_sections() emit -- it is
-                                  # applied even when it does not match
-                                  # ELF_MACHINES[machine]['elfclass'] (e.g.
-                                  # `-m 62 -f 32`, mirroring the real x32
-                                  # ABI's EM_X86_64-in-ELFCLASS32 combo).
+        self.osabi: int = 9        # ELF ヘッダの OSABI（9=FreeBSD）
+        self.objfile: str = ""     # -o の出力先。空なら ELF 出力しない
+        self.machine: int = 62     # e_machine（62=x86-64）。ELF_MACHINES のキー
+        self.elf_class: int = 2    # 1=ELF32 / 2=ELF64
 
-        self.relocations = []
-        self.tracking = False    # True only during Pass 2 while writing an ELF object
-        self.label_refs_seen = []
-        self.current_word_idx: int = -1  # index within the current instruction's
-                                          # object-code words that a label reference
-                                          # was seen at; -1 means "not inside makeobj()"
-        self.var_to_label: dict = {}     # captured pattern variable -> (label name, value),
-                                          # used to recover which label a !x-style
-                                          # capture came from when emitting relocations
-        self.capturing_var: str | None = None  # pattern variable currently being
-                                                # captured, if any
+        # --- パス2でのリロケーション収集 ---
+        self.relocations = []          # 確定した (セクション, 位置, 名前, 型, 加数, 幅)
+        self.tracking = False          # いま収集中か（パス2かつ -o のときだけ真）
+        self.label_refs_seen = []      # 1命令分の (ラベル名, 生値, ワード番号)
+        self.current_word_idx: int = -1  # 生成中のオブジェクトコードの何ワード目か
+        self.var_to_label: dict = {}   # パターン変数 → 束縛元のラベル名
+        self.capturing_var: str | None = None  # いま `!x` で捕捉中の変数
 
-        self.gen_debug: bool = False  # -g flag: also emit DWARF line-number info
-        self.line_map: list = []
+        # --- DWARF デバッグ情報（-g） ---
+        self.gen_debug: bool = False
+        self.line_map: list = []   # (セクション, pc, ファイル, 行) の対応表
 
-        # {encoded-field-byte-width: reloc type}, set from the source file's
-        # `.reloctype` directive. Overrides ELF_MACHINES[machine]['width_guess']
-        # on a per-width basis for auto-detected (no explicit ::reloctype)
-        # label references; see AssemblyDirectiveProcessor.reloctype_processing
-        # and its use at the width_guess lookup in ObjectGenerator.makeobj().
-        self.reloctype_override: dict = {}
+        self.reloctype_override: dict = {}  # `.EQU 値::型名` で明示指定された型
 
 
 class RelaxationState:
-    """State specific to the Pass 1 relaxation loop, which re-assembles the
-    source repeatedly until label addresses stop moving (see Assembler.run()).
-    Kept separate from AssemblerState mainly for readability; relaxation is a
-    Pass 1-only concern."""
+    """パス1のサイズ収束（リラクゼーション）に関する状態。
+
+    可変長命令では「ジャンプ先が遠いか近いか」で命令長が変わり、その命令長が
+    後続ラベルのアドレスを動かし、それがまたジャンプ距離を変える……という
+    循環がある。そこでパス1を複数回まわし、全ラベルのアドレスが前回と一致
+    （＝収束）するまで繰り返す。
+    """
 
     def __init__(self):
-        self.pas = 0  # 0 = interactive/single-line mode, 1 = Pass 1, 2 = Pass 2
+        self.pas = 0   # 0=対話モード / 1=パス1（収束中） / 2=パス2（最終）
 
-        # Size-probe mode: while true, an undefined forward-reference label
-        # resolves to 0 instead of erroring, purely so a pattern's encoded
-        # size can be estimated before the label is known.
+        # サイズだけ知りたい試行中か。真のときは実バイトを出力しない。
         self.pass1_size_mode = False
 
-        # Snapshot of each label's resolved address from the previous
-        # relaxation iteration. Sentinel value on the very first iteration
-        # (see _RELAXATION_SENTINEL) so forward references have no estimate
-        # yet and must fall back to 0-sized/UNDEF handling instead.
+        # 前回反復での「ラベル→アドレス」。これが今回と一致したら収束とみなす。
+        # 番兵は「まだ1回も反復していない」ことを表す（空辞書と区別するため）。
         self.pass1_prev_label_pcs = _RELAXATION_SENTINEL
 
-        # Per-label snapshot of the same address across iterations, used so
-        # a still-forward-referenced label can be estimated using its value
-        # from the previous pass (letting variable-length encodings converge)
-        # rather than being flatly undefined mid-relaxation.
+        # 前方参照ラベルの推定値（前回反復の確定値）。
         self.relax_prev_values = {}
 
-        # True only during the FIRST relaxation iteration. While set, a label
-        # that has no value yet (a forward reference, with no estimate from a
-        # previous iteration to fall back on) is estimated as "right here",
-        # i.e. the address of the instruction currently being encoded. See
-        # label_get_value() for why the loop needs an optimistic seed rather
-        # than the UNDEF sentinel.
+        # 収束を早めるため、未確定の前方参照を「近い」と楽観的に仮定するモード。
         self.relax_optimistic = False
 
-        # Which (file, line) pairs have already been warned about exhausting
-        # the pattern-matching combination budget, so the warning fires once
-        # per site instead of once per relaxation iteration.
+        # `[[...]]` の組み合わせ爆発を警告済みのパターンを覚えておき、
+        # 同じ警告を何度も出さないようにする。
         self.combo_budget_warned = set()
 
 
 class AssemblerState:
-    """The assembler's central mutable state ("God object"), shared by every
-    other class in this file (LabelManager, ExpressionEvaluator, the various
-    directive processors, etc.) via a single `state` reference each holds.
+    """アセンブル中の全状態を1か所に集めた入れ物。
 
-    VLIWState/ElfState/RelaxationState hold logically-grouped subsets of this
-    state, but old code (and this file's many call sites) was written
-    expecting flat attributes like `state.vliwbits` or `state.pas` directly
-    on AssemblerState. `_FORWARDED_ATTRS` plus `__getattr__`/`__setattr__`
-    below transparently forward those flat names to the grouped sub-objects,
-    so both styles work without duplicating any data.
+    パターン照合・式評価・ディレクティブ処理・出力生成の各クラスは、
+    自前の状態を持たずに全てこのオブジェクトを共有して読み書きする。
     """
 
     def __init__(self):
-        # Publish this instance so the module-level diag() bridge can reach
-        # the same funnel from the static helpers.
         global _ACTIVE_STATE
+        # モジュール関数 diag() がここへ委譲できるように自身を登録する。
         _ACTIVE_STATE = self
 
-        # Diagnostics buffered for the candidate pattern currently being
-        # tried; None when not inside a match attempt.
+        # パターン照合の試行中に出た診断を溜めておく箱（None なら捕捉していない）。
+        # 「試したが不採用だったパターン」のエラーを表示しないために使う。
         self._diag_pending = None
 
-        self.outfile = ""
-        self.expfile = ""       # -e: plain-text label export path
-        self.expfile_elf = ""   # -E: ELF-flavored label export path
-        self.impfile = ""       # -i: label import path (for split builds)
+        # --- 出力先 ---
+        self.outfile = ""       # -b 生バイナリ
+        self.expfile = ""       # -e ラベル TSV（素の形式）
+        self.expfile_elf = ""   # -E ラベル TSV（ELF セクションフラグ付き）
+        self.impfile = ""       # -i ラベル TSV の取り込み
 
-        self.pc = 0        # current raw, monotonically-increasing program counter
-        self.padding = 0   # fill byte used by .ORG when advancing pc
+        # --- 位置カウンタ ---
+        self.pc = 0             # 現在のプログラムカウンタ（ワード単位）
+        self.padding = 0        # .padding の詰め物バイト値
 
-        # $$ / $. support: pc at the start / end of the instruction currently
-        # being encoded, and whether we're inside that encoding at all. Only
-        # meaningful while _in_binary_list is True (see ExpressionEvaluator
-        # factor() handling of "$$"/"$.").
-        self.pc_instr_start = 0
-        self.pc_instr_end = 0
-        self._in_binary_list = False
+        self.pc_instr_start = 0   # いま組み立て中の命令の先頭アドレス（`$$`）
+        self.pc_instr_end = 0     # その次の命令のアドレス（`$.`）
+        self._in_binary_list = False  # オブジェクトコード生成の最中か
 
-        self.lwordchars = DIGIT + ALPHABET + "_."             # valid label-name characters
-        self.swordchars = DIGIT + ALPHABET + "_%$-~&|"         # valid .setsym-symbol characters
+        # 識別子に使える文字集合。パターンファイルの .labelc 等で変更できる。
+        self.lwordchars = DIGIT + ALPHABET + "_."   # ラベル名
+        self.swordchars = DIGIT + ALPHABET + "_%$-~&|"  # .setsym シンボル名
 
         self.current_section = ".text"
         self.current_file = ""
 
-        self.labels = {}          # name -> [value, section, is_equ, is_imported, reloc_type?]
-        self.sections = {}        # name -> [start_pc, cumulative_size, entry_pc, confirmed]
-                                   # (of the section's *current* open visit; see
-                                   # section_ranges below for the full fragment history)
-        self.symbols = {}         # pattern-file .setsym symbols currently in scope
-        self.patsymbols = {}      # baseline .setsym symbols as defined by the pattern
-                                   # file itself, restored at the top of every line
-        self.export_labels = {}   # subset of labels to write via -e/-E
-        self.pat = []              # parsed pattern-file entries (PatternFileReader output)
+        # --- 記号表 ---
+        self.labels = {}         # ソース側ラベル 名 → [値, セクション, is_equ, ...]
+        self.sections = {}       # セクション名 → [開始, ワード数, 入口pc]
+        self.symbols = {}        # 現在有効なシンボル（patsymbols のコピー＋α）
+        self.patsymbols = {}     # パターンファイルの .setsym で定義されたもの
+        self.export_labels = {}  # .global 等で外部公開するラベル
+        self.pat = []            # 読み込んだパターン表
 
         self.vliw = VLIWState()
 
-        self.expmode = EXP_PAT
+        self.expmode = EXP_PAT   # いま評価中の式がパターン側かソース側か
+
+        # 直近の式評価で未定義ラベルを踏んだか。重要な約束として、この旗は
+        # 「失敗したときに立てる」だけで、成功しても勝手に降ろさない。
+        # 1つの式の途中で複数のラベルを引くため、途中で降ろすと先に立った
+        # 失敗の情報が消えてしまう。降ろすのは、真新しく判定したい側
+        # （.ORG/.RESB/.ZERO/.ALIGN/.EQU 等）が評価直前に自分で行う。
         self.error_undefined_label = False
         self.error_label_conflict = False
 
-        # Persistent (never auto-reset per-line, unlike error_undefined_label/
-        # error_label_conflict above): set once and left set for the rest of
-        # the run whenever a user-facing " error - ..." is actually reported
-        # during assembly. run() checks this after Pass 2 to refuse to write
-        # output for a build that printed errors, instead of silently
-        # succeeding with incomplete/wrong bytes.
+        # ユーザ向けの " error - ..." を1度でも表示したら立ち、以後降ろさない。
+        # run() はパス2の後にこれを見て、エラーが出ていたら出力を書かずに
+        # 終了コード1で終わる（不完全・誤ったバイナリを黙って残さないため）。
         self.had_error = False
 
-        # True while PatternMatcher is trying a candidate pattern that hasn't
-        # been chosen yet; suppresses "undefined label" errors for references
-        # that only exist because of a not-yet-rejected trial match.
+        # パターン照合の試行中か。試行中のエラーは本物の失敗とは限らないので
+        # 表示を抑制する。
         self._in_match_attempt = False
 
-        self.align = 16
-        self.bts = 8              # bits per "word" (the pattern file's basic addressable unit)
+        # --- 出力語の形 ---
+        self.align = 16          # .align の既定値
+        self.bts = 8             # 1ワードのビット幅（.bits。8以外も可）
         self.endian = 'little'
         self.byte = 'yes'
         self.debug = False
 
-        self.cl = ""
-        self.ln = 0
-        self.fnstack = []   # .INCLUDE call stack: saved current_file per nesting level
-        self.lnstack = []   # .INCLUDE call stack: saved line number per nesting level
+        # --- 現在行の位置情報（エラー表示と DWARF 用） ---
+        self.cl = ""             # 現在行のテキスト
+        self.ln = 0              # 行番号
+        self.fnstack = []        # .INCLUDE のファイル名スタック
+        self.lnstack = []        # 同、行番号スタック
 
-        self.vars = [VAR_UNDEF for i in range(26)]  # pattern !a-!z capture variables
+        # パターン変数 a〜z の束縛値。
+        self.vars = [VAR_UNDEF for i in range(26)]
 
-        self.deb1 = ""
-        self.deb2 = ""
+        self.deb1 = ""           # 照合デバッグ用（ソース側の残り）
+        self.deb2 = ""           # 同（パターン側の残り）
 
-        self.exp_typ: str = 'i'
+        self.exp_typ: str = 'i'  # 'i'=整数 / 'f'=浮動小数点
 
         self.relax = RelaxationState()
 
         self.verbose: bool = False
 
-        # Temp file backing a "stdin" pseudo-include (see fileassemble()):
-        # created on first use, reused across relaxation iterations, deleted
-        # in run()'s cleanup.
+        # 標準入力から読んだソースを置く一時ファイル（全パスで再利用する）。
         self.stdin_tmp_path: str | None = None
 
         self.elf = ElfState()
@@ -620,74 +544,34 @@ class AssemblerState:
         self.init_func: str | None = None
         self.fini_func: str | None = None
 
-        # Per-pattern-check state used by the pattern file's .check/.clrcheck
-        # directives (operand-combination validation during matching).
+        # .check で登録された「この変数はこの条件を満たすこと」という制約。
         self.check_constraints: dict = {}
 
-        # Chronological (section_name, start_pc, length) fragments recording
-        # every visit to every section, in visitation order. A section
-        # entered more than once (.text -> .data -> .text) has one entry per
-        # visit here, which is what makes it possible to reconstruct its true
-        # (non-contiguous-in-pc-space) byte layout in the final output; see
-        # _section_word_ranges()/_addr_to_word_offset() below.
+        # セクションは .section / .endsection の出入りで断片化しうる。
+        # その断片ごとの (名前, 開始, ワード数) を順に記録する。
         self.section_ranges: list = []
 
-        # Set of section names touched while evaluating a reloc_type-less
-        # .EQU expression; None when not currently inside one. Used to warn
-        # if the expression silently assumes a fixed relative layout between
-        # sections (see AssemblyDirectiveProcessor.label_processing()).
+        # .EQU の右辺が複数セクションのラベルにまたがっていないかの検査用。
         self._equ_sections_touched = None
 
-    # ---------------------------------------------------------------
-    # Diagnostic funnel
-    # ---------------------------------------------------------------
-    # Every user-facing " error - " / " warning - " message in this file
-    # goes through diag() below.  Both suppression rules live here, and
-    # ONLY here, so that a new call site physically cannot forget one.
-    #
-    # Historical note -- why this exists:
-    #   Each diagnostic used to inline its own guard, and the two guards
-    #   were forgotten independently at different sites.  Three separate
-    #   real bugs came out of that single structural weakness:
-    #     * a single-character lowercase label reference assembled to 0;
-    #     * a malformed "**" / "not(" expression built cleanly;
-    #     * "#"-prefixed immediates (6502, 68000, ARM, MIPS, ...) aborted
-    #       the build, because the *losing* candidate patterns complained
-    #       about a "#" they were never meant to parse -- while the
-    #       winning pattern had already produced correct bytes.
-    #   Centralising the guards turns "remember to write two conditions"
-    #   into "call one method", which is not a class of mistake any more.
 
     def diag(self, text, set_error=True, force=False):
-        """Emit one diagnostic line, subject to the two global gates.
+        """診断メッセージを表示し、必要なら had_error を立てる。
 
-        text       complete message line, e.g. " error - undefined symbol".
-        set_error  also latch state.had_error, so the run aborts output.
-        force      bypass both gates; for diagnostics raised outside
-                   assembly proper (CLI/usage, pattern-file loading, the
-                   end-of-run summary) which have no pass or match context.
+        表示するかどうかは3段階で決まる:
+          1. force=True なら常に表示する（コマンドライン引数の誤り等、
+             パスの概念より前に起きる問題用）。
+          2. パターン照合の試行中なら表示しない。捕捉中（_diag_pending）なら
+             溜めておき、そのパターンが最終的に採用されたときだけ再生する。
+          3. それ以外は should_report_errors()、すなわちパス2か対話モードのときだけ。
+             パス1で表示しないのは、前方参照が「まだ解決していない」だけで
+             本当のエラーではない場合が多いため。
 
-        Gate 1 -- _in_match_attempt.  While the pattern matcher is *trying*
-        candidate patterns, a failure is how matching works, not an error.
-        A candidate that cannot parse the operand must stay silent and let
-        the next one run.
-
-        Gate 2 -- should_report_errors().  Outside interactive mode and the
-        final Pass 2, an "undefined label" is usually just not-resolved-YET
-        during relaxation, so reporting it would be a false alarm.
-
-        Returns True if the line was actually printed.
+        表示できたときに限り True を返す。set_error=True なら同時に had_error を
+        立てるので、以降 run() は出力を書かなくなる。
         """
         if not force:
             if self._in_match_attempt:
-                # DEFER, don't discard.  A candidate pattern's diagnostics are
-                # only meaningful if that candidate ends up winning: the loser
-                # that could not parse a "#" immediate must stay silent, but
-                # the winner that hit a real "Division by 0" must still be
-                # reported -- and for a `!x`-captured operand the expression is
-                # evaluated *only* during the trial, so simply dropping the
-                # message would lose the error for good.  The match loop keeps
-                # the winning candidate's buffer and replays it.
                 if self._diag_pending is not None:
                     self._diag_pending.append((text, set_error))
                 return False
@@ -699,18 +583,20 @@ class AssemblerState:
         return True
 
     def diag_capture_begin(self):
-        """Start buffering diagnostics raised by one candidate pattern."""
+        """以後の診断を表示せず溜め始める（パターン照合の試行前に呼ぶ）。"""
         self._diag_pending = []
 
     def diag_capture_take(self):
-        """Stop buffering and hand back this candidate's diagnostics."""
+        """溜めた診断を取り出して捕捉を終える。"""
         out = self._diag_pending if self._diag_pending is not None else []
         self._diag_pending = None
         return out
 
     def diag_replay(self, items):
-        """Emit the winning candidate's buffered diagnostics, under the
-        ordinary should_report_errors() gate."""
+        """捕捉しておいた診断を実際に表示する。
+
+        採用が確定したパターンの分だけを後から出すために使う。
+        """
         for text, set_error in items:
             if self.should_report_errors():
                 print(text, file=sys.stderr)
@@ -718,25 +604,23 @@ class AssemblerState:
                     self.had_error = True
 
     def diag_error(self, msg, force=False):
-        """Preferred entry point for new code: prefixes " error - " and
-        latches had_error."""
         return self.diag(f" error - {msg}", set_error=True, force=force)
 
     def diag_warning(self, msg, force=False):
-        """Preferred entry point for new code: prefixes " warning - " and
-        does NOT latch had_error."""
         return self.diag(f" warning - {msg}", set_error=False, force=force)
 
     def should_report_errors(self):
-        """Whether user-facing errors should be printed right now: only in
-        interactive/single-line mode (pas==0) or the final Pass 2 (pas==2),
-        never during Pass 1 relaxation where a "forward reference" is often
-        just not resolved *yet*, not actually invalid."""
+        """ユーザ向けエラーを今表示してよいパスか。
+
+        パス2（最終）と対話モードのみ。パス1のリラクゼーション中は同じエラーが
+        反復回数だけ重複するうえ、前方参照が未解決なだけの偽エラーも多い。
+        """
         return self.pas == 2 or self.pas == 0
 
-    # Flat legacy attribute name -> (sub-object attr, sub-object field) map
-    # consumed by __getattr__/__setattr__ below, so `state.vliwbits` reads
-    # and writes `state.vliw.bits` transparently.
+    # 旧来のフラットな属性名（state.vliwbits 等）を、分割後のサブ状態
+    # （state.vliw.bits 等）へ転送するための対応表。呼び出し側を一斉に
+    # 書き換えずに状態を整理できるようにしてある。実際の転送は下の
+    # __getattr__ / __setattr__ が行う。
     _FORWARDED_ATTRS = {
         'pas':                   ('relax', 'pas'),
         '_pass1_size_mode':      ('relax', 'pass1_size_mode'),
@@ -768,12 +652,6 @@ class AssemblerState:
         'line_map':               ('elf', 'line_map'),
         'reloctype_override':     ('elf', 'reloctype_override'),
     }
-    # Build one `property` per entry in _FORWARDED_ATTRS and inject it into
-    # this class body (this loop runs once, at class-definition time, not
-    # per instance). _sub_name/_sub_attr are bound as default arguments
-    # rather than captured by reference, since a plain closure over the loop
-    # variables would make every generated property forward to whatever
-    # (_sub_name, _sub_attr) happened to be *last* in the dict.
     for _old_name, (_sub_name, _sub_attr) in _FORWARDED_ATTRS.items():
         def _make_forward(_sub_name=_sub_name, _sub_attr=_sub_attr):
             def _getter(self):
@@ -783,44 +661,44 @@ class AssemblerState:
                 setattr(getattr(self, _sub_name), _sub_attr, value)
             return property(_getter, _setter)
         locals()[_old_name] = _make_forward()
-    # Clean up the loop/helper names so they don't themselves become
-    # unintended class attributes.
     del _old_name, _sub_name, _sub_attr, _make_forward
 
 
 class StringUtils:
-    """Stateless string/line-parsing helpers shared by the pattern-file and
-    source-file tokenizers. Static methods only: none of this depends on
-    assembler state."""
+    """行の前処理（コメント除去・エスケープ解決・トークン切り出し）の小道具。
 
-    # a-z -> A-Z only; str.upper() would also touch non-ASCII (e.g. 'ß'->'SS'),
-    # which this deliberately does not.
+    axx は字句解析器を持たず、1文字ずつ見ながら照合する設計なので、
+    「どこまでが1つの語か」を決める処理がこのクラスに集まっている。
+    """
+
+    # ASCII 専用の大文字化テーブル。str.upper() を使わないのは、
+    # 非 ASCII（日本語等）を変換してしまうと .ascii 文字列の内容が壊れるため。
     _ASCII_UPPER = str.maketrans(LOWER, CAPITAL)
 
     @staticmethod
     def upper(s):
-        """Uppercase only ASCII lowercase letters, leaving everything else
-        (digits, punctuation, non-ASCII) untouched."""
+        """ASCII 英小文字だけを大文字化する（非 ASCII はそのまま）。"""
         return s.translate(StringUtils._ASCII_UPPER)
 
     @staticmethod
     def q(s, t, idx):
-        """Case-insensitive "does s at idx start with t" check."""
+        """s の idx 位置が文字列 t で始まるか（大小文字を無視して）判定する。"""
         return StringUtils.upper(s[idx:idx + len(t)]) == StringUtils.upper(t)
 
     @staticmethod
     def skipspc(s, idx):
+        """空白・タブを読み飛ばした位置を返す。"""
         while idx < len(s) and s[idx] in ' \t':
             idx += 1
         return idx
 
     @staticmethod
     def skip_squote_literal(s, i):
-        """Given i pointing at a single-quote that opens a character literal
-        ('a', '\\n', '\\x41', ...), return the index just past its closing
-        quote, so remove_comment_asm() doesn't mistake a quoted ';' for a
-        comment start. Falls back to i+1 (treat as a lone quote, not a
-        literal) if the quote never closes."""
+        """i が開き引用符の文字リテラル（'a' '\\n' '\\x41'）の直後位置を返す。
+
+        コメント除去が、文字リテラル中の ';' をコメント開始と誤認しないために使う。
+        閉じ引用符が見つからなければ「ただの引用符1文字」とみなして i+1 を返す。
+        """
         j = i + 1
         if j < len(s) and s[j] == '\\' and j + 1 < len(s):
             esc_char = s[j + 1]
@@ -840,15 +718,11 @@ class StringUtils:
 
     @staticmethod
     def parse_hex_char_literal(s, idx):
-        """Parse a C-style '\\xHH' character literal (1-2 hex digits)
-        starting at idx (pointing at the opening quote). Mirrors the
-        \\x-escape branch of skip_squote_literal() above, which already
-        recognizes this form well enough to not mistake a quoted ';' for a
-        comment -- but ExpressionEvaluator.factor1() had no matching case to
-        actually evaluate one, so e.g. "MOV '\\x41'" (equivalent to "MOV 'A'")
-        failed with a syntax error. Returns (True, value, new_idx) on
-        success, or (False, 0, idx) unchanged if this isn't a well-formed
-        \\x literal, so the caller can fall through to other literal forms."""
+        """'\\xHH' 形式の文字リテラルを評価する（16進1〜2桁）。
+
+        戻り値は (成功したか, 値, 次の位置)。形が違えば idx を変えずに
+        (False, 0, idx) を返すので、呼び出し側は他のリテラル形式へ進める。
+        """
         if not (idx + 3 <= len(s) and s[idx] == "'" and s[idx + 1] == '\\'
                 and s[idx + 2] in 'xX'):
             return False, 0, idx
@@ -865,13 +739,11 @@ class StringUtils:
 
     @staticmethod
     def reduce_spaces(text):
-        """Collapse runs of whitespace to a single space."""
         return StringUtils._SPACE_RUNS.sub(' ', text)
 
     @staticmethod
     def remove_comment(l):
-        """Strip a pattern-file /* ... */ (line-oriented: only the opening
-        marker matters here, the rest of the line is discarded)."""
+        """パターンファイルのコメント `/* ...` を落とす（行単位・閉じ記号は不要）。"""
         idx = 0
         while idx < len(l):
             if l[idx:idx + 2] == '/*':
@@ -881,14 +753,12 @@ class StringUtils:
 
     @staticmethod
     def remove_comment_asm(l):
-        """Strip a source-line ';' comment, but only outside string/char
-        literals: a ';' inside "..." or a 'x' character literal is real
-        content, not a comment start. A backslash-escaped '\\;' outside
-        quotes is resolved to a literal ';' (backslash stripped) instead of
-        starting a comment, so a genuine ';' can appear unquoted in source
-        text. Tracks double-quote state directly and delegates single-quote
-        literals to skip_squote_literal() since those can contain escapes
-        (\\x41) that a naive quote-toggle would misparse."""
+        """アセンブリソースの `;` コメントを落とす。
+
+        ただし文字列 "..." や文字リテラル 'x' の中の `;` は本物のデータなので
+        残す。引用符の外の `\\;` はエスケープとして扱い、バックスラッシュを外した
+        リテラルな `;` に変える（コメントを開始させない）。
+        """
         in_dquote = False
         out = []
         i = 0
@@ -928,26 +798,26 @@ class StringUtils:
 
     @staticmethod
     def resolve_vliw_escapes(l):
-        """Resolve source-line '\\!' escapes into a literal '!' (backslash
-        stripped), and replace genuine (unescaped) VLIW "!!"/"!!!!"
-        separators with the VLIW_SEP/VLIW_STOP sentinel characters.
+        """ソース行の `\\!` を解決し、本物の VLIW 区切りを番兵に置き換える。
 
-        This must happen in a single left-to-right pass together with the
-        separator detection itself: if "\\!\\!" (meaning a literal "!!")
-        were first resolved into two bare '!' characters and the boundary
-        decision made afterward by a separate, later scan, that later scan
-        would have no way to tell those two resolved characters apart from
-        a genuine "!!" separator -- it has no memory of which "!!" came
-        from an escape. Doing both here, once, and having every later VLIW
-        boundary check (lineassemble()'s post-match check, VLIWProcessor.
-        vliwprocess()'s own slot-scanning, StringUtils.get_param_to_spc()/
-        get_param_to_eon()) look for the sentinel instead of raw "!!" text
-        sidesteps the ambiguity entirely.
+        処理は2つあるが、必ず1回の左→右走査で同時に行う必要がある:
 
-        Only called on source lines, after remove_comment_asm() has already
-        resolved any '\\;' escape and stripped the real comment -- so this
-        function only needs to handle '\\!'. Skips "..." strings and 'x'
-        char literals unchanged, same as remove_comment_asm()."""
+          * `\\!` → リテラルな `!`（バックスラッシュを外す）
+          * 本物の（エスケープされていない）`!!` → VLIW_SEP
+            同じく `!!!!` → VLIW_STOP
+
+        なぜ同時でなければならないか。仮に先に `\\!\\!` を `!!` へ戻してしまうと、
+        後から区切りを探す別の走査からは、それが「エスケープ由来のただの !!」なのか
+        「本物の区切り」なのか区別できない。後続の走査は「どの !! がエスケープ
+        だったか」を覚えていないからである。ここで一度だけ判定して本物だけを
+        番兵にしておけば、以降の全ての箇所（lineassemble() の後処理、
+        VLIWProcessor のスロット走査、get_param_to_spc()/get_param_to_eon()）は
+        番兵だけを見ればよく、取り違えが原理的に起きない。
+
+        文字列 "..." と文字リテラル 'x' の中身はそのまま素通しする。
+        呼ぶのは remove_comment_asm() が `\\;` を解決しコメントを落とした後なので、
+        ここで面倒を見るのは `\\!` だけでよい。
+        """
         out = []
         in_dquote = False
         i = 0
@@ -995,16 +865,16 @@ class StringUtils:
 
     @staticmethod
     def get_param_to_spc(s, idx):
-        """Read one whitespace-delimited token, stopping early at a
-        VLIW_SEP/VLIW_STOP sentinel (a genuine, unescaped "!!"/"!!!!" VLIW
-        slot separator in a source line -- see resolve_vliw_escapes()) so a
-        token never accidentally swallows the next slot's content.
+        """空白区切りで1語（ニーモニック部分）を切り出す。
 
-        Deliberately does NOT also stop at raw "!!" text: on a source line,
-        resolve_vliw_escapes() has already turned every genuine separator
-        into a sentinel by the time this runs, so any raw "!!" still
-        present is a resolved '\\!\\!' escape and must be read as ordinary
-        literal text, not treated as a second, phantom boundary."""
+        VLIW 区切りの番兵でも切る。番兵で切らないと、`NOP!!NOP` のように
+        空白なしで next スロットが続く書き方でニーモニックが隣のスロットを
+        飲み込んでしまう。
+
+        素の "!!" では切らないことに注意。ここへ来る時点で本物の区切りは
+        resolve_vliw_escapes() が番兵に変換済みなので、残っている "!!" は
+        `\\!\\!` を解決したただの文字列であり、区切りとして扱ってはいけない。
+        """
         t = ""
         idx = StringUtils.skipspc(s, idx)
         while idx < len(s) and s[idx] != ' ' and s[idx] not in (VLIW_SEP, VLIW_STOP):
@@ -1014,8 +884,7 @@ class StringUtils:
 
     @staticmethod
     def get_param_to_eon(s, idx):
-        """Read the rest of the line (spaces included), stopping at a
-        VLIW_SEP/VLIW_STOP sentinel (see get_param_to_spc())."""
+        """行の残り（空白を含む＝オペランド部分）を、VLIW 区切りの手前まで取る。"""
         t = ""
         idx = StringUtils.skipspc(s, idx)
         while idx < len(s) and s[idx] not in (VLIW_SEP, VLIW_STOP):
@@ -1025,10 +894,11 @@ class StringUtils:
 
     @staticmethod
     def get_string(l2):
-        """Parse a double-quoted string literal (as used by .ascii/.asciz
-        and string-mode search/replace), applying C-style backslash escapes:
-        \\n \\t \\r \\" \\\\, \\xHH (1-2 hex digits), \\uHHHH / \\UHHHHHHHH.
-        Returns "" if l2 doesn't start with a '"' at all."""
+        """`"..."` 形式の文字列リテラルを解釈して中身を返す。
+
+        C 風のエスケープ \\n \\t \\r \\" \\\\ と、\\xHH / \\uHHHH / \\UHHHHHHHH に対応する。
+        先頭が `"` でなければ空文字列を返す（.ascii 等の引数検査に使う）。
+        """
         idx = 0
         idx = StringUtils.skipspc(l2, idx)
         if l2 == '' or idx >= len(l2) or l2[idx] != '"':
@@ -1097,17 +967,17 @@ class StringUtils:
 
 
 class Parser:
-    """Low-level token readers shared across the pattern-file and
-    assembly-source parsers: numbers, symbol/label names, {}-bracketed
-    expressions, and (via ExpressionEvaluator) full arithmetic. State-aware
-    (needs state.swordchars/lwordchars, which a pattern file's .labelc
-    directive can customize), unlike StringUtils."""
+    """パターン/ソース双方から「1つの語」を切り出す下位パーサ群。
+    
+    数値リテラル・浮動小数点リテラル・`{...}` で囲まれた本体・シンボル名・
+    ラベル名など、文字種の規約に従って可変長のトークンを読み取る。
+    どれも (取り出した文字列, 次の位置) の形で返すのが共通の約束。
+    """
 
     def __init__(self, state):
         self.state = state
 
     def get_intstr(self, s, idx):
-        """Read a run of decimal digits."""
         fs = ''
         while idx < len(s) and s[idx] in DIGIT:
             fs += s[idx]
@@ -1115,10 +985,6 @@ class Parser:
         return fs, idx
 
     def get_floatstr(self, s, idx):
-        """Read a float literal: -inf/inf/nan, or digits[.digits][e[+-]digits].
-        Backtracks to just the mantissa if an 'e'/'E' isn't followed by any
-        exponent digits, so "2e" parses as "2" rather than consuming a
-        dangling exponent marker."""
         if s[idx:idx + 4] == '-inf':
             return '-inf', idx + 4
         elif s[idx:idx + 3] == 'inf':
@@ -1148,7 +1014,6 @@ class Parser:
             return fs, idx
 
     def isfloatstr(self, s, idx):
-        """Whether a float literal starts at idx, without consuming it."""
         sidx = idx
         v, idx = self.get_floatstr(s, idx)
         if idx == sidx:
@@ -1157,11 +1022,6 @@ class Parser:
             return True
 
     def get_curlb(self, s, idx):
-        """Read a {...} bracketed expression body verbatim (no nested-brace
-        handling: the first '}' closes it), used by directives like .EQU and
-        by qad{}/dbl{}/flt{} float notation. Returns (found, body, new_idx);
-        found is False (with idx unchanged past leading space) if s[idx]
-        isn't '{' at all."""
         idx = StringUtils.skipspc(s, idx)
         f = False
         t = ''
@@ -1173,13 +1033,6 @@ class Parser:
                 t += s[idx]
                 idx += 1
             if idx >= len(s):
-                # Bugfix: this used to be completely unconditional (no
-                # should_report_errors() gate, unlike every other
-                # diagnostic in the file -- fired redundantly on every
-                # pattern-match trial pass) and never set had_error, so a
-                # malformed "qad{"/"dbl{"/"flt{"/"enflt{"/"endbl{" body
-                # missing its closing '}' silently produced a 0 with a
-                # "successful" build.
                 self.state.diag(f" error - missing closing '}}' in expression: '{{{t}'", set_error=True)
                 return False, '', len(s)
             idx += 1
@@ -1188,10 +1041,6 @@ class Parser:
         return f, t, idx
 
     def get_symbol_word(self, s, idx):
-        """Read a .setsym-style symbol name (case-folded to upper), using
-        state.swordchars as the valid character set so a pattern file's
-        .labelc directive can widen/narrow what counts as a symbol
-        character. May not start with a digit."""
         t = ""
         if idx < len(s) and s[idx] not in DIGIT and s[idx] in self.state.swordchars:
             t = s[idx]
@@ -1202,11 +1051,6 @@ class Parser:
         return StringUtils.upper(t), idx
 
     def get_label_word(self, s, idx):
-        """Read a label/directive name (case preserved, unlike symbols),
-        using state.lwordchars, and additionally consume a trailing ':' that
-        marks a label definition -- but not "::" (the .EQU-with-reloctype
-        separator), so "label::abs64" isn't mistaken for a label-defining
-        colon followed by ":abs64"."""
         t = ""
         if idx < len(s) and (s[idx] == '.' or (s[idx] not in DIGIT and s[idx] in self.state.lwordchars)):
             t = s[idx]
@@ -1221,8 +1065,6 @@ class Parser:
         return t, idx
 
     def get_params1(self, l, idx):
-        """Read a pattern's operand-template text up to its "::" separator
-        (the boundary before the encoding expression)."""
         idx = StringUtils.skipspc(l, idx)
 
         if idx >= len(l):
@@ -1240,8 +1082,6 @@ class Parser:
 
 
 def enfloat(a):
-    """Reinterpret a's low 32 bits as an IEEE-754 single-precision float
-    (the inverse of packing a float into a 32-bit instruction field)."""
     try:
         float_value = struct.unpack('f', struct.pack('I', int(a) & 0xFFFFFFFF))[0]
     except (struct.error, OverflowError, ValueError):
@@ -1250,7 +1090,6 @@ def enfloat(a):
 
 
 def endouble(a):
-    """Reinterpret a's low 64 bits as an IEEE-754 double."""
     try:
         double_value = struct.unpack('d', struct.pack('Q', int(a) & 0xFFFFFFFFFFFFFFFF))[0]
     except (struct.error, OverflowError, ValueError):
@@ -1263,13 +1102,13 @@ endbl = endouble
 
 
 class IEEE754Converter:
-    """Converts a decimal string (or 'inf'/'-inf'/'nan') to its IEEE-754 bit
-    pattern, as a hex string, for the 32-/64-/128-bit formats. The 32- and
-    64-bit cases can lean on Python's own `struct`/float (which are IEEE-754
-    under the hood); 128-bit ("binary128"/quad precision) has no native
-    Python or struct support, so _decimal_to_ieee754_128bit_hex_impl()
-    below builds the sign/exponent/fraction fields by hand using Decimal for
-    the needed precision."""
+    """10進表記の数値を IEEE754 のビットパターンへ変換する。
+    
+    32/64bit は struct で足りるが、128bit（四倍精度）は Python に型が無いため
+    Decimal を高精度モードで使って手組みで組み立てる。
+    decimal_eval_expr() は `3.14*2+1` のような定数式を、途中で float に落とさず
+    Decimal のまま評価するためのもの（丸め誤差を持ち込まないため）。
+    """
 
     @staticmethod
     def decimal_to_ieee754_32bit_hex(a):
@@ -1317,15 +1156,6 @@ class IEEE754Converter:
 
     @staticmethod
     def _decimal_to_ieee754_128bit_hex_impl(a):
-        """Build a binary128 bit pattern by hand: find the base-2 exponent
-        via bit_length() on a fixed-point-scaled integer (avoiding float's
-        53-bit mantissa, which can't represent this range/precision),
-        normalize the mantissa into [1,2), then split into
-        sign/exponent/fraction fields and round the fraction to
-        SIGNIFICAND_BITS. Overflow rounds to +/-infinity; an unbiased
-        exponent at or below 0 falls back to the subnormal encoding (fixed
-        exponent field of 0, fraction scaled without the implicit leading
-        1)."""
         BIAS = 16383
         SIGNIFICAND_BITS = 112
         EXPONENT_BITS = 15
@@ -1391,21 +1221,12 @@ class IEEE754Converter:
                 shift = two ** (1 - BIAS - SIGNIFICAND_BITS)
                 fraction = int(d / shift + Decimal('0.5'))
                 if fraction >= (1 << SIGNIFICAND_BITS):
-                    # Rounded up past the largest subnormal into the
-                    # smallest normal value (2**(1-BIAS)).
                     exponent = 1
                     fraction = 0
             else:
                 exponent = biased_exp
                 fraction = int((normalized - 1) * (two ** SIGNIFICAND_BITS) + Decimal('0.5'))
                 if fraction >= (1 << SIGNIFICAND_BITS):
-                    # Mantissa rounded up to 2**SIGNIFICAND_BITS (e.g. a
-                    # value a hair below a power of two): carry into the
-                    # exponent instead of silently wrapping the fraction
-                    # back to 0 while leaving the exponent one power of
-                    # two too low. If this pushes the exponent to
-                    # _MAX_EXP, exponent=_MAX_EXP/fraction=0 is exactly
-                    # the correct infinity encoding.
                     fraction = 0
                     exponent += 1
 
@@ -1416,10 +1237,6 @@ class IEEE754Converter:
 
     @staticmethod
     def decimal_eval_expr(text):
-        """Evaluate a +,-,*,/ decimal arithmetic expression at 60 digits of
-        precision (used for float literals like "3.14*2+1"), so results
-        stay exact enough for the 128-bit conversion above rather than
-        picking up float rounding error."""
         with localcontext() as _ctx:
             _ctx.prec = 60
             return IEEE754Converter._decimal_eval_expr_impl(text)
@@ -1530,8 +1347,11 @@ class IEEE754Converter:
 
 
 class VariableManager:
-    """Storage for the pattern file's single-letter capture variables
-    (!a-!z, read back as A-Z in an encoding expression)."""
+    """パターン変数 a〜z の束縛を管理する。
+    
+    `!x` や `!Fx` でソースから捕捉した値の置き場。状態は state.vars（26要素の配列）で、
+    このクラスは添字計算と未定義判定を隠すだけの薄い層。
+    """
 
     def __init__(self, state):
         self.state = state
@@ -1541,11 +1361,6 @@ class VariableManager:
         return self.state.vars[c - ord('A')]
 
     def put(self, s, v):
-        """Store a captured value, normalizing its Python type: an integral
-        Decimal/float becomes a plain int (so later bitwise/shift operators
-        on it work), a genuinely fractional value stays float, and anything
-        that can't be coerced to int (e.g. already-UNDEF-derived) is stored
-        as-is rather than raising."""
         if StringUtils.upper(s) in CAPITAL:
             c = ord(StringUtils.upper(s))
             if isinstance(v, Decimal):
@@ -1565,35 +1380,21 @@ class VariableManager:
 
 
 class LabelManager:
-    """Owns state.labels: name -> [value, section, is_equ, is_imported,
-    reloc_type?]. Label names are case-sensitive (unlike SymbolManager's
-    .setsym symbols)."""
+    """ソース側ラベルの定義と参照を管理する。
+    
+    値の取得（get_value）で未定義だった場合は state.error_undefined_label を
+    「立てる」だけで、成功しても降ろさないのが重要な約束。
+    1つの式が複数のラベルを引くため、途中で降ろすと先に起きた失敗が消えてしまう。
+    
+    put_value はパスによって意味が変わる:
+      パス1 … 新規定義。既に在れば二重定義エラー（.extern の仮登録だけは上書き可）。
+      パス2 … 既にパス1で在るはず。無ければ両パスで見た入力が違うという異常。
+    """
 
     def __init__(self, state):
         self.state = state
 
     def _section_relative_offset(self, name, word_pc):
-        """Translate a raw, whole-assembly program counter (word_pc) into
-        its position relative to the start of section `name` in the final
-        output file, or None if word_pc doesn't fall in any recorded visit
-        to that section.
-
-        This exists because a label's stored value is always the raw pc at
-        the moment it was defined, but a section that is entered more than
-        once (.text -> .data -> .text) has its fragments concatenated
-        contiguously in the actual output -- with any other section's bytes
-        in between simply absent from `name`'s own byte stream. Two labels
-        in the *same* section can therefore have a raw-pc difference that
-        doesn't match their true final byte distance whenever another
-        section was visited between them; converting both sides to this
-        section-relative offset first fixes that (see get_value() below).
-
-        First checks the already-closed fragments recorded in
-        state.section_ranges (one entry per completed visit, in order), then
-        falls back to state.sections[name]'s *current, still-open* visit
-        (entry_pc = pc at the most recent re-entry, not yet appended to
-        section_ranges since the section hasn't been left or closed yet).
-        """
         ranges = [(rs, rl) for (rn, rs, rl) in self.state.section_ranges if rn == name]
         cum = 0
         for rs, rl in ranges:
@@ -1608,9 +1409,6 @@ class LabelManager:
         return None
 
     def get_section(self, k):
-        # Same fix as get_value() above: only ever set the flag, never
-        # clear it on success, so it doesn't clobber a sibling lookup's
-        # earlier failure within the same expression.
         try:
             v = self.state.labels[k][1]
         except (KeyError, IndexError):
@@ -1619,84 +1417,12 @@ class LabelManager:
         return v
 
     def get_value(self, k):
-        """Look up label k's value, converting it to a section-relative
-        offset (see _section_relative_offset() above) in the two specific
-        situations where that's actually safe and needed:
-
-        - Inside a reloc_type-less .EQU's expression (state._equ_sections_touched
-          is the set of every section touched so far by this .EQU; also used
-          afterward to warn if it spans more than one section). A .EQU
-          without an explicit reloc type bakes its result in as a fixed
-          constant with no linker fixup, so it must already be correct for
-          the *output* layout, not the assembler's internal pc numbering.
-        - While actually encoding an instruction's object-code bytes
-          (state._in_binary_list), and only when the referenced label lives
-          in the *same* section currently being written to. $$/$. (the
-          current-instruction pc markers) are converted the same way, so a
-          pattern's "label - $$" arithmetic stays internally consistent.
-          A cross-section reference is deliberately left as a raw value:
-          the existing ELF relocation machinery already resolves those
-          correctly, and converting only one side of a cross-section
-          subtraction would make things worse, not better.
-
-        Any other caller (e.g. a plain .EQU without reloc_type touching an
-        *unrelated* section, or generic expression evaluation outside both
-        of the above) gets the raw stored value untouched.
-        """
-        # Bugfix: this used to unconditionally reset error_undefined_label
-        # to False here, on every single lookup. That clobbers the signal
-        # from an EARLIER label reference in the same compound expression
-        # (e.g. "undefined_label + defined_label": the first operand's
-        # lookup correctly sets the flag, but the second operand's lookup
-        # -- succeeding -- reset it right back to False, since none of the
-        # binary-operator levels (term0..term11) save/restore or OR-merge
-        # the flag around each operand). The net effect: only the LAST
-        # label reference evaluated in an expression determined whether
-        # ".ORG"/".RESB"/".ZERO"/the main instruction-encoding check ever
-        # saw an undefined-label error at all -- an expression referencing
-        # one undefined and one defined label could silently encode as if
-        # correct, with no error printed. Only ever SET the flag (on
-        # failure) here; never clear it on success, so it correctly
-        # accumulates for the whole expression. Top-level callers that
-        # need a "fresh" check (.ORG/.RESB/.ZERO/etc.) reset it themselves
-        # immediately before evaluating their own expression.
         try:
             v = self.state.labels[k][0]
         except (KeyError, IndexError):
             if self.state.pas == 1 and k in self.state._relax_prev_values:
                 return self.state._relax_prev_values[k]
             if self.state.pas == 1 and self.state._relax_optimistic:
-                # First relaxation iteration: this label is a forward
-                # reference and there is no previous-iteration estimate yet.
-                #
-                # Falling through to UNDEF here would hand the pattern's
-                # size-selecting expression a meaningless huge value, so
-                # every range test ("does this displacement fit in 8 bits?")
-                # fails and the instruction starts out at its LONGEST form.
-                # The later iterations only ever see displacements computed
-                # from that inflated layout, so a long encoding that is
-                # self-consistent stays put even when a short one would also
-                # have been self-consistent -- the loop settles on whichever
-                # fixed point the initial guess happened to fall into rather
-                # than on the smallest one. (Concretely, for a PC-relative
-                # operand whose displacement lands exactly on the 8-bit
-                # boundary, both the short and the long encoding are stable,
-                # and the pessimistic seed always picks the long one.)
-                #
-                # Estimating an unknown forward label as the address of the
-                # instruction being encoded makes every displacement come out
-                # as small as it possibly could be, so iteration 1 lays the
-                # program out with every variable-length instruction at its
-                # shortest form. Label addresses can then only move forward
-                # from iteration to iteration, so encodings only ever grow,
-                # and the loop converges on the SMALLEST self-consistent
-                # layout -- which is both what an assembler should emit and
-                # what makes the result independent of the starting guess.
-                #
-                # The flag is still set: an estimate is not a definition, and
-                # a genuinely undefined label must still be reported. Pass 1
-                # never reports (see should_report_errors()), and Pass 2 --
-                # which never takes this branch -- does.
                 self.state.error_undefined_label = True
                 return self.state.pc
             if self.state._pass1_size_mode:
@@ -1722,37 +1448,21 @@ class LabelManager:
             if _adj is not None:
                 v = _adj
 
-        # ELF relocation tracking: a plain .equ constant needs no relocation
-        # (it's a fixed value baked in directly), so only track address
-        # labels, or a .equ that explicitly asked for one via ::reloctype.
         _is_equ = len(self.state.labels[k]) > 2 and self.state.labels[k][2]
         _equ_has_reloc = _is_equ and len(self.state.labels[k]) > 4 and self.state.labels[k][4] is not None
         if self.state._elf_tracking and not self.state.error_undefined_label and (not _is_equ or _equ_has_reloc):
             if self.state._elf_capturing_var is not None:
-                # PatternMatcher is capturing a !x-style variable: remember
-                # which label it came from. A second write to the same
-                # variable means the expression combined more than one label
-                # (e.g. "label1+label2"), which can't map to a single
-                # relocation, so mark it as such (None) instead.
                 cv = self.state._elf_capturing_var
                 if cv not in self.state._elf_var_to_label:
                     self.state._elf_var_to_label[cv] = (k, v)
                 else:
                     self.state._elf_var_to_label[cv] = None
             elif self.state._elf_current_word_idx >= 0:
-                # Inside makeobj(): a direct label reference in the object-code
-                # expression itself (not via a captured pattern variable).
                 self.state._elf_label_refs_seen.append(
                     (k, v, self.state._elf_current_word_idx))
         return v
 
     def put_value(self, k, v, s, is_equ=False, reloc_type=None):
-        """Define/redefine label k. On Pass 1, redefining an existing label
-        is an error unless the existing entry was only an imported
-        placeholder (which a real local definition is allowed to replace).
-        On Pass 2, every label must already exist from Pass 1 -- a
-        first-time definition there would mean the two passes saw different
-        source, which should never happen."""
         if self.state.pas == 1 or self.state.pas == 0:
             if k in self.state.labels:
                 existing = self.state.labels[k]
@@ -1760,19 +1470,6 @@ class LabelManager:
                 if not old_is_imported:
                     self.state.error_label_conflict = True
                     self.state.had_error = True
-                    # NOTE: intentionally NOT gated by should_report_errors()
-                    # -- that helper excludes pas==1 by design (Pass 1
-                    # relaxation), and there is no equivalent re-check for a
-                    # genuine duplicate label during Pass 2 (its own check
-                    # just above tests the opposite condition: a label
-                    # MISSING from pass 1, not a duplicate WITHIN a pass).
-                    # Gating this would silently swallow the only diagnostic
-                    # a real duplicate-label error ever gets outside
-                    # interactive mode. This does still print once per
-                    # pass-1 relaxation iteration (up to MAX_RELAX=16x) for
-                    # the same duplicate -- cosmetic stderr noise, not a
-                    # correctness bug (had_error is already set once,
-                    # correctly aborting the build either way).
                     self.state.diag(" error - label already defined.", set_error=False)
                     return False
         elif self.state.pas == 2:
@@ -1782,14 +1479,6 @@ class LabelManager:
                 self.state.diag(f" error - label '{k}' not defined in pass 1.", set_error=False)
                 return False
 
-        # patsymbols is keyed by the uppercased name (setpatsymbols() runs every
-        # .setsym name through StringUtils.upper()), and pattern-symbol matching
-        # is case-insensitive, so the collision test has to uppercase the label
-        # name too.  Testing the raw key let any lowercase or mixed-case label
-        # that shadows a pattern symbol slip through: with z80.axx, "c: .equ
-        # 0x99" was accepted and the token `c` then resolved as the register in
-        # one instruction and as the label in the next, with no diagnostic.
-        # caxx.c already uppercases here (axx_strupr_to() into `uk`).
         if StringUtils.upper(k) in self.state.patsymbols:
             self.state.had_error = True
             self.state.diag(f" error - '{k}' is a pattern file symbol.", set_error=False)
@@ -1807,8 +1496,6 @@ class LabelManager:
         return True
 
     def printlabels(self):
-        """Dump every label's value/section to stderr (used by the
-        interactive "?" command)."""
         result = {}
         for key, value in self.state.labels.items():
             num = value[0]
@@ -1828,8 +1515,11 @@ class LabelManager:
 
 
 class SymbolManager:
-    """Owns state.symbols: the pattern file's .setsym-defined symbols
-    (register names, etc.), looked up case-insensitively (unlike labels)."""
+    """パターンファイルの `.setsym` で定義されたシンボルを引く。
+    
+    レジスタ名などの「小文字1文字パターン」が照合時にここを参照する。
+    名前は大小文字を区別せずに解決する。
+    """
 
     def __init__(self, state):
         self.state = state
@@ -1840,14 +1530,23 @@ class SymbolManager:
 
 
 class ExpressionEvaluator:
-    """Recursive-descent arithmetic expression parser/evaluator, used for
-    both pattern-file encoding expressions and assembly-source address
-    expressions. The chain runs low-to-high precedence: expression() ->
-    term11() -> term10() -> ... -> term0() -> term0_0() -> factor() ->
-    factor1(), where each termN handles exactly one precedence level and
-    factor()/factor1() bottom out at the smallest units that can't be split
-    further (numeric/string/char literals, $$/$./#symbol, qad{}/dbl{}/flt{}
-    float notation, label/variable references)."""
+    """式評価器。優先順位ごとの再帰下降パーサ。
+    
+    下から順に:
+      factor / factor1  リテラル・ラベル・`$$`/`$.`・`#sym`・qad{}/dbl{}/flt{}・
+                        単項 -,~,@・バイト抽出 *(値,位置)・not(...)
+      term0_0           `**`
+      term0             `*` `/` `//` `%`
+      term1             `+` `-`
+      term2             `<<` `>>`
+      term3/4/5         `&` `|` `^`
+      term6             `'`（任意ビット位置からの符号拡張）
+      term7             比較
+      term8〜11         論理演算と三項演算子
+    
+    xeval() だけは系統が違い、qad{}/dbl{}/flt{} の中身専用の制限付き評価器。
+    Python の ast で解析し、`:ラベル名` 参照と enfloat/endouble 等の呼び出しを許す。
+    """
 
     def __init__(self, state, var_manager, label_manager, symbol_manager, parser):
         self.state = state
@@ -1857,8 +1556,6 @@ class ExpressionEvaluator:
         self.parser = parser
 
     def nbit(self, l):
-        """Number of bits needed to represent abs(l) (the '@' unary operator
-        below); NaN/inf have no meaningful bit width, so both return 0."""
         b = 0
         if isinstance(l, float) and not l == l:
             return 0
@@ -1878,21 +1575,13 @@ class ExpressionEvaluator:
         return -1
 
     def factor(self, s, idx):
-        """Bottom of the precedence chain: literals, unary operators
-        (-,~,@), the *(value,byteoffset) byte-extract form, and (via
-        factor1()) everything else that can't be decomposed further."""
         idx = StringUtils.skipspc(s, idx)
         x = 0
 
         if idx + 4 <= len(s) and s[idx:idx + 4] == '!!!!' and self.state.expmode == EXP_PAT:
-            # End-of-VLIW-packet marker, valid only inside a pattern's own
-            # encoding expression (EXP_PAT): whether this packet was closed
-            # with "!!!!" (state.vliwstop, set by VLIWProcessor).
             x = self.state.vliwstop
             idx += 4
         elif idx + 3 <= len(s) and s[idx:idx + 3] == '!!!' and self.state.expmode == EXP_PAT:
-            # "!!!" evaluates to the current VLIW slot count (state.vcnt),
-            # also pattern-file-only.
             x = self.state.vcnt
             idx += 3
         elif idx < len(s) and s[idx] == '-':
@@ -1921,10 +1610,6 @@ class ExpressionEvaluator:
                 return 0, idx
             x = self.nbit(x)
         elif idx < len(s) and s[idx] == '*':
-            # *(value, byte_index) extracts byte number `byte_index`
-            # (0=least-significant) from `value`, used by patterns that need
-            # to split a multi-byte computed value across several encoded
-            # bytes.
             if idx + 1 < len(s) and s[idx + 1] == '(':
                 x, idx = self.expression(s, idx + 2)
                 if idx < len(s) and s[idx] == ',':
@@ -1943,15 +1628,6 @@ class ExpressionEvaluator:
                             else:
                                 x = x >> shift_amount
                     else:
-                        # Bugfix: these three *(expr,expr) syntax-error
-                        # prints (missing ')', missing ',', missing '(')
-                        # used to be completely unconditional -- not even
-                        # gated by should_report_errors() like every other
-                        # diagnostic in the file, so they fired on every
-                        # pattern-match trial pass, and never set
-                        # had_error, so a malformed *(...) silently left a
-                        # 0 baked into the object file with a "successful"
-                        # build.
                         self.state.diag(" error - missing ')' in *(expr, expr) expression.", set_error=True)
                         x = 0
                 else:
@@ -1973,16 +1649,6 @@ class ExpressionEvaluator:
         return x, idx
 
     def xeval(self, x, _=None):
-        """Evaluate the body of a qad{}/dbl{}/flt{} float-notation expression
-        (a string that may reference labels via ":name" and call
-        enfloat/endouble/enflt/endbl), *without* using Python's own eval()
-        on untrusted input directly. Label references are first substituted
-        with unique numeric placeholders (so a label named e.g. "e" can't be
-        confused with Python's exponent syntax), then the result is parsed
-        with ast.parse() and walked by hand (_ev() below), allowing only a
-        small fixed set of literal/operator/call node types -- arbitrary
-        code execution is never reachable even though the input text
-        ultimately comes from the assembly source or pattern file."""
         def _cc_escape(chars):
             out = []
             for c in chars:
@@ -2159,11 +1825,6 @@ class ExpressionEvaluator:
         return result
 
     def factor1(self, s, idx):
-        """The rest of factor()'s job: parenthesized sub-expressions, C-style
-        character-literal escapes ('\\t', '\\'', 'a', ...), $$/$./#symbol,
-        qad{}/dbl{}/flt{} float notation (via xeval() above), numeric
-        literals in the pattern file's default hex radix, and finally
-        label/pattern-variable name references."""
         x = 0
         idx = StringUtils.skipspc(s, idx)
 
@@ -2175,11 +1836,6 @@ class ExpressionEvaluator:
             if idx < len(s) and s[idx] == ')':
                 idx += 1
             else:
-                # Bugfix: unconditional print (no should_report_errors()
-                # gate, unlike every other diagnostic here) and no
-                # had_error -- a malformed "(...)" grouping anywhere in
-                # any expression silently produced a 0 with a "successful"
-                # build.
                 self.state.diag(" error - missing closing ')' in expression.", set_error=True)
         elif idx + 4 <= len(s) and s[idx:idx + 4] == "'\\t'":
             x = 0x09
@@ -2354,29 +2010,11 @@ class ExpressionEvaluator:
                         self.state.diag(" error - endbl{}: non-finite float value; using 0.", set_error=True)
                         x = endbl(0)
         elif idx + 4 <= len(s) and s[idx:idx + 4] == 'not(':
-            # not(expr): logical negation, written as a call-like form rather
-            # than a prefix operator so it reads unambiguously in pattern
-            # text. Handled here (factor1(), the base of the precedence
-            # chain) rather than at some higher termN level, so that its
-            # result is just an ordinary atom to every operator above it
-            # (+, -, comparisons, &&, ||, ?:) on EITHER side -- e.g.
-            # "not(0)+5" must mean "(not(0))+5", not "not(0+5)". Bugfix:
-            # this used to live in term8 (between term7 comparisons and
-            # term9 &&), which meant only operators ABOVE term8 (&&, ||,
-            # ternary) got a chance to combine with its result via their own
-            # while-loops; anything BELOW term8 (comparisons, +/-, etc.) is
-            # only ever invoked while parsing a fresh left-hand operand, so
-            # a trailing "+5" after "not(0)" was silently left unconsumed
-            # by the level that used to handle it, and unnoticed here.
             x, idx = self.expression(s, idx + 4)
             idx = StringUtils.skipspc(s, idx)
             if idx < len(s) and s[idx] == ')':
                 idx += 1
             else:
-                # Bugfix: unconditional print (no should_report_errors()
-                # gate, unlike every other diagnostic here) and no
-                # had_error -- a malformed "not(..." grouping silently
-                # produced a "successful" build.
                 self.state.diag(" error - missing closing ')' in not(...) expression.", set_error=True)
             x = 0 if x else 1
         elif self.state.exp_typ == 'i' and idx < len(s) and s[idx].isdigit():
@@ -2388,15 +2026,6 @@ class ExpressionEvaluator:
                     x = float(fs) if fs else 0.0
                 except ValueError:
                     x = 0.0
-        # Pattern capture variables (!a-!z) only exist while an encoding
-        # expression from the pattern file is being evaluated (EXP_PAT).
-        # In assembly-source context (EXP_ASM) a bare lowercase letter is an
-        # ordinary user label, so this branch must not run there -- otherwise
-        # it consumes the name before the label lookup below ever sees it and
-        # silently yields the (unset) variable's value, i.e. 0, with no
-        # diagnostic.  Bugfix: the expmode test used to be missing, so every
-        # single-character lowercase label reference assembled to 0 while the
-        # label itself was still defined and exported correctly.
         elif (idx < len(s) and self.state.expmode == EXP_PAT and
               s[idx] in LOWER and (idx + 1 >= len(s) or s[idx + 1] not in self.state.lwordchars)):
             ch = s[idx]
@@ -2430,10 +2059,6 @@ class ExpressionEvaluator:
         return x, idx
 
     def term0_0(self, s, idx):
-        """Highest-precedence binary operator: ** (exponentiation). Capped
-        both on the exponent itself and on the estimated result bit-length,
-        so a chained "2**2**2**..." or a huge exponent can't blow up into an
-        unbounded/extremely slow big-integer computation."""
         x, idx = self.factor(s, idx)
         while idx < len(s) and StringUtils.q(s, '**', idx):
             t, idx = self.factor(s, idx + 2)
@@ -2444,13 +2069,6 @@ class ExpressionEvaluator:
                 t_int = int(t)
             except (ValueError, OverflowError):
                 t_int = 0
-            # Bugfix: these four self.err() calls used to print with no
-            # " error - " prefix (breaking the convention every other
-            # diagnostic in the file follows), no should_report_errors()
-            # gating (so they'd also fire redundantly on every pattern-match
-            # trial/relaxation pass, not just the final reporting pass), and
-            # never set had_error -- so a malformed "**" expression silently
-            # evaluated to 0 with a clean, successful build.
             if t_int < 0:
                 self.state.diag(" error - Negative exponent in ** expression; result set to 0.", set_error=True)
                 x = 0
@@ -2480,10 +2098,6 @@ class ExpressionEvaluator:
         return x, idx
 
     def term0(self, s, idx):
-        """*, //, /, % (multiplication/division/modulo). Integer / falls
-        back to float division only when the operands don't divide evenly,
-        warning if that loses precision for very large operands; // and %
-        guard against division by zero."""
         x, idx = self.term0_0(s, idx)
         while idx < len(s):
             if s[idx] == '*' and (idx + 1 >= len(s) or s[idx + 1] != '*'):
@@ -2492,11 +2106,6 @@ class ExpressionEvaluator:
             elif StringUtils.q(s, '//', idx):
                 t, idx = self.term0_0(s, idx + 2)
                 if t == 0:
-                    # Bugfix: self.err() here used to print a bare
-                    # "Division by 0 error." with no " error -" prefix and
-                    # no had_error, so a division-by-zero in an ordinary
-                    # instruction operand silently produced a plausible-
-                    # looking 0 with a build that still reported success.
                     self.state.diag(" error - Division by 0 error.", set_error=True)
                     x = 0
                     break
@@ -2511,15 +2120,6 @@ class ExpressionEvaluator:
                 else:
                     if (self.state.exp_typ == 'i'
                             and isinstance(x, int) and isinstance(t, int)):
-                        # Integer '/' truncates toward zero and stays an int.
-                        # It used to fall back to float division whenever the
-                        # operands did not divide evenly, which (a) made the
-                        # result disagree with caxx.c, (b) let a float leak
-                        # into the rest of the expression -- "(7/2)*2" gave 7,
-                        # "(7/2)==3" was false and "(1/2)" was true -- and
-                        # (c) lost precision above 2**53, which the warning
-                        # below this used to be about.  '//' still floors, so
-                        # the two operators stay distinct.
                         q = abs(x) // abs(t)
                         x = -q if (x < 0) != (t < 0) else q
                     else:
@@ -2537,7 +2137,6 @@ class ExpressionEvaluator:
         return x, idx
 
     def term1(self, s, idx):
-        """+, - (addition/subtraction)."""
         x, idx = self.term0(s, idx)
         while idx < len(s):
             if s[idx] == '+':
@@ -2551,9 +2150,6 @@ class ExpressionEvaluator:
         return x, idx
 
     def term2(self, s, idx):
-        """<<, >> (bit shift). Shift count is capped and rejected if
-        negative, both to avoid a pathologically slow/huge big-integer
-        shift from a malformed expression."""
         x, idx = self.term1(s, idx)
         _SHIFT_MAX = 65536
         while idx < len(s):
@@ -2587,11 +2183,6 @@ class ExpressionEvaluator:
                     x = 0
                     break
                 if t > _SHIFT_MAX:
-                    # Bugfix: this branch used to silently zero the result
-                    # with NO diagnostic at all (unlike its << sibling just
-                    # above, which at least printed a message) -- an
-                    # oversized right-shift produced a plausible-looking 0
-                    # with a clean build and exit code 0.
                     self.state.diag(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in >> expression.", set_error=True)
                     x = 0
                     break
@@ -2606,15 +2197,10 @@ class ExpressionEvaluator:
         except (OverflowError, ValueError):
             if self.state.should_report_errors():
                 self.state.diag(f" error - non-finite value {v!r} in bitwise '{op_name}' operation; treated as 0.", set_error=False)
-                # Bugfix: this correctly-formatted, correctly-gated error
-                # print never set had_error, so a non-finite operand
-                # reaching &/|/^ silently became 0 with a clean, successful
-                # build despite a real " error - ..." having been printed.
                 self.state.had_error = True
             return 0
 
     def term3(self, s, idx):
-        """& (bitwise AND), but not && (logical AND, handled by term9)."""
         x, idx = self.term2(s, idx)
         while idx < len(s) and s[idx] == '&' and (idx + 1 >= len(s) or s[idx + 1] != '&'):
             t, idx = self.term2(s, idx + 1)
@@ -2622,7 +2208,6 @@ class ExpressionEvaluator:
         return x, idx
 
     def term4(self, s, idx):
-        """| (bitwise OR), but not || (logical OR, handled by term10)."""
         x, idx = self.term3(s, idx)
         while idx < len(s) and s[idx] == '|' and (idx + 1 >= len(s) or s[idx + 1] != '|'):
             t, idx = self.term3(s, idx + 1)
@@ -2630,7 +2215,6 @@ class ExpressionEvaluator:
         return x, idx
 
     def term5(self, s, idx):
-        """^ (bitwise XOR)."""
         x, idx = self.term4(s, idx)
         while idx < len(s) and s[idx] == '^':
             t, idx = self.term4(s, idx + 1)
@@ -2638,12 +2222,6 @@ class ExpressionEvaluator:
         return x, idx
 
     def term6(self, s, idx):
-        """x'n : sign-extend x as if it were an n-bit signed value (used to
-        turn a small captured field, e.g. a 5-bit displacement, into its
-        correctly-signed full-width value before further arithmetic). Only
-        triggers when a digit or '(' follows the "'", so a bare "'a'"
-        character literal elsewhere in the expression isn't misread as this
-        operator."""
         _SEXT_MAX_BITS = 128
         x, idx = self.term5(s, idx)
         while idx < len(s) and s[idx] == '\'':
@@ -2661,12 +2239,6 @@ class ExpressionEvaluator:
             if t <= 0:
                 x = 0
             elif t > _SEXT_MAX_BITS:
-                # Bugfix: unconditional print, unlike every other warning/
-                # error in the file (not should_report_errors()-gated) --
-                # fired redundantly on every pattern-match trial pass.
-                # Still just a warning (deliberately zeroes the result,
-                # like other precision-loss warnings elsewhere), so
-                # had_error is intentionally NOT set here.
                 self.state.diag(f" warning - sign-extension bit width {t} exceeds maximum {_SEXT_MAX_BITS}, result set to 0.", set_error=False)
                 x = 0
             else:
@@ -2674,7 +2246,6 @@ class ExpressionEvaluator:
         return x, idx
 
     def term7(self, s, idx):
-        """Comparison operators (<=, <, >=, >, ==, !=), each yielding 1/0."""
         x, idx = self.term6(s, idx)
         while idx < len(s):
             if StringUtils.q(s, '<=', idx):
@@ -2700,19 +2271,9 @@ class ExpressionEvaluator:
         return x, idx
 
     def term8(self, s, idx):
-        """Placeholder level between term7 (comparisons) and term9 (&&).
-        `not(expr)` used to be special-cased here, but that meant only
-        operators ABOVE this level (&&, ||, ternary) could combine with its
-        result; anything below (comparisons, +/-, etc.) is only ever invoked
-        while parsing a fresh left-hand operand, so e.g. "not(0)+5" silently
-        dropped the "+5". `not(...)` is now handled in factor1() instead,
-        the base of the chain, so its result is an ordinary atom to every
-        operator on either side. See ExpressionEvaluator's class docstring
-        for the term0_0..term11 chain."""
         return self.term7(s, idx)
 
     def term9(self, s, idx):
-        """&& (logical AND)."""
         x, idx = self.term8(s, idx)
         while idx < len(s) and StringUtils.q(s, '&&', idx):
             t, idx = self.term8(s, idx + 2)
@@ -2720,7 +2281,6 @@ class ExpressionEvaluator:
         return x, idx
 
     def term10(self, s, idx):
-        """|| (logical OR) -- lowest-precedence binary operator."""
         x, idx = self.term9(s, idx)
         while idx < len(s) and StringUtils.q(s, '||', idx):
             t, idx = self.term9(s, idx + 2)
@@ -2728,21 +2288,6 @@ class ExpressionEvaluator:
         return x, idx
 
     def term11(self, s, idx):
-        """cond ? true_expr : false_expr (ternary), the lowest-precedence
-        construct and the only right-associative one (hence its own level
-        recursing into itself for both branches).
-
-        Both branches must actually be *parsed* to find where the whole
-        ternary ends, regardless of which one the condition picks -- but
-        evaluating the untaken branch can still have side effects (capturing
-        pattern variables, flagging an undefined label, recording an ELF
-        relocation reference), and those must not leak into the final
-        result. So state.vars/error flags/ELF-tracking lists are snapshotted
-        before evaluating the true branch, evaluated for both branches in
-        turn, and finally *replaced* with whichever branch's post-evaluation
-        state corresponds to the chosen result -- never merged, so the
-        rejected branch's effects are fully discarded.
-        """
         x, idx = self.term10(s, idx)
         if idx < len(s) and StringUtils.q(s, '?', idx):
             saved_vars              = self.state.vars[:]
@@ -2793,10 +2338,6 @@ class ExpressionEvaluator:
         return x, idx
 
     def expression(self, s, idx):
-        """Public entry point: parse one full expression starting at idx,
-        guarding the whole term0-term11 recursive-descent chain against a
-        RecursionError from pathologically deep/nested input (reported as an
-        error instead of crashing the assembler)."""
         try:
             idx0 = StringUtils.skipspc(s, idx)
             x, idx0 = self.term11(s, idx0)
@@ -2806,17 +2347,11 @@ class ExpressionEvaluator:
             return 0, idx
 
     def _terminate(self, s):
-        """Ensure a NUL terminator is present, since several factor()/factor1()
-        lookahead checks compare against chr(0) as an explicit "end of input"
-        sentinel rather than checking len(s) everywhere."""
         if not s or s[-1] != chr(0):
             return s + chr(0)
         return s
 
     def expression_pat(self, s, idx):
-        """Evaluate an expression in pattern-file context (EXP_PAT), where
-        "!!!"/"!!!!" mean the VLIW slot-count/end-of-packet markers rather
-        than being unrecognized tokens."""
         prev = self.state.expmode
         self.state.expmode = EXP_PAT
         try:
@@ -2825,7 +2360,6 @@ class ExpressionEvaluator:
             self.state.expmode = prev
 
     def expression_asm(self, s, idx):
-        """Evaluate an expression in assembly-source context (EXP_ASM)."""
         prev = self.state.expmode
         self.state.expmode = EXP_ASM
         try:
@@ -2834,13 +2368,6 @@ class ExpressionEvaluator:
             self.state.expmode = prev
 
     def expression_esc(self, s, idx, stopchar):
-        """Evaluate an expression that runs until an unbracketed occurrence
-        of stopchar (used to find where a pattern's operand-capture
-        expression ends when the stop character itself might also appear,
-        legitimately, inside balanced ()/[] or the pattern file's OB/CB
-        [[/]] escapes). A small stack of open-bracket characters tracks
-        nesting depth; stopchar only actually terminates the expression when
-        the stack is empty, i.e. we're not inside any bracket pair."""
         result = list(s[:idx])
 
         OPEN_TO_CLOSE = {'(': ')', '[': ']', OB: CB}
@@ -2880,12 +2407,12 @@ class ExpressionEvaluator:
 
 
 class BinaryWriter:
-    """Accumulates assembled words in a sparse {position: value} buffer and,
-    on flush(), writes them out as a flat raw binary file (the -b output
-    path, as opposed to -o's ELF object output which is handled separately
-    in Assembler.write_elf_obj()). Sparse storage lets .ORG jump the write
-    position around freely; any positions never written stay at
-    state.padding when flushed."""
+    """生成したワードを出力バッファへ書き込む。
+    
+    アドレスをキーにした疎な辞書で保持するので、`.ORG` でアドレスが飛んでも
+    その間を無駄に埋めずに済む。1ワードのビット幅（state.bts）は 8 とは限らず、
+    書き込み時にその幅でマスクし、エンディアンに従ってバイトへ展開する。
+    """
 
     def __init__(self, state):
         self.state = state
@@ -2900,10 +2427,6 @@ class BinaryWriter:
         self._buffer[position] = word_val & mask
 
     def flush(self):
-        """Write the buffered words to state.outfile as a flat binary,
-        filling any never-written word positions up to the highest position
-        seen with state.padding. Guards against a pathologically large
-        computed output size (e.g. from a mistaken huge .ORG address)."""
         if not self.state.outfile or not self._buffer:
             return
 
@@ -2928,8 +2451,6 @@ class BinaryWriter:
 
         _MAX_OUTPUT_BYTES = 1 << 30
         if total_size > _MAX_OUTPUT_BYTES:
-            # Fix: set_error was False, so this reported an error and then
-            # exited 0 with no output file -- a build script saw success.
             self.state.diag(f" error - output size {total_size} bytes exceeds maximum "
                             f"{_MAX_OUTPUT_BYTES}. Check for incorrect .ORG or address "
                             f"values.", set_error=True, force=True)
@@ -2967,8 +2488,6 @@ class BinaryWriter:
         print(f"wrote raw binary {self.state.outfile} ({len(data)} bytes)", file=sys.stderr)
 
     def fwrite(self, position, x, prt):
-        """Mask x to the current word width, optionally echo it in hex
-        (verbose/-v output), and buffer it at `position`."""
         if self.state.bts <= 0:
             return 0
         mask = (1 << self.state.bts) - 1
@@ -2983,8 +2502,6 @@ class BinaryWriter:
         return 1
 
     def outbin2(self, a, x):
-        """Write a word without ever echoing it (used for internal/silent
-        writes, e.g. .ORG's fill bytes)."""
         if self.state.should_report_errors():
             try:
                 self.fwrite(a, int(x), 0)
@@ -2992,9 +2509,6 @@ class BinaryWriter:
                 self.state.diag(f" error - non-finite value {x!r} cannot be written as binary word.", set_error=False)
 
     def outbin(self, a, x):
-        """Write a word, echoing it in hex only when that's actually
-        meaningful to show: interactive mode, or verbose Pass 2 (Pass 1 is
-        just relaxation bookkeeping, and non-verbose Pass 2 is silent)."""
         if self.state.should_report_errors():
             _prt = 1 if ((self.state.pas == 2 and self.state.verbose) or self.state.pas == 0) else 0
             try:
@@ -3003,11 +2517,6 @@ class BinaryWriter:
                 self.state.diag(f" error - non-finite value {x!r} cannot be written as binary word.", set_error=False)
 
     def align_(self, addr):
-        """Round addr up to the next multiple of state.align (no-op if
-        already aligned or if alignment is disabled). Note: the caller is
-        responsible for using a *section-relative* addr when the result
-        needs to reflect actual alignment in the final output file across a
-        section re-entry -- see AssemblyDirectiveProcessor.align_processing()."""
         if self.state.align <= 0:
             return addr
         a = addr % self.state.align
@@ -3017,13 +2526,14 @@ class BinaryWriter:
 
 
 class DirectiveProcessor:
-    """Handles pattern-file-level directives (`.setsym`/`.clearsym`/`.bits`/
-    `.padding`/`.symbolc`/`.vliw`/`EPIC`/`.check`/`.clrcheck`).
-
-    Each method here recognizes one directive by checking `i[0]` (the parsed
-    field list for the pattern line) and returns False immediately if it
-    doesn't match, so callers can chain `processor.foo(i) or processor.bar(i)
-    or ...` to dispatch on the directive keyword.
+    """パターンファイル側のディレクティブを処理する。
+    
+    `.setsym`（シンボル定義）、`.bits`（語長とエンディアン）、`.vliw` / `EPIC`
+    （VLIW パケットの形）、`.padding`、`.check` / `.clrcheck`（オペランド制約）など、
+    「命令表そのものではなく、命令表の読み方を決める」指示を扱う。
+    
+    これらはパターン走査の途中でも出現順に副作用を及ぼすため、採用パターンが
+    確定したときには「そのパターンに到達した時点の状態」へ巻き戻す必要がある。
     """
 
     def __init__(self, state, expr_eval, binary_writer, symbol_manager=None, parser=None):
@@ -3034,13 +2544,11 @@ class DirectiveProcessor:
         self.parser = parser
 
     def add_avoiding_dup(self, l, e):
-        """Append `e` to `l` unless it's already present (used for vliwset)."""
         if e not in l:
             l.append(e)
         return l
 
     def clear_symbol(self, i):
-        """`.clearsym [name]` — remove one pattern-symbol, or all of them if no name given."""
         if len(i) == 0 or i[0] != '.clearsym':
             return False
 
@@ -3053,21 +2561,9 @@ class DirectiveProcessor:
         return True
 
     def set_symbol(self, i):
-        """`.setsym name [value]` — define/overwrite a pattern-file symbol."""
         if len(i) == 0 or i[0] != '.setsym':
             return False
 
-        # readpat() pads every directive line to a fixed 6-field list, and
-        # for a line with only ONE `::`-separated argument it lands that
-        # argument in i[2], not i[1] (its indexing is built for
-        # pattern-definition lines, whose 2-field form is "mnemonic ::
-        # encoding" with an implicit empty operand-syntax field in between).
-        # So a name-only ".setsym::FOO" is a 2-field line with the name in
-        # i[2]; only the 3-field ".setsym::FOO::value" form puts it in i[1].
-        # Bugfix: this method used to always read the name from i[1] and
-        # always evaluate i[2] as the value expression, so the name-only
-        # form stored an empty-string key and reported "Label undefined"
-        # for the name (misread as a value expression).
         if i[1]:
             key = StringUtils.upper(i[1])
             value_field = i[2]
@@ -3086,7 +2582,6 @@ class DirectiveProcessor:
         return True
 
     def bits(self, i):
-        """`.bits [big|little] [width]` — set endianness and/or default word width."""
         if len(i) == 0 or i[0] != '.bits':
             return False
 
@@ -3109,7 +2604,6 @@ class DirectiveProcessor:
         return True
 
     def paddingp(self, i):
-        """`.padding value` — set the fill byte/word used to pad unemitted bits."""
         if len(i) == 0 or i[0] != '.padding':
             return False
 
@@ -3126,7 +2620,6 @@ class DirectiveProcessor:
         return True
 
     def symbolc(self, i):
-        """`.symbolc extrachars` — extend the character set allowed in symbol words."""
         if len(i) == 0 or i[0] != '.symbolc':
             return False
 
@@ -3135,9 +2628,6 @@ class DirectiveProcessor:
         return True
 
     def vliwp(self, i):
-        """`.vliw vliwbits vliwinstbits vliwtemplatebits nop_value` — declare a VLIW/EPIC
-        target's packet width, per-slot instruction width, template-field width, and the
-        NOP filler bit pattern (converted here to a little-endian byte list)."""
         if len(i) == 0 or i[0] != ".vliw":
             return False
 
@@ -3156,13 +2646,6 @@ class DirectiveProcessor:
             self.state.vliwtemplatebits = int(v3)
         except (OverflowError, ValueError):
             self.state.diag(" error - .vliw: non-finite parameter value.", set_error=True)
-            # Bugfix: this directive line (i[0] == '.vliw') was already
-            # claimed above; returning False here (instead of True, like
-            # every other directive's error path) told the caller's dispatch
-            # chain this line was NOT handled, so it fell through and got
-            # retried as an ordinary instruction pattern against every
-            # subsequent source line for the rest of the assembly --
-            # spamming this error once per source line instead of once.
             return True
 
         _VLIW_INSTBITS_MAX = 8192
@@ -3181,10 +2664,6 @@ class DirectiveProcessor:
         return True
 
     def epic(self, i):
-        """`EPIC slot_indices pattern` — register an EPIC-style multi-slot pattern:
-        `slot_indices` is a comma-separated list of expressions giving which
-        packet slot(s) the pattern occupies; `pattern` is the mnemonic syntax
-        for that slot combination. Entries accumulate in `state.vliwset`."""
         if len(i) == 0 or StringUtils.upper(i[0]) != "EPIC":
             return False
 
@@ -3211,11 +2690,6 @@ class DirectiveProcessor:
         return True
 
     def error(self, s):
-        """Evaluate a pattern-file `.ERROR condition;code, ...` field: for each
-        `condition;code` pair, if `condition` is truthy and errors are currently
-        being reported (see `AssemblerState.should_report_errors`), print the
-        diagnostic (looked up by code in `ERRORS`) and record it as triggered.
-        Returns (triggered, last_error_code)."""
         ss = s.replace(' ', '')
         if ss == "":
             return False, 0
@@ -3259,34 +2733,13 @@ class DirectiveProcessor:
                 print(": ", file=sys.stderr)
                 error_code = t_int
                 triggered = True
-                # A triggered guard makes the caller emit no object bytes for
-                # this instruction (objl = [] at the call site), so the output
-                # would be silently short.  Latch had_error -- as every other
-                # error path does via diag(set_error=True) -- so run() aborts
-                # with a non-zero exit status instead of writing a wrong
-                # binary that a makefile would happily hand to the linker.
                 self.state.had_error = True
 
         return triggered, error_code
 
     def check_processing(self, i):
-        """`.check var [ALLOWED,SYMS,...]` — restrict which `.setsym` symbol
-        names the lower-case pattern-template letter `var` (a *bare* operand
-        letter matched directly against a source symbol word, e.g. the `a`
-        in a template like `MOV a,b` -- NOT a `!x`-style captured
-        expression, which can evaluate to an arbitrary value and has no
-        single "symbol name" to check against a list; see the sole
-        enforcement site, ExpressionEvaluator/PatternMatcher's `elif a in
-        LOWER:` branch) may match to. An empty list means "no restriction
-        has been set" is not the same as "any symbol", callers consult
-        `state.check_constraints` directly."""
         if len(i) == 0 or i[0] != '.check':
             return False
-        # Same readpat() 2-field-vs-3-field indexing quirk as .setsym (see
-        # its comment above): a var-only ".check::c" line puts "c" in i[2],
-        # not i[1] -- only the 3-field ".check::c::LIST" form puts the var
-        # in i[1]. Bugfix: this method used to always read the var from
-        # i[1], so the list-less form always hit the "not specified" error.
         if i[1].strip():
             var_field, syms_field = i[1], i[2]
         elif i[2].strip():
@@ -3305,7 +2758,6 @@ class DirectiveProcessor:
         return True
 
     def clrcheck_processing(self, i):
-        """`.clrcheck [var]` — remove one variable's `.check` restriction, or all of them."""
         if len(i) == 0 or i[0] != '.clrcheck':
             return False
         var_field = i[2].strip() if len(i) >= 3 and i[2] else ''
@@ -3324,28 +2776,26 @@ _SYM_CORE = set(DIGIT + ALPHABET + '_')
 
 
 def _expects_expr(t, idx):
-    """True when pattern `t` has an expression capture (`!x`, `!!x`, `!Fx` ...)
-    at `idx`, ignoring spaces.  Used to decide whether a literal '+' in the
-    pattern may also stand for a '-' in the source: only a '+' that introduces
-    a captured operand is a sign, a bare '+' elsewhere is still just a '+'."""
     while idx < len(t) and t[idx] in ' \t':
         idx += 1
     return idx < len(t) and t[idx] == '!'
 
 
 class PatternMatcher:
-    """Matches one source-line-fragment `s` against one pattern-file syntax
-    template `t`, binding pattern variables (`!x`) to symbols/expression values
-    as it goes. `t` uses uppercase letters as literal-but-case-insensitive
-    text, lowercase letters as symbol-reference variables, `!x` as
-    expression-capturing variables (with `!Fx`/`!Dx`/`!Qx` float variants and
-    `!!x` for a "raw factor, no operators" capture), and `[[...]]` (rewritten
-    to OB/CB sentinels) to mark optional groups tried both present and absent.
-
-    `last_score`/`last_match_score` record `(n_expr, -n_lit, n_sym)` for the
-    most recent successful match so callers can prefer the pattern with the
-    most literal text (fewest captured/least ambiguous) when several patterns
-    match the same source line.
+    """ソース行とパターンの照合を行う。
+    
+    字句解析をせず1文字ずつ突き合わせる。パターン側の文字の意味は:
+      大文字        大小無視でリテラル一致（ニーモニック）
+      小文字1文字   .setsym のシンボル（レジスタ名等）を取る
+      `!x`          任意の式を読んで変数 x に束縛
+      `!!x`         式ではなく factor 1個だけを束縛
+      `!Fx`/`!Dx`/`!Qx`  浮動小数点式を IEEE754 の 32/64/128bit として束縛
+      `\c`          次の1文字をリテラル扱い（エスケープ）
+      `[[ ... ]]`   省略可能グループ。含む/含まないの全組合せを試す
+    
+    照合が成功すると具体度スコア (式の数, -リテラル文字数, シンボル数) を残す。
+    呼び出し側はこれが最小のパターンを採用する（＝最も具体的なものが勝つ）ので、
+    パターンファイル内の記述順に依存しない。
     """
 
     def __init__(self, state, expr_eval, var_manager, symbol_manager, parser):
@@ -3358,10 +2808,6 @@ class PatternMatcher:
         self.last_match_score = None
 
     def remove_brackets(self, s, l):
-        """Given optional-group serial numbers `l` (1-based, in first-seen
-        order of OB), blank out those `[[...]]` groups' contents in `s` —
-        used by `match0` to try each present/absent combination of optional
-        groups without re-parsing the bracket nesting each time."""
         serial = 0
         stack = []
         bracket_pairs = {}
@@ -3385,20 +2831,6 @@ class PatternMatcher:
         return ''.join(result)
 
     def match(self, s, t):
-        """Try to match source fragment `s` against pattern `t` (with any
-        remaining OB/CB optional-group markers stripped — `match0` has already
-        decided which groups are present). Walks both strings in lockstep:
-        uppercase template chars require a case-insensitive literal match,
-        lowercase chars consume a symbol word via `get_symbol_word`, `!x`
-        (and its `!Fx`/`!Dx`/`!Qx`/`!!x` variants) consumes an expression via
-        the appropriate `ExpressionEvaluator` entry point, and any other char
-        must match literally. A "word break" check (`word_break`) rejects
-        matches where a literal/keyword match would run together with an
-        adjacent alnum sequence that came from a different template atom,
-        avoiding e.g. matching "MOV" as a prefix of "MOVQ". Returns True (with
-        `last_score` set) on a full match to end-of-string, False otherwise —
-        any variable bindings made along a failed path are the caller's
-        (`match0`'s) responsibility to roll back."""
         self.state.deb1 = s
         self.state.deb2 = t
 
@@ -3467,7 +2899,6 @@ class PatternMatcher:
                 if a == chr(0):
                     return False
                 if a == 'F':
-                    # !Fx: capture a float32-encoded expression into variable x.
                     if idx_t >= len(t):
                         return False
                     a = t[idx_t]
@@ -3496,7 +2927,6 @@ class PatternMatcher:
                         idx_s += 1
                     continue
                 elif a == 'D':
-                    # !Dx: capture a float64-encoded expression into variable x.
                     if idx_t >= len(t):
                         return False
                     a = t[idx_t]
@@ -3525,8 +2955,6 @@ class PatternMatcher:
                         idx_s += 1
                     continue
                 elif a == 'Q':
-                    # !Qx: capture as IEEE754 128-bit ("quad") float, via decimal_eval_expr
-                    # on the raw source text (not the numeric result) for full precision.
                     if idx_t >= len(t):
                         return False
                     a = t[idx_t]
@@ -3573,9 +3001,6 @@ class PatternMatcher:
                         idx_s += 1
                     continue
                 elif a == '!':
-                    # !!x: capture a single "factor" only (no binary operators) —
-                    # used where the pattern needs to stop before an operator that
-                    # is itself part of the surrounding template, not the operand.
                     if idx_t >= len(t):
                         return False
                     a = t[idx_t]
@@ -3590,7 +3015,6 @@ class PatternMatcher:
                     self.var_manager.put(a, v)
                     continue
                 else:
-                    # !x: capture a full expression into variable x.
                     if a == chr(0) or a not in LOWER:
                         return False
                     idx_t = StringUtils.skipspc(t, idx_t)
@@ -3617,15 +3041,6 @@ class PatternMatcher:
                 w, idx_s = self.parser.get_symbol_word(s, idx_s)
                 v = self.symbol_manager.get(w)
                 if v == "":
-                    # `swordchars` deliberately contains operator-ish characters
-                    # ("_%$-~&|"), so the greedy scan above swallows things like
-                    # "RBX-8" whole and then fails to find a symbol of that name.
-                    # Retreat to the longest prefix that *is* a defined symbol,
-                    # cutting only at those non-alphanumeric characters -- so
-                    # "RBX-8" becomes "RBX" and the "-8" is left for the
-                    # expression that follows in the pattern.  A symbol whose
-                    # name really does contain one of those characters still
-                    # wins, because the full-length lookup is tried first.
                     for _cut in range(len(w) - 1, 0, -1):
                         if w[_cut] in _SYM_CORE:
                             continue
@@ -3645,13 +3060,6 @@ class PatternMatcher:
                 n_sym += 1
                 continue
             elif a == '+' and b == '-' and _expects_expr(t, idx_t + 1):
-                # Signed displacement.  A pattern writes base-plus-displacement
-                # as "[b+!o]" / "(IX+!d)", but assembly source writes a negative
-                # displacement as "[RBX-8]" / "(IX-5)".  Consume the pattern's
-                # '+' and leave the '-' in the source: the expression capture
-                # that follows then reads "-8" and yields a negative value, so
-                # no separate negated pattern is needed.  Scored exactly like a
-                # literal '+' so pattern selection is unchanged.
                 idx_t += 1
                 n_lit += 1
                 prev_alnum = False
@@ -3672,13 +3080,6 @@ class PatternMatcher:
     _MAX_COMBINATIONS = 1 << 16
 
     def match0(self, s, t):
-        """Entry point for matching: expands `[[...]]` optional groups to
-        OB/CB, then tries every subset of groups present/absent (largest
-        subsets first, so the most literal-text match wins ties), calling
-        `match()` for each candidate and restoring `state.vars`/ELF-tracking
-        on failure. Bails out (treats as non-matching) if the group count
-        exceeds `_MAX_OPT_GROUPS` or the combination budget `_MAX_COMBINATIONS`
-        is exceeded, to keep pathological patterns from hanging the assembler."""
         t = t.replace('[[', OB).replace(']]', CB)
         cnt = t.count(OB)
         sl = [_ + 1 for _ in range(cnt)]
@@ -3722,16 +3123,14 @@ class PatternMatcher:
 
 
 class PatternFileReader:
-    """Reads a `.axx` pattern file into a list of 6-field pattern-line records
-    (`[mnemonic, size_field, syntax, object_field, extra1, extra2]`), handling
-    `.INCLUDE` recursively with cycle/depth protection.
-
-    Pattern files go through the same `!`-macro layer as source files, via a
-    dedicated `MacroPreprocessor` running in `pat_mode`.  It is a *separate*
-    instance from the source-side one on purpose: the two namespaces never
-    see each other, so a pattern file cannot change how a source file
-    expands (and vice versa), and the per-pass reset the source layer needs
-    cannot wipe macros that were defined while reading the pattern file."""
+    """`.axx` パターンファイルを読み、パターン表に変換する。
+    
+    各行を "::" 区切りで最大6フィールドに分解する。`.INCLUDE` は再帰的に展開し、
+    循環と深すぎる入れ子は検出して打ち切る。
+    
+    ソース側とは別インスタンスのマクロ層を通す。名前空間を分けてあるので、
+    パターンファイルのマクロがソースの展開に影響することはない。
+    """
 
     def __init__(self, parser, macro_proc=None):
         self.parser = parser
@@ -3739,9 +3138,6 @@ class PatternFileReader:
             else MacroPreprocessor(None, pat_mode=True)
 
     def readpat(self, fn, base_dir=None, _depth=0, _chain=None):
-        """Read and parse pattern file `fn`. `_chain` is the set of already-open
-        (realpath-resolved) files on the current .INCLUDE stack, used to detect
-        cycles; `_depth` caps recursion depth independently as a backstop."""
         if fn == '':
             return []
 
@@ -3767,18 +3163,9 @@ class PatternFileReader:
         p = []
         w = []
 
-        # The macro layer runs over the raw text of the pattern file before
-        # any of the pattern-line parsing below, exactly as it does for
-        # source files: a macro may therefore generate whole pattern lines,
-        # or a `.INCLUDE` directive.  Macro state is reset only for the
-        # top-level pattern file, so macros defined there stay visible inside
-        # everything it `.INCLUDE`s.
         if _depth == 0:
             self.macro_proc.reset_pass()
 
-        # Fix: same unguarded-open problem as fileassemble() -- a missing
-        # pattern file, or a pattern-side `.INCLUDE` of one, raised a raw
-        # FileNotFoundError traceback instead of a diagnostic.
         try:
             with open(fn, "rt", encoding="utf-8") as f:
                 raw_lines = f.readlines()
@@ -3829,9 +3216,6 @@ class PatternFileReader:
         return w
 
     def include_pat(self, l, base_dir=None, _depth=0, _chain=None):
-        """If line `l` is a `.INCLUDE "file"` directive, recursively read and
-        return that file's pattern lines; otherwise return None so the caller
-        parses `l` as an ordinary pattern-file line."""
         idx = StringUtils.skipspc(l, 0)
         i = l[idx:idx + 8]
         i = i.upper()
@@ -3857,10 +3241,15 @@ class PatternFileReader:
 
 
 class ObjectGenerator:
-    """Turns a matched pattern's object-code field (the comma-separated list of
-    expressions describing one instruction's encoded words) into a list of
-    integer word values, expanding the `%%`/`%0` auto-index and `@@[n,...]`
-    repeat-group shorthands first."""
+    """パターンのエンコーディング欄を評価してワード列を作る。
+    
+      replace_percent_with_index  `%%` を 0,1,2,... の連番に置き換える
+      e_p                         `@@[個数, 式]` を個数分だけ展開する
+      makeobj                     カンマ区切りの各式を評価してワード列にする
+    
+    `;` で始まる要素は条件付き出力で、値が 0 なら何も出さない
+    （x86 の REX プレフィックスの有無のような分岐に使う）。
+    """
 
     def __init__(self, state, expr_eval, binary_writer):
         self.state = state
@@ -3868,8 +3257,6 @@ class ObjectGenerator:
         self.binary_writer = binary_writer
 
     def replace_percent_with_index(self, s):
-        """Replace successive `%%` occurrences with 0,1,2,... (an auto-incrementing
-        word index, e.g. for `%%*8` byte-offset fields); `%0` resets the counter."""
         count = 0
         result = []
         i = 0
@@ -3887,12 +3274,6 @@ class ObjectGenerator:
         return ''.join(result)
 
     def e_p(self, pattern):
-        """Expand `@@[count_expr, repeated_pattern]` groups by evaluating
-        `count_expr` and emitting `repeated_pattern` that many times, comma-
-        joined, in place of the group (capped at `_N_MAX` to guard against a
-        runaway repeat count). Returns `(expanded_string, is_all_whitespace)`;
-        the second value tells `makeobj` that a `z`-count of 0 (or a field
-        that expanded to nothing) means "emit no words for this instruction"."""
         result = []
         has_content = False
         i = 0
@@ -3940,15 +3321,6 @@ class ObjectGenerator:
 
                     i += 1
                 else:
-                    # Bugfix: a malformed @@[...] group with no top-level
-                    # comma (e.g. a pattern-file typo like "@@[4*3]" instead
-                    # of "@@[4,3]") used to silently discard everything
-                    # between "@@[" and the matched (or missing) "]" here,
-                    # replacing it with the bare literal "@@[" and giving no
-                    # indication anything was wrong -- the caller's
-                    # expression parser then just saw a stray "[]" and
-                    # reported an unrelated generic "unrecognized token"
-                    # warning, if anything at all.
                     self.state.diag(" error - @@[...]: missing ',' separating count and pattern.", set_error=True)
                     result.append('@@[')
                     has_content = True
@@ -3960,17 +3332,6 @@ class ObjectGenerator:
         return ''.join(result), not has_content
 
     def makeobj(self, s):
-        """Evaluate a matched pattern's object-code field `s` (comma-separated
-        expressions, `@@[]`/`%%` shorthand already handled by callers via `e_p`/
-        `replace_percent_with_index`) into a list of integer word values, one
-        per comma-separated expression. Sets `state._in_binary_list` for the
-        duration so `LabelManager`/relocation-tracking code knows it's encoding
-        real instruction bytes (see `LabelManager.get_value` and the ELF addend
-        machinery, which behave differently outside this context). A leading
-        `;` on a sub-expression makes that word conditional: if it evaluates to
-        0, the word (and any relocation reference recorded for it) is dropped
-        rather than emitted — used by patterns that only emit an optional
-        prefix/suffix word when its value is nonzero."""
         s, z = self.e_p(s)
         s = self.replace_percent_with_index(s)
 
@@ -3982,16 +3343,6 @@ class ObjectGenerator:
             return objl
 
         self.state._in_binary_list = True
-        # Bugfix: this used to unconditionally reset error_undefined_label
-        # to False here, discarding any "undefined label" status the
-        # caller had already established BEFORE calling makeobj() -- in
-        # particular, a `!x`-captured pattern variable's value is computed
-        # once during trial pattern-matching (get_value() calls happen
-        # there, not here), so if that capture referenced an undefined
-        # label, the only trace of it is the error_undefined_label flag the
-        # caller carries into this call. Save it and OR it back in once
-        # this call's own (correctly self-contained, comma-word-list-local)
-        # tracking is done, instead of just dropping it on the floor.
         _prior_undef = self.state.error_undefined_label
         self.state.error_undefined_label = False
         try:
@@ -4040,9 +3391,13 @@ class ObjectGenerator:
 
 
 class VLIWProcessor:
-    """Assembles one VLIW/EPIC packet: a base instruction plus zero or more
-    `!!`-separated additional slot instructions on the same source line,
-    packed together with a template field per `.vliw`'s configured widths."""
+    """`!!` 区切りで並んだ複数命令を1つの VLIW パケットに詰める。
+    
+    各スロットを vliwinstbits 幅のフィールドに詰め、余ったスロットは NOP で埋め、
+    EPIC ならスロットの組み合わせに対応するテンプレート値を合成して、
+    パケット幅ぶんのバイト列として出力する。
+    テンプレート幅が負のときはテンプレートをパケットの上位側に置く。
+    """
 
     def __init__(self, state, expr_eval, binary_writer):
         self.state = state
@@ -4050,20 +3405,6 @@ class VLIWProcessor:
         self.binary_writer = binary_writer
 
     def vliwprocess(self, line, idxs, objl, flag, idx, lineassemble2_func):
-        """`objl`/`idxs`/`flag` are the already-assembled first slot's result;
-        `idx` points just past it in `line`. Repeatedly consume `!!<instr>`
-        slot separators (assembling each via `lineassemble2_func`, the
-        `Assembler`'s own line-matching entry point, so slots use the exact
-        same pattern-matching path as top-level instructions) until `!!!!`
-        (marks the packet's last slot, stop-bit) or no more `!!` is found.
-        Then looks up the matching `EPIC` slot-combination pattern (by the
-        exact list of per-slot pattern indices used) to get this packet's
-        template-field value, packs all slots' words into `vliwinstbits`-wide
-        instruction fields (padding any leftover slots with `vliwnop`),
-        combines them with the template per `vliwtemplatebits`'s sign (negative
-        means template occupies the high bits), and emits the whole packet
-        (`vliwbits` wide) to the output. Returns False (with a diagnostic) on
-        any slot-assembly failure or config inconsistency."""
         objs = [objl]
         idxlst = [idxs]
         self.state.vliwstop = 0
@@ -4158,10 +3499,8 @@ class VLIWProcessor:
                 r = r & pm
 
                 if self.state.vliwtemplatebits < 0:
-                    # Negative width: template occupies the packet's high bits.
                     res = r | (templ << (vbits - abs(self.state.vliwtemplatebits)))
                 else:
-                    # Positive width: template occupies the low bits.
                     res = (r << self.state.vliwtemplatebits) | templ
 
                 q = 0
@@ -4190,16 +3529,15 @@ class VLIWProcessor:
 
 
 class AssemblyDirectiveProcessor:
-    """Handles source-file (`.asm`-side) directives: label definitions
-    (including `.EQU`), `.SECTION`/`.ENDSECTION`, `.ALIGN`, `.ORG`,
-    `.ASCII`/`.ASCIZ`, `.RESB`/`.ZERO`, `.EXTERN`, `.EXPORT`/`.GLOBAL`.
-
-    `section_processing`/`endsection_processing`/`align_processing` are the
-    methods most directly responsible for maintaining `state.section_ranges`
-    (the chronological list of section fragments) and for converting the
-    monotonic global `state.pc` to a section-relative position wherever the
-    *output file's* byte layout — not raw assembly order — is what matters;
-    see `LabelManager._section_relative_offset` for the full rationale.
+    """アセンブリソース側のディレクティブを処理する。
+    
+    `.section`/`.endsection`、`.EQU`、`.RESB`/`.ZERO`（領域確保）、
+    `.ASCII`/`.ASCIZ`（文字列）、`.ORG`（配置アドレス）、`.ALIGN`、
+    `.global`/`.extern`（外部シンボル）など。
+    
+    領域確保や配置系は引数に未定義ラベルが混ざっていると意味を成さないため、
+    評価の直前に state.error_undefined_label を自分で降ろしてから評価し、
+    立っていたらエラーにする（LabelManager の「立てるだけ」規約との対）。
     """
 
     def __init__(self, state, expr_eval, binary_writer, label_manager, parser):
@@ -4210,7 +3548,6 @@ class AssemblyDirectiveProcessor:
         self.parser = parser
 
     def labelc_processing(self, l, ll):
-        """`.LABELC extrachars` — extend the character set allowed in label words."""
         if l.upper() != '.LABELC':
             return False
         if ll:
@@ -4218,12 +3555,6 @@ class AssemblyDirectiveProcessor:
         return True
 
     def label_processing(self, l):
-        """Recognize and consume a leading `label:` (or `label: .EQU expr[::reloctype]`)
-        on source line `l`, defining the label at the current pc (or at the
-        `.EQU` expression's value) and returning the remainder of the line
-        for further directive/instruction processing. Returns `l` unchanged
-        if there's no label here, or "" if the whole line was consumed by
-        `.EQU` (which has no further content) or the label definition failed."""
         if l == "":
             return ""
 
@@ -4236,11 +3567,6 @@ class AssemblyDirectiveProcessor:
 
             if e.upper() == '.EQU':
                 reloc_type = None
-                # An explicit `::reloctype` suffix (e.g. `tape_a: .equ tape::abs32`)
-                # marks this label as an ELF-relocation-generating alias: its value
-                # must stay the label's raw (non-section-relative) pc so the
-                # relocation addend math stays consistent — see _equ_sections_touched
-                # below and LabelManager.get_value's is_equ/reloc_type branches.
                 expr_part = l[idx:].strip()
                 if '::' in expr_part:
                     parts = [p.strip() for p in expr_part.split('::', 1)]
@@ -4258,12 +3584,6 @@ class AssemblyDirectiveProcessor:
                 if self.state.pas == 1:
                     self.state._pass1_size_mode = True
 
-                # Only a reloc_type-LESS .EQU (no `::reloctype`) gets its referenced
-                # labels' values converted to section-relative offsets (see
-                # LabelManager.get_value); _equ_sections_touched, populated during
-                # that evaluation, records which sections were actually referenced
-                # so we can warn if the constant silently assumed a specific
-                # section layout (e.g. combined labels from two sections).
                 _track_sections = reloc_type is None
                 if _track_sections:
                     self.state._equ_sections_touched = set()
@@ -4279,13 +3599,6 @@ class AssemblyDirectiveProcessor:
                          f"multiple sections ({', '.join(sorted(_touched))}) without an "
                          f"explicit ::reloctype; the resulting constant assumes a specific "
                          f"section layout and will NOT be relocated by the linker.", set_error=False)
-                # Bugfix: an undefined label referenced by this .EQU's
-                # expression used to go completely unnoticed here -- no
-                # print, no had_error -- silently baking the UNDEF sentinel
-                # (or 0, during pass1's size-probe mode) into `label`'s
-                # value as if it were a legitimate constant. Mirrors the
-                # same check every other directive that evaluates an
-                # expression already performs (.ORG/.RESB/.ZERO).
                 if self.state.error_undefined_label and self.state.should_report_errors():
                     self.state.diag(f" error - .EQU '{label}': expression contains undefined label.", set_error=True)
                 ok = self.label_manager.put_value(label, u, self.state.current_section, is_equ=True, reloc_type=reloc_type)
@@ -4298,11 +3611,6 @@ class AssemblyDirectiveProcessor:
         return l
 
     def asciistr(self, l2):
-        """Emit a quoted string literal's bytes one at a time via `binary_writer.outbin`
-        (advancing `state.pc`), decoding `\\0`/`\\t`/`\\n`/`\\r`/`\\\\`/`\\"` and
-        `\\xHH`/`\\uHHHH`/`\\UHHHHHHHH` escapes. Shared by `.ASCII` (no terminator)
-        and `.ASCIZ` (caller appends a trailing NUL). Returns False if `l2`
-        doesn't start with a `"`."""
         idx = 0
         if l2 == '' or l2[idx] != '"':
             return False
@@ -4376,11 +3684,6 @@ class AssemblyDirectiveProcessor:
         return True
 
     def export_processing(self, l1, l2):
-        """`.EXPORT`/`.GLOBAL label, ...` — mark labels for inclusion in the
-        output ELF symbol table (`state.export_labels`), snapshotting each
-        one's current value/section/is-equ status. Only meaningful when error
-        reporting is active (i.e. the final pass), since label values aren't
-        final until then."""
         if not (self.state.should_report_errors()):
             return False
         _l1u = StringUtils.upper(l1)
@@ -4408,17 +3711,10 @@ class AssemblyDirectiveProcessor:
     _RES_UNITS = {'.RESB': 1, '.RESW': 2, '.RESD': 4, '.RESQ': 8}
 
     def resb_processing(self, l1, l2):
-        """`.RESB/.RESW/.RESD/.RESQ count` — reserve `count` units (x1/x2/x4/x8)
-        without writing them (e.g. for `.bss`); just advances `state.pc`,
-        capped at `_RESB_MAX` to catch a runaway/misparsed count.
-        Mirrors caxx.c adir_resX()."""
         _directive = StringUtils.upper(l1)
         _mul = self._RES_UNITS.get(_directive)
         if _mul is None:
             return False
-        # get_value() no longer clears this on a successful lookup (see its
-        # Bugfix comment), so callers that want a fresh per-evaluation
-        # check must reset it themselves right before evaluating.
         self.state.error_undefined_label = False
         x, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
@@ -4441,12 +3737,8 @@ class AssemblyDirectiveProcessor:
         return True
 
     def zero_processing(self, l1, l2):
-        """`.ZERO count` — like `.RESB` but actually writes `count` zero bytes
-        to the output (rather than just skipping pc), capped at `_ZERO_MAX`."""
         if StringUtils.upper(l1) != ".ZERO":
             return False
-        # See resb_processing()'s comment: get_value() no longer resets
-        # this for us, so reset before evaluating for a fresh check.
         self.state.error_undefined_label = False
         x, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
@@ -4470,13 +3762,11 @@ class AssemblyDirectiveProcessor:
         return True
 
     def ascii_processing(self, l1, l2):
-        """`.ASCII "text"` — emit the string's bytes with no terminator."""
         if StringUtils.upper(l1) != ".ASCII":
             return False
         return self.asciistr(l2)
 
     def asciiz_processing(self, l1, l2):
-        """`.ASCIZ "text"` — like `.ASCII` but appends a trailing NUL byte."""
         if StringUtils.upper(l1) != ".ASCIZ":
             return False
         if not self.asciistr(l2):
@@ -4487,24 +3777,6 @@ class AssemblyDirectiveProcessor:
         return True
 
     def section_processing(self, l1, l2):
-        """`.SECTION`/`.SEGMENT name` — switch the current output section.
-        Before switching, closes out the fragment of `old_sec` we were just
-        writing: computes its length from `state.pc` minus the fragment's
-        starting pc (`entry_pc`, recorded in `state.sections[old_sec][2]` the
-        last time this section was entered) and appends `(old_sec, entry_pc,
-        length)` to `state.section_ranges` — the record `_section_relative_offset`
-        walks to translate a raw pc into its position in the final concatenated
-        output. This is naturally a no-op (tentative == 0) if the section was
-        already closed by a matching `.ENDSECTION`, which advances `entry_pc`
-        to the current pc as it records the fragment -- but if more code ran
-        in this section *after* that `.ENDSECTION` (with no intervening
-        `.SECTION`), `entry_pc` is still behind `pc` and that trailing
-        fragment is correctly flushed here too, rather than being dropped.
-        `state.sections[name] = [start_pc, cumulative_size, entry_pc, confirmed]`
-        tracks each section's first-seen start, total bytes across all its
-        fragments, and this fragment's start; re-entering a section takes the
-        min of the existing start and the current pc as the (possibly still
-        provisional) overall start."""
         if StringUtils.upper(l1) != ".SECTION" and StringUtils.upper(l1) != ".SEGMENT":
             return False
 
@@ -4535,28 +3807,10 @@ class AssemblyDirectiveProcessor:
         return True
 
     def align_processing(self, l1, l2):
-        """`.ALIGN [boundary]` — pad up to the next multiple of `boundary`
-        (or the previously-set alignment if omitted). Padding must be computed
-        against the SECTION-RELATIVE position, not the raw global pc: after a
-        non-contiguous section re-entry (e.g. `.text` -> `.data` -> `.text`),
-        the raw pc can coincidentally already sit on an alignment boundary
-        while the actual output-file position is not aligned at all. We
-        resolve the section-relative base via `_section_relative_offset`
-        (falling back to raw pc if unresolvable), compute the padding delta
-        against THAT, then apply the same delta to the raw pc — never replace
-        pc outright, since raw pc must stay consistent with everything else
-        that tracks it."""
         if StringUtils.upper(l1) != ".ALIGN":
             return False
 
         if l2 != '':
-            # Bugfix: this directive never checked error_undefined_label at
-            # all -- an undefined label as the boundary argument evaluated
-            # to the UNDEF sentinel (an enormous but finite integer), which
-            # then sailed past the `u_int <= 0` guard (it's huge and
-            # positive) and got assigned directly to state.align, silently
-            # corrupting all subsequent .ALIGN padding computations. Same
-            # reset-before-evaluate-then-check pattern as .ORG/.RESB/.ZERO.
             self.state.error_undefined_label = False
             u, idx = self.expr_eval.expression_asm(l2, 0)
             if self.state.error_undefined_label:
@@ -4580,17 +3834,6 @@ class AssemblyDirectiveProcessor:
         return True
 
     def endsection_processing(self, l1, l2):
-        """`.ENDSECTION`/`.ENDSEGMENT` — explicitly close out the current
-        section's fragment (see `section_processing`'s docstring for the
-        `section_ranges` mechanics) and advance this section's `entry_pc` to
-        the current pc, so a later plain `.SECTION` re-entry into the same
-        name computes an empty (zero-length) delta instead of re-flushing
-        this same fragment. Also marks `confirmed=True`, consulted only by
-        `section_processing`'s re-entry logic to pick the section's overall
-        start address -- it no longer gates whether a fragment gets flushed,
-        so any code that runs after `.ENDSECTION` but before the next
-        `.SECTION` still has its bytes correctly recorded rather than
-        silently dropped."""
         if StringUtils.upper(l1) != ".ENDSECTION" and StringUtils.upper(l1) != ".ENDSEGMENT":
             return False
         if self.state.current_section not in self.state.sections:
@@ -4611,11 +3854,6 @@ class AssemblyDirectiveProcessor:
         return True
 
     def extern_processing(self, l1, l2):
-        """`.EXTERN label[::reloctype], ...` — declare an externally-defined
-        symbol, choosing a machine-appropriate default relocation type (looked
-        up by `state.elf_machine`) unless overridden by an explicit
-        `::reloctype` suffix. Existing (already-defined, non-extern) labels
-        are left alone except their reloc_type may be updated."""
         if StringUtils.upper(l1) != ".EXTERN":
             return False
 
@@ -4665,42 +3903,6 @@ class AssemblyDirectiveProcessor:
         return True
 
     def reloctype_processing(self, l1, l2):
-        """`.RELOCTYPE name8,name16,name32,name64` -- from the source file,
-        override the machine's default relocation type that ObjectGenerator
-        picks (via ELF_MACHINES[machine]['width_guess']) for an
-        auto-detected label reference of a given encoded field width, i.e.
-        one with no explicit `::reloctype` suffix on its label (see
-        `.EXTERN`/`.EQU ::reloctype` for that per-label form instead).
-
-        The four comma-separated positions correspond, in order, to encoded
-        field widths of 1, 2, 4, and 8 bytes. Fewer than four may be given;
-        trailing positions are simply left at the machine's built-in
-        default. A blank position (two consecutive commas, or a trailing
-        comma) also leaves that width's mapping untouched, so a single width
-        can be overridden without having to respecify the others -- e.g.
-        `.reloctype pc8,pc16,pc32,abs64` sets all four, while
-        `.reloctype ,,,abs64` only changes the 8-byte (64-bit) width.
-
-        Each name must be one of the target machine's registered
-        `::reloctype` names (the same set `.EXTERN`/`.EQU` accept, e.g.
-        `pc8`/`pc16`/`pc32`/`pc64`/`abs8`/`abs16`/`abs32`/`abs64`/`plt32`/
-        `got32`/... depending on -m/--machine) and its registered width must
-        equal the position it's given in; a name that doesn't exist for this
-        machine, or whose width doesn't match its position, is rejected with
-        a warning and that position's previous mapping (built-in default, or
-        an earlier `.reloctype` for the same width) is left in place.
-
-        Repeated `.reloctype` directives accumulate: only the widths named
-        in the *latest* directive are touched, earlier overrides for other
-        widths remain active. `.reloctype` with no arguments at all is a
-        no-op (equivalent to omitting the directive).
-
-        This is a whole-file, order-independent setting (like `-m` itself,
-        which selects the table `.reloctype` names are validated against) --
-        it is not scoped to a `.section` or to lines following it only; the
-        override applies to every subsequent auto-detected relocation for
-        the rest of the assembly, in both Pass 1 and Pass 2, until changed
-        by another `.reloctype`."""
         if StringUtils.upper(l1) != ".RELOCTYPE":
             return False
 
@@ -4737,14 +3939,8 @@ class AssemblyDirectiveProcessor:
         return True
 
     def org_processing(self, l1, l2):
-        """`.ORG address[,P]` — jump the pc to an absolute address. The `,P`
-        suffix additionally pads the output with `state.padding` bytes to fill
-        the gap (only when moving forward); without it, pc just jumps with no
-        bytes written for the skipped region."""
         if StringUtils.upper(l1) != ".ORG":
             return False
-        # See resb_processing()'s comment: get_value() no longer resets
-        # this for us, so reset before evaluating for a fresh check.
         self.state.error_undefined_label = False
         u, idx = self.expr_eval.expression_asm(l2, 0)
         if self.state.error_undefined_label:
@@ -4771,81 +3967,13 @@ class AssemblyDirectiveProcessor:
         return True
 
 
-# ===========================================================================
-# Macro preprocessor layer
-# ===========================================================================
-#
-# A source-to-source stage that runs over the raw source lines *before* the
-# assembler proper sees them (see `Assembler.fileassemble`).  It is kept
-# deliberately independent of the assembler's own expression evaluator,
-# label table, section state and program counter:
-#
-#   * The macro layer has its own value space (Python ints and strings) and
-#     its own variable namespace, so it can never observe a label whose value
-#     is still unknown, and can never observe a *different* value on a later
-#     relaxation pass.  Expansion is therefore a pure function of the source
-#     text, which is what lets `fileassemble()` simply re-run it on every
-#     Pass 1 relaxation iteration and on Pass 2 and hand the assembler
-#     byte-identical input every time.
-#
-#   * Conversely, nothing in the macro layer can read `.equ` symbols, labels
-#     or `$`/`$$`.  That is a design decision, not an omission: allowing it
-#     would make expansion pass-dependent, and could make the *number* of
-#     emitted source lines differ between passes -- something the relaxation
-#     loop has no way to converge on.
-#
-# Syntax (every statement starts with `!` as the first non-blank character of
-# a line; `{` opens a block at the end of a header line, and a line whose
-# first non-blank character is `}` closes one):
-#
-#     !def name(p1, p2, ...) {        macro / compile-time function
-#         ...
-#         !return expr                (optional; also an early exit)
-#     }
-#
-#     !if expr !then {
-#         ...
-#     } !elif expr !then {
-#         ...
-#     } !else {
-#         ...
-#     }
-#
-#     !while expr {
-#         ...
-#         !break / !continue
-#     }
-#
-#     !set name = expr                assign (innermost scope that has it)
-#     !local name [= expr]            declare in the current scope
-#     !undef name
-#     !name(a, b, ...)                expand a macro as a statement
-#     !include "file"                 macro-time textual include
-#     !error expr / !warning expr / !echo expr
-#
-# Inside an ordinary (non-`!`) line, `!{expr}` is replaced by the textual
-# value of `expr`, and `!{expr:fmt}` applies a Python format spec
-# (`!{n:04x}`).  Write `\!{` for a literal `!{`.
-#
-# Backward compatibility: a `!`-line is only intercepted when the word after
-# the `!` is one of the keywords above, the name of an already-defined macro,
-# or is immediately followed by `(`.  `!!` (VLIW slot separator) is never
-# touched, and a `}` line is only treated as a block close when a block is
-# actually open.  `--no-macro` disables the whole layer.
-# ===========================================================================
 
 
-# Recursion / runaway guards.  These exist so a mistake in a macro produces a
-# diagnostic instead of hanging the assembler or exhausting memory.
 _MACRO_MAX_DEPTH = 200
 _MACRO_MAX_ITER = 1000000
 _MACRO_MAX_LINES = 2000000
 _MACRO_MAX_INCLUDE_DEPTH = 64
 
-# Statement keywords.  A line starting with `!` is only intercepted when the
-# word after `!` is one of these or the name of an already-defined macro;
-# anything else is passed through untouched, so a pattern file that defines a
-# mnemonic beginning with `!` keeps working.
 _MACRO_KEYWORDS = frozenset((
     'if', 'then', 'else', 'elif', 'while', 'def', 'return', 'set', 'local',
     'break', 'continue', 'error', 'warning', 'echo', 'include', 'undef',
@@ -4853,9 +3981,6 @@ _MACRO_KEYWORDS = frozenset((
 
 
 class MacroError(Exception):
-    """A macro-layer error.  `msg` is already fully formatted (with source
-    position); `MacroPreprocessor.expand()` turns it into a normal axx error
-    message on stderr."""
 
     def __init__(self, msg):
         super().__init__(msg)
@@ -4877,7 +4002,6 @@ class _MacroReturn(Exception):
 
 
 class _MacroFunc:
-    """One `!def`: parameter names plus the already-parsed body."""
 
     __slots__ = ('name', 'params', 'defaults', 'body', 'pos')
 
@@ -4890,22 +4014,10 @@ class _MacroFunc:
 
 
 def _fmt_pos(pos):
-    """`(file, lineno)` -> the `file:line` prefix used in diagnostics."""
     return f"{pos[0]}:{pos[1]}"
 
 
 def _strip_comment(text, pat_mode=False):
-    """Remove a `;` comment from a macro *statement* line, respecting string
-    and character literals.  Ordinary (passed-through) source lines are never
-    touched here -- the assembler strips their comments itself, and the
-    listing output is expected to still show them.
-
-    `pat_mode` switches to the pattern-file comment convention: a comment
-    starts at `/*` and runs to the end of the line, and `;` is NOT a comment
-    marker.  That distinction matters because `;` separates the error-code
-    suffix of a pattern's error field (`v>0xff;2`), so treating it as a
-    comment start would silently truncate macro statements that build
-    pattern lines."""
     quote = ''
     i = 0
     while i < len(text):
@@ -4927,16 +4039,8 @@ def _strip_comment(text, pat_mode=False):
     return text.rstrip()
 
 
-# ---------------------------------------------------------------------------
-# Expression evaluation
-# ---------------------------------------------------------------------------
 
 class _ExprParser:
-    """Recursive-descent evaluator for one macro-time expression.
-
-    Values are Python `int` or `str`.  Comparisons and the logical operators
-    yield 0/1.  `+` concatenates when either side is a string.  Precedence
-    follows C, with a ternary `?:` at the top."""
 
     def __init__(self, text, pp, pos):
         self.s = text
@@ -4944,7 +4048,6 @@ class _ExprParser:
         self.pp = pp
         self.pos = pos
 
-    # -- lexical helpers ---------------------------------------------------
 
     def err(self, msg):
         raise MacroError(f"{_fmt_pos(self.pos)}: macro expression: {msg} in {self.s!r}")
@@ -4958,11 +4061,8 @@ class _ExprParser:
         return self.s[self.i:self.i + n]
 
     def eat(self, tok):
-        """Consume `tok` if it is next; return True if it was."""
         self.skip()
         if self.s.startswith(tok, self.i):
-            # An operator must not be the prefix of a longer operator, and a
-            # word operator must not be the prefix of an identifier.
             if tok[-1].isalpha():
                 j = self.i + len(tok)
                 if j < len(self.s) and (self.s[j].isalnum() or self.s[j] == '_'):
@@ -4979,7 +4079,6 @@ class _ExprParser:
         self.skip()
         return self.i >= len(self.s)
 
-    # -- grammar -----------------------------------------------------------
 
     def parse(self):
         v = self.ternary()
@@ -5280,8 +4379,6 @@ def _cmp_lt_eq(p, a, b, or_equal):
 
 
 def _c_div(a, b):
-    """C-style truncating division, so `-7/2 == -3` as an assembly programmer
-    would expect, rather than Python's floor semantics."""
     q = abs(a) // abs(b)
     return q if (a >= 0) == (b >= 0) else -q
 
@@ -5290,36 +4387,14 @@ def _c_mod(a, b):
     return a - _c_div(a, b) * b
 
 
-# ---------------------------------------------------------------------------
-# The preprocessor itself
-# ---------------------------------------------------------------------------
 
 class MacroPreprocessor:
-    """Expands the `!`-prefixed macro layer of a source file.
-
-    `expand(lines, filename)` takes the raw lines of one source file and
-    returns a list of `(text, filename, lineno)` triples, where `lineno` is
-    the *original* source line the emitted text came from, so assembler
-    diagnostics and DWARF line records keep pointing at real source.
-
-    A single instance is reused for the whole assembly so that macros defined
-    in one file stay visible in files it macro-includes; `reset()` clears
-    everything and must be called at the start of every assembly pass, since
-    expansion has to produce exactly the same text on each pass."""
 
     def __init__(self, state=None, pat_mode=False):
         self.state = state
-        # `pat_mode` makes this instance expand *pattern* files (`.axx`)
-        # rather than source files.  Two things change: the comment marker on
-        # macro statement lines becomes `/*` (see `_strip_comment`), and the
-        # layer is only engaged when the file really contains a macro
-        # construct (see `has_macro_constructs`), because in a pattern file a
-        # bare `!` is the pattern-variable sigil (`LD A,!d`) and so appears on
-        # almost every line.
         self.pat_mode = pat_mode
         self.reset()
 
-    # -- lifecycle ---------------------------------------------------------
 
     def reset(self):
         self.enabled = True
@@ -5328,18 +4403,7 @@ class MacroPreprocessor:
         self.reset_pass()
 
     def reset_pass(self):
-        """Clear everything the macro layer accumulates while expanding a
-        source tree, but keep the CLI-level `enabled` flag.  Called at the
-        start of every assembly pass (including every Pass 1 relaxation
-        iteration), because the assembler re-reads the source from scratch
-        each time and expansion must produce identical text on each of them."""
         self.funcs = {}
-        # Names seen by `!def` during *parsing*.  Kept separate from `funcs`
-        # (which only gets an entry once the `!def` is actually executed) so
-        # that a macro defined inside a `!if` branch that is not taken is
-        # still recognised as a statement keyword while parsing, without
-        # `defined()` claiming it exists or a call to it silently expanding
-        # to nothing.
         self.declared = set()
         self.globals = {}
         self.scopes = [self.globals]
@@ -5348,7 +4412,6 @@ class MacroPreprocessor:
         self.uid = 0
         self.include_stack = []
 
-    # -- variable / function environment -----------------------------------
 
     def scope(self):
         return self.scopes[-1]
@@ -5374,7 +4437,6 @@ class MacroPreprocessor:
                 return
         self.scope()[name] = value
 
-    # -- expression entry points -------------------------------------------
 
     def eval(self, text, pos):
         text = text.strip()
@@ -5383,8 +4445,6 @@ class MacroPreprocessor:
         return _ExprParser(text, self, pos).parse()
 
     def call_value(self, name, args, pos):
-        """A call appearing inside an expression: the macro's `!return` value
-        is the result, and the macro must not emit any text."""
         if name in _BUILTINS:
             return _BUILTINS[name](self, args, pos)
         if name not in self.funcs:
@@ -5400,8 +4460,6 @@ class MacroPreprocessor:
         return value
 
     def invoke(self, fn, args, pos):
-        """Bind arguments, run the body in a fresh scope, return the
-        `!return` value (0 if the body falls off the end)."""
         nreq = len(fn.params) - sum(1 for d in fn.defaults if d is not None)
         if len(args) > len(fn.params) or len(args) < nreq:
             raise MacroError(f"{_fmt_pos(pos)}: macro '{fn.name}' takes "
@@ -5431,10 +4489,8 @@ class MacroPreprocessor:
             self.scopes.pop()
         return 0
 
-    # -- text interpolation ------------------------------------------------
 
     def interpolate(self, text, pos):
-        """Replace every `!{expr}` / `!{expr:fmt}` in an ordinary source line."""
         if '!{' not in text:
             return text
         out = []
@@ -5477,7 +4533,6 @@ class MacroPreprocessor:
         return ''.join(out)
 
     def format_value(self, body, pos):
-        """Evaluate one `!{...}` body, honouring a trailing `:format-spec`."""
         spec = None
         quote = ''
         par = 0
@@ -5495,8 +4550,6 @@ class MacroPreprocessor:
             elif c in ')]':
                 par -= 1
             elif c == ':' and par == 0:
-                # A ':' at nesting level 0 that is not part of a '?:' ternary
-                # introduces the format spec.  '?' before it means ternary.
                 if '?' in body[:k]:
                     continue
                 spec = body[k + 1:].strip()
@@ -5509,19 +4562,13 @@ class MacroPreprocessor:
                     raise ValueError
                 return format(v, spec)
             except (ValueError, TypeError, OverflowError):
-                # OverflowError comes from `!{n:c}` with n outside the Unicode
-                # range; without it that reached the user as a raw Python
-                # traceback instead of a macro diagnostic.
                 raise MacroError(f"{_fmt_pos(pos)}: bad format spec ':{spec}' "
                                  f"for value {v!r}")
         return _as_str(v)
 
-    # -- parsing -----------------------------------------------------------
 
     @staticmethod
     def statement_word(text):
-        """If `text` is a `!`-statement line, return the word after the `!`
-        (lower-cased) and the rest of the line; otherwise `(None, None)`."""
         t = text.lstrip()
         if not t.startswith('!') or t.startswith('!!'):
             return None, None
@@ -5533,12 +4580,6 @@ class MacroPreprocessor:
         return t[1:j], t[j:]
 
     def parse_block(self, lines, i, depth):
-        """Parse statements until the `}` that closes the enclosing block.
-
-        Returns `(nodes, i)` where `lines[i]` is that `}` line (or `i ==
-        len(lines)` at top level).  A `}` seen at `depth == 0` is not a block
-        terminator and is passed through as ordinary text, so source that
-        legitimately starts a line with `}` is unaffected."""
         nodes = []
         n = len(lines)
         while i < n:
@@ -5586,7 +4627,6 @@ class MacroPreprocessor:
 
     @staticmethod
     def looks_like_call(rest):
-        """`!name(...)` with nothing but the call on the line."""
         r = rest.strip()
         return r.startswith('(')
 
@@ -5613,12 +4653,9 @@ class MacroPreprocessor:
             return (lw, rest.strip(), pos)
         if lw == 'include':
             return ('include', rest.strip(), pos)
-        # A macro call used as a statement.
         return ('call', word, rest.strip(), pos)
 
     def parse_header(self, text, kw, pos):
-        """Split a `!if expr !then {` / `!while expr {` header into the
-        expression text, checking that the line really opens a block."""
         t = text.strip()
         body = t[len(kw) + 1:]
         if not body.rstrip().endswith('{'):
@@ -5723,9 +4760,6 @@ class MacroPreprocessor:
             if defaults[k] is not None:
                 seen = p
 
-        # Register the name *before* parsing the body so a recursive call
-        # inside the body is recognised as a statement call rather than
-        # passed through to the assembler as ordinary text.
         self.declared.add(name)
         body, i = self.parse_block(lines, i + 1, depth + 1)
         if i >= len(lines):
@@ -5736,7 +4770,6 @@ class MacroPreprocessor:
                              f"'}}': {trailer!r}")
         return ('def', _MacroFunc(name, params, defaults, body, pos), pos), i + 1
 
-    # -- execution ---------------------------------------------------------
 
     def emit(self, text, pos):
         if len(self.out) >= _MACRO_MAX_LINES:
@@ -5840,11 +4873,6 @@ class MacroPreprocessor:
 
         if kind == 'echo':
             _, expr, pos = node
-            # Emit once per assembly, not once per relaxation iteration:
-            # Pass 1 may re-expand the source up to sixteen times.  Pass 2
-            # (`pas == 2`) and interactive/listing mode (`pas == 0`) each run
-            # exactly once, so restricting output to those gives the user
-            # exactly one copy of each `!echo`.
             if self.state is None or getattr(self.state, 'pas', 2) != 1:
                 print(_as_str(self.eval(expr, pos)), file=sys.stderr)
             else:
@@ -5887,12 +4915,6 @@ class MacroPreprocessor:
             raise MacroError(f"{_fmt_pos(pos)}: '!include' needs a file name string")
         path = name
         if not os.path.isabs(path):
-            # Resolve relative to the directory of the file that contains the
-            # '!include', exactly like caxx's axx_dir_of()/axx_resolve_path().
-            # os.path.abspath() must NOT be used here: pos[0] is the name the
-            # including file was opened under, and making it absolute against
-            # the *current working directory* is what used to break nested
-            # includes whenever cwd differed from the source directory.
             base = os.path.dirname(pos[0]) if pos[0] else ''
             if base:
                 path = os.path.join(base, path)
@@ -5910,8 +4932,6 @@ class MacroPreprocessor:
                 raw = f.readlines()
         except OSError as e:
             raise MacroError(f"{_fmt_pos(pos)}: cannot '!include' {name!r}: {e}")
-        # Tag the included lines with the *resolved* path, not the string as
-        # written: a nested '!include' inside this file resolves against it.
         lines = [(t.rstrip('\r\n'), path, k + 1) for k, t in enumerate(raw)]
         self.include_stack.append(real)
         try:
@@ -5920,44 +4940,23 @@ class MacroPreprocessor:
         finally:
             self.include_stack.pop()
 
-    # -- diagnostics -------------------------------------------------------
 
     def warn(self, msg):
         if msg in self._reported:
             return
         self._reported.add(msg)
-        # force=True: see fail() below.  Macro expansion happens during Pass 1,
-        # which the normal gate silences.
         diag(f" warning - {msg}", set_error=False, force=True)
 
     def fail(self, msg):
-        # Pass 1 re-reads (and so re-expands) the whole source on every
-        # relaxation iteration, and Pass 2 reads it once more; without this
-        # de-duplication a single macro error would be printed up to
-        # seventeen times.  `_reported` is cleared by `reset()`, not by
-        # `reset_pass()`, so it survives for the whole run.
         if msg not in self._reported:
             self._reported.add(msg)
-            # force=True is required.  Macro expansion runs inside Pass 1, and
-            # the ordinary gate drops Pass 1 diagnostics because an "undefined
-            # label" there is usually just not-resolved-yet.  A macro error is
-            # nothing of the sort -- it is deterministic and will never resolve
-            # -- so without the force the user saw only the generic "one or
-            # more errors were reported during assembly" with no file, no line
-            # and no reason.  (The message text still shows up under -P, which
-            # skips assembly, which is what made this easy to miss.)
-            # The _reported de-duplication above already stops the message
-            # from being repeated once per relaxation iteration.
             self.state.diag(f" error - {msg}", set_error=False, force=True)
         self.had_error = True
         if self.state is not None:
             self.state.had_error = True
 
-    # -- public entry point ------------------------------------------------
 
     def contains_macros(self, raw):
-        """Cheap pre-filter: a file with no `!` at all cannot use the macro
-        layer, so it is handed back untouched with no parsing at all."""
         for t in raw:
             if '!' in t or t.lstrip().startswith('}'):
                 return True
@@ -5965,7 +4964,6 @@ class MacroPreprocessor:
 
     @staticmethod
     def has_interpolation(t):
-        """True when `t` contains an unescaped `!{` interpolation."""
         i = t.find('!{')
         while i >= 0:
             if i == 0 or t[i - 1] != '\\':
@@ -5974,18 +4972,6 @@ class MacroPreprocessor:
         return False
 
     def has_macro_constructs(self, raw):
-        """Strict pre-filter used for *pattern* files.
-
-        `contains_macros()` engages the layer as soon as a `!` appears
-        anywhere, which is the right call for source files but useless for a
-        pattern file: there `!` introduces a pattern variable (`ADD A,!d`) and
-        so occurs on nearly every line.  This variant asks the narrower
-        question the interception rule in `parse_block()` actually cares
-        about -- is there a line that would really be taken as a macro
-        statement, an unescaped `!{...}` interpolation, or a block-closing
-        `}`?  A pattern file that uses no macros therefore skips parsing
-        entirely and is handed to the pattern reader byte-for-byte as
-        written, which is what keeps every existing `.axx` file unaffected."""
         for t in raw:
             s = t.lstrip()
             if s.startswith('}'):
@@ -6001,8 +4987,6 @@ class MacroPreprocessor:
         return False
 
     def expand(self, raw, filename):
-        """Expand one source file.  `raw` is a list of lines (newline included
-        or not); returns a list of `(text, filename, lineno)`."""
         lines = [(t.rstrip('\r\n'), filename, k + 1) for k, t in enumerate(raw)]
         if not self.enabled:
             return lines
@@ -6011,22 +4995,10 @@ class MacroPreprocessor:
                    else self.contains_macros(texts))
         if not engaged:
             return lines
-        # A macro error is fatal for the whole run, and Pass 1 would otherwise
-        # re-expand (and re-hit) it on every relaxation iteration -- which for
-        # a runaway `!while` means paying the full iteration limit sixteen
-        # times over.  Once expansion has failed, stop trying.
         if self.had_error:
             return []
         saved_out = self.out
         self.out = []
-        # caxx enforces _MACRO_MAX_DEPTH (200) with an explicit counter and an
-        # iterative interpreter, so it really can nest 200 macro calls.  The
-        # Python expander is recursive and burns roughly 20 CPython frames per
-        # macro level, so with the default limit of 1000 it died with a bare
-        # RecursionError at depth 51 -- long before its own guard fired, and
-        # long before the limit that MACRO.md documents for both.  Lift the
-        # interpreter limit for the duration of the expansion so the two
-        # implementations accept the same programs, then put it back.
         saved_reclimit = sys.getrecursionlimit()
         need = _MACRO_MAX_DEPTH * 40 + 1000
         if saved_reclimit < need:
@@ -6053,9 +5025,6 @@ class MacroPreprocessor:
         return result
 
 
-# ---------------------------------------------------------------------------
-# Builtin macro-time functions
-# ---------------------------------------------------------------------------
 
 def _bi_check(pp, args, pos, name, lo, hi=None):
     hi = lo if hi is None else hi
@@ -6114,11 +5083,6 @@ def _bi_substr(pp, a, pos):
     start = a[1]
     if not isinstance(start, int):
         raise MacroError(f"{_fmt_pos(pos)}: substr() index must be an integer")
-    # Clamp exactly like caxx's substr(): a negative start means "from the
-    # beginning", not Python's "from the end".  Using a raw Python slice here
-    # made the two implementations disagree (substr("ab",-1) gave "b" in
-    # axx.py but "ab" in caxx) and made axx.py itself inconsistent, because
-    # s[-1:-1+2] is "" while s[-1:] is "b".
     ln = len(s)
     if start < 0:
         start = 0
@@ -6176,17 +5140,6 @@ _BUILTINS = {
 
 
 class Assembler:
-    """Top-level driver: owns one `AssemblerState` plus all the collaborator
-    objects (parser, expression evaluator, label/symbol/variable managers,
-    binary writer, directive processors, pattern matcher/reader, object
-    generator, VLIW processor) and wires them together. `run()` is the
-    external entry point: reads the pattern file, then runs Pass 1 (size
-    relaxation, iterating until instruction sizes stop changing) and Pass 2
-    (final encoding + ELF/DWARF emission) over the source file(s).
-    `lineassemble2`/`lineassemble` do the actual per-source-line work of
-    matching one instruction against the pattern file and emitting its
-    object code; `write_elf_obj`/`_build_dwarf_sections` handle ELF64
-    relocatable object file generation."""
 
     def __init__(self):
         self.state = AssemblerState()
@@ -6201,12 +5154,6 @@ class Assembler:
                                                   self.symbol_manager, self.parser)
         self.pattern_matcher = PatternMatcher(self.state, self.expr_eval, self.var_manager,
                                              self.symbol_manager, self.parser)
-        # Separate macro-preprocessor instances for the two kinds of input:
-        # `pat_macro_proc` expands pattern files (`.axx`) and is reset once,
-        # when the pattern file is read; `macro_proc` expands source files
-        # and is reset at the start of every assembly pass.  Keeping the
-        # namespaces apart means a pattern file's macros can never change how
-        # a source file expands, and the per-pass reset can never wipe them.
         self.pat_macro_proc = MacroPreprocessor(self.state, pat_mode=True)
         self.pattern_reader = PatternFileReader(self.parser, self.pat_macro_proc)
         self.obj_gen = ObjectGenerator(self.state, self.expr_eval, self.binary_writer)
@@ -6217,8 +5164,6 @@ class Assembler:
         self._imp_sections: dict = {}
 
     def include_asm(self, l1, l2):
-        """`.INCLUDE "file"` (source-side) — recursively assemble `file` in
-        place, resolving a relative path against the including file's directory."""
         if StringUtils.upper(l1) != ".INCLUDE":
             return False
         s = StringUtils.get_string(l2)
@@ -6233,49 +5178,6 @@ class Assembler:
         return True
 
     def lineassemble2(self, line, idx):
-        """Assemble one instruction starting at `line[idx:]` (used both for a
-        whole non-VLIW source line and for one slot of a VLIW packet).
-
-        First dispatches directives that can appear where an instruction is
-        expected (`.SECTION`/`.ALIGN`/`.EXTERN`/etc., and pattern-file-only
-        directives like `.setsym`/`.bits` encountered while scanning `state.pat`)
-        by trying each `AssemblyDirectiveProcessor`/`DirectiveProcessor` method
-        in turn; each returns False immediately if its keyword doesn't match,
-        so this is effectively a big dispatch chain.
-
-        If it's an ordinary instruction, tries every pattern-file entry against
-        it via `pattern_matcher.match0`, using `_lead_caps` (the pattern's
-        leading run of literal capital letters) as a cheap prefilter to skip
-        obviously-non-matching patterns without paying for full match0's
-        combinatorial optional-group expansion. Among all patterns that DO
-        match, keeps the lowest-scoring one (`last_match_score` = `(n_expr,
-        -n_lit, n_sym)`, so more literal text / fewer captured operands wins
-        ties) via the `best` dict, snapshotting directive-affecting state
-        (`_snap_dirstate`/`_restore_dirstate`) alongside each candidate so the
-        chosen pattern's directive side effects (if it came from mid-file
-        `.setsym` etc.) are the ones actually applied. A perfect match (no
-        expression captures or literal-count tiebreak needed, i.e. score
-        `(0, ..., 0)`) short-circuits the search.
-
-        Once a winner is chosen, first does a throw-away probe encoding
-        (`_pass1_size_mode=True`) purely to learn the instruction's word count
-        for `state.pc_instr_end` (needed by `$.`  in later patterns before the
-        real encoding runs), then does the real `makeobj()` call. On pass 1,
-        an evaluation exception (e.g. a forward-referenced label not yet
-        known) is tolerated via a second `_pass1_size_mode` probe purely to
-        estimate size for relaxation purposes; on pass 2 the same exception is
-        a real error.
-
-        Exceptions raised by `match0` itself for individual candidate patterns
-        (malformed object-code expressions, etc.) are caught and logged
-        (`exc_log`) rather than aborting the whole search, so one broken
-        pattern-file entry doesn't prevent trying the rest.
-
-        Returns `(idxs, objl, ok, idx)`: `idxs` is the matched pattern's size-
-        field value (row 3, `i[3]`), `objl` is the list of encoded words (empty
-        if a directive consumed the line or on error), `ok` is False only on
-        genuine syntax/undefined-label errors during pass 2, `idx` is the
-        input position after this instruction/directive."""
         l, idx = StringUtils.get_param_to_spc(line, idx)
         l2, idx = StringUtils.get_param_to_eon(line, idx)
         l = l.rstrip()
@@ -6337,11 +5239,6 @@ class Assembler:
                               'vliwbits', 'vliwinstbits', 'vliwtemplatebits',
                               'vliwflag')
 
-        # Directives encountered while scanning the pattern file (.setsym,
-        # .bits, etc., dispatched above via directive_proc) can mutate global
-        # assembler state; since we try many candidate patterns before picking
-        # a winner, snapshot/restore that state per-candidate so only the
-        # winning pattern's directive side effects survive.
         def _snap_dirstate():
             snap = {f: getattr(self.state, f) for f in _DIR_SCALAR_FIELDS}
             snap['symbols'] = dict(self.state.symbols)
@@ -6452,19 +5349,6 @@ class Assembler:
                         'refs':  self.state._elf_label_refs_seen[saved_refs_len:],
                         'v2l':   dict(self.state._elf_var_to_label),
                         'dir':   _snap_dirstate(),
-                        # Bugfix: a `!x`-captured pattern variable's value is
-                        # computed once here, during this trial match (e.g.
-                        # "!e" capturing "undefined_label*0 + deflab" into a
-                        # plain int stored in state.vars) -- makeobj() later
-                        # just reads that already-computed int back and never
-                        # calls get_value() again for it. Without saving
-                        # this flag here, the unconditional reset a few
-                        # lines below (and again once the winning pattern is
-                        # re-applied) always erased it before the final
-                        # "Undefined label in expression" check downstream
-                        # could ever see it, so an instruction whose only
-                        # undefined-label reference was inside a `!x`
-                        # capture silently encoded as if correct.
                         'error_undefined_label': self.state.error_undefined_label,
                         'diags': _cand_diags,
                     }
@@ -6504,10 +5388,6 @@ class Assembler:
             try:
                 self.state.pc_instr_start = self.state.pc
                 self.state.pc_instr_end   = self.state.pc_instr_start
-                # Throw-away probe encoding, purely to learn the instruction's
-                # word count so pc_instr_end is available to `$.` if it's
-                # referenced by this same instruction's own object-code field
-                # (it needs to be set before the real makeobj() call below).
                 _probe_sm_saved    = self.state._pass1_size_mode
                 _probe_refs_len    = len(self.state._elf_label_refs_seen)
                 _probe_widx_saved  = self.state._elf_current_word_idx
@@ -6521,10 +5401,6 @@ class Assembler:
                     self.state._pass1_size_mode = _probe_sm_saved
                     del self.state._elf_label_refs_seen[_probe_refs_len:]
                     self.state._elf_current_word_idx = _probe_widx_saved
-                    # Restore (not hard-reset) so the real makeobj() call
-                    # just below still sees the winning pattern's captured
-                    # undefined-label status (see the 'error_undefined_label'
-                    # key saved on `best` above) rather than losing it here.
                     self.state.error_undefined_label = best.get('error_undefined_label', False)
                 err_triggered, _err_code = self.directive_proc.error(i[1])
                 if not err_triggered:
@@ -6535,10 +5411,6 @@ class Assembler:
             except (ArithmeticError, KeyError, IndexError, ValueError,
                     TypeError, AttributeError, OverflowError,
                     struct.error) as _exc:
-                # Pass 1 tolerates a forward-referenced label raising here (it may
-                # not be defined yet); fall back to a size-only estimate so
-                # relaxation can still converge. The same exception on pass 2
-                # (all labels are known by then) is a genuine error (oerr=True).
                 if self.state.pas == 1:
                     if self.state.debug:
                         import traceback as _tb
@@ -6587,33 +5459,11 @@ class Assembler:
         return idxs, objl, True, idx
 
     def lineassemble(self, line):
-        """Assemble one full source line: strip comments, apply any leading
-        `label:`/`.EQU`, split VLIW slots (`!!`-separated, tracked in
-        `state.vcnt`), then dispatch through `lineassemble2` to match+encode.
-
-        For a non-VLIW instruction, this is also where ELF relocations are
-        actually computed and appended to `state.relocations` (on pass 2 of a
-        `-o` build): `state._elf_label_refs_seen` was populated during
-        expression evaluation with `(label_name, label_raw_value, word_index)`
-        for every label reference seen while encoding this instruction's
-        object-code words. Consecutive same-label references are grouped into
-        one relocation spanning `num_words` words (`groups`), the relocation
-        type is looked up per-target-machine (`_rmap`, keyed by field byte
-        width) unless the label has an explicit reloc_type override
-        (`.EXTERN`/`.EQU ::reloctype`), and the addend is computed as
-        `raw_val - abs_w_bytes [+ P_asm_bytes for pc-relative types]` — see
-        the inline comments below for why `P_asm_bytes` must use the same
-        section-relative/raw frame as `raw_val`."""
         line = line.replace('\t', ' ').replace('\n', '').replace('\r', '')
         line = StringUtils.reduce_spaces(line)
         line = StringUtils.remove_comment_asm(line)
         if line == '':
             return False
-        # Resolve '\!' escapes and replace genuine "!!"/"!!!!" VLIW
-        # separators with sentinels -- see resolve_vliw_escapes()'s
-        # docstring for why this must happen once, up front, rather than
-        # by each of the several places below that check for a VLIW
-        # boundary independently checking for raw "!!" text themselves.
         line = StringUtils.resolve_vliw_escapes(line)
 
         self.state.check_constraints.clear()
@@ -6622,9 +5472,6 @@ class Assembler:
 
         line = self.asm_directive_proc.label_processing(line)
 
-        # Sentinels never appear inside quotes/char-literals (resolve_vliw_
-        # escapes() already skipped those), so counting vcnt no longer
-        # needs its own quote-tracking.
         _vparts = line.replace(VLIW_STOP, VLIW_SEP).split(VLIW_SEP)
         self.state.vcnt = sum(1 for _p in _vparts if _p != '')
 
@@ -6659,16 +5506,6 @@ class Assembler:
                 valid_refs = [(ln, aw, wi) for (ln, aw, wi) in self.state._elf_label_refs_seen if wi >= 0]
                 valid_refs.sort(key=lambda r: r[2])
 
-                # Bugfix: the same label can be captured into the same output
-                # word twice (e.g. two pattern variables both bound to the
-                # same source operand, as in a hypothetical "DIFF L,L").
-                # Left unchecked, both identical (label, word_idx) entries
-                # survive the ambiguity filter just below (which only fires
-                # when DIFFERENT labels collide at the same widx) and then
-                # form two separate single-word groups anchored at the same
-                # widx, emitting a duplicate/non-conformant .rela entry at
-                # the same offset. De-duplicate exact (label, widx) repeats
-                # first, keeping only the first occurrence.
                 _seen_ln_wi = set()
                 _deduped_refs = []
                 for _r in valid_refs:
@@ -6679,10 +5516,6 @@ class Assembler:
                     _deduped_refs.append(_r)
                 valid_refs = _deduped_refs
 
-                # If two different labels were both recorded against the same
-                # word index (e.g. a combined expression like `label1-label2`),
-                # we can't attribute that word to a single relocation target,
-                # so drop it rather than emit a wrong relocation.
                 _widx_labels = {}
                 for _ln, _, _wi in valid_refs:
                     _widx_labels.setdefault(_wi, set()).add(_ln)
@@ -6699,14 +5532,7 @@ class Assembler:
                     groups.append((lname, abs_w, widx, gj - gi))
                     gi = gj
 
-                # ELF_MACHINE_TABLE (near top of file) is the single source
-                # of truth for all of this machine's relocation numbering;
-                # -m/--machine is validated against it at startup, so a
-                # lookup miss here can't happen for a completed run.
                 _mach_tbl_la = ELF_MACHINES[self.state.elf_machine]
-                # A `.reloctype` directive in the source file overrides the
-                # machine's built-in per-width default on a per-width basis;
-                # widths it didn't touch keep falling back to width_guess.
                 _rmap = {**_mach_tbl_la['width_guess'], **self.state.reloctype_override}
                 _pc_rel_types_all = _mach_tbl_la['pc_rel']
 
@@ -6720,22 +5546,6 @@ class Assembler:
                     if lentry and len(lentry) > 4 and lentry[4] is not None:
                         rtype_override = lentry[4]
                         expected = _mach_tbl_la['reloc_bytes'].get(rtype_override)
-                        # Bugfix: this used to also trust the override
-                        # unconditionally whenever `_is_imported` (true for
-                        # every `.EXTERN` label, not just `-i`-imported
-                        # ones), skipping the width check entirely. Since
-                        # `.EXTERN` without an explicit `::type` always
-                        # records the machine's extern_default (e.g. a
-                        # 4-byte PC32-style type on x86_64) regardless of
-                        # the field actually encoded, *any* narrow-field
-                        # reference to a plain `.EXTERN`'d symbol (e.g. a
-                        # 1-byte `Jcc rel8` to an extern label) got a
-                        # relocation type wider than its field -- a linker
-                        # applying it per the ELF spec overwrites whatever
-                        # bytes follow. The width check must apply
-                        # uniformly regardless of is_imported; only an
-                        # unknown/unregistered reloc type (expected is
-                        # None) still passes through unchecked.
                         if expected is None or expected == num_bytes:
                             rtype = rtype_override
                         else:
@@ -6767,85 +5577,26 @@ class Assembler:
                        _is_undef_derived(abs_w):
                         continue
 
-                    # The embedded field value is a signed disp/offset once encoded
-                    # (e.g. 0xfc in a 1-byte field means -4), so sign-extend it
-                    # from the field width before using it in the addend formula
-                    # below — an unsigned interpretation here would corrupt every
-                    # negative displacement's addend.
-                    #
-                    # Bugfix: this must be the TRUE encoded bit width
-                    # (num_words * state.bts), not the byte-rounded
-                    # num_bytes*8. raw_val was built above using word_mask =
-                    # (1<<state.bts)-1, so for a word size that isn't a
-                    # multiple of 8 (e.g. .bits::11), num_bytes*8 is larger
-                    # than the actual field (16 vs. 11 bits), so raw_val
-                    # (which never exceeds 2**bts-1) could never reach the
-                    # byte-rounded halfway point and negative values were
-                    # never sign-extended -- corrupting the addend by
-                    # exactly 2**bts for every negative pc-relative/relocated
-                    # value on such targets.
                     _field_bits = num_words * self.state.bts
                     if _field_bits > 0 and raw_val >= (1 << (_field_bits - 1)):
                         raw_val -= (1 << _field_bits)
 
                     abs_w_bytes = int(abs_w) * bpw_r
 
-                    # A field whose encoded value already equals the label's raw
-                    # address (rather than a small displacement) is actually an
-                    # absolute reference that only guessed a pc-relative reloc type
-                    # from its byte width; reclassify to the matching abs type.
-                    # Kept x86_64-only (as before consolidation): the other
-                    # registered architectures' width_guess tables were built
-                    # and validated without this extra reclassification step,
-                    # so extending it to them would be a behavior change this
-                    # pass deliberately avoids (see ELF_MACHINES' docstring).
                     if (_rtype_is_default_guess and rtype in _pc_rel_types_all
                             and raw_val == abs_w_bytes and self.state.elf_machine == 62):
                         _rmap_abs_default = {8: 1, 4: 10, 2: 12, 1: 14}
                         rtype = _rmap_abs_default.get(num_bytes, rtype)
 
-                    # M68K (machine 4): width_guess alone can't disambiguate a
-                    # byte/word/long-width field, since on this target the SAME
-                    # width holds both PC-relative branch/DBcc/BSR displacements
-                    # (68000.axx computes these as "e-($$+2)") and absolute
-                    # references (byte/word immediates like "CMPI.W #label,d0",
-                    # and the 4-byte absolute-long EA operand of e.g.
-                    # "JSR label"). width_guess's static per-width default
-                    # (abs for 1/2 bytes, pc32 for 4) is right for immediates
-                    # and JSR's counterpart wrong, and wrong for branches --
-                    # confirmed against a real m68k-linux-gnu-ld: linking the
-                    # unpatched output at a non-zero base corrupted every
-                    # branch target and made "JSR label" always jump to
-                    # absolute address 0 regardless of where label actually
-                    # ended up. Resolved the same way as the x86_64 rule just
-                    # above: compare the value already baked into the field
-                    # against the label's raw absolute address.
                     if _rtype_is_default_guess and self.state.elf_machine == 4:
-                        _m68k_abs_default = {4: 1, 2: 2, 1: 3}   # abs32/abs16/abs8
-                        _m68k_pc_default = {4: 4, 2: 5, 1: 6}    # pc32/pc16/pc8
+                        _m68k_abs_default = {4: 1, 2: 2, 1: 3}
+                        _m68k_pc_default = {4: 4, 2: 5, 1: 6}
                         if rtype in _pc_rel_types_all and raw_val == abs_w_bytes:
-                            # Guessed pc-relative (JSR/JMP/LEA/PEA's absolute-long
-                            # EA, 4 bytes), but the baked field IS the label's raw
-                            # address rather than a computed delta -> really absolute.
                             rtype = _m68k_abs_default.get(num_bytes, rtype)
                         elif rtype not in _pc_rel_types_all and raw_val != abs_w_bytes:
-                            # Guessed absolute (Bcc/DBcc/BSR's word/byte-width
-                            # field), but the baked value is a small delta, not
-                            # the label's address -> it was computed as
-                            # target-PC, so it's really PC-relative.
                             rtype = _m68k_pc_default.get(num_bytes, rtype)
 
                     if rtype in _pc_rel_types_all:
-                        # addend = raw_val - abs_w_bytes + P, where P is this
-                        # instruction word's own address. P MUST be expressed in
-                        # the same frame (section-relative vs. raw) as raw_val's
-                        # embedded `$`/`$.` computation was — otherwise addend is
-                        # off by the raw/section-relative skew whenever this
-                        # section isn't first in the output file. See
-                        # LabelManager._section_relative_offset's docstring; this
-                        # was the root cause of a real segfault (got.s/foo.c) when
-                        # `.rodata` preceded `.text` and P still used raw pc while
-                        # raw_val had already been converted to section-relative.
                         _P_raw = (self.state.pc + first_widx) * bpw_r
                         _P_adj = self.label_manager._section_relative_offset(
                             self.state.current_section, self.state.pc + first_widx)
@@ -6854,7 +5605,6 @@ class Assembler:
                         addend = raw_val - abs_w_bytes + P_asm_bytes
 
                     else:
-                        # Absolute reference: no instruction-address term needed.
                         addend = raw_val - abs_w_bytes
 
                     self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend, num_bytes))
@@ -6882,9 +5632,6 @@ class Assembler:
         return True
 
     def lineassemble0(self, line):
-        """Wrapper around `lineassemble` that additionally echoes each source
-        line (with its resolved pc) when in verbose/listing mode (pass 2 with
-        `-v`, or the dedicated listing pass 0) and advances `state.ln`."""
         cleaned = line.replace('\n', '').replace('\r', '')
         _show = (self.state.pas == 2 and self.state.verbose) or self.state.pas == 0
         if _show:
@@ -6898,29 +5645,11 @@ class Assembler:
         return f
 
     def setpatsymbols(self, pat):
-        """Pre-scan the whole pattern file's `.setsym`/`.clearsym` directives
-        once up front, building `state.patsymbols` — the symbol-table baseline
-        that `lineassemble` resets `state.symbols` to before each source line
-        (mid-file `.setsym`/`.clearsym` encountered during actual matching can
-        still further adjust it for subsequent lines within the same pass).
-
-        Also applies a `.bits` directive as soon as it's seen, the same way,
-        so `state.bts`/`state.endian` already reflect the pattern file's real
-        word width by the time `run()` processes a `-i` label-import file
-        (which happens right after this call, before any source line is
-        assembled) — `.bits` is normally only applied lazily while scanning
-        `state.pat` during actual line assembly (see `lineassemble2`), which
-        would otherwise leave `state.bts` at its default (8) during import,
-        corrupting the bytes-per-word conversion `imp_label()` needs."""
         fresh = {}
         for i in pat:
             if i is None:
                 continue
             if len(i) > 0 and i[0] == '.setsym':
-                # Same readpat() 2-field-vs-3-field indexing quirk fixed in
-                # DirectiveProcessor.set_symbol(): a name-only ".setsym::FOO"
-                # line puts "FOO" in i[2], not i[1] (only the 3-field
-                # ".setsym::FOO::value" form uses i[1] for the name).
                 if len(i) >= 2 and i[1]:
                     key = StringUtils.upper(i[1])
                     self.state.symbols = dict(fresh)
@@ -6944,19 +5673,7 @@ class Assembler:
         self.state.symbols = dict(fresh)
 
     def fileassemble(self, fn):
-        """Assemble source file `fn` line by line (or `state.stdin_tmp_path`'s
-        cached copy of stdin, so stdin can be read once and reused across
-        both assembly passes). Tracks the include stack (`fnstack`/`lnstack`)
-        for circular-`.INCLUDE` detection and for restoring `current_file`/`ln`
-        on return."""
 
-        # Entering the top-level source file means a new assembly pass has
-        # begun (Pass 1 re-reads the whole file on every relaxation
-        # iteration, then Pass 2 reads it once more).  The macro layer must
-        # start from a clean slate each time so that expansion is textually
-        # identical on every pass; macro state is deliberately NOT reset for
-        # a nested `.INCLUDE`, so a macro defined before the include stays
-        # visible inside it.
         if not self.state.fnstack:
             self.macro_proc.reset_pass()
 
@@ -6977,16 +5694,6 @@ class Assembler:
                 self.state.diag(f" error - circular .INCLUDE detected: '{fn}' is already being assembled.", set_error=True)
                 return
 
-        # Bugfix: push `fn` itself (the file about to be entered), not the
-        # caller's current_file. fnstack must contain the exact stack of
-        # files currently open so the cycle check above can see a file that
-        # re-includes ITSELF directly (`.INCLUDE` of its own name): pushing
-        # the caller's file instead left `fn` absent from fnstack for its
-        # first (direct) re-entry, so a self-including file got assembled
-        # twice -- duplicating its emitted bytes at wrong addresses -- before
-        # the cycle was finally caught one level deeper. current_file/ln are
-        # restored from locals in `finally` instead, decoupling that concern
-        # from the cycle-detection stack.
         _caller_file = self.state.current_file
         self.state.fnstack.append(fn)
         self.state.lnstack.append(self.state.ln)
@@ -7004,14 +5711,6 @@ class Assembler:
                         stdintmp.write(af)
                 fn = self.state.stdin_tmp_path
 
-            # Fix: this open() was unguarded, so a mistyped `.INCLUDE
-            # "utils.s"` (or a missing top-level source file) escaped as an
-            # unhandled FileNotFoundError traceback rather than an assembler
-            # diagnostic -- no file:line, and a Python stack dump in place of
-            # the message.  `.INCLUDE` of a directory raised IsADirectoryError
-            # the same way.  caxx had the mirror-image problem (it printed a
-            # bare line and carried on), so both sides are now brought to the
-            # wording -P/-p already used.
             try:
                 with open(fn, "rt", encoding="utf-8") as f:
                     af = f.readlines()
@@ -7020,12 +5719,6 @@ class Assembler:
                                 set_error=True)
                 return
 
-            # Macro-expand before assembling.  `expand()` returns
-            # (text, file, lineno) triples where `lineno` is the ORIGINAL
-            # source line the text came from (inside a macro body, the line
-            # of that body line in the file that defined it), so assembler
-            # diagnostics, the `-v` listing and DWARF line records all keep
-            # pointing at real source rather than at expansion offsets.
             for _mtext, _mfile, _mln in self.macro_proc.expand(af, self.state.current_file):
                 self.state.current_file = _mfile
                 self.state.ln = _mln
@@ -7036,8 +5729,6 @@ class Assembler:
             self.state.ln = self.state.lnstack.pop()
 
     def file_input_from_stdin(self):
-        """Slurp all of stdin (used once, then cached to a temp file by
-        `fileassemble` so both assembly passes can re-read the same input)."""
         af = ""
         while True:
             line = sys.stdin.readline()
@@ -7047,12 +5738,6 @@ class Assembler:
         return af
 
     def imp_label(self, l):
-        """Parse one line of a `--import` label file: either a 3-field section
-        record (`name\\tstart_hex\\tsize_hex`, accumulated into `_imp_sections`
-        for address-to-section lookup) or a 2-field label record
-        (`name[::reloctype]\\tvalue_hex`), which is registered as an imported
-        (`labels[name][3] = True`) label whose section is inferred by finding
-        which previously-seen section record its address falls within."""
         l = l.rstrip('\r\n')
         if not l:
             return False
@@ -7104,22 +5789,6 @@ class Assembler:
                 if _found:
                     break
 
-            # Bugfix: `_write_export()` (see `_write_export`'s `lbl_addr`
-            # computation) writes non-.EQU label addresses in BYTES
-            # (word_value * bpw), matching the ELF st_value convention. But
-            # `state.labels[k][0]` is used everywhere else in this file
-            # (ELF st_value, DWARF addresses, $$/$. pc-relative math, ...)
-            # as a raw WORD pc, which those consumers themselves multiply by
-            # bpw as needed. Storing the byte-scaled `v` here directly,
-            # unconverted, double-counted bpw for every reference to an
-            # imported label whenever bpw != 1 (state.bts not a multiple of
-            # 8) -- e.g. a label imported at byte offset 4 on a 16-bit-word
-            # target (bpw=2) was silently treated as word offset 4 (byte 8)
-            # instead of the correct word offset 2. Section-membership
-            # comparisons above intentionally still use the byte-scaled `v`
-            # against `_imp_sections`' byte-scaled ranges (both exported by
-            # the same `_write_export()`, so they're mutually consistent);
-            # only the value finally stored needs converting back to words.
             bpw = max(1, (self.state.bts + 7) // 8)
             v_words = v // bpw
 
@@ -7132,17 +5801,9 @@ class Assembler:
         return False
 
     def printaddr(self, pc):
-        """Print a 16-hex-digit address prefix (verbose/listing mode)."""
         print("%016x: " % pc, end='')
 
     def _section_word_ranges(self, name):
-        """All recorded fragments (start, length) of section `name`, in the
-        order they were closed in `state.section_ranges`; falls back to the
-        section's single still-open span (`state.sections[name]`) if it was
-        never fragmented/closed — used by `_addr_to_word_offset` for DWARF
-        line-table generation (a separate consumer of the same raw-pc-to-
-        section-relative-offset problem `LabelManager._section_relative_offset`
-        solves for label values)."""
         ranges = [(rs, rl) for (rn, rs, rl) in self.state.section_ranges if rn == name]
         if ranges:
             return ranges
@@ -7152,17 +5813,6 @@ class Assembler:
         return []
 
     def _addr_to_word_offset(self, name, word_pc):
-        """Convert a raw global word-pc within section `name` to its word
-        offset in the final concatenated section, by walking `_section_word_ranges`
-        and accumulating prior fragments' lengths. Returns None if `word_pc`
-        doesn't fall in any recorded fragment of this section.
-
-        If `.SECTION`/`.SEGMENT` was never used at all this run, `state.sections`
-        stays empty and no fragments were ever recorded -- write_elf_obj's own
-        `not self.state.sections` branch treats that case as one single implicit
-        section starting at word 0, so the raw word_pc already IS the correct
-        section-relative offset; mirror that here instead of returning None
-        (which previously made every DWARF address collapse to 0)."""
         if not self.state.sections:
             return word_pc
         cum = 0
@@ -7173,30 +5823,14 @@ class Assembler:
         return None
 
     def _build_dwarf_sections(self, csecs, sec_name_to_idx, bpw, machine):
-        """Build minimal DWARF `.debug_line`/`.debug_line_str` (DWARF5) section
-        contents plus their relocations from `state.line_map` (recorded per
-        emitted instruction when `--debug`/`gen_debug` is on): one line-number
-        program per source file, mapping addresses back to (file, line).
-        Returns `([] , [])` if debug info wasn't requested or nothing was
-        recorded. `csecs`/`sec_name_to_idx` let this look up each referenced
-        code section's ELF section index for the address relocations it emits."""
         line_map = self.state.line_map
         if not self.state.gen_debug or not line_map:
             return [], []
 
         _mach_tbl_dw = ELF_MACHINES.get(machine)
-        # The *effective* class (native class, unless overridden by -f) is
-        # what actually gets written to disk in write_elf_obj() -- so that,
-        # not just the machine's conventional class, is what decides the
-        # address width (`addr_sz`) every address-sized field below uses.
-        # A 64-bit machine forced down to ELF32 via `-f 32` (e.g. `-m 62
-        # -f 32`), or a 32-bit machine forced up to ELF64, is honored the
-        # same way write_elf_obj() honors it for ordinary sections.
         _native_dw   = _mach_tbl_dw['elfclass'] if _mach_tbl_dw else 2
         _eff_class_dw = getattr(self.state, 'elf_class', None) or _native_dw
         if _mach_tbl_dw is None:
-            # Unknown machine: no dwarf_abs/is_rela entry to build correct
-            # relocations against, so there's nothing safe to emit.
             self.state.diag(f" warning - DWARF debug info (-g) is not supported for "
                  f"unknown machine {machine}; skipping debug sections.", set_error=False)
             return [], []
@@ -7204,28 +5838,17 @@ class Assembler:
         import struct as _struct
         _pk = '<' if self.state.endian != 'big' else '>'
 
-        # is_elf64_dw/addr_sz select the on-disk address width (DW_FORM_addr
-        # size, DW_LNE_set_address operand size, CU header address_size);
-        # is_rela_dw selects RELA (explicit per-entry addend, `.rela.debug_*`)
-        # vs REL (addend baked into the field bytes, `.rel.debug_*`) framing,
-        # exactly mirroring write_elf_obj's `_is_elf64`/`_is_rela` for
-        # ordinary code relocations -- DWARF's address relocations are just
-        # more absolute relocations against section symbols, so they follow
-        # the same per-target psABI convention as everything else in the
-        # object file.
         is_elf64_dw = (_eff_class_dw == 2)
         addr_sz = 8 if is_elf64_dw else 4
         is_rela_dw = _mach_tbl_dw.get('is_rela', True)
 
         def _pack_addr(v):
-            """Pack one address-sized (`addr_sz` bytes) unsigned field."""
             v &= (1 << (addr_sz * 8)) - 1
             return _struct.pack(f'{_pk}I', v) if addr_sz == 4 else _struct.pack(f'{_pk}Q', v)
 
         abs64 = _mach_tbl_dw['dwarf_abs']
 
         def _uleb(v):
-            """DWARF unsigned LEB128 encoding."""
             out = bytearray()
             v = int(v)
             while True:
@@ -7238,7 +5861,6 @@ class Assembler:
                     return bytes(out)
 
         def _sleb(v):
-            """DWARF signed LEB128 encoding."""
             out = bytearray()
             v = int(v)
             while True:
@@ -7252,11 +5874,6 @@ class Assembler:
         _csec_idx_by_name = {s.name: i + 1 for i, s in enumerate(csecs)}
 
         def _addr_to_sec(byte_addr, sec_name=None):
-            """Resolve a raw byte address (optionally hinted with its known
-            section name) to `(1-based ELF section index, section-relative
-            byte offset)`, via `_addr_to_word_offset`; used for DIE/line-table
-            address relocations, which must point at final output-file
-            positions, not raw assembly pcs."""
             word_pc = byte_addr // bpw if bpw else 0
             if sec_name is not None:
                 _idx = _csec_idx_by_name.get(sec_name)
@@ -7279,10 +5896,6 @@ class Assembler:
         DW_FORM_addr, DW_FORM_data2, DW_FORM_data8 = 0x01, 0x05, 0x07
         DW_FORM_string, DW_FORM_sec_offset = 0x08, 0x17
 
-        # .debug_abbrev: two abbreviation codes — (1) the compile-unit DIE
-        # with name/producer/comp_dir/low_pc/high_pc/stmt_list, and (2) a
-        # plain label DIE (name + low_pc) emitted once per non-.EQU,
-        # non-imported label below.
         abbrev = bytearray()
         abbrev += _uleb(1) + _uleb(DW_TAG_compile_unit) + bytes([DW_CHILDREN_yes])
         for at, fm in ((DW_AT_producer, DW_FORM_string),
@@ -7313,11 +5926,6 @@ class Assembler:
         comp_dir = os.getcwd()
         cu_name = line_map[0][2] or "(source)"
 
-        # .debug_info: one compile_unit DIE followed by one label DIE per
-        # exported/real label. info_relas collects (offset-into-die, section,
-        # reloc-type, addend) tuples for the low_pc fields, which need actual
-        # ELF relocations since the assembler doesn't know final link-time
-        # addresses (this is a relocatable .o, not a linked executable).
         info_relas = []
         die = bytearray()
         die += _uleb(1)
@@ -7327,9 +5935,7 @@ class Assembler:
         die += comp_dir.encode() + b'\x00'
         if primary_idx:
             info_relas.append((len(die), primary_idx, abs64, 0))
-        die += _pack_addr(0)  # low_pc: addend is always 0 here, so the
-                               # RELA placeholder and the REL real value
-                               # (both 0) are the same bytes either way.
+        die += _pack_addr(0)
         die += _struct.pack(f'{_pk}Q', primary_size & 0xFFFFFFFFFFFFFFFF)
         die += _struct.pack(f'{_pk}I', 0)
         for name, *_rest in sorted(self.state.labels.items()):
@@ -7349,10 +5955,7 @@ class Assembler:
             die += _uleb(2)
             die += name.encode() + b'\x00'
             info_relas.append((len(die), sidx, abs64, off))
-            die += _pack_addr(0 if is_rela_dw else off)  # RELA: placeholder,
-                               # real value lives in the relocation entry's
-                               # addend. REL: no addend field exists, so the
-                               # value must be baked into the field itself.
+            die += _pack_addr(0 if is_rela_dw else off)
         die += _uleb(0)
 
         info_body = (_struct.pack(f'{_pk}H', 4)
@@ -7371,11 +5974,6 @@ class Assembler:
                 files.append(fn)
                 file_idx[fn] = len(files)
 
-        # .debug_line: DWARF5 line-number program header (fixed opcode-base/
-        # standard-opcode-lengths, one directory, one file-name entry per
-        # distinct source file seen in line_map) followed by one line-number
-        # program per section that had instructions, each row advancing
-        # file/line/address registers by delta from the previous emitted row.
         hbody = bytearray()
         hbody += bytes([1])
         hbody += bytes([1])
@@ -7439,12 +6037,6 @@ class Assembler:
         debug_line = _struct.pack(f'{_pk}I', len(line_body)) + line_body
 
         def _pack_dbg_relocs(entries):
-            """Pack `(offset, symbol_idx, reloc_type, addend)` tuples into raw
-            Elf64_Rela/Elf32_Rela (explicit addend) or Elf64_Rel/Elf32_Rel (no
-            addend field -- already baked into the section bytes above)
-            records, selected by `is_elf64_dw`/`is_rela_dw` exactly the way
-            write_elf_obj's `_pack_rela`/`_pack_rel` select for ordinary code
-            relocations against the same target."""
             out = bytearray()
             if is_rela_dw:
                 if is_elf64_dw:
@@ -7484,31 +6076,6 @@ class Assembler:
         return prog_sections, rela_list
 
     def write_elf_obj(self, path: str, machine: int = 62) -> None:
-        """Emit an ELF32 or ELF64 relocatable object file (`.o`) at `path`
-        (ELF class selected by `state.elf_class`, i.e. -f/--format on the
-        CLI -- default ELF64/ELFCLASS64, independent of `machine`; see the
-        `_native_elfclass`/`_elfclass` split just below): builds
-        one output section per distinct section name seen (`_CSec`,
-        extracting its bytes from the sparse `binary_writer._buffer` via
-        `_extract`), appends DWARF debug sections from `_build_dwarf_sections`
-        if enabled (32- and 64-bit targets -- see that method), builds the
-        symbol table (locals, then exported/extern globals) and `.rela.*`
-        sections for `state.relocations` plus any DWARF relocations, and
-        writes the ELF header/section headers/`.shstrtab`/`.strtab`/
-        `.symtab` framing around it all. No linking is done here —
-        relocation addends were already computed correctly for the *final*
-        object-file section layout back in `lineassemble`/
-        `_build_dwarf_sections`; this method's job is purely to serialize
-        sections/symbols/relocations to the on-disk ELF format.
-
-        Emits RELA (`.rela.*`, explicit per-entry addend) or REL (`.rel.*`,
-        no addend field -- the addend is instead baked directly into the
-        relocated field's bytes) according to `ELF_MACHINES[machine]['is_rela']`,
-        matching each target's real psABI convention (i386 and ARM(32) use
-        REL; everything else in this table uses RELA). For a REL target,
-        the byte-patching pass right after `rela_entries` is built below
-        overwrites each relocated field with the addend value, since
-        nothing else would otherwise record it once the .o is written."""
         import struct as _struct
 
         bpw = max(1, (self.state.bts + 7) // 8)
@@ -7518,16 +6085,6 @@ class Assembler:
         _ei_data  = 1 if _is_le else 2
         _pk       = '<' if _is_le else '>'
 
-        # ELF class (32/64-bit container) is now selected independently of
-        # the target machine, via -f/--format (default: ELF64). This is
-        # deliberately NOT the same thing as ELF_MACHINES[machine]['elfclass']
-        # any more -- that field still records each architecture's
-        # *conventional* class (used only for the mismatch warning below and
-        # as the fallback for machines this build predates), but -f is now
-        # the sole authority actually written to disk, so combinations like
-        # `-m 62 -f 32` (EM_X86_64 in an ELFCLASS32 container -- the real
-        # x32 ABI's layout) are fully supported rather than silently
-        # forced back to the machine's usual class.
         _native_elfclass = ELF_MACHINES.get(machine, {}).get('elfclass', 2)
         _elfclass  = getattr(self.state, 'elf_class', None) or _native_elfclass
         if _elfclass != _native_elfclass:
@@ -7542,8 +6099,6 @@ class Assembler:
         _word_mask = 0xFFFFFFFFFFFFFFFF if _is_elf64 else 0xFFFFFFFF
 
         def _pack_ehdr(e_type, e_machine, e_shoff, e_shnum, e_shstrndx):
-            """Pack the Elf64_Ehdr/Elf32_Ehdr (section-header-only layout: no
-            program headers, entry point 0 — this is a relocatable object)."""
             ident = (b'\x7fELF'
                      + bytes([2 if _is_elf64 else 1, _ei_data, 1, self.state.osabi])
                      + b'\x00' * 8)
@@ -7576,7 +6131,6 @@ class Assembler:
 
         def _pack_shdr(sh_name, sh_type, sh_flags, sh_addr, sh_offset,
                        sh_size, sh_link, sh_info, sh_addralign, sh_entsize):
-            """Pack one Elf64_Shdr/Elf32_Shdr section header."""
             if _is_elf64:
                 return _struct.pack(f'{_pk}IIQQQQIIQQ',
                     sh_name, sh_type, sh_flags, sh_addr, sh_offset,
@@ -7586,10 +6140,6 @@ class Assembler:
                 sh_size, sh_link, sh_info, sh_addralign, sh_entsize)
 
         def _pack_sym(st_name, st_info, st_other, st_shndx, st_value, st_size):
-            """Pack one Elf64_Sym/Elf32_Sym symbol table entry. Field ORDER
-            (not just field width) differs between the two: Elf64_Sym is
-            name/info/other/shndx/value/size, but Elf32_Sym is
-            name/value/size/info/other/shndx."""
             if _is_elf64:
                 return _struct.pack(f'{_pk}IBBHQQ',
                     st_name, st_info, st_other, st_shndx, st_value, st_size)
@@ -7600,11 +6150,6 @@ class Assembler:
             return (x + a - 1) & ~(a - 1)
 
         def _extract(w_start, w_count):
-            """Extract `w_count` words starting at global word-pc `w_start`
-            from the sparse `binary_writer._buffer` dict, filling any unwritten
-            word with `state.padding` (so gaps left by e.g. `.ORG` without
-            `,P`, or by relaxation shrinking an earlier instruction, still
-            produce well-defined output bytes)."""
             n = w_count * bpw
             if n == 0:
                 return b''
@@ -7636,7 +6181,6 @@ class Assembler:
             return bytes(data)
 
         class _CSec:
-            """One finished output section's name, extracted byte data, and ELF flags."""
             __slots__ = ('name', 'byte_start', 'data', 'byte_size', 'flags')
 
             def __init__(self, name, byte_start, data, flags):
@@ -7646,10 +6190,6 @@ class Assembler:
                 self.byte_size  = len(data)
                 self.flags      = flags
 
-        # Build one output section per section name, concatenating each
-        # section's fragments in the order they were closed (_section_word_ranges)
-        # rather than by raw pc — this is the byte layout the linker will
-        # actually see, and must match what _find_shndx/relocations assume.
         csecs = []
         max_w = max(buf.keys(), default=-1)
 
@@ -7692,12 +6232,6 @@ class Assembler:
                 rela_entries[sidx].append((off, sym_name, rtype, addend, nbytes))
 
         if not _is_rela:
-            # REL-style target (see ELF_MACHINES' `is_rela` docstring): there
-            # is no addend field in the relocation entry, so the addend
-            # `lineassemble` computed must be baked directly into the
-            # relocated field's bytes instead of the *originally encoded*
-            # value (raw_val) that's there now -- a REL consumer reads that
-            # field back as the implicit addend.
             for sidx, entries in rela_entries.items():
                 csec = csecs[sidx - 1]
                 patched = bytearray(csec.data)
@@ -7745,11 +6279,6 @@ class Assembler:
         shstrtab = bytes(shstrtab)
 
         def _find_shndx(byte_addr, sec_name=None):
-            """Resolve a raw byte address (with a section-name hint when known)
-            to `(1-based section header index, section-relative byte offset)`
-            for a symbol table entry. Falls back to a nearest-section guess by
-            `byte_start` only if the address can't be placed in any recorded
-            fragment (shouldn't normally happen for real labels)."""
             word_pc = byte_addr // bpw if bpw else 0
             if sec_name is not None:
                 _idx = sec_name_to_idx.get(sec_name)
@@ -7777,11 +6306,6 @@ class Assembler:
         strtab = bytearray(b'\x00')
         syms   = []
 
-        # ELF requires all STB_LOCAL symbols to precede STB_GLOBAL ones in
-        # .symtab (st_info's binding nibble), tracked by sh_info on .symtab
-        # (first_global, set below). Order here: null symbol, one STT_SECTION
-        # symbol per section, then local (non-exported, non-imported) labels,
-        # then imported labels, then exported labels — all as globals.
         syms.append(_pack_sym(0, 0, 0, 0, 0, 0))
 
         for i in range(ncs):
@@ -7796,10 +6320,6 @@ class Assembler:
             is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
             if name in export_keys or is_imported:
                 continue
-            # A plain .EQU (no ::reloctype) is a pure constant, not tied to any
-            # section — encode it as SHN_ABS (0xfff1) with its raw value; one
-            # WITH a reloc_type override is a section-relocatable alias (like
-            # tape_a) and must resolve to a real section+offset instead.
             _equ_has_reloc = is_equ and len(_lentry[0]) > 4 and _lentry[0][4] is not None
             if is_equ and not _equ_has_reloc:
                 shndx, sym_val = 0xfff1, val
@@ -7867,14 +6387,6 @@ class Assembler:
         _REL_ENTSIZE_ACTIVE = _RELA_ENTSIZE if _is_rela else _REL_ENTSIZE
 
         def _pack_rela(r_offset, r_sym, r_type, r_addend):
-            """Pack one Elf64_Rela/Elf32_Rela record (explicit addend).
-            r_info's bit layout differs between the two classes -- Elf64
-            packs a 32-bit sym index and a 32-bit type into 64 bits
-            (`sym<<32 | type`), but Elf32 packs an only-24-bit sym index and
-            an 8-bit type into 32 bits (`sym<<8 | type`); every
-            relocation-type number this assembler uses for a 32-bit-class
-            machine fits in 8 bits (see ELF_MACHINES), so no truncation
-            happens in practice."""
             if _is_elf64:
                 r_info = (r_sym << 32) | (r_type & 0xffffffff)
                 _MAX, _MIN = (1 << 63) - 1, -(1 << 63)
@@ -7892,9 +6404,6 @@ class Assembler:
             return _struct.pack(f'{_pk}IIi', r_offset, r_info, r_addend)
 
         def _pack_rel(r_offset, r_sym, r_type):
-            """Pack one Elf64_Rel/Elf32_Rel record: same r_info layout as
-            _pack_rela's, but with no addend field at all -- the addend was
-            already patched directly into the section's bytes above."""
             if _is_elf64:
                 r_info = (r_sym << 32) | (r_type & 0xffffffff)
                 return _struct.pack(f'{_pk}QQ', r_offset, r_info)
@@ -7916,16 +6425,6 @@ class Assembler:
                 )
             rela_datas.append(data)
 
-        # File layout: Ehdr, then section data (16-byte aligned), rela data
-        # (8-byte aligned), symtab, strtab, shstrtab, DWARF sections/relas
-        # (32- and 64-bit targets), then the section header table itself
-        # (shdr_off) — a conventional ELF32/ELF64 relocatable-object layout
-        # that any standard linker can read.
-        # SHT_NOBITS (.bss) sections must NOT consume file space.
-        # ELF spec: "A section of type SHT_NOBITS occupies no space in the
-        # file."  We record sh_offset = current offset (any valid offset is
-        # fine; linkers ignore it for NOBITS) but do NOT advance past the
-        # section data.  Mirrors caxx.c's weo_isno()/"Fix 1B".
         def _is_nobits(s):
             return s.name.upper().startswith('.BSS')
 
@@ -7976,13 +6475,6 @@ class Assembler:
         try:
             _elf_file = open(path, 'wb')
         except OSError as _e:
-            # Bugfix: this used to be unconditional (no should_report_errors()
-            # gate) and never set had_error, and run() (the only caller)
-            # never checked write_elf_obj()'s return value either -- so a
-            # failure to even open the output file (e.g. a nonexistent
-            # directory in the -o path) printed a clear error yet still
-            # exited 0 with no file written, silently breaking any build
-            # system that only checks the exit code.
             self.state.diag(f" error - cannot create ELF output file '{path}': {_e}", set_error=True)
             return
         with _elf_file as f:
@@ -7991,7 +6483,6 @@ class Assembler:
             for i, s in enumerate(csecs):
                 cur = f.tell()
                 f.write(b'\x00' * (sec_offsets[i] - cur))
-                # NOBITS sections (.bss) have no file bytes — skip the write.
                 if not _is_nobits(s):
                     f.write(s.data)
 
@@ -8030,7 +6521,7 @@ class Assembler:
 
             _word_align = 8 if _is_elf64 else 4
             _sym_entsize = 24 if _is_elf64 else 16
-            _rela_sh_type = 4 if _is_rela else 9   # SHT_RELA : SHT_REL
+            _rela_sh_type = 4 if _is_rela else 9
             for ri, sidx in enumerate(rela_sec_order):
                 f.write(_pack_shdr(
                     rela_name_offs[ri], _rela_sh_type, 0x40, 0,
@@ -8055,11 +6546,6 @@ class Assembler:
                     dbg_prog_name_offs[i], 1, 0, 0,
                     dbg_prog_offsets[i], len(ddata), 0, 0, 1, 0))
             for i, (rname, tname, rdata) in enumerate(dbg_rela):
-                # Same SHT_RELA/SHT_REL, alignment and entsize convention as
-                # the ordinary code-relocation sections above (_rela_sh_type/
-                # _word_align/_REL_ENTSIZE_ACTIVE) -- _build_dwarf_sections
-                # packed these DWARF relocations against the same machine/
-                # class, so they share the same on-disk record format.
                 f.write(_pack_shdr(
                     dbg_rela_name_offs[i], _rela_sh_type, 0x40, 0,
                     dbg_rela_offsets[i], len(rdata),
@@ -8073,12 +6559,6 @@ class Assembler:
               file=sys.stderr)
 
     def _build_arg_parser(self):
-        """Build the `argparse` CLI: `axx.py patternfile [sourcefile] [options]`,
-        with `-o` selecting ELF object output (vs. `-b` for raw binary),
-        `-f` choosing the ELF class (32/64, default 64), `-e`/`-E`/`-i` for
-        label export/import, `-m` for target machine, and `-g` for DWARF
-        debug info generation (only meaningful with `-o`; supports both
-        32- and 64-bit ELF output -- see `_build_dwarf_sections`)."""
         import argparse
         ap = argparse.ArgumentParser(
             prog='axx',
@@ -8157,14 +6637,6 @@ class Assembler:
         return ap
 
     def _macro_expand_only(self, sourcefile, dest):
-        """`-P/--macro-expand`: run only the macro layer over `sourcefile` and
-        write the expanded assembly to `dest` ("-" = stdout), then stop.
-
-        Each emitted line keeps a trailing origin marker in a comment so a
-        macro-generated line can be traced back to the body line that
-        produced it. Note that `.INCLUDE`d files are NOT followed here (they
-        are pulled in by the assembler, not by this layer); `!include`d files
-        are, since those are expanded by the macro layer itself."""
         self.macro_proc.reset_pass()
         try:
             with open(sourcefile, "rt", encoding="utf-8") as f:
@@ -8193,13 +6665,6 @@ class Assembler:
         return True
 
     def _pat_macro_expand_only(self, patternfile, dest):
-        """`-p/--macro-expand-pattern`: run only the macro layer over the pattern
-        file and write the expanded pattern text to `dest` ("-" = stdout),
-        then stop.
-
-        `.INCLUDE`d pattern files are NOT followed here (the pattern reader
-        pulls those in, not this layer); `!include`d ones are, since those are
-        expanded by the macro layer itself."""
         self.pat_macro_proc.reset_pass()
         try:
             with open(patternfile, "rt", encoding="utf-8") as f:
@@ -8228,10 +6693,6 @@ class Assembler:
 
     @staticmethod
     def _normalise_macro_expand_argv(argv):
-        """`-P/--macro-expand` takes an optional argument, which argparse would
-        greedily fill with the next positional (so `axx.py -P pat.axx src.s`
-        loses the pattern file).  Mirror caxx.c's rule instead: consume the
-        following token only when both positionals are already in hand."""
         _with_arg = {'--osabi', '-b', '-e', '-E', '-i', '-o', '-m'}
         out, positional, i = [], 0, 0
         while i < len(argv):
@@ -8241,9 +6702,6 @@ class Assembler:
                 i += 2
                 continue
             if a in ('-P', '--macro-expand', '-p', '--macro-expand-pattern'):
-                # `-p` only ever needs the pattern file, so it may take its
-                # optional FILE as soon as that one positional is in hand;
-                # `-P` expands a source file and so waits for both.
                 need = 1 if a in ('-p', '--macro-expand-pattern') else 2
                 if (i + 1 < len(argv) and not argv[i + 1].startswith('-')
                         and positional >= need):
@@ -8260,33 +6718,6 @@ class Assembler:
         return out
 
     def run(self):
-        """Top-level entry point (called from `main()`). Parses CLI args, then:
-
-        - No sourcefile: interactive REPL mode (`pas=0`), one line at a time,
-          `?` prints all labels via `LabelManager.printlabels`.
-        - Sourcefile given: runs Pass 1 relaxation (`pas=1`) up to `MAX_RELAX`
-          times, re-assembling the WHOLE file from scratch each iteration
-          (resetting pc/labels/sections/section_ranges) since variable-length
-          instructions can change size as forward-referenced label addresses
-          shift, which can in turn change other instructions' sizes. Converges
-          when the current iteration's `(label_pc, label_section)` snapshot
-          exactly matches a previously-seen snapshot AND the cycle length is 1
-          (identical to the immediately preceding iteration) — a longer cycle
-          means it's oscillating between distinct layouts and will never
-          settle, which is reported as a hard error since output would be
-          simply wrong. Then runs Pass 2 (`pas=2`) once for real encoding +
-          relocation/line-map recording, and cross-checks Pass 1's final label
-          addresses against Pass 2's actual addresses (`_drift`) as a sanity
-          check that relaxation genuinely converged (a mismatch here would
-          mean corrupted output, so it's also a hard abort).
-
-        Finally flushes the binary writer, optionally writes the ELF object
-        (`write_elf_obj`) and/or plain-binary output, and optionally writes
-        `-e`/`-E` label-export TSV files (`_write_export`, with the `-E`
-        variant additionally recording each section's ELF flags and each
-        label's reloc_type override, for round-tripping through `-i` in a
-        later separate assembly of a different file against the same
-        pattern set)."""
         ap = self._build_arg_parser()
 
         if len(sys.argv) == 1:
@@ -8313,9 +6744,6 @@ class Assembler:
             return False
         self.state.elf_machine  = args.elf_machine
 
-        # -f {32,64}: ELF class for -o output, independent of -m. argparse's
-        # choices=(32, 64) already rejects anything else, so this is just
-        # the 64/32 -> ELFCLASS64/ELFCLASS32 (2/1) mapping.
         self.state.elf_class    = 2 if args.elf_format == 64 else 1
 
         if args.elf_osabi not in osabitbl:
@@ -8345,10 +6773,6 @@ class Assembler:
 
             if self.state.impfile:
 
-                # Fix: unguarded open() -- a missing -i file raised a raw
-                # traceback here (and caxx ignored the failure in complete
-                # silence, emitting a binary in which every imported symbol
-                # resolved to 0).
                 try:
                     with open(self.state.impfile, 'rt', encoding="utf-8") as label_file:
                         raw_lines = label_file.readlines()
@@ -8403,9 +6827,6 @@ class Assembler:
                 _initial_vars = list(self.state.vars)
 
                 for relax_iter in range(MAX_RELAX):
-                    # Only the first iteration has no previous-iteration
-                    # estimates to work from; from the second onwards every
-                    # forward reference resolves through _relax_prev_values.
                     self.state._relax_optimistic = (relax_iter == 0)
                     self.state.pc = 0
                     self.state.pas = 1
@@ -8428,10 +6849,6 @@ class Assembler:
                             _e1[1] += _blk1
                             self.state.section_ranges.append((_last_sec1, _ep1, _blk1))
 
-                    # A label whose value is still UNDEF-derived means some
-                    # forward reference hasn't resolved yet this iteration;
-                    # convergence can't be judged from PCs alone until that
-                    # clears, so skip the cycle-detection check for this round.
                     current_pcs = {k: (v[0], v[1]) for k, v in self.state.labels.items()}
                     has_undef = any(
                         _is_undef_derived(pc)
@@ -8477,9 +6894,6 @@ class Assembler:
                             print(f"         Labels still changing: {', '.join(changed[:10])}", file=sys.stderr)
                     return False
 
-                # Relaxation is done; Pass 2 must NOT consult the first-
-                # iteration optimistic seed (it has to report a genuinely
-                # undefined label rather than silently estimating it).
                 self.state._relax_optimistic = False
 
                 _pass1_final_addrs = {
@@ -8506,10 +6920,6 @@ class Assembler:
                         _e[1] += _block
                         self.state.section_ranges.append((_last_sec, _entry_pc, _block))
 
-                # Sanity check: Pass 1's converged addresses should exactly match
-                # what Pass 2 actually computes; any mismatch means relaxation
-                # didn't truly converge (a bug, not a normal condition) and the
-                # emitted addresses/relocations would be wrong, so treat it as fatal.
                 _drift = []
                 for k, p2 in ((kk, vv[0]) for kk, vv in self.state.labels.items()
                               if not (len(vv) > 2 and vv[2])):
@@ -8541,10 +6951,6 @@ class Assembler:
 
             self.binary_writer.flush()
 
-            # Fix: flush() can itself report an error (output size over
-            # _MAX_OUTPUT_BYTES), in which case no binary is written -- but
-            # nothing looked at had_error afterwards, so axx.py exited 0 and
-            # a build script saw a successful run that produced no file.
             if self.state.had_error:
                 return False
 
@@ -8562,12 +6968,6 @@ class Assembler:
                       file=sys.stderr)
 
             def _write_export(path, elf):
-                """Write one export TSV: a `section\\tstart\\tsize[\\tflags]` line
-                per section fragment, then a `label[::reloctype]\\taddress` line
-                per exported label. `elf=1` (the `-E` form) additionally emits
-                ELF section flags and each label's explicit reloc_type (if any),
-                so a later `-i` import of this file preserves relocation-type
-                info for cross-file references; `elf=0` (`-e`) omits both."""
                 h   = list(self.state.export_labels.items())
                 key = list(self.state.sections.keys())
                 _bpw_export = max(1, (self.state.bts + 7) // 8)
@@ -8631,7 +7031,6 @@ class Assembler:
 
 
 def main():
-    """Create a fresh `Assembler` and run it; returns True on success."""
     assembler = Assembler()
     return assembler.run()
 

@@ -1,30 +1,40 @@
+
 /*
- * axx general assembler designed and programmed by Taisuke Maekawa
- * C translation (complete, behavior-compatible)
+ * caxx — axx 汎用アセンブラの C 実装
  *
- * Bug fixes applied (bugs 2-8, original):
- *  2. remove_brackets_str(): use unique serials per OB so parallel groups are distinguishable
- *  3. pat_match0(): avoid UB from 1<<cnt when cnt>=32; use size_t/uint64 mask
- *  4. u256_pow(): use full 256-bit exponent (no 0xffff truncation)
- *  5. expr_term11(): lazy evaluation – only evaluate the chosen branch
- *  6. ieee754_128_from_str()/xeval(): shell-escape via execvp-style popen to avoid injection
- *  7. adir_label_processing(): pass l2 (expression tail) instead of full l to expr_expression_asm
- *  8. expr_term6(): guard tv==256 in sign-extension shl to avoid zero-mask
+ * 同じディレクトリの axx.py（Python 版・こちらが原典）の移植であり、
+ * 同一の入力に対して同一のバイト列を出すことを目標に保守されている。
+ * 仕様・設計の説明は axx.py 冒頭のコメントを参照。
  *
- * Additional bug fixes (secondary pass):
- *  A. u256_pow(): avoid unnecessary base squarings after last set bit (performance fix)
- *  B. lmap_free(): reset nbuckets to 0 to prevent stale-count use after free
- *  C. secmap_clear(): zero out dangling pointers in order[] after freeing entries
- *  D. binary_flush(): guard max_pos==UINT64_MAX to prevent silent integer overflow
- *  E. ieee754_128_from_str(): unlink temp script on ALL exit paths (was leaking on !safe)
- *  F. xeval(): unlink temp script on ALL exit paths (was leaking on spawn failure)
- *  G. expr_term11(): add skip_ternary_expr() so nested ternaries in false-branch are
- *     fully skipped (not just up to the inner '?') when the condition is true
- *  H. ivv_push(): add NULL-check after realloc (was missing, unlike every other push helper)
- *  I. binary_flush(): guard total_size > SIZE_MAX before cast to size_t (32-bit heap corruption)
- *  J. weo_pad(): guard ftell() < 0 to avoid silent padding skip on I/O error
- *  K. int_cmp(): replace subtraction with branchless 3-way compare to avoid signed overflow
- *  L. expr_term0(): set x=0 on division by zero (was silently returning the dividend)
+ * axx は命令セットをコードに埋め込まず、外部のパターンファイル（.axx）から
+ * 「ニーモニックの書式 → バイナリエンコーディング」の対応を読み込む。
+ * パターンファイルを差し替えるだけで任意の ISA を扱える。
+ *
+ *     caxx <パターンファイル.axx> <ソース.s> -o <出力.o>
+ *
+ * 処理の流れ:
+ *   1. パターンファイル読み込み（readpat / .INCLUDE を再帰展開）
+ *   2. マクロ展開（macro_expand）
+ *   3. パス1: サイズ収束。可変長命令の長さが前方参照ラベルの値に依存するため、
+ *      全ラベルのアドレスが前回反復と一致するまで繰り返す（リラクゼーション）
+ *   4. パス2: 確定アドレスで実バイト列と ELF リロケーションを生成
+ *   5. 出力: ELF オブジェクト / 生バイナリ / ラベル TSV
+ *
+ * このファイルの大まかな構成（上から順に）:
+ *   - uint256_t          256bit 整数演算（アドレスと即値の内部表現）
+ *   - 各種コンテナ       ラベル表・シンボル表・セクション表・出力バッファ
+ *   - AsmState           アセンブル中の全状態
+ *   - axx_*              行の前処理（コメント除去・エスケープ・トークン切り出し）
+ *   - IEEE754 変換       32/64/128bit 浮動小数点のビットパターン生成
+ *   - expr_*             式評価器（優先順位ごとの再帰下降）
+ *   - pat_*              パターン照合
+ *   - dir_* / adir_*     パターン側 / ソース側のディレクティブ処理
+ *   - makeobj            エンコーディング欄からワード列を作る
+ *   - vliwprocess        VLIW/EPIC パケット組み立て
+ *   - lineassemble       1行を処理する主ループ
+ *   - write_elf_obj      ELF オブジェクト出力
+ *   - macro_*            行指向マクロ層（!if / !while / !def）
+ *   - main               コマンドライン処理と全体の駆動
  */
 
 #define _GNU_SOURCE
@@ -38,8 +48,6 @@
 #include <errno.h>
 #include <stdarg.h>
 
-/* 診断ファネル前方宣言 (定義は should_report_errors() の直後)。
- * このファイルの " error - " / " warning - " はすべてこれを通る。 */
 static void axx_diagf(int set_error, int force, const char *fmt, ...);
 static void m_pyrepr(const char *s, char *out, size_t outsz);
 #include <unistd.h>
@@ -48,8 +56,6 @@ static void m_pyrepr(const char *s, char *out, size_t outsz);
 #include <limits.h>
 #include <sys/wait.h>
 
-/* Portability helper: suppress -Wunused-function for API utilities that are
- * defined now but may be referenced by future callers or external tools.    */
 #ifdef __GNUC__
 #  define AXX_UNUSED __attribute__((unused))
 #else
@@ -57,25 +63,21 @@ static void m_pyrepr(const char *s, char *out, size_t outsz);
 #endif
 
 /* =========================================================
- * Big integer: 256-bit unsigned, stored as 4x uint64_t
- * lo[0] = least significant 64 bits ... lo[3] = most significant
- * Python's UNDEF = 0xffff...ff (256 bits of 1s)
+ * uint256_t — 256bit 整数
+ *
+ * アドレス・即値・ラベル値の内部表現。w[0] が最下位ワード。
+ * 256bit も必要なのは、axx が 128bit 浮動小数点（四倍精度）のビットパターンを
+ * 整数として扱うことと、未定義ラベルを巨大な番兵値で表現するため。
+ * 符号付きとして解釈する場合は最上位ビット（w[3] の bit63）が符号になる。
+ *
+ * 浮動小数点モード（st.exp_typ_float）では、同じ uint256_t を「C の double の
+ * ビットを w[0] にコピーしたもの」として使う。数値変換ではなくビット再解釈
+ * である点に注意（u256_to_double / double_to_u256 は memcpy で実装されている）。
  * ========================================================= */
 typedef struct { uint64_t w[4]; } uint256_t;
 static void u256_to_pydec(uint256_t a, char *out, size_t outsz);
 
-/* PatVar: a pattern-variable (a-z) slot: the captured value plus a genuine
- * provenance flag (is_undef) recording whether this value came from an
- * actually-failed label lookup, as opposed to merely being numerically
- * equal to the UNDEF sentinel (see UNDEF_VAL()/u256_is_undef_derived()
- * below for why the numeric value alone cannot be trusted to tell these
- * apart -- most notably, a legitimate immediate of exactly -1 is bit-
- * identical to UNDEF in this fixed-width 256-bit two's-complement type).
- * Bundling the flag into the same struct as the value means every existing
- * whole-array memcpy() of vars[26] (trial-match save/restore, best-match
- * snapshot/restore, macro !if/!while scoping, etc.) automatically carries
- * the provenance flag along with the value with no further changes needed
- * at those call sites. */
+/* パターン変数（a〜z）1個ぶんの束縛。is_undef は「まだ束縛されていない」印。 */
 typedef struct { uint256_t val; int is_undef; } PatVar;
 
 static uint256_t u256_zero(void) {
@@ -100,25 +102,10 @@ static int u256_is_zero(uint256_t a) {
 static int u256_eq(uint256_t a, uint256_t b) {
     return a.w[0]==b.w[0] && a.w[1]==b.w[1] && a.w[2]==b.w[2] && a.w[3]==b.w[3];
 }
-/* signed compare: treat as two's-complement 256-bit.
- *
- * Bug 1/3 fix: when both operands have the same sign, the correct ordering
- * is always the UNSIGNED ordering, regardless of sign.
- *
- * Proof: for two's-complement negatives, the more-negative (smaller signed)
- * value has a SMALLER unsigned representation.
- *   e.g. INT256_MIN = 0x8000...0  <  -1 = 0xFFFF...F  (both unsigned and signed)
- *   e.g. -2 = 0xFFFF...E  <  -1 = 0xFFFF...F          (both unsigned and signed)
- *
- * The original code inverted the comparison for negative operands (sa==1),
- * making every negative-vs-negative comparison return the wrong answer.
- */
 static int u256_lt_signed(uint256_t a, uint256_t b) {
     int sa = (int)(a.w[3] >> 63);
     int sb = (int)(b.w[3] >> 63);
-    /* Different signs: negative < positive */
     if (sa != sb) return sa > sb;
-    /* Same sign: plain unsigned word-by-word comparison (correct for both signs) */
     if (a.w[3] != b.w[3]) return a.w[3] < b.w[3];
     if (a.w[2] != b.w[2]) return a.w[2] < b.w[2];
     if (a.w[1] != b.w[1]) return a.w[1] < b.w[1];
@@ -173,7 +160,6 @@ static uint256_t u256_shl(uint256_t a, int n) {
     }
     return r;
 }
-/* arithmetic right shift */
 static uint256_t u256_sar(uint256_t a, int n) {
     if (n <= 0) return a;
     if (n >= 256) {
@@ -197,7 +183,6 @@ static uint256_t u256_sar(uint256_t a, int n) {
     }
     return r;
 }
-/* unsigned multiply: only lower 256 bits */
 static uint256_t u256_mul(uint256_t a, uint256_t b) {
     uint256_t r = u256_zero();
     for (int i=0;i<4;i++){
@@ -210,11 +195,9 @@ static uint256_t u256_mul(uint256_t a, uint256_t b) {
     }
     return r;
 }
-/* signed multiply (Python semantics, lower 256 bits) */
 static uint256_t u256_mul_signed(uint256_t a, uint256_t b) {
     return u256_mul(a,b);
 }
-/* unsigned divide: a // b */
 static uint256_t u256_udiv(uint256_t a, uint256_t b) {
     if (u256_is_zero(b)) return u256_zero();
     uint256_t q = u256_zero();
@@ -233,7 +216,6 @@ static uint256_t u256_udiv(uint256_t a, uint256_t b) {
     }
     return q;
 }
-/* Python floor division (signed): truncates toward negative infinity */
 static uint256_t u256_floordiv(uint256_t a, uint256_t b) {
     if (u256_is_zero(b)) { fprintf(stderr,"Division by zero\n"); return u256_zero(); }
     int sa = (int)(a.w[3]>>63);
@@ -248,15 +230,6 @@ static uint256_t u256_floordiv(uint256_t a, uint256_t b) {
     }
     return q;
 }
-/* Truncating division (toward zero), the C/gas sense of '/'.
- *
- * u256_floordiv() rounds toward negative infinity, which is what '//' means.
- * expr_term0() used to call it for '/' as well, so the two operators were
- * indistinguishable in integer mode: "(0-7)/2" produced -4 where axx.py
- * produced -3.  Keeping '/' truncating restores the distinction the operator
- * table draws between "division" and "integer division", and does it without
- * routing integer operands through a double (which would cap exact results at
- * 53 bits inside a 256-bit evaluator). */
 static uint256_t u256_truncdiv(uint256_t a, uint256_t b) {
     if (u256_is_zero(b)) { fprintf(stderr,"Division by zero\n"); return u256_zero(); }
     int sa = (int)(a.w[3]>>63);
@@ -267,28 +240,16 @@ static uint256_t u256_truncdiv(uint256_t a, uint256_t b) {
     if (sa != sb) q = u256_neg(q);
     return q;
 }
-/* Python modulo */
 static uint256_t u256_mod(uint256_t a, uint256_t b) {
     if (u256_is_zero(b)) { fprintf(stderr,"Division by zero\n"); return u256_zero(); }
     uint256_t q = u256_floordiv(a,b);
     return u256_sub(a, u256_mul(q,b));
 }
 
-/* -------------------------------------------------------
- * Bug 4 fix: u256_pow() – use the full 256-bit exponent.
- * The original truncated exp to 16 bits (& 0xffff), which
- * silently gave wrong results for any exponent >= 65536.
- * We now iterate over all 256 bits (square-and-multiply).
- * ------------------------------------------------------- */
-/* Fix A: u256_pow() – avoid unnecessary base squarings after the last set bit.
- * The original always performed 256 squarings regardless of exp magnitude.
- * We now break as soon as all remaining exp words are zero, so small exponents
- * (the common case) run in O(log2(exp)) multiplications instead of O(256). */
 static uint256_t u256_pow(uint256_t base, uint256_t exp) {
     uint256_t r = u256_one();
     for (int wi = 0; wi < 4; wi++) {
         uint64_t word = exp.w[wi];
-        /* If this and all higher words are zero, nothing more to do */
         if (!word) {
             int all_zero = 1;
             for (int k = wi + 1; k < 4; k++) if (exp.w[k]) { all_zero = 0; break; }
@@ -297,7 +258,6 @@ static uint256_t u256_pow(uint256_t base, uint256_t exp) {
         for (int bi = 0; bi < 64; bi++) {
             if (word & ((uint64_t)1 << bi))
                 r = u256_mul(r, base);
-            /* Only square base when there are more bits still to process */
             int last_bit = (wi == 3 && bi == 63);
             if (!last_bit)
                 base = u256_mul(base, base);
@@ -306,25 +266,13 @@ static uint256_t u256_pow(uint256_t base, uint256_t exp) {
     return r;
 }
 
-/* Convert to int64 (sign-extended from lower 64 bits for printing etc.) */
 static int64_t u256_to_i64(uint256_t a) { return (int64_t)a.w[0]; }
 static uint64_t u256_to_u64(uint256_t a) { return a.w[0]; }
 
-/* nbit: number of bits needed.
- * Fix #3: the 256-bit signed minimum value (0x8000...0) is its own negation
- * under two's-complement, so the original "if negative, negate first" approach
- * left it unchanged and the while-loop ran forever.
- * Fix: use a pure unsigned bit-scan over all 256 bits instead. */
 static int u256_nbit(uint256_t v) {
-    /* Mirrors axx.py nbit(): count bits of abs(v).
-     * abs() is the two's-complement absolute value: negate if the sign bit is set.
-     * Special case: the minimum value (0x8000...0) negates to itself under two's-
-     * complement, so we detect it separately and return 256. */
     int sign = (int)(v.w[3] >> 63);
     if(sign){
-        /* Negative: compute abs = -v = ~v + 1 */
         uint256_t av = u256_neg(v);
-        /* If negation overflowed back to the same value, it was INT256_MIN → 256 bits */
         if((int)(av.w[3] >> 63)){
             return 256;
         }
@@ -333,7 +281,6 @@ static int u256_nbit(uint256_t v) {
     int b = 0;
     for (int wi = 3; wi >= 0; wi--) {
         if (v.w[wi]) {
-            /* floor(log2(v.w[wi])) + 1 */
             uint64_t word = v.w[wi];
             int bits = 0;
             while (word) { word >>= 1; bits++; }
@@ -344,46 +291,10 @@ static int u256_nbit(uint256_t v) {
     return b;
 }
 
-/* UNDEF = 0xfff...f (256 bits) */
 static uint256_t UNDEF_VAL(void) { return u256_not(u256_zero()); }
 static int u256_is_undef(uint256_t a) { return u256_eq(a, UNDEF_VAL()); }
-/* B (axx.py port): centralized "UNDEF-derived" detection.
- * Python raised the threshold from 2^128 to 2^192:
- *   axx legitimately handles up to 256-bit values and 128-bit (quad) floats,
- *   so values >= 2^128 can occur legitimately and must NOT be mistaken for
- *   undefined. Real addresses fit in 64 bits and quad immediates are < 2^128,
- *   so no legitimate value reaches 2^192, while UNDEF (2^256-1) and
- *   UNDEF +/- displacement (~2^256) all have the top 64-bit word (w[3]) set.
- * Using the existing unsigned convention of this file (w[3] != 0  <=>  >= 2^192),
- * this matches axx.py's `v == UNDEF or abs(v) >= 2^192` for the dominant
- * (large-positive, near-2^256) UNDEF-derived case.
- *
- * 破綻点修正2 (axx.py port, ただし本質的な制約あり):
- * axx.pyは任意精度整数なので、番兵UNDEFを2^1024級まで押し上げて実用上
- * 衝突しない安全域を作れた。しかしこのCポートの値は本物の固定幅256bit
- * 整数(uint256_t)であり、型自体が256bitを超える値を表現できないため、
- * 同じ手は使えない。つまり[2^192, 2^256)の範囲(値域の上位1/4)にある
- * 正当な256bit定数(例: 全ビット1のビットマスクや256bit表現の-1)は、
- * 現状のヒューリスティックでは原理的にUNDEF由来と誤判定されうる。
- * この誤判定を型レベルで完全に無くすには値の表現方法自体を変える必要が
- * あり(全呼び出し箇所に影響する非常に大規模な変更になる)、このセッション
- * の修正範囲を超える。ここでは最低限、実際にその境界値域に達したことを
- * 検出できる場合に一度だけ警告し、無警告での誤判定を防ぐに留める。 */
 static int u256_is_undef_derived(uint256_t a) {
     if (u256_is_undef(a)) return 1;
-    /* 破綻点修正: 以前は符号なしのまま w[3]!=0 (>=2^192) だけを見ていたため、
-     * "全く普通の負の値" が軒並み誤判定されていた。uint256_tには符号の
-     * 概念が無く、負の値は二の補数表現で符号拡張されるため、上位ワードが
-     * 全て1になる点で「巨大な符号なし値」と見分けが付かない。例えば
-     * ".equ 0-1"(-1)は全ビット1になり、これはUNDEF自体の値と完全に一致
-     * するため u256_is_undef() で検出され、".equ 3-8"(-5)のような他の
-     * 小さな負の値も w[3]!=0 の網に掛かって無警告でシンボルテーブルから
-     * 消えていた(axx.pyは任意精度の符号付き整数なので abs(v) で正しく
-     * 小さいと判定できるが、Cでは符号付き解釈の絶対値を計算して初めて
-     * 同じ判定になる)。ここで符号付き絶対値を計算してから閾値と比較する
-     * ことで、-1 以外の負の値(実用上ほぼ全て)を正しく「未定義由来ではない」
-     * と判定できるようにする。値が厳密に-1(=UNDEFのビットパターンそのもの)
-     * である場合だけは、型の値域に本質的な制約があるため区別できない。 */
     int sign = (int)(a.w[3] >> 63);
     uint256_t av = sign ? u256_neg(a) : a;
     if (av.w[3] != 0) {
@@ -397,12 +308,9 @@ static int u256_is_undef_derived(uint256_t a) {
                        "out-of-band sentinel.\n");
         }
     }
-    return av.w[3] != 0;          /* signed absolute value >= 2^192 */
+    return av.w[3] != 0;
 }
 
-/* =========================================================
- * Dynamic string
- * ========================================================= */
 typedef struct {
     char   *buf;
     size_t  len;
@@ -442,9 +350,6 @@ static AXX_UNUSED void ds_appendc(DynStr *d, char c) {
 }
 static AXX_UNUSED const char *ds_get(const DynStr *d) { return d->buf ? d->buf : ""; }
 
-/* =========================================================
- * Dynamic array of uint256_t
- * ========================================================= */
 typedef struct {
     uint256_t *data;
     int        len;
@@ -470,9 +375,6 @@ static AXX_UNUSED void iv_append(IntVec *dst, const IntVec *src) {
     for(int i=0;i<src->len;i++) iv_push(dst, src->data[i]);
 }
 
-/* =========================================================
- * String vector
- * ========================================================= */
 typedef struct {
     char **data;
     int    len;
@@ -495,9 +397,6 @@ static AXX_UNUSED void sv_free(StrVec *v){
     free(v->data); sv_init(v);
 }
 
-/* =========================================================
- * int vector for file-line stack
- * ========================================================= */
 typedef struct { int *data; int len; int cap; } IStack;
 static void is_init(IStack*v){v->data=NULL;v->len=0;v->cap=0;}
 static void is_push(IStack*v,int x){
@@ -506,30 +405,17 @@ static void is_push(IStack*v,int x){
 }
 static int is_pop(IStack*v){return v->len>0?v->data[--v->len]:0;}
 
-/* =========================================================
- * Hash map: string -> [uint256_t value, string section]
- * ========================================================= */
 #define HASH_INIT_CAP 64
 
+/* ラベル1個ぶんの定義。ハッシュ表 LabelMap のチェイン要素でもある。 */
 typedef struct LabelEntry {
-    char          *key;
-    uint256_t      value;
-    char          *section;
-    int            is_equ;              /* 1 if defined via .equ – not relocatable */
-    int            is_imported;         /* 1 if declared via .EXTERN – STB_GLOBAL/SHN_UNDEF in ELF */
-    int            reloc_type_override; /* -1 = not set; otherwise ELF relocation type from .EXTERN label::rtype */
-    /* is_undef: genuine provenance flag, same idea as PatVar.is_undef above --
-     * true only when this label's stored value was itself computed from a
-     * .equ expression that actually hit error_undefined_label (a real failed
-     * reference somewhere in its RHS), never derived from the bit pattern of
-     * `value` alone. This exists because a legitimate .equ constant that
-     * happens to equal exactly -1 (e.g. ".equ 0-1") is bit-identical to
-     * UNDEF_VAL() in this fixed-width 256-bit type, so callers that need to
-     * know "is this label really undefined" must consult this flag instead
-     * of comparing `value` to UNDEF_VAL()/u256_is_undef_derived(). Defaults
-     * to 0 (calloc), which is correct for address labels (value is always a
-     * concrete pc, never undef-derived) and imported/.EXTERN placeholders. */
-    int            is_undef;
+    char          *key;                 /* ラベル名 */
+    uint256_t      value;               /* 値（.EQU なら定数、通常はアドレス） */
+    char          *section;             /* 属するセクション名 */
+    int            is_equ;              /* .EQU 由来か（アドレスではなく定数） */
+    int            is_imported;         /* .extern の仮登録。実定義で上書き可 */
+    int            reloc_type_override; /* `::型名` で明示指定されたリロケーション型 */
+    int            is_undef;            /* 参照されたが未定義 */
     struct LabelEntry *next;
 } LabelEntry;
 
@@ -550,7 +436,6 @@ static void lmap_init(LabelMap *m) {
     m->buckets=calloc(m->nbuckets,sizeof(LabelEntry*));
     m->count=0;
 }
-/* Fix B: reset nbuckets to 0 so any stale use after free is detectable. */
 static void lmap_free(LabelMap *m) {
     for(int i=0;i<m->nbuckets;i++){
         LabelEntry *e=m->buckets[i];
@@ -572,20 +457,6 @@ static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *se
     for(LabelEntry*e=m->buckets[h];e;e=e->next){
         if(strcmp(e->key,key)==0){
             e->value=val; free(e->section); e->section=strdup(sec); e->is_equ=is_equ; e->is_undef=is_undef;
-            /* axx.py fix: ::reloctype を省略した場合は旧エントリの reloc_type_override を
-             * 引き継がず -1 にリセットする。reloc_type が必要な場合は呼び出し側が
-             * lmap_set_reloc_type() で明示的に設定する。
-             *
-             * 破綻点修正 (axx.py port): is_imported は以前「.EXTERNが独立して
-             * 管理するので保持する」として引き継いでいたが、これはバグだった。
-             * lmap_set() は「この名前に実際の値を設定する」呼び出しであり、
-             * .EXTERNで仮登録された名前(is_imported=1)がローカルで実定義
-             * されたときは、その時点で輸入(import)状態を終了させなければ
-             * ならない。保持し続けると、write_elf_obj() がこのシンボルを
-             * 永久にSTB_GLOBAL/SHN_UNDEFとして出力し、ローカルに正しい値を
-             * 持つのにELF上では未定義シンボルのままになる
-             * (label_put_value() 側でも .EXTERN プレースホルダの上書きを
-             * 許可するよう対応済み)。 */
             e->is_imported = 0;
             e->reloc_type_override = -1;
             return;
@@ -596,14 +467,10 @@ static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *se
     e->is_equ=is_equ; e->is_imported=0; e->reloc_type_override=-1; e->is_undef=is_undef;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
 }
-/* lmap_set の直後に reloc_type_override を設定するヘルパー。
- * label_put_value() が ::reloctype 付き .equ から呼ぶ。 */
 static void lmap_set_reloc_type(LabelMap *m, const char *key, int reloc_type) {
     LabelEntry *e = lmap_find(m, key);
     if(e) e->reloc_type_override = reloc_type;
 }
-/* Set a label as an imported external symbol (.EXTERN).
- * Mirrors axx.py: labels[s] = [0, '.text', False, True, reloc_type] */
 static void lmap_set_imported(LabelMap *m, const char *key, uint256_t val, const char *sec, int reloc_type) {
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
     for(LabelEntry*e=m->buckets[h];e;e=e->next){
@@ -619,7 +486,6 @@ static void lmap_set_imported(LabelMap *m, const char *key, uint256_t val, const
     e->is_equ=0; e->is_imported=1; e->reloc_type_override=reloc_type; e->is_undef=0;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
 }
-/* Copy all label fields including is_imported and reloc_type_override. Used for relaxation snapshots. */
 static void lmap_set_full(LabelMap *m, const char *key, uint256_t val,
                           const char *sec, int is_equ, int is_imported, int reloc_type_override,
                           int is_undef) {
@@ -658,9 +524,6 @@ static AXX_UNUSED void lmap_iter(LabelMap *m, lmap_iter_fn fn, void*user){
             fn(e->key,e->value,e->section,user);
 }
 
-/* =========================================================
- * Symbol map: string -> uint256_t
- * ========================================================= */
 typedef struct SymEntry { char*key; uint256_t val; struct SymEntry*next; } SymEntry;
 typedef struct { SymEntry**buckets; int nb; int count; } SymMap;
 static void smap_init(SymMap*m){m->nb=HASH_INIT_CAP;m->buckets=calloc(m->nb,sizeof(SymEntry*));m->count=0;}
@@ -696,15 +559,13 @@ static void smap_clear(SymMap*m){
     m->count=0;
 }
 
-/* =========================================================
- * Section map: string -> [start uint256_t, size uint256_t]
- * ========================================================= */
+/* セクション1個ぶん。.section / .endsection の出入りで複数回訪れうる。 */
 typedef struct SecEntry {
     char       *name;
-    uint256_t   start;
-    uint256_t   size;
-    uint256_t   entry_pc;   /* PC at last section entry (for incremental size update) */
-    int         confirmed;  /* 1 = size set by .ENDSECTION, do not overwrite */
+    uint256_t   start;      /* 開始アドレス（ワード単位） */
+    uint256_t   size;       /* 累計ワード数 */
+    uint256_t   entry_pc;   /* 今回このセクションに入ったときの pc */
+    int         confirmed;  /* パス1で確定済みか */
     struct SecEntry *next;
 } SecEntry;
 typedef struct { SecEntry**buckets; int nb; SecEntry**order; int count; int cap; } SecMap;
@@ -714,8 +575,6 @@ static SecEntry *secmap_find(SecMap*m,const char*name){
     for(SecEntry*e=m->buckets[h];e;e=e->next) if(strcmp(e->name,name)==0)return e;
     return NULL;
 }
-/* secmap_set() was defined here but never called; removed to keep the
- * -Wall build warning-free.  secmap_find()/secmap_get() remain in use. */
 
 static AXX_UNUSED void secmap_free(SecMap*m){
     for(int i=0;i<m->nb;i++){
@@ -726,26 +585,16 @@ static AXX_UNUSED void secmap_free(SecMap*m){
     free(m->buckets); free(m->order);
     m->buckets=NULL; m->order=NULL; m->count=0; m->cap=0; m->nb=0;
 }
-/* Fix C: zero out freed pointers in order[] so they cannot be dereferenced.
- * Previously the order[] array retained dangling pointers even after entries
- * were freed; any code path that iterated up to the old count would crash. */
 static void secmap_clear(SecMap*m){
     for(int i=0;i<m->nb;i++){
         SecEntry*e=m->buckets[i];
         while(e){SecEntry*n=e->next;free(e->name);free(e);e=n;}
         m->buckets[i]=NULL;
     }
-    /* Null out stale pointers in the ordering array */
     for(int i=0;i<m->count;i++) m->order[i]=NULL;
     m->count=0;
 }
 
-/* 破綻点修正 (axx.py port): 各セクションへの訪問記録(名前, 開始pc,
- * ワード数)を時系列順に保持する。同じセクションに複数回出入りすると
- * (.text→.data→.text等)、真の内容はグローバルpc空間上で不連続な複数の
- * 断片に分かれる。write_elf_obj()相当のコードはこれを使って各断片を
- * 訪問順に連結し、アドレス→セクション内オフセットの変換も断片ごとの
- * 累積オフセットを使って正しく計算する。 */
 typedef struct { char *name; uint256_t start; uint256_t len; } SecRange;
 typedef struct { SecRange *data; int len; int cap; } SecRangeVec;
 AXX_UNUSED static void secrangevec_init(SecRangeVec*v){v->data=NULL;v->len=0;v->cap=0;}
@@ -769,12 +618,6 @@ AXX_UNUSED static void secrangevec_free(SecRangeVec*v){
     secrangevec_clear(v);
     free(v->data); v->data=NULL; v->cap=0;
 }
-/* word_pc がセクション name 内のどこに対応するか、断片を跨いだ累積ワード
- * オフセットを返す。属さない場合は -1 を返す(u256_to_i64(-1)と衝突しない
- * ようcallerはint型で受ける)。上限は閉区間(<=)で判定する: セクション末尾
- * ちょうど(そのセクションの最後に書かれたバイトの1つ先)を指す「終端
- * マーカー」ラベル(_etext的なもの)は正当なイディオムなので、境界値を
- * 除外する理由はない。 */
 static int64_t addr_to_word_offset(SecRangeVec*ranges, const char*name, uint64_t word_pc){
     uint64_t cum = 0;
     for(int i=0;i<ranges->len;i++){
@@ -787,19 +630,14 @@ static int64_t addr_to_word_offset(SecRangeVec*ranges, const char*name, uint64_t
     return -1;
 }
 
-/* Finalize the current (last) section's size after fileassemble() completes.
- * Mirrors axx.py run():
- *   _last_sec = self.state.current_section
- *   if _last_sec in self.state.sections:
- *       _e = self.state.sections[_last_sec]
- *       if not _confirmed: _e[1] += (pc - entry_pc)
- * Must be called after every fileassemble() — relaxation passes and pass2. */
-/* Note: AsmState is defined later; this function is defined after AsmState below. */
-/* Forward declaration: */
 
-/* =========================================================
- * Pattern: each entry has 6 string fields
- * ========================================================= */
+/* パターンファイル1行ぶん。"::" 区切りで最大6フィールドに分解して持つ。
+ *   f[0] 照合パターン（ニーモニックの書式）
+ *   f[1] エラー条件（`条件;番号` 形式。ERRORS_TABLE の番号を返す）
+ *   f[2] エンコーディング（カンマ区切りの式。ここを評価してバイト列を作る）
+ *   f[3] サイズ / VLIW スロット番号
+ *   f[4..5] 予備
+ * 注意: 2フィールドしか書かれていない行は f[1] ではなく f[2] に入る。 */
 #define PAT_FIELDS 6
 typedef struct {
     char *f[PAT_FIELDS];
@@ -826,9 +664,6 @@ static void pat_set(PatEntry*e,int idx,const char*s){
     free(e->f[idx]); e->f[idx]=strdup(s);
 }
 
-/* =========================================================
- * VLIW set entry: int array + template string
- * ========================================================= */
 typedef struct {
     int   *idxs;
     int    nidxs;
@@ -863,9 +698,8 @@ static void vset_add(VliwSet*v,int*idxs,int n,const char*templ){
     v->len++;
 }
 
-/* =========================================================
- * Binary output buffer: position -> byte value
- * ========================================================= */
+/* 出力バッファ。アドレス→ワード値の疎なハッシュ表として持つので、
+ * .ORG でアドレスが大きく飛んでもその間を埋めずに済む。 */
 typedef struct BufEntry { uint64_t pos; uint64_t val; struct BufEntry*next; } BufEntry;
 #define BUFMAP_NB 4096
 typedef struct { BufEntry *buckets[BUFMAP_NB]; } BufMap;
@@ -877,10 +711,6 @@ static void bufmap_set(BufMap*m, uint64_t pos, uint64_t val){
     BufEntry*e=malloc(sizeof(BufEntry)); if(!e){perror("malloc");exit(1);} e->pos=pos; e->val=val;
     e->next=m->buckets[h]; m->buckets[h]=e;
 }
-/* Fix (new): bufmap_max_key now writes the found flag into *found_out so that
- * binary_flush can distinguish "no bytes written" from "one byte at position 0".
- * The old signature returned 0 for both cases, silently writing a one-word file
- * even when the assembler produced no output at all. */
 static uint64_t bufmap_max_key(BufMap*m, int *found_out){
     uint64_t mx=0; int found=0;
     for(int i=0;i<BUFMAP_NB;i++) for(BufEntry*e=m->buckets[i];e;e=e->next){
@@ -893,141 +723,103 @@ static AXX_UNUSED void bufmap_free(BufMap*m){
     for(int i=0;i<BUFMAP_NB;i++){BufEntry*e=m->buckets[i];while(e){BufEntry*n=e->next;free(e);e=n;}m->buckets[i]=NULL;}
 }
 
-/* =========================================================
- * AssemblerState
- * ========================================================= */
 #define OB_CHAR  ((char)0x90)
 #define CB_CHAR  ((char)0x91)
-/* axx.py port: sentinels standing in for a genuine (unescaped) source-line
- * VLIW "!!" slot separator / "!!!!" stop marker, once axx_resolve_vliw_
- * escapes() has told them apart from a "\!\!"-escaped literal "!!" earlier
- * in the SAME left-to-right pass. Every later, independent scan for a VLIW
- * boundary looks for these instead of raw "!!"/"!!!!" text, so a
- * resolved-but-literal "!!" from an escape can never be re-interpreted as
- * a real separator by a later pass with no memory of which "!!" was
- * escaped. Mirrors axx.py's VLIW_SEP/VLIW_STOP. */
 #define VLIW_SEP_CHAR  ((char)0x92)
 #define VLIW_STOP_CHAR ((char)0x93)
 #define EXP_PAT  0
 #define EXP_ASM  1
 
 static const char *ERRORS_TABLE[] = {
-    "",                          /* 0 – empty (Python ERRORS[0]) */
-    "Invalid syntax.",           /* 1 */
-    "Address out of range.",     /* 2 */
-    "Value out of range.",       /* 3 */
-    "",                          /* 4 – empty */
-    "Register out of range.",    /* 5 */
-    "Port number out of range."  /* 6 */
+    "",
+    "Invalid syntax.",
+    "Address out of range.",
+    "Value out of range.",
+    "",
+    "Register out of range.",
+    "Port number out of range."
 };
 #define ERRORS_COUNT 7
 
+/* =========================================================
+ * AsmState — アセンブル中の全状態
+ *
+ * 式評価・パターン照合・ディレクティブ処理・出力生成の各関数は自前の状態を
+ * 持たず、全てこの構造体を共有して読み書きする（axx.py の AssemblerState に対応）。
+ * ========================================================= */
 typedef struct {
-    char outfile[512];
-    char expfile[512];
-    char expfile_elf[512];   /* -E option: ELF-format export TSV */
-    char impfile[512];
-    /* Largest program counter seen beyond the 64-bit range BufMap positions
-     * use; binary_flush() turns this into axx.py's "output size ... exceeds
-     * maximum" error. */
-    uint256_t pc_overflow_max;
+    /* --- 出力先 --- */
+    char outfile[512];       /* -b 生バイナリ */
+    char expfile[512];       /* -e ラベル TSV */
+    char expfile_elf[512];   /* -E ラベル TSV（ELF フラグ付き） */
+    char impfile[512];       /* -i ラベル TSV の取り込み */
+    uint256_t pc_overflow_max;  /* pc が 64bit を超えた場合の記録（警告用） */
     int       pc_overflow_set;
-    int  osabi;
+    int  osabi;              /* ELF ヘッダの OSABI（9=FreeBSD） */
 
-    uint256_t pc;
-    uint256_t padding;
+    /* --- 位置カウンタ --- */
+    uint256_t pc;            /* 現在のプログラムカウンタ（ワード単位） */
+    uint256_t padding;       /* .padding の詰め物値 */
 
-    char lwordchars[256];
-    char swordchars[256];
+    /* 識別子に使える文字集合（.labelc 等で変更可能） */
+    char lwordchars[256];    /* ラベル名 */
+    char swordchars[256];    /* .setsym シンボル名 */
 
     char current_section[512];
     char current_file[512];
 
-    LabelMap   labels;
-    SecMap     sections;
-    SymMap     symbols;
-    SymMap     patsymbols;
-    LabelMap   export_labels;
-    /* Bugfix (axx.py port): export_labels is a hash map, so iterating its
-     * buckets directly (as WRITE_EXPORT used to) visits labels in hash
-     * order, not the `.export`/`.global` declaration order axx.py's dict
-     * (`self.state.export_labels`, insertion-ordered) produces. The two
-     * implementations' -e/-E TSV output therefore listed the same labels
-     * in different order -- harmless for the labels the file re-imports
-     * by name, but a real, silent divergence from the project's own
-     * same-output goal for a documented, tool-consumed file. Track
-     * declaration order separately here (deduped, since .export/.global
-     * is processed every relaxation pass like .EXTERN) and have
-     * WRITE_EXPORT walk this instead of the bucket array. */
-    StrVec     export_order;
-    PatVec     pat;
+    /* --- 記号表 --- */
+    LabelMap   labels;         /* ソース側ラベル */
+    SecMap     sections;       /* セクション */
+    SymMap     symbols;        /* 現在有効なシンボル */
+    SymMap     patsymbols;     /* パターンファイルの .setsym 由来 */
+    LabelMap   export_labels;  /* .global 等で外部公開するラベル */
+    StrVec     export_order;   /* 公開順（出力の再現性のため） */
+    PatVec     pat;            /* 読み込んだパターン表 */
 
-    int        vliwinstbits;
-    IntVec     vliwnop;
-    int        vliwbits;
-    VliwSet    vliwset;
-    int        vliwflag;
-    int        vliwtemplatebits;
-    int        vliwstop;
-    int        vcnt;
+    /* --- VLIW / EPIC --- */
+    int        vliwinstbits;     /* 命令スロット1個のビット幅 */
+    IntVec     vliwnop;          /* 余ったスロットを埋める NOP バイト列 */
+    int        vliwbits;         /* パケット全体のビット幅 */
+    VliwSet    vliwset;          /* EPIC: スロット組み合わせ→テンプレート値 */
+    int        vliwflag;         /* .vliw が宣言済みか */
+    int        vliwtemplatebits; /* テンプレート幅（負なら上位側に配置） */
+    int        vliwstop;         /* この行が `!!!!` で終わったか */
+    int        vcnt;             /* この行のスロット数 */
 
-    int        expmode;
-    /* exp_typ_float: 0 = integer mode (default), 1 = floating-point mode.
-     * When 1, number literals are parsed as double and arithmetic operations
-     * (+, -, *, /, **) are performed in double precision.  The double value
-     * is carried inside uint256_t.w[0] as a raw bit-cast.
-     * Mirrors axx.py AssemblerState.exp_typ ('i' vs 'f'). */
-    int        exp_typ_float;
+    /* --- 式評価とエラー状態 --- */
+    int        expmode;        /* EXP_PAT=パターン側 / EXP_ASM=ソース側 */
+    int        exp_typ_float;  /* 浮動小数点モードか */
+
+    /* 直近の式評価で未定義ラベルを踏んだか。「失敗時に立てる」だけで
+     * 成功しても降ろさない（1つの式が複数ラベルを引くため、途中で降ろすと
+     * 先に起きた失敗が消える）。降ろすのは .ORG/.RESB/.ZERO/.ALIGN/.EQU 等、
+     * 新規に判定したい側が評価直前に自分で行う。 */
     int        error_undefined_label;
     int        error_already_defined;
-    /* axx.py port (bugfix): persistent, never auto-reset per-line, unlike
-     * error_undefined_label/error_already_defined above. Set once and left
-     * set for the rest of the run whenever a user-facing " error - ..." is
-     * actually reported during assembly. main() checks this after pass2 to
-     * refuse to write output for a build that printed errors, instead of
-     * silently exiting 0 with incomplete/wrong bytes. */
+
+    /* ユーザ向けの " error - ..." を1度でも表示したら立ち、以後降ろさない。
+     * 最後にこれを見て、立っていれば出力を書かず終了コード1で終わる
+     * （不完全・誤ったバイナリを黙って残さないため）。 */
     int        had_error;
-    /* axx.py port: パターンマッチ試行中フラグ。
-     * match0() → match() → expression キャプチャ → label_get_value() の経路で
-     * 失敗試行中のラベル未定義エラー表示を抑制する。
-     * match0() が True を返した後の makeobj() 呼び出し前に 0 に戻す。 */
+
+    /* パターン照合の試行中か。試行中のエラーは本物の失敗とは限らないので
+     * 表示を抑制する。 */
     int        in_match_attempt;
 
-    /* 順序非依存マッチング (axx.py port): 直近の pat_match() 成功時の
-     * 具体度スコア。(式キャプチャ数, シンボルキャプチャ数, リテラル一致文字数)。
-     * lineassemble2() が全パターン走査後に最も具体的なマッチを選ぶために使う。 */
     int        match_score_expr;
     int        match_score_sym;
     int        match_score_lit;
 
-    /* pc_instr_start: binary_list中の$$が命令先頭アドレスを指すように、
-     * makeobj呼び出し前にst->pcの値を保存する。makeobj内のexpression評価では
-     * st->pcではなくst->pc_instr_startを$$として使う。 */
     uint256_t  pc_instr_start;
-    /* pc_instr_end: $.が返す「命令末尾(次命令の先頭)アドレス」。
-     * パターンマッチ確定後・error()/makeobj()呼び出し前のサイズプローブで確定する。
-     * binary_list中/外・pass0(対話モード)を問わず常にこの値を返す。 */
     uint256_t  pc_instr_end;
-    /* in_binary_list: makeobj実行中は1。$$がpc_instr_startを返すのは
-     * binary_list評価中のみ。.equなど他のコンテキストでは$$=現在のPC。 */
     int        in_binary_list;
 
-    /* Fix: was `int`.  ".ALIGN 1<<32" (or any value that is a non-zero
-     * multiple of 2**32 below 2**64) truncated to 0 on assignment, slipping
-     * past the "must be positive" guard, and align_addr()'s "addr % align"
-     * then killed the assembler outright with SIGFPE -- a plain source-level
-     * typo crashed caxx.  Values like 0x100000001 truncated to 1 instead and
-     * aligned silently wrongly.  axx.py keeps this as an unbounded int, so
-     * int64_t restores parity for every value the 64-bit pc can reach. */
     uint256_t  align;
     int        bts;
     int        endian_big;
     int        pas;
     int        debug;
-    /* 互換(axx.py port): axx.py は verbose(-v: pass2のhexリスト出力) と
-     * debug(-d: リラクゼーション収束等のデバッグ出力) を別フラグとして持つ。
-     * C版は両者を debug に統合し -v に割り当てていたため挙動が非互換だった。
-     * verbose を分離して axx.py に一致させる。 */
     int        verbose;
 
     char       cl[4096];
@@ -1042,146 +834,77 @@ typedef struct {
 
     BufMap     buf;
 
-    /* Fix C-3: Pass1 size-estimation mode.
-     * When true, label_get_value() returns 0 for unknown labels instead of
-     * UNDEF_VAL().  This lets makeobj() compute the correct byte count even
-     * when a forward-referenced label is not yet defined. */
     int        pass1_size_mode;
 
-    /* Fix C-6: per-process stdin temp file path (replaces fixed "axx.tmp").
-     * NULL until first stdin read; freed and unlinked at the end of run(). */
     char       stdin_tmp_path[512];
 
-    /* ELF relocatable object output (-o / -m options) */
     char       elf_objfile[512];
-    int        elf_machine;   /* default 62 = EM_X86_64 */
-    /* -f {32,64}: ELF class for -o output (1=ELFCLASS32, 2=ELFCLASS64;
-     * default 2/ELF64). Independent of elf_machine -- write_elf_obj() uses
-     * this, not elf_machine's own ->elfclass, as the class actually written
-     * to disk (mirrors axx.py's state.elf_class). */
+    int        elf_machine;
     int        elf_class;
 
-    /* DWARF debug info generation (-g).
-     * When gen_debug && elf_objfile is set, write_elf_obj() emits
-     * .debug_abbrev / .debug_info / .debug_line (+ .rela.debug_*). */
+    /* --- DWARF デバッグ情報（-g） --- */
     int        gen_debug;
-    /* line_map: during pass2, for every assembly line that emits bytes we
-     * record (section, word_pc_at_line_start, file, line). It is the source
-     * data for the DWARF .debug_line line-number program. Reset at pass2
-     * start; section/file strings are strdup'd and freed in run(). */
+    /* pc とソース行の対応表。.debug_line の生成に使う */
     struct { char *section; uint64_t word_pc; char *file; int line; } *line_map;
     int        line_map_len;
     int        line_map_cap;
 
-    /* ELF relocation tracking (active during pass2 when elf_objfile is set) */
-    int        elf_tracking;                /* 1 while assembling one instruction */
-    /* dynamic array of refs seen in current insn: (name, val, word_idx)
-     * word_idx = index into objl at which the reference was made (-1 = outside makeobj) */
+    /* --- パス2でのリロケーション収集 ---
+     * 式評価中にラベル参照を見つけるたび elf_refs へ (名前, 生値, 何ワード目か)
+     * を積む。1命令ぶん組み立て終わった時点でこれをまとめ、同じラベルへの
+     * 連続した参照を1つのリロケーションに束ねて relocations へ確定させる。 */
+    int        elf_tracking;
     struct { char *name; uint64_t val; int word_idx; } *elf_refs;
     int        elf_refs_len;
     int        elf_refs_cap;
-    /* makeobj() word-index sentinel: set to len(objl) before each expr eval,
-     * -1 outside makeobj (sentinel). */
     int        elf_current_word_idx;
-    /* variable -> label mapping captured during match() !var evaluation.
-     * Indexed by var letter - 'a'.
-     * set=0: unset  set=1: valid  set=-1: conflict (compound expr) */
     struct {
         int      set;
         char    *label_name;
         uint64_t label_val;
     }          elf_var_to_label[26];
-    /* current variable being captured by match() !var; '\0' = not capturing */
     char       elf_capturing_var;
-    /* accumulated relocations across all of pass2 */
     struct {
         char   *section;
         int64_t sec_offset;
         char   *sym;
         int     rtype;
         int64_t addend;
-        int     nbytes;  /* encoded field byte width; needed for REL (non-RELA)
-                           * targets to patch the addend directly into the
-                           * relocated field's bytes -- see write_elf_obj(). */
+        int     nbytes;
     } *relocations;
     int        reloc_count;
     int        reloc_cap;
 
-    /* Source-file `.RELOCTYPE` directive: per-encoded-field-width override
-     * of this machine's built-in default width-guess reloc type
-     * (elf_machine_width_guess()). Index 0/1/2/3 corresponds to encoded
-     * field widths of 1/2/4/8 bytes; -1 = not overridden (fall back to the
-     * machine's built-in wg1/wg2/wg4/wg8). Mirrors axx.py's
-     * state.reloctype_override dict; see adir_reloctype() and its
-     * consultation at the RTYPE_FOR() width-guess lookup. */
     int        reloctype_override[4];
 
-    /* .check 拘束条件テーブル (変数 a-z に対応する 26 要素配列)。
-     * check_constraints[i] は変数 'a'+i に対する許可シンボル名の StrVec。
-     * 空 StrVec (len==0) はその変数に拘束なし。
-     * .check::x::sym1,sym2,... で登録、.clrcheck::x で解除。
-     * マッチ成功後・makeobj 前に pat_match() 内でインライン検証する。    */
+    /* .check で登録された「変数 a〜z が満たすべき条件」 */
     StrVec     check_constraints[26];
 
-    /* C (axx.py port): expression recursion depth guard.
-     * C has no exceptions; unbounded recursion (deeply nested parentheses or
-     * unary operators) would overflow the native stack and segfault.
-     * expr_factor() increments this on entry and decrements on exit, returning
-     * 0 once EXPR_MAX_DEPTH is exceeded. */
+    /* 式の再帰深度。深すぎる入れ子でネイティブスタックを溢れさせない番人 */
     int        expr_depth;
 
-    /* A (axx.py port): pass1 relaxation previous-iteration label values.
-     * Points to the previous iteration's label snapshot during pass1 so that
-     * forward references return a realistic estimate (their prior address)
-     * instead of 0/UNDEF. This lets relaxation actually converge to the
-     * optimal variable-length layout. NULL outside the pass1 relaxation loop. */
+    /* --- パス1のリラクゼーション（サイズ収束） ---
+     * relax_prev は前回反復での「ラベル→アドレス」。今回と一致したら収束。
+     * relax_optimistic は未確定の前方参照を「近い」と仮定して収束を早めるモード。 */
     LabelMap  *relax_prev;
 
-    /* Nonzero only during the FIRST relaxation iteration. While set, a label
-     * that has no value yet (a forward reference, with no previous-iteration
-     * estimate to fall back on) is estimated as "right here", i.e. the address
-     * of the instruction currently being encoded. See label_get_value() for
-     * why the loop needs an optimistic seed rather than the UNDEF sentinel. */
     int        relax_optimistic;
 
-    /* D8 (axx.py port): pattern-file .INCLUDE chain (canonical paths) for
-     * circular-include detection, plus the current nesting depth. */
     char      *pat_include_chain[64];
     int        pat_include_depth;
 
-    /* 破綻点修正5 (axx.py port): pat_match0()の組合せ数予算を使い切った
-     * ことを警告済みかどうか。
-     *
-     * 破綻点修正 (再修正): 以前は単一のint(0/1)フラグだったため、パターン
-     * ファイル中の複数箇所で組合せ爆発が起きても最初の1箇所しか警告が出ず、
-     * 2箇所目以降は原因不明のまま「非マッチ」として静かに扱われていた
-     * (axx.py側の同種の問題と合わせて修正)。ファイル名+行番号の組を
-     * 最大64件までキャッシュし、「同じ箇所での繰り返し警告は1回に抑える」
-     * という当初の意図を保ったまま、異なる箇所ではそれぞれ独立して1回ずつ
-     * 警告できるようにする。キャッシュが溢れた場合は安全側(警告を出す側)
-     * に倒す。 */
     char       combo_budget_warned_file[64][512];
     int        combo_budget_warned_line[64];
     int        combo_budget_warned_count;
 
-    /* 破綻点修正 (axx.py port): 各セクションへの訪問記録(SecRangeVec参照)。
-     * write_elf_obj相当のELF出力コードがこれを使って複数回の出入りで
-     * 生じた不連続な断片を正しく連結・アドレス変換する。 */
     SecRangeVec section_ranges;
 
-    /* 破綻点修正 (axx.py port): .EQU(reloc_type指定なし)の式評価中に1に
-     * しておくと、label_get_value()が参照したラベルの所属セクションを
-     * ここに記録する(tracking=0のときは何もしない)。異なるセクションの
-     * ラベルを跨いで演算すると、結果はリンク時のセクション配置に依存する
-     * 定数になってしまうにもかかわらずリロケーションが一切生成されない
-     * ため、adir_label_processing()がこれを見て警告する。 */
     int        equ_section_tracking;
     char       equ_first_section[64];
     int        equ_multi_section;
 
-    /* 診断ファネル (axx.py の AssemblerState._diag_pending と対応)。
-     * パターンマッチ試行中に出た診断はここに退避され、勝った候補の分だけ
-     * あとで再生される。負けた候補の分は捨てられる。 */
+    /* パターン照合の試行中に出た診断を溜める箱。
+     * そのパターンが最終的に採用されたときだけ再生して表示する。 */
     char     **diag_pending;
     int       *diag_pending_seterr;
     int        diag_pending_len;
@@ -1189,43 +912,22 @@ typedef struct {
     int        diag_capturing;
 } AsmState;
 
-/* 破綻点修正7 (axx.py port): 「ユーザー向けエラーを表示すべきパスか」の
- * 判定 (pas==0:対話モード, pas==2:Pass2) が全体で16箇所に条件式として
- * 直書きされており、新しいpas値を追加する際の修正漏れの温床になって
- * いた。1箇所のヘルパーに集約する(axx.py側のAssemblerState.should_report_errors()
- * と対応)。 */
+/* ユーザ向けエラーを今表示してよいパスか。
+ * パス2（最終）と対話モード(0)のみ。パス1のリラクゼーション中は同じエラーが
+ * 反復回数だけ重複するうえ、前方参照が未解決なだけの偽エラーも多い。 */
 static inline int should_report_errors(const AsmState *st) {
     return st->pas == 2 || st->pas == 0;
 }
 
-/* =========================================================
- * 診断ファネル (axx.py の AssemblerState.diag() と 1:1 対応)
- *
- * このファイルの " error - " / " warning - " はすべて axx_diagf() を通る。
- * 抑止条件をここ 1 箇所にまとめてあるので、新しい呼び出し箇所が
- * 条件を書き忘れることが構造的に起きない。
- *
- * 経緯: 以前は各箇所が個別に if(...) を書いており、書き忘れから
- *   ・1 文字小文字ラベル参照が 0 になる
- *   ・"#" 前置の即値 (6502/68000/ARM/MIPS…) でビルドが中断する
- * という別々のバグが出た。
- *
- * 抑止条件 1: in_match_attempt
- *   マッチ試行中の失敗はマッチングの正常動作であってエラーではない。
- *   ただし捨てずに退避する — !x キャプチャの式は試行中にしか評価
- *   されないため、勝った候補の本物のエラーまで消えてしまう。
- * 抑止条件 2: should_report_errors()
- *   pass1 の未定義ラベルは「まだ解決していない」だけのことが多い。
- * ========================================================= */
 
-static AsmState *g_active_state = NULL;   /* 現在走っているアセンブラ */
+static AsmState *g_active_state = NULL;
 
 static void diag_pending_push(AsmState *st, const char *text, int set_error){
     if(st->diag_pending_len >= st->diag_pending_cap){
         int nc = st->diag_pending_cap ? st->diag_pending_cap*2 : 8;
         char **nt = realloc(st->diag_pending, (size_t)nc*sizeof(char*));
         int   *ns = realloc(st->diag_pending_seterr, (size_t)nc*sizeof(int));
-        if(!nt || !ns){ free(nt); free(ns); return; }   /* 診断は best-effort */
+        if(!nt || !ns){ free(nt); free(ns); return; }
         st->diag_pending = nt; st->diag_pending_seterr = ns;
         st->diag_pending_cap = nc;
     }
@@ -1242,7 +944,6 @@ static void diag_capture_begin(AsmState *st){
     st->diag_capturing   = 1;
 }
 
-/* 退避中の診断を呼び出し側へ渡す（所有権も渡す）。*/
 static void diag_capture_take(AsmState *st, char ***texts, int **seterr, int *n){
     *texts  = st->diag_pending;
     *seterr = st->diag_pending_seterr;
@@ -1282,33 +983,6 @@ static void axx_diagf(int set_error, int force, const char *fmt, ...){
     if(st && set_error) st->had_error = 1;
 }
 
-/* Open an input file for reading and report a real assembler diagnostic if
- * that fails.
- *
- * Fix: the three input-open sites below (the source file / .INCLUDE target,
- * the pattern file and the `-i` import TSV) each used a bare
- *     if(!f){ fprintf(stderr,"Cannot open: %s\n",fn); ... }
- * or, for `-i`, silently ignored the failure.  None of them set had_error,
- * so a mistyped `.INCLUDE "utils.s"` printed a line on stderr (once per
- * pass), assembled the rest of the file anyway, wrote the resulting
- * *silently truncated* binary and exited with status 0 -- a make(1) rule or
- * CI step saw a successful build.  A missing `-i` file was not reported at
- * all.  axx.py refuses in all three cases, so this was also a C/Python
- * parity break.
- *
- * Two further points this fixes:
- *   - glibc's fopen() SUCCEEDS on a directory in "r" mode (only the reads
- *     fail, with EISDIR), so `.INCLUDE "somedir"` used to be swallowed
- *     completely, with no message at all.  stat() it first.
- *   - the message wording and had_error handling now match what -P/-p
- *     already did ("cannot open source file '<f>': <reason>"), and going
- *     through axx_diagf() means it is printed once rather than once per
- *     relaxation pass. */
-/* Render an errno the way Python renders str(OSError):
- *     [Errno 2] No such file or directory: 'missing.s'
- * so the C and Python diagnostics for an unopenable file are identical.
- * (The two pre-existing -P/-p messages used bare strerror() and so already
- * differed from axx.py's wording; they now go through this too.) */
 static void axx_oserr_str(const char *fn, int err, char *out, size_t osz){
     char q[1024]; m_pyrepr(fn ? fn : "", q, sizeof(q));
     snprintf(out, osz, "[Errno %d] %s: %s", err, strerror(err), q);
@@ -1331,50 +1005,19 @@ static FILE *axx_open_input(const char *fn, const char *what){
     return f;
 }
 
-/* =========================================================
- * ELF_MACHINES: consolidated per-e_machine relocation tables.
- *
- * axx.py port: this mirrors axx.py's ELF_MACHINES dict (top of axx.py)
- * exactly -- same architectures, same relocation-type numbers, same
- * width-guess/pc-relative/named-override/dwarf_abs/is_rela semantics. It
- * replaces what used to be 8 independently-maintained scattered
- * tables/branches in this file (the `.EQU`/`.EXTERN`/`-i` import/`-E`
- * export named-reloctype maps, the width->rtype `_rm[]` table, the
- * PC-relative classification branch, the absolute-rtype reclassification
- * guard, and the DWARF abs64 ternary) -- a 12th architecture now only
- * needs one new entry here instead of edits at 8 call sites.
- *
- * `named` is `{symbolic name usable in a "::name" override: reloc type,
- * expected encoded field byte width}` -- the single source of truth for
- * `.EXTERN`/`.EQU`/the `-i` import syntax's `::reloctype` overrides *and*
- * the reverse lookup `-E` export uses to print a symbolic name; the width
- * is what an override's field-width sanity check validates against.
- *
- * `is_rela` says whether this machine's psABI stores relocation addends
- * explicitly (RELA: separate addend field, `.rela.NAME` sections, SHT_RELA)
- * or implicitly (REL: no addend field -- baked directly into the relocated
- * field's bytes instead, `.rel.NAME` sections, SHT_REL). i386's REL
- * convention was confirmed against a real `gcc -m32`-produced object file;
- * the rest are this port's best-effort read of documented psABI
- * conventions, unverified against a real cross-linker for either file --
- * flag any that turn out wrong.
- * ========================================================= */
 typedef struct { const char *name; int rtype; int width; } ElfNamedReloc;
 
 typedef struct {
     int         machine;
     const char *name;
-    int         elfclass;      /* 1 = ELFCLASS32, 2 = ELFCLASS64 */
-    int         is_rela;       /* 1 = RELA (explicit addend), 0 = REL (implicit) */
+    int         elfclass;
+    int         is_rela;
     int         extern_default;
     int         dwarf_abs;
-    /* Default-guess reloc type for an auto-detected label reference of
-     * this many encoded bytes, when no explicit `::reloctype` override was
-     * given; 0 = no entry for that width (no relocation emitted). */
     int         wg8, wg4, wg2, wg1;
-    const int  *pc_rel;        /* reloc-type numbers that are PC-relative */
+    const int  *pc_rel;
     int         pc_rel_n;
-    const ElfNamedReloc *named; /* name==NULL terminated */
+    const ElfNamedReloc *named;
 } ElfMachineInfo;
 
 static const int _pcrel_i386[]    = {2, 13, 21, 23};
@@ -1456,18 +1099,18 @@ static const ElfNamedReloc _named_aarch64[] = {
     {NULL, 0, 0},
 };
 static const ElfNamedReloc _named_riscv[] = {
-    /* abs16/abs8 (34/33) reproduce this assembler's pre-existing
-     * width-guess numbering as-is; unlike the other entries here they are
-     * not independently confirmed against psABI documentation (RISC-V's
-     * base spec does not define a plain absolute 16-/8-bit relocation the
-     * way most other ISAs do) -- treat those two specifically as
-     * low-confidence. */
     {"abs64", 2, 8}, {"abs32", 1, 4}, {"abs16", 34, 2}, {"abs8", 33, 1},
     {NULL, 0, 0},
 };
 
+/* アーキテクチャ別 ELF 情報表（axx.py の ELF_MACHINES に対応）。
+ * 列の意味は左から:
+ *   e_machine, 名前, elfclass(1=32/2=64), is_rela(1=RELA/0=REL),
+ *   外部シンボルの既定型, 幅4の既定型, 幅8の既定型, 幅2の既定型, 幅1の既定型,
+ *   PC相対型の一覧, DWARF絶対参照の型, 記号名テーブル
+ * REL（加数を命令バイト列に埋め込む形式）を使うのは i386 と ARM(32) だけで、
+ * 他は全て RELA（加数を専用フィールドに持つ）。 */
 static const ElfMachineInfo ELF_MACHINES[] = {
-    /* EM_386: confirmed REL (not RELA) against a real `gcc -m32` object. */
     {3,   "i386",      1, 0, 2,   1,   0,  2, 20, 22, _pcrel_i386,    4, _named_i386},
     {4,   "m68k",       1, 1, 4,   1,   0,  4,  2,  3, _pcrel_m68k,    3, _named_m68k},
     {20,  "PowerPC",    1, 1, 26,  1,   0, 26,  4,  0, _pcrel_ppc32,   2, _named_ppc32},
@@ -1488,7 +1131,6 @@ static const ElfMachineInfo *elf_machine_find(int machine){
     return NULL;
 }
 
-/* {name}::reloctype -> reloc type number, or -1 if unknown for this machine. */
 static int elf_machine_named(const ElfMachineInfo *m, const char *name){
     if(!m) return -1;
     for(int i=0; m->named[i].name; i++)
@@ -1496,7 +1138,6 @@ static int elf_machine_named(const ElfMachineInfo *m, const char *name){
     return -1;
 }
 
-/* reloc type number -> its first matching symbolic name, or NULL. */
 static const char *elf_machine_reverse(const ElfMachineInfo *m, int rtype){
     if(!m) return NULL;
     for(int i=0; m->named[i].name; i++)
@@ -1504,9 +1145,6 @@ static const char *elf_machine_reverse(const ElfMachineInfo *m, int rtype){
     return NULL;
 }
 
-/* reloc type number -> its expected encoded field byte width, or 0 if
- * this machine has no named entry for that number (override validation
- * then can't check it and accepts it as-is, mirroring axx.py). */
 static int elf_machine_reloc_bytes(const ElfMachineInfo *m, int rtype){
     if(!m) return 0;
     for(int i=0; m->named[i].name; i++)
@@ -1531,11 +1169,6 @@ static int elf_machine_width_guess(const ElfMachineInfo *m, int nbytes){
     }
 }
 
-/* Like elf_machine_width_guess(), but first consults the source file's
- * `.RELOCTYPE` directive override (st->reloctype_override), if any was set
- * for this width; falls back to the machine's built-in default otherwise.
- * Mirrors axx.py's `{**width_guess, **state.reloctype_override}` merge at
- * the same call site (ObjectGenerator.makeobj()). */
 static int reloctype_for(const AsmState *st, const ElfMachineInfo *m, int nbytes){
     int idx;
     switch(nbytes){
@@ -1549,79 +1182,26 @@ static int reloctype_for(const AsmState *st, const ElfMachineInfo *m, int nbytes
     return elf_machine_width_guess(m, nbytes);
 }
 
-/* Finalize the current (last) section's size after fileassemble() completes.
- * adir_section() only updates the OLD section on switch; the final section is
- * never switched away from and stays at size=0.
- * Mirrors axx.py run() post-fileassemble logic for both pass1 and pass2. */
 static void secmap_finalize_current(AsmState *st){
     SecEntry *e = secmap_find(&st->sections, st->current_section);
     if(!e) return;
-    /* Bugfix (axx.py port): do NOT skip just because `confirmed` is set.
-     * entry_pc is always advanced to the current pc at the moment a
-     * fragment is flushed (here or in adir_endsection()/adir_section()),
-     * so a fresh delta of 0 already makes this a safe no-op post-ENDSECTION.
-     * But if more code ran in this section *after* that ENDSECTION (with no
-     * intervening .SECTION), entry_pc is still behind pc and `confirmed`
-     * would incorrectly suppress flushing that trailing fragment, silently
-     * dropping it from section_ranges/the final output. */
     uint256_t delta = u256_sub(st->pc, e->entry_pc);
-    if(u256_lt_signed(delta, u256_zero())) return;   /* negative delta: skip */
+    if(u256_lt_signed(delta, u256_zero())) return;
     e->size = u256_add(e->size, delta);
     if(!u256_is_zero(delta))
         secrangevec_push(&st->section_ranges, st->current_section, e->entry_pc, delta);
-    e->entry_pc = st->pc;   /* prevent double-counting on re-call */
+    e->entry_pc = st->pc;
 }
 
-/* DWARF .debug_line生成用の小さなヘルパー: word_pc をセクションsec_name内の
- * バイトオフセットに変換する(断片を跨いだ累積オフセット)。該当する断片が
- * 見つからない場合は0にフォールバックする(DWARF生成自体をクラッシュ
- * させないため)。 */
-/* 破綻点修正 (axx.py port): axx.pyの_addr_to_word_offset()は
- * 「.SECTION/.SEGMENTが一度も使われずst->sections(st->sectionsに相当する
- * self.state.sections)が空のままなら、write_elf_objの
- * 'not self.state.sections'分岐がその場合を単一の暗黙セクション(word 0
- * 起点)として扱うのに合わせ、生word_pcをそのままセクション内オフセット
- * として返す」という特例を持つ(このコメント自体がaxx.py側に残る「以前は
- * これによりDWARFアドレスが全て0に潰れていた」という記述)。caxx.cの
- * addr_to_word_offset()側にはこの特例が移植されておらず、.SECTIONを
- * 一度も使わないソース(6809.s/z80.s/8080.s等、暗黙の既定.textのみで
- * 書かれた通常のファイル)では st->sections が常に空のため
- * addr_to_word_offset()が全行で-1(未検出)を返し続け、結果として
- * DWARF .debug_lineの行番号プログラムが最初の1行を除き全てアドレス
- *据え置き(advance-pcオペコードが実質発行されない)という壊れた出力に
- * なっていた(実機確認: caxxで-g付き .o を作ると、6809/z80/8080の
- * いずれも該当セクションの全命令が実質アドレス0にマップされ、gdb等の
- * ソースレベルデバッグが機能しない)。axx.pyと同じ特例をここに追加する。 */
 static uint64_t dwarf_word_offset(AsmState *st, const char *sec_name, uint64_t word_pc, int bpw){
     if(st->sections.count == 0) return word_pc * (uint64_t)bpw;
     int64_t o = addr_to_word_offset(&st->section_ranges, sec_name, word_pc);
     return (uint64_t)(o >= 0 ? o : 0) * (uint64_t)bpw;
 }
 
-/* 破綻点修正 (axx.py port): .EQU(reloc_type未指定)は最終的な定数として
- * そのままバイナリに焼き込まれ、後からリンカが補正することはない。一方
- * ラベルの値は「アセンブル全体を通した生のグローバルpc」で保持されて
- * おり、同じセクションに複数回出入りした場合(.text→.data→.text等)、
- * 出力ファイル上では断片が詰めて連結されるのに対し生pcは間に挟まった
- * 他セクション分だけ余分にズレたままになる。そのため「同じセクション内
- * の2ラベルの差分」のような計算が、セクション再入があると無警告で
- * 誤った値になっていた。実際の出力ファイルでの位置であるセクション内
- * 相対オフセットに変換する。section_rangesにまだ記録が無い場合(参照
- * している時点でまだ開いている現在のセクション)はst->sectionsの
- * (開始, 現在までのサイズ)にフォールバックする(axx.pyの
- * _section_word_ranges()と同じ)。解決できない場合は元の値をそのまま
- * 返す合図として-1を返す。 */
 static int64_t equ_section_relative_offset(AsmState *st, const char *sec_name, uint64_t word_pc){
     int64_t o = addr_to_word_offset(&st->section_ranges, sec_name, word_pc);
     if(o >= 0) return o;
-    /* 破綻点修正 (axx.py port): $$(現在pc)は、命令をエンコード中の「今
-     * まさに開いていてまだ.ENDSECTION/セクション切替で確定していない
-     * 断片」を指すことがほとんどだが、その断片はまだsection_rangesに
-     * 乗っていない。size>0(=既に確定済みの累積サイズがある)を要求する
-     * だけでは、現在オープン中の断片の途中にあるword_pcを解決できず
-     * -1を返してしまい、$$を使うPC相対エンコード式が常に補正不能に
-     * なっていた。entry_pc(直近の再入位置)以降かどうかを追加でチェック
-     * し、確定済み累積(e->size)にその断片内オフセットを足して返す。 */
     SecEntry *e = secmap_find(&st->sections, sec_name);
     if(e){
         uint64_t entry_pc = u256_to_u64(e->entry_pc);
@@ -1633,8 +1213,6 @@ static int64_t equ_section_relative_offset(AsmState *st, const char *sec_name, u
 
 static void state_init(AsmState *st) {
     memset(st, 0, sizeof(*st));
-    /* 診断ファネルから参照できるよう、走行中の state を公開する
-     * (axx.py の _ACTIVE_STATE に対応)。 */
     g_active_state = st;
     strcpy(st->lwordchars, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_.");
     strcpy(st->swordchars, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_%$-~&|");
@@ -1676,7 +1254,7 @@ static void state_init(AsmState *st) {
     st->expfile_elf[0] = '\0';
     st->elf_objfile[0] = '\0';
     st->elf_machine = 62;
-    st->elf_class = 2;   /* -f default: ELF64/ELFCLASS64 */
+    st->elf_class = 2;
     st->gen_debug = 0;
     st->line_map = NULL;
     st->line_map_len = 0;
@@ -1696,14 +1274,9 @@ static void state_init(AsmState *st) {
     st->reloc_count = 0;
     st->reloc_cap = 0;
     for(int _rti=0; _rti<4; _rti++) st->reloctype_override[_rti] = -1;
-    /* .check 拘束テーブルは memset で既にゼロ初期化済みだが、
-     * sv_init() と同等であることを明示的に保証する。              */
     for(int _ci=0; _ci<26; _ci++) sv_init(&st->check_constraints[_ci]);
 }
 
-/* =========================================================
- * String utilities
- * ========================================================= */
 static char axx_upper_char(char c) {
     if(c>='a'&&c<='z') return c-32;
     return c;
@@ -1750,6 +1323,8 @@ static void axx_reduce_spaces(char *s) {
     *dst=0;
 }
 
+/* パターンファイルのコメント（スラッシュ＋アスタリスク以降）を落とす。
+ * 行単位で扱うので閉じ記号は不要。 */
 static void axx_remove_comment(char *l) {
     for(int i=0;l[i];i++){
         if(l[i]=='/'&&l[i+1]=='*'){
@@ -1758,35 +1333,18 @@ static void axx_remove_comment(char *l) {
     }
 }
 
+/* アセンブリソースの `;` コメントを落とす。
+ * 文字列 "..." や文字リテラル 'x' の中の `;` は本物のデータなので残す。
+ * 引用符の外の `\;` はエスケープとして扱い、バックスラッシュを外した
+ * リテラルな `;` に変える（コメントを開始させない）。
+ * 文字列が縮むので、読み位置 i と書き位置 w を分けた in-place 詰め直しで行う
+ * （常に w <= i なので同じバッファを上書きしても安全）。 */
 static void axx_remove_comment_asm(char *l) {
-    /* Fix C-N1: handle backslash-escaped quotes inside string literals.
-     * Fix ⑦: also handle single-quote character literals ('x' and '\x')
-     * so that semicolons inside them are not treated as comment starts.
-     * Strategy: when we encounter a single quote outside a double-quoted
-     * string, perform look-ahead to consume the entire literal:
-     *   '\x' form (4 chars): quote + backslash + char + quote
-     *   'x'  form (3 chars): quote + char + quote
-     * An isolated quote (no matching close) is passed through silently.
-     *
-     * Bugfix (axx.py port): a backslash-escaped "\;" outside quotes is now
-     * resolved to a literal ';' (backslash stripped) instead of starting a
-     * comment, so a genuine ';' can appear unquoted in source text. Since
-     * this shrinks the string, the function now does an in-place
-     * read(i)/write(w) compaction rather than only ever advancing a single
-     * cursor -- w is always <= i, so writing behind the read cursor into
-     * the same buffer is safe.
-     *
-     * Bugfix (axx.py port): axx.py's StringUtils.delete_comment() warns when
-     * a line ends while still inside a double-quoted string; this returned
-     * quietly, so `.ascii "abc` (no closing quote) emitted bytes with no
-     * notice from caxx while axx.py warned.  The message quotes the original
-     * text, so keep a copy before the in-place compaction below. */
     char *orig = strdup(l);
     int in_str=0;
     int i=0, w=0;
     while(l[i]){
         if(in_str && l[i]=='\\'){
-            /* escape sequence inside double-quoted string: copy verbatim */
             l[w++]=l[i++];
             if(l[i]) l[w++]=l[i++];
             continue;
@@ -1798,18 +1356,14 @@ static void axx_remove_comment_asm(char *l) {
         }
         if(l[i]=='"'){ in_str=!in_str; l[w++]=l[i++]; continue; }
         if(l[i]=='\'' && !in_str){
-            /* Fix ⑦: single-quote look-ahead */
             int j=i+1;
             if(l[j]=='\\' && l[j+1] && l[j+2]=='\''){
-                /* '\x' form: consume 4 chars */
                 while(i<j+3) l[w++]=l[i++];
                 continue;
             } else if(l[j] && l[j+1]=='\''){
-                /* 'x' form: consume 3 chars */
                 while(i<j+2) l[w++]=l[i++];
                 continue;
             }
-            /* isolated quote: pass through and continue */
             l[w++]=l[i++]; continue;
         }
         if(l[i]==';'&&!in_str){
@@ -1829,22 +1383,24 @@ static void axx_remove_comment_asm(char *l) {
     free(orig);
 }
 
+/* ソース行の `\!` を解決し、本物の VLIW 区切りを番兵に置き換える。
+ *
+ * 2つの処理を必ず1回の左→右走査で同時に行う:
+ *   `\!`   → リテラルな `!`（バックスラッシュを外す）
+ *   `!!`   → VLIW_SEP_CHAR   （本物のスロット区切り）
+ *   `!!!!` → VLIW_STOP_CHAR  （本物のストップビット）
+ *
+ * 同時でなければならない理由: 先に `\!\!` を `!!` へ戻してしまうと、後から
+ * 区切りを探す別の走査からは「エスケープ由来のただの !!」と「本物の区切り」を
+ * 区別できない。後続の走査はどの !! がエスケープだったかを覚えていないからである。
+ * ここで一度だけ判定して本物だけを番兵にしておけば、以降の全ての箇所
+ * （lineassemble() の後処理、vliwprocess() のスロット走査、
+ * axx_get_param_to_spc()/axx_get_param_to_eon()）は番兵だけを見ればよい。
+ *
+ * 文字列 "..." と文字リテラル 'x' の中身はそのまま素通しする。
+ * 呼ぶのは axx_remove_comment_asm() が `\;` を解決した後なので、ここで面倒を
+ * 見るのは `\!` だけでよい。 */
 static void axx_resolve_vliw_escapes(char *l) {
-    /* axx.py port: mirrors StringUtils.resolve_vliw_escapes(). Resolves
-     * "\!" escapes into a literal '!' (backslash stripped), and replaces
-     * genuine (unescaped) VLIW "!!"/"!!!!" separators with the
-     * VLIW_SEP_CHAR/VLIW_STOP_CHAR sentinels -- in a single left-to-right
-     * pass together with the separator detection itself, so a "\!\!"
-     * (meaning a literal "!!") can never be mistaken for a real separator
-     * by any LATER, independent scan that has no memory of which "!!" was
-     * escaped (axx_lineassemble()'s post-match check, vliwprocess()'s own
-     * slot-scanning, axx_get_param_to_spc()/axx_get_param_to_eon()).
-     * Called after axx_remove_comment_asm() has already resolved any "\;"
-     * escape and stripped the real comment, so this only needs to handle
-     * "\!". Skips "..." strings and 'x' char literals unchanged, same as
-     * axx_remove_comment_asm(). In-place read(i)/write(w) compaction,
-     * safe since every substitution here is length-preserving or
-     * shrinking (w <= i always). */
     int in_str=0;
     int i=0, w=0;
     while(l[i]){
@@ -1885,34 +1441,41 @@ static void axx_resolve_vliw_escapes(char *l) {
     l[w]=0;
 }
 
+/* 空白区切りで1語（ニーモニック部分）を切り出す。
+ * VLIW 区切りの番兵でも切る（`NOP!!NOP` のように空白なしで次スロットが続く
+ * 書き方で、ニーモニックが隣のスロットを飲み込まないように）。
+ *
+ * 番兵の判定は引用符の外だけで行う。番兵を「挿入」する
+ * axx_resolve_vliw_escapes() が引用符の中を素通ししている以上、「探す」側も
+ * 引用符の中を見てはいけない。番兵の値 0x92/0x93 は UTF-8 の継続バイトでもあり、
+ * .ascii "..." の中の多バイト文字（例: 日本語）に生の 0x92/0x93 が正当に現れる
+ * ため、引用符内で判定すると文字列の途中で切れてしまう。 */
 static int axx_get_param_to_spc(const char *s, int idx, char *t, size_t tsz) {
-    /* 破綻点修正 (axx.py port): "!!"は常にVLIWスロット区切り/終端マーカー
-     * として予約されている。以前は空白のみを境界とみなしていたため、
-     * オペランドを持たない命令(NOP等)をVLIWスロットとして空白なしで
-     * "nop!!!!"のように書くと、"!!!!"ごとニーモニックとして取り込まれて
-     * マッチに失敗していた(NOPのエンコード値がたまたまvliwnopの穴埋め値と
-     * 同じ0x00だったため出力バイトはたまたま一致していたが、"Syntax error"
-     * が誤って報告され、エンコードが異なる命令では実際にバイト列が壊れる)。
-     *
-     * Bugfix (axx.py port): now stops at the VLIW_SEP_CHAR/VLIW_STOP_CHAR
-     * sentinels instead of raw "!!"/"!!!!" text. By the time a source line
-     * reaches here, axx_resolve_vliw_escapes() has already replaced every
-     * genuine separator with a sentinel -- any raw "!!" still present is a
-     * resolved "\!\!" escape and must be read as ordinary literal text,
-     * not treated as a second, phantom boundary. */
     idx=axx_skipspc(s,idx);
     size_t n=0;
-    while(s[idx]&&s[idx]!=' '&&s[idx]!=VLIW_SEP_CHAR&&s[idx]!=VLIW_STOP_CHAR&&n<tsz-1) t[n++]=s[idx++];
+    int in_str=0;
+    while(s[idx]&&n<tsz-1){
+        if(!in_str&&(s[idx]==' '||s[idx]==VLIW_SEP_CHAR||s[idx]==VLIW_STOP_CHAR)) break;
+        if(s[idx]=='"') in_str=!in_str;
+        else if(in_str&&s[idx]=='\\'&&s[idx+1]){ t[n++]=s[idx++]; if(n>=tsz-1) break; }
+        t[n++]=s[idx++];
+    }
     t[n]=0;
     return idx;
 }
 
+/* 行の残り（空白を含む＝オペランド部分）を VLIW 区切りの手前まで取る。
+ * 番兵の判定を引用符の外だけで行う理由は axx_get_param_to_spc() を参照。 */
 static int axx_get_param_to_eon(const char *s, int idx, char *t, size_t tsz) {
-    /* Bugfix (axx.py port): stops at the VLIW_SEP_CHAR/VLIW_STOP_CHAR
-     * sentinel instead of raw "!!" text -- see axx_get_param_to_spc(). */
     idx=axx_skipspc(s,idx);
     size_t n=0;
-    while(s[idx]&&s[idx]!=VLIW_SEP_CHAR&&s[idx]!=VLIW_STOP_CHAR&&n<tsz-1) t[n++]=s[idx++];
+    int in_str=0;
+    while(s[idx]&&n<tsz-1){
+        if(!in_str&&(s[idx]==VLIW_SEP_CHAR||s[idx]==VLIW_STOP_CHAR)) break;
+        if(s[idx]=='"') in_str=!in_str;
+        else if(in_str&&s[idx]=='\\'&&s[idx+1]){ t[n++]=s[idx++]; if(n>=tsz-1) break; }
+        t[n++]=s[idx++];
+    }
     while(n>0&&(t[n-1]==' '||t[n-1]=='\t')) n--;
     t[n]=0;
     return idx;
@@ -1933,7 +1496,6 @@ static void axx_get_string(const char *l2, char *out, size_t osz) {
             else if(nc=='t')  { out[n++]='\t'; idx+=2; }
             else if(nc=='r')  { out[n++]='\r'; idx+=2; }
             else if(nc=='x'||nc=='X'){
-                /* Fix (axx.py port): \xNN hex escape – consume up to 2 hex digits. */
                 idx+=2;
                 char hex[3]; int hn=0;
                 while(l2[idx]&&is_xdigit_upper(axx_upper_char(l2[idx]))&&hn<2)
@@ -1942,7 +1504,6 @@ static void axx_get_string(const char *l2, char *out, size_t osz) {
                 if(hn>0){
                     out[n++]=(char)(int)strtol(hex,NULL,16);
                 } else {
-                    /* \x with no hex digits: output literal 'x' */
                     if(n<osz-1) out[n++]='x';
                 }
             }
@@ -1956,9 +1517,6 @@ static void axx_get_string(const char *l2, char *out, size_t osz) {
         axx_diagf(0, 0, " warning - unterminated string literal: %s\n", l2);
 }
 
-/* =========================================================
- * Parser helpers
- * ========================================================= */
 static int char_in(char c, const char *set){
     return strchr(set,c)!=NULL;
 }
@@ -1971,18 +1529,12 @@ static int axx_get_intstr(const char *s, int idx, char *fs, size_t fsz){
 }
 
 static int axx_get_floatstr(const char *s, int idx, char *fs, size_t fsz){
-    /* Fix 11: leading '-' is handled by expr_factor() as unary minus;
-     * consuming it here would double-interpret it.  Only '-inf' is kept
-     * as a single special token (axx.py treats '-inf' as one literal). */
     if(strncmp(s+idx,"-inf",4)==0){strcpy(fs,"-inf");return idx+4;}
     if(strncmp(s+idx,"inf",3)==0){strcpy(fs,"inf");return idx+3;}
     if(strncmp(s+idx,"nan",3)==0){strcpy(fs,"nan");return idx+3;}
     size_t n=0;
-    /* NOTE: do NOT consume a leading '-' here (Fix 11). */
     while(s[idx]&&(is_digit(s[idx])||s[idx]=='.')&&n<fsz-1) fs[n++]=s[idx++];
     if((s[idx]=='e'||s[idx]=='E') && n<fsz-1){
-        /* Fix (axx.py port): roll back exponent part when no digits follow 'e'/'E'.
-         * e.g. "1e" or "1e+" would produce an invalid float string – discard. */
         int saved_idx = idx;
         size_t saved_n = n;
         fs[n++]=s[idx++];
@@ -1990,7 +1542,6 @@ static int axx_get_floatstr(const char *s, int idx, char *fs, size_t fsz){
         int digits_start = idx;
         while(s[idx]&&is_digit(s[idx])&&n<fsz-1) fs[n++]=s[idx++];
         if(idx == digits_start){
-            /* no digits after exponent marker: discard and roll back */
             idx = saved_idx;
             n   = saved_n;
         }
@@ -2010,20 +1561,12 @@ static int axx_get_curlb(AsmState *st, const char *s, int idx, int *f_out, char 
     while(n>0&&t_out[n-1]==' ') n--;
     t_out[n]=0;
     if(!s[idx]){
-        /* 修正③: closing '}' not found – report error.
-         * axx.py returns len(s) to force parse termination (not start_idx).
-         * Bugfix (axx.py port): this used to be completely unconditional
-         * (no should_report_errors() gate, unlike every other diagnostic
-         * in the file -- fired redundantly on every pattern-match trial
-         * pass) and never set had_error, so a malformed "qad{"/"dbl{"/
-         * "flt{"/"enflt{"/"endbl{" body missing its closing '}' silently
-         * produced a 0 with a "successful" build. */
         if(should_report_errors(st)){
             axx_diagf(1, 0, " error - missing closing '}' in expression: '{%s'\n", t_out);
         }
         return (int)strlen(s);
     }
-    idx++; /* consume '}' */
+    idx++;
     *f_out=1;
     return idx;
 }
@@ -2032,14 +1575,6 @@ static int axx_get_symbol_word(const char *s, int idx, const char *swordchars, c
     t_out[0]=0;
     if(!s[idx]||is_digit(s[idx])||!char_in(s[idx],swordchars)) return idx;
     size_t n=0;
-    /* Fix: idx must always advance over the *entire* word in the source,
-     * even once the output buffer is full. Previously the loop condition
-     * "n<tsz-1" also gated idx's advance, so a word longer than tsz-1
-     * bytes left its unconsumed tail in the source string, causing the
-     * remainder to be misparsed as a following token (idx/n desync).
-     * Writing into t_out and advancing idx are now independent: t_out is
-     * truncated (with a warning) but idx always reflects the true word end,
-     * matching axx.py's unbounded get_symbol_word(). */
     int truncated = 0;
     t_out[n++]=s[idx++];
     while(s[idx]&&char_in(s[idx],swordchars)){
@@ -2060,8 +1595,6 @@ static int axx_get_label_word(const char *s, int idx, const char *lwordchars, ch
     if(!s[idx]) return idx;
     if(s[idx]!='.'&&(is_digit(s[idx])||!char_in(s[idx],lwordchars))) return idx;
     size_t n=0;
-    /* Fix: same idx/n desync as axx_get_symbol_word above; idx now always
-     * advances over the full label word regardless of buffer capacity. */
     int truncated = 0;
     t_out[n++]=s[idx++];
     while(s[idx]&&char_in(s[idx],lwordchars)){
@@ -2091,10 +1624,6 @@ static int axx_get_params1(const char *l, int idx, char *s_out, size_t ssz){
     return idx;
 }
 
-/* =========================================================
- * IEEE754 conversion helpers (used by expr_factor1 via direct call;
- * the 32/64 variants are also retained as API for future extensions)
- * ========================================================= */
 static AXX_UNUSED uint32_t ieee754_32_from_str(const char *a){
     if(strcmp(a,"inf")==0) return 0x7F800000u;
     if(strcmp(a,"-inf")==0) return 0xFF800000u;
@@ -2110,50 +1639,12 @@ static AXX_UNUSED uint64_t ieee754_64_from_str(const char *a){
     uint64_t r; memcpy(&r,&d,8); return r;
 }
 
-/* -------------------------------------------------------
- * Note: safe_spawn_read() / safe_spawn_close() have been removed.
- * ieee754_128_from_str() and xeval() no longer spawn subprocesses;
- * they use pure C implementations instead (Fix P11, Fix P12).
- * sys/wait.h is still included for completeness.
- * ------------------------------------------------------- */
 
-/* -------------------------------------------------------
- * Fix P11 (rev2): ieee754_128_from_str() -- two bugs fixed.
- *
- * Bug A (byte order): The previous little-endian loop read raw[7-i]
- *   and shifted left, placing raw[0] in the MSB -- big-endian semantics.
- *   On a little-endian machine, raw[0] is the LSB; the correct copy is
- *   simply memcpy(&result.w[0], raw, 8) and memcpy(&result.w[1], raw+8, 8).
- *
- * Bug B (precision): (__float128)strtold(a, NULL) parses the string with
- *   long-double precision (~18–19 decimal digits / 64 mantissa bits), then
- *   promotes to __float128.  Promotion zero-pads the lower 48 mantissa bits,
- *   giving a wrong result compared to mpmath which parses the decimal with
- *   full 113-bit binary128 precision.
- *
- *   Fix B: parse the decimal string directly using __float128 arithmetic
- *   (+, -, *, / on __float128 operands) so every intermediate value has
- *   113-bit precision.  This matches Python/mpmath output exactly.
- *
- * No subprocess, no temp files, no mpmath, no quadmath.
- * ------------------------------------------------------- */
 
 #if defined(__GNUC__) && !defined(__STRICT_ANSI__) && \
     (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
      defined(__arm__) || defined(__riscv))
 
-/* Parse a finite decimal string into __float128 with full 113-bit precision.
- *
- * Key insight: per-digit division by place (= place / 10 each step) accumulates
- * rounding errors because 1/10 is not exactly representable in binary.
- * Instead, collect ALL significant digits as one big __float128 integer (exact,
- * since typical decimal inputs have ≤20 digits which fit well within 113 bits),
- * then divide ONCE by 10^(num_fraction_digits).  One correctly-rounded division
- * produces the closest binary128 to the input decimal — matching mpmath.
- *
- * Handles: optional sign, integer digits, optional '.', fraction digits,
- * optional 'e'/'E' followed by a signed integer exponent.
- * nan/inf are handled before this is called.                               */
 static __float128 f128_from_decimal(const char *s)
 {
     const __float128 ten  = (__float128)10;
@@ -2163,8 +1654,6 @@ static __float128 f128_from_decimal(const char *s)
     if(*s == '-'){ sign = 1; s++; }
     else if(*s == '+'){ s++; }
 
-    /* Collect all significant digits (integer + fraction) as one __float128
-     * integer, tracking how many belong to the fraction part.              */
     __float128 int_val    = (__float128)0;
     int        frac_digits = 0;
     int        in_frac    = 0;
@@ -2180,12 +1669,10 @@ static __float128 f128_from_decimal(const char *s)
         s++;
     }
 
-    /* Divide once by 10^frac_digits (one correctly-rounded __float128 op). */
     __float128 denom = one;
     for(int i = 0; i < frac_digits; i++) denom *= ten;
     __float128 result = int_val / denom;
 
-    /* Apply explicit exponent if present */
     if(*s == 'e' || *s == 'E'){
         s++;
         int esign = 1;
@@ -2202,23 +1689,9 @@ static __float128 f128_from_decimal(const char *s)
     return sign ? -result : result;
 }
 
-/* -------------------------------------------------------
- * f128_eval_expr(): evaluate a simple arithmetic expression
- * in __float128 precision.
- *
- * Grammar:
- *   expr   := term   (('+' | '-') term)*
- *   term   := factor (('*' | '/') factor)*
- *   factor := '(' expr ')'  |  '-' factor  |  '+' factor  |  number
- *   number := decimal literal parsed by f128_from_decimal
- *
- * Used by both qad{} and !Q so that "3.14*2+1" is evaluated with
- * full 113-bit binary128 precision, matching Python mpmath exactly.
- * Non-parseable tokens (labels/symbols) cause ok=0; callers fall
- * back to the existing double-mode evaluator.                        */
 typedef struct { __float128 val; const char *end; int ok; } F128R;
 
-static F128R f128_expr_fn(const char *s);   /* forward declaration */
+static F128R f128_expr_fn(const char *s);
 
 static F128R f128_factor_fn(const char *s)
 {
@@ -2233,7 +1706,6 @@ static F128R f128_factor_fn(const char *s)
     }
     if(*s=='-'){ r=f128_factor_fn(s+1); r.val=-r.val; return r; }
     if(*s=='+'){ return f128_factor_fn(s+1); }
-    /* decimal number literal */
     if((*s>='0'&&*s<='9')||*s=='.'){
         char buf[80]; int n=0;
         while(((*s>='0'&&*s<='9')||*s=='.')&&n<78) buf[n++]=*s++;
@@ -2265,15 +1737,6 @@ static F128R f128_term_fn(const char *s)
             F128R r2=f128_factor_fn(p+1); if(!r2.ok) break;
             if(r2.val!=(__float128)0){ r.val/=r2.val; r.end=r2.end; }
             else {
-                /* Bugfix: mirrors axx.py's decimal_eval_expr(), whose
-                 * Decimal arithmetic raises DivisionByZero (a
-                 * ZeroDivisionError subclass) for e.g. "1/0" -- its caller
-                 * (qad{}) catches that and falls through to xeval(). This
-                 * used to silently skip the division, leaving `r.val`
-                 * unchanged (e.g. "1/0" evaluated to 1, not a failure) and
-                 * never falling through. Fail the whole parse instead, so
-                 * the caller's existing fallback chain (xeval_eval(), then
-                 * the native-evaluator tier) runs, exactly like axx.py. */
                 r.ok=0;
                 return r;
             }
@@ -2301,8 +1764,6 @@ static F128R f128_expr_fn(const char *s)
     return r;
 }
 
-/* Convert __float128 to uint256_t bit pattern.
- * w[0] = lower 64 bits (LE) / upper 64 bits (BE).                   */
 static uint256_t f128_to_u256(__float128 v)
 {
     unsigned char raw[16];
@@ -2318,18 +1779,10 @@ static uint256_t f128_to_u256(__float128 v)
     return res;
 }
 
-/* Evaluate text as __float128 expression. ok_out=0 on failure.       */
 static uint256_t f128_eval_text(const char *text, int *ok_out)
 {
     F128R r = f128_expr_fn(text);
     if(r.ok){
-        /* Bugfix: mirrors axx.py's decimal_eval_expr(), whose Decimal
-         * arithmetic raises DivisionByZero (a ZeroDivisionError subclass)
-         * for e.g. "1/0", which its caller (qad{}) catches and falls
-         * through to xeval(). IEEE754 __float128 division instead
-         * silently produces infinity with no exception, so without this
-         * check "qad{1/0}" would succeed here with a bogus infinite
-         * result instead of falling through like axx.py does. */
         double dcheck = (double)r.val;
         if(!isfinite(dcheck)) r.ok = 0;
     }
@@ -2338,10 +1791,9 @@ static uint256_t f128_eval_text(const char *text, int *ok_out)
     return f128_to_u256(r.val);
 }
 
-#endif /* __GNUC__ block */
+#endif
 
 static uint256_t ieee754_128_from_str(const char *a){
-    /* Special values */
     if(strcmp(a,"inf")==0){
         uint256_t r=u256_zero(); r.w[1]=0x7FFF000000000000ULL; return r;
     }
@@ -2355,17 +1807,11 @@ static uint256_t ieee754_128_from_str(const char *a){
 #if defined(__GNUC__) && !defined(__STRICT_ANSI__) && \
     (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
      defined(__arm__) || defined(__riscv))
-    /* Path A: use __float128 arithmetic via f128_eval_text (full 113-bit
-     * precision, same result as Python mpmath with mp.prec=128).            */
     int ok = 0;
     uint256_t r = f128_eval_text(a, &ok);
     if(ok) return r;
-    /* Fall through to Path B if the expression couldn't be parsed
-     * (e.g. something other than a plain decimal literal).                  */
 #endif
 
-    /* Path B: long double iterative extraction (portable fallback).         */
-    /* Warn once if long double has the same precision as double (64-bit).  */
     {
         static int warned = 0;
         if(!warned && sizeof(long double)==sizeof(double)){
@@ -2382,30 +1828,22 @@ static uint256_t ieee754_128_from_str(const char *a){
     int sign = (ld < 0.0L) ? 1 : 0;
     if(ld < 0.0L) ld = -ld;
     int fe = 0;
-    /* Use frexpl: returns value in [0.5, 1.0) and sets fe such that
-     * ld == significand * 2^fe.  We want form 1.frac * 2^exp so:
-     * exp = fe-1, significand_normalized = ld * 2^(1-fe) */
     long double sig = frexpl(ld, &fe);
-    /* sig is in [0.5, 1.0), multiply by 2 to get [1.0, 2.0) */
     sig *= 2.0L;
     int exp_unbiased = fe - 1;
     int biased_exp = exp_unbiased + 16383;
-    /* Guard against exponent overflow / underflow */
-    if(biased_exp <= 0)  biased_exp = 0;  /* subnormal – treat as zero */
+    if(biased_exp <= 0)  biased_exp = 0;
     if(biased_exp >= 32767) {
-        /* Infinity */
         uint256_t r=u256_zero();
         r.w[1] = (uint64_t)(sign?1ULL:0ULL)<<63 | 0x7FFF000000000000ULL;
         return r;
     }
-    long double frac_part = sig - 1.0L;  /* fractional part after hidden bit */
-    /* Extract 48 high mantissa bits (bits 111..64 of the 112-bit field) */
+    long double frac_part = sig - 1.0L;
     uint64_t hi = 0;
     for(int b=47;b>=0;b--){
         frac_part *= 2.0L;
         if(frac_part >= 1.0L){ hi |= ((uint64_t)1<<b); frac_part -= 1.0L; }
     }
-    /* Extract 64 low mantissa bits (bits 63..0) */
     uint64_t lo = 0;
     for(int b=63;b>=0;b--){
         frac_part *= 2.0L;
@@ -2426,27 +1864,12 @@ static double endouble_bits(uint64_t a){
     double d; memcpy(&d,&a,8); return d;
 }
 
-/* =========================================================
- * Float-mode helpers for the expression evaluator.
- *
- * When AsmState.exp_typ_float == 1, the expression evaluator carries
- * double values as raw bit-casts inside uint256_t.w[0].  The two
- * conversion helpers below perform the bit-cast in both directions.
- *
- * axx_isfloatstr() returns 1 when the character at s[idx] can start a
- * floating-point literal recognised by axx_get_floatstr().  It is used
- * in expr_factor1() to dispatch between float and integer number parsing,
- * mirroring axx.py Parser.isfloatstr() / ExpressionEvaluator.factor1().
- * ========================================================= */
 static inline double u256_to_double(uint256_t v){
     double d; memcpy(&d, &v.w[0], 8); return d;
 }
 static inline uint256_t double_to_u256(double d){
     uint256_t r = u256_zero(); memcpy(&r.w[0], &d, 8); return r;
 }
-/* Returns 1 when s[idx] starts a float literal (digit, '.', 'i'nf, 'n'an, '-inf').
- * Leading '-' for regular numbers is NOT checked here because unary minus is
- * handled by expr_factor().  Only '-inf' is kept as a single special token. */
 static int axx_isfloatstr(const char *s, int idx){
     if(!s[idx]) return 0;
     if(strncmp(s+idx,"-inf",4)==0) return 1;
@@ -2457,9 +1880,6 @@ static int axx_isfloatstr(const char *s, int idx){
     return 0;
 }
 
-/* =========================================================
- * Forward declarations
- * ========================================================= */
 typedef struct Assembler Assembler;
 static uint256_t expr_expression(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_expression_pat(Assembler *asmb, const char *s, int idx, int *idx_out);
@@ -2472,21 +1892,8 @@ static int lineassemble(Assembler *asmb, const char *line);
 static int lineassemble0(Assembler *asmb, const char *line);
 static void fileassemble(Assembler *asmb, const char *fn);
 
-/* =========================================================
- * Assembler struct
- * ========================================================= */
 struct Assembler {
     AsmState st;
-    /* imp_label: section info parsed from the import TSV file.
-     * Built while reading section lines; used by subsequent label lines
-     * to resolve label -> section membership.
-     * Kept in Assembler (not AsmState) because it belongs to the import
-     * phase only and must not be confused with st.sections (assembly output).
-     * 破綻点修正 (axx.py port): SecMap(secmap_get)は同名キーの2回目の
-     * set()が1回目を上書きするため、再入セクションの断片ごとに複数行
-     * 書き出されるようになったTSVを読むと、名前ごとに最後の断片しか
-     * 残らず、それ以前の断片に定義されたラベルの所属セクションを
-     * 誤判定していた。SecRangeVec(重複キー可・追記のみ)に変更する。 */
     SecRangeVec imp_sections;
 };
 
@@ -2495,16 +1902,6 @@ static void assembler_init(Assembler *a){
     secrangevec_init(&a->imp_sections);
 }
 
-/* =========================================================
- * BinaryWriter helpers
- * ========================================================= */
-/* Fix: st->align used to be an `int`, so ".ALIGN 1<<32" truncated to 0 on
- * assignment, slipped past adir_align()'s "must be positive" guard and made
- * this "addr % align" kill the assembler with SIGFPE -- a plain source-level
- * typo crashed caxx outright.  Values like 0x100000001 truncated to 1 and
- * aligned silently wrongly instead.  axx.py holds the boundary as an
- * unbounded int, so it is kept full-width here too and the arithmetic is
- * done in 256-bit. */
 static uint256_t align_addr256(AsmState *st, uint256_t addr){
     if(u256_is_zero(st->align)) return addr;
     uint256_t q = u256_udiv(addr, st->align);
@@ -2545,17 +1942,9 @@ static void binary_flush(AsmState *st){
     if(!st->outfile[0]) return;
     int buf_found = 0;
     uint64_t max_pos = bufmap_max_key(&st->buf, &buf_found);
-    /* Fix (new): if nothing was ever written to the buffer, bail out now.
-     * Previously max_pos==0 was returned for both "empty buffer" and "one word
-     * at position 0", so an empty assembly would create a one-word output file. */
     if(!buf_found) return;
     int word_bits = st->bts;
     int bytes_per_word = (word_bits+7)/8;
-    /* Fix (axx.py port): a pc past 2**64 was previously only a warning, and
-     * the position was silently truncated to its low 64 bits -- ".org 1<<70"
-     * wrapped to 0 and produced a 1-byte file with exit status 0, while
-     * axx.py refused.  The size is computed from the recorded full-width pc
-     * because by now the buffer positions have already been truncated. */
     if(st->pc_overflow_set){
         uint256_t _tot = u256_mul(u256_add(st->pc_overflow_max, u256_from_u64(1)),
                                   u256_from_u64((uint64_t)bytes_per_word));
@@ -2565,15 +1954,7 @@ static void binary_flush(AsmState *st){
                   _tb, (unsigned long long)((uint64_t)1<<30));
         return;
     }
-    /* Fix D: max_pos+1 wraps to 0 when max_pos==UINT64_MAX, producing a
-     * bogus total_size==0 that silently discards the entire binary.  Treat
-     * UINT64_MAX as an impossible address and bail out with an error. */
     if(max_pos == (uint64_t)-1){
-        /* Fix (axx.py port): report this with the same wording and the same
-         * size figure axx.py's flush() uses, instead of an internal-sounding
-         * message, and set had_error so the exit status is non-zero.  The
-         * size does not fit in uint64_t (it is exactly 2**64 * bytes_per_word
-         * here), so it is computed in 256-bit. */
         uint256_t _tot = u256_mul(u256_shl(u256_from_u64(1), 64),
                                   u256_from_u64((uint64_t)bytes_per_word));
         char _tb[96]; u256_to_pydec(_tot, _tb, sizeof(_tb));
@@ -2584,12 +1965,6 @@ static void binary_flush(AsmState *st){
     }
     uint64_t total_size = (max_pos+1)*(uint64_t)bytes_per_word;
     if(total_size==0) return;
-    /* Fix (axx.py port, BinaryWriter.flush()'s _MAX_OUTPUT_BYTES): cap the
-     * output size at 1 GiB and report it as an assembly error.  Without this
-     * a mistaken ".org 1<<70" produced only a "program counter exceeds
-     * 64-bit range" warning, then wrote a 1-byte file (the truncated address
-     * wrapped to 0) and exited 0, while axx.py refused and wrote nothing --
-     * a silent byte-level divergence between the two implementations. */
     {
         const uint64_t MAX_OUTPUT_BYTES = (uint64_t)1<<30;
         if(total_size > MAX_OUTPUT_BYTES){
@@ -2600,9 +1975,6 @@ static void binary_flush(AsmState *st){
             return;
         }
     }
-    /* Fix I: on 32-bit systems SIZE_MAX is ~4 GB.  If total_size exceeds it,
-     * the cast to size_t wraps silently, calloc allocates far too little, and
-     * subsequent writes corrupt the heap.  Fail loudly instead. */
     if(total_size > (uint64_t)(size_t)-1){
         fprintf(stderr,"binary_flush: output too large (%llu bytes) for this platform's size_t.\n",
                 (unsigned long long)total_size);
@@ -2611,9 +1983,6 @@ static void binary_flush(AsmState *st){
     unsigned char *data = calloc(1, (size_t)total_size);
     if(!data){perror("calloc");return;}
 
-    /* Fix #6: fill every word-slot with the padding value first,
-     * then overwrite only the positions that were actually written.
-     * The original calloc() always pre-filled with 0, ignoring st->padding. */
     uint64_t pad_val = u256_to_u64(st->padding);
     if(pad_val != 0){
         for(uint64_t pos = 0; pos <= max_pos; pos++){
@@ -2662,17 +2031,11 @@ static void binary_flush(AsmState *st){
     free(data);
 }
 
-/* =========================================================
- * VariableManager
- * ========================================================= */
 static uint256_t var_get(AsmState *st, char ch){
     ch=(char)axx_upper_char(ch);
     if(ch>='A'&&ch<='Z') return st->vars[ch-'A'].val;
     return u256_zero();
 }
-/* Whether the variable's currently-stored value genuinely came from a
- * failed label lookup (see PatVar's comment above) -- NOT a check on the
- * numeric value itself. */
 static int var_get_is_undef(AsmState *st, char ch){
     ch=(char)axx_upper_char(ch);
     if(ch>='A'&&ch<='Z') return st->vars[ch-'A'].is_undef;
@@ -2682,32 +2045,16 @@ static void var_put(AsmState *st, char ch, uint256_t v){
     ch=(char)axx_upper_char(ch);
     if(ch>='A'&&ch<='Z'){ st->vars[ch-'A'].val=v; st->vars[ch-'A'].is_undef=0; }
 }
-/* var_put_tagged: like var_put(), but also records genuine provenance
- * (is_undef) alongside the value, so a later read of this same variable
- * can tell a legitimate value that merely equals the UNDEF bit pattern
- * (e.g. -1) apart from a value that really did come from an unresolved
- * label reference. */
 static void var_put_tagged(AsmState *st, char ch, uint256_t v, int is_undef){
     ch=(char)axx_upper_char(ch);
     if(ch>='A'&&ch<='Z'){ st->vars[ch-'A'].val=v; st->vars[ch-'A'].is_undef=is_undef; }
 }
 
-/* =========================================================
- * LabelManager
- * ========================================================= */
+/* ラベルの値を引く。
+ * 見つからなければ st->error_undefined_label を「立てる」。成功しても降ろさない
+ * のが重要な約束で、1つの式が複数のラベルを引くため、途中で降ろすと先に起きた
+ * 失敗の情報が消えてしまう。新規に判定したい側が評価直前に自分で降ろす。 */
 static uint256_t label_get_value(AsmState *st, const char *k){
-    /* Bugfix (axx.py port): this used to unconditionally clear
-     * error_undefined_label here on every call, clobbering the signal
-     * from an EARLIER label reference in the same compound expression
-     * (e.g. "undefined_label + defined_label": the first operand's lookup
-     * correctly sets the flag, but the second operand's lookup --
-     * succeeding -- reset it right back to 0, since none of the
-     * expr_termN() binary-operator levels save/restore or OR-merge the
-     * flag around each operand). Only ever SET it (on failure, below);
-     * never clear it here on success, so it correctly accumulates for the
-     * whole expression. Top-level callers that need a "fresh" check
-     * (.ORG/.RESB/.ZERO/etc.) reset it themselves immediately before
-     * evaluating their own expression. */
     LabelEntry *e=lmap_find(&st->labels,k);
     if(e){
         uint256_t ret_val = e->value;
@@ -2722,40 +2069,12 @@ static uint256_t label_get_value(AsmState *st, const char *k){
             int64_t _adj = equ_section_relative_offset(st, sec, u256_to_u64(e->value));
             if(_adj >= 0) ret_val = u256_from_u64((uint64_t)_adj);
         } else if(st->in_binary_list && strcmp(sec, st->current_section) == 0){
-            /* 破綻点修正 (axx.py port): .EQU以外でも、命令エンコード式
-             * (パターンファイルの$$/ラベル参照の組合せ、例: z80の
-             * "JR !e :: 0x18,e-$$-2")は生のグローバルpcで計算されており、
-             * 同じセクションへの再入で生じるズレの影響を受けていた
-             * (上の.EQUと同じ根本原因)。$$は常に現在セクション内の値
-             * なので、参照ラベルが現在セクションと同じ場合に限り、両者を
-             * 同じ基準(セクション内相対オフセット)に揃える。異なる
-             * セクションを参照する場合は、既存のELFリロケーション機構が
-             * 別途正しく処理するためここでは変更しない。
-             *
-             * 破綻点修正2 (重大): st->in_binary_list の条件を追加した。
-             * これが無いと、reloc_type付き.EQU(例:
-             * "tape_a: .equ tape::abs32")が同じセクション内のアドレス
-             * ラベル(tape)を参照した際にもこの変換が誤って適用され、
-             * tape_a の値が「tapeの生pc」ではなく「セクション先頭からの
-             * 相対オフセット」に壊されてしまっていた(bf.sで実際に
-             * 発生・確認済み: tape_a が0になり、[tape_a+r15] SIB
-             * アドレッシングが.textの先頭を指してbus errorでクラッシュ
-             * した)。reloc_type付き.EQUやその他の通常の式評価
-             * (in_binary_list=0)では、ラベルの生の値をそのまま維持
-             * しなければならない。 */
             int64_t _adj = equ_section_relative_offset(st, sec, u256_to_u64(e->value));
             if(_adj >= 0) ret_val = u256_from_u64((uint64_t)_adj);
         }
-        /* ELF relocation tracking.
-         * .equ-defined labels は原則として絶対定数であり追跡しない。
-         * ただし .equ $$::reloctype のように reloc_type_override が設定されている場合は
-         * アドレスラベルと同様に追跡してリロケーションを生成する必要がある。 */
         int _equ_has_reloc = e->is_equ && (e->reloc_type_override >= 0);
         if(st->elf_tracking && (!e->is_equ || _equ_has_reloc)){
             if(st->elf_capturing_var != '\0'){
-                /* match() is capturing !var: record variable->label mapping.
-                 * If the same var gets two different get_value() calls the
-                 * expression is compound (e.g. label1+label2) – mark invalid. */
                 int vi = (unsigned char)st->elf_capturing_var - 'a';
                 if(vi >= 0 && vi < 26){
                     if(st->elf_var_to_label[vi].set == 0){
@@ -2764,14 +2083,12 @@ static uint256_t label_get_value(AsmState *st, const char *k){
                         st->elf_var_to_label[vi].label_name = strdup(k);
                         st->elf_var_to_label[vi].label_val = u256_to_u64(e->value);
                     } else {
-                        /* conflict – compound expression, not directly relocatable */
                         st->elf_var_to_label[vi].set = -1;
                         free(st->elf_var_to_label[vi].label_name);
                         st->elf_var_to_label[vi].label_name = NULL;
                     }
                 }
             } else if(st->elf_current_word_idx >= 0){
-                /* Inside makeobj(): direct label reference in object expression */
                 if(st->elf_refs_len >= st->elf_refs_cap){
                     st->elf_refs_cap = st->elf_refs_cap ? st->elf_refs_cap*2 : 8;
                     st->elf_refs = realloc(st->elf_refs,
@@ -2786,66 +2103,18 @@ static uint256_t label_get_value(AsmState *st, const char *k){
         }
         return ret_val;
     }
-    /* A (axx.py port): pass1 forward reference uses the previous relaxation
-     * iteration's resolved address as an estimate. This (1) lets relaxation
-     * actually converge for variable-length forward branches and (2) makes the
-     * size-probe and the error-condition see the same realistic displacement.
-     * An estimate is trusted (no error_undefined_label) so makeobj proceeds.
-     * pass2 (pas==2) never takes this path, so a truly undefined label still
-     * errors there. UNDEF-derived estimates are ignored (treated as no estimate). */
     if(st->pas == 1 && st->relax_prev){
         LabelEntry *pe = lmap_find(st->relax_prev, k);
-        /* Bugfix: was !u256_is_undef_derived(pe->value), which wrongly
-         * discarded a previous-iteration estimate that happened to be a
-         * legitimate -1 (bit-identical to UNDEF_VAL() in this fixed-width
-         * type). is_undef is propagated into every relax_prev snapshot via
-         * lmap_set_full(), so this is a safe drop-in replacement -- see
-         * LabelEntry.is_undef. */
         if(pe && !pe->is_undef){
             return pe->value;
         }
     }
     if(st->pas == 1 && st->relax_optimistic){
-        /* First relaxation iteration: this label is a forward reference and
-         * there is no previous-iteration estimate yet.
-         *
-         * Falling through to UNDEF_VAL() here would hand the pattern's
-         * size-selecting expression a meaningless value (all-bits-1, i.e. -1
-         * when the expression compares it as a signed displacement), so which
-         * encoding length comes out first depends on nothing but the current
-         * .ORG. Every later iteration only ever sees displacements computed
-         * from that arbitrary first layout, so a long encoding that happens to
-         * be self-consistent stays put even when a short one would also have
-         * been self-consistent -- the loop settles on whichever fixed point
-         * the initial guess fell into rather than on the smallest one.
-         * (Concretely, for a PC-relative operand whose displacement lands
-         * exactly on the 8-bit boundary, both the short and the long encoding
-         * are stable, and which one is produced varied with .ORG.)
-         *
-         * Estimating an unknown forward label as the address of the
-         * instruction being encoded makes every displacement come out as small
-         * as it possibly could be, so iteration 1 lays the program out with
-         * every variable-length instruction at its shortest form. Label
-         * addresses can then only move forward from iteration to iteration, so
-         * encodings only ever grow, and the loop converges on the SMALLEST
-         * self-consistent layout -- which is both what an assembler should
-         * emit and what makes the result independent of the starting guess.
-         *
-         * The flag is still set: an estimate is not a definition, and a
-         * genuinely undefined label must still be reported. Pass 1 never
-         * reports (see should_report_errors()), and pass 2 -- which never
-         * takes this branch -- does.
-         *
-         * This mirrors AssemblerState.relax_optimistic in axx.py; the two
-         * implementations must agree byte for byte. */
         st->error_undefined_label = 1;
         return st->pc;
     }
     st->error_undefined_label = 1;
     if(st->pass1_size_mode) return u256_zero();
-    /* in_match_attempt が 1 のときはパターンマッチ試行中であり、
-     * このラベル参照は後に別パターンに差し替えられる可能性があるためエラーを表示しない。
-     * （例: OUT (!n),A が OUT (C),E を試みる際に !n キャプチャで C がラベル評価される。） */
     if(!st->in_match_attempt && should_report_errors(st)){
         axx_diagf(0, 0, " error - Label undefined: '%s'  [%s:%d]\n",
                    k, st->current_file, (int)st->ln);
@@ -2853,37 +2122,22 @@ static uint256_t label_get_value(AsmState *st, const char *k){
     return UNDEF_VAL();
 }
 static const char *label_get_section(AsmState *st, const char *k){
-    /* Same fix as label_get_value() above: only ever set the flag, never
-     * clear it on success. */
     LabelEntry *e=lmap_find(&st->labels,k);
     if(e) return e->section;
     st->error_undefined_label=1;
     return "";
 }
+/* ラベルを定義する。パスによって意味が変わる:
+ *   パス1/対話 … 新規定義。既に在れば二重定義エラー。ただし .extern による
+ *                 仮登録(is_imported)は実体を持たないので上書きを許す。
+ *   パス2      … パス1で既に在るはず。無ければ両パスで見た入力が違うという異常。
+ * パターンファイルの .setsym と同名なら衝突として拒否する。 */
 static int label_put_value(AsmState *st, const char *k, uint256_t v, const char *sec, int is_equ, int reloc_type, int is_undef){
     if(st->pas==1||st->pas==0){
         LabelEntry *_existing = lmap_find(&st->labels,k);
-        /* 破綻点修正 (axx.py port): .EXTERNで仮登録された名前(is_imported=1)は
-         * まだ実体を持たないプレースホルダなので、同名のローカル定義で
-         * 上書きすることを許可する(axx.py側の put_value() と同じ仕様)。
-         * 従来はis_imported を無視して無条件に「既に定義済み」エラーに
-         * していたため、.EXTERN後に同名をローカル定義する正当なパターンが
-         * 常に失敗していた。 */
         if(_existing && !_existing->is_imported){
             st->error_already_defined=1;
             st->had_error=1;
-            /* NOTE (axx.py port): intentionally NOT gated by
-             * should_report_errors() -- that helper excludes pas==1 by
-             * design (Pass 1 relaxation), and there is no equivalent
-             * re-check for a genuine duplicate label during Pass 2 (its
-             * own check just below tests the opposite condition: a label
-             * MISSING from pass 1, not a duplicate WITHIN a pass). Gating
-             * this would silently swallow the only diagnostic a real
-             * duplicate-label error ever gets outside interactive mode.
-             * This does still print once per pass-1 relaxation iteration
-             * for the same duplicate -- cosmetic stderr noise, not a
-             * correctness bug (had_error is already set once, correctly
-             * aborting the build either way). */
             axx_diagf(0, 0, " error - label already defined.\n");
             return 0;
         }
@@ -2905,29 +2159,11 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
         return 0;
     }
     st->error_already_defined=0;
-    /* lmap_set は reloc_type_override を -1 にリセットする（旧値を引き継がない）。
-     * ::reloctype が明示指定された場合のみ直後に設定する。 */
     lmap_set(&st->labels,k,v,sec,is_equ,is_undef);
     if(reloc_type >= 0)
         lmap_set_reloc_type(&st->labels, k, reloc_type);
     return 1;
 }
-/* u256_to_pyhex: render a stored label value the way Python's hex(int(num))
- * does -- lowercase, no leading zeros, and a leading '-' for negative values
- * ("-0x5", not the unsigned two's-complement expansion "0xffff...fb").
- *
- * Label values are held two's complement in uint256_t, so the top bit of w[3]
- * is the sign, the same reading u256_cmp_signed() gives these words elsewhere
- * in this file.  The previous printer went through u256_to_u64(), which keeps
- * only w[0]: that turned ".equ 0-5" into 0xfffffffffffffffb and silently
- * printed 0x0 for any value whose significant bits sat above bit 63
- * (".equ 1<<80").
- *
- * Residual limit (pre-existing, from the 256-bit storage rather than from this
- * function): Python holds label values as unbounded ints, so -1 and 2**256-1
- * are distinct there while both are all-ones here.  Values at or above 2**255
- * are therefore reported as their negative counterparts.  Ordinary address and
- * .equ arithmetic never reaches that range. */
 static void u256_to_pyhex(uint256_t a, char *out, size_t outsz){
     char buf[80]; size_t n=0; int neg=0;
     if((a.w[3]>>63)&1ULL){ neg=1; a=u256_neg(a); }
@@ -2938,17 +2174,6 @@ static void u256_to_pyhex(uint256_t a, char *out, size_t outsz){
     snprintf(out,outsz,"%s0x%s",neg?"-":"",buf);
 }
 
-/* u256_to_pydec: render a 256-bit value the way Python's str(int(num)) does --
- * plain decimal, no leading zeros, a leading '-' for negative values.
- *
- * Needed because diagnostics that quote a value back to the user (".ORG
- * address must be non-negative, got -8.") have to match axx.py's wording,
- * and every existing printer here either loses the high words
- * (u256_to_i64() keeps only w[0]) or prints hex (u256_to_pyhex()).
- *
- * The same residual limit as u256_to_pyhex() applies: values at or above
- * 2**255 are reported as their negative counterparts, since the two are
- * bit-identical in 256-bit storage. */
 static void u256_to_pydec(uint256_t a, char *out, size_t outsz){
     char buf[96]; int n=0; int neg=0;
     if((a.w[3]>>63)&1ULL){ neg=1; a=u256_neg(a); }
@@ -2973,32 +2198,11 @@ static int label_key_cmp(const void *pa, const void *pb){
     return strcmp(a->key, b->key);
 }
 
-/* label_print_all: mirrors Python LabelManager.printlabels()
- *   for key, value in self.state.labels.items():
- *       num = value[0]; section = value[1]
- *       num_str = "UNDEF" if num == UNDEF else hex(int(num))
- *       result[key] = [num_str, section]
- *   for k, v in sorted(result.items()):
- *       print(f"  {k:40s}  {v[0]}  ({v[1]})", file=sys.stderr)
- *
- * One line per label, sorted by name.  The comment block that used to sit here
- * quoted an older printlabels() that dumped the raw dict on one line; axx.py
- * was rewritten (sorted output, aligned columns, UNDEF handling) and this port
- * was never brought along.  Only the interactive "?" command reaches this
- * function, and no sample in the tree runs interactively, so the divergence
- * never showed up in the sample-by-sample byte comparison.
- *
- * UNDEF is taken from the entry's is_undef provenance flag rather than by
- * comparing value against the all-ones sentinel.  Python can afford the value
- * test because its UNDEF is (1<<1024)-1, distinct from -1; here the two are
- * bit-identical, so a legitimate ".equ 0-1" would otherwise be reported as
- * undefined -- the same collision LabelEntry.is_undef was introduced to
- * settle. */
 static void label_print_all(AsmState *st){
     int n=0;
     for(int i=0;i<st->labels.nbuckets;i++)
         for(LabelEntry*e=st->labels.buckets[i];e;e=e->next) n++;
-    if(n==0) return;                 /* Python's loop prints nothing for {} */
+    if(n==0) return;
     LabelEntry **v=(LabelEntry**)malloc(sizeof(LabelEntry*)*(size_t)n);
     if(!v) return;
     int k=0;
@@ -3014,51 +2218,11 @@ static void label_print_all(AsmState *st){
     free(v);
 }
 
-/* =========================================================
- * SymbolManager
- * ========================================================= */
 static int symbol_get(AsmState *st, const char *w, uint256_t *out){
     char uw[512]; axx_strupr_to(uw,w,sizeof(uw));
     return smap_get(&st->symbols,uw,out);
 }
 
-/* =========================================================
- * xeval: qad{}/dbl{}/flt{} float-notation expression evaluator.
- *
- * axx.py port: mirrors axx.py's xeval() -- a SEPARATE, restricted
- * arithmetic-expression language (not the general expr_expression()
- * grammar used everywhere else in this file), used only to evaluate
- * qad{}/dbl{}/flt{} bodies. Supports +,-,*,/,//,%,**, &,|,^,<<,>>, unary
- * +,-,~, parentheses, ":labelname" label-value references, and calls to
- * enfloat/endouble/enflt/endbl (bit-reinterpret an integer as a float).
- * Values are represented as `double` throughout, matching how axx.py's
- * xeval() duck-types int/float together for this use case.
- *
- * Was previously entirely unimplemented in the C port: flt{}/dbl{}/qad{}
- * fell back to running the raw body text through the general expression
- * evaluator, which has no notion of ":label" or enfloat(...)-style calls
- * at all -- "enfloat" parsed as an (always-undefined) bare label
- * reference and ":label" mostly got silently dropped, producing a wrong
- * numeric result with no diagnostic. That silent-wrong-answer bug is
- * exactly what motivated implementing this properly instead of just
- * working around the symptom.
- *
- * Scope note: axx.py's xeval() also allows and/or/not, chained
- * comparisons, and a Python `a if b else c` ternary (it parses the whole
- * Python expression grammar via ast.parse). Those are not reproduced
- * here -- they don't serve xeval()'s actual purpose (building a
- * float32/float64/binary128 bit pattern from label values and
- * constants), and no shipped .axx pattern file relies on them there.
- * Extend the same way (see xeval_primary()/xeval_term()) if real usage
- * turns up.
- * ========================================================= */
-/* Reconstruct the full two's-complement magnitude of a 256-bit label value
- * as a long double, instead of silently truncating to just the low 64 bits
- * (as u256_to_i64() does). Exact for values that fit within long double's
- * ~64-bit mantissa (e.g. any dbl{} 64-bit bit pattern); as accurate as long
- * double allows for wider qad{} (128-bit) bit patterns -- still a large
- * improvement over reading back 0 for values whose significant bits sit
- * above bit 63. */
 static long double u256_to_long_double(uint256_t v){
     int neg = (int)((v.w[3] >> 63) & 1);
     uint256_t m = v;
@@ -3086,7 +2250,6 @@ static void xeval_skip(XEP *p){
     while(p->i<p->len && (p->s[p->i]==' '||p->s[p->i]=='\t')) p->i++;
 }
 
-/* NUMBER | ":labelname" | NAME '(' expr ')' | '(' expr ')' */
 static long double xeval_primary(XEP *p){
     xeval_skip(p);
     if(!p->ok || p->i>=p->len){ p->ok=0; return 0; }
@@ -3106,30 +2269,8 @@ static long double xeval_primary(XEP *p){
         if(p->i==start){ p->ok=0; return 0; }
         char name[512]; int n=p->i-start; if(n>(int)sizeof(name)-1) n=(int)sizeof(name)-1;
         memcpy(name,p->s+start,(size_t)n); name[n]='\0';
-        /* Direct label-table lookup (mirrors axx.py xeval()'s replacer(),
-         * which reads self.state.labels[...] directly rather than going
-         * through get_value()/label_get_value() -- deliberately, so a
-         * failed lookup here only sets error_undefined_label without
-         * also printing its own "Label undefined" message; the outer
-         * caller (whatever ends up checking the flag) is what reports
-         * it, exactly once, if it's still set once evaluation finishes. */
         AsmState *st=&p->asmb->st;
         LabelEntry *e = lmap_find(&st->labels, name);
-        /* Bugfix: this used to also treat u256_is_undef_derived(e->value) as
-         * undefined -- i.e. flag any label whose stored value happened to be
-         * bit-identical to UNDEF_VAL(). axx.py's xeval() can safely compare
-         * against its UNDEF sentinel because it is an arbitrary-precision
-         * integer far outside any realistic value's range, so the comparison
-         * never has a false positive there. This C port's UNDEF_VAL() is
-         * merely the all-ones 256-bit pattern, which is exactly the two's-
-         * complement representation of a perfectly legitimate -1 -- so
-         * ":label" referencing a real, defined label such as
-         * "label: .equ 0-1" was wrongly reported as undefined here. Genuine
-         * undefined-ness is now tracked via e->is_undef (set only when the
-         * label's own defining expression actually failed a lookup -- see
-         * LabelEntry.is_undef / label_put_value()'s is_undef argument),
-         * so a label that is simply present and not undef-derived is used
-         * as-is regardless of what its bit pattern looks like. */
         if(!e || e->is_undef){
             st->error_undefined_label = 1;
             return 0;
@@ -3143,9 +2284,6 @@ static long double xeval_primary(XEP *p){
         memcpy(name,p->s+start,(size_t)n); name[n]='\0';
         xeval_skip(p);
         if(p->i>=p->len || p->s[p->i]!='('){
-            /* xeval() only allows bare names that are label placeholders
-             * (handled above via ':') or calls to the 4 allowed
-             * functions; anything else is a disallowed name in axx.py. */
             p->ok=0; return 0;
         }
         p->i++;
@@ -3179,8 +2317,6 @@ static long double xeval_primary(XEP *p){
 
 static long double xeval_unary(XEP *p);
 
-/* primary ('**' unary)?  -- right-associative, exponent may itself be unary
- * (so "2**-1" parses), matching Python's ** precedence/associativity. */
 static long double xeval_power(XEP *p){
     long double base = xeval_primary(p);
     xeval_skip(p);
@@ -3192,7 +2328,6 @@ static long double xeval_power(XEP *p){
     return base;
 }
 
-/* ('+'|'-'|'~') unary | power */
 static long double xeval_unary(XEP *p){
     xeval_skip(p);
     if(p->ok && p->i<p->len && p->s[p->i]=='+'){ p->i++; return xeval_unary(p); }
@@ -3205,7 +2340,6 @@ static long double xeval_unary(XEP *p){
     return xeval_power(p);
 }
 
-/* unary (('//'|'/'|'%'|'*') unary)*  -- '//' checked before '/' */
 static long double xeval_term(XEP *p){
     long double v = xeval_unary(p);
     while(p->ok){
@@ -3230,7 +2364,6 @@ static long double xeval_term(XEP *p){
     return v;
 }
 
-/* term (('+'|'-') term)* */
 static long double xeval_addsub(XEP *p){
     long double v = xeval_term(p);
     while(p->ok){
@@ -3242,7 +2375,6 @@ static long double xeval_addsub(XEP *p){
     return v;
 }
 
-/* addsub (('<<'|'>>') addsub)* */
 static long double xeval_shift(XEP *p){
     long double v = xeval_addsub(p);
     while(p->ok){
@@ -3258,7 +2390,6 @@ static long double xeval_shift(XEP *p){
     return v;
 }
 
-/* shift ('&' shift)* */
 static long double xeval_band(XEP *p){
     long double v = xeval_shift(p);
     while(p->ok){
@@ -3269,7 +2400,6 @@ static long double xeval_band(XEP *p){
     return v;
 }
 
-/* band ('^' band)* */
 static long double xeval_bxor(XEP *p){
     long double v = xeval_band(p);
     while(p->ok){
@@ -3280,7 +2410,6 @@ static long double xeval_bxor(XEP *p){
     return v;
 }
 
-/* bxor ('|' bxor)* */
 static long double xeval_expr(XEP *p){
     long double v = xeval_bxor(p);
     while(p->ok){
@@ -3291,13 +2420,6 @@ static long double xeval_expr(XEP *p){
     return v;
 }
 
-/* Evaluate `text` (a qad{}/dbl{}/flt{} body) as an xeval expression.
- * Returns 1 and sets *out on success, 0 on a genuine parse/syntax error
- * (mirrors axx.py xeval() raising ValueError -- callers report their own
- * "cannot convert expression" message in that case). An undefined
- * ":label" reference is NOT a parse error: it returns 1 with *out=0, and
- * the caller finds out via st->error_undefined_label (set above),
- * exactly like axx.py's xeval(). */
 static int xeval_eval(Assembler *asmb, const char *text, double *out){
     XEP p; p.s=text; p.i=0; p.len=(int)strlen(text); p.ok=1; p.asmb=asmb;
     long double v = xeval_expr(&p);
@@ -3307,12 +2429,6 @@ static int xeval_eval(Assembler *asmb, const char *text, double *out){
     return 1;
 }
 
-/* =========================================================
- * Expression evaluator
- * ========================================================= */
-/* C (axx.py port): max expression recursion depth. Each nesting level consumes
- * several C stack frames; 500 is far beyond any real assembler expression yet
- * safely under typical 8MB stack limits. */
 #define EXPR_MAX_DEPTH 500
 static uint256_t expr_factor(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *idx_out);
@@ -3320,8 +2436,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
 static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_out);
-/* Forward declarations: expr_term2() needs the float-mode helpers that are
- * defined further down alongside expr_term3(). */
 static uint256_t expr_safe_bitwise_operand(Assembler *asmb, uint256_t v, const char *op_name);
 static uint256_t expr_bitwise_result(Assembler *asmb, uint256_t v);
 static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_out);
@@ -3335,11 +2449,6 @@ static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_ou
 static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_out);
 
-/* Bug 4 fix: expr_terminate()
- * The original had a dead branch `if(l>0 && s[l-1]=='\0')` which can never
- * be true: strlen() returns the index of the first NUL, so s[l-1] is always
- * a non-NUL character when l>0.  The then-branch was therefore unreachable.
- * Simplified to the single always-taken path. */
 static char *expr_terminate(const char *s){
     size_t l = strlen(s);
     char *r = malloc(l + 2);
@@ -3364,53 +2473,30 @@ static uint256_t expr_expression_asm(Assembler *asmb, const char *s, int idx, in
     free(ts);
     return r;
 }
-/* Fix C-4: expr_expression_esc() – stack-based bracket matching.
- *
- * The old implementation used two independent counters (depth for '()'
- * and bracket_depth for '[]').  This failed for mixed-bracket patterns
- * such as "([)]" or when stopchar is ')' while '[' is open: the counters
- * could go out of sync.
- *
- * Fix: push the opening bracket type onto a stack; pop only when the
- * matching closing bracket arrives.  stopchar is recognized only when the
- * stack is empty (depth == 0). */
 static uint256_t expr_expression_esc(Assembler *asmb, const char *s, int idx, char stopchar, int *idx_out){
     size_t l = strlen(s);
     char *buf = malloc(l + 2);
     if(!buf){ perror("malloc"); exit(1); }
-    memcpy(buf, s, idx);   /* copy prefix unchanged */
+    memcpy(buf, s, idx);
 
-    /* Stack of opening brackets seen so far. */
     char stk[256];
     int  stkp = 0;
 
     for(size_t i = (size_t)idx; i < l; i++){
         char c = s[i];
-        /* 【バグ修正①】Check depth-0 stopchar BEFORE opening-bracket test.
-         * If stopchar is '(' or '[' or OB_CHAR, the old code pushed it onto
-         * the stack instead of terminating the expression.  By checking
-         * (stkp==0 && c==stopchar) first, any stopchar works correctly.
-         *
-         * Fix C-N5: include OB_CHAR(0x90)/CB_CHAR(0x91) in the bracket stack. */
         if(stkp == 0 && c == stopchar){
-            /* Depth-0 stopchar → terminate expression */
             buf[i] = '\0';
         } else if(c == '(' || c == '[' || c == OB_CHAR){
-            /* Opening bracket: push and copy */
             if(stkp < (int)(sizeof(stk)-1)) stk[stkp++] = c;
             buf[i] = c;
         } else if(c == ')' || c == ']' || c == CB_CHAR){
-            /* Closing bracket – determine the matching opener */
             char expected = (c == ')') ? '(' : (c == ']') ? '[' : OB_CHAR;
             if(stkp > 0 && stk[stkp-1] == expected){
-                /* Matched: pop, copy normally */
                 stkp--;
                 buf[i] = c;
             } else if(stkp == 0 && c == stopchar){
-                /* Depth-0 match of stopchar → terminate expression */
                 buf[i] = '\0';
             } else {
-                /* Mismatched closing bracket (malformed input) – copy as-is */
                 buf[i] = c;
             }
         } else {
@@ -3428,22 +2514,10 @@ static uint256_t expr_expression_esc(Assembler *asmb, const char *s, int idx, ch
     return r;
 }
 
-/* Note: xeval() has been removed (Fix P12). Float-mode expressions that
- * previously required a python3 subprocess are now evaluated directly by
- * the assembler's own expression evaluator in float mode.                    */
 
 static uint256_t expr_factor(Assembler *asmb, const char *s, int idx, int *idx_out){
-    /* C (axx.py port): recursion depth guard. expr_factor is the hub through
-     * which all recursion passes (unary -,~,@ recurse into expr_factor; '('
-     * recurses expr_factor1 -> expr_expression -> ... -> expr_factor), so
-     * guarding here protects every nested-expression path from a native stack
-     * overflow. Mirrors axx.py's factor/_factor_impl split. */
     AsmState *st=&asmb->st;
     if(st->expr_depth >= EXPR_MAX_DEPTH){
-        /* Bugfix: mirrors axx.py's RecursionError handlers in unary
-         * -/~/@ -- gated correctly but never set had_error, so an
-         * expression nested too deep printed a real error yet still
-         * produced a "successful" exit 0 build. */
         if(should_report_errors(st)){
             axx_diagf(1, 0, " error - expression nesting too deep.\n");
         }
@@ -3477,11 +2551,9 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
         }
     } else if(s[idx]=='~'){
         x=expr_factor(asmb,s,idx+1,&idx);
-        /* ~ is bitwise NOT: always integer, same as Python (int only) */
         x=u256_not(x);
     } else if(s[idx]=='@'){
         x=expr_factor(asmb,s,idx+1,&idx);
-        /* nbit(x) is always integer; in float mode promote to double */
         int nb = u256_nbit(x);
         if(asmb->st.exp_typ_float)
             x=double_to_u256((double)nb);
@@ -3498,9 +2570,6 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
                     idx++;
                     int64_t offset=u256_to_i64(x2);
                     if(offset<0){
-                        /* Bugfix: mirrors axx.py's "negative byte-extract
-                         * offset in *(expr, expr)" diagnostic, which
-                         * didn't exist in C at all. */
                         if(should_report_errors(st)){
                             axx_diagf(1, 0, " error - negative byte-extract offset in *(expr, expr).\n");
                         }
@@ -3510,27 +2579,18 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
                         x=u256_sar(x,shift);
                     }
                 } else {
-                    /* 修正⑩: missing ')' – report error and return 0.
-                     * Bugfix: this print used to be completely unconditional
-                     * (no should_report_errors() gate, unlike every other
-                     * diagnostic in the file) and never set had_error. */
                     if(should_report_errors(st)){
                         axx_diagf(1, 0, " error - missing ')' in *(expr, expr) expression.\n");
                     }
                     x=u256_zero();
                 }
             } else {
-                /* 修正⑩: missing ',' – report error and return 0.
-                 * Bugfix: same ungated/no-had_error issue as above. */
                 if(should_report_errors(st)){
                     axx_diagf(1, 0, " error - missing ',' in *(expr, expr) expression.\n");
                 }
                 x=u256_zero();
             }
         } else {
-            /* Bugfix: mirrors axx.py's "expected '(' after '*'" diagnostic,
-             * which didn't exist in C at all -- "*1,2)" (missing '(' after
-             * '*') silently returned 0 with zero diagnostic. */
             if(should_report_errors(st)){
                 axx_diagf(1, 0, " error - expected '(' after '*' in *(expr,expr) expression.\n");
             }
@@ -3544,15 +2604,6 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
     return x;
 }
 
-/* Parse a C-style '\xHH' character literal (1-2 hex digits) at s[idx]
- * (pointing at the opening quote). Fix (axx.py port): expr_factor1() below
- * hand-lists a fixed set of '\t'/'\''/'\\'/... escapes plus a generic 3-char
- * 'x' literal, but had no case for '\xHH' -- so e.g. "MOV '\x41'" (meant to
- * be equivalent to "MOV 'A'") failed with a syntax error even though it's a
- * form axx documents/recognizes elsewhere (skip_squote_literal handling in
- * axx.py; the C comment-stripper here also tolerates a bare backslash before
- * a quoted-out ';'). Returns 1 and sets *val / *out_idx on success, 0 (idx
- * unchanged) otherwise so the caller can fall through to other literal forms. */
 static int parse_hex_char_literal(const char *s, int idx, int slen, int *val, int *out_idx){
     if(!(idx+3<=slen && s[idx]=='\'' && s[idx+1]=='\\' && (s[idx+2]=='x'||s[idx+2]=='X')))
         return 0;
@@ -3583,11 +2634,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         x=expr_expression(asmb,s,idx+1,&idx);
         if(s[idx]==')') idx++;
         else {
-            /* axx.py port: mirrors ExpressionEvaluator.factor1()'s
-             * "missing closing ')' in expression" diagnostic, which didn't
-             * exist in C at all -- a malformed "(..." grouping anywhere in
-             * any expression silently kept whatever value was computed
-             * inside with zero diagnostic. */
             if(should_report_errors(st)){
                 axx_diagf(1, 0, " error - missing closing ')' in expression.\n");
             }
@@ -3615,43 +2661,21 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         if(asmb->st.exp_typ_float) x=double_to_u256(11.0); }
     else if(_hexlit_ok){ x=u256_from_i64(_hexlit_val); idx=_hexlit_end;
         if(asmb->st.exp_typ_float) x=double_to_u256((double)_hexlit_val); }
-    /* Fix: 3-char 'x' literal: only when s[idx+1] is NOT backslash (so '\x' forms above
-     * are not double-consumed). Mirrors axx.py factor1() Fix 3 guard. */
     else if(idx+3<=slen && s[idx]=='\'' && s[idx+1] != '\\' && s[idx+2]=='\''){
         unsigned char cv=(unsigned char)s[idx+1]; x=u256_from_i64(cv); idx+=3;
         if(asmb->st.exp_typ_float) x=double_to_u256((double)cv); }
     else if(axx_q(s,slen,"$$",idx)){
         idx+=2;
-        /* binary_list中(makeobj内)では命令先頭アドレスpc_instr_startを返す。
-         * .equなど他のコンテキストでは現在のPC(st->pc)を返す。 */
         x = st->in_binary_list ? st->pc_instr_start : st->pc;
-        /* 破綻点修正 (axx.py port): $$は常に現在セクション(current_section)
-         * 内の生グローバルpcだった。同じセクションへの再入があると、ラベル
-         * 参照(label_get_value(), 同じセクションの場合はセクション内相対
-         * オフセットへ変換済み)と単位が食い違い、"e-$$-2"のようなPC相対
-         * エンコード式(z80のJR等)が誤った値になっていた。$$も同じ
-         * セクション内相対オフセットに揃える。
-         *
-         * 破綻点修正2 (重大): ただしこの変換は、命令のバイト列を組み立てて
-         * いる最中(in_binary_list、makeobj())か、reloc_type未指定の.EQU式
-         * 評価中(equ_section_tracking)に限定する。これら以外(reloc_type
-         * 付き.EQUの右辺など)で$$が使われる場合、その値は「生のpc」の
-         * まま維持されるべきであり、無条件に変換すると別の破綻点を生む
-         * (label_get_value()の同種の条件分岐を参照。bf.sのtape_aが
-         * 壊れてbus errorになった実例で確認済み)。 */
         if(st->in_binary_list || st->equ_section_tracking){
             int64_t _adj = equ_section_relative_offset(st, st->current_section, u256_to_u64(x));
             if(_adj >= 0) x = u256_from_u64((uint64_t)_adj);
         }
-        /* In float mode, treat PC as an integer-valued double (int→float). */
         if(asmb->st.exp_typ_float)
             x=double_to_u256((double)(int64_t)u256_to_u64(x));
     }
     else if(axx_q(s,slen,"$.",idx)){
         idx+=2;
-        /* $.は常に「その命令の次のアドレス」を返す。
-         * binary_list中/外・pass0(対話モード)を問わず pc_instr_end を返す。
-         * pc_instr_end はパターンマッチ確定直後のサイズプローブで設定済み。 */
         x = st->pc_instr_end;
         if(st->in_binary_list || st->equ_section_tracking){
             int64_t _adj = equ_section_relative_offset(st, st->current_section, u256_to_u64(x));
@@ -3667,10 +2691,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         uint256_t sv;
         if(symbol_get(st,t,&sv)) x=sv;
         else {
-            /* axx.py port: mirrors ExpressionEvaluator.factor1()'s
-             * "undefined symbol" diagnostic, which didn't exist in C at
-             * all -- an undefined "#symbol" reference silently became 0
-             * with zero diagnostic. */
             if(should_report_errors(st)){
                 axx_diagf(1, 0, " error - undefined symbol: '#%s'\n", t);
             }
@@ -3685,7 +2705,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             x=u256_add(u256_mul(x,u256_from_u64(2)), u256_from_u64(s[idx]-'0'));
             idx++;
         }
-        /* In float mode, promote integer value to double (Python auto-promotion) */
         if(asmb->st.exp_typ_float)
             x=double_to_u256((double)(int64_t)u256_to_i64(x));
     }
@@ -3697,20 +2716,15 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             x=u256_add(u256_mul(x,u256_from_u64(16)), u256_from_u64((uint64_t)d));
             idx++;
         }
-        /* In float mode, promote integer value to double (Python auto-promotion) */
         if(asmb->st.exp_typ_float)
             x=double_to_u256((double)(int64_t)u256_to_i64(x));
     }
-    /* Fix: guard all keyword tokens (qad/dbl/flt/enflt/endbl) so labels like
-     * qad_foo, dbl_val, etc. are NOT consumed as keywords.
-     * Mirrors axx.py factor1(): only treat as keyword when '{' follows (after spaces). */
     else if(idx+3<=slen && strncmp(s+idx,"qad",3)==0 &&
             ({ int _j=axx_skipspc(s,idx+3); _j<slen && s[_j]=='{'; })){
         idx+=3;
         idx=axx_skipspc(s,idx);
         if(s[idx]=='{'){
             idx++;
-            /* Read full expression up to matching '}', handling nested '()' */
             char expr_buf[1024]; size_t en=0; int depth=0;
             while(s[idx] && en<sizeof(expr_buf)-1){
                 if(s[idx]=='('||s[idx]=='[') depth++;
@@ -3720,18 +2734,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             }
             expr_buf[en]='\0';
             if(s[idx]=='}') idx++;
-            /* Bugfix: qad{inf}/qad{-inf}/qad{nan} silently produced an
-             * all-zero (positive-zero) bit pattern instead of the correct
-             * binary128 special value. ieee754_128_from_str() already
-             * handles these three tokens correctly (see its "Special
-             * values" check), but nothing on this path ever called it with
-             * the literal token -- f128_eval_text() only parses numeric
-             * arithmetic and fails on "inf"/"nan", and xeval_eval() below
-             * only recognises NUMBER / ":label" / call syntax, so both
-             * silently fail to parse and execution fell through to a
-             * default of 0. dbl{}/flt{} already guard against this with an
-             * explicit strcmp() before evaluating (see the dbl{} handler
-             * just below); qad{} was missing the equivalent check. */
             if(strcmp(expr_buf,"inf")==0 || strcmp(expr_buf,"-inf")==0 ||
                strcmp(expr_buf,"nan")==0){
                 x=ieee754_128_from_str(expr_buf);
@@ -3741,49 +2743,17 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
 #if defined(__GNUC__) && !defined(__STRICT_ANSI__) && \
     (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
      defined(__arm__) || defined(__riscv))
-            /* Evaluate in full __float128 precision matching mpmath */
             int q_ok=0;
             uint256_t qbits = f128_eval_text(expr_buf, &q_ok);
             if(q_ok){ x=qbits; }
             else
 #endif
             {
-                /* axx.py port: f128_eval_text() only handles pure
-                 * arithmetic (no labels/functions), mirroring
-                 * decimal_eval_expr() on the Python side -- try xeval()
-                 * next (":label" references, enfloat/endouble/enflt/
-                 * endbl calls), matching axx.py's qad{} handler, which
-                 * falls back from decimal_eval_expr() to xeval() before
-                 * giving up. Only fall further back to the general
-                 * expression evaluator (no label/function support
-                 * either, but historically what this file did) if even
-                 * that fails to parse. */
                 double xv;
                 if(xeval_eval(asmb, expr_buf, &xv)){
                     char fstr[64]; snprintf(fstr,sizeof(fstr),"%.17g",xv);
                     x=ieee754_128_from_str(fstr);
                 } else {
-                    /* This fallback tier doesn't exist in axx.py (its
-                     * qad{}/dbl{}/flt{} handlers only ever call xeval());
-                     * it's a C-only robustness addition covering grammar
-                     * xeval_eval() intentionally doesn't parse (and/or/not,
-                     * comparisons, ternary -- axx.py's real xeval() supports
-                     * these via ast.parse(), but xeval_eval() deliberately
-                     * doesn't, see its own doc comment). Bugfix: axx.py's
-                     * qad{} now reports " error - qad{}: cannot evaluate
-                     * ...; using 0." and sets had_error whenever its xeval()
-                     * raises (e.g. "qad{1/0}") -- previously this fallback
-                     * silently absorbed the same failure (e.g. a
-                     * div-by-zero re-encountered inside expr_expression_pat)
-                     * with no diagnostic and no had_error, diverging from
-                     * axx.py's now-correct abort behavior. Distinguish
-                     * "xeval_eval() couldn't parse the grammar but the
-                     * fallback computed a clean value" (still silent, no
-                     * error -- matches axx.py's real xeval() succeeding on
-                     * and/or/not/comparisons/ternary) from "the fallback
-                     * itself hit a real error" (now reported, matching
-                     * axx.py's failure path) by checking whether the
-                     * fallback call itself newly set had_error. */
                     int io2;
                     int prev_flt=asmb->st.exp_typ_float;
                     int _prior_had_error=asmb->st.had_error;
@@ -3807,34 +2777,20 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             }
         }
     }
-    /* enflt{expr}: evaluate expr in integer mode, interpret 32 low bits as
-     * IEEE754 float32, return the float value.
-     * Mirrors axx.py factor1():
-     *   v, _ = self.expression(t + chr(0), 0)   # integer mode
-     *   x = enflt(int(v))                        # = enfloat(int(v))
-     * The result is a floating-point value; callers should use this inside
-     * flt{} / dbl{} or in a float-mode context. */
     else if(idx+5<=slen && strncmp(s+idx,"enflt",5)==0 &&
             ({ int _j=axx_skipspc(s,idx+5); _j<slen && s[_j]=='{'; })){
         idx+=5;
         int f; char t[512];
         idx=axx_get_curlb(&asmb->st,s,idx,&f,t,sizeof(t));
         if(f){
-            /* Always evaluate inner expression in integer mode */
             int prev_flt=asmb->st.exp_typ_float;
             asmb->st.exp_typ_float=0;
             int io2; uint256_t iv=expr_expression_pat(asmb,t,0,&io2);
             asmb->st.exp_typ_float=prev_flt;
             double fval=enfloat_bits(u256_to_u64(iv));
-            /* Return as double bit-cast (float mode value) */
             x=double_to_u256(fval);
         }
     }
-    /* endbl{expr}: evaluate expr in integer mode, interpret 64 bits as
-     * IEEE754 float64, return the double value.
-     * Mirrors axx.py factor1():
-     *   v, _ = self.expression(t + chr(0), 0)   # integer mode
-     *   x = endbl(int(v))                        # = endouble(int(v))  */
     else if(idx+5<=slen && strncmp(s+idx,"endbl",5)==0 &&
             ({ int _j=axx_skipspc(s,idx+5); _j<slen && s[_j]=='{'; })){
         idx+=5;
@@ -3860,25 +2816,10 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             else if(strcmp(t,"inf")==0) bits=0x7ff0000000000000ULL;
             else if(strcmp(t,"-inf")==0) bits=0xfff0000000000000ULL;
             else {
-                /* axx.py port: dbl{} always evaluates its body via
-                 * xeval() (":label" refs, enfloat/endouble/enflt/endbl
-                 * calls) -- it never falls back to the general
-                 * expression grammar, which doesn't understand either of
-                 * those. Only fall back here (native C evaluator, no
-                 * label/function support) if xeval() can't parse the
-                 * body at all, for robustness on anything relying on
-                 * plain arithmetic this port's xeval() doesn't cover. */
                 double xv;
                 if(xeval_eval(asmb, t, &xv)){
                     memcpy(&bits,&xv,8);
                 } else {
-                    /* Bugfix: see the detailed comment in qad{}'s fallback
-                     * above -- distinguish "xeval_eval() couldn't parse the
-                     * grammar but the fallback computed cleanly" (silent,
-                     * matches axx.py's real xeval() succeeding on and/or/
-                     * not/comparisons/ternary) from "the fallback itself
-                     * hit a real error" (now reported + had_error, matching
-                     * axx.py's dbl{} failure path, e.g. "dbl{1/0}"). */
                     int prev_flt = asmb->st.exp_typ_float;
                     int _prior_had_error = asmb->st.had_error;
                     asmb->st.exp_typ_float = 1;
@@ -3897,20 +2838,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     }
                 }
             }
-            /* Bugfix: dbl{}'s result is conceptually an INTEGER (the
-             * float64 bit-pattern, matching axx.py's plain Python int),
-             * usable directly in an integer-mode encoding expression --
-             * but in float mode this file represents every uint256_t
-             * "value" as the bit-cast of a C double (see u256_to_double()/
-             * double_to_u256(), and the identical promotion already done
-             * for 0x.../0b... literals just above in this same function).
-             * Storing `bits` via u256_from_u64() unconditionally left a
-             * float-mode consumer's later u256_to_double() call
-             * bit-reinterpreting the raw integer bits as if they were
-             * already an encoded double -- garbage in every realistic
-             * case (e.g. dbl{}/flt{} nested inside a !D/!F capture, which
-             * evaluates its source text in float mode) instead of the
-             * intended numeric value. */
             x = asmb->st.exp_typ_float ? double_to_u256((double)bits) : u256_from_u64(bits);
         }
     }
@@ -3925,19 +2852,11 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             else if(strcmp(t,"inf")==0) bits=0x7f800000u;
             else if(strcmp(t,"-inf")==0) bits=0xff800000u;
             else {
-                /* See dbl{}'s comment just above: xeval() first, native
-                 * evaluator only as a fallback for anything xeval() can't
-                 * parse. */
                 double xv;
                 if(xeval_eval(asmb, t, &xv)){
                     float v = (float)xv;
                     memcpy(&bits,&v,4);
                 } else {
-                    /* Bugfix: see qad{}'s fallback comment above --
-                     * distinguish a clean fallback success (silent) from
-                     * the fallback itself hitting a real error (now
-                     * reported + had_error, matching axx.py's flt{}
-                     * failure path). */
                     int prev_flt = asmb->st.exp_typ_float;
                     int _prior_had_error = asmb->st.had_error;
                     asmb->st.exp_typ_float = 1;
@@ -3956,45 +2875,20 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     }
                 }
             }
-            /* See dbl{}'s comment above: same integer-vs-float-mode
-             * value-representation fix. */
             x = asmb->st.exp_typ_float ? double_to_u256((double)bits) : u256_from_u64(bits);
         }
     }
     else if(idx+4<=slen && axx_q(s,slen,"not(",idx)){
-        /* not(expr): logical negation, written as a call-like form rather
-         * than a prefix operator so it reads unambiguously in pattern text.
-         * Bugfix (mirrors the identical fix applied to axx.py
-         * ExpressionEvaluator.factor1()/term8()): this used to be handled
-         * in expr_term8() (between expr_term7 comparisons and expr_term9
-         * &&), calling expr_expression() starting at the '(' itself. That
-         * re-entered the ENTIRE term-chain, so after the matching ')' was
-         * consumed, the surrounding term7/term9/term10/term11 layers of
-         * that SAME re-entrant call kept consuming any trailing operator
-         * (+, -, comparisons, &&, ||, ?:) as if it were still part of
-         * not()'s argument -- e.g. "not(0)+5" evaluated as "not(0+5)".
-         * Handling it here instead (expr_factor1, the base of the
-         * precedence chain) makes its result an ordinary atom to every
-         * operator above it on EITHER side, exactly like the plain '('
-         * grouping case just above. */
         x=expr_expression(asmb,s,idx+4,&idx);
         idx=axx_skipspc(s,idx);
         if(idx<slen && s[idx]==')') idx++;
         else {
-            /* Bugfix: this print used to be completely unconditional (no
-             * should_report_errors() gate, unlike every other diagnostic
-             * in the file) and never set had_error. */
             if(should_report_errors(st)){
                 axx_diagf(1, 0, " error - missing closing ')' in not(...) expression.\n");
             }
         }
         x=u256_from_i64(u256_is_zero(x)?1:0);
     }
-    /* Float-mode number literal: parsed by axx_get_floatstr() as a double.
-     * This branch is checked BEFORE the integer branch so that "3.14" is
-     * consumed as a float literal when exp_typ_float == 1.
-     * Mirrors axx.py factor1():
-     *   elif self.state.exp_typ=='f' and isfloatstr(s,idx): x = float(fs) */
     else if(asmb->st.exp_typ_float && axx_isfloatstr(s,idx)){
         char fs[64];
         idx=axx_get_floatstr(s,idx,fs,sizeof(fs));
@@ -4010,11 +2904,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
     else if(st->expmode==EXP_PAT && is_lower(s[idx]) && (s[idx+1]=='\0'||!is_lower(s[idx+1]))){
         char ch=s[idx];
         if(idx+3<=slen && s[idx+1]==':'&&s[idx+2]=='='){
-            /* Isolate whether resolving a label DURING this specific
-             * right-hand-side expression genuinely failed, so the
-             * assigned variable's provenance flag reflects only this
-             * expression -- not whatever error_undefined_label happened
-             * to hold beforehand (see PatVar's comment above). */
             int _assign_prior_eul = st->error_undefined_label;
             st->error_undefined_label = 0;
             x=expr_expression(asmb,s,idx+3,&idx);
@@ -4024,71 +2913,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         } else {
             x=var_get(st,ch);
             idx++;
-            /* Fix (axx.py port): detect UNDEF values in pattern variables during
-             * makeobj evaluation.
-             *
-             * When in_match_attempt=1, label_get_value() suppresses its error
-             * *output* (but still sets error_undefined_label — see below)
-             * and stores UNDEF (0xff…ff) in the variable via var_put().
-             * makeobj() later reads the variable through var_get() — NOT through
-             * label_get_value() — so without this check no error would be
-             * emitted here even though the assembled word is garbage.
-             *
-             * Bugfix (2026-07-29): this used to detect the condition by
-             * inspecting the VALUE (u256_is_undef_derived(x): x == UNDEF or
-             * abs(x) >= 2^192, mirroring axx.py's factor1() which does the
-             * analogous check against its own UNDEF = (1<<1024)-1 sentinel).
-             * That works in axx.py because Python ints are arbitrary-
-             * precision, so a legitimate small negative number (e.g. -1)
-             * can never collide with a 1024-bit sentinel. But uint256_t
-             * here is a FIXED 256-bit two's-complement type, and UNDEF is
-             * defined as all 256 bits set (see UNDEF_VAL() above) — which
-             * is bit-for-bit IDENTICAL to the legitimate value -1 (any
-             * negative number's two's-complement sign-extension fills all
-             * higher words with 1s; for -1 specifically that includes the
-             * low word too, so the whole 256 bits end up as 1). So a
-             * perfectly ordinary immediate like "mov rax, -1" or
-             * "cmp reg, -1" was being misreported as an undefined label
-             * and aborted the whole assembly (see u256_is_undef_derived()'s
-             * own comment above, which already documented this exact
-             * unavoidable-by-value-inspection collision and deferred a
-             * proper fix as out of scope for that session).
-             *
-             * Fix: check genuine PROVENANCE (PatVar.is_undef — see its
-             * definition above) instead of the value's bit pattern.
-             * is_undef is set on a variable ONLY at the point it is bound
-             * (var_put_tagged(), in the '!'-capture and ":="-assignment
-             * branches below) by asking "did resolving a label anywhere
-             * inside THIS specific captured expression actually fail?"
-             * (via a local save/reset/restore of error_undefined_label
-             * around just that one expression evaluation) — never by
-             * inspecting the resulting number. A legitimate expression that
-             * merely evaluates to -1 (whether a bare literal or e.g.
-             * "definedlabel - definedlabel - 1") never touches a failing
-             * label_get_value() call, so is_undef stays 0 for it; a
-             * genuinely unresolved reference sets is_undef=1 regardless of
-             * what numeric value UNDEF happens to decay to. This flag
-             * naturally survives the trial-match rollback / best-match
-             * snapshot-restore / macro !if/!while save-restore, because
-             * PatVar bundles it with the value itself, so every existing
-             * whole-array vars[26] memcpy() already carries it along.
-             *
-             * makeobj() resets error_undefined_label to 0 before
-             * evaluating each binary_list element and only accumulates
-             * "any_undef" from what becomes 1 during that one element's
-             * evaluation (it never re-derives anything from a variable's
-             * stored value on its own, since reading a variable here goes
-             * through var_get() rather than label_get_value()) — so this
-             * check must re-set error_undefined_label=1 itself whenever
-             * is_undef is found true, or the failure would silently vanish
-             * and produce garbage bytes instead of an error.
-             *
-             * (Note: the check below is keyed on `ch` specifically —
-             * var_get_is_undef(st, ch), not any instruction-wide flag — so
-             * even when a single element's expression combines more than
-             * one captured variable and only one of them is genuinely
-             * undefined, the letter this prints correctly names that one
-             * variable and not whichever happens to be read first.) */
             if(!st->in_match_attempt
                && !st->pass1_size_mode
                && should_report_errors(st)){
@@ -4099,26 +2923,8 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                                ch, st->current_file, (int)st->ln);
                 }
             }
-            /* In float mode, promote the variable's stored integer value to
-             * double, matching Python's automatic int→float type promotion.
-             * Exception: if the variable was captured by !F/!D (float bit-
-             * pattern), the value is already stored as a double bit-cast and
-             * must NOT be re-promoted.  We detect this by checking whether the
-             * raw w[0] pattern, when decoded as int64, produces the same double
-             * as when decoded as a double — if different, it's a double already.
-             *
-             * Simpler heuristic: just convert via (double)(int64_t)val.
-             * This is what Python does: all values in the assembler are Python
-             * ints; float mode only changes how *literals* are parsed.  When a
-             * pattern variable is read in float mode it starts as an int and
-             * Python auto-promotes it in any float arithmetic/comparison.
-             * Variables set by !F/!D store integer BIT PATTERNS, not floats;
-             * their bit-patterns happen to be used in integer-mode makeobj, not
-             * in float-mode expressions.  So (double)(int64_t)val is correct. */
             if(asmb->st.exp_typ_float)
                 x=double_to_u256((double)(int64_t)u256_to_i64(x));
-            /* ELF tracking: if inside makeobj and the variable was captured
-             * from a single label by match(), record it as a relocation ref. */
             if(st->elf_tracking && st->elf_current_word_idx >= 0){
                 int _vi = (unsigned char)ch - 'a';
                 if(_vi >= 0 && _vi < 26 && st->elf_var_to_label[_vi].set == 1){
@@ -4142,10 +2948,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         if(new_idx!=idx){
             idx=new_idx;
             x=label_get_value(st,w);
-            /* In float mode, treat label's integer address as an integer-valued
-             * double (int→float), not as a bit-cast of the address bits.
-             * Mirrors Python: label values are substituted as decimal strings
-             * in xeval(), then parsed as integers before float promotion. */
             if(asmb->st.exp_typ_float && !st->error_undefined_label)
                 x=double_to_u256((double)(int64_t)u256_to_u64(x));
         }
@@ -4165,14 +2967,6 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
             double a=u256_to_double(x), b=u256_to_double(t);
             x=double_to_u256(pow(a,b));
         } else {
-            /* axx.py port: mirrors ExpressionEvaluator.term0_0()'s exponent/
-             * result-size caps. Bugfix: this used to call u256_pow()
-             * directly with no guards at all -- a negative exponent (e.g.
-             * "2**-1") got reinterpreted as a huge unsigned 256-bit
-             * magnitude and squared through all 256 bits, silently
-             * producing a wrapped garbage result instead of axx.py's
-             * "negative exponent -> 0, error" behavior; a legitimately
-             * huge exponent had no cap at all, unlike Python's _EXP_MAX. */
             const int64_t EXP_MAX = 1024;
             const int64_t EXP_RESULT_MAX_BITS = 1 << 20;
             int64_t t_int = u256_to_i64(t);
@@ -4215,16 +3009,10 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             if(flt) x=double_to_u256(u256_to_double(x)*u256_to_double(t));
             else    x=u256_mul_signed(x,t);
         } else if(axx_q(s,slen,"//",idx)){
-            /* Floor division */
             uint256_t t=expr_term0_0(asmb,s,idx+2,&idx);
             if(flt){
                 double b=u256_to_double(t);
                 if(b==0.0){
-                    /* Bugfix (axx.py port): this used to print a bare
-                     * "Division by 0 error." with no " error -" prefix and
-                     * no had_error, so a division-by-zero in an ordinary
-                     * instruction operand silently produced a plausible-
-                     * looking 0 with a build that still reported success. */
                     if(should_report_errors(&asmb->st)){
                         axx_diagf(1, 0, " error - Division by 0 error.\n");
                     }
@@ -4232,8 +3020,6 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
                 }
                 else x=double_to_u256(floor(u256_to_double(x)/b));
             } else {
-                /* Fix L: set x=0 on div-by-zero; previously x kept the old
-                 * dividend value, making 'a//0' silently return 'a'. */
                 if(u256_is_zero(t)){
                     if(should_report_errors(&asmb->st)){
                         axx_diagf(1, 0, " error - Division by 0 error.\n");
@@ -4243,16 +3029,10 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
                 else x=u256_floordiv(x,t);
             }
         } else if(s[idx]=='/'&&s[idx+1]!='/'){
-            /* True division */
             uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
             if(flt){
                 double b=u256_to_double(t);
                 if(b==0.0){
-                    /* Bugfix (axx.py port): this used to print a bare
-                     * "Division by 0 error." with no " error -" prefix and
-                     * no had_error, so a division-by-zero in an ordinary
-                     * instruction operand silently produced a plausible-
-                     * looking 0 with a build that still reported success. */
                     if(should_report_errors(&asmb->st)){
                         axx_diagf(1, 0, " error - Division by 0 error.\n");
                     }
@@ -4260,7 +3040,6 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
                 }
                 else x=double_to_u256(u256_to_double(x)/b);
             } else {
-                /* Fix L: same as // fix */
                 if(u256_is_zero(t)){
                     if(should_report_errors(&asmb->st)){
                         axx_diagf(1, 0, " error - Division by 0 error.\n");
@@ -4274,30 +3053,17 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             if(flt){
                 double b=u256_to_double(t);
                 if(b==0.0){
-                    /* Bugfix (axx.py port): this used to print a bare
-                     * "Division by 0 error." with no " error -" prefix and
-                     * no had_error, so a division-by-zero in an ordinary
-                     * instruction operand silently produced a plausible-
-                     * looking 0 with a build that still reported success. */
                     if(should_report_errors(&asmb->st)){
                         axx_diagf(1, 0, " error - Division by 0 error.\n");
                     }
                     x=double_to_u256(0.0);
                 }
                 else {
-                    /* '%' is floored in axx (u256_mod() below is built on
-                     * u256_floordiv(), and axx.py uses Python's '%'), so the
-                     * remainder has to take the sign of the divisor.  Plain
-                     * fmod() takes the sign of the dividend, which made the
-                     * float mode used for error patterns disagree with both
-                     * the integer mode next to it and axx.py: "(0-7)%2" came
-                     * out -1 here and +1 there. */
                     double r=fmod(u256_to_double(x),b);
                     if(r!=0.0 && ((r<0.0)!=(b<0.0))) r+=b;
                     x=double_to_u256(r);
                 }
             } else {
-                /* Fix L: same as // fix */
                 if(u256_is_zero(t)){
                     if(should_report_errors(&asmb->st)){
                         axx_diagf(1, 0, " error - Division by 0 error.\n");
@@ -4332,22 +3098,10 @@ static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_ou
 static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term1(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
-    /* axx.py port: mirrors ExpressionEvaluator.term2()'s _SHIFT_MAX cap and
-     * had_error convention. Bugfix: this used to have no overflow cap at
-     * all, and neither branch's negative-shift-count error set had_error
-     * -- an error print with a build that still exited 0. */
     const int64_t SHIFT_MAX = 65536;
     while(idx<slen){
         if(axx_q(s,slen,"<<",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
-            /* Bugfix: shifts need the same float-mode handling that
-             * expr_term3()'s bitwise operators already got.  In float mode
-             * every value in flight is a double bit pattern, so both the
-             * shifted value and the shift count arrived here as IEEE-754
-             * patterns: an error_pattern such as "(a>>8)&7" read the count 8
-             * as 0x4020000000000000 and reported "shift count ... exceeds
-             * maximum".  axx.py evaluates the same expression numerically,
-             * so the two implementations disagreed. */
             int64_t sv=u256_to_i64(expr_safe_bitwise_operand(asmb,t,"<<"));
             if(sv<0){
                 if(should_report_errors(&asmb->st)){
@@ -4362,7 +3116,6 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
             } else x=expr_bitwise_result(asmb,u256_shl(expr_safe_bitwise_operand(asmb,x,"<<"),(int)sv));
         } else if(axx_q(s,slen,">>",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
-            /* Bugfix: see the "<<" branch above. */
             int64_t sv=u256_to_i64(expr_safe_bitwise_operand(asmb,t,">>"));
             if(sv<0){
                 if(should_report_errors(&asmb->st)){
@@ -4370,9 +3123,6 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
                 }
                 x=u256_zero();
             } else if(sv>SHIFT_MAX){
-                /* Bugfix: this branch used to silently zero the result
-                 * with NO diagnostic at all (unlike << above), mirroring
-                 * the identical fix applied to axx.py's term2(). */
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - shift count %lld exceeds maximum %lld in >> expression.\n",(long long)sv,(long long)SHIFT_MAX);
                 }
@@ -4383,16 +3133,9 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
-/* --- double <-> 256-bit integer conversion for float-mode bitwise ops ---
- *
- * In float mode a value is carried as the raw IEEE-754 bit pattern of a
- * double (see u256_to_double / double_to_u256).  The bitwise operators must
- * therefore convert to an integer *value* before operating, exactly as
- * axx.py's _safe_int() does with int(v).                                  */
 
-/* Python int(): truncate toward zero. */
 static uint256_t double_trunc_to_u256(double d){
-    const double LIMB = 18446744073709551616.0;   /* 2^64 */
+    const double LIMB = 18446744073709551616.0;
     int neg = (d < 0.0);
     double a = neg ? -d : d;
     a = floor(a);
@@ -4404,10 +3147,8 @@ static uint256_t double_trunc_to_u256(double d){
     return neg ? u256_neg(r) : r;
 }
 
-/* Two's-complement 256-bit integer -> double (inexact above 2^53, which is
- * inherent to float mode's double representation). */
 static double u256_int_to_double(uint256_t v){
-    const double LIMB = 18446744073709551616.0;   /* 2^64 */
+    const double LIMB = 18446744073709551616.0;
     int neg = (int)((v.w[3] >> 63) & 1u);
     uint256_t m = neg ? u256_neg(v) : v;
     double d = 0.0;
@@ -4415,24 +3156,6 @@ static double u256_int_to_double(uint256_t v){
     return neg ? -d : d;
 }
 
-/* axx.py port: mirrors ExpressionEvaluator._safe_int(), used by
- * term3/term4/term5 (&, |, ^) to guard against a non-finite float-mode
- * operand reaching a bitwise operator.
- *
- * Bugfix 1: this check didn't exist in C at all -- a non-finite value
- * (e.g. from "inf" under a !Fx/!Dx capture) silently participated in
- * u256_and/or/xor's raw bit-pattern operation with zero diagnostic and no
- * had_error, unlike axx.py's _safe_int().
- *
- * Bugfix 2: even for finite values the operand was returned unchanged, so
- * u256_and/or/xor combined the *IEEE-754 bit patterns* rather than the
- * numeric values.  axx.py evaluates error_patterns in float mode, so a
- * condition such as
- *     VMOVAPS x,y :: (x|y)>=0x100;5 :: ...
- * with x=1, y=2 computed
- *     0x3FF0000000000000 | 0x4000000000000000 == 0x7FF0000000000000
- * i.e. +inf instead of 3, and the error fired on every 128-bit VEX
- * instruction.  axx.py returned 3.  Convert to an integer first. */
 static uint256_t expr_safe_bitwise_operand(Assembler *asmb, uint256_t v, const char *op_name){
     if(asmb->st.exp_typ_float){
         double d = u256_to_double(v);
@@ -4447,9 +3170,6 @@ static uint256_t expr_safe_bitwise_operand(Assembler *asmb, uint256_t v, const c
     return v;
 }
 
-/* Re-encode the integer result of a bitwise operation for the current mode.
- * In float mode every value in flight is a double bit pattern, so the
- * integer produced by u256_and/or/xor must be converted back. */
 static uint256_t expr_bitwise_result(Assembler *asmb, uint256_t v){
     if(asmb->st.exp_typ_float) return double_to_u256(u256_int_to_double(v));
     return v;
@@ -4485,18 +3205,6 @@ static uint256_t expr_term5(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
-/* -------------------------------------------------------
- * Bug 8 fix: expr_term6() sign extension operator x'n
- * When tv == 256 the original u256_shl(~0, 256) returned 0,
- * making the mask all-1s and bypassing the sign extension
- * entirely.  Guard with tv < 256; for tv >= 256 the value
- * already fits and no extension is needed.
- *
- * 修正⑨: mirror axx.py term6(): for tv > 128 (_SEXT_MAX_BITS)
- * emit a warning and return 0 (not a silent no-op).  Bit widths
- * larger than 128 are unrealistic in an assembler context and
- * usually indicate a malformed operand.
- * ------------------------------------------------------- */
 #define SEXT_MAX_BITS 128
 static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term5(asmb,s,idx,&idx);
@@ -4509,26 +3217,17 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
         if(tv<=0){
             x=u256_zero();
         } else if(tv > SEXT_MAX_BITS){
-            /* 修正⑨: 非現実的なビット幅は警告を出して 0 を返す (axx.py term6)
-             * Bugfix: this print used to be completely unconditional (no
-             * should_report_errors() gate, unlike every other diagnostic),
-             * firing redundantly on every pattern-match trial pass. Still
-             * just a warning (deliberately zeroes the result), so
-             * had_error is intentionally NOT set, mirroring axx.py. */
             if(should_report_errors(&asmb->st)){
                 axx_diagf(0, 0, " warning - sign-extension bit width %lld exceeds maximum %d, result set to 0.\n",
                            (long long)tv, SEXT_MAX_BITS);
             }
             x=u256_zero();
         } else {
-            /* mask = ~(~0 << tv)  -- safe because 0 < tv <= 128 < 256 */
             uint256_t mask = u256_not(u256_shl(u256_not(u256_zero()), (int)tv));
             x = u256_and(x, mask);
-            /* sign_bit = (x >> (tv-1)) & 1 */
             uint256_t sign_bit = u256_sar(x, (int)(tv - 1));
             sign_bit = u256_and(sign_bit, u256_one());
             if(!u256_is_zero(sign_bit)){
-                /* extend: or in all-ones above bit tv */
                 uint256_t ext = u256_shl(u256_not(u256_zero()), (int)tv);
                 x = u256_or(x, ext);
             }
@@ -4572,34 +3271,19 @@ static uint256_t expr_term7(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
-/* Placeholder level between expr_term7 (comparisons) and expr_term9 (&&).
- * `not(expr)` used to be special-cased here, but that meant only operators
- * ABOVE this level (&&, ||, ternary) could combine with its result; anything
- * below (comparisons, +/-, etc.) is only ever invoked while parsing a fresh
- * left-hand operand, so e.g. "not(0)+5" silently dropped the "+5". `not(...)`
- * is now handled in expr_factor1() instead, the base of the chain, so its
- * result is an ordinary atom to every operator on either side. Mirrors the
- * identical fix applied to axx.py ExpressionEvaluator.term8(). */
 static uint256_t expr_term8(Assembler *asmb, const char *s, int idx, int *idx_out){
     return expr_term7(asmb,s,idx,idx_out);
 }
 
-/* Fix C-2: expr_term9() – short-circuit &&
- * The original always evaluated both sides.  When the left operand is
- * zero the right side must be skipped, otherwise ':=' assignments in the
- * unchosen branch fire as side-effects.
- * Note: skip_subexpr() is defined after expr_term11(); forward-declare it. */
 static int skip_subexpr(const char *s, int idx);
 
 static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term8(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
     while(idx<slen && axx_q(s,slen,"&&",idx)){
-        idx+=2; /* consume '&&' */
+        idx+=2;
         if(u256_is_zero(x)){
-            /* Short-circuit: skip right-hand side without evaluating */
             idx = skip_subexpr(s, axx_skipspc(s, idx));
-            /* result stays zero */
         } else {
             uint256_t t=expr_term8(asmb,s,idx,&idx);
             x=u256_from_i64((!u256_is_zero(t))?1:0);
@@ -4608,17 +3292,13 @@ static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
-/* Fix C-2: expr_term10() – short-circuit ||
- * When the left operand is non-zero the right side must be skipped. */
 static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term9(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
     while(idx<slen && axx_q(s,slen,"||",idx)){
-        idx+=2; /* consume '||' */
+        idx+=2;
         if(!u256_is_zero(x)){
-            /* Short-circuit: skip right-hand side without evaluating */
             idx = skip_subexpr(s, axx_skipspc(s, idx));
-            /* result stays 1 */
             x = u256_one();
         } else {
             uint256_t t=expr_term9(asmb,s,idx,&idx);
@@ -4628,61 +3308,29 @@ static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_o
     *idx_out=idx; return x;
 }
 
-/* -------------------------------------------------------
- * Bug 5 fix: expr_term11() ternary operator lazy evaluation.
- * The original eagerly evaluated both branches before
- * choosing.  This caused side-effects (variable assignments
- * via :=) in the unchosen branch to execute.
- *
- * Fix: parse past the true-expression token boundary without
- * evaluating it, then only evaluate the chosen branch.
- * We use a helper that advances idx without calling expr.
- * ------------------------------------------------------- */
 
-/* skip_subexpr: advance idx over a sub-expression without evaluating it.
- * Stops at depth-0 delimiters that cannot be part of an expression:
- *   '?'  – ternary operator start
- *   ':'  – ternary else separator
- *   ','  – object-list separator in makeobj  ← Bug fix: was missing,
- *            causing ";z?0xf3:0,0xa4" to skip "0,0xa4" as the false
- *            branch instead of stopping at the comma.
- *   ';'  – 互換修正(axx.py port): error-field "condition;code" separator and
- *            makeobj conditional-byte prefix. The evaluating path (expr_term9/10)
- *            naturally stops at ';' because it is not an operator, but the SKIP
- *            path did not, so a short-circuited '||'/'&&' RHS in an error
- *            condition (e.g. "(a)>5||(a)<0;1") skipped PAST ";1", making
- *            dir_error() read error code 0 instead of 1. axx.py's parser stops
- *            at ';' in both paths; matching that here restores compatibility.
- * ')' at depth 0 stops because we are inside a caller's parentheses.
- */
 static int skip_subexpr(const char *s, int idx) {
     int slen = (int)strlen(s);
-    int paren_depth = 0;   /* depth for '(' / ')' */
-    int brack_depth = 0;   /* depth for '[' / ']'  – Fix C-N7: was missing    */
-    int ob_depth    = 0;   /* Fix (new): depth for OB_CHAR(0x90) / CB_CHAR(0x91)
-                            * Pattern-file optional groups use these special bracket
-                            * chars.  Skipping without tracking them caused depth-0
-                            * '?' or ':' inside OB…CB groups to be treated as ternary
-                            * delimiters, cutting off the skip too early. */
+    int paren_depth = 0;
+    int brack_depth = 0;
+    int ob_depth    = 0;
     while(idx < slen && s[idx]){
         char c = s[idx];
         if(c == '(') { paren_depth++; idx++; }
         else if(c == ')') {
             if(paren_depth > 0){ paren_depth--; idx++; }
-            else break;  /* depth-0 ')': stop (we are inside caller's parens) */
+            else break;
         }
         else if(c == '[') { brack_depth++; idx++; }
         else if(c == ']') {
             if(brack_depth > 0){ brack_depth--; idx++; }
-            else break;  /* depth-0 ']': stop */
+            else break;
         }
         else if(c == OB_CHAR) { ob_depth++; idx++; }
         else if(c == CB_CHAR) {
             if(ob_depth > 0){ ob_depth--; idx++; }
-            else break;  /* depth-0 CB_CHAR: stop */
+            else break;
         }
-        /* ':=' is a variable-assignment operator, not a ternary separator.
-         * Stop at ':' only when the next character is NOT '='. */
         else if(paren_depth == 0 && brack_depth == 0 && ob_depth == 0
                 && (c == '?' || c == ',' || c == ';')) break;
         else if(paren_depth == 0 && brack_depth == 0 && ob_depth == 0
@@ -4692,82 +3340,39 @@ static int skip_subexpr(const char *s, int idx) {
     return idx;
 }
 
-/* Fix G: skip_ternary_expr() – recursively skip a full ternary expression.
- *
- * skip_subexpr() alone stops at the first depth-0 '?', which is correct for
- * skipping a simple operand (e.g. the true-branch 'b' in 'a ? b : c').
- * However, when the false-branch itself is a nested ternary (e.g. 'c ? d : e')
- * we must skip the *entire* nested expression, not just up to its inner '?'.
- *
- * This function handles that by:
- *   1. Calling skip_subexpr() to advance past the base expression.
- *   2. If a '?' follows at depth 0, consuming it and recursing for both
- *      the true-branch and the false-branch.
- *
- * The caller in expr_term11 (condition-true path) uses this instead of the
- * bare skip_subexpr() so that 'a ? b : c ? d : e' leaves idx pointing past
- * 'e', not stranded at '? d : e'.
- */
 static int skip_ternary_expr(const char *s, int idx) {
     int slen = (int)strlen(s);
-    /* Skip the leading operand (stops at '?', ':', ',', ')' at depth 0) */
     idx = skip_subexpr(s, idx);
-    /* If a ternary '?' follows, consume it and skip both branches */
     if(idx < slen && s[idx] == '?' && s[idx+1] != '='){
-        idx++; /* consume '?' */
+        idx++;
         idx = axx_skipspc(s, idx);
-        idx = skip_ternary_expr(s, idx); /* skip true-branch recursively */
+        idx = skip_ternary_expr(s, idx);
         idx = axx_skipspc(s, idx);
         if(idx < slen && s[idx] == ':' && s[idx+1] != '='){
-            idx++; /* consume ':' */
+            idx++;
             idx = axx_skipspc(s, idx);
-            idx = skip_ternary_expr(s, idx); /* skip false-branch recursively */
+            idx = skip_ternary_expr(s, idx);
         }
     }
     return idx;
 }
 
-/* Fix #5 + Fix G: expr_term11() – ternary operator, right-associative and
- * fully lazy.
- *
- * Fix #5 (existing): replaced the left-associative while-loop with a single
- * if + right-recursive call so 'a ? b : c ? d : e' parses as
- * 'a ? b : (c ? d : e)'.
- *
- * Fix G (new): when the condition is TRUE, the false-branch must be skipped
- * entirely, including any nested ternary chains.  The old code called
- * skip_subexpr() for the false-branch, which stops at the first depth-0 '?'.
- * For an input like 'a ? b : c ? d : e' with a==true this left idx pointing
- * at '? d : e', causing the outer parser to misinterpret the remaining tokens.
- * Fix: use skip_ternary_expr() instead, which recurses through '?…:…' chains.
- */
 static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x = expr_term10(asmb, s, idx, &idx);
     int slen = (int)strlen(s);
     if(idx < slen && axx_q(s, slen, "?", idx)){
-        idx++; /* consume '?' */
+        idx++;
         idx = axx_skipspc(s, idx);
         if(u256_is_zero(x)){
-            /* condition false: skip true-branch (simple operand), then
-             * right-recurse into the false-branch. */
             int skip_end = skip_subexpr(s, idx);
             if(axx_q(s, slen, ":", skip_end) && s[skip_end+1] != '='){
                 int false_start = axx_skipspc(s, skip_end + 1);
-                x = expr_term11(asmb, s, false_start, &idx);  /* right-recursive */
-                /* Fix ⑦: error_undefined_label stays as the false-branch's value
-                 * (already current after the recursive call – no action needed). */
+                x = expr_term11(asmb, s, false_start, &idx);
             } else {
                 idx = skip_end;
                 x = u256_zero();
             }
         } else {
-            /* condition true: snapshot vars, evaluate true-branch, save its state,
-             * restore vars, evaluate false-branch for extent only, then restore.
-             *
-             * Fix ⑦ (axx.py term11): adopt the error_undefined_label flag from
-             * the chosen (true) branch.  The old code let the false-branch's flag
-             * persist, so whenever the false-branch contained an undefined label
-             * the error was spuriously reported even when condition was true. */
             PatVar    saved_vars[26];
             memcpy(saved_vars, asmb->st.vars, sizeof(saved_vars));
 
@@ -4778,14 +3383,10 @@ static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_o
 
             idx = axx_skipspc(s, idx);
             if(axx_q(s, slen, ":", idx) && s[idx+1] != '='){
-                idx++; /* consume ':' */
-                /* Restore vars to pre-true-branch state before evaluating false */
+                idx++;
                 memcpy(asmb->st.vars, saved_vars, sizeof(saved_vars));
-                /* Fix G: use skip_ternary_expr so nested ternaries are fully
-                 * consumed, not just the leading operand before the inner '?'. */
                 idx = skip_ternary_expr(s, axx_skipspc(s, idx));
             }
-            /* Restore true-branch vars and error flag (condition was true) */
             memcpy(asmb->st.vars, vars_after_true, sizeof(vars_after_true));
             asmb->st.error_undefined_label = err_after_true;
         }
@@ -4799,17 +3400,8 @@ static uint256_t expr_expression(Assembler *asmb, const char *s, int idx, int *i
     return expr_term11(asmb,s,idx,idx_out);
 }
 
-/* =========================================================
- * DirectiveProcessor (pattern file directives)
- * ========================================================= */
 static int dir_set_symbol(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".setsym")!=0) return 0;
-    /* Bugfix (axx.py port): readpat()'s field mapping puts a lone
-     * ".setsym::NAME" argument (2 fields) in f[2], not f[1] -- only the
-     * 3-field ".setsym::NAME::value" form uses f[1] for the name (same
-     * quirk dir_clrcheck already accounts for). This used to always read
-     * the name from f[1], so the name-only form stored an empty-string key
-     * and evaluated the name itself as an (undefined-label) expression. */
     const char *name_field = e->f[1][0] ? e->f[1] : e->f[2];
     const char *value_field = e->f[1][0] ? e->f[2] : "";
     char key[512]; axx_strupr_to(key,name_field,sizeof(key));
@@ -4832,9 +3424,6 @@ static int dir_clear_symbol(Assembler *asmb, PatEntry *e){
 
 static int dir_bits(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".bits")!=0) return 0;
-    /* axx.py 側は i[1].lower() で比較しているので大文字小文字を区別しない。
-     * C 版も strcasecmp に揃える (".bits::BIG::16" が axx.py では big、
-     * C では little になっていた)。 */
     asmb->st.endian_big=(strcasecmp(e->f[1],"big")==0);
     int io;
     uint256_t v = e->f[2][0] ? expr_expression_pat(asmb,e->f[2],0,&io) : u256_from_i64(8);
@@ -4870,13 +3459,6 @@ static int dir_vliwp(Assembler *asmb, PatEntry *e){
     asmb->st.vliwbits=(int)u256_to_i64(v1);
     asmb->st.vliwinstbits=(int)u256_to_i64(v2);
     asmb->st.vliwtemplatebits=(int)u256_to_i64(v3);
-    /* 破綻点修正 (axx.py port): ソース1行ごとにパターンファイル全体が
-     * 再スキャンされる設計のため(lineassemble2相当のメインループ参照)、
-     * .vliwディレクティブに出会うたびにdir_vliwp()が呼ばれ、直後のNOP
-     * バイト列構築ループがvliwinstbits/8回実行される。vliwinstbitsは
-     * 本来ちいさな命令幅を表す値だが上限チェックが無いため、桁を書き
-     * 間違える(例: 80000000)とソース1行あたり数秒かかる処理が行数分
-     * 積み上がり、通常サイズのソースファイルでも事実上ハングする。 */
     if(asmb->st.vliwinstbits < 0 || asmb->st.vliwinstbits > 8192){
         axx_diagf(1, 0, " error - .vliw: vliwinstbits %d is out of range (must be 0-8192).\n",
                    asmb->st.vliwinstbits);
@@ -4913,43 +3495,8 @@ static int dir_epic(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* =========================================================
- * .check / .clrcheck ディレクティブ (パターンファイル専用)
- *
- * dir_check():
- *   PatEntry フィールド配置:
- *     f[0] = ".check"
- *     f[1] = 変数名 (小文字1文字, e.g. "x")
- *     f[2] = 許可シンボル名をカンマ区切りで列挙 (e.g. "R0,R1,R2")
- *   当該変数に対する拘束を st->check_constraints[var-'a'] に登録する。
- *   既存の拘束は上書きされる。
- *
- * dir_clrcheck():
- *   PatEntry フィールド配置:
- *     f[0] = ".clrcheck"
- *     f[1] = 変数名 (省略時は全変数の拘束を解除)
- *   対象変数の拘束を解除する。
- *
- * 適用範囲についての訂正 (axx.py port): 拘束の実際の評価は
- * pat_match() 内 `a>='a'&&a<='z'` 分岐 (このファイル内の該当箇所を
- * 参照) 1箇所のみで行われ、パターンテンプレート中の素の小文字1文字
- * (例: "MOV a,b" の a のように、ソース上の .setsym シンボル語に直接
- * マッチする形) にのみ効く。"!x" 形式(任意の式を捕捉する)で束縛された
- * 変数には一切適用されない -- !x は数値を計算する式であり、リストと
- * 比較すべき単一の「シンボル名」が存在しないため。以前このコメントが
- * 言及していた独立した dir_check_eval() 関数は実装として存在せず
- * (grep しても本コメント以外に出現しない)、拘束評価は上記の pat_match()
- * 内インライン処理がそのまま最終的な適用箇所である。axx.pyの
- * check_processing() のdocstringも同じ誤りがあったため合わせて訂正した。
- * ========================================================= */
 static int dir_check(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".check") != 0) return 0;
-    /* Bugfix (axx.py port): same readpat() field-mapping quirk fixed in
-     * dir_set_symbol()/dir_clrcheck() -- a var-only ".check::c" line (2
-     * fields) puts "c" in f[2], not f[1]; only the 3-field
-     * ".check::c::LIST" form uses f[1] for the var and f[2] for the list.
-     * This used to always read the var from f[1], so the list-less form
-     * always hit the "not specified" error below. */
     const char *var_str  = e->f[1][0] ? e->f[1] : e->f[2];
     const char *syms_str = e->f[1][0] ? e->f[2] : "";
     if(!var_str[0]){
@@ -4963,10 +3510,8 @@ static int dir_check(Assembler *asmb, PatEntry *e){
         return 1;
     }
     int idx = var - 'a';
-    /* Clear existing constraint for this variable */
     sv_free(&asmb->st.check_constraints[idx]);
     sv_init(&asmb->st.check_constraints[idx]);
-    /* Parse comma-separated symbol names from syms_str; store uppercased */
     const char *p = syms_str;
     while(*p){
         while(*p == ' ' || *p == '\t') p++;
@@ -4975,7 +3520,6 @@ static int dir_check(Assembler *asmb, PatEntry *e){
         while(*p && *p != ',' && j < (int)sizeof(buf)-1)
             buf[j++] = (char)toupper((unsigned char)*p++);
         buf[j] = '\0';
-        /* trim trailing spaces */
         while(j > 0 && (buf[j-1] == ' ' || buf[j-1] == '\t')) buf[--j] = '\0';
         if(j > 0) sv_push(&asmb->st.check_constraints[idx], buf);
         if(*p == ',') p++;
@@ -4985,11 +3529,6 @@ static int dir_check(Assembler *asmb, PatEntry *e){
 
 static int dir_clrcheck(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".clrcheck") != 0) return 0;
-    /* 仕様: 変数名はフィールド2 (f[2]) を参照する。
-     * readpat のフィールドマッピングにより `.clrcheck::var` 形式
-     * （2フィールド）は f[1]="" / f[2]="var" となるため、
-     * .setsym 等と同様に引数はフィールド2 に格納される。
-     * f[2] が空の場合は引数省略とみなし全拘束を解除する。 */
     const char *var_str = e->f[2];
     if(var_str[0]){
         char var = (char)tolower((unsigned char)var_str[0]);
@@ -5002,7 +3541,6 @@ static int dir_clrcheck(Assembler *asmb, PatEntry *e){
         sv_free(&asmb->st.check_constraints[idx]);
         sv_init(&asmb->st.check_constraints[idx]);
     } else {
-        /* No variable specified: clear all constraints */
         for(int i = 0; i < 26; i++){
             sv_free(&asmb->st.check_constraints[i]);
             sv_init(&asmb->st.check_constraints[i]);
@@ -5011,11 +3549,6 @@ static int dir_clrcheck(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* Fix 10 (axx.py): dir_error() now returns 1 when at least one condition
- * fired (triggered), 0 otherwise.  The caller uses this to skip makeobj()
- * when the .error directive raised an error, preventing bad object code from
- * being emitted.  Mirrors axx.py DirectiveProcessor.error() returning
- * (triggered: bool, code: int). */
 static int dir_error(Assembler *asmb, const char *s){
     AsmState *st=&asmb->st;
     int has_content=0;
@@ -5032,10 +3565,6 @@ static int dir_error(Assembler *asmb, const char *s){
     while(1){
         if(!buf[idx]) break;
         if(buf[idx]==','){idx++;continue;}
-        /* Python evaluates the condition (u) in float mode, matching:
-         *   self.expr_eval.state.exp_typ = 'f'
-         *   u, idxn = self.expr_eval.expression_pat(s, idx)
-         *   self.expr_eval.state.exp_typ = prev_typ               */
         int io;
         int prev_flt = st->exp_typ_float;
         st->exp_typ_float = 1;
@@ -5051,40 +3580,12 @@ static int dir_error(Assembler *asmb, const char *s){
             if(tc>=0&&tc<ERRORS_COUNT) fprintf(stderr,"%s",ERRORS_TABLE[tc]);
             fprintf(stderr,": \n");
             triggered=1;
-            /* A triggered guard makes the caller skip makeobj(), so this
-             * instruction contributes no object bytes and the output would be
-             * silently short.  Latch had_error -- as every other error path
-             * does via diag(set_error=1) -- so the run aborts with a non-zero
-             * exit status instead of writing a wrong binary that a makefile
-             * would happily hand to the linker.  Mirrors axx.py
-             * DirectiveProcessor.error(). */
             st->had_error=1;
         }
     }
     return triggered;
 }
 
-/* -------------------------------------------------------
- * expr_expression_esc_float():
- *   Evaluate expression in floating-point mode for !F/!D/!Q pattern capture.
- *
- *   Temporarily sets exp_typ_float=1 and calls expr_expression_esc()
- *   (the native C evaluator) so that number literals are parsed as
- *   doubles and arithmetic is done in double precision.
- *
- *   Mirrors axx.py ExpressionEvaluator.expression_esc_float():
- *     prev = self.state.exp_typ
- *     self.state.exp_typ = 'f'
- *     try:
- *         v,idx = self.expression_esc(s,idx,stopchar)
- *     finally:
- *         self.state.exp_typ = prev
- *     return (v,idx)
- *
- *   Returns the raw double result as a uint256_t bit-cast (w[0] holds
- *   the IEEE754 bits).  The caller converts to float/double/quad as
- *   appropriate.
- * ------------------------------------------------------- */
 static uint256_t expr_expression_esc_float(Assembler *asmb, const char *s,
                                             int idx, char stopchar, int *idx_out)
 {
@@ -5095,20 +3596,7 @@ static uint256_t expr_expression_esc_float(Assembler *asmb, const char *s,
     return r;
 }
 
-/* =========================================================
- * PatternMatcher
- * ========================================================= */
 
-/* -------------------------------------------------------
- * Bug 2 fix: remove_brackets_str()
- * Original used nesting depth as the group ID, so two
- * sibling optional groups "[[A]] [[B]]" both got level=1
- * and could not be addressed individually.
- *
- * Fix: assign a unique monotone serial number to each OB,
- * matched with its corresponding CB via an open-stack.
- * remove_idx[] now refers to these serials.
- * ------------------------------------------------------- */
 static char *remove_brackets_str(const char *s, int *remove_idx, int nr){
     int len=(int)strlen(s);
     typedef struct { int serial; int pos; int is_open; } BP;
@@ -5127,14 +3615,7 @@ static char *remove_brackets_str(const char *s, int *remove_idx, int nr){
     }
     free(stk);
 
-    /* Fix (new): the original used '\x01' as an in-band sentinel inside the
-     * result buffer to mark positions to be deleted.  Any genuine '\x01' byte
-     * in the input (e.g. from an embedded control character) would be silently
-     * stripped even when it was not inside a removed bracket group.
-     *
-     * Fix: use a separate boolean array to track which positions to delete,
-     * so the result buffer is never modified with an in-band sentinel value. */
-    char *del = calloc(len + 1, 1);  /* del[i] = 1 → position i is removed */
+    char *del = calloc(len + 1, 1);
     for(int ri = 0; ri < nr; ri++){
         int ridx = remove_idx[ri];
         int start_pos = -1, end_pos = -1;
@@ -5153,17 +3634,23 @@ static char *remove_brackets_str(const char *s, int *remove_idx, int nr){
 }
 
 
-/* True when pattern `t` has an expression capture ("!x", "!!x", "!Fx" ...) at
- * `idx`, ignoring spaces.  Used to decide whether a literal '+' in the pattern
- * may also stand for a '-' in the source: only a '+' that introduces a captured
- * operand is a sign; a bare '+' elsewhere is still just a '+'. */
 static int pat_expects_expr(const char *t, int idx){
     while(t[idx]==' '||t[idx]=='\t') idx++;
     return t[idx]=='!';
 }
+/* ソース行 s_orig をパターン t_orig と照合する（字句解析なしの1文字ずつ突き合わせ）。
+ * パターン側の文字の意味:
+ *   大文字      大小無視でリテラル一致（ニーモニック）
+ *   小文字1文字 .setsym のシンボル（レジスタ名等）を取る
+ *   !x          任意の式を読んで変数 x に束縛
+ *   !!x         式ではなく factor 1個だけを束縛
+ *   !Fx/!Dx/!Qx 浮動小数点式を IEEE754 の 32/64/128bit として束縛
+ *   \c          次の1文字をリテラル扱い（エスケープ）
+ * 成功時は具体度スコア (式の数, リテラル文字数, シンボル数) を st に残す。
+ * 呼び出し側はこれが最も「具体的」なパターンを採用するので、パターンファイル内の
+ * 記述順に依存しない。末尾まで両方使い切ったときだけ成功とする。 */
 static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
     AsmState *st=&asmb->st;
-    /* deb1/deb2 are debug-only buffers (4096 B); truncate long patterns safely */
     snprintf(st->deb1, sizeof(st->deb1), "%.*s",
              (int)(sizeof(st->deb1)-1), s_orig);
     snprintf(st->deb2, sizeof(st->deb2), "%.*s",
@@ -5184,39 +3671,15 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
     int tlen=(int)strlen(t);
     int result=0;
 
-    /* 順序非依存マッチング用の具体度カウンタ (axx.py port)。
-     * スコアは (n_expr, -n_lit, n_sym) の辞書式比較で小さいほど具体的:
-     *   リテラルのみ  LD A,(HL)  →  最優先
-     *   シンボル捕捉  LD A,r     →  次点
-     *   式キャプチャ  LD A,!e    →  最後
-     * 修正: 第2キーをシンボル数からリテラル一致文字数に変更 (axx.py と同期)。
-     * 旧順序では式キャプチャ数が同じ2パターンのうちシンボル数の少ない方が
-     * リテラル一致がどれほど多くても勝ってしまい、`ld a,(iy+9)` で
-     * LD A,(!n) が LD s,(IY[[+!d]]) に勝って iy+9 が式に飲み込まれ、
-     * 未定義ラベル iy のエラーになっていた。                              */
     int n_expr=0, n_sym=0, n_lit=0;
 
-    /* 直前に消費したパターン文字が英数字リテラルだったか(単語境界判定用) */
     int prev_alnum=0;
 
     while(1){
-        /* 単語境界ルール(axx.py側と同期): アセンブリ行側の空白は「トークン
-         * の区切り」として扱う。以前はここで無条件に axx_skipspc() を両側に
-         * かけていたため、空白がマッチに一切影響せず、例えば `jl exit_error`
-         * がパターン `JLE !a` にマッチしてしまっていた(JLの後の空白を飛ばして
-         * exit_errorの先頭'e'がパターンの'E'に食われ、!aが'xit_error'を捕捉
-         * して未定義エラーになる)。
-         * 空白スキップ自体は従来どおり行うが、「行側に空白があった」
-         * 「パターン側に空白があった」を記録しておき、英数字リテラル同士の
-         * 連続(=1つの単語)の途中で行側だけに空白があった場合はマッチ失敗と
-         * する。カンマ・括弧など英数字以外の前後の空白は従来どおり自由
-         * (互換性維持)。 */
         int s_sp = (s[idx_s]==' '||s[idx_s]=='\t');
         int t_sp = (t[idx_t]==' '||t[idx_t]=='\t');
         idx_s=axx_skipspc(s,idx_s);
         idx_t=axx_skipspc(t,idx_t);
-        /* 行側だけに空白があった位置は単語境界。パターン側にも空白が
-         * あればパターンもそこで単語が切れているので境界違反にならない。 */
         int word_break = s_sp && !t_sp;
         char b=s[idx_s], a=t[idx_t];
 
@@ -5240,8 +3703,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             else { result=0; break; }
         } else if(a>='A'&&a<='Z'){
             if(a==axx_upper_char(b)){
-                /* 英数字リテラルの連続途中に行側の空白は入れない
-                 * (JLE が 'jl e...' にマッチするのを防ぐ) */
                 if(prev_alnum && word_break){ result=0; break; }
                 idx_s++; idx_t++; n_lit++;
                 prev_alnum=1;
@@ -5253,43 +3714,22 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             n_expr++;
             idx_t++;
             a=t[idx_t]; idx_t++;
-            /* --- !F : capture float32 bit-pattern -------------------------
-             *   !F<var>[\stopchar]  reads a float expression from source,
-             *   packs as IEEE754 32-bit and stores the integer bit-pattern.
-             *   Mirrors axx.py match() case a=='F'. */
             if(a=='F' || a=='D' || a=='Q'){
                 char ftype = a;
-                a = t[idx_t]; idx_t++;          /* variable name (single char) */
+                a = t[idx_t]; idx_t++;
                 idx_t = axx_skipspc(t, idx_t);
                 char stopchar = '\0';
                 if(idx_t < tlen && t[idx_t] == '\\'){
-                    idx_t++;                    /* skip '\' */
+                    idx_t++;
                     idx_t = axx_skipspc(t, idx_t);
-                    stopchar = t[idx_t]; idx_t++; /* stopchar, then advance */
+                    stopchar = t[idx_t]; idx_t++;
                 }
-                /* Evaluate in float mode to get the expression extent.
-                 * Save source position first so we can extract the raw text
-                 * for __float128 re-evaluation.                             */
                 int idx_s_q_start = idx_s;
                 uint256_t fv = expr_expression_esc_float(asmb, s, idx_s, stopchar, &idx_s);
                 double dv = u256_to_double(fv);
-                /* consume stopchar from source if present */
                 if(stopchar != '\0' && idx_s < (int)strlen(s) && s[idx_s] == stopchar)
                     idx_s++;
                 if(ftype == 'F'){
-                    /* float32: pack → integer bit-pattern.
-                     * Bugfix (axx.py port): mirrors match()'s !F capture,
-                     * whose struct.pack('>f', v) raises OverflowError for a
-                     * FINITE value outside float32 range (e.g. 1e300) --
-                     * the C (float)dv cast instead silently produces
-                     * +/-Infinity with no diagnostic. Detect that by
-                     * comparing finiteness before/after the narrowing
-                     * cast: only report an error when dv was finite but
-                     * fval isn't (a genuine overflow-on-narrowing) -- a
-                     * dv that was ALREADY +/-inf/nan (e.g. a legitimate
-                     * "ldd a,-inf") must pass through unchanged, exactly
-                     * like Python's struct.pack, which does NOT raise for
-                     * an already-infinite/nan input. */
                     float fval = (float)dv;
                     if(isfinite(dv) && !isfinite(fval)){
                         if(should_report_errors(st)){
@@ -5300,24 +3740,13 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     uint32_t bits; memcpy(&bits, &fval, 4);
                     var_put(st, a, u256_from_u64((uint64_t)bits));
                 } else if(ftype == 'D'){
-                    /* float64: pack → integer bit-pattern. Unlike !F, a
-                     * double->double capture has no narrowing step that
-                     * could newly overflow a finite value to infinity, so
-                     * (unlike !F) there is no analogous error condition to
-                     * detect here -- dv (finite or a legitimate inf/nan)
-                     * passes through unchanged, matching axx.py's !D. */
                     uint64_t bits; memcpy(&bits, &dv, 8);
                     var_put(st, a, u256_from_u64(bits));
                 } else {
-                    /* !Q : IEEE754 128-bit (quad) bit-pattern.
-                     * Extract the raw source text and evaluate in __float128
-                     * for full precision matching Python mpmath.            */
-                    /* The stopchar (if any) was consumed above; the extent
-                     * idx_s_q_start..idx_s covers text + optional stopchar */
                     int raw_len = idx_s - idx_s_q_start;
                     if(stopchar && raw_len > 0 &&
                        s[idx_s_q_start + raw_len - 1] == stopchar)
-                        raw_len--;  /* trim trailing stopchar */
+                        raw_len--;
                     uint256_t qbits;
 #if defined(__GNUC__) && !defined(__STRICT_ANSI__) && \
     (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
@@ -5326,16 +3755,12 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                         char expr_text[1024];
                         memcpy(expr_text, s + idx_s_q_start, (size_t)raw_len);
                         expr_text[raw_len] = '\0';
-                        /* Strip "qad{...}" wrapper if present so that both
-                         *   !Q  3.14*2+1
-                         *   !Q  qad{3.14*2+1}
-                         * are evaluated identically in __float128.          */
                         const char *f128_text = expr_text;
                         char stripped[1024];
                         if(raw_len > 4 &&
                            strncmp(expr_text, "qad{", 4) == 0 &&
                            expr_text[raw_len-1] == '}'){
-                            int inner = raw_len - 5; /* strip "qad{" and "}" */
+                            int inner = raw_len - 5;
                             memcpy(stripped, expr_text + 4, (size_t)inner);
                             stripped[inner] = '\0';
                             f128_text = stripped;
@@ -5343,22 +3768,10 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                         int q_ok = 0;
                         qbits = f128_eval_text(f128_text, &q_ok);
                         if(!q_ok){
-                            /* Bugfix: "inf"/"-inf"/"nan" tokens reach here
-                             * (f128_eval_text only parses arithmetic and
-                             * fails on them), and the double→string
-                             * fallback below is unusable for them: dv came
-                             * from u256_to_double(fv), which reads only the
-                             * low 64 bits of the (possibly 128-bit qad{})
-                             * value -- for a genuine binary128 inf/nan the
-                             * significant bits live in the upper word, so
-                             * dv silently reads back as 0.0 and the special
-                             * value is lost. Handle the three tokens
-                             * directly instead of falling through. */
                             if(strcmp(f128_text,"inf")==0 || strcmp(f128_text,"-inf")==0 ||
                                strcmp(f128_text,"nan")==0){
                                 qbits = ieee754_128_from_str(f128_text);
                             } else {
-                                /* fall back: double→string→binary128 */
                                 char fstr[64];
                                 snprintf(fstr, sizeof(fstr), "%.17g", dv);
                                 qbits = ieee754_128_from_str(fstr);
@@ -5376,12 +3789,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 continue;
             } else if(a=='!'){
                 a=t[idx_t]; idx_t++;
-                /* ELF tracking: record which variable is being captured */
                 st->elf_capturing_var = a;
-                /* Isolate whether resolving a label DURING this specific
-                 * captured expression genuinely failed (see PatVar's
-                 * comment above), independent of whatever
-                 * error_undefined_label happened to hold going in. */
                 int _cap_prior_eul = st->error_undefined_label;
                 st->error_undefined_label = 0;
                 uint256_t v=expr_factor(asmb,s,idx_s,&idx_s);
@@ -5399,9 +3807,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     stopchar=t[idx_t];
                     idx_t++;
                 }
-                /* ELF tracking: record which variable is being captured */
                 st->elf_capturing_var = a;
-                /* Same isolation as the '!' branch above. */
                 int _cap_prior_eul2 = st->error_undefined_label;
                 st->error_undefined_label = 0;
                 uint256_t v=expr_expression_esc(asmb,s,idx_s,stopchar,&idx_s);
@@ -5420,15 +3826,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             idx_s=axx_get_symbol_word(s,idx_s,st->swordchars,w,sizeof(w));
             uint256_t sv;
             if(!symbol_get(st,w,&sv)){
-                /* swordchars deliberately contains operator-ish characters
-                 * ("_%$-~&|"), so the greedy scan above swallows things like
-                 * "RBX-8" whole and then finds no symbol of that name.
-                 * Retreat to the longest prefix that *is* a defined symbol,
-                 * cutting only at those non-alphanumeric characters, so
-                 * "RBX-8" becomes "RBX" and "-8" is left for the expression
-                 * that follows in the pattern.  A symbol whose name really
-                 * does contain one of those characters still wins, because
-                 * the full-length lookup is tried first.  Mirrors axx.py. */
                 int _wl = (int)strlen(w), _hit = 0;
                 for(int _cut = _wl - 1; _cut > 0; _cut--){
                     unsigned char _ch = (unsigned char)w[_cut];
@@ -5440,8 +3837,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 }
                 if(!_hit){ result=0; break; }
             }
-            
-            /* .check constraint validation (name-based) */
+
             int vi = a - 'a';
             StrVec *cv = &st->check_constraints[vi];
             if(cv->len > 0){
@@ -5454,10 +3850,9 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 }
                 if(!ok){ result=0; break; }
             }
-            
-            /* Fix 5 (new): if get_symbol_word didn't advance, it's a match failure. */
+
             if(idx_s == prev_idx_s){ result=0; break; }
-            
+
             var_put(st,a,sv);
             n_sym++;
             continue;
@@ -5468,19 +3863,10 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             if(s[idx_s]==a){ idx_s++; n_lit++; continue; }
             else { result=0; break; }
         } else if(a=='+' && b=='-' && pat_expects_expr(t, idx_t + 1)){
-            /* Signed displacement.  A pattern writes base-plus-displacement as
-             * "[b+!o]" / "(IX+!d)", but assembly source writes a negative
-             * displacement as "[RBX-8]" / "(IX-5)".  Consume the pattern's '+'
-             * and leave the '-' in the source: the expression capture that
-             * follows then reads "-8" and yields a negative value, so no
-             * separate negated pattern is needed.  Scored exactly like a
-             * literal '+' so pattern selection is unchanged.  Mirrors axx.py. */
             idx_t++; n_lit++;
             prev_alnum = 0;
             continue;
         } else if(a==b){
-            /* 数字リテラル等も英数字リテラル連続の一部として扱う
-             * (パターン 'R1' が行 'r 1' にマッチしないように) */
             int lit_alnum = isalnum((unsigned char)a) ? 1 : 0;
             if(lit_alnum && prev_alnum && word_break){ result=0; break; }
             idx_t++; idx_s++; n_lit++;
@@ -5493,21 +3879,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
     return result;
 }
 
-/* -------------------------------------------------------
- * Bug 3 fix: pat_match0() – undefined behaviour from 1<<cnt
- * When cnt >= 32, (1<<cnt) is UB in C (signed int overflow).
- *
- * Fix: use uint64_t for the mask.
- *
- * 破綻点修正: 上記のuint64_t化だけでは、2^cnt通りの組合せを全探索する
- * コストそのものは解消されない。axx.py 版は "現実のパターンファイルで
- * [[]] が20を超えることはない" という前提で _MAX_OPT_GROUPS=20 を上限に
- * 設定している（2^20 ≈ 100万通りが実用上の上限）。
- * このCポートは「uint64_tに収まる」という理由だけでcnt<=63を許容して
- * いたが、2^63通りは事実上無限であり、axx.pyでは即座に処理される
- * cnt=18程度のパターンでも、この上限のせいでハングし続ける
- * （実測: cnt=18でCコード0.6秒 vs cnt=24で30秒超）。
- * axx.py と同じ実用上限20に揃える。 */
 static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
     char *t=malloc(strlen(t_orig)+1);
     strcpy(t,t_orig);
@@ -5522,9 +3893,6 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
 
     int cnt=0; for(const char*p=t;*p;p++) if(*p==OB_CHAR) cnt++;
 
-    /* axx.py の _MAX_OPT_GROUPS と同じ実用上限。2^20 ≈ 100万通りに
-     * 抑えることで、超過分は「常に含む」扱いにして事実上無限の
-     * 組合せ爆発によるハングを防ぐ。 */
     enum { MAX_OPT_GROUPS = 20 };
     if(cnt > MAX_OPT_GROUPS){
         axx_diagf(0, 0, " warning - pattern has %d optional groups (max %d); "
@@ -5534,18 +3902,13 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
     }
 
     int *sl=malloc((cnt+1)*sizeof(int));
-    for(int i=0;i<cnt;i++) sl[i]=i+1;   /* serials 1..cnt */
+    for(int i=0;i<cnt;i++) sl[i]=i+1;
 
-    /* 破綻点修正5 (axx.py port): MAX_OPT_GROUPS=20 だけではcnt=20で
-     * 2^20 ≈ 100万通りに達しうる。グループ数の上限とは別に、1回の
-     * pat_match0()呼び出しが試してよい組合せの総数にも予算を設け、
-     * 予算を使い切ったら「不成立」として安全側に倒す(誤ったマッチを
-     * 返すことはない)。 */
     const uint64_t MAX_COMBINATIONS = (uint64_t)1 << 16;
     uint64_t tried = 0;
 
     int found=0;
-    uint64_t total = (uint64_t)1 << cnt; /* 2^cnt subsets; safe for cnt<=63 */
+    uint64_t total = (uint64_t)1 << cnt;
     for(uint64_t mask=0; mask<total && !found; mask++){
         if(++tried > MAX_COMBINATIONS){
             int _already_warned = 0;
@@ -5576,15 +3939,10 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
         for(int i=0;i<cnt;i++) if(mask & ((uint64_t)1<<i)) ri[nr++]=sl[i];
         char *lt=remove_brackets_str(t,ri,nr);
 
-        /* Fix C-1 / Fix ④ (axx.py): snapshot vars AND ELF tracking state before
-         * each trial.  Failed match attempts must not leave partial variable
-         * writes or spurious ELF ref entries visible to the next attempt. */
         PatVar    saved_vars[26];
         memcpy(saved_vars, asmb->st.vars, sizeof(saved_vars));
 
-        /* Snapshot ELF refs */
         int saved_elf_refs_len = asmb->st.elf_refs_len;
-        /* Snapshot elf_var_to_label (set/label_name/label_val per slot) */
         struct {int set; char *label_name; uint64_t label_val;} saved_vtl[26];
         for(int vi=0;vi<26;vi++){
             saved_vtl[vi].set       = asmb->st.elf_var_to_label[vi].set;
@@ -5596,22 +3954,18 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
 
         if(pat_match(asmb,s,lt)){
             found=1;
-            /* Free the pre-match snapshot (keep current ELF state) */
             for(int vi=0;vi<26;vi++) free(saved_vtl[vi].label_name);
         } else {
-            /* restore vars on failure */
             memcpy(asmb->st.vars, saved_vars, sizeof(saved_vars));
-            /* restore ELF refs: free any names added during the failed attempt */
             for(int ri2=saved_elf_refs_len; ri2<asmb->st.elf_refs_len; ri2++)
                 free(asmb->st.elf_refs[ri2].name);
             asmb->st.elf_refs_len = saved_elf_refs_len;
-            /* restore elf_var_to_label */
             for(int vi=0;vi<26;vi++){
                 free(asmb->st.elf_var_to_label[vi].label_name);
                 asmb->st.elf_var_to_label[vi].set       = saved_vtl[vi].set;
                 asmb->st.elf_var_to_label[vi].label_val = saved_vtl[vi].label_val;
                 asmb->st.elf_var_to_label[vi].label_name = saved_vtl[vi].label_name;
-                saved_vtl[vi].label_name = NULL; /* ownership transferred */
+                saved_vtl[vi].label_name = NULL;
             }
         }
         free(lt);
@@ -5620,34 +3974,19 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
     return found;
 }
 
-/* =========================================================
- * PatternFileReader
- * ========================================================= */
-/* -------------------------------------------------------
- * axx_resolve_path(): resolve a (possibly relative) filename
- * against base_dir.  If base_dir is NULL or empty, or fn is
- * absolute, fn is returned unchanged (copied into out).
- * Mirrors axx.py readpat() / include_asm() path resolution:
- *   if base_dir and not os.path.isabs(fn):
- *       fn = os.path.join(base_dir, fn)
- * ------------------------------------------------------- */
 static void axx_resolve_path(const char *base_dir, const char *fn,
                               char *out, size_t osz)
 {
     if(!fn || !fn[0]){ out[0]='\0'; return; }
-    /* absolute path: use as-is */
     if(fn[0]=='/' || !base_dir || !base_dir[0]){
         strncpy(out, fn, osz-1); out[osz-1]='\0'; return;
     }
     snprintf(out, osz, "%s/%s", base_dir, fn);
 }
 
-/* axx_dir_of(): extract the directory component of path into out.
- * If path has no directory part (no '/'), out is set to ".". */
 static void axx_dir_of(const char *path, char *out, size_t osz)
 {
     strncpy(out, path, osz-1); out[osz-1]='\0';
-    /* Use dirname() from libgen.h – it modifies the buffer in-place */
     char *d = dirname(out);
     if(d != out) strncpy(out, d, osz-1);
 }
@@ -5655,28 +3994,18 @@ static void axx_dir_of(const char *path, char *out, size_t osz)
 static void readpat(Assembler *asmb, const char *fn);
 static void include_pat(Assembler *asmb, const char *l, const char *base_dir);
 
-/* Defined after the macro layer (see pat_macro_expand there). Pattern files
- * go through the same '!'-macro layer as source files, so a macro may
- * generate whole pattern lines -- or a .INCLUDE directive. */
 static char **pat_macro_expand(FILE *f, const char *display, int *nlines);
 static void pat_macro_expand_free(char **v, int n);
 static void macro_reset_pass_pattern(void);
 
-/* Bug 5 fix + relative-path fix: include_pat()
- * Now accepts base_dir (the directory of the calling pattern file) and
- * resolves the .INCLUDE filename relative to it, exactly as axx.py does:
- *   this_dir = os.path.dirname(os.path.abspath(fn))
- *   ww = self.include_pat(l, this_dir)  */
 static void include_pat(Assembler *asmb, const char *l, const char *base_dir){
     int idx=axx_skipspc(l,0);
     char upper8[16]={0};
     for(int i=0;i<8&&l[idx+i];i++) upper8[i]=axx_upper_char(l[idx+i]);
     if(strcmp(upper8,".INCLUDE")!=0) return;
-    /* 修正⑦ (axx.py): use l+idx+8 (not l+8) to skip past any leading spaces */
     const char *after_kw = l + idx + 8;
     char raw[512]; axx_get_string(after_kw,raw,sizeof(raw));
     if(!raw[0]){
-        /* Fix ⑥ (axx.py): don't silently return – try unquoted fallback or error. */
         char trimmed[512];
         int ti=axx_skipspc(after_kw,0);
         int tn=0;
@@ -5700,21 +4029,14 @@ static void include_pat(Assembler *asmb, const char *l, const char *base_dir){
 static void readpat(Assembler *asmb, const char *fn){
     if(!fn||!fn[0]) return;
 
-    /* D8 (axx.py port): pattern .INCLUDE depth limit + circular-include detection.
-     * The Python original limited nesting to 50 and (after the recent fix)
-     * detects cycles via a chain of canonical paths. The C port previously had
-     * NEITHER, so a self-including pattern file would recurse until it crashed
-     * (native stack overflow) instead of stopping cleanly. */
     enum { MAX_PAT_DEPTH = 50 };
     if(asmb->st.pat_include_depth > MAX_PAT_DEPTH){
         axx_diagf(0, 0, " error - pattern .INCLUDE nesting exceeds %d: '%s'\n",
                    MAX_PAT_DEPTH, fn);
         return;
     }
-    /* Canonicalize for reliable cycle keys (resolves symlinks / './' / '..'). */
     char real[PATH_MAX];
     if(!realpath(fn, real)){
-        /* file may be unreadable; fall back to the raw name as the cycle key */
         strncpy(real, fn, sizeof(real)-1); real[sizeof(real)-1]='\0';
     }
     for(int i=0;i<asmb->st.pat_include_depth;i++){
@@ -5729,26 +4051,15 @@ static void readpat(Assembler *asmb, const char *fn){
     FILE *f=axx_open_input(fn, "pattern file");
     if(!f) return;
 
-    /* push this file onto the include chain */
     if(asmb->st.pat_include_depth < (int)(sizeof(asmb->st.pat_include_chain)
                                           / sizeof(asmb->st.pat_include_chain[0]))){
         asmb->st.pat_include_chain[asmb->st.pat_include_depth] = strdup(real);
     }
     asmb->st.pat_include_depth++;
 
-    /* Compute this file's directory for recursive .INCLUDE resolution */
     char this_dir[1024];
     axx_dir_of(fn, this_dir, sizeof(this_dir));
 
-    /* Macro-expand the whole pattern file first, then parse the resulting
-     * lines. Macro state is reset only for the top-level pattern file (depth
-     * 0 at entry), so macros defined there stay visible inside everything it
-     * .INCLUDEs -- the same rule the source side uses for its own .INCLUDE.
-     *
-     * The previous getline() loop is gone, but its guarantee is kept:
-     * m_read_lines() inside the macro layer also reads with getline(), so a
-     * pattern line still has no length limit (an earlier fix; a fixed 4096-
-     * byte fgets() buffer used to split long lines silently). */
     if(asmb->st.pat_include_depth == 1) macro_reset_pass_pattern();
 
     int nexp = 0;
@@ -5796,7 +4107,6 @@ static void readpat(Assembler *asmb, const char *fn){
     }
     free(line);
     pat_macro_expand_free(exp, nexp);
-    /* D8: pop this file off the include chain */
     asmb->st.pat_include_depth--;
     if(asmb->st.pat_include_depth >= 0
        && asmb->st.pat_include_depth < (int)(sizeof(asmb->st.pat_include_chain)
@@ -5806,17 +4116,6 @@ static void readpat(Assembler *asmb, const char *fn){
     }
 }
 
-/* =========================================================
- * ObjectGenerator
- * ========================================================= */
-/* [Bug: %%-growth-truncation 修正]
- * "%%" (2文字) は連番カウンタの10進表記に置き換わるが、カウンタが2桁を
- * 超えると出力は入力より長くなる（例: "%%"の100回目以降は"100"のように
- * 3文字以上）。呼び出し元が固定マージンでバッファを確保していると、
- * @@[n,%%] のようなリピートで n が100を超えたあたりから無警告で末尾が
- * 切り詰められる（axx.py 側は無制限長の文字列なので発生しない）。
- * この関数自身に切り詰めが起きたかどうかを返させ、呼び出し元で
- * バッファを拡大して再試行できるようにする。 */
 static int replace_percent_with_index(const char *s, char *out, size_t osz){
     int count=0,i=0; size_t n=0; int truncated=0;
     while(s[i]){
@@ -5836,6 +4135,10 @@ static int replace_percent_with_index(const char *s, char *out, size_t osz){
     return truncated;
 }
 
+/* エンコーディング欄の `@@[個数, 式]` を個数分だけ展開する。
+ * 例: `0xe8,@@[4,*(e-$.,%%)]` は 4 バイトのリトルエンディアン展開になる。
+ * is_empty には「展開の結果ワードが1つも無い」ことを返す（`;` 条件付き出力で
+ * 何も出さない命令を、長さ0として扱うため）。 */
 static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assembler *asmb){
     size_t n=0; int has_content=0;
     int i=0; int plen=(int)strlen(pattern);
@@ -5857,8 +4160,6 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
                 int rl=i-comma_pos-1; if(rl>=(int)sizeof(rep_pat)) rl=sizeof(rep_pat)-1;
                 memcpy(rep_pat,pattern+comma_pos+1,rl);
                 int io;
-                /* 修正: 直前の処理でerror_undefined_labelが残っていると
-                 * nrep=0と誤判定されるため、評価前にリセットする。 */
                 asmb->st.error_undefined_label = 0;
                 uint256_t nv=expr_expression_pat(asmb,expr_part,0,&io);
                 int64_t nrep=u256_to_i64(nv);
@@ -5871,11 +4172,6 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
                 }
                 i++;
             } else {
-                /* Bugfix (mirrors axx.py ObjectGenerator.e_p()): a malformed
-                 * @@[...] group with no top-level comma (e.g. a pattern-file
-                 * typo like "@@[4*3]" instead of "@@[4,3]") used to silently
-                 * discard everything between "@@[" and the matched (or
-                 * missing) "]" here with no diagnostic at all. */
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - @@[...]: missing ',' separating count and pattern.\n");
                 }
@@ -5887,13 +4183,14 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
     *is_empty=!has_content;
 }
 
+/* パターンのエンコーディング欄を評価して、出力ワード列 objl を作る。
+ * s_in はカンマ区切りの式の並び。`%%`(連番) と `@@[]`(反復) は呼び出し前に
+ * 展開済み。要素が `;` で始まるものは条件付き出力で、値が 0 なら何も出さない
+ * （x86 の REX プレフィックスの有無のような分岐に使う）。 */
 static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     AsmState *st=&asmb->st;
     iv_clear(objl);
 
-    /* Fix P6: replace fixed-size ep_buf[8192]/s[8192] with dynamically grown
-     * buffers so that long @@[N,...] expansions cannot silently truncate the
-     * binary_list.  The old post-overflow check fired too late.              */
     size_t ep_cap = 8192;
     char *ep_buf = NULL;
     int is_empty = 0;
@@ -5903,7 +4200,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         memset(ep_buf, 0, ep_cap);
         e_p(s_in, ep_buf, ep_cap, &is_empty, asmb);
         size_t used = strlen(ep_buf);
-        if(used < ep_cap - 16) break;          /* fits with margin */
+        if(used < ep_cap - 16) break;
         ep_cap *= 2;
         if(ep_cap > (size_t)256*1024*1024){
             fprintf(stderr,"makeobj: expanded pattern too large (>256 MB), truncating.\n");
@@ -5912,10 +4209,6 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     }
     if(is_empty){ free(ep_buf); return; }
 
-    /* [Bug: %%-growth-truncation 修正] "%%"が2桁超の連番に置き換わって
-     * 入力より長くなるケースに備え、ep_buf側と同じ「切り詰め検出→倍にして
-     * 再試行」方式にする（固定+64マージンでは @@[n,%%] の n が100を超える
-     * あたりから無警告で末尾が欠落していた）。 */
     size_t s_cap = strlen(ep_buf) + 64;
     char *s = NULL;
     while(1){
@@ -5933,44 +4226,22 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
 
     int slen = (int)strlen(s);
 
-    /* binary_list評価中フラグ: $$がpc_instr_startを返すのはこの期間のみ */
     st->in_binary_list = 1;
-    /* Bugfix (axx.py port): this used to unconditionally clear
-     * error_undefined_label here, discarding any "undefined label" status
-     * the caller had already established BEFORE calling makeobj() -- in
-     * particular, a !x-captured pattern variable's value is computed once
-     * during trial pattern-matching (label_get_value() calls happen
-     * there, not here), so if that capture referenced an undefined label,
-     * the only trace of it is the flag the caller carries into this call.
-     * Save it and OR it back in at the end (see any_undef below) instead
-     * of dropping it on the floor. */
     int _prior_undef = st->error_undefined_label;
     st->error_undefined_label = 0;
     int any_undef = 0;
 
-    /* Fix P9: use a separate logical index for ELF word tracking so that
-     * UNDEF-skipped elements do not cause subsequent elements to inherit a
-     * stale/duplicate word_idx (the old code used objl->len which does not
-     * advance when an element is skipped).                                   */
     int logical_word_idx = 0;
     int idx=0;
     while(1){
         if(idx>=slen||s[idx]=='\0') break;
         if(s[idx]==','){
-            /* 修正: ','はセパレータのみ。alignment paddingは挿入しない。
-             * 旧コードはcommaごとにalign_addr()でパディングを入れていたが、
-             * binary_listパターン内の','はフィールド区切りであって
-             * アライメント指示ではない。 */
             idx++;
             continue;
         }
         int semicolon=0;
         if(s[idx]==';'){ semicolon=1; idx++; }
         st->elf_current_word_idx = logical_word_idx;
-        /* pass==1では常にpass1_size_modeで評価する。
-         * 未定義ラベル(EXTERN等)がある場合でも0として扱い、
-         * @@[8,*(e,%%)]のような式でも8バイト分のサイズが正しく計上される。
-         * pass==2/0では通常通りerror_undefined_labelフラグで判定する。 */
         if(st->pas==1) st->pass1_size_mode=1;
         st->error_undefined_label = 0;
         int io;
@@ -5986,9 +4257,6 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         if(semicolon?!u256_is_zero(x):1){
             iv_push(objl,x);
         } else if(semicolon){
-            /* semicolon && x==0: element suppressed; remove any ELF refs recorded
-             * at this word_idx to avoid generating spurious relocations.
-             * Mirrors axx.py makeobj(): self.state._elf_label_refs_seen = [e for e in ... if e[2] != idx] */
             int cur_widx = logical_word_idx - 1;
             int wi2 = 0;
             for(int ri2 = 0; ri2 < st->elf_refs_len; ri2++){
@@ -5998,21 +4266,6 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
                     free(st->elf_refs[ri2].name);
             }
             st->elf_refs_len = wi2;
-            /* Bugfix: a suppressed field (e.g. the conditional REX-prefix
-             * word in "MOV f,!e" for a register <8, which needs no REX)
-             * consumes no objl slot, so it must not permanently consume a
-             * logical_word_idx slot either -- otherwise every later field
-             * in this same binary_list is recorded one word past its real
-             * position in objl, corrupting the ELF relocation offset (and,
-             * downstream, the abs-vs-pcrel type inference that compares
-             * the recorded word's value against the label's address).
-             * Mirrors axx.py's makeobj(), which sets
-             * _elf_current_word_idx = len(objl) fresh before each field
-             * and so self-corrects automatically whenever a field is not
-             * appended. This is independent of the any_undef/"continue"
-             * path above (P9), which is unaffected: pass 2 either
-             * resolves the label and pushes normally, or assembly aborts
-             * with an error and no ELF output is written either way. */
             logical_word_idx--;
         }
         if(s[idx]==','){idx++;continue;}
@@ -6024,14 +4277,8 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     free(s);
 }
 
-/* =========================================================
- * VLIWProcessor
- * ========================================================= */
 typedef struct { IntVec *data; int len; int cap; } IVVec;
 static void ivv_init(IVVec*v){v->data=NULL;v->len=0;v->cap=0;}
-/* Fix H: add NULL check after realloc, matching the guard in iv_push/sv_push.
- * The original silently continued to &v->data[v->len] after a failed realloc,
- * producing a NULL-dereference crash on the very next line. */
 static void ivv_push(IVVec*v,IntVec*iv){
     if(v->len>=v->cap){
         v->cap=v->cap?v->cap*2:8;
@@ -6045,14 +4292,21 @@ static void ivv_free(IVVec*v){
     free(v->data); ivv_init(v);
 }
 
-/* Fix K: int_cmp used subtraction (*(int*)a - *(int*)b) which overflows when
- * a is large-positive and b is large-negative (or vice-versa), producing the
- * wrong sort order.  Use a branchless 3-way compare instead. */
 static int int_cmp(const void*a,const void*b){
     int ia=*(const int*)a, ib=*(const int*)b;
     return (ia > ib) - (ia < ib);
 }
 
+/* `!!` 区切りで並んだ複数命令を1つの VLIW パケットに詰めて出力する。
+ *
+ * 各スロットを lineassemble2() で個別に組み立て、vliwinstbits 幅のフィールドへ
+ * 順に詰め、余ったスロットは vliwnop で埋める。EPIC ならスロットの組み合わせに
+ * 対応するテンプレート値を合成する（テンプレート幅が負ならパケットの上位側に置く）。
+ * 最後にパケット幅ぶんのバイト列として書き出し、pc をパケット1個分進める。
+ *
+ * 注意: パケット全体を書き終えるまで pc は進まないので、スロットの中身が
+ * .section 等のディレクティブだと誤った pc を基準に副作用が起きる。
+ * そのためスロット内のディレクティブは明確なエラーとして弾く。 */
 static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVec *objl_in,
                        int idx, int *idx_out){
     AsmState *st=&asmb->st;
@@ -6060,33 +4314,15 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
     ivv_push(&objs,objl_in);
 
     int *idxlst=malloc(256*sizeof(int)); int nidxlst=0;
-    /* The guard is inside the for-loop so each element is individually checked.
-     * The original had `if(nidxlst<256) for(...)` which checks BEFORE the loop,
-     * allowing nidxlst to overflow the buffer if new_idxs.len > 1. */
     for(int i=0;i<idxs_in->len;i++) if(nidxlst<256) idxlst[nidxlst++]=(int)u256_to_i64(idxs_in->data[i]);
 
     st->vliwstop=0;
     int slen=(int)strlen(line);
     while(1){
         idx=axx_skipspc(line,idx);
-        /* Bugfix (axx.py port): checks the VLIW_SEP_CHAR/VLIW_STOP_CHAR
-         * sentinel instead of raw "!!"/"!!!!" text -- see
-         * axx_resolve_vliw_escapes(). */
         if(idx<slen && line[idx]==VLIW_STOP_CHAR){ idx+=1; st->vliwstop=1; continue; }
         else if(idx<slen && line[idx]==VLIW_SEP_CHAR){
             idx+=1;
-            /* 破綻点修正 (axx.py port): VLIWスロットの内容が".section"/
-             * ".endsection"/".INCLUDE"等のディレクティブだった場合、
-             * lineassemble2()はそれを即座に処理してしまう。しかしこの
-             * パケット全体のバイトはまだ書き込まれておらず、st->pcも
-             * パケット先頭のままである(st->pc += q はパケット全体の
-             * 組み立てが終わった後に1回だけ行われる)。そのため.section
-             * が行うセクション切替え等の副作用は誤った(パケット末尾では
-             * なく先頭の)pcを基準に記録されてしまい、検出困難な形で
-             * このパケットや後続バイトがセクション取り違えにより出力から
-             * 消える/誤配置される事故になっていた。ディレクティブは
-             * VLIWスロットの内容として意味を持たないため、明確なエラー
-             * として打ち切る。 */
             { int _peek=idx; while(_peek<slen && (line[_peek]==' '||line[_peek]=='\t')) _peek++;
               if(_peek<slen && line[_peek]=='.'){
                   if(should_report_errors(st)){
@@ -6126,8 +4362,6 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
     int vbits=(st->vliwbits<0)?-st->vliwbits:st->vliwbits;
     int found=0;
 
-    /* Fix ③ (axx.py): vliwinstbits==0 causes division by zero in noi calculation.
-     * Guard and report an error, matching axx.py VLIWProcessor.vliwprocess(). */
     if(st->vliwinstbits == 0){
         if(should_report_errors(st)){
             axx_diagf(1, 0, " error - vliwinstbits is zero; cannot compute instruction slots.\n");
@@ -6160,12 +4394,6 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
 
         int ibyte=st->vliwinstbits/8+(st->vliwinstbits%8?1:0);
         int noi=(vbits-at)/st->vliwinstbits;
-        /* 破綻点修正 (axx.py port): vliwtemplatebits(at)がvbitsを超える
-         * (パケット幅よりテンプレート自体が大きい)矛盾した.vliw定義では、
-         * noiが負になりtarget_lenも負になって、以降のfor(j=0;j<noi;j++)相当
-         * のループが実質空になり、命令スロットの内容が無警告のまま失われた
-         * 状態で何らかのパケットが出力されてしまう。noiが0以下の場合は
-         * 明確なエラーで打ち切る。 */
         if(noi <= 0){
             if(should_report_errors(st)){
                 axx_diagf(1, 0, " error - .vliw: vliwtemplatebits (%d) leaves no room for "
@@ -6190,20 +4418,15 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         IntVec v1; iv_init(&v1);
         int cnt2=0;
         uint256_t im=u256_sub(u256_shl(u256_one(),st->vliwinstbits),u256_one());
-        /* スロット内のバイト組み立ては .bits のエンディアン指定に従う
-         * (axx.py VLIWProcessor.vliwprocess() と同一)。従来の C 版は
-         * st->endian_big を無視して常に big-endian で組み立てていた。 */
         for(int j=0;j<noi;j++){
             uint256_t vv=u256_zero();
             if(!st->endian_big){
-                /* little-endian: values[cnt2] が最下位バイト */
                 for(int ii=0;ii<ibyte;ii++){
                     if(values.len>cnt2)
                         vv=u256_or(vv,u256_shl(u256_and(values.data[cnt2],u256_from_u64(0xff)),8*ii));
                     cnt2++;
                 }
             } else {
-                /* big-endian: values[cnt2] が最上位バイト */
                 for(int ii=0;ii<ibyte;ii++){
                     vv=u256_shl(vv,8);
                     if(values.len>cnt2) vv=u256_or(vv,u256_and(values.data[cnt2],u256_from_u64(0xff)));
@@ -6218,24 +4441,10 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         for(int vi=0;vi<v1.len;vi++){ r=u256_shl(r,st->vliwinstbits); r=u256_or(r,v1.data[vi]); }
         r=u256_and(r,pm);
 
-        /* res: combine instruction words with template bits.
-         * vliwtemplatebits<0 means template is placed at the MSB side;
-         * otherwise template is placed at the LSB side.
-         * vliwbits の符号はパケット幅の絶対値取得にしか使わない
-         * (axx.py も vbits = abs(vliwbits))。出力バイト順は下の
-         * st->endian_big が決める。 */
         uint256_t res;
         if(st->vliwtemplatebits<0) res=u256_or(r,u256_shl(templ,(int)(vbits-at)));
         else res=u256_or(u256_shl(r,at),templ);
 
-        /* パケットのバイト出力順は .bits のエンディアン指定に従う
-         * (axx.py VLIWProcessor.vliwprocess() と同一)。従来の C 版は
-         * vliwbits の符号で big/little を選んでいたため、.bits を書かない
-         * パターンファイルでは axx.py とスロット並びが逆転していた。
-         * バイト数も vbits/8 (切り捨て) から (vbits+7)/8 (切り上げ) に
-         * 変更し、8 の倍数でないパケット幅の端数バイトが落ちないようにした。
-         * u256_sar は算術シフトだが、取り出した後に 0xff でマスクする
-         * ため符号拡張ビットは結果に混入しない。 */
         int q=0;
         uint64_t pc64=u256_to_u64(st->pc);
         if(vbits<8){
@@ -6265,9 +4474,6 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
     return found;
 }
 
-/* =========================================================
- * AssemblyDirectiveProcessor
- * ========================================================= */
 static int adir_labelc(AsmState *st, const char *l, const char *ll){
     char up[32]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".LABELC")!=0) return 0;
@@ -6278,21 +4484,6 @@ static int adir_labelc(AsmState *st, const char *l, const char *ll){
     return 1;
 }
 
-/* -------------------------------------------------------
- * Bug 7 fix: adir_label_processing()
- * For "label: .EQU expr", the original called
- *   expr_expression_asm(asmb, l, idx, &io)
- * where l is the full line and idx points past ".EQU".
- * This is correct as long as the expression parser ignores
- * everything before idx -- which it does via skipspc --
- * EXCEPT when the label name is itself a valid lwordchars
- * token at the start of l.  In that case the recursive
- * descent would try to parse the label name as a label
- * reference.
- *
- * Fix: pass (l + idx) as the string and reset idx to 0, so
- * the expression parser only ever sees the expression tail.
- * ------------------------------------------------------- */
 static char *adir_label_processing(Assembler *asmb, const char *l, char *out, size_t osz){
     AsmState *st=&asmb->st;
     if(!l[0]){ out[0]=0; return out; }
@@ -6305,23 +4496,15 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
         char ue[256]; axx_strupr_to(ue,e,sizeof(ue));
         if(strcmp(ue,".EQU")==0){
             int io;
-            /* axx.py fix: .EQU で ::reloctype 構文をサポートする。
-             *   label: .equ <式>::<reloctype>  → reloc_type_override を設定
-             *   label: .equ <式>              → reloc_type_override = -1（情報なし）
-             * ::reloctype を省略すると label_put_value が -1 を渡し lmap_set が
-             * 旧エントリの reloc_type_override をリセットする。 */
             const char *expr_tail = l + idx;
             int reloc_type = -1;
-            /* expr_tail に '::' が含まれるか検索 */
             const char *dcolon = strstr(expr_tail, "::");
             char expr_buf[1024];
             if(dcolon){
-                /* 式部分をコピー */
                 size_t elen = (size_t)(dcolon - expr_tail);
                 if(elen >= sizeof(expr_buf)) elen = sizeof(expr_buf)-1;
                 memcpy(expr_buf, expr_tail, elen); expr_buf[elen] = '\0';
                 expr_tail = expr_buf;
-                /* reloctype 文字列 */
                 const char *rt_str = dcolon + 2;
                 char rt_lc[64]; int ri=0;
                 while(rt_str[ri] && ri < 63){ rt_lc[ri]=(char)tolower((unsigned char)rt_str[ri]); ri++; }
@@ -6332,49 +4515,11 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
                                rt_lc, st->elf_machine);
             }
 
-            /* === ここが修正箇所：.equ 内の forward reference を pass1 で正しく扱う === */
             uint256_t u;
-            /* Bugfix (axx.py port, missing in caxx): label_get_value() only
-             * ever SETS error_undefined_label, never clears it (see its own
-             * comment), so a stale 1 left over from an EARLIER, unrelated
-             * forward reference in this same pass (e.g. an instruction a few
-             * lines above referencing a label not yet defined) survives
-             * unchanged into THIS .EQU's own evaluation below. Every other
-             * directive that evaluates an expression (.ORG/.RESB/.RESW/
-             * .RESD/.RESQ/.ZERO/.ALIGN) already resets the flag immediately
-             * before its own expr_expression_asm() call "for a fresh check";
-             * .EQU was the one directive missing it, and axx.py's port
-             * (adir_label_processing / equ_processing) already has this
-             * exact reset at the equivalent point.
-             *
-             * Without it, a perfectly well-defined ".equ" line (e.g. `buffer:
-             * .equ 0x0200`, no label references at all) gets its is_undef
-             * provenance incorrectly poisoned to 1 by the stale flag, purely
-             * because something earlier in the same top-to-bottom sweep
-             * happened to forward-reference an as-yet-undefined label. That
-             * poisoned is_undef then defeats the relax_prev forward-reference
-             * estimate on the NEXT relaxation iteration (label_get_value()
-             * requires `!pe->is_undef` before trusting a relax_prev hit), so
-             * any later expression forward-referencing this .EQU symbol (or
-             * an .EQU chained to it, e.g. `total: .equ buffer+0x40` written
-             * before `buffer`'s own definition) converges on a stable but
-             * wrong value instead of the correct one -- silently, since
-             * pass1 errors are never reported. Confirmed via a minimal
-             * repro against 8080.axx: STA/LDA of a forward-declared
-             * `total: .equ buffer+0x40` (with `buffer` defined even later)
-             * emitted the wrong high address byte in caxx while axx.py
-             * (which has this reset) emitted the correct one. */
             st->error_undefined_label = 0;
             int saved_mode = st->pass1_size_mode;
             if(st->pas == 1)
-                st->pass1_size_mode = 1;   /* forward ref を 0 として扱う */
-            /* 破綻点修正 (axx.py port): reloc_type未指定の.EQUで異なる
-             * セクションのラベルを跨いで演算すると(例: a_in_text -
-             * b_in_data)、結果はアセンブラが暗黙に仮定する「連続配置」
-             * でのみ正しい値になり、リロケーションが一切生成されない
-             * ため、リンカがセクションを別配置にした瞬間に無警告で
-             * 不正な定数になる。参照したラベルの所属セクションを記録し、
-             * 2つ以上の異なるセクションに跨っていたら警告する。 */
+                st->pass1_size_mode = 1;
             int track_sections = (reloc_type < 0);
             if(track_sections){
                 st->equ_section_tracking = 1;
@@ -6392,50 +4537,21 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
                                "relocated by the linker.\n", label);
                 }
             }
-            /* Bugfix (axx.py port): an undefined label referenced by this
-             * .EQU's expression used to go completely unnoticed here -- no
-             * print, no had_error -- silently baking the UNDEF sentinel
-             * (or 0, during pass1's size-probe mode) into `label`'s value
-             * as if it were a legitimate constant. Mirrors the same check
-             * every other directive that evaluates an expression already
-             * performs (.ORG/.RESB/.ZERO/.ALIGN). */
             if(st->error_undefined_label && should_report_errors(st)){
                 axx_diagf(1, 0, " error - .EQU '%s': expression contains undefined label.\n",
                            label);
             }
-            /* ====================================================================== */
 
-            /* is_undef provenance (see LabelEntry.is_undef): st->error_undefined_label
-             * right here reflects whether evaluating THIS .equ's own expression (the
-             * expr_expression_asm() call above) actually hit a failed label lookup --
-             * exactly the same signal the diagnostic just above already relies on.
-             * A plain constant like ".equ 0-1" never touches a label lookup, so this
-             * is 0 for it even though its stored value is bit-identical to UNDEF_VAL();
-             * only a genuinely-failed reference (e.g. aliasing an undefined label)
-             * sets it. */
-            label_put_value(st,label,u,st->current_section,1,reloc_type,st->error_undefined_label);  /* is_equ=1 */
+            label_put_value(st,label,u,st->current_section,1,reloc_type,st->error_undefined_label);
             out[0]=0; return out;
         } else {
-            label_put_value(st,label,st->pc,st->current_section,0,-1,0);  /* is_equ=0; address labels (st->pc) are never undef-derived */
+            label_put_value(st,label,st->pc,st->current_section,0,-1,0);
             strncpy(out,l+lidx,osz-1); out[osz-1]=0; return out;
         }
     }
     strncpy(out,l,osz-1); out[osz-1]=0; return out;
 }
 
-/* asciistr: output quoted string bytes.
- * Returns 1 if l2 started with '"' (valid quoted string), 0 otherwise.
- * Mirrors axx.py asciistr() which returns True/False. */
-/* asciistr: emit the characters of a quoted string, one output word each.
- *
- * Bugfix (axx.py port): only \0 \t \n \r \\ \" were recognised here.  axx.py's
- * asciistr() also takes \x/\X (1-2 hex digits), \u (exactly 4) and \U (exactly
- * 8), so `.ascii "A\x42\u0043"` produced 'A','B','C' there and the literal
- * text 'A','\','x','4','2',... here -- silently, with no diagnostic and a
- * different byte count.  The two length/word-width diagnostics axx.py emits
- * (unterminated literal, character wider than the output word) were missing
- * as well.  A malformed \x/\u/\U returns 0, which the .ASCII/.ASCIZ callers
- * turn into an error, again matching axx.py. */
 static int asciistr(Assembler *asmb, const char *l2){
     AsmState *st=&asmb->st;
     if(!l2[0]||l2[0]!='"') return 0;
@@ -6480,7 +4596,6 @@ static int asciistr(Assembler *asmb, const char *l2){
                 return 0;
             }
             unsigned long cp = strtoul(hx,NULL,16);
-            /* Python's chr() rejects anything above U+10FFFF. */
             if(cp > 0x10FFFFul){
                 char r[1024]; m_pyrepr(l2, r, sizeof(r));
                 axx_diagf(0, 0, " error - invalid \\u/\\U escape in string: %s\n", r);
@@ -6510,15 +4625,8 @@ static int adir_section(AsmState *st, const char *l, const char *l2){
     char up[32]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".SECTION")!=0 && strcmp(up,".SEGMENT")!=0) return 0;
     if(l2&&l2[0]){
-        /* Fix: mirror axx.py section_processing():
-         * 1. Before switching, register the OLD section if not already registered,
-         *    so sections appear in the order they are first WRITTEN TO (not declared).
-         * 2. Update the old section's tentative size (if not confirmed by ENDSECTION).
-         * 3. Register or update the NEW section, preserving confirmed sizes. */
         const char *old_sec = st->current_section;
 
-        /* If old section is not yet registered, create it with start=0 entry_pc=0.
-         * This handles the initial ".text" that is active before any .SECTION directive. */
         if(!secmap_find(&st->sections, old_sec)){
             SecEntry *ne = calloc(1, sizeof(SecEntry));
             ne->name = strdup(old_sec);
@@ -6538,35 +4646,22 @@ static int adir_section(AsmState *st, const char *l, const char *l2){
             }
             st->sections.order[st->sections.count++] = ne;
         }
-        /* Update old section's tentative size (cumulative).
-         * Bugfix (axx.py port): this used to skip entirely when
-         * oe->confirmed was set (i.e. the old section was already closed by
-         * .ENDSECTION). That gate is unnecessary for avoiding double-counting
-         * -- entry_pc is already advanced to pc at every flush point, so the
-         * delta below is naturally 0 right after a matching .ENDSECTION --
-         * and it actively drops any code that ran in old_sec *after* that
-         * .ENDSECTION but before this .SECTION switch, since that content's
-         * nonzero delta never got flushed anywhere. Relying on the delta
-         * alone (below) handles both cases correctly. */
         {
             SecEntry *oe = secmap_find(&st->sections, old_sec);
             if(oe){
                 uint256_t delta = u256_sub(st->pc, oe->entry_pc);
-                if(!u256_lt_signed(delta, u256_zero())){   /* delta >= 0 */
+                if(!u256_lt_signed(delta, u256_zero())){
                     oe->size = u256_add(oe->size, delta);
                     if(!u256_is_zero(delta))
                         secrangevec_push(&st->section_ranges, old_sec, oe->entry_pc, delta);
                 }
-                /* entry_pc will be updated on re-entry */
             }
         }
 
-        /* Switch to new section */
         snprintf(st->current_section, sizeof(st->current_section), "%s", l2);
 
         SecEntry *ne = secmap_find(&st->sections, l2);
         if(!ne){
-            /* First visit: register new section at current pc */
             uint32_t h = hash_str(l2) % (uint32_t)st->sections.nb;
             ne = calloc(1, sizeof(SecEntry));
             ne->name = strdup(l2);
@@ -6585,28 +4680,13 @@ static int adir_section(AsmState *st, const char *l, const char *l2){
             }
             st->sections.order[st->sections.count++] = ne;
         } else {
-            /* Re-entry: update entry_pc so next ENDSECTION measures from here.
-             * If confirmed, keep size unchanged. If not confirmed and size==0,
-             * this was a dummy entry created as old_sec — update start. */
 
             if(u256_is_zero(ne->size) && !ne->confirmed){
                 ne->start = st->pc;
             } else if(!ne->confirmed){
-                /* multi-block: keep the minimum start */
                 if(u256_lt_signed(st->pc, ne->start)) ne->start = st->pc;
             }
             ne->entry_pc = st->pc;
-            /* 破綻点修正 (axx.py port): confirmedを前回訪問終了時の値の
-             * ままにしていたため、以前.ENDSECTIONで確定済み(confirmed=1)
-             * だったセクションに再入すると、今回の訪問が一度も.ENDSECTION
-             * で閉じられていないのにconfirmed=1のままになっていた。この
-             * 状態でファイル末尾までこのセクションが再度閉じられずに
-             * 終わると、secmap_finalize_current()(ファイル末尾で開いた
-             * ままの最終セクションを確定する処理)がconfirmed=1を見て
-             * 「既に確定済み」と誤認し、今回の訪問分のバイト列が
-             * section_rangesに一切登録されないまま(=最終出力から丸ごと
-             * 欠落したまま)出力されていた。再入は必ず新しい未確定の訪問
-             * なので、confirmedは0にリセットする。 */
             ne->confirmed = 0;
         }
     }
@@ -6621,39 +4701,20 @@ static int adir_endsection(AsmState *st, const char *l){
                    st->current_section);
         return 1;
     }
-    /* Confirmed size: measure from entry_pc (last re-entry) to current pc.
-     * Mirrors axx.py endsection_processing() using entry_pc for accuracy. */
     uint256_t delta = u256_sub(st->pc, e->entry_pc);
     if(!u256_lt_signed(delta, u256_zero())){
         e->size = u256_add(e->size, delta);
         if(!u256_is_zero(delta))
             secrangevec_push(&st->section_ranges, st->current_section, e->entry_pc, delta);
     }
-    /* Bugfix (axx.py port): advance entry_pc to the current pc, mirroring
-     * axx.py endsection_processing()'s
-     *   self.state.sections[...] = [start, new_size, self.state.pc, True]
-     * Without this, entry_pc is left pointing at the START of the fragment
-     * just closed. adir_section()'s old-section-close logic and
-     * secmap_finalize_current() no longer gate on `confirmed` (that gate
-     * used to hide this), so leaving entry_pc stale would make either of
-     * them recompute the exact same [entry_pc, pc) span again later and
-     * double-count/double-push this fragment's bytes. */
     e->entry_pc = st->pc;
     e->confirmed = 1;
     return 1;
 }
-/* Helper shared by .RESB / .RESW / .RESD / .RESQ.
- * Advances PC by (cnt * mul) word-units without writing bytes to output.
- * The corresponding range is filled with the padding value at binary_flush()
- * time because BufMap entries are absent for the reserved region.
- * Mirrors axx.py AssemblyDirectiveProcessor.resb_processing() etc. */
 static int adir_resX(Assembler *asmb, const char *l, const char *l2,
                      const char *directive, uint64_t mul){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,directive)!=0) return 0;
-    /* label_get_value() no longer clears this for us on a successful
-     * lookup (see its Bugfix comment); reset before evaluating for a
-     * fresh check. */
     asmb->st.error_undefined_label = 0;
     int io;
     uint256_t x=expr_expression_asm(asmb,l2,0,&io);
@@ -6671,7 +4732,6 @@ static int adir_resX(Assembler *asmb, const char *l, const char *l2,
         }
         return 1;
     }
-    /* 256 MB guard: check before multiplying to avoid signed overflow */
     if(cnt > (int64_t)(1 << 28) / (int64_t)mul){
         if(should_report_errors(&asmb->st)){
             axx_diagf(1, 0, " error - %s count %lld (x%llu) exceeds maximum %d words.\n",
@@ -6684,31 +4744,24 @@ static int adir_resX(Assembler *asmb, const char *l, const char *l2,
     return 1;
 }
 
-/* .RESB N  -- reserve N byte-units (×1): advance PC by N. */
 static int adir_resb(Assembler *asmb, const char *l, const char *l2){
     return adir_resX(asmb,l,l2,".RESB",1);
 }
-/* .RESW N  -- reserve N word-units (×2): advance PC by N*2. */
 static int adir_resw(Assembler *asmb, const char *l, const char *l2){
     return adir_resX(asmb,l,l2,".RESW",2);
 }
-/* .RESD N  -- reserve N dword-units (×4): advance PC by N*4. */
 static int adir_resd(Assembler *asmb, const char *l, const char *l2){
     return adir_resX(asmb,l,l2,".RESD",4);
 }
-/* .RESQ N  -- reserve N qword-units (×8): advance PC by N*8. */
 static int adir_resq(Assembler *asmb, const char *l, const char *l2){
     return adir_resX(asmb,l,l2,".RESQ",8);
 }
 static int adir_zero(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ZERO")!=0) return 0;
-    /* See adir_resX()'s comment: reset before evaluating for a fresh check. */
     asmb->st.error_undefined_label = 0;
     int io;
     uint256_t x=expr_expression_asm(asmb,l2,0,&io);
-    /* Fix ②: guard against UNDEF (undefined label) to avoid range(UNDEF) freeze.
-     * Also guard against negative values. Mirrors axx.py zero_processing(). */
     if(asmb->st.error_undefined_label){
         if(should_report_errors(&asmb->st)){
             axx_diagf(1, 0, " error - .ZERO argument contains undefined label.\n");
@@ -6731,8 +4784,6 @@ static int adir_zero(Assembler *asmb, const char *l, const char *l2){
 static int adir_ascii(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ASCII")!=0) return 0;
-    /* Return the result of asciistr: 0 if l2 is not a quoted string.
-     * Mirrors axx.py ascii_processing() which returns asciistr(). */
     return asciistr(asmb,l2);
 }
 static int adir_asciiz(Assembler *asmb, const char *l, const char *l2){
@@ -6753,13 +4804,6 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ALIGN")!=0) return 0;
     if(l2&&l2[0]){
-        /* Bugfix (axx.py port): this never checked error_undefined_label
-         * at all -- an undefined label as the boundary argument evaluated
-         * to the UNDEF sentinel (an enormous but finite value), which then
-         * sailed past the `u_int <= 0` guard below (it's huge and
-         * positive) and got assigned directly to st->align, silently
-         * corrupting all subsequent .ALIGN padding computations. Same
-         * reset-before-evaluate-then-check pattern as .ORG/.RESB/.ZERO. */
         asmb->st.error_undefined_label = 0;
         int io; uint256_t u=expr_expression_asm(asmb,l2,0,&io);
         if(asmb->st.error_undefined_label){
@@ -6769,13 +4813,6 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
             return 1;
         }
 
-        /* 破綻点修正 (axx.py port): 値の検証が一切なかったため、".ALIGN 0"が
-         * align_addr()内の"addr % st->align"でゼロ除算を起こし、SIGFPEで
-         * 即座にクラッシュしていた(axx.py側は元々 u_int<=0 をエラーとして
-         * 弾いており、Cポートだけこのガードが欠落していた)。 */
-        /* Fix: the sign/zero test read only the low 64 bits (u256_to_i64),
-         * so ".ALIGN 1<<64" was rejected as "0" where axx.py accepted the
-         * real value.  Test the full 256-bit value. */
         if(u256_is_zero(u) || ((u.w[3]>>63)&1ULL)){
             if(should_report_errors(&asmb->st)){
                 char _ab[96]; u256_to_pydec(u, _ab, sizeof(_ab));
@@ -6785,15 +4822,6 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
         }
         asmb->st.align=u;
     }
-    /* 破綻点修正 (axx.py port): align_addr()はstate.pc(生のグローバルpc)を
-     * そのまま境界に揃えていたが、境界判定に本来使うべきなのは出力
-     * ファイル上の実際の位置であるセクション内相対オフセットである。
-     * 同じセクションへの再入があると、間に挟まった他セクション分だけ
-     * 生pcとセクション内相対オフセットがズレるため、生pc基準では
-     * たまたま境界に乗っていても実際の出力上では境界からズレたままに
-     * なる無警告の不整合が起きていた。セクション内相対オフセット基準で
-     * 必要なパディング量を計算し、そのパディング量をそのまま生pcにも
-     * 加算する。 */
     {
         uint64_t _raw = u256_to_u64(asmb->st.pc);
         int64_t _adj = equ_section_relative_offset(&asmb->st, asmb->st.current_section, _raw);
@@ -6807,28 +4835,16 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
 static int adir_org(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ORG")!=0) return 0;
-    /* axx.py org_processing()'s _ORG_FILL_MAX. */
     const uint64_t ORG_FILL_MAX = (uint64_t)1<<28;
-    /* See adir_resX()'s comment: reset before evaluating for a fresh check. */
     asmb->st.error_undefined_label = 0;
     int io;
     uint256_t u=expr_expression_asm(asmb,l2,0,&io);
-    /* Fix ②: guard against UNDEF to prevent pc being set to 0xffff…ff.
-     * Mirrors axx.py org_processing() which checks error_undefined_label. */
     if(asmb->st.error_undefined_label){
         if(should_report_errors(&asmb->st)){
             axx_diagf(1, 0, " error - .ORG argument contains undefined label.\n");
         }
         return 1;
     }
-    /* Fix (axx.py port, org_processing()): reject a negative address.
-     * Without this the value wrapped round to 2**256-1; the pc then read
-     * back as 0xffffffffffffffff, which produced only a "program counter
-     * exceeds 64-bit range" warning followed by "binary_flush: max_pos
-     * overflow, skipping output" -- and caxx still exited 0, so `.org -1`
-     * (or `.org x` with a negative .equ) looked like a successful build
-     * that had merely produced no file.  With a slightly different negative
-     * value it instead attempted a ~2**64-byte calloc(). */
     if((u.w[3]>>63)&1ULL){
         if(should_report_errors(&asmb->st)){
             char nb[96]; u256_to_pydec(u, nb, sizeof(nb));
@@ -6838,12 +4854,6 @@ static int adir_org(Assembler *asmb, const char *l, const char *l2){
     }
     if(io+2<=(int)strlen(l2) && axx_upper_char(l2[io])==','&&axx_upper_char(l2[io+1])=='P'){
         if(u256_gt_signed(u,asmb->st.pc)){
-            /* Fix (axx.py port): cap the fill count at _ORG_FILL_MAX (1<<28),
-             * the same limit axx.py's org_processing() applies.  The loop
-             * below runs (to-from) times, so `.org 0x10000001,P` -- one byte
-             * over the limit, and an easy typo -- ran for over three minutes
-             * without finishing while axx.py rejected it immediately, and a
-             * larger value simply never terminates. */
             uint256_t _span = u256_sub(u, asmb->st.pc);
             if(u256_gt_signed(_span, u256_from_u64(ORG_FILL_MAX))){
                 if(should_report_errors(&asmb->st)){
@@ -6865,7 +4875,6 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     if(st->pas!=2&&st->pas!=0) return 0;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
-    /* axx.py export_processing(): handles both .EXPORT and .GLOBAL */
     if(strcmp(up,".EXPORT")!=0 && strcmp(up,".GLOBAL")!=0) return 0;
     char buf[4096]; strncpy(buf,l2,sizeof(buf)-1); buf[sizeof(buf)-1]=0;
     int idx=0; int blen=(int)strlen(buf);
@@ -6877,16 +4886,10 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
         if(buf[idx]==':') idx++;
         uint256_t v=label_get_value(st,s);
         const char *sec=label_get_section(st,s);
-        /* Preserve the is_equ flag so that .equ-defined constants get
-         * SHN_ABS treatment in the ELF symbol table.
-         * Mirrors axx.py export_processing() which stores the full label entry. */
         LabelEntry *le=lmap_find(&st->labels,s);
         int is_equ_v = le ? le->is_equ : 0;
         int is_undef_v = le ? le->is_undef : 0;
         if(!lmap_find(&st->export_labels,s)){
-            /* first time this name is exported (this pass or any earlier
-             * one, since export_labels was just freshly reset) -- record
-             * declaration order before lmap_set() creates the entry. */
             sv_push(&st->export_order, s);
         }
         lmap_set(&st->export_labels,s,v,sec,is_equ_v,is_undef_v);
@@ -6895,16 +4898,6 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
     return 1;
 }
 
-/* axx.py extern_processing():
- * .EXTERN label [::rtype] [, label [::rtype] ...]
- * Declares external (undefined) symbols.  Each name is registered in
- * st->labels as an imported label (is_imported=1, value=0, section=".text")
- * so that references do NOT raise "undefined label" errors, and
- * write_elf_obj() emits the symbol as STB_GLOBAL / SHN_UNDEF.
- * If the label is already locally defined (.EXTERN is processed in all passes
- * to support forward references in the pass1 relaxation loop).
- * Optional ::rtype suffix (e.g. ::plt32) overrides the ELF relocation type
- * for references to this symbol.  Mirrors axx.py extern_processing(). */
 static int adir_extern(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
@@ -6916,13 +4909,8 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
         char s[512]; s[0]=0;
         idx=axx_get_label_word(buf,idx,st->lwordchars,s,sizeof(s));
         if(!s[0]) break;
-        /* axx.py: get_label_word consumes a trailing ':'; if the consumed char
-         * was the first ':' of '::' we need to step back so '::' is detected. */
         if(idx > 0 && buf[idx-1]==':' && idx < blen && buf[idx]==':')
-            idx--;  /* back up to expose '::' */
-        /* Parse optional ::rtype suffix. Default relocation type and the
-         * ::name -> reloc-type-number lookup both come from ELF_MACHINES
-         * (axx.py port: single source of truth, see its definition above). */
+            idx--;
         const ElfMachineInfo *_mtbl_ext = elf_machine_find(st->elf_machine);
         int reloc_type = _mtbl_ext ? _mtbl_ext->extern_default : 2;
         if(idx+1 < blen && buf[idx]==':' && buf[idx+1]==':'){
@@ -6936,7 +4924,6 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
             if(rt_len > 0 && rt_len < (int)sizeof(rt_str)-1){
                 memcpy(rt_str, buf+rt_start, (size_t)rt_len);
                 rt_str[rt_len]=0;
-                /* lower-case for comparison */
                 for(int _ci=0;rt_str[_ci];_ci++)
                     if(rt_str[_ci]>='A'&&rt_str[_ci]<='Z') rt_str[_ci]+=32;
                 int rtype = elf_machine_named(_mtbl_ext, rt_str);
@@ -6948,38 +4935,10 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
             }
         }
         if(idx < blen && buf[idx]==':') idx++;
-        /* Bugfix (axx.py port): the previous check only distinguished
-         * "locally defined" (is_imported==0) from everything else, so a
-         * label already registered by a `-i` import (is_imported==1, with
-         * a real non-zero value from imp_label()) fell into the same
-         * "not locally defined" branch as a genuinely-never-seen label and
-         * got re-registered via lmap_set_imported() with value u256_zero(),
-         * silently clobbering the imported value back to 0 -- the exact
-         * split-build workflow (`-i impfile.tsv` + `.EXTERN` for the same
-         * names) the import file's own comment ("for split builds") exists
-         * for. axx.py's extern_processing() avoids this by branching on
-         * three states (never seen / already imported / locally defined)
-         * instead of two; mirror that here: only a never-seen label gets
-         * value-initialized, an already-imported label only has its
-         * reloc_type possibly updated (value untouched), and a locally
-         * defined label is left alone entirely (matching axx.py, which
-         * does not update reloc_type_override for non-imported labels). */
         LabelEntry *existing=lmap_find(&st->labels,s);
         if(!existing){
             lmap_set_imported(&st->labels, s, u256_zero(), ".text", reloc_type);
         } else if(existing->is_imported){
-            /* axx.py port: extern_processing() only overwrites an already-
-             * present reloc-type slot (`len(existing) >= 5`). For a label
-             * that was `-i`-imported via a plain (no `::type`) TSV line,
-             * imp_label() never appended that 5th list element, so even an
-             * explicit `.EXTERN label::type` here is a silent no-op for
-             * such a label -- verified against axx.py directly (an
-             * `::plt32` override on a plain-imported label is dropped;
-             * the same override on a never-before-seen label applies
-             * normally). Mirror this exactly rather than "fixing" it into
-             * applying unconditionally: only update reloc_type_override
-             * if it is already >= 0 (set by an earlier `::type`, on the
-             * `-i` line itself or a still-earlier `.EXTERN`). */
             if(reloc_type >= 0 && existing->reloc_type_override >= 0)
                 existing->reloc_type_override = reloc_type;
         }
@@ -6989,26 +4948,6 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
     return 1;
 }
 
-/* axx.py reloctype_processing() port:
- * .RELOCTYPE name8,name16,name32,name64
- * Overrides, per encoded-field byte width, the default relocation type
- * that the auto-detect path (RTYPE_FOR() / elf_machine_width_guess())
- * picks for a label reference with no explicit `::reloctype` suffix on its
- * own label (that per-label form is still `.EXTERN`/`.EQU ::reloctype`).
- *
- * The four comma-separated positions correspond, in order, to encoded
- * field widths of 1, 2, 4, and 8 bytes. Fewer than four may be given, and a
- * blank position (two consecutive commas, or a trailing comma) leaves that
- * width's mapping untouched -- e.g. `.reloctype ,,,abs64` only changes the
- * 8-byte width. Each name must be registered for the target machine
- * (the same set `.EXTERN`/`.EQU` accept) and its registered width must
- * match the position it's given in; otherwise it's rejected with a warning
- * and that position keeps its previous mapping (built-in default, or an
- * earlier `.reloctype` for the same width). Repeated `.RELOCTYPE`
- * directives accumulate: only the widths named in the latest directive are
- * touched. This is a whole-file, order-independent setting, like axx.py's
- * counterpart -- it applies to every subsequent auto-detected relocation
- * for the rest of the assembly (both passes) until changed again. */
 static int adir_reloctype(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
@@ -7038,7 +4977,6 @@ static int adir_reloctype(Assembler *asmb, const char *l, const char *l2){
         }
 
         char name[64]={0};
-        /* trim surrounding spaces/tabs, lower-case, bounds-checked copy */
         int a=tok_start, b=idx;
         while(a<b && (buf[a]==' '||buf[a]=='\t')) a++;
         while(b>a && (buf[b-1]==' '||buf[b-1]=='\t')) b--;
@@ -7071,51 +5009,20 @@ static int adir_reloctype(Assembler *asmb, const char *l, const char *l2){
 
         pos++;
         if(idx>=blen) break;
-        idx++;  /* skip ',' */
+        idx++;
     }
     return 1;
 }
 
-/* =========================================================
- * Main assembly loop
- * ========================================================= */
-/* =========================================================
- * 順序非依存パターン選択 (order-independent pattern matching)
- *
- * 旧実装は「ファイル中で最初にマッチしたパターン」を採用していたため、
- * LD A,(HL) / LD A,r / LD A,!e のようなパターン群はファイル内の出現順に
- * 依存していた（例: LD A,!e が先にあると LD A,(HL) の (HL) が式として
- * 捕捉されてしまう）。
- *
- * 新実装は全パターンを走査し、マッチしたものの中から具体度スコア
- *     (式キャプチャ数, シンボルキャプチャ数, -リテラル一致文字数)
- * が最小（=最も具体的）なパターンを採用する。優先順位は
- *     リテラル完全一致 > シンボル(小文字)一致 > 式キャプチャ(!e等)
- * となり、同点の場合はファイル内で先に出現したパターンを採用する
- * （従来動作との互換性を保つ）。
- *
- * ディレクティブ (.setsym / .check / .bits 等) はファイル順に効果を持つ
- * ため走査中は従来通り逐次適用し、マッチ成功時点のディレクティブ状態を
- * BestMatch にスナップショットとして保存する。採用パターンのオブジェクト
- * 生成は走査完了後にそのスナップショットを復元してから行うので、
- * 「そのパターン位置までのディレクティブが適用された状態で生成する」
- * という従来のセマンティクスが保たれる。
- *
- * 注: すべてファイルスコープの static 関数で実装する（ネスト関数不使用）。
- * ========================================================= */
 typedef struct {
     int       valid;
     int       score_expr, score_sym, score_lit;
     int       pln;
     PatEntry *pat;
-    /* マッチで確定したキャプチャ変数 */
     PatVar    vars[26];
-    /* マッチ中に追加された ELF 参照の差分（name は strdup 所有） */
     struct { char *name; uint64_t val; int word_idx; } *refs;
     int       refs_len;
-    /* elf_var_to_label のスナップショット（label_name は strdup 所有） */
     struct { int set; char *label_name; uint64_t label_val; } vtl[26];
-    /* --- このパターン位置までのディレクティブ状態 --- */
     SymMap    symbols;
     StrVec    check_constraints[26];
     char      swordchars[256];
@@ -7125,16 +5032,8 @@ typedef struct {
     int       vliwbits, vliwinstbits, vliwtemplatebits, vliwflag;
     IntVec    vliwnop;
     VliwSet   vliwset;
-    /* Bugfix (axx.py port): a !x-captured pattern variable's value is
-     * computed once during THIS trial match (label_get_value() calls
-     * happen inside pat_match0() above, not later), so if that capture
-     * referenced an undefined label, this flag is the only record of it.
-     * Without saving/restoring it here, it was always discarded before
-     * the real makeobj() call and the final "Undefined label in
-     * expression" check downstream could ever see it. */
     int       error_undefined_label;
 
-    /* この候補がマッチ試行中に出した診断（勝ったときだけ再生する）。 */
     char    **diags;
     int      *diag_seterr;
     int       diags_len;
@@ -7159,16 +5058,12 @@ static void best_free(BestMatch *b){
     memset(b, 0, sizeof(*b));
 }
 
-/* スコア (e1,-l1,s1) < (e2,-l2,s2) の辞書式比較。1 なら左辺がより具体的。
- * 修正: リテラル一致文字数をシンボル数より優先する (axx.py と同期)。 */
 static int score_less(int e1,int s1,int l1, int e2,int s2,int l2){
     if(e1 != e2) return e1 < e2;
-    if(l1 != l2) return l1 > l2;   /* リテラル一致文字数は多いほど具体的 */
+    if(l1 != l2) return l1 > l2;
     return s1 < s2;
 }
 
-/* 現在のマッチ結果とディレクティブ状態を best にスナップショットする。
- * saved_refs_len はマッチ試行直前の elf_refs_len（差分抽出用）。 */
 static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
                          int saved_refs_len){
     best_free(b);
@@ -7181,7 +5076,6 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
     b->error_undefined_label = st->error_undefined_label;
     memcpy(b->vars, st->vars, sizeof(b->vars));
 
-    /* マッチで追加された ELF 参照の差分を複製 */
     b->refs_len = st->elf_refs_len - saved_refs_len;
     b->refs = NULL;
     if(b->refs_len > 0){
@@ -7194,14 +5088,12 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
             b->refs[i].word_idx = st->elf_refs[saved_refs_len+i].word_idx;
         }
     }
-    /* elf_var_to_label のスナップショット */
     for(int i=0;i<26;i++){
         b->vtl[i].set       = st->elf_var_to_label[i].set;
         b->vtl[i].label_val = st->elf_var_to_label[i].label_val;
         b->vtl[i].label_name = st->elf_var_to_label[i].label_name
                                ? strdup(st->elf_var_to_label[i].label_name) : NULL;
     }
-    /* ディレクティブ状態 */
     smap_init(&b->symbols);
     for(int bi=0; bi<st->symbols.nb; bi++)
         for(SymEntry *e=st->symbols.buckets[bi]; e; e=e->next)
@@ -7227,7 +5119,6 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
                  st->vliwset.data[i].nidxs, st->vliwset.data[i].templ);
 }
 
-/* best に保存したディレクティブ状態を st に復元する。 */
 static void best_restore_dirstate(AsmState *st, const BestMatch *b){
     smap_clear(&st->symbols);
     for(int bi=0; bi<b->symbols.nb; bi++)
@@ -7253,7 +5144,6 @@ static void best_restore_dirstate(AsmState *st, const BestMatch *b){
                  b->vliwset.data[i].nidxs, b->vliwset.data[i].templ);
 }
 
-/* st->elf_refs に1件追加する（name は strdup 複製）。 */
 static void elf_refs_push_copy(AsmState *st, const char *name,
                                uint64_t val, int word_idx){
     if(st->elf_refs_len >= st->elf_refs_cap){
@@ -7268,14 +5158,6 @@ static void elf_refs_push_copy(AsmState *st, const char *name,
     st->elf_refs_len++;
 }
 
-/* 事前フィルタ: パターン先頭のリテラル大文字列（ニーモニック部）が
- * 入力行と一致するかを判定する。pat_match() の大文字分岐は
- * 「パターンの大文字は入力と大文字小文字を無視して完全一致、空白は
- * 両側で読み飛ばし」なので、この前置部分が一致しないパターンは
- * pat_match0() を呼ぶまでもなく不成立と判定できる
- * （結果を変えない純粋な高速化）。
- * 大文字・空白以外の文字（!, 小文字, 記号, [[ 等）が現れた時点で
- * 前置部分を打ち切る。前置部分が空ならフィルタ不可として 1 を返す。 */
 static int pat_prefix_matches(const char *pat, const char *lin){
     char pfx[64];
     int np = 0;
@@ -7284,7 +5166,7 @@ static int pat_prefix_matches(const char *pat, const char *lin){
         else if(*p == ' ') continue;
         else break;
     }
-    if(np == 0) return 1;   /* フィルタ不可: 常に pat_match0 を試行 */
+    if(np == 0) return 1;
     int k = 0;
     for(const char *q = lin; *q; q++){
         if(*q == ' ') continue;
@@ -7292,7 +5174,7 @@ static int pat_prefix_matches(const char *pat, const char *lin){
         k++;
         if(k == np) return 1;
     }
-    return 0;   /* 入力行が前置部分より短い */
+    return 0;
 }
 
 static int lineassemble2(Assembler *asmb, const char *line, int idx,
@@ -7316,11 +5198,6 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(adir_resd(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_resq(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_zero(asmb,l,l2)){ *idx_out=idx; return 1; }
-    /* Bugfix (axx.py port): axx.py dispatches on the directive name and, when
-     * the string argument does not parse, reports
-     * "  error - .ASCII: failed to process string argument: '...'".  Falling
-     * through to the generic "Syntax error" here left the two implementations
-     * with different diagnostics for the same input. */
     {
         char _adup[16]; axx_strupr_to(_adup,l,sizeof(_adup));
         if(strcmp(_adup,".ASCII")==0){
@@ -7342,29 +5219,12 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
       if(strcmp(up,".INCLUDE")==0){
           char raw[512]; axx_get_string(l2,raw,sizeof(raw));
           if(raw[0]){
-              /* Resolve relative path against the currently assembling file.
-               * Mirrors axx.py include_asm():
-               *   if not os.path.isabs(s):
-               *       base = os.path.dirname(os.path.abspath(cur))
-               *       s = os.path.join(base, s)  */
               char resolved[1024];
               const char *cur = st->current_file;
-              /* 破綻点修正 (axx.py port): raw(インクルード対象)が特殊
-               * マーカー文字列"stdin"そのものである場合、fileassemble()が
-               * fn=="stdin"を厳密一致で見て標準入力を読み込む特別扱いを
-               * するためのリテラルマーカーであり、実在するファイルパス
-               * ではない。base_dirと結合してしまうと厳密一致が壊れ、
-               * 存在しないファイルを開こうとして失敗していた。 */
               if(strcmp(raw,"stdin")==0){
                   strncpy(resolved, raw, sizeof(resolved)-1);
                   resolved[sizeof(resolved)-1]='\0';
               } else if(cur && cur[0] && strcmp(cur,"(stdin)")!=0 && strcmp(cur,"stdin")!=0){
-                  /* Fix: axx.py uses os.path.dirname(os.path.abspath(cur)),
-                   * i.e. an ABSOLUTE base directory; this used the raw
-                   * (usually relative) name, so the resolved path -- which
-                   * ends up in diagnostics and in the .INCLUDE cycle stack --
-                   * read "./nosuch.s" where axx.py said "/full/path/nosuch.s".
-                   * Same file either way, different message text. */
                   char abs_buf[1024], dir_buf[1024];
                   if(cur[0]=='/'){
                       strncpy(abs_buf, cur, sizeof(abs_buf)-1);
@@ -7396,20 +5256,14 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(adir_reloctype(asmb,l,l2)){ *idx_out=idx; return 1; }
     if(adir_export(asmb,l,l2)){ *idx_out=idx; return 1; }
 
-    /* 撤廃: ソース側(.sファイル)からの.setsym/.clearsymは廃止した。
-     * シンボル(レジスタ名等のエンコード値)はパターンファイル(.axx)側
-     * でのみ定義するものとし、ソース側からの上書きは受け付けない。
-     * ソース中に.setsym/.clearsymと書いても、以下のパターンマッチング
-     * ループに委ねられ、該当パターンが無いため通常の
-     * 未知命令/構文エラーとして報告される。 */
 
     if(!l[0]){ *idx_out=idx; return 0; }
 
     int se=0, oerr=0, pln=0;
     int idxs_val=0;
     int loopflag=1;
-    PatEntry *oerr_entry=NULL;   /* pattern entry that caused oerr */
-    int hit_sentinel=0;          /* 番兵エントリ f[0]=="" に到達したか */
+    PatEntry *oerr_entry=NULL;
+    int hit_sentinel=0;
     BestMatch best;
     best_init(&best);
 
@@ -7431,21 +5285,12 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         int lw=0; for(int fi=0;fi<PAT_FIELDS;fi++) if(i->f[fi][0]) lw++;
         if(lw==0) continue;
 
-        /* Fix: l2(オペランド部)が空のとき "%s %s" は末尾に余分な空白を
-         * 残してしまい、空白の有無を厳密に見るようになった pat_match() で
-         * 「NOP」のようなオペランド無しパターンが不一致になってしまう。
-         * l2が空の場合は区切りの空白を入れない(axx.py側と同期)。 */
         char lin[8192];
         if(l2[0]) snprintf(lin,sizeof(lin),"%s %s",l,l2);
         else      snprintf(lin,sizeof(lin),"%s",l);
         axx_reduce_spaces(lin);
 
         if(!i->f[0][0]){
-            /* 番兵エントリ: パターン走査の終端。
-             * f[3] にはVLIWスロットインデックス式が入っているため、
-             * マッチが1つも無い場合はここで必ず評価する。
-             * マッチ済み (best.valid) の場合は採用パターンの f[3] を
-             * 生成ステージで評価するのでここでは評価しない。 */
             hit_sentinel=1;
             if(!best.valid){
                 int io2;
@@ -7455,15 +5300,11 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
             break;
         }
 
-        /* 事前フィルタ: 先頭ニーモニック不一致のパターンはスキップする
-         * （結果は変わらない・高速化のみ）。 */
         if(!pat_prefix_matches(i->f[0], lin)) continue;
 
         st->error_undefined_label=0;
         st->expmode=EXP_ASM;
 
-        /* マッチ試行の副作用（キャプチャ変数・ELF追跡状態）を
-         * 巻き戻せるよう保存する。 */
         PatVar    saved_vars[26];
         memcpy(saved_vars, st->vars, sizeof(saved_vars));
         int saved_refs_len = st->elf_refs_len;
@@ -7476,23 +5317,19 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
                                        : NULL;
         }
 
-        /* パターンマッチ試行中はラベル未定義エラーの表示を抑制する。
-         * (例: OUT (!n),A が OUT (C),E を試みると !n キャプチャで
-         *  C がラベルとして評価され false-positive エラーが出る。) */
         st->in_match_attempt = 1;
         diag_capture_begin(st);
         int _match_ok = pat_match0(asmb,lin,i->f[0]);
         st->in_match_attempt = 0;
         char **_cand_diags = NULL; int *_cand_seterr = NULL; int _cand_ndiag = 0;
         diag_capture_take(st, &_cand_diags, &_cand_seterr, &_cand_ndiag);
-        if(!_match_ok){                     /* 落選候補の診断は捨てる */
+        if(!_match_ok){
             for(int di=0; di<_cand_ndiag; di++) free(_cand_diags[di]);
             free(_cand_diags); free(_cand_seterr);
             _cand_diags = NULL; _cand_seterr = NULL; _cand_ndiag = 0;
         }
 
         if(_match_ok){
-            /* より具体的なマッチなら候補を更新する（同点は先出現優先）。 */
             if(!best.valid ||
                score_less(st->match_score_expr, st->match_score_sym,
                           st->match_score_lit,
@@ -7506,8 +5343,6 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
             for(int di=0; di<_cand_ndiag; di++) free(_cand_diags[di]);
             free(_cand_diags); free(_cand_seterr);
             _cand_diags = NULL; _cand_seterr = NULL; _cand_ndiag = 0;
-            /* 副作用を巻き戻して走査を継続する
-             * （より具体的なパターンが後方にあるかもしれない）。 */
             memcpy(st->vars, saved_vars, sizeof(saved_vars));
             for(int ri2=saved_refs_len; ri2<st->elf_refs_len; ri2++)
                 free(st->elf_refs[ri2].name);
@@ -7517,31 +5352,22 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
                 st->elf_var_to_label[vi].set        = saved_vtl[vi].set;
                 st->elf_var_to_label[vi].label_val  = saved_vtl[vi].label_val;
                 st->elf_var_to_label[vi].label_name = saved_vtl[vi].label_name;
-                saved_vtl[vi].label_name = NULL;   /* 所有権移動 */
+                saved_vtl[vi].label_name = NULL;
             }
             st->error_undefined_label=0;
 
-            /* 最適化: リテラルのみのマッチ (式・シンボルキャプチャ 0) は
-             * これ以上具体的なパターンが存在し得ないため走査を打ち切る。
-             * （同一行にマッチするリテラルのみのパターン同士は
-             *   リテラル一致文字数も必ず等しいので、先出現優先も保たれる。）*/
             if(best.score_expr==0 && best.score_sym==0) break;
         } else {
-            /* pat_match0 は失敗時に内部で状態を復元済み。
-             * 保存用に複製した label_name を解放する。 */
             for(int vi=0;vi<26;vi++) free(saved_vtl[vi].label_name);
             st->error_undefined_label=0;
         }
     }
 
-    /* ---- 採用パターンでのオブジェクト生成ステージ ---- */
     if(best.valid){
         PatEntry *i = best.pat;
         pln = best.pln;
         loopflag = 0;
 
-        /* マッチ成功時点のディレクティブ状態・キャプチャ変数・
-         * ELF追跡状態を復元する。 */
         best_restore_dirstate(st, &best);
         memcpy(st->vars, best.vars, sizeof(st->vars));
         for(int ri2=0; ri2<best.refs_len; ri2++)
@@ -7555,34 +5381,24 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
                                                   ? strdup(best.vtl[vi].label_name)
                                                   : NULL;
         }
-        /* Bugfix (axx.py port): restore (not hard-reset) so a !x-captured
-         * pattern variable's undefined-label status from the winning
-         * trial match (saved on `best` above) survives into the probe/
-         * real makeobj() calls below instead of being discarded here. */
         st->error_undefined_label = best.error_undefined_label;
-        /* 勝った候補がマッチ試行中に出した診断をここで再生する。 */
         diag_replay(st, best.diags, best.diag_seterr, best.diags_len);
         st->expmode = EXP_ASM;
 
-        /* $$/$. のために命令先頭・末尾アドレスを事前確定する。
-         * error条件式 i->f[1] でも $. を参照できるよう dir_error() より前に実施。 */
         st->pc_instr_start = st->pc;
-        st->pc_instr_end   = st->pc_instr_start;  /* プローブ中の暫定値 */
+        st->pc_instr_end   = st->pc_instr_start;
         {
             int _probe_sm_saved  = st->pass1_size_mode;
             int _probe_refs_len  = st->elf_refs_len;
             int _probe_widx_saved = st->elf_current_word_idx;
             st->pass1_size_mode = 1;
             IntVec _probe_objl; iv_init(&_probe_objl);
-            /* プローブ中はerror_undefined_labelが汚染しないよう保護 */
             int _probe_err_undef_saved = st->error_undefined_label;
             st->error_undefined_label = 0;
             makeobj(asmb, i->f[2], &_probe_objl);
-            /* pc_instr_end = 命令先頭 + 命令バイト数 */
             uint256_t _probe_sz = u256_from_i64((int64_t)_probe_objl.len);
             st->pc_instr_end = u256_add(st->pc_instr_start, _probe_sz);
             iv_free(&_probe_objl);
-            /* ELFトラッキング状態をプローブ前に巻き戻す */
             for(int ri2=_probe_refs_len; ri2<st->elf_refs_len; ri2++)
                 free(st->elf_refs[ri2].name);
             st->elf_refs_len        = _probe_refs_len;
@@ -7590,15 +5406,9 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
             st->pass1_size_mode     = _probe_sm_saved;
             st->error_undefined_label = _probe_err_undef_saved;
         }
-        /* Fix 10 (axx.py): only call makeobj when dir_error did NOT trigger.
-         * Previously makeobj always ran even if an .error condition fired. */
         int err_triggered = dir_error(asmb,i->f[1]);
         if(!err_triggered){
-            /* pc_instr_start は上のプローブブロックで設定済み */
             makeobj(asmb,i->f[2],objl_out);
-            /* Pass1ではmakeobj内でpass1_size_modeを使うため、
-             * ここでのretryは不要。error_undefined_labelはmakeobj内でクリア済み。
-             * Pass2: if makeobj produced undefined label, that's a hard error */
             if(st->pas==2 && st->error_undefined_label){
                 oerr=1;
                 oerr_entry=i;
@@ -7612,8 +5422,6 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
             idxs_val=(int)u256_to_i64(idxv);
         }
     } else if(hit_sentinel){
-        /* 番兵に到達し、かつ何もマッチしなかった。
-         * 従来通り構文エラーとはせず、番兵で評価した idxs を返す。 */
         loopflag=0;
     }
     best_free(&best);
@@ -7621,16 +5429,6 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     if(loopflag){ se=1; pln=0; }
 
     if(should_report_errors(st)){
-        /* Bugfix (axx.py port): each of these three conditions must abort
-         * this line (return 0) the same way `oerr` below already does.
-         * Previously only `oerr` returned early; the undefined-label and
-         * syntax-error branches printed their message but then fell through
-         * to the success path at the bottom of this function, so the caller
-         * (lineassemble()) treated the line as successfully assembled --
-         * e.g. a genuinely undefined label reference (reachable in
-         * interactive/pas==0 mode, where the pas==2-gated oerr conversion
-         * below never triggers) printed "Undefined label" yet still
-         * returned 1 with whatever bytes makeobj() happened to produce. */
         if(st->error_undefined_label){
             axx_diagf(1, 0, " error - Undefined label in expression.  [%s:%d]\n",
                        st->current_file, (int)st->ln);
@@ -7642,9 +5440,6 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
             *idx_out=idx; return 0;
         }
         if(oerr){
-            /* Mirrors Python:
-             *   print(f" ; pat {pln} {pl} error - Illegal syntax in assemble line or pattern line.")
-             * pl is the PatEntry (list of 6 strings). */
             fprintf(stderr, " ; pat %d ['%s', '%s', '%s', '%s', '%s', '%s'] error - Illegal syntax in assemble line or pattern line.\n",
                    pln,
                    oerr_entry ? oerr_entry->f[0] : "",
@@ -7664,32 +5459,29 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     return 1;
 }
 
-/* =========================================================
- * ELF relocation reference type and comparator.
- *
- * Fix (new): the original code defined both the typedef and the comparator
- * as a GCC nested function inside lineassemble().  This is:
- *   (a) non-standard C (GCC extension only – Clang/MSVC reject it), and
- *   (b) using subtraction for comparison, which overflows when one word_idx
- *       is large-positive and the other is large-negative (same class of
- *       bug as the int_cmp() fix K).
- *
- * Fix: promote the typedef to file scope and provide a proper static
- * comparator using the branchless 3-way pattern already used by int_cmp().
- * ========================================================= */
 typedef struct { const char *name; uint64_t val; int word_idx; } ElfRef;
 
 static int elf_ref_cmp(const void *a, const void *b){
     int ia = ((const ElfRef *)a)->word_idx;
     int ib = ((const ElfRef *)b)->word_idx;
-    return (ia > ib) - (ia < ib);   /* branchless 3-way; no overflow */
+    return (ia > ib) - (ia < ib);
 }
 
+/* ソース1行を処理する主関数。
+ *
+ *   1. タブ・改行の正規化 → コメント除去 → `\!` エスケープ解決
+ *   2. 行頭の `label:` / `.EQU` を処理
+ *   3. VLIW スロット数を数える
+ *   4. lineassemble2() でパターン照合とエンコードを行う
+ *   5. VLIW 継続なら vliwprocess() へ、そうでなければバイト列を出力
+ *   6. パス2かつ -o なら、この命令ぶんの ELF リロケーションを確定させる
+ *
+ * リロケーションは、式評価中に集めた (ラベル名, 生値, ワード番号) の並びを、
+ * 同じラベルへの連続参照ごとにまとめて1件にし、加数を
+ * 「生値 - 対象フィールドの絶対位置 [+ PC相対なら命令アドレス]」で求める。 */
 static int lineassemble(Assembler *asmb, const char *line_in){
     AsmState *st=&asmb->st;
 
-    /* Fix P7c: replace fixed char line[4096] with a heap-allocated copy so
-     * that source lines longer than 4095 bytes are not silently truncated.  */
     size_t lin_len = strlen(line_in);
     char *line = malloc(lin_len + 2);
     if(!line){ perror("malloc"); return 0; }
@@ -7699,21 +5491,8 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     axx_reduce_spaces(line);
     axx_remove_comment_asm(line);
     if(!line[0]){ free(line); return 0; }
-    /* Resolve '\!' escapes and replace genuine "!!"/"!!!!" VLIW separators
-     * with sentinels -- see axx_resolve_vliw_escapes()'s comment for why
-     * this must happen once, up front, rather than by each of the several
-     * places below that check for a VLIW boundary independently checking
-     * for raw "!!" text themselves. Safe in this same (never-growing)
-     * buffer: axx_remove_comment_asm() and axx_resolve_vliw_escapes() are
-     * both length-preserving-or-shrinking in-place compactions. */
     axx_resolve_vliw_escapes(line);
 
-    /* アセンブリ行を1行処理するたびに .check 拘束条件を全解除する。
-     * パターンファイルの .check ディレクティブはパターン走査ループ
-     * (lineassemble2 内のパターン探索) の中で再登録される。行ごとに
-     * ここでクリアしておくことで、パターン走査が当該行のために再登録した
-     * .check 拘束のみが有効になり、前行の走査で蓄積された残留拘束が
-     * 次行へ持ち越されない。 */
     for(int _ci = 0; _ci < 26; _ci++){
         sv_free(&asmb->st.check_constraints[_ci]);
         sv_init(&asmb->st.check_constraints[_ci]);
@@ -7724,55 +5503,52 @@ static int lineassemble(Assembler *asmb, const char *line_in){
         for(SymEntry *se=asmb->st.patsymbols.buckets[pi]; se; se=se->next)
             smap_set(&asmb->st.symbols, se->key, se->val);
 
-    /* Fix P7d: replace fixed char processed[4096] with a heap buffer.
-     * adir_label_processing output is at most strlen(line)+1 bytes.          */
     char *processed = malloc(lin_len + 2);
     if(!processed){ perror("malloc"); free(line); return 0; }
     adir_label_processing(asmb, line, processed, lin_len + 2);
     free(line);
 
-    /* Fix P10: warn when PC exceeds the uint64_t range used by BufMap.
-     *
-     * Fix (axx.py port): this used to be a *warning* only, so the pc was
-     * silently truncated to its low 64 bits and assembly carried on -- for
-     * ".org 1<<70" the truncated position wrapped to 0 and caxx cheerfully
-     * wrote a 1-byte file and exited 0, where axx.py refused with
-     * "output size ... exceeds maximum 1073741824".  Anything past
-     * _MAX_OUTPUT_BYTES cannot produce a valid file either way, so raise it
-     * to an error with axx.py's wording (the size is computed from the full
-     * 256-bit pc, which is why it is not just a binary_flush() check: by
-     * then the position has already been truncated). */
     if(st->pc.w[1]||st->pc.w[2]||st->pc.w[3]){
-        /* Record the largest out-of-range pc seen; binary_flush() reports it.
-         * axx.py raises this from BinaryWriter.flush(), after assembly has
-         * finished, so reporting it here would put the message (and the
-         * "Aborting: no output file written." footer) in a different place
-         * in the output. */
         if(!st->pc_overflow_set || u256_gt_signed(st->pc, st->pc_overflow_max)){
             st->pc_overflow_max = st->pc;
             st->pc_overflow_set = 1;
         }
     }
 
-    /* Fix: vcnt !! counting must ignore !! inside double-quoted strings and
-     * single-quote char literals. Mirrors axx.py lineassemble() Bugfix L/L2/L3.
-     * Bugfix (axx.py port): now counts the VLIW_SEP_CHAR/VLIW_STOP_CHAR
-     * sentinels instead of scanning for raw "!!" text -- axx_resolve_vliw_
-     * escapes() has already told genuine separators (now sentinels) apart
-     * from a resolved "\!\!" escape (now bare, literal "!!" text) earlier
-     * in the pipeline, so this no longer needs its own quote-tracking
-     * (sentinels never appear inside quotes/char-literals in the first
-     * place) and, critically, no longer risks re-matching a resolved
-     * escaped "!!" as a phantom separator. */
+    /* VLIW スロット数を数える。
+     * 番兵の判定は引用符・文字リテラルの外だけで行う（理由は
+     * axx_get_param_to_spc() のコメントを参照）。 */
     {
         int _vcnt = 0;
         int _has_content = 0;
-        for(const char *_pp = processed; *_pp; _pp++){
-            if(*_pp == VLIW_SEP_CHAR || *_pp == VLIW_STOP_CHAR){
-                if(_has_content){ _vcnt++; _has_content = 0; }
+        int _in_dq = 0;
+        const char *_pp = processed;
+        while(*_pp){
+            char _c = *_pp;
+            if(_c == '\\' && _in_dq){
+                _pp++;
+                if(*_pp) _pp++;
+                _has_content = 1;
                 continue;
             }
-            if(*_pp != ' ') _has_content = 1;
+            if(_c == '"'){
+                _in_dq = !_in_dq;
+                _pp++; _has_content = 1;
+                continue;
+            }
+            if(_c == '\'' && !_in_dq){
+                if(_pp[1] == '\\' && _pp[2] && _pp[3] == '\''){ _pp += 4; _has_content = 1; continue; }
+                else if(_pp[1] && _pp[2] == '\''){ _pp += 3; _has_content = 1; continue; }
+                _pp++; _has_content = 1;
+                continue;
+            }
+            if(!_in_dq && (_c == VLIW_SEP_CHAR || _c == VLIW_STOP_CHAR)){
+                if(_has_content){ _vcnt++; _has_content = 0; }
+                _pp++;
+                continue;
+            }
+            if(_c != ' ') _has_content = 1;
+            _pp++;
         }
         if(_has_content) _vcnt++;
         st->vcnt = _vcnt ? _vcnt : 1;
@@ -7803,53 +5579,20 @@ static int lineassemble(Assembler *asmb, const char *line_in){
 
     const char *rest=processed+new_idx;
     while(*rest==' ') rest++;
-    /* Bugfix (axx.py port): checks the VLIW_SEP_CHAR/VLIW_STOP_CHAR
-     * sentinel instead of raw "!!" text -- see axx_resolve_vliw_escapes(). */
     int is_vliw_cont=(st->vliwflag && (rest[0]==VLIW_SEP_CHAR||rest[0]==VLIW_STOP_CHAR));
 
     if(!is_vliw_cont){
-        /* ELF relocation detection (tracking method)
-         * Use word_idx recorded during makeobj()/expr_factor1() to locate each
-         * label reference precisely.  No binary scanning – no false positives.
-         *
-         * Architecture-specific default relocation type table (machine → nbytes → rtype):
-         *   EM_X86_64(62) : 8→R_X86_64_64(1)   4→R_X86_64_PC32(2)   2→R_X86_64_16(12)  1→R_X86_64_8(14)
-         *   EM_386(3)     : 4→R_386_PC32(2)     2→R_386_16(20)       1→R_386_8(22)
-         *   EM_ARM(40)    : 4→R_ARM_REL32(3)    2→R_ARM_ABS16(4)     1→R_ARM_ABS8(8)
-         *   EM_AARCH64(183): 8→R_AARCH64_ABS64(257) 4→R_AARCH64_PREL32(261) 2→R_AARCH64_PREL16(262)
-         *   EM_RISCV(243) : 8→R_RISCV_64(2)    4→R_RISCV_32(1)      2→R_RISCV_ADD16(34) 1→R_RISCV_ADD8(33)
-         *   EM_PPC(20)    : 4→R_PPC_REL32(26)  2→R_PPC_ADDR16(4)
-         *   fallback      : 8→1  4→2  2→3  1→4
-         *
-         * 4-byte default is PC-relative for x86-64/i386/ARM/AArch64/PPC because
-         * CALL/JMP/BL are the dominant 4-byte symbol references in code sections.
-         * Use .EXTERN label::abs32 (or abs32s/abs64 etc.) to force absolute. */
         if(st->elf_objfile[0] && st->pas==2 && objl.len>0 && st->elf_refs_len>0){
             int bpw = (st->bts+7)/8; if(bpw<1) bpw=1;
             const char *sec_name = st->current_section;
             SecEntry *_rse = secmap_find(&st->sections, sec_name);
-            /* 破綻点修正 (axx.py port): 以前は sec_start をこのセクションの
-             * 「最初の訪問の開始pc」とし、sec_rel = pc - sec_start として
-             * いた。これはセクションに複数回出入りする(.text→.data→.text等)
-             * と、2回目以降の訪問のオフセットが正しく計算できない(間に
-             * 挟まった他セクションのぶんだけずれる)。現在オープン中の訪問
-             * より前に完了した訪問の累積ワード数(_rse->size、離脱時に
-             * 加算済み)に、今回の訪問内でのオフセット(pc - entry_pc)を
-             * 足すことで、断片を跨いだ正しいセクション内相対位置を計算する。 */
             uint64_t sec_completed_words = _rse ? u256_to_u64(_rse->size) : 0;
             uint64_t sec_entry_pc_cur    = _rse ? u256_to_u64(_rse->entry_pc) : 0;
             uint64_t cur_pc    = u256_to_u64(st->pc);
 
-        /* Per-machine rtype lookup: ELF_MACHINES' width_guess (axx.py port,
-         * see ELF_MACHINES' definition above -- single source of truth,
-         * replacing what used to be a table hand-duplicated at this call
-         * site). 4-byte is PC-relative (CALL/JMP主流) for most
-         * architectures; absolute variants: use .EXTERN label::abs32 /
-         * ::abs64 etc. to force. */
             const ElfMachineInfo *_mtbl_rm = elf_machine_find(st->elf_machine);
             #define RTYPE_FOR(nb) reloctype_for(st, _mtbl_rm, (nb))
 
-            /* collect refs with valid word_idx (>= 0), sort by word_idx */
             ElfRef *_valid = (ElfRef*)malloc((size_t)st->elf_refs_len * sizeof(ElfRef));
             if(!_valid){perror("malloc");exit(1);}
             int _nvalid = 0;
@@ -7859,21 +5602,8 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                                               st->elf_refs[_ri].val,
                                               st->elf_refs[_ri].word_idx};
             }
-            /* sort by word_idx – use file-scope elf_ref_cmp (branchless, standard C) */
             qsort(_valid, (size_t)_nvalid, sizeof(ElfRef), elf_ref_cmp);
 
-            /* Bugfix (axx.py port): the same label can be captured into the
-             * same output word twice (e.g. two pattern variables both bound
-             * to the same source operand, as in a hypothetical "DIFF L,L").
-             * Left unchecked, both identical (name, word_idx) entries survive
-             * here and the grouping loop below -- which only extends a group
-             * when the NEXT entry's word_idx is exactly one past the
-             * previous -- ends up forming two separate single-word groups
-             * both anchored at the same word_idx, emitting a duplicate/
-             * non-conformant .rela entry at the same offset. De-duplicate
-             * exact (name, word_idx) repeats first, keeping only the first
-             * occurrence (array is already sorted by word_idx, so repeats
-             * for the same label are adjacent). */
             {
                 int _w2 = 0;
                 for(int _r2 = 0; _r2 < _nvalid; _r2++){
@@ -7887,7 +5617,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                 _nvalid = _w2;
             }
 
-            /* group consecutive same-label refs into one relocation entry */
             int _gi = 0;
             while(_gi < _nvalid){
                 const char *_lname = _valid[_gi].name;
@@ -7899,32 +5628,17 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     _gj++;
                 int _nwords = _gj - _gi;
                 int _nbytes = _nwords * bpw;
-                /* axx.py: check .EXTERN reloc_type_override first, then fall back to default */
                 int _rtype = 0;
                 int _rtype_is_default_guess = 0;
                 {
                     LabelEntry *_le = lmap_find(&st->labels, _lname);
                     if(_le && _le->reloc_type_override >= 0){
                         int _rt_ov = _le->reloc_type_override;
-                        /* reloc_type が要求するフィールド幅と実際のフィールド幅が
-                         * 一致しなければ override を無視する。例: abs64(8バイト) を
-                         * 4バイトの CALL フィールドに適用すると隣接バイトを破壊して
-                         * セグフォルトを引き起こす。
-                         * Bugfix (axx.py port): 以前は is_imported (.EXTERN で
-                         * 宣言されたラベルは常にtrue) の場合このチェックを
-                         * 無条件にスキップしていた。`.EXTERN foo`(型指定なし)は
-                         * 常にマシンのデフォルトreloc型(例: x86_64なら4バイト幅の
-                         * PC32)を記録するため、1バイト幅の短縮ジャンプ(Jcc rel8)
-                         * のような狭いフィールドで参照されると、実際のフィールド幅
-                         * と食い違ったまま常に適用されてしまい、リンク時に後続の
-                         * 命令バイトまで巻き込んで破壊するrelocationが生成されて
-                         * いた。is_imported かどうかに関わらず幅チェックを適用する
-                         * (axx.pyのlineassemble()と同じ修正)。 */
                         int _expected = elf_machine_reloc_bytes(_mtbl_rm, _rt_ov);
                         if(_expected == 0 || _expected == _nbytes)
                             _rtype = _rt_ov;
                         else {
-                            _rtype = RTYPE_FOR(_nbytes);  /* フィールド幅不一致 → デフォルト */
+                            _rtype = RTYPE_FOR(_nbytes);
                             _rtype_is_default_guess = 1;
                         }
                     } else {
@@ -7936,24 +5650,12 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     int64_t _sec_rel = (int64_t)((sec_completed_words +
                                                    (cur_pc + (uint64_t)_widx - sec_entry_pc_cur))
                                                   * (uint64_t)bpw);
-                    /* RELA addend computation:
-                     *   addend = (value stored in objl word(s)) − (label absolute address)
-                     *
-                     * The old code fixed addend=0.  For a reference like "label+8" the
-                     * assembled word holds label_value+8, but with addend=0 the linker
-                     * writes S+0 (symbol address only) and loses the +8 offset.
-                     *
-                     * Fix: reconstruct the scalar stored in the word group using the
-                     * assembler's current endianness and bts setting, then subtract the
-                     * label's absolute value.  The result is the constant addend that
-                     * must be preserved across relocation. */
                     int _bts = st->bts;
                     uint64_t _wmask = (_bts < 64)
                         ? (((uint64_t)1 << _bts) - 1)
                         : (uint64_t)-1;
                     uint64_t _raw_val = 0;
                     if(!st->endian_big){
-                        /* little-endian: word[0] is least-significant */
                         for(int _k = 0; _k < _nwords; _k++){
                             int _wk = _widx + _k;
                             if(_wk < objl.len){
@@ -7962,7 +5664,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                             }
                         }
                     } else {
-                        /* big-endian: word[0] is most-significant */
                         for(int _k = 0; _k < _nwords; _k++){
                             int _wk = _widx + _k;
                             if(_wk < objl.len){
@@ -7971,144 +5672,40 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                             }
                         }
                     }
-                    /* 破綻点修正 (axx.py port): _raw_valはフィールド幅の生の
-                     * ビットパターンをuint64_tにそのまま集めただけで、一度も
-                     * 符号拡張されていなかった。axx.py側は
-                     * "if raw_val >= (1<<(field_bits-1)): raw_val -= (1<<field_bits)"
-                     * でフィールド幅基準の符号付き値に変換してから
-                     * addend計算(raw_val - abs_w_bytes)に使っているが、
-                     * caxx.cはこの変換が無いままint64_tにキャストしていたため、
-                     * 埋め込み済みフィールド値の最上位ビットが立っている場合
-                     * (例: 1バイト幅で0xfc=符号付き-4)、符号なしの
-                     * 大きな正数(252)としてそのままaddend計算に使われ、
-                     * PC相対でない(絶対)リロケーションのaddendが誤って
-                     * 計算されていた。uint64_t上で2の補数表現になるよう
-                     * 減算しておけば、後続のint64_tへのキャストで正しく
-                     * 符号付き値として解釈される。 */
                     {
-                        /* Bugfix (axx.py port): this must be the TRUE encoded
-                         * bit width (_nwords * _bts), not the byte-rounded
-                         * _nbytes*8. _raw_val was built above using _wmask =
-                         * (1<<_bts)-1, so for a word size that isn't a
-                         * multiple of 8 (e.g. .bits::11), _nbytes*8 is larger
-                         * than the actual field (16 vs. 11 bits); _raw_val
-                         * (which never exceeds 2**_bts-1) could then never
-                         * reach the byte-rounded halfway point, so negative
-                         * values were never sign-extended -- corrupting the
-                         * addend by exactly 2**_bts for every negative
-                         * pc-relative/relocated value on such targets.
-                         * Mirrors the identical fix applied to axx.py
-                         * lineassemble(): _field_bits = num_words*state.bts. */
                         int _field_bits = _nwords * _bts;
                         if(_field_bits > 0 && _field_bits < 64
                            && _raw_val >= ((uint64_t)1 << (_field_bits - 1))){
                             _raw_val -= ((uint64_t)1 << _field_bits);
                         }
                     }
-                    /* Bugfix (axx.py port): abs_w must be converted to BYTE
-                     * units (abs_w * bpw) before comparing/subtracting
-                     * against _raw_val (which is already a byte-field
-                     * value once bts spans more than one byte's worth of
-                     * addressing). `_valid[_gi].val` is the label's raw
-                     * stored value in WORDS (mirrors axx.py's `abs_w`), so
-                     * for any target where bpw != 1 (bts > 8), comparing/
-                     * subtracting it directly against _raw_val without this
-                     * scaling silently produced wrong results. This was
-                     * masked in all prior byte-addressable (bts==8, bpw==1)
-                     * test cases, where scaling by 1 is a no-op. */
                     int64_t _abs_w_bytes = (int64_t)_valid[_gi].val * (int64_t)bpw;
 
-                    /* 破綻点修正 (axx.py port): _rtype がreloc_type明示指定なしに
-                     * バイト幅だけから推測された場合(_rtype_is_default_guess)、
-                     * その推測がたまたまPC相対型に landing しても、実際に
-                     * エンコードされた値(_raw_val)がラベルの絶対アドレス
-                     * そのもの(_abs_w_bytes)と厳密に一致するなら、それは
-                     * 減算を伴わない絶対参照(例: "DD label")であることの
-                     * 明確な証拠になる。真にPC相対な参照(call/jmp rel32等)
-                     * ではraw_valが絶対アドレスとぴったり一致することは
-                     * 実質あり得ないため、この場合だけ絶対型に読み替える
-                     * (x86_64のデフォルト表でのみ確認済み: 4バイト幅は
-                     * R_X86_64_PC32(2)ではなくR_X86_64_32(10)にすべき)。 */
-                    /* axx.py port: kept x86_64-only after ELF_MACHINES
-                     * consolidation (was already excluded for 3/40/183/20/
-                     * 243 before; now explicit rather than an exclusion
-                     * list, so newly-added architectures don't silently
-                     * inherit a heuristic never validated for them --
-                     * mirrors axx.py's `self.state.elf_machine == 62` guard). */
                     if(_rtype_is_default_guess && _rtype == 2 && _nbytes == 4
                        && st->elf_machine == 62
                        && (int64_t)_raw_val == _abs_w_bytes){
-                        _rtype = 10; /* R_X86_64_32: absolute 32-bit */
+                        _rtype = 10;
                     }
 
-                    /* M68K (machine 4) 用の双方向再分類 (axx.pyの対応する修正の
-                     * Cポート版)。68000.axx では同じフィールド幅が、PC相対の
-                     * 分岐/DBcc/BSR変位("e-($$+2))"で計算)と、絶対参照
-                     * (「CMPI.W #label,d0」等の即値、および「JSR label」の
-                     * 絶対ロングEAオペランド)の両方に使われるため、
-                     * width_guessの幅だけによる静的なデフォルト推測では
-                     * 区別できない。実物の m68k-linux-gnu-ld で確認済み:
-                     * 修正前はゼロ番地以外にリンクすると分岐先が全て壊れ、
-                     * 「JSR label」は常に絶対アドレス0へ飛ぶ命令になっていた。
-                     * axx.py側の同名の修正と同じロジック: 実際にフィールドへ
-                     * 焼き込まれた値(_raw_val)が、ラベルの生の絶対アドレス
-                     * (_abs_w_bytes)と一致するかどうかで判定する。 */
                     if(_rtype_is_default_guess && st->elf_machine == 4){
                         int _is_pcrel_guess_m68k = elf_machine_is_pcrel(_mtbl_rm, _rtype);
                         if(_is_pcrel_guess_m68k && (int64_t)_raw_val == _abs_w_bytes){
-                            /* 推測はPC相対(pc32)だったが、焼き込み値は
-                             * ラベルの絶対アドレスそのもの -> 本当は絶対参照
-                             * (JSR/JMP/LEA/PEAの絶対ロングEA)。 */
                             switch(_nbytes){
-                                case 4: _rtype = 1; break; /* R_68K_32 */
-                                case 2: _rtype = 2; break; /* R_68K_16 */
-                                case 1: _rtype = 3; break; /* R_68K_8 */
+                                case 4: _rtype = 1; break;
+                                case 2: _rtype = 2; break;
+                                case 1: _rtype = 3; break;
                             }
                         } else if(!_is_pcrel_guess_m68k && (int64_t)_raw_val != _abs_w_bytes){
-                            /* 推測は絶対(abs16/abs8)だったが、焼き込み値は
-                             * ラベルの絶対アドレスと一致しない小さな差分値
-                             * -> target-PCとして計算されたPC相対変位
-                             * (Bcc/DBcc/BSR)。 */
                             switch(_nbytes){
-                                case 4: _rtype = 4; break; /* R_68K_PC32 */
-                                case 2: _rtype = 5; break; /* R_68K_PC16 */
-                                case 1: _rtype = 6; break; /* R_68K_PC8 */
+                                case 4: _rtype = 4; break;
+                                case 2: _rtype = 5; break;
+                                case 1: _rtype = 6; break;
                             }
                         }
                     }
 
-                    /* addend の計算 (axx.py port bugfix):
-                     * 旧コードはPC相対の場合を「フィールド = ターゲット -
-                     * (命令アドレス+フィールドサイズ)」という特定の規約
-                     * (x86のCALL/JMP rel32のような、命令末尾基準の相対
-                     * アドレシング)に固定的に決め打ちし、addend=-num_bytes
-                     * という定数式を使っていた。axxは任意のISA(Z80のJR等、
-                     * 命令先頭基準で相対値を計算するパターンも含む)を
-                     * パターンファイルだけでターゲットにできる汎用アセンブラ
-                     * であり、この決め打ちはパターンが実際に採用している
-                     * $$規約と食い違う場合(例: "JMP !d :: (d-$$)"のように
-                     * 命令先頭基準の場合)、addendを誤って計算していた
-                     * (x86のCALL rel32のような命令末尾基準の規約とたまたま
-                     * 一致するケースでしか正しい値にならなかった)。
-                     *
-                     * axx.pyのlineassemble()と同じ、raw_val・ラベルの絶対値・
-                     * 命令自身のアドレス(P)から汎用的に再構成する式に統一する:
-                     *   PC相対: addend = raw_val - abs_w_bytes + P
-                     *   絶対  : addend = raw_val - abs_w_bytes
-                     * Pは「このリロケーション参照が実際に埋め込まれている
-                     * ワードのセクション相対バイトアドレス」であり、これは
-                     * 数バイト下で r_offset として使っている _sec_rel と
-                     * 全く同じ値(同じ pc+_widx から計算される)なので、
-                     * そのまま再利用する。 */
                     int64_t _addend;
                     {
-                    /* PC相対リロケーション型はアーキテクチャ別に定義する。
-                     * 全アーキテクチャ共通リストにすると番号衝突が発生する。
-                     * 例: PPC R_PPC_REL24=10 と x86-64 R_X86_64_32=10(絶対) が衝突 →
-                     *     x86-64 で abs32 が誤って PC相対と判定され addend=-4 になるバグ。
-                     * Mirrors axx.py: _pc_rel_types_all はマシン別に分岐して定義。 */
-                    /* Machine-specific PC-relative relocation-type set, from
-                     * ELF_MACHINES (axx.py port: single source of truth). */
                     int _is_pcrel = elf_machine_is_pcrel(_mtbl_rm, _rtype);
                         if(_is_pcrel)
                             _addend = (int64_t)_raw_val - _abs_w_bytes + _sec_rel;
@@ -8135,10 +5732,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
             #undef RTYPE_FOR
         }
 
-        /* DWARF .debug_line: record (section, word_pc, file, line) for every
-         * byte-producing line during pass2. The VLIW branch below is excluded
-         * (instruction/byte boundaries are not 1:1 there). st->ln is the line
-         * currently being assembled (lineassemble0 increments it afterwards). */
         if(st->gen_debug && st->pas==2 && objl.len>0){
             if(st->line_map_len >= st->line_map_cap){
                 st->line_map_cap = st->line_map_cap ? st->line_map_cap*2 : 64;
@@ -8176,8 +5769,6 @@ static int lineassemble0(Assembler *asmb, const char *line){
     int l=(int)strlen(st->cl);
     while(l>0&&(st->cl[l-1]=='\n'||st->cl[l-1]=='\r')) st->cl[--l]=0;
 
-    /* -v (verbose) フラグが立っているときだけリスト出力する（axx.py の verbose）。
-     * 対話モード (pas==0) は常に出力する。                         */
     int show = (st->pas==0) || ((st->pas==2) && st->verbose);
     if(show){
         printf("%016llx %s %d %s ",(unsigned long long)u256_to_u64(st->pc),
@@ -8199,7 +5790,6 @@ static char *file_input_from_stdin(void){
         for(size_t i=0;i<l;i++) if(line[i]=='\r'){ memmove(line+i,line+i+1,l-i); l--; }
         while(total+l+1>cap){
             cap*=2;
-            /* Fix #8: save old pointer so it can be freed if realloc fails */
             char *tmp=realloc(buf,cap);
             if(!tmp){ free(buf); perror("realloc"); exit(1); }
             buf=tmp;
@@ -8212,54 +5802,22 @@ static char *file_input_from_stdin(void){
 }
 
 
-/* =========================================================
- * write_elf_obj: write FreeBSD ELF64 relocatable object file
- * Mirrors axx.py Assembler.write_elf_obj() exactly.
- *
- * File layout:
- *   ELF header (64 bytes)
- *   Content sections (16-byte aligned each)
- *   .rela.X sections (8-byte aligned, 24 bytes/entry)
- *   .symtab          (8-byte aligned, 24 bytes/entry)
- *   .strtab
- *   .shstrtab
- *   Section header table (8-byte aligned, 64 bytes/entry)
- * ========================================================= */
 
-/* =====================================================================
- * ELF/DWARF writer helpers (file scope).
- *
- * These were previously GCC *nested functions* defined inside
- * write_elf_obj().  Nested functions are a GNU C extension and are NOT
- * supported by clang (the default `cc` on FreeBSD/macOS), so they are
- * lifted to file scope here, with the formerly-captured local variables
- * passed as explicit parameters.  This lets the file build with a plain
- * standard C compiler (cc/clang) as well as gcc.
- * ===================================================================== */
 
-/* dynamic byte buffer (string tables start with a leading NUL byte) */
 typedef struct { uint8_t*b; size_t len,cap; } WBB;
-/* one content (output) section */
 typedef struct { const char*name; uint64_t bs,bsz,fl; uint8_t*data; } WCS;
-/* (section index, value-within-section) result of weo_shndx() */
 typedef struct { uint16_t shndx; uint64_t sv; } WSR;
-/* relocation entry / per-section list */
 typedef struct { int64_t off; const char*sym; int rtype; int64_t addend; int nbytes; } WRE;
 typedef struct { WRE*data; int len,cap; } WRL;
-/* symbol-name -> symtab-index map entry */
 typedef struct { const char*name; int idx; } WSNI;
-/* label record used for sorting */
 typedef struct { const char*name; uint64_t val; int is_equ; int is_imported; int reloc_type_override; const char*section; } WLK;
-/* DWARF section descriptors */
 typedef struct { const char *name; uint8_t *data; size_t len; } DSEC;
 typedef struct { const char *name; int target; uint8_t *data; size_t len; } DREL;
-/* DWARF raw byte buffer, relocation accumulator, and line-row */
 typedef struct { uint8_t*b; size_t len,cap; } RB;
 typedef struct { uint64_t off; int sym; int rtype; int64_t addend; } DRE;
 typedef struct { DRE*d; int len,cap; } DRV;
 typedef struct { uint64_t wpc; int file; int line; } LROW;
 
-/* endian-aware integer writers (is_le: 1=little, 0=big) */
 static void weo_w2(uint8_t*p,uint16_t v,int is_le){
     if(is_le){ p[0]=v&0xff; p[1]=(v>>8)&0xff; }
     else     { p[1]=v&0xff; p[0]=(v>>8)&0xff; }
@@ -8274,7 +5832,6 @@ static void weo_w8(uint8_t*p,uint64_t v,int is_le){
 }
 static void weo_w8s(uint8_t*p,int64_t v,int is_le){ weo_w8(p,(uint64_t)v,is_le); }
 
-/* WBB dynamic byte buffer helpers */
 static void wbb_init(WBB*w){ w->b=calloc(1,64); w->len=1; w->cap=64; }
 static void wbb_grow(WBB*w, size_t need){
     while(w->len+need>w->cap){w->cap*=2;w->b=realloc(w->b,w->cap);if(!w->b){perror("realloc");exit(1);}}
@@ -8287,7 +5844,6 @@ static void wbb_app(WBB*w, const void*src, size_t n){
     wbb_grow(w,n); memcpy(w->b+w->len,src,n); w->len+=n;
 }
 
-/* extract word range [w0, w0+wn) of the binary image as a byte array */
 static uint8_t *weo_extract(AsmState*st,int bpw,uint64_t w0,uint64_t wn){
     uint64_t nb=wn*(uint64_t)bpw;
     if(!nb) return calloc(1,1);
@@ -8311,11 +5867,6 @@ static uint8_t *weo_extract(AsmState*st,int bpw,uint64_t w0,uint64_t wn){
     return d;
 }
 
-/* 破綻点修正 (axx.py port): セクションが複数回の出入り(.text→.data→.text等)
- * で複数の断片に分かれている場合、単一の(start,size)によるweo_extract()
- * だけでは真の内容を正しく取り出せない(2つ目以降の断片の位置に別
- * セクションのバイトが来てしまう)。st->section_ranges に記録された、この
- * セクションに属する全ての断片を訪問順に連結する。 */
 static uint8_t *weo_extract_ranges(AsmState*st, int bpw, const char*name, uint64_t *out_nb){
     uint64_t total_words = 0;
     for(int i=0;i<st->section_ranges.len;i++)
@@ -8339,33 +5890,8 @@ static uint8_t *weo_extract_ranges(AsmState*st, int bpw, const char*name, uint64
     return d;
 }
 
-/* byte-address -> (1-based content section index, in-section offset)
- *
- * axx.py の _find_shndx() (Fix 7) 相当のフォールバックを追加。
- * 旧実装は「start <= addr < start+size」の通常範囲にも
- * 「size==0 かつ addr==start」にも一致しないアドレスを即座に
- * SHN_ABS(0xfff1) としていた。これにより、ファイル末尾（セクション終端＝
- * start+size ちょうど）に置かれたラベル（サイズマーカーなど、よくあるパターン）が
- * axx.py では .text セクション相対シンボルとして出力されるのに対し、
- * caxx.c では誤って絶対シンボル扱いになっていた。
- * 修正: 通常範囲に一致しない場合、addr 以下で最も開始アドレスが近い
- * セクションに帰属させる（best-effort）。セクションが1つも無い場合のみ
- * SHN_ABS を返す。 */
-/* 破綻点修正 (axx.py port): ラベルがセクション境界ちょうど(前セクションの
- * 終端 == 次セクションの先頭)にあると、アドレスだけからの逆引きでは
- * 半開区間 [start, start+size) の判定により誤って次のセクションに
- * 帰属してしまう(例: ".text"末尾の終端マーカーラベルが".data"の
- * シンボルとして出力される)。ラベル自身が保持する本来のセクション名
- * (sec_name)が分かっている場合はそれを最優先で使う。名前が一致する
- * セクションが無い場合のみ、従来通りアドレスからの逆引きにフォール
- * バックする。sec_name==NULLのときは従来通りアドレスのみで判定する。 */
 static WSR weo_shndx(WCS*csecs,int ncs,uint64_t ba,const char*sec_name,
                       SecRangeVec*ranges,int bpw){
-    /* 破綻点修正 (axx.py port): セクションの真の内容は複数回の出入り
-     * (.text→.data→.text等)で複数の断片に分かれうるため、単純な
-     * ba - csecs[i].bs では断片2つ目以降のアドレスが正しいオフセットに
-     * ならない。addr_to_word_offset()で断片を跨いだ累積オフセットを
-     * 計算する(戻り値-1は「このセクションに属さない」の意味)。 */
     uint64_t word_pc = bpw ? ba/(uint64_t)bpw : 0;
     if(sec_name){
         for(int i=0;i<ncs;i++){
@@ -8384,17 +5910,13 @@ static WSR weo_shndx(WCS*csecs,int ncs,uint64_t ba,const char*sec_name,
         for(int i=0;i<ncs;i++){
             if(csecs[i].bs<=ba && csecs[i].bs>=best_start){ best_i=i; best_start=csecs[i].bs; }
         }
-        uint64_t sv = ba - csecs[best_i].bs;   /* ba < csecs[best_i].bs のときは 0 側に丸める */
+        uint64_t sv = ba - csecs[best_i].bs;
         if(ba < csecs[best_i].bs) sv = 0;
         return (WSR){(uint16_t)(best_i+1), sv};
     }
-    return (WSR){0xfff1,ba};   /* SHN_ABS（セクションが一切ない場合のみ） */
+    return (WSR){0xfff1,ba};
 }
 
-/* Append one Elf64_Sym (24 bytes) or Elf32_Sym (16 bytes) to the symtab
- * buffer. axx.py port note: Elf32_Sym's field ORDER (not just width)
- * differs from Elf64_Sym -- name/value/size/info/other/shndx instead of
- * name/info/other/shndx/value/size. */
 static void weo_sym(WBB*symtab_bb,int*nsyms,int is_le,int is_elf64,
                     uint32_t nm,uint8_t info,uint8_t oth,uint16_t shndx,uint64_t val,uint64_t sz){
     if(is_elf64){
@@ -8411,22 +5933,18 @@ static void weo_sym(WBB*symtab_bb,int*nsyms,int is_le,int is_elf64,
     (*nsyms)++;
 }
 
-/* qsort comparator for WLK label records (by name) */
 static int cmp_wlk(const void*a,const void*b){ return strcmp(((const WLK*)a)->name,((const WLK*)b)->name); }
 
-/* is name present in the export array? */
 static int weo_isexp(WLK*earr,int ne,const char*nm){
     for(int i=0;i<ne;i++) if(!strcmp(earr[i].name,nm)) return 1;
     return 0;
 }
 
-/* symbol name -> symtab index */
 static int weo_symof(WSNI*snimap,int snimap_len,const char*nm){
     for(int i=0;i<snimap_len;i++) if(!strcmp(snimap[i].name,nm)) return snimap[i].idx;
     return 0;
 }
 
-/* is content section i a .bss (SHT_NOBITS)? */
 static int weo_isno(WCS*csecs,int i){
     char _n[64]; int _j=0;
     for(;csecs[i].name[_j]&&_j<63;_j++) _n[_j]=(char)axx_upper_char(csecs[i].name[_j]);
@@ -8434,14 +5952,12 @@ static int weo_isno(WCS*csecs,int i){
     return strncmp(_n,".BSS",4)==0;
 }
 
-/* pad file with zero bytes up to absolute offset t */
 static void weo_pad(FILE*f,uint64_t t){
     long c=ftell(f);
     if(c < 0){ fprintf(stderr,"weo_pad: ftell failed\n"); return; }
     while((uint64_t)c<t){fputc(0,f);c++;}
 }
 
-/* write one Elf64_Shdr (64 bytes) or Elf32_Shdr (40 bytes) */
 static void weo_shdr(FILE*f,int is_le,int is_elf64,uint32_t nm,uint32_t ty,uint64_t fl,uint64_t addr,uint64_t off,
                      uint64_t sz,uint32_t lnk,uint32_t info,uint64_t align,uint64_t entsz){
     if(is_elf64){
@@ -8459,7 +5975,6 @@ static void weo_shdr(FILE*f,int is_le,int is_elf64,uint32_t nm,uint32_t ty,uint6
     }
 }
 
-/* ---- DWARF raw-buffer helpers ---- */
 static void rb_init(RB*r){ r->b=malloc(64); r->len=0; r->cap=64; if(!r->b){perror("malloc");exit(1);} }
 static void rb_need(RB*r,size_t n){ while(r->len+n>r->cap){ r->cap*=2; r->b=realloc(r->b,r->cap); if(!r->b){perror("realloc");exit(1);} } }
 static void rb_u8(RB*r,uint8_t v){ rb_need(r,1); r->b[r->len++]=v; }
@@ -8470,9 +5985,6 @@ static void rb_sleb(RB*r,int64_t v){ for(;;){ uint8_t b=(uint8_t)(v&0x7f); v>>=7
 static void rb_w2(RB*r,uint16_t v,int is_le){ uint8_t t[2]; weo_w2(t,v,is_le); rb_app(r,t,2); }
 static void rb_w4(RB*r,uint32_t v,int is_le){ uint8_t t[4]; weo_w4(t,v,is_le); rb_app(r,t,4); }
 static void rb_w8(RB*r,uint64_t v,int is_le){ uint8_t t[8]; weo_w8(t,v,is_le); rb_app(r,t,8); }
-/* Write one address-sized (4 or 8 byte) unsigned field -- used for every
- * DW_FORM_addr field and the DW_LNE_set_address operand, whose width must
- * track the CU's address_size (4 for a 32-bit target, 8 for 64-bit). */
 static void rb_waddr(RB*r,uint64_t v,int addr_sz,int is_le){
     if(addr_sz==8) rb_w8(r,v,is_le); else rb_w4(r,(uint32_t)v,is_le);
 }
@@ -8480,13 +5992,6 @@ static void drv_add(DRV*v,uint64_t off,int sym,int rtype,int64_t add){
     if(v->len>=v->cap){ v->cap=v->cap?v->cap*2:8; v->d=realloc(v->d,(size_t)v->cap*sizeof(DRE)); if(!v->d){perror("realloc");exit(1);} }
     v->d[v->len++]=(DRE){off,sym,rtype,add};
 }
-/* Pack a DRV of DWARF address relocations into Elf64_Rela/Elf32_Rela
- * (explicit addend) or Elf64_Rel/Elf32_Rel (no addend field -- already
- * baked into the section bytes by the caller) payload bytes, matching the
- * exact on-disk convention write_elf_obj() uses for ordinary code
- * relocations against the same machine/class (see _reloc_entsz and the
- * rela_bufs loop above): Elf64 r_info is sym<<32|type, Elf32 r_info is
- * (sym&0xffffff)<<8|type. */
 static uint8_t* dwarf_pack_relocs(DRV*v,size_t*outlen,int is_le,int is_elf64,int is_rela){
     size_t entsz = is_elf64 ? (is_rela?24:16) : (is_rela?12:8);
     size_t n=(size_t)v->len*entsz; uint8_t*b=calloc(1,n?n:1);
@@ -8504,39 +6009,21 @@ static uint8_t* dwarf_pack_relocs(DRV*v,size_t*outlen,int is_le,int is_elf64,int
     }
     *outlen=n; return b;
 }
-/* qsort comparator for DWARF line rows (by address) */
 static int lrow_cmp(const void*a,const void*b){ uint64_t x=((const LROW*)a)->wpc,y=((const LROW*)b)->wpc; return x<y?-1:(x>y?1:0); }
 
+/* ELF リロケータブルオブジェクト(.o)を書き出す。
+ * elfclass に応じて ELF32/ELF64 を、is_rela に応じて .rel/.rela を出し分ける。
+ * Elf32_Sym と Elf64_Sym はフィールドの幅だけでなく並び順自体が違う点に注意。
+ * -g 指定時は .debug_info/.debug_abbrev/.debug_line も生成する（64bit のみ）。 */
 static void write_elf_obj(AsmState *st, const char *path, int machine){
     int bpw = (st->bts+7)/8; if(bpw<1) bpw=1;
 
-    /* Endianness: mirrors axx.py write_elf_obj():
-     *   _is_le   = (self.state.endian != 'big')
-     *   _ei_data = 1 if _is_le else 2   (ELFDATA2LSB / ELFDATA2MSB)
-     *   _pk      = '<' if _is_le else '>'
-     * The ELF structures (header, shdrs, symtab, rela) must use the same
-     * byte order as the target architecture. */
     int _is_le  = !st->endian_big;
-    int _ei_data = _is_le ? 1 : 2;   /* EI_DATA: 1=LE, 2=BE */
+    int _ei_data = _is_le ? 1 : 2;
 
-    /* axx.py port: RELA-vs-REL convention comes from ELF_MACHINES (single
-     * source of truth, see its definition near the top of this file).
-     * Falls back to RELA if `machine` somehow isn't in the table --
-     * shouldn't happen since -m is validated against it at CLI parse time,
-     * but write_elf_obj() has no other caller-independent way to fail
-     * loudly here. */
     const ElfMachineInfo *_mtbl_w = elf_machine_find(machine);
     int _is_rela_w = !_mtbl_w || _mtbl_w->is_rela;
 
-    /* ELF class (32/64-bit container) is selected independently of the
-     * target machine, via -f/--format (default: ELF64/st->elf_class==2).
-     * This is deliberately NOT the same thing as _mtbl_w->elfclass any
-     * more -- that field still records each architecture's *conventional*
-     * class (used only for the mismatch warning below), but st->elf_class
-     * is the sole authority actually written to disk, so combinations like
-     * `-m 62 -f 32` (EM_X86_64 in an ELFCLASS32 container -- the real x32
-     * ABI's layout) are fully supported rather than silently forced back
-     * to the machine's usual class. Mirrors axx.py write_elf_obj(). */
     int _native_elfclass = _mtbl_w ? _mtbl_w->elfclass : 2;
     int _elfclass = st->elf_class ? st->elf_class : _native_elfclass;
     if(_elfclass != _native_elfclass){
@@ -8548,7 +6035,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     }
     int _is_elf64 = (_elfclass == 2);
 
-    /* Endian-aware field write helpers */
     #define WEO_W2(p,v) do{ uint16_t _v=(uint16_t)(v); \
         if(_is_le){ (p)[0]=_v&0xff; (p)[1]=(_v>>8)&0xff; } \
         else      { (p)[1]=_v&0xff; (p)[0]=(_v>>8)&0xff; } }while(0)
@@ -8560,17 +6046,13 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         else      { for(int _j=7;_j>=0;_j--){(p)[_j]=(uint8_t)(_v&0xff);_v>>=8;} } }while(0)
     #define WEO_W8S(p,v) WEO_W8(p,(uint64_t)(int64_t)(v))
     #define WEO_ALIGN(x,a) (((uint64_t)(x)+((uint64_t)(a)-1))&~((uint64_t)(a)-1))
-    /* Aliases used in symtab / rela / shdr write code */
     #define WEO_LE2(p,v)  WEO_W2(p,v)
     #define WEO_LE4(p,v)  WEO_W4(p,v)
     #define WEO_LE8(p,v)  WEO_W8(p,v)
     #define WEO_LE8S(p,v) WEO_W8S(p,v)
 
-    /* dynamic byte buffer (starts with one NUL byte) */
 
-    /* extract word range [w0, w0+wn) as byte array */
 
-    /* ---- 1. collect content sections ---- */
     uint64_t max_w=0; int have_w=0;
     for(int i=0;i<BUFMAP_NB;i++)
         for(BufEntry*be=st->buf.buckets[i];be;be=be->next)
@@ -8586,11 +6068,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         for(int i=0;i<ncs;i++){
             SecEntry *se=st->sections.order[i];
             uint64_t w0=u256_to_u64(se->start);
-            /* 破綻点修正 (axx.py port): セクションの真のバイト数・内容は
-             * section_ranges に記録された全断片から得る(旧来の「次の
-             * セクションの開始位置から借用してサイズを推定する」フォール
-             * バックは、複数回出入りする設計では単一連続領域を仮定してしまい
-             * 誤りだったため廃止)。 */
             char un[64]; int ui=0;
             for(;se->name[ui]&&ui<63;ui++) un[ui]=(char)axx_upper_char(se->name[ui]);
             un[ui]=0;
@@ -8606,7 +6083,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         }
     }
 
-    /* ---- 2. group relocations by content section ---- */
     WRL *rela_lists=calloc((size_t)ncs,sizeof(WRL));
     for(int ri=0;ri<st->reloc_count;ri++){
         int sidx=-1;
@@ -8619,13 +6095,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
                                    st->relocations[ri].nbytes};
     }
 
-    /* axx.py port: REL-style target (ELF_MACHINES' is_rela==0, e.g. i386,
-     * ARM(32)) has no addend field in the relocation entry at all -- the
-     * addend must instead be baked directly into the relocated field's
-     * bytes (a REL consumer reads it back as the implicit addend). The
-     * bytes there right now hold the *originally encoded* field value, not
-     * the RELA-style addend `pat_match`/the reloc-collection code above
-     * computed; patch them here before the section data is written out. */
     if(!_is_rela_w){
         for(int i=0;i<ncs;i++){
             WRL *rl=&rela_lists[i];
@@ -8648,7 +6117,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     int *rs_idx=calloc((size_t)(nrela?nrela:1),sizeof(int));
     { int ri2=0; for(int i=0;i<ncs;i++) if(rela_lists[i].len>0) rs_idx[ri2++]=i; }
 
-    /* ---- 3. build shstrtab and strtab ---- */
     WBB shstr; wbb_init(&shstr);
     WBB strtab_bb; wbb_init(&strtab_bb);
 
@@ -8663,26 +6131,19 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     uint32_t str_noff  =wbb_str(&shstr,".strtab");
     uint32_t shstr_noff=wbb_str(&shstr,".shstrtab");
 
-    /* ---- 4. build .symtab ---- */
     int WEO_SYMSZ = _is_elf64 ? 24 : 16;
     WBB symtab_bb; symtab_bb.b=calloc(32,(size_t)WEO_SYMSZ); symtab_bb.len=0; symtab_bb.cap=32*WEO_SYMSZ;
     int nsyms=0;
     WSNI *snimap=calloc((size_t)(st->labels.count+st->export_labels.count+8),sizeof(WSNI));
     int snimap_len=0;
 
-    weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,0,0,0,0,0,0);                             /* null */
-    for(int i=0;i<ncs;i++) weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,0,0x03,0,(uint16_t)(i+1),0,0); /* section syms */
+    weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,0,0,0,0,0,0);
+    for(int i=0;i<ncs;i++) weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,0,0x03,0,(uint16_t)(i+1),0,0);
 
-    /* sort labels and export_labels by name */
     int nl=0;
     WLK *larr=calloc((size_t)(st->labels.count?st->labels.count:1),sizeof(WLK));
     {for(int bi=0;bi<st->labels.nbuckets;bi++)
         for(LabelEntry*e=st->labels.buckets[bi];e;e=e->next){
-            /* Bugfix: was u256_is_undef_derived(e->value), which wrongly
-             * excludes any legitimately-defined label whose value happens
-             * to be exactly -1 (bit-identical to UNDEF_VAL() in this
-             * fixed-width type -- see LabelEntry.is_undef). Use the genuine
-             * provenance flag instead so such labels are correctly emitted. */
             if(e->is_undef) continue;
             larr[nl++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,e->is_imported,e->reloc_type_override,e->section};}}
     qsort(larr,nl,sizeof(WLK),cmp_wlk);
@@ -8691,20 +6152,16 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     WLK *earr=calloc((size_t)(st->export_labels.count?st->export_labels.count:1),sizeof(WLK));
     {for(int bi=0;bi<st->export_labels.nbuckets;bi++)
         for(LabelEntry*e=st->export_labels.buckets[bi];e;e=e->next){
-            if(e->is_undef) continue;  /* same fix as labels[] above -- see LabelEntry.is_undef */
-            /* export_labels には reloc_type_override が保存されないため labels から引く */
+            if(e->is_undef) continue;
             LabelEntry *_fl=lmap_find(&st->labels,e->key);
             int _rto = _fl ? _fl->reloc_type_override : -1;
             earr[ne++]=(WLK){e->key,u256_to_u64(e->value),e->is_equ,0,_rto,e->section};}}
     qsort(earr,ne,sizeof(WLK),cmp_wlk);
 
 
-    /* (1) Local labels: not exported, not imported → STB_LOCAL (0x00) */
     for(int i=0;i<nl;i++){
         if(weo_isexp(earr,ne,larr[i].name)) continue;
-        if(larr[i].is_imported) continue;   /* imported: emitted below as STB_GLOBAL/SHN_UNDEF */
-        /* .equ+::reloctype のラベルはアドレスラベルとしてセクション相対シンボルで出力する。
-         * reloc_type_override のない純粋な .equ 定数のみ SHN_ABS とする。 */
+        if(larr[i].is_imported) continue;
         int _equ_has_reloc = larr[i].is_equ && (larr[i].reloc_type_override >= 0);
         WSR sr = (larr[i].is_equ && !_equ_has_reloc)
                  ? (WSR){0xfff1, larr[i].val}
@@ -8714,16 +6171,13 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,0x00,0,sr.shndx,sr.sv,0);
     }
     int first_global=nsyms;
-    /* (2) Imported symbols (.EXTERN): STB_GLOBAL (0x10) / SHN_UNDEF (0)
-     * Mirrors axx.py: syms.append(_pack_sym(name_off, 0x10, 0, 0, 0, 0)) */
     for(int i=0;i<nl;i++){
         if(!larr[i].is_imported) continue;
         if(weo_isexp(earr,ne,larr[i].name)) continue;
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
         snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
-        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,0x10,0,0,0,0);   /* SHN_UNDEF=0, value=0 */
+        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,0x10,0,0,0,0);
     }
-    /* (3) Export labels → STB_GLOBAL (0x10) */
     for(int i=0;i<ne;i++){
         int _equ_has_reloc = earr[i].is_equ && (earr[i].reloc_type_override >= 0);
         WSR sr = (earr[i].is_equ && !_equ_has_reloc)
@@ -8735,16 +6189,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     }
 
 
-    /* ---- 5. build .rela/.rel data ----
-     * axx.py port: entry size and layout depend on both ELF class and the
-     * RELA-vs-REL convention --
-     *   Elf64_Rela (24B): offset(8) info(8, sym<<32|type) addend(8)
-     *   Elf32_Rela (12B): offset(4) info(4, sym<<8|type)  addend(4)
-     *   Elf64_Rel  (16B): offset(8) info(8, sym<<32|type)  -- no addend
-     *   Elf32_Rel  ( 8B): offset(4) info(4, sym<<8|type)   -- no addend
-     * (REL's implicit addend was already patched into the section bytes
-     * above; every relocation-type number used for a 32-bit-class machine
-     * fits in 8 bits, so Elf32's info packing never truncates in practice.) */
     int _reloc_entsz = _is_elf64 ? (_is_rela_w?24:16) : (_is_rela_w?12:8);
     uint8_t **rela_bufs=calloc((size_t)(nrela?nrela:1),sizeof(uint8_t*));
     size_t   *rela_szs =calloc((size_t)(nrela?nrela:1),sizeof(size_t));
@@ -8770,16 +6214,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         rela_bufs[ri2]=rb; rela_szs[ri2]=rbs;
     }
 
-    /* ---- 5b. build DWARF debug sections (-g) ----
-     * Mirrors the axx.py _build_dwarf_sections() port:
-     *   dbg_prog : SHT_PROGBITS  .debug_abbrev / .debug_info / .debug_line
-     *   dbg_rela : SHT_RELA      .rela.debug_info / .rela.debug_line
-     * Debug sections are appended AFTER .shstrtab so e_shstrndx / .symtab /
-     * .strtab indices are unchanged. Addresses are 8 bytes and relocated
-     * against the content section symbol (sym index == content index),
-     * carrying the in-section byte offset as the addend. Single CU, so
-     * DW_AT_stmt_list and abbrev_offset are 0 (no relocation needed).
-     * Strings are inline (DW_FORM_string), so no .debug_str is required. */
     DSEC dbg_prog[3]; int n_dbg_prog=0;
     DREL dbg_rela[2]; int n_dbg_rela=0;
     for(int _i=0;_i<3;_i++){ dbg_prog[_i]=(DSEC){NULL,NULL,0}; }
@@ -8787,50 +6221,33 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
 
     const ElfMachineInfo *_mtbl_dbg = elf_machine_find(machine);
     if(st->gen_debug && st->line_map_len>0 && !_mtbl_dbg){
-        /* Unknown machine: no dwarf_abs/is_rela entry to build correct
-         * relocations against, so there's nothing safe to emit. */
         axx_diagf(0, 0, " warning - DWARF debug info (-g) is not supported for "
                    "unknown machine %d; skipping debug sections.\n", machine);
     }
     if(st->gen_debug && st->line_map_len>0 && _mtbl_dbg){
-        /* growable raw byte buffer */
 
-        /* relocation accumulator for debug sections */
 
-        /* addr_sz/is_rela_dbg select the on-disk address width and the
-         * RELA-vs-REL framing exactly the way _is_elf64/_is_rela_w already
-         * do for ordinary code relocations above -- DWARF's address
-         * relocations are just more absolute relocations against section
-         * symbols, sized and shaped to match the *effective* class (native
-         * class, unless overridden by -f) that actually gets written to
-         * disk, same as everywhere else in this function. */
         int addr_sz = _is_elf64 ? 8 : 4;
         int is_rela_dbg = _is_rela_w;
 
-        /* absolute relocation type per arch, from ELF_MACHINES (axx.py
-         * port: single source of truth) -- already the *native pointer
-         * width* reloc (abs32 for a 32-bit-class machine, abs64 for a
-         * 64-bit-class one), so no separate 32-bit variant is needed. */
         int abs64 = _mtbl_dbg->dwarf_abs;
 
-        /* ---- .debug_abbrev ---- */
         RB abv; rb_init(&abv);
-        rb_uleb(&abv,1); rb_uleb(&abv,0x11); rb_u8(&abv,1);   /* compile_unit, children */
-        rb_uleb(&abv,0x25);rb_uleb(&abv,0x08);  /* producer  DW_FORM_string  */
-        rb_uleb(&abv,0x13);rb_uleb(&abv,0x05);  /* language  DW_FORM_data2   */
-        rb_uleb(&abv,0x03);rb_uleb(&abv,0x08);  /* name      DW_FORM_string  */
-        rb_uleb(&abv,0x1b);rb_uleb(&abv,0x08);  /* comp_dir  DW_FORM_string  */
-        rb_uleb(&abv,0x11);rb_uleb(&abv,0x01);  /* low_pc    DW_FORM_addr    */
-        rb_uleb(&abv,0x12);rb_uleb(&abv,0x07);  /* high_pc   DW_FORM_data8   */
-        rb_uleb(&abv,0x10);rb_uleb(&abv,0x17);  /* stmt_list DW_FORM_sec_offset */
+        rb_uleb(&abv,1); rb_uleb(&abv,0x11); rb_u8(&abv,1);
+        rb_uleb(&abv,0x25);rb_uleb(&abv,0x08);
+        rb_uleb(&abv,0x13);rb_uleb(&abv,0x05);
+        rb_uleb(&abv,0x03);rb_uleb(&abv,0x08);
+        rb_uleb(&abv,0x1b);rb_uleb(&abv,0x08);
+        rb_uleb(&abv,0x11);rb_uleb(&abv,0x01);
+        rb_uleb(&abv,0x12);rb_uleb(&abv,0x07);
+        rb_uleb(&abv,0x10);rb_uleb(&abv,0x17);
         rb_uleb(&abv,0);rb_uleb(&abv,0);
-        rb_uleb(&abv,2); rb_uleb(&abv,0x0a); rb_u8(&abv,0);   /* label, no children */
-        rb_uleb(&abv,0x03);rb_uleb(&abv,0x08);  /* name   DW_FORM_string */
-        rb_uleb(&abv,0x11);rb_uleb(&abv,0x01);  /* low_pc DW_FORM_addr   */
+        rb_uleb(&abv,2); rb_uleb(&abv,0x0a); rb_u8(&abv,0);
+        rb_uleb(&abv,0x03);rb_uleb(&abv,0x08);
+        rb_uleb(&abv,0x11);rb_uleb(&abv,0x01);
         rb_uleb(&abv,0);rb_uleb(&abv,0);
-        rb_uleb(&abv,0);                          /* end of abbrev table */
+        rb_uleb(&abv,0);
 
-        /* ---- primary section for CU low_pc/high_pc ---- */
         int primary_idx=0; uint64_t primary_size=0;
         for(int i=0;i<ncs;i++) if(strcmp(csecs[i].name,st->line_map[0].section)==0){ primary_idx=i+1; break; }
         if(primary_idx==0 && ncs>0) primary_idx=1;
@@ -8840,45 +6257,36 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         const char *cu_name = st->line_map[0].file[0]?st->line_map[0].file:"(source)";
         const char *producer = "axx general assembler (C, DWARF4)";
 
-        /* ---- .debug_info ---- */
         DRV info_relas={0,0,0};
         RB die; rb_init(&die);
         rb_uleb(&die,1);
         rb_cstr(&die,producer);
-        rb_w2(&die,0x8001,_is_le);            /* DW_LANG_Mips_Assembler */
+        rb_w2(&die,0x8001,_is_le);
         rb_cstr(&die,cu_name);
         rb_cstr(&die,cwd);
         if(primary_idx>0) drv_add(&info_relas,die.len,primary_idx,abs64,0);
-        rb_waddr(&die,0,addr_sz,_is_le);      /* low_pc (relocated; addend
-                                                * is always 0 here, so the
-                                                * RELA placeholder and the
-                                                * REL real value are the
-                                                * same bytes either way) */
-        rb_w8(&die,primary_size,_is_le);      /* high_pc (data8)    */
-        rb_w4(&die,0,_is_le);                 /* stmt_list = 0      */
+        rb_waddr(&die,0,addr_sz,_is_le);
+        rb_w8(&die,primary_size,_is_le);
+        rb_w4(&die,0,_is_le);
         for(int i=0;i<nl;i++){
             if(larr[i].is_equ || larr[i].is_imported) continue;
             WSR sr = weo_shndx(csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section,&st->section_ranges,bpw);
-            if(sr.shndx==0xfff1) continue;           /* not in a content section */
+            if(sr.shndx==0xfff1) continue;
             rb_uleb(&die,2);
             rb_cstr(&die,larr[i].name);
             drv_add(&info_relas,die.len,(int)sr.shndx,abs64,(int64_t)sr.sv);
-            /* RELA: zero placeholder, real value lives in the relocation
-             * entry's addend. REL: no addend field exists, so the value
-             * must be baked into the field itself. */
             rb_waddr(&die,is_rela_dbg?0:sr.sv,addr_sz,_is_le);
         }
-        rb_uleb(&die,0);               /* terminate CU children */
+        rb_uleb(&die,0);
         RB info; rb_init(&info);
-        rb_w4(&info,(uint32_t)(2+4+1+die.len),_is_le); /* unit_length */
-        rb_w2(&info,4,_is_le);                          /* version */
-        rb_w4(&info,0,_is_le);                          /* debug_abbrev_offset */
-        rb_u8(&info,(uint8_t)addr_sz);           /* address_size */
-        size_t info_prefix=info.len;             /* 4+2+4+1 = 11 */
+        rb_w4(&info,(uint32_t)(2+4+1+die.len),_is_le);
+        rb_w2(&info,4,_is_le);
+        rb_w4(&info,0,_is_le);
+        rb_u8(&info,(uint8_t)addr_sz);
+        size_t info_prefix=info.len;
         rb_app(&info,die.b,die.len);
         free(die.b);
 
-        /* ---- .debug_line (DWARF v4) ---- */
         DRV line_relas={0,0,0};
         const char **files=calloc((size_t)st->line_map_len,sizeof(char*)); int nfiles=0;
         int *row_file=calloc((size_t)st->line_map_len,sizeof(int));
@@ -8886,22 +6294,22 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
             const char *fn=st->line_map[i].file[0]?st->line_map[i].file:"(source)";
             int fi=0; for(;fi<nfiles;fi++) if(strcmp(files[fi],fn)==0) break;
             if(fi==nfiles) files[nfiles++]=fn;
-            row_file[i]=fi+1; /* 1-based */
+            row_file[i]=fi+1;
         }
         RB hb; rb_init(&hb);
-        rb_u8(&hb,1);  /* minimum_instruction_length */
-        rb_u8(&hb,1);  /* maximum_operations_per_instruction (v4) */
-        rb_u8(&hb,1);  /* default_is_stmt */
-        rb_u8(&hb,(uint8_t)(int8_t)-5); /* line_base */
-        rb_u8(&hb,14); /* line_range */
-        rb_u8(&hb,13); /* opcode_base */
+        rb_u8(&hb,1);
+        rb_u8(&hb,1);
+        rb_u8(&hb,1);
+        rb_u8(&hb,(uint8_t)(int8_t)-5);
+        rb_u8(&hb,14);
+        rb_u8(&hb,13);
         { static const uint8_t sol[12]={0,1,1,1,1,0,0,0,1,0,0,1}; rb_app(&hb,sol,12); }
-        rb_u8(&hb,0);  /* include_directories: none + terminator */
+        rb_u8(&hb,0);
         for(int fi=0;fi<nfiles;fi++){ rb_cstr(&hb,files[fi]); rb_uleb(&hb,0);rb_uleb(&hb,0);rb_uleb(&hb,0); }
-        rb_u8(&hb,0);  /* end of file_names */
+        rb_u8(&hb,0);
 
         RB prog; rb_init(&prog);
-        size_t prog_base = 4+2+4+hb.len;   /* program offset within .debug_line */
+        size_t prog_base = 4+2+4+hb.len;
         for(int s=0;s<ncs;s++){
             int cnt=0;
             for(int i=0;i<st->line_map_len;i++) if(strcmp(st->line_map[i].section,csecs[s].name)==0) cnt++;
@@ -8911,13 +6319,8 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
                 rows[k].wpc=st->line_map[i].word_pc; rows[k].file=row_file[i]; rows[k].line=st->line_map[i].line; k++;
             }
             qsort(rows,(size_t)cnt,sizeof(LROW),lrow_cmp);
-            /* 破綻点修正 (axx.py port): セクションが複数回の出入りで複数の
-             * 断片に分かれている場合、単純な (wpc*bpw - secbase) では
-             * 2つ目以降の断片のアドレスが正しいオフセットにならない。
-             * addr_to_word_offset()で断片を跨いだ累積オフセットを使う
-             * (該当する断片が見つからない場合は0にフォールバックする)。 */
             uint64_t first_off = dwarf_word_offset(st, csecs[s].name, rows[0].wpc, bpw);
-            rb_u8(&prog,0); rb_uleb(&prog,1+(uint64_t)addr_sz); rb_u8(&prog,2);   /* DW_LNE_set_address */
+            rb_u8(&prog,0); rb_uleb(&prog,1+(uint64_t)addr_sz); rb_u8(&prog,2);
             drv_add(&line_relas, prog_base+prog.len, s+1, abs64, (int64_t)first_off);
             rb_waddr(&prog,is_rela_dbg?0:first_off,addr_sz,_is_le);
             uint64_t cur_off=first_off; int cur_line=1, cur_file=1;
@@ -8926,24 +6329,23 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
                 if(rows[i].file!=cur_file){ rb_u8(&prog,4); rb_uleb(&prog,(uint64_t)rows[i].file); cur_file=rows[i].file; }
                 if(rows[i].line!=cur_line){ rb_u8(&prog,3); rb_sleb(&prog,(int64_t)rows[i].line-cur_line); cur_line=rows[i].line; }
                 if(boff>cur_off){ rb_u8(&prog,2); rb_uleb(&prog,boff-cur_off); cur_off=boff; }
-                rb_u8(&prog,1); /* DW_LNS_copy */
+                rb_u8(&prog,1);
             }
             uint64_t end_off=csecs[s].bsz;
             if(end_off>cur_off){ rb_u8(&prog,2); rb_uleb(&prog,end_off-cur_off); }
-            rb_u8(&prog,0); rb_uleb(&prog,1); rb_u8(&prog,1); /* DW_LNE_end_sequence */
+            rb_u8(&prog,0); rb_uleb(&prog,1); rb_u8(&prog,1);
             free(rows);
         }
         free(files); free(row_file);
 
         RB line; rb_init(&line);
-        rb_w4(&line,(uint32_t)(2+4+hb.len+prog.len),_is_le); /* unit_length */
-        rb_w2(&line,4,_is_le);                                /* version */
-        rb_w4(&line,(uint32_t)hb.len,_is_le);                 /* header_length */
+        rb_w4(&line,(uint32_t)(2+4+hb.len+prog.len),_is_le);
+        rb_w2(&line,4,_is_le);
+        rb_w4(&line,(uint32_t)hb.len,_is_le);
         rb_app(&line,hb.b,hb.len);
         rb_app(&line,prog.b,prog.len);
         free(hb.b); free(prog.b);
 
-        /* pack Elf64_Rela payloads */
 
         dbg_prog[n_dbg_prog++]=(DSEC){".debug_abbrev",abv.b,abv.len};
         int info_pi=n_dbg_prog; dbg_prog[n_dbg_prog++]=(DSEC){".debug_info",info.b,info.len};
@@ -8953,30 +6355,22 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         if(line_relas.len>0){ size_t L; uint8_t*B=dwarf_pack_relocs(&line_relas,&L,_is_le,_is_elf64,is_rela_dbg); dbg_rela[n_dbg_rela++]=(DREL){is_rela_dbg?".rela.debug_line":".rel.debug_line",line_pi,B,L}; }
         free(info_relas.d); free(line_relas.d);
     }
-    /* add debug section names to shstrtab (must be before offset computation) */
     uint32_t dbg_prog_noff[3]={0,0,0};
     uint32_t dbg_rela_noff[2]={0,0};
     for(int i=0;i<n_dbg_prog;i++) dbg_prog_noff[i]=wbb_str(&shstr,dbg_prog[i].name);
     for(int i=0;i<n_dbg_rela;i++) dbg_rela_noff[i]=wbb_str(&shstr,dbg_rela[i].name);
 
-    /* ---- 6. compute file offsets ---- */
-    /* Fix 1B: SHT_NOBITS (.bss) sections must NOT consume file space.
-     * ELF spec: "A section of type SHT_NOBITS occupies no space in the file."
-     * We record sh_offset = current foff (any valid offset is fine; linkers
-     * ignore it for NOBITS) but do NOT advance foff past the section data.
-     * weo_isno(csecs,) mirrors the same .bss test used in the section-header loop. */
     uint64_t foff=_is_elf64?64:52;
     uint64_t *sec_fo=calloc((size_t)ncs,sizeof(uint64_t));
     for(int i=0;i<ncs;i++){
         foff=WEO_ALIGN(foff,16); sec_fo[i]=foff;
-        if(!weo_isno(csecs,i)) foff+=csecs[i].bsz;  /* NOBITS: offset recorded, no file bytes */
+        if(!weo_isno(csecs,i)) foff+=csecs[i].bsz;
     }
     uint64_t *rela_fo=calloc((size_t)(nrela?nrela:1),sizeof(uint64_t));
     for(int ri2=0;ri2<nrela;ri2++){foff=WEO_ALIGN(foff,8);rela_fo[ri2]=foff;foff+=rela_szs[ri2];}
     uint64_t sym_fo=WEO_ALIGN(foff,8); foff=sym_fo+(uint64_t)nsyms*(uint64_t)WEO_SYMSZ;
     uint64_t str_fo=foff;     foff+=strtab_bb.len;
     uint64_t shstr_fo=foff;   foff+=shstr.len;
-    /* DWARF debug section offsets (placed after .shstrtab) */
     uint64_t dbg_prog_fo[3]={0,0,0};
     for(int i=0;i<n_dbg_prog;i++){ foff=WEO_ALIGN(foff,1); dbg_prog_fo[i]=foff; foff+=dbg_prog[i].len; }
     uint64_t dbg_rela_fo[2]={0,0};
@@ -8985,37 +6379,23 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
 
     int ndbg=n_dbg_prog+n_dbg_rela;
     int tot_sh=1+ncs+nrela+3+ndbg;
-    int shstrndx=ncs+nrela+3;          /* .shstrtab index is unchanged */
-    int dbg_base=ncs+nrela+3;          /* debug sections follow .shstrtab */
+    int shstrndx=ncs+nrela+3;
+    int dbg_base=ncs+nrela+3;
     int sym_shidx=ncs+nrela+1;
     int str_shidx=ncs+nrela+2;
 
-    /* ---- 7. write file ---- */
     FILE *fp=fopen(path,"wb");
     if(!fp){
-        /* Bugfix (axx.py port): this used to just perror() (unconditional,
-         * no should_report_errors() gate) and never set had_error, and the
-         * caller never checked for failure either -- so a failure to even
-         * open the output file (e.g. a nonexistent directory in the -o
-         * path) printed a message yet still exited 0 with no file written,
-         * silently breaking any build system that only checks the exit
-         * code. */
         if(should_report_errors(st)){
             axx_diagf(1, 0, " error - cannot create ELF output file '%s': %s\n", path, strerror(errno));
         }
         goto weo_done;
     }
 
-    /* ELF header: Elf64_Ehdr (64 bytes) or Elf32_Ehdr (52 bytes). Both share
-     * the same 16-byte e_ident and the same e_type/e_machine/e_version
-     * layout at offset 16, but diverge from e_entry onward -- Elf32 packs
-     * e_entry/e_phoff/e_shoff as 4-byte fields instead of Elf64's 8-byte
-     * ones, shifting every field after it. axx.py port: mirrors axx.py
-     * write_elf_obj()'s _pack_ehdr(). */
     if(_is_elf64){
         uint8_t eh[64]={0};
         eh[0]=0x7f;eh[1]='E';eh[2]='L';eh[3]='F';
-        eh[4]=2;eh[5]=(uint8_t)_ei_data;eh[6]=1;eh[7]=st->osabi; /* ELFCLASS64 EI_DATA EV_CURRENT ELFOSABI */
+        eh[4]=2;eh[5]=(uint8_t)_ei_data;eh[6]=1;eh[7]=st->osabi;
         WEO_LE2(eh+16,1); WEO_LE2(eh+18,(uint16_t)machine); WEO_LE4(eh+20,1);
         WEO_LE8(eh+40,shdr_fo);
         WEO_LE2(eh+52,64); WEO_LE2(eh+58,64);
@@ -9024,7 +6404,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     } else {
         uint8_t eh[52]={0};
         eh[0]=0x7f;eh[1]='E';eh[2]='L';eh[3]='F';
-        eh[4]=1;eh[5]=(uint8_t)_ei_data;eh[6]=1;eh[7]=st->osabi; /* ELFCLASS32 EI_DATA EV_CURRENT ELFOSABI */
+        eh[4]=1;eh[5]=(uint8_t)_ei_data;eh[6]=1;eh[7]=st->osabi;
         WEO_LE2(eh+16,1); WEO_LE2(eh+18,(uint16_t)machine); WEO_LE4(eh+20,1);
         WEO_LE4(eh+32,(uint32_t)shdr_fo);
         WEO_LE2(eh+40,52); WEO_LE2(eh+46,40);
@@ -9032,31 +6412,21 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         fwrite(eh,1,52,fp);
     }
 
-    /* Fix J: if ftell() fails it returns -1 (a negative long).  The original
-     * cast that to uint64_t, yielding UINT64_MAX, which is never < t so the
-     * while-loop exited immediately — silently skipping the required padding
-     * and corrupting the ELF file.  Now we detect the error and abort. */
 
     for(int i=0;i<ncs;i++){
         weo_pad(fp,sec_fo[i]);
-        /* NOBITS sections (.bss) have no file bytes — skip fwrite. */
         if(!weo_isno(csecs,i) && csecs[i].bsz) fwrite(csecs[i].data,1,(size_t)csecs[i].bsz,fp);
     }
     for(int ri2=0;ri2<nrela;ri2++){weo_pad(fp,rela_fo[ri2]);if(rela_szs[ri2])fwrite(rela_bufs[ri2],1,rela_szs[ri2],fp);}
     weo_pad(fp,sym_fo); fwrite(symtab_bb.b,1,(size_t)nsyms*(size_t)WEO_SYMSZ,fp);
     fwrite(strtab_bb.b,1,strtab_bb.len,fp);
     fwrite(shstr.b,1,shstr.len,fp);
-    /* DWARF debug section data (PROGBITS then RELA) */
     for(int i=0;i<n_dbg_prog;i++){ weo_pad(fp,dbg_prog_fo[i]); if(dbg_prog[i].len) fwrite(dbg_prog[i].data,1,dbg_prog[i].len,fp); }
     for(int i=0;i<n_dbg_rela;i++){ weo_pad(fp,dbg_rela_fo[i]); if(dbg_rela[i].len) fwrite(dbg_rela[i].data,1,dbg_rela[i].len,fp); }
     weo_pad(fp,shdr_fo);
 
-    weo_shdr(fp,_is_le,_is_elf64,0,0,0,0,0,0,0,0,0,0); /* [0] NULL */
+    weo_shdr(fp,_is_le,_is_elf64,0,0,0,0,0,0,0,0,0,0);
     for(int i=0;i<ncs;i++){
-        /* Fix: .bss は SHT_NOBITS (8)、それ以外は SHT_PROGBITS (1)。
-         * ELF 仕様上 SHT_NOBITS セクションはファイル領域を持たない（sh_size は
-         * 実際のバイト数を保持するがファイルデータは書かれない）ため、
-         * リンカ・ローダーが正しくゼロ初期化できる。 */
         char _un[64]; int _ui=0;
         for(;csecs[i].name[_ui]&&_ui<63;_ui++) _un[_ui]=(char)axx_upper_char(csecs[i].name[_ui]);
         _un[_ui]=0;
@@ -9065,7 +6435,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     }
     {
     uint32_t _word_align = _is_elf64?8:4;
-    uint32_t _rel_sh_type = _is_rela_w?4:9;   /* SHT_RELA : SHT_REL */
+    uint32_t _rel_sh_type = _is_rela_w?4:9;
     for(int ri2=0;ri2<nrela;ri2++)
         weo_shdr(fp,_is_le,_is_elf64,rela_noff[ri2],_rel_sh_type,0x40,0,rela_fo[ri2],rela_szs[ri2],
                  (uint32_t)sym_shidx,(uint32_t)(rs_idx[ri2]+1),_word_align,(uint64_t)_reloc_entsz);
@@ -9074,16 +6444,11 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     }
     weo_shdr(fp,_is_le,_is_elf64,str_noff,3,0,0,str_fo,strtab_bb.len,0,0,1,0);
     weo_shdr(fp,_is_le,_is_elf64,shstr_noff,3,0,0,shstr_fo,shstr.len,0,0,1,0);
-    /* DWARF debug section headers (PROGBITS then RELA/REL) -- same
-     * SHT_RELA/SHT_REL, alignment and entsize convention as the ordinary
-     * code-relocation sections above (_rel_sh_type/_word_align/
-     * _reloc_entsz), since the DWARF builder packed these relocations
-     * against the same machine/class. */
     for(int i=0;i<n_dbg_prog;i++)
         weo_shdr(fp,_is_le,_is_elf64,dbg_prog_noff[i],1,0,0,dbg_prog_fo[i],dbg_prog[i].len,0,0,1,0);
     {
     uint32_t _dbg_word_align = _is_elf64?8:4;
-    uint32_t _dbg_rel_sh_type = _is_rela_w?4:9;   /* SHT_RELA : SHT_REL */
+    uint32_t _dbg_rel_sh_type = _is_rela_w?4:9;
     for(int i=0;i<n_dbg_rela;i++)
         weo_shdr(fp,_is_le,_is_elf64,dbg_rela_noff[i],_dbg_rel_sh_type,0x40,0,dbg_rela_fo[i],dbg_rela[i].len,
                  (uint32_t)sym_shidx,(uint32_t)(dbg_base+1+dbg_rela[i].target),_dbg_word_align,(uint64_t)_reloc_entsz);
@@ -9115,74 +6480,6 @@ weo_done:
     #undef WEO_ALIGN
 }
 
-/* ===========================================================================
- * Macro preprocessor layer  (port of axx.py's MacroPreprocessor)
- * ===========================================================================
- *
- * A source-to-source stage that runs over the raw source lines *before* the
- * assembler proper sees them (see fileassemble()). It is kept deliberately
- * independent of the assembler's own expression evaluator, label table,
- * section state and program counter:
- *
- *   * The macro layer has its own value space (int64 and strings) and its own
- *     variable namespace, so it can never observe a label whose value is
- *     still unknown, and can never observe a *different* value on a later
- *     relaxation pass. Expansion is therefore a pure function of the source
- *     text, which is what lets fileassemble() simply re-run it on every
- *     Pass 1 relaxation iteration and on Pass 2 and hand the assembler
- *     byte-identical input every time.
- *
- *   * Conversely, nothing in the macro layer can read .EQU symbols, labels or
- *     $$/$. . That is a design decision, not an omission: allowing it would
- *     make expansion pass-dependent, and could make the *number* of emitted
- *     source lines differ between passes -- something the relaxation loop has
- *     no way to converge on.
- *
- * Syntax (every statement starts with '!' as the first non-blank character of
- * a line; '{' opens a block at the end of a header line, and a line whose
- * first non-blank character is '}' closes one):
- *
- *     !def name(p1, p2, ...) {        macro / compile-time function
- *         ...
- *         !return expr                (optional; also an early exit)
- *     }
- *
- *     !if expr !then {
- *         ...
- *     } !elif expr !then {
- *         ...
- *     } !else {
- *         ...
- *     }
- *
- *     !while expr {
- *         ...
- *         !break / !continue
- *     }
- *
- *     !set name = expr                assign (innermost scope that has it)
- *     !local name [= expr]            declare in the current scope
- *     !undef name
- *     !name(a, b, ...)                expand a macro as a statement
- *     !include "file"                 macro-time textual include
- *     !error expr / !warning expr / !echo expr
- *
- * Inside an ordinary (non-'!') line, !{expr} is replaced by the textual value
- * of expr, and !{expr:fmt} applies a format spec (!{n:04x}). Write \!{ for a
- * literal !{ .
- *
- * Backward compatibility: a '!'-line is only intercepted when the word after
- * the '!' is one of the keywords above, the name of an already-defined macro,
- * or is immediately followed by '('. "!!" (VLIW slot separator) is never
- * touched, and a '}' line is only treated as a block close when a block is
- * actually open. --no-macro disables the whole layer.
- *
- * Divergence from axx.py worth knowing: Python's macro values are arbitrary-
- * precision integers; here they are int64. Macro-time arithmetic that
- * overflows 64 bits is the one place the two implementations can differ.
- * Everything the macro layer emits is plain source text, so this cannot
- * affect the assembler's own 256-bit expression evaluation.
- * =========================================================================== */
 
 #include <setjmp.h>
 
@@ -9194,21 +6491,8 @@ enum {
 };
 #define MACRO_MAX_ITER   1000000L
 #define MACRO_MAX_LINES  2000000L
-/* Hard cap on the macro layer's arena. Expansion is a pure text transform, so
- * a runaway string-building loop is the only way to reach this; failing with
- * a diagnostic beats being OOM-killed. */
 #define MACRO_MAX_ARENA  ((size_t)512*1024*1024)
 
-/* ---------------------------------------------------------------------------
- * Bump arena.
- *
- * Every string, AST node and expanded line the macro layer produces is
- * allocated here and released in one go by macro_reset_pass(), which runs at
- * the start of each assembly pass. That removes any need for per-node
- * ownership rules in a stage that is re-run up to seventeen times per build.
- * Scopes are the one exception: they are strictly stack-disciplined, so they
- * use malloc/free and do not accumulate across a long loop.
- * ------------------------------------------------------------------------- */
 typedef struct MArenaBlk { struct MArenaBlk *next; size_t used, cap; char *data; } MArenaBlk;
 typedef struct { MArenaBlk *head; size_t total; } MArena;
 
@@ -9233,18 +6517,15 @@ struct MNode {
     MNKind      kind;
     const char *file;
     int         line;
-    char       *a;          /* text / name / expression */
-    char       *b;          /* second expression (!set / !local) */
-    /* !if */
+    char       *a;
+    char       *b;
     char      **conds;
     MBlock     *arms;
     int         narms;
-    MBlock     *elsebody;   /* NULL when there is no !else */
-    /* !while / !def */
+    MBlock     *elsebody;
     MBlock     *body;
-    /* !def */
     char      **params;
-    char      **defaults;   /* entry is NULL when the parameter has no default */
+    char      **defaults;
     int         nparams;
 };
 
@@ -9256,7 +6537,7 @@ typedef struct {
     MBlock *body;
     const char *file;
     int     line;
-    int     defined;        /* 0 while only parse-time-declared */
+    int     defined;
 } MFunc;
 
 typedef struct { char **names; MVal *vals; int len, cap; } MScope;
@@ -9269,14 +6550,14 @@ struct MacroPP {
 
     MFunc     *funcs;
     int        nfuncs, cfuncs;
-    char     **declared;    /* names seen by !def during parsing */
+    char     **declared;
     int        ndecl, cdecl;
 
     MScope    *scopes[MACRO_MAX_SCOPES];
     int        nscopes;
 
-    MLineVec  *out;         /* current expansion target */
-    int        depth;       /* macro-call recursion depth */
+    MLineVec  *out;
+    int        depth;
     long long  uid;
     long       nemitted;
 
@@ -9289,39 +6570,12 @@ struct MacroPP {
     int        enabled;
     int        had_error;
 
-    /* A malloc'd (not arena) buffer currently being built by a caller that
-     * is about to call into code which can longjmp via m_fail() -- e.g.
-     * m_interpolate()'s growable `out` buffer while it calls
-     * m_format_value(). Registered here so m_fail() can free it before
-     * unwinding; otherwise the buffer's only pointer lives in a stack frame
-     * that longjmp discards without running its cleanup, leaking it. NULL
-     * whenever no such buffer is in flight. */
     char      *pending_buf;
 
-    /* The full text of the macro expression currently being evaluated by the
-     * innermost still-executing m_eval() call, so error sites that only have
-     * `mp` (not the MEP parse cursor `p`) -- e.g. mv_need_int(), reached from
-     * deep inside a builtin -- can still report "... in '<expr>'" the way
-     * axx.py's _ExprParser.err() always does (it wraps every message with
-     * `in {self.s!r}` because `self.s` is an instance field, visible from
-     * anywhere in that class). Saved/restored around each m_eval() call so
-     * nesting (e.g. a default-parameter expression evaluated while still
-     * inside an outer call's argument list) unwinds correctly. NULL outside
-     * any m_eval() call. */
     const char *cur_expr;
 
-    /* 1 when this instance expands *pattern* files (.axx) rather than source
-     * files. Two things change: the comment marker on a macro statement line
-     * becomes a slash-star sequence instead of ';' (see m_strip_comment), and
-     * the layer is only engaged when the file really contains a macro construct (see
-     * m_has_macro_constructs), because in a pattern file a bare '!' is the
-     * pattern-variable sigil and so appears on almost every line. Set by
-     * macro_init_pattern(); never cleared by macro_reset_pass(). */
     int        pat_mode;
 
-    /* Reported diagnostics, so a single macro error is printed once per run
-     * rather than once per relaxation iteration. Cleared only by
-     * macro_init()/macro_free(), never by macro_reset_pass(). */
     char     **reported;
     int        nreported, creported;
 
@@ -9329,7 +6583,6 @@ struct MacroPP {
     int        jb_active;
 };
 
-/* ---- arena ---------------------------------------------------------------- */
 
 static void *marena_alloc(MArena *a, size_t n){
     n = (n + 15) & ~(size_t)15;
@@ -9362,7 +6615,6 @@ static char *marena_strdup(MArena *a, const char *s){
     return marena_strndup(a, s, strlen(s));
 }
 
-/* ---- small growable containers (arena-backed) ----------------------------- */
 
 static void mblock_push(MacroPP *mp, MBlock *b, MNode *n){
     if(b->len >= b->cap){
@@ -9386,7 +6638,6 @@ static void mlinevec_push(MacroPP *mp, MLineVec *v, char *text, const char *file
     v->len++;
 }
 
-/* ---- lifecycle ------------------------------------------------------------ */
 
 static void macro_init(MacroPP *mp, Assembler *asmb){
     memset(mp, 0, sizeof(*mp));
@@ -9411,7 +6662,6 @@ static void macro_reset_pass(MacroPP *mp){
     mp->ctl = MCTL_NONE;
     mp->retval.is_str = 0; mp->retval.i = 0; mp->retval.s = NULL;
     mp->jb_active = 0;
-    /* Globals scope */
     MScope *g = calloc(1, sizeof(MScope));
     if(!g){ perror("calloc"); exit(1); }
     mp->scopes[mp->nscopes++] = g;
@@ -9427,11 +6677,7 @@ static void macro_free(MacroPP *mp){
     marena_reset(&mp->arena);
 }
 
-/* ---- diagnostics ---------------------------------------------------------- */
 
-/* Returns 1 the first time msg is seen, 0 afterwards. Pass 1 re-expands the
- * whole source on every relaxation iteration, so without this a single macro
- * error would be printed up to seventeen times. */
 static int m_first_report(MacroPP *mp, const char *msg){
     for(int i = 0; i < mp->nreported; i++)
         if(strcmp(mp->reported[i], msg) == 0) return 0;
@@ -9451,18 +6697,12 @@ static void m_warn(MacroPP *mp, const char *file, int line, const char *fmt, ...
     vsnprintf(body, sizeof(body), fmt, ap);
     va_end(ap);
     char msg[1200];
-    /* line<0 means "no line number" (axx.py's _fmt_pos()-less top-level
-     * messages, e.g. fail(f"{filename}: '!return' outside a macro
-     * definition") -- no ":<line>" at all, not even ":0"). */
     if(line < 0) snprintf(msg, sizeof(msg), "%s: %s", file ? file : "?", body);
     else snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
     if(m_first_report(mp, msg))
-        /* force=1: same reason as m_fail() below. */
         axx_diagf(0, 1, " warning - %s\n", msg);
 }
 
-/* Abort the current expansion. Never returns: it longjmps back to
- * macro_expand()'s setjmp, which reports the message and yields no lines. */
 static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...){
     char body[1024];
     va_list ap; va_start(ap, fmt);
@@ -9472,12 +6712,6 @@ static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...
     if(line < 0) snprintf(msg, sizeof(msg), "%s: %s", file ? file : "?", body);
     else snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
     if(m_first_report(mp, msg))
-        /* force=1: macro expansion runs inside Pass 1, whose diagnostics are
-         * normally gated off because an unresolved label there is not yet an
-         * error.  A macro error is deterministic and will never resolve, so
-         * without the force the user saw only the generic "one or more errors
-         * were reported during assembly" -- no file, no line, no reason.
-         * m_first_report() already stops it repeating once per iteration. */
         axx_diagf(0, 1, " error - %s\n", msg);
     mp->had_error = 1;
     if(mp->asmb) mp->asmb->st.had_error = 1;
@@ -9486,18 +6720,7 @@ static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...
     exit(1);
 }
 
-/* ---- diagnostics: Python-style repr() for diagnostic message parity ------- */
 
-/* Renders `s` the way Python's repr() renders a str, so a caxx diagnostic
- * quoting a piece of macro source text reads identically to the axx.py
- * diagnostic for the same input (both implementations' macro-expression
- * errors are meant to match byte-for-byte -- see MacroError/_ExprParser.err()
- * on the Python side). Matches CPython's unicode_repr() quote-choice rule:
- * prefer '...', but switch to "..." when the text contains a "'" and no '"'
- * (avoids escaping the common case of an apostrophe in ordinary text).
- * Escapes backslash, the chosen quote, and \n/\t/\r the same way repr() does;
- * other control bytes become \xNN. Truncates (without a trailing partial
- * escape) if `out` is too small -- diagnostic text, not round-tripped. */
 static void m_pyrepr(const char *s, char *out, size_t outsz){
     if(outsz < 3){ if(outsz) out[0] = '\0'; return; }
     int has_sq = strchr(s, '\'') != NULL;
@@ -9507,7 +6730,7 @@ static void m_pyrepr(const char *s, char *out, size_t outsz){
     out[o++] = q;
     for(const unsigned char *p = (const unsigned char*)s; *p; p++){
         unsigned char c = *p;
-        if(o + 6 >= outsz) break; /* leave room for worst-case \xNN + closing quote + NUL */
+        if(o + 6 >= outsz) break;
         if(c == '\\' || c == (unsigned char)q){ out[o++] = '\\'; out[o++] = (char)c; }
         else if(c == '\n'){ out[o++] = '\\'; out[o++] = 'n'; }
         else if(c == '\t'){ out[o++] = '\\'; out[o++] = 't'; }
@@ -9521,7 +6744,6 @@ static void m_pyrepr(const char *s, char *out, size_t outsz){
     out[o] = '\0';
 }
 
-/* ---- values --------------------------------------------------------------- */
 
 static MVal mv_int(long long v){ MVal r; r.is_str = 0; r.i = v; r.s = NULL; return r; }
 static MVal mv_str(char *s){ MVal r; r.is_str = 1; r.i = 0; r.s = s; return r; }
@@ -9535,11 +6757,6 @@ static char *mv_to_text(MacroPP *mp, MVal v){
 }
 static long long mv_need_int(MacroPP *mp, MVal v, const char *file, int line){
     if(v.is_str){
-        /* axx.py: _as_int() -> p.err(f"expected an integer, got the string
-         * {v!r}") -- routed through _ExprParser.err(), which always appends
-         * "in {self.s!r}". This call site only has `mp` (it is reached from
-         * deep inside builtins, not the MEP parse cursor), so the enclosing
-         * expression text comes from mp->cur_expr (see its declaration). */
         char vr[600], er[600];
         m_pyrepr(v.s ? v.s : "", vr, sizeof(vr));
         if(mp->cur_expr) m_pyrepr(mp->cur_expr, er, sizeof(er));
@@ -9548,15 +6765,12 @@ static long long mv_need_int(MacroPP *mp, MVal v, const char *file, int line){
     }
     return v.i;
 }
-/* C-style truncating division, so -7/2 == -3 as an assembly programmer would
- * expect (and matching axx.py's macro layer, which does the same). */
 static long long m_cdiv(long long a, long long b){
     long long q = (a < 0 ? -a : a) / (b < 0 ? -b : b);
     return ((a >= 0) == (b >= 0)) ? q : -q;
 }
 static long long m_cmod(long long a, long long b){ return a - m_cdiv(a, b) * b; }
 
-/* ---- variable environment -------------------------------------------------- */
 
 static MScope *m_scope(MacroPP *mp){ return mp->scopes[mp->nscopes - 1]; }
 
@@ -9648,11 +6862,6 @@ static void m_assign(MacroPP *mp, const char *name, MVal v){
     m_scope_set(m_scope(mp), marena_strdup(&mp->arena, name), v);
 }
 
-/* ---- expression evaluator --------------------------------------------------
- * Recursive descent over one macro-time expression. Values are int64 or
- * string; comparisons and the logical operators yield 0/1; '+' concatenates
- * when either side is a string. Precedence follows C with a ternary on top.
- * ------------------------------------------------------------------------- */
 
 typedef struct { const char *s; int i; MacroPP *mp; const char *file; int line; } MEP;
 
@@ -9671,7 +6880,6 @@ static int mep_eat(MEP *p, const char *tok){
 }
 static void mep_expect(MEP *p, const char *tok){
     if(!mep_eat(p, tok)){
-        /* axx.py: self.err(f"expected {tok!r}") -> "... expected ')' in '...'" */
         char tokr[16], sr[600];
         m_pyrepr(tok, tokr, sizeof(tokr));
         m_pyrepr(p->s, sr, sizeof(sr));
@@ -9685,7 +6893,6 @@ static char *mep_ident(MEP *p){
     int j = p->i;
     while(p->s[j] && (isalnum((unsigned char)p->s[j]) || p->s[j] == '_')) j++;
     if(j == p->i){
-        /* axx.py: self.err("expected a name") */
         char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
         m_fail(p->mp, p->file, p->line, "macro expression: expected a name in %s", sr);
     }
@@ -9716,7 +6923,6 @@ static MVal mep_number(MEP *p){
         ndig++; j++;
     }
     if(ndig == 0 || j == start){
-        /* axx.py: self.err("malformed number") */
         char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
         m_fail(p->mp, p->file, p->line, "macro expression: malformed number in %s", sr);
     }
@@ -9727,7 +6933,6 @@ static MVal mep_number(MEP *p){
 static char *mep_string(MEP *p, char q, int *len_out){
     const char *s = p->s;
     int j = p->i + 1;
-    /* Worst case the unescaped text is as long as the source text. */
     char *buf = marena_alloc(&p->mp->arena, strlen(s) + 1);
     int n = 0;
     while(s[j]){
@@ -9748,7 +6953,6 @@ static char *mep_string(MEP *p, char q, int *len_out){
         buf[n++] = c; j++;
     }
     {
-        /* axx.py: self.err("unterminated string literal") */
         char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
         m_fail(p->mp, p->file, p->line, "macro expression: unterminated string literal in %s", sr);
     }
@@ -9759,7 +6963,6 @@ static MVal mep_primary(MEP *p){
     mep_skip(p);
     char c = p->s[p->i];
     if(!c){
-        /* axx.py: self.err("unexpected end of expression") */
         char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
         m_fail(p->mp, p->file, p->line, "macro expression: unexpected end of expression in %s", sr);
     }
@@ -9811,7 +7014,6 @@ static MVal mep_primary(MEP *p){
         return m_lookup(p->mp, name, p->file, p->line);
     }
     {
-        /* axx.py: self.err(f"unexpected character {c!r}") */
         char cbuf[2] = { c, 0 }, cr[16], sr[600];
         m_pyrepr(cbuf, cr, sizeof(cr));
         m_pyrepr(p->s, sr, sizeof(sr));
@@ -10034,18 +7236,12 @@ static MVal mep_ternary(MEP *p){
 static MVal m_eval(MacroPP *mp, const char *text, const char *file, int line){
     while(*text == ' ' || *text == '\t') text++;
     if(!*text) m_fail(mp, file, line, "empty macro expression");
-    /* Save/restore around this call so a nested m_eval() (e.g. a default-
-     * parameter expression evaluated mid-parse of an outer call's argument
-     * list) doesn't leave mp->cur_expr pointing at the wrong expression once
-     * it returns -- see the field's declaration in struct MacroPP. */
     const char *saved_cur_expr = mp->cur_expr;
     mp->cur_expr = text;
     MEP p; p.s = text; p.i = 0; p.mp = mp; p.file = file; p.line = line;
     MVal v = mep_ternary(&p);
     mep_skip(&p);
     if(p.s[p.i]){
-        /* axx.py: self.err(f"unexpected trailing text {self.s[self.i:]!r}")
-         * -> "... unexpected trailing text '<tail>' in '<full>'" */
         char tailr[600], sr[600];
         m_pyrepr(p.s + p.i, tailr, sizeof(tailr));
         m_pyrepr(p.s, sr, sizeof(sr));
@@ -10055,7 +7251,6 @@ static MVal m_eval(MacroPP *mp, const char *text, const char *file, int line){
     return v;
 }
 
-/* ---- builtins -------------------------------------------------------------- */
 
 static void m_bi_argc(MacroPP *mp, const char *name, int n, int lo, int hi,
                       const char *file, int line){
@@ -10146,7 +7341,6 @@ static int m_builtin(MacroPP *mp, const char *name, MVal *a, int n,
     return 0;
 }
 
-/* ---- macro invocation ------------------------------------------------------ */
 
 static void m_exec_block(MacroPP *mp, MBlock *b);
 
@@ -10166,8 +7360,6 @@ static MVal m_invoke(MacroPP *mp, MFunc *f, MVal *args, int nargs,
     MScope *sc = calloc(1, sizeof(MScope));
     if(!sc){ perror("calloc"); exit(1); }
 
-    /* Defaults are evaluated in the caller's scope, matching the order the
-     * arguments themselves were evaluated in. */
     MVal bound[MACRO_MAX_ARGS];
     for(int i = 0; i < f->nparams; i++)
         bound[i] = (i < nargs) ? args[i] : m_eval(mp, f->defaults[i], file, line);
@@ -10192,9 +7384,6 @@ static MVal m_invoke(MacroPP *mp, MFunc *f, MVal *args, int nargs,
     return r;
 }
 
-/* A call appearing inside an expression: the macro's !return value is the
- * result, and the macro must not emit any source text (there would be nowhere
- * to put it). */
 static MVal m_call_value(MacroPP *mp, const char *name, MVal *args, int nargs,
                          const char *file, int line){
     MVal out;
@@ -10207,7 +7396,6 @@ static MVal m_call_value(MacroPP *mp, const char *name, MVal *args, int nargs,
     if(mp->out && mp->out->len != mark){
         char *emitted = mp->out->d[mark].text;
         mp->out->len = mark;
-        /* axx.py: emitted[0].strip()!r} -- strip whitespace before repr(). */
         char *e0 = emitted, *e1;
         while(*e0==' '||*e0=='\t'||*e0=='\n'||*e0=='\r'||*e0=='\f'||*e0=='\v') e0++;
         e1 = e0 + strlen(e0);
@@ -10222,48 +7410,27 @@ static MVal m_call_value(MacroPP *mp, const char *name, MVal *args, int nargs,
     return v;
 }
 
-/* ---- text interpolation ---------------------------------------------------- */
 
-/* ---- format spec (Python format mini-language) ----------------------------
- *
- * axx.py hands `!{expr:spec}` straight to Python's format(), so Python's
- * mini-language IS the specification (MACRO.md and README both say so). This
- * used to accept only `[0][width][type]`, which made caxx reject specs that
- * axx.py formatted happily -- alignment, sign, '#', grouping and the float
- * types all failed. The grammar implemented here is Python's:
- *
- *     [[fill]align][sign][z][#][0][width][grouping][.precision][type]
- *     align     ::= "<" | ">" | "=" | "^"
- *     sign      ::= "+" | "-" | " "
- *     grouping  ::= "," | "_"
- *     type      ::= b c d e E f F g G n o s x X %
- *
- * with the same validity rules Python enforces (no precision on integer
- * types, no ',' with 'x'/'o'/'b'/'c'/'n', no sign or '#' on strings, and so
- * on). Anything Python rejects is rejected here with the identical message
- * axx.py produces, so the two implementations agree on failures too.
- * ------------------------------------------------------------------------- */
 
 typedef struct {
     char fill;
-    char align;      /* 0 = unspecified */
-    char sign;       /* 0 = unspecified (behaves as '-') */
-    int  has_fill;   /* an explicit fill character was given */
-    int  zcoerce;    /* 'z' */
-    int  alt;        /* '#' */
-    int  zeropad;    /* leading '0' before the width */
+    char align;
+    char sign;
+    int  has_fill;
+    int  zcoerce;
+    int  alt;
+    int  zeropad;
     int  width;
-    char group;      /* 0, ',' or '_' */
+    char group;
     int  has_prec;
     int  prec;
-    char type;       /* 0 = unspecified */
+    char type;
 } MFmt;
 
 static int m_is_align(char c){
     return c == '<' || c == '>' || c == '=' || c == '^';
 }
 
-/* Parse `spec`. Returns 0 when the spec is malformed. */
 static int m_fmt_parse(const char *spec, MFmt *f){
     memset(f, 0, sizeof(*f));
     f->fill = ' ';
@@ -10276,8 +7443,6 @@ static int m_fmt_parse(const char *spec, MFmt *f){
     if(*p == 'z'){ f->zcoerce = 1; p++; }
     if(*p == '#'){ f->alt = 1; p++; }
     if(*p == '0'){
-        /* A leading '0' always means fill='0'; it additionally implies
-         * sign-aware '=' alignment only when no alignment was given. */
         f->zeropad = 1;
         if(!f->has_fill) f->fill = '0';
         p++;
@@ -10306,13 +7471,10 @@ static int m_fmt_parse(const char *spec, MFmt *f){
     return *p == '\0';
 }
 
-/* Length of `n` digits once `group` separators every `iv` digits are added. */
 static int m_group_len(int n, int iv){
     return n + (n - 1) / iv;
 }
 
-/* Write `digits` (n of them, already zero-extended to the wanted length)
- * into out[] inserting a separator every `iv` digits. Returns the length. */
 static int m_group_emit(char *out, const char *digits, int n, int iv, char sep){
     int lead = n % iv;
     if(lead == 0) lead = iv;
@@ -10326,9 +7488,6 @@ static int m_group_emit(char *out, const char *digits, int n, int iv, char sep){
     return o;
 }
 
-/* Number of code points in a UTF-8 string. Python measures width and
- * precision in characters, so a multi-byte result from `!{n:c}` (or a
- * non-ASCII string value) must not be counted byte-wise here. */
 static int m_utf8_len(const char *s){
     int n = 0;
     for(const unsigned char *p = (const unsigned char*)s; *p; p++)
@@ -10336,7 +7495,6 @@ static int m_utf8_len(const char *s){
     return n;
 }
 
-/* Byte offset of the `n`-th code point (or the whole length if shorter). */
 static size_t m_utf8_off(const char *s, int n){
     const unsigned char *p = (const unsigned char*)s;
     size_t i = 0;
@@ -10351,11 +7509,10 @@ static size_t m_utf8_off(const char *s, int n){
     return i;
 }
 
-/* Pad `head` (sign + any 0x/0o/0b prefix) plus `body` out to f->width. */
 static char *m_fmt_pad(MacroPP *mp, const char *head, const char *body,
                        MFmt *f, char defalign){
     int hl = (int)strlen(head), bl = (int)strlen(body);
-    int total = m_utf8_len(head) + m_utf8_len(body);   /* width is in chars */
+    int total = m_utf8_len(head) + m_utf8_len(body);
     char align = f->align ? f->align : defalign;
     if(total >= f->width){
         char *r = marena_alloc(&mp->arena, (size_t)total + 1);
@@ -10380,7 +7537,7 @@ static char *m_fmt_pad(MacroPP *mp, const char *head, const char *body,
         memcpy(r + o, head, (size_t)hl); o += hl;
         memcpy(r + o, body, (size_t)bl); o += bl;
         for(int k = 0; k < right; k++) r[o++] = f->fill;
-    } else {                                   /* '>' */
+    } else {
         for(int k = 0; k < pad; k++) r[o++] = f->fill;
         memcpy(r + o, head, (size_t)hl); o += hl;
         memcpy(r + o, body, (size_t)bl); o += bl;
@@ -10389,9 +7546,6 @@ static char *m_fmt_pad(MacroPP *mp, const char *head, const char *body,
     return r;
 }
 
-/* UTF-8 encode one code point, so `!{65:c}` and `!{255:c}` produce the same
- * bytes axx.py does (Python yields a str, which the expander writes as UTF-8;
- * caxx used to emit the raw byte and disagreed for anything above U+007F). */
 static int m_utf8(unsigned long cp, char *out){
     if(cp < 0x80){ out[0] = (char)cp; return 1; }
     if(cp < 0x800){
@@ -10412,33 +7566,20 @@ static int m_utf8(unsigned long cp, char *out){
     return 4;
 }
 
-/* Format an integer. Sets *err on anything Python would reject. */
 static char *m_fmt_int(MacroPP *mp, long long iv, MFmt *f, int *err){
     char type = f->type ? f->type : 'd';
     int isfloat = (type=='e'||type=='E'||type=='f'||type=='F'
                    ||type=='g'||type=='G'||type=='%');
     if(type == 's'){ *err = 1; return NULL; }
-    if(!isfloat && f->has_prec){ *err = 1; return NULL; }      /* precision */
-    if(!isfloat && f->zcoerce){ *err = 1; return NULL; }       /* 'z' */
+    if(!isfloat && f->has_prec){ *err = 1; return NULL; }
+    if(!isfloat && f->zcoerce){ *err = 1; return NULL; }
     if(type == 'c'){
         if(f->sign || f->alt || f->group || f->has_prec){ *err = 1; return NULL; }
         if(iv < 0 || iv > 0x10FFFF){ *err = 1; return NULL; }
-        /* U+0000 is valid in Python (chr(0)) but cannot be embedded here as
-         * a raw NUL byte: the whole !{...} expansion pipeline (m_interpolate
-         * and friends), and the source-line handling beyond it, copies
-         * through NUL-terminated C strings via strlen()/*p-style scans, so
-         * a literal NUL byte would be mistaken for end-of-line by whatever
-         * reads the expanded line next (confirmed: it breaks the .ASCII/
-         * .ASCIZ quoted-string scanner specifically). Rendering it as an
-         * empty string is a deliberate, documented caxx-only difference
-         * from axx.py's chr(0), not an oversight. */
         if(iv == 0) return m_fmt_pad(mp, "", "", f, '>');
         char buf[8];
         int n = m_utf8((unsigned long)iv, buf);
         buf[n] = '\0';
-        /* Python right-aligns 'c' like every other integer presentation
-         * type by default (format(65,'5c') == '    A'); only string ('s')
-         * defaults to left. */
         return m_fmt_pad(mp, "", buf, f, '>');
     }
     if(f->group == ',' && strchr("xXob", type)){ *err = 1; return NULL; }
@@ -10457,8 +7598,6 @@ static char *m_fmt_int(MacroPP *mp, long long iv, MFmt *f, int *err){
         if(type == '%'){ d *= 100.0; conv = 'f'; }
         if(d < 0){ neg = 1; d = -d; }
         char cfmt[16];
-        /* '#' keeps the decimal point (and, for g/G, the trailing zeros)
-         * exactly as Python's alternate form does. */
         snprintf(cfmt, sizeof(cfmt), "%%%s.%d%c", f->alt ? "#" : "", prec, conv);
         nd = snprintf(digits, sizeof(digits), cfmt, d);
         if(type == '%'){ digits[nd++] = '%'; digits[nd] = '\0'; }
@@ -10506,32 +7645,19 @@ static char *m_fmt_int(MacroPP *mp, long long iv, MFmt *f, int *err){
         return m_fmt_pad(mp, headbuf, digits, f,
                          (f->zeropad && !f->align) ? '=' : '>');
 
-    /* Grouping. The digits that get separators are the leading run of the
-     * body (for a float that is the part before the '.'). */
     int iv_step = strchr("xXob", type) ? 4 : 3;
     int intlen;
     if(isfloat){
-        /* stop at the '.' or the exponent: only the integer part is grouped */
         intlen = 0;
         while(intlen < nd && isdigit((unsigned char)digits[intlen])) intlen++;
     } else {
-        /* the whole body is one run of digits -- and for x/X/o/b those
-         * "digits" include a-f, which isdigit() does not accept */
         intlen = nd;
     }
     const char *tail = digits + intlen;
 
     int want = intlen;
-    /* Python's trigger for this is the *resolved* alignment/fill being
-     * '=' and '0' -- not merely "the '0' shorthand was used with no
-     * explicit align". '0=20,d' (explicit align) grows the digit count
-     * exactly like '020,d' (implicit) does; '*=20,d' (align '=' but a
-     * non-'0' fill) and '0<20,d' (fill '0' but align '<') do not. */
     char eff_align = f->align ? f->align : (f->zeropad ? '=' : '>');
     if(eff_align == '=' && f->fill == '0'){
-        /* Zero padding happens *inside* the grouping, and Python grows the
-         * digit count until the grouped form reaches the requested width
-         * (overshooting it when no digit count lands on it exactly). */
         int avail = f->width - (int)strlen(headbuf) - (int)strlen(tail);
         while(m_group_len(want, iv_step) < avail) want++;
     }
@@ -10548,7 +7674,6 @@ static char *m_fmt_int(MacroPP *mp, long long iv, MFmt *f, int *err){
                      (f->zeropad && !f->align) ? '=' : '>');
 }
 
-/* Format a string. Sets *err on anything Python would reject. */
 static char *m_fmt_str(MacroPP *mp, const char *s, MFmt *f, int *err){
     if(f->type && f->type != 's'){ *err = 1; return NULL; }
     if(f->sign || f->alt || f->group || f->zcoerce){ *err = 1; return NULL; }
@@ -10559,7 +7684,6 @@ static char *m_fmt_str(MacroPP *mp, const char *s, MFmt *f, int *err){
     return m_fmt_pad(mp, "", body, f, '<');
 }
 
-/* Evaluate one !{...} body, honouring a trailing :format-spec. */
 static char *m_format_value(MacroPP *mp, const char *body, const char *file, int line){
     int len = (int)strlen(body);
     int spec_at = -1;
@@ -10593,8 +7717,6 @@ static char *m_format_value(MacroPP *mp, const char *body, const char *file, int
     else if(v.is_str) out = m_fmt_str(mp, v.s ? v.s : "", &f, &err);
     else out = m_fmt_int(mp, v.i, &f, &err);
     if(err || !out){
-        /* Same wording axx.py produces when format() raises, so a bad spec
-         * reads identically whichever implementation the user ran. */
         if(v.is_str)
             m_fail(mp, file, line, "bad format spec ':%s' for value '%s'",
                    spec, v.s ? v.s : "");
@@ -10603,7 +7725,6 @@ static char *m_format_value(MacroPP *mp, const char *body, const char *file, int
     return out;
 }
 
-/* Replace every !{expr} / !{expr:fmt} in an ordinary source line. */
 static char *m_interpolate(MacroPP *mp, const char *text, const char *file, int line){
     if(!strstr(text, "!{")) return (char*)text;
     size_t cap = strlen(text) + 256, n = 0;
@@ -10639,10 +7760,6 @@ static char *m_interpolate(MacroPP *mp, const char *text, const char *file, int 
         }
         char *body = marena_strndup(&mp->arena, text + i + 2, (size_t)(j - i - 2));
         char *val;
-        /* m_format_value may longjmp via m_fail(). Register `out` so m_fail()
-         * can free it before unwinding past this frame -- setting a local
-         * variable here would do nothing, since longjmp skips straight past
-         * any code that would restore or use it. */
         mp->pending_buf = out;
         val = m_format_value(mp, body, file, line);
         mp->pending_buf = NULL;
@@ -10658,18 +7775,7 @@ static char *m_interpolate(MacroPP *mp, const char *text, const char *file, int 
     return r;
 }
 
-/* ---- line/statement helpers ------------------------------------------------ */
 
-/* Remove a ';' comment from a macro *statement* line, respecting string and
- * character literals. Ordinary (passed-through) source lines are never touched
- * here: the assembler strips their comments itself, and the listing output is
- * expected to still show them.
- *
- * In pattern mode (mp->pat_mode) the pattern-file convention applies instead:
- * a comment starts at a slash-star sequence and runs to the end of the line,
- * and ';' is NOT a comment marker. That matters because ';' separates the error-code
- * suffix of a pattern's error field (v>0xff;2), so treating it as a comment
- * start would silently truncate macro statements that build pattern lines. */
 static char *m_strip_comment(MacroPP *mp, const char *text){
     int i = 0; char quote = 0;
     while(text[i]){
@@ -10699,9 +7805,6 @@ static char *m_rstrip(MacroPP *mp, const char *s){
 }
 static char *m_trim(MacroPP *mp, const char *s){ return m_rstrip(mp, m_lstrip(s)); }
 
-/* If text is a '!'-statement line, write the word after the '!' into word[]
- * and return a pointer to the rest of the line; otherwise return NULL. "!!"
- * (the VLIW slot separator) is never a statement. */
 static const char *m_statement_word(const char *text, char *word, size_t wsz){
     const char *t = m_lstrip(text);
     if(t[0] != '!' || t[1] == '!') return NULL;
@@ -10722,7 +7825,6 @@ static int m_is_keyword(const char *w){
     return 0;
 }
 
-/* ---- parser ---------------------------------------------------------------- */
 
 typedef struct { MLine *d; int n; } MSrc;
 
@@ -10735,12 +7837,10 @@ static MNode *m_node(MacroPP *mp, MNKind k, const char *file, int line){
     return n;
 }
 
-/* Split a "!if expr !then {" / "!while expr {" header into its expression,
- * checking that the line really opens a block. */
 static char *m_parse_header(MacroPP *mp, const char *text, const char *kw,
                             const char *file, int line){
     char *t = m_trim(mp, text);
-    size_t kl = strlen(kw) + 1;             /* '!' + keyword */
+    size_t kl = strlen(kw) + 1;
     if(strlen(t) < kl) m_fail(mp, file, line, "malformed '!%s' header", kw);
     char *body = m_rstrip(mp, t + kl);
     size_t bl = strlen(body);
@@ -10748,7 +7848,6 @@ static char *m_parse_header(MacroPP *mp, const char *text, const char *kw,
         m_fail(mp, file, line, "'!%s' header must end with '{'", kw);
     body[bl-1] = '\0';
     if(strcmp(kw, "if") == 0 || strcmp(kw, "elif") == 0){
-        /* find the LAST "!then" outside quotes */
         int at = -1; char quote = 0;
         for(int k = 0; body[k]; k++){
             char c = body[k];
@@ -10794,7 +7893,7 @@ static MNode *m_parse_if(MacroPP *mp, MSrc *src, int *ip, int depth){
         const char *cfile = src->d[*ip].file;
         int cline = src->d[*ip].line;
         char *close = m_trim(mp, m_strip_comment(mp, src->d[*ip].text));
-        const char *tail = m_lstrip(close + 1);      /* skip the '}' */
+        const char *tail = m_lstrip(close + 1);
         if(!*tail){ (*ip)++; return n; }
 
         char w[64];
@@ -10873,7 +7972,7 @@ static MNode *m_parse_def(MacroPP *mp, MSrc *src, int *ip, int depth){
             m_fail(mp, file, line, "bad macro name '%s'", name);
     if(m_is_keyword(name))
         m_fail(mp, file, line, "'%s' is a reserved macro name", name);
-    {   /* builtins are reserved too */
+    {
         MVal probe; MVal noargs[1];
         (void)probe; (void)noargs;
         static const char *bi[] = {"len","str","hex","int","upper","lower",
@@ -10919,7 +8018,7 @@ static MNode *m_parse_def(MacroPP *mp, MSrc *src, int *ip, int depth){
             p = comma + 1;
         }
     }
-    {   /* a parameter without a default may not follow one that has one */
+    {
         const char *seen = NULL;
         for(int k = 0; k < n->nparams; k++){
             if(!n->defaults[k] && seen)
@@ -10930,9 +8029,6 @@ static MNode *m_parse_def(MacroPP *mp, MSrc *src, int *ip, int depth){
         }
     }
 
-    /* Register the name *before* parsing the body so a recursive call inside
-     * the body is recognised as a statement call rather than passed through to
-     * the assembler as ordinary text. */
     m_declare(mp, name);
 
     (*ip)++;
@@ -10986,17 +8082,12 @@ static MNode *m_parse_simple(MacroPP *mp, const char *w, const char *rest,
         n->a = m_trim(mp, rest);
         return n;
     }
-    /* macro call used as a statement */
     MNode *n = m_node(mp, MN_CALL, file, line);
     n->a = marena_strdup(&mp->arena, w);
     n->b = m_trim(mp, rest);
     return n;
 }
 
-/* Parse statements until the '}' that closes the enclosing block. On return
- * *ip indexes that '}' line (or src->n at top level). A '}' seen at depth 0 is
- * not a block terminator and is passed through as ordinary text, so source
- * that legitimately starts a line with '}' is unaffected. */
 static MBlock *m_parse_block(MacroPP *mp, MSrc *src, int *ip, int depth){
     MBlock *b = marena_alloc(&mp->arena, sizeof(MBlock));
     memset(b, 0, sizeof(*b));
@@ -11040,7 +8131,6 @@ static MBlock *m_parse_block(MacroPP *mp, MSrc *src, int *ip, int depth){
     return b;
 }
 
-/* ---- execution -------------------------------------------------------------- */
 
 static void m_do_include(MacroPP *mp, const char *name, const char *file, int line);
 
@@ -11174,9 +8264,6 @@ static void m_exec_node(MacroPP *mp, MNode *n){
     }
     case MN_ECHO: {
         MVal v = m_eval(mp, n->a, n->file, n->line);
-        /* Emit once per assembly, not once per relaxation iteration: Pass 1
-         * may re-expand the source up to sixteen times, while Pass 2 (pas==2)
-         * and interactive/listing mode (pas==0) each run exactly once. */
         if(!mp->asmb || mp->asmb->st.pas != 1)
             fprintf(stderr, "%s\n", mv_to_text(mp, v));
         return;
@@ -11197,7 +8284,6 @@ static void m_exec_block(MacroPP *mp, MBlock *b){
     }
 }
 
-/* ---- reading and expanding -------------------------------------------------- */
 
 static void m_read_lines(MacroPP *mp, FILE *f, const char *display, MSrc *out){
     int cap = 256, n = 0;
@@ -11246,8 +8332,6 @@ static void m_do_include(MacroPP *mp, const char *name, const char *file, int li
     if(!f) m_fail(mp, file, line, "cannot '!include' \"%s\": %s", name, strerror(errno));
 
     MSrc src;
-    /* Tag the included lines with the *resolved* path, not the string as
-     * written: a nested '!include' inside this file resolves against it. */
     m_read_lines(mp, f, path, &src);
     fclose(f);
 
@@ -11258,8 +8342,6 @@ static void m_do_include(MacroPP *mp, const char *name, const char *file, int li
     mp->ninc--;
 }
 
-/* Cheap pre-filter: a file with no '!' and no line starting with '}' cannot
- * use the macro layer, so it is handed back untouched with no parsing at all. */
 static int m_contains_macros(MSrc *src){
     for(int i = 0; i < src->n; i++){
         if(strchr(src->d[i].text, '!')) return 1;
@@ -11268,24 +8350,12 @@ static int m_contains_macros(MSrc *src){
     return 0;
 }
 
-/* True when text contains an unescaped "!{" interpolation. */
 static int m_has_interpolation(const char *t){
     for(const char *p = strstr(t, "!{"); p; p = strstr(p + 2, "!{"))
         if(p == t || p[-1] != '\\') return 1;
     return 0;
 }
 
-/* Strict pre-filter used for *pattern* files.
- *
- * m_contains_macros() engages the layer as soon as a '!' appears anywhere,
- * which is the right call for source files but useless for a pattern file:
- * there '!' introduces a pattern variable (ADD A,!d) and so occurs on nearly
- * every line. This variant asks the narrower question the interception rule
- * in m_parse_block() actually cares about -- is there a line that would
- * really be taken as a macro statement, an unescaped "!{...}" interpolation,
- * or a block-closing '}'? A pattern file that uses no macros therefore skips
- * parsing entirely and reaches the pattern reader byte-for-byte as written,
- * which is what keeps every existing .axx file unaffected. */
 static int m_has_macro_constructs(MacroPP *mp, MSrc *src){
     for(int i = 0; i < src->n; i++){
         const char *t = src->d[i].text;
@@ -11300,10 +8370,6 @@ static int m_has_macro_constructs(MacroPP *mp, MSrc *src){
     return 0;
 }
 
-/* Expand one already-open source file. `display` is the name diagnostics and
- * DWARF line records should use. The returned lines carry the ORIGINAL source
- * position they came from (inside a macro body, the line of that body line in
- * the file that defined it). */
 static MLineVec macro_expand(MacroPP *mp, FILE *f, const char *display){
     MLineVec result;
     memset(&result, 0, sizeof(result));
@@ -11318,10 +8384,6 @@ static MLineVec macro_expand(MacroPP *mp, FILE *f, const char *display){
             mlinevec_push(mp, &result, src.d[i].text, src.d[i].file, src.d[i].line);
         return result;
     }
-    /* A macro error is fatal for the whole run, and Pass 1 would otherwise
-     * re-expand (and re-hit) it on every relaxation iteration -- which for a
-     * runaway '!while' means paying the full iteration limit sixteen times
-     * over. Once expansion has failed, stop trying. */
     if(mp->had_error) return result;
 
     MLineVec *saved_out = mp->out;
@@ -11341,7 +8403,6 @@ static MLineVec macro_expand(MacroPP *mp, FILE *f, const char *display){
         if(mp->ctl == MCTL_BREAK || mp->ctl == MCTL_CONTINUE)
             m_fail(mp, display, -1, "'!break'/'!continue' outside a '!while' loop");
     } else {
-        /* m_fail() already reported; unwind whatever was left half-built. */
         memset(&result, 0, sizeof(result));
         while(mp->nscopes > saved_scopes){
             MScope *sc = mp->scopes[--mp->nscopes];
@@ -11357,17 +8418,8 @@ static MLineVec macro_expand(MacroPP *mp, FILE *f, const char *display){
     return result;
 }
 
-/* The single macro-preprocessor instance. main() creates exactly one
- * Assembler, so a file-static instance is enough and keeps the change to
- * struct Assembler (and every function that takes one) at zero. */
 static MacroPP g_macro;
 
-/* The pattern-file macro-preprocessor instance.
- *
- * Deliberately separate from g_macro: the two namespaces never see each
- * other, so a pattern file's macros cannot change how a source file expands
- * (and vice versa), and the per-pass macro_reset_pass() that fileassemble()
- * needs cannot wipe macros defined while reading the pattern file. */
 static MacroPP g_pat_macro;
 
 static void macro_init_pattern(Assembler *asmb){
@@ -11375,18 +8427,10 @@ static void macro_init_pattern(Assembler *asmb){
     g_pat_macro.pat_mode = 1;
 }
 
-/* Reset the pattern-side macro namespace. Called by readpat() when it enters
- * the top-level pattern file, so a second readpat() would start clean. */
 static void macro_reset_pass_pattern(void){
     macro_reset_pass(&g_pat_macro);
 }
 
-/* readpat() is defined long before the macro layer, and MLineVec is an
- * anonymous struct type that cannot be forward-declared, so the pattern
- * reader reaches the layer through this narrow wrapper instead: it expands
- * the already-open pattern file and hands back a plain NUL-terminated array
- * of line texts. The strings are copied out of the arena because readpat()
- * rewrites each line in place while parsing it. */
 static char **pat_macro_expand(FILE *f, const char *display, int *nlines){
     MLineVec v = macro_expand(&g_pat_macro, f, display);
     char **out = malloc(sizeof(char*) * (size_t)(v.len + 1));
@@ -11409,17 +8453,8 @@ static void pat_macro_expand_free(char **v, int n){
 static void fileassemble(Assembler *asmb, const char *fn){
     AsmState *st=&asmb->st;
 
-    /* Entering the top-level source file means a new assembly pass has begun
-     * (Pass 1 re-reads the whole file on every relaxation iteration, then
-     * Pass 2 reads it once more). The macro layer must start from a clean
-     * slate each time so that expansion is textually identical on every pass;
-     * macro state is deliberately NOT reset for a nested .INCLUDE, so a macro
-     * defined before the include stays visible inside it. */
     if(st->fnstack.len == 0) macro_reset_pass(&g_macro);
 
-    /* Fix ③ (axx.py): circular .INCLUDE detection.
-     * Compare absolute paths to catch relative-path aliases.
-     * stdin / (stdin) are compared by name only (no realpath). */
     {
         int is_stdin_fn = (strcmp(fn,"stdin")==0 || strcmp(fn,"(stdin)")==0);
         for(int si=0; si<st->fnstack.len; si++){
@@ -11431,7 +8466,6 @@ static void fileassemble(Assembler *asmb, const char *fn){
                 return;
             }
             if(!is_stdin_fn && !is_stdin_already){
-                /* Compare by resolved absolute path */
                 char abs_fn[4096]={0}, abs_al[4096]={0};
                 if(realpath(fn,   abs_fn) && realpath(already, abs_al)
                    && strcmp(abs_fn, abs_al)==0){
@@ -11442,19 +8476,6 @@ static void fileassemble(Assembler *asmb, const char *fn){
         }
     }
 
-    /* Bugfix (axx.py port): push `fn` itself (the file about to be entered)
-     * onto fnstack, not the caller's current_file. fnstack must contain the
-     * exact stack of files currently open so the cycle check above can see
-     * a file that re-includes ITSELF directly (`.INCLUDE` of its own name):
-     * pushing the caller's file instead left `fn` absent from fnstack for
-     * its first (direct) re-entry, so a self-including file got assembled
-     * twice -- duplicating its emitted bytes at wrong addresses -- before
-     * the cycle was finally caught one level deeper. current_file is saved
-     * in a local and restored from there in `done:` below instead, so
-     * fnstack purely tracks "files currently open" for cycle detection.
-     *
-     * Fix C-10 (still applies): push is always unconditional; pop must
-     * therefore also be unconditional. */
     char _caller_file[512];
     strncpy(_caller_file, st->current_file, sizeof(_caller_file)-1);
     _caller_file[sizeof(_caller_file)-1] = '\0';
@@ -11467,45 +8488,25 @@ static void fileassemble(Assembler *asmb, const char *fn){
     char *stdin_buf=NULL;
 
     if(strcmp(fn,"stdin")==0){
-        /* Fix C-6 / Fix C-N4: use a per-process unique temp file instead of
-         * the fixed name "axx.tmp" to avoid races when multiple caxx instances
-         * run concurrently.
-         *
-         * Fix C-N4: the old code set need_read=(st->pas==1), which caused stdin
-         * to be read again on every relaxation iteration (pas is always 1 inside
-         * the loop).  By the second iteration stdin is at EOF, so the temp file
-         * was overwritten with an empty string and all subsequent passes assembled
-         * nothing.
-         *
-         * Fix: read stdin exactly once – when stdin_tmp_path is first created.
-         * All subsequent calls (relaxation iterations + pass2) reuse the file. */
         if(st->stdin_tmp_path[0] == '\0'){
-            /* First call: create unique temp file AND read stdin into it. */
             char tmpl[] = "/tmp/axx_XXXXXX";
             int fd = mkstemp(tmpl);
             if(fd >= 0){
                 close(fd);
                 strncpy(st->stdin_tmp_path, tmpl, sizeof(st->stdin_tmp_path)-1);
             } else {
-                /* fallback to fixed name if mkstemp fails */
                 strncpy(st->stdin_tmp_path, "axx.tmp", sizeof(st->stdin_tmp_path)-1);
             }
             stdin_buf=file_input_from_stdin();
             FILE *tmpf=fopen(st->stdin_tmp_path,"wt");
             if(tmpf){ fwrite(stdin_buf,1,strlen(stdin_buf),tmpf); fclose(tmpf); }
         }
-        /* All passes (including relaxation iterations) reuse the same file. */
         fn=st->stdin_tmp_path;
     }
 
     f=axx_open_input(fn, "source file");
     if(!f) goto done;
     {
-        /* Macro-expand before assembling. macro_expand() returns
-         * (text, file, line) triples where `line` is the ORIGINAL source line
-         * the text came from, so assembler diagnostics, the -v listing and
-         * DWARF line records all keep pointing at real source rather than at
-         * expansion offsets. */
         MLineVec _mexp = macro_expand(&g_macro, f, st->current_file);
         fclose(f); f=NULL;
         for(int _mi=0; _mi<_mexp.len; _mi++){
@@ -11519,36 +8520,13 @@ static void fileassemble(Assembler *asmb, const char *fn){
 
 done:
     free(stdin_buf);
-    /* Fix C-10: pop unconditionally to mirror the unconditional push above.
-     * The original guarded the pop with (fnstack.len>0) which could silently
-     * leave current_file/ln unrestored if the stack was somehow empty.
-     * Bugfix (axx.py port): restore current_file from `_caller_file` (saved
-     * before the push above), not from fnstack's top -- fnstack now holds
-     * `fn` itself (needed so the cycle check above can see direct
-     * self-includes), not the caller's file, so reading it here would
-     * incorrectly "restore" current_file back to `fn`. */
     strncpy(st->current_file, _caller_file, sizeof(st->current_file)-1);
     st->current_file[sizeof(st->current_file)-1] = '\0';
     sv_pop(&st->fnstack);
     st->ln = is_pop(&st->lnstack);
 }
 
-/* =========================================================
- * setpatsymbols
- * ========================================================= */
 static void setpatsymbols(Assembler *asmb){
-    /* Fix 8 (axx.py): process .setsym AND .clearsym in pattern-file order,
-     * starting from an empty table.  The old code only called dir_set_symbol()
-     * and ignored .clearsym, so a pattern sequence like:
-     *   .setsym A 1
-     *   .clearsym
-     * would still leave A defined.  Also, calling dir_set_symbol() mutated
-     * st->symbols directly and then copied to patsymbols; if .clearsym wiped
-     * st->symbols before the copy, patsymbols ended up empty regardless of what
-     * .setsym defined earlier.
-     *
-     * Fix: build a fresh map by processing entries in order, then assign to
-     * both patsymbols and symbols (mirroring axx.py setpatsymbols()).         */
     SymMap fresh; smap_init(&fresh);
 
     for(int pi=0; pi<asmb->st.pat.len; pi++){
@@ -11556,9 +8534,6 @@ static void setpatsymbols(Assembler *asmb){
         if(!e) continue;
 
         if(strcmp(e->f[0],".setsym")==0){
-            /* Same readpat() 2-field-vs-3-field indexing quirk fixed in
-             * dir_set_symbol() above: a name-only ".setsym::FOO" line puts
-             * "FOO" in f[2], not f[1]. */
             const char *name_field = e->f[1][0] ? e->f[1] : e->f[2];
             const char *value_field = e->f[1][0] ? e->f[2] : "";
             char key[512]; axx_strupr_to(key,name_field,sizeof(key));
@@ -11576,22 +8551,12 @@ static void setpatsymbols(Assembler *asmb){
             }
             continue;
         }
-        /* Bugfix (axx.py port): apply `.bits` as soon as it's seen here, the
-         * same way, so `st->bts`/`st->endian_big` already reflect the
-         * pattern file's real word width by the time `main()` processes a
-         * `-i` label-import file (which happens right after this call,
-         * before any source line is assembled). `.bits` is normally only
-         * applied lazily while scanning `st->pat` during actual line
-         * assembly (inside lineassemble2()'s directive dispatch), which
-         * would otherwise leave st->bts at its default (8) during import,
-         * corrupting the bytes-per-word conversion imp_label() needs. */
         if(strcmp(e->f[0],".bits")==0){
             dir_bits(asmb, e);
             continue;
         }
     }
 
-    /* Assign fresh to patsymbols and sync symbols */
     smap_free(&asmb->st.patsymbols); smap_init(&asmb->st.patsymbols);
     smap_clear(&asmb->st.symbols);
     for(int i=0; i<fresh.nb; i++)
@@ -11602,34 +8567,14 @@ static void setpatsymbols(Assembler *asmb){
     smap_free(&fresh);
 }
 
-/* =========================================================
- * imp_label
- * ========================================================= */
 static int imp_label(Assembler *asmb, const char *l){
-    /* Parse TSV format produced by WRITE_EXPORT.
-     *
-     * Line formats (tab-separated):
-     *   section_name\tstart_hex\tsize_hex\t[flag]  <- section line (>=3 fields)
-     *   label_name\tvalue_hex                      <- label line  (2 fields)
-     *
-     * The old implementation used axx_skipspc() (space-only skip) together
-     * with axx_get_label_word() and assumed a space-separated
-     * "section label value" layout.  WRITE_EXPORT writes TAB-separated TSV
-     * with section and label information on separate lines, so the old code
-     * never parsed a single line correctly – imp_label always returned 0.
-     *
-     * Fix: split on '\t', distinguish line kind by field count, build a
-     * running imp_sections table for label→section resolution.
-     */
 
-    /* strip trailing CR/LF */
     char buf[4096];
     strncpy(buf, l, sizeof(buf)-1); buf[sizeof(buf)-1] = '\0';
     int blen = (int)strlen(buf);
     while(blen > 0 && (buf[blen-1]=='\n'||buf[blen-1]=='\r')) buf[--blen] = '\0';
     if(!buf[0]) return 0;
 
-    /* split on '\t' – at most 5 fields needed */
     char *fields[5]; int nfields = 0;
     char *p = buf;
     while(nfields < 5){
@@ -11641,7 +8586,6 @@ static int imp_label(Assembler *asmb, const char *l){
     }
 
     if(nfields >= 3){
-        /* section line: record start/size for later label->section lookup */
         const char *sname = fields[0];
         char *endp;
         uint64_t start = strtoull(fields[1], &endp, 16);
@@ -11658,14 +8602,6 @@ static int imp_label(Assembler *asmb, const char *l){
         strncpy(labelbuf, fields[0], sizeof(labelbuf)-1); labelbuf[sizeof(labelbuf)-1]='\0';
         const char *label = labelbuf;
         if(!label[0]) return 0;
-        /* 破綻点修正 (axx.py port): WRITE_EXPORTはreloc_type付きラベルを
-         * "labelname::reloctype" という1フィールドで書き出す(例:
-         * "myconst::abs64")が、ここではその"::"を一切分離せず
-         * フィールド全体をラベル名としてそのまま取り込んでいたため、
-         * インポート後は本来の"myconst"とは無関係な、実体の無い
-         * "myconst::abs64"という名前のグローバル未定義シンボルが
-         * 紛れ込み、かつ肝心のreloc_type情報はインポート後に
-         * 失われていた(常に-1固定で label_put_value に渡していた)。 */
         int reloc_type = -1;
         char *sep = strstr(labelbuf, "::");
         if(sep){
@@ -11681,10 +8617,6 @@ static int imp_label(Assembler *asmb, const char *l){
         uint64_t v = strtoull(fields[1], &endp, 16);
         if(endp == fields[1]) return 0;
 
-        /* determine section by range lookup in previously parsed sections.
-         * 破綻点修正 (axx.py port): imp_sectionsがSecRangeVec(断片ごと
-         * 複数エントリ可)になったため、同名の全断片を単純に線形走査
-         * すれば、再入セクションの2回目以降の断片も正しく拾える。 */
         const char *section = ".text";
         for(int i = 0; i < asmb->imp_sections.len; i++){
             SecRange *se = &asmb->imp_sections.data[i];
@@ -11693,29 +8625,6 @@ static int imp_label(Assembler *asmb, const char *l){
             if(sz > 0 && v >= s0 && v < s0 + sz){ section = se->name; break; }
             if(sz == 0 && v == s0)               { section = se->name; break; }
         }
-        /* 破綻点修正 (axx.py port): label_put_value() 経由(→lmap_set())
-         * では is_imported が常に0にリセットされ、インポートしたラベルが
-         * ELF出力上「このファイル内でローカルに実定義された値」として
-         * 書き出されてしまい、本来リンク時に解決されるべき外部シンボルが
-         * 誤ったローカル値のまま固定されるバグがあった(axx.py側は
-         * self.state.labels[label] = [v, section, False, True] と直接
-         * 代入しis_imported=Trueにしている)。.EXTERN と同じ経路である
-         * lmap_set_imported() を使い、is_imported=1 として登録する。 */
-        /* Bugfix (axx.py port): WRITE_EXPORT writes non-.EQU label addresses
-         * in BYTES (word_value * bpw, matching the ELF st_value convention;
-         * see the WRITE_EXPORT macro's byte_start/lbl_addr computation).
-         * But every other consumer of a label's stored value (ELF st_value,
-         * DWARF addresses, $$/$. pc-relative math, ...) treats it as a raw
-         * WORD pc and multiplies by bpw itself. Storing `v` here unconverted
-         * double-counted bpw for every reference to an imported label
-         * whenever bpw != 1 (st->bts not a multiple of 8) -- e.g. a label
-         * imported at byte offset 4 on a 16-bit-word target (bpw=2) was
-         * silently treated as word offset 4 (byte 8) instead of the correct
-         * word offset 2. The section-membership lookup just above
-         * intentionally still compares the byte-scaled `v` against
-         * imp_sections' byte-scaled ranges (both written by the same
-         * WRITE_EXPORT, so mutually consistent); only the value finally
-         * stored needs converting back to words. */
         {
             int _bpw = (asmb->st.bts+7)/8; if(_bpw<1) _bpw=1;
             v /= (uint64_t)_bpw;
@@ -11727,9 +8636,6 @@ static int imp_label(Assembler *asmb, const char *l){
     return 0;
 }
 
-/* =========================================================
- * main
- * ========================================================= */
 static void print_usage(const char *prog){
     printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-f {32,64}] [-m machine] [-v] [-d] [-g] [--no-macro] [-P [file]] [-p [file]]\n",prog);
     printf("  --no-macro   disable the macro preprocessor layer (!if/!while/!def/!return/!set and !{...})\n");
@@ -11738,12 +8644,6 @@ static void print_usage(const char *prog){
     printf("axx general assembler programmed and designed by Taisuke Maekawa\n");
 }
 
-/* 破綻点修正6 (axx.py port): Pass1リラクゼーションの振動検出。
- * 直前の1回とだけ比較していると、周期2以上で振動するレイアウト
- * (A→B→A→B→...)をMAX_RELAX回使い切るまで検出できない。過去に見た
- * 全レイアウトの履歴(history[])と比較し、以前に見たものへ戻ったら
- * その時点で振動として検出する。比較基準は既存の収束判定と同じ
- * (エントリ数が一致し、全ラベルの値・所属セクションが一致)。 */
 static int label_maps_equal(LabelMap *a, LabelMap *b) {
     if (a->count != b->count) return 0;
     for (int bi = 0; bi < a->nbuckets; bi++)
@@ -11769,12 +8669,6 @@ typedef struct {
     int     nu;
 } OSABIENT;
 
-/* 破綻点修正 (axx.py port): 小文字表記("linux"/"freebsd")のエントリが
- * 無かったため、find_osabi()は大文字小文字完全一致のみで判定し、
- * 未知値扱いになった場合は警告も出さずに黙ってFreeBSD(デフォルトと
- * 同じ値)へフォールバックしていた。既定値がたまたまFreeBSDのため、
- * "--osabi linux"のように小文字でLinuxを明示指定したつもりが、
- * ユーザに一切気づかれないままFreeBSDとして出力される事故になっていた。 */
 static OSABIENT osabitbl[]={{"Linux",0},{"linux",0},{"FreeBSD",9},{"freebsd",9},{"EOTBL",-1}};
 
 int find_osabi( char *osname ) {
@@ -11788,7 +8682,7 @@ int find_osabi( char *osname ) {
     }
 }
 
-    
+
 int main(int argc, char *argv[]){
     if(argc==1){ print_usage(argv[0]); return 0; }
 
@@ -11800,9 +8694,9 @@ int main(int argc, char *argv[]){
     macro_init_pattern(asmb);
 
     const char *patternfile=NULL, *sourcefile=NULL;
-    char osabistr[16]="FreeBSD"; /* ELF_OSABI Default: FreeBSD */
-    const char *macro_expand_dest=NULL;   /* -P: "-" = stdout */
-    const char *pat_macro_expand_dest=NULL; /* -p: "-" = stdout */
+    char osabistr[16]="FreeBSD";
+    const char *macro_expand_dest=NULL;
+    const char *pat_macro_expand_dest=NULL;
 
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--osabi")==0&&i+1<argc){ strncpy(osabistr,argv[++i],sizeof(osabistr)-1); }
@@ -11812,8 +8706,6 @@ int main(int argc, char *argv[]){
         else if(strcmp(argv[i],"-i")==0&&i+1<argc){ strncpy(st->impfile,argv[++i],sizeof(st->impfile)-1); }
         else if(strcmp(argv[i],"-o")==0&&i+1<argc){ strncpy(st->elf_objfile,argv[++i],sizeof(st->elf_objfile)-1); }
         else if(strcmp(argv[i],"-f")==0&&i+1<argc){
-            /* -f {32,64}: ELF class for -o output, independent of -m.
-             * Mirrors axx.py's `-f`/argparse choices=(32,64) check. */
             const char *_fs = argv[++i];
             if(strcmp(_fs,"64")==0){ st->elf_class = 2; }
             else if(strcmp(_fs,"32")==0){ st->elf_class = 1; }
@@ -11824,12 +8716,6 @@ int main(int argc, char *argv[]){
         }
         else if(strcmp(argv[i],"-m")==0&&i+1<argc){
             int _mval = atoi(argv[++i]);
-            /* axx.py port: reject any machine number ELF_MACHINES doesn't
-             * know correct relocation numbering for, rather than accepting
-             * any 16-bit value and silently falling back to x86_64-shaped
-             * relocations for an unrecognized one (that used to be this
-             * check's only job -- range-only, no whitelist -- mirrors
-             * axx.py's `args.elf_machine not in ELF_MACHINES` check). */
             if(!elf_machine_find(_mval)){
                 char _known[512]; int _kn=0;
                 for(int _mi=0; _mi<ELF_MACHINES_N && _kn < (int)sizeof(_known)-40; _mi++){
@@ -11855,12 +8741,6 @@ int main(int argc, char *argv[]){
             if(!*pat_macro_expand_dest) pat_macro_expand_dest="-";
         }
         else if(strcmp(argv[i],"-p")==0||strcmp(argv[i],"--macro-expand-pattern")==0){
-            /* Optional argument, same shape as -P but keyed on the pattern
-             * file alone: -p never needs a source file, so requiring one just
-             * to name an output file would be a trap. Consume the next token
-             * only when it is not another option and the pattern file is
-             * already in hand, so "-p pat.axx" still keeps pat.axx as the
-             * pattern file rather than eating it as the destination. */
             if(i+1<argc && argv[i+1][0]!='-' && patternfile)
                 pat_macro_expand_dest=argv[++i];
             else
@@ -11871,9 +8751,6 @@ int main(int argc, char *argv[]){
             if(!*macro_expand_dest) macro_expand_dest="-";
         }
         else if(strcmp(argv[i],"-P")==0||strcmp(argv[i],"--macro-expand")==0){
-            /* Optional argument: consume the next token only when it is not
-             * another option and not the (still unseen) positional source
-             * file -- i.e. only when both positionals are already in hand. */
             if(i+1<argc && argv[i+1][0]!='-' && patternfile && sourcefile)
                 macro_expand_dest=argv[++i];
             else
@@ -11889,8 +8766,6 @@ int main(int argc, char *argv[]){
             }
         }
         else{
-            /* Unknown option: fail loudly rather than silently ignoring it,
-             * matching axx.py (argparse) behaviour. */
             fprintf(stderr,"error: unknown option '%s'.\n",argv[i]);
             print_usage(argv[0]);
             return 1;
@@ -11902,7 +8777,7 @@ int main(int argc, char *argv[]){
         fprintf(stderr, "warning: unknown --osabi value '%s'; "
                 "valid choices are Linux/linux/FreeBSD/freebsd. Using 'FreeBSD'.\n",
                 osabistr);
-        osa = find_osabi("FreeBSD"); /* Fall back to Default FreeBSD */
+        osa = find_osabi("FreeBSD");
     }
     st->osabi = osa;
 
@@ -11912,9 +8787,6 @@ int main(int argc, char *argv[]){
     setpatsymbols(asmb);
 
     if(st->impfile[0]){
-        /* Fix: a missing/unreadable -i import file used to be ignored in
-         * complete silence, producing a binary in which every imported
-         * symbol resolved to 0.  Report it (axx.py port). */
         FILE *lf=axx_open_input(st->impfile, "import file");
         if(!lf){ exit_code=1; goto cleanup; }
         { char *l=NULL; size_t lc=0; while(getline(&l,&lc,lf)!=-1) imp_label(asmb,l); free(l); fclose(lf); }
@@ -11922,10 +8794,6 @@ int main(int argc, char *argv[]){
 
     if(st->outfile[0]) remove(st->outfile);
 
-    /* -p/--macro-expand-pattern: the pattern-file counterpart of -P. Runs only
-     * the macro layer over the pattern file and writes the expanded pattern
-     * text out, then stops. .INCLUDEd pattern files are NOT followed (the
-     * pattern reader pulls those in, not this layer); !included ones are. */
     if(pat_macro_expand_dest){
         if(!patternfile){
             axx_diagf(0, 0, " error - -p/--macro-expand-pattern needs a pattern file.\n");
@@ -11957,11 +8825,6 @@ int main(int argc, char *argv[]){
         goto cleanup;
     }
 
-    /* -P/--macro-expand: run only the macro layer over the source file and
-     * write the expanded assembly out, then stop. Note that .INCLUDEd files
-     * are NOT followed here (they are pulled in by the assembler, not by this
-     * layer); !included files are, since those are expanded by the macro
-     * layer itself. */
     if(macro_expand_dest){
         if(!sourcefile){
             axx_diagf(0, 0, " error - -P/--macro-expand needs a source file.\n");
@@ -11995,24 +8858,11 @@ int main(int argc, char *argv[]){
         strncpy(st->current_file,"(stdin)",sizeof(st->current_file)-1);
         char *line=NULL; size_t lcap=0;
         while(1){
-            /* Mirrors Python printaddr() + input(">> "):
-             *   print("%016x: " % pc, end='')
-             *   line = input(">> ")                                  */
             printf("%016llx: >> ",(unsigned long long)u256_to_u64(st->pc));
             fflush(stdout);
             if(getline(&line,&lcap,stdin)==-1) break;
             int ll=(int)strlen(line);
             while(ll>0&&(line[ll-1]=='\n'||line[ll-1]=='\r')) line[--ll]=0;
-            /* Bugfix (axx.py port): this used to also do an extra
-             * "replace('\\\\','\\')" pass here, mirroring what was (also
-             * buggily) in axx.py. That pre-collapsed backslash pairs
-             * BEFORE the line ever reached the normal string-literal
-             * escape processing (.ASCII/asciistr etc.), which already
-             * correctly interprets '\\' as one escaped backslash --
-             * double-processing it silently produced different bytes in
-             * interactive/stdin mode than the identical line assembled
-             * from a file would. Removed; both modes now agree. */
-            /* Python: line = line.strip() */
             ll=(int)strlen(line);
             while(ll>0&&line[ll-1]==' ') line[--ll]=0;
             int start=0; while(line[start]==' ') start++;
@@ -12023,31 +8873,7 @@ int main(int argc, char *argv[]){
         }
         free(line);
     } else {
-        /* Fix C-3: pass1 relaxation loop.
-         *
-         * For variable-length instruction architectures, a single pass1 may
-         * estimate instruction sizes incorrectly when forward references force
-         * label values to 0.  This shifts all subsequent label addresses, which
-         * in turn may change instruction sizes again.
-         *
-         * Fix: repeat pass1 (up to MAX_RELAX times) until every label's PC
-         * value is identical to the previous iteration ("converged").  Then
-         * run pass2 once against the stable label table.
-         *
-         * For fixed-size ISAs the loop converges in one iteration (no change).
-         *
-         * Fix 5  (axx.py): imported labels (-i option) must be restored at the
-         *   start of every iteration; a bare lmap_free+lmap_init discards them.
-         * Fix ⑧ (axx.py): vars (a-z) must be reset to their pre-loop state at
-         *   the start of every iteration.
-         * Fix ⑤ (axx.py): if any label value is UNDEF (0xff…ff) do not consider
-         *   the iteration converged; UNDEF == UNDEF is a false convergence.
-         * Fix ⑥-2 (axx.py): convergence snapshot includes section membership,
-         *   not just PC value.
-         */
-#define MAX_RELAX 16   /* A (axx.py port): relaxation now actually iterates; allow more headroom */
-        /* Fix 5: snapshot imported labels before the relaxation loop so they
-         * can be restored at the start of each iteration. */
+#define MAX_RELAX 16
         LabelMap imported_labels;
         lmap_init(&imported_labels);
         for(int bi=0; bi<st->labels.nbuckets; bi++)
@@ -12055,7 +8881,6 @@ int main(int argc, char *argv[]){
                 lmap_set_full(&imported_labels, e->key, e->value, e->section,
                               e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
 
-        /* Fix ⑧: snapshot initial vars (a-z) */
         PatVar    initial_vars[26];
         memcpy(initial_vars, st->vars, sizeof(initial_vars));
 
@@ -12063,82 +8888,33 @@ int main(int argc, char *argv[]){
         lmap_init(&prev_labels);
         int converged = 0;
 
-        /* 破綻点修正6: 振動検出用のレイアウト履歴(label_maps_equal参照)。 */
         LabelMap history[MAX_RELAX];
         int history_count = 0;
 
-        /* A (axx.py port): expose the previous-iteration snapshot to
-         * label_get_value() so pass1 forward references resolve to their prior
-         * address. prev_labels is updated at the END of each iteration, so at
-         * the START of iteration N it holds iteration N-1's values (empty on
-         * the first iteration => forward refs fall back to 0/UNDEF, correct). */
         st->relax_prev = &prev_labels;
 
         for(int relax=0; relax<MAX_RELAX; relax++){
-            /* Only the first iteration has no previous-iteration estimates to
-             * work from; from the second onwards every forward reference
-             * resolves through relax_prev. */
             st->relax_optimistic = (relax == 0);
             st->pc=u256_zero(); st->pas=1; st->ln=1;
-            /* Fix 5: restore imported labels instead of starting from empty */
             lmap_free(&st->labels); lmap_init(&st->labels);
             for(int bi=0; bi<imported_labels.nbuckets; bi++)
                 for(LabelEntry *e=imported_labels.buckets[bi]; e; e=e->next)
                     lmap_set_full(&st->labels, e->key, e->value, e->section,
                                   e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
-            /* reset sections and export_labels too (mirrors axx.py run()) */
             secmap_clear(&st->sections);
             secrangevec_clear(&st->section_ranges);
-            /* Bug修正(axx.py port): reset current_section so that the previous
-             * iteration's trailing section (.data etc.) does not become old_sec
-             * at the next iteration's start and get wrongly registered at pc=0. */
             strcpy(st->current_section, ".text");
             lmap_free(&st->export_labels); lmap_init(&st->export_labels);
             sv_free(&st->export_order);
-            /* Fix C-N6: reset symbols to the post-pattern-file baseline at the
-             * start of every relaxation iteration (patsymbols is immutable
-             * after the initial setpatsymbols() call now that source-level
-             * .setsym/.clearsym has been removed; only symbols needs
-             * resetting here, since the per-line pattern-file replay
-             * mutates it during matching). */
             smap_clear(&st->symbols);
             for(int pi=0; pi<st->patsymbols.nb; pi++)
                 for(SymEntry *se2=st->patsymbols.buckets[pi]; se2; se2=se2->next)
                     smap_set(&st->symbols, se2->key, se2->val);
-            /* Fix ⑧: restore vars to pre-loop state */
             memcpy(st->vars, initial_vars, sizeof(st->vars));
             fileassemble(asmb,sourcefile);
 
-            /* Bug修正(axx.py port): finalize the last section's size.
-             * adir_section() only updates old_sec when switching sections, so the
-             * final (trailing) section never gets its size updated.
-             * Mirrors axx.py run(): _blk1 = pc - entry_pc; _e1[1] += _blk1 */
             secmap_finalize_current(st);
 
-            /* Fix ⑤: if any label is UNDEF, do not treat this as converged.
-             * Fix ⑥-2: convergence check includes section membership as well
-             * as PC value (mirrors axx.py current_pcs = {k: (v[0], v[1]) ...}).
-             * Fix ⑮ (axx.py port): values >= 2^128 are also treated as UNDEF-derived.
-             *   UNDEF = 2^256-1; UNDEF+offset etc. produce huge but not all-ones values.
-             *   In practice no real assembler PC exceeds 2^128, so treat anything
-             *   that large as an unresolved forward-reference (mirrors axx.py
-             *   _UNDEF_THRESHOLD = 1 << 128 logic).
-             *   is_equ labels hold arbitrary integer constants and are excluded
-             *   from this check (they may legitimately be large).
-             *
-             * NOTE: this loop already skips is_equ labels above, so every
-             * entry reaching the check below is an address label (value is
-             * always a concrete `st->pc`, which never legitimately equals -1
-             * or any other huge value). It intentionally keeps the bit-
-             * pattern test (u256_is_undef_derived) rather than e->is_undef:
-             * the two ask different questions -- e->is_undef records whether
-             * a .equ's *defining expression* failed, whereas this needs "is
-             * this address label's pc still an unresolved placeholder from an
-             * earlier relaxation iteration", which address labels never carry
-             * an is_undef flag for at all (it's hard-coded 0 at
-             * label_put_value()'s address-label call site). Swapping this to
-             * e->is_undef would make has_undef never fire and silently break
-             * relaxation convergence detection. */
             int has_undef = 0;
             for(int bi=0; bi<st->labels.nbuckets && !has_undef; bi++)
                 for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next){
@@ -12146,10 +8922,6 @@ int main(int argc, char *argv[]){
                     if(u256_is_undef_derived(e->value)){ has_undef=1; break; }
                 }
 
-            /* 破綻点修正6: 直前の1回だけでなく、履歴中の全レイアウトと比較する。
-             * cycle_len==1なら従来通りの単純収束、2以上なら振動として検出し、
-             * MAX_RELAX回を待たずに明確なエラーで打ち切る(誤ったバイナリを
-             * 黙って出力しないため)。 */
             converged = 0;
             if(!has_undef){
                 int first_seen = -1;
@@ -12161,12 +8933,6 @@ int main(int argc, char *argv[]){
                     if(cycle_len == 1){
                         converged = 1;
                     } else {
-                        /* force=1: this fires during pass 1, which
-                         * should_report_errors() normally suppresses, so
-                         * without it the user only ever saw the bare
-                         * "Aborting: no output file written." line with no
-                         * reason attached. axx.py passes force=True at the
-                         * matching call site. */
                         axx_diagf(0, 1, " error - Pass1 relaxation is oscillating with period %d "
                                    "(the instruction layout at iteration %d is identical to "
                                    "iteration %d); it will never converge by simple repetition.\n",
@@ -12185,8 +8951,6 @@ int main(int argc, char *argv[]){
                 }
             }
 
-            /* Update prev_labels snapshot (label_get_value()の前方参照推定用。
-             * 振動検出のhistory[]とは別目的なので、こちらは従来通り毎回更新する)。 */
             lmap_free(&prev_labels); lmap_init(&prev_labels);
             for(int bi=0; bi<st->labels.nbuckets; bi++)
                 for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
@@ -12201,8 +8965,6 @@ int main(int argc, char *argv[]){
             }
         }
         for(int hi=0; hi<history_count; hi++) lmap_free(&history[hi]);
-        /* A (axx.py port, 指摘3): snapshot pass1-final addresses (is_equ=0 only)
-         * for the pass1<->pass2 consistency check performed after pass2. */
         LabelMap pass1_final;
         lmap_init(&pass1_final);
         for(int bi=0; bi<st->labels.nbuckets; bi++)
@@ -12213,17 +8975,10 @@ int main(int argc, char *argv[]){
 
         lmap_free(&prev_labels);
         lmap_free(&imported_labels);
-        /* A: relaxation is done; pass2 must NOT consult the (now-freed) snapshot. */
         st->relax_prev = NULL;
-        /* ...nor the first-iteration optimistic seed (pass 2 must report a
-         * genuinely undefined label, not silently estimate it). */
         st->relax_optimistic = 0;
 
         if(!converged){
-            /* Fix: 収束しなかった場合は単なる警告ではなく致命的エラーとする。
-             * 収束前提のPass2アドレスは信頼できないため、Pass2実行・出力書き込み
-             * を行わずここで打ち切る(誤ったバイナリを黙って出力しないため)。 */
-            /* force=1 for the same reason as the oscillation diagnostic above. */
             axx_diagf(0, 1, " error - Pass1 relaxation did not converge after %d iterations; "
                        "addresses would be incorrect for variable-length instructions "
                        "with forward references.\n", MAX_RELAX);
@@ -12235,43 +8990,23 @@ int main(int argc, char *argv[]){
 #undef MAX_RELAX
 
         st->pc=u256_zero(); st->pas=2; st->ln=1;
-        /* reset relocations before pass2 (mirrors axx.py run()) */
         for(int ri=0;ri<st->reloc_count;ri++){
             free(st->relocations[ri].section);
             free(st->relocations[ri].sym);
         }
         st->reloc_count=0;
-        /* reset DWARF line map before pass2 (only pass2 fills it) */
         for(int _li=0;_li<st->line_map_len;_li++){
             free(st->line_map[_li].section);
             free(st->line_map[_li].file);
         }
         st->line_map_len=0;
-        /* Fix 5 (new) (axx.py port): reset sections before pass2 so stale
-         * provisional sizes from pass1 do not carry over.  labels and
-         * patsymbols do NOT need resetting here (only sections): symbols
-         * are only ever set by the pattern file (source-level .setsym/
-         * .clearsym has been removed), so patsymbols is immutable after
-         * the initial setpatsymbols() call and needs no per-pass reset. */
         secmap_clear(&st->sections);
         secrangevec_clear(&st->section_ranges);
-        /* Bug修正(axx.py port): reset current_section before pass2 (mirrors
-         * axx.py: self.state.current_section = '.text' before pass2 fileassemble). */
         strcpy(st->current_section, ".text");
         fileassemble(asmb,sourcefile);
 
-        /* Bug修正(axx.py port): finalize the last section's size after pass2.
-         * Mirrors axx.py run():
-         *   _last_sec = self.state.current_section
-         *   if not _confirmed: _e[1] += (pc - entry_pc) */
         secmap_finalize_current(st);
 
-        /* A (axx.py port, 指摘3): pass1<->pass2 address consistency check (safety net).
-         * If any non-.equ label's pass2 address differs from its pass1-final
-         * address, the emitted binary's addresses are unreliable (relaxation did
-         * not fully converge). The old code emitted such a binary silently.
-         * Two passes: first count all drifts (so the header can include the
-         * count, matching axx.py exactly), then print up to 10 details. */
         {
             int drift_count = 0;
             for(int bi=0; bi<st->labels.nbuckets; bi++)
@@ -12302,9 +9037,6 @@ int main(int argc, char *argv[]){
                     }
                 if(drift_count > 10)
                     fprintf(stderr,"           ... and %d more.\n", drift_count - 10);
-                /* Fix: 従来はエラー表示のみで出力を続けていたため、アドレスが
-                 * 不正なオブジェクトファイルがそのまま生成されていた。ここで
-                 * 中断し、出力ファイルを書かない。 */
                 fprintf(stderr,"         Aborting: no output file written.\n");
                 lmap_free(&pass1_final);
                 exit_code = 1;
@@ -12313,13 +9045,6 @@ int main(int argc, char *argv[]){
         }
         lmap_free(&pass1_final);
 
-        /* Bugfix (axx.py port): a genuine per-line error during pass2
-         * (undefined label, syntax error, illegal pattern match, label
-         * conflict) must abort the build instead of silently writing a
-         * shorter/wrong binary and exiting 0. Previously fileassemble()'s
-         * per-line return values were discarded entirely and no run-wide
-         * error state existed, so main() always reached this point and
-         * wrote output regardless of errors printed above. */
         if(st->had_error){
             axx_diagf(0, 0, " error - one or more errors were reported during assembly; "
                        "output would be incomplete or wrong.\n");
@@ -12331,13 +9056,8 @@ int main(int argc, char *argv[]){
 
     binary_flush(st);
 
-    /* Fix (axx.py port): binary_flush() can itself report an error (output
-     * size over the 1 GiB cap), in which case no binary is written -- but
-     * nothing looked at had_error afterwards, so caxx exited 0 and a build
-     * script saw a successful run that had produced no file. */
     if(st->had_error){ exit_code = 1; goto cleanup; }
 
-    /* ELF relocatable object output (-o option) */
     if(st->elf_objfile[0]){
         write_elf_obj(st, st->elf_objfile, st->elf_machine);
         if(st->had_error){
@@ -12349,22 +9069,11 @@ int main(int argc, char *argv[]){
         }
     }
 
-    /* Fix #2: -e と -E が同時指定された場合、元のコードは expfile_elf で
-     * st->expfile を上書きしてから一回だけ書き出していたため -e ファイルが
-     * 消えていた。修正: write_export() を分離し、-e と -E をそれぞれ独立して
-     * 書き出す。両方指定された場合は警告を表示する。             */
     if(st->expfile_elf[0] && st->expfile[0])
         fprintf(stderr,"warning: both -e '%s' and -E '%s' specified; "
                 "exporting plain format to -e and ELF format to -E separately.\n",
                 st->expfile, st->expfile_elf);
 
-    /* Helper lambda (as a nested function via a local write) */
-    /* Fix (axx.py port):
-     *   1. Section start/size are stored in word units; imp_label() expects byte
-     *      units.  Multiply by bytes-per-word (_bpw_export) before writing.
-     *   2. Label addresses are also word-unit PCs; convert to bytes.
-     *      Exception: is_equ=1 labels are absolute constants, not PCs – no conversion.
-     *   Mirrors axx.py _write_export() / _bpw_export logic. */
     int _bpw_export = ((st->bts + 7) / 8);
     if(_bpw_export < 1) _bpw_export = 1;
 
@@ -12378,14 +9087,7 @@ int main(int argc, char *argv[]){
                     if(strcmp(e->name,".text")==0) flag="AX"; \
                     else if(strcmp(e->name,".data")==0) flag="WA"; \
                 } \
-                /* 破綻点修正 (axx.py port): セクションが複数回出入り \
-                 * した場合(.text→.data→.text等)、真の訪問範囲は複数の \
-                 * 断片に分かれる。以前はst->sections[i]の(最小開始pc, \
-                 * 累積サイズ)を単一の範囲として書き出していたため、 \
-                 * 2回目以降の断片の実際のpc位置を全くカバーしない \
-                 * 不正な範囲になり、-iでインポートした際にラベルの \
-                 * 所属セクションを誤判定する原因になっていた。 \
-                 * st->section_rangesから断片ごとに個別の行を書き出す。 */ \
+ \
                 int _wrote_any = 0; \
                 for(int j=0;j<st->section_ranges.len;j++){ \
                     SecRange *sr=&st->section_ranges.data[j]; \
@@ -12410,7 +9112,7 @@ int main(int argc, char *argv[]){
             for(int i=0;i<st->export_order.len;i++){ \
                 LabelEntry*e=lmap_find(&st->export_labels, st->export_order.data[i]); \
                 { \
-                    if(!e || e->is_undef) continue; /* same fix as write_elf_obj()'s .symtab loop -- see LabelEntry.is_undef */ \
+                    if(!e || e->is_undef) continue;  \
                     unsigned long long lbl_addr; \
                     if(e->is_equ){ \
                         lbl_addr=(unsigned long long)u256_to_u64(e->value); \
@@ -12418,9 +9120,7 @@ int main(int argc, char *argv[]){
                         lbl_addr=(unsigned long long)u256_to_u64(e->value) \
                                  *(unsigned long long)_bpw_export; \
                     } \
-                    /* axx.py: emit ::reloc_type suffix if reloc_type_override is set, \
-                     * looking up the symbolic name from ELF_MACHINES (axx.py port: \
-                     * single source of truth, was a hardcoded x86_64-only switch). */ \
+ \
                     char _rtype_sfx[80]=""; \
                     if(elf_){ \
                         LabelEntry *_full=lmap_find(&st->labels,e->key); \
@@ -12442,14 +9142,12 @@ int main(int argc, char *argv[]){
 
     #undef WRITE_EXPORT
 
-    /* Fix C-6: clean up the per-process stdin temp file if one was created. */
 cleanup:
     if(st->stdin_tmp_path[0]){
         unlink(st->stdin_tmp_path);
         st->stdin_tmp_path[0] = '\0';
     }
 
-    /* Free the DWARF line map (strdup'd section/file strings + array). */
     for(int _li=0;_li<st->line_map_len;_li++){
         free(st->line_map[_li].section);
         free(st->line_map[_li].file);
