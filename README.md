@@ -92,7 +92,7 @@ Thinking Machines - Massively parallel
 
 The execution platform is also independent of specific systems. It ignores `chr(13)` at the end of lines in DOS files. It should work on any system that runs Python.
 
-axx does not support practical features such as the optimizations found in specialized assemblers, or high-level macros that translate structured or functional assembly constructs into imperative assembly. However, it does include standard macro capabilities. Since the basic functionality is present, you can adapt it for more advanced use cases.
+axx does not support features such as the optimizations found in specialized assemblers, or high-level macros that translate structured or functional assembly constructs into imperative assembly. However, it does include standard macro capabilities. Since the basic functionality is present, you can adapt it for more advanced use cases.
 
 Because pattern files and source files are separated, it's possible to generate machine code for a different processor from the source code of one instruction set, provided you don't consider the effort involved in coding. It's also possible to generate machine code for different processors from a common language. 
 
@@ -1299,9 +1299,6 @@ NOP
 * Specifying the `-i` option imports labels from a TSV file. Specifying the `-e` option exports the labels specified in `.export`, along with the section/segment to which they belong, to a TSV file.
 
 * Creating axx pattern files is difficult with a large ISA, and since the specifications are fixed, I hope that AI can handle this. While assemblers were originally created to make machine code easier for humans to understand, in today's world where AI writes code, a generalized assembler for both assembly language and computers would be beneficial.
-
-* I don' like the massive, complex, and existential nature of LLVM, so I aimed for a simple, beautiful, and essential structure. However, due to circumstances, I used AI too much in the coding, resulting in complex code. I regret this. Is this how programming is these days? Even so, I believe the purity of the design philosophy remains.
-
 
 ### Unimplemented Items
 
