@@ -48,6 +48,7 @@ The bundled files and their matching test sources are:
 | **x86_64m.axx** | 935 KB | ~5,787 | **hello.s** (or macro-enabled sources) | x86_64-v3 with macros. Also used in demos such as the Brainfuck interpreter |
 | **6809.axx** | 125 KB | ~1,950 | **6809.s** | Motorola 6809 |
 | **68000.axx** | 41 KB | ~378 | **68000.s** | Motorola 68000 (present in the repository; not listed in the older FILE_DESCRIPTION) |
+| **6800.axx** | 18 KB | ~271 | **6800.s** | Motorola 6800 |
 | **6502.axx** | 15 KB | ~192 | **6502.s** | MOS 6502 |
 | **z80.axx** | 7.5 KB | ~283 | **z80.s** | Zilog Z80 |
 | **8048.axx** | 6.4 KB | ~95 | **8048.s** | Intel 8048 |
