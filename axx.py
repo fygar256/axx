@@ -2822,7 +2822,7 @@ def _expects_expr(t, idx):
 
 
 class PatternMatcher:
-    """ソース行とパターンの照合を行う。
+    r"""ソース行とパターンの照合を行う。
     
     字句解析をせず1文字ずつ突き合わせる。パターン側の文字の意味は:
       大文字        大小無視でリテラル一致（ニーモニック）
@@ -6773,9 +6773,15 @@ class Assembler:
                 continue
             if a in ('-P', '--macro-expand', '-p', '--macro-expand-pattern'):
                 need = 1 if a in ('-p', '--macro-expand-pattern') else 2
-                if (i + 1 < len(argv) and not argv[i + 1].startswith('-')
+                nxt = argv[i + 1] if i + 1 < len(argv) else None
+                if nxt == '-':
+                    # An explicit "-" always names stdout. Consume it here so
+                    # that argparse never sees it as a stray positional.
+                    out += [a, '-']
+                    i += 2
+                elif (nxt is not None and not nxt.startswith('-')
                         and positional >= need):
-                    out += [a, argv[i + 1]]
+                    out += [a, nxt]
                     i += 2
                 else:
                     out += [a, '-']

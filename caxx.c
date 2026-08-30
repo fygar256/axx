@@ -8810,7 +8810,13 @@ int main(int argc, char *argv[]){
             if(!*pat_macro_expand_dest) pat_macro_expand_dest="-";
         }
         else if(strcmp(argv[i],"-p")==0||strcmp(argv[i],"--macro-expand-pattern")==0){
-            if(i+1<argc && argv[i+1][0]!='-' && patternfile)
+            /* An explicit "-" always names stdout; consume it so that it is
+               not left behind to be reported as an unknown option. */
+            if(i+1<argc && strcmp(argv[i+1],"-")==0){
+                pat_macro_expand_dest="-";
+                i++;
+            }
+            else if(i+1<argc && argv[i+1][0]!='-' && patternfile)
                 pat_macro_expand_dest=argv[++i];
             else
                 pat_macro_expand_dest="-";
@@ -8820,7 +8826,13 @@ int main(int argc, char *argv[]){
             if(!*macro_expand_dest) macro_expand_dest="-";
         }
         else if(strcmp(argv[i],"-P")==0||strcmp(argv[i],"--macro-expand")==0){
-            if(i+1<argc && argv[i+1][0]!='-' && patternfile && sourcefile)
+            /* An explicit "-" always names stdout; consume it so that it is
+               not left behind to be reported as an unknown option. */
+            if(i+1<argc && strcmp(argv[i+1],"-")==0){
+                macro_expand_dest="-";
+                i++;
+            }
+            else if(i+1<argc && argv[i+1][0]!='-' && patternfile && sourcefile)
                 macro_expand_dest=argv[++i];
             else
                 macro_expand_dest="-";
