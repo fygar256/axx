@@ -77,8 +77,7 @@ It extracts the essential commonalities of the von Neumann architecture, metamod
 
 # Text
 
-axx.py is a general assembler that generalizes assembly language. It can process almost any processor architecture. A pattern file (processor description file) is required to process individual processor architectures. While you can define free-form instructions, creating a pattern file according to the target processor's assembly language allows it to process that processor's assembly language, albeit with slightly different notation. Essentially, it's just a grammatical rule for instructions and binary generation based on it. axx targets not only virtual CPUs but also "abstracted real CPUs." Converting the specifications of a real processor into a pattern file allows for direct assembly. In that sense, creating pattern files for large ISAs is well-suited to AI, considering the human effort involved. Creating pattern files for large ISAs is time-consuming, but once created, the ISA is complete and can be reused. For a small ISA, using axx allows you to have AI quickly generate the pattern file and complete the assembler. Since the axx pattern file itself lacks an explicit structure, it is well-suited for unstructured assembly code; however, you can also use the `.check` directive to express structured operations—such as `MOVabc r,s` involving the Cartesian product of a=[a1, a2, a3], b=[b1, b2, b3], and c=[c1, c2, c3]. Notation such as `movem d1 d2 d4` can also be expressed using the `.check` directive and the syntax `MOVEM [[ a [[ b [[ c [[ d ]]]]]]]]`. axx operates at a lower level than LLVM, CGen, or customasm.
-
+axx.py is a general assembler that generalizes assembly language. It can process almost any processor architecture. A pattern file (processor description file) is required to process individual processor architectures. While you can define free-form instructions, creating a pattern file according to the target processor's assembly language allows it to process that processor's assembly language, albeit with slightly different notation. Essentially, it's just a grammatical rule for instructions and binary generation based on it. axx targets not only virtual CPUs but also "abstracted real CPUs." Converting the specifications of a real processor into a pattern file allows for direct assembly. In that sense, creating pattern files for large ISAs is well-suited to AI, considering the human effort involved. Creating pattern files for large ISAs is time-consuming, but once created, the ISA is complete and can be reused. For a small ISA, using axx allows you to have AI quickly generate the pattern file and complete the assembler. Since the axx pattern file itself lacks an explicit structure, it is well-suited for unstructured assembly code; however, you can write instructions like `MOVabc r,s`—where a, b, and c are defined as arrays such as `a=[a1,a2,a3,""]`, `b=[b1,b2,b3,""]`, and `c=[c1,c2,c3,""]`—by utilizing the `.check` directive. Compared to LLVM, CGen, or customasm, axx operates at a lower level of abstraction.
 This is not a "general-purpose assembler" in the sense of being "widely usable." It's a "general assembler" in the sense of being "common to everything." The `binary_list` only has five control structures: assignment, ternary operators, the `;` modifier, alignment, and `@@[]`. While ordinary general assemblers have `mnemonic operand definitions` alongside pattern definitions, axx's pattern definitions are arranged as `instruction :: error_pattern :: binary_list`, allowing for flexible instruction patterns. Therefore, notations like `r1 = r2 + r3` are possible, making it usable not only for assembly language but also as a general-purpose binary generator. The pattern file is Turing incomplete. Because of this Turing incompleteness, it's not suitable for processors with extremely complex architectures. Processor architectures can become infinitely complex if one chooses to make them so. If it were Turing complete, it could follow suit, but axx.py is Turing incomplete, and therefore not a "universal assembler." The reason it's currently Turing incomplete is that if it were Turing complete, the DSL would become a "program." In other words, it's also for the sake of guaranteeing cessation of pattern matching. However, this does not apply to the macro layer.
 
 It cannot handle very specialized processors. For example, it cannot describe the ISAs of the following processors other than general-purpose processors:
@@ -485,6 +484,33 @@ MOV t,!a ::0xb8|t,a,a>>8
 
 This allows you to write it as (mov al,0x12,mov bl,0x12) and (mov ax,0x1234,mov bx,0x1234).
 
+You can also specify a null string `""` for the `.check` directive.
+
+```
+.setsym::a1::1
+.setsym::a2::2
+.setsym::a3::3
+.setsym::b1::1
+.setsym::b2::2
+.setsym::b3::3
+.setsym::c1::1
+.setsym::c2::2
+.setsym::c3::3
+.check::a::a1,a2,a3,""
+.check::b::b1,b2,b3,""
+.check::c::c1,c2,c3,""
+MOVabc:: ::a*100+b*10+c
+```
+
+This results in:
+
+```
+mov                  0
+mova1              100
+mova1c2            102
+movb2               20
+movb2c1             21
+```
 
 #### Double Braces
 
