@@ -145,21 +145,35 @@ def _is_undef_derived(v):
 
 @functools.lru_cache(maxsize=None)
 def _lead_caps(pat_text):
-    """パターン先頭の連続する大文字（＝ニーモニック部分）を取り出す。
+    """パターン先頭の連続する大文字（＝ニーモニック部分）と、その直後が
+    「英数字を食える書き方か」を返す。
 
     パターン照合は1行につき数千個のパターンを試すため、本格的な照合に入る前の
     足切りに使う。ソース行の先頭がこの文字列で始まっていなければ、そのパターンは
     絶対にマッチしないので即座に捨てられる。結果は lru_cache で使い回す。
+
+    第2要素 closed が True なら、ニーモニック直後のパターン文字は英数字を
+    絶対に食えない（`.` `,` `(` `#` 等のリテラル、またはパターン終端）。この場合
+    ソース側がそこで英数字を続けていれば不一致が確定するので、`MOVE` 系の
+    パターンを `MOVEM` の行に試す、といった無駄打ちを消せる。
+    小文字（シンボル）・`!`（式）・`\\`（エスケープ）・`[`（省略可グループ）・
+    数字は英数字を食いうるので closed は False にする。
     """
     p = []
-    for ch in pat_text:
+    i = 0
+    n = len(pat_text)
+    while i < n:
+        ch = pat_text[i]
         if ch in CAPITAL:
             p.append(ch)
         elif ch == ' ':
-            continue
+            pass
         else:
             break
-    return ''.join(p)
+        i += 1
+    nxt = pat_text[i] if i < n else ''
+    closed = nxt not in _PFX_OPEN
+    return ''.join(p), closed
 
 
 # パターン記法の基本規約: 大文字＝そのまま照合するリテラル（ニーモニック）、
@@ -169,6 +183,16 @@ LOWER = "abcdefghijklmnopqrstuvwxyz"
 DIGIT = '0123456789'
 XDIGIT = "0123456789ABCDEF"
 ALPHABET = LOWER + CAPITAL
+
+# _lead_caps 用。ニーモニック直後に来ると「英数字を食いうる」パターン文字。
+#   小文字 … .setsym シンボルのプレースホルダ
+#   '!'    … 式
+#   '\'    … 次の1文字をリテラル化するエスケープ
+#   '['    … [[ ]] 省略可グループの開き
+#   数字   … リテラルの数字
+_PFX_OPEN = frozenset(LOWER + DIGIT + '!\\[')
+# 足切りで「ニーモニックが途中で終わっていないか」を見るときの語構成文字。
+_PFX_WORD = frozenset(ALPHABET + DIGIT + '_')
 
 
 # パターンファイルの第2フィールド（エラー条件）が返す番号 → メッセージ。
@@ -5335,11 +5359,12 @@ class Assembler:
                     idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                 break
 
-            _pfx = _lead_caps(i[0])
+            _pfx, _closed = _lead_caps(i[0])
             if _pfx:
                 _k = 0
                 _ok = True
-                for _ch in lin:
+                _end = -1
+                for _ci, _ch in enumerate(lin):
                     if _ch == ' ':
                         continue
                     if _ch.upper() != _pfx[_k]:
@@ -5347,8 +5372,13 @@ class Assembler:
                         break
                     _k += 1
                     if _k == len(_pfx):
+                        _end = _ci + 1
                         break
                 if _k < len(_pfx):
+                    _ok = False
+                if _ok and _closed and _end < len(lin) and lin[_end] in _PFX_WORD:
+                    # パターン側はここでニーモニックが終わっているのに、ソース側は
+                    # まだ語が続いている（`MOVE` パターン vs `MOVEM` 行）。
                     _ok = False
                 if not _ok:
                     continue

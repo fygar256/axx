@@ -5207,18 +5207,41 @@ static void elf_refs_push_copy(AsmState *st, const char *name,
 static int pat_prefix_matches(const char *pat, const char *lin){
     char pfx[64];
     int np = 0;
-    for(const char *p = pat; *p && np < (int)sizeof(pfx)-1; p++){
+    const char *p = pat;
+    for(; *p && np < (int)sizeof(pfx)-1; p++){
         if(*p >= 'A' && *p <= 'Z') pfx[np++] = *p;
         else if(*p == ' ') continue;
         else break;
     }
     if(np == 0) return 1;
+
+    /* ニーモニック直後のパターン文字が英数字を食える種類かどうか。
+       小文字（シンボル）, '!'（式）, '\\'（エスケープ）, '['（[[ ]] の開き）,
+       数字（リテラル）は食いうる。それ以外（'.' ',' '(' '#' 等のリテラル、
+       またはパターン終端）は食えないので、ソース側がそこで語を続けていれば
+       不一致が確定する。`MOVE` のパターンを `MOVEM` の行に試さないための足切り。 */
+    int closed = 1;
+    if(np >= (int)sizeof(pfx)-1){
+        closed = 0;               /* 打ち切ったので直後の文字が分からない */
+    } else if(*p){
+        char c = *p;
+        if((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+           || c == '!' || c == '\\' || c == '[') closed = 0;
+    }
+
     int k = 0;
     for(const char *q = lin; *q; q++){
         if(*q == ' ') continue;
         if(axx_upper_char(*q) != pfx[k]) return 0;
         k++;
-        if(k == np) return 1;
+        if(k == np){
+            if(closed){
+                char n = q[1];
+                if((n >= 'A' && n <= 'Z') || (n >= 'a' && n <= 'z')
+                   || (n >= '0' && n <= '9') || n == '_') return 0;
+            }
+            return 1;
+        }
     }
     return 0;
 }
