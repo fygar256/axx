@@ -110,6 +110,12 @@ VLIW_STOP = chr(0x93)
 UNDEF = (1 << 1024) - 1
 VAR_UNDEF = 0
 
+# .check の許可リストに `""` が書かれたときに積む印。
+# 「そのオペランドは省略可、省略時は VAR_UNDEF(0)」を意味する。
+# シンボル名は get_symbol_word で必ず1文字以上・大文字化されるため、
+# 空文字は実在のシンボル名と衝突しない。
+CHECK_OMIT = ''
+
 # UNDEF から算術で派生した値を「未定義由来」と判定する閾値。
 # UNDEF そのものと完全一致しなくても（UNDEF+4 等）、この大きさなら未定義由来とみなす。
 _UNDEF_DERIVED_THRESHOLD = 1 << 768
@@ -2753,7 +2759,17 @@ class DirectiveProcessor:
             return True
         syms = []
         if syms_field:
-            syms = [s.strip().upper() for s in syms_field.split(',') if s.strip()]
+            for s in syms_field.split(','):
+                s = s.strip()
+                if not s:
+                    continue
+                if s == '""' or s == "''":
+                    # 空文字リテラルは「このオペランドは省略してよい」印。
+                    # 省略時、変数には VAR_UNDEF(0) が入る。
+                    if CHECK_OMIT not in syms:
+                        syms.append(CHECK_OMIT)
+                    continue
+                syms.append(s.upper())
         self.state.check_constraints[var] = syms
         return True
 
@@ -3038,6 +3054,8 @@ class PatternMatcher:
                 prev_alnum = False
                 idx_t += 1
                 prev_idx_s = idx_s
+                allowed = self.state.check_constraints.get(a)
+                allow_omit = allowed is not None and CHECK_OMIT in allowed
                 w, idx_s = self.parser.get_symbol_word(s, idx_s)
                 v = self.symbol_manager.get(w)
                 if v == "":
@@ -3050,12 +3068,34 @@ class PatternMatcher:
                             v = _v
                             idx_s = prev_idx_s + _cut
                             break
-                if v == "":
-                    return False
-                if a in self.state.check_constraints and w not in self.state.check_constraints[a]:
-                    return False
-                if idx_s == prev_idx_s:
-                    return False
+                ok = v != "" and idx_s != prev_idx_s
+                if ok and allowed is not None and w not in allowed:
+                    ok = False
+                if not ok and allowed:
+                    # 語として切り出せなかった／許可リストに無かった場合、
+                    # 許可リストの名前そのものを前方一致で取り直す。
+                    # `MOVa1c3` のように区切り文字なしで連結された書き方を通すため。
+                    _best = ''
+                    for _nm in allowed:
+                        if not _nm or len(_nm) <= len(_best):
+                            continue
+                        if StringUtils.upper(s[prev_idx_s:prev_idx_s + len(_nm)]) == _nm:
+                            _best = _nm
+                    if _best:
+                        _v = self.symbol_manager.get(_best)
+                        if _v != "":
+                            w = _best
+                            v = _v
+                            idx_s = prev_idx_s + len(_best)
+                            ok = True
+                if not ok:
+                    if not allow_omit:
+                        return False
+                    # 省略とみなす。ソースは1文字も消費せず、変数は未代入(0)。
+                    idx_s = prev_idx_s
+                    self.var_manager.put(a, VAR_UNDEF)
+                    n_sym += 1
+                    continue
                 self.var_manager.put(a, v)
                 n_sym += 1
                 continue

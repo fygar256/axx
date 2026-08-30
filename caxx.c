@@ -3521,7 +3521,16 @@ static int dir_check(Assembler *asmb, PatEntry *e){
             buf[j++] = (char)toupper((unsigned char)*p++);
         buf[j] = '\0';
         while(j > 0 && (buf[j-1] == ' ' || buf[j-1] == '\t')) buf[--j] = '\0';
-        if(j > 0) sv_push(&asmb->st.check_constraints[idx], buf);
+        if(j == 2 && ((buf[0]=='"' && buf[1]=='"') || (buf[0]=='\'' && buf[1]=='\''))){
+            /* 空文字リテラルは「このオペランドは省略可」の印。
+               省略時、変数には 0 が入る。長さ0の要素として積む。 */
+            int dup = 0;
+            for(int si = 0; si < asmb->st.check_constraints[idx].len; si++)
+                if(asmb->st.check_constraints[idx].data[si][0] == '\0'){ dup = 1; break; }
+            if(!dup) sv_push(&asmb->st.check_constraints[idx], "");
+        } else if(j > 0){
+            sv_push(&asmb->st.check_constraints[idx], buf);
+        }
         if(*p == ',') p++;
     }
     return 1;
@@ -3822,9 +3831,18 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             prev_alnum=0;
             idx_t++;
             int prev_idx_s = idx_s;
+            int vi = a - 'a';
+            StrVec *cv = &st->check_constraints[vi];
+            int allow_omit = 0, n_named = 0;
+            for(int si = 0; si < cv->len; si++){
+                if(cv->data[si][0] == '\0') allow_omit = 1;
+                else                        n_named++;
+            }
+
             char w[512];
             idx_s=axx_get_symbol_word(s,idx_s,st->swordchars,w,sizeof(w));
-            uint256_t sv;
+            uint256_t sv = u256_zero();
+            int ok = 1;
             if(!symbol_get(st,w,&sv)){
                 int _wl = (int)strlen(w), _hit = 0;
                 for(int _cut = _wl - 1; _cut > 0; _cut--){
@@ -3835,23 +3853,51 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     if(symbol_get(st,w,&sv)){ idx_s = prev_idx_s + _cut; _hit = 1; break; }
                     w[_cut] = _save;
                 }
-                if(!_hit){ result=0; break; }
+                if(!_hit) ok = 0;
             }
+            if(ok && idx_s == prev_idx_s) ok = 0;
 
-            int vi = a - 'a';
-            StrVec *cv = &st->check_constraints[vi];
-            if(cv->len > 0){
-                int ok = 0;
+            if(ok && cv->len > 0){
+                int hit = 0;
                 for(int si = 0; si < cv->len; si++){
-                    if(strcmp(cv->data[si], w) == 0){
-                        ok = 1;
+                    if(cv->data[si][0] != '\0' && strcmp(cv->data[si], w) == 0){
+                        hit = 1;
                         break;
                     }
                 }
-                if(!ok){ result=0; break; }
+                if(!hit) ok = 0;
             }
 
-            if(idx_s == prev_idx_s){ result=0; break; }
+            if(!ok && n_named > 0){
+                /* 語として切り出せなかった／許可リストに無かった場合、
+                   許可リストの名前そのものを前方一致で取り直す。
+                   `MOVa1c3` のように区切り文字なしで連結された書き方を通すため。 */
+                int best_len = 0, best_si = -1;
+                for(int si = 0; si < cv->len; si++){
+                    const char *nm = cv->data[si];
+                    int nl = (int)strlen(nm);
+                    if(nl <= best_len) continue;
+                    int k = 0;
+                    while(k < nl && s[prev_idx_s + k]
+                          && axx_upper_char(s[prev_idx_s + k]) == nm[k]) k++;
+                    if(k == nl){ best_len = nl; best_si = si; }
+                }
+                if(best_si >= 0 && (int)strlen(cv->data[best_si]) < (int)sizeof(w)
+                   && symbol_get(st, cv->data[best_si], &sv)){
+                    snprintf(w, sizeof(w), "%s", cv->data[best_si]);
+                    idx_s = prev_idx_s + best_len;
+                    ok = 1;
+                }
+            }
+
+            if(!ok){
+                if(!allow_omit){ result=0; break; }
+                /* 省略とみなす。ソースは1文字も消費せず、変数は未代入(0)。 */
+                idx_s = prev_idx_s;
+                var_put(st, a, u256_zero());
+                n_sym++;
+                continue;
+            }
 
             var_put(st,a,sv);
             n_sym++;
