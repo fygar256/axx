@@ -507,7 +507,7 @@ This results in:
 ```
 mov                  0
 mova1              100
-mova1c2            102
+mova1c3            103
 movb2               20
 movb2c1             21
 ```
