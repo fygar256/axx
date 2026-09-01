@@ -222,12 +222,12 @@ Uppercase letters, numbers, and symbols in the pattern file's instructions are t
 
 ```
 Uppercase letters, symbols, and escaped characters. Character constants.
-Lowercase letters: Values of the symbol at that position.
-!Lowercase letters: Values of integer expressions.
-!!Lowercase letters: Values of integer factors.
-!F lowercase letters: Values of 32-bit floating-point expressions.
-!D lowercase letters: Values of 64-bit floating-point expressions.
-!Q lowercase letters: Values of 128-bit floating-point expressions.
+Lowercase letter: Values of the symbol at that position.
+!Lowercase letter: Values of integer expressions.
+!!Lowercase letter: Values of integer factors.
+!F lowercase letter: Values of 32-bit floating-point expressions.
+!D lowercase letter: Values of 64-bit floating-point expressions.
+!Q lowercase letter: Values of 128-bit floating-point expressions.
 ```
 
 Lowercase variables are all initialized to 0 for each line of the pattern file.
