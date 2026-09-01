@@ -59,10 +59,10 @@ The bundled files and their matching test sources are:
 | **vliw.axx** | 178 B | ~9 | **vliw.s** | Non-EPIC VLIW (test only) |
 | **bf.axx** | 128 B | ~9 | **bf.s** | Brainfuck virtual CPU (hello-world style test) |
 
-
-
 Note that `x86_64.axx` uses the source `hello.s`, not a file named
 `x86_64.s`.
+
+While x86_64 and legacy CPUs currently make up the majority of the processors implemented and supported in axx, it would be unfortunate if that were perceived as the extent of its capabilities; in reality, it is architecturally capable of handling a wide range of processors.
 
 # GENERAL ASSEMBLER 'axx.py'
 
