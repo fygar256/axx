@@ -1308,7 +1308,7 @@ AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v
 
 ## Appendix B. Bundled Pattern Files
 
-x86_64.axx, x86_64m.axx, 68000.axx, z80.axx, 8080.axx, 8048.axx, 6502.axx, 6800.axx, 6809.axx, and 4004.axx are for practical use.
+x86_64.axx, x86_64m.axx, 68000.axx, z80.axx, 8080.axx, 8048.axx, 8051.axx, 6502.axx, 6800.axx, 6809.axx, and 4004.axx are for practical use.
 
 https://github.com/fygar256/x86_64_pattern_file_for_axx
 
