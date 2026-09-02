@@ -32,6 +32,7 @@ hello.s                             assembly file of x86_64 hello world. use x86
 hello.tsv                           export file of x86_64 hello world
 imp.tsv                             import file
 secsort.py                          execution file of section sort
+test1                               assemble test for all apttern file
 test.axx                            test pattern file of some CPUs 
 test.s                              test assemble file of some CPUs
 z80.axx                             pattern file for Z80
