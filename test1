@@ -1,0 +1,44 @@
+#!/bin/sh
+
+caxx 4004.axx 4004.s -b b0
+caxx z80.axx z80.s -b b1
+caxx 6502.axx 6502.s -b b2
+caxx 6800.axx 6800.s -b b3
+caxx 6809.axx 6809.s -b b4
+caxx 8080.axx 8080.s -b b5
+caxx 8048.axx 8048.s -b b6
+caxx 8051.axx 8051.s -b b7
+caxx 68000.axx 68000.s -b b8
+caxx vliw.axx vliw.s -b b9
+caxx itanium.axx vliw.s -b b10
+caxx x86_64.axx hello.s -b b11
+caxx x86_64m.axx hello.s -b b12
+
+paxx 4004.axx 4004.s -b a0
+paxx z80.axx z80.s -b a1
+paxx 6502.axx 6502.s -b a2
+paxx 6800.axx 6800.s -b a3
+paxx 6809.axx 6809.s -b a4
+paxx 8080.axx 8080.s -b a5
+paxx 8048.axx 8048.s -b a6
+paxx 8051.axx 8051.s -b a7
+paxx 68000.axx 68000.s -b a8
+paxx vliw.axx vliw.s -b a9
+paxx itanium.axx vliw.s -b a10
+paxx x86_64.axx hello.s -b a11
+paxx x86_64m.axx hello.s -b a12
+
+cmp a0 b0
+cmp a1 b1
+cmp a2 b2
+cmp a3 b3
+cmp a4 b4
+cmp a5 b5
+cmp a6 b6
+cmp a7 b7
+cmp a8 b8
+cmp a9 b9
+cmp a10 b10
+cmp a11 b11
+cmp a12 b12
+
