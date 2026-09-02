@@ -1,0 +1,119 @@
+.org 0x0000
+start:
+    nop
+    add a,r0
+    add a,@r0
+    add a,#0x12
+    add a,0x30
+    addc a,r1
+    addc a,@r1
+    addc a,#0x12
+    addc a,0x30
+    subb a,r2
+    subb a,@r0
+    subb a,#0x12
+    subb a,0x30
+    inc a
+    inc dptr
+    inc @r0
+    inc r3
+    inc 0x30
+    dec a
+    dec @r1
+    dec r4
+    dec 0x31
+    mul ab
+    div ab
+    da a
+    anl a,r5
+    anl a,@r0
+    anl a,#0x0f
+    anl a,0x30
+    anl 0x30,a
+    anl 0x30,#0x0f
+    orl a,r6
+    orl a,@r1
+    orl a,#0x0f
+    orl a,0x30
+    orl 0x30,a
+    orl 0x30,#0x0f
+    xrl a,r7
+    xrl a,@r0
+    xrl a,#0x0f
+    xrl a,0x30
+    xrl 0x30,a
+    xrl 0x30,#0x0f
+    clr a
+    cpl a
+    rl a
+    rlc a
+    rr a
+    rrc a
+    swap a
+    mov a,r0
+    mov a,@r0
+    mov a,#0x12
+    mov a,0x30
+    mov r0,a
+    mov r0,#0x12
+    mov r0,0x30
+    mov @r0,a
+    mov @r0,#0x12
+    mov @r0,0x30
+    mov dptr,#0x1234
+    mov 0x30,c
+    mov c,0x30
+    mov 0x30,a
+    mov 0x30,r0
+    mov 0x30,@r0
+    mov 0x30,#0x12
+    mov 0x30,0x31
+    movc a,@a+dptr
+    movc a,@a+pc
+    movx a,@dptr
+    movx a,@r0
+    movx @dptr,a
+    movx @r0,a
+    push 0x30
+    pop 0x30
+    xch a,r0
+    xch a,@r0
+    xch a,0x30
+    xchd a,@r0
+    clr c
+    clr 0x20
+    setb c
+    setb 0x20
+    cpl c
+    cpl 0x20
+    anl c,/0x20
+    anl c,0x20
+    orl c,/0x20
+    orl c,0x20
+    jc lab1
+    jnc lab1
+    jb 0x20,lab1
+    jnb 0x20,lab1
+    jbc 0x20,lab1
+lab1:
+    acall sub1
+    ajmp lab2
+    lcall sub1
+    ljmp lab2
+    ret
+    reti
+    sjmp lab2
+    jmp @a+dptr
+    jz lab2
+    jnz lab2
+    cjne a,#0x12,lab2
+    cjne a,0x30,lab2
+    cjne @r0,#0x12,lab2
+    cjne r0,#0x12,lab2
+    djnz r0,lab2
+    djnz 0x30,lab2
+    nop
+lab2:
+    nop
+sub1:
+    ret
