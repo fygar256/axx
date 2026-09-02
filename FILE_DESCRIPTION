@@ -3,6 +3,8 @@ File description
 ```
 8048.axx                            pattern file for 8048 CPU
 8048.s                              test assemble file for 8048 CPU
+8051.axx                            pattern file for 8051 CPU
+8051.s                              test assemble file for 8051 CPU
 6809.axx                            pattern file for 6809 CPU
 6809.s                              test assemble file for 6809
 6800.axx                            pattern file for 6800 CPU
