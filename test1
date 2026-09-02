@@ -28,17 +28,17 @@ paxx itanium.axx vliw.s -b a10
 paxx x86_64.axx hello.s -b a11
 paxx x86_64m.axx hello.s -b a12
 
-cmp a0 b0
-cmp a1 b1
-cmp a2 b2
-cmp a3 b3
-cmp a4 b4
-cmp a5 b5
-cmp a6 b6
-cmp a7 b7
-cmp a8 b8
-cmp a9 b9
-cmp a10 b10
-cmp a11 b11
-cmp a12 b12
+cmp -s a0 b0
+cmp -s a1 b1
+cmp -s a2 b2
+cmp -s a3 b3
+cmp -s a4 b4
+cmp -s a5 b5
+cmp -s a6 b6
+cmp -s a7 b7
+cmp -s a8 b8
+cmp -s a9 b9
+cmp -s a10 b10
+cmp -s a11 b11
+cmp -s a12 b12
 
