@@ -1326,6 +1326,7 @@ The bundled files and their matching test sources are:
 | **6502.axx** | 15 KB | ~192 | **6502.s** | MOS 6502 |
 | **z80.axx** | 7.5 KB | ~283 | **z80.s** | Zilog Z80 |
 | **8048.axx** | 6.4 KB | ~95 | **8048.s** | Intel 8048 |
+| **8051.axx** | 9.2 KB | ~206 | **8051.s** | Intel 8051 |
 | **8080.axx** | 6.0 KB | ~113 | **8080.s** | Intel 8080 |
 | **4004.axx** | 5.4 KB | ~53 | **4004.s** | Intel 4004 |
 | **test.axx** | 1.1 KB | ~40 | **test.s** | Test-only pattern file containing fragments of several ISAs |
