@@ -13,6 +13,7 @@ caxx vliw.axx vliw.s -b b9
 caxx itanium.axx vliw.s -b b10
 caxx x86_64.axx hello.s -b b11
 caxx x86_64m.axx hello.s -b b12
+caxx bf.axx bf.s -b b13
 
 paxx 4004.axx 4004.s -b a0
 paxx z80.axx z80.s -b a1
@@ -27,18 +28,25 @@ paxx vliw.axx vliw.s -b a9
 paxx itanium.axx vliw.s -b a10
 paxx x86_64.axx hello.s -b a11
 paxx x86_64m.axx hello.s -b a12
+paxx bf.axx bf.s -b a13
 
-cmp -s a0 b0
-cmp -s a1 b1
-cmp -s a2 b2
-cmp -s a3 b3
-cmp -s a4 b4
-cmp -s a5 b5
-cmp -s a6 b6
-cmp -s a7 b7
-cmp -s a8 b8
-cmp -s a9 b9
-cmp -s a10 b10
-cmp -s a11 b11
-cmp -s a12 b12
+FAIL=0
 
+cmp a0 b0 || FAIL=1
+cmp a1 b1 || FAIL=1
+cmp a2 b2 || FAIL=1
+cmp a3 b3 || FAIL=1
+cmp a4 b4 || FAIL=1
+cmp a5 b5 || FAIL=1
+cmp a6 b6 || FAIL=1
+cmp a7 b7 || FAIL=1
+cmp a8 b8 || FAIL=1
+cmp a9 b9 || FAIL=1
+cmp a10 b10 || FAIL=1
+cmp a11 b11 || FAIL=1
+cmp a12 b12 || FAIL=1
+cmp a13 b13 || FAIL=1
+
+if [ $FAIL -eq 0 ]; then
+    echo "test all passed"
+fi
