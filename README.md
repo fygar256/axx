@@ -445,6 +445,27 @@ movb2               20
 movb2c1             21
 ```
 
+AVX-512 notation is handled like this, for example:
+
+```
+.symbolc::{}
+.setsym::EAX::0
+.setsym::EBX::1
+.setsym::{K1}::1
+.setsym::{K2}::2
+.check::x::EAX,EBX
+.check::k::{K1},{K2},""
+FOO xk,y :: :: 0x90,k,x,y
+```
+
+```
+FOO EAX,EBX          → 0x90 0x00 0x00 0x01  (k omitted)
+FOO EAX{K1},EBX       → 0x90 0x01 0x00 0x01  (k={K1}=1, x=EAX=0)
+FOO EAX{K2},EBX       → 0x90 0x02 0x00 0x01
+```
+
+
+
 ### 3.6 Double braces
 
 Optional parts within the instruction can be enclosed in double brackets. This shows the z80 `inc (ix)` instruction.
