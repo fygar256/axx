@@ -791,8 +791,8 @@ resolved elsewhere. When both name the same label, the value brought in by
 In addition to `.section`/`.segment` below, the following are accepted:
 
 ```
-.bss                ; switch to the .bss section
-.rodata             ; switch to the .rodata section
+.section .bss       ; switch to the .bss section
+.section .rodata    ; switch to the .rodata section
 .endsection         ; end the current section
 .endsegment         ; end the current segment
 ```
