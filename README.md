@@ -5,303 +5,400 @@ author: fygar256
 slide: false
 ---
 
-A C version is also available, named Caxx. Caxx is much faster than Paxx.
-
-caxx compile:
-
-`gcc caxx.c -o caxx -lm -O2`
-
-`-lm` is required, as the expression evaluator uses the math library.
-Alternatively, `make` builds and installs both implementations at once.
-
-Paxx is the reference implementation. Due to Paxx version upgrades, updates to caxx may be delayed. The two are intended to produce identical output for the same input, and the bundled pattern files and test sources are the material used to check that.
-
 # axx — General Assembler
 
 axx (**A**rbitrary e**X**tended **X** assembler) is a *general* assembler: the
-assembler itself holds no knowledge of any instruction set, and all
+assembler itself holds no knowledge of any instruction set. All
 processor-specific knowledge lives in an external, declarative **pattern file**.
 Writing a pattern file for a processor gives you an assembler for it.
 
-Two implementations are provided and are intended to produce identical output
-for the same input:
+## Quick start
 
-| | File | Nickname | Notes |
+```sh
+git clone https://github.com/fygar256/axx.git
+cd axx
+make                            # builds and installs caxx, paxx, axx and the man page (uses sudo)
+```
+
+To build only the C implementation:
+
+```sh
+gcc caxx.c -o caxx -lm -O2      # -lm is required: the expression evaluator uses libm
+```
+
+Assemble:
+
+```sh
+axx z80.axx z80.s -v            # listing to stdout
+axx z80.axx z80.s -b out.bin    # raw binary
+axx x86_64.axx hello.s -o out.o # ELF relocatable object
+```
+
+## Two implementations
+
+| Language | File | Nickname | Role |
 |---|---|---|---|
 | Python | `axx.py` | Paxx | Reference implementation; new features land here first |
 | C | `caxx.c` | Caxx | Much faster; may lag behind Paxx |
 
-```
-gcc caxx.c -o caxx -lm -O2     # -lm is required: the expression evaluator uses libm
-make                           # builds and installs both, plus the man page
-```
+The two are intended to produce **byte-identical output** for the same input.
+The bundled pattern files, test sources and the `test1` script exist to check
+exactly that: `test1` assembles all fourteen bundled pattern/source pairs with
+both implementations and `cmp`s the results.
 
 **Contents**
 
-1. [Overview](#1-overview)
-2. [Installation and Command Line](#2-installation-and-command-line)
-3. [Pattern File Reference](#3-pattern-file-reference)
-4. [VLIW and EPIC Processors](#4-vliw-and-epic-processors)
-5. [Assembly Source Reference](#5-assembly-source-reference)
-6. [Expressions and Operators](#6-expressions-and-operators)
-7. [Macro Layer](#7-macro-layer)
-8. [Object Output, Export and Import](#8-object-output-export-and-import)
+1. [Scope: what axx can and cannot do](#1-scope-what-axx-can-and-cannot-do)
+2. [Command line](#2-command-line)
+3. [Pattern file reference](#3-pattern-file-reference)
+4. [VLIW and EPIC processors](#4-vliw-and-epic-processors)
+5. [Assembly source reference](#5-assembly-source-reference)
+6. [Expressions and operators](#6-expressions-and-operators)
+7. [Macro layer](#7-macro-layer)
+8. [Object output, export and import](#8-object-output-export-and-import)
 9. [Errors](#9-errors)
+10. [Design notes and background](#10-design-notes-and-background)
 
 Appendices: [A. Examples](#appendix-a-examples) ·
-[B. Bundled Pattern Files](#appendix-b-bundled-pattern-files) ·
-[C. Related Resources](#appendix-c-related-resources) ·
+[B. Bundled pattern files](#appendix-b-bundled-pattern-files) ·
+[C. Related resources](#appendix-c-related-resources) ·
 [D. Roadmap](#appendix-d-roadmap) ·
-[E. Project Notes](#appendix-e-project-notes)
+[E. Project notes](#appendix-e-project-notes)
 
-## 1. Overview
+---
 
-### 1.1 What axx is
+## 1. Scope: what axx can and cannot do
 
-Since it's written in Python, the nickname is Paxx. axx is an abbreviation for "Arbitrary eXtended X(cross) assembler." The name also comes from superimposing an X — representing an unknown CPU — onto "ASM."
+Read this section first. The rest of the document assumes you know where the
+boundary is.
 
-The core ideas, the name "AXX," and a prototype written in C already existed back in 1986—conceived during my university days while working part-time at Tokyo Denshi Sekkei—but it wasn't until 2024, after rediscovering the original program listing 38 years later and rewriting it in Python, that I finally released the functional code as it exists today. The `instruction` in the axx pattern file is the meta-language for all imperative assembly languages. Although it's a DSL, it doesn't really have a defined grammar; it's a free syntax language (pattern language) where you create your own grammar by combining string literals, symbols, and expressions.
+### 1.1 The model
 
-All imperative assembly languages, except for EPIC/VLIW which have meta-level complexity in machine code, can essentially be reduced to a simple structure: `instruction :: error_patterns :: binary_list`. Further simplification by omitting error checking results in `instruction::binary_list`. Here, axx's binary_list includes complex expression calculations, alignment, and the `;` prefix modifier (which prevents binary output if 0) for practical purposes, but these are unnecessary in the minimal model. An instruction is a combination of (string literals, symbols replaceable by integer values, integer expressions, integer factors, and floating-point expressions). This allows processing of any imperative assembly language. However, the binary generation function isn't universal, limiting compatible processors; however, any processor where instructions and machine code are a one-to-one mapping can be processed. axx can also process Itanium-type EPIC and vliw processors through later extensions.
-
-It extracts the essential commonalities of the von Neumann architecture, metamodels the instruction set architecture (ISA), and formalizes it using pattern matching.
-
-### 1.2 Design and scope
-
-axx.py is a general assembler that generalizes assembly language. It can process almost any processor architecture. A pattern file (processor description file) is required to process individual processor architectures. While you can define free-form instructions, creating a pattern file according to the target processor's assembly language allows it to process that processor's assembly language, albeit with slightly different notation. Essentially, it's just a grammatical rule for instructions and binary generation based on it. axx targets not only virtual CPUs but also "abstracted real CPUs." Converting the specifications of a real processor into a pattern file allows for direct assembly. In that sense, creating pattern files for large ISAs is well-suited to AI, considering the human effort involved. Creating pattern files for large ISAs is time-consuming, but once created, the ISA is complete and can be reused. For a small ISA, using axx allows you to have AI quickly generate the pattern file and complete the assembler. Since the axx pattern file itself lacks an explicit structure, it is well-suited for unstructured assembly code; however, you can write instructions like `MOVabc r,s`—where a, b, and c are defined as arrays such as `a=[a1,a2,a3,""]`, `b=[b1,b2,b3,""]`, and `c=[c1,c2,c3,""]`—by utilizing the `.check` directive. Compared to LLVM, CGen, or customasm, axx operates at a lower level of abstraction.
-This is not a "general-purpose assembler" in the sense of being "widely usable." It's a "general assembler" in the sense of being "common to everything." The `binary_list` only has five control structures: assignment, ternary operators, the `;` modifier, alignment, and `@@[]`. While ordinary general assemblers have `mnemonic operand definitions` alongside pattern definitions, axx's pattern definitions are arranged as `instruction :: error_pattern :: binary_list`, allowing for flexible instruction patterns. Therefore, notations like `r1 = r2 + r3` are possible, making it usable not only for assembly language but also as a general-purpose binary generator. The pattern file is Turing incomplete. Because of this Turing incompleteness, it's not suitable for processors with extremely complex architectures. Processor architectures can become infinitely complex if one chooses to make them so. If it were Turing complete, it could follow suit, but axx.py is Turing incomplete, and therefore not a "universal assembler." The reason it's currently Turing incomplete is that if it were Turing complete, the DSL would become a "program." In other words, it's also for the sake of guaranteeing cessation of pattern matching. However, this does not apply to the macro layer.
-
-It cannot handle very specialized processors. For example, it cannot describe the ISAs of the following processors other than general-purpose processors:
-
-Processor - Reason
-
-Mill CPU - Belt architecture
-
-ZISC - No instructions
-
-Thinking Machines - Massively parallel
-
-The execution platform is also independent of specific systems. It ignores `chr(13)` at the end of lines in DOS files. It should work on any system that runs Python.
-
-axx does not support features such as the optimizations found in specialized assemblers, or high-level macros that translate structured or functional assembly constructs into imperative assembly. However, it does include standard macro capabilities. Since the basic functionality is present, you can adapt it for more advanced use cases.
-
-Because pattern files and source files are separated, it's possible to generate machine code for a different processor from the source code of one instruction set, provided you don't consider the effort involved in coding. It's also possible to generate machine code for different processors from a common language. 
-
-axx reads assembler pattern data from the first argument and assembles the source file specified in the second argument based on that data. During this process, the pattern data is matched against the assembly lines one by one, and the `binary_list` of any matching pattern is output to the result. While the definition of directives within the pattern file is order-dependent, the patterns themselves are not. If the second argument is omitted, the source input is read from the terminal (standard input).
-
-The result is output as text to standard output if the -v option is present; a binary file is written to the current directory if an argument is specified with the -b option; and an ELF64 object file is produced if the -o option is used. The -e option outputs labels specified via .export—along with section/segment information—to a file in TSV format.
-
-In `axx`, lines input from assembly language source files or standard input are called assembly lines.
-
-## 2. Installation and Command Line
-
-### 2.1 Install and run
-
-```
-# Install
-git clone https://github.com/fygar256/axx.git
-cd axx
-chmod +x axx.py
-sudo cp axx.py /usr/bin/axx
-# Execution (Assemble)
-axx patternfile.axx [source.s] [-b outfile.bin] [-e expfile.tsv] [-i impfile.tsv] [-o object.o]
-```
-
-The bundled `makefile` builds and installs both implementations in one step
-(it installs `caxx`, `paxx`, `axx` and the man page, and uses `sudo`):
-
-```
-make
-```
-
-patternfile.axx --- Pattern file
-source.s --- Assembly source
-outfile.bin --- Raw binary output file
-expfile.tsv --- Section label information export file
-impfile.tsv --- Section label information import file
-object.o ---- ELF relocatable object file
-
-Currently, object file output supports both ELF64 and ELF32 relocatable objects (see `-f`, below). ELF class (32/64-bit) is selected independently of the target machine (`-m`) via `-f`, and defaults to ELF64.
-
-Relocatable object output works on FreeBSD and Linux (see `--osabi`). It is not limited to x86_64: `-m` currently has relocation-numbering support for i386, M68K, PowerPC, PowerPC64, s390x, ARM, SuperH, SPARCV9, x86-64, AArch64, and RISC-V, and `-f` selects ELF32 or ELF64 independently of the chosen machine (defaulting to ELF64, with a warning if the combination is non-conventional for that machine). `-g`/`--gen-debug` DWARF output currently requires ELF64.
-
-Usage:
-
-```
-usage: axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV]
-           [-E EXPORT_ELF_TSV] [-i IMPORT_TSV] [-o OBJ_FILE] [-f {32,64}]
-           [-m MACHINE] [-v] [-d] [-g] [--no-macro] [-P [FILE]] [-p [FILE]]
-           patternfile [sourcefile]
-
-axx general assembler programmed and designed by Taisuke Maekawa
-
-positional arguments:
-  patternfile           Pattern definition file (.axx)
-  sourcefile            Assembly source file (.s). Omit for interactive mode.
-
-options:
-  -h, --help            show this help message and exit
-  --osabi ELF_OSABI     ELF OSABI value (default: FreeBSD; FreeBSD/Linux, case-insensitive)
-  -b OUTFILE            Output binary file
-  -e EXPORT_TSV         Export labels to TSV file (plain format)
-  -E EXPORT_ELF_TSV     Export labels to TSV file (ELF section flags format)
-  -i IMPORT_TSV         Import labels from TSV file
-  -o OBJ_FILE           Write ELF relocatable object file (.o); class selected by -f (default: ELF64)
-  -f {32,64}            ELF class for -o output: 64 for ELF64/ELFCLASS64, 32 for ELF32/ELFCLASS32
-                        (default: 64). Independent of -m/--machine; a value that does not match the
-                        selected machine's conventional class (e.g. -m 62 -f 32, the real x32 ABI's
-                        EM_X86_64-in-ELFCLASS32 layout) is honored, with a warning. -g/--gen-debug
-                        DWARF output currently requires 64.
-  -m MACHINE            ELF e_machine value (default 62=EM_X86_64). Must be one of the architectures axx has
-                        relocation-numbering support for -- see ELF_MACHINES near the top of this file for the full
-                        list (currently: 3=i386, 4=M68K, 20=PowerPC, 21=PowerPC64, 22=s390x, 40=ARM, 42=SuperH,
-                        43=SPARCV9, 62=x86-64, 183=AArch64, 243=RISC-V)
-  -v, --verbose         Verbose: print assembly listing to stdout (default: silent)
-  -d, --debug           Enable debug output (forward-ref fallback, relaxation log, etc.)
-  -g, --gen-debug       Generate DWARF debug information (.debug_info/.debug_abbrev/.debug_line) in the ELF object so
-                        that gdb/lldb can do source-level debugging. Effective only together with -o.
-  --no-macro            Disable the macro preprocessor layer (!if/!while/!def/!return/!set and !{...} interpolation),
-                        so the source is handed to the assembler exactly as written.
-  -P [FILE], --macro-expand [FILE]
-                        Macro-expand the source file and write the resulting assembly to FILE (or stdout if FILE is
-                        omitted or "-") without assembling it. Useful for debugging macros.
-  -p [FILE], --macro-expand-pattern [FILE]
-                        The pattern-file counterpart of -P: macro-expand the pattern file and write the resulting
-                        pattern text to FILE (or stdout if FILE is omitted or "-") without assembling. Useful for
-                        debugging pattern-file macros.
-```
-
-### 2.2 Differences in the C version’s command line
-
-`caxx` takes the same option names as `axx.py`, with the following exceptions:
-
-- `-h` / `--help` is not accepted. Run `caxx` with no arguments to see the usage line.
-- `-d` / `--debug` is not implemented.
-- Because the filename after `-P` may be omitted, `caxx` treats the next
-  argument as the output file only when both the pattern file and the source
-  file have already been given, e.g. `caxx pat.axx src.s -P out.s`.
-
-### 2.3 Prompt mode
-
-When the prompt `>>` appears and you are typing from the keyboard, you can use the label display command `?`.
-
-## 3. Pattern File Reference
-
-### 3.1 Structure of a pattern file
-
-A pattern file is a processor description file, user-defined to correspond to an individual processor. It is a kind of metalanguage for machine code and assembly language. The DSL used for pattern files is a basic ISADL (ISA Description Language).
-
-If you find defining pattern files difficult, you can write them as string literals, passing only the minimum number of operands to the expression evaluation.
-
-Furthermore, the parts of the ISA that are difficult to structure will be resolved by enumeration.
-
-The pattern data in a pattern file is arranged as follows:
+Every pattern in a pattern file has this shape:
 
 ```
 instruction :: error_patterns :: binary_list
-instruction :: error_patterns :: binary_list
-instruction :: error_patterns :: binary_list
-:
-:
 ```
-`instruction` is mandatory. `error_patterns` is optional. `binary_list` is mandatory.
-`instruction`, `error_patterns`, and `binary_list` should be separated by `::`.
 
-for example (x86_64)
+- `instruction` — the syntax to match against an assembly line. Mandatory.
+- `error_patterns` — conditions that make the line an error. Optional.
+- `binary_list` — the bytes to emit. Mandatory.
+
+Example (x86_64):
 
 ```
 RET :: 0xc3
 ```
-Comments
 
-Writing `/*` in a pattern file makes everything after `/*` on that line a comment. Currently, closing with `*/` is not possible. It is only effective for everything after `/*` on that line.
+That is the whole model. The claim axx makes rests on two separate legs, and
+they have different reach:
 
-Case Sensitivity, Variables
+### 1.2 Leg one: instruction syntax — very wide
 
-Uppercase letters, numbers, and symbols in the pattern file's instructions are treated as character constants. Uppercase letters match both uppercase and lowercase characters. Lowercase letters are treated as single-character variables. The value of the symbol at that position on the assembly line is assigned to the variable. Using `!lowercase` assigns the value of the integer expression at that position, `!!lowercase` assigns the value of the factor at that position, `!Flowercase` assigns the integer bit pattern of the 32-bit floating-point expression at that position, `!Dlowercase` assigns the 64-bit floating-point expression at that position, and `!Qlowercase` assigns the integer bit pattern of the 128-bit floating-point expression at that position. These values are then referenced from `error_patterns` and `binary_list`. All unassigned variables are initialized to 0. The `!` is not necessary when referencing from `error_patterns` and `binary_list`. All values are referenced similarly.
+An `instruction` is any combination of
+
+- string literals (uppercase letters, digits, symbols),
+- symbols replaceable by integer values,
+- integer expressions,
+- integer factors,
+- floating-point expressions.
+
+This is enough to express the *surface syntax* of essentially any imperative
+assembly language, and it is not restricted to conventional mnemonic-plus-
+operand forms. `r1 = r2 + r3` is a legal instruction pattern, which makes axx
+usable as a general binary generator rather than only as an assembler.
+
+### 1.3 Leg two: binary generation — deliberately narrower
+
+`binary_list` has only five control structures: assignment, the ternary
+operator, the `;` modifier, alignment, and `@@[]`. This is **not** a universal
+encoder. The practical condition is:
+
+> axx can assemble a processor whose instructions map **one-to-one** onto
+> machine code.
+
+Two consequences follow, and both are design decisions rather than oversights:
+
+**The pattern language is Turing-incomplete.** This guarantees that pattern
+matching terminates. The cost is that an ISA whose encoding requires unbounded
+computation cannot be described. axx is therefore a *general* assembler, not a
+*universal* one. (The macro layer in section 7 is a separate stage and is not
+subject to this restriction.)
+
+**Some real architectures fall outside the model.** Not because their syntax
+cannot be written down, but because their encoding cannot be produced by
+`binary_list`:
+
+| Processor | Why it is out of scope |
+|---|---|
+| Mill CPU | Belt architecture: operand references depend on execution history |
+| ZISC | Has no instructions at all |
+| Thinking Machines | Massively parallel; no per-instruction encoding to target |
+
+Quantum computers and LISP machines are also out of scope; what they run is
+not an imperative assembly language.
+
+EPIC and VLIW machines have meta-level structure in their machine code that the
+basic model does not cover, and are handled by a later extension — see
+[section 4](#4-vliw-and-epic-processors).
+
+### 1.4 Where axx sits relative to other tools
+
+axx operates at a **lower level of abstraction** than LLVM, CGen or customasm.
+It is not a "general-purpose assembler" in the sense of being widely usable
+out of the box; it is a "general assembler" in the sense of having one common
+mechanism underneath every target.
+
+It does not do the optimizations a hand-written assembler for a specific chip
+would do, and it does not translate structured or functional assembly
+constructs down into imperative form. It does have a full macro layer
+(section 7).
+
+Because the pattern file and the source file are separate, one source can be
+assembled for a different processor by swapping the pattern file, and a common
+source language can target several processors. Whether that is *useful* depends
+entirely on how much work you are willing to put into the pattern files.
+
+### 1.5 Practical note on writing pattern files
+
+Writing a pattern file for a large ISA is a long job, but a finished one is
+done for good and is reusable. The format is declarative and mechanical, which
+makes it a reasonable target for AI-assisted generation — for a small ISA you
+can have a model produce the pattern file and have a working assembler quickly.
+
+If a pattern proves hard to express, the fallback is always available: pass
+only the operands that really need evaluating, and write the rest as string
+literals. Parts of an ISA that resist structure can simply be enumerated.
+
+The execution platform is not significant. `chr(13)` at the end of DOS lines is
+ignored, and Paxx runs anywhere Python 3 runs.
+
+---
+
+## 2. Command line
+
+### 2.1 Synopsis
 
 ```
-Uppercase letters, symbols, and escaped characters. Character constants.
-Lowercase letter: Values of the symbol at that position.
-!Lowercase letter: Values of integer expressions.
-!!Lowercase letter: Values of integer factors.
-!F lowercase letter: Values of 32-bit floating-point expressions.
-!D lowercase letter: Values of 64-bit floating-point expressions.
-!Q lowercase letter: Values of 128-bit floating-point expressions.
+axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV]
+    [-E EXPORT_ELF_TSV] [-i IMPORT_TSV] [-o OBJ_FILE] [-f {32,64}]
+    [-m MACHINE] [-v] [-d] [-g] [--no-macro] [-P [FILE]] [-p [FILE]]
+    patternfile [sourcefile]
 ```
 
-Lowercase variables are all initialized to 0 for each line of the pattern file.
+| Argument | Meaning |
+|---|---|
+| `patternfile` | Pattern definition file (`.axx`). Required. |
+| `sourcefile` | Assembly source (`.s`). Omit to read from stdin (prompt mode). |
 
-From the assembly line, uppercase and lowercase letters are accepted the same, except for labels and section names.
+| Option | Meaning |
+|---|---|
+| `-b OUTFILE` | Write raw binary |
+| `-o OBJ_FILE` | Write ELF relocatable object; class selected by `-f` |
+| `-f {32,64}` | ELF class for `-o`. Default 64 |
+| `-m MACHINE` | ELF `e_machine` value. Default 62 (`EM_X86_64`) |
+| `--osabi ELF_OSABI` | ELF OSABI. Default FreeBSD; FreeBSD/Linux, case-insensitive |
+| `-e EXPORT_TSV` | Export labels to TSV (plain format) |
+| `-E EXPORT_ELF_TSV` | Export labels to TSV (with ELF section flags) |
+| `-i IMPORT_TSV` | Import labels from TSV |
+| `-v`, `--verbose` | Print assembly listing to stdout (default: silent) |
+| `-d`, `--debug` | Debug output: forward-ref fallback, relaxation log |
+| `-g`, `--gen-debug` | Emit DWARF (`.debug_info`/`.debug_abbrev`/`.debug_line`). Requires `-o` and ELF64 |
+| `--no-macro` | Disable the macro layer on both the source and pattern side |
+| `-P [FILE]` | Macro-expand the source and write it out without assembling |
+| `-p [FILE]` | Macro-expand the pattern file and write it out without assembling |
+| `-h`, `--help` | Usage |
 
-#### 3.1.1 Escape characters
+If no output option is given, nothing is written; `-v` is what makes the run
+visible.
 
-The escape character `\` can be used within the instruction.
+### 2.2 ELF output
 
-### 3.2 error_patterns
+`-o` produces a relocatable object and works on FreeBSD and Linux. It is not
+limited to x86_64. `-m` accepts any architecture axx has relocation numbering
+for:
 
-`error_patterns` specifies the conditions under which an error occurs, using variables and comparison operators.
+| Value | Machine | Value | Machine |
+|---|---|---|---|
+| 3 | i386 | 43 | SPARCV9 |
+| 4 | M68K | 62 | x86-64 (default) |
+| 20 | PowerPC | 183 | AArch64 |
+| 21 | PowerPC64 | 243 | RISC-V |
+| 22 | s390x | | |
+| 40 | ARM | | |
+| 42 | SuperH | | |
 
-Multiple error patterns can be specified, separated by commas. For example:
+`-f` selects ELF32 or ELF64 independently of `-m`. A combination that is not
+conventional for the chosen machine (for example `-m 62 -f 32`, the real x32
+ABI layout) is honored, with a warning.
+
+### 2.3 Differences in the C version
+
+`caxx` takes the same option names as `axx.py`, except:
+
+- `-h` / `--help` is not accepted. Run `caxx` with no arguments for usage.
+- `-d` / `--debug` is not implemented.
+- Because the filename after `-P` may be omitted, `caxx` treats the next
+  argument as the output file only when both the pattern file and the source
+  file have already been given: `caxx pat.axx src.s -P out.s`. `-p` follows the
+  same rule.
+
+### 2.4 Prompt mode
+
+With no source file, axx reads assembly lines from the terminal at a `>>`
+prompt. `?` displays the label table. The macro layer is bypassed in this mode.
+
+---
+
+## 3. Pattern file reference
+
+### 3.1 Structure
+
+A pattern file is a processor description file. It is a small ISA description
+language (ISADL) — a metalanguage for the relationship between assembly text
+and machine code.
+
+```
+instruction :: error_patterns :: binary_list
+instruction :: error_patterns :: binary_list
+:
+```
+
+The three fields are separated by `::`. `error_patterns` may be empty, but if
+you omit it entirely the line has only one `::`, which is the two-field form.
+
+**Comments.** `/*` starts a comment that runs to the end of the line. There is
+no `*/`; block comments do not exist.
+
+### 3.2 Pattern order does not matter
+
+Directive definitions **are** order-dependent — a later `.setsym` overrides an
+earlier one, and `.check` applies from where it appears. **Patterns are not.**
+
+axx does not stop at the first pattern that matches. It tries every pattern,
+scores each successful match, and emits the best one. The score is the tuple
+
+```
+(n_expr, -n_lit, n_sym)
+```
+
+where `n_expr` counts `!`-prefixed expression captures, `n_lit` counts literal
+characters matched, and `n_sym` counts symbol captures. The **smallest** tuple
+wins, which reads as:
+
+1. Fewest expression captures.
+2. On a tie, the most literal characters matched.
+3. On a tie, the fewest symbol captures.
+
+In other words the most specific pattern wins, whatever order it sits in. Given
+
+```
+MOV A,!d :: 0xAA,d
+MOV A,B  :: 0xBB
+```
+
+`mov a,b` emits `0xBB` and `mov a,5` emits `0xAA 0x05`, and swapping the two
+lines changes nothing.
+
+This removes the bookkeeping that table-driven assemblers usually demand —
+there is no need to hand-sort an instruction table so that special forms
+precede general ones. It matters most in a large pattern file, where the
+special cases are far from the general rule they override.
+
+### 3.3 Case and variables
+
+In the `instruction` field:
+
+| Written as | Meaning |
+|---|---|
+| Uppercase letters, digits, symbols, escaped characters | Character constants. Uppercase matches both cases in the source. |
+| lowercase letter | Value of the **symbol** at that position |
+| `!x` | Value of the **integer expression** at that position |
+| `!!x` | Value of the **integer factor** at that position |
+| `!Fx` | IEEE-754 bit pattern of a **32-bit** float expression |
+| `!Dx` | IEEE-754 bit pattern of a **64-bit** float expression |
+| `!Qx` | IEEE-754 bit pattern of a **128-bit** float expression |
+
+Captured values are referenced from `error_patterns` and `binary_list` by the
+bare letter — the `!` prefix is not repeated there. Every lowercase variable is
+reset to 0 for each pattern line, so an unmatched optional operand reads as 0.
+
+Assembly lines are case-insensitive except for labels and section names.
+
+The escape character `\` may be used inside `instruction`.
+
+### 3.4 error_patterns
+
+Conditions that raise an error, comma-separated, each with an error code after
+`;`:
 
 ```
 a>3;4,b>7;5
 ```
 
-In this example, when a>3, error code 4 is returned, and when b>7, error code 5 is returned.
+Here `a>3` raises code 4 and `b>7` raises code 5. Comparison operators
+including `!=` are available, so `a!=3;2` and `(s&0xf!=0)||(s>>4)>3;9` are both
+valid.
 
-The number after `;` is the error code. Codes 1, 2, 3, 5 and 6 have a message
-text attached (see [errors](#errors) below); any other code, including 4 and
-anything from 7 upward, is still reported and still aborts the assembly, but
-prints an empty message. Pick one of the five with text where it fits, or add
-your own message to the `ERRORS` table in `axx.py` and `caxx.c`.
+Codes 1, 2, 3, 5 and 6 have message text; see [section 9](#9-errors). Any other
+code — including 4, and anything from 7 up — still raises the error and still
+aborts the assembly, but prints an empty message. Either pick one of the five
+with text, or add your own to the `ERRORS` table in `axx.py` and `caxx.c`.
 
-Comparison operators including `!=` may be used here, so both
-`a!=3;2` and `(s&0xf!=0)||(s>>4)>3;9` are valid error patterns.
+`error_patterns` is evaluated in floating-point mode, so values travel as
+IEEE-754 double bit patterns. The bitwise and shift operators compensate
+internally, so `(8>>2)>0;2` evaluates as written.
 
-Note that `error_patterns` is evaluated in floating-point mode, so a value
-used here travels as an IEEE-754 double bit pattern. The bitwise and shift
-operators compensate for this internally, and expressions such as
-`(8>>2)>0;2` evaluate as written.
+### 3.5 binary_list
 
-### 3.3 binary_list
-
-`binary_list` specifies the output codes separated by commas. For example, 0x03,d will output 0x3 followed by d.
-
-Let's take 8048 as an example. If the pattern file contains:
+Comma-separated output values. `0x03,d` emits `0x03` followed by `d`.
 
 ```
 ADD A,R!n :: n>7;5 :: n|0x68
 ```
 
-If you pass `add a,rn` to the assembly line, it will return error code 5 (Register out of range) when n>7, and generate a binary at address 0x69 with `add a,r1`.
+`add a,r1` emits `0x69`; `n>7` raises code 5 (Register out of range).
 
-If the elements of `binary_list` are empty, alignment is performed. If the beginning starts with a comma, or if it's 0x12,,0x13, etc., the empty part will be padded up to the exact address.
+- An **empty element** performs alignment. A leading comma, or `0x12,,0x13`,
+  pads to the exact address.
+- An element starting with `;` is **suppressed when its value is 0**.
 
-If an element of `binary_list` starts with a semicolon, and that element is 0, it will not be output.
+#### 3.5.1 `@@[]` — repetition
 
-#### 3.3.1 @@[] — repetition
+`@@[n,<str>]` repeats `<str>` n times. `%%` is the repetition index; `%0`
+resets it to 0.
 
-You can use `@@[n,\<str\>]` within `binary_list`. This means repeating `<str>` n times. To set index %% to 0, use `%0`.
-
-### 3.4 symbol
+### 3.6 Symbols
 
 ```
-.setsym :: symbol :: n
+.setsym :: name :: value
 ```
 
-Writing this defines a symbol with the value n.
+A symbol name may contain letters, digits and symbol characters. Symbols are
+case-insensitive. A later definition of the same name overrides an earlier one,
+so the same identifier can mean different things in different regions of the
+file:
 
-A symbol can be an alphabet, a number, or a sequence of symbols.
+```
+.setsym::B::0
+.setsym::C::1
+ADD A,s              /* C here is 1
 
-To define symbol2 with symbol1, you would write it as follows:
+.setsym::NZ::0
+.setsym::Z::1
+.setsym::NC::2
+.setsym::C ::3
+RET s                /* C here is 3
+```
+
+To define a symbol from another symbol, use `#`:
 
 ```
 .setsym ::symbol1 ::1
 .setsym ::symbol2 ::#symbol1
 ```
 
-Here is an example of a symbol definition in z80. Within the pattern file, if you write:
+Z80 register example:
 
 ```
 .setsym ::B ::0
@@ -317,92 +414,44 @@ Here is an example of a symbol definition in z80. Within the pattern file, if yo
 .setsym ::SP ::0x30
 ```
 
-This defines the symbols B, C, D, E, H, L, A, BC, DE, HL, and SP as 0, 1, 2, 3, 4, 5, 7, 0x00, 0x10, 0x20, and 0x30, respectively. Symbols are case-insensitive.
+Symbols may contain punctuation and digits: `.setsym ::$s5:: 21`.
 
-If there are multiple definitions of the same symbol in the pattern file, the newer definition will overwrite the older one. That is,
+**Clearing.** `.clearsym::ax` undefines `ax`; `.clearsym` with no argument
+clears everything.
 
-```
-.setsym ::B::0
-.setsym ::C::1
-ADD A,s
+**Character set.** `.symbolc::<characters>` extends the character set used for
+symbols. The default is letters, digits, and `_%$-~&|`.
 
-.setsym ::NZ::0
-.setsym ::Z::1
-.setsym ::NC::2
-.setsym ::C ::3
-RET s
-```
-
-In this case, the C in ADD A,C becomes 1, and the C in RET C becomes 3.
-
-* Example of a symbol containing symbols, numbers, and letters
-
-```
-.setsym ::$s5:: 21
-```
-
-Symbols are cleared using .clearsym.
-
-```
-.clearsym::ax
-```
-
-The example above undefines the symbol ax.
-
-To clear all symbols, do not specify any arguments.
-
-```
-.clearsym
-```
-
-You can determine the character set used for symbols from within the pattern file.
-
-```
-.symbolc::<characters>
-```
-
-This allows you to specify characters other than numbers and uppercase and lowercase letters using <characters>.
-
-The default is alphabet + numbers + `_%$-~&|`.
-
-Note that `-` is part of the default set. This is what lets a symbol be
-followed directly by a negative displacement: the matcher tries the longest
-symbol prefix first and falls back, so both of the following work as expected
-without any special notation in the pattern file.
+Note that `-` is in the default set. This is what lets a symbol be followed
+directly by a negative displacement — the matcher tries the longest symbol
+prefix first and falls back:
 
 ```
 MOV EAX,[RBX-8]      ; x86_64.axx -> 8b 83 f8 ff ff ff
 LD A,(IX-5)          ; z80.axx
 ```
 
-A consequence of the same rule is that writing a negative value where the
-pattern expects a symbol -- for example `ASR #-1` when the instruction has no
-immediate form -- is reported as `undefined symbol: '#-1'` rather than as a
-range error.
+The same rule means that writing a negative value where the pattern expects a
+symbol — `ASR #-1` when the instruction has no immediate form — is reported as
+`undefined symbol: '#-1'` rather than as a range error.
 
-### 3.5 Symbol check
+### 3.7 Symbol check (`.check`)
 
 ```
 .check::x::r1,r2,r3
 ```
 
-If you set this, an error will occur if a symbol other than r1, r2, or r3 appears at the position of x.
+Restricts what may appear at the position captured by `x`. Anything else is an
+error. `.clrcheck::x` removes the restriction.
 
-To clear .check, use
+**`.check` is worth setting whenever a lowercase variable is reused for more
+than one class of operand.** Without it the variable accepts *any* symbol
+defined anywhere in the pattern file, so a nonsensical operand combination
+assembles silently into wrong bytes instead of being rejected. `.check` is
+positional and stays in effect until changed, so place a new `.check` (or a
+`.clrcheck`) at each point where the meaning of the variable changes.
 
-```
-.clrcheck::x
-```
-
-`.check` is worth setting whenever a lowercase variable is reused for more
-than one class of operand. Without it, the variable accepts **any** symbol
-that happens to be defined anywhere in the pattern file, so a nonsensical
-operand combination silently assembles into wrong bytes instead of being
-rejected. Because `.check` is positional and stays in effect until changed,
-place a new `.check` (or a `.clrcheck`) at each point in the file where the
-meaning of the variable changes.
-
-The handling of the same mnemonic in registers with different byte lengths is as follows:
+Registers of different widths sharing a mnemonic:
 
 ```
 .setsym::AL::0x00
@@ -412,12 +461,13 @@ The handling of the same mnemonic in registers with different byte lengths is as
 .check::s::AL,BL
 .check::t::AX,BX
 MOV s,!a :: 0xb0|s,a
-MOV t,!a ::0xb8|t,a,a>>8
+MOV t,!a :: 0xb8|t,a,a>>8
 ```
 
-This allows you to write it as (mov al,0x12,mov bl,0x12) and (mov ax,0x1234,mov bx,0x1234).
+This distinguishes `mov al,0x12` from `mov ax,0x1234`.
 
-You can also specify a null string `""` for the `.check` directive.
+**Optional positions.** `""` in a `.check` list permits the position to be
+absent:
 
 ```
 .setsym::a1::1
@@ -435,8 +485,6 @@ You can also specify a null string `""` for the `.check` directive.
 MOVabc:: ::a*100+b*10+c
 ```
 
-This results in:
-
 ```
 mov                  0
 mova1              100
@@ -445,107 +493,131 @@ movb2               20
 movb2c1             21
 ```
 
-### 3.6 Double braces
+AVX-512 masking notation uses the same mechanism:
 
-Optional parts within the instruction can be enclosed in double brackets. This shows the z80 `inc (ix)` instruction.
+```
+.symbolc::{}
+.setsym::EAX::0
+.setsym::EBX::1
+.setsym::{K1}::1
+.setsym::{K2}::2
+.check::x::EAX,EBX
+.check::k::{K1},{K2},""
+FOO xk,y :: :: 0x90,k,x,y
+```
+
+```
+FOO EAX,EBX          -> 0x90 0x00 0x00 0x01   (k omitted)
+FOO EAX{K1},EBX      -> 0x90 0x01 0x00 0x01
+FOO EAX{K2},EBX      -> 0x90 0x02 0x00 0x01
+```
+
+### 3.8 Optional parts (`[[ ]]`)
+
+Double brackets mark an optional section of an instruction:
 
 ```
 INC (IX[[+!d]]) :: 0xdd,0x34,d
 ```
 
-In this case, since the initial value of lowercase variables is 0, `inc (ix+0x12)` outputs `0xdd,0x34,0x12` if not omitted, and `inc (ix)` outputs `0xdd,0x34,0x00` if omitted.
+`inc (ix+0x12)` emits `0xdd,0x34,0x12`; `inc (ix)` emits `0xdd,0x34,0x00`,
+because lowercase variables default to 0.
 
-### 3.7 Padding bytecode
-
-From the pattern file,
+### 3.9 Padding
 
 ```
 .padding::0x12
 ```
 
-This sets the padding bytecode to 0x12. The default is 0x00.
+Sets the padding byte used by alignment. Default `0x00`.
 
-### 3.8 Word widths that are not 8 bits (.bits)
-
-By adding the following to the pattern file:
+### 3.10 Word widths other than 8 bits (`.bits`)
 
 ```
 .bits::12
-```
-
-You can handle 12-bit processors. The default is 8 bits.
-
-This directive is used to assemble processors with fewer than 8 bits, such as bit-slice processors or processors where machine code words are not in byte units. Since axx outputs in 8-bit units, for a 4-bit processor, the lower 4 bits will be output. For an 11-bit processor, depending on the specified byte order, (lower 8 bits, upper 3 bits) or (upper 3 bits, lower 8 bits) will be output to the binary file in 8-bit increments. Extra bits within 8 bits are masked with 0.
-
-When the `.bits` directive is specified, the value indicated by the address will be in word units. For example, the 64-bit processor x86_64 can process in byte units, so specifying the `.bits` directive is unnecessary.
-
-Byte order is specified as follows:
-
-```
 .bits::big::12
 ```
 
-The `big` option arranges bytes in big-endian format. `little` uses little-endian format.
+For bit-slice processors and machines whose word is not a byte. Default is 8
+bits and `little`.
 
-The default is `little`, and it defaults to `little` even if not specified.
+Output is always in 8-bit units, so a 4-bit machine emits the low 4 bits per
+byte, and an 11-bit machine emits (low 8, high 3) or (high 3, low 8) depending
+on endianness. Unused bits within a byte are masked to 0.
 
-### 3.9 include
+When `.bits` is in effect, **the location counter counts words, not bytes**.
+For a byte-addressable machine such as x86_64, `.bits` is unnecessary.
 
-This allows you to include a file.
+### 3.11 Include
 
 ```
 .include "file.axx"
 ```
 
-### 3.10 Escape characters in expressions
+On the pattern side this is processed *after* macro expansion, so a macro can
+generate the `.include` line itself. Each included file is macro-expanded in
+turn and inherits the macros defined by the top-level pattern file.
 
-Expressions stop evaluating when they contain the escape character `\`. The handling of escaped characters is saved for later and processed again within the pattern file.
+### 3.12 Escapes in expressions
 
-```text:Example
+Expression evaluation stops at the escape character `\`. The escaped part is
+deferred and processed again within the pattern file.
+
+```
 LEAQ r, [ s + t * !h \+ !i ] :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
 ```
 
-This example processes an assembly line like `leaq rax,[rax+rbx*(2+2)+0x40]` for x86_64.
+matches `leaq rax,[rax+rbx*(2+2)+0x40]`, and
 
 ```
 LEAQ r,(s+t*!!h+!!i) :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
 ```
 
-This example is used in cases like `leaq rax,(rax+rbx*(2+2)+0x40)`.
+matches the parenthesized form `leaq rax,(rax+rbx*(2+2)+0x40)`.
 
-### 3.11 Index displacement matching for negative values
-
-For example, in the following case:
+### 3.13 Negative index displacements
 
 ```
 mov rax,[rbp-8]
 ```
 
-It matches the following pattern:
+matches
 
 ```
 MOV RAX,[RBP+!e]
 ```
 
-This occurs because when the pattern matcher encounters a '-' in the source, it matches the '-' against the '+' in the pattern; it then skips over the '+' in the pattern and passes the expression starting with '-' directly to the next stage of expression evaluation.
+When the matcher meets `-` in the source where the pattern has `+`, it matches
+the two against each other, skips the pattern's `+`, and hands the expression —
+starting at the `-` — to the expression evaluator. No special notation is
+needed in the pattern file.
 
-## 4. VLIW and EPIC Processors
+---
 
-### 4.1 The .vliw directive
+## 4. VLIW and EPIC processors
+
+### 4.1 `.vliw`
 
 ```
+.vliw::<bundle bits>::<instruction bits>::<template bits>::<NOP code>
 .vliw::128::41::5::00
 ```
 
-This allows you to handle an EPIC processor with 128 bits in the bundle, 41 bits per instruction, 5 template bits, and a NOP code of 0x00 (Itanium example).
+The example describes Itanium: a 128-bit bundle holding three 41-bit
+instructions (123 bits) plus 5 template bits, with NOP `0x00`.
 
-For example, in Itanium, there are three 41-bit instructions, resulting in an instruction set of 41 * 3 = 123 bits in length, plus a 5-bit template bit at the end. For non-EPIC processors, specify 0 for the template bit.
+- For non-EPIC machines, give `0` for the template bits.
+- A positive template-bit count places the template at the right end; negative
+  places it at the left end, using the absolute value as the width.
+- `.bits::big` reverses the byte order of the output relative to the default
+  `little`.
 
-If the template bit is a positive number, it is placed at the right end; if it is a negative number, it is placed at the left end. The number of bits in the template bit is an absolute value. Specifying `big` for the endianness in the `.bits` directive reverses the byte order of the output compared to the default `little`.
+The number of bytes a pattern emits must match
+`(bundle bits − template bits) ÷ 8`, rounded up.
 
 ### 4.2 EPIC
 
-For EPIC processors, the pattern file is written as follows:
+EPIC patterns take a **fourth** field: the index code.
 
 ```
 /* VLIW
@@ -560,13 +632,18 @@ AD a,b,c:: ::0x01,0,0,a,b,c::1
 LOD d,[!e]:: :: 0x00,0x01,0,d,e,e>>8::2
 ```
 
-Written as above, ``!!!!` represents a stop bit. ``EPIC::1,2::0x8|!!!!` represents a set of EPIC instructions, a bitwise OR code of a bundle of instructions at indices 1 and 2, with a template of 0x8 and a stop bit. The following instruction, `AD a,b,c:: ::0x01,0,0,a,b,c::1`, outputs 0x01,0,0,a,b,c without error checking using ADD instructions r1,r2,r3, with an index code of 1. The instruction `LOD d,[!e]:: :: 0x00,0x01,0,d,e,e>>8::2` stores the contents of [!e] in the LOAD instruction r4, outputs 0,1,0,0xd,e (lower 8 bits) and e (upper 8 bits) without error checking, with an index code of 2. This sample is for testing purposes and differs from actual bytecode.
+- `EPIC::1,2::0x8|!!!!` describes a bundle of the instructions with index codes
+  1 and 2, with template `0x8`, OR'd with the stop bit.
+- `!!!!` denotes the stop bit.
+- `AD a,b,c` has index code 1; `LOD d,[!e]` has index code 2.
 
-The parameter specified in .vliw must match the number of bytes represented by the pattern: (Bundle bit count - Template bit count divided by 8 (bits)) + (1 if there is a remainder, 0 otherwise). In EPIC, error patterns must be explicitly specified using `:: ::`.
+**In EPIC patterns the error field must be written explicitly**, even when
+empty — hence the `:: ::`.
+
+(The values above are a test fixture and do not correspond to real Itanium
+encodings.)
 
 ### 4.3 Non-EPIC VLIW
-
-For non-EPIC processors, the pattern file is written as follows:
 
 ```
 /* VLIW
@@ -580,97 +657,98 @@ LOD d,[!e]::0x02,d,e,e>>8
 JMP !a ::0x03,a,a>>8,0
 ```
 
-### 4.4 Instruction concatenation
+### 4.4 Bundling in the source
 
-To bundle multiple VLIW instructions into one, connect them with !! as shown below.
+Instructions are bundled with `!!`:
 
 ```
 ad r1,r2,r3 !! lod r4,[0x1234]
 ```
 
-If `!!!` is present in the pattern file's binary_list, `!!!` represents the number of instructions concatenated with `!!`.
-
-If `!!!!` is present at the end of the concatenation, it sets the stop bit.
+In `binary_list`, `!!!` is the number of instructions joined by `!!`, and
+`!!!!` at the end of a bundle sets the stop bit.
 
 ### 4.5 Endianness
 
-Big-endian or little-endian is specified by the output order of the data in binary_list.
+Determined by the order in which you write the values in `binary_list`.
 
-## 5. Assembly Source Reference
+---
+
+## 5. Assembly source reference
+
+Lines read from a source file or from stdin are called **assembly lines**.
+Comments start with `;`.
 
 ### 5.1 Labels
-
-Labels are defined from the assembly line in the following way.
-
-Labels defined with `.equ` lose their relocation information and are treated as constants.
 
 ```
 label1:
 label2: .equ 0x10
 label3: nop
-```
-
-Labels are sequences of letters, numbers, and some symbols, starting with a non-numeric ., an alphabet, or some other symbol.
-
-You define a label using a label as follows:
-
-```
 label4: .equ label1
 ```
 
-You can determine the character set to use for labels from within the pattern file.
+A label is a sequence of letters, digits and some symbols, starting with a
+non-digit. A label defined with `.equ` loses its relocation information and is
+treated as a constant.
 
-```
-.labelc::<characters>
-```
+`.labelc::<characters>` extends the label character set. The default is
+letters, digits, `_` and `.`.
 
-This allows you to specify characters other than numbers and uppercase and lowercase alphabets using `<characters>`.
-
-The default is alphabet + numbers + underscore + period.
-
-### 5.2 ORG
-
-ORG is defined from the assembly line as:
+### 5.2 Location counter
 
 ```
 .org 0x800
-or
 .org 0x800,p
 ```
 
-`.org` modifies the value of the location counter. If `,p` is present, and the previous location counter value is smaller than the value specified by `.org`, padding will be applied up to the value specified by `.org`.
-
-### 5.3 Alignment
-
-From the assembly line,
+`.org` sets the location counter. With `,p`, if the counter is currently below
+the target, the gap is padded.
 
 ```
 .align 16
 ```
 
-This aligns to 16 (padding with the bytecode specified by `.padding` up to addresses that are multiples of 16). If the argument is omitted, alignment is performed using the number specified by the previous `.align` or the default value.
+Aligns to a multiple of 16, padding with the `.padding` byte. With no argument,
+the previous (or default) alignment is used.
 
-### 5.4 Floating-point notation
-
-For example, suppose a processor (such as ARM64) includes floating-point numbers as operands, and `VMOV.F32 S0, #3.14` loads the float (32-bit) value 3.14 into the S0 register, with its opcode 0x80. In that case, the pattern data will be:
+### 5.3 Data
 
 ```
-VMOV.F32 S!n,#!Fd ::0x80|n,d>>24,d>>16,d>>8,d
+.ascii "sample1"        ; string bytes
+.asciz "sample2"        ; string bytes plus a trailing 0x00
+.zero 65536             ; 65536 zero bytes
 ```
 
-If you pass `vmov.f32 s0,#3.14` to the assembly line, the binary output will be `0x80,0xc3,0xf5,0x48,0x40`. If `!F` becomes `!D`, it's a double-precision floating-point number. `!Q` is a 128-bit floating-point number.
+Reserve storage without emitting bytes — the location counter simply advances:
 
-Use the prefix `0b` for binary numbers.
+```
+.resb n     ; n bytes
+.resw n     ; n words       (n*2 bytes)
+.resd n     ; n doublewords (n*4 bytes)
+.resq n     ; n quadwords   (n*8 bytes)
+```
 
-Use the prefix `0x` for hexadecimal numbers.
+**A byte-emitting mnemonic such as `DB` is not built into axx.** It exists only
+if the pattern file defines it. Among the bundled files, `8048.axx` and
+`x86_64.axx` define `DB`; `z80.axx` does not. The data directives that are
+always available regardless of the pattern file are `.ascii`, `.asciz`, `.zero`
+and the `.resb`/`.resw`/`.resd`/`.resq` family.
 
-#### 5.4.1 Float notation in expressions
+### 5.4 Floating point
 
 `!F` / `!D` / `!Q` capture a floating-point operand at a position in the
-instruction. To write a floating-point value inside an ordinary integer
-expression -- for instance to give it a name with `.equ` -- use the brace
-notation instead. It evaluates its body as floating point and yields the
-IEEE-754 bit pattern as an integer.
+instruction:
+
+```
+VMOV.F32 S!n,#!Fd :: 0x80|n,d>>24,d>>16,d>>8,d
+```
+
+`vmov.f32 s0,#3.14` emits `0x80,0xc3,0xf5,0x48,0x40`.
+
+To write a floating-point value inside an ordinary integer expression — to give
+it a name with `.equ`, for instance — use the brace forms. Each evaluates its
+body as floating point and yields the IEEE-754 bit pattern as an integer:
 
 ```
 flt{expr}     ; 32-bit  (binary32) bit pattern
@@ -678,15 +756,15 @@ dbl{expr}     ; 64-bit  (binary64) bit pattern
 qad{expr}     ; 128-bit (binary128) bit pattern
 ```
 
-The inverse direction is provided by functions usable inside those bodies:
+The inverse functions are usable inside those bodies:
 
 ```
 enfloat(v)  / enflt(v)     ; read v's low 32 bits back as a float
 endouble(v) / endbl(v)     ; read v's low 64 bits back as a double
 ```
 
-This makes a named floating-point constant possible, since the stored label
-holds a bit pattern that can be decoded again and recomputed:
+Which makes a named floating-point constant work, since the stored label holds
+a bit pattern that can be decoded and recomputed:
 
 ```
 c1: .equ flt{3.14}
@@ -694,114 +772,37 @@ c1: .equ flt{3.14}
 ```
 
 `:label` inside such an expression refers to the label's value directly.
+`inf`, `-inf` and `nan` are accepted. Use `0b` for binary literals and `0x` for
+hexadecimal.
 
-`inf`, `-inf` and `nan` are accepted as floating-point values.
-
-### 5.5 Strings
-
-`.ascii` outputs the bytecode of a string, and `.asciz` outputs the bytecode of a string with 0x00 at the end.
+### 5.5 Sections
 
 ```
-.ascii "sample1"
-.asciz "sample2"
+.section .text
+.segment .text          ; currently identical in meaning
+.endsection
+.endsegment
 ```
 
-### 5.6 Fill with 0x00
+Section names are matched against `.text`, `.data`, `.rodata` and `.bss` when
+deriving ELF section flags for `-o` and `-E` output.
 
-`.zero <expression>` fills the specified number of bytes with 0x00.
+> **Note.** `.section` (or `.segment`) is the only way to switch sections.
+> There is no bare `.text` / `.data` / `.rodata` / `.bss` shorthand — writing
+> one of those on its own line is a syntax error in both Paxx and Caxx.
 
-```
-.zero 65536
-```
+#### 5.5.1 `.reloctype`
 
-### 5.7 reserve
-
-Each reserves storage without emitting bytes. Simply increment the location
-counter. `.resb` counts bytes; `.resw`, `.resd` and `.resq` count 2-, 4- and
-8-byte units respectively.
-
-```
-.resb n ; reserve n bytes
-.resw n ; reserve n words       (n*2 bytes)
-.resd n ; reserve n doublewords (n*4 bytes)
-.resq n ; reserve n quadwords   (n*8 bytes)
-```
-
-### 5.8 export
-
-The following allows you to export a label along with section/segment information. Only the label specified by the `.export` command is exported.
-
-```
-.export label
-.export label1,label2,label3     ; several labels at once
-```
-
-The exported labels are written out by the `-e` / `-E` options. See
-[Export / import file format](#export--import-file-format) below.
-
-### 5.9 .global
-
-Pass the label externally. Like `.export`, it accepts a comma-separated list,
-and the labels it declares are written out by `-e` / `-E` as well.
-
-```
-.global label
-.global label1,label2
-```
-
-### 5.10 .extern
-
-Declares the loading of an external label. A comma-separated list is accepted,
-and a relocation type may be attached to an individual name with `:`.
-
-```
-.extern label
-.extern label1,label2
-.extern label1:2,label2          ; label1 uses relocation type 2
-```
-
-`.extern` and `-i` are designed to be combined: `-i` supplies the actual
-address of an external label, and `.extern` declares that the name is
-resolved elsewhere. When both name the same label, the value brought in by
-`-i` is kept.
-
-.global and .extern are processed by the ELF relocatable object file output function.
-
-### 5.11 Section-related directives
-
-In addition to `.section`/`.segment` below, the following are accepted:
-
-```
-.bss                ; switch to the .bss section
-.rodata             ; switch to the .rodata section
-.endsection         ; end the current section
-.endsegment         ; end the current segment
-```
-
-#### 5.11.1 .reloctype
-
-Overrides the machine's default width-guess relocation type for
-auto-detected label references in the current source file.
+Overrides the machine's default width-guess relocation type for auto-detected
+label references in the current source file:
 
 ```
 .reloctype name8,name16,name32,name64
 ```
 
-#### 5.11.2 .section
+#### 5.5.2 Section ordering
 
-You can specify a section/segment as shown below.
-
-```
-.section .text
-or
-.segment .text
-```
-
-Currently, .section and .segment have the same meaning.
-
-#### 5.11.3 Section sort
-
-For example, with `z80.axx`:
+Sections are laid out exactly in the order written, so this:
 
 ```
 .section .text
@@ -814,7 +815,7 @@ ld b,9
 .ascii "test2"
 ```
 
-If you do this, the elements will be arranged exactly as written, so use secsort.py to sort them.
+does not group by section. Run `secsort.py` to get:
 
 ```
 .section .text
@@ -825,117 +826,138 @@ ld b,9
 .ascii "test2"
 ```
 
-Note that a byte-emitting mnemonic such as `DB` is **not** built into axx; it
-only exists if the pattern file defines it. Among the bundled pattern files,
-`8048.axx` and `x86_64.axx` define `DB`, while `z80.axx` does not. The built-in
-data directives that are always available regardless of the pattern file are
-`.ascii`, `.asciz`, `.zero` and the `.resb`/`.resw`/`.resd`/`.resq` family.
+### 5.6 Linkage
 
-### 5.12 include
+```
+.export label
+.export label1,label2,label3
+.global label1,label2
+.extern label1,label2
+.extern label1:2,label2          ; label1 uses relocation type 2
+```
 
-This is how you can include a file.
+- `.export` marks labels for `-e` / `-E` output, together with their
+  section/segment. Only labels named here are exported.
+- `.global` passes a label externally; it is written out by `-e` / `-E` as well.
+- `.extern` declares that a name is resolved elsewhere. A relocation type may
+  be attached to an individual name with `:`.
+
+`.extern` and `-i` are designed to be used together: `-i` supplies the actual
+address of an external label and `.extern` declares that the name is resolved
+elsewhere. When both name the same label, the value brought in by `-i` wins.
+
+`.global` and `.extern` are consumed by the ELF object writer.
+
+### 5.7 Include
 
 ```
 .include "file.s"
 ```
 
-### 5.13 Comments in assembly source
+On the source side this **bypasses the macro layer**; use `!include` (section
+7) to bring in macro definitions.
 
-Comments in the assembly line are `;`.
+---
 
-## 6. Expressions and Operators
+## 6. Expressions and operators
 
-### 6.1 Expressions, operators, and special terms
+The assembly line and the pattern data call the same expression evaluator, so
+the two behave almost identically. The one restriction is that **lowercase
+pattern variables cannot be referenced from an assembly line.**
 
-A special term is `!!!`. This term represents the number of instructions connected by !!.
+### 6.1 Special terms
 
-`%%` returns the number of times %% has appeared (an index starting from 0).
+| Term | Meaning |
+|---|---|
+| `!!!` | Number of instructions joined by `!!` |
+| `%%` | Number of times `%%` has appeared so far (index from 0) |
+| `$$` | Current location counter |
+| `$.` | Start address of the following instruction |
 
-`$$` returns the value of the current location counter.
+### 6.2 Operators
 
-`$.` returns the starting address of the instruction following that instruction.
-
-Both the assembly line expression and the pattern data expression call the same function, so their function is almost identical. Lowercase variables cannot be referenced from the assembly line.
-
-### 6.2 Operator precedence
-
-Operators and their precedence are based on Python and are as follows:
+Precedence follows Python, loosest last:
 
 ```
-(expression) Expression enclosed in parentheses
-# Operator that returns the value of symbol
-*(x,y) The yth byte from the least significant bit of x (y>=0)
--,~ Negative, bitwise NOT
-@ Unary operator that returns the position of the most significant bit of the following value from the right
-'c' Character code for 'c'
-:= Assignment operator
-** Exponentiation
-*,/,// Multiplication, division, integer division
-+,- Addition, subtraction
-<<,>> Left shift, right shift
-& Bitwise AND
-| Bitwise OR
-^ Bitwise XOR
-' Sign extension
-<=,<,>,>=,!=,== Comparison operators
-not(x) Logical NOT
-&& Logical AND
-|| Logical OR
-x?a:b Ternary operator
+(expr)          parenthesized expression
+#               value of the following symbol
+*(x,y)          the yth byte of x from the least significant end (y>=0)
+-, ~            negation, bitwise NOT
+@               position of the most significant set bit, counted from the right
+'c'             character code
+:=              assignment
+**              exponentiation
+*, /, //        multiplication, division, integer division
++, -            addition, subtraction
+<<, >>          shifts
+&               bitwise AND
+|               bitwise OR
+^               bitwise XOR
+'               sign extension
+<=, <, >, >=, !=, ==     comparison
+not(x)          logical NOT
+&&              logical AND
+||              logical OR
+x?a:b           ternary
 ```
 
-`:=` is used as an assignment operator. When you write `d:=24`, the value 24 is assigned to the variable `d`. The value held by the assignment operator is the value that was assigned.
+- `d:=24` assigns 24 to `d` and evaluates to 24.
+- `#name` yields the value of symbol `name`.
+- `@v` gives the bit position of the highest set bit of `v` counted from the
+  right. (The Hebimarumatta operator.)
+- `a'24` sign-extends `a`, treating bit 24 as the sign bit. (The SEX operator.)
 
-The prefix operator `#` takes the value of the symbol that follows it.
+---
 
-The prefix operator `@` returns the position of the most significant bit of the following value from the right. We'll call this the Hebimarumatta operator.
+## 7. Macro layer
 
-The binary operator `'`, when written as `a'24`, performs sign extension by making the 24th bit of `a` the sign bit. We'll call this the SEX operator.
+The same material is kept as a standalone document in `MACRO.md` (Japanese) and
+`macro_en.md` (English).
 
-The binary operator `**` is exponentiation.
+This is a source-to-source transformation that runs **before** the assembler
+proper. Label values, `.equ` definitions and `$` / `$$` are therefore *not*
+visible to it — this is deliberate, so that expansion results stay consistent
+across relaxation passes.
 
-The ternary operator `?:`, in `x?a:b`, returns `a` if `x` is true, and `b` if `x` is false.
-
-## 7. Macro Layer
-
-The same material is kept as a standalone document in `MACRO.md` (Japanese)
-and `macro_en.md` (English).
-
-This is a source-to-source transformation stage that runs before the source is passed to the main assembler. Label values, `.equ` definitions, and `$` or `$$` symbols cannot be referenced (to ensure that expansion results remain consistent across relaxation passes).
-
-It is implemented with identical specifications in both `axx.py` and `caxx.c`. The only difference between the two is numeric representation: the Python version uses arbitrary-precision integers, while the C version uses `int64`. Results will differ only when macro-time calculations exceed 64 bits (since the macro layer outputs source text, this does not affect the main assembler's 256-bit expression evaluation).
+Both `axx.py` and `caxx.c` implement the same specification. The only
+difference is numeric representation: Paxx uses arbitrary-precision integers,
+Caxx uses `int64`. Results diverge only when a macro-time calculation exceeds
+64 bits, and since the macro layer emits source text, this does not affect the
+assembler's own 256-bit expression evaluation.
 
 ### 7.1 Statements
 
-All statements begin with `!` at the start of the line (ignoring leading whitespace).
+Every statement starts with `!` at the beginning of a line (leading whitespace
+is ignored).
 
 | Syntax | Meaning |
 |---|---|
-| `!def name(p1, p2, p3 = default) { ... }` | Macro/compile-time function definition |
-| `!return expr` | Return value; also serves as an early exit from the body |
-| `!if expr !then { ... } !elif expr !then { ... } !else { ... }` | Conditional branching |
+| `!def name(p1, p2, p3 = default) { ... }` | Macro / compile-time function |
+| `!return expr` | Return a value; also an early exit |
+| `!if expr !then { ... } !elif expr !then { ... } !else { ... }` | Conditional |
 | `!while expr { ... }` | Loop |
 | `!break` / `!continue` | Loop control |
-| `!set name = expr` | Assign by searching scopes from inner to outer; create in current scope if not found |
+| `!set name = expr` | Assign, searching scopes inner to outer; create in current scope if not found |
 | `!local name [= expr]` | Declare in the current scope |
-| `!undef name` | Delete variable/macro |
-| `!name(a, b)` | Expand macro as a statement |
-| `!include "file"` | Include text at macro-expansion time |
-| `!error expr` | Abort expansion and report error |
-| `!warning expr` / `!echo expr` | Output to stderr |
+| `!undef name` | Delete a variable or macro |
+| `!name(a, b)` | Expand a macro as a statement |
+| `!include "file"` | Include text at expansion time |
+| `!error expr` | Abort expansion with an error |
+| `!warning expr` / `!echo expr` | Write to stderr |
 
-The opening `{` must appear at the end of the header line, and the closing `}` at the start of a line. `; comment` may be written after a statement.
+The opening `{` must be the last thing on the header line, and the closing `}`
+must start a line. `; comment` may follow a statement.
 
-### 7.2 Embedding in expressions
+### 7.2 Interpolation
 
 | Notation | Meaning |
 |---|---|
-| `!{expr}` | Expand value to text |
-| `!{expr:04x}` | Apply Python-style formatting |
+| `!{expr}` | Expand the value as text |
+| `!{expr:04x}` | Apply a Python-style format spec |
+| `\!{` | A literal `!{` |
 
-The format spec is Python's format mini-language. Both implementations
-implement the same grammar, and agree on which specs are accepted, which are
-rejected, and the wording of the resulting error.
+The format spec is Python's format mini-language. Both implementations accept
+the same specs, reject the same specs, and agree on the error wording.
 
 ```
 [[fill]align][sign][z][#][0][width][grouping][.precision][type]
@@ -950,53 +972,51 @@ gives `*11111111*`, `!{255:.2f}` gives `255.00`. Python's restrictions apply
 too: no precision on integer types, no `,` with `x`/`X`/`o`/`b`/`c`/`n`, no
 sign or `#` on a string.
 
-Both implementations strip whitespace around the spec before interpreting it,
-so Python's space-as-sign form (`!{5: d}`, which Python renders as `' 5'`) is
-the one thing that cannot be expressed; it behaves like `!{5:d}`.
+Two known divergences from Python:
 
-**Known difference**: `!{0:c}` (code point 0) yields a NUL character from
-axx.py, but an empty string from caxx, which cannot carry a NUL inside a C
-string.
-| `\!{` | Literal `!{` |
+- Both implementations strip whitespace around the spec before interpreting it,
+  so the space-as-sign form (`!{5: d}`, which Python renders as `' 5'`) cannot
+  be expressed; it behaves like `!{5:d}`.
+- `!{0:c}` yields a NUL character from Paxx, but an empty string from Caxx,
+  which cannot carry a NUL inside a C string.
 
-### 7.3 Values and operators
+### 7.3 Values, operators, built-ins
 
-Values are limited to integers and strings. Operators are C-compliant:
-`?:` `||` `&&` `|` `^` `&` `==` `!=` `<` `<=` `>` `>=` `<<` `>>` `+` `-` `*` `/` `%`
-plus unary `-` `+` `~` `!`. `/` and `%` truncate towards zero, just like in C (`-7/2 == -3`).
-`+` performs concatenation if either operand is a string; `"ab" * 3` performs repetition.
-Integer literals: `10` / `0x1f` / `0b1010` / `0o17` (underscores allowed).
-`'A'` is treated as a character code if it is a single character, or a string if multiple characters.
+Values are integers and strings. Operators are C-compliant:
 
-### 7.4 Built-in functions
+```
+?:  ||  &&  |  ^  &  ==  !=  <  <=  >  >=  <<  >>  +  -  *  /  %
+unary:  -  +  ~  !
+```
 
-`len(s)` `hex(v[,digits])` `str(v)` `int(s[,base])` `upper(s)` `lower(s)`
-`substr(s,start[,length])` `abs(v)` `min(...)` `max(...)` `uid()` `defined(name)`
+`/` and `%` truncate toward zero as in C (`-7/2 == -3`). `+` concatenates if
+either operand is a string; `"ab" * 3` repeats. Integer literals: `10`,
+`0x1f`, `0b1010`, `0o17`, underscores permitted. `'A'` is a character code if
+it is one character, a string if more.
 
-`substr()` clamps its start and length to the string. A negative start means
-the beginning (0), *not* Python-style indexing from the end; a negative length
-is treated as 0.
+Built-in functions:
 
-### 7.5 Implicit variables in macros
+```
+len(s)  hex(v[,digits])  str(v)  int(s[,base])  upper(s)  lower(s)
+substr(s,start[,length])  abs(v)  min(...)  max(...)  uid()  defined(name)
+```
+
+`substr()` clamps start and length to the string. A negative start means the
+beginning (0), **not** Python-style indexing from the end; a negative length is
+treated as 0.
+
+Implicit variables inside a macro:
 
 | Name | Content |
 |---|---|
-| `__id__` | Integer unique to each invocation (for generating local labels) |
+| `__id__` | Integer unique to each invocation — for generating local labels |
 | `__name__` | Macro name |
 
-### 7.6 Command-line options
+### 7.4 Macros in pattern files
 
-| Option | Meaning |
-|---|---|
-| `--no-macro` | Completely disable the macro layer |
-| `-P [FILE]`, `--macro-expand [FILE]` | Output only the expanded source and exit (defaults to stdout) |
-| `-p [FILE]`, `--macro-expand-pattern [FILE]` | Output only the expanded pattern file and exit (defaults to stdout) |
-
-caxx.c uses the same option names. To allow the filename to be omitted, the `-P` option in the C version interprets the subsequent argument as the output destination only when placed after both the pattern file and the source file have been specified (e.g., `caxx pat.axx src.s -P out.s`). `-p` follows the same rule. `--no-macro` disables both the source-side and the pattern-side layer.
-
-### 7.7 Macros in pattern files
-
-Pattern files (`.axx`) go through the same macro layer as source files. An instruction table tends to consist of rows of the same shape that differ only in a register number or an opcode, so those rows can be generated instead of written out by hand:
+Pattern files go through the same macro layer. An instruction table tends to be
+rows of the same shape differing only in a register number or an opcode, so the
+rows can be generated:
 
 ```
 !def alu(name, base) {          /* pattern-file comment syntax, on a statement line
@@ -1010,7 +1030,8 @@ Pattern files (`.axx`) go through the same macro layer as source files. An instr
 !alu("SUB", 0x90)
 ```
 
-The error field can be generated too, so a range check written once is applied to every generated row:
+The error field can be generated too, so a range check written once applies to
+every generated row:
 
 ```
 !def imm(name, op) {
@@ -1020,35 +1041,50 @@ The error field can be generated too, so a range check written once is applied t
 !imm("SUBI", 0xd6)
 ```
 
-Only three things differ from the source side; the syntax, the built-in functions and the runaway guards are all the same.
+Three things differ from the source side; the syntax, built-ins and runaway
+guards are identical.
 
-1. **A separate namespace.** The pattern side and the source side have independent macro environments and cannot see each other's macros or variables. A pattern file's macros can therefore never change how a source file expands, and the per-pass reset the source side performs during relaxation can never wipe macros defined while reading the pattern file.
-2. **Comments on statement lines start with a slash-star sequence**, matching pattern-file convention. `;` is not a comment marker there, because it separates the error-code suffix of a pattern's error field (`v>0xff;2`).
-3. **A stricter engage condition.** In a pattern file `!` is the pattern-variable sigil (`ADD A,!d`), so it appears on nearly every line. The layer is therefore engaged only when a line would really be taken as a macro statement, or contains an unescaped `!{...}`, or starts with `}`. A pattern file that uses no macros skips the layer entirely: every pattern file shipped with axx expands to itself byte-for-byte and assembles in the same time as before.
+1. **Separate namespace.** The pattern side and source side have independent
+   macro environments and cannot see each other's macros or variables. A
+   pattern file's macros can therefore never change how a source file expands,
+   and the per-pass reset the source side performs during relaxation can never
+   wipe macros defined while reading the pattern file.
+2. **Comments on statement lines use `/*`,** matching pattern-file convention.
+   `;` is not a comment marker there, because it introduces the error-code
+   suffix in an error field (`v>0xff;2`).
+3. **Stricter engage condition.** In a pattern file `!` is the pattern-variable
+   sigil (`ADD A,!d`) and appears on nearly every line, so the layer engages
+   only when a line would really be taken as a macro statement, contains an
+   unescaped `!{...}`, or starts with `}`. A pattern file that uses no macros
+   skips the layer entirely: every bundled pattern file expands to itself
+   byte-for-byte and assembles in the same time as before.
 
-`.INCLUDE` on the pattern side is processed *after* macro expansion, so a macro can generate the `.INCLUDE` line itself. Each `.INCLUDE`d pattern file is macro-expanded in turn, inheriting the macros defined by the top-level pattern file.
+Use `-p` to inspect the generated pattern text without assembling.
 
-Use `-p` to see the generated pattern text without assembling.
+### 7.5 Compatibility and limits
 
-### 7.8 Backward compatibility
+Backward compatibility:
 
-- Lines starting with `!` are intercepted only if they contain a keyword, a predefined macro name, or are immediately followed by `(`.
-VLIW-specific `!!` and `!F` / `!D` / `!Q` constructs remain untouched.
-- A `}` at the start of a line is treated as a closing brace only when a block is currently open.
-- Output for source code containing no macros remains identical to previous behavior.
+- A line starting with `!` is intercepted only if it contains a keyword, names
+  a defined macro, or is immediately followed by `(`. The VLIW `!!` and the
+  `!F` / `!D` / `!Q` forms are untouched.
+- A `}` at the start of a line closes a block only when a block is open.
+- Source containing no macros produces identical output to before the macro
+  layer existed.
 
-### 7.9 Limitations
+Limitations:
 
-- Source-side `.INCLUDE` directives bypass the macro layer; use `!include` to import macro definition files. (Pattern-side `.INCLUDE` does run the included file through the macro layer.)
-- Constructs like `!{a ? b : c:04x}` (combining a ternary operator with format specifiers) cannot currently be parsed.
-- Interactive mode (when no source file is specified) bypasses the macro layer.
+- Source-side `.include` bypasses the macro layer; use `!include` for macro
+  definition files. (Pattern-side `.include` *does* run through the layer.)
+- `!{a ? b : c:04x}` — a ternary combined with a format spec — cannot currently
+  be parsed.
+- Prompt mode bypasses the macro layer.
 
-### 7.10 Runaway protection
+Runaway protection: 200 levels of recursion, 1,000,000 `!while` iterations,
+2,000,000 generated lines, `!include` nesting depth 64. Exceeding any limit
+raises an error and aborts expansion for the rest of the pass.
 
-Limits: 200 levels of recursion, 1,000,000 `!while` iterations, 2,000,000 generated lines, and a nesting depth of 64 for `!include`.
-Exceeding any of these limits triggers an error, and expansion is aborted for the remainder of the pass.
-
-### 7.11 Example
+### 7.6 Example
 
 ```asm
 !include "lib.inc"
@@ -1084,30 +1120,30 @@ end:
 NOP
 ```
 
-## 8. Object Output, Export and Import
+---
 
-### 8.1 Export / import file format
+## 8. Object output, export and import
 
-The files handled by `-e`, `-E` and `-i` are **tab-separated** (TSV). Fields
-must be separated by a real tab character; a line separated by spaces is
-silently ignored.
+### 8.1 File format
 
-#### 8.1.1 Export (-e, -E)
+The files handled by `-e`, `-E` and `-i` are **tab-separated**. Fields must be
+separated by a real tab; a line separated by spaces is silently ignored.
 
-Two kinds of record are written. A section record has three fields (four with
-`-E`), and a label record has two:
+Two record shapes exist. A section record has three fields (four with `-E`); a
+label record has two:
 
 ```
 sectionname   startaddress   size   [flags]
 labelname     value
 ```
 
-Addresses, sizes and values are written with a `0x` prefix. `-E` adds a fourth
-field to the section records holding the ELF section flags (`AX`, `WA`, and so
-on); `-e` omits the flags. Labels appear in the order in which `.export` /
-`.global` declared them.
+### 8.2 Export (`-e`, `-E`)
 
-Example (`axx x86_64.axx hello.s -E hello.tsv`):
+Addresses, sizes and values are written with a `0x` prefix. `-E` adds a fourth
+field to section records holding the ELF section flags (`AX`, `WA`, …); `-e`
+omits them. Labels appear in the order `.export` / `.global` declared them.
+
+`axx x86_64.axx hello.s -E hello.tsv`:
 
 ```
 .text	0x401000	0x39	AX
@@ -1116,18 +1152,18 @@ _start	0x401000
 len	0xd
 ```
 
-#### 8.1.2 Import (-i)
+### 8.3 Import (`-i`)
 
-The import file uses the same two record shapes, and the two may be mixed in
-one file. **Values are read as hexadecimal, without a `0x` prefix.**
+The import file uses the same two record shapes and may mix them.
+**Values are read as hexadecimal, without a `0x` prefix** — this differs from
+the export format.
 
-- A three-field line `sectionname<TAB>start<TAB>size` declares the address
-  range of a section.
-- A two-field line `labelname<TAB>value` defines an imported label. Its
-  section is inferred by finding which of the previously declared ranges the
-  address falls into; if none matches, `.text` is assumed.
+- A three-field line declares the address range of a section.
+- A two-field line defines an imported label. Its section is inferred by
+  finding which declared range the address falls into; if none matches, `.text`
+  is assumed.
 
-A relocation type can be attached to an imported label with `::` :
+A relocation type can be attached to an imported label with `::`:
 
 ```
 .text	401000	39
@@ -1136,13 +1172,11 @@ otherlabel::pc32	401020
 ```
 
 The names accepted after `::` are the short names in the `named` table of the
-selected machine in `ELF_MACHINES`. For x86-64 they are `abs64`, `abs32`,
-`abs32s`, `abs16`, `abs8`, `pc32`, `rel32`, `plt32`, `pc16`, `pc8`, `pc64`,
-`got32`, `gotpcrel` and `got64`. An unrecognized name produces a warning and
-is ignored.
+selected machine in `ELF_MACHINES`. For x86-64: `abs64`, `abs32`, `abs32s`,
+`abs16`, `abs8`, `pc32`, `rel32`, `plt32`, `pc16`, `pc8`, `pc64`, `got32`,
+`gotpcrel`, `got64`. An unrecognized name produces a warning and is ignored.
 
-Section records are optional. If you only need label values, a file of
-two-field lines is enough:
+Section records are optional. If you only need label values:
 
 ```
 label1	0
@@ -1150,38 +1184,86 @@ label2	1
 label3	2
 ```
 
+---
+
 ## 9. Errors
 
-- If a label conflicts with a symbol in the pattern file, an "is a pattern file symbol" error occurs.
+Diagnostics raised by the assembler itself:
 
-- Defining the same label more than once results in a "label already defined" error.
+| Condition | Message |
+|---|---|
+| A label collides with a pattern-file symbol | *is a pattern file symbol* |
+| A label is defined more than once | *label already defined* |
+| A line cannot be parsed | *Syntax error* |
+| A referenced label is never defined | *Label undefined* |
+| Malformed assembler or pattern line | *Illegal syntax in assembler line or pattern line* |
+| An EPIC template is not set | *No VLIW instruction-set defined* |
+| A malformed VLIW pattern file | reported during interpretation |
 
-- If parsing is not possible, a "Syntax error" occurs.
-
-- Referencing an undefined label results in a "Label undefined" error.
-
-- If the syntax is incorrect, an "Illegal syntax in assembler line or pattern line" error occurs.
-
-- If the EPIC template is not set, a "No VLIW instruction-set defined" error occurs.
-
-- If the VLIW pattern file is incorrect, errors in the VLIW definition are reported during interpretation.
-
-- An error will occur if any of the conditions in `error_patterns` are met. The code written after `;` selects the message:
+Errors raised by `error_patterns`, selected by the code after `;`:
 
 | Code | Message |
 |---|---|
 | 1 | Invalid syntax. |
 | 2 | Address out of range. |
 | 3 | Value out of range. |
-| 4 | (none) |
+| 4 | *(none)* |
 | 5 | Register out of range. |
 | 6 | Port number out of range. |
-| 7 and above | (none) |
+| 7 and above | *(none)* |
 
-  A code with no message still raises the error and still stops the output
-  file from being written; only the text is blank. If there are not enough
-  error types, please add error messages to the `ERRORS` table in the source
-  code (`axx.py`, and the matching table in `caxx.c`).
+A code with no text still raises the error and still prevents the output file
+from being written; only the message is blank. To add messages, extend the
+`ERRORS` table in `axx.py` and the matching table in `caxx.c`.
+
+---
+
+## 10. Design notes and background
+
+*This section is background. Nothing here is needed to use axx.*
+
+### 10.1 Origin
+
+`axx` abbreviates "Arbitrary eXtended X(cross) assembler". The name also comes
+from superimposing an X — an unknown CPU — onto "ASM". Since the reference
+implementation is Python, its nickname is Paxx.
+
+The core idea, the name, and a prototype in C existed in 1986, conceived during
+university while working part-time at Tokyo Denshi Sekkei. The original listing
+resurfaced 38 years later, and the working code released today is a 2024
+rewrite of it in Python.
+
+### 10.2 The metalanguage
+
+The `instruction` field is a metalanguage for imperative assembly languages.
+It is a DSL without a fixed grammar — a free-syntax pattern language in which
+you build your own grammar out of string literals, symbols and expressions.
+
+Reduced to its minimum, an imperative assembly language is
+`instruction :: binary_list`; error checking is an addition, and axx's
+`binary_list` adds expression evaluation, alignment and the `;` modifier for
+practical use rather than out of necessity.
+
+What axx does is extract the common structure of the von Neumann architecture,
+metamodel the ISA, and formalize the result as pattern matching.
+
+### 10.3 Why the pattern language is not Turing-complete
+
+A processor architecture can be made arbitrarily complex if one chooses to make
+it so. A Turing-complete pattern language could follow it anywhere; axx's
+cannot, which is what makes it a general rather than a universal assembler.
+
+The reason for the restriction is that a Turing-complete DSL would make the
+pattern file a *program*, and pattern matching would no longer be guaranteed to
+terminate. That guarantee was judged worth more than the extra reach. The macro
+layer is a separate stage and is not restricted this way.
+
+Because a pattern file has no explicit structure, it suits unstructured
+instruction encodings well; `.check` (section 3.6) is what lets you impose
+structure — such as an instruction `MOVabc r,s` where `a`, `b`, `c` each range
+over a fixed set — when you want it.
+
+---
 
 ## Appendix A. Examples
 
@@ -1194,11 +1276,12 @@ label3	2
 LD s,!d:: (s&0xf!=0)||(s>>4)>3;9 :: s|0x01,d&0xff,d>>8
 ```
 
-Then, `ld bc,0x1234`, `ld de,0x1234`, and `ld hl,0x1234` will output 0x01,0x34,0x12, 0x11,0x34,0x12, and 0x21,0x34,0x12, respectively.
+`ld bc,0x1234`, `ld de,0x1234` and `ld hl,0x1234` emit `0x01,0x34,0x12`,
+`0x11,0x34,0x12` and `0x21,0x34,0x12`.
 
-### A.2 Testing instructions on several processors
+### A.2 Fragments of several processors
 
-This is a test, so the binary is different from the actual code.
+A test fixture; the encodings are not the real ones.
 
 ```test.axx
 /* test
@@ -1276,10 +1359,8 @@ label: .equ flt{3.14}
 ldf a,flt{enfloat(:label)*2}
 ```
 
-#### A.2.1 Execution example
-
 ```
-$ axx.py test.axx test.s -v
+$ axx test.axx test.s -v
 0000000000000000 test.s 1 ldf a,3.14  0x01 0xc3 0xf5 0x48 0x40
 0000000000000005 test.s 2 ldf a,3.14*2+1  0x01 0xc3 0xf5 0xe8 0x40
 000000000000000a test.s 3 ldd a,3.14  0x01 0x1f 0x85 0xeb 0x51 0xb8 0x1e 0x09 0x40
@@ -1300,104 +1381,161 @@ $ axx.py test.axx test.s -v
 0000000000000063 test.s 18 ldf a,flt{enfloat(:label)*2}  0x01 0xec 0x91 0x81 0x4e
 ```
 
-This is what an AArch64 logical immediate looks like. This is likely the most complex example. Logical immediates and the like can be consolidated into a single entity using macros.
+### A.3 AArch64 logical immediate
+
+Probably the most complex thing expressible in a single pattern. Encodings like
+this can be folded into one macro (section 7.4).
+
 ```
 AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v)?2:((v&0xf)*0x1111111111111111==v)?4:((v&0xff)*0x0101010101010101==v)?8:((v&0xffff)*0x1000100010001==v)?16:((v&0xffffffff)*0x100000001==v)?32:64)*0,;(m:=(1<<e)-1)*0,;(y:=v&m)*0,;(t:=@(y^(y-1))-1)*0,;(u:=y>>t)*0,;(w:=(y^m)==0?1:y^m)*0,;(p:=@(w^(w-1))-1)*0,;(q:=w>>p)*0,;(c:=((u+1)&u)==0)*0,;(b:=c?@u:e-@q)*0,
  ;(r:=c?(e-t)&(e-1):(e-(p+@q))&(e-1))*0,;(s:=((0-2*e)&0x7f)|(b-1))*0,;(z:=(1<<31)|(0x24<<23)|((((s>>6)&1)^1)<<22)|(r<<16)|((s&0x3f)<<10)|(n<<5)|d)*0,@@[4,z>>(%%*8)]
 ```
 
-## Appendix B. Bundled Pattern Files
+---
 
-x86_64.axx, x86_64m.axx, 68000.axx, z80.axx, 8080.axx, 8048.axx, 8051.axx, 6502.axx, 6800.axx, 6809.axx, and 4004.axx are for practical use.
+## Appendix B. Bundled pattern files
 
-https://github.com/fygar256/x86_64_pattern_file_for_axx
+`x86_64.axx`, `x86_64m.axx`, `68000.axx`, `z80.axx`, `8080.axx`, `8048.axx`,
+`8051.axx`, `6502.axx`, `6800.axx`, `6809.axx` and `4004.axx` are for practical
+use. The rest are test fixtures.
 
-the other pattern files are for tests.
+The x86_64 pattern file is also maintained separately at
+<https://github.com/fygar256/x86_64_pattern_file_for_axx>.
 
-The bundled files and their matching test sources are:
+| Pattern file | Size | `::` lines | Source | Notes |
+|---|---|---|---|---|
+| **x86_64.axx** | 3.9 MB | 23,923 | **hello.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512 |
+| **x86_64m.axx** | 935 KB | 5,787 | **hello.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo |
+| **6809.axx** | 124 KB | 1,950 | **6809.s** | Motorola 6809 |
+| **68000.axx** | 49 KB | 458 | **68000.s** | Motorola 68000 |
+| **6800.axx** | 18 KB | 271 | **6800.s** | Motorola 6800 |
+| **6502.axx** | 14 KB | 192 | **6502.s** | MOS 6502 |
+| **z80.axx** | 7.5 KB | 283 | **z80.s** | Zilog Z80 |
+| **8051.axx** | 8.9 KB | 111 | **8051.s** | Intel 8051 |
+| **8080.axx** | 6.0 KB | 113 | **8080.s** | Intel 8080 |
+| **8048.axx** | 6.3 KB | 95 | **8048.s** | Intel 8048 |
+| **4004.axx** | 5.4 KB | 53 | **4004.s** | Intel 4004 |
+| **test.axx** | 1.1 KB | 40 | **test.s** | Fragments of several ISAs; test only |
+| **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
+| **vliw.axx** | 178 B | 9 | **vliw.s** | Non-EPIC VLIW; test only |
+| **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck virtual CPU; hello-world test |
 
-| Pattern file (.axx) | Size | Approx. pattern count (`::` lines) | Matching source (.s) | Description / Notes |
-|---------------------|------|------------------------------------|----------------------|---------------------|
-| **x86_64.axx** | 3.9 MB | ~23,923 | **hello.s** | x86_64-v3 (segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512). Large practical pattern set. README explicitly states that `x86_64.axx` uses `hello.s` |
-| **x86_64m.axx** | 935 KB | ~5,787 | **hello.s** (or macro-enabled sources) | x86_64-v3 with macros. Also used in demos such as the Brainfuck interpreter |
-| **6809.axx** | 125 KB | ~1,950 | **6809.s** | Motorola 6809 |
-| **68000.axx** | 41 KB | ~378 | **68000.s** | Motorola 68000 (present in the repository; not listed in the older FILE_DESCRIPTION) |
-| **6800.axx** | 18 KB | ~271 | **6800.s** | Motorola 6800 |
-| **6502.axx** | 15 KB | ~192 | **6502.s** | MOS 6502 |
-| **z80.axx** | 7.5 KB | ~283 | **z80.s** | Zilog Z80 |
-| **8048.axx** | 6.4 KB | ~95 | **8048.s** | Intel 8048 |
-| **8051.axx** | 9.2 KB | ~206 | **8051.s** | Intel 8051 |
-| **8080.axx** | 6.0 KB | ~113 | **8080.s** | Intel 8080 |
-| **4004.axx** | 5.4 KB | ~53 | **4004.s** | Intel 4004 |
-| **test.axx** | 1.1 KB | ~40 | **test.s** | Test-only pattern file containing fragments of several ISAs |
-| **itanium.axx** | 281 B | ~12 | **vliw.s** | Itanium (EPIC) sketch. Incomplete; no accompanying test source |
-| **vliw.axx** | 178 B | ~9 | **vliw.s** | Non-EPIC VLIW (test only) |
-| **bf.axx** | 128 B | ~9 | **bf.s** | Brainfuck virtual CPU (hello-world style test) |
+Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
+`itanium.axx` also uses `vliw.s`.
 
-Note that `x86_64.axx` uses the source `hello.s`, not a file named
-`x86_64.s`.
+`test1` runs every pair above through both implementations and compares the
+results.
 
-While x86_64 and legacy CPUs currently make up the majority of the processors implemented and supported in axx, it would be unfortunate if that were perceived as the extent of its capabilities; in reality, it is architecturally capable of handling a wide range of processors.
+x86_64 and legacy CPUs make up most of what is currently implemented, but that
+reflects where the work has gone, not the limit of what axx can describe.
 
-## Appendix C. Related Resources
+---
 
-### C.1 Test environment
+## Appendix C. Related resources
 
-FreeBSD,Linux terminal
+### C.1 Documents in this repository
 
-### C.2 Original article (Japanese)
+| File | Contents |
+|---|---|
+| `MACRO.md` / `macro_en.md` | Macro layer reference (Japanese / English). Same material as section 7 |
+| `axx_introduction_paper.md` / `_en.md` | Introduction paper: the design rationale behind the free-syntax pattern language, the specificity score, and the deliberate Turing incompleteness |
+| `axxsemantics` | A denotational-semantics formalization of axx, including relaxation read as a fixed point over the label environment. The formulas in it are that document's own construction, not an official specification |
+| `FILE_DESCRIPTION` | One-line description of every file |
+| `format_of_exp_imp_file` | Export/import file format |
+| `axx.1.gz` | Man page |
 
-Qiita: https://qiita.com/fygar256/items/1d06fb757ac422796e31
+`test1` assembles all fourteen bundled pattern/source pairs with both
+implementations and compares the results.
 
-### C.3 Relocatable ELF generation
+### C.2 External
 
-GitHub: https://github.com/fygar256/axx_relocatable_elf_generation
+**Test environment:** FreeBSD, Linux terminal.
 
-### C.4 Brainfuck interpreter demonstration
+- Original article (Japanese): <https://qiita.com/fygar256/items/1d06fb757ac422796e31>
+- Relocatable ELF generation: <https://github.com/fygar256/axx_relocatable_elf_generation>
+- Brainfuck interpreter demonstration:
+  <https://github.com/fygar256/brainfuck_interpreter_for_axx_on_freebsd_of_x86_64>
 
-https://github.com/fygar256/brainfuck_interpreter_for_axx_on_freebsd_of_x86_64
+---
 
 ## Appendix D. Roadmap
 
-### D.1 Unimplemented items
+### D.1 Not implemented
 
-* If one were to prepare pattern files for axx and add advanced structured macros and optimization features, it would become a truly impressive system; however, since it is difficult for a single individual to cover the full range of structured assembly-style macros, I hope someone else will take on the task. I would be delighted to see this realized.
+Pattern files plus advanced structured macros and optimization would make this
+a considerably more capable system, but covering the full range of
+structured-assembly macro constructs is more than one person can do. If someone
+wants to take it on, I would be glad to see it.
 
 ### D.2 The axx2 concept
 
-- Using a more descriptive metalanguage for pattern files would improve readability, eliminate dependency on evaluation order, make control statements easier to write, and make processor description file debugging easier. However, pattern data is more intuitive. Further generalizing the metalanguage and using a descriptive metalanguage for pattern files, adding string literals, string operations, and numeric operations to binary_list, and adding control statements, would enable the generation of intermediate languages and converters between assembly languages. In this case, the binary_list would be renamed object_list, and the pattern file would be renamed processor_specification_file. The metalanguage would be a multi-line description language rather than pattern data. This is feasible. Apparently, someone is currently working on it based on axx. Even in pattern files, you can write macros smartly by setting a='MOV b,c', assigning commands (strings) to character variables (currently lowercase letters, but if you expand this to what we normally call symbols), and writing them in binary_list. Allowing loop structures makes debugging difficult if an infinite loop occurs during processing within axx.py, but allowing evaluation only in pattern files simplifies debugging and allows loop and branch structures. Turing-completeness allows processing of any processor architecture. Lisp machines are also possible in principle. Self-reference checks are required. Use expand(a) to expand. For example, if a='b ; c' b='MOV AX,d' c='JMPC e', the result becomes 'MOV AX,d ; JMPC e'. Use expression(a) to evaluate the expression, and label: to define the label. Keeping labels separate in the processor description file and the assembly file eliminates the need to worry about the same label appearing in both. Meta-processing like EPIC is solved by enumerating variables. Making it a descriptive metalanguage requires drastic rewriting. If the assembler's processor characteristic description file becomes complex, it becomes difficult to make the file compatible with General Disassembler.
+A more descriptive metalanguage for pattern files would improve readability,
+remove the dependence on evaluation order, make control statements easier to
+write, and make processor description files easier to debug. Pattern data is
+more intuitive, so this is a trade rather than a straight win.
 
-## Appendix E. Project Notes
+Generalizing further — a descriptive metalanguage, string literals and string
+operations in what is currently `binary_list`, plus control statements — would
+allow intermediate-language generation and conversion between assembly
+languages. `binary_list` would become `object_list` and the pattern file would
+become a *processor specification file*, described in a multi-line language
+rather than as pattern data. This is feasible; apparently someone is working on
+it based on axx.
 
-### E.1 Notes and remarks
+Even in the current pattern files, macros can be written by assigning command
+strings to variables — `a='MOV b,c'` — and referring to them in `binary_list`.
+Extending single-character lowercase variables to full symbols, adding
+`expand(a)` for expansion (with `a='b ; c'`, `b='MOV AX,d'`, `c='JMPC e'`
+giving `'MOV AX,d ; JMPC e'`), `expression(a)` for evaluation, and `label:` for
+definitions would go a long way.
 
-* Apologies for the unconventional notation.
+Loop structures inside axx itself would make an infinite loop hard to debug;
+confining evaluation to the pattern file keeps debugging tractable while still
+permitting loops and branches, with self-reference checks. Turing completeness
+would allow any processor architecture — LISP machines included, in principle.
+Keeping the pattern file's labels separate from the assembly file's removes any
+concern about the same label appearing in both. EPIC-style meta-processing is
+solved by enumerating variables.
 
-* It may be an unreasonable thing to ask for, but axx does not support quantum computers or LISP machines. The assembly language for quantum computers is called quantum assembly, not assembly language, and programs for LISP machines are not assembly language either.
+The cost is a drastic rewrite, and a more complex processor description file
+makes compatibility with a general disassembler harder.
 
-* From homemade processors to supercomputers, please feel free to use it.
+---
 
-* Please evaluate, extend, and modify axx. The structure is complex, but since it's written in Python, extension is easy. Please feel free to extend it.
+## Appendix E. Project notes
 
-* Currently, only quadruple-precision floating-point numbers can be handled as constants. This is due to the Python 3 specification. It would be great if Python 4 could handle quadruple-precision floating-point numbers.
+### E.1 Notes
 
-* Macro functionality is built in, but to cover all assembly languages, a high-performance macro processor is needed to translate high-level assembly constructs — such as functional and structured assembly languages — into imperative assembly language.
-
-* Specifying the `-i` option imports labels from a TSV file. Specifying the `-e` option exports the labels specified in `.export`, along with the section/segment to which they belong, to a TSV file.
-
-* Creating axx pattern files is difficult with a large ISA, and since the specifications are fixed, I hope that AI can handle this. While assemblers were originally created to make machine code easier for humans to understand, in today's world where AI writes code, a generalized assembler for both assembly language and computers would be beneficial.
+- Apologies for the unconventional notation.
+- axx does not support quantum computers or LISP machines. What quantum
+  computers run is quantum assembly, and what LISP machines run is not assembly
+  language at all.
+- From homemade processors to supercomputers, please feel free to use it.
+- Please evaluate, extend and modify axx. The structure is complex, but it is
+  Python, so extending it is easy.
+- Constants are currently limited to quadruple precision, which is a Python 3
+  limitation. It would be good if Python 4 handled quad precision natively.
+- The macro layer is built in, but covering every assembly language would need
+  a stronger macro processor — one that lowers functional and structured
+  assembly constructs into imperative form.
+- Assemblers were originally built to make machine code readable by humans. Now
+  that AI writes code, a generalized assembler covering both assembly language
+  and the machine seems worth having — and generating pattern files for large
+  ISAs is exactly the kind of work AI should be doing.
 
 ### E.2 Bug reports
 
-If you find a bug, I would appreciate it if you could let me know what isn't working in axx.
+If you find a bug, please let me know what is not working.
 
 ### E.3 Acknowledgements
 
-I would like to express my gratitude to my mentor, Junichi Hamada, and Tokyo Denshi Sekkei, who gave me the problems and hints, the University of Electro-Communications, the computer scientists and engineers, Qiita, Google, IEEE, The Alan Turing Institute and some unforgettable people. I received a passing grade from Emeritus professor Kameda of the Information Processing Society of Japan. Thank you very much.
+My thanks to my mentor Junichi Hamada and to Tokyo Denshi Sekkei, who gave me
+the problems and the hints; to the University of Electro-Communications; to the
+computer scientists and engineers; to Qiita, Google, IEEE, The Alan Turing
+Institute; and to some unforgettable people. I received a passing grade from
+Emeritus Professor Kameda of the Information Processing Society of Japan. Thank
+you very much.
 
-### E.4 A note on the English text
+### E.4 Mascot
 
-### E.5 Mascot character
-
-<img alt="image" width="200px" height="200px" src="https://github.com/fygar256/axx/blob/main/axxgirl.png">
-
+<img alt="axxgirl" width="200px" height="200px" src="https://github.com/fygar256/axx/blob/main/axxgirl.png">
