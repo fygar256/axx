@@ -1246,7 +1246,7 @@ Reduced to its minimum, an imperative assembly language is
 practical use rather than out of necessity.
 
 What axx does is extract the common structure of the von Neumann architecture,
-metamodel the ISA, and formalize the result as pattern matching.
+metamodel the ISA, generalization of the format for describing ISAs, and formalize the result as pattern matching.
 
 ### 10.3 Why the pattern language is not Turing-complete
 
