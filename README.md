@@ -103,6 +103,7 @@ An `instruction` is any combination of
 - integer factors,
 - floating-point expressions.
 
+Axx `instruction`'s pattern language has no grammar, which is a free syntax DSL.
 This is enough to express the *surface syntax* of essentially any imperative
 assembly language, and it is not restricted to conventional mnemonic-plus-
 operand forms. `r1 = r2 + r3` is a legal instruction pattern, which makes axx
