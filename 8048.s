@@ -1,7 +1,7 @@
 nop
 nop
 L2:
-mov a,#L2:
+mov a,#L2
 ADD     A,R1
 mov     @R1,#2
 MOV     A,#4
