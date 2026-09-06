@@ -1,4 +1,4 @@
-;=============================================================
+; ============================================================
 ;  4004.s -- 4004.axx demo. The Intel 4004 (1971) was the first
 ;  commercial microprocessor, designed for the Busicom 141-PF
 ;  calculator; this program leans into that heritage with a
@@ -13,7 +13,7 @@
 ;  addend (least-significant digit first), register 1 holds the
 ;  second addend; ADD16 leaves the 4-digit decimal sum in
 ;  register 1, one BCD digit per DATA RAM character.
-;=============================================================
+; ============================================================
 
         .org    0x000
 
