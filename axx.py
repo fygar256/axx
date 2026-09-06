@@ -30,7 +30,7 @@
 """
 
 
-from decimal import Decimal, localcontext
+from decimal import Decimal, localcontext, ROUND_HALF_EVEN
 try:
     import readline
 except ImportError:
@@ -126,6 +126,11 @@ _UNDEF_DERIVED_THRESHOLD = 1 << 768
 # 誤判定しうることを一度だけ警告する。
 _UNDEF_SANE_CEILING = 1 << 256
 _undef_ceiling_warned = False
+
+# `*(値, 位置)` のバイト抽出でシフトさせる最大ビット数。これを超えると結果は
+# 符号（0 か -1）にしかならないので、頭打ちにしても値は変わらず、
+# 巨大なシフト量を渡されたときの暴走だけを防げる。
+_BYTE_EXTRACT_SHIFT_MAX = 1 << 20
 
 
 def _is_undef_derived(v):
@@ -298,7 +303,10 @@ _ELF_MACHINE_RAW = {
     ),
     40: dict(
         name='ARM', elfclass=1, is_rela=False,
-        width_guess={4: 3, 2: 4, 1: 8},
+        # 幅2の既定は R_ARM_ABS16(5)。かつて 4 と書かれていたが、ARM の 4 は
+        # R_ARM_LDR_PC_G0（32bit 命令フィールド用）で 16bit データ参照ではなく、
+        # 下の named にも reloc_bytes にも現れない値だった。
+        width_guess={4: 3, 2: 5, 1: 8},
         pc_rel={1, 3},
         extern_default=3,
         named={
@@ -530,7 +538,10 @@ class AssemblerState:
         # 失敗の情報が消えてしまう。降ろすのは、真新しく判定したい側
         # （.ORG/.RESB/.ZERO/.ALIGN/.EQU 等）が評価直前に自分で行う。
         self.error_undefined_label = False
-        self.error_label_conflict = False
+
+        # 既に報告したラベル定義の誤り。パス1はリラクゼーションで何度も走るので、
+        # 同じ誤りを反復回数だけ並べないための記録（LabelManager が使う）。
+        self.reported_label_errors = set()
 
         # ユーザ向けの " error - ..." を1度でも表示したら立ち、以後降ろさない。
         # run() はパス2の後にこれを見て、エラーが出ていたら出力を書かずに
@@ -556,6 +567,14 @@ class AssemblerState:
 
         # パターン変数 a〜z の束縛値。
         self.vars = [VAR_UNDEF for i in range(26)]
+
+        # 同じ添字で「その値が未定義ラベル由来か」を覚えておく札。
+        # 値そのものの大きさ（_is_undef_derived）だけでは、`UNDEF-UNDEF` や
+        # `UNDEF%UNDEF`、`UNDEF&0` のように算術で番兵が消えた場合を取りこぼす。
+        # 束縛した時点で判っている事実なので、値とは別に持ち回る
+        # （caxx.c の PatVar.is_undef に対応）。
+        # vars を退避・復元する箇所は必ずこちらも一緒に扱うこと。
+        self.vars_undef = [False] * 26
 
         self.deb1 = ""           # 照合デバッグ用（ソース側の残り）
         self.deb2 = ""           # 同（パターン側の残り）
@@ -649,8 +668,8 @@ class AssemblerState:
 
     # 旧来のフラットな属性名（state.vliwbits 等）を、分割後のサブ状態
     # （state.vliw.bits 等）へ転送するための対応表。呼び出し側を一斉に
-    # 書き換えずに状態を整理できるようにしてある。実際の転送は下の
-    # __getattr__ / __setattr__ が行う。
+    # 書き換えずに状態を整理できるようにしてある。実際の転送は、この表から
+    # クラス定義時に生成する property（すぐ下のループ）が行う。
     _FORWARDED_ATTRS = {
         'pas':                   ('relax', 'pas'),
         '_pass1_size_mode':      ('relax', 'pass1_size_mode'),
@@ -770,6 +789,66 @@ class StringUtils:
     @staticmethod
     def reduce_spaces(text):
         return StringUtils._SPACE_RUNS.sub(' ', text)
+
+    @staticmethod
+    def normalize_ws(l):
+        """アセンブリソース1行の空白を整える（引用符の中は手を付けない）。
+
+        引用符の外では タブ・CR・LF を空白に直し、連続する空白を1個に潰す。
+        照合は空白の個数を見ないので、こうしておくと `MOV  A , B` のような
+        書き方の揺れを吸収できる。
+
+        破綻点修正: 以前は行全体に一律で適用していたため、文字列リテラルの
+        中身まで潰していた。`.ascii "a    b"` が 3 バイトの `a b` になり、
+        生のタブは空白へ化けていた（診断は一切出ない）。文字列は「そのままの
+        バイト列を置く」のがアセンブラの仕事なので、引用符の中は素通しする。
+
+        `"..."` と `'x'` の扱いは remove_comment_asm() と同じ規約に従う。
+        """
+        out = []
+        in_dquote = False
+        in_ws = False
+        i = 0
+        n = len(l)
+        while i < n:
+            ch = l[i]
+
+            if in_dquote:
+                if ch == '\\' and i + 1 < n:
+                    out.append(l[i:i + 2])
+                    i += 2
+                    continue
+                if ch == '"':
+                    in_dquote = False
+                out.append(ch)
+                i += 1
+                continue
+
+            if ch == '"':
+                in_dquote = True
+                in_ws = False
+                out.append(ch)
+                i += 1
+                continue
+
+            if ch == '\'':
+                j = StringUtils.skip_squote_literal(l, i)
+                out.append(l[i:j])
+                in_ws = False
+                i = j
+                continue
+
+            if ch in ' \t\n\r':
+                if not in_ws:
+                    out.append(' ')
+                    in_ws = True
+                i += 1
+                continue
+
+            out.append(ch)
+            in_ws = False
+            i += 1
+        return ''.join(out)
 
     @staticmethod
     def remove_comment(l):
@@ -965,6 +1044,8 @@ class StringUtils:
                     if hex_str:
                         s += chr(int(hex_str, 16))
                     else:
+                        diag(f" warning - '\\x' escape requires at least one hex digit; "
+                             f"treated as literal 'x' in: {l2!r}", set_error=False)
                         s += 'x'
                 elif next_char in 'uU':
 
@@ -1062,8 +1143,21 @@ class Parser:
             while idx < len(s) and s[idx] != '}':
                 t += s[idx]
                 idx += 1
+            # 末尾の空白と、式文字列に付く終端 NUL を落とす（caxx.c の
+            # axx_get_curlb() と揃える）。`}` が閉じていない失敗経路では
+            # 行末までを取り込むためこれらが混ざり、エラーメッセージに
+            # そのまま出ていた。
+            t = t.rstrip(' \t\r\n\x00')
             if idx >= len(s):
-                self.state.diag(f" error - missing closing '}}' in expression: '{{{t}'", set_error=True)
+                # 破綻点修正: 通常の diag() はパターン照合の試行中は抑制されるため、
+                # この「`}` が閉じていない」という具体的な原因が握り潰され、
+                # 呼び出し元の総称的な "Illegal syntax ..." だけが出ていた
+                # （caxx.c は照合中でも表示するので、両実装で診断が食い違っていた）。
+                # 閉じ括弧の欠落はどのパターンで試しても同じく失敗する構文上の誤りで、
+                # 特定パターンの不採用とは無関係なので、照合中の抑制を迂回して報告する。
+                if self.state.should_report_errors():
+                    self.state.diag(f" error - missing closing '}}' in expression: '{{{t}'",
+                                    set_error=True, force=True)
                 return False, '', len(s)
             idx += 1
             f = True
@@ -1080,7 +1174,19 @@ class Parser:
                 idx += 1
         return StringUtils.upper(t), idx
 
-    def get_label_word(self, s, idx):
+    def get_label_word(self, s, idx, eat_colon=True):
+        """ラベル名を1語切り出す。
+
+        eat_colon=True のときは、名前の直後の `:` も一緒に読み飛ばす。
+        `foo: NOP` の行頭ラベルや `.EXTERN foo::pc32` を切り出すための約束で、
+        呼び出し側は `l[idx-1] == ':'` を見て「ラベル定義だったか」を判定する。
+
+        破綻点修正: 式の評価（ExpressionEvaluator.factor1）からも同じ関数を
+        呼んでいたため、三項演算子の `:` がラベル名の一部として食われていた。
+        `0?foo:bar` は bar ではなく 0 になり（term11 が `:` を見つけられず
+        else 節ごと消える）、しかも診断は一切出なかった。`foo :bar` のように
+        空白を入れたときだけ正しく動くという再現条件の分かりにくい誤りだったので、
+        式の文脈からは eat_colon=False で呼ぶ。"""
         t = ""
         if idx < len(s) and (s[idx] == '.' or (s[idx] not in DIGIT and s[idx] in self.state.lwordchars)):
             t = s[idx]
@@ -1089,7 +1195,8 @@ class Parser:
                 t += s[idx]
                 idx += 1
 
-            if idx < len(s) and s[idx] == ':' and (idx + 1 >= len(s) or s[idx + 1] != '='):
+            if (eat_colon and idx < len(s) and s[idx] == ':'
+                    and (idx + 1 >= len(s) or s[idx + 1] != '=')):
                 idx += 1
 
         return t, idx
@@ -1211,7 +1318,7 @@ class IEEE754Converter:
             exponent = (1 << EXPONENT_BITS) - 1
             fraction = 0
         elif d == 0:
-            sign = 0
+            sign = 1 if d.is_signed() else 0
             exponent = 0
             fraction = 0
         else:
@@ -1249,13 +1356,13 @@ class IEEE754Converter:
             if biased_exp <= 0:
                 exponent = 0
                 shift = two ** (1 - BIAS - SIGNIFICAND_BITS)
-                fraction = int(d / shift + Decimal('0.5'))
+                fraction = int((d / shift).to_integral_value(rounding=ROUND_HALF_EVEN))
                 if fraction >= (1 << SIGNIFICAND_BITS):
                     exponent = 1
                     fraction = 0
             else:
                 exponent = biased_exp
-                fraction = int((normalized - 1) * (two ** SIGNIFICAND_BITS) + Decimal('0.5'))
+                fraction = int(((normalized - 1) * (two ** SIGNIFICAND_BITS)).to_integral_value(rounding=ROUND_HALF_EVEN))
                 if fraction >= (1 << SIGNIFICAND_BITS):
                     fraction = 0
                     exponent += 1
@@ -1381,32 +1488,58 @@ class VariableManager:
     
     `!x` や `!Fx` でソースから捕捉した値の置き場。状態は state.vars（26要素の配列）で、
     このクラスは添字計算と未定義判定を隠すだけの薄い層。
+
+    値とは別に「未定義ラベル由来か」の札（state.vars_undef）も持つ。put() は
+    札を降ろし、put_tagged() は明示した札を立てる。捕捉時に判っている事実を
+    そのまま覚えておくためで、理由は state.vars_undef のコメントを参照。
     """
 
     def __init__(self, state):
         self.state = state
 
+    @staticmethod
+    def _index(s):
+        u = StringUtils.upper(s)
+        if len(u) != 1 or u not in CAPITAL:
+            return -1
+        return ord(u) - ord('A')
+
     def get(self, s):
-        c = ord(StringUtils.upper(s))
-        return self.state.vars[c - ord('A')]
+        i = self._index(s)
+        if i < 0:
+            return VAR_UNDEF
+        return self.state.vars[i]
+
+    def is_undef(self, s):
+        i = self._index(s)
+        if i < 0:
+            return False
+        return self.state.vars_undef[i]
 
     def put(self, s, v):
-        if StringUtils.upper(s) in CAPITAL:
-            c = ord(StringUtils.upper(s))
-            if isinstance(v, Decimal):
-                if not v.is_finite():
-                    self.state.vars[c - ord('A')] = float(v)
-                elif v == v.to_integral_value():
-                    self.state.vars[c - ord('A')] = int(v)
-                else:
-                    self.state.vars[c - ord('A')] = float(v)
-            elif isinstance(v, float) and not v.is_integer():
-                self.state.vars[c - ord('A')] = v
+        self.put_tagged(s, v, False)
+
+    def put_tagged(self, s, v, is_undef):
+        # 破綻点修正: `'' in CAPITAL` は True なので、空文字を渡されると
+        # 直後の ord('') が TypeError になっていた（`len == 1` の判定が要る）。
+        c = self._index(s)
+        if c < 0:
+            return
+        if isinstance(v, Decimal):
+            if not v.is_finite():
+                self.state.vars[c] = float(v)
+            elif v == v.to_integral_value():
+                self.state.vars[c] = int(v)
             else:
-                try:
-                    self.state.vars[c - ord('A')] = int(v)
-                except (OverflowError, ValueError):
-                    self.state.vars[c - ord('A')] = v
+                self.state.vars[c] = float(v)
+        elif isinstance(v, float) and not v.is_integer():
+            self.state.vars[c] = v
+        else:
+            try:
+                self.state.vars[c] = int(v)
+            except (OverflowError, ValueError):
+                self.state.vars[c] = v
+        self.state.vars_undef[c] = bool(is_undef)
 
 
 class LabelManager:
@@ -1462,8 +1595,11 @@ class LabelManager:
             if not self.state._in_match_attempt and (self.state.should_report_errors()):
                 _fn = self.state.current_file or ""
                 _ln = self.state.ln
+                # 破綻点修正: set_error=False で出していたため had_error が立たず、
+                # この診断だけが出る経路（パターンファイル側ディレクティブの式など）
+                # では「エラーを表示しながら終了コード0」になっていた。
                 self.state.diag(f" error - Label undefined: '{k}'"
-                     f"  [{_fn}:{_ln}]", set_error=False)
+                     f"  [{_fn}:{_ln}]", set_error=True)
             return v
         _sec = self.state.labels[k][1]
         if self.state._equ_sections_touched is not None:
@@ -1492,29 +1628,46 @@ class LabelManager:
                     (k, v, self.state._elf_current_word_idx))
         return v
 
+    def _report_definition_error(self, key, msg):
+        """ラベル定義の誤りを、1つにつき1回だけ必ず表示する。
+
+        破綻点修正: これらは had_error を立てながら通常の diag() で出していた。
+        しかし定義の衝突が見つかるのはパス1で、パス1の診断は抑制される。
+        パス2では「既に在るラベル」に見えるので二度と検出されず、結果として
+        ユーザには具体的な原因が一度も表示されないまま、
+        " error - one or more errors were reported during assembly" だけ、
+        あるいは（値がずれた場合）「パス1/パス2のアドレス不一致 ＝ リラクゼーション
+        未収束」という全く無関係なメッセージが出ていた。
+        パス1の抑制を迂回して出す代わりに、リラクゼーションの反復回数だけ
+        重複しないよう、同じ誤りは1回に抑える。
+        """
+        self.state.had_error = True
+        if key in self.state.reported_label_errors:
+            return
+        self.state.reported_label_errors.add(key)
+        _fn = self.state.current_file or ""
+        self.state.diag(f" error - {msg}  [{_fn}:{self.state.ln}]",
+                        set_error=True, force=True)
+
     def put_value(self, k, v, s, is_equ=False, reloc_type=None):
         if self.state.pas == 1 or self.state.pas == 0:
             if k in self.state.labels:
                 existing = self.state.labels[k]
                 old_is_imported = len(existing) > 3 and existing[3]
                 if not old_is_imported:
-                    self.state.error_label_conflict = True
-                    self.state.had_error = True
-                    self.state.diag(" error - label already defined.", set_error=False)
+                    self._report_definition_error(
+                        ('dup', k), f"label '{k}' is already defined.")
                     return False
         elif self.state.pas == 2:
             if k not in self.state.labels:
-                self.state.error_label_conflict = True
-                self.state.had_error = True
-                self.state.diag(f" error - label '{k}' not defined in pass 1.", set_error=False)
+                self._report_definition_error(
+                    ('pass1', k), f"label '{k}' not defined in pass 1.")
                 return False
 
         if StringUtils.upper(k) in self.state.patsymbols:
-            self.state.had_error = True
-            self.state.diag(f" error - '{k}' is a pattern file symbol.", set_error=False)
+            self._report_definition_error(
+                ('patsym', k), f"'{k}' is a pattern file symbol.")
             return False
-
-        self.state.error_label_conflict = False
 
         is_imported = False
 
@@ -1656,7 +1809,19 @@ class ExpressionEvaluator:
                                 self.state.diag(" error - negative byte-extract offset in *(expr, expr).", set_error=True)
                                 x = 0
                             else:
-                                x = x >> shift_amount
+                                # 破綻点修正: 抽出元が float のとき `>>` が
+                                # TypeError で落ちていた（単項 `~` は int() で
+                                # 守られているのにここだけ素通しだった）。
+                                # 併せて桁数の上限を切る。上限を超えた分は
+                                # 符号だけが残るので、caxx.c の 256bit 算術シフト
+                                # （n>=256 で符号で埋める）と同じ結果になる。
+                                try:
+                                    x = int(x)
+                                except (OverflowError, ValueError):
+                                    self.state.diag(" error - non-finite value in *(expr, expr) byte extract.", set_error=True)
+                                    x = 0
+                                else:
+                                    x >>= min(shift_amount, _BYTE_EXTRACT_SHIFT_MAX)
                     else:
                         self.state.diag(" error - missing ')' in *(expr, expr) expression.", set_error=True)
                         x = 0
@@ -2047,7 +2212,16 @@ class ExpressionEvaluator:
             else:
                 self.state.diag(" error - missing closing ')' in not(...) expression.", set_error=True)
             x = 0 if x else 1
-        elif self.state.exp_typ == 'i' and idx < len(s) and s[idx].isdigit():
+        elif self.state.exp_typ == 'i' and idx < len(s) and s[idx] in DIGIT:
+                # 破綻点修正: str.isdigit() は '²'（上付き2）のような Unicode の
+                # 「digit」だが「decimal」ではない文字にも True を返す。
+                # 一方 get_intstr() は ASCII の '0'-'9' しか消費しないため、
+                # そのような文字では fs='' のまま返ってきて int('') が
+                # 未捕捉の ValueError を投げ、生のトレースバックで落ちていた
+                # （caxx.c は ASCII のみを見るので同じ入力を正しく構文エラーに
+                # する）。ここを get_intstr が実際に消費する文字集合（DIGIT、
+                # ASCII '0'-'9'）と揃え、Unicode digit を「数字の先頭ではない」
+                # として後続の一般トークン処理に委ねる。
                 fs, idx = self.parser.get_intstr(s, idx)
                 x = int(fs)
         elif self.state.exp_typ == 'f' and idx < len(s) and (self.parser.isfloatstr(s, idx)):
@@ -2060,15 +2234,24 @@ class ExpressionEvaluator:
               s[idx] in LOWER and (idx + 1 >= len(s) or s[idx + 1] not in self.state.lwordchars)):
             ch = s[idx]
             if idx + 3 <= len(s) and s[idx + 1:idx + 3] == ':=':
+                # 代入の右辺だけが未定義かどうかを見たいので、旗を一度降ろして
+                # 評価し、結果を変数の札にしてから元の旗と OR で戻す。
+                _assign_prior = self.state.error_undefined_label
+                self.state.error_undefined_label = False
                 x, idx = self.expression(s, idx + 3)
-                self.var_manager.put(ch, x)
+                _assign_undef = self.state.error_undefined_label
+                self.state.error_undefined_label = _assign_prior or _assign_undef
+                self.var_manager.put_tagged(ch, x, _assign_undef)
             else:
                 x = self.var_manager.get(ch)
                 idx += 1
+                # 破綻点修正: 値の大きさ（_is_undef_derived）だけで判定していたため、
+                # `UNDEF-UNDEF` や `UNDEF%UNDEF` のように算術で番兵が消える式では
+                # 未定義を見逃し、0 を黙って出力していた。束縛時に付けた札も見る。
                 if (not self.state._in_match_attempt
                         and not self.state._pass1_size_mode
                         and (self.state.should_report_errors())
-                        and _is_undef_derived(x)):
+                        and (self.var_manager.is_undef(ch) or _is_undef_derived(x))):
                     self.state.error_undefined_label = True
                     self.state.diag(f" error - Label undefined: variable '{ch}' contains undefined value"
                          f"  [{self.state.current_file}:{self.state.ln}]", set_error=False)
@@ -2080,7 +2263,7 @@ class ExpressionEvaluator:
                         self.state._elf_label_refs_seen.append(
                             (lname, lval, self.state._elf_current_word_idx))
         elif idx < len(s) and s[idx] in self.state.lwordchars:
-            w, idx_new = self.parser.get_label_word(s, idx)
+            w, idx_new = self.parser.get_label_word(s, idx, eat_colon=False)
             if idx != idx_new:
                 idx = idx_new
                 x = self.label_manager.get_value(w)
@@ -2093,7 +2276,11 @@ class ExpressionEvaluator:
         while idx < len(s) and StringUtils.q(s, '**', idx):
             t, idx = self.factor(s, idx + 2)
             _EXP_MAX = 1024
-            _EXP_RESULT_MAX_BITS = 1 << 20
+            # axx が本物の値として保証するのは 2**256 まで（_UNDEF_SANE_CEILING）。
+            # これを超えて _UNDEF_DERIVED_THRESHOLD (2**768) に近づくと、
+            # 正当な ** の結果が「未定義ラベル由来」に誤判定されてしまうため、
+            # 上限もこの設計に合わせて 256bit に揃える。
+            _EXP_RESULT_MAX_BITS = _UNDEF_SANE_CEILING.bit_length() - 1
 
             try:
                 t_int = int(t)
@@ -2317,54 +2504,91 @@ class ExpressionEvaluator:
             x = 1 if x or t else 0
         return x, idx
 
-    def term11(self, s, idx):
-        x, idx = self.term10(s, idx)
-        if idx < len(s) and StringUtils.q(s, '?', idx):
-            saved_vars              = self.state.vars[:]
-            saved_err_undef         = self.state.error_undefined_label
-            saved_err_conflict      = self.state.error_label_conflict
-            saved_elf_refs_len      = len(self.state._elf_label_refs_seen)
-            saved_elf_v2l           = dict(self.state._elf_var_to_label)
-
-            t, idx = self.term11(s, idx + 1)
-            vars_after_true         = self.state.vars[:]
-            err_after_true          = self.state.error_undefined_label
-            conflict_after_true     = self.state.error_label_conflict
-            refs_after_true         = list(self.state._elf_label_refs_seen)
-            v2l_after_true          = dict(self.state._elf_var_to_label)
-
-            if idx < len(s) and StringUtils.q(s, ':', idx):
-                self.state.vars                     = saved_vars[:]
-                self.state.error_undefined_label    = saved_err_undef
-                self.state.error_label_conflict     = saved_err_conflict
-                del self.state._elf_label_refs_seen[saved_elf_refs_len:]
-                self.state._elf_var_to_label        = dict(saved_elf_v2l)
-                u, idx = self.term11(s, idx + 1)
-
-                if x != 0:
-                    self.state.vars                     = vars_after_true
-                    self.state.error_undefined_label    = err_after_true
-                    self.state.error_label_conflict     = conflict_after_true
-                    self.state._elf_label_refs_seen     = refs_after_true
-                    self.state._elf_var_to_label        = v2l_after_true
-                    x = t
-                else:
-                    x = u
+    # 三項演算子の「取らない側」を、評価せずに字面だけで読み飛ばすための走査。
+    # 括弧・角括弧・省略可グループの入れ子は数えて、深さ0の `?` `,` `;` と、
+    # `:=`（代入）ではない `:` で止まる。
+    @staticmethod
+    def _skip_subexpr(s, idx):
+        paren = brack = ob = 0
+        n = len(s)
+        while idx < n and s[idx] != chr(0):
+            c = s[idx]
+            if c == '(':
+                paren += 1
+                idx += 1
+            elif c == ')':
+                if paren <= 0:
+                    break
+                paren -= 1
+                idx += 1
+            elif c == '[':
+                brack += 1
+                idx += 1
+            elif c == ']':
+                if brack <= 0:
+                    break
+                brack -= 1
+                idx += 1
+            elif c == OB:
+                ob += 1
+                idx += 1
+            elif c == CB:
+                if ob <= 0:
+                    break
+                ob -= 1
+                idx += 1
+            elif paren == 0 and brack == 0 and ob == 0 and c in '?,;':
+                break
+            elif (paren == 0 and brack == 0 and ob == 0 and c == ':'
+                    and (idx + 1 >= n or s[idx + 1] != '=')):
+                break
             else:
-                if x != 0:
-                    self.state.vars                     = vars_after_true
-                    self.state.error_undefined_label    = err_after_true
-                    self.state.error_label_conflict     = conflict_after_true
-                    self.state._elf_label_refs_seen     = refs_after_true
-                    self.state._elf_var_to_label        = v2l_after_true
-                    x = t
+                idx += 1
+        return idx
+
+    @classmethod
+    def _skip_ternary_expr(cls, s, idx):
+        n = len(s)
+        idx = cls._skip_subexpr(s, idx)
+        if idx < n and s[idx] == '?' and (idx + 1 >= n or s[idx + 1] != '='):
+            idx = StringUtils.skipspc(s, idx + 1)
+            idx = cls._skip_ternary_expr(s, idx)
+            idx = StringUtils.skipspc(s, idx)
+            if idx < n and s[idx] == ':' and (idx + 1 >= n or s[idx + 1] != '='):
+                idx = StringUtils.skipspc(s, idx + 1)
+                idx = cls._skip_ternary_expr(s, idx)
+        return idx
+
+    def term11(self, s, idx):
+        """三項演算子 `cond ? a : b`。
+
+        破綻点修正: 以前は両辺を必ず評価し、取らなかった側の副作用
+        （変数束縛・未定義ラベル旗・ELF リロケーション参照）を後から巻き戻して
+        いた。しかし diag() で「表示済み」になった診断だけは巻き戻せないため、
+        `1 ? 5 : nosuchlabel` のように取らない側に未定義ラベルがあると、
+        値は正しいのに " error - Label undefined: 'nosuchlabel'" が出て
+        ビルドが失敗していた。加えて、取らない側の解析位置に依存する作りだった
+        ので、真側がラベルで終わると `:` を見失って else 節ごと消えていた。
+
+        caxx.c と同じく、取らない側は評価せず字面で読み飛ばす短絡評価に統一する。
+        """
+        x, idx = self.term10(s, idx)
+        n = len(s)
+        if idx < n and s[idx] == '?':
+            idx = StringUtils.skipspc(s, idx + 1)
+            if x == 0:
+                skip_end = self._skip_subexpr(s, idx)
+                if (skip_end < n and s[skip_end] == ':'
+                        and (skip_end + 1 >= n or s[skip_end + 1] != '=')):
+                    x, idx = self.term11(s, StringUtils.skipspc(s, skip_end + 1))
                 else:
-                    self.state.vars                     = saved_vars
-                    self.state.error_undefined_label    = saved_err_undef
-                    self.state.error_label_conflict     = saved_err_conflict
-                    del self.state._elf_label_refs_seen[saved_elf_refs_len:]
-                    self.state._elf_var_to_label        = dict(saved_elf_v2l)
+                    idx = skip_end
                     x = 0
+            else:
+                x, idx = self.term11(s, idx)
+                idx = StringUtils.skipspc(s, idx)
+                if idx < n and s[idx] == ':' and (idx + 1 >= n or s[idx + 1] != '='):
+                    idx = self._skip_ternary_expr(s, StringUtils.skipspc(s, idx + 1))
         return x, idx
 
     def expression(self, s, idx):
@@ -2373,7 +2597,7 @@ class ExpressionEvaluator:
             x, idx0 = self.term11(s, idx0)
             return x, idx0
         except RecursionError:
-            self.state.diag(" error - expression nesting too deep (RecursionError).", set_error=False)
+            self.state.diag(" error - expression nesting too deep (RecursionError).", set_error=True)
             return 0, idx
 
     def _terminate(self, s):
@@ -2457,12 +2681,19 @@ class BinaryWriter:
         self._buffer[position] = word_val & mask
 
     def flush(self):
-        if not self.state.outfile or not self._buffer:
+        if not self.state.outfile:
             return
 
+        # 破綻点修正: この検査は `not self._buffer` の後ろに置かれていたが、
+        # bts<=0 のときは _store() が何も溜めないので _buffer は必ず空であり、
+        # 警告に到達できないデッドコードだった（結果として何も言わずに
+        # 出力ファイルが作られないだけになる）。バッファ判定より前に出す。
         if self.state.bts <= 0:
-            self.state.diag(f" warning - flush: bts={self.state.bts} is invalid (<=0); "
-                 f"output file '{self.state.outfile}' will be empty.", set_error=False)
+            self.state.diag(f" error - flush: bts={self.state.bts} is invalid (<=0); "
+                 f"no output written to '{self.state.outfile}'.", set_error=True)
+            return
+
+        if not self._buffer:
             return
 
         valid_buffer = {k: v for k, v in self._buffer.items() if k >= 0}
@@ -2536,7 +2767,7 @@ class BinaryWriter:
             try:
                 self.fwrite(a, int(x), 0)
             except (OverflowError, ValueError):
-                self.state.diag(f" error - non-finite value {x!r} cannot be written as binary word.", set_error=False)
+                self.state.diag(f" error - non-finite value {x!r} cannot be written as binary word.", set_error=True)
 
     def outbin(self, a, x):
         if self.state.should_report_errors():
@@ -2544,7 +2775,7 @@ class BinaryWriter:
             try:
                 self.fwrite(a, int(x), _prt)
             except (OverflowError, ValueError):
-                self.state.diag(f" error - non-finite value {x!r} cannot be written as binary word.", set_error=False)
+                self.state.diag(f" error - non-finite value {x!r} cannot be written as binary word.", set_error=True)
 
     def align_(self, addr):
         if self.state.align <= 0:
@@ -2612,25 +2843,61 @@ class DirectiveProcessor:
         return True
 
     def bits(self, i):
+        """`.bits[::<big|little>][::<幅>]` — ワード長とエンディアン。
+
+        破綻点修正: 幅の検証が一切無かった。パターン表の行は常に6要素なので
+        `len(i) >= 3` が必ず真になり、`.bits::big`（幅の書き忘れ。この形では
+        'big' は i[2] に入る）でも i[2] を式として評価してしまい、未定義ラベル
+        'big' の番兵 (1<<1024)-1 がそのままワード長になっていた。以降の出力は
+        1ワードごとに OverflowError で潰れ、しかもその診断は had_error を
+        立てないため「エラーを表示しながら終了コード0・出力ファイル無し」という
+        無言の失敗になっていた。欄の解釈を整理し、1..64 の整数だけを受け付ける。
+        """
         if len(i) == 0 or i[0] != '.bits':
             return False
 
-        if len(i) >= 2:
-            if i[1].lower() == 'big':
-                self.state.endian = 'big'
-            elif i[1].lower() == 'little':
-                self.state.endian = 'little'
+        # 破綻点修正: 欄の意味を位置(第1欄=エンディアン,第2欄=幅)で固定していたため
+        # `.bits::<幅>::<big|little>`（順序が逆）を書くと、幅の値が捨てられた上で
+        # 診断なしにエンディアンだけが適用されていた。位置ではなく内容
+        # ('big'/'little' かどうか)でフィールドの役割を判定し、順序に依らず両方
+        # 正しく解釈する。
+        fields = []
+        if len(i) >= 2 and i[1] != '':
+            fields.append(i[1])
+        if len(i) >= 3 and i[2] != '':
+            fields.append(i[2])
 
-        v = None
-        if len(i) >= 3:
-            v, idx = self.expr_eval.expression_pat(i[2], 0)
-        elif len(i) >= 2 and i[1].lower() not in ('big', 'little'):
-            v, idx = self.expr_eval.expression_pat(i[1], 0)
-        if v is not None:
-            try:
-                self.state.bts = int(v)
-            except (OverflowError, ValueError):
-                self.state.diag(" error - .bits: non-finite bit width value.", set_error=True)
+        wf = ''
+        for f in fields:
+            fl = f.lower()
+            if fl == 'big':
+                self.state.endian = 'big'
+            elif fl == 'little':
+                self.state.endian = 'little'
+            elif wf == '':
+                wf = f
+            else:
+                self.state.diag(f" error - .bits: multiple word-width fields given "
+                                f"({wf!r} and {f!r}).", set_error=True)
+
+        if wf:
+            self.state.error_undefined_label = False
+            v, _idx = self.expr_eval.expression_pat(wf, 0)
+            ok = not self.state.error_undefined_label and not _is_undef_derived(v)
+            nb = 0
+            if ok:
+                try:
+                    nb = int(v)
+                except (OverflowError, ValueError, TypeError):
+                    ok = False
+                else:
+                    ok = (nb == v) and 1 <= nb <= 64
+            if ok:
+                self.state.bts = nb
+            else:
+                self.state.diag(f" error - .bits: word width must be an integer in "
+                                f"1..64, got {wf!r}.", set_error=True)
+            self.state.error_undefined_label = False
         return True
 
     def paddingp(self, i):
@@ -2662,7 +2929,7 @@ class DirectiveProcessor:
             return False
 
         if len(i) < 5:
-            self.state.diag(f" error - .vliw directive requires 4 parameters (vliwbits, vliwinstbits, vliwtemplatebits, nop_value), got {len(i) - 1}", set_error=False)
+            self.state.diag(f" error - .vliw directive requires 4 parameters (vliwbits, vliwinstbits, vliwtemplatebits, nop_value), got {len(i) - 1}", set_error=True)
             return False
 
         v1, idx = self.expr_eval.expression_pat(i[1], 0)
@@ -2676,6 +2943,16 @@ class DirectiveProcessor:
             self.state.vliwtemplatebits = int(v3)
         except (OverflowError, ValueError):
             self.state.diag(" error - .vliw: non-finite parameter value.", set_error=True)
+            return True
+
+        # 破綻点修正: v1〜v3 だけ int() を通していて v4（NOP 値）は生のまま
+        # `v4 & 0xff` / `v4 >>= 8` に渡していた。float なら TypeError、負値なら
+        # Python の算術シフトが 0xff を無限に生み続けて caxx.c（uint64 で
+        # いずれ 0 になる）と食い違っていた。64bit の符号なし値に揃える。
+        try:
+            v4 = int(v4) & 0xFFFFFFFFFFFFFFFF
+        except (OverflowError, ValueError):
+            self.state.diag(" error - .vliw: non-finite nop value.", set_error=True)
             return True
 
         _VLIW_INSTBITS_MAX = 8192
@@ -2905,7 +3182,14 @@ class PatternMatcher:
 
             if a == '\\':
                 idx_t += 1
-                if idx_t < len(t) and t[idx_t] == b:
+                # 破綻点修正: 上限を len(t) で見ていたが、t は末尾に番兵の
+                # chr(0) を1個足してある。パターン欄が `\` で終わると
+                # その番兵を「エスケープされた文字」として b（同じく番兵）に
+                # 一致させてしまい、idx_s が s の外へ出て IndexError になった。
+                # 例外は呼び出し元が握り潰すので、症状は「そのパターンが
+                # 永久に一致しない」＋原因不明の Illegal syntax だった。
+                # caxx.c と同じく、番兵の手前までを本文として扱う。
+                if idx_t < len(t) - 1 and t[idx_t] == b:
                     lit_alnum = t[idx_t].isalnum()
                     if lit_alnum and prev_alnum and word_break:
                         return False
@@ -3048,11 +3332,17 @@ class PatternMatcher:
                         return False
                     idx_t += 1
                     self.state._elf_capturing_var = a
+                    # 捕捉した式だけが未定義だったかを見たいので旗を一度降ろす。
+                    # 結果は変数の札に移し、外側の旗は OR で戻す。
+                    _cap_prior = self.state.error_undefined_label
+                    self.state.error_undefined_label = False
                     try:
                         v, idx_s = self.expr_eval.factor(s, idx_s)
                     finally:
                         self.state._elf_capturing_var = None
-                    self.var_manager.put(a, v)
+                    _cap_undef = self.state.error_undefined_label
+                    self.state.error_undefined_label = _cap_prior or _cap_undef
+                    self.var_manager.put_tagged(a, v, _cap_undef)
                     continue
                 else:
                     if a == chr(0) or a not in LOWER:
@@ -3066,11 +3356,15 @@ class PatternMatcher:
                         stopchar = chr(0)
 
                     self.state._elf_capturing_var = a
+                    _cap_prior = self.state.error_undefined_label
+                    self.state.error_undefined_label = False
                     try:
                         v, idx_s = self.expr_eval.expression_esc(s, idx_s, stopchar)
                     finally:
                         self.state._elf_capturing_var = None
-                    self.var_manager.put(a, v)
+                    _cap_undef = self.state.error_undefined_label
+                    self.state.error_undefined_label = _cap_prior or _cap_undef
+                    self.var_manager.put_tagged(a, v, _cap_undef)
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
                         idx_s += 1
                     continue
@@ -3175,12 +3469,14 @@ class PatternMatcher:
                     return False
                 lt = self.remove_brackets(t, list(j))
                 saved_vars = self.state.vars[:]
+                saved_vars_undef = self.state.vars_undef[:]
                 saved_refs_len = len(self.state._elf_label_refs_seen)
                 saved_v2l      = dict(self.state._elf_var_to_label)
                 if self.match(s, lt):
                     self.last_match_score = self.last_score
                     return True
                 self.state.vars = saved_vars
+                self.state.vars_undef = saved_vars_undef
                 del self.state._elf_label_refs_seen[saved_refs_len:]
                 self.state._elf_var_to_label = saved_v2l
         return False
@@ -3207,7 +3503,7 @@ class PatternFileReader:
 
         _MAX_PAT_DEPTH = 50
         if _depth > _MAX_PAT_DEPTH:
-            diag(f" error - pattern .INCLUDE nesting exceeds {_MAX_PAT_DEPTH}: '{fn}'", set_error=False)
+            diag(f" error - pattern .INCLUDE nesting exceeds {_MAX_PAT_DEPTH}: '{fn}'", set_error=True)
             return []
 
         if base_dir and not os.path.isabs(fn):
@@ -3218,7 +3514,7 @@ class PatternFileReader:
             _chain = frozenset()
         if _real in _chain:
             diag(f" error - circular pattern .INCLUDE detected: '{fn}' "
-                 f"(already in include chain). Skipped.", set_error=False)
+                 f"(already in include chain). Skipped.", set_error=True)
             return []
         _chain = _chain | {_real}
 
@@ -3295,10 +3591,10 @@ class PatternFileReader:
                          "Please use double quotes.", set_error=False)
                     s = fallback
                 else:
-                    diag(f" error - .INCLUDE directive has no filename: {l!r}", set_error=False)
+                    diag(f" error - .INCLUDE directive has no filename: {l!r}", set_error=True)
                     return []
             else:
-                diag(f" error - .INCLUDE directive has no filename: {l!r}", set_error=False)
+                diag(f" error - .INCLUDE directive has no filename: {l!r}", set_error=True)
                 return []
         w = self.readpat(s, base_dir, _depth=_depth, _chain=_chain)
         return w
@@ -3363,25 +3659,37 @@ class ObjectGenerator:
                     expr = pattern[expr_start:comma_pos]
                     rep_pattern = pattern[comma_pos + 1:i]
 
+                    # 破綻点修正: 繰り返し回数の未定義判定のために旗を降ろした
+                    # まま復元していなかったため、オペランド捕捉の段階で立った
+                    # 「未定義ラベルを踏んだ」という情報が、`@@[]` を含むパターン
+                    # では必ず消えていた。makeobj() は e_p() の呼び出し「後」に
+                    # 旗を退避するので、呼び出し元の状態ごと失われ、未定義ラベル
+                    # を含む命令が診断なしで 0 として出力されていた。
+                    _rep_prior = self.state.error_undefined_label
                     self.state.error_undefined_label = False
                     n, idx = self.expr_eval.expression_pat(expr, 0)
+                    _rep_undef = self.state.error_undefined_label
+                    self.state.error_undefined_label = _rep_prior or _rep_undef
                     _N_MAX = 1 << 24
-                    if self.state.error_undefined_label:
+                    if _rep_undef or _is_undef_derived(n):
                         n = 0
                     try:
                         n_int = int(n)
                     except (ValueError, OverflowError):
                         n_int = 0
                     if n_int > _N_MAX:
-                        self.state.diag(f" error - @@[n,...]: repeat count {n_int} exceeds maximum {_N_MAX}.", set_error=False)
+                        # 表示だけで had_error を立てないと、切り詰めた誤った
+                        # バイト列がそのまま出力されてしまうので失敗扱いにする。
+                        self.state.diag(f" error - @@[n,...]: repeat count {n_int} exceeds maximum {_N_MAX}.", set_error=True)
                         n_int = 0
                     if n_int > 0:
                         n = n_int
                         has_content = True
+                        expanded_rep, _ = self.e_p(rep_pattern)
                         for j in range(int(n)):
                             if j > 0:
                                 result.append(',')
-                            result.append(rep_pattern)
+                            result.append(expanded_rep)
 
                     i += 1
                 else:
@@ -3510,7 +3818,16 @@ class VLIWProcessor:
                 im = 2 ** self.state.vliwinstbits - 1
                 tm = 2 ** abs(self.state.vliwtemplatebits) - 1
                 pm = 2 ** vbits - 1
+                # 破綻点修正: VLIW/EPIC テンプレート式が未定義値を踏んでも
+                # error_undefined_label は factor1 側で立つだけで、lineassemble2
+                # の通常経路と違ってここでは誰も had_error に変換していなかった。
+                # メッセージは出るのに exit 0 になり、不完全な出力が書かれていた。
+                _tmpl_prior_undef = self.state.error_undefined_label
+                self.state.error_undefined_label = False
                 x, idx = self.expr_eval.expression_pat(k[1], 0)
+                if self.state.error_undefined_label and self.state.should_report_errors():
+                    self.state.had_error = True
+                self.state.error_undefined_label = _tmpl_prior_undef or self.state.error_undefined_label
                 templ = x & tm
 
                 values = []
@@ -3685,6 +4002,7 @@ class AssemblyDirectiveProcessor:
 
         while idx < len(l2) and not l2[idx] == '"':
             ch = None
+            _is_literal = False   # ソース中の生の文字か、エスケープ由来か
             if l2[idx:idx + 2] == '\\0':
                 idx += 2
                 ch = chr(0)
@@ -3734,11 +4052,25 @@ class AssemblyDirectiveProcessor:
             else:
                 ch = l2[idx]
                 idx += 1
+                _is_literal = True
             if ch is not None:
-                if ord(ch) > _word_mask:
-                    _truncated = True
-                self.binary_writer.outbin(self.state.pc, ord(ch))
-                self.state.pc += 1
+                # 破綻点修正: 以前は文字を常に ord(ch)（コードポイント）1個として
+                # 出力していたため、ソースに直接書かれた非ASCII文字が語長で
+                # 切り捨てられ無意味な値になっていた（"こ"=U+3053 → 0x53）。
+                # アセンブラとしては元のバイト列をそのまま置くのが正しく、
+                # caxx.c もそう動く（C はバイト列で処理するため自然にそうなる）。
+                # ソース中の生の文字だけを UTF-8 バイト列に展開する。
+                # \xHH などのエスケープは「バイト値の指定」なので1バイトのまま扱う
+                # （ここを UTF-8 符号化すると \xFF が 2 バイトになってしまう）。
+                if _is_literal:
+                    _vals = list(ch.encode('utf-8'))
+                else:
+                    _vals = [ord(ch)]
+                for _v in _vals:
+                    if _v > _word_mask:
+                        _truncated = True
+                    self.binary_writer.outbin(self.state.pc, _v)
+                    self.state.pc += 1
         if idx >= len(l2):
             self.state.diag(f" warning - unterminated string literal in .ASCII/.ASCIZ: {l2!r}", set_error=False)
         if _truncated and self.state.should_report_errors():
@@ -3748,11 +4080,15 @@ class AssemblyDirectiveProcessor:
         return True
 
     def export_processing(self, l1, l2):
-        if not (self.state.should_report_errors()):
-            return False
         _l1u = StringUtils.upper(l1)
         if _l1u != ".EXPORT" and _l1u != ".GLOBAL":
             return False
+        # 破綻点修正: パス1では False（＝未処理）を返していたため、`.global foo`
+        # の行がパス1だけパターン照合へ流れ、たまたま一致するパターンがあると
+        # パス1でだけバイトが出てパス1/パス2のアドレスがずれた。
+        # ディレクティブとしては必ず消費し、記録だけをパス2/対話時に限る。
+        if not (self.state.should_report_errors()):
+            return True
 
         idx = 0
         l2 += chr(0)
@@ -4092,8 +4428,17 @@ def _strip_comment(text, pat_mode=False):
                 continue
             if c == quote:
                 quote = ''
-        elif c in '"\'':
+        elif c == '"':
             quote = c
+        elif c == "'":
+            # 破綻点修正: `'` を無条件に引用符の開きとして扱っていた。しかし
+            # パターンファイルでは `'` は「任意ビット位置からの符号拡張」演算子
+            # （`!x'8` 等）でもあり、行に1個しか無い場合そこから行末までが
+            # 「引用符の中」とみなされ、以降の `/*` コメントが除去されなくなって
+            # マクロ層の行判定が狂っていた。対になる `'` が同じ行にあるときだけ
+            # 文字リテラルとみなす。
+            if text.find("'", i + 1) >= 0:
+                quote = c
         elif pat_mode:
             if c == '/' and text[i + 1:i + 2] == '*':
                 return text[:i].rstrip()
@@ -4217,8 +4562,6 @@ class _ExprParser:
         v = self.shift()
         while True:
             self.skip()
-            if self.s.startswith('<<', self.i) or self.s.startswith('>>', self.i):
-                return v
             if self.eat('<='):
                 v = 1 if _cmp_lt_eq(self, v, self.shift(), True) else 0
             elif self.eat('>='):
@@ -4533,25 +4876,27 @@ class MacroPreprocessor:
                              f"{_MACRO_MAX_DEPTH} while expanding '{fn.name}'")
 
         local = {}
-        for k, pname in enumerate(fn.params):
-            if k < len(args):
-                local[pname] = args[k]
-            else:
-                local[pname] = self.eval(fn.defaults[k], pos)
-        self.uid += 1
-        local['__id__'] = self.uid
-        local['__name__'] = fn.name
-
         self.scopes.append(local)
-        self.depth += 1
         try:
-            self.exec_block(fn.body)
-        except _MacroReturn as r:
-            return r.value
+            for k, pname in enumerate(fn.params):
+                if k < len(args):
+                    local[pname] = args[k]
+                else:
+                    local[pname] = self.eval(fn.defaults[k], pos)
+            self.uid += 1
+            local['__id__'] = self.uid
+            local['__name__'] = fn.name
+
+            self.depth += 1
+            try:
+                self.exec_block(fn.body)
+            except _MacroReturn as r:
+                return r.value
+            finally:
+                self.depth -= 1
+            return 0
         finally:
-            self.depth -= 1
             self.scopes.pop()
-        return 0
 
 
     def interpolate(self, text, pos):
@@ -4600,12 +4945,20 @@ class MacroPreprocessor:
         spec = None
         quote = ''
         par = 0
-        for k, c in enumerate(body):
+        k = 0
+        # 破綻点修正: 引用符の中の `\` を見たとき次の1文字を飛ばさずに continue
+        # していたため（interpolate() は j += 2 で正しく飛ばしている）、
+        # `!{ "a\"b" : spec }` のようにエスケープされた引用符を含むと
+        # そこで引用符が閉じたと誤認し、書式指定の `:` の位置を取り違えていた。
+        while k < len(body):
+            c = body[k]
             if quote:
                 if c == '\\':
+                    k += 2
                     continue
                 if c == quote:
                     quote = ''
+                k += 1
                 continue
             if c in '"\'':
                 quote = c
@@ -4615,10 +4968,12 @@ class MacroPreprocessor:
                 par -= 1
             elif c == ':' and par == 0:
                 if '?' in body[:k]:
+                    k += 1
                     continue
                 spec = body[k + 1:].strip()
                 body = body[:k]
                 break
+            k += 1
         v = self.eval(body, pos)
         if spec:
             try:
@@ -5012,9 +5367,14 @@ class MacroPreprocessor:
         diag(f" warning - {msg}", set_error=False, force=True)
 
     def fail(self, msg):
+        # 破綻点修正: None 検査より前に self.state.diag() を呼んでいた。
+        # PatternFileReader は既定でマクロ層を state=None で作る（3行下の
+        # コンストラクタ）ので、その経路でマクロエラーが起きると
+        # AttributeError で落ちていた。warn() と同じくモジュール関数の diag()
+        # に委ねる（状態が無ければそのまま stderr へ出る）。
         if msg not in self._reported:
             self._reported.add(msg)
-            self.state.diag(f" error - {msg}", set_error=False, force=True)
+            diag(f" error - {msg}", set_error=False, force=True)
         self.had_error = True
         if self.state is not None:
             self.state.had_error = True
@@ -5172,14 +5532,28 @@ def _bi_abs(pp, a, pos):
     return abs(a[0])
 
 
+def _bi_minmax(pp, a, pos, want_min):
+    # 破綻点修正: 組込 min()/max() をそのまま呼んでいたため、文字列と整数が
+    # 混ざると MacroError ではなく素の TypeError が飛び、expand() の捕捉対象外
+    # なので Python のトレースバックがそのままユーザに出ていた。
+    # 他の比較（`<` 等）と同じ経路を通して同じ診断を出す。
+    p = _ExprParser('', pp, pos)
+    best = a[0]
+    for v in a[1:]:
+        lt = _cmp_lt_eq(p, v, best, False)
+        if lt if want_min else (not lt and not _cmp_eq(v, best)):
+            best = v
+    return best
+
+
 def _bi_min(pp, a, pos):
     _bi_check(pp, a, pos, 'min', 1, 64)
-    return min(a)
+    return _bi_minmax(pp, a, pos, True)
 
 
 def _bi_max(pp, a, pos):
     _bi_check(pp, a, pos, 'max', 1, 64)
-    return max(a)
+    return _bi_minmax(pp, a, pos, False)
 
 
 def _bi_uid(pp, a, pos):
@@ -5231,14 +5605,27 @@ class Assembler:
         if StringUtils.upper(l1) != ".INCLUDE":
             return False
         s = StringUtils.get_string(l2)
-        if s:
+        if not s:
+            raw = l2.strip()
+            if raw:
+                fallback, _ = StringUtils.get_param_to_spc(raw, 0)
+                if fallback:
+                    self.state.diag(f" warning - .INCLUDE filename not quoted: {fallback!r}. "
+                                     "Please use double quotes.", set_error=False)
+                    s = fallback
+                else:
+                    self.state.diag(f" error - .INCLUDE directive has no filename: {l2!r}", set_error=True)
+                    return True
+            else:
+                self.state.diag(f" error - .INCLUDE directive has no filename: {l2!r}", set_error=True)
+                return True
 
-            if s != "stdin" and not os.path.isabs(s):
-                cur = self.state.current_file
-                if cur and cur not in ("(stdin)", ""):
-                    base = os.path.dirname(os.path.abspath(cur))
-                    s = os.path.join(base, s)
-            self.fileassemble(s)
+        if s != "stdin" and not os.path.isabs(s):
+            cur = self.state.current_file
+            if cur and cur not in ("(stdin)", ""):
+                base = os.path.dirname(os.path.abspath(cur))
+                s = os.path.join(base, s)
+        self.fileassemble(s)
         return True
 
     def lineassemble2(self, line, idx):
@@ -5324,6 +5711,7 @@ class Assembler:
             pln += 1
             pl = i
             self.state.vars = [VAR_UNDEF] * 26
+            self.state.vars_undef = [False] * 26
 
             if i is None:
                 continue
@@ -5388,6 +5776,7 @@ class Assembler:
             self.state.expmode = EXP_ASM
 
             saved_vars = self.state.vars[:]
+            saved_vars_undef = self.state.vars_undef[:]
             saved_refs_len = len(self.state._elf_label_refs_seen)
             saved_v2l = dict(self.state._elf_var_to_label)
 
@@ -5416,6 +5805,7 @@ class Assembler:
                         'pln':   pln,
                         'pat':   i,
                         'vars':  self.state.vars[:],
+                        'vars_undef': self.state.vars_undef[:],
                         'refs':  self.state._elf_label_refs_seen[saved_refs_len:],
                         'v2l':   dict(self.state._elf_var_to_label),
                         'dir':   _snap_dirstate(),
@@ -5424,11 +5814,17 @@ class Assembler:
                     }
 
                 self.state.vars = saved_vars
+                self.state.vars_undef = saved_vars_undef
                 del self.state._elf_label_refs_seen[saved_refs_len:]
                 self.state._elf_var_to_label = saved_v2l
 
-                if score[0] == 0 and score[2] == 0:
-                    break
+                # 破綻点修正: 以前は「式もシンボルも0個」なら即打ち切っていたが、
+                # スコアは (式の数, -リテラル数, シンボル数) の辞書順最小が勝ちで、
+                # あとからもっとリテラルの多い（＝より具体的な）パターンが
+                # 現れうるため、これでは取りこぼしがあった。健全な打ち切り条件を
+                # 作るのは `+`/`-` の読み替え（ソースを消費せずリテラル数だけ
+                # 増える）があるため難しく、全パターンを見ても実測で十分速いので、
+                # 打ち切り自体をやめて常に最良スコアを選ぶ。
 
             self.state.error_undefined_label = False
 
@@ -5449,6 +5845,7 @@ class Assembler:
 
             _restore_dirstate(best['dir'])
             self.state.vars = best['vars'][:]
+            self.state.vars_undef = best['vars_undef'][:]
             self.state._elf_label_refs_seen.extend(best['refs'])
             self.state._elf_var_to_label = dict(best['v2l'])
             self.state.error_undefined_label = best.get('error_undefined_label', False)
@@ -5523,14 +5920,20 @@ class Assembler:
                 return 0, [], False, idx
             if oerr:
                 self.state.had_error = True
-                self.state.diag(f" ; pat {pln} {pl} error - Illegal syntax in assemble line or pattern line.{_loc}", set_error=False)
+                # 破綻点修正: パターン番号と生の6フィールド配列という内部表現を
+                # 常にユーザ向けメッセージへ混ぜており、-d の有無に関わらず
+                # 出力されていた。さらに " error - " より前に "; pat ..." が付くため、
+                # 他の全診断が従う書式からも外れていた。
+                # 詳細は -d 指定時だけ、本文とは別行で出す。
+                self.state.diag(f" error - Illegal syntax in assemble line or pattern line.{_loc}", set_error=False)
+                if self.state.debug:
+                    self.state.diag(f"   (pattern {pln}: {pl})", set_error=False)
                 return 0, [], False, idx
 
         return idxs, objl, True, idx
 
     def lineassemble(self, line):
-        line = line.replace('\t', ' ').replace('\n', '').replace('\r', '')
-        line = StringUtils.reduce_spaces(line)
+        line = StringUtils.normalize_ws(line)
         line = StringUtils.remove_comment_asm(line)
         if line == '':
             return False
@@ -5612,7 +6015,6 @@ class Assembler:
                     rtype = 0
                     _rtype_is_default_guess = False
                     lentry = self.state.labels.get(lname)
-                    _is_imported = lentry and len(lentry) > 3 and lentry[3]
                     if lentry and len(lentry) > 4 and lentry[4] is not None:
                         rtype_override = lentry[4]
                         expected = _mach_tbl_la['reloc_bytes'].get(rtype_override)
@@ -5625,7 +6027,12 @@ class Assembler:
                         rtype = _rmap.get(num_bytes, 0)
                         _rtype_is_default_guess = True
 
-                    if rtype == 0 or first_widx >= len(objl):
+                    if first_widx >= len(objl):
+                        continue
+                    if rtype == 0:
+                        self.state.diag(
+                            f" warning - no relocation type available for a {num_bytes}-byte "
+                            f"reference to '{lname}'; relocation omitted.", set_error=False)
                         continue
 
                     sec_rel = (_completed_words + (self.state.pc + first_widx - _entry_pc_cur)) * bpw_r
@@ -6763,7 +7170,7 @@ class Assembler:
 
     @staticmethod
     def _normalise_macro_expand_argv(argv):
-        _with_arg = {'--osabi', '-b', '-e', '-E', '-i', '-o', '-m'}
+        _with_arg = {'--osabi', '-b', '-e', '-E', '-f', '-i', '-o', '-m'}
         out, positional, i = [], 0, 0
         while i < len(argv):
             a = argv[i]
@@ -6783,6 +7190,23 @@ class Assembler:
                         and positional >= need):
                     out += [a, nxt]
                     i += 2
+                elif nxt is not None and not nxt.startswith('-'):
+                    # 破綻点修正: 位置引数が揃う前に `-P out.txt pat.axx src.s`
+                    # と書かれた場合、この分岐は `-P` を引数なしと解釈し、
+                    # out.txt を位置引数（＝パターンファイル）へ流していた。
+                    # 「out.txt は -P の出力先」なのか「パターンファイル」なのか
+                    # は原理的に決められないので、黙って一方に倒さず断る。
+                    _long = ('--macro-expand-pattern'
+                             if a in ('-p', '--macro-expand-pattern')
+                             else '--macro-expand')
+                    _what = ('the pattern file'
+                             if a in ('-p', '--macro-expand-pattern')
+                             else 'the pattern/source files')
+                    diag(f" error - '{a} {nxt}' is ambiguous here: {nxt!r} could be "
+                         f"{a}'s output file or a positional argument. Write "
+                         f"'{_long}={nxt}', or put {a} after {_what}.",
+                         set_error=False, force=True)
+                    sys.exit(2)
                 else:
                     out += [a, '-']
                     i += 1
@@ -6802,7 +7226,7 @@ class Assembler:
 
         args = ap.parse_args(self._normalise_macro_expand_argv(sys.argv[1:]))
 
-        osabitbl = {'Linux': 0, 'linux': 0, 'FreeBSD': 9, 'freebsd': 9}
+        osabitbl = {'linux': 0, 'freebsd': 9}
 
         self.state.outfile      = args.outfile
         self.state.expfile      = args.expfile
@@ -6822,11 +7246,12 @@ class Assembler:
 
         self.state.elf_class    = 2 if args.elf_format == 64 else 1
 
-        if args.elf_osabi not in osabitbl:
+        _osabi_key = args.elf_osabi.lower()
+        if _osabi_key not in osabitbl:
             print(f"warning: unknown --osabi value '{args.elf_osabi}'; "
-                  f"valid choices are {list(osabitbl.keys())}. Using 'FreeBSD'.",
+                  f"valid choices are {list(osabitbl.keys())} (case-insensitive). Using 'FreeBSD'.",
                   file=sys.stderr)
-        self.state.osabi        = osabitbl.get(args.elf_osabi, 9)
+        self.state.osabi        = osabitbl.get(_osabi_key, 9)
         self.state.verbose      = args.verbose
         self.state.debug        = args.debug
         self.state.gen_debug    = args.gen_debug
@@ -6845,7 +7270,29 @@ class Assembler:
 
         try:
             self.state.pat = self.pattern_reader.readpat(args.patternfile)
+            # 破綻点修正: パターンファイルが読めなかった場合、readpat() は
+            # エラーを報告して空のパターン表を返すが、そのまま組み立てに進んで
+            # いたため、全ソース行が「どのパターンにも一致しない」となり
+            # 偽の "Syntax error" が行数ぶん並んで真の原因が埋もれていた。
+            # （終了コードが 1 になっていたのはその偽エラーの副作用にすぎない。）
+            if self.state.had_error:
+                self.state.diag(" error - one or more errors were reported during assembly; "
+                                "output would be incomplete or wrong.",
+                                set_error=False, force=True)
+                self.state.diag("         Aborting: no output file written.",
+                                set_error=False, force=True)
+                return False
             self.setpatsymbols(self.state.pat)
+            # 破綻点修正: パターンファイル側のディレクティブ評価（.setsym / .bits 等）
+            # で出たエラーを誰も拾っていなかったため、" error - ..." を表示しながら
+            # 終了コード0で「出力ファイルだけ作られない」無言の失敗になっていた。
+            if self.state.had_error:
+                self.state.diag(" error - one or more errors were reported while reading "
+                                "the pattern file; output would be incomplete or wrong.",
+                                set_error=False, force=True)
+                self.state.diag("         Aborting: no output file written.",
+                                set_error=False, force=True)
+                return False
 
             if self.state.impfile:
 
@@ -6901,6 +7348,7 @@ class Assembler:
                 _imported_labels = dict(self.state.labels)
 
                 _initial_vars = list(self.state.vars)
+                _initial_vars_undef = list(self.state.vars_undef)
 
                 for relax_iter in range(MAX_RELAX):
                     self.state._relax_optimistic = (relax_iter == 0)
@@ -6913,6 +7361,7 @@ class Assembler:
                     self.state.current_section = '.text'
                     self.state.symbols = dict(self.state.patsymbols)
                     self.state.vars = list(_initial_vars)
+                    self.state.vars_undef = list(_initial_vars_undef)
                     self.state.section_ranges = []
                     self.fileassemble(args.sourcefile)
 
@@ -7006,8 +7455,16 @@ class Assembler:
                     self.state.diag(" error - address mismatch between pass1 and pass2 "
                                     f"({len(_drift)} label(s)); output addresses are "
                                     f"UNRELIABLE.", set_error=False, force=True)
-                    print("         This usually means pass1 relaxation did not fully "
-                          "converge for variable-length forward references.", file=sys.stderr)
+                    # ラベル定義の誤りを既に報告している場合、ずれはその結果に
+                    # すぎない（パス1では定義を拒否し、パス2では通ってしまう）。
+                    # リラクゼーションの話を持ち出すと原因を見誤らせるので、
+                    # そのときは上の報告を指す案内に差し替える。
+                    if self.state.reported_label_errors:
+                        print("         This is a consequence of the label definition "
+                              "error(s) reported above; fix those first.", file=sys.stderr)
+                    else:
+                        print("         This usually means pass1 relaxation did not fully "
+                              "converge for variable-length forward references.", file=sys.stderr)
                     for k, p1, p2 in _drift[:10]:
                         try:
                             print(f"           {k}: pass1=0x{int(p1):X} pass2=0x{int(p2):X}",

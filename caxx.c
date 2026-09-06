@@ -50,6 +50,7 @@
 
 static void axx_diagf(int set_error, int force, const char *fmt, ...);
 static void m_pyrepr(const char *s, char *out, size_t outsz);
+static int  m_utf8(unsigned long cp, char *out);
 #include <unistd.h>
 #include <sys/stat.h>
 #include <libgen.h>
@@ -291,9 +292,28 @@ static int u256_nbit(uint256_t v) {
     return b;
 }
 
-static uint256_t UNDEF_VAL(void) { return u256_not(u256_zero()); }
+/* 未定義ラベルの値を表す番兵。
+ *
+ * 破綻点修正: 以前は ~0（全ビット1）だった。これは二の補数では -1 そのものなので、
+ * 式が正当に -1 を返しただけで「未定義ラベル由来」と誤判定していた
+ * （`MVI A,-1` がアセンブルできない、等）。axx.py の番兵 (1<<1024)-1 は
+ * 巨大な「正」の値で -1 とは別物であり、C 側だけが衝突していた。
+ *
+ * uint256_t には 256bit を超える帯域外の余地が無いため、代わりに
+ * 「符号付きで表せる最大値」= 0x7FFF...FFFF を番兵に使う。こうすると
+ *   - -1 は符号付き絶対値が 1 なので未定義由来と判定されない
+ *   - 番兵そのものと、そこから算術で派生した値（UNDEF+4 等）は
+ *     符号付き絶対値が 2**192 以上のままなので従来どおり検出できる
+ * という両立ができる。2**192 以上の正当な巨大定数を誤判定しうる点は
+ * 従来と変わらない（下の警告を参照）。 */
+static uint256_t UNDEF_VAL(void) {
+    uint256_t r = u256_not(u256_zero());
+    r.w[3] &= 0x7FFFFFFFFFFFFFFFULL;
+    return r;
+}
 static int u256_is_undef(uint256_t a) { return u256_eq(a, UNDEF_VAL()); }
 static int u256_is_undef_derived(uint256_t a) {
+    /* 番兵そのものは確定なので、下のヒューリスティック警告を出さずに返す。 */
     if (u256_is_undef(a)) return 1;
     int sign = (int)(a.w[3] >> 63);
     uint256_t av = sign ? u256_neg(a) : a;
@@ -443,6 +463,28 @@ static void lmap_free(LabelMap *m) {
     }
     free(m->buckets); m->buckets=NULL; m->count=0; m->nbuckets=0;
 }
+/* 破綻点修正: バケット数が 64 固定でリハッシュしなかったため、ラベルが増えると
+ * チェインが伸びて検索が O(n) になり、全体が O(n^2) になっていた（大きなソースで
+ * 目に見えて遅くなる）。要素数がバケット数の4倍を超えたら4倍に広げる。 */
+static void lmap_maybe_grow(LabelMap *m) {
+    if(!m->buckets || m->nbuckets <= 0) return;
+    if(m->count < m->nbuckets * 4) return;
+    int nb = m->nbuckets * 4;
+    LabelEntry **nbuf = calloc((size_t)nb, sizeof(LabelEntry*));
+    if(!nbuf) return;                    /* 広げられなくても動作は正しいまま */
+    for(int i=0;i<m->nbuckets;i++){
+        LabelEntry *e = m->buckets[i];
+        while(e){
+            LabelEntry *n = e->next;
+            uint32_t h = hash_str(e->key) % (uint32_t)nb;
+            e->next = nbuf[h]; nbuf[h] = e;
+            e = n;
+        }
+    }
+    free(m->buckets);
+    m->buckets = nbuf; m->nbuckets = nb;
+}
+
 static LabelEntry *lmap_find(LabelMap *m, const char *key) {
     if(!m->nbuckets) return NULL;
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
@@ -466,6 +508,7 @@ static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *se
     e->key=strdup(key); e->value=val; e->section=strdup(sec);
     e->is_equ=is_equ; e->is_imported=0; e->reloc_type_override=-1; e->is_undef=is_undef;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
+    lmap_maybe_grow(m);
 }
 static void lmap_set_reloc_type(LabelMap *m, const char *key, int reloc_type) {
     LabelEntry *e = lmap_find(m, key);
@@ -485,6 +528,7 @@ static void lmap_set_imported(LabelMap *m, const char *key, uint256_t val, const
     e->key=strdup(key); e->value=val; e->section=strdup(sec);
     e->is_equ=0; e->is_imported=1; e->reloc_type_override=reloc_type; e->is_undef=0;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
+    lmap_maybe_grow(m);
 }
 static void lmap_set_full(LabelMap *m, const char *key, uint256_t val,
                           const char *sec, int is_equ, int is_imported, int reloc_type_override,
@@ -505,6 +549,7 @@ static void lmap_set_full(LabelMap *m, const char *key, uint256_t val,
     e->reloc_type_override=reloc_type_override;
     e->is_undef=is_undef;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
+    lmap_maybe_grow(m);
 }
 static AXX_UNUSED void lmap_delete(LabelMap *m, const char *key) {
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
@@ -796,7 +841,11 @@ typedef struct {
      * 先に起きた失敗が消える）。降ろすのは .ORG/.RESB/.ZERO/.ALIGN/.EQU 等、
      * 新規に判定したい側が評価直前に自分で行う。 */
     int        error_undefined_label;
-    int        error_already_defined;
+
+    /* 既に報告したラベル定義の誤り（"種別:名前" の一覧）。パス1はリラクゼーション
+     * で何度も走るので、同じ誤りを反復回数だけ並べないための記録。
+     * report_definition_error() が使う。 */
+    StrVec     reported_label_errors;
 
     /* ユーザ向けの " error - ..." を1度でも表示したら立ち、以後降ろさない。
      * 最後にこれを見て、立っていれば出力を書かず終了コード1で終わる
@@ -955,6 +1004,48 @@ static void diag_capture_take(AsmState *st, char ***texts, int **seterr, int *n)
     st->diag_capturing      = 0;
 }
 
+/* 内側の評価器が出す診断を一時的に飲み込むための退避/復元。
+ *
+ * qad{}/dbl{}/flt{} の「予備の評価器」を呼ぶときに使う。予備側で起きた
+ * ゼロ除算等の内部エラーをそのまま表示すると、axx.py が出す
+ * "dbl{}: cannot convert ..." とは別の文言（"Division by 0 error."）が
+ * 混ざって両実装の出力が食い違うため、内側の分は捨てて呼び出し側が
+ * 正しい文言を1本だけ出す。
+ *
+ * axx_diagf() は in_match_attempt かつ diag_capturing のときだけ溜め込む
+ * ので、両方立てる。既に外側で捕捉中の場合を壊さないよう、現在の捕捉
+ * バッファごと退避してから始め、終了時に元へ戻す。 */
+typedef struct {
+    char **texts; int *seterr; int n; int cap; int capturing; int in_match;
+} DiagSuppress;
+
+static void diag_suppress_begin(AsmState *st, DiagSuppress *sv){
+    sv->texts     = st->diag_pending;
+    sv->seterr    = st->diag_pending_seterr;
+    sv->n         = st->diag_pending_len;
+    sv->cap       = st->diag_pending_cap;
+    sv->capturing = st->diag_capturing;
+    sv->in_match  = st->in_match_attempt;
+    st->diag_pending        = NULL;
+    st->diag_pending_seterr = NULL;
+    st->diag_pending_len    = 0;
+    st->diag_pending_cap    = 0;
+    st->diag_capturing      = 1;
+    st->in_match_attempt    = 1;
+}
+
+static void diag_suppress_end(AsmState *st, DiagSuppress *sv){
+    for(int i=0;i<st->diag_pending_len;i++) free(st->diag_pending[i]);
+    free(st->diag_pending);
+    free(st->diag_pending_seterr);
+    st->diag_pending        = sv->texts;
+    st->diag_pending_seterr = sv->seterr;
+    st->diag_pending_len    = sv->n;
+    st->diag_pending_cap    = sv->cap;
+    st->diag_capturing      = sv->capturing;
+    st->in_match_attempt    = sv->in_match;
+}
+
 static void diag_replay(AsmState *st, char **texts, int *seterr, int n){
     for(int i=0;i<n;i++){
         if(should_report_errors(st)){
@@ -1104,19 +1195,23 @@ static const ElfNamedReloc _named_riscv[] = {
 };
 
 /* アーキテクチャ別 ELF 情報表（axx.py の ELF_MACHINES に対応）。
- * 列の意味は左から:
+ * 列の意味は左から（ElfMachineInfo の宣言順そのまま）:
  *   e_machine, 名前, elfclass(1=32/2=64), is_rela(1=RELA/0=REL),
- *   外部シンボルの既定型, 幅4の既定型, 幅8の既定型, 幅2の既定型, 幅1の既定型,
- *   PC相対型の一覧, DWARF絶対参照の型, 記号名テーブル
+ *   外部シンボルの既定型, DWARF絶対参照の型,
+ *   幅8の既定型, 幅4の既定型, 幅2の既定型, 幅1の既定型,
+ *   PC相対型の一覧, その個数, 記号名テーブル
  * REL（加数を命令バイト列に埋め込む形式）を使うのは i386 と ARM(32) だけで、
- * 他は全て RELA（加数を専用フィールドに持つ）。 */
+ * 他は全て RELA（加数を専用フィールドに持つ）。
+ * 幅N の既定型は、必ずその名前表(named)に現れて幅も一致していること
+ * （ARM の幅2 はかつて 4 = R_ARM_LDR_PC_G0 という 16bit データ参照ではない
+ *   値になっていた。正しくは R_ARM_ABS16 の 5）。 */
 static const ElfMachineInfo ELF_MACHINES[] = {
     {3,   "i386",      1, 0, 2,   1,   0,  2, 20, 22, _pcrel_i386,    4, _named_i386},
     {4,   "m68k",       1, 1, 4,   1,   0,  4,  2,  3, _pcrel_m68k,    3, _named_m68k},
     {20,  "PowerPC",    1, 1, 26,  1,   0, 26,  4,  0, _pcrel_ppc32,   2, _named_ppc32},
     {21,  "PowerPC64",  2, 1, 26,  38,  38,26,  4,  0, _pcrel_ppc64,   3, _named_ppc64},
     {22,  "s390x",      2, 1, 5,   22,  22, 5,  3,  1, _pcrel_s390x,   3, _named_s390x},
-    {40,  "ARM",        1, 0, 3,   2,   0,  3,  4,  8, _pcrel_arm,     2, _named_arm},
+    {40,  "ARM",        1, 0, 3,   2,   0,  3,  5,  8, _pcrel_arm,     2, _named_arm},
     {42,  "SuperH",     1, 1, 2,   1,   0,  2,  0,  0, _pcrel_sh,      1, _named_sh},
     {43,  "SPARCV9",    2, 1, 6,   32,  32,  6,  2,  1, _pcrel_sparcv9, 4, _named_sparcv9},
     {62,  "x86-64",     2, 1, 2,   1,   1,  2, 12, 14, _pcrel_x86_64,  6, _named_x86_64},
@@ -1193,9 +1288,39 @@ static void secmap_finalize_current(AsmState *st){
     e->entry_pc = st->pc;
 }
 
+/* axx.py の Assembler._addr_to_word_offset() 相当。
+ *
+ * 破綻点修正: 以前は section_ranges しか見ていなかったため、そのセクションの
+ * 断片が1つも記録されていない場合（.section/.endsection を跨がずに終わった等）
+ * にオフセットが求まらず、シンボルのセクション所属や DWARF のアドレスが
+ * axx.py と食い違っていた。axx.py の _section_word_ranges() と同じく、
+ * 断片が無いときだけ sections 表の (start, size) を1つの断片とみなす。 */
+static int64_t sec_word_offset(AsmState *st, const char *name, uint64_t word_pc){
+    if(st->sections.count == 0) return (int64_t)word_pc;
+    uint64_t cum = 0;
+    int have_range = 0;
+    for(int i=0;i<st->section_ranges.len;i++){
+        if(strcmp(st->section_ranges.data[i].name,name)!=0) continue;
+        have_range = 1;
+        uint64_t rs = u256_to_u64(st->section_ranges.data[i].start);
+        uint64_t rl = u256_to_u64(st->section_ranges.data[i].len);
+        if(word_pc >= rs && word_pc <= rs+rl) return (int64_t)(cum + (word_pc-rs));
+        cum += rl;
+    }
+    if(!have_range){
+        SecEntry *e = secmap_find(&st->sections, name);
+        if(e && !u256_is_zero(e->size)){
+            uint64_t rs = u256_to_u64(e->start);
+            uint64_t rl = u256_to_u64(e->size);
+            if(word_pc >= rs && word_pc <= rs+rl) return (int64_t)(word_pc - rs);
+        }
+    }
+    return -1;
+}
+
 static uint64_t dwarf_word_offset(AsmState *st, const char *sec_name, uint64_t word_pc, int bpw){
     if(st->sections.count == 0) return word_pc * (uint64_t)bpw;
-    int64_t o = addr_to_word_offset(&st->section_ranges, sec_name, word_pc);
+    int64_t o = sec_word_offset(st, sec_name, word_pc);
     return (uint64_t)(o >= 0 ? o : 0) * (uint64_t)bpw;
 }
 
@@ -1214,6 +1339,7 @@ static int64_t equ_section_relative_offset(AsmState *st, const char *sec_name, u
 static void state_init(AsmState *st) {
     memset(st, 0, sizeof(*st));
     g_active_state = st;
+    sv_init(&st->reported_label_errors);
     strcpy(st->lwordchars, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_.");
     strcpy(st->swordchars, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_%$-~&|");
     strcpy(st->current_section, ".text");
@@ -1309,6 +1435,63 @@ static int axx_q(const char *s, int slen, const char *t, int idx) {
 static int axx_skipspc(const char *s, int idx) {
     while(s[idx]==' ') idx++;
     return idx;
+}
+
+/* Portable ISO C replacement for the GCC-only `({ ... })` statement-expression
+ * that used to be inlined at each qad{}/dbl{}/flt{}/enflt{}/endbl{} lookahead
+ * site: returns 1 if, after skipping spaces from idx, the next character is
+ * '{' and still within bounds. */
+static int axx_next_nonspace_is_brace(const char *s, int slen, int idx) {
+    int j = axx_skipspc(s, idx);
+    return j < slen && s[j] == '{';
+}
+
+/* アセンブリソース1行の空白を整える（引用符の中は手を付けない）。
+ *
+ * 引用符の外では タブ・CR・LF を空白に直し、連続する空白を1個に潰す。
+ * 照合は空白の個数を見ないので、こうしておくと `MOV  A , B` のような書き方の
+ * 揺れを吸収できる。
+ *
+ * 破綻点修正: 以前は行全体に一律で適用していた（\t を空白に置換するループ＋
+ * axx_reduce_spaces()）ため、文字列リテラルの中身まで潰していた。
+ * `.ascii "a    b"` が 3 バイトの `a b` になり、生のタブは空白へ化けていた
+ * （診断は一切出ない）。文字列は「そのままのバイト列を置く」のがアセンブラの
+ * 仕事なので、引用符の中は素通しする。
+ *
+ * `"..."` と `'x'` の扱いは axx_remove_comment_asm() と同じ規約に従う。
+ * 常に w <= i なので同じバッファを上書きしても安全。 */
+static void axx_normalize_ws(char *l) {
+    int in_str=0, in_ws=0;
+    int i=0, w=0;
+    while(l[i]){
+        if(in_str){
+            if(l[i]=='\\' && l[i+1]){ l[w++]=l[i++]; l[w++]=l[i++]; continue; }
+            if(l[i]=='"') in_str=0;
+            l[w++]=l[i++];
+            continue;
+        }
+        if(l[i]=='"'){ in_str=1; in_ws=0; l[w++]=l[i++]; continue; }
+        if(l[i]=='\''){
+            int j=i+1;
+            if(l[j]=='\\' && l[j+1] && l[j+2]=='\''){
+                while(i<j+3) l[w++]=l[i++];
+            } else if(l[j] && l[j+1]=='\''){
+                while(i<j+2) l[w++]=l[i++];
+            } else {
+                l[w++]=l[i++];
+            }
+            in_ws=0;
+            continue;
+        }
+        if(l[i]==' '||l[i]=='\t'||l[i]=='\n'||l[i]=='\r'){
+            if(!in_ws){ l[w++]=' '; in_ws=1; }
+            i++;
+            continue;
+        }
+        l[w++]=l[i++];
+        in_ws=0;
+    }
+    l[w]=0;
 }
 
 static void axx_reduce_spaces(char *s) {
@@ -1501,10 +1684,42 @@ static void axx_get_string(const char *l2, char *out, size_t osz) {
                 while(l2[idx]&&is_xdigit_upper(axx_upper_char(l2[idx]))&&hn<2)
                     hex[hn++]=l2[idx++];
                 hex[hn]=0;
+                if(l2[idx]&&is_xdigit_upper(axx_upper_char(l2[idx]))){
+                    char r[600]; m_pyrepr(l2, r, sizeof(r));
+                    axx_diagf(0, 0, " warning - '\\x' escape takes at most 2 hex digits; "
+                                    "extra digit(s) treated as literal characters in: %s\n", r);
+                }
                 if(hn>0){
                     out[n++]=(char)(int)strtol(hex,NULL,16);
                 } else {
                     if(n<osz-1) out[n++]='x';
+                }
+            }
+            /* 破綻点修正: \u / \U を解釈していなかったため（axx.py は解釈する）、
+             * `.INCLUDE "é..."` のようなファイル名で両実装が別のパスを開いていた。
+             * axx.py は chr(コードポイント) を文字列に入れ、開くときに UTF-8 へ
+             * 符号化されるので、ここでも UTF-8 バイト列を書き込む。 */
+            else if(nc=='u'||nc=='U'){
+                int want = (nc=='u') ? 4 : 8;
+                idx+=2;
+                char hex[9]; int hn=0;
+                while(l2[idx]&&is_xdigit_upper(axx_upper_char(l2[idx]))&&hn<want)
+                    hex[hn++]=l2[idx++];
+                hex[hn]=0;
+                unsigned long cp = (hn>0) ? strtoul(hex,NULL,16) : 0;
+                if(hn!=want || cp>0x10FFFFul){
+                    char r[600]; m_pyrepr(l2, r, sizeof(r));
+                    if(hn!=want)
+                        axx_diagf(0, 0, " warning - '\\%c' escape requires %d hex digits; "
+                                        "treated as literal characters in: %s\n", nc, want, r);
+                    else
+                        axx_diagf(0, 0, " warning - invalid \\%c escape in: %s\n", nc, r);
+                    if(n<osz-1) out[n++]=nc;
+                    for(int hi=0; hi<hn && n<osz-1; hi++) out[n++]=hex[hi];
+                } else {
+                    char ub[4];
+                    int ul = m_utf8(cp, ub);
+                    for(int ui=0; ui<ul && n<osz-1; ui++) out[n++]=ub[ui];
                 }
             }
             else              { out[n++]=nc;   idx+=2; }
@@ -1550,24 +1765,36 @@ static int axx_get_floatstr(const char *s, int idx, char *fs, size_t fsz){
     return idx;
 }
 
-static int axx_get_curlb(AsmState *st, const char *s, int idx, int *f_out, char *t_out, size_t tsz){
+/* 破綻点修正: 以前は本文を呼び出し側の固定長 char[512] に写していたため、
+ * 512 文字を超える式で本文が途中で切れ、しかも切れた位置は "}" ではない
+ * ので、その次の走査は "}" を読み飛ばすつもりで無関係な1文字を読み飛ばし、
+ * 以降の構文解析全体がずれる（axx.py には長さ制限が無い）。まず区切り位置
+ * だけを走査してから実際の長さぶんだけ動的に確保し、呼び出し側に
+ * 所有権を渡す（使い終わったら free() すること）。 */
+static int axx_get_curlb(AsmState *st, const char *s, int idx, int *f_out, char **t_out){
     idx=axx_skipspc(s,idx);
-    *f_out=0; t_out[0]=0;
+    *f_out=0; *t_out=NULL;
     if(s[idx]!='{') return idx;
     idx++;
     idx=axx_skipspc(s,idx);
-    size_t n=0;
-    while(s[idx]&&s[idx]!='}'&&n<tsz-1) t_out[n++]=s[idx++];
-    while(n>0&&t_out[n-1]==' ') n--;
-    t_out[n]=0;
+    int start=idx;
+    while(s[idx]&&s[idx]!='}') idx++;
+    size_t n=(size_t)(idx-start);
+    while(n>0&&s[start+n-1]==' ') n--;
+    char *buf=malloc(n+1);
+    if(!buf){ perror("malloc"); exit(1); }
+    memcpy(buf,s+start,n);
+    buf[n]=0;
     if(!s[idx]){
         if(should_report_errors(st)){
-            axx_diagf(1, 0, " error - missing closing '}' in expression: '{%s'\n", t_out);
+            axx_diagf(1, 0, " error - missing closing '}' in expression: '{%s'\n", buf);
         }
+        free(buf);
         return (int)strlen(s);
     }
     idx++;
     *f_out=1;
+    *t_out=buf;
     return idx;
 }
 
@@ -1585,12 +1812,42 @@ static int axx_get_symbol_word(const char *s, int idx, const char *swordchars, c
     t_out[n]=0;
     axx_strupr(t_out);
     if(truncated){
-        fprintf(stderr,"warning - symbol name truncated to %zu characters\n", tsz-1);
+        axx_diagf(0, 0, "warning - symbol name truncated to %zu characters\n", tsz-1);
     }
     return idx;
 }
 
-static int axx_get_label_word(const char *s, int idx, const char *lwordchars, char *t_out, size_t tsz){
+/* ラベル名を1語切り出す。
+ *
+ * eat_colon が真のときは、名前の直後の `:` も一緒に読み飛ばす。
+ * `foo: NOP` の行頭ラベルや `.EXTERN foo::pc32` を切り出すための約束で、
+ * 呼び出し側は l[idx-1]==':' を見て「ラベル定義だったか」を判定する。
+ *
+ * 破綻点修正: 式の評価（expr_factor1）からも同じ関数を呼んでいたため、
+ * 三項演算子の `:` がラベル名の一部として食われていた。`1?foo:bar` は
+ * `foo` の直後で `:` を失い、残った `bar` が解析されない余りとして残って
+ * Syntax error になっていた（`foo :bar` と空白を入れたときだけ通るという
+ * 再現条件の分かりにくい誤り）。式の文脈からは eat_colon=0 で呼ぶ。 */
+/* ラベル名／シンボル名を切り出すための作業バッファを用意する。
+ *
+ * 破綻点修正: 呼び出し側はどこも char[512] の自動変数を渡していたため、
+ * 511 文字を超える名前が（警告は出るものの）切り詰められ、axx.py には長さの
+ * 制限が無いのでシンボル表が食い違っていた。語の長さは「入力の残り長」で
+ * 上限が決まるので、そこに収まらないときだけヒープへ逃がす
+ * （ふだんは自動変数のままなので、ラベル参照ごとの確保は起きない）。
+ * 戻り値が stackbuf と違うときは、使い終わりに free() すること。 */
+static char *axx_word_buf(const char *s, int idx, char *stackbuf, size_t stacksz,
+                          size_t *szout){
+    size_t rem = strlen(s + idx) + 1;
+    if(rem <= stacksz){ *szout = stacksz; return stackbuf; }
+    char *h = malloc(rem);
+    if(!h){ perror("malloc"); exit(1); }
+    *szout = rem;
+    return h;
+}
+
+static int axx_get_label_word_ex(const char *s, int idx, const char *lwordchars,
+                                 char *t_out, size_t tsz, int eat_colon){
     t_out[0]=0;
     if(!s[idx]) return idx;
     if(s[idx]!='.'&&(is_digit(s[idx])||!char_in(s[idx],lwordchars))) return idx;
@@ -1604,10 +1861,14 @@ static int axx_get_label_word(const char *s, int idx, const char *lwordchars, ch
     }
     t_out[n]=0;
     if(truncated){
-        fprintf(stderr,"warning - label name truncated to %zu characters\n", tsz-1);
+        axx_diagf(0, 0, "warning - label name truncated to %zu characters\n", tsz-1);
     }
-    if(s[idx]==':'&&s[idx+1]!='=') idx++;
+    if(eat_colon && s[idx]==':' && s[idx+1]!='=') idx++;
     return idx;
+}
+
+static int axx_get_label_word(const char *s, int idx, const char *lwordchars, char *t_out, size_t tsz){
+    return axx_get_label_word_ex(s, idx, lwordchars, t_out, tsz, 1);
 }
 
 static int axx_get_params1(const char *l, int idx, char *s_out, size_t ssz){
@@ -1645,10 +1906,26 @@ static AXX_UNUSED uint64_t ieee754_64_from_str(const char *a){
     (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
      defined(__arm__) || defined(__riscv))
 
+/* 破綻点修正: 10^n を `scale *= base` の逐次乗算で求めると、n が大きいとき
+ * （小数部の桁数や指数部）に最大 n 回ぶんの丸め誤差が積み重なり、axx.py
+ * （Decimal による正確な計算）と異なるビットパターンになっていた
+ * （例: 1e300 の最下位ニブルがずれる）。二分累乗法なら乗算回数が
+ * O(log n) で済み、丸め回数を大幅に減らせる。 */
+static __float128 f128_ipow10(int n)
+{
+    __float128 base = (__float128)10;
+    __float128 result = (__float128)1;
+    while(n > 0){
+        if(n & 1) result *= base;
+        base *= base;
+        n >>= 1;
+    }
+    return result;
+}
+
 static __float128 f128_from_decimal(const char *s)
 {
     const __float128 ten  = (__float128)10;
-    const __float128 one  = (__float128)1;
 
     int sign = 0;
     if(*s == '-'){ sign = 1; s++; }
@@ -1669,8 +1946,7 @@ static __float128 f128_from_decimal(const char *s)
         s++;
     }
 
-    __float128 denom = one;
-    for(int i = 0; i < frac_digits; i++) denom *= ten;
+    __float128 denom = f128_ipow10(frac_digits);
     __float128 result = int_val / denom;
 
     if(*s == 'e' || *s == 'E'){
@@ -1679,11 +1955,17 @@ static __float128 f128_from_decimal(const char *s)
         if(*s == '-'){ esign = -1; s++; }
         else if(*s == '+'){ s++; }
         int eabs = 0;
-        while(*s >= '0' && *s <= '9'){ eabs = eabs*10 + (*s-'0'); s++; }
-        __float128 scale = one;
-        __float128 base  = (esign > 0) ? ten : (one / ten);
-        while(eabs-- > 0) scale *= base;
-        result *= scale;
+        /* 破綻点修正: 指数の桁数に上限が無く、極端に長い指数文字列で
+         * eabs(int) が符号付きオーバーフロー(未定義動作)を起こしうる。
+         * float128 の指数範囲(最大でも5桁程度)よりずっと大きい値で頭打ちにする。 */
+        while(*s >= '0' && *s <= '9'){
+            if(eabs < 1000000) eabs = eabs*10 + (*s-'0');
+            s++;
+        }
+        /* 負の指数は「10^eabs の逆数を掛ける」のではなく「10^eabs で割る」。
+         * 逆数自体が持つ丸め誤差を掛け算で複利させず、割り算1回ぶんに抑える。 */
+        __float128 scale = f128_ipow10(eabs);
+        result = (esign > 0) ? (result * scale) : (result / scale);
     }
 
     return sign ? -result : result;
@@ -1779,13 +2061,25 @@ static uint256_t f128_to_u256(__float128 v)
     return res;
 }
 
+/* 破綻点修正: ここは元々 `(double)r.val` を isfinite() で見ていたため、
+ * __float128 としては有限な正当な値（1e400 や 1e4900 のように quad の
+ * 指数範囲 [~1e-4932, ~1e4932] には収まるが double の範囲 [~1e-308, 1e308]
+ * には収まらない値）まで「非有限」と誤判定し、精度の落ちる strtold 経路
+ * （x86 拡張倍精度なら 64bit 仮数、long double == double な環境なら 53bit
+ * 仮数）へ不必要にフォールバックさせ、112bit 仮数で計算できるはずの値を
+ * 誤ったビットパターンにしていた。__float128 の生のビット列から指数
+ * フィールドを直接見れば、quad 自身の範囲内かどうかを正しく判定できる。 */
+static int f128_is_finite(__float128 v)
+{
+    uint256_t u = f128_to_u256(v);
+    uint64_t exp = (u.w[1] >> 48) & 0x7FFFu;
+    return exp != 0x7FFFu;
+}
+
 static uint256_t f128_eval_text(const char *text, int *ok_out)
 {
     F128R r = f128_expr_fn(text);
-    if(r.ok){
-        double dcheck = (double)r.val;
-        if(!isfinite(dcheck)) r.ok = 0;
-    }
+    if(r.ok && !f128_is_finite(r.val)) r.ok = 0;
     if(ok_out) *ok_out = r.ok;
     if(!r.ok)  return u256_zero();
     return f128_to_u256(r.val);
@@ -1823,7 +2117,11 @@ static uint256_t ieee754_128_from_str(const char *a){
     }
     long double ld = strtold(a, NULL);
     if(ld == 0.0L){
-        return u256_zero();
+        /* 破綻点修正: -0.0 と +0.0 は == で等しいため、符号を見ずに常に
+         * u256_zero() を返すと "-0.0" の符号ビットが消えていた。 */
+        uint256_t r = u256_zero();
+        if(signbit(ld)) r.w[1] = (uint64_t)1ULL<<63;
+        return r;
     }
     int sign = (ld < 0.0L) ? 1 : 0;
     if(ld < 0.0L) ld = -ld;
@@ -1909,18 +2207,26 @@ static uint256_t align_addr256(AsmState *st, uint256_t addr){
     if(u256_is_zero(a)) return addr;
     return u256_add(addr, u256_sub(st->align, a));
 }
-static uint64_t align_addr(AsmState *st, uint64_t addr){
-    return u256_to_u64(align_addr256(st, u256_from_u64(addr)));
+
+/* ワード幅ぶんのマスク。
+ * 破綻点修正: 以前は `(uint64_t)1 << st->bts` を直に書いていたため、
+ * `.bits` に 0 以下や 64 以上が入ると未定義動作（負シフト／幅以上のシフト）に
+ * なっていた。.bits 側でも 1..64 を検証するようにしたが、ここでも守る。 */
+static uint64_t axx_word_mask(int bts){
+    if(bts <= 0)  return 0;
+    if(bts >= 64) return (uint64_t)-1;
+    return ((uint64_t)1 << bts) - 1;
 }
 
 static void outbin_store(AsmState *st, uint64_t position, uint256_t word_val){
-    uint64_t mask = (st->bts<64) ? ((uint64_t)1<<st->bts)-1 : (uint64_t)-1;
-    uint64_t v = u256_to_u64(word_val) & mask;
+    if(st->bts <= 0) return;   /* axx.py の _store と同じく何も書かない */
+    uint64_t v = u256_to_u64(word_val) & axx_word_mask(st->bts);
     bufmap_set(&st->buf, position, v);
 }
 
 static void fwrite_word(AsmState *st, uint64_t position, uint256_t x, int prt){
-    uint64_t mask = (st->bts<64) ? ((uint64_t)1<<st->bts)-1 : (uint64_t)-1;
+    if(st->bts <= 0) return;
+    uint64_t mask = axx_word_mask(st->bts);
     uint64_t val = u256_to_u64(x) & mask;
     if(prt){
         int colm=(st->bts+3)/4;
@@ -1963,18 +2269,23 @@ static void binary_flush(AsmState *st){
                   _tb, (unsigned long long)((uint64_t)1<<30));
         return;
     }
-    uint64_t total_size = (max_pos+1)*(uint64_t)bytes_per_word;
-    if(total_size==0) return;
-    {
-        const uint64_t MAX_OUTPUT_BYTES = (uint64_t)1<<30;
-        if(total_size > MAX_OUTPUT_BYTES){
-            axx_diagf(1, 1, " error - output size %llu bytes exceeds maximum %llu."
-                            " Check for incorrect .ORG or address values.\n",
-                      (unsigned long long)total_size,
-                      (unsigned long long)MAX_OUTPUT_BYTES);
-            return;
-        }
+    /* 破綻点修正: max_pos が2^64に近い場合、(max_pos+1)*bytes_per_word が
+     * 64bit算術でラップアラウンドし、小さな total_size を通してしまっていた
+     * （巨大な .ORG + 複数バイト幅のワードで再現）。pc_overflow_set /
+     * max_pos==-1 の特別扱いと同じく、256bit演算でオーバーフローさせずに
+     * MAX_OUTPUT_BYTES と比較してから初めて64bitへ落とす。 */
+    uint256_t _tot256 = u256_mul(u256_add(u256_from_u64(max_pos), u256_from_u64(1)),
+                                  u256_from_u64((uint64_t)bytes_per_word));
+    const uint64_t MAX_OUTPUT_BYTES = (uint64_t)1<<30;
+    if(u256_gt_signed(_tot256, u256_from_u64(MAX_OUTPUT_BYTES))){
+        char _tb[96]; u256_to_pydec(_tot256, _tb, sizeof(_tb));
+        axx_diagf(1, 1, " error - output size %s bytes exceeds maximum %llu."
+                        " Check for incorrect .ORG or address values.\n",
+                  _tb, (unsigned long long)MAX_OUTPUT_BYTES);
+        return;
     }
+    uint64_t total_size = u256_to_u64(_tot256);
+    if(total_size==0) return;
     if(total_size > (uint64_t)(size_t)-1){
         fprintf(stderr,"binary_flush: output too large (%llu bytes) for this platform's size_t.\n",
                 (unsigned long long)total_size);
@@ -2116,7 +2427,10 @@ static uint256_t label_get_value(AsmState *st, const char *k){
     st->error_undefined_label = 1;
     if(st->pass1_size_mode) return u256_zero();
     if(!st->in_match_attempt && should_report_errors(st)){
-        axx_diagf(0, 0, " error - Label undefined: '%s'  [%s:%d]\n",
+        /* 破綻点修正: set_error=0 で出していたため had_error が立たず、
+         * この診断だけが出る経路（パターンファイル側ディレクティブの式など）では
+         * エラー表示ありで終了コード 0 になっていた。 */
+        axx_diagf(1, 0, " error - Label undefined: '%s'  [%s:%d]\n",
                    k, st->current_file, (int)st->ln);
     }
     return UNDEF_VAL();
@@ -2132,40 +2446,69 @@ static const char *label_get_section(AsmState *st, const char *k){
  *                 仮登録(is_imported)は実体を持たないので上書きを許す。
  *   パス2      … パス1で既に在るはず。無ければ両パスで見た入力が違うという異常。
  * パターンファイルの .setsym と同名なら衝突として拒否する。 */
+/* ラベル定義の誤りを、1つにつき1回だけ必ず表示する。
+ *
+ * 破綻点修正: これらは had_error を立てながら通常の axx_diagf() で出していた。
+ * しかし定義の衝突が見つかるのはパス1で、パス1の診断は抑制される。パス2では
+ * 「既に在るラベル」に見えるので二度と検出されず、結果としてユーザには具体的な
+ * 原因が一度も表示されないまま、
+ * " error - one or more errors were reported during assembly" だけ、あるいは
+ * （値がずれた場合）「パス1/パス2のアドレス不一致＝リラクゼーション未収束」という
+ * 全く無関係なメッセージが出ていた。パス1の抑制を迂回して出す代わりに、
+ * リラクゼーションの反復回数だけ重複しないよう、同じ誤りは1回に抑える。 */
+static void report_definition_error(AsmState *st, const char *kind, const char *key,
+                                    const char *fmt, ...){
+    st->had_error = 1;
+    char tag[600];
+    snprintf(tag, sizeof(tag), "%s:%s", kind, key);
+    for(int i=0;i<st->reported_label_errors.len;i++)
+        if(strcmp(st->reported_label_errors.data[i], tag)==0) return;
+    sv_push(&st->reported_label_errors, tag);
+
+    char body[1024];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+    axx_diagf(1, 1, " error - %s  [%s:%d]\n",
+              body, st->current_file, (int)st->ln);
+}
+
 static int label_put_value(AsmState *st, const char *k, uint256_t v, const char *sec, int is_equ, int reloc_type, int is_undef){
     if(st->pas==1||st->pas==0){
         LabelEntry *_existing = lmap_find(&st->labels,k);
         if(_existing && !_existing->is_imported){
-            st->error_already_defined=1;
-            st->had_error=1;
-            axx_diagf(0, 0, " error - label already defined.\n");
+            report_definition_error(st, "dup", k, "label '%s' is already defined.", k);
             return 0;
         }
     } else if(st->pas==2){
         if(!lmap_contains(&st->labels,k)){
-            st->error_already_defined=1;
-            st->had_error=1;
-            if(should_report_errors(st))
-                axx_diagf(0, 0, " error - label '%s' not defined in pass 1.\n",k);
+            report_definition_error(st, "pass1", k, "label '%s' not defined in pass 1.", k);
             return 0;
         }
     }
     char uk[512]; axx_strupr_to(uk,k,sizeof(uk));
     uint256_t dummy;
     if(smap_get(&st->patsymbols,uk,&dummy)){
-        st->had_error=1;
-        if(should_report_errors(st))
-            axx_diagf(0, 0, " error - '%s' is a pattern file symbol.\n",k);
+        report_definition_error(st, "patsym", k, "'%s' is a pattern file symbol.", k);
         return 0;
     }
-    st->error_already_defined=0;
     lmap_set(&st->labels,k,v,sec,is_equ,is_undef);
     if(reloc_type >= 0)
         lmap_set_reloc_type(&st->labels, k, reloc_type);
     return 1;
 }
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
 static void u256_to_pyhex(uint256_t a, char *out, size_t outsz){
-    char buf[80]; size_t n=0; int neg=0;
+    /* a is a 256-bit value, so buf can never hold more than 64 hex digits
+     * (4 words x 16 hex digits via %llx/%016llx, both bounded by the 64-bit
+     * width of unsigned long long); with the sign and "0x" prefix that is at
+     * most 67 characters plus the terminator, well inside buf's 96 bytes.
+     * GCC's -Wformat-truncation cannot prove that loop bound, hence the
+     * diagnostic suppression above rather than an unbounded buffer. */
+    char buf[96]; size_t n=0; int neg=0;
     if((a.w[3]>>63)&1ULL){ neg=1; a=u256_neg(a); }
     int hi=3; while(hi>0 && a.w[hi]==0) hi--;
     n += (size_t)snprintf(buf+n,sizeof(buf)-n,"%llx",(unsigned long long)a.w[hi]);
@@ -2173,6 +2516,9 @@ static void u256_to_pyhex(uint256_t a, char *out, size_t outsz){
         n += (size_t)snprintf(buf+n,sizeof(buf)-n,"%016llx",(unsigned long long)a.w[i]);
     snprintf(out,outsz,"%s0x%s",neg?"-":"",buf);
 }
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 static void u256_to_pydec(uint256_t a, char *out, size_t outsz){
     char buf[96]; int n=0; int neg=0;
@@ -2210,7 +2556,7 @@ static void label_print_all(AsmState *st){
         for(LabelEntry*e=st->labels.buckets[i];e;e=e->next) v[k++]=e;
     qsort(v,(size_t)n,sizeof(LabelEntry*),label_key_cmp);
     for(int i=0;i<n;i++){
-        char val[80];
+        char val[96];
         if(v[i]->is_undef) snprintf(val,sizeof(val),"UNDEF");
         else u256_to_pyhex(v[i]->value,val,sizeof(val));
         fprintf(stderr,"  %-40s  %s  (%s)\n",v[i]->key,val,v[i]->section);
@@ -2381,10 +2727,14 @@ static long double xeval_shift(XEP *p){
         xeval_skip(p);
         if(p->i+1<p->len && p->s[p->i]=='<' && p->s[p->i+1]=='<'){
             p->i+=2; long double t=xeval_addsub(p);
-            v = (long double)((int64_t)v << (int64_t)t);
+            int64_t sh=(int64_t)t;
+            if(sh<0 || sh>63){ p->ok=0; break; }
+            v = (long double)((int64_t)v << sh);
         } else if(p->i+1<p->len && p->s[p->i]=='>' && p->s[p->i+1]=='>'){
             p->i+=2; long double t=xeval_addsub(p);
-            v = (long double)((int64_t)v >> (int64_t)t);
+            int64_t sh=(int64_t)t;
+            if(sh<0 || sh>63){ p->ok=0; break; }
+            v = (long double)((int64_t)v >> sh);
         } else break;
     }
     return v;
@@ -2575,7 +2925,12 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
                         }
                         x=u256_zero();
                     } else {
-                        int shift=(int)(offset*8);
+                        /* 破綻点修正: offset は int64_t なので、巨大な値だと
+                         * offset*8 が符号付き整数のオーバーフロー（未定義動作）を
+                         * 起こし、int への切り詰めで負になると u256_sar() が
+                         * 「シフトしない」で素通しになっていた。256 を超える分は
+                         * 符号で埋まるだけなので、先に頭打ちにする。 */
+                        int shift = (offset > 256/8) ? 256 : (int)(offset*8);
                         x=u256_sar(x,shift);
                     }
                 } else {
@@ -2720,21 +3075,50 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             x=double_to_u256((double)(int64_t)u256_to_i64(x));
     }
     else if(idx+3<=slen && strncmp(s+idx,"qad",3)==0 &&
-            ({ int _j=axx_skipspc(s,idx+3); _j<slen && s[_j]=='{'; })){
+            axx_next_nonspace_is_brace(s, slen, idx+3)){
         idx+=3;
         idx=axx_skipspc(s,idx);
         if(s[idx]=='{'){
             idx++;
-            char expr_buf[1024]; size_t en=0; int depth=0;
-            while(s[idx] && en<sizeof(expr_buf)-1){
+            /* 破綻点修正: 以前は式本体を固定長 char[1024] に写していたため、
+             * 1024 文字を超える式が診断もなく途中で切れ、axx.py（長さ制限なし）
+             * と違う値になっていた。まず区切り位置だけを走査してから、
+             * 実際の長さぶんだけ動的に確保する。 */
+            int start=idx; int depth=0;
+            while(s[idx]){
                 if(s[idx]=='('||s[idx]=='[') depth++;
                 else if((s[idx]==')'||s[idx]==']')&&depth>0) depth--;
                 else if(s[idx]=='}'&&depth==0) break;
-                expr_buf[en++]=s[idx++];
+                idx++;
             }
+            size_t en = (size_t)(idx-start);
+            char *expr_buf = malloc(en+1);
+            if(!expr_buf){ perror("malloc"); exit(1); }
+            memcpy(expr_buf, s+start, en);
             expr_buf[en]='\0';
-            if(s[idx]=='}') idx++;
-            if(strcmp(expr_buf,"inf")==0 || strcmp(expr_buf,"-inf")==0 ||
+            if(s[idx]!='}'){
+                /* 破綻点修正: 閉じ '}' が無いまま行末（や文字列末尾）に達した
+                 * 場合、以前はそれを無視してそのまま式を評価し、黙って値を
+                 * 出力していた（axx.py は "missing closing '}'" エラーで
+                 * 中断する）。ここで揃える。 */
+                if(should_report_errors(&asmb->st)){
+                    axx_diagf(1, 0, " error - missing closing '}' in expression: '{%s'\n", expr_buf);
+                }
+                x=u256_zero();
+                free(expr_buf);
+            }
+            else {
+            idx++;
+            if(en==0){
+                /* 破綻点修正: 空の `qad{}` を、以前は評価器に一切通さず
+                 * そのまま 0 として黙って成功させていた（axx.py は
+                 * "cannot evaluate expression ''" エラーで中断する）。 */
+                if(should_report_errors(&asmb->st)){
+                    axx_diagf(1, 0, " error - qad{}: cannot evaluate expression '%s'; using 0.\n", expr_buf);
+                }
+                x=u256_zero();
+            }
+            else if(strcmp(expr_buf,"inf")==0 || strcmp(expr_buf,"-inf")==0 ||
                strcmp(expr_buf,"nan")==0){
                 x=ieee754_128_from_str(expr_buf);
             }
@@ -2757,10 +3141,15 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     int io2;
                     int prev_flt=asmb->st.exp_typ_float;
                     int _prior_had_error=asmb->st.had_error;
+                    DiagSuppress _sv;
                     asmb->st.exp_typ_float=1;
+                    diag_suppress_begin(&asmb->st, &_sv);
                     uint256_t fv=expr_expression_pat(asmb,expr_buf,0,&io2);
+                    int _inner_errs = asmb->st.diag_pending_len;
+                    diag_suppress_end(&asmb->st, &_sv);
                     asmb->st.exp_typ_float=prev_flt;
-                    int _fallback_errored = asmb->st.had_error && !_prior_had_error;
+                    int _fallback_errored = _inner_errs > 0
+                                            || (asmb->st.had_error && !_prior_had_error);
                     asmb->st.had_error=_prior_had_error;
                     if(_fallback_errored){
                         if(should_report_errors(&asmb->st)){
@@ -2775,44 +3164,69 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                 }
             }
             }
+            free(expr_buf);
+            }
         }
     }
     else if(idx+5<=slen && strncmp(s+idx,"enflt",5)==0 &&
-            ({ int _j=axx_skipspc(s,idx+5); _j<slen && s[_j]=='{'; })){
+            axx_next_nonspace_is_brace(s, slen, idx+5)){
         idx+=5;
-        int f; char t[512];
-        idx=axx_get_curlb(&asmb->st,s,idx,&f,t,sizeof(t));
+        int f; char *t;
+        idx=axx_get_curlb(&asmb->st,s,idx,&f,&t);
         if(f){
             int prev_flt=asmb->st.exp_typ_float;
             asmb->st.exp_typ_float=0;
             int io2; uint256_t iv=expr_expression_pat(asmb,t,0,&io2);
             asmb->st.exp_typ_float=prev_flt;
             double fval=enfloat_bits(u256_to_u64(iv));
-            x=double_to_u256(fval);
+            /* 破綻点修正: 常に double_to_u256()（ビットキャスト）を格納していたため、
+             * 整数モードの文脈では IEEE754 のビット列そのものが整数として読まれ、
+             * 例えば enflt{0x3f800000}（=1.0）が 0x3FF0000000000000 の下位バイト、
+             * すなわち 0 になっていた（axx.py は 1 を返す）。
+             * dbl{}/flt{} で既に使っている規約に合わせ、浮動小数点モードのときだけ
+             * ビットキャストし、整数モードでは数値そのものを切り捨てて格納する。
+             * 非有限値は (int64_t) キャストが未定義動作なので 0 に倒す。 */
+            x = asmb->st.exp_typ_float ? double_to_u256(fval)
+                                       : (isfinite(fval) ? u256_from_i64((int64_t)fval)
+                                                         : u256_zero());
+            free(t);
         }
     }
     else if(idx+5<=slen && strncmp(s+idx,"endbl",5)==0 &&
-            ({ int _j=axx_skipspc(s,idx+5); _j<slen && s[_j]=='{'; })){
+            axx_next_nonspace_is_brace(s, slen, idx+5)){
         idx+=5;
-        int f; char t[512];
-        idx=axx_get_curlb(&asmb->st,s,idx,&f,t,sizeof(t));
+        int f; char *t;
+        idx=axx_get_curlb(&asmb->st,s,idx,&f,&t);
         if(f){
             int prev_flt=asmb->st.exp_typ_float;
             asmb->st.exp_typ_float=0;
             int io2; uint256_t iv=expr_expression_pat(asmb,t,0,&io2);
             asmb->st.exp_typ_float=prev_flt;
             double fval=endouble_bits(u256_to_u64(iv));
-            x=double_to_u256(fval);
+            /* 破綻点修正: enflt{} と同じ問題。上のコメントを参照。 */
+            x = asmb->st.exp_typ_float ? double_to_u256(fval)
+                                       : (isfinite(fval) ? u256_from_i64((int64_t)fval)
+                                                         : u256_zero());
+            free(t);
         }
     }
     else if(idx+3<=slen && strncmp(s+idx,"dbl",3)==0 &&
-            ({ int _j=axx_skipspc(s,idx+3); _j<slen && s[_j]=='{'; })){
+            axx_next_nonspace_is_brace(s, slen, idx+3)){
         idx+=3;
-        int f; char t[512];
-        idx=axx_get_curlb(&asmb->st,s,idx,&f,t,sizeof(t));
+        int f; char *t;
+        idx=axx_get_curlb(&asmb->st,s,idx,&f,&t);
         if(f){
             uint64_t bits;
-            if(strcmp(t,"nan")==0) bits=0x7ff8000000000000ULL;
+            /* 破綻点修正: 空の `dbl{}` を xeval_eval("") が「空式=0.0」として
+             * 黙って成功させていた（axx.py の ast.parse は空式を構文エラーと
+             * するので "cannot convert expression" エラーで中断する）。 */
+            if(t[0]=='\0'){
+                if(should_report_errors(&asmb->st)){
+                    axx_diagf(1, 0, " error - dbl{}: cannot convert expression to float64; using 0.\n");
+                }
+                bits=0;
+            }
+            else if(strcmp(t,"nan")==0) bits=0x7ff8000000000000ULL;
             else if(strcmp(t,"inf")==0) bits=0x7ff0000000000000ULL;
             else if(strcmp(t,"-inf")==0) bits=0xfff0000000000000ULL;
             else {
@@ -2822,10 +3236,15 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                 } else {
                     int prev_flt = asmb->st.exp_typ_float;
                     int _prior_had_error = asmb->st.had_error;
+                    DiagSuppress _sv;
                     asmb->st.exp_typ_float = 1;
+                    diag_suppress_begin(&asmb->st, &_sv);
                     int io2; uint256_t fv = expr_expression_pat(asmb,t,0,&io2);
+                    int _inner_errs = asmb->st.diag_pending_len;
+                    diag_suppress_end(&asmb->st, &_sv);
                     asmb->st.exp_typ_float = prev_flt;
-                    int _fallback_errored = asmb->st.had_error && !_prior_had_error;
+                    int _fallback_errored = _inner_errs > 0
+                                            || (asmb->st.had_error && !_prior_had_error);
                     asmb->st.had_error = _prior_had_error;
                     if(_fallback_errored){
                         if(should_report_errors(&asmb->st)){
@@ -2839,16 +3258,24 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                 }
             }
             x = asmb->st.exp_typ_float ? double_to_u256((double)bits) : u256_from_u64(bits);
+            free(t);
         }
     }
     else if(idx+3<=slen && strncmp(s+idx,"flt",3)==0 &&
-            ({ int _j=axx_skipspc(s,idx+3); _j<slen && s[_j]=='{'; })){
+            axx_next_nonspace_is_brace(s, slen, idx+3)){
         idx+=3;
-        int f; char t[512];
-        idx=axx_get_curlb(&asmb->st,s,idx,&f,t,sizeof(t));
+        int f; char *t;
+        idx=axx_get_curlb(&asmb->st,s,idx,&f,&t);
         if(f){
             uint32_t bits;
-            if(strcmp(t,"nan")==0) bits=0x7fc00000u;
+            /* 破綻点修正: dbl{} と同じ問題。上のコメントを参照。 */
+            if(t[0]=='\0'){
+                if(should_report_errors(&asmb->st)){
+                    axx_diagf(1, 0, " error - flt{}: cannot convert expression to float32; using 0.\n");
+                }
+                bits=0;
+            }
+            else if(strcmp(t,"nan")==0) bits=0x7fc00000u;
             else if(strcmp(t,"inf")==0) bits=0x7f800000u;
             else if(strcmp(t,"-inf")==0) bits=0xff800000u;
             else {
@@ -2859,10 +3286,15 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                 } else {
                     int prev_flt = asmb->st.exp_typ_float;
                     int _prior_had_error = asmb->st.had_error;
+                    DiagSuppress _sv;
                     asmb->st.exp_typ_float = 1;
+                    diag_suppress_begin(&asmb->st, &_sv);
                     int io2; uint256_t fv = expr_expression_pat(asmb,t,0,&io2);
+                    int _inner_errs = asmb->st.diag_pending_len;
+                    diag_suppress_end(&asmb->st, &_sv);
                     asmb->st.exp_typ_float = prev_flt;
-                    int _fallback_errored = asmb->st.had_error && !_prior_had_error;
+                    int _fallback_errored = _inner_errs > 0
+                                            || (asmb->st.had_error && !_prior_had_error);
                     asmb->st.had_error = _prior_had_error;
                     if(_fallback_errored){
                         if(should_report_errors(&asmb->st)){
@@ -2876,6 +3308,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                 }
             }
             x = asmb->st.exp_typ_float ? double_to_u256((double)bits) : u256_from_u64(bits);
+            free(t);
         }
     }
     else if(idx+4<=slen && axx_q(s,slen,"not(",idx)){
@@ -2901,7 +3334,13 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         uint256_t ten=u256_from_u64(10);
         for(int di=0;fs[di];di++) x=u256_add(u256_mul(x,ten),u256_from_u64((uint64_t)(fs[di]-'0')));
     }
-    else if(st->expmode==EXP_PAT && is_lower(s[idx]) && (s[idx+1]=='\0'||!is_lower(s[idx+1]))){
+    /* パターン変数 a〜z は「小文字1文字で、直後がラベル構成文字でない」ときだけ。
+     * 破綻点修正: 直後の文字を is_lower() でしか見ていなかったため、`a1` や `aB`
+     * のようにラベル構成文字（数字・大文字・`_`・`.`）が続く場合まで変数 `a` として
+     * 食ってしまい、残った `1` で式リストの解析が打ち切られて後続のワードごと
+     * 黙って消えていた（axx.py は lwordchars で判定するのでラベル `a1` になる）。 */
+    else if(st->expmode==EXP_PAT && is_lower(s[idx])
+            && (s[idx+1]=='\0' || !char_in(s[idx+1], st->lwordchars))){
         char ch=s[idx];
         if(idx+3<=slen && s[idx+1]==':'&&s[idx+2]=='='){
             int _assign_prior_eul = st->error_undefined_label;
@@ -2916,7 +3355,14 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             if(!st->in_match_attempt
                && !st->pass1_size_mode
                && should_report_errors(st)){
-                if(var_get_is_undef(st, ch)){
+                /* 破綻点修正: 束縛時に付けたタグ(var_get_is_undef)だけを見ていたため、
+                 * 「ラベル自体は定義されているが、その値が未定義由来」という場合を
+                 * 取りこぼしていた。例: `L: .equ NOSUCH` は L を定義するが値は
+                 * UNDEF 由来になる。`!x` が L に束縛されてもラベル検索自体は成功して
+                 * いるのでタグは付かず、結果として 0xff 等のゴミを黙って生成していた
+                 * （axx.py は値そのものを _is_undef_derived() で見るので検出できる）。
+                 * axx.py と同じく値も検査する。 */
+                if(var_get_is_undef(st, ch) || u256_is_undef_derived(x)){
                     st->error_undefined_label = 1;
                     axx_diagf(0, 0, " error - Label undefined: variable '%c' contains undefined value"
                                "  [%s:%d]\n",
@@ -2943,14 +3389,16 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         }
     }
     else if(s[idx]&&char_in(s[idx],st->lwordchars)){
-        char w[512];
-        int new_idx=axx_get_label_word(s,idx,st->lwordchars,w,sizeof(w));
+        char wbuf[512]; size_t wsz;
+        char *w = axx_word_buf(s, idx, wbuf, sizeof(wbuf), &wsz);
+        int new_idx=axx_get_label_word_ex(s,idx,st->lwordchars,w,wsz,0);
         if(new_idx!=idx){
             idx=new_idx;
             x=label_get_value(st,w);
             if(asmb->st.exp_typ_float && !st->error_undefined_label)
                 x=double_to_u256((double)(int64_t)u256_to_u64(x));
         }
+        if(w!=wbuf) free(w);
     }
 
     idx=axx_skipspc(s,idx);
@@ -2968,7 +3416,10 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
             x=double_to_u256(pow(a,b));
         } else {
             const int64_t EXP_MAX = 1024;
-            const int64_t EXP_RESULT_MAX_BITS = 1 << 20;
+            /* axx.py の _EXP_RESULT_MAX_BITS ( _UNDEF_SANE_CEILING(1<<256).bit_length()-1 )
+             * に合わせる。1<<20 のままだと base_bits(<=256)*exp_factor(<=1024) が
+             * 構造的にこの上限を超えられず、桁溢れ検出が常に不発になっていた。 */
+            const int64_t EXP_RESULT_MAX_BITS = 256;
             int64_t t_int = u256_to_i64(t);
             if(t_int < 0){
                 if(should_report_errors(&asmb->st)){
@@ -3277,17 +3728,16 @@ static uint256_t expr_term8(Assembler *asmb, const char *s, int idx, int *idx_ou
 
 static int skip_subexpr(const char *s, int idx);
 
+/* 破綻点修正: `&&` / `||` を短絡評価していたが、axx.py は必ず両辺を評価する
+ * （`x = 1 if x and t else 0`）。式には `a:=...` の代入や、パス2の ELF
+ * リロケーション収集（ラベル参照の記録）といった副作用があるため、右辺を
+ * 読み飛ばすと生成コードが変わってしまう。両辺を評価する形に揃える。 */
 static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term8(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
     while(idx<slen && axx_q(s,slen,"&&",idx)){
-        idx+=2;
-        if(u256_is_zero(x)){
-            idx = skip_subexpr(s, axx_skipspc(s, idx));
-        } else {
-            uint256_t t=expr_term8(asmb,s,idx,&idx);
-            x=u256_from_i64((!u256_is_zero(t))?1:0);
-        }
+        uint256_t t=expr_term8(asmb,s,idx+2,&idx);
+        x=u256_from_i64((!u256_is_zero(x) && !u256_is_zero(t))?1:0);
     }
     *idx_out=idx; return x;
 }
@@ -3296,14 +3746,8 @@ static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_o
     uint256_t x=expr_term9(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
     while(idx<slen && axx_q(s,slen,"||",idx)){
-        idx+=2;
-        if(!u256_is_zero(x)){
-            idx = skip_subexpr(s, axx_skipspc(s, idx));
-            x = u256_one();
-        } else {
-            uint256_t t=expr_term9(asmb,s,idx,&idx);
-            x=u256_from_i64((!u256_is_zero(t))?1:0);
-        }
+        uint256_t t=expr_term9(asmb,s,idx+2,&idx);
+        x=u256_from_i64((!u256_is_zero(x) || !u256_is_zero(t))?1:0);
     }
     *idx_out=idx; return x;
 }
@@ -3340,27 +3784,53 @@ static int skip_subexpr(const char *s, int idx) {
     return idx;
 }
 
-static int skip_ternary_expr(const char *s, int idx) {
+static int skip_ternary_expr_d(const char *s, int idx, int depth) {
+    /* 破綻点修正: 深くネストした三項式の偽側を読み飛ばす再帰に上限が無く、
+     * expr_factor の EXPR_MAX_DEPTH ガードも経由しないため、巨大な連鎖
+     * `?:` でCスタックオーバーフローしうる。expr_factor と同じ上限で止める。 */
+    if(depth > EXPR_MAX_DEPTH) return idx;
     int slen = (int)strlen(s);
     idx = skip_subexpr(s, idx);
     if(idx < slen && s[idx] == '?' && s[idx+1] != '='){
         idx++;
         idx = axx_skipspc(s, idx);
-        idx = skip_ternary_expr(s, idx);
+        idx = skip_ternary_expr_d(s, idx, depth + 1);
         idx = axx_skipspc(s, idx);
         if(idx < slen && s[idx] == ':' && s[idx+1] != '='){
             idx++;
             idx = axx_skipspc(s, idx);
-            idx = skip_ternary_expr(s, idx);
+            idx = skip_ternary_expr_d(s, idx, depth + 1);
         }
     }
     return idx;
 }
+static int skip_ternary_expr(const char *s, int idx) {
+    return skip_ternary_expr_d(s, idx, 0);
+}
 
 static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_out){
+    AsmState *st = &asmb->st;
     uint256_t x = expr_term10(asmb, s, idx, &idx);
     int slen = (int)strlen(s);
     if(idx < slen && axx_q(s, slen, "?", idx)){
+        /* 破綻点修正: 連鎖した `?:` の再帰は expr_factor を経由しないため
+         * EXPR_MAX_DEPTH の深さガードが効かず、巨大な連鎖式でCスタック
+         * オーバーフローしうる。expr_factor と同じカウンタを共有して防ぐ。 */
+        if(st->expr_depth >= EXPR_MAX_DEPTH){
+            if(should_report_errors(st)){
+                axx_diagf(1, 0, " error - expression nesting too deep.\n");
+            }
+            idx++;
+            idx = axx_skipspc(s, idx);
+            idx = skip_ternary_expr(s, idx);
+            idx = axx_skipspc(s, idx);
+            if(axx_q(s, slen, ":", idx) && s[idx+1] != '='){
+                idx = skip_ternary_expr(s, axx_skipspc(s, idx + 1));
+            }
+            *idx_out = idx;
+            return u256_zero();
+        }
+        st->expr_depth++;
         idx++;
         idx = axx_skipspc(s, idx);
         if(u256_is_zero(x)){
@@ -3373,23 +3843,18 @@ static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_o
                 x = u256_zero();
             }
         } else {
-            PatVar    saved_vars[26];
-            memcpy(saved_vars, asmb->st.vars, sizeof(saved_vars));
-
-            x = expr_term10(asmb, s, idx, &idx);
-            PatVar    vars_after_true[26];
-            memcpy(vars_after_true, asmb->st.vars, sizeof(vars_after_true));
-            int err_after_true = asmb->st.error_undefined_label;
-
+            /* 破綻点修正: 真側を expr_term10 で解析していたため、
+             * `c1 ? c2 ? a : b : d` のような括弧なしの入れ子三項が
+             * axx.py（真側も term11 で解析する）と違う結び付きになっていた。 */
+            x = expr_term11(asmb, s, idx, &idx);
             idx = axx_skipspc(s, idx);
             if(axx_q(s, slen, ":", idx) && s[idx+1] != '='){
-                idx++;
-                memcpy(asmb->st.vars, saved_vars, sizeof(saved_vars));
-                idx = skip_ternary_expr(s, axx_skipspc(s, idx));
+                /* 偽側は評価しない。skip_ternary_expr() は字面を追うだけで
+                 * 副作用が無いので、変数や旗の退避・復元は要らない。 */
+                idx = skip_ternary_expr(s, axx_skipspc(s, idx + 1));
             }
-            memcpy(asmb->st.vars, vars_after_true, sizeof(vars_after_true));
-            asmb->st.error_undefined_label = err_after_true;
         }
+        st->expr_depth--;
     }
     *idx_out = idx;
     return x;
@@ -3422,19 +3887,55 @@ static int dir_clear_symbol(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.bits[::<big|little>][::<幅>]`
+ *
+ * 破綻点修正1: 以前は endian_big を無条件に
+ *   `strcasecmp(f[1],"big")==0`
+ * で上書きしていたため、エンディアン欄を書かない2欄形式（`.bits::16`、
+ * このとき f[1] は空）が来るたびにビッグエンディアン指定が黙って
+ * リトルに戻っていた（axx.py はエンディアン欄が big/little のときしか
+ * 変更しないので、同じパターンファイルで両者のバイト順が食い違う）。
+ * 欄が big/little のときだけ設定する。
+ *
+ * 破綻点修正2: 幅の検証が無く、`.bits::big`（幅を書き忘れた形。この形では
+ * "big" が f[2] に入る）だと "big" をラベルとして評価しようとして未定義
+ * ラベルになり、そのゴミ値がワード幅になっていた。1〜64 の範囲を検証し、
+ * 外れていたらエラーにして従来の幅を保つ。 */
 static int dir_bits(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".bits")!=0) return 0;
-    asmb->st.endian_big=(strcasecmp(e->f[1],"big")==0);
-    int io;
-    uint256_t v = e->f[2][0] ? expr_expression_pat(asmb,e->f[2],0,&io) : u256_from_i64(8);
-    asmb->st.bts=(int)u256_to_i64(v);
+    const char *ef = e->f[1];
+    const char *wf = e->f[2];
+
+    if(strcasecmp(ef,"big")==0){ asmb->st.endian_big=1; }
+    else if(strcasecmp(ef,"little")==0){ asmb->st.endian_big=0; }
+    else if(ef[0] && !wf[0]){ wf = ef; }   /* `.bits::<幅>::` の形 */
+
+    /* 2欄形式 `.bits::big` / `.bits::little` は幅欄側に入ってくる。 */
+    if(strcasecmp(wf,"big")==0){ asmb->st.endian_big=1; wf = ""; }
+    else if(strcasecmp(wf,"little")==0){ asmb->st.endian_big=0; wf = ""; }
+
+    if(wf[0]){
+        int io;
+        asmb->st.error_undefined_label = 0;
+        uint256_t v = expr_expression_pat(asmb,wf,0,&io);
+        int64_t nb = u256_to_i64(v);
+        if(asmb->st.error_undefined_label || u256_is_undef_derived(v)
+           || nb < 1 || nb > 64 || !u256_eq(v, u256_from_i64(nb))){
+            axx_diagf(1, 0, " error - .bits: word width must be an integer in 1..64, got '%s'.\n", wf);
+        } else {
+            asmb->st.bts = (int)nb;
+        }
+        asmb->st.error_undefined_label = 0;
+    }
     return 1;
 }
 
 static int dir_padding(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".padding")!=0) return 0;
+    /* axx.py と同じく f[2] を優先し、空なら f[1] を見る。 */
+    const char *pf = e->f[2][0] ? e->f[2] : (e->f[1][0] ? e->f[1] : "");
     int io;
-    uint256_t v = e->f[2][0] ? expr_expression_pat(asmb,e->f[2],0,&io) : u256_zero();
+    uint256_t v = pf[0] ? expr_expression_pat(asmb,pf,0,&io) : u256_zero();
     asmb->st.padding=v;
     return 1;
 }
@@ -3482,16 +3983,25 @@ static int dir_epic(Assembler *asmb, PatEntry *e){
     if(!e->f[1][0]) return 0;
     const char *s=e->f[1];
     int idx=0;
-    int idxs[64]; int ni=0;
+    /* 破綻点修正: int idxs[64] の固定長で、65 個目以降を診断もなく捨てていた。
+     * axx.py には個数の制限が無いので、スロットの組み合わせが一致せず
+     * 「No vliw instruction-set defined.」になったり別のテンプレートが選ばれたり
+     * していた。要素数はカンマの数で上限が決まるので、そのぶん確保する。 */
+    int cap=1;
+    for(const char *q=s; *q; q++) if(*q==',') cap++;
+    int *idxs=malloc((size_t)cap*sizeof(int));
+    if(!idxs){ perror("malloc"); exit(1); }
+    int ni=0;
     while(1){
         int io;
         uint256_t v=expr_expression_pat(asmb,s,idx,&io);
-        if(ni<64) idxs[ni++]=(int)u256_to_i64(v);
+        if(ni<cap) idxs[ni++]=(int)u256_to_i64(v);
         idx=io;
         if(s[idx]==','){idx++;continue;}
         break;
     }
     vset_add(&asmb->st.vliwset,idxs,ni,e->f[2]);
+    free(idxs);
     return 1;
 }
 
@@ -3722,16 +4232,27 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             prev_alnum=0;
             n_expr++;
             idx_t++;
+            /* 破綻点修正: パターンが `!` で終わっている等、変数名が無い／小文字で
+             * ない場合の不一致判定が無かった。axx.py は False を返して次の
+             * パターンを試すが、C は '\0' を変数名として扱い、代入も行われない
+             * まま照合を続けてしまっていた。 */
+            if(idx_t >= tlen){ result=0; break; }
             a=t[idx_t]; idx_t++;
+            if(a=='\0'){ result=0; break; }
             if(a=='F' || a=='D' || a=='Q'){
                 char ftype = a;
-                a = t[idx_t]; idx_t++;
+                if(idx_t >= tlen){ result=0; break; }
+                a = t[idx_t];
+                if(a=='\0' || !is_lower(a)){ result=0; break; }
+                idx_t++;
                 idx_t = axx_skipspc(t, idx_t);
                 char stopchar = '\0';
                 if(idx_t < tlen && t[idx_t] == '\\'){
                     idx_t++;
-                    idx_t = axx_skipspc(t, idx_t);
-                    stopchar = t[idx_t]; idx_t++;
+                    /* axx.py は `\` の直後の1文字をそのまま停止文字にする
+                     * （空白読み飛ばしを挟まない）ので、ここでも挟まない。 */
+                    stopchar = (idx_t < tlen) ? t[idx_t] : '\0';
+                    idx_t++;
                 }
                 int idx_s_q_start = idx_s;
                 uint256_t fv = expr_expression_esc_float(asmb, s, idx_s, stopchar, &idx_s);
@@ -3797,7 +4318,10 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 }
                 continue;
             } else if(a=='!'){
-                a=t[idx_t]; idx_t++;
+                if(idx_t >= tlen){ result=0; break; }
+                a=t[idx_t];
+                if(a=='\0' || !is_lower(a)){ result=0; break; }
+                idx_t++;
                 st->elf_capturing_var = a;
                 int _cap_prior_eul = st->error_undefined_label;
                 st->error_undefined_label = 0;
@@ -3808,12 +4332,13 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 var_put_tagged(st,a,v,_cap_this_undef);
                 continue;
             } else {
+                if(!is_lower(a)){ result=0; break; }
                 idx_t=axx_skipspc(t,idx_t);
                 char stopchar='\0';
                 if(idx_t<tlen && t[idx_t]=='\\'){
                     idx_t++;
-                    idx_t=axx_skipspc(t,idx_t);
-                    stopchar=t[idx_t];
+                    /* axx.py と同じく `\` の直後の1文字をそのまま停止文字にする。 */
+                    stopchar=(idx_t<tlen) ? t[idx_t] : '\0';
                     idx_t++;
                 }
                 st->elf_capturing_var = a;
@@ -3839,8 +4364,9 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 else                        n_named++;
             }
 
-            char w[512];
-            idx_s=axx_get_symbol_word(s,idx_s,st->swordchars,w,sizeof(w));
+            char wbuf[512]; size_t wsz;
+            char *w = axx_word_buf(s, idx_s, wbuf, sizeof(wbuf), &wsz);
+            idx_s=axx_get_symbol_word(s,idx_s,st->swordchars,w,wsz);
             uint256_t sv = u256_zero();
             int ok = 1;
             if(!symbol_get(st,w,&sv)){
@@ -3882,13 +4408,15 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                           && axx_upper_char(s[prev_idx_s + k]) == nm[k]) k++;
                     if(k == nl){ best_len = nl; best_si = si; }
                 }
-                if(best_si >= 0 && (int)strlen(cv->data[best_si]) < (int)sizeof(w)
+                if(best_si >= 0 && strlen(cv->data[best_si]) < wsz
                    && symbol_get(st, cv->data[best_si], &sv)){
-                    snprintf(w, sizeof(w), "%s", cv->data[best_si]);
+                    snprintf(w, wsz, "%s", cv->data[best_si]);
                     idx_s = prev_idx_s + best_len;
                     ok = 1;
                 }
             }
+
+            if(w!=wbuf) free(w);
 
             if(!ok){
                 if(!allow_omit){ result=0; break; }
@@ -3953,9 +4481,19 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
     const uint64_t MAX_COMBINATIONS = (uint64_t)1 << 16;
     uint64_t tried = 0;
 
+    /* `[[...]]` の省略可グループの組み合わせを、削除する個数の少ない順・
+     * 同じ個数なら添字の辞書順で試す（axx.py の
+     * `for i in range(len(sl)+1): for j in itertools.combinations(sl, i)` と同じ順）。
+     *
+     * 破綻点修正: 以前はビットマスクの昇順（0,1,2,3,...）で回していた。これは
+     * 削除個数の順ではないため、グループが3個以上あって複数の組み合わせが
+     * 一致する場合に採用される組み合わせが axx.py と食い違っていた
+     * （例: 3個なら Python は {3} を先に試すのに対し C は {1,2} を先に試す）。 */
     int found=0;
-    uint64_t total = (uint64_t)1 << cnt;
-    for(uint64_t mask=0; mask<total && !found; mask++){
+    int comb[MAX_OPT_GROUPS + 1];
+    for(int size=0; size<=cnt && !found; size++){
+      for(int k=0;k<size;k++) comb[k]=k;
+      while(!found){
         if(++tried > MAX_COMBINATIONS){
             int _already_warned = 0;
             for(int _wi=0; _wi<asmb->st.combo_budget_warned_count; _wi++){
@@ -3979,10 +4517,10 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
                            "consider splitting it into multiple explicit pattern entries.\n",
                            cnt, (unsigned long long)MAX_COMBINATIONS);
             }
-            break;
+            goto combo_done;
         }
-        int ri[64]; int nr=0;
-        for(int i=0;i<cnt;i++) if(mask & ((uint64_t)1<<i)) ri[nr++]=sl[i];
+        int ri[MAX_OPT_GROUPS + 1]; int nr=0;
+        for(int k=0;k<size;k++) ri[nr++]=sl[comb[k]];
         char *lt=remove_brackets_str(t,ri,nr);
 
         PatVar    saved_vars[26];
@@ -4015,7 +4553,17 @@ static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
             }
         }
         free(lt);
+
+        /* 次の組み合わせ（同じ個数のまま辞書順で1つ進める）。
+           進められなければこの個数は打ち止め。 */
+        int k = size - 1;
+        while(k >= 0 && comb[k] == cnt - size + k) k--;
+        if(k < 0) break;
+        comb[k]++;
+        for(int j = k + 1; j < size; j++) comb[j] = comb[j-1] + 1;
+      }
     }
+combo_done:
     free(sl); free(t);
     return found;
 }
@@ -4032,9 +4580,9 @@ static void axx_resolve_path(const char *base_dir, const char *fn,
 
 static void axx_dir_of(const char *path, char *out, size_t osz)
 {
-    strncpy(out, path, osz-1); out[osz-1]='\0';
+    snprintf(out, osz, "%s", path ? path : "");
     char *d = dirname(out);
-    if(d != out) strncpy(out, d, osz-1);
+    if(d != out) memmove(out, d, strlen(d) + 1);
 }
 
 static void readpat(Assembler *asmb, const char *fn);
@@ -4133,12 +4681,20 @@ static void readpat(Assembler *asmb, const char *fn){
         for(int i=0;i<8&&line[si+i];i++) uline[i]=axx_upper_char(line[si+i]);
         if(strcmp(uline,".INCLUDE")==0){ include_pat(asmb,line+si,this_dir); continue; }
 
-        char fields[8][1024]; int nf=0;
+        /* 破綻点修正: フィールドを char[8][1024] の固定長に写していたため、
+         * 1023 文字を超える欄（長い三項式や @@[] を並べた符号化欄など）が
+         * 診断もなく途中で切れていた。axx.py には長さの制限が無いので、
+         * 同じパターンファイルから違うバイト列が出る。行長から必要量が
+         * 決まるので、行ごとに確保する。 */
+        size_t fsz = strlen(line) + 1;
+        char *fbuf = malloc(8 * fsz);
+        if(!fbuf){ perror("malloc"); exit(1); }
+        char *fields[8];
+        for(int i=0;i<8;i++){ fields[i] = fbuf + (size_t)i*fsz; fields[i][0]=0; }
+        int nf=0;
         int idx=0;
         while(1){
-            char f_out[1024];
-            idx=axx_get_params1(line,idx,f_out,sizeof(f_out));
-            fields[nf][0]=0; snprintf(fields[nf], sizeof(fields[nf]), "%s", f_out);
+            idx=axx_get_params1(line,idx,fields[nf],fsz);
             nf++;
             if(idx>=(int)strlen(line)||nf>=8) break;
         }
@@ -4150,6 +4706,7 @@ static void readpat(Assembler *asmb, const char *fn){
         else if(nf==4){ pat_set(pe,0,fields[0]); pat_set(pe,1,fields[1]); pat_set(pe,2,fields[2]); pat_set(pe,3,fields[3]); }
         else if(nf==5){ for(int i=0;i<5;i++) pat_set(pe,i,fields[i]); }
         else if(nf>=6){ for(int i=0;i<6;i++) pat_set(pe,i,fields[i]); }
+        free(fbuf);
     }
     free(line);
     pat_macro_expand_free(exp, nexp);
@@ -4199,23 +4756,59 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
                 i++;
             }
             if(comma_pos>0){
-                char expr_part[1024]={0};
-                int el=comma_pos-expr_start; if(el>=(int)sizeof(expr_part)) el=sizeof(expr_part)-1;
-                memcpy(expr_part,pattern+expr_start,el);
-                char rep_pat[1024]={0};
-                int rl=i-comma_pos-1; if(rl>=(int)sizeof(rep_pat)) rl=sizeof(rep_pat)-1;
-                memcpy(rep_pat,pattern+comma_pos+1,rl);
+                /* 破綻点修正: 1024 バイトの自動変数に写していたため、長い
+                 * `@@[n, ...]` の反復パターン（や回数の式）が診断もなく途中で
+                 * 切れていた。axx.py には制限が無いので同じパターンファイルから
+                 * 違うバイト列が出る。実際の長さぶんだけ確保する。 */
+                int el=comma_pos-expr_start;
+                int rl=i-comma_pos-1;
+                if(el<0) el=0;
+                if(rl<0) rl=0;
+                char *expr_part = malloc((size_t)el+1);
+                char *rep_pat   = malloc((size_t)rl+1);
+                if(!expr_part||!rep_pat){ perror("malloc"); exit(1); }
+                memcpy(expr_part,pattern+expr_start,(size_t)el); expr_part[el]=0;
+                memcpy(rep_pat,pattern+comma_pos+1,(size_t)rl); rep_pat[rl]=0;
                 int io;
+                /* 破綻点修正: 繰り返し回数の未定義判定のために旗を降ろしたまま
+                 * 復元していなかったため、オペランド捕捉の段階で立った
+                 * 「未定義ラベルを踏んだ」という情報が、`@@[]` を含むパターンでは
+                 * 必ず消えていた。makeobj() は e_p() の呼び出し「後」に旗を退避
+                 * するので、呼び出し元の状態ごと失われていた。 */
+                int _rep_prior = asmb->st.error_undefined_label;
                 asmb->st.error_undefined_label = 0;
                 uint256_t nv=expr_expression_pat(asmb,expr_part,0,&io);
+                int _rep_undef = asmb->st.error_undefined_label;
+                asmb->st.error_undefined_label = _rep_prior || _rep_undef;
                 int64_t nrep=u256_to_i64(nv);
+                /* 破綻点修正: 繰り返し回数について、未定義ラベルの判定も上限の
+                 * チェックも無かった（axx.py はどちらも行う）。未定義なら 0 回、
+                 * 上限 (1<<24) 超はエラーにして 0 回に倒す。 */
+                const int64_t N_MAX = (int64_t)1 << 24;
+                if(_rep_undef || u256_is_undef_derived(nv)) nrep = 0;
+                if(nrep > N_MAX){
+                    axx_diagf(0, 0, " error - @@[n,...]: repeat count %lld exceeds maximum %lld.\n",
+                              (long long)nrep, (long long)N_MAX);
+                    asmb->st.had_error = 1;
+                    nrep = 0;
+                }
                 if(nrep>0){
                     has_content=1;
+                    /* 破綻点修正: rep_pat をそのまま複製していたため、その中に
+                     * ネストした @@[...] があっても再帰展開されず、
+                     * axx.py（e_p を再帰呼び出しして展開する）と食い違って
+                     * いた。展開してから複製する。 */
+                    char *exp_rep = malloc(osz);
+                    if(!exp_rep){ perror("malloc"); exit(1); }
+                    int rep_empty=0;
+                    e_p(rep_pat, exp_rep, osz, &rep_empty, asmb);
                     for(int j=0;j<nrep;j++){
                         if(j>0&&n<osz-1) out[n++]=',';
-                        for(const char*p=rep_pat;*p&&n<osz-1;) out[n++]=*p++;
+                        for(const char*p=exp_rep;*p&&n<osz-1;) out[n++]=*p++;
                     }
+                    free(exp_rep);
                 }
+                free(expr_part); free(rep_pat);
                 i++;
             } else {
                 if(should_report_errors(&asmb->st)){
@@ -4258,8 +4851,9 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     size_t s_cap = strlen(ep_buf) + 64;
     char *s = NULL;
     while(1){
-        s = realloc(s, s_cap);
-        if(!s){ perror("malloc"); free(ep_buf); return; }
+        char *s_new = realloc(s, s_cap);
+        if(!s_new){ perror("malloc"); free(s); free(ep_buf); return; }
+        s = s_new;
         int truncated = replace_percent_with_index(ep_buf, s, s_cap);
         if(!truncated) break;
         s_cap *= 2;
@@ -4275,9 +4869,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     st->in_binary_list = 1;
     int _prior_undef = st->error_undefined_label;
     st->error_undefined_label = 0;
-    int any_undef = 0;
 
-    int logical_word_idx = 0;
     int idx=0;
     while(1){
         if(idx>=slen||s[idx]=='\0') break;
@@ -4287,23 +4879,21 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         }
         int semicolon=0;
         if(s[idx]==';'){ semicolon=1; idx++; }
-        st->elf_current_word_idx = logical_word_idx;
+        /* ワード番号は「いま objl に積まれている数」。`;` 付きで出力されなかった
+         * 要素は番号を消費しない（axx.py の `_elf_current_word_idx = len(objl)`）。 */
+        int cur_widx = objl->len;
+        st->elf_current_word_idx = cur_widx;
         if(st->pas==1) st->pass1_size_mode=1;
-        st->error_undefined_label = 0;
         int io;
         uint256_t x=expr_expression_pat(asmb,s,idx,&io);
         if(st->pas==1){ st->pass1_size_mode=0; st->error_undefined_label=0; }
         idx=io;
-        logical_word_idx++;
-        if(st->error_undefined_label){
-            any_undef = 1;
-            if(s[idx]==','){idx++;continue;}
-            continue;
-        }
-        if(semicolon?!u256_is_zero(x):1){
+        /* 破綻点修正: 以前は未定義ラベルを含むワードを objl に積まずに読み飛ばして
+         * いたため、命令長と `$.` が axx.py（値がゴミでも必ず積む）とずれていた。
+         * 未定義は error_undefined_label の伝播だけで表現し、長さは変えない。 */
+        if(semicolon ? !u256_is_zero(x) : 1){
             iv_push(objl,x);
-        } else if(semicolon){
-            int cur_widx = logical_word_idx - 1;
+        } else {
             int wi2 = 0;
             for(int ri2 = 0; ri2 < st->elf_refs_len; ri2++){
                 if(st->elf_refs[ri2].word_idx != cur_widx)
@@ -4312,14 +4902,13 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
                     free(st->elf_refs[ri2].name);
             }
             st->elf_refs_len = wi2;
-            logical_word_idx--;
         }
         if(s[idx]==','){idx++;continue;}
         break;
     }
     st->elf_current_word_idx = -1;
     st->in_binary_list = 0;
-    st->error_undefined_label = any_undef || _prior_undef;
+    if(_prior_undef) st->error_undefined_label = 1;
     free(s);
 }
 
@@ -4338,7 +4927,7 @@ static void ivv_free(IVVec*v){
     free(v->data); ivv_init(v);
 }
 
-static int int_cmp(const void*a,const void*b){
+AXX_UNUSED static int int_cmp(const void*a,const void*b){
     int ia=*(const int*)a, ib=*(const int*)b;
     return (ia > ib) - (ia < ib);
 }
@@ -4360,7 +4949,14 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
     ivv_push(&objs,objl_in);
 
     int *idxlst=malloc(256*sizeof(int)); int nidxlst=0;
-    for(int i=0;i<idxs_in->len;i++) if(nidxlst<256) idxlst[nidxlst++]=(int)u256_to_i64(idxs_in->data[i]);
+    for(int i=0;i<idxs_in->len;i++){
+        if(nidxlst<256){ idxlst[nidxlst++]=(int)u256_to_i64(idxs_in->data[i]); continue; }
+        if(should_report_errors(st)){
+            axx_diagf(1, 0, " error - VLIW packet exceeds maximum of 256 slot indices; "
+                       "extra slots ignored.\n");
+        }
+        break;
+    }
 
     st->vliwstop=0;
     int slen=(int)strlen(line);
@@ -4393,7 +4989,14 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
                 return 0;
             }
             ivv_push(&objs,&new_objl);
-            for(int i=0;i<new_idxs.len;i++) if(nidxlst<256) idxlst[nidxlst++]=(int)u256_to_i64(new_idxs.data[i]);
+            for(int i=0;i<new_idxs.len;i++){
+                if(nidxlst<256){ idxlst[nidxlst++]=(int)u256_to_i64(new_idxs.data[i]); continue; }
+                if(should_report_errors(st)){
+                    axx_diagf(1, 0, " error - VLIW packet exceeds maximum of 256 slot indices; "
+                               "extra slots ignored.\n");
+                }
+                break;
+            }
             iv_free(&new_idxs); iv_free(&new_objl);
             continue;
         } else break;
@@ -4419,14 +5022,15 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
 
     for(int ki=0;ki<st->vliwset.len;ki++){
         VliwSetEntry *k=&st->vliwset.data[ki];
-        int *sorted_k=malloc(k->nidxs*sizeof(int));
-        memcpy(sorted_k,k->idxs,k->nidxs*sizeof(int));
-        qsort(sorted_k,k->nidxs,sizeof(int),int_cmp);
-        int *sorted_l=malloc(nidxlst*sizeof(int));
-        memcpy(sorted_l,idxlst,nidxlst*sizeof(int));
-        qsort(sorted_l,nidxlst,sizeof(int),int_cmp);
-        int match=(k->nidxs==nidxlst && memcmp(sorted_k,sorted_l,k->nidxs*sizeof(int))==0);
-        free(sorted_k); free(sorted_l);
+        /* 破綻点修正: 以前は両方の並びをソートしてから比較していたため、
+         * スロットの「順序」が違うだけの EPIC テンプレートまで一致扱いになり、
+         * axx.py（`list(k[0]) == list(idxlst)` で順序込みの比較）と
+         * 違うテンプレート値を選ぶことがあった。順序込みで比較する。 */
+        int match = (k->nidxs == nidxlst);
+        if(match){
+            for(int mi=0; mi<nidxlst; mi++)
+                if(k->idxs[mi] != idxlst[mi]){ match = 0; break; }
+        }
         if(!match && st->vliwtemplatebits!=0) continue;
 
         int io;
@@ -4457,8 +5061,18 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
                 fprintf(stderr,"warning-VLIW:%d values exceed slot capacity %d,truncating.\n",values.len,target_len);
             values.len=target_len;
         } else {
+            /* 破綻点修正: 以前は「不足数 × NOP のバイト数」個を積んでいた
+             * （必要なのは不足数ぶんだけ）。使われるのは先頭 target_len 個なので
+             * 出力は変わらないが、NOP 1個ぶんのバイト数倍の無駄な確保をしていた。
+             * NOP パターンを周期的に繰り返して、不足数ちょうどを積む
+             * （axx.py の「NOP を full 個＋余り」と同じ並びになる）。 */
             int needed=target_len-values.len;
-            for(int pi=0;pi<needed;pi++) for(int ni=0;ni<st->vliwnop.len;ni++) iv_push(&values,st->vliwnop.data[ni]);
+            for(int pi=0;pi<needed;pi++){
+                uint256_t nv = (st->vliwnop.len > 0)
+                             ? st->vliwnop.data[pi % st->vliwnop.len]
+                             : u256_zero();
+                iv_push(&values, nv);
+            }
         }
 
         IntVec v1; iv_init(&v1);
@@ -4533,8 +5147,10 @@ static int adir_labelc(AsmState *st, const char *l, const char *ll){
 static char *adir_label_processing(Assembler *asmb, const char *l, char *out, size_t osz){
     AsmState *st=&asmb->st;
     if(!l[0]){ out[0]=0; return out; }
-    char label[512]; int idx;
-    idx=axx_get_label_word(l,0,st->lwordchars,label,sizeof(label));
+    char lblbuf[512]; size_t lblsz;
+    char *label = axx_word_buf(l, 0, lblbuf, sizeof(lblbuf), &lblsz);
+    int idx;
+    idx=axx_get_label_word(l,0,st->lwordchars,label,lblsz);
     int lidx=idx;
     if(label[0]&&lidx>0&&l[lidx-1]==':'){
         idx=axx_skipspc(l,idx);
@@ -4545,10 +5161,14 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
             const char *expr_tail = l + idx;
             int reloc_type = -1;
             const char *dcolon = strstr(expr_tail, "::");
-            char expr_buf[1024];
+            /* 破綻点修正: `.EQU 式::型名` の式を 1024 バイトの自動変数に写して
+             * いたため、長い式が診断もなく途中で切れて axx.py と違う値になって
+             * いた。実際の長さぶんだけ確保する。 */
+            char *expr_buf = NULL;
             if(dcolon){
                 size_t elen = (size_t)(dcolon - expr_tail);
-                if(elen >= sizeof(expr_buf)) elen = sizeof(expr_buf)-1;
+                expr_buf = malloc(elen + 1);
+                if(!expr_buf){ perror("malloc"); exit(1); }
                 memcpy(expr_buf, expr_tail, elen); expr_buf[elen] = '\0';
                 expr_tail = expr_buf;
                 const char *rt_str = dcolon + 2;
@@ -4589,12 +5209,16 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
             }
 
             label_put_value(st,label,u,st->current_section,1,reloc_type,st->error_undefined_label);
+            free(expr_buf);
+            if(label!=lblbuf) free(label);
             out[0]=0; return out;
         } else {
             label_put_value(st,label,st->pc,st->current_section,0,-1,0);
+            if(label!=lblbuf) free(label);
             strncpy(out,l+lidx,osz-1); out[osz-1]=0; return out;
         }
     }
+    if(label!=lblbuf) free(label);
     strncpy(out,l,osz-1); out[osz-1]=0; return out;
 }
 
@@ -4602,9 +5226,7 @@ static int asciistr(Assembler *asmb, const char *l2){
     AsmState *st=&asmb->st;
     if(!l2[0]||l2[0]!='"') return 0;
     int idx=1;
-    uint64_t word_mask = (st->bts > 0)
-                       ? ((st->bts < 64) ? (((uint64_t)1 << st->bts) - 1) : (uint64_t)-1)
-                       : 0xFFu;
+    uint64_t word_mask = (st->bts > 0) ? axx_word_mask(st->bts) : 0xFFu;
     int truncated = 0;
     while(l2[idx]&&l2[idx]!='"'){
         uint32_t ch;
@@ -4748,11 +5370,24 @@ static int adir_endsection(AsmState *st, const char *l){
         return 1;
     }
     uint256_t delta = u256_sub(st->pc, e->entry_pc);
-    if(!u256_lt_signed(delta, u256_zero())){
-        e->size = u256_add(e->size, delta);
-        if(!u256_is_zero(delta))
-            secrangevec_push(&st->section_ranges, st->current_section, e->entry_pc, delta);
+    if(u256_lt_signed(delta, u256_zero())){
+        /* 破綻点修正: delta が負（.org でセクション内の pc を巻き戻した後に
+         * .ENDSECTION した場合）でも entry_pc・confirmed を無条件に更新して
+         * いたため、次にこのセクションを測る基準点が「既に (旧entry_pc,pc)
+         * として section_ranges へ記録済みの範囲」の内側まで後退し、
+         * アセンブリ終了時の最終クローズ処理がその範囲と重複するバイト域を
+         * 二重に積んでいた（axx.py はこの分岐で entry_pc を変更せずに抜ける
+         * ので重複しない。また axx.py はここで警告も出す）。 */
+        char db[96]; u256_to_pydec(delta, db, sizeof(db));
+        if(should_report_errors(st)){
+            axx_diagf(0, 0, " warning - ENDSECTION: computed block size %s < 0 for "
+                       "'%s'; keeping previous size.\n", db, st->current_section);
+        }
+        return 1;
     }
+    e->size = u256_add(e->size, delta);
+    if(!u256_is_zero(delta))
+        secrangevec_push(&st->section_ranges, st->current_section, e->entry_pc, delta);
     e->entry_pc = st->pc;
     e->confirmed = 1;
     return 1;
@@ -4771,19 +5406,26 @@ static int adir_resX(Assembler *asmb, const char *l, const char *l2,
         return 1;
     }
     int64_t cnt=u256_to_i64(x);
-    if(cnt < 0){
+    /* 64bit へ切り詰めた値だけで判定すると、2**64 の倍数のような値が 0 に
+     * 見えて検査をすり抜けるので、元の 256bit 値でも比較する。 */
+    if(u256_lt_signed(x, u256_zero())){
         if(should_report_errors(&asmb->st)){
-            axx_diagf(1, 0, " error - %s requires a non-negative count, got %lld.\n",
-                       directive,(long long)cnt);
+            char cb[96]; u256_to_pydec(x, cb, sizeof(cb));
+            axx_diagf(1, 0, " error - %s requires a non-negative count, got %s.\n",
+                       directive, cb);
         }
         return 1;
     }
-    if(cnt > (int64_t)(1 << 28) / (int64_t)mul){
-        if(should_report_errors(&asmb->st)){
-            axx_diagf(1, 0, " error - %s count %lld (x%llu) exceeds maximum %d words.\n",
-                       directive,(long long)cnt,(unsigned long long)mul,1<<28);
+    {
+        int64_t lim = (int64_t)(1 << 28) / (int64_t)mul;
+        if(cnt > lim || u256_gt_signed(x, u256_from_i64(lim))){
+            if(should_report_errors(&asmb->st)){
+                char cb[96]; u256_to_pydec(x, cb, sizeof(cb));
+                axx_diagf(1, 0, " error - %s count %s (x%llu) exceeds maximum %d words.\n",
+                           directive, cb, (unsigned long long)mul, 1<<28);
+            }
+            return 1;
         }
-        return 1;
     }
     int64_t total = cnt * (int64_t)mul;
     asmb->st.pc = u256_add(asmb->st.pc, u256_from_u64((uint64_t)total));
@@ -4815,11 +5457,27 @@ static int adir_zero(Assembler *asmb, const char *l, const char *l2){
         return 1;
     }
     int64_t cnt=u256_to_i64(x);
-    if(cnt < 0){
+    if(u256_lt_signed(x, u256_zero())){
         if(should_report_errors(&asmb->st)){
-            axx_diagf(1, 0, " error - .ZERO requires a non-negative count, got %lld.\n", (long long)cnt);
+            char cb[96]; u256_to_pydec(x, cb, sizeof(cb));
+            axx_diagf(1, 0, " error - .ZERO requires a non-negative count, got %s.\n", cb);
         }
         return 1;
+    }
+    /* 破綻点修正: 上限チェックが無く、巨大な .ZERO で事実上ハングしていた
+     * （axx.py は 1<<28 で打ち切る）。同じ上限を入れる。
+     * 64bit に収まらない値は u256_to_i64() の切り捨てで小さく見えうるので、
+     * 元の 256bit 値でも判定する。 */
+    {
+        const int64_t ZERO_MAX = (int64_t)1 << 28;
+        if(cnt > ZERO_MAX || u256_gt_signed(x, u256_from_i64(ZERO_MAX))){
+            if(should_report_errors(&asmb->st)){
+                char cb[96]; u256_to_pydec(x, cb, sizeof(cb));
+                axx_diagf(1, 0, " error - .ZERO count %s exceeds maximum %lld.\n",
+                          cb, (long long)ZERO_MAX);
+            }
+            return 1;
+        }
     }
     for(int64_t i=0;i<cnt;i++){
         outbin2(&asmb->st,asmb->st.pc,u256_from_u64(0));
@@ -4919,16 +5577,25 @@ static int adir_org(Assembler *asmb, const char *l, const char *l2){
 }
 static int adir_export(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
-    if(st->pas!=2&&st->pas!=0) return 0;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".EXPORT")!=0 && strcmp(up,".GLOBAL")!=0) return 0;
-    char buf[4096]; strncpy(buf,l2,sizeof(buf)-1); buf[sizeof(buf)-1]=0;
+    /* 破綻点修正: パス1では 0 を返して「未処理」扱いにしていたため、
+     * `.global foo` の行がパス1だけパターン照合へ流れ、たまたま一致する
+     * パターンがあるとパス1でだけバイトが出てパス1/パス2のアドレスがずれた。
+     * ディレクティブとして必ず消費し、記録だけをパス2/対話時に限る。 */
+    if(st->pas!=2&&st->pas!=0) return 1;
+    /* 破綻点修正: 4096 バイトの自動変数に写してから走査していたため、
+     * ラベルを多数並べた `.global a,b,c,...` が診断もなく途中で切れていた
+     * （実測: 600 個並べると caxx だけ 513 個しか登録されない）。
+     * このバッファは書き換えないので、写さず l2 をそのまま読めばよい。 */
+    const char *buf = l2;
     int idx=0; int blen=(int)strlen(buf);
     while(idx<blen&&buf[idx]){
         idx=axx_skipspc(buf,idx);
-        char s[512];
-        idx=axx_get_label_word(buf,idx,st->lwordchars,s,sizeof(s));
-        if(!s[0]) break;
+        char sbuf[512]; size_t ssz;
+        char *s = axx_word_buf(buf, idx, sbuf, sizeof(sbuf), &ssz);
+        idx=axx_get_label_word(buf,idx,st->lwordchars,s,ssz);
+        if(!s[0]){ if(s!=sbuf) free(s); break; }
         if(buf[idx]==':') idx++;
         uint256_t v=label_get_value(st,s);
         const char *sec=label_get_section(st,s);
@@ -4939,6 +5606,7 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
             sv_push(&st->export_order, s);
         }
         lmap_set(&st->export_labels,s,v,sec,is_equ_v,is_undef_v);
+        if(s!=sbuf) free(s);
         if(buf[idx]==',') idx++;
     }
     return 1;
@@ -4948,13 +5616,19 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".EXTERN")!=0) return 0;
-    char buf[4096]; strncpy(buf,l2,sizeof(buf)-1); buf[sizeof(buf)-1]=0;
+    /* 破綻点修正: 4096 バイトの自動変数に写してから走査していたため、
+     * ラベルを多数並べた `.global a,b,c,...` が診断もなく途中で切れていた
+     * （実測: 600 個並べると caxx だけ 513 個しか登録されない）。
+     * このバッファは書き換えないので、写さず l2 をそのまま読めばよい。 */
+    const char *buf = l2;
     int idx=0; int blen=(int)strlen(buf);
     while(idx<blen&&buf[idx]){
         idx=axx_skipspc(buf,idx);
-        char s[512]; s[0]=0;
-        idx=axx_get_label_word(buf,idx,st->lwordchars,s,sizeof(s));
-        if(!s[0]) break;
+        char sbuf[512]; size_t ssz;
+        char *s = axx_word_buf(buf, idx, sbuf, sizeof(sbuf), &ssz);
+        s[0]=0;
+        idx=axx_get_label_word(buf,idx,st->lwordchars,s,ssz);
+        if(!s[0]){ if(s!=sbuf) free(s); break; }
         if(idx > 0 && buf[idx-1]==':' && idx < blen && buf[idx]==':')
             idx--;
         const ElfMachineInfo *_mtbl_ext = elf_machine_find(st->elf_machine);
@@ -4988,6 +5662,7 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
             if(reloc_type >= 0 && existing->reloc_type_override >= 0)
                 existing->reloc_type_override = reloc_type;
         }
+        if(s!=sbuf) free(s);
         idx=axx_skipspc(buf,idx);
         if(buf[idx]==',') idx++;
     }
@@ -5007,7 +5682,8 @@ static int adir_reloctype(Assembler *asmb, const char *l, const char *l2){
     }
     static const int _widths[4] = {1, 2, 4, 8};
 
-    char buf[4096]; strncpy(buf,l2,sizeof(buf)-1); buf[sizeof(buf)-1]=0;
+    /* 写さずに読む（理由は adir_export のコメント参照）。 */
+    const char *buf = l2;
     int blen=(int)strlen(buf);
     int idx=0, pos=0;
     while(idx<=blen){
@@ -5246,19 +5922,30 @@ static int pat_prefix_matches(const char *pat, const char *lin){
     return 0;
 }
 
-static int lineassemble2(Assembler *asmb, const char *line, int idx,
-                         IntVec *idxs_out, IntVec *objl_out, int *idx_out){
+/* 作業用バッファは呼び出し元（lineassemble2）がソース行の長さに合わせて確保する。
+ *
+ * 破綻点修正: ここは l[1024] / l2[4096] / lin[8192] という固定長の自動変数で、
+ * それを超える行は診断もなく黙って切り捨てていた。`.ascii "…"` に 4096 文字を
+ * 超える文字列を書くと axx.py は全部出すのに caxx は途中で打ち切る、という形で
+ * 生成物が食い違っていた（実測: 5000 文字 → axx.py 5000 バイト / caxx 4086 バイト）。
+ * バッファ長は行長から決まるので、上限そのものを無くす。
+ *   lbuf, l2buf, nsbuf : 各 bufsz バイト（行長+2）
+ *   linbuf             : linsz バイト（"l l2" が入る長さ）*/
+static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
+                              IntVec *idxs_out, IntVec *objl_out, int *idx_out,
+                              char *l, char *l2, char *l_nospace, size_t bufsz,
+                              char *lin, size_t linsz){
     AsmState *st=&asmb->st;
     iv_clear(idxs_out); iv_clear(objl_out);
 
-    char l[1024]={0}, l2[4096]={0};
-    idx=axx_get_param_to_spc(line,idx,l,sizeof(l));
-    idx=axx_get_param_to_eon(line,idx,l2,sizeof(l2));
+    l[0]=0; l2[0]=0;
+    idx=axx_get_param_to_spc(line,idx,l,bufsz);
+    idx=axx_get_param_to_eon(line,idx,l2,bufsz);
     int ll=(int)strlen(l); while(ll>0&&(l[ll-1]==' '||l[ll-1]=='\t')) l[--ll]=0;
-    char l_nospace[1024]={0}; int nn=0;
+    int nn=0;
     for(int i=0;l[i];i++) if(l[i]!=' ') l_nospace[nn++]=l[i];
     l_nospace[nn]=0;
-    snprintf(l, sizeof(l), "%s", l_nospace);
+    memcpy(l, l_nospace, (size_t)nn+1);
 
     if(adir_section(st,l,l2)){ *idx_out=idx; return 1; }
     if(adir_endsection(st,l)){ *idx_out=idx; return 1; }
@@ -5271,14 +5958,14 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         char _adup[16]; axx_strupr_to(_adup,l,sizeof(_adup));
         if(strcmp(_adup,".ASCII")==0){
             if(!adir_ascii(asmb,l,l2) && should_report_errors(&asmb->st)){
-                char r[1024]; m_pyrepr(l2?l2:"", r, sizeof(r));
+                char r[1024]; m_pyrepr(l2, r, sizeof(r));
                 axx_diagf(1, 0, " error - .ASCII: failed to process string argument: %s\n", r);
             }
             *idx_out=idx; return 1;
         }
         if(strcmp(_adup,".ASCIZ")==0){
             if(!adir_asciiz(asmb,l,l2) && should_report_errors(&asmb->st)){
-                char r[1024]; m_pyrepr(l2?l2:"", r, sizeof(r));
+                char r[1024]; m_pyrepr(l2, r, sizeof(r));
                 axx_diagf(1, 0, " error - .ASCIZ: failed to process string argument: %s\n", r);
             }
             *idx_out=idx; return 1;
@@ -5288,13 +5975,13 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
       if(strcmp(up,".INCLUDE")==0){
           char raw[512]; axx_get_string(l2,raw,sizeof(raw));
           if(raw[0]){
-              char resolved[1024];
+              char resolved[2048];
               const char *cur = st->current_file;
               if(strcmp(raw,"stdin")==0){
                   strncpy(resolved, raw, sizeof(resolved)-1);
                   resolved[sizeof(resolved)-1]='\0';
               } else if(cur && cur[0] && strcmp(cur,"(stdin)")!=0 && strcmp(cur,"stdin")!=0){
-                  char abs_buf[1024], dir_buf[1024];
+                  char abs_buf[2048], dir_buf[2048];
                   if(cur[0]=='/'){
                       strncpy(abs_buf, cur, sizeof(abs_buf)-1);
                       abs_buf[sizeof(abs_buf)-1]='\0';
@@ -5354,9 +6041,8 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
         int lw=0; for(int fi=0;fi<PAT_FIELDS;fi++) if(i->f[fi][0]) lw++;
         if(lw==0) continue;
 
-        char lin[8192];
-        if(l2[0]) snprintf(lin,sizeof(lin),"%s %s",l,l2);
-        else      snprintf(lin,sizeof(lin),"%s",l);
+        if(l2[0]) snprintf(lin,linsz,"%s %s",l,l2);
+        else      snprintf(lin,linsz,"%s",l);
         axx_reduce_spaces(lin);
 
         if(!i->f[0][0]){
@@ -5425,7 +6111,12 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
             }
             st->error_undefined_label=0;
 
-            if(best.score_expr==0 && best.score_sym==0) break;
+            /* 破綻点修正: 「式もシンボルも0個」なら即打ち切っていたが、スコアは
+             * (式の数が少ない, リテラル数が多い, シンボル数が少ない) の順で勝つので、
+             * あとからもっとリテラルの多い（より具体的な）パターンが現れうる。
+             * 健全な打ち切り条件は `+`/`-` の読み替え（ソースを消費せずリテラル数
+             * だけ増える）があるため作りにくく、全走査でも実測で十分速いので、
+             * 打ち切り自体をやめて常に最良スコアを選ぶ。 */
         } else {
             for(int vi=0;vi<26;vi++) free(saved_vtl[vi].label_name);
             st->error_undefined_label=0;
@@ -5509,15 +6200,24 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
             *idx_out=idx; return 0;
         }
         if(oerr){
-            fprintf(stderr, " ; pat %d ['%s', '%s', '%s', '%s', '%s', '%s'] error - Illegal syntax in assemble line or pattern line.\n",
-                   pln,
-                   oerr_entry ? oerr_entry->f[0] : "",
-                   oerr_entry ? oerr_entry->f[1] : "",
-                   oerr_entry ? oerr_entry->f[2] : "",
-                   oerr_entry ? oerr_entry->f[3] : "",
-                   oerr_entry ? oerr_entry->f[4] : "",
-                   oerr_entry ? oerr_entry->f[5] : "");
-            st->had_error=1;
+            /* 破綻点修正: パターン番号と生の6フィールド配列という内部表現を
+             * 常にユーザ向けメッセージへ混ぜており、-d の有無に関わらず
+             * 出力されていた。さらに " error - " より前に "; pat ..." が付くため、
+             * 他の全診断が従う書式からも外れ、axx_diagf() を通さない生の
+             * fprintf だったため表示制御からも外れていた。
+             * 詳細は -d 指定時だけ、本文とは別行で出す。 */
+            axx_diagf(1, 0, " error - Illegal syntax in assemble line or pattern line.  [%s:%d]\n",
+                      st->current_file, (int)st->ln);
+            if(st->debug){
+                fprintf(stderr, "   (pattern %d: ['%s', '%s', '%s', '%s', '%s', '%s'])\n",
+                       pln,
+                       oerr_entry ? oerr_entry->f[0] : "",
+                       oerr_entry ? oerr_entry->f[1] : "",
+                       oerr_entry ? oerr_entry->f[2] : "",
+                       oerr_entry ? oerr_entry->f[3] : "",
+                       oerr_entry ? oerr_entry->f[4] : "",
+                       oerr_entry ? oerr_entry->f[5] : "");
+            }
             *idx_out=idx; return 0;
         }
     }
@@ -5528,12 +6228,36 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     return 1;
 }
 
-typedef struct { const char *name; uint64_t val; int word_idx; } ElfRef;
+/* 作業用バッファを行長に合わせて確保し、本体へ渡す薄い皮。
+ * 本体には途中 return が多数あるので、確保と解放はここ1か所に集める。 */
+static int lineassemble2(Assembler *asmb, const char *line, int idx,
+                         IntVec *idxs_out, IntVec *objl_out, int *idx_out){
+    size_t n = strlen(line);
+    size_t bufsz = n + 2;
+    size_t linsz = 2*n + 4;
+    char *blk = malloc(3*bufsz + linsz);
+    if(!blk){ perror("malloc"); exit(1); }
+    char *l  = blk;
+    char *l2 = blk + bufsz;
+    char *ns = blk + 2*bufsz;
+    char *lin= blk + 3*bufsz;
+    int r = lineassemble2_impl(asmb, line, idx, idxs_out, objl_out, idx_out,
+                               l, l2, ns, bufsz, lin, linsz);
+    free(blk);
+    return r;
+}
 
+typedef struct { const char *name; uint64_t val; int word_idx; int ord; } ElfRef;
+
+/* ワード番号の昇順。同じワード番号なら元の出現順（ord）を保つ。
+ * 破綻点修正: qsort は安定ソートではないので、ワード番号だけで比較すると
+ * 同一ワードに複数の参照があるときの並びが不定になり、あとの重複排除
+ * （直前の要素としか比較しない）の結果が実行ごとに変わりうる。axx.py は
+ * 安定ソートなので、ここでも出現順をタイブレークに使って揃える。 */
 static int elf_ref_cmp(const void *a, const void *b){
-    int ia = ((const ElfRef *)a)->word_idx;
-    int ib = ((const ElfRef *)b)->word_idx;
-    return (ia > ib) - (ia < ib);
+    const ElfRef *x = (const ElfRef *)a, *y = (const ElfRef *)b;
+    if(x->word_idx != y->word_idx) return (x->word_idx > y->word_idx) - (x->word_idx < y->word_idx);
+    return (x->ord > y->ord) - (x->ord < y->ord);
 }
 
 /* ソース1行を処理する主関数。
@@ -5556,8 +6280,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     if(!line){ perror("malloc"); return 0; }
     memcpy(line, line_in, lin_len + 1);
 
-    for(char*p=line;*p;p++){ if(*p=='\t') *p=' '; if(*p=='\n'||*p=='\r') *p=' '; }
-    axx_reduce_spaces(line);
+    axx_normalize_ws(line);
     axx_remove_comment_asm(line);
     if(!line[0]){ free(line); return 0; }
     axx_resolve_vliw_escapes(line);
@@ -5666,20 +6389,46 @@ static int lineassemble(Assembler *asmb, const char *line_in){
             if(!_valid){perror("malloc");exit(1);}
             int _nvalid = 0;
             for(int _ri=0; _ri<st->elf_refs_len; _ri++){
-                if(st->elf_refs[_ri].word_idx >= 0)
-                    _valid[_nvalid++] = (ElfRef){st->elf_refs[_ri].name,
+                if(st->elf_refs[_ri].word_idx >= 0){
+                    _valid[_nvalid] = (ElfRef){st->elf_refs[_ri].name,
                                               st->elf_refs[_ri].val,
-                                              st->elf_refs[_ri].word_idx};
+                                              st->elf_refs[_ri].word_idx,
+                                              _nvalid};
+                    _nvalid++;
+                }
             }
             qsort(_valid, (size_t)_nvalid, sizeof(ElfRef), elf_ref_cmp);
 
+            /* 破綻点修正1: 重複排除が「直前に残した要素」としか比較していなかった
+             * ため、同じ (ラベル, ワード番号) の組が離れて並ぶと重複が残っていた
+             * （axx.py は集合で全体を見る）。同一ワード内を総当たりで見る。
+             * 破綻点修正2: 「同じワード位置に別々のラベルの参照がある」曖昧な場合を
+             * 落とす処理が無かった（axx.py の _ambiguous）。どちらのラベルに対する
+             * リロケーションなのか決められないので、そのワードは丸ごと除外する。 */
             {
                 int _w2 = 0;
                 for(int _r2 = 0; _r2 < _nvalid; _r2++){
-                    if(_w2 > 0
-                       && _valid[_r2].word_idx == _valid[_w2-1].word_idx
-                       && strcmp(_valid[_r2].name, _valid[_w2-1].name) == 0)
-                        continue;
+                    int _dup = 0;
+                    for(int _k = 0; _k < _w2; _k++){
+                        if(_valid[_k].word_idx == _valid[_r2].word_idx
+                           && strcmp(_valid[_k].name, _valid[_r2].name) == 0){ _dup = 1; break; }
+                    }
+                    if(_dup) continue;
+                    if(_w2 != _r2) _valid[_w2] = _valid[_r2];
+                    _w2++;
+                }
+                _nvalid = _w2;
+            }
+            {
+                int _w2 = 0;
+                for(int _r2 = 0; _r2 < _nvalid; _r2++){
+                    int _ambig = 0;
+                    for(int _k = 0; _k < _nvalid; _k++){
+                        if(_k != _r2
+                           && _valid[_k].word_idx == _valid[_r2].word_idx
+                           && strcmp(_valid[_k].name, _valid[_r2].name) != 0){ _ambig = 1; break; }
+                    }
+                    if(_ambig) continue;
                     if(_w2 != _r2) _valid[_w2] = _valid[_r2];
                     _w2++;
                 }
@@ -5720,16 +6469,20 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                                                    (cur_pc + (uint64_t)_widx - sec_entry_pc_cur))
                                                   * (uint64_t)bpw);
                     int _bts = st->bts;
-                    uint64_t _wmask = (_bts < 64)
-                        ? (((uint64_t)1 << _bts) - 1)
-                        : (uint64_t)-1;
+                    uint64_t _wmask = axx_word_mask(_bts);
                     uint64_t _raw_val = 0;
                     if(!st->endian_big){
                         for(int _k = 0; _k < _nwords; _k++){
                             int _wk = _widx + _k;
                             if(_wk < objl.len){
                                 uint64_t _wv = u256_to_u64(objl.data[_wk]) & _wmask;
-                                _raw_val |= _wv << (_bts * _k);
+                                /* 破綻点修正: bts*_k が64以上になりうる(例: 32bit幅
+                                 * ワードが3つ以上連なるリロケーション)場合、uint64_t
+                                 * を64以上シフトするのは未定義動作になるため避ける。
+                                 * 64bitの蓄積先に収まらない上位語は元々表現できない
+                                 * ので寄与を0とする。 */
+                                int _sh = _bts * _k;
+                                if(_sh < 64) _raw_val |= _wv << _sh;
                             }
                         }
                     } else {
@@ -5737,7 +6490,8 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                             int _wk = _widx + _k;
                             if(_wk < objl.len){
                                 uint64_t _wv = u256_to_u64(objl.data[_wk]) & _wmask;
-                                _raw_val = (_raw_val << _bts) | _wv;
+                                if(_bts < 64) _raw_val = (_raw_val << _bts) | _wv;
+                                else _raw_val = _wv;
                             }
                         }
                     }
@@ -5834,17 +6588,31 @@ static int lineassemble(Assembler *asmb, const char *line_in){
 
 static int lineassemble0(Assembler *asmb, const char *line){
     AsmState *st=&asmb->st;
-    strncpy(st->cl,line,sizeof(st->cl)-1);
-    int l=(int)strlen(st->cl);
-    while(l>0&&(st->cl[l-1]=='\n'||st->cl[l-1]=='\r')) st->cl[--l]=0;
+
+    /* 破綻点修正: 改行を落とした行を st->cl（表示用の cl[4096]）に strncpy して
+     * から、その「切り詰められた写し」を lineassemble() に渡していた。
+     * 4095 文字を超える行は診断もなく途中で切れ、例えば 5000 文字の
+     * `.ascii "…"` が 4086 バイトしか出ないという形で axx.py と食い違っていた。
+     * 組み立てには元の行をそのまま渡し、st->cl はあくまで表示用の写しに留める。 */
+    size_t n = strlen(line);
+    char *cleaned = malloc(n + 1);
+    if(!cleaned){ perror("malloc"); exit(1); }
+    size_t w = 0;
+    for(size_t i = 0; i < n; i++)
+        if(line[i] != '\n' && line[i] != '\r') cleaned[w++] = line[i];
+    cleaned[w] = '\0';
+
+    strncpy(st->cl, cleaned, sizeof(st->cl)-1);
+    st->cl[sizeof(st->cl)-1] = '\0';
 
     int show = (st->pas==0) || ((st->pas==2) && st->verbose);
     if(show){
         printf("%016llx %s %d %s ",(unsigned long long)u256_to_u64(st->pc),
-               st->current_file, st->ln, st->cl);
+               st->current_file, st->ln, cleaned);
     }
-    int f=lineassemble(asmb,st->cl);
+    int f=lineassemble(asmb,cleaned);
     if(show) printf("\n");
+    free(cleaned);
     st->ln++;
     return f;
 }
@@ -5856,7 +6624,7 @@ static char *file_input_from_stdin(void){
     char line[4096];
     while(fgets(line,sizeof(line),stdin)){
         size_t l=strlen(line);
-        for(size_t i=0;i<l;i++) if(line[i]=='\r'){ memmove(line+i,line+i+1,l-i); l--; }
+        for(size_t i=0;i<l;i++) if(line[i]=='\r'){ memmove(line+i,line+i+1,l-i); l--; i--; }
         while(total+l+1>cap){
             cap*=2;
             char *tmp=realloc(buf,cap);
@@ -5919,7 +6687,7 @@ static uint8_t *weo_extract(AsmState*st,int bpw,uint64_t w0,uint64_t wn){
     uint8_t *d=calloc(1,(size_t)nb); if(!d){perror("calloc");exit(1);}
     uint64_t pad=u256_to_u64(st->padding);
     if(pad){
-        uint64_t mask=(st->bts<64)?((uint64_t)1<<st->bts)-1:(uint64_t)-1; pad&=mask;
+        pad &= axx_word_mask(st->bts);
         for(uint64_t wp=0;wp<wn;wp++){
             uint64_t base=wp*(uint64_t)bpw,tmp=pad;
             if(!st->endian_big){for(int j=0;j<bpw;j++){d[base+j]=(uint8_t)(tmp&0xff);tmp>>=8;}}
@@ -5938,9 +6706,23 @@ static uint8_t *weo_extract(AsmState*st,int bpw,uint64_t w0,uint64_t wn){
 
 static uint8_t *weo_extract_ranges(AsmState*st, int bpw, const char*name, uint64_t *out_nb){
     uint64_t total_words = 0;
+    int have_range = 0;
     for(int i=0;i<st->section_ranges.len;i++)
-        if(strcmp(st->section_ranges.data[i].name,name)==0)
+        if(strcmp(st->section_ranges.data[i].name,name)==0){
+            have_range = 1;
             total_words += u256_to_u64(st->section_ranges.data[i].len);
+        }
+    /* 破綻点修正: 断片が1つも記録されていないセクションで中身が空になっていた。
+     * axx.py の _section_word_ranges() と同じく sections 表を代わりに使う。 */
+    if(!have_range){
+        SecEntry *fe = secmap_find(&st->sections, name);
+        if(fe && !u256_is_zero(fe->size)){
+            uint64_t nb0 = u256_to_u64(fe->size)*(uint64_t)bpw;
+            *out_nb = nb0;
+            if(!nb0) return calloc(1,1);
+            return weo_extract(st, bpw, u256_to_u64(fe->start), u256_to_u64(fe->size));
+        }
+    }
     uint64_t nb = total_words*(uint64_t)bpw;
     if(!nb){ *out_nb=0; return calloc(1,1); }
     uint8_t *d = malloc((size_t)nb);
@@ -5959,28 +6741,28 @@ static uint8_t *weo_extract_ranges(AsmState*st, int bpw, const char*name, uint64
     return d;
 }
 
-static WSR weo_shndx(WCS*csecs,int ncs,uint64_t ba,const char*sec_name,
-                      SecRangeVec*ranges,int bpw){
+static WSR weo_shndx(AsmState*st,WCS*csecs,int ncs,uint64_t ba,const char*sec_name,
+                      int bpw){
     uint64_t word_pc = bpw ? ba/(uint64_t)bpw : 0;
     if(sec_name){
         for(int i=0;i<ncs;i++){
             if(strcmp(csecs[i].name,sec_name)==0){
-                int64_t woff = addr_to_word_offset(ranges, sec_name, word_pc);
+                int64_t woff = sec_word_offset(st, sec_name, word_pc);
                 if(woff >= 0) return (WSR){(uint16_t)(i+1), (uint64_t)woff*(uint64_t)bpw};
             }
         }
     }
     for(int i=0;i<ncs;i++){
-        int64_t woff = addr_to_word_offset(ranges, csecs[i].name, word_pc);
+        int64_t woff = sec_word_offset(st, csecs[i].name, word_pc);
         if(woff >= 0) return (WSR){(uint16_t)(i+1), (uint64_t)woff*(uint64_t)bpw};
     }
     if(ncs>0){
-        int best_i=0; uint64_t best_start=csecs[0].bs;
+        int best_i=0; uint64_t best_start=0; int found=0;
         for(int i=0;i<ncs;i++){
-            if(csecs[i].bs<=ba && csecs[i].bs>=best_start){ best_i=i; best_start=csecs[i].bs; }
+            if(csecs[i].bs<=ba && (!found || csecs[i].bs>=best_start)){ best_i=i; best_start=csecs[i].bs; found=1; }
         }
         uint64_t sv = ba - csecs[best_i].bs;
-        if(ba < csecs[best_i].bs) sv = 0;
+        if(!found || ba < csecs[best_i].bs) sv = 0;
         return (WSR){(uint16_t)(best_i+1), sv};
     }
     return (WSR){0xfff1,ba};
@@ -6234,7 +7016,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         int _equ_has_reloc = larr[i].is_equ && (larr[i].reloc_type_override >= 0);
         WSR sr = (larr[i].is_equ && !_equ_has_reloc)
                  ? (WSR){0xfff1, larr[i].val}
-                 : weo_shndx(csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section,&st->section_ranges,bpw);
+                 : weo_shndx(st,csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section,bpw);
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
         snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
         weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,0x00,0,sr.shndx,sr.sv,0);
@@ -6251,7 +7033,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         int _equ_has_reloc = earr[i].is_equ && (earr[i].reloc_type_override >= 0);
         WSR sr = (earr[i].is_equ && !_equ_has_reloc)
                  ? (WSR){0xfff1, earr[i].val}
-                 : weo_shndx(csecs,ncs,earr[i].val*(uint64_t)bpw,earr[i].section,&st->section_ranges,bpw);
+                 : weo_shndx(st,csecs,ncs,earr[i].val*(uint64_t)bpw,earr[i].section,bpw);
         uint32_t noff=wbb_str(&strtab_bb,earr[i].name);
         snimap[snimap_len++]=(WSNI){earr[i].name,nsyms};
         weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,0x10,0,sr.shndx,sr.sv,0);
@@ -6324,7 +7106,11 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
 
         char cwd[1024]; if(!getcwd(cwd,sizeof(cwd))) strcpy(cwd,".");
         const char *cu_name = st->line_map[0].file[0]?st->line_map[0].file:"(source)";
-        const char *producer = "axx general assembler (C, DWARF4)";
+        /* 破綻点修正: axx.py は "(DWARF4)" なので、-g を付けると DW_AT_producer
+          * の長さが違い、.debug_info（と先頭の unit_length）がずれて、両実装の
+          * .o が同一バイト列にならなかった。DW_AT_producer は「どのツールが
+          * 作ったか」を書く欄で、実装言語を区別する場所ではない。文言を揃える。 */
+        const char *producer = "axx general assembler (DWARF4)";
 
         DRV info_relas={0,0,0};
         RB die; rb_init(&die);
@@ -6339,7 +7125,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         rb_w4(&die,0,_is_le);
         for(int i=0;i<nl;i++){
             if(larr[i].is_equ || larr[i].is_imported) continue;
-            WSR sr = weo_shndx(csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section,&st->section_ranges,bpw);
+            WSR sr = weo_shndx(st,csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section,bpw);
             if(sr.shndx==0xfff1) continue;
             rb_uleb(&die,2);
             rb_cstr(&die,larr[i].name);
@@ -6523,8 +7309,16 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
                  (uint32_t)sym_shidx,(uint32_t)(dbg_base+1+dbg_rela[i].target),_dbg_word_align,(uint64_t)_reloc_entsz);
     }
     fclose(fp);
+    {
+    /* 破綻点修正: axx.py は ", N debug section(s)" と出すのに対し、ここだけ
+     * ", +DWARF debug" という別の文言だった。-g のときだけ両実装の stderr が
+     * 食い違い、出力比較による回帰検査をすり抜けていた。 */
+    char _dbg_msg[64];
+    if(n_dbg_prog) snprintf(_dbg_msg,sizeof(_dbg_msg),", %d debug section(s)",n_dbg_prog);
+    else           _dbg_msg[0]='\0';
     fprintf(stderr,"elf: wrote %s (%d section(s), %d %s section(s), %d symbol(s)%s)\n",
-            path,ncs,nrela,_is_rela_w?"rela":"rel",nsyms, n_dbg_prog?", +DWARF debug":"");
+            path,ncs,nrela,_is_rela_w?"rela":"rel",nsyms,_dbg_msg);
+    }
 
 weo_done:
     for(int i=0;i<ncs;i++) free(csecs[i].data);
@@ -6834,11 +7628,42 @@ static long long mv_need_int(MacroPP *mp, MVal v, const char *file, int line){
     }
     return v.i;
 }
-static long long m_cdiv(long long a, long long b){
-    long long q = (a < 0 ? -a : a) / (b < 0 ? -b : b);
-    return ((a >= 0) == (b >= 0)) ? q : -q;
+/* 破綻点修正: マクロ時の int64 演算は、MACRO.md が明言するとおり axx.py の
+ * 多倍長整数と違って 64bit で切り捨てる仕様である。しかし従来の実装は
+ * その切り捨てを素の `+`/`-`/`*`/単項 `-`/`<<` で行っており、これらは
+ * オペランドが INT64_MIN や桁あふれを起こす値のとき C の符号付き整数
+ * オーバーフロー（未定義動作）を踏む。UBSan はこれを多数検出する
+ * （`9223372036854775807+1`、`INT64_MIN` の単項 `-` や abs()、
+ * 負値の `<<` など）。未定義動作である以上、最適化次第で「64bit 切り捨て」
+ * にすらならない壊れ方をしうるので、意図した2の補数の折り返しを
+ * 符号なし演算で明示的に行い、結果だけ符号付きへ戻す。
+ * （符号なし→符号付きの変換は実装依存だが、実用上の全処理系で
+ * 2の補数として素通しされ、これは C 標準でも許容された実装依存動作であって
+ * 未定義動作ではない。） */
+static inline long long m_i64_neg(long long a){
+    return (long long)(0ULL - (unsigned long long)a);
 }
-static long long m_cmod(long long a, long long b){ return a - m_cdiv(a, b) * b; }
+static inline long long m_i64_abs(long long a){
+    return a < 0 ? m_i64_neg(a) : a;
+}
+static inline long long m_i64_add(long long a, long long b){
+    return (long long)((unsigned long long)a + (unsigned long long)b);
+}
+static inline long long m_i64_sub(long long a, long long b){
+    return (long long)((unsigned long long)a - (unsigned long long)b);
+}
+static inline long long m_i64_mul(long long a, long long b){
+    return (long long)((unsigned long long)a * (unsigned long long)b);
+}
+static inline long long m_i64_shl(long long a, int n){
+    return (long long)((unsigned long long)a << n);
+}
+
+static long long m_cdiv(long long a, long long b){
+    long long q = m_i64_abs(a) / m_i64_abs(b);
+    return ((a >= 0) == (b >= 0)) ? q : m_i64_neg(q);
+}
+static long long m_cmod(long long a, long long b){ return m_i64_sub(a, m_i64_mul(m_cdiv(a, b), b)); }
 
 
 static MScope *m_scope(MacroPP *mp){ return mp->scopes[mp->nscopes - 1]; }
@@ -6908,7 +7733,11 @@ static void m_declare(MacroPP *mp, const char *name){
 }
 
 static int m_is_defined(MacroPP *mp, const char *name){
-    if(m_func_find(mp, name)) return 1;
+    /* 破綻点修正: `!undef` はマクロを表から消さず defined=0 にするだけなのに、
+     * ここは存在するかどうかしか見ていなかった。そのため `!undef foo` のあとも
+     * `defined(foo)` が真を返し、axx.py（funcs から削除する）と食い違っていた。 */
+    MFunc *_f = m_func_find(mp, name);
+    if(_f && _f->defined) return 1;
     for(int i = mp->nscopes - 1; i >= 0; i--)
         if(m_scope_find(mp->scopes[i], name)) return 1;
     return 0;
@@ -6918,8 +7747,11 @@ static MVal m_lookup(MacroPP *mp, const char *name, const char *file, int line){
         MVal *p = m_scope_find(mp->scopes[i], name);
         if(p) return *p;
     }
-    if(m_func_find(mp, name))
-        m_fail(mp, file, line, "macro '%s' used as a variable (call it as '%s(...)')", name, name);
+    {
+        MFunc *_f = m_func_find(mp, name);
+        if(_f && _f->defined)
+            m_fail(mp, file, line, "macro '%s' used as a variable (call it as '%s(...)')", name, name);
+    }
     m_fail(mp, file, line, "undefined macro variable '%s'", name);
     return mv_int(0);
 }
@@ -7095,9 +7927,27 @@ static MVal mep_unary(MEP *p){
     mep_skip(p);
     if(p->s[p->i] == '!' && p->s[p->i+1] != '='){ p->i++; return mv_int(mv_truth(mep_unary(p)) ? 0 : 1); }
     if(p->s[p->i] == '~'){ p->i++; return mv_int(~mv_need_int(p->mp, mep_unary(p), p->file, p->line)); }
-    if(p->s[p->i] == '-'){ p->i++; return mv_int(-mv_need_int(p->mp, mep_unary(p), p->file, p->line)); }
+    if(p->s[p->i] == '-'){ p->i++; return mv_int(m_i64_neg(mv_need_int(p->mp, mep_unary(p), p->file, p->line))); }
     if(p->s[p->i] == '+'){ p->i++; return mep_unary(p); }
     return mep_primary(p);
+}
+
+/* 破綻点修正: `n * (long long)l` は n が大きいと符号付きオーバーフロー（UB）を
+ * 起こし、上限チェック自体をすり抜けてから marena_alloc() に渡っていた
+ * （ヒープバッファオーバーフロー。ASan で確認済み）。しかも文字列側が右辺に
+ * 来る形（!v.is_str && r.is_str）には上限チェックが一切無かった。
+ * 掛け算をせずに割り算で判定すれば、n・l がどちらも非負である前提のもとで
+ * オーバーフローなしに「n*l が上限を超えるか」を判定できる。 */
+static long long m_safe_repeat_len(MacroPP *mp, const char *file, int line,
+                                    const char *srcline, long long n, size_t l){
+    if(n < 0) n = 0;
+    const long long MAXLEN = 16*1024*1024;
+    if(n == 0 || l == 0) return 0;
+    if((unsigned long long)n > (unsigned long long)(MAXLEN) / l){
+        char sr[600]; m_pyrepr(srcline, sr, sizeof(sr));
+        m_fail(mp, file, line, "macro expression: string repetition too large in %s", sr);
+    }
+    return n * (long long)l;
 }
 
 static MVal mep_mul(MEP *p){
@@ -7111,26 +7961,24 @@ static MVal mep_mul(MEP *p){
             if(v.is_str && !r.is_str){
                 long long n = r.i < 0 ? 0 : r.i;
                 size_t l = strlen(v.s);
-                if(n * (long long)l > 16*1024*1024){
-                    char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
-                    m_fail(p->mp, p->file, p->line, "macro expression: string repetition too large in %s", sr);
-                }
-                char *b = marena_alloc(&p->mp->arena, (size_t)n * l + 1);
+                long long total = m_safe_repeat_len(p->mp, p->file, p->line, p->s, n, l);
+                char *b = marena_alloc(&p->mp->arena, (size_t)total + 1);
                 b[0] = '\0';
                 for(long long k = 0; k < n; k++) memcpy(b + (size_t)k*l, v.s, l);
-                b[(size_t)n*l] = '\0';
+                b[(size_t)total] = '\0';
                 v = mv_str(b);
             } else if(!v.is_str && r.is_str){
                 MVal t = v; v = r; r = t;
                 long long n = r.i < 0 ? 0 : r.i;
                 size_t l = strlen(v.s);
-                char *b = marena_alloc(&p->mp->arena, (size_t)n * l + 1);
+                long long total = m_safe_repeat_len(p->mp, p->file, p->line, p->s, n, l);
+                char *b = marena_alloc(&p->mp->arena, (size_t)total + 1);
                 for(long long k = 0; k < n; k++) memcpy(b + (size_t)k*l, v.s, l);
-                b[(size_t)n*l] = '\0';
+                b[(size_t)total] = '\0';
                 v = mv_str(b);
             } else {
-                v = mv_int(mv_need_int(p->mp, v, p->file, p->line) *
-                           mv_need_int(p->mp, r, p->file, p->line));
+                v = mv_int(m_i64_mul(mv_need_int(p->mp, v, p->file, p->line),
+                                      mv_need_int(p->mp, r, p->file, p->line)));
             }
         } else if(c == '/'){
             p->i++;
@@ -7166,11 +8014,11 @@ static MVal mep_add(MEP *p){
                 char *t = marena_alloc(&p->mp->arena, la + lb + 1);
                 memcpy(t, a, la); memcpy(t + la, b, lb + 1);
                 v = mv_str(t);
-            } else v = mv_int(v.i + r.i);
+            } else v = mv_int(m_i64_add(v.i, r.i));
         } else if(c == '-'){
             p->i++;
-            v = mv_int(mv_need_int(p->mp, v, p->file, p->line) -
-                       mv_need_int(p->mp, mep_mul(p), p->file, p->line));
+            v = mv_int(m_i64_sub(mv_need_int(p->mp, v, p->file, p->line),
+                       mv_need_int(p->mp, mep_mul(p), p->file, p->line)));
         } else return v;
     }
 }
@@ -7186,7 +8034,7 @@ static MVal mep_shift(MEP *p){
                 char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
                 m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range in %s", sr);
             }
-            v = mv_int(mv_need_int(p->mp, v, p->file, p->line) << n);
+            v = mv_int(m_i64_shl(mv_need_int(p->mp, v, p->file, p->line), (int)n));
         } else if(p->s[p->i] == '>' && p->s[p->i+1] == '>'){
             p->i += 2;
             long long n = mv_need_int(p->mp, mep_add(p), p->file, p->line);
@@ -7388,7 +8236,7 @@ static int m_builtin(MacroPP *mp, const char *name, MVal *a, int n,
     if(strcmp(name, "abs") == 0){
         m_bi_argc(mp, "abs", n, 1, 1, file, line);
         long long v = mv_need_int(mp, a[0], file, line);
-        *out = mv_int(v < 0 ? -v : v);
+        *out = mv_int(m_i64_abs(v));
         return 1;
     }
     if(strcmp(name, "min") == 0 || strcmp(name, "max") == 0){
@@ -7429,13 +8277,17 @@ static MVal m_invoke(MacroPP *mp, MFunc *f, MVal *args, int nargs,
     MScope *sc = calloc(1, sizeof(MScope));
     if(!sc){ perror("calloc"); exit(1); }
 
-    MVal bound[MACRO_MAX_ARGS];
-    for(int i = 0; i < f->nparams; i++)
-        bound[i] = (i < nargs) ? args[i] : m_eval(mp, f->defaults[i], file, line);
-
+    /* 破綻点修正: 引数のデフォルト式を新しいスコープを push する前に評価
+     * していたため、`!def f(a, b=a+1)` の b のデフォルトが呼び出し元の
+     * スコープの 'a' を参照してしまっていた(axx.py 側にも同じ破綻点があり
+     * 併せて修正済み)。先にスコープを push し、仮引数を確定させるたびに
+     * そのスコープへ書き込みながら進めることで、後続のデフォルト式から
+     * 前方の仮引数を正しく参照できるようにする。 */
     mp->scopes[mp->nscopes++] = sc;
-    for(int i = 0; i < f->nparams; i++)
-        m_scope_set(sc, f->params[i], bound[i]);
+    for(int i = 0; i < f->nparams; i++){
+        MVal v = (i < nargs) ? args[i] : m_eval(mp, f->defaults[i], file, line);
+        m_scope_set(sc, f->params[i], v);
+    }
     mp->uid++;
     m_scope_set(sc, marena_strdup(&mp->arena, "__id__"), mv_int(mp->uid));
     m_scope_set(sc, marena_strdup(&mp->arena, "__name__"),
@@ -7669,7 +8521,13 @@ static char *m_fmt_int(MacroPP *mp, long long iv, MFmt *f, int *err){
         char cfmt[16];
         snprintf(cfmt, sizeof(cfmt), "%%%s.%d%c", f->alt ? "#" : "", prec, conv);
         nd = snprintf(digits, sizeof(digits), cfmt, d);
-        if(type == '%'){ digits[nd++] = '%'; digits[nd] = '\0'; }
+        if(nd < 0) nd = 0;
+        if(nd >= (int)sizeof(digits)) nd = (int)sizeof(digits) - 1;
+        if(type == '%'){
+            if(nd > (int)sizeof(digits) - 2) nd = (int)sizeof(digits) - 2;
+            digits[nd++] = '%';
+            digits[nd] = '\0';
+        }
     } else {
         unsigned long long uv;
         if(iv < 0){ neg = 1; uv = (unsigned long long)(-(iv + 1)) + 1ULL; }
@@ -7802,7 +8660,7 @@ static char *m_interpolate(MacroPP *mp, const char *text, const char *file, int 
     int i = 0, len = (int)strlen(text);
     while(i < len){
         if(text[i] == '\\' && text[i+1] == '!' && text[i+2] == '{'){
-            if(n + 3 >= cap){ cap *= 2; out = realloc(out, cap); }
+            if(n + 3 >= cap){ cap *= 2; out = realloc(out, cap); if(!out){perror("realloc");exit(1);} }
             out[n++] = '!'; out[n++] = '{';
             i += 3; continue;
         }
@@ -7852,7 +8710,15 @@ static char *m_strip_comment(MacroPP *mp, const char *text){
         if(quote){
             if(c == '\\'){ i += 2; continue; }
             if(c == quote) quote = 0;
-        } else if(c == '"' || c == '\'') quote = c;
+        } else if(c == '"') quote = c;
+        else if(c == '\''){
+            /* 破綻点修正: `'` を無条件に引用符の開きとして扱っていた。しかし
+             * パターンファイルでは `'` は符号拡張演算子（`!x'8` 等）でもあり、
+             * 行に1個しか無いとそこから行末までが「引用符の中」になって
+             * 以降のブロックコメント開始記号が除去されず、マクロ層の行判定が狂っていた。
+             * 対になる `'` が同じ行にあるときだけ文字リテラルとみなす。 */
+            if(strchr(text + i + 1, '\'')) quote = c;
+        }
         else if(mp->pat_mode){
             if(c == '/' && text[i+1] == '*') break;
         }
@@ -8158,6 +9024,15 @@ static MNode *m_parse_simple(MacroPP *mp, const char *w, const char *rest,
 }
 
 static MBlock *m_parse_block(MacroPP *mp, MSrc *src, int *ip, int depth){
+    /* 破綻点修正: !if/!while/!def のブロック入れ子に上限が無く、深すぎる
+     * ネストでパース時のC再帰がスタックオーバーフローしうる。
+     * MACRO_MAX_DEPTH は呼び出し(実行)時の深さガードなので、
+     * パース時のブロック入れ子はここで別途止める。 */
+    if(depth > MACRO_MAX_DEPTH){
+        const char *f = (*ip < src->n) ? src->d[*ip].file : (src->n ? src->d[src->n-1].file : "?");
+        int l = (*ip < src->n) ? src->d[*ip].line : (src->n ? src->d[src->n-1].line : 0);
+        m_fail(mp, f, l, "macro block nesting deeper than %d", MACRO_MAX_DEPTH);
+    }
     MBlock *b = marena_alloc(&mp->arena, sizeof(MBlock));
     memset(b, 0, sizeof(*b));
     while(*ip < src->n){
@@ -8378,16 +9253,22 @@ static void m_read_lines(MacroPP *mp, FILE *f, const char *display, MSrc *out){
 }
 
 static void m_do_include(MacroPP *mp, const char *name, const char *file, int line){
-    char path[1024];
+    /* 破綻点修正: path は char[1024] の固定長だった。長いパスが黙って切り詰め
+     * られ、意図しないファイルを読むか「開けない」で止まっていた。必要量は
+     * name と file の長さで決まる。m_fail() は longjmp で抜けるので、解放を
+     * 気にしなくてよいマクロ用アリーナから取る（reset_pass でまとめて戻る）。 */
+    size_t psz = strlen(name) + (file ? strlen(file) : 0) + 4;
+    char *path = marena_alloc(&mp->arena, psz);
+    size_t dsz = (file ? strlen(file) : 0) + 4;
+    char *dir  = marena_alloc(&mp->arena, dsz);
     if(name[0] == '/'){
-        snprintf(path, sizeof(path), "%s", name);
+        snprintf(path, psz, "%s", name);
     } else {
-        char dir[1024];
-        axx_dir_of(file && file[0] ? file : ".", dir, sizeof(dir));
+        axx_dir_of(file && file[0] ? file : ".", dir, dsz);
         if(dir[0] == '.' && dir[1] == '\0')
-            snprintf(path, sizeof(path), "%s", name);
+            snprintf(path, psz, "%s", name);
         else
-            axx_resolve_path(dir, name, path, sizeof(path));
+            axx_resolve_path(dir, name, path, psz);
     }
     char real[PATH_MAX];
     if(!realpath(path, real)){ snprintf(real, sizeof(real), "%s", path); }
@@ -8551,6 +9432,7 @@ static void fileassemble(Assembler *asmb, const char *fn){
     sv_push(&st->fnstack, fn);
     is_push(&st->lnstack, st->ln);
     strncpy(st->current_file,fn,sizeof(st->current_file)-1);
+    st->current_file[sizeof(st->current_file)-1]='\0';
     st->ln=1;
 
     FILE *f=NULL;
@@ -8818,6 +9700,17 @@ int main(int argc, char *argv[]){
             }
             else if(i+1<argc && argv[i+1][0]!='-' && patternfile)
                 pat_macro_expand_dest=argv[++i];
+            else if(i+1<argc && argv[i+1][0]!='-'){
+                /* 破綻点修正: 位置引数が揃う前に `-p out.txt pat.axx` と
+                 * 書かれた場合、ここは -p を引数なしと解釈し、out.txt を
+                 * 位置引数（＝パターンファイル）へ流していた。どちらの意味かは
+                 * 原理的に決められないので、黙って一方に倒さず断る。 */
+                fprintf(stderr," error - '%s %s' is ambiguous here: '%s' could be "
+                        "%s's output file or a positional argument. Write "
+                        "'--macro-expand-pattern=%s', or put %s after the pattern file.\n",
+                        argv[i], argv[i+1], argv[i+1], argv[i], argv[i+1], argv[i]);
+                return 2;
+            }
             else
                 pat_macro_expand_dest="-";
         }
@@ -8834,6 +9727,14 @@ int main(int argc, char *argv[]){
             }
             else if(i+1<argc && argv[i+1][0]!='-' && patternfile && sourcefile)
                 macro_expand_dest=argv[++i];
+            else if(i+1<argc && argv[i+1][0]!='-'){
+                /* 曖昧な指定を黙って取り違えない。理由は -p 側のコメント参照。 */
+                fprintf(stderr," error - '%s %s' is ambiguous here: '%s' could be "
+                        "%s's output file or a positional argument. Write "
+                        "'--macro-expand=%s', or put %s after the pattern/source files.\n",
+                        argv[i], argv[i+1], argv[i+1], argv[i], argv[i+1], argv[i]);
+                return 2;
+            }
             else
                 macro_expand_dest="-";
         }
@@ -8864,17 +9765,6 @@ int main(int argc, char *argv[]){
 
     if(!patternfile){ print_usage(argv[0]); return 1; }
 
-    readpat(asmb,patternfile);
-    setpatsymbols(asmb);
-
-    if(st->impfile[0]){
-        FILE *lf=axx_open_input(st->impfile, "import file");
-        if(!lf){ exit_code=1; goto cleanup; }
-        { char *l=NULL; size_t lc=0; while(getline(&l,&lc,lf)!=-1) imp_label(asmb,l); free(l); fclose(lf); }
-    }
-
-    if(st->outfile[0]) remove(st->outfile);
-
     if(pat_macro_expand_dest){
         if(!patternfile){
             axx_diagf(0, 0, " error - -p/--macro-expand-pattern needs a pattern file.\n");
@@ -8890,6 +9780,7 @@ int main(int argc, char *argv[]){
         macro_reset_pass_pattern();
         int _pn=0;
         char **_pv=pat_macro_expand(pf, patternfile, &_pn);
+        fclose(pf);
         if(g_pat_macro.had_error || st->had_error){
             pat_macro_expand_free(_pv,_pn); exit_code=1; goto cleanup;
         }
@@ -8934,6 +9825,57 @@ int main(int argc, char *argv[]){
         goto cleanup;
     }
 
+    readpat(asmb,patternfile);
+    /* 破綻点修正: パターンファイルが読めなかった場合、readpat() はエラーを
+     * 報告して空のパターン表のまま戻るが、そのまま組み立てに進んでいたため、
+     * 全ソース行が「どのパターンにも一致しない」となり偽の "Syntax error" が
+     * 行数ぶん並んで真の原因が埋もれていた。
+     * （終了コードが 1 になっていたのはその偽エラーの副作用にすぎない。） */
+    if(st->had_error){
+        fprintf(stderr," error - one or more errors were reported during assembly; "
+                       "output would be incomplete or wrong.\n");
+        fprintf(stderr,"         Aborting: no output file written.\n");
+        exit_code=1; goto cleanup;
+    }
+    setpatsymbols(asmb);
+    /* 破綻点修正: パターンファイル側のディレクティブ評価（.setsym / .bits 等）で
+     * 出たエラーを誰も拾っていなかったため、" error - ..." を表示しながら
+     * 終了コード 0 で「出力ファイルだけ作られない」無言の失敗になっていた。 */
+    if(st->had_error){
+        fprintf(stderr," error - one or more errors were reported while reading the "
+                       "pattern file; output would be incomplete or wrong.\n");
+        fprintf(stderr,"         Aborting: no output file written.\n");
+        exit_code=1; goto cleanup;
+    }
+
+    if(st->impfile[0]){
+        FILE *lf=axx_open_input(st->impfile, "import file");
+        if(!lf){ exit_code=1; goto cleanup; }
+        /* 破綻点修正: 1回の走査で処理していたため、ラベル行がセクション行より
+         * 前に置かれた TSV では、そのラベルの所属セクションを決めるための
+         * 範囲情報がまだ登録されておらず、常に .text 扱いになっていた。
+         * axx.py と同じく「3欄以上（セクション範囲）を先に全部」→
+         * 「2欄（ラベル）をあとで全部」の2パスで読む。 */
+        StrVec _implines; sv_init(&_implines);
+        { char *l=NULL; size_t lc=0;
+          while(getline(&l,&lc,lf)!=-1) sv_push(&_implines, l);
+          free(l); }
+        fclose(lf);
+        for(int _phase=0; _phase<2; _phase++){
+            for(int _li=0; _li<_implines.len; _li++){
+                const char *_l = _implines.data[_li];
+                int _nf = 1;
+                for(const char *_q=_l; *_q; _q++)
+                    if(*_q=='\t') _nf++;
+                    else if(*_q=='\n'||*_q=='\r') break;
+                if(_phase==0 ? (_nf>=3) : (_nf==2))
+                    imp_label(asmb, _l);
+            }
+        }
+        sv_free(&_implines);
+    }
+
+    if(st->outfile[0]) remove(st->outfile);
     if(!sourcefile){
         st->pc=u256_zero(); st->pas=0; st->ln=1;
         strncpy(st->current_file,"(stdin)",sizeof(st->current_file)-1);
@@ -9100,8 +10042,15 @@ int main(int argc, char *argv[]){
             if(drift_count){
                 axx_diagf(0, 0, " error - address mismatch between pass1 and pass2 "
                            "(%d label(s)); output addresses are UNRELIABLE.\n", drift_count);
-                fprintf(stderr,"         This usually means pass1 relaxation did "
-                    "not fully converge for variable-length forward references.\n");
+                /* ラベル定義の誤りを既に報告している場合、ずれはその結果に
+                 * すぎない（パス1では定義を拒否し、パス2では通ってしまう）。
+                 * リラクゼーションの話を持ち出すと原因を見誤らせる。 */
+                if(st->reported_label_errors.len > 0)
+                    fprintf(stderr,"         This is a consequence of the label definition "
+                        "error(s) reported above; fix those first.\n");
+                else
+                    fprintf(stderr,"         This usually means pass1 relaxation did "
+                        "not fully converge for variable-length forward references.\n");
                 int shown = 0;
                 for(int bi=0; bi<st->labels.nbuckets && shown<10; bi++)
                     for(LabelEntry *e=st->labels.buckets[bi]; e && shown<10; e=e->next){
@@ -9194,13 +10143,13 @@ int main(int argc, char *argv[]){
                 LabelEntry*e=lmap_find(&st->export_labels, st->export_order.data[i]); \
                 { \
                     if(!e || e->is_undef) continue;  \
-                    unsigned long long lbl_addr; \
-                    if(e->is_equ){ \
-                        lbl_addr=(unsigned long long)u256_to_u64(e->value); \
-                    } else { \
-                        lbl_addr=(unsigned long long)u256_to_u64(e->value) \
-                                 *(unsigned long long)_bpw_export; \
-                    } \
+                    /* 破綻点修正: 64bit 符号なしに丸めて出していたため、負の .EQU が \
+                     * 0xffffffffffffffff になっていた（axx.py は -0x1）。 \
+                     * 256bit のまま計算し、符号付きの Python 表記で出す。 */ \
+                    uint256_t _lv = e->is_equ \
+                                  ? e->value \
+                                  : u256_mul_signed(e->value, u256_from_u64((uint64_t)_bpw_export)); \
+                    char _lbl_addr[96]; u256_to_pyhex(_lv, _lbl_addr, sizeof(_lbl_addr)); \
  \
                     char _rtype_sfx[80]=""; \
                     if(elf_){ \
@@ -9211,7 +10160,7 @@ int main(int argc, char *argv[]){
                             if(_nm) snprintf(_rtype_sfx,sizeof(_rtype_sfx),"::%s",_nm); \
                         } \
                     } \
-                    fprintf(lf,"%s%s\t0x%llx\n",e->key,_rtype_sfx,lbl_addr); \
+                    fprintf(lf,"%s%s\t%s\n",e->key,_rtype_sfx,_lbl_addr); \
                 } \
             } \
             fclose(lf); \
