@@ -1,4 +1,4 @@
-; ============================================================
+;
 ;  4004.s -- 4004.axx demo. The Intel 4004 (1971) was the first
 ;  commercial microprocessor, designed for the Busicom 141-PF
 ;  calculator; this program leans into that heritage with a
