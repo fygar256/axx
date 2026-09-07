@@ -800,7 +800,7 @@ typedef struct {
     char impfile[512];       /* -i ラベル TSV の取り込み */
     uint256_t pc_overflow_max;  /* pc が 64bit を超えた場合の記録（警告用） */
     int       pc_overflow_set;
-    int  osabi;              /* ELF ヘッダの OSABI（9=FreeBSD） */
+    int  osabi;              /* ELF ヘッダの OSABI（0=Linux, 9=FreeBSD） */
 
     /* --- 位置カウンタ --- */
     uint256_t pc;            /* 現在のプログラムカウンタ（ワード単位） */
@@ -975,9 +975,15 @@ static void diag_pending_push(AsmState *st, const char *text, int set_error){
     if(st->diag_pending_len >= st->diag_pending_cap){
         int nc = st->diag_pending_cap ? st->diag_pending_cap*2 : 8;
         char **nt = realloc(st->diag_pending, (size_t)nc*sizeof(char*));
-        int   *ns = realloc(st->diag_pending_seterr, (size_t)nc*sizeof(int));
-        if(!nt || !ns){ free(nt); free(ns); return; }
-        st->diag_pending = nt; st->diag_pending_seterr = ns;
+        /* 破綻点修正: nt と ns を別々に realloc していたため、nt は成功したが
+         * ns は失敗した場合、両方を free して抜けていた。しかし realloc が
+         * 成功した時点で古いブロックは既に解放/移動済みなので、そこで
+         * st->diag_pending を更新しないまま抜けるとダングリングポインタが
+         * 残る。成功した側だけでも必ず反映してから抜ける。 */
+        if(nt) st->diag_pending = nt;
+        int *ns = realloc(st->diag_pending_seterr, (size_t)nc*sizeof(int));
+        if(ns) st->diag_pending_seterr = ns;
+        if(!nt || !ns) return;
         st->diag_pending_cap = nc;
     }
     char *cp = strdup(text);
@@ -1365,7 +1371,7 @@ static void state_init(AsmState *st) {
     st->endian_big = 0;
     st->pas = 0;
     st->debug = 0;
-    st->osabi = 9;
+    st->osabi = 0;
     st->ln = 0;
     sv_init(&st->fnstack);
     is_init(&st->lnstack);
@@ -3041,8 +3047,9 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
     }
     else if(axx_q(s,slen,"#",idx)){
         idx++;
-        char t[512];
-        idx=axx_get_symbol_word(s,idx,st->swordchars,t,sizeof(t));
+        char tbuf[512]; size_t tsz;
+        char *t = axx_word_buf(s, idx, tbuf, sizeof(tbuf), &tsz);
+        idx=axx_get_symbol_word(s,idx,st->swordchars,t,tsz);
         uint256_t sv;
         if(symbol_get(st,t,&sv)) x=sv;
         else {
@@ -3051,6 +3058,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             }
             x=u256_zero();
         }
+        if(t!=tbuf) free(t);
         if(asmb->st.exp_typ_float)
             x=double_to_u256((double)(int64_t)u256_to_u64(x));
     }
@@ -4074,9 +4082,14 @@ static int dir_error(Assembler *asmb, const char *s){
     for(const char*p=s;*p;p++) if(*p!=' '){has_content=1;break;}
     if(!has_content) return 0;
 
-    char buf[4096];
+    /* 破綻点修正: 固定長 char buf[4096] へ無言で切り詰めていたため、
+     * condition;errorcode の対応リストが4096バイトを超えるパターンファイルでは
+     * 条件とエラーコードの対応がずれ得た。他の箇所と同じく、収まらないときだけ
+     * ヒープへ逃がす。 */
+    char stackbuf[4096];
     size_t l=strlen(s);
-    if(l>=sizeof(buf)) l=sizeof(buf)-1;
+    char *buf = (l < sizeof(stackbuf)) ? stackbuf : malloc(l+1);
+    if(!buf){ perror("malloc"); exit(1); }
     memcpy(buf,s,l); buf[l]='\0';
 
     int idx=0;
@@ -4102,6 +4115,7 @@ static int dir_error(Assembler *asmb, const char *s){
             st->had_error=1;
         }
     }
+    if(buf!=stackbuf) free(buf);
     return triggered;
 }
 
@@ -4742,7 +4756,15 @@ static int replace_percent_with_index(const char *s, char *out, size_t osz){
  * 例: `0xe8,@@[4,*(e-$.,%%)]` は 4 バイトのリトルエンディアン展開になる。
  * is_empty には「展開の結果ワードが1つも無い」ことを返す（`;` 条件付き出力で
  * 何も出さない命令を、長さ0として扱うため）。 */
-static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assembler *asmb){
+static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assembler *asmb, int ep_depth){
+    enum { MAX_EP_DEPTH = 200 };
+    if(ep_depth > MAX_EP_DEPTH){
+        if(should_report_errors(&asmb->st)){
+            axx_diagf(1, 0, " error - @@[...]: nesting exceeds maximum depth %d.\n", MAX_EP_DEPTH);
+        }
+        out[0]=0; *is_empty=1;
+        return;
+    }
     size_t n=0; int has_content=0;
     int i=0; int plen=(int)strlen(pattern);
     while(i<plen&&n<osz-1){
@@ -4801,7 +4823,7 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
                     char *exp_rep = malloc(osz);
                     if(!exp_rep){ perror("malloc"); exit(1); }
                     int rep_empty=0;
-                    e_p(rep_pat, exp_rep, osz, &rep_empty, asmb);
+                    e_p(rep_pat, exp_rep, osz, &rep_empty, asmb, ep_depth+1);
                     for(int j=0;j<nrep;j++){
                         if(j>0&&n<osz-1) out[n++]=',';
                         for(const char*p=exp_rep;*p&&n<osz-1;) out[n++]=*p++;
@@ -4837,7 +4859,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         ep_buf = realloc(ep_buf, ep_cap);
         if(!ep_buf){ perror("realloc"); exit(1); }
         memset(ep_buf, 0, ep_cap);
-        e_p(s_in, ep_buf, ep_cap, &is_empty, asmb);
+        e_p(s_in, ep_buf, ep_cap, &is_empty, asmb, 0);
         size_t used = strlen(ep_buf);
         if(used < ep_cap - 16) break;
         ep_cap *= 2;
@@ -9645,7 +9667,11 @@ int main(int argc, char *argv[]){
     macro_init_pattern(asmb);
 
     const char *patternfile=NULL, *sourcefile=NULL;
-    char osabistr[16]="FreeBSD";
+    /* 破綻点修正: 既定値が FreeBSD(9) 固定だったため、--osabi を指定しない
+     * 通常の使い方では、標準的な Linux 環境の ld が OSABI ミスマッチで
+     * 生成された .o を拒否し得た（axxelfbug 参照）。axx.py と同じく既定値を
+     * Linux(0) に変更する。 */
+    char osabistr[16]="Linux";
     const char *macro_expand_dest=NULL;
     const char *pat_macro_expand_dest=NULL;
 
@@ -9757,9 +9783,9 @@ int main(int argc, char *argv[]){
     int osa = find_osabi(osabistr);
     if (osa==-1) {
         fprintf(stderr, "warning: unknown --osabi value '%s'; "
-                "valid choices are Linux/linux/FreeBSD/freebsd. Using 'FreeBSD'.\n",
+                "valid choices are Linux/linux/FreeBSD/freebsd. Using 'Linux'.\n",
                 osabistr);
-        osa = find_osabi("FreeBSD");
+        osa = find_osabi("Linux");
     }
     st->osabi = osa;
 
@@ -9875,7 +9901,11 @@ int main(int argc, char *argv[]){
         sv_free(&_implines);
     }
 
-    if(st->outfile[0]) remove(st->outfile);
+    /* 破綻点修正: ここで既存の -b 出力を先に消すと、この後リラクゼーションが
+     * 振動/非収束で失敗して "no output file written" と表示した場合でも、
+     * 実際には直前の正常なビルド成果物が既に失われてしまう。binary_flush()
+     * の fopen(..,"wb") が成功時に上書き・切り詰めを行うので、ここでの
+     * 事前削除は不要かつ有害。 */
     if(!sourcefile){
         st->pc=u256_zero(); st->pas=0; st->ln=1;
         strncpy(st->current_file,"(stdin)",sizeof(st->current_file)-1);

@@ -433,7 +433,7 @@ class ElfState:
     """ELF オブジェクト出力（-o）に関わる設定と、パス2で集める情報。"""
 
     def __init__(self):
-        self.osabi: int = 9        # ELF ヘッダの OSABI（9=FreeBSD）
+        self.osabi: int = 0        # ELF ヘッダの OSABI（0=Linux, 9=FreeBSD）
         self.objfile: str = ""     # -o の出力先。空なら ELF 出力しない
         self.machine: int = 62     # e_machine（62=x86-64）。ELF_MACHINES のキー
         self.elf_class: int = 2    # 1=ELF32 / 2=ELF64
@@ -1327,21 +1327,36 @@ class IEEE754Converter:
 
             two = Decimal(2)
 
-            scaled = int(d * (two ** SIGNIFICAND_BITS))
-            if scaled == 0:
-                exp_unbiased = -(BIAS - 1)
-            else:
-                exp_unbiased = scaled.bit_length() - 1 - SIGNIFICAND_BITS
+            # 破綻点修正: 従来は scaled = int(d * 2**112) で2進指数を求めていたが、
+            # d の指数が巨大な場合（qad{1e500000} や qad{1e-500000} 等）、
+            # Decimal→巨大整数の変換や以降の1ビットずつの正規化ループが指数の
+            # 桁数にほぼ比例して重くなり、事実上ハングしていた。
+            # d.adjusted()（10進の桁指数。内部タプルの参照だけで求まり O(1)）を
+            # 2進指数へ換算した近似値から出発すれば、以降の補正ループは
+            # 桁数によらず数回で 1<=normalized<2 に収束する。
+            exp_unbiased = int(d.adjusted() * math.log2(10))
 
             scale = two ** exp_unbiased
             normalized = d / scale
 
+            _NORM_MAX_ITERS = 1000
+            _norm_iters = 0
             while normalized >= 2:
                 exp_unbiased += 1
                 normalized /= 2
+                _norm_iters += 1
+                if _norm_iters > _NORM_MAX_ITERS:
+                    raise ValueError(
+                        "decimal_to_ieee754_128bit_hex: failed to normalize "
+                        f"{d!r} (exponent estimate did not converge)")
             while normalized < 1:
                 exp_unbiased -= 1
                 normalized *= 2
+                _norm_iters += 1
+                if _norm_iters > _NORM_MAX_ITERS:
+                    raise ValueError(
+                        "decimal_to_ieee754_128bit_hex: failed to normalize "
+                        f"{d!r} (exponent estimate did not converge)")
 
             biased_exp = exp_unbiased + BIAS
 
@@ -6856,6 +6871,9 @@ class Assembler:
             _si += 1
 
         for name, *_eentry in sorted(self.state.export_labels.items()):
+            val = _eentry[0][0]
+            if _is_undef_derived(val):
+                continue
             sym_name_to_idx[name] = _si
             _si += 1
 
@@ -7047,8 +7065,12 @@ class Assembler:
         ap.add_argument('sourcefile', nargs='?', default=None,
                         help='Assembly source file (.s). Omit for interactive mode.')
 
-        ap.add_argument('--osabi', dest='elf_osabi', type=str, default='FreeBSD',
-                        help='ELF OSABI value (default: FreeBSD; FreeBSD/Linux, case-insensitive)')
+        # 破綻点修正: 既定値が FreeBSD(9) 固定だったため、--osabi を指定しない
+        # 通常の使い方では、標準的な Linux 環境の ld が OSABI ミスマッチで
+        # 生成された .o を拒否し得た（axxelfbug 参照）。既定値を、実行環境として
+        # 最も一般的な Linux(0) に変更する。
+        ap.add_argument('--osabi', dest='elf_osabi', type=str, default='Linux',
+                        help='ELF OSABI value (default: Linux; FreeBSD/Linux, case-insensitive)')
         ap.add_argument('-b', dest='outfile', default='',
                         metavar='OUTFILE',
                         help='Output binary file')
@@ -7249,9 +7271,9 @@ class Assembler:
         _osabi_key = args.elf_osabi.lower()
         if _osabi_key not in osabitbl:
             print(f"warning: unknown --osabi value '{args.elf_osabi}'; "
-                  f"valid choices are {list(osabitbl.keys())} (case-insensitive). Using 'FreeBSD'.",
+                  f"valid choices are {list(osabitbl.keys())} (case-insensitive). Using 'Linux'.",
                   file=sys.stderr)
-        self.state.osabi        = osabitbl.get(_osabi_key, 9)
+        self.state.osabi        = osabitbl.get(_osabi_key, 0)
         self.state.verbose      = args.verbose
         self.state.debug        = args.debug
         self.state.gen_debug    = args.gen_debug
@@ -7312,11 +7334,10 @@ class Assembler:
                     if len(fields) == 2:
                         self.imp_label(l)
 
-            if self.state.outfile:
-                try:
-                    os.remove(self.state.outfile)
-                except OSError:
-                    pass
+            # 破綻点修正: ここで既存の -b 出力を先に消すと、この後リラクゼーションが
+            # 失敗して "no output written" と表示した場合でも、実際には直前の
+            # 正常なビルド成果物が既に失われてしまう。書き込み側 (open(..,'wb'))
+            # が成功時に上書き・切り詰めを行うので、ここでの事前削除は不要かつ有害。
 
             if args.sourcefile is None:
                 self.state.pc = 0
