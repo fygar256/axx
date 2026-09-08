@@ -7443,6 +7443,7 @@ struct MacroPP {
 
     MLineVec  *out;
     int        depth;
+    int        expr_depth;
     long long  uid;
     long       nemitted;
 
@@ -7541,6 +7542,7 @@ static void macro_reset_pass(MacroPP *mp){
     mp->declared = NULL; mp->ndecl = mp->cdecl = 0;
     mp->out = NULL;
     mp->depth = 0;
+    mp->expr_depth = 0;
     mp->uid = 0;
     mp->nemitted = 0;
     mp->ninc = 0;
@@ -7891,9 +7893,20 @@ static MVal mep_primary(MEP *p){
     }
 
     if(c == '('){
+        /* 破綻点修正: mep_primary〜mep_ternary の相互再帰に上限が無く、
+         * `(` の深いネスト（!set/!if/!while の式に現れうる）でCスタックを
+         * 使い果たしてクラッシュしうた（expr_factor 側の EXPR_MAX_DEPTH と
+         * 同種の問題）。axx.py は RecursionError で安全に止まるのに対し、
+         * こちらは無防備だったので、同じ上限で止める。 */
+        if(p->mp->expr_depth >= EXPR_MAX_DEPTH){
+            char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+            m_fail(p->mp, p->file, p->line, "macro expression: nesting too deep in %s", sr);
+        }
+        p->mp->expr_depth++;
         p->i++;
         MVal v = mep_ternary(p);
         mep_expect(p, ")");
+        p->mp->expr_depth--;
         return v;
     }
     if(c == '"'){
@@ -8175,6 +8188,10 @@ static MVal mep_ternary(MEP *p){
 static MVal m_eval(MacroPP *mp, const char *text, const char *file, int line){
     while(*text == ' ' || *text == '\t') text++;
     if(!*text) m_fail(mp, file, line, "empty macro expression");
+    /* 破綻点修正: m_fail は longjmp で抜けるため、エラーで打ち切られた前回の
+     * 評価が mep_primary の '(' で加算した expr_depth を減算し損ねたまま
+     * 残ることがある。各トップレベル評価の開始時に必ず 0 へ戻す。 */
+    mp->expr_depth = 0;
     const char *saved_cur_expr = mp->cur_expr;
     mp->cur_expr = text;
     MEP p; p.s = text; p.i = 0; p.mp = mp; p.file = file; p.line = line;
