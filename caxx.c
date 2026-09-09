@@ -792,6 +792,62 @@ static const char *ERRORS_TABLE[] = {
  * 式評価・パターン照合・ディレクティブ処理・出力生成の各関数は自前の状態を
  * 持たず、全てこの構造体を共有して読み書きする（axx.py の AssemblerState に対応）。
  * ========================================================= */
+/* マクロ層の $/$$ 用。「あるファイルの展開後 N 行目が、直前の反復でどの
+ * アドレスに置かれたか」を覚えておくための表。ファイル1つぶんが
+ * MacroLinePcs、それをファイル名で引くのが MacroLinePcsVec。 */
+typedef struct { char *file; long long *pcs; int len, cap; } MacroLinePcs;
+typedef struct { MacroLinePcs *d; int len, cap; } MacroLinePcsVec;
+
+static void mlp_vec_free(MacroLinePcsVec *v){
+    for(int i=0;i<v->len;i++){ free(v->d[i].file); free(v->d[i].pcs); }
+    free(v->d);
+    v->d=NULL; v->len=v->cap=0;
+}
+
+/* file 用の記録欄を新しく開く（同名が既にあれば作り直す）。戻り値は欄の
+ * 添字。ポインタを返さないのは、.INCLUDE で fileassemble が再帰すると
+ * この配列が realloc されて既存のポインタが無効になるため。欄は追加しか
+ * しないので、添字なら再帰をまたいでも有効なまま。 */
+static int mlp_begin(MacroLinePcsVec *v, const char *file){
+    for(int i=0;i<v->len;i++){
+        if(strcmp(v->d[i].file, file)==0){
+            free(v->d[i].pcs);
+            v->d[i].pcs=NULL; v->d[i].len=v->d[i].cap=0;
+            return i;
+        }
+    }
+    if(v->len >= v->cap){
+        v->cap = v->cap ? v->cap*2 : 8;
+        v->d = realloc(v->d, (size_t)v->cap * sizeof(v->d[0]));
+        if(!v->d){ perror("realloc"); exit(1); }
+    }
+    MacroLinePcs *e = &v->d[v->len++];
+    e->file = strdup(file ? file : "");
+    if(!e->file){ perror("strdup"); exit(1); }
+    e->pcs=NULL; e->len=e->cap=0;
+    return v->len - 1;
+}
+
+static void mlp_push(MacroLinePcsVec *v, int idx, long long pc){
+    if(idx < 0 || idx >= v->len) return;
+    MacroLinePcs *e = &v->d[idx];
+    if(e->len >= e->cap){
+        e->cap = e->cap ? e->cap*2 : 64;
+        e->pcs = realloc(e->pcs, (size_t)e->cap * sizeof(e->pcs[0]));
+        if(!e->pcs){ perror("realloc"); exit(1); }
+    }
+    e->pcs[e->len++] = pc;
+}
+
+/* 展開後 idx 行目のアドレス。記録が無ければ 0。 */
+static long long mlp_get(const MacroLinePcsVec *v, const char *file, int idx){
+    if(!file || idx < 0) return 0;
+    for(int i=0;i<v->len;i++)
+        if(strcmp(v->d[i].file, file)==0)
+            return (idx < v->d[i].len) ? v->d[i].pcs[idx] : 0;
+    return 0;
+}
+
 typedef struct {
     /* --- 出力先 --- */
     char outfile[512];       /* -b 生バイナリ */
@@ -938,6 +994,22 @@ typedef struct {
     LabelMap  *relax_prev;
 
     int        relax_optimistic;
+
+    /* --- マクロ層からラベル値・.equ・$/$$ を参照するためのスナップショット ---
+     * マクロ展開はアドレス確定より前に走るので「今の値」は原理的に無い。
+     * 前回リラクゼーション反復の値を使い、収束はリラクゼーションループ
+     * （反復上限・振動検出・未収束なら出力しない）に委ねる。
+     * macro_labels_valid==0 は「まだ一度も反復していない＝何も分からない」で、
+     * このとき未知の名前は 0・defined() は偽になる。
+     * relax_prev と別に持つのは、relax_prev がパス2の前に解放されるのに対し、
+     * こちらは収束後の展開をパス2でも再現するため生かしておく必要があるため。 */
+    LabelMap   macro_labels;
+    int        macro_labels_valid;
+
+    /* $/$$ 用。ラベルと違って位置で決まる値なので、展開後の行番号でしか
+     * 対応が取れない。macro_line_pcs が前回反復の記録、_cur が今回ぶん。 */
+    MacroLinePcsVec macro_line_pcs;
+    MacroLinePcsVec macro_line_pcs_cur;
 
     char      *pat_include_chain[64];
     int        pat_include_depth;
@@ -1354,6 +1426,7 @@ static void state_init(AsmState *st) {
     smap_init(&st->symbols);
     smap_init(&st->patsymbols);
     lmap_init(&st->export_labels);
+    lmap_init(&st->macro_labels);
     sv_init(&st->export_order);
     pv_init(&st->pat);
     st->vliwinstbits = 41;
@@ -7813,6 +7886,54 @@ static void m_declare(MacroPP *mp, const char *name){
     mp->declared[mp->ndecl++] = marena_strdup(&mp->arena, name);
 }
 
+/* アセンブラ側のラベル / .equ を引いた結果。 */
+typedef enum { MLBL_NO = 0, MLBL_UNKNOWN, MLBL_VALUE } MLabelStatus;
+
+/* アセンブラ側のラベル / .equ を引く。
+ *
+ * マクロ展開はアドレス確定より前に走るので「今の値」は存在しない。前回
+ * リラクゼーション反復のスナップショット(st->macro_labels)を見て、
+ *   MLBL_VALUE   … 前回反復で値が確定していた（*out に値）
+ *   MLBL_UNKNOWN … ラベルとしては在るが値が未確定（初回反復では全ての名前）
+ *   MLBL_NO      … そんなラベルは無い（＝綴り間違い）
+ * を返す。パターンファイル側のマクロ層はソースのアセンブル前に走るので、
+ * そこでは常に MLBL_NO。
+ *
+ * 値が確定しているかの判定に LabelEntry::is_undef を使わず値だけを見るのは、
+ * axx.py 側にこのフラグが無く、値で判定しているため。両実装でマクロ層から
+ * 見える世界を一致させる。 */
+static MLabelStatus m_asm_label(MacroPP *mp, const char *name, long long *out){
+    if(out) *out = 0;
+    if(mp->pat_mode || !mp->asmb) return MLBL_NO;
+    AsmState *st = &mp->asmb->st;
+    if(!st->macro_labels_valid){
+        /* まだ一度も反復していない。前方参照なのか綴り間違いなのかを区別
+         * できないので、エラーにせず未確定として扱う。綴り間違いは次の
+         * 反復で MLBL_NO として捕まる。 */
+        return MLBL_UNKNOWN;
+    }
+    LabelEntry *e = lmap_find(&st->macro_labels, name);
+    if(!e) return MLBL_NO;
+    if(u256_is_undef_derived(e->value)) return MLBL_UNKNOWN;
+    if(out) *out = (long long)u256_to_u64(e->value);
+    return MLBL_VALUE;
+}
+
+/* マクロ展開時の位置カウンタ（$ / $$）。ラベルと違って名前ではなく位置で
+ * 決まる値なので、前回反復で記録した「展開後 N 行目のアドレス」を返す。
+ * 初回反復や、展開行数が変わって対応する行がまだ無い場合は 0。 */
+static long long m_loc_counter(MacroPP *mp, const char *file, int line){
+    if(mp->pat_mode || !mp->asmb){
+        m_fail(mp, file, line,
+               "'$'/'$$' is not available in pattern-file macros "
+               "(there is no location counter before the source is assembled)");
+        return 0;
+    }
+    AsmState *st = &mp->asmb->st;
+    int idx = mp->out ? mp->out->len : 0;
+    return mlp_get(&st->macro_line_pcs, st->current_file, idx);
+}
+
 static int m_is_defined(MacroPP *mp, const char *name){
     /* 破綻点修正: `!undef` はマクロを表から消さず defined=0 にするだけなのに、
      * ここは存在するかどうかしか見ていなかった。そのため `!undef foo` のあとも
@@ -7821,7 +7942,7 @@ static int m_is_defined(MacroPP *mp, const char *name){
     if(_f && _f->defined) return 1;
     for(int i = mp->nscopes - 1; i >= 0; i--)
         if(m_scope_find(mp->scopes[i], name)) return 1;
-    return 0;
+    return m_asm_label(mp, name, NULL) == MLBL_VALUE;
 }
 static MVal m_lookup(MacroPP *mp, const char *name, const char *file, int line){
     for(int i = mp->nscopes - 1; i >= 0; i--){
@@ -7832,6 +7953,10 @@ static MVal m_lookup(MacroPP *mp, const char *name, const char *file, int line){
         MFunc *_f = m_func_find(mp, name);
         if(_f && _f->defined)
             m_fail(mp, file, line, "macro '%s' used as a variable (call it as '%s(...)')", name, name);
+    }
+    {
+        long long lv = 0;
+        if(m_asm_label(mp, name, &lv) != MLBL_NO) return mv_int(lv);
     }
     m_fail(mp, file, line, "undefined macro variable '%s'", name);
     return mv_int(0);
@@ -7977,6 +8102,15 @@ static MVal mep_primary(MEP *p){
         if(n == 1) return mv_int((unsigned char)t[0]);
         return mv_str(t);
     }
+    if(c == '$'){
+        /* 位置カウンタ。`$` と `$$` は同義（アセンブラ本体では `$$` が位置
+         * カウンタなので、そちらの綴りも受ける）。空白を挟んだ `$ $` を
+         * `$$` と読まないよう、次の文字は素で見る。 */
+        p->i++;
+        if(p->s[p->i] == '$') p->i++;
+        return mv_int(m_loc_counter(p->mp, p->file, p->line));
+    }
+
     if(isdigit((unsigned char)c)) return mep_number(p);
 
     if(c == '_' || isalpha((unsigned char)c)){
@@ -8349,6 +8483,19 @@ static int m_builtin(MacroPP *mp, const char *name, MVal *a, int n,
     if(strcmp(name, "uid") == 0){
         m_bi_argc(mp, "uid", n, 0, 0, file, line);
         *out = mv_int(++mp->uid);
+        return 1;
+    }
+    if(strcmp(name, "label") == 0){
+        /* label("名前") — アセンブラ側のラベル / .equ の値。裸の識別子でも
+         * 同じ値を引けるが、`.L1` のようにマクロの識別子として書けない名前は
+         * こちらでしか参照できない。解決規則は裸の識別子と同一。 */
+        m_bi_argc(mp, "label", n, 1, 1, file, line);
+        if(!a[0].is_str)
+            m_fail(mp, file, line, "label() needs a string");
+        long long lv = 0;
+        if(m_asm_label(mp, a[0].s ? a[0].s : "", &lv) == MLBL_NO)
+            m_fail(mp, file, line, "no such label or .equ: '%s'", a[0].s ? a[0].s : "");
+        *out = mv_int(lv);
         return 1;
     }
     return 0;
@@ -9007,7 +9154,7 @@ static MNode *m_parse_def(MacroPP *mp, MSrc *src, int *ip, int depth){
         MVal probe; MVal noargs[1];
         (void)probe; (void)noargs;
         static const char *bi[] = {"len","str","hex","int","upper","lower",
-                                   "substr","abs","min","max","uid","defined",NULL};
+                                   "substr","abs","min","max","uid","label","defined",NULL};
         for(int k = 0; bi[k]; k++)
             if(strcmp(name, bi[k]) == 0)
                 m_fail(mp, file, line, "'%s' is a reserved macro name", name);
@@ -9554,9 +9701,18 @@ static void fileassemble(Assembler *asmb, const char *fn){
     f=axx_open_input(fn, "source file");
     if(!f) goto done;
     {
+        /* マクロ層の $/$$ は「展開後の何行目か」で決まる値なので、この反復で
+         * 各行がどのアドレスに置かれたかを記録しておき、次の反復の展開時に
+         * 参照する。読む先(macro_line_pcs)と書く先(_cur)は別の表なので、
+         * 展開中に自分が読んでいる記録を壊すことはない。 */
+        char _expkey[sizeof(st->current_file)];
+        strncpy(_expkey, st->current_file, sizeof(_expkey)-1);
+        _expkey[sizeof(_expkey)-1]='\0';
         MLineVec _mexp = macro_expand(&g_macro, f, st->current_file);
         fclose(f); f=NULL;
+        int _lp = mlp_begin(&st->macro_line_pcs_cur, _expkey);
         for(int _mi=0; _mi<_mexp.len; _mi++){
+            mlp_push(&st->macro_line_pcs_cur, _lp, (long long)u256_to_u64(st->pc));
             strncpy(st->current_file, _mexp.d[_mi].file, sizeof(st->current_file)-1);
             st->current_file[sizeof(st->current_file)-1]='\0';
             st->ln = _mexp.d[_mi].line;
@@ -10084,6 +10240,23 @@ int main(int argc, char *argv[]){
                     lmap_set_full(&prev_labels, e->key, e->value, e->section,
                                   e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
 
+            /* マクロ層に見せるスナップショット。prev_labels と別に持つのは、
+             * prev_labels がパス2の前に解放されるのに対し、こちらは収束後の
+             * 展開をパス2でも同じに再現するため生かしておく必要があるため。 */
+            lmap_free(&st->macro_labels); lmap_init(&st->macro_labels);
+            for(int bi=0; bi<st->labels.nbuckets; bi++)
+                for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
+                    lmap_set_full(&st->macro_labels, e->key, e->value, e->section,
+                                  e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
+            st->macro_labels_valid = 1;
+
+            /* 行番号→アドレスの記録は「複製」ではなく「移動」する。同じ表を
+             * 共有すると、次に fileassemble() が今回ぶんを積み直すときに、
+             * まさに展開中の式が読んでいる記録を壊してしまう。 */
+            mlp_vec_free(&st->macro_line_pcs);
+            st->macro_line_pcs = st->macro_line_pcs_cur;
+            memset(&st->macro_line_pcs_cur, 0, sizeof(st->macro_line_pcs_cur));
+
             if(converged){
                 if(st->debug)
                     fprintf(stderr,"Pass1 relaxation converged after %d iteration(s)\n",
@@ -10293,6 +10466,10 @@ cleanup:
     }
     free(st->line_map);
     st->line_map=NULL; st->line_map_len=0; st->line_map_cap=0;
+
+    lmap_free(&st->macro_labels);
+    mlp_vec_free(&st->macro_line_pcs);
+    mlp_vec_free(&st->macro_line_pcs_cur);
 
     macro_free(&g_macro);
     macro_free(&g_pat_macro);

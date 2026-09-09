@@ -634,6 +634,22 @@ class AssemblerState:
         # .EQU の右辺が複数セクションのラベルにまたがっていないかの検査用。
         self._equ_sections_touched = None
 
+        # マクロ層からラベル値・.equ・$/$$ を参照するための、前回リラクゼーション
+        # 反復のスナップショット。マクロ展開はアドレス確定より前に走るので、
+        # 「今回の値」は原理的に存在しない。代わりに前回反復の値を使い、収束は
+        # リラクゼーションループ（反復上限・振動検出・未収束なら出力しない）に
+        # 委ねる。None は「まだ一度も反復していない＝何も分からない」の意味で、
+        # このとき未知の名前は 0・defined() は偽になる。
+        #   _macro_label_values : 名前 -> 値（値が確定しているものだけ）
+        #   _macro_label_names  : 前回反復で存在が確認できたラベル名の集合。
+        #                         値が未確定でも「綴り間違いではない」と判定する
+        #                         ために、値とは別に持つ。
+        #   _macro_line_pcs     : 展開後の行番号 -> その行のアドレス($$ 用)
+        self._macro_label_values = None
+        self._macro_label_names = None
+        self._macro_line_pcs = None
+        self._macro_line_pcs_cur: dict = {}
+
 
     def diag(self, text, set_error=True, force=False):
         """診断メッセージを表示し、必要なら had_error を立てる。
@@ -4742,6 +4758,15 @@ class _ExprParser:
                 return ord(t)
             return t
 
+        if c == '$':
+            # 位置カウンタ。`$` と `$$` は同義（アセンブラ本体では `$$` が
+            # 位置カウンタなので、そちらの綴りも受ける）。空白を挟んだ
+            # `$ $` を `$$` と読まないよう、次の文字は素で見る。
+            self.i += 1
+            if self.s[self.i:self.i + 1] == '$':
+                self.i += 1
+            return self.pp.loc_counter(self.pos)
+
         if c.isdigit():
             return self.read_number()
 
@@ -4893,10 +4918,60 @@ class MacroPreprocessor:
         self.depth = 0
         self.uid = 0
         self.include_stack = []
+        self._expand_key = None
 
 
     def scope(self):
         return self.scopes[-1]
+
+    def asm_label(self, name):
+        """アセンブラ側のラベル / .equ を引く。
+
+        マクロ展開はアドレス確定より前に走るので「今の値」は存在しない。
+        前回リラクゼーション反復のスナップショット（AssemblerState 側が反復
+        ごとに更新する）を見て、次の3状態を返す。
+
+          ('val', 値) … 前回反復で値が確定していた
+          ('unk', 0)  … ラベルとしては存在するが値がまだ確定していない
+                        （初回反復では全ての名前がこれになる）
+          ('no',  0)  … そんなラベルは無い（＝綴り間違い）
+
+        パターンファイル側のマクロ層はソースのアセンブル前に走るため、
+        ここは常に 'no' を返してラベル参照そのものを認めない。
+        """
+        if self.pat_mode or self.state is None:
+            return ('no', 0)
+        values = self.state._macro_label_values
+        if values is None:
+            # まだ一度も反復していない。この時点では「前方参照でまだ値が
+            # 無い」のか「綴り間違い」なのか区別できないので、エラーにせず
+            # 未確定として扱う。綴り間違いは次の反復で 'no' として捕まる。
+            return ('unk', 0)
+        if name in values:
+            return ('val', values[name])
+        if name in (self.state._macro_label_names or ()):
+            return ('unk', 0)
+        return ('no', 0)
+
+    def loc_counter(self, pos):
+        """マクロ展開時の位置カウンタ（$ / $$）。
+
+        ラベルと違って名前ではなく位置で決まる値なので、前回反復で記録した
+        「展開後 N 行目のアドレス」を返す。初回反復や、展開行数が変わって
+        対応する行がまだ無い場合は 0。
+        """
+        if self.pat_mode or self.state is None:
+            raise MacroError(f"{_fmt_pos(pos)}: '$'/'$$' is not available in "
+                             f"pattern-file macros (there is no location counter "
+                             f"before the source is assembled)")
+        pcs = self.state._macro_line_pcs
+        if not pcs:
+            return 0
+        lst = pcs.get(self._expand_key)
+        if not lst:
+            return 0
+        i = len(self.out)
+        return lst[i] if 0 <= i < len(lst) else 0
 
     def lookup(self, name, pos):
         for sc in reversed(self.scopes):
@@ -4905,12 +4980,17 @@ class MacroPreprocessor:
         if name in self.funcs:
             raise MacroError(f"{_fmt_pos(pos)}: macro '{name}' used as a variable "
                              f"(call it as '{name}(...)')")
+        _st, _v = self.asm_label(name)
+        if _st != 'no':
+            return _v
         raise MacroError(f"{_fmt_pos(pos)}: undefined macro variable '{name}'")
 
     def is_defined(self, name):
         if name in self.funcs:
             return True
-        return any(name in sc for sc in self.scopes)
+        if any(name in sc for sc in self.scopes):
+            return True
+        return self.asm_label(name)[0] == 'val'
 
     def assign(self, name, value):
         for sc in reversed(self.scopes):
@@ -5497,6 +5577,10 @@ class MacroPreprocessor:
         if self.had_error:
             return []
         saved_out = self.out
+        saved_expand_key = self._expand_key
+        # $/$$ は「展開後の何行目か」で引くので、どのファイルの展開中かを
+        # 覚えておく（AssemblerState 側の記録も同じキーで積まれている）。
+        self._expand_key = filename
         self.out = []
         saved_reclimit = sys.getrecursionlimit()
         need = _MACRO_MAX_DEPTH * 40 + 1000
@@ -5521,6 +5605,7 @@ class MacroPreprocessor:
         finally:
             sys.setrecursionlimit(saved_reclimit)
             self.out = saved_out
+            self._expand_key = saved_expand_key
         return result
 
 
@@ -5639,6 +5724,23 @@ def _bi_uid(pp, a, pos):
     return pp.uid
 
 
+def _bi_label(pp, a, pos):
+    """label("名前") — アセンブラ側のラベル / .equ の値。
+
+    裸の識別子でも同じ値を引けるが、`.L1` のようにマクロの識別子として
+    書けない名前はこちらでしか参照できない。解決規則は裸の識別子と同一で、
+    存在しない名前はエラーになる。
+    """
+    _bi_check(pp, a, pos, 'label', 1)
+    name = a[0]
+    if not isinstance(name, str):
+        raise MacroError(f"{_fmt_pos(pos)}: label() needs a string")
+    st, v = pp.asm_label(name)
+    if st == 'no':
+        raise MacroError(f"{_fmt_pos(pos)}: no such label or .equ: '{name}'")
+    return v
+
+
 _BUILTINS = {
     'len': _bi_len,
     'hex': _bi_hex,
@@ -5651,6 +5753,7 @@ _BUILTINS = {
     'min': _bi_min,
     'max': _bi_max,
     'uid': _bi_uid,
+    'label': _bi_label,
 }
 
 
@@ -6273,7 +6376,14 @@ class Assembler:
                                 set_error=True)
                 return
 
+            # マクロ層の $/$$ は「展開後の何行目か」で決まる値なので、名前で
+            # 引けるラベルと違って行番号でしか対応が取れない。この反復での
+            # 行番号→アドレスを記録しておき、次の反復の展開時にそれを返す。
+            _expkey = self.state.current_file
+            _line_pcs = []
+            self.state._macro_line_pcs_cur[_expkey] = _line_pcs
             for _mtext, _mfile, _mln in self.macro_proc.expand(af, self.state.current_file):
+                _line_pcs.append(self.state.pc)
                 self.state.current_file = _mfile
                 self.state.ln = _mln
                 self.lineassemble0(_mtext)
@@ -7435,6 +7545,7 @@ class Assembler:
 
                 for relax_iter in range(MAX_RELAX):
                     self.state._relax_optimistic = (relax_iter == 0)
+                    self.state._macro_line_pcs_cur = {}
                     self.state.pc = 0
                     self.state.pas = 1
                     self.state.ln = 1
@@ -7468,6 +7579,17 @@ class Assembler:
                         k: v[0] for k, v in self.state.labels.items()
                         if not _is_undef_derived(v[0])
                     }
+
+                    # マクロ層に見せるスナップショット。次の反復の展開はこれを
+                    # 使って評価される。名前の集合を値とは別に持つのは、値が
+                    # まだ未確定なラベルを「綴り間違い」と誤判定しないため。
+                    self.state._macro_label_values = dict(self.state._relax_prev_values)
+                    self.state._macro_label_names = set(self.state.labels)
+                    # dict() で複製するのは必須。同じ辞書を共有すると、次に
+                    # fileassemble() が今回ぶんの記録を積み直すときに、まさに
+                    # 展開中の式が読んでいるリストを空で上書きしてしまう
+                    # （パス2で $ が 0 に化け、パス1と食い違う）。
+                    self.state._macro_line_pcs = dict(self.state._macro_line_pcs_cur)
                     if not has_undef:
                         _pcs_key = frozenset(current_pcs.items())
                         _first_seen = _seen_pcs_history.get(_pcs_key)

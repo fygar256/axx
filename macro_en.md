@@ -1,6 +1,6 @@
 # axx Macro Layer Syntax Reference
 
-This is a source-to-source transformation stage that runs before the source is passed to the main assembler. Label values, `.equ` definitions, and `$` or `$$` symbols cannot be referenced (to ensure that expansion results remain consistent across relaxation passes).
+This is a source-to-source transformation stage that runs before the source is passed to the main assembler. Macros in source files (`.s`) can read label values, `.equ` definitions, and the `$` / `$$` location counter (see "Reading assembler-side values").
 
 **The layer runs over both source files (`.s`) and pattern files (`.axx`).** See the "Macros in Pattern Files" section below for what differs on the pattern side.
 
@@ -70,11 +70,57 @@ Integer literals: `10` / `0x1f` / `0b1010` / `0o17` (underscores allowed).
 ## Built-in Functions
 
 `len(s)` `hex(v[,digits])` `str(v)` `int(s[,base])` `upper(s)` `lower(s)`
-`substr(s,start[,length])` `abs(v)` `min(...)` `max(...)` `uid()` `defined(name)`
+`substr(s,start[,length])` `abs(v)` `min(...)` `max(...)` `uid()` `label(name)`
+`defined(name)`
 
 `substr()` clamps its start and length to the string. A negative start means
 the beginning (0), *not* Python-style indexing from the end; a negative length
 is treated as 0.
+
+## Reading Assembler-Side Values
+
+Macros in source files (`.s`) can read the main assembler's label values,
+`.equ` definitions, and location counter.
+
+| Syntax | Meaning |
+|---|---|
+| `end` | Value of a label / `.equ`. A bare identifier resolves to a macro variable first, then to a label |
+| `label("...")` | The same, for names that are not valid macro identifiers (e.g. `.L1`) |
+| `defined(end)` | True if the value is settled |
+| `$` / `$$` | Location counter (the address the line will be placed at). The two spellings are equivalent |
+
+**Which values you get.** Macro expansion runs before addresses are settled, so
+"the current value" does not exist. What you read is the value from the
+*previous relaxation iteration*. On the first iteration nothing is known yet, so
+labels read as 0, `defined()` is false, and `$` / `$$` are 0. Once the values
+stabilise across iterations, so does the expansion.
+
+```
+!if defined(end) && end - start > 127 !then {
+  jmp near end
+} !else {
+  jmp short end        ; tentatively chosen on the first iteration
+}
+```
+
+**Convergence.** Because expansion can now depend on label values, it can differ
+from one iteration to the next. Convergence is enforced by the pass-1 relaxation
+loop, which caps iterations (16), detects oscillation, and aborts without
+writing an output file if it does not converge. It will not silently emit a
+wrong binary, but unlike before it is possible to write a macro that never
+converges.
+
+**Names that do not exist.** A name that is neither a macro variable nor a label
+still raises `undefined macro variable` — detectable from the second iteration
+onward; on the first iteration it cannot be told apart from a forward reference
+and reads as 0.
+
+**Not available in pattern files.** Pattern-file (`.axx`) macros run before any
+source is assembled, so no labels or location counter exist. `$` / `$$` raise an
+explicit error, and bare identifiers resolve only as macro variables.
+
+**Under `-P`.** `-P` expands without assembling, so every label is unsettled (0).
+The result differs from the expansion performed during a real assembly.
 
 ## Implicit Variables in Macros
 
