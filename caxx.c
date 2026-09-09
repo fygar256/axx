@@ -3908,16 +3908,26 @@ static int dir_clear_symbol(Assembler *asmb, PatEntry *e){
  * 外れていたらエラーにして従来の幅を保つ。 */
 static int dir_bits(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".bits")!=0) return 0;
-    const char *ef = e->f[1];
-    const char *wf = e->f[2];
 
-    if(strcasecmp(ef,"big")==0){ asmb->st.endian_big=1; }
-    else if(strcasecmp(ef,"little")==0){ asmb->st.endian_big=0; }
-    else if(ef[0] && !wf[0]){ wf = ef; }   /* `.bits::<幅>::` の形 */
+    /* 破綻点修正: 欄の意味を位置（第1欄=エンディアン,第2欄=幅）で固定していた
+     * ため、`.bits::<幅>::<big|little>`（順序が逆）を書くと幅の値が捨てられた
+     * 上で診断なしにエンディアンだけが適用されていた（axx.py の bits() と
+     * 同じ問題を移植時に作り込んでいた）。位置ではなく内容('big'/'little'か
+     * どうか)でフィールドの役割を判定し、順序に依らず両方正しく解釈する。 */
+    const char *fields[2]; int nfields=0;
+    if(e->f[1][0]) fields[nfields++] = e->f[1];
+    if(e->f[2][0]) fields[nfields++] = e->f[2];
 
-    /* 2欄形式 `.bits::big` / `.bits::little` は幅欄側に入ってくる。 */
-    if(strcasecmp(wf,"big")==0){ asmb->st.endian_big=1; wf = ""; }
-    else if(strcasecmp(wf,"little")==0){ asmb->st.endian_big=0; wf = ""; }
+    const char *wf = "";
+    for(int fi=0; fi<nfields; fi++){
+        const char *f = fields[fi];
+        if(strcasecmp(f,"big")==0){ asmb->st.endian_big=1; }
+        else if(strcasecmp(f,"little")==0){ asmb->st.endian_big=0; }
+        else if(!wf[0]){ wf = f; }
+        else {
+            axx_diagf(1, 0, " error - .bits: multiple word-width fields given ('%s' and '%s').\n", wf, f);
+        }
+    }
 
     if(wf[0]){
         int io;
@@ -6001,6 +6011,38 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     { char up[16]; axx_strupr_to(up,l,sizeof(up));
       if(strcmp(up,".INCLUDE")==0){
           char raw[512]; axx_get_string(l2,raw,sizeof(raw));
+          if(!raw[0]){
+              /* 破綻点修正: axx_get_string() は引用符で始まらない文字列に
+               * 常に空を返す。axx.py の include_asm はこの場合、①引用符
+               * なしのファイル名らしき語があれば警告した上でそれを使う、
+               * ②本当に何もなければエラーにする、のどちらかを必ず行うのに、
+               * caxx はここで何もせずに行を読み飛ばしていた（インクルード
+               * されるはずの内容が無言でオブジェクトファイルに反映されない、
+               * このプロジェクトが最も嫌う「黙って間違った結果を出す」
+               * 失敗モードそのもの）。axx.py と同じ2分岐に揃える。 */
+              char trimmed[512]; size_t tn=0;
+              { int ti=axx_skipspc(l2,0);
+                while(l2[ti] && tn < sizeof(trimmed)-1) trimmed[tn++]=l2[ti++];
+                while(tn>0 && (trimmed[tn-1]==' '||trimmed[tn-1]=='\t')) tn--;
+                trimmed[tn]=0;
+              }
+              if(trimmed[0]){
+                  char fallback[512];
+                  axx_get_param_to_spc(trimmed,0,fallback,sizeof(fallback));
+                  if(fallback[0]){
+                      char r[600]; m_pyrepr(fallback, r, sizeof(r));
+                      axx_diagf(0, 0, " warning - .INCLUDE filename not quoted: %s. "
+                                      "Please use double quotes.\n", r);
+                      strncpy(raw, fallback, sizeof(raw)-1);
+                      raw[sizeof(raw)-1]='\0';
+                  }
+              }
+              if(!raw[0]){
+                  char r[600]; m_pyrepr(l2, r, sizeof(r));
+                  axx_diagf(1, 0, " error - .INCLUDE directive has no filename: %s\n", r);
+                  *idx_out=idx; return 1;
+              }
+          }
           if(raw[0]){
               char resolved[2048];
               const char *cur = st->current_file;
@@ -6531,10 +6573,20 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     }
                     int64_t _abs_w_bytes = (int64_t)_valid[_gi].val * (int64_t)bpw;
 
-                    if(_rtype_is_default_guess && _rtype == 2 && _nbytes == 4
-                       && st->elf_machine == 62
+                    if(_rtype_is_default_guess && st->elf_machine == 62
+                       && elf_machine_is_pcrel(_mtbl_rm, _rtype)
                        && (int64_t)_raw_val == _abs_w_bytes){
-                        _rtype = 10;
+                        /* 破綻点修正: 4バイト幅（PC32→abs32=10）しか判定して
+                         * いなかったため、.RELOCTYPE でデフォルト型を
+                         * pc64/pc16/pc8 相当に変えた上でこの自動判定に
+                         * 掛かった場合、8/2/1バイト幅では絶対値型への
+                         * 差し替えが起きず axx.py と食い違っていた。 */
+                        switch(_nbytes){
+                            case 8: _rtype = 1;  break;
+                            case 4: _rtype = 10; break;
+                            case 2: _rtype = 12; break;
+                            case 1: _rtype = 14; break;
+                        }
                     }
 
                     if(_rtype_is_default_guess && st->elf_machine == 4){

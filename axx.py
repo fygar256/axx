@@ -133,6 +133,35 @@ _undef_ceiling_warned = False
 _BYTE_EXTRACT_SHIFT_MAX = 1 << 20
 
 
+def _ieee_pow(a, b):
+    """C の pow(a,b) と同じ IEEE754 のべき乗セマンティクスで計算する。
+
+    Python の ** / math.pow は範囲外（OverflowError）や定義域外
+    （負の底に非整数指数、ValueError）で例外を投げるが、Cの pow() は
+    例外を投げず ±inf / nan を返す。caxx.c の浮動小数点モード(exp_typ_float)
+    はまさに pow() をそのまま呼ぶので、同一入力で「Python はエラーで0、
+    C は inf/nan のビットパターン」という食い違いが起きないよう揃える。
+    """
+    a = float(a)
+    b = float(b)
+    if math.isnan(a) or math.isnan(b):
+        return float('nan')
+    if a == 0.0 and b < 0.0:
+        return float('inf')
+    if a < 0.0 and b != math.floor(b):
+        # glibc の pow() は負の底・非整数指数の定義域エラーで、符号ビットが
+        # 立った nan (0xfff8...) を返す。実測で caxx.c と突き合わせて確認済み。
+        return math.copysign(float('nan'), -1.0)
+    try:
+        return math.pow(a, b)
+    except OverflowError:
+        if a < 0.0 and int(b) % 2 != 0:
+            return float('-inf')
+        return float('inf')
+    except ValueError:
+        return math.copysign(float('nan'), -1.0)
+
+
 def _is_undef_derived(v):
     """値が UNDEF（未定義ラベル）に由来するか判定する。"""
     global _undef_ceiling_warned
@@ -2292,6 +2321,25 @@ class ExpressionEvaluator:
         x, idx = self.factor(s, idx)
         while idx < len(s) and StringUtils.q(s, '**', idx):
             t, idx = self.factor(s, idx + 2)
+
+            if self.state.exp_typ == 'f':
+                # 浮動小数点モードでは caxx.c の pow(a,b) と同じ、実数のべき乗を
+                # そのまま計算する。以下の桁数上限・負指数拒否ガードは、任意精度
+                # Python整数が際限なく育つのを防ぐための整数モード専用の安全策で、
+                # 有限精度のdoubleしか扱わない浮動小数点モードには無関係。
+                # (このガードを素通りさせないと、x が float であるという理由だけで
+                # _base_bits が「不明な巨大さ」を意味する1024にフォールバックし、
+                # 指数の値に関係なく常にエラー・結果0になっていた。)
+                #
+                # C の pow(a,b) は範囲外・定義域外でも例外を投げず ±inf/nan を
+                # 返す（IEEE754のpowのセマンティクス）。Python の ** / math.pow は
+                # 同じ入力で OverflowError / ValueError を投げるため、そのまま
+                # 使うとエラー終了と inf/nan のビットパターンとで出力が食い違う。
+                # _ieee_pow() で C 側と同じ「例外を投げず ±inf/nan を返す」挙動に
+                # 揃える。
+                x = _ieee_pow(x, t)
+                continue
+
             _EXP_MAX = 1024
             # axx が本物の値として保証するのは 2**256 まで（_UNDEF_SANE_CEILING）。
             # これを超えて _UNDEF_DERIVED_THRESHOLD (2**768) に近づくと、
