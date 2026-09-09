@@ -143,7 +143,9 @@ def _is_undef_derived(v):
         if _UNDEF_SANE_CEILING <= av < _UNDEF_DERIVED_THRESHOLD and not _undef_ceiling_warned:
             _undef_ceiling_warned = True
             diag(" warning - a value larger than 2**256 was computed; the UNDEF-sentinel "
-                 "heuristic may misclassify very large legitimate values as undefined.", set_error=False)
+                 "heuristic treats it as a legitimate large value (not undefined-derived) "
+                 "and may fail to detect it if it actually originated from an undefined "
+                 "label.", set_error=False)
         return av >= _UNDEF_DERIVED_THRESHOLD
     return False
 
@@ -2652,11 +2654,13 @@ class ExpressionEvaluator:
                 stack.append(ch)
                 result.append(ch)
             elif ch in CLOSE_CHARS:
-                if stack and OPEN_TO_CLOSE.get(stack[-1]) == ch:
+                # 種類が不一致でも（例: "(...]"）深さは1段閉じたものとして扱う。
+                # 型を厳密に照合してポップを拒否すると、不正な入力に対して
+                # stack が空に戻らなくなり、以降 stopchar が永久に見つからなく
+                # なってしまう（未対応の閉じ括弧のまま行末まで飲み込まれる）。
+                if stack:
                     stack.pop()
-                    result.append(ch)
-                else:
-                    result.append(ch)
+                result.append(ch)
             else:
                 result.append(ch)
 
@@ -4286,6 +4290,12 @@ class AssemblyDirectiveProcessor:
             _em_ext = self.state.elf_machine
             _mach_tbl_ext = ELF_MACHINES.get(_em_ext)
             reloc_type = _mach_tbl_ext['extern_default'] if _mach_tbl_ext else 2
+            # このEXTERN文自身が `::型名` を明示したかどうか。reloc_type は
+            # 明示指定が無ければデフォルト型で埋まってしまうため、reloc_type
+            # 自体では「明示されたか」を区別できない。既存ラベルの
+            # reloc_type_override は明示指定があったときだけ上書きしたいので、
+            # 別のフラグで覚えておく。
+            explicit_reloc_type = False
             if idx < len(l2) and l2[idx:idx + 2] == '::':
                 idx += 2
                 rt_start = idx
@@ -4298,6 +4308,8 @@ class AssemblyDirectiveProcessor:
                     if reloc_type is None:
                         self.state.diag(f" warning - unknown reloc type '{rt_str}' in .EXTERN"
                              f" for machine {_em_ext}", set_error=False)
+                    else:
+                        explicit_reloc_type = True
 
             if idx < len(l2) and l2[idx] == ':':
                 idx += 1
@@ -4308,7 +4320,7 @@ class AssemblyDirectiveProcessor:
                 self.state.labels[label_part] = [0, '.text', False, True, reloc_type]
             elif len(existing) > 3 and existing[3]:
 
-                if len(existing) >= 5 and reloc_type is not None:
+                if len(existing) >= 5 and explicit_reloc_type:
                     existing[4] = reloc_type
 
             idx = StringUtils.skipspc(l2, idx)
@@ -5483,9 +5495,11 @@ def _bi_hex(pp, a, pos):
     if isinstance(v, str):
         raise MacroError(f"{_fmt_pos(pos)}: hex() needs an integer")
     width = a[1] if len(a) > 1 else 0
+    if not isinstance(width, int):
+        raise MacroError(f"{_fmt_pos(pos)}: hex() width must be an integer")
     neg = v < 0
     s = format(abs(v), 'x')
-    if isinstance(width, int) and width > len(s):
+    if width > len(s):
         s = '0' * (width - len(s)) + s
     return ('-' if neg else '') + s
 

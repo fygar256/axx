@@ -2846,15 +2846,12 @@ static uint256_t expr_expression_esc(Assembler *asmb, const char *s, int idx, ch
             if(stkp < (int)(sizeof(stk)-1)) stk[stkp++] = c;
             buf[i] = c;
         } else if(c == ')' || c == ']' || c == CB_CHAR){
-            char expected = (c == ')') ? '(' : (c == ']') ? '[' : OB_CHAR;
-            if(stkp > 0 && stk[stkp-1] == expected){
-                stkp--;
-                buf[i] = c;
-            } else if(stkp == 0 && c == stopchar){
-                buf[i] = '\0';
-            } else {
-                buf[i] = c;
-            }
+            /* 種類が不一致でも（例: "(...]"）深さは1段閉じたものとして扱う。
+             * 型を厳密に照合してポップを拒否すると、不正な入力に対して
+             * stkp が0に戻らなくなり、以降 stopchar を永久に見つけられなく
+             * なってしまう（axx.py の expression_esc と同じ修正）。 */
+            if(stkp > 0) stkp--;
+            buf[i] = c;
         } else {
             if(stkp == 0 && c == stopchar)
                 buf[i] = '\0';
@@ -5655,6 +5652,12 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
             idx--;
         const ElfMachineInfo *_mtbl_ext = elf_machine_find(st->elf_machine);
         int reloc_type = _mtbl_ext ? _mtbl_ext->extern_default : 2;
+        /* このEXTERN文自身が `::型名` を明示したかどうか。reloc_type は
+         * 明示指定が無ければデフォルト型で埋まってしまうため、reloc_type
+         * 自体では「明示されたか」を区別できない。既存ラベルの
+         * reloc_type_override は明示指定があったときだけ上書きしたいので、
+         * 別のフラグで覚えておく。 */
+        int explicit_reloc_type = 0;
         if(idx+1 < blen && buf[idx]==':' && buf[idx+1]==':'){
             idx += 2;
             int rt_start = idx;
@@ -5672,8 +5675,10 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
                 if(rtype < 0)
                     axx_diagf(0, 0, " warning - unknown reloc type '%s' in .EXTERN for machine %d\n",
                                rt_str, st->elf_machine);
-                else
+                else {
                     reloc_type = rtype;
+                    explicit_reloc_type = 1;
+                }
             }
         }
         if(idx < blen && buf[idx]==':') idx++;
@@ -5681,7 +5686,7 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
         if(!existing){
             lmap_set_imported(&st->labels, s, u256_zero(), ".text", reloc_type);
         } else if(existing->is_imported){
-            if(reloc_type >= 0 && existing->reloc_type_override >= 0)
+            if(explicit_reloc_type && existing->reloc_type_override >= 0)
                 existing->reloc_type_override = reloc_type;
         }
         if(s!=sbuf) free(s);
@@ -10156,7 +10161,12 @@ int main(int argc, char *argv[]){
 
     #define WRITE_EXPORT(path_, elf_) do { \
         FILE *lf=fopen((path_),"wt"); \
-        if(lf){ \
+        if(!lf){ \
+            char _experrbuf[1200]; axx_oserr_str((path_), errno, _experrbuf, sizeof(_experrbuf)); \
+            axx_diagf(0, 0, " error - cannot open export file '%s': %s\n", \
+                       (path_), _experrbuf); \
+            exit_code = 1; \
+        } else { \
             for(int i=0;i<st->sections.count;i++){ \
                 SecEntry *e=st->sections.order[i]; \
                 const char *flag=""; \
