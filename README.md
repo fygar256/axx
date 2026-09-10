@@ -1610,11 +1610,11 @@ If you find a bug, please let me know what is not working.
 ### E.3 Acknowledgements
 
 My thanks to my mentor Junichi Hamada and to Tokyo Denshi Sekkei, who gave me
-the problems and the hints; to the University of Electro-Communications; to the
-computer scientists and engineers; to Qiita, Google, IEEE, The Alan Turing
-Institute; and to some unforgettable people. I received a passing grade from
-Emeritus Professor Kameda of the Information Processing Society of Japan. Thank
-you very much.
+the problems and the hints; to the University of Electro-Communications; to Pacific
+Software Development; to the computer scientists and engineers; to Qiita, IEEE, 
+The Alan Turing Institute; and to some unforgettable people. I received a passing 
+grade from Emeritus Professor Kameda of the Information Processing Society of Japan.
+Thank you very much.
 
 ### E.4 Mascot
 
