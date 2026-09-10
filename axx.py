@@ -270,7 +270,7 @@ _ELF_MACHINE_RAW = {
     3: dict(
         name='i386', elfclass=1, is_rela=False,
         width_guess={4: 2, 2: 20, 1: 22},
-        pc_rel={2, 13, 21, 23},
+        pc_rel={2, 4, 13, 21, 23},
         extern_default=2,
         named={
             'abs32': (1, 4), 'pc32': (2, 4), 'rel32': (2, 4),
@@ -1512,7 +1512,10 @@ class IEEE754Converter:
                     t, i = parse_factor(s, i + 2)
                     if t == 0:
                         raise ZeroDivisionError("floor division by zero in qad{}")
-                    v = Decimal(int(v // t))
+                    tq = v // t  # Decimal '//' truncates toward zero, not floor
+                    if tq * t != v and (v < 0) != (t < 0):
+                        tq -= 1
+                    v = Decimal(int(tq))
                 elif i < len(s) and s[i] == '/' and (i + 1 >= len(s) or s[i + 1] != '/'):
                     t, i = parse_factor(s, i + 1)
                     if t == 0:
@@ -1623,7 +1626,7 @@ class LabelManager:
         ranges = [(rs, rl) for (rn, rs, rl) in self.state.section_ranges if rn == name]
         cum = 0
         for rs, rl in ranges:
-            if rs <= word_pc <= rs + rl:
+            if rs <= word_pc < rs + rl:
                 return cum + (word_pc - rs)
             cum += rl
         entry = self.state.sections.get(name)
@@ -1770,7 +1773,7 @@ class SymbolManager:
         self.state = state
 
     def get(self, w):
-        w = w.upper()
+        w = StringUtils.upper(w)
         return self.state.symbols.get(w, "")
 
 
@@ -2376,11 +2379,21 @@ class ExpressionEvaluator:
                 x = 0
                 break
 
+            # 指数 0/1 は結果がベースより大きくならない（0乗は常に1、1乗は
+            # ベースそのもの）ので、ベースの桁数がどうであれ「掛け合わせで
+            # 際限なく育つ」ことはない。既に成立しているベースの値をこの
+            # チェックで巻き戻さないよう、桁数ガードの対象から外す。
+            if t_int == 0:
+                x = 1
+                continue
+            if t_int == 1:
+                continue
+
             try:
                 _base_bits = abs(x).bit_length() if isinstance(x, int) else 1024
             except (TypeError, ValueError, OverflowError):
                 _base_bits = 1024
-            if _base_bits * max(t_int, 1) > _EXP_RESULT_MAX_BITS:
+            if _base_bits * t_int > _EXP_RESULT_MAX_BITS:
                 self.state.diag(f" error - ** result would exceed {_EXP_RESULT_MAX_BITS} bits "
                          f"(chained exponentiation); result set to 0.", set_error=True)
                 x = 0
@@ -2658,7 +2671,7 @@ class ExpressionEvaluator:
         if idx < n and s[idx] == '?':
             idx = StringUtils.skipspc(s, idx + 1)
             if x == 0:
-                skip_end = self._skip_subexpr(s, idx)
+                skip_end = self._skip_ternary_expr(s, idx)
                 if (skip_end < n and s[skip_end] == ':'
                         and (skip_end + 1 >= n or s[skip_end + 1] != '=')):
                     x, idx = self.term11(s, StringUtils.skipspc(s, skip_end + 1))
@@ -4386,6 +4399,9 @@ class AssemblyDirectiveProcessor:
 
                 if len(existing) >= 5 and explicit_reloc_type:
                     existing[4] = reloc_type
+            else:
+                self.state.diag(f" warning - .EXTERN: '{label_part}' is already defined"
+                     f" locally; ignoring extern declaration", set_error=False)
 
             idx = StringUtils.skipspc(l2, idx)
             if idx < len(l2) and l2[idx] == ',':
@@ -4547,6 +4563,7 @@ class _ExprParser:
         self.i = 0
         self.pp = pp
         self.pos = pos
+        self.suppress = 0
 
 
     def err(self, msg):
@@ -4589,24 +4606,54 @@ class _ExprParser:
     def ternary(self):
         c = self.logic_or()
         if self.eat('?'):
-            a = self.ternary()
-            self.expect(':')
-            b = self.ternary()
-            return a if _truth(c) else b
+            if _truth(c):
+                a = self.ternary()
+                self.expect(':')
+                self.suppress += 1
+                try:
+                    self.ternary()
+                finally:
+                    self.suppress -= 1
+                return a
+            else:
+                self.suppress += 1
+                try:
+                    self.ternary()
+                finally:
+                    self.suppress -= 1
+                self.expect(':')
+                b = self.ternary()
+                return b
         return c
 
     def logic_or(self):
         v = self.logic_and()
         while self.eat('||'):
-            r = self.logic_and()
-            v = 1 if (_truth(v) or _truth(r)) else 0
+            if _truth(v):
+                self.suppress += 1
+                try:
+                    self.logic_and()
+                finally:
+                    self.suppress -= 1
+                v = 1
+            else:
+                r = self.logic_and()
+                v = 1 if _truth(r) else 0
         return v
 
     def logic_and(self):
         v = self.bit_or()
         while self.eat('&&'):
-            r = self.bit_or()
-            v = 1 if (_truth(v) and _truth(r)) else 0
+            if not _truth(v):
+                self.suppress += 1
+                try:
+                    self.bit_or()
+                finally:
+                    self.suppress -= 1
+                v = 0
+            else:
+                r = self.bit_or()
+                v = 1 if _truth(r) else 0
         return v
 
     def bit_or(self):
@@ -4670,12 +4717,18 @@ class _ExprParser:
             if self.eat('<<'):
                 r = _as_int(self, self.additive())
                 if r < 0 or r > 4096:
-                    self.err("shift count out of range")
+                    if self.suppress:
+                        r = 0
+                    else:
+                        self.err("shift count out of range")
                 v = _as_int(self, v) << r
             elif self.eat('>>'):
                 r = _as_int(self, self.additive())
                 if r < 0 or r > 4096:
-                    self.err("shift count out of range")
+                    if self.suppress:
+                        r = 0
+                    else:
+                        self.err("shift count out of range")
                 v = _as_int(self, v) >> r
             else:
                 return v
@@ -4714,14 +4767,22 @@ class _ExprParser:
                 self.i += 1
                 r = _as_int(self, self.unary())
                 if r == 0:
-                    self.err("division by zero")
-                v = _c_div(_as_int(self, v), r)
+                    if self.suppress:
+                        v = 0
+                    else:
+                        self.err("division by zero")
+                else:
+                    v = _c_div(_as_int(self, v), r)
             elif self.s.startswith('%', self.i):
                 self.i += 1
                 r = _as_int(self, self.unary())
                 if r == 0:
-                    self.err("modulo by zero")
-                v = _c_mod(_as_int(self, v), r)
+                    if self.suppress:
+                        v = 0
+                    else:
+                        self.err("modulo by zero")
+                else:
+                    v = _c_mod(_as_int(self, v), r)
             else:
                 return v
 
@@ -4789,7 +4850,11 @@ class _ExprParser:
                             continue
                         self.expect(')')
                         break
+                if self.suppress:
+                    return 0
                 return self.pp.call_value(name, args, self.pos)
+            if self.suppress:
+                return 0
             return self.pp.lookup(name, self.pos)
 
         self.err(f"unexpected character {c!r}")
@@ -4865,6 +4930,8 @@ def _truth(v):
 
 def _as_int(p, v):
     if isinstance(v, str):
+        if getattr(p, 'suppress', 0):
+            return 0
         p.err(f"expected an integer, got the string {v!r}")
     return v
 
@@ -4881,6 +4948,8 @@ def _cmp_eq(a, b):
 
 def _cmp_lt_eq(p, a, b, or_equal):
     if isinstance(a, str) != isinstance(b, str):
+        if getattr(p, 'suppress', 0):
+            return False
         p.err("cannot order a string against an integer")
     return (a <= b) if or_equal else (a < b)
 
@@ -5047,6 +5116,9 @@ class MacroPreprocessor:
                 self.exec_block(fn.body)
             except _MacroReturn as r:
                 return r.value
+            except (_MacroBreak, _MacroContinue):
+                raise MacroError(f"{_fmt_pos(pos)}: '!break'/'!continue' outside a "
+                                  f"'!while' loop in macro '{fn.name}'")
             finally:
                 self.depth -= 1
             return 0
@@ -6310,7 +6382,11 @@ class Assembler:
                 if len(i) >= 2 and i[1]:
                     key = StringUtils.upper(i[1])
                     self.state.symbols = dict(fresh)
-                    v, _ = self.expr_eval.expression_pat(i[2], 0)
+                    value_field = i[2] if len(i) >= 3 else ''
+                    if value_field:
+                        v, _ = self.expr_eval.expression_pat(value_field, 0)
+                    else:
+                        v = 0
                     fresh[key] = v
                 elif len(i) >= 3 and i[2]:
                     key = StringUtils.upper(i[2])

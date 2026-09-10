@@ -515,6 +515,7 @@ static void lmap_set_reloc_type(LabelMap *m, const char *key, int reloc_type) {
     if(e) e->reloc_type_override = reloc_type;
 }
 static void lmap_set_imported(LabelMap *m, const char *key, uint256_t val, const char *sec, int reloc_type) {
+    if(!m->nbuckets) return;
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
     for(LabelEntry*e=m->buckets[h];e;e=e->next){
         if(strcmp(e->key,key)==0){
@@ -533,6 +534,7 @@ static void lmap_set_imported(LabelMap *m, const char *key, uint256_t val, const
 static void lmap_set_full(LabelMap *m, const char *key, uint256_t val,
                           const char *sec, int is_equ, int is_imported, int reloc_type_override,
                           int is_undef) {
+    if(!m->nbuckets) return;
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
     for(LabelEntry*e=m->buckets[h];e;e=e->next){
         if(strcmp(e->key,key)==0){
@@ -2209,13 +2211,18 @@ static uint256_t ieee754_128_from_str(const char *a){
     sig *= 2.0L;
     int exp_unbiased = fe - 1;
     int biased_exp = exp_unbiased + 16383;
-    if(biased_exp <= 0)  biased_exp = 0;
+    int subnorm_shift = 0;
+    if(biased_exp <= 0) { subnorm_shift = 1 - biased_exp; biased_exp = 0; }
     if(biased_exp >= 32767) {
         uint256_t r=u256_zero();
         r.w[1] = (uint64_t)(sign?1ULL:0ULL)<<63 | 0x7FFF000000000000ULL;
         return r;
     }
-    long double frac_part = sig - 1.0L;
+    /* 破綻点修正: 非正規化数(biased_exp==0)には暗黙の先頭1ビットが無い。
+     * 正規化された sig (1.xxx 形式) からそのまま sig-1.0 で仮数部を作ると
+     * 非正規化数のビットパターンを誤って符号化する。sig を 2^-subnorm_shift
+     * だけ右シフトしてから仮数部を抽出する（十分小さければ自然に0へ丸まる）。 */
+    long double frac_part = (subnorm_shift > 0) ? ldexpl(sig, -subnorm_shift) : (sig - 1.0L);
     uint64_t hi = 0;
     for(int b=47;b>=0;b--){
         frac_part *= 2.0L;
@@ -4045,14 +4052,32 @@ static int dir_vliwp(Assembler *asmb, PatEntry *e){
     uint256_t v2=expr_expression_pat(asmb,e->f[2],0,&io);
     uint256_t v3=expr_expression_pat(asmb,e->f[3],0,&io);
     uint256_t v4=expr_expression_pat(asmb,e->f[4],0,&io);
-    asmb->st.vliwbits=(int)u256_to_i64(v1);
-    asmb->st.vliwinstbits=(int)u256_to_i64(v2);
-    asmb->st.vliwtemplatebits=(int)u256_to_i64(v3);
-    if(asmb->st.vliwinstbits < 0 || asmb->st.vliwinstbits > 8192){
-        axx_diagf(1, 0, " error - .vliw: vliwinstbits %d is out of range (must be 0-8192).\n",
-                   asmb->st.vliwinstbits);
+
+    /* 破綻点修正: vliwbits/vliwinstbits/vliwtemplatebits を範囲検証なしに
+     * int へ切り詰めていた。2^32 の倍数だけずれた値は int へのキャストで
+     * 別の（たまたま範囲内に見える）値に化けて検証をすり抜けてしまい、
+     * さらに vliwbits/vliwtemplatebits が INT_MIN だと vliwprocess() 側の
+     * 符号反転(-vliwbits)が未定義動作になり得た。dir_bits と同じ
+     * 「256bit値への往復チェック」で切り詰め前の値を検証してから代入する。 */
+    int64_t vb64 = u256_to_i64(v1);
+    int64_t vi64 = u256_to_i64(v2);
+    int64_t vt64 = u256_to_i64(v3);
+    if(vb64 < -8192 || vb64 > 8192 || !u256_eq(v1, u256_from_i64(vb64))){
+        axx_diagf(1, 0, " error - .vliw: vliwbits is out of range (must be -8192..8192).\n");
         return 1;
     }
+    if(vi64 < 0 || vi64 > 8192 || !u256_eq(v2, u256_from_i64(vi64))){
+        axx_diagf(1, 0, " error - .vliw: vliwinstbits %lld is out of range (must be 0-8192).\n",
+                   (long long)vi64);
+        return 1;
+    }
+    if(vt64 < -8192 || vt64 > 8192 || !u256_eq(v3, u256_from_i64(vt64))){
+        axx_diagf(1, 0, " error - .vliw: vliwtemplatebits is out of range (must be -8192..8192).\n");
+        return 1;
+    }
+    asmb->st.vliwbits=(int)vb64;
+    asmb->st.vliwinstbits=(int)vi64;
+    asmb->st.vliwtemplatebits=(int)vt64;
     asmb->st.vliwflag=1;
     iv_clear(&asmb->st.vliwnop);
     uint64_t v4v=u256_to_u64(v4);
@@ -6260,7 +6285,20 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
              * だけ増える）があるため作りにくく、全走査でも実測で十分速いので、
              * 打ち切り自体をやめて常に最良スコアを選ぶ。 */
         } else {
-            for(int vi=0;vi<26;vi++) free(saved_vtl[vi].label_name);
+            /* 破綻点修正: マッチに失敗した候補でも pat_match0() 内の式評価が
+             * elf_var_to_label[] を書き換え得る。ここで saved_vtl を書き戻さず
+             * label_name を解放するだけだと、失敗した候補による汚染がそのまま
+             * 次の候補の pat_match0() に持ち越されてしまう（st->vars は
+             * ループ先頭で毎回ゼロクリアされるが elf_var_to_label には
+             * 同様のリセットが無い）。成功時の巻き戻しと対称に、ここでも
+             * 保存しておいた値を書き戻す。 */
+            for(int vi=0;vi<26;vi++){
+                free(st->elf_var_to_label[vi].label_name);
+                st->elf_var_to_label[vi].set        = saved_vtl[vi].set;
+                st->elf_var_to_label[vi].label_val  = saved_vtl[vi].label_val;
+                st->elf_var_to_label[vi].label_name = saved_vtl[vi].label_name;
+                saved_vtl[vi].label_name = NULL;
+            }
             st->error_undefined_label=0;
         }
     }
@@ -8026,7 +8064,7 @@ static MVal mep_number(MEP *p){
         else if(c >= 'A' && c <= 'F') d = c - 'A' + 10;
         else break;
         if(d >= base) break;
-        v = v * base + d;
+        v = m_i64_add(m_i64_mul(v, base), d);
         ndig++; j++;
     }
     if(ndig == 0 || j == start){
@@ -10303,6 +10341,18 @@ int main(int argc, char *argv[]){
         secmap_clear(&st->sections);
         secrangevec_clear(&st->section_ranges);
         strcpy(st->current_section, ".text");
+        /* 破綻点修正: pass1 の各リラクゼーション反復は毎回 vars/symbols を
+         * initial_vars/patsymbols から作り直してから fileassemble() を
+         * 呼んでいたが、pass2 は最後の pass1 反復が実行し終えた後の
+         * vars/symbols をそのまま引き継いでいた。.setsym 等でシンボル・
+         * 変数を書き換えるソースでは pass2 の開始状態が pass1 のどの反復
+         * とも食い違い、アドレスに影響しなければ後段のドリフト検査（ラベル
+         * アドレスのみ比較）もすり抜けて出力の値が静かに誤り得た。 */
+        smap_clear(&st->symbols);
+        for(int pi=0; pi<st->patsymbols.nb; pi++)
+            for(SymEntry *se2=st->patsymbols.buckets[pi]; se2; se2=se2->next)
+                smap_set(&st->symbols, se2->key, se2->val);
+        memcpy(st->vars, initial_vars, sizeof(st->vars));
         fileassemble(asmb,sourcefile);
 
         secmap_finalize_current(st);
