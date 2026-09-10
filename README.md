@@ -1068,12 +1068,22 @@ Built-in functions:
 
 ```
 len(s)  hex(v[,digits])  str(v)  int(s[,base])  upper(s)  lower(s)
-substr(s,start[,length])  abs(v)  min(...)  max(...)  uid()  defined(name)
+substr(s,start[,length])  abs(v)  min(...)  max(...)  uid()  label(name)
+defined(name)
 ```
 
 `substr()` clamps start and length to the string. A negative start means the
 beginning (0), **not** Python-style indexing from the end; a negative length is
 treated as 0.
+
+`label(name)` reads an assembler-side label or `.equ` value for a name that
+cannot be written as a macro identifier, such as `label(".L1")`. A name that
+*is* a valid identifier is read by writing it bare — a bare identifier resolves
+to a macro variable first, and to a label only if no variable is found. Both
+forms work in source files only; in a pattern file no labels exist yet, so a
+bare identifier resolves only as a macro variable. What either form reads is
+the value from the previous relaxation iteration, as described at the top of
+this section.
 
 Implicit variables inside a macro:
 
@@ -1600,11 +1610,11 @@ If you find a bug, please let me know what is not working.
 ### E.3 Acknowledgements
 
 My thanks to my mentor Junichi Hamada and to Tokyo Denshi Sekkei, who gave me
-the problems and the hints; to the University of Electro-Communications; to the
-computer scientists and engineers; to Qiita, Google, IEEE, The Alan Turing
-Institute; and to some unforgettable people. I received a passing grade from
-Emeritus Professor Kameda of the Information Processing Society of Japan. Thank
-you very much.
+the problems and the hints; to the University of Electro-Communications; to Pacific
+Software Development; to the computer scientists and engineers; to Qiita, IEEE, 
+The Alan Turing Institute; and to some unforgettable people. I received a passing 
+grade from Emeritus Professor Kameda of the Information Processing Society of Japan.
+Thank you very much.
 
 ### E.4 Mascot
 
