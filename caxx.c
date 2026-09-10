@@ -417,6 +417,22 @@ static AXX_UNUSED void sv_free(StrVec *v){
     free(v->data); sv_init(v);
 }
 
+/* .enum で登録された列挙。names は要素名（大文字化済み）を列挙順に、
+ * expr は `!E<変数>` が拾ったリストから値を作る式を持つ。
+ * expr が NULL なら、その変数に列挙は定義されていない。 */
+typedef struct { StrVec names; char *expr; } EnumDef;
+
+static void enumdef_init(EnumDef *e){ sv_init(&e->names); e->expr=NULL; }
+static void enumdef_clear(EnumDef *e){
+    sv_free(&e->names);
+    free(e->expr); e->expr=NULL;
+}
+static void enumdef_copy(EnumDef *dst, const EnumDef *src){
+    enumdef_clear(dst);
+    for(int i=0;i<src->names.len;i++) sv_push(&dst->names, src->names.data[i]);
+    dst->expr = src->expr ? strdup(src->expr) : NULL;
+}
+
 typedef struct { int *data; int len; int cap; } IStack;
 static void is_init(IStack*v){v->data=NULL;v->len=0;v->cap=0;}
 static void is_push(IStack*v,int x){
@@ -987,6 +1003,14 @@ typedef struct {
     /* .check で登録された「変数 a〜z が満たすべき条件」 */
     StrVec     check_constraints[26];
 
+    /* .enum で登録された、変数 a〜z の列挙（`!E<変数>` が使う） */
+    EnumDef    enum_defs[26];
+
+    /* .enum の式を評価している間だけ非 NULL。要素名を「出現していれば
+     * .setsym の値、非出現なら 0」に束縛した表を指す。 */
+    const StrVec    *enum_bind_names;
+    const uint256_t *enum_bind_vals;
+
     /* 式の再帰深度。深すぎる入れ子でネイティブスタックを溢れさせない番人 */
     int        expr_depth;
 
@@ -1482,6 +1506,9 @@ static void state_init(AsmState *st) {
     st->reloc_cap = 0;
     for(int _rti=0; _rti<4; _rti++) st->reloctype_override[_rti] = -1;
     for(int _ci=0; _ci<26; _ci++) sv_init(&st->check_constraints[_ci]);
+    for(int _ci=0; _ci<26; _ci++) enumdef_init(&st->enum_defs[_ci]);
+    st->enum_bind_names = NULL;
+    st->enum_bind_vals  = NULL;
 }
 
 static char axx_upper_char(char c) {
@@ -1503,6 +1530,30 @@ static void axx_strupr_to(char *dst, const char *src, size_t maxlen) {
     size_t i=0;
     for(;src[i]&&i<maxlen-1;i++) dst[i]=axx_upper_char(src[i]);
     dst[i]=0;
+}
+
+/* s の idx 位置に一致する列挙要素名のうち最長のものの番号を返す（無ければ -1）。
+ * 直後が英数字・下線なら語の途中なので一致とみなさない。記号文字（.symbolc の
+ * 既定に含まれる `-` 等）まで語の一部と見なすと `A0-A1` の範囲指定も減算も
+ * 書けなくなるので、英数字と下線だけを見る。 */
+static int enum_name_at(const char *s, int idx, const StrVec *names, int *end_out){
+    int best=-1, best_end=idx;
+    for(int k=0;k<names->len;k++){
+        const char *nm=names->data[k];
+        int n=(int)strlen(nm);
+        if(n <= best_end-idx) continue;
+        int ok=1;
+        for(int j=0;j<n;j++){
+            char c=s[idx+j];
+            if(c=='\0' || axx_upper_char(c)!=nm[j]){ ok=0; break; }
+        }
+        if(!ok) continue;
+        char nx=s[idx+n];
+        if((nx>='0'&&nx<='9')||(nx>='A'&&nx<='Z')||(nx>='a'&&nx<='z')||nx=='_') continue;
+        best=k; best_end=idx+n;
+    }
+    *end_out=best_end;
+    return best;
 }
 
 static int axx_q(const char *s, int slen, const char *t, int idx) {
@@ -3065,6 +3116,8 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
     int slen=(int)strlen(s);
     int _hexlit_val=0, _hexlit_end=idx;
     int _hexlit_ok = parse_hex_char_literal(s, idx, slen, &_hexlit_val, &_hexlit_end);
+    /* .enum の式を評価している間だけ使う、列挙要素名の束縛。 */
+    int _en_k=-1, _en_end=idx;
 
     if(idx>=slen||s[idx]=='\0'){ *idx_out=idx; return x; }
 
@@ -3424,6 +3477,13 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
      * のようにラベル構成文字（数字・大文字・`_`・`.`）が続く場合まで変数 `a` として
      * 食ってしまい、残った `1` で式リストの解析が打ち切られて後続のワードごと
      * 黙って消えていた（axx.py は lwordchars で判定するのでラベル `a1` になる）。 */
+    /* .enum の式の中では、列挙要素名はその束縛値として読む。`#name` は
+     * これより前の枝で処理されるので、そちらは素の .setsym 値になる。 */
+    else if(st->enum_bind_names
+            && (_en_k=enum_name_at(s, idx, st->enum_bind_names, &_en_end)) >= 0){
+        x = st->enum_bind_vals[_en_k];
+        idx = _en_end;
+    }
     else if(st->expmode==EXP_PAT && is_lower(s[idx])
             && (s[idx+1]=='\0' || !char_in(s[idx+1], st->lwordchars))){
         char ch=s[idx];
@@ -4181,6 +4241,79 @@ static int dir_clrcheck(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.enum::<変数>::<要素名の並び>::<式>`
+ * `!E<変数>` が拾う「要素名のリスト」の語彙と、そこから値を作る式を決める。
+ * 式の中では各要素名が「そのリストに現れていれば .setsym の値、
+ * 現れていなければ 0」に束縛される。 */
+static int dir_enum(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".enum") != 0) return 0;
+    const char *var_str   = e->f[1];
+    const char *names_str = e->f[2];
+    const char *expr_str  = e->f[3];
+    char var = (char)tolower((unsigned char)var_str[0]);
+    if(!var_str[0] || var < 'a' || var > 'z' || var_str[1] != '\0'){
+        axx_diagf(1, 0, " error - .enum: variable should be a lower case letter ('%s').\n",
+                   var_str);
+        return 1;
+    }
+    int idx = var - 'a';
+
+    StrVec names; sv_init(&names);
+    const char *p = names_str;
+    while(*p){
+        while(*p == ' ' || *p == '\t') p++;
+        char buf[512]; int j = 0;
+        while(*p && *p != ',' && j < (int)sizeof(buf)-1)
+            buf[j++] = axx_upper_char(*p++);
+        while(*p && *p != ',') p++;
+        buf[j] = '\0';
+        while(j > 0 && (buf[j-1] == ' ' || buf[j-1] == '\t')) buf[--j] = '\0';
+        if(j > 0){
+            int dup = 0;
+            for(int k = 0; k < names.len; k++)
+                if(strcmp(names.data[k], buf) == 0){ dup = 1; break; }
+            if(!dup) sv_push(&names, buf);
+        }
+        if(*p == ',') p++;
+    }
+    if(names.len == 0){
+        axx_diagf(1, 0, " error - .enum: no enumeration element is given.\n");
+        sv_free(&names);
+        return 1;
+    }
+    int expr_blank = 1;
+    for(const char *q = expr_str; *q; q++)
+        if(*q != ' ' && *q != '\t'){ expr_blank = 0; break; }
+    if(expr_blank){
+        axx_diagf(1, 0, " error - .enum: the value expression is missing.\n");
+        sv_free(&names);
+        return 1;
+    }
+
+    enumdef_clear(&asmb->st.enum_defs[idx]);
+    asmb->st.enum_defs[idx].names = names;   /* 所有権を移す */
+    asmb->st.enum_defs[idx].expr  = strdup(expr_str);
+    if(!asmb->st.enum_defs[idx].expr){ perror("strdup"); exit(1); }
+    return 1;
+}
+
+static int dir_clrenum(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".clrenum") != 0) return 0;
+    const char *var_str = e->f[2];
+    if(var_str[0]){
+        char var = (char)tolower((unsigned char)var_str[0]);
+        if(var < 'a' || var > 'z' || var_str[1] != '\0'){
+            axx_diagf(1, 0, " error - .clrenum: variable should be a lower case letter ('%s').\n",
+                       var_str);
+            return 1;
+        }
+        enumdef_clear(&asmb->st.enum_defs[var - 'a']);
+    } else {
+        for(int i = 0; i < 26; i++) enumdef_clear(&asmb->st.enum_defs[i]);
+    }
+    return 1;
+}
+
 static int dir_error(Assembler *asmb, const char *s){
     AsmState *st=&asmb->st;
     int has_content=0;
@@ -4276,6 +4409,93 @@ static int pat_expects_expr(const char *t, int idx){
     while(t[idx]==' '||t[idx]=='\t') idx++;
     return t[idx]=='!';
 }
+/* .enum の式を、出現した要素だけ .setsym の値に束縛して評価する。
+ * 現れた要素に .setsym が無ければ *ok_out=0（不一致）にする。 */
+static uint256_t enum_eval(Assembler *asmb, const EnumDef *ed,
+                           const unsigned char *present, int *ok_out){
+    AsmState *st=&asmb->st;
+    int n = ed->names.len;
+    uint256_t *vals = malloc((size_t)(n>0?n:1) * sizeof(uint256_t));
+    if(!vals){ perror("malloc"); exit(1); }
+    for(int k=0;k<n;k++){
+        if(!present[k]){ vals[k]=u256_zero(); continue; }
+        uint256_t sv;
+        if(!smap_get(&st->symbols, ed->names.data[k], &sv)){
+            /* 現れた要素に .setsym が無い ＝ パターンファイル側の書き損じ。
+             * 0 を黙って混ぜて誤ったバイトを出すより、不一致にして知らせる。 */
+            free(vals);
+            *ok_out = 0;
+            return u256_zero();
+        }
+        vals[k]=sv;
+    }
+    const StrVec    *prev_names = st->enum_bind_names;
+    const uint256_t *prev_vals  = st->enum_bind_vals;
+    int prev_expmode = st->expmode;
+    st->enum_bind_names = &ed->names;
+    st->enum_bind_vals  = vals;
+    int io=0;
+    uint256_t r = expr_expression_pat(asmb, ed->expr, 0, &io);
+    /* expr_expression_pat() は expmode を戻さないので、照合中の EXP_ASM を
+     * 壊さないようここで自分で戻す。 */
+    st->expmode = prev_expmode;
+    st->enum_bind_names = prev_names;
+    st->enum_bind_vals  = prev_vals;
+    free(vals);
+    *ok_out = 1;
+    return r;
+}
+
+/* `!E<変数>` の位置から列挙要素のリストを読む。
+ * 受け付けるのは `A0`、`A0-A2`（列挙順での範囲）、およびそれらを `,` か `/` で
+ * 並べたもの。区切り記号は「その先に要素名が続くとき」だけ消費するので、
+ * `MOVEM !Ex,-(SP)` のようにパターン側が後ろで `,` を使っていても
+ * リストの一部と取り違えない。
+ * 成功時は 1 を返し、*val_out に値、*idx_out に読み終えた位置を入れる。 */
+static int enum_capture(Assembler *asmb, const EnumDef *ed, const char *s, int idx,
+                        uint256_t *val_out, int *idx_out){
+    const StrVec *names = &ed->names;
+    int n = names->len;
+    unsigned char *present = calloc((size_t)(n>0?n:1), 1);
+    if(!present){ perror("calloc"); exit(1); }
+
+    int e1=0;
+    int k1 = enum_name_at(s, axx_skipspc(s, idx), names, &e1);
+    if(k1 < 0){ free(present); return 0; }
+    int pos = e1;
+    for(;;){
+        pos = e1;
+        int pr = axx_skipspc(s, e1);
+        if(s[pr] == '-'){
+            int e2=0;
+            int k2 = enum_name_at(s, axx_skipspc(s, pr+1), names, &e2);
+            if(k2 >= k1){
+                for(int k=k1;k<=k2;k++) present[k]=1;
+                pos = e2;
+            } else {
+                /* 範囲として読めない `-` は、減算などパターン側の続きに残す。 */
+                present[k1]=1;
+            }
+        } else {
+            present[k1]=1;
+        }
+        int ps = axx_skipspc(s, pos);
+        if(s[ps]==',' || s[ps]=='/'){
+            int e3=0;
+            int k3 = enum_name_at(s, axx_skipspc(s, ps+1), names, &e3);
+            if(k3 >= 0){ k1=k3; e1=e3; continue; }
+        }
+        break;
+    }
+    int ok=0;
+    uint256_t v = enum_eval(asmb, ed, present, &ok);
+    free(present);
+    if(!ok) return 0;
+    *val_out = v;
+    *idx_out = pos;
+    return 1;
+}
+
 /* ソース行 s_orig をパターン t_orig と照合する（字句解析なしの1文字ずつ突き合わせ）。
  * パターン側の文字の意味:
  *   大文字      大小無視でリテラル一致（ニーモニック）
@@ -4283,6 +4503,7 @@ static int pat_expects_expr(const char *t, int idx){
  *   !x          任意の式を読んで変数 x に束縛
  *   !!x         式ではなく factor 1個だけを束縛
  *   !Fx/!Dx/!Qx 浮動小数点式を IEEE754 の 32/64/128bit として束縛
+ *   !Ex         .enum で決めた列挙要素のリストを読み、その式の値を束縛
  *   \c          次の1文字をリテラル扱い（エスケープ）
  * 成功時は具体度スコア (式の数, リテラル文字数, シンボル数) を st に残す。
  * 呼び出し側はこれが最も「具体的」なパターンを採用するので、パターンファイル内の
@@ -4435,6 +4656,18 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     }
                     var_put(st, a, qbits);
                 }
+                continue;
+            } else if(a=='E'){
+                if(idx_t >= tlen){ result=0; break; }
+                a = t[idx_t];
+                if(a=='\0' || !is_lower(a)){ result=0; break; }
+                idx_t++;
+                const EnumDef *ed = &st->enum_defs[a-'a'];
+                if(!ed->expr){ result=0; break; }
+                uint256_t ev; int eend=idx_s;
+                if(!enum_capture(asmb, ed, s, idx_s, &ev, &eend)){ result=0; break; }
+                idx_s = eend;
+                var_put(st, a, ev);
                 continue;
             } else if(a=='!'){
                 if(idx_t >= tlen){ result=0; break; }
@@ -5882,6 +6115,7 @@ typedef struct {
     struct { int set; char *label_name; uint64_t label_val; } vtl[26];
     SymMap    symbols;
     StrVec    check_constraints[26];
+    EnumDef   enum_defs[26];
     char      swordchars[256];
     uint256_t padding;
     int       bts;
@@ -5910,6 +6144,7 @@ static void best_free(BestMatch *b){
     for(int i=0;i<26;i++) free(b->vtl[i].label_name);
     smap_free(&b->symbols);
     for(int i=0;i<26;i++) sv_free(&b->check_constraints[i]);
+    for(int i=0;i<26;i++) enumdef_clear(&b->enum_defs[i]);
     iv_free(&b->vliwnop);
     vset_free(&b->vliwset);
     memset(b, 0, sizeof(*b));
@@ -5959,6 +6194,8 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
         sv_init(&b->check_constraints[i]);
         for(int j=0;j<st->check_constraints[i].len;j++)
             sv_push(&b->check_constraints[i], st->check_constraints[i].data[j]);
+        enumdef_init(&b->enum_defs[i]);
+        enumdef_copy(&b->enum_defs[i], &st->enum_defs[i]);
     }
     memcpy(b->swordchars, st->swordchars, sizeof(b->swordchars));
     b->padding          = st->padding;
@@ -5985,6 +6222,7 @@ static void best_restore_dirstate(AsmState *st, const BestMatch *b){
         sv_free(&st->check_constraints[i]);
         for(int j=0;j<b->check_constraints[i].len;j++)
             sv_push(&st->check_constraints[i], b->check_constraints[i].data[j]);
+        enumdef_copy(&st->enum_defs[i], &b->enum_defs[i]);
     }
     memcpy(st->swordchars, b->swordchars, sizeof(st->swordchars));
     st->padding          = b->padding;
@@ -6204,6 +6442,8 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         if(dir_vliwp(asmb,i)) continue;
         if(dir_check(asmb,i)) continue;
         if(dir_clrcheck(asmb,i)) continue;
+        if(dir_enum(asmb,i)) continue;
+        if(dir_clrenum(asmb,i)) continue;
 
         int lw=0; for(int fi=0;fi<PAT_FIELDS;fi++) if(i->f[fi][0]) lw++;
         if(lw==0) continue;
@@ -6468,6 +6708,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     for(int _ci = 0; _ci < 26; _ci++){
         sv_free(&asmb->st.check_constraints[_ci]);
         sv_init(&asmb->st.check_constraints[_ci]);
+        enumdef_clear(&asmb->st.enum_defs[_ci]);
     }
 
     smap_clear(&asmb->st.symbols);

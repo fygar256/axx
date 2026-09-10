@@ -75,12 +75,24 @@ loop:
     bcc     loop
     bsr.w   start
 
-    movem.l d0 d2 a0 a2,-(sp)
-    movem.l (sp)+,d0 d2 a0 a2
-    movem.w d0 d1 d2 d3 d4 d5 d6 d7 a0 a1 a2 a3 a4 a5 a6,-(sp)
-    movem.l d2 d3 d4 d5 d6 d7,-(sp)
-    movem.l (sp)+,d2 d3 d4 d5 d6 d7
+; MOVEM register lists, written as the manual writes them:
+; `-` is a range and `/` separates entries.
+    movem.l d0/d2/a0/a2,-(sp)
+    movem.l (sp)+,d0/d2/a0/a2
+    movem.w d0-d7/a0-a6,-(sp)
+    movem.l d2-d7,-(sp)
+    movem.l d0-d2,d4-d6,d7/a0-a2,a6,-(sp)
+    movem.l (sp)+,d2-d7
     movem.l a5,(a0)
-    movem.w d0 a7,(0x400).w
+    movem.w d0/a7,(0x400).w
+; the mask order follows the addressing mode: reversed for -(An),
+; normal for every other <ea>.
+    movem.l d0-d3/a0-a3,(a0)
+    movem.l d0-d3/a0-a3,-(a0)
+    movem.w d0-d7,12(a1)
+    movem.l (a0)+,d0-d7/a0-a6
+    movem.w (0x400).w,d0/d7
+    movem.l start(pc),d0/d1
+; a 16 bit mask may be given directly instead of a list
     movem.l #0x3f00,-(sp)
     movem.l (sp)+,#0x00fc

@@ -294,10 +294,16 @@
 /*  branches       .S selects the 8 bit form, .W and the bare mnemonic
 /*                 select the 16 bit form.  There is no automatic
 /*                 relaxation, so an out of range .S is reported.
-/*  MOVEM          the register list is written as a 16 bit mask:
+/*  MOVEM          the register list is written the way the manual writes
+/*                 it, `-` for a range and `/` between entries:
+/*                     MOVEM.L D0-D7/A0-A6,-(SP)
+/*                     MOVEM.L (SP)+,D0-D7/A0-A6
+/*                 A 16 bit mask may still be given directly instead:
 /*                     MOVEM.L #0x3F00,-(SP)   saves D2-D7
 /*                     MOVEM.L (SP)+,#0x00FC   restores them
-/*                 remember the mask runs the other way round for -(An).
+/*                 The mask runs the other way round for -(An); with the
+/*                 list form the assembler takes care of that, with the
+/*                 numeric form you write the mask yourself.
 /*  ADDQ/SUBQ      #1..#8 ; #8 is encoded as 0 by the assembler.
 /*  sizes          .B .W .L as usual.  Instructions with only one legal
 /*                 size (ABCD, TAS, Scc, EXG, SWAP ...) accept the bare
@@ -706,24 +712,30 @@ EXG s,b :: :: (0xC188|(s<<9)|b)>>8,(0xC188|(s<<9)|b)
 EXG a,d :: :: (0xC188|(d<<9)|a)>>8,(0xC188|(d<<9)|a)
 
 /* ================= MOVEM with a register list =================
-/* The register list is 16 optional operands: k..z, each constrained by
-/* .check to a register name and each allowed to be omitted (the `""`
-/* entry in the list).  An omitted operand stays unassigned (0), so the
-/* mask is just the OR of all 16 and one pattern covers every list
-/* length 1..16.  This replaces the old 352 explicit patterns (one per
-/* length x <ea>) with 22, so a MOVEM line is matched ~16x faster.
-/* [[ ]] is still unusable here: 16 optional groups is 2**16 matches.
+/* The list is captured with !Ex from the .enum below.  The elements are
+/* the 16 registers in D0..D7,A0..A7 order (SP is the usual alias for A7)
+/* and the value of a list is the OR of the mask bits of the registers in
+/* it, so one pattern per <ea> covers every list.
 /*
-/* Load (mem->regs, normal mask D0=bit0..A7=bit15):
-/*   (An)+  (An)  d16(An)  (xxx).W  (xxx).L  d16(PC)
-/* Store (regs->mem, reversed mask for -(An) transfer order):
-/*   (An)  -(An)  d16(An)  (xxx).W  (xxx).L
+/* The source syntax is the manual's: `-` is a range over that order and
+/* `/` separates entries.
+/*     MOVEM.L D0-D7/A0-A6,-(SP)
+/*     MOVEM.L (SP)+,D0-D7/A0-A6
+/* `,` separates entries too, but a `,` is only taken into the list when a
+/* register follows it, so `!Ex,-(a)` still splits the list from the <ea>.
+/*
+/* The manual gives two mask orders and ties them to the addressing mode:
+/*     control modes and (An)+   bit0=D0..bit7=D7, bit8=A0..bit15=A7
+/*     -(An) only                bit0=A7..bit7=A0, bit8=D7..bit15=D0
+/* One .enum yields both, because an element is worth its .setsym value at
+/* the point the pattern sits: the -(An) patterns are placed after a second
+/* .setsym block that reverses the 16 values.  Base An comes back out of
+/* the mask bit with @: (@a-9) normal, (8-@a) reversed.
+/*
 /* Indexed modes: use the numeric-mask form MOVEM.L #mask,<ea>.
-/* Base An recovered with @: (@a-9) normal, (8-@a) reversed.
-/* An empty register list is rejected by the (k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)==0 guard.
 /* ============================================================ */
 
-/* --- load: normal mask --- */
+/* --- normal mask: every load <ea>, and every store <ea> except -(An) --- */
 .setsym::D0::0x0001
 .setsym::D1::0x0002
 .setsym::D2::0x0004
@@ -741,37 +753,35 @@ EXG a,d :: :: (0xC188|(d<<9)|a)>>8,(0xC188|(d<<9)|a)
 .setsym::A6::0x4000
 .setsym::A7::0x8000
 .setsym::SP::0x8000
-.check::k::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::l::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::m::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::n::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::o::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::p::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::q::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::r::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::s::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::t::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::u::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::v::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::w::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::x::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::y::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::z::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
+.enum::x::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP::D0|D1|D2|D3|D4|D5|D6|D7|A0|A1|A2|A3|A4|A5|A6|A7|SP
 .check::a::A0,A1,A2,A3,A4,A5,A6,A7,SP
 
+/* load: mem -> regs */
 !def MOVEM_LD(SZ, OP) {
-MOVEM.!{SZ} (a)+,k l m n o p q r s t u v w x y z :: (k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)==0;5 :: (!{OP}|(0x18|(@a-9)))>>8,(!{OP}|(0x18|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
-MOVEM.!{SZ} (a),k l m n o p q r s t u v w x y z :: (k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)==0;5 :: (!{OP}|(0x10|(@a-9)))>>8,(!{OP}|(0x10|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
-MOVEM.!{SZ} !f(a),k l m n o p q r s t u v w x y z :: f>32767;3,f<-32768;3,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)==0;5 :: (!{OP}|(0x28|(@a-9)))>>8,(!{OP}|(0x28|(@a-9))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>8,f
-MOVEM.!{SZ} (!f).W,k l m n o p q r s t u v w x y z :: f>65535;3,f<-32768;3,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)==0;5 :: (!{OP}|0x38)>>8,(!{OP}|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>8,f
-MOVEM.!{SZ} (!f).L,k l m n o p q r s t u v w x y z :: (k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)==0;5 :: (!{OP}|0x39)>>8,(!{OP}|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>24,f>>16,f>>8,f
-MOVEM.!{SZ} !f(PC),k l m n o p q r s t u v w x y z :: (k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)==0;5 :: (!{OP}|0x3A)>>8,(!{OP}|0x3A),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),(f-($$+2))>>8,(f-($$+2))
+MOVEM.!{SZ} (a)+,!Ex :: :: (!{OP}|(0x18|(@a-9)))>>8,(!{OP}|(0x18|(@a-9))),x>>8,x
+MOVEM.!{SZ} (a),!Ex :: :: (!{OP}|(0x10|(@a-9)))>>8,(!{OP}|(0x10|(@a-9))),x>>8,x
+MOVEM.!{SZ} !f(a),!Ex :: f>32767;3,f<-32768;3 :: (!{OP}|(0x28|(@a-9)))>>8,(!{OP}|(0x28|(@a-9))),x>>8,x,f>>8,f
+MOVEM.!{SZ} (!f).W,!Ex :: f>65535;3,f<-32768;3 :: (!{OP}|0x38)>>8,(!{OP}|0x38),x>>8,x,f>>8,f
+MOVEM.!{SZ} (!f).L,!Ex :: :: (!{OP}|0x39)>>8,(!{OP}|0x39),x>>8,x,f>>24,f>>16,f>>8,f
+MOVEM.!{SZ} !f(PC),!Ex :: :: (!{OP}|0x3A)>>8,(!{OP}|0x3A),x>>8,x,(f-($$+2))>>8,(f-($$+2))
 }
 
 !MOVEM_LD("W", "0x4C80")
 !MOVEM_LD("L", "0x4CC0")
 
-/* --- store: reversed mask --- */
+/* store: regs -> mem, control modes.  The manual keeps the normal mask
+/* order for these; only -(An) below reverses it. */
+!def MOVEM_ST(SZ, OP) {
+MOVEM.!{SZ} !Ex,(a) :: :: (!{OP}|(0x10|(@a-9)))>>8,(!{OP}|(0x10|(@a-9))),x>>8,x
+MOVEM.!{SZ} !Ex,!f(a) :: f>32767;3,f<-32768;3 :: (!{OP}|(0x28|(@a-9)))>>8,(!{OP}|(0x28|(@a-9))),x>>8,x,f>>8,f
+MOVEM.!{SZ} !Ex,(!f).W :: f>65535;3,f<-32768;3 :: (!{OP}|0x38)>>8,(!{OP}|0x38),x>>8,x,f>>8,f
+MOVEM.!{SZ} !Ex,(!f).L :: :: (!{OP}|0x39)>>8,(!{OP}|0x39),x>>8,x,f>>24,f>>16,f>>8,f
+}
+
+!MOVEM_ST("W", "0x4880")
+!MOVEM_ST("L", "0x48C0")
+
+/* --- reversed mask: -(An) only --- */
 .setsym::D0::0x8000
 .setsym::D1::0x4000
 .setsym::D2::0x2000
@@ -789,31 +799,10 @@ MOVEM.!{SZ} !f(PC),k l m n o p q r s t u v w x y z :: (k|l|m|n|o|p|q|r|s|t|u|v|w
 .setsym::A6::0x0002
 .setsym::A7::0x0001
 .setsym::SP::0x0001
-.check::k::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::l::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::m::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::n::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::o::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::p::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::q::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::r::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::s::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::t::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::u::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::v::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::w::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::x::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::y::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::z::D0,D1,D2,D3,D4,D5,D6,D7,A0,A1,A2,A3,A4,A5,A6,A7,SP,""
-.check::a::A0,A1,A2,A3,A4,A5,A6,A7,SP
 
-!def MOVEM_ST(SZ, OP) {
-MOVEM.!{SZ} k l m n o p q r s t u v w x y z,(a) :: (k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)==0;5 :: (!{OP}|(0x10|(8-@a)))>>8,(!{OP}|(0x10|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
-MOVEM.!{SZ} k l m n o p q r s t u v w x y z,-(a) :: (k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)==0;5 :: (!{OP}|(0x20|(8-@a)))>>8,(!{OP}|(0x20|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)
-MOVEM.!{SZ} k l m n o p q r s t u v w x y z,!f(a) :: f>32767;3,f<-32768;3,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)==0;5 :: (!{OP}|(0x28|(8-@a)))>>8,(!{OP}|(0x28|(8-@a))),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>8,f
-MOVEM.!{SZ} k l m n o p q r s t u v w x y z,(!f).W :: f>65535;3,f<-32768;3,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)==0;5 :: (!{OP}|0x38)>>8,(!{OP}|0x38),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>8,f
-MOVEM.!{SZ} k l m n o p q r s t u v w x y z,(!f).L :: (k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)==0;5 :: (!{OP}|0x39)>>8,(!{OP}|0x39),(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)>>8,(k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z),f>>24,f>>16,f>>8,f
+!def MOVEM_ST_PD(SZ, OP) {
+MOVEM.!{SZ} !Ex,-(a) :: :: (!{OP}|(0x20|(8-@a)))>>8,(!{OP}|(0x20|(8-@a))),x>>8,x
 }
 
-!MOVEM_ST("W", "0x4880")
-!MOVEM_ST("L", "0x48C0")
+!MOVEM_ST_PD("W", "0x4880")
+!MOVEM_ST_PD("L", "0x48C0")

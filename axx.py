@@ -627,6 +627,14 @@ class AssemblerState:
         # .check で登録された「この変数はこの条件を満たすこと」という制約。
         self.check_constraints: dict = {}
 
+        # .enum で登録された列挙。変数1文字 -> (要素名のタプル, 式の文字列)。
+        # `!Ex` の照合と値の算出に使う。
+        self.enum_defs: dict = {}
+
+        # .enum の式を評価している間だけ立つ束縛表。[(要素名, 値), ...]。
+        # 要素名は「出現していれば .setsym の値、非出現なら 0」に束縛される。
+        self.enum_bindings: list | None = None
+
         # セクションは .section / .endsection の出入りで断片化しうる。
         # その断片ごとの (名前, 開始, ワード数) を順に記録する。
         self.section_ranges: list = []
@@ -1777,6 +1785,34 @@ class SymbolManager:
         return self.state.symbols.get(w, "")
 
 
+# 列挙要素名が「語として」そこで終わっているかの判定に使う文字集合。
+# 記号文字（.symbolc の既定に含まれる `-` など）を入れると `A0-A1` の `-` が
+# 語の一部に見えて範囲指定も減算も書けなくなるので、英数字と下線に限る。
+_ENUM_WORD_CHARS = set(DIGIT + ALPHABET + '_')
+
+
+def _enum_name_at(s, idx, names):
+    """s の idx 位置に一致する列挙要素名のうち最長のものを返す。
+
+    返り値は (要素番号, 終了位置)。一致しなければ (-1, idx)。
+    直後が英数字・下線なら語の途中なので一致とみなさない。
+    """
+    best = -1
+    best_end = idx
+    for k, nm in enumerate(names):
+        n = len(nm)
+        if n <= best_end - idx:
+            continue
+        if StringUtils.upper(s[idx:idx + n]) != nm:
+            continue
+        e = idx + n
+        if e < len(s) and s[e] in _ENUM_WORD_CHARS:
+            continue
+        best = k
+        best_end = e
+    return best, best_end
+
+
 class ExpressionEvaluator:
     """式評価器。優先順位ごとの再帰下降パーサ。
     
@@ -2091,6 +2127,15 @@ class ExpressionEvaluator:
         if idx >= len(s):
             return x, idx
 
+        # .enum の式を評価している間だけ、列挙要素名をその束縛値として読む。
+        # `#name` は先に別の枝で処理されるので、そちらは素の .setsym 値になる。
+        _enum_hit = None
+        if self.state.enum_bindings is not None:
+            _enames, _evals = self.state.enum_bindings
+            _ek, _eend = _enum_name_at(s, idx, _enames)
+            if _ek >= 0:
+                _enum_hit = (_evals[_ek], _eend)
+
         if s[idx] == '(':
             x, idx = self.expression(s, idx + 1)
             if idx < len(s) and s[idx] == ')':
@@ -2295,6 +2340,8 @@ class ExpressionEvaluator:
                     x = float(fs) if fs else 0.0
                 except ValueError:
                     x = 0.0
+        elif _enum_hit is not None:
+            x, idx = _enum_hit
         elif (idx < len(s) and self.state.expmode == EXP_PAT and
               s[idx] in LOWER and (idx + 1 >= len(s) or s[idx + 1] not in self.state.lwordchars)):
             ch = s[idx]
@@ -3184,6 +3231,50 @@ class DirectiveProcessor:
             self.state.check_constraints.clear()
         return True
 
+    def enum_processing(self, i):
+        """`.enum::<変数>::<要素名の並び>::<式>`。
+
+        `!E<変数>` が拾う「要素名のリスト」の語彙と、そこから値を作る式を決める。
+        式の中では各要素名が「そのリストに現れていれば .setsym の値、
+        現れていなければ 0」に束縛される。
+        """
+        if len(i) == 0 or i[0] != '.enum':
+            return False
+        var_field = i[1].strip() if len(i) >= 2 else ''
+        names_field = i[2] if len(i) >= 3 else ''
+        expr_field = i[3] if len(i) >= 4 else ''
+        var = var_field.lower()
+        if len(var) != 1 or var not in LOWER:
+            self.state.diag(f" error - .enum: variable should be a lower case letter ('{var_field}').", set_error=True)
+            return True
+        names = []
+        for nm in names_field.split(','):
+            nm = StringUtils.upper(nm.strip())
+            if nm and nm not in names:
+                names.append(nm)
+        if not names:
+            self.state.diag(" error - .enum: no enumeration element is given.", set_error=True)
+            return True
+        if not expr_field.strip():
+            self.state.diag(" error - .enum: the value expression is missing.", set_error=True)
+            return True
+        self.state.enum_defs[var] = (tuple(names), expr_field)
+        return True
+
+    def clrenum_processing(self, i):
+        if len(i) == 0 or i[0] != '.clrenum':
+            return False
+        var_field = i[2].strip() if len(i) >= 3 and i[2] else ''
+        if var_field:
+            var = var_field.lower()
+            if len(var) == 1 and var in LOWER:
+                self.state.enum_defs.pop(var, None)
+            else:
+                self.state.diag(f" error - .clrenum: variable should be a lower case letter ('{var_field}').", set_error=True)
+        else:
+            self.state.enum_defs.clear()
+        return True
+
 
 _SYM_CORE = set(DIGIT + ALPHABET + '_')
 
@@ -3242,6 +3333,68 @@ class PatternMatcher:
                     result[j] = ''
 
         return ''.join(result)
+
+    def _enum_capture(self, s, idx, edef):
+        """`!E<変数>` の位置から列挙要素のリストを読み、式の値を返す。
+
+        受け付けるのは `A0`、`A0-A2`（列挙順での範囲）、およびそれらを `,` か
+        `/` で並べたもの。区切り記号は「その先に要素名が続くとき」だけ消費する
+        ので、`MOVEM !Ex,-(SP)` のようにパターン側が後ろで `,` を使っていても
+        リストの一部と取り違えない。
+
+        返り値は (値, 読み終えた位置)。一致しなければ None。
+        """
+        names = edef[0]
+        present = set()
+        k1, e1 = _enum_name_at(s, StringUtils.skipspc(s, idx), names)
+        if k1 < 0:
+            return None
+        while True:
+            pos = e1
+            pr = StringUtils.skipspc(s, e1)
+            if pr < len(s) and s[pr] == '-':
+                k2, e2 = _enum_name_at(s, StringUtils.skipspc(s, pr + 1), names)
+                if k2 >= k1:
+                    present.update(range(k1, k2 + 1))
+                    pos = e2
+                else:
+                    # 範囲として読めない `-` は、減算などパターン側の続きに残す。
+                    present.add(k1)
+            else:
+                present.add(k1)
+            ps = StringUtils.skipspc(s, pos)
+            if ps < len(s) and s[ps] in ',/':
+                k3, e3 = _enum_name_at(s, StringUtils.skipspc(s, ps + 1), names)
+                if k3 >= 0:
+                    k1, e1 = k3, e3
+                    continue
+            break
+        v = self._enum_eval(edef, present)
+        if v is None:
+            return None
+        return v, pos
+
+    def _enum_eval(self, edef, present):
+        """列挙の式を、出現した要素だけ .setsym の値に束縛して評価する。"""
+        names, expr = edef
+        values = []
+        for k, nm in enumerate(names):
+            if k not in present:
+                values.append(0)
+                continue
+            v = self.symbol_manager.get(nm)
+            if v == "":
+                # 現れた要素に .setsym が無い ＝ パターンファイル側の書き損じ。
+                # 0 を黙って混ぜて誤ったバイトを出すより、不一致にして知らせる。
+                return None
+            values.append(v)
+        prev = self.state.enum_bindings
+        self.state.enum_bindings = (names, values)
+        try:
+            v, _ = self.expr_eval.expression_pat(expr, 0)
+        finally:
+            self.state.enum_bindings = prev
+        return v
 
     def match(self, s, t):
         self.state.deb1 = s
@@ -3419,6 +3572,22 @@ class PatternMatcher:
                     idx_s = idx_s_after
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
                         idx_s += 1
+                    continue
+                elif a == 'E':
+                    if idx_t >= len(t):
+                        return False
+                    a = t[idx_t]
+                    if a == chr(0) or a not in LOWER:
+                        return False
+                    idx_t += 1
+                    edef = self.state.enum_defs.get(a)
+                    if edef is None:
+                        return False
+                    hit = self._enum_capture(s, idx_s, edef)
+                    if hit is None:
+                        return False
+                    v, idx_s = hit
+                    self.var_manager.put(a, v)
                     continue
                 elif a == '!':
                     if idx_t >= len(t):
@@ -5946,6 +6115,7 @@ class Assembler:
             snap = {f: getattr(self.state, f) for f in _DIR_SCALAR_FIELDS}
             snap['symbols'] = dict(self.state.symbols)
             snap['check_constraints'] = dict(self.state.check_constraints)
+            snap['enum_defs'] = dict(self.state.enum_defs)
             snap['vliwnop'] = list(self.state.vliwnop)
             snap['vliwset'] = list(self.state.vliwset)
             return snap
@@ -5955,6 +6125,7 @@ class Assembler:
                 setattr(self.state, f, snap[f])
             self.state.symbols = dict(snap['symbols'])
             self.state.check_constraints = dict(snap['check_constraints'])
+            self.state.enum_defs = dict(snap['enum_defs'])
             self.state.vliwnop = list(snap['vliwnop'])
             self.state.vliwset = list(snap['vliwset'])
 
@@ -5984,6 +6155,10 @@ class Assembler:
             if self.directive_proc.check_processing(i):
                 continue
             if self.directive_proc.clrcheck_processing(i):
+                continue
+            if self.directive_proc.enum_processing(i):
+                continue
+            if self.directive_proc.clrenum_processing(i):
                 continue
 
             lw = len([_ for _ in i if _])
@@ -6192,6 +6367,7 @@ class Assembler:
         line = StringUtils.resolve_vliw_escapes(line)
 
         self.state.check_constraints.clear()
+        self.state.enum_defs.clear()
 
         self.state.symbols = dict(self.state.patsymbols)
 

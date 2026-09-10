@@ -103,7 +103,6 @@ An `instruction` is any combination of
 - integer factors,
 - floating-point expressions.
 
-Axx `instruction`'s pattern language has no grammar, which is a free syntax DSL.
 This is enough to express the *surface syntax* of essentially any imperative
 assembly language, and it is not restricted to conventional mnemonic-plus-
 operand forms. `r1 = r2 + r3` is a legal instruction pattern, which makes axx
@@ -319,6 +318,7 @@ In the `instruction` field:
 | `!Fx` | IEEE-754 bit pattern of a **32-bit** float expression |
 | `!Dx` | IEEE-754 bit pattern of a **64-bit** float expression |
 | `!Qx` | IEEE-754 bit pattern of a **128-bit** float expression |
+| `!Ex` | Value of an **enumerated operand list** declared with `.enum` (section 3.7.1) |
 
 Captured values are referenced from `error_patterns` and `binary_list` by the
 bare letter — the `!` prefix is not repeated there. Every lowercase variable is
@@ -512,6 +512,70 @@ FOO EAX,EBX          -> 0x90 0x00 0x00 0x01   (k omitted)
 FOO EAX{K1},EBX      -> 0x90 0x01 0x00 0x01
 FOO EAX{K2},EBX      -> 0x90 0x02 0x00 0x01
 ```
+
+#### 3.7.1 Enumerated operand lists (`.enum`)
+
+Where `.check` restricts a position to *one* symbol out of a set, `.enum`
+declares a position that takes a *list* of them — a register list such as the
+68000's `MOVEM`.
+
+```
+.enum::<variable>::<element,element,...>::<expression>
+```
+
+The element order is the enumeration order, and it is what a `-` range in the
+source means. In `<expression>` each element name evaluates to
+
+- its `.setsym` value, if that element appears in the source list, and
+- `0`, if it does not.
+
+The list is captured with `!E<variable>`; the value of `<expression>` is bound
+to the variable and is then referenced from `error_patterns` and `binary_list`
+by the bare letter, exactly like every other capture.
+
+```
+.setsym::A0::0x01
+.setsym::A1::0x02
+.setsym::A2::0x04
+.setsym::B0::0x08
+.setsym::B1::0x10
+.setsym::B2::0x20
+.enum::x::A0,A1,A2,B0,B1,B2::A0|A1|A2|B0|B1|B2
+MOVEM !Ex :: :: @@[8,*(x,%%)]
+```
+
+```
+movem a0-a2,b2       -> 27 00 00 00 00 00 00 00   (0x01|0x02|0x04|0x20)
+movem a0-a2/b2       -> the same; `,` and `/` are both separators
+movem a0/a2          -> 05 00 00 00 00 00 00 00
+movem a1             -> 02 00 00 00 00 00 00 00
+```
+
+The expression is an ordinary axx expression, so the elements do not have to
+combine as a bit mask. Weighting them by hand gives a positional encoding
+instead:
+
+```
+.enum::y::A0,A1,A2,B0,B1,B2::A0*100000+A1*10000+A2*1000+B0*100+B1*10+B2
+```
+
+Notes.
+
+- **Separators.** `,` and `/` both separate elements, and `first-last` is a
+  range over the enumeration order. A separator is consumed only when another
+  element follows it, so a pattern may keep using `,` after the list:
+  `PUSH !Ex,-(SP)` matches `push a0-a2,-(sp)`. A `-` that is not followed by an
+  element is likewise left for the rest of the pattern, so `SUBT !Ev-!d`
+  matches `subt a0-9`.
+- **A reversed range** (`a2-a0`) is not read as a range; the `-` is left to the
+  pattern.
+- **An element that appears in the source but has no `.setsym` definition**
+  makes the pattern not match, rather than contributing 0 silently.
+- `#name` inside `<expression>` is the plain `.setsym` value, unaffected by
+  whether the element appeared.
+- `.enum` is positional like `.check`: a later `.enum` for the same variable
+  replaces the earlier one, and `.clrenum::x` (or `.clrenum` with no argument)
+  removes it.
 
 ### 3.8 Optional parts (`[[ ]]`)
 
@@ -916,9 +980,14 @@ The same material is kept as a standalone document in `MACRO.md` (Japanese) and
 `macro_en.md` (English).
 
 This is a source-to-source transformation that runs **before** the assembler
-proper. Label values, `.equ` definitions and `$` / `$$` are therefore *not*
-visible to it — this is deliberate, so that expansion results stay consistent
-across relaxation passes.
+proper. Macros in source files can nonetheless read label values, `.equ`
+definitions and the `$` / `$$` location counter: what they see is the value from
+the *previous* relaxation iteration (0 / undefined on the first one). Because
+expansion can then change from iteration to iteration, convergence is enforced
+by the relaxation loop itself — it caps iterations, detects oscillation, and
+aborts without writing an output file rather than emitting a wrong binary.
+Pattern-file macros run before any source is assembled and so have no access to
+either. See `MACRO.md` / `macro_en.md` for the details.
 
 Both `axx.py` and `caxx.c` implement the same specification. The only
 difference is numeric representation: Paxx uses arbitrary-precision integers,
@@ -1246,7 +1315,7 @@ Reduced to its minimum, an imperative assembly language is
 practical use rather than out of necessity.
 
 What axx does is extract the common structure of the von Neumann architecture,
-metamodel the ISA, generalization of the format for describing ISAs, and formalize the result as pattern matching.
+metamodel the ISA, and formalize the result as pattern matching.
 
 ### 10.3 Why the pattern language is not Turing-complete
 
