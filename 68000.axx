@@ -199,6 +199,30 @@
 !{H} #!f!{T} :: f>65535;3,f<-32768;3 :: (!{OP}|0x3C)>>8,(!{OP}|0x3C)!{IM},f>>8,f!{TB}
 !{H} !f!{T} ::  :: (!{OP}|0x39)>>8,(!{OP}|0x39)!{IM},f>>24,f>>16,f>>8,f!{TB}
 }
+/* BTST's two forms use different <ea> sets even though both are "Data": the
+/* register form (BTST Dn,<ea>) accepts an immediate <ea>, but the immediate
+/* form (BTST #n,<ea>) does not -- the manual's own table lists "#<data>"
+/* as "-- --" (not encodable) for the static-bit-number instruction word,
+/* while it lists PC-relative and everything else the same as EA_DATAW. */
+!def EA_DATAW_NOIMM(H, T, OP, IM, TB = "", IMLEN = "0") {
+!{H} d!{T} ::  :: (!{OP}|0x00|d)>>8,(!{OP}|0x00|d)!{IM}!{TB}
+!{H} (a)!{T} ::  :: (!{OP}|0x10|a)>>8,(!{OP}|0x10|a)!{IM}!{TB}
+!{H} (a)+!{T} ::  :: (!{OP}|0x18|a)>>8,(!{OP}|0x18|a)!{IM}!{TB}
+!{H} -(a)!{T} ::  :: (!{OP}|0x20|a)>>8,(!{OP}|0x20|a)!{IM}!{TB}
+!{H} !f(a)!{T} :: f>32767;3,f<-32768;3 :: (!{OP}|0x28|a)>>8,(!{OP}|0x28|a)!{IM},f>>8,f!{TB}
+!{H} !f(a,i.W)!{T} :: f>127;3,f<-128;3 :: (!{OP}|0x30|a)>>8,(!{OP}|0x30|a)!{IM},(i<<4),f!{TB}
+!{H} !f(a,i.L)!{T} :: f>127;3,f<-128;3 :: (!{OP}|0x30|a)>>8,(!{OP}|0x30|a)!{IM},(0x08|(i<<4)),f!{TB}
+!{H} !f(a,j.W)!{T} :: f>127;3,f<-128;3 :: (!{OP}|0x30|a)>>8,(!{OP}|0x30|a)!{IM},(0x80|(j<<4)),f!{TB}
+!{H} !f(a,j.L)!{T} :: f>127;3,f<-128;3 :: (!{OP}|0x30|a)>>8,(!{OP}|0x30|a)!{IM},(0x88|(j<<4)),f!{TB}
+!{H} (!f).W!{T} :: f>65535;3,f<-32768;3 :: (!{OP}|0x38)>>8,(!{OP}|0x38)!{IM},f>>8,f!{TB}
+!{H} (!f).L!{T} ::  :: (!{OP}|0x39)>>8,(!{OP}|0x39)!{IM},f>>24,f>>16,f>>8,f!{TB}
+!{H} !f(PC)!{T} ::  :: (!{OP}|0x3A)>>8,(!{OP}|0x3A)!{IM},(f-($$+2+!{IMLEN}))>>8,(f-($$+2+!{IMLEN}))!{TB}
+!{H} !f(PC,i.W)!{T} ::  :: (!{OP}|0x3B)>>8,(!{OP}|0x3B)!{IM},(i<<4),(f-($$+2+!{IMLEN}))!{TB}
+!{H} !f(PC,i.L)!{T} ::  :: (!{OP}|0x3B)>>8,(!{OP}|0x3B)!{IM},(0x08|(i<<4)),(f-($$+2+!{IMLEN}))!{TB}
+!{H} !f(PC,j.W)!{T} ::  :: (!{OP}|0x3B)>>8,(!{OP}|0x3B)!{IM},(0x80|(j<<4)),(f-($$+2+!{IMLEN}))!{TB}
+!{H} !f(PC,j.L)!{T} ::  :: (!{OP}|0x3B)>>8,(!{OP}|0x3B)!{IM},(0x88|(j<<4)),(f-($$+2+!{IMLEN}))!{TB}
+!{H} !f!{T} ::  :: (!{OP}|0x39)>>8,(!{OP}|0x39)!{IM},f>>24,f>>16,f>>8,f!{TB}
+}
 !def EA_DATAL(H, T, OP, IM, TB = "", IMLEN = "0") {
 !{H} d!{T} ::  :: (!{OP}|0x00|d)>>8,(!{OP}|0x00|d)!{IM}!{TB}
 !{H} (a)!{T} ::  :: (!{OP}|0x10|a)>>8,(!{OP}|0x10|a)!{IM}!{TB}
@@ -569,7 +593,7 @@ ROL s,d :: :: (0xE158|(s<<9)|0x20|d)>>8,(0xE158|(s<<9)|0x20|d)
 
 /* ================= bit manipulation ================= */
 !EA_DATAW("BTST s,", "", "(0x0100|(s<<9)|0x00)", "", "")
-!EA_DATAW("BTST #!e,", "", "0x0800", ",0x00,e", "", "2")
+!EA_DATAW_NOIMM("BTST #!e,", "", "0x0800", ",0x00,e", "", "2")
 !EA_DALT("BCHG s,", "", "(0x0100|(s<<9)|0x40)", "", "")
 !EA_DALT("BCHG #!e,", "", "0x0840", ",0x00,e", "")
 !EA_DALT("BCLR s,", "", "(0x0100|(s<<9)|0x80)", "", "")
