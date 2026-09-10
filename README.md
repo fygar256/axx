@@ -1068,12 +1068,22 @@ Built-in functions:
 
 ```
 len(s)  hex(v[,digits])  str(v)  int(s[,base])  upper(s)  lower(s)
-substr(s,start[,length])  abs(v)  min(...)  max(...)  uid()  defined(name)
+substr(s,start[,length])  abs(v)  min(...)  max(...)  uid()  label(name)
+defined(name)
 ```
 
 `substr()` clamps start and length to the string. A negative start means the
 beginning (0), **not** Python-style indexing from the end; a negative length is
 treated as 0.
+
+`label(name)` reads an assembler-side label or `.equ` value for a name that
+cannot be written as a macro identifier, such as `label(".L1")`. A name that
+*is* a valid identifier is read by writing it bare — a bare identifier resolves
+to a macro variable first, and to a label only if no variable is found. Both
+forms work in source files only; in a pattern file no labels exist yet, so a
+bare identifier resolves only as a macro variable. What either form reads is
+the value from the previous relaxation iteration, as described at the top of
+this section.
 
 Implicit variables inside a macro:
 
