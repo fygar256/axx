@@ -657,6 +657,36 @@ the two against each other, skips the pattern's `+`, and hands the expression �
 starting at the `-` — to the expression evaluator. No special notation is
 needed in the pattern file.
 
+### 3.14 Custom error messages (`.error`)
+
+```
+.error::n::"Message text"
+```
+
+Registers the text shown for error code `n` — the same `n` an
+`error_patterns` condition raises with `;n` (section 3.4). Two of the six
+built-in codes (4, and 7 and above) ship with no message (section 9); `.error`
+gives them one, and can also override the text of an existing code (1, 2, 3,
+5, 6). `n` must be a non-negative integer expression; the message must be a
+double-quoted string literal, with the same `\n` `\t` `\r` `\"` `\\`
+`\xHH` `\uHHHH` `\UHHHHHHHH` escapes as `.INCLUDE` filenames (section 3.11).
+
+```
+.error::4::"Immediate value not representable in this addressing mode."
+.error::9::"Shift amount out of range."
+ADD A,!v :: v<0||v>0xff;4 :: 0xc6,v
+SHL A,!v :: v>7;9 :: 0xd0,v
+```
+
+`add a,300` now reports code 4 with the message above instead of the default
+empty text; `shl a,9` reports the newly-defined code 9. Like `.setsym`, a
+later `.error` for the same `n` overrides an earlier one — but unlike
+`.setsym`, the table has no meaningful notion of region-dependent
+redefinition, so in practice one `.error` per code near the top of the file is
+the natural style. A code that is never given a message still raises its
+error and still blocks the output file from being written; only the printed
+text stays blank, exactly as for an undeclared code today.
+
 ---
 
 ## 4. VLIW and EPIC processors
@@ -1293,8 +1323,9 @@ Errors raised by `error_patterns`, selected by the code after `;`:
 | 7 and above | *(none)* |
 
 A code with no text still raises the error and still prevents the output file
-from being written; only the message is blank. To add messages, extend the
-`ERRORS` table in `axx.py` and the matching table in `caxx.c`.
+from being written; only the message is blank. To add or override messages
+from a pattern file, without touching either implementation's source, use
+`.error::n::"Message"` (section 3.14).
 
 ---
 

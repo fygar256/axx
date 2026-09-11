@@ -635,6 +635,11 @@ class AssemblerState:
         # 要素名は「出現していれば .setsym の値、非出現なら 0」に束縛される。
         self.enum_bindings: list | None = None
 
+        # error_patterns 欄（例: `n>7;5`）が返すエラーコード → メッセージ文字列。
+        # 実行ごとに独立した可変コピーとして持ち、モジュール定数 ERRORS を汚さない。
+        # .error::n::"Message" ディレクティブで上書き・拡張できる。
+        self.errors: list = list(ERRORS)
+
         # セクションは .section / .endsection の出入りで断片化しうる。
         # その断片ごとの (名前, 開始, ワード数) を順に記録する。
         self.section_ranges: list = []
@@ -3178,8 +3183,8 @@ class DirectiveProcessor:
                 except (OverflowError, ValueError):
                     t_int = 0
                 print(f"Line {self.state.ln} Error code {t_int} ", end="", file=sys.stderr)
-                if 0 <= t_int < len(ERRORS):
-                    print(f"{ERRORS[t_int]}", end='', file=sys.stderr)
+                if 0 <= t_int < len(self.state.errors):
+                    print(f"{self.state.errors[t_int]}", end='', file=sys.stderr)
                 print(": ", file=sys.stderr)
                 error_code = t_int
                 triggered = True
@@ -3273,6 +3278,51 @@ class DirectiveProcessor:
                 self.state.diag(f" error - .clrenum: variable should be a lower case letter ('{var_field}').", set_error=True)
         else:
             self.state.enum_defs.clear()
+        return True
+
+    def errmsg_processing(self, i):
+        """`.error::n::"Message"` — error_patterns 欄（`n>7;5` の `5` のような
+        エラーコード）に対応するメッセージ文字列を ERRORS テーブルに登録する。
+
+        組み込みの ERRORS が文言を持たないコード（4 や 7 以上）にも新しく
+        メッセージを追加できるし、既存コード（1・2・3・5・6）の文言を
+        上書きすることもできる。n がテーブルの現在の大きさを超える場合は
+        空文字列で埋めて拡張する（README 9章の「文言の無いコードは空文字列で
+        表示される」という既定動作と整合する）。
+        """
+        if len(i) == 0 or i[0] != '.error':
+            return False
+
+        n_field = i[1].strip() if len(i) >= 2 else ''
+        msg_field = i[2] if len(i) >= 3 else ''
+
+        if not n_field:
+            self.state.diag(" error - .error directive requires an error code (number).", set_error=True)
+            return True
+
+        self.state.error_undefined_label = False
+        n, _idx = self.expr_eval.expression_pat(n_field, 0)
+        bad = self.state.error_undefined_label or _is_undef_derived(n)
+        self.state.error_undefined_label = False
+
+        n_int = None
+        if not bad:
+            try:
+                n_int = int(n)
+            except (OverflowError, ValueError, TypeError):
+                n_int = None
+        if n_int is None or n_int != n or n_int < 0:
+            self.state.diag(f" error - .error: error code must be a non-negative integer, got {n_field!r}.", set_error=True)
+            return True
+
+        if not msg_field.strip().startswith('"'):
+            self.state.diag(f" error - .error: message must be a double-quoted string, got {msg_field!r}.", set_error=True)
+            return True
+        msg = StringUtils.get_string(msg_field.strip())
+
+        if n_int >= len(self.state.errors):
+            self.state.errors.extend([''] * (n_int + 1 - len(self.state.errors)))
+        self.state.errors[n_int] = msg
         return True
 
 
@@ -6159,6 +6209,8 @@ class Assembler:
             if self.directive_proc.enum_processing(i):
                 continue
             if self.directive_proc.clrenum_processing(i):
+                continue
+            if self.directive_proc.errmsg_processing(i):
                 continue
 
             lw = len([_ for _ in i if _])

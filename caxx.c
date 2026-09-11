@@ -416,6 +416,15 @@ static AXX_UNUSED void sv_free(StrVec *v){
     for(int i=0;i<v->len;i++)free(v->data[i]);
     free(v->data); sv_init(v);
 }
+/* 添字 idx の要素を s に置き換える。len<=idx なら空文字列で埋めて伸ばす。
+ * .error::n::"Message" のような「番号を指定して差し替える」用途向け。 */
+static AXX_UNUSED void sv_set(StrVec *v, int idx, const char *s){
+    while(v->len<=idx) sv_push(v, "");
+    char *dup = strdup(s);
+    if(!dup){perror("strdup"); exit(1);}
+    free(v->data[idx]);
+    v->data[idx] = dup;
+}
 
 /* .enum で登録された列挙。names は要素名（大文字化済み）を列挙順に、
  * expr は `!E<変数>` が拾ったリストから値を作る式を持つ。
@@ -1011,6 +1020,11 @@ typedef struct {
     const StrVec    *enum_bind_names;
     const uint256_t *enum_bind_vals;
 
+    /* error_patterns 欄が返すエラーコード → メッセージ文字列。
+     * ERRORS_TABLE の実行時可変コピーとして state_init() で複製する。
+     * .error::n::"Message" ディレクティブで上書き・拡張できる。 */
+    StrVec     errors;
+
     /* 式の再帰深度。深すぎる入れ子でネイティブスタックを溢れさせない番人 */
     int        expr_depth;
 
@@ -1509,6 +1523,8 @@ static void state_init(AsmState *st) {
     for(int _ci=0; _ci<26; _ci++) enumdef_init(&st->enum_defs[_ci]);
     st->enum_bind_names = NULL;
     st->enum_bind_vals  = NULL;
+    sv_init(&st->errors);
+    for(int _ei=0; _ei<ERRORS_COUNT; _ei++) sv_push(&st->errors, ERRORS_TABLE[_ei]);
 }
 
 static char axx_upper_char(char c) {
@@ -4314,6 +4330,59 @@ static int dir_clrenum(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.error::n::"Message"` — error_patterns 欄（`n>7;5` の `5` のような
+ * エラーコード）に対応するメッセージ文字列を errors テーブルに登録する。
+ * 組み込みの ERRORS_TABLE が文言を持たないコード（4 や 7 以上）にも
+ * 新しくメッセージを追加できるし、既存コード（1・2・3・5・6）の文言を
+ * 上書きすることもできる。n がテーブルの現在の大きさを超える場合は
+ * 空文字列で埋めて拡張する（axx.py の errmsg_processing と対応）。 */
+static int dir_errmsg(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".error") != 0) return 0;
+
+    const char *n_field   = e->f[1];
+    const char *msg_field = e->f[2];
+
+    int n_blank = 1;
+    for(const char *q = n_field; *q; q++)
+        if(*q != ' ' && *q != '\t'){ n_blank = 0; break; }
+    if(n_blank){
+        axx_diagf(1, 0, " error - .error directive requires an error code (number).\n");
+        return 1;
+    }
+
+    AsmState *st = &asmb->st;
+    st->error_undefined_label = 0;
+    int io;
+    uint256_t n = expr_expression_pat(asmb, n_field, 0, &io);
+    int64_t n_int = u256_to_i64(n);
+    if(st->error_undefined_label || u256_is_undef_derived(n)
+       || n_int < 0 || !u256_eq(n, u256_from_i64(n_int))){
+        axx_diagf(1, 0, " error - .error: error code must be a non-negative integer, got '%s'.\n", n_field);
+        st->error_undefined_label = 0;
+        return 1;
+    }
+    st->error_undefined_label = 0;
+
+    int idx0 = axx_skipspc(msg_field, 0);
+    if(msg_field[idx0] != '"'){
+        axx_diagf(1, 0, " error - .error: message must be a double-quoted string, got '%s'.\n", msg_field);
+        return 1;
+    }
+
+    /* 復号後の文字列はエスケープの分だけ短くなりこそすれ伸びないので、
+     * 元欄の長さ+1 を出力バッファに取れば絶対に切り詰まらない。 */
+    size_t mlen = strlen(msg_field);
+    char stackbuf[512];
+    char *msg = (mlen < sizeof(stackbuf)) ? stackbuf : malloc(mlen + 1);
+    if(!msg){ perror("malloc"); exit(1); }
+    axx_get_string(msg_field, msg, mlen + 1);
+
+    sv_set(&st->errors, (int)n_int, msg);
+
+    if(msg != stackbuf) free(msg);
+    return 1;
+}
+
 static int dir_error(Assembler *asmb, const char *s){
     AsmState *st=&asmb->st;
     int has_content=0;
@@ -4347,7 +4416,7 @@ static int dir_error(Assembler *asmb, const char *s){
         if((should_report_errors(st))&&!u256_is_zero(u)){
             int64_t tc=u256_to_i64(t);
             fprintf(stderr,"Line %d Error code %lld ",(int)st->ln,(long long)tc);
-            if(tc>=0&&tc<ERRORS_COUNT) fprintf(stderr,"%s",ERRORS_TABLE[tc]);
+            if(tc>=0&&tc<st->errors.len) fprintf(stderr,"%s",st->errors.data[tc]);
             fprintf(stderr,": \n");
             triggered=1;
             st->had_error=1;
@@ -6444,6 +6513,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         if(dir_clrcheck(asmb,i)) continue;
         if(dir_enum(asmb,i)) continue;
         if(dir_clrenum(asmb,i)) continue;
+        if(dir_errmsg(asmb,i)) continue;
 
         int lw=0; for(int fi=0;fi<PAT_FIELDS;fi++) if(i->f[fi][0]) lw++;
         if(lw==0) continue;
