@@ -6594,7 +6594,7 @@ class Assembler:
         if _show:
             self.state.cl = cleaned
             print("%016x " % self.state.pc, end='')
-            print(f"{self.state.current_file} {self.state.ln} {self.state.cl} ", end='')
+            print(f"{self.state.current_file} {self.state.ln} {self.state.cl} //", end='')
         f = self.lineassemble(cleaned)
         if _show:
             print("")

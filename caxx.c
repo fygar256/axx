@@ -7108,7 +7108,7 @@ static int lineassemble0(Assembler *asmb, const char *line){
 
     int show = (st->pas==0) || ((st->pas==2) && st->verbose);
     if(show){
-        printf("%016llx %s %d %s ",(unsigned long long)u256_to_u64(st->pc),
+        printf("%016llx %s %d %s //",(unsigned long long)u256_to_u64(st->pc),
                st->current_file, st->ln, cleaned);
     }
     int f=lineassemble(asmb,cleaned);
