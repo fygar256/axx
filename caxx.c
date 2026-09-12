@@ -5120,6 +5120,18 @@ static void readpat(Assembler *asmb, const char *fn){
             if(idx>=(int)strlen(line)||nf>=8) break;
         }
 
+        if(nf==1){
+            int nonblank=0;
+            for(const char*p=fields[0];*p;p++){ if(!isspace((unsigned char)*p)){ nonblank=1; break; } }
+            if(nonblank){
+                axx_diagf(0, 0, " warning - pattern line has no '::' field separator "
+                           "and can never match (a pattern file has no line-"
+                           "continuation mechanism, so this is likely a stray "
+                           "line left over from a multi-line comment, or a "
+                           "binary_list/error_patterns that was continued onto "
+                           "the next physical line): '%s'\n", fields[0]);
+            }
+        }
         PatEntry *pe=pv_push_blank(&asmb->st.pat);
         if(nf==1){ pat_set(pe,0,fields[0]); }
         else if(nf==2){ pat_set(pe,0,fields[0]); pat_set(pe,2,fields[1]); }
@@ -9822,11 +9834,18 @@ static void m_exec_block(MacroPP *mp, MBlock *b){
 
 
 static void m_read_lines(MacroPP *mp, FILE *f, const char *display, MSrc *out){
+    /* 行末が '\' の行は次の行と連結する(行継続)。パターンファイル・ソース
+     * ファイルのどちらも1物理行=1パターン/1命令が前提の実装なので、複雑な
+     * 式を複数行に分けて書くとそこで暗黙に切れてしまう(README Appendix A.3
+     * の AND immediate 例がまさにこれで、警告も出さずに後半のフィールドを
+     * 取りこぼしていた)。要素数(=行番号の基準)は変えず、継続元の行は空文字
+     * 列にして、連結された内容は継続が終わった行の位置にまとめる。 */
     int cap = 256, n = 0;
     MLine *d = marena_alloc(&mp->arena, (size_t)cap * sizeof(MLine));
     char *line = NULL; size_t lcap = 0;
     ssize_t r;
     char *name = marena_strdup(&mp->arena, display);
+    char *pending = NULL; size_t pending_len = 0;
     while((r = getline(&line, &lcap, f)) != -1){
         while(r > 0 && (line[r-1] == '\n' || line[r-1] == '\r')) line[--r] = '\0';
         if(n >= cap){
@@ -9835,10 +9854,44 @@ static void m_read_lines(MacroPP *mp, FILE *f, const char *display, MSrc *out){
             memcpy(nd, d, (size_t)n * sizeof(MLine));
             d = nd; cap = nc;
         }
-        d[n].text = marena_strndup(&mp->arena, line, (size_t)r);
+        int continued = (r > 0 && line[r-1] == '\\');
+        size_t body_len = continued ? (size_t)(r - 1) : (size_t)r;
+        if(continued){
+            char *np = realloc(pending, pending_len + body_len + 1);
+            if(!np){ perror("realloc"); exit(1); }
+            pending = np;
+            memcpy(pending + pending_len, line, body_len);
+            pending_len += body_len;
+            pending[pending_len] = '\0';
+            d[n].text = marena_strdup(&mp->arena, "");
+        } else if(pending){
+            char *np = realloc(pending, pending_len + body_len + 1);
+            if(!np){ perror("realloc"); exit(1); }
+            pending = np;
+            memcpy(pending + pending_len, line, body_len);
+            pending_len += body_len;
+            pending[pending_len] = '\0';
+            d[n].text = marena_strdup(&mp->arena, pending);
+            free(pending); pending = NULL; pending_len = 0;
+        } else {
+            d[n].text = marena_strndup(&mp->arena, line, body_len);
+        }
         d[n].file = name;
         d[n].line = n + 1;
         n++;
+    }
+    if(pending){
+        if(n >= cap){
+            int nc = cap + 1;
+            MLine *nd = marena_alloc(&mp->arena, (size_t)nc * sizeof(MLine));
+            memcpy(nd, d, (size_t)n * sizeof(MLine));
+            d = nd; cap = nc;
+        }
+        d[n].text = marena_strdup(&mp->arena, pending);
+        d[n].file = name;
+        d[n].line = n + 1;
+        n++;
+        free(pending); pending = NULL;
     }
     free(line);
     out->d = d; out->n = n;

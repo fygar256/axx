@@ -790,6 +790,40 @@ class StringUtils:
         return s.translate(StringUtils._ASCII_UPPER)
 
     @staticmethod
+    def join_backslash_continuations(raw_lines):
+        """行末が '\\' で終わる行を、次の行と1つの論理行に連結する。
+
+        パターンファイル・ソースファイルのどちらも1物理行=1パターン/1命令が
+        前提の実装なので、複雑な式を複数行に分けて書くとそこで暗黙に切れて
+        しまう(README Appendix A.3 の AND immediate 例がまさにこれで、警告
+        も出さずに後半のフィールドを取りこぼしていた)。'\\' を末尾に置けば
+        次の行と連結されるようにして、書き手が意図して複数行に分けられる
+        ようにする。
+
+        要素数は変えない: 継続元の行は空文字列に置き換え、連結された内容は
+        継続が終わった行の位置にまとめる。呼び出し側は行番号を「リスト内で
+        の位置」で数えていることが多いので、これで既存の行番号処理に影響を
+        与えない。
+        """
+        out = []
+        pending = ''
+        for raw in raw_lines:
+            body, ending = raw, ''
+            if body.endswith('\r\n'):
+                body, ending = body[:-2], '\r\n'
+            elif body.endswith('\n') or body.endswith('\r'):
+                body, ending = body[:-1], body[-1]
+            if body.endswith('\\'):
+                pending += body[:-1]
+                out.append('')
+            else:
+                out.append(pending + body + ending)
+                pending = ''
+        if pending:
+            out.append(pending)
+        return out
+
+    @staticmethod
     def q(s, t, idx):
         """s の idx 位置が文字列 t で始まるか（大小文字を無視して）判定する。"""
         return StringUtils.upper(s[idx:idx + len(t)]) == StringUtils.upper(t)
@@ -3847,6 +3881,7 @@ class PatternFileReader:
         except OSError as e:
             diag(f" error - cannot open pattern file '{fn}': {e}", set_error=True)
             return []
+        raw_lines = StringUtils.join_backslash_continuations(raw_lines)
 
         for l, _mfile, _mln in self.macro_proc.expand(raw_lines, fn):
 
@@ -3871,6 +3906,13 @@ class PatternFileReader:
                 l = r
 
                 if len(l) == 1:
+                    if l[0].strip() != '':
+                        diag(f" warning - pattern line has no '::' field separator "
+                             f"and can never match (a pattern file has no line-"
+                             f"continuation mechanism, so this is likely a stray "
+                             f"line left over from a multi-line comment, or a "
+                             f"binary_list/error_patterns that was continued onto "
+                             f"the next physical line): {l[0]!r}", set_error=False)
                     p = [l[0], '', '', '', '', '']
                 elif len(l) == 2:
                     p = [l[0], '', l[1], '', '', '']
@@ -6679,6 +6721,7 @@ class Assembler:
                 self.state.diag(f" error - cannot open source file '{fn}': {e}",
                                 set_error=True)
                 return
+            af = StringUtils.join_backslash_continuations(af)
 
             # マクロ層の $/$$ は「展開後の何行目か」で決まる値なので、名前で
             # 引けるラベルと違って行番号でしか対応が取れない。この反復での
