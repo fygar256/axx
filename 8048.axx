@@ -9,11 +9,11 @@ ANL    A,R!n   ::       n>7;5         ::       n|0x58
 ANL    A,# !d  ::       d>0xFF;1      ::       0x53,d
 ANL    BUS,# !d::       d>0xFF;1      ::       0x98,d
 
-; ANL/ORL Px,#d → P1とP2のみ有効
+/* ANL/ORL Px,#d → P1とP2のみ有効 */
 ANL    P!c,# !d::       c!=1&&c!=2;6,d>0xFF;1  ::       (c|0x98),d
 ORL    P!c,# !d::       c!=1&&c!=2;6,d>0xFF;1  ::       (c|0x88),d
 
-; ANLD/ORLD → P4～P7のみ有効（8243用）
+/* ANLD/ORLD → P4～P7のみ有効（8243用） */
 ANLD   P!z,A   ::       z<4||z>7;6             ::       (z&3)|0x9C
 ORLD   P!c,A   ::       c<4||c>7;6             ::       (c&3)|0x8C
 
@@ -36,11 +36,11 @@ EN     I       ::                               0x05
 EN     TCNTI   ::                               0x25
 ENT0   CLK     ::                               0x75
 
-; IN A,Px / OUTL Px,A → P1とP2のみ有効
+/* IN A,Px / OUTL Px,A → P1とP2のみ有効 */
 IN     A,P!c   ::       c!=1&&c!=2;6          ::       c|0x08
 OUTL   P!c,A   ::       c!=1&&c!=2;6          ::       c|0x38
 
-; BUS専用命令（Syntax error対策）
+/* BUS専用命令（Syntax error対策） */
 OUTL   BUS,A   ::                               0x02
 
 INC    A       ::                               0x17
