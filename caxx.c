@@ -5135,6 +5135,24 @@ static void readpat(Assembler *asmb, const char *fn){
     fclose(f);
     f = NULL;
 
+    /* 破綻点修正: 「本物の複数行ブロックコメント(閉じ記号が後の行にある)」
+     * と「開始記号を単なる行末コメントの目印として毎行書くだけの古い流儀
+     * (どの行にも閉じ記号が無い)」の2つの書き方が実在のパターンファイルに
+     * 混在している。前者だけを想定して常に状態を引き継ぐと、後者の書き方
+     * (開始記号だけの行が何行も続くがファイル中に一度も閉じ記号が現れない)を
+     * 「ファイル末尾まで閉じないコメント」として丸ごと呑み込んでしまい、
+     * 実際のパターン行が軒並み消える重大な退行になる。そこで、コメントを
+     * 新規に開いた瞬間だけ「このコメント開始位置より後ろのどこかに閉じ記号が
+     * 本当に存在するか」を先読みし、無ければ複数行へは持ち越さず
+     * (旧来どおりその行だけの扱いに戻し)、あれば従来どおり複数行コメントと
+     * して正しく閉じるまで追跡する。 */
+    int *rest_has_close = malloc(sizeof(int) * (size_t)(nexp + 1));
+    if(!rest_has_close){ perror("malloc"); exit(1); }
+    rest_has_close[nexp] = 0;
+    for(int i = nexp - 1; i >= 0; i--){
+        rest_has_close[i] = rest_has_close[i+1] || (strstr(exp[i], "*/") != NULL);
+    }
+
     char *line = NULL; size_t lcap = 0;
     int in_block_comment = 0;
     for(int li = 0; li < nexp; li++){
@@ -5145,7 +5163,11 @@ static void readpat(Assembler *asmb, const char *fn){
             line = nl; lcap = need;
         }
         memcpy(line, exp[li], need);
+        int was_in_comment = in_block_comment;
         axx_remove_comment(line, &in_block_comment);
+        if(in_block_comment && !was_in_comment && !rest_has_close[li+1]){
+            in_block_comment = 0;
+        }
         for(char*p=line;*p;p++){ if(*p=='\t') *p=' '; if(*p=='\r') *p=' '; }
         int l=(int)strlen(line);
         while(l>0&&(line[l-1]=='\n'||line[l-1]=='\r')) line[--l]=0;
@@ -5199,6 +5221,7 @@ static void readpat(Assembler *asmb, const char *fn){
         axx_diagf(0, 0, " warning - pattern file '%s' ends while a /* ... */ comment "
                    "is still open (missing closing '*/').\n", fn);
     }
+    free(rest_has_close);
     free(line);
     pat_macro_expand_free(exp, nexp);
     asmb->st.pat_include_depth--;

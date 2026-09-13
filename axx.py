@@ -3911,10 +3911,29 @@ class PatternFileReader:
             return []
         raw_lines = StringUtils.join_backslash_continuations(raw_lines)
 
-        in_block_comment = False
-        for l, _mfile, _mln in self.macro_proc.expand(raw_lines, fn):
+        # 破綻点修正: 「本物の複数行ブロックコメント(閉じ記号が後の行にある)」
+        # と「開始記号を単なる行末コメントの目印として毎行書くだけの古い流儀
+        # (どの行にも閉じ記号が無い)」の2つの書き方が実在のパターンファイルに
+        # 混在している。前者だけを想定して常に状態を引き継ぐと、後者の書き方
+        # (開始記号だけの行が何行も続くがファイル中に一度も閉じ記号が現れない)を
+        # 「ファイル末尾まで閉じないコメント」として丸ごと呑み込んでしまい、
+        # 実際のパターン行が軒並み消える重大な退行になる。そこで、コメントを
+        # 新規に開いた瞬間だけ「このコメント開始位置より後ろのどこかに閉じ記号が
+        # 本当に存在するか」を先読みし、無ければ複数行へは持ち越さず
+        # (旧来どおりその行だけの扱いに戻し)、あれば従来どおり複数行コメントと
+        # して正しく閉じるまで追跡する。
+        expanded = list(self.macro_proc.expand(raw_lines, fn))
+        rest_has_close = [False] * (len(expanded) + 1)
+        for i in range(len(expanded) - 1, -1, -1):
+            rest_has_close[i] = rest_has_close[i + 1] or ('*/' in expanded[i][0])
 
+        in_block_comment = False
+        for _li, (l, _mfile, _mln) in enumerate(expanded):
+
+            was_in_comment = in_block_comment
             l, in_block_comment = StringUtils.remove_comment(l, in_block_comment)
+            if in_block_comment and not was_in_comment and not rest_has_close[_li + 1]:
+                in_block_comment = False
             l = l.replace('\t', ' ')
             l = l.replace(chr(13), '')
             l = l.replace('\n', '')
