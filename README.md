@@ -267,8 +267,28 @@ instruction :: error_patterns :: binary_list
 The three fields are separated by `::`. `error_patterns` may be empty, but if
 you omit it entirely the line has only one `::`, which is the two-field form.
 
-**Comments.** `/*` starts a comment that runs to the end of the line. There is
-no `*/`; block comments do not exist.
+**Comments.** `/*` starts a comment. If `*/` appears later on the *same* line,
+only the text between `/*` and `*/` is removed and the rest of the line is
+read normally — `/* note */ MORE` keeps `MORE`. Otherwise the comment behaves
+like a real block comment and continues onto the following lines until a line
+containing `*/` is found; text after that `*/` on the closing line is read
+normally again.
+
+For backward compatibility with older pattern files that write `/*` at the
+start of every commented line instead of opening one real block, a comment
+does **not** extend past its own line when either of these holds:
+
+- the very next line itself begins with `/*`, or
+- no `*/` occurs anywhere later in the file at all.
+
+In both cases the line is truncated at its own `/*` and nothing carries over,
+matching the original single-line behavior — and a whole run of such lines is
+treated the same way, including the run's last line even though the line
+right after it is ordinary (non-comment) content.
+
+In short: closing every block comment with its own `*/`, and opening every
+commented line with its own `/*`, are both fully supported conventions and
+may be mixed freely within one file.
 
 ### 3.2 Pattern order does not matter
 
