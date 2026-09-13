@@ -269,6 +269,18 @@ static uint256_t u256_pow(uint256_t base, uint256_t exp) {
 
 static int64_t u256_to_i64(uint256_t a) { return (int64_t)a.w[0]; }
 static uint64_t u256_to_u64(uint256_t a) { return a.w[0]; }
+/* u256_to_i64/u64 は下位64bitしか見ないため、シフト量や指数のように
+ * 「安全な範囲に収まっているか」を判定する用途にそのまま使うと、上位ワードに
+ * 値が乗っている(=64bitを大きく超える)ケースで切り詰められた小さい値として
+ * 誤判定してしまう(境界チェックの回避を許してしまう)。符号と、小さな定数
+ * 上限との大小関係を上位ワードも含めて正しく判定するヘルパー。 */
+static int u256_is_neg256(uint256_t v){ return (int)(v.w[3]>>63); }
+static int u256_nonneg_gt_i64(uint256_t v, int64_t max){
+    /* v は非負であることが呼び出し側で確認済みという前提。max は 64bit に
+     * 収まる小さな正の定数であることが前提(EXP_MAX/SHIFT_MAX 用途)。 */
+    if(v.w[1] || v.w[2] || v.w[3]) return 1;
+    return v.w[0] > (uint64_t)max;
+}
 
 static int u256_nbit(uint256_t v) {
     int sign = (int)(v.w[3] >> 63);
@@ -2639,12 +2651,20 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
             return 0;
         }
     }
-    char uk[512]; axx_strupr_to(uk,k,sizeof(uk));
+    /* 破綻点修正: 固定長 char uk[512] へ無言で切り詰めていたため、511バイトを
+     * 超える長さのラベル名同士が先頭511文字の一致だけで誤って衝突扱いになったり、
+     * 逆に本来の衝突が511バイト以降の差異のせいで見逃されたりし得た。他の箇所
+     * と同じく axx_word_buf() で必要なら収まらない分をヒープへ逃がす。 */
+    char uk_stackbuf[512]; size_t uk_sz;
+    char *uk = axx_word_buf(k, 0, uk_stackbuf, sizeof(uk_stackbuf), &uk_sz);
+    axx_strupr_to(uk,k,uk_sz);
     uint256_t dummy;
     if(smap_get(&st->patsymbols,uk,&dummy)){
         report_definition_error(st, "patsym", k, "'%s' is a pattern file symbol.", k);
+        if(uk != uk_stackbuf) free(uk);
         return 0;
     }
+    if(uk != uk_stackbuf) free(uk);
     lmap_set(&st->labels,k,v,sec,is_equ,is_undef);
     if(reloc_type >= 0)
         lmap_set_reloc_type(&st->labels, k, reloc_type);
@@ -3051,10 +3071,17 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
         }
     } else if(s[idx]=='~'){
         x=expr_factor(asmb,s,idx+1,&idx);
-        x=u256_not(x);
+        /* 破綻点修正: float 型式では x が IEEE754 の生ビットを保持しているため、
+         * その生ビットに直接 u256_not() を掛けると axx.py の `~int(x)`（数値へ
+         * 変換してから NOT する）と全く違う結果になっていた。<< / >> と同じ
+         * expr_safe_bitwise_operand/expr_bitwise_result で整数域へ変換して
+         * 演算する。 */
+        x=expr_bitwise_result(asmb,u256_not(expr_safe_bitwise_operand(asmb,x,"~")));
     } else if(s[idx]=='@'){
         x=expr_factor(asmb,s,idx+1,&idx);
-        int nb = u256_nbit(x);
+        /* 同上: nbit() は数値としてのビット長を求めるものなので、float 型式では
+         * 生ビットではなく数値へ変換してから渡す(axx.py の nbit(x) と同じ)。 */
+        int nb = u256_nbit(expr_safe_bitwise_operand(asmb,x,"@"));
         if(asmb->st.exp_typ_float)
             x=double_to_u256((double)nb);
         else
@@ -3099,6 +3126,11 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
             if(should_report_errors(st)){
                 axx_diagf(1, 0, " error - expected '(' after '*' in *(expr,expr) expression.\n");
             }
+            /* 破綻点修正: ここで idx を '*' の次へ進めないと、呼び出し元の
+             * 乗算ループ(term0)が同じ未消費の '*' を通常の乗算演算子として
+             * 再度読み、"5+*x" のような壊れた式が 0 * <次の因子> という
+             * 誤った値へ静かに縮退していた。エラー後は '*' を読み飛ばす。 */
+            idx++;
             x=u256_zero();
         }
     } else {
@@ -3581,21 +3613,21 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
              * に合わせる。1<<20 のままだと base_bits(<=256)*exp_factor(<=1024) が
              * 構造的にこの上限を超えられず、桁溢れ検出が常に不発になっていた。 */
             const int64_t EXP_RESULT_MAX_BITS = 256;
-            int64_t t_int = u256_to_i64(t);
-            if(t_int < 0){
+            if(u256_is_neg256(t)){
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - Negative exponent in ** expression; result set to 0.\n");
                 }
                 x = u256_zero();
                 break;
             }
-            if(t_int > EXP_MAX){
+            if(u256_nonneg_gt_i64(t, EXP_MAX)){
                 if(should_report_errors(&asmb->st)){
-                    axx_diagf(1, 0, " error - Exponent %lld exceeds maximum %lld in ** expression; result set to 0.\n",(long long)t_int,(long long)EXP_MAX);
+                    axx_diagf(1, 0, " error - Exponent exceeds maximum %lld in ** expression; result set to 0.\n",(long long)EXP_MAX);
                 }
                 x = u256_zero();
                 break;
             }
+            int64_t t_int = u256_to_i64(t);
             int64_t base_bits = u256_nbit(x);
             int64_t exp_factor = t_int > 1 ? t_int : 1;
             if(base_bits * exp_factor > EXP_RESULT_MAX_BITS){
@@ -3714,32 +3746,32 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
     while(idx<slen){
         if(axx_q(s,slen,"<<",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
-            int64_t sv=u256_to_i64(expr_safe_bitwise_operand(asmb,t,"<<"));
-            if(sv<0){
+            uint256_t sop=expr_safe_bitwise_operand(asmb,t,"<<");
+            if(u256_is_neg256(sop)){
                 if(should_report_errors(&asmb->st)){
-                    axx_diagf(1, 0, " error - negative shift count (%lld) in << expression.\n",(long long)sv);
+                    axx_diagf(1, 0, " error - negative shift count (%lld) in << expression.\n",(long long)u256_to_i64(sop));
                 }
                 x=u256_zero();
-            } else if(sv>SHIFT_MAX){
+            } else if(u256_nonneg_gt_i64(sop,SHIFT_MAX)){
                 if(should_report_errors(&asmb->st)){
-                    axx_diagf(1, 0, " error - shift count %lld exceeds maximum %lld in << expression.\n",(long long)sv,(long long)SHIFT_MAX);
+                    axx_diagf(1, 0, " error - shift count exceeds maximum %lld in << expression.\n",(long long)SHIFT_MAX);
                 }
                 x=u256_zero();
-            } else x=expr_bitwise_result(asmb,u256_shl(expr_safe_bitwise_operand(asmb,x,"<<"),(int)sv));
+            } else x=expr_bitwise_result(asmb,u256_shl(expr_safe_bitwise_operand(asmb,x,"<<"),(int)u256_to_i64(sop)));
         } else if(axx_q(s,slen,">>",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
-            int64_t sv=u256_to_i64(expr_safe_bitwise_operand(asmb,t,">>"));
-            if(sv<0){
+            uint256_t sop=expr_safe_bitwise_operand(asmb,t,">>");
+            if(u256_is_neg256(sop)){
                 if(should_report_errors(&asmb->st)){
-                    axx_diagf(1, 0, " error - negative shift count (%lld) in >> expression.\n",(long long)sv);
+                    axx_diagf(1, 0, " error - negative shift count (%lld) in >> expression.\n",(long long)u256_to_i64(sop));
                 }
                 x=u256_zero();
-            } else if(sv>SHIFT_MAX){
+            } else if(u256_nonneg_gt_i64(sop,SHIFT_MAX)){
                 if(should_report_errors(&asmb->st)){
-                    axx_diagf(1, 0, " error - shift count %lld exceeds maximum %lld in >> expression.\n",(long long)sv,(long long)SHIFT_MAX);
+                    axx_diagf(1, 0, " error - shift count exceeds maximum %lld in >> expression.\n",(long long)SHIFT_MAX);
                 }
                 x=u256_zero();
-            } else x=expr_bitwise_result(asmb,u256_sar(expr_safe_bitwise_operand(asmb,x,">>"),(int)sv));
+            } else x=expr_bitwise_result(asmb,u256_sar(expr_safe_bitwise_operand(asmb,x,">>"),(int)u256_to_i64(sop)));
         } else break;
     }
     *idx_out=idx; return x;
@@ -4355,9 +4387,14 @@ static int dir_errmsg(Assembler *asmb, PatEntry *e){
     int io;
     uint256_t n = expr_expression_pat(asmb, n_field, 0, &io);
     int64_t n_int = u256_to_i64(n);
+    /* エラーコードは errors StrVec の添字として (int) にキャストされ、
+     * 添字ぶんだけ空文字列で埋めて伸長する。上限を設けないと、
+     * INT_MAX を超える値がキャストで負値に化けて配列外アクセスになったり、
+     * 巨大な正値が数十億要素の伸長でハング/OOM したりする。 */
+    #define AXX_ERROR_CODE_MAX 1000000
     if(st->error_undefined_label || u256_is_undef_derived(n)
-       || n_int < 0 || !u256_eq(n, u256_from_i64(n_int))){
-        axx_diagf(1, 0, " error - .error: error code must be a non-negative integer, got '%s'.\n", n_field);
+       || n_int < 0 || n_int > AXX_ERROR_CODE_MAX || !u256_eq(n, u256_from_i64(n_int))){
+        axx_diagf(1, 0, " error - .error: error code must be a non-negative integer (0-%d), got '%s'.\n", AXX_ERROR_CODE_MAX, n_field);
         st->error_undefined_label = 0;
         return 1;
     }
@@ -5274,10 +5311,46 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     size_t ep_cap = 8192;
     char *ep_buf = NULL;
     int is_empty = 0;
+
+    /* 破綻点修正: バッファが小さすぎて再試行するとき、e_p() はキャプチャ
+     * スロット(vars / elf_var_to_label / elf_refs)を書き換える副作用を
+     * 持つ。捨てられる1回目の評価の副作用が2回目の評価に持ち越されると、
+     * 「同じキャプチャ参照の2回目の出現」と誤判定されて曖昧扱いになり、
+     * 有効なラベル→変数キャプチャが静かに失われることがあった。
+     * combo_done 側の既存パターンと同じく、再試行のたびに退避した状態へ
+     * 復元してから e_p() を呼び直す。 */
+    PatVar saved_vars[26];
+    memcpy(saved_vars, st->vars, sizeof(saved_vars));
+    int saved_elf_refs_len = st->elf_refs_len;
+    struct {int set; char *label_name; uint64_t label_val;} saved_vtl[26];
+    for(int vi=0;vi<26;vi++){
+        saved_vtl[vi].set       = st->elf_var_to_label[vi].set;
+        saved_vtl[vi].label_val = st->elf_var_to_label[vi].label_val;
+        saved_vtl[vi].label_name = st->elf_var_to_label[vi].label_name
+                                   ? strdup(st->elf_var_to_label[vi].label_name)
+                                   : NULL;
+    }
+
+    int first_try = 1;
     while(1){
         ep_buf = realloc(ep_buf, ep_cap);
         if(!ep_buf){ perror("realloc"); exit(1); }
         memset(ep_buf, 0, ep_cap);
+        if(!first_try){
+            memcpy(st->vars, saved_vars, sizeof(saved_vars));
+            for(int ri2=saved_elf_refs_len; ri2<st->elf_refs_len; ri2++)
+                free(st->elf_refs[ri2].name);
+            st->elf_refs_len = saved_elf_refs_len;
+            for(int vi=0;vi<26;vi++){
+                free(st->elf_var_to_label[vi].label_name);
+                st->elf_var_to_label[vi].set       = saved_vtl[vi].set;
+                st->elf_var_to_label[vi].label_val = saved_vtl[vi].label_val;
+                st->elf_var_to_label[vi].label_name = saved_vtl[vi].label_name
+                                                       ? strdup(saved_vtl[vi].label_name)
+                                                       : NULL;
+            }
+        }
+        first_try = 0;
         e_p(s_in, ep_buf, ep_cap, &is_empty, asmb, 0);
         size_t used = strlen(ep_buf);
         if(used < ep_cap - 16) break;
@@ -5287,6 +5360,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
             break;
         }
     }
+    for(int vi=0;vi<26;vi++) free(saved_vtl[vi].label_name);
     if(is_empty){ free(ep_buf); return; }
 
     size_t s_cap = strlen(ep_buf) + 64;
@@ -5475,7 +5549,13 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         if(!match && st->vliwtemplatebits!=0) continue;
 
         int io;
+        int _tmpl_prior_undef = st->error_undefined_label;
+        st->error_undefined_label = 0;
         uint256_t xv=expr_expression_pat(asmb,k->templ,0,&io);
+        if(st->error_undefined_label && should_report_errors(st)){
+            st->had_error = 1;
+        }
+        st->error_undefined_label = _tmpl_prior_undef || st->error_undefined_label;
         int at=st->vliwtemplatebits<0?-st->vliwtemplatebits:st->vliwtemplatebits;
         uint256_t tmask=u256_is_zero(u256_from_u64((uint64_t)at))?u256_zero():u256_sub(u256_shl(u256_one(),at),u256_one());
         uint256_t templ=u256_and(xv,tmask);
@@ -7451,7 +7531,16 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int ri=0;ri<st->reloc_count;ri++){
         int sidx=-1;
         for(int i=0;i<ncs;i++) if(strcmp(st->relocations[ri].section,csecs[i].name)==0){sidx=i;break;}
-        if(sidx<0) continue;
+        if(sidx<0){
+            /* 破綻点修正: セクション名が一致しないリロケーションを無警告で
+             * 捨てていたため、修正が抜け落ちた「見た目は正常な」.oファイルが
+             * 静かに生成されていた。診断を出す。 */
+            if(should_report_errors(st)){
+                axx_diagf(1, 0, " error - relocation references unknown section '%s'; dropped from output.\n",
+                           st->relocations[ri].section);
+            }
+            continue;
+        }
         WRL *rl=&rela_lists[sidx];
         if(rl->len>=rl->cap){rl->cap=rl->cap?rl->cap*2:4;rl->data=realloc(rl->data,rl->cap*sizeof(WRE));if(!rl->data){perror("realloc");exit(1);}}
         rl->data[rl->len++]=(WRE){st->relocations[ri].sec_offset,st->relocations[ri].sym,
@@ -7752,6 +7841,21 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     int sym_shidx=ncs+nrela+1;
     int str_shidx=ncs+nrela+2;
 
+    /* 破綻点修正: tot_sh/shstrndx は ELF ヘッダの e_shnum/e_shstrndx
+     * (uint16_t) へ無言でキャストされていたため、セクションヘッダ総数が
+     * 65535 を超えるソースでは値が 65536 でラップし、readelf/objdump が
+     * セクション数を誤解釈する壊れた .o が黙って生成されていた。
+     * (axx.py 側は struct.pack('H', ...) がこの場合に例外で落ちるので、
+     * 少なくとも壊れた出力は書かれない。) SHN_XINDEX 拡張には対応せず、
+     * 明示的にエラーで打ち切る。 */
+    if(tot_sh > 0xFFFF || shstrndx > 0xFFFF){
+        if(should_report_errors(st)){
+            axx_diagf(1, 0, " error - too many ELF section headers (%d) to represent in e_shnum; "
+                       "cannot write ELF object.\n", tot_sh);
+        }
+        goto weo_done;
+    }
+
     FILE *fp=fopen(path,"wb");
     if(!fp){
         if(should_report_errors(st)){
@@ -7874,6 +7978,7 @@ typedef struct { MArenaBlk *head; size_t total; } MArena;
 
 typedef struct MacroPP MacroPP;
 static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...);
+typedef struct { const char *s; int i; MacroPP *mp; const char *file; int line; } MEP;
 
 typedef struct { int is_str; long long i; char *s; } MVal;
 
@@ -8161,24 +8266,58 @@ static inline long long m_i64_neg(long long a){
 static inline long long m_i64_abs(long long a){
     return a < 0 ? m_i64_neg(a) : a;
 }
-static inline long long m_i64_add(long long a, long long b){
-    return (long long)((unsigned long long)a + (unsigned long long)b);
+/* 破綻点修正: 以前は +,-,* を unsigned キャスト経由で無言のままラップアラウンド
+ * させていた。axx.py 側は任意精度整数なので、64bit を超えるマクロ計算では
+ * 両実装が黙って別々の(誤った)値を返す食い違いが起きていた。完全な任意精度化
+ * はここでは行わないが、64bit をオーバーフローする場合は黙って間違った値を
+ * 返す代わりに、呼び出し元(MEP*)経由で明示的にエラーにする。 */
+static inline long long m_i64_add(MEP *p, long long a, long long b){
+    long long r;
+    if(__builtin_add_overflow(a, b, &r)){
+        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
+    }
+    return r;
 }
-static inline long long m_i64_sub(long long a, long long b){
-    return (long long)((unsigned long long)a - (unsigned long long)b);
+static inline long long m_i64_sub(MEP *p, long long a, long long b){
+    long long r;
+    if(__builtin_sub_overflow(a, b, &r)){
+        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
+    }
+    return r;
 }
-static inline long long m_i64_mul(long long a, long long b){
-    return (long long)((unsigned long long)a * (unsigned long long)b);
+static inline long long m_i64_mul(MEP *p, long long a, long long b){
+    long long r;
+    if(__builtin_mul_overflow(a, b, &r)){
+        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
+    }
+    return r;
 }
 static inline long long m_i64_shl(long long a, int n){
     return (long long)((unsigned long long)a << n);
 }
+/* 数値リテラルの桁読み取り専用: 例えば 0xFFFFFFFFFFFFFFFF のような
+ * 64bit いっぱいのビットパターンは、signed long long としては
+ * 「ラップアラウンドして -1 になる」のがビットパターンとして正しい表現であり、
+ * 演算子の桁溢れとは性質が違う。ここでは意図的に無言のラップアラウンドを保つ。 */
+static inline long long m_i64_add_raw(long long a, long long b){
+    return (long long)((unsigned long long)a + (unsigned long long)b);
+}
+static inline long long m_i64_mul_raw(long long a, long long b){
+    return (long long)((unsigned long long)a * (unsigned long long)b);
+}
 
-static long long m_cdiv(long long a, long long b){
+static long long m_cdiv(MEP *p, long long a, long long b){
+    if(a == LLONG_MIN && b == -1){
+        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
+    }
     long long q = m_i64_abs(a) / m_i64_abs(b);
     return ((a >= 0) == (b >= 0)) ? q : m_i64_neg(q);
 }
-static long long m_cmod(long long a, long long b){ return m_i64_sub(a, m_i64_mul(m_cdiv(a, b), b)); }
+static long long m_cmod(MEP *p, long long a, long long b){ return m_i64_sub(p, a, m_i64_mul(p, m_cdiv(p, a, b), b)); }
 
 
 static MScope *m_scope(MacroPP *mp){ return mp->scopes[mp->nscopes - 1]; }
@@ -8331,8 +8470,6 @@ static void m_assign(MacroPP *mp, const char *name, MVal v){
 }
 
 
-typedef struct { const char *s; int i; MacroPP *mp; const char *file; int line; } MEP;
-
 static MVal mep_ternary(MEP *p);
 static MVal m_call_value(MacroPP *mp, const char *name, MVal *args, int nargs,
                          const char *file, int line);
@@ -8387,7 +8524,7 @@ static MVal mep_number(MEP *p){
         else if(c >= 'A' && c <= 'F') d = c - 'A' + 10;
         else break;
         if(d >= base) break;
-        v = m_i64_add(m_i64_mul(v, base), d);
+        v = m_i64_add_raw(m_i64_mul_raw(v, base), d);
         ndig++; j++;
     }
     if(ndig == 0 || j == start){
@@ -8564,7 +8701,7 @@ static MVal mep_mul(MEP *p){
                 b[(size_t)total] = '\0';
                 v = mv_str(b);
             } else {
-                v = mv_int(m_i64_mul(mv_need_int(p->mp, v, p->file, p->line),
+                v = mv_int(m_i64_mul(p, mv_need_int(p->mp, v, p->file, p->line),
                                       mv_need_int(p->mp, r, p->file, p->line)));
             }
         } else if(c == '/'){
@@ -8574,7 +8711,7 @@ static MVal mep_mul(MEP *p){
                 char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
                 m_fail(p->mp, p->file, p->line, "macro expression: division by zero in %s", sr);
             }
-            v = mv_int(m_cdiv(mv_need_int(p->mp, v, p->file, p->line), r));
+            v = mv_int(m_cdiv(p, mv_need_int(p->mp, v, p->file, p->line), r));
         } else if(c == '%'){
             p->i++;
             long long r = mv_need_int(p->mp, mep_unary(p), p->file, p->line);
@@ -8582,7 +8719,7 @@ static MVal mep_mul(MEP *p){
                 char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
                 m_fail(p->mp, p->file, p->line, "macro expression: modulo by zero in %s", sr);
             }
-            v = mv_int(m_cmod(mv_need_int(p->mp, v, p->file, p->line), r));
+            v = mv_int(m_cmod(p, mv_need_int(p->mp, v, p->file, p->line), r));
         } else return v;
     }
 }
@@ -8601,10 +8738,10 @@ static MVal mep_add(MEP *p){
                 char *t = marena_alloc(&p->mp->arena, la + lb + 1);
                 memcpy(t, a, la); memcpy(t + la, b, lb + 1);
                 v = mv_str(t);
-            } else v = mv_int(m_i64_add(v.i, r.i));
+            } else v = mv_int(m_i64_add(p, v.i, r.i));
         } else if(c == '-'){
             p->i++;
-            v = mv_int(m_i64_sub(mv_need_int(p->mp, v, p->file, p->line),
+            v = mv_int(m_i64_sub(p, mv_need_int(p->mp, v, p->file, p->line),
                        mv_need_int(p->mp, mep_mul(p), p->file, p->line)));
         } else return v;
     }
@@ -8621,7 +8758,16 @@ static MVal mep_shift(MEP *p){
                 char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
                 m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range in %s", sr);
             }
-            v = mv_int(m_i64_shl(mv_need_int(p->mp, v, p->file, p->line), (int)n));
+            long long base = mv_need_int(p->mp, v, p->file, p->line);
+            long long shifted = m_i64_shl(base, (int)n);
+            /* 破綻点修正: 64bit を超えて追い出されたビットを黙って捨てていたため、
+             * axx.py(任意精度)と異なる値を無言で返していた。追い出されたビットが
+             * あれば(逆シフトで元に戻らなければ)明示的にエラーにする。 */
+            if(n > 0 && (shifted >> n) != base){
+                char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+                m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
+            }
+            v = mv_int(shifted);
         } else if(p->s[p->i] == '>' && p->s[p->i+1] == '>'){
             p->i += 2;
             long long n = mv_need_int(p->mp, mep_add(p), p->file, p->line);
