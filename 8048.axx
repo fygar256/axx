@@ -40,7 +40,7 @@ ENT0   CLK     ::                               0x75
 IN     A,P!c   ::       c!=1&&c!=2;6          ::       c|0x08
 OUTL   P!c,A   ::       c!=1&&c!=2;6          ::       c|0x38
 
-/* BUS専用命令（Syntax error対策） */
+/* BUS専用命令 */
 OUTL   BUS,A   ::                               0x02
 
 INC    A       ::                               0x17
