@@ -5135,17 +5135,21 @@ static void readpat(Assembler *asmb, const char *fn){
     fclose(f);
     f = NULL;
 
-    /* 破綻点修正: 「本物の複数行ブロックコメント(閉じ記号が後の行にある)」
-     * と「開始記号を単なる行末コメントの目印として毎行書くだけの古い流儀
-     * (どの行にも閉じ記号が無い)」の2つの書き方が実在のパターンファイルに
-     * 混在している。前者だけを想定して常に状態を引き継ぐと、後者の書き方
-     * (開始記号だけの行が何行も続くがファイル中に一度も閉じ記号が現れない)を
-     * 「ファイル末尾まで閉じないコメント」として丸ごと呑み込んでしまい、
-     * 実際のパターン行が軒並み消える重大な退行になる。そこで、コメントを
-     * 新規に開いた瞬間だけ「このコメント開始位置より後ろのどこかに閉じ記号が
-     * 本当に存在するか」を先読みし、無ければ複数行へは持ち越さず
-     * (旧来どおりその行だけの扱いに戻し)、あれば従来どおり複数行コメントと
-     * して正しく閉じるまで追跡する。 */
+    /* 破綻点修正: 「本物の複数行ブロックコメント(閉じ記号が後の行にあり、
+     * 中身の行は開始記号で始まらない)」と「開始記号を単なる行末コメントの
+     * 目印として毎行書くだけの古い流儀(コメントの各行が開始記号で始まり、
+     * 閉じ記号は無いか、あっても離れた場所にある別の無関係なコメントの
+     * ものでしかない)」の2つの書き方が実在のパターンファイルに混在している。
+     * 「次の1行だけ」を見て判定すると、旧来スタイルの連続コメントの最後の
+     * 1行(次の行はもう普通のコード)を誤って「本物のブロックコメント開始」
+     * と誤認し、たまたま遠く離れた場所にある無関係な閉じ記号まで実際の
+     * パターン行を丸ごと呑み込んでしまう(8080.axx で発生)。そこで、
+     * 「直前の行も開始記号で始まる行で、かつ単発扱い(旧来スタイル)と
+     * 判定されていたか」を legacy_chain として引き継ぎ、旧来スタイルの
+     * 連続コメントは何行続いても・最後の1行であっても単発行として扱う。
+     * legacy_chain が途切れた(=直前が普通のコードだった)場合のみ、次の
+     * 行が開始記号で始まらずかつこの位置より後ろに閉じ記号が本当に存在する
+     * ときに限り、新規のブロックコメントとして正しく閉じるまで追跡する。 */
     int *rest_has_close = malloc(sizeof(int) * (size_t)(nexp + 1));
     if(!rest_has_close){ perror("malloc"); exit(1); }
     rest_has_close[nexp] = 0;
@@ -5155,6 +5159,7 @@ static void readpat(Assembler *asmb, const char *fn){
 
     char *line = NULL; size_t lcap = 0;
     int in_block_comment = 0;
+    int legacy_chain = 0;
     for(int li = 0; li < nexp; li++){
         size_t need = strlen(exp[li]) + 1;
         if(need > lcap){
@@ -5165,8 +5170,30 @@ static void readpat(Assembler *asmb, const char *fn){
         memcpy(line, exp[li], need);
         int was_in_comment = in_block_comment;
         axx_remove_comment(line, &in_block_comment);
-        if(in_block_comment && !was_in_comment && !rest_has_close[li+1]){
-            in_block_comment = 0;
+        if(!in_block_comment){
+            /* このコメントはこの行の中で完結した(あるいは元々コメントで
+             * なかった)ので、旧来スタイルの連鎖はここで途切れる。 */
+            legacy_chain = 0;
+        } else if(!was_in_comment){
+            int oi = axx_skipspc(exp[li], 0);
+            int this_is_bare_open = (exp[li][oi]=='/' && exp[li][oi+1]=='*');
+            int treat_as_legacy;
+            if(legacy_chain && this_is_bare_open){
+                treat_as_legacy = 1;
+            } else {
+                int next_looks_legacy = 0;
+                if(li+1 < nexp){
+                    int ni = axx_skipspc(exp[li+1], 0);
+                    next_looks_legacy = (exp[li+1][ni]=='/' && exp[li+1][ni+1]=='*');
+                }
+                treat_as_legacy = next_looks_legacy || !rest_has_close[li+1];
+            }
+            if(treat_as_legacy){
+                in_block_comment = 0;
+                legacy_chain = this_is_bare_open;
+            } else {
+                legacy_chain = 0;
+            }
         }
         for(char*p=line;*p;p++){ if(*p=='\t') *p=' '; if(*p=='\r') *p=' '; }
         int l=(int)strlen(line);

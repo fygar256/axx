@@ -3911,29 +3911,52 @@ class PatternFileReader:
             return []
         raw_lines = StringUtils.join_backslash_continuations(raw_lines)
 
-        # 破綻点修正: 「本物の複数行ブロックコメント(閉じ記号が後の行にある)」
-        # と「開始記号を単なる行末コメントの目印として毎行書くだけの古い流儀
-        # (どの行にも閉じ記号が無い)」の2つの書き方が実在のパターンファイルに
-        # 混在している。前者だけを想定して常に状態を引き継ぐと、後者の書き方
-        # (開始記号だけの行が何行も続くがファイル中に一度も閉じ記号が現れない)を
-        # 「ファイル末尾まで閉じないコメント」として丸ごと呑み込んでしまい、
-        # 実際のパターン行が軒並み消える重大な退行になる。そこで、コメントを
-        # 新規に開いた瞬間だけ「このコメント開始位置より後ろのどこかに閉じ記号が
-        # 本当に存在するか」を先読みし、無ければ複数行へは持ち越さず
-        # (旧来どおりその行だけの扱いに戻し)、あれば従来どおり複数行コメントと
-        # して正しく閉じるまで追跡する。
+        # 破綻点修正: 「本物の複数行ブロックコメント(閉じ記号が後の行にあり、
+        # 中身の行は '/*' で始まらない)」と「開始記号を単なる行末コメントの
+        # 目印として毎行書くだけの古い流儀(コメントの各行が '/*' で始まり、
+        # 閉じ記号は無いか、あっても離れた場所にある別の無関係なコメントの
+        # ものでしかない)」の2つの書き方が実在のパターンファイルに混在している。
+        # 「次の1行だけ」を見て判定すると、旧来スタイルの連続コメントの最後の
+        # 1行(次の行はもう普通のコード)を誤って「本物のブロックコメント開始」
+        # と誤認し、たまたま遠く離れた場所にある無関係な閉じ記号まで実際の
+        # パターン行を丸ごと呑み込んでしまう(8080.axx で発生)。そこで、
+        # 「直前の行も '/*' で始まる行で、かつ単発扱い(旧来スタイル)と
+        # 判定されていたか」を legacy_chain として引き継ぎ、旧来スタイルの
+        # 連続コメントは何行続いても・最後の1行であっても単発行として扱う。
+        # legacy_chain が途切れた(=直前が普通のコードだった)場合のみ、次の
+        # 行が '/*' で始まらずかつこの位置より後ろに閉じ記号が本当に存在する
+        # ときに限り、新規のブロックコメントとして正しく閉じるまで追跡する。
         expanded = list(self.macro_proc.expand(raw_lines, fn))
         rest_has_close = [False] * (len(expanded) + 1)
         for i in range(len(expanded) - 1, -1, -1):
             rest_has_close[i] = rest_has_close[i + 1] or ('*/' in expanded[i][0])
 
+        def _starts_with_open_comment(s):
+            return s.lstrip(' \t').startswith('/*')
+
         in_block_comment = False
+        legacy_chain = False
         for _li, (l, _mfile, _mln) in enumerate(expanded):
 
             was_in_comment = in_block_comment
             l, in_block_comment = StringUtils.remove_comment(l, in_block_comment)
-            if in_block_comment and not was_in_comment and not rest_has_close[_li + 1]:
-                in_block_comment = False
+            if not in_block_comment:
+                # このコメントはこの行の中で完結した(あるいは元々コメントで
+                # なかった)ので、旧来スタイルの連鎖はここで途切れる。
+                legacy_chain = False
+            elif not was_in_comment:
+                this_is_bare_open = _starts_with_open_comment(expanded[_li][0])
+                if legacy_chain and this_is_bare_open:
+                    treat_as_legacy = True
+                else:
+                    next_looks_legacy = (_li + 1 < len(expanded)
+                                          and _starts_with_open_comment(expanded[_li + 1][0]))
+                    treat_as_legacy = next_looks_legacy or not rest_has_close[_li + 1]
+                if treat_as_legacy:
+                    in_block_comment = False
+                    legacy_chain = this_is_bare_open
+                else:
+                    legacy_chain = False
             l = l.replace('\t', ' ')
             l = l.replace(chr(13), '')
             l = l.replace('\n', '')
