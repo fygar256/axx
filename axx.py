@@ -945,14 +945,37 @@ class StringUtils:
         return ''.join(out)
 
     @staticmethod
-    def remove_comment(l):
-        """パターンファイルのコメント `/* ...` を落とす（行単位・閉じ記号は不要）。"""
-        idx = 0
-        while idx < len(l):
-            if l[idx:idx + 2] == '/*':
-                return "" if idx == 0 else l[0:idx]
-            idx += 1
-        return l
+    def remove_comment(l, in_comment=False):
+        """パターンファイルのコメント `/* ... */` を落とす。
+
+        破綻点修正: 以前は「行単位で扱うので閉じ記号は不要」という設計で、
+        その行に現れた `/*` から行末までを問答無用で切り捨てるだけだった。
+        実際のパターンファイルは何十行にもまたがる本物の C 形式ブロック
+        コメントを書いており、開始行以降・終了行までの中身が「'::' の
+        無い迷子の行」として毎行 warning を出していた。呼び出し元が
+        ファイル全体で共有する in_comment を渡し、複数行にまたがる
+        ブロックコメントとして正しく扱う。戻り値は (削った行, 更新後の
+        in_comment) のタプル。同じ行内に閉じ記号があれば、その後ろの
+        内容は通常どおり生かす。
+        """
+        out = []
+        i = 0
+        n = len(l)
+        while i < n:
+            if in_comment:
+                if l[i:i + 2] == '*/':
+                    in_comment = False
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if l[i:i + 2] == '/*':
+                in_comment = True
+                i += 2
+                continue
+            out.append(l[i])
+            i += 1
+        return ''.join(out), in_comment
 
     @staticmethod
     def remove_comment_asm(l):
@@ -1970,6 +1993,11 @@ class ExpressionEvaluator:
                     x = 0
             else:
                 self.state.diag(" error - expected '(' after '*' in *(expr,expr) expression.", set_error=True)
+                # 破綻点修正: idx を '*' の次へ進めないと、呼び出し元の乗算ループ
+                # (term0)が同じ未消費の '*' を通常の乗算演算子として再度読み、
+                # "5+*x" のような壊れた式が 0 * <次の因子> という誤った値へ
+                # 静かに縮退してしまう。エラー後は '*' を読み飛ばす。
+                idx += 1
         else:
             prev_idx = idx
             x, idx = self.factor1(s, idx)
@@ -3883,9 +3911,10 @@ class PatternFileReader:
             return []
         raw_lines = StringUtils.join_backslash_continuations(raw_lines)
 
+        in_block_comment = False
         for l, _mfile, _mln in self.macro_proc.expand(raw_lines, fn):
 
-            l = StringUtils.remove_comment(l)
+            l, in_block_comment = StringUtils.remove_comment(l, in_block_comment)
             l = l.replace('\t', ' ')
             l = l.replace(chr(13), '')
             l = l.replace('\n', '')
@@ -3929,6 +3958,10 @@ class PatternFileReader:
                          f"(extra fields ignored): {l[6:]!r}", set_error=False)
                     p = [l[0], l[1], l[2], l[3], l[4], l[5]]
                 w.append(p)
+
+        if in_block_comment:
+            diag(f" warning - pattern file '{fn}' ends while a /* ... */ comment "
+                 f"is still open (missing closing '*/').", set_error=False)
 
         return w
 
@@ -7241,6 +7274,14 @@ class Assembler:
             sidx = sec_name_to_idx.get(sname, 0)
             if sidx:
                 rela_entries[sidx].append((off, sym_name, rtype, addend, nbytes))
+            else:
+                # 破綻点修正: セクション名が一致しないリロケーションを無警告で
+                # 捨てていたため、修正が抜け落ちた「見た目は正常な」.oファイルが
+                # 静かに生成されていた。診断を出す。
+                if self.state.should_report_errors():
+                    self.state.diag(
+                        f" error - relocation references unknown section '{sname}'; dropped from output.",
+                        set_error=True)
 
         if not _is_rela:
             for sidx, entries in rela_entries.items():

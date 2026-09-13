@@ -1666,14 +1666,30 @@ static void axx_reduce_spaces(char *s) {
     *dst=0;
 }
 
-/* パターンファイルのコメント（スラッシュ＋アスタリスク以降）を落とす。
- * 行単位で扱うので閉じ記号は不要。 */
-static void axx_remove_comment(char *l) {
-    for(int i=0;l[i];i++){
-        if(l[i]=='/'&&l[i+1]=='*'){
-            l[i]=0; return;
+/* パターンファイルのコメント(スラッシュ+アスタリスクで始まりアスタリスク+
+ * スラッシュで終わるブロックコメント)を落とす。
+ *
+ * 破綻点修正: 以前は「行単位で扱うので閉じ記号は不要」という設計で、
+ * その行に現れた開始記号から行末までを問答無用で切り捨てるだけだった。
+ * 実際のパターンファイル（got.axx 等）は何十行にもまたがる本物の
+ * C 形式ブロックコメントを書いており、開始行以降・終了行までの中身
+ * (説明文や区切り線など) が「'::' の無い迷子の行」として毎行
+ * warning を出しながらパターン表に無害だが無駄なエントリとして
+ * 積まれていた。呼び出し元がファイル全体で共有する *in_comment 経由で
+ * 状態を引き継ぎ、複数行にまたがるブロックコメントとして正しく扱う。
+ * 同じ行内に閉じ記号があれば、その後ろの内容は通常どおり生かす
+ * (閉じ記号の直後に続く内容が消えていた副作用も合わせて直る)。 */
+static void axx_remove_comment(char *l, int *in_comment) {
+    int i=0, w=0;
+    while(l[i]){
+        if(*in_comment){
+            if(l[i]=='*'&&l[i+1]=='/'){ *in_comment=0; i+=2; continue; }
+            i++; continue;
         }
+        if(l[i]=='/'&&l[i+1]=='*'){ *in_comment=1; i+=2; continue; }
+        l[w++]=l[i++];
     }
+    l[w]=0;
 }
 
 /* アセンブリソースの `;` コメントを落とす。
@@ -5120,6 +5136,7 @@ static void readpat(Assembler *asmb, const char *fn){
     f = NULL;
 
     char *line = NULL; size_t lcap = 0;
+    int in_block_comment = 0;
     for(int li = 0; li < nexp; li++){
         size_t need = strlen(exp[li]) + 1;
         if(need > lcap){
@@ -5128,7 +5145,7 @@ static void readpat(Assembler *asmb, const char *fn){
             line = nl; lcap = need;
         }
         memcpy(line, exp[li], need);
-        axx_remove_comment(line);
+        axx_remove_comment(line, &in_block_comment);
         for(char*p=line;*p;p++){ if(*p=='\t') *p=' '; if(*p=='\r') *p=' '; }
         int l=(int)strlen(line);
         while(l>0&&(line[l-1]=='\n'||line[l-1]=='\r')) line[--l]=0;
@@ -5177,6 +5194,10 @@ static void readpat(Assembler *asmb, const char *fn){
         else if(nf==5){ for(int i=0;i<5;i++) pat_set(pe,i,fields[i]); }
         else if(nf>=6){ for(int i=0;i<6;i++) pat_set(pe,i,fields[i]); }
         free(fbuf);
+    }
+    if(in_block_comment){
+        axx_diagf(0, 0, " warning - pattern file '%s' ends while a /* ... */ comment "
+                   "is still open (missing closing '*/').\n", fn);
     }
     free(line);
     pat_macro_expand_free(exp, nexp);
