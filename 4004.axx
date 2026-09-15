@@ -1,4 +1,4 @@
-/* =====================================================================
+/*  ==================================================================
 /*  4004.axx -- Intel 4004 pattern file (complete official instruction set)
 /*
 /*  Covers all 46 documented 4004 instructions (239 defined opcodes out
