@@ -34,6 +34,13 @@ MOV a,!b,!c :: .call name(a,b,c)
 MIX !e :: 0x90,.call rep(e),0xff
 ```
 
+An argument written `[expr, expr, ...]` is an array; its elements are pattern
+expressions too. `[]` is the empty array.
+
+```
+LOG !v :: .call table([0x11,0x22,v],3)
+```
+
 A function may be defined after the place that uses it; references are resolved
 once the whole pattern file has been read.
 
@@ -173,6 +180,25 @@ v = .call hypot2(a,b)
 - **The `.return` that closes the body may carry a value too.** The last
   `.return` of a function marks the end of the body, and with `.return expr` it
   also returns a value there.
+- **The return value of a function called from `binary_list` becomes output.**
+  A number is one word; an array is one word per element from index 0. It
+  follows whatever the function passed to `.emit`, so a function that only
+  `.emit`s and returns nothing behaves exactly as before.
+
+```
+SEQ !n :: 0xaa,.call seq(n),0xbb
+
+.func::seq::n
+a=[]
+.for i in range(n)
+a[i]=0xc0+i
+.next
+.return a
+```
+
+```
+seq 4                -> aa c0 c1 c2 c3 bb
+```
 
 ```
 .func::mkarr::n
@@ -207,7 +233,8 @@ i=i+1
 
 - **Arguments are pattern-layer expressions.** In `.call f(a,b)`, `a` and `b` mean
   the captured pattern variables. Anything writable in `binary_list` works —
-  labels, `.equ`, `$.` — including forward-referenced labels.
+  labels, `.equ`, `$.` — including forward-referenced labels. An array argument
+  is written `[expr, expr, ...]`.
 - **Variable namespaces are separate.** Mini-language variables have nothing to do
   with pattern variables `a`–`z` or with `.setsym` symbols; pass what you need as
   an argument.
@@ -218,8 +245,13 @@ i=i+1
   one 12-bit word under `.bits::12`.
 - **The number of words emitted is the instruction's length.** Emit the same count
   in both passes; a count that varies by pass will not let addresses settle.
-- **`;` cannot be applied to `.call`.** For conditional output, wrap `.emit` in
-  `.if`.
+- **`;` may be applied to `.call`.** `;.call f(a)` emits nothing when the call's
+  whole output is a single word equal to 0 — that is how a prefix byte which is
+  sometimes absent is written. `;;.call f(a)` runs the call and discards its
+  output.
+- **`;;element` outputs nothing.** Writing `;;` in front of a `binary_list`
+  element evaluates it but emits no word. A `binary_list` of just `;;n` has
+  length 0.
 
 ## Runaway guards
 
