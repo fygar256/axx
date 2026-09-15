@@ -4163,6 +4163,10 @@ class PatternFileReader:
                     continue
                 cur = func_stack[-1]
                 if _dk == '.RETURN' and cur.depth == 0:
+                    # 本体を閉じる `.return`。`.return 式` なら値を返す文でも
+                    # あるので、閉じるだけでなく本体の最後の行としても残す。
+                    if l.strip()[len(_dk):].strip():
+                        cur.lines.append((l, fn, _mln))
                     func_stack.pop()
                     continue
                 if _dk in _MINI_OPEN:
@@ -4361,7 +4365,17 @@ class MiniLangError(Exception):
 
 
 class _MiniReturn(Exception):
-    """`.return` 文。関数1段ぶんだけ脱出する。"""
+    """`.return` 文。関数1段ぶんだけ脱出する。
+
+    `.return 式` なら value にその値（整数か配列）を運ぶ。値のない `.return`
+    は value が None で、呼び出し元が `var = .call ...` の形だとエラーになる。
+    """
+
+    __slots__ = ('value',)
+
+    def __init__(self, value=None):
+        super().__init__()
+        self.value = value
 
 
 # ミニ言語の整数は axx の式と同じ 256bit 2の補数。Python と C で同じ値に
@@ -4734,8 +4748,8 @@ class MiniParser:
         if k == 'dot':
             if v == '.RETURN':
                 if len(toks) > 1:
-                    raise MiniLangError(f"{f}:{ln}: '.return' takes no value")
-                return ('return', pos)
+                    return ('return', _MiniExprParser(toks[1:], pos).parse(), pos)
+                return ('return', None, pos)
             if v == '.EMIT':
                 p = _MiniExprParser(toks[1:], pos)
                 p.expect_op('(')
@@ -4751,19 +4765,7 @@ class MiniParser:
                     raise MiniLangError(f"{f}:{ln}: '.emit' needs at least one value")
                 return ('emit', args, pos)
             if v == '.CALL':
-                if len(toks) < 2 or toks[1][0] != 'name':
-                    raise MiniLangError(f"{f}:{ln}: '.call' needs a function name")
-                name = toks[1][1]
-                p = _MiniExprParser(toks[2:], pos)
-                p.expect_op('(')
-                args = []
-                if not p.at_op(')'):
-                    args.append(p.or_())
-                    while p.eat_op(','):
-                        args.append(p.or_())
-                p.expect_op(')')
-                if not p.at_end():
-                    raise MiniLangError(f"{f}:{ln}: unexpected text after '.call'")
+                name, args = self._call_tail(toks, pos)
                 return ('call', name, args, pos)
             if v == '.NONLOCAL':
                 names = []
@@ -4793,8 +4795,31 @@ class MiniParser:
             idx = p.or_()
             p.expect_op(']')
         p.expect_op('=')
-        val = _MiniExprParser(p.toks[p.i:], pos).parse()
+        rest = p.toks[p.i:]
+        # `var = .call f(...)` は呼んだ関数の返り値を代入する。
+        if rest and rest[0] == ('dot', '.CALL'):
+            fname, args = self._call_tail(rest, pos)
+            return ('callassign', name, idx, fname, args, pos)
+        val = _MiniExprParser(rest, pos).parse()
         return ('assign', name, idx, val, pos)
+
+    def _call_tail(self, toks, pos):
+        """`.call 名前(引数, ...)` を読んで (名前, 引数の式) を返す。"""
+        f, ln = pos
+        if len(toks) < 2 or toks[1][0] != 'name':
+            raise MiniLangError(f"{f}:{ln}: '.call' needs a function name")
+        name = toks[1][1]
+        p = _MiniExprParser(toks[2:], pos)
+        p.expect_op('(')
+        args = []
+        if not p.at_op(')'):
+            args.append(p.or_())
+            while p.eat_op(','):
+                args.append(p.or_())
+        p.expect_op(')')
+        if not p.at_end():
+            raise MiniLangError(f"{f}:{ln}: unexpected text after '.call'")
+        return name, args
 
 
 class MiniInterp:
@@ -4968,6 +4993,25 @@ class MiniInterp:
         return 1 if sa != sb else 0
 
     # --- 文 ----------------------------------------------------------------
+    def _store(self, name, idx, v, pos):
+        """`name = v` / `name[idx] = v` を実行する。v は整数か配列。"""
+        if idx is None:
+            self._set(name, list(v) if self._is_arr(v) else _mini_wrap(v), pos)
+            return
+        i = _mini_signed(self._need_int(self.eval(idx, pos), pos, 'an index'))
+        if i < 0:
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: negative index {i} in assignment")
+        if i >= self.MAX_ARRAY:
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: array index {i} exceeds the "
+                                f"maximum length {self.MAX_ARRAY}")
+        arr = self._get(name, pos)
+        if not self._is_arr(arr):
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: {name!r} is not an array")
+        # 足りない分は 0 で埋めて伸ばす。
+        if i >= len(arr):
+            arr.extend([0] * (i + 1 - len(arr)))
+        arr[i] = self._need_int(v, pos, 'an array element')
+
     def _tick(self, pos):
         self.steps += 1
         if self.steps > self.MAX_STEPS:
@@ -4984,23 +5028,17 @@ class MiniInterp:
         self._tick(pos)
         if kind == 'assign':
             _, name, idx, val, _ = st
-            v = self.eval(val, pos)
-            if idx is None:
-                self._set(name, list(v) if self._is_arr(v) else _mini_wrap(v), pos)
-                return
-            i = _mini_signed(self._need_int(self.eval(idx, pos), pos, 'an index'))
-            if i < 0:
-                raise MiniLangError(f"{pos[0]}:{pos[1]}: negative index {i} in assignment")
-            if i >= self.MAX_ARRAY:
-                raise MiniLangError(f"{pos[0]}:{pos[1]}: array index {i} exceeds the "
-                                    f"maximum length {self.MAX_ARRAY}")
-            arr = self._get(name, pos)
-            if not self._is_arr(arr):
-                raise MiniLangError(f"{pos[0]}:{pos[1]}: {name!r} is not an array")
-            # 足りない分は 0 で埋めて伸ばす。
-            if i >= len(arr):
-                arr.extend([0] * (i + 1 - len(arr)))
-            arr[i] = self._need_int(v, pos, 'an array element')
+            self._store(name, idx, self.eval(val, pos), pos)
+            return
+        if kind == 'callassign':
+            _, name, idx, fname, args, _ = st
+            fn = self._lookup(fname, pos)
+            vals = [self.eval(a, pos) for a in args]
+            ret = self.call(fn, vals, pos)
+            if ret is None:
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: {fname!r} returned no value; "
+                                    f"give it a '.return <expression>'")
+            self._store(name, idx, ret, pos)
             return
         if kind == 'emit':
             for x in st[1]:
@@ -5020,7 +5058,7 @@ class MiniInterp:
             self.call(fn, vals, pos)
             return
         if kind == 'return':
-            raise _MiniReturn()
+            raise _MiniReturn(None if st[1] is None else self.eval(st[1], pos))
         if kind == 'nonlocal':
             top = self.frames[-1]
             for nm in st[1]:
@@ -5087,12 +5125,14 @@ class MiniInterp:
         for nm, v in zip(func.params, args):
             frame['vars'][nm] = list(v) if self._is_arr(v) else _mini_wrap(v)
         self.frames.append(frame)
+        ret = None
         try:
             self.exec_block(func.body or [])
-        except _MiniReturn:
-            pass
+        except _MiniReturn as r:
+            ret = r.value
         finally:
             self.frames.pop()
+        return ret
 
     def run(self, func, args, pos):
         self.out = []

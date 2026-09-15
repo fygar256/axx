@@ -55,7 +55,7 @@ ARM, AArch64, RISC-V, PowerPC, MIPS and SPARC don't have pattern files yet. That
 
 ## How it compares
 
-**customasm** (Rust, actively maintained) shares the same core idea — describe an ISA declaratively, get an assembler for it — but customasm output formats (binary, hexdump, intelhex, and similar dump formats) stop short of anything like ELF; there's no relocatable-object output at all. If you're building a toy VM or an FPGA CPU, customasm is the better fit. If you need something that links into a real OS binary, axx is the one that does that.
+**customasm** (Rust, actively maintained) shares the same core idea — describe an ISA declaratively, get an assembler for it — and its `#subruledef` composition system is more structured than axx's flat pattern model. But its output formats (binary, hexdump, intelhex, and similar dump formats) stop short of anything like ELF; there's no relocatable-object output at all. If you're building a toy VM or an FPGA CPU, customasm is the better fit. If you need something that links into a real OS binary, axx is the one that does that.
 
 **LLVM MC** is the production-grade backend actually used by clang and rustc, with object-format support (ELF, COFF, Mach-O, wasm) and target coverage that axx doesn't come close to. But TableGen alone rarely suffices for a real target — most non-trivial backends carry thousands of lines of hand-written C++ alongside the declarative description. If you need a mainstream architecture in production today, use LLVM. If you want a historical or unusual ISA running from a single file you can actually read end to end, that's axx's territory.
 
@@ -913,11 +913,13 @@ MIX !e :: 0x90,.call rep(e),0xff
 | `name[index] = expression` | Assign to an array element |
 | `.emit(e1, e2, ...)` | Append one word per value to the output |
 | `.call name(args)` | Call another function |
+| `name = .call name(args)` | Call another function and assign its return value |
 | `.if <expr> .then` / `.else` / `.endif` | Conditional |
 | `.while(<expr>)` / `.endwhile` | Loop while the condition is non-zero |
 | `.for <name> in range(...)` / `.next` | Loop over `range(stop)`, `range(start, stop)` or `range(start, stop, step)` |
 | `.nonlocal a, b` | Bind these names to the enclosing call instead of locally |
 | `.return` | Return from the function |
+| `.return <expr>` | Return a value from the function |
 
 `.emit` appends one word of `.bits` width per value — one byte at the default
 width. The number of words a call emits is the instruction's length, so a
@@ -946,6 +948,40 @@ Assigning past the end extends the array with zeros. Reading past the end, or
 at a negative index, gives `0` and leaves the array alone. Slice bounds are
 clamped to the array. `.len(x)` is the length. Array elements are numbers, not
 arrays.
+
+#### Return values
+
+`.return <expr>` returns a value, and the caller takes it with
+`var = .call name(args)`:
+
+```
+.func::hypot2::a,b
+.return a*a+b*b
+
+.func::emit_h::a,b
+v = .call hypot2(a,b)
+.emit(v)
+.return
+```
+
+The value may be a number or an array; an array is passed as a copy. The target
+may be an array element (`a[i] = .call f(x)`), in which case the returned value
+must be a number. Calling a function that returns nothing in that form is an
+error, and `.call` cannot appear inside a larger expression — take the value
+into a variable first. A `.return <expr>` also works as the line that closes
+the body, and as an early return from inside a block:
+
+```
+.func::firstdiv::n
+i=2
+.while(i<n)
+.if n%i==0 .then
+.return i
+.endif
+i=i+1
+.endwhile
+.return 0
+```
 
 #### Scope and nesting
 
@@ -1023,6 +1059,32 @@ c=c+1
 primes 50            -> 02 03 05 07 0b 0d 11 13 17 1d 1f 25 29 2b 2f
 collatz 27           -> 6f
 ```
+
+Recursion with return values builds the value itself:
+
+```
+FIBV !n :: .call fibv(n)
+
+.func::fibn::k
+.if k<2 .then
+.return k
+.endif
+p = .call fibn(k-1)
+q = .call fibn(k-2)
+.return p+q
+
+.func::fibv::n
+v = .call fibn(n)
+.emit(v)
+.return
+```
+
+```
+fibv 10              -> 37
+```
+
+The same material is kept as a standalone document in `MINI.md` (Japanese) and
+`mini_en.md` (English).
 
 #### Limits
 
@@ -1902,7 +1964,8 @@ reflects where the work has gone, not the limit of what axx can describe.
 | File | Contents |
 |---|---|
 | `MACRO.md` / `macro_en.md` | Macro layer reference (Japanese / English). Same material as section 7 |
-| `axx_introduction_paper.md` / `_en.md` | Introduction paper: the design rationale behind the free-syntax pattern language, the specificity score, and the deliberate Turing incompleteness |
+| `MINI.md` / `mini_en.md` | Mini language reference (Japanese / English). Same material as section 3.15 |
+| `axx_introduction_paper.md` / `_en.md` | Introduction paper: the design rationale behind the free-syntax pattern language, the specificity score, and the separation of computational power from the declarative core |
 | `axxsemantics` | A denotational-semantics formalization of axx, including relaxation read as a fixed point over the label environment. The formulas in it are that document's own construction, not an official specification |
 | `FILE_DESCRIPTION` | One-line description of every file |
 | `format_of_exp_imp_file` | Export/import file format |

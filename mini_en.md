@@ -47,11 +47,13 @@ One statement per line.
 | `name[index] = expr` | Assign to an array element |
 | `.emit(e1, e2, ...)` | Output one word per value |
 | `.call name(args)` | Call another function |
+| `name = .call name(args)` | Call another function and assign its return value |
 | `.if expr .then` / `.else` / `.endif` | Conditional; `.else` is optional |
 | `.while(expr)` / `.endwhile` | Repeat while the value is non-zero |
 | `.for name in range(...)` / `.next` | `range(stop)`, `range(start, stop)`, `range(start, stop, step)` |
 | `.nonlocal a, b` | Treat these names as belonging to an enclosing call |
 | `.return` | Return from the function |
+| `.return expr` | Return a value from the function |
 | `.func::name::params...` | Nested function definition |
 
 The `.if` line must end with `.then`. The condition of `.while` needs no
@@ -143,6 +145,63 @@ n=n+1
 
 `.nonlocal` must appear before that name is otherwise used in the function. If no
 enclosing call has the name, it is an error.
+
+## Return values
+
+`.return expr` returns a value. The caller receives it by writing
+`var = .call name(args)`.
+
+```
+.func::hypot2::a,b
+.return a*a+b*b
+
+.func::emit_h::a,b
+v = .call hypot2(a,b)
+.emit(v)
+.return
+```
+
+- **The value may be a number or an array.** An array is passed as a copy, so
+  changing it in the caller does not affect the callee's variable.
+- **The target may be an array element.** `a[i] = .call f(x)` is allowed; the
+  returned value must then be a number.
+- **Calling a function that returns nothing with `var = .call ...` is an error.**
+  That covers both a valueless `.return` and a body that ends without reaching
+  one.
+- **`.call` cannot appear inside an expression.** `x = 1 + .call f(y)` is not
+  allowed; take the value into a variable first.
+- **The `.return` that closes the body may carry a value too.** The last
+  `.return` of a function marks the end of the body, and with `.return expr` it
+  also returns a value there.
+
+```
+.func::mkarr::n
+a=[]
+.for i in range(n)
+a[i]=i*i
+.next
+.return a
+
+.func::use::n
+v = .call mkarr(n)
+.emit(.len(v))
+.emit(v[2])
+.return
+```
+
+Returning early works as well.
+
+```
+.func::firstdiv::n
+i=2
+.while(i<n)
+.if n%i==0 .then
+.return i
+.endif
+i=i+1
+.endwhile
+.return 0
+```
 
 ## The boundary with the pattern layer
 
@@ -239,4 +298,27 @@ FIB !n :: .call fib(n)
 .call fib(k-2)
 .endif
 .return
+```
+
+With return values, the same recursion can build the value itself.
+
+```
+FIBV !n :: .call fibv(n)
+
+.func::fibn::k
+.if k<2 .then
+.return k
+.endif
+p = .call fibn(k-1)
+q = .call fibn(k-2)
+.return p+q
+
+.func::fibv::n
+v = .call fibn(n)
+.emit(v)
+.return
+```
+
+```
+fibv 10              -> 37
 ```

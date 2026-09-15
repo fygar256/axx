@@ -44,11 +44,13 @@ MIX !e :: 0x90,.call rep(e),0xff
 | `name[添字] = 式` | 配列要素への代入 |
 | `.emit(e1, e2, ...)` | 値 1 つにつき 1 ワード出力する |
 | `.call 名前(引数, ...)` | 他の関数を呼ぶ |
+| `name = .call 名前(引数, ...)` | 他の関数を呼び、返り値を代入する |
 | `.if 式 .then` / `.else` / `.endif` | 条件分岐。`.else` は省略可 |
 | `.while(式)` / `.endwhile` | 式が 0 でない間くり返す |
 | `.for 名前 in range(...)` / `.next` | `range(stop)` `range(start, stop)` `range(start, stop, step)` |
 | `.nonlocal a, b` | その名前を外側の呼び出しのものとして扱う |
 | `.return` | 関数から戻る |
+| `.return 式` | 値を返して関数から戻る |
 | `.func::名前::引数...` | 入れ子の関数定義 |
 
 `.if` の行は `.then` で終わること。`.while` の条件は括弧の有無を問わない
@@ -134,6 +136,60 @@ n=n+1
 
 `.nonlocal` は、その関数の中でその名前を使うより前に書くこと。外側にその名前が
 無ければエラーになる。
+
+## 返り値
+
+`.return 式` と書くと値を返す。呼ぶ側は `var = .call 名前(引数, ...)` の形で受け取る。
+
+```
+.func::hypot2::a,b
+.return a*a+b*b
+
+.func::emit_h::a,b
+v = .call hypot2(a,b)
+.emit(v)
+.return
+```
+
+- **値は整数でも配列でもよい。** 配列はコピーして渡るので、受け取った側で書き換えても
+  呼ばれた側の変数には影響しない。
+- **受け取り先は配列要素でもよい。** `a[i] = .call f(x)` と書ける。この場合、
+  返り値は整数であること。
+- **値を返さない関数を `var = .call ...` で呼ぶとエラー。** 値のない `.return` で
+  戻った場合と、`.return` を踏まずに本体を終えた場合の両方が該当する。
+- **`.call` を式の途中には書けない。** `x = 1 + .call f(y)` は書けないので、
+  いったん変数で受けてから使う。
+- **本体を閉じる `.return` にも式を書ける。** 関数の最後の `.return` は本体の
+  終わりを示す行でもあるが、`.return 式` ならそこで値を返す文でもある。
+
+```
+.func::mkarr::n
+a=[]
+.for i in range(n)
+a[i]=i*i
+.next
+.return a
+
+.func::use::n
+v = .call mkarr(n)
+.emit(.len(v))
+.emit(v[2])
+.return
+```
+
+早期に戻ることもできる。
+
+```
+.func::firstdiv::n
+i=2
+.while(i<n)
+.if n%i==0 .then
+.return i
+.endif
+i=i+1
+.endwhile
+.return 0
+```
 
 ## パターン層との境界
 
@@ -226,4 +282,27 @@ FIB !n :: .call fib(n)
 .call fib(k-2)
 .endif
 .return
+```
+
+返り値を使えば、同じ再帰で値そのものを組み立てられる。
+
+```
+FIBV !n :: .call fibv(n)
+
+.func::fibn::k
+.if k<2 .then
+.return k
+.endif
+p = .call fibn(k-1)
+q = .call fibn(k-2)
+.return p+q
+
+.func::fibv::n
+v = .call fibn(n)
+.emit(v)
+.return
+```
+
+```
+fibv 10              -> 37
 ```

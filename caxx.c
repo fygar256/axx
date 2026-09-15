@@ -565,14 +565,16 @@ typedef struct MExpr {
 } MExpr;
 
 typedef enum {
-    MS_ASSIGN, MS_EMIT, MS_CALL, MS_RETURN, MS_IF, MS_WHILE, MS_FOR, MS_NONLOCAL
+    MS_ASSIGN, MS_EMIT, MS_CALL, MS_CALLASSIGN, MS_RETURN, MS_IF, MS_WHILE,
+    MS_FOR, MS_NONLOCAL
 } MSKind;
 
 typedef struct MStmt {
     MSKind         k;
     char          *name;       /* 代入先 / 呼ぶ関数名 / .for の変数 */
+    char          *fname;      /* `var = .call f(...)` の呼ぶ関数名 */
     MExpr         *idx;        /* 代入先の添字。無ければ NULL */
-    MExpr         *val;        /* 代入する式 / .if .while の条件 */
+    MExpr         *val;        /* 代入する式 / .if .while の条件 / .return の値 */
     MExpr        **args;       /* .emit .call の引数, .for の range 引数 */
     int            nargs;
     struct MStmt **body;       /* .if の then / .while .for の本体 */
@@ -5939,6 +5941,16 @@ static int mini_is_ender(const char *kw){
 static void msp_block(MSP *p, const char *e1, const char *e2,
                       MStmt ***outv, int *outn);
 
+/* `.call 名前(引数, ...)` の後半を読む。toks[0] は '.CALL'。 */
+static void ms_call_tail(MiniCtx *c, MTok *toks, int n, char **namep,
+                         MExpr ***argv, int *argn){
+    if(n < 2 || toks[1].k != MT_NAME) mini_fail(c, "'.call' needs a function name");
+    *namep = mini_strdup(toks[1].s);
+    MXP ep; ep.t = toks + 2; ep.n = n - 2; ep.i = 0; ep.c = c;
+    mxp_arglist(&ep, argv, argn);
+    if(!mxp_end(&ep)) mini_fail(c, "unexpected text after '.call'");
+}
+
 static MStmt *msp_simple(MSP *p, int li){
     MiniCtx *c = p->c;
     const char *text = p->f->lines[li];
@@ -5951,8 +5963,12 @@ static MStmt *msp_simple(MSP *p, int li){
     if(toks[0].k == MT_DOT){
         const char *kw = toks[0].s;
         if(strcmp(kw, ".RETURN") == 0){
-            if(n > 1) mini_fail(c, "'.return' takes no value");
-            return ms_new(MS_RETURN, p, li);
+            MStmt *s = ms_new(MS_RETURN, p, li);
+            if(n > 1){
+                MXP ep; ep.t = toks + 1; ep.n = n - 1; ep.i = 0; ep.c = c;
+                s->val = mxp_full(&ep);
+            }
+            return s;
         }
         if(strcmp(kw, ".EMIT") == 0){
             MStmt *s = ms_new(MS_EMIT, p, li);
@@ -5963,12 +5979,8 @@ static MStmt *msp_simple(MSP *p, int li){
             return s;
         }
         if(strcmp(kw, ".CALL") == 0){
-            if(n < 2 || toks[1].k != MT_NAME) mini_fail(c, "'.call' needs a function name");
             MStmt *s = ms_new(MS_CALL, p, li);
-            s->name = mini_strdup(toks[1].s);
-            MXP ep; ep.t = toks + 2; ep.n = n - 2; ep.i = 0; ep.c = c;
-            mxp_arglist(&ep, &s->args, &s->nargs);
-            if(!mxp_end(&ep)) mini_fail(c, "unexpected text after '.call'");
+            ms_call_tail(c, toks, n, &s->name, &s->args, &s->nargs);
             return s;
         }
         if(strcmp(kw, ".NONLOCAL") == 0){
@@ -6006,7 +6018,15 @@ static MStmt *msp_simple(MSP *p, int li){
             mxp_expect(&ep, "]");
         }
         mxp_expect(&ep, "=");
-        MXP rp; rp.t = ep.t + ep.i; rp.n = ep.n - ep.i; rp.i = 0; rp.c = c;
+        MTok *rt = ep.t + ep.i;
+        int rn = ep.n - ep.i;
+        /* `var = .call f(...)` は呼んだ関数の返り値を代入する。 */
+        if(rn > 0 && rt[0].k == MT_DOT && strcmp(rt[0].s, ".CALL") == 0){
+            s->k = MS_CALLASSIGN;
+            ms_call_tail(c, rt, rn, &s->fname, &s->args, &s->nargs);
+            return s;
+        }
+        MXP rp; rp.t = rt; rp.n = rn; rp.i = 0; rp.c = c;
         s->val = mxp_full(&rp);
         return s;
     }
@@ -6147,6 +6167,8 @@ typedef struct {
     long       steps;
     MiniFrame *frames; int nframes, cframes;
     int        returning;
+    MiniVal    retval;   /* 直前の `.return 式` の値。整数でも配列でもよい */
+    int        has_ret;  /* retval が有効か。値なしの `.return` なら 0 */
 } MiniRun;
 
 static MiniVal mini_eval(MiniRun *r, MExpr *e);
@@ -6382,32 +6404,40 @@ static MiniFunc *mini_lookup(MiniRun *r, const char *name){
 
 static void mini_call_func(MiniRun *r, MiniFunc *f, MiniVal *args, int nargs);
 
+/* `name = v` / `name[idx] = v`。v の所有権はこの関数が引き取る。 */
+static void mini_store(MiniRun *r, MStmt *s, MiniVal v){
+    if(!s->idx){ mini_set(r, s->name, v); return; }
+    uint256_t iv = mini_need_num(r, mini_eval(r, s->idx), "an index");
+    long long i = mini_to_ll(r, iv);
+    if(i < 0){ mini_val_free(&v); mini_fail(&r->c, "negative index %lld in assignment", i); }
+    if(i >= MINI_MAX_ARRAY){
+        mini_val_free(&v);
+        mini_fail(&r->c, "array index %lld exceeds the maximum length %d",
+                  i, MINI_MAX_ARRAY);
+    }
+    uint256_t elem = mini_need_num(r, v, "an array element");
+    MiniBind *b = mini_ref(r, s->name);
+    if(!b->v.is_arr) mini_fail(&r->c, "'%s' is not an array", s->name);
+    if(i >= b->v.n){
+        mini_arr_reserve(&b->v, (int)i + 1);
+        for(int q = b->v.n; q <= (int)i; q++) b->v.arr[q] = u256_zero();
+        b->v.n = (int)i + 1;
+    }
+    b->v.arr[i] = elem;
+}
+
+/* 直前の呼び出しが置いていった返り値を捨てる。 */
+static void mini_drop_ret(MiniRun *r){
+    if(r->has_ret){ mini_val_free(&r->retval); r->has_ret = 0; }
+}
+
 static void mini_exec(MiniRun *r, MStmt *s){
     mini_at(r, s);
     mini_tick(r);
     switch(s->k){
-    case MS_ASSIGN: {
-        MiniVal v = mini_eval(r, s->val);
-        if(!s->idx){ mini_set(r, s->name, v); return; }
-        uint256_t iv = mini_need_num(r, mini_eval(r, s->idx), "an index");
-        long long i = mini_to_ll(r, iv);
-        if(i < 0){ mini_val_free(&v); mini_fail(&r->c, "negative index %lld in assignment", i); }
-        if(i >= MINI_MAX_ARRAY){
-            mini_val_free(&v);
-            mini_fail(&r->c, "array index %lld exceeds the maximum length %d",
-                      i, MINI_MAX_ARRAY);
-        }
-        uint256_t elem = mini_need_num(r, v, "an array element");
-        MiniBind *b = mini_ref(r, s->name);
-        if(!b->v.is_arr) mini_fail(&r->c, "'%s' is not an array", s->name);
-        if(i >= b->v.n){
-            mini_arr_reserve(&b->v, (int)i + 1);
-            for(int q = b->v.n; q <= (int)i; q++) b->v.arr[q] = u256_zero();
-            b->v.n = (int)i + 1;
-        }
-        b->v.arr[i] = elem;
+    case MS_ASSIGN:
+        mini_store(r, s, mini_eval(r, s->val));
         return;
-    }
     case MS_EMIT:
         for(int i = 0; i < s->nargs; i++){
             uint256_t x = mini_need_num(r, mini_eval(r, s->args[i]), "'.emit'");
@@ -6424,9 +6454,33 @@ static void mini_exec(MiniRun *r, MStmt *s){
         mini_call_func(r, f, vals, s->nargs);
         for(int i = 0; i < s->nargs; i++) mini_val_free(&vals[i]);
         free(vals);
+        mini_drop_ret(r);   /* 文としての `.call` は返り値を使わない */
+        return;
+    }
+    case MS_CALLASSIGN: {
+        MiniFunc *f = mini_lookup(r, s->fname);
+        MiniVal *vals = s->nargs ? mini_alloc((size_t)s->nargs * sizeof(MiniVal)) : NULL;
+        for(int i = 0; i < s->nargs; i++) vals[i] = mini_eval(r, s->args[i]);
+        mini_at(r, s);
+        mini_call_func(r, f, vals, s->nargs);
+        for(int i = 0; i < s->nargs; i++) mini_val_free(&vals[i]);
+        free(vals);
+        mini_at(r, s);
+        if(!r->has_ret)
+            mini_fail(&r->c, "'%s' returned no value; give it a "
+                      "'.return <expression>'", s->fname);
+        MiniVal ret = r->retval;          /* 所有権をここで引き取る */
+        memset(&r->retval, 0, sizeof(r->retval));
+        r->has_ret = 0;
+        mini_store(r, s, ret);
         return;
     }
     case MS_RETURN:
+        mini_drop_ret(r);
+        if(s->val){
+            r->retval = mini_eval(r, s->val);
+            r->has_ret = 1;
+        }
         r->returning = 1;
         return;
     case MS_NONLOCAL: {
@@ -6510,6 +6564,7 @@ static void mini_call_func(MiniRun *r, MiniFunc *f, MiniVal *args, int nargs){
         r->frames = realloc(r->frames, (size_t)r->cframes * sizeof(MiniFrame));
         if(!r->frames){ perror("realloc"); exit(1); }
     }
+    mini_drop_ret(r);
     MiniFrame *fr = &r->frames[r->nframes++];
     memset(fr, 0, sizeof(*fr));
     fr->func = f;
@@ -6547,6 +6602,7 @@ static void mini_stmt_free(MStmt *s){
     for(int i = 0; i < s->nnames; i++) free(s->names[i]);
     free(s->names);
     free(s->name);
+    free(s->fname);
     free(s);
 }
 
@@ -6738,6 +6794,7 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx, IntVec *obj
     }
     for(int i = 0; i < r.nframes; i++) mini_frame_clear(&r.frames[i]);
     free(r.frames);
+    mini_drop_ret(&r);
     free(r.out.data);
     for(int i = 0; i < nargs; i++) mini_val_free(&args[i]);
     free(args);
@@ -6913,7 +6970,15 @@ static void readpat(Assembler *asmb, const char *fn){
                     continue;
                 }
                 MiniFunc *cur = func_stack[nfunc_stack-1];
-                if(strcmp(dk, ".RETURN") == 0 && cur->depth == 0){ nfunc_stack--; continue; }
+                if(strcmp(dk, ".RETURN") == 0 && cur->depth == 0){
+                    /* 本体を閉じる `.return`。`.return 式` なら値を返す文でも
+                     * あるので、閉じるだけでなく本体の最後の行としても残す。 */
+                    int rb = axx_skipspc(line, 0) + (int)strlen(dk);
+                    rb = axx_skipspc(line, rb);
+                    if(line[rb]) mini_func_addline(cur, line, fn, li + 1);
+                    nfunc_stack--;
+                    continue;
+                }
                 if(strcmp(dk, ".IF") == 0 || strcmp(dk, ".FOR") == 0
                    || strcmp(dk, ".WHILE") == 0){
                     cur->depth++;
