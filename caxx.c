@@ -5525,7 +5525,9 @@ enum {
 };
 
 typedef enum { MT_END, MT_NUM, MT_NAME, MT_DOT, MT_OP } MTKind;
-typedef struct { MTKind k; uint256_t num; char s[128]; } MTok;
+/* 字句1個ぶん。s は名前／ディレクティブ名を丸ごと収める。axx.py 側に名前の
+ * 長さ制限は無いので、実用上ぶつからない幅を取っておく（作業領域はヒープ）。 */
+typedef struct { MTKind k; uint256_t num; char s[512]; } MTok;
 
 typedef struct {
     jmp_buf     jb;
@@ -5902,6 +5904,11 @@ typedef struct {
     MiniFunc *f;
     int       i;
     MiniCtx  *c;
+    /* 字句の作業領域。MTok[MINI_MAX_TOK] は 170KB 近くあり、msp_block は
+     * ブロックの深さぶん再帰するので、各段で自動変数に取るとスタックが尽きる
+     * （40段ほどで落ちていた）。解析は 1 行ぶんずつ完結し、式は木に写してから
+     * 次の段へ進むので、1本を使い回して構わない。 */
+    MTok     *tok;
 } MSP;
 
 static void ms_push(MStmt ***v, int *n, int *cap, MStmt *s){
@@ -5956,7 +5963,7 @@ static MStmt *msp_simple(MSP *p, int li){
     const char *text = p->f->lines[li];
     c->file = p->f->lfiles[li];
     c->line = p->f->llines[li];
-    MTok toks[MINI_MAX_TOK];
+    MTok *toks = p->tok;
     int n = mini_lex(c, text, toks);
     if(n == 0) mini_fail(c, "empty statement");
 
@@ -6051,7 +6058,7 @@ static void msp_block(MSP *p, const char *e1, const char *e2,
             mini_fail(c, "'%s' without a matching opener", low);
         }
         if(strcmp(kw, ".IF") == 0){
-            MTok toks[MINI_MAX_TOK];
+            MTok *toks = p->tok;
             int n = mini_lex(c, p->f->lines[li], toks);
             if(n < 2 || toks[n-1].k != MT_DOT || strcmp(toks[n-1].s, ".THEN") != 0)
                 mini_fail(c, "'.if' must end with '.then'");
@@ -6068,7 +6075,7 @@ static void msp_block(MSP *p, const char *e1, const char *e2,
                 char kw2[32];
                 mini_dotkw(p->f->lines[p->i], kw2, sizeof(kw2));
                 if(strcmp(kw2, ".ELSE") == 0){
-                    MTok t2[MINI_MAX_TOK];
+                    MTok *t2 = p->tok;
                     c->file = p->f->lfiles[p->i]; c->line = p->f->llines[p->i];
                     if(mini_lex(c, p->f->lines[p->i], t2) != 1)
                         mini_fail(c, "unexpected text after '.else'");
@@ -6085,7 +6092,7 @@ static void msp_block(MSP *p, const char *e1, const char *e2,
             continue;
         }
         if(strcmp(kw, ".WHILE") == 0){
-            MTok toks[MINI_MAX_TOK];
+            MTok *toks = p->tok;
             int n = mini_lex(c, p->f->lines[li], toks);
             MStmt *s = ms_new(MS_WHILE, p, li);
             MXP ep; ep.t = toks + 1; ep.n = n - 1; ep.i = 0; ep.c = c;
@@ -6101,7 +6108,7 @@ static void msp_block(MSP *p, const char *e1, const char *e2,
             continue;
         }
         if(strcmp(kw, ".FOR") == 0){
-            MTok toks[MINI_MAX_TOK];
+            MTok *toks = p->tok;
             int n = mini_lex(c, p->f->lines[li], toks);
             if(n < 4 || toks[1].k != MT_NAME)
                 mini_fail(c, "'.for' needs 'variable in range(...)'");
@@ -6131,8 +6138,20 @@ static void msp_block(MSP *p, const char *e1, const char *e2,
 }
 
 /* 本体の行を文の木にする。エラーは *errout に書いて 0 を返す。 */
+/* 字句の作業領域。解析は 1 関数ずつ順に走るので 1 本で足りる。
+ * msp_block の再帰段ごとに自動変数で持つとスタックが尽きるため外に出す。 */
+static MTok *mini_tokbuf(void){
+    static MTok *buf;
+    if(!buf){
+        buf = malloc((size_t)MINI_MAX_TOK * sizeof(MTok));
+        if(!buf){ perror("malloc"); exit(1); }
+    }
+    return buf;
+}
+
 static int mini_compile_func(MiniFunc *f, char *errout, size_t esz){
     MiniCtx c;
+    MTok *tokbuf = mini_tokbuf();
     memset(&c, 0, sizeof(c));
     c.file = f->file; c.line = f->line;
     c.jb_active = 1;
@@ -6141,7 +6160,7 @@ static int mini_compile_func(MiniFunc *f, char *errout, size_t esz){
         f->body = NULL; f->nbody = 0;
         return 0;
     }
-    MSP p; p.f = f; p.i = 0; p.c = &c;
+    MSP p; p.f = f; p.i = 0; p.c = &c; p.tok = tokbuf;
     msp_block(&p, NULL, NULL, &f->body, &f->nbody);
     if(p.i < f->nlines){
         c.file = f->lfiles[p.i]; c.line = f->llines[p.i];
@@ -6175,6 +6194,19 @@ static MiniVal mini_eval(MiniRun *r, MExpr *e);
 static void mini_exec_block(MiniRun *r, MStmt **body, int n);
 
 static void mini_at(MiniRun *r, MStmt *s){ r->c.file = s->file; r->c.line = s->line; }
+
+/* 添字やスライス境界のように「範囲外なら丸める」場所で使う飽和変換。
+ * axx.py は多倍長のまま比較するので、long long に収まらない値でエラーに
+ * せず、符号の向きに振り切った値として扱えば同じ結果になる。 */
+static long long mini_to_ll_sat(uint256_t v){
+    if(u256_is_neg256(v)){
+        uint256_t p = u256_neg(v);
+        if(u256_nonneg_gt_i64(p, 0x7fffffffffffffffLL)) return -0x7fffffffffffffffLL - 1;
+        return -(long long)u256_to_u64(p);
+    }
+    if(u256_nonneg_gt_i64(v, 0x7fffffffffffffffLL)) return 0x7fffffffffffffffLL;
+    return (long long)u256_to_u64(v);
+}
 
 static long long mini_to_ll(MiniRun *r, uint256_t v){
     if(u256_is_neg256(v)){
@@ -6327,7 +6359,7 @@ static MiniVal mini_eval(MiniRun *r, MExpr *e){
         MiniVal b = mini_eval(r, e->a);
         if(!b.is_arr){ mini_val_free(&b); mini_fail(&r->c, "only an array can be indexed"); }
         uint256_t iv = mini_need_num(r, mini_eval(r, e->b), "an index");
-        long long i = mini_to_ll(r, iv);
+        long long i = mini_to_ll_sat(iv);
         /* 範囲外の読み出しは 0。配列は書き込みで伸びるので読みでは伸ばさない。 */
         uint256_t out = (i < 0 || i >= b.n) ? u256_zero() : b.arr[i];
         mini_val_free(&b);
@@ -6338,8 +6370,8 @@ static MiniVal mini_eval(MiniRun *r, MExpr *e){
         if(!b.is_arr){ mini_val_free(&b); mini_fail(&r->c, "only an array can be sliced"); }
         long long n = b.n;
         long long lo = 0, hi = n;
-        if(e->b) lo = mini_to_ll(r, mini_need_num(r, mini_eval(r, e->b), "a slice bound"));
-        if(e->c) hi = mini_to_ll(r, mini_need_num(r, mini_eval(r, e->c), "a slice bound"));
+        if(e->b) lo = mini_to_ll_sat(mini_need_num(r, mini_eval(r, e->b), "a slice bound"));
+        if(e->c) hi = mini_to_ll_sat(mini_need_num(r, mini_eval(r, e->c), "a slice bound"));
         if(lo < 0) lo = 0;
         if(lo > n) lo = n;
         if(hi < lo) hi = lo;
@@ -6408,13 +6440,18 @@ static void mini_call_func(MiniRun *r, MiniFunc *f, MiniVal *args, int nargs);
 static void mini_store(MiniRun *r, MStmt *s, MiniVal v){
     if(!s->idx){ mini_set(r, s->name, v); return; }
     uint256_t iv = mini_need_num(r, mini_eval(r, s->idx), "an index");
-    long long i = mini_to_ll(r, iv);
-    if(i < 0){ mini_val_free(&v); mini_fail(&r->c, "negative index %lld in assignment", i); }
-    if(i >= MINI_MAX_ARRAY){
+    if(u256_is_neg256(iv)){
+        char nb[96]; u256_to_pydec(iv, nb, sizeof(nb));
         mini_val_free(&v);
-        mini_fail(&r->c, "array index %lld exceeds the maximum length %d",
-                  i, MINI_MAX_ARRAY);
+        mini_fail(&r->c, "negative index %s in assignment", nb);
     }
+    if(u256_nonneg_gt_i64(iv, (int64_t)MINI_MAX_ARRAY - 1)){
+        char nb[96]; u256_to_pydec(iv, nb, sizeof(nb));
+        mini_val_free(&v);
+        mini_fail(&r->c, "array index %s exceeds the maximum length %d",
+                  nb, MINI_MAX_ARRAY);
+    }
+    long long i = mini_to_ll(r, iv);
     uint256_t elem = mini_need_num(r, v, "an array element");
     MiniBind *b = mini_ref(r, s->name);
     if(!b->v.is_arr) mini_fail(&r->c, "'%s' is not an array", s->name);
@@ -6440,7 +6477,12 @@ static void mini_exec(MiniRun *r, MStmt *s){
         return;
     case MS_EMIT:
         for(int i = 0; i < s->nargs; i++){
-            uint256_t x = mini_need_num(r, mini_eval(r, s->args[i]), "'.emit'");
+            MiniVal ev = mini_eval(r, s->args[i]);
+            if(ev.is_arr){
+                mini_val_free(&ev);
+                mini_fail(&r->c, "'.emit' needs numbers, not an array");
+            }
+            uint256_t x = ev.num;
             if(r->out.len >= MINI_MAX_EMIT)
                 mini_fail(&r->c, "'.emit' produced more than %d words", MINI_MAX_EMIT);
             iv_push(&r->out, x);
@@ -6515,20 +6557,32 @@ static void mini_exec(MiniRun *r, MStmt *s){
         }
         return;
     case MS_FOR: {
-        long long v[3] = {0, 0, 0};
+        /* 反復変数は 256bit のまま回す。long long に落とすと、範囲の端が
+         * 64bit を超えるだけで axx.py（多倍長）と挙動が食い違うため。 */
+        uint256_t v[3];
+        v[0] = v[1] = v[2] = u256_zero();
         for(int i = 0; i < s->nargs; i++)
-            v[i] = mini_to_ll(r, mini_need_num(r, mini_eval(r, s->args[i]), "a range bound"));
-        long long start, stop, step;
-        if(s->nargs == 1){ start = 0; stop = v[0]; step = 1; }
-        else if(s->nargs == 2){ start = v[0]; stop = v[1]; step = 1; }
+            v[i] = mini_need_num(r, mini_eval(r, s->args[i]), "a range bound");
+        uint256_t start, stop, step;
+        if(s->nargs == 1){ start = u256_zero(); stop = v[0]; step = u256_one(); }
+        else if(s->nargs == 2){ start = v[0]; stop = v[1]; step = u256_one(); }
         else { start = v[0]; stop = v[1]; step = v[2]; }
-        if(step == 0) mini_fail(&r->c, "range() step must not be zero");
-        for(long long i = start; step > 0 ? i < stop : i > stop; i += step){
+        if(u256_is_zero(step)) mini_fail(&r->c, "range() step must not be zero");
+        int up = !u256_is_neg256(step);
+        uint256_t i = start;
+        while(up ? u256_lt_signed(i, stop) : u256_gt_signed(i, stop)){
             mini_at(r, s);
             mini_tick(r);
-            mini_set(r, s->name, mini_num(u256_from_i64(i)));
+            mini_set(r, s->name, mini_num(i));
             mini_exec_block(r, s->body, s->nbody);
             if(r->returning) return;
+            /* axx.py の反復変数は桁あふれしない整数なので、256bit の符号付き
+             * 範囲を越えた時点で必ず停止条件を満たす。同じ所で打ち切る。 */
+            uint256_t nx = u256_add(i, step);
+            if(up ? (!u256_is_neg256(i) && u256_is_neg256(nx))
+                  : (u256_is_neg256(i) && !u256_is_neg256(nx)))
+                return;
+            i = nx;
         }
         return;
     }
@@ -6760,7 +6814,7 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx, IntVec *obj
     int j = idx;
     while(j < slen && (isalnum((unsigned char)s[j]) || s[j] == '_')) j++;
     int namelen = j - idx;
-    char name[128];
+    char name[512];
     if(namelen <= 0 || namelen >= (int)sizeof(name)){
         if(!quiet) axx_diagf(1, 0, " error - '.call' needs 'name(argument, ...)'.\n");
         return slen;
@@ -9048,6 +9102,12 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         _rtype_is_default_guess = 1;
                     }
                 }
+                /* 破綻点修正: リロケーション型が決まらないとき、axx.py は
+                 * 「型が無いので省いた」と警告してから捨てるが、こちらは黙って
+                 * 捨てていた。同じ入力で同じ診断が出るよう揃える。 */
+                if(_rtype == 0 && _widx < objl.len)
+                    axx_diagf(0, 0, " warning - no relocation type available for a %d-byte "
+                               "reference to '%s'; relocation omitted.\n", _nbytes, _lname);
                 if(_rtype != 0 && _widx < objl.len){
                     int64_t _sec_rel = (int64_t)((sec_completed_words +
                                                    (cur_pc + (uint64_t)_widx - sec_entry_pc_cur))

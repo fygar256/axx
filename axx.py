@@ -4273,16 +4273,30 @@ class PatternFileReader:
 
         1ソース行ごとに解析し直すのは無駄なので一度だけ。文法の誤りも
         組み立てが始まる前にまとめて報告できる。
+
+        ブロックの入れ子と括弧の深さはそのまま Python の再帰になるので、
+        マクロ展開と同じように上限を一時的に上げ、それでも足りなければ
+        トレースバックではなく診断として報告する。
         """
-        def walk(table):
-            for f in table.values():
-                try:
-                    f.body = MiniParser(f).parse_body()
-                except MiniLangError as e:
-                    diag(f" error - {e}", set_error=True)
-                    f.body = []
-                walk(f.children)
-        walk(self.funcs)
+        saved_reclimit = sys.getrecursionlimit()
+        if saved_reclimit < _MINI_RECLIMIT:
+            sys.setrecursionlimit(_MINI_RECLIMIT)
+        try:
+            def walk(table):
+                for f in table.values():
+                    try:
+                        f.body = MiniParser(f).parse_body()
+                    except MiniLangError as e:
+                        diag(f" error - {e}", set_error=True)
+                        f.body = []
+                    except RecursionError:
+                        diag(f" error - {f.file}:{f.line}: '.func::{f.name}' nests "
+                             f"too deeply to parse.", set_error=True)
+                        f.body = []
+                    walk(f.children)
+            walk(self.funcs)
+        finally:
+            sys.setrecursionlimit(saved_reclimit)
 
     def check_sub_refs(self, pat):
         """`!S{{名前}}` の参照を読み込み時に検算する。
@@ -4377,6 +4391,11 @@ class _MiniReturn(Exception):
         super().__init__()
         self.value = value
 
+
+# ミニ言語の解析・実行中だけ上げる再帰上限。ブロックの入れ子と括弧の深さが
+# そのまま Python の再帰になるので、既定の 1000 では浅い入れ子で尽きてしまう。
+# caxx 側は再帰の深さに固定の上限を持たないので、届く範囲を揃えておく。
+_MINI_RECLIMIT = 20000
 
 # ミニ言語の整数は axx の式と同じ 256bit 2の補数。Python と C で同じ値に
 # なるよう、演算のたびに幅を合わせる。
@@ -5319,6 +5338,9 @@ class ObjectGenerator:
                 continue
             break
 
+        saved_reclimit = sys.getrecursionlimit()
+        if saved_reclimit < _MINI_RECLIMIT:
+            sys.setrecursionlimit(_MINI_RECLIMIT)
         try:
             words, ret = MiniInterp(self.state).run(fn, args, (fn.file, fn.line))
         except MiniLangError as e:
@@ -5327,6 +5349,8 @@ class ObjectGenerator:
         except RecursionError:
             self._mini_diag(f" error - '.call {name}': expression nesting too deep.")
             return [], idx
+        finally:
+            sys.setrecursionlimit(saved_reclimit)
         # 返り値もワードになる。配列なら添字 0 から順に、スカラーなら 1 ワード。
         if ret is not None:
             words = words + (list(ret) if isinstance(ret, list) else [ret])
