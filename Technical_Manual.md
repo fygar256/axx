@@ -332,6 +332,7 @@ In the `instruction` field:
 | `!Dx` | IEEE-754 bit pattern of a **64-bit** float expression |
 | `!Qx` | IEEE-754 bit pattern of a **128-bit** float expression |
 | `!Ex` | Value of an **enumerated operand list** declared with `.enum` (section 3.7.1) |
+| `!S{{name}}x` | Value of the matching entry of the **sub table** `name` declared with `.sub` (section 3.7.2) |
 
 Captured values are referenced from `error_patterns` and `binary_list` by the
 bare letter — the `!` prefix is not repeated there. Every lowercase variable is
@@ -589,6 +590,58 @@ Notes.
 - `.enum` is positional like `.check`: a later `.enum` for the same variable
   replaces the earlier one, and `.clrenum::x` (or `.clrenum` with no argument)
   removes it.
+
+#### 3.7.2 Sub tables (`.sub` / `.return`)
+
+A sub table is a named set of alternatives that can be spliced into a position
+of an `instruction` field. Where `.check` restricts a position to one *symbol*,
+a sub table lets that position be a whole *pattern*, each alternative carrying
+its own value.
+
+```
+.sub::<name>
+<pattern>::<value list>
+...
+.return
+```
+
+The table is referenced with `!S{{<name>}}<variable>`. Every entry is tried in
+the order written; the entry's `<pattern>` is matched in place of the reference,
+and the value of its `<value list>` is bound to the variable, which is then
+referenced from `error_patterns` and `binary_list` by the bare letter, exactly
+like every other capture.
+
+```
+MOV!S{{sub1}}x A,!e :: 0x01,x<<8,x,e<<8,e
+.sub::sub1
+R1::0x01,0x01
+R2::0x02,0x02
+R3::0x03,0x03
+.return
+```
+
+```
+movr1 a,0x22         -> 01 00 01 00 22
+movr2 a,0x33         -> 01 00 02 00 33
+```
+
+A value list with more than one element is packed into a single value, the
+first element highest, `.bits` bits each — so `0x01,0x02` is `0x0102` at the
+default width. A single element is the value itself.
+
+Notes.
+
+- The entry pattern is an ordinary pattern, so it may itself capture: with
+  `.sub::cc` holding `NZ::0` / `Z::0x08`, `JMP!S{{cc}}c !e` matches `jmpz 0x1234`.
+- The value list is evaluated **after** the match, so it may use variables the
+  entry pattern captured: `R!n::n` binds the captured digit.
+- Sub tables may reference other sub tables; the inner value is bound first, so
+  the outer value list can use it.
+- The whole pattern file is read before references are resolved, so a table may
+  be defined after its use. Unknown table names and circular references are
+  reported once when the pattern file is read.
+- A `.sub` block may not be nested inside another; the entries live in the sub
+  table only and are never matched as ordinary pattern lines.
 
 ### 3.8 Optional parts (`[[ ]]`)
 

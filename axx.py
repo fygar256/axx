@@ -231,6 +231,11 @@ _PFX_OPEN = frozenset(LOWER + DIGIT + '!\\[')
 _PFX_WORD = frozenset(ALPHABET + DIGIT + '_')
 
 
+def _is_sub_name(s):
+    """`.sub::名前` / `!S{{名前}}` に書けるサブ表の名前か。"""
+    return bool(s) and all(c in _PFX_WORD for c in s)
+
+
 # パターンファイルの第2フィールド（エラー条件）が返す番号 → メッセージ。
 # 例: `ADD A,R!n :: n>7;5 :: ...` は n>7 のとき番号5（レジスタ範囲外）を報告する。
 ERRORS = [
@@ -634,6 +639,10 @@ class AssemblerState:
         # .enum の式を評価している間だけ立つ束縛表。[(要素名, 値), ...]。
         # 要素名は「出現していれば .setsym の値、非出現なら 0」に束縛される。
         self.enum_bindings: list | None = None
+
+        # `.sub::名前 ... .return` で登録されたサブ表。
+        # 名前 -> [(照合パターン, 値欄), ...]。`!S{{名前}}変数` の展開に使う。
+        self.sub_defs: dict = {}
 
         # error_patterns 欄（例: `n>7;5`）が返すエラーコード → メッセージ文字列。
         # 実行ごとに独立した可変コピーとして持ち、モジュール定数 ERRORS を汚さない。
@@ -3406,6 +3415,8 @@ class PatternMatcher:
       `!x`          任意の式を読んで変数 x に束縛
       `!!x`         式ではなく factor 1個だけを束縛
       `!Fx`/`!Dx`/`!Qx`  浮動小数点式を IEEE754 の 32/64/128bit として束縛
+      `!S{{名前}}x` `.sub::名前 … .return` のサブ表のどれか1項目に一致させ、
+                    その項目の値欄を評価した結果を変数 x に束縛
       `\c`          次の1文字をリテラル扱い（エスケープ）
       `[[ ... ]]`   省略可能グループ。含む/含まないの全組合せを試す
     
@@ -3813,8 +3824,105 @@ class PatternMatcher:
                 return False
 
     _MAX_COMBINATIONS = 1 << 16
+    _SUB_MAX_DEPTH = 8
+
+    @staticmethod
+    def _find_sub_ref(t, start=0):
+        """`!S{{名前}}変数` を探し、(開始, 終了, 名前, 変数) を返す。無ければ None。"""
+        i = start
+        while True:
+            i = t.find('!S{{', i)
+            if i < 0:
+                return None
+            j = t.find('}}', i + 4)
+            if j < 0:
+                return None
+            # `\!` とエスケープされていれば式ではなくリテラルの `!`。
+            if i > 0 and t[i - 1] == '\\':
+                i = j + 2
+                continue
+            name = t[i + 4:j]
+            k = j + 2
+            if _is_sub_name(name) and k < len(t) and t[k] in LOWER:
+                return i, k + 1, name, t[k]
+            i = j + 2
+
+    def _sub_variants(self, t, depth=0):
+        """`!S{{名前}}x` をサブ表の各項目で置換した候補を、表の記述順に生成する。
+
+        返すのは (置換後のパターン, ((変数, 値欄), ...)) の組。値欄は照合が
+        成功してから評価する（項目のパターンが束縛した変数を使えるように）。
+        """
+        ref = self._find_sub_ref(t)
+        if ref is None:
+            yield t, ()
+            return
+        start, end, name, var = ref
+        ref_text = '!S{{' + name + '}}'
+        if depth >= self._SUB_MAX_DEPTH:
+            self.state.diag(f" error - {ref_text}: sub table expansion exceeds "
+                            f"maximum depth {self._SUB_MAX_DEPTH}.", set_error=True)
+            return
+        entries = self.state.sub_defs.get(name)
+        if entries is None:
+            self.state.diag(f" error - {ref_text}: no sub table named {name!r} "
+                            f"(define it with '.sub::{name} ... .return').",
+                            set_error=True)
+            return
+        for ent_pat, ent_val in entries:
+            nt = t[:start] + ent_pat + t[end:]
+            for vt, binds in self._sub_variants(nt, depth + 1):
+                yield vt, ((var, ent_val),) + binds
+
+    def _sub_value(self, expr_text):
+        """サブ表の値欄を評価する。
+
+        カンマ区切りで複数書かれていれば、先頭を上位として `.bits` 幅ずつ
+        詰めた1つの整数にする（`0x01,0x02` は 8bit 幅なら 0x0102）。
+        1つだけなら値そのもの。
+        """
+        s = expr_text + chr(0)
+        idx = 0
+        vals = []
+        while idx < len(s) and s[idx] != chr(0):
+            if s[idx] == ',':
+                idx += 1
+                continue
+            v, idx = self.expr_eval.expression_pat(s, idx)
+            vals.append(v)
+            if idx < len(s) and s[idx] == ',':
+                idx += 1
+                continue
+            break
+        if not vals:
+            return 0
+        if len(vals) == 1:
+            return vals[0]
+        bts = self.state.bts if self.state.bts > 0 else 8
+        mask = (1 << bts) - 1
+        acc = 0
+        for v in vals:
+            acc = (acc << bts) | (int(v) & mask)
+        return acc
 
     def match0(self, s, t):
+        for vt, binds in self._sub_variants(t):
+            saved_vars = self.state.vars[:]
+            saved_vars_undef = self.state.vars_undef[:]
+            saved_refs_len = len(self.state._elf_label_refs_seen)
+            saved_v2l = dict(self.state._elf_var_to_label)
+            if self.match0_brackets(s, vt):
+                # 入れ子のときは内側から。外側の値欄が内側の変数を使える。
+                for var, ent_val in reversed(binds):
+                    self.var_manager.put(var, self._sub_value(ent_val))
+                return True
+            self.state.vars = saved_vars
+            self.state.vars_undef = saved_vars_undef
+            del self.state._elf_label_refs_seen[saved_refs_len:]
+            self.state._elf_var_to_label = saved_v2l
+        return False
+
+    def match0_brackets(self, s, t):
         t = t.replace('[[', OB).replace(']]', CB)
         cnt = t.count(OB)
         sl = [_ + 1 for _ in range(cnt)]
@@ -3873,6 +3981,8 @@ class PatternFileReader:
         self.parser = parser
         self.macro_proc = macro_proc if macro_proc is not None \
             else MacroPreprocessor(None, pat_mode=True)
+        # `.sub::名前 ... .return` で集めたサブ表。名前 -> [(パターン, 値欄), ...]。
+        self.subs = {}
 
     def readpat(self, fn, base_dir=None, _depth=0, _chain=None):
         if fn == '':
@@ -3902,6 +4012,7 @@ class PatternFileReader:
 
         if _depth == 0:
             self.macro_proc.reset_pass()
+            self.subs = {}
 
         try:
             with open(fn, "rt", encoding="utf-8") as f:
@@ -3939,6 +4050,7 @@ class PatternFileReader:
 
         in_block_comment = False
         legacy_chain = False
+        cur_sub = None
         for _li, (l, _mfile, _mln) in enumerate(expanded):
 
             was_in_comment = in_block_comment
@@ -3979,6 +4091,37 @@ class PatternFileReader:
                         break
                 l = r
 
+                _kw = StringUtils.upper(l[0].strip())
+                if _kw == '.SUB':
+                    _nm = (l[1] if len(l) > 1 else '').strip()
+                    if cur_sub is not None:
+                        diag(f" error - '.sub' inside '.sub::{cur_sub}': sub tables "
+                             f"cannot be nested.", set_error=True)
+                    elif not _is_sub_name(_nm):
+                        diag(f" error - '.sub' needs a table name made of letters, "
+                             f"digits and '_': {_nm!r}", set_error=True)
+                    else:
+                        if _nm in self.subs:
+                            diag(f" warning - sub table {_nm!r} is defined more than "
+                                 f"once; the later definition wins.", set_error=False)
+                        cur_sub = _nm
+                        self.subs[_nm] = []
+                    continue
+                if _kw == '.RETURN':
+                    if cur_sub is None:
+                        diag(" error - '.return' without a matching '.sub'.",
+                             set_error=True)
+                    cur_sub = None
+                    continue
+                if cur_sub is not None:
+                    if len(l) < 2:
+                        if l[0].strip() != '':
+                            diag(f" error - sub table {cur_sub!r}: entry has no '::' "
+                                 f"field separator: {l[0]!r}", set_error=True)
+                        continue
+                    self.subs[cur_sub].append((l[0], l[-1]))
+                    continue
+
                 if len(l) == 1:
                     if l[0].strip() != '':
                         diag(f" warning - pattern line has no '::' field separator "
@@ -4007,8 +4150,65 @@ class PatternFileReader:
         if in_block_comment:
             diag(f" warning - pattern file '{fn}' ends while a /* ... */ comment "
                  f"is still open (missing closing '*/').", set_error=False)
+        if cur_sub is not None:
+            diag(f" error - pattern file '{fn}' ends while sub table {cur_sub!r} "
+                 f"is still open (missing '.return').", set_error=True)
+
+        if _depth == 0:
+            self.check_sub_refs(w)
 
         return w
+
+    def check_sub_refs(self, pat):
+        """`!S{{名前}}` の参照を読み込み時に検算する。
+
+        照合中に出した診断は「採用されなかった候補のもの」として捨てられるので、
+        名前の綴り違いや循環参照はそのままだと全行が素の Syntax error になる。
+        パターンファイル側の誤りはここで一度だけ報告する。
+        """
+        def refs(t):
+            out, i = [], 0
+            while True:
+                r = PatternMatcher._find_sub_ref(t, i)
+                if r is None:
+                    return out
+                out.append(r[2])
+                i = r[1]
+
+        def check_unknown(where, t):
+            for nm in refs(t):
+                if nm not in self.subs:
+                    diag(f" error - !S{{{{{nm}}}}} in {where}: no sub table named "
+                         f"{nm!r} (define it with '.sub::{nm} ... .return').",
+                         set_error=True)
+
+        for p in pat:
+            if p[0]:
+                check_unknown('pattern', p[0])
+        for nm, entries in self.subs.items():
+            for ent_pat, _ in entries:
+                check_unknown(f"sub table {nm!r}", ent_pat)
+
+        # 展開が終わらなくなる循環参照。
+        mark = {}
+
+        def walk(nm, stack):
+            if mark.get(nm) == 'done':
+                return
+            if mark.get(nm) == 'open':
+                diag(f" error - sub table {nm!r} is circular "
+                     f"({' -> '.join(stack + [nm])}); expansion would not terminate.",
+                     set_error=True)
+                return
+            mark[nm] = 'open'
+            for ent_pat, _ in self.subs.get(nm, ()):
+                for r in refs(ent_pat):
+                    if r in self.subs:
+                        walk(r, stack + [nm])
+            mark[nm] = 'done'
+
+        for nm in self.subs:
+            walk(nm, [])
 
     def include_pat(self, l, base_dir=None, _depth=0, _chain=None):
         idx = StringUtils.skipspc(l, 0)
@@ -7908,6 +8108,7 @@ class Assembler:
 
         try:
             self.state.pat = self.pattern_reader.readpat(args.patternfile)
+            self.state.sub_defs = self.pattern_reader.subs
             # 破綻点修正: パターンファイルが読めなかった場合、readpat() は
             # エラーを報告して空のパターン表を返すが、そのまま組み立てに進んで
             # いたため、全ソース行が「どのパターンにも一致しない」となり

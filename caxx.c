@@ -477,6 +477,67 @@ static void enumdef_copy(EnumDef *dst, const EnumDef *src){
     dst->expr = src->expr ? strdup(src->expr) : NULL;
 }
 
+/* `.sub::名前 … .return` で登録されたサブ表。
+ * pat は項目の照合パターン、val は値欄（カンマ区切りの式）。
+ * `!S{{名前}}<変数>` は、この表のどれか1項目に一致したとき、その項目の値欄を
+ * 評価した結果をその変数に束縛する。 */
+typedef struct { char *pat; char *val; } SubEntry;
+typedef struct { char *name; SubEntry *e; int n; int cap; } SubDef;
+typedef struct { SubDef *data; int len; int cap; } SubVec;
+
+static void subv_init(SubVec*v){ v->data=NULL; v->len=0; v->cap=0; }
+static void subv_free(SubVec*v){
+    for(int i=0;i<v->len;i++){
+        for(int j=0;j<v->data[i].n;j++){
+            free(v->data[i].e[j].pat);
+            free(v->data[i].e[j].val);
+        }
+        free(v->data[i].e);
+        free(v->data[i].name);
+    }
+    free(v->data); subv_init(v);
+}
+static SubDef *subv_find(SubVec*v, const char *name){
+    for(int i=0;i<v->len;i++) if(strcmp(v->data[i].name,name)==0) return &v->data[i];
+    return NULL;
+}
+static SubDef *subv_new(SubVec*v, const char *name){
+    SubDef *old = subv_find(v, name);
+    if(old){
+        for(int j=0;j<old->n;j++){ free(old->e[j].pat); free(old->e[j].val); }
+        old->n = 0;
+        return old;
+    }
+    if(v->len>=v->cap){
+        v->cap = v->cap ? v->cap*2 : 8;
+        v->data = realloc(v->data, (size_t)v->cap*sizeof(SubDef));
+        if(!v->data){ perror("realloc"); exit(1); }
+    }
+    SubDef *d = &v->data[v->len++];
+    d->name = strdup(name); d->e = NULL; d->n = 0; d->cap = 0;
+    if(!d->name){ perror("strdup"); exit(1); }
+    return d;
+}
+static void subdef_push(SubDef *d, const char *pat, const char *val){
+    if(d->n>=d->cap){
+        d->cap = d->cap ? d->cap*2 : 8;
+        d->e = realloc(d->e, (size_t)d->cap*sizeof(SubEntry));
+        if(!d->e){ perror("realloc"); exit(1); }
+    }
+    d->e[d->n].pat = strdup(pat);
+    d->e[d->n].val = strdup(val);
+    if(!d->e[d->n].pat || !d->e[d->n].val){ perror("strdup"); exit(1); }
+    d->n++;
+}
+
+/* `.sub::名前` / `!S{{名前}}` に書ける名前か。 */
+static int is_sub_name(const char *s){
+    if(!s || !s[0]) return 0;
+    for(const char *p=s; *p; p++)
+        if(!(isalnum((unsigned char)*p) || *p=='_')) return 0;
+    return 1;
+}
+
 typedef struct { int *data; int len; int cap; } IStack;
 static void is_init(IStack*v){v->data=NULL;v->len=0;v->cap=0;}
 static void is_push(IStack*v,int x){
@@ -939,6 +1000,7 @@ typedef struct {
     LabelMap   export_labels;  /* .global 等で外部公開するラベル */
     StrVec     export_order;   /* 公開順（出力の再現性のため） */
     PatVec     pat;            /* 読み込んだパターン表 */
+    SubVec     subs;           /* `.sub … .return` のサブ表 */
 
     /* --- VLIW / EPIC --- */
     int        vliwinstbits;     /* 命令スロット1個のビット幅 */
@@ -1504,6 +1566,7 @@ static void state_init(AsmState *st) {
     lmap_init(&st->macro_labels);
     sv_init(&st->export_order);
     pv_init(&st->pat);
+    subv_init(&st->subs);
     st->vliwinstbits = 41;
     iv_init(&st->vliwnop);
     st->vliwbits = 128;
@@ -5018,7 +5081,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
     return result;
 }
 
-static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
+static int pat_match0_brackets(Assembler *asmb, const char *s, const char *t_orig){
     char *t=malloc(strlen(t_orig)+1);
     strcpy(t,t_orig);
     char *out=malloc(strlen(t)*2+4);
@@ -5133,6 +5196,132 @@ combo_done:
     return found;
 }
 
+/* `!S{{名前}}<変数>` を探す。見つかれば開始位置を返し、*end に変数の次の位置、
+ * name に表名、*var に変数名を書く。無ければ -1。 */
+static int pat_find_sub_ref(const char *t, int start, int *end, char *name, size_t nsz, char *var){
+    for(int i=start; t[i]; i++){
+        if(!(t[i]=='!' && t[i+1]=='S' && t[i+2]=='{' && t[i+3]=='{')) continue;
+        /* `\!` とエスケープされていれば式ではなくリテラルの `!`。 */
+        if(i>0 && t[i-1]=='\\') continue;
+        const char *cb = strstr(t+i+4, "}}");
+        if(!cb) return -1;
+        size_t n = (size_t)(cb - (t+i+4));
+        if(n >= nsz) continue;
+        memcpy(name, t+i+4, n); name[n]='\0';
+        char v = cb[2];
+        if(is_sub_name(name) && is_lower(v)){
+            *var = v;
+            *end = (int)(cb + 3 - t);
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* サブ表の値欄を評価する。カンマ区切りで複数書かれていれば、先頭を上位として
+ * `.bits` 幅ずつ詰めた1つの値にする（`0x01,0x02` は 8bit 幅なら 0x0102）。 */
+static uint256_t pat_sub_value(Assembler *asmb, const char *expr){
+    AsmState *st=&asmb->st;
+    int bts = st->bts > 0 ? st->bts : 8;
+    uint256_t mask = u256_sub(u256_shl(u256_one(), bts), u256_one());
+    uint256_t acc = u256_zero();
+    uint256_t first = u256_zero();
+    int count = 0;
+    int idx = 0, slen = (int)strlen(expr);
+    while(idx < slen){
+        if(expr[idx]==','){ idx++; continue; }
+        int io;
+        uint256_t v = expr_expression_pat(asmb, expr, idx, &io);
+        if(io <= idx) break;
+        idx = io;
+        if(count==0) first = v;
+        acc = u256_or(u256_shl(acc, bts), u256_and(v, mask));
+        count++;
+        if(idx < slen && expr[idx]==','){ idx++; continue; }
+        break;
+    }
+    if(count==0) return u256_zero();
+    if(count==1) return first;
+    return acc;
+}
+
+typedef struct { char var; const char *val; } SubBind;
+
+enum { SUB_MAX_DEPTH = 8 };
+
+static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
+                           SubBind *binds, int nbinds, int depth){
+    char name[64]; char var; int end;
+    int start = pat_find_sub_ref(t, 0, &end, name, sizeof(name), &var);
+    if(start < 0){
+        PatVar saved_vars[26];
+        memcpy(saved_vars, asmb->st.vars, sizeof(saved_vars));
+        int saved_elf_refs_len = asmb->st.elf_refs_len;
+        struct {int set; char *label_name; uint64_t label_val;} saved_vtl[26];
+        for(int vi=0;vi<26;vi++){
+            saved_vtl[vi].set        = asmb->st.elf_var_to_label[vi].set;
+            saved_vtl[vi].label_val  = asmb->st.elf_var_to_label[vi].label_val;
+            saved_vtl[vi].label_name = asmb->st.elf_var_to_label[vi].label_name
+                                       ? strdup(asmb->st.elf_var_to_label[vi].label_name)
+                                       : NULL;
+        }
+        if(pat_match0_brackets(asmb, s, t)){
+            /* 値欄は照合成功後に評価する。項目のパターンが束縛した変数を
+             * 値欄から使えるようにするため。入れ子のときは内側から評価する
+             * ので、外側の値欄が内側の変数を使える。 */
+            for(int k=nbinds-1;k>=0;k--)
+                var_put(&asmb->st, binds[k].var, pat_sub_value(asmb, binds[k].val));
+            for(int vi=0;vi<26;vi++) free(saved_vtl[vi].label_name);
+            return 1;
+        }
+        memcpy(asmb->st.vars, saved_vars, sizeof(saved_vars));
+        for(int ri=saved_elf_refs_len; ri<asmb->st.elf_refs_len; ri++)
+            free(asmb->st.elf_refs[ri].name);
+        asmb->st.elf_refs_len = saved_elf_refs_len;
+        for(int vi=0;vi<26;vi++){
+            free(asmb->st.elf_var_to_label[vi].label_name);
+            asmb->st.elf_var_to_label[vi].set        = saved_vtl[vi].set;
+            asmb->st.elf_var_to_label[vi].label_val  = saved_vtl[vi].label_val;
+            asmb->st.elf_var_to_label[vi].label_name = saved_vtl[vi].label_name;
+        }
+        return 0;
+    }
+
+    if(depth >= SUB_MAX_DEPTH){
+        axx_diagf(1, 0, " error - !S{{%s}}: sub table expansion exceeds maximum "
+                   "depth %d.\n", name, SUB_MAX_DEPTH);
+        return 0;
+    }
+    SubDef *d = subv_find(&asmb->st.subs, name);
+    if(!d){
+        axx_diagf(1, 0, " error - !S{{%s}}: no sub table named '%s' (define it with "
+                   "'.sub::%s ... .return').\n", name, name, name);
+        return 0;
+    }
+    if(nbinds >= SUB_MAX_DEPTH) return 0;
+
+    int tlen = (int)strlen(t);
+    for(int k=0; k<d->n; k++){
+        size_t nl = (size_t)start + strlen(d->e[k].pat) + (size_t)(tlen-end) + 1;
+        char *nt = malloc(nl);
+        if(!nt){ perror("malloc"); exit(1); }
+        memcpy(nt, t, (size_t)start);
+        strcpy(nt + start, d->e[k].pat);
+        strcat(nt + start, t + end);
+        binds[nbinds].var = var;
+        binds[nbinds].val = d->e[k].val;
+        int ok = pat_match0_subs(asmb, s, nt, binds, nbinds+1, depth+1);
+        free(nt);
+        if(ok) return 1;
+    }
+    return 0;
+}
+
+static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
+    SubBind binds[SUB_MAX_DEPTH];
+    return pat_match0_subs(asmb, s, t_orig, binds, 0, 0);
+}
+
 static void axx_resolve_path(const char *base_dir, const char *fn,
                               char *out, size_t osz)
 {
@@ -5185,6 +5374,78 @@ static void include_pat(Assembler *asmb, const char *l, const char *base_dir){
     readpat(asmb, resolved);
 }
 
+/* `!S{{名前}}` の参照を読み込み時に検算する。
+ * 照合中に出した診断は「採用されなかった候補のもの」として捨てられるので、
+ * 名前の綴り違いや循環参照はそのままだと全行が素の Syntax error になる。
+ * パターンファイル側の誤りはここで一度だけ報告する。 */
+static void sub_check_unknown(Assembler *asmb, const char *where, const char *t){
+    char name[64], var; int end, i = 0;
+    while((i = pat_find_sub_ref(t, i, &end, name, sizeof(name), &var)) >= 0){
+        if(!subv_find(&asmb->st.subs, name))
+            axx_diagf(1, 0, " error - !S{{%s}} in %s: no sub table named '%s' "
+                       "(define it with '.sub::%s ... .return').\n",
+                       name, where, name, name);
+        i = end;
+    }
+}
+
+static void sub_walk_cycle(Assembler *asmb, int idx, char *mark, int *stack, int nstack){
+    SubVec *sv = &asmb->st.subs;
+    if(mark[idx] == 2) return;
+    if(mark[idx] == 1){
+        char path[512]; size_t n = 0;
+        for(int k = 0; k < nstack; k++)
+            n += (size_t)snprintf(path+n, n<sizeof(path)?sizeof(path)-n:0,
+                                  "%s -> ", sv->data[stack[k]].name);
+        snprintf(path+n, n<sizeof(path)?sizeof(path)-n:0, "%s", sv->data[idx].name);
+        axx_diagf(1, 0, " error - sub table '%s' is circular (%s); expansion would "
+                   "not terminate.\n", sv->data[idx].name, path);
+        return;
+    }
+    mark[idx] = 1;
+    SubDef *d = &sv->data[idx];
+    for(int k = 0; k < d->n; k++){
+        char name[64], var; int end, i = 0;
+        while((i = pat_find_sub_ref(d->e[k].pat, i, &end, name, sizeof(name), &var)) >= 0){
+            SubDef *tgt = subv_find(sv, name);
+            if(tgt && nstack < sv->len){
+                stack[nstack] = idx;
+                sub_walk_cycle(asmb, (int)(tgt - sv->data), mark, stack, nstack+1);
+            }
+            i = end;
+        }
+    }
+    mark[idx] = 2;
+}
+
+static void check_sub_refs(Assembler *asmb){
+    SubVec *sv = &asmb->st.subs;
+    for(int i = 0; i < asmb->st.pat.len; i++){
+        const char *p0 = asmb->st.pat.data[i].f[0];
+        if(p0 && p0[0]) sub_check_unknown(asmb, "pattern", p0);
+    }
+    for(int i = 0; i < sv->len; i++){
+        char where[128];
+        snprintf(where, sizeof(where), "sub table '%s'", sv->data[i].name);
+        for(int k = 0; k < sv->data[i].n; k++)
+            sub_check_unknown(asmb, where, sv->data[i].e[k].pat);
+    }
+    if(sv->len == 0) return;
+    char *mark = calloc((size_t)sv->len, 1);
+    int  *stack = malloc((size_t)(sv->len+1) * sizeof(int));
+    if(!mark || !stack){ perror("calloc"); exit(1); }
+    for(int i = 0; i < sv->len; i++) sub_walk_cycle(asmb, i, mark, stack, 0);
+    free(mark); free(stack);
+}
+
+/* 前後の空白を落とす（s は書き換え可能であること）。 */
+static char *pat_trim(char *s){
+    char *p = s + axx_skipspc(s, 0);
+    size_t n = strlen(p);
+    while(n > 0 && isspace((unsigned char)p[n-1])) p[--n] = '\0';
+    return p;
+}
+
 static void readpat(Assembler *asmb, const char *fn){
     if(!fn||!fn[0]) return;
 
@@ -5219,7 +5480,10 @@ static void readpat(Assembler *asmb, const char *fn){
     char this_dir[1024];
     axx_dir_of(fn, this_dir, sizeof(this_dir));
 
-    if(asmb->st.pat_include_depth == 1) macro_reset_pass_pattern();
+    if(asmb->st.pat_include_depth == 1){
+        macro_reset_pass_pattern();
+        subv_free(&asmb->st.subs);
+    }
 
     int nexp = 0;
     char **exp = pat_macro_expand(f, fn, &nexp);
@@ -5251,6 +5515,7 @@ static void readpat(Assembler *asmb, const char *fn){
     char *line = NULL; size_t lcap = 0;
     int in_block_comment = 0;
     int legacy_chain = 0;
+    SubDef *cur_sub = NULL;
     for(int li = 0; li < nexp; li++){
         size_t need = strlen(exp[li]) + 1;
         if(need > lcap){
@@ -5314,6 +5579,52 @@ static void readpat(Assembler *asmb, const char *fn){
             if(idx>=(int)strlen(line)||nf>=8) break;
         }
 
+        /* `.sub::名前 … .return` はパターン層のサブ表。中の項目は本体の
+         * パターン表には積まず、サブ表として別に覚えておく。 */
+        {
+            char kw[16]={0};
+            {
+                /* fields[0] は書き換えずに、前後の空白を除いた大文字の写しを作る。 */
+                int a = axx_skipspc(fields[0], 0);
+                int e = (int)strlen(fields[0]);
+                while(e > a && isspace((unsigned char)fields[0][e-1])) e--;
+                if(e - a < (int)sizeof(kw))
+                    for(int k = a; k < e; k++) kw[k-a] = axx_upper_char(fields[0][k]);
+            }
+            if(strcmp(kw,".SUB")==0){
+                char *nm = (nf>1) ? pat_trim(fields[1]) : (char*)"";
+                if(cur_sub){
+                    axx_diagf(1, 0, " error - '.sub' inside '.sub::%s': sub tables "
+                               "cannot be nested.\n", cur_sub->name);
+                } else if(!is_sub_name(nm)){
+                    axx_diagf(1, 0, " error - '.sub' needs a table name made of "
+                               "letters, digits and '_': '%s'\n", nm);
+                } else {
+                    if(subv_find(&asmb->st.subs, nm))
+                        axx_diagf(0, 0, " warning - sub table '%s' is defined more "
+                                   "than once; the later definition wins.\n", nm);
+                    cur_sub = subv_new(&asmb->st.subs, nm);
+                }
+                free(fbuf); continue;
+            }
+            if(strcmp(kw,".RETURN")==0){
+                if(!cur_sub)
+                    axx_diagf(1, 0, " error - '.return' without a matching '.sub'.\n");
+                cur_sub = NULL;
+                free(fbuf); continue;
+            }
+            if(cur_sub){
+                if(nf<2){
+                    if(pat_trim(fields[0])[0])
+                        axx_diagf(1, 0, " error - sub table '%s': entry has no '::' "
+                                   "field separator: '%s'\n", cur_sub->name, fields[0]);
+                } else {
+                    subdef_push(cur_sub, fields[0], fields[nf-1]);
+                }
+                free(fbuf); continue;
+            }
+        }
+
         if(nf==1){
             int nonblank=0;
             for(const char*p=fields[0];*p;p++){ if(!isspace((unsigned char)*p)){ nonblank=1; break; } }
@@ -5339,6 +5650,11 @@ static void readpat(Assembler *asmb, const char *fn){
         axx_diagf(0, 0, " warning - pattern file '%s' ends while a /* ... */ comment "
                    "is still open (missing closing '*/').\n", fn);
     }
+    if(cur_sub){
+        axx_diagf(1, 0, " error - pattern file '%s' ends while sub table '%s' is "
+                   "still open (missing '.return').\n", fn, cur_sub->name);
+    }
+    if(asmb->st.pat_include_depth == 1) check_sub_refs(asmb);
     free(rest_has_close);
     free(line);
     pat_macro_expand_free(exp, nexp);
