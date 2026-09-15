@@ -1652,7 +1652,7 @@ makes compatibility with a general disassembler harder.
 - Assemblers were originally built to make machine code readable by humans. Now
   that AI writes code, a generalized assembler covering both assembly language
   and the machine seems worth having — and generating pattern files for large
-  ISAs is exactly the kind of work AI should be doing.
+  ISAs is exactly the kind of work AI should be doing. Recent AI can do it.
 
 ### E.2 Bug reports
 
