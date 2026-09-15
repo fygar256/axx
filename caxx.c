@@ -78,8 +78,18 @@ static int  m_utf8(unsigned long cp, char *out);
 typedef struct { uint64_t w[4]; } uint256_t;
 static void u256_to_pydec(uint256_t a, char *out, size_t outsz);
 
-/* パターン変数（a〜z）1個ぶんの束縛。is_undef は「まだ束縛されていない」印。 */
-typedef struct { uint256_t val; int is_undef; } PatVar;
+/* パターン変数（a〜z）1個ぶんの束縛。is_undef は「まだ束縛されていない」印。
+ * is_float は、val が「C の double のビットパターン」（true）なのか
+ * 「そのままの256bit整数値」（false）なのかを覚えておく印。浮動小数点モード
+ * では同じ uint256_t をどちらの意味でも使うため、書き込み時にどちらの
+ * 意味で書いたかを追跡しないと、読み出し側（浮動小数点モードの比較・算術）
+ * が整数値をdoubleのビット列として誤って再解釈してしまう（破綻点修正、
+ * var_get_for_mode 呼び出し側と var_put/var_put_tagged を参照）。
+ * !F/!D/!Q での束縛は対象外: axx.py 自身がそれを struct.pack したビット列を
+ * int.from_bytes() で普通の Python int として var_manager.put() に渡して
+ * いる（put_tagged ではない）ため、そちら側は is_float=0（整数扱い）の
+ * ままにして axx.py の実際の挙動に合わせる。 */
+typedef struct { uint256_t val; int is_undef; int is_float; } PatVar;
 
 static uint256_t u256_zero(void) {
     uint256_t r; memset(&r,0,sizeof(r)); return r;
@@ -2388,6 +2398,12 @@ static inline double u256_to_double(uint256_t v){
 static inline uint256_t double_to_u256(double d){
     uint256_t r = u256_zero(); memcpy(&r.w[0], &d, 8); return r;
 }
+/* 定義は後方(expr_bitwise_result 付近)にある u256_int_to_double を
+ * ここより前で使うための前方宣言。u256_to_double(memcpyでビット列を
+ * そのまま取り出す)とは違い、こちらは「符号付き256bit整数としての値」を
+ * 実際に数値変換して最も近いdoubleにする。PatVar が整数のまま
+ * 浮動小数点モードの式に読み込まれたときに使う（var_get_for_mode 参照）。 */
+static double u256_int_to_double(uint256_t v);
 static int axx_isfloatstr(const char *s, int idx){
     if(!s[idx]) return 0;
     if(strncmp(s+idx,"-inf",4)==0) return 1;
@@ -2562,23 +2578,29 @@ static void binary_flush(AsmState *st){
     free(data);
 }
 
-static uint256_t var_get(AsmState *st, char ch){
-    ch=(char)axx_upper_char(ch);
-    if(ch>='A'&&ch<='Z') return st->vars[ch-'A'].val;
-    return u256_zero();
-}
 static int var_get_is_undef(AsmState *st, char ch){
     ch=(char)axx_upper_char(ch);
     if(ch>='A'&&ch<='Z') return st->vars[ch-'A'].is_undef;
     return 0;
 }
+/* 浮動小数点モード評価の直前に呼ぶ。整数のまま束縛された変数
+ * (is_float==0) だけ数値変換し、既にdoubleのビット列として束縛済みの
+ * 変数(is_float==1、例: !D で束縛、または flt モード下での `:=` 代入)は
+ * そのまま通す（二重変換でビット列を壊さないため）。 */
+static uint256_t var_get_for_mode(AsmState *st, char ch, int want_float){
+    ch=(char)axx_upper_char(ch);
+    if(ch<'A'||ch>'Z') return u256_zero();
+    PatVar *pv = &st->vars[ch-'A'];
+    if(want_float && !pv->is_float) return double_to_u256(u256_int_to_double(pv->val));
+    return pv->val;
+}
 static void var_put(AsmState *st, char ch, uint256_t v){
     ch=(char)axx_upper_char(ch);
-    if(ch>='A'&&ch<='Z'){ st->vars[ch-'A'].val=v; st->vars[ch-'A'].is_undef=0; }
+    if(ch>='A'&&ch<='Z'){ st->vars[ch-'A'].val=v; st->vars[ch-'A'].is_undef=0; st->vars[ch-'A'].is_float=st->exp_typ_float; }
 }
 static void var_put_tagged(AsmState *st, char ch, uint256_t v, int is_undef){
     ch=(char)axx_upper_char(ch);
-    if(ch>='A'&&ch<='Z'){ st->vars[ch-'A'].val=v; st->vars[ch-'A'].is_undef=is_undef; }
+    if(ch>='A'&&ch<='Z'){ st->vars[ch-'A'].val=v; st->vars[ch-'A'].is_undef=is_undef; st->vars[ch-'A'].is_float=st->exp_typ_float; }
 }
 
 /* ラベルの値を引く。
@@ -3605,7 +3627,16 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             st->error_undefined_label = _assign_prior_eul || _assign_this_undef;
             var_put_tagged(st,ch,x,_assign_this_undef);
         } else {
-            x=var_get(st,ch);
+            /* 破綻点修正: 通常(整数)モードで束縛されたパターン変数を
+             * 浮動小数点モードの式（.error の error_patterns 等）で
+             * そのまま読むと、後続の演算子が u256_to_double() で
+             * 「整数のビット列」を無変換で「doubleのビット列」として
+             * 再解釈してしまい、桁の大きい値の比較・算術が意味不明な
+             * 結果になっていた（axx.py はPythonのint/float混在比較・
+             * 算術がそもそも精度を失わないため、この問題が起きない）。
+             * is_float タグを見て、整数のまま束縛された値だけ、ここで
+             * 数値としてdoubleへ変換する。 */
+            x=var_get_for_mode(st,ch,asmb->st.exp_typ_float);
             idx++;
             if(!st->in_match_attempt
                && !st->pass1_size_mode
@@ -3624,8 +3655,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                                ch, st->current_file, (int)st->ln);
                 }
             }
-            if(asmb->st.exp_typ_float)
-                x=double_to_u256((double)(int64_t)u256_to_i64(x));
             if(st->elf_tracking && st->elf_current_word_idx >= 0){
                 int _vi = (unsigned char)ch - 'a';
                 if(_vi >= 0 && _vi < 26 && st->elf_var_to_label[_vi].set == 1){
@@ -4781,6 +4810,16 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                         }
                         fval = 0.0f;
                     }
+                    /* 破綻点修正: axx.py の !F/!D/!Q 捕捉は struct.pack した
+                     * ビット列を int.from_bytes() でただの Python int として
+                     * var_manager.put() に渡している（put_tagged ではない）。
+                     * つまり axx.py 自身、!D 等で束縛した変数をその後
+                     * error_patterns 等で比較・算術に使うときは「doubleの値」
+                     * ではなく「ビット列を整数値とみなした値」として扱われる
+                     * （これが axx.py の実際の挙動である以上、caxx.c 側も
+                     * "既にdoubleとして正しい" と特別扱いしてはいけない。
+                     * var_put_float ではなく var_put で is_float=0 のまま
+                     * 束縛する）。 */
                     uint32_t bits; memcpy(&bits, &fval, 4);
                     var_put(st, a, u256_from_u64((uint64_t)bits));
                 } else if(ftype == 'D'){
