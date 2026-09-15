@@ -407,6 +407,19 @@ static AXX_UNUSED void iv_append(IntVec *dst, const IntVec *src) {
     for(int i=0;i<src->len;i++) iv_push(dst, src->data[i]);
 }
 
+/* 破綻点修正: VLIW パケットのスロット添字列（vliwprocess の idxlst）が
+ * 固定256要素で確保されていて、それを超えると axx.py には無いエラーで
+ * 打ち切っていた（axx.py はただの list なので無制限）。他の可変長配列
+ * (IntVec)と同じ倍々伸長で置き換える。 */
+static void ilst_push(int **arr, int *n, int *cap, int v) {
+    if(*n >= *cap){
+        *cap = *cap ? *cap*2 : 256;
+        *arr = realloc(*arr, (size_t)(*cap)*sizeof(int));
+        if(!*arr){perror("realloc");exit(1);}
+    }
+    (*arr)[(*n)++] = v;
+}
+
 typedef struct {
     char **data;
     int    len;
@@ -1913,8 +1926,16 @@ static int char_in(char c, const char *set){
 }
 
 static int axx_get_intstr(const char *s, int idx, char *fs, size_t fsz){
+    /* 破綻点修正: 旧実装は桁数がバッファ上限に達すると idx を進めるのを
+     * やめてしまい、残った数字がそのまま次のトークンとして解析され
+     * "Syntax error" に化けていた（axx.py は無制限精度なので桁数の上限が
+     * 無く、この desync が起きない）。桁数が上限を超えても数字である間は
+     * idx を進め続け、バッファに書き込む桁だけを先頭 fsz-1 桁に絞る。 */
     size_t n=0;
-    while(s[idx]&&is_digit(s[idx])&&n<fsz-1) fs[n++]=s[idx++];
+    while(s[idx]&&is_digit(s[idx])){
+        if(n<fsz-1) fs[n++]=s[idx];
+        idx++;
+    }
     fs[n]=0;
     return idx;
 }
@@ -3530,7 +3551,9 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         if(fs[0]) x=double_to_u256(strtod(fs,NULL));
     }
     else if(is_digit(s[idx])){
-        char fs[64];
+        /* 2**256 は10進78桁なので、正当な256bit値を丸ごと収めるには
+         * 64バイトでは足りない（axx.py は無制限精度）。余裕を持って128バイト。 */
+        char fs[128];
         idx=axx_get_intstr(s,idx,fs,sizeof(fs));
         x=u256_zero();
         uint256_t ten=u256_from_u64(10);
@@ -5085,7 +5108,7 @@ static void include_pat(Assembler *asmb, const char *l, const char *base_dir){
                        "Please use double quotes.\n", trimmed);
             strncpy(raw, trimmed, sizeof(raw)-1); raw[sizeof(raw)-1]='\0';
         } else {
-            axx_diagf(0, 0, " error - .INCLUDE directive has no filename: %s\n", l);
+            axx_diagf(1, 0, " error - .INCLUDE directive has no filename: %s\n", l);
             return;
         }
     }
@@ -5099,7 +5122,7 @@ static void readpat(Assembler *asmb, const char *fn){
 
     enum { MAX_PAT_DEPTH = 50 };
     if(asmb->st.pat_include_depth > MAX_PAT_DEPTH){
-        axx_diagf(0, 0, " error - pattern .INCLUDE nesting exceeds %d: '%s'\n",
+        axx_diagf(1, 0, " error - pattern .INCLUDE nesting exceeds %d: '%s'\n",
                    MAX_PAT_DEPTH, fn);
         return;
     }
@@ -5110,7 +5133,7 @@ static void readpat(Assembler *asmb, const char *fn){
     for(int i=0;i<asmb->st.pat_include_depth;i++){
         if(asmb->st.pat_include_chain[i]
            && strcmp(asmb->st.pat_include_chain[i], real)==0){
-            axx_diagf(0, 0, " error - circular pattern .INCLUDE detected: '%s' "
+            axx_diagf(1, 0, " error - circular pattern .INCLUDE detected: '%s' "
                        "(already in include chain). Skipped.\n", fn);
             return;
         }
@@ -5534,15 +5557,9 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
     IVVec objs; ivv_init(&objs);
     ivv_push(&objs,objl_in);
 
-    int *idxlst=malloc(256*sizeof(int)); int nidxlst=0;
-    for(int i=0;i<idxs_in->len;i++){
-        if(nidxlst<256){ idxlst[nidxlst++]=(int)u256_to_i64(idxs_in->data[i]); continue; }
-        if(should_report_errors(st)){
-            axx_diagf(1, 0, " error - VLIW packet exceeds maximum of 256 slot indices; "
-                       "extra slots ignored.\n");
-        }
-        break;
-    }
+    int *idxlst=NULL; int nidxlst=0; int capidxlst=0;
+    for(int i=0;i<idxs_in->len;i++)
+        ilst_push(&idxlst,&nidxlst,&capidxlst,(int)u256_to_i64(idxs_in->data[i]));
 
     st->vliwstop=0;
     int slen=(int)strlen(line);
@@ -5575,14 +5592,8 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
                 return 0;
             }
             ivv_push(&objs,&new_objl);
-            for(int i=0;i<new_idxs.len;i++){
-                if(nidxlst<256){ idxlst[nidxlst++]=(int)u256_to_i64(new_idxs.data[i]); continue; }
-                if(should_report_errors(st)){
-                    axx_diagf(1, 0, " error - VLIW packet exceeds maximum of 256 slot indices; "
-                               "extra slots ignored.\n");
-                }
-                break;
-            }
+            for(int i=0;i<new_idxs.len;i++)
+                ilst_push(&idxlst,&nidxlst,&capidxlst,(int)u256_to_i64(new_idxs.data[i]));
             iv_free(&new_idxs); iv_free(&new_objl);
             continue;
         } else break;

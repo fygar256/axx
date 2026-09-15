@@ -3909,6 +3909,9 @@ class PatternFileReader:
         except OSError as e:
             diag(f" error - cannot open pattern file '{fn}': {e}", set_error=True)
             return []
+        except UnicodeDecodeError as e:
+            diag(f" error - pattern file '{fn}' is not valid UTF-8: {e}", set_error=True)
+            return []
         raw_lines = StringUtils.join_backslash_continuations(raw_lines)
 
         # 破綻点修正: 「本物の複数行ブロックコメント(閉じ記号が後の行にあり、
@@ -6796,6 +6799,10 @@ class Assembler:
                 self.state.diag(f" error - cannot open source file '{fn}': {e}",
                                 set_error=True)
                 return
+            except UnicodeDecodeError as e:
+                self.state.diag(f" error - source file '{fn}' is not valid UTF-8: {e}",
+                                set_error=True)
+                return
             af = StringUtils.join_backslash_continuations(af)
 
             # マクロ層の $/$$ は「展開後の何行目か」で決まる値なので、名前で
@@ -7745,6 +7752,9 @@ class Assembler:
         except OSError as e:
             self.state.diag(f" error - cannot open source file '{sourcefile}': {e}", set_error=False, force=True)
             return False
+        except UnicodeDecodeError as e:
+            self.state.diag(f" error - source file '{sourcefile}' is not valid UTF-8: {e}", set_error=False, force=True)
+            return False
 
         expanded = self.macro_proc.expand(raw, sourcefile)
         if self.macro_proc.had_error or self.state.had_error:
@@ -7772,6 +7782,10 @@ class Assembler:
                 raw = f.readlines()
         except OSError as e:
             self.state.diag(f" error - cannot open pattern file '{patternfile}': {e}",
+                            set_error=False, force=True)
+            return False
+        except UnicodeDecodeError as e:
+            self.state.diag(f" error - pattern file '{patternfile}' is not valid UTF-8: {e}",
                             set_error=False, force=True)
             return False
 
@@ -7926,6 +7940,10 @@ class Assembler:
                 except OSError as e:
                     self.state.diag(f" error - cannot open import file "
                                     f"'{self.state.impfile}': {e}", set_error=True)
+                    return False
+                except UnicodeDecodeError as e:
+                    self.state.diag(f" error - import file "
+                                    f"'{self.state.impfile}' is not valid UTF-8: {e}", set_error=True)
                     return False
                 for l in raw_lines:
                     fields = l.rstrip('\r\n').split('\t')
