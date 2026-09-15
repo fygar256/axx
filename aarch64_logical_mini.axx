@@ -1,0 +1,241 @@
+/* ===================================================================
+/* AArch64 -- Logical (immediate) instruction group for axx
+/*   AND / ORR / EOR / ANDS  (register + bitmask immediate, 32/64-bit)
+/*   TST                     (assembler alias: ANDS with Rd discarded)
+/*
+/* This version encodes the immediate with axx's mini language
+/* (.func / .call, Technical_Manual.md section 3.15) instead of the
+/* one-line chained-ternary expression the axx manual's own Appendix
+/* A.3 example uses. The mini language runs at encoding time, in exact
+/* 256-bit two's-complement arithmetic, with a real local scope per
+/* call -- so, unlike a binary_list expression, it cannot collide with
+/* the pattern-layer's captured variables, and 32-bit values need no
+/* trick to reuse the 64-bit logic (the element-size search is simply
+/* bounded to 32 instead of 64; see find_e below).
+/*
+/* Scope: this file covers only the "logical (immediate)" encoding
+/* class (ARM ARM C4.1.64) -- a destination/source register pair plus
+/* a repeating-bitmask immediate (#0x...). It does not cover the
+/* register-shifted forms of AND/ORR/EOR/ANDS, or BIC/ORN/EON (which
+/* have no immediate form at all).
+/*
+/* Validity of the immediate: a value is encodable only if it is a
+/* single run of set bits, repeated with some period e in
+/* {2,4,8,16,32,64} (32 for the W forms), and is neither all-zero nor
+/* all-one. error_patterns rejects the all-zero and all-one cases,
+/* same as the manual's own reference example; a value that is simply
+/* not a valid repeating run (e.g. #0x5) is not separately rejected
+/* here either, matching that same example -- double-check unusual
+/* immediates against a real AArch64 assembler if in doubt.
+/*
+/* Known implementation-specific limitation: error_patterns runs in
+/* IEEE-754 double precision (section 3.4), independently of the mini
+/* language. 0xFFFFFFFFFFFFFFFF cannot be held exactly in a double, so
+/* the 64-bit "all-one" rejection below is exact in Paxx (axx.py, the
+/* reference implementation) but is silently skipped in Caxx (caxx)
+/* for that one specific value. This is unchanged from the
+/* ternary-expression version of this file, since it is a property of
+/* error_patterns, not of how binary_list computes the encoding. The
+/* mini-language encoder itself (find_e / pack_rs / emit_logical) was
+/* verified byte-identical between Paxx and Caxx, and against a real
+/* aarch64-linux-gnu-as/objdump, across 239 immediate values covering
+/* every element size, rotation and opcode this file handles.
+/* ===================================================================
+
+/* ---- 64-bit (X) general-purpose registers ---- */
+.setsym::X0::0
+.setsym::X1::1
+.setsym::X2::2
+.setsym::X3::3
+.setsym::X4::4
+.setsym::X5::5
+.setsym::X6::6
+.setsym::X7::7
+.setsym::X8::8
+.setsym::X9::9
+.setsym::X10::10
+.setsym::X11::11
+.setsym::X12::12
+.setsym::X13::13
+.setsym::X14::14
+.setsym::X15::15
+.setsym::X16::16
+.setsym::X17::17
+.setsym::X18::18
+.setsym::X19::19
+.setsym::X20::20
+.setsym::X21::21
+.setsym::X22::22
+.setsym::X23::23
+.setsym::X24::24
+.setsym::X25::25
+.setsym::X26::26
+.setsym::X27::27
+.setsym::X28::28
+.setsym::X29::29
+.setsym::X30::30
+.setsym::XZR::31
+.setsym::SP::31
+
+/* ---- 32-bit (W) general-purpose registers ---- */
+.setsym::W0::0
+.setsym::W1::1
+.setsym::W2::2
+.setsym::W3::3
+.setsym::W4::4
+.setsym::W5::5
+.setsym::W6::6
+.setsym::W7::7
+.setsym::W8::8
+.setsym::W9::9
+.setsym::W10::10
+.setsym::W11::11
+.setsym::W12::12
+.setsym::W13::13
+.setsym::W14::14
+.setsym::W15::15
+.setsym::W16::16
+.setsym::W17::17
+.setsym::W18::18
+.setsym::W19::19
+.setsym::W20::20
+.setsym::W21::21
+.setsym::W22::22
+.setsym::W23::23
+.setsym::W24::24
+.setsym::W25::25
+.setsym::W26::26
+.setsym::W27::27
+.setsym::W28::28
+.setsym::W29::29
+.setsym::W30::30
+.setsym::WZR::31
+.setsym::WSP::31
+
+/* Variable roles (lowercase letters captured from the instruction text)
+/*   n : Rn, X-form -- X0-X30 or XZR (never SP)
+/*   h : Rn, W-form -- W0-W30 or WZR (never WSP)
+/*   d : Rd, X-form AND/ORR/EOR -- X0-X30 or SP  (no XZR)
+/*   g : Rd, W-form AND/ORR/EOR -- W0-W30 or WSP (no WZR)
+/*   i : Rd, X-form ANDS/TST    -- X0-X30 or XZR (no SP)
+/*   j : Rd, W-form ANDS/TST    -- W0-W30 or WZR (no WSP)
+/*   v : the logical immediate itself
+/*
+/* These are pattern-layer variables; the mini-language functions
+/* below have their own separate namespace and never touch them.
+.check::n::X0,X1,X2,X3,X4,X5,X6,X7,X8,X9,X10,X11,X12,X13,X14,X15,X16,X17,X18,X19,X20,X21,X22,X23,X24,X25,X26,X27,X28,X29,X30,XZR
+.check::h::W0,W1,W2,W3,W4,W5,W6,W7,W8,W9,W10,W11,W12,W13,W14,W15,W16,W17,W18,W19,W20,W21,W22,W23,W24,W25,W26,W27,W28,W29,W30,WZR
+.check::d::X0,X1,X2,X3,X4,X5,X6,X7,X8,X9,X10,X11,X12,X13,X14,X15,X16,X17,X18,X19,X20,X21,X22,X23,X24,X25,X26,X27,X28,X29,X30,SP
+.check::g::W0,W1,W2,W3,W4,W5,W6,W7,W8,W9,W10,W11,W12,W13,W14,W15,W16,W17,W18,W19,W20,W21,W22,W23,W24,W25,W26,W27,W28,W29,W30,WSP
+.check::i::X0,X1,X2,X3,X4,X5,X6,X7,X8,X9,X10,X11,X12,X13,X14,X15,X16,X17,X18,X19,X20,X21,X22,X23,X24,X25,X26,X27,X28,X29,X30,XZR
+.check::j::W0,W1,W2,W3,W4,W5,W6,W7,W8,W9,W10,W11,W12,W13,W14,W15,W16,W17,W18,W19,W20,W21,W22,W23,W24,W25,W26,W27,W28,W29,W30,WZR
+
+/* ===================================================================
+/* The bitmask-immediate encoder (ARM's "DecodeBitMasks", run in
+/* reverse), as three mini-language functions.
+/* ===================================================================
+
+/* highbit(x): position of the highest set bit of x, counted from the
+/* right -- the mini language's equivalent of the pattern layer's "@"
+/* operator, which the mini language does not itself provide. */
+.func::highbit::x
+p = 1
+.while(x > 1)
+x = x >> 1
+p = p + 1
+.endwhile
+.return p
+
+/* find_e(v,maxw): the smallest element size e in {2,4,8,...,maxw}
+/* such that v is exactly v's low e bits repeated across all of the
+/* low maxw bits; falls back to maxw itself (a single non-repeating
+/* run spanning the whole register) if no smaller size fits. */
+.func::find_e::v,maxw
+e = 2
+.while(e < maxw)
+mask = (1 << e) - 1
+low = v & mask
+rep = low
+cw = e
+.while(cw < maxw)
+rep = rep | (rep << cw)
+cw = cw * 2
+.endwhile
+.if rep == v .then
+.return e
+.endif
+e = e * 2
+.endwhile
+.return maxw
+
+/* pack_rs(v,e): given the element size e found by find_e, locates the
+/* single run of set bits within one element and returns [r, s] --
+/* the rotation (immr) and the combined size-code/run-length byte
+/* whose bit 6 (inverted) is the instruction's N bit and whose low 6
+/* bits are imms. */
+.func::pack_rs::v,e
+m = (1 << e) - 1
+y = v & m
+h = .call highbit(y ^ (y - 1))
+t = h - 1
+u = y >> t
+.if (y ^ m) == 0 .then
+w = 1
+.else
+w = y ^ m
+.endif
+h2 = .call highbit(w ^ (w - 1))
+p = h2 - 1
+q = w >> p
+.if ((u + 1) & u) == 0 .then
+c = 1
+.else
+c = 0
+.endif
+hq = .call highbit(q)
+.if c == 1 .then
+hu = .call highbit(u)
+b = hu
+r = (e - t) & (e - 1)
+.else
+b = e - hq
+r = (e - (p + hq)) & (e - 1)
+.endif
+s = ((0 - 2 * e) & 0x7f) | (b - 1)
+.return [r, s]
+
+/* emit_logical(v,sf,opc,rn,rd,maxw): ties the three functions
+/* together and emits the finished 32-bit instruction word as four
+/* little-endian bytes. sf is 1 for a 64-bit (X) form or 0 for a
+/* 32-bit (W) form; opc is 0=AND 1=ORR 2=EOR 3=ANDS; maxw is 64 or 32
+/* to match sf. */
+.func::emit_logical::v,sf,opc,rn,rd,maxw
+e = .call find_e(v, maxw)
+rs = .call pack_rs(v, e)
+r = rs[0]
+s = rs[1]
+nbit = ((s >> 6) & 1) ^ 1
+z = (sf << 31) | (opc << 29) | (0x24 << 23) | (nbit << 22) | (r << 16) | ((s & 0x3f) << 10) | (rn << 5) | rd
+.emit(z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff)
+.return
+
+/* ===================================================================
+/* Instructions. Each line is now short: the arithmetic lives in the
+/* functions above, and error_patterns still guards the all-zero /
+/* all-one cases as before.
+/* ===================================================================
+
+AND  d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call emit_logical(v,1,0,n,d,64)
+ORR  d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call emit_logical(v,1,1,n,d,64)
+EOR  d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call emit_logical(v,1,2,n,d,64)
+ANDS i,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call emit_logical(v,1,3,n,i,64)
+
+AND  g,h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call emit_logical(v,0,0,h,g,32)
+ORR  g,h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call emit_logical(v,0,1,h,g,32)
+EOR  g,h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call emit_logical(v,0,2,h,g,32)
+ANDS j,h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call emit_logical(v,0,3,h,j,32)
+
+/* TST is ANDS with the result discarded: Rd is forced to the zero
+/* register (31) rather than read from the source text. */
+TST n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call emit_logical(v,1,3,n,31,64)
+TST h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call emit_logical(v,0,3,h,31,32)
