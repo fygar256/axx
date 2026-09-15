@@ -1732,6 +1732,8 @@ pattern file a *program*, and pattern matching would no longer be guaranteed to
 terminate. That guarantee was judged worth more than the extra reach. The macro
 layer is a separate stage and is not restricted this way.
 
+While the pattern file is not Turing-complete, when computation is required, you can invoke a Turing-complete function (a mini-language) from the `binary_list` using `.call func()`.
+
 Because a pattern file has no explicit structure, it suits unstructured
 instruction encodings well; `.check` (section 3.6) is what lets you impose
 structure — such as an instruction `MOVabc r,s` where `a`, `b`, `c` each range
