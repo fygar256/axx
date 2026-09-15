@@ -13,7 +13,7 @@ caxx vliw.axx vliw.s -b b9
 caxx itanium.axx vliw.s -b b10
 caxx x86_64.axx hello.s -b b11
 caxx x86_64m.axx hello.s -b b12
-caxx bf.axx bf.s -b b13
+caxx aarch64_logical_mini.axx aarch64_logical_mini_demo.s -b b13
 
 paxx 4004.axx 4004.s -b a0
 paxx z80.axx z80.s -b a1
@@ -28,7 +28,7 @@ paxx vliw.axx vliw.s -b a9
 paxx itanium.axx vliw.s -b a10
 paxx x86_64.axx hello.s -b a11
 paxx x86_64m.axx hello.s -b a12
-paxx bf.axx bf.s -b a13
+paxx aarch64_logical_mini.axx aarch64_logical_mini_demo.s -b b13
 
 FAIL=0
 
@@ -49,6 +49,4 @@ cmp a13 b13 || FAIL=1
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"
-    rm a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13
-    rm b0 b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11 b12 b13
 fi
