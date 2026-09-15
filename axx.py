@@ -236,6 +236,45 @@ def _is_sub_name(s):
     return bool(s) and all(c in _PFX_WORD for c in s)
 
 
+def _dot_kw(s):
+    """行頭の `.word` を大文字で返す。`.` で始まらなければ空文字。"""
+    t = s.strip()
+    if not t.startswith('.'):
+        return ''
+    j = 1
+    while j < len(t) and (t[j].isalnum() or t[j] == '_'):
+        j += 1
+    return StringUtils.upper(t[:j])
+
+
+# ミニ言語のブロック開始・終了キーワード。パターンファイルを読む段階で
+# `.return` が「関数の終わり」なのか「早期リターン文」なのかを見分けるために使う。
+_MINI_OPEN = frozenset(('.IF', '.FOR', '.WHILE'))
+_MINI_CLOSE = frozenset(('.ENDIF', '.NEXT', '.ENDWHILE'))
+
+
+class _MiniFunc:
+    """`.func::名前::引数 … .return` で定義されたミニ言語の関数。
+
+    入れ子で定義された関数は children に入り、名前解決は自分 → 親 → … →
+    トップレベルの順に外側へたどる。body は読み込み時に文の木へ変換する。
+    """
+
+    __slots__ = ('name', 'params', 'lines', 'body', 'parent', 'children',
+                 'file', 'line', 'depth')
+
+    def __init__(self, name, params, parent, file, line):
+        self.name = name
+        self.params = params
+        self.lines = []
+        self.body = None
+        self.parent = parent
+        self.children = {}
+        self.file = file
+        self.line = line
+        self.depth = 0
+
+
 # パターンファイルの第2フィールド（エラー条件）が返す番号 → メッセージ。
 # 例: `ADD A,R!n :: n>7;5 :: ...` は n>7 のとき番号5（レジスタ範囲外）を報告する。
 ERRORS = [
@@ -643,6 +682,10 @@ class AssemblerState:
         # `.sub::名前 ... .return` で登録されたサブ表。
         # 名前 -> [(照合パターン, 値欄), ...]。`!S{{名前}}変数` の展開に使う。
         self.sub_defs: dict = {}
+
+        # `.func::名前::引数 ... .return` で登録されたミニ言語の関数。
+        # 名前 -> _MiniFunc。`binary_list` 欄の `.call` から呼ぶ。
+        self.func_defs: dict = {}
 
         # error_patterns 欄（例: `n>7;5`）が返すエラーコード → メッセージ文字列。
         # 実行ごとに独立した可変コピーとして持ち、モジュール定数 ERRORS を汚さない。
@@ -3983,6 +4026,8 @@ class PatternFileReader:
             else MacroPreprocessor(None, pat_mode=True)
         # `.sub::名前 ... .return` で集めたサブ表。名前 -> [(パターン, 値欄), ...]。
         self.subs = {}
+        # `.func::名前::引数 ... .return` で集めたミニ言語の関数。名前 -> _MiniFunc。
+        self.funcs = {}
 
     def readpat(self, fn, base_dir=None, _depth=0, _chain=None):
         if fn == '':
@@ -4013,6 +4058,7 @@ class PatternFileReader:
         if _depth == 0:
             self.macro_proc.reset_pass()
             self.subs = {}
+            self.funcs = {}
 
         try:
             with open(fn, "rt", encoding="utf-8") as f:
@@ -4051,6 +4097,7 @@ class PatternFileReader:
         in_block_comment = False
         legacy_chain = False
         cur_sub = None
+        func_stack = []
         for _li, (l, _mfile, _mln) in enumerate(expanded):
 
             was_in_comment = in_block_comment
@@ -4076,6 +4123,59 @@ class PatternFileReader:
             l = l.replace(chr(13), '')
             l = l.replace('\n', '')
             l = StringUtils.reduce_spaces(l)
+
+            # ミニ言語の `.func` 本体は `::` で分解せず、行のまま集める。
+            _dk = _dot_kw(l)
+            if func_stack or _dk == '.FUNC':
+                if _dk == '.FUNC':
+                    _hdr = []
+                    _hi = 0
+                    while True:
+                        _s, _hi = self.parser.get_params1(l, _hi)
+                        _hdr += [_s]
+                        if len(l) <= _hi:
+                            break
+                    _nm = (_hdr[1] if len(_hdr) > 1 else '').strip()
+                    _ps = [_p.strip() for _p in (_hdr[2] if len(_hdr) > 2 else '').split(',')
+                           if _p.strip()]
+                    parent = func_stack[-1] if func_stack else None
+                    if not _is_sub_name(_nm):
+                        diag(f" error - '.func' needs a name made of letters, digits "
+                             f"and '_': {_nm!r}", set_error=True)
+                        _nm = None
+                    for _p in _ps:
+                        if not _is_sub_name(_p):
+                            diag(f" error - '.func::{_nm}': bad parameter name {_p!r}",
+                                 set_error=True)
+                            _nm = None
+                            break
+                    if _nm is not None:
+                        _fn_obj = _MiniFunc(_nm, _ps, parent, fn, _mln)
+                        target = parent.children if parent else self.funcs
+                        if _nm in target:
+                            diag(f" warning - function {_nm!r} is defined more than "
+                                 f"once; the later definition wins.", set_error=False)
+                        target[_nm] = _fn_obj
+                        func_stack.append(_fn_obj)
+                    else:
+                        # 名前が壊れていても本体を取り込んで `.return` の対応を保つ。
+                        func_stack.append(_MiniFunc('?', [], parent, fn, _mln))
+                    continue
+                cur = func_stack[-1]
+                if _dk == '.RETURN' and cur.depth == 0:
+                    func_stack.pop()
+                    continue
+                if _dk in _MINI_OPEN:
+                    cur.depth += 1
+                elif _dk in _MINI_CLOSE:
+                    cur.depth -= 1
+                    if cur.depth < 0:
+                        diag(f" error - '.func::{cur.name}': {_dk.lower()} without a "
+                             f"matching block opener.", set_error=True)
+                        cur.depth = 0
+                if l.strip():
+                    cur.lines.append((l, fn, _mln))
+                continue
 
             ww = self.include_pat(l, this_dir, _depth=_depth + 1, _chain=_chain)
             if ww is not None:
@@ -4153,11 +4253,32 @@ class PatternFileReader:
         if cur_sub is not None:
             diag(f" error - pattern file '{fn}' ends while sub table {cur_sub!r} "
                  f"is still open (missing '.return').", set_error=True)
+        while func_stack:
+            _f = func_stack.pop()
+            diag(f" error - pattern file '{fn}' ends while function {_f.name!r} "
+                 f"is still open (missing '.return').", set_error=True)
 
         if _depth == 0:
             self.check_sub_refs(w)
+            self.compile_funcs()
 
         return w
+
+    def compile_funcs(self):
+        """集めた関数の本体を、読み込み時に文の木へ変換する。
+
+        1ソース行ごとに解析し直すのは無駄なので一度だけ。文法の誤りも
+        組み立てが始まる前にまとめて報告できる。
+        """
+        def walk(table):
+            for f in table.values():
+                try:
+                    f.body = MiniParser(f).parse_body()
+                except MiniLangError as e:
+                    diag(f" error - {e}", set_error=True)
+                    f.body = []
+                walk(f.children)
+        walk(self.funcs)
 
     def check_sub_refs(self, pat):
         """`!S{{名前}}` の参照を読み込み時に検算する。
@@ -4233,6 +4354,752 @@ class PatternFileReader:
                 return []
         w = self.readpat(s, base_dir, _depth=_depth, _chain=_chain)
         return w
+
+
+class MiniLangError(Exception):
+    """ミニ言語の構文・実行時エラー。読み込み時と組み立て時の両方で使う。"""
+
+
+class _MiniReturn(Exception):
+    """`.return` 文。関数1段ぶんだけ脱出する。"""
+
+
+# ミニ言語の整数は axx の式と同じ 256bit 2の補数。Python と C で同じ値に
+# なるよう、演算のたびに幅を合わせる。
+_MINI_BITS = 256
+_MINI_MASK = (1 << _MINI_BITS) - 1
+
+
+def _mini_wrap(v):
+    return int(v) & _MINI_MASK
+
+
+def _mini_signed(v):
+    v = int(v) & _MINI_MASK
+    return v - (1 << _MINI_BITS) if v >> (_MINI_BITS - 1) else v
+
+
+_MINI_OPS2 = ('**', '<<', '>>', '<=', '>=', '==', '!=', '&&', '||')
+_MINI_OPS1 = frozenset('+-*/%&|^~<>!()[]:,=')
+
+
+def _mini_lex(text, pos):
+    """1行を字句に分解する。返すのは (種別, 値) の並び。"""
+    toks = []
+    t = text
+    i = 0
+    n = len(t)
+    while i < n:
+        c = t[i]
+        if c in ' \t':
+            i += 1
+            continue
+        if c.isdigit():
+            if c == '0' and i + 1 < n and t[i + 1] in 'xX':
+                j = i + 2
+                while j < n and (t[j] in '0123456789abcdefABCDEF_'):
+                    j += 1
+                if j == i + 2:
+                    raise MiniLangError(f"{pos[0]}:{pos[1]}: malformed hex number")
+                toks.append(('num', int(t[i + 2:j].replace('_', ''), 16)))
+            elif c == '0' and i + 1 < n and t[i + 1] in 'bB':
+                j = i + 2
+                while j < n and t[j] in '01_':
+                    j += 1
+                if j == i + 2:
+                    raise MiniLangError(f"{pos[0]}:{pos[1]}: malformed binary number")
+                toks.append(('num', int(t[i + 2:j].replace('_', ''), 2)))
+            else:
+                j = i
+                while j < n and (t[j].isdigit() or t[j] == '_'):
+                    j += 1
+                toks.append(('num', int(t[i:j].replace('_', ''))))
+            i = j
+            continue
+        if c.isalpha() or c == '_':
+            j = i
+            while j < n and (t[j].isalnum() or t[j] == '_'):
+                j += 1
+            toks.append(('name', t[i:j]))
+            i = j
+            continue
+        if c == '.':
+            j = i + 1
+            while j < n and (t[j].isalnum() or t[j] == '_'):
+                j += 1
+            if j == i + 1:
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: stray '.'")
+            toks.append(('dot', StringUtils.upper(t[i:j])))
+            i = j
+            continue
+        if t[i:i + 2] in _MINI_OPS2:
+            toks.append(('op', t[i:i + 2]))
+            i += 2
+            continue
+        if c in _MINI_OPS1:
+            toks.append(('op', c))
+            i += 1
+            continue
+        raise MiniLangError(f"{pos[0]}:{pos[1]}: unexpected character {c!r}")
+    return toks
+
+
+class _MiniExprParser:
+    """字句列から式の木を作る再帰下降パーサ。
+
+    優先順位は低いほうから `|| && ! 比較 | ^ & シフト +- */% 単項 ** 添字`。
+    返す木は ('num',値) ('var',名) ('arr',[式]) ('index',式,式)
+    ('slice',式,式|None,式|None) ('len',式) ('bin',演算子,左,右) ('un',演算子,式)。
+    """
+
+    def __init__(self, toks, pos):
+        self.toks = toks
+        self.i = 0
+        self.pos = pos
+
+    def fail(self, msg):
+        raise MiniLangError(f"{self.pos[0]}:{self.pos[1]}: {msg}")
+
+    def peek(self):
+        return self.toks[self.i] if self.i < len(self.toks) else ('end', None)
+
+    def at_op(self, *ops):
+        k, v = self.peek()
+        return k == 'op' and v in ops
+
+    def eat_op(self, op):
+        if self.at_op(op):
+            self.i += 1
+            return True
+        return False
+
+    def expect_op(self, op):
+        if not self.eat_op(op):
+            k, v = self.peek()
+            self.fail(f"expected {op!r}, found {v if k != 'end' else 'end of line'!r}")
+
+    def at_end(self):
+        return self.i >= len(self.toks)
+
+    def parse(self):
+        e = self.or_()
+        if not self.at_end():
+            k, v = self.peek()
+            self.fail(f"unexpected {v!r} in expression")
+        return e
+
+    def or_(self):
+        e = self.and_()
+        while self.at_op('||'):
+            self.i += 1
+            e = ('bin', '||', e, self.and_())
+        return e
+
+    def and_(self):
+        e = self.not_()
+        while self.at_op('&&'):
+            self.i += 1
+            e = ('bin', '&&', e, self.not_())
+        return e
+
+    def not_(self):
+        if self.at_op('!'):
+            self.i += 1
+            return ('un', '!', self.not_())
+        return self.cmp_()
+
+    def cmp_(self):
+        e = self.bitor_()
+        while self.at_op('==', '!=', '<=', '>=', '<', '>'):
+            op = self.peek()[1]
+            self.i += 1
+            e = ('bin', op, e, self.bitor_())
+        return e
+
+    def bitor_(self):
+        e = self.bitxor_()
+        while self.at_op('|'):
+            self.i += 1
+            e = ('bin', '|', e, self.bitxor_())
+        return e
+
+    def bitxor_(self):
+        e = self.bitand_()
+        while self.at_op('^'):
+            self.i += 1
+            e = ('bin', '^', e, self.bitand_())
+        return e
+
+    def bitand_(self):
+        e = self.shift_()
+        while self.at_op('&'):
+            self.i += 1
+            e = ('bin', '&', e, self.shift_())
+        return e
+
+    def shift_(self):
+        e = self.add_()
+        while self.at_op('<<', '>>'):
+            op = self.peek()[1]
+            self.i += 1
+            e = ('bin', op, e, self.add_())
+        return e
+
+    def add_(self):
+        e = self.mul_()
+        while self.at_op('+', '-'):
+            op = self.peek()[1]
+            self.i += 1
+            e = ('bin', op, e, self.mul_())
+        return e
+
+    def mul_(self):
+        e = self.unary_()
+        while self.at_op('*', '/', '%'):
+            op = self.peek()[1]
+            self.i += 1
+            e = ('bin', op, e, self.unary_())
+        return e
+
+    def unary_(self):
+        if self.at_op('-', '+', '~'):
+            op = self.peek()[1]
+            self.i += 1
+            return ('un', op, self.unary_())
+        return self.power_()
+
+    def power_(self):
+        e = self.postfix_()
+        if self.at_op('**'):
+            self.i += 1
+            return ('bin', '**', e, self.unary_())
+        return e
+
+    def postfix_(self):
+        e = self.primary_()
+        while self.at_op('['):
+            self.i += 1
+            lo = None if self.at_op(':') else self.or_()
+            if self.eat_op(':'):
+                hi = None if self.at_op(']') else self.or_()
+                self.expect_op(']')
+                e = ('slice', e, lo, hi)
+            else:
+                self.expect_op(']')
+                if lo is None:
+                    self.fail("empty subscript")
+                e = ('index', e, lo)
+        return e
+
+    def primary_(self):
+        k, v = self.peek()
+        if k == 'num':
+            self.i += 1
+            return ('num', _mini_wrap(v))
+        if k == 'name':
+            self.i += 1
+            return ('var', v)
+        if k == 'dot':
+            if v != '.LEN':
+                self.fail(f"{v.lower()!r} cannot be used in an expression")
+            self.i += 1
+            self.expect_op('(')
+            e = self.or_()
+            self.expect_op(')')
+            return ('len', e)
+        if k == 'op' and v == '(':
+            self.i += 1
+            e = self.or_()
+            self.expect_op(')')
+            return e
+        if k == 'op' and v == '[':
+            self.i += 1
+            items = []
+            if not self.at_op(']'):
+                items.append(self.or_())
+                while self.eat_op(','):
+                    items.append(self.or_())
+            self.expect_op(']')
+            return ('arr', items)
+        self.fail(f"expected a value, found {v if k != 'end' else 'end of line'!r}")
+
+    def parse_list(self):
+        """カンマ区切りの式の並び。空なら空リスト。"""
+        items = []
+        if self.at_end():
+            return items
+        items.append(self.or_())
+        while self.eat_op(','):
+            items.append(self.or_())
+        if not self.at_end():
+            k, v = self.peek()
+            self.fail(f"unexpected {v!r} after expression list")
+        return items
+
+
+class MiniParser:
+    """`.func` 本体の行の並びを文の木にする。"""
+
+    _ENDERS = frozenset(('.ELSE', '.ENDIF', '.NEXT', '.ENDWHILE'))
+
+    def __init__(self, func):
+        self.func = func
+        self.lines = func.lines
+
+    def parse_body(self):
+        body, i = self._block(0, ())
+        if i < len(self.lines):
+            text, f, ln = self.lines[i]
+            raise MiniLangError(f"{f}:{ln}: '{text.strip()}' has no matching opener")
+        return body
+
+    def _block(self, i, enders):
+        out = []
+        while i < len(self.lines):
+            text, f, ln = self.lines[i]
+            pos = (f, ln)
+            kw = _dot_kw(text)
+            if kw in enders:
+                return out, i
+            if kw in self._ENDERS:
+                raise MiniLangError(f"{f}:{ln}: '{kw.lower()}' without a matching opener")
+            if kw == '.IF':
+                toks = _mini_lex(text, pos)
+                if not toks or toks[-1] != ('dot', '.THEN'):
+                    raise MiniLangError(f"{f}:{ln}: '.if' must end with '.then'")
+                cond = _MiniExprParser(toks[1:-1], pos).parse()
+                then_b, i = self._block(i + 1, ('.ELSE', '.ENDIF'))
+                if i >= len(self.lines):
+                    raise MiniLangError(f"{f}:{ln}: '.if' is never closed with '.endif'")
+                else_b = []
+                if _dot_kw(self.lines[i][0]) == '.ELSE':
+                    rest = _mini_lex(self.lines[i][0], pos)[1:]
+                    if rest:
+                        raise MiniLangError(f"{f}:{ln}: unexpected text after '.else'")
+                    else_b, i = self._block(i + 1, ('.ENDIF',))
+                    if i >= len(self.lines):
+                        raise MiniLangError(f"{f}:{ln}: '.if' is never closed with '.endif'")
+                out.append(('if', cond, then_b, else_b, pos))
+                i += 1
+                continue
+            if kw == '.WHILE':
+                toks = _mini_lex(text, pos)
+                cond = _MiniExprParser(toks[1:], pos).parse()
+                body, i = self._block(i + 1, ('.ENDWHILE',))
+                if i >= len(self.lines):
+                    raise MiniLangError(f"{f}:{ln}: '.while' is never closed with '.endwhile'")
+                out.append(('while', cond, body, pos))
+                i += 1
+                continue
+            if kw == '.FOR':
+                var, args = self._for_header(text, pos)
+                body, i = self._block(i + 1, ('.NEXT',))
+                if i >= len(self.lines):
+                    raise MiniLangError(f"{f}:{ln}: '.for' is never closed with '.next'")
+                out.append(('for', var, args, body, pos))
+                i += 1
+                continue
+            out.append(self._simple(text, pos))
+            i += 1
+        return out, i
+
+    def _for_header(self, text, pos):
+        toks = _mini_lex(text, pos)
+        f, ln = pos
+        if len(toks) < 4 or toks[1][0] != 'name':
+            raise MiniLangError(f"{f}:{ln}: '.for' needs 'variable in range(...)'")
+        var = toks[1][1]
+        if toks[2] != ('name', 'in') or toks[3] != ('name', 'range'):
+            raise MiniLangError(f"{f}:{ln}: '.for {var}' must be followed by 'in range(...)'")
+        p = _MiniExprParser(toks[4:], pos)
+        p.expect_op('(')
+        args = []
+        if not p.at_op(')'):
+            args.append(p.or_())
+            while p.eat_op(','):
+                args.append(p.or_())
+        p.expect_op(')')
+        if not p.at_end():
+            raise MiniLangError(f"{f}:{ln}: unexpected text after 'range(...)'")
+        if not 1 <= len(args) <= 3:
+            raise MiniLangError(f"{f}:{ln}: range() takes 1 to 3 arguments, got {len(args)}")
+        return var, args
+
+    def _simple(self, text, pos):
+        f, ln = pos
+        toks = _mini_lex(text, pos)
+        if not toks:
+            raise MiniLangError(f"{f}:{ln}: empty statement")
+        k, v = toks[0]
+        if k == 'dot':
+            if v == '.RETURN':
+                if len(toks) > 1:
+                    raise MiniLangError(f"{f}:{ln}: '.return' takes no value")
+                return ('return', pos)
+            if v == '.EMIT':
+                p = _MiniExprParser(toks[1:], pos)
+                p.expect_op('(')
+                args = []
+                if not p.at_op(')'):
+                    args.append(p.or_())
+                    while p.eat_op(','):
+                        args.append(p.or_())
+                p.expect_op(')')
+                if not p.at_end():
+                    raise MiniLangError(f"{f}:{ln}: unexpected text after '.emit(...)'")
+                if not args:
+                    raise MiniLangError(f"{f}:{ln}: '.emit' needs at least one value")
+                return ('emit', args, pos)
+            if v == '.CALL':
+                if len(toks) < 2 or toks[1][0] != 'name':
+                    raise MiniLangError(f"{f}:{ln}: '.call' needs a function name")
+                name = toks[1][1]
+                p = _MiniExprParser(toks[2:], pos)
+                p.expect_op('(')
+                args = []
+                if not p.at_op(')'):
+                    args.append(p.or_())
+                    while p.eat_op(','):
+                        args.append(p.or_())
+                p.expect_op(')')
+                if not p.at_end():
+                    raise MiniLangError(f"{f}:{ln}: unexpected text after '.call'")
+                return ('call', name, args, pos)
+            if v == '.NONLOCAL':
+                names = []
+                j = 1
+                while j < len(toks):
+                    if toks[j][0] != 'name':
+                        raise MiniLangError(f"{f}:{ln}: '.nonlocal' needs variable names")
+                    names.append(toks[j][1])
+                    j += 1
+                    if j < len(toks):
+                        if toks[j] != ('op', ','):
+                            raise MiniLangError(f"{f}:{ln}: '.nonlocal' names must be "
+                                                f"separated by ','")
+                        j += 1
+                if not names:
+                    raise MiniLangError(f"{f}:{ln}: '.nonlocal' needs variable names")
+                return ('nonlocal', names, pos)
+            raise MiniLangError(f"{f}:{ln}: unknown statement {v.lower()!r}")
+        # 代入。左辺は名前か、名前への添字1つ。
+        if k != 'name':
+            raise MiniLangError(f"{f}:{ln}: statement must be a directive or an assignment")
+        name = v
+        p = _MiniExprParser(toks[1:], pos)
+        idx = None
+        if p.at_op('['):
+            p.i += 1
+            idx = p.or_()
+            p.expect_op(']')
+        p.expect_op('=')
+        val = _MiniExprParser(p.toks[p.i:], pos).parse()
+        return ('assign', name, idx, val, pos)
+
+
+class MiniInterp:
+    """ミニ言語を実行して `.emit` されたワードを集める。
+
+    変数は関数呼び出しごとのフレームに持つ。`.nonlocal` を宣言した名前は、
+    外側の呼び出しフレームのうち、その名前を持つ一番内側のものを指す。
+    """
+
+    MAX_STEPS = 4_000_000
+    MAX_DEPTH = 128
+    MAX_EMIT = 1 << 20
+    MAX_ARRAY = 1 << 20
+
+    def __init__(self, state):
+        self.state = state
+        self.out = []
+        self.steps = 0
+        self.frames = []
+
+    # --- 値の入れ物 --------------------------------------------------------
+    @staticmethod
+    def _is_arr(v):
+        return isinstance(v, list)
+
+    def _need_int(self, v, pos, what):
+        if self._is_arr(v):
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: {what} must be a number, not an array")
+        return _mini_wrap(v)
+
+    # --- 変数 --------------------------------------------------------------
+    def _frame_for(self, name):
+        """`.nonlocal` 宣言があれば外側のフレームを、なければ現フレームを返す。"""
+        top = self.frames[-1]
+        if name not in top['nonlocal']:
+            return top
+        for fr in reversed(self.frames[:-1]):
+            if name in fr['vars']:
+                return fr
+        return None
+
+    def _get(self, name, pos):
+        fr = self._frame_for(name)
+        if fr is None:
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: '.nonlocal {name}' found no "
+                                f"enclosing definition of {name!r}")
+        if name not in fr['vars']:
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: {name!r} is used before it is set")
+        return fr['vars'][name]
+
+    def _set(self, name, value, pos):
+        fr = self._frame_for(name)
+        if fr is None:
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: '.nonlocal {name}' found no "
+                                f"enclosing definition of {name!r}")
+        fr['vars'][name] = value
+
+    # --- 式 ----------------------------------------------------------------
+    def eval(self, e, pos):
+        k = e[0]
+        if k == 'num':
+            return e[1]
+        if k == 'var':
+            return self._get(e[1], pos)
+        if k == 'arr':
+            return [self._need_int(self.eval(x, pos), pos, 'an array element')
+                    for x in e[1]]
+        if k == 'len':
+            v = self.eval(e[1], pos)
+            if not self._is_arr(v):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: '.len' needs an array")
+            return _mini_wrap(len(v))
+        if k == 'index':
+            base = self.eval(e[1], pos)
+            idx = _mini_signed(self._need_int(self.eval(e[2], pos), pos, 'an index'))
+            if not self._is_arr(base):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: only an array can be indexed")
+            # 範囲外の読み出しは 0。配列は書き込みで伸びるので、読みでは伸ばさない。
+            if idx < 0 or idx >= len(base):
+                return 0
+            return base[idx]
+        if k == 'slice':
+            base = self.eval(e[1], pos)
+            if not self._is_arr(base):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: only an array can be sliced")
+            n = len(base)
+            lo = 0 if e[2] is None else _mini_signed(
+                self._need_int(self.eval(e[2], pos), pos, 'a slice bound'))
+            hi = n if e[3] is None else _mini_signed(
+                self._need_int(self.eval(e[3], pos), pos, 'a slice bound'))
+            lo = max(0, min(lo, n))
+            hi = max(lo, min(hi, n))
+            return base[lo:hi]
+        if k == 'un':
+            op = e[1]
+            v = self._need_int(self.eval(e[2], pos), pos, 'an operand')
+            if op == '-':
+                return _mini_wrap(-_mini_signed(v))
+            if op == '+':
+                return v
+            if op == '~':
+                return _mini_wrap(~v)
+            return 1 if _mini_signed(v) == 0 else 0
+        if k == 'bin':
+            return self._binop(e, pos)
+        raise MiniLangError(f"{pos[0]}:{pos[1]}: bad expression")
+
+    def _binop(self, e, pos):
+        op = e[1]
+        if op == '&&':
+            if _mini_signed(self._need_int(self.eval(e[2], pos), pos, 'an operand')) == 0:
+                return 0
+            return 1 if _mini_signed(
+                self._need_int(self.eval(e[3], pos), pos, 'an operand')) != 0 else 0
+        if op == '||':
+            if _mini_signed(self._need_int(self.eval(e[2], pos), pos, 'an operand')) != 0:
+                return 1
+            return 1 if _mini_signed(
+                self._need_int(self.eval(e[3], pos), pos, 'an operand')) != 0 else 0
+        a = self._need_int(self.eval(e[2], pos), pos, 'an operand')
+        b = self._need_int(self.eval(e[3], pos), pos, 'an operand')
+        sa, sb = _mini_signed(a), _mini_signed(b)
+        if op == '+':
+            return _mini_wrap(sa + sb)
+        if op == '-':
+            return _mini_wrap(sa - sb)
+        if op == '*':
+            return _mini_wrap(sa * sb)
+        if op == '/':
+            if sb == 0:
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: division by zero")
+            q = abs(sa) // abs(sb)
+            return _mini_wrap(-q if (sa < 0) != (sb < 0) else q)
+        if op == '%':
+            if sb == 0:
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: division by zero")
+            r = abs(sa) % abs(sb)
+            return _mini_wrap(-r if sa < 0 else r)
+        if op == '**':
+            if sb < 0:
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: negative exponent")
+            # 剰余つきべき乗。C 側の u256_pow（2乗しながら 256bit で回る）と
+            # 同じ値になり、指数が大きくても計算量が爆発しない。
+            return _mini_wrap(pow(sa, sb, 1 << _MINI_BITS))
+        if op == '<<':
+            if sb < 0 or sb >= _MINI_BITS:
+                return 0
+            return _mini_wrap(a << sb)
+        if op == '>>':
+            if sb < 0:
+                return 0
+            if sb >= _MINI_BITS:
+                return _mini_wrap(-1) if sa < 0 else 0
+            return _mini_wrap(sa >> sb)
+        if op == '&':
+            return a & b
+        if op == '|':
+            return a | b
+        if op == '^':
+            return a ^ b
+        if op == '<':
+            return 1 if sa < sb else 0
+        if op == '>':
+            return 1 if sa > sb else 0
+        if op == '<=':
+            return 1 if sa <= sb else 0
+        if op == '>=':
+            return 1 if sa >= sb else 0
+        if op == '==':
+            return 1 if sa == sb else 0
+        return 1 if sa != sb else 0
+
+    # --- 文 ----------------------------------------------------------------
+    def _tick(self, pos):
+        self.steps += 1
+        if self.steps > self.MAX_STEPS:
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: mini language ran more than "
+                                f"{self.MAX_STEPS} statements; assuming a runaway loop")
+
+    def exec_block(self, body):
+        for st in body:
+            self._exec(st)
+
+    def _exec(self, st):
+        kind = st[0]
+        pos = st[-1]
+        self._tick(pos)
+        if kind == 'assign':
+            _, name, idx, val, _ = st
+            v = self.eval(val, pos)
+            if idx is None:
+                self._set(name, list(v) if self._is_arr(v) else _mini_wrap(v), pos)
+                return
+            i = _mini_signed(self._need_int(self.eval(idx, pos), pos, 'an index'))
+            if i < 0:
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: negative index {i} in assignment")
+            if i >= self.MAX_ARRAY:
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: array index {i} exceeds the "
+                                    f"maximum length {self.MAX_ARRAY}")
+            arr = self._get(name, pos)
+            if not self._is_arr(arr):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: {name!r} is not an array")
+            # 足りない分は 0 で埋めて伸ばす。
+            if i >= len(arr):
+                arr.extend([0] * (i + 1 - len(arr)))
+            arr[i] = self._need_int(v, pos, 'an array element')
+            return
+        if kind == 'emit':
+            for x in st[1]:
+                v = self.eval(x, pos)
+                if self._is_arr(v):
+                    raise MiniLangError(f"{pos[0]}:{pos[1]}: '.emit' needs numbers, "
+                                        f"not an array")
+                if len(self.out) >= self.MAX_EMIT:
+                    raise MiniLangError(f"{pos[0]}:{pos[1]}: '.emit' produced more than "
+                                        f"{self.MAX_EMIT} words")
+                self.out.append(v)
+            return
+        if kind == 'call':
+            _, name, args, _ = st
+            fn = self._lookup(name, pos)
+            vals = [self.eval(a, pos) for a in args]
+            self.call(fn, vals, pos)
+            return
+        if kind == 'return':
+            raise _MiniReturn()
+        if kind == 'nonlocal':
+            top = self.frames[-1]
+            for nm in st[1]:
+                if nm in top['vars']:
+                    raise MiniLangError(f"{pos[0]}:{pos[1]}: {nm!r} is already local; "
+                                        f"'.nonlocal' must come before it is set")
+                top['nonlocal'].add(nm)
+            return
+        if kind == 'if':
+            _, cond, then_b, else_b, _ = st
+            if _mini_signed(self._need_int(self.eval(cond, pos), pos, 'a condition')) != 0:
+                self.exec_block(then_b)
+            else:
+                self.exec_block(else_b)
+            return
+        if kind == 'while':
+            _, cond, body, _ = st
+            while _mini_signed(
+                    self._need_int(self.eval(cond, pos), pos, 'a condition')) != 0:
+                self._tick(pos)
+                self.exec_block(body)
+            return
+        if kind == 'for':
+            _, var, args, body, _ = st
+            vs = [_mini_signed(self._need_int(self.eval(a, pos), pos, 'a range bound'))
+                  for a in args]
+            if len(vs) == 1:
+                start, stop, step = 0, vs[0], 1
+            elif len(vs) == 2:
+                start, stop, step = vs[0], vs[1], 1
+            else:
+                start, stop, step = vs
+            if step == 0:
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: range() step must not be zero")
+            i = start
+            while (i < stop) if step > 0 else (i > stop):
+                self._tick(pos)
+                self._set(var, _mini_wrap(i), pos)
+                self.exec_block(body)
+                i += step
+            return
+        raise MiniLangError(f"{pos[0]}:{pos[1]}: bad statement")
+
+    # --- 関数 --------------------------------------------------------------
+    def _lookup(self, name, pos):
+        fn = self.frames[-1]['func'] if self.frames else None
+        while fn is not None:
+            if name in fn.children:
+                return fn.children[name]
+            fn = fn.parent
+        fn = self.state.func_defs.get(name)
+        if fn is None:
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: no function named {name!r}")
+        return fn
+
+    def call(self, func, args, pos):
+        if len(self.frames) >= self.MAX_DEPTH:
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: call nesting deeper than "
+                                f"{self.MAX_DEPTH}; assuming runaway recursion")
+        if len(args) != len(func.params):
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: {func.name!r} takes "
+                                f"{len(func.params)} argument(s), got {len(args)}")
+        frame = {'vars': {}, 'nonlocal': set(), 'func': func}
+        for nm, v in zip(func.params, args):
+            frame['vars'][nm] = list(v) if self._is_arr(v) else _mini_wrap(v)
+        self.frames.append(frame)
+        try:
+            self.exec_block(func.body or [])
+        except _MiniReturn:
+            pass
+        finally:
+            self.frames.pop()
+
+    def run(self, func, args, pos):
+        self.out = []
+        self.steps = 0
+        self.frames = []
+        self.call(func, args, pos)
+        return self.out
 
 
 class ObjectGenerator:
@@ -4338,6 +5205,75 @@ class ObjectGenerator:
 
         return ''.join(result), not has_content
 
+    def _mini_diag(self, msg):
+        # 命令長を測るだけの試し打ちでも makeobj が走るので、同じエラーが
+        # 二重に出る。試し打ちのときは黙って、本番の評価でだけ報告する。
+        if not self.state._pass1_size_mode:
+            self.state.diag(msg, set_error=True)
+
+    def mini_call(self, s, idx):
+        """`binary_list` 欄の `.call 名前(引数, ...)` を実行し、(ワード列, 次の位置)。
+
+        引数はパターン層の式として評価するので、`a` や `b` は捕捉済みの
+        パターン変数を指す。未定義ラベル由来の値は 0 として渡す。パス1で
+        大きさを測るときに、番兵の巨大な値で反復回数が爆発しないようにするため。
+        """
+        idx += 5
+        idx = StringUtils.skipspc(s, idx)
+        j = idx
+        while j < len(s) and s[j] in _SYM_CORE:
+            j += 1
+        name = s[idx:j]
+        idx = StringUtils.skipspc(s, j)
+        if not name or idx >= len(s) or s[idx] != '(':
+            self._mini_diag(" error - '.call' needs 'name(argument, ...)'.")
+            return [], len(s)
+        depth = 0
+        k = idx
+        while k < len(s) and s[k] != chr(0):
+            if s[k] in '([':
+                depth += 1
+            elif s[k] in ')]':
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        if depth != 0 or k >= len(s):
+            self._mini_diag(f" error - '.call {name}': unbalanced parentheses.")
+            return [], len(s)
+        arg_text = s[idx + 1:k]
+        idx = k + 1
+
+        fn = self.state.func_defs.get(name)
+        if fn is None:
+            self._mini_diag(f" error - '.call': no function named {name!r} "
+                            f"(define it with '.func::{name}:: ... .return').")
+            return [], idx
+
+        args = []
+        a = 0
+        arg_text_z = arg_text + chr(0)
+        while a < len(arg_text_z) and arg_text_z[a] != chr(0):
+            if arg_text_z[a] == ',':
+                a += 1
+                continue
+            v, a = self.expr_eval.expression_pat(arg_text_z, a)
+            args.append(0 if _is_undef_derived(v) else v)
+            if a < len(arg_text_z) and arg_text_z[a] == ',':
+                a += 1
+                continue
+            break
+
+        try:
+            words = MiniInterp(self.state).run(fn, args, (fn.file, fn.line))
+        except MiniLangError as e:
+            self._mini_diag(f" error - {e}")
+            return [], idx
+        except RecursionError:
+            self._mini_diag(f" error - '.call {name}': expression nesting too deep.")
+            return [], idx
+        return words, idx
+
     def makeobj(self, s):
         s, z = self.e_p(s)
         s = self.replace_percent_with_index(s)
@@ -4365,6 +5301,17 @@ class ObjectGenerator:
                 if s[idx] == ';':
                     semicolon = True
                     idx += 1
+
+                if StringUtils.upper(s[idx:idx + 5]) == '.CALL' and (
+                        idx + 5 >= len(s) or s[idx + 5] not in _SYM_CORE):
+                    if semicolon:
+                        self._mini_diag(" error - ';' cannot be applied to '.call'.")
+                    words, idx = self.mini_call(s, idx)
+                    objl += words
+                    if idx < len(s) and s[idx] == ',':
+                        idx += 1
+                        continue
+                    break
 
                 self.state._elf_current_word_idx = len(objl)
 
@@ -8109,6 +9056,7 @@ class Assembler:
         try:
             self.state.pat = self.pattern_reader.readpat(args.patternfile)
             self.state.sub_defs = self.pattern_reader.subs
+            self.state.func_defs = self.pattern_reader.funcs
             # 破綻点修正: パターンファイルが読めなかった場合、readpat() は
             # エラーを報告して空のパターン表を返すが、そのまま組み立てに進んで
             # いたため、全ソース行が「どのパターンにも一致しない」となり

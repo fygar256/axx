@@ -112,11 +112,18 @@ encoder. The practical condition is:
 
 Two consequences follow, and both are design decisions rather than oversights:
 
-**The pattern language is Turing-incomplete.** This guarantees that pattern
-matching terminates. The cost is that an ISA whose encoding requires unbounded
-computation cannot be described. axx is therefore a *general* assembler, not a
-*universal* one. (The macro layer in section 7 is a separate stage and is not
-subject to this restriction.)
+**The pattern notation itself is Turing-incomplete.** This guarantees that
+pattern *matching* terminates. An encoding that needs unbounded computation
+cannot be written in `binary_list` alone.
+
+**Unbounded computation is available, but only by asking for it.** A
+`binary_list` element may be `.call name(...)`, which runs a function written in
+the **mini language** of [section 3.15](#315-mini-language-func--call) — loops,
+recursion, conditionals and arrays, and therefore Turing complete. Matching
+still terminates; only the encoding step can compute without a fixed bound, and
+it is bounded in practice by the step, depth and output caps in section 3.15.
+(The macro layer in section 7 is a third, earlier stage and is likewise not
+restricted.)
 
 **Some real architectures fall outside the model.** Not because their syntax
 cannot be written down, but because their encoding cannot be produced by
@@ -778,6 +785,174 @@ redefinition, so in practice one `.error` per code near the top of the file is
 the natural style. A code that is never given a message still raises its
 error and still blocks the output file from being written; only the printed
 text stays blank, exactly as for an undeclared code today.
+
+### 3.15 Mini language (`.func` / `.call`)
+
+A `binary_list` element may be `.call name(argument, ...)`, which runs a
+function written in a small procedural language and emits the words that
+function produces. The language has assignment, `.if`, `.while`, `.for`,
+recursion and arrays, so an encoding that cannot be written as a fixed
+expression can be computed instead.
+
+A function is defined at the top level of a pattern file:
+
+```
+.func::<name>::<parameter, parameter, ...>
+<statements>
+.return
+```
+
+Everything between the header and the matching `.return` is the body; those
+lines are never matched as ordinary pattern lines. Parameters may be empty
+(`.func::name::`).
+
+```
+MOV a,!b,!c :: .call name(a,b,c)
+```
+
+The arguments at the call site are ordinary axx pattern expressions, so `a`,
+`b` and `c` there mean the captured pattern variables. Inside the function they
+become its parameters, which are local to the call. `.call` is one
+comma-separated element like any other, so it can be mixed with plain values:
+
+```
+MIX !e :: 0x90,.call rep(e),0xff
+```
+
+#### Statements
+
+| Statement | Meaning |
+|---|---|
+| `name = expression` | Assign to a local variable |
+| `name[index] = expression` | Assign to an array element |
+| `.emit(e1, e2, ...)` | Append one word per value to the output |
+| `.call name(args)` | Call another function |
+| `.if <expr> .then` / `.else` / `.endif` | Conditional |
+| `.while(<expr>)` / `.endwhile` | Loop while the condition is non-zero |
+| `.for <name> in range(...)` / `.next` | Loop over `range(stop)`, `range(start, stop)` or `range(start, stop, step)` |
+| `.nonlocal a, b` | Bind these names to the enclosing call instead of locally |
+| `.return` | Return from the function |
+
+`.emit` appends one word of `.bits` width per value — one byte at the default
+width. The number of words a call emits is the instruction's length, so a
+function must emit the same count in both passes for addresses to settle.
+
+Values are 256-bit two's complement integers, the same as everywhere else in
+axx. Operators, from loosest to tightest: `||`, `&&`, `!`, comparisons
+(`== != < <= > >=`), `|`, `^`, `&`, `<< >>`, `+ -`, `* / %`, unary `- + ~`,
+`**`, subscript. `/` truncates toward zero and `%` takes the sign of the
+dividend. `>>` is arithmetic.
+
+#### Arrays
+
+An array is written `[]`, or `[e1, e2, ...]`, or produced by slicing.
+
+```
+a = []
+a[3] = 5          /* a is now [0,0,0,5] — the gap is filled with 0 */
+.emit(a[0])       /* 0 */
+.emit(a[99])      /* 0 — reading past the end gives 0, without extending */
+.emit(.len(a))    /* 4 */
+b = a[1:3]        /* [0,0] — the end index is not included */
+```
+
+Assigning past the end extends the array with zeros. Reading past the end, or
+at a negative index, gives `0` and leaves the array alone. Slice bounds are
+clamped to the array. `.len(x)` is the length. Array elements are numbers, not
+arrays.
+
+#### Scope and nesting
+
+Each call gets its own variables. A name read before it is set is an error, so
+a typo does not silently read zero.
+
+Functions may be defined inside other functions. An inner function is visible
+to its enclosing function and resolves names outward; `.nonlocal` lets it
+assign to a variable of an enclosing call rather than creating its own:
+
+```
+.func::outer::
+n=7
+.func::inner::
+.nonlocal n
+n=n+1
+.emit(n)
+.return
+.call inner()
+.call inner()
+.emit(n)
+.return
+```
+
+```
+-> 08 09 09
+```
+
+`.nonlocal` must appear before the name is otherwise used in that function.
+
+#### Example
+
+A sieve, and an instruction whose encoding is a Collatz step count:
+
+```
+PRIMES !n  :: .call sieve(n)
+COLLATZ !n :: .call collatz(n)
+
+.func::sieve::n
+mark=[]
+mark[n]=0
+i=2
+.while(i*i<n)
+.if mark[i]==0 .then
+j=i*i
+.while(j<n)
+mark[j]=1
+j=j+i
+.endwhile
+.endif
+i=i+1
+.endwhile
+.for k in range(2,n)
+.if mark[k]==0 .then
+.emit(k)
+.endif
+.next
+.return
+
+.func::collatz::n
+c=0
+.while(n!=1)
+.if n%2==0 .then
+n=n/2
+.else
+n=3*n+1
+.endif
+c=c+1
+.endwhile
+.emit(c)
+.return
+```
+
+```
+primes 50            -> 02 03 05 07 0b 0d 11 13 17 1d 1f 25 29 2b 2f
+collatz 27           -> 6f
+```
+
+#### Limits
+
+The language is Turing complete, so a buggy pattern file could otherwise hang
+the assembler. Four caps stop that and report the offending line instead:
+
+| Cap | Value |
+|---|---|
+| Statements executed per `.call` | 4,000,000 |
+| Call nesting | 128 |
+| Words emitted per `.call` | 1,048,576 |
+| Array length | 1,048,576 |
+
+An argument that came from an undefined label is passed as `0`, so a
+forward reference cannot blow a loop count up during the first pass.
+
 
 ---
 

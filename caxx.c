@@ -47,6 +47,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <setjmp.h>
 
 static void axx_diagf(int set_error, int force, const char *fmt, ...);
 static void m_pyrepr(const char *s, char *out, size_t outsz);
@@ -538,6 +539,74 @@ static int is_sub_name(const char *s){
     return 1;
 }
 
+/* ==================== ミニ言語 (`.func` / `.call`) の型 ====================
+ * `binary_list` 欄の `.call 名前(引数,…)` から呼ばれる、チューリング完全な
+ * 小さな手続き型言語。値は 256bit 2の補数の整数か、その配列。 */
+
+typedef struct {
+    int        is_arr;
+    uint256_t  num;
+    uint256_t *arr;
+    int        n, cap;
+} MiniVal;
+
+typedef enum {
+    MX_NUM, MX_VAR, MX_ARRLIT, MX_INDEX, MX_SLICE, MX_LEN, MX_BIN, MX_UN
+} MXKind;
+
+typedef struct MExpr {
+    MXKind         k;
+    uint256_t      num;
+    char          *name;
+    char           op[3];
+    struct MExpr  *a, *b, *c;
+    struct MExpr **items;
+    int            nitems;
+} MExpr;
+
+typedef enum {
+    MS_ASSIGN, MS_EMIT, MS_CALL, MS_RETURN, MS_IF, MS_WHILE, MS_FOR, MS_NONLOCAL
+} MSKind;
+
+typedef struct MStmt {
+    MSKind         k;
+    char          *name;       /* 代入先 / 呼ぶ関数名 / .for の変数 */
+    MExpr         *idx;        /* 代入先の添字。無ければ NULL */
+    MExpr         *val;        /* 代入する式 / .if .while の条件 */
+    MExpr        **args;       /* .emit .call の引数, .for の range 引数 */
+    int            nargs;
+    struct MStmt **body;       /* .if の then / .while .for の本体 */
+    int            nbody;
+    struct MStmt **body2;      /* .if の else */
+    int            nbody2;
+    char         **names;      /* .nonlocal の名前 */
+    int            nnames;
+    const char    *file;
+    int            line;
+} MStmt;
+
+typedef struct MiniFunc {
+    char             *name;
+    char            **params;
+    int               nparams;
+    char            **lines;     /* 読み込み時に集めた本体の行 */
+    char            **lfiles;
+    int              *llines;
+    int               nlines, clines;
+    MStmt           **body;      /* 解析済みの文の並び */
+    int               nbody;
+    struct MiniFunc  *parent;
+    struct MiniFunc **children;
+    int               nchildren, cchildren;
+    char             *file;
+    int               line;
+    int               depth;     /* 読み込み中のブロック深さ */
+} MiniFunc;
+
+typedef struct { MiniFunc **data; int len; int cap; } MiniFuncVec;
+
+static void mfv_init(MiniFuncVec *v){ v->data = NULL; v->len = 0; v->cap = 0; }
+
 typedef struct { int *data; int len; int cap; } IStack;
 static void is_init(IStack*v){v->data=NULL;v->len=0;v->cap=0;}
 static void is_push(IStack*v,int x){
@@ -1001,6 +1070,7 @@ typedef struct {
     StrVec     export_order;   /* 公開順（出力の再現性のため） */
     PatVec     pat;            /* 読み込んだパターン表 */
     SubVec     subs;           /* `.sub … .return` のサブ表 */
+    MiniFuncVec funcs;         /* `.func … .return` のミニ言語の関数 */
 
     /* --- VLIW / EPIC --- */
     int        vliwinstbits;     /* 命令スロット1個のビット幅 */
@@ -1567,6 +1637,7 @@ static void state_init(AsmState *st) {
     sv_init(&st->export_order);
     pv_init(&st->pat);
     subv_init(&st->subs);
+    mfv_init(&st->funcs);
     st->vliwinstbits = 41;
     iv_init(&st->vliwnop);
     st->vliwbits = 128;
@@ -5438,6 +5509,1241 @@ static void check_sub_refs(Assembler *asmb){
     free(mark); free(stack);
 }
 
+/* ==================== ミニ言語: 実装 ====================
+ * `.func::名前::引数 … .return` で定義し、`binary_list` 欄の
+ * `.call 名前(引数,…)` から呼ぶ。`.emit` した値がその位置のワードになる。
+ * axx.py の MiniParser / MiniInterp の移植で、同じ入力に同じ値を出す。 */
+
+enum {
+    MINI_MAX_STEPS = 4000000,
+    MINI_MAX_DEPTH = 128,
+    MINI_MAX_EMIT  = 1 << 20,
+    MINI_MAX_ARRAY = 1 << 20,
+    MINI_MAX_TOK   = 1024
+};
+
+typedef enum { MT_END, MT_NUM, MT_NAME, MT_DOT, MT_OP } MTKind;
+typedef struct { MTKind k; uint256_t num; char s[128]; } MTok;
+
+typedef struct {
+    jmp_buf     jb;
+    int         jb_active;
+    char        err[512];
+    const char *file;
+    int         line;
+} MiniCtx;
+
+static void mini_fail(MiniCtx *c, const char *fmt, ...){
+    va_list ap;
+    char body[400];
+    va_start(ap, fmt);
+    vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+    snprintf(c->err, sizeof(c->err), "%s:%d: %s",
+             c->file ? c->file : "?", c->line, body);
+    if(c->jb_active) longjmp(c->jb, 1);
+    fprintf(stderr, " error - %s\n", c->err);
+    exit(1);
+}
+
+static void *mini_alloc(size_t n){
+    void *p = calloc(1, n);
+    if(!p){ perror("calloc"); exit(1); }
+    return p;
+}
+
+static char *mini_strdup(const char *s){
+    char *p = strdup(s ? s : "");
+    if(!p){ perror("strdup"); exit(1); }
+    return p;
+}
+
+/* --------------------------- 値 --------------------------- */
+
+static void mini_val_free(MiniVal *v){
+    if(v->arr) free(v->arr);
+    v->arr = NULL; v->n = v->cap = 0; v->is_arr = 0;
+}
+
+static MiniVal mini_num(uint256_t x){
+    MiniVal v; memset(&v, 0, sizeof(v));
+    v.num = x;
+    return v;
+}
+
+static MiniVal mini_val_copy(const MiniVal *src){
+    MiniVal v; memset(&v, 0, sizeof(v));
+    v.is_arr = src->is_arr;
+    v.num = src->num;
+    if(src->is_arr && src->n > 0){
+        v.arr = mini_alloc((size_t)src->n * sizeof(uint256_t));
+        memcpy(v.arr, src->arr, (size_t)src->n * sizeof(uint256_t));
+        v.n = v.cap = src->n;
+    }
+    return v;
+}
+
+static void mini_arr_reserve(MiniVal *v, int want){
+    if(want <= v->cap) return;
+    int cap = v->cap ? v->cap : 8;
+    while(cap < want) cap *= 2;
+    uint256_t *na = realloc(v->arr, (size_t)cap * sizeof(uint256_t));
+    if(!na){ perror("realloc"); exit(1); }
+    v->arr = na; v->cap = cap;
+}
+
+/* --------------------------- 字句 --------------------------- */
+
+static uint256_t mini_digits(const char *s, int from, int to, int base){
+    uint256_t acc = u256_zero();
+    uint256_t b = u256_from_u64((uint64_t)base);
+    for(int i = from; i < to; i++){
+        if(s[i] == '_') continue;
+        int d;
+        char ch = s[i];
+        if(ch >= '0' && ch <= '9') d = ch - '0';
+        else if(ch >= 'a' && ch <= 'f') d = ch - 'a' + 10;
+        else d = ch - 'A' + 10;
+        acc = u256_add(u256_mul(acc, b), u256_from_u64((uint64_t)d));
+    }
+    return acc;
+}
+
+static int mini_lex(MiniCtx *c, const char *t, MTok *out){
+    static const char *ops2[] = { "**","<<",">>","<=",">=","==","!=","&&","||", NULL };
+    int n = 0, i = 0;
+    int len = (int)strlen(t);
+    while(i < len){
+        if(n >= MINI_MAX_TOK - 1) mini_fail(c, "statement is too long");
+        char ch = t[i];
+        if(ch == ' ' || ch == '\t'){ i++; continue; }
+        if(isdigit((unsigned char)ch)){
+            int j;
+            if(ch == '0' && i + 1 < len && (t[i+1] == 'x' || t[i+1] == 'X')){
+                j = i + 2;
+                while(j < len && (isxdigit((unsigned char)t[j]) || t[j] == '_')) j++;
+                if(j == i + 2) mini_fail(c, "malformed hex number");
+                out[n].k = MT_NUM; out[n].num = mini_digits(t, i + 2, j, 16);
+            } else if(ch == '0' && i + 1 < len && (t[i+1] == 'b' || t[i+1] == 'B')){
+                j = i + 2;
+                while(j < len && (t[j] == '0' || t[j] == '1' || t[j] == '_')) j++;
+                if(j == i + 2) mini_fail(c, "malformed binary number");
+                out[n].k = MT_NUM; out[n].num = mini_digits(t, i + 2, j, 2);
+            } else {
+                j = i;
+                while(j < len && (isdigit((unsigned char)t[j]) || t[j] == '_')) j++;
+                out[n].k = MT_NUM; out[n].num = mini_digits(t, i, j, 10);
+            }
+            out[n].s[0] = 0; n++; i = j; continue;
+        }
+        if(isalpha((unsigned char)ch) || ch == '_'){
+            int j = i;
+            while(j < len && (isalnum((unsigned char)t[j]) || t[j] == '_')) j++;
+            if(j - i >= (int)sizeof(out[n].s)) mini_fail(c, "name is too long");
+            out[n].k = MT_NAME;
+            memcpy(out[n].s, t + i, (size_t)(j - i)); out[n].s[j - i] = 0;
+            n++; i = j; continue;
+        }
+        if(ch == '.'){
+            int j = i + 1;
+            while(j < len && (isalnum((unsigned char)t[j]) || t[j] == '_')) j++;
+            if(j == i + 1) mini_fail(c, "stray '.'");
+            if(j - i >= (int)sizeof(out[n].s)) mini_fail(c, "directive name is too long");
+            out[n].k = MT_DOT;
+            for(int q = i; q < j; q++) out[n].s[q - i] = axx_upper_char(t[q]);
+            out[n].s[j - i] = 0;
+            n++; i = j; continue;
+        }
+        {
+            int hit = 0;
+            for(int q = 0; ops2[q]; q++){
+                if(t[i] == ops2[q][0] && i + 1 < len && t[i+1] == ops2[q][1]){
+                    out[n].k = MT_OP;
+                    out[n].s[0] = ops2[q][0]; out[n].s[1] = ops2[q][1]; out[n].s[2] = 0;
+                    n++; i += 2; hit = 1; break;
+                }
+            }
+            if(hit) continue;
+        }
+        if(strchr("+-*/%&|^~<>!()[]:,=", ch)){
+            out[n].k = MT_OP; out[n].s[0] = ch; out[n].s[1] = 0;
+            n++; i++; continue;
+        }
+        mini_fail(c, "unexpected character '%c'", ch);
+    }
+    out[n].k = MT_END; out[n].s[0] = 0;
+    return n;
+}
+
+/* --------------------------- 式の構文解析 --------------------------- */
+
+typedef struct { MTok *t; int n; int i; MiniCtx *c; } MXP;
+
+static MExpr *mxp_or(MXP *p);
+
+static MExpr *mx_new(MXKind k){
+    MExpr *e = mini_alloc(sizeof(MExpr));
+    e->k = k;
+    return e;
+}
+
+static int mxp_is_op(MXP *p, const char *op){
+    return p->i < p->n && p->t[p->i].k == MT_OP && strcmp(p->t[p->i].s, op) == 0;
+}
+
+static int mxp_eat(MXP *p, const char *op){
+    if(mxp_is_op(p, op)){ p->i++; return 1; }
+    return 0;
+}
+
+static void mxp_expect(MXP *p, const char *op){
+    if(!mxp_eat(p, op)){
+        if(p->i < p->n) mini_fail(p->c, "expected '%s', found '%s'", op, p->t[p->i].s);
+        else mini_fail(p->c, "expected '%s', found end of line", op);
+    }
+}
+
+static int mxp_end(MXP *p){ return p->i >= p->n; }
+
+static MExpr *mxp_primary(MXP *p){
+    if(mxp_end(p)) mini_fail(p->c, "expected a value, found end of line");
+    MTok *tk = &p->t[p->i];
+    if(tk->k == MT_NUM){ p->i++; MExpr *e = mx_new(MX_NUM); e->num = tk->num; return e; }
+    if(tk->k == MT_NAME){ p->i++; MExpr *e = mx_new(MX_VAR); e->name = mini_strdup(tk->s); return e; }
+    if(tk->k == MT_DOT){
+        if(strcmp(tk->s, ".LEN") != 0)
+            mini_fail(p->c, "'%s' cannot be used in an expression", tk->s);
+        p->i++;
+        mxp_expect(p, "(");
+        MExpr *e = mx_new(MX_LEN);
+        e->a = mxp_or(p);
+        mxp_expect(p, ")");
+        return e;
+    }
+    if(mxp_is_op(p, "(")){
+        p->i++;
+        MExpr *e = mxp_or(p);
+        mxp_expect(p, ")");
+        return e;
+    }
+    if(mxp_is_op(p, "[")){
+        p->i++;
+        MExpr *e = mx_new(MX_ARRLIT);
+        int cap = 0;
+        if(!mxp_is_op(p, "]")){
+            do {
+                if(e->nitems >= cap){
+                    cap = cap ? cap * 2 : 8;
+                    e->items = realloc(e->items, (size_t)cap * sizeof(MExpr*));
+                    if(!e->items){ perror("realloc"); exit(1); }
+                }
+                e->items[e->nitems++] = mxp_or(p);
+            } while(mxp_eat(p, ","));
+        }
+        mxp_expect(p, "]");
+        return e;
+    }
+    mini_fail(p->c, "expected a value, found '%s'", tk->s);
+    return NULL;
+}
+
+static MExpr *mxp_postfix(MXP *p){
+    MExpr *e = mxp_primary(p);
+    while(mxp_is_op(p, "[")){
+        p->i++;
+        MExpr *lo = mxp_is_op(p, ":") ? NULL : mxp_or(p);
+        if(mxp_eat(p, ":")){
+            MExpr *hi = mxp_is_op(p, "]") ? NULL : mxp_or(p);
+            mxp_expect(p, "]");
+            MExpr *s = mx_new(MX_SLICE);
+            s->a = e; s->b = lo; s->c = hi;
+            e = s;
+        } else {
+            mxp_expect(p, "]");
+            if(!lo) mini_fail(p->c, "empty subscript");
+            MExpr *s = mx_new(MX_INDEX);
+            s->a = e; s->b = lo;
+            e = s;
+        }
+    }
+    return e;
+}
+
+static MExpr *mxp_unary(MXP *p);
+
+static MExpr *mxp_power(MXP *p){
+    MExpr *e = mxp_postfix(p);
+    if(mxp_is_op(p, "**")){
+        p->i++;
+        MExpr *b = mx_new(MX_BIN);
+        strcpy(b->op, "**"); b->a = e; b->b = mxp_unary(p);
+        return b;
+    }
+    return e;
+}
+
+static MExpr *mxp_unary(MXP *p){
+    if(mxp_is_op(p, "-") || mxp_is_op(p, "+") || mxp_is_op(p, "~")){
+        char op[3]; strcpy(op, p->t[p->i].s);
+        p->i++;
+        MExpr *e = mx_new(MX_UN);
+        strcpy(e->op, op);
+        e->a = mxp_unary(p);
+        return e;
+    }
+    return mxp_power(p);
+}
+
+static MExpr *mxp_binlevel(MXP *p, int level){
+    /* level: 0=| 1=^ 2=& 3=shift 4=add 5=mul */
+    static const char *tbl[6][3] = {
+        { "|",  NULL, NULL },
+        { "^",  NULL, NULL },
+        { "&",  NULL, NULL },
+        { "<<", ">>", NULL },
+        { "+",  "-",  NULL },
+        { "*",  "/",  "%"  },
+    };
+    MExpr *e = (level == 5) ? mxp_unary(p) : mxp_binlevel(p, level + 1);
+    for(;;){
+        int hit = -1;
+        for(int q = 0; q < 3 && tbl[level][q]; q++)
+            if(mxp_is_op(p, tbl[level][q])){ hit = q; break; }
+        if(hit < 0) break;
+        char op[3]; strcpy(op, p->t[p->i].s);
+        p->i++;
+        MExpr *b = mx_new(MX_BIN);
+        strcpy(b->op, op);
+        b->a = e;
+        b->b = (level == 5) ? mxp_unary(p) : mxp_binlevel(p, level + 1);
+        e = b;
+    }
+    return e;
+}
+
+static MExpr *mxp_cmp(MXP *p){
+    static const char *ops[] = { "==","!=","<=",">=","<",">", NULL };
+    MExpr *e = mxp_binlevel(p, 0);
+    for(;;){
+        int hit = -1;
+        for(int q = 0; ops[q]; q++) if(mxp_is_op(p, ops[q])){ hit = q; break; }
+        if(hit < 0) break;
+        char op[3]; strcpy(op, p->t[p->i].s);
+        p->i++;
+        MExpr *b = mx_new(MX_BIN);
+        strcpy(b->op, op); b->a = e; b->b = mxp_binlevel(p, 0);
+        e = b;
+    }
+    return e;
+}
+
+static MExpr *mxp_not(MXP *p){
+    if(mxp_is_op(p, "!")){
+        p->i++;
+        MExpr *e = mx_new(MX_UN);
+        strcpy(e->op, "!");
+        e->a = mxp_not(p);
+        return e;
+    }
+    return mxp_cmp(p);
+}
+
+static MExpr *mxp_and(MXP *p){
+    MExpr *e = mxp_not(p);
+    while(mxp_is_op(p, "&&")){
+        p->i++;
+        MExpr *b = mx_new(MX_BIN);
+        strcpy(b->op, "&&"); b->a = e; b->b = mxp_not(p);
+        e = b;
+    }
+    return e;
+}
+
+static MExpr *mxp_or(MXP *p){
+    MExpr *e = mxp_and(p);
+    while(mxp_is_op(p, "||")){
+        p->i++;
+        MExpr *b = mx_new(MX_BIN);
+        strcpy(b->op, "||"); b->a = e; b->b = mxp_and(p);
+        e = b;
+    }
+    return e;
+}
+
+static MExpr *mxp_full(MXP *p){
+    MExpr *e = mxp_or(p);
+    if(!mxp_end(p)) mini_fail(p->c, "unexpected '%s' in expression", p->t[p->i].s);
+    return e;
+}
+
+/* `(` の直後から `)` までのカンマ区切りの式を読む。 */
+static void mxp_arglist(MXP *p, MExpr ***outv, int *outn){
+    mxp_expect(p, "(");
+    int cap = 0;
+    *outv = NULL; *outn = 0;
+    if(!mxp_is_op(p, ")")){
+        do {
+            if(*outn >= cap){
+                cap = cap ? cap * 2 : 8;
+                *outv = realloc(*outv, (size_t)cap * sizeof(MExpr*));
+                if(!*outv){ perror("realloc"); exit(1); }
+            }
+            (*outv)[(*outn)++] = mxp_or(p);
+        } while(mxp_eat(p, ","));
+    }
+    mxp_expect(p, ")");
+}
+
+/* --------------------------- 文の構文解析 --------------------------- */
+
+typedef struct {
+    MiniFunc *f;
+    int       i;
+    MiniCtx  *c;
+} MSP;
+
+static void ms_push(MStmt ***v, int *n, int *cap, MStmt *s){
+    if(*n >= *cap){
+        *cap = *cap ? *cap * 2 : 8;
+        *v = realloc(*v, (size_t)*cap * sizeof(MStmt*));
+        if(!*v){ perror("realloc"); exit(1); }
+    }
+    (*v)[(*n)++] = s;
+}
+
+static MStmt *ms_new(MSKind k, MSP *p, int li){
+    MStmt *s = mini_alloc(sizeof(MStmt));
+    s->k = k;
+    s->file = p->f->lfiles[li];
+    s->line = p->f->llines[li];
+    return s;
+}
+
+static void mini_dotkw(const char *s, char *out, size_t osz){
+    int i = axx_skipspc(s, 0);
+    out[0] = 0;
+    if(s[i] != '.') return;
+    size_t n = 0;
+    out[n++] = '.';
+    i++;
+    while(s[i] && (isalnum((unsigned char)s[i]) || s[i] == '_') && n < osz - 1)
+        out[n++] = axx_upper_char(s[i++]);
+    out[n] = 0;
+}
+
+static int mini_is_ender(const char *kw){
+    return strcmp(kw, ".ELSE") == 0 || strcmp(kw, ".ENDIF") == 0
+        || strcmp(kw, ".NEXT") == 0 || strcmp(kw, ".ENDWHILE") == 0;
+}
+
+static void msp_block(MSP *p, const char *e1, const char *e2,
+                      MStmt ***outv, int *outn);
+
+static MStmt *msp_simple(MSP *p, int li){
+    MiniCtx *c = p->c;
+    const char *text = p->f->lines[li];
+    c->file = p->f->lfiles[li];
+    c->line = p->f->llines[li];
+    MTok toks[MINI_MAX_TOK];
+    int n = mini_lex(c, text, toks);
+    if(n == 0) mini_fail(c, "empty statement");
+
+    if(toks[0].k == MT_DOT){
+        const char *kw = toks[0].s;
+        if(strcmp(kw, ".RETURN") == 0){
+            if(n > 1) mini_fail(c, "'.return' takes no value");
+            return ms_new(MS_RETURN, p, li);
+        }
+        if(strcmp(kw, ".EMIT") == 0){
+            MStmt *s = ms_new(MS_EMIT, p, li);
+            MXP ep; ep.t = toks + 1; ep.n = n - 1; ep.i = 0; ep.c = c;
+            mxp_arglist(&ep, &s->args, &s->nargs);
+            if(!mxp_end(&ep)) mini_fail(c, "unexpected text after '.emit(...)'");
+            if(s->nargs == 0) mini_fail(c, "'.emit' needs at least one value");
+            return s;
+        }
+        if(strcmp(kw, ".CALL") == 0){
+            if(n < 2 || toks[1].k != MT_NAME) mini_fail(c, "'.call' needs a function name");
+            MStmt *s = ms_new(MS_CALL, p, li);
+            s->name = mini_strdup(toks[1].s);
+            MXP ep; ep.t = toks + 2; ep.n = n - 2; ep.i = 0; ep.c = c;
+            mxp_arglist(&ep, &s->args, &s->nargs);
+            if(!mxp_end(&ep)) mini_fail(c, "unexpected text after '.call'");
+            return s;
+        }
+        if(strcmp(kw, ".NONLOCAL") == 0){
+            MStmt *s = ms_new(MS_NONLOCAL, p, li);
+            int cap = 0, j = 1;
+            while(j < n){
+                if(toks[j].k != MT_NAME) mini_fail(c, "'.nonlocal' needs variable names");
+                if(s->nnames >= cap){
+                    cap = cap ? cap * 2 : 8;
+                    s->names = realloc(s->names, (size_t)cap * sizeof(char*));
+                    if(!s->names){ perror("realloc"); exit(1); }
+                }
+                s->names[s->nnames++] = mini_strdup(toks[j].s);
+                j++;
+                if(j < n){
+                    if(!(toks[j].k == MT_OP && strcmp(toks[j].s, ",") == 0))
+                        mini_fail(c, "'.nonlocal' names must be separated by ','");
+                    j++;
+                }
+            }
+            if(s->nnames == 0) mini_fail(c, "'.nonlocal' needs variable names");
+            return s;
+        }
+        mini_fail(c, "unknown statement '%s'", kw);
+    }
+    if(toks[0].k != MT_NAME)
+        mini_fail(c, "statement must be a directive or an assignment");
+    {
+        MStmt *s = ms_new(MS_ASSIGN, p, li);
+        s->name = mini_strdup(toks[0].s);
+        MXP ep; ep.t = toks + 1; ep.n = n - 1; ep.i = 0; ep.c = c;
+        if(mxp_is_op(&ep, "[")){
+            ep.i++;
+            s->idx = mxp_or(&ep);
+            mxp_expect(&ep, "]");
+        }
+        mxp_expect(&ep, "=");
+        MXP rp; rp.t = ep.t + ep.i; rp.n = ep.n - ep.i; rp.i = 0; rp.c = c;
+        s->val = mxp_full(&rp);
+        return s;
+    }
+}
+
+static void msp_block(MSP *p, const char *e1, const char *e2,
+                      MStmt ***outv, int *outn){
+    MiniCtx *c = p->c;
+    int cap = 0;
+    *outv = NULL; *outn = 0;
+    while(p->i < p->f->nlines){
+        int li = p->i;
+        char kw[32];
+        mini_dotkw(p->f->lines[li], kw, sizeof(kw));
+        c->file = p->f->lfiles[li];
+        c->line = p->f->llines[li];
+        if((e1 && strcmp(kw, e1) == 0) || (e2 && strcmp(kw, e2) == 0)) return;
+        if(mini_is_ender(kw)){
+            char low[32];
+            snprintf(low, sizeof(low), "%s", kw);
+            for(char *q = low; *q; q++) *q = (char)tolower((unsigned char)*q);
+            mini_fail(c, "'%s' without a matching opener", low);
+        }
+        if(strcmp(kw, ".IF") == 0){
+            MTok toks[MINI_MAX_TOK];
+            int n = mini_lex(c, p->f->lines[li], toks);
+            if(n < 2 || toks[n-1].k != MT_DOT || strcmp(toks[n-1].s, ".THEN") != 0)
+                mini_fail(c, "'.if' must end with '.then'");
+            MStmt *s = ms_new(MS_IF, p, li);
+            MXP ep; ep.t = toks + 1; ep.n = n - 2; ep.i = 0; ep.c = c;
+            s->val = mxp_full(&ep);
+            p->i = li + 1;
+            msp_block(p, ".ELSE", ".ENDIF", &s->body, &s->nbody);
+            if(p->i >= p->f->nlines){
+                c->file = s->file; c->line = s->line;
+                mini_fail(c, "'.if' is never closed with '.endif'");
+            }
+            {
+                char kw2[32];
+                mini_dotkw(p->f->lines[p->i], kw2, sizeof(kw2));
+                if(strcmp(kw2, ".ELSE") == 0){
+                    MTok t2[MINI_MAX_TOK];
+                    c->file = p->f->lfiles[p->i]; c->line = p->f->llines[p->i];
+                    if(mini_lex(c, p->f->lines[p->i], t2) != 1)
+                        mini_fail(c, "unexpected text after '.else'");
+                    p->i++;
+                    msp_block(p, ".ENDIF", NULL, &s->body2, &s->nbody2);
+                    if(p->i >= p->f->nlines){
+                        c->file = s->file; c->line = s->line;
+                        mini_fail(c, "'.if' is never closed with '.endif'");
+                    }
+                }
+            }
+            p->i++;
+            ms_push(outv, outn, &cap, s);
+            continue;
+        }
+        if(strcmp(kw, ".WHILE") == 0){
+            MTok toks[MINI_MAX_TOK];
+            int n = mini_lex(c, p->f->lines[li], toks);
+            MStmt *s = ms_new(MS_WHILE, p, li);
+            MXP ep; ep.t = toks + 1; ep.n = n - 1; ep.i = 0; ep.c = c;
+            s->val = mxp_full(&ep);
+            p->i = li + 1;
+            msp_block(p, ".ENDWHILE", NULL, &s->body, &s->nbody);
+            if(p->i >= p->f->nlines){
+                c->file = s->file; c->line = s->line;
+                mini_fail(c, "'.while' is never closed with '.endwhile'");
+            }
+            p->i++;
+            ms_push(outv, outn, &cap, s);
+            continue;
+        }
+        if(strcmp(kw, ".FOR") == 0){
+            MTok toks[MINI_MAX_TOK];
+            int n = mini_lex(c, p->f->lines[li], toks);
+            if(n < 4 || toks[1].k != MT_NAME)
+                mini_fail(c, "'.for' needs 'variable in range(...)'");
+            MStmt *s = ms_new(MS_FOR, p, li);
+            s->name = mini_strdup(toks[1].s);
+            if(!(toks[2].k == MT_NAME && strcmp(toks[2].s, "in") == 0) ||
+               !(toks[3].k == MT_NAME && strcmp(toks[3].s, "range") == 0))
+                mini_fail(c, "'.for %s' must be followed by 'in range(...)'", s->name);
+            MXP ep; ep.t = toks + 4; ep.n = n - 4; ep.i = 0; ep.c = c;
+            mxp_arglist(&ep, &s->args, &s->nargs);
+            if(!mxp_end(&ep)) mini_fail(c, "unexpected text after 'range(...)'");
+            if(s->nargs < 1 || s->nargs > 3)
+                mini_fail(c, "range() takes 1 to 3 arguments, got %d", s->nargs);
+            p->i = li + 1;
+            msp_block(p, ".NEXT", NULL, &s->body, &s->nbody);
+            if(p->i >= p->f->nlines){
+                c->file = s->file; c->line = s->line;
+                mini_fail(c, "'.for' is never closed with '.next'");
+            }
+            p->i++;
+            ms_push(outv, outn, &cap, s);
+            continue;
+        }
+        ms_push(outv, outn, &cap, msp_simple(p, li));
+        p->i = li + 1;
+    }
+}
+
+/* 本体の行を文の木にする。エラーは *errout に書いて 0 を返す。 */
+static int mini_compile_func(MiniFunc *f, char *errout, size_t esz){
+    MiniCtx c;
+    memset(&c, 0, sizeof(c));
+    c.file = f->file; c.line = f->line;
+    c.jb_active = 1;
+    if(setjmp(c.jb)){
+        snprintf(errout, esz, "%s", c.err);
+        f->body = NULL; f->nbody = 0;
+        return 0;
+    }
+    MSP p; p.f = f; p.i = 0; p.c = &c;
+    msp_block(&p, NULL, NULL, &f->body, &f->nbody);
+    if(p.i < f->nlines){
+        c.file = f->lfiles[p.i]; c.line = f->llines[p.i];
+        mini_fail(&c, "'%s' has no matching opener", f->lines[p.i]);
+    }
+    return 1;
+}
+
+/* --------------------------- 実行 --------------------------- */
+
+typedef struct { char *name; MiniVal v; } MiniBind;
+
+typedef struct {
+    MiniBind  *vars;   int nvars, cvars;
+    char     **nonloc; int nnonloc, cnonloc;
+    MiniFunc  *func;
+} MiniFrame;
+
+typedef struct {
+    Assembler *asmb;
+    MiniCtx    c;
+    IntVec     out;
+    long       steps;
+    MiniFrame *frames; int nframes, cframes;
+    int        returning;
+} MiniRun;
+
+static MiniVal mini_eval(MiniRun *r, MExpr *e);
+static void mini_exec_block(MiniRun *r, MStmt **body, int n);
+
+static void mini_at(MiniRun *r, MStmt *s){ r->c.file = s->file; r->c.line = s->line; }
+
+static long long mini_to_ll(MiniRun *r, uint256_t v){
+    if(u256_is_neg256(v)){
+        uint256_t p = u256_neg(v);
+        if(u256_nonneg_gt_i64(p, 0x7fffffffffffffffLL))
+            mini_fail(&r->c, "value is out of range for this use");
+        return -(long long)u256_to_u64(p);
+    }
+    if(u256_nonneg_gt_i64(v, 0x7fffffffffffffffLL))
+        mini_fail(&r->c, "value is out of range for this use");
+    return (long long)u256_to_u64(v);
+}
+
+static uint256_t mini_need_num(MiniRun *r, MiniVal v, const char *what){
+    if(v.is_arr){
+        mini_val_free(&v);
+        mini_fail(&r->c, "%s must be a number, not an array", what);
+    }
+    return v.num;
+}
+
+static MiniFrame *mini_frame_for(MiniRun *r, const char *name, int *found){
+    MiniFrame *top = &r->frames[r->nframes - 1];
+    *found = 1;
+    int is_nl = 0;
+    for(int i = 0; i < top->nnonloc; i++)
+        if(strcmp(top->nonloc[i], name) == 0){ is_nl = 1; break; }
+    if(!is_nl) return top;
+    for(int fi = r->nframes - 2; fi >= 0; fi--)
+        for(int i = 0; i < r->frames[fi].nvars; i++)
+            if(strcmp(r->frames[fi].vars[i].name, name) == 0) return &r->frames[fi];
+    *found = 0;
+    return NULL;
+}
+
+static MiniBind *mini_find(MiniFrame *fr, const char *name){
+    for(int i = 0; i < fr->nvars; i++)
+        if(strcmp(fr->vars[i].name, name) == 0) return &fr->vars[i];
+    return NULL;
+}
+
+static MiniBind *mini_bind_new(MiniFrame *fr, const char *name){
+    if(fr->nvars >= fr->cvars){
+        fr->cvars = fr->cvars ? fr->cvars * 2 : 8;
+        fr->vars = realloc(fr->vars, (size_t)fr->cvars * sizeof(MiniBind));
+        if(!fr->vars){ perror("realloc"); exit(1); }
+    }
+    MiniBind *b = &fr->vars[fr->nvars++];
+    memset(b, 0, sizeof(*b));
+    b->name = mini_strdup(name);
+    return b;
+}
+
+static MiniVal mini_get(MiniRun *r, const char *name){
+    int found;
+    MiniFrame *fr = mini_frame_for(r, name, &found);
+    if(!found)
+        mini_fail(&r->c, "'.nonlocal %s' found no enclosing definition of '%s'", name, name);
+    MiniBind *b = mini_find(fr, name);
+    if(!b) mini_fail(&r->c, "'%s' is used before it is set", name);
+    return mini_val_copy(&b->v);
+}
+
+static void mini_set(MiniRun *r, const char *name, MiniVal v){
+    int found;
+    MiniFrame *fr = mini_frame_for(r, name, &found);
+    if(!found){
+        mini_val_free(&v);
+        mini_fail(&r->c, "'.nonlocal %s' found no enclosing definition of '%s'", name, name);
+    }
+    MiniBind *b = mini_find(fr, name);
+    if(!b) b = mini_bind_new(fr, name);
+    else mini_val_free(&b->v);
+    b->v = v;
+}
+
+/* 代入で伸ばすため、変数そのものへの参照を得る。 */
+static MiniBind *mini_ref(MiniRun *r, const char *name){
+    int found;
+    MiniFrame *fr = mini_frame_for(r, name, &found);
+    if(!found)
+        mini_fail(&r->c, "'.nonlocal %s' found no enclosing definition of '%s'", name, name);
+    MiniBind *b = mini_find(fr, name);
+    if(!b) mini_fail(&r->c, "'%s' is used before it is set", name);
+    return b;
+}
+
+static uint256_t mini_bool(int b){ return b ? u256_one() : u256_zero(); }
+
+static uint256_t mini_binop(MiniRun *r, const char *op, uint256_t a, uint256_t b){
+    if(strcmp(op, "+") == 0) return u256_add(a, b);
+    if(strcmp(op, "-") == 0) return u256_sub(a, b);
+    if(strcmp(op, "*") == 0) return u256_mul(a, b);
+    if(strcmp(op, "/") == 0){
+        if(u256_is_zero(b)) mini_fail(&r->c, "division by zero");
+        return u256_truncdiv(a, b);
+    }
+    if(strcmp(op, "%") == 0){
+        if(u256_is_zero(b)) mini_fail(&r->c, "division by zero");
+        /* 0 方向への切り捨て除算と対になる剰余（符号は被除数に従う）。
+         * u256_mod は floor 除算が前提で符号の扱いが違うので使わない。 */
+        return u256_sub(a, u256_mul(u256_truncdiv(a, b), b));
+    }
+    if(strcmp(op, "**") == 0){
+        if(u256_is_neg256(b)) mini_fail(&r->c, "negative exponent");
+        return u256_pow(a, b);
+    }
+    if(strcmp(op, "<<") == 0){
+        if(u256_is_neg256(b)) return u256_zero();
+        if(u256_nonneg_gt_i64(b, 255)) return u256_zero();
+        return u256_shl(a, (int)u256_to_u64(b));
+    }
+    if(strcmp(op, ">>") == 0){
+        if(u256_is_neg256(b)) return u256_zero();
+        if(u256_nonneg_gt_i64(b, 255))
+            return u256_is_neg256(a) ? u256_neg(u256_one()) : u256_zero();
+        return u256_sar(a, (int)u256_to_u64(b));
+    }
+    if(strcmp(op, "&") == 0) return u256_and(a, b);
+    if(strcmp(op, "|") == 0) return u256_or(a, b);
+    if(strcmp(op, "^") == 0) return u256_xor(a, b);
+    if(strcmp(op, "<") == 0)  return mini_bool(u256_lt_signed(a, b));
+    if(strcmp(op, ">") == 0)  return mini_bool(u256_gt_signed(a, b));
+    if(strcmp(op, "<=") == 0) return mini_bool(u256_le_signed(a, b));
+    if(strcmp(op, ">=") == 0) return mini_bool(u256_ge_signed(a, b));
+    if(strcmp(op, "==") == 0) return mini_bool(u256_eq(a, b));
+    return mini_bool(!u256_eq(a, b));
+}
+
+static MiniVal mini_eval(MiniRun *r, MExpr *e){
+    switch(e->k){
+    case MX_NUM: return mini_num(e->num);
+    case MX_VAR: return mini_get(r, e->name);
+    case MX_ARRLIT: {
+        MiniVal v; memset(&v, 0, sizeof(v));
+        v.is_arr = 1;
+        mini_arr_reserve(&v, e->nitems > 0 ? e->nitems : 1);
+        for(int i = 0; i < e->nitems; i++)
+            v.arr[v.n++] = mini_need_num(r, mini_eval(r, e->items[i]), "an array element");
+        return v;
+    }
+    case MX_LEN: {
+        MiniVal b = mini_eval(r, e->a);
+        if(!b.is_arr){ mini_val_free(&b); mini_fail(&r->c, "'.len' needs an array"); }
+        int n = b.n;
+        mini_val_free(&b);
+        return mini_num(u256_from_u64((uint64_t)n));
+    }
+    case MX_INDEX: {
+        MiniVal b = mini_eval(r, e->a);
+        if(!b.is_arr){ mini_val_free(&b); mini_fail(&r->c, "only an array can be indexed"); }
+        uint256_t iv = mini_need_num(r, mini_eval(r, e->b), "an index");
+        long long i = mini_to_ll(r, iv);
+        /* 範囲外の読み出しは 0。配列は書き込みで伸びるので読みでは伸ばさない。 */
+        uint256_t out = (i < 0 || i >= b.n) ? u256_zero() : b.arr[i];
+        mini_val_free(&b);
+        return mini_num(out);
+    }
+    case MX_SLICE: {
+        MiniVal b = mini_eval(r, e->a);
+        if(!b.is_arr){ mini_val_free(&b); mini_fail(&r->c, "only an array can be sliced"); }
+        long long n = b.n;
+        long long lo = 0, hi = n;
+        if(e->b) lo = mini_to_ll(r, mini_need_num(r, mini_eval(r, e->b), "a slice bound"));
+        if(e->c) hi = mini_to_ll(r, mini_need_num(r, mini_eval(r, e->c), "a slice bound"));
+        if(lo < 0) lo = 0;
+        if(lo > n) lo = n;
+        if(hi < lo) hi = lo;
+        if(hi > n) hi = n;
+        MiniVal v; memset(&v, 0, sizeof(v));
+        v.is_arr = 1;
+        if(hi > lo){
+            mini_arr_reserve(&v, (int)(hi - lo));
+            for(long long i = lo; i < hi; i++) v.arr[v.n++] = b.arr[i];
+        }
+        mini_val_free(&b);
+        return v;
+    }
+    case MX_UN: {
+        uint256_t a = mini_need_num(r, mini_eval(r, e->a), "an operand");
+        if(strcmp(e->op, "-") == 0) return mini_num(u256_neg(a));
+        if(strcmp(e->op, "+") == 0) return mini_num(a);
+        if(strcmp(e->op, "~") == 0) return mini_num(u256_not(a));
+        return mini_num(mini_bool(u256_is_zero(a)));
+    }
+    case MX_BIN: {
+        if(strcmp(e->op, "&&") == 0){
+            uint256_t a = mini_need_num(r, mini_eval(r, e->a), "an operand");
+            if(u256_is_zero(a)) return mini_num(u256_zero());
+            uint256_t b = mini_need_num(r, mini_eval(r, e->b), "an operand");
+            return mini_num(mini_bool(!u256_is_zero(b)));
+        }
+        if(strcmp(e->op, "||") == 0){
+            uint256_t a = mini_need_num(r, mini_eval(r, e->a), "an operand");
+            if(!u256_is_zero(a)) return mini_num(u256_one());
+            uint256_t b = mini_need_num(r, mini_eval(r, e->b), "an operand");
+            return mini_num(mini_bool(!u256_is_zero(b)));
+        }
+        uint256_t a = mini_need_num(r, mini_eval(r, e->a), "an operand");
+        uint256_t b = mini_need_num(r, mini_eval(r, e->b), "an operand");
+        return mini_num(mini_binop(r, e->op, a, b));
+    }
+    }
+    mini_fail(&r->c, "bad expression");
+    return mini_num(u256_zero());
+}
+
+static void mini_tick(MiniRun *r){
+    if(++r->steps > MINI_MAX_STEPS)
+        mini_fail(&r->c, "mini language ran more than %d statements; "
+                  "assuming a runaway loop", MINI_MAX_STEPS);
+}
+
+static MiniFunc *mini_lookup(MiniRun *r, const char *name){
+    MiniFunc *f = r->nframes ? r->frames[r->nframes - 1].func : NULL;
+    while(f){
+        for(int i = 0; i < f->nchildren; i++)
+            if(strcmp(f->children[i]->name, name) == 0) return f->children[i];
+        f = f->parent;
+    }
+    for(int i = 0; i < r->asmb->st.funcs.len; i++)
+        if(strcmp(r->asmb->st.funcs.data[i]->name, name) == 0)
+            return r->asmb->st.funcs.data[i];
+    mini_fail(&r->c, "no function named '%s'", name);
+    return NULL;
+}
+
+static void mini_call_func(MiniRun *r, MiniFunc *f, MiniVal *args, int nargs);
+
+static void mini_exec(MiniRun *r, MStmt *s){
+    mini_at(r, s);
+    mini_tick(r);
+    switch(s->k){
+    case MS_ASSIGN: {
+        MiniVal v = mini_eval(r, s->val);
+        if(!s->idx){ mini_set(r, s->name, v); return; }
+        uint256_t iv = mini_need_num(r, mini_eval(r, s->idx), "an index");
+        long long i = mini_to_ll(r, iv);
+        if(i < 0){ mini_val_free(&v); mini_fail(&r->c, "negative index %lld in assignment", i); }
+        if(i >= MINI_MAX_ARRAY){
+            mini_val_free(&v);
+            mini_fail(&r->c, "array index %lld exceeds the maximum length %d",
+                      i, MINI_MAX_ARRAY);
+        }
+        uint256_t elem = mini_need_num(r, v, "an array element");
+        MiniBind *b = mini_ref(r, s->name);
+        if(!b->v.is_arr) mini_fail(&r->c, "'%s' is not an array", s->name);
+        if(i >= b->v.n){
+            mini_arr_reserve(&b->v, (int)i + 1);
+            for(int q = b->v.n; q <= (int)i; q++) b->v.arr[q] = u256_zero();
+            b->v.n = (int)i + 1;
+        }
+        b->v.arr[i] = elem;
+        return;
+    }
+    case MS_EMIT:
+        for(int i = 0; i < s->nargs; i++){
+            uint256_t x = mini_need_num(r, mini_eval(r, s->args[i]), "'.emit'");
+            if(r->out.len >= MINI_MAX_EMIT)
+                mini_fail(&r->c, "'.emit' produced more than %d words", MINI_MAX_EMIT);
+            iv_push(&r->out, x);
+        }
+        return;
+    case MS_CALL: {
+        MiniFunc *f = mini_lookup(r, s->name);
+        MiniVal *vals = s->nargs ? mini_alloc((size_t)s->nargs * sizeof(MiniVal)) : NULL;
+        for(int i = 0; i < s->nargs; i++) vals[i] = mini_eval(r, s->args[i]);
+        mini_at(r, s);
+        mini_call_func(r, f, vals, s->nargs);
+        for(int i = 0; i < s->nargs; i++) mini_val_free(&vals[i]);
+        free(vals);
+        return;
+    }
+    case MS_RETURN:
+        r->returning = 1;
+        return;
+    case MS_NONLOCAL: {
+        MiniFrame *top = &r->frames[r->nframes - 1];
+        for(int i = 0; i < s->nnames; i++){
+            if(mini_find(top, s->names[i]))
+                mini_fail(&r->c, "'%s' is already local; '.nonlocal' must come "
+                          "before it is set", s->names[i]);
+            if(top->nnonloc >= top->cnonloc){
+                top->cnonloc = top->cnonloc ? top->cnonloc * 2 : 8;
+                top->nonloc = realloc(top->nonloc, (size_t)top->cnonloc * sizeof(char*));
+                if(!top->nonloc){ perror("realloc"); exit(1); }
+            }
+            top->nonloc[top->nnonloc++] = mini_strdup(s->names[i]);
+        }
+        return;
+    }
+    case MS_IF: {
+        uint256_t cv = mini_need_num(r, mini_eval(r, s->val), "a condition");
+        if(!u256_is_zero(cv)) mini_exec_block(r, s->body, s->nbody);
+        else mini_exec_block(r, s->body2, s->nbody2);
+        return;
+    }
+    case MS_WHILE:
+        for(;;){
+            mini_at(r, s);
+            uint256_t cv = mini_need_num(r, mini_eval(r, s->val), "a condition");
+            if(u256_is_zero(cv)) break;
+            mini_tick(r);
+            mini_exec_block(r, s->body, s->nbody);
+            if(r->returning) return;
+        }
+        return;
+    case MS_FOR: {
+        long long v[3] = {0, 0, 0};
+        for(int i = 0; i < s->nargs; i++)
+            v[i] = mini_to_ll(r, mini_need_num(r, mini_eval(r, s->args[i]), "a range bound"));
+        long long start, stop, step;
+        if(s->nargs == 1){ start = 0; stop = v[0]; step = 1; }
+        else if(s->nargs == 2){ start = v[0]; stop = v[1]; step = 1; }
+        else { start = v[0]; stop = v[1]; step = v[2]; }
+        if(step == 0) mini_fail(&r->c, "range() step must not be zero");
+        for(long long i = start; step > 0 ? i < stop : i > stop; i += step){
+            mini_at(r, s);
+            mini_tick(r);
+            mini_set(r, s->name, mini_num(u256_from_i64(i)));
+            mini_exec_block(r, s->body, s->nbody);
+            if(r->returning) return;
+        }
+        return;
+    }
+    }
+}
+
+static void mini_exec_block(MiniRun *r, MStmt **body, int n){
+    for(int i = 0; i < n; i++){
+        mini_exec(r, body[i]);
+        if(r->returning) return;
+    }
+}
+
+static void mini_frame_clear(MiniFrame *fr){
+    for(int i = 0; i < fr->nvars; i++){
+        free(fr->vars[i].name);
+        mini_val_free(&fr->vars[i].v);
+    }
+    free(fr->vars);
+    for(int i = 0; i < fr->nnonloc; i++) free(fr->nonloc[i]);
+    free(fr->nonloc);
+    memset(fr, 0, sizeof(*fr));
+}
+
+static void mini_call_func(MiniRun *r, MiniFunc *f, MiniVal *args, int nargs){
+    if(r->nframes >= MINI_MAX_DEPTH)
+        mini_fail(&r->c, "call nesting deeper than %d; assuming runaway recursion",
+                  MINI_MAX_DEPTH);
+    if(nargs != f->nparams)
+        mini_fail(&r->c, "'%s' takes %d argument(s), got %d", f->name, f->nparams, nargs);
+    if(r->nframes >= r->cframes){
+        r->cframes = r->cframes ? r->cframes * 2 : 16;
+        r->frames = realloc(r->frames, (size_t)r->cframes * sizeof(MiniFrame));
+        if(!r->frames){ perror("realloc"); exit(1); }
+    }
+    MiniFrame *fr = &r->frames[r->nframes++];
+    memset(fr, 0, sizeof(*fr));
+    fr->func = f;
+    for(int i = 0; i < nargs; i++){
+        MiniBind *b = mini_bind_new(fr, f->params[i]);
+        b->v = mini_val_copy(&args[i]);
+    }
+    mini_exec_block(r, f->body, f->nbody);
+    r->returning = 0;
+    mini_frame_clear(&r->frames[r->nframes - 1]);
+    r->nframes--;
+}
+
+/* --------------------------- 関数表 --------------------------- */
+
+static void mini_expr_free(MExpr *e){
+    if(!e) return;
+    mini_expr_free(e->a); mini_expr_free(e->b); mini_expr_free(e->c);
+    for(int i = 0; i < e->nitems; i++) mini_expr_free(e->items[i]);
+    free(e->items);
+    free(e->name);
+    free(e);
+}
+
+static void mini_stmt_free(MStmt *s){
+    if(!s) return;
+    mini_expr_free(s->idx);
+    mini_expr_free(s->val);
+    for(int i = 0; i < s->nargs; i++) mini_expr_free(s->args[i]);
+    free(s->args);
+    for(int i = 0; i < s->nbody; i++) mini_stmt_free(s->body[i]);
+    free(s->body);
+    for(int i = 0; i < s->nbody2; i++) mini_stmt_free(s->body2[i]);
+    free(s->body2);
+    for(int i = 0; i < s->nnames; i++) free(s->names[i]);
+    free(s->names);
+    free(s->name);
+    free(s);
+}
+
+static void mini_func_free(MiniFunc *f){
+    if(!f) return;
+    for(int i = 0; i < f->nchildren; i++) mini_func_free(f->children[i]);
+    free(f->children);
+    for(int i = 0; i < f->nbody; i++) mini_stmt_free(f->body[i]);
+    free(f->body);
+    for(int i = 0; i < f->nlines; i++){ free(f->lines[i]); free(f->lfiles[i]); }
+    free(f->lines); free(f->lfiles); free(f->llines);
+    for(int i = 0; i < f->nparams; i++) free(f->params[i]);
+    free(f->params);
+    free(f->name); free(f->file);
+    free(f);
+}
+
+static void mfv_free(MiniFuncVec *v){
+    for(int i = 0; i < v->len; i++) mini_func_free(v->data[i]);
+    free(v->data);
+    mfv_init(v);
+}
+
+static MiniFunc *mfv_find(MiniFuncVec *v, const char *name){
+    for(int i = 0; i < v->len; i++)
+        if(strcmp(v->data[i]->name, name) == 0) return v->data[i];
+    return NULL;
+}
+
+/* 親が NULL ならトップレベル、そうでなければ親の children に入れる。
+ * 同名が既にあればそれを捨てて置き換える（後の定義が勝つ）。 */
+static MiniFunc *mini_func_new(Assembler *asmb, MiniFunc *parent, const char *name,
+                               const char *file, int line){
+    MiniFunc *f = mini_alloc(sizeof(MiniFunc));
+    f->name = mini_strdup(name);
+    f->file = mini_strdup(file);
+    f->line = line;
+    f->parent = parent;
+    if(parent){
+        for(int i = 0; i < parent->nchildren; i++){
+            if(strcmp(parent->children[i]->name, name) == 0){
+                mini_func_free(parent->children[i]);
+                parent->children[i] = f;
+                return f;
+            }
+        }
+        if(parent->nchildren >= parent->cchildren){
+            parent->cchildren = parent->cchildren ? parent->cchildren * 2 : 4;
+            parent->children = realloc(parent->children,
+                                       (size_t)parent->cchildren * sizeof(MiniFunc*));
+            if(!parent->children){ perror("realloc"); exit(1); }
+        }
+        parent->children[parent->nchildren++] = f;
+        return f;
+    }
+    {
+        MiniFuncVec *v = &asmb->st.funcs;
+        for(int i = 0; i < v->len; i++){
+            if(strcmp(v->data[i]->name, name) == 0){
+                mini_func_free(v->data[i]);
+                v->data[i] = f;
+                return f;
+            }
+        }
+        if(v->len >= v->cap){
+            v->cap = v->cap ? v->cap * 2 : 8;
+            v->data = realloc(v->data, (size_t)v->cap * sizeof(MiniFunc*));
+            if(!v->data){ perror("realloc"); exit(1); }
+        }
+        v->data[v->len++] = f;
+    }
+    return f;
+}
+
+static void mini_func_addparam(MiniFunc *f, const char *p){
+    f->params = realloc(f->params, (size_t)(f->nparams + 1) * sizeof(char*));
+    if(!f->params){ perror("realloc"); exit(1); }
+    f->params[f->nparams++] = mini_strdup(p);
+}
+
+static void mini_func_addline(MiniFunc *f, const char *text, const char *file, int line){
+    if(f->nlines >= f->clines){
+        f->clines = f->clines ? f->clines * 2 : 16;
+        f->lines  = realloc(f->lines,  (size_t)f->clines * sizeof(char*));
+        f->lfiles = realloc(f->lfiles, (size_t)f->clines * sizeof(char*));
+        f->llines = realloc(f->llines, (size_t)f->clines * sizeof(int));
+        if(!f->lines || !f->lfiles || !f->llines){ perror("realloc"); exit(1); }
+    }
+    f->lines[f->nlines]  = mini_strdup(text);
+    f->lfiles[f->nlines] = mini_strdup(file);
+    f->llines[f->nlines] = line;
+    f->nlines++;
+}
+
+/* 読み込みの最後に、集めた本体をまとめて文の木にする。 */
+static void mini_compile_all(MiniFunc **v, int n){
+    for(int i = 0; i < n; i++){
+        char err[512];
+        if(!mini_compile_func(v[i], err, sizeof(err)))
+            axx_diagf(1, 0, " error - %s\n", err);
+        mini_compile_all(v[i]->children, v[i]->nchildren);
+    }
+}
+
+/* --------------------------- binary_list からの呼び出し --------------------------- */
+
+/* `.call 名前(引数, …)` を実行して objl に積む。戻り値は次に読む位置。 */
+static int mini_call_binary(Assembler *asmb, const char *s, int idx, IntVec *objl){
+    AsmState *st = &asmb->st;
+    int slen = (int)strlen(s);
+    /* 命令長を測るだけの試し打ちでも makeobj は走るので、そのときは黙る。 */
+    int quiet = st->pass1_size_mode;
+
+    idx += 5;
+    idx = axx_skipspc(s, idx);
+    int j = idx;
+    while(j < slen && (isalnum((unsigned char)s[j]) || s[j] == '_')) j++;
+    int namelen = j - idx;
+    char name[128];
+    if(namelen <= 0 || namelen >= (int)sizeof(name)){
+        if(!quiet) axx_diagf(1, 0, " error - '.call' needs 'name(argument, ...)'.\n");
+        return slen;
+    }
+    memcpy(name, s + idx, (size_t)namelen); name[namelen] = 0;
+    idx = axx_skipspc(s, j);
+    if(idx >= slen || s[idx] != '('){
+        if(!quiet) axx_diagf(1, 0, " error - '.call' needs 'name(argument, ...)'.\n");
+        return slen;
+    }
+    int depth = 0, k = idx;
+    while(k < slen){
+        if(s[k] == '(' || s[k] == '[') depth++;
+        else if(s[k] == ')' || s[k] == ']'){ depth--; if(depth == 0) break; }
+        k++;
+    }
+    if(depth != 0 || k >= slen){
+        if(!quiet) axx_diagf(1, 0, " error - '.call %s': unbalanced parentheses.\n", name);
+        return slen;
+    }
+    int arglen = k - idx - 1;
+    char *argtext = mini_alloc((size_t)arglen + 2);
+    memcpy(argtext, s + idx + 1, (size_t)arglen);
+    argtext[arglen] = 0;
+    idx = k + 1;
+
+    MiniFunc *f = mfv_find(&st->funcs, name);
+    if(!f){
+        if(!quiet)
+            axx_diagf(1, 0, " error - '.call': no function named '%s' (define it with "
+                       "'.func::%s:: ... .return').\n", name, name);
+        free(argtext);
+        return idx;
+    }
+
+    MiniVal *args = NULL;
+    int nargs = 0, cargs = 0;
+    int a = 0, alen = (int)strlen(argtext);
+    while(a < alen){
+        if(argtext[a] == ','){ a++; continue; }
+        int io;
+        uint256_t v = expr_expression_pat(asmb, argtext, a, &io);
+        if(io <= a) break;
+        a = io;
+        /* 未定義ラベル由来の巨大な番兵で反復回数が爆発しないよう 0 を渡す。 */
+        if(u256_is_undef_derived(v)) v = u256_zero();
+        if(nargs >= cargs){
+            cargs = cargs ? cargs * 2 : 8;
+            args = realloc(args, (size_t)cargs * sizeof(MiniVal));
+            if(!args){ perror("realloc"); exit(1); }
+        }
+        args[nargs++] = mini_num(v);
+        if(a < alen && argtext[a] == ','){ a++; continue; }
+        break;
+    }
+    free(argtext);
+
+    MiniRun r;
+    memset(&r, 0, sizeof(r));
+    r.asmb = asmb;
+    iv_init(&r.out);
+    r.c.file = f->file;
+    r.c.line = f->line;
+    r.c.jb_active = 1;
+    if(setjmp(r.c.jb) == 0){
+        mini_call_func(&r, f, args, nargs);
+        for(int i = 0; i < r.out.len; i++) iv_push(objl, r.out.data[i]);
+    } else {
+        if(!quiet) axx_diagf(1, 0, " error - %s\n", r.c.err);
+    }
+    for(int i = 0; i < r.nframes; i++) mini_frame_clear(&r.frames[i]);
+    free(r.frames);
+    free(r.out.data);
+    for(int i = 0; i < nargs; i++) mini_val_free(&args[i]);
+    free(args);
+    return idx;
+}
+
 /* 前後の空白を落とす（s は書き換え可能であること）。 */
 static char *pat_trim(char *s){
     char *p = s + axx_skipspc(s, 0);
@@ -5483,6 +6789,7 @@ static void readpat(Assembler *asmb, const char *fn){
     if(asmb->st.pat_include_depth == 1){
         macro_reset_pass_pattern();
         subv_free(&asmb->st.subs);
+        mfv_free(&asmb->st.funcs);
     }
 
     int nexp = 0;
@@ -5516,6 +6823,8 @@ static void readpat(Assembler *asmb, const char *fn){
     int in_block_comment = 0;
     int legacy_chain = 0;
     SubDef *cur_sub = NULL;
+    MiniFunc *func_stack[64];
+    int nfunc_stack = 0;
     for(int li = 0; li < nexp; li++){
         size_t need = strlen(exp[li]) + 1;
         if(need > lcap){
@@ -5555,6 +6864,75 @@ static void readpat(Assembler *asmb, const char *fn){
         int l=(int)strlen(line);
         while(l>0&&(line[l-1]=='\n'||line[l-1]=='\r')) line[--l]=0;
         axx_reduce_spaces(line);
+
+        /* ミニ言語の `.func` 本体は `::` で分解せず、行のまま集める。 */
+        {
+            char dk[32];
+            mini_dotkw(line, dk, sizeof(dk));
+            if(nfunc_stack > 0 || strcmp(dk, ".FUNC") == 0){
+                if(strcmp(dk, ".FUNC") == 0){
+                    if(nfunc_stack >= (int)(sizeof(func_stack)/sizeof(func_stack[0]))){
+                        axx_diagf(1, 0, " error - '.func' nesting is deeper than %d.\n",
+                                   (int)(sizeof(func_stack)/sizeof(func_stack[0])));
+                        continue;
+                    }
+                    size_t hsz = strlen(line) + 1;
+                    char *hbuf = malloc(3 * hsz);
+                    if(!hbuf){ perror("malloc"); exit(1); }
+                    char *hf[3];
+                    for(int q=0;q<3;q++){ hf[q] = hbuf + (size_t)q*hsz; hf[q][0] = 0; }
+                    int hn = 0, hi = 0;
+                    while(1){
+                        hi = axx_get_params1(line, hi, hf[hn], hsz);
+                        hn++;
+                        if(hi >= (int)strlen(line) || hn >= 3) break;
+                    }
+                    char *nm = (hn > 1) ? pat_trim(hf[1]) : (char*)"";
+                    int ok = is_sub_name(nm);
+                    if(!ok)
+                        axx_diagf(1, 0, " error - '.func' needs a name made of letters, "
+                                   "digits and '_': '%s'\n", nm);
+                    MiniFunc *parent = nfunc_stack ? func_stack[nfunc_stack-1] : NULL;
+                    MiniFunc *nf = mini_func_new(asmb, parent, ok ? nm : "?", fn, li + 1);
+                    if(ok && hn > 2){
+                        char *ps = hf[2];
+                        char *tok = strtok(ps, ",");
+                        while(tok){
+                            char *pn = pat_trim(tok);
+                            if(!is_sub_name(pn)){
+                                axx_diagf(1, 0, " error - '.func::%s': bad parameter "
+                                           "name '%s'\n", nm, pn);
+                            } else {
+                                mini_func_addparam(nf, pn);
+                            }
+                            tok = strtok(NULL, ",");
+                        }
+                    }
+                    free(hbuf);
+                    func_stack[nfunc_stack++] = nf;
+                    continue;
+                }
+                MiniFunc *cur = func_stack[nfunc_stack-1];
+                if(strcmp(dk, ".RETURN") == 0 && cur->depth == 0){ nfunc_stack--; continue; }
+                if(strcmp(dk, ".IF") == 0 || strcmp(dk, ".FOR") == 0
+                   || strcmp(dk, ".WHILE") == 0){
+                    cur->depth++;
+                } else if(strcmp(dk, ".ENDIF") == 0 || strcmp(dk, ".NEXT") == 0
+                          || strcmp(dk, ".ENDWHILE") == 0){
+                    cur->depth--;
+                    if(cur->depth < 0){
+                        axx_diagf(1, 0, " error - '.func::%s': %s without a matching "
+                                   "block opener.\n", cur->name, dk);
+                        cur->depth = 0;
+                    }
+                }
+                {
+                    int nb = axx_skipspc(line, 0);
+                    if(line[nb]) mini_func_addline(cur, line, fn, li + 1);
+                }
+                continue;
+            }
+        }
 
         char uline[16]={0};
         int si=axx_skipspc(line,0);
@@ -5654,7 +7032,15 @@ static void readpat(Assembler *asmb, const char *fn){
         axx_diagf(1, 0, " error - pattern file '%s' ends while sub table '%s' is "
                    "still open (missing '.return').\n", fn, cur_sub->name);
     }
-    if(asmb->st.pat_include_depth == 1) check_sub_refs(asmb);
+    while(nfunc_stack > 0){
+        axx_diagf(1, 0, " error - pattern file '%s' ends while function '%s' is "
+                   "still open (missing '.return').\n",
+                   fn, func_stack[--nfunc_stack]->name);
+    }
+    if(asmb->st.pat_include_depth == 1){
+        check_sub_refs(asmb);
+        mini_compile_all(asmb->st.funcs.data, asmb->st.funcs.len);
+    }
     free(rest_has_close);
     free(line);
     pat_macro_expand_free(exp, nexp);
@@ -5872,6 +7258,15 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         }
         int semicolon=0;
         if(s[idx]==';'){ semicolon=1; idx++; }
+        if(s[idx]=='.' && axx_upper_char(s[idx+1])=='C' && axx_upper_char(s[idx+2])=='A'
+           && axx_upper_char(s[idx+3])=='L' && axx_upper_char(s[idx+4])=='L'
+           && !(isalnum((unsigned char)s[idx+5]) || s[idx+5]=='_')){
+            if(semicolon && !st->pass1_size_mode)
+                axx_diagf(1, 0, " error - ';' cannot be applied to '.call'.\n");
+            idx = mini_call_binary(asmb, s, idx, objl);
+            if(s[idx]==','){ idx++; continue; }
+            break;
+        }
         /* ワード番号は「いま objl に積まれている数」。`;` 付きで出力されなかった
          * 要素は番号を消費しない（axx.py の `_elf_current_word_idx = len(objl)`）。 */
         int cur_widx = objl->len;
