@@ -635,13 +635,39 @@ Notes.
   `.sub::cc` holding `NZ::0` / `Z::0x08`, `JMP!S{{cc}}c !e` matches `jmpz 0x1234`.
 - The value list is evaluated **after** the match, so it may use variables the
   entry pattern captured: `R!n::n` binds the captured digit.
-- Sub tables may reference other sub tables; the inner value is bound first, so
-  the outer value list can use it.
+- The entries live in the sub table only; they are never matched as ordinary
+  pattern lines.
 - The whole pattern file is read before references are resolved, so a table may
   be defined after its use. Unknown table names and circular references are
   reported once when the pattern file is read.
-- A `.sub` block may not be nested inside another; the entries live in the sub
-  table only and are never matched as ordinary pattern lines.
+
+**Nesting.** A `.sub` block may **not** be written inside another `.sub` block;
+that is an error. Nesting is expressed instead by letting an entry pattern
+reference a second table, which is expanded exactly like a reference in an
+ordinary pattern:
+
+```
+LD!S{{outer}}a :: 0x10,a
+.sub::outer
+A!S{{inner}}b::b
+B!S{{inner}}b::b+0x40
+.return
+.sub::inner
+1::0x01
+2::0x02
+.return
+```
+
+```
+lda1                 -> 10 01
+ldb2                 -> 10 42
+```
+
+The inner variable is bound before the outer one, so an outer value list may use
+it — above, `b` is the inner value and the outer entry adds `0x40` to it.
+
+A chain of references is expanded at most **8** deep. A longer chain is not
+expanded, and the line simply fails to match.
 
 ### 3.8 Optional parts (`[[ ]]`)
 
