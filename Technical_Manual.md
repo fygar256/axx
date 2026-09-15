@@ -938,6 +938,9 @@ primes 50            -> 02 03 05 07 0b 0d 11 13 17 1d 1f 25 29 2b 2f
 collatz 27           -> 6f
 ```
 
+The same material is kept as a standalone document in `MINI.md` (Japanese) and
+`mini_en.md` (English).
+
 #### Limits
 
 The language is Turing complete, so a buggy pattern file could otherwise hang
@@ -1816,7 +1819,8 @@ reflects where the work has gone, not the limit of what axx can describe.
 | File | Contents |
 |---|---|
 | `MACRO.md` / `macro_en.md` | Macro layer reference (Japanese / English). Same material as section 7 |
-| `axx_introduction_paper.md` / `_en.md` | Introduction paper: the design rationale behind the free-syntax pattern language, the specificity score, and the deliberate Turing incompleteness |
+| `MINI.md` / `mini_en.md` | Mini language reference (Japanese / English). Same material as section 3.15 |
+| `axx_introduction_paper.md` / `_en.md` | Introduction paper: the design rationale behind the free-syntax pattern language, the specificity score, and the separation of computational power from the declarative core |
 | `axxsemantics` | A denotational-semantics formalization of axx, including relaxation read as a fixed point over the label environment. The formulas in it are that document's own construction, not an official specification |
 | `FILE_DESCRIPTION` | One-line description of every file |
 | `format_of_exp_imp_file` | Export/import file format |
