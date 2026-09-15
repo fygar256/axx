@@ -4503,6 +4503,11 @@ static int dir_error(Assembler *asmb, const char *s){
     while(1){
         if(!buf[idx]) break;
         if(buf[idx]==','){idx++;continue;}
+        /* 破綻点修正: axx.py の error() は idx が全く進まなかった場合に
+         * ループを打ち切る（axx.py:3235-3236）。ここにその歯止めが無かった
+         * ため、式評価器が1文字も消費できないトークン（例: 単独の ')'）で
+         * 無限ループに陥っていた（axx.py はこの歯止めで即座に打ち切る）。 */
+        int idx_before = idx;
         int io;
         int prev_flt = st->exp_typ_float;
         st->exp_typ_float = 1;
@@ -4512,6 +4517,7 @@ static int dir_error(Assembler *asmb, const char *s){
         if(buf[idx]==';') idx++;
         uint256_t t=expr_expression_pat(asmb,buf,idx,&io);
         idx=io;
+        if(idx <= idx_before) break;
         if((should_report_errors(st))&&!u256_is_zero(u)){
             int64_t tc=u256_to_i64(t);
             fprintf(stderr,"Line %d Error code %lld ",(int)st->ln,(long long)tc);
@@ -10423,6 +10429,15 @@ static void setpatsymbols(Assembler *asmb){
     smap_free(&fresh);
 }
 
+/* imp_label の16進フィールド検査で使う。axx.py の int(s,16) は前後の空白を
+ * 許容しつつも、それ以外の余分な文字が混じっていれば ValueError にする。
+ * strtoull は末尾を切り詰めるだけなので、endp から先が空白だけであることを
+ * 別途確認する。 */
+static int hexfield_fully_consumed(const char *endp){
+    while(*endp==' '||*endp=='\t') endp++;
+    return *endp=='\0';
+}
+
 static int imp_label(Assembler *asmb, const char *l){
 
     char buf[4096];
@@ -10444,10 +10459,15 @@ static int imp_label(Assembler *asmb, const char *l){
     if(nfields >= 3){
         const char *sname = fields[0];
         char *endp;
+        /* 破綻点修正: strtoull は末尾に余分な非16進文字があっても、先頭が
+         * 数字であれば途中までを黙って解釈して成功扱いにする。axx.py の
+         * int(s,16) はフィールド全体が正当な16進数でなければ ValueError に
+         * なりインポート行ごと捨てる。endp が文字列末尾まで届いているかも
+         * 確認しないと、壊れた値をそのまま採用して「成功」してしまう。 */
         uint64_t start = strtoull(fields[1], &endp, 16);
-        if(endp == fields[1]) return 0;
+        if(endp == fields[1] || !hexfield_fully_consumed(endp)) return 0;
         uint64_t size  = strtoull(fields[2], &endp, 16);
-        if(endp == fields[2]) return 0;
+        if(endp == fields[2] || !hexfield_fully_consumed(endp)) return 0;
         secrangevec_push(&asmb->imp_sections, sname,
                           u256_from_u64(start), u256_from_u64(size));
         return 1;
@@ -10471,7 +10491,7 @@ static int imp_label(Assembler *asmb, const char *l){
         if(!label[0]) return 0;
         char *endp;
         uint64_t v = strtoull(fields[1], &endp, 16);
-        if(endp == fields[1]) return 0;
+        if(endp == fields[1] || !hexfield_fully_consumed(endp)) return 0;
 
         const char *section = ".text";
         for(int i = 0; i < asmb->imp_sections.len; i++){
@@ -10558,14 +10578,22 @@ int main(int argc, char *argv[]){
     const char *macro_expand_dest=NULL;
     const char *pat_macro_expand_dest=NULL;
 
+    /* 破綻点修正: 値を取るオプションが `i+1<argc` だけを見て次の argv を
+     * 無条件に値として飲み込んでいたため、値を書き忘れて後ろに別のフラグが
+     * 続く場合（例: `-b -o`）、そのフラグ文字列がそのままファイル名として
+     * 採用されてしまっていた（axx.py の argparse は "expected one argument"
+     * で即座に拒否する）。同じファイル内で -p/-P に既にある「次の argv が
+     * '-' で始まっていたら値として食わない」規約を、値を取る単純なフラグ
+     * 全部に揃える。値を食わずに条件が外れれば、末尾の catch-all が
+     * "unknown option" として拒否する。 */
     for(int i=1;i<argc;i++){
-        if(strcmp(argv[i],"--osabi")==0&&i+1<argc){ strncpy(osabistr,argv[++i],sizeof(osabistr)-1); }
-        else if(strcmp(argv[i],"-b")==0&&i+1<argc){ strncpy(st->outfile,argv[++i],sizeof(st->outfile)-1); }
-        else if(strcmp(argv[i],"-e")==0&&i+1<argc){ strncpy(st->expfile,argv[++i],sizeof(st->expfile)-1); }
-        else if(strcmp(argv[i],"-E")==0&&i+1<argc){ strncpy(st->expfile_elf,argv[++i],sizeof(st->expfile_elf)-1); }
-        else if(strcmp(argv[i],"-i")==0&&i+1<argc){ strncpy(st->impfile,argv[++i],sizeof(st->impfile)-1); }
-        else if(strcmp(argv[i],"-o")==0&&i+1<argc){ strncpy(st->elf_objfile,argv[++i],sizeof(st->elf_objfile)-1); }
-        else if(strcmp(argv[i],"-f")==0&&i+1<argc){
+        if(strcmp(argv[i],"--osabi")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(osabistr,argv[++i],sizeof(osabistr)-1); }
+        else if(strcmp(argv[i],"-b")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(st->outfile,argv[++i],sizeof(st->outfile)-1); }
+        else if(strcmp(argv[i],"-e")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(st->expfile,argv[++i],sizeof(st->expfile)-1); }
+        else if(strcmp(argv[i],"-E")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(st->expfile_elf,argv[++i],sizeof(st->expfile_elf)-1); }
+        else if(strcmp(argv[i],"-i")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(st->impfile,argv[++i],sizeof(st->impfile)-1); }
+        else if(strcmp(argv[i],"-o")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(st->elf_objfile,argv[++i],sizeof(st->elf_objfile)-1); }
+        else if(strcmp(argv[i],"-f")==0&&i+1<argc&&argv[i+1][0]!='-'){
             const char *_fs = argv[++i];
             if(strcmp(_fs,"64")==0){ st->elf_class = 2; }
             else if(strcmp(_fs,"32")==0){ st->elf_class = 1; }
@@ -10574,7 +10602,7 @@ int main(int argc, char *argv[]){
                 return 1;
             }
         }
-        else if(strcmp(argv[i],"-m")==0&&i+1<argc){
+        else if(strcmp(argv[i],"-m")==0&&i+1<argc&&argv[i+1][0]!='-'){
             int _mval = atoi(argv[++i]);
             if(!elf_machine_find(_mval)){
                 char _known[512]; int _kn=0;
