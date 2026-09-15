@@ -36,8 +36,8 @@ axx x86_64.axx hello.s -o out.o # ELF relocatable object
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all fourteen bundled pattern/source pairs with
-both implementations and `cmp`s the results.
+exactly that: `test1` assembles fourteen bundled pattern/source pairs with both
+implementations and `cmp`s the results.
 
 **Contents**
 
@@ -941,6 +941,26 @@ collatz 27           -> 6f
 The same material is kept as a standalone document in `MINI.md` (Japanese) and
 `mini_en.md` (English).
 
+#### A worked example from a real ISA
+
+`aarch64_logical_mini.axx` encodes the AArch64 logical-immediate group
+(AND / ORR / EOR / ANDS / TST, 32- and 64-bit) this way. ARM's `DecodeBitMasks`
+run in reverse is split across four functions — `highbit`, `find_e`, `pack_rs`
+and `emit_logical` — which leaves each instruction line short:
+
+```
+AND  d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call emit_logical(v,1,0,n,d,64)
+```
+
+[Appendix A.3](#a3-aarch64-logical-immediate) gives the same encoding written
+instead as a single chained-ternary `binary_list`, which is what the mini
+language is there to replace. Both compute in the same 256-bit arithmetic; what
+the function form gains is that each call has its own local scope, so its
+working variables cannot collide with the pattern layer's captured ones, and
+that one body serves both widths — the 32-bit forms only bound the element-size
+search to 32 instead of 64, where the `binary_list` version needs the width
+folded into the expression.
+
 #### Limits
 
 The language is Turing complete, so a buggy pattern file could otherwise hang
@@ -1767,6 +1787,12 @@ $ axx test.axx test.s -v
 Probably the most complex thing expressible in a single pattern. Encodings like
 this can be folded into one macro (section 7.4).
 
+The bundled `aarch64_logical_mini.axx` covers this same instruction group with
+the mini language of [section 3.15](#315-mini-language-func--call) instead, and
+is the form to start from if you are writing something like this yourself; the
+one-liner below is kept here as a demonstration of the declarative core's
+reach.
+
 ```
 AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v)?2:((v&0xf)*0x1111111111111111==v)?4:((v&0xff)*0x0101010101010101==v)?8:((v&0xffff)*0x1000100010001==v)?16:((v&0xffffffff)*0x100000001==v)?32:64)*0,;(m:=(1<<e)-1)*0,;(y:=v&m)*0,;(t:=@(y^(y-1))-1)*0,;(u:=y>>t)*0,;(w:=(y^m)==0?1:y^m)*0,;(p:=@(w^(w-1))-1)*0,;(q:=w>>p)*0,;(c:=((u+1)&u)==0)*0,;(b:=c?@u:e-@q)*0,
  ;(r:=c?(e-t)&(e-1):(e-(p+@q))&(e-1))*0,;(s:=((0-2*e)&0x7f)|(b-1))*0,;(z:=(1<<31)|(0x24<<23)|((((s>>6)&1)^1)<<22)|(r<<16)|((s&0x3f)<<10)|(n<<5)|d)*0,@@[4,z>>(%%*8)]
@@ -1778,7 +1804,8 @@ AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v
 
 `x86_64.axx`, `x86_64m.axx`, `68000.axx`, `z80.axx`, `8080.axx`, `8048.axx`,
 `8051.axx`, `6502.axx`, `6800.axx`, `6809.axx` and `4004.axx` are for practical
-use. The rest are test fixtures.
+use, as is `aarch64_logical_mini.axx` within the one instruction group it
+covers. The rest are test fixtures.
 
 The x86_64 pattern file is also maintained separately at
 <https://github.com/fygar256/x86_64_pattern_file_for_axx>.
@@ -1787,8 +1814,9 @@ The x86_64 pattern file is also maintained separately at
 |---|---|---|---|---|
 | **x86_64.axx** | 3.9 MB | 23,923 | **hello.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512 |
 | **x86_64m.axx** | 935 KB | 5,787 | **hello.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo |
+| **aarch64_logical_mini.axx** | 8.6 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 logical (immediate): AND/ORR/EOR/ANDS/TST, 32- and 64-bit. Encodes the bitmask immediate with the mini language (section 3.15) |
 | **6809.axx** | 124 KB | 1,950 | **6809.s** | Motorola 6809 |
-| **68000.axx** | 49 KB | 458 | **68000.s** | Motorola 68000 |
+| **68000.axx** | 49 KB | 453 | **68000.s** | Motorola 68000 |
 | **6800.axx** | 18 KB | 271 | **6800.s** | Motorola 6800 |
 | **6502.axx** | 14 KB | 192 | **6502.s** | MOS 6502 |
 | **z80.axx** | 7.5 KB | 283 | **z80.s** | Zilog Z80 |
@@ -1798,14 +1826,16 @@ The x86_64 pattern file is also maintained separately at
 | **4004.axx** | 5.4 KB | 53 | **4004.s** | Intel 4004 |
 | **test.axx** | 1.1 KB | 40 | **test.s** | Fragments of several ISAs; test only |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
-| **vliw.axx** | 178 B | 9 | **vliw.s** | Non-EPIC VLIW; test only |
-| **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck virtual CPU; hello-world test |
+| **vliw.axx** | 178 B | 10 | **vliw.s** | Non-EPIC VLIW; test only |
+| **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck virtual CPU; hello-world demo. Bundled, but not part of `test1` |
 
 Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
-`itanium.axx` also uses `vliw.s`.
+`itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
+`aarch64_logical_mini_demo.s`.
 
-`test1` runs every pair above through both implementations and compares the
-results.
+`test1` runs fourteen of the pairs above through both implementations and
+compares the results. `bf.axx` / `bf.s` is the one bundled pair it does not
+cover.
 
 x86_64 and legacy CPUs make up most of what is currently implemented, but that
 reflects where the work has gone, not the limit of what axx can describe.
@@ -1826,7 +1856,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all fourteen bundled pattern/source pairs with both
+`test1` assembles fourteen bundled pattern/source pairs with both
 implementations and compares the results.
 
 ### C.2 External

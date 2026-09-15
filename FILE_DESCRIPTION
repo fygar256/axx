@@ -17,13 +17,18 @@ File description
 8080.s                              test assemble file for 8080
 4004.axx                            pattern file for 4004
 4004.s                              test assemble file for 4004
+aarch64_logical_mini.axx            pattern file for the AArch64 logical (immediate)
+                                    group, AND/ORR/EOR/ANDS/TST, 32 and 64 bit.
+                                    encodes the bitmask immediate with the mini
+                                    language instead of one binary_list expression
+aarch64_logical_mini_demo.s         test assemble file for aarch64_logical_mini.axx
 LICENSE                             license
 README.md                           readme
+Technical_Manual.md                 technical manual, full reference
 URL_to_newest_article_in_Japanese   as it is
 caxx.c                              axx in C 'Caxx'
 axx.1.gz                            axx man page
 axx.py                              axx in python 'Paxx'
-axx.py.org                          axx in python not refactored
 axxgirl.png                         mascot character picture file
 bf.axx                              pattern file for brainfuck virtual CPU system
 bf.s                                hello world test assemble file for brainfuck virtual CPU
@@ -32,7 +37,7 @@ hello.s                             assembly file of x86_64 hello world. use x86
 hello.tsv                           export file of x86_64 hello world
 imp.tsv                             import file
 secsort.py                          execution file of section sort
-test1                               assemble test for all apttern file
+test1                               assemble test for all pattern file
 test.axx                            test pattern file of some CPUs 
 test.s                              test assemble file of some CPUs
 z80.axx                             pattern file for Z80
@@ -44,6 +49,11 @@ x86_64m.axx                         pattern file for x86_64-v3 with macro
 itanium.axx                         test pattern file for itanium
 MACRO.md                            macro layer reference (Japanese)
 macro_en.md                         macro layer reference (English)
+MINI.md                             mini language reference (Japanese)
+mini_en.md                          mini language reference (English)
 axx_introduction_paper.md           introduction paper (Japanese)
 axx_introduction_paper_en.md        introduction paper (English)
+axxsemantics                        denotational semantics of axx (Japanese)
+FILE_DESCRIPTION                    this file
 makefile                            build/install rules for caxx and paxx
+```
