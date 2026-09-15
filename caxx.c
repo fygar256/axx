@@ -1941,18 +1941,36 @@ static int axx_get_intstr(const char *s, int idx, char *fs, size_t fsz){
 }
 
 static int axx_get_floatstr(const char *s, int idx, char *fs, size_t fsz){
+    /* 破綻点修正: axx_get_intstr と同じ desync バグがここにもあった。
+     * バッファ上限に達すると idx を進めるのをやめてしまい、残った桁が
+     * 次のトークンとして誤読されていた（axx.py は無制限）。さらに、
+     * 仮数部だけでバッファが埋まっていると、指数部の数字が実在しても
+     * `n<fsz-1` が false になって while が一度も回らず、"e/E の直後に
+     * 数字が無い" と誤認して指数部ごと巻き戻す不具合もあった。数字/'.'/
+     * 'e'/符号である間は常に idx を進め、バッファに書き込む文字数だけを
+     * 先頭 fsz-1 文字に絞る。 */
     if(strncmp(s+idx,"-inf",4)==0){strcpy(fs,"-inf");return idx+4;}
     if(strncmp(s+idx,"inf",3)==0){strcpy(fs,"inf");return idx+3;}
     if(strncmp(s+idx,"nan",3)==0){strcpy(fs,"nan");return idx+3;}
     size_t n=0;
-    while(s[idx]&&(is_digit(s[idx])||s[idx]=='.')&&n<fsz-1) fs[n++]=s[idx++];
-    if((s[idx]=='e'||s[idx]=='E') && n<fsz-1){
+    while(s[idx]&&(is_digit(s[idx])||s[idx]=='.')){
+        if(n<fsz-1) fs[n++]=s[idx];
+        idx++;
+    }
+    if(s[idx]=='e'||s[idx]=='E'){
         int saved_idx = idx;
         size_t saved_n = n;
-        fs[n++]=s[idx++];
-        if((s[idx]=='+'||s[idx]=='-')&&n<fsz-1) fs[n++]=s[idx++];
+        if(n<fsz-1) fs[n++]=s[idx];
+        idx++;
+        if(s[idx]=='+'||s[idx]=='-'){
+            if(n<fsz-1) fs[n++]=s[idx];
+            idx++;
+        }
         int digits_start = idx;
-        while(s[idx]&&is_digit(s[idx])&&n<fsz-1) fs[n++]=s[idx++];
+        while(s[idx]&&is_digit(s[idx])){
+            if(n<fsz-1) fs[n++]=s[idx];
+            idx++;
+        }
         if(idx == digits_start){
             idx = saved_idx;
             n   = saved_n;
@@ -3546,7 +3564,12 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         x=u256_from_i64(u256_is_zero(x)?1:0);
     }
     else if(asmb->st.exp_typ_float && axx_isfloatstr(s,idx)){
-        char fs[64];
+        /* 128bit(四倍精度)を正しく往復させるには仮数部だけで最大36桁前後
+         * 要る。旧来の64バイトだと、仮数部だけでバッファが埋まった場合に
+         * 指数部を書き込む余地が無くなり、idx はその先まで正しく進んでも
+         * strtod に渡る文字列からは指数だけ丸ごと消えてしまっていた
+         * （桁落ちではなく桁ごと消える誤り）。余裕を持って96バイト。 */
+        char fs[96];
         idx=axx_get_floatstr(s,idx,fs,sizeof(fs));
         if(fs[0]) x=double_to_u256(strtod(fs,NULL));
     }
