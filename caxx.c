@@ -10399,6 +10399,17 @@ static void setpatsymbols(Assembler *asmb){
             const char *name_field = e->f[1][0] ? e->f[1] : e->f[2];
             const char *value_field = e->f[1][0] ? e->f[2] : "";
             char key[512]; axx_strupr_to(key,name_field,sizeof(key));
+            /* 破綻点修正: axx.py は各 .setsym の値を評価する直前に、それまで
+             * 積み上げた fresh を毎回 st->symbols へ再公開している
+             * (axx.py:6732)。これにより `#symbol1` のようなここまでの
+             * .setsym 参照が値の式の中で解決できる（README 3.6）。caxx.c は
+             * ループが終わってから一括でしか smap_set していなかったため、
+             * `.setsym::symbol2::#symbol1` が常に「未定義シンボル」で失敗
+             * していた（機能が丸ごと壊れていた）。 */
+            smap_clear(&asmb->st.symbols);
+            for(int fi=0; fi<fresh.nb; fi++)
+                for(SymEntry *fe=fresh.buckets[fi]; fe; fe=fe->next)
+                    smap_set(&asmb->st.symbols, fe->key, fe->val);
             int io;
             uint256_t v = value_field[0] ? expr_expression_pat(asmb,value_field,0,&io) : u256_zero();
             smap_set(&fresh, key, v);
