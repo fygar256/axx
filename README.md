@@ -55,7 +55,7 @@ ARM, AArch64, RISC-V, PowerPC, MIPS and SPARC don't have pattern files yet. That
 
 ## How it compares
 
-**customasm** (Rust, actively maintained) shares the same core idea — describe an ISA declaratively, get an assembler for it — and its `#subruledef` composition system is more structured than axx's flat pattern model. But its output formats (binary, hexdump, intelhex, and similar dump formats) stop short of anything like ELF; there's no relocatable-object output at all. If you're building a toy VM or an FPGA CPU, customasm is the better fit. If you need something that links into a real OS binary, axx is the one that does that.
+**customasm** (Rust, actively maintained) shares the same core idea — describe an ISA declaratively, get an assembler for it — but customasm output formats (binary, hexdump, intelhex, and similar dump formats) stop short of anything like ELF; there's no relocatable-object output at all. If you're building a toy VM or an FPGA CPU, customasm is the better fit. If you need something that links into a real OS binary, axx is the one that does that.
 
 **LLVM MC** is the production-grade backend actually used by clang and rustc, with object-format support (ELF, COFF, Mach-O, wasm) and target coverage that axx doesn't come close to. But TableGen alone rarely suffices for a real target — most non-trivial backends carry thousands of lines of hand-written C++ alongside the declarative description. If you need a mainstream architecture in production today, use LLVM. If you want a historical or unusual ISA running from a single file you can actually read end to end, that's axx's territory.
 
