@@ -82,7 +82,7 @@ Pattern files for ARM, RISC-V, PowerPC, MIPS and SPARC don't exist yet. Getting 
 
 ---
 
-*Every verification claim in this document (byte-identical dual implementations, actual ELF object generation, the line-count comparison) was checked by cloning, building, and running the repository directly — not taken from the README on faith.*
+*Every verification claim in this document (byte-identical dual implementations, actual ELF object generation, the line-count comparison) was checked by cloning, building, and running the repository directly.*
 
 
 ## 3 Acknowledgements
