@@ -5135,11 +5135,15 @@ class MiniInterp:
         return ret
 
     def run(self, func, args, pos):
+        """関数を1回走らせ、(`.emit` したワード列, 返り値) を返す。
+
+        返り値は整数か配列。値を返さずに戻った場合は None。
+        """
         self.out = []
         self.steps = 0
         self.frames = []
-        self.call(func, args, pos)
-        return self.out
+        ret = self.call(func, args, pos)
+        return self.out, ret
 
 
 class ObjectGenerator:
@@ -5293,26 +5297,78 @@ class ObjectGenerator:
         args = []
         a = 0
         arg_text_z = arg_text + chr(0)
-        while a < len(arg_text_z) and arg_text_z[a] != chr(0):
+        while True:
+            a = StringUtils.skipspc(arg_text_z, a)
+            if a >= len(arg_text_z) or arg_text_z[a] == chr(0):
+                break
             if arg_text_z[a] == ',':
                 a += 1
                 continue
-            v, a = self.expr_eval.expression_pat(arg_text_z, a)
-            args.append(0 if _is_undef_derived(v) else v)
+            # `[式, 式, ...]` は配列の引数。要素もパターン層の式。
+            if arg_text_z[a] == '[':
+                v, a = self._mini_arg_array(arg_text_z, a, name)
+                if v is None:
+                    return [], idx
+                args.append(v)
+            else:
+                v, a = self.expr_eval.expression_pat(arg_text_z, a)
+                args.append(0 if _is_undef_derived(v) else v)
+            a = StringUtils.skipspc(arg_text_z, a)
             if a < len(arg_text_z) and arg_text_z[a] == ',':
                 a += 1
                 continue
             break
 
         try:
-            words = MiniInterp(self.state).run(fn, args, (fn.file, fn.line))
+            words, ret = MiniInterp(self.state).run(fn, args, (fn.file, fn.line))
         except MiniLangError as e:
             self._mini_diag(f" error - {e}")
             return [], idx
         except RecursionError:
             self._mini_diag(f" error - '.call {name}': expression nesting too deep.")
             return [], idx
+        # 返り値もワードになる。配列なら添字 0 から順に、スカラーなら 1 ワード。
+        if ret is not None:
+            words = words + (list(ret) if isinstance(ret, list) else [ret])
         return words, idx
+
+    def _mini_arg_array(self, t, a, name):
+        """`.call` の引数欄の `[式, 式, ...]` を読んで配列の値にする。
+
+        戻り値は (要素のリスト, `]` の次の位置)。読めなければ (None, 末尾)。
+        """
+        depth = 0
+        k = a
+        while k < len(t) and t[k] != chr(0):
+            if t[k] in '([':
+                depth += 1
+            elif t[k] in ')]':
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        if depth != 0 or k >= len(t) or t[k] != ']':
+            self._mini_diag(f" error - '.call {name}': unbalanced '[' in the "
+                            f"argument list.")
+            return None, len(t)
+        inner = t[a + 1:k] + chr(0)
+        out = []
+        i = 0
+        while True:
+            i = StringUtils.skipspc(inner, i)
+            if i >= len(inner) or inner[i] == chr(0):
+                break
+            if inner[i] == ',':
+                i += 1
+                continue
+            v, i = self.expr_eval.expression_pat(inner, i)
+            out.append(_mini_wrap(0 if _is_undef_derived(v) else v))
+            i = StringUtils.skipspc(inner, i)
+            if i < len(inner) and inner[i] == ',':
+                i += 1
+                continue
+            break
+        return out, k + 1
 
     def makeobj(self, s):
         s, z = self.e_p(s)
@@ -5338,15 +5394,21 @@ class ObjectGenerator:
                     continue
 
                 semicolon = False
+                drop = False
                 if s[idx] == ';':
                     semicolon = True
                     idx += 1
+                    # `;;要素` は評価だけして何も出さない。
+                    if idx < len(s) and s[idx] == ';':
+                        drop = True
+                        idx += 1
 
                 if StringUtils.upper(s[idx:idx + 5]) == '.CALL' and (
                         idx + 5 >= len(s) or s[idx + 5] not in _SYM_CORE):
-                    if semicolon:
-                        self._mini_diag(" error - ';' cannot be applied to '.call'.")
                     words, idx = self.mini_call(s, idx)
+                    # `;` 付きは、出したワードが 1 個で 0 のときだけ何も出さない。
+                    if drop or (semicolon and len(words) == 1 and words[0] == 0):
+                        words = []
                     objl += words
                     if idx < len(s) and s[idx] == ',':
                         idx += 1
@@ -5362,9 +5424,9 @@ class ObjectGenerator:
                     self.state._pass1_size_mode = False
                     self.state.error_undefined_label = False
 
-                if not semicolon or x != 0:
+                if not drop and (not semicolon or x != 0):
                     objl += [x]
-                elif semicolon:
+                else:
                     self.state._elf_label_refs_seen = [
                         e for e in self.state._elf_label_refs_seen
                         if e[2] != self.state._elf_current_word_idx

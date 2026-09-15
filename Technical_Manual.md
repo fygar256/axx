@@ -384,6 +384,8 @@ ADD A,R!n :: n>7;5 :: n|0x68
 - An **empty element** performs alignment. A leading comma, or `0x12,,0x13`,
   pads to the exact address.
 - An element starting with `;` is **suppressed when its value is 0**.
+- An element starting with `;;` is **evaluated but never output**. `0x11,;;n,0x22`
+  emits two words, and a `binary_list` of just `;;n` emits none at all.
 
 #### 3.5.1 `@@[]` — repetition
 
@@ -790,7 +792,8 @@ text stays blank, exactly as for an undeclared code today.
 
 A `binary_list` element may be `.call name(argument, ...)`, which runs a
 function written in a small procedural language and emits the words that
-function produces. The language has assignment, `.if`, `.while`, `.for`,
+function produces — the values it passes to `.emit`, followed by its return
+value if it has one. The language has assignment, `.if`, `.while`, `.for`,
 recursion and arrays, so an encoding that cannot be written as a fixed
 expression can be computed instead.
 
@@ -819,6 +822,18 @@ comma-separated element like any other, so it can be mixed with plain values:
 MIX !e :: 0x90,.call rep(e),0xff
 ```
 
+An argument written `[e1, e2, ...]` is an **array**; its elements are pattern
+expressions too. `[]` is the empty array.
+
+```
+LOG !v :: .call table([0x11,0x22,v],3)
+```
+
+The `;` modifier of [section 3.5](#35-binary_list) applies to `.call` as well:
+`;.call f(a)` emits nothing when the call's whole output is a single word equal
+to 0, which is how a prefix byte that is sometimes absent is written. `;;.call
+f(a)` runs the call and discards its output.
+
 #### Statements
 
 | Statement | Meaning |
@@ -827,11 +842,13 @@ MIX !e :: 0x90,.call rep(e),0xff
 | `name[index] = expression` | Assign to an array element |
 | `.emit(e1, e2, ...)` | Append one word per value to the output |
 | `.call name(args)` | Call another function |
+| `name = .call name(args)` | Call another function and assign its return value |
 | `.if <expr> .then` / `.else` / `.endif` | Conditional |
 | `.while(<expr>)` / `.endwhile` | Loop while the condition is non-zero |
 | `.for <name> in range(...)` / `.next` | Loop over `range(stop)`, `range(start, stop)` or `range(start, stop, step)` |
 | `.nonlocal a, b` | Bind these names to the enclosing call instead of locally |
 | `.return` | Return from the function |
+| `.return <expr>` | Return a value from the function |
 
 `.emit` appends one word of `.bits` width per value — one byte at the default
 width. The number of words a call emits is the instruction's length, so a
@@ -843,9 +860,65 @@ axx. Operators, from loosest to tightest: `||`, `&&`, `!`, comparisons
 `**`, subscript. `/` truncates toward zero and `%` takes the sign of the
 dividend. `>>` is arithmetic.
 
+#### Return values
+
+`.return <expr>` returns a value, and the caller takes it with
+`var = .call name(args)`:
+
+```
+.func::hypot2::a,b
+.return a*a+b*b
+
+.func::emit_h::a,b
+v = .call hypot2(a,b)
+.emit(v)
+.return
+```
+
+The value may be a number or an array; an array is passed as a copy. The target
+may be an array element (`a[i] = .call f(x)`), in which case the returned value
+must be a number. Calling a function that returns nothing in that form is an
+error, and `.call` cannot appear inside a larger expression — take the value
+into a variable first. A `.return <expr>` also works as the line that closes
+the body, and as an early return from inside a block:
+
+```
+.func::firstdiv::n
+i=2
+.while(i<n)
+.if n%i==0 .then
+.return i
+.endif
+i=i+1
+.endwhile
+.return 0
+```
+
+When a function is called straight from `binary_list`, its return value becomes
+output: a number is one word, an array is one word per element from index 0.
+That is in addition to whatever it passed to `.emit`, so a function that only
+`.emit`s and returns nothing behaves exactly as before.
+
+```
+SEQ !n :: 0xaa,.call seq(n),0xbb
+
+.func::seq::n
+a=[]
+.for i in range(n)
+a[i]=0xc0+i
+.next
+.return a
+```
+
+```
+seq 4                -> aa c0 c1 c2 c3 bb
+```
+
 #### Arrays
 
-An array is written `[]`, or `[e1, e2, ...]`, or produced by slicing.
+An array is written `[]`, or `[e1, e2, ...]`, or produced by slicing. An array
+may also be passed as a function argument, both between functions and from a
+`binary_list` call site.
 
 ```
 a = []

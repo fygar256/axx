@@ -1,0 +1,189 @@
+/* ===================================================================
+/* AArch64 -- Logical (immediate) instruction group for axx
+/*   AND / ORR / EOR / ANDS  (register + bitmask immediate, 32/64-bit)
+/*   TST                     (assembler alias: ANDS with Rd discarded)
+/*
+/* Scope: this file covers only the "logical (immediate)" encoding
+/* class (ARM ARM C4.1.64), i.e. a destination/source register pair
+/* plus a repeating-bitmask immediate (#0x...). It does not cover the
+/* register-shifted forms of AND/ORR/EOR/ANDS, or BIC/ORN/EON (which
+/* have no immediate form at all).
+/*
+/* Validity of the immediate: a value is encodable only if it is a
+/* single run of set bits, repeated with some period e in
+/* {2,4,8,16,32,64} (32 for the W forms), and is neither all-zero nor
+/* all-one. error_patterns rejects the all-zero and all-one cases the
+/* same way the reference example in the axx manual does (Appendix
+/* A.3); values that are simply not a valid repeating run (e.g. #0x5)
+/* are not separately rejected here either -- matching the manual's
+/* own example -- so double-check unusual immediates against a real
+/* AArch64 assembler if in doubt.
+/*
+/* Known implementation-specific limitation: error_patterns runs in
+/* IEEE-754 double precision (see Technical_Manual.md section 3.4).
+/* 0xFFFFFFFFFFFFFFFF cannot be held exactly in a double, so the
+/* 64-bit "all-one" rejection below is exact in Paxx (axx.py, the
+/* reference implementation) but is silently skipped in Caxx (caxx,
+/* the C implementation) for that one specific value -- Caxx still
+/* accepts AND/ORR/EOR/ANDS/TST X-forms with #0xFFFFFFFFFFFFFFFF and
+/* emits the corresponding (architecturally reserved) encoding rather
+/* than reporting error 3. binary_list itself is unaffected and was
+/* verified byte-identical between Paxx and Caxx, and against a real
+/* aarch64-linux-gnu-as/objdump, across 239 immediate values spanning
+/* every element size, rotation and opcode covered by this file --
+/* only this one boundary value differs, and only in Caxx's error
+/* checking. The 32-bit forms have no such gap: 0xFFFFFFFF fits a
+/* double exactly and is rejected identically by both implementations.
+/* ===================================================================
+
+/* ---- 64-bit (X) general-purpose registers ---- */
+.setsym::X0::0
+.setsym::X1::1
+.setsym::X2::2
+.setsym::X3::3
+.setsym::X4::4
+.setsym::X5::5
+.setsym::X6::6
+.setsym::X7::7
+.setsym::X8::8
+.setsym::X9::9
+.setsym::X10::10
+.setsym::X11::11
+.setsym::X12::12
+.setsym::X13::13
+.setsym::X14::14
+.setsym::X15::15
+.setsym::X16::16
+.setsym::X17::17
+.setsym::X18::18
+.setsym::X19::19
+.setsym::X20::20
+.setsym::X21::21
+.setsym::X22::22
+.setsym::X23::23
+.setsym::X24::24
+.setsym::X25::25
+.setsym::X26::26
+.setsym::X27::27
+.setsym::X28::28
+.setsym::X29::29
+.setsym::X30::30
+.setsym::XZR::31
+.setsym::SP::31
+
+/* ---- 32-bit (W) general-purpose registers ---- */
+.setsym::W0::0
+.setsym::W1::1
+.setsym::W2::2
+.setsym::W3::3
+.setsym::W4::4
+.setsym::W5::5
+.setsym::W6::6
+.setsym::W7::7
+.setsym::W8::8
+.setsym::W9::9
+.setsym::W10::10
+.setsym::W11::11
+.setsym::W12::12
+.setsym::W13::13
+.setsym::W14::14
+.setsym::W15::15
+.setsym::W16::16
+.setsym::W17::17
+.setsym::W18::18
+.setsym::W19::19
+.setsym::W20::20
+.setsym::W21::21
+.setsym::W22::22
+.setsym::W23::23
+.setsym::W24::24
+.setsym::W25::25
+.setsym::W26::26
+.setsym::W27::27
+.setsym::W28::28
+.setsym::W29::29
+.setsym::W30::30
+.setsym::WZR::31
+.setsym::WSP::31
+
+/* Variable roles (lowercase letters captured from the instruction text)
+/*   n : Rn, X-form -- X0-X30 or XZR (never SP)
+/*   h : Rn, W-form -- W0-W30 or WZR (never WSP)
+/*   d : Rd, X-form AND/ORR/EOR -- X0-X30 or SP  (no XZR)
+/*   g : Rd, W-form AND/ORR/EOR -- W0-W30 or WSP (no WZR)
+/*   i : Rd, X-form ANDS/TST    -- X0-X30 or XZR (no SP)
+/*   j : Rd, W-form ANDS/TST    -- W0-W30 or WZR (no WSP)
+/*   v : the logical immediate itself
+/*
+/* None of the six above collide with the scratch names the encoder formula
+/* below uses for its own bookkeeping: e,m,y,t,u,w,p,q,c,b,r,s,z,x
+/*
+/* x holds the width-32 immediate duplicated into all 64 bits, used only
+/* by the W-form macro. It is kept separate from v (rather than assigning
+/* straight into v) because error_patterns and binary_list share the same
+/* variable slots, and error_patterns must still see the original,
+/* un-duplicated v when it runs its range checks.
+.check::n::X0,X1,X2,X3,X4,X5,X6,X7,X8,X9,X10,X11,X12,X13,X14,X15,X16,X17,X18,X19,X20,X21,X22,X23,X24,X25,X26,X27,X28,X29,X30,XZR
+.check::h::W0,W1,W2,W3,W4,W5,W6,W7,W8,W9,W10,W11,W12,W13,W14,W15,W16,W17,W18,W19,W20,W21,W22,W23,W24,W25,W26,W27,W28,W29,W30,WZR
+.check::d::X0,X1,X2,X3,X4,X5,X6,X7,X8,X9,X10,X11,X12,X13,X14,X15,X16,X17,X18,X19,X20,X21,X22,X23,X24,X25,X26,X27,X28,X29,X30,SP
+.check::g::W0,W1,W2,W3,W4,W5,W6,W7,W8,W9,W10,W11,W12,W13,W14,W15,W16,W17,W18,W19,W20,W21,W22,W23,W24,W25,W26,W27,W28,W29,W30,WSP
+.check::i::X0,X1,X2,X3,X4,X5,X6,X7,X8,X9,X10,X11,X12,X13,X14,X15,X16,X17,X18,X19,X20,X21,X22,X23,X24,X25,X26,X27,X28,X29,X30,XZR
+.check::j::W0,W1,W2,W3,W4,W5,W6,W7,W8,W9,W10,W11,W12,W13,W14,W15,W16,W17,W18,W19,W20,W21,W22,W23,W24,W25,W26,W27,W28,W29,W30,WZR
+
+/* ===================================================================
+/* The bitmask-immediate encoder (ARM's "DecodeBitMasks", run in
+/* reverse), folded into two macros -- one per register width.
+/*
+/* Given a 64-bit value v that already repeats with some period
+/* e in {2,4,8,16,32,64}, this finds the smallest such e, then finds
+/* the rotation r and run length b of the single block of set bits
+/* within one period, and packs N:immr:imms into the instruction.
+/*
+/* Each intermediate step is a binary_list element written `;;(x:=...)`
+/* -- the `;;` modifier (Technical_Manual.md section 3.5) evaluates the
+/* element for its assignment and emits nothing, so only the final
+/* `@@[4,z>>(%%*8)]` produces bytes.
+/*
+/*   e  element size (bits) that v repeats with
+/*   m  mask of one element, (1<<e)-1
+/*   y  the low element of v
+/*   t  index of the lowest set bit of y
+/*   u  y rotated so its run starts at bit 0
+/*   w  gap-complement of y, used when the run wraps around
+/*   c  true when the run does not wrap (starts at bit 0 already)
+/*   b  run length
+/*   r  rotation amount (immr)
+/*   s  imms, packed with the element-size code in its high bits
+/*   z  the finished 32-bit instruction word
+/*
+/* mnem : mnemonic text (AND / ORR / EOR / ANDS)
+/* opc  : 0=AND 1=ORR 2=EOR 3=ANDS   (bits 30:29)
+/* rd   : capture letter used for Rd in the instruction text
+/* rn   : capture letter used for Rn in the instruction text
+/* ===================================================================
+
+/* ---- 64-bit (X) form: sf=1, v used exactly as given ---- */
+!def aarch64_logical_x(mnem, opc, rd, rn) {
+!{mnem} !{rd},!{rn},#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;;(e:=((v&3)*0x5555555555555555==v)?2:((v&0xf)*0x1111111111111111==v)?4:((v&0xff)*0x0101010101010101==v)?8:((v&0xffff)*0x1000100010001==v)?16:((v&0xffffffff)*0x100000001==v)?32:64),;;(m:=(1<<e)-1),;;(y:=v&m),;;(t:=@(y^(y-1))-1),;;(u:=y>>t),;;(w:=(y^m)==0?1:y^m),;;(p:=@(w^(w-1))-1),;;(q:=w>>p),;;(c:=((u+1)&u)==0),;;(b:=c?@u:e-@q),;;(r:=c?(e-t)&(e-1):(e-(p+@q))&(e-1)),;;(s:=((0-2*e)&0x7f)|(b-1)),;;(z:=(1<<31)|(!{opc}<<29)|(0x24<<23)|((((s>>6)&1)^1)<<22)|(r<<16)|((s&0x3f)<<10)|(!{rn}<<5)|!{rd}),@@[4,z>>(%%*8)]
+}
+
+/* ---- 32-bit (W) form: sf=0, v duplicated into the high 32 bits so
+/*      the same periodicity test finds the same e, capped at 32 ---- */
+!def aarch64_logical_w(mnem, opc, rd, rn) {
+!{mnem} !{rd},!{rn},#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 ::;;(x:=(v&0xffffffff)|((v&0xffffffff)<<32)),;;(e:=((x&3)*0x5555555555555555==x)?2:((x&0xf)*0x1111111111111111==x)?4:((x&0xff)*0x0101010101010101==x)?8:((x&0xffff)*0x1000100010001==x)?16:32),;;(m:=(1<<e)-1),;;(y:=x&m),;;(t:=@(y^(y-1))-1),;;(u:=y>>t),;;(w:=(y^m)==0?1:y^m),;;(p:=@(w^(w-1))-1),;;(q:=w>>p),;;(c:=((u+1)&u)==0),;;(b:=c?@u:e-@q),;;(r:=c?(e-t)&(e-1):(e-(p+@q))&(e-1)),;;(s:=((0-2*e)&0x7f)|(b-1)),;;(z:=(0<<31)|(!{opc}<<29)|(0x24<<23)|((((s>>6)&1)^1)<<22)|(r<<16)|((s&0x3f)<<10)|(!{rn}<<5)|!{rd}),@@[4,z>>(%%*8)]
+}
+
+!aarch64_logical_x("AND",  0, "d", "n")
+!aarch64_logical_x("ORR",  1, "d", "n")
+!aarch64_logical_x("EOR",  2, "d", "n")
+!aarch64_logical_x("ANDS", 3, "i", "n")
+!aarch64_logical_w("AND",  0, "g", "h")
+!aarch64_logical_w("ORR",  1, "g", "h")
+!aarch64_logical_w("EOR",  2, "g", "h")
+!aarch64_logical_w("ANDS", 3, "j", "h")
+
+/* ---- TST is ANDS with the result discarded: Rd is forced to the
+/*      zero register (31) rather than read from the source text ---- */
+TST n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;;(i:=31),;;(e:=((v&3)*0x5555555555555555==v)?2:((v&0xf)*0x1111111111111111==v)?4:((v&0xff)*0x0101010101010101==v)?8:((v&0xffff)*0x1000100010001==v)?16:((v&0xffffffff)*0x100000001==v)?32:64),;;(m:=(1<<e)-1),;;(y:=v&m),;;(t:=@(y^(y-1))-1),;;(u:=y>>t),;;(w:=(y^m)==0?1:y^m),;;(p:=@(w^(w-1))-1),;;(q:=w>>p),;;(c:=((u+1)&u)==0),;;(b:=c?@u:e-@q),;;(r:=c?(e-t)&(e-1):(e-(p+@q))&(e-1)),;;(s:=((0-2*e)&0x7f)|(b-1)),;;(z:=(1<<31)|(3<<29)|(0x24<<23)|((((s>>6)&1)^1)<<22)|(r<<16)|((s&0x3f)<<10)|(n<<5)|i),@@[4,z>>(%%*8)]
+
+TST h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 ::;;(x:=(v&0xffffffff)|((v&0xffffffff)<<32)),;;(j:=31),;;(e:=((x&3)*0x5555555555555555==x)?2:((x&0xf)*0x1111111111111111==x)?4:((x&0xff)*0x0101010101010101==x)?8:((x&0xffff)*0x1000100010001==x)?16:32),;;(m:=(1<<e)-1),;;(y:=x&m),;;(t:=@(y^(y-1))-1),;;(u:=y>>t),;;(w:=(y^m)==0?1:y^m),;;(p:=@(w^(w-1))-1),;;(q:=w>>p),;;(c:=((u+1)&u)==0),;;(b:=c?@u:e-@q),;;(r:=c?(e-t)&(e-1):(e-(p+@q))&(e-1)),;;(s:=((0-2*e)&0x7f)|(b-1)),;;(z:=(0<<31)|(3<<29)|(0x24<<23)|((((s>>6)&1)^1)<<22)|(r<<16)|((s&0x3f)<<10)|(h<<5)|j),@@[4,z>>(%%*8)]

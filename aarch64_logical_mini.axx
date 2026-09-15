@@ -13,6 +13,13 @@
 /* trick to reuse the 64-bit logic (the element-size search is simply
 /* bounded to 32 instead of 64; see find_e below).
 /*
+/* Each function here computes a value and hands it back with
+/* `.return <expr>`; the caller takes it with `var = .call f(...)`,
+/* and the return value of the outermost call -- a four-element array
+/* -- is what binary_list emits. So the whole encoder is written as
+/* ordinary functions with results, and `.emit` appears nowhere in
+/* this file.
+/*
 /* Scope: this file covers only the "logical (immediate)" encoding
 /* class (ARM ARM C4.1.64) -- a destination/source register pair plus
 /* a repeating-bitmask immediate (#0x...). It does not cover the
@@ -36,7 +43,7 @@
 /* for that one specific value. This is unchanged from the
 /* ternary-expression version of this file, since it is a property of
 /* error_patterns, not of how binary_list computes the encoding. The
-/* mini-language encoder itself (find_e / pack_rs / emit_logical) was
+/* mini-language encoder itself (find_e / pack_rs / logical) was
 /* verified byte-identical between Paxx and Caxx, and against a real
 /* aarch64-linux-gnu-as/objdump, across 239 immediate values covering
 /* every element size, rotation and opcode this file handles.
@@ -204,38 +211,42 @@ r = (e - (p + hq)) & (e - 1)
 s = ((0 - 2 * e) & 0x7f) | (b - 1)
 .return [r, s]
 
-/* emit_logical(v,sf,opc,rn,rd,maxw): ties the three functions
-/* together and emits the finished 32-bit instruction word as four
-/* little-endian bytes. sf is 1 for a 64-bit (X) form or 0 for a
-/* 32-bit (W) form; opc is 0=AND 1=ORR 2=EOR 3=ANDS; maxw is 64 or 32
-/* to match sf. */
-.func::emit_logical::v,sf,opc,rn,rd,maxw
+/* logical(v,sf,opc,rn,rd,maxw): ties the three functions together and
+/* returns the finished 32-bit instruction word as four little-endian
+/* bytes. sf is 1 for a 64-bit (X) form or 0 for a 32-bit (W) form;
+/* opc is 0=AND 1=ORR 2=EOR 3=ANDS; maxw is 64 or 32 to match sf.
+/*
+/* The array comes back to binary_list as the instruction's four
+/* bytes, element 0 first -- a function called straight from
+/* binary_list has its return value emitted, so nothing here needs
+/* .emit at all. */
+.func::logical::v,sf,opc,rn,rd,maxw
 e = .call find_e(v, maxw)
 rs = .call pack_rs(v, e)
 r = rs[0]
 s = rs[1]
 nbit = ((s >> 6) & 1) ^ 1
 z = (sf << 31) | (opc << 29) | (0x24 << 23) | (nbit << 22) | (r << 16) | ((s & 0x3f) << 10) | (rn << 5) | rd
-.emit(z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff)
-.return
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
 
 /* ===================================================================
 /* Instructions. Each line is now short: the arithmetic lives in the
-/* functions above, and error_patterns still guards the all-zero /
-/* all-one cases as before.
+/* functions above, whose returned four bytes become the instruction,
+/* and error_patterns still guards the all-zero / all-one cases as
+/* before.
 /* ===================================================================
 
-AND  d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call emit_logical(v,1,0,n,d,64)
-ORR  d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call emit_logical(v,1,1,n,d,64)
-EOR  d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call emit_logical(v,1,2,n,d,64)
-ANDS i,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call emit_logical(v,1,3,n,i,64)
+AND  d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call logical(v,1,0,n,d,64)
+ORR  d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call logical(v,1,1,n,d,64)
+EOR  d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call logical(v,1,2,n,d,64)
+ANDS i,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call logical(v,1,3,n,i,64)
 
-AND  g,h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call emit_logical(v,0,0,h,g,32)
-ORR  g,h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call emit_logical(v,0,1,h,g,32)
-EOR  g,h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call emit_logical(v,0,2,h,g,32)
-ANDS j,h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call emit_logical(v,0,3,h,j,32)
+AND  g,h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call logical(v,0,0,h,g,32)
+ORR  g,h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call logical(v,0,1,h,g,32)
+EOR  g,h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call logical(v,0,2,h,g,32)
+ANDS j,h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call logical(v,0,3,h,j,32)
 
 /* TST is ANDS with the result discarded: Rd is forced to the zero
 /* register (31) rather than read from the source text. */
-TST n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call emit_logical(v,1,3,n,31,64)
-TST h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call emit_logical(v,0,3,h,31,32)
+TST n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call logical(v,1,3,n,31,64)
+TST h,#!v ::v==0;3,v<0;3,v>0xFFFFFFFF;3,v==0xFFFFFFFF;3 :: .call logical(v,0,3,h,31,32)

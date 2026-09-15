@@ -6710,6 +6710,45 @@ static void mini_compile_all(MiniFunc **v, int n){
 /* --------------------------- binary_list からの呼び出し --------------------------- */
 
 /* `.call 名前(引数, …)` を実行して objl に積む。戻り値は次に読む位置。 */
+/* `.call` の引数欄の `[式, 式, ...]` を読んで配列の値にする。
+ * t は書き換えてよい作業用バッファ。ok に 0 を返したら読めなかったということ。 */
+static MiniVal mini_arg_array(Assembler *asmb, char *t, int a, int *out_i, int *ok){
+    MiniVal v; memset(&v, 0, sizeof(v));
+    v.is_arr = 1;
+    *ok = 0;
+    int len = (int)strlen(t);
+    int depth = 0, k = a;
+    while(k < len){
+        if(t[k] == '(' || t[k] == '[') depth++;
+        else if(t[k] == ')' || t[k] == ']'){ depth--; if(depth == 0) break; }
+        k++;
+    }
+    if(depth != 0 || k >= len || t[k] != ']'){ *out_i = len; return v; }
+    /* 中身だけを見せるため、いったん `]` を終端にする。 */
+    t[k] = 0;
+    int i = a + 1;
+    while(1){
+        i = axx_skipspc(t, i);
+        if(!t[i]) break;
+        if(t[i] == ','){ i++; continue; }
+        int io;
+        uint256_t x = expr_expression_pat(asmb, t, i, &io);
+        if(io <= i) break;
+        i = io;
+        /* 未定義ラベル由来の巨大な番兵で反復回数が爆発しないよう 0 を渡す。 */
+        if(u256_is_undef_derived(x)) x = u256_zero();
+        mini_arr_reserve(&v, v.n + 1);
+        v.arr[v.n++] = x;
+        i = axx_skipspc(t, i);
+        if(t[i] == ','){ i++; continue; }
+        break;
+    }
+    t[k] = ']';
+    *out_i = k + 1;
+    *ok = 1;
+    return v;
+}
+
 static int mini_call_binary(Assembler *asmb, const char *s, int idx, IntVec *objl){
     AsmState *st = &asmb->st;
     int slen = (int)strlen(s);
@@ -6760,20 +6799,42 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx, IntVec *obj
     MiniVal *args = NULL;
     int nargs = 0, cargs = 0;
     int a = 0, alen = (int)strlen(argtext);
-    while(a < alen){
+    while(1){
+        a = axx_skipspc(argtext, a);
+        if(a >= alen || !argtext[a]) break;
         if(argtext[a] == ','){ a++; continue; }
-        int io;
-        uint256_t v = expr_expression_pat(asmb, argtext, a, &io);
-        if(io <= a) break;
-        a = io;
-        /* 未定義ラベル由来の巨大な番兵で反復回数が爆発しないよう 0 を渡す。 */
-        if(u256_is_undef_derived(v)) v = u256_zero();
+        MiniVal av;
+        /* `[式, 式, ...]` は配列の引数。要素もパターン層の式。 */
+        if(argtext[a] == '['){
+            int ok, io;
+            av = mini_arg_array(asmb, argtext, a, &io, &ok);
+            if(!ok){
+                mini_val_free(&av);
+                if(!quiet)
+                    axx_diagf(1, 0, " error - '.call %s': unbalanced '[' in the "
+                               "argument list.\n", name);
+                for(int i = 0; i < nargs; i++) mini_val_free(&args[i]);
+                free(args);
+                free(argtext);
+                return idx;
+            }
+            a = io;
+        } else {
+            int io;
+            uint256_t v = expr_expression_pat(asmb, argtext, a, &io);
+            if(io <= a) break;
+            a = io;
+            /* 未定義ラベル由来の巨大な番兵で反復回数が爆発しないよう 0 を渡す。 */
+            if(u256_is_undef_derived(v)) v = u256_zero();
+            av = mini_num(v);
+        }
         if(nargs >= cargs){
             cargs = cargs ? cargs * 2 : 8;
             args = realloc(args, (size_t)cargs * sizeof(MiniVal));
             if(!args){ perror("realloc"); exit(1); }
         }
-        args[nargs++] = mini_num(v);
+        args[nargs++] = av;
+        a = axx_skipspc(argtext, a);
         if(a < alen && argtext[a] == ','){ a++; continue; }
         break;
     }
@@ -6789,6 +6850,13 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx, IntVec *obj
     if(setjmp(r.c.jb) == 0){
         mini_call_func(&r, f, args, nargs);
         for(int i = 0; i < r.out.len; i++) iv_push(objl, r.out.data[i]);
+        /* 返り値もワードになる。配列なら添字 0 から順に、スカラーなら 1 ワード。 */
+        if(r.has_ret){
+            if(r.retval.is_arr)
+                for(int i = 0; i < r.retval.n; i++) iv_push(objl, r.retval.arr[i]);
+            else
+                iv_push(objl, r.retval.num);
+        }
     } else {
         if(!quiet) axx_diagf(1, 0, " error - %s\n", r.c.err);
     }
@@ -7321,14 +7389,21 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
             idx++;
             continue;
         }
-        int semicolon=0;
-        if(s[idx]==';'){ semicolon=1; idx++; }
+        int semicolon=0, drop=0;
+        if(s[idx]==';'){
+            semicolon=1; idx++;
+            /* `;;要素` は評価だけして何も出さない。 */
+            if(s[idx]==';'){ drop=1; idx++; }
+        }
         if(s[idx]=='.' && axx_upper_char(s[idx+1])=='C' && axx_upper_char(s[idx+2])=='A'
            && axx_upper_char(s[idx+3])=='L' && axx_upper_char(s[idx+4])=='L'
            && !(isalnum((unsigned char)s[idx+5]) || s[idx+5]=='_')){
-            if(semicolon && !st->pass1_size_mode)
-                axx_diagf(1, 0, " error - ';' cannot be applied to '.call'.\n");
-            idx = mini_call_binary(asmb, s, idx, objl);
+            IntVec callw; iv_init(&callw);
+            idx = mini_call_binary(asmb, s, idx, &callw);
+            /* `;` 付きは、出したワードが 1 個で 0 のときだけ何も出さない。 */
+            if(!(drop || (semicolon && callw.len == 1 && u256_is_zero(callw.data[0]))))
+                for(int q = 0; q < callw.len; q++) iv_push(objl, callw.data[q]);
+            iv_free(&callw);
             if(s[idx]==','){ idx++; continue; }
             break;
         }
@@ -7344,7 +7419,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         /* 破綻点修正: 以前は未定義ラベルを含むワードを objl に積まずに読み飛ばして
          * いたため、命令長と `$.` が axx.py（値がゴミでも必ず積む）とずれていた。
          * 未定義は error_undefined_label の伝播だけで表現し、長さは変えない。 */
-        if(semicolon ? !u256_is_zero(x) : 1){
+        if(!drop && (semicolon ? !u256_is_zero(x) : 1)){
             iv_push(objl,x);
         } else {
             int wi2 = 0;
