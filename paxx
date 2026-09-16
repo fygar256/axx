@@ -348,62 +348,6 @@ def _dot_kw(s):
     return StringUtils.upper(t[:j])
 
 
-def _parse_func_header(l):
-    """`.func 名前(引数, 引数)` の見出しを (名前, 引数リスト, エラー文) に分解する。
-
-    引数欄は丸ごと省略できる（`.func name`）。空の括弧 `.func name()` も同じ
-    意味。`.call 名前(引数)` の呼び出し側と同じ書き方にそろえるための形。
-
-    旧来の `.func::名前::引数,引数` も読める。`.func` の直後が `::` のときだけ
-    そちらに切り替えるので、新しい形と取り違えることはない。
-    """
-    t = l.strip()
-    i = 1
-    while i < len(t) and (t[i].isalnum() or t[i] == '_'):
-        i += 1
-    i = StringUtils.skipspc(t, i)
-
-    if t[i:i + 2] == '::':
-        # 旧形式。`::` で最大3欄に割る。
-        hdr = []
-        hi = 0
-        while True:
-            hi = StringUtils.skipspc(t, hi)
-            fld = ''
-            while hi < len(t):
-                if t[hi:hi + 2] == '::':
-                    hi += 2
-                    break
-                fld += t[hi]
-                hi += 1
-            hdr.append(fld.rstrip(' \t'))
-            if len(t) <= hi:
-                break
-        nm = (hdr[1] if len(hdr) > 1 else '').strip()
-        ps = [p.strip() for p in (hdr[2] if len(hdr) > 2 else '').split(',') if p.strip()]
-        return nm, ps, None
-
-    j = i
-    while j < len(t) and (t[j].isalnum() or t[j] == '_'):
-        j += 1
-    nm = t[i:j]
-    k = StringUtils.skipspc(t, j)
-
-    if k >= len(t):
-        return nm, [], None
-    if t[k] != '(':
-        return nm, [], (f" error - '.func': expected '(' or end of line after the "
-                        f"name, got {t[k:]!r}")
-    e = t.rfind(')')
-    if e < k:
-        return nm, [], " error - '.func': missing closing ')' in the parameter list."
-    if t[e + 1:].strip():
-        return nm, [], (f" error - '.func': trailing text after ')': "
-                        f"{t[e + 1:].strip()!r}")
-    ps = [p.strip() for p in t[k + 1:e].split(',') if p.strip()]
-    return nm, ps, None
-
-
 # ミニ言語のブロック開始・終了キーワード。パターンファイルを読む段階で
 # `.endfunc`（関数本体を閉じる）が `.if`/`.while`/`.for` の中で来ていないか
 # 見分けるために使う。`.return` はここでは特別扱いしない（早期リターン文と
@@ -4256,22 +4200,27 @@ class PatternFileReader:
             _dk = _dot_kw(l)
             if func_stack or _dk == '.FUNC':
                 if _dk == '.FUNC':
-                    _nm, _ps, _hdr_err = _parse_func_header(l)
+                    _hdr = []
+                    _hi = 0
+                    while True:
+                        _s, _hi = self.parser.get_params1(l, _hi)
+                        _hdr += [_s]
+                        if len(l) <= _hi:
+                            break
+                    _nm = (_hdr[1] if len(_hdr) > 1 else '').strip()
+                    _ps = [_p.strip() for _p in (_hdr[2] if len(_hdr) > 2 else '').split(',')
+                           if _p.strip()]
                     parent = func_stack[-1] if func_stack else None
-                    if _hdr_err is not None:
-                        diag(_hdr_err, set_error=True)
-                        _nm = None
-                    elif not _is_sub_name(_nm):
+                    if not _is_sub_name(_nm):
                         diag(f" error - '.func' needs a name made of letters, digits "
                              f"and '_': {_nm!r}", set_error=True)
                         _nm = None
-                    else:
-                        for _p in _ps:
-                            if not _is_sub_name(_p):
-                                diag(f" error - '.func {_nm}': bad parameter name {_p!r}",
-                                     set_error=True)
-                                _nm = None
-                                break
+                    for _p in _ps:
+                        if not _is_sub_name(_p):
+                            diag(f" error - '.func::{_nm}': bad parameter name {_p!r}",
+                                 set_error=True)
+                            _nm = None
+                            break
                     if _nm is not None:
                         _fn_obj = _MiniFunc(_nm, _ps, parent, fn, _mln)
                         target = parent.children if parent else self.funcs
@@ -4290,7 +4239,7 @@ class PatternFileReader:
                     # 閉じきらないまま来たら壊れたパターンなので報告するが、
                     # 後続行を巻き込まないよう関数はここで閉じてしまう。
                     if cur.depth != 0:
-                        diag(f" error - '.func {cur.name}': '.endfunc' while a block "
+                        diag(f" error - '.func::{cur.name}': '.endfunc' while a block "
                              f"('.if'/'.while'/'.for') is still open.", set_error=True)
                     func_stack.pop()
                     continue

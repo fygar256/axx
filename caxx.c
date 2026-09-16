@@ -7223,6 +7223,130 @@ static char *pat_trim(char *s){
     return p;
 }
 
+/* `.func 名前(引数, 引数)` の見出しを名前と引数名の配列に分解する。
+ * 引数欄は丸ごと省略できる（`.func name`）。空の括弧 `.func name()` も同じ。
+ * `.call 名前(引数)` の呼び出し側と同じ書き方にそろえるための形。
+ *
+ * 旧来の `.func::名前::引数,引数` も読める。`.func` の直後が `::` のときだけ
+ * そちらに切り替えるので、新しい形と取り違えることはない。
+ *
+ * 戻り値: 0=成功。0以外ならエラーで、errbuf に理由が入る。
+ * name / params は呼び出し側が用意した領域に書く（params は最大 npmax 個）。 */
+static int parse_func_header(const char *l, char *name, size_t nsz,
+                             char *params, size_t psz, int npmax, int *np,
+                             char *errbuf, size_t esz){
+    name[0] = '\0';
+    *np = 0;
+    errbuf[0] = '\0';
+
+    /* 行頭の空白を落とし、末尾の空白も見ないよう長さを詰める。 */
+    int b = axx_skipspc(l, 0);
+    const char *t = l + b;
+    int tlen = (int)strlen(t);
+    while(tlen > 0 && isspace((unsigned char)t[tlen-1])) tlen--;
+
+    int i = 1;   /* t[0] は '.' */
+    while(i < tlen && (isalnum((unsigned char)t[i]) || t[i]=='_')) i++;
+    i = axx_skipspc(t, i);
+
+    if(t[i]==':' && t[i+1]==':'){
+        /* 旧形式。`::` で最大3欄に割る。 */
+        size_t hsz = (size_t)tlen + 1;
+        char *hbuf = malloc(3 * hsz);
+        if(!hbuf){ perror("malloc"); exit(1); }
+        char *hf[3];
+        for(int q=0;q<3;q++){ hf[q] = hbuf + (size_t)q*hsz; hf[q][0] = '\0'; }
+        int hn = 0, hi = 0;
+        while(1){
+            hi = axx_get_params1(t, hi, hf[hn], hsz);
+            hn++;
+            if(hi >= tlen || hn >= 3) break;
+        }
+        const char *nm = (hn > 1) ? pat_trim(hf[1]) : "";
+        snprintf(name, nsz, "%s", nm);
+        if(hn > 2){
+            char *tok = strtok(hf[2], ",");
+            while(tok){
+                char *pn = pat_trim(tok);
+                if(pn[0]){
+                    if(*np >= npmax){
+                        snprintf(errbuf, esz, " error - '.func': more than %d parameters.\n", npmax);
+                        free(hbuf);
+                        return 1;
+                    }
+                    snprintf(params + (size_t)(*np)*psz, psz, "%s", pn);
+                    (*np)++;
+                }
+                tok = strtok(NULL, ",");
+            }
+        }
+        free(hbuf);
+        return 0;
+    }
+
+    int j = i;
+    while(j < tlen && (isalnum((unsigned char)t[j]) || t[j]=='_')) j++;
+    if((size_t)(j - i) >= nsz){
+        snprintf(errbuf, esz, " error - '.func': name is too long.\n");
+        return 1;
+    }
+    memcpy(name, t + i, (size_t)(j - i));
+    name[j - i] = '\0';
+
+    int k = axx_skipspc(t, j);
+    if(k >= tlen) return 0;                 /* `.func name` — 引数なし */
+    if(t[k] != '('){
+        snprintf(errbuf, esz, " error - '.func': expected '(' or end of line after "
+                 "the name, got '%.*s'\n", tlen - k, t + k);
+        return 1;
+    }
+    int e = -1;
+    for(int q = tlen - 1; q > k; q--) if(t[q] == ')'){ e = q; break; }
+    if(e < 0){
+        snprintf(errbuf, esz, " error - '.func': missing closing ')' in the "
+                 "parameter list.\n");
+        return 1;
+    }
+    for(int q = e + 1; q < tlen; q++){
+        if(!isspace((unsigned char)t[q])){
+            /* 前後の空白は落として報告する（axx.py の strip() と揃える）。 */
+            int ts = e + 1, te = tlen;
+            while(ts < te && isspace((unsigned char)t[ts])) ts++;
+            while(te > ts && isspace((unsigned char)t[te-1])) te--;
+            snprintf(errbuf, esz, " error - '.func': trailing text after ')': "
+                     "'%.*s'\n", te - ts, t + ts);
+            return 1;
+        }
+    }
+
+    /* 括弧の中をカンマで割る。strtok は使わず自前で刻む（呼び出し側の
+     * バッファを壊さないため）。 */
+    int q = k + 1;
+    while(q < e){
+        int st2 = q;
+        while(q < e && t[q] != ',') q++;
+        int en = q;
+        while(st2 < en && isspace((unsigned char)t[st2])) st2++;
+        while(en > st2 && isspace((unsigned char)t[en-1])) en--;
+        if(en > st2){
+            if(*np >= npmax){
+                snprintf(errbuf, esz, " error - '.func': more than %d parameters.\n", npmax);
+                return 1;
+            }
+            int plen = en - st2;
+            if((size_t)plen >= psz){
+                snprintf(errbuf, esz, " error - '.func': parameter name is too long.\n");
+                return 1;
+            }
+            memcpy(params + (size_t)(*np)*psz, t + st2, (size_t)plen);
+            params[(size_t)(*np)*psz + plen] = '\0';
+            (*np)++;
+        }
+        if(q < e) q++;  /* ',' を飛ばす */
+    }
+    return 0;
+}
+
 static void readpat(Assembler *asmb, const char *fn){
     if(!fn||!fn[0]) return;
 
@@ -7347,39 +7471,39 @@ static void readpat(Assembler *asmb, const char *fn){
                                    (int)(sizeof(func_stack)/sizeof(func_stack[0])));
                         continue;
                     }
-                    size_t hsz = strlen(line) + 1;
-                    char *hbuf = malloc(3 * hsz);
-                    if(!hbuf){ perror("malloc"); exit(1); }
-                    char *hf[3];
-                    for(int q=0;q<3;q++){ hf[q] = hbuf + (size_t)q*hsz; hf[q][0] = 0; }
-                    int hn = 0, hi = 0;
-                    while(1){
-                        hi = axx_get_params1(line, hi, hf[hn], hsz);
-                        hn++;
-                        if(hi >= (int)strlen(line) || hn >= 3) break;
-                    }
-                    char *nm = (hn > 1) ? pat_trim(hf[1]) : (char*)"";
-                    int ok = is_sub_name(nm);
-                    if(!ok)
+                    enum { FUNC_PARAM_MAX = 64, FUNC_NAME_MAX = 256 };
+                    char nmbuf[FUNC_NAME_MAX];
+                    char *pbuf = malloc((size_t)FUNC_PARAM_MAX * FUNC_NAME_MAX);
+                    if(!pbuf){ perror("malloc"); exit(1); }
+                    char errbuf[512];
+                    int nparam = 0;
+                    int hdr_err = parse_func_header(line, nmbuf, sizeof(nmbuf),
+                                                    pbuf, FUNC_NAME_MAX,
+                                                    FUNC_PARAM_MAX, &nparam,
+                                                    errbuf, sizeof(errbuf));
+                    int ok = 1;
+                    if(hdr_err){
+                        axx_diagf(1, 0, "%s", errbuf);
+                        ok = 0;
+                    } else if(!is_sub_name(nmbuf)){
                         axx_diagf(1, 0, " error - '.func' needs a name made of letters, "
-                                   "digits and '_': '%s'\n", nm);
+                                   "digits and '_': '%s'\n", nmbuf);
+                        ok = 0;
+                    }
                     MiniFunc *parent = nfunc_stack ? func_stack[nfunc_stack-1] : NULL;
-                    MiniFunc *nf = mini_func_new(asmb, parent, ok ? nm : "?", fn, li + 1);
-                    if(ok && hn > 2){
-                        char *ps = hf[2];
-                        char *tok = strtok(ps, ",");
-                        while(tok){
-                            char *pn = pat_trim(tok);
+                    MiniFunc *nf = mini_func_new(asmb, parent, ok ? nmbuf : "?", fn, li + 1);
+                    if(ok){
+                        for(int q=0;q<nparam;q++){
+                            char *pn = pbuf + (size_t)q*FUNC_NAME_MAX;
                             if(!is_sub_name(pn)){
-                                axx_diagf(1, 0, " error - '.func::%s': bad parameter "
-                                           "name '%s'\n", nm, pn);
+                                axx_diagf(1, 0, " error - '.func %s': bad parameter "
+                                           "name '%s'\n", nmbuf, pn);
                             } else {
                                 mini_func_addparam(nf, pn);
                             }
-                            tok = strtok(NULL, ",");
                         }
                     }
-                    free(hbuf);
+                    free(pbuf);
                     func_stack[nfunc_stack++] = nf;
                     continue;
                 }
@@ -7389,7 +7513,7 @@ static void readpat(Assembler *asmb, const char *fn){
                      * 閉じきらないまま来たら壊れたパターンなので報告するが、
                      * 後続行を巻き込まないよう関数はここで閉じてしまう。 */
                     if(cur->depth != 0){
-                        axx_diagf(1, 0, " error - '.func::%s': '.endfunc' while a block "
+                        axx_diagf(1, 0, " error - '.func %s': '.endfunc' while a block "
                                    "('.if'/'.while'/'.for') is still open.\n", cur->name);
                     }
                     nfunc_stack--;

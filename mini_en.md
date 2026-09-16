@@ -15,14 +15,18 @@ bytes — and the same `.echo` text on stderr.
 ## Defining and calling
 
 ```
-.func::<name>::<parameter, parameter, ...>
+.func <name>(<parameter, parameter, ...>)
 <statements>
 .endfunc
 ```
 
 Everything from the header to the matching `.endfunc` is the body; those lines are
 never matched as pattern lines. The parameter field may be empty
-(`.func::name::`). Names and parameter names are letters, digits and `_`.
+(`.func name()`, or just `.func name`). Names and parameter names are letters,
+digits and `_`. It is the same shape as the call site's `.call name(a,b)`.
+
+The older `.func::name::params` header is still read. A `::` directly after
+`.func` selects it, so existing pattern files keep working unchanged.
 
 ```
 MOV a,!b,!c :: .call name(a,b,c)
@@ -63,7 +67,7 @@ One statement per line.
 | `.nonlocal a, b` | Treat these names as belonging to an enclosing call |
 | `.return` | Return from the function. May appear anywhere in the body (top level or inside `.if`/`.while`/`.for`), any number of times |
 | `.return expr` | Return a value from the function |
-| `.func::name::params...` … `.endfunc` | Nested function definition; `.endfunc` closes the body |
+| `.func name(params...)` … `.endfunc` | Nested function definition; `.endfunc` closes the body |
 
 The `.if` and `.elif` lines must end with `.then`. Any number of `.elif`
 branches may follow an `.if`, and an `.else` may close the chain; a single
@@ -114,7 +118,7 @@ the same way.
 
 MOV !n :: .call mov(n)
 
-.func::mov::n
+.func mov(n)
 .if n > 255 .then
 .raise 3
 .return
@@ -154,7 +158,7 @@ comes back usable as it is.
 ```
 BR !t :: .call rel8(t)
 
-.func::rel8::target
+.func rel8(target)
 d = target - $.
 .if d < 0-128 || d > 127 .then
 .raise 2
@@ -251,9 +255,9 @@ on to the top level. `.nonlocal` makes a name refer to a variable of an enclosin
 call instead of a local one.
 
 ```
-.func::outer::
+.func outer()
 n=7
-.func::inner::
+.func inner()
 .nonlocal n
 n=n+1
 .emit(n)
@@ -279,11 +283,11 @@ enclosing call has the name, it is an error.
 `var = .call name(args)`.
 
 ```
-.func::hypot2::a,b
+.func hypot2(a,b)
 .return a*a+b*b
 .endfunc
 
-.func::emit_h::a,b
+.func emit_h(a,b)
 v = .call hypot2(a,b)
 .emit(v)
 .return
@@ -310,7 +314,7 @@ v = .call hypot2(a,b)
 ```
 SEQ !n :: 0xaa,.call seq(n),0xbb
 
-.func::seq::n
+.func seq(n)
 a=[]
 .for i in range(n)
 a[i]=0xc0+i
@@ -324,7 +328,7 @@ seq 4                -> aa c0 c1 c2 c3 bb
 ```
 
 ```
-.func::mkarr::n
+.func mkarr(n)
 a=[]
 .for i in range(n)
 a[i]=i*i
@@ -332,7 +336,7 @@ a[i]=i*i
 .return a
 .endfunc
 
-.func::use::n
+.func use(n)
 v = .call mkarr(n)
 .emit(.len(v))
 .emit(v[2])
@@ -343,7 +347,7 @@ v = .call mkarr(n)
 Returning early works as well.
 
 ```
-.func::firstdiv::n
+.func firstdiv(n)
 i=2
 .while(i<n)
 .if n%i==0 .then
@@ -403,7 +407,7 @@ A sieve, and an instruction whose encoding is a Collatz step count.
 PRIMES !n  :: .call sieve(n)
 COLLATZ !n :: .call collatz(n)
 
-.func::sieve::n
+.func sieve(n)
 mark=[]
 mark[n]=0
 i=2
@@ -425,7 +429,7 @@ i=i+1
 .return
 .endfunc
 
-.func::collatz::n
+.func collatz(n)
 c=0
 .while(n!=1)
 .if n%2==0 .then
@@ -450,7 +454,7 @@ Recursion works too.
 ```
 FIB !n :: .call fib(n)
 
-.func::fib::k
+.func fib(k)
 .if k<2 .then
 .emit(k)
 .else
@@ -466,7 +470,7 @@ With return values, the same recursion can build the value itself.
 ```
 FIBV !n :: .call fibv(n)
 
-.func::fibn::k
+.func fibn(k)
 .if k<2 .then
 .return k
 .endif
@@ -475,7 +479,7 @@ q = .call fibn(k-2)
 .return p+q
 .endfunc
 
-.func::fibv::n
+.func fibv(n)
 v = .call fibn(n)
 .emit(v)
 .return

@@ -801,14 +801,16 @@ anything, for working out why a function produced what it did.
 A function is defined at the top level of a pattern file:
 
 ```
-.func::<name>::<parameter, parameter, ...>
+.func <name>(<parameter, parameter, ...>)
 <statements>
 .endfunc
 ```
 
 Everything between the header and the matching `.endfunc` is the body; those
 lines are never matched as ordinary pattern lines. Parameters may be empty
-(`.func::name::`).
+(`.func name()`, or just `.func name`) — the same shape as the `.call name(...)`
+that invokes it. The older `.func::name::params` header is still read; a `::`
+directly after `.func` selects it, so existing pattern files keep working.
 
 ```
 MOV a,!b,!c :: .call name(a,b,c)
@@ -912,7 +914,7 @@ written.
 
 MOV !n :: .call mov(n)
 
-.func::mov::n
+.func mov(n)
 .if n > 255 .then
 .raise 3
 .return
@@ -936,7 +938,7 @@ is.
 ```
 BR !t :: .call rel8(t)
 
-.func::rel8::target
+.func rel8(target)
 d = target - $.
 .if d < 0-128 || d > 127 .then
 .echo("branch out of range:", d)
@@ -958,11 +960,11 @@ A value derived from an undefined label comes through as 0, the same treatment
 `var = .call name(args)`:
 
 ```
-.func::hypot2::a,b
+.func hypot2(a,b)
 .return a*a+b*b
 .endfunc
 
-.func::emit_h::a,b
+.func emit_h(a,b)
 v = .call hypot2(a,b)
 .emit(v)
 .return
@@ -978,7 +980,7 @@ that — so `.return <expr>` may also be used as an early return from inside a
 block, any number of times:
 
 ```
-.func::firstdiv::n
+.func firstdiv(n)
 i=2
 .while(i<n)
 .if n%i==0 .then
@@ -998,7 +1000,7 @@ That is in addition to whatever it passed to `.emit`, so a function that only
 ```
 SEQ !n :: 0xaa,.call seq(n),0xbb
 
-.func::seq::n
+.func seq(n)
 a=[]
 .for i in range(n)
 a[i]=0xc0+i
@@ -1041,9 +1043,9 @@ to its enclosing function and resolves names outward; `.nonlocal` lets it
 assign to a variable of an enclosing call rather than creating its own:
 
 ```
-.func::outer::
+.func outer()
 n=7
-.func::inner::
+.func inner()
 .nonlocal n
 n=n+1
 .emit(n)
@@ -1070,7 +1072,7 @@ A sieve, and an instruction whose encoding is a Collatz step count:
 PRIMES !n  :: .call sieve(n)
 COLLATZ !n :: .call collatz(n)
 
-.func::sieve::n
+.func sieve(n)
 mark=[]
 mark[n]=0
 i=2
@@ -1092,7 +1094,7 @@ i=i+1
 .return
 .endfunc
 
-.func::collatz::n
+.func collatz(n)
 c=0
 .while(n!=1)
 .if n%2==0 .then

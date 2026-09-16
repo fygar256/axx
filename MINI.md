@@ -14,13 +14,17 @@ axx.py と caxx.c の両方に同一仕様で実装されている。値は両�
 ## 定義と呼び出し
 
 ```
-.func::<名前>::<引数, 引数, ...>
+.func <名前>(<引数, 引数, ...>)
 <文>
 .endfunc
 ```
 
 見出しから対応する `.endfunc` までが本体で、この行はパターン行としては照合されない。
-引数欄は空でもよい（`.func::name::`）。名前と引数名は英数字と `_`。
+引数が無いときは `.func name()` でも `.func name` でもよい。名前と引数名は英数字と
+`_`。呼び出し側の `.call name(a,b)` と同じ書き方である。
+
+旧来の `.func::名前::引数,引数` も読める。`.func` の直後が `::` のときだけそちらに
+切り替わるので、既存のパターンファイルはそのまま動く。
 
 ```
 MOV a,!b,!c :: .call name(a,b,c)
@@ -59,7 +63,7 @@ LOG !v :: .call table([0x11,0x22,v],3)
 | `.nonlocal a, b` | その名前を外側の呼び出しのものとして扱う |
 | `.return` | 関数から戻る。本体中どこでも（トップレベルでも `.if`/`.while`/`.for` の中でも）、何度でも書ける |
 | `.return 式` | 値を返して関数から戻る |
-| `.func::名前::引数...` … `.endfunc` | 入れ子の関数定義。本体を閉じるのは `.endfunc` |
+| `.func 名前(引数...)` … `.endfunc` | 入れ子の関数定義。本体を閉じるのは `.endfunc` |
 
 `.if` と `.elif` の行は `.then` で終わること。`.if` のあとに `.elif` を何段
 続けてもよく、最後に `.else` を置ける。連鎖全体を閉じる `.endif` は 1 つでよい。
@@ -105,7 +109,7 @@ LOG !v :: .call table([0x11,0x22,v],3)
 
 MOV !n :: .call mov(n)
 
-.func::mov::n
+.func mov(n)
 .if n > 255 .then
 .raise 3
 .return
@@ -143,7 +147,7 @@ MOV 300              -> Line 1 Error code 3 immediate out of range:
 ```
 BR !t :: .call rel8(t)
 
-.func::rel8::target
+.func rel8(target)
 d = target - $.
 .if d < 0-128 || d > 127 .then
 .raise 2
@@ -233,9 +237,9 @@ b = a[1:3]        /* [0,0]。終了の添字は含まない */
 自分のローカルではなく外側の呼び出しの変数を指す。
 
 ```
-.func::outer::
+.func outer()
 n=7
-.func::inner::
+.func inner()
 .nonlocal n
 n=n+1
 .emit(n)
@@ -260,11 +264,11 @@ n=n+1
 `.return 式` と書くと値を返す。呼ぶ側は `var = .call 名前(引数, ...)` の形で受け取る。
 
 ```
-.func::hypot2::a,b
+.func hypot2(a,b)
 .return a*a+b*b
 .endfunc
 
-.func::emit_h::a,b
+.func emit_h(a,b)
 v = .call hypot2(a,b)
 .emit(v)
 .return
@@ -289,7 +293,7 @@ v = .call hypot2(a,b)
 ```
 SEQ !n :: 0xaa,.call seq(n),0xbb
 
-.func::seq::n
+.func seq(n)
 a=[]
 .for i in range(n)
 a[i]=0xc0+i
@@ -303,7 +307,7 @@ seq 4                -> aa c0 c1 c2 c3 bb
 ```
 
 ```
-.func::mkarr::n
+.func mkarr(n)
 a=[]
 .for i in range(n)
 a[i]=i*i
@@ -311,7 +315,7 @@ a[i]=i*i
 .return a
 .endfunc
 
-.func::use::n
+.func use(n)
 v = .call mkarr(n)
 .emit(.len(v))
 .emit(v[2])
@@ -322,7 +326,7 @@ v = .call mkarr(n)
 早期に戻ることもできる。
 
 ```
-.func::firstdiv::n
+.func firstdiv(n)
 i=2
 .while(i<n)
 .if n%i==0 .then
@@ -376,7 +380,7 @@ i=i+1
 PRIMES !n  :: .call sieve(n)
 COLLATZ !n :: .call collatz(n)
 
-.func::sieve::n
+.func sieve(n)
 mark=[]
 mark[n]=0
 i=2
@@ -398,7 +402,7 @@ i=i+1
 .return
 .endfunc
 
-.func::collatz::n
+.func collatz(n)
 c=0
 .while(n!=1)
 .if n%2==0 .then
@@ -423,7 +427,7 @@ collatz 27           -> 6f
 ```
 FIB !n :: .call fib(n)
 
-.func::fib::k
+.func fib(k)
 .if k<2 .then
 .emit(k)
 .else
@@ -439,7 +443,7 @@ FIB !n :: .call fib(n)
 ```
 FIBV !n :: .call fibv(n)
 
-.func::fibn::k
+.func fibn(k)
 .if k<2 .then
 .return k
 .endif
@@ -448,7 +452,7 @@ q = .call fibn(k-2)
 .return p+q
 .endfunc
 
-.func::fibv::n
+.func fibv(n)
 v = .call fibn(n)
 .emit(v)
 .return
