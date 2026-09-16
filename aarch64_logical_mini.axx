@@ -152,6 +152,7 @@ x = x >> 1
 p = p + 1
 .endwhile
 .return p
+.endfunc
 
 /* find_e(v,maxw): the smallest element size e in {2,4,8,...,maxw}
 /* such that v is exactly v's low e bits repeated across all of the
@@ -174,6 +175,7 @@ cw = cw * 2
 e = e * 2
 .endwhile
 .return maxw
+.endfunc
 
 /* pack_rs(v,e): given the element size e found by find_e, locates the
 /* single run of set bits within one element and returns [r, s] --
@@ -210,6 +212,7 @@ r = (e - (p + hq)) & (e - 1)
 .endif
 s = ((0 - 2 * e) & 0x7f) | (b - 1)
 .return [r, s]
+.endfunc
 
 /* logical(v,sf,opc,rn,rd,maxw): ties the three functions together and
 /* returns the finished 32-bit instruction word as four little-endian
@@ -228,6 +231,7 @@ s = rs[1]
 nbit = ((s >> 6) & 1) ^ 1
 z = (sf << 31) | (opc << 29) | (0x24 << 23) | (nbit << 22) | (r << 16) | ((s & 0x3f) << 10) | (rn << 5) | rd
 .return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
 
 /* ===================================================================
 /* Instructions. Each line is now short: the arithmetic lives in the
