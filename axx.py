@@ -4415,6 +4415,10 @@ def _mini_signed(v):
 _MINI_OPS2 = ('**', '<<', '>>', '<=', '>=', '==', '!=', '&&', '||')
 _MINI_OPS1 = frozenset('+-*/%&|^~<>!()[]:,=')
 
+# 文字列リテラルで使える逃げ記号。値は整数と配列だけなので、文字列が書けるのは
+# `.echo` の引数欄だけである。
+_MINI_ESC = {'\\': '\\', '"': '"', 'n': '\n', 't': '\t'}
+
 
 def _mini_lex(text, pos):
     """1行を字句に分解する。返すのは (種別, 値) の並び。"""
@@ -4463,6 +4467,31 @@ def _mini_lex(text, pos):
             if j == i + 1:
                 raise MiniLangError(f"{pos[0]}:{pos[1]}: stray '.'")
             toks.append(('dot', StringUtils.upper(t[i:j])))
+            i = j
+            continue
+        if c == '"':
+            j = i + 1
+            buf = []
+            while True:
+                if j >= n:
+                    raise MiniLangError(f"{pos[0]}:{pos[1]}: unterminated string")
+                ch = t[j]
+                if ch == '"':
+                    j += 1
+                    break
+                if ch == '\\':
+                    if j + 1 >= n:
+                        raise MiniLangError(f"{pos[0]}:{pos[1]}: unterminated string")
+                    e = t[j + 1]
+                    if e not in _MINI_ESC:
+                        raise MiniLangError(f"{pos[0]}:{pos[1]}: unknown escape "
+                                            f"'\\{e}' in a string")
+                    buf.append(_MINI_ESC[e])
+                    j += 2
+                    continue
+                buf.append(ch)
+                j += 1
+            toks.append(('str', ''.join(buf)))
             i = j
             continue
         if t[i:i + 2] in _MINI_OPS2:
@@ -4626,6 +4655,8 @@ class _MiniExprParser:
 
     def primary_(self):
         k, v = self.peek()
+        if k == 'str':
+            self.fail("a string can only be used in '.echo'")
         if k == 'num':
             self.i += 1
             return ('num', _mini_wrap(v))
@@ -4673,7 +4704,7 @@ class _MiniExprParser:
 class MiniParser:
     """`.func` 本体の行の並びを文の木にする。"""
 
-    _ENDERS = frozenset(('.ELSE', '.ENDIF', '.NEXT', '.ENDWHILE'))
+    _ENDERS = frozenset(('.ELIF', '.ELSE', '.ENDIF', '.NEXT', '.ENDWHILE'))
 
     def __init__(self, func):
         self.func = func
@@ -4697,22 +4728,8 @@ class MiniParser:
             if kw in self._ENDERS:
                 raise MiniLangError(f"{f}:{ln}: '{kw.lower()}' without a matching opener")
             if kw == '.IF':
-                toks = _mini_lex(text, pos)
-                if not toks or toks[-1] != ('dot', '.THEN'):
-                    raise MiniLangError(f"{f}:{ln}: '.if' must end with '.then'")
-                cond = _MiniExprParser(toks[1:-1], pos).parse()
-                then_b, i = self._block(i + 1, ('.ELSE', '.ENDIF'))
-                if i >= len(self.lines):
-                    raise MiniLangError(f"{f}:{ln}: '.if' is never closed with '.endif'")
-                else_b = []
-                if _dot_kw(self.lines[i][0]) == '.ELSE':
-                    rest = _mini_lex(self.lines[i][0], pos)[1:]
-                    if rest:
-                        raise MiniLangError(f"{f}:{ln}: unexpected text after '.else'")
-                    else_b, i = self._block(i + 1, ('.ENDIF',))
-                    if i >= len(self.lines):
-                        raise MiniLangError(f"{f}:{ln}: '.if' is never closed with '.endif'")
-                out.append(('if', cond, then_b, else_b, pos))
+                node, i = self._if_chain(i)
+                out.append(node)
                 i += 1
                 continue
             if kw == '.WHILE':
@@ -4735,6 +4752,37 @@ class MiniParser:
             out.append(self._simple(text, pos))
             i += 1
         return out, i
+
+    def _if_chain(self, i):
+        """`.if`／`.elif` の 1 段を読む。戻り値は (文, `.endif` の行番号)。
+
+        `.elif` は「`.else` の中に `.if` が 1 つだけある」形に展開する。連鎖の
+        途中では `.endif` を読み飛ばさないので、いちばん外側の呼び出し元だけが
+        1 行進めればよい。
+        """
+        text, f, ln = self.lines[i]
+        pos = (f, ln)
+        kw = _dot_kw(text)
+        toks = _mini_lex(text, pos)
+        if not toks or toks[-1] != ('dot', '.THEN'):
+            raise MiniLangError(f"{f}:{ln}: '{kw.lower()}' must end with '.then'")
+        cond = _MiniExprParser(toks[1:-1], pos).parse()
+        then_b, i = self._block(i + 1, ('.ELIF', '.ELSE', '.ENDIF'))
+        if i >= len(self.lines):
+            raise MiniLangError(f"{f}:{ln}: '.if' is never closed with '.endif'")
+        else_b = []
+        nkw = _dot_kw(self.lines[i][0])
+        if nkw == '.ELIF':
+            node, i = self._if_chain(i)
+            else_b = [node]
+        elif nkw == '.ELSE':
+            rest = _mini_lex(self.lines[i][0], pos)[1:]
+            if rest:
+                raise MiniLangError(f"{f}:{ln}: unexpected text after '.else'")
+            else_b, i = self._block(i + 1, ('.ENDIF',))
+            if i >= len(self.lines):
+                raise MiniLangError(f"{f}:{ln}: '.if' is never closed with '.endif'")
+        return ('if', cond, then_b, else_b, pos), i
 
     def _for_header(self, text, pos):
         toks = _mini_lex(text, pos)
@@ -4783,6 +4831,25 @@ class MiniParser:
                 if not args:
                     raise MiniLangError(f"{f}:{ln}: '.emit' needs at least one value")
                 return ('emit', args, pos)
+            if v == '.ECHO':
+                # 項目は文字列リテラルか式。文字列はそのまま、式は値を表示する。
+                p = _MiniExprParser(toks[1:], pos)
+                p.expect_op('(')
+                items = []
+                if not p.at_op(')'):
+                    while True:
+                        k2, v2 = p.peek()
+                        if k2 == 'str':
+                            p.i += 1
+                            items.append(('s', v2))
+                        else:
+                            items.append(('e', p.or_()))
+                        if not p.eat_op(','):
+                            break
+                p.expect_op(')')
+                if not p.at_end():
+                    raise MiniLangError(f"{f}:{ln}: unexpected text after '.echo(...)'")
+                return ('echo', items, pos)
             if v == '.CALL':
                 name, args = self._call_tail(toks, pos)
                 return ('call', name, args, pos)
@@ -4863,6 +4930,13 @@ class MiniInterp:
     @staticmethod
     def _is_arr(v):
         return isinstance(v, list)
+
+    @classmethod
+    def _echo_text(cls, v):
+        """`.echo` の 1 つぶんの表示。整数は符号つき 10 進、配列は `[1, 2, 3]`。"""
+        if cls._is_arr(v):
+            return '[' + ', '.join(str(_mini_signed(e)) for e in v) + ']'
+        return str(_mini_signed(v))
 
     def _need_int(self, v, pos, what):
         if self._is_arr(v):
@@ -5069,6 +5143,16 @@ class MiniInterp:
                     raise MiniLangError(f"{pos[0]}:{pos[1]}: '.emit' produced more than "
                                         f"{self.MAX_EMIT} words")
                 self.out.append(v)
+            return
+        if kind == 'echo':
+            parts = [x if k2 == 's' else self._echo_text(self.eval(x, pos))
+                     for k2, x in st[1]]
+            # 命令長を測るだけの試し打ちと、収束途中のパス1では黙る。
+            # 同じ行が反復回数だけ重複して出るのを防ぐため。
+            if (self.state is not None
+                    and self.state.should_report_errors()
+                    and not self.state._pass1_size_mode):
+                print(' '.join(parts), file=sys.stderr)
             return
         if kind == 'call':
             _, name, args, _ = st

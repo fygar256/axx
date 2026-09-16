@@ -551,7 +551,8 @@ typedef struct {
 } MiniVal;
 
 typedef enum {
-    MX_NUM, MX_VAR, MX_ARRLIT, MX_INDEX, MX_SLICE, MX_LEN, MX_BIN, MX_UN
+    MX_NUM, MX_VAR, MX_ARRLIT, MX_INDEX, MX_SLICE, MX_LEN, MX_BIN, MX_UN,
+    MX_STR   /* `.echo` の文字列リテラル専用。式としては評価されない */
 } MXKind;
 
 typedef struct MExpr {
@@ -565,8 +566,8 @@ typedef struct MExpr {
 } MExpr;
 
 typedef enum {
-    MS_ASSIGN, MS_EMIT, MS_CALL, MS_CALLASSIGN, MS_RETURN, MS_IF, MS_WHILE,
-    MS_FOR, MS_NONLOCAL
+    MS_ASSIGN, MS_EMIT, MS_ECHO, MS_CALL, MS_CALLASSIGN, MS_RETURN, MS_IF,
+    MS_WHILE, MS_FOR, MS_NONLOCAL
 } MSKind;
 
 typedef struct MStmt {
@@ -3308,19 +3309,21 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
                 uint256_t x2=expr_expression(asmb,s,idx+1,&i3); idx=i3;
                 if(s[idx]==')'){
                     idx++;
-                    int64_t offset=u256_to_i64(x2);
-                    if(offset<0){
+                    /* 破綻点修正: u256_to_i64() は下位64bitしか見ないので、
+                     * 2**63 のような値は「負」に、2**64 の倍数は 0 に化けていた。
+                     * (前者は偽のエラーでアセンブルが止まり、後者は「シフト
+                     * しない」で素通しになる。) axx.py は 256bit の値そのもので
+                     * 判定するので、シフト量や指数と同じ 256bit 用のヘルパーで
+                     * 符号と上限を見る。 */
+                    if(u256_is_neg256(x2)){
                         if(should_report_errors(st)){
                             axx_diagf(1, 0, " error - negative byte-extract offset in *(expr, expr).\n");
                         }
                         x=u256_zero();
                     } else {
-                        /* 破綻点修正: offset は int64_t なので、巨大な値だと
-                         * offset*8 が符号付き整数のオーバーフロー（未定義動作）を
-                         * 起こし、int への切り詰めで負になると u256_sar() が
-                         * 「シフトしない」で素通しになっていた。256 を超える分は
-                         * 符号で埋まるだけなので、先に頭打ちにする。 */
-                        int shift = (offset > 256/8) ? 256 : (int)(offset*8);
+                        /* 256 を超える分は符号で埋まるだけなので、先に頭打ちにする。 */
+                        int shift = u256_nonneg_gt_i64(x2, 256/8)
+                                    ? 256 : (int)(u256_to_i64(x2)*8);
                         x=u256_sar(x,shift);
                     }
                 } else {
@@ -4084,16 +4087,20 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
         int ni=idx+1; ni=axx_skipspc(s,ni);
         if(ni>=slen||((s[ni]<'0'||s[ni]>'9')&&s[ni]!='(')) break;
         uint256_t t=expr_term5(asmb,s,idx+1,&idx);
-        int64_t tv=u256_to_i64(t);
-        if(tv<=0){
+        /* 破綻点修正: u256_to_i64() は下位64bitしか見ないので、2**64+8 のような
+         * 幅が 8 に化け、axx.py が「上限超え→0」にするところを黙って
+         * ビット 8 で符号拡張していた。256bit の値そのもので符号と上限を見る。 */
+        if(u256_is_neg256(t) || u256_is_zero(t)){
             x=u256_zero();
-        } else if(tv > SEXT_MAX_BITS){
+        } else if(u256_nonneg_gt_i64(t, SEXT_MAX_BITS)){
             if(should_report_errors(&asmb->st)){
-                axx_diagf(0, 0, " warning - sign-extension bit width %lld exceeds maximum %d, result set to 0.\n",
-                           (long long)tv, SEXT_MAX_BITS);
+                char cb[96]; u256_to_pydec(t, cb, sizeof(cb));
+                axx_diagf(0, 0, " warning - sign-extension bit width %s exceeds maximum %d, result set to 0.\n",
+                           cb, SEXT_MAX_BITS);
             }
             x=u256_zero();
         } else {
+            int64_t tv=u256_to_i64(t);
             uint256_t mask = u256_not(u256_shl(u256_not(u256_zero()), (int)tv));
             x = u256_and(x, mask);
             uint256_t sign_bit = u256_sar(x, (int)(tv - 1));
@@ -5524,7 +5531,7 @@ enum {
     MINI_MAX_TOK   = 1024
 };
 
-typedef enum { MT_END, MT_NUM, MT_NAME, MT_DOT, MT_OP } MTKind;
+typedef enum { MT_END, MT_NUM, MT_NAME, MT_DOT, MT_OP, MT_STR } MTKind;
 /* 字句1個ぶん。s は名前／ディレクティブ名を丸ごと収める。axx.py 側に名前の
  * 長さ制限は無いので、実用上ぶつからない幅を取っておく（作業領域はヒープ）。 */
 typedef struct { MTKind k; uint256_t num; char s[512]; } MTok;
@@ -5648,6 +5655,36 @@ static int mini_lex(MiniCtx *c, const char *t, MTok *out){
             memcpy(out[n].s, t + i, (size_t)(j - i)); out[n].s[j - i] = 0;
             n++; i = j; continue;
         }
+        if(ch == '"'){
+            /* 文字列リテラル。値は整数と配列だけなので、書けるのは `.echo` の
+             * 引数欄だけである（式の中に現れたら mxp_primary が弾く）。 */
+            int j = i + 1, m = 0;
+            for(;;){
+                if(j >= len) mini_fail(c, "unterminated string");
+                char cc = t[j];
+                if(cc == '"'){ j++; break; }
+                if(cc == '\\'){
+                    if(j + 1 >= len) mini_fail(c, "unterminated string");
+                    char e = t[j+1];
+                    char r;
+                    if(e == '\\')      r = '\\';
+                    else if(e == '"')  r = '"';
+                    else if(e == 'n')  r = '\n';
+                    else if(e == 't')  r = '\t';
+                    else { mini_fail(c, "unknown escape '\\%c' in a string", e); r = 0; }
+                    if(m >= (int)sizeof(out[n].s) - 1) mini_fail(c, "string is too long");
+                    out[n].s[m++] = r;
+                    j += 2;
+                    continue;
+                }
+                if(m >= (int)sizeof(out[n].s) - 1) mini_fail(c, "string is too long");
+                out[n].s[m++] = cc;
+                j++;
+            }
+            out[n].s[m] = 0;
+            out[n].k = MT_STR;
+            n++; i = j; continue;
+        }
         if(ch == '.'){
             int j = i + 1;
             while(j < len && (isalnum((unsigned char)t[j]) || t[j] == '_')) j++;
@@ -5712,6 +5749,7 @@ static int mxp_end(MXP *p){ return p->i >= p->n; }
 static MExpr *mxp_primary(MXP *p){
     if(mxp_end(p)) mini_fail(p->c, "expected a value, found end of line");
     MTok *tk = &p->t[p->i];
+    if(tk->k == MT_STR) mini_fail(p->c, "a string can only be used in '.echo'");
     if(tk->k == MT_NUM){ p->i++; MExpr *e = mx_new(MX_NUM); e->num = tk->num; return e; }
     if(tk->k == MT_NAME){ p->i++; MExpr *e = mx_new(MX_VAR); e->name = mini_strdup(tk->s); return e; }
     if(tk->k == MT_DOT){
@@ -5881,6 +5919,32 @@ static MExpr *mxp_full(MXP *p){
 }
 
 /* `(` の直後から `)` までのカンマ区切りの式を読む。 */
+/* `.echo` の引数欄。項目は文字列リテラルか式。文字列は MX_STR のまま持ち回り、
+ * 表示のときだけ取り出す（式としては評価しない）。 */
+static void mxp_echo_arglist(MXP *p, MExpr ***outv, int *outn){
+    mxp_expect(p, "(");
+    int cap = 0;
+    *outv = NULL; *outn = 0;
+    if(!mxp_is_op(p, ")")){
+        do {
+            if(*outn >= cap){
+                cap = cap ? cap * 2 : 8;
+                *outv = realloc(*outv, (size_t)cap * sizeof(MExpr*));
+                if(!*outv){ perror("realloc"); exit(1); }
+            }
+            if(p->i < p->n && p->t[p->i].k == MT_STR){
+                MExpr *e = mx_new(MX_STR);
+                e->name = mini_strdup(p->t[p->i].s);
+                p->i++;
+                (*outv)[(*outn)++] = e;
+            } else {
+                (*outv)[(*outn)++] = mxp_or(p);
+            }
+        } while(mxp_eat(p, ","));
+    }
+    mxp_expect(p, ")");
+}
+
 static void mxp_arglist(MXP *p, MExpr ***outv, int *outn){
     mxp_expect(p, "(");
     int cap = 0;
@@ -5941,12 +6005,14 @@ static void mini_dotkw(const char *s, char *out, size_t osz){
 }
 
 static int mini_is_ender(const char *kw){
-    return strcmp(kw, ".ELSE") == 0 || strcmp(kw, ".ENDIF") == 0
+    return strcmp(kw, ".ELIF") == 0 || strcmp(kw, ".ELSE") == 0
+        || strcmp(kw, ".ENDIF") == 0
         || strcmp(kw, ".NEXT") == 0 || strcmp(kw, ".ENDWHILE") == 0;
 }
 
-static void msp_block(MSP *p, const char *e1, const char *e2,
+static void msp_block(MSP *p, const char *e1, const char *e2, const char *e3,
                       MStmt ***outv, int *outn);
+static MStmt *msp_if_chain(MSP *p, int li);
 
 /* `.call 名前(引数, ...)` の後半を読む。toks[0] は '.CALL'。 */
 static void ms_call_tail(MiniCtx *c, MTok *toks, int n, char **namep,
@@ -5983,6 +6049,13 @@ static MStmt *msp_simple(MSP *p, int li){
             mxp_arglist(&ep, &s->args, &s->nargs);
             if(!mxp_end(&ep)) mini_fail(c, "unexpected text after '.emit(...)'");
             if(s->nargs == 0) mini_fail(c, "'.emit' needs at least one value");
+            return s;
+        }
+        if(strcmp(kw, ".ECHO") == 0){
+            MStmt *s = ms_new(MS_ECHO, p, li);
+            MXP ep; ep.t = toks + 1; ep.n = n - 1; ep.i = 0; ep.c = c;
+            mxp_echo_arglist(&ep, &s->args, &s->nargs);
+            if(!mxp_end(&ep)) mini_fail(c, "unexpected text after '.echo(...)'");
             return s;
         }
         if(strcmp(kw, ".CALL") == 0){
@@ -6039,7 +6112,54 @@ static MStmt *msp_simple(MSP *p, int li){
     }
 }
 
-static void msp_block(MSP *p, const char *e1, const char *e2,
+/* `.if` / `.elif` の 1 段を読む。戻り値の文を返した時点で p->i は対応する
+ * `.endif` の行を指している。`.elif` は「`.else` の中に `.if` が 1 つだけある」
+ * 形へ展開するので、連鎖の途中では `.endif` を読み飛ばさない。1 行進めるのは
+ * いちばん外側の呼び出し元（msp_block）だけでよい。 */
+static MStmt *msp_if_chain(MSP *p, int li){
+    MiniCtx *c = p->c;
+    char kw[32];
+    mini_dotkw(p->f->lines[li], kw, sizeof(kw));
+    char low[32];
+    snprintf(low, sizeof(low), "%s", kw);
+    for(char *q = low; *q; q++) *q = (char)tolower((unsigned char)*q);
+    c->file = p->f->lfiles[li];
+    c->line = p->f->llines[li];
+    MTok *toks = p->tok;
+    int n = mini_lex(c, p->f->lines[li], toks);
+    if(n < 2 || toks[n-1].k != MT_DOT || strcmp(toks[n-1].s, ".THEN") != 0)
+        mini_fail(c, "'%s' must end with '.then'", low);
+    MStmt *s = ms_new(MS_IF, p, li);
+    MXP ep; ep.t = toks + 1; ep.n = n - 2; ep.i = 0; ep.c = c;
+    s->val = mxp_full(&ep);
+    p->i = li + 1;
+    msp_block(p, ".ELIF", ".ELSE", ".ENDIF", &s->body, &s->nbody);
+    if(p->i >= p->f->nlines){
+        c->file = s->file; c->line = s->line;
+        mini_fail(c, "'.if' is never closed with '.endif'");
+    }
+    char kw2[32];
+    mini_dotkw(p->f->lines[p->i], kw2, sizeof(kw2));
+    if(strcmp(kw2, ".ELIF") == 0){
+        MStmt *inner = msp_if_chain(p, p->i);
+        int cap2 = 0;
+        ms_push(&s->body2, &s->nbody2, &cap2, inner);
+    } else if(strcmp(kw2, ".ELSE") == 0){
+        MTok *t2 = p->tok;
+        c->file = p->f->lfiles[p->i]; c->line = p->f->llines[p->i];
+        if(mini_lex(c, p->f->lines[p->i], t2) != 1)
+            mini_fail(c, "unexpected text after '.else'");
+        p->i++;
+        msp_block(p, ".ENDIF", NULL, NULL, &s->body2, &s->nbody2);
+        if(p->i >= p->f->nlines){
+            c->file = s->file; c->line = s->line;
+            mini_fail(c, "'.if' is never closed with '.endif'");
+        }
+    }
+    return s;
+}
+
+static void msp_block(MSP *p, const char *e1, const char *e2, const char *e3,
                       MStmt ***outv, int *outn){
     MiniCtx *c = p->c;
     int cap = 0;
@@ -6050,7 +6170,8 @@ static void msp_block(MSP *p, const char *e1, const char *e2,
         mini_dotkw(p->f->lines[li], kw, sizeof(kw));
         c->file = p->f->lfiles[li];
         c->line = p->f->llines[li];
-        if((e1 && strcmp(kw, e1) == 0) || (e2 && strcmp(kw, e2) == 0)) return;
+        if((e1 && strcmp(kw, e1) == 0) || (e2 && strcmp(kw, e2) == 0)
+           || (e3 && strcmp(kw, e3) == 0)) return;
         if(mini_is_ender(kw)){
             char low[32];
             snprintf(low, sizeof(low), "%s", kw);
@@ -6058,35 +6179,7 @@ static void msp_block(MSP *p, const char *e1, const char *e2,
             mini_fail(c, "'%s' without a matching opener", low);
         }
         if(strcmp(kw, ".IF") == 0){
-            MTok *toks = p->tok;
-            int n = mini_lex(c, p->f->lines[li], toks);
-            if(n < 2 || toks[n-1].k != MT_DOT || strcmp(toks[n-1].s, ".THEN") != 0)
-                mini_fail(c, "'.if' must end with '.then'");
-            MStmt *s = ms_new(MS_IF, p, li);
-            MXP ep; ep.t = toks + 1; ep.n = n - 2; ep.i = 0; ep.c = c;
-            s->val = mxp_full(&ep);
-            p->i = li + 1;
-            msp_block(p, ".ELSE", ".ENDIF", &s->body, &s->nbody);
-            if(p->i >= p->f->nlines){
-                c->file = s->file; c->line = s->line;
-                mini_fail(c, "'.if' is never closed with '.endif'");
-            }
-            {
-                char kw2[32];
-                mini_dotkw(p->f->lines[p->i], kw2, sizeof(kw2));
-                if(strcmp(kw2, ".ELSE") == 0){
-                    MTok *t2 = p->tok;
-                    c->file = p->f->lfiles[p->i]; c->line = p->f->llines[p->i];
-                    if(mini_lex(c, p->f->lines[p->i], t2) != 1)
-                        mini_fail(c, "unexpected text after '.else'");
-                    p->i++;
-                    msp_block(p, ".ENDIF", NULL, &s->body2, &s->nbody2);
-                    if(p->i >= p->f->nlines){
-                        c->file = s->file; c->line = s->line;
-                        mini_fail(c, "'.if' is never closed with '.endif'");
-                    }
-                }
-            }
+            MStmt *s = msp_if_chain(p, li);
             p->i++;
             ms_push(outv, outn, &cap, s);
             continue;
@@ -6098,7 +6191,7 @@ static void msp_block(MSP *p, const char *e1, const char *e2,
             MXP ep; ep.t = toks + 1; ep.n = n - 1; ep.i = 0; ep.c = c;
             s->val = mxp_full(&ep);
             p->i = li + 1;
-            msp_block(p, ".ENDWHILE", NULL, &s->body, &s->nbody);
+            msp_block(p, ".ENDWHILE", NULL, NULL, &s->body, &s->nbody);
             if(p->i >= p->f->nlines){
                 c->file = s->file; c->line = s->line;
                 mini_fail(c, "'.while' is never closed with '.endwhile'");
@@ -6123,7 +6216,7 @@ static void msp_block(MSP *p, const char *e1, const char *e2,
             if(s->nargs < 1 || s->nargs > 3)
                 mini_fail(c, "range() takes 1 to 3 arguments, got %d", s->nargs);
             p->i = li + 1;
-            msp_block(p, ".NEXT", NULL, &s->body, &s->nbody);
+            msp_block(p, ".NEXT", NULL, NULL, &s->body, &s->nbody);
             if(p->i >= p->f->nlines){
                 c->file = s->file; c->line = s->line;
                 mini_fail(c, "'.for' is never closed with '.next'");
@@ -6161,7 +6254,7 @@ static int mini_compile_func(MiniFunc *f, char *errout, size_t esz){
         return 0;
     }
     MSP p; p.f = f; p.i = 0; p.c = &c; p.tok = tokbuf;
-    msp_block(&p, NULL, NULL, &f->body, &f->nbody);
+    msp_block(&p, NULL, NULL, NULL, &f->body, &f->nbody);
     if(p.i < f->nlines){
         c.file = f->lfiles[p.i]; c.line = f->llines[p.i];
         mini_fail(&c, "'%s' has no matching opener", f->lines[p.i]);
@@ -6338,6 +6431,11 @@ static uint256_t mini_binop(MiniRun *r, const char *op, uint256_t a, uint256_t b
 
 static MiniVal mini_eval(MiniRun *r, MExpr *e){
     switch(e->k){
+    /* MX_STR は `.echo` の表示側でしか取り出さない。式として来たら構文解析の
+     * 取りこぼしなので、黙って 0 にせず止める。 */
+    case MX_STR:
+        mini_fail(&r->c, "a string can only be used in '.echo'");
+        return mini_num(u256_zero());   /* mini_fail は longjmp で戻らない */
     case MX_NUM: return mini_num(e->num);
     case MX_VAR: return mini_get(r, e->name);
     case MX_ARRLIT: {
@@ -6488,6 +6586,39 @@ static void mini_exec(MiniRun *r, MStmt *s){
             iv_push(&r->out, x);
         }
         return;
+    case MS_ECHO: {
+        /* 命令長を測るだけの試し打ちと、収束途中のパス1では黙る。
+         * 同じ行が反復回数だけ重複して出るのを防ぐため。 */
+        int show = r->asmb && should_report_errors(&r->asmb->st)
+                   && !r->asmb->st.pass1_size_mode;
+        for(int i = 0; i < s->nargs; i++){
+            if(s->args[i]->k == MX_STR){
+                if(show){
+                    if(i) fputc(' ', stderr);
+                    fputs(s->args[i]->name, stderr);
+                }
+                continue;
+            }
+            MiniVal ev = mini_eval(r, s->args[i]);
+            if(show){
+                if(i) fputc(' ', stderr);
+                if(ev.is_arr){
+                    fputc('[', stderr);
+                    for(int j = 0; j < ev.n; j++){
+                        char cb[96]; u256_to_pydec(ev.arr[j], cb, sizeof(cb));
+                        fprintf(stderr, "%s%s", j ? ", " : "", cb);
+                    }
+                    fputc(']', stderr);
+                } else {
+                    char cb[96]; u256_to_pydec(ev.num, cb, sizeof(cb));
+                    fputs(cb, stderr);
+                }
+            }
+            mini_val_free(&ev);
+        }
+        if(show) fputc('\n', stderr);
+        return;
+    }
     case MS_CALL: {
         MiniFunc *f = mini_lookup(r, s->name);
         MiniVal *vals = s->nargs ? mini_alloc((size_t)s->nargs * sizeof(MiniVal)) : NULL;
@@ -7315,9 +7446,14 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
                  * 上限 (1<<24) 超はエラーにして 0 回に倒す。 */
                 const int64_t N_MAX = (int64_t)1 << 24;
                 if(_rep_undef || u256_is_undef_derived(nv)) nrep = 0;
-                if(nrep > N_MAX){
-                    axx_diagf(0, 0, " error - @@[n,...]: repeat count %lld exceeds maximum %lld.\n",
-                              (long long)nrep, (long long)N_MAX);
+                /* 破綻点修正: nrep は u256_to_i64() で下位64bitに切り詰めた値
+                 * なので、2**64+3 のような回数が 3 に化けて上限チェックを
+                 * すり抜けていた（axx.py はエラーにする）。元の 256bit 値でも
+                 * 判定し、表示も切り詰めない値で行う。 */
+                else if(u256_gt_signed(nv, u256_from_i64(N_MAX))){
+                    char cb[96]; u256_to_pydec(nv, cb, sizeof(cb));
+                    axx_diagf(0, 0, " error - @@[n,...]: repeat count %s exceeds maximum %lld.\n",
+                              cb, (long long)N_MAX);
                     asmb->st.had_error = 1;
                     nrep = 0;
                 }
@@ -10101,6 +10237,12 @@ struct MacroPP {
     MLineVec  *out;
     int        depth;
     int        expr_depth;
+    /* 破綻点修正: `&&` `||` `?:` の「取らない側」を評価しないための印。
+     * この評価器は式のテキストを直接たどるので、取らない側も構文としては
+     * 最後まで読まないと位置が合わない。読みはするが、実行時のエラー
+     * （0除算・桁溢れ・未定義の名前）と副作用（uid() の採番、マクロ呼び出し）
+     * だけを止める。axx.py は木を組んでから評価するので初めから短絡している。 */
+    int        noeval;
     long long  uid;
     long       nemitted;
 
@@ -10301,6 +10443,7 @@ static char *mv_to_text(MacroPP *mp, MVal v){
 }
 static long long mv_need_int(MacroPP *mp, MVal v, const char *file, int line){
     if(v.is_str){
+        if(mp->noeval) return 0;
         char vr[600], er[600];
         m_pyrepr(v.s ? v.s : "", vr, sizeof(vr));
         if(mp->cur_expr) m_pyrepr(mp->cur_expr, er, sizeof(er));
@@ -10327,6 +10470,20 @@ static inline long long m_i64_neg(long long a){
 static inline long long m_i64_abs(long long a){
     return a < 0 ? m_i64_neg(a) : a;
 }
+/* 破綻点修正: 単項 '-' と abs() だけが桁溢れ検査を通っておらず、
+ * INT64_MIN に対して黙ってラップアラウンド（符号付きオーバーフロー）していた。
+ * 他の演算子と同じく、表現できない結果は明示的なエラーにする。 */
+static inline long long m_i64_neg_ck(MEP *p, long long a){
+    if(a == LLONG_MIN){
+        if(p->mp->noeval) return 0;
+        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
+    }
+    return -a;
+}
+static inline long long m_i64_abs_ck(MEP *p, long long a){
+    return a < 0 ? m_i64_neg_ck(p, a) : a;
+}
 /* 破綻点修正: 以前は +,-,* を unsigned キャスト経由で無言のままラップアラウンド
  * させていた。axx.py 側は任意精度整数なので、64bit を超えるマクロ計算では
  * 両実装が黙って別々の(誤った)値を返す食い違いが起きていた。完全な任意精度化
@@ -10335,6 +10492,7 @@ static inline long long m_i64_abs(long long a){
 static inline long long m_i64_add(MEP *p, long long a, long long b){
     long long r;
     if(__builtin_add_overflow(a, b, &r)){
+        if(p->mp->noeval) return 0;
         char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
         m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
     }
@@ -10343,6 +10501,7 @@ static inline long long m_i64_add(MEP *p, long long a, long long b){
 static inline long long m_i64_sub(MEP *p, long long a, long long b){
     long long r;
     if(__builtin_sub_overflow(a, b, &r)){
+        if(p->mp->noeval) return 0;
         char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
         m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
     }
@@ -10351,6 +10510,7 @@ static inline long long m_i64_sub(MEP *p, long long a, long long b){
 static inline long long m_i64_mul(MEP *p, long long a, long long b){
     long long r;
     if(__builtin_mul_overflow(a, b, &r)){
+        if(p->mp->noeval) return 0;
         char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
         m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
     }
@@ -10371,12 +10531,22 @@ static inline long long m_i64_mul_raw(long long a, long long b){
 }
 
 static long long m_cdiv(MEP *p, long long a, long long b){
+    if(b == 0) return 0;                 /* 取らない側を読み飛ばしている最中 */
     if(a == LLONG_MIN && b == -1){
+        if(p->mp->noeval) return 0;
         char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
         m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
     }
-    long long q = m_i64_abs(a) / m_i64_abs(b);
-    return ((a >= 0) == (b >= 0)) ? q : m_i64_neg(q);
+    /* 破綻点修正: m_i64_abs(INT64_MIN) は INT64_MIN のままなので（絶対値が
+     * 表現できない）、商が既に負のところへさらに符号反転がかかり、
+     * INT64_MIN/2 が +4611686018427387904 という符号の逆な値になっていた。
+     * 絶対値は符号なしで取れば必ず正しく表せるので、そちらで割る。 */
+    unsigned long long ua = (a < 0) ? (0ULL - (unsigned long long)a) : (unsigned long long)a;
+    unsigned long long ub = (b < 0) ? (0ULL - (unsigned long long)b) : (unsigned long long)b;
+    unsigned long long q = ua / ub;
+    /* 符号が違えば商は 2**63 以下なので -q は必ず表現できる。符号が同じ
+     * 場合、a==INT64_MIN && b==-1 は上で弾いてあるので q は INT64_MAX 以下。 */
+    return ((a >= 0) == (b >= 0)) ? (long long)q : (long long)(0ULL - q);
 }
 static long long m_cmod(MEP *p, long long a, long long b){ return m_i64_sub(p, a, m_i64_mul(p, m_cdiv(p, a, b), b)); }
 
@@ -10506,6 +10676,8 @@ static int m_is_defined(MacroPP *mp, const char *name){
     return m_asm_label(mp, name, NULL) == MLBL_VALUE;
 }
 static MVal m_lookup(MacroPP *mp, const char *name, const char *file, int line){
+    /* 取らない側を読み飛ばしている最中は、名前を引かない。 */
+    if(mp->noeval) return mv_int(0);
     for(int i = mp->nscopes - 1; i >= 0; i--){
         MVal *p = m_scope_find(mp->scopes[i], name);
         if(p) return *p;
@@ -10712,7 +10884,7 @@ static MVal mep_unary(MEP *p){
     mep_skip(p);
     if(p->s[p->i] == '!' && p->s[p->i+1] != '='){ p->i++; return mv_int(mv_truth(mep_unary(p)) ? 0 : 1); }
     if(p->s[p->i] == '~'){ p->i++; return mv_int(~mv_need_int(p->mp, mep_unary(p), p->file, p->line)); }
-    if(p->s[p->i] == '-'){ p->i++; return mv_int(m_i64_neg(mv_need_int(p->mp, mep_unary(p), p->file, p->line))); }
+    if(p->s[p->i] == '-'){ p->i++; return mv_int(m_i64_neg_ck(p, mv_need_int(p->mp, mep_unary(p), p->file, p->line))); }
     if(p->s[p->i] == '+'){ p->i++; return mep_unary(p); }
     return mep_primary(p);
 }
@@ -10729,6 +10901,7 @@ static long long m_safe_repeat_len(MacroPP *mp, const char *file, int line,
     const long long MAXLEN = 16*1024*1024;
     if(n == 0 || l == 0) return 0;
     if((unsigned long long)n > (unsigned long long)(MAXLEN) / l){
+        if(mp->noeval) return 0;
         char sr[600]; m_pyrepr(srcline, sr, sizeof(sr));
         m_fail(mp, file, line, "macro expression: string repetition too large in %s", sr);
     }
@@ -10768,7 +10941,7 @@ static MVal mep_mul(MEP *p){
         } else if(c == '/'){
             p->i++;
             long long r = mv_need_int(p->mp, mep_unary(p), p->file, p->line);
-            if(r == 0){
+            if(r == 0 && !p->mp->noeval){
                 char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
                 m_fail(p->mp, p->file, p->line, "macro expression: division by zero in %s", sr);
             }
@@ -10776,7 +10949,7 @@ static MVal mep_mul(MEP *p){
         } else if(c == '%'){
             p->i++;
             long long r = mv_need_int(p->mp, mep_unary(p), p->file, p->line);
-            if(r == 0){
+            if(r == 0 && !p->mp->noeval){
                 char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
                 m_fail(p->mp, p->file, p->line, "macro expression: modulo by zero in %s", sr);
             }
@@ -10815,16 +10988,17 @@ static MVal mep_shift(MEP *p){
         if(p->s[p->i] == '<' && p->s[p->i+1] == '<'){
             p->i += 2;
             long long n = mv_need_int(p->mp, mep_add(p), p->file, p->line);
-            if(n < 0 || n > 63){
+            if((n < 0 || n > 63) && !p->mp->noeval){
                 char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
                 m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range in %s", sr);
             }
+            if(n < 0 || n > 63) n = 0;   /* 取らない側を読み飛ばしている最中 */
             long long base = mv_need_int(p->mp, v, p->file, p->line);
             long long shifted = m_i64_shl(base, (int)n);
             /* 破綻点修正: 64bit を超えて追い出されたビットを黙って捨てていたため、
              * axx.py(任意精度)と異なる値を無言で返していた。追い出されたビットが
              * あれば(逆シフトで元に戻らなければ)明示的にエラーにする。 */
-            if(n > 0 && (shifted >> n) != base){
+            if(n > 0 && (shifted >> n) != base && !p->mp->noeval){
                 char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
                 m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
             }
@@ -10832,10 +11006,11 @@ static MVal mep_shift(MEP *p){
         } else if(p->s[p->i] == '>' && p->s[p->i+1] == '>'){
             p->i += 2;
             long long n = mv_need_int(p->mp, mep_add(p), p->file, p->line);
-            if(n < 0 || n > 63){
+            if((n < 0 || n > 63) && !p->mp->noeval){
                 char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
                 m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range in %s", sr);
             }
+            if(n < 0 || n > 63) n = 0;   /* 取らない側を読み飛ばしている最中 */
             v = mv_int(mv_need_int(p->mp, v, p->file, p->line) >> n);
         } else return v;
     }
@@ -10918,16 +11093,25 @@ static MVal mep_bor(MEP *p){
 static MVal mep_land(MEP *p){
     MVal v = mep_bor(p);
     while(mep_eat(p, "&&")){
+        /* 左が偽なら右は評価しない（C と同じ短絡）。 */
+        int skip = !p->mp->noeval && !mv_truth(v);
+        if(skip) p->mp->noeval++;
         MVal r = mep_bor(p);
-        v = mv_int((mv_truth(v) && mv_truth(r)) ? 1 : 0);
+        if(skip) p->mp->noeval--;
+        v = mv_int((!skip && mv_truth(v) && mv_truth(r)) ? 1 : 0);
     }
     return v;
 }
 static MVal mep_lor(MEP *p){
     MVal v = mep_land(p);
     while(mep_eat(p, "||")){
+        /* 左が真なら右は評価しない（C と同じ短絡）。テキストをたどる評価器
+         * なので読み飛ばしはせず、noeval を立てたまま最後まで読む。 */
+        int skip = !p->mp->noeval && mv_truth(v);
+        if(skip) p->mp->noeval++;
         MVal r = mep_land(p);
-        v = mv_int((mv_truth(v) || mv_truth(r)) ? 1 : 0);
+        if(skip) p->mp->noeval--;
+        v = mv_int((skip || mv_truth(v) || mv_truth(r)) ? 1 : 0);
     }
     return v;
 }
@@ -10936,10 +11120,16 @@ static MVal mep_ternary(MEP *p){
     mep_skip(p);
     if(p->s[p->i] == '?'){
         p->i++;
+        int taken = p->mp->noeval ? 0 : (mv_truth(c) ? 1 : 2);
+        /* 取る側だけを評価する。取らない側は noeval のまま読む。 */
+        if(taken == 2) p->mp->noeval++;
         MVal a = mep_ternary(p);
+        if(taken == 2) p->mp->noeval--;
         mep_expect(p, ":");
+        if(taken == 1) p->mp->noeval++;
         MVal b = mep_ternary(p);
-        return mv_truth(c) ? a : b;
+        if(taken == 1) p->mp->noeval--;
+        return (taken == 2) ? b : a;
     }
     return c;
 }
@@ -10951,6 +11141,9 @@ static MVal m_eval(MacroPP *mp, const char *text, const char *file, int line){
      * 評価が mep_primary の '(' で加算した expr_depth を減算し損ねたまま
      * 残ることがある。各トップレベル評価の開始時に必ず 0 へ戻す。 */
     mp->expr_depth = 0;
+    /* 同上: 取らない側を読んでいる途中で m_fail に飛ばれると noeval が
+     * 立ったまま残り、以後の実行時エラーが黙って握り潰される。 */
+    mp->noeval = 0;
     const char *saved_cur_expr = mp->cur_expr;
     mp->cur_expr = text;
     MEP p; p.s = text; p.i = 0; p.mp = mp; p.file = file; p.line = line;
@@ -11034,7 +11227,11 @@ static int m_builtin(MacroPP *mp, const char *name, MVal *a, int n,
     if(strcmp(name, "abs") == 0){
         m_bi_argc(mp, "abs", n, 1, 1, file, line);
         long long v = mv_need_int(mp, a[0], file, line);
-        *out = mv_int(m_i64_abs(v));
+        /* 破綻点修正: abs(INT64_MIN) は 64bit で表現できない。黙って
+         * INT64_MIN のまま返さず、他の演算子と同じくエラーにする。 */
+        if(v == LLONG_MIN)
+            m_fail(mp, file, line, "macro expression: integer overflow (64-bit) in abs()");
+        *out = mv_int(v < 0 ? -v : v);
         return 1;
     }
     if(strcmp(name, "min") == 0 || strcmp(name, "max") == 0){
@@ -11118,6 +11315,9 @@ static MVal m_invoke(MacroPP *mp, MFunc *f, MVal *args, int nargs,
 
 static MVal m_call_value(MacroPP *mp, const char *name, MVal *args, int nargs,
                          const char *file, int line){
+    /* 取らない側を読み飛ばしている最中は呼ばない。uid() の採番や
+     * マクロ本体の副作用が起きてしまうため。 */
+    if(mp->noeval) return mv_int(0);
     MVal out;
     if(m_builtin(mp, name, args, nargs, file, line, &out)) return out;
     MFunc *f = m_func_find(mp, name);
@@ -11895,6 +12095,7 @@ static void m_parse_args(MacroPP *mp, const char *argtext, MVal *args, int *narg
     const char *t = m_lstrip(argtext);
     if(!*t) return;
     if(*t != '(') m_fail(mp, file, line, "macro call needs parentheses");
+    mp->noeval = 0;     /* m_eval と同じく、前回の打ち切りの取りこぼしを消す */
     MEP p; p.s = t; p.i = 0; p.mp = mp; p.file = file; p.line = line;
     mep_expect(&p, "(");
     if(mep_peek(&p) == ')') p.i++;
