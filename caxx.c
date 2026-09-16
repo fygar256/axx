@@ -605,7 +605,7 @@ typedef struct MExpr {
 
 typedef enum {
     MS_ASSIGN, MS_EMIT, MS_ECHO, MS_CALL, MS_CALLASSIGN, MS_RETURN, MS_IF,
-    MS_WHILE, MS_FOR, MS_NONLOCAL
+    MS_WHILE, MS_FOR, MS_NONLOCAL, MS_RAISE
 } MSKind;
 
 typedef struct MStmt {
@@ -6149,6 +6149,15 @@ static MStmt *msp_simple(MSP *p, int li){
             }
             return s;
         }
+        if(strcmp(kw, ".RAISE") == 0){
+            /* `.raise n` … error_patterns 欄の `条件;n` と同じ形でエラーコード n を
+             * 報告する。`.error::n::"文言"` で登録した文言もそのまま使われる。 */
+            if(n <= 1) mini_fail(c, "'.raise' needs an error code");
+            MStmt *s = ms_new(MS_RAISE, p, li);
+            MXP ep; ep.t = toks + 1; ep.n = n - 1; ep.i = 0; ep.c = c;
+            s->val = mxp_full(&ep);
+            return s;
+        }
         if(strcmp(kw, ".EMIT") == 0){
             MStmt *s = ms_new(MS_EMIT, p, li);
             MXP ep; ep.t = toks + 1; ep.n = n - 1; ep.i = 0; ep.c = c;
@@ -6730,6 +6739,27 @@ static void mini_exec(MiniRun *r, MStmt *s){
             iv_push(&r->out, x);
         }
         return;
+    case MS_RAISE: {
+        MiniVal ev = mini_eval(r, s->val);
+        if(ev.is_arr){
+            mini_val_free(&ev);
+            mini_fail(&r->c, "'.raise' needs a number, not an array");
+        }
+        /* 命令長を測るだけの試し打ちと、収束途中のパス1では黙る（`.echo` と同じ）。
+         * 同じ行が反復回数だけ重複して報告されるのを防ぐため。
+         * 報告の体裁は error_patterns 欄（dir_error）と揃えてある。 */
+        if(r->asmb && should_report_errors(&r->asmb->st)
+           && !r->asmb->st.pass1_size_mode){
+            AsmState *st = &r->asmb->st;
+            int64_t tc = u256_to_i64(ev.num);
+            fprintf(stderr, "Line %d Error code %lld ", (int)st->ln, (long long)tc);
+            if(tc >= 0 && tc < st->errors.len)
+                fprintf(stderr, "%s", st->errors.data[tc]);
+            fprintf(stderr, ": \n");
+            st->had_error = 1;
+        }
+        return;
+    }
     case MS_ECHO: {
         /* 命令長を測るだけの試し打ちと、収束途中のパス1では黙る。
          * 同じ行が反復回数だけ重複して出るのを防ぐため。 */

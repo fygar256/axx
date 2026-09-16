@@ -843,6 +843,7 @@ f(a)` runs the call and discards its output.
 | `name[index] = expression` | Assign to an array element |
 | `.emit(e1, e2, ...)` | Append one word per value to the output |
 | `.echo(item, item, ...)` | Print strings and values to stderr — for debugging only, emits nothing |
+| `.raise <expr>` | Report an error whose error code is the value of `<expr>` |
 | `.call name(args)` | Call another function |
 | `name = .call name(args)` | Call another function and assign its return value |
 | `.if <expr> .then` / `.elif <expr> .then` / `.else` / `.endif` | Conditional; `.elif` may repeat, `.else` is optional |
@@ -894,6 +895,32 @@ and arrays only, so a string cannot be assigned to a variable or used in an
 expression. The escapes are `\\`, `\"`, `\n` and `\t`; any other `\` is an
 error. A string cannot contain `/*` — that is the pattern file's comment
 marker, stripped before the mini language sees the line.
+
+`.raise <expr>` reports an error whose error code is the value of `<expr>`, in
+exactly the format an `error_patterns` field produces for `condition;code`
+([section 3.4](#34-error_patterns)); a message registered with
+`.error::code::"text"` is used the same way, and an unregistered code prints
+the number alone. Reporting does not stop the function — execution continues
+with the next statement, so follow it with `.return` to stop there — and, like
+`.echo`, it stays quiet while instruction lengths are only being measured and
+during pass-1 relaxation, so each assembled instruction reports at most once.
+As with a triggered `error_patterns`, the assembly fails and no output file is
+written.
+
+```
+.error::3::"immediate out of range"
+
+MOV !n :: .call mov(n)
+
+.func::mov::n
+.if n > 255 .then
+.raise 3
+.return
+.endif
+.emit(0xb0, n)
+.return
+.endfunc
+```
 
 Values are 256-bit two's complement integers, the same as everywhere else in
 axx. Operators, from loosest to tightest: `||`, `&&`, `!`, comparisons

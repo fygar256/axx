@@ -54,6 +54,7 @@ One statement per line.
 | `name[index] = expr` | Assign to an array element |
 | `.emit(e1, e2, ...)` | Output one word per value |
 | `.echo(item, item, ...)` | Print strings and values to stderr; outputs no word |
+| `.raise expr` | Report an error whose error code is the value of `expr` |
 | `.call name(args)` | Call another function |
 | `name = .call name(args)` | Call another function and assign its return value |
 | `.if expr .then` / `.elif expr .then` / `.else` / `.endif` | Conditional; `.elif` may repeat, `.else` is optional |
@@ -100,6 +101,42 @@ and arrays only, so a string cannot be assigned to a variable or used in an
 expression. The escapes are `\\`, `\"`, `\n` and `\t`; any other `\` is an error.
 A string cannot contain `/*`: that is the pattern file's comment marker and is
 stripped before the mini language sees the line.
+
+## Reporting an error
+
+`.raise expr` reports an error whose error code is the value of `expr`. The
+format is exactly the one an `error_patterns` field produces for
+`condition;code`, and a message registered with `.error::code::"text"` is used
+the same way.
+
+```
+.error::3::"immediate out of range"
+
+MOV !n :: .call mov(n)
+
+.func::mov::n
+.if n > 255 .then
+.raise 3
+.return
+.endif
+.emit(0xb0, n)
+.return
+.endfunc
+```
+
+```
+MOV 300              -> Line 1 Error code 3 immediate out of range:
+```
+
+- **Reporting does not stop the function.** Execution continues with the next
+  statement, so follow it with `.return` when you mean to stop there, as above.
+- **The code need not be registered.** An unregistered one simply prints the
+  number with no text: `Line 1 Error code 9 : `.
+- **Like `.echo`, it stays quiet** while instruction lengths are only being
+  measured and during pass-1 relaxation, so each assembled instruction reports
+  at most once.
+- **The assembly fails.** As with a triggered `error_patterns`, no output file
+  is written.
 
 ## Delegating to the assembler's expression evaluator
 

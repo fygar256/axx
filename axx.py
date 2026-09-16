@@ -4914,6 +4914,12 @@ class MiniParser:
                 if len(toks) > 1:
                     return ('return', _MiniExprParser(toks[1:], pos).parse(), pos)
                 return ('return', None, pos)
+            if v == '.RAISE':
+                # `.raise n` … error_patterns 欄の `条件;n` と同じ形でエラーコード n を
+                # 報告する。`.error::n::"文言"` で登録した文言もそのまま使われる。
+                if len(toks) <= 1:
+                    raise MiniLangError(f"{f}:{ln}: '.raise' needs an error code")
+                return ('raise', _MiniExprParser(toks[1:], pos).parse(), pos)
             if v == '.EMIT':
                 p = _MiniExprParser(toks[1:], pos)
                 p.expect_op('(')
@@ -5281,6 +5287,27 @@ class MiniInterp:
                     raise MiniLangError(f"{pos[0]}:{pos[1]}: '.emit' produced more than "
                                         f"{self.MAX_EMIT} words")
                 self.out.append(v)
+            return
+        if kind == 'raise':
+            v = self.eval(st[1], pos)
+            if self._is_arr(v):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: '.raise' needs a number, "
+                                    f"not an array")
+            # 命令長を測るだけの試し打ちと、収束途中のパス1では黙る（`.echo` と同じ）。
+            # 同じ行が反復回数だけ重複して報告されるのを防ぐため。
+            # 報告の体裁は error_patterns 欄（error()）と揃えてある。
+            if (self.state is not None
+                    and self.state.should_report_errors()
+                    and not self.state._pass1_size_mode):
+                # caxx.c の u256_to_i64（下位64bitを符号つきで読む）と同じ値にする。
+                _lo = int(v) & 0xFFFFFFFFFFFFFFFF
+                code = _lo - (1 << 64) if _lo >> 63 else _lo
+                print(f"Line {self.state.ln} Error code {code} ", end="",
+                      file=sys.stderr)
+                if 0 <= code < len(self.state.errors):
+                    print(f"{self.state.errors[code]}", end='', file=sys.stderr)
+                print(": ", file=sys.stderr)
+                self.state.had_error = True
             return
         if kind == 'echo':
             parts = [x if k2 == 's' else self._echo_value(self.eval(x, pos))
