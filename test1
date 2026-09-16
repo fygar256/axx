@@ -30,7 +30,7 @@ paxx itanium.axx vliw.s -b a10
 paxx x86_64.axx hello.s -b a11
 paxx x86_64m.axx hello.s -b a12
 paxx aarch64_logical_mini.axx aarch64_logical_mini_demo.s -b a13
-paxx bf.axx bf.s -b b15
+paxx bf.axx bf.s -b a14
 
 FAIL=0
 
