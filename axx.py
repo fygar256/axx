@@ -349,13 +349,15 @@ def _dot_kw(s):
 
 
 # ミニ言語のブロック開始・終了キーワード。パターンファイルを読む段階で
-# `.return` が「関数の終わり」なのか「早期リターン文」なのかを見分けるために使う。
+# `.endfunc`（関数本体を閉じる）が `.if`/`.while`/`.for` の中で来ていないか
+# 見分けるために使う。`.return` はここでは特別扱いしない（早期リターン文と
+# して本体にそのまま積むだけで、関数を閉じるのは常に `.endfunc`）。
 _MINI_OPEN = frozenset(('.IF', '.FOR', '.WHILE'))
 _MINI_CLOSE = frozenset(('.ENDIF', '.NEXT', '.ENDWHILE'))
 
 
 class _MiniFunc:
-    """`.func::名前::引数 … .return` で定義されたミニ言語の関数。
+    """`.func::名前::引数 … .endfunc` で定義されたミニ言語の関数。
 
     入れ子で定義された関数は children に入り、名前解決は自分 → 親 → … →
     トップレベルの順に外側へたどる。body は読み込み時に文の木へ変換する。
@@ -785,7 +787,7 @@ class AssemblerState:
         # 名前 -> [(照合パターン, 値欄), ...]。`!S{{名前}}変数` の展開に使う。
         self.sub_defs: dict = {}
 
-        # `.func::名前::引数 ... .return` で登録されたミニ言語の関数。
+        # `.func::名前::引数 ... .endfunc` で登録されたミニ言語の関数。
         # 名前 -> _MiniFunc。`binary_list` 欄の `.call` から呼ぶ。
         self.func_defs: dict = {}
 
@@ -4096,7 +4098,7 @@ class PatternFileReader:
             else MacroPreprocessor(None, pat_mode=True)
         # `.sub::名前 ... .return` で集めたサブ表。名前 -> [(パターン, 値欄), ...]。
         self.subs = {}
-        # `.func::名前::引数 ... .return` で集めたミニ言語の関数。名前 -> _MiniFunc。
+        # `.func::名前::引数 ... .endfunc` で集めたミニ言語の関数。名前 -> _MiniFunc。
         self.funcs = {}
 
     def readpat(self, fn, base_dir=None, _depth=0, _chain=None):
@@ -4131,7 +4133,7 @@ class PatternFileReader:
             self.funcs = {}
 
         try:
-            with open(fn, "rt", encoding="utf-8") as f:
+            with open(fn, "rt", encoding="utf-8", errors="surrogateescape") as f:
                 raw_lines = f.readlines()
         except OSError as e:
             diag(f" error - cannot open pattern file '{fn}': {e}", set_error=True)
@@ -4228,15 +4230,17 @@ class PatternFileReader:
                         target[_nm] = _fn_obj
                         func_stack.append(_fn_obj)
                     else:
-                        # 名前が壊れていても本体を取り込んで `.return` の対応を保つ。
+                        # 名前が壊れていても本体を取り込んで `.endfunc` の対応を保つ。
                         func_stack.append(_MiniFunc('?', [], parent, fn, _mln))
                     continue
                 cur = func_stack[-1]
-                if _dk == '.RETURN' and cur.depth == 0:
-                    # 本体を閉じる `.return`。`.return 式` なら値を返す文でも
-                    # あるので、閉じるだけでなく本体の最後の行としても残す。
-                    if l.strip()[len(_dk):].strip():
-                        cur.lines.append((l, fn, _mln))
+                if _dk == '.ENDFUNC':
+                    # 本体を閉じるのは `.endfunc` のみ。`.if`/`.while`/`.for` が
+                    # 閉じきらないまま来たら壊れたパターンなので報告するが、
+                    # 後続行を巻き込まないよう関数はここで閉じてしまう。
+                    if cur.depth != 0:
+                        diag(f" error - '.func::{cur.name}': '.endfunc' while a block "
+                             f"('.if'/'.while'/'.for') is still open.", set_error=True)
                     func_stack.pop()
                     continue
                 if _dk in _MINI_OPEN:
@@ -4330,7 +4334,7 @@ class PatternFileReader:
         while func_stack:
             _f = func_stack.pop()
             diag(f" error - pattern file '{fn}' ends while function {_f.name!r} "
-                 f"is still open (missing '.return').", set_error=True)
+                 f"is still open (missing '.endfunc').", set_error=True)
 
         if _depth == 0:
             self.check_sub_refs(w)
@@ -5528,7 +5532,7 @@ class ObjectGenerator:
         fn = self.state.func_defs.get(name)
         if fn is None:
             self._mini_diag(f" error - '.call': no function named {name!r} "
-                            f"(define it with '.func::{name}:: ... .return').")
+                            f"(define it with '.func::{name}:: ... .endfunc').")
             return [], idx
 
         args = []
@@ -5990,7 +5994,7 @@ class AssemblyDirectiveProcessor:
                 # \xHH などのエスケープは「バイト値の指定」なので1バイトのまま扱う
                 # （ここを UTF-8 符号化すると \xFF が 2 バイトになってしまう）。
                 if _is_literal:
-                    _vals = list(ch.encode('utf-8'))
+                    _vals = list(ch.encode('utf-8', errors='surrogateescape'))
                 else:
                     _vals = [ord(ch)]
                 for _v in _vals:
@@ -7472,7 +7476,7 @@ class MacroPreprocessor:
             raise MacroError(f"{_fmt_pos(pos)}: '!include' nested deeper than "
                              f"{_MACRO_MAX_INCLUDE_DEPTH}")
         try:
-            with open(path, 'rt', encoding='utf-8') as f:
+            with open(path, 'rt', encoding='utf-8', errors='surrogateescape') as f:
                 raw = f.readlines()
         except OSError as e:
             raise MacroError(f"{_fmt_pos(pos)}: cannot '!include' {name!r}: {e}")
@@ -8349,12 +8353,13 @@ class Assembler:
                     os.close(fd)
                     self.state.stdin_tmp_path = tmp_path
                     af = self.file_input_from_stdin()
-                    with open(self.state.stdin_tmp_path, "wt", encoding="utf-8") as stdintmp:
+                    with open(self.state.stdin_tmp_path, "wt", encoding="utf-8",
+                              errors="surrogateescape") as stdintmp:
                         stdintmp.write(af)
                 fn = self.state.stdin_tmp_path
 
             try:
-                with open(fn, "rt", encoding="utf-8") as f:
+                with open(fn, "rt", encoding="utf-8", errors="surrogateescape") as f:
                     af = f.readlines()
             except OSError as e:
                 self.state.diag(f" error - cannot open source file '{fn}': {e}",
@@ -9308,7 +9313,7 @@ class Assembler:
     def _macro_expand_only(self, sourcefile, dest):
         self.macro_proc.reset_pass()
         try:
-            with open(sourcefile, "rt", encoding="utf-8") as f:
+            with open(sourcefile, "rt", encoding="utf-8", errors="surrogateescape") as f:
                 raw = f.readlines()
         except OSError as e:
             self.state.diag(f" error - cannot open source file '{sourcefile}': {e}", set_error=False, force=True)
@@ -9329,7 +9334,7 @@ class Assembler:
             sys.stdout.write(data)
         else:
             try:
-                with open(dest, "wt", encoding="utf-8") as f:
+                with open(dest, "wt", encoding="utf-8", errors="surrogateescape") as f:
                     f.write(data)
             except OSError as e:
                 self.state.diag(f" error - cannot write '{dest}': {e}", set_error=False, force=True)
@@ -9339,7 +9344,7 @@ class Assembler:
     def _pat_macro_expand_only(self, patternfile, dest):
         self.pat_macro_proc.reset_pass()
         try:
-            with open(patternfile, "rt", encoding="utf-8") as f:
+            with open(patternfile, "rt", encoding="utf-8", errors="surrogateescape") as f:
                 raw = f.readlines()
         except OSError as e:
             self.state.diag(f" error - cannot open pattern file '{patternfile}': {e}",
@@ -9359,7 +9364,7 @@ class Assembler:
             sys.stdout.write(data)
         else:
             try:
-                with open(dest, "wt", encoding="utf-8") as f:
+                with open(dest, "wt", encoding="utf-8", errors="surrogateescape") as f:
                     f.write(data)
             except OSError as e:
                 self.state.diag(f" error - cannot write '{dest}': {e}",
@@ -9498,7 +9503,8 @@ class Assembler:
             if self.state.impfile:
 
                 try:
-                    with open(self.state.impfile, 'rt', encoding="utf-8") as label_file:
+                    with open(self.state.impfile, 'rt', encoding="utf-8",
+                              errors="surrogateescape") as label_file:
                         raw_lines = label_file.readlines()
                 except OSError as e:
                     self.state.diag(f" error - cannot open import file "

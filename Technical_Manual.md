@@ -803,10 +803,10 @@ A function is defined at the top level of a pattern file:
 ```
 .func::<name>::<parameter, parameter, ...>
 <statements>
-.return
+.endfunc
 ```
 
-Everything between the header and the matching `.return` is the body; those
+Everything between the header and the matching `.endfunc` is the body; those
 lines are never matched as ordinary pattern lines. Parameters may be empty
 (`.func::name::`).
 
@@ -849,8 +849,9 @@ f(a)` runs the call and discards its output.
 | `.while(<expr>)` / `.endwhile` | Loop while the condition is non-zero |
 | `.for <name> in range(...)` / `.next` | Loop over `range(stop)`, `range(start, stop)` or `range(start, stop, step)` |
 | `.nonlocal a, b` | Bind these names to the enclosing call instead of locally |
-| `.return` | Return from the function |
+| `.return` | Return from the function. May appear anywhere in the body (top level or inside `.if`/`.while`/`.for`), any number of times |
 | `.return <expr>` | Return a value from the function |
+| `.endfunc` | Close the function's body (see above) |
 
 `.emit` appends one word of `.bits` width per value — one byte at the default
 width. The number of words a call emits is the instruction's length, so a
@@ -915,6 +916,7 @@ d = target - $.
 .endif
 .emit(d & 0xff)
 .return
+.endfunc
 ```
 
 Pattern variables `a`-`z` and `!!!` are *not* available there: nothing has
@@ -931,19 +933,22 @@ A value derived from an undefined label comes through as 0, the same treatment
 ```
 .func::hypot2::a,b
 .return a*a+b*b
+.endfunc
 
 .func::emit_h::a,b
 v = .call hypot2(a,b)
 .emit(v)
 .return
+.endfunc
 ```
 
 The value may be a number or an array; an array is passed as a copy. The target
 may be an array element (`a[i] = .call f(x)`), in which case the returned value
 must be a number. Calling a function that returns nothing in that form is an
 error, and `.call` cannot appear inside a larger expression — take the value
-into a variable first. A `.return <expr>` also works as the line that closes
-the body, and as an early return from inside a block:
+into a variable first. `.return` never closes the body — only `.endfunc` does
+that — so `.return <expr>` may also be used as an early return from inside a
+block, any number of times:
 
 ```
 .func::firstdiv::n
@@ -955,6 +960,7 @@ i=2
 i=i+1
 .endwhile
 .return 0
+.endfunc
 ```
 
 When a function is called straight from `binary_list`, its return value becomes
@@ -971,6 +977,7 @@ a=[]
 a[i]=0xc0+i
 .next
 .return a
+.endfunc
 ```
 
 ```
@@ -1014,10 +1021,12 @@ n=7
 n=n+1
 .emit(n)
 .return
+.endfunc
 .call inner()
 .call inner()
 .emit(n)
 .return
+.endfunc
 ```
 
 ```
@@ -1054,6 +1063,7 @@ i=i+1
 .endif
 .next
 .return
+.endfunc
 
 .func::collatz::n
 c=0
@@ -1067,6 +1077,7 @@ c=c+1
 .endwhile
 .emit(c)
 .return
+.endfunc
 ```
 
 ```
@@ -2012,9 +2023,9 @@ The x86_64 pattern file is also maintained separately at
 |---|---|---|---|---|
 | **x86_64.axx** | 3.9 MB | 23,923 | **hello.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512 |
 | **x86_64m.axx** | 935 KB | 5,787 | **hello.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo |
-| **aarch64_logical_mini.axx** | 8.6 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 logical (immediate): AND/ORR/EOR/ANDS/TST, 32- and 64-bit. Encodes the bitmask immediate with the mini language (section 3.15) |
+| **aarch64_logical_mini.axx** | 9.2 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 logical (immediate): AND/ORR/EOR/ANDS/TST, 32- and 64-bit. Encodes the bitmask immediate with the mini language (section 3.15) |
 | **6809.axx** | 124 KB | 1,950 | **6809.s** | Motorola 6809 |
-| **68000.axx** | 49 KB | 453 | **68000.s** | Motorola 68000 |
+| **68000.axx** | 51 KB | 453 | **68000.s** | Motorola 68000 |
 | **6800.axx** | 18 KB | 271 | **6800.s** | Motorola 6800 |
 | **6502.axx** | 14 KB | 192 | **6502.s** | MOS 6502 |
 | **z80.axx** | 7.5 KB | 283 | **z80.s** | Zilog Z80 |

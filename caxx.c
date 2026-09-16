@@ -5573,8 +5573,11 @@ static void check_sub_refs(Assembler *asmb){
 }
 
 /* ==================== ミニ言語: 実装 ====================
- * `.func::名前::引数 … .return` で定義し、`binary_list` 欄の
+ * `.func::名前::引数 … .endfunc` で定義し、`binary_list` 欄の
  * `.call 名前(引数,…)` から呼ぶ。`.emit` した値がその位置のワードになる。
+ * `.return` / `.return 式` は本体中どこでも(トップレベルでも `.if`/`.while`/
+ * `.for` の中でも、何回でも)書ける早期リターン文で、関数の終わりを示す
+ * ものではない。本体そのものを閉じるのは `.endfunc` だけ。
  * axx.py の MiniParser / MiniInterp の移植で、同じ入力に同じ値を出す。 */
 
 enum {
@@ -7104,7 +7107,7 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx, IntVec *obj
     if(!f){
         if(!quiet)
             axx_diagf(1, 0, " error - '.call': no function named '%s' (define it with "
-                       "'.func::%s:: ... .return').\n", name, name);
+                       "'.func::%s:: ... .endfunc').\n", name, name);
         free(argtext);
         return idx;
     }
@@ -7351,12 +7354,14 @@ static void readpat(Assembler *asmb, const char *fn){
                     continue;
                 }
                 MiniFunc *cur = func_stack[nfunc_stack-1];
-                if(strcmp(dk, ".RETURN") == 0 && cur->depth == 0){
-                    /* 本体を閉じる `.return`。`.return 式` なら値を返す文でも
-                     * あるので、閉じるだけでなく本体の最後の行としても残す。 */
-                    int rb = axx_skipspc(line, 0) + (int)strlen(dk);
-                    rb = axx_skipspc(line, rb);
-                    if(line[rb]) mini_func_addline(cur, line, fn, li + 1);
+                if(strcmp(dk, ".ENDFUNC") == 0){
+                    /* 本体を閉じるのは `.endfunc` のみ。`.if`/`.while`/`.for` が
+                     * 閉じきらないまま来たら壊れたパターンなので報告するが、
+                     * 後続行を巻き込まないよう関数はここで閉じてしまう。 */
+                    if(cur->depth != 0){
+                        axx_diagf(1, 0, " error - '.func::%s': '.endfunc' while a block "
+                                   "('.if'/'.while'/'.for') is still open.\n", cur->name);
+                    }
                     nfunc_stack--;
                     continue;
                 }
@@ -7480,7 +7485,7 @@ static void readpat(Assembler *asmb, const char *fn){
     }
     while(nfunc_stack > 0){
         axx_diagf(1, 0, " error - pattern file '%s' ends while function '%s' is "
-                   "still open (missing '.return').\n",
+                   "still open (missing '.endfunc').\n",
                    fn, func_stack[--nfunc_stack]->name);
     }
     if(asmb->st.pat_include_depth == 1){

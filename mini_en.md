@@ -17,10 +17,10 @@ bytes — and the same `.echo` text on stderr.
 ```
 .func::<name>::<parameter, parameter, ...>
 <statements>
-.return
+.endfunc
 ```
 
-Everything from the header to the matching `.return` is the body; those lines are
+Everything from the header to the matching `.endfunc` is the body; those lines are
 never matched as pattern lines. The parameter field may be empty
 (`.func::name::`). Names and parameter names are letters, digits and `_`.
 
@@ -60,9 +60,9 @@ One statement per line.
 | `.while(expr)` / `.endwhile` | Repeat while the value is non-zero |
 | `.for name in range(...)` / `.next` | `range(stop)`, `range(start, stop)`, `range(start, stop, step)` |
 | `.nonlocal a, b` | Treat these names as belonging to an enclosing call |
-| `.return` | Return from the function |
+| `.return` | Return from the function. May appear anywhere in the body (top level or inside `.if`/`.while`/`.for`), any number of times |
 | `.return expr` | Return a value from the function |
-| `.func::name::params...` | Nested function definition |
+| `.func::name::params...` … `.endfunc` | Nested function definition; `.endfunc` closes the body |
 
 The `.if` and `.elif` lines must end with `.then`. Any number of `.elif`
 branches may follow an `.if`, and an `.else` may close the chain; a single
@@ -124,6 +124,7 @@ d = target - $.
 .endif
 .emit(d & 0xff)
 .return
+.endfunc
 ```
 
 Which terms that evaluator accepts depends on the context it is called from (a
@@ -220,10 +221,12 @@ n=7
 n=n+1
 .emit(n)
 .return
+.endfunc
 .call inner()
 .call inner()
 .emit(n)
 .return
+.endfunc
 ```
 
 ```
@@ -241,11 +244,13 @@ enclosing call has the name, it is an error.
 ```
 .func::hypot2::a,b
 .return a*a+b*b
+.endfunc
 
 .func::emit_h::a,b
 v = .call hypot2(a,b)
 .emit(v)
 .return
+.endfunc
 ```
 
 - **The value may be a number or an array.** An array is passed as a copy, so
@@ -257,9 +262,9 @@ v = .call hypot2(a,b)
   one.
 - **`.call` cannot appear inside an expression.** `x = 1 + .call f(y)` is not
   allowed; take the value into a variable first.
-- **The `.return` that closes the body may carry a value too.** The last
-  `.return` of a function marks the end of the body, and with `.return expr` it
-  also returns a value there.
+- **`.return` never closes the body.** Only `.endfunc` does that; `.return` and
+  `.return expr` may appear anywhere in the body — top level or nested inside
+  `.if`/`.while`/`.for` — any number of times, as an early-exit statement.
 - **The return value of a function called from `binary_list` becomes output.**
   A number is one word; an array is one word per element from index 0. It
   follows whatever the function passed to `.emit`, so a function that only
@@ -274,6 +279,7 @@ a=[]
 a[i]=0xc0+i
 .next
 .return a
+.endfunc
 ```
 
 ```
@@ -287,12 +293,14 @@ a=[]
 a[i]=i*i
 .next
 .return a
+.endfunc
 
 .func::use::n
 v = .call mkarr(n)
 .emit(.len(v))
 .emit(v[2])
 .return
+.endfunc
 ```
 
 Returning early works as well.
@@ -307,6 +315,7 @@ i=2
 i=i+1
 .endwhile
 .return 0
+.endfunc
 ```
 
 ## The boundary with the pattern layer
@@ -377,6 +386,7 @@ i=i+1
 .endif
 .next
 .return
+.endfunc
 
 .func::collatz::n
 c=0
@@ -390,6 +400,7 @@ c=c+1
 .endwhile
 .emit(c)
 .return
+.endfunc
 ```
 
 ```
@@ -410,6 +421,7 @@ FIB !n :: .call fib(n)
 .call fib(k-2)
 .endif
 .return
+.endfunc
 ```
 
 With return values, the same recursion can build the value itself.
@@ -424,11 +436,13 @@ FIBV !n :: .call fibv(n)
 p = .call fibn(k-1)
 q = .call fibn(k-2)
 .return p+q
+.endfunc
 
 .func::fibv::n
 v = .call fibn(n)
 .emit(v)
 .return
+.endfunc
 ```
 
 ```

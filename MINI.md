@@ -16,10 +16,10 @@ axx.py と caxx.c の両方に同一仕様で実装されている。値は両�
 ```
 .func::<名前>::<引数, 引数, ...>
 <文>
-.return
+.endfunc
 ```
 
-見出しから対応する `.return` までが本体で、この行はパターン行としては照合されない。
+見出しから対応する `.endfunc` までが本体で、この行はパターン行としては照合されない。
 引数欄は空でもよい（`.func::name::`）。名前と引数名は英数字と `_`。
 
 ```
@@ -56,9 +56,9 @@ LOG !v :: .call table([0x11,0x22,v],3)
 | `.while(式)` / `.endwhile` | 式が 0 でない間くり返す |
 | `.for 名前 in range(...)` / `.next` | `range(stop)` `range(start, stop)` `range(start, stop, step)` |
 | `.nonlocal a, b` | その名前を外側の呼び出しのものとして扱う |
-| `.return` | 関数から戻る |
+| `.return` | 関数から戻る。本体中どこでも（トップレベルでも `.if`/`.while`/`.for` の中でも）、何度でも書ける |
 | `.return 式` | 値を返して関数から戻る |
-| `.func::名前::引数...` | 入れ子の関数定義 |
+| `.func::名前::引数...` … `.endfunc` | 入れ子の関数定義。本体を閉じるのは `.endfunc` |
 
 `.if` と `.elif` の行は `.then` で終わること。`.if` のあとに `.elif` を何段
 続けてもよく、最後に `.else` を置ける。連鎖全体を閉じる `.endif` は 1 つでよい。
@@ -115,6 +115,7 @@ d = target - $.
 .endif
 .emit(d & 0xff)
 .return
+.endfunc
 ```
 
 本体の評価器は呼ばれた文脈ごとに使える項目が変わる（能力記述子）。ミニ言語から
@@ -204,10 +205,12 @@ n=7
 n=n+1
 .emit(n)
 .return
+.endfunc
 .call inner()
 .call inner()
 .emit(n)
 .return
+.endfunc
 ```
 
 ```
@@ -224,11 +227,13 @@ n=n+1
 ```
 .func::hypot2::a,b
 .return a*a+b*b
+.endfunc
 
 .func::emit_h::a,b
 v = .call hypot2(a,b)
 .emit(v)
 .return
+.endfunc
 ```
 
 - **値は整数でも配列でもよい。** 配列はコピーして渡るので、受け取った側で書き換えても
@@ -239,8 +244,9 @@ v = .call hypot2(a,b)
   戻った場合と、`.return` を踏まずに本体を終えた場合の両方が該当する。
 - **`.call` を式の途中には書けない。** `x = 1 + .call f(y)` は書けないので、
   いったん変数で受けてから使う。
-- **本体を閉じる `.return` にも式を書ける。** 関数の最後の `.return` は本体の
-  終わりを示す行でもあるが、`.return 式` ならそこで値を返す文でもある。
+- **`.return` は本体を閉じない。** 本体を閉じるのは常に `.endfunc` で、`.return` /
+  `.return 式` はトップレベルでも `.if`/`.while`/`.for` の中でも、何度でも書ける
+  早期リターン文である。
 - **`binary_list` から呼んだ関数の返り値はそのまま出力になる。** スカラーなら
   1 ワード、配列なら添字 0 から順に 1 要素 1 ワード。`.emit` した値の後ろに続く
   ので、`.emit` だけで値を返さない関数は従来どおりのふるまいになる。
@@ -254,6 +260,7 @@ a=[]
 a[i]=0xc0+i
 .next
 .return a
+.endfunc
 ```
 
 ```
@@ -267,12 +274,14 @@ a=[]
 a[i]=i*i
 .next
 .return a
+.endfunc
 
 .func::use::n
 v = .call mkarr(n)
 .emit(.len(v))
 .emit(v[2])
 .return
+.endfunc
 ```
 
 早期に戻ることもできる。
@@ -287,6 +296,7 @@ i=2
 i=i+1
 .endwhile
 .return 0
+.endfunc
 ```
 
 ## パターン層との境界
@@ -351,6 +361,7 @@ i=i+1
 .endif
 .next
 .return
+.endfunc
 
 .func::collatz::n
 c=0
@@ -364,6 +375,7 @@ c=c+1
 .endwhile
 .emit(c)
 .return
+.endfunc
 ```
 
 ```
@@ -384,6 +396,7 @@ FIB !n :: .call fib(n)
 .call fib(k-2)
 .endif
 .return
+.endfunc
 ```
 
 返り値を使えば、同じ再帰で値そのものを組み立てられる。
@@ -398,11 +411,13 @@ FIBV !n :: .call fibv(n)
 p = .call fibn(k-1)
 q = .call fibn(k-2)
 .return p+q
+.endfunc
 
 .func::fibv::n
 v = .call fibn(n)
 .emit(v)
 .return
+.endfunc
 ```
 
 ```

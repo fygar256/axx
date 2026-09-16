@@ -59,6 +59,7 @@ d = target - $.
 .endif
 .emit(d & 0xff)
 .return
+.endfunc
 ```
 
 It has assignment, `.if`/`.elif`, `.while`, `.for`, recursion, arrays, and `.echo` for debugging, and it can read labels, the location counter and `.setsym` symbols through the assembler's own expression evaluator. `aarch64_logical_mini.axx` uses it for real: AArch64's logical-immediate encoding is a bitmask-to-`N:immr:imms` search that no fixed expression can express, and the whole instruction group fits in 86 pattern lines because of it. Both implementations run the language to the same spec, down to 256-bit wraparound. [MINI.md](MINI.md) / [mini_en.md](mini_en.md) are the reference.
