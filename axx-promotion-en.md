@@ -1,11 +1,4 @@
----
-title: Generalized assembler 'axx General Assembler'
-tags: Terminal Python general assembler
-author: fygar256
-slide: false
----
-
-# axx — An assembler conceived in 1986, dormant for 38 years
+﻿# axx — An assembler conceived in 1986, dormant for 38 years
 
 ## The 30-second version
 
@@ -45,31 +38,15 @@ file out.o
 
 **The grammar itself is free-form.** axx has no tokenizer; it matches character by character. That means it isn't limited to the conventional "mnemonic plus operands" shape — a register-transfer style instruction like `r1 = r2 + r3` is just as legal a pattern as `MOV A,B`. This isn't incidental: LLVM's assembler-generation machinery (TableGen/AsmMatcher) explicitly assumes mnemonic-led syntax, and had to be specially patched to handle Hexagon's mnemonic-less `r0 = r1` transfer syntax. axx never had that assumption baked in to begin with.
 
-**A macro layer keeps large ISAs maintainable.** The full x86_64 pattern set (through AVX-512/EVEX) is 23,923 pattern lines written flat. The macro-based version is 5,787 — a quarter of the size — and expands back to an identical, byte-for-byte matching pattern set at load time. Runtime cost of matching against ~24,000 patterns is still sub-second in the C implementation (0.2 s to assemble `hello.s`).
-
-**When an encoding can't be written as an expression, compute it.** The output field of a pattern is normally just data — `0x03,d` emits two bytes — but it can also be `.call f(d)`, which runs a function written in a small procedural language kept in the same pattern file:
-
-```
-BR !t :: .call rel8(t)
-
-.func::rel8::target
-d = target - $.
-.if d < 0-128 || d > 127 .then
-.echo("branch out of range:", d)
-.endif
-.emit(d & 0xff)
-.return
-```
-
-It has assignment, `.if`/`.elif`, `.while`, `.for`, recursion, arrays, and `.echo` for debugging, and it can read labels, the location counter and `.setsym` symbols through the assembler's own expression evaluator. `aarch64_logical_mini.axx` uses it for real: AArch64's logical-immediate encoding is a bitmask-to-`N:immr:imms` search that no fixed expression can express, and the whole instruction group fits in 86 pattern lines because of it. Both implementations run the language to the same spec, down to 256-bit wraparound. [MINI.md](MINI.md) / [mini_en.md](mini_en.md) are the reference.
+**A macro layer keeps large ISAs maintainable.** The full x86_64 pattern set (through AVX-512/EVEX) is 23,923 pattern lines written flat. The macro-based version is 5,787 — a quarter of the size — and expands back to an identical, byte-for-byte matching pattern set at load time. Runtime cost of matching against ~24,000 patterns is still sub-second in the C implementation.
 
 ## What's covered today
 
 Bundled and working: **x86_64** (x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512), **Motorola 6809 / 68000 / 6800**, **MOS 6502**, **Zilog Z80**, **Intel 8080 / 8051 / 8048 / 4004**.
 
-ARM, AArch64, RISC-V, PowerPC, MIPS and SPARC don't have pattern files yet. That's not a design limitation — it's a labor constraint: the author doesn't currently have real hardware or emulators to validate against, and doing it solo is more than one person wants to take on. The pattern-file format itself is fully documented, and there's nothing architecture-specific stopping someone from writing one. The pattern layer proper is deliberately Turing-incomplete, which is what guarantees pattern matching terminates; where an encoding genuinely needs computation, the mini language above is the escape hatch, and it is invoked only from output fields that ask for it by name.
+ARM, AArch64, RISC-V, PowerPC, MIPS and SPARC don't have pattern files yet. That's not a design limitation — it's a labor constraint: the author doesn't currently have real hardware or emulators to validate against, and doing it solo is more than one person wants to take on. The pattern-file format itself is fully documented and, within the "instructions map one-to-one onto machine code" boundary the design deliberately enforces (a Turing-incomplete core guarantees pattern matching terminates), there's nothing architecture-specific stopping someone from writing one.
 
-## How it compares
+## How it compares (honestly)
 
 **customasm** (Rust, actively maintained) shares the same core idea — describe an ISA declaratively, get an assembler for it — and its `#subruledef` composition system is more structured than axx's flat pattern model. But its output formats (binary, hexdump, intelhex, and similar dump formats) stop short of anything like ELF; there's no relocatable-object output at all. If you're building a toy VM or an FPGA CPU, customasm is the better fit. If you need something that links into a real OS binary, axx is the one that does that.
 
@@ -98,5 +75,4 @@ Pattern files for ARM, RISC-V, PowerPC, MIPS and SPARC don't exist yet. Getting 
 
 ---
 
-*Every verification claim in this document (byte-identical dual implementations, actual ELF object generation, the line-count comparison) was checked by cloning, building, and running the repository directly
-
+*Every verification claim in this document (byte-identical dual implementations, actual ELF object generation, the line-count comparison) was checked by cloning, building, and running the repository directly — not taken from the README on faith.*

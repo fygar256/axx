@@ -17,11 +17,17 @@ File description
 8080.s                              test assemble file for 8080
 4004.axx                            pattern file for 4004
 4004.s                              test assemble file for 4004
+aarch64_logical.axx                 pattern file for the AArch64 logical (immediate)
+                                    group, AND/ORR/EOR/ANDS/TST, 32 and 64 bit.
+                                    the macro-layer version: the rows are
+                                    generated with !def, and the bitmask
+                                    immediate is encoded in binary_list
 aarch64_logical_mini.axx            pattern file for the AArch64 logical (immediate)
                                     group, AND/ORR/EOR/ANDS/TST, 32 and 64 bit.
                                     encodes the bitmask immediate with the mini
                                     language instead of one binary_list expression
 aarch64_logical_mini_demo.s         test assemble file for aarch64_logical_mini.axx
+                                    (also assembles with aarch64_logical.axx)
 LICENSE                             license
 README.md                           readme
 Technical_Manual.md                 technical manual, full reference
