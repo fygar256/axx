@@ -23,7 +23,7 @@ All statements begin with `!` at the start of the line (ignoring leading whitesp
 | `!name(a, b)` | Expand macro as a statement |
 | `!include "file"` | Include text at macro-expansion time |
 | `!error expr` | Abort expansion and report error |
-| `!warning expr` / `!echo expr` | Output to stderr |
+| `!warning expr` / `!echo expr` | Output to stderr (`!echo` shares its layout with the mini language's `.echo`) |
 
 The opening `{` must appear at the end of the header line, and the closing `}` at the start of a line. `; comment` may be written after a statement. ## Embedding in Expressions
 
@@ -66,6 +66,29 @@ plus unary `-` `+` `~` `!`. `/` and `%` truncate towards zero, just like in C (`
 `+` performs concatenation if either operand is a string; `"ab" * 3` performs repetition.
 Integer literals: `10` / `0x1f` / `0b1010` / `0o17` (underscores allowed).
 `'A'` is treated as a character code if it is a single character, or a string if multiple characters.
+
+Three unary/postfix operators come across from the assembler's own evaluator.
+They share one implementation with it, so they mean the same thing:
+
+| Written | Meaning |
+|---|---|
+| `@v` | Position of the highest set bit of `v`, counted from the right |
+| `v'bits` | Sign-extend, treating bit `bits-1` as the sign bit |
+| `*(v, n)` | Keep everything above byte `n` of `v`, counted from the low end |
+
+```
+!{@255}          -> 8
+!{0xff'8}        -> -1
+!{*(0xabcd,1)}   -> 171
+```
+
+`'` binds looser than the bitwise operators and tighter than `&&`. The
+assembler puts it between `^` and the comparisons; macro-layer precedence
+follows C, where comparisons bind tighter than the bitwise operators, so the
+same relative position is not available. Whether a `'` is sign extension or the
+start of a character literal is decided the same way the assembler decides it:
+by whether a digit or `(` follows. Only a `*(` where a value is expected is a
+byte extract; an infix `*` is still multiplication.
 
 ## Built-in Functions
 

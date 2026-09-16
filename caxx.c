@@ -78,6 +78,8 @@ static int  m_utf8(unsigned long cp, char *out);
  * ========================================================= */
 typedef struct { uint64_t w[4]; } uint256_t;
 static void u256_to_pydec(uint256_t a, char *out, size_t outsz);
+/* マクロ層とミニ言語で共通の `echo` 出力（定義はマクロ層側）。 */
+static void m_echo_write(char *const *items, int n);
 
 /* パターン変数（a〜z）1個ぶんの束縛。is_undef は「まだ束縛されていない」印。
  * is_float は、val が「C の double のビットパターン」（true）なのか
@@ -313,6 +315,41 @@ static int u256_nbit(uint256_t v) {
         }
     }
     return b;
+}
+
+/* 本体の式評価器が持つ単項/後置演算子の実装。マクロ層からも同じ意味で呼べる
+ * ように評価器の外へ出してある。どれも診断は出さず「値と、あれば伝えるべき
+ * 文言」を返すだけにして、報告はそれぞれの層に任せる。
+ * axx.py の op_msb / op_sext / op_byte と同じ。 */
+
+#define SEXT_MAX_BITS 128
+
+/* `@v` … 最上位の立っているビットの位置を右から数えた値。 */
+static int op_msb(uint256_t v){ return u256_nbit(v); }
+
+/* `x'bits` … ビット bits-1 を符号ビットとみなした符号拡張。
+ * warn_out には上限超えのときだけ 1 が入る（表示は呼び出し側）。 */
+static uint256_t op_sext(uint256_t x, uint256_t bits, int *warn_out){
+    *warn_out = 0;
+    if(u256_is_neg256(bits) || u256_is_zero(bits)) return u256_zero();
+    if(u256_nonneg_gt_i64(bits, SEXT_MAX_BITS)){ *warn_out = 1; return u256_zero(); }
+    int tv = (int)u256_to_i64(bits);
+    uint256_t mask = u256_not(u256_shl(u256_not(u256_zero()), tv));
+    x = u256_and(x, mask);
+    uint256_t sign_bit = u256_and(u256_sar(x, tv - 1), u256_one());
+    if(!u256_is_zero(sign_bit))
+        x = u256_or(x, u256_shl(u256_not(u256_zero()), tv));
+    return x;
+}
+
+/* `*(x, index)` … 下位から数えて index バイト目より上を残した値。
+ * index が負なら neg_out に 1 を入れて 0 を返す（表示は呼び出し側）。
+ * 256 を超える分は符号で埋まるだけなので先に頭打ちにする。 */
+static uint256_t op_byte(uint256_t x, uint256_t index, int *neg_out){
+    *neg_out = 0;
+    if(u256_is_neg256(index)){ *neg_out = 1; return u256_zero(); }
+    int shift = u256_nonneg_gt_i64(index, 256/8) ? 256 : (int)(u256_to_i64(index)*8);
+    return u256_sar(x, shift);
 }
 
 /* 未定義ラベルの値を表す番兵。
@@ -552,7 +589,8 @@ typedef struct {
 
 typedef enum {
     MX_NUM, MX_VAR, MX_ARRLIT, MX_INDEX, MX_SLICE, MX_LEN, MX_BIN, MX_UN,
-    MX_STR   /* `.echo` の文字列リテラル専用。式としては評価されない */
+    MX_STR,  /* `.echo` の文字列リテラル専用。式としては評価されない */
+    MX_CORE  /* `$$` `$.` `#記号` … 本体の式評価器に委譲する項 */
 } MXKind;
 
 typedef struct MExpr {
@@ -970,6 +1008,30 @@ static AXX_UNUSED void bufmap_free(BufMap*m){
 #define EXP_PAT  0
 #define EXP_ASM  1
 
+/* 式評価器の「この場では何が書けるか」を表す能力記述子。
+ * 本体・マクロ層・ミニ言語の 3 つの層が同じ式評価器を呼ぶが、呼ぶ時点で意味を
+ * 成す項目は層ごとに違う。たとえばパターン変数 `a` はパターン行を符号化して
+ * いる最中にしか束縛されていないし、`!!!` は VLIW のパターン行でしか意味が
+ * ない。どの項目が生きているかを 1 か所にまとめ、評価器は st->expcaps を見て
+ * 判断する。呼ぶタイミングが変われば記述子が変わり、使える機能が変わる。
+ * axx.py の ExprCaps と同じ構成。 */
+typedef struct {
+    const char *name;
+    int patvars;   /* 小文字 1 文字のパターン変数 a〜z */
+    int vliw;      /* `!!!` / `!!!!` */
+    int labels;    /* ラベル名・.equ 名の参照 */
+    int loc;       /* `$$` / `$.` */
+    int syms;      /* `#name` と .setsym の記号 */
+} ExprCaps;
+
+/* パターンファイルの式。すべて使える。 */
+static const ExprCaps CAPS_PAT  = { "pattern",       1, 1, 1, 1, 1 };
+/* アセンブリソース行の式。パターン変数と VLIW 計数は無い。 */
+static const ExprCaps CAPS_ASM  = { "assembly",      0, 0, 1, 1, 1 };
+/* ミニ言語 (`.func` 本体) から呼ぶとき。ラベル・`$$`・`#記号` は読めるが、
+ * パターン変数はその場で束縛されていないので落とす。 */
+static const ExprCaps CAPS_MINI = { "mini language", 0, 0, 1, 1, 1 };
+
 static const char *ERRORS_TABLE[] = {
     "",
     "Invalid syntax.",
@@ -1087,6 +1149,7 @@ typedef struct {
 
     /* --- 式評価とエラー状態 --- */
     int        expmode;        /* EXP_PAT=パターン側 / EXP_ASM=ソース側 */
+    const ExprCaps *expcaps;   /* いま評価中の式で使える項目 */
     int        exp_typ_float;  /* 浮動小数点モードか */
 
     /* 直近の式評価で未定義ラベルを踏んだか。「失敗時に立てる」だけで
@@ -1650,6 +1713,7 @@ static void state_init(AsmState *st) {
     st->vliwstop = 0;
     st->vcnt = 1;
     st->expmode = EXP_PAT;
+    st->expcaps = &CAPS_PAT;
     st->exp_typ_float = 0;
     st->align = u256_from_u64(16);
     st->bts = 8;
@@ -3198,13 +3262,29 @@ static char *expr_terminate(const char *s){
 
 static uint256_t expr_expression_pat(Assembler *asmb, const char *s, int idx, int *idx_out){
     asmb->st.expmode=EXP_PAT;
+    asmb->st.expcaps=&CAPS_PAT;
     char *ts=expr_terminate(s);
     uint256_t r=expr_expression(asmb,ts,idx,idx_out);
     free(ts);
     return r;
 }
+/* 能力記述子を指定して評価する。マクロ層・ミニ言語からの委譲用。 */
+static uint256_t expr_expression_caps(Assembler *asmb, const char *s, int idx,
+                                       const ExprCaps *caps, int *idx_out){
+    int prev_mode = asmb->st.expmode;
+    const ExprCaps *prev_caps = asmb->st.expcaps;
+    asmb->st.expmode=EXP_PAT;
+    asmb->st.expcaps=caps;
+    char *ts=expr_terminate(s);
+    uint256_t r=expr_expression(asmb,ts,idx,idx_out);
+    free(ts);
+    asmb->st.expmode=prev_mode;
+    asmb->st.expcaps=prev_caps;
+    return r;
+}
 static uint256_t expr_expression_asm(Assembler *asmb, const char *s, int idx, int *idx_out){
     asmb->st.expmode=EXP_ASM;
+    asmb->st.expcaps=&CAPS_ASM;
     char *ts=expr_terminate(s);
     uint256_t r=expr_expression(asmb,ts,idx,idx_out);
     free(ts);
@@ -3269,10 +3349,10 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
     uint256_t x=u256_zero();
     int slen=(int)strlen(s);
 
-    if(idx+4<=slen && strncmp(s+idx,"!!!!",4)==0 && st->expmode==EXP_PAT){
+    if(idx+4<=slen && strncmp(s+idx,"!!!!",4)==0 && st->expcaps->vliw){
         x=u256_from_i64(st->vliwstop); idx+=4;
         if(asmb->st.exp_typ_float) x=double_to_u256((double)st->vliwstop);
-    } else if(idx+3<=slen && strncmp(s+idx,"!!!",3)==0 && st->expmode==EXP_PAT){
+    } else if(idx+3<=slen && strncmp(s+idx,"!!!",3)==0 && st->expcaps->vliw){
         x=u256_from_i64(st->vcnt); idx+=3;
         if(asmb->st.exp_typ_float) x=double_to_u256((double)st->vcnt);
     } else if(s[idx]=='-'){
@@ -3295,7 +3375,7 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
         x=expr_factor(asmb,s,idx+1,&idx);
         /* 同上: nbit() は数値としてのビット長を求めるものなので、float 型式では
          * 生ビットではなく数値へ変換してから渡す(axx.py の nbit(x) と同じ)。 */
-        int nb = u256_nbit(expr_safe_bitwise_operand(asmb,x,"@"));
+        int nb = op_msb(expr_safe_bitwise_operand(asmb,x,"@"));
         if(asmb->st.exp_typ_float)
             x=double_to_u256((double)nb);
         else
@@ -3309,22 +3389,11 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
                 uint256_t x2=expr_expression(asmb,s,idx+1,&i3); idx=i3;
                 if(s[idx]==')'){
                     idx++;
-                    /* 破綻点修正: u256_to_i64() は下位64bitしか見ないので、
-                     * 2**63 のような値は「負」に、2**64 の倍数は 0 に化けていた。
-                     * (前者は偽のエラーでアセンブルが止まり、後者は「シフト
-                     * しない」で素通しになる。) axx.py は 256bit の値そのもので
-                     * 判定するので、シフト量や指数と同じ 256bit 用のヘルパーで
-                     * 符号と上限を見る。 */
-                    if(u256_is_neg256(x2)){
-                        if(should_report_errors(st)){
-                            axx_diagf(1, 0, " error - negative byte-extract offset in *(expr, expr).\n");
-                        }
-                        x=u256_zero();
-                    } else {
-                        /* 256 を超える分は符号で埋まるだけなので、先に頭打ちにする。 */
-                        int shift = u256_nonneg_gt_i64(x2, 256/8)
-                                    ? 256 : (int)(u256_to_i64(x2)*8);
-                        x=u256_sar(x,shift);
+                    /* 実装は共有関数 op_byte() 側。マクロ層も同じものを呼ぶ。 */
+                    int neg = 0;
+                    x = op_byte(x, x2, &neg);
+                    if(neg && should_report_errors(st)){
+                        axx_diagf(1, 0, " error - negative byte-extract offset in *(expr, expr).\n");
                     }
                 } else {
                     if(should_report_errors(st)){
@@ -3755,7 +3824,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         x = st->enum_bind_vals[_en_k];
         idx = _en_end;
     }
-    else if(st->expmode==EXP_PAT && is_lower(s[idx])
+    else if(st->expcaps->patvars && is_lower(s[idx])
             && (s[idx+1]=='\0' || !char_in(s[idx+1], st->lwordchars))){
         char ch=s[idx];
         if(idx+3<=slen && s[idx+1]==':'&&s[idx+2]=='='){
@@ -4079,7 +4148,6 @@ static uint256_t expr_term5(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
-#define SEXT_MAX_BITS 128
 static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term5(asmb,s,idx,&idx);
     int slen=(int)strlen(s);
@@ -4087,33 +4155,17 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
         int ni=idx+1; ni=axx_skipspc(s,ni);
         if(ni>=slen||((s[ni]<'0'||s[ni]>'9')&&s[ni]!='(')) break;
         uint256_t t=expr_term5(asmb,s,idx+1,&idx);
-        /* 破綻点修正: u256_to_i64() は下位64bitしか見ないので、2**64+8 のような
-         * 幅が 8 に化け、axx.py が「上限超え→0」にするところを黙って
-         * ビット 8 で符号拡張していた。256bit の値そのもので符号と上限を見る。 */
-        if(u256_is_neg256(t) || u256_is_zero(t)){
-            x=u256_zero();
-        } else if(u256_nonneg_gt_i64(t, SEXT_MAX_BITS)){
-            if(should_report_errors(&asmb->st)){
-                char cb[96]; u256_to_pydec(t, cb, sizeof(cb));
-                axx_diagf(0, 0, " warning - sign-extension bit width %s exceeds maximum %d, result set to 0.\n",
-                           cb, SEXT_MAX_BITS);
-            }
-            x=u256_zero();
-        } else {
-            int64_t tv=u256_to_i64(t);
-            uint256_t mask = u256_not(u256_shl(u256_not(u256_zero()), (int)tv));
-            x = u256_and(x, mask);
-            uint256_t sign_bit = u256_sar(x, (int)(tv - 1));
-            sign_bit = u256_and(sign_bit, u256_one());
-            if(!u256_is_zero(sign_bit)){
-                uint256_t ext = u256_shl(u256_not(u256_zero()), (int)tv);
-                x = u256_or(x, ext);
-            }
+        /* 実装は共有関数 op_sext() 側。マクロ層も同じものを呼ぶ。 */
+        int warn = 0;
+        x = op_sext(x, t, &warn);
+        if(warn && should_report_errors(&asmb->st)){
+            char cb[96]; u256_to_pydec(t, cb, sizeof(cb));
+            axx_diagf(0, 0, " warning - sign-extension bit width %s exceeds maximum %d, result set to 0.\n",
+                       cb, SEXT_MAX_BITS);
         }
     }
     *idx_out=idx; return x;
 }
-#undef SEXT_MAX_BITS
 
 static uint256_t expr_term7(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term6(asmb,s,idx,&idx);
@@ -4778,6 +4830,7 @@ static uint256_t enum_eval(Assembler *asmb, const EnumDef *ed,
     const StrVec    *prev_names = st->enum_bind_names;
     const uint256_t *prev_vals  = st->enum_bind_vals;
     int prev_expmode = st->expmode;
+    const ExprCaps *prev_expcaps = st->expcaps;
     st->enum_bind_names = &ed->names;
     st->enum_bind_vals  = vals;
     int io=0;
@@ -4785,6 +4838,7 @@ static uint256_t enum_eval(Assembler *asmb, const EnumDef *ed,
     /* expr_expression_pat() は expmode を戻さないので、照合中の EXP_ASM を
      * 壊さないようここで自分で戻す。 */
     st->expmode = prev_expmode;
+    st->expcaps = prev_expcaps;
     st->enum_bind_names = prev_names;
     st->enum_bind_vals  = prev_vals;
     free(vals);
@@ -5531,7 +5585,7 @@ enum {
     MINI_MAX_TOK   = 1024
 };
 
-typedef enum { MT_END, MT_NUM, MT_NAME, MT_DOT, MT_OP, MT_STR } MTKind;
+typedef enum { MT_END, MT_NUM, MT_NAME, MT_DOT, MT_OP, MT_STR, MT_CORE } MTKind;
 /* 字句1個ぶん。s は名前／ディレクティブ名を丸ごと収める。axx.py 側に名前の
  * 長さ制限は無いので、実用上ぶつからない幅を取っておく（作業領域はヒープ）。 */
 typedef struct { MTKind k; uint256_t num; char s[512]; } MTok;
@@ -5571,6 +5625,10 @@ static char *mini_strdup(const char *s){
 
 /* --------------------------- 値 --------------------------- */
 
+/* ミニ言語の値を、マクロ層の `!echo` と同じ体裁の文字列にする。整数は符号つき
+ * 10 進、配列は `[1, 2, 3]`。返り値は free() すること。 */
+static char *mini_echo_text(MiniVal *v);
+
 static void mini_val_free(MiniVal *v){
     if(v->arr) free(v->arr);
     v->arr = NULL; v->n = v->cap = 0; v->is_arr = 0;
@@ -5601,6 +5659,28 @@ static void mini_arr_reserve(MiniVal *v, int want){
     uint256_t *na = realloc(v->arr, (size_t)cap * sizeof(uint256_t));
     if(!na){ perror("realloc"); exit(1); }
     v->arr = na; v->cap = cap;
+}
+
+static char *mini_echo_text(MiniVal *v){
+    if(!v->is_arr){
+        char cb[96]; u256_to_pydec(v->num, cb, sizeof(cb));
+        return mini_strdup(cb);
+    }
+    /* 1 要素あたり 256bit 符号つき 10 進は最長 78 桁 + 符号。区切りの ", " を
+     * 足して 98 文字を見ておけば足りる。 */
+    size_t cap = (size_t)v->n * 98 + 4;
+    char *b = mini_alloc(cap);
+    size_t len = 0;
+    b[len++] = '[';
+    for(int i = 0; i < v->n; i++){
+        if(i){ b[len++] = ','; b[len++] = ' '; }
+        char cb[96]; u256_to_pydec(v->arr[i], cb, sizeof(cb));
+        size_t l = strlen(cb);
+        memcpy(b + len, cb, l); len += l;
+    }
+    b[len++] = ']';
+    b[len] = 0;
+    return b;
 }
 
 /* --------------------------- 字句 --------------------------- */
@@ -5652,6 +5732,28 @@ static int mini_lex(MiniCtx *c, const char *t, MTok *out){
             while(j < len && (isalnum((unsigned char)t[j]) || t[j] == '_')) j++;
             if(j - i >= (int)sizeof(out[n].s)) mini_fail(c, "name is too long");
             out[n].k = MT_NAME;
+            memcpy(out[n].s, t + i, (size_t)(j - i)); out[n].s[j - i] = 0;
+            n++; i = j; continue;
+        }
+        if(ch == '$'){
+            /* `$$` / `$.` は本体の式評価器が持つ項。ここでは字面を覚えるだけで、
+             * 実際の値は評価時に本体へ渡して求める。 */
+            if(t[i+1] == '$' || t[i+1] == '.'){
+                out[n].k = MT_CORE;
+                out[n].s[0] = t[i]; out[n].s[1] = t[i+1]; out[n].s[2] = 0;
+                n++; i += 2; continue;
+            }
+            mini_fail(c, "'$' must be written '$$' (location counter) or '$.' "
+                         "(start of the next instruction)");
+        }
+        if(ch == '#'){
+            /* `#name` も本体の式評価器が持つ項（`.setsym` の記号）。 */
+            int j = i + 1;
+            while(j < len && (isalnum((unsigned char)t[j]) || t[j] == '_'
+                              || t[j] == '.' || t[j] == '$')) j++;
+            if(j == i + 1) mini_fail(c, "'#' needs a symbol name");
+            if(j - i >= (int)sizeof(out[n].s)) mini_fail(c, "symbol name is too long");
+            out[n].k = MT_CORE;
             memcpy(out[n].s, t + i, (size_t)(j - i)); out[n].s[j - i] = 0;
             n++; i = j; continue;
         }
@@ -5750,6 +5852,7 @@ static MExpr *mxp_primary(MXP *p){
     if(mxp_end(p)) mini_fail(p->c, "expected a value, found end of line");
     MTok *tk = &p->t[p->i];
     if(tk->k == MT_STR) mini_fail(p->c, "a string can only be used in '.echo'");
+    if(tk->k == MT_CORE){ p->i++; MExpr *e = mx_new(MX_CORE); e->name = mini_strdup(tk->s); return e; }
     if(tk->k == MT_NUM){ p->i++; MExpr *e = mx_new(MX_NUM); e->num = tk->num; return e; }
     if(tk->k == MT_NAME){ p->i++; MExpr *e = mx_new(MX_VAR); e->name = mini_strdup(tk->s); return e; }
     if(tk->k == MT_DOT){
@@ -6353,13 +6456,50 @@ static MiniBind *mini_bind_new(MiniFrame *fr, const char *name){
     return b;
 }
 
+/* `$$` `$.` `#記号` ラベル名を本体の式評価器に評価してもらう。
+ * ミニ言語は本体と同じ 256bit の値を扱うので、結果はそのまま使える。
+ * 能力記述子は CAPS_MINI。パターン変数 a〜z と `!!!` は `.func` の本体が
+ * 走っている時点では束縛されていないか意味を持たないので、そこで落とす。
+ * 未定義ラベル由来の値は 0 にする。`.call` の引数を評価するときと同じ扱いで、
+ * 番兵の巨大な値で反復回数が爆発するのを防ぐ。
+ * axx.py の MiniInterp._core_eval と同じ。 */
+static uint256_t mini_core_eval(MiniRun *r, const char *text){
+    if(!r->asmb) mini_fail(&r->c, "'%s' is not available here", text);
+    int io = 0;
+    uint256_t v = expr_expression_caps(r->asmb, text, 0, &CAPS_MINI, &io);
+    if(u256_is_undef_derived(v)) return u256_zero();
+    return v;
+}
+
+/* その名前をアセンブラ本体が知っているか（ラベル / `.setsym` 記号）。 */
+static int mini_core_name(MiniRun *r, const char *name){
+    if(!r->asmb) return 0;
+    AsmState *st = &r->asmb->st;
+    if(lmap_find(&st->labels, name)) return 1;
+    {
+        char up[512];
+        axx_strupr_to(up, name, sizeof(up));
+        if(smap_find(&st->symbols, up)) return 1;
+    }
+    if(st->relax_prev && lmap_find(st->relax_prev, name)) return 1;
+    return 0;
+}
+
 static MiniVal mini_get(MiniRun *r, const char *name){
     int found;
     MiniFrame *fr = mini_frame_for(r, name, &found);
     if(!found)
         mini_fail(&r->c, "'.nonlocal %s' found no enclosing definition of '%s'", name, name);
     MiniBind *b = mini_find(fr, name);
-    if(!b) mini_fail(&r->c, "'%s' is used before it is set", name);
+    if(!b){
+        /* ローカルに無い名前は、アセンブラ本体のラベル / `.setsym` 記号として
+         * 読み直す。パス2では本体の表が揃っているので「そんな名前は無い」と
+         * 断定でき、綴り間違いは従来どおりミニ言語のエラーになる。パス1では
+         * まだ前方参照が埋まっていないので、判断を本体側に預ける。 */
+        if(r->asmb && (mini_core_name(r, name) || r->asmb->st.pas != 2))
+            return mini_num(mini_core_eval(r, name));
+        mini_fail(&r->c, "'%s' is used before it is set", name);
+    }
     return mini_val_copy(&b->v);
 }
 
@@ -6436,6 +6576,7 @@ static MiniVal mini_eval(MiniRun *r, MExpr *e){
     case MX_STR:
         mini_fail(&r->c, "a string can only be used in '.echo'");
         return mini_num(u256_zero());   /* mini_fail は longjmp で戻らない */
+    case MX_CORE: return mini_num(mini_core_eval(r, e->name));
     case MX_NUM: return mini_num(e->num);
     case MX_VAR: return mini_get(r, e->name);
     case MX_ARRLIT: {
@@ -6591,32 +6732,19 @@ static void mini_exec(MiniRun *r, MStmt *s){
          * 同じ行が反復回数だけ重複して出るのを防ぐため。 */
         int show = r->asmb && should_report_errors(&r->asmb->st)
                    && !r->asmb->st.pass1_size_mode;
+        char **items = s->nargs ? mini_alloc((size_t)s->nargs * sizeof(char*)) : NULL;
         for(int i = 0; i < s->nargs; i++){
             if(s->args[i]->k == MX_STR){
-                if(show){
-                    if(i) fputc(' ', stderr);
-                    fputs(s->args[i]->name, stderr);
-                }
+                if(show) items[i] = mini_strdup(s->args[i]->name);
                 continue;
             }
             MiniVal ev = mini_eval(r, s->args[i]);
-            if(show){
-                if(i) fputc(' ', stderr);
-                if(ev.is_arr){
-                    fputc('[', stderr);
-                    for(int j = 0; j < ev.n; j++){
-                        char cb[96]; u256_to_pydec(ev.arr[j], cb, sizeof(cb));
-                        fprintf(stderr, "%s%s", j ? ", " : "", cb);
-                    }
-                    fputc(']', stderr);
-                } else {
-                    char cb[96]; u256_to_pydec(ev.num, cb, sizeof(cb));
-                    fputs(cb, stderr);
-                }
-            }
+            if(show) items[i] = mini_echo_text(&ev);
             mini_val_free(&ev);
         }
-        if(show) fputc('\n', stderr);
+        if(show) m_echo_write(items, s->nargs);
+        for(int i = 0; i < s->nargs; i++) free(items[i]);
+        free(items);
         return;
     }
     case MS_CALL: {
@@ -8819,6 +8947,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
 
         st->error_undefined_label=0;
         st->expmode=EXP_ASM;
+        st->expcaps=&CAPS_ASM;
 
         PatVar    saved_vars[26];
         memcpy(saved_vars, st->vars, sizeof(saved_vars));
@@ -8917,6 +9046,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         st->error_undefined_label = best.error_undefined_label;
         diag_replay(st, best.diags, best.diag_seterr, best.diags_len);
         st->expmode = EXP_ASM;
+        st->expcaps = &CAPS_ASM;
 
         st->pc_instr_start = st->pc;
         st->pc_instr_end   = st->pc_instr_start;
@@ -10441,6 +10571,27 @@ static char *mv_to_text(MacroPP *mp, MVal v){
     snprintf(buf, sizeof(buf), "%lld", v.i);
     return marena_strdup(&mp->arena, buf);
 }
+
+/* マクロ層の `!echo` とミニ言語の `.echo` に共通の出力ルーチン。
+ * 項目を空白区切りで 1 行にまとめて標準エラーへ出す。体裁を 1 か所に
+ * 集めておくため、どちらの層もここを通す（axx.py の _echo_write と同じ）。 */
+/* `s[i]` の `'` が符号拡張の演算子か（右に幅が続くか）を見分ける。
+ * 文字定数 `'A'` と区別するため、本体の評価器と同じく「続く文字が数字か `(`」
+ * を条件にする。`!{...}` の走査とマクロ式パーサの両方から使う。
+ * axx.py の _sext_tick_at と同じ。 */
+static int m_sext_tick_at(const char *s, int i){
+    int j = i + 1;
+    while(s[j] == ' ' || s[j] == '\t') j++;
+    return (s[j] >= '0' && s[j] <= '9') || s[j] == '(';
+}
+
+static void m_echo_write(char *const *items, int n){
+    for(int i = 0; i < n; i++){
+        if(i) fputc(' ', stderr);
+        fputs(items[i] ? items[i] : "", stderr);
+    }
+    fputc('\n', stderr);
+}
 static long long mv_need_int(MacroPP *mp, MVal v, const char *file, int line){
     if(v.is_str){
         if(mp->noeval) return 0;
@@ -10886,6 +11037,29 @@ static MVal mep_unary(MEP *p){
     if(p->s[p->i] == '~'){ p->i++; return mv_int(~mv_need_int(p->mp, mep_unary(p), p->file, p->line)); }
     if(p->s[p->i] == '-'){ p->i++; return mv_int(m_i64_neg_ck(p, mv_need_int(p->mp, mep_unary(p), p->file, p->line))); }
     if(p->s[p->i] == '+'){ p->i++; return mep_unary(p); }
+    /* 本体の `@`（最上位ビット位置）。実装は共有関数 op_msb()。 */
+    if(p->s[p->i] == '@'){
+        p->i++;
+        long long xv = mv_need_int(p->mp, mep_unary(p), p->file, p->line);
+        return mv_int(op_msb(u256_from_i64(xv)));
+    }
+    /* 本体の `*(値, 位置)`（バイト抽出）。値が来る位置の `*` だけがこれで、
+     * 中置の `*` は従来どおり掛け算（本体の評価器と同じ見分け方）。 */
+    if(p->s[p->i] == '*' && p->s[p->i+1] == '('){
+        p->i += 2;
+        MVal xa = mep_ternary(p);
+        mep_expect(p, ",");
+        MVal na = mep_ternary(p);
+        mep_expect(p, ")");
+        long long xv = mv_need_int(p->mp, xa, p->file, p->line);
+        long long nv = mv_need_int(p->mp, na, p->file, p->line);
+        int neg = 0;
+        uint256_t r = op_byte(u256_from_i64(xv), u256_from_i64(nv), &neg);
+        if(neg && !p->mp->noeval)
+            m_fail(p->mp, p->file, p->line,
+                   "negative byte-extract offset in *(expr, expr)");
+        return mv_int(u256_to_i64(r));
+    }
     return mep_primary(p);
 }
 
@@ -11090,13 +11264,40 @@ static MVal mep_bor(MEP *p){
         } else return v;
     }
 }
-static MVal mep_land(MEP *p){
+/* 本体の `'`（任意ビット位置からの符号拡張）をマクロ式でも使えるようにする。
+ * 実装は本体と同じ共有関数 op_sext()。位置はビット演算子より緩く `&&` より
+ * きつい段。本体では `^` と比較のあいだだが、マクロ層の優先順位は C に
+ * 合わせてあり比較のほうがビット演算子よりきついので、同じ相対位置は取れない。
+ * axx.py の _ExprParser.sext と同じ。 */
+static MVal mep_sext(MEP *p){
     MVal v = mep_bor(p);
+    for(;;){
+        mep_skip(p);
+        if(p->s[p->i] != '\'' || !m_sext_tick_at(p->s, p->i)) break;
+        p->i++;
+        MVal t = mep_bor(p);
+        long long xv = mv_need_int(p->mp, v, p->file, p->line);
+        long long tv = mv_need_int(p->mp, t, p->file, p->line);
+        int warn = 0;
+        uint256_t r = op_sext(u256_from_i64(xv), u256_from_i64(tv), &warn);
+        if(warn && !p->mp->noeval){
+            char cb[96]; u256_to_pydec(u256_from_i64(tv), cb, sizeof(cb));
+            m_warn(p->mp, p->file, p->line,
+                    "sign-extension bit width %s exceeds maximum %d, result set to 0",
+                    cb, SEXT_MAX_BITS);
+        }
+        v = mv_int(u256_to_i64(r));
+    }
+    return v;
+}
+
+static MVal mep_land(MEP *p){
+    MVal v = mep_sext(p);
     while(mep_eat(p, "&&")){
         /* 左が偽なら右は評価しない（C と同じ短絡）。 */
         int skip = !p->mp->noeval && !mv_truth(v);
         if(skip) p->mp->noeval++;
-        MVal r = mep_bor(p);
+        MVal r = mep_sext(p);
         if(skip) p->mp->noeval--;
         v = mv_int((!skip && mv_truth(v) && mv_truth(r)) ? 1 : 0);
     }
@@ -11687,6 +11888,8 @@ static char *m_interpolate(MacroPP *mp, const char *text, const char *file, int 
             if(quote){
                 if(c == '\\'){ j += 2; continue; }
                 if(c == quote) quote = 0;
+            } else if(c == '\'' && m_sext_tick_at(text, j)) {
+                /* 符号拡張の `'` は文字定数の開始ではないので数えない。 */
             } else if(c == '"' || c == '\'') quote = c;
             else if(c == '{') depth++;
             else if(c == '}'){ if(--depth == 0) break; }
@@ -12220,8 +12423,10 @@ static void m_exec_node(MacroPP *mp, MNode *n){
     }
     case MN_ECHO: {
         MVal v = m_eval(mp, n->a, n->file, n->line);
-        if(!mp->asmb || mp->asmb->st.pas != 1)
-            fprintf(stderr, "%s\n", mv_to_text(mp, v));
+        if(!mp->asmb || mp->asmb->st.pas != 1){
+            char *t = mv_to_text(mp, v);
+            m_echo_write(&t, 1);
+        }
         return;
     }
     case MN_INCLUDE: {

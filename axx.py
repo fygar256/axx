@@ -88,6 +88,47 @@ def diag_warning(msg, force=False):
 # 使える記法（`!!!` 等のパターン専用トークン）が変わる。
 EXP_PAT = 0
 EXP_ASM = 1
+
+
+class ExprCaps:
+    """式評価器の「この場では何が書けるか」を表す能力記述子。
+
+    本体・マクロ層・ミニ言語の 3 つの層が同じ式評価器を呼ぶが、呼ぶ時点で
+    意味を成す項目は層ごとに違う。たとえばパターン変数 `a` は、パターン行を
+    符号化している最中にしか束縛されていないし、`!!!` は VLIW のパターン行
+    でしか意味がない。どの項目が生きているかを 1 か所にまとめ、評価器は
+    `state.expcaps` を見て判断する。呼ぶタイミングが変われば記述子が変わり、
+    使える機能が変わる。
+
+    - `patvars` … 小文字 1 文字のパターン変数 a〜z
+    - `vliw`    … `!!!` / `!!!!`
+    - `labels`  … ラベル名・`.equ` 名の参照
+    - `loc`     … `$$` / `$.`
+    - `syms`    … `#name` と `.setsym` の記号
+    """
+
+    __slots__ = ('name', 'patvars', 'vliw', 'labels', 'loc', 'syms')
+
+    def __init__(self, name, patvars=False, vliw=False,
+                 labels=True, loc=True, syms=True):
+        self.name = name
+        self.patvars = patvars
+        self.vliw = vliw
+        self.labels = labels
+        self.loc = loc
+        self.syms = syms
+
+    def __repr__(self):
+        return f"<ExprCaps {self.name}>"
+
+
+# パターンファイルの式。すべて使える。
+CAPS_PAT = ExprCaps('pattern', patvars=True, vliw=True)
+# アセンブリソース行の式。パターン変数と VLIW 計数は無い。
+CAPS_ASM = ExprCaps('assembly')
+# ミニ言語 (`.func` 本体) から呼ぶとき。ラベル・`$$`・`#記号` は読めるが、
+# パターン変数はその場で束縛されていないので落とす。
+CAPS_MINI = ExprCaps('mini language')
 exp_typ = 'i'          # 'i'=整数モード / 'f'=浮動小数点モード
 
 
@@ -131,6 +172,66 @@ _undef_ceiling_warned = False
 # 符号（0 か -1）にしかならないので、頭打ちにしても値は変わらず、
 # 巨大なシフト量を渡されたときの暴走だけを防げる。
 _BYTE_EXTRACT_SHIFT_MAX = 1 << 20
+_SEXT_MAX_BITS = 128
+
+
+# 本体の式評価器が持つ単項/後置演算子の実装。マクロ層からも同じ意味で呼べる
+# ように、評価器の外へ出して 1 か所にまとめてある。どれも診断は出さず、
+# 「値と、あれば伝えるべき文言」を返すだけにして、報告はそれぞれの層に任せる。
+
+def op_msb(v):
+    """`@v` … 最上位の立っているビットの位置を右から数えた値。"""
+    if isinstance(v, float):
+        if v != v or v in (float('inf'), float('-inf')):
+            return 0
+    try:
+        r = int(abs(v))
+    except (OverflowError, ValueError):
+        return 0
+    b = 0
+    while r:
+        r >>= 1
+        b += 1
+    return b
+
+
+def op_sext(x, bits):
+    """`x'bits` … ビット `bits-1` を符号ビットとみなした符号拡張。
+
+    返り値は (値, 警告文 or None, 続行してよいか)。非有限の浮動小数点値が
+    来たときだけ「続行してよいか」が False になり、呼び出し側は連鎖を打ち切る。
+    """
+    try:
+        x = int(x)
+        bits = int(bits)
+    except (ValueError, OverflowError):
+        return 0, None, False
+    if bits <= 0:
+        return 0, None, True
+    if bits > _SEXT_MAX_BITS:
+        return 0, (f"sign-extension bit width {bits} exceeds maximum "
+                   f"{_SEXT_MAX_BITS}, result set to 0"), True
+    return ((x & ~((~0) << bits)) | ((~0) << bits if (x >> (bits - 1)) & 1 else 0),
+            None, True)
+
+
+def op_byte(x, index):
+    """`*(x, index)` … 下位から数えて `index` バイト目より上を残した値。
+
+    返り値は (値, エラー文 or None)。上限を超える分は符号で埋まるだけなので
+    頭打ちにする（caxx.c の 256bit 算術シフトと同じ結果になる）。
+    """
+    try:
+        index = int(index)
+    except (OverflowError, ValueError):
+        return 0, "non-finite byte-extract offset in *(expr, expr)"
+    if index < 0:
+        return 0, "negative byte-extract offset in *(expr, expr)"
+    try:
+        x = int(x)
+    except (OverflowError, ValueError):
+        return 0, "non-finite value in *(expr, expr) byte extract"
+    return x >> min(index * 8, _BYTE_EXTRACT_SHIFT_MAX), None
 
 
 def _ieee_pow(a, b):
@@ -606,6 +707,7 @@ class AssemblerState:
         self.vliw = VLIWState()
 
         self.expmode = EXP_PAT   # いま評価中の式がパターン側かソース側か
+        self.expcaps = CAPS_PAT  # いま評価中の式で使える項目（ExprCaps）
 
         # 直近の式評価で未定義ラベルを踏んだか。重要な約束として、この旗は
         # 「失敗したときに立てる」だけで、成功しても勝手に降ろさない。
@@ -1954,19 +2056,8 @@ class ExpressionEvaluator:
         self.parser = parser
 
     def nbit(self, l):
-        b = 0
-        if isinstance(l, float) and not l == l:
-            return 0
-        if isinstance(l, float) and (l == float('inf') or l == float('-inf')):
-            return 0
-        try:
-            r = int(abs(l))
-        except (OverflowError, ValueError):
-            return 0
-        while r:
-            r >>= 1
-            b += 1
-        return b
+        # 実装は共有関数 op_msb() 側。マクロ層も同じものを呼ぶ。
+        return op_msb(l)
 
     def err(self, m):
         print(m, file=sys.stderr)
@@ -1976,10 +2067,10 @@ class ExpressionEvaluator:
         idx = StringUtils.skipspc(s, idx)
         x = 0
 
-        if idx + 4 <= len(s) and s[idx:idx + 4] == '!!!!' and self.state.expmode == EXP_PAT:
+        if idx + 4 <= len(s) and s[idx:idx + 4] == '!!!!' and self.state.expcaps.vliw:
             x = self.state.vliwstop
             idx += 4
-        elif idx + 3 <= len(s) and s[idx:idx + 3] == '!!!' and self.state.expmode == EXP_PAT:
+        elif idx + 3 <= len(s) and s[idx:idx + 3] == '!!!' and self.state.expcaps.vliw:
             x = self.state.vcnt
             idx += 3
         elif idx < len(s) and s[idx] == '-':
@@ -2014,29 +2105,9 @@ class ExpressionEvaluator:
                     x2, idx = self.expression(s, idx + 1)
                     if idx < len(s) and s[idx] == ')':
                         idx += 1
-                        try:
-                            shift_amount = int(x2) * 8
-                        except (OverflowError, ValueError):
-                            self.state.diag(" error - non-finite byte-extract offset in *(expr, expr).", set_error=True)
-                            x = 0
-                        else:
-                            if shift_amount < 0:
-                                self.state.diag(" error - negative byte-extract offset in *(expr, expr).", set_error=True)
-                                x = 0
-                            else:
-                                # 破綻点修正: 抽出元が float のとき `>>` が
-                                # TypeError で落ちていた（単項 `~` は int() で
-                                # 守られているのにここだけ素通しだった）。
-                                # 併せて桁数の上限を切る。上限を超えた分は
-                                # 符号だけが残るので、caxx.c の 256bit 算術シフト
-                                # （n>=256 で符号で埋める）と同じ結果になる。
-                                try:
-                                    x = int(x)
-                                except (OverflowError, ValueError):
-                                    self.state.diag(" error - non-finite value in *(expr, expr) byte extract.", set_error=True)
-                                    x = 0
-                                else:
-                                    x >>= min(shift_amount, _BYTE_EXTRACT_SHIFT_MAX)
+                        x, _err = op_byte(x, x2)
+                        if _err:
+                            self.state.diag(f" error - {_err}.", set_error=True)
                     else:
                         self.state.diag(" error - missing ')' in *(expr, expr) expression.", set_error=True)
                         x = 0
@@ -2461,7 +2532,7 @@ class ExpressionEvaluator:
                     x = 0.0
         elif _enum_hit is not None:
             x, idx = _enum_hit
-        elif (idx < len(s) and self.state.expmode == EXP_PAT and
+        elif (idx < len(s) and self.state.expcaps.patvars and
               s[idx] in LOWER and (idx + 1 >= len(s) or s[idx + 1] not in self.state.lwordchars)):
             ch = s[idx]
             if idx + 3 <= len(s) and s[idx + 1:idx + 3] == ':=':
@@ -2699,7 +2770,6 @@ class ExpressionEvaluator:
         return x, idx
 
     def term6(self, s, idx):
-        _SEXT_MAX_BITS = 128
         x, idx = self.term5(s, idx)
         while idx < len(s) and s[idx] == '\'':
             next_idx = idx + 1
@@ -2707,19 +2777,12 @@ class ExpressionEvaluator:
             if next_idx >= len(s) or (s[next_idx] not in DIGIT and s[next_idx] != '('):
                 break
             t, idx = self.term5(s, idx + 1)
-            try:
-                x = int(x)
-                t = int(t)
-            except (ValueError, OverflowError):
-                x = 0
+            # 実装は共有関数 op_sext() 側。マクロ層も同じものを呼ぶ。
+            x, _warn, _go = op_sext(x, t)
+            if _warn:
+                self.state.diag(f" warning - {_warn}.", set_error=False)
+            if not _go:
                 break
-            if t <= 0:
-                x = 0
-            elif t > _SEXT_MAX_BITS:
-                self.state.diag(f" warning - sign-extension bit width {t} exceeds maximum {_SEXT_MAX_BITS}, result set to 0.", set_error=False)
-                x = 0
-            else:
-                x = (x & ~((~0) << t)) | ((~0) << t if (x >> (t - 1) & 1) else 0)
         return x, idx
 
     def term7(self, s, idx):
@@ -2866,20 +2929,25 @@ class ExpressionEvaluator:
         return s
 
     def expression_pat(self, s, idx):
+        return self._expression_in(s, idx, EXP_PAT, CAPS_PAT)
+
+    def expression_caps(self, s, idx, caps):
+        """能力記述子を指定して評価する。マクロ層・ミニ言語からの委譲用。"""
+        return self._expression_in(s, idx, EXP_PAT, caps)
+
+    def _expression_in(self, s, idx, mode, caps):
         prev = self.state.expmode
-        self.state.expmode = EXP_PAT
+        prev_caps = self.state.expcaps
+        self.state.expmode = mode
+        self.state.expcaps = caps
         try:
             return self.expression(self._terminate(s), idx)
         finally:
             self.state.expmode = prev
+            self.state.expcaps = prev_caps
 
     def expression_asm(self, s, idx):
-        prev = self.state.expmode
-        self.state.expmode = EXP_ASM
-        try:
-            return self.expression(self._terminate(s), idx)
-        finally:
-            self.state.expmode = prev
+        return self._expression_in(s, idx, EXP_ASM, CAPS_ASM)
 
     def expression_esc(self, s, idx, stopchar):
         result = list(s[:idx])
@@ -2913,12 +2981,14 @@ class ExpressionEvaluator:
     def expression_esc_float(self, s, idx, stopchar):
         prev_typ  = self.state.exp_typ
         prev_mode = self.state.expmode
+        prev_caps = self.state.expcaps
         self.state.exp_typ = 'f'
         try:
             v, idx = self.expression_esc(s, idx, stopchar)
         finally:
             self.state.exp_typ  = prev_typ
             self.state.expmode  = prev_mode
+            self.state.expcaps  = prev_caps
         return (v, idx)
 
 
@@ -4469,6 +4539,26 @@ def _mini_lex(text, pos):
             toks.append(('dot', StringUtils.upper(t[i:j])))
             i = j
             continue
+        if c == '$':
+            # `$$` / `$.` は本体の式評価器が持つ項。ここでは字面を覚えるだけで、
+            # 実際の値は評価時に本体へ渡して求める。
+            if t[i:i + 2] in ('$$', '$.'):
+                toks.append(('core', t[i:i + 2]))
+                i += 2
+                continue
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: '$' must be written "
+                                f"'$$' (location counter) or '$.' "
+                                f"(start of the next instruction)")
+        if c == '#':
+            # `#name` も本体の式評価器が持つ項（`.setsym` の記号）。
+            j = i + 1
+            while j < n and (t[j].isalnum() or t[j] in '_.$'):
+                j += 1
+            if j == i + 1:
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: '#' needs a symbol name")
+            toks.append(('core', t[i:j]))
+            i = j
+            continue
         if c == '"':
             j = i + 1
             buf = []
@@ -4657,6 +4747,9 @@ class _MiniExprParser:
         k, v = self.peek()
         if k == 'str':
             self.fail("a string can only be used in '.echo'")
+        if k == 'core':
+            self.i += 1
+            return ('core', v)
         if k == 'num':
             self.i += 1
             return ('num', _mini_wrap(v))
@@ -4920,8 +5013,9 @@ class MiniInterp:
     MAX_EMIT = 1 << 20
     MAX_ARRAY = 1 << 20
 
-    def __init__(self, state):
+    def __init__(self, state, expr_eval=None):
         self.state = state
+        self.expr_eval = expr_eval   # 本体の式評価器。`$$`・`#記号`・ラベルの委譲先
         self.out = []
         self.steps = 0
         self.frames = []
@@ -4932,11 +5026,15 @@ class MiniInterp:
         return isinstance(v, list)
 
     @classmethod
-    def _echo_text(cls, v):
-        """`.echo` の 1 つぶんの表示。整数は符号つき 10 進、配列は `[1, 2, 3]`。"""
+    def _echo_value(cls, v):
+        """`.echo` の 1 項目を `_echo_write` に渡せる値にする。
+
+        ミニ言語の整数は 256bit を符号なしで持っているので、表示のために符号つき
+        へ直す。配列はそのまま渡せば `_as_str` が `[1, 2, 3]` の体裁にする。
+        """
         if cls._is_arr(v):
-            return '[' + ', '.join(str(_mini_signed(e)) for e in v) + ']'
-        return str(_mini_signed(v))
+            return [_mini_signed(e) for e in v]
+        return _mini_signed(v)
 
     def _need_int(self, v, pos, what):
         if self._is_arr(v):
@@ -4954,12 +5052,46 @@ class MiniInterp:
                 return fr
         return None
 
+    def _core_eval(self, text, pos):
+        """`$$` `$.` `#記号` ラベル名を本体の式評価器に評価してもらう。
+
+        ミニ言語は本体と同じ 256bit の値を扱うので、結果はそのまま使える。
+        能力記述子は CAPS_MINI を渡す。パターン変数 `a`〜`z` と `!!!` は、
+        `.func` の本体が走っている時点では束縛されていないか意味を持たない
+        ので、ここで落とす。未定義ラベル由来の値は 0 にする。`.call` の引数を
+        評価するときと同じ扱いで、番兵の巨大な値で反復回数が爆発するのを防ぐ。
+        """
+        if self.expr_eval is None:
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: {text!r} is not available here")
+        v, _ = self.expr_eval.expression_caps(text, 0, CAPS_MINI)
+        if _is_undef_derived(v):
+            return 0
+        return _mini_wrap(v)
+
+    def _core_name(self, name):
+        """その名前をアセンブラ本体が知っているか（ラベル / `.setsym` 記号）。"""
+        st = self.state
+        if st is None:
+            return False
+        if name in st.labels:
+            return True
+        if StringUtils.upper(name) in st.symbols:
+            return True
+        return name in st._relax_prev_values
+
     def _get(self, name, pos):
         fr = self._frame_for(name)
         if fr is None:
             raise MiniLangError(f"{pos[0]}:{pos[1]}: '.nonlocal {name}' found no "
                                 f"enclosing definition of {name!r}")
         if name not in fr['vars']:
+            # ローカルに無い名前は、アセンブラ本体のラベル / `.setsym` 記号として
+            # 読み直す。パス2では本体の表が揃っているので「そんな名前は無い」と
+            # 断定でき、綴り間違いは従来どおりミニ言語のエラーになる。パス1では
+            # まだ前方参照が埋まっていないので、判断を本体側に預ける。
+            if self.expr_eval is not None and self.state is not None \
+                    and (self._core_name(name) or self.state.pas != 2):
+                return self._core_eval(name, pos)
             raise MiniLangError(f"{pos[0]}:{pos[1]}: {name!r} is used before it is set")
         return fr['vars'][name]
 
@@ -4975,6 +5107,8 @@ class MiniInterp:
         k = e[0]
         if k == 'num':
             return e[1]
+        if k == 'core':
+            return self._core_eval(e[1], pos)
         if k == 'var':
             return self._get(e[1], pos)
         if k == 'arr':
@@ -5145,14 +5279,14 @@ class MiniInterp:
                 self.out.append(v)
             return
         if kind == 'echo':
-            parts = [x if k2 == 's' else self._echo_text(self.eval(x, pos))
+            parts = [x if k2 == 's' else self._echo_value(self.eval(x, pos))
                      for k2, x in st[1]]
             # 命令長を測るだけの試し打ちと、収束途中のパス1では黙る。
             # 同じ行が反復回数だけ重複して出るのを防ぐため。
             if (self.state is not None
                     and self.state.should_report_errors()
                     and not self.state._pass1_size_mode):
-                print(' '.join(parts), file=sys.stderr)
+                _echo_write(parts)
             return
         if kind == 'call':
             _, name, args, _ = st
@@ -5426,7 +5560,8 @@ class ObjectGenerator:
         if saved_reclimit < _MINI_RECLIMIT:
             sys.setrecursionlimit(_MINI_RECLIMIT)
         try:
-            words, ret = MiniInterp(self.state).run(fn, args, (fn.file, fn.line))
+            words, ret = MiniInterp(self.state, self.expr_eval).run(
+                fn, args, (fn.file, fn.line))
         except MiniLangError as e:
             self._mini_diag(f" error - {e}")
             return [], idx
@@ -6216,6 +6351,18 @@ class _MacroFunc:
         self.pos = pos
 
 
+def _sext_tick_at(s, i):
+    """`s[i]` の `'` が符号拡張の演算子か（右に幅が続くか）を見分ける。
+
+    文字定数 `'A'` と区別するため、本体の評価器と同じく「続く文字が数字か `(`」
+    を条件にする。`!{...}` の走査とマクロ式パーサの両方から使う。
+    """
+    j = i + 1
+    while j < len(s) and s[j] in ' \t':
+        j += 1
+    return j < len(s) and (s[j].isdigit() or s[j] == '(')
+
+
 def _fmt_pos(pos):
     return f"{pos[0]}:{pos[1]}"
 
@@ -6338,18 +6485,43 @@ class _ExprParser:
         return v
 
     def logic_and(self):
-        v = self.bit_or()
+        v = self.sext()
         while self.eat('&&'):
             if not _truth(v):
                 self.suppress += 1
                 try:
-                    self.bit_or()
+                    self.sext()
                 finally:
                     self.suppress -= 1
                 v = 0
             else:
-                r = self.bit_or()
+                r = self.sext()
                 v = 1 if _truth(r) else 0
+        return v
+
+    def sext(self):
+        """本体の `'`（任意ビット位置からの符号拡張）をマクロ式でも使えるようにする。
+
+        実装は本体と同じ共有関数 op_sext()。位置はビット演算子より緩く `&&` より
+        きつい段に置く。本体では `^` と比較のあいだだが、マクロ層の優先順位は C
+        に合わせてあり比較のほうがビット演算子よりきついので、同じ相対位置は
+        取れない。`'` の右は幅を書くところなので、`'` に続く文字が数字か `(`
+        のときだけ演算子として読む（`'A'` の文字定数と衝突させないため）。
+        """
+        v = self.bit_or()
+        while True:
+            self.skip()
+            if self.i >= len(self.s) or self.s[self.i] != "'":
+                break
+            if not _sext_tick_at(self.s, self.i):
+                break
+            self.i += 1
+            t = self.bit_or()
+            v, _warn, _go = op_sext(_as_int(self, v), _as_int(self, t))
+            if _warn and not self.suppress:
+                self.pp.warn(f"{_fmt_pos(self.pos)}: {_warn}")
+            if not _go:
+                break
         return v
 
     def bit_or(self):
@@ -6492,6 +6664,22 @@ class _ExprParser:
             return -_as_int(self, self.unary())
         if self.eat('+'):
             return self.unary()
+        # 本体の `@`（最上位ビット位置）。実装は共有関数 op_msb()。
+        if self.eat('@'):
+            return op_msb(_as_int(self, self.unary()))
+        # 本体の `*(値, 位置)`（バイト抽出）。値が来る位置の `*` だけが
+        # これで、中置の `*` は従来どおり掛け算（本体の評価器と同じ見分け方）。
+        if self.i < len(self.s) and self.s[self.i] == '*' \
+                and self.s[self.i + 1:self.i + 2] == '(':
+            self.i += 2
+            x = self.ternary()
+            self.expect(',')
+            n = self.ternary()
+            self.expect(')')
+            v, _err = op_byte(_as_int(self, x), _as_int(self, n))
+            if _err and not self.suppress:
+                self.err(_err)
+            return v
         return self.primary()
 
     def primary(self):
@@ -6634,6 +6822,15 @@ def _as_int(p, v):
 
 def _as_str(v):
     return v if isinstance(v, str) else str(v)
+
+
+def _echo_write(items):
+    """マクロ層の `!echo` とミニ言語の `.echo` に共通の出力ルーチン。
+
+    項目を `_as_str` で文字列にし、空白区切りで 1 行にまとめて標準エラーへ出す。
+    体裁を 1 か所に集めておくため、どちらの層もここを通す。
+    """
+    print(' '.join(_as_str(x) for x in items), file=sys.stderr)
 
 
 def _cmp_eq(a, b):
@@ -6848,6 +7045,11 @@ class MacroPreprocessor:
                         continue
                     if c == quote:
                         quote = ''
+                elif c == "'" and _sext_tick_at(text, j):
+                    # 符号拡張の `'`（右が数字か `(`）は文字定数の開始では
+                    # ないので、引用符として数えない。式パーサ側の見分け方と
+                    # 同じにしておかないと `!{v'8}` が閉じられなくなる。
+                    pass
                 elif c in '"\'':
                     quote = c
                 elif c == '{':
@@ -7216,7 +7418,7 @@ class MacroPreprocessor:
         if kind == 'echo':
             _, expr, pos = node
             if self.state is None or getattr(self.state, 'pas', 2) != 1:
-                print(_as_str(self.eval(expr, pos)), file=sys.stderr)
+                _echo_write([self.eval(expr, pos)])
             else:
                 self.eval(expr, pos)
             return
@@ -7730,6 +7932,7 @@ class Assembler:
             self.state.error_undefined_label = False
 
             self.state.expmode = EXP_ASM
+            self.state.expcaps = CAPS_ASM
 
             saved_vars = self.state.vars[:]
             saved_vars_undef = self.state.vars_undef[:]
@@ -7807,6 +8010,7 @@ class Assembler:
             self.state.error_undefined_label = best.get('error_undefined_label', False)
             self.state.diag_replay(best.get('diags', ()))
             self.state.expmode = EXP_ASM
+            self.state.expcaps = CAPS_ASM
 
             try:
                 self.state.pc_instr_start = self.state.pc
