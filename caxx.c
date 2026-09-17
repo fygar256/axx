@@ -3250,6 +3250,20 @@ static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_ou
 static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_out);
 
+/* 破綻点修正(性能): 符号化欄は `@@[n,...]` の展開で要素数に比例して長くなる
+ * 一方、要素ごとの評価は「文字列全体」に対して expr_terminate() の複製と
+ * 各優先順位関数の strlen() を掛け直していたため、出力バイト数に対して
+ * 二乗の時間が掛かっていた（axx.py は len() が O(1) なので線形）。
+ * 評価の間だけ「この文字列の長さは既知で、二重 NUL 終端済み」と覚えておき、
+ * 複製と再計測を省く。覚えている間その領域は解放されないので、別の割り当てが
+ * 同じ番地を取ることはなく、値が古くなることはない。 */
+static const char *g_expr_slen_ptr = NULL;
+static int         g_expr_slen_len = 0;
+static inline int expr_slen(const char *s){
+    if(s == g_expr_slen_ptr) return g_expr_slen_len;
+    return (int)strlen(s);
+}
+
 static char *expr_terminate(const char *s){
     size_t l = strlen(s);
     char *r = malloc(l + 2);
@@ -3263,6 +3277,7 @@ static char *expr_terminate(const char *s){
 static uint256_t expr_expression_pat(Assembler *asmb, const char *s, int idx, int *idx_out){
     asmb->st.expmode=EXP_PAT;
     asmb->st.expcaps=&CAPS_PAT;
+    if(s == g_expr_slen_ptr) return expr_expression(asmb,s,idx,idx_out);
     char *ts=expr_terminate(s);
     uint256_t r=expr_expression(asmb,ts,idx,idx_out);
     free(ts);
@@ -3347,7 +3362,7 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
     AsmState *st=&asmb->st;
     idx=axx_skipspc(s,idx);
     uint256_t x=u256_zero();
-    int slen=(int)strlen(s);
+    int slen=expr_slen(s);
 
     if(idx+4<=slen && strncmp(s+idx,"!!!!",4)==0 && st->expcaps->vliw){
         x=u256_from_i64(st->vliwstop); idx+=4;
@@ -3446,7 +3461,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
     AsmState *st=&asmb->st;
     uint256_t x=u256_zero();
     idx=axx_skipspc(s,idx);
-    int slen=(int)strlen(s);
+    int slen=expr_slen(s);
     int _hexlit_val=0, _hexlit_end=idx;
     int _hexlit_ok = parse_hex_char_literal(s, idx, slen, &_hexlit_val, &_hexlit_end);
     /* .enum の式を評価している間だけ使う、列挙要素名の束縛。 */
@@ -3496,7 +3511,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             if(_adj >= 0) x = u256_from_u64((uint64_t)_adj);
         }
         if(asmb->st.exp_typ_float)
-            x=double_to_u256((double)(int64_t)u256_to_u64(x));
+            x=double_to_u256(u256_int_to_double(x));
     }
     else if(axx_q(s,slen,"$.",idx)){
         idx+=2;
@@ -3506,7 +3521,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             if(_adj >= 0) x = u256_from_u64((uint64_t)_adj);
         }
         if(asmb->st.exp_typ_float)
-            x=double_to_u256((double)(int64_t)u256_to_u64(x));
+            x=double_to_u256(u256_int_to_double(x));
     }
     else if(axx_q(s,slen,"#",idx)){
         idx++;
@@ -3523,7 +3538,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         }
         if(t!=tbuf) free(t);
         if(asmb->st.exp_typ_float)
-            x=double_to_u256((double)(int64_t)u256_to_u64(x));
+            x=double_to_u256(u256_int_to_double(x));
     }
     else if(axx_q(s,slen,"0b",idx)){
         idx+=2;
@@ -3532,7 +3547,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             idx++;
         }
         if(asmb->st.exp_typ_float)
-            x=double_to_u256((double)(int64_t)u256_to_i64(x));
+            x=double_to_u256(u256_int_to_double(x));
     }
     else if(axx_q(s,slen,"0x",idx)){
         idx+=2;
@@ -3543,7 +3558,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             idx++;
         }
         if(asmb->st.exp_typ_float)
-            x=double_to_u256((double)(int64_t)u256_to_i64(x));
+            x=double_to_u256(u256_int_to_double(x));
     }
     else if(idx+3<=slen && strncmp(s+idx,"qad",3)==0 &&
             axx_next_nonspace_is_brace(s, slen, idx+3)){
@@ -3888,7 +3903,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             idx=new_idx;
             x=label_get_value(st,w);
             if(asmb->st.exp_typ_float && !st->error_undefined_label)
-                x=double_to_u256((double)(int64_t)u256_to_u64(x));
+                x=double_to_u256(u256_int_to_double(x));
         }
         if(w!=wbuf) free(w);
     }
@@ -3900,7 +3915,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
 
 static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_factor(asmb,s,idx,&idx);
-    int slen=(int)strlen(s);
+    int slen=expr_slen(s);
     while(idx<slen && axx_q(s,slen,"**",idx)){
         uint256_t t=expr_factor(asmb,s,idx+2,&idx);
         if(asmb->st.exp_typ_float){
@@ -3921,7 +3936,8 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
             }
             if(u256_nonneg_gt_i64(t, EXP_MAX)){
                 if(should_report_errors(&asmb->st)){
-                    axx_diagf(1, 0, " error - Exponent exceeds maximum %lld in ** expression; result set to 0.\n",(long long)EXP_MAX);
+                    char _ec[96]; u256_to_pydec(t, _ec, sizeof(_ec));
+                    axx_diagf(1, 0, " error - Exponent %s exceeds maximum %lld in ** expression; result set to 0.\n", _ec, (long long)EXP_MAX);
                 }
                 x = u256_zero();
                 break;
@@ -3944,7 +3960,7 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
 
 static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term0_0(asmb,s,idx,&idx);
-    int slen=(int)strlen(s);
+    int slen=expr_slen(s);
     while(idx<slen){
         int flt=asmb->st.exp_typ_float;
         if(s[idx]=='*'&&s[idx+1]!='*'){
@@ -4022,7 +4038,7 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
 
 static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term0(asmb,s,idx,&idx);
-    int slen=(int)strlen(s);
+    int slen=expr_slen(s);
     while(idx<slen){
         int flt=asmb->st.exp_typ_float;
         if(s[idx]=='+'){
@@ -4040,36 +4056,50 @@ static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_ou
 
 static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term1(asmb,s,idx,&idx);
-    int slen=(int)strlen(s);
+    int slen=expr_slen(s);
     const int64_t SHIFT_MAX = 65536;
     while(idx<slen){
         if(axx_q(s,slen,"<<",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
             uint256_t sop=expr_safe_bitwise_operand(asmb,t,"<<");
             if(u256_is_neg256(sop)){
+                /* 破綻点修正: シフト量を %lld へ切り詰めて表示していたため、
+                 * 64bit に収まらない値が別の数（や 0）として報告されていた。
+                 * axx.py と同じく元の値をそのまま出す。 */
+                char _sc[96]; u256_to_pydec(sop, _sc, sizeof(_sc));
                 if(should_report_errors(&asmb->st)){
-                    axx_diagf(1, 0, " error - negative shift count (%lld) in << expression.\n",(long long)u256_to_i64(sop));
+                    axx_diagf(1, 0, " error - negative shift count (%s) in << expression.\n", _sc);
                 }
-                x=u256_zero();
+                /* 破綻点修正: エラー後もループを続けていたため、axx.py（ここで
+                 * 打ち切る）には出ない後続の診断まで余計に出ていた。 */
+                x=u256_zero(); break;
             } else if(u256_nonneg_gt_i64(sop,SHIFT_MAX)){
+                char _sc[96]; u256_to_pydec(sop, _sc, sizeof(_sc));
                 if(should_report_errors(&asmb->st)){
-                    axx_diagf(1, 0, " error - shift count exceeds maximum %lld in << expression.\n",(long long)SHIFT_MAX);
+                    axx_diagf(1, 0, " error - shift count %s exceeds maximum %lld in << expression.\n", _sc, (long long)SHIFT_MAX);
                 }
-                x=u256_zero();
+                x=u256_zero(); break;
             } else x=expr_bitwise_result(asmb,u256_shl(expr_safe_bitwise_operand(asmb,x,"<<"),(int)u256_to_i64(sop)));
         } else if(axx_q(s,slen,">>",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
             uint256_t sop=expr_safe_bitwise_operand(asmb,t,">>");
             if(u256_is_neg256(sop)){
+                /* 破綻点修正: シフト量を %lld へ切り詰めて表示していたため、
+                 * 64bit に収まらない値が別の数（や 0）として報告されていた。
+                 * axx.py と同じく元の値をそのまま出す。 */
+                char _sc[96]; u256_to_pydec(sop, _sc, sizeof(_sc));
                 if(should_report_errors(&asmb->st)){
-                    axx_diagf(1, 0, " error - negative shift count (%lld) in >> expression.\n",(long long)u256_to_i64(sop));
+                    axx_diagf(1, 0, " error - negative shift count (%s) in >> expression.\n", _sc);
                 }
-                x=u256_zero();
+                /* 破綻点修正: エラー後もループを続けていたため、axx.py（ここで
+                 * 打ち切る）には出ない後続の診断まで余計に出ていた。 */
+                x=u256_zero(); break;
             } else if(u256_nonneg_gt_i64(sop,SHIFT_MAX)){
+                char _sc[96]; u256_to_pydec(sop, _sc, sizeof(_sc));
                 if(should_report_errors(&asmb->st)){
-                    axx_diagf(1, 0, " error - shift count exceeds maximum %lld in >> expression.\n",(long long)SHIFT_MAX);
+                    axx_diagf(1, 0, " error - shift count %s exceeds maximum %lld in >> expression.\n", _sc, (long long)SHIFT_MAX);
                 }
-                x=u256_zero();
+                x=u256_zero(); break;
             } else x=expr_bitwise_result(asmb,u256_sar(expr_safe_bitwise_operand(asmb,x,">>"),(int)u256_to_i64(sop)));
         } else break;
     }
@@ -4120,7 +4150,7 @@ static uint256_t expr_bitwise_result(Assembler *asmb, uint256_t v){
 
 static uint256_t expr_term3(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term2(asmb,s,idx,&idx);
-    int slen=(int)strlen(s);
+    int slen=expr_slen(s);
     while(idx<slen && s[idx]=='&' && s[idx+1]!='&'){
         uint256_t t=expr_term2(asmb,s,idx+1,&idx);
         x=expr_bitwise_result(asmb,u256_and(expr_safe_bitwise_operand(asmb,x,"&"),expr_safe_bitwise_operand(asmb,t,"&")));
@@ -4130,7 +4160,7 @@ static uint256_t expr_term3(Assembler *asmb, const char *s, int idx, int *idx_ou
 
 static uint256_t expr_term4(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term3(asmb,s,idx,&idx);
-    int slen=(int)strlen(s);
+    int slen=expr_slen(s);
     while(idx<slen && s[idx]=='|' && s[idx+1]!='|'){
         uint256_t t=expr_term3(asmb,s,idx+1,&idx);
         x=expr_bitwise_result(asmb,u256_or(expr_safe_bitwise_operand(asmb,x,"|"),expr_safe_bitwise_operand(asmb,t,"|")));
@@ -4140,7 +4170,7 @@ static uint256_t expr_term4(Assembler *asmb, const char *s, int idx, int *idx_ou
 
 static uint256_t expr_term5(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term4(asmb,s,idx,&idx);
-    int slen=(int)strlen(s);
+    int slen=expr_slen(s);
     while(idx<slen && s[idx]=='^'){
         uint256_t t=expr_term4(asmb,s,idx+1,&idx);
         x=expr_bitwise_result(asmb,u256_xor(expr_safe_bitwise_operand(asmb,x,"^"),expr_safe_bitwise_operand(asmb,t,"^")));
@@ -4150,7 +4180,7 @@ static uint256_t expr_term5(Assembler *asmb, const char *s, int idx, int *idx_ou
 
 static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term5(asmb,s,idx,&idx);
-    int slen=(int)strlen(s);
+    int slen=expr_slen(s);
     while(idx<slen && s[idx]=='\''){
         int ni=idx+1; ni=axx_skipspc(s,ni);
         if(ni>=slen||((s[ni]<'0'||s[ni]>'9')&&s[ni]!='(')) break;
@@ -4169,7 +4199,7 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
 
 static uint256_t expr_term7(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term6(asmb,s,idx,&idx);
-    int slen=(int)strlen(s);
+    int slen=expr_slen(s);
     while(idx<slen){
         int flt=asmb->st.exp_typ_float;
         if(axx_q(s,slen,"<=",idx)){
@@ -4213,7 +4243,7 @@ static int skip_subexpr(const char *s, int idx);
  * 読み飛ばすと生成コードが変わってしまう。両辺を評価する形に揃える。 */
 static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term8(asmb,s,idx,&idx);
-    int slen=(int)strlen(s);
+    int slen=expr_slen(s);
     while(idx<slen && axx_q(s,slen,"&&",idx)){
         uint256_t t=expr_term8(asmb,s,idx+2,&idx);
         x=u256_from_i64((!u256_is_zero(x) && !u256_is_zero(t))?1:0);
@@ -4223,7 +4253,7 @@ static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_ou
 
 static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term9(asmb,s,idx,&idx);
-    int slen=(int)strlen(s);
+    int slen=expr_slen(s);
     while(idx<slen && axx_q(s,slen,"||",idx)){
         uint256_t t=expr_term9(asmb,s,idx+2,&idx);
         x=u256_from_i64((!u256_is_zero(x) || !u256_is_zero(t))?1:0);
@@ -4233,7 +4263,7 @@ static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_o
 
 
 static int skip_subexpr(const char *s, int idx) {
-    int slen = (int)strlen(s);
+    int slen = expr_slen(s);
     int paren_depth = 0;
     int brack_depth = 0;
     int ob_depth    = 0;
@@ -4268,7 +4298,7 @@ static int skip_ternary_expr_d(const char *s, int idx, int depth) {
      * expr_factor の EXPR_MAX_DEPTH ガードも経由しないため、巨大な連鎖
      * `?:` でCスタックオーバーフローしうる。expr_factor と同じ上限で止める。 */
     if(depth > EXPR_MAX_DEPTH) return idx;
-    int slen = (int)strlen(s);
+    int slen = expr_slen(s);
     idx = skip_subexpr(s, idx);
     if(idx < slen && s[idx] == '?' && s[idx+1] != '='){
         idx++;
@@ -4290,7 +4320,7 @@ static int skip_ternary_expr(const char *s, int idx) {
 static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_out){
     AsmState *st = &asmb->st;
     uint256_t x = expr_term10(asmb, s, idx, &idx);
-    int slen = (int)strlen(s);
+    int slen = expr_slen(s);
     if(idx < slen && axx_q(s, slen, "?", idx)){
         /* 破綻点修正: 連鎖した `?:` の再帰は expr_factor を経由しないため
          * EXPR_MAX_DEPTH の深さガードが効かず、巨大な連鎖式でCスタック
@@ -7097,7 +7127,7 @@ static MiniVal mini_arg_array(Assembler *asmb, char *t, int a, int *out_i, int *
 
 static int mini_call_binary(Assembler *asmb, const char *s, int idx, IntVec *objl){
     AsmState *st = &asmb->st;
-    int slen = (int)strlen(s);
+    int slen = expr_slen(s);
     /* 命令長を測るだけの試し打ちでも makeobj は走るので、そのときは黙る。 */
     int quiet = st->pass1_size_mode;
 
@@ -7854,6 +7884,15 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     free(ep_buf);
 
     int slen = (int)strlen(s);
+    /* 破綻点修正(性能): 要素ごとの評価に「長さは既知・二重NUL終端済み」を
+     * 教えて、文字列全体の複製と strlen() の掛け直しを省く。s はこのループが
+     * 終わるまで解放されないので、番地が使い回されて古くなることはない。 */
+    if((size_t)slen + 1 < s_cap) s[slen+1] = '\0';
+    else { char *s2 = realloc(s, (size_t)slen + 2); if(s2){ s = s2; s_cap = (size_t)slen + 2; s[slen+1] = '\0'; } }
+    const char *_prev_slen_ptr = g_expr_slen_ptr;
+    int         _prev_slen_len = g_expr_slen_len;
+    g_expr_slen_ptr = s;
+    g_expr_slen_len = slen;
 
     st->in_binary_list = 1;
     int _prior_undef = st->error_undefined_label;
@@ -7913,6 +7952,8 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     }
     st->elf_current_word_idx = -1;
     st->in_binary_list = 0;
+    g_expr_slen_ptr = _prev_slen_ptr;
+    g_expr_slen_len = _prev_slen_len;
     if(_prior_undef) st->error_undefined_label = 1;
     free(s);
 }
@@ -11321,12 +11362,26 @@ static MVal mep_shift(MEP *p){
         if(p->s[p->i] == '<' && p->s[p->i+1] == '<'){
             p->i += 2;
             long long n = mv_need_int(p->mp, mep_add(p), p->file, p->line);
-            if((n < 0 || n > 63) && !p->mp->noeval){
+            /* 破綻点修正: 上限を 63 にしていたため、axx.py が受け付ける
+             * 0〜4096 のシフト量のうち 64 以上が、値の大小に関わらず
+             * 「shift count out of range」で落ちていた。上限を axx.py に
+             * 合わせ、64bit から溢れるかどうかは下の桁溢れ検査で見る。 */
+            if((n < 0 || n > 4096) && !p->mp->noeval){
                 char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
                 m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range in %s", sr);
             }
-            if(n < 0 || n > 63) n = 0;   /* 取らない側を読み飛ばしている最中 */
+            if(n < 0 || n > 4096) n = 0;   /* 取らない側を読み飛ばしている最中 */
             long long base = mv_need_int(p->mp, v, p->file, p->line);
+            if(n > 63){
+                /* 64bit では表せない。0 を何ビット左にずらしても 0 なので、
+                 * その場合だけは axx.py と同じ値を返せる。 */
+                if(base != 0 && !p->mp->noeval){
+                    char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+                    m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
+                }
+                v = mv_int(0);
+                continue;
+            }
             long long shifted = m_i64_shl(base, (int)n);
             /* 破綻点修正: 64bit を超えて追い出されたビットを黙って捨てていたため、
              * axx.py(任意精度)と異なる値を無言で返していた。追い出されたビットが
@@ -11339,12 +11394,16 @@ static MVal mep_shift(MEP *p){
         } else if(p->s[p->i] == '>' && p->s[p->i+1] == '>'){
             p->i += 2;
             long long n = mv_need_int(p->mp, mep_add(p), p->file, p->line);
-            if((n < 0 || n > 63) && !p->mp->noeval){
+            /* 破綻点修正: 同上。右シフトは 64 以上でも結果が 64bit に収まる
+             * （符号に応じて 0 か -1 に落ち着く）ので、そこまで含めて
+             * axx.py と同じ値を返す。 */
+            if((n < 0 || n > 4096) && !p->mp->noeval){
                 char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
                 m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range in %s", sr);
             }
-            if(n < 0 || n > 63) n = 0;   /* 取らない側を読み飛ばしている最中 */
-            v = mv_int(mv_need_int(p->mp, v, p->file, p->line) >> n);
+            if(n < 0 || n > 4096) n = 0;   /* 取らない側を読み飛ばしている最中 */
+            long long rbase = mv_need_int(p->mp, v, p->file, p->line);
+            v = mv_int(n > 63 ? (rbase < 0 ? -1 : 0) : (rbase >> n));
         } else return v;
     }
 }
