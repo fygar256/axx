@@ -318,8 +318,9 @@ v = .call hypot2(a,b)
 - **Calling a function that returns nothing with `var = .call ...` is an error.**
   That covers both a valueless `.return` and a body that ends without reaching
   one.
-- **`.call` cannot appear inside an expression.** `x = 1 + .call f(y)` is not
-  allowed; take the value into a variable first.
+- **`.call` may appear inside an expression.** `x = 1 + .call f(y)` and
+  `.emit(.call f(1) + .call g(2))` are fine — anywhere a value is expected.
+  A function called this way must return a value; it is an error if it does not.
 - **`.return` never closes the body.** Only `.endfunc` does that; `.return` and
   `.return expr` may appear anywhere in the body — top level or nested inside
   `.if`/`.while`/`.for` — any number of times, as an early-exit statement.

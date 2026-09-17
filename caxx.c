@@ -589,6 +589,7 @@ typedef struct {
 
 typedef enum {
     MX_NUM, MX_VAR, MX_ARRLIT, MX_INDEX, MX_SLICE, MX_LEN, MX_BIN, MX_UN,
+    MX_CALL, /* 式の途中の `.call 名前(引数, ...)`。name と items を使う */
     MX_STR,  /* `.echo` の文字列リテラル専用。式としては評価されない */
     MX_CORE  /* `$$` `$.` `#記号` … 本体の式評価器に委譲する項 */
 } MXKind;
@@ -5889,14 +5890,38 @@ static MExpr *mxp_primary(MXP *p){
     if(tk->k == MT_NUM){ p->i++; MExpr *e = mx_new(MX_NUM); e->num = tk->num; return e; }
     if(tk->k == MT_NAME){ p->i++; MExpr *e = mx_new(MX_VAR); e->name = mini_strdup(tk->s); return e; }
     if(tk->k == MT_DOT){
-        if(strcmp(tk->s, ".LEN") != 0)
-            mini_fail(p->c, "'%s' cannot be used in an expression", tk->s);
-        p->i++;
-        mxp_expect(p, "(");
-        MExpr *e = mx_new(MX_LEN);
-        e->a = mxp_or(p);
-        mxp_expect(p, ")");
-        return e;
+        if(strcmp(tk->s, ".LEN") == 0){
+            p->i++;
+            mxp_expect(p, "(");
+            MExpr *e = mx_new(MX_LEN);
+            e->a = mxp_or(p);
+            mxp_expect(p, ")");
+            return e;
+        }
+        if(strcmp(tk->s, ".CALL") == 0){
+            /* 式の途中の `.call 名前(引数, ...)`。呼んだ関数の返り値になる。 */
+            p->i++;
+            if(p->i >= p->n || p->t[p->i].k != MT_NAME)
+                mini_fail(p->c, "'.call' needs a function name");
+            MExpr *e = mx_new(MX_CALL);
+            e->name = mini_strdup(p->t[p->i].s);
+            p->i++;
+            mxp_expect(p, "(");
+            int cap = 0;
+            if(!mxp_is_op(p, ")")){
+                do {
+                    if(e->nitems >= cap){
+                        cap = cap ? cap * 2 : 8;
+                        e->items = realloc(e->items, (size_t)cap * sizeof(MExpr*));
+                        if(!e->items){ perror("realloc"); exit(1); }
+                    }
+                    e->items[e->nitems++] = mxp_or(p);
+                } while(mxp_eat(p, ","));
+            }
+            mxp_expect(p, ")");
+            return e;
+        }
+        mini_fail(p->c, "'%s' cannot be used in an expression", tk->s);
     }
     if(mxp_is_op(p, "(")){
         p->i++;
@@ -6445,6 +6470,8 @@ typedef struct {
 
 static MiniVal mini_eval(MiniRun *r, MExpr *e);
 static void mini_exec_block(MiniRun *r, MStmt **body, int n);
+static MiniFunc *mini_lookup(MiniRun *r, const char *name);
+static void mini_call_func(MiniRun *r, MiniFunc *f, MiniVal *args, int nargs);
 
 static void mini_at(MiniRun *r, MStmt *s){ r->c.file = s->file; r->c.line = s->line; }
 
@@ -6643,6 +6670,25 @@ static MiniVal mini_eval(MiniRun *r, MExpr *e){
         for(int i = 0; i < e->nitems; i++)
             v.arr[v.n++] = mini_need_num(r, mini_eval(r, e->items[i]), "an array element");
         return v;
+    }
+    case MX_CALL: {
+        MiniFunc *f = mini_lookup(r, e->name);
+        MiniVal *vals = e->nitems ? mini_alloc((size_t)e->nitems * sizeof(MiniVal)) : NULL;
+        for(int i = 0; i < e->nitems; i++) vals[i] = mini_eval(r, e->items[i]);
+        /* 呼んだ先で進む診断位置を、戻ったあとに元の行へ戻す。 */
+        const char *sfile = r->c.file;
+        int sline = r->c.line;
+        mini_call_func(r, f, vals, e->nitems);
+        for(int i = 0; i < e->nitems; i++) mini_val_free(&vals[i]);
+        free(vals);
+        r->c.file = sfile; r->c.line = sline;
+        if(!r->has_ret)
+            mini_fail(&r->c, "'%s' returned no value; give it a "
+                      "'.return <expression>'", e->name);
+        MiniVal ret = r->retval;          /* 所有権をここで引き取る */
+        memset(&r->retval, 0, sizeof(r->retval));
+        r->has_ret = 0;
+        return ret;
     }
     case MX_LEN: {
         MiniVal b = mini_eval(r, e->a);

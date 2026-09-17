@@ -4668,7 +4668,8 @@ class _MiniExprParser:
 
     優先順位は低いほうから `|| && ! 比較 | ^ & シフト +- */% 単項 ** 添字`。
     返す木は ('num',値) ('var',名) ('arr',[式]) ('index',式,式)
-    ('slice',式,式|None,式|None) ('len',式) ('bin',演算子,左,右) ('un',演算子,式)。
+    ('slice',式,式|None,式|None) ('len',式) ('callexpr',名,[式])
+    ('bin',演算子,左,右) ('un',演算子,式)。
     """
 
     def __init__(self, toks, pos):
@@ -4824,13 +4825,28 @@ class _MiniExprParser:
             self.i += 1
             return ('var', v)
         if k == 'dot':
-            if v != '.LEN':
-                self.fail(f"{v.lower()!r} cannot be used in an expression")
-            self.i += 1
-            self.expect_op('(')
-            e = self.or_()
-            self.expect_op(')')
-            return ('len', e)
+            if v == '.LEN':
+                self.i += 1
+                self.expect_op('(')
+                e = self.or_()
+                self.expect_op(')')
+                return ('len', e)
+            if v == '.CALL':
+                # 式の途中の `.call 名前(引数, ...)`。呼んだ関数の返り値になる。
+                self.i += 1
+                k2, v2 = self.peek()
+                if k2 != 'name':
+                    self.fail("'.call' needs a function name")
+                self.i += 1
+                self.expect_op('(')
+                args = []
+                if not self.at_op(')'):
+                    args.append(self.or_())
+                    while self.eat_op(','):
+                        args.append(self.or_())
+                self.expect_op(')')
+                return ('callexpr', v2, args)
+            self.fail(f"{v.lower()!r} cannot be used in an expression")
         if k == 'op' and v == '(':
             self.i += 1
             e = self.or_()
@@ -5200,6 +5216,14 @@ class MiniInterp:
         if k == 'arr':
             return [self._need_int(self.eval(x, pos), pos, 'an array element')
                     for x in e[1]]
+        if k == 'callexpr':
+            fn = self._lookup(e[1], pos)
+            vals = [self.eval(a, pos) for a in e[2]]
+            ret = self.call(fn, vals, pos)
+            if ret is None:
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: {e[1]!r} returned no value; "
+                                    f"give it a '.return <expression>'")
+            return ret
         if k == 'len':
             v = self.eval(e[1], pos)
             if not self._is_arr(v):
