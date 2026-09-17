@@ -64,6 +64,8 @@ One statement per line.
 | `.if expr .then` / `.elif expr .then` / `.else` / `.endif` | Conditional; `.elif` may repeat, `.else` is optional |
 | `.while(expr)` / `.endwhile` | Repeat while the value is non-zero |
 | `.for name in range(...)` / `.next` | `range(stop)`, `range(start, stop)`, `range(start, stop, step)` |
+| `.break` | Leave the innermost `.while` / `.for` loop |
+| `.continue` | Skip to the next iteration of the innermost `.while` / `.for` loop |
 | `.nonlocal a, b` | Treat these names as belonging to an enclosing call |
 | `.return` | Return from the function. May appear anywhere in the body (top level or inside `.if`/`.while`/`.for`), any number of times |
 | `.return expr` | Return a value from the function |
@@ -74,6 +76,21 @@ branches may follow an `.if`, and an `.else` may close the chain; a single
 `.endif` ends the whole chain. The condition of `.while` needs no
 parentheses of its own (`(expr)` simply reads as a parenthesized expression). The
 `step` of `range()` must not be 0.
+`.break` and `.continue` may only appear inside a `.while` or `.for` body;
+outside a loop they are an error at parse time. Each affects only the innermost
+loop.
+
+```
+.for i in range(10)
+.if i == 3 .then
+.continue          /* skip 3 and go on */
+.endif
+.if i == 7 .then
+.break             /* stop at 7 */
+.endif
+.emit(i)
+.next
+```
 
 ```
 .if n > 100 .then

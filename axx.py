@@ -4503,6 +4503,18 @@ class MiniLangError(Exception):
     """ミニ言語の構文・実行時エラー。読み込み時と組み立て時の両方で使う。"""
 
 
+class _MiniBreak(Exception):
+    """`.break` 文。いちばん内側の `.while` / `.for` を抜ける。"""
+
+    __slots__ = ()
+
+
+class _MiniContinue(Exception):
+    """`.continue` 文。いちばん内側の `.while` / `.for` の次の反復へ進む。"""
+
+    __slots__ = ()
+
+
 class _MiniReturn(Exception):
     """`.return` 文。関数1段ぶんだけ脱出する。
 
@@ -4857,6 +4869,7 @@ class MiniParser:
     def __init__(self, func):
         self.func = func
         self.lines = func.lines
+        self.loopdepth = 0   # `.break` / `.continue` が書ける深さ
 
     def parse_body(self):
         body, i = self._block(0, ())
@@ -4883,7 +4896,9 @@ class MiniParser:
             if kw == '.WHILE':
                 toks = _mini_lex(text, pos)
                 cond = _MiniExprParser(toks[1:], pos).parse()
+                self.loopdepth += 1
                 body, i = self._block(i + 1, ('.ENDWHILE',))
+                self.loopdepth -= 1
                 if i >= len(self.lines):
                     raise MiniLangError(f"{f}:{ln}: '.while' is never closed with '.endwhile'")
                 out.append(('while', cond, body, pos))
@@ -4891,7 +4906,9 @@ class MiniParser:
                 continue
             if kw == '.FOR':
                 var, args = self._for_header(text, pos)
+                self.loopdepth += 1
                 body, i = self._block(i + 1, ('.NEXT',))
+                self.loopdepth -= 1
                 if i >= len(self.lines):
                     raise MiniLangError(f"{f}:{ln}: '.for' is never closed with '.next'")
                 out.append(('for', var, args, body, pos))
@@ -5004,6 +5021,14 @@ class MiniParser:
                 if not p.at_end():
                     raise MiniLangError(f"{f}:{ln}: unexpected text after '.echo(...)'")
                 return ('echo', items, pos)
+            if v in ('.BREAK', '.CONTINUE'):
+                low = v.lower()
+                if len(toks) != 1:
+                    raise MiniLangError(f"{f}:{ln}: unexpected text after '{low}'")
+                if self.loopdepth <= 0:
+                    raise MiniLangError(f"{f}:{ln}: '{low}' must be inside a "
+                                        f"'.while' or '.for' loop")
+                return (low[1:], pos)
             if v == '.CALL':
                 name, args = self._call_tail(toks, pos)
                 return ('call', name, args, pos)
@@ -5376,6 +5401,10 @@ class MiniInterp:
             vals = [self.eval(a, pos) for a in args]
             self.call(fn, vals, pos)
             return
+        if kind == 'break':
+            raise _MiniBreak()
+        if kind == 'continue':
+            raise _MiniContinue()
         if kind == 'return':
             raise _MiniReturn(None if st[1] is None else self.eval(st[1], pos))
         if kind == 'nonlocal':
@@ -5398,7 +5427,12 @@ class MiniInterp:
             while _mini_signed(
                     self._need_int(self.eval(cond, pos), pos, 'a condition')) != 0:
                 self._tick(pos)
-                self.exec_block(body)
+                try:
+                    self.exec_block(body)
+                except _MiniContinue:
+                    pass
+                except _MiniBreak:
+                    break
             return
         if kind == 'for':
             _, var, args, body, _ = st
@@ -5416,7 +5450,12 @@ class MiniInterp:
             while (i < stop) if step > 0 else (i > stop):
                 self._tick(pos)
                 self._set(var, _mini_wrap(i), pos)
-                self.exec_block(body)
+                try:
+                    self.exec_block(body)
+                except _MiniContinue:
+                    pass
+                except _MiniBreak:
+                    break
                 i += step
             return
         raise MiniLangError(f"{pos[0]}:{pos[1]}: bad statement")

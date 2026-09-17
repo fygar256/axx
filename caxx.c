@@ -605,7 +605,7 @@ typedef struct MExpr {
 
 typedef enum {
     MS_ASSIGN, MS_EMIT, MS_ECHO, MS_CALL, MS_CALLASSIGN, MS_RETURN, MS_IF,
-    MS_WHILE, MS_FOR, MS_NONLOCAL, MS_RAISE
+    MS_WHILE, MS_FOR, MS_NONLOCAL, MS_RAISE, MS_BREAK, MS_CONTINUE
 } MSKind;
 
 typedef struct MStmt {
@@ -6109,6 +6109,7 @@ typedef struct {
      * （40段ほどで落ちていた）。解析は 1 行ぶんずつ完結し、式は木に写してから
      * 次の段へ進むので、1本を使い回して構わない。 */
     MTok     *tok;
+    int       loopdepth;   /* `.break` / `.continue` が書ける深さ */
 } MSP;
 
 static void ms_push(MStmt ***v, int *n, int *cap, MStmt *s){
@@ -6202,6 +6203,15 @@ static MStmt *msp_simple(MSP *p, int li){
             mxp_echo_arglist(&ep, &s->args, &s->nargs);
             if(!mxp_end(&ep)) mini_fail(c, "unexpected text after '.echo(...)'");
             return s;
+        }
+        if(strcmp(kw, ".BREAK") == 0 || strcmp(kw, ".CONTINUE") == 0){
+            int isbrk = (strcmp(kw, ".BREAK") == 0);
+            if(n != 1)
+                mini_fail(c, "unexpected text after '%s'", isbrk ? ".break" : ".continue");
+            if(p->loopdepth <= 0)
+                mini_fail(c, "'%s' must be inside a '.while' or '.for' loop",
+                          isbrk ? ".break" : ".continue");
+            return ms_new(isbrk ? MS_BREAK : MS_CONTINUE, p, li);
         }
         if(strcmp(kw, ".CALL") == 0){
             MStmt *s = ms_new(MS_CALL, p, li);
@@ -6336,7 +6346,9 @@ static void msp_block(MSP *p, const char *e1, const char *e2, const char *e3,
             MXP ep; ep.t = toks + 1; ep.n = n - 1; ep.i = 0; ep.c = c;
             s->val = mxp_full(&ep);
             p->i = li + 1;
+            p->loopdepth++;
             msp_block(p, ".ENDWHILE", NULL, NULL, &s->body, &s->nbody);
+            p->loopdepth--;
             if(p->i >= p->f->nlines){
                 c->file = s->file; c->line = s->line;
                 mini_fail(c, "'.while' is never closed with '.endwhile'");
@@ -6361,7 +6373,9 @@ static void msp_block(MSP *p, const char *e1, const char *e2, const char *e3,
             if(s->nargs < 1 || s->nargs > 3)
                 mini_fail(c, "range() takes 1 to 3 arguments, got %d", s->nargs);
             p->i = li + 1;
+            p->loopdepth++;
             msp_block(p, ".NEXT", NULL, NULL, &s->body, &s->nbody);
+            p->loopdepth--;
             if(p->i >= p->f->nlines){
                 c->file = s->file; c->line = s->line;
                 mini_fail(c, "'.for' is never closed with '.next'");
@@ -6398,7 +6412,7 @@ static int mini_compile_func(MiniFunc *f, char *errout, size_t esz){
         f->body = NULL; f->nbody = 0;
         return 0;
     }
-    MSP p; p.f = f; p.i = 0; p.c = &c; p.tok = tokbuf;
+    MSP p; p.f = f; p.i = 0; p.c = &c; p.tok = tokbuf; p.loopdepth = 0;
     msp_block(&p, NULL, NULL, NULL, &f->body, &f->nbody);
     if(p.i < f->nlines){
         c.file = f->lfiles[p.i]; c.line = f->llines[p.i];
@@ -6424,6 +6438,7 @@ typedef struct {
     long       steps;
     MiniFrame *frames; int nframes, cframes;
     int        returning;
+    int        loopctl;  /* 1 = `.break` 実行中, 2 = `.continue` 実行中 */
     MiniVal    retval;   /* 直前の `.return 式` の値。整数でも配列でもよい */
     int        has_ret;  /* retval が有効か。値なしの `.return` なら 0 */
 } MiniRun;
@@ -6839,6 +6854,12 @@ static void mini_exec(MiniRun *r, MStmt *s){
         mini_store(r, s, ret);
         return;
     }
+    case MS_BREAK:
+        r->loopctl = 1;
+        return;
+    case MS_CONTINUE:
+        r->loopctl = 2;
+        return;
     case MS_RETURN:
         mini_drop_ret(r);
         if(s->val){
@@ -6876,6 +6897,7 @@ static void mini_exec(MiniRun *r, MStmt *s){
             mini_tick(r);
             mini_exec_block(r, s->body, s->nbody);
             if(r->returning) return;
+            if(r->loopctl){ int lc = r->loopctl; r->loopctl = 0; if(lc == 1) break; }
         }
         return;
     case MS_FOR: {
@@ -6898,6 +6920,7 @@ static void mini_exec(MiniRun *r, MStmt *s){
             mini_set(r, s->name, mini_num(i));
             mini_exec_block(r, s->body, s->nbody);
             if(r->returning) return;
+            if(r->loopctl){ int lc = r->loopctl; r->loopctl = 0; if(lc == 1) return; }
             /* axx.py の反復変数は桁あふれしない整数なので、256bit の符号付き
              * 範囲を越えた時点で必ず停止条件を満たす。同じ所で打ち切る。 */
             uint256_t nx = u256_add(i, step);
@@ -6914,7 +6937,7 @@ static void mini_exec(MiniRun *r, MStmt *s){
 static void mini_exec_block(MiniRun *r, MStmt **body, int n){
     for(int i = 0; i < n; i++){
         mini_exec(r, body[i]);
-        if(r->returning) return;
+        if(r->returning || r->loopctl) return;
     }
 }
 
@@ -6950,6 +6973,7 @@ static void mini_call_func(MiniRun *r, MiniFunc *f, MiniVal *args, int nargs){
     }
     mini_exec_block(r, f->body, f->nbody);
     r->returning = 0;
+    r->loopctl = 0;
     mini_frame_clear(&r->frames[r->nframes - 1]);
     r->nframes--;
 }

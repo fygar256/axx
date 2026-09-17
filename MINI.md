@@ -60,6 +60,8 @@ LOG !v :: .call table([0x11,0x22,v],3)
 | `.if 式 .then` / `.elif 式 .then` / `.else` / `.endif` | 条件分岐。`.elif` は何段でも書け、`.else` は省略可 |
 | `.while(式)` / `.endwhile` | 式が 0 でない間くり返す |
 | `.for 名前 in range(...)` / `.next` | `range(stop)` `range(start, stop)` `range(start, stop, step)` |
+| `.break` | いちばん内側の `.while` / `.for` を抜ける |
+| `.continue` | いちばん内側の `.while` / `.for` の次のくり返しへ進む |
 | `.nonlocal a, b` | その名前を外側の呼び出しのものとして扱う |
 | `.return` | 関数から戻る。本体中どこでも（トップレベルでも `.if`/`.while`/`.for` の中でも）、何度でも書ける |
 | `.return 式` | 値を返して関数から戻る |
@@ -69,6 +71,20 @@ LOG !v :: .call table([0x11,0x22,v],3)
 続けてもよく、最後に `.else` を置ける。連鎖全体を閉じる `.endif` は 1 つでよい。
 `.while` の条件は括弧の有無を問わない（`(式)` は括弧式として読める）。
 `range()` の `step` に 0 は書けない。
+`.break` と `.continue` は `.while` か `.for` の中だけに書ける。ループの外に
+書くとその場でエラーになる。どちらもいちばん内側のループ 1 段にだけ効く。
+
+```
+.for i in range(10)
+.if i == 3 .then
+.continue          /* 3 は飛ばして次へ */
+.endif
+.if i == 7 .then
+.break             /* 7 で打ち切る */
+.endif
+.emit(i)
+.next
+```
 
 ```
 .if n > 100 .then
