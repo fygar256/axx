@@ -1853,6 +1853,8 @@ from being written; only the message is blank. To add or override messages
 from a pattern file, without touching either implementation's source, use
 `.error::n::"Message"` (section 3.14).
 
+A `.raise n` directive in axx mini language raises an error with an error code n.
+
 ---
 
 ## 10. Design notes and background
