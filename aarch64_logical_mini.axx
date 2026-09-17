@@ -210,7 +210,7 @@ r = (e - t) & (e - 1)
 b = e - hq
 r = (e - (p + hq)) & (e - 1)
 .endif
-s = ((0 - 2 * e) & 0x7f) | (b - 1)
+s = ((-2 * e) & 0x7f) | (b - 1)
 .return [r, s]
 .endfunc
 

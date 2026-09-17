@@ -54,7 +54,7 @@ BR !t :: .call rel8(t)
 
 .func rel8(target)
 d = target - $.
-.if d < 0-128 || d > 127 .then
+.if d < -128 || d > 127 .then
 .raise 2
 .endif
 .emit(d & 0xff)
