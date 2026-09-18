@@ -848,6 +848,7 @@ f(a)` runs the call and discards its output.
 | `.raise <expr>` | Report an error whose error code is the value of `<expr>` |
 | `.call name(args)` | Call another function |
 | `name = .call name(args)` | Call another function and assign its return value |
+| `... .call name(args) ...` | A call used as a term inside an expression — its value is the return value |
 | `.if <expr> .then` / `.elif <expr> .then` / `.else` / `.endif` | Conditional; `.elif` may repeat, `.else` is optional |
 | `.while(<expr>)` / `.endwhile` | Loop while the condition is non-zero |
 | `.for <name> in range(...)` / `.next` | Loop over `range(stop)`, `range(start, stop)` or `range(start, stop, step)` |
@@ -974,8 +975,20 @@ v = .call hypot2(a,b)
 The value may be a number or an array; an array is passed as a copy. The target
 may be an array element (`a[i] = .call f(x)`), in which case the returned value
 must be a number. Calling a function that returns nothing in that form is an
-error, and `.call` cannot appear inside a larger expression — take the value
-into a variable first. `.return` never closes the body — only `.endfunc` does
+error.
+
+`.call name(args)` may also appear as a term *inside* a larger expression, where
+it stands for the value the function returns:
+
+```
+d = .call hypot2(a,b) + .call hypot2(c,e)
+.if(.call firstdiv(n) == n)
+m = t[.call idx(k)]
+```
+
+The call may be nested in the arguments of another call, and its arguments are
+ordinary expressions. A function that returns nothing cannot be used this way —
+it is an error, the same as in the assignment form. `.return` never closes the body — only `.endfunc` does
 that — so `.return <expr>` may also be used as an early return from inside a
 block, any number of times:
 
