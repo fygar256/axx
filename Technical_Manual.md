@@ -552,6 +552,54 @@ MOV t,!a :: 0xb8|t,a,a>>8
 
 This distinguishes `mov al,0x12` from `mov ax,0x1234`.
 
+#### 3.7.0 `.map` — a symbol table and its check in one line
+
+```
+.map::<variable>::<name,name,...>::<expression in the variable>
+```
+
+Gives each name in the list a value, and restricts the variable to that list.
+Inside the expression the variable stands for the **position of the name in the
+list**, counted from 0.
+
+```
+.map::x::R0,R1,R2,R3,R4::1<<x
+```
+
+is exactly equivalent to:
+
+```
+.setsym::R0::1<<(0)
+.setsym::R1::1<<(1)
+.setsym::R2::1<<(2)
+.setsym::R3::1<<(3)
+.setsym::R4::1<<(4)
+.check::x::R0,R1,R2,R3,R4
+```
+
+The expression may be left out, in which case it is the variable itself, so the
+names get 0, 1, 2, … in order:
+
+| Written | Values given to `R0`…`R4` |
+|---|---|
+| `.map::x::R0,R1,R2,R3,R4` | 0, 1, 2, 3, 4 |
+| `.map::x::R0,R1,R2,R3,R4::x` | 0, 1, 2, 3, 4 |
+| `.map::x::R0,R1,R2,R3,R4::1<<x` | 1, 2, 4, 8, 16 |
+| `.map::x::R0,R1,R2,R3,R4::10**x` | 1, 10, 100, 1000, 10000 |
+
+Register files, bit masks and other tables whose names *are* the numbering are
+the common case, and writing the `.setsym` lines out by hand makes it easy for
+the list and the values to drift apart. `.map` is expanded into the directives
+above as the pattern file is read, so nothing downstream treats it specially.
+
+The position is substituted into the expression in parentheses, so operator
+precedence is unaffected, and only whole-word occurrences of the variable are
+replaced — the `x` of `0xff` is left alone.
+
+An empty element (`""`) consumes its position without defining a symbol, which
+keeps the numbering aligned while marking the operand as optional in the
+`.check` list.
+
 **Optional positions.** `""` in a `.check` list permits the position to be
 absent:
 

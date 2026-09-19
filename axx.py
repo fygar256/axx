@@ -4354,6 +4354,47 @@ class PatternFileReader:
                     self.subs[cur_sub].append((l[0], l[-1]))
                     continue
 
+                # `.map::<変数>::<名前の並び>::<式>` は、並びの各名前に値を与える
+                # `.setsym` と、その変数の `.check` をまとめて書くための省略形。
+                # 式の中の変数は「その名前が並びの何番目か」(0 から数える) を指す。
+                #
+                #   .map::x::R0,R1,R2::1<<x
+                # は
+                #   .setsym::R0::1<<(0)
+                #   .setsym::R1::1<<(1)
+                #   .setsym::R2::1<<(2)
+                #   .check::x::R0,R1,R2
+                # と等価である。式を省くと変数そのもの、すなわち 0 からの連番に
+                # なる。レジスタ名やビットマスクのように「名前の並びがそのまま
+                # 規則的な値」になる表は、`.setsym` を並べて書くと並び順と値が
+                # 食い違いやすい。ここでパターン表へ展開してしまうので、以降の
+                # 処理は素の `.setsym` / `.check` と区別しない。
+                if _kw == '.MAP':
+                    var_str = l[1].strip() if len(l) > 2 else ''
+                    syms_str = l[2] if len(l) > 2 else (l[1] if len(l) > 1 else '')
+                    expr_str = l[3] if (len(l) > 3 and l[3].strip()) else var_str
+                    if len(l) < 3 or var_str == '':
+                        diag(" error - .map: needs '.map::<variable>::"
+                             "<name,name,...>[::<expression in the variable>]'.",
+                             set_error=True)
+                    elif len(var_str) != 1 or not ('a' <= var_str.lower() <= 'z'):
+                        diag(f" error - .map: variable should be a lower case "
+                             f"letter ({var_str!r}).", set_error=True)
+                    else:
+                        # 名前の並びを `,` で切り、i 番目の名前に「式の変数を i に
+                        # 置き換えたもの」を値として与える。空の要素（`""` の
+                        # 省略可印など）は番号だけ消費して `.setsym` を出さない。
+                        for i, nm in enumerate(syms_str.split(',')):
+                            nm = nm.strip()
+                            if nm == '' or nm in ('""', "''"):
+                                continue
+                            w.append(['.setsym', nm,
+                                      self._map_subst_index(expr_str,
+                                                            var_str.lower(), i),
+                                      '', '', ''])
+                        w.append(['.check', var_str, syms_str, '', '', ''])
+                    continue
+
                 if len(l) == 1:
                     if l[0].strip() != '':
                         diag(f" warning - pattern line has no '::' field separator "
@@ -4395,6 +4436,28 @@ class PatternFileReader:
             self.compile_funcs()
 
         return w
+
+    @staticmethod
+    def _map_subst_index(expr, var, i):
+        """`.map` の式の中の変数を、並びの番号に置き換えた新しい式を作る。
+
+        置き換えるのは語として独立している出現だけで、`0xff` の `x` のように
+        英数字に挟まれたものは触らない。番号は `(3)` と括って埋めるので、
+        `1<<x` は `1<<(3)` となり、前後の演算子の優先順位は変わらない。
+        caxx.c の map_subst_index() と同じ規則である。
+        """
+        num = '(%d)' % i
+        out = []
+        for k, c in enumerate(expr):
+            if c.lower() == var:
+                prev = expr[k - 1] if k > 0 else ''
+                nxt = expr[k + 1] if k + 1 < len(expr) else ''
+                if not (prev.isalnum() or prev == '_') and \
+                   not (nxt.isalnum() or nxt == '_'):
+                    out.append(num)
+                    continue
+            out.append(c)
+        return ''.join(out)
 
     def compile_funcs(self):
         """集めた関数の本体を、読み込み時に文の木へ変換する。

@@ -7452,6 +7452,31 @@ static int parse_func_header(const char *l, char *name, size_t nsz,
     return 0;
 }
 
+/* `.map` の式の中の変数を、並びの番号に置き換えた新しい式を作る。
+ * 置き換えるのは語として独立している出現だけで、`0xff` の `x` のように
+ * 英数字に挟まれたものは触らない。番号は `(3)` と括って埋めるので、
+ * `1<<x` は `1<<(3)` となり、前後の演算子の優先順位は変わらない。 */
+static char *map_subst_index(const char *expr, char var, int i){
+    char num[32];
+    snprintf(num, sizeof(num), "(%d)", i);
+    size_t nl = strlen(num);
+    size_t cap = strlen(expr) * nl + nl + 16;
+    char *out = malloc(cap);
+    if(!out){ perror("malloc"); exit(1); }
+    size_t w = 0;
+    char up = (char)axx_upper_char(var);
+    for(size_t k = 0; expr[k]; k++){
+        char c = expr[k];
+        int is_var = (c == var || c == up);
+        int lsep = (k == 0) || !(isalnum((unsigned char)expr[k-1]) || expr[k-1]=='_');
+        int rsep = !(isalnum((unsigned char)expr[k+1]) || expr[k+1]=='_');
+        if(is_var && lsep && rsep){ memcpy(out+w, num, nl); w += nl; }
+        else out[w++] = c;
+    }
+    out[w] = '\0';
+    return out;
+}
+
 static void readpat(Assembler *asmb, const char *fn){
     if(!fn||!fn[0]) return;
 
@@ -7708,6 +7733,75 @@ static void readpat(Assembler *asmb, const char *fn){
                                    "field separator: '%s'\n", cur_sub->name, fields[0]);
                 } else {
                     subdef_push(cur_sub, fields[0], fields[nf-1]);
+                }
+                free(fbuf); continue;
+            }
+        }
+
+        /* `.map::<変数>::<名前の並び>::<式>` は、並びの各名前に値を与える
+         * `.setsym` と、その変数の `.check` をまとめて書くための省略形。
+         * 式の中の変数は「その名前が並びの何番目か」(0 から数える) を指す。
+         *
+         *   .map::x::R0,R1,R2::1<<x
+         * は
+         *   .setsym::R0::1<<(0)
+         *   .setsym::R1::1<<(1)
+         *   .setsym::R2::1<<(2)
+         *   .check::x::R0,R1,R2
+         * と等価である。式を省くと変数そのもの、すなわち 0 からの連番になる。
+         * レジスタ名やビットマスクのように「名前の並びがそのまま規則的な値」に
+         * なる表は、`.setsym` を並べて書くと並び順と値が食い違いやすい。
+         * ここでパターン表へ展開してしまうので、以降の処理は素の
+         * `.setsym` / `.check` と区別しない。 */
+        {
+            char kw[16]={0};
+            int a = axx_skipspc(fields[0], 0);
+            int e = (int)strlen(fields[0]);
+            while(e > a && isspace((unsigned char)fields[0][e-1])) e--;
+            if(e - a < (int)sizeof(kw))
+                for(int k = a; k < e; k++) kw[k-a] = axx_upper_char(fields[0][k]);
+            if(strcmp(kw,".MAP")==0){
+                const char *var_str  = (nf>2) ? pat_trim(fields[1]) : "";
+                const char *syms_str = (nf>2) ? fields[2] : ((nf>1) ? fields[1] : "");
+                const char *expr_str = (nf>3 && pat_trim(fields[3])[0]) ? fields[3] : var_str;
+                char var = var_str[0] ? (char)tolower((unsigned char)var_str[0]) : 0;
+                if(!var_str[0] || nf<3){
+                    axx_diagf(1, 0, " error - .map: needs '.map::<variable>::"
+                               "<name,name,...>[::<expression in the variable>]'.\n");
+                } else if(var < 'a' || var > 'z' || var_str[1] != '\0'){
+                    axx_diagf(1, 0, " error - .map: variable should be a lower case "
+                               "letter ('%s').\n", var_str);
+                } else {
+                    /* 名前の並びを `,` で切り、i 番目の名前に「式の変数を i に
+                     * 置き換えたもの」を値として与える。空の要素（`""` の
+                     * 省略可印など）は番号だけ消費して `.setsym` を出さない。 */
+                    const char *q = syms_str;
+                    int i = 0;
+                    while(1){
+                        while(*q == ' ' || *q == '\t') q++;
+                        char nm[512]; int j = 0;
+                        while(*q && *q != ',' && j < (int)sizeof(nm)-1) nm[j++] = *q++;
+                        while(j > 0 && (nm[j-1]==' ' || nm[j-1]=='\t')) j--;
+                        nm[j] = '\0';
+                        int empty = (j == 0)
+                                    || (j == 2 && ((nm[0]=='"'  && nm[1]=='"')
+                                                || (nm[0]=='\'' && nm[1]=='\'')));
+                        if(!empty){
+                            char *val = map_subst_index(expr_str, var, i);
+                            PatEntry *se = pv_push_blank(&asmb->st.pat);
+                            pat_set(se,0,".setsym");
+                            pat_set(se,1,nm);
+                            pat_set(se,2,val);
+                            free(val);
+                        }
+                        i++;
+                        if(*q != ',') break;
+                        q++;
+                    }
+                    PatEntry *ce = pv_push_blank(&asmb->st.pat);
+                    pat_set(ce,0,".check");
+                    pat_set(ce,1,var_str);
+                    pat_set(ce,2,syms_str);
                 }
                 free(fbuf); continue;
             }
