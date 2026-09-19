@@ -834,9 +834,13 @@ expanded, and the line simply fails to match.
 
 ```
 .map::<variable>::<name,name,...>::<expression in the variable>
+.map::<variable>::<name,name,...>::<value,value,...>
 ```
 
 Gives each name in the list a value, and restricts the variable to that list.
+The value field is read either way round: one expression that computes every
+value, or a list of values that pairs up with the names one by one.
+
 Inside the expression the variable stands for the **position of the name in the
 list**, counted from 0.
 
@@ -865,6 +869,32 @@ names get 0, 1, 2, … in order:
 | `.map::x::R0,R1,R2,R3,R4::1<<x` | 1, 2, 4, 8, 16 |
 | `.map::x::R0,R1,R2,R3,R4::10**x` | 1, 10, 100, 1000, 10000 |
 
+**A list of values.** When the value field holds more than one item, separated
+by commas, the items pair up with the names in order:
+
+```
+.map::x::R0,R1,R2,R3::9,7,14,41
+```
+
+is exactly equivalent to:
+
+```
+.setsym::R0::9
+.setsym::R1::7
+.setsym::R2::14
+.setsym::R3::41
+.check::x::R0,R1,R2,R3
+```
+
+That is the form for a table whose values follow no rule. The two lists must be
+the same length, or the directive reports an error and defines nothing. Each
+item is an expression like any other, so `.map::x::R0,R1,R2::x*10,100+x,7`
+gives 0, 101 and 7 — the variable still stands for the position.
+
+Only commas outside brackets separate the items, so an expression that contains
+one of its own is a single item: `.map::x::R0,R1,R2::*(#W,x)` stays one
+expression, and the names get successive bytes of `W`.
+
 Register files, bit masks and other tables whose names *are* the numbering are
 the common case, and writing the `.setsym` lines out by hand makes it easy for
 the list and the values to drift apart. `.map` is expanded into the directives
@@ -876,7 +906,8 @@ replaced — the `x` of `0xff` is left alone.
 
 An empty element (`""`) consumes its position without defining a symbol, which
 keeps the numbering aligned while marking the operand as optional in the
-`.check` list.
+`.check` list. With a list of values it consumes its value too, so the two
+lists stay aligned.
 
 The list may also be an array symbol (section 3.6.1), so the register names can
 be written once and shared with `.check` and `.enum`:

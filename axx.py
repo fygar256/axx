@@ -3602,8 +3602,35 @@ class DirectiveProcessor:
             self.state.check_constraints.clear()
         return True
 
+    @staticmethod
+    def _map_value_split(text):
+        """`.map` の値欄を最上位のカンマで切る。
+
+        括弧の中のカンマは区切りにしない（`*(x,1)` のような式がそのまま
+        1項目になるようにするため）。深さの数え方は expression_esc() と
+        同じで、閉じ括弧の種類は厳密に照合しない。
+        caxx.c の map_value_split() と同じ規則である。
+        """
+        items = []
+        buf = []
+        depth = 0
+        for ch in text:
+            if ch in '([{':
+                depth += 1
+            elif ch in ')]}':
+                if depth > 0:
+                    depth -= 1
+            elif ch == ',' and depth == 0:
+                items.append(''.join(buf).strip())
+                buf = []
+                continue
+            buf.append(ch)
+        items.append(''.join(buf).strip())
+        return items
+
     def map_apply(self, i, into=None, set_check=True):
         """`.map::<変数>::<名前の並び>::<式>`
+        `.map::<変数>::<名前の並び>::<値,値,…>`
 
         並びの各名前に値を与える `.setsym` と、その変数の `.check` をまとめて
         書くための省略形。式の中の変数は「その名前が並びの何番目か」
@@ -3616,6 +3643,20 @@ class DirectiveProcessor:
             .setsym::R2::1<<(2)
             .check::x::R0,R1,R2
         と等価である。式を省くと変数そのもの、すなわち 0 からの連番になる。
+
+        値欄を最上位のカンマで区切って書くと、並びと1対1で対応する値の
+        リストになる。
+
+            .map::x::R0,R1,R2,R3::9,7,14,41
+        は
+            .setsym::R0::9
+            .setsym::R1::7
+            .setsym::R2::14
+            .setsym::R3::41
+            .check::x::R0,R1,R2,R3
+        と等価である。個数が合わないときはエラーにする。各項目は式なので、
+        変数（＝並びの番号）を書いてもよい。
+
         並びには配列シンボルの名前を書ける（elem_list_expand() が展開する）。
 
         into が与えられればシンボルはそこへ、なければ state.symbols へ入れる。
@@ -3630,11 +3671,19 @@ class DirectiveProcessor:
         target = self.state.symbols if into is None else into
 
         elems = self.elem_list_expand(syms_str)
+        # 値欄が最上位のカンマで区切られていれば、並びと1対1の値のリスト。
+        # 1項目しか無ければ従来どおり「変数を含む式」1本として扱う。
+        vals = self._map_value_split(expr_str)
+        if len(vals) > 1 and len(vals) != len(elems):
+            self.state.diag(f" error - .map: the value list has {len(vals)} items "
+                            f"but the name list has {len(elems)}.", set_error=True)
+            return
         for n, nm in enumerate(elems):
             # 空の要素（`""` の省略可印など）は番号だけ消費して何も定義しない。
             if nm == '':
                 continue
-            val = PatternFileReader._map_subst_index(expr_str, var, n)
+            src = vals[n] if len(vals) > 1 else expr_str
+            val = PatternFileReader._map_subst_index(src, var, n)
             v, _ = self.expr_eval.expression_pat(val, 0)
             target[nm] = v
         if set_check:

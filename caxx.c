@@ -4872,6 +4872,31 @@ static char *map_subst_index(const char *expr, const char *var, int i);
  *
  * into が非NULLならシンボルはそこへ、NULLなら st->symbols へ入れる。
  * set_check が真なら `.check` も設定する。 */
+/* `.map` の値欄を最上位のカンマで切る。括弧の中のカンマは区切りにしない
+ * （`*(x,1)` のような式がそのまま1項目になるようにするため）。深さの数え方は
+ * expr_expression_esc() と同じで、閉じ括弧の種類は厳密に照合しない。
+ * axx.py の _map_value_split() と同じ規則である。 */
+static void map_value_split(const char *text, StrVec *out){
+    int depth = 0;
+    const char *b = text;
+    char item[1024];
+    for(const char *p = text; ; p++){
+        if(*p == '(' || *p == '[' || *p == '{') depth++;
+        else if(*p == ')' || *p == ']' || *p == '}'){ if(depth > 0) depth--; }
+        if(*p == '\0' || (*p == ',' && depth == 0)){
+            const char *s0 = b, *s1 = p;
+            while(s0 < s1 && (*s0==' '||*s0=='\t')) s0++;
+            while(s1 > s0 && (s1[-1]==' '||s1[-1]=='\t')) s1--;
+            int n = (int)(s1 - s0);
+            if(n > (int)sizeof(item)-1) n = (int)sizeof(item)-1;
+            memcpy(item, s0, (size_t)n); item[n] = '\0';
+            sv_push(out, item);
+            if(*p == '\0') break;
+            b = p + 1;
+        }
+    }
+}
+
 static void map_apply(Assembler *asmb, PatEntry *e, SymMap *into, int set_check){
     AsmState *st = &asmb->st;
     const char *var_str  = e->f[1][0] ? pat_trim(e->f[1]) : "";
@@ -4884,15 +4909,27 @@ static void map_apply(Assembler *asmb, PatEntry *e, SymMap *into, int set_check)
 
     StrVec elems; sv_init(&elems);
     elem_list_expand(st, syms_str, &elems);
+    /* 値欄が最上位のカンマで区切られていれば、並びと1対1の値のリスト。
+     * 1項目しか無ければ従来どおり「変数を含む式」1本として扱う。 */
+    StrVec vals; sv_init(&vals);
+    map_value_split(expr_str, &vals);
+    if(vals.len > 1 && vals.len != elems.len){
+        axx_diagf(1, 0, " error - .map: the value list has %d items "
+                        "but the name list has %d.\n", vals.len, elems.len);
+        sv_free(&vals); sv_free(&elems);
+        return;
+    }
     for(int i = 0; i < elems.len; i++){
         /* 空の要素（`""` の省略可印など）は番号だけ消費して何も定義しない。 */
         if(!elems.data[i][0]) continue;
-        char *val = map_subst_index(expr_str, vname, i);
+        const char *src = (vals.len > 1) ? vals.data[i] : expr_str;
+        char *val = map_subst_index(src, vname, i);
         int io;
         uint256_t v = expr_expression_pat(asmb, val, 0, &io);
         free(val);
         smap_set(into ? into : &st->symbols, elems.data[i], v);
     }
+    sv_free(&vals);
     if(set_check){
         int idx = vslot;
         sv_free(&st->check_constraints[idx]);
