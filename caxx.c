@@ -94,16 +94,14 @@ static void m_echo_write(char *const *items, int n);
  * ままにして axx.py の実際の挙動に合わせる。 */
 typedef struct { uint256_t val; int is_undef; int is_float; } PatVar;
 
-/* パターン変数の置き場。0〜25 は従来どおり小文字1文字 `a`〜`z` で、
- * 26 番から先は `var_2` のような2文字以上の名前に割り当てる。名前は
- * パターンファイルを読むときに登録し、以後は添字（スロット番号）で扱う。
- * g_nvars は「実際に使っている個数」で、変数を走査するループの上限。
- * 1文字しか使わないパターンファイルでは 26 のままなので、走査の手間は
- * これまでと変わらない。 */
+/* パターン変数の置き場。名前は綴りだけで決まり、長さは問わない（`a` でも
+ * `var_2` でも同じ扱い）。名前はパターンファイルを読むときに登録し、以後は
+ * 添字（スロット番号）で扱う。g_nvars は登録した個数で、変数を走査する
+ * ループの上限である。捕捉も代入もされていない名前にはスロットを作らず、
+ * 式の中で読むと 0 になる。 */
 #define NVARS 256
-static int    g_nvars = 26;
-static char  *g_varnames[NVARS];   /* スロット 26+i の名前 */
-static int    g_nvarnames = 0;
+static int    g_nvars = 0;
+static char  *g_varnames[NVARS];   /* スロット i の名前 */
 
 /* パターン変数の名前は小文字で始まり、小文字・数字・`_` が続く。 */
 static int var_name_len(const char *s){
@@ -113,53 +111,42 @@ static int var_name_len(const char *s){
     return n;
 }
 
-/* 名前をスロット番号にする。1文字ならそのまま `a`〜`z` の 0〜25。
- * 2文字以上は登録表を引き、create が真なら無ければ新しく割り当てる。
- * 見つからない（かつ create でない）ときは -1。 */
+/* 先頭 len 文字がちょうど変数名ひとつか。 */
+static int is_var_name_n(const char *s, int len){
+    if(len <= 0) return 0;
+    if(!(s[0] >= 'a' && s[0] <= 'z')) return 0;
+    for(int i = 1; i < len; i++)
+        if(!((s[i]>='a'&&s[i]<='z')||(s[i]>='0'&&s[i]<='9')||s[i]=='_')) return 0;
+    return 1;
+}
+
+/* 名前をスロット番号にする。長さは問わない。create が真なら無ければ新しく
+ * 割り当てる。見つからない（かつ create でない）ときは -1。 */
 static int var_slot(const char *name, int len, int create){
-    if(len <= 0) return -1;
-    if(len == 1){
-        if(name[0] >= 'a' && name[0] <= 'z') return name[0] - 'a';
-        if(name[0] >= 'A' && name[0] <= 'Z') return name[0] - 'A';
-        return -1;
-    }
-    for(int i = 0; i < g_nvarnames; i++)
-        if((int)strlen(g_varnames[i]) == len && strncmp(g_varnames[i], name, (size_t)len) == 0)
-            return 26 + i;
+    char lower[256];
+    if(len <= 0 || len >= (int)sizeof(lower)) return -1;
+    for(int i = 0; i < len; i++) lower[i] = (char)tolower((unsigned char)name[i]);
+    lower[len] = '\0';
+    if(!is_var_name_n(lower, len)) return -1;
+    for(int i = 0; i < g_nvars; i++)
+        if((int)strlen(g_varnames[i]) == len && memcmp(g_varnames[i], lower, (size_t)len) == 0)
+            return i;
     if(!create) return -1;
-    if(26 + g_nvarnames >= NVARS){
-        fprintf(stderr, " error - too many pattern variable names (maximum %d).\n", NVARS - 26);
+    if(g_nvars >= NVARS){
+        fprintf(stderr, " error - too many pattern variable names (maximum %d).\n", NVARS);
         return -1;
     }
     char *dup = malloc((size_t)len + 1);
     if(!dup){ perror("malloc"); exit(1); }
-    memcpy(dup, name, (size_t)len); dup[len] = '\0';
-    g_varnames[g_nvarnames++] = dup;
-    g_nvars = 26 + g_nvarnames;
-    return 26 + g_nvarnames - 1;
+    memcpy(dup, lower, (size_t)len); dup[len] = '\0';
+    g_varnames[g_nvars] = dup;
+    return g_nvars++;
 }
 
-/* 診断に出すための名前。スロット 0〜25 は1文字。 */
+/* 診断に出すための名前。 */
 static const char *var_slot_name(int slot){
-    static char one[2];
-    if(slot < 0) return "?";
-    if(slot < 26){ one[0] = (char)('a' + slot); one[1] = '\0'; return one; }
-    if(slot - 26 < g_nvarnames) return g_varnames[slot - 26];
-    return "?";
-}
-
-/* 位置 s[idx] から始まる最長の「登録済み変数名」。無ければ 0。
- * 式の中で `var_2` を変数として読むために使う。1文字の変数は従来どおり
- * 別の枝が扱うので、ここでは2文字以上だけを見る。 */
-static int var_registered_len_at(const char *s, int idx){
-    int best = 0;
-    for(int i = 0; i < g_nvarnames; i++){
-        int l = (int)strlen(g_varnames[i]);
-        if(l <= best) continue;
-        if(strncmp(s + idx, g_varnames[i], (size_t)l) != 0) continue;
-        best = l;
-    }
-    return best;
+    if(slot < 0 || slot >= g_nvars) return "?";
+    return g_varnames[slot];
 }
 
 /* 配列シンボルの1項目。数値か文字列のどちらかを持つ。 */
@@ -1872,7 +1859,6 @@ static char axx_upper_char(char c) {
     if(c>='a'&&c<='z') return c-32;
     return c;
 }
-static int is_lower(char c){ return c>='a'&&c<='z'; }
 static int is_digit(char c){ return c>='0'&&c<='9'; }
 static int is_xdigit_upper(char c){
     return (c>='0'&&c<='9')||(c>='A'&&c<='F');
@@ -3958,11 +3944,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         uint256_t ten=u256_from_u64(10);
         for(int di=0;fs[di];di++) x=u256_add(u256_mul(x,ten),u256_from_u64((uint64_t)(fs[di]-'0')));
     }
-    /* パターン変数 a〜z は「小文字1文字で、直後がラベル構成文字でない」ときだけ。
-     * 破綻点修正: 直後の文字を is_lower() でしか見ていなかったため、`a1` や `aB`
-     * のようにラベル構成文字（数字・大文字・`_`・`.`）が続く場合まで変数 `a` として
-     * 食ってしまい、残った `1` で式リストの解析が打ち切られて後続のワードごと
-     * 黙って消えていた（axx.py は lwordchars で判定するのでラベル `a1` になる）。 */
     /* .enum の式の中では、列挙要素名はその束縛値として読む。`#name` は
      * これより前の枝で処理されるので、そちらは素の .setsym 値になる。 */
     else if(st->enum_bind_names
@@ -3970,17 +3951,18 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         x = st->enum_bind_vals[_en_k];
         idx = _en_end;
     }
-    /* 登録済みの2文字以上の変数名（`var_2` 等）は、ラベルより先にここで読む。
-     * 1文字の変数はこれまでどおり「直後がラベル構成文字でないとき」だけ。 */
+    /* パターン変数は「小文字で始まる名前で、直後がラベル構成文字でない」とき。
+     * 長さは問わず、`a` も `var_2` も同じ規則でラベルより先にここで読む。
+     * 直後の文字を見るのは、`aB` や `a.b` のようにラベル構成文字（大文字や
+     * `.`）が続く綴りをラベルとして残すためである。
+     * 捕捉も代入もされていない名前にはスロットが無いので、値は 0 になる。 */
     else if(st->expcaps->patvars
-            && ((_vnl = var_registered_len_at(s, idx)) > 0
-                  ? (s[idx+_vnl]=='\0' || !char_in(s[idx+_vnl], st->lwordchars))
-                  : (is_lower(s[idx])
-                     && (s[idx+1]=='\0' || !char_in(s[idx+1], st->lwordchars))
-                     && (_vnl = 1)))){
-        int vslot = var_slot(s+idx, _vnl, 0);
-        if(vslot < 0) vslot = var_slot(s+idx, _vnl, 1);
-        if(idx+_vnl+2<=slen && s[idx+_vnl]==':'&&s[idx+_vnl+1]=='='){
+            && (_vnl = var_name_len(s+idx)) > 0
+            && (s[idx+_vnl]=='\0' || !char_in(s[idx+_vnl], st->lwordchars))){
+        /* 場所を作るのは代入のときだけ。読むだけの名前は増やさない。 */
+        int _is_assign = (idx+_vnl+2<=slen && s[idx+_vnl]==':' && s[idx+_vnl+1]=='=');
+        int vslot = var_slot(s+idx, _vnl, _is_assign);
+        if(_is_assign){
             int _assign_prior_eul = st->error_undefined_label;
             st->error_undefined_label = 0;
             x=expr_expression(asmb,s,idx+_vnl+2,&idx);
@@ -5679,7 +5661,10 @@ static int pat_match0_brackets(Assembler *asmb, const char *s, const char *t_ori
 
         int saved_elf_refs_len = asmb->st.elf_refs_len;
         struct {int set; char *label_name; uint64_t label_val;} saved_vtl[NVARS];
-        for(int vi=0;vi<g_nvars;vi++){
+        /* 退避した個数を控える。評価の途中で変数名が増えても、復元は
+         * 退避した分だけを回す。 */
+        int saved_nvars = g_nvars;
+        for(int vi=0;vi<saved_nvars;vi++){
             saved_vtl[vi].set       = asmb->st.elf_var_to_label[vi].set;
             saved_vtl[vi].label_val = asmb->st.elf_var_to_label[vi].label_val;
             saved_vtl[vi].label_name = asmb->st.elf_var_to_label[vi].label_name
@@ -5689,13 +5674,13 @@ static int pat_match0_brackets(Assembler *asmb, const char *s, const char *t_ori
 
         if(pat_match(asmb,s,lt)){
             found=1;
-            for(int vi=0;vi<g_nvars;vi++) free(saved_vtl[vi].label_name);
+            for(int vi=0;vi<saved_nvars;vi++) free(saved_vtl[vi].label_name);
         } else {
             memcpy(asmb->st.vars, saved_vars, sizeof(saved_vars));
             for(int ri2=saved_elf_refs_len; ri2<asmb->st.elf_refs_len; ri2++)
                 free(asmb->st.elf_refs[ri2].name);
             asmb->st.elf_refs_len = saved_elf_refs_len;
-            for(int vi=0;vi<g_nvars;vi++){
+            for(int vi=0;vi<saved_nvars;vi++){
                 free(asmb->st.elf_var_to_label[vi].label_name);
                 asmb->st.elf_var_to_label[vi].set       = saved_vtl[vi].set;
                 asmb->st.elf_var_to_label[vi].label_val = saved_vtl[vi].label_val;
@@ -5785,7 +5770,8 @@ static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
         memcpy(saved_vars, asmb->st.vars, sizeof(saved_vars));
         int saved_elf_refs_len = asmb->st.elf_refs_len;
         struct {int set; char *label_name; uint64_t label_val;} saved_vtl[NVARS];
-        for(int vi=0;vi<g_nvars;vi++){
+        int saved_nvars = g_nvars;   /* 復元は退避した個数だけ回す。 */
+        for(int vi=0;vi<saved_nvars;vi++){
             saved_vtl[vi].set        = asmb->st.elf_var_to_label[vi].set;
             saved_vtl[vi].label_val  = asmb->st.elf_var_to_label[vi].label_val;
             saved_vtl[vi].label_name = asmb->st.elf_var_to_label[vi].label_name
@@ -5798,14 +5784,14 @@ static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
              * ので、外側の値欄が内側の変数を使える。 */
             for(int k=nbinds-1;k>=0;k--)
                 var_slot_put(&asmb->st, binds[k].var, pat_sub_value(asmb, binds[k].val));
-            for(int vi=0;vi<g_nvars;vi++) free(saved_vtl[vi].label_name);
+            for(int vi=0;vi<saved_nvars;vi++) free(saved_vtl[vi].label_name);
             return 1;
         }
         memcpy(asmb->st.vars, saved_vars, sizeof(saved_vars));
         for(int ri=saved_elf_refs_len; ri<asmb->st.elf_refs_len; ri++)
             free(asmb->st.elf_refs[ri].name);
         asmb->st.elf_refs_len = saved_elf_refs_len;
-        for(int vi=0;vi<g_nvars;vi++){
+        for(int vi=0;vi<saved_nvars;vi++){
             free(asmb->st.elf_var_to_label[vi].label_name);
             asmb->st.elf_var_to_label[vi].set        = saved_vtl[vi].set;
             asmb->st.elf_var_to_label[vi].label_val  = saved_vtl[vi].label_val;
@@ -8664,7 +8650,7 @@ static void txt_emit_expr(Assembler *asmb, TxtBuf *t, const char *expr, int kind
 /* テンプレートの中の名前を解決して積む。
  * 優先順位は
  *   1. `.setsym::名前::"文字列"` の文字列シンボル … その文字列
- *   2. 1文字の小文字                             … パターン変数の値（10進）
+ *   2. 変数として使われている名前                 … パターン変数の値（10進）
  *   3. どれでもない                               … 書かれたままの文字
  * で、`Rr` の `r` は 2 に、`{{x}}` の `x` は 1 に当たる。
  * 数値シンボルをここで引かないのは、`num=` のような普通の文（たまたま
@@ -8691,16 +8677,13 @@ static void txt_emit_name(Assembler *asmb, TxtBuf *t, const char *name, int len)
         return;
     }
 
-    /* 登録済みのパターン変数（1文字でも `var_2` のように長くてもよい）。 */
-    {
-        char lower[64];
-        if(len < (int)sizeof(lower)){
-            for(int k=0;k<len;k++) lower[k] = (char)tolower((unsigned char)name[k]);
-            lower[len] = '\0';
-            int vs = (len == 1 && lower[0] >= 'a' && lower[0] <= 'z')
-                     ? lower[0] - 'a' : var_slot(lower, len, 0);
-            if(vs >= 0){ txt_radix(t, st->vars[vs].val, 10); return; }
-        }
+    /* パターン変数（`a` でも `var_2` でも同じ規則）。パターンファイルが
+     * その名前を変数として使っていれば値を、そうでなければ書かれたままの
+     * 文字を出す。ふつうの単語が黙って数字に化けないようにするためで、
+     * 変数と決まっている名前が未束縛なら 0 になる。 */
+    if(is_var_name_n(name, len)){
+        int vs = var_slot(name, len, 0);
+        if(vs >= 0){ txt_radix(t, st->vars[vs].val, 10); return; }
     }
     txt_addn(t, name, (size_t)len);
 }
@@ -8932,7 +8915,10 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     memcpy(saved_vars, st->vars, sizeof(saved_vars));
     int saved_elf_refs_len = st->elf_refs_len;
     struct {int set; char *label_name; uint64_t label_val;} saved_vtl[NVARS];
-    for(int vi=0;vi<g_nvars;vi++){
+    /* 退避した個数を控える。e_p() の評価中に `名前:=式` で変数名が増えても、
+     * 復元は退避した分だけを回す。 */
+    int saved_nvars = g_nvars;
+    for(int vi=0;vi<saved_nvars;vi++){
         saved_vtl[vi].set       = st->elf_var_to_label[vi].set;
         saved_vtl[vi].label_val = st->elf_var_to_label[vi].label_val;
         saved_vtl[vi].label_name = st->elf_var_to_label[vi].label_name
@@ -8950,7 +8936,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
             for(int ri2=saved_elf_refs_len; ri2<st->elf_refs_len; ri2++)
                 free(st->elf_refs[ri2].name);
             st->elf_refs_len = saved_elf_refs_len;
-            for(int vi=0;vi<g_nvars;vi++){
+            for(int vi=0;vi<saved_nvars;vi++){
                 free(st->elf_var_to_label[vi].label_name);
                 st->elf_var_to_label[vi].set       = saved_vtl[vi].set;
                 st->elf_var_to_label[vi].label_val = saved_vtl[vi].label_val;
@@ -8969,7 +8955,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
             break;
         }
     }
-    for(int vi=0;vi<g_nvars;vi++) free(saved_vtl[vi].label_name);
+    for(int vi=0;vi<saved_nvars;vi++) free(saved_vtl[vi].label_name);
     if(is_empty){ free(ep_buf); return; }
 
     size_t s_cap = strlen(ep_buf) + 64;
@@ -10260,7 +10246,10 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         memcpy(saved_vars, st->vars, sizeof(saved_vars));
         int saved_refs_len = st->elf_refs_len;
         struct { int set; char *label_name; uint64_t label_val; } saved_vtl[NVARS];
-        for(int vi=0;vi<g_nvars;vi++){
+        /* 退避した個数を控える。照合や値欄の評価で新しい変数名が登録されて
+         * g_nvars が増えても、書き戻すのは退避した分だけにする。 */
+        int saved_nvars = g_nvars;
+        for(int vi=0;vi<saved_nvars;vi++){
             saved_vtl[vi].set        = st->elf_var_to_label[vi].set;
             saved_vtl[vi].label_val  = st->elf_var_to_label[vi].label_val;
             saved_vtl[vi].label_name = st->elf_var_to_label[vi].label_name
@@ -10298,7 +10287,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
             for(int ri2=saved_refs_len; ri2<st->elf_refs_len; ri2++)
                 free(st->elf_refs[ri2].name);
             st->elf_refs_len = saved_refs_len;
-            for(int vi=0;vi<g_nvars;vi++){
+            for(int vi=0;vi<saved_nvars;vi++){
                 free(st->elf_var_to_label[vi].label_name);
                 st->elf_var_to_label[vi].set        = saved_vtl[vi].set;
                 st->elf_var_to_label[vi].label_val  = saved_vtl[vi].label_val;
@@ -10321,7 +10310,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
              * ループ先頭で毎回ゼロクリアされるが elf_var_to_label には
              * 同様のリセットが無い）。成功時の巻き戻しと対称に、ここでも
              * 保存しておいた値を書き戻す。 */
-            for(int vi=0;vi<g_nvars;vi++){
+            for(int vi=0;vi<saved_nvars;vi++){
                 free(st->elf_var_to_label[vi].label_name);
                 st->elf_var_to_label[vi].set        = saved_vtl[vi].set;
                 st->elf_var_to_label[vi].label_val  = saved_vtl[vi].label_val;

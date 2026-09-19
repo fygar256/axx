@@ -100,7 +100,7 @@ class ExprCaps:
     `state.expcaps` を見て判断する。呼ぶタイミングが変われば記述子が変わり、
     使える機能が変わる。
 
-    - `patvars` … 小文字 1 文字のパターン変数 a〜z
+    - `patvars` … パターン変数（`a` でも `var_2` でも同じ）
     - `vliw`    … `!!!` / `!!!!`
     - `labels`  … ラベル名・`.equ` 名の参照
     - `loc`     … `$$` / `$.`
@@ -840,8 +840,9 @@ class AssemblerState:
         self.fini_func: str | None = None
 
         # .check で登録された「この変数はこの条件を満たすこと」という制約。
-        # パターンが宣言した2文字以上の変数名（`var_2` 等）。式の中では
-        # ラベルより先にこれを見る。1文字の変数は従来どおり登録不要。
+        # パターンが宣言した変数名（`a` でも `var_2` でも同じ）。式の中で
+        # 変数と読むかどうかは綴りだけで決まるので、この集合は `.free` の
+        # 取り消しと診断のための記録である。
         self.varnames: set = set()
         self.check_constraints: dict = {}
 
@@ -1851,10 +1852,11 @@ class IEEE754Converter:
 
 
 class VariableManager:
-    """パターン変数 a〜z の束縛を管理する。
+    """パターン変数の束縛を管理する。
     
-    `!x` や `!Fx` でソースから捕捉した値の置き場。状態は state.vars（26要素の配列）で、
-    このクラスは添字計算と未定義判定を隠すだけの薄い層。
+    `!x` や `!Fx` でソースから捕捉した値の置き場。状態は state.vars（名前→値の表）で、
+    このクラスは名前の正規化と未定義判定を隠すだけの薄い層。捕捉されていない
+    名前を引くと 0 を返す。
 
     値とは別に「未定義ラベル由来か」の札（state.vars_undef）も持つ。put() は
     札を降ろし、put_tagged() は明示した札を立てる。捕捉時に判っている事実を
@@ -1901,6 +1903,9 @@ class VariableManager:
         c = self._index(s)
         if c is None:
             return
+        # caxx.c が束縛のときスロットを作るのに合わせ、名前を覚えておく。
+        # 文字列テンプレートが「これは変数の名前か」を見るのに使う。
+        self.state.varnames.add(c)
         if isinstance(v, Decimal):
             if not v.is_finite():
                 self.state.vars[c] = float(v)
@@ -2076,7 +2081,7 @@ class LabelManager:
 class SymbolManager:
     """パターンファイルの `.setsym` で定義されたシンボルを引く。
     
-    レジスタ名などの「小文字1文字パターン」が照合時にここを参照する。
+    レジスタ名などの「小文字で始まる名前のパターン」が照合時にここを参照する。
     名前は大小文字を区別せずに解決する。
     """
 
@@ -3042,24 +3047,18 @@ class ExpressionEvaluator:
     def _patvar_len_at(self, s, idx):
         """位置 idx から読めるパターン変数名の長さ。変数でなければ 0。
 
-        登録済みの2文字以上の名前（`var_2` 等）を最長一致で先に見て、無ければ
-        従来どおり「直後がラベル構成文字でない小文字1文字」を変数とする。
-        caxx.c の var_registered_len_at() と同じ規則である。
+        小文字で始まり小文字・数字・`_` が続くひと続きを、長さによらず
+        パターン変数の名前とする。`a` も `var_2` も同じ規則で、宣言や
+        捕捉の有無は問わない（捕捉されていない変数は 0 を返す）。
+        直後にラベル構成文字（大文字や `.`）が続くときだけ、変数ではなく
+        ラベルとして読む。caxx.c の pat_var_len_at() と同じ規則である。
         """
-        best = 0
-        for nm in self.state.varnames:
-            n = len(nm)
-            if n <= best or not s.startswith(nm, idx):
-                continue
-            if idx + n < len(s) and s[idx + n] in self.state.lwordchars:
-                continue
-            best = n
-        if best:
-            return best
-        if (idx < len(s) and s[idx] in LOWER
-                and (idx + 1 >= len(s) or s[idx + 1] not in self.state.lwordchars)):
-            return 1
-        return 0
+        n = PatternMatcher._var_name_at(s, idx)
+        if n == 0:
+            return 0
+        if idx + n < len(s) and s[idx + n] in self.state.lwordchars:
+            return 0
+        return n
 
     def expression_pat(self, s, idx):
         return self._expression_in(s, idx, EXP_PAT, CAPS_PAT)
@@ -3535,8 +3534,7 @@ class DirectiveProcessor:
         for ch in v[1:]:
             if not ('a' <= ch <= 'z' or ch.isdigit() or ch == '_'):
                 return None
-        if len(v) > 1:
-            self.state.varnames.add(v)
+        self.state.varnames.add(v)
         return v
 
     def elem_list_expand(self, text):
@@ -3665,7 +3663,7 @@ class DirectiveProcessor:
           - `.setsym` の数値シンボル・文字列シンボル・配列シンボル
           - `.sub` の表
           - `.check` の候補（どの変数の一覧に入っていても取り除く）
-          - 名前が小文字1文字なら、その変数の `.check` と `.enum` ごと
+          - 名前が変数として読める綴りなら、その変数の `.check` と `.enum` ごと
         で、`.clearsym` などと同じく書かれた位置から先に効く。
         caxx.c の dir_free() と同じ規則である。
         """
@@ -3690,7 +3688,7 @@ class DirectiveProcessor:
                 self.state.check_constraints[var] = [x for x in syms if x != key]
             # 名前が変数そのものなら、その変数の制約と列挙ごと外す。
             _v = nm.lower()
-            if _v in self.state.varnames or (len(_v) == 1 and _v in LOWER):
+            if _v and PatternMatcher._var_name_at(_v, 0) == len(_v):
                 self.state.check_constraints.pop(_v, None)
                 self.state.enum_defs.pop(_v, None)
         return True
@@ -3798,7 +3796,7 @@ class PatternMatcher:
     
     字句解析をせず1文字ずつ突き合わせる。パターン側の文字の意味は:
       大文字        大小無視でリテラル一致（ニーモニック）
-      小文字1文字   .setsym のシンボル（レジスタ名等）を取る
+      小文字の名前  .setsym のシンボル（レジスタ名等）を取る
       `!x`          任意の式を読んで変数 x に束縛
       `!!x`         式ではなく factor 1個だけを束縛
       `!Fx`/`!Dx`/`!Qx`  浮動小数点式を IEEE754 の 32/64/128bit として束縛
@@ -3860,8 +3858,8 @@ class PatternMatcher:
         return n
 
     def _var_declare(self, name):
-        """2文字以上の名前を「この表の変数」として登録する。"""
-        if len(name) > 1:
+        """名前を「この表の変数」として登録する。長さは問わない。"""
+        if name:
             self.state.varnames.add(name)
         return name
 
@@ -6306,8 +6304,8 @@ class ObjectGenerator:
                         i = cp + 1
                         continue
             if 'a' <= c <= 'z':
-                # 小文字で始まる名前。1文字ならパターン変数、それより長ければ
-                # `var1` `var_2` のような文字列シンボルの名前として引く。
+                # 小文字で始まる名前。文字列シンボルにあればその文字列、
+                # 無ければパターン変数の値（`a` でも `var_2` でも同じ）。
                 j = i + 1
                 while j < len(s) and (s[j].islower() or s[j].isdigit() or s[j] == '_'):
                     j += 1
@@ -6359,7 +6357,7 @@ class ObjectGenerator:
 
         優先順位は
           1. `.setsym::名前::"文字列"` の文字列シンボル … その文字列
-          2. 1文字の小文字                             … パターン変数の値（10進）
+          2. 変数として使われている名前                 … パターン変数の値（10進）
           3. どれでもない                               … 書かれたままの文字
         で、`Rr` の `r` は 2 に、`{{x}}` の `x` は 1 に当たる。
         数値シンボルをここで引かないのは、`num=` のような普通の文（たまたま
@@ -6374,9 +6372,12 @@ class ObjectGenerator:
         if key in self.state.arrsymbols:
             return ','.join(v if isinstance(v, str) else self._txt_radix(v, 10)
                             for v in self.state.arrsymbols[key])
-        # 登録済みのパターン変数（1文字でも `var_2` のように長くてもよい）。
+        # パターン変数（`a` でも `var_2` でも同じ規則）。パターンファイルが
+        # その名前を変数として使っていれば値を、そうでなければ書かれたままの
+        # 文字を出す。ふつうの単語が黙って数字に化けないようにするためで、
+        # 変数と決まっている名前が未束縛なら 0 になる。
         _v = name.lower()
-        if _v in self.state.varnames or (len(_v) == 1 and 'a' <= _v <= 'z'):
+        if _v == name and _v in self.state.varnames:
             return self._txt_radix(self.state.vars.get(_v, VAR_UNDEF), 10)
         return name
 

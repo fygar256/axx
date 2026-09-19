@@ -193,7 +193,7 @@ capability descriptor). Called from the mini language it looks like this:
 | Label / `.equ` | yes | yes |
 | `$$` / `$.` | yes | yes |
 | `#symbol` | yes | yes |
-| Pattern variables `a`-`z` | yes | **no** |
+| Pattern variables | yes | **no** |
 | `!!!` / `!!!!` | yes | **no** |
 
 Pattern variables are dropped because nothing has bound them at the time a
@@ -384,7 +384,7 @@ i=i+1
   labels, `.equ`, `$.` — including forward-referenced labels. An array argument
   is written `[expr, expr, ...]`.
 - **Variable namespaces are separate.** Mini-language variables have nothing to do
-  with pattern variables `a`–`z` or with `.setsym` symbols; pass what you need as
+  with pattern variables or with `.setsym` symbols; pass what you need as
   an argument.
 - **An argument derived from an undefined label arrives as 0,** so a sentinel
   value cannot blow up a loop count while instruction sizes are being measured in

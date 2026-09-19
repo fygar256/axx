@@ -355,12 +355,18 @@ are used by `.check`, `.enum`, `.clrcheck`, `.clrenum`, `.map` and `.free`.
 INC reg,!imm_1 :: :: 0x03|reg,imm_1
 ```
 
-A name longer than one letter is recognised in `error_patterns` and
-`binary_list` only after the pattern file has declared it — by capturing it
-(`!imm_1`), by naming it as a symbol position, or by a directive that takes a
-variable (`.check::reg::…`). Undeclared words there stay labels, exactly as
-before, so a name like `a1` still reads as a label unless a pattern declared it
-as a variable.
+Length makes no difference: `a` and `var_2` are read by the same rule. In
+`error_patterns` and `binary_list`, a run of text that starts with a lowercase
+letter is a variable, whether or not this line captured it — an uncaptured name
+reads as 0, the same as an unmatched optional operand. Nothing has to be
+declared first.
+
+A bare lowercase word there is therefore never a label. The run stops at the
+first character that is not a lowercase letter, a digit or `_`, and if the
+character that follows is one a label may contain (an upper-case letter or `.`),
+the whole word is a label after all — so `aB` and `a.b` still read as labels,
+while `a1` and `var_2` are variables. A label a pattern line has to name must
+therefore carry an upper-case letter or a `.` somewhere in it.
 
 Assembly lines are case-insensitive except for labels and section names.
 
@@ -435,7 +441,7 @@ Inside the string:
 | `.dec(<expr>)` | Decimal digits of the value |
 | `.bin(<expr>)` | Binary digits of the value |
 | `.float(<expr>)` | The value as a decimal 128-bit floating point number, 34 significant digits (`16` becomes `16.0`) |
-| a lowercase name | A string symbol, or a single-letter pattern variable — see below |
+| a lowercase name | A string symbol, or a pattern variable — see below |
 | `\<char>` | `<char>` literally — the way to write a literal lowercase letter |
 
 The four conversions may be written inside `{{ }}` or on their own, directly in
@@ -456,12 +462,20 @@ lowercase letters, digits and `_`, so `abcdef`, `var1` and `var_2` are each a
 single name. A name resolves in this order:
 
 1. a **string symbol** — `.setsym::<name>::"<text>"` — inserts its text;
-2. a **single lowercase letter** — the value of that pattern variable, in decimal;
+2. a **name the pattern file uses as a variable** — `a` and `var_2` alike — the
+   value of that variable, in decimal;
 3. anything else — the characters as written.
 
 That is why `Rr` becomes `R1`: `R` is upper case and therefore literal, and `r`
-is a single letter bound by `!r`. Mnemonic text is written in upper case, and a
-literal lowercase letter is escaped with a backslash.
+is bound by `!r`. Mnemonic text is written in upper case, and a literal
+lowercase letter is escaped with a backslash.
+
+Rule 2 asks whether the pattern file ever uses that name as a variable — by
+capturing it, assigning to it, or naming it in a directive that takes one. A
+word it never uses that way falls through to rule 3 and stays text, so a
+template can spell out lowercase mnemonics. This is the one place where a
+name's history matters: in an expression, every lowercase name is a variable
+and an uncaptured one is simply 0.
 
 Numeric `.setsym` symbols are deliberately *not* looked up here, so ordinary
 words in the text are never silently replaced by a number. Write `{{#NAME}}`
@@ -930,7 +944,7 @@ reused without having to remember which directive defined it. It clears:
 - the `.setsym` numeric, string and array symbol of that name;
 - the `.sub` table of that name;
 - that name wherever it appears as a candidate in a `.check` list;
-- and, when the name is a single lowercase letter, that variable's whole
+- and, when the name reads as a variable name, that variable's whole
   `.check` list and its `.enum`.
 
 Like `.clearsym` and `.clrcheck`, `.free` is positional: patterns written above
@@ -1217,7 +1231,7 @@ d = target - $.
 .endfunc
 ```
 
-Pattern variables `a`-`z` and `!!!` are *not* available there: nothing has
+Pattern variables and `!!!` are *not* available there: nothing has
 bound them while a `.func` body runs, so pass them in at the call site as
 `.call f(a,b)`. [Section 6.3](#63-what-is-available-where) has the full table.
 A value derived from an undefined label comes through as 0, the same treatment
@@ -1761,7 +1775,7 @@ decides, so the feature set changes with the moment of the call:
 | Label / `.equ` | yes | yes | yes | previous iteration's value |
 | `$$` / `$.` | yes | yes | yes | `$` / `$$`, previous iteration |
 | `#symbol` | yes | yes | yes | — |
-| Pattern variables `a`-`z` | yes | uppercase only | no | no |
+| Pattern variables | yes | uppercase only | no | no |
 | `!!!` / `!!!!` | yes | no | no | no |
 | `@`, `'`, `*(x,y)` | yes | yes | yes | yes |
 
