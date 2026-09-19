@@ -7933,14 +7933,92 @@ static void txt_radix(TxtBuf *t, uint256_t v, int radix){
     while(n > 0) txt_addc(t, tmp[--n]);
 }
 
-/* `.float(式)` の出力。整数として束縛された値はその値の実数表記
- * （16 なら `16.0`）になる。 */
-static void txt_float(TxtBuf *t, double d){
-    char tmp[64];
-    snprintf(tmp, sizeof(tmp), "%.17g", d);
-    /* `%.17g` は 16 を "16" と書くので、小数点が無ければ `.0` を足す。 */
-    if(!strpbrk(tmp, ".eEni")) strncat(tmp, ".0", sizeof(tmp)-strlen(tmp)-1);
-    txt_adds(t, tmp);
+/* `.float(式)` は値を10進128ビット浮動小数点数（有効数字34桁）として書く。
+ * 表記は「digits を d1.d2d3… ×10^exp10 と読む」形に正規化してから組み立てる。
+ * 指数が小さいうちは普通の小数表記にし、小数部が無ければ `.0` を付ける
+ * （16 なら `16.0`）。axx.py の _txt_float_parts() と同じ規則である。 */
+#define TXT_FLOAT_PREC 34
+
+static void txt_float_emit(TxtBuf *t, int neg, char *digits, int ndig, int exp10){
+    while(ndig > 1 && digits[ndig-1] == '0') digits[--ndig] = '\0';
+    if(neg) txt_addc(t, '-');
+    if(exp10 >= -6 && exp10 < TXT_FLOAT_PREC){
+        if(exp10 >= ndig-1){
+            txt_addn(t, digits, (size_t)ndig);
+            for(int i = 0; i < exp10-(ndig-1); i++) txt_addc(t, '0');
+            txt_adds(t, ".0");
+        } else if(exp10 >= 0){
+            txt_addn(t, digits, (size_t)(exp10+1));
+            txt_addc(t, '.');
+            txt_adds(t, digits + exp10 + 1);
+        } else {
+            txt_adds(t, "0.");
+            for(int i = 0; i < -exp10-1; i++) txt_addc(t, '0');
+            txt_adds(t, digits);
+        }
+    } else {
+        txt_addc(t, digits[0]);
+        txt_addc(t, '.');
+        txt_adds(t, ndig > 1 ? digits+1 : "0");
+        char e[16];
+        snprintf(e, sizeof(e), "e%c%02d", exp10 < 0 ? '-' : '+',
+                 exp10 < 0 ? -exp10 : exp10);
+        txt_adds(t, e);
+    }
+}
+
+/* 整数として束縛された値。10進の桁をそのまま取り出し、34桁を超える分は
+ * 四捨五入して落とす。 */
+static void txt_float_int(TxtBuf *t, uint256_t v){
+    int neg = 0;
+    if(u256_lt_signed(v, u256_zero())){ neg = 1; v = u256_sub(u256_zero(), v); }
+    char rev[96];
+    int n = 0;
+    uint256_t ten = u256_from_u64(10);
+    if(u256_is_zero(v)) rev[n++] = '0';
+    while(!u256_is_zero(v) && n < (int)sizeof(rev)){
+        uint256_t q = u256_udiv(v, ten);
+        rev[n++] = (char)('0' + (int)u256_to_u64(u256_sub(v, u256_mul(q, ten))));
+        v = q;
+    }
+    char all[128];
+    for(int i = 0; i < n; i++) all[i] = rev[n-1-i];
+    all[n] = '\0';
+    int exp10 = n - 1;
+    if(n > TXT_FLOAT_PREC){
+        int round_up = (all[TXT_FLOAT_PREC] >= '5');
+        all[TXT_FLOAT_PREC] = '\0';
+        n = TXT_FLOAT_PREC;
+        if(round_up){
+            int i = n - 1;
+            while(i >= 0){
+                if(all[i] != '9'){ all[i]++; break; }
+                all[i--] = '0';
+            }
+            /* 全桁が繰り上がったら桁が1つ増える。 */
+            if(i < 0){ memmove(all+1, all, (size_t)n+1); all[0] = '1'; exp10++; }
+        }
+    }
+    txt_float_emit(t, neg, all, n, exp10);
+}
+
+/* 浮動小数として束縛された値。34桁に正しく丸めた10進を取り出す。 */
+static void txt_float_double(TxtBuf *t, double d){
+    if(!(d == d) || d > 1.0e308*10 || d < -1.0e308*10){
+        txt_adds(t, (d == d) ? (d > 0 ? "inf" : "-inf") : "nan");
+        return;
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.*e", TXT_FLOAT_PREC-1, d);
+    int neg = 0, k = 0;
+    if(buf[k] == '-'){ neg = 1; k++; }
+    char digits[TXT_FLOAT_PREC+1];
+    int n = 0;
+    for(; buf[k] && buf[k] != 'e' && buf[k] != 'E'; k++)
+        if(buf[k] != '.' && n < TXT_FLOAT_PREC) digits[n++] = buf[k];
+    digits[n] = '\0';
+    int exp10 = (buf[k] == 'e' || buf[k] == 'E') ? atoi(buf+k+1) : 0;
+    txt_float_emit(t, neg, digits, n, exp10);
 }
 
 /* 数値変換の直前にある `0X` `0B` `0F` を小文字へ倒す。 */
@@ -7989,7 +8067,12 @@ static void txt_emit_expr(Assembler *asmb, TxtBuf *t, const char *expr, int kind
     switch(kind){
     case 0: txt_lower_radix_prefix(t, before); txt_radix(t, v, 16); break;
     case 2: txt_lower_radix_prefix(t, before); txt_radix(t, v, 2);  break;
-    case 3: txt_lower_radix_prefix(t, before); txt_float(t, u256_int_to_double(v)); break;
+    case 3:
+        txt_lower_radix_prefix(t, before);
+        /* 浮動小数として評価された式はビット列を、そうでなければ整数値を読む。 */
+        if(st->exp_typ_float) txt_float_double(t, u256_to_double(v));
+        else                  txt_float_int(t, v);
+        break;
     default: txt_radix(t, v, 10); break;
     }
 }

@@ -417,7 +417,7 @@ Inside the string:
 | `.hex(<expr>)` | Hexadecimal digits of the value |
 | `.dec(<expr>)` | Decimal digits of the value |
 | `.bin(<expr>)` | Binary digits of the value |
-| `.float(<expr>)` | The value as a real number (`16` becomes `16.0`) |
+| `.float(<expr>)` | The value as a decimal 128-bit floating point number, 34 significant digits (`16` becomes `16.0`) |
 | lowercase `a`–`z` | The value of that pattern variable, in decimal |
 | `\<char>` | `<char>` literally — the way to write a literal lowercase letter |
 
@@ -427,6 +427,12 @@ yourself. When a conversion is immediately preceded by `0X`, `0B` or `0F`, that
 prefix is lowered to `0x`, `0b` or `0f` to match the usual convention of the
 target syntax.
 
+`.float` renders the value as a decimal 128-bit floating point number: 34
+significant digits, rounded half to even. A value with no fractional part still
+gets one, so `16` is written `16.0`. Beyond 34 digits, or for very small
+magnitudes, it switches to exponent form (`1.234567890123456789012345678901235e+36`).
+Both implementations produce byte-identical text.
+
 Every lowercase letter in the template is a pattern variable, which is why
 `Rr` becomes `R1`. Mnemonic text is therefore written in upper case, and a
 literal lowercase letter is escaped with a backslash.
@@ -435,7 +441,7 @@ literal lowercase letter is escaped with a backslash.
 MOV R!r,!e:: "LD Rr,0X{{.hex(e)}}"    ->  LD R1,0x10
 MOV R!r,!e:: "LD Rr,{{.dec(e)}}"      ->  LD R1,16
 MOV R!r,!e:: "LD Rr,0B{{.bin(e)}}"    ->  LD R1,0b10000
-MOV R!r,!e:: "LD Rr,0F.float(e)"      ->  LD R1,0f16.0
+MOV R!r,!e:: "LD Rr,0F{{.float(e)}}"  ->  LD R1,0f16.0
 ```
 
 Where the text goes:

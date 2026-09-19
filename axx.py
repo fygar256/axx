@@ -30,7 +30,7 @@
 """
 
 
-from decimal import Decimal, localcontext, ROUND_HALF_EVEN
+from decimal import Decimal, Context, localcontext, ROUND_HALF_EVEN
 try:
     import readline
 except ImportError:
@@ -5815,13 +5815,45 @@ class ObjectGenerator:
                 n //= radix
         return ('-' + body) if neg else body
 
-    @staticmethod
-    def _txt_float(v):
-        """`.float(式)` の出力。16 なら `16.0`。"""
-        t = repr(float(v))
-        if not any(c in t for c in '.eEni'):
-            t += '.0'
-        return t
+    # `.float(式)` は値を10進128ビット浮動小数点数（有効数字34桁）として書く。
+    _TXT_FLOAT_PREC = 34
+
+    @classmethod
+    def _txt_float_parts(cls, neg, digits, exp10):
+        """digits を d1.d2d3… ×10^exp10 と読んで文字列にする。
+
+        指数が小さいうちは普通の小数表記にし、小数部が無ければ `.0` を付ける
+        （16 なら `16.0`）。caxx.c の txt_float_emit() と同じ規則である。
+        """
+        digits = digits.rstrip('0') or '0'
+        n = len(digits)
+        if -6 <= exp10 < cls._TXT_FLOAT_PREC:
+            if exp10 >= n - 1:
+                body = digits + '0' * (exp10 - (n - 1)) + '.0'
+            elif exp10 >= 0:
+                body = digits[:exp10 + 1] + '.' + digits[exp10 + 1:]
+            else:
+                body = '0.' + '0' * (-exp10 - 1) + digits
+        else:
+            frac = digits[1:] if n > 1 else '0'
+            body = '%s.%se%s%02d' % (digits[0], frac,
+                                     '-' if exp10 < 0 else '+', abs(exp10))
+        return ('-' + body) if neg else body
+
+    @classmethod
+    def _txt_float(cls, v):
+        """整数・実数のどちらで束縛された値でも、34桁に丸めて書く。"""
+        prec = cls._TXT_FLOAT_PREC
+        if isinstance(v, float):
+            if v != v or v in (float('inf'), float('-inf')):
+                return 'nan' if v != v else ('inf' if v > 0 else '-inf')
+            d = Context(prec=prec).create_decimal(Decimal(v))
+        else:
+            d = Context(prec=prec).create_decimal(Decimal(int(v)))
+        sign, digits, dexp = d.as_tuple()
+        digits = ''.join(str(x) for x in digits) or '0'
+        # as_tuple() の指数は最下位桁の重み。d1.d2… ×10^exp10 の形へ直す。
+        return cls._txt_float_parts(sign == 1, digits, len(digits) - 1 + dexp)
 
     @staticmethod
     def _txt_lower_radix_prefix(parts):
