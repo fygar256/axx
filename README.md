@@ -18,7 +18,7 @@ RET :: 0xc3
 That one line is a complete assembler for the x86_64 `RET` instruction. Stack up lines in the same shape (`instruction syntax :: error conditions :: output bytes`) and you get an assembler for anything from the Intel 4004 to x86_64 with AVX-512.
 
 - GitHub: https://github.com/fygar256/axx
-- Author: fygar256 (Taisuke Maekawa)
+- Author: fygar256 (Taisuke Maekawa/前川田井介)
 - License: MIT
 
 ## Why it exists
