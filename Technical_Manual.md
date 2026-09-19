@@ -525,6 +525,23 @@ location counter, or to any binary or ELF output.
 .setsym :: name :: value
 ```
 
+One directive defines every kind of symbol; what the value field looks like
+decides which kind it is:
+
+| Value field | Defines |
+|---|---|
+| `0x20`, `#OTHER+1` | a **numeric symbol** — any pattern expression |
+| `"LD"` | a **string symbol** — text for a template (3.5.2) |
+| `[1,"A",#B]` | an **array symbol** — a list of numbers and text (3.6.1) |
+| `other` | a **copy** of that string or array symbol (3.6.1) |
+| `r0,r1,r2` | a **set** — a list of names (3.6.2) |
+| `a&b`, `a\|b`, `a^b`, `a+b`, `a-b` | a **set** computed from other sets (3.6.2) |
+
+The special forms — a quote, a bracket, a bare name, a list of names, a set
+expression — are recognised as such wherever they fit; a field that is none of
+them is read as a numeric expression. Each form is described in the section
+named beside it.
+
 A symbol name may contain letters, digits and symbol characters. Symbols are
 case-insensitive. A later definition of the same name overrides an earlier one,
 so the same identifier can mean different things in different regions of the
@@ -653,6 +670,63 @@ The same rule means that writing a negative value where the pattern expects a
 symbol — `ASR #-1` when the instruction has no immediate form — is reported as
 `undefined symbol: '#-1'` rather than as a range error.
 
+#### 3.6.2 Sets
+
+A value field that is a plain list of names, separated by commas, makes a
+**set**:
+
+```
+.setsym::a::a1,a2,a3
+.setsym::b::b1,b2,b3,a2
+```
+
+A set is an array symbol whose items are those names, so everything in section
+3.6.1 applies to it — `.check::x::a`, `.map::x::a::…`, `.enum::f::a::…`, and
+`{{a}}` or `{{a[0]}}` in a template all work. Its items are names rather than
+numbers, so `#a[0]` in an expression reports a string item as it would for any
+other array of text. Names are upper cased like any other symbol name, and a
+name repeated in the list is kept once. A name in the list that is itself a set
+is expanded in place, so `.setsym::c::a,b` is the union of the two.
+
+**Set algebra.** Sets combine with five operators:
+
+| Written | Result |
+|---|---|
+| `a&b` | intersection — the names in both |
+| `a\|b` | union — the names in either |
+| `a+b` | union, the same as `a\|b` |
+| `a^b` | symmetric difference — the names in one but not the other |
+| `a-b` | difference — the names in `a` that are not in `b` |
+
+```
+.setsym::x::a&b        /* A2                      */
+.setsym::y::a|b        /* A1,A2,A3,B1,B2,B3       */
+.setsym::z::a^b        /* A1,A3,B1,B2,B3          */
+.setsym::t::a+b        /* A1,A2,A3,B1,B2,B3       */
+.setsym::q::a-b        /* A1,A3                   */
+```
+
+Each result is an independent copy, so redefining `a` afterwards leaves `x`
+… `q` as they were, and `.setsym::a::a|b` is safe.
+
+Order follows the first appearance of each name: the left operand's names
+first, then the right operand's. Operators are applied left to right with no
+precedence of their own, so `a&b|c` means `(a&b)|c`.
+
+**When the field is not a set.** The set reading is tried before the ordinary
+numeric one and gives way to it whenever the field cannot be a set, so nothing
+that assembled before changes meaning:
+
+- every item of a comma list must be a name — a list whose items start with a
+  digit, such as `.setsym::X::1,2`, is left to the expression evaluator;
+- every operand of an operator must be a bare identifier naming an existing
+  set — `.setsym::X::#N1+#N2` adds two numeric symbols as it always did;
+- a field holding a single name is a copy (section 3.6.1), not a one-element
+  set. Write `.setsym::a::["A1"]` for that.
+
+Because `-`, `&` and `|` may appear inside a symbol name, an operand is only
+recognised as a set when it is spelled with letters, digits and `_` alone.
+
 ### 3.7 Symbol check (`.check`)
 
 ```
@@ -661,7 +735,7 @@ symbol — `ASR #-1` when the instruction has no immediate form — is reported 
 
 Restricts what may appear at the position captured by `x`. Anything else is an
 error. `.clrcheck::x` removes the restriction. The list may be an array symbol
-(section 3.6.1), or a mix of arrays and plain names.
+(section 3.6.1) or a set (section 3.6.2), or a mix of those and plain names.
 
 **`.check` is worth setting whenever a lowercase variable is reused for more
 than one class of operand.** Without it the variable accepts *any* symbol
@@ -972,7 +1046,7 @@ FOO EAX{K2},EBX      -> 0x90 0x02 0x00 0x01
 Removes each name from every table the pattern layer keeps, so the name can be
 reused without having to remember which directive defined it. It clears:
 
-- the `.setsym` numeric, string and array symbol of that name;
+- the `.setsym` numeric, string, array and set symbol of that name;
 - the `.sub` table of that name;
 - that name wherever it appears as a candidate in a `.check` list;
 - and, when the name reads as a variable name, that variable's whole

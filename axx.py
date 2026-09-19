@@ -317,6 +317,8 @@ def _lead_caps(pat_text):
 # 小文字＝.setsym で定義されたシンボル（レジスタ名等）を取るプレースホルダ。
 CAPITAL = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 LOWER = "abcdefghijklmnopqrstuvwxyz"
+# 集合式の演算子（`.setsym::x::a&b` など）。
+SET_OPS = "&|^+-"
 DIGIT = '0123456789'
 XDIGIT = "0123456789ABCDEF"
 ALPHABET = LOWER + CAPITAL
@@ -3314,6 +3316,9 @@ class DirectiveProcessor:
         # `.setsym::y::x` — x が文字列／配列シンボルなら、その写しを作る。
         if symbol_copy_from_name(self.state, key, _vf):
             return True
+        # `名前,名前,…` は名前の集合、`a&b` などは集合どうしの演算。
+        if symbol_set_from_text(self.state, key, value_field):
+            return True
         if value_field:
             v, idx = self.expr_eval.expression_pat(value_field, 0)
         else:
@@ -3602,32 +3607,6 @@ class DirectiveProcessor:
             self.state.check_constraints.clear()
         return True
 
-    @staticmethod
-    def _map_value_split(text):
-        """`.map` の値欄を最上位のカンマで切る。
-
-        括弧の中のカンマは区切りにしない（`*(x,1)` のような式がそのまま
-        1項目になるようにするため）。深さの数え方は expression_esc() と
-        同じで、閉じ括弧の種類は厳密に照合しない。
-        caxx.c の map_value_split() と同じ規則である。
-        """
-        items = []
-        buf = []
-        depth = 0
-        for ch in text:
-            if ch in '([{':
-                depth += 1
-            elif ch in ')]}':
-                if depth > 0:
-                    depth -= 1
-            elif ch == ',' and depth == 0:
-                items.append(''.join(buf).strip())
-                buf = []
-                continue
-            buf.append(ch)
-        items.append(''.join(buf).strip())
-        return items
-
     def map_apply(self, i, into=None, set_check=True):
         """`.map::<変数>::<名前の並び>::<式>`
         `.map::<変数>::<名前の並び>::<値,値,…>`
@@ -3673,7 +3652,7 @@ class DirectiveProcessor:
         elems = self.elem_list_expand(syms_str)
         # 値欄が最上位のカンマで区切られていれば、並びと1対1の値のリスト。
         # 1項目しか無ければ従来どおり「変数を含む式」1本として扱う。
-        vals = self._map_value_split(expr_str)
+        vals = split_top_commas(expr_str)
         if len(vals) > 1 and len(vals) != len(elems):
             self.state.diag(f" error - .map: the value list has {len(vals)} items "
                             f"but the name list has {len(elems)}.", set_error=True)
@@ -6571,6 +6550,155 @@ def arr_items_from_text(expr_eval, q):
 
 
 
+def split_top_commas(text):
+    """文字列を最上位のカンマで切る。
+
+    括弧の中のカンマは区切りにしない（`*(x,1)` のような式がそのまま1項目に
+    なるようにするため）。深さの数え方は expression_esc() と同じで、閉じ括弧の
+    種類は厳密に照合しない。caxx.c の split_top_commas() と同じ規則である。
+    """
+    items = []
+    buf = []
+    depth = 0
+    for ch in text:
+        if ch in '([{':
+            depth += 1
+        elif ch in ')]}':
+            if depth > 0:
+                depth -= 1
+        elif ch == ',' and depth == 0:
+            items.append(''.join(buf).strip())
+            buf = []
+            continue
+        buf.append(ch)
+    items.append(''.join(buf).strip())
+    return items
+
+
+def _set_name_token(t):
+    """集合の要素として書ける名前なら大文字化して返す。でなければ None。
+
+    数字で始まるものと空白を含むものは名前とみなさない。`.setsym::X::1,2` の
+    ような数式が集合に化けないようにするためである。
+    """
+    t = t.strip()
+    if not t or not t.isascii() or t[0] in DIGIT:
+        return None
+    for ch in t:
+        if ch in ' \t':
+            return None
+    return StringUtils.upper(t)
+
+
+def set_items_dedupe(items):
+    """並び順は保ったまま重複を落とす。集合なので同じ要素は1つだけ持つ。"""
+    out = []
+    for it in items:
+        if it not in out:
+            out.append(it)
+    return out
+
+
+def set_literal_from_text(state, text):
+    """`名前,名前,…` を集合の項目にする。集合として読めなければ None。
+
+    項目に既存の集合の名前を書くと、その中身をその場に展開する。
+    caxx.c の set_literal_from_text() と同じ規則である。
+    """
+    parts = split_top_commas(text)
+    if len(parts) < 2:
+        return None
+    items = []
+    for p in parts:
+        nm = _set_name_token(p)
+        if nm is None:
+            return None
+        arr = state.arrsymbols.get(nm)
+        if arr is not None:
+            items.extend(arr)
+        else:
+            items.append(nm)
+    return set_items_dedupe(items)
+
+
+def _set_operand(state, t):
+    """集合式の被演算子。素の識別子で、既にある集合ならその項目を返す。"""
+    t = t.strip()
+    if not t or not t.isascii():
+        return None
+    if not (t[0].isalpha() or t[0] == '_'):
+        return None
+    for ch in t[1:]:
+        if not (ch.isalnum() or ch == '_'):
+            return None
+    arr = state.arrsymbols.get(StringUtils.upper(t))
+    return None if arr is None else set_items_dedupe(list(arr))
+
+
+def set_expr_from_text(state, text):
+    """集合どうしの演算を評価する。集合式として読めなければ None。
+
+        a&b   積集合（and 集合）
+        a|b   和集合（or 集合）
+        a^b   対称差（xor 集合）
+        a+b   和集合
+        a-b   差集合
+
+    被演算子はすべて既にある集合であること。演算子は左から順に適用し、
+    優先順位は無い。caxx.c の set_expr_from_text() と同じ規則である。
+    """
+    toks = []
+    cur = []
+    for ch in text:
+        if ch in SET_OPS:
+            toks.append(''.join(cur))
+            toks.append(ch)
+            cur = []
+        else:
+            cur.append(ch)
+    toks.append(''.join(cur))
+    if len(toks) < 3:
+        return None                     # 演算子が1つも無い
+    acc = _set_operand(state, toks[0])
+    if acc is None:
+        return None
+    k = 1
+    while k + 1 < len(toks):
+        op = toks[k]
+        rhs = _set_operand(state, toks[k + 1])
+        if rhs is None:
+            return None
+        if op == '&':
+            acc = [x for x in acc if x in rhs]
+        elif op in '|+':
+            acc = acc + [x for x in rhs if x not in acc]
+        elif op == '^':
+            acc = ([x for x in acc if x not in rhs]
+                   + [x for x in rhs if x not in acc])
+        else:
+            acc = [x for x in acc if x not in rhs]
+        k += 2
+    return acc
+
+
+def symbol_set_from_text(state, dst_upper, value_field):
+    """値欄が集合の書き方なら、その集合を作って True を返す。
+
+        .setsym::a::a1,a2,a3      名前の集合
+        .setsym::x::a&b           既にある集合どうしの演算
+
+    結果は写しなので、あとで元の集合を書き換えても影響しない。
+    caxx.c の symbol_set_from_text() と同じ規則である。
+    """
+    items = set_expr_from_text(state, value_field)
+    if items is None:
+        items = set_literal_from_text(state, value_field)
+    if items is None:
+        return False
+    state.arrsymbols[dst_upper] = items
+    return True
+
+
 def symbol_copy_from_name(state, dst_upper, value_field):
     """値欄が「名前ひとつ」で、それが文字列／配列シンボルなら複製する。
 
@@ -9230,6 +9358,9 @@ class Assembler:
                         continue
                     # `.setsym::y::x` — x が文字列／配列シンボルなら写しを作る。
                     if symbol_copy_from_name(self.state, key, _vf):
+                        continue
+                    # `名前,名前,…` は名前の集合、`a&b` などは集合どうしの演算。
+                    if symbol_set_from_text(self.state, key, value_field):
                         continue
                     if value_field:
                         v, _ = self.expr_eval.expression_pat(value_field, 0)

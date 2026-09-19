@@ -4504,6 +4504,8 @@ static void        arrsym_set_from_text(Assembler *asmb, const char *upper_name,
 static void        arrsym_delete(AsmState *st, const char *upper_name);
 static void        arrsym_clear_all(AsmState *st);
 static int         symbol_copy_from_name(AsmState *st, const char *dst_upper, const char *value_field);
+/* 集合（`.setsym::a::a1,a2,a3` / `.setsym::x::a&b`）。定義は後方にある。 */
+static int         symbol_set_from_text(AsmState *st, const char *dst_upper, const char *value_field);
 
 static int dir_set_symbol(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".setsym")!=0) return 0;
@@ -4526,6 +4528,8 @@ static int dir_set_symbol(Assembler *asmb, PatEntry *e){
         }
         /* `.setsym::y::x` — x が文字列／配列シンボルなら、その写しを作る。 */
         if(symbol_copy_from_name(&asmb->st, key, value_field)) return 1;
+        /* `名前,名前,…` は名前の集合、`a&b` などは集合どうしの演算。 */
+        if(symbol_set_from_text(&asmb->st, key, value_field)) return 1;
     }
     int io;
     uint256_t v = value_field[0] ? expr_expression_pat(asmb,value_field,0,&io) : u256_zero();
@@ -4872,11 +4876,11 @@ static char *map_subst_index(const char *expr, const char *var, int i);
  *
  * into が非NULLならシンボルはそこへ、NULLなら st->symbols へ入れる。
  * set_check が真なら `.check` も設定する。 */
-/* `.map` の値欄を最上位のカンマで切る。括弧の中のカンマは区切りにしない
+/* 文字列を最上位のカンマで切る。括弧の中のカンマは区切りにしない
  * （`*(x,1)` のような式がそのまま1項目になるようにするため）。深さの数え方は
  * expr_expression_esc() と同じで、閉じ括弧の種類は厳密に照合しない。
- * axx.py の _map_value_split() と同じ規則である。 */
-static void map_value_split(const char *text, StrVec *out){
+ * axx.py の split_top_commas() と同じ規則である。 */
+static void split_top_commas(const char *text, StrVec *out){
     int depth = 0;
     const char *b = text;
     char item[1024];
@@ -4912,7 +4916,7 @@ static void map_apply(Assembler *asmb, PatEntry *e, SymMap *into, int set_check)
     /* 値欄が最上位のカンマで区切られていれば、並びと1対1の値のリスト。
      * 1項目しか無ければ従来どおり「変数を含む式」1本として扱う。 */
     StrVec vals; sv_init(&vals);
-    map_value_split(expr_str, &vals);
+    split_top_commas(expr_str, &vals);
     if(vals.len > 1 && vals.len != elems.len){
         axx_diagf(1, 0, " error - .map: the value list has %d items "
                         "but the name list has %d.\n", vals.len, elems.len);
@@ -8339,6 +8343,20 @@ static void arrsym_clear_all(AsmState *st){
     st->arrsyms = NULL; st->arrsyms_len = 0; st->arrsyms_cap = 0;
 }
 
+/* 組み立て済みの項目列をそのまま配列シンボルとして据える（所有権を渡す）。 */
+static void arrsym_install(AsmState *st, const char *dst_upper, SymItem *items, int n){
+    arrsym_delete(st, dst_upper);
+    if(st->arrsyms_len >= st->arrsyms_cap){
+        st->arrsyms_cap = st->arrsyms_cap ? st->arrsyms_cap*2 : 8;
+        st->arrsyms = realloc(st->arrsyms, (size_t)st->arrsyms_cap*sizeof(*st->arrsyms));
+        if(!st->arrsyms){ perror("realloc"); exit(1); }
+    }
+    struct ArrSym *a = &st->arrsyms[st->arrsyms_len++];
+    a->name = strdup(dst_upper);
+    a->items = items;
+    a->len = n;
+}
+
 /* 既にある配列シンボルをそのまま複製する。`.setsym::y::x` 用。 */
 static void arrsym_copy(AsmState *st, const char *dst_upper, const char *src_upper){
     struct ArrSym *src = arrsym_get(st, src_upper);
@@ -8353,16 +8371,7 @@ static void arrsym_copy(AsmState *st, const char *dst_upper, const char *src_upp
         items[i].v      = src->items[i].v;
         items[i].s      = src->items[i].s ? strdup(src->items[i].s) : NULL;
     }
-    arrsym_delete(st, dst_upper);
-    if(st->arrsyms_len >= st->arrsyms_cap){
-        st->arrsyms_cap = st->arrsyms_cap ? st->arrsyms_cap*2 : 8;
-        st->arrsyms = realloc(st->arrsyms, (size_t)st->arrsyms_cap*sizeof(*st->arrsyms));
-        if(!st->arrsyms){ perror("realloc"); exit(1); }
-    }
-    struct ArrSym *a = &st->arrsyms[st->arrsyms_len++];
-    a->name = strdup(dst_upper);
-    a->items = items;
-    a->len = n;
+    arrsym_install(st, dst_upper, items, n);
 }
 
 /* 値欄が「名前ひとつ」で、それが文字列／配列シンボルなら複製する。
@@ -8394,6 +8403,167 @@ static int symbol_copy_from_name(AsmState *st, const char *dst_upper, const char
         return 1;
     }
     return 0;
+}
+
+/* ==================== 集合（名前の並び）====================
+ * `.setsym::a::a1,a2,a3` は名前の集合を作り、`.setsym::x::a&b` のように
+ * 既にある集合どうしを演算できる。集合は配列シンボルとして持つので、
+ * `.check` `.enum` `.map` の並び欄や `{{a}}` からそのまま使える。 */
+
+typedef struct { SymItem *data; int len, cap; } ItemVec;
+
+static void itv_init(ItemVec *v){ v->data = NULL; v->len = 0; v->cap = 0; }
+static void itv_free(ItemVec *v){
+    for(int i=0;i<v->len;i++) free(v->data[i].s);
+    free(v->data);
+    itv_init(v);
+}
+static void itv_push(ItemVec *v, const SymItem *it){
+    if(v->len >= v->cap){
+        v->cap = v->cap ? v->cap*2 : 8;
+        v->data = realloc(v->data, (size_t)v->cap*sizeof(SymItem));
+        if(!v->data){ perror("realloc"); exit(1); }
+    }
+    SymItem *d = &v->data[v->len++];
+    d->is_str = it->is_str;
+    d->v      = it->v;
+    d->s      = it->s ? strdup(it->s) : NULL;
+}
+static int symitem_eq(const SymItem *a, const SymItem *b){
+    if(a->is_str != b->is_str) return 0;
+    if(a->is_str) return strcmp(a->s ? a->s : "", b->s ? b->s : "") == 0;
+    return u256_eq(a->v, b->v);
+}
+static int itv_has(const ItemVec *v, const SymItem *it){
+    for(int i=0;i<v->len;i++) if(symitem_eq(&v->data[i], it)) return 1;
+    return 0;
+}
+/* 集合なので同じ要素は1つだけ持つ。並び順は最初に現れた順。 */
+static void itv_push_unique(ItemVec *v, const SymItem *it){
+    if(!itv_has(v, it)) itv_push(v, it);
+}
+
+/* acc に rhs を演算子 op で作用させる。演算子は左から順に適用する。 */
+static void set_op_apply(ItemVec *acc, const ItemVec *rhs, char op){
+    ItemVec out; itv_init(&out);
+    if(op == '&'){
+        for(int i=0;i<acc->len;i++)
+            if(itv_has(rhs, &acc->data[i])) itv_push_unique(&out, &acc->data[i]);
+    } else if(op == '|' || op == '+'){
+        for(int i=0;i<acc->len;i++) itv_push_unique(&out, &acc->data[i]);
+        for(int i=0;i<rhs->len;i++) itv_push_unique(&out, &rhs->data[i]);
+    } else if(op == '^'){
+        for(int i=0;i<acc->len;i++)
+            if(!itv_has(rhs, &acc->data[i])) itv_push_unique(&out, &acc->data[i]);
+        for(int i=0;i<rhs->len;i++)
+            if(!itv_has(acc, &rhs->data[i])) itv_push_unique(&out, &rhs->data[i]);
+    } else {   /* '-' */
+        for(int i=0;i<acc->len;i++)
+            if(!itv_has(rhs, &acc->data[i])) itv_push_unique(&out, &acc->data[i]);
+    }
+    itv_free(acc);
+    *acc = out;
+}
+
+/* 集合の要素として書ける名前なら大文字化して out へ。でなければ 0。
+ * 数字で始まるものと空白を含むものは名前とみなさない（`.setsym::X::1,2` の
+ * ような数式が集合に化けないようにするため）。 */
+static int set_name_token(const char *t, char *out, size_t outsz){
+    while(*t==' '||*t=='\t') t++;
+    const char *e = t + strlen(t);
+    while(e > t && (e[-1]==' '||e[-1]=='\t')) e--;
+    int n = (int)(e - t);
+    if(n <= 0 || n >= (int)outsz) return 0;
+    if(t[0] >= '0' && t[0] <= '9') return 0;
+    for(int i=0;i<n;i++) if(t[i]==' '||t[i]=='\t') return 0;
+    for(int i=0;i<n;i++) out[i] = (char)axx_upper_char(t[i]);
+    out[n] = '\0';
+    return 1;
+}
+
+/* 集合式の被演算子。素の識別子で、既にある集合ならその項目を out へ。 */
+static int set_operand(AsmState *st, const char *b, int n, ItemVec *out){
+    while(n > 0 && (*b==' '||*b=='\t')){ b++; n--; }
+    while(n > 0 && (b[n-1]==' '||b[n-1]=='\t')) n--;
+    if(n <= 0) return 0;
+    if(!(isalpha((unsigned char)b[0]) || b[0]=='_')) return 0;
+    for(int i=1;i<n;i++)
+        if(!(isalnum((unsigned char)b[i]) || b[i]=='_')) return 0;
+    char nm[512];
+    if(n >= (int)sizeof(nm)) return 0;
+    for(int i=0;i<n;i++) nm[i] = (char)axx_upper_char(b[i]);
+    nm[n] = '\0';
+    struct ArrSym *a = arrsym_get(st, nm);
+    if(!a) return 0;
+    itv_init(out);
+    for(int i=0;i<a->len;i++) itv_push_unique(out, &a->items[i]);
+    return 1;
+}
+
+/* `a&b` `a|b` `a^b` `a+b` `a-b` の集合式を評価する。
+ * 被演算子はすべて既にある集合であること。集合式として読めなければ 0。
+ * axx.py の set_expr_from_text() と同じ規則である。 */
+static int set_expr_from_text(AsmState *st, const char *text, ItemVec *out){
+    ItemVec acc; itv_init(&acc);
+    int have = 0, nops = 0;
+    char op = 0;
+    const char *b = text;
+    for(const char *p = text; ; p++){
+        if(*p=='&' || *p=='|' || *p=='^' || *p=='+' || *p=='-' || *p=='\0'){
+            ItemVec cur;
+            if(!set_operand(st, b, (int)(p - b), &cur)){
+                if(have) itv_free(&acc);
+                return 0;
+            }
+            if(!have){ acc = cur; have = 1; }
+            else { set_op_apply(&acc, &cur, op); itv_free(&cur); nops++; }
+            if(*p == '\0') break;
+            op = *p;
+            b  = p + 1;
+        }
+    }
+    if(nops == 0){ itv_free(&acc); return 0; }   /* 演算子が無ければ集合式ではない */
+    *out = acc;
+    return 1;
+}
+
+/* `名前,名前,…` を集合の項目にする。集合として読めなければ 0。
+ * 項目に既存の集合の名前を書くと、その中身をその場に展開する。
+ * axx.py の set_literal_from_text() と同じ規則である。 */
+static int set_literal_from_text(AsmState *st, const char *text, ItemVec *out){
+    StrVec parts; sv_init(&parts);
+    split_top_commas(text, &parts);
+    if(parts.len < 2){ sv_free(&parts); return 0; }
+    ItemVec v; itv_init(&v);
+    for(int i=0;i<parts.len;i++){
+        char nm[512];
+        if(!set_name_token(parts.data[i], nm, sizeof(nm))){
+            itv_free(&v); sv_free(&parts); return 0;
+        }
+        struct ArrSym *a = arrsym_get(st, nm);
+        if(a){
+            for(int k=0;k<a->len;k++) itv_push_unique(&v, &a->items[k]);
+        } else {
+            SymItem it; it.is_str = 1; it.s = nm; it.v = u256_zero();
+            itv_push_unique(&v, &it);
+        }
+    }
+    sv_free(&parts);
+    *out = v;
+    return 1;
+}
+
+/* 値欄が集合の書き方なら、その集合を作って真を返す。
+ *   .setsym::a::a1,a2,a3   名前の集合
+ *   .setsym::x::a&b        既にある集合どうしの演算
+ * 結果は写しなので、あとで元の集合を書き換えても影響しない。
+ * axx.py の symbol_set_from_text() と同じ規則である。 */
+static int symbol_set_from_text(AsmState *st, const char *dst_upper, const char *value_field){
+    ItemVec items;
+    if(!set_expr_from_text(st, value_field, &items)
+       && !set_literal_from_text(st, value_field, &items)) return 0;
+    arrsym_install(st, dst_upper, items.data, items.len);   /* 所有権を移す */
+    return 1;
 }
 
 /* `[...]` の中身を項目に切って登録する。q は `[` を指していること。
@@ -14148,6 +14318,8 @@ static void setpatsymbols(Assembler *asmb){
                 }
                 /* `.setsym::y::x` — x が文字列／配列シンボルなら写しを作る。 */
                 if(symbol_copy_from_name(&asmb->st, key, value_field)) continue;
+                /* `名前,名前,…` は名前の集合、`a&b` などは集合どうしの演算。 */
+                if(symbol_set_from_text(&asmb->st, key, value_field)) continue;
             }
             int io;
             uint256_t v = value_field[0] ? expr_expression_pat(asmb,value_field,0,&io) : u256_zero();
