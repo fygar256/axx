@@ -418,7 +418,7 @@ Inside the string:
 | `.dec(<expr>)` | Decimal digits of the value |
 | `.bin(<expr>)` | Binary digits of the value |
 | `.float(<expr>)` | The value as a decimal 128-bit floating point number, 34 significant digits (`16` becomes `16.0`) |
-| lowercase `a`–`z` | The value of that pattern variable, in decimal |
+| a lowercase name | A string symbol, or a single-letter pattern variable — see below |
 | `\<char>` | `<char>` literally — the way to write a literal lowercase letter |
 
 The four conversions may be written inside `{{ }}` or on their own, directly in
@@ -433,9 +433,43 @@ gets one, so `16` is written `16.0`. Beyond 34 digits, or for very small
 magnitudes, it switches to exponent form (`1.234567890123456789012345678901235e+36`).
 Both implementations produce byte-identical text.
 
-Every lowercase letter in the template is a pattern variable, which is why
-`Rr` becomes `R1`. Mnemonic text is therefore written in upper case, and a
+**Names in a template.** A run of text starting with a lowercase letter is
+read as one name: the first character is `a`–`z`, and it continues over
+lowercase letters, digits and `_`, so `abcdef`, `var1` and `var_2` are each a
+single name. A name resolves in this order:
+
+1. a **string symbol** — `.setsym::<name>::"<text>"` — inserts its text;
+2. a **single lowercase letter** — the value of that pattern variable, in decimal;
+3. anything else — the characters as written.
+
+That is why `Rr` becomes `R1`: `R` is upper case and therefore literal, and `r`
+is a single letter bound by `!r`. Mnemonic text is written in upper case, and a
 literal lowercase letter is escaped with a backslash.
+
+Numeric `.setsym` symbols are deliberately *not* looked up here, so ordinary
+words in the text are never silently replaced by a number. Write `{{#NAME}}`
+when you want the value of a numeric symbol.
+
+**String symbols.** `.setsym` stores text instead of a number when its value
+field starts with a double quote:
+
+```
+.setsym::x::"LD"
+MOV R!r,!e::"{{x}} Rr,{{.dec(e)}}"        ->  LD R0,12
+```
+
+```
+.setsym::x::"LO"
+.setsym::y::"AD"
+MOV R!r,!e::"{{x}}{{y}} Rr,{{.dec(e)}}"   ->  LOAD R0,12
+```
+
+Given `mov r0,12`, those produce `LD R0,12` and `LOAD R0,12`. A string symbol
+carries no numeric value, so it cannot appear in an expression — it exists for
+text templates. `.clearsym` removes string symbols in the same way as numeric
+ones.
+
+Given `MOV R1,0x10`:
 
 ```
 MOV R!r,!e:: "LD Rr,0X{{.hex(e)}}"    ->  LD R1,0x10
@@ -484,6 +518,73 @@ To define a symbol from another symbol, use `#`:
 .setsym ::symbol2 ::#symbol1
 ```
 
+A value field that starts with a double quote makes a **string symbol**:
+
+```
+.setsym::x::"LD"
+```
+
+String symbols hold text rather than a number, so they cannot appear in an
+expression. They are used by text templates (section 3.5.2), where `{{x}}`
+inserts `LD`. `.clearsym` removes them like any other symbol.
+
+#### 3.6.1 Array symbols
+
+A value field that starts with `[` makes an **array symbol**. Its items may be
+numeric expressions, string literals, or a mix of the two:
+
+```
+.setsym::x::[1,2,3,4,5]
+.setsym::y::["A","B","C","D","E"]
+```
+
+Items are separated by top-level commas; commas inside `"..."` or inside nested
+brackets or parentheses do not split. Each numeric item is an ordinary pattern
+expression, so earlier symbols are available (`.setsym::m::[1,#BASE,#BASE+1]`).
+
+An item is selected with `[<index>]`, counting from 0. The index is itself an
+expression, so a pattern variable can drive it:
+
+| Where | How | Example |
+|---|---|---|
+| Text template (3.5.2) | `x[3]`, or `{{x[3]}}` | `{{y[3]}}` → `D` |
+| Expression | `#x[3]` | `MOV !e :: #x[3],e` emits `4` |
+
+In a template, a numeric item is written in decimal and a string item is
+inserted as text. `#x[3]` in an expression needs a numeric item — a string item
+is an error there, since it has no numeric value. An array name with no index
+in a template expands to all of its items joined by `,`.
+
+Out-of-range indices and `name[...]` on a name that is not an array are
+reported as errors. `.clearsym` removes array symbols like any other symbol.
+
+**Copying.** A value field that is just the name of an array or string symbol
+copies it:
+
+```
+.setsym::x::["R1","R2","R3"]
+.setsym::y::x                  /* y is now a copy of x */
+```
+
+The copy is independent — redefining `x` afterwards leaves `y` as it was. A
+bare name is otherwise a *label* reference (a numeric symbol is written `#x`),
+so this does not change the meaning of any expression that was valid before.
+
+**An array can stand in for a list of elements.** Wherever a directive takes an
+enumerated list of names — `.check`, `.enum` and `.map` — writing the name of an
+array symbol expands it to its contents in place:
+
+```
+.setsym::regs::["R0","R1","R2","R3","R4"]
+.check::x::regs           /* same as .check::x::R0,R1,R2,R3,R4 */
+.map::x::regs::1<<x       /* same as .map::x::R0,R1,R2,R3,R4::1<<x */
+.enum::f::regs::…
+```
+
+Arrays and plain names may be mixed in one list (`.check::x::regs,SP`), and a
+numeric item contributes its decimal spelling. One list of register names can
+therefore be written once and used by every directive that needs it.
+
 Z80 register example:
 
 ```
@@ -528,7 +629,8 @@ symbol — `ASR #-1` when the instruction has no immediate form — is reported 
 ```
 
 Restricts what may appear at the position captured by `x`. Anything else is an
-error. `.clrcheck::x` removes the restriction.
+error. `.clrcheck::x` removes the restriction. The list may be an array symbol
+(section 3.6.1), or a mix of arrays and plain names.
 
 **`.check` is worth setting whenever a lowercase variable is reused for more
 than one class of operand.** Without it the variable accepts *any* symbol
@@ -552,100 +654,6 @@ MOV t,!a :: 0xb8|t,a,a>>8
 
 This distinguishes `mov al,0x12` from `mov ax,0x1234`.
 
-#### 3.7.0 `.map` — a symbol table and its check in one line
-
-```
-.map::<variable>::<name,name,...>::<expression in the variable>
-```
-
-Gives each name in the list a value, and restricts the variable to that list.
-Inside the expression the variable stands for the **position of the name in the
-list**, counted from 0.
-
-```
-.map::x::R0,R1,R2,R3,R4::1<<x
-```
-
-is exactly equivalent to:
-
-```
-.setsym::R0::1<<(0)
-.setsym::R1::1<<(1)
-.setsym::R2::1<<(2)
-.setsym::R3::1<<(3)
-.setsym::R4::1<<(4)
-.check::x::R0,R1,R2,R3,R4
-```
-
-The expression may be left out, in which case it is the variable itself, so the
-names get 0, 1, 2, … in order:
-
-| Written | Values given to `R0`…`R4` |
-|---|---|
-| `.map::x::R0,R1,R2,R3,R4` | 0, 1, 2, 3, 4 |
-| `.map::x::R0,R1,R2,R3,R4::x` | 0, 1, 2, 3, 4 |
-| `.map::x::R0,R1,R2,R3,R4::1<<x` | 1, 2, 4, 8, 16 |
-| `.map::x::R0,R1,R2,R3,R4::10**x` | 1, 10, 100, 1000, 10000 |
-
-Register files, bit masks and other tables whose names *are* the numbering are
-the common case, and writing the `.setsym` lines out by hand makes it easy for
-the list and the values to drift apart. `.map` is expanded into the directives
-above as the pattern file is read, so nothing downstream treats it specially.
-
-The position is substituted into the expression in parentheses, so operator
-precedence is unaffected, and only whole-word occurrences of the variable are
-replaced — the `x` of `0xff` is left alone.
-
-An empty element (`""`) consumes its position without defining a symbol, which
-keeps the numbering aligned while marking the operand as optional in the
-`.check` list.
-
-**Optional positions.** `""` in a `.check` list permits the position to be
-absent:
-
-```
-.setsym::a1::1
-.setsym::a2::2
-.setsym::a3::3
-.setsym::b1::1
-.setsym::b2::2
-.setsym::b3::3
-.setsym::c1::1
-.setsym::c2::2
-.setsym::c3::3
-.check::a::a1,a2,a3,""
-.check::b::b1,b2,b3,""
-.check::c::c1,c2,c3,""
-MOVabc:: ::a*100+b*10+c
-```
-
-```
-mov                  0
-mova1              100
-mova1c3            103
-movb2               20
-movb2c1             21
-```
-
-AVX-512 masking notation uses the same mechanism:
-
-```
-.symbolc::{}
-.setsym::EAX::0
-.setsym::EBX::1
-.setsym::{K1}::1
-.setsym::{K2}::2
-.check::x::EAX,EBX
-.check::k::{K1},{K2},""
-FOO xk,y :: :: 0x90,k,x,y
-```
-
-```
-FOO EAX,EBX          -> 0x90 0x00 0x00 0x01   (k omitted)
-FOO EAX{K1},EBX      -> 0x90 0x01 0x00 0x01
-FOO EAX{K2},EBX      -> 0x90 0x02 0x00 0x01
-```
-
 #### 3.7.1 Enumerated operand lists (`.enum`)
 
 Where `.check` restricts a position to *one* symbol out of a set, `.enum`
@@ -655,6 +663,9 @@ declares a position that takes a *list* of them — a register list such as the
 ```
 .enum::<variable>::<element,element,...>::<expression>
 ```
+
+The element list may be an array symbol (section 3.6.1) instead of names
+written out.
 
 The element order is the enumeration order, and it is what a `-` range in the
 source means. In `<expression>` each element name evaluates to
@@ -787,6 +798,136 @@ it — above, `b` is the inner value and the outer entry adds `0x40` to it.
 
 A chain of references is expanded at most **8** deep. A longer chain is not
 expanded, and the line simply fails to match.
+
+#### 3.7.3 `.map` — a symbol table and its check in one line
+
+```
+.map::<variable>::<name,name,...>::<expression in the variable>
+```
+
+Gives each name in the list a value, and restricts the variable to that list.
+Inside the expression the variable stands for the **position of the name in the
+list**, counted from 0.
+
+```
+.map::x::R0,R1,R2,R3,R4::1<<x
+```
+
+is exactly equivalent to:
+
+```
+.setsym::R0::1<<(0)
+.setsym::R1::1<<(1)
+.setsym::R2::1<<(2)
+.setsym::R3::1<<(3)
+.setsym::R4::1<<(4)
+.check::x::R0,R1,R2,R3,R4
+```
+
+The expression may be left out, in which case it is the variable itself, so the
+names get 0, 1, 2, … in order:
+
+| Written | Values given to `R0`…`R4` |
+|---|---|
+| `.map::x::R0,R1,R2,R3,R4` | 0, 1, 2, 3, 4 |
+| `.map::x::R0,R1,R2,R3,R4::x` | 0, 1, 2, 3, 4 |
+| `.map::x::R0,R1,R2,R3,R4::1<<x` | 1, 2, 4, 8, 16 |
+| `.map::x::R0,R1,R2,R3,R4::10**x` | 1, 10, 100, 1000, 10000 |
+
+Register files, bit masks and other tables whose names *are* the numbering are
+the common case, and writing the `.setsym` lines out by hand makes it easy for
+the list and the values to drift apart. `.map` is expanded into the directives
+above as the pattern file is read, so nothing downstream treats it specially.
+
+The position is substituted into the expression in parentheses, so operator
+precedence is unaffected, and only whole-word occurrences of the variable are
+replaced — the `x` of `0xff` is left alone.
+
+An empty element (`""`) consumes its position without defining a symbol, which
+keeps the numbering aligned while marking the operand as optional in the
+`.check` list.
+
+The list may also be an array symbol (section 3.6.1), so the register names can
+be written once and shared with `.check` and `.enum`:
+
+```
+.setsym::regs::["R0","R1","R2","R3","R4"]
+.map::x::regs::1<<x
+```
+
+**Optional positions.** `""` in a `.check` list permits the position to be
+absent:
+
+```
+.setsym::a1::1
+.setsym::a2::2
+.setsym::a3::3
+.setsym::b1::1
+.setsym::b2::2
+.setsym::b3::3
+.setsym::c1::1
+.setsym::c2::2
+.setsym::c3::3
+.check::a::a1,a2,a3,""
+.check::b::b1,b2,b3,""
+.check::c::c1,c2,c3,""
+MOVabc:: ::a*100+b*10+c
+```
+
+```
+mov                  0
+mova1              100
+mova1c3            103
+movb2               20
+movb2c1             21
+```
+
+AVX-512 masking notation uses the same mechanism:
+
+```
+.symbolc::{}
+.setsym::EAX::0
+.setsym::EBX::1
+.setsym::{K1}::1
+.setsym::{K2}::2
+.check::x::EAX,EBX
+.check::k::{K1},{K2},""
+FOO xk,y :: :: 0x90,k,x,y
+```
+
+```
+FOO EAX,EBX          -> 0x90 0x00 0x00 0x01   (k omitted)
+FOO EAX{K1},EBX      -> 0x90 0x01 0x00 0x01
+FOO EAX{K2},EBX      -> 0x90 0x02 0x00 0x01
+```
+
+#### 3.7.4 `.free` — release a name from every table
+
+```
+.free::x1,y1,z1
+```
+
+Removes each name from every table the pattern layer keeps, so the name can be
+reused without having to remember which directive defined it. It clears:
+
+- the `.setsym` numeric, string and array symbol of that name;
+- the `.sub` table of that name;
+- that name wherever it appears as a candidate in a `.check` list;
+- and, when the name is a single lowercase letter, that variable's whole
+  `.check` list and its `.enum`.
+
+Like `.clearsym` and `.clrcheck`, `.free` is positional: patterns written above
+it still see the names, patterns below it do not.
+
+```
+.setsym::N1::7
+.sub::T1
+X::0x99
+.return
+BEFORE     :: :: #N1        /* 0x07 */
+.free::N1,T1
+AFTER      :: :: #N1        /* error - undefined symbol: '#N1' */
+```
 
 ### 3.8 Optional parts (`[[ ]]`)
 

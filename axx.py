@@ -822,6 +822,13 @@ class AssemblerState:
         # パターンのエンコーディング欄が文字列テンプレート "..." だったときに、
         # そこから組み立てたアセンブリ結果のテキスト。1行ごとに作り直す。
         self.asmtext = None
+        # `.setsym::名前::"文字列"` で登録された文字列シンボル。値が数値では
+        # ないので式には出せず、文字列テンプレート（3.5.2）の中でだけ使える。
+        # 名前は大文字化して持つ（`.setsym` の数値シンボルと同じ規約）。
+        self.strsymbols = {}
+        # `.setsym::名前::[項目,項目,…]` で登録された配列シンボル。項目は数値
+        # (int/float) でも文字列 (str) でもよく、`x[3]` や `#x[3]` で引く。
+        self.arrsymbols = {}
 
         # 標準入力から読んだソースを置く一時ファイル（全パスで再利用する）。
         self.stdin_tmp_path: str | None = None
@@ -845,6 +852,12 @@ class AssemblerState:
         # `.sub::名前 ... .return` で登録されたサブ表。
         # 名前 -> [(照合パターン, 値欄), ...]。`!S{{名前}}変数` の展開に使う。
         self.sub_defs: dict = {}
+        # `.free` で「この行から先は使わない」と印を付けたサブ表の名前
+        # (大文字化)。`.sub` はパターンを読むときに一度だけ組み立てられ、
+        # `.setsym` のようにソース1行ごとに作り直されはしないので、消して
+        # しまうと `.free` より前に書かれたパターンまで2行目以降に使えなく
+        # なる。印は行の頭で落とす。
+        self.freed_subs: set = set()
 
         # `.func::名前::引数 ... .endfunc` で登録されたミニ言語の関数。
         # 名前 -> _MiniFunc。`binary_list` 欄の `.call` から呼ぶ。
@@ -2448,12 +2461,35 @@ class ExpressionEvaluator:
         elif StringUtils.q(s, '#', idx):
             idx += 1
             t, idx = self.parser.get_symbol_word(s, idx)
-            _sym_val = self.symbol_manager.get(t)
-            if _sym_val == "":
-                self.state.diag(f" error - undefined symbol: '#{t}'", set_error=True)
-                x = 0
+            # `#x[3]` は配列シンボルの項目。添字は式で、0 から数える。
+            _akey = StringUtils.upper(t)
+            _arr = self.state.arrsymbols.get(_akey)
+            if _arr is not None and idx < len(s) and s[idx] == '[':
+                _iv, idx = self.expression_pat(s, idx + 1)
+                if idx < len(s) and s[idx] == ']':
+                    idx += 1
+                else:
+                    self.state.diag(f" error - '#{_akey}[': missing ']'.",
+                                    set_error=True)
+                _n = int(_iv)
+                if _n < 0 or _n >= len(_arr):
+                    self.state.diag(f" error - index {_n} is out of range for array "
+                                    f"symbol '{_akey}' (0..{len(_arr) - 1}).",
+                                    set_error=True)
+                    x = 0
+                elif isinstance(_arr[_n], str):
+                    self.state.diag(f" error - '#{_akey}[{_n}]' is a string item and "
+                                    f"has no numeric value.", set_error=True)
+                    x = 0
+                else:
+                    x = _arr[_n]
             else:
-                x = _sym_val
+                _sym_val = self.symbol_manager.get(t)
+                if _sym_val == "":
+                    self.state.diag(f" error - undefined symbol: '#{t}'", set_error=True)
+                    x = 0
+                else:
+                    x = _sym_val
         elif StringUtils.q(s, '0b', idx):
             idx += 2
             while idx < len(s) and s[idx] in "01":
@@ -3209,8 +3245,12 @@ class DirectiveProcessor:
         if len(i) >= 3 and i[2] != '':
             key = StringUtils.upper(i[2])
             self.state.symbols.pop(key, None)
+            self.state.strsymbols.pop(key, None)
+            self.state.arrsymbols.pop(key, None)
         else:
             self.state.symbols = {}
+            self.state.strsymbols = {}
+            self.state.arrsymbols = {}
 
         return True
 
@@ -3228,6 +3268,17 @@ class DirectiveProcessor:
             self.state.diag(" error - .setsym directive requires at least a symbol name", set_error=True)
             return False
 
+        # 値が `"..."` なら文字列シンボル、`[...]` なら配列シンボル。
+        _vf = value_field.lstrip(' \t')
+        if _vf.startswith('"'):
+            self.state.strsymbols[key] = ObjectGenerator._txt_template_inner(_vf)
+            return True
+        if _vf.startswith('['):
+            self.state.arrsymbols[key] = arr_items_from_text(self.expr_eval, _vf)
+            return True
+        # `.setsym::y::x` — x が文字列／配列シンボルなら、その写しを作る。
+        if symbol_copy_from_name(self.state, key, _vf):
+            return True
         if value_field:
             v, idx = self.expr_eval.expression_pat(value_field, 0)
         else:
@@ -3437,6 +3488,31 @@ class DirectiveProcessor:
 
         return triggered, error_code
 
+    def elem_list_expand(self, text):
+        """要素の列挙欄（`.check` `.enum` `.map` の「名前の並び」）を項目に切る。
+
+        項目が配列シンボルの名前なら、その内容をその場に展開する。つまり
+            .setsym::regs::["R0","R1","R2"]
+            .check::x::regs
+        は `.check::x::R0,R1,R2` と同じ意味になる。配列と素の名前は混ぜて
+        書ける。名前は大文字化して積み、`""` `''`（省略可の印）と空欄は
+        空文字の項目にする。caxx.c の elem_list_expand() と同じ規則である。
+        """
+        out = []
+        for tok in (text or '').split(','):
+            tok = StringUtils.upper(tok.strip())
+            if tok in ('', '""', "''"):
+                out.append('')
+                continue
+            arr = self.state.arrsymbols.get(tok)
+            if arr is None:
+                out.append(tok)
+                continue
+            for v in arr:
+                out.append(StringUtils.upper(v) if isinstance(v, str)
+                           else ObjectGenerator._txt_radix(v, 10))
+        return out
+
     def check_processing(self, i):
         if len(i) == 0 or i[0] != '.check':
             return False
@@ -3452,18 +3528,14 @@ class DirectiveProcessor:
             self.state.diag(f" error - .check: variable should be a lower case letter ('{var_field}').", set_error=True)
             return True
         syms = []
-        if syms_field:
-            for s in syms_field.split(','):
-                s = s.strip()
-                if not s:
-                    continue
-                if s == '""' or s == "''":
-                    # 空文字リテラルは「このオペランドは省略してよい」印。
-                    # 省略時、変数には VAR_UNDEF(0) が入る。
-                    if CHECK_OMIT not in syms:
-                        syms.append(CHECK_OMIT)
-                    continue
-                syms.append(s.upper())
+        for nm in self.elem_list_expand(syms_field):
+            if nm == '':
+                # 空文字リテラルは「このオペランドは省略してよい」印。
+                # 省略時、変数には VAR_UNDEF(0) が入る。
+                if CHECK_OMIT not in syms:
+                    syms.append(CHECK_OMIT)
+                continue
+            syms.append(nm)
         self.state.check_constraints[var] = syms
         return True
 
@@ -3479,6 +3551,96 @@ class DirectiveProcessor:
                 self.state.diag(f" error - .clrcheck: variable should be a lower case letter ('{var_field}').", set_error=True)
         else:
             self.state.check_constraints.clear()
+        return True
+
+    def map_apply(self, i, into=None, set_check=True):
+        """`.map::<変数>::<名前の並び>::<式>`
+
+        並びの各名前に値を与える `.setsym` と、その変数の `.check` をまとめて
+        書くための省略形。式の中の変数は「その名前が並びの何番目か」
+        (0 から数える) を指す。
+
+            .map::x::R0,R1,R2::1<<x
+        は
+            .setsym::R0::1<<(0)
+            .setsym::R1::1<<(1)
+            .setsym::R2::1<<(2)
+            .check::x::R0,R1,R2
+        と等価である。式を省くと変数そのもの、すなわち 0 からの連番になる。
+        並びには配列シンボルの名前を書ける（elem_list_expand() が展開する）。
+
+        into が与えられればシンボルはそこへ、なければ state.symbols へ入れる。
+        caxx.c の map_apply() と同じ規則である。
+        """
+        var_str = i[1].strip() if len(i) >= 2 else ''
+        syms_str = i[2] if len(i) >= 3 else ''
+        expr_str = i[3] if (len(i) >= 4 and i[3].strip()) else var_str
+        if len(var_str) != 1 or not ('a' <= var_str.lower() <= 'z'):
+            return
+        var = var_str.lower()
+        target = self.state.symbols if into is None else into
+
+        elems = self.elem_list_expand(syms_str)
+        for n, nm in enumerate(elems):
+            # 空の要素（`""` の省略可印など）は番号だけ消費して何も定義しない。
+            if nm == '':
+                continue
+            val = PatternFileReader._map_subst_index(expr_str, var, n)
+            v, _ = self.expr_eval.expression_pat(val, 0)
+            target[nm] = v
+        if set_check:
+            syms = []
+            for nm in elems:
+                if nm == '':
+                    if CHECK_OMIT not in syms:
+                        syms.append(CHECK_OMIT)
+                    continue
+                syms.append(nm)
+            self.state.check_constraints[var] = syms
+
+    def map_processing(self, i):
+        """`.map` をパターン走査中に適用する。"""
+        if len(i) == 0 or i[0] != '.map':
+            return False
+        self.map_apply(i)
+        return True
+
+    def free_processing(self, i):
+        """`.free::名前,名前,…`
+
+        その名前を、パターン層のあらゆる表から外す。置き場所ごとに
+        `.clearsym` `.clrcheck` `.clrenum` と書き分けなくても、名前ひとつで
+        「もうこの名前は使わない」と宣言できるようにするためのもの。外すのは
+          - `.setsym` の数値シンボル・文字列シンボル・配列シンボル
+          - `.sub` の表
+          - `.check` の候補（どの変数の一覧に入っていても取り除く）
+          - 名前が小文字1文字なら、その変数の `.check` と `.enum` ごと
+        で、`.clearsym` などと同じく書かれた位置から先に効く。
+        caxx.c の dir_free() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.free':
+            return False
+        names = (i[2] if len(i) >= 3 and i[2] else (i[1] if len(i) >= 2 else ''))
+        if not names.strip():
+            self.state.diag(" error - .free: needs '.free::<name,name,...>'.",
+                            set_error=True)
+            return True
+        for nm in names.split(','):
+            nm = nm.strip()
+            if not nm:
+                continue
+            key = StringUtils.upper(nm)
+            self.state.symbols.pop(key, None)
+            self.state.strsymbols.pop(key, None)
+            self.state.arrsymbols.pop(key, None)
+            self.state.freed_subs.add(key)
+            # `.check` の候補からも外す。候補は大文字で積まれている。
+            for var, syms in self.state.check_constraints.items():
+                self.state.check_constraints[var] = [x for x in syms if x != key]
+            # 名前が変数そのものなら、その変数の制約と列挙ごと外す。
+            if len(nm) == 1 and nm.lower() in LOWER:
+                self.state.check_constraints.pop(nm.lower(), None)
+                self.state.enum_defs.pop(nm.lower(), None)
         return True
 
     def enum_processing(self, i):
@@ -3498,8 +3660,7 @@ class DirectiveProcessor:
             self.state.diag(f" error - .enum: variable should be a lower case letter ('{var_field}').", set_error=True)
             return True
         names = []
-        for nm in names_field.split(','):
-            nm = StringUtils.upper(nm.strip())
+        for nm in self.elem_list_expand(names_field):
             if nm and nm not in names:
                 names.append(nm)
         if not names:
@@ -4038,6 +4199,8 @@ class PatternMatcher:
                             f"maximum depth {self._SUB_MAX_DEPTH}.", set_error=True)
             return
         entries = self.state.sub_defs.get(name)
+        if StringUtils.upper(name) in self.state.freed_subs:
+            entries = None          # `.free` で解放済み
         if entries is None:
             self.state.diag(f" error - {ref_text}: no sub table named {name!r} "
                             f"(define it with '.sub::{name} ... .return').",
@@ -4354,25 +4517,12 @@ class PatternFileReader:
                     self.subs[cur_sub].append((l[0], l[-1]))
                     continue
 
-                # `.map::<変数>::<名前の並び>::<式>` は、並びの各名前に値を与える
-                # `.setsym` と、その変数の `.check` をまとめて書くための省略形。
-                # 式の中の変数は「その名前が並びの何番目か」(0 から数える) を指す。
-                #
-                #   .map::x::R0,R1,R2::1<<x
-                # は
-                #   .setsym::R0::1<<(0)
-                #   .setsym::R1::1<<(1)
-                #   .setsym::R2::1<<(2)
-                #   .check::x::R0,R1,R2
-                # と等価である。式を省くと変数そのもの、すなわち 0 からの連番に
-                # なる。レジスタ名やビットマスクのように「名前の並びがそのまま
-                # 規則的な値」になる表は、`.setsym` を並べて書くと並び順と値が
-                # 食い違いやすい。ここでパターン表へ展開してしまうので、以降の
-                # 処理は素の `.setsym` / `.check` と区別しない。
+                # `.map::<変数>::<名前の並び>::<式>` の書式検査。展開は
+                # setpatsymbols() と map_processing() で行う（並びに配列
+                # シンボルを書けるようにするため。配列はパターンを読み終えて
+                # から登録される）。
                 if _kw == '.MAP':
                     var_str = l[1].strip() if len(l) > 2 else ''
-                    syms_str = l[2] if len(l) > 2 else (l[1] if len(l) > 1 else '')
-                    expr_str = l[3] if (len(l) > 3 and l[3].strip()) else var_str
                     if len(l) < 3 or var_str == '':
                         diag(" error - .map: needs '.map::<variable>::"
                              "<name,name,...>[::<expression in the variable>]'.",
@@ -4380,20 +4530,6 @@ class PatternFileReader:
                     elif len(var_str) != 1 or not ('a' <= var_str.lower() <= 'z'):
                         diag(f" error - .map: variable should be a lower case "
                              f"letter ({var_str!r}).", set_error=True)
-                    else:
-                        # 名前の並びを `,` で切り、i 番目の名前に「式の変数を i に
-                        # 置き換えたもの」を値として与える。空の要素（`""` の
-                        # 省略可印など）は番号だけ消費して `.setsym` を出さない。
-                        for i, nm in enumerate(syms_str.split(',')):
-                            nm = nm.strip()
-                            if nm == '' or nm in ('""', "''"):
-                                continue
-                            w.append(['.setsym', nm,
-                                      self._map_subst_index(expr_str,
-                                                            var_str.lower(), i),
-                                      '', '', ''])
-                        w.append(['.check', var_str, syms_str, '', '', ''])
-                    continue
 
                 if len(l) == 1:
                     if l[0].strip() != '':
@@ -5849,6 +5985,52 @@ class ObjectGenerator:
         return t if t.startswith('"') else None
 
     @staticmethod
+    def _arr_split(q):
+        """`[...]` の中身を項目の文字列に切る。
+
+        区切りは最上位のカンマだけで、`"..."` の中や入れ子の括弧の中のカンマは
+        区切りにしない（`[1,(2,3)]` のような書き方で崩れないようにするため）。
+        caxx.c の arrsym_set_from_text() と同じ規則である。
+        """
+        items = []
+        i = 1                      # `[` の次から
+        n = len(q)
+        while i < n:
+            while i < n and q[i] in ' \t':
+                i += 1
+            if i >= n or q[i] == ']':
+                break
+            b = i
+            depth = 0
+            inq = False
+            while i < n:
+                c = q[i]
+                if inq:
+                    if c == '\\' and i + 1 < n:
+                        i += 1
+                    elif c == '"':
+                        inq = False
+                elif c == '"':
+                    inq = True
+                elif c in '[(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+                elif c == ']':
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif c == ',' and depth == 0:
+                    break
+                i += 1
+            items.append(q[b:i].rstrip(' \t'))
+            if i < n and q[i] == ',':
+                i += 1
+            else:
+                break
+        return items
+
+    @staticmethod
     def _txt_template_inner(q):
         """`"..."` の中身を取り出す。`\` は残して展開側に任せる。"""
         out = []
@@ -5995,6 +6177,19 @@ class ObjectGenerator:
                             self._txt_emit_expr(parts, inner[j + 1 + nl + 1:cp], kind)
                             done = True
                 if not done:
+                    # `{{x[3]}}` のように名前と添字なら、配列シンボルを引く。
+                    nm, ix = self._txt_bare_indexed(inner)
+                    if nm is not None:
+                        parts.append(self._txt_indexed_text(nm, ix))
+                        done = True
+                if not done:
+                    # `{{x}}` のように名前ひとつなら、文字列／配列シンボルを先に見る。
+                    bare = self._txt_bare_name(inner)
+                    if bare is not None and (bare in self.state.strsymbols
+                                             or bare in self.state.arrsymbols):
+                        parts.append(self._txt_name_text(bare))
+                        done = True
+                if not done:
                     self._txt_emit_expr(parts, inner, -1)
                 i = e + 2
                 continue
@@ -6007,13 +6202,116 @@ class ObjectGenerator:
                         i = cp + 1
                         continue
             if 'a' <= c <= 'z':
-                # パターン変数。値は10進で埋める。
-                parts.append(self._txt_radix(self.state.vars[ord(c) - ord('a')], 10))
-                i += 1
+                # 小文字で始まる名前。1文字ならパターン変数、それより長ければ
+                # `var1` `var_2` のような文字列シンボルの名前として引く。
+                j = i + 1
+                while j < len(s) and (s[j].islower() or s[j].isdigit() or s[j] == '_'):
+                    j += 1
+                if j < len(s) and s[j] == '[':
+                    cb = self._txt_close_bracket(s, j)
+                    if cb > 0:
+                        parts.append(self._txt_indexed_text(s[i:j], s[j + 1:cb]))
+                        i = cb + 1
+                        continue
+                parts.append(self._txt_name_text(s[i:j]))
+                i = j
                 continue
             parts.append(c)
             i += 1
         return ''.join(parts)
+
+    @classmethod
+    def _txt_bare_indexed(cls, inner):
+        """`{{...}}` の中身が `名前[式]` だけなら (名前, 添字の式) を返す。"""
+        t = inner.strip()
+        if not t.isascii() or not t[:1].isalpha() and t[:1] != '_':
+            return None, None
+        i = 1
+        while i < len(t) and (t[i].isalnum() or t[i] == '_'):
+            i += 1
+        name = t[:i]
+        while i < len(t) and t[i] in ' \t':
+            i += 1
+        if i >= len(t) or t[i] != '[':
+            return None, None
+        cb = cls._txt_close_bracket(t, i)
+        if cb < 0 or t[cb + 1:].strip() != '':
+            return None, None
+        return name, t[i + 1:cb]
+
+    @staticmethod
+    def _txt_bare_name(inner):
+        """`{{...}}` の中身が名前ひとつだけなら、大文字化した名前を返す。"""
+        t = inner.strip()
+        if not t.isascii() or not (t[:1].isalpha() or t[:1] == '_'):
+            return None
+        for ch in t[1:]:
+            if not (ch.isalnum() or ch == '_'):
+                return None
+        return StringUtils.upper(t)
+
+    def _txt_name_text(self, name):
+        """テンプレートの中の名前を解決する。
+
+        優先順位は
+          1. `.setsym::名前::"文字列"` の文字列シンボル … その文字列
+          2. 1文字の小文字                             … パターン変数の値（10進）
+          3. どれでもない                               … 書かれたままの文字
+        で、`Rr` の `r` は 2 に、`{{x}}` の `x` は 1 に当たる。
+        数値シンボルをここで引かないのは、`num=` のような普通の文（たまたま
+        `.setsym::NUM` がある）が黙って数字に化けるのを避けるため。数値が要る
+        ときは `{{#NUM}}` と書けば本体の式評価器が引く。
+        caxx.c の txt_emit_name() と同じ規則である。
+        """
+        key = StringUtils.upper(name)
+        if key in self.state.strsymbols:
+            return self.state.strsymbols[key]
+        # 添字なしの配列は、全項目を `,` でつないで出す。
+        if key in self.state.arrsymbols:
+            return ','.join(v if isinstance(v, str) else self._txt_radix(v, 10)
+                            for v in self.state.arrsymbols[key])
+        if len(name) == 1 and 'a' <= name <= 'z':
+            return self._txt_radix(self.state.vars[ord(name) - ord('a')], 10)
+        return name
+
+    @staticmethod
+    def _txt_close_bracket(s, i):
+        """名前の直後の `[...]` の閉じ位置を返す。無ければ -1。"""
+        depth = 0
+        while i < len(s):
+            if s[i] == '[':
+                depth += 1
+            elif s[i] == ']':
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    def _txt_indexed_text(self, name, idxtext):
+        """`x[3]` のような添字つきの参照。添字は式で、0 から数える。
+
+        配列でない名前や範囲外の添字は診断して空文字を返す。
+        """
+        key = StringUtils.upper(name)
+        if key not in self.state.arrsymbols:
+            self.state.diag(f" error - '{key}' is not an array symbol; "
+                            f"'{key}[...]' needs '.setsym::{key}::[...]'.",
+                            set_error=True)
+            return ''
+        saved_undef = self.state.error_undefined_label
+        self.state.error_undefined_label = False
+        v, _ = self.expr_eval.expression_pat(idxtext, 0)
+        if self.state.error_undefined_label:
+            saved_undef = True
+        self.state.error_undefined_label = saved_undef
+        arr = self.state.arrsymbols[key]
+        n = int(v)
+        if n < 0 or n >= len(arr):
+            self.state.diag(f" error - index {n} is out of range for array symbol "
+                            f"'{key}' (0..{len(arr) - 1}).", set_error=True)
+            return ''
+        return arr[n] if isinstance(arr[n], str) else self._txt_radix(arr[n], 10)
 
     def makeobj(self, s):
         # `"..."` で始まる欄はバイト列ではなくアセンブリ結果のテキストを作る。
@@ -6095,6 +6393,53 @@ class ObjectGenerator:
             self.state.error_undefined_label = self.state.error_undefined_label or _prior_undef
 
         return objl
+
+
+
+def arr_items_from_text(expr_eval, q):
+    """`.setsym` の `[...]` を項目の並びにする。
+
+    項目は `"文字列"` ならそのまま文字列 (str)、それ以外は式として評価した
+    数値になる。caxx.c の arrsym_set_from_text() と同じ規則である。
+    """
+    out = []
+    for item in ObjectGenerator._arr_split(q):
+        if item.startswith('"'):
+            out.append(ObjectGenerator._txt_template_inner(item))
+        elif item:
+            v, _ = expr_eval.expression_pat(item, 0)
+            out.append(v)
+        else:
+            out.append(0)
+    return out
+
+
+
+def symbol_copy_from_name(state, dst_upper, value_field):
+    """値欄が「名前ひとつ」で、それが文字列／配列シンボルなら複製する。
+
+    `.setsym::y::x` が `x` の写しを作るための枝で、複製したら True を返す。
+    素の名前は本来ラベル参照なので（シンボルは `#x` と書く）、ここで拾っても
+    これまで書けていた式の意味は変わらない。
+    caxx.c の symbol_copy_from_name() と同じ規則である。
+    """
+    t = value_field.strip()
+    if not t.isascii() or not (t[:1].isalpha() or t[:1] == '_'):
+        return False
+    for ch in t[1:]:
+        if not (ch.isalnum() or ch == '_'):
+            return False
+    src = StringUtils.upper(t)
+    if src in state.arrsymbols:
+        if src != dst_upper:
+            # 項目は数値か文字列なので、浅い複製で独立した配列になる。
+            state.arrsymbols[dst_upper] = list(state.arrsymbols[src])
+        return True
+    if src in state.strsymbols:
+        if src != dst_upper:
+            state.strsymbols[dst_upper] = state.strsymbols[src]
+        return True
+    return False
 
 
 class VLIWProcessor:
@@ -8293,6 +8638,10 @@ class Assembler:
                 continue
             if self.directive_proc.clrcheck_processing(i):
                 continue
+            if self.directive_proc.map_processing(i):
+                continue
+            if self.directive_proc.free_processing(i):
+                continue
             if self.directive_proc.enum_processing(i):
                 continue
             if self.directive_proc.clrenum_processing(i):
@@ -8509,6 +8858,7 @@ class Assembler:
 
         self.state.check_constraints.clear()
         self.state.enum_defs.clear()
+        self.state.freed_subs.clear()
 
         self.state.symbols = dict(self.state.patsymbols)
 
@@ -8702,6 +9052,8 @@ class Assembler:
 
     def setpatsymbols(self, pat):
         fresh = {}
+        self.state.strsymbols = {}
+        self.state.arrsymbols = {}
         for i in pat:
             if i is None:
                 continue
@@ -8710,6 +9062,19 @@ class Assembler:
                     key = StringUtils.upper(i[1])
                     self.state.symbols = dict(fresh)
                     value_field = i[2] if len(i) >= 3 else ''
+                    # 値が `"..."` なら数値ではなく文字列シンボル。式には出せない
+                    # が、文字列テンプレート（3.5.2）の中から名前で呼び出せる。
+                    _vf = value_field.lstrip(' \t')
+                    if _vf.startswith('"'):
+                        self.state.strsymbols[key] = \
+                            ObjectGenerator._txt_template_inner(_vf)
+                        continue
+                    if _vf.startswith('['):
+                        self.state.arrsymbols[key] = arr_items_from_text(self.expr_eval, _vf)
+                        continue
+                    # `.setsym::y::x` — x が文字列／配列シンボルなら写しを作る。
+                    if symbol_copy_from_name(self.state, key, _vf):
+                        continue
                     if value_field:
                         v, _ = self.expr_eval.expression_pat(value_field, 0)
                     else:
@@ -8723,8 +9088,33 @@ class Assembler:
                 if len(i) >= 3 and i[2] != '':
                     key = StringUtils.upper(i[2])
                     fresh.pop(key, None)
+                    self.state.strsymbols.pop(key, None)
+                    self.state.arrsymbols.pop(key, None)
                 else:
                     fresh = {}
+                    self.state.strsymbols = {}
+                    self.state.arrsymbols = {}
+                continue
+            if len(i) > 0 and i[0] == '.map':
+                # `.map` のシンボルもこの前処理の表に積む。ここまでに積んだ
+                # ものを公開してから展開するので、並びに書いた配列シンボルも、
+                # 値の式に書いた `#記号` も解決できる。
+                self.state.symbols = dict(fresh)
+                self.directive_proc.map_apply(i, into=fresh, set_check=False)
+                continue
+            # `.free` はシンボルもこの前処理の表から外す（本体の走査でも同じ
+            # ことをするが、ここで外しておかないと後続の `.setsym` の値の式から
+            # 見えたままになる）。
+            if len(i) > 0 and i[0] == '.free':
+                _names = (i[2] if len(i) >= 3 and i[2] else (i[1] if len(i) >= 2 else ''))
+                for _nm in _names.split(','):
+                    _nm = _nm.strip()
+                    if not _nm:
+                        continue
+                    _k = StringUtils.upper(_nm)
+                    fresh.pop(_k, None)
+                    self.state.strsymbols.pop(_k, None)
+                    self.state.arrsymbols.pop(_k, None)
                 continue
             if len(i) > 0 and i[0] == '.bits':
                 self.directive_proc.bits(i)

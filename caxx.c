@@ -94,6 +94,10 @@ static void m_echo_write(char *const *items, int n);
  * ままにして axx.py の実際の挙動に合わせる。 */
 typedef struct { uint256_t val; int is_undef; int is_float; } PatVar;
 
+/* 配列シンボルの1項目。数値か文字列のどちらかを持つ。 */
+typedef struct { int is_str; char *s; uint256_t v; } SymItem;
+struct ArrSym { char *name; SymItem *items; int len; };
+
 static uint256_t u256_zero(void) {
     uint256_t r; memset(&r,0,sizeof(r)); return r;
 }
@@ -520,7 +524,7 @@ static void enumdef_copy(EnumDef *dst, const EnumDef *src){
  * `!S{{名前}}<変数>` は、この表のどれか1項目に一致したとき、その項目の値欄を
  * 評価した結果をその変数に束縛する。 */
 typedef struct { char *pat; char *val; } SubEntry;
-typedef struct { char *name; SubEntry *e; int n; int cap; } SubDef;
+typedef struct { char *name; SubEntry *e; int n; int cap; int freed; } SubDef;
 typedef struct { SubDef *data; int len; int cap; } SubVec;
 
 static void subv_init(SubVec*v){ v->data=NULL; v->len=0; v->cap=0; }
@@ -539,6 +543,18 @@ static SubDef *subv_find(SubVec*v, const char *name){
     for(int i=0;i<v->len;i++) if(strcmp(v->data[i].name,name)==0) return &v->data[i];
     return NULL;
 }
+/* `.free` で「この行から先は使わない」と印を付ける。表そのものは消さない。
+ * `.sub` はパターンを読むときに一度だけ組み立てられ、`.setsym` のように
+ * ソース1行ごとに作り直されはしないので、消してしまうと `.free` より前に
+ * 書かれたパターンまで2行目以降に使えなくなる。印は行の頭で落とす。 */
+static int subv_mark_freed(SubVec*v, const char *name){
+    for(int i=0;i<v->len;i++)
+        if(strcasecmp(v->data[i].name, name)==0){ v->data[i].freed = 1; return 1; }
+    return 0;
+}
+static void subv_unfreeze_all(SubVec*v){
+    for(int i=0;i<v->len;i++) v->data[i].freed = 0;
+}
 static SubDef *subv_new(SubVec*v, const char *name){
     SubDef *old = subv_find(v, name);
     if(old){
@@ -552,6 +568,7 @@ static SubDef *subv_new(SubVec*v, const char *name){
         if(!v->data){ perror("realloc"); exit(1); }
     }
     SubDef *d = &v->data[v->len++];
+    d->freed = 0;
     d->name = strdup(name); d->e = NULL; d->n = 0; d->cap = 0;
     if(!d->name){ perror("strdup"); exit(1); }
     return d;
@@ -1132,6 +1149,17 @@ typedef struct {
     SecMap     sections;       /* セクション */
     SymMap     symbols;        /* 現在有効なシンボル */
     SymMap     patsymbols;     /* パターンファイルの .setsym 由来 */
+    /* `.setsym::名前::"文字列"` で登録された文字列シンボル。値が数値では
+     * ないので式には出せず、文字列テンプレート（3.5.2）の中でだけ使える。
+     * 名前は大文字化して names に、中身をそのまま vals に、同じ添字で持つ。 */
+    StrVec     strsym_names;
+    StrVec     strsym_vals;
+
+    /* `.setsym::名前::[項目,項目,…]` で登録された配列シンボル。項目は数値でも
+     * 文字列でもよく、`x[3]`（テンプレート）や `#x[3]`（式）で引く。 */
+    struct ArrSym *arrsyms;
+    int        arrsyms_len;
+    int        arrsyms_cap;
     LabelMap   export_labels;  /* .global 等で外部公開するラベル */
     StrVec     export_order;   /* 公開順（出力の再現性のため） */
     PatVec     pat;            /* 読み込んだパターン表 */
@@ -1726,6 +1754,9 @@ static void state_init(AsmState *st) {
     st->pas = 0;
     st->debug = 0;
     st->asmtext = NULL;
+    sv_init(&st->strsym_names);
+    sv_init(&st->strsym_vals);
+    st->arrsyms = NULL; st->arrsyms_len = 0; st->arrsyms_cap = 0;
     st->osabi = 0;
     st->ln = 0;
     sv_init(&st->fnstack);
@@ -3021,6 +3052,9 @@ static void label_print_all(AsmState *st){
     free(v);
 }
 
+/* 配列シンボル（`.setsym::名前::[…]`）。定義は後方にある。 */
+static struct ArrSym *arrsym_get(AsmState *st, const char *upper_name);
+
 static int symbol_get(AsmState *st, const char *w, uint256_t *out){
     char uw[512]; axx_strupr_to(uw,w,sizeof(uw));
     return smap_get(&st->symbols,uw,out);
@@ -3535,7 +3569,32 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         char *t = axx_word_buf(s, idx, tbuf, sizeof(tbuf), &tsz);
         idx=axx_get_symbol_word(s,idx,st->swordchars,t,tsz);
         uint256_t sv;
-        if(symbol_get(st,t,&sv)) x=sv;
+        /* `#x[3]` は配列シンボルの項目。添字は式で、0 から数える。 */
+        char akey[512]; axx_strupr_to(akey,t,sizeof(akey));
+        struct ArrSym *ar = arrsym_get(st, akey);
+        if(ar && idx < slen && s[idx]=='['){
+            int io2;
+            uint256_t ixv = expr_expression_pat(asmb, s, idx+1, &io2);
+            idx = io2;
+            if(idx < slen && s[idx]==']') idx++;
+            else if(should_report_errors(st))
+                axx_diagf(1, 0, " error - '#%s[': missing ']'.\n", akey);
+            int64_t n = u256_to_i64(ixv);
+            if(n < 0 || n >= ar->len){
+                if(should_report_errors(st))
+                    axx_diagf(1, 0, " error - index %lld is out of range for array "
+                               "symbol '%s' (0..%d).\n", (long long)n, akey, ar->len-1);
+                x = u256_zero();
+            } else if(ar->items[n].is_str){
+                if(should_report_errors(st))
+                    axx_diagf(1, 0, " error - '#%s[%lld]' is a string item and has no "
+                               "numeric value.\n", akey, (long long)n);
+                x = u256_zero();
+            } else {
+                x = ar->items[n].v;
+            }
+        }
+        else if(symbol_get(st,t,&sv)) x=sv;
         else {
             if(should_report_errors(st)){
                 axx_diagf(1, 0, " error - undefined symbol: '#%s'\n", t);
@@ -4380,11 +4439,39 @@ static uint256_t expr_expression(Assembler *asmb, const char *s, int idx, int *i
     return expr_term11(asmb,s,idx,idx_out);
 }
 
+/* 文字列シンボル（`.setsym::名前::"文字列"`）。定義は後方にある。 */
+static void        strsym_set(AsmState *st, const char *upper_name, const char *val);
+static void        strsym_delete(AsmState *st, const char *upper_name);
+static const char *strsym_get(AsmState *st, const char *upper_name);
+static char       *txt_template_inner(const char *q);
+/* 配列シンボル（`.setsym::名前::[…]`）。定義は後方にある。 */
+static void        arrsym_set_from_text(Assembler *asmb, const char *upper_name, const char *q);
+static void        arrsym_delete(AsmState *st, const char *upper_name);
+static void        arrsym_clear_all(AsmState *st);
+static int         symbol_copy_from_name(AsmState *st, const char *dst_upper, const char *value_field);
+
 static int dir_set_symbol(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".setsym")!=0) return 0;
     const char *name_field = e->f[1][0] ? e->f[1] : e->f[2];
     const char *value_field = e->f[1][0] ? e->f[2] : "";
     char key[512]; axx_strupr_to(key,name_field,sizeof(key));
+    /* 値が `"..."` なら文字列シンボル、`[...]` なら配列シンボル。 */
+    {
+        const char *q = value_field;
+        while(*q==' '||*q=='\t') q++;
+        if(*q=='"'){
+            char *body = txt_template_inner(q);
+            strsym_set(&asmb->st, key, body);
+            free(body);
+            return 1;
+        }
+        if(*q=='['){
+            arrsym_set_from_text(asmb, key, q);
+            return 1;
+        }
+        /* `.setsym::y::x` — x が文字列／配列シンボルなら、その写しを作る。 */
+        if(symbol_copy_from_name(&asmb->st, key, value_field)) return 1;
+    }
     int io;
     uint256_t v = value_field[0] ? expr_expression_pat(asmb,value_field,0,&io) : u256_zero();
     smap_set(&asmb->st.symbols,key,v);
@@ -4396,8 +4483,13 @@ static int dir_clear_symbol(Assembler *asmb, PatEntry *e){
     if(e->f[2][0]){
         char key[512]; axx_strupr_to(key,e->f[2],sizeof(key));
         smap_delete(&asmb->st.symbols,key);
+        strsym_delete(&asmb->st, key);
+        arrsym_delete(&asmb->st, key);
     } else {
         smap_clear(&asmb->st.symbols);
+        sv_free(&asmb->st.strsym_names); sv_init(&asmb->st.strsym_names);
+        sv_free(&asmb->st.strsym_vals);  sv_init(&asmb->st.strsym_vals);
+        arrsym_clear_all(&asmb->st);
     }
     return 1;
 }
@@ -4548,6 +4640,47 @@ static int dir_epic(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* 要素の列挙欄（`.check` `.enum` `.map` の「名前の並び」）を項目に切る。
+ * 項目が配列シンボルの名前なら、その内容をその場に展開する。つまり
+ *   .setsym::regs::["R0","R1","R2"]
+ *   .check::x::regs
+ * は `.check::x::R0,R1,R2` と同じ意味になる。配列と素の名前は混ぜて書ける。
+ * 名前は大文字化して積み、`""` `''`（省略可の印）と空欄は長さ0の項目にする。 */
+static void elem_list_expand(AsmState *st, const char *text, StrVec *out){
+    const char *p = text;
+    while(*p){
+        while(*p == ' ' || *p == '\t') p++;
+        char buf[512]; int j = 0;
+        while(*p && *p != ',' && j < (int)sizeof(buf)-1) buf[j++] = axx_upper_char(*p++);
+        while(*p && *p != ',') p++;
+        buf[j] = '\0';
+        while(j > 0 && (buf[j-1] == ' ' || buf[j-1] == '\t')) buf[--j] = '\0';
+
+        if(j == 2 && ((buf[0]=='"' && buf[1]=='"') || (buf[0]=='\'' && buf[1]=='\''))) j = 0;
+        if(j == 0){
+            sv_push(out, "");
+        } else {
+            struct ArrSym *ar = arrsym_get(st, buf);
+            if(ar){
+                for(int k = 0; k < ar->len; k++){
+                    if(ar->items[k].is_str){
+                        char up[512]; axx_strupr_to(up, ar->items[k].s, sizeof(up));
+                        sv_push(out, up);
+                    } else {
+                        char num[96];
+                        u256_to_pydec(ar->items[k].v, num, sizeof(num));
+                        sv_push(out, num);
+                    }
+                }
+            } else {
+                sv_push(out, buf);
+            }
+        }
+        if(*p == ',') p++;
+        else break;
+    }
+}
+
 static int dir_check(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".check") != 0) return 0;
     const char *var_str  = e->f[1][0] ? e->f[1] : e->f[2];
@@ -4565,27 +4698,22 @@ static int dir_check(Assembler *asmb, PatEntry *e){
     int idx = var - 'a';
     sv_free(&asmb->st.check_constraints[idx]);
     sv_init(&asmb->st.check_constraints[idx]);
-    const char *p = syms_str;
-    while(*p){
-        while(*p == ' ' || *p == '\t') p++;
-        if(!*p) break;
-        char buf[512]; int j = 0;
-        while(*p && *p != ',' && j < (int)sizeof(buf)-1)
-            buf[j++] = (char)toupper((unsigned char)*p++);
-        buf[j] = '\0';
-        while(j > 0 && (buf[j-1] == ' ' || buf[j-1] == '\t')) buf[--j] = '\0';
-        if(j == 2 && ((buf[0]=='"' && buf[1]=='"') || (buf[0]=='\'' && buf[1]=='\''))){
+    StrVec elems; sv_init(&elems);
+    elem_list_expand(&asmb->st, syms_str, &elems);
+    for(int ei = 0; ei < elems.len; ei++){
+        const char *nm = elems.data[ei];
+        if(!nm[0]){
             /* 空文字リテラルは「このオペランドは省略可」の印。
                省略時、変数には 0 が入る。長さ0の要素として積む。 */
             int dup = 0;
             for(int si = 0; si < asmb->st.check_constraints[idx].len; si++)
                 if(asmb->st.check_constraints[idx].data[si][0] == '\0'){ dup = 1; break; }
             if(!dup) sv_push(&asmb->st.check_constraints[idx], "");
-        } else if(j > 0){
-            sv_push(&asmb->st.check_constraints[idx], buf);
+        } else {
+            sv_push(&asmb->st.check_constraints[idx], nm);
         }
-        if(*p == ',') p++;
     }
+    sv_free(&elems);
     return 1;
 }
 
@@ -4611,6 +4739,131 @@ static int dir_clrcheck(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.free::名前,名前,…`
+ * その名前を、パターン層のあらゆる表から外す。置き場所ごとに
+ * `.clearsym` `.clrcheck` `.clrenum` と書き分けなくても、名前ひとつで
+ * 「もうこの名前は使わない」と宣言できるようにするためのもの。外すのは
+ *   - `.setsym` の数値シンボル・文字列シンボル・配列シンボル
+ *   - `.sub` の表
+ *   - `.check` の候補（どの変数の一覧に入っていても取り除く）
+ *   - 名前が小文字1文字なら、その変数の `.check` と `.enum` ごと
+ * で、`.clearsym` などと同じく書かれた位置から先に効く。 */
+static void free_one_name(Assembler *asmb, const char *name){
+    AsmState *st = &asmb->st;
+    if(!name[0]) return;
+    char key[512]; axx_strupr_to(key,name,sizeof(key));
+
+    smap_delete(&st->symbols, key);
+    strsym_delete(st, key);
+    arrsym_delete(st, key);
+    subv_mark_freed(&st->subs, name);
+
+    /* `.check` の候補からも外す。候補は大文字で積まれている。 */
+    for(int vi=0; vi<26; vi++){
+        StrVec *cv = &st->check_constraints[vi];
+        int w = 0;
+        for(int k=0; k<cv->len; k++){
+            if(strcmp(cv->data[k], key)==0){ free(cv->data[k]); continue; }
+            cv->data[w++] = cv->data[k];
+        }
+        cv->len = w;
+    }
+
+    /* 名前が変数そのものなら、その変数の制約と列挙ごと外す。 */
+    if(name[1]=='\0'){
+        int c = axx_upper_char(name[0]);
+        if(c>='A' && c<='Z'){
+            int vi = c - 'A';
+            sv_free(&st->check_constraints[vi]); sv_init(&st->check_constraints[vi]);
+            enumdef_clear(&st->enum_defs[vi]);
+        }
+    }
+}
+
+/* 定義は後方にある。 */
+static char *pat_trim(char *s);
+static char *map_subst_index(const char *expr, char var, int i);
+
+/* `.map::<変数>::<名前の並び>::<式>`
+ * 並びの各名前に値を与える `.setsym` と、その変数の `.check` をまとめて書く
+ * ための省略形。式の中の変数は「その名前が並びの何番目か」(0 から数える)。
+ *
+ *   .map::x::R0,R1,R2::1<<x
+ * は
+ *   .setsym::R0::1<<(0)
+ *   .setsym::R1::1<<(1)
+ *   .setsym::R2::1<<(2)
+ *   .check::x::R0,R1,R2
+ * と等価である。式を省くと変数そのもの、すなわち 0 からの連番になる。
+ * 並びには配列シンボルの名前を書ける（elem_list_expand() が展開する）。
+ *
+ * into が非NULLならシンボルはそこへ、NULLなら st->symbols へ入れる。
+ * set_check が真なら `.check` も設定する。 */
+static void map_apply(Assembler *asmb, PatEntry *e, SymMap *into, int set_check){
+    AsmState *st = &asmb->st;
+    const char *var_str  = e->f[1][0] ? pat_trim(e->f[1]) : "";
+    const char *syms_str = e->f[2];
+    const char *expr_str = pat_trim(e->f[3])[0] ? e->f[3] : var_str;
+    if(!var_str[0] || var_str[1] != '\0') return;
+    char var = (char)tolower((unsigned char)var_str[0]);
+    if(var < 'a' || var > 'z') return;
+
+    StrVec elems; sv_init(&elems);
+    elem_list_expand(st, syms_str, &elems);
+    for(int i = 0; i < elems.len; i++){
+        /* 空の要素（`""` の省略可印など）は番号だけ消費して何も定義しない。 */
+        if(!elems.data[i][0]) continue;
+        char *val = map_subst_index(expr_str, var, i);
+        int io;
+        uint256_t v = expr_expression_pat(asmb, val, 0, &io);
+        free(val);
+        smap_set(into ? into : &st->symbols, elems.data[i], v);
+    }
+    if(set_check){
+        int idx = var - 'a';
+        sv_free(&st->check_constraints[idx]);
+        sv_init(&st->check_constraints[idx]);
+        for(int i = 0; i < elems.len; i++){
+            if(!elems.data[i][0]){
+                int dup = 0;
+                for(int si = 0; si < st->check_constraints[idx].len; si++)
+                    if(st->check_constraints[idx].data[si][0] == '\0'){ dup = 1; break; }
+                if(!dup) sv_push(&st->check_constraints[idx], "");
+            } else {
+                sv_push(&st->check_constraints[idx], elems.data[i]);
+            }
+        }
+    }
+    sv_free(&elems);
+}
+
+static int dir_map(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".map") != 0) return 0;
+    map_apply(asmb, e, NULL, 1);
+    return 1;
+}
+
+static int dir_free(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".free") != 0) return 0;
+    const char *names = e->f[2][0] ? e->f[2] : e->f[1];
+    if(!names[0]){
+        axx_diagf(1, 0, " error - .free: needs '.free::<name,name,...>'.\n");
+        return 1;
+    }
+    const char *p = names;
+    while(*p){
+        while(*p==' '||*p=='\t') p++;
+        char nm[512]; int j = 0;
+        while(*p && *p!=',' && j < (int)sizeof(nm)-1) nm[j++] = *p++;
+        while(j > 0 && (nm[j-1]==' '||nm[j-1]=='\t')) j--;
+        nm[j] = '\0';
+        free_one_name(asmb, nm);
+        if(*p==',') p++;
+        else break;
+    }
+    return 1;
+}
+
 /* `.enum::<変数>::<要素名の並び>::<式>`
  * `!E<変数>` が拾う「要素名のリスト」の語彙と、そこから値を作る式を決める。
  * 式の中では各要素名が「そのリストに現れていれば .setsym の値、
@@ -4628,24 +4881,18 @@ static int dir_enum(Assembler *asmb, PatEntry *e){
     }
     int idx = var - 'a';
 
+    StrVec elems; sv_init(&elems);
+    elem_list_expand(&asmb->st, names_str, &elems);
     StrVec names; sv_init(&names);
-    const char *p = names_str;
-    while(*p){
-        while(*p == ' ' || *p == '\t') p++;
-        char buf[512]; int j = 0;
-        while(*p && *p != ',' && j < (int)sizeof(buf)-1)
-            buf[j++] = axx_upper_char(*p++);
-        while(*p && *p != ',') p++;
-        buf[j] = '\0';
-        while(j > 0 && (buf[j-1] == ' ' || buf[j-1] == '\t')) buf[--j] = '\0';
-        if(j > 0){
-            int dup = 0;
-            for(int k = 0; k < names.len; k++)
-                if(strcmp(names.data[k], buf) == 0){ dup = 1; break; }
-            if(!dup) sv_push(&names, buf);
-        }
-        if(*p == ',') p++;
+    for(int ei = 0; ei < elems.len; ei++){
+        const char *nm = elems.data[ei];
+        if(!nm[0]) continue;
+        int dup = 0;
+        for(int k = 0; k < names.len; k++)
+            if(strcmp(names.data[k], nm) == 0){ dup = 1; break; }
+        if(!dup) sv_push(&names, nm);
     }
+    sv_free(&elems);
     if(names.len == 0){
         axx_diagf(1, 0, " error - .enum: no enumeration element is given.\n");
         sv_free(&names);
@@ -5463,6 +5710,7 @@ static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
         return 0;
     }
     SubDef *d = subv_find(&asmb->st.subs, name);
+    if(d && d->freed) d = NULL;   /* `.free` で解放済み */
     if(!d){
         axx_diagf(1, 0, " error - !S{{%s}}: no sub table named '%s' (define it with "
                    "'.sub::%s ... .return').\n", name, name, name);
@@ -7738,21 +7986,9 @@ static void readpat(Assembler *asmb, const char *fn){
             }
         }
 
-        /* `.map::<変数>::<名前の並び>::<式>` は、並びの各名前に値を与える
-         * `.setsym` と、その変数の `.check` をまとめて書くための省略形。
-         * 式の中の変数は「その名前が並びの何番目か」(0 から数える) を指す。
-         *
-         *   .map::x::R0,R1,R2::1<<x
-         * は
-         *   .setsym::R0::1<<(0)
-         *   .setsym::R1::1<<(1)
-         *   .setsym::R2::1<<(2)
-         *   .check::x::R0,R1,R2
-         * と等価である。式を省くと変数そのもの、すなわち 0 からの連番になる。
-         * レジスタ名やビットマスクのように「名前の並びがそのまま規則的な値」に
-         * なる表は、`.setsym` を並べて書くと並び順と値が食い違いやすい。
-         * ここでパターン表へ展開してしまうので、以降の処理は素の
-         * `.setsym` / `.check` と区別しない。 */
+        /* `.map::<変数>::<名前の並び>::<式>` の書式検査。展開は
+         * setpatsymbols() と dir_map() で行う（並びに配列シンボルを書けるよう
+         * にするため。配列はパターンを読み終えてから登録される）。 */
         {
             char kw[16]={0};
             int a = axx_skipspc(fields[0], 0);
@@ -7761,9 +7997,7 @@ static void readpat(Assembler *asmb, const char *fn){
             if(e - a < (int)sizeof(kw))
                 for(int k = a; k < e; k++) kw[k-a] = axx_upper_char(fields[0][k]);
             if(strcmp(kw,".MAP")==0){
-                const char *var_str  = (nf>2) ? pat_trim(fields[1]) : "";
-                const char *syms_str = (nf>2) ? fields[2] : ((nf>1) ? fields[1] : "");
-                const char *expr_str = (nf>3 && pat_trim(fields[3])[0]) ? fields[3] : var_str;
+                const char *var_str = (nf>2) ? pat_trim(fields[1]) : "";
                 char var = var_str[0] ? (char)tolower((unsigned char)var_str[0]) : 0;
                 if(!var_str[0] || nf<3){
                     axx_diagf(1, 0, " error - .map: needs '.map::<variable>::"
@@ -7771,39 +8005,7 @@ static void readpat(Assembler *asmb, const char *fn){
                 } else if(var < 'a' || var > 'z' || var_str[1] != '\0'){
                     axx_diagf(1, 0, " error - .map: variable should be a lower case "
                                "letter ('%s').\n", var_str);
-                } else {
-                    /* 名前の並びを `,` で切り、i 番目の名前に「式の変数を i に
-                     * 置き換えたもの」を値として与える。空の要素（`""` の
-                     * 省略可印など）は番号だけ消費して `.setsym` を出さない。 */
-                    const char *q = syms_str;
-                    int i = 0;
-                    while(1){
-                        while(*q == ' ' || *q == '\t') q++;
-                        char nm[512]; int j = 0;
-                        while(*q && *q != ',' && j < (int)sizeof(nm)-1) nm[j++] = *q++;
-                        while(j > 0 && (nm[j-1]==' ' || nm[j-1]=='\t')) j--;
-                        nm[j] = '\0';
-                        int empty = (j == 0)
-                                    || (j == 2 && ((nm[0]=='"'  && nm[1]=='"')
-                                                || (nm[0]=='\'' && nm[1]=='\'')));
-                        if(!empty){
-                            char *val = map_subst_index(expr_str, var, i);
-                            PatEntry *se = pv_push_blank(&asmb->st.pat);
-                            pat_set(se,0,".setsym");
-                            pat_set(se,1,nm);
-                            pat_set(se,2,val);
-                            free(val);
-                        }
-                        i++;
-                        if(*q != ',') break;
-                        q++;
-                    }
-                    PatEntry *ce = pv_push_blank(&asmb->st.pat);
-                    pat_set(ce,0,".check");
-                    pat_set(ce,1,var_str);
-                    pat_set(ce,2,syms_str);
                 }
-                free(fbuf); continue;
             }
         }
 
@@ -7971,6 +8173,186 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
     }
     out[n]=0;
     *is_empty=!has_content;
+}
+
+/* ==================== 配列シンボル ====================
+ * `.setsym::名前::[項目,項目,…]` で登録する。項目は数値の式でも
+ * `"文字列"` でもよく、混ざっていてもよい。添字は 0 から数える。
+ *   x[3]      … 文字列テンプレート（3.5.2）の中から
+ *   #x[3]     … 式の中から（数値の項目のみ）
+ * 数は多くないので、文字列シンボルと同じく素直な線形探索で引く。 */
+static int arrsym_find(AsmState *st, const char *upper_name){
+    for(int i=0;i<st->arrsyms_len;i++)
+        if(strcmp(st->arrsyms[i].name, upper_name)==0) return i;
+    return -1;
+}
+static struct ArrSym *arrsym_get(AsmState *st, const char *upper_name){
+    int i = arrsym_find(st, upper_name);
+    return (i < 0) ? NULL : &st->arrsyms[i];
+}
+static void arrsym_free_one(struct ArrSym *a){
+    for(int i=0;i<a->len;i++) free(a->items[i].s);
+    free(a->items); free(a->name);
+    a->items = NULL; a->name = NULL; a->len = 0;
+}
+static void arrsym_delete(AsmState *st, const char *upper_name){
+    int i = arrsym_find(st, upper_name);
+    if(i < 0) return;
+    arrsym_free_one(&st->arrsyms[i]);
+    for(int k=i+1;k<st->arrsyms_len;k++) st->arrsyms[k-1] = st->arrsyms[k];
+    st->arrsyms_len--;
+}
+static void arrsym_clear_all(AsmState *st){
+    for(int i=0;i<st->arrsyms_len;i++) arrsym_free_one(&st->arrsyms[i]);
+    free(st->arrsyms);
+    st->arrsyms = NULL; st->arrsyms_len = 0; st->arrsyms_cap = 0;
+}
+
+/* 既にある配列シンボルをそのまま複製する。`.setsym::y::x` 用。 */
+static void arrsym_copy(AsmState *st, const char *dst_upper, const char *src_upper){
+    struct ArrSym *src = arrsym_get(st, src_upper);
+    if(!src) return;
+    /* 自分自身への代入は何もしない（複製元を消してしまわないように）。 */
+    if(strcmp(dst_upper, src_upper)==0) return;
+    int n = src->len;
+    SymItem *items = n ? malloc((size_t)n*sizeof(SymItem)) : NULL;
+    if(n && !items){ perror("malloc"); exit(1); }
+    for(int i=0;i<n;i++){
+        items[i].is_str = src->items[i].is_str;
+        items[i].v      = src->items[i].v;
+        items[i].s      = src->items[i].s ? strdup(src->items[i].s) : NULL;
+    }
+    arrsym_delete(st, dst_upper);
+    if(st->arrsyms_len >= st->arrsyms_cap){
+        st->arrsyms_cap = st->arrsyms_cap ? st->arrsyms_cap*2 : 8;
+        st->arrsyms = realloc(st->arrsyms, (size_t)st->arrsyms_cap*sizeof(*st->arrsyms));
+        if(!st->arrsyms){ perror("realloc"); exit(1); }
+    }
+    struct ArrSym *a = &st->arrsyms[st->arrsyms_len++];
+    a->name = strdup(dst_upper);
+    a->items = items;
+    a->len = n;
+}
+
+/* 値欄が「名前ひとつ」で、それが文字列／配列シンボルなら複製する。
+ * `.setsym::y::x` が `x` の写しを作るための枝で、複製したら真を返す。
+ * 素の名前は本来ラベル参照なので（シンボルは `#x` と書く）、ここで拾っても
+ * これまで書けていた式の意味は変わらない。 */
+static int symbol_copy_from_name(AsmState *st, const char *dst_upper, const char *value_field){
+    const char *q = value_field;
+    while(*q==' '||*q=='\t') q++;
+    const char *b = q;
+    if(!(isalpha((unsigned char)*q) || *q=='_')) return 0;
+    while(isalnum((unsigned char)*q) || *q=='_') q++;
+    int n = (int)(q - b);
+    while(*q==' '||*q=='\t') q++;
+    if(*q) return 0;                 /* 名前だけの欄ではない */
+    char src[512];
+    if(n >= (int)sizeof(src)) return 0;
+    for(int i=0;i<n;i++) src[i] = (char)axx_upper_char(b[i]);
+    src[n] = '\0';
+
+    if(arrsym_get(st, src)){ arrsym_copy(st, dst_upper, src); return 1; }
+    const char *sv = strsym_get(st, src);
+    if(sv){
+        if(strcmp(dst_upper, src)==0) return 1;
+        char *dup = strdup(sv);
+        if(!dup){ perror("strdup"); exit(1); }
+        strsym_set(st, dst_upper, dup);
+        free(dup);
+        return 1;
+    }
+    return 0;
+}
+
+/* `[...]` の中身を項目に切って登録する。q は `[` を指していること。
+ * 区切りは最上位のカンマだけで、`"..."` の中や入れ子の括弧の中のカンマは
+ * 区切りにしない（`[1,(2,3)]` のような書き方で崩れないようにするため）。 */
+static void arrsym_set_from_text(Assembler *asmb, const char *upper_name, const char *q){
+    AsmState *st = &asmb->st;
+    arrsym_delete(st, upper_name);
+    if(st->arrsyms_len >= st->arrsyms_cap){
+        st->arrsyms_cap = st->arrsyms_cap ? st->arrsyms_cap*2 : 8;
+        st->arrsyms = realloc(st->arrsyms, (size_t)st->arrsyms_cap*sizeof(*st->arrsyms));
+        if(!st->arrsyms){ perror("realloc"); exit(1); }
+    }
+    struct ArrSym *a = &st->arrsyms[st->arrsyms_len++];
+    a->name = strdup(upper_name);
+    a->items = NULL; a->len = 0;
+    int cap = 0;
+
+    const char *p = q + 1;         /* `[` の次から */
+    while(*p){
+        while(*p==' '||*p=='\t') p++;
+        if(*p==']' || !*p) break;
+        /* 1項目ぶんの範囲を測る。 */
+        const char *b = p;
+        int depth = 0, inq = 0;
+        while(*p){
+            if(inq){
+                if(*p=='\\' && p[1]) p++;
+                else if(*p=='"') inq = 0;
+            } else if(*p=='"') inq = 1;
+            else if(*p=='[' || *p=='(') depth++;
+            else if(*p==')') depth--;
+            else if(*p==']'){ if(depth==0) break; depth--; }
+            else if(*p==',' && depth==0) break;
+            p++;
+        }
+        int n = (int)(p - b);
+        while(n > 0 && (b[n-1]==' '||b[n-1]=='\t')) n--;
+        char *item = malloc((size_t)n+1);
+        if(!item){ perror("malloc"); exit(1); }
+        memcpy(item, b, (size_t)n); item[n] = '\0';
+
+        if(a->len >= cap){
+            cap = cap ? cap*2 : 8;
+            a->items = realloc(a->items, (size_t)cap*sizeof(SymItem));
+            if(!a->items){ perror("realloc"); exit(1); }
+        }
+        SymItem *it = &a->items[a->len++];
+        it->is_str = 0; it->s = NULL; it->v = u256_zero();
+        if(item[0]=='"'){
+            it->is_str = 1;
+            it->s = txt_template_inner(item);
+        } else if(item[0]){
+            int io;
+            it->v = expr_expression_pat(asmb, item, 0, &io);
+        }
+        free(item);
+        if(*p==',') p++;
+        else break;
+    }
+}
+
+/* 文字列シンボルの表。数は多くないので素直な線形探索で引く。
+ * 名前は大文字化した形で覚える（`.setsym` の数値シンボルと同じ規約）。 */
+static int strsym_find(AsmState *st, const char *upper_name){
+    for(int i=0;i<st->strsym_names.len;i++)
+        if(strcmp(st->strsym_names.data[i], upper_name)==0) return i;
+    return -1;
+}
+static const char *strsym_get(AsmState *st, const char *upper_name){
+    int i = strsym_find(st, upper_name);
+    return (i < 0) ? NULL : st->strsym_vals.data[i];
+}
+static void strsym_set(AsmState *st, const char *upper_name, const char *val){
+    int i = strsym_find(st, upper_name);
+    if(i >= 0){ free(st->strsym_vals.data[i]); st->strsym_vals.data[i] = strdup(val); return; }
+    sv_push(&st->strsym_names, upper_name);
+    sv_push(&st->strsym_vals,  val);
+}
+static void strsym_delete(AsmState *st, const char *upper_name){
+    int i = strsym_find(st, upper_name);
+    if(i < 0) return;
+    free(st->strsym_names.data[i]);
+    free(st->strsym_vals.data[i]);
+    for(int k=i+1;k<st->strsym_names.len;k++){
+        st->strsym_names.data[k-1] = st->strsym_names.data[k];
+        st->strsym_vals.data[k-1]  = st->strsym_vals.data[k];
+    }
+    st->strsym_names.len--;
+    st->strsym_vals.len--;
 }
 
 /* ==================== 文字列テンプレートのエンコーディング欄 ====================
@@ -8171,6 +8553,100 @@ static void txt_emit_expr(Assembler *asmb, TxtBuf *t, const char *expr, int kind
     }
 }
 
+/* テンプレートの中の名前を解決して積む。
+ * 優先順位は
+ *   1. `.setsym::名前::"文字列"` の文字列シンボル … その文字列
+ *   2. 1文字の小文字                             … パターン変数の値（10進）
+ *   3. どれでもない                               … 書かれたままの文字
+ * で、`Rr` の `r` は 2 に、`{{x}}` の `x` は 1 に当たる。
+ * 数値シンボルをここで引かないのは、`num=` のような普通の文（たまたま
+ * `.setsym::NUM` がある）が黙って数字に化けるのを避けるため。数値が要る
+ * ときは `{{#NUM}}` と書けば本体の式評価器が引く。 */
+static void txt_emit_name(Assembler *asmb, TxtBuf *t, const char *name, int len){
+    AsmState *st = &asmb->st;
+    char key[512];
+    if(len >= (int)sizeof(key)) len = (int)sizeof(key)-1;
+    for(int k=0;k<len;k++) key[k] = (char)axx_upper_char(name[k]);
+    key[len] = '\0';
+
+    const char *sv = strsym_get(st, key);
+    if(sv){ txt_adds(t, sv); return; }
+
+    /* 添字なしの配列は、全項目を `,` でつないで出す。 */
+    struct ArrSym *ar = arrsym_get(st, key);
+    if(ar){
+        for(int k=0;k<ar->len;k++){
+            if(k) txt_addc(t, ',');
+            if(ar->items[k].is_str) txt_adds(t, ar->items[k].s);
+            else                    txt_radix(t, ar->items[k].v, 10);
+        }
+        return;
+    }
+
+    if(len == 1 && name[0] >= 'a' && name[0] <= 'z'){
+        txt_radix(t, st->vars[name[0]-'a'].val, 10);
+        return;
+    }
+    txt_addn(t, name, (size_t)len);
+}
+
+/* `x[3]` のような添字つきの参照を積む。添字は式で、0 から数える。
+ * 配列でない名前や範囲外の添字は診断して何も出さない。 */
+static void txt_emit_indexed(Assembler *asmb, TxtBuf *t,
+                             const char *name, int len, const char *idxtext){
+    AsmState *st = &asmb->st;
+    char key[512];
+    if(len >= (int)sizeof(key)) len = (int)sizeof(key)-1;
+    for(int k=0;k<len;k++) key[k] = (char)axx_upper_char(name[k]);
+    key[len] = '\0';
+
+    struct ArrSym *ar = arrsym_get(st, key);
+    if(!ar){
+        if(should_report_errors(st))
+            axx_diagf(1, 0, " error - '%s' is not an array symbol; '%s[...]' "
+                       "needs '.setsym::%s::[...]'.\n", key, key, key);
+        return;
+    }
+    int io;
+    int saved_undef = st->error_undefined_label;
+    st->error_undefined_label = 0;
+    uint256_t iv = expr_expression_pat(asmb, idxtext, 0, &io);
+    if(st->error_undefined_label) saved_undef = 1;
+    st->error_undefined_label = saved_undef;
+    int64_t n = u256_to_i64(iv);
+    if(n < 0 || n >= ar->len){
+        if(should_report_errors(st))
+            axx_diagf(1, 0, " error - index %lld is out of range for array symbol "
+                       "'%s' (0..%d).\n", (long long)n, key, ar->len-1);
+        return;
+    }
+    if(ar->items[n].is_str) txt_adds(t, ar->items[n].s);
+    else                    txt_radix(t, ar->items[n].v, 10);
+}
+
+/* 名前の直後の `[...]` の閉じ位置を返す。無ければ -1。 */
+static int txt_close_bracket(const char *s, int i){
+    int depth = 0;
+    for(; s[i]; i++){
+        if(s[i]=='[') depth++;
+        else if(s[i]==']'){ if(--depth == 0) return i; }
+    }
+    return -1;
+}
+
+/* `{{...}}` の中身が名前ひとつだけかどうか。そうなら長さを返す。 */
+static int txt_bare_name_len(const char *s){
+    int i = 0;
+    while(s[i]==' '||s[i]=='\t') i++;
+    int a = i;
+    if(!((s[i]>='a'&&s[i]<='z')||(s[i]>='A'&&s[i]<='Z')||s[i]=='_')) return 0;
+    while((s[i]>='a'&&s[i]<='z')||(s[i]>='A'&&s[i]<='Z')
+          ||(s[i]>='0'&&s[i]<='9')||s[i]=='_') i++;
+    int len = i - a;
+    while(s[i]==' '||s[i]=='\t') i++;
+    return s[i] ? 0 : len;
+}
+
 /* テンプレート本文（引用符の中身）を展開して t に積む。 */
 static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
     AsmState *st = &asmb->st;
@@ -8196,6 +8672,44 @@ static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
                     done = 1;
                 }
             }
+            if(!done){
+                /* `{{x[3]}}` のように名前と添字なら、配列シンボルを引く。 */
+                int bs = 0; while(inner[bs]==' '||inner[bs]=='\t') bs++;
+                int be = bs;
+                if((inner[be]>='a'&&inner[be]<='z')||(inner[be]>='A'&&inner[be]<='Z')
+                   || inner[be]=='_'){
+                    while((inner[be]>='a'&&inner[be]<='z')||(inner[be]>='A'&&inner[be]<='Z')
+                          ||(inner[be]>='0'&&inner[be]<='9')||inner[be]=='_') be++;
+                    int bq = be; while(inner[bq]==' '||inner[bq]=='\t') bq++;
+                    if(inner[bq]=='['){
+                        int cb = txt_close_bracket(inner, bq);
+                        if(cb > 0){
+                            int tail = cb+1;
+                            while(inner[tail]==' '||inner[tail]=='\t') tail++;
+                            if(!inner[tail]){
+                                inner[cb] = '\0';
+                                txt_emit_indexed(asmb, t, inner+bs, be-bs, inner+bq+1);
+                                done = 1;
+                            }
+                        }
+                    }
+                }
+            }
+            if(!done){
+                /* `{{x}}` のように名前ひとつなら、文字列／配列シンボルを先に見る。 */
+                int bl = txt_bare_name_len(inner);
+                if(bl){
+                    char bk[512];
+                    int bs = 0; while(inner[bs]==' '||inner[bs]=='\t') bs++;
+                    int bn = bl < (int)sizeof(bk) ? bl : (int)sizeof(bk)-1;
+                    for(int k=0;k<bn;k++) bk[k] = (char)axx_upper_char(inner[bs+k]);
+                    bk[bn] = '\0';
+                    if(strsym_get(st, bk) || arrsym_get(st, bk)){
+                        txt_emit_name(asmb, t, inner+bs, bn);
+                        done = 1;
+                    }
+                }
+            }
             if(!done) txt_emit_expr(asmb, t, inner, -1);
             free(inner);
             i += n + 4;
@@ -8219,9 +8733,25 @@ static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
             }
         }
         if(s[i] >= 'a' && s[i] <= 'z'){
-            /* パターン変数。値は10進で埋める。 */
-            txt_radix(t, st->vars[s[i]-'a'].val, 10);
-            i++;
+            /* 小文字で始まる名前。1文字ならパターン変数、それより長ければ
+             * `var1` `var_2` のような文字列／数値シンボルの名前として引く。 */
+            int j = i + 1;
+            while((s[j]>='a'&&s[j]<='z') || (s[j]>='0'&&s[j]<='9') || s[j]=='_') j++;
+            if(s[j]=='['){
+                int cb = txt_close_bracket(s, j);
+                if(cb > 0){
+                    int n = cb - (j+1);
+                    char *ix = malloc((size_t)n+1);
+                    if(!ix){ perror("malloc"); exit(1); }
+                    memcpy(ix, s+j+1, (size_t)n); ix[n] = '\0';
+                    txt_emit_indexed(asmb, t, s + i, j - i, ix);
+                    free(ix);
+                    i = cb + 1;
+                    continue;
+                }
+            }
+            txt_emit_name(asmb, t, s + i, j - i);
+            i = j;
             continue;
         }
         txt_addc(t, s[i++]);
@@ -9582,6 +10112,8 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         if(dir_vliwp(asmb,i)) continue;
         if(dir_check(asmb,i)) continue;
         if(dir_clrcheck(asmb,i)) continue;
+        if(dir_map(asmb,i)) continue;
+        if(dir_free(asmb,i)) continue;
         if(dir_enum(asmb,i)) continue;
         if(dir_clrenum(asmb,i)) continue;
         if(dir_errmsg(asmb,i)) continue;
@@ -9853,6 +10385,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
         sv_init(&asmb->st.check_constraints[_ci]);
         enumdef_clear(&asmb->st.enum_defs[_ci]);
     }
+    subv_unfreeze_all(&asmb->st.subs);
 
     smap_clear(&asmb->st.symbols);
     for(int pi=0; pi<asmb->st.patsymbols.nb; pi++)
@@ -13433,6 +13966,9 @@ done:
 
 static void setpatsymbols(Assembler *asmb){
     SymMap fresh; smap_init(&fresh);
+    sv_free(&asmb->st.strsym_names); sv_init(&asmb->st.strsym_names);
+    sv_free(&asmb->st.strsym_vals);  sv_init(&asmb->st.strsym_vals);
+    arrsym_clear_all(&asmb->st);
 
     for(int pi=0; pi<asmb->st.pat.len; pi++){
         PatEntry *e=&asmb->st.pat.data[pi];
@@ -13453,6 +13989,25 @@ static void setpatsymbols(Assembler *asmb){
             for(int fi=0; fi<fresh.nb; fi++)
                 for(SymEntry *fe=fresh.buckets[fi]; fe; fe=fe->next)
                     smap_set(&asmb->st.symbols, fe->key, fe->val);
+            /* 値が `"..."` なら文字列シンボル、`[...]` なら配列シンボル。
+             * どちらも数値ではないので式には直接出せず、文字列テンプレート
+             * （3.5.2）や `#名前[添字]` から引く。 */
+            {
+                const char *q = value_field;
+                while(*q==' '||*q=='\t') q++;
+                if(*q=='"'){
+                    char *body = txt_template_inner(q);
+                    strsym_set(&asmb->st, key, body);
+                    free(body);
+                    continue;
+                }
+                if(*q=='['){
+                    arrsym_set_from_text(asmb, key, q);
+                    continue;
+                }
+                /* `.setsym::y::x` — x が文字列／配列シンボルなら写しを作る。 */
+                if(symbol_copy_from_name(&asmb->st, key, value_field)) continue;
+            }
             int io;
             uint256_t v = value_field[0] ? expr_expression_pat(asmb,value_field,0,&io) : u256_zero();
             smap_set(&fresh, key, v);
@@ -13462,8 +14017,46 @@ static void setpatsymbols(Assembler *asmb){
             if(e->f[2][0]){
                 char key[512]; axx_strupr_to(key,e->f[2],sizeof(key));
                 smap_delete(&fresh, key);
+                strsym_delete(&asmb->st, key);
+                arrsym_delete(&asmb->st, key);
             } else {
                 smap_clear(&fresh);
+                sv_free(&asmb->st.strsym_names); sv_init(&asmb->st.strsym_names);
+                sv_free(&asmb->st.strsym_vals);  sv_init(&asmb->st.strsym_vals);
+                arrsym_clear_all(&asmb->st);
+            }
+            continue;
+        }
+        if(strcmp(e->f[0],".map")==0){
+            /* `.map` のシンボルもこの前処理の表に積む。ここまでに積んだ
+             * ものを公開してから展開するので、並びに書いた配列シンボルも、
+             * 値の式に書いた `#記号` も解決できる。 */
+            smap_clear(&asmb->st.symbols);
+            for(int fi=0; fi<fresh.nb; fi++)
+                for(SymEntry *fe=fresh.buckets[fi]; fe; fe=fe->next)
+                    smap_set(&asmb->st.symbols, fe->key, fe->val);
+            map_apply(asmb, e, &fresh, 0);
+            continue;
+        }
+        /* `.free` はシンボルもこの前処理の表から外す（本体の走査でも同じ
+         * ことをするが、ここで外しておかないと後続の `.setsym` の値の式から
+         * 見えたままになる）。 */
+        if(strcmp(e->f[0],".free")==0){
+            const char *names = e->f[2][0] ? e->f[2] : e->f[1];
+            const char *p = names;
+            while(*p){
+                while(*p==' '||*p=='\t') p++;
+                char nm[512]; int j=0;
+                while(*p && *p!=',' && j<(int)sizeof(nm)-1) nm[j++]=*p++;
+                while(j>0 && (nm[j-1]==' '||nm[j-1]=='\t')) j--;
+                nm[j]='\0';
+                if(nm[0]){
+                    char key[512]; axx_strupr_to(key,nm,sizeof(key));
+                    smap_delete(&fresh, key);
+                    strsym_delete(&asmb->st, key);
+                    arrsym_delete(&asmb->st, key);
+                }
+                if(*p==',') p++; else break;
             }
             continue;
         }
