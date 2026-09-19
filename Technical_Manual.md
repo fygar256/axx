@@ -332,7 +332,7 @@ In the `instruction` field:
 | Written as | Meaning |
 |---|---|
 | Uppercase letters, digits, symbols, escaped characters | Character constants. Uppercase matches both cases in the source. |
-| lowercase letter | Value of the **symbol** at that position |
+| lowercase name | Value of the **symbol** at that position |
 | `!x` | Value of the **integer expression** at that position |
 | `!!x` | Value of the **integer factor** at that position |
 | `!Fx` | IEEE-754 bit pattern of a **32-bit** float expression |
@@ -342,8 +342,25 @@ In the `instruction` field:
 | `!S{{name}}x` | Value of the matching entry of the **sub table** `name` declared with `.sub` (section 3.7.2) |
 
 Captured values are referenced from `error_patterns` and `binary_list` by the
-bare letter — the `!` prefix is not repeated there. Every lowercase variable is
-reset to 0 for each pattern line, so an unmatched optional operand reads as 0.
+bare name — the `!` prefix is not repeated there. Every variable is reset to 0
+for each pattern line, so an unmatched optional operand reads as 0.
+
+**Variable names.** A variable is written `x` above, but a name may be longer:
+it starts with a lowercase letter and continues over lowercase letters, digits
+and `_`, so `abcdef`, `var1` and `var_2` are all variable names. The same names
+are used by `.check`, `.enum`, `.clrcheck`, `.clrenum`, `.map` and `.free`.
+
+```
+.check::reg::BC,DE,HL,SP
+INC reg,!imm_1 :: :: 0x03|reg,imm_1
+```
+
+A name longer than one letter is recognised in `error_patterns` and
+`binary_list` only after the pattern file has declared it — by capturing it
+(`!imm_1`), by naming it as a symbol position, or by a directive that takes a
+variable (`.check::reg::…`). Undeclared words there stay labels, exactly as
+before, so a name like `a1` still reads as a label unless a pattern declared it
+as a variable.
 
 Assembly lines are case-insensitive except for labels and section names.
 

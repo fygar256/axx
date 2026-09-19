@@ -801,7 +801,8 @@ class AssemblerState:
         self.lnstack = []        # 同、行番号スタック
 
         # パターン変数 a〜z の束縛値。
-        self.vars = [VAR_UNDEF for i in range(26)]
+        # 変数名（小文字1文字でも `var_2` のように長くてもよい）→ 値。
+        self.vars = {}
 
         # 同じ添字で「その値が未定義ラベル由来か」を覚えておく札。
         # 値そのものの大きさ（_is_undef_derived）だけでは、`UNDEF-UNDEF` や
@@ -809,7 +810,7 @@ class AssemblerState:
         # 束縛した時点で判っている事実なので、値とは別に持ち回る
         # （caxx.c の PatVar.is_undef に対応）。
         # vars を退避・復元する箇所は必ずこちらも一緒に扱うこと。
-        self.vars_undef = [False] * 26
+        self.vars_undef = {}
 
         self.deb1 = ""           # 照合デバッグ用（ソース側の残り）
         self.deb2 = ""           # 同（パターン側の残り）
@@ -839,6 +840,9 @@ class AssemblerState:
         self.fini_func: str | None = None
 
         # .check で登録された「この変数はこの条件を満たすこと」という制約。
+        # パターンが宣言した2文字以上の変数名（`var_2` 等）。式の中では
+        # ラベルより先にこれを見る。1文字の変数は従来どおり登録不要。
+        self.varnames: set = set()
         self.check_constraints: dict = {}
 
         # .enum で登録された列挙。変数1文字 -> (要素名のタプル, 式の文字列)。
@@ -1862,22 +1866,31 @@ class VariableManager:
 
     @staticmethod
     def _index(s):
-        u = StringUtils.upper(s)
-        if len(u) != 1 or u not in CAPITAL:
-            return -1
-        return ord(u) - ord('A')
+        """変数名を正規化する。小文字1文字でも `var_2` のように長くてもよい。
+
+        名前として読めなければ None。caxx.c の var_slot() にあたる。
+        """
+        if not s:
+            return None
+        u = s.lower()
+        if not u.isascii() or not ('a' <= u[0] <= 'z'):
+            return None
+        for ch in u[1:]:
+            if not ('a' <= ch <= 'z' or ch.isdigit() or ch == '_'):
+                return None
+        return u
 
     def get(self, s):
         i = self._index(s)
-        if i < 0:
+        if i is None:
             return VAR_UNDEF
-        return self.state.vars[i]
+        return self.state.vars.get(i, VAR_UNDEF)
 
     def is_undef(self, s):
         i = self._index(s)
-        if i < 0:
+        if i is None:
             return False
-        return self.state.vars_undef[i]
+        return self.state.vars_undef.get(i, False)
 
     def put(self, s, v):
         self.put_tagged(s, v, False)
@@ -1886,7 +1899,7 @@ class VariableManager:
         # 破綻点修正: `'' in CAPITAL` は True なので、空文字を渡されると
         # 直後の ord('') が TypeError になっていた（`len == 1` の判定が要る）。
         c = self._index(s)
-        if c < 0:
+        if c is None:
             return
         if isinstance(v, Decimal):
             if not v.is_finite():
@@ -2629,21 +2642,22 @@ class ExpressionEvaluator:
                     x = 0.0
         elif _enum_hit is not None:
             x, idx = _enum_hit
-        elif (idx < len(s) and self.state.expcaps.patvars and
-              s[idx] in LOWER and (idx + 1 >= len(s) or s[idx + 1] not in self.state.lwordchars)):
-            ch = s[idx]
-            if idx + 3 <= len(s) and s[idx + 1:idx + 3] == ':=':
+        elif (idx < len(s) and self.state.expcaps.patvars
+              and self._patvar_len_at(s, idx) > 0):
+            _vnl = self._patvar_len_at(s, idx)
+            ch = s[idx:idx + _vnl]
+            if idx + _vnl + 2 <= len(s) and s[idx + _vnl:idx + _vnl + 2] == ':=':
                 # 代入の右辺だけが未定義かどうかを見たいので、旗を一度降ろして
                 # 評価し、結果を変数の札にしてから元の旗と OR で戻す。
                 _assign_prior = self.state.error_undefined_label
                 self.state.error_undefined_label = False
-                x, idx = self.expression(s, idx + 3)
+                x, idx = self.expression(s, idx + _vnl + 2)
                 _assign_undef = self.state.error_undefined_label
                 self.state.error_undefined_label = _assign_prior or _assign_undef
                 self.var_manager.put_tagged(ch, x, _assign_undef)
             else:
                 x = self.var_manager.get(ch)
-                idx += 1
+                idx += _vnl
                 # 破綻点修正: 値の大きさ（_is_undef_derived）だけで判定していたため、
                 # `UNDEF-UNDEF` や `UNDEF%UNDEF` のように算術で番兵が消える式では
                 # 未定義を見逃し、0 を黙って出力していた。束縛時に付けた札も見る。
@@ -3024,6 +3038,28 @@ class ExpressionEvaluator:
         if not s or s[-1] != chr(0):
             return s + chr(0)
         return s
+
+    def _patvar_len_at(self, s, idx):
+        """位置 idx から読めるパターン変数名の長さ。変数でなければ 0。
+
+        登録済みの2文字以上の名前（`var_2` 等）を最長一致で先に見て、無ければ
+        従来どおり「直後がラベル構成文字でない小文字1文字」を変数とする。
+        caxx.c の var_registered_len_at() と同じ規則である。
+        """
+        best = 0
+        for nm in self.state.varnames:
+            n = len(nm)
+            if n <= best or not s.startswith(nm, idx):
+                continue
+            if idx + n < len(s) and s[idx + n] in self.state.lwordchars:
+                continue
+            best = n
+        if best:
+            return best
+        if (idx < len(s) and s[idx] in LOWER
+                and (idx + 1 >= len(s) or s[idx + 1] not in self.state.lwordchars)):
+            return 1
+        return 0
 
     def expression_pat(self, s, idx):
         return self._expression_in(s, idx, EXP_PAT, CAPS_PAT)
@@ -3488,6 +3524,21 @@ class DirectiveProcessor:
 
         return triggered, error_code
 
+    def _dir_var(self, field):
+        """ディレクティブの変数欄を読む。1文字でも `var_2` のように長くてもよい。
+
+        名前として読めなければ None。caxx.c の dir_var_slot() にあたる。
+        """
+        v = (field or '').strip().lower()
+        if not v or not v.isascii() or not ('a' <= v[0] <= 'z'):
+            return None
+        for ch in v[1:]:
+            if not ('a' <= ch <= 'z' or ch.isdigit() or ch == '_'):
+                return None
+        if len(v) > 1:
+            self.state.varnames.add(v)
+        return v
+
     def elem_list_expand(self, text):
         """要素の列挙欄（`.check` `.enum` `.map` の「名前の並び」）を項目に切る。
 
@@ -3523,9 +3574,9 @@ class DirectiveProcessor:
         else:
             self.state.diag(" error - .check: variable name is not specified.", set_error=True)
             return True
-        var = var_field.strip().lower()
-        if len(var) != 1 or var not in LOWER:
-            self.state.diag(f" error - .check: variable should be a lower case letter ('{var_field}').", set_error=True)
+        var = self._dir_var(var_field)
+        if var is None:
+            self.state.diag(f" error - .check: variable should be a lower case name ('{var_field}').", set_error=True)
             return True
         syms = []
         for nm in self.elem_list_expand(syms_field):
@@ -3544,11 +3595,11 @@ class DirectiveProcessor:
             return False
         var_field = i[2].strip() if len(i) >= 3 and i[2] else ''
         if var_field:
-            var = var_field.lower()
-            if len(var) == 1 and var in LOWER:
+            var = self._dir_var(var_field)
+            if var is not None:
                 self.state.check_constraints.pop(var, None)
             else:
-                self.state.diag(f" error - .clrcheck: variable should be a lower case letter ('{var_field}').", set_error=True)
+                self.state.diag(f" error - .clrcheck: variable should be a lower case name ('{var_field}').", set_error=True)
         else:
             self.state.check_constraints.clear()
         return True
@@ -3575,9 +3626,9 @@ class DirectiveProcessor:
         var_str = i[1].strip() if len(i) >= 2 else ''
         syms_str = i[2] if len(i) >= 3 else ''
         expr_str = i[3] if (len(i) >= 4 and i[3].strip()) else var_str
-        if len(var_str) != 1 or not ('a' <= var_str.lower() <= 'z'):
+        var = self._dir_var(var_str)
+        if var is None:
             return
-        var = var_str.lower()
         target = self.state.symbols if into is None else into
 
         elems = self.elem_list_expand(syms_str)
@@ -3638,9 +3689,10 @@ class DirectiveProcessor:
             for var, syms in self.state.check_constraints.items():
                 self.state.check_constraints[var] = [x for x in syms if x != key]
             # 名前が変数そのものなら、その変数の制約と列挙ごと外す。
-            if len(nm) == 1 and nm.lower() in LOWER:
-                self.state.check_constraints.pop(nm.lower(), None)
-                self.state.enum_defs.pop(nm.lower(), None)
+            _v = nm.lower()
+            if _v in self.state.varnames or (len(_v) == 1 and _v in LOWER):
+                self.state.check_constraints.pop(_v, None)
+                self.state.enum_defs.pop(_v, None)
         return True
 
     def enum_processing(self, i):
@@ -3655,9 +3707,9 @@ class DirectiveProcessor:
         var_field = i[1].strip() if len(i) >= 2 else ''
         names_field = i[2] if len(i) >= 3 else ''
         expr_field = i[3] if len(i) >= 4 else ''
-        var = var_field.lower()
-        if len(var) != 1 or var not in LOWER:
-            self.state.diag(f" error - .enum: variable should be a lower case letter ('{var_field}').", set_error=True)
+        var = self._dir_var(var_field)
+        if var is None:
+            self.state.diag(f" error - .enum: variable should be a lower case name ('{var_field}').", set_error=True)
             return True
         names = []
         for nm in self.elem_list_expand(names_field):
@@ -3677,11 +3729,11 @@ class DirectiveProcessor:
             return False
         var_field = i[2].strip() if len(i) >= 3 and i[2] else ''
         if var_field:
-            var = var_field.lower()
-            if len(var) == 1 and var in LOWER:
+            var = self._dir_var(var_field)
+            if var is not None:
                 self.state.enum_defs.pop(var, None)
             else:
-                self.state.diag(f" error - .clrenum: variable should be a lower case letter ('{var_field}').", set_error=True)
+                self.state.diag(f" error - .clrenum: variable should be a lower case name ('{var_field}').", set_error=True)
         else:
             self.state.enum_defs.clear()
         return True
@@ -3791,6 +3843,27 @@ class PatternMatcher:
                     result[j] = ''
 
         return ''.join(result)
+
+    @staticmethod
+    def _var_name_at(t, i):
+        """パターン文字列 t の位置 i から変数名を読む。長さを返す（0 なら無し）。
+
+        名前は小文字で始まり、小文字・数字・`_` が続く。
+        caxx.c の var_name_len() と同じ規則である。
+        """
+        if i >= len(t) or not ('a' <= t[i] <= 'z'):
+            return 0
+        n = 1
+        while i + n < len(t) and ('a' <= t[i + n] <= 'z'
+                                  or t[i + n].isdigit() or t[i + n] == '_'):
+            n += 1
+        return n
+
+    def _var_declare(self, name):
+        """2文字以上の名前を「この表の変数」として登録する。"""
+        if len(name) > 1:
+            self.state.varnames.add(name)
+        return name
 
     def _enum_capture(self, s, idx, edef):
         """`!E<変数>` の位置から列挙要素のリストを読み、式の値を返す。
@@ -3932,10 +4005,11 @@ class PatternMatcher:
                 if a == 'F':
                     if idx_t >= len(t):
                         return False
-                    a = t[idx_t]
-                    if a == chr(0) or a not in LOWER:
+                    _nl = self._var_name_at(t, idx_t)
+                    if _nl == 0:
                         return False
-                    idx_t = StringUtils.skipspc(t, idx_t + 1)
+                    a = self._var_declare(t[idx_t:idx_t + _nl])
+                    idx_t = StringUtils.skipspc(t, idx_t + _nl)
                     if idx_t < len(t) and t[idx_t] == '\\':
                         idx_t += 1
                         stopchar = t[idx_t] if idx_t < len(t) else chr(0)
@@ -3960,10 +4034,11 @@ class PatternMatcher:
                 elif a == 'D':
                     if idx_t >= len(t):
                         return False
-                    a = t[idx_t]
-                    if a == chr(0) or a not in LOWER:
+                    _nl = self._var_name_at(t, idx_t)
+                    if _nl == 0:
                         return False
-                    idx_t = StringUtils.skipspc(t, idx_t + 1)
+                    a = self._var_declare(t[idx_t:idx_t + _nl])
+                    idx_t = StringUtils.skipspc(t, idx_t + _nl)
                     if idx_t < len(t) and t[idx_t] == '\\':
                         idx_t += 1
                         stopchar = t[idx_t] if idx_t < len(t) else chr(0)
@@ -3988,10 +4063,11 @@ class PatternMatcher:
                 elif a == 'Q':
                     if idx_t >= len(t):
                         return False
-                    a = t[idx_t]
-                    if a == chr(0) or a not in LOWER:
+                    _nl = self._var_name_at(t, idx_t)
+                    if _nl == 0:
                         return False
-                    idx_t = StringUtils.skipspc(t, idx_t + 1)
+                    a = self._var_declare(t[idx_t:idx_t + _nl])
+                    idx_t = StringUtils.skipspc(t, idx_t + _nl)
                     if idx_t < len(t) and t[idx_t] == '\\':
                         idx_t += 1
                         stopchar = t[idx_t] if idx_t < len(t) else chr(0)
@@ -4034,10 +4110,11 @@ class PatternMatcher:
                 elif a == 'E':
                     if idx_t >= len(t):
                         return False
-                    a = t[idx_t]
-                    if a == chr(0) or a not in LOWER:
+                    _nl = self._var_name_at(t, idx_t)
+                    if _nl == 0:
                         return False
-                    idx_t += 1
+                    a = self._var_declare(t[idx_t:idx_t + _nl])
+                    idx_t += _nl
                     edef = self.state.enum_defs.get(a)
                     if edef is None:
                         return False
@@ -4050,10 +4127,11 @@ class PatternMatcher:
                 elif a == '!':
                     if idx_t >= len(t):
                         return False
-                    a = t[idx_t]
-                    if a == chr(0) or a not in LOWER:
+                    _nl = self._var_name_at(t, idx_t)
+                    if _nl == 0:
                         return False
-                    idx_t += 1
+                    a = self._var_declare(t[idx_t:idx_t + _nl])
+                    idx_t += _nl
                     self.state._elf_capturing_var = a
                     # 捕捉した式だけが未定義だったかを見たいので旗を一度降ろす。
                     # 結果は変数の札に移し、外側の旗は OR で戻す。
@@ -4068,8 +4146,12 @@ class PatternMatcher:
                     self.var_manager.put_tagged(a, v, _cap_undef)
                     continue
                 else:
-                    if a == chr(0) or a not in LOWER:
+                    # `!name` の名前。直前で1文字読み進めてあるので測り直す。
+                    _nl = self._var_name_at(t, idx_t - 1)
+                    if _nl == 0:
                         return False
+                    a = self._var_declare(t[idx_t - 1:idx_t - 1 + _nl])
+                    idx_t += _nl - 1
                     idx_t = StringUtils.skipspc(t, idx_t)
                     if idx_t < len(t) and t[idx_t] == '\\':
                         idx_t += 1
@@ -4093,7 +4175,10 @@ class PatternMatcher:
                     continue
             elif a in LOWER:
                 prev_alnum = False
-                idx_t += 1
+                # シンボルを取る位置。名前は1文字でも `var_2` のように長くてもよい。
+                _nl = self._var_name_at(t, idx_t)
+                a = self._var_declare(t[idx_t:idx_t + _nl])
+                idx_t += _nl
                 prev_idx_s = idx_s
                 allowed = self.state.check_constraints.get(a)
                 allow_omit = allowed is not None and CHECK_OMIT in allowed
@@ -4178,8 +4263,10 @@ class PatternMatcher:
                 continue
             name = t[i + 4:j]
             k = j + 2
-            if _is_sub_name(name) and k < len(t) and t[k] in LOWER:
-                return i, k + 1, name, t[k]
+            # 変数名は1文字でも `var_2` のように長くてもよい。
+            vl = PatternMatcher._var_name_at(t, k)
+            if _is_sub_name(name) and vl > 0:
+                return i, k + vl, name, t[k:k + vl]
             i = j + 2
 
     def _sub_variants(self, t, depth=0):
@@ -4189,6 +4276,8 @@ class PatternMatcher:
         成功してから評価する（項目のパターンが束縛した変数を使えるように）。
         """
         ref = self._find_sub_ref(t)
+        if ref is not None:
+            self._var_declare(ref[3])
         if ref is None:
             yield t, ()
             return
@@ -4244,8 +4333,8 @@ class PatternMatcher:
 
     def match0(self, s, t):
         for vt, binds in self._sub_variants(t):
-            saved_vars = self.state.vars[:]
-            saved_vars_undef = self.state.vars_undef[:]
+            saved_vars = dict(self.state.vars)
+            saved_vars_undef = dict(self.state.vars_undef)
             saved_refs_len = len(self.state._elf_label_refs_seen)
             saved_v2l = dict(self.state._elf_var_to_label)
             if self.match0_brackets(s, vt):
@@ -4290,8 +4379,8 @@ class PatternMatcher:
                              f"pattern entries.", set_error=False)
                     return False
                 lt = self.remove_brackets(t, list(j))
-                saved_vars = self.state.vars[:]
-                saved_vars_undef = self.state.vars_undef[:]
+                saved_vars = dict(self.state.vars)
+                saved_vars_undef = dict(self.state.vars_undef)
                 saved_refs_len = len(self.state._elf_label_refs_seen)
                 saved_v2l      = dict(self.state._elf_var_to_label)
                 if self.match(s, lt):
@@ -4527,9 +4616,9 @@ class PatternFileReader:
                         diag(" error - .map: needs '.map::<variable>::"
                              "<name,name,...>[::<expression in the variable>]'.",
                              set_error=True)
-                    elif len(var_str) != 1 or not ('a' <= var_str.lower() <= 'z'):
+                    elif self._dir_var_name(var_str) is None:
                         diag(f" error - .map: variable should be a lower case "
-                             f"letter ({var_str!r}).", set_error=True)
+                             f"name ({var_str!r}).", set_error=True)
 
                 if len(l) == 1:
                     if l[0].strip() != '':
@@ -4574,6 +4663,17 @@ class PatternFileReader:
         return w
 
     @staticmethod
+    def _dir_var_name(field):
+        """ディレクティブの変数欄として読めるなら正規化した名前、駄目なら None。"""
+        v = (field or '').strip().lower()
+        if not v or not v.isascii() or not ('a' <= v[0] <= 'z'):
+            return None
+        for ch in v[1:]:
+            if not ('a' <= ch <= 'z' or ch.isdigit() or ch == '_'):
+                return None
+        return v
+
+    @staticmethod
     def _map_subst_index(expr, var, i):
         """`.map` の式の中の変数を、並びの番号に置き換えた新しい式を作る。
 
@@ -4583,16 +4683,20 @@ class PatternFileReader:
         caxx.c の map_subst_index() と同じ規則である。
         """
         num = '(%d)' % i
+        vl = len(var)
         out = []
-        for k, c in enumerate(expr):
-            if c.lower() == var:
+        k = 0
+        while k < len(expr):
+            if expr[k:k + vl].lower() == var:
                 prev = expr[k - 1] if k > 0 else ''
-                nxt = expr[k + 1] if k + 1 < len(expr) else ''
+                nxt = expr[k + vl] if k + vl < len(expr) else ''
                 if not (prev.isalnum() or prev == '_') and \
                    not (nxt.isalnum() or nxt == '_'):
                     out.append(num)
+                    k += vl
                     continue
-            out.append(c)
+            out.append(expr[k])
+            k += 1
         return ''.join(out)
 
     def compile_funcs(self):
@@ -6270,8 +6374,10 @@ class ObjectGenerator:
         if key in self.state.arrsymbols:
             return ','.join(v if isinstance(v, str) else self._txt_radix(v, 10)
                             for v in self.state.arrsymbols[key])
-        if len(name) == 1 and 'a' <= name <= 'z':
-            return self._txt_radix(self.state.vars[ord(name) - ord('a')], 10)
+        # 登録済みのパターン変数（1文字でも `var_2` のように長くてもよい）。
+        _v = name.lower()
+        if _v in self.state.varnames or (len(_v) == 1 and 'a' <= _v <= 'z'):
+            return self._txt_radix(self.state.vars.get(_v, VAR_UNDEF), 10)
         return name
 
     @staticmethod
@@ -8615,8 +8721,8 @@ class Assembler:
         for i in self.state.pat:
             pln += 1
             pl = i
-            self.state.vars = [VAR_UNDEF] * 26
-            self.state.vars_undef = [False] * 26
+            self.state.vars = {}
+            self.state.vars_undef = {}
 
             if i is None:
                 continue
@@ -8691,8 +8797,8 @@ class Assembler:
             self.state.expmode = EXP_ASM
             self.state.expcaps = CAPS_ASM
 
-            saved_vars = self.state.vars[:]
-            saved_vars_undef = self.state.vars_undef[:]
+            saved_vars = dict(self.state.vars)
+            saved_vars_undef = dict(self.state.vars_undef)
             saved_refs_len = len(self.state._elf_label_refs_seen)
             saved_v2l = dict(self.state._elf_var_to_label)
 
@@ -8720,8 +8826,8 @@ class Assembler:
                         'score': score,
                         'pln':   pln,
                         'pat':   i,
-                        'vars':  self.state.vars[:],
-                        'vars_undef': self.state.vars_undef[:],
+                        'vars':  dict(self.state.vars),
+                        'vars_undef': dict(self.state.vars_undef),
                         'refs':  self.state._elf_label_refs_seen[saved_refs_len:],
                         'v2l':   dict(self.state._elf_var_to_label),
                         'dir':   _snap_dirstate(),
@@ -8760,8 +8866,8 @@ class Assembler:
             loopflag = False
 
             _restore_dirstate(best['dir'])
-            self.state.vars = best['vars'][:]
-            self.state.vars_undef = best['vars_undef'][:]
+            self.state.vars = dict(best['vars'])
+            self.state.vars_undef = dict(best['vars_undef'])
             self.state._elf_label_refs_seen.extend(best['refs'])
             self.state._elf_var_to_label = dict(best['v2l'])
             self.state.error_undefined_label = best.get('error_undefined_label', False)
@@ -10361,8 +10467,8 @@ class Assembler:
 
                 _imported_labels = dict(self.state.labels)
 
-                _initial_vars = list(self.state.vars)
-                _initial_vars_undef = list(self.state.vars_undef)
+                _initial_vars = dict(self.state.vars)
+                _initial_vars_undef = dict(self.state.vars_undef)
 
                 for relax_iter in range(MAX_RELAX):
                     self.state._relax_optimistic = (relax_iter == 0)
@@ -10375,8 +10481,8 @@ class Assembler:
                     self.state.export_labels = {}
                     self.state.current_section = '.text'
                     self.state.symbols = dict(self.state.patsymbols)
-                    self.state.vars = list(_initial_vars)
-                    self.state.vars_undef = list(_initial_vars_undef)
+                    self.state.vars = dict(_initial_vars)
+                    self.state.vars_undef = dict(_initial_vars_undef)
                     self.state.section_ranges = []
                     self.fileassemble(args.sourcefile)
 

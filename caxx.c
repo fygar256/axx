@@ -94,6 +94,74 @@ static void m_echo_write(char *const *items, int n);
  * ままにして axx.py の実際の挙動に合わせる。 */
 typedef struct { uint256_t val; int is_undef; int is_float; } PatVar;
 
+/* パターン変数の置き場。0〜25 は従来どおり小文字1文字 `a`〜`z` で、
+ * 26 番から先は `var_2` のような2文字以上の名前に割り当てる。名前は
+ * パターンファイルを読むときに登録し、以後は添字（スロット番号）で扱う。
+ * g_nvars は「実際に使っている個数」で、変数を走査するループの上限。
+ * 1文字しか使わないパターンファイルでは 26 のままなので、走査の手間は
+ * これまでと変わらない。 */
+#define NVARS 256
+static int    g_nvars = 26;
+static char  *g_varnames[NVARS];   /* スロット 26+i の名前 */
+static int    g_nvarnames = 0;
+
+/* パターン変数の名前は小文字で始まり、小文字・数字・`_` が続く。 */
+static int var_name_len(const char *s){
+    if(!(s[0] >= 'a' && s[0] <= 'z')) return 0;
+    int n = 1;
+    while((s[n]>='a'&&s[n]<='z')||(s[n]>='0'&&s[n]<='9')||s[n]=='_') n++;
+    return n;
+}
+
+/* 名前をスロット番号にする。1文字ならそのまま `a`〜`z` の 0〜25。
+ * 2文字以上は登録表を引き、create が真なら無ければ新しく割り当てる。
+ * 見つからない（かつ create でない）ときは -1。 */
+static int var_slot(const char *name, int len, int create){
+    if(len <= 0) return -1;
+    if(len == 1){
+        if(name[0] >= 'a' && name[0] <= 'z') return name[0] - 'a';
+        if(name[0] >= 'A' && name[0] <= 'Z') return name[0] - 'A';
+        return -1;
+    }
+    for(int i = 0; i < g_nvarnames; i++)
+        if((int)strlen(g_varnames[i]) == len && strncmp(g_varnames[i], name, (size_t)len) == 0)
+            return 26 + i;
+    if(!create) return -1;
+    if(26 + g_nvarnames >= NVARS){
+        fprintf(stderr, " error - too many pattern variable names (maximum %d).\n", NVARS - 26);
+        return -1;
+    }
+    char *dup = malloc((size_t)len + 1);
+    if(!dup){ perror("malloc"); exit(1); }
+    memcpy(dup, name, (size_t)len); dup[len] = '\0';
+    g_varnames[g_nvarnames++] = dup;
+    g_nvars = 26 + g_nvarnames;
+    return 26 + g_nvarnames - 1;
+}
+
+/* 診断に出すための名前。スロット 0〜25 は1文字。 */
+static const char *var_slot_name(int slot){
+    static char one[2];
+    if(slot < 0) return "?";
+    if(slot < 26){ one[0] = (char)('a' + slot); one[1] = '\0'; return one; }
+    if(slot - 26 < g_nvarnames) return g_varnames[slot - 26];
+    return "?";
+}
+
+/* 位置 s[idx] から始まる最長の「登録済み変数名」。無ければ 0。
+ * 式の中で `var_2` を変数として読むために使う。1文字の変数は従来どおり
+ * 別の枝が扱うので、ここでは2文字以上だけを見る。 */
+static int var_registered_len_at(const char *s, int idx){
+    int best = 0;
+    for(int i = 0; i < g_nvarnames; i++){
+        int l = (int)strlen(g_varnames[i]);
+        if(l <= best) continue;
+        if(strncmp(s + idx, g_varnames[i], (size_t)l) != 0) continue;
+        best = l;
+    }
+    return best;
+}
+
 /* 配列シンボルの1項目。数値か文字列のどちらかを持つ。 */
 typedef struct { int is_str; char *s; uint256_t v; } SymItem;
 struct ArrSym { char *name; SymItem *items; int len; };
@@ -1225,7 +1293,7 @@ typedef struct {
     StrVec     fnstack;
     IStack     lnstack;
 
-    PatVar     vars[26];
+    PatVar     vars[NVARS];
 
     char deb1[4096];
     char deb2[4096];
@@ -1260,8 +1328,8 @@ typedef struct {
         int      set;
         char    *label_name;
         uint64_t label_val;
-    }          elf_var_to_label[26];
-    char       elf_capturing_var;
+    }          elf_var_to_label[NVARS];
+    int        elf_capturing_var;   /* 捕捉中の変数スロット。-1 でなし */
     struct {
         char   *section;
         int64_t sec_offset;
@@ -1276,10 +1344,10 @@ typedef struct {
     int        reloctype_override[4];
 
     /* .check で登録された「変数 a〜z が満たすべき条件」 */
-    StrVec     check_constraints[26];
+    StrVec     check_constraints[NVARS];
 
     /* .enum で登録された、変数 a〜z の列挙（`!E<変数>` が使う） */
-    EnumDef    enum_defs[26];
+    EnumDef    enum_defs[NVARS];
 
     /* .enum の式を評価している間だけ非 NULL。要素名を「出現していれば
      * .setsym の値、非出現なら 0」に束縛した表を指す。 */
@@ -1761,7 +1829,7 @@ static void state_init(AsmState *st) {
     st->ln = 0;
     sv_init(&st->fnstack);
     is_init(&st->lnstack);
-    for(int i=0;i<26;i++){ st->vars[i].val=u256_zero(); st->vars[i].is_undef=0; }
+    for(int i=0;i<NVARS;i++){ st->vars[i].val=u256_zero(); st->vars[i].is_undef=0; }
     bufmap_init(&st->buf);
     st->pc = u256_zero();
     st->padding = u256_zero();
@@ -1782,18 +1850,18 @@ static void state_init(AsmState *st) {
     st->elf_refs_len = 0;
     st->elf_refs_cap = 0;
     st->elf_current_word_idx = -1;
-    for(int _vi=0;_vi<26;_vi++){
+    for(int _vi=0;_vi<NVARS;_vi++){
         st->elf_var_to_label[_vi].set = 0;
         st->elf_var_to_label[_vi].label_name = NULL;
         st->elf_var_to_label[_vi].label_val = 0;
     }
-    st->elf_capturing_var = '\0';
+    st->elf_capturing_var = -1;
     st->relocations = NULL;
     st->reloc_count = 0;
     st->reloc_cap = 0;
     for(int _rti=0; _rti<4; _rti++) st->reloctype_override[_rti] = -1;
-    for(int _ci=0; _ci<26; _ci++) sv_init(&st->check_constraints[_ci]);
-    for(int _ci=0; _ci<26; _ci++) enumdef_init(&st->enum_defs[_ci]);
+    for(int _ci=0; _ci<NVARS; _ci++) sv_init(&st->check_constraints[_ci]);
+    for(int _ci=0; _ci<NVARS; _ci++) enumdef_init(&st->enum_defs[_ci]);
     st->enum_bind_names = NULL;
     st->enum_bind_vals  = NULL;
     sv_init(&st->errors);
@@ -2816,29 +2884,26 @@ static void binary_flush(AsmState *st){
     free(data);
 }
 
-static int var_get_is_undef(AsmState *st, char ch){
-    ch=(char)axx_upper_char(ch);
-    if(ch>='A'&&ch<='Z') return st->vars[ch-'A'].is_undef;
+static int var_slot_is_undef(AsmState *st, int slot){
+    if(slot>=0 && slot<NVARS) return st->vars[slot].is_undef;
     return 0;
 }
 /* 浮動小数点モード評価の直前に呼ぶ。整数のまま束縛された変数
  * (is_float==0) だけ数値変換し、既にdoubleのビット列として束縛済みの
  * 変数(is_float==1、例: !D で束縛、または flt モード下での `:=` 代入)は
  * そのまま通す（二重変換でビット列を壊さないため）。 */
-static uint256_t var_get_for_mode(AsmState *st, char ch, int want_float){
-    ch=(char)axx_upper_char(ch);
-    if(ch<'A'||ch>'Z') return u256_zero();
-    PatVar *pv = &st->vars[ch-'A'];
+static uint256_t var_slot_for_mode(AsmState *st, int slot, int want_float){
+    if(slot<0||slot>=NVARS) return u256_zero();
+    PatVar *pv = &st->vars[slot];
     if(want_float && !pv->is_float) return double_to_u256(u256_int_to_double(pv->val));
     return pv->val;
 }
-static void var_put(AsmState *st, char ch, uint256_t v){
-    ch=(char)axx_upper_char(ch);
-    if(ch>='A'&&ch<='Z'){ st->vars[ch-'A'].val=v; st->vars[ch-'A'].is_undef=0; st->vars[ch-'A'].is_float=st->exp_typ_float; }
+static void var_slot_put_tagged(AsmState *st, int slot, uint256_t v, int is_undef){
+    if(slot<0||slot>=NVARS) return;
+    st->vars[slot].val=v; st->vars[slot].is_undef=is_undef; st->vars[slot].is_float=st->exp_typ_float;
 }
-static void var_put_tagged(AsmState *st, char ch, uint256_t v, int is_undef){
-    ch=(char)axx_upper_char(ch);
-    if(ch>='A'&&ch<='Z'){ st->vars[ch-'A'].val=v; st->vars[ch-'A'].is_undef=is_undef; st->vars[ch-'A'].is_float=st->exp_typ_float; }
+static void var_slot_put(AsmState *st, int slot, uint256_t v){
+    var_slot_put_tagged(st, slot, v, 0);
 }
 
 /* ラベルの値を引く。
@@ -2865,9 +2930,9 @@ static uint256_t label_get_value(AsmState *st, const char *k){
         }
         int _equ_has_reloc = e->is_equ && (e->reloc_type_override >= 0);
         if(st->elf_tracking && (!e->is_equ || _equ_has_reloc)){
-            if(st->elf_capturing_var != '\0'){
-                int vi = (unsigned char)st->elf_capturing_var - 'a';
-                if(vi >= 0 && vi < 26){
+            if(st->elf_capturing_var >= 0){
+                int vi = st->elf_capturing_var;
+                if(vi >= 0 && vi < g_nvars){
                     if(st->elf_var_to_label[vi].set == 0){
                         st->elf_var_to_label[vi].set = 1;
                         free(st->elf_var_to_label[vi].label_name);
@@ -3506,6 +3571,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
     int _hexlit_ok = parse_hex_char_literal(s, idx, slen, &_hexlit_val, &_hexlit_end);
     /* .enum の式を評価している間だけ使う、列挙要素名の束縛。 */
     int _en_k=-1, _en_end=idx;
+    int _vnl=0;   /* ここで読んだパターン変数名の長さ */
 
     if(idx>=slen||s[idx]=='\0'){ *idx_out=idx; return x; }
 
@@ -3904,16 +3970,23 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         x = st->enum_bind_vals[_en_k];
         idx = _en_end;
     }
-    else if(st->expcaps->patvars && is_lower(s[idx])
-            && (s[idx+1]=='\0' || !char_in(s[idx+1], st->lwordchars))){
-        char ch=s[idx];
-        if(idx+3<=slen && s[idx+1]==':'&&s[idx+2]=='='){
+    /* 登録済みの2文字以上の変数名（`var_2` 等）は、ラベルより先にここで読む。
+     * 1文字の変数はこれまでどおり「直後がラベル構成文字でないとき」だけ。 */
+    else if(st->expcaps->patvars
+            && ((_vnl = var_registered_len_at(s, idx)) > 0
+                  ? (s[idx+_vnl]=='\0' || !char_in(s[idx+_vnl], st->lwordchars))
+                  : (is_lower(s[idx])
+                     && (s[idx+1]=='\0' || !char_in(s[idx+1], st->lwordchars))
+                     && (_vnl = 1)))){
+        int vslot = var_slot(s+idx, _vnl, 0);
+        if(vslot < 0) vslot = var_slot(s+idx, _vnl, 1);
+        if(idx+_vnl+2<=slen && s[idx+_vnl]==':'&&s[idx+_vnl+1]=='='){
             int _assign_prior_eul = st->error_undefined_label;
             st->error_undefined_label = 0;
-            x=expr_expression(asmb,s,idx+3,&idx);
+            x=expr_expression(asmb,s,idx+_vnl+2,&idx);
             int _assign_this_undef = st->error_undefined_label;
             st->error_undefined_label = _assign_prior_eul || _assign_this_undef;
-            var_put_tagged(st,ch,x,_assign_this_undef);
+            var_slot_put_tagged(st,vslot,x,_assign_this_undef);
         } else {
             /* 破綻点修正: 通常(整数)モードで束縛されたパターン変数を
              * 浮動小数点モードの式（.error の error_patterns 等）で
@@ -3924,8 +3997,8 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
              * 算術がそもそも精度を失わないため、この問題が起きない）。
              * is_float タグを見て、整数のまま束縛された値だけ、ここで
              * 数値としてdoubleへ変換する。 */
-            x=var_get_for_mode(st,ch,asmb->st.exp_typ_float);
-            idx++;
+            x=var_slot_for_mode(st,vslot,asmb->st.exp_typ_float);
+            idx+=_vnl;
             if(!st->in_match_attempt
                && !st->pass1_size_mode
                && should_report_errors(st)){
@@ -3936,16 +4009,16 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                  * いるのでタグは付かず、結果として 0xff 等のゴミを黙って生成していた
                  * （axx.py は値そのものを _is_undef_derived() で見るので検出できる）。
                  * axx.py と同じく値も検査する。 */
-                if(var_get_is_undef(st, ch) || u256_is_undef_derived(x)){
+                if(var_slot_is_undef(st, vslot) || u256_is_undef_derived(x)){
                     st->error_undefined_label = 1;
-                    axx_diagf(0, 0, " error - Label undefined: variable '%c' contains undefined value"
+                    axx_diagf(0, 0, " error - Label undefined: variable '%s' contains undefined value"
                                "  [%s:%d]\n",
-                               ch, st->current_file, (int)st->ln);
+                               var_slot_name(vslot), st->current_file, (int)st->ln);
                 }
             }
             if(st->elf_tracking && st->elf_current_word_idx >= 0){
-                int _vi = (unsigned char)ch - 'a';
-                if(_vi >= 0 && _vi < 26 && st->elf_var_to_label[_vi].set == 1){
+                int _vi = vslot;
+                if(_vi >= 0 && _vi < g_nvars && st->elf_var_to_label[_vi].set == 1){
                     if(st->elf_refs_len >= st->elf_refs_cap){
                         st->elf_refs_cap = st->elf_refs_cap ? st->elf_refs_cap*2 : 8;
                         st->elf_refs = realloc(st->elf_refs,
@@ -4640,6 +4713,21 @@ static int dir_epic(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* ディレクティブの変数欄を読む。1文字でも `var_2` のように長くてもよい。
+ * 名前全体を使い切っていなければ -1（綴りの誤り）。 */
+static int dir_var_slot(const char *field){
+    const char *p = field;
+    while(*p==' '||*p=='\t') p++;
+    char lower[64]; int n = 0;
+    while(*p && n < (int)sizeof(lower)-1 && !(*p==' '||*p=='\t'))
+        lower[n++] = (char)tolower((unsigned char)*p++);
+    lower[n] = '\0';
+    while(*p==' '||*p=='\t') p++;
+    if(*p || n == 0) return -1;
+    if(var_name_len(lower) != n) return -1;
+    return var_slot(lower, n, 1);
+}
+
 /* 要素の列挙欄（`.check` `.enum` `.map` の「名前の並び」）を項目に切る。
  * 項目が配列シンボルの名前なら、その内容をその場に展開する。つまり
  *   .setsym::regs::["R0","R1","R2"]
@@ -4689,13 +4777,12 @@ static int dir_check(Assembler *asmb, PatEntry *e){
         axx_diagf(1, 0, " error - .check: variable name is not specified.\n");
         return 1;
     }
-    char var = (char)tolower((unsigned char)var_str[0]);
-    if(var < 'a' || var > 'z' || var_str[1] != '\0'){
-        axx_diagf(1, 0, " error - .check: variable should be a lower case letter ('%s').\n",
+    int idx = dir_var_slot(var_str);
+    if(idx < 0){
+        axx_diagf(1, 0, " error - .check: variable should be a lower case name ('%s').\n",
                    var_str);
         return 1;
     }
-    int idx = var - 'a';
     sv_free(&asmb->st.check_constraints[idx]);
     sv_init(&asmb->st.check_constraints[idx]);
     StrVec elems; sv_init(&elems);
@@ -4721,17 +4808,16 @@ static int dir_clrcheck(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".clrcheck") != 0) return 0;
     const char *var_str = e->f[2];
     if(var_str[0]){
-        char var = (char)tolower((unsigned char)var_str[0]);
-        if(var < 'a' || var > 'z' || var_str[1] != '\0'){
-            axx_diagf(1, 0, " error - .clrcheck: variable should be a lower case letter ('%s').\n",
+        int idx = dir_var_slot(var_str);
+        if(idx < 0){
+            axx_diagf(1, 0, " error - .clrcheck: variable should be a lower case name ('%s').\n",
                        var_str);
             return 1;
         }
-        int idx = var - 'a';
         sv_free(&asmb->st.check_constraints[idx]);
         sv_init(&asmb->st.check_constraints[idx]);
     } else {
-        for(int i = 0; i < 26; i++){
+        for(int i = 0; i < g_nvars; i++){
             sv_free(&asmb->st.check_constraints[i]);
             sv_init(&asmb->st.check_constraints[i]);
         }
@@ -4759,7 +4845,7 @@ static void free_one_name(Assembler *asmb, const char *name){
     subv_mark_freed(&st->subs, name);
 
     /* `.check` の候補からも外す。候補は大文字で積まれている。 */
-    for(int vi=0; vi<26; vi++){
+    for(int vi=0; vi<g_nvars; vi++){
         StrVec *cv = &st->check_constraints[vi];
         int w = 0;
         for(int k=0; k<cv->len; k++){
@@ -4770,19 +4856,24 @@ static void free_one_name(Assembler *asmb, const char *name){
     }
 
     /* 名前が変数そのものなら、その変数の制約と列挙ごと外す。 */
-    if(name[1]=='\0'){
-        int c = axx_upper_char(name[0]);
-        if(c>='A' && c<='Z'){
-            int vi = c - 'A';
-            sv_free(&st->check_constraints[vi]); sv_init(&st->check_constraints[vi]);
-            enumdef_clear(&st->enum_defs[vi]);
+    {
+        char lower[64]; int n = 0;
+        for(const char *q = name; *q && n < (int)sizeof(lower)-1; q++)
+            lower[n++] = (char)tolower((unsigned char)*q);
+        lower[n] = '\0';
+        if(var_name_len(lower) == n){
+            int vi = var_slot(lower, n, 0);
+            if(vi >= 0){
+                sv_free(&st->check_constraints[vi]); sv_init(&st->check_constraints[vi]);
+                enumdef_clear(&st->enum_defs[vi]);
+            }
         }
     }
 }
 
 /* 定義は後方にある。 */
 static char *pat_trim(char *s);
-static char *map_subst_index(const char *expr, char var, int i);
+static char *map_subst_index(const char *expr, const char *var, int i);
 
 /* `.map::<変数>::<名前の並び>::<式>`
  * 並びの各名前に値を与える `.setsym` と、その変数の `.check` をまとめて書く
@@ -4804,23 +4895,24 @@ static void map_apply(Assembler *asmb, PatEntry *e, SymMap *into, int set_check)
     const char *var_str  = e->f[1][0] ? pat_trim(e->f[1]) : "";
     const char *syms_str = e->f[2];
     const char *expr_str = pat_trim(e->f[3])[0] ? e->f[3] : var_str;
-    if(!var_str[0] || var_str[1] != '\0') return;
-    char var = (char)tolower((unsigned char)var_str[0]);
-    if(var < 'a' || var > 'z') return;
+    int vslot = dir_var_slot(var_str);
+    if(vslot < 0) return;
+    char vname[64];
+    snprintf(vname, sizeof(vname), "%s", var_slot_name(vslot));
 
     StrVec elems; sv_init(&elems);
     elem_list_expand(st, syms_str, &elems);
     for(int i = 0; i < elems.len; i++){
         /* 空の要素（`""` の省略可印など）は番号だけ消費して何も定義しない。 */
         if(!elems.data[i][0]) continue;
-        char *val = map_subst_index(expr_str, var, i);
+        char *val = map_subst_index(expr_str, vname, i);
         int io;
         uint256_t v = expr_expression_pat(asmb, val, 0, &io);
         free(val);
         smap_set(into ? into : &st->symbols, elems.data[i], v);
     }
     if(set_check){
-        int idx = var - 'a';
+        int idx = vslot;
         sv_free(&st->check_constraints[idx]);
         sv_init(&st->check_constraints[idx]);
         for(int i = 0; i < elems.len; i++){
@@ -4873,13 +4965,12 @@ static int dir_enum(Assembler *asmb, PatEntry *e){
     const char *var_str   = e->f[1];
     const char *names_str = e->f[2];
     const char *expr_str  = e->f[3];
-    char var = (char)tolower((unsigned char)var_str[0]);
-    if(!var_str[0] || var < 'a' || var > 'z' || var_str[1] != '\0'){
-        axx_diagf(1, 0, " error - .enum: variable should be a lower case letter ('%s').\n",
+    int idx = dir_var_slot(var_str);
+    if(idx < 0){
+        axx_diagf(1, 0, " error - .enum: variable should be a lower case name ('%s').\n",
                    var_str);
         return 1;
     }
-    int idx = var - 'a';
 
     StrVec elems; sv_init(&elems);
     elem_list_expand(&asmb->st, names_str, &elems);
@@ -4918,15 +5009,15 @@ static int dir_clrenum(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".clrenum") != 0) return 0;
     const char *var_str = e->f[2];
     if(var_str[0]){
-        char var = (char)tolower((unsigned char)var_str[0]);
-        if(var < 'a' || var > 'z' || var_str[1] != '\0'){
-            axx_diagf(1, 0, " error - .clrenum: variable should be a lower case letter ('%s').\n",
+        int idx = dir_var_slot(var_str);
+        if(idx < 0){
+            axx_diagf(1, 0, " error - .clrenum: variable should be a lower case name ('%s').\n",
                        var_str);
             return 1;
         }
-        enumdef_clear(&asmb->st.enum_defs[var - 'a']);
+        enumdef_clear(&asmb->st.enum_defs[idx]);
     } else {
-        for(int i = 0; i < 26; i++) enumdef_clear(&asmb->st.enum_defs[i]);
+        for(int i = 0; i < g_nvars; i++) enumdef_clear(&asmb->st.enum_defs[i]);
     }
     return 1;
 }
@@ -5265,9 +5356,11 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             if(a=='F' || a=='D' || a=='Q'){
                 char ftype = a;
                 if(idx_t >= tlen){ result=0; break; }
-                a = t[idx_t];
-                if(a=='\0' || !is_lower(a)){ result=0; break; }
-                idx_t++;
+                int _nl = var_name_len(t+idx_t);
+                if(_nl == 0){ result=0; break; }
+                int vslot = var_slot(t+idx_t, _nl, 1);
+                if(vslot < 0){ result=0; break; }
+                idx_t += _nl;
                 idx_t = axx_skipspc(t, idx_t);
                 char stopchar = '\0';
                 if(idx_t < tlen && t[idx_t] == '\\'){
@@ -5301,10 +5394,10 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                      * var_put_float ではなく var_put で is_float=0 のまま
                      * 束縛する）。 */
                     uint32_t bits; memcpy(&bits, &fval, 4);
-                    var_put(st, a, u256_from_u64((uint64_t)bits));
+                    var_slot_put(st, vslot, u256_from_u64((uint64_t)bits));
                 } else if(ftype == 'D'){
                     uint64_t bits; memcpy(&bits, &dv, 8);
-                    var_put(st, a, u256_from_u64(bits));
+                    var_slot_put(st, vslot, u256_from_u64(bits));
                 } else {
                     int raw_len = idx_s - idx_s_q_start;
                     if(stopchar && raw_len > 0 &&
@@ -5347,37 +5440,47 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                         snprintf(fstr, sizeof(fstr), "%.17g", dv);
                         qbits = ieee754_128_from_str(fstr);
                     }
-                    var_put(st, a, qbits);
+                    var_slot_put(st, vslot, qbits);
                 }
                 continue;
             } else if(a=='E'){
                 if(idx_t >= tlen){ result=0; break; }
-                a = t[idx_t];
-                if(a=='\0' || !is_lower(a)){ result=0; break; }
-                idx_t++;
-                const EnumDef *ed = &st->enum_defs[a-'a'];
+                int _nl = var_name_len(t+idx_t);
+                if(_nl == 0){ result=0; break; }
+                int vslot = var_slot(t+idx_t, _nl, 1);
+                if(vslot < 0){ result=0; break; }
+                idx_t += _nl;
+                const EnumDef *ed = &st->enum_defs[vslot];
                 if(!ed->expr){ result=0; break; }
                 uint256_t ev; int eend=idx_s;
                 if(!enum_capture(asmb, ed, s, idx_s, &ev, &eend)){ result=0; break; }
                 idx_s = eend;
-                var_put(st, a, ev);
+                var_slot_put(st, vslot, ev);
                 continue;
             } else if(a=='!'){
                 if(idx_t >= tlen){ result=0; break; }
-                a=t[idx_t];
-                if(a=='\0' || !is_lower(a)){ result=0; break; }
-                idx_t++;
-                st->elf_capturing_var = a;
+                int _nl = var_name_len(t+idx_t);
+                if(_nl == 0){ result=0; break; }
+                int vslot = var_slot(t+idx_t, _nl, 1);
+                if(vslot < 0){ result=0; break; }
+                idx_t += _nl;
+                st->elf_capturing_var = vslot;
                 int _cap_prior_eul = st->error_undefined_label;
                 st->error_undefined_label = 0;
                 uint256_t v=expr_factor(asmb,s,idx_s,&idx_s);
                 int _cap_this_undef = st->error_undefined_label;
                 st->error_undefined_label = _cap_prior_eul || _cap_this_undef;
-                st->elf_capturing_var = '\0';
-                var_put_tagged(st,a,v,_cap_this_undef);
+                st->elf_capturing_var = -1;
+                var_slot_put_tagged(st,vslot,v,_cap_this_undef);
                 continue;
             } else {
-                if(!is_lower(a)){ result=0; break; }
+                /* `!name` の名前は小文字で始まり、小文字・数字・`_` が続く。
+                 * 直前で1文字だけ読み進めてあるので、そこから測り直す。 */
+                int _nl = var_name_len(t+idx_t-1);
+                if(_nl == 0){ result=0; break; }
+                int vslot = var_slot(t+idx_t-1, _nl, 1);
+                if(vslot < 0){ result=0; break; }
+                idx_t += _nl - 1;
                 idx_t=axx_skipspc(t,idx_t);
                 char stopchar='\0';
                 if(idx_t<tlen && t[idx_t]=='\\'){
@@ -5386,22 +5489,25 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     stopchar=(idx_t<tlen) ? t[idx_t] : '\0';
                     idx_t++;
                 }
-                st->elf_capturing_var = a;
+                st->elf_capturing_var = vslot;
                 int _cap_prior_eul2 = st->error_undefined_label;
                 st->error_undefined_label = 0;
                 uint256_t v=expr_expression_esc(asmb,s,idx_s,stopchar,&idx_s);
                 int _cap_this_undef2 = st->error_undefined_label;
                 st->error_undefined_label = _cap_prior_eul2 || _cap_this_undef2;
-                st->elf_capturing_var = '\0';
-                var_put_tagged(st,a,v,_cap_this_undef2);
+                st->elf_capturing_var = -1;
+                var_slot_put_tagged(st,vslot,v,_cap_this_undef2);
                 if(stopchar && s[idx_s]==stopchar) idx_s++;
                 continue;
             }
         } else if(a>='a'&&a<='z'){
             prev_alnum=0;
-            idx_t++;
+            /* シンボルを取る位置。名前は1文字でも `var_2` のように長くてもよい。 */
+            int _nl = var_name_len(t+idx_t);
+            int vi = var_slot(t+idx_t, _nl, 1);
+            if(vi < 0){ result=0; break; }
+            idx_t += _nl;
             int prev_idx_s = idx_s;
-            int vi = a - 'a';
             StrVec *cv = &st->check_constraints[vi];
             int allow_omit = 0, n_named = 0;
             for(int si = 0; si < cv->len; si++){
@@ -5467,12 +5573,12 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 if(!allow_omit){ result=0; break; }
                 /* 省略とみなす。ソースは1文字も消費せず、変数は未代入(0)。 */
                 idx_s = prev_idx_s;
-                var_put(st, a, u256_zero());
+                var_slot_put(st, vi, u256_zero());
                 n_sym++;
                 continue;
             }
 
-            var_put(st,a,sv);
+            var_slot_put(st,vi,sv);
             n_sym++;
             continue;
         } else if(a=='[' || a==']'){
@@ -5568,12 +5674,12 @@ static int pat_match0_brackets(Assembler *asmb, const char *s, const char *t_ori
         for(int k=0;k<size;k++) ri[nr++]=sl[comb[k]];
         char *lt=remove_brackets_str(t,ri,nr);
 
-        PatVar    saved_vars[26];
+        PatVar    saved_vars[NVARS];
         memcpy(saved_vars, asmb->st.vars, sizeof(saved_vars));
 
         int saved_elf_refs_len = asmb->st.elf_refs_len;
-        struct {int set; char *label_name; uint64_t label_val;} saved_vtl[26];
-        for(int vi=0;vi<26;vi++){
+        struct {int set; char *label_name; uint64_t label_val;} saved_vtl[NVARS];
+        for(int vi=0;vi<g_nvars;vi++){
             saved_vtl[vi].set       = asmb->st.elf_var_to_label[vi].set;
             saved_vtl[vi].label_val = asmb->st.elf_var_to_label[vi].label_val;
             saved_vtl[vi].label_name = asmb->st.elf_var_to_label[vi].label_name
@@ -5583,13 +5689,13 @@ static int pat_match0_brackets(Assembler *asmb, const char *s, const char *t_ori
 
         if(pat_match(asmb,s,lt)){
             found=1;
-            for(int vi=0;vi<26;vi++) free(saved_vtl[vi].label_name);
+            for(int vi=0;vi<g_nvars;vi++) free(saved_vtl[vi].label_name);
         } else {
             memcpy(asmb->st.vars, saved_vars, sizeof(saved_vars));
             for(int ri2=saved_elf_refs_len; ri2<asmb->st.elf_refs_len; ri2++)
                 free(asmb->st.elf_refs[ri2].name);
             asmb->st.elf_refs_len = saved_elf_refs_len;
-            for(int vi=0;vi<26;vi++){
+            for(int vi=0;vi<g_nvars;vi++){
                 free(asmb->st.elf_var_to_label[vi].label_name);
                 asmb->st.elf_var_to_label[vi].set       = saved_vtl[vi].set;
                 asmb->st.elf_var_to_label[vi].label_val = saved_vtl[vi].label_val;
@@ -5615,7 +5721,9 @@ combo_done:
 
 /* `!S{{名前}}<変数>` を探す。見つかれば開始位置を返し、*end に変数の次の位置、
  * name に表名、*var に変数名を書く。無ければ -1。 */
-static int pat_find_sub_ref(const char *t, int start, int *end, char *name, size_t nsz, char *var){
+/* `!S{{表名}}変数` を探す。変数名は1文字でも `var_2` のように長くてもよく、
+ * 見つけた名前はスロット番号にして返す。 */
+static int pat_find_sub_ref(const char *t, int start, int *end, char *name, size_t nsz, int *var){
     for(int i=start; t[i]; i++){
         if(!(t[i]=='!' && t[i+1]=='S' && t[i+2]=='{' && t[i+3]=='{')) continue;
         /* `\!` とエスケープされていれば式ではなくリテラルの `!`。 */
@@ -5625,10 +5733,12 @@ static int pat_find_sub_ref(const char *t, int start, int *end, char *name, size
         size_t n = (size_t)(cb - (t+i+4));
         if(n >= nsz) continue;
         memcpy(name, t+i+4, n); name[n]='\0';
-        char v = cb[2];
-        if(is_sub_name(name) && is_lower(v)){
-            *var = v;
-            *end = (int)(cb + 3 - t);
+        int vl = var_name_len(cb+2);
+        if(is_sub_name(name) && vl > 0){
+            int vs = var_slot(cb+2, vl, 1);
+            if(vs < 0) continue;
+            *var = vs;
+            *end = (int)(cb + 2 + vl - t);
             return i;
         }
     }
@@ -5662,20 +5772,20 @@ static uint256_t pat_sub_value(Assembler *asmb, const char *expr){
     return acc;
 }
 
-typedef struct { char var; const char *val; } SubBind;
+typedef struct { int var; const char *val; } SubBind;
 
 enum { SUB_MAX_DEPTH = 8 };
 
 static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
                            SubBind *binds, int nbinds, int depth){
-    char name[64]; char var; int end;
+    char name[64]; int var; int end;
     int start = pat_find_sub_ref(t, 0, &end, name, sizeof(name), &var);
     if(start < 0){
-        PatVar saved_vars[26];
+        PatVar saved_vars[NVARS];
         memcpy(saved_vars, asmb->st.vars, sizeof(saved_vars));
         int saved_elf_refs_len = asmb->st.elf_refs_len;
-        struct {int set; char *label_name; uint64_t label_val;} saved_vtl[26];
-        for(int vi=0;vi<26;vi++){
+        struct {int set; char *label_name; uint64_t label_val;} saved_vtl[NVARS];
+        for(int vi=0;vi<g_nvars;vi++){
             saved_vtl[vi].set        = asmb->st.elf_var_to_label[vi].set;
             saved_vtl[vi].label_val  = asmb->st.elf_var_to_label[vi].label_val;
             saved_vtl[vi].label_name = asmb->st.elf_var_to_label[vi].label_name
@@ -5687,15 +5797,15 @@ static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
              * 値欄から使えるようにするため。入れ子のときは内側から評価する
              * ので、外側の値欄が内側の変数を使える。 */
             for(int k=nbinds-1;k>=0;k--)
-                var_put(&asmb->st, binds[k].var, pat_sub_value(asmb, binds[k].val));
-            for(int vi=0;vi<26;vi++) free(saved_vtl[vi].label_name);
+                var_slot_put(&asmb->st, binds[k].var, pat_sub_value(asmb, binds[k].val));
+            for(int vi=0;vi<g_nvars;vi++) free(saved_vtl[vi].label_name);
             return 1;
         }
         memcpy(asmb->st.vars, saved_vars, sizeof(saved_vars));
         for(int ri=saved_elf_refs_len; ri<asmb->st.elf_refs_len; ri++)
             free(asmb->st.elf_refs[ri].name);
         asmb->st.elf_refs_len = saved_elf_refs_len;
-        for(int vi=0;vi<26;vi++){
+        for(int vi=0;vi<g_nvars;vi++){
             free(asmb->st.elf_var_to_label[vi].label_name);
             asmb->st.elf_var_to_label[vi].set        = saved_vtl[vi].set;
             asmb->st.elf_var_to_label[vi].label_val  = saved_vtl[vi].label_val;
@@ -5797,7 +5907,7 @@ static void include_pat(Assembler *asmb, const char *l, const char *base_dir){
  * 名前の綴り違いや循環参照はそのままだと全行が素の Syntax error になる。
  * パターンファイル側の誤りはここで一度だけ報告する。 */
 static void sub_check_unknown(Assembler *asmb, const char *where, const char *t){
-    char name[64], var; int end, i = 0;
+    char name[64]; int var; int end, i = 0;
     while((i = pat_find_sub_ref(t, i, &end, name, sizeof(name), &var)) >= 0){
         if(!subv_find(&asmb->st.subs, name))
             axx_diagf(1, 0, " error - !S{{%s}} in %s: no sub table named '%s' "
@@ -5823,7 +5933,7 @@ static void sub_walk_cycle(Assembler *asmb, int idx, char *mark, int *stack, int
     mark[idx] = 1;
     SubDef *d = &sv->data[idx];
     for(int k = 0; k < d->n; k++){
-        char name[64], var; int end, i = 0;
+        char name[64]; int var; int end, i = 0;
         while((i = pat_find_sub_ref(d->e[k].pat, i, &end, name, sizeof(name), &var)) >= 0){
             SubDef *tgt = subv_find(sv, name);
             if(tgt && nstack < sv->len){
@@ -7704,22 +7814,21 @@ static int parse_func_header(const char *l, char *name, size_t nsz,
  * 置き換えるのは語として独立している出現だけで、`0xff` の `x` のように
  * 英数字に挟まれたものは触らない。番号は `(3)` と括って埋めるので、
  * `1<<x` は `1<<(3)` となり、前後の演算子の優先順位は変わらない。 */
-static char *map_subst_index(const char *expr, char var, int i){
+static char *map_subst_index(const char *expr, const char *var, int i){
     char num[32];
     snprintf(num, sizeof(num), "(%d)", i);
     size_t nl = strlen(num);
-    size_t cap = strlen(expr) * nl + nl + 16;
+    size_t vl = strlen(var);
+    size_t cap = strlen(expr) * (nl > vl ? nl : 1) + nl + 16;
     char *out = malloc(cap);
     if(!out){ perror("malloc"); exit(1); }
     size_t w = 0;
-    char up = (char)axx_upper_char(var);
-    for(size_t k = 0; expr[k]; k++){
-        char c = expr[k];
-        int is_var = (c == var || c == up);
+    for(size_t k = 0; expr[k]; ){
+        int is_var = (strncasecmp(expr+k, var, vl) == 0);
         int lsep = (k == 0) || !(isalnum((unsigned char)expr[k-1]) || expr[k-1]=='_');
-        int rsep = !(isalnum((unsigned char)expr[k+1]) || expr[k+1]=='_');
-        if(is_var && lsep && rsep){ memcpy(out+w, num, nl); w += nl; }
-        else out[w++] = c;
+        int rsep = !(isalnum((unsigned char)expr[k+vl]) || expr[k+vl]=='_');
+        if(is_var && lsep && rsep){ memcpy(out+w, num, nl); w += nl; k += vl; }
+        else out[w++] = expr[k++];
     }
     out[w] = '\0';
     return out;
@@ -7998,13 +8107,12 @@ static void readpat(Assembler *asmb, const char *fn){
                 for(int k = a; k < e; k++) kw[k-a] = axx_upper_char(fields[0][k]);
             if(strcmp(kw,".MAP")==0){
                 const char *var_str = (nf>2) ? pat_trim(fields[1]) : "";
-                char var = var_str[0] ? (char)tolower((unsigned char)var_str[0]) : 0;
                 if(!var_str[0] || nf<3){
                     axx_diagf(1, 0, " error - .map: needs '.map::<variable>::"
                                "<name,name,...>[::<expression in the variable>]'.\n");
-                } else if(var < 'a' || var > 'z' || var_str[1] != '\0'){
+                } else if(dir_var_slot(var_str) < 0){
                     axx_diagf(1, 0, " error - .map: variable should be a lower case "
-                               "letter ('%s').\n", var_str);
+                               "name ('%s').\n", var_str);
                 }
             }
         }
@@ -8583,9 +8691,16 @@ static void txt_emit_name(Assembler *asmb, TxtBuf *t, const char *name, int len)
         return;
     }
 
-    if(len == 1 && name[0] >= 'a' && name[0] <= 'z'){
-        txt_radix(t, st->vars[name[0]-'a'].val, 10);
-        return;
+    /* 登録済みのパターン変数（1文字でも `var_2` のように長くてもよい）。 */
+    {
+        char lower[64];
+        if(len < (int)sizeof(lower)){
+            for(int k=0;k<len;k++) lower[k] = (char)tolower((unsigned char)name[k]);
+            lower[len] = '\0';
+            int vs = (len == 1 && lower[0] >= 'a' && lower[0] <= 'z')
+                     ? lower[0] - 'a' : var_slot(lower, len, 0);
+            if(vs >= 0){ txt_radix(t, st->vars[vs].val, 10); return; }
+        }
     }
     txt_addn(t, name, (size_t)len);
 }
@@ -8813,11 +8928,11 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
      * 有効なラベル→変数キャプチャが静かに失われることがあった。
      * combo_done 側の既存パターンと同じく、再試行のたびに退避した状態へ
      * 復元してから e_p() を呼び直す。 */
-    PatVar saved_vars[26];
+    PatVar saved_vars[NVARS];
     memcpy(saved_vars, st->vars, sizeof(saved_vars));
     int saved_elf_refs_len = st->elf_refs_len;
-    struct {int set; char *label_name; uint64_t label_val;} saved_vtl[26];
-    for(int vi=0;vi<26;vi++){
+    struct {int set; char *label_name; uint64_t label_val;} saved_vtl[NVARS];
+    for(int vi=0;vi<g_nvars;vi++){
         saved_vtl[vi].set       = st->elf_var_to_label[vi].set;
         saved_vtl[vi].label_val = st->elf_var_to_label[vi].label_val;
         saved_vtl[vi].label_name = st->elf_var_to_label[vi].label_name
@@ -8835,7 +8950,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
             for(int ri2=saved_elf_refs_len; ri2<st->elf_refs_len; ri2++)
                 free(st->elf_refs[ri2].name);
             st->elf_refs_len = saved_elf_refs_len;
-            for(int vi=0;vi<26;vi++){
+            for(int vi=0;vi<g_nvars;vi++){
                 free(st->elf_var_to_label[vi].label_name);
                 st->elf_var_to_label[vi].set       = saved_vtl[vi].set;
                 st->elf_var_to_label[vi].label_val = saved_vtl[vi].label_val;
@@ -8854,7 +8969,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
             break;
         }
     }
-    for(int vi=0;vi<26;vi++) free(saved_vtl[vi].label_name);
+    for(int vi=0;vi<g_nvars;vi++) free(saved_vtl[vi].label_name);
     if(is_empty){ free(ep_buf); return; }
 
     size_t s_cap = strlen(ep_buf) + 64;
@@ -9779,13 +9894,13 @@ typedef struct {
     int       score_expr, score_sym, score_lit;
     int       pln;
     PatEntry *pat;
-    PatVar    vars[26];
+    PatVar    vars[NVARS];
     struct { char *name; uint64_t val; int word_idx; } *refs;
     int       refs_len;
-    struct { int set; char *label_name; uint64_t label_val; } vtl[26];
+    struct { int set; char *label_name; uint64_t label_val; } vtl[NVARS];
     SymMap    symbols;
-    StrVec    check_constraints[26];
-    EnumDef   enum_defs[26];
+    StrVec    check_constraints[NVARS];
+    EnumDef   enum_defs[NVARS];
     char      swordchars[256];
     uint256_t padding;
     int       bts;
@@ -9811,10 +9926,10 @@ static void best_free(BestMatch *b){
     if(!b->valid){ memset(b, 0, sizeof(*b)); return; }
     for(int i=0;i<b->refs_len;i++) free(b->refs[i].name);
     free(b->refs);
-    for(int i=0;i<26;i++) free(b->vtl[i].label_name);
+    for(int i=0;i<g_nvars;i++) free(b->vtl[i].label_name);
     smap_free(&b->symbols);
-    for(int i=0;i<26;i++) sv_free(&b->check_constraints[i]);
-    for(int i=0;i<26;i++) enumdef_clear(&b->enum_defs[i]);
+    for(int i=0;i<g_nvars;i++) sv_free(&b->check_constraints[i]);
+    for(int i=0;i<g_nvars;i++) enumdef_clear(&b->enum_defs[i]);
     iv_free(&b->vliwnop);
     vset_free(&b->vliwset);
     memset(b, 0, sizeof(*b));
@@ -9850,7 +9965,7 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
             b->refs[i].word_idx = st->elf_refs[saved_refs_len+i].word_idx;
         }
     }
-    for(int i=0;i<26;i++){
+    for(int i=0;i<g_nvars;i++){
         b->vtl[i].set       = st->elf_var_to_label[i].set;
         b->vtl[i].label_val = st->elf_var_to_label[i].label_val;
         b->vtl[i].label_name = st->elf_var_to_label[i].label_name
@@ -9860,7 +9975,7 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
     for(int bi=0; bi<st->symbols.nb; bi++)
         for(SymEntry *e=st->symbols.buckets[bi]; e; e=e->next)
             smap_set(&b->symbols, e->key, e->val);
-    for(int i=0;i<26;i++){
+    for(int i=0;i<g_nvars;i++){
         sv_init(&b->check_constraints[i]);
         for(int j=0;j<st->check_constraints[i].len;j++)
             sv_push(&b->check_constraints[i], st->check_constraints[i].data[j]);
@@ -9888,7 +10003,7 @@ static void best_restore_dirstate(AsmState *st, const BestMatch *b){
     for(int bi=0; bi<b->symbols.nb; bi++)
         for(SymEntry *e=b->symbols.buckets[bi]; e; e=e->next)
             smap_set(&st->symbols, e->key, e->val);
-    for(int i=0;i<26;i++){
+    for(int i=0;i<g_nvars;i++){
         sv_free(&st->check_constraints[i]);
         for(int j=0;j<b->check_constraints[i].len;j++)
             sv_push(&st->check_constraints[i], b->check_constraints[i].data[j]);
@@ -10101,7 +10216,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     for(int pi=0;pi<st->pat.len;pi++){
         PatEntry *i=&st->pat.data[pi];
         pln++;
-        for(int vi=0;vi<26;vi++){ st->vars[vi].val=u256_zero(); st->vars[vi].is_undef=0; }
+        for(int vi=0;vi<g_nvars;vi++){ st->vars[vi].val=u256_zero(); st->vars[vi].is_undef=0; }
 
         if(dir_set_symbol(asmb,i)) continue;
         if(dir_clear_symbol(asmb,i)) continue;
@@ -10141,11 +10256,11 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         st->expmode=EXP_ASM;
         st->expcaps=&CAPS_ASM;
 
-        PatVar    saved_vars[26];
+        PatVar    saved_vars[NVARS];
         memcpy(saved_vars, st->vars, sizeof(saved_vars));
         int saved_refs_len = st->elf_refs_len;
-        struct { int set; char *label_name; uint64_t label_val; } saved_vtl[26];
-        for(int vi=0;vi<26;vi++){
+        struct { int set; char *label_name; uint64_t label_val; } saved_vtl[NVARS];
+        for(int vi=0;vi<g_nvars;vi++){
             saved_vtl[vi].set        = st->elf_var_to_label[vi].set;
             saved_vtl[vi].label_val  = st->elf_var_to_label[vi].label_val;
             saved_vtl[vi].label_name = st->elf_var_to_label[vi].label_name
@@ -10183,7 +10298,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
             for(int ri2=saved_refs_len; ri2<st->elf_refs_len; ri2++)
                 free(st->elf_refs[ri2].name);
             st->elf_refs_len = saved_refs_len;
-            for(int vi=0;vi<26;vi++){
+            for(int vi=0;vi<g_nvars;vi++){
                 free(st->elf_var_to_label[vi].label_name);
                 st->elf_var_to_label[vi].set        = saved_vtl[vi].set;
                 st->elf_var_to_label[vi].label_val  = saved_vtl[vi].label_val;
@@ -10206,7 +10321,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
              * ループ先頭で毎回ゼロクリアされるが elf_var_to_label には
              * 同様のリセットが無い）。成功時の巻き戻しと対称に、ここでも
              * 保存しておいた値を書き戻す。 */
-            for(int vi=0;vi<26;vi++){
+            for(int vi=0;vi<g_nvars;vi++){
                 free(st->elf_var_to_label[vi].label_name);
                 st->elf_var_to_label[vi].set        = saved_vtl[vi].set;
                 st->elf_var_to_label[vi].label_val  = saved_vtl[vi].label_val;
@@ -10227,7 +10342,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         for(int ri2=0; ri2<best.refs_len; ri2++)
             elf_refs_push_copy(st, best.refs[ri2].name,
                                best.refs[ri2].val, best.refs[ri2].word_idx);
-        for(int vi=0;vi<26;vi++){
+        for(int vi=0;vi<g_nvars;vi++){
             free(st->elf_var_to_label[vi].label_name);
             st->elf_var_to_label[vi].set        = best.vtl[vi].set;
             st->elf_var_to_label[vi].label_val  = best.vtl[vi].label_val;
@@ -10380,7 +10495,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     if(!line[0]){ free(line); return 0; }
     axx_resolve_vliw_escapes(line);
 
-    for(int _ci = 0; _ci < 26; _ci++){
+    for(int _ci = 0; _ci < g_nvars; _ci++){
         sv_free(&asmb->st.check_constraints[_ci]);
         sv_init(&asmb->st.check_constraints[_ci]);
         enumdef_clear(&asmb->st.enum_defs[_ci]);
@@ -10448,13 +10563,13 @@ static int lineassemble(Assembler *asmb, const char *line_in){
         for(int ri=0;ri<st->elf_refs_len;ri++) free(st->elf_refs[ri].name);
         st->elf_refs_len=0;
         st->elf_current_word_idx = -1;
-        for(int _vi=0;_vi<26;_vi++){
+        for(int _vi=0;_vi<NVARS;_vi++){
             st->elf_var_to_label[_vi].set = 0;
             free(st->elf_var_to_label[_vi].label_name);
             st->elf_var_to_label[_vi].label_name = NULL;
             st->elf_var_to_label[_vi].label_val = 0;
         }
-        st->elf_capturing_var = '\0';
+        st->elf_capturing_var = -1;
     }
 
     IntVec idxs; iv_init(&idxs);
@@ -14492,7 +14607,7 @@ int main(int argc, char *argv[]){
                 lmap_set_full(&imported_labels, e->key, e->value, e->section,
                               e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
 
-        PatVar    initial_vars[26];
+        PatVar    initial_vars[NVARS];
         memcpy(initial_vars, st->vars, sizeof(initial_vars));
 
         LabelMap prev_labels;
