@@ -1188,6 +1188,10 @@ typedef struct {
     int        debug;
     int        verbose;
 
+    /* パターンのエンコーディング欄が文字列テンプレート "..." だったときに、
+     * そこから組み立てたアセンブリ結果のテキスト。1行ごとに作り直す。 */
+    char      *asmtext;
+
     char       cl[4096];
     int        ln;
     StrVec     fnstack;
@@ -1721,6 +1725,7 @@ static void state_init(AsmState *st) {
     st->endian_big = 0;
     st->pas = 0;
     st->debug = 0;
+    st->asmtext = NULL;
     st->osabi = 0;
     st->ln = 0;
     sv_init(&st->fnstack);
@@ -7874,6 +7879,200 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
     *is_empty=!has_content;
 }
 
+/* ==================== 文字列テンプレートのエンコーディング欄 ====================
+ * パターンの3欄目が `"..."` で始まるとき、その行はバイト列ではなく
+ * 「アセンブリ結果のテキスト」を作る。別の書式のニーモニックへ書き換える
+ * ための欄で、たとえば
+ *
+ *     MOV R!r,!e:: "LD Rr,0X{{.hex(e)}}"
+ *
+ * に `MOV R1,0x10` を与えると `LD R1,0x10` を出す。文字列の中では
+ *   - `{{式}}`            … 式を評価して10進で埋める
+ *   - `.hex(式)` `.dec(式)` `.bin(式)` `.float(式)`
+ *                          … それぞれ16進/10進/2進/浮動小数の文字列にする
+ *                            （`{{ }}` の中でも外でも書ける）
+ *   - 小文字 a〜z         … 同名のパターン変数の値（10進）に置き換わる
+ *   - `\x`                … x をそのままの文字として出す（小文字の逃げ道）
+ * が使える。数値変換の直前が `0X` `0B` `0F` のときは、出力側の慣習に合わせて
+ * `0x` `0b` `0f` と小文字にして出す。 */
+
+typedef struct { char *b; size_t len, cap; } TxtBuf;
+
+static void txt_init(TxtBuf *t){ t->b=NULL; t->len=0; t->cap=0; }
+static void txt_addn(TxtBuf *t, const char *s, size_t n){
+    if(t->len + n + 1 > t->cap){
+        size_t nc = t->cap ? t->cap : 64;
+        while(t->len + n + 1 > nc) nc *= 2;
+        char *nb = realloc(t->b, nc);
+        if(!nb){ perror("realloc"); exit(1); }
+        t->b = nb; t->cap = nc;
+    }
+    memcpy(t->b + t->len, s, n);
+    t->len += n;
+    t->b[t->len] = '\0';
+}
+static void txt_addc(TxtBuf *t, char c){ txt_addn(t, &c, 1); }
+static void txt_adds(TxtBuf *t, const char *s){ txt_addn(t, s, strlen(s)); }
+
+/* 値を radix 進の桁だけの文字列にする（`0x` のような接頭辞は付けない）。
+ * 負の値は 2 の補数のままではなく `-` を付けた絶対値で出す。 */
+static void txt_radix(TxtBuf *t, uint256_t v, int radix){
+    int neg = 0;
+    if(u256_lt_signed(v, u256_zero())){ neg = 1; v = u256_sub(u256_zero(), v); }
+    char tmp[300];
+    int n = 0;
+    uint256_t base = u256_from_u64((uint64_t)radix);
+    if(u256_is_zero(v)) tmp[n++] = '0';
+    while(!u256_is_zero(v) && n < (int)sizeof(tmp)){
+        uint256_t q = u256_udiv(v, base);
+        uint64_t  d = u256_to_u64(u256_sub(v, u256_mul(q, base)));
+        tmp[n++] = "0123456789abcdef"[d & 15];
+        v = q;
+    }
+    if(neg) txt_addc(t, '-');
+    while(n > 0) txt_addc(t, tmp[--n]);
+}
+
+/* `.float(式)` の出力。整数として束縛された値はその値の実数表記
+ * （16 なら `16.0`）になる。 */
+static void txt_float(TxtBuf *t, double d){
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), "%.17g", d);
+    /* `%.17g` は 16 を "16" と書くので、小数点が無ければ `.0` を足す。 */
+    if(!strpbrk(tmp, ".eEni")) strncat(tmp, ".0", sizeof(tmp)-strlen(tmp)-1);
+    txt_adds(t, tmp);
+}
+
+/* 数値変換の直前にある `0X` `0B` `0F` を小文字へ倒す。 */
+static void txt_lower_radix_prefix(TxtBuf *t, size_t before){
+    if(before < 2 || !t->b) return;
+    if(t->b[before-2] != '0') return;
+    char c = t->b[before-1];
+    if(c=='X'||c=='B'||c=='F') t->b[before-1] = (char)(c - 'A' + 'a');
+}
+
+/* テンプレート中の丸括弧の対応を取り、閉じ括弧の位置を返す。 */
+static int txt_close_paren(const char *s, int i){
+    int depth = 0;
+    for(; s[i]; i++){
+        if(s[i]=='(') depth++;
+        else if(s[i]==')'){ if(--depth == 0) return i; }
+    }
+    return -1;
+}
+
+/* `.hex` `.dec` `.bin` `.float` のどれかなら、名前の長さを返す。違えば 0。 */
+static int txt_conv_name(const char *s, int *kind){
+    static const struct { const char *n; int k; } tbl[] = {
+        {"float",3},{"hex",0},{"dec",1},{"bin",2},{NULL,0}
+    };
+    for(int i=0; tbl[i].n; i++){
+        size_t l = strlen(tbl[i].n);
+        size_t j = 0;
+        while(j < l && s[j] && axx_upper_char(s[j]) == axx_upper_char(tbl[i].n[j])) j++;
+        if(j == l && s[l]=='('){ *kind = tbl[i].k; return (int)l; }
+    }
+    return 0;
+}
+
+/* 式を評価し、kind（-1/1:10進 0:16進 2:2進 3:浮動小数）に従って積む。 */
+static void txt_emit_expr(Assembler *asmb, TxtBuf *t, const char *expr, int kind){
+    AsmState *st = &asmb->st;
+    int io;
+    int saved_undef = st->error_undefined_label;
+    st->error_undefined_label = 0;
+    uint256_t v = expr_expression_pat(asmb, expr, 0, &io);
+    if(st->error_undefined_label) saved_undef = 1;
+    st->error_undefined_label = saved_undef;
+
+    size_t before = t->len;
+    switch(kind){
+    case 0: txt_lower_radix_prefix(t, before); txt_radix(t, v, 16); break;
+    case 2: txt_lower_radix_prefix(t, before); txt_radix(t, v, 2);  break;
+    case 3: txt_lower_radix_prefix(t, before); txt_float(t, u256_int_to_double(v)); break;
+    default: txt_radix(t, v, 10); break;
+    }
+}
+
+/* テンプレート本文（引用符の中身）を展開して t に積む。 */
+static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
+    AsmState *st = &asmb->st;
+    for(int i = 0; s[i]; ){
+        if(s[i]=='\\' && s[i+1]){ txt_addc(t, s[i+1]); i += 2; continue; }
+        if(s[i]=='{' && s[i+1]=='{'){
+            const char *e = strstr(s+i+2, "}}");
+            if(!e){ txt_addc(t, s[i++]); continue; }
+            int n = (int)(e - (s+i+2));
+            char *inner = malloc((size_t)n + 1);
+            if(!inner){ perror("malloc"); exit(1); }
+            memcpy(inner, s+i+2, (size_t)n); inner[n] = '\0';
+            /* `{{.hex(e)}}` のように中身が変換関数ならそれを使う。 */
+            int j = 0; while(inner[j]==' ') j++;
+            int kind = -1, nl = 0;
+            if(inner[j]=='.') nl = txt_conv_name(inner+j+1, &kind);
+            int done = 0;
+            if(nl){
+                int cp = txt_close_paren(inner, j+1+nl);
+                if(cp > 0){
+                    inner[cp] = '\0';
+                    txt_emit_expr(asmb, t, inner + j + 1 + nl + 1, kind);
+                    done = 1;
+                }
+            }
+            if(!done) txt_emit_expr(asmb, t, inner, -1);
+            free(inner);
+            i += n + 4;
+            continue;
+        }
+        if(s[i]=='.'){
+            int kind = -1;
+            int nl = txt_conv_name(s+i+1, &kind);
+            if(nl){
+                int cp = txt_close_paren(s, i+1+nl);
+                if(cp > 0){
+                    int n = cp - (i+1+nl+1);
+                    char *inner = malloc((size_t)n + 1);
+                    if(!inner){ perror("malloc"); exit(1); }
+                    memcpy(inner, s+i+1+nl+1, (size_t)n); inner[n] = '\0';
+                    txt_emit_expr(asmb, t, inner, kind);
+                    free(inner);
+                    i = cp + 1;
+                    continue;
+                }
+            }
+        }
+        if(s[i] >= 'a' && s[i] <= 'z'){
+            /* パターン変数。値は10進で埋める。 */
+            txt_radix(t, st->vars[s[i]-'a'].val, 10);
+            i++;
+            continue;
+        }
+        txt_addc(t, s[i++]);
+    }
+}
+
+/* エンコーディング欄が文字列テンプレートかどうか。先頭の空白を飛ばして
+ * `"` で始まっていればそう見なす。 */
+static const char *txt_template_body(const char *s){
+    while(*s==' '||*s=='\t') s++;
+    return (*s=='"') ? s : NULL;
+}
+
+/* `"..."` から中身を取り出す。`\` はそのまま残して txt_render() に任せる。 */
+static char *txt_template_inner(const char *q){
+    size_t n = strlen(q);
+    char *r = malloc(n + 1);
+    if(!r){ perror("malloc"); exit(1); }
+    size_t w = 0;
+    for(size_t i = 1; i < n; i++){
+        if(q[i]=='\\' && q[i+1]){ r[w++]=q[i]; r[w++]=q[i+1]; i++; continue; }
+        if(q[i]=='"') break;
+        r[w++] = q[i];
+    }
+    r[w] = '\0';
+    return r;
+}
+
 /* パターンのエンコーディング欄を評価して、出力ワード列 objl を作る。
  * s_in はカンマ区切りの式の並び。`%%`(連番) と `@@[]`(反復) は呼び出し前に
  * 展開済み。要素が `;` で始まるものは条件付き出力で、値が 0 なら何も出さない
@@ -7881,6 +8080,20 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
 static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     AsmState *st=&asmb->st;
     iv_clear(objl);
+
+    /* `"..."` で始まる欄はバイト列ではなくアセンブリ結果のテキストを作る。 */
+    {
+        const char *q = txt_template_body(s_in);
+        if(q){
+            char *inner = txt_template_inner(q);
+            TxtBuf t; txt_init(&t);
+            txt_render(asmb, &t, inner);
+            free(inner);
+            free(st->asmtext);
+            st->asmtext = t.b ? t.b : strdup("");
+            return;
+        }
+    }
 
     size_t ep_cap = 8192;
     char *ep_buf = NULL;
@@ -9800,7 +10013,16 @@ static int lineassemble0(Assembler *asmb, const char *line){
         printf("%016llx %s %d %s //",(unsigned long long)u256_to_u64(st->pc),
                st->current_file, st->ln, cleaned);
     }
+    free(st->asmtext); st->asmtext=NULL;
     int f=lineassemble(asmb,cleaned);
+    /* パターンが文字列テンプレートだった行は、アセンブリ結果をテキストで出す。
+     * -v の診断行の中では `` ではなく "" で括って見せ、診断を出さないときは
+     * その行だけを素のまま標準出力へ流す（トランスレータとしての出力）。 */
+    if(st->asmtext && (st->pas==0 || st->pas==2)){
+        if(show) printf(" \"%s\"", st->asmtext);
+        else     printf("%s\n", st->asmtext);
+    }
+    free(st->asmtext); st->asmtext=NULL;
     if(show) printf("\n");
     free(cleaned);
     st->ln++;

@@ -36,8 +36,8 @@ axx x86_64.axx hello.s -o out.o # ELF relocatable object
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles fourteen bundled pattern/source pairs with both
-implementations and `cmp`s the results.
+exactly that: `test1` assembles all fourteen bundled pattern/source pairs with
+both implementations and `cmp`s the results.
 
 **Contents**
 
@@ -112,18 +112,11 @@ encoder. The practical condition is:
 
 Two consequences follow, and both are design decisions rather than oversights:
 
-**The pattern notation itself is Turing-incomplete.** This guarantees that
-pattern *matching* terminates. An encoding that needs unbounded computation
-cannot be written in `binary_list` alone.
-
-**Unbounded computation is available, but only by asking for it.** A
-`binary_list` element may be `.call name(...)`, which runs a function written in
-the **mini language** of [section 3.15](#315-mini-language-func--call) — loops,
-recursion, conditionals and arrays, and therefore Turing complete. Matching
-still terminates; only the encoding step can compute without a fixed bound, and
-it is bounded in practice by the step, depth and output caps in section 3.15.
-(The macro layer in section 7 is a third, earlier stage and is likewise not
-restricted.)
+**The pattern language is Turing-incomplete.** This guarantees that pattern
+matching terminates. The cost is that an ISA whose encoding requires unbounded
+computation cannot be described. axx is therefore a *general* assembler, not a
+*universal* one. (The macro layer in section 7 is a separate stage and is not
+subject to this restriction.)
 
 **Some real architectures fall outside the model.** Not because their syntax
 cannot be written down, but because their encoding cannot be produced by
@@ -384,69 +377,11 @@ ADD A,R!n :: n>7;5 :: n|0x68
 - An **empty element** performs alignment. A leading comma, or `0x12,,0x13`,
   pads to the exact address.
 - An element starting with `;` is **suppressed when its value is 0**.
-- An element starting with `;;` is **evaluated but never output**. `0x11,;;n,0x22`
-  emits two words, and a `binary_list` of just `;;n` emits none at all.
 
 #### 3.5.1 `@@[]` — repetition
 
 `@@[n,<str>]` repeats `<str>` n times. `%%` is the repetition index; `%0`
 resets it to 0.
-
-#### 3.5.2 Text templates — emitting assembly text instead of bytes
-
-When the `binary_list` field starts with a double quote, the line does not
-produce bytes at all. It produces **text**: the assembly result for that
-source line, written in some other mnemonic syntax. This turns a pattern file
-into a source-to-source translator.
-
-```
-MOV R!r,!e:: "LD Rr,0X{{.hex(e)}}"
-```
-
-Given `MOV R1,0x10`, that pattern outputs:
-
-```
-LD R1,0x10
-```
-
-Inside the string:
-
-| Form | Meaning |
-|---|---|
-| `{{<expr>}}` | Evaluate the expression and insert it in decimal |
-| `.hex(<expr>)` | Hexadecimal digits of the value |
-| `.dec(<expr>)` | Decimal digits of the value |
-| `.bin(<expr>)` | Binary digits of the value |
-| `.float(<expr>)` | The value as a real number (`16` becomes `16.0`) |
-| lowercase `a`–`z` | The value of that pattern variable, in decimal |
-| `\<char>` | `<char>` literally — the way to write a literal lowercase letter |
-
-The four conversions may be written inside `{{ }}` or on their own, directly in
-the text. They emit digits only, with no radix prefix, so you write the prefix
-yourself. When a conversion is immediately preceded by `0X`, `0B` or `0F`, that
-prefix is lowered to `0x`, `0b` or `0f` to match the usual convention of the
-target syntax.
-
-Every lowercase letter in the template is a pattern variable, which is why
-`Rr` becomes `R1`. Mnemonic text is therefore written in upper case, and a
-literal lowercase letter is escaped with a backslash.
-
-```
-MOV R!r,!e:: "LD Rr,0X{{.hex(e)}}"    ->  LD R1,0x10
-MOV R!r,!e:: "LD Rr,{{.dec(e)}}"      ->  LD R1,16
-MOV R!r,!e:: "LD Rr,0B{{.bin(e)}}"    ->  LD R1,0b10000
-MOV R!r,!e:: "LD Rr,0F.float(e)"      ->  LD R1,0f16.0
-```
-
-Where the text goes:
-
-- Without `-v`, the rendered line alone is written to standard output, so the
-  translated program can simply be redirected to a file.
-- With `-v`, it appears at the end of that line's diagnostic, after the `//`,
-  enclosed in double quotes: `... MOV R1,0x10 // "LD R1,0x10"`.
-
-A text-template line emits no words, so it contributes nothing to `$.`, to the
-location counter, or to any binary or ELF output.
 
 ### 3.6 Symbols
 
@@ -844,384 +779,6 @@ the natural style. A code that is never given a message still raises its
 error and still blocks the output file from being written; only the printed
 text stays blank, exactly as for an undeclared code today.
 
-### 3.15 Mini language (`.func` / `.call`)
-
-A `binary_list` element may be `.call name(argument, ...)`, which runs a
-function written in a small procedural language and emits the words that
-function produces — the values it passes to `.emit`, followed by its return
-value if it has one. The language has assignment, `.if`/`.elif`, `.while`,
-`.for`, recursion and arrays, so an encoding that cannot be written as a fixed
-expression can be computed instead. `.echo` prints to stderr without emitting
-anything, for working out why a function produced what it did.
-
-A function is defined at the top level of a pattern file:
-
-```
-.func <name>(<parameter, parameter, ...>)
-<statements>
-.endfunc
-```
-
-Everything between the header and the matching `.endfunc` is the body; those
-lines are never matched as ordinary pattern lines. Parameters may be empty
-(`.func name()`, or just `.func name`) — the same shape as the `.call name(...)`
-that invokes it. The older `.func::name::params` header is still read; a `::`
-directly after `.func` selects it, so existing pattern files keep working.
-
-```
-MOV a,!b,!c :: .call name(a,b,c)
-```
-
-The arguments at the call site are ordinary axx pattern expressions, so `a`,
-`b` and `c` there mean the captured pattern variables. Inside the function they
-become its parameters, which are local to the call. `.call` is one
-comma-separated element like any other, so it can be mixed with plain values:
-
-```
-MIX !e :: 0x90,.call rep(e),0xff
-```
-
-An argument written `[e1, e2, ...]` is an **array**; its elements are pattern
-expressions too. `[]` is the empty array.
-
-```
-LOG !v :: .call table([0x11,0x22,v],3)
-```
-
-The `;` modifier of [section 3.5](#35-binary_list) applies to `.call` as well:
-`;.call f(a)` emits nothing when the call's whole output is a single word equal
-to 0, which is how a prefix byte that is sometimes absent is written. `;;.call
-f(a)` runs the call and discards its output.
-
-#### Statements
-
-| Statement | Meaning |
-|---|---|
-| `name = expression` | Assign to a local variable |
-| `name[index] = expression` | Assign to an array element |
-| `.emit(e1, e2, ...)` | Append one word per value to the output |
-| `.echo(item, item, ...)` | Print strings and values to stderr — for debugging only, emits nothing |
-| `.raise <expr>` | Report an error whose error code is the value of `<expr>` |
-| `.call name(args)` | Call another function |
-| `name = .call name(args)` | Call another function and assign its return value |
-| `... .call name(args) ...` | A call used as a term inside an expression — its value is the return value |
-| `.if <expr> .then` / `.elif <expr> .then` / `.else` / `.endif` | Conditional; `.elif` may repeat, `.else` is optional |
-| `.while(<expr>)` / `.endwhile` | Loop while the condition is non-zero |
-| `.for <name> in range(...)` / `.next` | Loop over `range(stop)`, `range(start, stop)` or `range(start, stop, step)` |
-| `.nonlocal a, b` | Bind these names to the enclosing call instead of locally |
-| `.return` | Return from the function. May appear anywhere in the body (top level or inside `.if`/`.while`/`.for`), any number of times |
-| `.return <expr>` | Return a value from the function |
-| `.endfunc` | Close the function's body (see above) |
-
-`.emit` appends one word of `.bits` width per value — one byte at the default
-width. The number of words a call emits is the instruction's length, so a
-function must emit the same count in both passes for addresses to settle.
-
-The `.if` and `.elif` lines must end with `.then`. Any number of `.elif`
-branches may follow an `.if`, an `.else` may close the chain, and one `.endif`
-ends the whole chain:
-
-```
-.if n > 100 .then
-.emit(0xff, n & 0xff)
-.elif n > 10 .then
-.emit(0xfe, n & 0xff)
-.else
-.emit(n & 0xff)
-.endif
-```
-
-`.echo` is the debugging counterpart of `.emit`: it writes to stderr and
-appends nothing to the output, so adding or removing one never changes the
-generated bytes. Each item is either a `"..."` string literal or an expression,
-and the two may be mixed:
-
-```
-.echo("Example", n, 1)          /* -> Example 7 1 */
-.echo("n=", n, "arr=", a)       /* -> n= 7 arr= [7, 14] */
-```
-
-A string prints as written, an integer as signed decimal, an array as
-`[1, 2, 3]`, and the items of one call share a line separated by spaces — the
-same output routine the macro layer's `!echo` uses, so the two agree.
-`.echo()` with no item prints an empty line. Nothing is printed while the
-assembler is measuring instruction lengths or converging in pass 1, so each
-line appears once per assembled instruction, not once per relaxation
-iteration.
-
-Strings may appear only in the argument list of `.echo`. Values are integers
-and arrays only, so a string cannot be assigned to a variable or used in an
-expression. The escapes are `\\`, `\"`, `\n` and `\t`; any other `\` is an
-error. A string cannot contain `/*` — that is the pattern file's comment
-marker, stripped before the mini language sees the line.
-
-`.raise <expr>` reports an error whose error code is the value of `<expr>`, in
-exactly the format an `error_patterns` field produces for `condition;code`
-([section 3.4](#34-error_patterns)); a message registered with
-`.error::code::"text"` is used the same way, and an unregistered code prints
-the number alone. Reporting does not stop the function — execution continues
-with the next statement, so follow it with `.return` to stop there — and, like
-`.echo`, it stays quiet while instruction lengths are only being measured and
-during pass-1 relaxation, so each assembled instruction reports at most once.
-As with a triggered `error_patterns`, the assembly fails and no output file is
-written.
-
-```
-.error::3::"immediate out of range"
-
-MOV !n :: .call mov(n)
-
-.func mov(n)
-.if n > 255 .then
-.raise 3
-.return
-.endif
-.emit(0xb0, n)
-.return
-.endfunc
-```
-
-Values are 256-bit two's complement integers, the same as everywhere else in
-axx. Operators, from loosest to tightest: `||`, `&&`, `!`, comparisons
-(`== != < <= > >=`), `|`, `^`, `&`, `<< >>`, `+ -`, `* / %`, unary `- + ~`,
-`**`, subscript. `/` truncates toward zero and `%` takes the sign of the
-dividend. `>>` is arithmetic.
-
-Four terms are handed to the assembler's own expression evaluator instead:
-`$$`, `$.`, `#name`, and a bare name that no local variable claims (read as a
-label or `.equ`). Both sides are 256-bit, so the value comes back usable as it
-is.
-
-```
-BR !t :: .call rel8(t)
-
-.func rel8(target)
-d = target - $.
-.if d < -128 || d > 127 .then
-.echo("branch out of range:", d)
-.endif
-.emit(d & 0xff)
-.return
-.endfunc
-```
-
-Pattern variables `a`-`z` and `!!!` are *not* available there: nothing has
-bound them while a `.func` body runs, so pass them in at the call site as
-`.call f(a,b)`. [Section 6.3](#63-what-is-available-where) has the full table.
-A value derived from an undefined label comes through as 0, the same treatment
-`.call` arguments get, so a huge sentinel cannot blow up a loop count.
-
-#### Return values
-
-`.return <expr>` returns a value, and the caller takes it with
-`var = .call name(args)`:
-
-```
-.func hypot2(a,b)
-.return a*a+b*b
-.endfunc
-
-.func emit_h(a,b)
-v = .call hypot2(a,b)
-.emit(v)
-.return
-.endfunc
-```
-
-The value may be a number or an array; an array is passed as a copy. The target
-may be an array element (`a[i] = .call f(x)`), in which case the returned value
-must be a number. Calling a function that returns nothing in that form is an
-error.
-
-`.call name(args)` may also appear as a term *inside* a larger expression, where
-it stands for the value the function returns:
-
-```
-d = .call hypot2(a,b) + .call hypot2(c,e)
-.if(.call firstdiv(n) == n)
-m = t[.call idx(k)]
-```
-
-The call may be nested in the arguments of another call, and its arguments are
-ordinary expressions. A function that returns nothing cannot be used this way —
-it is an error, the same as in the assignment form. `.return` never closes the body — only `.endfunc` does
-that — so `.return <expr>` may also be used as an early return from inside a
-block, any number of times:
-
-```
-.func firstdiv(n)
-i=2
-.while(i<n)
-.if n%i==0 .then
-.return i
-.endif
-i=i+1
-.endwhile
-.return 0
-.endfunc
-```
-
-When a function is called straight from `binary_list`, its return value becomes
-output: a number is one word, an array is one word per element from index 0.
-That is in addition to whatever it passed to `.emit`, so a function that only
-`.emit`s and returns nothing behaves exactly as before.
-
-```
-SEQ !n :: 0xaa,.call seq(n),0xbb
-
-.func seq(n)
-a=[]
-.for i in range(n)
-a[i]=0xc0+i
-.next
-.return a
-.endfunc
-```
-
-```
-seq 4                -> aa c0 c1 c2 c3 bb
-```
-
-#### Arrays
-
-An array is written `[]`, or `[e1, e2, ...]`, or produced by slicing. An array
-may also be passed as a function argument, both between functions and from a
-`binary_list` call site.
-
-```
-a = []
-a[3] = 5          /* a is now [0,0,0,5] — the gap is filled with 0 */
-.emit(a[0])       /* 0 */
-.emit(a[99])      /* 0 — reading past the end gives 0, without extending */
-.emit(.len(a))    /* 4 */
-b = a[1:3]        /* [0,0] — the end index is not included */
-```
-
-Assigning past the end extends the array with zeros. Reading past the end, or
-at a negative index, gives `0` and leaves the array alone. Slice bounds are
-clamped to the array. `.len(x)` is the length. Array elements are numbers, not
-arrays.
-
-#### Scope and nesting
-
-Each call gets its own variables. A name read before it is set is an error, so
-a typo does not silently read zero.
-
-Functions may be defined inside other functions. An inner function is visible
-to its enclosing function and resolves names outward; `.nonlocal` lets it
-assign to a variable of an enclosing call rather than creating its own:
-
-```
-.func outer()
-n=7
-.func inner()
-.nonlocal n
-n=n+1
-.emit(n)
-.return
-.endfunc
-.call inner()
-.call inner()
-.emit(n)
-.return
-.endfunc
-```
-
-```
--> 08 09 09
-```
-
-`.nonlocal` must appear before the name is otherwise used in that function.
-
-#### Example
-
-A sieve, and an instruction whose encoding is a Collatz step count:
-
-```
-PRIMES !n  :: .call sieve(n)
-COLLATZ !n :: .call collatz(n)
-
-.func sieve(n)
-mark=[]
-mark[n]=0
-i=2
-.while(i*i<n)
-.if mark[i]==0 .then
-j=i*i
-.while(j<n)
-mark[j]=1
-j=j+i
-.endwhile
-.endif
-i=i+1
-.endwhile
-.for k in range(2,n)
-.if mark[k]==0 .then
-.emit(k)
-.endif
-.next
-.return
-.endfunc
-
-.func collatz(n)
-c=0
-.while(n!=1)
-.if n%2==0 .then
-n=n/2
-.else
-n=3*n+1
-.endif
-c=c+1
-.endwhile
-.emit(c)
-.return
-.endfunc
-```
-
-```
-primes 50            -> 02 03 05 07 0b 0d 11 13 17 1d 1f 25 29 2b 2f
-collatz 27           -> 6f
-```
-
-The same material is kept as a standalone document in `MINI.md` (Japanese) and
-`mini_en.md` (English).
-
-#### A worked example from a real ISA
-
-`aarch64_logical_mini.axx` encodes the AArch64 logical-immediate group
-(AND / ORR / EOR / ANDS / TST, 32- and 64-bit) this way. ARM's `DecodeBitMasks`
-run in reverse is split across four functions — `highbit`, `find_e`, `pack_rs`
-and `emit_logical` — which leaves each instruction line short:
-
-```
-AND  d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 :: .call emit_logical(v,1,0,n,d,64)
-```
-
-[Appendix A.3](#a3-aarch64-logical-immediate) gives the same encoding written
-instead as a single chained-ternary `binary_list`, which is what the mini
-language is there to replace. Both compute in the same 256-bit arithmetic; what
-the function form gains is that each call has its own local scope, so its
-working variables cannot collide with the pattern layer's captured ones, and
-that one body serves both widths — the 32-bit forms only bound the element-size
-search to 32 instead of 64, where the `binary_list` version needs the width
-folded into the expression.
-
-#### Limits
-
-The language is Turing complete, so a buggy pattern file could otherwise hang
-the assembler. Four caps stop that and report the offending line instead:
-
-| Cap | Value |
-|---|---|
-| Statements executed per `.call` | 4,000,000 |
-| Call nesting | 128 |
-| Words emitted per `.call` | 1,048,576 |
-| Array length | 1,048,576 |
-
-An argument that came from an undefined label is passed as `0`, so a
-forward reference cannot blow a loop count up during the first pass.
-
-
 ---
 
 ## 4. VLIW and EPIC processors
@@ -1537,57 +1094,6 @@ x?a:b           ternary
   right. (The Hebimarumatta operator.)
 - `a'24` sign-extends `a`, treating bit 24 as the sign bit. (The SEX operator.)
 
-### 6.3 What is available where
-
-The same evaluator is called from three places — an assembly line, a pattern
-file's fields, and (by delegation) the macro layer and the mini language — and
-not every term means something in every one of them. A capability descriptor
-decides, so the feature set changes with the moment of the call:
-
-| Term | Pattern line | Assembly line | Mini language | Macro layer |
-|---|---|---|---|---|
-| Label / `.equ` | yes | yes | yes | previous iteration's value |
-| `$$` / `$.` | yes | yes | yes | `$` / `$$`, previous iteration |
-| `#symbol` | yes | yes | yes | — |
-| Pattern variables `a`-`z` | yes | uppercase only | no | no |
-| `!!!` / `!!!!` | yes | no | no | no |
-| `@`, `'`, `*(x,y)` | yes | yes | yes | yes |
-
-Pattern variables are dropped for the mini language because nothing has bound
-them while a `.func` body runs — pass them in at the call site instead. `!!!`
-only means anything on a VLIW pattern line. In a pattern file the macro layer
-runs before any source is assembled, so it has no labels and no location
-counter to read at all.
-
-`@`, `'` and `*(x,y)` are implemented once and called from both the assembler's
-evaluator and the macro layer, so they mean the same thing in either. In the
-macro layer `'` binds looser than the bitwise operators and tighter than `&&`;
-the position differs from the assembler's, where it sits between `^` and the
-comparisons, because macro-layer precedence follows C and there comparisons
-bind tighter than the bitwise operators.
-
-### 6.4 Very large values and the UNDEF sentinel
-
-An undefined label carries a sentinel value through ordinary arithmetic, so
-that `label+4` stays recognisably undefined instead of raising. Paxx can put
-that sentinel out of band — its integers are arbitrary-precision, so the
-sentinel lives above `2**768` where no real value reaches. Caxx has no headroom
-above 256 bits, so it treats any magnitude of `2**192` or more as
-sentinel-derived, and says so once in a warning.
-
-Keep computed values below `2**192` and the two implementations agree exactly.
-Above it they part company, each in its own way:
-
-| Value | Paxx | Caxx |
-|---|---|---|
-| magnitude ≥ `2**192` | a normal value | reported as an undefined-label reference |
-| bit 255 set | positive, so `>>` shifts in zeros | negative, so `>>` shifts in ones |
-| ≥ `2**256` | kept as-is | wrapped to 256 bits |
-
-Both implementations warn when a value enters the band they cannot judge. This
-is a property of the sentinel design, not of any one operator: giving Caxx an
-out-of-band sentinel would mean widening its value type beyond 256 bits.
-
 ---
 
 ## 7. Macro layer
@@ -1629,7 +1135,7 @@ is ignored).
 | `!name(a, b)` | Expand a macro as a statement |
 | `!include "file"` | Include text at expansion time |
 | `!error expr` | Abort expansion with an error |
-| `!warning expr` / `!echo expr` | Write to stderr (`!echo` shares its layout with the mini language's `.echo`, [section 3.15](#315-mini-language-func--call)) |
+| `!warning expr` / `!echo expr` | Write to stderr |
 
 The opening `{` must be the last thing on the header line, and the closing `}`
 must start a line. `; comment` may follow a statement.
@@ -1679,15 +1185,6 @@ unary:  -  +  ~  !
 either operand is a string; `"ab" * 3` repeats. Integer literals: `10`,
 `0x1f`, `0b1010`, `0o17`, underscores permitted. `'A'` is a character code if
 it is one character, a string if more.
-
-Three more come across from the assembler's own evaluator, sharing one
-implementation with it so that they mean the same thing in either place:
-`@v` (position of the highest set bit), `v'bits` (sign extension) and
-`*(v, n)` (byte extract) — `!{@255}` is 8, `!{0xff'8}` is -1, `!{*(0xabcd,1)}`
-is 171. `'` binds looser than the bitwise operators and tighter than `&&`;
-see [section 6.3](#63-what-is-available-where) for why the position differs
-from the assembler's. Only a `*(` where a value is expected is a byte extract;
-an infix `*` is still multiplication.
 
 Built-in functions:
 
@@ -1922,8 +1419,6 @@ from being written; only the message is blank. To add or override messages
 from a pattern file, without touching either implementation's source, use
 `.error::n::"Message"` (section 3.14).
 
-A `.raise n` directive in axx mini language raises an error with an error code n.
-
 ---
 
 ## 10. Design notes and background
@@ -1965,8 +1460,6 @@ The reason for the restriction is that a Turing-complete DSL would make the
 pattern file a *program*, and pattern matching would no longer be guaranteed to
 terminate. That guarantee was judged worth more than the extra reach. The macro
 layer is a separate stage and is not restricted this way.
-
-While the pattern file is not Turing-complete, when computation is required, you can invoke a Turing-complete function (a mini-language) from the `binary_list` using `.call func()`.
 
 Because a pattern file has no explicit structure, it suits unstructured
 instruction encodings well; `.check` (section 3.6) is what lets you impose
@@ -2096,15 +1589,9 @@ $ axx test.axx test.s -v
 Probably the most complex thing expressible in a single pattern. Encodings like
 this can be folded into one macro (section 7.4).
 
-The bundled `aarch64_logical_mini.axx` covers this same instruction group with
-the mini language of [section 3.15](#315-mini-language-func--call) instead, and
-is the form to start from if you are writing something like this yourself; the
-one-liner below is kept here as a demonstration of the declarative core's
-reach.
-
 ```
 AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v)?2:((v&0xf)*0x1111111111111111==v)?4:((v&0xff)*0x0101010101010101==v)?8:((v&0xffff)*0x1000100010001==v)?16:((v&0xffffffff)*0x100000001==v)?32:64)*0,;(m:=(1<<e)-1)*0,;(y:=v&m)*0,;(t:=@(y^(y-1))-1)*0,;(u:=y>>t)*0,;(w:=(y^m)==0?1:y^m)*0,;(p:=@(w^(w-1))-1)*0,;(q:=w>>p)*0,;(c:=((u+1)&u)==0)*0,;(b:=c?@u:e-@q)*0,
- ;(r:=c?(e-t)&(e-1):(e-(p+@q))&(e-1))*0,;(s:=((-2*e)&0x7f)|(b-1))*0,;(z:=(1<<31)|(0x24<<23)|((((s>>6)&1)^1)<<22)|(r<<16)|((s&0x3f)<<10)|(n<<5)|d)*0,@@[4,z>>(%%*8)]
+ ;(r:=c?(e-t)&(e-1):(e-(p+@q))&(e-1))*0,;(s:=((0-2*e)&0x7f)|(b-1))*0,;(z:=(1<<31)|(0x24<<23)|((((s>>6)&1)^1)<<22)|(r<<16)|((s&0x3f)<<10)|(n<<5)|d)*0,@@[4,z>>(%%*8)]
 ```
 
 ---
@@ -2113,8 +1600,7 @@ AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v
 
 `x86_64.axx`, `x86_64m.axx`, `68000.axx`, `z80.axx`, `8080.axx`, `8048.axx`,
 `8051.axx`, `6502.axx`, `6800.axx`, `6809.axx` and `4004.axx` are for practical
-use, as is `aarch64_logical_mini.axx` within the one instruction group it
-covers. The rest are test fixtures.
+use. The rest are test fixtures.
 
 The x86_64 pattern file is also maintained separately at
 <https://github.com/fygar256/x86_64_pattern_file_for_axx>.
@@ -2123,9 +1609,8 @@ The x86_64 pattern file is also maintained separately at
 |---|---|---|---|---|
 | **x86_64.axx** | 3.9 MB | 23,923 | **hello.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512 |
 | **x86_64m.axx** | 935 KB | 5,787 | **hello.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo |
-| **aarch64_logical_mini.axx** | 9.2 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 logical (immediate): AND/ORR/EOR/ANDS/TST, 32- and 64-bit. Encodes the bitmask immediate with the mini language (section 3.15) |
 | **6809.axx** | 124 KB | 1,950 | **6809.s** | Motorola 6809 |
-| **68000.axx** | 51 KB | 453 | **68000.s** | Motorola 68000 |
+| **68000.axx** | 49 KB | 458 | **68000.s** | Motorola 68000 |
 | **6800.axx** | 18 KB | 271 | **6800.s** | Motorola 6800 |
 | **6502.axx** | 14 KB | 192 | **6502.s** | MOS 6502 |
 | **z80.axx** | 7.5 KB | 283 | **z80.s** | Zilog Z80 |
@@ -2135,16 +1620,14 @@ The x86_64 pattern file is also maintained separately at
 | **4004.axx** | 5.4 KB | 53 | **4004.s** | Intel 4004 |
 | **test.axx** | 1.1 KB | 40 | **test.s** | Fragments of several ISAs; test only |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
-| **vliw.axx** | 178 B | 10 | **vliw.s** | Non-EPIC VLIW; test only |
-| **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck virtual CPU; hello-world demo. Bundled, but not part of `test1` |
+| **vliw.axx** | 178 B | 9 | **vliw.s** | Non-EPIC VLIW; test only |
+| **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck virtual CPU; hello-world test |
 
 Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
-`itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
-`aarch64_logical_mini_demo.s`.
+`itanium.axx` also uses `vliw.s`.
 
-`test1` runs fourteen of the pairs above through both implementations and
-compares the results. `bf.axx` / `bf.s` is the one bundled pair it does not
-cover.
+`test1` runs every pair above through both implementations and compares the
+results.
 
 x86_64 and legacy CPUs make up most of what is currently implemented, but that
 reflects where the work has gone, not the limit of what axx can describe.
@@ -2158,14 +1641,13 @@ reflects where the work has gone, not the limit of what axx can describe.
 | File | Contents |
 |---|---|
 | `MACRO.md` / `macro_en.md` | Macro layer reference (Japanese / English). Same material as section 7 |
-| `MINI.md` / `mini_en.md` | Mini language reference (Japanese / English). Same material as section 3.15 |
-| `axx_introduction_paper.md` / `_en.md` | Introduction paper: the design rationale behind the free-syntax pattern language, the specificity score, and the separation of computational power from the declarative core |
+| `axx_introduction_paper.md` / `_en.md` | Introduction paper: the design rationale behind the free-syntax pattern language, the specificity score, and the deliberate Turing incompleteness |
 | `axxsemantics` | A denotational-semantics formalization of axx, including relaxation read as a fixed point over the label environment. The formulas in it are that document's own construction, not an official specification |
 | `FILE_DESCRIPTION` | One-line description of every file |
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles fourteen bundled pattern/source pairs with both
+`test1` assembles all fourteen bundled pattern/source pairs with both
 implementations and compares the results.
 
 ### C.2 External

@@ -819,6 +819,9 @@ class AssemblerState:
         self.relax = RelaxationState()
 
         self.verbose: bool = False
+        # パターンのエンコーディング欄が文字列テンプレート "..." だったときに、
+        # そこから組み立てたアセンブリ結果のテキスト。1行ごとに作り直す。
+        self.asmtext = None
 
         # 標準入力から読んだソースを置く一時ファイル（全パスで再利用する）。
         self.stdin_tmp_path: str | None = None
@@ -5758,7 +5761,172 @@ class ObjectGenerator:
             break
         return out, k + 1
 
+    # ==================== 文字列テンプレートのエンコーディング欄 ====================
+    # パターンの3欄目が `"..."` で始まるとき、その行はバイト列ではなく
+    # 「アセンブリ結果のテキスト」を作る。別の書式のニーモニックへ書き換える
+    # ための欄で、たとえば
+    #
+    #     MOV R!r,!e:: "LD Rr,0X{{.hex(e)}}"
+    #
+    # に `MOV R1,0x10` を与えると `LD R1,0x10` を出す。文字列の中では
+    #   - `{{式}}`            … 式を評価して10進で埋める
+    #   - `.hex(式)` `.dec(式)` `.bin(式)` `.float(式)`
+    #                          … それぞれ16進/10進/2進/浮動小数の文字列にする
+    #                            （`{{ }}` の中でも外でも書ける）
+    #   - 小文字 a〜z         … 同名のパターン変数の値（10進）に置き換わる
+    #   - `\x`                … x をそのままの文字として出す（小文字の逃げ道）
+    # が使える。数値変換の直前が `0X` `0B` `0F` のときは、出力側の慣習に
+    # 合わせて `0x` `0b` `0f` と小文字にして出す。
+    _TXT_CONVS = (('float', 3), ('hex', 0), ('dec', 1), ('bin', 2))
+
+    @staticmethod
+    def _txt_template_body(s):
+        """エンコーディング欄が文字列テンプレートなら `"` からの部分を返す。"""
+        t = s.lstrip(' \t')
+        return t if t.startswith('"') else None
+
+    @staticmethod
+    def _txt_template_inner(q):
+        """`"..."` の中身を取り出す。`\` は残して展開側に任せる。"""
+        out = []
+        i = 1
+        while i < len(q):
+            if q[i] == '\\' and i + 1 < len(q):
+                out.append(q[i]); out.append(q[i + 1]); i += 2; continue
+            if q[i] == '"':
+                break
+            out.append(q[i]); i += 1
+        return ''.join(out)
+
+    @staticmethod
+    def _txt_radix(v, radix):
+        """radix 進の桁だけの文字列。接頭辞は付けず、負なら `-` を付ける。"""
+        n = int(v)
+        neg = n < 0
+        if neg:
+            n = -n
+        if n == 0:
+            body = '0'
+        else:
+            digits = '0123456789abcdef'
+            body = ''
+            while n:
+                body = digits[n % radix] + body
+                n //= radix
+        return ('-' + body) if neg else body
+
+    @staticmethod
+    def _txt_float(v):
+        """`.float(式)` の出力。16 なら `16.0`。"""
+        t = repr(float(v))
+        if not any(c in t for c in '.eEni'):
+            t += '.0'
+        return t
+
+    @staticmethod
+    def _txt_lower_radix_prefix(parts):
+        """直前に積んだ `0X` `0B` `0F` を小文字へ倒す。"""
+        tail = ''.join(parts)[-2:]
+        if len(tail) == 2 and tail[0] == '0' and tail[1] in 'XBF':
+            rest = ''.join(parts)
+            parts[:] = [rest[:-1] + rest[-1].lower()]
+
+    @staticmethod
+    def _txt_close_paren(s, i):
+        """丸括弧の対応を取り、閉じ括弧の位置を返す。無ければ -1。"""
+        depth = 0
+        while i < len(s):
+            if s[i] == '(':
+                depth += 1
+            elif s[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    @classmethod
+    def _txt_conv_name(cls, s):
+        """`.hex` などなら (名前の長さ, 種別) を返す。違えば (0, -1)。"""
+        u = StringUtils.upper(s)
+        for name, kind in cls._TXT_CONVS:
+            if u.startswith(StringUtils.upper(name)) and s[len(name):len(name) + 1] == '(':
+                return len(name), kind
+        return 0, -1
+
+    def _txt_emit_expr(self, parts, expr, kind):
+        """式を評価し、kind に従って parts に積む。"""
+        saved_undef = self.state.error_undefined_label
+        self.state.error_undefined_label = False
+        v, _ = self.expr_eval.expression_pat(expr, 0)
+        if self.state.error_undefined_label:
+            saved_undef = True
+        self.state.error_undefined_label = saved_undef
+
+        if kind == 0:
+            self._txt_lower_radix_prefix(parts)
+            parts.append(self._txt_radix(v, 16))
+        elif kind == 2:
+            self._txt_lower_radix_prefix(parts)
+            parts.append(self._txt_radix(v, 2))
+        elif kind == 3:
+            self._txt_lower_radix_prefix(parts)
+            parts.append(self._txt_float(v))
+        else:
+            parts.append(self._txt_radix(v, 10))
+
+    def _txt_render(self, s):
+        """テンプレート本文を展開して文字列にする。"""
+        parts = []
+        i = 0
+        while i < len(s):
+            c = s[i]
+            if c == '\\' and i + 1 < len(s):
+                parts.append(s[i + 1]); i += 2; continue
+            if s.startswith('{{', i):
+                e = s.find('}}', i + 2)
+                if e < 0:
+                    parts.append(c); i += 1; continue
+                inner = s[i + 2:e]
+                j = 0
+                while j < len(inner) and inner[j] == ' ':
+                    j += 1
+                done = False
+                if inner[j:j + 1] == '.':
+                    nl, kind = self._txt_conv_name(inner[j + 1:])
+                    if nl:
+                        cp = self._txt_close_paren(inner, j + 1 + nl)
+                        if cp > 0:
+                            self._txt_emit_expr(parts, inner[j + 1 + nl + 1:cp], kind)
+                            done = True
+                if not done:
+                    self._txt_emit_expr(parts, inner, -1)
+                i = e + 2
+                continue
+            if c == '.':
+                nl, kind = self._txt_conv_name(s[i + 1:])
+                if nl:
+                    cp = self._txt_close_paren(s, i + 1 + nl)
+                    if cp > 0:
+                        self._txt_emit_expr(parts, s[i + 1 + nl + 1:cp], kind)
+                        i = cp + 1
+                        continue
+            if 'a' <= c <= 'z':
+                # パターン変数。値は10進で埋める。
+                parts.append(self._txt_radix(self.state.vars[ord(c) - ord('a')], 10))
+                i += 1
+                continue
+            parts.append(c)
+            i += 1
+        return ''.join(parts)
+
     def makeobj(self, s):
+        # `"..."` で始まる欄はバイト列ではなくアセンブリ結果のテキストを作る。
+        q = self._txt_template_body(s)
+        if q is not None:
+            self.state.asmtext = self._txt_render(self._txt_template_inner(q))
+            return []
+
         s, z = self.e_p(s)
         s = self.replace_percent_with_index(s)
 
@@ -8421,7 +8589,17 @@ class Assembler:
             self.state.cl = cleaned
             print("%016x " % self.state.pc, end='')
             print(f"{self.state.current_file} {self.state.ln} {self.state.cl} //", end='')
+        self.state.asmtext = None
         f = self.lineassemble(cleaned)
+        # パターンが文字列テンプレートだった行は、アセンブリ結果をテキストで出す。
+        # -v の診断行の中では `` ではなく "" で括って見せ、診断を出さないときは
+        # その行だけを素のまま標準出力へ流す（トランスレータとしての出力）。
+        if self.state.asmtext is not None and self.state.pas in (0, 2):
+            if _show:
+                print(' "%s"' % self.state.asmtext, end='')
+            else:
+                print(self.state.asmtext)
+        self.state.asmtext = None
         if _show:
             print("")
         self.state.ln += 1
