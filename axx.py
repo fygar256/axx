@@ -6148,17 +6148,20 @@ class ObjectGenerator:
     # 「アセンブリ結果のテキスト」を作る。別の書式のニーモニックへ書き換える
     # ための欄で、たとえば
     #
-    #     MOV R!r,!e:: "LD Rr,0X{{.hex(e)}}"
+    #     MOV R!r,!e:: "LD R{{r}},0x{{.hex(e)}}"
     #
-    # に `MOV R1,0x10` を与えると `LD R1,0x10` を出す。文字列の中では
-    #   - `{{式}}`            … 式を評価して10進で埋める
+    # に `MOV R1,0x10` を与えると `LD R1,0x10` を出す。
+    #
+    # 置き換わるのは `{{ }}` で囲んだところだけで、それ以外は書いたままの字
+    # が出る。`{{ }}` の中には
+    #   - `式`                          … 評価して10進で埋める
     #   - `.hex(式)` `.dec(式)` `.bin(式)` `.float(式)`
-    #                          … それぞれ16進/10進/2進/浮動小数の文字列にする
-    #                            （`{{ }}` の中でも外でも書ける）
-    #   - 小文字 a〜z         … 同名のパターン変数の値（10進）に置き換わる
-    #   - `\x`                … x をそのままの文字として出す（小文字の逃げ道）
-    # が使える。数値変換の直前が `0X` `0B` `0F` のときは、出力側の慣習に
-    # 合わせて `0x` `0b` `0f` と小文字にして出す。
+    #                                   … 16進/10進/2進/浮動小数の文字列にする
+    #                                     （桁だけで、`0x` などの接頭辞は付か
+    #                                      ないので、要るなら外に書く）
+    #   - `名前` `名前[添字]`           … 文字列シンボル／配列シンボル、
+    #                                     どちらでもなければパターン変数の値
+    # が書ける。文字列の外と同じく `\n` `\t` `\r` `\\` `\"` は解く。
     #
     # 組み上がったテキストはそのままバイナリとしても出る。`.ascii` と同じく
     # UTF-8 の 1 バイトが 1 ワードになり、ロケーションカウンタもその分進んで
@@ -6283,14 +6286,6 @@ class ObjectGenerator:
         return cls._txt_float_parts(sign == 1, digits, len(digits) - 1 + dexp)
 
     @staticmethod
-    def _txt_lower_radix_prefix(parts):
-        """直前に積んだ `0X` `0B` `0F` を小文字へ倒す。"""
-        tail = ''.join(parts)[-2:]
-        if len(tail) == 2 and tail[0] == '0' and tail[1] in 'XBF':
-            rest = ''.join(parts)
-            parts[:] = [rest[:-1] + rest[-1].lower()]
-
-    @staticmethod
     def _txt_close_paren(s, i):
         """丸括弧の対応を取り、閉じ括弧の位置を返す。無ければ -1。"""
         depth = 0
@@ -6323,13 +6318,10 @@ class ObjectGenerator:
         self.state.error_undefined_label = saved_undef
 
         if kind == 0:
-            self._txt_lower_radix_prefix(parts)
             parts.append(self._txt_radix(v, 16))
         elif kind == 2:
-            self._txt_lower_radix_prefix(parts)
             parts.append(self._txt_radix(v, 2))
         elif kind == 3:
-            self._txt_lower_radix_prefix(parts)
             parts.append(self._txt_float(v))
         else:
             parts.append(self._txt_radix(v, 10))
@@ -6376,29 +6368,6 @@ class ObjectGenerator:
                 if not done:
                     self._txt_emit_expr(parts, inner, -1)
                 i = e + 2
-                continue
-            if c == '.':
-                nl, kind = self._txt_conv_name(s[i + 1:])
-                if nl:
-                    cp = self._txt_close_paren(s, i + 1 + nl)
-                    if cp > 0:
-                        self._txt_emit_expr(parts, s[i + 1 + nl + 1:cp], kind)
-                        i = cp + 1
-                        continue
-            if 'a' <= c <= 'z':
-                # 小文字で始まる名前。文字列シンボルにあればその文字列、
-                # 無ければパターン変数の値（`a` でも `var_2` でも同じ）。
-                j = i + 1
-                while j < len(s) and (s[j].islower() or s[j].isdigit() or s[j] == '_'):
-                    j += 1
-                if j < len(s) and s[j] == '[':
-                    cb = self._txt_close_bracket(s, j)
-                    if cb > 0:
-                        parts.append(self._txt_indexed_text(s[i:j], s[j + 1:cb]))
-                        i = cb + 1
-                        continue
-                parts.append(self._txt_name_text(s[i:j]))
-                i = j
                 continue
             parts.append(c)
             i += 1

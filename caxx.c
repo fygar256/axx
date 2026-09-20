@@ -8706,17 +8706,20 @@ static void strsym_delete(AsmState *st, const char *upper_name){
  * 「アセンブリ結果のテキスト」を作る。別の書式のニーモニックへ書き換える
  * ための欄で、たとえば
  *
- *     MOV R!r,!e:: "LD Rr,0X{{.hex(e)}}"
+ *     MOV R!r,!e:: "LD R{{r}},0x{{.hex(e)}}"
  *
- * に `MOV R1,0x10` を与えると `LD R1,0x10` を出す。文字列の中では
- *   - `{{式}}`            … 式を評価して10進で埋める
+ * に `MOV R1,0x10` を与えると `LD R1,0x10` を出す。
+ *
+ * 置き換わるのは `{{ }}` で囲んだところだけで、それ以外は書いたままの字が
+ * 出る。`{{ }}` の中には
+ *   - `式`                          … 評価して10進で埋める
  *   - `.hex(式)` `.dec(式)` `.bin(式)` `.float(式)`
- *                          … それぞれ16進/10進/2進/浮動小数の文字列にする
- *                            （`{{ }}` の中でも外でも書ける）
- *   - 小文字 a〜z         … 同名のパターン変数の値（10進）に置き換わる
- *   - `\x`                … x をそのままの文字として出す（小文字の逃げ道）
- * が使える。数値変換の直前が `0X` `0B` `0F` のときは、出力側の慣習に合わせて
- * `0x` `0b` `0f` と小文字にして出す。
+ *                                   … 16進/10進/2進/浮動小数の文字列にする
+ *                                     （桁だけで、`0x` などの接頭辞は付かない
+ *                                      ので、要るなら外に書く）
+ *   - `名前` `名前[添字]`           … 文字列シンボル／配列シンボル、
+ *                                     どちらでもなければパターン変数の値
+ * が書ける。文字列の外と同じく `\n` `\t` `\r` `\\` `\"` は解く。
  *
  * 組み上がったテキストはそのままバイナリとしても出る。`.ascii` と同じく
  * UTF-8 の 1 バイトが 1 ワードになり、ロケーションカウンタもその分進んで
@@ -8864,14 +8867,6 @@ static void txt_float_double(TxtBuf *t, double d){
     txt_float_emit(t, neg, digits, n, exp10);
 }
 
-/* 数値変換の直前にある `0X` `0B` `0F` を小文字へ倒す。 */
-static void txt_lower_radix_prefix(TxtBuf *t, size_t before){
-    if(before < 2 || !t->b) return;
-    if(t->b[before-2] != '0') return;
-    char c = t->b[before-1];
-    if(c=='X'||c=='B'||c=='F') t->b[before-1] = (char)(c - 'A' + 'a');
-}
-
 /* テンプレート中の丸括弧の対応を取り、閉じ括弧の位置を返す。 */
 static int txt_close_paren(const char *s, int i){
     int depth = 0;
@@ -8906,12 +8901,10 @@ static void txt_emit_expr(Assembler *asmb, TxtBuf *t, const char *expr, int kind
     if(st->error_undefined_label) saved_undef = 1;
     st->error_undefined_label = saved_undef;
 
-    size_t before = t->len;
     switch(kind){
-    case 0: txt_lower_radix_prefix(t, before); txt_radix(t, v, 16); break;
-    case 2: txt_lower_radix_prefix(t, before); txt_radix(t, v, 2);  break;
+    case 0: txt_radix(t, v, 16); break;
+    case 2: txt_radix(t, v, 2);  break;
     case 3:
-        txt_lower_radix_prefix(t, before);
         /* 浮動小数として評価された式はビット列を、そうでなければ整数値を読む。 */
         if(st->exp_typ_float) txt_float_double(t, u256_to_double(v));
         else                  txt_float_int(t, v);
@@ -8925,7 +8918,7 @@ static void txt_emit_expr(Assembler *asmb, TxtBuf *t, const char *expr, int kind
  *   1. `.setsym::名前::"文字列"` の文字列シンボル … その文字列
  *   2. 変数として使われている名前                 … パターン変数の値（10進）
  *   3. どれでもない                               … 書かれたままの文字
- * で、`Rr` の `r` は 2 に、`{{x}}` の `x` は 1 に当たる。
+ * で、`{{x}}` の `x` は 1 に、`{{r}}` の `r` は 2 に当たる。
  * 数値シンボルをここで引かないのは、`num=` のような普通の文（たまたま
  * `.setsym::NUM` がある）が黙って数字に化けるのを避けるため。数値が要る
  * ときは `{{#NUM}}` と書けば本体の式評価器が引く。 */
@@ -9081,7 +9074,7 @@ static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
             if(!done){
                 /* `{{x}}` のように名前ひとつなら、文字列／配列シンボルを先に見る。 */
                 int bl = txt_bare_name_len(inner);
-                if(bl){
+                if(bl > 0){
                     char bk[512];
                     int bs = 0; while(inner[bs]==' '||inner[bs]=='\t') bs++;
                     int bn = bl < (int)sizeof(bk) ? bl : (int)sizeof(bk)-1;
@@ -9096,45 +9089,6 @@ static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
             if(!done) txt_emit_expr(asmb, t, inner, -1);
             free(inner);
             i += n + 4;
-            continue;
-        }
-        if(s[i]=='.'){
-            int kind = -1;
-            int nl = txt_conv_name(s+i+1, &kind);
-            if(nl){
-                int cp = txt_close_paren(s, i+1+nl);
-                if(cp > 0){
-                    int n = cp - (i+1+nl+1);
-                    char *inner = malloc((size_t)n + 1);
-                    if(!inner){ perror("malloc"); exit(1); }
-                    memcpy(inner, s+i+1+nl+1, (size_t)n); inner[n] = '\0';
-                    txt_emit_expr(asmb, t, inner, kind);
-                    free(inner);
-                    i = cp + 1;
-                    continue;
-                }
-            }
-        }
-        if(s[i] >= 'a' && s[i] <= 'z'){
-            /* 小文字で始まる名前。1文字ならパターン変数、それより長ければ
-             * `var1` `var_2` のような文字列／数値シンボルの名前として引く。 */
-            int j = i + 1;
-            while((s[j]>='a'&&s[j]<='z') || (s[j]>='0'&&s[j]<='9') || s[j]=='_') j++;
-            if(s[j]=='['){
-                int cb = txt_close_bracket(s, j);
-                if(cb > 0){
-                    int n = cb - (j+1);
-                    char *ix = malloc((size_t)n+1);
-                    if(!ix){ perror("malloc"); exit(1); }
-                    memcpy(ix, s+j+1, (size_t)n); ix[n] = '\0';
-                    txt_emit_indexed(asmb, t, s + i, j - i, ix);
-                    free(ix);
-                    i = cb + 1;
-                    continue;
-                }
-            }
-            txt_emit_name(asmb, t, s + i, j - i);
-            i = j;
             continue;
         }
         txt_addc(t, s[i++]);

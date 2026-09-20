@@ -424,7 +424,7 @@ source-to-source translator. The same text is also emitted as **binary**, one
 byte per word, so the string itself becomes the output of that line.
 
 ```
-MOV R!r,!e:: "LD Rr,0X{{.hex(e)}}"
+MOV R!r,!e:: "LD R{{r}},0x{{.hex(e)}}"
 ```
 
 Given `MOV R1,0x10`, that pattern outputs `LD R1,0x10`, as both text and the
@@ -442,24 +442,23 @@ MOV A,!e::"load a,{{e}}\n",0x12,0x13
 MOV A,3   ->  6c 6f 61 64 20 61 2c 33 0a 12 13   ("load a,3\n" then 0x12 0x13)
 ```
 
-Inside the string:
+**Only `{{ }}` is substituted.** Everything else in the string is the text as
+written — upper case, lower case, `.hex(e)` outside braces, all of it comes
+out unchanged. The only other thing read is a backslash escape.
 
 | Form | Meaning |
 |---|---|
 | `{{<expr>}}` | Evaluate the expression and insert it in decimal |
-| `.hex(<expr>)` | Hexadecimal digits of the value |
-| `.dec(<expr>)` | Decimal digits of the value |
-| `.bin(<expr>)` | Binary digits of the value |
-| `.float(<expr>)` | The value as a decimal 128-bit floating point number, 34 significant digits (`16` becomes `16.0`) |
-| a lowercase name | A string symbol, or a pattern variable — see below |
+| `{{.hex(<expr>)}}` | Hexadecimal digits of the value |
+| `{{.dec(<expr>)}}` | Decimal digits of the value |
+| `{{.bin(<expr>)}}` | Binary digits of the value |
+| `{{.float(<expr>)}}` | The value as a decimal 128-bit floating point number, 34 significant digits (`16` becomes `16.0`) |
+| `{{<name>}}` `{{<name>[<expr>]}}` | A string symbol or array symbol, else a pattern variable — see below |
 | `\n` `\t` `\r` `\\` `\"` | Newline, tab, carriage return, backslash, double quote |
-| `\<char>` | any other `<char>` literally — the way to write a literal lowercase letter |
+| `\<char>` | any other `<char>` literally |
 
-The four conversions may be written inside `{{ }}` or on their own, directly in
-the text. They emit digits only, with no radix prefix, so you write the prefix
-yourself. When a conversion is immediately preceded by `0X`, `0B` or `0F`, that
-prefix is lowered to `0x`, `0b` or `0f` to match the usual convention of the
-target syntax.
+The four conversions emit digits only, with no radix prefix, so you write the
+prefix yourself — `0x{{.hex(e)}}`, `0b{{.bin(e)}}`.
 
 `.float` renders the value as a decimal 128-bit floating point number: 34
 significant digits, rounded half to even. A value with no fractional part still
@@ -467,43 +466,33 @@ gets one, so `16` is written `16.0`. Beyond 34 digits, or for very small
 magnitudes, it switches to exponent form (`1.234567890123456789012345678901235e+36`).
 Both implementations produce byte-identical text.
 
-**Names in a template.** A run of text starting with a lowercase letter is
-read as one name: the first character is `a`–`z`, and it continues over
-lowercase letters, digits and `_`, so `abcdef`, `var1` and `var_2` are each a
-single name. A name resolves in this order:
+**Names in `{{ }}`.** A name written alone inside the braces resolves in this
+order:
 
 1. a **string symbol** — `.setsym::<name>::"<text>"` — inserts its text;
-2. a **name the pattern file uses as a variable** — `a` and `var_2` alike — the
-   value of that variable, in decimal;
-3. anything else — the characters as written.
+2. an **array symbol** — with `[<expr>]`, the item at that index;
+3. anything else — the **expression**, so a pattern variable gives its value in
+   decimal.
 
-That is why `Rr` becomes `R1`: `R` is upper case and therefore literal, and `r`
-is bound by `!r`. Mnemonic text is written in upper case, and a literal
-lowercase letter is escaped with a backslash.
+That is why `R{{r}}` becomes `R1`: `R` is outside the braces and therefore
+literal, and `r` is bound by `!r`.
 
-Rule 2 asks whether the pattern file ever uses that name as a variable — by
-capturing it, assigning to it, or naming it in a directive that takes one. A
-word it never uses that way falls through to rule 3 and stays text, so a
-template can spell out lowercase mnemonics. This is the one place where a
-name's history matters: in an expression, every lowercase name is a variable
-and an uncaptured one is simply 0.
-
-Numeric `.setsym` symbols are deliberately *not* looked up here, so ordinary
-words in the text are never silently replaced by a number. Write `{{#NAME}}`
-when you want the value of a numeric symbol.
+Numeric `.setsym` symbols are deliberately *not* looked up by rule 1, so a
+plain word is never silently replaced by a number. Write `{{#NAME}}` when you
+want the value of a numeric symbol.
 
 **String symbols.** `.setsym` stores text instead of a number when its value
 field starts with a double quote:
 
 ```
 .setsym::x::"LD"
-MOV R!r,!e::"{{x}} Rr,{{.dec(e)}}"        ->  LD R0,12
+MOV R!r,!e::"{{x}} R{{r}},{{.dec(e)}}"        ->  LD R0,12
 ```
 
 ```
 .setsym::x::"LO"
 .setsym::y::"AD"
-MOV R!r,!e::"{{x}}{{y}} Rr,{{.dec(e)}}"   ->  LOAD R0,12
+MOV R!r,!e::"{{x}}{{y}} R{{r}},{{.dec(e)}}"   ->  LOAD R0,12
 ```
 
 Given `mov r0,12`, those produce `LD R0,12` and `LOAD R0,12`. A string symbol
@@ -514,10 +503,10 @@ ones.
 Given `MOV R1,0x10`:
 
 ```
-MOV R!r,!e:: "LD Rr,0X{{.hex(e)}}"    ->  LD R1,0x10
-MOV R!r,!e:: "LD Rr,{{.dec(e)}}"      ->  LD R1,16
-MOV R!r,!e:: "LD Rr,0B{{.bin(e)}}"    ->  LD R1,0b10000
-MOV R!r,!e:: "LD Rr,0F{{.float(e)}}"  ->  LD R1,0f16.0
+MOV R!r,!e:: "LD R{{r}},0x{{.hex(e)}}"    ->  LD R1,0x10
+MOV R!r,!e:: "LD R{{r}},{{.dec(e)}}"      ->  LD R1,16
+MOV R!r,!e:: "LD R{{r}},0b{{.bin(e)}}"    ->  LD R1,0b10000
+MOV R!r,!e:: "LD R{{r}},0f{{.float(e)}}"  ->  LD R1,0f16.0
 ```
 
 Where the text goes:
@@ -630,7 +619,7 @@ expression, so a pattern variable can drive it:
 
 | Where | How | Example |
 |---|---|---|
-| Text template (3.5.2) | `x[3]`, or `{{x[3]}}` | `{{y[3]}}` → `D` |
+| Text template (3.5.2) | `{{x[3]}}` | `{{y[3]}}` → `D` |
 | Expression | `#x[3]` | `MOV !e :: #x[3],e` emits `4` |
 
 In a template, a numeric item is written in decimal and a string item is
