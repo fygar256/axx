@@ -825,6 +825,7 @@ class AssemblerState:
         # パターンのエンコーディング欄が文字列テンプレート "..." だったときに、
         # そこから組み立てたアセンブリ結果のテキスト。1行ごとに作り直す。
         self.asmtext = None
+        self.asmtext_disp = None
         # `.setsym::名前::"文字列"` で登録された文字列シンボル。値が数値では
         # ないので式には出せず、文字列テンプレート（3.5.2）の中でだけ使える。
         # 名前は大文字化して持つ（`.setsym` の数値シンボルと同じ規約）。
@@ -5873,7 +5874,7 @@ def asmtext_escaped(s):
     行が折れないよう、テキストの中の改行やタブは `\\n` `\\t` と書いたまま
     見せる。素のまま流す方（トランスレータとしての標準出力）は解いた文字の
     ままで、こちらは表示用の写しだけを変える。caxx.c の
-    print_asmtext_escaped() と同じ規則である。
+    txt_add_escaped() と同じ規則である。
     """
     return ''.join(_ASMTEXT_SHOW.get(c, c) for c in s)
 
@@ -6502,9 +6503,11 @@ class ObjectGenerator:
         return arr[n] if isinstance(arr[n], str) else self._txt_radix(arr[n], 10)
 
     def makeobj(self, s):
-        # 行に現れた `"..."` の展開結果をつないでおく。標準出力へのテキスト
-        # 出力（トランスレータとしての使い方）に使う。
+        # 行に現れた `"..."` の展開結果をつないでおく。_txtacc は素のまま流す
+        # 用（トランスレータとしての使い方）、_dispacc は -v の診断行に見せる
+        # 用で、`"A","B"` のように欄に書いたとおり分けて括る。
         _txtacc = []
+        _dispacc = []
 
         s, z = self.e_p(s)
         s = self.replace_percent_with_index(s)
@@ -6562,6 +6565,7 @@ class ObjectGenerator:
                                  f"truncated (high bits discarded): {_txt!r}", set_error=False)
                         objl += _vals
                         _txtacc.append(_txt)
+                        _dispacc.append('"%s"' % asmtext_escaped(_txt))
                     # 閉じ `"` の次まで読み飛ばす。
                     _closed = False
                     idx = _qs + 1
@@ -6623,6 +6627,7 @@ class ObjectGenerator:
             self.state.error_undefined_label = self.state.error_undefined_label or _prior_undef
             if _txtacc:
                 self.state.asmtext = ''.join(_txtacc)
+                self.state.asmtext_disp = ','.join(_dispacc)
 
         return objl
 
@@ -9416,6 +9421,7 @@ class Assembler:
             print("%016x " % self.state.pc, end='')
             print(f"{self.state.current_file} {self.state.ln} {self.state.cl} //", end='')
         self.state.asmtext = None
+        self.state.asmtext_disp = None
         f = self.lineassemble(cleaned)
         # パターンが文字列テンプレートだった行は、バイナリ出力とは別に、
         # アセンブリ結果をテキストでも出す。
@@ -9423,10 +9429,11 @@ class Assembler:
         # その行だけを素のまま標準出力へ流す（トランスレータとしての出力）。
         if self.state.asmtext is not None and self.state.pas in (0, 2):
             if _show:
-                print(' "%s"' % asmtext_escaped(self.state.asmtext), end='')
+                print(' %s' % (self.state.asmtext_disp or ''), end='')
             else:
                 print(self.state.asmtext)
         self.state.asmtext = None
+        self.state.asmtext_disp = None
         if _show:
             print("")
         self.state.ln += 1

@@ -533,7 +533,8 @@ Where the text goes:
 - With `-v`, it appears at the end of that line's diagnostic, after the `//`,
   enclosed in double quotes: `... MOV R1,0x10 // "LD R1,0x10"`. There it is
   shown escaped — a newline reads `\n`, not a line break — so the diagnostic
-  stays on one line.
+  stays on one line, and a line with several strings shows them apart, as they
+  are written in the field: `... // "A","B"`.
 
   A `;;` element is evaluated and emitted nowhere, text included; a `;` string
   is skipped when it renders empty.

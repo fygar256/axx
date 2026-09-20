@@ -1272,8 +1272,11 @@ typedef struct {
     int        verbose;
 
     /* パターンのエンコーディング欄が文字列テンプレート "..." だったときに、
-     * そこから組み立てたアセンブリ結果のテキスト。1行ごとに作り直す。 */
+     * そこから組み立てたアセンブリ結果のテキスト。1行ごとに作り直す。
+     * asmtext は素のまま流す用につないだもの、asmtext_disp は -v の診断行に
+     * 見せる用で、`"A","B"` のように欄に書いたとおり分けて括ってある。 */
     char      *asmtext;
+    char      *asmtext_disp;
 
     char       cl[4096];
     int        ln;
@@ -1809,6 +1812,7 @@ static void state_init(AsmState *st) {
     st->pas = 0;
     st->debug = 0;
     st->asmtext = NULL;
+    st->asmtext_disp = NULL;
     sv_init(&st->strsym_names);
     sv_init(&st->strsym_vals);
     st->arrsyms = NULL; st->arrsyms_len = 0; st->arrsyms_cap = 0;
@@ -8737,6 +8741,22 @@ static void txt_addn(TxtBuf *t, const char *s, size_t n){
 static void txt_addc(TxtBuf *t, char c){ txt_addn(t, &c, 1); }
 static void txt_adds(TxtBuf *t, const char *s){ txt_addn(t, s, strlen(s)); }
 
+/* -v の診断行に見せる写し。行が折れないよう、テキストの中の改行やタブは
+ * `\n` `\t` と書いたまま見せる。素のまま流す方（トランスレータとしての
+ * 標準出力）は解いた文字のままで、こちらは表示用の写しだけを変える。 */
+static void txt_add_escaped(TxtBuf *t, const char *s){
+    for(const unsigned char *p=(const unsigned char *)s; *p; p++){
+        switch(*p){
+        case '\n': txt_adds(t, "\\n");  break;
+        case '\t': txt_adds(t, "\\t");  break;
+        case '\r': txt_adds(t, "\\r");  break;
+        case '\\': txt_adds(t, "\\\\"); break;
+        case '"':  txt_adds(t, "\\\""); break;
+        default:   txt_addc(t, (char)*p); break;
+        }
+    }
+}
+
 /* 値を radix 進の桁だけの文字列にする（`0x` のような接頭辞は付けない）。
  * 負の値は 2 の補数のままではなく `-` を付けた絶対値で出す。 */
 static void txt_radix(TxtBuf *t, uint256_t v, int radix){
@@ -9148,7 +9168,8 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
 
     /* 行に現れた `"..."` の展開結果をつないでおく。標準出力へのテキスト出力
      * （トランスレータとしての使い方）に使う。 */
-    TxtBuf txtacc; txt_init(&txtacc);
+    TxtBuf txtacc;  txt_init(&txtacc);
+    TxtBuf dispacc; txt_init(&dispacc);
     int have_text = 0;
 
     size_t ep_cap = 8192;
@@ -9207,13 +9228,13 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         }
     }
     for(int vi=0;vi<saved_nvars;vi++) free(saved_vtl[vi].label_name);
-    if(is_empty){ free(ep_buf); free(txtacc.b); return; }
+    if(is_empty){ free(ep_buf); free(txtacc.b); free(dispacc.b); return; }
 
     size_t s_cap = strlen(ep_buf) + 64;
     char *s = NULL;
     while(1){
         char *s_new = realloc(s, s_cap);
-        if(!s_new){ perror("malloc"); free(s); free(ep_buf); free(txtacc.b); return; }
+        if(!s_new){ perror("malloc"); free(s); free(ep_buf); free(txtacc.b); free(dispacc.b); return; }
         s = s_new;
         int truncated = replace_percent_with_index(ep_buf, s, s_cap);
         if(!truncated) break;
@@ -9278,6 +9299,11 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
                                         "(high bits discarded): %s\n", st->bts, r);
                     }
                     txt_adds(&txtacc, txt);
+                    /* 診断行では欄に書いたとおり `"A","B"` と分けて見せる。 */
+                    if(have_text) txt_addc(&dispacc, ',');
+                    txt_addc(&dispacc, '"');
+                    txt_add_escaped(&dispacc, txt);
+                    txt_addc(&dispacc, '"');
                     have_text = 1;
                 }
                 free(t.b);
@@ -9346,8 +9372,11 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     if(have_text){
         free(st->asmtext);
         st->asmtext = txtacc.b ? txtacc.b : strdup("");
+        free(st->asmtext_disp);
+        st->asmtext_disp = dispacc.b ? dispacc.b : strdup("");
     } else {
         free(txtacc.b);
+        free(dispacc.b);
     }
     free(s);
 }
@@ -11106,22 +11135,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     return 1;
 }
 
-/* -v の診断行に埋める文字列。行が折れないよう、テキストの中の改行やタブは
- * `\n` `\t` と書いたまま見せる。素のまま流す方（トランスレータとしての
- * 標準出力）は解いた文字のままで、こちらは表示用の写しだけを変える。 */
-static void print_asmtext_escaped(const char *s){
-    for(const unsigned char *p=(const unsigned char *)s; *p; p++){
-        switch(*p){
-        case '\n': fputs("\\n",  stdout); break;
-        case '\t': fputs("\\t",  stdout); break;
-        case '\r': fputs("\\r",  stdout); break;
-        case '\\': fputs("\\\\", stdout); break;
-        case '"':  fputs("\\\"", stdout); break;
-        default:   putchar(*p);            break;
-        }
-    }
-}
-
 static int lineassemble0(Assembler *asmb, const char *line){
     AsmState *st=&asmb->st;
 
@@ -11147,16 +11160,18 @@ static int lineassemble0(Assembler *asmb, const char *line){
                st->current_file, st->ln, cleaned);
     }
     free(st->asmtext); st->asmtext=NULL;
+    free(st->asmtext_disp); st->asmtext_disp=NULL;
     int f=lineassemble(asmb,cleaned);
     /* パターンが文字列テンプレートだった行は、バイナリ出力とは別に、
      * アセンブリ結果をテキストでも出す。
      * -v の診断行の中では `` ではなく "" で括って見せ、診断を出さないときは
      * その行だけを素のまま標準出力へ流す（トランスレータとしての出力）。 */
     if(st->asmtext && (st->pas==0 || st->pas==2)){
-        if(show){ printf(" \""); print_asmtext_escaped(st->asmtext); printf("\""); }
+        if(show) printf(" %s", st->asmtext_disp ? st->asmtext_disp : "");
         else     printf("%s\n", st->asmtext);
     }
     free(st->asmtext); st->asmtext=NULL;
+    free(st->asmtext_disp); st->asmtext_disp=NULL;
     if(show) printf("\n");
     free(cleaned);
     st->ln++;
