@@ -415,21 +415,31 @@ ADD A,R!n :: n>7;5 :: n|0x68
 `@@[n,<str>]` repeats `<str>` n times. `%%` is the repetition index; `%0`
 resets it to 0.
 
-#### 3.5.2 Text templates — emitting assembly text instead of bytes
+#### 3.5.2 Text templates — emitting a string
 
-When the `binary_list` field starts with a double quote, the line does not
-produce bytes at all. It produces **text**: the assembly result for that
-source line, written in some other mnemonic syntax. This turns a pattern file
-into a source-to-source translator.
+An element of the `binary_list` may be a **string** in double quotes instead
+of an expression. It builds **text**: the assembly result for that source
+line, written in some other mnemonic syntax. This turns a pattern file into a
+source-to-source translator. The same text is also emitted as **binary**, one
+byte per word, so the string itself becomes the output of that line.
 
 ```
 MOV R!r,!e:: "LD Rr,0X{{.hex(e)}}"
 ```
 
-Given `MOV R1,0x10`, that pattern outputs:
+Given `MOV R1,0x10`, that pattern outputs `LD R1,0x10`, as both text and the
+ten bytes `4c 44 20 52 31 2c 30 78 31 30`.
+
+A string is one element of the list like any other, so it may be mixed freely
+with expressions, repeated with `@@[...]`, and written more than once. A comma
+inside a string does not separate elements.
 
 ```
-LD R1,0x10
+MOV A,!e::"load a,{{e}}\n",0x12,0x13
+```
+
+```
+MOV A,3   ->  6c 6f 61 64 20 61 2c 33 0a 12 13   ("load a,3\n" then 0x12 0x13)
 ```
 
 Inside the string:
@@ -442,7 +452,8 @@ Inside the string:
 | `.bin(<expr>)` | Binary digits of the value |
 | `.float(<expr>)` | The value as a decimal 128-bit floating point number, 34 significant digits (`16` becomes `16.0`) |
 | a lowercase name | A string symbol, or a pattern variable — see below |
-| `\<char>` | `<char>` literally — the way to write a literal lowercase letter |
+| `\n` `\t` `\r` `\\` `\"` | Newline, tab, carriage return, backslash, double quote |
+| `\<char>` | any other `<char>` literally — the way to write a literal lowercase letter |
 
 The four conversions may be written inside `{{ }}` or on their own, directly in
 the text. They emit digits only, with no radix prefix, so you write the prefix
@@ -511,13 +522,36 @@ MOV R!r,!e:: "LD Rr,0F{{.float(e)}}"  ->  LD R1,0f16.0
 
 Where the text goes:
 
-- Without `-v`, the rendered line alone is written to standard output, so the
-  translated program can simply be redirected to a file.
+- It is emitted as bytes, exactly like `.ascii` (section 4.4): the rendered
+  text is encoded in UTF-8 and each byte becomes one output word, so the line
+  advances the location counter and lands in the binary and ELF output. A byte
+  wider than the output word width (`.bits`) is truncated with a warning.
+  There is no `\0` or `\xHH` escape — a byte that is not text is written as a
+  number in the list, next to the string.
+- Without `-v`, the rendered line alone is also written to standard output, so
+  the translated program can simply be redirected to a file.
 - With `-v`, it appears at the end of that line's diagnostic, after the `//`,
-  enclosed in double quotes: `... MOV R1,0x10 // "LD R1,0x10"`.
+  enclosed in double quotes: `... MOV R1,0x10 // "LD R1,0x10"`. There it is
+  shown escaped — a newline reads `\n`, not a line break — so the diagnostic
+  stays on one line.
 
-A text-template line emits no words, so it contributes nothing to `$.`, to the
-location counter, or to any binary or ELF output.
+  A `;;` element is evaluated and emitted nowhere, text included; a `;` string
+  is skipped when it renders empty.
+
+So one pattern file serves both uses at once: the text on standard output for
+translation, and the same string in the binary for assembly.
+
+```
+NOP  :: "ABC"
+DW !e:: e,e>>8
+```
+
+```
+NOP        ->  0x41 0x42 0x43
+NOP        ->  0x41 0x42 0x43
+L1:
+DW L1      ->  0x06 0x00        ; L1 is 6, the three bytes of each NOP counted
+```
 
 ### 3.6 Symbols
 

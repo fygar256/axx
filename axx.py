@@ -5860,6 +5860,24 @@ class MiniInterp:
         return self.out, ret
 
 
+# 文字列テンプレート（3.5.2）の中で解くエスケープ。ここに無い `\x` は
+# x をそのままの字として出す（小文字の逃げ道）。caxx.c の txt_render() と同じ。
+_TXT_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', '\\': '\\', '"': '"'}
+
+_ASMTEXT_SHOW = {'\n': '\\n', '\t': '\\t', '\r': '\\r', '\\': '\\\\', '"': '\\"'}
+
+
+def asmtext_escaped(s):
+    """-v の診断行に埋める文字列。
+
+    行が折れないよう、テキストの中の改行やタブは `\\n` `\\t` と書いたまま
+    見せる。素のまま流す方（トランスレータとしての標準出力）は解いた文字の
+    ままで、こちらは表示用の写しだけを変える。caxx.c の
+    print_asmtext_escaped() と同じ規則である。
+    """
+    return ''.join(_ASMTEXT_SHOW.get(c, c) for c in s)
+
+
 class ObjectGenerator:
     """パターンのエンコーディング欄を評価してワード列を作る。
     
@@ -5881,6 +5899,19 @@ class ObjectGenerator:
         result = []
         i = 0
         while i < len(s):
+            # `"..."` の中身は文字列テンプレート（3.5.2）の材料なので、
+            # 連番置換の対象にせずそのまま写す。
+            if s[i] == '"':
+                result.append(s[i])
+                i += 1
+                while i < len(s):
+                    if s[i] == '\\' and i + 1 < len(s):
+                        result.append(s[i:i + 2]); i += 2; continue
+                    ch = s[i]
+                    result.append(ch); i += 1
+                    if ch == '"':
+                        break
+                continue
             if i + 1 < len(s) and s[i:i + 2] == '%%':
                 result.append(str(count))
                 count += 1
@@ -5905,6 +5936,16 @@ class ObjectGenerator:
                 comma_pos = -1
 
                 while i < len(pattern) and depth > 0:
+                    # `"..."` の中の `[` `]` `,` は区切りとして数えない。
+                    if pattern[i] == '"':
+                        i += 1
+                        while i < len(pattern):
+                            if pattern[i] == '\\' and i + 1 < len(pattern):
+                                i += 2; continue
+                            if pattern[i] == '"':
+                                i += 1; break
+                            i += 1
+                        continue
                     if pattern[i] == '[':
                         depth += 1
                     elif pattern[i] == ']':
@@ -5956,6 +5997,17 @@ class ObjectGenerator:
                     self.state.diag(" error - @@[...]: missing ',' separating count and pattern.", set_error=True)
                     result.append('@@[')
                     has_content = True
+            elif pattern[i] == '"':
+                # `"..."` の中は `@@[` の展開対象にせず、そのまま写す。
+                result.append(pattern[i]); i += 1
+                has_content = True
+                while i < len(pattern):
+                    if pattern[i] == '\\' and i + 1 < len(pattern):
+                        result.append(pattern[i:i + 2]); i += 2; continue
+                    ch = pattern[i]
+                    result.append(ch); i += 1
+                    if ch == '"':
+                        break
             else:
                 result.append(pattern[i])
                 has_content = True
@@ -6091,7 +6143,7 @@ class ObjectGenerator:
         return out, k + 1
 
     # ==================== 文字列テンプレートのエンコーディング欄 ====================
-    # パターンの3欄目が `"..."` で始まるとき、その行はバイト列ではなく
+    # パターンの3欄目が `"..."` で始まるとき、その行は式の並びではなく
     # 「アセンブリ結果のテキスト」を作る。別の書式のニーモニックへ書き換える
     # ための欄で、たとえば
     #
@@ -6106,13 +6158,12 @@ class ObjectGenerator:
     #   - `\x`                … x をそのままの文字として出す（小文字の逃げ道）
     # が使える。数値変換の直前が `0X` `0B` `0F` のときは、出力側の慣習に
     # 合わせて `0x` `0b` `0f` と小文字にして出す。
+    #
+    # 組み上がったテキストはそのままバイナリとしても出る。`.ascii` と同じく
+    # UTF-8 の 1 バイトが 1 ワードになり、ロケーションカウンタもその分進んで
+    # バイナリ／ELF 出力に載る。標準出力へのテキスト出力（トランスレータと
+    # しての使い方）はそのまま残るので、同じパターンで両方が得られる。
     _TXT_CONVS = (('float', 3), ('hex', 0), ('dec', 1), ('bin', 2))
-
-    @staticmethod
-    def _txt_template_body(s):
-        """エンコーディング欄が文字列テンプレートなら `"` からの部分を返す。"""
-        t = s.lstrip(' \t')
-        return t if t.startswith('"') else None
 
     @staticmethod
     def _arr_split(q):
@@ -6289,7 +6340,9 @@ class ObjectGenerator:
         while i < len(s):
             c = s[i]
             if c == '\\' and i + 1 < len(s):
-                parts.append(s[i + 1]); i += 2; continue
+                # `.ascii` と同じ逃げ方をする制御文字だけを解き、それ以外の
+                # `\x` は x をそのままの字として出す（小文字の逃げ道）。
+                parts.append(_TXT_ESCAPES.get(s[i + 1], s[i + 1])); i += 2; continue
             if s.startswith('{{', i):
                 e = s.find('}}', i + 2)
                 if e < 0:
@@ -6449,11 +6502,9 @@ class ObjectGenerator:
         return arr[n] if isinstance(arr[n], str) else self._txt_radix(arr[n], 10)
 
     def makeobj(self, s):
-        # `"..."` で始まる欄はバイト列ではなくアセンブリ結果のテキストを作る。
-        q = self._txt_template_body(s)
-        if q is not None:
-            self.state.asmtext = self._txt_render(self._txt_template_inner(q))
-            return []
+        # 行に現れた `"..."` の展開結果をつないでおく。標準出力へのテキスト
+        # 出力（トランスレータとしての使い方）に使う。
+        _txtacc = []
 
         s, z = self.e_p(s)
         s = self.replace_percent_with_index(s)
@@ -6486,6 +6537,50 @@ class ObjectGenerator:
                     if idx < len(s) and s[idx] == ';':
                         drop = True
                         idx += 1
+
+                # `"..."` はテキストとして展開し、そのバイト列をワードとして出す。
+                _qs = idx
+                while _qs < len(s) and s[_qs] in ' \t':
+                    _qs += 1
+                if _qs < len(s) and s[_qs] == '"':
+                    # s の末尾には番兵の chr(0) が付いている。閉じ `"` を欠く
+                    # 文字列でそれを拾わないよう、最初の chr(0) で切る。
+                    _src = s[_qs:]
+                    _nul = _src.find(chr(0))
+                    if _nul >= 0:
+                        _src = _src[:_nul]
+                    _txt = self._txt_render(self._txt_template_inner(_src))
+                    # `;;` は何も出さず、`;` は中身が空なら出さない。
+                    if not (drop or (semicolon and _txt == '')):
+                        _word_mask = (1 << self.state.bts) - 1 if self.state.bts > 0 else 0xFF
+                        _vals = list(_txt.encode('utf-8', errors='surrogateescape'))
+                        if (any(_v > _word_mask for _v in _vals)
+                                and not self.state._pass1_size_mode
+                                and self.state.should_report_errors()):
+                            self.state.diag(f" warning - text template: one or more bytes exceed "
+                                 f"the output word width ({self.state.bts} bit(s)) and were "
+                                 f"truncated (high bits discarded): {_txt!r}", set_error=False)
+                        objl += _vals
+                        _txtacc.append(_txt)
+                    # 閉じ `"` の次まで読み飛ばす。
+                    _closed = False
+                    idx = _qs + 1
+                    while idx < len(s) and s[idx] != chr(0):
+                        if s[idx] == '\\' and idx + 1 < len(s):
+                            idx += 2; continue
+                        if s[idx] == '"':
+                            idx += 1; _closed = True; break
+                        idx += 1
+                    if (not _closed and not self.state._pass1_size_mode
+                            and self.state.should_report_errors()):
+                        self.state.diag(f" warning - unterminated string literal in pattern "
+                             f"encoding field: {_src!r}", set_error=False)
+                    while idx < len(s) and s[idx] in ' \t':
+                        idx += 1
+                    if idx < len(s) and s[idx] == ',':
+                        idx += 1
+                        continue
+                    break
 
                 if StringUtils.upper(s[idx:idx + 5]) == '.CALL' and (
                         idx + 5 >= len(s) or s[idx + 5] not in _SYM_CORE):
@@ -6526,6 +6621,8 @@ class ObjectGenerator:
             if self.state.pas == 1:
                 self.state._pass1_size_mode = False
             self.state.error_undefined_label = self.state.error_undefined_label or _prior_undef
+            if _txtacc:
+                self.state.asmtext = ''.join(_txtacc)
 
         return objl
 
@@ -9320,12 +9417,13 @@ class Assembler:
             print(f"{self.state.current_file} {self.state.ln} {self.state.cl} //", end='')
         self.state.asmtext = None
         f = self.lineassemble(cleaned)
-        # パターンが文字列テンプレートだった行は、アセンブリ結果をテキストで出す。
+        # パターンが文字列テンプレートだった行は、バイナリ出力とは別に、
+        # アセンブリ結果をテキストでも出す。
         # -v の診断行の中では `` ではなく "" で括って見せ、診断を出さないときは
         # その行だけを素のまま標準出力へ流す（トランスレータとしての出力）。
         if self.state.asmtext is not None and self.state.pas in (0, 2):
             if _show:
-                print(' "%s"' % self.state.asmtext, end='')
+                print(' "%s"' % asmtext_escaped(self.state.asmtext), end='')
             else:
                 print(self.state.asmtext)
         self.state.asmtext = None

@@ -8197,6 +8197,24 @@ static void readpat(Assembler *asmb, const char *fn){
 static int replace_percent_with_index(const char *s, char *out, size_t osz){
     int count=0,i=0; size_t n=0; int truncated=0;
     while(s[i]){
+        /* `"..."` の中身は文字列テンプレート（3.5.2）の材料なので、
+         * 連番置換の対象にせずそのまま写す。 */
+        if(s[i]=='"'){
+            if(n<osz-1) out[n++]=s[i]; else truncated=1;
+            i++;
+            while(s[i]){
+                if(s[i]=='\\' && s[i+1]){
+                    if(n<osz-1) out[n++]=s[i];   else truncated=1;
+                    if(n<osz-1) out[n++]=s[i+1]; else truncated=1;
+                    i+=2; continue;
+                }
+                char ch=s[i];
+                if(n<osz-1) out[n++]=ch; else truncated=1;
+                i++;
+                if(ch=='"') break;
+            }
+            continue;
+        }
         if(s[i]=='%'&&s[i+1]=='%'){
             char num[16]; snprintf(num,sizeof(num),"%d",count++);
             for(const char*p=num;*p;p++){
@@ -8233,6 +8251,16 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
             i+=3;
             int depth=1, expr_start=i, comma_pos=-1;
             while(i<plen&&depth>0){
+                /* `"..."` の中の `[` `]` `,` は区切りとして数えない。 */
+                if(pattern[i]=='"'){
+                    i++;
+                    while(i<plen){
+                        if(pattern[i]=='\\' && i+1<plen){ i+=2; continue; }
+                        if(pattern[i]=='"'){ i++; break; }
+                        i++;
+                    }
+                    continue;
+                }
                 if(pattern[i]=='[') depth++;
                 else if(pattern[i]==']'){ depth--; if(depth==0) break; }
                 else if(pattern[i]==','&&depth==1&&comma_pos<0) comma_pos=i;
@@ -8303,6 +8331,19 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
                     axx_diagf(1, 0, " error - @@[...]: missing ',' separating count and pattern.\n");
                 }
                 if(n+3<osz){ out[n++]='@'; out[n++]='@'; out[n++]='['; has_content=1; }
+            }
+        } else if(pattern[i]=='"'){
+            /* `"..."` の中は `@@[` の展開対象にせず、そのまま写す。 */
+            out[n++]=pattern[i++]; has_content=1;
+            while(i<plen&&n<osz-1){
+                if(pattern[i]=='\\' && i+1<plen && n+1<osz-1){
+                    out[n++]=pattern[i++];
+                    out[n++]=pattern[i++];
+                    continue;
+                }
+                char ch=pattern[i];
+                out[n++]=pattern[i++];
+                if(ch=='"') break;
             }
         } else { out[n++]=pattern[i++]; has_content=1; }
     }
@@ -8657,7 +8698,7 @@ static void strsym_delete(AsmState *st, const char *upper_name){
 }
 
 /* ==================== 文字列テンプレートのエンコーディング欄 ====================
- * パターンの3欄目が `"..."` で始まるとき、その行はバイト列ではなく
+ * パターンの3欄目が `"..."` で始まるとき、その行は式の並びではなく
  * 「アセンブリ結果のテキスト」を作る。別の書式のニーモニックへ書き換える
  * ための欄で、たとえば
  *
@@ -8671,7 +8712,12 @@ static void strsym_delete(AsmState *st, const char *upper_name){
  *   - 小文字 a〜z         … 同名のパターン変数の値（10進）に置き換わる
  *   - `\x`                … x をそのままの文字として出す（小文字の逃げ道）
  * が使える。数値変換の直前が `0X` `0B` `0F` のときは、出力側の慣習に合わせて
- * `0x` `0b` `0f` と小文字にして出す。 */
+ * `0x` `0b` `0f` と小文字にして出す。
+ *
+ * 組み上がったテキストはそのままバイナリとしても出る。`.ascii` と同じく
+ * UTF-8 の 1 バイトが 1 ワードになり、ロケーションカウンタもその分進んで
+ * バイナリ／ELF 出力に載る。標準出力へのテキスト出力（トランスレータとしての
+ * 使い方）はそのまま残るので、同じパターンで両方が得られる。 */
 
 typedef struct { char *b; size_t len, cap; } TxtBuf;
 
@@ -8956,7 +9002,19 @@ static int txt_bare_name_len(const char *s){
 static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
     AsmState *st = &asmb->st;
     for(int i = 0; s[i]; ){
-        if(s[i]=='\\' && s[i+1]){ txt_addc(t, s[i+1]); i += 2; continue; }
+        if(s[i]=='\\' && s[i+1]){
+            /* `.ascii` と同じ逃げ方をする制御文字だけを解き、それ以外の
+             * `\x` は x をそのままの字として出す（小文字の逃げ道）。 */
+            switch(s[i+1]){
+            case 'n':  txt_addc(t, '\n');  break;
+            case 't':  txt_addc(t, '\t');  break;
+            case 'r':  txt_addc(t, '\r');  break;
+            case '\\': txt_addc(t, '\\'); break;
+            case '"':  txt_addc(t, '"');   break;
+            default:   txt_addc(t, s[i+1]); break;
+            }
+            i += 2; continue;
+        }
         if(s[i]=='{' && s[i+1]=='{'){
             const char *e = strstr(s+i+2, "}}");
             if(!e){ txt_addc(t, s[i++]); continue; }
@@ -9063,13 +9121,6 @@ static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
     }
 }
 
-/* エンコーディング欄が文字列テンプレートかどうか。先頭の空白を飛ばして
- * `"` で始まっていればそう見なす。 */
-static const char *txt_template_body(const char *s){
-    while(*s==' '||*s=='\t') s++;
-    return (*s=='"') ? s : NULL;
-}
-
 /* `"..."` から中身を取り出す。`\` はそのまま残して txt_render() に任せる。 */
 static char *txt_template_inner(const char *q){
     size_t n = strlen(q);
@@ -9088,24 +9139,17 @@ static char *txt_template_inner(const char *q){
 /* パターンのエンコーディング欄を評価して、出力ワード列 objl を作る。
  * s_in はカンマ区切りの式の並び。`%%`(連番) と `@@[]`(反復) は呼び出し前に
  * 展開済み。要素が `;` で始まるものは条件付き出力で、値が 0 なら何も出さない
- * （x86 の REX プレフィックスの有無のような分岐に使う）。 */
+ * （x86 の REX プレフィックスの有無のような分岐に使う）。
+ * 要素が `"..."` のときは文字列テンプレート（3.5.2）で、展開したテキストの
+ * バイト列がそのままワードになる。式と混ぜて並べてよい。 */
 static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     AsmState *st=&asmb->st;
     iv_clear(objl);
 
-    /* `"..."` で始まる欄はバイト列ではなくアセンブリ結果のテキストを作る。 */
-    {
-        const char *q = txt_template_body(s_in);
-        if(q){
-            char *inner = txt_template_inner(q);
-            TxtBuf t; txt_init(&t);
-            txt_render(asmb, &t, inner);
-            free(inner);
-            free(st->asmtext);
-            st->asmtext = t.b ? t.b : strdup("");
-            return;
-        }
-    }
+    /* 行に現れた `"..."` の展開結果をつないでおく。標準出力へのテキスト出力
+     * （トランスレータとしての使い方）に使う。 */
+    TxtBuf txtacc; txt_init(&txtacc);
+    int have_text = 0;
 
     size_t ep_cap = 8192;
     char *ep_buf = NULL;
@@ -9163,13 +9207,13 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         }
     }
     for(int vi=0;vi<saved_nvars;vi++) free(saved_vtl[vi].label_name);
-    if(is_empty){ free(ep_buf); return; }
+    if(is_empty){ free(ep_buf); free(txtacc.b); return; }
 
     size_t s_cap = strlen(ep_buf) + 64;
     char *s = NULL;
     while(1){
         char *s_new = realloc(s, s_cap);
-        if(!s_new){ perror("malloc"); free(s); free(ep_buf); return; }
+        if(!s_new){ perror("malloc"); free(s); free(ep_buf); free(txtacc.b); return; }
         s = s_new;
         int truncated = replace_percent_with_index(ep_buf, s, s_cap);
         if(!truncated) break;
@@ -9208,6 +9252,52 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
             semicolon=1; idx++;
             /* `;;要素` は評価だけして何も出さない。 */
             if(s[idx]==';'){ drop=1; idx++; }
+        }
+        /* `"..."` はテキストとして展開し、そのバイト列をワードとして出す。 */
+        {
+            int qs = idx;
+            while(s[qs]==' '||s[qs]=='\t') qs++;
+            if(s[qs]=='"'){
+                char *inner = txt_template_inner(s+qs);
+                TxtBuf t; txt_init(&t);
+                txt_render(asmb, &t, inner);
+                free(inner);
+                const char *txt = t.b ? t.b : "";
+                /* `;;` は何も出さず、`;` は中身が空なら出さない。 */
+                if(!(drop || (semicolon && txt[0]=='\0'))){
+                    uint64_t word_mask = (st->bts > 0) ? axx_word_mask(st->bts) : 0xFFu;
+                    int trunc = 0;
+                    for(const unsigned char *bp=(const unsigned char *)txt; *bp; bp++){
+                        if((uint64_t)*bp > word_mask) trunc = 1;
+                        iv_push(objl, u256_from_u64((uint64_t)*bp));
+                    }
+                    if(trunc && !st->pass1_size_mode && should_report_errors(st)){
+                        char r[1024]; m_pyrepr(txt, r, sizeof(r));
+                        axx_diagf(0, 0, " warning - text template: one or more bytes exceed the "
+                                        "output word width (%d bit(s)) and were truncated "
+                                        "(high bits discarded): %s\n", st->bts, r);
+                    }
+                    txt_adds(&txtacc, txt);
+                    have_text = 1;
+                }
+                free(t.b);
+                /* 閉じ `"` の次まで読み飛ばす。 */
+                int closed = 0;
+                idx = qs + 1;
+                while(s[idx]){
+                    if(s[idx]=='\\' && s[idx+1]){ idx+=2; continue; }
+                    if(s[idx]=='"'){ idx++; closed=1; break; }
+                    idx++;
+                }
+                if(!closed && !st->pass1_size_mode && should_report_errors(st)){
+                    char r[1024]; m_pyrepr(s+qs, r, sizeof(r));
+                    axx_diagf(0, 0, " warning - unterminated string literal in pattern encoding "
+                                    "field: %s\n", r);
+                }
+                while(s[idx]==' '||s[idx]=='\t') idx++;
+                if(s[idx]==','){ idx++; continue; }
+                break;
+            }
         }
         if(s[idx]=='.' && axx_upper_char(s[idx+1])=='C' && axx_upper_char(s[idx+2])=='A'
            && axx_upper_char(s[idx+3])=='L' && axx_upper_char(s[idx+4])=='L'
@@ -9253,6 +9343,12 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     g_expr_slen_ptr = _prev_slen_ptr;
     g_expr_slen_len = _prev_slen_len;
     if(_prior_undef) st->error_undefined_label = 1;
+    if(have_text){
+        free(st->asmtext);
+        st->asmtext = txtacc.b ? txtacc.b : strdup("");
+    } else {
+        free(txtacc.b);
+    }
     free(s);
 }
 
@@ -11010,6 +11106,22 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     return 1;
 }
 
+/* -v の診断行に埋める文字列。行が折れないよう、テキストの中の改行やタブは
+ * `\n` `\t` と書いたまま見せる。素のまま流す方（トランスレータとしての
+ * 標準出力）は解いた文字のままで、こちらは表示用の写しだけを変える。 */
+static void print_asmtext_escaped(const char *s){
+    for(const unsigned char *p=(const unsigned char *)s; *p; p++){
+        switch(*p){
+        case '\n': fputs("\\n",  stdout); break;
+        case '\t': fputs("\\t",  stdout); break;
+        case '\r': fputs("\\r",  stdout); break;
+        case '\\': fputs("\\\\", stdout); break;
+        case '"':  fputs("\\\"", stdout); break;
+        default:   putchar(*p);            break;
+        }
+    }
+}
+
 static int lineassemble0(Assembler *asmb, const char *line){
     AsmState *st=&asmb->st;
 
@@ -11036,11 +11148,12 @@ static int lineassemble0(Assembler *asmb, const char *line){
     }
     free(st->asmtext); st->asmtext=NULL;
     int f=lineassemble(asmb,cleaned);
-    /* パターンが文字列テンプレートだった行は、アセンブリ結果をテキストで出す。
+    /* パターンが文字列テンプレートだった行は、バイナリ出力とは別に、
+     * アセンブリ結果をテキストでも出す。
      * -v の診断行の中では `` ではなく "" で括って見せ、診断を出さないときは
      * その行だけを素のまま標準出力へ流す（トランスレータとしての出力）。 */
     if(st->asmtext && (st->pas==0 || st->pas==2)){
-        if(show) printf(" \"%s\"", st->asmtext);
+        if(show){ printf(" \""); print_asmtext_escaped(st->asmtext); printf("\""); }
         else     printf("%s\n", st->asmtext);
     }
     free(st->asmtext); st->asmtext=NULL;
