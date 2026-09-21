@@ -36,7 +36,7 @@ axx x86_64.axx hello.s -o out.o # ELF relocatable object
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles fourteen bundled pattern/source pairs with both
+exactly that: `test1` assembles all sixteen bundled pattern/source pairs with both
 implementations and `cmp`s the results.
 
 **Contents**
@@ -368,9 +368,33 @@ the whole word is a label after all — so `aB` and `a.b` still read as labels,
 while `a1` and `var_2` are variables. A label a pattern line has to name must
 therefore carry an upper-case letter or a `.` somewhere in it.
 
+**A separator that is itself a name character.** Because `_` continues a
+variable name, an underscore written in `instruction` directly after a capture
+is swallowed by that name rather than matched as text. In
+
+```
+MRS xt,S!S{{tbl}}a_Z
+```
+
+the name reads as `a_`, the separator disappears, and `mrs x0,s3_z` no longer
+matches. Escaping it ends the name and matches the underscore literally:
+
+```
+MRS xt,S!S{{tbl}}a\_Z          /* matches mrs x0,s3_z */
+```
+
+The same escape is what separates two expression captures, since a numeric
+literal also accepts `_` as a digit separator — `!v_!w` reads `3_5` as the
+single number 35, while `!v\_!w` reads it as 3 and 5. This applies to every
+kind of capture: a symbol placeholder, `!x`, `!!x` and `!S{{name}}x` alike.
+An underscore that is not preceded by a capture needs no escape, and a
+`.setsym` name containing one — `TPIDR_EL0` — is unaffected, because `_` is in
+the default symbol character set and the whole word is one symbol.
+
 Assembly lines are case-insensitive except for labels and section names.
 
-The escape character `\` may be used inside `instruction`.
+The escape character `\` may be used inside `instruction`; see
+[section 3.12](#312-escapes-in-expressions).
 
 ### 3.4 error_patterns
 
@@ -1151,6 +1175,22 @@ LEAQ r,(s+t*!!h+!!i) :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
 ```
 
 matches the parenthesized form `leaq rax,(rax+rbx*(2+2)+0x40)`.
+
+The escape also ends a **name** that would otherwise run on. A variable name
+continues over lowercase letters, digits and `_`, and a numeric literal accepts
+`_` between digits, so an underscore meant as a separator has to be escaped
+where a capture precedes it:
+
+```
+MRS xt,S!S{{p0}}a\_!S{{d8}}b\_C!S{{d16}}c\_C!S{{d16}}e\_!S{{d8}}f
+T   xt,!v\_!w
+```
+
+The first matches `mrs x0,s3_3_c4_c2_0`, binding the five fields separately;
+the second matches `t x0,3_5` as 3 and 5 rather than as the number 35. Written
+without the escapes, both lose the separator. `aarch64.axx` uses the first form
+for the generic system-register spelling. Section
+[3.3](#33-case-and-variables) has the rule this follows from.
 
 ### 3.13 Negative index displacements
 
@@ -2466,10 +2506,10 @@ AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v
 
 ## Appendix B. Bundled pattern files
 
-`x86_64.axx`, `x86_64m.axx`, `68000.axx`, `z80.axx`, `8080.axx`, `8048.axx`,
-`8051.axx`, `6502.axx`, `6800.axx`, `6809.axx` and `4004.axx` are for practical
-use, as is `aarch64_logical_mini.axx` within the one instruction group it
-covers. The rest are test fixtures.
+`x86_64.axx`, `x86_64m.axx`, `aarch64.axx`, `68000.axx`, `z80.axx`, `8080.axx`,
+`8048.axx`, `8051.axx`, `6502.axx`, `6800.axx`, `6809.axx` and `4004.axx` are
+for practical use, as is `aarch64_logical_mini.axx` within the one instruction
+group it covers. The rest are test fixtures.
 
 The x86_64 pattern file is also maintained separately at
 <https://github.com/fygar256/x86_64_pattern_file_for_axx>.
@@ -2478,6 +2518,7 @@ The x86_64 pattern file is also maintained separately at
 |---|---|---|---|---|
 | **x86_64.axx** | 3.9 MB | 23,923 | **hello.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512 |
 | **x86_64m.axx** | 935 KB | 5,787 | **hello.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo |
+| **aarch64.axx** | 132 KB | 3,644 | **aarch64.s** | AArch64 (A64): data processing, branches, exception generation, hints, barriers, system registers and SYS aliases, loads and stores, LSE atomics, scalar floating point, Advanced SIMD (vector and scalar) including the LD1-LD4 / ST1-ST4 structure accesses, cryptography, and the scalar extensions (PAuth, MTE, MOPS, FCMA, dot product, BFloat16, matrix multiply, LS64). SVE, SVE2 and SME are not covered |
 | **aarch64_logical_mini.axx** | 9.2 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 logical (immediate): AND/ORR/EOR/ANDS/TST, 32- and 64-bit. Encodes the bitmask immediate with the mini language (section 3.15) |
 | **6809.axx** | 124 KB | 1,950 | **6809.s** | Motorola 6809 |
 | **68000.axx** | 51 KB | 453 | **68000.s** | Motorola 68000 |
@@ -2497,9 +2538,8 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 `itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
 `aarch64_logical_mini_demo.s`.
 
-`test1` runs fourteen of the pairs above through both implementations and
-compares the results. `bf.axx` / `bf.s` is the one bundled pair it does not
-cover.
+`test1` runs all sixteen of the pairs above through both implementations and
+compares the results.
 
 x86_64 and legacy CPUs make up most of what is currently implemented, but that
 reflects where the work has gone, not the limit of what axx can describe.
@@ -2520,7 +2560,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles fourteen bundled pattern/source pairs with both
+`test1` assembles all sixteen bundled pattern/source pairs with both
 implementations and compares the results.
 
 ### C.2 External
