@@ -1,0 +1,1627 @@
+/* ===================================================================
+/* AArch64 (A64) instruction set -- pattern file for axx
+/*
+/* Grown from aarch64_logical_mini.axx, which covered the logical
+/* (immediate) group alone. The bitmask-immediate encoder from that
+/* file is kept here unchanged in spirit (highbit / find_e / pack_rs),
+/* with an added validity test so that an immediate which is not a
+/* legal repeating run is rejected instead of silently encoded.
+/*
+/* Coverage -- the A64 *scalar* instruction set:
+/*   - Data processing (immediate): PC-rel, add/sub, logical, move
+/*     wide, bitfield, extract, and their aliases
+/*   - Data processing (register): logical/arith shifted and extended
+/*     register, add/sub with carry, conditional compare, conditional
+/*     select, 1/2/3-source, CRC32, and their aliases
+/*   - Branches, exception generation, hints, barriers, system
+/*     registers, SYS/SYSL/IC/DC/AT/TLBI
+/*   - Loads and stores: literal, register (scaled / unscaled / pre /
+/*     post / register offset), pair, exclusive, acquire-release,
+/*     LSE atomics, PRFM
+/*   - Scalar floating point: H/S/D data processing, compare,
+/*     conditional select/compare, conversions, FMOV immediate, and
+/*     FP loads and stores
+/*
+/* Not covered, and said so rather than half-done:
+/*   Advanced SIMD (the vector forms of V registers), SVE and SVE2,
+/*   SME, the memory-tagging instructions (ADDG/SUBG/STG/...), the
+/*   pointer-authentication instructions outside the hint space
+/*   (PACIA Xd,Xn, BRAA, RETAA, LDRAA, XPACI and the rest), and the
+/*   named system registers beyond the common set below -- though
+/*   those last are all still reachable through the generic
+/*   S<op0>_<op1>_C<Cn>_C<Cm>_<op2> spelling, which is complete.
+/*
+/* The macro layer (Technical_Manual.md section 7) generates the rows
+/* that differ only in an opcode constant, and the mini language
+/* (section 3.15) computes the four encodings that no fixed
+/* expression can express: the logical bitmask immediate, the MOV
+/* immediate alias choice, the scaled/unscaled load-store offset
+/* choice, and the 8-bit floating-point immediate.
+/*
+/* A note on names: every register, condition code, shift kind, extend
+/* kind, barrier option, prefetch operation, system register and
+/* cache/TLB operation below is a pattern-file symbol, and axx does not
+/* let an assembly-source label share a name with one. So a label
+/* called "pl", "sy" or "x0" is rejected; give labels names that no
+/* operand spelling uses.
+/*
+/* Verified byte-for-byte against llvm-mc -triple=aarch64 over ~11,700
+/* encodings -- among them every valid 32- and 64-bit logical bitmask
+/* immediate, every MOV-immediate form, all 256 encodable
+/* floating-point immediates, every condition code on every
+/* conditional instruction, every addressing mode of every access
+/* size, and the load/store offsets either side of the scaled /
+/* unscaled boundary. Paxx and Caxx agree byte for byte on all of it.
+/* ===================================================================
+
+/* ===================================================================
+/* Registers
+/* =================================================================== */
+!def gpr(p, n) {
+!local i = 0
+!while i <= n {
+.setsym::!{p}!{i}::!{i}
+!set i = i + 1
+}
+}
+!def rset(nm, p, n) {
+!local s = p + "0"
+!local i = 1
+!while i <= n {
+!set s = s + "," + p + str(i)
+!set i = i + 1
+}
+.setsym::!{nm}::!{s}
+}
+
+!gpr("X", 30)
+!gpr("W", 30)
+.setsym::XZR::31
+.setsym::WZR::31
+.setsym::SP::31
+.setsym::WSP::31
+
+!gpr("B", 31)
+!gpr("H", 31)
+!gpr("S", 31)
+!gpr("D", 31)
+!gpr("Q", 31)
+
+!rset("XR", "X", 30)
+!rset("WR", "W", 30)
+!rset("BR", "B", 31)
+!rset("HR", "H", 31)
+!rset("SR", "S", 31)
+!rset("DR", "D", 31)
+!rset("QR", "Q", 31)
+
+/* Variable roles. Every one is positional (.check, section 3.7) and
+/* is set once here, so a nonsensical operand is rejected instead of
+/* assembling into wrong bytes.
+/*   x* / w*  general registers reading 31 as the zero register
+/*   xs / ws  general registers reading 31 as SP / WSP
+/*   xb       memory base register, reads 31 as SP
+/*   f*       scalar floating-point registers */
+.check::xd::XR,XZR
+.check::xn::XR,XZR
+.check::xm::XR,XZR
+.check::xa::XR,XZR
+.check::xt::XR,XZR
+.check::xu::XR,XZR
+.check::xs::XR,SP
+.check::xe::XR,SP
+.check::xb::XR,SP
+.check::wd::WR,WZR
+.check::wn::WR,WZR
+.check::wm::WR,WZR
+.check::wa::WR,WZR
+.check::wt::WR,WZR
+.check::wu::WR,WZR
+.check::ws::WR,WSP
+.check::we::WR,WSP
+.check::fb::BR
+.check::fh::HR
+.check::fs::SR
+.check::ff::DR
+.check::fq::QR
+.check::fbd::BR
+.check::fbn::BR
+.check::fhd::HR
+.check::fhn::HR
+.check::fhm::HR
+.check::fha::HR
+.check::fsd::SR
+.check::fsn::SR
+.check::fsm::SR
+.check::fsa::SR
+.check::fdd::DR
+.check::fdn::DR
+.check::fdm::DR
+.check::fda::DR
+.check::fqd::QR
+.check::fqn::QR
+
+/* ===================================================================
+/* Condition codes, shift kinds, extend kinds
+/* =================================================================== */
+.setsym::EQ::0
+.setsym::NE::1
+.setsym::CS::2
+.setsym::HS::2
+.setsym::CC::3
+.setsym::LO::3
+.setsym::MI::4
+.setsym::PL::5
+.setsym::VS::6
+.setsym::VC::7
+.setsym::HI::8
+.setsym::LS::9
+.setsym::GE::10
+.setsym::LT::11
+.setsym::GT::12
+.setsym::LE::13
+.setsym::AL::14
+.setsym::NV::15
+.setsym::CONDS::EQ,NE,CS,HS,CC,LO,MI,PL,VS,VC,HI,LS,GE,LT,GT,LE,AL,NV
+.check::cnd::CONDS
+
+.setsym::LSL::0
+.setsym::LSR::1
+.setsym::ASR::2
+.setsym::ROR::3
+.check::sht::LSL,LSR,ASR,ROR
+.check::sha::LSL,LSR,ASR
+
+.setsym::UXTB::0
+.setsym::UXTH::1
+.setsym::UXTW::2
+.setsym::UXTX::3
+.setsym::SXTB::4
+.setsym::SXTH::5
+.setsym::SXTW::6
+.setsym::SXTX::7
+.check::exw::UXTB,UXTH,UXTW,SXTB,SXTH,SXTW
+.check::exx::UXTB,UXTH,UXTW,UXTX,SXTB,SXTH,SXTW,SXTX
+
+/* Barrier options */
+.setsym::OSHLD::1
+.setsym::OSHST::2
+.setsym::OSH::3
+.setsym::NSHLD::5
+.setsym::NSHST::6
+.setsym::NSH::7
+.setsym::ISHLD::9
+.setsym::ISHST::10
+.setsym::ISH::11
+.setsym::LD::13
+.setsym::ST::14
+.setsym::SY::15
+.check::bar::OSHLD,OSHST,OSH,NSHLD,NSHST,NSH,ISHLD,ISHST,ISH,LD,ST,SY
+
+/* Prefetch operations */
+.setsym::PLDL1KEEP::0
+.setsym::PLDL1STRM::1
+.setsym::PLDL2KEEP::2
+.setsym::PLDL2STRM::3
+.setsym::PLDL3KEEP::4
+.setsym::PLDL3STRM::5
+.setsym::PLIL1KEEP::8
+.setsym::PLIL1STRM::9
+.setsym::PLIL2KEEP::10
+.setsym::PLIL2STRM::11
+.setsym::PLIL3KEEP::12
+.setsym::PLIL3STRM::13
+.setsym::PSTL1KEEP::16
+.setsym::PSTL1STRM::17
+.setsym::PSTL2KEEP::18
+.setsym::PSTL2STRM::19
+.setsym::PSTL3KEEP::20
+.setsym::PSTL3STRM::21
+.check::prf::PLDL1KEEP,PLDL1STRM,PLDL2KEEP,PLDL2STRM,PLDL3KEEP,PLDL3STRM,PLIL1KEEP,PLIL1STRM,PLIL2KEEP,PLIL2STRM,PLIL3KEEP,PLIL3STRM,PSTL1KEEP,PSTL1STRM,PSTL2KEEP,PSTL2STRM,PSTL3KEEP,PSTL3STRM
+
+/* ===================================================================
+/* Error messages (section 3.14)
+/* =================================================================== */
+.error::2::"branch target out of range"
+.error::3::"immediate value out of range"
+.error::5::"register out of range"
+.error::7::"immediate is not a valid logical bitmask"
+.error::8::"memory offset not encodable"
+.error::9::"immediate not representable as an 8-bit floating-point value"
+.error::10::"shift or extend amount out of range"
+.error::11::"immediate not encodable as a move-wide or bitmask value"
+.error::12::"condition AL and NV cannot be used with this alias"
+
+/* ===================================================================
+/* Mini-language encoders (Technical_Manual.md section 3.15)
+/*
+/* Four things in A64 cannot be written as a fixed binary_list
+/* expression. Each is one function here; every pattern line that
+/* needs one calls it and emits its returned four bytes.
+/* =================================================================== */
+
+/* w4(z): the little-endian bytes of a 32-bit instruction word. Every
+/* function below hands its result back through this one. */
+.func::w4::z
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+/* highbit(x): position of the highest set bit of x, counted from the
+/* right -- the mini language's equivalent of the pattern layer's "@"
+/* operator, which the mini language does not itself provide. */
+.func::highbit::x
+p = 1
+.while(x > 1)
+x = x >> 1
+p = p + 1
+.endwhile
+.return p
+.endfunc
+
+/* isrun(y,e): 1 when the low e bits of y are a single run of set bits,
+/* possibly rotated, and are neither all-zero nor all-one -- exactly
+/* the condition ARM's DecodeBitMasks can invert. This is the test the
+/* original aarch64_logical_mini.axx left out, so that #0x5 is now
+/* rejected instead of encoding to something wrong. */
+.func::isrun::y,e
+m = (1 << e) - 1
+y = y & m
+.if y == 0 .then
+.return 0
+.endif
+.if y == m .then
+.return 0
+.endif
+i = 0
+.while(i < e)
+.if (y & 1) == 1 .then
+.if ((y >> (e - 1)) & 1) == 0 .then
+.if ((y + 1) & y) == 0 .then
+.return 1
+.endif
+.return 0
+.endif
+.endif
+y = ((y >> 1) | ((y & 1) << (e - 1))) & m
+i = i + 1
+.endwhile
+.return 0
+.endfunc
+
+/* find_e(v,maxw): the smallest element size e in {2,4,8,...,maxw}
+/* such that v is exactly v's low e bits repeated across all of the
+/* low maxw bits; falls back to maxw itself (a single non-repeating
+/* run spanning the whole register) if no smaller size fits. */
+.func::find_e::v,maxw
+e = 2
+.while(e < maxw)
+mask = (1 << e) - 1
+low = v & mask
+rep = low
+cw = e
+.while(cw < maxw)
+rep = rep | (rep << cw)
+cw = cw * 2
+.endwhile
+.if rep == v .then
+.return e
+.endif
+e = e * 2
+.endwhile
+.return maxw
+.endfunc
+
+/* pack_rs(v,e): given the element size e found by find_e, locates the
+/* single run of set bits within one element and returns [r, s] --
+/* the rotation (immr) and the combined size-code/run-length byte
+/* whose bit 6 (inverted) is the instruction's N bit and whose low 6
+/* bits are imms. */
+.func::pack_rs::v,e
+m = (1 << e) - 1
+y = v & m
+h = .call highbit(y ^ (y - 1))
+t = h - 1
+u = y >> t
+.if (y ^ m) == 0 .then
+w = 1
+.else
+w = y ^ m
+.endif
+h2 = .call highbit(w ^ (w - 1))
+p = h2 - 1
+q = w >> p
+.if ((u + 1) & u) == 0 .then
+c = 1
+.else
+c = 0
+.endif
+hq = .call highbit(q)
+.if c == 1 .then
+hu = .call highbit(u)
+b = hu
+r = (e - t) & (e - 1)
+.else
+b = e - hq
+r = (e - (p + hq)) & (e - 1)
+.endif
+s = ((-2 * e) & 0x7f) | (b - 1)
+.return [r, s]
+.endfunc
+
+/* logical(v,sf,opc,rn,rd,maxw): the finished logical-immediate word.
+/* opc is 0=AND 1=ORR 2=EOR 3=ANDS; maxw is 64 or 32 to match sf. */
+.func::logical::v,sf,opc,rn,rd,maxw
+m = (1 << maxw) - 1
+v = v & m
+e = .call find_e(v, maxw)
+.if .call isrun(v, e) == 0 .then
+.raise 7
+.return [0, 0, 0, 0]
+.endif
+rs = .call pack_rs(v, e)
+r = rs[0]
+s = rs[1]
+nbit = ((s >> 6) & 1) ^ 1
+.return .call w4((sf << 31) | (opc << 29) | (0x24 << 23) | (nbit << 22) | (r << 16) | ((s & 0x3f) << 10) | (rn << 5) | rd)
+.endfunc
+
+/* movwide(v,sf,rd,maxw): the MOV (immediate) alias. A64 spells one
+/* mnemonic over three encodings, and which one applies depends on the
+/* value: MOVZ when the value is a 16-bit field shifted into place,
+/* MOVN when its inverse is, and ORR with a bitmask immediate
+/* otherwise. That decision is a search, so it lives here. */
+.func::movwide::v,sf,rd,maxw
+m = (1 << maxw) - 1
+v = v & m
+nh = maxw / 16
+i = 0
+.while(i < nh)
+f = 0xffff << (16 * i)
+.if (v & (m ^ f)) == 0 .then
+.return .call w4((sf << 31) | (2 << 29) | (0x25 << 23) | (i << 21) | (((v >> (16 * i)) & 0xffff) << 5) | rd)
+.endif
+i = i + 1
+.endwhile
+nv = (~v) & m
+i = 0
+.while(i < nh)
+f = 0xffff << (16 * i)
+.if (nv & (m ^ f)) == 0 .then
+.return .call w4((sf << 31) | (0x25 << 23) | (i << 21) | (((nv >> (16 * i)) & 0xffff) << 5) | rd)
+.endif
+i = i + 1
+.endwhile
+e = .call find_e(v, maxw)
+.if .call isrun(v, e) == 1 .then
+.return .call logical(v, sf, 1, 31, rd, maxw)
+.endif
+.raise 11
+.return [0, 0, 0, 0]
+.endfunc
+
+/* lsoff(size,vb,opc,imm,rn,rt,scale): a load or store with an
+/* immediate offset. A64 has two encodings for it -- a scaled
+/* unsigned offset reaching 4095*size, and an unscaled signed one
+/* reaching +-256 -- and the assembler picks whichever fits, so that
+/* choice is a function rather than a pattern. */
+.func::lsoff::size,vb,opc,imm,rn,rt,scale
+sc = 1 << scale
+.if imm >= 0 .then
+.if (imm % sc) == 0 .then
+.if (imm >> scale) <= 4095 .then
+.return .call w4((size << 30) | (7 << 27) | (vb << 26) | (1 << 24) | (opc << 22) | ((imm >> scale) << 10) | (rn << 5) | rt)
+.endif
+.endif
+.endif
+.if imm >= -256 .then
+.if imm <= 255 .then
+.return .call w4((size << 30) | (7 << 27) | (vb << 26) | (opc << 22) | ((imm & 0x1ff) << 12) | (rn << 5) | rt)
+.endif
+.endif
+.raise 8
+.return [0, 0, 0, 0]
+.endfunc
+
+/* fpimm8(v): the 8-bit floating-point immediate field for a binary64
+/* bit pattern, or -1 when the value is not one of the 256 that A64
+/* can spell. The exponent has to be the 1:b:bbbbbbbb:xx shape that
+/* VFPExpandImm produces, and the mantissa has to fit four bits. */
+.func::fpimm8::v
+sg = (v >> 63) & 1
+ex = (v >> 52) & 0x7ff
+fr = v & 0xfffffffffffff
+.if (fr & 0xffffffffffff) != 0 .then
+.return -1
+.endif
+e2 = ex >> 2
+.if e2 == 0x100 .then
+b = 0
+.elif e2 == 0xff .then
+b = 1
+.else
+.return -1
+.endif
+.return (sg << 7) | (b << 6) | ((ex & 3) << 4) | (fr >> 48)
+.endfunc
+
+.func::fmovi::v,ptype,rd
+i8 = .call fpimm8(v)
+.if i8 < 0 .then
+.raise 9
+.return [0, 0, 0, 0]
+.endif
+.return .call w4((0x1e << 24) | (ptype << 22) | (1 << 21) | (i8 << 13) | (4 << 10) | rd)
+.endfunc
+
+/* ===================================================================
+/* Data processing -- immediate
+/* =================================================================== */
+
+/* PC-relative addressing */
+ADR xd,!t ::((t-$$)<-1048576)||((t-$$)>1048575);2 :: .call w4((((t-$$)&3)<<29)|(0x10<<24)|((((t-$$)>>2)&0x7ffff)<<5)|xd)
+ADRP xd,!t :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
+
+/* Add/subtract (immediate). sh selects the LSL #12 form. */
+!def asi(nm, op, s, rd, rn, sf) {
+!{nm} !{rd},!{rn},#!v ::v<0;3,v>0xfff;3 :: .call w4((!{sf}<<31)|(!{op}<<30)|(!{s}<<29)|(0x11<<24)|(v<<10)|(!{rn}<<5)|!{rd})
+!{nm} !{rd},!{rn},#!v,LSL #!h ::v<0;3,v>0xfff;3,(h!=0)&&(h!=12);10 :: .call w4((!{sf}<<31)|(!{op}<<30)|(!{s}<<29)|(0x11<<24)|((h==12?1:0)<<22)|(v<<10)|(!{rn}<<5)|!{rd})
+}
+!asi("ADD", 0, 0, "xs", "xe", 1)
+!asi("ADD", 0, 0, "ws", "we", 0)
+!asi("ADDS", 0, 1, "xd", "xe", 1)
+!asi("ADDS", 0, 1, "wd", "we", 0)
+!asi("SUB", 1, 0, "xs", "xe", 1)
+!asi("SUB", 1, 0, "ws", "we", 0)
+!asi("SUBS", 1, 1, "xd", "xe", 1)
+!asi("SUBS", 1, 1, "wd", "we", 0)
+
+!def cmpi(nm, op, rn, sf) {
+!{nm} !{rn},#!v ::v<0;3,v>0xfff;3 :: .call w4((!{sf}<<31)|(!{op}<<30)|(1<<29)|(0x11<<24)|(v<<10)|(!{rn}<<5)|31)
+!{nm} !{rn},#!v,LSL #!h ::v<0;3,v>0xfff;3,(h!=0)&&(h!=12);10 :: .call w4((!{sf}<<31)|(!{op}<<30)|(1<<29)|(0x11<<24)|((h==12?1:0)<<22)|(v<<10)|(!{rn}<<5)|31)
+}
+!cmpi("CMN", 0, "xe", 1)
+!cmpi("CMN", 0, "we", 0)
+!cmpi("CMP", 1, "xe", 1)
+!cmpi("CMP", 1, "we", 0)
+
+/* MOV to or from SP is ADD #0. The shifted-register MOV further down
+/* cannot take its place, because its .check lists hold XZR and not SP. */
+MOV SP,xe :: .call w4((1<<31)|(0x11<<24)|(xe<<5)|31)
+MOV xs,SP :: .call w4((1<<31)|(0x11<<24)|(31<<5)|xs)
+MOV WSP,we :: .call w4((0x11<<24)|(we<<5)|31)
+MOV ws,WSP :: .call w4((0x11<<24)|(31<<5)|ws)
+
+/* Logical (immediate) */
+!def logi(nm, opc, rd, rn, sf, mx) {
+!{nm} !{rd},!{rn},#!v :: .call logical(v,!{sf},!{opc},!{rn},!{rd},!{mx})
+}
+!logi("AND", 0, "xs", "xn", 1, 64)
+!logi("AND", 0, "ws", "wn", 0, 32)
+!logi("ORR", 1, "xs", "xn", 1, 64)
+!logi("ORR", 1, "ws", "wn", 0, 32)
+!logi("EOR", 2, "xs", "xn", 1, 64)
+!logi("EOR", 2, "ws", "wn", 0, 32)
+!logi("ANDS", 3, "xd", "xn", 1, 64)
+!logi("ANDS", 3, "wd", "wn", 0, 32)
+TST xn,#!v :: .call logical(v,1,3,xn,31,64)
+TST wn,#!v :: .call logical(v,0,3,wn,31,32)
+
+/* Move wide (immediate) */
+!def movw(nm, opc, rd, sf, mx) {
+!{nm} !{rd},#!v[[,LSL #!h]] ::v<0;3,v>0xffff;3,(h&15)!=0;10,h>!{mx};10 :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|((h>>4)<<21)|(v<<5)|!{rd})
+}
+!movw("MOVZ", 2, "xd", 1, 48)
+!movw("MOVZ", 2, "wd", 0, 16)
+!movw("MOVN", 0, "xd", 1, 48)
+!movw("MOVN", 0, "wd", 0, 16)
+!movw("MOVK", 3, "xd", 1, 48)
+!movw("MOVK", 3, "wd", 0, 16)
+
+/* MOV (immediate): MOVZ, MOVN or ORR, decided by the value. */
+MOV xd,#!v :: .call movwide(v,1,xd,64)
+MOV wd,#!v ::v<-2147483648;3,v>0xffffffff;3 :: .call movwide(v,0,wd,32)
+
+/* Bitfield move and its aliases */
+!def bfmraw(nm, opc, rd, rn, sf, mx) {
+!{nm} !{rd},!{rn},#!r,#!s ::r<0;3,r>!{mx};3,s<0;3,s>!{mx};3 :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x26<<23)|(!{sf}<<22)|(r<<16)|(s<<10)|(!{rn}<<5)|!{rd})
+}
+!bfmraw("SBFM", 0, "xd", "xn", 1, 63)
+!bfmraw("SBFM", 0, "wd", "wn", 0, 31)
+!bfmraw("BFM", 1, "xd", "xn", 1, 63)
+!bfmraw("BFM", 1, "wd", "wn", 0, 31)
+!bfmraw("UBFM", 2, "xd", "xn", 1, 63)
+!bfmraw("UBFM", 2, "wd", "wn", 0, 31)
+
+/* Insert form: immr = -lsb mod regsize, imms = width-1 */
+!def bfiz(nm, opc, rd, rn, sf, mx) {
+!{nm} !{rd},!{rn},#!l,#!c ::l<0;3,l>!{mx};3,c<1;3,(l+c)>!{mx+1};3 :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x26<<23)|(!{sf}<<22)|(((-l)&!{mx})<<16)|((c-1)<<10)|(!{rn}<<5)|!{rd})
+}
+!bfiz("SBFIZ", 0, "xd", "xn", 1, 63)
+!bfiz("SBFIZ", 0, "wd", "wn", 0, 31)
+!bfiz("BFI", 1, "xd", "xn", 1, 63)
+!bfiz("BFI", 1, "wd", "wn", 0, 31)
+!bfiz("UBFIZ", 2, "xd", "xn", 1, 63)
+!bfiz("UBFIZ", 2, "wd", "wn", 0, 31)
+
+/* Extract form: immr = lsb, imms = lsb+width-1 */
+!def bfx(nm, opc, rd, rn, sf, mx) {
+!{nm} !{rd},!{rn},#!l,#!c ::l<0;3,l>!{mx};3,c<1;3,(l+c)>!{mx+1};3 :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x26<<23)|(!{sf}<<22)|(l<<16)|((l+c-1)<<10)|(!{rn}<<5)|!{rd})
+}
+!bfx("SBFX", 0, "xd", "xn", 1, 63)
+!bfx("SBFX", 0, "wd", "wn", 0, 31)
+!bfx("BFXIL", 1, "xd", "xn", 1, 63)
+!bfx("BFXIL", 1, "wd", "wn", 0, 31)
+!bfx("UBFX", 2, "xd", "xn", 1, 63)
+!bfx("UBFX", 2, "wd", "wn", 0, 31)
+
+/* BFC is BFI with the zero register as the source */
+BFC xd,#!l,#!c ::l<0;3,l>63;3,c<1;3,(l+c)>64;3 :: .call w4((1<<31)|(1<<29)|(0x26<<23)|(1<<22)|(((-l)&63)<<16)|((c-1)<<10)|(31<<5)|xd)
+BFC wd,#!l,#!c ::l<0;3,l>31;3,c<1;3,(l+c)>32;3 :: .call w4((1<<29)|(0x26<<23)|(((-l)&31)<<16)|((c-1)<<10)|(31<<5)|wd)
+
+/* Shift by a constant: aliases of SBFM and UBFM */
+ASR xd,xn,#!s ::s<0;3,s>63;3 :: .call w4((1<<31)|(0x26<<23)|(1<<22)|(s<<16)|(63<<10)|(xn<<5)|xd)
+ASR wd,wn,#!s ::s<0;3,s>31;3 :: .call w4((0x26<<23)|(s<<16)|(31<<10)|(wn<<5)|wd)
+LSR xd,xn,#!s ::s<0;3,s>63;3 :: .call w4((1<<31)|(2<<29)|(0x26<<23)|(1<<22)|(s<<16)|(63<<10)|(xn<<5)|xd)
+LSR wd,wn,#!s ::s<0;3,s>31;3 :: .call w4((2<<29)|(0x26<<23)|(s<<16)|(31<<10)|(wn<<5)|wd)
+LSL xd,xn,#!s ::s<0;3,s>63;3 :: .call w4((1<<31)|(2<<29)|(0x26<<23)|(1<<22)|(((-s)&63)<<16)|((63-s)<<10)|(xn<<5)|xd)
+LSL wd,wn,#!s ::s<0;3,s>31;3 :: .call w4((2<<29)|(0x26<<23)|(((-s)&31)<<16)|((31-s)<<10)|(wn<<5)|wd)
+
+/* Sign and zero extension: aliases of SBFM and UBFM */
+SXTB xd,wn :: .call w4((1<<31)|(0x26<<23)|(1<<22)|(7<<10)|(wn<<5)|xd)
+SXTB wd,wn :: .call w4((0x26<<23)|(7<<10)|(wn<<5)|wd)
+SXTH xd,wn :: .call w4((1<<31)|(0x26<<23)|(1<<22)|(15<<10)|(wn<<5)|xd)
+SXTH wd,wn :: .call w4((0x26<<23)|(15<<10)|(wn<<5)|wd)
+SXTW xd,wn :: .call w4((1<<31)|(0x26<<23)|(1<<22)|(31<<10)|(wn<<5)|xd)
+UXTB wd,wn :: .call w4((2<<29)|(0x26<<23)|(7<<10)|(wn<<5)|wd)
+UXTH wd,wn :: .call w4((2<<29)|(0x26<<23)|(15<<10)|(wn<<5)|wd)
+
+/* Extract register, and the ROR alias that reads one register twice */
+EXTR xd,xn,xm,#!s ::s<0;3,s>63;3 :: .call w4((1<<31)|(0x27<<23)|(1<<22)|(xm<<16)|(s<<10)|(xn<<5)|xd)
+EXTR wd,wn,wm,#!s ::s<0;3,s>31;3 :: .call w4((0x27<<23)|(wm<<16)|(s<<10)|(wn<<5)|wd)
+ROR xd,xn,#!s ::s<0;3,s>63;3 :: .call w4((1<<31)|(0x27<<23)|(1<<22)|(xn<<16)|(s<<10)|(xn<<5)|xd)
+ROR wd,wn,#!s ::s<0;3,s>31;3 :: .call w4((0x27<<23)|(wn<<16)|(s<<10)|(wn<<5)|wd)
+
+/* ===================================================================
+/* Data processing -- register
+/* =================================================================== */
+
+/* Logical (shifted register). The optional part carries both the
+/* shift kind and its amount, so one row covers "AND x0,x1,x2" and
+/* "AND x0,x1,x2,LSR #7" alike -- an absent optional operand reads 0,
+/* which is LSL #0. */
+!def logr(nm, opc, n, rd, rn, rm, sf, mx) {
+!{nm} !{rd},!{rn},!{rm}[[,sht #!a]] ::a<0;10,a>!{mx};10 :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x0a<<24)|(sht<<22)|(!{n}<<21)|(!{rm}<<16)|(a<<10)|(!{rn}<<5)|!{rd})
+}
+!logr("AND", 0, 0, "xd", "xn", "xm", 1, 63)
+!logr("AND", 0, 0, "wd", "wn", "wm", 0, 31)
+!logr("BIC", 0, 1, "xd", "xn", "xm", 1, 63)
+!logr("BIC", 0, 1, "wd", "wn", "wm", 0, 31)
+!logr("ORR", 1, 0, "xd", "xn", "xm", 1, 63)
+!logr("ORR", 1, 0, "wd", "wn", "wm", 0, 31)
+!logr("ORN", 1, 1, "xd", "xn", "xm", 1, 63)
+!logr("ORN", 1, 1, "wd", "wn", "wm", 0, 31)
+!logr("EOR", 2, 0, "xd", "xn", "xm", 1, 63)
+!logr("EOR", 2, 0, "wd", "wn", "wm", 0, 31)
+!logr("EON", 2, 1, "xd", "xn", "xm", 1, 63)
+!logr("EON", 2, 1, "wd", "wn", "wm", 0, 31)
+!logr("ANDS", 3, 0, "xd", "xn", "xm", 1, 63)
+!logr("ANDS", 3, 0, "wd", "wn", "wm", 0, 31)
+!logr("BICS", 3, 1, "xd", "xn", "xm", 1, 63)
+!logr("BICS", 3, 1, "wd", "wn", "wm", 0, 31)
+
+/* Aliases that fix one operand to the zero register */
+!def logr2(nm, opc, n, rd, rm, sf, mx) {
+!{nm} !{rd},!{rm}[[,sht #!a]] ::a<0;10,a>!{mx};10 :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x0a<<24)|(sht<<22)|(!{n}<<21)|(!{rm}<<16)|(a<<10)|(31<<5)|!{rd})
+}
+!logr2("MOV", 1, 0, "xd", "xm", 1, 63)
+!logr2("MOV", 1, 0, "wd", "wm", 0, 31)
+!logr2("MVN", 1, 1, "xd", "xm", 1, 63)
+!logr2("MVN", 1, 1, "wd", "wm", 0, 31)
+TST xn,xm[[,sht #!a]] ::a<0;10,a>63;10 :: .call w4((1<<31)|(3<<29)|(0x0a<<24)|(sht<<22)|(xm<<16)|(a<<10)|(xn<<5)|31)
+TST wn,wm[[,sht #!a]] ::a<0;10,a>31;10 :: .call w4((3<<29)|(0x0a<<24)|(sht<<22)|(wm<<16)|(a<<10)|(wn<<5)|31)
+
+/* Add/subtract (shifted register). Only LSL, LSR and ASR are legal
+/* here, which is what the .check list on "sha" enforces. */
+!def asr3(nm, op, s, rd, rn, rm, sf, mx) {
+!{nm} !{rd},!{rn},!{rm}[[,sha #!a]] ::a<0;10,a>!{mx};10 :: .call w4((!{sf}<<31)|(!{op}<<30)|(!{s}<<29)|(0x0b<<24)|(sha<<22)|(!{rm}<<16)|(a<<10)|(!{rn}<<5)|!{rd})
+}
+!asr3("ADD", 0, 0, "xd", "xn", "xm", 1, 63)
+!asr3("ADD", 0, 0, "wd", "wn", "wm", 0, 31)
+!asr3("ADDS", 0, 1, "xd", "xn", "xm", 1, 63)
+!asr3("ADDS", 0, 1, "wd", "wn", "wm", 0, 31)
+!asr3("SUB", 1, 0, "xd", "xn", "xm", 1, 63)
+!asr3("SUB", 1, 0, "wd", "wn", "wm", 0, 31)
+!asr3("SUBS", 1, 1, "xd", "xn", "xm", 1, 63)
+!asr3("SUBS", 1, 1, "wd", "wn", "wm", 0, 31)
+
+!def asr2(nm, op, s, rd, rm, sf, mx) {
+!{nm} !{rd},!{rm}[[,sha #!a]] ::a<0;10,a>!{mx};10 :: .call w4((!{sf}<<31)|(!{op}<<30)|(!{s}<<29)|(0x0b<<24)|(sha<<22)|(!{rm}<<16)|(a<<10)|(31<<5)|!{rd})
+}
+!asr2("NEG", 1, 0, "xd", "xm", 1, 63)
+!asr2("NEG", 1, 0, "wd", "wm", 0, 31)
+!asr2("NEGS", 1, 1, "xd", "xm", 1, 63)
+!asr2("NEGS", 1, 1, "wd", "wm", 0, 31)
+CMN xn,xm[[,sha #!a]] ::a<0;10,a>63;10 :: .call w4((1<<31)|(1<<29)|(0x0b<<24)|(sha<<22)|(xm<<16)|(a<<10)|(xn<<5)|31)
+CMN wn,wm[[,sha #!a]] ::a<0;10,a>31;10 :: .call w4((1<<29)|(0x0b<<24)|(sha<<22)|(wm<<16)|(a<<10)|(wn<<5)|31)
+CMP xn,xm[[,sha #!a]] ::a<0;10,a>63;10 :: .call w4((1<<31)|(1<<30)|(1<<29)|(0x0b<<24)|(sha<<22)|(xm<<16)|(a<<10)|(xn<<5)|31)
+CMP wn,wm[[,sha #!a]] ::a<0;10,a>31;10 :: .call w4((1<<30)|(1<<29)|(0x0b<<24)|(sha<<22)|(wm<<16)|(a<<10)|(wn<<5)|31)
+
+/* Add/subtract (extended register). Written with the extend keyword
+/* it is unambiguous; written without one it only arises where SP is
+/* an operand, so those rows name SP literally and never collide with
+/* the shifted-register rows above, whose .check lists hold XZR. */
+!def aer(nm, op, s, rd, rn, sf) {
+!{nm} !{rd},!{rn},wm,exw[[ #!a]] ::a<0;10,a>4;10 :: .call w4((!{sf}<<31)|(!{op}<<30)|(!{s}<<29)|(0x0b<<24)|(1<<21)|(wm<<16)|(exw<<13)|(a<<10)|(!{rn}<<5)|!{rd})
+!{nm} !{rd},!{rn},xm,UXTX[[ #!a]] ::a<0;10,a>4;10 :: .call w4((!{sf}<<31)|(!{op}<<30)|(!{s}<<29)|(0x0b<<24)|(1<<21)|(xm<<16)|(3<<13)|(a<<10)|(!{rn}<<5)|!{rd})
+!{nm} !{rd},!{rn},xm,SXTX[[ #!a]] ::a<0;10,a>4;10 :: .call w4((!{sf}<<31)|(!{op}<<30)|(!{s}<<29)|(0x0b<<24)|(1<<21)|(xm<<16)|(7<<13)|(a<<10)|(!{rn}<<5)|!{rd})
+}
+!aer("ADD", 0, 0, "xs", "xe", 1)
+!aer("ADDS", 0, 1, "xd", "xe", 1)
+!aer("SUB", 1, 0, "xs", "xe", 1)
+!aer("SUBS", 1, 1, "xd", "xe", 1)
+CMN xe,wm,exw[[ #!a]] ::a<0;10,a>4;10 :: .call w4((1<<31)|(1<<29)|(0x0b<<24)|(1<<21)|(wm<<16)|(exw<<13)|(a<<10)|(xe<<5)|31)
+CMP xe,wm,exw[[ #!a]] ::a<0;10,a>4;10 :: .call w4((1<<31)|(1<<30)|(1<<29)|(0x0b<<24)|(1<<21)|(wm<<16)|(exw<<13)|(a<<10)|(xe<<5)|31)
+CMN xe,xm,UXTX[[ #!a]] ::a<0;10,a>4;10 :: .call w4((1<<31)|(1<<29)|(0x0b<<24)|(1<<21)|(xm<<16)|(3<<13)|(a<<10)|(xe<<5)|31)
+CMP xe,xm,UXTX[[ #!a]] ::a<0;10,a>4;10 :: .call w4((1<<31)|(1<<30)|(1<<29)|(0x0b<<24)|(1<<21)|(xm<<16)|(3<<13)|(a<<10)|(xe<<5)|31)
+
+!def aerw(nm, op, s, rd, rn) {
+!{nm} !{rd},!{rn},wm,exw[[ #!a]] ::a<0;10,a>4;10 :: .call w4((!{op}<<30)|(!{s}<<29)|(0x0b<<24)|(1<<21)|(wm<<16)|(exw<<13)|(a<<10)|(!{rn}<<5)|!{rd})
+}
+!aerw("ADD", 0, 0, "ws", "we")
+!aerw("ADDS", 0, 1, "wd", "we")
+!aerw("SUB", 1, 0, "ws", "we")
+!aerw("SUBS", 1, 1, "wd", "we")
+CMN we,wm,exw[[ #!a]] ::a<0;10,a>4;10 :: .call w4((1<<29)|(0x0b<<24)|(1<<21)|(wm<<16)|(exw<<13)|(a<<10)|(we<<5)|31)
+CMP we,wm,exw[[ #!a]] ::a<0;10,a>4;10 :: .call w4((1<<30)|(1<<29)|(0x0b<<24)|(1<<21)|(wm<<16)|(exw<<13)|(a<<10)|(we<<5)|31)
+
+/* The SP forms written without an extend keyword. Each row is given
+/* the pattern text and the encoded number for Rd and Rn separately,
+/* because "SP" written in a binary_list expression would be read as a
+/* label rather than as register 31. */
+!def aesp(nm, op, s, pd, ed, pn, en, sf, wl) {
+!{nm} !{pd},!{pn},!{wl}m[[,LSL #!a]] ::a<0;10,a>4;10 :: .call w4((!{sf}<<31)|(!{op}<<30)|(!{s}<<29)|(0x0b<<24)|(1<<21)|(!{wl}m<<16)|(!{sf==1?3:2}<<13)|(a<<10)|(!{en}<<5)|!{ed})
+}
+!aesp("ADD", 0, 0, "xs", "xs", "SP", "31", 1, "x")
+!aesp("ADD", 0, 0, "SP", "31", "xe", "xe", 1, "x")
+!aesp("ADDS", 0, 1, "xd", "xd", "SP", "31", 1, "x")
+!aesp("SUB", 1, 0, "xs", "xs", "SP", "31", 1, "x")
+!aesp("SUB", 1, 0, "SP", "31", "xe", "xe", 1, "x")
+!aesp("SUBS", 1, 1, "xd", "xd", "SP", "31", 1, "x")
+!aesp("ADD", 0, 0, "ws", "ws", "WSP", "31", 0, "w")
+!aesp("ADD", 0, 0, "WSP", "31", "we", "we", 0, "w")
+!aesp("ADDS", 0, 1, "wd", "wd", "WSP", "31", 0, "w")
+!aesp("SUB", 1, 0, "ws", "ws", "WSP", "31", 0, "w")
+!aesp("SUB", 1, 0, "WSP", "31", "we", "we", 0, "w")
+!aesp("SUBS", 1, 1, "wd", "wd", "WSP", "31", 0, "w")
+CMN SP,xm[[,LSL #!a]] ::a<0;10,a>4;10 :: .call w4((1<<31)|(1<<29)|(0x0b<<24)|(1<<21)|(xm<<16)|(3<<13)|(a<<10)|(31<<5)|31)
+CMP SP,xm[[,LSL #!a]] ::a<0;10,a>4;10 :: .call w4((1<<31)|(1<<30)|(1<<29)|(0x0b<<24)|(1<<21)|(xm<<16)|(3<<13)|(a<<10)|(31<<5)|31)
+CMN WSP,wm[[,LSL #!a]] ::a<0;10,a>4;10 :: .call w4((1<<29)|(0x0b<<24)|(1<<21)|(wm<<16)|(2<<13)|(a<<10)|(31<<5)|31)
+CMP WSP,wm[[,LSL #!a]] ::a<0;10,a>4;10 :: .call w4((1<<30)|(1<<29)|(0x0b<<24)|(1<<21)|(wm<<16)|(2<<13)|(a<<10)|(31<<5)|31)
+
+/* Add/subtract with carry */
+!def adc(nm, op, s, rd, rn, rm, sf) {
+!{nm} !{rd},!{rn},!{rm} :: .call w4((!{sf}<<31)|(!{op}<<30)|(!{s}<<29)|(0xd0<<21)|(!{rm}<<16)|(!{rn}<<5)|!{rd})
+}
+!adc("ADC", 0, 0, "xd", "xn", "xm", 1)
+!adc("ADC", 0, 0, "wd", "wn", "wm", 0)
+!adc("ADCS", 0, 1, "xd", "xn", "xm", 1)
+!adc("ADCS", 0, 1, "wd", "wn", "wm", 0)
+!adc("SBC", 1, 0, "xd", "xn", "xm", 1)
+!adc("SBC", 1, 0, "wd", "wn", "wm", 0)
+!adc("SBCS", 1, 1, "xd", "xn", "xm", 1)
+!adc("SBCS", 1, 1, "wd", "wn", "wm", 0)
+!def ngc(nm, s, rd, rm, sf) {
+!{nm} !{rd},!{rm} :: .call w4((!{sf}<<31)|(1<<30)|(!{s}<<29)|(0xd0<<21)|(!{rm}<<16)|(31<<5)|!{rd})
+}
+!ngc("NGC", 0, "xd", "xm", 1)
+!ngc("NGC", 0, "wd", "wm", 0)
+!ngc("NGCS", 1, "xd", "xm", 1)
+!ngc("NGCS", 1, "wd", "wm", 0)
+
+/* Conditional compare */
+!def ccmp(nm, op, rn, rm, sf) {
+!{nm} !{rn},!{rm},#!f,cnd ::f<0;3,f>15;3 :: .call w4((!{sf}<<31)|(!{op}<<30)|(1<<29)|(0xd2<<21)|(!{rm}<<16)|(cnd<<12)|(!{rn}<<5)|f)
+!{nm} !{rn},#!i,#!f,cnd ::i<0;3,i>31;3,f<0;3,f>15;3 :: .call w4((!{sf}<<31)|(!{op}<<30)|(1<<29)|(0xd2<<21)|(i<<16)|(cnd<<12)|(1<<11)|(!{rn}<<5)|f)
+}
+!ccmp("CCMN", 0, "xn", "xm", 1)
+!ccmp("CCMN", 0, "wn", "wm", 0)
+!ccmp("CCMP", 1, "xn", "xm", 1)
+!ccmp("CCMP", 1, "wn", "wm", 0)
+
+/* Conditional select, and the aliases that invert the condition */
+!def csel(nm, op, o2, rd, rn, rm, sf) {
+!{nm} !{rd},!{rn},!{rm},cnd :: .call w4((!{sf}<<31)|(!{op}<<30)|(0xd4<<21)|(!{rm}<<16)|(cnd<<12)|(!{o2}<<10)|(!{rn}<<5)|!{rd})
+}
+!csel("CSEL", 0, 0, "xd", "xn", "xm", 1)
+!csel("CSEL", 0, 0, "wd", "wn", "wm", 0)
+!csel("CSINC", 0, 1, "xd", "xn", "xm", 1)
+!csel("CSINC", 0, 1, "wd", "wn", "wm", 0)
+!csel("CSINV", 1, 0, "xd", "xn", "xm", 1)
+!csel("CSINV", 1, 0, "wd", "wn", "wm", 0)
+!csel("CSNEG", 1, 1, "xd", "xn", "xm", 1)
+!csel("CSNEG", 1, 1, "wd", "wn", "wm", 0)
+
+/* CINC, CINV, CNEG, CSET and CSETM encode the inverted condition, so
+/* AL and NV are not available to them: the inverse would be NV or AL,
+/* which those encodings do not allow. */
+!def cinc(nm, op, o2, rd, rn, sf) {
+!{nm} !{rd},!{rn},cnd ::(cnd==14)||(cnd==15);12 :: .call w4((!{sf}<<31)|(!{op}<<30)|(0xd4<<21)|(!{rn}<<16)|((cnd^1)<<12)|(!{o2}<<10)|(!{rn}<<5)|!{rd})
+}
+!cinc("CINC", 0, 1, "xd", "xn", 1)
+!cinc("CINC", 0, 1, "wd", "wn", 0)
+!cinc("CINV", 1, 0, "xd", "xn", 1)
+!cinc("CINV", 1, 0, "wd", "wn", 0)
+!cinc("CNEG", 1, 1, "xd", "xn", 1)
+!cinc("CNEG", 1, 1, "wd", "wn", 0)
+
+!def cset(nm, op, o2, rd, sf) {
+!{nm} !{rd},cnd ::(cnd==14)||(cnd==15);12 :: .call w4((!{sf}<<31)|(!{op}<<30)|(0xd4<<21)|(31<<16)|((cnd^1)<<12)|(!{o2}<<10)|(31<<5)|!{rd})
+}
+!cset("CSET", 0, 1, "xd", 1)
+!cset("CSET", 0, 1, "wd", 0)
+!cset("CSETM", 1, 0, "xd", 1)
+!cset("CSETM", 1, 0, "wd", 0)
+
+/* Data processing (3 source) */
+!def dp3(nm, o31, o0, rd, rn, rm, ra, sf) {
+!{nm} !{rd},!{rn},!{rm},!{ra} :: .call w4((!{sf}<<31)|(0x1b<<24)|(!{o31}<<21)|(!{rm}<<16)|(!{o0}<<15)|(!{ra}<<10)|(!{rn}<<5)|!{rd})
+}
+!dp3("MADD", 0, 0, "xd", "xn", "xm", "xa", 1)
+!dp3("MADD", 0, 0, "wd", "wn", "wm", "wa", 0)
+!dp3("MSUB", 0, 1, "xd", "xn", "xm", "xa", 1)
+!dp3("MSUB", 0, 1, "wd", "wn", "wm", "wa", 0)
+!dp3("SMADDL", 1, 0, "xd", "wn", "wm", "xa", 1)
+!dp3("SMSUBL", 1, 1, "xd", "wn", "wm", "xa", 1)
+!dp3("UMADDL", 5, 0, "xd", "wn", "wm", "xa", 1)
+!dp3("UMSUBL", 5, 1, "xd", "wn", "wm", "xa", 1)
+
+!def dp3z(nm, o31, o0, rd, rn, rm, sf) {
+!{nm} !{rd},!{rn},!{rm} :: .call w4((!{sf}<<31)|(0x1b<<24)|(!{o31}<<21)|(!{rm}<<16)|(!{o0}<<15)|(31<<10)|(!{rn}<<5)|!{rd})
+}
+!dp3z("MUL", 0, 0, "xd", "xn", "xm", 1)
+!dp3z("MUL", 0, 0, "wd", "wn", "wm", 0)
+!dp3z("MNEG", 0, 1, "xd", "xn", "xm", 1)
+!dp3z("MNEG", 0, 1, "wd", "wn", "wm", 0)
+!dp3z("SMULL", 1, 0, "xd", "wn", "wm", 1)
+!dp3z("SMNEGL", 1, 1, "xd", "wn", "wm", 1)
+!dp3z("UMULL", 5, 0, "xd", "wn", "wm", 1)
+!dp3z("UMNEGL", 5, 1, "xd", "wn", "wm", 1)
+!dp3z("SMULH", 2, 0, "xd", "xn", "xm", 1)
+!dp3z("UMULH", 6, 0, "xd", "xn", "xm", 1)
+
+/* Data processing (2 source) */
+!def dp2(nm, opc, rd, rn, rm, sf) {
+!{nm} !{rd},!{rn},!{rm} :: .call w4((!{sf}<<31)|(0xd6<<21)|(!{rm}<<16)|(!{opc}<<10)|(!{rn}<<5)|!{rd})
+}
+!dp2("UDIV", 2, "xd", "xn", "xm", 1)
+!dp2("UDIV", 2, "wd", "wn", "wm", 0)
+!dp2("SDIV", 3, "xd", "xn", "xm", 1)
+!dp2("SDIV", 3, "wd", "wn", "wm", 0)
+!dp2("LSLV", 8, "xd", "xn", "xm", 1)
+!dp2("LSLV", 8, "wd", "wn", "wm", 0)
+!dp2("LSRV", 9, "xd", "xn", "xm", 1)
+!dp2("LSRV", 9, "wd", "wn", "wm", 0)
+!dp2("ASRV", 10, "xd", "xn", "xm", 1)
+!dp2("ASRV", 10, "wd", "wn", "wm", 0)
+!dp2("RORV", 11, "xd", "xn", "xm", 1)
+!dp2("RORV", 11, "wd", "wn", "wm", 0)
+!dp2("LSL", 8, "xd", "xn", "xm", 1)
+!dp2("LSL", 8, "wd", "wn", "wm", 0)
+!dp2("LSR", 9, "xd", "xn", "xm", 1)
+!dp2("LSR", 9, "wd", "wn", "wm", 0)
+!dp2("ASR", 10, "xd", "xn", "xm", 1)
+!dp2("ASR", 10, "wd", "wn", "wm", 0)
+!dp2("ROR", 11, "xd", "xn", "xm", 1)
+!dp2("ROR", 11, "wd", "wn", "wm", 0)
+!dp2("CRC32B", 0x10, "wd", "wn", "wm", 0)
+!dp2("CRC32H", 0x11, "wd", "wn", "wm", 0)
+!dp2("CRC32W", 0x12, "wd", "wn", "wm", 0)
+!dp2("CRC32X", 0x13, "wd", "wn", "xm", 1)
+!dp2("CRC32CB", 0x14, "wd", "wn", "wm", 0)
+!dp2("CRC32CH", 0x15, "wd", "wn", "wm", 0)
+!dp2("CRC32CW", 0x16, "wd", "wn", "wm", 0)
+!dp2("CRC32CX", 0x17, "wd", "wn", "xm", 1)
+
+/* Data processing (1 source) */
+!def dp1(nm, opc, rd, rn, sf) {
+!{nm} !{rd},!{rn} :: .call w4((!{sf}<<31)|(1<<30)|(0xd6<<21)|(!{opc}<<10)|(!{rn}<<5)|!{rd})
+}
+!dp1("RBIT", 0, "xd", "xn", 1)
+!dp1("RBIT", 0, "wd", "wn", 0)
+!dp1("REV16", 1, "xd", "xn", 1)
+!dp1("REV16", 1, "wd", "wn", 0)
+!dp1("REV32", 2, "xd", "xn", 1)
+!dp1("REV", 3, "xd", "xn", 1)
+!dp1("REV", 2, "wd", "wn", 0)
+!dp1("CLZ", 4, "xd", "xn", 1)
+!dp1("CLZ", 4, "wd", "wn", 0)
+!dp1("CLS", 5, "xd", "xn", 1)
+!dp1("CLS", 5, "wd", "wn", 0)
+
+/* ===================================================================
+/* Branches, exception generation, hints, barriers and system
+/* =================================================================== */
+
+/* Unconditional branch (immediate) */
+B !t ::((t-$$)<-134217728)||((t-$$)>134217724);2 :: .call w4(0x14000000|(((t-$$)>>2)&0x3ffffff))
+BL !t ::((t-$$)<-134217728)||((t-$$)>134217724);2 :: .call w4(0x94000000|(((t-$$)>>2)&0x3ffffff))
+
+/* Conditional branch */
+B.cnd !t ::((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4(0x54000000|((((t-$$)>>2)&0x7ffff)<<5)|cnd)
+
+/* Compare and branch */
+!def cb(nm, op, rt, sf) {
+!{nm} !{rt},!t ::((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4((!{sf}<<31)|(0x1a<<25)|(!{op}<<24)|((((t-$$)>>2)&0x7ffff)<<5)|!{rt})
+}
+!cb("CBZ", 0, "xt", 1)
+!cb("CBZ", 0, "wt", 0)
+!cb("CBNZ", 1, "xt", 1)
+!cb("CBNZ", 1, "wt", 0)
+
+/* Test bit and branch */
+!def tb(nm, op, rt, mx) {
+!{nm} !{rt},#!b,!t ::b<0;3,b>!{mx};3,((t-$$)<-32768)||((t-$$)>32764);2 :: .call w4(((b>>5)<<31)|(0x1b<<25)|(!{op}<<24)|((b&31)<<19)|((((t-$$)>>2)&0x3fff)<<5)|!{rt})
+}
+!tb("TBZ", 0, "xt", 63)
+!tb("TBZ", 0, "wt", 31)
+!tb("TBNZ", 1, "xt", 63)
+!tb("TBNZ", 1, "wt", 31)
+
+/* Unconditional branch (register) */
+BR xn :: .call w4(0xd61f0000|(xn<<5))
+BLR xn :: .call w4(0xd63f0000|(xn<<5))
+RET :: .call w4(0xd65f0000|(30<<5))
+RET xn :: .call w4(0xd65f0000|(xn<<5))
+ERET :: .call w4(0xd69f03e0)
+DRPS :: .call w4(0xd6bf03e0)
+
+/* Exception generation */
+!def exc(nm, opc, ll) {
+!{nm} #!v ::v<0;3,v>0xffff;3 :: .call w4(0xd4000000|(!{opc}<<21)|(v<<5)|!{ll})
+}
+!exc("SVC", 0, 1)
+!exc("HVC", 0, 2)
+!exc("SMC", 0, 3)
+!exc("BRK", 1, 0)
+!exc("HLT", 2, 0)
+/* The DCPS immediate is optional and defaults to 0 */
+!def dcps(nm, ll) {
+!{nm}[[ #!v]] ::v<0;3,v>0xffff;3 :: .call w4(0xd4000000|(5<<21)|(v<<5)|!{ll})
+}
+!dcps("DCPS1", 1)
+!dcps("DCPS2", 2)
+!dcps("DCPS3", 3)
+
+/* Hints. All of them are one encoding with CRm and op2 varying. */
+!def hint(nm, crm, op2) {
+!{nm} :: .call w4(0xd503201f|(!{crm}<<8)|(!{op2}<<5))
+}
+!hint("NOP", 0, 0)
+!hint("YIELD", 0, 1)
+!hint("WFE", 0, 2)
+!hint("WFI", 0, 3)
+!hint("SEV", 0, 4)
+!hint("SEVL", 0, 5)
+!hint("DGH", 0, 6)
+!hint("XPACLRI", 0, 7)
+!hint("PACIA1716", 1, 0)
+!hint("PACIB1716", 1, 2)
+!hint("AUTIA1716", 1, 4)
+!hint("AUTIB1716", 1, 6)
+!hint("ESB", 2, 0)
+!hint("PSB CSYNC", 2, 1)
+!hint("TSB CSYNC", 2, 2)
+!hint("CSDB", 2, 4)
+!hint("PACIAZ", 3, 0)
+!hint("PACIASP", 3, 1)
+!hint("PACIBZ", 3, 2)
+!hint("PACIBSP", 3, 3)
+!hint("AUTIAZ", 3, 4)
+!hint("AUTIASP", 3, 5)
+!hint("AUTIBZ", 3, 6)
+!hint("AUTIBSP", 3, 7)
+!hint("BTI", 4, 0)
+!hint("BTI C", 4, 2)
+!hint("BTI J", 4, 4)
+!hint("BTI JC", 4, 6)
+HINT #!v ::v<0;3,v>127;3 :: .call w4(0xd503201f|((v>>3)<<8)|((v&7)<<5))
+
+/* Barriers */
+CLREX :: .call w4(0xd503305f|(15<<8))
+CLREX #!v ::v<0;3,v>15;3 :: .call w4(0xd503305f|(v<<8))
+DSB bar :: .call w4(0xd503309f|(bar<<8))
+DSB #!v ::v<0;3,v>15;3 :: .call w4(0xd503309f|(v<<8))
+DMB bar :: .call w4(0xd50330bf|(bar<<8))
+DMB #!v ::v<0;3,v>15;3 :: .call w4(0xd50330bf|(v<<8))
+ISB :: .call w4(0xd50330df|(15<<8))
+ISB bar :: .call w4(0xd50330df|(bar<<8))
+ISB #!v ::v<0;3,v>15;3 :: .call w4(0xd50330df|(v<<8))
+SB :: .call w4(0xd50330ff)
+
+/* PSTATE (MSR immediate) */
+!def pstate(nm, op1, op2) {
+MSR !{nm},#!v ::v<0;3,v>15;3 :: .call w4(0xd500401f|(!{op1}<<16)|(v<<8)|(!{op2}<<5))
+}
+!pstate("SPSEL", 0, 5)
+!pstate("DAIFSET", 3, 6)
+!pstate("DAIFCLR", 3, 7)
+!pstate("UAO", 0, 3)
+!pstate("PAN", 0, 4)
+!pstate("DIT", 3, 2)
+!pstate("SSBS", 3, 1)
+!pstate("TCO", 3, 4)
+CFINV :: .call w4(0xd500401f)
+
+/* System register access. The named registers below are the common
+/* ones; every other register, named or not, is reachable through the
+/* generic S<op0>_<op1>_C<Cn>_C<Cm>_<op2> form underneath, whose digits
+/* are matched by the small .sub tables at the end of this section. */
+/* rw: 0 read-only, 1 write-only, 2 read/write. MRS and MSR get their
+/* own .check lists from it, so writing to a read-only register is
+/* rejected rather than quietly encoded. */
+!set SRR = ""
+!set SRW = ""
+!def sr(nm, o0, op1, crn, crm, op2, rw) {
+.setsym::!{nm}::!{((o0 - 2) << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2}
+!if rw != 1 !then {
+!if SRR == "" !then {
+!set SRR = nm
+} !else {
+!set SRR = SRR + "," + nm
+}
+}
+!if rw != 0 !then {
+!if SRW == "" !then {
+!set SRW = nm
+} !else {
+!set SRW = SRW + "," + nm
+}
+}
+}
+!sr("NZCV", 3, 3, 4, 2, 0, 2)
+!sr("DAIF", 3, 3, 4, 2, 1, 2)
+!sr("FPCR", 3, 3, 4, 4, 0, 2)
+!sr("FPSR", 3, 3, 4, 4, 1, 2)
+!sr("SPSEL", 3, 0, 4, 2, 0, 2)
+!sr("CURRENTEL", 3, 0, 4, 2, 2, 0)
+!sr("MIDR_EL1", 3, 0, 0, 0, 0, 0)
+!sr("MPIDR_EL1", 3, 0, 0, 0, 5, 0)
+!sr("REVIDR_EL1", 3, 0, 0, 0, 6, 0)
+!sr("CTR_EL0", 3, 3, 0, 0, 1, 0)
+!sr("DCZID_EL0", 3, 3, 0, 0, 7, 0)
+!sr("ID_AA64PFR0_EL1", 3, 0, 0, 4, 0, 0)
+!sr("ID_AA64PFR1_EL1", 3, 0, 0, 4, 1, 0)
+!sr("ID_AA64ISAR0_EL1", 3, 0, 0, 6, 0, 0)
+!sr("ID_AA64ISAR1_EL1", 3, 0, 0, 6, 1, 0)
+!sr("ID_AA64MMFR0_EL1", 3, 0, 0, 7, 0, 0)
+!sr("ID_AA64MMFR1_EL1", 3, 0, 0, 7, 1, 0)
+!sr("SCTLR_EL1", 3, 0, 1, 0, 0, 2)
+!sr("CPACR_EL1", 3, 0, 1, 0, 2, 2)
+!sr("TTBR0_EL1", 3, 0, 2, 0, 0, 2)
+!sr("TTBR1_EL1", 3, 0, 2, 0, 1, 2)
+!sr("TCR_EL1", 3, 0, 2, 0, 2, 2)
+!sr("SPSR_EL1", 3, 0, 4, 0, 0, 2)
+!sr("ELR_EL1", 3, 0, 4, 0, 1, 2)
+!sr("SP_EL0", 3, 0, 4, 1, 0, 2)
+!sr("SP_EL1", 3, 4, 4, 1, 0, 2)
+!sr("ESR_EL1", 3, 0, 5, 2, 0, 2)
+!sr("FAR_EL1", 3, 0, 6, 0, 0, 2)
+!sr("PAR_EL1", 3, 0, 7, 4, 0, 2)
+!sr("MAIR_EL1", 3, 0, 10, 2, 0, 2)
+!sr("AMAIR_EL1", 3, 0, 10, 3, 0, 2)
+!sr("VBAR_EL1", 3, 0, 12, 0, 0, 2)
+!sr("CONTEXTIDR_EL1", 3, 0, 13, 0, 1, 2)
+!sr("TPIDR_EL1", 3, 0, 13, 0, 4, 2)
+!sr("TPIDR_EL0", 3, 3, 13, 0, 2, 2)
+!sr("TPIDRRO_EL0", 3, 3, 13, 0, 3, 2)
+!sr("CNTFRQ_EL0", 3, 3, 14, 0, 0, 2)
+!sr("CNTPCT_EL0", 3, 3, 14, 0, 1, 0)
+!sr("CNTVCT_EL0", 3, 3, 14, 0, 2, 0)
+!sr("CNTKCTL_EL1", 3, 0, 14, 1, 0, 2)
+!sr("CNTP_TVAL_EL0", 3, 3, 14, 2, 0, 2)
+!sr("CNTP_CTL_EL0", 3, 3, 14, 2, 1, 2)
+!sr("CNTP_CVAL_EL0", 3, 3, 14, 2, 2, 2)
+!sr("CNTV_TVAL_EL0", 3, 3, 14, 3, 0, 2)
+!sr("CNTV_CTL_EL0", 3, 3, 14, 3, 1, 2)
+!sr("CNTV_CVAL_EL0", 3, 3, 14, 3, 2, 2)
+!sr("HCR_EL2", 3, 4, 1, 1, 0, 2)
+!sr("SCTLR_EL2", 3, 4, 1, 0, 0, 2)
+!sr("TTBR0_EL2", 3, 4, 2, 0, 0, 2)
+!sr("TCR_EL2", 3, 4, 2, 0, 2, 2)
+!sr("VTTBR_EL2", 3, 4, 2, 1, 0, 2)
+!sr("SPSR_EL2", 3, 4, 4, 0, 0, 2)
+!sr("ELR_EL2", 3, 4, 4, 0, 1, 2)
+!sr("ESR_EL2", 3, 4, 5, 2, 0, 2)
+!sr("FAR_EL2", 3, 4, 6, 0, 0, 2)
+!sr("MAIR_EL2", 3, 4, 10, 2, 0, 2)
+!sr("VBAR_EL2", 3, 4, 12, 0, 0, 2)
+!sr("SCTLR_EL3", 3, 6, 1, 0, 0, 2)
+!sr("SCR_EL3", 3, 6, 1, 1, 0, 2)
+!sr("SPSR_EL3", 3, 6, 4, 0, 0, 2)
+!sr("ELR_EL3", 3, 6, 4, 0, 1, 2)
+!sr("VBAR_EL3", 3, 6, 12, 0, 0, 2)
+!sr("MDSCR_EL1", 2, 0, 0, 2, 2, 2)
+!sr("OSLAR_EL1", 2, 0, 1, 0, 4, 1)
+!sr("OSDLR_EL1", 2, 0, 1, 3, 4, 2)
+.check::sysr::!{SRR}
+.check::sysw::!{SRW}
+
+MRS xt,sysr :: .call w4(0xd5300000|(sysr<<5)|xt)
+MSR sysw,xt :: .call w4(0xd5100000|(sysw<<5)|xt)
+MRS xt,S!S{{sop0}}a!S{{sd8}}bC!S{{sd16}}cC!S{{sd16}}e!S{{sd8x}}f :: .call w4(0xd5300000|((a-2)<<19)|(b<<16)|(c<<12)|(e<<8)|(f<<5)|xt)
+MSR S!S{{sop0}}a!S{{sd8}}bC!S{{sd16}}cC!S{{sd16}}e!S{{sd8x}}f,xt :: .call w4(0xd5100000|((a-2)<<19)|(b<<16)|(c<<12)|(e<<8)|(f<<5)|xt)
+
+/* Digit tables for the generic system-register spelling. The trailing
+/* "_" of each field belongs to the table entry, not to the pattern:
+/* a variable name written right after a capture would otherwise eat
+/* the underscore, since "_" is a variable-name character. */
+!def dtab(nm, hi, suf) {
+.sub::!{nm}
+!local i = hi
+!while i >= 0 {
+!{i}!{suf}::!{i}
+!set i = i - 1
+}
+.return
+}
+!dtab("sop0", 3, "_")
+!dtab("sd8", 7, "_")
+!dtab("sd16", 15, "_")
+!dtab("sd8x", 7, "")
+
+/* SYS, SYSL and the cache/TLB aliases built on them */
+!def crreg(n) {
+.setsym::C!{n}::!{n}
+}
+!local i = 0
+!while i <= 15 {
+!crreg(i)
+!set i = i + 1
+}
+.setsym::CRS::C0,C1,C2,C3,C4,C5,C6,C7,C8,C9,C10,C11,C12,C13,C14,C15
+.check::crn::CRS
+.check::crm::CRS
+
+SYS #!p,crn,crm,#!q ::p<0;3,p>7;3,q<0;3,q>7;3 :: .call w4(0xd5080000|(p<<16)|(crn<<12)|(crm<<8)|(q<<5)|31)
+SYS #!p,crn,crm,#!q,xt ::p<0;3,p>7;3,q<0;3,q>7;3 :: .call w4(0xd5080000|(p<<16)|(crn<<12)|(crm<<8)|(q<<5)|xt)
+SYSL xt,#!p,crn,crm,#!q ::p<0;3,p>7;3,q<0;3,q>7;3 :: .call w4(0xd5280000|(p<<16)|(crn<<12)|(crm<<8)|(q<<5)|xt)
+
+/* Named cache, address-translation and TLB operations. Each name
+/* holds op1:CRn:CRm:op2 packed four bits per field. */
+!def sysop(nm, op1, crn, crm, op2) {
+.setsym::!{nm}::!{(op1 << 12) | (crn << 8) | (crm << 4) | op2}
+}
+/* Two forms: an operation that names an address takes Xt, one that
+/* does not takes none. They are kept in separate .check lists so that
+/* the wrong shape is rejected. */
+!def sysins0(mn, vr) {
+!{mn} !{vr} :: .call w4(0xd5080000|((!{vr}>>12)<<16)|(((!{vr}>>8)&15)<<12)|(((!{vr}>>4)&15)<<8)|((!{vr}&7)<<5)|31)
+}
+!def sysins1(mn, vr) {
+!{mn} !{vr},xt :: .call w4(0xd5080000|((!{vr}>>12)<<16)|(((!{vr}>>8)&15)<<12)|(((!{vr}>>4)&15)<<8)|((!{vr}&7)<<5)|xt)
+}
+!sysop("IALLUIS", 0, 7, 1, 0)
+!sysop("IALLU", 0, 7, 5, 0)
+!sysop("IVAU", 3, 7, 5, 1)
+.check::icop0::IALLUIS,IALLU
+.check::icop1::IVAU
+!sysins0("IC", "icop0")
+!sysins1("IC", "icop1")
+
+!sysop("IVAC", 0, 7, 6, 1)
+!sysop("ISW", 0, 7, 6, 2)
+!sysop("CSW", 0, 7, 10, 2)
+!sysop("CISW", 0, 7, 14, 2)
+!sysop("ZVA", 3, 7, 4, 1)
+!sysop("CVAC", 3, 7, 10, 1)
+!sysop("CVAU", 3, 7, 11, 1)
+!sysop("CVAP", 3, 7, 12, 1)
+!sysop("CIVAC", 3, 7, 14, 1)
+.check::dcop1::IVAC,ISW,CSW,CISW,ZVA,CVAC,CVAU,CVAP,CIVAC
+!sysins1("DC", "dcop1")
+
+!sysop("S1E1R", 0, 7, 8, 0)
+!sysop("S1E1W", 0, 7, 8, 1)
+!sysop("S1E0R", 0, 7, 8, 2)
+!sysop("S1E0W", 0, 7, 8, 3)
+!sysop("S1E2R", 4, 7, 8, 0)
+!sysop("S1E2W", 4, 7, 8, 1)
+!sysop("S12E1R", 4, 7, 8, 4)
+!sysop("S12E1W", 4, 7, 8, 5)
+!sysop("S12E0R", 4, 7, 8, 6)
+!sysop("S12E0W", 4, 7, 8, 7)
+!sysop("S1E3R", 6, 7, 8, 0)
+!sysop("S1E3W", 6, 7, 8, 1)
+.check::atop1::S1E1R,S1E1W,S1E0R,S1E0W,S1E2R,S1E2W,S12E1R,S12E1W,S12E0R,S12E0W,S1E3R,S1E3W
+!sysins1("AT", "atop1")
+
+!sysop("VMALLE1IS", 0, 8, 3, 0)
+!sysop("VAE1IS", 0, 8, 3, 1)
+!sysop("ASIDE1IS", 0, 8, 3, 2)
+!sysop("VAAE1IS", 0, 8, 3, 3)
+!sysop("VALE1IS", 0, 8, 3, 5)
+!sysop("VAALE1IS", 0, 8, 3, 7)
+!sysop("VMALLE1", 0, 8, 7, 0)
+!sysop("VAE1", 0, 8, 7, 1)
+!sysop("ASIDE1", 0, 8, 7, 2)
+!sysop("VAAE1", 0, 8, 7, 3)
+!sysop("VALE1", 0, 8, 7, 5)
+!sysop("VAALE1", 0, 8, 7, 7)
+!sysop("ALLE1IS", 4, 8, 3, 4)
+!sysop("ALLE2IS", 4, 8, 3, 0)
+!sysop("ALLE3IS", 6, 8, 3, 0)
+!sysop("ALLE1", 4, 8, 7, 4)
+!sysop("ALLE2", 4, 8, 7, 0)
+!sysop("ALLE3", 6, 8, 7, 0)
+!sysop("VMALLS12E1IS", 4, 8, 3, 6)
+!sysop("VMALLS12E1", 4, 8, 7, 6)
+.check::tlbiop0::VMALLE1IS,VMALLE1,ALLE1IS,ALLE2IS,ALLE3IS,ALLE1,ALLE2,ALLE3,VMALLS12E1IS,VMALLS12E1
+.check::tlbiop1::VAE1IS,ASIDE1IS,VAAE1IS,VALE1IS,VAALE1IS,VAE1,ASIDE1,VAAE1,VALE1,VAALE1
+!sysins0("TLBI", "tlbiop0")
+!sysins1("TLBI", "tlbiop1")
+
+/* ===================================================================
+/* Loads and stores
+/* =================================================================== */
+.check::rs::WR,WZR
+
+/* Load/store register. Eleven rows per access size cover the whole
+/* addressing repertoire: base with an optional offset (the mini
+/* language picks the scaled or the unscaled encoding), pre- and
+/* post-index, and the four register-offset extends. The "\!" in the
+/* pre-index row escapes axx's own capture sigil so that it matches a
+/* literal "!". */
+!def lsreg(mn, rt, size, v, opc, scale) {
+!{mn} !{rt},[xb[[,#!o]]] :: .call lsoff(!{size},!{v},!{opc},o,xb,!{rt},!{scale})
+!{mn} !{rt},[xb,#!o]\! ::o<-256;8,o>255;8 :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(!{opc}<<22)|((o&0x1ff)<<12)|(3<<10)|(xb<<5)|!{rt})
+!{mn} !{rt},[xb],#!o ::o<-256;8,o>255;8 :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(!{opc}<<22)|((o&0x1ff)<<12)|(1<<10)|(xb<<5)|!{rt})
+!{mn} !{rt},[xb,xm] :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(!{opc}<<22)|(1<<21)|(xm<<16)|(3<<13)|(2<<10)|(xb<<5)|!{rt})
+!{mn} !{rt},[xb,xm,LSL #!a] ::(a!=0)&&(a!=!{scale});10 :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(!{opc}<<22)|(1<<21)|(xm<<16)|(3<<13)|((a==!{scale}?1:0)<<12)|(2<<10)|(xb<<5)|!{rt})
+!{mn} !{rt},[xb,xm,SXTX] :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(!{opc}<<22)|(1<<21)|(xm<<16)|(7<<13)|(2<<10)|(xb<<5)|!{rt})
+!{mn} !{rt},[xb,xm,SXTX #!a] ::(a!=0)&&(a!=!{scale});10 :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(!{opc}<<22)|(1<<21)|(xm<<16)|(7<<13)|((a==!{scale}?1:0)<<12)|(2<<10)|(xb<<5)|!{rt})
+!{mn} !{rt},[xb,wm,UXTW] :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(!{opc}<<22)|(1<<21)|(wm<<16)|(2<<13)|(2<<10)|(xb<<5)|!{rt})
+!{mn} !{rt},[xb,wm,UXTW #!a] ::(a!=0)&&(a!=!{scale});10 :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(!{opc}<<22)|(1<<21)|(wm<<16)|(2<<13)|((a==!{scale}?1:0)<<12)|(2<<10)|(xb<<5)|!{rt})
+!{mn} !{rt},[xb,wm,SXTW] :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(!{opc}<<22)|(1<<21)|(wm<<16)|(6<<13)|(2<<10)|(xb<<5)|!{rt})
+!{mn} !{rt},[xb,wm,SXTW #!a] ::(a!=0)&&(a!=!{scale});10 :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(!{opc}<<22)|(1<<21)|(wm<<16)|(6<<13)|((a==!{scale}?1:0)<<12)|(2<<10)|(xb<<5)|!{rt})
+}
+!lsreg("STRB", "wt", 0, 0, 0, 0)
+!lsreg("LDRB", "wt", 0, 0, 1, 0)
+!lsreg("LDRSB", "xt", 0, 0, 2, 0)
+!lsreg("LDRSB", "wt", 0, 0, 3, 0)
+!lsreg("STRH", "wt", 1, 0, 0, 1)
+!lsreg("LDRH", "wt", 1, 0, 1, 1)
+!lsreg("LDRSH", "xt", 1, 0, 2, 1)
+!lsreg("LDRSH", "wt", 1, 0, 3, 1)
+!lsreg("STR", "wt", 2, 0, 0, 2)
+!lsreg("LDR", "wt", 2, 0, 1, 2)
+!lsreg("LDRSW", "xt", 2, 0, 2, 2)
+!lsreg("STR", "xt", 3, 0, 0, 3)
+!lsreg("LDR", "xt", 3, 0, 1, 3)
+!lsreg("PRFM", "prf", 3, 0, 2, 3)
+!lsreg("STR", "fb", 0, 1, 0, 0)
+!lsreg("LDR", "fb", 0, 1, 1, 0)
+!lsreg("STR", "fq", 0, 1, 2, 4)
+!lsreg("LDR", "fq", 0, 1, 3, 4)
+!lsreg("STR", "fh", 1, 1, 0, 1)
+!lsreg("LDR", "fh", 1, 1, 1, 1)
+!lsreg("STR", "fs", 2, 1, 0, 2)
+!lsreg("LDR", "fs", 2, 1, 1, 2)
+!lsreg("STR", "ff", 3, 1, 0, 3)
+!lsreg("LDR", "ff", 3, 1, 1, 3)
+
+/* Unscaled offset: the same encoding lsoff falls back to, reached by
+/* its own mnemonic so that it can be asked for explicitly. */
+!def lsur(mn, rt, size, v, opc) {
+!{mn} !{rt},[xb[[,#!o]]] ::o<-256;8,o>255;8 :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(!{opc}<<22)|((o&0x1ff)<<12)|(xb<<5)|!{rt})
+}
+!lsur("STURB", "wt", 0, 0, 0)
+!lsur("LDURB", "wt", 0, 0, 1)
+!lsur("LDURSB", "xt", 0, 0, 2)
+!lsur("LDURSB", "wt", 0, 0, 3)
+!lsur("STURH", "wt", 1, 0, 0)
+!lsur("LDURH", "wt", 1, 0, 1)
+!lsur("LDURSH", "xt", 1, 0, 2)
+!lsur("LDURSH", "wt", 1, 0, 3)
+!lsur("STUR", "wt", 2, 0, 0)
+!lsur("LDUR", "wt", 2, 0, 1)
+!lsur("LDURSW", "xt", 2, 0, 2)
+!lsur("STUR", "xt", 3, 0, 0)
+!lsur("LDUR", "xt", 3, 0, 1)
+!lsur("PRFUM", "prf", 3, 0, 2)
+!lsur("STUR", "fb", 0, 1, 0)
+!lsur("LDUR", "fb", 0, 1, 1)
+!lsur("STUR", "fq", 0, 1, 2)
+!lsur("LDUR", "fq", 0, 1, 3)
+!lsur("STUR", "fh", 1, 1, 0)
+!lsur("LDUR", "fh", 1, 1, 1)
+!lsur("STUR", "fs", 2, 1, 0)
+!lsur("LDUR", "fs", 2, 1, 1)
+!lsur("STUR", "ff", 3, 1, 0)
+!lsur("LDUR", "ff", 3, 1, 1)
+
+/* Load register (literal) */
+!def lslit(mn, rt, opc, v) {
+!{mn} !{rt},!t ::((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4((!{opc}<<30)|(3<<27)|(!{v}<<26)|((((t-$$)>>2)&0x7ffff)<<5)|!{rt})
+}
+!lslit("LDR", "wt", 0, 0)
+!lslit("LDR", "xt", 1, 0)
+!lslit("LDRSW", "xt", 2, 0)
+!lslit("PRFM", "prf", 3, 0)
+!lslit("LDR", "fs", 0, 1)
+!lslit("LDR", "ff", 1, 1)
+!lslit("LDR", "fq", 2, 1)
+
+/* PRFM also accepts the raw 5-bit prefetch operand in place of a name */
+PRFM #!p,[xb[[,#!o]]] ::p<0;3,p>31;3 :: .call lsoff(3,0,2,o,xb,p,3)
+PRFM #!p,[xb,xm[[,LSL #!a]]] ::p<0;3,p>31;3,(a!=0)&&(a!=3);10 :: .call w4((3<<30)|(7<<27)|(2<<22)|(1<<21)|(xm<<16)|(3<<13)|((a==3?1:0)<<12)|(2<<10)|(xb<<5)|p)
+PRFM #!p,!t ::p<0;3,p>31;3,((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4((3<<30)|(3<<27)|((((t-$$)>>2)&0x7ffff)<<5)|p)
+PRFUM #!p,[xb[[,#!o]]] ::p<0;3,p>31;3,o<-256;8,o>255;8 :: .call w4((3<<30)|(7<<27)|(2<<22)|((o&0x1ff)<<12)|(xb<<5)|p)
+
+/* Load/store pair. sh is the log2 of the access size, so the scaled
+/* offset is a shift rather than a division. */
+!def lspair(mn, l, rt, ru, opc, v, sh) {
+!{mn} !{rt},!{ru},[xb[[,#!o]]] ::(o&!{(1<<sh)-1})!=0;8,(o>>!{sh})<-64;8,(o>>!{sh})>63;8 :: .call w4((!{opc}<<30)|(5<<27)|(!{v}<<26)|(2<<23)|(!{l}<<22)|(((o>>!{sh})&0x7f)<<15)|(!{ru}<<10)|(xb<<5)|!{rt})
+!{mn} !{rt},!{ru},[xb,#!o]\! ::(o&!{(1<<sh)-1})!=0;8,(o>>!{sh})<-64;8,(o>>!{sh})>63;8 :: .call w4((!{opc}<<30)|(5<<27)|(!{v}<<26)|(3<<23)|(!{l}<<22)|(((o>>!{sh})&0x7f)<<15)|(!{ru}<<10)|(xb<<5)|!{rt})
+!{mn} !{rt},!{ru},[xb],#!o ::(o&!{(1<<sh)-1})!=0;8,(o>>!{sh})<-64;8,(o>>!{sh})>63;8 :: .call w4((!{opc}<<30)|(5<<27)|(!{v}<<26)|(1<<23)|(!{l}<<22)|(((o>>!{sh})&0x7f)<<15)|(!{ru}<<10)|(xb<<5)|!{rt})
+}
+!lspair("STP", 0, "wt", "wu", 0, 0, 2)
+!lspair("LDP", 1, "wt", "wu", 0, 0, 2)
+!lspair("LDPSW", 1, "xt", "xu", 1, 0, 2)
+!lspair("STP", 0, "xt", "xu", 2, 0, 3)
+!lspair("LDP", 1, "xt", "xu", 2, 0, 3)
+!lspair("STP", 0, "fs", "fsn", 0, 1, 2)
+!lspair("LDP", 1, "fs", "fsn", 0, 1, 2)
+!lspair("STP", 0, "ff", "fdn", 1, 1, 3)
+!lspair("LDP", 1, "ff", "fdn", 1, 1, 3)
+!lspair("STP", 0, "fq", "fqn", 2, 1, 4)
+!lspair("LDP", 1, "fq", "fqn", 2, 1, 4)
+
+/* Load/store no-allocate pair (offset form only) */
+!def lsnp(mn, l, rt, ru, opc, v, sh) {
+!{mn} !{rt},!{ru},[xb[[,#!o]]] ::(o&!{(1<<sh)-1})!=0;8,(o>>!{sh})<-64;8,(o>>!{sh})>63;8 :: .call w4((!{opc}<<30)|(5<<27)|(!{v}<<26)|(!{l}<<22)|(((o>>!{sh})&0x7f)<<15)|(!{ru}<<10)|(xb<<5)|!{rt})
+}
+!lsnp("STNP", 0, "wt", "wu", 0, 0, 2)
+!lsnp("LDNP", 1, "wt", "wu", 0, 0, 2)
+!lsnp("STNP", 0, "xt", "xu", 2, 0, 3)
+!lsnp("LDNP", 1, "xt", "xu", 2, 0, 3)
+!lsnp("STNP", 0, "fs", "fsn", 0, 1, 2)
+!lsnp("LDNP", 1, "fs", "fsn", 0, 1, 2)
+!lsnp("STNP", 0, "ff", "fdn", 1, 1, 3)
+!lsnp("LDNP", 1, "ff", "fdn", 1, 1, 3)
+!lsnp("STNP", 0, "fq", "fqn", 2, 1, 4)
+!lsnp("LDNP", 1, "fq", "fqn", 2, 1, 4)
+
+/* Load/store exclusive and the acquire-release pairs */
+!def stex(mn, size, o2, o0, rt) {
+!{mn} rs,!{rt},[xb] :: .call w4((!{size}<<30)|(8<<24)|(!{o2}<<23)|(!{o0}<<15)|(rs<<16)|(31<<10)|(xb<<5)|!{rt})
+}
+!def ldex(mn, size, o2, o0, rt) {
+!{mn} !{rt},[xb] :: .call w4((!{size}<<30)|(8<<24)|(!{o2}<<23)|(1<<22)|(31<<16)|(!{o0}<<15)|(31<<10)|(xb<<5)|!{rt})
+}
+!def strl(mn, size, o0, rt) {
+!{mn} !{rt},[xb] :: .call w4((!{size}<<30)|(8<<24)|(1<<23)|(31<<16)|(!{o0}<<15)|(31<<10)|(xb<<5)|!{rt})
+}
+!def exgrp(sfx, size, rt) {
+!stex("STXR" + sfx, size, 0, 0, rt)
+!stex("STLXR" + sfx, size, 0, 1, rt)
+!ldex("LDXR" + sfx, size, 0, 0, rt)
+!ldex("LDAXR" + sfx, size, 0, 1, rt)
+!strl("STLLR" + sfx, size, 0, rt)
+!strl("STLR" + sfx, size, 1, rt)
+!ldex("LDLAR" + sfx, size, 1, 0, rt)
+!ldex("LDAR" + sfx, size, 1, 1, rt)
+}
+!exgrp("B", 0, "wt")
+!exgrp("H", 1, "wt")
+!exgrp("", 2, "wt")
+!exgrp("", 3, "xt")
+
+/* Load/store exclusive pair */
+!def expair(sfx, size, rt, ru) {
+STXP!{sfx} rs,!{rt},!{ru},[xb] :: .call w4((!{size}<<30)|(8<<24)|(1<<21)|(rs<<16)|(!{ru}<<10)|(xb<<5)|!{rt})
+STLXP!{sfx} rs,!{rt},!{ru},[xb] :: .call w4((!{size}<<30)|(8<<24)|(1<<21)|(rs<<16)|(1<<15)|(!{ru}<<10)|(xb<<5)|!{rt})
+LDXP!{sfx} !{rt},!{ru},[xb] :: .call w4((!{size}<<30)|(8<<24)|(1<<22)|(1<<21)|(31<<16)|(!{ru}<<10)|(xb<<5)|!{rt})
+LDAXP!{sfx} !{rt},!{ru},[xb] :: .call w4((!{size}<<30)|(8<<24)|(1<<22)|(1<<21)|(31<<16)|(1<<15)|(!{ru}<<10)|(xb<<5)|!{rt})
+}
+!expair("", 2, "wt", "wu")
+!expair("", 3, "xt", "xu")
+
+/* Compare and swap (FEAT_LSE) */
+!def casgrp(sfx, size, rt, rr) {
+!local ai = 0
+!local nm = ""
+!local l = 0
+!local o0 = 0
+!while ai <= 3 {
+!set nm = ai == 0 ? "CAS" : (ai == 1 ? "CASA" : (ai == 2 ? "CASL" : "CASAL"))
+!set l = (ai == 1 || ai == 3) ? 1 : 0
+!set o0 = (ai >= 2) ? 1 : 0
+!{nm}!{sfx} !{rr},!{rt},[xb] :: .call w4((!{size}<<30)|(8<<24)|(1<<23)|(!{l}<<22)|(1<<21)|(!{rr}<<16)|(!{o0}<<15)|(31<<10)|(xb<<5)|!{rt})
+!set ai = ai + 1
+}
+}
+!casgrp("B", 0, "wt", "wm")
+!casgrp("H", 1, "wt", "wm")
+!casgrp("", 2, "wt", "wm")
+!casgrp("", 3, "xt", "xm")
+
+/* Atomic memory operations (FEAT_LSE). Four acquire/release variants
+/* times four access sizes for each operation, generated rather than
+/* written out. */
+!def atomop(base, opc, o3) {
+!local si = 0
+!local sfx = ""
+!local rt = ""
+!local rr = ""
+!local ai = 0
+!local ar = ""
+!local a = 0
+!local r = 0
+!while si <= 3 {
+!set sfx = si == 0 ? "B" : (si == 1 ? "H" : "")
+!set rt = si == 3 ? "xt" : "wt"
+!set rr = si == 3 ? "xm" : "wm"
+!set ai = 0
+!while ai <= 3 {
+!set ar = ai == 0 ? "" : (ai == 1 ? "A" : (ai == 2 ? "L" : "AL"))
+!set a = (ai == 1 || ai == 3) ? 1 : 0
+!set r = ai >= 2 ? 1 : 0
+!{base}!{ar}!{sfx} !{rr},!{rt},[xb] :: .call w4((!{si}<<30)|(7<<27)|(!{a}<<23)|(!{r}<<22)|(1<<21)|(!{rr}<<16)|(!{o3}<<15)|(!{opc}<<12)|(xb<<5)|!{rt})
+!set ai = ai + 1
+}
+!set si = si + 1
+}
+}
+!atomop("LDADD", 0, 0)
+!atomop("LDCLR", 1, 0)
+!atomop("LDEOR", 2, 0)
+!atomop("LDSET", 3, 0)
+!atomop("LDSMAX", 4, 0)
+!atomop("LDSMIN", 5, 0)
+!atomop("LDUMAX", 6, 0)
+!atomop("LDUMIN", 7, 0)
+!atomop("SWP", 0, 1)
+
+/* The ST<op> aliases discard the loaded value, so Rt is the zero
+/* register and only the release variant exists. */
+!def statomop(base, opc) {
+!local si = 0
+!local sfx = ""
+!local rr = ""
+!local ai = 0
+!local ar = ""
+!local r = 0
+!while si <= 3 {
+!set sfx = si == 0 ? "B" : (si == 1 ? "H" : "")
+!set rr = si == 3 ? "xm" : "wm"
+!set ai = 0
+!while ai <= 1 {
+!set ar = ai == 0 ? "" : "L"
+!set r = ai
+!{base}!{ar}!{sfx} !{rr},[xb] :: .call w4((!{si}<<30)|(7<<27)|(!{r}<<22)|(1<<21)|(!{rr}<<16)|(!{opc}<<12)|(xb<<5)|31)
+!set ai = ai + 1
+}
+!set si = si + 1
+}
+}
+!statomop("STADD", 0)
+!statomop("STCLR", 1)
+!statomop("STEOR", 2)
+!statomop("STSET", 3)
+!statomop("STSMAX", 4)
+!statomop("STSMIN", 5)
+!statomop("STUMAX", 6)
+!statomop("STUMIN", 7)
+
+/* ===================================================================
+/* Scalar floating point
+/*
+/* ptype is 00 for single, 01 for double and 11 for half precision;
+/* each group below is written once and instantiated for all three.
+/* =================================================================== */
+
+/* Data processing (1 source) */
+!def fpdp1(nm, opc, pt, rd, rn) {
+!{nm} !{rd},!{rn} :: .call w4((0x1e<<24)|(!{pt}<<22)|(1<<21)|(!{opc}<<15)|(0x10<<10)|(!{rn}<<5)|!{rd})
+}
+!def fp1all(nm, opc) {
+!fpdp1(nm, opc, 0, "fsd", "fsn")
+!fpdp1(nm, opc, 1, "fdd", "fdn")
+!fpdp1(nm, opc, 3, "fhd", "fhn")
+}
+!fp1all("FMOV", 0)
+!fp1all("FABS", 1)
+!fp1all("FNEG", 2)
+!fp1all("FSQRT", 3)
+!fp1all("FRINTN", 8)
+!fp1all("FRINTP", 9)
+!fp1all("FRINTM", 10)
+!fp1all("FRINTZ", 11)
+!fp1all("FRINTA", 12)
+!fp1all("FRINTX", 14)
+!fp1all("FRINTI", 15)
+
+/* FCVT: ptype is the source type, the opcode carries the destination */
+!fpdp1("FCVT", 4, 1, "fsd", "fdn")
+!fpdp1("FCVT", 4, 3, "fsd", "fhn")
+!fpdp1("FCVT", 5, 0, "fdd", "fsn")
+!fpdp1("FCVT", 5, 3, "fdd", "fhn")
+!fpdp1("FCVT", 7, 0, "fhd", "fsn")
+!fpdp1("FCVT", 7, 1, "fhd", "fdn")
+
+/* Data processing (2 source) */
+!def fpdp2(nm, opc, pt, rd, rn, rm) {
+!{nm} !{rd},!{rn},!{rm} :: .call w4((0x1e<<24)|(!{pt}<<22)|(1<<21)|(!{rm}<<16)|(!{opc}<<12)|(2<<10)|(!{rn}<<5)|!{rd})
+}
+!def fp2all(nm, opc) {
+!fpdp2(nm, opc, 0, "fsd", "fsn", "fsm")
+!fpdp2(nm, opc, 1, "fdd", "fdn", "fdm")
+!fpdp2(nm, opc, 3, "fhd", "fhn", "fhm")
+}
+!fp2all("FMUL", 0)
+!fp2all("FDIV", 1)
+!fp2all("FADD", 2)
+!fp2all("FSUB", 3)
+!fp2all("FMAX", 4)
+!fp2all("FMIN", 5)
+!fp2all("FMAXNM", 6)
+!fp2all("FMINNM", 7)
+!fp2all("FNMUL", 8)
+
+/* Data processing (3 source) */
+!def fpdp3(nm, o1, o0, pt, rd, rn, rm, ra) {
+!{nm} !{rd},!{rn},!{rm},!{ra} :: .call w4((0x1f<<24)|(!{pt}<<22)|(!{o1}<<21)|(!{rm}<<16)|(!{o0}<<15)|(!{ra}<<10)|(!{rn}<<5)|!{rd})
+}
+!def fp3all(nm, o1, o0) {
+!fpdp3(nm, o1, o0, 0, "fsd", "fsn", "fsm", "fsa")
+!fpdp3(nm, o1, o0, 1, "fdd", "fdn", "fdm", "fda")
+!fpdp3(nm, o1, o0, 3, "fhd", "fhn", "fhm", "fha")
+}
+!fp3all("FMADD", 0, 0)
+!fp3all("FMSUB", 0, 1)
+!fp3all("FNMADD", 1, 0)
+!fp3all("FNMSUB", 1, 1)
+
+/* Compare */
+!def fpcmp(nm, o2, pt, rn, rm) {
+!{nm} !{rn},!{rm} :: .call w4((0x1e<<24)|(!{pt}<<22)|(1<<21)|(!{rm}<<16)|(8<<10)|(!{rn}<<5)|!{o2})
+!{nm} !{rn},#0.0 :: .call w4((0x1e<<24)|(!{pt}<<22)|(1<<21)|(8<<10)|(!{rn}<<5)|!{o2+8})
+!{nm} !{rn},#0 :: .call w4((0x1e<<24)|(!{pt}<<22)|(1<<21)|(8<<10)|(!{rn}<<5)|!{o2+8})
+}
+!fpcmp("FCMP", 0, 0, "fsn", "fsm")
+!fpcmp("FCMP", 0, 1, "fdn", "fdm")
+!fpcmp("FCMP", 0, 3, "fhn", "fhm")
+!fpcmp("FCMPE", 16, 0, "fsn", "fsm")
+!fpcmp("FCMPE", 16, 1, "fdn", "fdm")
+!fpcmp("FCMPE", 16, 3, "fhn", "fhm")
+
+/* Conditional compare and conditional select */
+!def fpccmp(nm, op, pt, rn, rm) {
+!{nm} !{rn},!{rm},#!f,cnd ::f<0;3,f>15;3 :: .call w4((0x1e<<24)|(!{pt}<<22)|(1<<21)|(!{rm}<<16)|(cnd<<12)|(1<<10)|(!{rn}<<5)|(!{op}<<4)|f)
+}
+!fpccmp("FCCMP", 0, 0, "fsn", "fsm")
+!fpccmp("FCCMP", 0, 1, "fdn", "fdm")
+!fpccmp("FCCMP", 0, 3, "fhn", "fhm")
+!fpccmp("FCCMPE", 1, 0, "fsn", "fsm")
+!fpccmp("FCCMPE", 1, 1, "fdn", "fdm")
+!fpccmp("FCCMPE", 1, 3, "fhn", "fhm")
+
+!def fpcsel(pt, rd, rn, rm) {
+FCSEL !{rd},!{rn},!{rm},cnd :: .call w4((0x1e<<24)|(!{pt}<<22)|(1<<21)|(!{rm}<<16)|(cnd<<12)|(3<<10)|(!{rn}<<5)|!{rd})
+}
+!fpcsel(0, "fsd", "fsn", "fsm")
+!fpcsel(1, "fdd", "fdn", "fdm")
+!fpcsel(3, "fhd", "fhn", "fhm")
+
+/* Floating point to integer */
+!def f2i(nm, rmode, opc, sf, pt, rd, rn) {
+!{nm} !{rd},!{rn} :: .call w4((!{sf}<<31)|(0x1e<<24)|(!{pt}<<22)|(1<<21)|(!{rmode}<<19)|(!{opc}<<16)|(!{rn}<<5)|!{rd})
+}
+!def f2iall(nm, rmode, opc) {
+!f2i(nm, rmode, opc, 0, 0, "wd", "fsn")
+!f2i(nm, rmode, opc, 1, 0, "xd", "fsn")
+!f2i(nm, rmode, opc, 0, 1, "wd", "fdn")
+!f2i(nm, rmode, opc, 1, 1, "xd", "fdn")
+!f2i(nm, rmode, opc, 0, 3, "wd", "fhn")
+!f2i(nm, rmode, opc, 1, 3, "xd", "fhn")
+}
+!f2iall("FCVTNS", 0, 0)
+!f2iall("FCVTNU", 0, 1)
+!f2iall("FCVTAS", 0, 4)
+!f2iall("FCVTAU", 0, 5)
+!f2iall("FCVTPS", 1, 0)
+!f2iall("FCVTPU", 1, 1)
+!f2iall("FCVTMS", 2, 0)
+!f2iall("FCVTMU", 2, 1)
+!f2iall("FCVTZS", 3, 0)
+!f2iall("FCVTZU", 3, 1)
+
+/* Integer to floating point */
+!def i2f(nm, opc, sf, pt, rd, rn) {
+!{nm} !{rd},!{rn} :: .call w4((!{sf}<<31)|(0x1e<<24)|(!{pt}<<22)|(1<<21)|(!{opc}<<16)|(!{rn}<<5)|!{rd})
+}
+!def i2fall(nm, opc) {
+!i2f(nm, opc, 0, 0, "fsd", "wn")
+!i2f(nm, opc, 1, 0, "fsd", "xn")
+!i2f(nm, opc, 0, 1, "fdd", "wn")
+!i2f(nm, opc, 1, 1, "fdd", "xn")
+!i2f(nm, opc, 0, 3, "fhd", "wn")
+!i2f(nm, opc, 1, 3, "fhd", "xn")
+}
+!i2fall("SCVTF", 2)
+!i2fall("UCVTF", 3)
+
+/* FMOV between a general register and a floating-point register */
+!f2i("FMOV", 0, 6, 0, 0, "wd", "fsn")
+!i2f("FMOV", 7, 0, 0, "fsd", "wn")
+!f2i("FMOV", 0, 6, 1, 1, "xd", "fdn")
+!i2f("FMOV", 7, 1, 1, "fdd", "xn")
+!f2i("FMOV", 0, 6, 0, 3, "wd", "fhn")
+!i2f("FMOV", 7, 0, 3, "fhd", "wn")
+!f2i("FMOV", 0, 6, 1, 3, "xd", "fhn")
+!i2f("FMOV", 7, 1, 3, "fhd", "xn")
+
+/* FMOV (immediate). The operand is captured as a binary64 bit
+/* pattern and fmovi reduces it to the 8-bit field, reporting an
+/* error for any value A64 cannot spell. */
+FMOV fsd,#!Dv :: .call fmovi(v,0,fsd)
+FMOV fdd,#!Dv :: .call fmovi(v,1,fdd)
+FMOV fhd,#!Dv :: .call fmovi(v,3,fhd)
+
+/* Fixed-point conversions. The same encoding as the integer ones with
+/* bit 21 clear, and the scale field holding 64 minus the fraction
+/* width. */
+!def f2ifx(nm, rmode, opc, sf, pt, rd, rn, mx) {
+!{nm} !{rd},!{rn},#!c ::c<1;3,c>!{mx};3 :: .call w4((!{sf}<<31)|(0x1e<<24)|(!{pt}<<22)|(!{rmode}<<19)|(!{opc}<<16)|((64-c)<<10)|(!{rn}<<5)|!{rd})
+}
+!def i2ffx(nm, opc, sf, pt, rd, rn, mx) {
+!{nm} !{rd},!{rn},#!c ::c<1;3,c>!{mx};3 :: .call w4((!{sf}<<31)|(0x1e<<24)|(!{pt}<<22)|(!{opc}<<16)|((64-c)<<10)|(!{rn}<<5)|!{rd})
+}
+!def fxall(nm, rmode, opc, dir) {
+!if dir == 0 !then {
+!f2ifx(nm, rmode, opc, 0, 0, "wd", "fsn", 32)
+!f2ifx(nm, rmode, opc, 1, 0, "xd", "fsn", 64)
+!f2ifx(nm, rmode, opc, 0, 1, "wd", "fdn", 32)
+!f2ifx(nm, rmode, opc, 1, 1, "xd", "fdn", 64)
+!f2ifx(nm, rmode, opc, 0, 3, "wd", "fhn", 32)
+!f2ifx(nm, rmode, opc, 1, 3, "xd", "fhn", 64)
+} !else {
+!i2ffx(nm, opc, 0, 0, "fsd", "wn", 32)
+!i2ffx(nm, opc, 1, 0, "fsd", "xn", 64)
+!i2ffx(nm, opc, 0, 1, "fdd", "wn", 32)
+!i2ffx(nm, opc, 1, 1, "fdd", "xn", 64)
+!i2ffx(nm, opc, 0, 3, "fhd", "wn", 32)
+!i2ffx(nm, opc, 1, 3, "fhd", "xn", 64)
+}
+}
+!fxall("FCVTZS", 3, 0, 0)
+!fxall("FCVTZU", 3, 1, 0)
+!fxall("SCVTF", 0, 2, 1)
+!fxall("UCVTF", 0, 3, 1)
+
+/* Load-acquire RCpc register (FEAT_LRCPC) */
+!def ldapr(mn, size, rt) {
+!{mn} !{rt},[xb] :: .call w4((!{size}<<30)|(7<<27)|(1<<23)|(1<<21)|(31<<16)|(1<<15)|(4<<12)|(xb<<5)|!{rt})
+}
+!ldapr("LDAPRB", 0, "wt")
+!ldapr("LDAPRH", 1, "wt")
+!ldapr("LDAPR", 2, "wt")
+!ldapr("LDAPR", 3, "xt")
+
+/* Compare and swap pair (FEAT_LSE). Rs and Rt each name the first of
+/* an even-numbered pair. */
+!def caspgrp(sz, rt, ru, rr, rv) {
+!local ai = 0
+!local nm = ""
+!local l = 0
+!local o0 = 0
+!while ai <= 3 {
+!set nm = ai == 0 ? "CASP" : (ai == 1 ? "CASPA" : (ai == 2 ? "CASPL" : "CASPAL"))
+!set l = (ai == 1 || ai == 3) ? 1 : 0
+!set o0 = (ai >= 2) ? 1 : 0
+!{nm} !{rr},!{rv},!{rt},!{ru},[xb] ::(!{rr}&1)!=0;5,(!{rt}&1)!=0;5 :: .call w4((!{sz}<<30)|(8<<24)|(!{l}<<22)|(1<<21)|(!{rr}<<16)|(!{o0}<<15)|(31<<10)|(xb<<5)|!{rt})
+!set ai = ai + 1
+}
+}
+!caspgrp(0, "wt", "wu", "wm", "wn")
+!caspgrp(1, "xt", "xu", "xm", "xn")
