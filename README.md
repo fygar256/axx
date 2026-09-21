@@ -66,9 +66,9 @@ It has assignment, `.if`/`.elif`, `.while`, `.for`, recursion, arrays, and `.ech
 
 ## What's covered today
 
-Bundled and working: **x86_64** (x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512), **AArch64** (the A64 scalar set — data processing, branches, system, loads and stores, LSE atomics and scalar floating point; Advanced SIMD, SVE and SME are not covered), **Motorola 6809 / 68000 / 6800**, **MOS 6502**, **Zilog Z80**, **Intel 8080 / 8051 / 8048 / 4004**.
+Bundled and working: **x86_64** (x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512), **AArch64** (the A64 instruction set — data processing, branches, system, loads and stores, scalar floating point, Advanced SIMD, cryptography and the scalar extensions; SVE, SVE2 and SME are not covered), **Motorola 6809 / 68000 / 6800**, **MOS 6502**, **Zilog Z80**, **Intel 8080 / 8051 / 8048 / 4004**.
 
-ARM (A32/T32), RISC-V, PowerPC, MIPS and SPARC don't have pattern files yet, and AArch64's covers the scalar set but not Advanced SIMD or SVE. That's not a design limitation — it's a labor constraint: the author doesn't currently have real hardware or emulators to validate against, and doing it solo is more than one person wants to take on. The pattern-file format itself is fully documented, and there's nothing architecture-specific stopping someone from writing one. The pattern layer proper is deliberately Turing-incomplete, which is what guarantees pattern matching terminates; where an encoding genuinely needs computation, the mini language above is the escape hatch, and it is invoked only from output fields that ask for it by name.
+ARM (A32/T32), RISC-V, PowerPC, MIPS and SPARC don't have pattern files yet, and AArch64's covers all of A64 but not SVE, SVE2 or SME. That's not a design limitation — it's a labor constraint: the author doesn't currently have real hardware or emulators to validate against, and doing it solo is more than one person wants to take on. The pattern-file format itself is fully documented, and there's nothing architecture-specific stopping someone from writing one. The pattern layer proper is deliberately Turing-incomplete, which is what guarantees pattern matching terminates; where an encoding genuinely needs computation, the mini language above is the escape hatch, and it is invoked only from output fields that ask for it by name.
 
 ## How it compares
 
@@ -95,7 +95,7 @@ axx z80.axx z80.s -v              # assemble the Z80 sample, print the listing
 axx x86_64.axx hello.s -o out.o   # assemble x86_64 hello-world into an ELF object
 ```
 
-Pattern files for ARM (A32/T32), RISC-V, PowerPC, MIPS and SPARC don't exist yet, and AArch64's stops short of Advanced SIMD and SVE. Getting there — including real hardware/emulator validation — is more than one person can reasonably do alone. If you're interested in taking on one of those, that's where help would matter most.
+Pattern files for ARM (A32/T32), RISC-V, PowerPC, MIPS and SPARC don't exist yet, and AArch64's stops short of SVE. Getting there — including real hardware/emulator validation — is more than one person can reasonably do alone. If you're interested in taking on one of those, that's where help would matter most.
 
 ---
 

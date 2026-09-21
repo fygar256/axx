@@ -281,6 +281,183 @@ here:
         casp    w0, w1, w2, w3, [x4]
         caspal  x2, x3, x4, x5, [x6]
 
+; ---- Advanced SIMD: three same, two-register misc ----
+        add     v0.16b, v1.16b, v2.16b
+        sub     v0.2d, v1.2d, v2.2d
+        sqadd   v0.8h, v1.8h, v2.8h
+        umax    v0.4s, v1.4s, v2.4s
+        cmgt    v0.2d, v1.2d, v2.2d
+        mul     v0.4h, v1.4h, v2.4h
+        and     v0.8b, v1.8b, v2.8b
+        bsl     v0.16b, v1.16b, v2.16b
+        orn     v0.16b, v1.16b, v2.16b
+        mov     v0.16b, v1.16b
+        fadd    v0.4s, v1.4s, v2.4s
+        fmla    v0.2d, v1.2d, v2.2d
+        fdiv    v0.8h, v1.8h, v2.8h
+        facgt   v0.4s, v1.4s, v2.4s
+        sqrdmlah v0.4s, v1.4s, v2.4s
+        rev64   v0.4s, v1.4s
+        cnt     v0.16b, v1.16b
+        not     v0.8b, v1.8b
+        rbit    v0.16b, v1.16b
+        clz     v0.4s, v1.4s
+        abs     v0.2d, v1.2d
+        cmeq    v0.8h, v1.8h, #0
+        fcmlt   v0.4s, v1.4s, #0
+        fabs    v0.2d, v1.2d
+        fcvtzs  v0.4h, v1.4h
+        scvtf   v0.4s, v1.4s
+        frint64x v0.2d, v1.2d
+
+; ---- SIMD widening, narrowing, pairwise, three-different ----
+        saddlp  v0.4s, v1.8h
+        uadalp  v0.2d, v1.4s
+        xtn     v0.8b, v1.8h
+        xtn2    v0.16b, v1.8h
+        sqxtun  v0.4h, v1.4s
+        fcvtn   v0.4h, v1.4s
+        fcvtl2  v0.2d, v1.4s
+        shll    v0.4s, v1.4h, #16
+        smull   v0.4s, v1.4h, v2.4h
+        umlal2  v0.2d, v1.4s, v2.4s
+        sqdmull v0.4s, v1.4h, v2.4h
+        saddw   v0.8h, v1.8h, v2.8b
+        raddhn  v0.2s, v1.2d, v2.2d
+        pmull   v0.8h, v1.8b, v2.8b
+        pmull2  v0.1q, v1.2d, v2.2d
+
+; ---- SIMD across lanes, permute, extract, table ----
+        addv    b0, v1.16b
+        saddlv  s0, v1.8h
+        fmaxnmv s0, v1.4s
+        fminv   h0, v1.8h
+        zip1    v0.4s, v1.4s, v2.4s
+        uzp2    v0.2d, v1.2d, v2.2d
+        trn1    v0.8b, v1.8b, v2.8b
+        ext     v0.16b, v1.16b, v2.16b, #7
+        tbl     v0.8b, {v30.16b}, v2.8b
+        tbl     v0.16b, {v30.16b, v31.16b}, v2.16b
+        tbx     v0.16b, {v28.16b, v29.16b, v30.16b, v31.16b}, v2.16b
+
+; ---- SIMD copy and modified immediate ----
+        dup     v0.4s, v1.s[2]
+        dup     v0.2d, x1
+        dup     b0, v1.b[9]
+        smov    x0, v1.h[3]
+        umov    w0, v1.s[1]
+        ins     v0.d[1], x1
+        mov     v0.b[7], v1.b[2]
+        movi    v0.16b, #0xab
+        movi    v0.4s, #0x12, lsl #16
+        movi    v0.4s, #0x12, msl #8
+        mvni    v0.8h, #0x34, lsl #8
+        orr     v0.4s, #0x56
+        bic     v0.8h, #0x78, lsl #8
+        movi    v0.2d, #0xff00ff00ff00ff00
+        movi    d0, #0xffff0000ffff0000
+        fmov    v0.4s, #1.0
+        fmov    v0.2d, #-0.125
+        fmov    v0.8h, #31.0
+
+; ---- SIMD shift by immediate, by element ----
+        sshr    v0.16b, v1.16b, #3
+        urshr   v0.2d, v1.2d, #64
+        sli     v0.4h, v1.4h, #5
+        sqshlu  v0.4s, v1.4s, #31
+        shrn2   v0.8h, v1.4s, #16
+        sqrshrun v0.2s, v1.2d, #1
+        sshll   v0.2d, v1.2s, #7
+        uxtl2   v0.8h, v1.16b
+        scvtf   v0.4s, v1.4s, #4
+        fcvtzu  v0.2d, v1.2d, #64
+        mul     v0.8h, v1.8h, v15.h[7]
+        mla     v0.4s, v1.4s, v31.s[3]
+        fmla    v0.2d, v1.2d, v31.d[1]
+        fmulx   v0.4h, v1.4h, v15.h[5]
+        smlal2  v0.2d, v1.4s, v31.s[2]
+        sqdmull v0.4s, v1.4h, v15.h[1]
+        sdot    v0.4s, v1.16b, v31.4b[3]
+
+; ---- SIMD load and store structures ----
+        ld1     {v0.16b}, [x1]
+        ld1     {v0.8h, v1.8h}, [x1], #32
+        st1     {v0.4s, v1.4s, v2.4s}, [x1], x3
+        ld2     {v0.2d, v1.2d}, [x1]
+        st3     {v0.8b, v1.8b, v2.8b}, [x1], #24
+        ld4     {v0.4h, v1.4h, v2.4h, v3.4h}, [x1], x3
+        ld1     {v0.b}[15], [x1]
+        st2     {v0.s, v1.s}[3], [x1], #8
+        ld4     {v0.d, v1.d, v2.d, v3.d}[1], [x1], x3
+        ld1r    {v0.4s}, [x1]
+        ld3r    {v0.8h, v1.8h, v2.8h}, [x1], #6
+
+; ---- SIMD scalar forms ----
+        add     d0, d1, d2
+        sqadd   b0, b1, b2
+        sqdmulh h0, h1, h2
+        facge   s0, s1, s2
+        fabd    d0, d1, d2
+        sqabs   s0, s1
+        cmle    d0, d1, #0
+        fcvtzs  h0, h1
+        frecpx  s0, s1
+        sqxtn   b0, h1
+        addp    d0, v1.2d
+        faddp   s0, v1.2s
+        sshr    d0, d1, #7
+        sqshrn  h0, s1, #16
+        ucvtf   d0, d1, #32
+        sqdmlal s0, h1, h2
+        sqdmulh h0, h1, v15.h[6]
+        fmla    d0, d1, v31.d[1]
+
+; ---- cryptography, complex arithmetic, matrix multiply ----
+        aese    v0.16b, v1.16b
+        sha1c   q0, s1, v2.4s
+        sha256h2 q0, q1, v2.4s
+        sha512su1 v0.2d, v1.2d, v2.2d
+        eor3    v0.16b, v1.16b, v2.16b, v3.16b
+        xar     v0.2d, v1.2d, v2.2d, #13
+        sm3tt1a v0.4s, v1.4s, v2.s[2]
+        sm4e    v0.4s, v1.4s
+        fcadd   v0.4s, v1.4s, v2.4s, #270
+        fcmla   v0.2d, v1.2d, v2.2d, #180
+        fcmla   v0.4s, v1.4s, v2.s[1], #90
+        fmlal   v0.4s, v1.4h, v2.4h
+        fmlsl2  v0.2s, v1.2h, v2.h[5]
+        smmla   v0.4s, v1.16b, v2.16b
+        usdot   v0.4s, v1.16b, v31.4b[2]
+        bfdot   v0.4s, v1.8h, v2.8h
+        bfmlalt v0.4s, v1.8h, v2.h[7]
+        bfcvtn2 v0.8h, v1.4s
+
+; ---- pointer authentication, memory tagging, MOPS ----
+        pacia   x0, x1
+        pacia   x0, sp
+        autdzb  x0
+        xpaci   x0
+        braa    x0, x1
+        retab
+        ldraa   x0, [x1, #8]!
+        addg    x0, x1, #16, #3
+        irg     x0, x1, x2
+        subps   x0, x1, x2
+        stg     x0, [x1, #16]!
+        st2g    x0, [x1], #16
+        ldg     x0, [x1, #-16]
+        stgp    x0, x1, [x2, #16]
+        cpyfprn [x0]!, [x1]!, x2!
+        setgpt  [x0]!, x1!, x2
+        ldapursw x0, [x1, #-4]
+        stlurh  w0, [x1, #2]
+        fjcvtzs w0, d1
+        ld64b   x2, [x1]
+        rmif    x0, #13, #7
+        setf8   w0
+        axflag
+        chkfeat x16
+
 ; ---- forward references resolve through the relaxation loop ----
         b       tail
         adr     x2, tail

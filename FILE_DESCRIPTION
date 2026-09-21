@@ -17,11 +17,14 @@ File description
 8080.s                              test assemble file for 8080
 4004.axx                            pattern file for 4004
 4004.s                              test assemble file for 4004
-aarch64.axx                         pattern file for the AArch64 (A64) scalar
-                                    instruction set: data processing, branches,
-                                    system, loads and stores, LSE atomics and
-                                    scalar floating point. Advanced SIMD, SVE,
-                                    SME and MTE are not covered
+aarch64.axx                         pattern file for the AArch64 (A64) instruction
+                                    set: data processing, branches, system,
+                                    loads and stores, scalar floating point,
+                                    Advanced SIMD (vector and scalar),
+                                    cryptography, and the scalar extensions
+                                    (PAuth, MTE, MOPS, FCMA, dot product,
+                                    BFloat16, matrix multiply, LS64). SVE, SVE2
+                                    and SME are not covered
 aarch64.s                           test assemble file for aarch64.axx
 aarch64_logical.axx                 pattern file for the AArch64 logical (immediate)
                                     group, AND/ORR/EOR/ANDS/TST, 32 and 64 bit.
