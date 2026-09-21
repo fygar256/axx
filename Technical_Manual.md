@@ -368,9 +368,33 @@ the whole word is a label after all — so `aB` and `a.b` still read as labels,
 while `a1` and `var_2` are variables. A label a pattern line has to name must
 therefore carry an upper-case letter or a `.` somewhere in it.
 
+**A separator that is itself a name character.** Because `_` continues a
+variable name, an underscore written in `instruction` directly after a capture
+is swallowed by that name rather than matched as text. In
+
+```
+MRS xt,S!S{{tbl}}a_Z
+```
+
+the name reads as `a_`, the separator disappears, and `mrs x0,s3_z` no longer
+matches. Escaping it ends the name and matches the underscore literally:
+
+```
+MRS xt,S!S{{tbl}}a\_Z          /* matches mrs x0,s3_z */
+```
+
+The same escape is what separates two expression captures, since a numeric
+literal also accepts `_` as a digit separator — `!v_!w` reads `3_5` as the
+single number 35, while `!v\_!w` reads it as 3 and 5. This applies to every
+kind of capture: a symbol placeholder, `!x`, `!!x` and `!S{{name}}x` alike.
+An underscore that is not preceded by a capture needs no escape, and a
+`.setsym` name containing one — `TPIDR_EL0` — is unaffected, because `_` is in
+the default symbol character set and the whole word is one symbol.
+
 Assembly lines are case-insensitive except for labels and section names.
 
-The escape character `\` may be used inside `instruction`.
+The escape character `\` may be used inside `instruction`; see
+[section 3.12](#312-escapes-in-expressions).
 
 ### 3.4 error_patterns
 
@@ -1151,6 +1175,22 @@ LEAQ r,(s+t*!!h+!!i) :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
 ```
 
 matches the parenthesized form `leaq rax,(rax+rbx*(2+2)+0x40)`.
+
+The escape also ends a **name** that would otherwise run on. A variable name
+continues over lowercase letters, digits and `_`, and a numeric literal accepts
+`_` between digits, so an underscore meant as a separator has to be escaped
+where a capture precedes it:
+
+```
+MRS xt,S!S{{p0}}a\_!S{{d8}}b\_C!S{{d16}}c\_C!S{{d16}}e\_!S{{d8}}f
+T   xt,!v\_!w
+```
+
+The first matches `mrs x0,s3_3_c4_c2_0`, binding the five fields separately;
+the second matches `t x0,3_5` as 3 and 5 rather than as the number 35. Written
+without the escapes, both lose the separator. `aarch64.axx` uses the first form
+for the generic system-register spelling. Section
+[3.3](#33-case-and-variables) has the rule this follows from.
 
 ### 3.13 Negative index displacements
 

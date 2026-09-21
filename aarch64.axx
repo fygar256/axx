@@ -38,6 +38,14 @@
 /* immediate alias choice, the scaled/unscaled load-store offset
 /* choice, and the 8-bit floating-point immediate.
 /*
+/* A note on the escape: in the generic system-register spelling
+/* S<op0>_<op1>_C<Cn>_C<Cm>_<op2>, each separating underscore is
+/* written "\_". A bare "_" placed right after a capture would be
+/* read as part of the variable name, because "_" is a variable-name
+/* character, and the separator would be lost. The same applies to an
+/* expression capture, where "!v_!w" reads "3_5" as the single number
+/* 35 -- "!v\_!w" reads it as 3 and 5.
+/*
 /* A note on names: every register, condition code, shift kind, extend
 /* kind, barrier option, prefetch operation, system register and
 /* cache/TLB operation below is a pattern-file symbol, and axx does not
@@ -1048,26 +1056,27 @@ CFINV :: .call w4(0xd500401f)
 
 MRS xt,sysr :: .call w4(0xd5300000|(sysr<<5)|xt)
 MSR sysw,xt :: .call w4(0xd5100000|(sysw<<5)|xt)
-MRS xt,S!S{{sop0}}a!S{{sd8}}bC!S{{sd16}}cC!S{{sd16}}e!S{{sd8x}}f :: .call w4(0xd5300000|((a-2)<<19)|(b<<16)|(c<<12)|(e<<8)|(f<<5)|xt)
-MSR S!S{{sop0}}a!S{{sd8}}bC!S{{sd16}}cC!S{{sd16}}e!S{{sd8x}}f,xt :: .call w4(0xd5100000|((a-2)<<19)|(b<<16)|(c<<12)|(e<<8)|(f<<5)|xt)
+MRS xt,S!S{{sop0}}a\_!S{{sd8}}b\_C!S{{sd16}}c\_C!S{{sd16}}e\_!S{{sd8}}f :: .call w4(0xd5300000|((a-2)<<19)|(b<<16)|(c<<12)|(e<<8)|(f<<5)|xt)
+MSR S!S{{sop0}}a\_!S{{sd8}}b\_C!S{{sd16}}c\_C!S{{sd16}}e\_!S{{sd8}}f,xt :: .call w4(0xd5100000|((a-2)<<19)|(b<<16)|(c<<12)|(e<<8)|(f<<5)|xt)
 
-/* Digit tables for the generic system-register spelling. The trailing
-/* "_" of each field belongs to the table entry, not to the pattern:
-/* a variable name written right after a capture would otherwise eat
-/* the underscore, since "_" is a variable-name character. */
-!def dtab(nm, hi, suf) {
+/* Digit tables for the generic system-register spelling. Each "_"
+/* between the fields is written "\_" in the pattern above: a bare
+/* "_" right after a capture would be taken as part of the variable
+/* name, since "_" is a variable-name character, and the separator
+/* would vanish. The escape ends the name and matches the underscore
+/* literally (Technical_Manual.md section 3.12). */
+!def dtab(nm, lo, hi) {
 .sub::!{nm}
 !local i = hi
-!while i >= 0 {
-!{i}!{suf}::!{i}
+!while i >= lo {
+!{i}::!{i}
 !set i = i - 1
 }
 .return
 }
-!dtab("sop0", 3, "_")
-!dtab("sd8", 7, "_")
-!dtab("sd16", 15, "_")
-!dtab("sd8x", 7, "")
+!dtab("sop0", 2, 3)
+!dtab("sd8", 0, 7)
+!dtab("sd16", 0, 15)
 
 /* SYS, SYSL and the cache/TLB aliases built on them */
 !def crreg(n) {
