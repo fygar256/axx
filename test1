@@ -15,6 +15,7 @@ caxx x86_64.axx hello.s -b b11
 caxx x86_64m.axx hello.s -b b12
 caxx aarch64_logical_mini.axx aarch64_logical_mini_demo.s -b b13
 caxx bf.axx bf.s -b b14
+caxx aarch64.axx aarch64.s -b b15
 
 paxx 4004.axx 4004.s -b a0
 paxx z80.axx z80.s -b a1
@@ -31,6 +32,7 @@ paxx x86_64.axx hello.s -b a11
 paxx x86_64m.axx hello.s -b a12
 paxx aarch64_logical_mini.axx aarch64_logical_mini_demo.s -b a13
 paxx bf.axx bf.s -b a14
+paxx aarch64.axx aarch64.s -b a15
 
 FAIL=0
 
@@ -49,6 +51,7 @@ cmp a11 b11 || FAIL=1
 cmp a12 b12 || FAIL=1
 cmp a13 b13 || FAIL=1
 cmp a14 b14 || FAIL=1
+cmp a15 b15 || FAIL=1
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

@@ -36,7 +36,7 @@ axx x86_64.axx hello.s -o out.o # ELF relocatable object
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles fourteen bundled pattern/source pairs with both
+exactly that: `test1` assembles all sixteen bundled pattern/source pairs with both
 implementations and `cmp`s the results.
 
 **Contents**
@@ -2466,10 +2466,10 @@ AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v
 
 ## Appendix B. Bundled pattern files
 
-`x86_64.axx`, `x86_64m.axx`, `68000.axx`, `z80.axx`, `8080.axx`, `8048.axx`,
-`8051.axx`, `6502.axx`, `6800.axx`, `6809.axx` and `4004.axx` are for practical
-use, as is `aarch64_logical_mini.axx` within the one instruction group it
-covers. The rest are test fixtures.
+`x86_64.axx`, `x86_64m.axx`, `aarch64.axx`, `68000.axx`, `z80.axx`, `8080.axx`,
+`8048.axx`, `8051.axx`, `6502.axx`, `6800.axx`, `6809.axx` and `4004.axx` are
+for practical use, as is `aarch64_logical_mini.axx` within the one instruction
+group it covers. The rest are test fixtures.
 
 The x86_64 pattern file is also maintained separately at
 <https://github.com/fygar256/x86_64_pattern_file_for_axx>.
@@ -2478,6 +2478,7 @@ The x86_64 pattern file is also maintained separately at
 |---|---|---|---|---|
 | **x86_64.axx** | 3.9 MB | 23,923 | **hello.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512 |
 | **x86_64m.axx** | 935 KB | 5,787 | **hello.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo |
+| **aarch64.axx** | 60 KB | 1707 | **aarch64.s** | AArch64 (A64) scalar instruction set: data processing, branches, exception generation, hints, barriers, system registers and SYS aliases, loads and stores, LSE atomics and scalar floating point. Advanced SIMD, SVE, SME and MTE are not covered |
 | **aarch64_logical_mini.axx** | 9.2 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 logical (immediate): AND/ORR/EOR/ANDS/TST, 32- and 64-bit. Encodes the bitmask immediate with the mini language (section 3.15) |
 | **6809.axx** | 124 KB | 1,950 | **6809.s** | Motorola 6809 |
 | **68000.axx** | 51 KB | 453 | **68000.s** | Motorola 68000 |
@@ -2497,9 +2498,8 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 `itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
 `aarch64_logical_mini_demo.s`.
 
-`test1` runs fourteen of the pairs above through both implementations and
-compares the results. `bf.axx` / `bf.s` is the one bundled pair it does not
-cover.
+`test1` runs all sixteen of the pairs above through both implementations and
+compares the results.
 
 x86_64 and legacy CPUs make up most of what is currently implemented, but that
 reflects where the work has gone, not the limit of what axx can describe.
@@ -2520,7 +2520,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles fourteen bundled pattern/source pairs with both
+`test1` assembles all sixteen bundled pattern/source pairs with both
 implementations and compares the results.
 
 ### C.2 External
