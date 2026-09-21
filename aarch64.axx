@@ -28,6 +28,10 @@
 /*     modified immediate, pairwise, and the LD1-LD4 / ST1-ST4
 /*     structure loads and stores in all their addressing forms
 /*   - Cryptography: AES, SHA1, SHA2, SHA3, SHA512, SM3, SM4, PMULL
+/*   - The GNU-style relocation modifiers an assembler can resolve on
+/*     its own: :lo12: on ADD and on every load and store, :pg_hi21:
+/*     on ADRP, and :abs_g0: through :abs_g3: and :prel_g0: through
+/*     :prel_g3: (with their _nc forms) on MOVZ/MOVK/MOVN
 /*   - The scalar extensions: pointer authentication (FEAT_PAuth),
 /*     memory tagging (FEAT_MTE), memory copy and set (FEAT_MOPS),
 /*     complex arithmetic (FEAT_FCMA), dot product, FP16 multiply-long,
@@ -69,14 +73,16 @@
 /* operand spelling uses.
 /*
 /* Verified byte-for-byte against llvm-mc -triple=aarch64 over about
-/* 15,600 encodings -- among them every valid 32- and 64-bit logical
+/* 15,700 encodings -- among them every valid 32- and 64-bit logical
 /* bitmask immediate, every MOV-immediate form, all 256 encodable
 /* floating-point immediates, every condition code on every
 /* conditional instruction, every addressing mode of every access
 /* size, every arrangement of every SIMD operation that has one, all
 /* 16 MOPS option suffixes, and the load/store offsets either side of
-/* the scaled / unscaled boundary. Paxx and Caxx agree byte for byte
-/* on all of it.
+/* the scaled / unscaled boundary. The relocation-modifier rows are
+/* checked the same way for their opcode bits, and their computed
+/* slices against independently worked-out values. Paxx and Caxx
+/* agree byte for byte on all of it.
 /* ===================================================================
 
 /* ===================================================================
@@ -3391,3 +3397,145 @@ XAFLAG :: .call w4(0xd500403f)
 CFP RCTX,xt :: .call w4(0xd50b7380|xt)
 DVP RCTX,xt :: .call w4(0xd50b73a0|xt)
 CPP RCTX,xt :: .call w4(0xd50b73e0|xt)
+
+/* ===================================================================
+/* Relocation modifiers
+/*
+/* GNU-style AArch64 source writes a symbol through a modifier that
+/* says which slice of it the instruction field holds:
+/*
+/*     adrp    x0, msg
+/*     add     x0, x0, :lo12:msg
+/*     ldr     x1, [x0, :lo12:msg]
+/*     movz    x2, #:abs_g0_nc:msg
+/*
+/* The modifier is literal text in the pattern -- ":" is an ordinary
+/* character there, and only "::" separates the three fields -- so
+/* each one is a row that computes its own slice.
+/*
+/* What axx does with it differs from a linker-targeted assembler.
+/* GNU as and llvm-mc leave the field zero and emit a relocation;
+/* axx resolves the symbol itself and fills the field in, which is
+/* the same thing it already does for "B label" and every other
+/* symbol reference in this file. So the output is finished code,
+/* correct whenever the symbol's address is known at assembly time --
+/* which is the case for "-b", and for "-o" when the symbol is
+/* defined in the same source. For a symbol the linker has to place,
+/* axx cannot express these relocations: its relocation tracking
+/* follows label references through binary_list words, and the words
+/* here come out of a mini-language .call, which it does not follow.
+/* The modifiers below are therefore about accepting and computing
+/* the syntax, not about deferring it to a linker.
+/*
+/* Only the slices an assembler can work out on its own are here.
+/* :got:, :got_lo12:, :tlsdesc:, :gottprel: and the TLS :tprel_* /
+/* :dtprel_* family name addresses a linker creates, so there is
+/* nothing for axx to compute and they are left out.
+/*
+/* The "#" before the modifier is optional wherever an assembler
+/* accepts it, so each form is written both ways.
+/* =================================================================== */
+
+/* ADD (immediate). Only ADD takes :lo12:, because the relocation it
+/* stands for (ADD_ABS_LO12_NC) is defined for ADD alone. */
+!def addlo12(rd, rn, sf) {
+ADD !{rd},!{rn},:LO12:!t :: .call w4((!{sf}<<31)|(0x11<<24)|((t&0xfff)<<10)|(!{rn}<<5)|!{rd})
+ADD !{rd},!{rn},#:LO12:!t :: .call w4((!{sf}<<31)|(0x11<<24)|((t&0xfff)<<10)|(!{rn}<<5)|!{rd})
+}
+!addlo12("xs", "xe", 1)
+!addlo12("ws", "we", 0)
+
+/* Loads and stores. The low 12 bits are scaled by the access size,
+/* which is also what makes the alignment check below meaningful. */
+!def lslo12(mn, rt, size, v, opc, scale) {
+!{mn} !{rt},[xb,:LO12:!t] ::(t&!{(1<<scale)-1})!=0;8 :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(1<<24)|(!{opc}<<22)|(((t&0xfff)>>!{scale})<<10)|(xb<<5)|!{rt})
+!{mn} !{rt},[xb,#:LO12:!t] ::(t&!{(1<<scale)-1})!=0;8 :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(1<<24)|(!{opc}<<22)|(((t&0xfff)>>!{scale})<<10)|(xb<<5)|!{rt})
+}
+!lslo12("STRB", "wt", 0, 0, 0, 0)
+!lslo12("LDRB", "wt", 0, 0, 1, 0)
+!lslo12("LDRSB", "xt", 0, 0, 2, 0)
+!lslo12("LDRSB", "wt", 0, 0, 3, 0)
+!lslo12("STRH", "wt", 1, 0, 0, 1)
+!lslo12("LDRH", "wt", 1, 0, 1, 1)
+!lslo12("LDRSH", "xt", 1, 0, 2, 1)
+!lslo12("LDRSH", "wt", 1, 0, 3, 1)
+!lslo12("STR", "wt", 2, 0, 0, 2)
+!lslo12("LDR", "wt", 2, 0, 1, 2)
+!lslo12("LDRSW", "xt", 2, 0, 2, 2)
+!lslo12("STR", "xt", 3, 0, 0, 3)
+!lslo12("LDR", "xt", 3, 0, 1, 3)
+!lslo12("PRFM", "prf", 3, 0, 2, 3)
+!lslo12("STR", "fb", 0, 1, 0, 0)
+!lslo12("LDR", "fb", 0, 1, 1, 0)
+!lslo12("STR", "fq", 0, 1, 2, 4)
+!lslo12("LDR", "fq", 0, 1, 3, 4)
+!lslo12("STR", "fh", 1, 1, 0, 1)
+!lslo12("LDR", "fh", 1, 1, 1, 1)
+!lslo12("STR", "fs", 2, 1, 0, 2)
+!lslo12("LDR", "fs", 2, 1, 1, 2)
+!lslo12("STR", "ff", 3, 1, 0, 3)
+!lslo12("LDR", "ff", 3, 1, 1, 3)
+PRFM #!p,[xb,:LO12:!t] ::p<0;3,p>31;3,(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1<<24)|(2<<22)|(((t&0xfff)>>3)<<10)|(xb<<5)|p)
+PRFM #!p,[xb,#:LO12:!t] ::p<0;3,p>31;3,(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1<<24)|(2<<22)|(((t&0xfff)>>3)<<10)|(xb<<5)|p)
+
+/* ADRP. :pg_hi21: is the explicit spelling of what a bare symbol
+/* already means there, so it encodes identically to the plain row
+/* further up. GNU as takes this spelling; llvm-mc does not. */
+ADRP xd,:PG_HI21:!t :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
+
+/* Move wide. The modifier names which 16-bit slice of the symbol the
+/* field holds, and that also fixes hw. The checked forms report an
+/* error when the symbol does not fit below the slice they name; the
+/* _nc forms are the same encoding without that check. */
+!def movwabs(nm, opc, rd, sf, g, nc, mx) {
+!if nc !then {
+!{nm} !{rd},#:ABS_G!{g}_NC:!t :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|(((t>>!{g * 16})&0xffff)<<5)|!{rd})
+!{nm} !{rd},:ABS_G!{g}_NC:!t :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|(((t>>!{g * 16})&0xffff)<<5)|!{rd})
+} !else {
+!{nm} !{rd},#:ABS_G!{g}:!t ::(t>>!{(g + 1) * 16})!=0;3 :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|(((t>>!{g * 16})&0xffff)<<5)|!{rd})
+!{nm} !{rd},:ABS_G!{g}:!t ::(t>>!{(g + 1) * 16})!=0;3 :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|(((t>>!{g * 16})&0xffff)<<5)|!{rd})
+}
+}
+!def movwabsall(nm, opc) {
+!movwabs(nm, opc, "xd", 1, 0, 0, 0)
+!movwabs(nm, opc, "xd", 1, 0, 1, 0)
+!movwabs(nm, opc, "xd", 1, 1, 0, 0)
+!movwabs(nm, opc, "xd", 1, 1, 1, 0)
+!movwabs(nm, opc, "xd", 1, 2, 0, 0)
+!movwabs(nm, opc, "xd", 1, 2, 1, 0)
+!movwabs(nm, opc, "xd", 1, 3, 0, 0)
+!movwabs(nm, opc, "wd", 0, 0, 0, 0)
+!movwabs(nm, opc, "wd", 0, 0, 1, 0)
+!movwabs(nm, opc, "wd", 0, 1, 0, 0)
+!movwabs(nm, opc, "wd", 0, 1, 1, 0)
+}
+!movwabsall("MOVZ", 2)
+!movwabsall("MOVK", 3)
+!movwabsall("MOVN", 0)
+
+/* The PC-relative slices, which the assembler can also work out */
+!def movwprel(nm, opc, rd, sf, g, nc) {
+!if nc !then {
+!{nm} !{rd},#:PREL_G!{g}_NC:!t :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|((((t-$$)>>!{g * 16})&0xffff)<<5)|!{rd})
+!{nm} !{rd},:PREL_G!{g}_NC:!t :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|((((t-$$)>>!{g * 16})&0xffff)<<5)|!{rd})
+} !else {
+!{nm} !{rd},#:PREL_G!{g}:!t :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|((((t-$$)>>!{g * 16})&0xffff)<<5)|!{rd})
+!{nm} !{rd},:PREL_G!{g}:!t :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|((((t-$$)>>!{g * 16})&0xffff)<<5)|!{rd})
+}
+}
+!def movwprelall(nm, opc) {
+!movwprel(nm, opc, "xd", 1, 0, 0)
+!movwprel(nm, opc, "xd", 1, 0, 1)
+!movwprel(nm, opc, "xd", 1, 1, 0)
+!movwprel(nm, opc, "xd", 1, 1, 1)
+!movwprel(nm, opc, "xd", 1, 2, 0)
+!movwprel(nm, opc, "xd", 1, 2, 1)
+!movwprel(nm, opc, "xd", 1, 3, 0)
+!movwprel(nm, opc, "wd", 0, 0, 0)
+!movwprel(nm, opc, "wd", 0, 0, 1)
+!movwprel(nm, opc, "wd", 0, 1, 0)
+!movwprel(nm, opc, "wd", 0, 1, 1)
+}
+!movwprelall("MOVZ", 2)
+!movwprelall("MOVK", 3)
+!movwprelall("MOVN", 0)
