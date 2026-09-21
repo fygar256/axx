@@ -458,6 +458,33 @@ here:
         axflag
         chkfeat x16
 
+; ---- relocation modifiers ----
+; axx works the symbol out itself instead of leaving the field for a
+; linker, so :lo12: and friends come out already filled in. Here they
+; all name "here", which sits at address 0, so every slice is zero.
+; (:pg_hi21: is supported too but is left out here: GNU as takes that
+;  spelling, llvm-mc does not, and this file is compared against both.)
+        adrp    x0, here
+        add     x0, x0, :lo12:here
+        add     x0, x0, #:lo12:here
+        add     w1, w1, :lo12:here
+        add     sp, sp, :lo12:here
+        ldr     x1, [x0, :lo12:here]
+        ldr     x1, [x0, #:lo12:here]
+        ldrb    w2, [x0, :lo12:here]
+        ldrh    w2, [x0, :lo12:here]
+        ldrsw   x2, [x0, :lo12:here]
+        str     q0, [x0, :lo12:here]
+        ldr     d0, [x0, :lo12:here]
+        prfm    pldl1keep, [x0, :lo12:here]
+        movz    x4, #:abs_g0_nc:here
+        movk    x4, #:abs_g1_nc:here
+        movk    x4, #:abs_g2_nc:here
+        movk    x4, #:abs_g3:here
+        movz    x5, :abs_g0:here
+        movn    x6, #:abs_g1:here
+        movz    w7, #:abs_g0_nc:here
+
 ; ---- forward references resolve through the relaxation loop ----
         b       tail
         adr     x2, tail
