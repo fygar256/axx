@@ -7,7 +7,7 @@
 /* with an added validity test so that an immediate which is not a
 /* legal repeating run is rejected instead of silently encoded.
 /*
-/* Coverage -- the A64 *scalar* instruction set:
+/* Coverage -- the A64 instruction set:
 /*   - Data processing (immediate): PC-rel, add/sub, logical, move
 /*     wide, bitfield, extract, and their aliases
 /*   - Data processing (register): logical/arith shifted and extended
@@ -17,19 +17,34 @@
 /*     registers, SYS/SYSL/IC/DC/AT/TLBI
 /*   - Loads and stores: literal, register (scaled / unscaled / pre /
 /*     post / register offset), pair, exclusive, acquire-release,
-/*     LSE atomics, PRFM
+/*     LSE atomics, RCpc and RCpc2, PRFM
 /*   - Scalar floating point: H/S/D data processing, compare,
-/*     conditional select/compare, conversions, FMOV immediate, and
-/*     FP loads and stores
+/*     conditional select/compare, integer and fixed-point
+/*     conversions, FMOV immediate, and FP loads and stores
+/*   - Advanced SIMD, vector and scalar: three same (integer, logical
+/*     and floating point), two-register miscellaneous, three
+/*     different, across lanes, by element, shift by immediate,
+/*     widening and narrowing, copy, permute, extract, table lookup,
+/*     modified immediate, pairwise, and the LD1-LD4 / ST1-ST4
+/*     structure loads and stores in all their addressing forms
+/*   - Cryptography: AES, SHA1, SHA2, SHA3, SHA512, SM3, SM4, PMULL
+/*   - The scalar extensions: pointer authentication (FEAT_PAuth),
+/*     memory tagging (FEAT_MTE), memory copy and set (FEAT_MOPS),
+/*     complex arithmetic (FEAT_FCMA), dot product, FP16 multiply-long,
+/*     BFloat16, the integer matrix-multiply instructions, LS64,
+/*     FJCVTZS, RNDR, and the flag-manipulation instructions
 /*
 /* Not covered, and said so rather than half-done:
-/*   Advanced SIMD (the vector forms of V registers), SVE and SVE2,
-/*   SME, the memory-tagging instructions (ADDG/SUBG/STG/...), the
-/*   pointer-authentication instructions outside the hint space
-/*   (PACIA Xd,Xn, BRAA, RETAA, LDRAA, XPACI and the rest), and the
-/*   named system registers beyond the common set below -- though
-/*   those last are all still reachable through the generic
-/*   S<op0>_<op1>_C<Cn>_C<Cm>_<op2> spelling, which is complete.
+/*   SVE, SVE2 and SME. Those are a separate register file (Z and P
+/*   registers), a predication model and an addressing model of their
+/*   own, and describing them properly is a second pattern file rather
+/*   than an appendix to this one. Everything else in A64 is here.
+/*
+/*   The named system registers stop at the common set defined below,
+/*   but every register, named or not, is still reachable through the
+/*   generic S<op0>_<op1>_C<Cn>_C<Cm>_<op2> spelling, which is
+/*   complete. The same holds for IC/DC/AT/TLBI, whose named
+/*   operations are the common ones and whose general form is SYS.
 /*
 /* The macro layer (Technical_Manual.md section 7) generates the rows
 /* that differ only in an opcode constant, and the mini language
@@ -53,13 +68,15 @@
 /* called "pl", "sy" or "x0" is rejected; give labels names that no
 /* operand spelling uses.
 /*
-/* Verified byte-for-byte against llvm-mc -triple=aarch64 over ~11,700
-/* encodings -- among them every valid 32- and 64-bit logical bitmask
-/* immediate, every MOV-immediate form, all 256 encodable
+/* Verified byte-for-byte against llvm-mc -triple=aarch64 over about
+/* 15,600 encodings -- among them every valid 32- and 64-bit logical
+/* bitmask immediate, every MOV-immediate form, all 256 encodable
 /* floating-point immediates, every condition code on every
 /* conditional instruction, every addressing mode of every access
-/* size, and the load/store offsets either side of the scaled /
-/* unscaled boundary. Paxx and Caxx agree byte for byte on all of it.
+/* size, every arrangement of every SIMD operation that has one, all
+/* 16 MOPS option suffixes, and the load/store offsets either side of
+/* the scaled / unscaled boundary. Paxx and Caxx agree byte for byte
+/* on all of it.
 /* ===================================================================
 
 /* ===================================================================
@@ -118,6 +135,7 @@
 .check::xu::XR,XZR
 .check::xs::XR,SP
 .check::xe::XR,SP
+.check::xf::XR,SP
 .check::xb::XR,SP
 .check::wd::WR,WZR
 .check::wn::WR,WZR
@@ -239,6 +257,7 @@
 .error::10::"shift or extend amount out of range"
 .error::11::"immediate not encodable as a move-wide or bitmask value"
 .error::12::"condition AL and NV cannot be used with this alias"
+.error::13::"every byte of a 64-bit MOVI immediate must be 0x00 or 0xff"
 
 /* ===================================================================
 /* Mini-language encoders (Technical_Manual.md section 3.15)
@@ -1051,6 +1070,8 @@ CFINV :: .call w4(0xd500401f)
 !sr("MDSCR_EL1", 2, 0, 0, 2, 2, 2)
 !sr("OSLAR_EL1", 2, 0, 1, 0, 4, 1)
 !sr("OSDLR_EL1", 2, 0, 1, 3, 4, 2)
+!sr("RNDR", 3, 3, 2, 4, 0, 0)
+!sr("RNDRRS", 3, 3, 2, 4, 1, 0)
 .check::sysr::!{SRR}
 .check::sysw::!{SRW}
 
@@ -1634,3 +1655,1739 @@ FMOV fhd,#!Dv :: .call fmovi(v,3,fhd)
 }
 !caspgrp(0, "wt", "wu", "wm", "wn")
 !caspgrp(1, "xt", "xu", "xm", "xn")
+
+/* ===================================================================
+/* Advanced SIMD -- vector registers
+/*
+/* A V register is written as a symbol followed by its arrangement,
+/* and the arrangement is literal text in the pattern: "vd.16B" takes
+/* the register number through the symbol vd and fixes Q and size
+/* through the two characters after the dot. The symbol matcher stops
+/* at the ".", because "." is not a symbol character, so one row per
+/* arrangement is all it takes.
+/* =================================================================== */
+!gpr("V", 31)
+!rset("VR", "V", 31)
+.check::vd::VR
+.check::vn::VR
+.check::vm::VR
+.check::va::VR
+
+/* Three same (integer).
+/*   0 Q U 01110 size 1 Rm opcode 1 Rn Rd
+/* The four arrangement sets differ only in which element widths the
+/* operation is defined for: "b" adds 2D, "h" is the 16/32-bit-only
+/* group, and "o" is the byte-only group. */
+!def v3one(nm, u, opc, ar, q, sz) {
+!{nm} vd.!{ar},vn.!{ar},vm.!{ar} :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0e<<24)|(!{sz}<<22)|(1<<21)|(vm<<16)|(!{opc}<<11)|(1<<10)|(vn<<5)|vd)
+}
+!def v3(nm, u, opc, set) {
+!if set != 2 !then {
+!if set != 1 !then {
+!v3one(nm, u, opc, "8B", 0, 0)
+!v3one(nm, u, opc, "16B", 1, 0)
+}
+!v3one(nm, u, opc, "4H", 0, 1)
+!v3one(nm, u, opc, "8H", 1, 1)
+!v3one(nm, u, opc, "2S", 0, 2)
+!v3one(nm, u, opc, "4S", 1, 2)
+!if set == 3 !then {
+!v3one(nm, u, opc, "2D", 1, 3)
+}
+} !else {
+!v3one(nm, u, opc, "8B", 0, 0)
+!v3one(nm, u, opc, "16B", 1, 0)
+}
+}
+/* set: 0 = B/H/S, 1 = H/S only, 2 = B only, 3 = B/H/S/D */
+!v3("SHADD", 0, 0x00, 0)
+!v3("UHADD", 1, 0x00, 0)
+!v3("SQADD", 0, 0x01, 3)
+!v3("UQADD", 1, 0x01, 3)
+!v3("SRHADD", 0, 0x02, 0)
+!v3("URHADD", 1, 0x02, 0)
+!v3("SHSUB", 0, 0x04, 0)
+!v3("UHSUB", 1, 0x04, 0)
+!v3("SQSUB", 0, 0x05, 3)
+!v3("UQSUB", 1, 0x05, 3)
+!v3("CMGT", 0, 0x06, 3)
+!v3("CMHI", 1, 0x06, 3)
+!v3("CMGE", 0, 0x07, 3)
+!v3("CMHS", 1, 0x07, 3)
+!v3("SSHL", 0, 0x08, 3)
+!v3("USHL", 1, 0x08, 3)
+!v3("SQSHL", 0, 0x09, 3)
+!v3("UQSHL", 1, 0x09, 3)
+!v3("SRSHL", 0, 0x0a, 3)
+!v3("URSHL", 1, 0x0a, 3)
+!v3("SQRSHL", 0, 0x0b, 3)
+!v3("UQRSHL", 1, 0x0b, 3)
+!v3("SMAX", 0, 0x0c, 0)
+!v3("UMAX", 1, 0x0c, 0)
+!v3("SMIN", 0, 0x0d, 0)
+!v3("UMIN", 1, 0x0d, 0)
+!v3("SABD", 0, 0x0e, 0)
+!v3("UABD", 1, 0x0e, 0)
+!v3("SABA", 0, 0x0f, 0)
+!v3("UABA", 1, 0x0f, 0)
+!v3("ADD", 0, 0x10, 3)
+!v3("SUB", 1, 0x10, 3)
+!v3("CMTST", 0, 0x11, 3)
+!v3("CMEQ", 1, 0x11, 3)
+!v3("MLA", 0, 0x12, 0)
+!v3("MLS", 1, 0x12, 0)
+!v3("MUL", 0, 0x13, 0)
+!v3("PMUL", 1, 0x13, 2)
+!v3("SMAXP", 0, 0x14, 0)
+!v3("UMAXP", 1, 0x14, 0)
+!v3("SMINP", 0, 0x15, 0)
+!v3("UMINP", 1, 0x15, 0)
+!v3("SQDMULH", 0, 0x16, 1)
+!v3("SQRDMULH", 1, 0x16, 1)
+!v3("ADDP", 0, 0x17, 3)
+/* Three same extra: the same layout with bit 21 clear */
+!def v3xone(nm, u, opc, ar, q, sz) {
+!{nm} vd.!{ar},vn.!{ar},vm.!{ar} :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0e<<24)|(!{sz}<<22)|(vm<<16)|(!{opc}<<11)|(1<<10)|(vn<<5)|vd)
+}
+!def v3x(nm, u, opc) {
+!v3xone(nm, u, opc, "4H", 0, 1)
+!v3xone(nm, u, opc, "8H", 1, 1)
+!v3xone(nm, u, opc, "2S", 0, 2)
+!v3xone(nm, u, opc, "4S", 1, 2)
+}
+!v3x("SQRDMLAH", 1, 0x10)
+!v3x("SQRDMLSH", 1, 0x11)
+
+/* Three same (logical). The size field selects the operation rather
+/* than an element width, so these are byte arrangements only. */
+!def v3l(nm, u, sz) {
+!v3one(nm, u, 0x03, "8B", 0, sz)
+!v3one(nm, u, 0x03, "16B", 1, sz)
+}
+!v3l("AND", 0, 0)
+!v3l("BIC", 0, 1)
+!v3l("ORR", 0, 2)
+!v3l("ORN", 0, 3)
+!v3l("EOR", 1, 0)
+!v3l("BSL", 1, 1)
+!v3l("BIT", 1, 2)
+!v3l("BIF", 1, 3)
+/* MOV is ORR with the two source operands the same register */
+MOV vd.8B,vn.8B :: .call w4((0x0e<<24)|(2<<22)|(1<<21)|(vn<<16)|(3<<11)|(1<<10)|(vn<<5)|vd)
+MOV vd.16B,vn.16B :: .call w4((1<<30)|(0x0e<<24)|(2<<22)|(1<<21)|(vn<<16)|(3<<11)|(1<<10)|(vn<<5)|vd)
+
+/* Three same (floating point). The half-precision forms share the
+/* opcode's low three bits with the single/double ones; they differ
+/* by setting bit 22 and clearing bit 21. */
+!def v3fone(nm, u, op, opc, ar, q, sz) {
+!{nm} vd.!{ar},vn.!{ar},vm.!{ar} :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0e<<24)|(!{op}<<23)|(!{sz}<<22)|(1<<21)|(vm<<16)|(!{opc}<<11)|(1<<10)|(vn<<5)|vd)
+}
+!def v3hone(nm, u, op, opc, ar, q) {
+!{nm} vd.!{ar},vn.!{ar},vm.!{ar} :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0e<<24)|(!{op}<<23)|(1<<22)|(vm<<16)|(!{opc}<<11)|(1<<10)|(vn<<5)|vd)
+}
+!def v3f(nm, u, op, k) {
+!v3hone(nm, u, op, k, "4H", 0)
+!v3hone(nm, u, op, k, "8H", 1)
+!v3fone(nm, u, op, 0x18 + k, "2S", 0, 0)
+!v3fone(nm, u, op, 0x18 + k, "4S", 1, 0)
+!v3fone(nm, u, op, 0x18 + k, "2D", 1, 1)
+}
+!v3f("FMAXNM", 0, 0, 0)
+!v3f("FMLA", 0, 0, 1)
+!v3f("FADD", 0, 0, 2)
+!v3f("FMULX", 0, 0, 3)
+!v3f("FCMEQ", 0, 0, 4)
+!v3f("FMAX", 0, 0, 6)
+!v3f("FRECPS", 0, 0, 7)
+!v3f("FMINNM", 0, 1, 0)
+!v3f("FMLS", 0, 1, 1)
+!v3f("FSUB", 0, 1, 2)
+!v3f("FMIN", 0, 1, 6)
+!v3f("FRSQRTS", 0, 1, 7)
+!v3f("FMAXNMP", 1, 0, 0)
+!v3f("FADDP", 1, 0, 2)
+!v3f("FMUL", 1, 0, 3)
+!v3f("FCMGE", 1, 0, 4)
+!v3f("FACGE", 1, 0, 5)
+!v3f("FMAXP", 1, 0, 6)
+!v3f("FDIV", 1, 0, 7)
+!v3f("FMINNMP", 1, 1, 0)
+!v3f("FABD", 1, 1, 2)
+!v3f("FCMGT", 1, 1, 4)
+!v3f("FACGT", 1, 1, 5)
+!v3f("FMINP", 1, 1, 6)
+
+/* Two-register miscellaneous.
+/*   0 Q U 01110 size 10000 opcode 10 Rn Rd
+/* The half-precision rows put 11100 where the others put 10000, and
+/* for the floating-point groups the two "size" bits are the group
+/* selector and the precision bit rather than an element width. */
+!def v2one(nm, u, sz, hi, opc, ar, q) {
+!{nm} vd.!{ar},vn.!{ar} :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0e<<24)|(!{sz}<<22)|(!{hi}<<17)|(!{opc}<<12)|(2<<10)|(vn<<5)|vd)
+}
+!def v2zone(nm, u, sz, hi, opc, ar, q) {
+!{nm} vd.!{ar},vn.!{ar},#0 :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0e<<24)|(!{sz}<<22)|(!{hi}<<17)|(!{opc}<<12)|(2<<10)|(vn<<5)|vd)
+}
+/* set: 0 = B/H/S, 1 = S only, 2 = B only, 3 = B/H/S/D, 4 = B/H only */
+!def v2i(nm, u, opc, set) {
+!if set == 1 !then {
+!v2one(nm, u, 2, 0x10, opc, "2S", 0)
+!v2one(nm, u, 2, 0x10, opc, "4S", 1)
+} !else {
+!v2one(nm, u, 0, 0x10, opc, "8B", 0)
+!v2one(nm, u, 0, 0x10, opc, "16B", 1)
+!if set != 2 !then {
+!v2one(nm, u, 1, 0x10, opc, "4H", 0)
+!v2one(nm, u, 1, 0x10, opc, "8H", 1)
+!if set != 4 !then {
+!v2one(nm, u, 2, 0x10, opc, "2S", 0)
+!v2one(nm, u, 2, 0x10, opc, "4S", 1)
+!if set == 3 !then {
+!v2one(nm, u, 3, 0x10, opc, "2D", 1)
+}
+}
+}
+}
+}
+!def v2z(nm, u, opc) {
+!v2zone(nm, u, 0, 0x10, opc, "8B", 0)
+!v2zone(nm, u, 0, 0x10, opc, "16B", 1)
+!v2zone(nm, u, 1, 0x10, opc, "4H", 0)
+!v2zone(nm, u, 1, 0x10, opc, "8H", 1)
+!v2zone(nm, u, 2, 0x10, opc, "2S", 0)
+!v2zone(nm, u, 2, 0x10, opc, "4S", 1)
+!v2zone(nm, u, 3, 0x10, opc, "2D", 1)
+}
+/* h16: 1 when the operation also has half-precision arrangements */
+!def v2f(nm, u, op, opc, h16) {
+!if h16 !then {
+!v2one(nm, u, (op * 2) + 1, 0x1c, opc, "4H", 0)
+!v2one(nm, u, (op * 2) + 1, 0x1c, opc, "8H", 1)
+}
+!v2one(nm, u, op * 2, 0x10, opc, "2S", 0)
+!v2one(nm, u, op * 2, 0x10, opc, "4S", 1)
+!v2one(nm, u, (op * 2) + 1, 0x10, opc, "2D", 1)
+}
+!def v2fz(nm, u, op, opc) {
+!v2zone(nm, u, (op * 2) + 1, 0x1c, opc, "4H", 0)
+!v2zone(nm, u, (op * 2) + 1, 0x1c, opc, "8H", 1)
+!v2zone(nm, u, op * 2, 0x10, opc, "2S", 0)
+!v2zone(nm, u, op * 2, 0x10, opc, "4S", 1)
+!v2zone(nm, u, (op * 2) + 1, 0x10, opc, "2D", 1)
+}
+
+!v2i("REV64", 0, 0x00, 0)
+!v2i("REV32", 1, 0x00, 4)
+!v2i("REV16", 0, 0x01, 2)
+!v2i("SUQADD", 0, 0x03, 3)
+!v2i("USQADD", 1, 0x03, 3)
+!v2i("CLS", 0, 0x04, 0)
+!v2i("CLZ", 1, 0x04, 0)
+!v2i("CNT", 0, 0x05, 2)
+!v2i("SQABS", 0, 0x07, 3)
+!v2i("SQNEG", 1, 0x07, 3)
+!v2i("ABS", 0, 0x0b, 3)
+!v2i("NEG", 1, 0x0b, 3)
+!v2i("URECPE", 0, 0x1c, 1)
+!v2i("URSQRTE", 1, 0x1c, 1)
+/* NOT and RBIT share an opcode and are told apart by the size field */
+!v2one("NOT", 1, 0, 0x10, 0x05, "8B", 0)
+!v2one("NOT", 1, 0, 0x10, 0x05, "16B", 1)
+!v2one("MVN", 1, 0, 0x10, 0x05, "8B", 0)
+!v2one("MVN", 1, 0, 0x10, 0x05, "16B", 1)
+!v2one("RBIT", 1, 1, 0x10, 0x05, "8B", 0)
+!v2one("RBIT", 1, 1, 0x10, 0x05, "16B", 1)
+
+!v2z("CMGT", 0, 0x08)
+!v2z("CMGE", 1, 0x08)
+!v2z("CMEQ", 0, 0x09)
+!v2z("CMLE", 1, 0x09)
+!v2z("CMLT", 0, 0x0a)
+
+!v2f("FRINTN", 0, 0, 0x18, 1)
+!v2f("FRINTM", 0, 0, 0x19, 1)
+!v2f("FRINTA", 1, 0, 0x18, 1)
+!v2f("FRINTX", 1, 0, 0x19, 1)
+!v2f("FRINTP", 0, 1, 0x18, 1)
+!v2f("FRINTZ", 0, 1, 0x19, 1)
+!v2f("FRINTI", 1, 1, 0x19, 1)
+!v2f("FCVTNS", 0, 0, 0x1a, 1)
+!v2f("FCVTMS", 0, 0, 0x1b, 1)
+!v2f("FCVTAS", 0, 0, 0x1c, 1)
+!v2f("SCVTF", 0, 0, 0x1d, 1)
+!v2f("FCVTNU", 1, 0, 0x1a, 1)
+!v2f("FCVTMU", 1, 0, 0x1b, 1)
+!v2f("FCVTAU", 1, 0, 0x1c, 1)
+!v2f("UCVTF", 1, 0, 0x1d, 1)
+!v2f("FCVTPS", 0, 1, 0x1a, 1)
+!v2f("FCVTZS", 0, 1, 0x1b, 1)
+!v2f("FCVTPU", 1, 1, 0x1a, 1)
+!v2f("FCVTZU", 1, 1, 0x1b, 1)
+!v2f("FABS", 0, 1, 0x0f, 1)
+!v2f("FNEG", 1, 1, 0x0f, 1)
+!v2f("FSQRT", 1, 1, 0x1f, 1)
+!v2f("FRECPE", 0, 1, 0x1d, 1)
+!v2f("FRSQRTE", 1, 1, 0x1d, 1)
+!v2f("FRINT32Z", 0, 0, 0x1e, 0)
+!v2f("FRINT32X", 1, 0, 0x1e, 0)
+!v2f("FRINT64Z", 0, 0, 0x1f, 0)
+!v2f("FRINT64X", 1, 0, 0x1f, 0)
+!v2fz("FCMGT", 0, 1, 0x0c)
+!v2fz("FCMEQ", 0, 1, 0x0d)
+!v2fz("FCMLT", 0, 1, 0x0e)
+!v2fz("FCMGE", 1, 1, 0x0c)
+!v2fz("FCMLE", 1, 1, 0x0d)
+
+/* Widening pairwise, narrowing and widening. These share the
+/* two-register-miscellaneous encoding; only the operand arrangements
+/* differ, so each row names its destination and source shapes. */
+!def v2w(nm, u, opc, dar, sar, q, sz) {
+!{nm} vd.!{dar},vn.!{sar} :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0e<<24)|(!{sz}<<22)|(0x10<<17)|(!{opc}<<12)|(2<<10)|(vn<<5)|vd)
+}
+!def vpw(nm, u, opc) {
+!v2w(nm, u, opc, "4H", "8B", 0, 0)
+!v2w(nm, u, opc, "8H", "16B", 1, 0)
+!v2w(nm, u, opc, "2S", "4H", 0, 1)
+!v2w(nm, u, opc, "4S", "8H", 1, 1)
+!v2w(nm, u, opc, "1D", "2S", 0, 2)
+!v2w(nm, u, opc, "2D", "4S", 1, 2)
+}
+!vpw("SADDLP", 0, 0x02)
+!vpw("UADDLP", 1, 0x02)
+!vpw("SADALP", 0, 0x06)
+!vpw("UADALP", 1, 0x06)
+
+!def vnar(nm, u, opc) {
+!v2w(nm, u, opc, "8B", "8H", 0, 0)
+!v2w(nm, u, opc, "4H", "4S", 0, 1)
+!v2w(nm, u, opc, "2S", "2D", 0, 2)
+!v2w(nm + "2", u, opc, "16B", "8H", 1, 0)
+!v2w(nm + "2", u, opc, "8H", "4S", 1, 1)
+!v2w(nm + "2", u, opc, "4S", "2D", 1, 2)
+}
+!vnar("XTN", 0, 0x12)
+!vnar("SQXTN", 0, 0x14)
+!vnar("UQXTN", 1, 0x14)
+!vnar("SQXTUN", 1, 0x12)
+
+!v2w("FCVTN", 0, 0x16, "4H", "4S", 0, 0)
+!v2w("FCVTN", 0, 0x16, "2S", "2D", 0, 1)
+!v2w("FCVTN2", 0, 0x16, "8H", "4S", 1, 0)
+!v2w("FCVTN2", 0, 0x16, "4S", "2D", 1, 1)
+!v2w("FCVTXN", 1, 0x16, "2S", "2D", 0, 1)
+!v2w("FCVTXN2", 1, 0x16, "4S", "2D", 1, 1)
+!v2w("FCVTL", 0, 0x17, "4S", "4H", 0, 0)
+!v2w("FCVTL", 0, 0x17, "2D", "2S", 0, 1)
+!v2w("FCVTL2", 0, 0x17, "4S", "8H", 1, 0)
+!v2w("FCVTL2", 0, 0x17, "2D", "4S", 1, 1)
+
+/* SHLL shifts the source elements left by the element width, so the
+/* shift amount is fixed by the arrangement and is checked here. */
+!def vshll(nm, dar, sar, q, sz, amt) {
+!{nm} vd.!{dar},vn.!{sar},#!s ::s!=!{amt};3 :: .call w4((!{q}<<30)|(1<<29)|(0x0e<<24)|(!{sz}<<22)|(0x10<<17)|(0x13<<12)|(2<<10)|(vn<<5)|vd)
+}
+!vshll("SHLL", "8H", "8B", 0, 0, 8)
+!vshll("SHLL", "4S", "4H", 0, 1, 16)
+!vshll("SHLL", "2D", "2S", 0, 2, 32)
+!vshll("SHLL2", "8H", "16B", 1, 0, 8)
+!vshll("SHLL2", "4S", "8H", 1, 1, 16)
+!vshll("SHLL2", "2D", "4S", 1, 2, 32)
+
+/* Three different.
+/*   0 Q U 01110 size 1 Rm opcode 00 Rn Rd
+/* "l" widens both sources, "w" widens only the second, and "n"
+/* narrows the destination. */
+!def v3done(nm, u, opc, dar, nar, mar, q, sz) {
+!{nm} vd.!{dar},vn.!{nar},vm.!{mar} :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0e<<24)|(!{sz}<<22)|(1<<21)|(vm<<16)|(!{opc}<<12)|(vn<<5)|vd)
+}
+!def v3dl(nm, u, opc, b) {
+!if b !then {
+!v3done(nm, u, opc, "8H", "8B", "8B", 0, 0)
+!v3done(nm + "2", u, opc, "8H", "16B", "16B", 1, 0)
+}
+!v3done(nm, u, opc, "4S", "4H", "4H", 0, 1)
+!v3done(nm + "2", u, opc, "4S", "8H", "8H", 1, 1)
+!v3done(nm, u, opc, "2D", "2S", "2S", 0, 2)
+!v3done(nm + "2", u, opc, "2D", "4S", "4S", 1, 2)
+}
+!def v3dw(nm, u, opc) {
+!v3done(nm, u, opc, "8H", "8H", "8B", 0, 0)
+!v3done(nm + "2", u, opc, "8H", "8H", "16B", 1, 0)
+!v3done(nm, u, opc, "4S", "4S", "4H", 0, 1)
+!v3done(nm + "2", u, opc, "4S", "4S", "8H", 1, 1)
+!v3done(nm, u, opc, "2D", "2D", "2S", 0, 2)
+!v3done(nm + "2", u, opc, "2D", "2D", "4S", 1, 2)
+}
+!def v3dn(nm, u, opc) {
+!v3done(nm, u, opc, "8B", "8H", "8H", 0, 0)
+!v3done(nm + "2", u, opc, "16B", "8H", "8H", 1, 0)
+!v3done(nm, u, opc, "4H", "4S", "4S", 0, 1)
+!v3done(nm + "2", u, opc, "8H", "4S", "4S", 1, 1)
+!v3done(nm, u, opc, "2S", "2D", "2D", 0, 2)
+!v3done(nm + "2", u, opc, "4S", "2D", "2D", 1, 2)
+}
+!v3dl("SADDL", 0, 0x0, 1)
+!v3dl("UADDL", 1, 0x0, 1)
+!v3dl("SSUBL", 0, 0x2, 1)
+!v3dl("USUBL", 1, 0x2, 1)
+!v3dl("SABAL", 0, 0x5, 1)
+!v3dl("UABAL", 1, 0x5, 1)
+!v3dl("SABDL", 0, 0x7, 1)
+!v3dl("UABDL", 1, 0x7, 1)
+!v3dl("SMLAL", 0, 0x8, 1)
+!v3dl("UMLAL", 1, 0x8, 1)
+!v3dl("SMLSL", 0, 0xa, 1)
+!v3dl("UMLSL", 1, 0xa, 1)
+!v3dl("SMULL", 0, 0xc, 1)
+!v3dl("UMULL", 1, 0xc, 1)
+!v3dl("SQDMLAL", 0, 0x9, 0)
+!v3dl("SQDMLSL", 0, 0xb, 0)
+!v3dl("SQDMULL", 0, 0xd, 0)
+!v3dw("SADDW", 0, 0x1)
+!v3dw("UADDW", 1, 0x1)
+!v3dw("SSUBW", 0, 0x3)
+!v3dw("USUBW", 1, 0x3)
+!v3dn("ADDHN", 0, 0x4)
+!v3dn("RADDHN", 1, 0x4)
+!v3dn("SUBHN", 0, 0x6)
+!v3dn("RSUBHN", 1, 0x6)
+!v3done("PMULL", 0, 0xe, "8H", "8B", "8B", 0, 0)
+!v3done("PMULL2", 0, 0xe, "8H", "16B", "16B", 1, 0)
+!v3done("PMULL", 0, 0xe, "1Q", "1D", "1D", 0, 3)
+!v3done("PMULL2", 0, 0xe, "1Q", "2D", "2D", 1, 3)
+
+/* Across lanes.
+/*   0 Q U 01110 size 11000 opcode 10 Rn Rd
+/* The destination is a scalar of the widened element type, so each
+/* row names the scalar register class it writes. */
+!def vacr(nm, u, opc, rd, sar, q, sz) {
+!{nm} !{rd},vn.!{sar} :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0e<<24)|(!{sz}<<22)|(0x18<<17)|(!{opc}<<12)|(2<<10)|(vn<<5)|!{rd})
+}
+!def vacri(nm, u, opc, w) {
+!vacr(nm, u, opc, w == 1 ? "fhd" : "fbd", "8B", 0, 0)
+!vacr(nm, u, opc, w == 1 ? "fhd" : "fbd", "16B", 1, 0)
+!vacr(nm, u, opc, w == 1 ? "fsd" : "fhd", "4H", 0, 1)
+!vacr(nm, u, opc, w == 1 ? "fsd" : "fhd", "8H", 1, 1)
+!vacr(nm, u, opc, w == 1 ? "fdd" : "fsd", "4S", 1, 2)
+}
+!vacri("SADDLV", 0, 0x03, 1)
+!vacri("UADDLV", 1, 0x03, 1)
+!vacri("SMAXV", 0, 0x0a, 0)
+!vacri("UMAXV", 1, 0x0a, 0)
+!vacri("SMINV", 0, 0x1a, 0)
+!vacri("UMINV", 1, 0x1a, 0)
+!vacri("ADDV", 0, 0x1b, 0)
+!def vacrf(nm, opc, sz) {
+!vacr(nm, 0, opc, "fhd", "4H", 0, sz)
+!vacr(nm, 0, opc, "fhd", "8H", 1, sz)
+!vacr(nm, 1, opc, "fsd", "4S", 1, sz)
+}
+!vacrf("FMAXNMV", 0x0c, 0)
+!vacrf("FMAXV", 0x0f, 0)
+!vacrf("FMINNMV", 0x0c, 2)
+!vacrf("FMINV", 0x0f, 2)
+
+/* Permute.
+/*   0 Q 001110 size 0 Rm 0 opcode 10 Rn Rd */
+!def vperm1(nm, opc, ar, q, sz) {
+!{nm} vd.!{ar},vn.!{ar},vm.!{ar} :: .call w4((!{q}<<30)|(0x0e<<24)|(!{sz}<<22)|(vm<<16)|(!{opc}<<12)|(2<<10)|(vn<<5)|vd)
+}
+!def vperm(nm, opc) {
+!vperm1(nm, opc, "8B", 0, 0)
+!vperm1(nm, opc, "16B", 1, 0)
+!vperm1(nm, opc, "4H", 0, 1)
+!vperm1(nm, opc, "8H", 1, 1)
+!vperm1(nm, opc, "2S", 0, 2)
+!vperm1(nm, opc, "4S", 1, 2)
+!vperm1(nm, opc, "2D", 1, 3)
+}
+!vperm("UZP1", 1)
+!vperm("TRN1", 2)
+!vperm("ZIP1", 3)
+!vperm("UZP2", 5)
+!vperm("TRN2", 6)
+!vperm("ZIP2", 7)
+
+/* Extract.
+/*   0 Q 101110 00 0 Rm 0 imm4 0 Rn Rd */
+EXT vd.8B,vn.8B,vm.8B,#!i ::i<0;3,i>7;3 :: .call w4((1<<29)|(0x0e<<24)|(vm<<16)|(i<<11)|(vn<<5)|vd)
+EXT vd.16B,vn.16B,vm.16B,#!i ::i<0;3,i>15;3 :: .call w4((1<<30)|(1<<29)|(0x0e<<24)|(vm<<16)|(i<<11)|(vn<<5)|vd)
+
+/* Table lookup.
+/*   0 Q 001110 000 Rm 0 len op 00 Rn Rd
+/* The table is one to four consecutive V registers; only the first is
+/* encoded, so the rows check that the others really do follow it. */
+.check::vb::VR
+.check::vc::VR
+!def vtbl(nm, op, ar, q) {
+!{nm} vd.!{ar},{vn.16B},vm.!{ar} :: .call w4((!{q}<<30)|(0x0e<<24)|(vm<<16)|(!{op}<<12)|(vn<<5)|vd)
+!{nm} vd.!{ar},{vn.16B,va.16B},vm.!{ar} ::va!=((vn+1)&31);5 :: .call w4((!{q}<<30)|(0x0e<<24)|(vm<<16)|(1<<13)|(!{op}<<12)|(vn<<5)|vd)
+!{nm} vd.!{ar},{vn.16B,va.16B,vb.16B},vm.!{ar} ::va!=((vn+1)&31);5,vb!=((vn+2)&31);5 :: .call w4((!{q}<<30)|(0x0e<<24)|(vm<<16)|(2<<13)|(!{op}<<12)|(vn<<5)|vd)
+!{nm} vd.!{ar},{vn.16B,va.16B,vb.16B,vc.16B},vm.!{ar} ::va!=((vn+1)&31);5,vb!=((vn+2)&31);5,vc!=((vn+3)&31);5 :: .call w4((!{q}<<30)|(0x0e<<24)|(vm<<16)|(3<<13)|(!{op}<<12)|(vn<<5)|vd)
+}
+!vtbl("TBL", 0, "8B", 0)
+!vtbl("TBL", 0, "16B", 1)
+!vtbl("TBX", 1, "8B", 0)
+!vtbl("TBX", 1, "16B", 1)
+
+/* Copy.
+/*   0 Q op 01110000 imm5 0 imm4 1 Rn Rd
+/* imm5 carries both the element size and the index: the size is the
+/* lowest set bit and the index sits above it. */
+!def vdupe(ar, el, q, sh, lo, mx) {
+DUP vd.!{ar},vn.!{el}[!!i] ::i<0;3,i>!{mx};3 :: .call w4((!{q}<<30)|(0x0e<<24)|(((i<<!{sh})|!{lo})<<16)|(1<<10)|(vn<<5)|vd)
+}
+!vdupe("8B", "B", 0, 1, 1, 15)
+!vdupe("16B", "B", 1, 1, 1, 15)
+!vdupe("4H", "H", 0, 2, 2, 7)
+!vdupe("8H", "H", 1, 2, 2, 7)
+!vdupe("2S", "S", 0, 3, 4, 3)
+!vdupe("4S", "S", 1, 3, 4, 3)
+!vdupe("2D", "D", 1, 4, 8, 1)
+
+!def vdupg(ar, rn, q, lo) {
+DUP vd.!{ar},!{rn} :: .call w4((!{q}<<30)|(0x0e<<24)|(!{lo}<<16)|(1<<11)|(1<<10)|(!{rn}<<5)|vd)
+}
+!vdupg("8B", "wn", 0, 1)
+!vdupg("16B", "wn", 1, 1)
+!vdupg("4H", "wn", 0, 2)
+!vdupg("8H", "wn", 1, 2)
+!vdupg("2S", "wn", 0, 4)
+!vdupg("4S", "wn", 1, 4)
+!vdupg("2D", "xn", 1, 8)
+
+/* Scalar DUP, which is also spelled MOV. This one sits in the scalar
+/* copy block, so bit 28 is set where the vector rows clear it. */
+!def vdups(rd, el, sh, lo, mx) {
+DUP !{rd},vn.!{el}[!!i] ::i<0;3,i>!{mx};3 :: .call w4((1<<30)|(0x1e<<24)|(((i<<!{sh})|!{lo})<<16)|(1<<10)|(vn<<5)|!{rd})
+MOV !{rd},vn.!{el}[!!i] ::i<0;3,i>!{mx};3 :: .call w4((1<<30)|(0x1e<<24)|(((i<<!{sh})|!{lo})<<16)|(1<<10)|(vn<<5)|!{rd})
+}
+!vdups("fbd", "B", 1, 1, 15)
+!vdups("fhd", "H", 2, 2, 7)
+!vdups("fsd", "S", 3, 4, 3)
+!vdups("fdd", "D", 4, 8, 1)
+
+!def vsmov(nm, imm4, rd, el, q, sh, lo, mx) {
+!{nm} !{rd},vn.!{el}[!!i] ::i<0;3,i>!{mx};3 :: .call w4((!{q}<<30)|(0x0e<<24)|(((i<<!{sh})|!{lo})<<16)|(!{imm4}<<11)|(1<<10)|(vn<<5)|!{rd})
+}
+!vsmov("SMOV", 5, "wd", "B", 0, 1, 1, 15)
+!vsmov("SMOV", 5, "wd", "H", 0, 2, 2, 7)
+!vsmov("SMOV", 5, "xd", "B", 1, 1, 1, 15)
+!vsmov("SMOV", 5, "xd", "H", 1, 2, 2, 7)
+!vsmov("SMOV", 5, "xd", "S", 1, 3, 4, 3)
+!vsmov("UMOV", 7, "wd", "B", 0, 1, 1, 15)
+!vsmov("UMOV", 7, "wd", "H", 0, 2, 2, 7)
+!vsmov("UMOV", 7, "wd", "S", 0, 3, 4, 3)
+!vsmov("UMOV", 7, "xd", "D", 1, 4, 8, 1)
+!vsmov("MOV", 7, "wd", "S", 0, 3, 4, 3)
+!vsmov("MOV", 7, "xd", "D", 1, 4, 8, 1)
+
+/* INS, also spelled MOV, from a general register or from a lane */
+!def vinsg(nm, el, sh, lo, mx, rn) {
+!{nm} vd.!{el}[!!i],!{rn} ::i<0;3,i>!{mx};3 :: .call w4((1<<30)|(0x0e<<24)|(((i<<!{sh})|!{lo})<<16)|(3<<11)|(1<<10)|(!{rn}<<5)|vd)
+}
+!vinsg("INS", "B", 1, 1, 15, "wn")
+!vinsg("MOV", "B", 1, 1, 15, "wn")
+!vinsg("INS", "H", 2, 2, 7, "wn")
+!vinsg("MOV", "H", 2, 2, 7, "wn")
+!vinsg("INS", "S", 3, 4, 3, "wn")
+!vinsg("MOV", "S", 3, 4, 3, "wn")
+!vinsg("INS", "D", 4, 8, 1, "xn")
+!vinsg("MOV", "D", 4, 8, 1, "xn")
+!def vinse(nm, el, sh, lo, mx, jsh) {
+!{nm} vd.!{el}[!!i],vn.!{el}[!!j] ::i<0;3,i>!{mx};3,j<0;3,j>!{mx};3 :: .call w4((1<<30)|(1<<29)|(0x0e<<24)|(((i<<!{sh})|!{lo})<<16)|((j<<!{jsh})<<11)|(1<<10)|(vn<<5)|vd)
+}
+!vinse("INS", "B", 1, 1, 15, 0)
+!vinse("MOV", "B", 1, 1, 15, 0)
+!vinse("INS", "H", 2, 2, 7, 1)
+!vinse("MOV", "H", 2, 2, 7, 1)
+!vinse("INS", "S", 3, 4, 3, 2)
+!vinse("MOV", "S", 3, 4, 3, 2)
+!vinse("INS", "D", 4, 8, 1, 3)
+!vinse("MOV", "D", 4, 8, 1, 3)
+
+/* Modified immediate.
+/*   0 Q op 0111100000 abc cmode o2 1 defgh Rd
+/* cmode selects both the element width and the byte position the
+/* 8-bit value is shifted into, so the shift amount written in the
+/* source becomes part of it. */
+!def vmi(nm, op, ar, q, cmode) {
+!{nm} vd.!{ar},#!v ::v<0;3,v>0xff;3 :: .call w4((!{q}<<30)|(!{op}<<29)|(0x0f<<24)|(((v>>5)&7)<<16)|(!{cmode}<<12)|(1<<10)|((v&0x1f)<<5)|vd)
+}
+!def vmis(nm, op, ar, q, base, sh, mx) {
+!{nm} vd.!{ar},#!v,LSL #!s ::v<0;3,v>0xff;3,(s&7)!=0;10,s>!{mx};10 :: .call w4((!{q}<<30)|(!{op}<<29)|(0x0f<<24)|(((v>>5)&7)<<16)|((!{base}|((s>>3)<<1))<<12)|(1<<10)|((v&0x1f)<<5)|vd)
+}
+!def vmim(nm, op, ar, q) {
+!{nm} vd.!{ar},#!v,MSL #!s ::v<0;3,v>0xff;3,(s!=8)&&(s!=16);10 :: .call w4((!{q}<<30)|(!{op}<<29)|(0x0f<<24)|(((v>>5)&7)<<16)|((0xc|((s>>3)-1))<<12)|(1<<10)|((v&0x1f)<<5)|vd)
+}
+/* MOVI and MVNI */
+!vmi("MOVI", 0, "8B", 0, 0xe)
+!vmi("MOVI", 0, "16B", 1, 0xe)
+!def vmihs(nm, op) {
+!vmi(nm, op, "4H", 0, 0x8)
+!vmi(nm, op, "8H", 1, 0x8)
+!vmis(nm, op, "4H", 0, 0x8, 1, 8)
+!vmis(nm, op, "8H", 1, 0x8, 1, 8)
+!vmi(nm, op, "2S", 0, 0x0)
+!vmi(nm, op, "4S", 1, 0x0)
+!vmis(nm, op, "2S", 0, 0x0, 1, 24)
+!vmis(nm, op, "4S", 1, 0x0, 1, 24)
+!vmim(nm, op, "2S", 0)
+!vmim(nm, op, "4S", 1)
+}
+!vmihs("MOVI", 0)
+!vmihs("MVNI", 1)
+/* ORR and BIC with an immediate use the odd cmode values */
+!def vmiob(nm, op) {
+!vmi(nm, op, "4H", 0, 0x9)
+!vmi(nm, op, "8H", 1, 0x9)
+!vmis(nm, op, "4H", 0, 0x9, 1, 8)
+!vmis(nm, op, "8H", 1, 0x9, 1, 8)
+!vmi(nm, op, "2S", 0, 0x1)
+!vmi(nm, op, "4S", 1, 0x1)
+!vmis(nm, op, "2S", 0, 0x1, 1, 24)
+!vmis(nm, op, "4S", 1, 0x1, 1, 24)
+}
+!vmiob("ORR", 0)
+!vmiob("BIC", 1)
+/* The 64-bit MOVI takes one bit per byte, so the value has to be made
+/* of 0x00 and 0xff bytes; bytemask checks that and packs it. */
+MOVI vd.2D,#!v :: .call vmovi64(v,1,vd)
+MOVI fdd,#!v :: .call vmovi64(v,0,fdd)
+/* FMOV with a vector immediate reuses the 8-bit floating-point field */
+FMOV vd.2S,#!Dv :: .call vfmovi(v,0,0,0,vd)
+FMOV vd.4S,#!Dv :: .call vfmovi(v,1,0,0,vd)
+FMOV vd.2D,#!Dv :: .call vfmovi(v,1,1,0,vd)
+FMOV vd.4H,#!Dv :: .call vfmovi(v,0,0,1,vd)
+FMOV vd.8H,#!Dv :: .call vfmovi(v,1,0,1,vd)
+
+.func::bytemask::v
+r = 0
+i = 0
+.while(i < 8)
+b = (v >> (i * 8)) & 0xff
+.if b == 0xff .then
+r = r | (1 << i)
+.elif b != 0 .then
+.return -1
+.endif
+i = i + 1
+.endwhile
+.return r
+.endfunc
+
+.func::vmovi64::v,q,rd
+m = .call bytemask(v)
+.if m < 0 .then
+.raise 13
+.return [0, 0, 0, 0]
+.endif
+.return .call w4((q << 30) | (1 << 29) | (0x0f << 24) | (((m >> 5) & 7) << 16) | (0x0e << 12) | (1 << 10) | ((m & 0x1f) << 5) | rd)
+.endfunc
+
+.func::vfmovi::v,q,op,o2,rd
+i8 = .call fpimm8(v)
+.if i8 < 0 .then
+.raise 9
+.return [0, 0, 0, 0]
+.endif
+.return .call w4((q << 30) | (op << 29) | (0x0f << 24) | (((i8 >> 5) & 7) << 16) | (0x0f << 12) | (o2 << 11) | (1 << 10) | ((i8 & 0x1f) << 5) | rd)
+.endfunc
+
+/* Shift by immediate.
+/*   0 Q U 011110 immh immb opcode 1 Rn Rd
+/* immh:immb is one 7-bit field holding the element width and the
+/* shift together: a right shift stores 2*esize - amount, a left
+/* shift stores esize + amount. */
+!def vshr(nm, u, opc, ar, q, es) {
+!{nm} vd.!{ar},vn.!{ar},#!s ::s<1;3,s>!{es};3 :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0f<<24)|(((!{es}*2)-s)<<16)|(!{opc}<<11)|(1<<10)|(vn<<5)|vd)
+}
+!def vshl(nm, u, opc, ar, q, es) {
+!{nm} vd.!{ar},vn.!{ar},#!s ::s<0;3,s>!{es-1};3 :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0f<<24)|((!{es}+s)<<16)|(!{opc}<<11)|(1<<10)|(vn<<5)|vd)
+}
+!def vshall(nm, u, opc, right, d2) {
+!if right !then {
+!vshr(nm, u, opc, "8B", 0, 8)
+!vshr(nm, u, opc, "16B", 1, 8)
+!vshr(nm, u, opc, "4H", 0, 16)
+!vshr(nm, u, opc, "8H", 1, 16)
+!vshr(nm, u, opc, "2S", 0, 32)
+!vshr(nm, u, opc, "4S", 1, 32)
+!if d2 !then {
+!vshr(nm, u, opc, "2D", 1, 64)
+}
+} !else {
+!vshl(nm, u, opc, "8B", 0, 8)
+!vshl(nm, u, opc, "16B", 1, 8)
+!vshl(nm, u, opc, "4H", 0, 16)
+!vshl(nm, u, opc, "8H", 1, 16)
+!vshl(nm, u, opc, "2S", 0, 32)
+!vshl(nm, u, opc, "4S", 1, 32)
+!if d2 !then {
+!vshl(nm, u, opc, "2D", 1, 64)
+}
+}
+}
+!vshall("SSHR", 0, 0x00, 1, 1)
+!vshall("USHR", 1, 0x00, 1, 1)
+!vshall("SSRA", 0, 0x02, 1, 1)
+!vshall("USRA", 1, 0x02, 1, 1)
+!vshall("SRSHR", 0, 0x04, 1, 1)
+!vshall("URSHR", 1, 0x04, 1, 1)
+!vshall("SRSRA", 0, 0x06, 1, 1)
+!vshall("URSRA", 1, 0x06, 1, 1)
+!vshall("SRI", 1, 0x08, 1, 1)
+!vshall("SHL", 0, 0x0a, 0, 1)
+!vshall("SLI", 1, 0x0a, 0, 1)
+!vshall("SQSHL", 0, 0x0e, 0, 1)
+!vshall("UQSHL", 1, 0x0e, 0, 1)
+!vshall("SQSHLU", 1, 0x0c, 0, 1)
+
+/* Narrowing shifts. The stored field counts from twice the
+/* destination element width. */
+!def vshrn(nm, u, opc, dar, sar, q, es) {
+!{nm} vd.!{dar},vn.!{sar},#!s ::s<1;3,s>!{es};3 :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0f<<24)|(((!{es}*2)-s)<<16)|(!{opc}<<11)|(1<<10)|(vn<<5)|vd)
+}
+!def vnshift(nm, u, opc) {
+!vshrn(nm, u, opc, "8B", "8H", 0, 8)
+!vshrn(nm, u, opc, "4H", "4S", 0, 16)
+!vshrn(nm, u, opc, "2S", "2D", 0, 32)
+!vshrn(nm + "2", u, opc, "16B", "8H", 1, 8)
+!vshrn(nm + "2", u, opc, "8H", "4S", 1, 16)
+!vshrn(nm + "2", u, opc, "4S", "2D", 1, 32)
+}
+!vnshift("SHRN", 0, 0x10)
+!vnshift("RSHRN", 0, 0x11)
+!vnshift("SQSHRN", 0, 0x12)
+!vnshift("SQRSHRN", 0, 0x13)
+!vnshift("SQSHRUN", 1, 0x10)
+!vnshift("SQRSHRUN", 1, 0x11)
+!vnshift("UQSHRN", 1, 0x12)
+!vnshift("UQRSHRN", 1, 0x13)
+
+/* Widening shift, and the extend aliases that are the same thing
+/* with a shift of zero. */
+!def vshll2(nm, u, dar, sar, q, es) {
+!{nm} vd.!{dar},vn.!{sar},#!s ::s<0;3,s>!{es-1};3 :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0f<<24)|((!{es}+s)<<16)|(0x14<<11)|(1<<10)|(vn<<5)|vd)
+}
+!def vxtl(nm, u, dar, sar, q, es) {
+!{nm} vd.!{dar},vn.!{sar} :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0f<<24)|(!{es}<<16)|(0x14<<11)|(1<<10)|(vn<<5)|vd)
+}
+!def vwshift(nm, xn, u) {
+!vshll2(nm, u, "8H", "8B", 0, 8)
+!vshll2(nm, u, "4S", "4H", 0, 16)
+!vshll2(nm, u, "2D", "2S", 0, 32)
+!vshll2(nm + "2", u, "8H", "16B", 1, 8)
+!vshll2(nm + "2", u, "4S", "8H", 1, 16)
+!vshll2(nm + "2", u, "2D", "4S", 1, 32)
+!vxtl(xn, u, "8H", "8B", 0, 8)
+!vxtl(xn, u, "4S", "4H", 0, 16)
+!vxtl(xn, u, "2D", "2S", 0, 32)
+!vxtl(xn + "2", u, "8H", "16B", 1, 8)
+!vxtl(xn + "2", u, "4S", "8H", 1, 16)
+!vxtl(xn + "2", u, "2D", "4S", 1, 32)
+}
+!vwshift("SSHLL", "SXTL", 0)
+!vwshift("USHLL", "UXTL", 1)
+
+/* Vector fixed-point conversions */
+!def vfx(nm, u, opc, ar, q, es) {
+!{nm} vd.!{ar},vn.!{ar},#!c ::c<1;3,c>!{es};3 :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0f<<24)|(((!{es}*2)-c)<<16)|(!{opc}<<11)|(1<<10)|(vn<<5)|vd)
+}
+!def vfxall(nm, u, opc) {
+!vfx(nm, u, opc, "4H", 0, 16)
+!vfx(nm, u, opc, "8H", 1, 16)
+!vfx(nm, u, opc, "2S", 0, 32)
+!vfx(nm, u, opc, "4S", 1, 32)
+!vfx(nm, u, opc, "2D", 1, 64)
+}
+!vfxall("SCVTF", 0, 0x1c)
+!vfxall("UCVTF", 1, 0x1c)
+!vfxall("FCVTZS", 0, 0x1f)
+!vfxall("FCVTZU", 1, 0x1f)
+
+/* By element.
+/*   0 Q U 01111 size L M Rm opcode H 0 Rn Rd
+/* The lane index is split across H, L and M, and how it splits
+/* depends on the element width: a half-precision lane uses all three
+/* and leaves only four bits for Rm, so those rows restrict the second
+/* source to V0-V15. */
+.setsym::VL::V0,V1,V2,V3,V4,V5,V6,V7,V8,V9,V10,V11,V12,V13,V14,V15
+.check::vl::VL
+!def vbeh(nm, u, opc, dar, sar, q) {
+!{nm} vd.!{dar},vn.!{sar},vl.H[!!i] ::i<0;3,i>7;3 :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0f<<24)|(1<<22)|(((i>>1)&1)<<21)|((i&1)<<20)|(vl<<16)|(!{opc}<<12)|(((i>>2)&1)<<11)|(vn<<5)|vd)
+}
+!def vbehf(nm, u, opc, dar, sar, q) {
+!{nm} vd.!{dar},vn.!{sar},vl.H[!!i] ::i<0;3,i>7;3 :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0f<<24)|(((i>>1)&1)<<21)|((i&1)<<20)|(vl<<16)|(!{opc}<<12)|(((i>>2)&1)<<11)|(vn<<5)|vd)
+}
+!def vbes(nm, u, opc, dar, sar, q, sz) {
+!{nm} vd.!{dar},vn.!{sar},vm.S[!!i] ::i<0;3,i>3;3 :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0f<<24)|(!{sz}<<22)|((i&1)<<21)|(((vm>>4)&1)<<20)|((vm&15)<<16)|(!{opc}<<12)|(((i>>1)&1)<<11)|(vn<<5)|vd)
+}
+!def vbed(nm, u, opc, dar, sar, q) {
+!{nm} vd.!{dar},vn.!{sar},vm.D[!!i] ::i<0;3,i>1;3 :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0f<<24)|(3<<22)|(((vm>>4)&1)<<20)|((vm&15)<<16)|(!{opc}<<12)|(i<<11)|(vn<<5)|vd)
+}
+/* Same-shape integer forms */
+!def vbei(nm, u, opc) {
+!vbeh(nm, u, opc, "4H", "4H", 0)
+!vbeh(nm, u, opc, "8H", "8H", 1)
+!vbes(nm, u, opc, "2S", "2S", 0, 2)
+!vbes(nm, u, opc, "4S", "4S", 1, 2)
+}
+!vbei("MUL", 0, 0x8)
+!vbei("MLA", 1, 0x0)
+!vbei("MLS", 1, 0x4)
+!vbei("SQDMULH", 0, 0xc)
+!vbei("SQRDMULH", 0, 0xd)
+!vbei("SQRDMLAH", 1, 0xd)
+!vbei("SQRDMLSH", 1, 0xf)
+/* Same-shape floating-point forms; the half-precision ones use size
+/* 00 rather than 01. */
+!def vbef(nm, u, opc) {
+!vbehf(nm, u, opc, "4H", "4H", 0)
+!vbehf(nm, u, opc, "8H", "8H", 1)
+!vbes(nm, u, opc, "2S", "2S", 0, 2)
+!vbes(nm, u, opc, "4S", "4S", 1, 2)
+!vbed(nm, u, opc, "2D", "2D", 1)
+}
+!vbef("FMLA", 0, 0x1)
+!vbef("FMLS", 0, 0x5)
+!vbef("FMUL", 0, 0x9)
+!vbef("FMULX", 1, 0x9)
+/* Widening forms */
+!def vbew(nm, u, opc) {
+!vbeh(nm, u, opc, "4S", "4H", 0)
+!vbeh(nm + "2", u, opc, "4S", "8H", 1)
+!vbes(nm, u, opc, "2D", "2S", 0, 2)
+!vbes(nm + "2", u, opc, "2D", "4S", 1, 2)
+}
+!vbew("SMLAL", 0, 0x2)
+!vbew("SMLSL", 0, 0x6)
+!vbew("SMULL", 0, 0xa)
+!vbew("UMLAL", 1, 0x2)
+!vbew("UMLSL", 1, 0x6)
+!vbew("UMULL", 1, 0xa)
+!vbew("SQDMLAL", 0, 0x3)
+!vbew("SQDMLSL", 0, 0x7)
+!vbew("SQDMULL", 0, 0xb)
+/* Dot product by element: the lane names four bytes at a time */
+!def vbedot(nm, u) {
+!{nm} vd.2S,vn.8B,vm.4B[!!i] ::i<0;3,i>3;3 :: .call w4((!{u}<<29)|(0x0f<<24)|(2<<22)|((i&1)<<21)|(((vm>>4)&1)<<20)|((vm&15)<<16)|(0xe<<12)|(((i>>1)&1)<<11)|(vn<<5)|vd)
+!{nm} vd.4S,vn.16B,vm.4B[!!i] ::i<0;3,i>3;3 :: .call w4((1<<30)|(!{u}<<29)|(0x0f<<24)|(2<<22)|((i&1)<<21)|(((vm>>4)&1)<<20)|((vm&15)<<16)|(0xe<<12)|(((i>>1)&1)<<11)|(vn<<5)|vd)
+}
+!vbedot("SDOT", 0)
+!vbedot("UDOT", 1)
+
+/* ===================================================================
+/* Advanced SIMD load/store structures
+/*
+/* Multiple structures:
+/*   0 Q 0011 0 0 0 L 000000 opcode size Rn Rt
+/* Single structure and replicate:
+/*   0 Q 0011 0 1 0 L R 00000 opcode S size Rn Rt
+/* The post-index forms set bit 23 and put the index register in Rm,
+/* with 11111 there meaning "advance by the transfer size". The list
+/* is one to four consecutive V registers, and the rows check that
+/* they really are consecutive.
+/* =================================================================== */
+!def lsm1(nm, l, opc, ar, q, sz, nb) {
+!{nm} {vn.!{ar}},[xb] :: .call w4((!{q}<<30)|(0x0c<<24)|(!{l}<<22)|(!{opc}<<12)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar}},[xb],#!o ::o!=!{nb};3 :: .call w4((!{q}<<30)|(0x0c<<24)|(1<<23)|(!{l}<<22)|(31<<16)|(!{opc}<<12)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar}},[xb],xm :: .call w4((!{q}<<30)|(0x0c<<24)|(1<<23)|(!{l}<<22)|(xm<<16)|(!{opc}<<12)|(!{sz}<<10)|(xb<<5)|vn)
+}
+!def lsm2(nm, l, opc, ar, q, sz, nb) {
+!{nm} {vn.!{ar},va.!{ar}},[xb] ::va!=((vn+1)&31);5 :: .call w4((!{q}<<30)|(0x0c<<24)|(!{l}<<22)|(!{opc}<<12)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar},va.!{ar}},[xb],#!o ::va!=((vn+1)&31);5,o!=!{nb};3 :: .call w4((!{q}<<30)|(0x0c<<24)|(1<<23)|(!{l}<<22)|(31<<16)|(!{opc}<<12)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar},va.!{ar}},[xb],xm ::va!=((vn+1)&31);5 :: .call w4((!{q}<<30)|(0x0c<<24)|(1<<23)|(!{l}<<22)|(xm<<16)|(!{opc}<<12)|(!{sz}<<10)|(xb<<5)|vn)
+}
+!def lsm3(nm, l, opc, ar, q, sz, nb) {
+!{nm} {vn.!{ar},va.!{ar},vb.!{ar}},[xb] ::va!=((vn+1)&31);5,vb!=((vn+2)&31);5 :: .call w4((!{q}<<30)|(0x0c<<24)|(!{l}<<22)|(!{opc}<<12)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar},va.!{ar},vb.!{ar}},[xb],#!o ::va!=((vn+1)&31);5,vb!=((vn+2)&31);5,o!=!{nb};3 :: .call w4((!{q}<<30)|(0x0c<<24)|(1<<23)|(!{l}<<22)|(31<<16)|(!{opc}<<12)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar},va.!{ar},vb.!{ar}},[xb],xm ::va!=((vn+1)&31);5,vb!=((vn+2)&31);5 :: .call w4((!{q}<<30)|(0x0c<<24)|(1<<23)|(!{l}<<22)|(xm<<16)|(!{opc}<<12)|(!{sz}<<10)|(xb<<5)|vn)
+}
+!def lsm4(nm, l, opc, ar, q, sz, nb) {
+!{nm} {vn.!{ar},va.!{ar},vb.!{ar},vc.!{ar}},[xb] ::va!=((vn+1)&31);5,vb!=((vn+2)&31);5,vc!=((vn+3)&31);5 :: .call w4((!{q}<<30)|(0x0c<<24)|(!{l}<<22)|(!{opc}<<12)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar},va.!{ar},vb.!{ar},vc.!{ar}},[xb],#!o ::va!=((vn+1)&31);5,vb!=((vn+2)&31);5,vc!=((vn+3)&31);5,o!=!{nb};3 :: .call w4((!{q}<<30)|(0x0c<<24)|(1<<23)|(!{l}<<22)|(31<<16)|(!{opc}<<12)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar},va.!{ar},vb.!{ar},vc.!{ar}},[xb],xm ::va!=((vn+1)&31);5,vb!=((vn+2)&31);5,vc!=((vn+3)&31);5 :: .call w4((!{q}<<30)|(0x0c<<24)|(1<<23)|(!{l}<<22)|(xm<<16)|(!{opc}<<12)|(!{sz}<<10)|(xb<<5)|vn)
+}
+/* ST1: 1 register per group */
+!lsm1("ST1", 0, 0x7, "8B", 0, 0, 8)
+!lsm1("ST1", 0, 0x7, "16B", 1, 0, 16)
+!lsm1("ST1", 0, 0x7, "4H", 0, 1, 8)
+!lsm1("ST1", 0, 0x7, "8H", 1, 1, 16)
+!lsm1("ST1", 0, 0x7, "2S", 0, 2, 8)
+!lsm1("ST1", 0, 0x7, "4S", 1, 2, 16)
+!lsm1("ST1", 0, 0x7, "1D", 0, 3, 8)
+!lsm1("ST1", 0, 0x7, "2D", 1, 3, 16)
+/* ST1: 2 registers per group */
+!lsm2("ST1", 0, 0xa, "8B", 0, 0, 16)
+!lsm2("ST1", 0, 0xa, "16B", 1, 0, 32)
+!lsm2("ST1", 0, 0xa, "4H", 0, 1, 16)
+!lsm2("ST1", 0, 0xa, "8H", 1, 1, 32)
+!lsm2("ST1", 0, 0xa, "2S", 0, 2, 16)
+!lsm2("ST1", 0, 0xa, "4S", 1, 2, 32)
+!lsm2("ST1", 0, 0xa, "1D", 0, 3, 16)
+!lsm2("ST1", 0, 0xa, "2D", 1, 3, 32)
+/* ST1: 3 registers per group */
+!lsm3("ST1", 0, 0x6, "8B", 0, 0, 24)
+!lsm3("ST1", 0, 0x6, "16B", 1, 0, 48)
+!lsm3("ST1", 0, 0x6, "4H", 0, 1, 24)
+!lsm3("ST1", 0, 0x6, "8H", 1, 1, 48)
+!lsm3("ST1", 0, 0x6, "2S", 0, 2, 24)
+!lsm3("ST1", 0, 0x6, "4S", 1, 2, 48)
+!lsm3("ST1", 0, 0x6, "1D", 0, 3, 24)
+!lsm3("ST1", 0, 0x6, "2D", 1, 3, 48)
+/* ST1: 4 registers per group */
+!lsm4("ST1", 0, 0x2, "8B", 0, 0, 32)
+!lsm4("ST1", 0, 0x2, "16B", 1, 0, 64)
+!lsm4("ST1", 0, 0x2, "4H", 0, 1, 32)
+!lsm4("ST1", 0, 0x2, "8H", 1, 1, 64)
+!lsm4("ST1", 0, 0x2, "2S", 0, 2, 32)
+!lsm4("ST1", 0, 0x2, "4S", 1, 2, 64)
+!lsm4("ST1", 0, 0x2, "1D", 0, 3, 32)
+!lsm4("ST1", 0, 0x2, "2D", 1, 3, 64)
+/* ST2: 2 registers per group */
+!lsm2("ST2", 0, 0x8, "8B", 0, 0, 16)
+!lsm2("ST2", 0, 0x8, "16B", 1, 0, 32)
+!lsm2("ST2", 0, 0x8, "4H", 0, 1, 16)
+!lsm2("ST2", 0, 0x8, "8H", 1, 1, 32)
+!lsm2("ST2", 0, 0x8, "2S", 0, 2, 16)
+!lsm2("ST2", 0, 0x8, "4S", 1, 2, 32)
+!lsm2("ST2", 0, 0x8, "2D", 1, 3, 32)
+/* ST3: 3 registers per group */
+!lsm3("ST3", 0, 0x4, "8B", 0, 0, 24)
+!lsm3("ST3", 0, 0x4, "16B", 1, 0, 48)
+!lsm3("ST3", 0, 0x4, "4H", 0, 1, 24)
+!lsm3("ST3", 0, 0x4, "8H", 1, 1, 48)
+!lsm3("ST3", 0, 0x4, "2S", 0, 2, 24)
+!lsm3("ST3", 0, 0x4, "4S", 1, 2, 48)
+!lsm3("ST3", 0, 0x4, "2D", 1, 3, 48)
+/* ST4: 4 registers per group */
+!lsm4("ST4", 0, 0x0, "8B", 0, 0, 32)
+!lsm4("ST4", 0, 0x0, "16B", 1, 0, 64)
+!lsm4("ST4", 0, 0x0, "4H", 0, 1, 32)
+!lsm4("ST4", 0, 0x0, "8H", 1, 1, 64)
+!lsm4("ST4", 0, 0x0, "2S", 0, 2, 32)
+!lsm4("ST4", 0, 0x0, "4S", 1, 2, 64)
+!lsm4("ST4", 0, 0x0, "2D", 1, 3, 64)
+/* LD1: 1 register per group */
+!lsm1("LD1", 1, 0x7, "8B", 0, 0, 8)
+!lsm1("LD1", 1, 0x7, "16B", 1, 0, 16)
+!lsm1("LD1", 1, 0x7, "4H", 0, 1, 8)
+!lsm1("LD1", 1, 0x7, "8H", 1, 1, 16)
+!lsm1("LD1", 1, 0x7, "2S", 0, 2, 8)
+!lsm1("LD1", 1, 0x7, "4S", 1, 2, 16)
+!lsm1("LD1", 1, 0x7, "1D", 0, 3, 8)
+!lsm1("LD1", 1, 0x7, "2D", 1, 3, 16)
+/* LD1: 2 registers per group */
+!lsm2("LD1", 1, 0xa, "8B", 0, 0, 16)
+!lsm2("LD1", 1, 0xa, "16B", 1, 0, 32)
+!lsm2("LD1", 1, 0xa, "4H", 0, 1, 16)
+!lsm2("LD1", 1, 0xa, "8H", 1, 1, 32)
+!lsm2("LD1", 1, 0xa, "2S", 0, 2, 16)
+!lsm2("LD1", 1, 0xa, "4S", 1, 2, 32)
+!lsm2("LD1", 1, 0xa, "1D", 0, 3, 16)
+!lsm2("LD1", 1, 0xa, "2D", 1, 3, 32)
+/* LD1: 3 registers per group */
+!lsm3("LD1", 1, 0x6, "8B", 0, 0, 24)
+!lsm3("LD1", 1, 0x6, "16B", 1, 0, 48)
+!lsm3("LD1", 1, 0x6, "4H", 0, 1, 24)
+!lsm3("LD1", 1, 0x6, "8H", 1, 1, 48)
+!lsm3("LD1", 1, 0x6, "2S", 0, 2, 24)
+!lsm3("LD1", 1, 0x6, "4S", 1, 2, 48)
+!lsm3("LD1", 1, 0x6, "1D", 0, 3, 24)
+!lsm3("LD1", 1, 0x6, "2D", 1, 3, 48)
+/* LD1: 4 registers per group */
+!lsm4("LD1", 1, 0x2, "8B", 0, 0, 32)
+!lsm4("LD1", 1, 0x2, "16B", 1, 0, 64)
+!lsm4("LD1", 1, 0x2, "4H", 0, 1, 32)
+!lsm4("LD1", 1, 0x2, "8H", 1, 1, 64)
+!lsm4("LD1", 1, 0x2, "2S", 0, 2, 32)
+!lsm4("LD1", 1, 0x2, "4S", 1, 2, 64)
+!lsm4("LD1", 1, 0x2, "1D", 0, 3, 32)
+!lsm4("LD1", 1, 0x2, "2D", 1, 3, 64)
+/* LD2: 2 registers per group */
+!lsm2("LD2", 1, 0x8, "8B", 0, 0, 16)
+!lsm2("LD2", 1, 0x8, "16B", 1, 0, 32)
+!lsm2("LD2", 1, 0x8, "4H", 0, 1, 16)
+!lsm2("LD2", 1, 0x8, "8H", 1, 1, 32)
+!lsm2("LD2", 1, 0x8, "2S", 0, 2, 16)
+!lsm2("LD2", 1, 0x8, "4S", 1, 2, 32)
+!lsm2("LD2", 1, 0x8, "2D", 1, 3, 32)
+/* LD3: 3 registers per group */
+!lsm3("LD3", 1, 0x4, "8B", 0, 0, 24)
+!lsm3("LD3", 1, 0x4, "16B", 1, 0, 48)
+!lsm3("LD3", 1, 0x4, "4H", 0, 1, 24)
+!lsm3("LD3", 1, 0x4, "8H", 1, 1, 48)
+!lsm3("LD3", 1, 0x4, "2S", 0, 2, 24)
+!lsm3("LD3", 1, 0x4, "4S", 1, 2, 48)
+!lsm3("LD3", 1, 0x4, "2D", 1, 3, 48)
+/* LD4: 4 registers per group */
+!lsm4("LD4", 1, 0x0, "8B", 0, 0, 32)
+!lsm4("LD4", 1, 0x0, "16B", 1, 0, 64)
+!lsm4("LD4", 1, 0x0, "4H", 0, 1, 32)
+!lsm4("LD4", 1, 0x0, "8H", 1, 1, 64)
+!lsm4("LD4", 1, 0x0, "2S", 0, 2, 32)
+!lsm4("LD4", 1, 0x0, "4S", 1, 2, 64)
+!lsm4("LD4", 1, 0x0, "2D", 1, 3, 64)
+
+/* Single structure. Q, S and size together hold the lane index, so
+/* each row computes them from the index rather than fixing them. */
+!def lss1(nm, l, r, opc, el, mx, nb, qe, se, ze) {
+!{nm} {vn.!{el}}[!!i],[xb] ::i<0;3,i>!{mx};3 :: .call w4(((!{qe})<<30)|(0x0d<<24)|(!{l}<<22)|(!{r}<<21)|(!{opc}<<13)|((!{se})<<12)|((!{ze})<<10)|(xb<<5)|vn)
+!{nm} {vn.!{el}}[!!i],[xb],#!o ::i<0;3,i>!{mx};3,o!=!{nb};3 :: .call w4(((!{qe})<<30)|(0x0d<<24)|(1<<23)|(!{l}<<22)|(!{r}<<21)|(31<<16)|(!{opc}<<13)|((!{se})<<12)|((!{ze})<<10)|(xb<<5)|vn)
+!{nm} {vn.!{el}}[!!i],[xb],xm ::i<0;3,i>!{mx};3 :: .call w4(((!{qe})<<30)|(0x0d<<24)|(1<<23)|(!{l}<<22)|(!{r}<<21)|(xm<<16)|(!{opc}<<13)|((!{se})<<12)|((!{ze})<<10)|(xb<<5)|vn)
+}
+!def lss2(nm, l, r, opc, el, mx, nb, qe, se, ze) {
+!{nm} {vn.!{el},va.!{el}}[!!i],[xb] ::i<0;3,i>!{mx};3,va!=((vn+1)&31);5 :: .call w4(((!{qe})<<30)|(0x0d<<24)|(!{l}<<22)|(!{r}<<21)|(!{opc}<<13)|((!{se})<<12)|((!{ze})<<10)|(xb<<5)|vn)
+!{nm} {vn.!{el},va.!{el}}[!!i],[xb],#!o ::i<0;3,i>!{mx};3,va!=((vn+1)&31);5,o!=!{nb};3 :: .call w4(((!{qe})<<30)|(0x0d<<24)|(1<<23)|(!{l}<<22)|(!{r}<<21)|(31<<16)|(!{opc}<<13)|((!{se})<<12)|((!{ze})<<10)|(xb<<5)|vn)
+!{nm} {vn.!{el},va.!{el}}[!!i],[xb],xm ::i<0;3,i>!{mx};3,va!=((vn+1)&31);5 :: .call w4(((!{qe})<<30)|(0x0d<<24)|(1<<23)|(!{l}<<22)|(!{r}<<21)|(xm<<16)|(!{opc}<<13)|((!{se})<<12)|((!{ze})<<10)|(xb<<5)|vn)
+}
+!def lss3(nm, l, r, opc, el, mx, nb, qe, se, ze) {
+!{nm} {vn.!{el},va.!{el},vb.!{el}}[!!i],[xb] ::i<0;3,i>!{mx};3,va!=((vn+1)&31);5,vb!=((vn+2)&31);5 :: .call w4(((!{qe})<<30)|(0x0d<<24)|(!{l}<<22)|(!{r}<<21)|(!{opc}<<13)|((!{se})<<12)|((!{ze})<<10)|(xb<<5)|vn)
+!{nm} {vn.!{el},va.!{el},vb.!{el}}[!!i],[xb],#!o ::i<0;3,i>!{mx};3,va!=((vn+1)&31);5,vb!=((vn+2)&31);5,o!=!{nb};3 :: .call w4(((!{qe})<<30)|(0x0d<<24)|(1<<23)|(!{l}<<22)|(!{r}<<21)|(31<<16)|(!{opc}<<13)|((!{se})<<12)|((!{ze})<<10)|(xb<<5)|vn)
+!{nm} {vn.!{el},va.!{el},vb.!{el}}[!!i],[xb],xm ::i<0;3,i>!{mx};3,va!=((vn+1)&31);5,vb!=((vn+2)&31);5 :: .call w4(((!{qe})<<30)|(0x0d<<24)|(1<<23)|(!{l}<<22)|(!{r}<<21)|(xm<<16)|(!{opc}<<13)|((!{se})<<12)|((!{ze})<<10)|(xb<<5)|vn)
+}
+!def lss4(nm, l, r, opc, el, mx, nb, qe, se, ze) {
+!{nm} {vn.!{el},va.!{el},vb.!{el},vc.!{el}}[!!i],[xb] ::i<0;3,i>!{mx};3,va!=((vn+1)&31);5,vb!=((vn+2)&31);5,vc!=((vn+3)&31);5 :: .call w4(((!{qe})<<30)|(0x0d<<24)|(!{l}<<22)|(!{r}<<21)|(!{opc}<<13)|((!{se})<<12)|((!{ze})<<10)|(xb<<5)|vn)
+!{nm} {vn.!{el},va.!{el},vb.!{el},vc.!{el}}[!!i],[xb],#!o ::i<0;3,i>!{mx};3,va!=((vn+1)&31);5,vb!=((vn+2)&31);5,vc!=((vn+3)&31);5,o!=!{nb};3 :: .call w4(((!{qe})<<30)|(0x0d<<24)|(1<<23)|(!{l}<<22)|(!{r}<<21)|(31<<16)|(!{opc}<<13)|((!{se})<<12)|((!{ze})<<10)|(xb<<5)|vn)
+!{nm} {vn.!{el},va.!{el},vb.!{el},vc.!{el}}[!!i],[xb],xm ::i<0;3,i>!{mx};3,va!=((vn+1)&31);5,vb!=((vn+2)&31);5,vc!=((vn+3)&31);5 :: .call w4(((!{qe})<<30)|(0x0d<<24)|(1<<23)|(!{l}<<22)|(!{r}<<21)|(xm<<16)|(!{opc}<<13)|((!{se})<<12)|((!{ze})<<10)|(xb<<5)|vn)
+}
+!lss1("ST1", 0, 0, 0, "B", 15, 1, "(i>>3)&1", "(i>>2)&1", "i&3")
+!lss1("ST1", 0, 0, 2, "H", 7, 2, "(i>>2)&1", "(i>>1)&1", "(i&1)<<1")
+!lss1("ST1", 0, 0, 4, "S", 3, 4, "(i>>1)&1", "i&1", "0")
+!lss1("ST1", 0, 0, 4, "D", 1, 8, "i&1", "0", "1")
+!lss2("ST2", 0, 1, 0, "B", 15, 2, "(i>>3)&1", "(i>>2)&1", "i&3")
+!lss2("ST2", 0, 1, 2, "H", 7, 4, "(i>>2)&1", "(i>>1)&1", "(i&1)<<1")
+!lss2("ST2", 0, 1, 4, "S", 3, 8, "(i>>1)&1", "i&1", "0")
+!lss2("ST2", 0, 1, 4, "D", 1, 16, "i&1", "0", "1")
+!lss3("ST3", 0, 0, 1, "B", 15, 3, "(i>>3)&1", "(i>>2)&1", "i&3")
+!lss3("ST3", 0, 0, 3, "H", 7, 6, "(i>>2)&1", "(i>>1)&1", "(i&1)<<1")
+!lss3("ST3", 0, 0, 5, "S", 3, 12, "(i>>1)&1", "i&1", "0")
+!lss3("ST3", 0, 0, 5, "D", 1, 24, "i&1", "0", "1")
+!lss4("ST4", 0, 1, 1, "B", 15, 4, "(i>>3)&1", "(i>>2)&1", "i&3")
+!lss4("ST4", 0, 1, 3, "H", 7, 8, "(i>>2)&1", "(i>>1)&1", "(i&1)<<1")
+!lss4("ST4", 0, 1, 5, "S", 3, 16, "(i>>1)&1", "i&1", "0")
+!lss4("ST4", 0, 1, 5, "D", 1, 32, "i&1", "0", "1")
+!lss1("LD1", 1, 0, 0, "B", 15, 1, "(i>>3)&1", "(i>>2)&1", "i&3")
+!lss1("LD1", 1, 0, 2, "H", 7, 2, "(i>>2)&1", "(i>>1)&1", "(i&1)<<1")
+!lss1("LD1", 1, 0, 4, "S", 3, 4, "(i>>1)&1", "i&1", "0")
+!lss1("LD1", 1, 0, 4, "D", 1, 8, "i&1", "0", "1")
+!lss2("LD2", 1, 1, 0, "B", 15, 2, "(i>>3)&1", "(i>>2)&1", "i&3")
+!lss2("LD2", 1, 1, 2, "H", 7, 4, "(i>>2)&1", "(i>>1)&1", "(i&1)<<1")
+!lss2("LD2", 1, 1, 4, "S", 3, 8, "(i>>1)&1", "i&1", "0")
+!lss2("LD2", 1, 1, 4, "D", 1, 16, "i&1", "0", "1")
+!lss3("LD3", 1, 0, 1, "B", 15, 3, "(i>>3)&1", "(i>>2)&1", "i&3")
+!lss3("LD3", 1, 0, 3, "H", 7, 6, "(i>>2)&1", "(i>>1)&1", "(i&1)<<1")
+!lss3("LD3", 1, 0, 5, "S", 3, 12, "(i>>1)&1", "i&1", "0")
+!lss3("LD3", 1, 0, 5, "D", 1, 24, "i&1", "0", "1")
+!lss4("LD4", 1, 1, 1, "B", 15, 4, "(i>>3)&1", "(i>>2)&1", "i&3")
+!lss4("LD4", 1, 1, 3, "H", 7, 8, "(i>>2)&1", "(i>>1)&1", "(i&1)<<1")
+!lss4("LD4", 1, 1, 5, "S", 3, 16, "(i>>1)&1", "i&1", "0")
+!lss4("LD4", 1, 1, 5, "D", 1, 32, "i&1", "0", "1")
+
+/* Replicate: one element broadcast to every lane */
+!def lsr1(nm, r, opc, ar, q, sz, nb) {
+!{nm} {vn.!{ar}},[xb] :: .call w4((!{q}<<30)|(0x0d<<24)|(1<<22)|(!{r}<<21)|(!{opc}<<13)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar}},[xb],#!o ::o!=!{nb};3 :: .call w4((!{q}<<30)|(0x0d<<24)|(1<<23)|(1<<22)|(!{r}<<21)|(31<<16)|(!{opc}<<13)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar}},[xb],xm :: .call w4((!{q}<<30)|(0x0d<<24)|(1<<23)|(1<<22)|(!{r}<<21)|(xm<<16)|(!{opc}<<13)|(!{sz}<<10)|(xb<<5)|vn)
+}
+!def lsr2(nm, r, opc, ar, q, sz, nb) {
+!{nm} {vn.!{ar},va.!{ar}},[xb] ::va!=((vn+1)&31);5 :: .call w4((!{q}<<30)|(0x0d<<24)|(1<<22)|(!{r}<<21)|(!{opc}<<13)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar},va.!{ar}},[xb],#!o ::va!=((vn+1)&31);5,o!=!{nb};3 :: .call w4((!{q}<<30)|(0x0d<<24)|(1<<23)|(1<<22)|(!{r}<<21)|(31<<16)|(!{opc}<<13)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar},va.!{ar}},[xb],xm ::va!=((vn+1)&31);5 :: .call w4((!{q}<<30)|(0x0d<<24)|(1<<23)|(1<<22)|(!{r}<<21)|(xm<<16)|(!{opc}<<13)|(!{sz}<<10)|(xb<<5)|vn)
+}
+!def lsr3(nm, r, opc, ar, q, sz, nb) {
+!{nm} {vn.!{ar},va.!{ar},vb.!{ar}},[xb] ::va!=((vn+1)&31);5,vb!=((vn+2)&31);5 :: .call w4((!{q}<<30)|(0x0d<<24)|(1<<22)|(!{r}<<21)|(!{opc}<<13)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar},va.!{ar},vb.!{ar}},[xb],#!o ::va!=((vn+1)&31);5,vb!=((vn+2)&31);5,o!=!{nb};3 :: .call w4((!{q}<<30)|(0x0d<<24)|(1<<23)|(1<<22)|(!{r}<<21)|(31<<16)|(!{opc}<<13)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar},va.!{ar},vb.!{ar}},[xb],xm ::va!=((vn+1)&31);5,vb!=((vn+2)&31);5 :: .call w4((!{q}<<30)|(0x0d<<24)|(1<<23)|(1<<22)|(!{r}<<21)|(xm<<16)|(!{opc}<<13)|(!{sz}<<10)|(xb<<5)|vn)
+}
+!def lsr4(nm, r, opc, ar, q, sz, nb) {
+!{nm} {vn.!{ar},va.!{ar},vb.!{ar},vc.!{ar}},[xb] ::va!=((vn+1)&31);5,vb!=((vn+2)&31);5,vc!=((vn+3)&31);5 :: .call w4((!{q}<<30)|(0x0d<<24)|(1<<22)|(!{r}<<21)|(!{opc}<<13)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar},va.!{ar},vb.!{ar},vc.!{ar}},[xb],#!o ::va!=((vn+1)&31);5,vb!=((vn+2)&31);5,vc!=((vn+3)&31);5,o!=!{nb};3 :: .call w4((!{q}<<30)|(0x0d<<24)|(1<<23)|(1<<22)|(!{r}<<21)|(31<<16)|(!{opc}<<13)|(!{sz}<<10)|(xb<<5)|vn)
+!{nm} {vn.!{ar},va.!{ar},vb.!{ar},vc.!{ar}},[xb],xm ::va!=((vn+1)&31);5,vb!=((vn+2)&31);5,vc!=((vn+3)&31);5 :: .call w4((!{q}<<30)|(0x0d<<24)|(1<<23)|(1<<22)|(!{r}<<21)|(xm<<16)|(!{opc}<<13)|(!{sz}<<10)|(xb<<5)|vn)
+}
+!lsr1("LD1R", 0, 6, "8B", 0, 0, 1)
+!lsr1("LD1R", 0, 6, "16B", 1, 0, 1)
+!lsr1("LD1R", 0, 6, "4H", 0, 1, 2)
+!lsr1("LD1R", 0, 6, "8H", 1, 1, 2)
+!lsr1("LD1R", 0, 6, "2S", 0, 2, 4)
+!lsr1("LD1R", 0, 6, "4S", 1, 2, 4)
+!lsr1("LD1R", 0, 6, "1D", 0, 3, 8)
+!lsr1("LD1R", 0, 6, "2D", 1, 3, 8)
+!lsr2("LD2R", 1, 6, "8B", 0, 0, 2)
+!lsr2("LD2R", 1, 6, "16B", 1, 0, 2)
+!lsr2("LD2R", 1, 6, "4H", 0, 1, 4)
+!lsr2("LD2R", 1, 6, "8H", 1, 1, 4)
+!lsr2("LD2R", 1, 6, "2S", 0, 2, 8)
+!lsr2("LD2R", 1, 6, "4S", 1, 2, 8)
+!lsr2("LD2R", 1, 6, "1D", 0, 3, 16)
+!lsr2("LD2R", 1, 6, "2D", 1, 3, 16)
+!lsr3("LD3R", 0, 7, "8B", 0, 0, 3)
+!lsr3("LD3R", 0, 7, "16B", 1, 0, 3)
+!lsr3("LD3R", 0, 7, "4H", 0, 1, 6)
+!lsr3("LD3R", 0, 7, "8H", 1, 1, 6)
+!lsr3("LD3R", 0, 7, "2S", 0, 2, 12)
+!lsr3("LD3R", 0, 7, "4S", 1, 2, 12)
+!lsr3("LD3R", 0, 7, "1D", 0, 3, 24)
+!lsr3("LD3R", 0, 7, "2D", 1, 3, 24)
+!lsr4("LD4R", 1, 7, "8B", 0, 0, 4)
+!lsr4("LD4R", 1, 7, "16B", 1, 0, 4)
+!lsr4("LD4R", 1, 7, "4H", 0, 1, 8)
+!lsr4("LD4R", 1, 7, "8H", 1, 1, 8)
+!lsr4("LD4R", 1, 7, "2S", 0, 2, 16)
+!lsr4("LD4R", 1, 7, "4S", 1, 2, 16)
+!lsr4("LD4R", 1, 7, "1D", 0, 3, 32)
+!lsr4("LD4R", 1, 7, "2D", 1, 3, 32)
+
+/* ===================================================================
+/* Advanced SIMD scalar forms
+/*
+/* Every scalar block is its vector counterpart with bits 31:30 set to
+/* 01 and bit 28 set, so the opcode numbers below are the same ones
+/* the vector rows above use. The operands are the plain B/H/S/D
+/* registers rather than an arrangement.
+/* =================================================================== */
+!def s3one(nm, u, opc, rd, rn, rm, sz) {
+!{nm} !{rd},!{rn},!{rm} :: .call w4((1<<30)|(!{u}<<29)|(0x1e<<24)|(!{sz}<<22)|(1<<21)|(!{rm}<<16)|(!{opc}<<11)|(1<<10)|(!{rn}<<5)|!{rd})
+}
+/* set 0 = D only, 1 = B/H/S/D, 2 = H/S */
+!def s3i(nm, u, opc, set) {
+!if set == 0 !then {
+!s3one(nm, u, opc, "fdd", "fdn", "fdm", 3)
+}
+!if set == 1 !then {
+!s3one(nm, u, opc, "fbd", "fbn", "fbm", 0)
+!s3one(nm, u, opc, "fhd", "fhn", "fhm", 1)
+!s3one(nm, u, opc, "fsd", "fsn", "fsm", 2)
+!s3one(nm, u, opc, "fdd", "fdn", "fdm", 3)
+}
+!if set == 2 !then {
+!s3one(nm, u, opc, "fhd", "fhn", "fhm", 1)
+!s3one(nm, u, opc, "fsd", "fsn", "fsm", 2)
+}
+}
+.check::fbm::BR
+!s3i("SQADD", 0, 0x01, 1)
+!s3i("UQADD", 1, 0x01, 1)
+!s3i("SQSUB", 0, 0x05, 1)
+!s3i("UQSUB", 1, 0x05, 1)
+!s3i("SQSHL", 0, 0x09, 1)
+!s3i("UQSHL", 1, 0x09, 1)
+!s3i("SQRSHL", 0, 0x0b, 1)
+!s3i("UQRSHL", 1, 0x0b, 1)
+!s3i("CMGT", 0, 0x06, 0)
+!s3i("CMHI", 1, 0x06, 0)
+!s3i("CMGE", 0, 0x07, 0)
+!s3i("CMHS", 1, 0x07, 0)
+!s3i("SSHL", 0, 0x08, 0)
+!s3i("USHL", 1, 0x08, 0)
+!s3i("SRSHL", 0, 0x0a, 0)
+!s3i("URSHL", 1, 0x0a, 0)
+!s3i("ADD", 0, 0x10, 0)
+!s3i("SUB", 1, 0x10, 0)
+!s3i("CMTST", 0, 0x11, 0)
+!s3i("CMEQ", 1, 0x11, 0)
+!s3i("SQDMULH", 0, 0x16, 2)
+!s3i("SQRDMULH", 1, 0x16, 2)
+/* SQRDMLAH and SQRDMLSH sit in the "three same extra" block, which
+/* is the same encoding with bit 21 clear. */
+!def s3xone(nm, u, opc, rd, rn, rm, sz) {
+!{nm} !{rd},!{rn},!{rm} :: .call w4((1<<30)|(!{u}<<29)|(0x1e<<24)|(!{sz}<<22)|(!{rm}<<16)|(!{opc}<<11)|(1<<10)|(!{rn}<<5)|!{rd})
+}
+!def s3x(nm, u, opc) {
+!s3xone(nm, u, opc, "fhd", "fhn", "fhm", 1)
+!s3xone(nm, u, opc, "fsd", "fsn", "fsm", 2)
+}
+!s3x("SQRDMLAH", 1, 0x10)
+!s3x("SQRDMLSH", 1, 0x11)
+
+/* Scalar floating-point three same */
+!def s3h(nm, u, op, k) {
+!{nm} fhd,fhn,fhm :: .call w4((1<<30)|(!{u}<<29)|(0x1e<<24)|(!{op}<<23)|(1<<22)|(fhm<<16)|(!{k}<<11)|(1<<10)|(fhn<<5)|fhd)
+}
+!def s3f(nm, u, op, k) {
+!s3h(nm, u, op, k)
+!s3one(nm, u, 0x18 + k, "fsd", "fsn", "fsm", op * 2)
+!s3one(nm, u, 0x18 + k, "fdd", "fdn", "fdm", (op * 2) + 1)
+}
+!s3f("FMULX", 0, 0, 3)
+!s3f("FCMEQ", 0, 0, 4)
+!s3f("FRECPS", 0, 0, 7)
+!s3f("FRSQRTS", 0, 1, 7)
+!s3f("FCMGE", 1, 0, 4)
+!s3f("FACGE", 1, 0, 5)
+!s3f("FABD", 1, 1, 2)
+!s3f("FCMGT", 1, 1, 4)
+!s3f("FACGT", 1, 1, 5)
+
+/* Scalar two-register miscellaneous */
+!def s2one(nm, u, sz, hi, opc, rd, rn) {
+!{nm} !{rd},!{rn} :: .call w4((1<<30)|(!{u}<<29)|(0x1e<<24)|(!{sz}<<22)|(!{hi}<<17)|(!{opc}<<12)|(2<<10)|(!{rn}<<5)|!{rd})
+}
+!def s2zone(nm, u, sz, hi, opc, rd, rn) {
+!{nm} !{rd},!{rn},#0 :: .call w4((1<<30)|(!{u}<<29)|(0x1e<<24)|(!{sz}<<22)|(!{hi}<<17)|(!{opc}<<12)|(2<<10)|(!{rn}<<5)|!{rd})
+}
+!def s2i(nm, u, opc, set) {
+!if set == 0 !then {
+!s2one(nm, u, 3, 0x10, opc, "fdd", "fdn")
+} !else {
+!s2one(nm, u, 0, 0x10, opc, "fbd", "fbn")
+!s2one(nm, u, 1, 0x10, opc, "fhd", "fhn")
+!s2one(nm, u, 2, 0x10, opc, "fsd", "fsn")
+!s2one(nm, u, 3, 0x10, opc, "fdd", "fdn")
+}
+}
+!s2i("SUQADD", 0, 0x03, 1)
+!s2i("USQADD", 1, 0x03, 1)
+!s2i("SQABS", 0, 0x07, 1)
+!s2i("SQNEG", 1, 0x07, 1)
+!s2i("ABS", 0, 0x0b, 0)
+!s2i("NEG", 1, 0x0b, 0)
+!def s2z(nm, u, opc) {
+!s2zone(nm, u, 3, 0x10, opc, "fdd", "fdn")
+}
+!s2z("CMGT", 0, 0x08)
+!s2z("CMGE", 1, 0x08)
+!s2z("CMEQ", 0, 0x09)
+!s2z("CMLE", 1, 0x09)
+!s2z("CMLT", 0, 0x0a)
+!def s2f(nm, u, op, opc) {
+!s2one(nm, u, (op * 2) + 1, 0x1c, opc, "fhd", "fhn")
+!s2one(nm, u, op * 2, 0x10, opc, "fsd", "fsn")
+!s2one(nm, u, (op * 2) + 1, 0x10, opc, "fdd", "fdn")
+}
+!s2f("FCVTNS", 0, 0, 0x1a)
+!s2f("FCVTMS", 0, 0, 0x1b)
+!s2f("FCVTAS", 0, 0, 0x1c)
+!s2f("SCVTF", 0, 0, 0x1d)
+!s2f("FCVTNU", 1, 0, 0x1a)
+!s2f("FCVTMU", 1, 0, 0x1b)
+!s2f("FCVTAU", 1, 0, 0x1c)
+!s2f("UCVTF", 1, 0, 0x1d)
+!s2f("FCVTPS", 0, 1, 0x1a)
+!s2f("FCVTZS", 0, 1, 0x1b)
+!s2f("FCVTPU", 1, 1, 0x1a)
+!s2f("FCVTZU", 1, 1, 0x1b)
+!s2f("FRECPE", 0, 1, 0x1d)
+!s2f("FRECPX", 0, 1, 0x1f)
+!s2f("FRSQRTE", 1, 1, 0x1d)
+!def s2fz(nm, u, opc) {
+!s2zone(nm, u, 3, 0x1c, opc, "fhd", "fhn")
+!s2zone(nm, u, 2, 0x10, opc, "fsd", "fsn")
+!s2zone(nm, u, 3, 0x10, opc, "fdd", "fdn")
+}
+!s2fz("FCMGT", 0, 0x0c)
+!s2fz("FCMEQ", 0, 0x0d)
+!s2fz("FCMLT", 0, 0x0e)
+!s2fz("FCMGE", 1, 0x0c)
+!s2fz("FCMLE", 1, 0x0d)
+/* Scalar narrowing */
+!def s2n(nm, u, opc) {
+!s2one(nm, u, 0, 0x10, opc, "fbd", "fhn")
+!s2one(nm, u, 1, 0x10, opc, "fhd", "fsn")
+!s2one(nm, u, 2, 0x10, opc, "fsd", "fdn")
+}
+!s2n("SQXTN", 0, 0x14)
+!s2n("UQXTN", 1, 0x14)
+!s2n("SQXTUN", 1, 0x12)
+!s2one("FCVTXN", 1, 1, 0x10, 0x16, "fsd", "fdn")
+
+/* Scalar pairwise: the source is a two-element vector */
+ADDP fdd,vn.2D :: .call w4((1<<30)|(0x1e<<24)|(3<<22)|(0x18<<17)|(0x1b<<12)|(2<<10)|(vn<<5)|fdd)
+!def spwf(nm, opc, sz) {
+!{nm} fhd,vn.2H :: .call w4((1<<30)|(0x1e<<24)|(!{sz}<<22)|(0x18<<17)|(!{opc}<<12)|(2<<10)|(vn<<5)|fhd)
+!{nm} fsd,vn.2S :: .call w4((1<<30)|(1<<29)|(0x1e<<24)|(!{sz}<<22)|(0x18<<17)|(!{opc}<<12)|(2<<10)|(vn<<5)|fsd)
+!{nm} fdd,vn.2D :: .call w4((1<<30)|(1<<29)|(0x1e<<24)|(!{sz+1}<<22)|(0x18<<17)|(!{opc}<<12)|(2<<10)|(vn<<5)|fdd)
+}
+!spwf("FMAXNMP", 0x0c, 0)
+!spwf("FADDP", 0x0d, 0)
+!spwf("FMAXP", 0x0f, 0)
+!spwf("FMINNMP", 0x0c, 2)
+!spwf("FMINP", 0x0f, 2)
+
+/* Scalar shift by immediate */
+!def sshone(nm, u, opc, rd, rn, es, right) {
+!if right !then {
+!{nm} !{rd},!{rn},#!s ::s<1;3,s>!{es};3 :: .call w4((1<<30)|(!{u}<<29)|(0x1f<<24)|(((!{es}*2)-s)<<16)|(!{opc}<<11)|(1<<10)|(!{rn}<<5)|!{rd})
+} !else {
+!{nm} !{rd},!{rn},#!s ::s<0;3,s>!{es-1};3 :: .call w4((1<<30)|(!{u}<<29)|(0x1f<<24)|((!{es}+s)<<16)|(!{opc}<<11)|(1<<10)|(!{rn}<<5)|!{rd})
+}
+}
+!def sshd(nm, u, opc, right) {
+!sshone(nm, u, opc, "fdd", "fdn", 64, right)
+}
+!sshd("SSHR", 0, 0x00, 1)
+!sshd("USHR", 1, 0x00, 1)
+!sshd("SSRA", 0, 0x02, 1)
+!sshd("USRA", 1, 0x02, 1)
+!sshd("SRSHR", 0, 0x04, 1)
+!sshd("URSHR", 1, 0x04, 1)
+!sshd("SRSRA", 0, 0x06, 1)
+!sshd("URSRA", 1, 0x06, 1)
+!sshd("SRI", 1, 0x08, 1)
+!sshd("SHL", 0, 0x0a, 0)
+!sshd("SLI", 1, 0x0a, 0)
+!def sshall(nm, u, opc, right) {
+!sshone(nm, u, opc, "fbd", "fbn", 8, right)
+!sshone(nm, u, opc, "fhd", "fhn", 16, right)
+!sshone(nm, u, opc, "fsd", "fsn", 32, right)
+!sshone(nm, u, opc, "fdd", "fdn", 64, right)
+}
+!sshall("SQSHL", 0, 0x0e, 0)
+!sshall("UQSHL", 1, 0x0e, 0)
+!sshall("SQSHLU", 1, 0x0c, 0)
+/* Scalar narrowing shifts */
+!def sshn(nm, u, opc) {
+!sshone(nm, u, opc, "fbd", "fhn", 8, 1)
+!sshone(nm, u, opc, "fhd", "fsn", 16, 1)
+!sshone(nm, u, opc, "fsd", "fdn", 32, 1)
+}
+!sshn("SQSHRN", 0, 0x12)
+!sshn("SQRSHRN", 0, 0x13)
+!sshn("SQSHRUN", 1, 0x10)
+!sshn("SQRSHRUN", 1, 0x11)
+!sshn("UQSHRN", 1, 0x12)
+!sshn("UQRSHRN", 1, 0x13)
+/* Scalar fixed-point conversions */
+!def ssfx(nm, u, opc) {
+!sshone(nm, u, opc, "fhd", "fhn", 16, 1)
+!sshone(nm, u, opc, "fsd", "fsn", 32, 1)
+!sshone(nm, u, opc, "fdd", "fdn", 64, 1)
+}
+!ssfx("SCVTF", 0, 0x1c)
+!ssfx("UCVTF", 1, 0x1c)
+!ssfx("FCVTZS", 0, 0x1f)
+!ssfx("FCVTZU", 1, 0x1f)
+
+/* Scalar three different */
+!def s3d(nm, opc) {
+!{nm} fsd,fhn,fhm :: .call w4((1<<30)|(0x1e<<24)|(1<<22)|(1<<21)|(fhm<<16)|(!{opc}<<12)|(fhn<<5)|fsd)
+!{nm} fdd,fsn,fsm :: .call w4((1<<30)|(0x1e<<24)|(2<<22)|(1<<21)|(fsm<<16)|(!{opc}<<12)|(fsn<<5)|fdd)
+}
+!s3d("SQDMLAL", 0x9)
+!s3d("SQDMLSL", 0xb)
+!s3d("SQDMULL", 0xd)
+
+/* Scalar by element */
+!def sbeh(nm, u, opc, rd, rn) {
+!{nm} !{rd},!{rn},vl.H[!!i] ::i<0;3,i>7;3 :: .call w4((1<<30)|(!{u}<<29)|(0x1f<<24)|(1<<22)|(((i>>1)&1)<<21)|((i&1)<<20)|(vl<<16)|(!{opc}<<12)|(((i>>2)&1)<<11)|(!{rn}<<5)|!{rd})
+}
+!def sbehf(nm, u, opc, rd, rn) {
+!{nm} !{rd},!{rn},vl.H[!!i] ::i<0;3,i>7;3 :: .call w4((1<<30)|(!{u}<<29)|(0x1f<<24)|(((i>>1)&1)<<21)|((i&1)<<20)|(vl<<16)|(!{opc}<<12)|(((i>>2)&1)<<11)|(!{rn}<<5)|!{rd})
+}
+!def sbes(nm, u, opc, rd, rn, sz) {
+!{nm} !{rd},!{rn},vm.S[!!i] ::i<0;3,i>3;3 :: .call w4((1<<30)|(!{u}<<29)|(0x1f<<24)|(!{sz}<<22)|((i&1)<<21)|(((vm>>4)&1)<<20)|((vm&15)<<16)|(!{opc}<<12)|(((i>>1)&1)<<11)|(!{rn}<<5)|!{rd})
+}
+!def sbed(nm, u, opc, rd, rn) {
+!{nm} !{rd},!{rn},vm.D[!!i] ::i<0;3,i>1;3 :: .call w4((1<<30)|(!{u}<<29)|(0x1f<<24)|(3<<22)|(((vm>>4)&1)<<20)|((vm&15)<<16)|(!{opc}<<12)|(i<<11)|(!{rn}<<5)|!{rd})
+}
+!def sbei(nm, u, opc) {
+!sbeh(nm, u, opc, "fhd", "fhn")
+!sbes(nm, u, opc, "fsd", "fsn", 2)
+}
+!sbei("SQDMULH", 0, 0xc)
+!sbei("SQRDMULH", 0, 0xd)
+!sbei("SQRDMLAH", 1, 0xd)
+!sbei("SQRDMLSH", 1, 0xf)
+!def sbew(nm, opc) {
+!sbeh(nm, 0, opc, "fsd", "fhn")
+!sbes(nm, 0, opc, "fdd", "fsn", 2)
+}
+!sbew("SQDMLAL", 0x3)
+!sbew("SQDMLSL", 0x7)
+!sbew("SQDMULL", 0xb)
+!def sbef(nm, u, opc) {
+!sbehf(nm, u, opc, "fhd", "fhn")
+!sbes(nm, u, opc, "fsd", "fsn", 2)
+!sbed(nm, u, opc, "fdd", "fdn")
+}
+!sbef("FMLA", 0, 0x1)
+!sbef("FMLS", 0, 0x5)
+!sbef("FMUL", 0, 0x9)
+!sbef("FMULX", 1, 0x9)
+
+/* ===================================================================
+/* Cryptographic extensions
+/* =================================================================== */
+/* AES: 0100 1110 0010 1000 opcode 10 Rn Rd */
+!def aesop(nm, opc) {
+!{nm} vd.16B,vn.16B :: .call w4(0x4e280800|(!{opc}<<12)|(vn<<5)|vd)
+}
+!aesop("AESE", 4)
+!aesop("AESD", 5)
+!aesop("AESMC", 6)
+!aesop("AESIMC", 7)
+
+/* SHA1 and SHA2 (three register) */
+!def sha3r(nm, opc, rd, rn) {
+!{nm} !{rd},!{rn},vm.4S :: .call w4(0x5e000000|(vm<<16)|(!{opc}<<12)|(!{rn}<<5)|!{rd})
+}
+!sha3r("SHA1C", 0, "fqd", "fsn")
+!sha3r("SHA1P", 1, "fqd", "fsn")
+!sha3r("SHA1M", 2, "fqd", "fsn")
+!sha3r("SHA1SU0", 3, "vd", "vn")
+!sha3r("SHA256H", 4, "fqd", "fqn")
+!sha3r("SHA256H2", 5, "fqd", "fqn")
+!sha3r("SHA256SU1", 6, "vd", "vn")
+SHA1SU0 vd.4S,vn.4S,vm.4S :: .call w4(0x5e003000|(vm<<16)|(vn<<5)|vd)
+SHA256SU1 vd.4S,vn.4S,vm.4S :: .call w4(0x5e006000|(vm<<16)|(vn<<5)|vd)
+/* SHA1 and SHA2 (two register) */
+SHA1H fsd,fsn :: .call w4(0x5e280800|(fsn<<5)|fsd)
+SHA1SU1 vd.4S,vn.4S :: .call w4(0x5e281800|(vn<<5)|vd)
+SHA256SU0 vd.4S,vn.4S :: .call w4(0x5e282800|(vn<<5)|vd)
+
+/* SHA512, SHA3, SM3 and SM4 */
+SHA512H fqd,fqn,vm.2D :: .call w4(0xce608000|(vm<<16)|(fqn<<5)|fqd)
+SHA512H2 fqd,fqn,vm.2D :: .call w4(0xce608400|(vm<<16)|(fqn<<5)|fqd)
+SHA512SU1 vd.2D,vn.2D,vm.2D :: .call w4(0xce608800|(vm<<16)|(vn<<5)|vd)
+SHA512SU0 vd.2D,vn.2D :: .call w4(0xcec08000|(vn<<5)|vd)
+RAX1 vd.2D,vn.2D,vm.2D :: .call w4(0xce608c00|(vm<<16)|(vn<<5)|vd)
+EOR3 vd.16B,vn.16B,vm.16B,va.16B :: .call w4(0xce000000|(vm<<16)|(va<<10)|(vn<<5)|vd)
+BCAX vd.16B,vn.16B,vm.16B,va.16B :: .call w4(0xce200000|(vm<<16)|(va<<10)|(vn<<5)|vd)
+XAR vd.2D,vn.2D,vm.2D,#!i ::i<0;3,i>63;3 :: .call w4(0xce800000|(vm<<16)|(i<<10)|(vn<<5)|vd)
+SM3SS1 vd.4S,vn.4S,vm.4S,va.4S :: .call w4(0xce400000|(vm<<16)|(va<<10)|(vn<<5)|vd)
+!def sm3tt(nm, base) {
+!{nm} vd.4S,vn.4S,vm.S[!!i] ::i<0;3,i>3;3 :: .call w4(!{base}|(vm<<16)|(i<<12)|(vn<<5)|vd)
+}
+!sm3tt("SM3TT1A", 0xce408000)
+!sm3tt("SM3TT1B", 0xce408400)
+!sm3tt("SM3TT2A", 0xce408800)
+!sm3tt("SM3TT2B", 0xce408c00)
+SM3PARTW1 vd.4S,vn.4S,vm.4S :: .call w4(0xce60c000|(vm<<16)|(vn<<5)|vd)
+SM3PARTW2 vd.4S,vn.4S,vm.4S :: .call w4(0xce60c400|(vm<<16)|(vn<<5)|vd)
+SM4EKEY vd.4S,vn.4S,vm.4S :: .call w4(0xce60c800|(vm<<16)|(vn<<5)|vd)
+SM4E vd.4S,vn.4S :: .call w4(0xcec08400|(vn<<5)|vd)
+
+/* ===================================================================
+/* Complex number arithmetic (FEAT_FCMA)
+/* =================================================================== */
+!def fcadd(ar, q, sz) {
+FCADD vd.!{ar},vn.!{ar},vm.!{ar},#!r ::(r!=90)&&(r!=270);3 :: .call w4((!{q}<<30)|(1<<29)|(0x0e<<24)|(!{sz}<<22)|(vm<<16)|((0xe|(r==270?1:0))<<12)|(1<<10)|(vn<<5)|vd)
+}
+!fcadd("4H", 0, 1)
+!fcadd("8H", 1, 1)
+!fcadd("2S", 0, 2)
+!fcadd("4S", 1, 2)
+!fcadd("2D", 1, 3)
+!def fcmla(ar, q, sz) {
+FCMLA vd.!{ar},vn.!{ar},vm.!{ar},#!r ::(r!=0)&&(r!=90)&&(r!=180)&&(r!=270);3 :: .call w4((!{q}<<30)|(1<<29)|(0x0e<<24)|(!{sz}<<22)|(vm<<16)|(0xc<<12)|((r==0?0:(r==90?1:(r==180?2:3)))<<11)|(1<<10)|(vn<<5)|vd)
+}
+!fcmla("4H", 0, 1)
+!fcmla("8H", 1, 1)
+!fcmla("2S", 0, 2)
+!fcmla("4S", 1, 2)
+!fcmla("2D", 1, 3)
+FCMLA vd.4H,vn.4H,vl.H[!!i],#!r ::i<0;3,i>1;3,(r!=0)&&(r!=90)&&(r!=180)&&(r!=270);3 :: .call w4((1<<29)|(0x0f<<24)|(1<<22)|((i&1)<<21)|(vl<<16)|((r==0?0:(r==90?1:(r==180?2:3)))<<13)|(1<<12)|(vn<<5)|vd)
+FCMLA vd.8H,vn.8H,vl.H[!!i],#!r ::i<0;3,i>3;3,(r!=0)&&(r!=90)&&(r!=180)&&(r!=270);3 :: .call w4((1<<30)|(1<<29)|(0x0f<<24)|(1<<22)|((i&1)<<21)|(vl<<16)|((r==0?0:(r==90?1:(r==180?2:3)))<<13)|(1<<12)|(((i>>1)&1)<<11)|(vn<<5)|vd)
+FCMLA vd.4S,vn.4S,vm.S[!!i],#!r ::i<0;3,i>1;3,(r!=0)&&(r!=90)&&(r!=180)&&(r!=270);3 :: .call w4((1<<30)|(1<<29)|(0x0f<<24)|(2<<22)|(((vm>>4)&1)<<20)|((vm&15)<<16)|((r==0?0:(r==90?1:(r==180?2:3)))<<13)|(1<<12)|(i<<11)|(vn<<5)|vd)
+
+/* ===================================================================
+/* FP16 multiply-long, matrix multiply and BFloat16
+/* =================================================================== */
+!def fmlal(nm, u, sz, opc, dar, sar, q) {
+!{nm} vd.!{dar},vn.!{sar},vm.!{sar} :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0e<<24)|(!{sz}<<22)|(1<<21)|(vm<<16)|(!{opc}<<11)|(1<<10)|(vn<<5)|vd)
+}
+!fmlal("FMLAL", 0, 0, 0x1d, "2S", "2H", 0)
+!fmlal("FMLAL", 0, 0, 0x1d, "4S", "4H", 1)
+!fmlal("FMLSL", 0, 2, 0x1d, "2S", "2H", 0)
+!fmlal("FMLSL", 0, 2, 0x1d, "4S", "4H", 1)
+!fmlal("FMLAL2", 1, 0, 0x19, "2S", "2H", 0)
+!fmlal("FMLAL2", 1, 0, 0x19, "4S", "4H", 1)
+!fmlal("FMLSL2", 1, 2, 0x19, "2S", "2H", 0)
+!fmlal("FMLSL2", 1, 2, 0x19, "4S", "4H", 1)
+!def fmlale(nm, u, opc, dar, sar, q) {
+!{nm} vd.!{dar},vn.!{sar},vl.H[!!i] ::i<0;3,i>7;3 :: .call w4((!{q}<<30)|(!{u}<<29)|(0x0f<<24)|(2<<22)|(((i>>1)&1)<<21)|((i&1)<<20)|(vl<<16)|(!{opc}<<12)|(((i>>2)&1)<<11)|(vn<<5)|vd)
+}
+!fmlale("FMLAL", 0, 0x0, "2S", "2H", 0)
+!fmlale("FMLAL", 0, 0x0, "4S", "4H", 1)
+!fmlale("FMLSL", 0, 0x4, "2S", "2H", 0)
+!fmlale("FMLSL", 0, 0x4, "4S", "4H", 1)
+!fmlale("FMLAL2", 1, 0x8, "2S", "2H", 0)
+!fmlale("FMLAL2", 1, 0x8, "4S", "4H", 1)
+!fmlale("FMLSL2", 1, 0xc, "2S", "2H", 0)
+!fmlale("FMLSL2", 1, 0xc, "4S", "4H", 1)
+
+SMMLA vd.4S,vn.16B,vm.16B :: .call w4(0x4e80a400|(vm<<16)|(vn<<5)|vd)
+UMMLA vd.4S,vn.16B,vm.16B :: .call w4(0x6e80a400|(vm<<16)|(vn<<5)|vd)
+USMMLA vd.4S,vn.16B,vm.16B :: .call w4(0x4e80ac00|(vm<<16)|(vn<<5)|vd)
+USDOT vd.2S,vn.8B,vm.8B :: .call w4(0x0e809c00|(vm<<16)|(vn<<5)|vd)
+USDOT vd.4S,vn.16B,vm.16B :: .call w4(0x4e809c00|(vm<<16)|(vn<<5)|vd)
+!def vusdote(nm, base, dar, sar, q) {
+!{nm} vd.!{dar},vn.!{sar},vm.4B[!!i] ::i<0;3,i>3;3 :: .call w4(!{base}|(!{q}<<30)|((i&1)<<21)|(((vm>>4)&1)<<20)|((vm&15)<<16)|(((i>>1)&1)<<11)|(vn<<5)|vd)
+}
+!vusdote("USDOT", 0x0f80f000, "2S", "8B", 0)
+!vusdote("USDOT", 0x0f80f000, "4S", "16B", 1)
+!vusdote("SUDOT", 0x0f00f000, "2S", "8B", 0)
+!vusdote("SUDOT", 0x0f00f000, "4S", "16B", 1)
+BFDOT vd.2S,vn.4H,vm.4H :: .call w4(0x2e40fc00|(vm<<16)|(vn<<5)|vd)
+BFDOT vd.4S,vn.8H,vm.8H :: .call w4(0x6e40fc00|(vm<<16)|(vn<<5)|vd)
+BFDOT vd.2S,vn.4H,vm.2H[!!i] ::i<0;3,i>3;3 :: .call w4(0x0f40f000|((i&1)<<21)|(((vm>>4)&1)<<20)|((vm&15)<<16)|(((i>>1)&1)<<11)|(vn<<5)|vd)
+BFDOT vd.4S,vn.8H,vm.2H[!!i] ::i<0;3,i>3;3 :: .call w4(0x4f40f000|((i&1)<<21)|(((vm>>4)&1)<<20)|((vm&15)<<16)|(((i>>1)&1)<<11)|(vn<<5)|vd)
+BFMMLA vd.4S,vn.8H,vm.8H :: .call w4(0x6e40ec00|(vm<<16)|(vn<<5)|vd)
+BFMLALB vd.4S,vn.8H,vm.8H :: .call w4(0x2ec0fc00|(vm<<16)|(vn<<5)|vd)
+BFMLALT vd.4S,vn.8H,vm.8H :: .call w4(0x6ec0fc00|(vm<<16)|(vn<<5)|vd)
+BFMLALB vd.4S,vn.8H,vl.H[!!i] ::i<0;3,i>7;3 :: .call w4(0x0fc0f000|(((i>>1)&1)<<21)|((i&1)<<20)|(vl<<16)|(((i>>2)&1)<<11)|(vn<<5)|vd)
+BFMLALT vd.4S,vn.8H,vl.H[!!i] ::i<0;3,i>7;3 :: .call w4(0x4fc0f000|(((i>>1)&1)<<21)|((i&1)<<20)|(vl<<16)|(((i>>2)&1)<<11)|(vn<<5)|vd)
+BFCVT fhd,fsn :: .call w4(0x1e634000|(fsn<<5)|fhd)
+BFCVTN vd.4H,vn.4S :: .call w4(0x0ea16800|(vn<<5)|vd)
+BFCVTN2 vd.8H,vn.4S :: .call w4(0x4ea16800|(vn<<5)|vd)
+
+/* ===================================================================
+/* Pointer authentication (FEAT_PAuth)
+/* =================================================================== */
+!def pacr(nm, opc) {
+!{nm} xd,xs :: .call w4(0xdac10000|(!{opc}<<10)|(xs<<5)|xd)
+}
+!pacr("PACIA", 0)
+!pacr("PACIB", 1)
+!pacr("PACDA", 2)
+!pacr("PACDB", 3)
+!pacr("AUTIA", 4)
+!pacr("AUTIB", 5)
+!pacr("AUTDA", 6)
+!pacr("AUTDB", 7)
+!def pacz(nm, opc) {
+!{nm} xd :: .call w4(0xdac10000|(!{opc}<<10)|(31<<5)|xd)
+}
+!pacz("PACIZA", 8)
+!pacz("PACIZB", 9)
+!pacz("PACDZA", 10)
+!pacz("PACDZB", 11)
+!pacz("AUTIZA", 12)
+!pacz("AUTIZB", 13)
+!pacz("AUTDZA", 14)
+!pacz("AUTDZB", 15)
+!pacz("XPACI", 16)
+!pacz("XPACD", 17)
+/* The SP-relative forms name SP explicitly */
+!def pacsp(nm, opc) {
+!{nm} xd,SP :: .call w4(0xdac10000|(!{opc}<<10)|(31<<5)|xd)
+}
+!pacsp("PACIA", 0)
+!pacsp("PACIB", 1)
+!pacsp("PACDA", 2)
+!pacsp("PACDB", 3)
+!pacsp("AUTIA", 4)
+!pacsp("AUTIB", 5)
+!pacsp("AUTDA", 6)
+!pacsp("AUTDB", 7)
+
+/* Authenticated branches */
+BRAA xn,xm :: .call w4(0xd71f0800|(xn<<5)|xm)
+BRAB xn,xm :: .call w4(0xd71f0c00|(xn<<5)|xm)
+BLRAA xn,xm :: .call w4(0xd73f0800|(xn<<5)|xm)
+BLRAB xn,xm :: .call w4(0xd73f0c00|(xn<<5)|xm)
+BRAAZ xn :: .call w4(0xd61f081f|(xn<<5))
+BRABZ xn :: .call w4(0xd61f0c1f|(xn<<5))
+BLRAAZ xn :: .call w4(0xd63f081f|(xn<<5))
+BLRABZ xn :: .call w4(0xd63f0c1f|(xn<<5))
+RETAA :: .call w4(0xd65f0bff)
+RETAB :: .call w4(0xd65f0fff)
+ERETAA :: .call w4(0xd69f0bff)
+ERETAB :: .call w4(0xd69f0fff)
+
+/* Authenticated loads. The offset is a 10-bit signed value scaled by
+/* 8, and its top bit sits at bit 22 rather than beside the rest. */
+!def ldra(nm, m) {
+!{nm} xt,[xb[[,#!o]]] ::(o&7)!=0;8,o<-4096;8,o>4088;8 :: .call w4(0xf8000000|(!{m}<<23)|((((o>>3)>>9)&1)<<22)|(1<<21)|(((o>>3)&0x1ff)<<12)|(1<<10)|(xb<<5)|xt)
+!{nm} xt,[xb,#!o]\! ::(o&7)!=0;8,o<-4096;8,o>4088;8 :: .call w4(0xf8000000|(!{m}<<23)|((((o>>3)>>9)&1)<<22)|(1<<21)|(((o>>3)&0x1ff)<<12)|(1<<11)|(1<<10)|(xb<<5)|xt)
+}
+!ldra("LDRAA", 0)
+!ldra("LDRAB", 1)
+
+/* ===================================================================
+/* Memory tagging (FEAT_MTE)
+/* =================================================================== */
+ADDG xs,xe,#!o,#!t ::(o&15)!=0;3,o<0;3,o>1008;3,t<0;3,t>15;3 :: .call w4(0x91800000|((o>>4)<<16)|(t<<10)|(xe<<5)|xs)
+SUBG xs,xe,#!o,#!t ::(o&15)!=0;3,o<0;3,o>1008;3,t<0;3,t>15;3 :: .call w4(0xd1800000|((o>>4)<<16)|(t<<10)|(xe<<5)|xs)
+IRG xs,xe :: .call w4(0x9ac01000|(31<<16)|(xe<<5)|xs)
+IRG xs,xe,xm :: .call w4(0x9ac01000|(xm<<16)|(xe<<5)|xs)
+GMI xd,xe,xm :: .call w4(0x9ac01400|(xm<<16)|(xe<<5)|xd)
+SUBP xd,xe,xf :: .call w4(0x9ac00000|(xf<<16)|(xe<<5)|xd)
+SUBPS xd,xe,xf :: .call w4(0xbac00000|(xf<<16)|(xe<<5)|xd)
+CMPP xe,xf :: .call w4(0xbac0001f|(xf<<16)|(xe<<5))
+/* Tag stores. idx 2 is the plain offset form, 3 pre-index, 1 post. */
+!def stgf(nm, base) {
+!{nm} xt,[xb[[,#!o]]] ::(o&15)!=0;8,o<-4096;8,o>4080;8 :: .call w4(!{base}|(((o>>4)&0x1ff)<<12)|(2<<10)|(xb<<5)|xt)
+!{nm} xt,[xb,#!o]\! ::(o&15)!=0;8,o<-4096;8,o>4080;8 :: .call w4(!{base}|(((o>>4)&0x1ff)<<12)|(3<<10)|(xb<<5)|xt)
+!{nm} xt,[xb],#!o ::(o&15)!=0;8,o<-4096;8,o>4080;8 :: .call w4(!{base}|(((o>>4)&0x1ff)<<12)|(1<<10)|(xb<<5)|xt)
+}
+!stgf("STG", 0xd9200000)
+!stgf("STZG", 0xd9600000)
+!stgf("ST2G", 0xd9a00000)
+!stgf("STZ2G", 0xd9e00000)
+LDG xt,[xb[[,#!o]]] ::(o&15)!=0;8,o<-4096;8,o>4080;8 :: .call w4(0xd9600000|(((o>>4)&0x1ff)<<12)|(xb<<5)|xt)
+LDGM xt,[xb] :: .call w4(0xd9e00000|(xb<<5)|xt)
+STGM xt,[xb] :: .call w4(0xd9a00000|(xb<<5)|xt)
+STZGM xt,[xb] :: .call w4(0xd9200000|(xb<<5)|xt)
+STGP xt,xu,[xb[[,#!o]]] ::(o&15)!=0;8,(o>>4)<-64;8,(o>>4)>63;8 :: .call w4(0x69000000|(((o>>4)&0x7f)<<15)|(xu<<10)|(xb<<5)|xt)
+STGP xt,xu,[xb,#!o]\! ::(o&15)!=0;8,(o>>4)<-64;8,(o>>4)>63;8 :: .call w4(0x69800000|(((o>>4)&0x7f)<<15)|(xu<<10)|(xb<<5)|xt)
+STGP xt,xu,[xb],#!o ::(o&15)!=0;8,(o>>4)<-64;8,(o>>4)>63;8 :: .call w4(0x68800000|(((o>>4)&0x7f)<<15)|(xu<<10)|(xb<<5)|xt)
+
+/* ===================================================================
+/* Load-acquire / store-release unscaled (FEAT_LRCPC2)
+/* =================================================================== */
+!def lrcpc2(nm, base, rt) {
+!{nm} !{rt},[xb[[,#!o]]] ::o<-256;8,o>255;8 :: .call w4(!{base}|((o&0x1ff)<<12)|(xb<<5)|!{rt})
+}
+!lrcpc2("STLURB", 0x19000000, "wt")
+!lrcpc2("LDAPURB", 0x19400000, "wt")
+!lrcpc2("LDAPURSB", 0x19800000, "xt")
+!lrcpc2("LDAPURSB", 0x19c00000, "wt")
+!lrcpc2("STLURH", 0x59000000, "wt")
+!lrcpc2("LDAPURH", 0x59400000, "wt")
+!lrcpc2("LDAPURSH", 0x59800000, "xt")
+!lrcpc2("LDAPURSH", 0x59c00000, "wt")
+!lrcpc2("STLUR", 0x99000000, "wt")
+!lrcpc2("LDAPUR", 0x99400000, "wt")
+!lrcpc2("LDAPURSW", 0x99800000, "xt")
+!lrcpc2("STLUR", 0xd9000000, "xt")
+!lrcpc2("LDAPUR", 0xd9400000, "xt")
+
+/* ===================================================================
+/* Memory copy and set (FEAT_MOPS)
+/* =================================================================== */
+!def mopscpy(nm, b26, pme, opt) {
+!{nm} [xd]\!,[xe]\!,xn\! :: .call w4(0x19000000|(!{b26}<<26)|(!{pme}<<22)|(xe<<16)|(!{opt}<<12)|(1<<10)|(xn<<5)|xd)
+}
+!def mopsset(nm, b26, pme, opt) {
+!{nm} [xd]\!,xn\!,xm :: .call w4(0x19000000|(!{b26}<<26)|(3<<22)|(xm<<16)|(!{pme}<<14)|(!{opt}<<12)|(1<<10)|(xn<<5)|xd)
+}
+!mopscpy("CPYP", 1, 0, 0)
+!mopscpy("CPYPWT", 1, 0, 1)
+!mopscpy("CPYPRT", 1, 0, 2)
+!mopscpy("CPYPT", 1, 0, 3)
+!mopscpy("CPYPWN", 1, 0, 4)
+!mopscpy("CPYPWTWN", 1, 0, 5)
+!mopscpy("CPYPRTWN", 1, 0, 6)
+!mopscpy("CPYPTWN", 1, 0, 7)
+!mopscpy("CPYPRN", 1, 0, 8)
+!mopscpy("CPYPWTRN", 1, 0, 9)
+!mopscpy("CPYPRTRN", 1, 0, 10)
+!mopscpy("CPYPTRN", 1, 0, 11)
+!mopscpy("CPYPN", 1, 0, 12)
+!mopscpy("CPYPWTN", 1, 0, 13)
+!mopscpy("CPYPRTN", 1, 0, 14)
+!mopscpy("CPYPTN", 1, 0, 15)
+!mopscpy("CPYM", 1, 1, 0)
+!mopscpy("CPYMWT", 1, 1, 1)
+!mopscpy("CPYMRT", 1, 1, 2)
+!mopscpy("CPYMT", 1, 1, 3)
+!mopscpy("CPYMWN", 1, 1, 4)
+!mopscpy("CPYMWTWN", 1, 1, 5)
+!mopscpy("CPYMRTWN", 1, 1, 6)
+!mopscpy("CPYMTWN", 1, 1, 7)
+!mopscpy("CPYMRN", 1, 1, 8)
+!mopscpy("CPYMWTRN", 1, 1, 9)
+!mopscpy("CPYMRTRN", 1, 1, 10)
+!mopscpy("CPYMTRN", 1, 1, 11)
+!mopscpy("CPYMN", 1, 1, 12)
+!mopscpy("CPYMWTN", 1, 1, 13)
+!mopscpy("CPYMRTN", 1, 1, 14)
+!mopscpy("CPYMTN", 1, 1, 15)
+!mopscpy("CPYE", 1, 2, 0)
+!mopscpy("CPYEWT", 1, 2, 1)
+!mopscpy("CPYERT", 1, 2, 2)
+!mopscpy("CPYET", 1, 2, 3)
+!mopscpy("CPYEWN", 1, 2, 4)
+!mopscpy("CPYEWTWN", 1, 2, 5)
+!mopscpy("CPYERTWN", 1, 2, 6)
+!mopscpy("CPYETWN", 1, 2, 7)
+!mopscpy("CPYERN", 1, 2, 8)
+!mopscpy("CPYEWTRN", 1, 2, 9)
+!mopscpy("CPYERTRN", 1, 2, 10)
+!mopscpy("CPYETRN", 1, 2, 11)
+!mopscpy("CPYEN", 1, 2, 12)
+!mopscpy("CPYEWTN", 1, 2, 13)
+!mopscpy("CPYERTN", 1, 2, 14)
+!mopscpy("CPYETN", 1, 2, 15)
+!mopscpy("CPYFP", 0, 0, 0)
+!mopscpy("CPYFPWT", 0, 0, 1)
+!mopscpy("CPYFPRT", 0, 0, 2)
+!mopscpy("CPYFPT", 0, 0, 3)
+!mopscpy("CPYFPWN", 0, 0, 4)
+!mopscpy("CPYFPWTWN", 0, 0, 5)
+!mopscpy("CPYFPRTWN", 0, 0, 6)
+!mopscpy("CPYFPTWN", 0, 0, 7)
+!mopscpy("CPYFPRN", 0, 0, 8)
+!mopscpy("CPYFPWTRN", 0, 0, 9)
+!mopscpy("CPYFPRTRN", 0, 0, 10)
+!mopscpy("CPYFPTRN", 0, 0, 11)
+!mopscpy("CPYFPN", 0, 0, 12)
+!mopscpy("CPYFPWTN", 0, 0, 13)
+!mopscpy("CPYFPRTN", 0, 0, 14)
+!mopscpy("CPYFPTN", 0, 0, 15)
+!mopscpy("CPYFM", 0, 1, 0)
+!mopscpy("CPYFMWT", 0, 1, 1)
+!mopscpy("CPYFMRT", 0, 1, 2)
+!mopscpy("CPYFMT", 0, 1, 3)
+!mopscpy("CPYFMWN", 0, 1, 4)
+!mopscpy("CPYFMWTWN", 0, 1, 5)
+!mopscpy("CPYFMRTWN", 0, 1, 6)
+!mopscpy("CPYFMTWN", 0, 1, 7)
+!mopscpy("CPYFMRN", 0, 1, 8)
+!mopscpy("CPYFMWTRN", 0, 1, 9)
+!mopscpy("CPYFMRTRN", 0, 1, 10)
+!mopscpy("CPYFMTRN", 0, 1, 11)
+!mopscpy("CPYFMN", 0, 1, 12)
+!mopscpy("CPYFMWTN", 0, 1, 13)
+!mopscpy("CPYFMRTN", 0, 1, 14)
+!mopscpy("CPYFMTN", 0, 1, 15)
+!mopscpy("CPYFE", 0, 2, 0)
+!mopscpy("CPYFEWT", 0, 2, 1)
+!mopscpy("CPYFERT", 0, 2, 2)
+!mopscpy("CPYFET", 0, 2, 3)
+!mopscpy("CPYFEWN", 0, 2, 4)
+!mopscpy("CPYFEWTWN", 0, 2, 5)
+!mopscpy("CPYFERTWN", 0, 2, 6)
+!mopscpy("CPYFETWN", 0, 2, 7)
+!mopscpy("CPYFERN", 0, 2, 8)
+!mopscpy("CPYFEWTRN", 0, 2, 9)
+!mopscpy("CPYFERTRN", 0, 2, 10)
+!mopscpy("CPYFETRN", 0, 2, 11)
+!mopscpy("CPYFEN", 0, 2, 12)
+!mopscpy("CPYFEWTN", 0, 2, 13)
+!mopscpy("CPYFERTN", 0, 2, 14)
+!mopscpy("CPYFETN", 0, 2, 15)
+!mopsset("SETP", 0, 0, 0)
+!mopsset("SETPT", 0, 0, 1)
+!mopsset("SETPN", 0, 0, 2)
+!mopsset("SETPTN", 0, 0, 3)
+!mopsset("SETM", 0, 1, 0)
+!mopsset("SETMT", 0, 1, 1)
+!mopsset("SETMN", 0, 1, 2)
+!mopsset("SETMTN", 0, 1, 3)
+!mopsset("SETE", 0, 2, 0)
+!mopsset("SETET", 0, 2, 1)
+!mopsset("SETEN", 0, 2, 2)
+!mopsset("SETETN", 0, 2, 3)
+!mopsset("SETGP", 1, 0, 0)
+!mopsset("SETGPT", 1, 0, 1)
+!mopsset("SETGPN", 1, 0, 2)
+!mopsset("SETGPTN", 1, 0, 3)
+!mopsset("SETGM", 1, 1, 0)
+!mopsset("SETGMT", 1, 1, 1)
+!mopsset("SETGMN", 1, 1, 2)
+!mopsset("SETGMTN", 1, 1, 3)
+!mopsset("SETGE", 1, 2, 0)
+!mopsset("SETGET", 1, 2, 1)
+!mopsset("SETGEN", 1, 2, 2)
+!mopsset("SETGETN", 1, 2, 3)
+
+/* ===================================================================
+/* Remaining scalar extensions
+/* =================================================================== */
+FJCVTZS wd,fdn :: .call w4(0x1e7e0000|(fdn<<5)|wd)
+LD64B xt,[xb] :: .call w4(0xf83fd000|(xb<<5)|xt)
+ST64B xt,[xb] :: .call w4(0xf83f9000|(xb<<5)|xt)
+ST64BV xd,xt,[xb] :: .call w4(0xf820b000|(xd<<16)|(xb<<5)|xt)
+ST64BV0 xd,xt,[xb] :: .call w4(0xf820a000|(xd<<16)|(xb<<5)|xt)
+CHKFEAT X16 :: .call w4(0xd503251f)
+RMIF xn,#!s,#!m ::s<0;3,s>63;3,m<0;3,m>15;3 :: .call w4(0xba000400|(s<<15)|(xn<<5)|m)
+SETF8 wn :: .call w4(0x3a00080d|(wn<<5))
+SETF16 wn :: .call w4(0x3a00480d|(wn<<5))
+AXFLAG :: .call w4(0xd500405f)
+XAFLAG :: .call w4(0xd500403f)
+CFP RCTX,xt :: .call w4(0xd50b7380|xt)
+DVP RCTX,xt :: .call w4(0xd50b73a0|xt)
+CPP RCTX,xt :: .call w4(0xd50b73e0|xt)
