@@ -348,7 +348,8 @@ for each pattern line, so an unmatched optional operand reads as 0.
 **Variable names.** A variable is written `x` above, but a name may be longer:
 it starts with a lowercase letter and continues over lowercase letters, digits
 and `_`, so `abcdef`, `var1` and `var_2` are all variable names. The same names
-are used by `.check`, `.enum`, `.clrcheck`, `.clrenum`, `.map` and `.free`.
+are used by `.check`, `.enum`, `.clrcheck`, `.clrenum`, `.map`, `.reloc`,
+`.clrreloc` and `.free`.
 
 ```
 .check::reg::BC,DE,HL,SP
@@ -1098,7 +1099,7 @@ reused without having to remember which directive defined it. It clears:
 - the `.sub` table of that name;
 - that name wherever it appears as a candidate in a `.check` list;
 - and, when the name reads as a variable name, that variable's whole
-  `.check` list and its `.enum`.
+  `.check` list, its `.enum`, and its `.reloc` declaration.
 
 Like `.clearsym` and `.clrcheck`, `.free` is positional: patterns written above
 it still see the names, patterns below it do not.
@@ -1112,6 +1113,80 @@ BEFORE     :: :: #N1        /* 0x07 */
 .free::N1,T1
 AFTER      :: :: #N1        /* error - undefined symbol: '#N1' */
 ```
+
+#### 3.7.5 `.reloc` — declaring a relocation type
+
+```
+.reloc::<variable>::<type name>
+```
+
+Writes the label reference captured by that variable into the `-o` output with the
+named ELF relocation type. Like `.check` it is positional: a later `.reloc` replaces
+an earlier one, `.clrreloc::x` (or `.clrreloc` with no argument) removes it, and
+`.free` removes it too.
+
+The type name comes from the `named` table of the machine selected by `-m` — the
+same names a source file writes after `::` (section 8.3).
+
+**Why it is needed.** Normally the relocation type and addend are inferred from the
+emitted bytes: the value sits there as a plain integer across consecutive bytes, so
+the addend is "emitted value minus label value". On AArch64, though, a branch or
+address-generation instruction packs the value into scattered bit fields inside a
+32-bit instruction word, scaled to words or pages. The addend cannot be recovered
+from that, and a width-only guess gives `bl` a `PREL32`, which links without
+complaint and branches four times too far.
+
+`.reloc` declares the type per instruction. The addend is the difference between the
+operand value the pattern captured and the label's value, so `bl func` gives 0 and
+`bl func+8` gives 8. The instruction's own field bits are emitted as zero — RELA, so
+the linker fills them in, the same shape GNU as produces.
+
+```
+.reloc::t::call26
+BL !t :: :: @@[4,(0x94000000|(((t-$$)>>2)&0x3ffffff))>>(%%*8)]
+.clrreloc::t
+```
+
+```
+bl func      ->  R_AARCH64_CALL26  func + 0
+bl func+8    ->  R_AARCH64_CALL26  func + 8
+```
+
+**Why the symbol side cannot express this.** The type is a property of the operand
+position, not of the symbol. The `adrp` / `add` pair that builds one address on
+AArch64 refers to the *same* symbol under two different types,
+`ADR_PREL_PG_HI21` and `ADD_ABS_LO12_NC`. A per-symbol form such as
+`.extern name::type` cannot represent that at all.
+
+```
+.reloc::p::adrp
+ADRP X!d,!p :: :: …
+.clrreloc::p
+.reloc::o::add_abs_lo12_nc
+ADD X!d,X!n,#!o :: :: …
+.clrreloc::o
+```
+
+```
+adrp x0,msg      ->  R_AARCH64_ADR_PREL_PG_HI21  msg + 0
+add  x0,x0,#msg  ->  R_AARCH64_ADD_ABS_LO12_NC   msg + 0
+```
+
+The instruction-field types available for AArch64 are below. The data types
+(`abs64` `abs32` `abs16` `pc64` `pc32` `pc16`) are still inferred without `.reloc`.
+
+| Type name | ELF | Field |
+|---|---|---|
+| `call26` / `jump26` | 283 / 282 | imm26 of `bl` / `b` |
+| `condbr19` | 280 | imm19 of `b.cond`, `cbz` |
+| `tstbr14` | 279 | imm14 of `tbz` / `tbnz` |
+| `adr_prel_lo21` | 274 | immlo/immhi of `adr` |
+| `adr_prel_pg_hi21` (`adrp`) | 275 | immlo/immhi of `adrp` |
+| `adr_prel_pg_hi21_nc` | 276 | same, no overflow check |
+| `add_abs_lo12_nc` | 277 | imm12 of `add` |
+| `ldst8_abs_lo12_nc` | 278 | imm12 of load/store |
+| `ldst16` / `ldst32` / `ldst64` / `ldst128_abs_lo12_nc` | 284 / 285 / 286 / 299 | same, scaled per width |
+| `movw_uabs_g0` … `g3` (and `_nc`) | 263–269 | imm16 of `movz` / `movk` |
 
 ### 3.8 Optional parts (`[[ ]]`)
 
@@ -2275,6 +2350,10 @@ The names accepted after `::` are the short names in the `named` table of the
 selected machine in `ELF_MACHINES`. For x86-64: `abs64`, `abs32`, `abs32s`,
 `abs16`, `abs8`, `pc32`, `rel32`, `plt32`, `pc16`, `pc8`, `pc64`, `got32`,
 `gotpcrel`, `got64`. An unrecognized name produces a warning and is ignored.
+
+The same names are what `.reloc` takes in a pattern file (section 3.7.5). A name
+that is an instruction-field type, such as AArch64's `call26`, is only meaningful
+there — per symbol it cannot say which operand position it applies to.
 
 Section records are optional. If you only need label values:
 

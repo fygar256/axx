@@ -597,6 +597,23 @@ _ELF_MACHINE_RAW = {
             'pc64': (260, 8), 'rel64': (260, 8),
             'pc32': (261, 4), 'rel32': (261, 4),
             'pc16': (262, 2), 'rel16': (262, 2),
+            # 命令フィールド型。値は命令語のビット欄に詰められるため、素の整数が
+            # 並ぶデータ型とは扱いが異なる（AARCH64_INSN_RELOCS を参照）。
+            'movw_uabs_g0': (263, 4), 'movw_uabs_g0_nc': (264, 4),
+            'movw_uabs_g1': (265, 4), 'movw_uabs_g1_nc': (266, 4),
+            'movw_uabs_g2': (267, 4), 'movw_uabs_g2_nc': (268, 4),
+            'movw_uabs_g3': (269, 4),
+            'adr_prel_lo21': (274, 4),
+            'adr_prel_pg_hi21': (275, 4), 'adrp': (275, 4),
+            'adr_prel_pg_hi21_nc': (276, 4),
+            'add_abs_lo12_nc': (277, 4),
+            'ldst8_abs_lo12_nc': (278, 4),
+            'tstbr14': (279, 4), 'condbr19': (280, 4),
+            'jump26': (282, 4), 'call26': (283, 4),
+            'ldst16_abs_lo12_nc': (284, 4),
+            'ldst32_abs_lo12_nc': (285, 4),
+            'ldst64_abs_lo12_nc': (286, 4),
+            'ldst128_abs_lo12_nc': (299, 4),
         },
         dwarf_abs=257,
     ),
@@ -645,6 +662,52 @@ def _build_elf_machine_tables(raw):
 ELF_MACHINES = _build_elf_machine_tables(_ELF_MACHINE_RAW)
 
 
+# AArch64 の「命令フィールド型」リロケーション。
+#
+# データ型（ABS64 など）は対象の値がそのまま連続バイトに並ぶが、こちらは 32bit
+# 命令語の中の飛び飛びのビット欄に、しかも語単位・ページ単位に縮めた形で詰まる。
+# そのため加数を「出力バイト列 − ラベル値」で逆算する通常の経路が使えない。
+# 該当する型では代わりに、パターンが捕らえたオペランド値とラベル値の差をそのまま
+# 加数とし、命令語側のビット欄は 0 にして出す（GNU as と同じ形。RELA なので
+# リンカが欄を埋める）。
+#
+#   fields  値を詰めるビット欄を「値の下位側から」 (命令語の開始ビット, ビット数)
+#           で並べたもの。ADR/ADRP だけは immlo(2bit)/immhi(19bit) に分かれる。
+_A64_ADR_FIELDS = ((29, 2), (5, 19))
+_A64_LO12_FIELD = ((10, 12),)
+_A64_MOVW_FIELD = ((5, 16),)
+AARCH64_INSN_RELOCS = {
+    263: _A64_MOVW_FIELD, 264: _A64_MOVW_FIELD,   # MOVW_UABS_G0 / _NC
+    265: _A64_MOVW_FIELD, 266: _A64_MOVW_FIELD,   # MOVW_UABS_G1 / _NC
+    267: _A64_MOVW_FIELD, 268: _A64_MOVW_FIELD,   # MOVW_UABS_G2 / _NC
+    269: _A64_MOVW_FIELD,                         # MOVW_UABS_G3
+    274: _A64_ADR_FIELDS,                         # ADR_PREL_LO21
+    275: _A64_ADR_FIELDS, 276: _A64_ADR_FIELDS,   # ADR_PREL_PG_HI21 / _NC
+    277: _A64_LO12_FIELD,                         # ADD_ABS_LO12_NC
+    278: _A64_LO12_FIELD,                         # LDST8_ABS_LO12_NC
+    279: ((5, 14),),                              # TSTBR14
+    280: ((5, 19),),                              # CONDBR19
+    282: ((0, 26),), 283: ((0, 26),),             # JUMP26 / CALL26
+    284: _A64_LO12_FIELD, 285: _A64_LO12_FIELD,   # LDST16 / LDST32
+    286: _A64_LO12_FIELD, 299: _A64_LO12_FIELD,   # LDST64 / LDST128
+}
+
+
+def insn_reloc_field_mask(rtype):
+    """命令フィールド型なら、その値が占める 32bit 命令語中のビットマスクを返す。
+
+    データ型や未知の型では None。呼び出し側はこれで「通常の加数計算をするか、
+    命令フィールドとして扱うか」を振り分ける。
+    """
+    fields = AARCH64_INSN_RELOCS.get(rtype)
+    if fields is None:
+        return None
+    mask = 0
+    for lo, nbits in fields:
+        mask |= ((1 << nbits) - 1) << lo
+    return mask
+
+
 class VLIWState:
     """VLIW / EPIC パケット組み立ての設定と作業状態。
 
@@ -681,6 +744,10 @@ class ElfState:
         self.current_word_idx: int = -1  # 生成中のオブジェクトコードの何ワード目か
         self.var_to_label: dict = {}   # パターン変数 → 束縛元のラベル名
         self.capturing_var: str | None = None  # いま `!x` で捕捉中の変数
+        # .reloc 宣言付きの変数がラベルを運んだ箇所。
+        # ワード番号 → (型番号, 加数)。加数は「変数が持っていた値 − ラベル値」で、
+        # `bl func` なら 0、`bl func+8` なら 8 になる。
+        self.insn_reloc_hint: dict = {}
 
         # --- DWARF デバッグ情報（-g） ---
         self.gen_debug: bool = False
@@ -849,6 +916,13 @@ class AssemblerState:
         self.varnames: set = set()
         self.check_constraints: dict = {}
 
+        # .reloc で登録された「この変数が捕らえたラベル参照は、この ELF
+        # リロケーション型で外に出す」という宣言。変数名 -> 型番号。
+        # 型はオペランドの位置ごとに決まる（AArch64 では同じシンボルを adrp が
+        # ADR_PREL_PG_HI21、add が ADD_ABS_LO12_NC で参照する）ため、シンボル側
+        # ではなくパターン側の、この変数単位でしか表せない。
+        self.reloc_constraints: dict = {}
+
         # .enum で登録された列挙。変数1文字 -> (要素名のタプル, 式の文字列)。
         # `!Ex` の照合と値の算出に使う。
         self.enum_defs: dict = {}
@@ -993,6 +1067,7 @@ class AssemblerState:
         '_elf_current_word_idx':  ('elf', 'current_word_idx'),
         '_elf_var_to_label':      ('elf', 'var_to_label'),
         '_elf_capturing_var':     ('elf', 'capturing_var'),
+        '_elf_insn_reloc_hint':   ('elf', 'insn_reloc_hint'),
         'gen_debug':              ('elf', 'gen_debug'),
         'line_map':               ('elf', 'line_map'),
         'reloctype_override':     ('elf', 'reloctype_override'),
@@ -2683,6 +2758,13 @@ class ExpressionEvaluator:
                         lname, lval = entry
                         self.state._elf_label_refs_seen.append(
                             (lname, lval, self.state._elf_current_word_idx))
+                        _rt = self.state.reloc_constraints.get(ch)
+                        if _rt is not None and not _is_undef_derived(x):
+                            # 加数は「変数が持っていた値 − ラベル値」。`bl func` なら
+                            # 0、`bl func+8` なら 8。命令語のビット欄を逆算しなくて
+                            # 済むので、欄の分割や語単位の縮尺に左右されない。
+                            self.state._elf_insn_reloc_hint.setdefault(
+                                self.state._elf_current_word_idx, (_rt, int(x) - int(lval)))
         elif idx < len(s) and s[idx] in self.state.lwordchars:
             w, idx_new = self.parser.get_label_word(s, idx, eat_colon=False)
             if idx != idx_new:
@@ -3594,6 +3676,57 @@ class DirectiveProcessor:
         self.state.check_constraints[var] = syms
         return True
 
+    def reloc_processing(self, i):
+        """`.reloc::<変数>::<型名>`
+
+        その変数が捕らえたラベル参照を、指定の ELF リロケーション型で書き出す。
+        `.check` と同じく位置依存で、後の `.reloc` が前のものを置き換える。
+
+        型名は `-m` で選んだマシンの名前表（`::pc32` などに使うものと同じ）から
+        引く。AArch64 の `call26` のような命令フィールド型は、値が命令語のビット欄
+        に詰まっていて出力バイト列から加数を逆算できないため、この宣言が要る。
+        """
+        if len(i) == 0 or i[0] != '.reloc':
+            return False
+        if i[1].strip():
+            var_field, type_field = i[1], (i[2] if len(i) > 2 else '')
+        else:
+            self.state.diag(" error - .reloc: variable name is not specified.", set_error=True)
+            return True
+        var = self._dir_var(var_field)
+        if var is None:
+            self.state.diag(f" error - .reloc: variable should be a lower case name ('{var_field}').", set_error=True)
+            return True
+        tname = type_field.strip()
+        if not tname:
+            self.state.diag(" error - .reloc: relocation type is not specified.", set_error=True)
+            return True
+        mach = ELF_MACHINES.get(self.state.elf_machine)
+        rtype = mach['named'].get(tname.lower()) if mach else None
+        if rtype is None:
+            _mname = mach['name'] if mach else self.state.elf_machine
+            self.state.diag(
+                f" error - .reloc: unknown relocation type '{tname}' for {_mname}.", set_error=True)
+            return True
+        self.state.reloc_constraints[var] = rtype
+        return True
+
+    def clrreloc_processing(self, i):
+        if len(i) == 0 or i[0] != '.clrreloc':
+            return False
+        var_field = i[2].strip() if len(i) >= 3 and i[2] else ''
+        if not var_field and len(i) >= 2 and i[1]:
+            var_field = i[1].strip()
+        if var_field:
+            var = self._dir_var(var_field)
+            if var is not None:
+                self.state.reloc_constraints.pop(var, None)
+            else:
+                self.state.diag(f" error - .clrreloc: variable should be a lower case name ('{var_field}').", set_error=True)
+        else:
+            self.state.reloc_constraints.clear()
+        return True
+
     def clrcheck_processing(self, i):
         if len(i) == 0 or i[0] != '.clrcheck':
             return False
@@ -3719,6 +3852,7 @@ class DirectiveProcessor:
             _v = nm.lower()
             if _v and PatternMatcher._var_name_at(_v, 0) == len(_v):
                 self.state.check_constraints.pop(_v, None)
+                self.state.reloc_constraints.pop(_v, None)
                 self.state.enum_defs.pop(_v, None)
         return True
 
@@ -4364,6 +4498,7 @@ class PatternMatcher:
             saved_vars_undef = dict(self.state.vars_undef)
             saved_refs_len = len(self.state._elf_label_refs_seen)
             saved_v2l = dict(self.state._elf_var_to_label)
+            saved_hint = dict(self.state._elf_insn_reloc_hint)
             if self.match0_brackets(s, vt):
                 # 入れ子のときは内側から。外側の値欄が内側の変数を使える。
                 for var, ent_val in reversed(binds):
@@ -4373,6 +4508,7 @@ class PatternMatcher:
             self.state.vars_undef = saved_vars_undef
             del self.state._elf_label_refs_seen[saved_refs_len:]
             self.state._elf_var_to_label = saved_v2l
+            self.state._elf_insn_reloc_hint = saved_hint
         return False
 
     def match0_brackets(self, s, t):
@@ -4410,6 +4546,7 @@ class PatternMatcher:
                 saved_vars_undef = dict(self.state.vars_undef)
                 saved_refs_len = len(self.state._elf_label_refs_seen)
                 saved_v2l      = dict(self.state._elf_var_to_label)
+                saved_hint     = dict(self.state._elf_insn_reloc_hint)
                 if self.match(s, lt):
                     self.last_match_score = self.last_score
                     return True
@@ -4417,6 +4554,7 @@ class PatternMatcher:
                 self.state.vars_undef = saved_vars_undef
                 del self.state._elf_label_refs_seen[saved_refs_len:]
                 self.state._elf_var_to_label = saved_v2l
+                self.state._elf_insn_reloc_hint = saved_hint
         return False
 
 
@@ -8952,6 +9090,7 @@ class Assembler:
             snap = {f: getattr(self.state, f) for f in _DIR_SCALAR_FIELDS}
             snap['symbols'] = dict(self.state.symbols)
             snap['check_constraints'] = dict(self.state.check_constraints)
+            snap['reloc_constraints'] = dict(self.state.reloc_constraints)
             snap['enum_defs'] = dict(self.state.enum_defs)
             snap['vliwnop'] = list(self.state.vliwnop)
             snap['vliwset'] = list(self.state.vliwset)
@@ -8962,6 +9101,7 @@ class Assembler:
                 setattr(self.state, f, snap[f])
             self.state.symbols = dict(snap['symbols'])
             self.state.check_constraints = dict(snap['check_constraints'])
+            self.state.reloc_constraints = dict(snap['reloc_constraints'])
             self.state.enum_defs = dict(snap['enum_defs'])
             self.state.vliwnop = list(snap['vliwnop'])
             self.state.vliwset = list(snap['vliwset'])
@@ -8992,6 +9132,10 @@ class Assembler:
             if self.directive_proc.check_processing(i):
                 continue
             if self.directive_proc.clrcheck_processing(i):
+                continue
+            if self.directive_proc.reloc_processing(i):
+                continue
+            if self.directive_proc.clrreloc_processing(i):
                 continue
             if self.directive_proc.map_processing(i):
                 continue
@@ -9050,6 +9194,7 @@ class Assembler:
             saved_vars_undef = dict(self.state.vars_undef)
             saved_refs_len = len(self.state._elf_label_refs_seen)
             saved_v2l = dict(self.state._elf_var_to_label)
+            saved_hint = dict(self.state._elf_insn_reloc_hint)
 
             _cand_diags = []
             try:
@@ -9079,6 +9224,7 @@ class Assembler:
                         'vars_undef': dict(self.state.vars_undef),
                         'refs':  self.state._elf_label_refs_seen[saved_refs_len:],
                         'v2l':   dict(self.state._elf_var_to_label),
+                        'hint':  dict(self.state._elf_insn_reloc_hint),
                         'dir':   _snap_dirstate(),
                         'error_undefined_label': self.state.error_undefined_label,
                         'diags': _cand_diags,
@@ -9088,6 +9234,7 @@ class Assembler:
                 self.state.vars_undef = saved_vars_undef
                 del self.state._elf_label_refs_seen[saved_refs_len:]
                 self.state._elf_var_to_label = saved_v2l
+                self.state._elf_insn_reloc_hint = saved_hint
 
                 # 破綻点修正: 以前は「式もシンボルも0個」なら即打ち切っていたが、
                 # スコアは (式の数, -リテラル数, シンボル数) の辞書順最小が勝ちで、
@@ -9119,6 +9266,7 @@ class Assembler:
             self.state.vars_undef = dict(best['vars_undef'])
             self.state._elf_label_refs_seen.extend(best['refs'])
             self.state._elf_var_to_label = dict(best['v2l'])
+            self.state._elf_insn_reloc_hint = dict(best['hint'])
             self.state.error_undefined_label = best.get('error_undefined_label', False)
             self.state.diag_replay(best.get('diags', ()))
             self.state.expmode = EXP_ASM
@@ -9130,6 +9278,7 @@ class Assembler:
                 _probe_sm_saved    = self.state._pass1_size_mode
                 _probe_refs_len    = len(self.state._elf_label_refs_seen)
                 _probe_widx_saved  = self.state._elf_current_word_idx
+                _probe_hint_saved  = dict(self.state._elf_insn_reloc_hint)
                 self.state._pass1_size_mode = True
                 try:
                     _probe_objl = self.obj_gen.makeobj(i[2])
@@ -9140,6 +9289,7 @@ class Assembler:
                     self.state._pass1_size_mode = _probe_sm_saved
                     del self.state._elf_label_refs_seen[_probe_refs_len:]
                     self.state._elf_current_word_idx = _probe_widx_saved
+                    self.state._elf_insn_reloc_hint = _probe_hint_saved
                     self.state.error_undefined_label = best.get('error_undefined_label', False)
                 err_triggered, _err_code = self.directive_proc.error(i[1])
                 if not err_triggered:
@@ -9212,6 +9362,7 @@ class Assembler:
         line = StringUtils.resolve_vliw_escapes(line)
 
         self.state.check_constraints.clear()
+        self.state.reloc_constraints.clear()
         self.state.enum_defs.clear()
         self.state.freed_subs.clear()
 
@@ -9228,6 +9379,7 @@ class Assembler:
             self.state._elf_current_word_idx = -1
             self.state._elf_var_to_label = {}
             self.state._elf_capturing_var = None
+            self.state._elf_insn_reloc_hint = {}
 
         try:
             idxs, objl, flag, idx = self.lineassemble2(line, 0)
@@ -9286,10 +9438,43 @@ class Assembler:
                 for lname, abs_w, first_widx, num_words in groups:
                     num_bytes = num_words * bpw_r
 
+                    # `.reloc` が宣言された変数が運んだ参照は、命令語のビット欄に
+                    # 値が詰まっていて出力バイト列から加数を逆算できない。型と加数
+                    # は宣言側で決まっているので、通常の推定経路を通さずに出す。
+                    _hint = self.state._elf_insn_reloc_hint.get(first_widx)
+                    _forced_rtype = None
+                    if _hint is not None:
+                        _hint_rtype, _hint_addend = _hint
+                        _fmask = insn_reloc_field_mask(_hint_rtype)
+                        if _fmask is None:
+                            # データ型を宣言した場合。加数は通常どおり出力バイト列
+                            # から求まるので、型だけを固定して下の経路へ渡す。
+                            _forced_rtype = _hint_rtype
+                        else:
+                            _insn_bytes = _mach_tbl_la['reloc_bytes'].get(_hint_rtype, 4)
+                            _insn_words = max(1, _insn_bytes // bpw_r)
+                            if first_widx + _insn_words <= len(objl):
+                                # RELA ではリンカが欄を埋めるので、命令語側は 0 に
+                                # しておく（GNU as と同じ形）。
+                                _wmask = (1 << self.state.bts) - 1
+                                for _k in range(_insn_words):
+                                    _sh = self.state.bts * _k if self.state.endian == 'little' \
+                                        else self.state.bts * (_insn_words - 1 - _k)
+                                    _clear = (_fmask >> _sh) & _wmask
+                                    objl[first_widx + _k] = int(objl[first_widx + _k]) & ~_clear & _wmask
+                            _sec_rel_h = (_completed_words
+                                          + (self.state.pc + first_widx - _entry_pc_cur)) * bpw_r
+                            self.state.relocations.append(
+                                (sec_name_r, _sec_rel_h, lname, _hint_rtype,
+                                 _hint_addend, _insn_bytes))
+                            continue
+
                     rtype = 0
                     _rtype_is_default_guess = False
                     lentry = self.state.labels.get(lname)
-                    if lentry and len(lentry) > 4 and lentry[4] is not None:
+                    if _forced_rtype is not None:
+                        rtype = _forced_rtype
+                    elif lentry and len(lentry) > 4 and lentry[4] is not None:
                         rtype_override = lentry[4]
                         expected = _mach_tbl_la['reloc_bytes'].get(rtype_override)
                         if expected is None or expected == num_bytes:

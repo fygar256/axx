@@ -1310,7 +1310,11 @@ typedef struct {
      * を積む。1命令ぶん組み立て終わった時点でこれをまとめ、同じラベルへの
      * 連続した参照を1つのリロケーションに束ねて relocations へ確定させる。 */
     int        elf_tracking;
-    struct { char *name; uint64_t val; int word_idx; } *elf_refs;
+    /* rtype>0 なら `.reloc` が宣言された変数が運んだ参照。命令語のビット欄に
+     * 値が詰まっていて加数を逆算できないので、型と加数をここに持って回る。
+     * 加数は「変数が持っていた値 − ラベル値」で、`bl func` なら 0。 */
+    struct { char *name; uint64_t val; int word_idx;
+             int rtype; int64_t addend; } *elf_refs;
     int        elf_refs_len;
     int        elf_refs_cap;
     int        elf_current_word_idx;
@@ -1335,6 +1339,11 @@ typedef struct {
 
     /* .check で登録された「変数 a〜z が満たすべき条件」 */
     StrVec     check_constraints[NVARS];
+    /* .reloc で登録された「この変数が捕らえたラベル参照はこの型で外に出す」
+     * 宣言。変数スロット -> 型番号（0 でなし）。型はオペランドの位置ごとに
+     * 決まる（AArch64 では同じシンボルを adrp と add が別の型で参照する）ため、
+     * シンボル側ではなくパターン側の、この変数単位でしか表せない。 */
+    int        reloc_constraints[NVARS];
 
     /* .enum で登録された、変数 a〜z の列挙（`!E<変数>` が使う） */
     EnumDef    enum_defs[NVARS];
@@ -1629,8 +1638,50 @@ static const ElfNamedReloc _named_aarch64[] = {
     {"pc64", 260, 8}, {"rel64", 260, 8},
     {"pc32", 261, 4}, {"rel32", 261, 4},
     {"pc16", 262, 2}, {"rel16", 262, 2},
+    /* 命令フィールド型。値は命令語のビット欄に詰まるため、素の整数が並ぶ
+     * データ型とは扱いが異なる（insn_reloc_field_mask を参照）。 */
+    {"movw_uabs_g0", 263, 4}, {"movw_uabs_g0_nc", 264, 4},
+    {"movw_uabs_g1", 265, 4}, {"movw_uabs_g1_nc", 266, 4},
+    {"movw_uabs_g2", 267, 4}, {"movw_uabs_g2_nc", 268, 4},
+    {"movw_uabs_g3", 269, 4},
+    {"adr_prel_lo21", 274, 4},
+    {"adr_prel_pg_hi21", 275, 4}, {"adrp", 275, 4},
+    {"adr_prel_pg_hi21_nc", 276, 4},
+    {"add_abs_lo12_nc", 277, 4},
+    {"ldst8_abs_lo12_nc", 278, 4},
+    {"tstbr14", 279, 4}, {"condbr19", 280, 4},
+    {"jump26", 282, 4}, {"call26", 283, 4},
+    {"ldst16_abs_lo12_nc", 284, 4},
+    {"ldst32_abs_lo12_nc", 285, 4},
+    {"ldst64_abs_lo12_nc", 286, 4},
+    {"ldst128_abs_lo12_nc", 299, 4},
     {NULL, 0, 0},
 };
+
+/* AArch64 の「命令フィールド型」リロケーションが占める、32bit 命令語中の
+ * ビットマスクを返す。データ型や未知の型では 0。
+ *
+ * データ型（ABS64 など）は値がそのまま連続バイトに並ぶが、こちらは命令語の
+ * 飛び飛びのビット欄に、語単位・ページ単位に縮めた形で詰まる。そのため加数を
+ * 「出力バイト列 − ラベル値」で逆算する通常の経路が使えない。該当する型では
+ * 代わりに、パターンが捕らえたオペランド値とラベル値の差を加数とし、命令語側の
+ * ビット欄は 0 にして出す（GNU as と同じ形。RELA なのでリンカが欄を埋める）。 */
+static uint32_t insn_reloc_field_mask(int rtype){
+    switch(rtype){
+    case 263: case 264: case 265: case 266:
+    case 267: case 268: case 269:
+        return 0xffffu << 5;                    /* MOVW_UABS_G0..G3  imm16 */
+    case 274: case 275: case 276:
+        return (3u << 29) | (0x7ffffu << 5);    /* ADR/ADRP  immlo+immhi */
+    case 277: case 278: case 284: case 285:
+    case 286: case 299:
+        return 0xfffu << 10;                    /* ADD/LDST lo12  imm12 */
+    case 279: return 0x3fffu << 5;              /* TSTBR14  */
+    case 280: return 0x7ffffu << 5;             /* CONDBR19 */
+    case 282: case 283: return 0x3ffffffu;      /* JUMP26 / CALL26 */
+    default: return 0;
+    }
+}
 static const ElfNamedReloc _named_riscv[] = {
     {"abs64", 2, 8}, {"abs32", 1, 4}, {"abs16", 34, 2}, {"abs8", 33, 1},
     {NULL, 0, 0},
@@ -1852,6 +1903,7 @@ static void state_init(AsmState *st) {
     st->reloc_cap = 0;
     for(int _rti=0; _rti<4; _rti++) st->reloctype_override[_rti] = -1;
     for(int _ci=0; _ci<NVARS; _ci++) sv_init(&st->check_constraints[_ci]);
+    for(int _ci=0; _ci<NVARS; _ci++) st->reloc_constraints[_ci] = 0;
     for(int _ci=0; _ci<NVARS; _ci++) enumdef_init(&st->enum_defs[_ci]);
     st->enum_bind_names = NULL;
     st->enum_bind_vals  = NULL;
@@ -2944,6 +2996,8 @@ static uint256_t label_get_value(AsmState *st, const char *k){
                 st->elf_refs[st->elf_refs_len].name     = strdup(k);
                 st->elf_refs[st->elf_refs_len].val      = u256_to_u64(e->value);
                 st->elf_refs[st->elf_refs_len].word_idx = st->elf_current_word_idx;
+                st->elf_refs[st->elf_refs_len].rtype    = 0;
+                st->elf_refs[st->elf_refs_len].addend   = 0;
                 st->elf_refs_len++;
             }
         }
@@ -4014,6 +4068,12 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     st->elf_refs[st->elf_refs_len].name     = strdup(st->elf_var_to_label[_vi].label_name);
                     st->elf_refs[st->elf_refs_len].val      = st->elf_var_to_label[_vi].label_val;
                     st->elf_refs[st->elf_refs_len].word_idx = st->elf_current_word_idx;
+                    st->elf_refs[st->elf_refs_len].rtype    = st->reloc_constraints[_vi];
+                    /* 加数は「変数が持っていた値 − ラベル値」。`bl func` なら 0、
+                     * `bl func+8` なら 8。命令語のビット欄を逆算しなくて済むので、
+                     * 欄の分割や語単位の縮尺に左右されない。 */
+                    st->elf_refs[st->elf_refs_len].addend   =
+                        (int64_t)(u256_to_u64(x) - st->elf_var_to_label[_vi].label_val);
                     st->elf_refs_len++;
                 }
             }
@@ -4794,6 +4854,66 @@ static int dir_check(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.reloc::<変数>::<型名>`
+ *
+ * その変数が捕らえたラベル参照を、指定の ELF リロケーション型で書き出す。
+ * `.check` と同じく位置依存で、後の `.reloc` が前のものを置き換える。
+ *
+ * 型名は `-m` で選んだマシンの名前表（`::pc32` などに使うものと同じ）から引く。
+ * AArch64 の `call26` のような命令フィールド型は、値が命令語のビット欄に詰まって
+ * いて出力バイト列から加数を逆算できないため、この宣言が要る。 */
+static int dir_reloc(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".reloc") != 0) return 0;
+    const char *var_str  = e->f[1][0] ? e->f[1] : e->f[2];
+    const char *type_str = e->f[1][0] ? e->f[2] : "";
+    if(!var_str[0]){
+        axx_diagf(1, 0, " error - .reloc: variable name is not specified.\n");
+        return 1;
+    }
+    int idx = dir_var_slot(var_str);
+    if(idx < 0){
+        axx_diagf(1, 0, " error - .reloc: variable should be a lower case name ('%s').\n",
+                   var_str);
+        return 1;
+    }
+    char tname[64]; size_t tn = 0;
+    for(const char *q = type_str; *q && tn + 1 < sizeof(tname); q++){
+        if(*q == ' ' || *q == '\t') continue;
+        tname[tn++] = (char)tolower((unsigned char)*q);
+    }
+    tname[tn] = '\0';
+    if(!tname[0]){
+        axx_diagf(1, 0, " error - .reloc: relocation type is not specified.\n");
+        return 1;
+    }
+    const ElfMachineInfo *m = elf_machine_find(asmb->st.elf_machine);
+    int rtype = elf_machine_named(m, tname);
+    if(rtype < 0){
+        axx_diagf(1, 0, " error - .reloc: unknown relocation type '%s' for %s.\n",
+                   tname, m ? m->name : "?");
+        return 1;
+    }
+    asmb->st.reloc_constraints[idx] = rtype;
+    return 1;
+}
+
+static int dir_clrreloc(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".clrreloc") != 0) return 0;
+    const char *var_str = e->f[2][0] ? e->f[2] : e->f[1];
+    if(var_str[0]){
+        int idx = dir_var_slot(var_str);
+        if(idx < 0){
+            axx_diagf(1, 0, " error - .clrreloc: variable should be a lower case name ('%s').\n",
+                       var_str);
+            return 1;
+        }
+        asmb->st.reloc_constraints[idx] = 0;
+    } else {
+        for(int i = 0; i < g_nvars; i++) asmb->st.reloc_constraints[i] = 0;
+    }
+    return 1;
+}
+
 static int dir_clrcheck(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".clrcheck") != 0) return 0;
     const char *var_str = e->f[2];
@@ -4855,6 +4975,7 @@ static void free_one_name(Assembler *asmb, const char *name){
             int vi = var_slot(lower, n, 0);
             if(vi >= 0){
                 sv_free(&st->check_constraints[vi]); sv_init(&st->check_constraints[vi]);
+                st->reloc_constraints[vi] = 0;
                 enumdef_clear(&st->enum_defs[vi]);
             }
         }
@@ -10167,11 +10288,13 @@ typedef struct {
     int       pln;
     PatEntry *pat;
     PatVar    vars[NVARS];
-    struct { char *name; uint64_t val; int word_idx; } *refs;
+    struct { char *name; uint64_t val; int word_idx;
+             int rtype; int64_t addend; } *refs;
     int       refs_len;
     struct { int set; char *label_name; uint64_t label_val; } vtl[NVARS];
     SymMap    symbols;
     StrVec    check_constraints[NVARS];
+    int       reloc_constraints[NVARS];
     EnumDef   enum_defs[NVARS];
     char      swordchars[256];
     uint256_t padding;
@@ -10235,6 +10358,8 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
                               ? strdup(st->elf_refs[saved_refs_len+i].name) : NULL;
             b->refs[i].val      = st->elf_refs[saved_refs_len+i].val;
             b->refs[i].word_idx = st->elf_refs[saved_refs_len+i].word_idx;
+            b->refs[i].rtype    = st->elf_refs[saved_refs_len+i].rtype;
+            b->refs[i].addend   = st->elf_refs[saved_refs_len+i].addend;
         }
     }
     for(int i=0;i<g_nvars;i++){
@@ -10251,6 +10376,7 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
         sv_init(&b->check_constraints[i]);
         for(int j=0;j<st->check_constraints[i].len;j++)
             sv_push(&b->check_constraints[i], st->check_constraints[i].data[j]);
+        b->reloc_constraints[i] = st->reloc_constraints[i];
         enumdef_init(&b->enum_defs[i]);
         enumdef_copy(&b->enum_defs[i], &st->enum_defs[i]);
     }
@@ -10279,6 +10405,7 @@ static void best_restore_dirstate(AsmState *st, const BestMatch *b){
         sv_free(&st->check_constraints[i]);
         for(int j=0;j<b->check_constraints[i].len;j++)
             sv_push(&st->check_constraints[i], b->check_constraints[i].data[j]);
+        st->reloc_constraints[i] = b->reloc_constraints[i];
         enumdef_copy(&st->enum_defs[i], &b->enum_defs[i]);
     }
     memcpy(st->swordchars, b->swordchars, sizeof(st->swordchars));
@@ -10297,7 +10424,8 @@ static void best_restore_dirstate(AsmState *st, const BestMatch *b){
 }
 
 static void elf_refs_push_copy(AsmState *st, const char *name,
-                               uint64_t val, int word_idx){
+                               uint64_t val, int word_idx,
+                               int rtype, int64_t addend){
     if(st->elf_refs_len >= st->elf_refs_cap){
         st->elf_refs_cap = st->elf_refs_cap ? st->elf_refs_cap*2 : 8;
         st->elf_refs = realloc(st->elf_refs,
@@ -10307,6 +10435,8 @@ static void elf_refs_push_copy(AsmState *st, const char *name,
     st->elf_refs[st->elf_refs_len].name     = name ? strdup(name) : NULL;
     st->elf_refs[st->elf_refs_len].val      = val;
     st->elf_refs[st->elf_refs_len].word_idx = word_idx;
+    st->elf_refs[st->elf_refs_len].rtype    = rtype;
+    st->elf_refs[st->elf_refs_len].addend   = addend;
     st->elf_refs_len++;
 }
 
@@ -10499,6 +10629,8 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         if(dir_vliwp(asmb,i)) continue;
         if(dir_check(asmb,i)) continue;
         if(dir_clrcheck(asmb,i)) continue;
+        if(dir_reloc(asmb,i)) continue;
+        if(dir_clrreloc(asmb,i)) continue;
         if(dir_map(asmb,i)) continue;
         if(dir_free(asmb,i)) continue;
         if(dir_enum(asmb,i)) continue;
@@ -10616,7 +10748,8 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         memcpy(st->vars, best.vars, sizeof(st->vars));
         for(int ri2=0; ri2<best.refs_len; ri2++)
             elf_refs_push_copy(st, best.refs[ri2].name,
-                               best.refs[ri2].val, best.refs[ri2].word_idx);
+                               best.refs[ri2].val, best.refs[ri2].word_idx,
+                               best.refs[ri2].rtype, best.refs[ri2].addend);
         for(int vi=0;vi<g_nvars;vi++){
             free(st->elf_var_to_label[vi].label_name);
             st->elf_var_to_label[vi].set        = best.vtl[vi].set;
@@ -10732,7 +10865,8 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
     return r;
 }
 
-typedef struct { const char *name; uint64_t val; int word_idx; int ord; } ElfRef;
+typedef struct { const char *name; uint64_t val; int word_idx; int ord;
+                 int rtype; int64_t addend; } ElfRef;
 
 /* ワード番号の昇順。同じワード番号なら元の出現順（ord）を保つ。
  * 破綻点修正: qsort は安定ソートではないので、ワード番号だけで比較すると
@@ -10773,6 +10907,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     for(int _ci = 0; _ci < g_nvars; _ci++){
         sv_free(&asmb->st.check_constraints[_ci]);
         sv_init(&asmb->st.check_constraints[_ci]);
+        asmb->st.reloc_constraints[_ci] = 0;
         enumdef_clear(&asmb->st.enum_defs[_ci]);
     }
     subv_unfreeze_all(&asmb->st.subs);
@@ -10880,7 +11015,9 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     _valid[_nvalid] = (ElfRef){st->elf_refs[_ri].name,
                                               st->elf_refs[_ri].val,
                                               st->elf_refs[_ri].word_idx,
-                                              _nvalid};
+                                              _nvalid,
+                                              st->elf_refs[_ri].rtype,
+                                              st->elf_refs[_ri].addend};
                     _nvalid++;
                 }
             }
@@ -10933,9 +11070,64 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     _gj++;
                 int _nwords = _gj - _gi;
                 int _nbytes = _nwords * bpw;
+
+                /* `.reloc` が宣言された変数が運んだ参照は、命令語のビット欄に値が
+                 * 詰まっていて出力バイト列から加数を逆算できない。型と加数は宣言側
+                 * で決まっているので、通常の推定経路を通さずに出す。 */
+                int _forced_rtype = 0;
+                if(_valid[_gi].rtype > 0){
+                    uint32_t _fmask = insn_reloc_field_mask(_valid[_gi].rtype);
+                    if(_fmask == 0){
+                        /* データ型を宣言した場合。加数は通常どおり出力バイト列
+                         * から求まるので、型だけを固定して下の経路へ渡す。 */
+                        _forced_rtype = _valid[_gi].rtype;
+                    } else {
+                        int _ibytes = elf_machine_reloc_bytes(_mtbl_rm, _valid[_gi].rtype);
+                        if(_ibytes <= 0) _ibytes = 4;
+                        int _iwords = _ibytes / bpw;
+                        if(_iwords < 1) _iwords = 1;
+                        if(_widx + _iwords <= objl.len){
+                            /* RELA ではリンカが欄を埋めるので、命令語側は 0 に
+                             * しておく（GNU as と同じ形）。 */
+                            uint64_t _wmask_i = axx_word_mask(st->bts);
+                            for(int _k = 0; _k < _iwords; _k++){
+                                int _sh = st->endian_big
+                                        ? st->bts * (_iwords - 1 - _k)
+                                        : st->bts * _k;
+                                uint64_t _clear = (_sh < 32)
+                                                ? (((uint64_t)_fmask >> _sh) & _wmask_i) : 0;
+                                uint64_t _wv = u256_to_u64(objl.data[_widx + _k]);
+                                objl.data[_widx + _k] =
+                                    u256_from_u64((_wv & ~_clear) & _wmask_i);
+                            }
+                        }
+                        int64_t _sec_rel_h =
+                            (int64_t)((sec_completed_words +
+                                       (cur_pc + (uint64_t)_widx - sec_entry_pc_cur))
+                                      * (uint64_t)bpw);
+                        if(st->reloc_count >= st->reloc_cap){
+                            st->reloc_cap = st->reloc_cap ? st->reloc_cap*2 : 16;
+                            st->relocations = realloc(st->relocations,
+                                (size_t)st->reloc_cap * sizeof(st->relocations[0]));
+                            if(!st->relocations){ perror("realloc"); exit(1); }
+                        }
+                        st->relocations[st->reloc_count].section    = strdup(sec_name);
+                        st->relocations[st->reloc_count].sec_offset = _sec_rel_h;
+                        st->relocations[st->reloc_count].sym        = strdup(_lname);
+                        st->relocations[st->reloc_count].rtype      = _valid[_gi].rtype;
+                        st->relocations[st->reloc_count].addend     = _valid[_gi].addend;
+                        st->relocations[st->reloc_count].nbytes     = _ibytes;
+                        st->reloc_count++;
+                        _gi = _gj;
+                        continue;
+                    }
+                }
+
                 int _rtype = 0;
                 int _rtype_is_default_guess = 0;
-                {
+                if(_forced_rtype > 0){
+                    _rtype = _forced_rtype;
+                } else {
                     LabelEntry *_le = lmap_find(&st->labels, _lname);
                     if(_le && _le->reloc_type_override >= 0){
                         int _rt_ov = _le->reloc_type_override;
