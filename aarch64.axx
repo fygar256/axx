@@ -5173,3 +5173,482 @@ PRFB !{opt},pg,[xb,zm.D] :: .call w4(0xc4608000|(zm<<16)|(pg<<10)|(xb<<5)|!{opv}
 }
 !svprfall("svp", "(svp<8?svp:svp-8)")
 !svprfall("#!p", "(p&0xf)")
+
+/* -------------------------------------------------------------------
+/* SVE2.
+/* ------------------------------------------------------------------- */
+
+/* Unpredicated multiplies join the integer binary group */
+!sv3u("MUL", 0x18)
+!sv3u("SMULH", 0x1a)
+!sv3u("UMULH", 0x1b)
+!sv3u("SQDMULH", 0x1c)
+!sv3u("SQRDMULH", 0x1d)
+PMUL zd.B,zn.B,zm.B :: .call w4(0x04206400|(zm<<16)|(zn<<5)|zd)
+
+/* Shift by immediate, predicated -- the SVE2 additions */
+!svshp("SQSHL", 6, 0)
+!svshp("UQSHL", 7, 0)
+!svshp("SRSHR", 0xc, 1)
+!svshp("URSHR", 0xd, 1)
+!svshp("SQSHLU", 0xf, 0)
+
+/* Integer binary, predicated and destructive.
+/*   01000100 size 0 opc 100 Pg Zm Zdn */
+!def sv2bp1(nm, opc, el, sz) {
+!{nm} zd.!{el},pg/M,zd.!{el},zm.!{el} :: .call w4(0x44008000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zm<<5)|zd)
+}
+!def sv2bp(nm, opc) {
+!sv2bp1(nm, opc, "B", 0)
+!sv2bp1(nm, opc, "H", 1)
+!sv2bp1(nm, opc, "S", 2)
+!sv2bp1(nm, opc, "D", 3)
+}
+!sv2bp("SRSHL", 0x02)
+!sv2bp("URSHL", 0x03)
+!sv2bp("SRSHLR", 0x06)
+!sv2bp("URSHLR", 0x07)
+!sv2bp("SQSHL", 0x08)
+!sv2bp("UQSHL", 0x09)
+!sv2bp("SQRSHL", 0x0a)
+!sv2bp("UQRSHL", 0x0b)
+!sv2bp("SQSHLR", 0x0c)
+!sv2bp("UQSHLR", 0x0d)
+!sv2bp("SQRSHLR", 0x0e)
+!sv2bp("UQRSHLR", 0x0f)
+!sv2bp("SHADD", 0x10)
+!sv2bp("UHADD", 0x11)
+!sv2bp("SHSUB", 0x12)
+!sv2bp("UHSUB", 0x13)
+!sv2bp("SRHADD", 0x14)
+!sv2bp("URHADD", 0x15)
+!sv2bp("SHSUBR", 0x16)
+!sv2bp("UHSUBR", 0x17)
+!sv2bp("SQADD", 0x18)
+!sv2bp("UQADD", 0x19)
+!sv2bp("SQSUB", 0x1a)
+!sv2bp("UQSUB", 0x1b)
+!sv2bp("SUQADD", 0x1c)
+!sv2bp("USQADD", 0x1d)
+!sv2bp("SQSUBR", 0x1e)
+!sv2bp("UQSUBR", 0x1f)
+
+/* Pairwise, predicated and destructive */
+!def sv2pp1(nm, opc, el, sz) {
+!{nm} zd.!{el},pg/M,zd.!{el},zm.!{el} :: .call w4(0x4400a000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zm<<5)|zd)
+}
+!def sv2pp(nm, opc) {
+!sv2pp1(nm, opc, "B", 0)
+!sv2pp1(nm, opc, "H", 1)
+!sv2pp1(nm, opc, "S", 2)
+!sv2pp1(nm, opc, "D", 3)
+}
+!sv2pp("ADDP", 0x11)
+!sv2pp("SMAXP", 0x14)
+!sv2pp("UMAXP", 0x15)
+!sv2pp("SMINP", 0x16)
+!sv2pp("UMINP", 0x17)
+!def svfpp1(nm, opc, el, sz) {
+!{nm} zd.!{el},pg/M,zd.!{el},zm.!{el} :: .call w4(0x64008000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zm<<5)|zd)
+}
+!def svfpp(nm, opc) {
+!svfpp1(nm, opc, "H", 1)
+!svfpp1(nm, opc, "S", 2)
+!svfpp1(nm, opc, "D", 3)
+}
+!svfpp("FADDP", 0x10)
+!svfpp("FMAXNMP", 0x14)
+!svfpp("FMINNMP", 0x15)
+!svfpp("FMAXP", 0x16)
+!svfpp("FMINP", 0x17)
+
+/* Saturating unary, predicated */
+!def sv2u1(nm, opc, el, sz) {
+!{nm} zd.!{el},pg/M,zn.!{el} :: .call w4(0x4400a000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zn<<5)|zd)
+}
+!def sv2u(nm, opc) {
+!sv2u1(nm, opc, "B", 0)
+!sv2u1(nm, opc, "H", 1)
+!sv2u1(nm, opc, "S", 2)
+!sv2u1(nm, opc, "D", 3)
+}
+!sv2u("SQABS", 0x08)
+!sv2u("SQNEG", 0x09)
+URECPE zd.S,pg/M,zn.S :: .call w4(0x4480a000|(pg<<10)|(zn<<5)|zd)
+URSQRTE zd.S,pg/M,zn.S :: .call w4(0x4481a000|(pg<<10)|(zn<<5)|zd)
+/* Accumulate pairs into the next size up */
+!def sv2dalp(nm, opc, el, sel, sz) {
+!{nm} zd.!{el},pg/M,zn.!{sel} :: .call w4(0x4400a000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zn<<5)|zd)
+}
+!def sv2dalpa(nm, opc) {
+!sv2dalp(nm, opc, "H", "B", 1)
+!sv2dalp(nm, opc, "S", "H", 2)
+!sv2dalp(nm, opc, "D", "S", 3)
+}
+!sv2dalpa("SADALP", 4)
+!sv2dalpa("UADALP", 5)
+
+/* Widening and narrowing arithmetic.  sz is the wider element. */
+!def sv2w1(nm, opc, el, sel, sz) {
+!{nm} zd.!{el},zn.!{sel},zm.!{sel} :: .call w4(0x45000000|(!{sz}<<22)|(zm<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def sv2w(nm, opc) {
+!sv2w1(nm, opc, "H", "B", 1)
+!sv2w1(nm, opc, "S", "H", 2)
+!sv2w1(nm, opc, "D", "S", 3)
+}
+!sv2w("SADDLB", 0x00)
+!sv2w("SADDLT", 0x01)
+!sv2w("UADDLB", 0x02)
+!sv2w("UADDLT", 0x03)
+!sv2w("SSUBLB", 0x04)
+!sv2w("SSUBLT", 0x05)
+!sv2w("USUBLB", 0x06)
+!sv2w("USUBLT", 0x07)
+!sv2w("SQDMULLB", 0x18)
+!sv2w("SQDMULLT", 0x19)
+/* PMULL skips the word-from-halfword size */
+!sv2w1("PMULLB", 0x1a, "H", "B", 1)
+!sv2w1("PMULLT", 0x1b, "H", "B", 1)
+!sv2w1("PMULLB", 0x1a, "D", "S", 3)
+!sv2w1("PMULLT", 0x1b, "D", "S", 3)
+!sv2w("SMULLB", 0x1c)
+!sv2w("SMULLT", 0x1d)
+!sv2w("UMULLB", 0x1e)
+!sv2w("UMULLT", 0x1f)
+!sv2w("SADDLBT", 0x20)
+!sv2w("SSUBLBT", 0x22)
+!sv2w("SSUBLTB", 0x23)
+!sv2w("SABALB", 0x30)
+!sv2w("SABALT", 0x31)
+!sv2w("UABALB", 0x32)
+!sv2w("UABALT", 0x33)
+/* The 128-bit polynomial multiply has no size field */
+PMULLB zd.Q,zn.D,zm.D :: .call w4(0x45006800|(zm<<16)|(zn<<5)|zd)
+PMULLT zd.Q,zn.D,zm.D :: .call w4(0x45006c00|(zm<<16)|(zn<<5)|zd)
+/* Wide forms take one operand already widened */
+!def sv2ww1(nm, opc, el, sel, sz) {
+!{nm} zd.!{el},zn.!{el},zm.!{sel} :: .call w4(0x45000000|(!{sz}<<22)|(zm<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def sv2ww(nm, opc) {
+!sv2ww1(nm, opc, "H", "B", 1)
+!sv2ww1(nm, opc, "S", "H", 2)
+!sv2ww1(nm, opc, "D", "S", 3)
+}
+!sv2ww("SADDWB", 0x10)
+!sv2ww("SADDWT", 0x11)
+!sv2ww("UADDWB", 0x12)
+!sv2ww("UADDWT", 0x13)
+!sv2ww("SSUBWB", 0x14)
+!sv2ww("SSUBWT", 0x15)
+!sv2ww("USUBWB", 0x16)
+!sv2ww("USUBWT", 0x17)
+
+/* Multiply-accumulate long */
+!def sv2ml1(nm, opc, el, sel, sz) {
+!{nm} zd.!{el},zn.!{sel},zm.!{sel} :: .call w4(0x44000000|(!{sz}<<22)|(zm<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def sv2ml(nm, opc) {
+!sv2ml1(nm, opc, "H", "B", 1)
+!sv2ml1(nm, opc, "S", "H", 2)
+!sv2ml1(nm, opc, "D", "S", 3)
+}
+!sv2ml("SQDMLALBT", 0x02)
+!sv2ml("SQDMLSLBT", 0x03)
+!sv2ml("SMLALB", 0x10)
+!sv2ml("SMLALT", 0x11)
+!sv2ml("UMLALB", 0x12)
+!sv2ml("UMLALT", 0x13)
+!sv2ml("SMLSLB", 0x14)
+!sv2ml("SMLSLT", 0x15)
+!sv2ml("UMLSLB", 0x16)
+!sv2ml("UMLSLT", 0x17)
+!sv2ml("SQDMLALB", 0x18)
+!sv2ml("SQDMLALT", 0x19)
+!sv2ml("SQDMLSLB", 0x1a)
+!sv2ml("SQDMLSLT", 0x1b)
+
+/* Narrowing arithmetic.  sz is the wider, source element. */
+!def sv2n1(nm, opc, el, sel, sz) {
+!{nm} zd.!{el},zn.!{sel},zm.!{sel} :: .call w4(0x45200000|(!{sz}<<22)|(zm<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def sv2n(nm, opc) {
+!sv2n1(nm, opc, "B", "H", 1)
+!sv2n1(nm, opc, "H", "S", 2)
+!sv2n1(nm, opc, "S", "D", 3)
+}
+!sv2n("ADDHNB", 0x18)
+!sv2n("ADDHNT", 0x19)
+!sv2n("RADDHNB", 0x1a)
+!sv2n("RADDHNT", 0x1b)
+!sv2n("SUBHNB", 0x1c)
+!sv2n("SUBHNT", 0x1d)
+!sv2n("RSUBHNB", 0x1e)
+!sv2n("RSUBHNT", 0x1f)
+/* Saturating extract narrow: the split field holds the destination
+/* element width with no shift. */
+!def sv2x1(nm, opc, el, sel, ed) {
+!{nm} zd.!{el},zn.!{sel} :: .call w4(0x45204000|(((!{ed}>>5)&3)<<22)|((!{ed}&0x1f)<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def sv2x(nm, opc) {
+!sv2x1(nm, opc, "B", "H", 8)
+!sv2x1(nm, opc, "H", "S", 16)
+!sv2x1(nm, opc, "S", "D", 32)
+}
+!sv2x("SQXTNB", 0x00)
+!sv2x("SQXTNT", 0x01)
+!sv2x("UQXTNB", 0x02)
+!sv2x("UQXTNT", 0x03)
+!sv2x("SQXTUNB", 0x04)
+!sv2x("SQXTUNT", 0x05)
+/* Shift right and narrow */
+!def sv2sn1(nm, opc, el, sel, ed) {
+!{nm} zd.!{el},zn.!{sel},#!s ::s<1;3,s>!{ed};3 :: .call w4(0x45200000|((((!{ed}*2-s)>>5)&3)<<22)|(((!{ed}*2-s)&0x1f)<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def sv2sn(nm, opc) {
+!sv2sn1(nm, opc, "B", "H", 8)
+!sv2sn1(nm, opc, "H", "S", 16)
+!sv2sn1(nm, opc, "S", "D", 32)
+}
+!sv2sn("SQSHRUNB", 0x00)
+!sv2sn("SQSHRUNT", 0x01)
+!sv2sn("SQRSHRUNB", 0x02)
+!sv2sn("SQRSHRUNT", 0x03)
+!sv2sn("SHRNB", 0x04)
+!sv2sn("SHRNT", 0x05)
+!sv2sn("RSHRNB", 0x06)
+!sv2sn("RSHRNT", 0x07)
+!sv2sn("SQSHRNB", 0x08)
+!sv2sn("SQSHRNT", 0x09)
+!sv2sn("SQRSHRNB", 0x0a)
+!sv2sn("SQRSHRNT", 0x0b)
+!sv2sn("UQSHRNB", 0x0c)
+!sv2sn("UQSHRNT", 0x0d)
+!sv2sn("UQRSHRNB", 0x0e)
+!sv2sn("UQRSHRNT", 0x0f)
+
+/* Shift and accumulate, unpredicated */
+!def sv2sar(nm, opc, el, es) {
+!{nm} zd.!{el},zn.!{el},#!s ::s<1;3,s>!{es};3 :: .call w4(0x45000000|((((!{es}*2-s)>>5)&3)<<22)|(((!{es}*2-s)&0x1f)<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def sv2sal(nm, opc, el, es) {
+!{nm} zd.!{el},zn.!{el},#!s ::s<0;3,s>!{es-1};3 :: .call w4(0x45000000|((((!{es}+s)>>5)&3)<<22)|(((!{es}+s)&0x1f)<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def sv2sa(nm, opc, right) {
+!if right !then {
+!sv2sar(nm, opc, "B", 8)
+!sv2sar(nm, opc, "H", 16)
+!sv2sar(nm, opc, "S", 32)
+!sv2sar(nm, opc, "D", 64)
+} !else {
+!sv2sal(nm, opc, "B", 8)
+!sv2sal(nm, opc, "H", 16)
+!sv2sal(nm, opc, "S", 32)
+!sv2sal(nm, opc, "D", 64)
+}
+}
+!sv2sa("SSRA", 0x38, 1)
+!sv2sa("USRA", 0x39, 1)
+!sv2sa("SRSRA", 0x3a, 1)
+!sv2sa("URSRA", 0x3b, 1)
+!sv2sa("SRI", 0x3c, 1)
+!sv2sa("SLI", 0x3d, 0)
+
+/* Absolute difference and accumulate */
+!def sv2aba(nm, opc, el, sz) {
+!{nm} zd.!{el},zn.!{el},zm.!{el} :: .call w4(0x45000000|(!{sz}<<22)|(zm<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def sv2abaa(nm, opc) {
+!sv2aba(nm, opc, "B", 0)
+!sv2aba(nm, opc, "H", 1)
+!sv2aba(nm, opc, "S", 2)
+!sv2aba(nm, opc, "D", 3)
+}
+!sv2abaa("SABA", 0x3e)
+!sv2abaa("UABA", 0x3f)
+!sv2abaa("EORBT", 0x24)
+!sv2abaa("EORTB", 0x25)
+!sv2abaa("BEXT", 0x2c)
+!sv2abaa("BDEP", 0x2d)
+!sv2abaa("BGRP", 0x2e)
+/* Long carry propagation, on words and doublewords only */
+ADCLB zd.S,zn.S,zm.S :: .call w4(0x4500d000|(zm<<16)|(zn<<5)|zd)
+ADCLT zd.S,zn.S,zm.S :: .call w4(0x4500d400|(zm<<16)|(zn<<5)|zd)
+ADCLB zd.D,zn.D,zm.D :: .call w4(0x4540d000|(zm<<16)|(zn<<5)|zd)
+ADCLT zd.D,zn.D,zm.D :: .call w4(0x4540d400|(zm<<16)|(zn<<5)|zd)
+SBCLB zd.S,zn.S,zm.S :: .call w4(0x4580d000|(zm<<16)|(zn<<5)|zd)
+SBCLT zd.S,zn.S,zm.S :: .call w4(0x4580d400|(zm<<16)|(zn<<5)|zd)
+SBCLB zd.D,zn.D,zm.D :: .call w4(0x45c0d000|(zm<<16)|(zn<<5)|zd)
+SBCLT zd.D,zn.D,zm.D :: .call w4(0x45c0d400|(zm<<16)|(zn<<5)|zd)
+
+/* Complex integer arithmetic */
+!def sv2cadd(nm, op, el, sz) {
+!{nm} zd.!{el},zd.!{el},zm.!{el},#90 :: .call w4(0x4500d800|(!{sz}<<22)|(!{op}<<16)|(zm<<5)|zd)
+!{nm} zd.!{el},zd.!{el},zm.!{el},#270 :: .call w4(0x4500dc00|(!{sz}<<22)|(!{op}<<16)|(zm<<5)|zd)
+}
+!def sv2cadda(nm, op) {
+!sv2cadd(nm, op, "B", 0)
+!sv2cadd(nm, op, "H", 1)
+!sv2cadd(nm, op, "S", 2)
+!sv2cadd(nm, op, "D", 3)
+}
+!sv2cadda("CADD", 0)
+!sv2cadda("SQCADD", 1)
+!def sv2cmla(nm, base, el, sz, r, rv) {
+!{nm} zd.!{el},zn.!{el},zm.!{el},#!{r} :: .call w4(!{base}|(!{sz}<<22)|(zm<<16)|(!{rv}<<10)|(zn<<5)|zd)
+}
+!def sv2cmlaa(nm, base, el, sz) {
+!sv2cmla(nm, base, el, sz, 0, 0)
+!sv2cmla(nm, base, el, sz, 90, 1)
+!sv2cmla(nm, base, el, sz, 180, 2)
+!sv2cmla(nm, base, el, sz, 270, 3)
+}
+!def sv2cmlab(nm, base) {
+!sv2cmlaa(nm, base, "B", 0)
+!sv2cmlaa(nm, base, "H", 1)
+!sv2cmlaa(nm, base, "S", 2)
+!sv2cmlaa(nm, base, "D", 3)
+}
+!sv2cmlab("CMLA", 0x44002000)
+!sv2cmlab("SQRDCMLAH", 0x44003000)
+!def sv2cmlai(nm, base, r, rv) {
+!{nm} zd.H,zn.H,zy.H[!!i],#!{r} ::i<0;3,i>3;3 :: .call w4(!{base}|0x200000|(i<<19)|(zy<<16)|(!{rv}<<10)|(zn<<5)|zd)
+!{nm} zd.S,zn.S,zx.S[!!i],#!{r} ::i<0;3,i>1;3 :: .call w4(!{base}|0x600000|(i<<20)|(zx<<16)|(!{rv}<<10)|(zn<<5)|zd)
+}
+!def sv2cmlaia(nm, base) {
+!sv2cmlai(nm, base, 0, 0)
+!sv2cmlai(nm, base, 90, 1)
+!sv2cmlai(nm, base, 180, 2)
+!sv2cmlai(nm, base, 270, 3)
+}
+!sv2cmlaia("CMLA", 0x44806000)
+!sv2cmlaia("SQRDCMLAH", 0x44807000)
+/* Complex dot product */
+!def sv2cdot(r, rv) {
+CDOT zd.S,zn.B,zm.B,#!{r} :: .call w4(0x44801000|(zm<<16)|(!{rv}<<10)|(zn<<5)|zd)
+CDOT zd.D,zn.H,zm.H,#!{r} :: .call w4(0x44c01000|(zm<<16)|(!{rv}<<10)|(zn<<5)|zd)
+CDOT zd.S,zn.B,zy.B[!!i],#!{r} ::i<0;3,i>3;3 :: .call w4(0x44a04000|(i<<19)|(zy<<16)|(!{rv}<<10)|(zn<<5)|zd)
+CDOT zd.D,zn.H,zx.H[!!i],#!{r} ::i<0;3,i>1;3 :: .call w4(0x44e04000|(i<<20)|(zx<<16)|(!{rv}<<10)|(zn<<5)|zd)
+}
+!sv2cdot(0, 0)
+!sv2cdot(90, 1)
+!sv2cdot(180, 2)
+!sv2cdot(270, 3)
+
+/* Multiply by an indexed element */
+!def sv2mi(nm, opc) {
+!{nm} zd.H,zn.H,zy.H[!!i] ::i<0;3,i>7;3 :: .call w4(0x44200000|((i>>2)<<22)|((i&3)<<19)|(zy<<16)|(!{opc}<<10)|(zn<<5)|zd)
+!{nm} zd.S,zn.S,zy.S[!!i] ::i<0;3,i>3;3 :: .call w4(0x44a00000|(i<<19)|(zy<<16)|(!{opc}<<10)|(zn<<5)|zd)
+!{nm} zd.D,zn.D,zx.D[!!i] ::i<0;3,i>1;3 :: .call w4(0x44e00000|(i<<20)|(zx<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!sv2mi("MLA", 0x02)
+!sv2mi("MLS", 0x03)
+!sv2mi("SQRDMLAH", 0x04)
+!sv2mi("SQRDMLSH", 0x05)
+!sv2mi("SQDMULH", 0x3c)
+!sv2mi("SQRDMULH", 0x3d)
+!sv2mi("MUL", 0x3e)
+!def sv2rdml(nm, opc, el, sz) {
+!{nm} zd.!{el},zn.!{el},zm.!{el} :: .call w4(0x44000000|(!{sz}<<22)|(zm<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def sv2rdmla(nm, opc) {
+!sv2rdml(nm, opc, "B", 0)
+!sv2rdml(nm, opc, "H", 1)
+!sv2rdml(nm, opc, "S", 2)
+!sv2rdml(nm, opc, "D", 3)
+}
+!sv2rdmla("SQRDMLAH", 0x1c)
+!sv2rdmla("SQRDMLSH", 0x1d)
+
+/* Multiply long by an indexed element.  The index splits between bits
+/* 20-19 and bit 11, and bit 10 picks the top or bottom half. */
+!def sv2mli(nm, opc, tb) {
+!{nm} zd.S,zn.H,zy.H[!!i] ::i<0;3,i>7;3 :: .call w4(0x44a00000|((i>>1)<<19)|(zy<<16)|(!{opc}<<12)|((i&1)<<11)|(!{tb}<<10)|(zn<<5)|zd)
+!{nm} zd.D,zn.S,zx.S[!!i] ::i<0;3,i>1;3 :: .call w4(0x44e00000|(zx<<16)|(!{opc}<<12)|(i<<11)|(!{tb}<<10)|(zn<<5)|zd)
+}
+!sv2mli("SQDMLALB", 0x2, 0)
+!sv2mli("SQDMLALT", 0x2, 1)
+!sv2mli("SQDMLSLB", 0x3, 0)
+!sv2mli("SQDMLSLT", 0x3, 1)
+!sv2mli("SMLALB", 0x8, 0)
+!sv2mli("SMLALT", 0x8, 1)
+!sv2mli("UMLALB", 0x9, 0)
+!sv2mli("UMLALT", 0x9, 1)
+!sv2mli("SMLSLB", 0xa, 0)
+!sv2mli("SMLSLT", 0xa, 1)
+!sv2mli("UMLSLB", 0xb, 0)
+!sv2mli("UMLSLT", 0xb, 1)
+!sv2mli("SMULLB", 0xc, 0)
+!sv2mli("SMULLT", 0xc, 1)
+!sv2mli("UMULLB", 0xd, 0)
+!sv2mli("UMULLT", 0xd, 1)
+!sv2mli("SQDMULLB", 0xe, 0)
+!sv2mli("SQDMULLT", 0xe, 1)
+
+/* Half-precision multiply-accumulate to single precision */
+FMLALB zd.S,zn.H,zm.H :: .call w4(0x64a08000|(zm<<16)|(zn<<5)|zd)
+FMLALT zd.S,zn.H,zm.H :: .call w4(0x64a08400|(zm<<16)|(zn<<5)|zd)
+FMLSLB zd.S,zn.H,zm.H :: .call w4(0x64a0a000|(zm<<16)|(zn<<5)|zd)
+FMLSLT zd.S,zn.H,zm.H :: .call w4(0x64a0a400|(zm<<16)|(zn<<5)|zd)
+!def sv2fmlal(nm, sub, tb) {
+!{nm} zd.S,zn.H,zy.H[!!i] ::i<0;3,i>7;3 :: .call w4(0x64a04000|((i>>1)<<19)|(zy<<16)|(!{sub}<<13)|((i&1)<<11)|(!{tb}<<10)|(zn<<5)|zd)
+}
+!sv2fmlal("FMLALB", 0, 0)
+!sv2fmlal("FMLALT", 0, 1)
+!sv2fmlal("FMLSLB", 1, 0)
+!sv2fmlal("FMLSLT", 1, 1)
+
+/* Histogram, match and table lookup */
+HISTCNT zd.S,pg/Z,zn.S,zm.S :: .call w4(0x45a0c000|(zm<<16)|(pg<<10)|(zn<<5)|zd)
+HISTCNT zd.D,pg/Z,zn.D,zm.D :: .call w4(0x45e0c000|(zm<<16)|(pg<<10)|(zn<<5)|zd)
+HISTSEG zd.B,zn.B,zm.B :: .call w4(0x4520a000|(zm<<16)|(zn<<5)|zd)
+MATCH pd.B,pg/Z,zn.B,zm.B :: .call w4(0x45208000|(zm<<16)|(pg<<10)|(zn<<5)|pd)
+MATCH pd.H,pg/Z,zn.H,zm.H :: .call w4(0x45608000|(zm<<16)|(pg<<10)|(zn<<5)|pd)
+NMATCH pd.B,pg/Z,zn.B,zm.B :: .call w4(0x45208010|(zm<<16)|(pg<<10)|(zn<<5)|pd)
+NMATCH pd.H,pg/Z,zn.H,zm.H :: .call w4(0x45608010|(zm<<16)|(pg<<10)|(zn<<5)|pd)
+!def sv2tbl(el, sz) {
+TBL zd.!{el},{zn.!{el},za.!{el}},zm.!{el} :: .call w4(0x05202800|(!{sz}<<22)|(zm<<16)|(zn<<5)|zd)
+TBX zd.!{el},zn.!{el},zm.!{el} :: .call w4(0x05202c00|(!{sz}<<22)|(zm<<16)|(zn<<5)|zd)
+SPLICE zd.!{el},pg,{zn.!{el},za.!{el}} :: .call w4(0x052d8000|(!{sz}<<22)|(pg<<10)|(zn<<5)|zd)
+}
+!sv2tbl("B", 0)
+!sv2tbl("H", 1)
+!sv2tbl("S", 2)
+!sv2tbl("D", 3)
+
+/* Read-after-write and write-after-read predicates */
+!def sv2while(nm, rw, el, sz) {
+!{nm} pd.!{el},xn,xm :: .call w4(0x25203000|(!{sz}<<22)|(xm<<16)|(!{rw}<<4)|(xn<<5)|pd)
+}
+!def sv2whilea(nm, rw) {
+!sv2while(nm, rw, "B", 0)
+!sv2while(nm, rw, "H", 1)
+!sv2while(nm, rw, "S", 2)
+!sv2while(nm, rw, "D", 3)
+}
+!sv2whilea("WHILERW", 1)
+!sv2whilea("WHILEWR", 0)
+
+/* Bitwise ternary, on doublewords only */
+BSL zd.D,zd.D,zm.D,zk.D :: .call w4(0x04203c00|(zm<<16)|(zk<<5)|zd)
+BSL1N zd.D,zd.D,zm.D,zk.D :: .call w4(0x04603c00|(zm<<16)|(zk<<5)|zd)
+BSL2N zd.D,zd.D,zm.D,zk.D :: .call w4(0x04a03c00|(zm<<16)|(zk<<5)|zd)
+NBSL zd.D,zd.D,zm.D,zk.D :: .call w4(0x04e03c00|(zm<<16)|(zk<<5)|zd)
+EOR3 zd.D,zd.D,zm.D,zk.D :: .call w4(0x04203800|(zm<<16)|(zk<<5)|zd)
+BCAX zd.D,zd.D,zm.D,zk.D :: .call w4(0x04603800|(zm<<16)|(zk<<5)|zd)
+!def sv2xar(el, es) {
+XAR zd.!{el},zd.!{el},zm.!{el},#!s ::s<1;3,s>!{es};3 :: .call w4(0x04203400|((((!{es}*2-s)>>5)&3)<<22)|(((!{es}*2-s)&0x1f)<<16)|(zm<<5)|zd)
+}
+!sv2xar("B", 8)
+!sv2xar("H", 16)
+!sv2xar("S", 32)
+!sv2xar("D", 64)
+
+/* Cryptography */
+AESE zd.B,zd.B,zm.B :: .call w4(0x4522e000|(zm<<5)|zd)
+AESD zd.B,zd.B,zm.B :: .call w4(0x4522e400|(zm<<5)|zd)
+AESMC zd.B,zd.B :: .call w4(0x4520e000|zd)
+AESIMC zd.B,zd.B :: .call w4(0x4520e400|zd)
+RAX1 zd.D,zn.D,zm.D :: .call w4(0x4520f400|(zm<<16)|(zn<<5)|zd)
+SM4E zd.S,zd.S,zm.S :: .call w4(0x4523e000|(zm<<5)|zd)
+SM4EKEY zd.S,zn.S,zm.S :: .call w4(0x4520f000|(zm<<16)|(zn<<5)|zd)
