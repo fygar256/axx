@@ -4438,3 +4438,372 @@ DUPM zd.D,#!v :: .call svdupm(v,64,zd)
 }
 !svaddvall("SADDV", 0x00)
 !svaddvall("UADDV", 0x01)
+
+/* -------------------------------------------------------------------
+/* SVE floating point.
+/*
+/* Floating-point element sizes are H=1, S=2, D=3; the byte size has no
+/* floating-point meaning, so these families start at H.
+/* ------------------------------------------------------------------- */
+!rset("ZLO8", "Z", 7)
+!rset("ZLO16", "Z", 15)
+.check::zy::ZLO8
+.check::zx::ZLO16
+
+/* Binary, predicated and destructive.
+/*   01100101 size 00 opc Pg Zm Zd */
+!def svf3p1(nm, opc, el, sz) {
+!{nm} zd.!{el},pg/M,zd.!{el},zm.!{el} :: .call w4(0x65008000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zm<<5)|zd)
+}
+!def svf3p(nm, opc) {
+!svf3p1(nm, opc, "H", 1)
+!svf3p1(nm, opc, "S", 2)
+!svf3p1(nm, opc, "D", 3)
+}
+!svf3p("FADD", 0x00)
+!svf3p("FSUB", 0x01)
+!svf3p("FMUL", 0x02)
+!svf3p("FSUBR", 0x03)
+!svf3p("FMAXNM", 0x04)
+!svf3p("FMINNM", 0x05)
+!svf3p("FMAX", 0x06)
+!svf3p("FMIN", 0x07)
+!svf3p("FABD", 0x08)
+!svf3p("FSCALE", 0x09)
+!svf3p("FMULX", 0x0a)
+!svf3p("FDIVR", 0x0c)
+!svf3p("FDIV", 0x0d)
+
+/* Binary with one of two fixed immediates; bit 5 picks the second. */
+!def svf3i1(nm, opc, lo, hi, el, sz) {
+!{nm} zd.!{el},pg/M,zd.!{el},#!{lo} :: .call w4(0x65008000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|zd)
+!{nm} zd.!{el},pg/M,zd.!{el},#!{hi} :: .call w4(0x65008020|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|zd)
+}
+!def svf3i(nm, opc, lo, hi) {
+!svf3i1(nm, opc, lo, hi, "H", 1)
+!svf3i1(nm, opc, lo, hi, "S", 2)
+!svf3i1(nm, opc, lo, hi, "D", 3)
+}
+!svf3i("FADD", 0x18, "0.5", "1.0")
+!svf3i("FSUB", 0x19, "0.5", "1.0")
+!svf3i("FMUL", 0x1a, "0.5", "2.0")
+!svf3i("FSUBR", 0x1b, "0.5", "1.0")
+!svf3i("FMAXNM", 0x1c, "0.0", "1.0")
+!svf3i("FMINNM", 0x1d, "0.0", "1.0")
+!svf3i("FMAX", 0x1e, "0.0", "1.0")
+!svf3i("FMIN", 0x1f, "0.0", "1.0")
+
+/* Binary, unpredicated.
+/*   01100101 size 0 Zm 000 opc Zn Zd */
+!def svf3u1(nm, opc, el, sz) {
+!{nm} zd.!{el},zn.!{el},zm.!{el} :: .call w4(0x65000000|(!{sz}<<22)|(zm<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def svf3u(nm, opc) {
+!svf3u1(nm, opc, "H", 1)
+!svf3u1(nm, opc, "S", 2)
+!svf3u1(nm, opc, "D", 3)
+}
+!svf3u("FADD", 0)
+!svf3u("FSUB", 1)
+!svf3u("FMUL", 2)
+!svf3u("FTSMUL", 3)
+!svf3u("FRECPS", 6)
+!svf3u("FRSQRTS", 7)
+
+/* Trigonometric helpers */
+!def svftrig(el, sz) {
+FEXPA zd.!{el},zn.!{el} :: .call w4(0x0420b800|(!{sz}<<22)|(zn<<5)|zd)
+FTSSEL zd.!{el},zn.!{el},zm.!{el} :: .call w4(0x0420b000|(!{sz}<<22)|(zm<<16)|(zn<<5)|zd)
+FTMAD zd.!{el},zd.!{el},zm.!{el},#!i ::i<0;3,i>7;3 :: .call w4(0x65108000|(!{sz}<<22)|(i<<16)|(zm<<5)|zd)
+FRECPE zd.!{el},zn.!{el} :: .call w4(0x650e3000|(!{sz}<<22)|(zn<<5)|zd)
+FRSQRTE zd.!{el},zn.!{el} :: .call w4(0x650f3000|(!{sz}<<22)|(zn<<5)|zd)
+}
+!svftrig("H", 1)
+!svftrig("S", 2)
+!svftrig("D", 3)
+
+/* Unary, predicated.
+/*   01100101 size 0 opc Pg Zn Zd */
+!def svf2p1(nm, opc, el, sz) {
+!{nm} zd.!{el},pg/M,zn.!{el} :: .call w4(0x6500a000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zn<<5)|zd)
+}
+!def svf2p(nm, opc) {
+!svf2p1(nm, opc, "H", 1)
+!svf2p1(nm, opc, "S", 2)
+!svf2p1(nm, opc, "D", 3)
+}
+!svf2p("FRINTN", 0x00)
+!svf2p("FRINTP", 0x01)
+!svf2p("FRINTM", 0x02)
+!svf2p("FRINTZ", 0x03)
+!svf2p("FRINTA", 0x04)
+!svf2p("FRINTX", 0x06)
+!svf2p("FRINTI", 0x07)
+!svf2p("FRECPX", 0x0c)
+!svf2p("FSQRT", 0x0d)
+/* FABS and FNEG sit in the integer unary group instead */
+!def svf2pi1(nm, opc, el, sz) {
+!{nm} zd.!{el},pg/M,zn.!{el} :: .call w4(0x0400a000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zn<<5)|zd)
+}
+!def svf2pi(nm, opc) {
+!svf2pi1(nm, opc, "H", 1)
+!svf2pi1(nm, opc, "S", 2)
+!svf2pi1(nm, opc, "D", 3)
+}
+!svf2pi("FABS", 0x1c)
+!svf2pi("FNEG", 0x1d)
+/* FLOGB gives the unbiased exponent */
+FLOGB zd.H,pg/M,zn.H :: .call w4(0x651aa000|(pg<<10)|(zn<<5)|zd)
+FLOGB zd.S,pg/M,zn.S :: .call w4(0x651ca000|(pg<<10)|(zn<<5)|zd)
+FLOGB zd.D,pg/M,zn.D :: .call w4(0x651ea000|(pg<<10)|(zn<<5)|zd)
+
+/* Conversions.  The size pair does not decompose into a single field,
+/* so each one names its own base word. */
+!def svcvt(nm, base, dl, sl) {
+!{nm} zd.!{dl},pg/M,zn.!{sl} :: .call w4(!{base}|(pg<<10)|(zn<<5)|zd)
+}
+!svcvt("FCVT", 0x6588a000, "H", "S")
+!svcvt("FCVT", 0x6589a000, "S", "H")
+!svcvt("FCVT", 0x65c8a000, "H", "D")
+!svcvt("FCVT", 0x65c9a000, "D", "H")
+!svcvt("FCVT", 0x65caa000, "S", "D")
+!svcvt("FCVT", 0x65cba000, "D", "S")
+!svcvt("FCVTZS", 0x655aa000, "H", "H")
+!svcvt("FCVTZS", 0x655ca000, "S", "H")
+!svcvt("FCVTZS", 0x655ea000, "D", "H")
+!svcvt("FCVTZS", 0x659ca000, "S", "S")
+!svcvt("FCVTZS", 0x65dca000, "D", "S")
+!svcvt("FCVTZS", 0x65d8a000, "S", "D")
+!svcvt("FCVTZS", 0x65dea000, "D", "D")
+!svcvt("FCVTZU", 0x655ba000, "H", "H")
+!svcvt("FCVTZU", 0x655da000, "S", "H")
+!svcvt("FCVTZU", 0x655fa000, "D", "H")
+!svcvt("FCVTZU", 0x659da000, "S", "S")
+!svcvt("FCVTZU", 0x65dda000, "D", "S")
+!svcvt("FCVTZU", 0x65d9a000, "S", "D")
+!svcvt("FCVTZU", 0x65dfa000, "D", "D")
+!svcvt("SCVTF", 0x6552a000, "H", "H")
+!svcvt("SCVTF", 0x6554a000, "H", "S")
+!svcvt("SCVTF", 0x6556a000, "H", "D")
+!svcvt("SCVTF", 0x6594a000, "S", "S")
+!svcvt("SCVTF", 0x65d4a000, "S", "D")
+!svcvt("SCVTF", 0x65d0a000, "D", "S")
+!svcvt("SCVTF", 0x65d6a000, "D", "D")
+!svcvt("UCVTF", 0x6553a000, "H", "H")
+!svcvt("UCVTF", 0x6555a000, "H", "S")
+!svcvt("UCVTF", 0x6557a000, "H", "D")
+!svcvt("UCVTF", 0x6595a000, "S", "S")
+!svcvt("UCVTF", 0x65d5a000, "S", "D")
+!svcvt("UCVTF", 0x65d1a000, "D", "S")
+!svcvt("UCVTF", 0x65d7a000, "D", "D")
+/* The top-and-bottom conversions are SVE2 */
+!svcvt("FCVTX", 0x650aa000, "S", "D")
+!svcvt("FCVTXNT", 0x640aa000, "S", "D")
+!svcvt("FCVTNT", 0x6488a000, "H", "S")
+!svcvt("FCVTLT", 0x6489a000, "S", "H")
+!svcvt("FCVTNT", 0x64caa000, "S", "D")
+!svcvt("FCVTLT", 0x64cba000, "D", "S")
+!svcvt("BFCVT", 0x658aa000, "H", "S")
+!svcvt("BFCVTNT", 0x648aa000, "H", "S")
+
+/* Multiply-accumulate, predicated.
+/*   01100101 size 1 Zm opc Pg Zn Zda */
+!def svfma1(nm, opc, el, sz) {
+!{nm} zd.!{el},pg/M,zn.!{el},zm.!{el} :: .call w4(0x65200000|(!{sz}<<22)|(zm<<16)|(!{opc}<<13)|(pg<<10)|(zn<<5)|zd)
+}
+!def svfma(nm, opc) {
+!svfma1(nm, opc, "H", 1)
+!svfma1(nm, opc, "S", 2)
+!svfma1(nm, opc, "D", 3)
+}
+!svfma("FMLA", 0)
+!svfma("FMLS", 1)
+!svfma("FNMLA", 2)
+!svfma("FNMLS", 3)
+!svfma("FMAD", 4)
+!svfma("FMSB", 5)
+!svfma("FNMAD", 6)
+!svfma("FNMSB", 7)
+
+/* Multiply by an indexed element.  The half-precision index is three
+/* bits wide and splits across bit 22 and bits 20-19. */
+!def svfmul_h(nm, add) {
+!{nm} zd.H,zn.H,zy.H[!!i] ::i<0;3,i>7;3 :: .call w4(0x64200000|!{add}|((i>>2)<<22)|((i&3)<<19)|(zy<<16)|(zn<<5)|zd)
+}
+!def svfmul_s(nm, add) {
+!{nm} zd.S,zn.S,zy.S[!!i] ::i<0;3,i>3;3 :: .call w4(0x64a00000|!{add}|(i<<19)|(zy<<16)|(zn<<5)|zd)
+}
+!def svfmul_d(nm, add) {
+!{nm} zd.D,zn.D,zx.D[!!i] ::i<0;3,i>1;3 :: .call w4(0x64e00000|!{add}|(i<<20)|(zx<<16)|(zn<<5)|zd)
+}
+!def svfmulx(nm, add) {
+!svfmul_h(nm, add)
+!svfmul_s(nm, add)
+!svfmul_d(nm, add)
+}
+!svfmulx("FMLA", 0x0000)
+!svfmulx("FMLS", 0x0400)
+!svfmulx("FMUL", 0x2000)
+
+/* Complex arithmetic */
+!def svfcadd(el, sz) {
+FCADD zd.!{el},pg/M,zd.!{el},zm.!{el},#90 :: .call w4(0x64008000|(!{sz}<<22)|(pg<<10)|(zm<<5)|zd)
+FCADD zd.!{el},pg/M,zd.!{el},zm.!{el},#270 :: .call w4(0x64018000|(!{sz}<<22)|(pg<<10)|(zm<<5)|zd)
+}
+!svfcadd("H", 1)
+!svfcadd("S", 2)
+!svfcadd("D", 3)
+!def svfcmla(el, sz, r, rv) {
+FCMLA zd.!{el},pg/M,zn.!{el},zm.!{el},#!{r} :: .call w4(0x64000000|(!{sz}<<22)|(zm<<16)|(!{rv}<<13)|(pg<<10)|(zn<<5)|zd)
+}
+!def svfcmlaall(el, sz) {
+!svfcmla(el, sz, 0, 0)
+!svfcmla(el, sz, 90, 1)
+!svfcmla(el, sz, 180, 2)
+!svfcmla(el, sz, 270, 3)
+}
+!svfcmlaall("H", 1)
+!svfcmlaall("S", 2)
+!svfcmlaall("D", 3)
+!def svfcmlai(r, rv) {
+FCMLA zd.H,zn.H,zy.H[!!i],#!{r} ::i<0;3,i>3;3 :: .call w4(0x64a01000|(i<<19)|(zy<<16)|(!{rv}<<10)|(zn<<5)|zd)
+FCMLA zd.S,zn.S,zx.S[!!i],#!{r} ::i<0;3,i>1;3 :: .call w4(0x64e01000|(i<<20)|(zx<<16)|(!{rv}<<10)|(zn<<5)|zd)
+}
+!svfcmlai(0, 0)
+!svfcmlai(90, 1)
+!svfcmlai(180, 2)
+!svfcmlai(270, 3)
+
+/* Compares.  ne is bit 4. */
+!def svfcmp1(nm, base, ne, el, sz) {
+!{nm} pd.!{el},pg/Z,zn.!{el},zm.!{el} :: .call w4(!{base}|(!{sz}<<22)|(zm<<16)|(pg<<10)|(zn<<5)|(!{ne}<<4)|pd)
+}
+!def svfcmp(nm, base, ne) {
+!svfcmp1(nm, base, ne, "H", 1)
+!svfcmp1(nm, base, ne, "S", 2)
+!svfcmp1(nm, base, ne, "D", 3)
+}
+!svfcmp("FCMGE", 0x65004000, 0)
+!svfcmp("FCMGT", 0x65004000, 1)
+!svfcmp("FCMEQ", 0x65006000, 0)
+!svfcmp("FCMNE", 0x65006000, 1)
+!svfcmp("FCMUO", 0x6500c000, 0)
+!svfcmp("FACGE", 0x6500c000, 1)
+!svfcmp("FACGT", 0x6500e000, 1)
+/* The reversed mnemonics are aliases that swap the source operands */
+!def svfcmpr1(nm, base, ne, el, sz) {
+!{nm} pd.!{el},pg/Z,zn.!{el},zm.!{el} :: .call w4(!{base}|(!{sz}<<22)|(zn<<16)|(pg<<10)|(zm<<5)|(!{ne}<<4)|pd)
+}
+!def svfcmpr(nm, base, ne) {
+!svfcmpr1(nm, base, ne, "H", 1)
+!svfcmpr1(nm, base, ne, "S", 2)
+!svfcmpr1(nm, base, ne, "D", 3)
+}
+!svfcmpr("FCMLE", 0x65004000, 0)
+!svfcmpr("FCMLT", 0x65004000, 1)
+!svfcmpr("FACLE", 0x6500c000, 1)
+!svfcmpr("FACLT", 0x6500e000, 1)
+/* Compare against zero */
+!def svfcmpz1(nm, opc, ne, el, sz) {
+!{nm} pd.!{el},pg/Z,zn.!{el},#0.0 :: .call w4(0x65002000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zn<<5)|(!{ne}<<4)|pd)
+}
+!def svfcmpz(nm, opc, ne) {
+!svfcmpz1(nm, opc, ne, "H", 1)
+!svfcmpz1(nm, opc, ne, "S", 2)
+!svfcmpz1(nm, opc, ne, "D", 3)
+}
+!svfcmpz("FCMGE", 0x10, 0)
+!svfcmpz("FCMGT", 0x10, 1)
+!svfcmpz("FCMLT", 0x11, 0)
+!svfcmpz("FCMLE", 0x11, 1)
+!svfcmpz("FCMEQ", 0x12, 0)
+!svfcmpz("FCMNE", 0x13, 0)
+
+/* Reductions.  FADDA is ordered and reads its accumulator back. */
+!def svfredv(nm, opc, el, sz, vd) {
+!{nm} !{vd},pg,zn.!{el} :: .call w4(0x65002000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zn<<5)|!{vd})
+}
+!def svfred(nm, opc) {
+!svfredv(nm, opc, "H", 1, "fhd")
+!svfredv(nm, opc, "S", 2, "fsd")
+!svfredv(nm, opc, "D", 3, "fdd")
+}
+!svfred("FADDV", 0x00)
+!svfred("FMAXNMV", 0x04)
+!svfred("FMINNMV", 0x05)
+!svfred("FMAXV", 0x06)
+!svfred("FMINV", 0x07)
+!def svfadda(el, sz, vd) {
+FADDA !{vd},pg,!{vd},zm.!{el} :: .call w4(0x65182000|(!{sz}<<22)|(pg<<10)|(zm<<5)|!{vd})
+}
+!svfadda("H", 1, "fhd")
+!svfadda("S", 2, "fsd")
+!svfadda("D", 3, "fdd")
+
+/* Broadcast a floating-point immediate */
+.func::svfdup::v,sz,rd
+i8 = .call fpimm8(v)
+.if i8 < 0 .then
+.raise 9
+.return 0
+.endif
+.return .call w4(0x2539c000 | (sz << 22) | (i8 << 5) | rd)
+.endfunc
+.func::svfcpy::v,sz,pg,rd
+i8 = .call fpimm8(v)
+.if i8 < 0 .then
+.raise 9
+.return 0
+.endif
+.return .call w4(0x0510c000 | (sz << 22) | (pg << 16) | (i8 << 5) | rd)
+.endfunc
+!def svfimm(nm, el, sz) {
+!{nm} zd.!{el},#!Dv :: .call svfdup(v,!{sz},zd)
+}
+!svfimm("FDUP", "H", 1)
+!svfimm("FDUP", "S", 2)
+!svfimm("FDUP", "D", 3)
+!svfimm("FMOV", "H", 1)
+!svfimm("FMOV", "S", 2)
+!svfimm("FMOV", "D", 3)
+!def svfimmp(nm, el, sz) {
+!{nm} zd.!{el},pv/M,#!Dv :: .call svfcpy(v,!{sz},pv,zd)
+}
+!svfimmp("FCPY", "H", 1)
+!svfimmp("FCPY", "S", 2)
+!svfimmp("FCPY", "D", 3)
+!svfimmp("FMOV", "H", 1)
+!svfimmp("FMOV", "S", 2)
+!svfimmp("FMOV", "D", 3)
+/* Zero is not representable as an 8-bit floating-point immediate, so
+/* FMOV #0.0 becomes the integer broadcast of zero. */
+FMOV zd.H,#0.0 :: .call w4(0x2578c000|zd)
+FMOV zd.S,#0.0 :: .call w4(0x25b8c000|zd)
+FMOV zd.D,#0.0 :: .call w4(0x25f8c000|zd)
+
+/* Dot product and matrix multiply */
+SDOT zd.S,zn.B,zm.B :: .call w4(0x44800000|(zm<<16)|(zn<<5)|zd)
+UDOT zd.S,zn.B,zm.B :: .call w4(0x44800400|(zm<<16)|(zn<<5)|zd)
+SDOT zd.D,zn.H,zm.H :: .call w4(0x44c00000|(zm<<16)|(zn<<5)|zd)
+UDOT zd.D,zn.H,zm.H :: .call w4(0x44c00400|(zm<<16)|(zn<<5)|zd)
+SDOT zd.S,zn.B,zy.B[!!i] ::i<0;3,i>3;3 :: .call w4(0x44a00000|(i<<19)|(zy<<16)|(zn<<5)|zd)
+UDOT zd.S,zn.B,zy.B[!!i] ::i<0;3,i>3;3 :: .call w4(0x44a00400|(i<<19)|(zy<<16)|(zn<<5)|zd)
+SDOT zd.D,zn.H,zx.H[!!i] ::i<0;3,i>1;3 :: .call w4(0x44e00000|(i<<20)|(zx<<16)|(zn<<5)|zd)
+UDOT zd.D,zn.H,zx.H[!!i] ::i<0;3,i>1;3 :: .call w4(0x44e00400|(i<<20)|(zx<<16)|(zn<<5)|zd)
+USDOT zd.S,zn.B,zm.B :: .call w4(0x44807800|(zm<<16)|(zn<<5)|zd)
+USDOT zd.S,zn.B,zy.B[!!i] ::i<0;3,i>3;3 :: .call w4(0x44a01800|(i<<19)|(zy<<16)|(zn<<5)|zd)
+SUDOT zd.S,zn.B,zy.B[!!i] ::i<0;3,i>3;3 :: .call w4(0x44a01c00|(i<<19)|(zy<<16)|(zn<<5)|zd)
+SMMLA zd.S,zn.B,zm.B :: .call w4(0x45009800|(zm<<16)|(zn<<5)|zd)
+USMMLA zd.S,zn.B,zm.B :: .call w4(0x45809800|(zm<<16)|(zn<<5)|zd)
+UMMLA zd.S,zn.B,zm.B :: .call w4(0x45c09800|(zm<<16)|(zn<<5)|zd)
+FMMLA zd.S,zn.S,zm.S :: .call w4(0x64a0e400|(zm<<16)|(zn<<5)|zd)
+FMMLA zd.D,zn.D,zm.D :: .call w4(0x64e0e400|(zm<<16)|(zn<<5)|zd)
+
+/* BFloat16 */
+BFDOT zd.S,zn.H,zm.H :: .call w4(0x64608000|(zm<<16)|(zn<<5)|zd)
+BFDOT zd.S,zn.H,zy.H[!!i] ::i<0;3,i>3;3 :: .call w4(0x64604000|(i<<19)|(zy<<16)|(zn<<5)|zd)
+BFMMLA zd.S,zn.H,zm.H :: .call w4(0x6460e400|(zm<<16)|(zn<<5)|zd)
+BFMLALB zd.S,zn.H,zm.H :: .call w4(0x64e08000|(zm<<16)|(zn<<5)|zd)
+BFMLALT zd.S,zn.H,zm.H :: .call w4(0x64e08400|(zm<<16)|(zn<<5)|zd)
+BFMLALB zd.S,zn.H,zy.H[!!i] ::i<0;3,i>7;3 :: .call w4(0x64e04000|((i&1)<<11)|((i>>1)<<19)|(zy<<16)|(zn<<5)|zd)
+BFMLALT zd.S,zn.H,zy.H[!!i] ::i<0;3,i>7;3 :: .call w4(0x64e04400|((i&1)<<11)|((i>>1)<<19)|(zy<<16)|(zn<<5)|zd)
