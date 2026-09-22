@@ -4807,3 +4807,369 @@ BFMLALB zd.S,zn.H,zm.H :: .call w4(0x64e08000|(zm<<16)|(zn<<5)|zd)
 BFMLALT zd.S,zn.H,zm.H :: .call w4(0x64e08400|(zm<<16)|(zn<<5)|zd)
 BFMLALB zd.S,zn.H,zy.H[!!i] ::i<0;3,i>7;3 :: .call w4(0x64e04000|((i&1)<<11)|((i>>1)<<19)|(zy<<16)|(zn<<5)|zd)
 BFMLALT zd.S,zn.H,zy.H[!!i] ::i<0;3,i>7;3 :: .call w4(0x64e04400|((i&1)<<11)|((i>>1)<<19)|(zy<<16)|(zn<<5)|zd)
+
+/* -------------------------------------------------------------------
+/* SVE loads and stores.
+/*
+/* Vector-length-relative offsets are written "#n, MUL VL"; the field
+/* holds n directly for the single-register forms and n divided by the
+/* number of registers for the two-, three- and four-register ones.
+/* ------------------------------------------------------------------- */
+.check::zt::ZR
+.check::za::ZR
+.check::zb::ZR
+.check::zc::ZR
+.check::pt::PR
+
+.func::divn::v,n
+q = v / n
+.if q * n != v .then
+.raise 8
+.endif
+.return q
+.endfunc
+/* signed four-bit field, in units of n */
+.func::divs4::v,n
+q = .call divn(v, n)
+.if q < -8 .then
+.raise 3
+.endif
+.if q > 7 .then
+.raise 3
+.endif
+.return q & 0xf
+.endfunc
+/* unsigned six-bit field, in units of n */
+.func::divu6::v,n
+q = .call divn(v, n)
+.if q < 0 .then
+.raise 3
+.endif
+.if q > 63 .then
+.raise 3
+.endif
+.return q
+.endfunc
+/* the two wrappers that emit an offset form */
+.func::svmem4::base,v,n,pg,rn,zt
+q = .call divs4(v, n)
+.return .call w4(base | (q << 16) | (pg << 10) | (rn << 5) | zt)
+.endfunc
+.func::svmem6::base,v,n,pg,rn,zt
+q = .call divu6(v, n)
+.return .call w4(base | (q << 16) | (pg << 10) | (rn << 5) | zt)
+.endfunc
+/* unsigned five-bit field, in units of n */
+.func::divu5::v,n
+q = .call divn(v, n)
+.if q < 0 .then
+.raise 3
+.endif
+.if q > 31 .then
+.raise 3
+.endif
+.return q
+.endfunc
+
+/* Whole-register load and store.  The nine-bit offset splits into six
+/* bits at 16 and three bits at 10. */
+!def svldrstr(nm, base, rt) {
+!{nm} !{rt},[xb] :: .call w4(!{base}|(xb<<5)|!{rt})
+!{nm} !{rt},[xb,#!v,MUL VL] ::v<-256;3,v>255;3 :: .call w4(!{base}|(((v>>3)&0x3f)<<16)|((v&7)<<10)|(xb<<5)|!{rt})
+}
+!svldrstr("LDR", 0x85804000, "zt")
+!svldrstr("STR", 0xe5804000, "zt")
+!svldrstr("LDR", 0x85800000, "pt")
+!svldrstr("STR", 0xe5800000, "pt")
+
+/* Contiguous single-register loads.  base is the top sixteen bits; ix
+/* is the scalar index operand with its shift already spelled out. */
+!def svld1(sfx, el, base, ix) {
+LD1!{sfx} {zt.!{el}},pg/Z,[xb] :: .call w4((!{base}<<16)|0xa000|(pg<<10)|(xb<<5)|zt)
+LD1!{sfx} {zt.!{el}},pg/Z,[xb,#!v,MUL VL] ::v<-8;3,v>7;3 :: .call w4((!{base}<<16)|0xa000|((v&0xf)<<16)|(pg<<10)|(xb<<5)|zt)
+LD1!{sfx} {zt.!{el}},pg/Z,[xb,!{ix}] :: .call w4((!{base}<<16)|0x4000|(xm<<16)|(pg<<10)|(xb<<5)|zt)
+LDNF1!{sfx} {zt.!{el}},pg/Z,[xb] :: .call w4((!{base}<<16)|0x10a000|(pg<<10)|(xb<<5)|zt)
+LDNF1!{sfx} {zt.!{el}},pg/Z,[xb,#!v,MUL VL] ::v<-8;3,v>7;3 :: .call w4((!{base}<<16)|0x10a000|((v&0xf)<<16)|(pg<<10)|(xb<<5)|zt)
+LDFF1!{sfx} {zt.!{el}},pg/Z,[xb,!{ix}] :: .call w4((!{base}<<16)|0x6000|(xm<<16)|(pg<<10)|(xb<<5)|zt)
+LDFF1!{sfx} {zt.!{el}},pg/Z,[xb] :: .call w4((!{base}<<16)|0x6000|(31<<16)|(pg<<10)|(xb<<5)|zt)
+}
+!svld1("B", "B", 0xa400, "xm")
+!svld1("B", "H", 0xa420, "xm")
+!svld1("B", "S", 0xa440, "xm")
+!svld1("B", "D", 0xa460, "xm")
+!svld1("H", "H", 0xa4a0, "xm,LSL #1")
+!svld1("H", "S", 0xa4c0, "xm,LSL #1")
+!svld1("H", "D", 0xa4e0, "xm,LSL #1")
+!svld1("W", "S", 0xa540, "xm,LSL #2")
+!svld1("W", "D", 0xa560, "xm,LSL #2")
+!svld1("D", "D", 0xa5e0, "xm,LSL #3")
+!svld1("SB", "H", 0xa5c0, "xm")
+!svld1("SB", "S", 0xa5a0, "xm")
+!svld1("SB", "D", 0xa580, "xm")
+!svld1("SH", "S", 0xa520, "xm,LSL #1")
+!svld1("SH", "D", 0xa500, "xm,LSL #1")
+!svld1("SW", "D", 0xa480, "xm,LSL #2")
+
+/* Contiguous single-register stores */
+!def svst1(sfx, el, base, ix) {
+ST1!{sfx} {zt.!{el}},pg,[xb] :: .call w4((!{base}<<16)|0xe000|(pg<<10)|(xb<<5)|zt)
+ST1!{sfx} {zt.!{el}},pg,[xb,#!v,MUL VL] ::v<-8;3,v>7;3 :: .call w4((!{base}<<16)|0xe000|((v&0xf)<<16)|(pg<<10)|(xb<<5)|zt)
+ST1!{sfx} {zt.!{el}},pg,[xb,!{ix}] :: .call w4((!{base}<<16)|0x4000|(xm<<16)|(pg<<10)|(xb<<5)|zt)
+}
+!svst1("B", "B", 0xe400, "xm")
+!svst1("B", "H", 0xe420, "xm")
+!svst1("B", "S", 0xe440, "xm")
+!svst1("B", "D", 0xe460, "xm")
+!svst1("H", "H", 0xe4a0, "xm,LSL #1")
+!svst1("H", "S", 0xe4c0, "xm,LSL #1")
+!svst1("H", "D", 0xe4e0, "xm,LSL #1")
+!svst1("W", "S", 0xe540, "xm,LSL #2")
+!svst1("W", "D", 0xe560, "xm,LSL #2")
+!svst1("D", "D", 0xe5e0, "xm,LSL #3")
+
+/* Non-temporal and multi-register contiguous accesses.  The register
+/* count sits at bits 22-21; the store offset form also sets bit 20. */
+!def svldn1(nm, regs, n, msz, ix) {
+!{nm} {!{regs}},pg/Z,[xb] :: .call w4(0xa400e000|(!{msz}<<23)|(!{n-1}<<21)|(pg<<10)|(xb<<5)|zt)
+!{nm} {!{regs}},pg/Z,[xb,#!v,MUL VL] :: .call svmem4(0xa400e000|(!{msz}<<23)|(!{n-1}<<21),v,!{n},pg,xb,zt)
+!{nm} {!{regs}},pg/Z,[xb,!{ix}] :: .call w4(0xa400c000|(!{msz}<<23)|(!{n-1}<<21)|(xm<<16)|(pg<<10)|(xb<<5)|zt)
+}
+!def svstn1(nm, regs, n, msz, ix) {
+!{nm} {!{regs}},pg,[xb] :: .call w4(0xe410e000|(!{msz}<<23)|(!{n-1}<<21)|(pg<<10)|(xb<<5)|zt)
+!{nm} {!{regs}},pg,[xb,#!v,MUL VL] :: .call svmem4(0xe410e000|(!{msz}<<23)|(!{n-1}<<21),v,!{n},pg,xb,zt)
+!{nm} {!{regs}},pg,[xb,!{ix}] :: .call w4(0xe4006000|(!{msz}<<23)|(!{n-1}<<21)|(xm<<16)|(pg<<10)|(xb<<5)|zt)
+}
+!def svmulti(sfx, el, msz, ix) {
+!svldn1("LDNT1" + sfx, "zt." + el, 1, msz, ix)
+!svstn1("STNT1" + sfx, "zt." + el, 1, msz, ix)
+!svldn1("LD2" + sfx, "zt." + el + ",za." + el, 2, msz, ix)
+!svstn1("ST2" + sfx, "zt." + el + ",za." + el, 2, msz, ix)
+!svldn1("LD3" + sfx, "zt." + el + ",za." + el + ",zb." + el, 3, msz, ix)
+!svstn1("ST3" + sfx, "zt." + el + ",za." + el + ",zb." + el, 3, msz, ix)
+!svldn1("LD4" + sfx, "zt." + el + ",za." + el + ",zb." + el + ",zc." + el, 4, msz, ix)
+!svstn1("ST4" + sfx, "zt." + el + ",za." + el + ",zb." + el + ",zc." + el, 4, msz, ix)
+}
+!svmulti("B", "B", 0, "xm")
+!svmulti("H", "H", 1, "xm,LSL #1")
+!svmulti("W", "S", 2, "xm,LSL #2")
+!svmulti("D", "D", 3, "xm,LSL #3")
+
+/* Broadcast one element to every lane.  The six-bit offset counts
+/* elements, so it is the byte offset divided by the access size. */
+!def svld1rp(sfx, el, base, sz) {
+LD1R!{sfx} {zt.!{el}},pg/Z,[xb] :: .call w4(!{base}|(pg<<10)|(xb<<5)|zt)
+LD1R!{sfx} {zt.!{el}},pg/Z,[xb,#!v] :: .call svmem6(!{base},v,!{sz},pg,xb,zt)
+}
+!svld1rp("B", "B", 0x84408000, 1)
+!svld1rp("B", "H", 0x8440a000, 1)
+!svld1rp("B", "S", 0x8440c000, 1)
+!svld1rp("B", "D", 0x8440e000, 1)
+!svld1rp("H", "H", 0x84c0a000, 2)
+!svld1rp("H", "S", 0x84c0c000, 2)
+!svld1rp("H", "D", 0x84c0e000, 2)
+!svld1rp("W", "S", 0x8540c000, 4)
+!svld1rp("W", "D", 0x8540e000, 4)
+!svld1rp("D", "D", 0x85c0e000, 8)
+!svld1rp("SB", "H", 0x85c0c000, 1)
+!svld1rp("SB", "S", 0x85c0a000, 1)
+!svld1rp("SB", "D", 0x85c08000, 1)
+!svld1rp("SH", "S", 0x8540a000, 2)
+!svld1rp("SH", "D", 0x85408000, 2)
+!svld1rp("SW", "D", 0x84c08000, 4)
+
+/* Broadcast a whole quadword or octaword */
+!def svld1rq(sfx, el, msz, ix, sz, nm, bit21) {
+!{nm}!{sfx} {zt.!{el}},pg/Z,[xb] :: .call w4(0xa4002000|(!{msz}<<23)|(!{bit21}<<21)|(pg<<10)|(xb<<5)|zt)
+!{nm}!{sfx} {zt.!{el}},pg/Z,[xb,#!v] :: .call svmem4(0xa4002000|(!{msz}<<23)|(!{bit21}<<21),v,!{sz},pg,xb,zt)
+!{nm}!{sfx} {zt.!{el}},pg/Z,[xb,!{ix}] :: .call w4(0xa4000000|(!{msz}<<23)|(!{bit21}<<21)|(xm<<16)|(pg<<10)|(xb<<5)|zt)
+}
+!def svld1rqo(sfx, el, msz, ix) {
+!svld1rq(sfx, el, msz, ix, 16, "LD1RQ", 0)
+!svld1rq(sfx, el, msz, ix, 32, "LD1RO", 1)
+}
+!svld1rqo("B", "B", 0, "xm")
+!svld1rqo("H", "H", 1, "xm,LSL #1")
+!svld1rqo("W", "S", 2, "xm,LSL #2")
+!svld1rqo("D", "D", 3, "xm,LSL #3")
+
+/* -------------------------------------------------------------------
+/* SVE gather loads, scatter stores and prefetches.
+/* ------------------------------------------------------------------- */
+.func::svmem5::base,v,n,pg,rn,zt
+q = .call divu5(v, n)
+.return .call w4(base | (q << 16) | (pg << 10) | (rn << 5) | zt)
+.endfunc
+
+/* Gather with 32-bit offsets.  u is the zero-extend bit at 14 and ff
+/* the first-fault bit at 13. */
+!def svgat32(nm, msz, u, ff, sz) {
+!{nm} {zt.S},pg/Z,[xb,zm.S,UXTW] :: .call w4(0x84000000|(!{msz}<<23)|(zm<<16)|(!{u}<<14)|(!{ff}<<13)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.S},pg/Z,[xb,zm.S,SXTW] :: .call w4(0x84400000|(!{msz}<<23)|(zm<<16)|(!{u}<<14)|(!{ff}<<13)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.S},pg/Z,[zn.S] :: .call w4(0x84208000|(!{msz}<<23)|(!{u}<<14)|(!{ff}<<13)|(pg<<10)|(zn<<5)|zt)
+!{nm} {zt.S},pg/Z,[zn.S,#!v] :: .call svmem5(0x84208000|(!{msz}<<23)|(!{u}<<14)|(!{ff}<<13),v,!{sz},pg,zn,zt)
+}
+!def svgat32s(nm, msz, u, ff) {
+!{nm} {zt.S},pg/Z,[xb,zm.S,UXTW #!{msz}] :: .call w4(0x84200000|(!{msz}<<23)|(zm<<16)|(!{u}<<14)|(!{ff}<<13)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.S},pg/Z,[xb,zm.S,SXTW #!{msz}] :: .call w4(0x84600000|(!{msz}<<23)|(zm<<16)|(!{u}<<14)|(!{ff}<<13)|(pg<<10)|(xb<<5)|zt)
+}
+!svgat32("LD1B", 0, 1, 0, 1)
+!svgat32("LD1SB", 0, 0, 0, 1)
+!svgat32("LDFF1B", 0, 1, 1, 1)
+!svgat32("LDFF1SB", 0, 0, 1, 1)
+!svgat32("LD1H", 1, 1, 0, 2)
+!svgat32("LD1SH", 1, 0, 0, 2)
+!svgat32("LDFF1H", 1, 1, 1, 2)
+!svgat32("LDFF1SH", 1, 0, 1, 2)
+!svgat32("LD1W", 2, 1, 0, 4)
+!svgat32("LDFF1W", 2, 1, 1, 4)
+!svgat32s("LD1H", 1, 1, 0)
+!svgat32s("LD1SH", 1, 0, 0)
+!svgat32s("LDFF1H", 1, 1, 1)
+!svgat32s("LDFF1SH", 1, 0, 1)
+!svgat32s("LD1W", 2, 1, 0)
+!svgat32s("LDFF1W", 2, 1, 1)
+
+/* Gather with 64-bit offsets */
+!def svgat64(nm, msz, u, ff, sz) {
+!{nm} {zt.D},pg/Z,[xb,zm.D,UXTW] :: .call w4(0xc4000000|(!{msz}<<23)|(zm<<16)|(!{u}<<14)|(!{ff}<<13)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.D},pg/Z,[xb,zm.D,SXTW] :: .call w4(0xc4400000|(!{msz}<<23)|(zm<<16)|(!{u}<<14)|(!{ff}<<13)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.D},pg/Z,[xb,zm.D] :: .call w4(0xc4408000|(!{msz}<<23)|(zm<<16)|(!{u}<<14)|(!{ff}<<13)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.D},pg/Z,[zn.D] :: .call w4(0xc4208000|(!{msz}<<23)|(!{u}<<14)|(!{ff}<<13)|(pg<<10)|(zn<<5)|zt)
+!{nm} {zt.D},pg/Z,[zn.D,#!v] :: .call svmem5(0xc4208000|(!{msz}<<23)|(!{u}<<14)|(!{ff}<<13),v,!{sz},pg,zn,zt)
+}
+!def svgat64s(nm, msz, u, ff) {
+!{nm} {zt.D},pg/Z,[xb,zm.D,UXTW #!{msz}] :: .call w4(0xc4200000|(!{msz}<<23)|(zm<<16)|(!{u}<<14)|(!{ff}<<13)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.D},pg/Z,[xb,zm.D,SXTW #!{msz}] :: .call w4(0xc4600000|(!{msz}<<23)|(zm<<16)|(!{u}<<14)|(!{ff}<<13)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.D},pg/Z,[xb,zm.D,LSL #!{msz}] :: .call w4(0xc4608000|(!{msz}<<23)|(zm<<16)|(!{u}<<14)|(!{ff}<<13)|(pg<<10)|(xb<<5)|zt)
+}
+!svgat64("LD1B", 0, 1, 0, 1)
+!svgat64("LD1SB", 0, 0, 0, 1)
+!svgat64("LDFF1B", 0, 1, 1, 1)
+!svgat64("LDFF1SB", 0, 0, 1, 1)
+!svgat64("LD1H", 1, 1, 0, 2)
+!svgat64("LD1SH", 1, 0, 0, 2)
+!svgat64("LDFF1H", 1, 1, 1, 2)
+!svgat64("LDFF1SH", 1, 0, 1, 2)
+!svgat64("LD1W", 2, 1, 0, 4)
+!svgat64("LD1SW", 2, 0, 0, 4)
+!svgat64("LDFF1W", 2, 1, 1, 4)
+!svgat64("LDFF1SW", 2, 0, 1, 4)
+!svgat64("LD1D", 3, 1, 0, 8)
+!svgat64("LDFF1D", 3, 1, 1, 8)
+!svgat64s("LD1H", 1, 1, 0)
+!svgat64s("LD1SH", 1, 0, 0)
+!svgat64s("LDFF1H", 1, 1, 1)
+!svgat64s("LDFF1SH", 1, 0, 1)
+!svgat64s("LD1W", 2, 1, 0)
+!svgat64s("LD1SW", 2, 0, 0)
+!svgat64s("LDFF1W", 2, 1, 1)
+!svgat64s("LDFF1SW", 2, 0, 1)
+!svgat64s("LD1D", 3, 1, 0)
+!svgat64s("LDFF1D", 3, 1, 1)
+
+/* Scatter with 32-bit offsets */
+!def svsca32(nm, msz, sz) {
+!{nm} {zt.S},pg,[xb,zm.S,UXTW] :: .call w4(0xe4408000|(!{msz}<<23)|(zm<<16)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.S},pg,[xb,zm.S,SXTW] :: .call w4(0xe440c000|(!{msz}<<23)|(zm<<16)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.S},pg,[zn.S] :: .call w4(0xe460a000|(!{msz}<<23)|(pg<<10)|(zn<<5)|zt)
+!{nm} {zt.S},pg,[zn.S,#!v] :: .call svmem5(0xe460a000|(!{msz}<<23),v,!{sz},pg,zn,zt)
+}
+!def svsca32s(nm, msz) {
+!{nm} {zt.S},pg,[xb,zm.S,UXTW #!{msz}] :: .call w4(0xe4608000|(!{msz}<<23)|(zm<<16)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.S},pg,[xb,zm.S,SXTW #!{msz}] :: .call w4(0xe460c000|(!{msz}<<23)|(zm<<16)|(pg<<10)|(xb<<5)|zt)
+}
+!svsca32("ST1B", 0, 1)
+!svsca32("ST1H", 1, 2)
+!svsca32("ST1W", 2, 4)
+!svsca32s("ST1H", 1)
+!svsca32s("ST1W", 2)
+
+/* Scatter with 64-bit offsets */
+!def svsca64(nm, msz, sz) {
+!{nm} {zt.D},pg,[xb,zm.D,UXTW] :: .call w4(0xe4008000|(!{msz}<<23)|(zm<<16)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.D},pg,[xb,zm.D,SXTW] :: .call w4(0xe400c000|(!{msz}<<23)|(zm<<16)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.D},pg,[xb,zm.D] :: .call w4(0xe400a000|(!{msz}<<23)|(zm<<16)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.D},pg,[zn.D] :: .call w4(0xe440a000|(!{msz}<<23)|(pg<<10)|(zn<<5)|zt)
+!{nm} {zt.D},pg,[zn.D,#!v] :: .call svmem5(0xe440a000|(!{msz}<<23),v,!{sz},pg,zn,zt)
+}
+!def svsca64s(nm, msz) {
+!{nm} {zt.D},pg,[xb,zm.D,UXTW #!{msz}] :: .call w4(0xe4208000|(!{msz}<<23)|(zm<<16)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.D},pg,[xb,zm.D,SXTW #!{msz}] :: .call w4(0xe420c000|(!{msz}<<23)|(zm<<16)|(pg<<10)|(xb<<5)|zt)
+!{nm} {zt.D},pg,[xb,zm.D,LSL #!{msz}] :: .call w4(0xe420a000|(!{msz}<<23)|(zm<<16)|(pg<<10)|(xb<<5)|zt)
+}
+!svsca64("ST1B", 0, 1)
+!svsca64("ST1H", 1, 2)
+!svsca64("ST1W", 2, 4)
+!svsca64("ST1D", 3, 8)
+!svsca64s("ST1H", 1)
+!svsca64s("ST1W", 2)
+!svsca64s("ST1D", 3)
+
+/* Non-temporal gather and scatter */
+!def svntg(nm, msz, lo32, lo64) {
+!{nm} {zt.S},pg/Z,[zn.S] :: .call w4(0x84000000|(!{msz}<<23)|(31<<16)|!{lo32}|(pg<<10)|(zn<<5)|zt)
+!{nm} {zt.S},pg/Z,[zn.S,xm] :: .call w4(0x84000000|(!{msz}<<23)|(xm<<16)|!{lo32}|(pg<<10)|(zn<<5)|zt)
+!{nm} {zt.D},pg/Z,[zn.D] :: .call w4(0xc4000000|(!{msz}<<23)|(31<<16)|!{lo64}|(pg<<10)|(zn<<5)|zt)
+!{nm} {zt.D},pg/Z,[zn.D,xm] :: .call w4(0xc4000000|(!{msz}<<23)|(xm<<16)|!{lo64}|(pg<<10)|(zn<<5)|zt)
+}
+!svntg("LDNT1B", 0, 0xa000, 0xc000)
+!svntg("LDNT1H", 1, 0xa000, 0xc000)
+!svntg("LDNT1W", 2, 0xa000, 0xc000)
+!svntg("LDNT1SB", 0, 0x8000, 0x8000)
+!svntg("LDNT1SH", 1, 0x8000, 0x8000)
+LDNT1D {zt.D},pg/Z,[zn.D] :: .call w4(0xc59fc000|(pg<<10)|(zn<<5)|zt)
+LDNT1D {zt.D},pg/Z,[zn.D,xm] :: .call w4(0xc580c000|(xm<<16)|(pg<<10)|(zn<<5)|zt)
+LDNT1SW {zt.D},pg/Z,[zn.D] :: .call w4(0xc51f8000|(pg<<10)|(zn<<5)|zt)
+LDNT1SW {zt.D},pg/Z,[zn.D,xm] :: .call w4(0xc5008000|(xm<<16)|(pg<<10)|(zn<<5)|zt)
+!def svnts(nm, msz) {
+!{nm} {zt.S},pg,[zn.S] :: .call w4(0xe4402000|(!{msz}<<23)|(31<<16)|(pg<<10)|(zn<<5)|zt)
+!{nm} {zt.S},pg,[zn.S,xm] :: .call w4(0xe4402000|(!{msz}<<23)|(xm<<16)|(pg<<10)|(zn<<5)|zt)
+!{nm} {zt.D},pg,[zn.D] :: .call w4(0xe4002000|(!{msz}<<23)|(31<<16)|(pg<<10)|(zn<<5)|zt)
+!{nm} {zt.D},pg,[zn.D,xm] :: .call w4(0xe4002000|(!{msz}<<23)|(xm<<16)|(pg<<10)|(zn<<5)|zt)
+}
+!svnts("STNT1B", 0)
+!svnts("STNT1H", 1)
+!svnts("STNT1W", 2)
+STNT1D {zt.D},pg,[zn.D] :: .call w4(0xe59f2000|(pg<<10)|(zn<<5)|zt)
+STNT1D {zt.D},pg,[zn.D,xm] :: .call w4(0xe5802000|(xm<<16)|(pg<<10)|(zn<<5)|zt)
+
+/* Prefetches.  SVE has no instruction-prefetch hints and numbers its
+/* store hints from 8, so the base-ISA value is folded down by eight.
+/* The hint may also be written as a bare number, masked to four bits
+/* because that is the whole field. */
+.check::svp::PLDL1KEEP,PLDL1STRM,PLDL2KEEP,PLDL2STRM,PLDL3KEEP,PLDL3STRM,PSTL1KEEP,PSTL1STRM,PSTL2KEEP,PSTL2STRM,PSTL3KEEP,PSTL3STRM
+!def svprf(sfx, msz, ix, sz, opt, opv) {
+PRF!{sfx} !{opt},pg,[xb] :: .call w4(0x85c00000|(!{msz}<<13)|(pg<<10)|(xb<<5)|!{opv})
+PRF!{sfx} !{opt},pg,[xb,#!v,MUL VL] ::v<-32;3,v>31;3 :: .call w4(0x85c00000|((v&0x3f)<<16)|(!{msz}<<13)|(pg<<10)|(xb<<5)|!{opv})
+PRF!{sfx} !{opt},pg,[xb,!{ix}] :: .call w4(0x8400c000|(!{msz}<<23)|(xm<<16)|(pg<<10)|(xb<<5)|!{opv})
+PRF!{sfx} !{opt},pg,[zn.S,#!v] :: .call svmem5(0x8400e000|(!{msz}<<23),v,!{sz},pg,zn,!{opv})
+PRF!{sfx} !{opt},pg,[zn.S] :: .call w4(0x8400e000|(!{msz}<<23)|(pg<<10)|(zn<<5)|!{opv})
+PRF!{sfx} !{opt},pg,[zn.D,#!v] :: .call svmem5(0xc400e000|(!{msz}<<23),v,!{sz},pg,zn,!{opv})
+PRF!{sfx} !{opt},pg,[zn.D] :: .call w4(0xc400e000|(!{msz}<<23)|(pg<<10)|(zn<<5)|!{opv})
+}
+!def svprfx(sfx, msz, opt, opv) {
+PRF!{sfx} !{opt},pg,[xb,zm.S,UXTW #!{msz}] :: .call w4(0x84200000|(zm<<16)|(!{msz}<<13)|(pg<<10)|(xb<<5)|!{opv})
+PRF!{sfx} !{opt},pg,[xb,zm.S,SXTW #!{msz}] :: .call w4(0x84600000|(zm<<16)|(!{msz}<<13)|(pg<<10)|(xb<<5)|!{opv})
+PRF!{sfx} !{opt},pg,[xb,zm.D,UXTW #!{msz}] :: .call w4(0xc4200000|(zm<<16)|(!{msz}<<13)|(pg<<10)|(xb<<5)|!{opv})
+PRF!{sfx} !{opt},pg,[xb,zm.D,SXTW #!{msz}] :: .call w4(0xc4600000|(zm<<16)|(!{msz}<<13)|(pg<<10)|(xb<<5)|!{opv})
+PRF!{sfx} !{opt},pg,[xb,zm.D,LSL #!{msz}] :: .call w4(0xc4600000|(zm<<16)|(1<<15)|(!{msz}<<13)|(pg<<10)|(xb<<5)|!{opv})
+}
+!def svprfb(opt, opv) {
+PRFB !{opt},pg,[xb,zm.S,UXTW] :: .call w4(0x84200000|(zm<<16)|(pg<<10)|(xb<<5)|!{opv})
+PRFB !{opt},pg,[xb,zm.S,SXTW] :: .call w4(0x84600000|(zm<<16)|(pg<<10)|(xb<<5)|!{opv})
+PRFB !{opt},pg,[xb,zm.D,UXTW] :: .call w4(0xc4200000|(zm<<16)|(pg<<10)|(xb<<5)|!{opv})
+PRFB !{opt},pg,[xb,zm.D,SXTW] :: .call w4(0xc4600000|(zm<<16)|(pg<<10)|(xb<<5)|!{opv})
+PRFB !{opt},pg,[xb,zm.D] :: .call w4(0xc4608000|(zm<<16)|(pg<<10)|(xb<<5)|!{opv})
+}
+!def svprfall(opt, opv) {
+!svprf("B", 0, "xm", 1, opt, opv)
+!svprf("H", 1, "xm,LSL #1", 2, opt, opv)
+!svprf("W", 2, "xm,LSL #2", 4, opt, opv)
+!svprf("D", 3, "xm,LSL #3", 8, opt, opv)
+!svprfx("H", 1, opt, opv)
+!svprfx("W", 2, opt, opv)
+!svprfx("D", 3, opt, opv)
+!svprfb(opt, opv)
+}
+!svprfall("svp", "(svp<8?svp:svp-8)")
+!svprfall("#!p", "(p&0xf)")
