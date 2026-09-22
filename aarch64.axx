@@ -30,8 +30,9 @@
 /*   - Cryptography: AES, SHA1, SHA2, SHA3, SHA512, SM3, SM4, PMULL
 /*   - The GNU-style relocation modifiers an assembler can resolve on
 /*     its own: :lo12: on ADD and on every load and store, :pg_hi21:
-/*     on ADRP, and :abs_g0: through :abs_g3: and :prel_g0: through
-/*     :prel_g3: (with their _nc forms) on MOVZ/MOVK/MOVN
+/*     on ADRP, :abs_g0: through :abs_g3: and :prel_g0: through
+/*     :prel_g3: (with their _nc forms) on MOVZ/MOVK/MOVN, and the
+/*     :got: / :got_lo12: pair read as naming the GOT slot itself
 /*   - The scalar extensions: pointer authentication (FEAT_PAuth),
 /*     memory tagging (FEAT_MTE), memory copy and set (FEAT_MOPS),
 /*     complex arithmetic (FEAT_FCMA), dot product, FP16 multiply-long,
@@ -3427,10 +3428,29 @@ CPP RCTX,xt :: .call w4(0xd50b73e0|xt)
 /* The modifiers below are therefore about accepting and computing
 /* the syntax, not about deferring it to a linker.
 /*
-/* Only the slices an assembler can work out on its own are here.
-/* :got:, :got_lo12:, :tlsdesc:, :gottprel: and the TLS :tprel_* /
-/* :dtprel_* family name addresses a linker creates, so there is
-/* nothing for axx to compute and they are left out.
+/* :got: and :got_lo12: need a word of their own. To a linker they
+/* name the GOT entry it builds for the symbol, and axx builds no
+/* GOT. What axx does instead is take the symbol you name as being
+/* the GOT slot itself -- which is what you write anyway when there
+/* is no linker and the table is yours:
+/*
+/*     adrp    x0, :got:printf_slot
+/*     ldr     x0, [x0, :got_lo12:printf_slot]
+/*     ...
+/*     printf_slot:
+/*         .zero 8              /* filled in at run time */
+/*
+/* So :got: is the ADRP page of that slot and :got_lo12: is its low
+/* 12 bits scaled by 8, which is exactly the arithmetic the two
+/* relocations stand for once the slot has an address. Point them at
+/* the symbol itself, the way linker-targeted source does, and the
+/* result is the address of the symbol rather than of a slot holding
+/* it -- that indirection is the linker's, and axx cannot supply it.
+/*
+/* :tlsdesc:, :gottprel: and the TLS :tprel_* / :dtprel_* family are
+/* still left out: those name offsets a linker and a thread-local
+/* storage layout decide together, and no reading of the symbol makes
+/* them computable here.
 /*
 /* The "#" before the modifier is optional wherever an assembler
 /* accepts it, so each form is written both ways.
@@ -3482,6 +3502,15 @@ PRFM #!p,[xb,#:LO12:!t] ::p<0;3,p>31;3,(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1
 /* already means there, so it encodes identically to the plain row
 /* further up. GNU as takes this spelling; llvm-mc does not. */
 ADRP xd,:PG_HI21:!t :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
+
+/* The GOT pair. :got: is the page of the slot, :got_lo12: its low
+/* 12 bits scaled by 8 -- the slot holds a 64-bit address, so it is
+/* the LDR (64-bit) form that takes it, and the slot has to be
+/* 8-aligned for the offset to be representable. */
+ADRP xd,:GOT:!t :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
+ADRP xd,#:GOT:!t :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
+LDR xt,[xb,:GOT_LO12:!t] ::(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1<<24)|(1<<22)|(((t&0xfff)>>3)<<10)|(xb<<5)|xt)
+LDR xt,[xb,#:GOT_LO12:!t] ::(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1<<24)|(1<<22)|(((t&0xfff)>>3)<<10)|(xb<<5)|xt)
 
 /* Move wide. The modifier names which 16-bit slice of the symbol the
 /* field holds, and that also fixes hw. The checked forms report an

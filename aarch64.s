@@ -484,6 +484,12 @@ here:
         movz    x5, :abs_g0:here
         movn    x6, #:abs_g1:here
         movz    w7, #:abs_g0_nc:here
+; :got: and :got_lo12: name the GOT slot itself, since axx builds no
+; GOT of its own; "here" stands in for the slot below.
+        adrp    x8, :got:here
+        ldr     x8, [x8, :got_lo12:here]
+        adrp    x9, #:got:here
+        ldr     x9, [x9, #:got_lo12:here]
 
 ; ---- forward references resolve through the relaxation loop ----
         b       tail

@@ -25,8 +25,9 @@ aarch64.axx                         pattern file for the AArch64 (A64) instructi
                                     (PAuth, MTE, MOPS, FCMA, dot product,
                                     BFloat16, matrix multiply, LS64), and the
                                     GNU-style relocation modifiers :lo12:,
-                                    :pg_hi21:, :abs_g0:-:abs_g3: and
-                                    :prel_g0:-:prel_g3:. SVE, SVE2 and SME are
+                                    :pg_hi21:, :abs_g0:-:abs_g3:,
+                                    :prel_g0:-:prel_g3: and the :got: /
+                                    :got_lo12: pair. SVE, SVE2 and SME are
                                     not covered
 aarch64.s                           test assemble file for aarch64.axx
 aarch64_logical.axx                 pattern file for the AArch64 logical (immediate)
