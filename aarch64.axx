@@ -3433,16 +3433,16 @@ CPP RCTX,xt :: .call w4(0xd50b73e0|xt)
 /* correct whenever the symbol's address is known at assembly time --
 /* which is the case for "-b", and for "-o" when the symbol is
 /* defined in the same source. For a symbol the linker has to place,
-/* axx cannot express these relocations: its relocation tracking
-/* follows label references through binary_list words, and the words
-/* here come out of a mini-language .call, which it does not follow.
-/* The modifiers below are therefore about accepting and computing
-/* the syntax, not about deferring it to a linker.
+/* axx computes it as well, so "-b" gives finished code whenever the
+/* symbol's address is known at assembly time. For "-o" each row also
+/* carries a .reloc declaration, so a symbol the linker has to place
+/* comes out as a proper relocation with the field left zero -- the
+/* same shape GNU as produces.
 /*
-/* Only the slices an assembler can work out on its own are here.
-/* :got:, :got_lo12:, :tlsdesc:, :gottprel: and the TLS :tprel_* /
-/* :dtprel_* family name addresses a linker creates, so there is
-/* nothing for axx to compute and they are left out.
+/* :got: and :got_lo12: name a GOT entry the linker creates, so there
+/* is nothing for axx to compute: those two rows emit the bare opcode
+/* and leave everything to the relocation. The TLS families
+/* (:tlsdesc:, :gottprel:, :tprel_*, :dtprel_*) are still left out.
 /*
 /* The "#" before the modifier is optional wherever an assembler
 /* accepts it, so each form is written both ways.
@@ -3513,6 +3513,25 @@ PRFM #!p,[xb,#:LO12:!t] ::p<0;3,p>31;3,(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1
 /* further up. GNU as takes this spelling; llvm-mc does not. */
 .reloc::t::adr_prel_pg_hi21
 ADRP xd,:PG_HI21:!t :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
+.clrreloc::t
+
+/* GOT. The value is the address of a GOT entry the linker creates, so
+/* unlike every other row here there is nothing to compute: the field
+/* goes out zero and the relocation carries the whole meaning. `t` is
+/* still read (masked to nothing) because that is what makes the label
+/* reference visible to the relocation tracking.
+/*
+/*     adrp    x0, :got:sym
+/*     ldr     x0, [x0, :got_lo12:sym]
+/*
+/* :got_lo12: is the 64-bit load only -- LD64_GOT_LO12_NC scales by 8,
+/* so a narrower load through the GOT has no relocation to name. */
+.reloc::t::got_page
+ADRP xd,:GOT:!t :: .call w4((1<<31)|(0x10<<24)|(t&0)|xd)
+.clrreloc::t
+.reloc::t::got_lo12
+LDR xt,[xb,:GOT_LO12:!t] :: .call w4((3<<30)|(7<<27)|(1<<24)|(1<<22)|(t&0)|(xb<<5)|xt)
+LDR xt,[xb,#:GOT_LO12:!t] :: .call w4((3<<30)|(7<<27)|(1<<24)|(1<<22)|(t&0)|(xb<<5)|xt)
 .clrreloc::t
 
 /* Move wide. The modifier names which 16-bit slice of the symbol the

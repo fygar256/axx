@@ -614,6 +614,12 @@ _ELF_MACHINE_RAW = {
             'ldst32_abs_lo12_nc': (285, 4),
             'ldst64_abs_lo12_nc': (286, 4),
             'ldst128_abs_lo12_nc': (299, 4),
+            # GOT 経由。リンカが GOT エントリを作るので、値はアセンブル時には
+            # 決まらない。欄は 0 で出し、リンカが埋める。
+            'got_ld_prel19': (309, 4),
+            'got_page': (311, 4), 'adr_got_page': (311, 4),
+            'got_lo12': (312, 4), 'ld64_got_lo12_nc': (312, 4),
+            'ld64_gotpage_lo15': (313, 4),
         },
         dwarf_abs=257,
     ),
@@ -690,6 +696,10 @@ AARCH64_INSN_RELOCS = {
     282: ((0, 26),), 283: ((0, 26),),             # JUMP26 / CALL26
     284: _A64_LO12_FIELD, 285: _A64_LO12_FIELD,   # LDST16 / LDST32
     286: _A64_LO12_FIELD, 299: _A64_LO12_FIELD,   # LDST64 / LDST128
+    309: ((5, 19),),                              # GOT_LD_PREL19
+    311: _A64_ADR_FIELDS,                         # ADR_GOT_PAGE
+    312: _A64_LO12_FIELD,                         # LD64_GOT_LO12_NC
+    313: _A64_LO12_FIELD,                         # LD64_GOTPAGE_LO15
 }
 
 

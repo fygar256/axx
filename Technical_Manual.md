@@ -1187,6 +1187,14 @@ The instruction-field types available for AArch64 are below. The data types
 | `ldst8_abs_lo12_nc` | 278 | imm12 of load/store |
 | `ldst16` / `ldst32` / `ldst64` / `ldst128_abs_lo12_nc` | 284 / 285 / 286 / 299 | same, scaled per width |
 | `movw_uabs_g0` … `g3` (and `_nc`) | 263–269 | imm16 of `movz` / `movk` |
+| `got_page` (`adr_got_page`) | 311 | immlo/immhi of `adrp` — GOT page |
+| `got_lo12` (`ld64_got_lo12_nc`) | 312 | imm12 of a 64-bit `ldr` — offset in the GOT |
+| `got_ld_prel19` | 309 | imm19 of a literal `ldr` |
+| `ld64_gotpage_lo15` | 313 | imm12 |
+
+The two GOT types differ in kind from the rest. Their value is the address of a
+GOT entry the linker creates, so nothing is known at assembly time: the field
+goes out zero and the relocation carries the whole meaning.
 
 ### 3.8 Optional parts (`[[ ]]`)
 

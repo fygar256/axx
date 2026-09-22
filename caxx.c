@@ -1657,6 +1657,12 @@ static const ElfNamedReloc _named_aarch64[] = {
     {"ldst32_abs_lo12_nc", 285, 4},
     {"ldst64_abs_lo12_nc", 286, 4},
     {"ldst128_abs_lo12_nc", 299, 4},
+    /* GOT 経由。リンカが GOT エントリを作るので、値はアセンブル時には決まらない。
+     * 欄は 0 で出し、リンカが埋める。 */
+    {"got_ld_prel19", 309, 4},
+    {"got_page", 311, 4}, {"adr_got_page", 311, 4},
+    {"got_lo12", 312, 4}, {"ld64_got_lo12_nc", 312, 4},
+    {"ld64_gotpage_lo15", 313, 4},
     {NULL, 0, 0},
 };
 
@@ -1679,7 +1685,9 @@ static uint32_t insn_reloc_field_mask(int rtype){
     case 286: case 299:
         return 0xfffu << 10;                    /* ADD/LDST lo12  imm12 */
     case 279: return 0x3fffu << 5;              /* TSTBR14  */
-    case 280: return 0x7ffffu << 5;             /* CONDBR19 */
+    case 280: case 309: return 0x7ffffu << 5;   /* CONDBR19 / GOT_LD_PREL19 */
+    case 311: return (3u << 29) | (0x7ffffu << 5);  /* ADR_GOT_PAGE */
+    case 312: case 313: return 0xfffu << 10;    /* LD64_GOT_LO12_NC / GOTPAGE_LO15 */
     case 282: case 283: return 0x3ffffffu;      /* JUMP26 / CALL26 */
     default: return 0;
     }
