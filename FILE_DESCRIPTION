@@ -17,6 +17,8 @@ File description
 8080.s                              test assemble file for 8080
 4004.axx                            pattern file for 4004
 4004.s                              test assemble file for 4004
+aarch64.axx                         pattern file for aarch64
+aarch64.s                           test assemble file for aarch64
 aarch64_logical.axx                 pattern file for the AArch64 logical (immediate)
                                     group, AND/ORR/EOR/ANDS/TST, 32 and 64 bit.
                                     the macro-layer version: the rows are
