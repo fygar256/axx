@@ -3568,3 +3568,525 @@ LDR xt,[xb,#:GOT_LO12:!t] ::(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1<<24)|(1<<2
 !movwprelall("MOVZ", 2)
 !movwprelall("MOVK", 3)
 !movwprelall("MOVN", 0)
+
+/* ===================================================================
+/* SVE and SVE2
+/*
+/* A second register file: Z0-Z31 vectors of unknown length, P0-P15
+/* predicates. The element size is written after the register, the
+/* same way an Advanced SIMD arrangement is, so the matcher stops at
+/* the "." on its own and one row per element size is all it takes.
+/* A governing predicate is "Pg/M" or "Pg/Z", and "/" is an ordinary
+/* character in an instruction field, so that needs nothing special
+/* either.
+/*
+/* Element size codes are 0=B 1=H 2=S 3=D throughout.
+/* =================================================================== */
+!gpr("Z", 31)
+!gpr("P", 15)
+!rset("ZR", "Z", 31)
+!rset("PR", "P", 15)
+.setsym::PLO::P0,P1,P2,P3,P4,P5,P6,P7
+.check::zd::ZR
+.check::zn::ZR
+.check::zm::ZR
+.check::zk::ZR
+.check::zi::ZR
+.check::zj::ZR
+.check::zl::ZR
+/* pg is the three-bit governing predicate, so P0-P7 only; pv is the
+/* four-bit one, and pd/pn/pm are ordinary predicate operands. */
+.check::pg::PLO
+.check::pv::PR
+.check::pd::PR
+.check::pn::PR
+.check::pm::PR
+
+/* Integer binary, unpredicated.
+/*   00000100 size 1 Zm 000 opc Zn Zd */
+!def sv3u1(nm, opc, el, sz) {
+!{nm} zd.!{el},zn.!{el},zm.!{el} :: .call w4(0x04200000|(!{sz}<<22)|(zm<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def sv3u(nm, opc) {
+!sv3u1(nm, opc, "B", 0)
+!sv3u1(nm, opc, "H", 1)
+!sv3u1(nm, opc, "S", 2)
+!sv3u1(nm, opc, "D", 3)
+}
+!sv3u("ADD", 0)
+!sv3u("SUB", 1)
+!sv3u("SQADD", 4)
+!sv3u("UQADD", 5)
+!sv3u("SQSUB", 6)
+!sv3u("UQSUB", 7)
+
+/* Integer binary, predicated. The destination is also the first
+/* source, which is why these are written Zdn twice.
+/*   00000100 size 0 opc 000 Pg Zm Zdn */
+!def sv3p1(nm, opc, el, sz) {
+!{nm} zd.!{el},pg/M,zd.!{el},zm.!{el} :: .call w4(0x04000000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zm<<5)|zd)
+}
+!def sv3p(nm, opc, lo) {
+!if lo == 0 !then {
+!sv3p1(nm, opc, "B", 0)
+!sv3p1(nm, opc, "H", 1)
+}
+!sv3p1(nm, opc, "S", 2)
+!sv3p1(nm, opc, "D", 3)
+}
+!sv3p("ADD", 0x00, 0)
+!sv3p("SUB", 0x01, 0)
+!sv3p("SUBR", 0x03, 0)
+!sv3p("SMAX", 0x08, 0)
+!sv3p("UMAX", 0x09, 0)
+!sv3p("SMIN", 0x0a, 0)
+!sv3p("UMIN", 0x0b, 0)
+!sv3p("SABD", 0x0c, 0)
+!sv3p("UABD", 0x0d, 0)
+!sv3p("MUL", 0x10, 0)
+!sv3p("SMULH", 0x12, 0)
+!sv3p("UMULH", 0x13, 0)
+!sv3p("AND", 0x1a, 0)
+!sv3p("ORR", 0x18, 0)
+!sv3p("EOR", 0x19, 0)
+!sv3p("BIC", 0x1b, 0)
+/* Divide is defined for the 32- and 64-bit element sizes only */
+!sv3p("SDIV", 0x14, 1)
+!sv3p("UDIV", 0x15, 1)
+!sv3p("SDIVR", 0x16, 1)
+!sv3p("UDIVR", 0x17, 1)
+
+/* Bitwise logical, unpredicated. These have no element size of their
+/* own; the operands are written .D by convention.
+/*   00000100 opc 1 Zm 001100 Zn Zd */
+!def svlu(nm, opc) {
+!{nm} zd.D,zn.D,zm.D :: .call w4(0x04203000|(!{opc}<<22)|(zm<<16)|(zn<<5)|zd)
+}
+!svlu("AND", 0)
+!svlu("ORR", 1)
+!svlu("EOR", 2)
+!svlu("BIC", 3)
+
+/* Unary predicated.
+/*   00000100 size 010 opc 101 Pg Zn Zd */
+!def sv2p1(nm, opc, el, sz) {
+!{nm} zd.!{el},pg/M,zn.!{el} :: .call w4(0x0400a000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zn<<5)|zd)
+}
+!def sv2p(nm, opc, lo) {
+!if lo <= 0 !then {
+!sv2p1(nm, opc, "B", 0)
+}
+!if lo <= 1 !then {
+!sv2p1(nm, opc, "H", 1)
+}
+!if lo <= 2 !then {
+!sv2p1(nm, opc, "S", 2)
+}
+!sv2p1(nm, opc, "D", 3)
+}
+!sv2p("SXTB", 0x10, 1)
+!sv2p("UXTB", 0x11, 1)
+!sv2p("SXTH", 0x12, 2)
+!sv2p("UXTH", 0x13, 2)
+!sv2p("SXTW", 0x14, 3)
+!sv2p("UXTW", 0x15, 3)
+!sv2p("ABS", 0x16, 0)
+!sv2p("NEG", 0x17, 0)
+!sv2p("CLS", 0x18, 0)
+!sv2p("CLZ", 0x19, 0)
+!sv2p("CNT", 0x1a, 0)
+!sv2p("CNOT", 0x1b, 0)
+!sv2p("FABS", 0x1c, 1)
+!sv2p("FNEG", 0x1d, 1)
+!sv2p("NOT", 0x1e, 0)
+
+/* Reverse bits and bytes sit in their own block.
+/*   00000101 size 1001 opc 100 Pg Zn Zd */
+!def svrev1(nm, opc, el, sz) {
+!{nm} zd.!{el},pg/M,zn.!{el} :: .call w4(0x05248000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zn<<5)|zd)
+}
+!def svrevp(nm, opc, lo) {
+!if lo <= 0 !then {
+!svrev1(nm, opc, "B", 0)
+}
+!if lo <= 1 !then {
+!svrev1(nm, opc, "H", 1)
+}
+!if lo <= 2 !then {
+!svrev1(nm, opc, "S", 2)
+}
+!svrev1(nm, opc, "D", 3)
+}
+!svrevp("REVB", 0, 1)
+!svrevp("REVH", 1, 2)
+!svrevp("REVW", 2, 3)
+!svrevp("RBIT", 3, 0)
+
+/* Shift by immediate, predicated. tszh:tszl:imm3 is one field split
+/* across bits 23:22 and 9:5, holding 2*esize-amount for a right
+/* shift and esize+amount for a left one -- the same convention
+/* Advanced SIMD uses. */
+!def svshpr(nm, opc, el, sz, es) {
+!{nm} zd.!{el},pg/M,zd.!{el},#!s ::s<1;3,s>!{es};3 :: .call w4(0x04008000|(!{opc}<<16)|(((((!{es}*2)-s)>>5)&3)<<22)|(pg<<10)|((((!{es}*2)-s)&0x1f)<<5)|zd)
+}
+!def svshpl(nm, opc, el, sz, es) {
+!{nm} zd.!{el},pg/M,zd.!{el},#!s ::s<0;3,s>!{es-1};3 :: .call w4(0x04008000|(!{opc}<<16)|((((!{es}+s)>>5)&3)<<22)|(pg<<10)|(((!{es}+s)&0x1f)<<5)|zd)
+}
+!def svshp(nm, opc, right) {
+!if right !then {
+!svshpr(nm, opc, "B", 0, 8)
+!svshpr(nm, opc, "H", 1, 16)
+!svshpr(nm, opc, "S", 2, 32)
+!svshpr(nm, opc, "D", 3, 64)
+} !else {
+!svshpl(nm, opc, "B", 0, 8)
+!svshpl(nm, opc, "H", 1, 16)
+!svshpl(nm, opc, "S", 2, 32)
+!svshpl(nm, opc, "D", 3, 64)
+}
+}
+!svshp("ASR", 0, 1)
+!svshp("LSR", 1, 1)
+!svshp("LSL", 3, 0)
+!svshp("ASRD", 4, 1)
+
+/* Shift by immediate, unpredicated.
+/*   00000100 tszh 1 tszl imm3 100 opc Zn Zd */
+!def svshur(nm, opc, el, sz, es) {
+!{nm} zd.!{el},zn.!{el},#!s ::s<1;3,s>!{es};3 :: .call w4(0x04209000|(((((!{es}*2)-s)>>5)&3)<<22)|((((!{es}*2)-s)&0x1f)<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def svshul(nm, opc, el, sz, es) {
+!{nm} zd.!{el},zn.!{el},#!s ::s<0;3,s>!{es-1};3 :: .call w4(0x04209000|((((!{es}+s)>>5)&3)<<22)|(((!{es}+s)&0x1f)<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def svshu(nm, opc, right) {
+!if right !then {
+!svshur(nm, opc, "B", 0, 8)
+!svshur(nm, opc, "H", 1, 16)
+!svshur(nm, opc, "S", 2, 32)
+!svshur(nm, opc, "D", 3, 64)
+} !else {
+!svshul(nm, opc, "B", 0, 8)
+!svshul(nm, opc, "H", 1, 16)
+!svshul(nm, opc, "S", 2, 32)
+!svshul(nm, opc, "D", 3, 64)
+}
+}
+!svshu("ASR", 0, 1)
+!svshu("LSR", 1, 1)
+!svshu("LSL", 3, 0)
+
+/* Shift by vector, predicated, and the wide forms whose shift amount
+/* is always a .D vector. */
+!def svshr1(nm, opc, el, sz) {
+!{nm} zd.!{el},pg/M,zd.!{el},zm.!{el} :: .call w4(0x04008000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zm<<5)|zd)
+}
+!def svshr(nm, opc) {
+!svshr1(nm, opc, "B", 0)
+!svshr1(nm, opc, "H", 1)
+!svshr1(nm, opc, "S", 2)
+!svshr1(nm, opc, "D", 3)
+}
+!svshr("ASR", 0x10)
+!svshr("LSR", 0x11)
+!svshr("LSL", 0x13)
+!svshr("ASRR", 0x14)
+!svshr("LSRR", 0x15)
+!svshr("LSLR", 0x17)
+!def svshw1(nm, opc, el, sz) {
+!{nm} zd.!{el},pg/M,zd.!{el},zm.D :: .call w4(0x04008000|(!{sz}<<22)|(!{opc}<<16)|(pg<<10)|(zm<<5)|zd)
+!{nm} zd.!{el},zn.!{el},zm.D :: .call w4(0x04208000|(!{sz}<<22)|(zm<<16)|(!{opc-0x18}<<10)|(zn<<5)|zd)
+}
+!def svshw(nm, opc) {
+!svshw1(nm, opc, "B", 0)
+!svshw1(nm, opc, "H", 1)
+!svshw1(nm, opc, "S", 2)
+}
+!svshw("ASR", 0x18)
+!svshw("LSR", 0x19)
+!svshw("LSL", 0x1b)
+
+/* Integer binary with an immediate.
+/*   00100101 size opc 11 sh imm8 Zdn
+/* The shifted form multiplies the byte by 256; only the wrapping
+/* arithmetic operations have it. */
+!def svimm1(nm, opc, el, sz, sg, sh8) {
+!{nm} zd.!{el},zd.!{el},#!v ::v<!{sg};3,v>255;3 :: .call w4(0x2500c000|(!{sz}<<22)|(!{opc}<<16)|((v&0xff)<<5)|zd)
+!if sh8 !then {
+!{nm} zd.!{el},zd.!{el},#!v,LSL #!h ::v<!{sg};3,v>255;3,h!=8;10 :: .call w4(0x2500e000|(!{sz}<<22)|(!{opc}<<16)|((v&0xff)<<5)|zd)
+}
+}
+/* The shifted form has no byte version: a byte element has nowhere
+/* to put the top half. */
+!def svimm(nm, opc, sg, sh8) {
+!svimm1(nm, opc, "B", 0, sg, 0)
+!svimm1(nm, opc, "H", 1, sg, sh8)
+!svimm1(nm, opc, "S", 2, sg, sh8)
+!svimm1(nm, opc, "D", 3, sg, sh8)
+}
+!svimm("ADD", 0x20, 0, 1)
+!svimm("SUB", 0x21, 0, 1)
+!svimm("SUBR", 0x23, 0, 1)
+!svimm("SQADD", 0x24, 0, 1)
+!svimm("UQADD", 0x25, 0, 1)
+!svimm("SQSUB", 0x26, 0, 1)
+!svimm("UQSUB", 0x27, 0, 1)
+!svimm("SMAX", 0x28, -128, 0)
+!svimm("SMIN", 0x2a, -128, 0)
+!svimm("UMAX", 0x29, 0, 0)
+!svimm("UMIN", 0x2b, 0, 0)
+!svimm("MUL", 0x30, -128, 0)
+/* DUP with an immediate, and its MOV spelling */
+!def svdupi(nm, el, sz, sh8) {
+!{nm} zd.!{el},#!v ::v<-128;3,v>255;3 :: .call w4(0x2538c000|(!{sz}<<22)|((v&0xff)<<5)|zd)
+!if sh8 !then {
+!{nm} zd.!{el},#!v,LSL #!h ::v<-128;3,v>255;3,h!=8;10 :: .call w4(0x2538e000|(!{sz}<<22)|((v&0xff)<<5)|zd)
+}
+}
+!svdupi("DUP", "B", 0, 0)
+!svdupi("DUP", "H", 1, 1)
+!svdupi("DUP", "S", 2, 1)
+!svdupi("DUP", "D", 3, 1)
+!svdupi("MOV", "B", 0, 0)
+!svdupi("MOV", "H", 1, 1)
+!svdupi("MOV", "S", 2, 1)
+!svdupi("MOV", "D", 3, 1)
+
+/* Multiply-accumulate. MLA and MLS accumulate into Zda; MAD and MSB
+/* accumulate into the destination, so their operands read the other
+/* way round. */
+!def svmla1(nm, base, el, sz) {
+!{nm} zd.!{el},pg/M,zn.!{el},zm.!{el} :: .call w4(!{base}|(!{sz}<<22)|(zm<<16)|(pg<<10)|(zn<<5)|zd)
+}
+!def svmad1(nm, base, el, sz) {
+!{nm} zd.!{el},pg/M,zm.!{el},zk.!{el} :: .call w4(!{base}|(!{sz}<<22)|(zm<<16)|(pg<<10)|(zk<<5)|zd)
+}
+!def svmla(nm, base) {
+!svmla1(nm, base, "B", 0)
+!svmla1(nm, base, "H", 1)
+!svmla1(nm, base, "S", 2)
+!svmla1(nm, base, "D", 3)
+}
+!def svmad(nm, base) {
+!svmad1(nm, base, "B", 0)
+!svmad1(nm, base, "H", 1)
+!svmad1(nm, base, "S", 2)
+!svmad1(nm, base, "D", 3)
+}
+!svmla("MLA", 0x04004000)
+!svmla("MLS", 0x04006000)
+!svmad("MAD", 0x0400c000)
+!svmad("MSB", 0x0400e000)
+
+/* Integer compare, vector. The result is a predicate, so the
+/* destination carries the element size and the sources give the
+/* operands. CMPLT/CMPLE/CMPLO/CMPLS are CMPGT/CMPGE/CMPHI/CMPHS with
+/* the two vectors exchanged, which is how an assembler spells them.
+/*   00100100 size 0 Zm op Pg Zn ne Pd */
+!def svcmp1(nm, op, ne, el, sz, swap) {
+!if swap !then {
+!{nm} pd.!{el},pg/Z,zn.!{el},zm.!{el} :: .call w4(0x24000000|(!{sz}<<22)|(zn<<16)|(!{op}<<13)|(pg<<10)|(zm<<5)|(!{ne}<<4)|pd)
+} !else {
+!{nm} pd.!{el},pg/Z,zn.!{el},zm.!{el} :: .call w4(0x24000000|(!{sz}<<22)|(zm<<16)|(!{op}<<13)|(pg<<10)|(zn<<5)|(!{ne}<<4)|pd)
+}
+}
+!def svcmp(nm, op, ne, swap) {
+!svcmp1(nm, op, ne, "B", 0, swap)
+!svcmp1(nm, op, ne, "H", 1, swap)
+!svcmp1(nm, op, ne, "S", 2, swap)
+!svcmp1(nm, op, ne, "D", 3, swap)
+}
+!svcmp("CMPEQ", 5, 0, 0)
+!svcmp("CMPNE", 5, 1, 0)
+!svcmp("CMPGE", 4, 0, 0)
+!svcmp("CMPGT", 4, 1, 0)
+!svcmp("CMPLE", 4, 0, 1)
+!svcmp("CMPLT", 4, 1, 1)
+!svcmp("CMPHS", 0, 0, 0)
+!svcmp("CMPHI", 0, 1, 0)
+!svcmp("CMPLS", 0, 0, 1)
+!svcmp("CMPLO", 0, 1, 1)
+
+/* Integer compare against a .D vector of wide elements */
+!def svcmpw1(nm, op, ne, el, sz) {
+!{nm} pd.!{el},pg/Z,zn.!{el},zm.D :: .call w4(0x24000000|(!{sz}<<22)|(zm<<16)|(!{op}<<13)|(pg<<10)|(zn<<5)|(!{ne}<<4)|pd)
+}
+!def svcmpw(nm, op, ne) {
+!svcmpw1(nm, op, ne, "B", 0)
+!svcmpw1(nm, op, ne, "H", 1)
+!svcmpw1(nm, op, ne, "S", 2)
+}
+!svcmpw("CMPEQ", 1, 0)
+!svcmpw("CMPNE", 1, 1)
+!svcmpw("CMPGE", 2, 0)
+!svcmpw("CMPGT", 2, 1)
+!svcmpw("CMPLT", 3, 0)
+!svcmpw("CMPLE", 3, 1)
+!svcmpw("CMPHS", 6, 0)
+!svcmpw("CMPHI", 6, 1)
+!svcmpw("CMPLO", 7, 0)
+!svcmpw("CMPLS", 7, 1)
+
+/* Integer compare against an immediate: signed operations take a
+/* five-bit signed value, unsigned ones a seven-bit unsigned value,
+/* and they sit in different blocks. */
+!def svcmpi1(nm, op, ne, el, sz) {
+!{nm} pd.!{el},pg/Z,zn.!{el},#!v ::v<-16;3,v>15;3 :: .call w4(0x25000000|(!{sz}<<22)|((v&0x1f)<<16)|(!{op}<<13)|(pg<<10)|(zn<<5)|(!{ne}<<4)|pd)
+}
+!def svcmpu1(nm, op, ne, el, sz) {
+!{nm} pd.!{el},pg/Z,zn.!{el},#!v ::v<0;3,v>127;3 :: .call w4(0x24200000|(!{sz}<<22)|((v&0x7f)<<14)|(!{op}<<13)|(pg<<10)|(zn<<5)|(!{ne}<<4)|pd)
+}
+!def svcmpi(nm, op, ne) {
+!svcmpi1(nm, op, ne, "B", 0)
+!svcmpi1(nm, op, ne, "H", 1)
+!svcmpi1(nm, op, ne, "S", 2)
+!svcmpi1(nm, op, ne, "D", 3)
+}
+!def svcmpu(nm, op, ne) {
+!svcmpu1(nm, op, ne, "B", 0)
+!svcmpu1(nm, op, ne, "H", 1)
+!svcmpu1(nm, op, ne, "S", 2)
+!svcmpu1(nm, op, ne, "D", 3)
+}
+!svcmpi("CMPEQ", 4, 0)
+!svcmpi("CMPNE", 4, 1)
+!svcmpi("CMPGE", 0, 0)
+!svcmpi("CMPGT", 0, 1)
+!svcmpi("CMPLT", 1, 0)
+!svcmpi("CMPLE", 1, 1)
+!svcmpu("CMPHS", 0, 0)
+!svcmpu("CMPHI", 0, 1)
+!svcmpu("CMPLO", 1, 0)
+!svcmpu("CMPLS", 1, 1)
+
+/* Predicate logical.
+/*   00100101 op S 00 Pm 01 Pg b Pn o2 Pd */
+!def svplog(nm, op, s, b9, o2) {
+!{nm} pd.B,pg/Z,pn.B,pm.B :: .call w4(0x25004000|(!{op}<<23)|(!{s}<<22)|(pm<<16)|(pg<<10)|(!{b9}<<9)|(pn<<5)|(!{o2}<<4)|pd)
+}
+!svplog("AND", 0, 0, 0, 0)
+!svplog("BIC", 0, 0, 0, 1)
+!svplog("EOR", 0, 0, 1, 0)
+!svplog("ORR", 1, 0, 0, 0)
+!svplog("ORN", 1, 0, 0, 1)
+!svplog("NOR", 1, 0, 1, 0)
+!svplog("NAND", 1, 0, 1, 1)
+!svplog("ANDS", 0, 1, 0, 0)
+!svplog("BICS", 0, 1, 0, 1)
+!svplog("EORS", 0, 1, 1, 0)
+!svplog("ORRS", 1, 1, 0, 0)
+!svplog("ORNS", 1, 1, 0, 1)
+!svplog("NORS", 1, 1, 1, 0)
+!svplog("NANDS", 1, 1, 1, 1)
+/* SEL takes its governing predicate unqualified */
+SEL pd.B,pv,pn.B,pm.B :: .call w4(0x25004210|(pm<<16)|(pv<<10)|(pn<<5)|pd)
+/* MOV and MOVS are ORR and ORRS with one predicate used three times */
+MOV pd.B,pn.B :: .call w4(0x25804000|(pn<<16)|(pn<<10)|(pn<<5)|pd)
+MOVS pd.B,pn.B :: .call w4(0x25c04000|(pn<<16)|(pn<<10)|(pn<<5)|pd)
+/* The predicated spelling is AND rather than ORR, so that inactive
+/* elements come out zero. */
+MOV pd.B,pg/Z,pn.B :: .call w4(0x25004000|(pn<<16)|(pg<<10)|(pn<<5)|pd)
+MOVS pd.B,pg/Z,pn.B :: .call w4(0x25404000|(pn<<16)|(pg<<10)|(pn<<5)|pd)
+
+/* Predicate patterns for PTRUE and the element-count instructions */
+.setsym::POW2::0
+.setsym::VL1::1
+.setsym::VL2::2
+.setsym::VL3::3
+.setsym::VL4::4
+.setsym::VL5::5
+.setsym::VL6::6
+.setsym::VL7::7
+.setsym::VL8::8
+.setsym::VL16::9
+.setsym::VL32::10
+.setsym::VL64::11
+.setsym::VL128::12
+.setsym::VL256::13
+.setsym::MUL4::29
+.setsym::MUL3::30
+.setsym::ALL::31
+.setsym::PATS::POW2,VL1,VL2,VL3,VL4,VL5,VL6,VL7,VL8,VL16,VL32,VL64,VL128,VL256,MUL4,MUL3,ALL
+.check::pat::PATS
+
+/* Predicate initialisation and tests */
+!def svptrue(nm, s, el, sz) {
+!{nm} pd.!{el} :: .call w4(0x2518e000|(!{sz}<<22)|(!{s}<<16)|(31<<5)|pd)
+!{nm} pd.!{el},pat :: .call w4(0x2518e000|(!{sz}<<22)|(!{s}<<16)|(pat<<5)|pd)
+}
+!svptrue("PTRUE", 0, "B", 0)
+!svptrue("PTRUE", 0, "H", 1)
+!svptrue("PTRUE", 0, "S", 2)
+!svptrue("PTRUE", 0, "D", 3)
+!svptrue("PTRUES", 1, "B", 0)
+!svptrue("PTRUES", 1, "H", 1)
+!svptrue("PTRUES", 1, "S", 2)
+!svptrue("PTRUES", 1, "D", 3)
+PFALSE pd.B :: .call w4(0x2518e400|pd)
+PTEST pv,pn.B :: .call w4(0x2550c000|(pv<<10)|(pn<<5))
+PFIRST pd.B,pv,pd.B :: .call w4(0x2558c000|(pv<<5)|pd)
+!def svpnext(el, sz) {
+PNEXT pd.!{el},pv,pd.!{el} :: .call w4(0x2519c400|(!{sz}<<22)|(pv<<5)|pd)
+}
+!svpnext("B", 0)
+!svpnext("H", 1)
+!svpnext("S", 2)
+!svpnext("D", 3)
+
+/* Break instructions */
+/* The flag-setting variants have no merging form. */
+!def svbrk(nm, b23, s, m) {
+!{nm} pd.B,pg/Z,pn.B :: .call w4(0x25104000|(!{b23}<<23)|(!{s}<<22)|(pg<<10)|(pn<<5)|pd)
+!if m !then {
+!{nm} pd.B,pg/M,pn.B :: .call w4(0x25104010|(!{b23}<<23)|(!{s}<<22)|(pg<<10)|(pn<<5)|pd)
+}
+}
+!svbrk("BRKA", 0, 0, 1)
+!svbrk("BRKAS", 0, 1, 0)
+!svbrk("BRKB", 1, 0, 1)
+!svbrk("BRKBS", 1, 1, 0)
+BRKN pd.B,pg/Z,pn.B,pd.B :: .call w4(0x25184000|(pg<<10)|(pn<<5)|pd)
+BRKNS pd.B,pg/Z,pn.B,pd.B :: .call w4(0x25584000|(pg<<10)|(pn<<5)|pd)
+!def svbrkp(nm, s, o2) {
+!{nm} pd.B,pg/Z,pn.B,pm.B :: .call w4(0x2500c000|(!{s}<<22)|(pm<<16)|(pg<<10)|(pn<<5)|(!{o2}<<4)|pd)
+}
+!svbrkp("BRKPA", 0, 0)
+!svbrkp("BRKPB", 0, 1)
+!svbrkp("BRKPAS", 1, 0)
+!svbrkp("BRKPBS", 1, 1)
+
+/* First-fault register */
+RDFFR pd.B :: .call w4(0x2519f000|pd)
+RDFFRS pd.B,pg/Z :: .call w4(0x2558f000|(pg<<5)|pd)
+RDFFR pd.B,pg/Z :: .call w4(0x2518f000|(pg<<5)|pd)
+SETFFR :: .call w4(0x252c9000)
+WRFFR pn.B :: .call w4(0x25289000|(pn<<5))
+
+/* Count the active elements of a predicate */
+!def svcntp(el, sz) {
+CNTP xd,pv,pn.!{el} :: .call w4(0x25208000|(!{sz}<<22)|(pv<<10)|(pn<<5)|xd)
+}
+!svcntp("B", 0)
+!svcntp("H", 1)
+!svcntp("S", 2)
+!svcntp("D", 3)
+
+/* WHILE: build a predicate from a pair of scalars.
+/*   00100101 size 1 Rm cc sf 1 Rn ne Pd */
+!def svwhile1(nm, cc, ne, el, sz) {
+!{nm} pd.!{el},wn,wm :: .call w4(0x25200000|(!{sz}<<22)|(wm<<16)|(!{cc}<<10)|(wn<<5)|(!{ne}<<4)|pd)
+!{nm} pd.!{el},xn,xm :: .call w4(0x25201000|(!{sz}<<22)|(xm<<16)|(!{cc}<<10)|(xn<<5)|(!{ne}<<4)|pd)
+}
+!def svwhile(nm, cc, ne) {
+!svwhile1(nm, cc, ne, "B", 0)
+!svwhile1(nm, cc, ne, "H", 1)
+!svwhile1(nm, cc, ne, "S", 2)
+!svwhile1(nm, cc, ne, "D", 3)
+}
+!svwhile("WHILEGE", 0, 0)
+!svwhile("WHILEGT", 0, 1)
+!svwhile("WHILELT", 1, 0)
+!svwhile("WHILELE", 1, 1)
+!svwhile("WHILEHS", 2, 0)
+!svwhile("WHILEHI", 2, 1)
+!svwhile("WHILELO", 3, 0)
+!svwhile("WHILELS", 3, 1)
