@@ -4090,3 +4090,351 @@ CNTP xd,pv,pn.!{el} :: .call w4(0x25208000|(!{sz}<<22)|(pv<<10)|(pn<<5)|xd)
 !svwhile("WHILEHI", 2, 1)
 !svwhile("WHILELO", 3, 0)
 !svwhile("WHILELS", 3, 1)
+
+/* Element count and increment.
+/*   00000100 size 1 b20 imm4 opc pattern Rd
+/* The pattern defaults to ALL and the multiplier to 1. */
+!def svcnt1(nm, opc, b20, sz, rd) {
+!{nm} !{rd} :: .call w4(0x04200000|(!{sz}<<22)|(!{b20}<<20)|(!{opc}<<10)|(31<<5)|!{rd})
+!{nm} !{rd},pat :: .call w4(0x04200000|(!{sz}<<22)|(!{b20}<<20)|(!{opc}<<10)|(pat<<5)|!{rd})
+!{nm} !{rd},pat,MUL #!c ::c<1;3,c>16;3 :: .call w4(0x04200000|(!{sz}<<22)|(!{b20}<<20)|((c-1)<<16)|(!{opc}<<10)|(pat<<5)|!{rd})
+}
+!def svcntsz(nm, opc, b20, rd) {
+!svcnt1(nm + "B", opc, b20, 0, rd)
+!svcnt1(nm + "H", opc, b20, 1, rd)
+!svcnt1(nm + "W", opc, b20, 2, rd)
+!svcnt1(nm + "D", opc, b20, 3, rd)
+}
+!svcntsz("CNT", 0x38, 0, "xd")
+!svcntsz("INC", 0x38, 1, "xd")
+!svcntsz("DEC", 0x39, 1, "xd")
+!svcntsz("SQINC", 0x3c, 1, "xd")
+!svcntsz("UQINC", 0x3d, 1, "xd")
+!svcntsz("SQDEC", 0x3e, 1, "xd")
+!svcntsz("UQDEC", 0x3f, 1, "xd")
+!svcntsz("UQINC", 0x3d, 0, "wd")
+!svcntsz("UQDEC", 0x3f, 0, "wd")
+/* The saturating increments that take a 32-bit source and a 64-bit
+/* destination name both registers. */
+!def svcnt2(nm, opc, sz) {
+!{nm} xd,wd :: .call w4(0x04200000|(!{sz}<<22)|(!{opc}<<10)|(31<<5)|xd)
+!{nm} xd,wd,pat :: .call w4(0x04200000|(!{sz}<<22)|(!{opc}<<10)|(pat<<5)|xd)
+!{nm} xd,wd,pat,MUL #!c ::c<1;3,c>16;3 :: .call w4(0x04200000|(!{sz}<<22)|((c-1)<<16)|(!{opc}<<10)|(pat<<5)|xd)
+}
+!def svcnt2sz(nm, opc) {
+!svcnt2(nm + "B", opc, 0)
+!svcnt2(nm + "H", opc, 1)
+!svcnt2(nm + "W", opc, 2)
+!svcnt2(nm + "D", opc, 3)
+}
+!svcnt2sz("SQINC", 0x3c)
+!svcnt2sz("SQDEC", 0x3e)
+/* The vector forms step every element; there is no byte version. */
+!def svcntv1(nm, opc, b20, el, sz) {
+!{nm} zd.!{el} :: .call w4(0x0420c000|(!{sz}<<22)|(!{b20}<<20)|(!{opc-0x30}<<10)|(31<<5)|zd)
+!{nm} zd.!{el},pat :: .call w4(0x0420c000|(!{sz}<<22)|(!{b20}<<20)|(!{opc-0x30}<<10)|(pat<<5)|zd)
+!{nm} zd.!{el},pat,MUL #!c ::c<1;3,c>16;3 :: .call w4(0x0420c000|(!{sz}<<22)|(!{b20}<<20)|((c-1)<<16)|(!{opc-0x30}<<10)|(pat<<5)|zd)
+}
+!def svcntv(nm, opc, b20) {
+!svcntv1(nm + "H", opc, b20, "H", 1)
+!svcntv1(nm + "W", opc, b20, "S", 2)
+!svcntv1(nm + "D", opc, b20, "D", 3)
+}
+!svcntv("INC", 0x30, 1)
+!svcntv("DEC", 0x31, 1)
+!svcntv("SQINC", 0x30, 0)
+!svcntv("UQINC", 0x31, 0)
+!svcntv("SQDEC", 0x32, 0)
+!svcntv("UQDEC", 0x33, 0)
+
+/* Step by the number of active predicate elements */
+!def svincp1(nm, opc, b10, el, sz, rd) {
+!{nm} !{rd},pn.!{el} :: .call w4(0x25008800|(!{sz}<<22)|(!{opc}<<16)|(!{b10}<<10)|(pn<<5)|!{rd})
+}
+!def svincp(nm, opc, b10, rd) {
+!svincp1(nm, opc, b10, "B", 0, rd)
+!svincp1(nm, opc, b10, "H", 1, rd)
+!svincp1(nm, opc, b10, "S", 2, rd)
+!svincp1(nm, opc, b10, "D", 3, rd)
+}
+!svincp("INCP", 0x2c, 0, "xd")
+!svincp("DECP", 0x2d, 0, "xd")
+!svincp("SQINCP", 0x28, 1, "xd")
+!svincp("UQINCP", 0x29, 1, "xd")
+!svincp("SQDECP", 0x2a, 1, "xd")
+!svincp("UQDECP", 0x2b, 1, "xd")
+!svincp("UQINCP", 0x29, 0, "wd")
+!svincp("UQDECP", 0x2b, 0, "wd")
+!def svincp2(nm, opc, el, sz) {
+!{nm} xd,pn.!{el},wd :: .call w4(0x25008800|(!{sz}<<22)|(!{opc}<<16)|(pn<<5)|xd)
+}
+!def svincp2a(nm, opc) {
+!svincp2(nm, opc, "B", 0)
+!svincp2(nm, opc, "H", 1)
+!svincp2(nm, opc, "S", 2)
+!svincp2(nm, opc, "D", 3)
+}
+!svincp2a("SQINCP", 0x28)
+!svincp2a("SQDECP", 0x2a)
+!def svincpv1(nm, opc, el, sz) {
+!{nm} zd.!{el},pn :: .call w4(0x25008000|(!{sz}<<22)|(!{opc}<<16)|(pn<<5)|zd)
+}
+!def svincpv(nm, opc) {
+!svincpv1(nm, opc, "H", 1)
+!svincpv1(nm, opc, "S", 2)
+!svincpv1(nm, opc, "D", 3)
+}
+!svincpv("INCP", 0x2c)
+!svincpv("DECP", 0x2d)
+!svincpv("SQINCP", 0x28)
+!svincpv("UQINCP", 0x29)
+!svincpv("SQDECP", 0x2a)
+!svincpv("UQDECP", 0x2b)
+
+/* INDEX: a vector counting from a start by a step */
+!def svindex(el, sz, rw, xr) {
+INDEX zd.!{el},#!a,#!b ::a<-16;3,a>15;3,b<-16;3,b>15;3 :: .call w4(0x04204000|(!{sz}<<22)|((b&0x1f)<<16)|((a&0x1f)<<5)|zd)
+INDEX zd.!{el},#!a,!{rw}m ::a<-16;3,a>15;3 :: .call w4(0x04204800|(!{sz}<<22)|(!{rw}m<<16)|((a&0x1f)<<5)|zd)
+INDEX zd.!{el},!{rw}n,#!b ::b<-16;3,b>15;3 :: .call w4(0x04204400|(!{sz}<<22)|((b&0x1f)<<16)|(!{rw}n<<5)|zd)
+INDEX zd.!{el},!{rw}n,!{rw}m :: .call w4(0x04204c00|(!{sz}<<22)|(!{rw}m<<16)|(!{rw}n<<5)|zd)
+}
+!svindex("B", 0, "w", 0)
+!svindex("H", 1, "w", 0)
+!svindex("S", 2, "w", 0)
+!svindex("D", 3, "x", 1)
+
+/* Vector length arithmetic */
+RDVL xd,#!v ::v<-32;3,v>31;3 :: .call w4(0x04bf5000|((v&0x3f)<<5)|xd)
+ADDVL xs,xe,#!v ::v<-32;3,v>31;3 :: .call w4(0x04205000|(xe<<16)|((v&0x3f)<<5)|xs)
+ADDPL xs,xe,#!v ::v<-32;3,v>31;3 :: .call w4(0x04605000|(xe<<16)|((v&0x3f)<<5)|xs)
+
+/* ADR: compute a vector of addresses */
+!def svadr(el, hi, ex) {
+ADR zd.!{el},[zn.!{el},zm.!{el}!{ex}] :: .call w4(0x0420a000|(!{hi}<<22)|(zm<<16)|(zn<<5)|zd)
+ADR zd.!{el},[zn.!{el},zm.!{el}!{ex},LSL #!s] ::s<0;3,s>3;3 :: .call w4(0x0420a000|(!{hi}<<22)|(zm<<16)|(s<<10)|(zn<<5)|zd)
+}
+!svadr("S", 2, "")
+!svadr("D", 3, "")
+ADR zd.D,[zn.D,zm.D,UXTW] :: .call w4(0x0460a000|(zm<<16)|(zn<<5)|zd)
+ADR zd.D,[zn.D,zm.D,UXTW #!s] ::s<0;3,s>3;3 :: .call w4(0x0460a000|(zm<<16)|(s<<10)|(zn<<5)|zd)
+ADR zd.D,[zn.D,zm.D,SXTW] :: .call w4(0x0420a000|(zm<<16)|(zn<<5)|zd)
+ADR zd.D,[zn.D,zm.D,SXTW #!s] ::s<0;3,s>3;3 :: .call w4(0x0420a000|(zm<<16)|(s<<10)|(zn<<5)|zd)
+
+/* Permute: broadcast, insert, reverse */
+/* The index field skips bit 21, so it splits into imm2 at 22 and tsz at 16. */
+!def svdupx(nm, el, sh, lo, mx) {
+!{nm} zd.!{el},zn.!{el}[!!i] ::i<0;3,i>!{mx};3 :: .call w4(0x05202000|(((((i<<!{sh})|!{lo}))&0x1f)<<16)|(((((i<<!{sh})|!{lo}))>>5)<<22)|(zn<<5)|zd)
+}
+!svdupx("DUP", "B", 1, 1, 63)
+!svdupx("DUP", "H", 2, 2, 31)
+!svdupx("DUP", "S", 3, 4, 15)
+!svdupx("DUP", "D", 4, 8, 7)
+!svdupx("DUP", "Q", 5, 16, 3)
+!svdupx("MOV", "B", 1, 1, 63)
+!svdupx("MOV", "H", 2, 2, 31)
+!svdupx("MOV", "S", 3, 4, 15)
+!svdupx("MOV", "D", 4, 8, 7)
+!svdupx("MOV", "Q", 5, 16, 3)
+!def svdupg(nm, el, sz, rn) {
+!{nm} zd.!{el},!{rn} :: .call w4(0x05203800|(!{sz}<<22)|(!{rn}<<5)|zd)
+}
+!svdupg("DUP", "B", 0, "wn")
+!svdupg("DUP", "H", 1, "wn")
+!svdupg("DUP", "S", 2, "wn")
+!svdupg("DUP", "D", 3, "xn")
+!svdupg("MOV", "B", 0, "wn")
+!svdupg("MOV", "H", 1, "wn")
+!svdupg("MOV", "S", 2, "wn")
+!svdupg("MOV", "D", 3, "xn")
+!def svinsr(el, sz, rn, vn) {
+INSR zd.!{el},!{rn} :: .call w4(0x05243800|(!{sz}<<22)|(!{rn}<<5)|zd)
+INSR zd.!{el},!{vn} :: .call w4(0x05343800|(!{sz}<<22)|(!{vn}<<5)|zd)
+}
+!svinsr("B", 0, "wn", "fbn")
+!svinsr("H", 1, "wn", "fhn")
+!svinsr("S", 2, "wn", "fsn")
+!svinsr("D", 3, "xn", "fdn")
+!def svrevz(el, sz) {
+REV zd.!{el},zn.!{el} :: .call w4(0x05383800|(!{sz}<<22)|(zn<<5)|zd)
+REV pd.!{el},pn.!{el} :: .call w4(0x05344000|(!{sz}<<22)|(pn<<5)|pd)
+}
+!svrevz("B", 0)
+!svrevz("H", 1)
+!svrevz("S", 2)
+!svrevz("D", 3)
+
+/* Table lookup, extract, splice, compact */
+!def svtbl(el, sz) {
+TBL zd.!{el},{zn.!{el}},zm.!{el} :: .call w4(0x05203000|(!{sz}<<22)|(zm<<16)|(zn<<5)|zd)
+}
+!svtbl("B", 0)
+!svtbl("H", 1)
+!svtbl("S", 2)
+!svtbl("D", 3)
+EXT zd.B,zd.B,zm.B,#!i ::i<0;3,i>255;3 :: .call w4(0x05200000|(((i>>3)&0xff)<<16)|((i&7)<<10)|(zm<<5)|zd)
+!def svsplice(el, sz) {
+SPLICE zd.!{el},pv,zd.!{el},zm.!{el} :: .call w4(0x052c8000|(!{sz}<<22)|(pv<<10)|(zm<<5)|zd)
+}
+!svsplice("B", 0)
+!svsplice("H", 1)
+!svsplice("S", 2)
+!svsplice("D", 3)
+COMPACT zd.S,pv,zn.S :: .call w4(0x05a18000|(pv<<10)|(zn<<5)|zd)
+COMPACT zd.D,pv,zn.D :: .call w4(0x05e18000|(pv<<10)|(zn<<5)|zd)
+
+/* Extract the last element, with and without wrapping */
+!def svlast(nm, b16, el, sz, rd, vd) {
+!{nm} !{rd},pv,zn.!{el} :: .call w4(0x0520a000|(!{sz}<<22)|(!{b16}<<16)|(pv<<10)|(zn<<5)|!{rd})
+!{nm} !{vd},pv,zn.!{el} :: .call w4(0x05228000|(!{sz}<<22)|(!{b16}<<16)|(pv<<10)|(zn<<5)|!{vd})
+}
+!svlast("LASTA", 0, "B", 0, "wd", "fbd")
+!svlast("LASTA", 0, "H", 1, "wd", "fhd")
+!svlast("LASTA", 0, "S", 2, "wd", "fsd")
+!svlast("LASTA", 0, "D", 3, "xd", "fdd")
+!svlast("LASTB", 1, "B", 0, "wd", "fbd")
+!svlast("LASTB", 1, "H", 1, "wd", "fhd")
+!svlast("LASTB", 1, "S", 2, "wd", "fsd")
+!svlast("LASTB", 1, "D", 3, "xd", "fdd")
+!def svclast(nm, b16, el, sz, rd, vd) {
+!{nm} zd.!{el},pv,zd.!{el},zm.!{el} :: .call w4(0x05288000|(!{sz}<<22)|(!{b16}<<16)|(pv<<10)|(zm<<5)|zd)
+!{nm} !{rd},pv,!{rd},zn.!{el} :: .call w4(0x0530a000|(!{sz}<<22)|(!{b16}<<16)|(pv<<10)|(zn<<5)|!{rd})
+!{nm} !{vd},pv,!{vd},zn.!{el} :: .call w4(0x052a8000|(!{sz}<<22)|(!{b16}<<16)|(pv<<10)|(zn<<5)|!{vd})
+}
+!svclast("CLASTA", 0, "B", 0, "wd", "fbd")
+!svclast("CLASTA", 0, "H", 1, "wd", "fhd")
+!svclast("CLASTA", 0, "S", 2, "wd", "fsd")
+!svclast("CLASTA", 0, "D", 3, "xd", "fdd")
+!svclast("CLASTB", 1, "B", 0, "wd", "fbd")
+!svclast("CLASTB", 1, "H", 1, "wd", "fhd")
+!svclast("CLASTB", 1, "S", 2, "wd", "fsd")
+!svclast("CLASTB", 1, "D", 3, "xd", "fdd")
+
+/* Interleave and deinterleave, for vectors and for predicates */
+!def svperm(nm, off, el, sz) {
+!{nm} zd.!{el},zn.!{el},zm.!{el} :: .call w4(0x05206000|(!{off}<<10)|(!{sz}<<22)|(zm<<16)|(zn<<5)|zd)
+!{nm} pd.!{el},pn.!{el},pm.!{el} :: .call w4(0x05204000|(!{off}<<10)|(!{sz}<<22)|(pm<<16)|(pn<<5)|pd)
+}
+!def svpermall(nm, off) {
+!svperm(nm, off, "B", 0)
+!svperm(nm, off, "H", 1)
+!svperm(nm, off, "S", 2)
+!svperm(nm, off, "D", 3)
+}
+!svpermall("ZIP1", 0)
+!svpermall("ZIP2", 1)
+!svpermall("UZP1", 2)
+!svpermall("UZP2", 3)
+!svpermall("TRN1", 4)
+!svpermall("TRN2", 5)
+
+/* Unpack the low or high half into wider elements */
+!def svunpk(nm, opc, el, sel, sz) {
+!{nm} zd.!{el},zn.!{sel} :: .call w4(0x05303800|(!{sz}<<22)|(!{opc}<<16)|(zn<<5)|zd)
+}
+!def svunpkall(nm, opc) {
+!svunpk(nm, opc, "H", "B", 1)
+!svunpk(nm, opc, "S", "H", 2)
+!svunpk(nm, opc, "D", "S", 3)
+}
+!svunpkall("SUNPKLO", 0)
+!svunpkall("SUNPKHI", 1)
+!svunpkall("UUNPKLO", 2)
+!svunpkall("UUNPKHI", 3)
+PUNPKLO pd.H,pn.B :: .call w4(0x05304000|(pn<<5)|pd)
+PUNPKHI pd.H,pn.B :: .call w4(0x05314000|(pn<<5)|pd)
+
+/* Select, copy and move-prefix */
+!def svsel(el, sz) {
+SEL zd.!{el},pv,zn.!{el},zm.!{el} :: .call w4(0x0520c000|(!{sz}<<22)|(zm<<16)|(pv<<10)|(zn<<5)|zd)
+MOV zd.!{el},pv/M,zn.!{el} :: .call w4(0x0520c000|(!{sz}<<22)|(zd<<16)|(pv<<10)|(zn<<5)|zd)
+}
+!svsel("B", 0)
+!svsel("H", 1)
+!svsel("S", 2)
+!svsel("D", 3)
+!def svcpy(el, sz, rn, vn) {
+CPY zd.!{el},pg/M,!{rn} :: .call w4(0x0528a000|(!{sz}<<22)|(pg<<10)|(!{rn}<<5)|zd)
+MOV zd.!{el},pg/M,!{rn} :: .call w4(0x0528a000|(!{sz}<<22)|(pg<<10)|(!{rn}<<5)|zd)
+CPY zd.!{el},pg/M,!{vn} :: .call w4(0x05208000|(!{sz}<<22)|(pg<<10)|(!{vn}<<5)|zd)
+MOV zd.!{el},pg/M,!{vn} :: .call w4(0x05208000|(!{sz}<<22)|(pg<<10)|(!{vn}<<5)|zd)
+CPY zd.!{el},pv/Z,#!v ::v<-128;3,v>127;3 :: .call w4(0x05100000|(!{sz}<<22)|(pv<<16)|((v&0xff)<<5)|zd)
+CPY zd.!{el},pv/M,#!v ::v<-128;3,v>127;3 :: .call w4(0x05104000|(!{sz}<<22)|(pv<<16)|((v&0xff)<<5)|zd)
+MOV zd.!{el},pv/Z,#!v ::v<-128;3,v>127;3 :: .call w4(0x05100000|(!{sz}<<22)|(pv<<16)|((v&0xff)<<5)|zd)
+MOV zd.!{el},pv/M,#!v ::v<-128;3,v>127;3 :: .call w4(0x05104000|(!{sz}<<22)|(pv<<16)|((v&0xff)<<5)|zd)
+}
+!svcpy("B", 0, "wn", "fbn")
+!svcpy("H", 1, "wn", "fhn")
+!svcpy("S", 2, "wn", "fsn")
+!svcpy("D", 3, "xn", "fdn")
+!def svcpysh(el, sz) {
+CPY zd.!{el},pv/Z,#!v,LSL #!h ::v<-128;3,v>127;3,h!=8;10 :: .call w4(0x05102000|(!{sz}<<22)|(pv<<16)|((v&0xff)<<5)|zd)
+CPY zd.!{el},pv/M,#!v,LSL #!h ::v<-128;3,v>127;3,h!=8;10 :: .call w4(0x05106000|(!{sz}<<22)|(pv<<16)|((v&0xff)<<5)|zd)
+MOV zd.!{el},pv/Z,#!v,LSL #!h ::v<-128;3,v>127;3,h!=8;10 :: .call w4(0x05102000|(!{sz}<<22)|(pv<<16)|((v&0xff)<<5)|zd)
+MOV zd.!{el},pv/M,#!v,LSL #!h ::v<-128;3,v>127;3,h!=8;10 :: .call w4(0x05106000|(!{sz}<<22)|(pv<<16)|((v&0xff)<<5)|zd)
+}
+!svcpysh("H", 1)
+!svcpysh("S", 2)
+!svcpysh("D", 3)
+MOVPRFX zd,zn :: .call w4(0x0420bc00|(zn<<5)|zd)
+!def svmovprfx(el, sz) {
+MOVPRFX zd.!{el},pg/M,zn.!{el} :: .call w4(0x04112000|(!{sz}<<22)|(pg<<10)|(zn<<5)|zd)
+MOVPRFX zd.!{el},pg/Z,zn.!{el} :: .call w4(0x04102000|(!{sz}<<22)|(pg<<10)|(zn<<5)|zd)
+}
+!svmovprfx("B", 0)
+!svmovprfx("H", 1)
+!svmovprfx("S", 2)
+!svmovprfx("D", 3)
+
+/* DUPM broadcasts a bitmask immediate, using the same encoder the
+/* base ISA's logical immediates use. */
+.func::bitmask13::v,maxw
+m = (1 << maxw) - 1
+v = v & m
+e = .call find_e(v, maxw)
+.if .call isrun(v, e) == 0 .then
+.raise 7
+.return 0
+.endif
+rs = .call pack_rs(v, e)
+r = rs[0]
+s = rs[1]
+nbit = ((s >> 6) & 1) ^ 1
+.return (nbit << 12) | (r << 6) | (s & 0x3f)
+.endfunc
+.func::svdupm::v,maxw,rd
+i13 = .call bitmask13(v, maxw)
+.return .call w4(0x05c00000 | (i13 << 5) | rd)
+.endfunc
+DUPM zd.B,#!v :: .call svdupm(v,8,zd)
+DUPM zd.H,#!v :: .call svdupm(v,16,zd)
+DUPM zd.S,#!v :: .call svdupm(v,32,zd)
+DUPM zd.D,#!v :: .call svdupm(v,64,zd)
+
+/* Reductions to a scalar */
+!def svred(nm, opc, el, sz, vd) {
+!{nm} !{vd},pv,zn.!{el} :: .call w4(0x04002000|(!{sz}<<22)|(!{opc}<<16)|(pv<<10)|(zn<<5)|!{vd})
+}
+!def svredv(nm, opc) {
+!svred(nm, opc, "B", 0, "fbd")
+!svred(nm, opc, "H", 1, "fhd")
+!svred(nm, opc, "S", 2, "fsd")
+!svred(nm, opc, "D", 3, "fdd")
+}
+!svredv("SMAXV", 0x08)
+!svredv("UMAXV", 0x09)
+!svredv("SMINV", 0x0a)
+!svredv("UMINV", 0x0b)
+!svredv("ORV", 0x18)
+!svredv("EORV", 0x19)
+!svredv("ANDV", 0x1a)
+/* The widening sum always lands in a D register */
+!def svaddv(nm, opc, el, sz) {
+!{nm} fdd,pv,zn.!{el} :: .call w4(0x04002000|(!{sz}<<22)|(!{opc}<<16)|(pv<<10)|(zn<<5)|fdd)
+}
+!def svaddvall(nm, opc) {
+!svaddv(nm, opc, "B", 0)
+!svaddv(nm, opc, "H", 1)
+!svaddv(nm, opc, "S", 2)
+}
+!svaddvall("SADDV", 0x00)
+!svaddvall("UADDV", 0x01)
