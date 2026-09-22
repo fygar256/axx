@@ -922,6 +922,8 @@ class AssemblerState:
         # ADR_PREL_PG_HI21、add が ADD_ABS_LO12_NC で参照する）ため、シンボル側
         # ではなくパターン側の、この変数単位でしか表せない。
         self.reloc_constraints: dict = {}
+        # 未知の型名を報告済みかどうか。(型名, マシン) の集合。
+        self._reloc_badname_seen: set = set()
 
         # .enum で登録された列挙。変数1文字 -> (要素名のタプル, 式の文字列)。
         # `!Ex` の照合と値の算出に使う。
@@ -3701,12 +3703,23 @@ class DirectiveProcessor:
         if not tname:
             self.state.diag(" error - .reloc: relocation type is not specified.", set_error=True)
             return True
+        # リロケーションは `-o` の ELF 出力にしか現れない。`-b` などでは宣言は
+        # 無意味なので、型名を照合せずに受け流す。パターンファイルは複数の `-m`
+        # で使い回せるべきで、対象外のときに落ちてはいけない。
+        if not self.state.elf_objfile:
+            return True
         mach = ELF_MACHINES.get(self.state.elf_machine)
         rtype = mach['named'].get(tname.lower()) if mach else None
         if rtype is None:
             _mname = mach['name'] if mach else self.state.elf_machine
-            self.state.diag(
-                f" error - .reloc: unknown relocation type '{tname}' for {_mname}.", set_error=True)
+            # パターン行は1ソース行ごとに読み直されるので、同じ名前で何度も
+            # 出さないよう一度だけ報告する。
+            _key = (tname.lower(), self.state.elf_machine)
+            if _key not in self.state._reloc_badname_seen:
+                self.state._reloc_badname_seen.add(_key)
+                self.state.diag(
+                    f" error - .reloc: unknown relocation type '{tname}' for {_mname}.",
+                    set_error=True)
             return True
         self.state.reloc_constraints[var] = rtype
         return True
@@ -6695,11 +6708,22 @@ class ObjectGenerator:
 
                 if StringUtils.upper(s[idx:idx + 5]) == '.CALL' and (
                         idx + 5 >= len(s) or s[idx + 5] not in _SYM_CORE):
+                    # 引数はふつうのパターン式なので、ここでも何ワード目かを
+                    # 立てておく。そうしないと `.call` に渡したラベル参照が
+                    # 追跡されず、`.reloc` を宣言してもリロケーションが出ない。
+                    self.state._elf_current_word_idx = len(objl)
                     words, idx = self.mini_call(s, idx)
                     # `;` 付きは、出したワードが 1 個で 0 のときだけ何も出さない。
                     if drop or (semicolon and len(words) == 1 and words[0] == 0):
                         words = []
+                    if not words:
+                        _wi = self.state._elf_current_word_idx
+                        self.state._elf_label_refs_seen = [
+                            e for e in self.state._elf_label_refs_seen if e[2] != _wi
+                        ]
+                        self.state._elf_insn_reloc_hint.pop(_wi, None)
                     objl += words
+                    self.state._elf_current_word_idx = -1
                     if idx < len(s) and s[idx] == ',':
                         idx += 1
                         continue

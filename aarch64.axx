@@ -491,8 +491,11 @@ i8 = .call fpimm8(v)
 /* =================================================================== */
 
 /* PC-relative addressing */
+.reloc::t::adr_prel_lo21
 ADR xd,!t ::((t-$$)<-1048576)||((t-$$)>1048575);2 :: .call w4((((t-$$)&3)<<29)|(0x10<<24)|((((t-$$)>>2)&0x7ffff)<<5)|xd)
+.reloc::t::adr_prel_pg_hi21
 ADRP xd,!t :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
+.clrreloc::t
 
 /* Add/subtract (immediate). sh selects the LSL #12 form. */
 !def asi(nm, op, s, rd, rn, sf) {
@@ -876,15 +879,22 @@ CMP WSP,wm[[,LSL #!a]] ::a<0;10,a>4;10 :: .call w4((1<<30)|(1<<29)|(0x0b<<24)|(1
 /* =================================================================== */
 
 /* Unconditional branch (immediate) */
+.reloc::t::jump26
 B !t ::((t-$$)<-134217728)||((t-$$)>134217724);2 :: .call w4(0x14000000|(((t-$$)>>2)&0x3ffffff))
+.reloc::t::call26
 BL !t ::((t-$$)<-134217728)||((t-$$)>134217724);2 :: .call w4(0x94000000|(((t-$$)>>2)&0x3ffffff))
+.clrreloc::t
 
 /* Conditional branch */
+.reloc::t::condbr19
 B.cnd !t ::((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4(0x54000000|((((t-$$)>>2)&0x7ffff)<<5)|cnd)
+.clrreloc::t
 
 /* Compare and branch */
 !def cb(nm, op, rt, sf) {
+.reloc::t::condbr19
 !{nm} !{rt},!t ::((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4((!{sf}<<31)|(0x1a<<25)|(!{op}<<24)|((((t-$$)>>2)&0x7ffff)<<5)|!{rt})
+.clrreloc::t
 }
 !cb("CBZ", 0, "xt", 1)
 !cb("CBZ", 0, "wt", 0)
@@ -893,7 +903,9 @@ B.cnd !t ::((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4(0x54000000|((((t-$$
 
 /* Test bit and branch */
 !def tb(nm, op, rt, mx) {
+.reloc::t::tstbr14
 !{nm} !{rt},#!b,!t ::b<0;3,b>!{mx};3,((t-$$)<-32768)||((t-$$)>32764);2 :: .call w4(((b>>5)<<31)|(0x1b<<25)|(!{op}<<24)|((b&31)<<19)|((((t-$$)>>2)&0x3fff)<<5)|!{rt})
+.clrreloc::t
 }
 !tb("TBZ", 0, "xt", 63)
 !tb("TBZ", 0, "wt", 31)
@@ -3439,8 +3451,10 @@ CPP RCTX,xt :: .call w4(0xd50b73e0|xt)
 /* ADD (immediate). Only ADD takes :lo12:, because the relocation it
 /* stands for (ADD_ABS_LO12_NC) is defined for ADD alone. */
 !def addlo12(rd, rn, sf) {
+.reloc::t::add_abs_lo12_nc
 ADD !{rd},!{rn},:LO12:!t :: .call w4((!{sf}<<31)|(0x11<<24)|((t&0xfff)<<10)|(!{rn}<<5)|!{rd})
 ADD !{rd},!{rn},#:LO12:!t :: .call w4((!{sf}<<31)|(0x11<<24)|((t&0xfff)<<10)|(!{rn}<<5)|!{rd})
+.clrreloc::t
 }
 !addlo12("xs", "xe", 1)
 !addlo12("ws", "we", 0)
@@ -3448,8 +3462,24 @@ ADD !{rd},!{rn},#:LO12:!t :: .call w4((!{sf}<<31)|(0x11<<24)|((t&0xfff)<<10)|(!{
 /* Loads and stores. The low 12 bits are scaled by the access size,
 /* which is also what makes the alignment check below meaningful. */
 !def lslo12(mn, rt, size, v, opc, scale) {
+/* lo12 の縮尺がそのままリロケーション型を決める。 */
+!local rl = "ldst8_abs_lo12_nc"
+!if scale == 1 !then {
+!set rl = "ldst16_abs_lo12_nc"
+}
+!if scale == 2 !then {
+!set rl = "ldst32_abs_lo12_nc"
+}
+!if scale == 3 !then {
+!set rl = "ldst64_abs_lo12_nc"
+}
+!if scale == 4 !then {
+!set rl = "ldst128_abs_lo12_nc"
+}
+.reloc::t::!{rl}
 !{mn} !{rt},[xb,:LO12:!t] ::(t&!{(1<<scale)-1})!=0;8 :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(1<<24)|(!{opc}<<22)|(((t&0xfff)>>!{scale})<<10)|(xb<<5)|!{rt})
 !{mn} !{rt},[xb,#:LO12:!t] ::(t&!{(1<<scale)-1})!=0;8 :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(1<<24)|(!{opc}<<22)|(((t&0xfff)>>!{scale})<<10)|(xb<<5)|!{rt})
+.clrreloc::t
 }
 !lslo12("STRB", "wt", 0, 0, 0, 0)
 !lslo12("LDRB", "wt", 0, 0, 1, 0)
@@ -3481,7 +3511,9 @@ PRFM #!p,[xb,#:LO12:!t] ::p<0;3,p>31;3,(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1
 /* ADRP. :pg_hi21: is the explicit spelling of what a bare symbol
 /* already means there, so it encodes identically to the plain row
 /* further up. GNU as takes this spelling; llvm-mc does not. */
+.reloc::t::adr_prel_pg_hi21
 ADRP xd,:PG_HI21:!t :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
+.clrreloc::t
 
 /* Move wide. The modifier names which 16-bit slice of the symbol the
 /* field holds, and that also fixes hw. The checked forms report an

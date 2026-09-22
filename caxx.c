@@ -1344,6 +1344,8 @@ typedef struct {
      * 決まる（AArch64 では同じシンボルを adrp と add が別の型で参照する）ため、
      * シンボル側ではなくパターン側の、この変数単位でしか表せない。 */
     int        reloc_constraints[NVARS];
+    char      *reloc_badname[32];   /* 未知型名の報告済み一覧 */
+    int        reloc_badname_len;
 
     /* .enum で登録された、変数 a〜z の列挙（`!E<変数>` が使う） */
     EnumDef    enum_defs[NVARS];
@@ -1904,6 +1906,7 @@ static void state_init(AsmState *st) {
     for(int _rti=0; _rti<4; _rti++) st->reloctype_override[_rti] = -1;
     for(int _ci=0; _ci<NVARS; _ci++) sv_init(&st->check_constraints[_ci]);
     for(int _ci=0; _ci<NVARS; _ci++) st->reloc_constraints[_ci] = 0;
+    st->reloc_badname_len = 0;
     for(int _ci=0; _ci<NVARS; _ci++) enumdef_init(&st->enum_defs[_ci]);
     st->enum_bind_names = NULL;
     st->enum_bind_vals  = NULL;
@@ -4854,6 +4857,16 @@ static int dir_check(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* 未知の型名を報告済みか。報告済みなら 1。パターン行は1ソース行ごとに
+ * 読み直されるため、これが無いと同じ診断が何度も出る。 */
+static int reloc_badname_seen(AsmState *st, const char *name){
+    for(int i = 0; i < st->reloc_badname_len; i++)
+        if(strcmp(st->reloc_badname[i], name) == 0) return 1;
+    if(st->reloc_badname_len < (int)(sizeof(st->reloc_badname)/sizeof(st->reloc_badname[0])))
+        st->reloc_badname[st->reloc_badname_len++] = strdup(name);
+    return 0;
+}
+
 /* `.reloc::<変数>::<型名>`
  *
  * その変数が捕らえたラベル参照を、指定の ELF リロケーション型で書き出す。
@@ -4886,11 +4899,18 @@ static int dir_reloc(Assembler *asmb, PatEntry *e){
         axx_diagf(1, 0, " error - .reloc: relocation type is not specified.\n");
         return 1;
     }
+    /* リロケーションは `-o` の ELF 出力にしか現れない。`-b` などでは宣言は
+     * 無意味なので、型名を照合せずに受け流す。パターンファイルは複数の `-m`
+     * で使い回せるべきで、対象外のときに落ちてはいけない。 */
+    if(!asmb->st.elf_objfile[0]) return 1;
     const ElfMachineInfo *m = elf_machine_find(asmb->st.elf_machine);
     int rtype = elf_machine_named(m, tname);
     if(rtype < 0){
-        axx_diagf(1, 0, " error - .reloc: unknown relocation type '%s' for %s.\n",
-                   tname, m ? m->name : "?");
+        /* パターン行は1ソース行ごとに読み直されるので、同じ名前で何度も
+         * 出さないよう一度だけ報告する。 */
+        if(!reloc_badname_seen(&asmb->st, tname))
+            axx_diagf(1, 0, " error - .reloc: unknown relocation type '%s' for %s.\n",
+                       tname, m ? m->name : "?");
         return 1;
     }
     asmb->st.reloc_constraints[idx] = rtype;
@@ -9404,10 +9424,26 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
            && axx_upper_char(s[idx+3])=='L' && axx_upper_char(s[idx+4])=='L'
            && !(isalnum((unsigned char)s[idx+5]) || s[idx+5]=='_')){
             IntVec callw; iv_init(&callw);
+            /* 引数はふつうのパターン式なので、ここでも何ワード目かを立てておく。
+             * そうしないと `.call` に渡したラベル参照が追跡されず、`.reloc` を
+             * 宣言してもリロケーションが出ない。 */
+            int _call_widx = objl->len;
+            st->elf_current_word_idx = _call_widx;
             idx = mini_call_binary(asmb, s, idx, &callw);
             /* `;` 付きは、出したワードが 1 個で 0 のときだけ何も出さない。 */
-            if(!(drop || (semicolon && callw.len == 1 && u256_is_zero(callw.data[0]))))
+            if(!(drop || (semicolon && callw.len == 1 && u256_is_zero(callw.data[0])))){
                 for(int q = 0; q < callw.len; q++) iv_push(objl, callw.data[q]);
+            } else {
+                int _wi3 = 0;
+                for(int _ri3 = 0; _ri3 < st->elf_refs_len; _ri3++){
+                    if(st->elf_refs[_ri3].word_idx != _call_widx)
+                        st->elf_refs[_wi3++] = st->elf_refs[_ri3];
+                    else
+                        free(st->elf_refs[_ri3].name);
+                }
+                st->elf_refs_len = _wi3;
+            }
+            st->elf_current_word_idx = -1;
             iv_free(&callw);
             if(s[idx]==','){ idx++; continue; }
             break;
