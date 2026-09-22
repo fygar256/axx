@@ -1,1 +1,0 @@
-ld.lld -m aarch64linux -o bf_aarch64 aarch64.o
