@@ -9523,9 +9523,14 @@ class Assembler:
                     if first_widx >= len(objl):
                         continue
                     if rtype == 0:
-                        self.state.diag(
-                            f" warning - no relocation type available for a {num_bytes}-byte "
-                            f"reference to '{lname}'; relocation omitted.", set_error=False)
+                        # この幅のリロケーション型を持たない ISA では、アセンブラが
+                        # 自分で解決し終えた参照（分岐や adrp/:lo12: 等）が必ずここに
+                        # 落ちる。出力は正しいのに毎回警告が出て本物の診断を埋めて
+                        # しまうため、詳細は -d 指定時だけ出す。
+                        if self.state.debug:
+                            self.state.diag(
+                                f" warning - no relocation type available for a {num_bytes}-byte "
+                                f"reference to '{lname}'; relocation omitted.", set_error=False)
                         continue
 
                     sec_rel = (_completed_words + (self.state.pc + first_widx - _entry_pc_cur)) * bpw_r

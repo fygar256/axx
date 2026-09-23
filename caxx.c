@@ -11187,10 +11187,12 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         _rtype_is_default_guess = 1;
                     }
                 }
-                /* 破綻点修正: リロケーション型が決まらないとき、axx.py は
-                 * 「型が無いので省いた」と警告してから捨てるが、こちらは黙って
-                 * 捨てていた。同じ入力で同じ診断が出るよう揃える。 */
-                if(_rtype == 0 && _widx < objl.len)
+                /* リロケーション型が決まらないとき、axx.py は「型が無いので省いた」
+                 * と警告してから捨てる。ただしこの幅の型を持たない ISA では、
+                 * アセンブラが自分で解決し終えた参照（分岐や adrp/:lo12: 等）が
+                 * 必ずここに落ちる。出力は正しいのに毎回警告が出て本物の診断を
+                 * 埋めてしまうため、両者そろえて詳細は -d 指定時だけ出す。 */
+                if(_rtype == 0 && _widx < objl.len && st->debug)
                     axx_diagf(0, 0, " warning - no relocation type available for a %d-byte "
                                "reference to '%s'; relocation omitted.\n", _nbytes, _lname);
                 if(_rtype != 0 && _widx < objl.len){
