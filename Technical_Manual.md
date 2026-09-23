@@ -1113,6 +1113,115 @@ BEFORE     :: :: #N1        /* 0x07 */
 AFTER      :: :: #N1        /* error - undefined symbol: '#N1' */
 ```
 
+#### 3.7.5 `.reloc` — declaring a relocation type
+
+```
+.reloc::<variable>::<type name>
+```
+
+Writes the label reference that variable captured into the `-o` output as the
+named ELF relocation. Like `.check` it is positional: a later `.reloc` replaces
+an earlier one, `.clrreloc::x` takes it back (with no argument, all of them),
+and `.free` clears it too.
+
+The type name comes from the name table of the machine selected with `-m` — the
+same table the source-side `::pc32` spelling uses (section 8.3).
+
+The declaration only has an effect when `-o` was given. Without it the rows
+below it behave exactly as if it were not there, which is what lets one set of
+rows serve both outputs: a relocation for the linker under `-o`, an address axx
+worked out itself under `-b`.
+
+**Why it is needed.** Normally the type and the addend are inferred from the
+emitted bytes: the value sits there as a plain integer across consecutive
+bytes, so "emitted value minus label value" is the addend. But an AArch64
+branch or address-generation instruction packs its value into scattered bit
+fields of a 32-bit instruction word, scaled to words or to pages. The addend
+cannot be read back out of that, and a guess made from width alone gives `bl` a
+`PREL32` — which links without complaint and then branches four times too far.
+
+`.reloc` states the type per instruction. The addend becomes the difference
+between the operand value the pattern captured and the label value, so `bl
+func` gives 0 and `bl func+8` gives 8. The instruction's own bit field is
+emitted as 0 (RELA, so the linker fills it in — the same shape GNU as
+produces).
+
+```
+.reloc::t::call26
+BL !t :: :: @@[4,(0x94000000|(((t-$$)>>2)&0x3ffffff))>>(%%*8)]
+.clrreloc::t
+```
+
+```
+bl func      ->  R_AARCH64_CALL26  func + 0
+bl func+8    ->  R_AARCH64_CALL26  func + 8
+```
+
+**Why it cannot be stated on the symbol.** The type follows the operand
+position, not the symbol. The `adrp` / `add` pair that builds one address on
+AArch64 refers to the same symbol under two different types,
+`ADR_PREL_PG_HI21` and `ADD_ABS_LO12_NC`. A per-symbol spelling such as
+`.extern name::type` cannot express that at all.
+
+```
+.reloc::p::adrp
+ADRP X!d,!p :: :: ...
+.clrreloc::p
+.reloc::o::add_abs_lo12_nc
+ADD X!d,X!n,#!o :: :: ...
+.clrreloc::o
+```
+
+```
+adrp x0,msg      ->  R_AARCH64_ADR_PREL_PG_HI21  msg + 0
+add  x0,x0,#msg  ->  R_AARCH64_ADD_ABS_LO12_NC   msg + 0
+```
+
+Because `t` is the operand variable of nearly every row in a large pattern
+file, the `.clrreloc` matters as much as the `.reloc`: without it the
+declaration stays in force for every row the pattern scan walks past
+afterwards. `aarch64.axx` is the worked example — its Relocation modifiers
+section declares a type for each of `:lo12:`, `:pg_hi21:`, `:abs_g*:`,
+`:prel_g*:`, `:got:` and `:got_lo12:`, and takes it back immediately after the
+rows it belongs to.
+
+One caveat when both outputs are asked for in the same run. The fields left at
+0 are left at 0 in the raw binary too, so a `-b` image written alongside a `-o`
+object is only correct once that object has been linked. axx says so rather
+than letting it pass:
+
+```
+ warning - 16 instruction field(s) were left 0 for the linker (.text+0x0, ...);
+ this raw binary is only correct after linking a.o. Drop -o to have axx fill
+ them in.
+```
+
+These are the instruction-field types available for AArch64. The data types
+(`abs64` `abs32` `abs16` `pc64` `pc32` `pc16`) are still inferred without a
+`.reloc`.
+
+| Type name | ELF | Field |
+|---|---|---|
+| `call26` / `jump26` | 283 / 282 | imm26 of `bl` / `b` |
+| `condbr19` | 280 | imm19 of `b.cond`, `cbz` |
+| `tstbr14` | 279 | imm14 of `tbz` / `tbnz` |
+| `adr_prel_lo21` | 274 | immlo/immhi of `adr` |
+| `adr_prel_pg_hi21` (`adrp`) | 275 | immlo/immhi of `adrp` |
+| `adr_prel_pg_hi21_nc` | 276 | the same, without the overflow check |
+| `add_abs_lo12_nc` | 277 | imm12 of `add` |
+| `ldst8_abs_lo12_nc` | 278 | imm12 of a load or store |
+| `ldst16` / `ldst32` / `ldst64` / `ldst128_abs_lo12_nc` | 284 / 285 / 286 / 299 | the same, scaled per access width |
+| `movw_uabs_g0` ... `g3` (`_nc` forms too) | 263-269 | imm16 of `movz` / `movk` |
+| `movw_prel_g0` ... `g3` (`_nc` forms too) | 287-293 | the same, PC-relative |
+| `got_page` (`adr_got_page`) | 311 | immlo/immhi of `adrp` — the GOT page |
+| `got_lo12` (`ld64_got_lo12_nc`) | 312 | imm12 of a 64-bit `ldr` — offset within the GOT |
+| `got_ld_prel19` | 309 | imm19 of a literal `ldr` |
+| `ld64_gotpage_lo15` | 313 | imm12 |
+
+The two GOT types differ in kind from the rest. Their value is the address of a
+GOT entry the linker builds, so it is not knowable at assembly time: the field
+goes out as 0 and the relocation carries the whole meaning.
+
 ### 3.8 Optional parts (`[[ ]]`)
 
 Double brackets mark an optional section of an instruction:
@@ -2275,6 +2384,10 @@ The names accepted after `::` are the short names in the `named` table of the
 selected machine in `ELF_MACHINES`. For x86-64: `abs64`, `abs32`, `abs32s`,
 `abs16`, `abs8`, `pc32`, `rel32`, `plt32`, `pc16`, `pc8`, `pc64`, `got32`,
 `gotpcrel`, `got64`. An unrecognized name produces a warning and is ignored.
+
+The pattern file's `.reloc` (section 3.7.5) takes the same names. An
+instruction-field type such as AArch64's `call26` only means anything there,
+because a per-symbol spelling cannot say which operand position it applies to.
 
 Section records are optional. If you only need label values:
 
