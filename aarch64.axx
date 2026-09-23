@@ -6996,3 +6996,364 @@ UVDOT ZA.D[wv,!!o,VGX2],{zd.H,za.H},zx.H[!!i] ::o>7;3,i>1;3,(zd&3)!=0;5,za!=zd+3
 UVDOT ZA.D[wv,!!o,VGX2],{zd.H-za.H},zx.H[!!i] ::o>7;3,i>1;3,(zd&3)!=0;5,za!=zd+3;5 :: .call w4(0xc1d00818|(i<<10)|(1<<15)|(zx<<16)|((wv-8)<<13)|(zd<<5)|o)
 UVDOT ZA.D[wv,!!o,VGX4],{zd.H,za.H},zx.H[!!i] ::o>7;3,i>1;3,(zd&3)!=0;5,za!=zd+3;5 :: .call w4(0xc1d00818|(i<<10)|(1<<15)|(zx<<16)|((wv-8)<<13)|(zd<<5)|o)
 UVDOT ZA.D[wv,!!o,VGX4],{zd.H-za.H},zx.H[!!i] ::o>7;3,i>1;3,(zd&3)!=0;5,za!=zd+3;5 :: .call w4(0xc1d00818|(i<<10)|(1<<15)|(zx<<16)|((wv-8)<<13)|(zd<<5)|o)
+
+/* -------------------------------------------------------------------
+/* SME2: moving between the ZA array and a list, and the multi-vector
+/* loads and stores.
+/*
+/* A list written with commas may be consecutive or strided -- {z0.b,
+/* z8.b} is a strided pair and {z0.b, z4.b, z8.b, z12.b} a strided
+/* quad -- so the emitters read the register numbers and pick the
+/* form.  A list written with a dash is always consecutive.
+/* ------------------------------------------------------------------- */
+
+/* MOVA between a tile slice range and a list.  The tile number and
+/* the first slice share one field, and the slice index is divided by
+/* the list length. */
+.func::movam::base,t,i,wv,zn,a,b,nb
+g = .call n2q(a, b)
+k = 1
+.if g == 1 .then
+k = 2
+.endif
+.if (i & (k + k - 1)) != 0 .then
+.raise 3
+.endif
+sh = nb - k
+.if sh < 0 .then
+sh = 0
+.endif
+f = (t << sh) | (i >> k)
+.return .call w4(base | (g << 10) | ((wv - 12) << 13) | (f << 5) | zn)
+.endfunc
+.func::movamt::base,t,i,wv,zn,a,b,nb
+g = .call n2q(a, b)
+k = 1
+.if g == 1 .then
+k = 2
+.endif
+.if (i & (k + k - 1)) != 0 .then
+.raise 3
+.endif
+sh = nb - k
+.if sh < 0 .then
+sh = 0
+.endif
+f = (t << sh) | (i >> k)
+.return .call w4(base | (g << 10) | ((wv - 12) << 13) | (zn << 5) | f)
+.endfunc
+
+MOVA {zd.B,za.B},ZA!!tH.B[ws,!!i:!!j] ::t>0;3,i>15;3,j>15;3 :: .call movam(0xc0060000,t,i,ws,zd,zd,za,4)
+MOVA ZA!!tH.B[ws,!!i:!!j],{zd.B,za.B} ::t>0;3,i>15;3,j>15;3 :: .call movamt(0xc0040000,t,i,ws,zd,zd,za,4)
+MOVA {zd.B-za.B},ZA!!tH.B[ws,!!i:!!j] ::t>0;3,i>15;3,j>15;3 :: .call movam(0xc0060000,t,i,ws,zd,zd,za,4)
+MOVA ZA!!tH.B[ws,!!i:!!j],{zd.B-za.B} ::t>0;3,i>15;3,j>15;3 :: .call movamt(0xc0040000,t,i,ws,zd,zd,za,4)
+MOVA {zd.B,za.B},ZA!!tV.B[ws,!!i:!!j] ::t>0;3,i>15;3,j>15;3 :: .call movam(0xc0068000,t,i,ws,zd,zd,za,4)
+MOVA ZA!!tV.B[ws,!!i:!!j],{zd.B,za.B} ::t>0;3,i>15;3,j>15;3 :: .call movamt(0xc0048000,t,i,ws,zd,zd,za,4)
+MOVA {zd.B-za.B},ZA!!tV.B[ws,!!i:!!j] ::t>0;3,i>15;3,j>15;3 :: .call movam(0xc0068000,t,i,ws,zd,zd,za,4)
+MOVA ZA!!tV.B[ws,!!i:!!j],{zd.B-za.B} ::t>0;3,i>15;3,j>15;3 :: .call movamt(0xc0048000,t,i,ws,zd,zd,za,4)
+MOVA {zd.H,za.H},ZA!!tH.H[ws,!!i:!!j] ::t>1;3,i>7;3,j>15;3 :: .call movam(0xc0460000,t,i,ws,zd,zd,za,3)
+MOVA ZA!!tH.H[ws,!!i:!!j],{zd.H,za.H} ::t>1;3,i>7;3,j>15;3 :: .call movamt(0xc0440000,t,i,ws,zd,zd,za,3)
+MOVA {zd.H-za.H},ZA!!tH.H[ws,!!i:!!j] ::t>1;3,i>7;3,j>15;3 :: .call movam(0xc0460000,t,i,ws,zd,zd,za,3)
+MOVA ZA!!tH.H[ws,!!i:!!j],{zd.H-za.H} ::t>1;3,i>7;3,j>15;3 :: .call movamt(0xc0440000,t,i,ws,zd,zd,za,3)
+MOVA {zd.H,za.H},ZA!!tV.H[ws,!!i:!!j] ::t>1;3,i>7;3,j>15;3 :: .call movam(0xc0468000,t,i,ws,zd,zd,za,3)
+MOVA ZA!!tV.H[ws,!!i:!!j],{zd.H,za.H} ::t>1;3,i>7;3,j>15;3 :: .call movamt(0xc0448000,t,i,ws,zd,zd,za,3)
+MOVA {zd.H-za.H},ZA!!tV.H[ws,!!i:!!j] ::t>1;3,i>7;3,j>15;3 :: .call movam(0xc0468000,t,i,ws,zd,zd,za,3)
+MOVA ZA!!tV.H[ws,!!i:!!j],{zd.H-za.H} ::t>1;3,i>7;3,j>15;3 :: .call movamt(0xc0448000,t,i,ws,zd,zd,za,3)
+MOVA {zd.S,za.S},ZA!!tH.S[ws,!!i:!!j] ::t>3;3,i>3;3,j>15;3 :: .call movam(0xc0860000,t,i,ws,zd,zd,za,2)
+MOVA ZA!!tH.S[ws,!!i:!!j],{zd.S,za.S} ::t>3;3,i>3;3,j>15;3 :: .call movamt(0xc0840000,t,i,ws,zd,zd,za,2)
+MOVA {zd.S-za.S},ZA!!tH.S[ws,!!i:!!j] ::t>3;3,i>3;3,j>15;3 :: .call movam(0xc0860000,t,i,ws,zd,zd,za,2)
+MOVA ZA!!tH.S[ws,!!i:!!j],{zd.S-za.S} ::t>3;3,i>3;3,j>15;3 :: .call movamt(0xc0840000,t,i,ws,zd,zd,za,2)
+MOVA {zd.S,za.S},ZA!!tV.S[ws,!!i:!!j] ::t>3;3,i>3;3,j>15;3 :: .call movam(0xc0868000,t,i,ws,zd,zd,za,2)
+MOVA ZA!!tV.S[ws,!!i:!!j],{zd.S,za.S} ::t>3;3,i>3;3,j>15;3 :: .call movamt(0xc0848000,t,i,ws,zd,zd,za,2)
+MOVA {zd.S-za.S},ZA!!tV.S[ws,!!i:!!j] ::t>3;3,i>3;3,j>15;3 :: .call movam(0xc0868000,t,i,ws,zd,zd,za,2)
+MOVA ZA!!tV.S[ws,!!i:!!j],{zd.S-za.S} ::t>3;3,i>3;3,j>15;3 :: .call movamt(0xc0848000,t,i,ws,zd,zd,za,2)
+MOVA {zd.D,za.D},ZA!!tH.D[ws,!!i:!!j] ::t>7;3,i>1;3,j>15;3 :: .call movam(0xc0c60000,t,i,ws,zd,zd,za,1)
+MOVA ZA!!tH.D[ws,!!i:!!j],{zd.D,za.D} ::t>7;3,i>1;3,j>15;3 :: .call movamt(0xc0c40000,t,i,ws,zd,zd,za,1)
+MOVA {zd.D-za.D},ZA!!tH.D[ws,!!i:!!j] ::t>7;3,i>1;3,j>15;3 :: .call movam(0xc0c60000,t,i,ws,zd,zd,za,1)
+MOVA ZA!!tH.D[ws,!!i:!!j],{zd.D-za.D} ::t>7;3,i>1;3,j>15;3 :: .call movamt(0xc0c40000,t,i,ws,zd,zd,za,1)
+MOVA {zd.D,za.D},ZA!!tV.D[ws,!!i:!!j] ::t>7;3,i>1;3,j>15;3 :: .call movam(0xc0c68000,t,i,ws,zd,zd,za,1)
+MOVA ZA!!tV.D[ws,!!i:!!j],{zd.D,za.D} ::t>7;3,i>1;3,j>15;3 :: .call movamt(0xc0c48000,t,i,ws,zd,zd,za,1)
+MOVA {zd.D-za.D},ZA!!tV.D[ws,!!i:!!j] ::t>7;3,i>1;3,j>15;3 :: .call movam(0xc0c68000,t,i,ws,zd,zd,za,1)
+MOVA ZA!!tV.D[ws,!!i:!!j],{zd.D-za.D} ::t>7;3,i>1;3,j>15;3 :: .call movamt(0xc0c48000,t,i,ws,zd,zd,za,1)
+MOV {zd.B,za.B},ZA!!tH.B[ws,!!i:!!j] ::t>0;3,i>15;3,j>15;3 :: .call movam(0xc0060000,t,i,ws,zd,zd,za,4)
+MOV ZA!!tH.B[ws,!!i:!!j],{zd.B,za.B} ::t>0;3,i>15;3,j>15;3 :: .call movamt(0xc0040000,t,i,ws,zd,zd,za,4)
+MOV {zd.B-za.B},ZA!!tH.B[ws,!!i:!!j] ::t>0;3,i>15;3,j>15;3 :: .call movam(0xc0060000,t,i,ws,zd,zd,za,4)
+MOV ZA!!tH.B[ws,!!i:!!j],{zd.B-za.B} ::t>0;3,i>15;3,j>15;3 :: .call movamt(0xc0040000,t,i,ws,zd,zd,za,4)
+MOV {zd.B,za.B},ZA!!tV.B[ws,!!i:!!j] ::t>0;3,i>15;3,j>15;3 :: .call movam(0xc0068000,t,i,ws,zd,zd,za,4)
+MOV ZA!!tV.B[ws,!!i:!!j],{zd.B,za.B} ::t>0;3,i>15;3,j>15;3 :: .call movamt(0xc0048000,t,i,ws,zd,zd,za,4)
+MOV {zd.B-za.B},ZA!!tV.B[ws,!!i:!!j] ::t>0;3,i>15;3,j>15;3 :: .call movam(0xc0068000,t,i,ws,zd,zd,za,4)
+MOV ZA!!tV.B[ws,!!i:!!j],{zd.B-za.B} ::t>0;3,i>15;3,j>15;3 :: .call movamt(0xc0048000,t,i,ws,zd,zd,za,4)
+MOV {zd.H,za.H},ZA!!tH.H[ws,!!i:!!j] ::t>1;3,i>7;3,j>15;3 :: .call movam(0xc0460000,t,i,ws,zd,zd,za,3)
+MOV ZA!!tH.H[ws,!!i:!!j],{zd.H,za.H} ::t>1;3,i>7;3,j>15;3 :: .call movamt(0xc0440000,t,i,ws,zd,zd,za,3)
+MOV {zd.H-za.H},ZA!!tH.H[ws,!!i:!!j] ::t>1;3,i>7;3,j>15;3 :: .call movam(0xc0460000,t,i,ws,zd,zd,za,3)
+MOV ZA!!tH.H[ws,!!i:!!j],{zd.H-za.H} ::t>1;3,i>7;3,j>15;3 :: .call movamt(0xc0440000,t,i,ws,zd,zd,za,3)
+MOV {zd.H,za.H},ZA!!tV.H[ws,!!i:!!j] ::t>1;3,i>7;3,j>15;3 :: .call movam(0xc0468000,t,i,ws,zd,zd,za,3)
+MOV ZA!!tV.H[ws,!!i:!!j],{zd.H,za.H} ::t>1;3,i>7;3,j>15;3 :: .call movamt(0xc0448000,t,i,ws,zd,zd,za,3)
+MOV {zd.H-za.H},ZA!!tV.H[ws,!!i:!!j] ::t>1;3,i>7;3,j>15;3 :: .call movam(0xc0468000,t,i,ws,zd,zd,za,3)
+MOV ZA!!tV.H[ws,!!i:!!j],{zd.H-za.H} ::t>1;3,i>7;3,j>15;3 :: .call movamt(0xc0448000,t,i,ws,zd,zd,za,3)
+MOV {zd.S,za.S},ZA!!tH.S[ws,!!i:!!j] ::t>3;3,i>3;3,j>15;3 :: .call movam(0xc0860000,t,i,ws,zd,zd,za,2)
+MOV ZA!!tH.S[ws,!!i:!!j],{zd.S,za.S} ::t>3;3,i>3;3,j>15;3 :: .call movamt(0xc0840000,t,i,ws,zd,zd,za,2)
+MOV {zd.S-za.S},ZA!!tH.S[ws,!!i:!!j] ::t>3;3,i>3;3,j>15;3 :: .call movam(0xc0860000,t,i,ws,zd,zd,za,2)
+MOV ZA!!tH.S[ws,!!i:!!j],{zd.S-za.S} ::t>3;3,i>3;3,j>15;3 :: .call movamt(0xc0840000,t,i,ws,zd,zd,za,2)
+MOV {zd.S,za.S},ZA!!tV.S[ws,!!i:!!j] ::t>3;3,i>3;3,j>15;3 :: .call movam(0xc0868000,t,i,ws,zd,zd,za,2)
+MOV ZA!!tV.S[ws,!!i:!!j],{zd.S,za.S} ::t>3;3,i>3;3,j>15;3 :: .call movamt(0xc0848000,t,i,ws,zd,zd,za,2)
+MOV {zd.S-za.S},ZA!!tV.S[ws,!!i:!!j] ::t>3;3,i>3;3,j>15;3 :: .call movam(0xc0868000,t,i,ws,zd,zd,za,2)
+MOV ZA!!tV.S[ws,!!i:!!j],{zd.S-za.S} ::t>3;3,i>3;3,j>15;3 :: .call movamt(0xc0848000,t,i,ws,zd,zd,za,2)
+MOV {zd.D,za.D},ZA!!tH.D[ws,!!i:!!j] ::t>7;3,i>1;3,j>15;3 :: .call movam(0xc0c60000,t,i,ws,zd,zd,za,1)
+MOV ZA!!tH.D[ws,!!i:!!j],{zd.D,za.D} ::t>7;3,i>1;3,j>15;3 :: .call movamt(0xc0c40000,t,i,ws,zd,zd,za,1)
+MOV {zd.D-za.D},ZA!!tH.D[ws,!!i:!!j] ::t>7;3,i>1;3,j>15;3 :: .call movam(0xc0c60000,t,i,ws,zd,zd,za,1)
+MOV ZA!!tH.D[ws,!!i:!!j],{zd.D-za.D} ::t>7;3,i>1;3,j>15;3 :: .call movamt(0xc0c40000,t,i,ws,zd,zd,za,1)
+MOV {zd.D,za.D},ZA!!tV.D[ws,!!i:!!j] ::t>7;3,i>1;3,j>15;3 :: .call movam(0xc0c68000,t,i,ws,zd,zd,za,1)
+MOV ZA!!tV.D[ws,!!i:!!j],{zd.D,za.D} ::t>7;3,i>1;3,j>15;3 :: .call movamt(0xc0c48000,t,i,ws,zd,zd,za,1)
+MOV {zd.D-za.D},ZA!!tV.D[ws,!!i:!!j] ::t>7;3,i>1;3,j>15;3 :: .call movam(0xc0c68000,t,i,ws,zd,zd,za,1)
+MOV ZA!!tV.D[ws,!!i:!!j],{zd.D-za.D} ::t>7;3,i>1;3,j>15;3 :: .call movamt(0xc0c48000,t,i,ws,zd,zd,za,1)
+
+/* Multi-vector contiguous loads and stores under a counter */
+.func::lsp::a,b
+.if b == a + 1 .then
+.if (a & 1) != 0 .then
+.raise 5
+.endif
+.return 0
+.endif
+.if b == a + 8 .then
+.if (a & 8) != 0 .then
+.raise 5
+.endif
+.return 1
+.endif
+.raise 5
+.return 0
+.endfunc
+.func::lsq::a,b,c,d
+.if b == a + 1 .then
+.if c != a + 2 .then
+.raise 5
+.endif
+.if d != a + 3 .then
+.raise 5
+.endif
+.if (a & 3) != 0 .then
+.raise 5
+.endif
+.return 0
+.endif
+.if b == a + 4 .then
+.if c != a + 8 .then
+.raise 5
+.endif
+.if d != a + 12 .then
+.raise 5
+.endif
+.if (a & 12) != 0 .then
+.raise 5
+.endif
+.return 1
+.endif
+.raise 5
+.return 0
+.endfunc
+/* a comma-written pair: consecutive or strided */
+.func::ls2::base,fld,rn,pn,msz,nt,a,b
+s = .call lsp(a, b)
+.if s == 0 .then
+.return .call w4(base | (fld << 16) | (msz << 13) | ((pn - 8) << 10) | (rn << 5) | a | nt)
+.endif
+z = (a & 7) | ((a >> 4) << 4)
+.return .call w4(base | 0x01000000 | (fld << 16) | (msz << 13) | ((pn - 8) << 10) | (rn << 5) | z | (nt << 3))
+.endfunc
+/* a comma-written quad: consecutive or strided */
+.func::ls4::base,fld,rn,pn,msz,nt,a,b,c,d
+s = .call lsq(a, b, c, d)
+.if s == 0 .then
+.return .call w4(base | 0x8000 | (fld << 16) | (msz << 13) | ((pn - 8) << 10) | (rn << 5) | a | nt)
+.endif
+z = (a & 3) | ((a >> 4) << 4)
+.return .call w4(base | 0x01008000 | (fld << 16) | (msz << 13) | ((pn - 8) << 10) | (rn << 5) | z | (nt << 3))
+.endfunc
+/* a dash-written list: always consecutive, pair or quad */
+.func::lsd::base,fld,rn,pn,msz,nt,a,b
+g = .call n2q(a, b)
+.return .call w4(base | (g << 15) | (fld << 16) | (msz << 13) | ((pn - 8) << 10) | (rn << 5) | a | nt)
+.endfunc
+/* the same three with a vector-length-relative offset */
+.func::ls2i::base,off,rn,pn,msz,nt,a,b
+s = .call lsp(a, b)
+q = .call divs4(off, 2)
+.if s == 0 .then
+.return .call w4(base | (q << 16) | (msz << 13) | ((pn - 8) << 10) | (rn << 5) | a | nt)
+.endif
+z = (a & 7) | ((a >> 4) << 4)
+.return .call w4(base | 0x01000000 | (q << 16) | (msz << 13) | ((pn - 8) << 10) | (rn << 5) | z | (nt << 3))
+.endfunc
+.func::ls4i::base,off,rn,pn,msz,nt,a,b,c,d
+s = .call lsq(a, b, c, d)
+q = .call divs4(off, 4)
+.if s == 0 .then
+.return .call w4(base | 0x8000 | (q << 16) | (msz << 13) | ((pn - 8) << 10) | (rn << 5) | a | nt)
+.endif
+z = (a & 3) | ((a >> 4) << 4)
+.return .call w4(base | 0x01008000 | (q << 16) | (msz << 13) | ((pn - 8) << 10) | (rn << 5) | z | (nt << 3))
+.endfunc
+.func::lsdi::base,off,rn,pn,msz,nt,a,b
+g = .call n2q(a, b)
+n = 2
+.if g == 1 .then
+n = 4
+.endif
+q = .call divs4(off, n)
+.return .call w4(base | (g << 15) | (q << 16) | (msz << 13) | ((pn - 8) << 10) | (rn << 5) | a | nt)
+.endfunc
+
+LD1B {zd.B,za.B},pnn/Z,[xb] :: .call ls2(0xa0400000,0,xb,pnn,0,0,zd,za)
+LD1B {zd.B,za.B,zb.B,zc.B},pnn/Z,[xb] :: .call ls4(0xa0400000,0,xb,pnn,0,0,zd,za,zb,zc)
+LD1B {zd.B-za.B},pnn/Z,[xb] :: .call lsd(0xa0400000,0,xb,pnn,0,0,zd,za)
+LD1B {zd.B,za.B},pnn/Z,[xb,#!v,MUL VL] :: .call ls2i(0xa0400000,v,xb,pnn,0,0,zd,za)
+LD1B {zd.B,za.B,zb.B,zc.B},pnn/Z,[xb,#!v,MUL VL] :: .call ls4i(0xa0400000,v,xb,pnn,0,0,zd,za,zb,zc)
+LD1B {zd.B-za.B},pnn/Z,[xb,#!v,MUL VL] :: .call lsdi(0xa0400000,v,xb,pnn,0,0,zd,za)
+LD1B {zd.B,za.B},pnn/Z,[xb,xm] :: .call ls2(0xa0000000,xm,xb,pnn,0,0,zd,za)
+LD1B {zd.B,za.B,zb.B,zc.B},pnn/Z,[xb,xm] :: .call ls4(0xa0000000,xm,xb,pnn,0,0,zd,za,zb,zc)
+LD1B {zd.B-za.B},pnn/Z,[xb,xm] :: .call lsd(0xa0000000,xm,xb,pnn,0,0,zd,za)
+LD1H {zd.H,za.H},pnn/Z,[xb] :: .call ls2(0xa0400000,0,xb,pnn,1,0,zd,za)
+LD1H {zd.H,za.H,zb.H,zc.H},pnn/Z,[xb] :: .call ls4(0xa0400000,0,xb,pnn,1,0,zd,za,zb,zc)
+LD1H {zd.H-za.H},pnn/Z,[xb] :: .call lsd(0xa0400000,0,xb,pnn,1,0,zd,za)
+LD1H {zd.H,za.H},pnn/Z,[xb,#!v,MUL VL] :: .call ls2i(0xa0400000,v,xb,pnn,1,0,zd,za)
+LD1H {zd.H,za.H,zb.H,zc.H},pnn/Z,[xb,#!v,MUL VL] :: .call ls4i(0xa0400000,v,xb,pnn,1,0,zd,za,zb,zc)
+LD1H {zd.H-za.H},pnn/Z,[xb,#!v,MUL VL] :: .call lsdi(0xa0400000,v,xb,pnn,1,0,zd,za)
+LD1H {zd.H,za.H},pnn/Z,[xb,xm,LSL #1] :: .call ls2(0xa0000000,xm,xb,pnn,1,0,zd,za)
+LD1H {zd.H,za.H,zb.H,zc.H},pnn/Z,[xb,xm,LSL #1] :: .call ls4(0xa0000000,xm,xb,pnn,1,0,zd,za,zb,zc)
+LD1H {zd.H-za.H},pnn/Z,[xb,xm,LSL #1] :: .call lsd(0xa0000000,xm,xb,pnn,1,0,zd,za)
+LD1W {zd.S,za.S},pnn/Z,[xb] :: .call ls2(0xa0400000,0,xb,pnn,2,0,zd,za)
+LD1W {zd.S,za.S,zb.S,zc.S},pnn/Z,[xb] :: .call ls4(0xa0400000,0,xb,pnn,2,0,zd,za,zb,zc)
+LD1W {zd.S-za.S},pnn/Z,[xb] :: .call lsd(0xa0400000,0,xb,pnn,2,0,zd,za)
+LD1W {zd.S,za.S},pnn/Z,[xb,#!v,MUL VL] :: .call ls2i(0xa0400000,v,xb,pnn,2,0,zd,za)
+LD1W {zd.S,za.S,zb.S,zc.S},pnn/Z,[xb,#!v,MUL VL] :: .call ls4i(0xa0400000,v,xb,pnn,2,0,zd,za,zb,zc)
+LD1W {zd.S-za.S},pnn/Z,[xb,#!v,MUL VL] :: .call lsdi(0xa0400000,v,xb,pnn,2,0,zd,za)
+LD1W {zd.S,za.S},pnn/Z,[xb,xm,LSL #2] :: .call ls2(0xa0000000,xm,xb,pnn,2,0,zd,za)
+LD1W {zd.S,za.S,zb.S,zc.S},pnn/Z,[xb,xm,LSL #2] :: .call ls4(0xa0000000,xm,xb,pnn,2,0,zd,za,zb,zc)
+LD1W {zd.S-za.S},pnn/Z,[xb,xm,LSL #2] :: .call lsd(0xa0000000,xm,xb,pnn,2,0,zd,za)
+LD1D {zd.D,za.D},pnn/Z,[xb] :: .call ls2(0xa0400000,0,xb,pnn,3,0,zd,za)
+LD1D {zd.D,za.D,zb.D,zc.D},pnn/Z,[xb] :: .call ls4(0xa0400000,0,xb,pnn,3,0,zd,za,zb,zc)
+LD1D {zd.D-za.D},pnn/Z,[xb] :: .call lsd(0xa0400000,0,xb,pnn,3,0,zd,za)
+LD1D {zd.D,za.D},pnn/Z,[xb,#!v,MUL VL] :: .call ls2i(0xa0400000,v,xb,pnn,3,0,zd,za)
+LD1D {zd.D,za.D,zb.D,zc.D},pnn/Z,[xb,#!v,MUL VL] :: .call ls4i(0xa0400000,v,xb,pnn,3,0,zd,za,zb,zc)
+LD1D {zd.D-za.D},pnn/Z,[xb,#!v,MUL VL] :: .call lsdi(0xa0400000,v,xb,pnn,3,0,zd,za)
+LD1D {zd.D,za.D},pnn/Z,[xb,xm,LSL #3] :: .call ls2(0xa0000000,xm,xb,pnn,3,0,zd,za)
+LD1D {zd.D,za.D,zb.D,zc.D},pnn/Z,[xb,xm,LSL #3] :: .call ls4(0xa0000000,xm,xb,pnn,3,0,zd,za,zb,zc)
+LD1D {zd.D-za.D},pnn/Z,[xb,xm,LSL #3] :: .call lsd(0xa0000000,xm,xb,pnn,3,0,zd,za)
+ST1B {zd.B,za.B},pnn,[xb] :: .call ls2(0xa0600000,0,xb,pnn,0,0,zd,za)
+ST1B {zd.B,za.B,zb.B,zc.B},pnn,[xb] :: .call ls4(0xa0600000,0,xb,pnn,0,0,zd,za,zb,zc)
+ST1B {zd.B-za.B},pnn,[xb] :: .call lsd(0xa0600000,0,xb,pnn,0,0,zd,za)
+ST1B {zd.B,za.B},pnn,[xb,#!v,MUL VL] :: .call ls2i(0xa0600000,v,xb,pnn,0,0,zd,za)
+ST1B {zd.B,za.B,zb.B,zc.B},pnn,[xb,#!v,MUL VL] :: .call ls4i(0xa0600000,v,xb,pnn,0,0,zd,za,zb,zc)
+ST1B {zd.B-za.B},pnn,[xb,#!v,MUL VL] :: .call lsdi(0xa0600000,v,xb,pnn,0,0,zd,za)
+ST1B {zd.B,za.B},pnn,[xb,xm] :: .call ls2(0xa0200000,xm,xb,pnn,0,0,zd,za)
+ST1B {zd.B,za.B,zb.B,zc.B},pnn,[xb,xm] :: .call ls4(0xa0200000,xm,xb,pnn,0,0,zd,za,zb,zc)
+ST1B {zd.B-za.B},pnn,[xb,xm] :: .call lsd(0xa0200000,xm,xb,pnn,0,0,zd,za)
+ST1H {zd.H,za.H},pnn,[xb] :: .call ls2(0xa0600000,0,xb,pnn,1,0,zd,za)
+ST1H {zd.H,za.H,zb.H,zc.H},pnn,[xb] :: .call ls4(0xa0600000,0,xb,pnn,1,0,zd,za,zb,zc)
+ST1H {zd.H-za.H},pnn,[xb] :: .call lsd(0xa0600000,0,xb,pnn,1,0,zd,za)
+ST1H {zd.H,za.H},pnn,[xb,#!v,MUL VL] :: .call ls2i(0xa0600000,v,xb,pnn,1,0,zd,za)
+ST1H {zd.H,za.H,zb.H,zc.H},pnn,[xb,#!v,MUL VL] :: .call ls4i(0xa0600000,v,xb,pnn,1,0,zd,za,zb,zc)
+ST1H {zd.H-za.H},pnn,[xb,#!v,MUL VL] :: .call lsdi(0xa0600000,v,xb,pnn,1,0,zd,za)
+ST1H {zd.H,za.H},pnn,[xb,xm,LSL #1] :: .call ls2(0xa0200000,xm,xb,pnn,1,0,zd,za)
+ST1H {zd.H,za.H,zb.H,zc.H},pnn,[xb,xm,LSL #1] :: .call ls4(0xa0200000,xm,xb,pnn,1,0,zd,za,zb,zc)
+ST1H {zd.H-za.H},pnn,[xb,xm,LSL #1] :: .call lsd(0xa0200000,xm,xb,pnn,1,0,zd,za)
+ST1W {zd.S,za.S},pnn,[xb] :: .call ls2(0xa0600000,0,xb,pnn,2,0,zd,za)
+ST1W {zd.S,za.S,zb.S,zc.S},pnn,[xb] :: .call ls4(0xa0600000,0,xb,pnn,2,0,zd,za,zb,zc)
+ST1W {zd.S-za.S},pnn,[xb] :: .call lsd(0xa0600000,0,xb,pnn,2,0,zd,za)
+ST1W {zd.S,za.S},pnn,[xb,#!v,MUL VL] :: .call ls2i(0xa0600000,v,xb,pnn,2,0,zd,za)
+ST1W {zd.S,za.S,zb.S,zc.S},pnn,[xb,#!v,MUL VL] :: .call ls4i(0xa0600000,v,xb,pnn,2,0,zd,za,zb,zc)
+ST1W {zd.S-za.S},pnn,[xb,#!v,MUL VL] :: .call lsdi(0xa0600000,v,xb,pnn,2,0,zd,za)
+ST1W {zd.S,za.S},pnn,[xb,xm,LSL #2] :: .call ls2(0xa0200000,xm,xb,pnn,2,0,zd,za)
+ST1W {zd.S,za.S,zb.S,zc.S},pnn,[xb,xm,LSL #2] :: .call ls4(0xa0200000,xm,xb,pnn,2,0,zd,za,zb,zc)
+ST1W {zd.S-za.S},pnn,[xb,xm,LSL #2] :: .call lsd(0xa0200000,xm,xb,pnn,2,0,zd,za)
+ST1D {zd.D,za.D},pnn,[xb] :: .call ls2(0xa0600000,0,xb,pnn,3,0,zd,za)
+ST1D {zd.D,za.D,zb.D,zc.D},pnn,[xb] :: .call ls4(0xa0600000,0,xb,pnn,3,0,zd,za,zb,zc)
+ST1D {zd.D-za.D},pnn,[xb] :: .call lsd(0xa0600000,0,xb,pnn,3,0,zd,za)
+ST1D {zd.D,za.D},pnn,[xb,#!v,MUL VL] :: .call ls2i(0xa0600000,v,xb,pnn,3,0,zd,za)
+ST1D {zd.D,za.D,zb.D,zc.D},pnn,[xb,#!v,MUL VL] :: .call ls4i(0xa0600000,v,xb,pnn,3,0,zd,za,zb,zc)
+ST1D {zd.D-za.D},pnn,[xb,#!v,MUL VL] :: .call lsdi(0xa0600000,v,xb,pnn,3,0,zd,za)
+ST1D {zd.D,za.D},pnn,[xb,xm,LSL #3] :: .call ls2(0xa0200000,xm,xb,pnn,3,0,zd,za)
+ST1D {zd.D,za.D,zb.D,zc.D},pnn,[xb,xm,LSL #3] :: .call ls4(0xa0200000,xm,xb,pnn,3,0,zd,za,zb,zc)
+ST1D {zd.D-za.D},pnn,[xb,xm,LSL #3] :: .call lsd(0xa0200000,xm,xb,pnn,3,0,zd,za)
+LDNT1B {zd.B,za.B},pnn/Z,[xb] :: .call ls2(0xa0400000,0,xb,pnn,0,1,zd,za)
+LDNT1B {zd.B,za.B,zb.B,zc.B},pnn/Z,[xb] :: .call ls4(0xa0400000,0,xb,pnn,0,1,zd,za,zb,zc)
+LDNT1B {zd.B-za.B},pnn/Z,[xb] :: .call lsd(0xa0400000,0,xb,pnn,0,1,zd,za)
+LDNT1B {zd.B,za.B},pnn/Z,[xb,#!v,MUL VL] :: .call ls2i(0xa0400000,v,xb,pnn,0,1,zd,za)
+LDNT1B {zd.B,za.B,zb.B,zc.B},pnn/Z,[xb,#!v,MUL VL] :: .call ls4i(0xa0400000,v,xb,pnn,0,1,zd,za,zb,zc)
+LDNT1B {zd.B-za.B},pnn/Z,[xb,#!v,MUL VL] :: .call lsdi(0xa0400000,v,xb,pnn,0,1,zd,za)
+LDNT1B {zd.B,za.B},pnn/Z,[xb,xm] :: .call ls2(0xa0000000,xm,xb,pnn,0,1,zd,za)
+LDNT1B {zd.B,za.B,zb.B,zc.B},pnn/Z,[xb,xm] :: .call ls4(0xa0000000,xm,xb,pnn,0,1,zd,za,zb,zc)
+LDNT1B {zd.B-za.B},pnn/Z,[xb,xm] :: .call lsd(0xa0000000,xm,xb,pnn,0,1,zd,za)
+LDNT1H {zd.H,za.H},pnn/Z,[xb] :: .call ls2(0xa0400000,0,xb,pnn,1,1,zd,za)
+LDNT1H {zd.H,za.H,zb.H,zc.H},pnn/Z,[xb] :: .call ls4(0xa0400000,0,xb,pnn,1,1,zd,za,zb,zc)
+LDNT1H {zd.H-za.H},pnn/Z,[xb] :: .call lsd(0xa0400000,0,xb,pnn,1,1,zd,za)
+LDNT1H {zd.H,za.H},pnn/Z,[xb,#!v,MUL VL] :: .call ls2i(0xa0400000,v,xb,pnn,1,1,zd,za)
+LDNT1H {zd.H,za.H,zb.H,zc.H},pnn/Z,[xb,#!v,MUL VL] :: .call ls4i(0xa0400000,v,xb,pnn,1,1,zd,za,zb,zc)
+LDNT1H {zd.H-za.H},pnn/Z,[xb,#!v,MUL VL] :: .call lsdi(0xa0400000,v,xb,pnn,1,1,zd,za)
+LDNT1H {zd.H,za.H},pnn/Z,[xb,xm,LSL #1] :: .call ls2(0xa0000000,xm,xb,pnn,1,1,zd,za)
+LDNT1H {zd.H,za.H,zb.H,zc.H},pnn/Z,[xb,xm,LSL #1] :: .call ls4(0xa0000000,xm,xb,pnn,1,1,zd,za,zb,zc)
+LDNT1H {zd.H-za.H},pnn/Z,[xb,xm,LSL #1] :: .call lsd(0xa0000000,xm,xb,pnn,1,1,zd,za)
+LDNT1W {zd.S,za.S},pnn/Z,[xb] :: .call ls2(0xa0400000,0,xb,pnn,2,1,zd,za)
+LDNT1W {zd.S,za.S,zb.S,zc.S},pnn/Z,[xb] :: .call ls4(0xa0400000,0,xb,pnn,2,1,zd,za,zb,zc)
+LDNT1W {zd.S-za.S},pnn/Z,[xb] :: .call lsd(0xa0400000,0,xb,pnn,2,1,zd,za)
+LDNT1W {zd.S,za.S},pnn/Z,[xb,#!v,MUL VL] :: .call ls2i(0xa0400000,v,xb,pnn,2,1,zd,za)
+LDNT1W {zd.S,za.S,zb.S,zc.S},pnn/Z,[xb,#!v,MUL VL] :: .call ls4i(0xa0400000,v,xb,pnn,2,1,zd,za,zb,zc)
+LDNT1W {zd.S-za.S},pnn/Z,[xb,#!v,MUL VL] :: .call lsdi(0xa0400000,v,xb,pnn,2,1,zd,za)
+LDNT1W {zd.S,za.S},pnn/Z,[xb,xm,LSL #2] :: .call ls2(0xa0000000,xm,xb,pnn,2,1,zd,za)
+LDNT1W {zd.S,za.S,zb.S,zc.S},pnn/Z,[xb,xm,LSL #2] :: .call ls4(0xa0000000,xm,xb,pnn,2,1,zd,za,zb,zc)
+LDNT1W {zd.S-za.S},pnn/Z,[xb,xm,LSL #2] :: .call lsd(0xa0000000,xm,xb,pnn,2,1,zd,za)
+LDNT1D {zd.D,za.D},pnn/Z,[xb] :: .call ls2(0xa0400000,0,xb,pnn,3,1,zd,za)
+LDNT1D {zd.D,za.D,zb.D,zc.D},pnn/Z,[xb] :: .call ls4(0xa0400000,0,xb,pnn,3,1,zd,za,zb,zc)
+LDNT1D {zd.D-za.D},pnn/Z,[xb] :: .call lsd(0xa0400000,0,xb,pnn,3,1,zd,za)
+LDNT1D {zd.D,za.D},pnn/Z,[xb,#!v,MUL VL] :: .call ls2i(0xa0400000,v,xb,pnn,3,1,zd,za)
+LDNT1D {zd.D,za.D,zb.D,zc.D},pnn/Z,[xb,#!v,MUL VL] :: .call ls4i(0xa0400000,v,xb,pnn,3,1,zd,za,zb,zc)
+LDNT1D {zd.D-za.D},pnn/Z,[xb,#!v,MUL VL] :: .call lsdi(0xa0400000,v,xb,pnn,3,1,zd,za)
+LDNT1D {zd.D,za.D},pnn/Z,[xb,xm,LSL #3] :: .call ls2(0xa0000000,xm,xb,pnn,3,1,zd,za)
+LDNT1D {zd.D,za.D,zb.D,zc.D},pnn/Z,[xb,xm,LSL #3] :: .call ls4(0xa0000000,xm,xb,pnn,3,1,zd,za,zb,zc)
+LDNT1D {zd.D-za.D},pnn/Z,[xb,xm,LSL #3] :: .call lsd(0xa0000000,xm,xb,pnn,3,1,zd,za)
+STNT1B {zd.B,za.B},pnn,[xb] :: .call ls2(0xa0600000,0,xb,pnn,0,1,zd,za)
+STNT1B {zd.B,za.B,zb.B,zc.B},pnn,[xb] :: .call ls4(0xa0600000,0,xb,pnn,0,1,zd,za,zb,zc)
+STNT1B {zd.B-za.B},pnn,[xb] :: .call lsd(0xa0600000,0,xb,pnn,0,1,zd,za)
+STNT1B {zd.B,za.B},pnn,[xb,#!v,MUL VL] :: .call ls2i(0xa0600000,v,xb,pnn,0,1,zd,za)
+STNT1B {zd.B,za.B,zb.B,zc.B},pnn,[xb,#!v,MUL VL] :: .call ls4i(0xa0600000,v,xb,pnn,0,1,zd,za,zb,zc)
+STNT1B {zd.B-za.B},pnn,[xb,#!v,MUL VL] :: .call lsdi(0xa0600000,v,xb,pnn,0,1,zd,za)
+STNT1B {zd.B,za.B},pnn,[xb,xm] :: .call ls2(0xa0200000,xm,xb,pnn,0,1,zd,za)
+STNT1B {zd.B,za.B,zb.B,zc.B},pnn,[xb,xm] :: .call ls4(0xa0200000,xm,xb,pnn,0,1,zd,za,zb,zc)
+STNT1B {zd.B-za.B},pnn,[xb,xm] :: .call lsd(0xa0200000,xm,xb,pnn,0,1,zd,za)
+STNT1H {zd.H,za.H},pnn,[xb] :: .call ls2(0xa0600000,0,xb,pnn,1,1,zd,za)
+STNT1H {zd.H,za.H,zb.H,zc.H},pnn,[xb] :: .call ls4(0xa0600000,0,xb,pnn,1,1,zd,za,zb,zc)
+STNT1H {zd.H-za.H},pnn,[xb] :: .call lsd(0xa0600000,0,xb,pnn,1,1,zd,za)
+STNT1H {zd.H,za.H},pnn,[xb,#!v,MUL VL] :: .call ls2i(0xa0600000,v,xb,pnn,1,1,zd,za)
+STNT1H {zd.H,za.H,zb.H,zc.H},pnn,[xb,#!v,MUL VL] :: .call ls4i(0xa0600000,v,xb,pnn,1,1,zd,za,zb,zc)
+STNT1H {zd.H-za.H},pnn,[xb,#!v,MUL VL] :: .call lsdi(0xa0600000,v,xb,pnn,1,1,zd,za)
+STNT1H {zd.H,za.H},pnn,[xb,xm,LSL #1] :: .call ls2(0xa0200000,xm,xb,pnn,1,1,zd,za)
+STNT1H {zd.H,za.H,zb.H,zc.H},pnn,[xb,xm,LSL #1] :: .call ls4(0xa0200000,xm,xb,pnn,1,1,zd,za,zb,zc)
+STNT1H {zd.H-za.H},pnn,[xb,xm,LSL #1] :: .call lsd(0xa0200000,xm,xb,pnn,1,1,zd,za)
+STNT1W {zd.S,za.S},pnn,[xb] :: .call ls2(0xa0600000,0,xb,pnn,2,1,zd,za)
+STNT1W {zd.S,za.S,zb.S,zc.S},pnn,[xb] :: .call ls4(0xa0600000,0,xb,pnn,2,1,zd,za,zb,zc)
+STNT1W {zd.S-za.S},pnn,[xb] :: .call lsd(0xa0600000,0,xb,pnn,2,1,zd,za)
+STNT1W {zd.S,za.S},pnn,[xb,#!v,MUL VL] :: .call ls2i(0xa0600000,v,xb,pnn,2,1,zd,za)
+STNT1W {zd.S,za.S,zb.S,zc.S},pnn,[xb,#!v,MUL VL] :: .call ls4i(0xa0600000,v,xb,pnn,2,1,zd,za,zb,zc)
+STNT1W {zd.S-za.S},pnn,[xb,#!v,MUL VL] :: .call lsdi(0xa0600000,v,xb,pnn,2,1,zd,za)
+STNT1W {zd.S,za.S},pnn,[xb,xm,LSL #2] :: .call ls2(0xa0200000,xm,xb,pnn,2,1,zd,za)
+STNT1W {zd.S,za.S,zb.S,zc.S},pnn,[xb,xm,LSL #2] :: .call ls4(0xa0200000,xm,xb,pnn,2,1,zd,za,zb,zc)
+STNT1W {zd.S-za.S},pnn,[xb,xm,LSL #2] :: .call lsd(0xa0200000,xm,xb,pnn,2,1,zd,za)
+STNT1D {zd.D,za.D},pnn,[xb] :: .call ls2(0xa0600000,0,xb,pnn,3,1,zd,za)
+STNT1D {zd.D,za.D,zb.D,zc.D},pnn,[xb] :: .call ls4(0xa0600000,0,xb,pnn,3,1,zd,za,zb,zc)
+STNT1D {zd.D-za.D},pnn,[xb] :: .call lsd(0xa0600000,0,xb,pnn,3,1,zd,za)
+STNT1D {zd.D,za.D},pnn,[xb,#!v,MUL VL] :: .call ls2i(0xa0600000,v,xb,pnn,3,1,zd,za)
+STNT1D {zd.D,za.D,zb.D,zc.D},pnn,[xb,#!v,MUL VL] :: .call ls4i(0xa0600000,v,xb,pnn,3,1,zd,za,zb,zc)
+STNT1D {zd.D-za.D},pnn,[xb,#!v,MUL VL] :: .call lsdi(0xa0600000,v,xb,pnn,3,1,zd,za)
+STNT1D {zd.D,za.D},pnn,[xb,xm,LSL #3] :: .call ls2(0xa0200000,xm,xb,pnn,3,1,zd,za)
+STNT1D {zd.D,za.D,zb.D,zc.D},pnn,[xb,xm,LSL #3] :: .call ls4(0xa0200000,xm,xb,pnn,3,1,zd,za,zb,zc)
+STNT1D {zd.D-za.D},pnn,[xb,xm,LSL #3] :: .call lsd(0xa0200000,xm,xb,pnn,3,1,zd,za)
+
+/* The SME2 outer products */
+SMOPA ZA!!t.S,pg/M,pf/M,zn.H,zm.H ::t>3;3 :: .call w4(0xa0800008|(zm<<16)|(pf<<13)|(pg<<10)|(zn<<5)|t)
+SMOPS ZA!!t.S,pg/M,pf/M,zn.H,zm.H ::t>3;3 :: .call w4(0xa0800018|(zm<<16)|(pf<<13)|(pg<<10)|(zn<<5)|t)
+UMOPA ZA!!t.S,pg/M,pf/M,zn.H,zm.H ::t>3;3 :: .call w4(0xa1800008|(zm<<16)|(pf<<13)|(pg<<10)|(zn<<5)|t)
+UMOPS ZA!!t.S,pg/M,pf/M,zn.H,zm.H ::t>3;3 :: .call w4(0xa1800018|(zm<<16)|(pf<<13)|(pg<<10)|(zn<<5)|t)
+BMOPA ZA!!t.S,pg/M,pf/M,zn.S,zm.S ::t>3;3 :: .call w4(0x80800008|(zm<<16)|(pf<<13)|(pg<<10)|(zn<<5)|t)
+BMOPS ZA!!t.S,pg/M,pf/M,zn.S,zm.S ::t>3;3 :: .call w4(0x80800018|(zm<<16)|(pf<<13)|(pg<<10)|(zn<<5)|t)
