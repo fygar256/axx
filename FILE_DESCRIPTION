@@ -27,7 +27,12 @@ aarch64.axx                         pattern file for the AArch64 (A64) instructi
                                     GNU-style relocation modifiers :lo12:,
                                     :pg_hi21:, :abs_g0:-:abs_g3:,
                                     :prel_g0:-:prel_g3: and the :got: /
-                                    :got_lo12: pair. SVE, SVE2 and SME are
+                                    :got_lo12: pair, and SVE, SVE2 and SME:
+                                    the Z and P register files, predication,
+                                    the SVE load/store family including
+                                    gathers and scatters, the SVE2 widening,
+                                    narrowing and complex arithmetic, and the
+                                    SME ZA array and outer products. SME2 is
                                     not covered
 aarch64.s                           test assemble file for aarch64.axx
 aarch64_logical.axx                 pattern file for the AArch64 logical (immediate)

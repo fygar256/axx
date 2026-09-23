@@ -38,12 +38,28 @@
 /*     complex arithmetic (FEAT_FCMA), dot product, FP16 multiply-long,
 /*     BFloat16, the integer matrix-multiply instructions, LS64,
 /*     FJCVTZS, RNDR, and the flag-manipulation instructions
+/*   - SVE: integer and floating-point arithmetic, shifts, compares,
+/*     predicate generation and manipulation, element counts, INDEX,
+/*     permutes and reductions, the bitmask and floating-point
+/*     broadcasts, the dot-product and matrix-multiply instructions,
+/*     and the whole load/store family -- contiguous, non-temporal,
+/*     two-, three- and four-register, replicating, non-fault,
+/*     first-fault, gather, scatter and prefetch
+/*   - SVE2: widening, narrowing and pairwise arithmetic, saturating
+/*     and rounding shifts, multiply-accumulate long, complex
+/*     arithmetic and the complex dot product, the indexed forms,
+/*     bit permute, bitwise ternary, histogram and match, the
+/*     non-temporal gathers and scatters, and the SVE2 cryptography
+/*   - SME: streaming mode, the streaming vector length, the ZA array
+/*     (MOVA, LD1x/ST1x by tile slice, LDR/STR, ZERO), ADDHA/ADDVA,
+/*     the integer, floating-point and BFloat16 outer products, PSEL,
+/*     REVD and the CLAMP instructions
 /*
 /* Not covered, and said so rather than half-done:
-/*   SVE, SVE2 and SME. Those are a separate register file (Z and P
-/*   registers), a predication model and an addressing model of their
-/*   own, and describing them properly is a second pattern file rather
-/*   than an appendix to this one. Everything else in A64 is here.
+/*   SME2. Its multi-vector operands (register lists written
+/*   {Z0.S-Z3.S}, ZA array vector groups, the ZT0 lookup table) are a
+/*   different operand model again, and belong in their own pass
+/*   rather than tacked onto the SME section here.
 /*
 /*   The named system registers stop at the common set defined below,
 /*   but every register, named or not, is still reachable through the
@@ -53,10 +69,11 @@
 /*
 /* The macro layer (Technical_Manual.md section 7) generates the rows
 /* that differ only in an opcode constant, and the mini language
-/* (section 3.15) computes the four encodings that no fixed
-/* expression can express: the logical bitmask immediate, the MOV
-/* immediate alias choice, the scaled/unscaled load-store offset
-/* choice, and the 8-bit floating-point immediate.
+/* (section 3.15) computes the encodings that no fixed expression can
+/* express: the logical bitmask immediate and its SVE DUPM form, the
+/* MOV immediate alias choice, the scaled/unscaled load-store offset
+/* choice, the 8-bit floating-point immediate, and the SVE offsets
+/* that are a byte count divided by the access size.
 /*
 /* A note on the escape: in the generic system-register spelling
 /* S<op0>_<op1>_C<Cn>_C<Cm>_<op2>, each separating underscore is
@@ -5797,3 +5814,14 @@ REVD zd.Q,pg/M,zn.Q :: .call w4(0x052e8000|(pg<<10)|(zn<<5)|zd)
 !smclamp("FCLAMP", 0x64202400, "H", 1)
 !smclamp("FCLAMP", 0x64202400, "S", 2)
 !smclamp("FCLAMP", 0x64202400, "D", 3)
+
+/* Loop termination test */
+CTERMEQ wn,wm :: .call w4(0x25a02000|(wm<<16)|(wn<<5))
+CTERMNE wn,wm :: .call w4(0x25a02010|(wm<<16)|(wn<<5))
+CTERMEQ xn,xm :: .call w4(0x25e02000|(xm<<16)|(xn<<5))
+CTERMNE xn,xm :: .call w4(0x25e02010|(xm<<16)|(xn<<5))
+
+/* A merging move of floating-point zero is the integer copy of zero */
+FMOV zd.H,pv/M,#0.0 :: .call w4(0x05504000|(pv<<16)|zd)
+FMOV zd.S,pv/M,#0.0 :: .call w4(0x05904000|(pv<<16)|zd)
+FMOV zd.D,pv/M,#0.0 :: .call w4(0x05d04000|(pv<<16)|zd)

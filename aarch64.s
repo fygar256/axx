@@ -497,3 +497,105 @@ here:
         ldr     x4, tail
 tail:
         nop
+
+; ---- SVE ----
+        ptrue   p0.s
+        ptrue   p1.b, vl8
+        whilelt p2.s, x0, x1
+        index   z0.s, #0, #1
+        index   z1.d, x0, x1
+        cntb    x2
+        cntw    x3, mul4, mul #3
+        incd    z2.d, all, mul #2
+        addvl   x4, x4, #-2
+        rdvl    x5, #1
+        dup     z3.b, w0
+        dup     z4.s, z5.s[3]
+        dupm    z6.h, #0xf00f
+        mov     z7.d, p0/m, z8.d
+        add     z9.s, p0/m, z9.s, z10.s
+        mul     z11.h, z11.h, z12.h
+        sdot    z13.s, z14.b, z15.b
+        smmla   z16.s, z17.b, z18.b
+        asr     z19.b, p1/m, z19.b, #3
+        cmpgt   p3.s, p0/z, z0.s, z1.s
+        fadd    z20.d, p0/m, z20.d, #1.0
+        fmla    z21.s, p0/m, z22.s, z23.s
+        fmul    z24.h, z25.h, z6.h[5]
+        fcmla   z27.s, p0/m, z28.s, z29.s, #270
+        fcvtzs  z30.d, p0/m, z31.s
+        fmov    z0.s, #-2.5
+        faddv   s1, p0, z2.s
+        saddv   d3, p0, z4.b
+        lastb   x6, p0, z5.d
+        clasta  z6.h, p0, z6.h, z7.h
+        zip1    z8.b, z9.b, z10.b
+        punpklo p4.h, p5.b
+        movprfx z11.s, p0/m, z12.s
+        abs     z11.s, p0/m, z12.s
+        ldr     z13, [x7, #3, mul vl]
+        str     p6, [x8, #-1, mul vl]
+        ld1w    {z14.s}, p0/z, [x9, x10, lsl #2]
+        ld1sb   {z15.d}, p0/z, [x11, #-4, mul vl]
+        ldnf1h  {z16.h}, p0/z, [x12]
+        ldff1d  {z17.d}, p0/z, [x13, x14, lsl #3]
+        ld2d    {z18.d, z19.d}, p0/z, [x15, #4, mul vl]
+        st4b    {z20.b, z21.b, z22.b, z23.b}, p0, [x16, x17]
+        ld1rw   {z24.s}, p0/z, [x18, #12]
+        ld1rqd  {z25.d}, p0/z, [x19, #-16]
+        ld1d    {z26.d}, p0/z, [x20, z27.d, lsl #3]
+        st1w    {z28.s}, p0, [x21, z29.s, sxtw #2]
+        ld1sh   {z30.s}, p0/z, [z31.s, #6]
+        prfw    pldl1keep, p0, [x22, x23, lsl #2]
+        prfd    #5, p0, [z0.d, #16]
+
+; ---- SVE2 ----
+        smullb  z1.s, z2.h, z3.h
+        addhnt  z4.b, z5.h, z6.h
+        sqrshrunb z7.h, z8.s, #5
+        srsra   z9.d, z10.d, #17
+        saba    z11.b, z12.b, z13.b
+        bext    z14.s, z15.s, z16.s
+        cadd    z17.h, z17.h, z18.h, #270
+        cmla    z19.s, z20.s, z21.s, #90
+        cdot    z22.s, z23.b, z4.b[2], #180
+        sqrdmlah z25.h, z26.h, z7.h[3]
+        smlalt  z27.d, z28.s, z9.s[1]
+        fmlalb  z30.s, z31.h, z3.h[6]
+        histcnt z0.s, p0/z, z1.s, z2.s
+        match   p7.b, p0/z, z3.b, z4.b
+        tbx     z5.d, z6.d, z7.d
+        xar     z8.s, z8.s, z9.s, #7
+        bsl     z10.d, z10.d, z11.d, z12.d
+        aese    z13.b, z13.b, z14.b
+        rax1    z15.d, z16.d, z17.d
+        whilerw p1.d, x24, x25
+        ldnt1w  {z18.s}, p0/z, [z19.s, x26]
+        stnt1d  {z20.d}, p0, [z21.d, x27]
+
+; ---- SME ----
+        smstart
+        smstart sm
+        smstop  za
+        rdsvl   x28, #-3
+        addsvl  x29, x28, #2
+        addspl  x0, x1, #1
+        zero    {za}
+        zero    {za0.s, za2.s}
+        mova    z1.h, p0/m, za1v.h[w13, 5]
+        mova    za3h.s[w14, 2], p0/m, z2.s
+        ld1b    {za0h.b[w12, 9]}, p0/z, [x2, x3]
+        st1q    {za15v.q[w15, 0]}, p0, [x4]
+        ldr     za[w12, 0], [x5]
+        str     za[w13, 6], [x6, #6, mul vl]
+        addha   za2.s, p0/m, p1/m, z3.s
+        addva   za6.d, p0/m, p1/m, z4.d
+        smopa   za1.s, p0/m, p1/m, z5.b, z6.b
+        usmops  za0.d, p2/m, p3/m, z7.h, z8.h
+        fmopa   za2.s, p0/m, p1/m, z9.h, z10.h
+        bfmops  za3.s, p0/m, p1/m, z11.h, z12.h
+        psel    p2, p3, p4.s[w12, 1]
+        revd    z13.q, p0/m, z14.q
+        sclamp  z15.b, z16.b, z17.b
+        fclamp  z18.d, z19.d, z20.d
+        ctermeq x7, x8
