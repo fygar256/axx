@@ -5652,3 +5652,148 @@ AESIMC zd.B,zd.B :: .call w4(0x4520e400|zd)
 RAX1 zd.D,zn.D,zm.D :: .call w4(0x4520f400|(zm<<16)|(zn<<5)|zd)
 SM4E zd.S,zd.S,zm.S :: .call w4(0x4523e000|(zm<<5)|zd)
 SM4EKEY zd.S,zn.S,zm.S :: .call w4(0x4520f000|(zm<<16)|(zn<<5)|zd)
+
+/* -------------------------------------------------------------------
+/* SME: streaming mode, the ZA array and outer products.
+/*
+/* A ZA tile slice is written za<t><h|v>.<el>[<Ws>, <index>].  The tile
+/* number and the index share one field, the tile in the high bits and
+/* the index in the low ones, so a byte slice is all index and a
+/* quadword slice all tile.
+/* ------------------------------------------------------------------- */
+.check::ws::W12,W13,W14,W15
+.check::pf::PLO
+
+/* Entering and leaving streaming mode */
+SMSTART :: 0x7f,0x47,0x03,0xd5
+SMSTOP :: 0x7f,0x46,0x03,0xd5
+SMSTART SM :: 0x7f,0x43,0x03,0xd5
+SMSTART ZA :: 0x7f,0x45,0x03,0xd5
+SMSTOP SM :: 0x7f,0x42,0x03,0xd5
+SMSTOP ZA :: 0x7f,0x44,0x03,0xd5
+
+/* Streaming vector length arithmetic */
+RDSVL xd,#!v ::v<-32;3,v>31;3 :: .call w4(0x04bf5800|((v&0x3f)<<5)|xd)
+ADDSVL xs,xe,#!v ::v<-32;3,v>31;3 :: .call w4(0x04205800|(xe<<16)|((v&0x3f)<<5)|xs)
+ADDSPL xs,xe,#!v ::v<-32;3,v>31;3 :: .call w4(0x04605800|(xe<<16)|((v&0x3f)<<5)|xs)
+
+/* Zero tiles.  One row per list length covers every combination. */
+ZERO {} :: .call w4(0xc0080000)
+ZERO {ZA} :: .call w4(0xc00800ff)
+ZERO {ZA0.B} :: .call w4(0xc00800ff)
+ZERO {ZA!!a.H} ::a>1;3 :: .call w4(0xc0080000|((0x55<<a)&0xff))
+ZERO {ZA!!a.H,ZA!!b.H} ::a>1;3,b>1;3 :: .call w4(0xc0080000|(((0x55<<a)|(0x55<<b))&0xff))
+ZERO {ZA!!a.S} ::a>3;3 :: .call w4(0xc0080000|((0x11<<a)&0xff))
+ZERO {ZA!!a.S,ZA!!b.S} ::a>3;3,b>3;3 :: .call w4(0xc0080000|(((0x11<<a)|(0x11<<b))&0xff))
+ZERO {ZA!!a.S,ZA!!b.S,ZA!!c.S} ::a>3;3,b>3;3,c>3;3 :: .call w4(0xc0080000|(((0x11<<a)|(0x11<<b)|(0x11<<c))&0xff))
+ZERO {ZA!!a.S,ZA!!b.S,ZA!!c.S,ZA!!d.S} ::a>3;3,b>3;3,c>3;3,d>3;3 :: .call w4(0xc0080000|(((0x11<<a)|(0x11<<b)|(0x11<<c)|(0x11<<d))&0xff))
+ZERO {ZA!!a.D} ::a>7;3 :: .call w4(0xc0080000|(1<<a))
+ZERO {ZA!!a.D,ZA!!b.D} ::a>7;3,b>7;3 :: .call w4(0xc0080000|(1<<a)|(1<<b))
+ZERO {ZA!!a.D,ZA!!b.D,ZA!!c.D} ::a>7;3,b>7;3,c>7;3 :: .call w4(0xc0080000|(1<<a)|(1<<b)|(1<<c))
+ZERO {ZA!!a.D,ZA!!b.D,ZA!!c.D,ZA!!d.D} ::a>7;3,b>7;3,c>7;3,d>7;3 :: .call w4(0xc0080000|(1<<a)|(1<<b)|(1<<c)|(1<<d))
+ZERO {ZA!!a.D,ZA!!b.D,ZA!!c.D,ZA!!d.D,ZA!!e.D} ::a>7;3,b>7;3,c>7;3,d>7;3,e>7;3 :: .call w4(0xc0080000|(1<<a)|(1<<b)|(1<<c)|(1<<d)|(1<<e))
+ZERO {ZA!!a.D,ZA!!b.D,ZA!!c.D,ZA!!d.D,ZA!!e.D,ZA!!f.D} ::a>7;3,b>7;3,c>7;3,d>7;3,e>7;3,f>7;3 :: .call w4(0xc0080000|(1<<a)|(1<<b)|(1<<c)|(1<<d)|(1<<e)|(1<<f))
+ZERO {ZA!!a.D,ZA!!b.D,ZA!!c.D,ZA!!d.D,ZA!!e.D,ZA!!f.D,ZA!!g.D} ::a>7;3,b>7;3,c>7;3,d>7;3,e>7;3,f>7;3,g>7;3 :: .call w4(0xc0080000|(1<<a)|(1<<b)|(1<<c)|(1<<d)|(1<<e)|(1<<f)|(1<<g))
+ZERO {ZA!!a.D,ZA!!b.D,ZA!!c.D,ZA!!d.D,ZA!!e.D,ZA!!f.D,ZA!!g.D,ZA!!h.D} ::a>7;3,b>7;3,c>7;3,d>7;3,e>7;3,f>7;3,g>7;3,h>7;3 :: .call w4(0xc0080000|(1<<a)|(1<<b)|(1<<c)|(1<<d)|(1<<e)|(1<<f)|(1<<g)|(1<<h))
+
+/* Move between a vector and a tile slice */
+!def smmova(nm, el, szc, q, nb, maxt, maxi, hv, vb) {
+!{nm} zd.!{el},pg/M,ZA!!t!{hv}.!{el}[ws,!!i] ::t>!{maxt};3,i>!{maxi};3 :: .call w4(0xc0020000|(!{szc}<<22)|(!{q}<<16)|(!{vb}<<15)|((ws-12)<<13)|(pg<<10)|((((t<<!{nb})|i)&0x1f)<<5)|zd)
+!{nm} ZA!!t!{hv}.!{el}[ws,!!i],pg/M,zn.!{el} ::t>!{maxt};3,i>!{maxi};3 :: .call w4(0xc0000000|(!{szc}<<22)|(!{q}<<16)|(!{vb}<<15)|((ws-12)<<13)|(pg<<10)|(zn<<5)|(((t<<!{nb})|i)&0x1f))
+}
+!def smmovaa(nm, el, szc, q, nb, maxt, maxi) {
+!smmova(nm, el, szc, q, nb, maxt, maxi, "H", 0)
+!smmova(nm, el, szc, q, nb, maxt, maxi, "V", 1)
+}
+!def smmovall(nm) {
+!smmovaa(nm, "B", 0, 0, 4, 0, 15)
+!smmovaa(nm, "H", 1, 0, 3, 1, 7)
+!smmovaa(nm, "S", 2, 0, 2, 3, 3)
+!smmovaa(nm, "D", 3, 0, 1, 7, 1)
+!smmovaa(nm, "Q", 3, 1, 0, 15, 0)
+}
+!smmovall("MOVA")
+!smmovall("MOV")
+
+/* Load and store a tile slice */
+!def smls(sfx, el, msz, nb, maxt, maxi, hv, vb, ix) {
+LD1!{sfx} {ZA!!t!{hv}.!{el}[ws,!!i]},pg/Z,[xb] ::t>!{maxt};3,i>!{maxi};3 :: .call w4(0xe0000000|(!{msz}<<22)|(31<<16)|(!{vb}<<15)|((ws-12)<<13)|(pg<<10)|(xb<<5)|(((t<<!{nb})|i)&0xf))
+LD1!{sfx} {ZA!!t!{hv}.!{el}[ws,!!i]},pg/Z,[xb,!{ix}] ::t>!{maxt};3,i>!{maxi};3 :: .call w4(0xe0000000|(!{msz}<<22)|(xm<<16)|(!{vb}<<15)|((ws-12)<<13)|(pg<<10)|(xb<<5)|(((t<<!{nb})|i)&0xf))
+ST1!{sfx} {ZA!!t!{hv}.!{el}[ws,!!i]},pg,[xb] ::t>!{maxt};3,i>!{maxi};3 :: .call w4(0xe0200000|(!{msz}<<22)|(31<<16)|(!{vb}<<15)|((ws-12)<<13)|(pg<<10)|(xb<<5)|(((t<<!{nb})|i)&0xf))
+ST1!{sfx} {ZA!!t!{hv}.!{el}[ws,!!i]},pg,[xb,!{ix}] ::t>!{maxt};3,i>!{maxi};3 :: .call w4(0xe0200000|(!{msz}<<22)|(xm<<16)|(!{vb}<<15)|((ws-12)<<13)|(pg<<10)|(xb<<5)|(((t<<!{nb})|i)&0xf))
+}
+!def smlsa(sfx, el, msz, nb, maxt, maxi, ix) {
+!smls(sfx, el, msz, nb, maxt, maxi, "H", 0, ix)
+!smls(sfx, el, msz, nb, maxt, maxi, "V", 1, ix)
+}
+!smlsa("B", "B", 0, 4, 0, 15, "xm")
+!smlsa("H", "H", 1, 3, 1, 7, "xm,LSL #1")
+!smlsa("W", "S", 2, 2, 3, 3, "xm,LSL #2")
+!smlsa("D", "D", 3, 1, 7, 1, "xm,LSL #3")
+!smlsa("Q", "Q", 7, 0, 15, 0, "xm,LSL #4")
+
+/* Load and store the whole array, one vector at a time */
+LDR ZA[ws,!!i],[xb] ::i!=0;8 :: .call w4(0xe1000000|((ws-12)<<13)|(xb<<5)|i)
+LDR ZA[ws,!!i],[xb,#!v,MUL VL] ::i>15;3,v!=i;8 :: .call w4(0xe1000000|((ws-12)<<13)|(xb<<5)|i)
+STR ZA[ws,!!i],[xb] ::i!=0;8 :: .call w4(0xe1200000|((ws-12)<<13)|(xb<<5)|i)
+STR ZA[ws,!!i],[xb,#!v,MUL VL] ::i>15;3,v!=i;8 :: .call w4(0xe1200000|((ws-12)<<13)|(xb<<5)|i)
+
+/* Add a vector to every row or column of a tile */
+!def smadda(nm, op, el, b22, maxt) {
+!{nm} ZA!!t.!{el},pg/M,pf/M,zn.!{el} ::t>!{maxt};3 :: .call w4(0xc0900000|(!{b22}<<22)|(!{op}<<16)|(pf<<13)|(pg<<10)|(zn<<5)|t)
+}
+!def smaddaa(nm, op) {
+!smadda(nm, op, "S", 0, 3)
+!smadda(nm, op, "D", 1, 7)
+}
+!smaddaa("ADDHA", 0)
+!smaddaa("ADDVA", 1)
+
+/* Outer products */
+!def smmopa(nm, base, sub, el, sel, maxt) {
+!{nm} ZA!!t.!{el},pg/M,pf/M,zn.!{sel},zm.!{sel} ::t>!{maxt};3 :: .call w4(!{base}|(zm<<16)|(pf<<13)|(pg<<10)|(zn<<5)|(!{sub}<<4)|t)
+}
+!def smmopi(nm, base, sub) {
+!smmopa(nm, base, sub, "S", "B", 3)
+!smmopa(nm, base + 0x00400000, sub, "D", "H", 7)
+}
+!smmopi("SMOPA", 0xa0800000, 0)
+!smmopi("SMOPS", 0xa0800000, 1)
+!smmopi("SUMOPA", 0xa0a00000, 0)
+!smmopi("SUMOPS", 0xa0a00000, 1)
+!smmopi("USMOPA", 0xa1800000, 0)
+!smmopi("USMOPS", 0xa1800000, 1)
+!smmopi("UMOPA", 0xa1a00000, 0)
+!smmopi("UMOPS", 0xa1a00000, 1)
+!smmopa("FMOPA", 0x80800000, 0, "S", "S", 3)
+!smmopa("FMOPS", 0x80800000, 1, "S", "S", 3)
+!smmopa("FMOPA", 0x80c00000, 0, "D", "D", 7)
+!smmopa("FMOPS", 0x80c00000, 1, "D", "D", 7)
+!smmopa("FMOPA", 0x81a00000, 0, "S", "H", 3)
+!smmopa("FMOPS", 0x81a00000, 1, "S", "H", 3)
+!smmopa("BFMOPA", 0x81800000, 0, "S", "H", 3)
+!smmopa("BFMOPS", 0x81800000, 1, "S", "H", 3)
+
+/* Predicate select, and the vector instructions SME adds */
+!def smpsel(el, es, mx) {
+PSEL pd,pn,pm.!{el}[ws,!!i] ::i>!{mx};3 :: .call w4(0x25204000|(((((i*!{es*2})|!{es})>>3)&3)<<22)|((((i*!{es*2})|!{es})&7)<<18)|((ws-12)<<16)|(pn<<10)|(pm<<5)|pd)
+}
+!smpsel("B", 1, 15)
+!smpsel("H", 2, 7)
+!smpsel("S", 4, 3)
+!smpsel("D", 8, 1)
+REVD zd.Q,pg/M,zn.Q :: .call w4(0x052e8000|(pg<<10)|(zn<<5)|zd)
+!def smclamp(nm, base, el, sz) {
+!{nm} zd.!{el},zn.!{el},zm.!{el} :: .call w4(!{base}|(!{sz}<<22)|(zm<<16)|(zn<<5)|zd)
+}
+!def smclampa(nm, base) {
+!smclamp(nm, base, "B", 0)
+!smclamp(nm, base, "H", 1)
+!smclamp(nm, base, "S", 2)
+!smclamp(nm, base, "D", 3)
+}
+!smclampa("SCLAMP", 0x4400c000)
+!smclampa("UCLAMP", 0x4400c400)
+!smclamp("FCLAMP", 0x64202400, "H", 1)
+!smclamp("FCLAMP", 0x64202400, "S", 2)
+!smclamp("FCLAMP", 0x64202400, "D", 3)
