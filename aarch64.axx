@@ -5825,3 +5825,340 @@ CTERMNE xn,xm :: .call w4(0x25e02010|(xm<<16)|(xn<<5))
 FMOV zd.H,pv/M,#0.0 :: .call w4(0x05504000|(pv<<16)|zd)
 FMOV zd.S,pv/M,#0.0 :: .call w4(0x05904000|(pv<<16)|zd)
 FMOV zd.D,pv/M,#0.0 :: .call w4(0x05d04000|(pv<<16)|zd)
+
+/* -------------------------------------------------------------------
+/* SME2.
+/*
+/* Two new operand shapes appear here.  A predicate-as-counter is
+/* written pn8-pn15 and holds a count rather than a bit per element;
+/* its field is the register number less eight.  A multi-vector list
+/* is written {z0.s, z1.s} for a pair and {z0.s - z3.s} for a quad,
+/* and only the first register is encoded, so the list has to start on
+/* an even or a multiple-of-four boundary.
+/* ------------------------------------------------------------------- */
+.setsym::PN8::8
+.setsym::PN9::9
+.setsym::PN10::10
+.setsym::PN11::11
+.setsym::PN12::12
+.setsym::PN13::13
+.setsym::PN14::14
+.setsym::PN15::15
+.setsym::PNS::PN8,PN9,PN10,PN11,PN12,PN13,PN14,PN15
+.check::pnn::PNS
+.check::pnm::PNS
+.check::pe::PR
+.check::pk::PR
+
+/* Predicate-as-counter generation and use */
+!def s2pn(el, sz) {
+PTRUE pnn.!{el} :: .call w4(0x25207810|(!{sz}<<22)|(pnn-8))
+PEXT pd.!{el},pnn[!!i] ::i>1;3 :: .call w4(0x25207010|(!{sz}<<22)|(i<<8)|((pnn-8)<<5)|pd)
+PEXT {pd.!{el},pe.!{el}},pnn[!!i] ::i>1;3,(pd&1)!=0;5,pe!=pd+1;5 :: .call w4(0x25207410|(!{sz}<<22)|(i<<8)|((pnn-8)<<5)|pd)
+CNTP xd,pnn.!{el},VLX2 :: .call w4(0x25208300|(!{sz}<<22)|((pnn-8)<<5)|xd)
+CNTP xd,pnn.!{el},VLX4 :: .call w4(0x25208700|(!{sz}<<22)|((pnn-8)<<5)|xd)
+}
+!s2pn("B", 0)
+!s2pn("H", 1)
+!s2pn("S", 2)
+!s2pn("D", 3)
+
+/* WHILE with a counter or a predicate pair as the destination */
+!def s2while1(nm, lt, u, eq, el, sz) {
+!{nm} pnn.!{el},xn,xm,VLX2 :: .call w4(0x25204010|(!{sz}<<22)|(xm<<16)|(!{u}<<11)|(!{lt}<<10)|(1<<14)|(!{eq}<<3)|(xn<<5)|(pnn-8))
+!{nm} pnn.!{el},xn,xm,VLX4 :: .call w4(0x25206010|(!{sz}<<22)|(xm<<16)|(!{u}<<11)|(!{lt}<<10)|(1<<14)|(!{eq}<<3)|(xn<<5)|(pnn-8))
+!{nm} {pd.!{el},pe.!{el}},xn,xm ::(pd&1)!=0;5,pe!=pd+1;5 :: .call w4(0x25205010|(!{sz}<<22)|(xm<<16)|(!{u}<<11)|(!{lt}<<10)|(xn<<5)|!{eq}|pd)
+}
+!def s2while(nm, lt, u, eq) {
+!s2while1(nm, lt, u, eq, "B", 0)
+!s2while1(nm, lt, u, eq, "H", 1)
+!s2while1(nm, lt, u, eq, "S", 2)
+!s2while1(nm, lt, u, eq, "D", 3)
+}
+!s2while("WHILEGE", 0, 0, 0)
+!s2while("WHILEGT", 0, 0, 1)
+!s2while("WHILELT", 1, 0, 0)
+!s2while("WHILELE", 1, 0, 1)
+!s2while("WHILEHS", 0, 1, 0)
+!s2while("WHILEHI", 0, 1, 1)
+!s2while("WHILELO", 1, 1, 0)
+!s2while("WHILELS", 1, 1, 1)
+
+/* The lookup table register */
+LDR ZT0,[xb] :: .call w4(0xe11f8000|(xb<<5))
+STR ZT0,[xb] :: .call w4(0xe13f8000|(xb<<5))
+ZERO {ZT0} :: .call w4(0xc0480001)
+
+/* Table lookup through ZT0.  The index splits across bits 16 and up
+/* and the bits just below the element-size field. */
+!def s2luti1(nm, base, el, sz, shl, mx) {
+!{nm} zd.!{el},ZT0,zn[!!i] ::i>!{mx};3 :: .call w4(!{base}|(!{sz}<<12)|((i&!{(1<<(16-shl))-1})<<!{shl})|((i>>!{16-shl})<<16)|(zn<<5)|zd)
+}
+!s2luti1("LUTI2", 0xc0cc0000, "B", 0, 14, 3)
+!s2luti1("LUTI2", 0xc0cc0000, "H", 1, 14, 7)
+!s2luti1("LUTI2", 0xc0cc0000, "S", 2, 14, 7)
+!s2luti1("LUTI4", 0xc0ca0000, "B", 0, 14, 1)
+!s2luti1("LUTI4", 0xc0ca0000, "H", 1, 14, 3)
+!s2luti1("LUTI4", 0xc0ca0000, "S", 2, 14, 3)
+/* Pair and quad destinations */
+.func::lutil::base2,base4,sz,i,zn,a,b,mx2,mx4,sh2
+n = b - a
+.if n == 1 .then
+.if (a & 1) != 0 .then
+.raise 5
+.endif
+.if i > mx2 .then
+.raise 3
+.endif
+.return .call w4(base2 | (sz << 12) | ((i & ((1 << (16 - sh2)) - 1)) << sh2) | ((i >> (16 - sh2)) << 16) | (zn << 5) | a)
+.endif
+.if n == 3 .then
+.if (a & 3) != 0 .then
+.raise 5
+.endif
+.if i > mx4 .then
+.raise 3
+.endif
+.return .call w4(base4 | (sz << 12) | (i << 16) | (zn << 5) | a)
+.endif
+.raise 5
+.return 0
+.endfunc
+!def s2luti2(nm, base2, base4, el, sz, mx2, mx4, sh2) {
+!{nm} {zd.!{el},za.!{el}},ZT0,zn[!!i] :: .call lutil(!{base2},!{base4},!{sz},i,zn,zd,za,!{mx2},!{mx4},!{sh2})
+!{nm} {zd.!{el}-za.!{el}},ZT0,zn[!!i] :: .call lutil(!{base2},!{base4},!{sz},i,zn,zd,za,!{mx2},!{mx4},!{sh2})
+}
+!s2luti2("LUTI2", 0xc08c4000, 0xc08c8000, "B", 0, 3, 1, 15)
+!s2luti2("LUTI2", 0xc08c4000, 0xc08c8000, "H", 1, 3, 1, 15)
+!s2luti2("LUTI2", 0xc08c4000, 0xc08c8000, "S", 2, 3, 1, 15)
+!s2luti2("LUTI4", 0xc08a4000, 0xc08a8000, "B", 0, 1, -1, 15)
+!s2luti2("LUTI4", 0xc08a4000, 0xc08a8000, "H", 1, 1, 1, 15)
+!s2luti2("LUTI4", 0xc08a4000, 0xc08a8000, "S", 2, 1, 1, 15)
+
+/* -------------------------------------------------------------------
+/* SME2: multi-vector operations on Z registers.
+/*
+/* A list is a pair or a quad, and only its first register is encoded.
+/* n2q reads the two written register numbers, checks the alignment,
+/* and answers 0 for a pair and 1 for a quad; every row below goes
+/* through it so one pattern covers both widths.
+/* ------------------------------------------------------------------- */
+.check::zp::ZR
+.check::zq::ZR
+.check::zr::ZR
+.check::zs::ZR
+
+.func::n2q::a,b
+n = b - a
+.if n == 1 .then
+.if (a & 1) != 0 .then
+.raise 5
+.endif
+.return 0
+.endif
+.if n == 3 .then
+.if (a & 3) != 0 .then
+.raise 5
+.endif
+.return 1
+.endif
+.raise 5
+.return 0
+.endfunc
+
+/* Binary, destructive, against one vector or against a list */
+.func::s2a1::sz,opc,u,zm,a,b
+g = .call n2q(a, b)
+.return .call w4(0xc120a000 | (sz << 22) | (zm << 16) | (g << 11) | (opc << 5) | u | a)
+.endfunc
+.func::s2a2::sz,opc,u,m,n,a,b
+g = .call n2q(a, b)
+h = .call n2q(m, n)
+.if g != h .then
+.raise 5
+.endif
+.return .call w4(0xc120b000 | (sz << 22) | (m << 16) | (g << 11) | (opc << 5) | u | a)
+.endfunc
+!def s2mv1(nm, opc, u, el, sz) {
+!{nm} {zd.!{el},za.!{el}},{zd.!{el},za.!{el}},zx.!{el} :: .call s2a1(!{sz},!{opc},!{u},zx,zd,za)
+!{nm} {zd.!{el}-za.!{el}},{zd.!{el}-za.!{el}},zx.!{el} :: .call s2a1(!{sz},!{opc},!{u},zx,zd,za)
+!{nm} {zd.!{el},za.!{el}},{zd.!{el},za.!{el}},{zm.!{el},zk.!{el}} :: .call s2a2(!{sz},!{opc},!{u},zm,zk,zd,za)
+!{nm} {zd.!{el}-za.!{el}},{zd.!{el}-za.!{el}},{zm.!{el}-zk.!{el}} :: .call s2a2(!{sz},!{opc},!{u},zm,zk,zd,za)
+}
+!def s2mvi(nm, opc, u) {
+!s2mv1(nm, opc, u, "B", 0)
+!s2mv1(nm, opc, u, "H", 1)
+!s2mv1(nm, opc, u, "S", 2)
+!s2mv1(nm, opc, u, "D", 3)
+}
+!def s2mvf(nm, opc, u) {
+!s2mv1(nm, opc, u, "H", 1)
+!s2mv1(nm, opc, u, "S", 2)
+!s2mv1(nm, opc, u, "D", 3)
+}
+!s2mvi("SMAX", 0x00, 0)
+!s2mvi("UMAX", 0x00, 1)
+!s2mvi("SMIN", 0x01, 0)
+!s2mvi("UMIN", 0x01, 1)
+!s2mvf("FMAX", 0x08, 0)
+!s2mvf("FMIN", 0x08, 1)
+!s2mvf("FMAXNM", 0x09, 0)
+!s2mvf("FMINNM", 0x09, 1)
+!s2mvi("SRSHL", 0x11, 0)
+!s2mvi("URSHL", 0x11, 1)
+/* ADD has only the single-vector second operand */
+!def s2mvs(nm, opc, u, el, sz) {
+!{nm} {zd.!{el},za.!{el}},{zd.!{el},za.!{el}},zx.!{el} :: .call s2a1(!{sz},!{opc},!{u},zx,zd,za)
+!{nm} {zd.!{el}-za.!{el}},{zd.!{el}-za.!{el}},zx.!{el} :: .call s2a1(!{sz},!{opc},!{u},zx,zd,za)
+}
+!s2mvs("ADD", 0x18, 0, "B", 0)
+!s2mvs("ADD", 0x18, 0, "H", 1)
+!s2mvs("ADD", 0x18, 0, "S", 2)
+!s2mvs("ADD", 0x18, 0, "D", 3)
+!s2mvi("SQDMULH", 0x20, 0)
+
+/* Clamp to a range */
+.func::s2cl::base,sz,zn,zm,u,a,b
+g = .call n2q(a, b)
+.return .call w4(base | (sz << 22) | (zm << 16) | (g << 11) | (zn << 5) | u | a)
+.endfunc
+!def s2clamp(nm, base, u, el, sz) {
+!{nm} {zd.!{el},za.!{el}},zn.!{el},zm.!{el} :: .call s2cl(!{base},!{sz},zn,zm,!{u},zd,za)
+!{nm} {zd.!{el}-za.!{el}},zn.!{el},zm.!{el} :: .call s2cl(!{base},!{sz},zn,zm,!{u},zd,za)
+}
+!def s2clampi(nm, base, u) {
+!s2clamp(nm, base, u, "B", 0)
+!s2clamp(nm, base, u, "H", 1)
+!s2clamp(nm, base, u, "S", 2)
+!s2clamp(nm, base, u, "D", 3)
+}
+!s2clampi("SCLAMP", 0xc120c400, 0)
+!s2clampi("UCLAMP", 0xc120c400, 1)
+!s2clamp("FCLAMP", 0xc120c000, 0, "H", 1)
+!s2clamp("FCLAMP", 0xc120c000, 0, "S", 2)
+!s2clamp("FCLAMP", 0xc120c000, 0, "D", 3)
+
+/* Select between two lists under a counter */
+.func::s2sel::sz,pn,m,n,x,y,a,b
+g = .call n2q(a, b)
+.if g != .call n2q(m, n) .then
+.raise 5
+.endif
+.if g != .call n2q(x, y) .then
+.raise 5
+.endif
+.return .call w4(0xc1208000 | (sz << 22) | (x << 16) | (g << 16) | ((pn - 8) << 10) | (m << 5) | a)
+.endfunc
+!def s2selr(el, sz) {
+SEL {zd.!{el},za.!{el}},pnn,{zn.!{el},zb.!{el}},{zm.!{el},zk.!{el}} :: .call s2sel(!{sz},pnn,zn,zb,zm,zk,zd,za)
+SEL {zd.!{el}-za.!{el}},pnn,{zn.!{el}-zb.!{el}},{zm.!{el}-zk.!{el}} :: .call s2sel(!{sz},pnn,zn,zb,zm,zk,zd,za)
+}
+!s2selr("B", 0)
+!s2selr("H", 1)
+!s2selr("S", 2)
+!s2selr("D", 3)
+
+/* Interleave and deinterleave */
+!def s2zip(nm, base, u, el, sz) {
+!{nm} {zd.!{el},za.!{el}},zn.!{el},zm.!{el} ::(zd&1)!=0;5,za!=zd+1;5 :: .call w4(!{base}|(!{sz}<<22)|(zm<<16)|(zn<<5)|!{u}|zd)
+!{nm} {zd.!{el}-za.!{el}},zn.!{el},zm.!{el} ::(zd&1)!=0;5,za!=zd+1;5 :: .call w4(!{base}|(!{sz}<<22)|(zm<<16)|(zn<<5)|!{u}|zd)
+}
+!def s2zipq(nm, base, u, el, sz) {
+!{nm} {zd.!{el}-za.!{el}},{zn.!{el}-zb.!{el}} ::(zd&3)!=0;5,za!=zd+3;5,(zn&3)!=0;5,zb!=zn+3;5 :: .call w4(!{base}|(!{sz}<<22)|(zn<<5)|!{u}|zd)
+}
+!def s2zipa(nm, u) {
+!s2zip(nm, 0xc120d000, u, "B", 0)
+!s2zip(nm, 0xc120d000, u, "H", 1)
+!s2zip(nm, 0xc120d000, u, "S", 2)
+!s2zip(nm, 0xc120d000, u, "D", 3)
+!s2zip(nm, 0xc120d400, u, "Q", 0)
+!s2zipq(nm, 0xc136e000, 2*u, "B", 0)
+!s2zipq(nm, 0xc136e000, 2*u, "H", 1)
+!s2zipq(nm, 0xc136e000, 2*u, "S", 2)
+!s2zipq(nm, 0xc136e000, 2*u, "D", 3)
+!s2zipq(nm, 0xc137e000, 2*u, "Q", 0)
+}
+!s2zipa("ZIP", 0)
+!s2zipa("UZP", 1)
+
+/* Conversions between lists of the same width */
+!def s2cvt2(nm, base, del, sel) {
+!{nm} {zd.!{del},za.!{del}},{zn.!{sel},zb.!{sel}} ::(zd&1)!=0;5,za!=zd+1;5,(zn&1)!=0;5,zb!=zn+1;5 :: .call w4(!{base}|(zn<<5)|zd)
+}
+!def s2cvt4(nm, base, del, sel) {
+!{nm} {zd.!{del}-za.!{del}},{zn.!{sel}-zb.!{sel}} ::(zd&3)!=0;5,za!=zd+3;5,(zn&3)!=0;5,zb!=zn+3;5 :: .call w4(!{base}|(zn<<5)|zd)
+}
+!s2cvt2("FCVTZS", 0xc121e000, "S", "S")
+!s2cvt2("FCVTZU", 0xc121e020, "S", "S")
+!s2cvt2("SCVTF", 0xc122e000, "S", "S")
+!s2cvt2("UCVTF", 0xc122e020, "S", "S")
+!s2cvt2("FRINTN", 0xc1a8e000, "S", "S")
+!s2cvt2("FRINTP", 0xc1a9e000, "S", "S")
+!s2cvt2("FRINTM", 0xc1aae000, "S", "S")
+!s2cvt2("FRINTA", 0xc1ace000, "S", "S")
+!s2cvt4("FCVTZS", 0xc131e000, "S", "S")
+!s2cvt4("FCVTZU", 0xc131e020, "S", "S")
+!s2cvt4("SCVTF", 0xc132e000, "S", "S")
+!s2cvt4("UCVTF", 0xc132e020, "S", "S")
+!s2cvt4("FRINTN", 0xc1b8e000, "S", "S")
+!s2cvt4("FRINTP", 0xc1b9e000, "S", "S")
+!s2cvt4("FRINTM", 0xc1bae000, "S", "S")
+!s2cvt4("FRINTA", 0xc1bce000, "S", "S")
+
+/* Narrowing conversions into one vector */
+!def s2nar2(nm, base, del, sel) {
+!{nm} zd.!{del},{zn.!{sel},zb.!{sel}} ::(zn&1)!=0;5,zb!=zn+1;5 :: .call w4(!{base}|(zn<<5)|zd)
+}
+!def s2nar4(nm, base, del, sel) {
+!{nm} zd.!{del},{zn.!{sel}-zb.!{sel}} ::(zn&3)!=0;5,zb!=zn+3;5 :: .call w4(!{base}|(zn<<5)|zd)
+}
+!s2nar2("FCVT", 0xc120e000, "H", "S")
+!s2nar2("FCVTN", 0xc120e020, "H", "S")
+!s2nar2("BFCVT", 0xc160e000, "H", "S")
+!s2nar2("BFCVTN", 0xc160e020, "H", "S")
+!s2nar2("SQCVT", 0xc123e000, "H", "S")
+!s2nar2("UQCVT", 0xc123e020, "H", "S")
+!s2nar2("SQCVTU", 0xc163e000, "H", "S")
+!s2nar4("SQCVT", 0xc133e000, "B", "S")
+!s2nar4("UQCVT", 0xc133e020, "B", "S")
+!s2nar4("SQCVTN", 0xc133e040, "B", "S")
+!s2nar4("UQCVTN", 0xc133e060, "B", "S")
+!s2nar4("SQCVTU", 0xc173e000, "B", "S")
+!s2nar4("SQCVTUN", 0xc173e040, "B", "S")
+!s2nar4("SQCVT", 0xc1b3e000, "H", "D")
+!s2nar4("UQCVT", 0xc1b3e020, "H", "D")
+!s2nar4("SQCVTN", 0xc1b3e040, "H", "D")
+!s2nar4("UQCVTN", 0xc1b3e060, "H", "D")
+!s2nar4("SQCVTU", 0xc1f3e000, "H", "D")
+!s2nar4("SQCVTUN", 0xc1f3e040, "H", "D")
+/* The two-vector saturating narrow lives in the SVE2 encoding space */
+!s2nar2("SQCVTN", 0x45314000, "H", "S")
+!s2nar2("UQCVTN", 0x45314800, "H", "S")
+!s2nar2("SQCVTUN", 0x45315000, "H", "S")
+
+/* Narrowing shifts.  The field holds the destination width less the
+/* shift amount. */
+!def s2nsh2(nm, base, del, sel, es) {
+!{nm} zd.!{del},{zn.!{sel},zb.!{sel}},#!s ::s<1;3,s>!{es};3,(zn&1)!=0;5,zb!=zn+1;5 :: .call w4(!{base}|(((!{es}-s)&0x1f)<<16)|((((!{es}-s)>>5)&1)<<22)|(zn<<5)|zd)
+}
+!def s2nsh4(nm, base, del, sel, es) {
+!{nm} zd.!{del},{zn.!{sel}-zb.!{sel}},#!s ::s<1;3,s>!{es};3,(zn&3)!=0;5,zb!=zn+3;5 :: .call w4(!{base}|(((!{es}-s)&0x1f)<<16)|((((!{es}-s)>>5)&1)<<22)|(zn<<5)|zd)
+}
+!s2nsh2("SQRSHR", 0xc1e0d400, "H", "S", 16)
+!s2nsh2("UQRSHR", 0xc1e0d420, "H", "S", 16)
+!s2nsh2("SQRSHRU", 0xc1f0d400, "H", "S", 16)
+!s2nsh4("SQRSHR", 0xc160d800, "B", "S", 32)
+!s2nsh4("UQRSHR", 0xc160d820, "B", "S", 32)
+!s2nsh4("SQRSHRU", 0xc160d840, "B", "S", 32)
+!s2nsh4("SQRSHRN", 0xc160dc00, "B", "S", 32)
+!s2nsh4("UQRSHRN", 0xc160dc20, "B", "S", 32)
+!s2nsh4("SQRSHRUN", 0xc160dc40, "B", "S", 32)
+!s2nsh4("SQRSHR", 0xc1a0d800, "H", "D", 64)
+!s2nsh4("UQRSHR", 0xc1a0d820, "H", "D", 64)
+!s2nsh4("SQRSHRU", 0xc1a0d840, "H", "D", 64)
+!s2nsh4("SQRSHRN", 0xc1a0dc00, "H", "D", 64)
+!s2nsh4("UQRSHRN", 0xc1a0dc20, "H", "D", 64)
+!s2nsh4("SQRSHRUN", 0xc1a0dc40, "H", "D", 64)
+!s2nsh2("SQRSHRN", 0x45b02800, "H", "S", 16)
+!s2nsh2("UQRSHRN", 0x45b03800, "H", "S", 16)
+!s2nsh2("SQRSHRUN", 0x45b00800, "H", "S", 16)
