@@ -603,6 +603,10 @@ _ELF_MACHINE_RAW = {
             'movw_uabs_g1': (265, 4), 'movw_uabs_g1_nc': (266, 4),
             'movw_uabs_g2': (267, 4), 'movw_uabs_g2_nc': (268, 4),
             'movw_uabs_g3': (269, 4),
+            'movw_prel_g0': (287, 4), 'movw_prel_g0_nc': (288, 4),
+            'movw_prel_g1': (289, 4), 'movw_prel_g1_nc': (290, 4),
+            'movw_prel_g2': (291, 4), 'movw_prel_g2_nc': (292, 4),
+            'movw_prel_g3': (293, 4),
             'adr_prel_lo21': (274, 4),
             'adr_prel_pg_hi21': (275, 4), 'adrp': (275, 4),
             'adr_prel_pg_hi21_nc': (276, 4),
@@ -687,6 +691,10 @@ AARCH64_INSN_RELOCS = {
     265: _A64_MOVW_FIELD, 266: _A64_MOVW_FIELD,   # MOVW_UABS_G1 / _NC
     267: _A64_MOVW_FIELD, 268: _A64_MOVW_FIELD,   # MOVW_UABS_G2 / _NC
     269: _A64_MOVW_FIELD,                         # MOVW_UABS_G3
+    287: _A64_MOVW_FIELD, 288: _A64_MOVW_FIELD,   # MOVW_PREL_G0 / _NC
+    289: _A64_MOVW_FIELD, 290: _A64_MOVW_FIELD,   # MOVW_PREL_G1 / _NC
+    291: _A64_MOVW_FIELD, 292: _A64_MOVW_FIELD,   # MOVW_PREL_G2 / _NC
+    293: _A64_MOVW_FIELD,                         # MOVW_PREL_G3
     274: _A64_ADR_FIELDS,                         # ADR_PREL_LO21
     275: _A64_ADR_FIELDS, 276: _A64_ADR_FIELDS,   # ADR_PREL_PG_HI21 / _NC
     277: _A64_LO12_FIELD,                         # ADD_ABS_LO12_NC
@@ -3308,6 +3316,23 @@ class BinaryWriter:
         with open(self.state.outfile, 'wb') as f:
             f.write(data)
         print(f"wrote raw binary {self.state.outfile} ({len(data)} bytes)", file=sys.stderr)
+
+        # 命令フィールド型のリロケーションを出した箇所は、RELA の作法どおり命令語の
+        # ビット欄を 0 にしてある（リンカが埋める）。同じ実行で -b も書いていると、
+        # その 0 がそのまま生バイナリに残り、リンカを通さない側だけが壊れる。
+        # 黙って壊れた方が困るので、どの箇所かを添えて知らせる。
+        if self.state.elf_objfile:
+            _zeroed = [r for r in self.state.relocations
+                       if insn_reloc_field_mask(r[3]) is not None]
+            if _zeroed:
+                _where = ', '.join(f"{r[0]}+0x{r[1]:x}" for r in _zeroed[:4])
+                if len(_zeroed) > 4:
+                    _where += ', ...'
+                self.state.diag(
+                    f" warning - {len(_zeroed)} instruction field(s) were left 0 for the"
+                    f" linker ({_where}); this raw binary is only correct after linking"
+                    f" {self.state.elf_objfile}. Drop -o to have axx fill them in.",
+                    set_error=False, force=True)
 
     def fwrite(self, position, x, prt):
         if self.state.bts <= 0:

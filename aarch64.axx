@@ -565,9 +565,24 @@ i8 = .call fpimm8(v)
 /* Data processing -- immediate
 /* =================================================================== */
 
-/* PC-relative addressing */
+/* PC-relative addressing.
+/*
+/* ADR and ADRP hold a slice of the symbol -- ADR the 21-bit byte
+/* displacement, ADRP the page displacement -- so with `-o` the field
+/* has to be left to the linker: the page a symbol lands on is not
+/* known until sections are placed. `.reloc` names the type for the
+/* operand variable, which makes axx zero the field and emit the
+/* relocation instead of filling in its own answer. With `-b` the
+/* declaration is inert and axx computes the field as before.
+/*
+/* `.clrreloc` after each group matters: `.reloc` is position dependent
+/* and `t` is the operand variable of nearly every row in this file. */
+.reloc::t::adr_prel_lo21
 ADR xd,!t ::((t-$$)<-1048576)||((t-$$)>1048575);2 :: .call w4((((t-$$)&3)<<29)|(0x10<<24)|((((t-$$)>>2)&0x7ffff)<<5)|xd)
+.clrreloc::t
+.reloc::t::adr_prel_pg_hi21
 ADRP xd,!t :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
+.clrreloc::t
 
 /* Add/subtract (immediate). sh selects the LSL #12 form. */
 !def asi(nm, op, s, rd, rn, sf) {
@@ -3488,25 +3503,35 @@ CPP RCTX,xt :: .call w4(0xd50b73e0|xt)
 /* character there, and only "::" separates the three fields -- so
 /* each one is a row that computes its own slice.
 /*
-/* What axx does with it differs from a linker-targeted assembler.
-/* GNU as and llvm-mc leave the field zero and emit a relocation;
-/* axx resolves the symbol itself and fills the field in, which is
-/* the same thing it already does for "B label" and every other
-/* symbol reference in this file. So the output is finished code,
-/* correct whenever the symbol's address is known at assembly time --
-/* which is the case for "-b", and for "-o" when the symbol is
-/* defined in the same source. For a symbol the linker has to place,
-/* axx cannot express these relocations: its relocation tracking
-/* follows label references through binary_list words, and the words
-/* here come out of a mini-language .call, which it does not follow.
-/* The modifiers below are therefore about accepting and computing
-/* the syntax, not about deferring it to a linker.
+/* What axx does with it depends on the output it was asked for.
+/*
+/* With "-o" it behaves like GNU as and llvm-mc: the instruction field
+/* is left zero and a relocation is emitted, so the linker fills in
+/* the slice once it has placed the section. That is not an
+/* optimisation but a requirement -- a page displacement or a 16-bit
+/* slice of a symbol in another section is not knowable at assembly
+/* time, and an assembler that answers anyway writes code that breaks
+/* as soon as the linker moves anything.
+/*
+/* With "-b" there is no linker, so axx resolves the symbol itself and
+/* fills the field in, the same thing it already does for "B label"
+/* and every other symbol reference in this file. The output is
+/* finished code.
+/*
+/* Each group below declares its type with ".reloc::t::<type>" and
+/* takes it back with ".clrreloc::t". The declaration is what lets axx
+/* carry the reference out to a relocation: the field is packed by a
+/* mini-language .call, so the addend cannot be read back out of the
+/* emitted word, and the type says which slice the field holds.
+/* ".reloc" is inert unless "-o" was given, which is why the two
+/* readings above come from one set of rows.
 /*
 /* :got: and :got_lo12: need a word of their own. To a linker they
-/* name the GOT entry it builds for the symbol, and axx builds no
-/* GOT. What axx does instead is take the symbol you name as being
-/* the GOT slot itself -- which is what you write anyway when there
-/* is no linker and the table is yours:
+/* name the GOT entry it builds for the symbol, which is what "-o"
+/* now emits -- point them at the symbol, as linker-targeted source
+/* does. With "-b" there is no GOT to build, and the reading is
+/* instead that the symbol you name IS the slot -- which is what you
+/* write anyway when the table is yours:
 /*
 /*     adrp    x0, :got:printf_slot
 /*     ldr     x0, [x0, :got_lo12:printf_slot]
@@ -3514,12 +3539,9 @@ CPP RCTX,xt :: .call w4(0xd50b73e0|xt)
 /*     printf_slot:
 /*         .zero 8              /* filled in at run time */
 /*
-/* So :got: is the ADRP page of that slot and :got_lo12: is its low
-/* 12 bits scaled by 8, which is exactly the arithmetic the two
-/* relocations stand for once the slot has an address. Point them at
-/* the symbol itself, the way linker-targeted source does, and the
-/* result is the address of the symbol rather than of a slot holding
-/* it -- that indirection is the linker's, and axx cannot supply it.
+/* So under "-b", :got: is the ADRP page of that slot and :got_lo12:
+/* its low 12 bits scaled by 8, which is exactly the arithmetic the
+/* two relocations stand for once the slot has an address.
 /*
 /* :tlsdesc:, :gottprel: and the TLS :tprel_* / :dtprel_* family are
 /* still left out: those name offsets a linker and a thread-local
@@ -3533,70 +3555,95 @@ CPP RCTX,xt :: .call w4(0xd50b73e0|xt)
 /* ADD (immediate). Only ADD takes :lo12:, because the relocation it
 /* stands for (ADD_ABS_LO12_NC) is defined for ADD alone. */
 !def addlo12(rd, rn, sf) {
+.reloc::t::add_abs_lo12_nc
 ADD !{rd},!{rn},:LO12:!t :: .call w4((!{sf}<<31)|(0x11<<24)|((t&0xfff)<<10)|(!{rn}<<5)|!{rd})
 ADD !{rd},!{rn},#:LO12:!t :: .call w4((!{sf}<<31)|(0x11<<24)|((t&0xfff)<<10)|(!{rn}<<5)|!{rd})
+.clrreloc::t
 }
 !addlo12("xs", "xe", 1)
 !addlo12("ws", "we", 0)
 
 /* Loads and stores. The low 12 bits are scaled by the access size,
 /* which is also what makes the alignment check below meaningful. */
-!def lslo12(mn, rt, size, v, opc, scale) {
+/* `rel` is the relocation type, which follows the access size rather
+/* than the mnemonic: LDST8/16/32/64/128_ABS_LO12_NC for scale 0..4.
+/* The linker scales the low 12 bits the same way this row does. */
+!def lslo12(mn, rt, size, v, opc, scale, rel) {
+.reloc::t::!{rel}
 !{mn} !{rt},[xb,:LO12:!t] ::(t&!{(1<<scale)-1})!=0;8 :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(1<<24)|(!{opc}<<22)|(((t&0xfff)>>!{scale})<<10)|(xb<<5)|!{rt})
 !{mn} !{rt},[xb,#:LO12:!t] ::(t&!{(1<<scale)-1})!=0;8 :: .call w4((!{size}<<30)|(7<<27)|(!{v}<<26)|(1<<24)|(!{opc}<<22)|(((t&0xfff)>>!{scale})<<10)|(xb<<5)|!{rt})
+.clrreloc::t
 }
-!lslo12("STRB", "wt", 0, 0, 0, 0)
-!lslo12("LDRB", "wt", 0, 0, 1, 0)
-!lslo12("LDRSB", "xt", 0, 0, 2, 0)
-!lslo12("LDRSB", "wt", 0, 0, 3, 0)
-!lslo12("STRH", "wt", 1, 0, 0, 1)
-!lslo12("LDRH", "wt", 1, 0, 1, 1)
-!lslo12("LDRSH", "xt", 1, 0, 2, 1)
-!lslo12("LDRSH", "wt", 1, 0, 3, 1)
-!lslo12("STR", "wt", 2, 0, 0, 2)
-!lslo12("LDR", "wt", 2, 0, 1, 2)
-!lslo12("LDRSW", "xt", 2, 0, 2, 2)
-!lslo12("STR", "xt", 3, 0, 0, 3)
-!lslo12("LDR", "xt", 3, 0, 1, 3)
-!lslo12("PRFM", "prf", 3, 0, 2, 3)
-!lslo12("STR", "fb", 0, 1, 0, 0)
-!lslo12("LDR", "fb", 0, 1, 1, 0)
-!lslo12("STR", "fq", 0, 1, 2, 4)
-!lslo12("LDR", "fq", 0, 1, 3, 4)
-!lslo12("STR", "fh", 1, 1, 0, 1)
-!lslo12("LDR", "fh", 1, 1, 1, 1)
-!lslo12("STR", "fs", 2, 1, 0, 2)
-!lslo12("LDR", "fs", 2, 1, 1, 2)
-!lslo12("STR", "ff", 3, 1, 0, 3)
-!lslo12("LDR", "ff", 3, 1, 1, 3)
+!lslo12("STRB", "wt", 0, 0, 0, 0, "ldst8_abs_lo12_nc")
+!lslo12("LDRB", "wt", 0, 0, 1, 0, "ldst8_abs_lo12_nc")
+!lslo12("LDRSB", "xt", 0, 0, 2, 0, "ldst8_abs_lo12_nc")
+!lslo12("LDRSB", "wt", 0, 0, 3, 0, "ldst8_abs_lo12_nc")
+!lslo12("STRH", "wt", 1, 0, 0, 1, "ldst16_abs_lo12_nc")
+!lslo12("LDRH", "wt", 1, 0, 1, 1, "ldst16_abs_lo12_nc")
+!lslo12("LDRSH", "xt", 1, 0, 2, 1, "ldst16_abs_lo12_nc")
+!lslo12("LDRSH", "wt", 1, 0, 3, 1, "ldst16_abs_lo12_nc")
+!lslo12("STR", "wt", 2, 0, 0, 2, "ldst32_abs_lo12_nc")
+!lslo12("LDR", "wt", 2, 0, 1, 2, "ldst32_abs_lo12_nc")
+!lslo12("LDRSW", "xt", 2, 0, 2, 2, "ldst32_abs_lo12_nc")
+!lslo12("STR", "xt", 3, 0, 0, 3, "ldst64_abs_lo12_nc")
+!lslo12("LDR", "xt", 3, 0, 1, 3, "ldst64_abs_lo12_nc")
+!lslo12("PRFM", "prf", 3, 0, 2, 3, "ldst64_abs_lo12_nc")
+!lslo12("STR", "fb", 0, 1, 0, 0, "ldst8_abs_lo12_nc")
+!lslo12("LDR", "fb", 0, 1, 1, 0, "ldst8_abs_lo12_nc")
+!lslo12("STR", "fq", 0, 1, 2, 4, "ldst128_abs_lo12_nc")
+!lslo12("LDR", "fq", 0, 1, 3, 4, "ldst128_abs_lo12_nc")
+!lslo12("STR", "fh", 1, 1, 0, 1, "ldst16_abs_lo12_nc")
+!lslo12("LDR", "fh", 1, 1, 1, 1, "ldst16_abs_lo12_nc")
+!lslo12("STR", "fs", 2, 1, 0, 2, "ldst32_abs_lo12_nc")
+!lslo12("LDR", "fs", 2, 1, 1, 2, "ldst32_abs_lo12_nc")
+!lslo12("STR", "ff", 3, 1, 0, 3, "ldst64_abs_lo12_nc")
+!lslo12("LDR", "ff", 3, 1, 1, 3, "ldst64_abs_lo12_nc")
+.reloc::t::ldst64_abs_lo12_nc
 PRFM #!p,[xb,:LO12:!t] ::p<0;3,p>31;3,(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1<<24)|(2<<22)|(((t&0xfff)>>3)<<10)|(xb<<5)|p)
 PRFM #!p,[xb,#:LO12:!t] ::p<0;3,p>31;3,(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1<<24)|(2<<22)|(((t&0xfff)>>3)<<10)|(xb<<5)|p)
+.clrreloc::t
 
 /* ADRP. :pg_hi21: is the explicit spelling of what a bare symbol
 /* already means there, so it encodes identically to the plain row
 /* further up. GNU as takes this spelling; llvm-mc does not. */
+.reloc::t::adr_prel_pg_hi21
 ADRP xd,:PG_HI21:!t :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
+.clrreloc::t
 
 /* The GOT pair. :got: is the page of the slot, :got_lo12: its low
 /* 12 bits scaled by 8 -- the slot holds a 64-bit address, so it is
 /* the LDR (64-bit) form that takes it, and the slot has to be
 /* 8-aligned for the offset to be representable. */
+/* With `-o` these become the real GOT relocations, and then the slot
+/* is the linker's to build -- point them at the symbol, as
+/* linker-targeted source does. The reading below, where the symbol you
+/* name IS the slot, is what `-b` still does. */
+.reloc::t::adr_got_page
 ADRP xd,:GOT:!t :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
 ADRP xd,#:GOT:!t :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
+.clrreloc::t
+.reloc::t::ld64_got_lo12_nc
 LDR xt,[xb,:GOT_LO12:!t] ::(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1<<24)|(1<<22)|(((t&0xfff)>>3)<<10)|(xb<<5)|xt)
 LDR xt,[xb,#:GOT_LO12:!t] ::(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1<<24)|(1<<22)|(((t&0xfff)>>3)<<10)|(xb<<5)|xt)
+.clrreloc::t
 
 /* Move wide. The modifier names which 16-bit slice of the symbol the
 /* field holds, and that also fixes hw. The checked forms report an
 /* error when the symbol does not fit below the slice they name; the
 /* _nc forms are the same encoding without that check. */
+/* The type name follows the slice the modifier names, so it can be
+/* spelled straight from `g` and `nc`: MOVW_UABS_G<g>[_NC]. */
 !def movwabs(nm, opc, rd, sf, g, nc, mx) {
 !if nc !then {
+.reloc::t::movw_uabs_g!{g}_nc
 !{nm} !{rd},#:ABS_G!{g}_NC:!t :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|(((t>>!{g * 16})&0xffff)<<5)|!{rd})
 !{nm} !{rd},:ABS_G!{g}_NC:!t :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|(((t>>!{g * 16})&0xffff)<<5)|!{rd})
+.clrreloc::t
 } !else {
+.reloc::t::movw_uabs_g!{g}
 !{nm} !{rd},#:ABS_G!{g}:!t ::(t>>!{(g + 1) * 16})!=0;3 :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|(((t>>!{g * 16})&0xffff)<<5)|!{rd})
 !{nm} !{rd},:ABS_G!{g}:!t ::(t>>!{(g + 1) * 16})!=0;3 :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|(((t>>!{g * 16})&0xffff)<<5)|!{rd})
+.clrreloc::t
 }
 }
 !def movwabsall(nm, opc) {
@@ -3619,11 +3666,15 @@ LDR xt,[xb,#:GOT_LO12:!t] ::(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1<<24)|(1<<2
 /* The PC-relative slices, which the assembler can also work out */
 !def movwprel(nm, opc, rd, sf, g, nc) {
 !if nc !then {
+.reloc::t::movw_prel_g!{g}_nc
 !{nm} !{rd},#:PREL_G!{g}_NC:!t :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|((((t-$$)>>!{g * 16})&0xffff)<<5)|!{rd})
 !{nm} !{rd},:PREL_G!{g}_NC:!t :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|((((t-$$)>>!{g * 16})&0xffff)<<5)|!{rd})
+.clrreloc::t
 } !else {
+.reloc::t::movw_prel_g!{g}
 !{nm} !{rd},#:PREL_G!{g}:!t :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|((((t-$$)>>!{g * 16})&0xffff)<<5)|!{rd})
 !{nm} !{rd},:PREL_G!{g}:!t :: .call w4((!{sf}<<31)|(!{opc}<<29)|(0x25<<23)|(!{g}<<21)|((((t-$$)>>!{g * 16})&0xffff)<<5)|!{rd})
+.clrreloc::t
 }
 }
 !def movwprelall(nm, opc) {

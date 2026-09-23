@@ -1646,6 +1646,10 @@ static const ElfNamedReloc _named_aarch64[] = {
     {"movw_uabs_g1", 265, 4}, {"movw_uabs_g1_nc", 266, 4},
     {"movw_uabs_g2", 267, 4}, {"movw_uabs_g2_nc", 268, 4},
     {"movw_uabs_g3", 269, 4},
+    {"movw_prel_g0", 287, 4}, {"movw_prel_g0_nc", 288, 4},
+    {"movw_prel_g1", 289, 4}, {"movw_prel_g1_nc", 290, 4},
+    {"movw_prel_g2", 291, 4}, {"movw_prel_g2_nc", 292, 4},
+    {"movw_prel_g3", 293, 4},
     {"adr_prel_lo21", 274, 4},
     {"adr_prel_pg_hi21", 275, 4}, {"adrp", 275, 4},
     {"adr_prel_pg_hi21_nc", 276, 4},
@@ -1678,7 +1682,9 @@ static uint32_t insn_reloc_field_mask(int rtype){
     switch(rtype){
     case 263: case 264: case 265: case 266:
     case 267: case 268: case 269:
-        return 0xffffu << 5;                    /* MOVW_UABS_G0..G3  imm16 */
+    case 287: case 288: case 289: case 290:
+    case 291: case 292: case 293:
+        return 0xffffu << 5;                    /* MOVW_UABS/PREL_G0..G3  imm16 */
     case 274: case 275: case 276:
         return (3u << 29) | (0x7ffffu << 5);    /* ADR/ADRP  immlo+immhi */
     case 277: case 278: case 284: case 285:
@@ -2935,6 +2941,33 @@ static void binary_flush(AsmState *st){
     fclose(fp);
     fprintf(stderr,"wrote raw binary %s (%llu bytes)\n",st->outfile,(unsigned long long)total_size);
     free(data);
+
+    /* 命令フィールド型のリロケーションを出した箇所は、RELA の作法どおり命令語の
+     * ビット欄を 0 にしてある（リンカが埋める）。同じ実行で -b も書いていると、
+     * その 0 がそのまま生バイナリに残り、リンカを通さない側だけが壊れる。
+     * 黙って壊れた方が困るので、どの箇所かを添えて知らせる。 */
+    if(st->elf_objfile[0]){
+        int _nz = 0;
+        char _where[256]; size_t _wl = 0; _where[0] = '\0';
+        for(int i = 0; i < st->reloc_count; i++){
+            if(insn_reloc_field_mask(st->relocations[i].rtype) == 0) continue;
+            _nz++;
+            if(_nz <= 4){
+                int _n = snprintf(_where + _wl, sizeof(_where) - _wl, "%s%s+0x%llx",
+                                  _nz > 1 ? ", " : "",
+                                  st->relocations[i].section,
+                                  (unsigned long long)st->relocations[i].sec_offset);
+                if(_n > 0 && (size_t)_n < sizeof(_where) - _wl) _wl += (size_t)_n;
+            }
+        }
+        if(_nz > 0){
+            if(_nz > 4) snprintf(_where + _wl, sizeof(_where) - _wl, ", ...");
+            axx_diagf(0, 1, " warning - %d instruction field(s) were left 0 for the"
+                            " linker (%s); this raw binary is only correct after linking"
+                            " %s. Drop -o to have axx fill them in.\n",
+                      _nz, _where, st->elf_objfile);
+        }
+    }
 }
 
 static int var_slot_is_undef(AsmState *st, int slot){

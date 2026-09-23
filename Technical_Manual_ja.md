@@ -1120,6 +1120,7 @@ AArch64 で使える命令フィールド型は次のとおりです。データ
 | `ldst8_abs_lo12_nc` | 278 | ロード/ストアの imm12 |
 | `ldst16` / `ldst32` / `ldst64` / `ldst128_abs_lo12_nc` | 284 / 285 / 286 / 299 | 同上、幅ごとの縮尺 |
 | `movw_uabs_g0` … `g3`（`_nc` 付きも） | 263–269 | `movz` / `movk` の imm16 |
+| `movw_prel_g0` … `g3`（`_nc` 付きも） | 287–293 | 同上、PC 相対 |
 | `got_page` (`adr_got_page`) | 311 | `adrp` の immlo/immhi — GOT ページ |
 | `got_lo12` (`ld64_got_lo12_nc`) | 312 | 64bit `ldr` の imm12 — GOT 内オフセット |
 | `got_ld_prel19` | 309 | リテラル `ldr` の imm19 |
