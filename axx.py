@@ -3600,6 +3600,36 @@ class DirectiveProcessor:
         self.state.vliwset = self.add_avoiding_dup(self.state.vliwset, [idxs, s2])
         return True
 
+    def _cond_tests_relocated_var(self, cond_src):
+        """この条件式は、リンカが値を決める変数を見ているか。
+
+        `-o` で命令フィールド型のリロケーションを出す箇所では、命令語のビット欄は
+        0 で出してリンカが埋める。つまり `t` の値はアセンブル時には確定しておらず、
+        axx が持っているのは自分の仮レイアウト上の値にすぎない。その値に対する
+        整列・範囲チェックは判定できないものを判定していることになり、正しいソース
+        まで弾く。範囲や整列が本当に外れていればリンカが報告する（例:
+        `improper alignment for relocation R_AARCH64_LDST64_ABS_LO12_NC`）ので、
+        ここでは黙って通す。
+
+        対象は「その変数を読んでいる条件」だけ。同じ行の他のオペランドを見る条件
+        （PRFM の `p<0` 等）はそのまま働く。
+        """
+        if not self.state.elf_objfile or not self.state.reloc_constraints:
+            return False
+        for var, rtype in self.state.reloc_constraints.items():
+            if insn_reloc_field_mask(rtype) is None:
+                continue
+            for m in re.finditer(re.escape(var), cond_src):
+                b, e = m.start(), m.end()
+                # 変数名は単独の語として現れたときだけ。`t` が `tmp` や `xt` の
+                # 一部であるものを拾わない。
+                if b > 0 and (cond_src[b - 1].isalnum() or cond_src[b - 1] == '_'):
+                    continue
+                if e < len(cond_src) and (cond_src[e].isalnum() or cond_src[e] == '_'):
+                    continue
+                return True
+        return False
+
     def error(self, s):
         ss = s.replace(' ', '')
         if ss == "":
@@ -3633,7 +3663,8 @@ class DirectiveProcessor:
             if idx <= idx_before:
                 break
 
-            if (self.state.should_report_errors()) and u:
+            if (self.state.should_report_errors()) and u \
+                    and not self._cond_tests_relocated_var(s[idx_before:idx]):
                 try:
                     t_int = int(t)
                 except (OverflowError, ValueError):
@@ -9919,7 +9950,24 @@ class Assembler:
             v &= (1 << (addr_sz * 8)) - 1
             return _struct.pack(f'{_pk}I', v) if addr_sz == 4 else _struct.pack(f'{_pk}Q', v)
 
+        # DWARF が書く絶対アドレス参照の欄幅は addr_sz（= -f で決まる ELF クラス）
+        # だが、dwarf_abs はマシンごとの固定値。`-f` がそのマシンの慣習クラスと
+        # 違うときは両者がずれ、4バイトの欄に 8バイト型（あるいはその逆）の
+        # リロケーションを張ることになる。欄と同じ幅の型に取り替える。
         abs64 = _mach_tbl_dw['dwarf_abs']
+        if _mach_tbl_dw['reloc_bytes'].get(abs64) != addr_sz:
+            _want = 'abs64' if addr_sz == 8 else 'abs32'
+            _alt = _mach_tbl_dw['named'].get(_want)
+            if _alt is not None and _mach_tbl_dw['reloc_bytes'].get(_alt) == addr_sz:
+                abs64 = _alt
+            else:
+                # 幅の合う絶対型を持たないマシン（32bit 機を -f 64 で出した場合）。
+                # 幅の違う型を張れば黙って壊れたデバッグ情報になるので出さない。
+                self.state.diag(
+                    f" warning - DWARF debug info (-g) needs a {addr_sz}-byte absolute "
+                    f"relocation, which {_mach_tbl_dw['name']} does not have; "
+                    f"skipping debug sections.", set_error=False)
+                return [], []
 
         def _uleb(v):
             out = bytearray()
@@ -9969,8 +10017,27 @@ class Assembler:
         DW_FORM_addr, DW_FORM_data2, DW_FORM_data8 = 0x01, 0x05, 0x07
         DW_FORM_string, DW_FORM_sec_offset = 0x08, 0x17
 
+        # 子 DIE になるラベルを先に集める。CU の DW_CHILDREN は「子があるか」を
+        # 宣言するもので、ラベルを1つも持たないソース（命令だけのファイル）では
+        # 子なしになる。宣言と中身が食い違うと DWARF の検証器が指摘するため、
+        # 表を組む前に確定させる。
+        _dbg_labels = []
+        for _name, *_rest in sorted(self.state.labels.items()):
+            _entry = _rest[0]
+            if (len(_entry) > 2 and _entry[2]) or (len(_entry) > 3 and _entry[3]):
+                continue                      # .equ と取り込みラベルは持たない
+            try:
+                _byte_addr = int(_entry[0]) * bpw
+            except (TypeError, ValueError, OverflowError):
+                continue
+            _sidx, _off = _addr_to_sec(_byte_addr, _entry[1])
+            if _sidx is None:
+                continue
+            _dbg_labels.append((_name, _sidx, _off))
+
         abbrev = bytearray()
-        abbrev += _uleb(1) + _uleb(DW_TAG_compile_unit) + bytes([DW_CHILDREN_yes])
+        abbrev += _uleb(1) + _uleb(DW_TAG_compile_unit) \
+            + bytes([DW_CHILDREN_yes if _dbg_labels else DW_CHILDREN_no])
         for at, fm in ((DW_AT_producer, DW_FORM_string),
                        (DW_AT_language, DW_FORM_data2),
                        (DW_AT_name, DW_FORM_string),
@@ -10011,25 +10078,15 @@ class Assembler:
         die += _pack_addr(0)
         die += _struct.pack(f'{_pk}Q', primary_size & 0xFFFFFFFFFFFFFFFF)
         die += _struct.pack(f'{_pk}I', 0)
-        for name, *_rest in sorted(self.state.labels.items()):
-            entry = _rest[0]
-            val = entry[0]
-            is_equ = len(entry) > 2 and entry[2]
-            is_imported = len(entry) > 3 and entry[3]
-            if is_equ or is_imported:
-                continue
-            try:
-                byte_addr = int(val) * bpw
-            except (TypeError, ValueError, OverflowError):
-                continue
-            sidx, off = _addr_to_sec(byte_addr, entry[1])
-            if sidx is None:
-                continue
+        for name, sidx, off in _dbg_labels:
             die += _uleb(2)
             die += name.encode() + b'\x00'
             info_relas.append((len(die), sidx, abs64, off))
             die += _pack_addr(0 if is_rela_dw else off)
-        die += _uleb(0)
+        if _dbg_labels:
+            # 子の連鎖を閉じる null DIE。DW_CHILDREN_no のときは連鎖自体が無いので
+            # 置いてはいけない（読み手が余分な abbrev コード 0 を拾ってしまう）。
+            die += _uleb(0)
 
         info_body = (_struct.pack(f'{_pk}H', 4)
                      + _struct.pack(f'{_pk}I', 0)

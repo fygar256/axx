@@ -5289,6 +5289,45 @@ static int dir_errmsg(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* この条件式は、リンカが値を決める変数を見ているか。
+ *
+ * `-o` で命令フィールド型のリロケーションを出す箇所では、命令語のビット欄は 0 で
+ * 出してリンカが埋める。つまりその変数の値はアセンブル時には確定しておらず、axx が
+ * 持っているのは自分の仮レイアウト上の値にすぎない。その値に対する整列・範囲
+ * チェックは判定できないものを判定していることになり、正しいソースまで弾く。範囲や
+ * 整列が本当に外れていればリンカが報告する（例: `improper alignment for relocation
+ * R_AARCH64_LDST64_ABS_LO12_NC`）ので、ここでは黙って通す。
+ *
+ * 対象は「その変数を読んでいる条件」だけ。同じ行の他のオペランドを見る条件
+ * （PRFM の `p<0` 等）はそのまま働く。axx.py の
+ * DirectiveProcessor._cond_tests_relocated_var() と同じ判定。 */
+static int cond_tests_relocated_var(AsmState *st, const char *cond, size_t len){
+    if(!st->elf_objfile[0]) return 0;
+    for(int vi = 0; vi < g_nvars; vi++){
+        int rtype = st->reloc_constraints[vi];
+        if(rtype == 0 || insn_reloc_field_mask(rtype) == 0) continue;
+        const char *nm = g_varnames[vi];
+        if(!nm || !*nm) continue;
+        size_t nl = strlen(nm);
+        if(nl > len) continue;
+        for(size_t b = 0; b + nl <= len; b++){
+            if(memcmp(cond + b, nm, nl) != 0) continue;
+            /* 変数名は単独の語として現れたときだけ。`t` が `tmp` や `xt` の
+             * 一部であるものを拾わない。 */
+            if(b > 0){
+                char c = cond[b - 1];
+                if(isalnum((unsigned char)c) || c == '_') continue;
+            }
+            if(b + nl < len){
+                char c = cond[b + nl];
+                if(isalnum((unsigned char)c) || c == '_') continue;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int dir_error(Assembler *asmb, const char *s){
     AsmState *st=&asmb->st;
     int has_content=0;
@@ -5321,11 +5360,14 @@ static int dir_error(Assembler *asmb, const char *s){
         uint256_t u=expr_expression_pat(asmb,buf,idx,&io);
         st->exp_typ_float = prev_flt;
         idx=io;
+        int io_cond = io;          /* 条件式の終端。判定に条件の本文だけを渡す */
         if(buf[idx]==';') idx++;
         uint256_t t=expr_expression_pat(asmb,buf,idx,&io);
         idx=io;
         if(idx <= idx_before) break;
-        if((should_report_errors(st))&&!u256_is_zero(u)){
+        if((should_report_errors(st))&&!u256_is_zero(u)
+           && !cond_tests_relocated_var(st, buf + idx_before,
+                                        (size_t)(io_cond - idx_before))){
             int64_t tc=u256_to_i64(t);
             fprintf(stderr,"Line %d Error code %lld ",(int)st->ln,(long long)tc);
             if(tc>=0&&tc<st->errors.len) fprintf(stderr,"%s",st->errors.data[tc]);
@@ -11876,10 +11918,39 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         int addr_sz = _is_elf64 ? 8 : 4;
         int is_rela_dbg = _is_rela_w;
 
+        /* DWARF が書く絶対アドレス参照の欄幅は addr_sz（= -f で決まる ELF クラス）
+         * だが、dwarf_abs はマシンごとの固定値。`-f` がそのマシンの慣習クラスと
+         * 違うときは両者がずれ、4バイトの欄に 8バイト型（あるいはその逆）の
+         * リロケーションを張ることになる。欄と同じ幅の型に取り替える。 */
         int abs64 = _mtbl_dbg->dwarf_abs;
+        if(elf_machine_reloc_bytes(_mtbl_dbg, abs64) != addr_sz){
+            int _alt = elf_machine_named(_mtbl_dbg, addr_sz == 8 ? "abs64" : "abs32");
+            if(_alt > 0 && elf_machine_reloc_bytes(_mtbl_dbg, _alt) == addr_sz){
+                abs64 = _alt;
+            } else {
+                /* 幅の合う絶対型を持たないマシン（32bit 機を -f 64 で出した場合）。
+                 * 幅の違う型を張れば黙って壊れたデバッグ情報になるので出さない。 */
+                axx_diagf(0, 0, " warning - DWARF debug info (-g) needs a %d-byte absolute "
+                           "relocation, which %s does not have; skipping debug sections.\n",
+                           addr_sz, _mtbl_dbg->name);
+                goto dbg_done;
+            }
+        }
 
         RB abv; rb_init(&abv);
-        rb_uleb(&abv,1); rb_uleb(&abv,0x11); rb_u8(&abv,1);
+        /* 子 DIE になるラベルを先に数える。CU の DW_CHILDREN は「子があるか」を
+         * 宣言するもので、ラベルを1つも持たないソース（命令だけのファイル）では
+         * 子なしになる。宣言と中身が食い違うと DWARF の検証器が指摘するため、
+         * 表を組む前に確定させる。axx.py の _dbg_labels と同じ判定。 */
+        int _dbg_nchild = 0;
+        for(int i=0;i<nl;i++){
+            if(larr[i].is_equ || larr[i].is_imported) continue;
+            WSR _sr = weo_shndx(st,csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section,bpw);
+            if(_sr.shndx==0xfff1) continue;
+            _dbg_nchild++;
+        }
+
+        rb_uleb(&abv,1); rb_uleb(&abv,0x11); rb_u8(&abv,_dbg_nchild?1:0);
         rb_uleb(&abv,0x25);rb_uleb(&abv,0x08);
         rb_uleb(&abv,0x13);rb_uleb(&abv,0x05);
         rb_uleb(&abv,0x03);rb_uleb(&abv,0x08);
@@ -11927,7 +11998,9 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
             drv_add(&info_relas,die.len,(int)sr.shndx,abs64,(int64_t)sr.sv);
             rb_waddr(&die,is_rela_dbg?0:sr.sv,addr_sz,_is_le);
         }
-        rb_uleb(&die,0);
+        /* 子の連鎖を閉じる null DIE。DW_CHILDREN_no のときは連鎖自体が無いので
+         * 置いてはいけない（読み手が余分な abbrev コード 0 を拾ってしまう）。 */
+        if(_dbg_nchild) rb_uleb(&die,0);
         RB info; rb_init(&info);
         rb_w4(&info,(uint32_t)(2+4+1+die.len),_is_le);
         rb_w2(&info,4,_is_le);
@@ -12004,6 +12077,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         if(info_relas.len>0){ size_t L; uint8_t*B=dwarf_pack_relocs(&info_relas,&L,_is_le,_is_elf64,is_rela_dbg); dbg_rela[n_dbg_rela++]=(DREL){is_rela_dbg?".rela.debug_info":".rel.debug_info",info_pi,B,L}; }
         if(line_relas.len>0){ size_t L; uint8_t*B=dwarf_pack_relocs(&line_relas,&L,_is_le,_is_elf64,is_rela_dbg); dbg_rela[n_dbg_rela++]=(DREL){is_rela_dbg?".rela.debug_line":".rel.debug_line",line_pi,B,L}; }
         free(info_relas.d); free(line_relas.d);
+    dbg_done: ;
     }
     uint32_t dbg_prog_noff[3]={0,0,0};
     uint32_t dbg_rela_noff[2]={0,0};
