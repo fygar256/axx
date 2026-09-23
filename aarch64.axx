@@ -310,6 +310,50 @@
 .return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
 .endfunc
 
+/* An SVE byte immediate may be written with its shift folded in, so
+/* #53504 means the same as #209, LSL #8.  svai picks the form; svaim
+/* falls back on the bitmask broadcast, which is what MOV does when
+/* the value is neither. */
+.func::svai::base,v,lo,hi,sh8,rd
+.if v >= lo .then
+.if v <= hi .then
+.return .call w4(base | ((v & 0xff) << 5) | rd)
+.endif
+.endif
+.if sh8 == 1 .then
+w = v / 256
+.if w * 256 == v .then
+.if w >= lo .then
+.if w <= hi .then
+.return .call w4(base | 0x2000 | ((w & 0xff) << 5) | rd)
+.endif
+.endif
+.endif
+.endif
+.raise 3
+.return 0
+.endfunc
+/* the same, falling back on the bitmask broadcast that MOV allows */
+.func::svaim::base,v,lo,hi,sh8,maxw,rd
+.if v >= lo .then
+.if v <= hi .then
+.return .call w4(base | ((v & 0xff) << 5) | rd)
+.endif
+.endif
+.if sh8 == 1 .then
+w = v / 256
+.if w * 256 == v .then
+.if w >= lo .then
+.if w <= hi .then
+.return .call w4(base | 0x2000 | ((w & 0xff) << 5) | rd)
+.endif
+.endif
+.endif
+.endif
+i13 = .call bitmask13(v, maxw)
+.return .call w4(0x05c00000 | (i13 << 5) | rd)
+.endfunc
+
 /* highbit(x): position of the highest set bit of x, counted from the
 /* right -- the mini language's equivalent of the pattern layer's "@"
 /* operator, which the mini language does not itself provide. */
@@ -3840,7 +3884,7 @@ LDR xt,[xb,#:GOT_LO12:!t] ::(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1<<24)|(1<<2
 /* The shifted form multiplies the byte by 256; only the wrapping
 /* arithmetic operations have it. */
 !def svimm1(nm, opc, el, sz, sg, sh8) {
-!{nm} zd.!{el},zd.!{el},#!v ::v<!{sg};3,v>255;3 :: .call w4(0x2500c000|(!{sz}<<22)|(!{opc}<<16)|((v&0xff)<<5)|zd)
+!{nm} zd.!{el},zd.!{el},#!v :: .call svai(0x2500c000|(!{sz}<<22)|(!{opc}<<16),v,!{sg},255,!{sh8},zd)
 !if sh8 !then {
 !{nm} zd.!{el},zd.!{el},#!v,LSL #!h ::v<!{sg};3,v>255;3,h!=8;10 :: .call w4(0x2500e000|(!{sz}<<22)|(!{opc}<<16)|((v&0xff)<<5)|zd)
 }
@@ -3866,20 +3910,24 @@ LDR xt,[xb,#:GOT_LO12:!t] ::(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1<<24)|(1<<2
 !svimm("UMIN", 0x2b, 0, 0)
 !svimm("MUL", 0x30, -128, 0)
 /* DUP with an immediate, and its MOV spelling */
-!def svdupi(nm, el, sz, sh8) {
-!{nm} zd.!{el},#!v ::v<-128;3,v>255;3 :: .call w4(0x2538c000|(!{sz}<<22)|((v&0xff)<<5)|zd)
+!def svdupi(nm, el, sz, sh8, bm) {
+!if bm !then {
+!{nm} zd.!{el},#!v :: .call svaim(0x2538c000|(!{sz}<<22),v,-128,255,!{sh8},!{bm},zd)
+} !else {
+!{nm} zd.!{el},#!v :: .call svai(0x2538c000|(!{sz}<<22),v,-128,255,!{sh8},zd)
+}
 !if sh8 !then {
 !{nm} zd.!{el},#!v,LSL #!h ::v<-128;3,v>255;3,h!=8;10 :: .call w4(0x2538e000|(!{sz}<<22)|((v&0xff)<<5)|zd)
 }
 }
-!svdupi("DUP", "B", 0, 0)
-!svdupi("DUP", "H", 1, 1)
-!svdupi("DUP", "S", 2, 1)
-!svdupi("DUP", "D", 3, 1)
-!svdupi("MOV", "B", 0, 0)
-!svdupi("MOV", "H", 1, 1)
-!svdupi("MOV", "S", 2, 1)
-!svdupi("MOV", "D", 3, 1)
+!svdupi("DUP", "B", 0, 0, 0)
+!svdupi("DUP", "H", 1, 1, 0)
+!svdupi("DUP", "S", 2, 1, 0)
+!svdupi("DUP", "D", 3, 1, 0)
+!svdupi("MOV", "B", 0, 0, 8)
+!svdupi("MOV", "H", 1, 1, 16)
+!svdupi("MOV", "S", 2, 1, 32)
+!svdupi("MOV", "D", 3, 1, 64)
 
 /* Multiply-accumulate. MLA and MLS accumulate into Zda; MAD and MSB
 /* accumulate into the destination, so their operands read the other
@@ -3991,7 +4039,7 @@ LDR xt,[xb,#:GOT_LO12:!t] ::(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1<<24)|(1<<2
 /* Predicate logical.
 /*   00100101 op S 00 Pm 01 Pg b Pn o2 Pd */
 !def svplog(nm, op, s, b9, o2) {
-!{nm} pd.B,pg/Z,pn.B,pm.B :: .call w4(0x25004000|(!{op}<<23)|(!{s}<<22)|(pm<<16)|(pg<<10)|(!{b9}<<9)|(pn<<5)|(!{o2}<<4)|pd)
+!{nm} pd.B,pv/Z,pn.B,pm.B :: .call w4(0x25004000|(!{op}<<23)|(!{s}<<22)|(pm<<16)|(pv<<10)|(!{b9}<<9)|(pn<<5)|(!{o2}<<4)|pd)
 }
 !svplog("AND", 0, 0, 0, 0)
 !svplog("BIC", 0, 0, 0, 1)
@@ -4014,8 +4062,8 @@ MOV pd.B,pn.B :: .call w4(0x25804000|(pn<<16)|(pn<<10)|(pn<<5)|pd)
 MOVS pd.B,pn.B :: .call w4(0x25c04000|(pn<<16)|(pn<<10)|(pn<<5)|pd)
 /* The predicated spelling is AND rather than ORR, so that inactive
 /* elements come out zero. */
-MOV pd.B,pg/Z,pn.B :: .call w4(0x25004000|(pn<<16)|(pg<<10)|(pn<<5)|pd)
-MOVS pd.B,pg/Z,pn.B :: .call w4(0x25404000|(pn<<16)|(pg<<10)|(pn<<5)|pd)
+MOV pd.B,pv/Z,pn.B :: .call w4(0x25004000|(pn<<16)|(pv<<10)|(pn<<5)|pd)
+MOVS pd.B,pv/Z,pn.B :: .call w4(0x25404000|(pn<<16)|(pv<<10)|(pn<<5)|pd)
 
 /* Predicate patterns for PTRUE and the element-count instructions */
 .setsym::POW2::0
@@ -4042,6 +4090,7 @@ MOVS pd.B,pg/Z,pn.B :: .call w4(0x25404000|(pn<<16)|(pg<<10)|(pn<<5)|pd)
 !def svptrue(nm, s, el, sz) {
 !{nm} pd.!{el} :: .call w4(0x2518e000|(!{sz}<<22)|(!{s}<<16)|(31<<5)|pd)
 !{nm} pd.!{el},pat :: .call w4(0x2518e000|(!{sz}<<22)|(!{s}<<16)|(pat<<5)|pd)
+!{nm} pd.!{el},#!p ::p<0;3,p>31;3 :: .call w4(0x2518e000|(!{sz}<<22)|(!{s}<<16)|(p<<5)|pd)
 }
 !svptrue("PTRUE", 0, "B", 0)
 !svptrue("PTRUE", 0, "H", 1)
@@ -4065,19 +4114,19 @@ PNEXT pd.!{el},pv,pd.!{el} :: .call w4(0x2519c400|(!{sz}<<22)|(pv<<5)|pd)
 /* Break instructions */
 /* The flag-setting variants have no merging form. */
 !def svbrk(nm, b23, s, m) {
-!{nm} pd.B,pg/Z,pn.B :: .call w4(0x25104000|(!{b23}<<23)|(!{s}<<22)|(pg<<10)|(pn<<5)|pd)
+!{nm} pd.B,pv/Z,pn.B :: .call w4(0x25104000|(!{b23}<<23)|(!{s}<<22)|(pv<<10)|(pn<<5)|pd)
 !if m !then {
-!{nm} pd.B,pg/M,pn.B :: .call w4(0x25104010|(!{b23}<<23)|(!{s}<<22)|(pg<<10)|(pn<<5)|pd)
+!{nm} pd.B,pv/M,pn.B :: .call w4(0x25104010|(!{b23}<<23)|(!{s}<<22)|(pv<<10)|(pn<<5)|pd)
 }
 }
 !svbrk("BRKA", 0, 0, 1)
 !svbrk("BRKAS", 0, 1, 0)
 !svbrk("BRKB", 1, 0, 1)
 !svbrk("BRKBS", 1, 1, 0)
-BRKN pd.B,pg/Z,pn.B,pd.B :: .call w4(0x25184000|(pg<<10)|(pn<<5)|pd)
-BRKNS pd.B,pg/Z,pn.B,pd.B :: .call w4(0x25584000|(pg<<10)|(pn<<5)|pd)
+BRKN pd.B,pv/Z,pn.B,pd.B :: .call w4(0x25184000|(pv<<10)|(pn<<5)|pd)
+BRKNS pd.B,pv/Z,pn.B,pd.B :: .call w4(0x25584000|(pv<<10)|(pn<<5)|pd)
 !def svbrkp(nm, s, o2) {
-!{nm} pd.B,pg/Z,pn.B,pm.B :: .call w4(0x2500c000|(!{s}<<22)|(pm<<16)|(pg<<10)|(pn<<5)|(!{o2}<<4)|pd)
+!{nm} pd.B,pv/Z,pn.B,pm.B :: .call w4(0x2500c000|(!{s}<<22)|(pm<<16)|(pv<<10)|(pn<<5)|(!{o2}<<4)|pd)
 }
 !svbrkp("BRKPA", 0, 0)
 !svbrkp("BRKPB", 0, 1)
@@ -4086,8 +4135,8 @@ BRKNS pd.B,pg/Z,pn.B,pd.B :: .call w4(0x25584000|(pg<<10)|(pn<<5)|pd)
 
 /* First-fault register */
 RDFFR pd.B :: .call w4(0x2519f000|pd)
-RDFFRS pd.B,pg/Z :: .call w4(0x2558f000|(pg<<5)|pd)
-RDFFR pd.B,pg/Z :: .call w4(0x2518f000|(pg<<5)|pd)
+RDFFRS pd.B,pv/Z :: .call w4(0x2558f000|(pv<<5)|pd)
+RDFFR pd.B,pv/Z :: .call w4(0x2518f000|(pv<<5)|pd)
 SETFFR :: .call w4(0x252c9000)
 WRFFR pn.B :: .call w4(0x25289000|(pn<<5))
 
@@ -4128,6 +4177,8 @@ CNTP xd,pv,pn.!{el} :: .call w4(0x25208000|(!{sz}<<22)|(pv<<10)|(pn<<5)|xd)
 !{nm} !{rd} :: .call w4(0x04200000|(!{sz}<<22)|(!{b20}<<20)|(!{opc}<<10)|(31<<5)|!{rd})
 !{nm} !{rd},pat :: .call w4(0x04200000|(!{sz}<<22)|(!{b20}<<20)|(!{opc}<<10)|(pat<<5)|!{rd})
 !{nm} !{rd},pat,MUL #!c ::c<1;3,c>16;3 :: .call w4(0x04200000|(!{sz}<<22)|(!{b20}<<20)|((c-1)<<16)|(!{opc}<<10)|(pat<<5)|!{rd})
+!{nm} !{rd},#!p ::p<0;3,p>31;3 :: .call w4(0x04200000|(!{sz}<<22)|(!{b20}<<20)|(!{opc}<<10)|(p<<5)|!{rd})
+!{nm} !{rd},#!p,MUL #!c ::p<0;3,p>31;3,c<1;3,c>16;3 :: .call w4(0x04200000|(!{sz}<<22)|(!{b20}<<20)|((c-1)<<16)|(!{opc}<<10)|(p<<5)|!{rd})
 }
 !def svcntsz(nm, opc, b20, rd) {
 !svcnt1(nm + "B", opc, b20, 0, rd)
@@ -4150,6 +4201,8 @@ CNTP xd,pv,pn.!{el} :: .call w4(0x25208000|(!{sz}<<22)|(pv<<10)|(pn<<5)|xd)
 !{nm} xd,wd :: .call w4(0x04200000|(!{sz}<<22)|(!{opc}<<10)|(31<<5)|xd)
 !{nm} xd,wd,pat :: .call w4(0x04200000|(!{sz}<<22)|(!{opc}<<10)|(pat<<5)|xd)
 !{nm} xd,wd,pat,MUL #!c ::c<1;3,c>16;3 :: .call w4(0x04200000|(!{sz}<<22)|((c-1)<<16)|(!{opc}<<10)|(pat<<5)|xd)
+!{nm} xd,wd,#!p ::p<0;3,p>31;3 :: .call w4(0x04200000|(!{sz}<<22)|(!{opc}<<10)|(p<<5)|xd)
+!{nm} xd,wd,#!p,MUL #!c ::p<0;3,p>31;3,c<1;3,c>16;3 :: .call w4(0x04200000|(!{sz}<<22)|((c-1)<<16)|(!{opc}<<10)|(p<<5)|xd)
 }
 !def svcnt2sz(nm, opc) {
 !svcnt2(nm + "B", opc, 0)
@@ -4164,6 +4217,8 @@ CNTP xd,pv,pn.!{el} :: .call w4(0x25208000|(!{sz}<<22)|(pv<<10)|(pn<<5)|xd)
 !{nm} zd.!{el} :: .call w4(0x0420c000|(!{sz}<<22)|(!{b20}<<20)|(!{opc-0x30}<<10)|(31<<5)|zd)
 !{nm} zd.!{el},pat :: .call w4(0x0420c000|(!{sz}<<22)|(!{b20}<<20)|(!{opc-0x30}<<10)|(pat<<5)|zd)
 !{nm} zd.!{el},pat,MUL #!c ::c<1;3,c>16;3 :: .call w4(0x0420c000|(!{sz}<<22)|(!{b20}<<20)|((c-1)<<16)|(!{opc-0x30}<<10)|(pat<<5)|zd)
+!{nm} zd.!{el},#!p ::p<0;3,p>31;3 :: .call w4(0x0420c000|(!{sz}<<22)|(!{b20}<<20)|(!{opc-0x30}<<10)|(p<<5)|zd)
+!{nm} zd.!{el},#!p,MUL #!c ::p<0;3,p>31;3,c<1;3,c>16;3 :: .call w4(0x0420c000|(!{sz}<<22)|(!{b20}<<20)|((c-1)<<16)|(!{opc-0x30}<<10)|(p<<5)|zd)
 }
 !def svcntv(nm, opc, b20) {
 !svcntv1(nm + "H", opc, b20, "H", 1)
@@ -4208,6 +4263,7 @@ CNTP xd,pv,pn.!{el} :: .call w4(0x25208000|(!{sz}<<22)|(pv<<10)|(pn<<5)|xd)
 !svincp2a("SQDECP", 0x2a)
 !def svincpv1(nm, opc, el, sz) {
 !{nm} zd.!{el},pn :: .call w4(0x25008000|(!{sz}<<22)|(!{opc}<<16)|(pn<<5)|zd)
+!{nm} zd.!{el},pn.!{el} :: .call w4(0x25008000|(!{sz}<<22)|(!{opc}<<16)|(pn<<5)|zd)
 }
 !def svincpv(nm, opc) {
 !svincpv1(nm, opc, "H", 1)
@@ -4382,20 +4438,20 @@ MOV zd.!{el},pv/M,zn.!{el} :: .call w4(0x0520c000|(!{sz}<<22)|(zd<<16)|(pv<<10)|
 !svsel("H", 1)
 !svsel("S", 2)
 !svsel("D", 3)
-!def svcpy(el, sz, rn, vn) {
+!def svcpy(el, sz, rn, vn, sh8) {
 CPY zd.!{el},pg/M,!{rn} :: .call w4(0x0528a000|(!{sz}<<22)|(pg<<10)|(!{rn}<<5)|zd)
 MOV zd.!{el},pg/M,!{rn} :: .call w4(0x0528a000|(!{sz}<<22)|(pg<<10)|(!{rn}<<5)|zd)
 CPY zd.!{el},pg/M,!{vn} :: .call w4(0x05208000|(!{sz}<<22)|(pg<<10)|(!{vn}<<5)|zd)
 MOV zd.!{el},pg/M,!{vn} :: .call w4(0x05208000|(!{sz}<<22)|(pg<<10)|(!{vn}<<5)|zd)
-CPY zd.!{el},pv/Z,#!v ::v<-128;3,v>127;3 :: .call w4(0x05100000|(!{sz}<<22)|(pv<<16)|((v&0xff)<<5)|zd)
-CPY zd.!{el},pv/M,#!v ::v<-128;3,v>127;3 :: .call w4(0x05104000|(!{sz}<<22)|(pv<<16)|((v&0xff)<<5)|zd)
-MOV zd.!{el},pv/Z,#!v ::v<-128;3,v>127;3 :: .call w4(0x05100000|(!{sz}<<22)|(pv<<16)|((v&0xff)<<5)|zd)
-MOV zd.!{el},pv/M,#!v ::v<-128;3,v>127;3 :: .call w4(0x05104000|(!{sz}<<22)|(pv<<16)|((v&0xff)<<5)|zd)
+CPY zd.!{el},pv/Z,#!v :: .call svai(0x05100000|(!{sz}<<22)|(pv<<16),v,-128,127,!{sh8},zd)
+CPY zd.!{el},pv/M,#!v :: .call svai(0x05104000|(!{sz}<<22)|(pv<<16),v,-128,127,!{sh8},zd)
+MOV zd.!{el},pv/Z,#!v :: .call svai(0x05100000|(!{sz}<<22)|(pv<<16),v,-128,127,!{sh8},zd)
+MOV zd.!{el},pv/M,#!v :: .call svai(0x05104000|(!{sz}<<22)|(pv<<16),v,-128,127,!{sh8},zd)
 }
-!svcpy("B", 0, "wn", "fbn")
-!svcpy("H", 1, "wn", "fhn")
-!svcpy("S", 2, "wn", "fsn")
-!svcpy("D", 3, "xn", "fdn")
+!svcpy("B", 0, "wn", "fbn", 0)
+!svcpy("H", 1, "wn", "fhn", 1)
+!svcpy("S", 2, "wn", "fsn", 1)
+!svcpy("D", 3, "xn", "fdn", 1)
 !def svcpysh(el, sz) {
 CPY zd.!{el},pv/Z,#!v,LSL #!h ::v<-128;3,v>127;3,h!=8;10 :: .call w4(0x05102000|(!{sz}<<22)|(pv<<16)|((v&0xff)<<5)|zd)
 CPY zd.!{el},pv/M,#!v,LSL #!h ::v<-128;3,v>127;3,h!=8;10 :: .call w4(0x05106000|(!{sz}<<22)|(pv<<16)|((v&0xff)<<5)|zd)
@@ -4978,6 +5034,13 @@ ST1!{sfx} {zt.!{el}},pg,[xb,!{ix}] :: .call w4((!{base}<<16)|0x4000|(xm<<16)|(pg
 !svstn1("ST3" + sfx, "zt." + el + ",za." + el + ",zb." + el, 3, msz, ix)
 !svldn1("LD4" + sfx, "zt." + el + ",za." + el + ",zb." + el + ",zc." + el, 4, msz, ix)
 !svstn1("ST4" + sfx, "zt." + el + ",za." + el + ",zb." + el + ",zc." + el, 4, msz, ix)
+/* the same lists written with a dash */
+!svldn1("LD2" + sfx, "zt." + el + "-za." + el, 2, msz, ix)
+!svstn1("ST2" + sfx, "zt." + el + "-za." + el, 2, msz, ix)
+!svldn1("LD3" + sfx, "zt." + el + "-zb." + el, 3, msz, ix)
+!svstn1("ST3" + sfx, "zt." + el + "-zb." + el, 3, msz, ix)
+!svldn1("LD4" + sfx, "zt." + el + "-zc." + el, 4, msz, ix)
+!svstn1("ST4" + sfx, "zt." + el + "-zc." + el, 4, msz, ix)
 }
 !svmulti("B", "B", 0, "xm")
 !svmulti("H", "H", 1, "xm,LSL #1")
@@ -5594,7 +5657,7 @@ CDOT zd.D,zn.H,zx.H[!!i],#!{r} ::i<0;3,i>1;3 :: .call w4(0x44e04000|(i<<20)|(zx<
 /* 20-19 and bit 11, and bit 10 picks the top or bottom half. */
 !def sv2mli(nm, opc, tb) {
 !{nm} zd.S,zn.H,zy.H[!!i] ::i<0;3,i>7;3 :: .call w4(0x44a00000|((i>>1)<<19)|(zy<<16)|(!{opc}<<12)|((i&1)<<11)|(!{tb}<<10)|(zn<<5)|zd)
-!{nm} zd.D,zn.S,zx.S[!!i] ::i<0;3,i>1;3 :: .call w4(0x44e00000|(zx<<16)|(!{opc}<<12)|(i<<11)|(!{tb}<<10)|(zn<<5)|zd)
+!{nm} zd.D,zn.S,zx.S[!!i] ::i<0;3,i>3;3 :: .call w4(0x44e00000|(zx<<16)|(!{opc}<<12)|((i&1)<<11)|((i>>1)<<20)|(!{tb}<<10)|(zn<<5)|zd)
 }
 !sv2mli("SQDMLALB", 0x2, 0)
 !sv2mli("SQDMLALT", 0x2, 1)
@@ -5907,12 +5970,12 @@ ZERO {ZT0} :: .call w4(0xc0480001)
 !def s2luti1(nm, base, el, sz, shl, mx) {
 !{nm} zd.!{el},ZT0,zn[!!i] ::i>!{mx};3 :: .call w4(!{base}|(!{sz}<<12)|((i&!{(1<<(16-shl))-1})<<!{shl})|((i>>!{16-shl})<<16)|(zn<<5)|zd)
 }
-!s2luti1("LUTI2", 0xc0cc0000, "B", 0, 14, 3)
+!s2luti1("LUTI2", 0xc0cc0000, "B", 0, 14, 7)
 !s2luti1("LUTI2", 0xc0cc0000, "H", 1, 14, 7)
 !s2luti1("LUTI2", 0xc0cc0000, "S", 2, 14, 7)
-!s2luti1("LUTI4", 0xc0ca0000, "B", 0, 14, 1)
-!s2luti1("LUTI4", 0xc0ca0000, "H", 1, 14, 3)
-!s2luti1("LUTI4", 0xc0ca0000, "S", 2, 14, 3)
+!s2luti1("LUTI4", 0xc0ca0000, "B", 0, 14, 7)
+!s2luti1("LUTI4", 0xc0ca0000, "H", 1, 14, 7)
+!s2luti1("LUTI4", 0xc0ca0000, "S", 2, 14, 7)
 /* Pair and quad destinations */
 .func::lutil::base2,base4,sz,i,zn,a,b,mx2,mx4,sh2
 n = b - a
@@ -5941,12 +6004,12 @@ n = b - a
 !{nm} {zd.!{el},za.!{el}},ZT0,zn[!!i] :: .call lutil(!{base2},!{base4},!{sz},i,zn,zd,za,!{mx2},!{mx4},!{sh2})
 !{nm} {zd.!{el}-za.!{el}},ZT0,zn[!!i] :: .call lutil(!{base2},!{base4},!{sz},i,zn,zd,za,!{mx2},!{mx4},!{sh2})
 }
-!s2luti2("LUTI2", 0xc08c4000, 0xc08c8000, "B", 0, 3, 1, 15)
-!s2luti2("LUTI2", 0xc08c4000, 0xc08c8000, "H", 1, 3, 1, 15)
-!s2luti2("LUTI2", 0xc08c4000, 0xc08c8000, "S", 2, 3, 1, 15)
-!s2luti2("LUTI4", 0xc08a4000, 0xc08a8000, "B", 0, 1, -1, 15)
-!s2luti2("LUTI4", 0xc08a4000, 0xc08a8000, "H", 1, 1, 1, 15)
-!s2luti2("LUTI4", 0xc08a4000, 0xc08a8000, "S", 2, 1, 1, 15)
+!s2luti2("LUTI2", 0xc08c4000, 0xc08c8000, "B", 0, 7, 3, 15)
+!s2luti2("LUTI2", 0xc08c4000, 0xc08c8000, "H", 1, 7, 3, 15)
+!s2luti2("LUTI2", 0xc08c4000, 0xc08c8000, "S", 2, 7, 3, 15)
+!s2luti2("LUTI4", 0xc08a4000, 0xc08a8000, "B", 0, 7, -1, 15)
+!s2luti2("LUTI4", 0xc08a4000, 0xc08a8000, "H", 1, 7, 3, 15)
+!s2luti2("LUTI4", 0xc08a4000, 0xc08a8000, "S", 2, 7, 3, 15)
 
 /* -------------------------------------------------------------------
 /* SME2: multi-vector operations on Z registers.
@@ -5961,6 +6024,19 @@ n = b - a
 .check::zr::ZR
 .check::zs::ZR
 
+/* like n2q, but for the fields that hold the whole register number
+/* and so put no alignment on the list */
+.func::n2qf::a,b
+n = (b - a) & 31
+.if n == 1 .then
+.return 0
+.endif
+.if n == 3 .then
+.return 1
+.endif
+.raise 5
+.return 0
+.endfunc
 .func::n2q::a,b
 n = b - a
 .if n == 1 .then
@@ -6217,7 +6293,7 @@ g = .call gchk(g, vg)
 .endfunc
 /* a list against one vector */
 .func::za1::base,zm,wv,off,zn,a,b,vg
-g = .call n2q(a, b)
+g = .call n2qf(a, b)
 g = .call gchk(g, vg)
 .return .call w4(base | (g << 20) | (zm << 16) | ((wv - 8) << 13) | (zn << 5) | off)
 .endfunc
@@ -6234,7 +6310,7 @@ h = .call n2q(m, n)
 /* the same three, writing a range of slices */
 .func::za1s::base,zm,wv,o,p,zn,a,b,w,mx,vg
 q = .call slq(o, p, w, mx)
-g = .call n2q(a, b)
+g = .call n2qf(a, b)
 g = .call gchk(g, vg)
 .return .call w4(base | (g << 20) | (zm << 16) | ((wv - 8) << 13) | (zn << 5) | q)
 .endfunc
@@ -6254,13 +6330,13 @@ q = .call slq(o, p, w, mx)
 .endfunc
 /* indexed by an element of one vector */
 .func::zaix::base,ib,zm,wv,off,zn,a,b,vg
-g = .call n2q(a, b)
+g = .call n2qf(a, b)
 g = .call gchk(g, vg)
 .return .call w4(base | ib | (g << 15) | (zm << 16) | ((wv - 8) << 13) | (zn << 5) | off)
 .endfunc
 .func::zaixs::base,ib,zm,wv,o,p,zn,a,b,w,mx,vg
 q = .call slq(o, p, w, mx)
-g = .call n2q(a, b)
+g = .call n2qf(a, b)
 g = .call gchk(g, vg)
 .return .call w4(base | ib | (g << 15) | (zm << 16) | ((wv - 8) << 13) | (zn << 5) | q)
 .endfunc
@@ -6616,7 +6692,7 @@ FMLAL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1200800,zx,wv,
 FMLAL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H ::p>15;3 :: .call za1s(0xc1200800,zx,wv,o,p,zd,zd,za,2,3,-1)
 FMLAL ZA.S[wv,!!o:!!p],{zd.H,za.H},{zm.H,zk.H} ::p>15;3 :: .call za2s(0xc1a00800,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
 FMLAL ZA.S[wv,!!o:!!p],{zd.H-za.H},{zm.H-zk.H} ::p>15;3 :: .call za2s(0xc1a00800,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
-FMLAL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1200c00,zx,wv,o,p,zn,2,3)
+FMLAL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1200c00,zx,wv,o,p,zn,2,7)
 FMLAL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1901000,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 FMLAL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1901000,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 FMLAL ZA.S[wv,!!o:!!p,VGX2],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1200800,zx,wv,o,p,zd,zd,za,2,3,0)
@@ -6635,7 +6711,7 @@ FMLSL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1200808,zx,wv,
 FMLSL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H ::p>15;3 :: .call za1s(0xc1200808,zx,wv,o,p,zd,zd,za,2,3,-1)
 FMLSL ZA.S[wv,!!o:!!p],{zd.H,za.H},{zm.H,zk.H} ::p>15;3 :: .call za2s(0xc1a00808,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
 FMLSL ZA.S[wv,!!o:!!p],{zd.H-za.H},{zm.H-zk.H} ::p>15;3 :: .call za2s(0xc1a00808,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
-FMLSL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1200c08,zx,wv,o,p,zn,2,3)
+FMLSL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1200c08,zx,wv,o,p,zn,2,7)
 FMLSL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1901008,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 FMLSL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1901008,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 FMLSL ZA.S[wv,!!o:!!p,VGX2],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1200808,zx,wv,o,p,zd,zd,za,2,3,0)
@@ -6654,7 +6730,7 @@ BFMLAL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1200810,zx,wv
 BFMLAL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H ::p>15;3 :: .call za1s(0xc1200810,zx,wv,o,p,zd,zd,za,2,3,-1)
 BFMLAL ZA.S[wv,!!o:!!p],{zd.H,za.H},{zm.H,zk.H} ::p>15;3 :: .call za2s(0xc1a00810,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
 BFMLAL ZA.S[wv,!!o:!!p],{zd.H-za.H},{zm.H-zk.H} ::p>15;3 :: .call za2s(0xc1a00810,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
-BFMLAL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1200c10,zx,wv,o,p,zn,2,3)
+BFMLAL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1200c10,zx,wv,o,p,zn,2,7)
 BFMLAL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1901010,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 BFMLAL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1901010,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 BFMLAL ZA.S[wv,!!o:!!p,VGX2],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1200810,zx,wv,o,p,zd,zd,za,2,3,0)
@@ -6673,7 +6749,7 @@ BFMLSL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1200818,zx,wv
 BFMLSL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H ::p>15;3 :: .call za1s(0xc1200818,zx,wv,o,p,zd,zd,za,2,3,-1)
 BFMLSL ZA.S[wv,!!o:!!p],{zd.H,za.H},{zm.H,zk.H} ::p>15;3 :: .call za2s(0xc1a00818,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
 BFMLSL ZA.S[wv,!!o:!!p],{zd.H-za.H},{zm.H-zk.H} ::p>15;3 :: .call za2s(0xc1a00818,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
-BFMLSL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1200c18,zx,wv,o,p,zn,2,3)
+BFMLSL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1200c18,zx,wv,o,p,zn,2,7)
 BFMLSL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1901018,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 BFMLSL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1901018,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 BFMLSL ZA.S[wv,!!o:!!p,VGX2],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1200818,zx,wv,o,p,zd,zd,za,2,3,0)
@@ -6692,7 +6768,7 @@ SMLAL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600800,zx,wv,
 SMLAL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H ::p>15;3 :: .call za1s(0xc1600800,zx,wv,o,p,zd,zd,za,2,3,-1)
 SMLAL ZA.S[wv,!!o:!!p],{zd.H,za.H},{zm.H,zk.H} ::p>15;3 :: .call za2s(0xc1e00800,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
 SMLAL ZA.S[wv,!!o:!!p],{zd.H-za.H},{zm.H-zk.H} ::p>15;3 :: .call za2s(0xc1e00800,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
-SMLAL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600c00,zx,wv,o,p,zn,2,3)
+SMLAL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600c00,zx,wv,o,p,zn,2,7)
 SMLAL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1d01000,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 SMLAL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1d01000,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 SMLAL ZA.S[wv,!!o:!!p,VGX2],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600800,zx,wv,o,p,zd,zd,za,2,3,0)
@@ -6711,7 +6787,7 @@ SMLSL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600808,zx,wv,
 SMLSL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H ::p>15;3 :: .call za1s(0xc1600808,zx,wv,o,p,zd,zd,za,2,3,-1)
 SMLSL ZA.S[wv,!!o:!!p],{zd.H,za.H},{zm.H,zk.H} ::p>15;3 :: .call za2s(0xc1e00808,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
 SMLSL ZA.S[wv,!!o:!!p],{zd.H-za.H},{zm.H-zk.H} ::p>15;3 :: .call za2s(0xc1e00808,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
-SMLSL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600c08,zx,wv,o,p,zn,2,3)
+SMLSL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600c08,zx,wv,o,p,zn,2,7)
 SMLSL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1d01008,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 SMLSL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1d01008,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 SMLSL ZA.S[wv,!!o:!!p,VGX2],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600808,zx,wv,o,p,zd,zd,za,2,3,0)
@@ -6730,7 +6806,7 @@ UMLAL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600810,zx,wv,
 UMLAL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H ::p>15;3 :: .call za1s(0xc1600810,zx,wv,o,p,zd,zd,za,2,3,-1)
 UMLAL ZA.S[wv,!!o:!!p],{zd.H,za.H},{zm.H,zk.H} ::p>15;3 :: .call za2s(0xc1e00810,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
 UMLAL ZA.S[wv,!!o:!!p],{zd.H-za.H},{zm.H-zk.H} ::p>15;3 :: .call za2s(0xc1e00810,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
-UMLAL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600c10,zx,wv,o,p,zn,2,3)
+UMLAL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600c10,zx,wv,o,p,zn,2,7)
 UMLAL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1d01010,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 UMLAL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1d01010,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 UMLAL ZA.S[wv,!!o:!!p,VGX2],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600810,zx,wv,o,p,zd,zd,za,2,3,0)
@@ -6749,7 +6825,7 @@ UMLSL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600818,zx,wv,
 UMLSL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H ::p>15;3 :: .call za1s(0xc1600818,zx,wv,o,p,zd,zd,za,2,3,-1)
 UMLSL ZA.S[wv,!!o:!!p],{zd.H,za.H},{zm.H,zk.H} ::p>15;3 :: .call za2s(0xc1e00818,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
 UMLSL ZA.S[wv,!!o:!!p],{zd.H-za.H},{zm.H-zk.H} ::p>15;3 :: .call za2s(0xc1e00818,wv,o,p,zd,zd,za,zm,zk,2,3,-1)
-UMLSL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600c18,zx,wv,o,p,zn,2,3)
+UMLSL ZA.S[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600c18,zx,wv,o,p,zn,2,7)
 UMLSL ZA.S[wv,!!o:!!p],{zd.H,za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1d01018,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 UMLSL ZA.S[wv,!!o:!!p],{zd.H-za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1d01018,(((i&1)<<2)|((i>>1)<<10)),zx,wv,o,p,zd,zd,za,2,3,-1)
 UMLSL ZA.S[wv,!!o:!!p,VGX2],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600818,zx,wv,o,p,zd,zd,za,2,3,0)
@@ -6768,7 +6844,7 @@ SMLALL ZA.S[wv,!!o:!!p],{zd.B,za.B},zx.B ::p>15;3 :: .call za1s(0xc1200000,zx,wv
 SMLALL ZA.S[wv,!!o:!!p],{zd.B-za.B},zx.B ::p>15;3 :: .call za1s(0xc1200000,zx,wv,o,p,zd,zd,za,4,1,-1)
 SMLALL ZA.S[wv,!!o:!!p],{zd.B,za.B},{zm.B,zk.B} ::p>15;3 :: .call za2s(0xc1a00000,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
 SMLALL ZA.S[wv,!!o:!!p],{zd.B-za.B},{zm.B-zk.B} ::p>15;3 :: .call za2s(0xc1a00000,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
-SMLALL ZA.S[wv,!!o:!!p],zn.B,zx.B ::p>15;3 :: .call zass(0xc1200400,zx,wv,o,p,zn,4,1)
+SMLALL ZA.S[wv,!!o:!!p],zn.B,zx.B ::p>15;3 :: .call zass(0xc1200400,zx,wv,o,p,zn,4,3)
 SMLALL ZA.S[wv,!!o:!!p],{zd.B,za.B},zx.B[!!i] ::p>15;3,i>15;3 :: .call zaixs(0xc1100000,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 SMLALL ZA.S[wv,!!o:!!p],{zd.B-za.B},zx.B[!!i] ::p>15;3,i>15;3 :: .call zaixs(0xc1100000,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 SMLALL ZA.S[wv,!!o:!!p,VGX2],{zd.B,za.B},zx.B ::p>15;3 :: .call za1s(0xc1200000,zx,wv,o,p,zd,zd,za,4,1,0)
@@ -6787,7 +6863,7 @@ SMLSLL ZA.S[wv,!!o:!!p],{zd.B,za.B},zx.B ::p>15;3 :: .call za1s(0xc1200008,zx,wv
 SMLSLL ZA.S[wv,!!o:!!p],{zd.B-za.B},zx.B ::p>15;3 :: .call za1s(0xc1200008,zx,wv,o,p,zd,zd,za,4,1,-1)
 SMLSLL ZA.S[wv,!!o:!!p],{zd.B,za.B},{zm.B,zk.B} ::p>15;3 :: .call za2s(0xc1a00008,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
 SMLSLL ZA.S[wv,!!o:!!p],{zd.B-za.B},{zm.B-zk.B} ::p>15;3 :: .call za2s(0xc1a00008,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
-SMLSLL ZA.S[wv,!!o:!!p],zn.B,zx.B ::p>15;3 :: .call zass(0xc1200408,zx,wv,o,p,zn,4,1)
+SMLSLL ZA.S[wv,!!o:!!p],zn.B,zx.B ::p>15;3 :: .call zass(0xc1200408,zx,wv,o,p,zn,4,3)
 SMLSLL ZA.S[wv,!!o:!!p],{zd.B,za.B},zx.B[!!i] ::p>15;3,i>15;3 :: .call zaixs(0xc1100008,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 SMLSLL ZA.S[wv,!!o:!!p],{zd.B-za.B},zx.B[!!i] ::p>15;3,i>15;3 :: .call zaixs(0xc1100008,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 SMLSLL ZA.S[wv,!!o:!!p,VGX2],{zd.B,za.B},zx.B ::p>15;3 :: .call za1s(0xc1200008,zx,wv,o,p,zd,zd,za,4,1,0)
@@ -6806,7 +6882,7 @@ UMLALL ZA.S[wv,!!o:!!p],{zd.B,za.B},zx.B ::p>15;3 :: .call za1s(0xc1200010,zx,wv
 UMLALL ZA.S[wv,!!o:!!p],{zd.B-za.B},zx.B ::p>15;3 :: .call za1s(0xc1200010,zx,wv,o,p,zd,zd,za,4,1,-1)
 UMLALL ZA.S[wv,!!o:!!p],{zd.B,za.B},{zm.B,zk.B} ::p>15;3 :: .call za2s(0xc1a00010,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
 UMLALL ZA.S[wv,!!o:!!p],{zd.B-za.B},{zm.B-zk.B} ::p>15;3 :: .call za2s(0xc1a00010,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
-UMLALL ZA.S[wv,!!o:!!p],zn.B,zx.B ::p>15;3 :: .call zass(0xc1200410,zx,wv,o,p,zn,4,1)
+UMLALL ZA.S[wv,!!o:!!p],zn.B,zx.B ::p>15;3 :: .call zass(0xc1200410,zx,wv,o,p,zn,4,3)
 UMLALL ZA.S[wv,!!o:!!p],{zd.B,za.B},zx.B[!!i] ::p>15;3,i>15;3 :: .call zaixs(0xc1100010,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 UMLALL ZA.S[wv,!!o:!!p],{zd.B-za.B},zx.B[!!i] ::p>15;3,i>15;3 :: .call zaixs(0xc1100010,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 UMLALL ZA.S[wv,!!o:!!p,VGX2],{zd.B,za.B},zx.B ::p>15;3 :: .call za1s(0xc1200010,zx,wv,o,p,zd,zd,za,4,1,0)
@@ -6825,7 +6901,7 @@ UMLSLL ZA.S[wv,!!o:!!p],{zd.B,za.B},zx.B ::p>15;3 :: .call za1s(0xc1200018,zx,wv
 UMLSLL ZA.S[wv,!!o:!!p],{zd.B-za.B},zx.B ::p>15;3 :: .call za1s(0xc1200018,zx,wv,o,p,zd,zd,za,4,1,-1)
 UMLSLL ZA.S[wv,!!o:!!p],{zd.B,za.B},{zm.B,zk.B} ::p>15;3 :: .call za2s(0xc1a00018,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
 UMLSLL ZA.S[wv,!!o:!!p],{zd.B-za.B},{zm.B-zk.B} ::p>15;3 :: .call za2s(0xc1a00018,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
-UMLSLL ZA.S[wv,!!o:!!p],zn.B,zx.B ::p>15;3 :: .call zass(0xc1200418,zx,wv,o,p,zn,4,1)
+UMLSLL ZA.S[wv,!!o:!!p],zn.B,zx.B ::p>15;3 :: .call zass(0xc1200418,zx,wv,o,p,zn,4,3)
 UMLSLL ZA.S[wv,!!o:!!p],{zd.B,za.B},zx.B[!!i] ::p>15;3,i>15;3 :: .call zaixs(0xc1100018,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 UMLSLL ZA.S[wv,!!o:!!p],{zd.B-za.B},zx.B[!!i] ::p>15;3,i>15;3 :: .call zaixs(0xc1100018,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 UMLSLL ZA.S[wv,!!o:!!p,VGX2],{zd.B,za.B},zx.B ::p>15;3 :: .call za1s(0xc1200018,zx,wv,o,p,zd,zd,za,4,1,0)
@@ -6844,7 +6920,7 @@ USMLALL ZA.S[wv,!!o:!!p],{zd.B,za.B},zx.B ::p>15;3 :: .call za1s(0xc1200004,zx,w
 USMLALL ZA.S[wv,!!o:!!p],{zd.B-za.B},zx.B ::p>15;3 :: .call za1s(0xc1200004,zx,wv,o,p,zd,zd,za,4,1,-1)
 USMLALL ZA.S[wv,!!o:!!p],{zd.B,za.B},{zm.B,zk.B} ::p>15;3 :: .call za2s(0xc1a00004,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
 USMLALL ZA.S[wv,!!o:!!p],{zd.B-za.B},{zm.B-zk.B} ::p>15;3 :: .call za2s(0xc1a00004,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
-USMLALL ZA.S[wv,!!o:!!p],zn.B,zx.B ::p>15;3 :: .call zass(0xc1200404,zx,wv,o,p,zn,4,1)
+USMLALL ZA.S[wv,!!o:!!p],zn.B,zx.B ::p>15;3 :: .call zass(0xc1200404,zx,wv,o,p,zn,4,3)
 USMLALL ZA.S[wv,!!o:!!p],{zd.B,za.B},zx.B[!!i] ::p>15;3,i>15;3 :: .call zaixs(0xc1100020,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 USMLALL ZA.S[wv,!!o:!!p],{zd.B-za.B},zx.B[!!i] ::p>15;3,i>15;3 :: .call zaixs(0xc1100020,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 USMLALL ZA.S[wv,!!o:!!p,VGX2],{zd.B,za.B},zx.B ::p>15;3 :: .call za1s(0xc1200004,zx,wv,o,p,zd,zd,za,4,1,0)
@@ -6875,7 +6951,7 @@ SMLALL ZA.D[wv,!!o:!!p],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600000,zx,wv
 SMLALL ZA.D[wv,!!o:!!p],{zd.H-za.H},zx.H ::p>15;3 :: .call za1s(0xc1600000,zx,wv,o,p,zd,zd,za,4,1,-1)
 SMLALL ZA.D[wv,!!o:!!p],{zd.H,za.H},{zm.H,zk.H} ::p>15;3 :: .call za2s(0xc1e00000,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
 SMLALL ZA.D[wv,!!o:!!p],{zd.H-za.H},{zm.H-zk.H} ::p>15;3 :: .call za2s(0xc1e00000,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
-SMLALL ZA.D[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600400,zx,wv,o,p,zn,4,1)
+SMLALL ZA.D[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600400,zx,wv,o,p,zn,4,3)
 SMLALL ZA.D[wv,!!o:!!p],{zd.H,za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1900000,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 SMLALL ZA.D[wv,!!o:!!p],{zd.H-za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1900000,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 SMLALL ZA.D[wv,!!o:!!p,VGX2],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600000,zx,wv,o,p,zd,zd,za,4,1,0)
@@ -6894,7 +6970,7 @@ SMLSLL ZA.D[wv,!!o:!!p],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600008,zx,wv
 SMLSLL ZA.D[wv,!!o:!!p],{zd.H-za.H},zx.H ::p>15;3 :: .call za1s(0xc1600008,zx,wv,o,p,zd,zd,za,4,1,-1)
 SMLSLL ZA.D[wv,!!o:!!p],{zd.H,za.H},{zm.H,zk.H} ::p>15;3 :: .call za2s(0xc1e00008,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
 SMLSLL ZA.D[wv,!!o:!!p],{zd.H-za.H},{zm.H-zk.H} ::p>15;3 :: .call za2s(0xc1e00008,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
-SMLSLL ZA.D[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600408,zx,wv,o,p,zn,4,1)
+SMLSLL ZA.D[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600408,zx,wv,o,p,zn,4,3)
 SMLSLL ZA.D[wv,!!o:!!p],{zd.H,za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1900008,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 SMLSLL ZA.D[wv,!!o:!!p],{zd.H-za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1900008,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 SMLSLL ZA.D[wv,!!o:!!p,VGX2],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600008,zx,wv,o,p,zd,zd,za,4,1,0)
@@ -6913,7 +6989,7 @@ UMLALL ZA.D[wv,!!o:!!p],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600010,zx,wv
 UMLALL ZA.D[wv,!!o:!!p],{zd.H-za.H},zx.H ::p>15;3 :: .call za1s(0xc1600010,zx,wv,o,p,zd,zd,za,4,1,-1)
 UMLALL ZA.D[wv,!!o:!!p],{zd.H,za.H},{zm.H,zk.H} ::p>15;3 :: .call za2s(0xc1e00010,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
 UMLALL ZA.D[wv,!!o:!!p],{zd.H-za.H},{zm.H-zk.H} ::p>15;3 :: .call za2s(0xc1e00010,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
-UMLALL ZA.D[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600410,zx,wv,o,p,zn,4,1)
+UMLALL ZA.D[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600410,zx,wv,o,p,zn,4,3)
 UMLALL ZA.D[wv,!!o:!!p],{zd.H,za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1900010,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 UMLALL ZA.D[wv,!!o:!!p],{zd.H-za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1900010,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 UMLALL ZA.D[wv,!!o:!!p,VGX2],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600010,zx,wv,o,p,zd,zd,za,4,1,0)
@@ -6932,7 +7008,7 @@ UMLSLL ZA.D[wv,!!o:!!p],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600018,zx,wv
 UMLSLL ZA.D[wv,!!o:!!p],{zd.H-za.H},zx.H ::p>15;3 :: .call za1s(0xc1600018,zx,wv,o,p,zd,zd,za,4,1,-1)
 UMLSLL ZA.D[wv,!!o:!!p],{zd.H,za.H},{zm.H,zk.H} ::p>15;3 :: .call za2s(0xc1e00018,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
 UMLSLL ZA.D[wv,!!o:!!p],{zd.H-za.H},{zm.H-zk.H} ::p>15;3 :: .call za2s(0xc1e00018,wv,o,p,zd,zd,za,zm,zk,4,1,-1)
-UMLSLL ZA.D[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600418,zx,wv,o,p,zn,4,1)
+UMLSLL ZA.D[wv,!!o:!!p],zn.H,zx.H ::p>15;3 :: .call zass(0xc1600418,zx,wv,o,p,zn,4,3)
 UMLSLL ZA.D[wv,!!o:!!p],{zd.H,za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1900018,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 UMLSLL ZA.D[wv,!!o:!!p],{zd.H-za.H},zx.H[!!i] ::p>15;3,i>7;3 :: .call zaixs(0xc1900018,(((i&3)<<1)|((i>>2)<<10)),zx,wv,o,p,zd,zd,za,4,1,-1)
 UMLSLL ZA.D[wv,!!o:!!p,VGX2],{zd.H,za.H},zx.H ::p>15;3 :: .call za1s(0xc1600018,zx,wv,o,p,zd,zd,za,4,1,0)
@@ -7377,8 +7453,8 @@ BMOPS ZA!!t.S,pg/M,pf/M,zn.S,zm.S ::t>3;3 :: .call w4(0x80800018|(zm<<16)|(pf<<1
 /* ------------------------------------------------------------------- */
 
 /* The predicate NOT is an EOR against the governing predicate */
-NOT pd.B,pg/Z,pn.B :: .call w4(0x25004200|(pg<<16)|(pg<<10)|(pn<<5)|pd)
-NOTS pd.B,pg/Z,pn.B :: .call w4(0x25404200|(pg<<16)|(pg<<10)|(pn<<5)|pd)
+NOT pd.B,pv/Z,pn.B :: .call w4(0x25004200|(pv<<16)|(pv<<10)|(pn<<5)|pd)
+NOTS pd.B,pv/Z,pn.B :: .call w4(0x25404200|(pv<<16)|(pv<<10)|(pn<<5)|pd)
 
 /* Widening absolute difference */
 !sv2w("SABDLB", 0x0c)
@@ -7431,3 +7507,98 @@ g = .call n2q(a, b)
 }
 !s2unpa("SUNPK", 0)
 !s2unpa("UUNPK", 1)
+
+/* -------------------------------------------------------------------
+/* Forms the encoding-space sweep turned up: the SVE bitwise
+/* immediates, the constructive EXT, the quadword permutes, the
+/* half-precision dot product, and the SME2 widening
+/* multiply-accumulates that take a single source vector.
+/* ------------------------------------------------------------------- */
+
+/* Bitwise immediate.  BIC is AND against the complement. */
+.func::svlogi::base,v,maxw,rd
+i13 = .call bitmask13(v, maxw)
+.return .call w4(base | (i13 << 5) | rd)
+.endfunc
+.func::svlogni::base,v,maxw,rd
+i13 = .call bitmask13(0 - v - 1, maxw)
+.return .call w4(base | (i13 << 5) | rd)
+.endfunc
+!def svli(nm, base, el, maxw) {
+!{nm} zd.!{el},zd.!{el},#!v :: .call svlogi(!{base},v,!{maxw},zd)
+}
+!def svlia(nm, base) {
+!svli(nm, base, "B", 8)
+!svli(nm, base, "H", 16)
+!svli(nm, base, "S", 32)
+!svli(nm, base, "D", 64)
+}
+!svlia("ORR", 0x05000000)
+!svlia("EOR", 0x05400000)
+!svlia("AND", 0x05800000)
+!def svlin(el, maxw) {
+BIC zd.!{el},zd.!{el},#!v :: .call svlogni(0x05800000,v,!{maxw},zd)
+}
+!svlin("B", 8)
+!svlin("H", 16)
+!svlin("S", 32)
+!svlin("D", 64)
+
+/* Broadcast the low element of a scalar register */
+MOV zd.B,fbn :: .call w4(0x05202000|(1<<16)|(fbn<<5)|zd)
+MOV zd.H,fhn :: .call w4(0x05202000|(2<<16)|(fhn<<5)|zd)
+MOV zd.S,fsn :: .call w4(0x05202000|(4<<16)|(fsn<<5)|zd)
+MOV zd.D,fdn :: .call w4(0x05202000|(8<<16)|(fdn<<5)|zd)
+MOV zd.Q,fqn :: .call w4(0x05202000|(16<<16)|(fqn<<5)|zd)
+
+/* EXT with a separate destination */
+EXT zd.B,{zn.B,za.B},#!i ::i<0;3,i>255;3,za!=((zn+1)&31);5 :: .call w4(0x05600000|((i>>3)<<16)|((i&7)<<10)|(zn<<5)|zd)
+EXT zd.B,{zn.B-za.B},#!i ::i<0;3,i>255;3,za!=((zn+1)&31);5 :: .call w4(0x05600000|((i>>3)<<16)|((i&7)<<10)|(zn<<5)|zd)
+
+/* Quadword-element permutes */
+!def svqperm(nm, opc) {
+!{nm} zd.Q,zn.Q,zm.Q :: .call w4(0x05a00000|(!{opc}<<10)|(zm<<16)|(zn<<5)|zd)
+}
+!svqperm("ZIP1", 0)
+!svqperm("ZIP2", 1)
+!svqperm("UZP1", 2)
+!svqperm("UZP2", 3)
+!svqperm("TRN1", 6)
+!svqperm("TRN2", 7)
+
+/* Half-precision dot product into single precision */
+FDOT zd.S,zn.H,zm.H :: .call w4(0x64208000|(zm<<16)|(zn<<5)|zd)
+FDOT zd.S,zn.H,zy.H[!!i] ::i<0;3,i>3;3 :: .call w4(0x64204000|(i<<19)|(zy<<16)|(zn<<5)|zd)
+
+/* SME2 widening multiply-accumulate from a single vector, indexed */
+.func::zasi::base,ib,zm,wv,o,p,zn,w,mx
+q = .call slq(o, p, w, mx)
+.return .call w4(base | ib | (zm << 16) | ((wv - 8) << 13) | (zn << 5) | q)
+.endfunc
+!def zasi2(nm, base) {
+!{nm} ZA.S[wv,!!o:!!p],zn.H,zx.H[!!i] ::i<0;3,i>7;3 :: .call zasi(!{base},((i&3)<<10)|((i>>2)<<15),zx,wv,o,p,zn,2,7)
+}
+!zasi2("FMLAL", 0xc1801000)
+!zasi2("FMLSL", 0xc1801008)
+!zasi2("BFMLAL", 0xc1801010)
+!zasi2("BFMLSL", 0xc1801018)
+!zasi2("SMLAL", 0xc1c01000)
+!zasi2("SMLSL", 0xc1c01008)
+!zasi2("UMLAL", 0xc1c01010)
+!zasi2("UMLSL", 0xc1c01018)
+!def zasi4(nm, base) {
+!{nm} ZA.S[wv,!!o:!!p],zn.B,zx.B[!!i] ::i<0;3,i>15;3 :: .call zasi(!{base},((i&3)<<10)|(((i>>2)&1)<<12)|(((i>>3)&1)<<15),zx,wv,o,p,zn,4,3)
+}
+!zasi4("SMLALL", 0xc1000000)
+!zasi4("SMLSLL", 0xc1000008)
+!zasi4("UMLALL", 0xc1000010)
+!zasi4("UMLSLL", 0xc1000018)
+!zasi4("USMLALL", 0xc1000004)
+!zasi4("SUMLALL", 0xc1000014)
+!def zasi4d(nm, base) {
+!{nm} ZA.D[wv,!!o:!!p],zn.H,zx.H[!!i] ::i<0;3,i>7;3 :: .call zasi(!{base},((i&3)<<10)|((i>>2)<<15),zx,wv,o,p,zn,4,3)
+}
+!zasi4d("SMLALL", 0xc1800000)
+!zasi4d("SMLSLL", 0xc1800008)
+!zasi4d("UMLALL", 0xc1800010)
+!zasi4d("UMLSLL", 0xc1800018)
