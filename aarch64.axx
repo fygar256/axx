@@ -54,12 +54,25 @@
 /*     (MOVA, LD1x/ST1x by tile slice, LDR/STR, ZERO), ADDHA/ADDVA,
 /*     the integer, floating-point and BFloat16 outer products, PSEL,
 /*     REVD and the CLAMP instructions
+/*   - SME2: the predicate-as-counter registers pn8-pn15 with PTRUE,
+/*     PEXT, CNTP and the WHILE family, the ZT0 lookup table with
+/*     LUTI2/LUTI4, the multi-vector operations on Z registers
+/*     (min/max, rounding shifts, clamp, select, interleave, the
+/*     conversions and the saturating narrowing shifts), accumulation
+/*     into the ZA array (ADD/SUB/FADD/FSUB, FMLA/FMLS, the widening
+/*     multiply-accumulates, the dot products and the vertical dot
+/*     products, in their single, multi, and indexed forms), the
+/*     multi-vector MOVA, the multi-vector loads and stores in both
+/*     their consecutive and strided list forms, and the 16-bit and
+/*     binary outer products
 /*
 /* Not covered, and said so rather than half-done:
-/*   SME2. Its multi-vector operands (register lists written
-/*   {Z0.S-Z3.S}, ZA array vector groups, the ZT0 lookup table) are a
-/*   different operand model again, and belong in their own pass
-/*   rather than tacked onto the SME section here.
+/*   SVE2.1, SME2.1 and the optional extensions the reference
+/*   assembler used here does not accept either: FEAT_SME_F16F16,
+/*   FEAT_SME_B16B16, FEAT_SME_LUTv2 and FEAT_FAMINMAX. Everything the
+/*   assembler will encode in the SVE, SVE2, SME and SME2 encoding
+/*   space is here; a sweep of that space turns up no mnemonic this
+/*   file cannot assemble.
 /*
 /*   The named system registers stop at the common set defined below,
 /*   but every register, named or not, is still reachable through the

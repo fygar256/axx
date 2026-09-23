@@ -599,3 +599,64 @@ tail:
         sclamp  z15.b, z16.b, z17.b
         fclamp  z18.d, z19.d, z20.d
         ctermeq x7, x8
+
+; ---- SME2 ----
+        ptrue   pn8.s
+        pext    p0.h, pn9[1]
+        pext    {p2.b, p3.b}, pn10[0]
+        cntp    x0, pn11.d, vlx4
+        whilelt pn12.b, x1, x2, vlx2
+        whilege {p4.s, p5.s}, x3, x4
+        ldr     zt0, [x5]
+        str     zt0, [x6]
+        zero    {zt0}
+        luti2   z0.b, zt0, z1[3]
+        luti4   {z2.h, z3.h}, zt0, z4[1]
+        luti2   {z4.s - z7.s}, zt0, z8[1]
+        smax    {z0.b, z1.b}, {z0.b, z1.b}, z4.b
+        fminnm  {z8.h - z11.h}, {z8.h - z11.h}, {z12.h - z15.h}
+        srshl   {z2.d, z3.d}, {z2.d, z3.d}, z9.d
+        sqdmulh {z0.s - z3.s}, {z0.s - z3.s}, z5.s
+        sclamp  {z10.b, z11.b}, z12.b, z13.b
+        fclamp  {z16.s - z19.s}, z20.s, z21.s
+        sel     {z0.d, z1.d}, pn13, {z2.d, z3.d}, {z4.d, z5.d}
+        zip     {z6.q, z7.q}, z8.q, z9.q
+        uzp     {z12.h - z15.h}, {z16.h - z19.h}
+        fcvtzs  {z0.s, z1.s}, {z2.s, z3.s}
+        frinta  {z4.s - z7.s}, {z8.s - z11.s}
+        bfcvtn  z0.h, {z2.s, z3.s}
+        sqcvtun z1.b, {z4.s - z7.s}
+        sqrshr  z2.h, {z6.s, z7.s}, #9
+        uqrshrn z3.h, {z8.d - z11.d}, #40
+        sunpk   {z0.h, z1.h}, z2.b
+        uunpk   {z4.s - z7.s}, {z8.h, z9.h}
+        add     za.s[w8, 3], {z0.s, z1.s}
+        fsub    za.d[w11, 7, vgx4], {z4.d - z7.d}
+        fmla    za.s[w9, 2], {z8.s, z9.s}, z12.s
+        fmls    za.s[w10, 1], {z16.s - z19.s}, {z20.s - z23.s}
+        fmla    za.s[w8, 0], {z0.s, z1.s}, z3.s[2]
+        sdot    za.s[w8, 4], {z2.b, z3.b}, z7.b[1]
+        udot    za.d[w9, 5], {z4.h, z5.h}, z6.h
+        fdot    za.s[w8, 6], {z8.h, z9.h}, {z10.h, z11.h}
+        smlal   za.s[w8, 2:3], {z0.h, z1.h}, z4.h[5]
+        umlall  za.s[w10, 4:7], {z8.b - z11.b}, z1.b
+        usmlall za.s[w8, 0:3], z0.b, z4.b
+        bfmlsl  za.s[w11, 6:7], {z2.h, z3.h}, {z6.h, z7.h}
+        svdot   za.s[w8, 1], {z0.b - z3.b}, z4.b[3]
+        bfvdot  za.s[w9, 2], {z6.h, z7.h}, z5.h[1]
+        mova    {z0.b, z1.b}, za0h.b[w12, 6:7]
+        mova    za1v.h[w13, 4:7], {z4.h - z7.h}
+        ld1b    {z0.b, z1.b}, pn8/z, [x0]
+        ld1w    {z4.s - z7.s}, pn9/z, [x1, x2, lsl #2]
+        ld1d    {z0.d, z8.d}, pn10/z, [x3, #-4, mul vl]
+        st1h    {z2.h, z3.h}, pn11, [x4, #6, mul vl]
+        ldnt1b  {z0.b, z4.b, z8.b, z12.b}, pn12/z, [x5]
+        stnt1d  {z20.d - z23.d}, pn13, [x6, x7, lsl #3]
+        smopa   za1.s, p0/m, p1/m, z2.h, z3.h
+        umops   za2.s, p2/m, p3/m, z4.h, z5.h
+        bmopa   za3.s, p0/m, p1/m, z6.s, z7.s
+        bfmlslb z0.s, z1.h, z7.h[5]
+        sdot    z3.s, z9.h, z2.h[1]
+        sshllt  z4.d, z5.s, #17
+        uabdlb  z6.h, z7.b, z8.b
+        nots    p6.b, p1/z, p2.b
