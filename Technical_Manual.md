@@ -348,8 +348,7 @@ for each pattern line, so an unmatched optional operand reads as 0.
 **Variable names.** A variable is written `x` above, but a name may be longer:
 it starts with a lowercase letter and continues over lowercase letters, digits
 and `_`, so `abcdef`, `var1` and `var_2` are all variable names. The same names
-are used by `.check`, `.enum`, `.clrcheck`, `.clrenum`, `.map`, `.reloc`,
-`.clrreloc` and `.free`.
+are used by `.check`, `.enum`, `.clrcheck`, `.clrenum`, `.map` and `.free`.
 
 ```
 .check::reg::BC,DE,HL,SP
@@ -1099,7 +1098,7 @@ reused without having to remember which directive defined it. It clears:
 - the `.sub` table of that name;
 - that name wherever it appears as a candidate in a `.check` list;
 - and, when the name reads as a variable name, that variable's whole
-  `.check` list, its `.enum`, and its `.reloc` declaration.
+  `.check` list and its `.enum`.
 
 Like `.clearsym` and `.clrcheck`, `.free` is positional: patterns written above
 it still see the names, patterns below it do not.
@@ -1113,88 +1112,6 @@ BEFORE     :: :: #N1        /* 0x07 */
 .free::N1,T1
 AFTER      :: :: #N1        /* error - undefined symbol: '#N1' */
 ```
-
-#### 3.7.5 `.reloc` — declaring a relocation type
-
-```
-.reloc::<variable>::<type name>
-```
-
-Writes the label reference captured by that variable into the `-o` output with the
-named ELF relocation type. Like `.check` it is positional: a later `.reloc` replaces
-an earlier one, `.clrreloc::x` (or `.clrreloc` with no argument) removes it, and
-`.free` removes it too.
-
-The type name comes from the `named` table of the machine selected by `-m` — the
-same names a source file writes after `::` (section 8.3).
-
-**Why it is needed.** Normally the relocation type and addend are inferred from the
-emitted bytes: the value sits there as a plain integer across consecutive bytes, so
-the addend is "emitted value minus label value". On AArch64, though, a branch or
-address-generation instruction packs the value into scattered bit fields inside a
-32-bit instruction word, scaled to words or pages. The addend cannot be recovered
-from that, and a width-only guess gives `bl` a `PREL32`, which links without
-complaint and branches four times too far.
-
-`.reloc` declares the type per instruction. The addend is the difference between the
-operand value the pattern captured and the label's value, so `bl func` gives 0 and
-`bl func+8` gives 8. The instruction's own field bits are emitted as zero — RELA, so
-the linker fills them in, the same shape GNU as produces.
-
-```
-.reloc::t::call26
-BL !t :: :: @@[4,(0x94000000|(((t-$$)>>2)&0x3ffffff))>>(%%*8)]
-.clrreloc::t
-```
-
-```
-bl func      ->  R_AARCH64_CALL26  func + 0
-bl func+8    ->  R_AARCH64_CALL26  func + 8
-```
-
-**Why the symbol side cannot express this.** The type is a property of the operand
-position, not of the symbol. The `adrp` / `add` pair that builds one address on
-AArch64 refers to the *same* symbol under two different types,
-`ADR_PREL_PG_HI21` and `ADD_ABS_LO12_NC`. A per-symbol form such as
-`.extern name::type` cannot represent that at all.
-
-```
-.reloc::p::adrp
-ADRP X!d,!p :: :: …
-.clrreloc::p
-.reloc::o::add_abs_lo12_nc
-ADD X!d,X!n,#!o :: :: …
-.clrreloc::o
-```
-
-```
-adrp x0,msg      ->  R_AARCH64_ADR_PREL_PG_HI21  msg + 0
-add  x0,x0,#msg  ->  R_AARCH64_ADD_ABS_LO12_NC   msg + 0
-```
-
-The instruction-field types available for AArch64 are below. The data types
-(`abs64` `abs32` `abs16` `pc64` `pc32` `pc16`) are still inferred without `.reloc`.
-
-| Type name | ELF | Field |
-|---|---|---|
-| `call26` / `jump26` | 283 / 282 | imm26 of `bl` / `b` |
-| `condbr19` | 280 | imm19 of `b.cond`, `cbz` |
-| `tstbr14` | 279 | imm14 of `tbz` / `tbnz` |
-| `adr_prel_lo21` | 274 | immlo/immhi of `adr` |
-| `adr_prel_pg_hi21` (`adrp`) | 275 | immlo/immhi of `adrp` |
-| `adr_prel_pg_hi21_nc` | 276 | same, no overflow check |
-| `add_abs_lo12_nc` | 277 | imm12 of `add` |
-| `ldst8_abs_lo12_nc` | 278 | imm12 of load/store |
-| `ldst16` / `ldst32` / `ldst64` / `ldst128_abs_lo12_nc` | 284 / 285 / 286 / 299 | same, scaled per width |
-| `movw_uabs_g0` … `g3` (and `_nc`) | 263–269 | imm16 of `movz` / `movk` |
-| `got_page` (`adr_got_page`) | 311 | immlo/immhi of `adrp` — GOT page |
-| `got_lo12` (`ld64_got_lo12_nc`) | 312 | imm12 of a 64-bit `ldr` — offset in the GOT |
-| `got_ld_prel19` | 309 | imm19 of a literal `ldr` |
-| `ld64_gotpage_lo15` | 313 | imm12 |
-
-The two GOT types differ in kind from the rest. Their value is the address of a
-GOT entry the linker creates, so nothing is known at assembly time: the field
-goes out zero and the relocation carries the whole meaning.
 
 ### 3.8 Optional parts (`[[ ]]`)
 
@@ -2359,10 +2276,6 @@ selected machine in `ELF_MACHINES`. For x86-64: `abs64`, `abs32`, `abs32s`,
 `abs16`, `abs8`, `pc32`, `rel32`, `plt32`, `pc16`, `pc8`, `pc64`, `got32`,
 `gotpcrel`, `got64`. An unrecognized name produces a warning and is ignored.
 
-The same names are what `.reloc` takes in a pattern file (section 3.7.5). A name
-that is an instruction-field type, such as AArch64's `call26`, is only meaningful
-there — per symbol it cannot say which operand position it applies to.
-
 Section records are optional. If you only need label values:
 
 ```
@@ -2605,7 +2518,7 @@ The x86_64 pattern file is also maintained separately at
 |---|---|---|---|---|
 | **x86_64.axx** | 3.9 MB | 23,923 | **hello.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512 |
 | **x86_64m.axx** | 935 KB | 5,787 | **hello.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo |
-| **aarch64.axx** | 132 KB | 3,644 | **aarch64.s** | AArch64 (A64): data processing, branches, exception generation, hints, barriers, system registers and SYS aliases, loads and stores, LSE atomics, scalar floating point, Advanced SIMD (vector and scalar) including the LD1-LD4 / ST1-ST4 structure accesses, cryptography, and the scalar extensions (PAuth, MTE, MOPS, FCMA, dot product, BFloat16, matrix multiply, LS64). SVE, SVE2 and SME are not covered |
+| **aarch64.axx** | 339 KB | 8,214 | **aarch64.s** | AArch64 (A64): data processing, branches, exception generation, hints, barriers, system registers and SYS aliases, loads and stores, LSE atomics, scalar floating point, Advanced SIMD (vector and scalar) including the LD1-LD4 / ST1-ST4 structure accesses, cryptography, and the scalar extensions (PAuth, MTE, MOPS, FCMA, dot product, BFloat16, matrix multiply, LS64), and the GNU-style relocation modifiers `:lo12:`, `:pg_hi21:`, `:abs_g0:`-`:abs_g3:`, `:prel_g0:`-`:prel_g3:` and `:got:` / `:got_lo12:`, which axx resolves itself rather than deferring to a linker, reading the GOT pair as naming the slot. Also SVE and SVE2 -- arithmetic, shifts, compares, predicates, element counts, permutes, reductions, the whole load/store family (contiguous, replicating, non-fault, first-fault, gather, scatter, prefetch), the widening and narrowing groups, complex arithmetic and the SVE2 cryptography -- SME: streaming mode, the ZA array, and the integer, floating-point and BFloat16 outer products -- and SME2: the predicate-as-counter registers, the ZT0 lookup table, the multi-vector operations on Z registers, accumulation into the ZA array, and the multi-vector loads and stores in both their consecutive and strided forms |
 | **aarch64_logical_mini.axx** | 9.2 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 logical (immediate): AND/ORR/EOR/ANDS/TST, 32- and 64-bit. Encodes the bitmask immediate with the mini language (section 3.15) |
 | **6809.axx** | 124 KB | 1,950 | **6809.s** | Motorola 6809 |
 | **68000.axx** | 51 KB | 453 | **68000.s** | Motorola 68000 |
