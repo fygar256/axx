@@ -7357,3 +7357,64 @@ UMOPA ZA!!t.S,pg/M,pf/M,zn.H,zm.H ::t>3;3 :: .call w4(0xa1800008|(zm<<16)|(pf<<1
 UMOPS ZA!!t.S,pg/M,pf/M,zn.H,zm.H ::t>3;3 :: .call w4(0xa1800018|(zm<<16)|(pf<<13)|(pg<<10)|(zn<<5)|t)
 BMOPA ZA!!t.S,pg/M,pf/M,zn.S,zm.S ::t>3;3 :: .call w4(0x80800008|(zm<<16)|(pf<<13)|(pg<<10)|(zn<<5)|t)
 BMOPS ZA!!t.S,pg/M,pf/M,zn.S,zm.S ::t>3;3 :: .call w4(0x80800018|(zm<<16)|(pf<<13)|(pg<<10)|(zn<<5)|t)
+
+/* -------------------------------------------------------------------
+/* The last few forms: SVE2 shapes that the groups above did not
+/* reach, and the SME2 unpack.
+/* ------------------------------------------------------------------- */
+
+/* The predicate NOT is an EOR against the governing predicate */
+NOT pd.B,pg/Z,pn.B :: .call w4(0x25004200|(pg<<16)|(pg<<10)|(pn<<5)|pd)
+NOTS pd.B,pg/Z,pn.B :: .call w4(0x25404200|(pg<<16)|(pg<<10)|(pn<<5)|pd)
+
+/* Widening absolute difference */
+!sv2w("SABDLB", 0x0c)
+!sv2w("SABDLT", 0x0d)
+!sv2w("UABDLB", 0x0e)
+!sv2w("UABDLT", 0x0f)
+
+/* Widening shift left.  The field holds the source element size plus
+/* the shift amount. */
+!def sv2shll(nm, opc, el, sel, es) {
+!{nm} zd.!{el},zn.!{sel},#!s ::s<0;3,s>!{es-1};3 :: .call w4(0x4500a000|((((!{es}+s)>>5)&3)<<22)|(((!{es}+s)&0x1f)<<16)|(!{opc}<<10)|(zn<<5)|zd)
+}
+!def sv2shlla(nm, opc) {
+!sv2shll(nm, opc, "H", "B", 8)
+!sv2shll(nm, opc, "S", "H", 16)
+!sv2shll(nm, opc, "D", "S", 32)
+}
+!sv2shlla("SSHLLB", 0x28)
+!sv2shlla("SSHLLT", 0x29)
+!sv2shlla("USHLLB", 0x2a)
+!sv2shlla("USHLLT", 0x2b)
+
+/* BFloat16 multiply-subtract long */
+BFMLSLB zd.S,zn.H,zm.H :: .call w4(0x64e0a000|(zm<<16)|(zn<<5)|zd)
+BFMLSLT zd.S,zn.H,zm.H :: .call w4(0x64e0a400|(zm<<16)|(zn<<5)|zd)
+BFMLSLB zd.S,zn.H,zy.H[!!i] ::i<0;3,i>7;3 :: .call w4(0x64e06000|((i&1)<<11)|((i>>1)<<19)|(zy<<16)|(zn<<5)|zd)
+BFMLSLT zd.S,zn.H,zy.H[!!i] ::i<0;3,i>7;3 :: .call w4(0x64e06400|((i&1)<<11)|((i>>1)<<19)|(zy<<16)|(zn<<5)|zd)
+
+/* The two-way dot product from halfwords into words */
+SDOT zd.S,zn.H,zm.H :: .call w4(0x4400c800|(zm<<16)|(zn<<5)|zd)
+UDOT zd.S,zn.H,zm.H :: .call w4(0x4400cc00|(zm<<16)|(zn<<5)|zd)
+SDOT zd.S,zn.H,zy.H[!!i] ::i<0;3,i>3;3 :: .call w4(0x4480c800|(i<<19)|(zy<<16)|(zn<<5)|zd)
+UDOT zd.S,zn.H,zy.H[!!i] ::i<0;3,i>3;3 :: .call w4(0x4480cc00|(i<<19)|(zy<<16)|(zn<<5)|zd)
+
+/* SME2 unpack: one vector into a pair, or a pair into a quad */
+.func::s2unpk::sz,u,zn,a,b
+g = .call n2q(a, b)
+.return .call w4(0xc125e000 | (sz << 22) | (g << 20) | (zn << 5) | a | u)
+.endfunc
+!def s2unp(nm, u, el, sel, sz) {
+!{nm} {zd.!{el},za.!{el}},zn.!{sel} :: .call s2unpk(!{sz},!{u},zn,zd,za)
+!{nm} {zd.!{el}-za.!{el}},zn.!{sel} :: .call s2unpk(!{sz},!{u},zn,zd,za)
+!{nm} {zd.!{el}-za.!{el}},{zn.!{sel},zb.!{sel}} ::(zn&1)!=0;5,zb!=zn+1;5 :: .call s2unpk(!{sz},!{u},zn,zd,za)
+!{nm} {zd.!{el},za.!{el}},{zn.!{sel},zb.!{sel}} ::(zn&1)!=0;5,zb!=zn+1;5 :: .call s2unpk(!{sz},!{u},zn,zd,za)
+}
+!def s2unpa(nm, u) {
+!s2unp(nm, u, "H", "B", 1)
+!s2unp(nm, u, "S", "H", 2)
+!s2unp(nm, u, "D", "S", 3)
+}
+!s2unpa("SUNPK", 0)
+!s2unpa("UUNPK", 1)
