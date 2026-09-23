@@ -660,3 +660,44 @@ tail:
         sshllt  z4.d, z5.s, #17
         uabdlb  z6.h, z7.b, z8.b
         nots    p6.b, p1/z, p2.b
+
+; ---- forms the encoding-space sweep turned up ----
+        add     z24.s, z24.s, #53504
+        uqsub   z12.d, z12.d, #18176
+        mov     z7.h, p4/m, #3072
+        mov     z13.s, p15/m, #-17152
+        mov     z2.h, #-30721
+        mov     z13.d, #0x7ffff8
+        mov     z3.h, h23
+        orr     z17.b, z17.b, #0x4
+        and     z27.d, z27.d, #0x1ffffffffffffc
+        eor     z20.s, z20.s, #0x1f000000
+        bic     z29.h, z29.h, #0xff
+        ext     z29.b, {z17.b, z18.b}, #57
+        ext     z24.b, {z31.b, z0.b}, #152
+        zip1    z0.q, z1.q, z2.q
+        trn2    z16.q, z19.q, z20.q
+        uzp2    z1.q, z5.q, z29.q
+        fdot    z3.s, z3.h, z25.h
+        fdot    z4.s, z5.h, z2.h[3]
+        incw    x12, #23, mul #11
+        sqdech  z13.h, #18, mul #16
+        uqinch  w2, #24
+        ptrue   p1.s, #17
+        incp    z30.d, p9.d
+        eor     p12.b, p9/z, p5.b, p8.b
+        brkbs   p3.b, p12/z, p2.b
+        nand    p9.b, p13/z, p2.b, p12.b
+        rdffr   p1.b, p11/z
+        ld4b    {z0.b - z3.b}, p6/z, [x22, #-16, mul vl]
+        st3d    {z10.d - z12.d}, p7, [x6, x22, lsl #3]
+        umlslb  z31.d, z1.s, z12.s[2]
+        smullb  z1.d, z3.s, z9.s[3]
+        luti4   z5.s, zt0, z22[6]
+        luti2   {z4.h, z5.h}, zt0, z25[5]
+        smlsll  za.s[w9, 4:7], z8.b, z0.b[8]
+        fmlal   za.s[w11, 10:11], z18.h, z8.h
+        umlall  za.d[w10, 8:11], z16.h, z13.h[4]
+        sumlall za.s[w8, 4:7], z31.b, z12.b[14]
+        sub     za.d[w11, 4, vgx4], {z17.d - z20.d}, z8.d
+        fdot    za.s[w10, 2, vgx2], {z11.h, z12.h}, z11.h
