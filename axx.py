@@ -913,6 +913,11 @@ class AssemblerState:
         self.relax = RelaxationState()
 
         self.verbose: bool = False
+        # `-V` の設定。真なら、文字列テンプレートで組み立てたテキストを素のまま
+        # 標準出力へ流す（トランスレータとしての出力）。既定は無出力で、`-b`/`-o`
+        # を付けずに走らせても画面には何も出ない。caxx.c の AsmState.text_output
+        # と同じ意味である。
+        self.text_output: bool = False
         # パターンのエンコーディング欄が文字列テンプレート "..." だったときに、
         # そこから組み立てたアセンブリ結果のテキスト。1行ごとに作り直す。
         self.asmtext = None
@@ -10171,12 +10176,13 @@ class Assembler:
         f = self.lineassemble(cleaned)
         # パターンが文字列テンプレートだった行は、バイナリ出力とは別に、
         # アセンブリ結果をテキストでも出す。
-        # -v の診断行の中では `` ではなく "" で括って見せ、診断を出さないときは
-        # その行だけを素のまま標準出力へ流す（トランスレータとしての出力）。
+        # -v の診断行の中では `` ではなく "" で括って見せる。素のまま標準出力へ
+        # 流す（トランスレータとしての出力）のは `-V` を付けたときだけで、既定は
+        # 無出力である。caxx.c の lineassemble0() と同じ規則である。
         if self.state.asmtext is not None and self.state.pas in (0, 2):
             if _show:
                 print(' %s' % (self.state.asmtext_disp or ''), end='')
-            else:
+            elif self.state.text_output:
                 print(self.state.asmtext)
         self.state.asmtext = None
         self.state.asmtext_disp = None
@@ -11252,6 +11258,11 @@ class Assembler:
         ap.add_argument('-v', '--verbose', dest='verbose', action='store_true',
                         default=False,
                         help='Verbose: print assembly listing to stdout (default: silent)')
+        ap.add_argument('-V', '--text-output', dest='text_output', action='store_true',
+                        default=False,
+                        help='Print the text built from string-template patterns '
+                             '(.textmode translation output) to stdout (default: silent). '
+                             'With -v the same text is shown inside the listing instead.')
         ap.add_argument('-d', '--debug', dest='debug', action='store_true',
                         default=False,
                         help='Enable debug output (forward-ref fallback, relaxation log, etc.)')
@@ -11425,6 +11436,7 @@ class Assembler:
                   file=sys.stderr)
         self.state.osabi        = osabitbl.get(_osabi_key, 0)
         self.state.verbose      = args.verbose
+        self.state.text_output  = args.text_output
         self.state.debug        = args.debug
         self.state.gen_debug    = args.gen_debug
         self.macro_proc.enabled = not args.no_macro

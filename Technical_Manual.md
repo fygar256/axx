@@ -25,6 +25,7 @@ Assemble:
 axx z80.axx z80.s -v            # listing to stdout
 axx z80.axx z80.s -b out.bin    # raw binary
 axx x86_64.axx hello.s -o out.o # ELF relocatable object
+axx 8080toz80.axx hello8080.s -V > out.s  # translated text to stdout
 ```
 
 ## Two implementations
@@ -37,7 +38,9 @@ axx x86_64.axx hello.s -o out.o # ELF relocatable object
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
 exactly that: `test1` assembles all nineteen bundled pattern/source pairs with both
-implementations and `cmp`s the results.
+implementations and `cmp`s the results. For the two `.textmode` pairs it also
+`cmp`s the translated text each implementation sends to standard output under
+`-V`, for twenty-one comparisons in all.
 
 **Contents**
 
@@ -202,6 +205,7 @@ axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV]
 | `-E EXPORT_ELF_TSV` | Export labels to TSV (with ELF section flags) |
 | `-i IMPORT_TSV` | Import labels from TSV |
 | `-v`, `--verbose` | Print assembly listing to stdout (default: silent) |
+| `-V`, `--text-output` | Print the text built from string templates (section 3.5.2) plain to stdout (default: silent). This is what you use to translate a source with `.textmode` (section 3.18) |
 | `-d`, `--debug` | Debug output: forward-ref fallback, relaxation log |
 | `-g`, `--gen-debug` | Emit DWARF (`.debug_info`/`.debug_abbrev`/`.debug_line`). Requires `-o` and ELF64 |
 | `--no-macro` | Disable the macro layer on both the source and pattern side |
@@ -210,7 +214,8 @@ axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV]
 | `-h`, `--help` | Usage |
 
 If no output option is given, nothing is written; `-v` is what makes the run
-visible.
+visible. Use `-V` when you want only the translated text of the string
+templates, plain.
 
 ### 2.2 ELF output
 
@@ -547,8 +552,9 @@ Where the text goes:
   wider than the output word width (`.bits`) is truncated with a warning.
   There is no `\0` or `\xHH` escape — a byte that is not text is written as a
   number in the list, next to the string.
-- Without `-v`, the rendered line alone is also written to standard output, so
-  the translated program can simply be redirected to a file.
+- With `-V`, the rendered line alone is also written to standard output, so
+  the translated program can simply be redirected to a file. Without `-V`
+  nothing reaches standard output (silent by default).
 - With `-v`, it appears at the end of that line's diagnostic, after the `//`,
   enclosed in double quotes: `... MOV R1,0x10 // "LD R1,0x10"`. There it is
   shown escaped — a newline reads `\n`, not a line break — so the diagnostic
@@ -559,7 +565,7 @@ Where the text goes:
   is skipped when it renders empty.
 
 So one pattern file serves both uses at once: the text on standard output for
-translation, and the same string in the binary for assembly.
+translation (`-V`), and the same string in the binary for assembly (`-b`/`-o`).
 
 ```
 NOP  :: "ABC"
@@ -1814,7 +1820,8 @@ line.
 
 A line let through is treated exactly as if a pattern whose encoding field was
 `"<that line>"` had matched: one UTF-8 byte becomes one output word, the
-location counter advances by that much, and the text goes to standard output.
+location counter advances by that much, and, with `-V`, the text goes to
+standard output.
 The same text is produced in both passes, so labels after such a line still get
 the right address.
 
@@ -1872,9 +1879,9 @@ NOP::"NOP"
 ```
 
 - Only the **output words** get it. The text sent to standard output (the
-  translator's own output) does not, because that is already printed one line at
-  a time — so a `-b`/`-o` file gains the newlines while standard output looks
-  exactly as before.
+  translator's own output under `-V`) does not, because that is already printed
+  one line at a time — so a `-b`/`-o` file gains the newlines while standard
+  output looks exactly as before.
 - A line that produced no output word gets nothing (a comment-only line, a
   pattern that emits nothing, a directive line such as `.section`). Bytes written
   directly by `.ascii` and friends (section 5.3) are not affected either.
@@ -2000,7 +2007,7 @@ The bundled `8080toz80.axx` is this mode at work: it reads Intel 8080 source and
 writes Zilog Z80 source text for the same program.
 
 ```sh
-axx 8080toz80.axx hello8080.s > helloz80.s
+axx 8080toz80.axx hello8080.s -V > helloz80.s
 ```
 
 ```
@@ -2015,7 +2022,9 @@ msg:    db 'Hello, world$'            msg: db 'Hello, world$'
 
 Its operands are captured with `!L` and emitted with `{{.exp()}}`, so `msg` stays
 a label and `0x0005` keeps the spelling it was written with. The `helloz80.s` that
-comes out assembles as it is with `z80.axx`.
+comes out assembles as it is with `z80.axx`. Sending the text to standard output
+is `-V`'s job, so without it nothing appears on screen (`-b` still writes the
+same text to a file).
 
 
 ---
@@ -2948,7 +2957,10 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 `aarch64_logical_mini_demo.s`.
 
 `test1` runs all nineteen of the pairs above through both implementations and
-compares the results.
+compares the `-b` raw binaries. For the two pairs that use `.textmode`
+(`textmode.axx` and `8080toz80.axx`) it also compares the translated text each
+implementation writes to standard output under `-V`, for twenty-one comparisons
+in all.
 
 x86_64 and legacy CPUs make up most of what is currently implemented, but that
 reflects where the work has gone, not the limit of what axx can describe.
@@ -2970,7 +2982,8 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `axx.1.gz` | Man page |
 
 `test1` assembles all nineteen bundled pattern/source pairs with both
-implementations and compares the results.
+implementations and compares the results, plus the `-V` translation text of the
+two `.textmode` pairs.
 
 ### C.2 External
 

@@ -1270,6 +1270,11 @@ typedef struct {
     int        pas;
     int        debug;
     int        verbose;
+    /* `-V` の設定。真なら、文字列テンプレートで組み立てたテキストを素のまま
+     * 標準出力へ流す（トランスレータとしての出力）。既定は無出力で、`-b`/`-o`
+     * を付けずに走らせても画面には何も出ない。axx.py の AsmState.text_output
+     * と同じ意味である。 */
+    int        text_output;
 
     /* パターンのエンコーディング欄が文字列テンプレート "..." だったときに、
      * そこから組み立てたアセンブリ結果のテキスト。1行ごとに作り直す。
@@ -12060,11 +12065,12 @@ static int lineassemble0(Assembler *asmb, const char *line){
     int f=lineassemble(asmb,cleaned);
     /* パターンが文字列テンプレートだった行は、バイナリ出力とは別に、
      * アセンブリ結果をテキストでも出す。
-     * -v の診断行の中では `` ではなく "" で括って見せ、診断を出さないときは
-     * その行だけを素のまま標準出力へ流す（トランスレータとしての出力）。 */
+     * -v の診断行の中では `` ではなく "" で括って見せる。素のまま標準出力へ
+     * 流す（トランスレータとしての出力）のは `-V` を付けたときだけで、既定は
+     * 無出力である。axx.py の lineassemble0() と同じ規則である。 */
     if(st->asmtext && (st->pas==0 || st->pas==2)){
-        if(show) printf(" %s", st->asmtext_disp ? st->asmtext_disp : "");
-        else     printf("%s\n", st->asmtext);
+        if(show)                printf(" %s", st->asmtext_disp ? st->asmtext_disp : "");
+        else if(st->text_output) printf("%s\n", st->asmtext);
     }
     free(st->asmtext); st->asmtext=NULL;
     free(st->asmtext_disp); st->asmtext_disp=NULL;
@@ -15529,7 +15535,8 @@ static int imp_label(Assembler *asmb, const char *l){
 }
 
 static void print_usage(const char *prog){
-    printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-f {32,64}] [-m machine] [-v] [-d] [-g] [--no-macro] [-P [file]] [-p [file]]\n",prog);
+    printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-f {32,64}] [-m machine] [-v] [-V] [-d] [-g] [--no-macro] [-P [file]] [-p [file]]\n",prog);
+    printf("  -V           print the text built from string-template patterns (.textmode translation output) to stdout\n");
     printf("  --no-macro   disable the macro preprocessor layer (!if/!while/!def/!return/!set and !{...})\n");
     printf("  -P [file]    macro-expand the source and write it out (stdout if file is omitted), then stop\n");
     printf("  -p [file]    macro-expand the pattern file and write it out (stdout if file is omitted), then stop\n");
@@ -15637,6 +15644,7 @@ int main(int argc, char *argv[]){
             st->elf_machine = _mval;
         }
         else if(strcmp(argv[i],"-v")==0||strcmp(argv[i],"--verbose")==0){ st->verbose=1; }
+        else if(strcmp(argv[i],"-V")==0||strcmp(argv[i],"--text-output")==0){ st->text_output=1; }
         else if(strcmp(argv[i],"-d")==0||strcmp(argv[i],"--debug")==0){ st->debug=1; }
         else if(strcmp(argv[i],"-g")==0||strcmp(argv[i],"--gen-debug")==0){ st->gen_debug=1; }
         else if(strcmp(argv[i],"--no-macro")==0){ g_macro.enabled=0; g_pat_macro.enabled=0; }
