@@ -899,6 +899,12 @@ class AssemblerState:
         # vars を退避・復元する箇所は必ずこちらも一緒に扱うこと。
         self.vars_undef = {}
 
+        # `!L<名前>` が拾った「ソースに書かれていたままの式・ラベルの文字」。
+        # 変数名 → 文字列。テキストテンプレートの `{{.exp(<名前>)}}` がこれを
+        # そのまま出す（3.5.2 節）。値（vars）とは別物で、vars を退避・復元する
+        # 箇所では必ずこちらも一緒に扱うこと（caxx.c の PatVar.text_off に対応）。
+        self.vars_text = {}
+
         self.deb1 = ""           # 照合デバッグ用（ソース側の残り）
         self.deb2 = ""           # 同（パターン側の残り）
 
@@ -911,6 +917,10 @@ class AssemblerState:
         # そこから組み立てたアセンブリ結果のテキスト。1行ごとに作り直す。
         self.asmtext = None
         self.asmtext_disp = None
+        # テキスト置換モード（`.textmode`）で、その行の先頭にあった `label:` の
+        # 綴りをそのまま覚えておく置き場。書き換えたテキストの前に付け直す。
+        # 1行ごとに作り直す。
+        self.label_text = ''
         # `.setsym::名前::"文字列"` で登録された文字列シンボル。値が数値では
         # ないので式には出せず、文字列テンプレート（3.5.2）の中でだけ使える。
         # 名前は大文字化して持つ（`.setsym` の数値シンボルと同じ規約）。
@@ -923,6 +933,11 @@ class AssemblerState:
         self.passthru = 0
         # `.eol` の設定。真なら、出力を出した行ごとに改行を1ワード足す。
         self.eol = 0
+        # `.textmode` の設定。真なら「テキスト置換モード」。ソースを別の書式の
+        # テキストへ書き換えるための設定で、`.passthru` と `.eol` を一緒に立て、
+        # `!L<名前>` が拾った式・ラベルの中の未定義ラベルをエラーにしない
+        # （値は 0 になり、文字は書かれたとおりに出る）。
+        self.textmode = 0
 
         # 標準入力から読んだソースを置く一時ファイル（全パスで再利用する）。
         self.stdin_tmp_path: str | None = None
@@ -4013,6 +4028,48 @@ class DirectiveProcessor:
                             set_error=True)
         return True
 
+    def textmode_processing(self, i):
+        """`.textmode[::on|off]`
+
+        テキスト置換モード。ソースを別の書式のテキストへ書き換える
+        （トランスレータとしての）使い方のための設定で、次の3つをまとめて行う。
+
+          1. `.passthru` を立てる（マッチしない行はそのまま出す）
+          2. `.eol` を立てる（出力を出した行ごとに改行を1ワード足す）
+          3. `!L<名前>`（式・ラベル捕捉子）の中の未定義ラベルをエラーにしない。
+             値は 0 になり、`{{.exp(<名前>)}}` が書かれたとおりの文字を出す。
+
+            .textmode          on と同じ
+            .textmode::on      テキスト置換モードにする
+            .textmode::off     やめる（既定）
+
+        3 つまとめて動くので、`.passthru` や `.eol` だけを別にしたいときは
+        この行の後ろでそちらを書けばよい（ディレクティブは書いた順に効く）。
+
+        パターンファイルは1行ごとに全部走査されるので、これはファイル全体に
+        かかる設定として働く（同じファイルに複数書いた場合は最後のものが
+        効く）。caxx.c の dir_textmode() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.textmode':
+            return False
+        arg = ''
+        for f in i[1:]:
+            if f and f.strip():
+                arg = StringUtils.upper(f.strip())
+                break
+        if arg in ('', 'ON'):
+            self.state.textmode = 1
+            self.state.passthru = 1
+            self.state.eol = 1
+        elif arg == 'OFF':
+            self.state.textmode = 0
+            self.state.passthru = 0
+            self.state.eol = 0
+        else:
+            self.state.diag(f" error - .textmode: expected 'on' or 'off' "
+                            f"('{arg}').", set_error=True)
+        return True
+
     def enum_processing(self, i):
         """`.enum::<変数>::<要素名の並び>::<式>`。
 
@@ -4104,6 +4161,17 @@ class DirectiveProcessor:
 
 _SYM_CORE = set(DIGIT + ALPHABET + '_')
 
+# テキスト置換モード（`.textmode`）で、処理せずテキストとしてだけ出す組み込み
+# アセンブリディレクティブ。いずれも自分でワードや領域を出す（あるいは
+# ロケーションカウンタを飛ばす）ものなので、テキストとして出したうえで
+# さらに出させると中身が二重になり、翻訳結果のテキストに詰め物や生データが
+# 混ざってしまう。テキスト置換モードでの出力は「書き換えたテキストそのもの」
+# なので、行はテキストとして残し、出力の側は何も出さない。
+# caxx.c の textmode_text_only_dir() と同じ表である。
+_TEXTMODE_TEXT_ONLY_DIRS = frozenset((
+    '.ORG', '.ALIGN', '.ZERO', '.ASCII', '.ASCIZ',
+    '.RESB', '.RESW', '.RESD', '.RESQ'))
+
 
 def _expects_expr(t, idx):
     while idx < len(t) and t[idx] in ' \t':
@@ -4120,6 +4188,8 @@ class PatternMatcher:
       `!x`          任意の式を読んで変数 x に束縛
       `!!x`         式ではなく factor 1個だけを束縛
       `!Fx`/`!Dx`/`!Qx`  浮動小数点式を IEEE754 の 32/64/128bit として束縛
+      `!Lx`         式・ラベル捕捉子。`!x` と同じに値を束縛し、そのうえで
+                    ソースに書かれていたままの文字も覚える（`{{.exp(x)}}`）
       `!S{{名前}}x` `.sub::名前 … .return` のサブ表のどれか1項目に一致させ、
                     その項目の値欄を評価した結果を変数 x に束縛
       `\c`          次の1文字をリテラル扱い（エスケープ）
@@ -4425,6 +4495,56 @@ class PatternMatcher:
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
                         idx_s += 1
                     continue
+                elif a == 'L':
+                    # `!L<名前>` — 式・ラベル捕捉子。`!<名前>` と同じように式を
+                    # 1つ読んで値を束縛し、そのうえで「ソースに書かれていたまま
+                    # の文字」も覚えておく。テキストテンプレートの
+                    # `{{.exp(<名前>)}}` がその文字をそのまま出す（3.5.2 節）。
+                    # テキスト置換モード（`.textmode`）では、拾った式の中の
+                    # 未定義ラベルをエラーにせず値を 0 にする。書き換え先の
+                    # テキストに要るのは値ではなく綴りそのものだからである。
+                    if idx_t >= len(t):
+                        return False
+                    _nl = self._var_name_at(t, idx_t)
+                    if _nl == 0:
+                        return False
+                    a = self._var_declare(t[idx_t:idx_t + _nl])
+                    idx_t = StringUtils.skipspc(t, idx_t + _nl)
+                    if idx_t < len(t) and t[idx_t] == '\\':
+                        idx_t += 1
+                        stopchar = t[idx_t] if idx_t < len(t) else chr(0)
+                        idx_t += 1
+                    else:
+                        stopchar = chr(0)
+
+                    idx_s_text_start = idx_s
+                    self.state._elf_capturing_var = a
+                    _cap_prior = self.state.error_undefined_label
+                    self.state.error_undefined_label = False
+                    try:
+                        v, idx_s = self.expr_eval.expression_esc(s, idx_s, stopchar)
+                    finally:
+                        self.state._elf_capturing_var = None
+                    _cap_undef = self.state.error_undefined_label
+
+                    raw_text = s[idx_s_text_start:idx_s]
+                    if stopchar != chr(0) and raw_text.endswith(stopchar):
+                        raw_text = raw_text[:-1]
+                    self.state.vars_text[a] = raw_text.strip(' \t' + chr(0))
+
+                    if self.state.textmode:
+                        # テキストへ書き換えるだけの行なので、値が決まらない
+                        # ことは誤りではない。番兵を持ち回らず 0 にしておく。
+                        self.state.error_undefined_label = _cap_prior
+                        if _cap_undef or _is_undef_derived(v):
+                            v = 0
+                        self.var_manager.put_tagged(a, v, False)
+                    else:
+                        self.state.error_undefined_label = _cap_prior or _cap_undef
+                        self.var_manager.put_tagged(a, v, _cap_undef)
+                    if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
+                        idx_s += 1
+                    continue
                 elif a == 'E':
                     if idx_t >= len(t):
                         return False
@@ -4653,6 +4773,7 @@ class PatternMatcher:
         for vt, binds in self._sub_variants(t):
             saved_vars = dict(self.state.vars)
             saved_vars_undef = dict(self.state.vars_undef)
+            saved_vars_text = dict(self.state.vars_text)
             saved_refs_len = len(self.state._elf_label_refs_seen)
             saved_v2l = dict(self.state._elf_var_to_label)
             saved_hint = dict(self.state._elf_insn_reloc_hint)
@@ -4663,6 +4784,7 @@ class PatternMatcher:
                 return True
             self.state.vars = saved_vars
             self.state.vars_undef = saved_vars_undef
+            self.state.vars_text = saved_vars_text
             del self.state._elf_label_refs_seen[saved_refs_len:]
             self.state._elf_var_to_label = saved_v2l
             self.state._elf_insn_reloc_hint = saved_hint
@@ -4701,6 +4823,7 @@ class PatternMatcher:
                 lt = self.remove_brackets(t, list(j))
                 saved_vars = dict(self.state.vars)
                 saved_vars_undef = dict(self.state.vars_undef)
+                saved_vars_text = dict(self.state.vars_text)
                 saved_refs_len = len(self.state._elf_label_refs_seen)
                 saved_v2l      = dict(self.state._elf_var_to_label)
                 saved_hint     = dict(self.state._elf_insn_reloc_hint)
@@ -4709,6 +4832,7 @@ class PatternMatcher:
                     return True
                 self.state.vars = saved_vars
                 self.state.vars_undef = saved_vars_undef
+                self.state.vars_text = saved_vars_text
                 del self.state._elf_label_refs_seen[saved_refs_len:]
                 self.state._elf_var_to_label = saved_v2l
                 self.state._elf_insn_reloc_hint = saved_hint
@@ -4943,7 +5067,8 @@ class PatternFileReader:
                              f"name ({var_str!r}).", set_error=True)
 
                 if len(l) == 1:
-                    if l[0].strip() != '' and _kw not in ('.PASSTHRU', '.EOL'):
+                    if l[0].strip() != '' and _kw not in ('.PASSTHRU', '.EOL',
+                                                         '.TEXTMODE'):
                         diag(f" warning - pattern line has no '::' field separator "
                              f"and can never match (a pattern file has no line-"
                              f"continuation mechanism, so this is likely a stray "
@@ -6459,6 +6584,8 @@ class ObjectGenerator:
     #   - `.index 名前[添字]`           … その参照が使う添字そのもの
     #                                     （名前から番号を引くのに使う）
     #                                     （添字は名前・`"名前"`・式のいずれでもよい）
+    #   - `.exp(変数)`                  … `!L変数` が拾った式・ラベルを、ソースに
+    #                                     書かれていたままの文字で出す
     # が書ける。文字列の外と同じく `\n` `\t` `\r` `\\` `\"` は解く。
     #
     # 組み上がったテキストはそのままバイナリとしても出る。`.ascii` と同じく
@@ -6644,6 +6771,12 @@ class ObjectGenerator:
                     j += 1
                 done = False
                 if inner[j:j + 1] == '.':
+                    # `.exp(変数)` は `!L変数` が拾った式・ラベルの文字そのもの。
+                    en = self._txt_exp_call(inner[j + 1:])
+                    if en is not None:
+                        parts.append(self._txt_exp_text(en))
+                        done = True
+                if not done and inner[j:j + 1] == '.':
                     # `.index 配列[式]` は、その参照が使う添字そのものを返す。
                     nm, ix = self._txt_index_call(inner[j + 1:])
                     if nm is not None:
@@ -6802,6 +6935,43 @@ class ObjectGenerator:
             return ''
         n = self._arr_index_of(key, idxtext)
         return '' if n is None else self._txt_radix(n, 10)
+
+    @classmethod
+    def _txt_exp_call(cls, s):
+        """`.exp(変数)` なら変数名を返す。違えば None。
+
+        中に書けるのは変数名ひとつだけで、式は書けない。`!L変数` が拾った
+        「ソースに書かれていたままの式・ラベルの文字」を指す名前である。
+        caxx.c の txt_exp_call() と同じ規則である。
+        """
+        if StringUtils.upper(s[:3]) != 'EXP':
+            return None
+        rest = s[3:]
+        if rest[:1] not in (' ', '\t', '('):
+            return None                # `.expand` のような別の名前
+        rest = rest.strip()
+        if rest[:1] != '(':
+            return None
+        cb = cls._txt_close_paren(rest, 0)
+        if cb < 0 or rest[cb + 1:].strip() != '':
+            return None
+        nm = rest[1:cb].strip()
+        if not nm or PatternMatcher._var_name_at(nm, 0) != len(nm):
+            return None                # 変数名でなければ `.exp` ではない
+        return nm
+
+    def _txt_exp_text(self, name):
+        """`.exp(変数)` の中身。`!L変数` が拾った文字をそのまま返す。
+
+        その行で拾っていなければ（省略可部分に入っていた等）空文字を返す。
+        そもそも変数として使われていない名前なら書き損じなので診断する。
+        """
+        if name not in self.state.varnames:
+            self.state.diag(f" error - '{name}' is not a pattern variable; "
+                            f"'.exp({name})' needs '!L{name}' in the "
+                            f"instruction field.", set_error=True)
+            return ''
+        return self.state.vars_text.get(name, '')
 
     @staticmethod
     def _txt_quoted_text(t):
@@ -7470,11 +7640,20 @@ class AssemblyDirectiveProcessor:
                 if self.state.error_undefined_label and self.state.should_report_errors():
                     self.state.diag(f" error - .EQU '{label}': expression contains undefined label.", set_error=True)
                 ok = self.label_manager.put_value(label, u, self.state.current_section, is_equ=True, reloc_type=reloc_type)
+                # テキスト置換モードでは `label: .equ 式` の行もテキストとして
+                # 出す。ラベルの綴りは lineassemble() が前に付け直し、残りの
+                # `.equ 式` はどのパターンにも当たらないので素通しで出る。
+                if self.state.textmode:
+                    self.state.label_text = l[:lidx]
+                    return l[lidx:]
                 return ""
             else:
                 ok = self.label_manager.put_value(label, self.state.pc, self.state.current_section, is_equ=False)
                 if ok is False:
                     return ""
+                # テキスト置換モードでは、落とした `label:` を出力の先頭に
+                # 付け直すため、書かれていたとおりの綴りを覚えておく。
+                self.state.label_text = l[:lidx]
                 return l[lidx:]
         return l
 
@@ -9338,6 +9517,18 @@ class Assembler:
         self.fileassemble(s)
         return True
 
+    def _dir_line_done(self, l, l2, idx):
+        """組み込みアセンブリディレクティブを処理し終えた行の返り値。
+
+        テキスト置換モード（`.textmode`）では、その行もテキストとして出す。
+        翻訳結果から `.section` や `.global` のような行が消えないようにするため
+        である。そうでなければ今までどおり、出力を出さない行として返す。
+        caxx.c の adir_done() と同じ規則である。
+        """
+        if self.state.textmode:
+            return self._passthru_line(l, l2, idx)
+        return 0, [], True, idx
+
     def lineassemble2(self, line, idx):
         l, idx = StringUtils.get_param_to_spc(line, idx)
         l2, idx = StringUtils.get_param_to_eon(line, idx)
@@ -9345,14 +9536,20 @@ class Assembler:
         l2 = l2.rstrip()
         l = l.replace(' ', '')
 
+        # テキスト置換モードでは、自分でワードや領域を出すディレクティブは
+        # 処理せず、行をテキストとしてだけ出す（_TEXTMODE_TEXT_ONLY_DIRS の
+        # コメントを参照）。
+        if self.state.textmode and StringUtils.upper(l) in _TEXTMODE_TEXT_ONLY_DIRS:
+            return self._passthru_line(l, l2, idx)
+
         if self.asm_directive_proc.section_processing(l, l2):
-            return 0, [], True, idx
+            return self._dir_line_done(l, l2, idx)
         if self.asm_directive_proc.endsection_processing(l, l2):
-            return 0, [], True, idx
+            return self._dir_line_done(l, l2, idx)
         if self.asm_directive_proc.resb_processing(l, l2):
-            return 0, [], True, idx
+            return self._dir_line_done(l, l2, idx)
         if self.asm_directive_proc.zero_processing(l, l2):
-            return 0, [], True, idx
+            return self._dir_line_done(l, l2, idx)
         _l_upper = StringUtils.upper(l)
         if _l_upper == '.ASCII':
             _ok = self.asm_directive_proc.ascii_processing(l, l2)
@@ -9364,22 +9561,28 @@ class Assembler:
             if not _ok and (self.state.should_report_errors()):
                 self.state.diag(f" error - .ASCIZ: failed to process string argument: {l2!r}", set_error=True)
             return 0, [], True, idx
+        # `.include` は取り込んだ行そのものが訳されて出るので、この行は出さない。
         if self.include_asm(l, l2):
             return 0, [], True, idx
         if self.asm_directive_proc.align_processing(l, l2):
-            return 0, [], True, idx
+            return self._dir_line_done(l, l2, idx)
         if self.asm_directive_proc.org_processing(l, l2):
-            return 0, [], True, idx
+            return self._dir_line_done(l, l2, idx)
         if self.asm_directive_proc.labelc_processing(l, l2):
-            return 0, [], True, idx
+            return self._dir_line_done(l, l2, idx)
         if self.asm_directive_proc.extern_processing(l, l2):
-            return 0, [], True, idx
+            return self._dir_line_done(l, l2, idx)
         if self.asm_directive_proc.reloctype_processing(l, l2):
-            return 0, [], True, idx
+            return self._dir_line_done(l, l2, idx)
         if self.asm_directive_proc.export_processing(l, l2):
-            return 0, [], True, idx
+            return self._dir_line_done(l, l2, idx)
 
         if l == "":
+            # テキスト置換モードでラベルだけの行は、落とした `label:` を出力に
+            # 戻す仕事が残っているので、出力なしの成功として返す
+            # （付け直すのは lineassemble() の側）。
+            if self.state.textmode and self.state.label_text:
+                return 0, [], True, idx
             return 0, [], False, idx
 
         se = False
@@ -9426,6 +9629,7 @@ class Assembler:
             pl = i
             self.state.vars = {}
             self.state.vars_undef = {}
+            self.state.vars_text = {}
 
             if i is None:
                 continue
@@ -9458,6 +9662,8 @@ class Assembler:
             if self.directive_proc.passthru_processing(i):
                 continue
             if self.directive_proc.eol_processing(i):
+                continue
+            if self.directive_proc.textmode_processing(i):
                 continue
             if self.directive_proc.enum_processing(i):
                 continue
@@ -9510,6 +9716,7 @@ class Assembler:
 
             saved_vars = dict(self.state.vars)
             saved_vars_undef = dict(self.state.vars_undef)
+            saved_vars_text = dict(self.state.vars_text)
             saved_refs_len = len(self.state._elf_label_refs_seen)
             saved_v2l = dict(self.state._elf_var_to_label)
             saved_hint = dict(self.state._elf_insn_reloc_hint)
@@ -9540,6 +9747,7 @@ class Assembler:
                         'pat':   i,
                         'vars':  dict(self.state.vars),
                         'vars_undef': dict(self.state.vars_undef),
+                        'vars_text': dict(self.state.vars_text),
                         'refs':  self.state._elf_label_refs_seen[saved_refs_len:],
                         'v2l':   dict(self.state._elf_var_to_label),
                         'hint':  dict(self.state._elf_insn_reloc_hint),
@@ -9550,6 +9758,7 @@ class Assembler:
 
                 self.state.vars = saved_vars
                 self.state.vars_undef = saved_vars_undef
+                self.state.vars_text = saved_vars_text
                 del self.state._elf_label_refs_seen[saved_refs_len:]
                 self.state._elf_var_to_label = saved_v2l
                 self.state._elf_insn_reloc_hint = saved_hint
@@ -9582,6 +9791,7 @@ class Assembler:
             _restore_dirstate(best['dir'])
             self.state.vars = dict(best['vars'])
             self.state.vars_undef = dict(best['vars_undef'])
+            self.state.vars_text = dict(best['vars_text'])
             self.state._elf_label_refs_seen.extend(best['refs'])
             self.state._elf_var_to_label = dict(best['v2l'])
             self.state._elf_insn_reloc_hint = dict(best['hint'])
@@ -9715,6 +9925,7 @@ class Assembler:
 
         self.state.symbols = dict(self.state.patsymbols)
 
+        self.state.label_text = ''
         line = self.asm_directive_proc.label_processing(line)
 
         _vparts = line.replace(VLIW_STOP, VLIW_SEP).split(VLIW_SEP)
@@ -9735,6 +9946,29 @@ class Assembler:
 
         if not flag:
             return False
+
+        # テキスト置換モードでは、行頭にあった `label:` をそのまま出力の先頭に
+        # 付け直す。照合のために落としてあるので、ここで書かれていたとおりの
+        # 綴りで戻す。テキストを作った行と、ラベルだけの行が対象で、テキスト
+        # ではなく数値を出した行（`.ascii` などの組み込みディレクティブ）は
+        # データを壊さないようそのままにする。
+        if (self.state.textmode and self.state.label_text
+                and not self.state.vliwflag
+                and (self.state.asmtext is not None or not objl)):
+            _lpfx = self.state.label_text
+            _ltxt = self.state.asmtext
+            if _ltxt:
+                _lpfx += ' '
+            _lbytes = list(_lpfx.encode('utf-8', errors='surrogateescape'))
+            objl[0:0] = _lbytes
+            self.state.asmtext = _lpfx + (_ltxt or '')
+            self.state.asmtext_disp = '"%s"' % asmtext_escaped(self.state.asmtext)
+            # 前に足したぶん、その行のワード位置がずれる。ELF の再配置は
+            # ワード位置で覚えているので、同じだけ送っておく。
+            if _lbytes:
+                self.state._elf_label_refs_seen = [
+                    (_n, _v, (_w + len(_lbytes)) if _w >= 0 else _w)
+                    for (_n, _v, _w) in self.state._elf_label_refs_seen]
 
         # `.eol` が有効なら、出力を出した行ごとに改行を1ワード足す。標準出力へ
         # 流すテキストには足さない（そちらは行ごとに改行して出しているので、

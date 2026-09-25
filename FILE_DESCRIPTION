@@ -17,8 +17,6 @@ File description
 8080.s                              test assemble file for 8080
 4004.axx                            pattern file for 4004
 4004.s                              test assemble file for 4004
-aarch64.axx                         pattern file for aarch64
-aarch64.s                           test assemble file for aarch64
 aarch64_logical.axx                 pattern file for the AArch64 logical (immediate)
                                     group, AND/ORR/EOR/ANDS/TST, 32 and 64 bit.
                                     the macro-layer version: the rows are
@@ -30,6 +28,27 @@ aarch64_logical_mini.axx            pattern file for the AArch64 logical (immedi
                                     language instead of one binary_list expression
 aarch64_logical_mini_demo.s         test assemble file for aarch64_logical_mini.axx
                                     (also assembles with aarch64_logical.axx)
+arrindex.axx                        pattern file for the array-symbol features:
+                                    bare names as items, a name used as a
+                                    subscript, and .index (manual 3.6.1)
+arrindex.s                          test assemble file for arrindex.axx
+passthru.axx                        pattern file for .passthru and .eol: lines
+                                    that match no pattern are let through as
+                                    text, one output line per source line
+                                    (manual 3.16, 3.17)
+passthru.s                          test assemble file for passthru.axx
+textmode.axx                        pattern file for .textmode, the `!L` expression
+                                    /label capture and `{{.exp(x)}}`: text
+                                    replacement keeping labels and expressions
+                                    spelled as written (manual 3.18)
+textmode.s                          test assemble file for textmode.axx
+8080toz80.axx                       pattern file that translates Intel 8080 source
+                                    into Zilog Z80 source text: .textmode, `!L`
+                                    captures and `{{.exp()}}`, so labels and
+                                    expressions keep the spelling they had in the
+                                    input (manual 3.18)
+hello8080.s                         test assemble file for 8080toz80.axx: CP/M
+                                    hello world in 8080 mnemonics
 LICENSE                             license
 README.md                           readme
 Technical_Manual.md                 technical manual, full reference

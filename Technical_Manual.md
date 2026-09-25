@@ -36,7 +36,7 @@ axx x86_64.axx hello.s -o out.o # ELF relocatable object
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all sixteen bundled pattern/source pairs with both
+exactly that: `test1` assembles all nineteen bundled pattern/source pairs with both
 implementations and `cmp`s the results.
 
 **Contents**
@@ -338,6 +338,7 @@ In the `instruction` field:
 | `!Fx` | IEEE-754 bit pattern of a **32-bit** float expression |
 | `!Dx` | IEEE-754 bit pattern of a **64-bit** float expression |
 | `!Qx` | IEEE-754 bit pattern of a **128-bit** float expression |
+| `!Lx` | Value of an **integer expression**, exactly as `!x`; in addition, the **text of that expression or label as written in the source** is remembered (section 3.18, `{{.exp(x)}}`) |
 | `!Ex` | Value of an **enumerated operand list** declared with `.enum` (section 3.7.1) |
 | `!S{{name}}x` | Value of the matching entry of the **sub table** `name` declared with `.sub` (section 3.7.2) |
 
@@ -479,6 +480,7 @@ out unchanged. The only other thing read is a backslash escape.
 | `{{.float(<expr>)}}` | The value as a decimal 128-bit floating point number, 34 significant digits (`16` becomes `16.0`) |
 | `{{<name>}}` `{{<name>[<expr>]}}` | A string symbol or array symbol, else a pattern variable — see below |
 | `{{.index <name>[<expr>]}}` | The subscript that `{{<name>[<expr>]}}` uses, in decimal (3.6.1) |
+| `{{.exp(<variable>)}}` | The expression or label captured by `!L<variable>`, spelled exactly as in the source (3.18) |
 | `\n` `\t` `\r` `\\` `\"` | Newline, tab, carriage return, backslash, double quote |
 | `\<char>` | any other `<char>` literally |
 
@@ -1882,6 +1884,139 @@ NOP::"NOP"
 The pattern file is scanned in full for every source line, so this acts as a
 setting for the whole file (the last one in the file wins).
 
+### 3.18 `.textmode` — text replacement mode
+
+The setting for rewriting a source into text in another notation (using axx as a
+translator). It does three things at once.
+
+```
+.textmode          /* same as on */
+.textmode::on      /* text replacement mode */
+.textmode::off     /* off (the default) */
+```
+
+1. Turns `.passthru` (3.16) on — lines that match nothing are let through.
+2. Turns `.eol` (3.17) on — one source line becomes one output line.
+3. An **undefined label inside what `!L` captured is not an error**. Its value
+   becomes 0, and `{{.exp()}}` still emits the text as written.
+
+The three move together, so to set one of them differently write that directive
+after this line (directives take effect in the order written).
+
+#### `!L<variable>` — the expression/label capture
+
+Reads one expression and binds its value exactly as `!<variable>` does (3.3), and
+**in addition remembers the text as written in the source**. The text template
+`{{.exp(<variable>)}}` emits that text verbatim.
+
+```
+.textmode
+LXI H,!La :: "LD HL,{{.exp(a)}}"
+JMP  !La  :: "JP {{.exp(a)}}"
+```
+
+```
+	lxi	h,msg       ->  LD HL,msg
+	lxi	h,0x1234+2  ->  LD HL,0x1234+2
+	jmp	loop        ->  JP loop
+```
+
+This is the case where the spelling matters and the value does not. Written with
+`!a` and `{{.hex(a)}}`, a label collapses into a number such as `0x122` and the
+label is gone from the rewritten text. With `!La` and `{{.exp(a)}}`, `msg` stays
+`msg` and `0x1234+2` stays `0x1234+2`.
+
+- The value side keeps working. One line may use both `{{.exp(a)}}` and
+  `{{.hex(a)}}`, and `error_patterns` may still test `a>0xffff;2`.
+- The extent read is the same as `!<variable>`, and `!La\,` gives it a stop
+  character with `\` in the same way. Surrounding blanks are trimmed off the
+  remembered text.
+- When the capture sat inside `[[ ]]` (3.8) and was not taken that time,
+  `{{.exp()}}` is empty. A name that is not used as a variable at all is a
+  mistake and is reported as an error.
+- Outside text replacement mode `!L` behaves exactly like `!` (an undefined label
+  is an error). The text is remembered either way.
+
+#### A leading `label:`
+
+In text replacement mode a label definition at the start of a line **is emitted
+at the start of the output**. The label is registered as a label and also stays
+in the output spelled as written, so the rewritten text can be assembled as it
+is.
+
+```
+	lxi	h,msg
+here:	nop
+msg:
+```
+
+```
+LD HL,msg
+here: NOP
+msg:
+```
+
+A line holding nothing but a label comes out as its own line. A line that emitted
+numbers rather than text (`.ascii` and the other built-in directives of section
+5.3) is left alone, so data is not corrupted. With `.vliw` on it does nothing, as
+`.eol` does not, so packets stay intact.
+
+The label's value points at the **start of what the line emits, the label's own
+spelling included**. Both passes emit the same text, so the size of the line and
+the value of the label agree across the two passes.
+
+#### Built-in directive lines
+
+In text replacement mode a line holding one of axx's own built-in assembly
+directives (section 5) **also comes out as text**, so that lines such as `.org`
+and `.section` do not vanish from the translation.
+
+```
+	.org	0x100        ->  .org 0x100
+	.section .text       ->  .section .text
+	.global	start        ->  .global start
+buf:	.resb	16           ->  buf: .resb 16
+msg:	.ascii	"Hello"      ->  msg: .ascii "Hello"
+val:	.equ	0x1234       ->  val: .equ 0x1234
+```
+
+- `.org`, `.align`, `.zero`, `.ascii`, `.asciz`, `.resb`, `.resw`, `.resd` and
+  `.resq` come out as text and **emit nothing of their own**. Emitting padding or
+  raw data as well as the text of the line would put the content in twice and mix
+  it into the rewritten text. What text replacement mode emits *is* the rewritten
+  text, so a `-b` file is exactly the translated text.
+- `.section`, `.endsection`, `.labelc`, `.extern`, `.reloctype`, `.export`,
+  `.global` and `label: .equ <expr>` do their job as before and come out as text
+  as well.
+- `.include` alone is not echoed: the lines it pulls in are translated in place,
+  so echoing it too would duplicate them.
+
+The pattern file is scanned in full for every source line, so this acts as a
+setting for the whole file (the last one in the file wins).
+
+#### Example: 8080 to Z80
+
+The bundled `8080toz80.axx` is this mode at work: it reads Intel 8080 source and
+writes Zilog Z80 source text for the same program.
+
+```sh
+axx 8080toz80.axx hello8080.s > helloz80.s
+```
+
+```
+        .org 0x100                    .org 0x100
+start:                                start:
+        mvi c,9               ->      LD C,9
+        lxi d,msg                     LD DE,msg
+        call 0x0005                   CALL 0x0005
+        ret                           RET
+msg:    db 'Hello, world$'            msg: db 'Hello, world$'
+```
+
+Its operands are captured with `!L` and emitted with `{{.exp()}}`, so `msg` stays
+a label and `0x0005` keeps the spelling it was written with. The `helloz80.s` that
+comes out assembles as it is with `z80.axx`.
+
 
 ---
 
@@ -2800,6 +2935,10 @@ The x86_64 pattern file is also maintained separately at
 | **8048.axx** | 6.3 KB | 95 | **8048.s** | Intel 8048 |
 | **4004.axx** | 5.4 KB | 53 | **4004.s** | Intel 4004 |
 | **test.axx** | 1.1 KB | 40 | **test.s** | Fragments of several ISAs; test only |
+| **8080toz80.axx** | 5.8 KB | 117 | **hello8080.s** | Intel 8080 to Zilog Z80 source translator; `.textmode`, `!L` and `{{.exp()}}` (3.18) at work |
+| **textmode.axx** | 1.5 KB | 13 | **textmode.s** | `.textmode`, `!L` and `{{.exp()}}` (3.18); test only |
+| **arrindex.axx** | 860 B | 14 | **arrindex.s** | Array symbols: bare names as items, a name as a subscript, `.index` (3.6.1); test only |
+| **passthru.axx** | 686 B | 6 | **passthru.s** | `.passthru` and `.eol` (3.16 / 3.17); test only |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
 | **vliw.axx** | 178 B | 10 | **vliw.s** | Non-EPIC VLIW; test only |
 | **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck virtual CPU; hello-world demo. Bundled, but not part of `test1` |
@@ -2808,7 +2947,7 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 `itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
 `aarch64_logical_mini_demo.s`.
 
-`test1` runs all sixteen of the pairs above through both implementations and
+`test1` runs all nineteen of the pairs above through both implementations and
 compares the results.
 
 x86_64 and legacy CPUs make up most of what is currently implemented, but that
@@ -2830,7 +2969,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all sixteen bundled pattern/source pairs with both
+`test1` assembles all nineteen bundled pattern/source pairs with both
 implementations and compares the results.
 
 ### C.2 External

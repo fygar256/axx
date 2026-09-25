@@ -92,7 +92,7 @@ static void m_echo_write(char *const *items, int n);
  * int.from_bytes() で普通の Python int として var_manager.put() に渡して
  * いる（put_tagged ではない）ため、そちら側は is_float=0（整数扱い）の
  * ままにして axx.py の実際の挙動に合わせる。 */
-typedef struct { uint256_t val; int is_undef; int is_float; } PatVar;
+typedef struct { uint256_t val; int is_undef; int is_float; int text_off; } PatVar;
 
 /* パターン変数の置き場。名前は綴りだけで決まり、長さは問わない（`a` でも
  * `var_2` でも同じ扱い）。名前はパターンファイルを読むときに登録し、以後は
@@ -1283,6 +1283,25 @@ typedef struct {
     int        passthru;
     /* `.eol` の設定。真なら、出力を出した行ごとに改行を1ワード足す。 */
     int        eol;
+    /* `.textmode` の設定。真なら「テキスト置換モード」。ソースを別の書式の
+     * テキストへ書き換えるための設定で、`.passthru` と `.eol` を一緒に立て、
+     * `!L<名前>` が拾った式・ラベルの中の未定義ラベルをエラーにしない
+     * （値は 0 になり、文字は書かれたとおりに出る）。 */
+    int        textmode;
+
+    /* `!L<名前>` が拾った「ソースに書かれていたままの式・ラベルの文字」を置く
+     * 1行ぶんのアリーナ。PatVar.text_off がこの中の位置を指す（-1 なら無し）。
+     * 位置で持つのは、候補パターンごとに vars[] を memcpy で退避・復元するため
+     * である（ポインタを持たせると所有権が二重になる）。ソース1行ごとに空にする。
+     * テキストテンプレートの `{{.exp(<名前>)}}` がここの文字をそのまま出す。
+     * axx.py の state.vars_text に対応する。 */
+    char       captext[8192];
+    int        captext_len;
+
+    /* テキスト置換モードで、その行の先頭にあった `label:` の綴りをそのまま
+     * 覚えておく置き場。書き換えたテキストの前に付け直す。1行ごとに作り直す。
+     * axx.py の state.label_text に対応する。 */
+    char       label_text[512];
 
     char       cl[4096];
     int        ln;
@@ -1895,7 +1914,12 @@ static void state_init(AsmState *st) {
     st->ln = 0;
     sv_init(&st->fnstack);
     is_init(&st->lnstack);
-    for(int i=0;i<NVARS;i++){ st->vars[i].val=u256_zero(); st->vars[i].is_undef=0; }
+    for(int i=0;i<NVARS;i++){ st->vars[i].val=u256_zero(); st->vars[i].is_undef=0;
+                              st->vars[i].text_off=-1; }
+    st->textmode = 0;
+    st->captext_len = 0;
+    st->captext[0] = '\0';
+    st->label_text[0] = '\0';
     bufmap_init(&st->buf);
     st->pc = u256_zero();
     st->padding = u256_zero();
@@ -5234,6 +5258,44 @@ static int dir_eol(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.textmode[::on|off]`
+ * テキスト置換モード。ソースを別の書式のテキストへ書き換える（トランスレータ
+ * としての）使い方のための設定で、次の3つをまとめて行う。
+ *   1. `.passthru` を立てる（マッチしない行はそのまま出す）
+ *   2. `.eol` を立てる（出力を出した行ごとに改行を1ワード足す）
+ *   3. `!L<名前>`（式・ラベル捕捉子）の中の未定義ラベルをエラーにしない。
+ *      値は 0 になり、`{{.exp(<名前>)}}` が書かれたとおりの文字を出す。
+ *   .textmode        on と同じ
+ *   .textmode::on    テキスト置換モードにする
+ *   .textmode::off   やめる（既定）
+ * 3つまとめて動くので、`.passthru` や `.eol` だけを別にしたいときはこの行の
+ * 後ろでそちらを書けばよい（ディレクティブは書いた順に効く）。
+ * パターンファイルは1行ごとに全部走査されるので、これはファイル全体にかかる
+ * 設定として働く（同じファイルに複数書いた場合は最後のものが効く）。
+ * axx.py の textmode_processing() と同じ規則である。 */
+static int dir_textmode(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".textmode") != 0) return 0;
+    char arg[32]; arg[0] = '\0';
+    for(int fi=1; fi<PAT_FIELDS; fi++){
+        const char *p = e->f[fi];
+        while(*p==' '||*p=='\t') p++;
+        if(*p){ axx_strupr_to(arg, p, sizeof(arg)); break; }
+    }
+    { size_t n = strlen(arg);
+      while(n > 0 && (arg[n-1]==' '||arg[n-1]=='\t')) arg[--n] = '\0'; }
+    if(arg[0]=='\0' || strcmp(arg,"ON")==0){
+        asmb->st.textmode = 1;
+        asmb->st.passthru = 1;
+        asmb->st.eol      = 1;
+    } else if(strcmp(arg,"OFF")==0){
+        asmb->st.textmode = 0;
+        asmb->st.passthru = 0;
+        asmb->st.eol      = 0;
+    } else
+        axx_diagf(1, 0, " error - .textmode: expected 'on' or 'off' ('%s').\n", arg);
+    return 1;
+}
+
 /* `.enum::<変数>::<要素名の並び>::<式>`
  * `!E<変数>` が拾う「要素名のリスト」の語彙と、そこから値を作る式を決める。
  * 式の中では各要素名が「そのリストに現れていれば .setsym の値、
@@ -5540,6 +5602,20 @@ static uint256_t enum_eval(Assembler *asmb, const EnumDef *ed,
     return r;
 }
 
+/* `!L<名前>` が拾った文字を、その行ぶんのアリーナに写して位置を返す。
+ * 入らなければ -1（そのときは `{{.exp(…)}}` が空文字を出す）。ポインタではなく
+ * 位置で持つのは、候補パターンごとに vars[] を memcpy で退避・復元するためで、
+ * アリーナはソース1行のあいだ動かないので位置は退避・復元しても有効である。 */
+static int captext_put(AsmState *st, const char *p, int n){
+    if(n < 0) n = 0;
+    if(st->captext_len + n + 1 > (int)sizeof(st->captext)) return -1;
+    int off = st->captext_len;
+    memcpy(st->captext + off, p, (size_t)n);
+    st->captext[off + n] = '\0';
+    st->captext_len = off + n + 1;
+    return off;
+}
+
 /* `!E<変数>` の位置から列挙要素のリストを読む。
  * 受け付けるのは `A0`、`A0-A2`（列挙順での範囲）、およびそれらを `,` か `/` で
  * 並べたもの。区切り記号は「その先に要素名が続くとき」だけ消費するので、
@@ -5597,6 +5673,8 @@ static int enum_capture(Assembler *asmb, const EnumDef *ed, const char *s, int i
  *   !x          任意の式を読んで変数 x に束縛
  *   !!x         式ではなく factor 1個だけを束縛
  *   !Fx/!Dx/!Qx 浮動小数点式を IEEE754 の 32/64/128bit として束縛
+ *   !Lx         式・ラベル捕捉子。!x と同じに値を束縛し、そのうえでソースに
+ *               書かれていたままの文字も覚える（{{.exp(x)}} が出す）
  *   !Ex         .enum で決めた列挙要素のリストを読み、その式の値を束縛
  *   \c          次の1文字をリテラル扱い（エスケープ）
  * 成功時は具体度スコア (式の数, リテラル文字数, シンボル数) を st に残す。
@@ -5762,6 +5840,54 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     }
                     var_slot_put(st, vslot, qbits);
                 }
+                continue;
+            } else if(a=='L'){
+                /* `!L<名前>` — 式・ラベル捕捉子。`!<名前>` と同じように式を1つ
+                 * 読んで値を束縛し、そのうえで「ソースに書かれていたままの文字」
+                 * も覚えておく。テキストテンプレートの `{{.exp(<名前>)}}` が
+                 * その文字をそのまま出す（3.5.2 節）。テキスト置換モード
+                 * （`.textmode`）では、拾った式の中の未定義ラベルをエラーにせず
+                 * 値を 0 にする。書き換え先のテキストに要るのは値ではなく綴り
+                 * そのものだからである。
+                 * axx.py の pat_match の `!L` 分岐と同じ規則である。 */
+                if(idx_t >= tlen){ result=0; break; }
+                int _nl = var_name_len(t+idx_t);
+                if(_nl == 0){ result=0; break; }
+                int vslot = var_slot(t+idx_t, _nl, 1);
+                if(vslot < 0){ result=0; break; }
+                idx_t += _nl;
+                idx_t = axx_skipspc(t, idx_t);
+                char stopchar = '\0';
+                if(idx_t < tlen && t[idx_t] == '\\'){
+                    idx_t++;
+                    stopchar = (idx_t < tlen) ? t[idx_t] : '\0';
+                    idx_t++;
+                }
+                int idx_s_text_start = idx_s;
+                st->elf_capturing_var = vslot;
+                int _cap_prior_l = st->error_undefined_label;
+                st->error_undefined_label = 0;
+                uint256_t v = expr_expression_esc(asmb,s,idx_s,stopchar,&idx_s);
+                int _cap_undef_l = st->error_undefined_label;
+                st->elf_capturing_var = -1;
+                {   /* 拾った範囲の文字をそのまま覚える（前後の空白は落とす）。 */
+                    int _b = idx_s_text_start, _e = idx_s;
+                    if(stopchar && _e > _b && s[_e-1] == stopchar) _e--;
+                    while(_b < _e && (s[_b]==' '||s[_b]=='\t')) _b++;
+                    while(_e > _b && (s[_e-1]==' '||s[_e-1]=='\t')) _e--;
+                    st->vars[vslot].text_off = captext_put(st, s + _b, _e - _b);
+                }
+                if(st->textmode){
+                    /* テキストへ書き換えるだけの行なので、値が決まらないことは
+                     * 誤りではない。番兵を持ち回らず 0 にしておく。 */
+                    st->error_undefined_label = _cap_prior_l;
+                    if(_cap_undef_l || u256_is_undef_derived(v)) v = u256_zero();
+                    var_slot_put_tagged(st,vslot,v,0);
+                } else {
+                    st->error_undefined_label = _cap_prior_l || _cap_undef_l;
+                    var_slot_put_tagged(st,vslot,v,_cap_undef_l);
+                }
+                if(stopchar && s[idx_s]==stopchar) idx_s++;
                 continue;
             } else if(a=='E'){
                 if(idx_t >= tlen){ result=0; break; }
@@ -8454,7 +8580,8 @@ static void readpat(Assembler *asmb, const char *fn){
                 if(e - a < (int)sizeof(kw1))
                     for(int k = a; k < e; k++) kw1[k-a] = axx_upper_char(fields[0][k]);
             }
-            if(nonblank && strcmp(kw1,".PASSTHRU")!=0 && strcmp(kw1,".EOL")!=0){
+            if(nonblank && strcmp(kw1,".PASSTHRU")!=0 && strcmp(kw1,".EOL")!=0
+                        && strcmp(kw1,".TEXTMODE")!=0){
                 axx_diagf(0, 0, " warning - pattern line has no '::' field separator "
                            "and can never match (a pattern file has no line-"
                            "continuation mechanism, so this is likely a stray "
@@ -9049,6 +9176,8 @@ static void strsym_delete(AsmState *st, const char *upper_name){
  *   - `.index 名前[添字]`           … その参照が使う添字そのもの
  *                                     （名前から番号を引くのに使う）
  *                                     （添字は名前・`"名前"`・式のいずれでもよい）
+ *   - `.exp(変数)`                  … `!L変数` が拾った式・ラベルを、ソースに
+ *                                     書かれていたままの文字で出す
  * が書ける。文字列の外と同じく `\n` `\t` `\r` `\\` `\"` は解く。
  *
  * 組み上がったテキストはそのままバイナリとしても出る。`.ascii` と同じく
@@ -9510,6 +9639,59 @@ static void txt_emit_index(Assembler *asmb, TxtBuf *t, const char *name, const c
     txt_radix(t, u256_from_i64(n), 10);
 }
 
+/* `.exp(変数)` なら変数名を name に入れて真を返す。中に書けるのは変数名
+ * ひとつだけで、式は書けない。`!L変数` が拾った「ソースに書かれていたままの
+ * 式・ラベルの文字」を指す名前である。
+ * axx.py の _txt_exp_call() と同じ規則である。 */
+static int txt_exp_call(const char *s, char *name, size_t ncap){
+    static const char *w = "EXP";
+    int k = 0;
+    for(; k < 3; k++) if(axx_upper_char(s[k]) != w[k]) return 0;
+    if(!(s[k]==' ' || s[k]=='\t' || s[k]=='('))
+        return 0;                      /* `.expand` など別の名前 */
+    char *body = strdup(s + k);
+    if(!body){ perror("strdup"); exit(1); }
+    char *b = body;
+    while(*b==' '||*b=='\t') b++;
+    size_t bl = strlen(b);
+    while(bl > 0 && (b[bl-1]==' '||b[bl-1]=='\t')) b[--bl] = '\0';
+    if(*b != '('){ free(body); return 0; }
+    int cb = txt_close_paren(b, 0);
+    if(cb < 0){ free(body); return 0; }
+    const char *tail = b + cb + 1;
+    while(*tail==' '||*tail=='\t') tail++;
+    if(*tail){ free(body); return 0; }
+    b[cb] = '\0';
+    char *nm = b + 1;
+    while(*nm==' '||*nm=='\t') nm++;
+    size_t nl2 = strlen(nm);
+    while(nl2 > 0 && (nm[nl2-1]==' '||nm[nl2-1]=='\t')) nm[--nl2] = '\0';
+    /* 変数名でなければ `.exp` ではない。 */
+    if(nl2 == 0 || (int)nl2 != var_name_len(nm) || nl2 >= ncap){
+        free(body); return 0;
+    }
+    memcpy(name, nm, nl2 + 1);
+    free(body);
+    return 1;
+}
+
+/* `.exp(変数)` の中身を積む。`!L変数` が拾った文字をそのまま出す。
+ * その行で拾っていなければ（省略可部分に入っていた等）何も出さない。そもそも
+ * 変数として使われていない名前なら書き損じなので診断する。 */
+static void txt_emit_exp(Assembler *asmb, TxtBuf *t, const char *name){
+    AsmState *st = &asmb->st;
+    int slot = var_slot(name, (int)strlen(name), 0);
+    if(slot < 0){
+        if(should_report_errors(st))
+            axx_diagf(1, 0, " error - '%s' is not a pattern variable; '.exp(%s)' "
+                       "needs '!L%s' in the instruction field.\n", name, name, name);
+        return;
+    }
+    int off = st->vars[slot].text_off;
+    if(off < 0 || off >= st->captext_len) return;
+    txt_adds(t, st->captext + off);
+}
+
 /* テンプレート本文（引用符の中身）を展開して t に積む。 */
 static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
     AsmState *st = &asmb->st;
@@ -9539,6 +9721,14 @@ static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
             int kind = -1, nl = 0;
             int done = 0;
             if(inner[j]=='.'){
+                /* `.exp(変数)` は `!L変数` が拾った式・ラベルの文字そのもの。 */
+                char enm[512];
+                if(txt_exp_call(inner+j+1, enm, sizeof(enm))){
+                    txt_emit_exp(asmb, t, enm);
+                    done = 1;
+                }
+            }
+            if(!done && inner[j]=='.'){
                 /* `.index 配列[式]` は、その参照が使う添字そのものを返す。 */
                 char inm[512]; char *iex = NULL;
                 if(txt_index_call(inner+j+1, inm, sizeof(inm), &iex)){
@@ -10152,10 +10342,27 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
             label_put_value(st,label,u,st->current_section,1,reloc_type,st->error_undefined_label);
             free(expr_buf);
             if(label!=lblbuf) free(label);
+            /* テキスト置換モードでは `label: .equ 式` の行もテキストとして出す。
+             * ラベルの綴りは lineassemble() が前に付け直し、残りの `.equ 式` は
+             * どのパターンにも当たらないので素通しで出る。 */
+            if(st->textmode){
+                int _n = lidx;
+                if(_n > (int)sizeof(st->label_text)-1) _n = (int)sizeof(st->label_text)-1;
+                memcpy(st->label_text, l, (size_t)_n);
+                st->label_text[_n] = '\0';
+                strncpy(out,l+lidx,osz-1); out[osz-1]=0; return out;
+            }
             out[0]=0; return out;
         } else {
             label_put_value(st,label,st->pc,st->current_section,0,-1,0);
             if(label!=lblbuf) free(label);
+            /* テキスト置換モードでは、落とした `label:` を出力の先頭に付け直す
+             * ため、書かれていたとおりの綴りを覚えておく。 */
+            { int _n = lidx;
+              if(_n > (int)sizeof(st->label_text)-1) _n = (int)sizeof(st->label_text)-1;
+              memcpy(st->label_text, l, (size_t)_n);
+              st->label_text[_n] = '\0';
+            }
             strncpy(out,l+lidx,osz-1); out[osz-1]=0; return out;
         }
     }
@@ -10924,6 +11131,33 @@ static void passthru_line(Assembler *asmb, const char *l, const char *l2,
     free(t.b);
 }
 
+/* テキスト置換モード（`.textmode`）で、処理せずテキストとしてだけ出す組み込み
+ * アセンブリディレクティブか。いずれも自分でワードや領域を出す（あるいは
+ * ロケーションカウンタを飛ばす）ものなので、テキストとして出したうえでさらに
+ * 出させると中身が二重になり、翻訳結果のテキストに詰め物や生データが混ざって
+ * しまう。テキスト置換モードでの出力は「書き換えたテキストそのもの」なので、
+ * 行はテキストとして残し、出力の側は何も出さない。
+ * axx.py の _TEXTMODE_TEXT_ONLY_DIRS と同じ表である。 */
+static int textmode_text_only_dir(const char *l){
+    static const char *tbl[] = { ".ORG", ".ALIGN", ".ZERO", ".ASCII", ".ASCIZ",
+                                 ".RESB", ".RESW", ".RESD", ".RESQ", NULL };
+    char up[16]; axx_strupr_to(up, l, sizeof(up));
+    for(int i=0; tbl[i]; i++) if(strcmp(up, tbl[i]) == 0) return 1;
+    return 0;
+}
+
+/* 組み込みアセンブリディレクティブを処理し終えた行の返り値。
+ * テキスト置換モードでは、その行もテキストとして出す。翻訳結果から `.section`
+ * や `.global` のような行が消えないようにするためである。そうでなければ今まで
+ * どおり、出力を出さない行として返す。
+ * axx.py の _dir_line_done() と同じ規則である。 */
+static int adir_done(Assembler *asmb, const char *l, const char *l2,
+                     IntVec *objl_out, int idx, int *idx_out){
+    if(asmb->st.textmode) passthru_line(asmb, l, l2, objl_out);
+    *idx_out = idx;
+    return 1;
+}
+
 /* 作業用バッファは呼び出し元（lineassemble2）がソース行の長さに合わせて確保する。
  *
  * 破綻点修正: ここは l[1024] / l2[4096] / lin[8192] という固定長の自動変数で、
@@ -10949,13 +11183,20 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     l_nospace[nn]=0;
     memcpy(l, l_nospace, (size_t)nn+1);
 
-    if(adir_section(st,l,l2)){ *idx_out=idx; return 1; }
-    if(adir_endsection(st,l)){ *idx_out=idx; return 1; }
-    if(adir_resb(asmb,l,l2)){ *idx_out=idx; return 1; }
-    if(adir_resw(asmb,l,l2)){ *idx_out=idx; return 1; }
-    if(adir_resd(asmb,l,l2)){ *idx_out=idx; return 1; }
-    if(adir_resq(asmb,l,l2)){ *idx_out=idx; return 1; }
-    if(adir_zero(asmb,l,l2)){ *idx_out=idx; return 1; }
+    /* テキスト置換モードでは、自分でワードや領域を出すディレクティブは処理せず、
+     * 行をテキストとしてだけ出す（textmode_text_only_dir() のコメントを参照）。 */
+    if(st->textmode && textmode_text_only_dir(l)){
+        passthru_line(asmb, l, l2, objl_out);
+        *idx_out=idx; return 1;
+    }
+
+    if(adir_section(st,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_endsection(st,l)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_resb(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_resw(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_resd(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_resq(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_zero(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
     {
         char _adup[16]; axx_strupr_to(_adup,l,sizeof(_adup));
         if(strcmp(_adup,".ASCII")==0){
@@ -10973,6 +11214,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
             *idx_out=idx; return 1;
         }
     }
+    /* `.include` は取り込んだ行そのものが訳されて出るので、この行は出さない。 */
     { char up[16]; axx_strupr_to(up,l,sizeof(up));
       if(strcmp(up,".INCLUDE")==0){
           char raw[512]; axx_get_string(l2,raw,sizeof(raw));
@@ -11039,15 +11281,21 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
           *idx_out=idx; return 1;
       }
     }
-    if(adir_align(asmb,l,l2)){ *idx_out=idx; return 1; }
-    if(adir_org(asmb,l,l2)){ *idx_out=idx; return 1; }
-    if(adir_labelc(st,l,l2)){ *idx_out=idx; return 1; }
-    if(adir_extern(asmb,l,l2)){ *idx_out=idx; return 1; }
-    if(adir_reloctype(asmb,l,l2)){ *idx_out=idx; return 1; }
-    if(adir_export(asmb,l,l2)){ *idx_out=idx; return 1; }
+    if(adir_align(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_org(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_labelc(st,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_extern(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_reloctype(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_export(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
 
 
-    if(!l[0]){ *idx_out=idx; return 0; }
+    if(!l[0]){
+        /* テキスト置換モードでラベルだけの行は、落とした `label:` を出力に戻す
+         * 仕事が残っているので、出力なしの成功として返す
+         * （付け直すのは lineassemble() の側）。 */
+        *idx_out=idx;
+        return (st->textmode && st->label_text[0]) ? 1 : 0;
+    }
 
     int se=0, oerr=0, pln=0;
     int idxs_val=0;
@@ -11060,7 +11308,8 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     for(int pi=0;pi<st->pat.len;pi++){
         PatEntry *i=&st->pat.data[pi];
         pln++;
-        for(int vi=0;vi<g_nvars;vi++){ st->vars[vi].val=u256_zero(); st->vars[vi].is_undef=0; }
+        for(int vi=0;vi<g_nvars;vi++){ st->vars[vi].val=u256_zero(); st->vars[vi].is_undef=0;
+                                       st->vars[vi].text_off=-1; }
 
         if(dir_set_symbol(asmb,i)) continue;
         if(dir_clear_symbol(asmb,i)) continue;
@@ -11077,6 +11326,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         if(dir_free(asmb,i)) continue;
         if(dir_passthru(asmb,i)) continue;
         if(dir_eol(asmb,i)) continue;
+        if(dir_textmode(asmb,i)) continue;
         if(dir_enum(asmb,i)) continue;
         if(dir_clrenum(asmb,i)) continue;
         if(dir_errmsg(asmb,i)) continue;
@@ -11370,6 +11620,10 @@ static int lineassemble(Assembler *asmb, const char *line_in){
 
     char *processed = malloc(lin_len + 2);
     if(!processed){ perror("malloc"); free(line); return 0; }
+    /* `!L` が拾った文字の置き場と、行頭の `label:` の綴りは1行ごとに作り直す。 */
+    st->captext_len = 0;
+    st->captext[0] = '\0';
+    st->label_text[0] = '\0';
     adir_label_processing(asmb, line, processed, lin_len + 2);
     free(line);
 
@@ -11441,6 +11695,44 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     st->elf_tracking=0;
 
     if(!flag){ free(processed); iv_free(&idxs); iv_free(&objl); return 0; }
+
+    /* テキスト置換モードでは、行頭にあった `label:` をそのまま出力の先頭に
+     * 付け直す。照合のために落としてあるので、ここで書かれていたとおりの綴りで
+     * 戻す。テキストを作った行と、ラベルだけの行が対象で、テキストではなく数値を
+     * 出した行（`.ascii` などの組み込みディレクティブ）はデータを壊さないよう
+     * そのままにする。axx.py の lineassemble() と同じ規則である。 */
+    if(st->textmode && st->label_text[0] && !st->vliwflag
+       && (st->asmtext || objl.len == 0)){
+        TxtBuf lp; txt_init(&lp);
+        txt_adds(&lp, st->label_text);
+        if(st->asmtext && st->asmtext[0]) txt_addc(&lp, ' ');
+        const char *pfx = lp.b ? lp.b : "";
+        int plen = (int)strlen(pfx);
+        if(plen > 0){
+            /* 前に足すので、いちど後ろへずらす。 */
+            for(int k=0;k<plen;k++) iv_push(&objl, u256_zero());
+            for(int k=objl.len-1-plen; k>=0; k--) objl.data[k+plen] = objl.data[k];
+            for(int k=0;k<plen;k++)
+                objl.data[k] = u256_from_u64((uint64_t)(unsigned char)pfx[k]);
+        }
+        TxtBuf nt; txt_init(&nt);
+        txt_adds(&nt, pfx);
+        if(st->asmtext) txt_adds(&nt, st->asmtext);
+        free(st->asmtext);
+        st->asmtext = nt.b ? nt.b : strdup("");
+        if(!st->asmtext){ perror("strdup"); exit(1); }
+        TxtBuf nd; txt_init(&nd);
+        txt_addc(&nd, '"');
+        txt_add_escaped(&nd, st->asmtext);
+        txt_addc(&nd, '"');
+        free(st->asmtext_disp);
+        st->asmtext_disp = nd.b ? nd.b : strdup("");
+        /* 前に足したぶん、その行のワード位置がずれる。ELF の再配置はワード位置で
+         * 覚えているので、同じだけ送っておく。 */
+        for(int ri=0; ri<st->elf_refs_len; ri++)
+            if(st->elf_refs[ri].word_idx >= 0) st->elf_refs[ri].word_idx += plen;
+        free(lp.b);
+    }
 
     /* `.eol` が有効なら、出力を出した行ごとに改行を1ワード足す。標準出力へ流す
      * テキストには足さない（そちらは行ごとに改行して出しているので二重になる）。 */

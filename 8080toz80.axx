@@ -1,0 +1,179 @@
+/* =====================================================================
+/*  8080toz80.axx -- Intel 8080 -> Zilog Z80 source translator
+/*
+/*  8080 ニーモニックのソースを読み、同じ動作の Z80 ニーモニックの
+/*  テキストを出力するパターンファイル（テキストテンプレート使用）。
+/*
+/*  使い方:
+/*    caxx 8080toz80.axx prog8080.s > progz80.s
+/*    paxx 8080toz80.axx prog8080.s > progz80.s
+/*
+/*  オペランドは `!L` で拾い `{{.exp()}}` で出すので、ラベルも式も
+/*  ソースに書かれていたままの綴りで出る（`lxi h,msg` -> `LD HL,msg`）。
+/*  行頭の `label:` もそのまま残るので、出力はそのままアセンブルできる。
+/*  値を計算して出すのは RST だけで、その数値の書式は下の HP で
+/*  変更できる（既定は 0x 接頭辞）。
+/* =====================================================================
+
+.textmode
+
+.setsym::HP::"0x"
+
+/* ---------------------------------------------------------------------
+/*  レジスタ名の表（テンプレートで添字引き）
+/* ---------------------------------------------------------------------
+.setsym::R8::[B,C,D,E,H,L,"(HL)",A]
+.setsym::RP::[BC,DE,HL,SP]
+.setsym::PP::[BC,DE,HL,AF]
+
+/* ---------------------------------------------------------------------
+/*  8 ビットレジスタ群
+/* ---------------------------------------------------------------------
+.setsym ::B::0
+.setsym ::C::1
+.setsym ::D::2
+.setsym ::E::3
+.setsym ::H::4
+.setsym ::L::5
+.setsym ::A::7
+.check::dst::B,C,D,E,H,L,A
+.check::src::B,C,D,E,H,L,A
+
+MOV dst,src :: "LD {{R8[dst]}},{{R8[src]}}"
+MOV dst,M   :: "LD {{R8[dst]}},(HL)"
+MOV M,src   :: "LD (HL),{{R8[src]}}"
+MVI dst,!Li  :: i>0xff;3 :: "LD {{R8[dst]}},{{.exp(i)}}"
+
+INR dst :: "INC {{R8[dst]}}"
+DCR dst :: "DEC {{R8[dst]}}"
+
+ADD src :: "ADD A,{{R8[src]}}"
+ADC src :: "ADC A,{{R8[src]}}"
+SUB src :: "SUB {{R8[src]}}"
+SBB src :: "SBC A,{{R8[src]}}"
+ANA src :: "AND {{R8[src]}}"
+XRA src :: "XOR {{R8[src]}}"
+ORA src :: "OR {{R8[src]}}"
+CMP src :: "CP {{R8[src]}}"
+.clrcheck::dst
+.clrcheck::src
+
+MVI M,!Li :: i>0xff;3 :: "LD (HL),{{.exp(i)}}"
+INR M :: "INC (HL)"
+DCR M :: "DEC (HL)"
+ADD M :: "ADD A,(HL)"
+ADC M :: "ADC A,(HL)"
+SUB M :: "SUB (HL)"
+SBB M :: "SBC A,(HL)"
+ANA M :: "AND (HL)"
+XRA M :: "XOR (HL)"
+ORA M :: "OR (HL)"
+CMP M :: "CP (HL)"
+
+/* ---------------------------------------------------------------------
+/*  即値演算
+/* ---------------------------------------------------------------------
+ADI !Li :: i>0xff;3 :: "ADD A,{{.exp(i)}}"
+ACI !Li :: i>0xff;3 :: "ADC A,{{.exp(i)}}"
+SUI !Li :: i>0xff;3 :: "SUB {{.exp(i)}}"
+SBI !Li :: i>0xff;3 :: "SBC A,{{.exp(i)}}"
+ANI !Li :: i>0xff;3 :: "AND {{.exp(i)}}"
+XRI !Li :: i>0xff;3 :: "XOR {{.exp(i)}}"
+ORI !Li :: i>0xff;3 :: "OR {{.exp(i)}}"
+CPI !Li :: i>0xff;3 :: "CP {{.exp(i)}}"
+
+/* ---------------------------------------------------------------------
+/*  オペランドなし命令
+/* ---------------------------------------------------------------------
+DAA :: "DAA"
+RLC :: "RLCA"
+RRC :: "RRCA"
+RAL :: "RLA"
+RAR :: "RRA"
+CMA :: "CPL"
+CMC :: "CCF"
+STC :: "SCF"
+HLT :: "HALT"
+NOP :: "NOP"
+EI  :: "EI"
+DI  :: "DI"
+
+/* ---------------------------------------------------------------------
+/*  レジスタペア群（8080 は先頭 1 文字で書く: B=BC, D=DE, H=HL）
+/* ---------------------------------------------------------------------
+.setsym ::B::0
+.setsym ::D::1
+.setsym ::H::2
+.setsym ::SP::3
+.check::rp::B,D,H,SP
+LXI rp,!Ln :: n>0xffff;2 :: "LD {{RP[rp]}},{{.exp(n)}}"
+INX rp    :: "INC {{RP[rp]}}"
+DCX rp    :: "DEC {{RP[rp]}}"
+DAD rp    :: "ADD HL,{{RP[rp]}}"
+.clrcheck::rp
+
+.check::rp::B,D
+LDAX rp :: "LD A,({{RP[rp]}})"
+STAX rp :: "LD ({{RP[rp]}}),A"
+.clrcheck::rp
+
+.setsym ::PSW::3
+.check::rp::B,D,H,PSW
+PUSH rp :: "PUSH {{PP[rp]}}"
+POP rp  :: "POP {{PP[rp]}}"
+.clrcheck::rp
+
+XCHG :: "EX DE,HL"
+XTHL :: "EX (SP),HL"
+SPHL :: "LD SP,HL"
+PCHL :: "JP (HL)"
+
+/* ---------------------------------------------------------------------
+/*  直接アドレス
+/* ---------------------------------------------------------------------
+LDA  !Ln :: n>0xffff;2 :: "LD A,({{.exp(n)}})"
+STA  !Ln :: n>0xffff;2 :: "LD ({{.exp(n)}}),A"
+LHLD !Ln :: n>0xffff;2 :: "LD HL,({{.exp(n)}})"
+SHLD !Ln :: n>0xffff;2 :: "LD ({{.exp(n)}}),HL"
+
+/* ---------------------------------------------------------------------
+/*  分岐（8080 は条件がニーモニックに融合、Z80 は cc, で分離）
+/* ---------------------------------------------------------------------
+JMP !Ln :: n>0xffff;2 :: "JP {{.exp(n)}}"
+JNZ !Ln :: n>0xffff;2 :: "JP NZ,{{.exp(n)}}"
+JZ  !Ln :: n>0xffff;2 :: "JP Z,{{.exp(n)}}"
+JNC !Ln :: n>0xffff;2 :: "JP NC,{{.exp(n)}}"
+JC  !Ln :: n>0xffff;2 :: "JP C,{{.exp(n)}}"
+JPO !Ln :: n>0xffff;2 :: "JP PO,{{.exp(n)}}"
+JPE !Ln :: n>0xffff;2 :: "JP PE,{{.exp(n)}}"
+JP  !Ln :: n>0xffff;2 :: "JP P,{{.exp(n)}}"
+JM  !Ln :: n>0xffff;2 :: "JP M,{{.exp(n)}}"
+
+CALL !Ln :: n>0xffff;2 :: "CALL {{.exp(n)}}"
+CNZ  !Ln :: n>0xffff;2 :: "CALL NZ,{{.exp(n)}}"
+CZ   !Ln :: n>0xffff;2 :: "CALL Z,{{.exp(n)}}"
+CNC  !Ln :: n>0xffff;2 :: "CALL NC,{{.exp(n)}}"
+CC   !Ln :: n>0xffff;2 :: "CALL C,{{.exp(n)}}"
+CPO  !Ln :: n>0xffff;2 :: "CALL PO,{{.exp(n)}}"
+CPE  !Ln :: n>0xffff;2 :: "CALL PE,{{.exp(n)}}"
+CP   !Ln :: n>0xffff;2 :: "CALL P,{{.exp(n)}}"
+CM   !Ln :: n>0xffff;2 :: "CALL M,{{.exp(n)}}"
+
+RET :: "RET"
+RNZ :: "RET NZ"
+RZ  :: "RET Z"
+RNC :: "RET NC"
+RC  :: "RET C"
+RPO :: "RET PO"
+RPE :: "RET PE"
+RP  :: "RET P"
+RM  :: "RET M"
+
+/* 8080 の RST n (n=0..7) は Z80 では RST n*8 */
+RST !n :: n>7;3,n<0;3 :: "RST {{HP}}{{.hex(n*8)}}"
+
+/* ---------------------------------------------------------------------
+/*  入出力
+/* ---------------------------------------------------------------------
+IN  !Lp :: p>0xff;6 :: "IN A,({{.exp(p)}})"
+OUT !Lp :: p>0xff;6 :: "OUT ({{.exp(p)}}),A"
