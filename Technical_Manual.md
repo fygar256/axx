@@ -478,6 +478,7 @@ out unchanged. The only other thing read is a backslash escape.
 | `{{.bin(<expr>)}}` | Binary digits of the value |
 | `{{.float(<expr>)}}` | The value as a decimal 128-bit floating point number, 34 significant digits (`16` becomes `16.0`) |
 | `{{<name>}}` `{{<name>[<expr>]}}` | A string symbol or array symbol, else a pattern variable — see below |
+| `{{.index <name>[<expr>]}}` | The subscript that `{{<name>[<expr>]}}` uses, in decimal (3.6.1) |
 | `\n` `\t` `\r` `\\` `\"` | Newline, tab, carriage return, backslash, double quote |
 | `\<char>` | any other `<char>` literally |
 
@@ -581,7 +582,7 @@ decides which kind it is:
 | `0x20`, `#OTHER+1` | a **numeric symbol** — any pattern expression |
 | `"LD"` | a **string symbol** — text for a template (3.5.2) |
 | `[1,"A",#B]` | an **array symbol** — a list of numbers and text (3.6.1) |
-| `other` | a **copy** of that string or array symbol (3.6.1) |
+| `other` | a **copy** of that string or array symbol, or else a **string symbol holding that name** (3.6.1) |
 | `r0,r1,r2` | a **set** — a list of names (3.6.2) |
 | `a&b`, `a\|b`, `a^b`, `a+b`, `a-b` | a **set** computed from other sets (3.6.2) |
 
@@ -627,16 +628,21 @@ inserts `LD`. `.clearsym` removes them like any other symbol.
 #### 3.6.1 Array symbols
 
 A value field that starts with `[` makes an **array symbol**. Its items may be
-numeric expressions, string literals, or a mix of the two:
+numeric expressions, bare names, string literals, or a mix of them:
 
 ```
 .setsym::x::[1,2,3,4,5]
 .setsym::y::["A","B","C","D","E"]
+.setsym::regs::[R0,R1,R2]          /* the same as ["R0","R1","R2"] */
 ```
 
 Items are separated by top-level commas; commas inside `"..."` or inside nested
-brackets or parentheses do not split. Each numeric item is an ordinary pattern
-expression, so earlier symbols are available (`.setsym::m::[1,#BASE,#BASE+1]`).
+brackets or parentheses do not split. An item that is a **bare name** (`R0`,
+`_tmp`) is held as text, spelled exactly as written, so `[r0,r1]` keeps its
+lower case. Every other item is an ordinary pattern expression, so earlier
+symbols are available (`.setsym::m::[1,#BASE,#BASE+1]`); write `#R0` when you
+want the number a name was given by `.setsym` or `.map` rather than the name
+itself.
 
 An item is selected with `[<index>]`, counting from 0. The index is itself an
 expression, so a pattern variable can drive it:
@@ -651,6 +657,55 @@ inserted as text. `#x[3]` in an expression needs a numeric item — a string ite
 is an error there, since it has no numeric value. An array name with no index
 in a template expands to all of its items joined by `,`.
 
+**How a subscript resolves.** In a template — `{{<name>[<expr>]}}` and
+`{{.index <name>[<expr>]}}` — a subscript written as a **string literal** is
+opened to its text first, so `arrb["CX"]` reads the same as `arrb[CX]`. Inside a
+template the closing `"` of the pattern's own string comes first, so the literal
+is escaped there: `{{.index arrb[\"CX\"]}}`. The text is then resolved in this
+order:
+
+1. the name of a **string symbol** — its text is read again as the subscript;
+2. the name of a **pattern variable** — rule 4 (the variable's value is used);
+3. the name of an **item of that array** — the position of that item;
+   failing that, a `.setsym` or `.map` **numeric symbol** of the same name — its
+   value;
+4. anything else — an ordinary **expression**.
+
+Rule 3 is what makes a name usable as a subscript. Given
+
+```
+.map::r::AX,BX,CX                  /* AX=0, BX=1, CX=2 and .check::r */
+.setsym::arrb::[R0,R1,R2]
+.setsym::arra::[AX,BX,CX]
+.setsym::var1::BX                  /* var1 is the name BX (3.6) */
+```
+
+`{{arrb[var1]}}` is `R1`: `var1` is the name `BX` (rule 1), `BX` is not an item
+of `arrb`, and `BX` is the numeric symbol 1 that `.map` defined (rule 3), so the
+subscript is 1. `{{arra[var1]}}` is `BX` for the other half of rule 3 — `BX` is
+an item of `arra`, at position 1. `{{arrb[r]}}` uses rule 2, so
+`MOV r,!e::"LD {{arrb[r]}},0x{{.hex(e)}}"` turns `mov bx,5` into `LD R1,0x5`.
+
+**`.index` — the subscript itself.** `{{.index <name>[<expr>]}}` resolves the
+subscript by exactly those rules and writes the resulting index in decimal
+instead of the item. It is the name-to-number direction of a lookup:
+
+```
+.setsym::var1::BX
+TEST v::"LD A,{{.index arra[v]}}"     /* TEST CX  ->  LD A,2 */
+                                      /* {{.index arrb[var1]}}    ->  1 */
+                                      /* {{.index arrb[\"CX\"]}}   ->  2 */
+                                      /* {{.index arra[\"CX\"]}}   ->  2 */
+```
+
+The last two are the two halves of rule 3 arriving at the same answer: `CX` is
+not an item of `arrb`, so its numeric symbol 2 is the subscript, while in `arra`
+it is the item at position 2.
+
+`.index(<name>[<expr>])` may be written with parentheses; the two forms are the
+same. The array must exist and the subscript must be in range, as for any other
+reference.
+
 Out-of-range indices and `name[...]` on a name that is not an array are
 reported as errors. `.clearsym` removes array symbols like any other symbol.
 
@@ -662,9 +717,18 @@ copies it:
 .setsym::y::x                  /* y is now a copy of x */
 ```
 
-The copy is independent — redefining `x` afterwards leaves `y` as it was. A
-bare name is otherwise a *label* reference (a numeric symbol is written `#x`),
-so this does not change the meaning of any expression that was valid before.
+The copy is independent — redefining `x` afterwards leaves `y` as it was. A bare
+name that is neither an array nor a string symbol becomes a **string symbol
+holding that name**:
+
+```
+.setsym::var1::BX              /* var1 is the name BX; {{var1}} writes BX */
+```
+
+That is what lets a name be carried around and used as a subscript (see *How a
+subscript resolves* above). Write `#BX` for the number the name was given by
+`.setsym` or `.map`, and `BX+0` (any expression, not a lone name) when you mean
+the value of a *label* called `BX`.
 
 **An array can stand in for a list of elements.** Wherever a directive takes an
 enumerated list of names — `.check`, `.enum` and `.map` — writing the name of an

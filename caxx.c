@@ -8643,23 +8643,37 @@ static void arrsym_copy(AsmState *st, const char *dst_upper, const char *src_upp
     arrsym_install(st, dst_upper, items, n);
 }
 
-/* 値欄が「名前ひとつ」で、それが文字列／配列シンボルなら複製する。
- * `.setsym::y::x` が `x` の写しを作るための枝で、複製したら真を返す。
- * 素の名前は本来ラベル参照なので（シンボルは `#x` と書く）、ここで拾っても
- * これまで書けていた式の意味は変わらない。 */
-static int symbol_copy_from_name(AsmState *st, const char *dst_upper, const char *value_field){
-    const char *q = value_field;
+/* 欄が識別子ひとつなら、書かれたままの名前を out に入れて真を返す。
+ * 先頭は英字か `_`、続きは英数字か `_` で、前後の空白は無視する。
+ * axx.py の bare_name_of() と同じ規則である。 */
+static int bare_name_of(const char *text, char *out, size_t cap){
+    const char *q = text ? text : "";
     while(*q==' '||*q=='\t') q++;
     const char *b = q;
     if(!(isalpha((unsigned char)*q) || *q=='_')) return 0;
     while(isalnum((unsigned char)*q) || *q=='_') q++;
-    int n = (int)(q - b);
+    size_t n = (size_t)(q - b);
     while(*q==' '||*q=='\t') q++;
     if(*q) return 0;                 /* 名前だけの欄ではない */
+    if(n >= cap) return 0;
+    memcpy(out, b, n);
+    out[n] = '\0';
+    return 1;
+}
+
+/* 値欄が「名前ひとつ」のときの `.setsym`。拾ったら真を返す。
+ * その名前が文字列／配列シンボルなら写しを作り（`.setsym::y::x`）、どちらでも
+ * なければ「その名前そのもの」を指す文字列シンボルにする。つまり
+ *   .setsym::var1::BX
+ * は `var1` が BX という名前を指す、という意味になり、`{{var1}}` は `BX` と
+ * 出る。名前に与えた数値が要るときは `#BX`、ラベルの値が要るときは `BX+0` の
+ * ように式にして書く（素の名前はここで文字列として拾われる）。
+ * axx.py の symbol_copy_from_name() と同じ規則である。 */
+static int symbol_copy_from_name(AsmState *st, const char *dst_upper, const char *value_field){
+    char name[512];
+    if(!bare_name_of(value_field, name, sizeof(name))) return 0;
     char src[512];
-    if(n >= (int)sizeof(src)) return 0;
-    for(int i=0;i<n;i++) src[i] = (char)axx_upper_char(b[i]);
-    src[n] = '\0';
+    axx_strupr_to(src, name, sizeof(src));
 
     if(arrsym_get(st, src)){ arrsym_copy(st, dst_upper, src); return 1; }
     const char *sv = strsym_get(st, src);
@@ -8671,7 +8685,9 @@ static int symbol_copy_from_name(AsmState *st, const char *dst_upper, const char
         free(dup);
         return 1;
     }
-    return 0;
+    /* どの表にも無い素の名前は、その名前そのものを指す文字列シンボルにする。 */
+    strsym_set(st, dst_upper, name);
+    return 1;
 }
 
 /* ==================== 集合（名前の並び）====================
@@ -8882,9 +8898,17 @@ static void arrsym_set_from_text(Assembler *asmb, const char *upper_name, const 
         }
         SymItem *it = &a->items[a->len++];
         it->is_str = 0; it->s = NULL; it->v = u256_zero();
+        char nm[512];
         if(item[0]=='"'){
             it->is_str = 1;
             it->s = txt_template_inner(item);
+        } else if(bare_name_of(item, nm, sizeof(nm))){
+            /* 素の名前（`R0` など）は書かれたままの文字列。`[R0,R1,R2]` と
+             * `["R0","R1","R2"]` は同じ意味になる。その名前に `.setsym`／
+             * `.map` で与えた数値が要るときは `[#R0,#R1]` と書く。 */
+            it->is_str = 1;
+            it->s = strdup(nm);
+            if(!it->s){ perror("strdup"); exit(1); }
         } else if(item[0]){
             int io;
             it->v = expr_expression_pat(asmb, item, 0, &io);
@@ -8943,6 +8967,9 @@ static void strsym_delete(AsmState *st, const char *upper_name){
  *                                      ので、要るなら外に書く）
  *   - `名前` `名前[添字]`           … 文字列シンボル／配列シンボル、
  *                                     どちらでもなければパターン変数の値
+ *   - `.index 名前[添字]`           … その参照が使う添字そのもの
+ *                                     （名前から番号を引くのに使う）
+ *                                     （添字は名前・`"名前"`・式のいずれでもよい）
  * が書ける。文字列の外と同じく `\n` `\t` `\r` `\\` `\"` は解く。
  *
  * 組み上がったテキストはそのままバイナリとしても出る。`.ascii` と同じく
@@ -9178,8 +9205,122 @@ static void txt_emit_name(Assembler *asmb, TxtBuf *t, const char *name, int len)
     txt_addn(t, name, (size_t)len);
 }
 
-/* `x[3]` のような添字つきの参照を積む。添字は式で、0 から数える。
- * 配列でない名前や範囲外の添字は診断して何も出さない。 */
+/* 添字が配列の範囲に入っていれば *out に入れて真を返す。外なら診断して偽。 */
+static int txt_arr_index_check(Assembler *asmb, struct ArrSym *ar, const char *key,
+                               int64_t n, int64_t *out){
+    if(n < 0 || n >= ar->len){
+        if(should_report_errors(&asmb->st))
+            axx_diagf(1, 0, " error - index %lld is out of range for array symbol "
+                       "'%s' (0..%d).\n", (long long)n, key, ar->len-1);
+        return 0;
+    }
+    *out = n;
+    return 1;
+}
+
+/* 欄が `"..."` ひとつだけなら、逃げ方を解いた中身を out に入れて真を返す。
+ * `.index arrb["CX"]` の `"CX"` のように、名前をそのまま書くための形である。
+ * テンプレートの中では `"` が文字列の終わりなので `\"CX\"` と逃がして書くこと
+ * になる。その形も同じに受ける。
+ * axx.py の _txt_quoted_text() と同じ規則である。 */
+static int txt_quoted_text(const char *t, char *out, size_t cap){
+    const char *delim;
+    size_t dl;
+    if(t[0]=='\\' && t[1]=='"'){ delim = "\\\""; dl = 2; }
+    else if(t[0]=='"'){ delim = "\""; dl = 1; }
+    else return 0;
+    size_t w = 0;
+    for(size_t i = dl; t[i]; ){
+        if(strncmp(t+i, delim, dl)==0){
+            const char *tail = t + i + dl;
+            while(*tail==' '||*tail=='\t') tail++;
+            if(*tail) return 0;                /* 閉じたあとに何か書いてある */
+            out[w] = '\0';
+            return 1;
+        }
+        char c = t[i];
+        if(c=='\\' && t[i+1]){
+            switch(t[i+1]){
+            case 'n':  c = '\n';  break;
+            case 't':  c = '\t';  break;
+            case 'r':  c = '\r';  break;
+            case '\\': c = '\\'; break;
+            case '"':  c = '"';   break;
+            default:   c = t[i+1]; break;
+            }
+            i += 2;
+        } else i++;
+        if(w + 1 >= cap) return 0;
+        out[w++] = c;
+    }
+    return 0;                                  /* 閉じ `"` が無い */
+}
+
+/* 添字の欄を配列 ar の添字（0 起点）に解く。解けたら真を返して *out に入れる。
+ * まず `"..."` と書かれた欄はその中身に開く（`arrb["CX"]` は `arrb[CX]` と同じ
+ * に読む）。そのうえで
+ *   1. 文字列シンボルの名前ひとつ … その文字列を添字の欄として読み直す
+ *   2. パターン変数の名前ひとつ   … 4 へ（変数の値で引く）
+ *   3. 配列の項目名そのもの       … その項目の位置
+ *      それが無ければ同じ名前の `.setsym`／`.map` の数値シンボル … その値
+ *   4. どれでもない               … ふつうの式として評価した値
+ * の順に解く。`.setsym::var1::BX` のときの `arrb[var1]` は 1 を通り、`BX` が
+ * `.map::r::AX,BX,CX` で 1 になっているので添字 1 になる。`arrb["CX"]` なら同じ
+ * く 3 の後半で 2 になる。名前の並びをそのまま持つ配列（`[AX,BX,CX]`）なら 3 の
+ * 前半で位置が決まる。
+ * axx.py の _arr_index_of() と同じ規則である。 */
+static int txt_arr_index_of(Assembler *asmb, struct ArrSym *ar, const char *key,
+                            const char *idxtext, int64_t *out){
+    AsmState *st = &asmb->st;
+    char cur[1024], nm[512], up[512], qbuf[1024];
+    snprintf(cur, sizeof(cur), "%s", idxtext ? idxtext : "");
+    {
+        const char *p = cur;
+        while(*p==' '||*p=='\t') p++;
+        if(txt_quoted_text(p, qbuf, sizeof(qbuf)))
+            snprintf(cur, sizeof(cur), "%s", qbuf);
+    }
+    int have = bare_name_of(cur, nm, sizeof(nm));
+    if(have){
+        axx_strupr_to(up, nm, sizeof(up));
+        const char *sv = strsym_get(st, up);
+        if(sv){
+            /* 文字列シンボルの中身を、添字の欄として読み直す。 */
+            snprintf(cur, sizeof(cur), "%s", sv);
+            have = bare_name_of(cur, nm, sizeof(nm));
+            if(have) axx_strupr_to(up, nm, sizeof(up));
+        }
+    }
+    /* 変数の綴り（小文字で書かれ、パターンファイルが変数として使っている
+     * 名前）は、名前ではなく値として読む。 */
+    int is_var = 0;
+    if(have){
+        int len = (int)strlen(nm);
+        if(is_var_name_n(nm, len) && var_slot(nm, len, 0) >= 0) is_var = 1;
+    }
+    if(have && !is_var){
+        for(int k=0;k<ar->len;k++){
+            if(!ar->items[k].is_str) continue;
+            char ib[512];
+            axx_strupr_to(ib, ar->items[k].s, sizeof(ib));
+            if(strcmp(ib, up)==0){ *out = k; return 1; }
+        }
+        uint256_t sv2;
+        if(smap_get(&st->symbols, up, &sv2))
+            return txt_arr_index_check(asmb, ar, key, u256_to_i64(sv2), out);
+    }
+    int io;
+    int saved_undef = st->error_undefined_label;
+    st->error_undefined_label = 0;
+    uint256_t iv = expr_expression_pat(asmb, cur, 0, &io);
+    if(st->error_undefined_label) saved_undef = 1;
+    st->error_undefined_label = saved_undef;
+    return txt_arr_index_check(asmb, ar, key, u256_to_i64(iv), out);
+}
+
+/* `x[3]` のような添字つきの参照を積む。添字は 0 から数える。
+ * 配列でない名前や解けない添字は診断して何も出さない。添字の解き方は
+ * txt_arr_index_of() にまとめてあり、`.index` と同じである。 */
 static void txt_emit_indexed(Assembler *asmb, TxtBuf *t,
                              const char *name, int len, const char *idxtext){
     AsmState *st = &asmb->st;
@@ -9195,19 +9336,8 @@ static void txt_emit_indexed(Assembler *asmb, TxtBuf *t,
                        "needs '.setsym::%s::[...]'.\n", key, key, key);
         return;
     }
-    int io;
-    int saved_undef = st->error_undefined_label;
-    st->error_undefined_label = 0;
-    uint256_t iv = expr_expression_pat(asmb, idxtext, 0, &io);
-    if(st->error_undefined_label) saved_undef = 1;
-    st->error_undefined_label = saved_undef;
-    int64_t n = u256_to_i64(iv);
-    if(n < 0 || n >= ar->len){
-        if(should_report_errors(st))
-            axx_diagf(1, 0, " error - index %lld is out of range for array symbol "
-                       "'%s' (0..%d).\n", (long long)n, key, ar->len-1);
-        return;
-    }
+    int64_t n;
+    if(!txt_arr_index_of(asmb, ar, key, idxtext, &n)) return;
     if(ar->items[n].is_str) txt_adds(t, ar->items[n].s);
     else                    txt_radix(t, ar->items[n].v, 10);
 }
@@ -9233,6 +9363,72 @@ static int txt_bare_name_len(const char *s){
     int len = i - a;
     while(s[i]==' '||s[i]=='\t') i++;
     return s[i] ? 0 : len;
+}
+
+/* `.index 配列[式]` なら、配列名を name に、添字の式を *idx に（malloc した
+ * 写し）入れて真を返す。`.index(配列[式])` と括弧で括って書いてもよい。
+ * axx.py の _txt_index_call() と同じ規則である。 */
+static int txt_index_call(const char *s, char *name, size_t ncap, char **idx){
+    static const char *w = "INDEX";
+    int k = 0;
+    for(; k < 5; k++) if(axx_upper_char(s[k]) != w[k]) return 0;
+    if(!(s[k]==' ' || s[k]=='\t' || s[k]=='(')) return 0;  /* `.indexof` など別の名前 */
+    char *body = strdup(s + k);
+    if(!body){ perror("strdup"); exit(1); }
+    char *b = body;
+    while(*b==' '||*b=='\t') b++;
+    size_t bl = strlen(b);
+    while(bl > 0 && (b[bl-1]==' '||b[bl-1]=='\t')) b[--bl] = '\0';
+    if(*b=='('){
+        int cp = txt_close_paren(b, 0);
+        if(cp < 0){ free(body); return 0; }
+        const char *tail = b + cp + 1;
+        while(*tail==' '||*tail=='\t') tail++;
+        if(*tail){ free(body); return 0; }
+        b[cp] = '\0';
+        b++;
+        while(*b==' '||*b=='\t') b++;
+        bl = strlen(b);
+        while(bl > 0 && (b[bl-1]==' '||b[bl-1]=='\t')) b[--bl] = '\0';
+    }
+    /* ここからは `名前[式]` の形でなければならない。 */
+    char *p = b;
+    if(!(isalpha((unsigned char)*p) || *p=='_')){ free(body); return 0; }
+    char *nb = p;
+    while(isalnum((unsigned char)*p) || *p=='_') p++;
+    size_t n = (size_t)(p - nb);
+    char *q = p;
+    while(*q==' '||*q=='\t') q++;
+    if(*q != '['){ free(body); return 0; }
+    int cb = txt_close_bracket(q, 0);
+    if(cb < 0){ free(body); return 0; }
+    const char *tail = q + cb + 1;
+    while(*tail==' '||*tail=='\t') tail++;
+    if(*tail || n >= ncap){ free(body); return 0; }
+    q[cb] = '\0';
+    memcpy(name, nb, n); name[n] = '\0';
+    *idx = strdup(q + 1);
+    if(!*idx){ perror("strdup"); exit(1); }
+    free(body);
+    return 1;
+}
+
+/* `.index 配列[式]` の値を積む。`{{arr[e]}}` が引く項目の、その添字そのもの
+ * （0 起点）を10進で出す。配列でない名前や解けない添字は診断して何も出さない。 */
+static void txt_emit_index(Assembler *asmb, TxtBuf *t, const char *name, const char *idxtext){
+    AsmState *st = &asmb->st;
+    char key[512];
+    axx_strupr_to(key, name, sizeof(key));
+    struct ArrSym *ar = arrsym_get(st, key);
+    if(!ar){
+        if(should_report_errors(st))
+            axx_diagf(1, 0, " error - '%s' is not an array symbol; '.index %s[...]' "
+                       "needs '.setsym::%s::[...]'.\n", key, key, key);
+        return;
+    }
+    int64_t n;
+    if(!txt_arr_index_of(asmb, ar, key, idxtext, &n)) return;
+    txt_radix(t, u256_from_i64(n), 10);
 }
 
 /* テンプレート本文（引用符の中身）を展開して t に積む。 */
@@ -9262,8 +9458,17 @@ static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
             /* `{{.hex(e)}}` のように中身が変換関数ならそれを使う。 */
             int j = 0; while(inner[j]==' ') j++;
             int kind = -1, nl = 0;
-            if(inner[j]=='.') nl = txt_conv_name(inner+j+1, &kind);
             int done = 0;
+            if(inner[j]=='.'){
+                /* `.index 配列[式]` は、その参照が使う添字そのものを返す。 */
+                char inm[512]; char *iex = NULL;
+                if(txt_index_call(inner+j+1, inm, sizeof(inm), &iex)){
+                    txt_emit_index(asmb, t, inm, iex);
+                    free(iex);
+                    done = 1;
+                }
+            }
+            if(!done && inner[j]=='.') nl = txt_conv_name(inner+j+1, &kind);
             if(nl){
                 int cp = txt_close_paren(inner, j+1+nl);
                 if(cp > 0){

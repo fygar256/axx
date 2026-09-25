@@ -6378,6 +6378,9 @@ class ObjectGenerator:
     #                                      ないので、要るなら外に書く）
     #   - `名前` `名前[添字]`           … 文字列シンボル／配列シンボル、
     #                                     どちらでもなければパターン変数の値
+    #   - `.index 名前[添字]`           … その参照が使う添字そのもの
+    #                                     （名前から番号を引くのに使う）
+    #                                     （添字は名前・`"名前"`・式のいずれでもよい）
     # が書ける。文字列の外と同じく `\n` `\t` `\r` `\\` `\"` は解く。
     #
     # 組み上がったテキストはそのままバイナリとしても出る。`.ascii` と同じく
@@ -6563,6 +6566,12 @@ class ObjectGenerator:
                     j += 1
                 done = False
                 if inner[j:j + 1] == '.':
+                    # `.index 配列[式]` は、その参照が使う添字そのものを返す。
+                    nm, ix = self._txt_index_call(inner[j + 1:])
+                    if nm is not None:
+                        parts.append(self._txt_index_text(nm, ix))
+                        done = True
+                if not done and inner[j:j + 1] == '.':
                     nl, kind = self._txt_conv_name(inner[j + 1:])
                     if nl:
                         cp = self._txt_close_paren(inner, j + 1 + nl)
@@ -6664,9 +6673,10 @@ class ObjectGenerator:
         return -1
 
     def _txt_indexed_text(self, name, idxtext):
-        """`x[3]` のような添字つきの参照。添字は式で、0 から数える。
+        """`x[3]` のような添字つきの参照。添字は 0 から数える。
 
-        配列でない名前や範囲外の添字は診断して空文字を返す。
+        配列でない名前や範囲外の添字は診断して空文字を返す。添字の解き方は
+        `_arr_index_of()` にまとめてあり、`.index` と同じである。
         """
         key = StringUtils.upper(name)
         if key not in self.state.arrsymbols:
@@ -6674,19 +6684,126 @@ class ObjectGenerator:
                             f"'{key}[...]' needs '.setsym::{key}::[...]'.",
                             set_error=True)
             return ''
+        n = self._arr_index_of(key, idxtext)
+        if n is None:
+            return ''
+        arr = self.state.arrsymbols[key]
+        return arr[n] if isinstance(arr[n], str) else self._txt_radix(arr[n], 10)
+
+    @classmethod
+    def _txt_index_call(cls, s):
+        """`.index 配列[式]` なら (配列名, 添字の式) を返す。違えば (None, None)。
+
+        `.index(配列[式])` と括弧で括って書いてもよい。
+        caxx.c の txt_index_call() と同じ規則である。
+        """
+        if StringUtils.upper(s[:5]) != 'INDEX':
+            return None, None
+        rest = s[5:]
+        if rest[:1] not in (' ', '\t', '('):
+            return None, None          # `.indexof` のような別の名前
+        rest = rest.strip()
+        if rest.startswith('('):
+            cp = cls._txt_close_paren(rest, 0)
+            if cp < 0 or rest[cp + 1:].strip() != '':
+                return None, None
+            rest = rest[1:cp]
+        return cls._txt_bare_indexed(rest)
+
+    def _txt_index_text(self, name, idxtext):
+        """`.index 配列[式]` の値。0 から数えた添字を10進で返す。
+
+        `{{arr[e]}}` が引く項目の、その添字そのものである。配列でない名前や
+        解けない添字は診断して空文字を返す。
+        """
+        key = StringUtils.upper(name)
+        if key not in self.state.arrsymbols:
+            self.state.diag(f" error - '{key}' is not an array symbol; "
+                            f"'.index {key}[...]' needs '.setsym::{key}::[...]'.",
+                            set_error=True)
+            return ''
+        n = self._arr_index_of(key, idxtext)
+        return '' if n is None else self._txt_radix(n, 10)
+
+    @staticmethod
+    def _txt_quoted_text(t):
+        """欄が `"..."` ひとつだけなら、逃げ方を解いた中身を返す。でなければ None。
+
+        `.index arrb["CX"]` の `"CX"` のように、名前をそのまま書くための形である。
+        テンプレートの中では `"` が文字列の終わりなので `\"CX\"` と逃がして書く
+        ことになる。その形も同じに受ける。
+        caxx.c の txt_quoted_text() と同じ規則である。
+        """
+        if t.startswith('\\"'):
+            delim = '\\"'
+        elif t.startswith('"'):
+            delim = '"'
+        else:
+            return None
+        out = []
+        i = len(delim)
+        while i < len(t):
+            if t.startswith(delim, i):
+                return ''.join(out) if t[i + len(delim):].strip() == '' else None
+            if t[i] == '\\' and i + 1 < len(t):
+                out.append(_TXT_ESCAPES.get(t[i + 1], t[i + 1])); i += 2; continue
+            out.append(t[i]); i += 1
+        return None                    # 閉じ `"` が無い
+
+    def _arr_index_of(self, key, idxtext):
+        """添字の欄を配列 key の添字（0 起点）に解く。解けなければ None。
+
+        まず `"..."` と書かれた欄はその中身に開く（`arrb["CX"]` は `arrb[CX]` と
+        同じに読む）。そのうえで
+          1. 文字列シンボルの名前ひとつ … その文字列を添字の欄として読み直す
+          2. パターン変数の名前ひとつ   … 4 へ（変数の値で引く）
+          3. 配列の項目名そのもの       … その項目の位置
+             それが無ければ同じ名前の `.setsym`／`.map` の数値シンボル … その値
+          4. どれでもない               … ふつうの式として評価した値
+        の順に解く。`.setsym::var1::BX` のときの `arrb[var1]` は 1 を通り、`BX`
+        が `.map::r::AX,BX,CX` で 1 になっているので添字 1 になる。`arrb["CX"]`
+        なら同じく 3 の後半で 2 になる。名前の並びをそのまま持つ配列
+        （`[AX,BX,CX]`）なら 3 の前半で位置が決まる。
+        caxx.c の txt_arr_index_of() と同じ規則である。
+        """
+        arr = self.state.arrsymbols[key]
+        t = (idxtext or '').strip()
+        _q = self._txt_quoted_text(t)
+        if _q is not None:
+            t = _q.strip()
+        nm = self._txt_bare_name(t)
+        if nm is not None and nm in self.state.strsymbols:
+            t = self.state.strsymbols[nm].strip()
+            nm = self._txt_bare_name(t)
+        # 変数の綴り（小文字で書かれ、パターンファイルが変数として使っている
+        # 名前）は、名前ではなく値として読む。
+        _v = t.lower()
+        is_var = (_v == t and _v in self.state.varnames)
+        if nm is not None and not is_var:
+            for k, v in enumerate(arr):
+                if isinstance(v, str) and StringUtils.upper(v) == nm:
+                    return k
+            if nm in self.state.symbols:
+                return self._arr_index_check(key, arr, self.state.symbols[nm])
         saved_undef = self.state.error_undefined_label
         self.state.error_undefined_label = False
-        v, _ = self.expr_eval.expression_pat(idxtext, 0)
+        v, _ = self.expr_eval.expression_pat(t, 0)
         if self.state.error_undefined_label:
             saved_undef = True
         self.state.error_undefined_label = saved_undef
-        arr = self.state.arrsymbols[key]
-        n = int(v)
+        return self._arr_index_check(key, arr, v)
+
+    def _arr_index_check(self, key, arr, v):
+        """添字が配列の範囲に入っていれば int で返す。外なら診断して None。"""
+        try:
+            n = int(v)
+        except (OverflowError, ValueError, TypeError):
+            n = -1
         if n < 0 or n >= len(arr):
             self.state.diag(f" error - index {n} is out of range for array symbol "
                             f"'{key}' (0..{len(arr) - 1}).", set_error=True)
-            return ''
-        return arr[n] if isinstance(arr[n], str) else self._txt_radix(arr[n], 10)
+            return None
+        return n
 
     def makeobj(self, s):
         # 行に現れた `"..."` の展開結果をつないでおく。_txtacc は素のまま流す
@@ -6830,16 +6947,41 @@ class ObjectGenerator:
 
 
 
+def bare_name_of(text):
+    """欄が識別子ひとつなら、その名前を書かれたまま返す。でなければ None。
+
+    先頭は英字か `_`、続きは英数字か `_` で、前後の空白は無視する。
+    caxx.c の bare_name_of() と同じ規則である。
+    """
+    t = (text or '').strip()
+    if not t.isascii() or not (t[:1].isalpha() or t[:1] == '_'):
+        return None
+    for ch in t[1:]:
+        if not (ch.isalnum() or ch == '_'):
+            return None
+    return t
+
+
 def arr_items_from_text(expr_eval, q):
     """`.setsym` の `[...]` を項目の並びにする。
 
-    項目は `"文字列"` ならそのまま文字列 (str)、それ以外は式として評価した
-    数値になる。caxx.c の arrsym_set_from_text() と同じ規則である。
+    項目は
+      - `"文字列"`           … そのまま文字列 (str)
+      - 素の名前（`R0` など） … 書かれたままの文字列 (str)
+      - それ以外              … 式として評価した数値
+    になる。`[R0,R1,R2]` と `["R0","R1","R2"]` が同じ意味になるのは2番目の枝で、
+    名前は綴りをそのまま持つ（`[r0,r1]` なら小文字のまま出る）。その名前に
+    `.setsym`／`.map` で与えた数値が要るときは `[#R0,#R1]` と書く。
+    caxx.c の arrsym_set_from_text() と同じ規則である。
     """
     out = []
     for item in ObjectGenerator._arr_split(q):
         if item.startswith('"'):
             out.append(ObjectGenerator._txt_template_inner(item))
+            continue
+        nm = bare_name_of(item)
+        if nm is not None:
+            out.append(nm)
         elif item:
             v, _ = expr_eval.expression_pat(item, 0)
             out.append(v)
@@ -6999,19 +7141,21 @@ def symbol_set_from_text(state, dst_upper, value_field):
 
 
 def symbol_copy_from_name(state, dst_upper, value_field):
-    """値欄が「名前ひとつ」で、それが文字列／配列シンボルなら複製する。
+    """値欄が「名前ひとつ」のときの `.setsym`。拾ったら True を返す。
 
-    `.setsym::y::x` が `x` の写しを作るための枝で、複製したら True を返す。
-    素の名前は本来ラベル参照なので（シンボルは `#x` と書く）、ここで拾っても
-    これまで書けていた式の意味は変わらない。
+    その名前が文字列／配列シンボルなら写しを作り（`.setsym::y::x`）、どちらでも
+    なければ「その名前そのもの」を指す文字列シンボルにする。つまり
+
+        .setsym::var1::BX
+
+    は `var1` が BX という名前を指す、という意味になり、`{{var1}}` は `BX` と
+    出る。名前に与えた数値が要るときは `#BX`、ラベルの値が要るときは `BX+0` の
+    ように式にして書く（素の名前はここで文字列として拾われる）。
     caxx.c の symbol_copy_from_name() と同じ規則である。
     """
-    t = value_field.strip()
-    if not t.isascii() or not (t[:1].isalpha() or t[:1] == '_'):
+    t = bare_name_of(value_field)
+    if t is None:
         return False
-    for ch in t[1:]:
-        if not (ch.isalnum() or ch == '_'):
-            return False
     src = StringUtils.upper(t)
     if src in state.arrsymbols:
         if src != dst_upper:
@@ -7022,7 +7166,9 @@ def symbol_copy_from_name(state, dst_upper, value_field):
         if src != dst_upper:
             state.strsymbols[dst_upper] = state.strsymbols[src]
         return True
-    return False
+    # どの表にも無い素の名前は、その名前そのものを指す文字列シンボルにする。
+    state.strsymbols[dst_upper] = t
+    return True
 
 
 class VLIWProcessor:
