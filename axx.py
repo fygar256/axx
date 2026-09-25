@@ -918,6 +918,9 @@ class AssemblerState:
         # `.setsym::名前::[項目,項目,…]` で登録された配列シンボル。項目は数値
         # (int/float) でも文字列 (str) でもよく、`x[3]` や `#x[3]` で引く。
         self.arrsymbols = {}
+        # `.passthru` の設定。0=切（マッチしない行は Syntax error）、
+        # 1=素通し（行末に改行を付ける）、2=素通し（改行を付けない）。
+        self.passthru = 0
 
         # 標準入力から読んだソースを置く一時ファイル（全パスで再利用する）。
         self.stdin_tmp_path: str | None = None
@@ -3935,6 +3938,42 @@ class DirectiveProcessor:
                 self.state.enum_defs.pop(_v, None)
         return True
 
+    def passthru_processing(self, i):
+        """`.passthru[::on|nonl|off]`
+
+        どのパターンにもマッチしなかったソース行を、エラーにする代わりに
+        そのままテキストとして出す（トランスレータとしての使い方のため）。
+        その行はパターンのエンコーディング欄が `"<行>"` というテキスト
+        テンプレートだったのと同じ扱いになり、UTF-8 の 1 バイトが 1 ワードに
+        なってロケーションカウンタもその分進む。
+
+            .passthru          on と同じ
+            .passthru::on      素通しし、行末に改行を付ける
+            .passthru::nonl    素通しするが改行は付けない
+            .passthru::off     素通しをやめる（既定）
+
+        パターンファイルは1行ごとに全部走査されるので、これはファイル全体に
+        かかる設定として働く（同じファイルに複数書いた場合は最後のものが
+        効く）。caxx.c の dir_passthru() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.passthru':
+            return False
+        arg = ''
+        for f in i[1:]:
+            if f and f.strip():
+                arg = StringUtils.upper(f.strip())
+                break
+        if arg in ('', 'ON'):
+            self.state.passthru = 1
+        elif arg == 'NONL':
+            self.state.passthru = 2
+        elif arg == 'OFF':
+            self.state.passthru = 0
+        else:
+            self.state.diag(f" error - .passthru: expected 'on', 'nonl' or 'off' "
+                            f"('{arg}').", set_error=True)
+        return True
+
     def enum_processing(self, i):
         """`.enum::<変数>::<要素名の並び>::<式>`。
 
@@ -4865,7 +4904,7 @@ class PatternFileReader:
                              f"name ({var_str!r}).", set_error=True)
 
                 if len(l) == 1:
-                    if l[0].strip() != '':
+                    if l[0].strip() != '' and _kw != '.PASSTHRU':
                         diag(f" warning - pattern line has no '::' field separator "
                              f"and can never match (a pattern file has no line-"
                              f"continuation mechanism, so this is likely a stray "
@@ -9377,6 +9416,8 @@ class Assembler:
                 continue
             if self.directive_proc.free_processing(i):
                 continue
+            if self.directive_proc.passthru_processing(i):
+                continue
             if self.directive_proc.enum_processing(i):
                 continue
             if self.directive_proc.clrenum_processing(i):
@@ -9566,6 +9607,11 @@ class Assembler:
             pln = 0
             pl = ""
 
+        # `.passthru` が有効なら、マッチしなかった行はエラーにせずそのまま出す。
+        # 診断の抑止（パス1）に関わらず出すので、両パスで行の大きさが揃う。
+        if se and self.state.passthru:
+            return self._passthru_line(l, l2, idx)
+
         if self.state.should_report_errors():
             _loc = f"  [{self.state.current_file}:{self.state.ln}]"
             if self.state.error_undefined_label:
@@ -9589,6 +9635,31 @@ class Assembler:
                 return 0, [], False, idx
 
         return idxs, objl, True, idx
+
+    def _passthru_line(self, l, l2, idx):
+        """`.passthru` のとき、マッチしなかった行をそのままテキストとして出す。
+
+        出るのは照合にかけた形の行、つまり空白を1つに詰め、`;` コメントと
+        行頭のラベル定義を落としたあとの行である。`.passthru::on` なら行末に
+        改行を付ける。caxx.c の passthru_line() と同じ規則である。
+        """
+        txt = (l + ' ' + l2) if l2 else l
+        if self.state.passthru == 1:
+            txt += '\n'
+        # 素通しする行は式として読まないので、照合の途中で立った未定義ラベルの
+        # 印はこの行には関わらない。
+        self.state.error_undefined_label = False
+        objl = list(txt.encode('utf-8', errors='surrogateescape'))
+        _word_mask = (1 << self.state.bts) - 1 if self.state.bts > 0 else 0xFF
+        if (any(_v > _word_mask for _v in objl)
+                and not self.state._pass1_size_mode
+                and self.state.should_report_errors()):
+            self.state.diag(f" warning - .passthru: one or more bytes exceed the "
+                            f"output word width ({self.state.bts} bit(s)) and were "
+                            f"truncated (high bits discarded): {txt!r}", set_error=False)
+        self.state.asmtext = txt
+        self.state.asmtext_disp = '"%s"' % asmtext_escaped(txt)
+        return 0, objl, True, idx
 
     def lineassemble(self, line):
         line = StringUtils.normalize_ws(line)

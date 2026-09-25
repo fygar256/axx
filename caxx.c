@@ -1278,6 +1278,10 @@ typedef struct {
     char      *asmtext;
     char      *asmtext_disp;
 
+    /* `.passthru` の設定。0=切（マッチしない行は Syntax error）、
+     * 1=素通し（行末に改行を付ける）、2=素通し（改行を付けない）。 */
+    int        passthru;
+
     char       cl[4096];
     int        ln;
     StrVec     fnstack;
@@ -1880,6 +1884,7 @@ static void state_init(AsmState *st) {
     st->debug = 0;
     st->asmtext = NULL;
     st->asmtext_disp = NULL;
+    st->passthru = 0;
     sv_init(&st->strsym_names);
     sv_init(&st->strsym_vals);
     st->arrsyms = NULL; st->arrsyms_len = 0; st->arrsyms_cap = 0;
@@ -5165,6 +5170,37 @@ static int dir_free(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.passthru[::on|nonl|off]`
+ * どのパターンにもマッチしなかったソース行を、エラーにする代わりにそのまま
+ * テキストとして出す（トランスレータとしての使い方のため）。その行はパターンの
+ * エンコーディング欄が `"<行>"` というテキストテンプレートだったのと同じ扱いに
+ * なり、UTF-8 の 1 バイトが 1 ワードになってロケーションカウンタも進む。
+ *   .passthru        on と同じ
+ *   .passthru::on    素通しし、行末に改行を付ける
+ *   .passthru::nonl  素通しするが改行は付けない
+ *   .passthru::off   素通しをやめる（既定）
+ * パターンファイルは1行ごとに全部走査されるので、これはファイル全体にかかる
+ * 設定として働く（同じファイルに複数書いた場合は最後のものが効く）。
+ * axx.py の passthru_processing() と同じ規則である。 */
+static int dir_passthru(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".passthru") != 0) return 0;
+    char arg[32]; arg[0] = '\0';
+    for(int fi=1; fi<PAT_FIELDS; fi++){
+        const char *p = e->f[fi];
+        while(*p==' '||*p=='\t') p++;
+        if(*p){ axx_strupr_to(arg, p, sizeof(arg)); break; }
+    }
+    { size_t n = strlen(arg);
+      while(n > 0 && (arg[n-1]==' '||arg[n-1]=='\t')) arg[--n] = '\0'; }
+    if(arg[0]=='\0' || strcmp(arg,"ON")==0)   asmb->st.passthru = 1;
+    else if(strcmp(arg,"NONL")==0)            asmb->st.passthru = 2;
+    else if(strcmp(arg,"OFF")==0)             asmb->st.passthru = 0;
+    else
+        axx_diagf(1, 0, " error - .passthru: expected 'on', 'nonl' or 'off' "
+                        "('%s').\n", arg);
+    return 1;
+}
+
 /* `.enum::<変数>::<要素名の並び>::<式>`
  * `!E<変数>` が拾う「要素名のリスト」の語彙と、そこから値を作る式を決める。
  * 式の中では各要素名が「そのリストに現れていれば .setsym の値、
@@ -8375,7 +8411,17 @@ static void readpat(Assembler *asmb, const char *fn){
         if(nf==1){
             int nonblank=0;
             for(const char*p=fields[0];*p;p++){ if(!isspace((unsigned char)*p)){ nonblank=1; break; } }
-            if(nonblank){
+            /* 引数を省いた `.passthru` は欄がひとつだけの正しい書き方なので、
+             * 取りこぼしの警告からは外す。 */
+            char kw1[16]={0};
+            {
+                int a = axx_skipspc(fields[0], 0);
+                int e = (int)strlen(fields[0]);
+                while(e > a && isspace((unsigned char)fields[0][e-1])) e--;
+                if(e - a < (int)sizeof(kw1))
+                    for(int k = a; k < e; k++) kw1[k-a] = axx_upper_char(fields[0][k]);
+            }
+            if(nonblank && strcmp(kw1,".PASSTHRU")!=0){
                 axx_diagf(0, 0, " warning - pattern line has no '::' field separator "
                            "and can never match (a pattern file has no line-"
                            "continuation mechanism, so this is likely a stray "
@@ -10806,6 +10852,45 @@ static int pat_prefix_matches(const char *pat, const char *lin){
     return 0;
 }
 
+/* `.passthru` のとき、マッチしなかった行をそのままテキストとして出す。
+ * 出るのは照合にかけた形の行、つまり空白を1つに詰め、`;` コメントと行頭の
+ * ラベル定義を落としたあとの行である。`.passthru::on` なら行末に改行を付ける。
+ * axx.py の _passthru_line() と同じ規則である。 */
+static void passthru_line(Assembler *asmb, const char *l, const char *l2,
+                          IntVec *objl_out){
+    AsmState *st = &asmb->st;
+    TxtBuf t; txt_init(&t);
+    txt_adds(&t, l);
+    if(l2 && l2[0]){ txt_addc(&t, ' '); txt_adds(&t, l2); }
+    if(st->passthru == 1) txt_addc(&t, '\n');
+    const char *txt = t.b ? t.b : "";
+    /* 素通しする行は式として読まないので、照合の途中で立った未定義ラベルの
+     * 印はこの行には関わらない。 */
+    st->error_undefined_label = 0;
+    uint64_t word_mask = (st->bts > 0) ? axx_word_mask(st->bts) : 0xFFu;
+    int trunc = 0;
+    for(const unsigned char *bp=(const unsigned char *)txt; *bp; bp++){
+        if((uint64_t)*bp > word_mask) trunc = 1;
+        iv_push(objl_out, u256_from_u64((uint64_t)*bp));
+    }
+    if(trunc && !st->pass1_size_mode && should_report_errors(st)){
+        char r[1024]; m_pyrepr(txt, r, sizeof(r));
+        axx_diagf(0, 0, " warning - .passthru: one or more bytes exceed the "
+                        "output word width (%d bit(s)) and were truncated "
+                        "(high bits discarded): %s\n", st->bts, r);
+    }
+    free(st->asmtext);
+    st->asmtext = strdup(txt);
+    if(!st->asmtext){ perror("strdup"); exit(1); }
+    TxtBuf d; txt_init(&d);
+    txt_addc(&d, '"');
+    txt_add_escaped(&d, txt);
+    txt_addc(&d, '"');
+    free(st->asmtext_disp);
+    st->asmtext_disp = d.b ? d.b : strdup("");
+    free(t.b);
+}
+
 /* 作業用バッファは呼び出し元（lineassemble2）がソース行の長さに合わせて確保する。
  *
  * 破綻点修正: ここは l[1024] / l2[4096] / lin[8192] という固定長の自動変数で、
@@ -10957,6 +11042,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         if(dir_clrreloc(asmb,i)) continue;
         if(dir_map(asmb,i)) continue;
         if(dir_free(asmb,i)) continue;
+        if(dir_passthru(asmb,i)) continue;
         if(dir_enum(asmb,i)) continue;
         if(dir_clrenum(asmb,i)) continue;
         if(dir_errmsg(asmb,i)) continue;
@@ -11129,6 +11215,13 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     best_free(&best);
 
     if(loopflag){ se=1; pln=0; }
+
+    /* `.passthru` が有効なら、マッチしなかった行はエラーにせずそのまま出す。
+     * 診断の抑止（パス1）に関わらず出すので、両パスで行の大きさが揃う。 */
+    if(se && st->passthru){
+        passthru_line(asmb, l, l2, objl_out);
+        *idx_out=idx; return 1;
+    }
 
     if(should_report_errors(st)){
         if(st->error_undefined_label){

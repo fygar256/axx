@@ -1789,6 +1789,53 @@ the assembler. Four caps stop that and report the offending line instead:
 An argument that came from an undefined label is passed as `0`, so a
 forward reference cannot blow a loop count up during the first pass.
 
+### 3.16 `.passthru` — letting unmatched lines through
+
+By default a source line that matches no pattern is a `Syntax error` (code 1)
+and the output is discarded. `.passthru` switches that to **emitting the line as
+text, unchanged, instead of failing**. It is meant for translator use (the text
+templates of section 3.5.2): write patterns for the lines you want to rewrite
+and let the rest through.
+
+```
+.passthru          /* the same as on */
+.passthru::on      /* let it through, with a newline at the end of the line */
+.passthru::nonl    /* let it through with no newline */
+.passthru::off     /* stop letting lines through (the default) */
+```
+
+A line let through is treated exactly as if a pattern whose encoding field was
+`"<that line>"` had matched: one UTF-8 byte becomes one output word, the
+location counter advances by that much, and the text goes to standard output.
+The same text is produced in both passes, so labels after such a line still get
+the right address.
+
+```
+.bits::8
+.passthru
+.map::r::AX,BX,CX
+.setsym::rn::[AX,BX,CX]
+MOV r,!e::"LD {{rn[r]}},0x{{.hex(e)}}\n"
+```
+
+```
+	mov	bx,5        ->  LD BX,0x5
+	xyzzy	foo, bar    ->  xyzzy foo, bar     /* let through */
+	r1 = r2 + r3        ->  r1 = r2 + r3       /* let through */
+```
+
+What comes out is **the line as it was offered to the matcher**: tabs and runs of
+spaces squeezed to one space, a `;` comment removed, and a leading label
+definition removed (the label is still defined).
+
+The pattern file is scanned in full for every source line, so `.passthru` acts as
+a setting for the whole file (the last one in the file wins).
+
+Built-in assembly directives such as `.ascii` and `.resb` (section 5.3) are
+handled before this, so they keep their meaning. A **misspelling** such as
+`.aling`, on the other hand, is let through — with pass-through on, a typo flows
+into the output instead of being reported.
+
 
 ---
 
@@ -2471,7 +2518,7 @@ Diagnostics raised by the assembler itself:
 |---|---|
 | A label collides with a pattern-file symbol | *is a pattern file symbol* |
 | A label is defined more than once | *label already defined* |
-| A line cannot be parsed | *Syntax error* |
+| A line cannot be parsed | *Syntax error* (let through instead when `.passthru` is on — section 3.16) |
 | A referenced label is never defined | *Label undefined* |
 | Malformed assembler or pattern line | *Illegal syntax in assembler line or pattern line* |
 | An EPIC template is not set | *No VLIW instruction-set defined* |
