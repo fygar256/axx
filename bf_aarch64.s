@@ -1,9 +1,18 @@
 ; Brainfuck interpreter
 ; Android AArch64 / Linux
-; GNU as syntax
+; axx syntax
 ;
-; build on Android/Termux:
-;   clang --target=aarch64-linux-android -nostdlib -static -Wl,-e,_start -o bf bf_aarch64.s
+; build, via a linker:
+;   axx.py aarch64.axx bf_aarch64.s -m 183 -o bf.o
+;   ld.lld -static -e _start -o bf bf.o
+;
+; build, without one:
+;   axx.py aarch64.axx bf_aarch64.s -b bf.bin
+;
+; The flat image is .text, .rodata, then .bss at the end; wrap it in an ELF with
+; one RWX PT_LOAD at any 4KB-aligned address, p_filesz = image size,
+; p_memsz = p_filesz + TAPE_SIZE + PROG_SIZE.  The code is position independent
+; (every branch is relative, every data reference is an adrp/:lo12: pair).
 ;
 ; Usage:
 ;   ./bf program.bf
@@ -57,16 +66,25 @@ _open_file:
     b.lt _exit_error
     mov x20, x0                   ; fd
 
-    ; read(fd, prog_buf, PROG_SIZE)
+    ; read(fd, prog_buf, PROG_SIZE) until EOF or the buffer is full.
+    ; One read() is not enough: on a pipe or a FIFO it can return short.
+    adrp x25, prog_buf
+    add  x25, x25, :lo12:prog_buf
+    mov x21, #0                   ; bytes read so far
+_read_loop:
+    mov x2, #PROG_SIZE
+    sub x2, x2, x21               ; room left
+    cbz x2, _read_done
     mov x8, #SYS_read
     mov x0, x20
-    adrp x1, prog_buf
-    add  x1, x1, :lo12:prog_buf
-    mov x2, #PROG_SIZE
+    add x1, x25, x21
     svc #0
     cmp x0, #0
     b.lt _exit_error
-    mov x21, x0                   ; program length
+    b.eq _read_done               ; EOF
+    add x21, x21, x0
+    b _read_loop
+_read_done:                       ; x21 = program length
 
     ; close(fd)
     mov x8, #SYS_close
@@ -107,10 +125,12 @@ main_loop:
 
 op_inc_ptr:
     add x23, x23, #1
+    and x23, x23, #TAPE_SIZE-1    ; wrap; tape is adjacent to prog_buf
     b next
 
 op_dec_ptr:
     sub x23, x23, #1
+    and x23, x23, #TAPE_SIZE-1    ; wrap; below tape is read-only .rodata
     b next
 
 op_inc_val:
