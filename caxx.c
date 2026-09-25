@@ -1279,8 +1279,10 @@ typedef struct {
     char      *asmtext_disp;
 
     /* `.passthru` の設定。0=切（マッチしない行は Syntax error）、
-     * 1=素通し（行末に改行を付ける）、2=素通し（改行を付けない）。 */
+     * 1=素通し（マッチしない行をそのままテキストとして出す）。 */
     int        passthru;
+    /* `.eol` の設定。真なら、出力を出した行ごとに改行を1ワード足す。 */
+    int        eol;
 
     char       cl[4096];
     int        ln;
@@ -1885,6 +1887,7 @@ static void state_init(AsmState *st) {
     st->asmtext = NULL;
     st->asmtext_disp = NULL;
     st->passthru = 0;
+    st->eol = 0;
     sv_init(&st->strsym_names);
     sv_init(&st->strsym_vals);
     st->arrsyms = NULL; st->arrsyms_len = 0; st->arrsyms_cap = 0;
@@ -5176,9 +5179,10 @@ static int dir_free(Assembler *asmb, PatEntry *e){
  * エンコーディング欄が `"<行>"` というテキストテンプレートだったのと同じ扱いに
  * なり、UTF-8 の 1 バイトが 1 ワードになってロケーションカウンタも進む。
  *   .passthru        on と同じ
- *   .passthru::on    素通しし、行末に改行を付ける
- *   .passthru::nonl  素通しするが改行は付けない
+ *   .passthru::on    素通しする
  *   .passthru::off   素通しをやめる（既定）
+ * 行末の改行はこのディレクティブの仕事ではない。1行が1行になるようにしたいとき
+ * は `.eol` を併せて書く。
  * パターンファイルは1行ごとに全部走査されるので、これはファイル全体にかかる
  * 設定として働く（同じファイルに複数書いた場合は最後のものが効く）。
  * axx.py の passthru_processing() と同じ規則である。 */
@@ -5193,11 +5197,40 @@ static int dir_passthru(Assembler *asmb, PatEntry *e){
     { size_t n = strlen(arg);
       while(n > 0 && (arg[n-1]==' '||arg[n-1]=='\t')) arg[--n] = '\0'; }
     if(arg[0]=='\0' || strcmp(arg,"ON")==0)   asmb->st.passthru = 1;
-    else if(strcmp(arg,"NONL")==0)            asmb->st.passthru = 2;
     else if(strcmp(arg,"OFF")==0)             asmb->st.passthru = 0;
     else
-        axx_diagf(1, 0, " error - .passthru: expected 'on', 'nonl' or 'off' "
-                        "('%s').\n", arg);
+        axx_diagf(1, 0, " error - .passthru: expected 'on' or 'off' ('%s').\n", arg);
+    return 1;
+}
+
+/* `.eol[::on|off]`
+ * テキスト変換のための設定で、出力を出した行ごとに改行（`\n`）を1ワード足す。
+ * パターンのテキストテンプレートに `\n` を書いて回らなくても、ソースの1行が
+ * 出力の1行になる。
+ *   .eol         on と同じ
+ *   .eol::on     行ごとに改行を足す
+ *   .eol::off    足さない（既定）
+ * 足すのは出力ワード列の側だけで、標準出力へ流すテキスト（トランスレータとして
+ * の出力）には足さない。そちらは行ごとに改行して出しているので、二重に改行して
+ * しまわないようにしてある。出力ワードを1つも出さなかった行には足さない。
+ * `.vliw` が有効なときは、パケットを壊さないよう何もしない。
+ * パターンファイルは1行ごとに全部走査されるので、これはファイル全体にかかる
+ * 設定として働く（同じファイルに複数書いた場合は最後のものが効く）。
+ * axx.py の eol_processing() と同じ規則である。 */
+static int dir_eol(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".eol") != 0) return 0;
+    char arg[32]; arg[0] = '\0';
+    for(int fi=1; fi<PAT_FIELDS; fi++){
+        const char *p = e->f[fi];
+        while(*p==' '||*p=='\t') p++;
+        if(*p){ axx_strupr_to(arg, p, sizeof(arg)); break; }
+    }
+    { size_t n = strlen(arg);
+      while(n > 0 && (arg[n-1]==' '||arg[n-1]=='\t')) arg[--n] = '\0'; }
+    if(arg[0]=='\0' || strcmp(arg,"ON")==0) asmb->st.eol = 1;
+    else if(strcmp(arg,"OFF")==0)           asmb->st.eol = 0;
+    else
+        axx_diagf(1, 0, " error - .eol: expected 'on' or 'off' ('%s').\n", arg);
     return 1;
 }
 
@@ -8421,7 +8454,7 @@ static void readpat(Assembler *asmb, const char *fn){
                 if(e - a < (int)sizeof(kw1))
                     for(int k = a; k < e; k++) kw1[k-a] = axx_upper_char(fields[0][k]);
             }
-            if(nonblank && strcmp(kw1,".PASSTHRU")!=0){
+            if(nonblank && strcmp(kw1,".PASSTHRU")!=0 && strcmp(kw1,".EOL")!=0){
                 axx_diagf(0, 0, " warning - pattern line has no '::' field separator "
                            "and can never match (a pattern file has no line-"
                            "continuation mechanism, so this is likely a stray "
@@ -10854,7 +10887,8 @@ static int pat_prefix_matches(const char *pat, const char *lin){
 
 /* `.passthru` のとき、マッチしなかった行をそのままテキストとして出す。
  * 出るのは照合にかけた形の行、つまり空白を1つに詰め、`;` コメントと行頭の
- * ラベル定義を落としたあとの行である。`.passthru::on` なら行末に改行を付ける。
+ * ラベル定義を落としたあとの行である。行末の改行は付けない — 1行が1行になる
+ * ようにしたいときは `.eol` を書く。
  * axx.py の _passthru_line() と同じ規則である。 */
 static void passthru_line(Assembler *asmb, const char *l, const char *l2,
                           IntVec *objl_out){
@@ -10862,7 +10896,6 @@ static void passthru_line(Assembler *asmb, const char *l, const char *l2,
     TxtBuf t; txt_init(&t);
     txt_adds(&t, l);
     if(l2 && l2[0]){ txt_addc(&t, ' '); txt_adds(&t, l2); }
-    if(st->passthru == 1) txt_addc(&t, '\n');
     const char *txt = t.b ? t.b : "";
     /* 素通しする行は式として読まないので、照合の途中で立った未定義ラベルの
      * 印はこの行には関わらない。 */
@@ -11043,6 +11076,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         if(dir_map(asmb,i)) continue;
         if(dir_free(asmb,i)) continue;
         if(dir_passthru(asmb,i)) continue;
+        if(dir_eol(asmb,i)) continue;
         if(dir_enum(asmb,i)) continue;
         if(dir_clrenum(asmb,i)) continue;
         if(dir_errmsg(asmb,i)) continue;
@@ -11407,6 +11441,11 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     st->elf_tracking=0;
 
     if(!flag){ free(processed); iv_free(&idxs); iv_free(&objl); return 0; }
+
+    /* `.eol` が有効なら、出力を出した行ごとに改行を1ワード足す。標準出力へ流す
+     * テキストには足さない（そちらは行ごとに改行して出しているので二重になる）。 */
+    if(st->eol && objl.len > 0 && !st->vliwflag)
+        iv_push(&objl, u256_from_u64((uint64_t)'\n'));
 
     const char *rest=processed+new_idx;
     while(*rest==' ') rest++;

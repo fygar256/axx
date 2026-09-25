@@ -919,8 +919,10 @@ class AssemblerState:
         # (int/float) でも文字列 (str) でもよく、`x[3]` や `#x[3]` で引く。
         self.arrsymbols = {}
         # `.passthru` の設定。0=切（マッチしない行は Syntax error）、
-        # 1=素通し（行末に改行を付ける）、2=素通し（改行を付けない）。
+        # 1=素通し（マッチしない行をそのままテキストとして出す）。
         self.passthru = 0
+        # `.eol` の設定。真なら、出力を出した行ごとに改行を1ワード足す。
+        self.eol = 0
 
         # 標準入力から読んだソースを置く一時ファイル（全パスで再利用する）。
         self.stdin_tmp_path: str | None = None
@@ -3948,9 +3950,11 @@ class DirectiveProcessor:
         なってロケーションカウンタもその分進む。
 
             .passthru          on と同じ
-            .passthru::on      素通しし、行末に改行を付ける
-            .passthru::nonl    素通しするが改行は付けない
+            .passthru::on      素通しする
             .passthru::off     素通しをやめる（既定）
+
+        行末の改行はこのディレクティブの仕事ではない。1行が1行になるように
+        したいときは `.eol` を併せて書く。
 
         パターンファイルは1行ごとに全部走査されるので、これはファイル全体に
         かかる設定として働く（同じファイルに複数書いた場合は最後のものが
@@ -3965,13 +3969,48 @@ class DirectiveProcessor:
                 break
         if arg in ('', 'ON'):
             self.state.passthru = 1
-        elif arg == 'NONL':
-            self.state.passthru = 2
         elif arg == 'OFF':
             self.state.passthru = 0
         else:
-            self.state.diag(f" error - .passthru: expected 'on', 'nonl' or 'off' "
+            self.state.diag(f" error - .passthru: expected 'on' or 'off' "
                             f"('{arg}').", set_error=True)
+        return True
+
+    def eol_processing(self, i):
+        """`.eol[::on|off]`
+
+        テキスト変換のための設定で、出力を出した行ごとに改行（`\n`）を
+        1ワード足す。パターンのテキストテンプレートに `\n` を書いて回らなくても、
+        ソースの1行が出力の1行になる。
+
+            .eol          on と同じ
+            .eol::on      行ごとに改行を足す
+            .eol::off     足さない（既定）
+
+        足すのは出力ワード列の側だけで、標準出力へ流すテキスト（トランスレータ
+        としての出力）には足さない。そちらは行ごとに改行して出しているので、
+        二重に改行してしまわないようにしてある。出力ワードを1つも出さなかった行
+        （コメントだけの行や、何も出さないパターン）には足さない。`.vliw` が
+        有効なときは、パケットを壊さないよう何もしない。
+
+        パターンファイルは1行ごとに全部走査されるので、これはファイル全体に
+        かかる設定として働く（同じファイルに複数書いた場合は最後のものが
+        効く）。caxx.c の dir_eol() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.eol':
+            return False
+        arg = ''
+        for f in i[1:]:
+            if f and f.strip():
+                arg = StringUtils.upper(f.strip())
+                break
+        if arg in ('', 'ON'):
+            self.state.eol = 1
+        elif arg == 'OFF':
+            self.state.eol = 0
+        else:
+            self.state.diag(f" error - .eol: expected 'on' or 'off' ('{arg}').",
+                            set_error=True)
         return True
 
     def enum_processing(self, i):
@@ -4904,7 +4943,7 @@ class PatternFileReader:
                              f"name ({var_str!r}).", set_error=True)
 
                 if len(l) == 1:
-                    if l[0].strip() != '' and _kw != '.PASSTHRU':
+                    if l[0].strip() != '' and _kw not in ('.PASSTHRU', '.EOL'):
                         diag(f" warning - pattern line has no '::' field separator "
                              f"and can never match (a pattern file has no line-"
                              f"continuation mechanism, so this is likely a stray "
@@ -9418,6 +9457,8 @@ class Assembler:
                 continue
             if self.directive_proc.passthru_processing(i):
                 continue
+            if self.directive_proc.eol_processing(i):
+                continue
             if self.directive_proc.enum_processing(i):
                 continue
             if self.directive_proc.clrenum_processing(i):
@@ -9640,12 +9681,11 @@ class Assembler:
         """`.passthru` のとき、マッチしなかった行をそのままテキストとして出す。
 
         出るのは照合にかけた形の行、つまり空白を1つに詰め、`;` コメントと
-        行頭のラベル定義を落としたあとの行である。`.passthru::on` なら行末に
-        改行を付ける。caxx.c の passthru_line() と同じ規則である。
+        行頭のラベル定義を落としたあとの行である。行末の改行は付けない —
+        1行が1行になるようにしたいときは `.eol` を書く。
+        caxx.c の passthru_line() と同じ規則である。
         """
         txt = (l + ' ' + l2) if l2 else l
-        if self.state.passthru == 1:
-            txt += '\n'
         # 素通しする行は式として読まないので、照合の途中で立った未定義ラベルの
         # 印はこの行には関わらない。
         self.state.error_undefined_label = False
@@ -9695,6 +9735,12 @@ class Assembler:
 
         if not flag:
             return False
+
+        # `.eol` が有効なら、出力を出した行ごとに改行を1ワード足す。標準出力へ
+        # 流すテキストには足さない（そちらは行ごとに改行して出しているので、
+        # 二重になってしまう）。
+        if self.state.eol and objl and not self.state.vliwflag:
+            objl.append(ord('\n'))
 
         if not self.state.vliwflag or (idx >= len(line) or line[idx] not in (VLIW_SEP, VLIW_STOP)):
             of = len(objl)

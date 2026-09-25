@@ -536,6 +536,9 @@ MOV R!r,!e:: "LD R{{r}},0f{{.float(e)}}"  ->  LD R1,0f16.0
 
 Where the text goes:
 
+- A newline appears only where you write one. To make one source line become one
+  output line, `.eol` (section 3.17) can do it instead of an `\n` in every
+  template.
 - It is emitted as bytes, exactly like `.ascii` (section 4.4): the rendered
   text is encoded in UTF-8 and each byte becomes one output word, so the line
   advances the location counter and lands in the binary and ELF output. A byte
@@ -1799,10 +1802,13 @@ and let the rest through.
 
 ```
 .passthru          /* the same as on */
-.passthru::on      /* let it through, with a newline at the end of the line */
-.passthru::nonl    /* let it through with no newline */
+.passthru::on      /* let lines through */
 .passthru::off     /* stop letting lines through (the default) */
 ```
+
+The newline at the end of a line is not this directive's business. Write `.eol`
+(section 3.17) alongside it when you want one source line to become one output
+line.
 
 A line let through is treated exactly as if a pattern whose encoding field was
 `"<that line>"` had matched: one UTF-8 byte becomes one output word, the
@@ -1813,9 +1819,10 @@ the right address.
 ```
 .bits::8
 .passthru
+.eol
 .map::r::AX,BX,CX
 .setsym::rn::[AX,BX,CX]
-MOV r,!e::"LD {{rn[r]}},0x{{.hex(e)}}\n"
+MOV r,!e::"LD {{rn[r]}},0x{{.hex(e)}}"
 ```
 
 ```
@@ -1835,6 +1842,45 @@ Built-in assembly directives such as `.ascii` and `.resb` (section 5.3) are
 handled before this, so they keep their meaning. A **misspelling** such as
 `.aling`, on the other hand, is let through — with pass-through on, a typo flows
 into the output instead of being reported.
+
+### 3.17 `.eol` — a newline per line
+
+A setting for text conversion: it **appends one newline word (`\n`) to every line
+that produced output**. One source line becomes one output line without writing
+`\n` into every text template.
+
+```
+.eol          /* the same as on */
+.eol::on      /* append a newline per line */
+.eol::off     /* do not (the default) */
+```
+
+```
+.bits::8
+.eol
+.map::r::AX,BX,CX
+.setsym::rn::[AX,BX,CX]
+MOV r,!e::"LD {{rn[r]}},0x{{.hex(e)}}"
+NOP::"NOP"
+```
+
+```
+	mov	ax,0x10     ->  LD AX,0x10\n
+	nop                 ->  NOP\n
+```
+
+- Only the **output words** get it. The text sent to standard output (the
+  translator's own output) does not, because that is already printed one line at
+  a time — so a `-b`/`-o` file gains the newlines while standard output looks
+  exactly as before.
+- A line that produced no output word gets nothing (a comment-only line, a
+  pattern that emits nothing, a directive line such as `.section`). Bytes written
+  directly by `.ascii` and friends (section 5.3) are not affected either.
+- With `.vliw` on it does nothing, so packets stay intact.
+- Lines let through by `.passthru` (section 3.16) get the newline the same way.
+
+The pattern file is scanned in full for every source line, so this acts as a
+setting for the whole file (the last one in the file wins).
 
 
 ---
