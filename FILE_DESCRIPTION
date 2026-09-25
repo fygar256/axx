@@ -39,8 +39,8 @@ passthru.axx                        pattern file for .passthru and .eol: lines
 passthru.s                          test assemble file for passthru.axx
 textmode.axx                        pattern file for .textmode, the `!L` expression
                                     /label capture and `{{.exp(x)}}`: text
-                                    replacement keeping labels and expressions
-                                    spelled as written (manual 3.18)
+                                    replacement keeping labels, expressions and
+                                    `;` comments spelled as written (manual 3.18)
 textmode.s                          test assemble file for textmode.axx
 8080toz80.axx                       pattern file that translates Intel 8080 source
                                     into Zilog Z80 source text: .textmode, `!L`

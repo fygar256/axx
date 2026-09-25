@@ -1308,6 +1308,12 @@ typedef struct {
      * axx.py の state.label_text に対応する。 */
     char       label_text[512];
 
+    /* テキスト置換モードで、その行に書かれていた `;` コメントを `;` ごとそのまま
+     * 覚えておく置き場。書き換えたテキストの後ろに付け直す。1行ごとに作り直し、
+     * コメントが無い行とテキスト置換モードでないときは NULL である。
+     * axx.py の state.comment_text に対応する。 */
+    char      *comment_text;
+
     char       cl[4096];
     int        ln;
     StrVec     fnstack;
@@ -1925,6 +1931,7 @@ static void state_init(AsmState *st) {
     st->captext_len = 0;
     st->captext[0] = '\0';
     st->label_text[0] = '\0';
+    st->comment_text = NULL;
     bufmap_init(&st->buf);
     st->pc = u256_zero();
     st->padding = u256_zero();
@@ -2043,7 +2050,7 @@ static int axx_next_nonspace_is_brace(const char *s, int slen, int idx) {
  * （診断は一切出ない）。文字列は「そのままのバイト列を置く」のがアセンブラの
  * 仕事なので、引用符の中は素通しする。
  *
- * `"..."` と `'x'` の扱いは axx_remove_comment_asm() と同じ規約に従う。
+ * `"..."` と `'x'` の扱いは axx_split_comment_asm() と同じ規約に従う。
  * 常に w <= i なので同じバッファを上書きしても安全。 */
 static void axx_normalize_ws(char *l) {
     int in_str=0, in_ws=0;
@@ -2117,13 +2124,22 @@ static void axx_remove_comment(char *l, int *in_comment) {
     l[w]=0;
 }
 
-/* アセンブリソースの `;` コメントを落とす。
+/* アセンブリソース1行を「コードの部分」と「`;` コメントの部分」に分ける。
+ * コードは l を in-place で詰め直したもの、コメントは cmt_out に `;` から行末まで
+ * を書かれたまま（末尾の空白だけ落として）malloc して返す。コメントが無ければ
+ * NULL である（cmt_out に NULL を渡せばコメントは捨てる — 単に落としたいときの
+ * 使い方）。
  * 文字列 "..." や文字リテラル 'x' の中の `;` は本物のデータなので残す。
  * 引用符の外の `\;` はエスケープとして扱い、バックスラッシュを外した
  * リテラルな `;` に変える（コメントを開始させない）。
  * 文字列が縮むので、読み位置 i と書き位置 w を分けた in-place 詰め直しで行う
- * （常に w <= i なので同じバッファを上書きしても安全）。 */
-static void axx_remove_comment_asm(char *l) {
+ * （常に w <= i なので同じバッファを上書きしても安全。`;` に来た時点で l+i から
+ * 先は手つかずなので、そこからコメントをそのまま写せる）。
+ * コメントを捨てずに返すのは、テキスト置換モード（`.textmode`）がコメントも
+ * 訳したテキストに残すからである。
+ * axx.py の split_comment_asm() と同じ規則である。 */
+static void axx_split_comment_asm(char *l, char **cmt_out) {
+    if(cmt_out) *cmt_out = NULL;
     char *orig = strdup(l);
     int in_str=0;
     int i=0, w=0;
@@ -2151,6 +2167,14 @@ static void axx_remove_comment_asm(char *l) {
             l[w++]=l[i++]; continue;
         }
         if(l[i]==';'&&!in_str){
+            if(cmt_out){
+                char *c = strdup(l+i);
+                if(!c){ perror("strdup"); exit(1); }
+                size_t cn = strlen(c);
+                while(cn>0 && (c[cn-1]==' '||c[cn-1]=='\t'
+                               ||c[cn-1]=='\n'||c[cn-1]=='\r')) c[--cn]=0;
+                *cmt_out = c;
+            }
             int j=w-1;
             while(j>=0&&(l[j]==' '||l[j]=='\t')) j--;
             l[j+1]=0; free(orig); return;
@@ -2182,7 +2206,7 @@ static void axx_remove_comment_asm(char *l) {
  * axx_get_param_to_spc()/axx_get_param_to_eon()）は番兵だけを見ればよい。
  *
  * 文字列 "..." と文字リテラル 'x' の中身はそのまま素通しする。
- * 呼ぶのは axx_remove_comment_asm() が `\;` を解決した後なので、ここで面倒を
+ * 呼ぶのは axx_split_comment_asm() が `\;` を解決した後なので、ここで面倒を
  * 見るのは `\!` だけでよい。 */
 static void axx_resolve_vliw_escapes(char *l) {
     int in_str=0;
@@ -11097,6 +11121,26 @@ static int pat_prefix_matches(const char *pat, const char *lin){
     return 0;
 }
 
+/* テキストを出力ワードの並びにする。1文字が1ワードである。
+ * 出力ワード幅（`.bits`）に収まらない文字があれば警告する（切り捨てそのものは
+ * ワードを書く側が行う）。テキストを出す道すじ（`.passthru` の素通し、テキスト
+ * 置換モードのコメント付け直し）で共通に使う。
+ * axx.py の _text_words() と同じ規則である。 */
+static void text_words(AsmState *st, const char *txt, IntVec *objl_out){
+    uint64_t word_mask = (st->bts > 0) ? axx_word_mask(st->bts) : 0xFFu;
+    int trunc = 0;
+    for(const unsigned char *bp=(const unsigned char *)txt; *bp; bp++){
+        if((uint64_t)*bp > word_mask) trunc = 1;
+        iv_push(objl_out, u256_from_u64((uint64_t)*bp));
+    }
+    if(trunc && !st->pass1_size_mode && should_report_errors(st)){
+        char r[1024]; m_pyrepr(txt, r, sizeof(r));
+        axx_diagf(0, 0, " warning - .passthru: one or more bytes exceed the "
+                        "output word width (%d bit(s)) and were truncated "
+                        "(high bits discarded): %s\n", st->bts, r);
+    }
+}
+
 /* `.passthru` のとき、マッチしなかった行をそのままテキストとして出す。
  * 出るのは照合にかけた形の行、つまり空白を1つに詰め、`;` コメントと行頭の
  * ラベル定義を落としたあとの行である。行末の改行は付けない — 1行が1行になる
@@ -11112,18 +11156,7 @@ static void passthru_line(Assembler *asmb, const char *l, const char *l2,
     /* 素通しする行は式として読まないので、照合の途中で立った未定義ラベルの
      * 印はこの行には関わらない。 */
     st->error_undefined_label = 0;
-    uint64_t word_mask = (st->bts > 0) ? axx_word_mask(st->bts) : 0xFFu;
-    int trunc = 0;
-    for(const unsigned char *bp=(const unsigned char *)txt; *bp; bp++){
-        if((uint64_t)*bp > word_mask) trunc = 1;
-        iv_push(objl_out, u256_from_u64((uint64_t)*bp));
-    }
-    if(trunc && !st->pass1_size_mode && should_report_errors(st)){
-        char r[1024]; m_pyrepr(txt, r, sizeof(r));
-        axx_diagf(0, 0, " warning - .passthru: one or more bytes exceed the "
-                        "output word width (%d bit(s)) and were truncated "
-                        "(high bits discarded): %s\n", st->bts, r);
-    }
+    text_words(st, txt, objl_out);
     free(st->asmtext);
     st->asmtext = strdup(txt);
     if(!st->asmtext){ perror("strdup"); exit(1); }
@@ -11252,6 +11285,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
               if(!raw[0]){
                   char r[600]; m_pyrepr(l2, r, sizeof(r));
                   axx_diagf(1, 0, " error - .INCLUDE directive has no filename: %s\n", r);
+                  free(st->comment_text); st->comment_text = NULL;
                   *idx_out=idx; return 1;
               }
           }
@@ -11283,6 +11317,12 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
               }
               fileassemble(asmb,resolved);
           }
+          /* 取り込んだ行を訳した後にこの行のコメントだけが出てくると、順序が
+           * 入れ替わって読めなくなる。この行のコメントは出さない（取り込んだ側の
+           * 行が自分のコメントを出す）。取り込んだ先の行も1行ごとに comment_text を
+           * 置き換えるので、消すのは戻ってきたここでなければならない。
+           * axx.py の lineassemble2() と同じ規則である。 */
+          free(st->comment_text); st->comment_text = NULL;
           *idx_out=idx; return 1;
       }
     }
@@ -11295,11 +11335,12 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
 
 
     if(!l[0]){
-        /* テキスト置換モードでラベルだけの行は、落とした `label:` を出力に戻す
-         * 仕事が残っているので、出力なしの成功として返す
-         * （付け直すのは lineassemble() の側）。 */
+        /* テキスト置換モードでラベルだけの行とコメントだけの行は、落とした
+         * `label:` と `;` コメントを出力に戻す仕事が残っているので、出力なしの
+         * 成功として返す（付け直すのは lineassemble() の側）。 */
         *idx_out=idx;
-        return (st->textmode && st->label_text[0]) ? 1 : 0;
+        return (st->textmode && (st->label_text[0]
+                || (st->comment_text && st->comment_text[0]))) ? 1 : 0;
     }
 
     int se=0, oerr=0, pln=0;
@@ -11606,8 +11647,18 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     memcpy(line, line_in, lin_len + 1);
 
     axx_normalize_ws(line);
-    axx_remove_comment_asm(line);
-    if(!line[0]){ free(line); return 0; }
+    char *cmt = NULL;
+    axx_split_comment_asm(line, &cmt);
+    /* テキスト置換モードでは、ソースに書かれていた `;` コメントも訳したテキストに
+     * 残す（後ろに付け直すのはこの関数の終わりの側）。落としてしまうと書き換えた
+     * 結果からコメントが消えてしまうためである。そうでないときは今までどおり
+     * 落とす。 */
+    free(st->comment_text); st->comment_text = NULL;
+    if(st->textmode) st->comment_text = cmt; else free(cmt);
+    /* コメントだけの行も、テキスト置換モードなら1行として出す。 */
+    if(!line[0] && !(st->comment_text && st->comment_text[0])){
+        free(line); return 0;
+    }
     axx_resolve_vliw_escapes(line);
 
     for(int _ci = 0; _ci < g_nvars; _ci++){
@@ -11737,6 +11788,35 @@ static int lineassemble(Assembler *asmb, const char *line_in){
         for(int ri=0; ri<st->elf_refs_len; ri++)
             if(st->elf_refs[ri].word_idx >= 0) st->elf_refs[ri].word_idx += plen;
         free(lp.b);
+    }
+
+    /* テキスト置換モードでは、ソースにあった `;` コメントを訳したテキストの後ろに
+     * 付け直す。照合のために落としてあるので、ここで書かれていたとおりの綴りで
+     * 戻す。テキストを作った行と、コメントだけ・ラベルだけの行が対象で、テキスト
+     * ではなく数値を出した行（`.ascii` などの組み込みディレクティブ）はデータを
+     * 壊さないようそのままにする。後ろに足すだけなので、ラベルを前に足すときと
+     * 違って ELF のワード位置はずれない。
+     * axx.py の lineassemble() と同じ規則である。 */
+    if(st->textmode && st->comment_text && st->comment_text[0] && !st->vliwflag
+       && (st->asmtext || objl.len == 0)){
+        TxtBuf cs; txt_init(&cs);
+        if(st->asmtext && st->asmtext[0]) txt_addc(&cs, ' ');
+        txt_adds(&cs, st->comment_text);
+        const char *sfx = cs.b ? cs.b : "";
+        text_words(st, sfx, &objl);
+        TxtBuf nt; txt_init(&nt);
+        if(st->asmtext) txt_adds(&nt, st->asmtext);
+        txt_adds(&nt, sfx);
+        free(st->asmtext);
+        st->asmtext = nt.b ? nt.b : strdup("");
+        if(!st->asmtext){ perror("strdup"); exit(1); }
+        TxtBuf nd; txt_init(&nd);
+        txt_addc(&nd, '"');
+        txt_add_escaped(&nd, st->asmtext);
+        txt_addc(&nd, '"');
+        free(st->asmtext_disp);
+        st->asmtext_disp = nd.b ? nd.b : strdup("");
+        free(cs.b);
     }
 
     /* `.eol` が有効なら、出力を出した行ごとに改行を1ワード足す。標準出力へ流す

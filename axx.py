@@ -926,6 +926,10 @@ class AssemblerState:
         # 綴りをそのまま覚えておく置き場。書き換えたテキストの前に付け直す。
         # 1行ごとに作り直す。
         self.label_text = ''
+        # テキスト置換モード（`.textmode`）で、その行に書かれていた `;` コメントを
+        # `;` ごとそのまま覚えておく置き場。書き換えたテキストの後ろに付け直す。
+        # 1行ごとに作り直す。テキスト置換モードでないときは常に空文字である。
+        self.comment_text = ''
         # `.setsym::名前::"文字列"` で登録された文字列シンボル。値が数値では
         # ないので式には出せず、文字列テンプレート（3.5.2）の中でだけ使える。
         # 名前は大文字化して持つ（`.setsym` の数値シンボルと同じ規約）。
@@ -1253,7 +1257,7 @@ class StringUtils:
         生のタブは空白へ化けていた（診断は一切出ない）。文字列は「そのままの
         バイト列を置く」のがアセンブラの仕事なので、引用符の中は素通しする。
 
-        `"..."` と `'x'` の扱いは remove_comment_asm() と同じ規約に従う。
+        `"..."` と `'x'` の扱いは split_comment_asm() と同じ規約に従う。
         """
         out = []
         in_dquote = False
@@ -1334,12 +1338,20 @@ class StringUtils:
         return ''.join(out), in_comment
 
     @staticmethod
-    def remove_comment_asm(l):
-        """アセンブリソースの `;` コメントを落とす。
+    def split_comment_asm(l):
+        """アセンブリソース1行を「コードの部分」と「`;` コメントの部分」に分ける。
+
+        返すのは (コード, コメント) の対。コメントは `;` から行末までを書かれた
+        まま（末尾の空白だけ落として）返し、コメントが無ければ空文字を返す。
 
         ただし文字列 "..." や文字リテラル 'x' の中の `;` は本物のデータなので
-        残す。引用符の外の `\\;` はエスケープとして扱い、バックスラッシュを外した
-        リテラルな `;` に変える（コメントを開始させない）。
+        残す（コメントの始まりとはしない）。引用符の外の `\\;` はエスケープとして
+        扱い、バックスラッシュを外したリテラルな `;` に変える（コメントを
+        開始させない）。
+
+        コメントを捨てずに返すのは、テキスト置換モード（`.textmode`、3.18 節）が
+        コメントも訳したテキストに残すからである。caxx.c の
+        axx_split_comment_asm() と同じ規則である。
         """
         in_dquote = False
         out = []
@@ -1370,13 +1382,13 @@ class StringUtils:
                 i = j
                 continue
             elif ch == ';' and not in_dquote:
-                return ''.join(out).rstrip()
+                return ''.join(out).rstrip(), l[i:].rstrip()
 
             out.append(ch)
             i += 1
         if in_dquote:
             diag(f" warning - unterminated string literal in line: {l!r}", set_error=False)
-        return ''.join(out).rstrip()
+        return ''.join(out).rstrip(), ''
 
     @staticmethod
     def resolve_vliw_escapes(l):
@@ -1397,7 +1409,7 @@ class StringUtils:
         番兵だけを見ればよく、取り違えが原理的に起きない。
 
         文字列 "..." と文字リテラル 'x' の中身はそのまま素通しする。
-        呼ぶのは remove_comment_asm() が `\\;` を解決しコメントを落とした後なので、
+        呼ぶのは split_comment_asm() が `\\;` を解決しコメントを分けた後なので、
         ここで面倒を見るのは `\\!` だけでよい。
         """
         out = []
@@ -9568,6 +9580,10 @@ class Assembler:
             return 0, [], True, idx
         # `.include` は取り込んだ行そのものが訳されて出るので、この行は出さない。
         if self.include_asm(l, l2):
+            # 取り込んだ行を訳した後にこの行のコメントだけが出てくると、順序が
+            # 入れ替わって読めなくなる。この行のコメントは出さない（取り込んだ
+            # 側の行が自分のコメントを出す）。
+            self.state.comment_text = ''
             return 0, [], True, idx
         if self.asm_directive_proc.align_processing(l, l2):
             return self._dir_line_done(l, l2, idx)
@@ -9583,10 +9599,11 @@ class Assembler:
             return self._dir_line_done(l, l2, idx)
 
         if l == "":
-            # テキスト置換モードでラベルだけの行は、落とした `label:` を出力に
-            # 戻す仕事が残っているので、出力なしの成功として返す
-            # （付け直すのは lineassemble() の側）。
-            if self.state.textmode and self.state.label_text:
+            # テキスト置換モードでラベルだけの行とコメントだけの行は、落とした
+            # `label:` と `;` コメントを出力に戻す仕事が残っているので、出力なしの
+            # 成功として返す（付け直すのは lineassemble() の側）。
+            if self.state.textmode and (self.state.label_text
+                                        or self.state.comment_text):
                 return 0, [], True, idx
             return 0, [], False, idx
 
@@ -9892,6 +9909,24 @@ class Assembler:
 
         return idxs, objl, True, idx
 
+    def _text_words(self, txt):
+        """テキストを出力ワードの並びにする。
+
+        1文字が1ワードである。出力ワード幅（`.bits`）に収まらない文字があれば
+        警告する（切り捨てはワードを書く側が行う）。テキストを出す道すじ
+        （`.passthru` の素通し、テキスト置換モードのコメント付け直し）で共通に
+        使う。caxx.c の text_words() と同じ規則である。
+        """
+        words = list(txt.encode('utf-8', errors='surrogateescape'))
+        _word_mask = (1 << self.state.bts) - 1 if self.state.bts > 0 else 0xFF
+        if (any(_v > _word_mask for _v in words)
+                and not self.state._pass1_size_mode
+                and self.state.should_report_errors()):
+            self.state.diag(f" warning - .passthru: one or more bytes exceed the "
+                            f"output word width ({self.state.bts} bit(s)) and were "
+                            f"truncated (high bits discarded): {txt!r}", set_error=False)
+        return words
+
     def _passthru_line(self, l, l2, idx):
         """`.passthru` のとき、マッチしなかった行をそのままテキストとして出す。
 
@@ -9904,22 +9939,21 @@ class Assembler:
         # 素通しする行は式として読まないので、照合の途中で立った未定義ラベルの
         # 印はこの行には関わらない。
         self.state.error_undefined_label = False
-        objl = list(txt.encode('utf-8', errors='surrogateescape'))
-        _word_mask = (1 << self.state.bts) - 1 if self.state.bts > 0 else 0xFF
-        if (any(_v > _word_mask for _v in objl)
-                and not self.state._pass1_size_mode
-                and self.state.should_report_errors()):
-            self.state.diag(f" warning - .passthru: one or more bytes exceed the "
-                            f"output word width ({self.state.bts} bit(s)) and were "
-                            f"truncated (high bits discarded): {txt!r}", set_error=False)
+        objl = self._text_words(txt)
         self.state.asmtext = txt
         self.state.asmtext_disp = '"%s"' % asmtext_escaped(txt)
         return 0, objl, True, idx
 
     def lineassemble(self, line):
         line = StringUtils.normalize_ws(line)
-        line = StringUtils.remove_comment_asm(line)
-        if line == '':
+        line, _cmt = StringUtils.split_comment_asm(line)
+        # テキスト置換モードでは、ソースに書かれていた `;` コメントも訳した
+        # テキストに残す（後ろに付け直すのはこの関数の終わりの側）。落として
+        # しまうと書き換えた結果からコメントが消えてしまうためである。
+        # そうでないときは今までどおり落とす。
+        self.state.comment_text = _cmt if self.state.textmode else ''
+        # コメントだけの行も、テキスト置換モードなら1行として出す。
+        if line == '' and not self.state.comment_text:
             return False
         line = StringUtils.resolve_vliw_escapes(line)
 
@@ -9974,6 +10008,22 @@ class Assembler:
                 self.state._elf_label_refs_seen = [
                     (_n, _v, (_w + len(_lbytes)) if _w >= 0 else _w)
                     for (_n, _v, _w) in self.state._elf_label_refs_seen]
+
+        # テキスト置換モードでは、ソースにあった `;` コメントを訳したテキストの
+        # 後ろに付け直す。照合のために落としてあるので、ここで書かれていたとおりの
+        # 綴りで戻す。テキストを作った行と、コメントだけ・ラベルだけの行が対象で、
+        # テキストではなく数値を出した行（`.ascii` などの組み込みディレクティブ）は
+        # データを壊さないようそのままにする。後ろに足すだけなので、ラベルを前に
+        # 足すときと違って ELF のワード位置はずれない。
+        if (self.state.textmode and self.state.comment_text
+                and not self.state.vliwflag
+                and (self.state.asmtext is not None or not objl)):
+            _ctxt = self.state.comment_text
+            _cur = self.state.asmtext or ''
+            _csfx = (' ' + _ctxt) if _cur else _ctxt
+            objl.extend(self._text_words(_csfx))
+            self.state.asmtext = _cur + _csfx
+            self.state.asmtext_disp = '"%s"' % asmtext_escaped(self.state.asmtext)
 
         # `.eol` が有効なら、出力を出した行ごとに改行を1ワード足す。標準出力へ
         # 流すテキストには足さない（そちらは行ごとに改行して出しているので、

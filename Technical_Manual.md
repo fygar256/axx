@@ -1842,7 +1842,9 @@ MOV r,!e::"LD {{rn[r]}},0x{{.hex(e)}}"
 
 What comes out is **the line as it was offered to the matcher**: tabs and runs of
 spaces squeezed to one space, a `;` comment removed, and a leading label
-definition removed (the label is still defined).
+definition removed (the label is still defined). In text replacement mode
+(section 3.18) that comment and that label definition come back into the output
+spelled as they were written.
 
 The pattern file is scanned in full for every source line, so `.passthru` acts as
 a setting for the whole file (the last one in the file wins).
@@ -1884,7 +1886,9 @@ NOP::"NOP"
   output looks exactly as before.
 - A line that produced no output word gets nothing (a comment-only line, a
   pattern that emits nothing, a directive line such as `.section`). Bytes written
-  directly by `.ascii` and friends (section 5.3) are not affected either.
+  directly by `.ascii` and friends (section 5.3) are not affected either. In text
+  replacement mode (section 3.18) a comment-only line and a directive line do
+  emit text, so those do get the newline.
 - With `.vliw` on it does nothing, so packets stay intact.
 - Lines let through by `.passthru` (section 3.16) get the newline the same way.
 
@@ -1894,7 +1898,7 @@ setting for the whole file (the last one in the file wins).
 ### 3.18 `.textmode` — text replacement mode
 
 The setting for rewriting a source into text in another notation (using axx as a
-translator). It does three things at once.
+translator). It does four things at once.
 
 ```
 .textmode          /* same as on */
@@ -1906,9 +1910,11 @@ translator). It does three things at once.
 2. Turns `.eol` (3.17) on — one source line becomes one output line.
 3. An **undefined label inside what `!L` captured is not an error**. Its value
    becomes 0, and `{{.exp()}}` still emits the text as written.
+4. A `;` comment in the source is **not dropped: it comes out after the rewritten
+   text** (below).
 
-The three move together, so to set one of them differently write that directive
-after this line (directives take effect in the order written).
+`.passthru` and `.eol` move together, so to set one of them differently write that
+directive after this line (directives take effect in the order written).
 
 #### `!L<variable>` — the expression/label capture
 
@@ -1972,6 +1978,33 @@ The label's value points at the **start of what the line emits, the label's own
 spelling included**. Both passes emit the same text, so the size of the line and
 the value of the label agree across the two passes.
 
+#### `;` comments
+
+In text replacement mode a `;` comment in the source **stays in the output spelled
+as written**. It comes after the rewritten text with a single blank between them.
+
+```
+	mvi	c,9		; BDOS function 9    ->  LD C,9 ; BDOS function 9
+	.org	0x100		; loaded at 0x100    ->  .org 0x100 ; loaded at 0x100
+here:	; a comment after a label only       ->  here: ; a comment after a label only
+; a whole-line comment                       ->  ; a whole-line comment
+```
+
+- A line holding nothing but a comment comes out as **its own line**. Outside text
+  replacement mode nothing is emitted for it, as before.
+- A `;` inside a string `"..."` or a character literal `'x'` is real data, so it
+  does not start a comment. A `;` written as `\;` becomes a plain `;` with the
+  backslash taken off and does not start one either (section 3.2).
+- The comment is attached to a line that emitted text and to a comment-only or
+  label-only line. A line that emitted numbers rather than text is left alone, so
+  data is not corrupted. With `.vliw` on it does nothing, as `.eol` does not, so
+  packets stay intact.
+- The comment on an `.include` line is not echoed: the lines it pulls in are
+  translated first, and a comment coming out after them would read out of order.
+- The label's value points at the start of the line, the comment included. Both
+  passes emit the same text, so the size of the line and the value of the label
+  agree across the two passes.
+
 #### Built-in directive lines
 
 In text replacement mode a line holding one of axx's own built-in assembly
@@ -2010,18 +2043,34 @@ writes Zilog Z80 source text for the same program.
 axx 8080toz80.axx hello8080.s -V > helloz80.s
 ```
 
+`hello8080.s`, the bundled input (its comments are written in Japanese):
+
 ```
-        .org 0x100                    .org 0x100
-start:                                start:
-        mvi c,9               ->      LD C,9
-        lxi d,msg                     LD DE,msg
-        call 0x0005                   CALL 0x0005
-        ret                           RET
-msg:    db 'Hello, world$'            msg: db 'Hello, world$'
+        .org 0x100        ; .COM は 0x100 にロードされる
+start:
+        mvi c,9          ; BDOS function 9 = print $-terminated string
+        lxi d,msg        ; DE = アドレス of msg
+        call 0x0005      ; BDOS entry at 0005h
+        ret              ; CP/M に戻る
+
+msg:    db 'Hello, world$'
+```
+
+and the `helloz80.s` that comes out:
+
+```
+.org 0x100 ; .COM は 0x100 にロードされる
+start:
+LD C,9 ; BDOS function 9 = print $-terminated string
+LD DE,msg ; DE = アドレス of msg
+CALL 0x0005 ; BDOS entry at 0005h
+RET ; CP/M に戻る
+msg: db 'Hello, world$'
 ```
 
 Its operands are captured with `!L` and emitted with `{{.exp()}}`, so `msg` stays
-a label and `0x0005` keeps the spelling it was written with. The `helloz80.s` that
+a label and `0x0005` keeps the spelling it was written with, and every comment
+stays where it was written. The `helloz80.s` that
 comes out assembles as it is with `z80.axx`. Sending the text to standard output
 is `-V`'s job, so without it nothing appears on screen (`-b` still writes the
 same text to a file).
@@ -2112,7 +2161,8 @@ Determined by the order in which you write the values in `binary_list`.
 ## 5. Assembly source reference
 
 Lines read from a source file or from stdin are called **assembly lines**.
-Comments start with `;`.
+Comments start with `;`. A comment is dropped, except in text replacement mode
+(section 3.18), where it stays in the output spelled as written.
 
 ### 5.1 Labels
 
@@ -2945,7 +2995,7 @@ The x86_64 pattern file is also maintained separately at
 | **4004.axx** | 5.4 KB | 53 | **4004.s** | Intel 4004 |
 | **test.axx** | 1.1 KB | 40 | **test.s** | Fragments of several ISAs; test only |
 | **8080toz80.axx** | 5.8 KB | 117 | **hello8080.s** | Intel 8080 to Zilog Z80 source translator; `.textmode`, `!L` and `{{.exp()}}` (3.18) at work |
-| **textmode.axx** | 1.5 KB | 13 | **textmode.s** | `.textmode`, `!L` and `{{.exp()}}` (3.18); test only |
+| **textmode.axx** | 1.8 KB | 13 | **textmode.s** | `.textmode`, `!L`, `{{.exp()}}` and `;` comments (3.18); test only |
 | **arrindex.axx** | 860 B | 14 | **arrindex.s** | Array symbols: bare names as items, a name as a subscript, `.index` (3.6.1); test only |
 | **passthru.axx** | 686 B | 6 | **passthru.s** | `.passthru` and `.eol` (3.16 / 3.17); test only |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
