@@ -1,0 +1,23 @@
+/*  ==================================================================
+/*  arrindex.axx -- array symbols, name subscripts and .index
+/*
+/*  Technical_Manual 3.6.1 のテスト。素の名前の項目、名前による添字、
+/*  `.index` が paxx と caxx で一致することを確かめる。
+/*  ==================================================================
+
+.bits::8
+
+.map::r::AX,BX,CX
+.setsym::arrb::[R0,R1,R2]
+.setsym::arra::[AX,BX,CX]
+.setsym::copy::arrb
+.setsym::var1::BX
+.setsym::st::"CX"
+.setsym::nums::[1,2,3+4,#CX]
+
+MOV r,!e::"LD {{arrb[r]}},0x{{.hex(e)}}\n"
+IDX::"{{.index arrb[var1]}} {{.index arra[var1]}} {{.index(copy[st])}}\n"
+LIT::"{{.index arrb[\"CX\"]}} {{.index arra[\"CX\"]}} {{arrb[\"CX\"]}}\n"
+NAME::"{{var1}} {{arrb}} {{arra[var1]}} {{copy[2]}}\n"
+NUM::"{{nums}} {{nums[2]}} {{nums[3]}}\n"
+TEST v::"LD A,{{.index arra[v]}}\n"

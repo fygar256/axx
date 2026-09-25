@@ -15,6 +15,10 @@ caxx x86_64.axx hello.s -b b11
 caxx x86_64m.axx hello.s -b b12
 caxx aarch64_logical_mini.axx aarch64_logical_mini_demo.s -b b13
 caxx bf.axx bf.s -b b14
+caxx arrindex.axx arrindex.s -b b15
+caxx passthru.axx passthru.s -b b16
+caxx textmode.axx textmode.s -b b17
+caxx 8080toz80.axx hello8080.s -b b18
 
 paxx 4004.axx 4004.s -b a0
 paxx z80.axx z80.s -b a1
@@ -31,6 +35,10 @@ paxx x86_64.axx hello.s -b a11
 paxx x86_64m.axx hello.s -b a12
 paxx aarch64_logical_mini.axx aarch64_logical_mini_demo.s -b a13
 paxx bf.axx bf.s -b a14
+paxx arrindex.axx arrindex.s -b a15
+paxx passthru.axx passthru.s -b a16
+paxx textmode.axx textmode.s -b a17
+paxx 8080toz80.axx hello8080.s -b a18
 
 FAIL=0
 
@@ -49,6 +57,10 @@ cmp a11 b11 || FAIL=1
 cmp a12 b12 || FAIL=1
 cmp a13 b13 || FAIL=1
 cmp a14 b14 || FAIL=1
+cmp a15 b15 || FAIL=1
+cmp a16 b16 || FAIL=1
+cmp a17 b17 || FAIL=1
+cmp a18 b18 || FAIL=1
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"
