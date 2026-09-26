@@ -7,18 +7,16 @@
 ; % hello
 ; hello, world
 ;
-.export _hello,_start,len
+.export _hello,_hello2,len
 .section .text
-_start:
 _hello:
+_hello2:
         mov     eax, 4      ; sys_write (04)
         mov     edi, 1      ; stdout    (01)
         mov     edx,len     ; length    (13)
         mov     rsi,msg     ; address
         syscall
-        mov     edi, 0      ; return 0
-        mov     eax, 1
-        syscall
+        ret
 msg:     .ascii      "hello, world\n"
 len:     .equ     $$ - msg
 .endsection

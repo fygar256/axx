@@ -198,8 +198,8 @@ axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV]
 |---|---|
 | `-b OUTFILE` | Write raw binary |
 | `-o OBJ_FILE` | Write ELF relocatable object; class selected by `-f` |
-| `-f {32,64}` | ELF class for `-o`. Default 64 |
-| `-m MACHINE` | ELF `e_machine` value. Default 62 (`EM_X86_64`) |
+| `-f {32,64}` | ELF class for `-o`. Default: the pattern file's `.elfclass`, else the machine's conventional class (section 3.7.7) |
+| `-m MACHINE` | ELF `e_machine` value. Default: the pattern file's `.elfmachine`, else 62 (`EM_X86_64`). A number outside the built-in table is accepted too (section 3.7.7) |
 | `--osabi ELF_OSABI` | ELF OSABI. Default FreeBSD; FreeBSD/Linux, case-insensitive |
 | `-e EXPORT_TSV` | Export labels to TSV (plain format) |
 | `-E EXPORT_ELF_TSV` | Export labels to TSV (with ELF section flags) |
@@ -220,8 +220,8 @@ templates, plain.
 ### 2.2 ELF output
 
 `-o` produces a relocatable object and works on FreeBSD and Linux. It is not
-limited to x86_64. `-m` accepts any architecture axx has relocation numbering
-for:
+limited to x86_64. `-m` accepts the architectures axx has built-in relocation
+numbering for:
 
 | Value | Machine | Value | Machine |
 |---|---|---|---|
@@ -233,9 +233,19 @@ for:
 | 40 | ARM | | |
 | 42 | SuperH | | |
 
-`-f` selects ELF32 or ELF64 independently of `-m`. A combination that is not
-conventional for the chosen machine (for example `-m 62 -f 32`, the real x32
-ABI layout) is honored, with a warning.
+An `e_machine` number outside this table may be given to `-m` as well. The
+relocation types, the ELF class, RELA/REL and the header fields then come from
+the pattern file's ELF description (section 3.7.7); with no declarations, a
+reference whose type cannot be determined gets no relocation entry, rather than
+a guessed type number. With no `-m` at all, the pattern file's `.elfmachine` is
+the target, and failing that 62 (x86-64).
+
+`-f` selects ELF32 or ELF64 independently of `-m`. Without it the class comes
+from the pattern file's `.elfclass`, and failing that from the conventional
+class of the machine (ELF32 for the 32-bit machines, ELF64 for the 64-bit ones
+and for a machine outside the table). A combination that is not conventional for
+the chosen machine (for example `-m 62 -f 32`, the real x32 ABI layout) is
+honored, with a warning.
 
 ### 2.3 Differences in the C version
 
@@ -1303,7 +1313,7 @@ goes out as 0 and the relocation carries the whole meaning.
 #### 3.7.6 `.elftype` — naming a relocation type yourself
 
 ```
-.elftype::<name>::<value>
+.elftype::<name>::<value>[::<width>[::<pc-relative>]]
 ```
 
 Gives a name to an ELF relocation type number. The name can then be written
@@ -1355,14 +1365,122 @@ CALLX !t :: 0xe8,t,t>>8,t>>16,t>>24
         callx   ext1        ->  R_X86_64_GOTPCRELX  ext1 + 0
 ```
 
-Only the number is given, so the field width and whether the type is PC-relative
-are not known from the name table. When the number is one the table does carry,
-its width and PC-relativeness are taken from there; when it is not, the type
-counts as "any width" (it passes the width check of `.reloctype` as well). For a
-type that packs its value into bit fields of an instruction word, combine it with
-`.reloc` (section 3.7.5).
+**Width and PC-relativeness (both optional).** The fourth field is the width in
+bytes of the field this type rewrites (1, 2, 4 or 8 — any value from 1 to 8 is
+accepted), and the fifth field, when it is not 0, marks the type as PC-relative.
+
+```
+.elftype::abs16::2::2          /* a 2-byte absolute reference    */
+.elftype::pcrel16::4::2::1     /* a 2-byte PC-relative reference */
+```
+
+With both left out: when the number is one the machine's name table carries, its
+width and PC-relativeness are taken from there; when it is not, the type counts
+as "any width" (it passes the width check of `.reloctype` as well). On a machine
+with no built-in name table, write the width for any type that `.elfwidth` or
+`.elfextern` (section 3.7.7) will reach, because the addend is computed from the
+width of the field. For a type that packs its value into bit fields of an
+instruction word, combine it with `.reloc` (section 3.7.5).
 
 The bundled `elftype.axx` / `elftype.s` are a worked example.
+
+#### 3.7.7 Describing the ELF — writing `-o` for a machine axx does not know
+
+axx carries built-in relocation numbering for eleven machines — i386(3),
+m68k(4), PowerPC(20), PowerPC64(21), s390x(22), ARM(40), SuperH(42),
+SPARCV9(43), x86-64(62), AArch64(183) and RISC-V(243). Any other `e_machine`
+can be written with `-o` as well, as long as the pattern file says what the
+ELF object should look like.
+
+| Declaration | What it sets |
+|---|---|
+| `.elfmachine::<number>[::<name>]` | the `e_machine` number (and the name used in diagnostics) |
+| `.elfclass::<32>` / `<64>` | the ELF class (ELF32 / ELF64) |
+| `.elfrela::<1>` / `<0>` | RELA (1, also spelled `rela`) or REL (0, `rel`) |
+| `.elftype::<name>::<number>[::<width>[::<pc-relative>]]` | a relocation type (section 3.7.6) |
+| `.elfwidth::<bytes>::<type>` | the default type for a reference of that width |
+| `.elfextern::<type>` | the default type for `.extern` with no type name |
+| `.elfdwarf::<type>` | the absolute type the `-g` DWARF output uses |
+| `.elfheader::<field>::<value>` | a field of the ELF header |
+
+- Every declaration is a difference *laid over* the built-in table selected with
+  `-m`. On a machine that is in the table, only what you write is replaced — so
+  adding one type name to x86-64 with `.elftype`, or only an
+  `.elfheader::flags`, works just as well.
+- Wherever `<type>` is written, an `.elftype` name, a built-in name, or a type
+  number (decimal or `0x` hex) is accepted. Names are matched without regard to
+  case.
+- The width of `.elfwidth` is 1, 2, 4 or 8. A reference whose source wrote no
+  `::<type name>` looks up this table by the byte width of its field.
+- The declarations may be written anywhere. Like `.elftype` they are all
+  collected once the pattern file has been read, so a declaration below its
+  first use still resolves.
+
+**How they relate to `-m` and `-f`.** With no `-m`, the number from
+`.elfmachine` is the target; with `-m`, that wins (so one pattern file can be
+used for more than one number). `-f` works the same way: without it the class
+comes from `.elfclass`, and failing that from the conventional class of the
+machine (ELF64 for a machine that is not in the built-in table).
+
+**When a declaration is missing.** A reference whose type cannot be determined
+gets no relocation entry, rather than a guessed (and wrong) type number; `-d`
+lists the places that were skipped. Writing `-o` with an `-m` that is not in the
+built-in table warns about exactly this. The `-g` DWARF sections are likewise
+written only when the absolute type is known, from `.elfdwarf` or the built-in
+table.
+
+**The fields `.elfheader` writes.**
+
+| Field | ELF header field | Default | Range |
+|---|---|---|---|
+| `type` | `e_type` | 1 (`ET_REL`) | 0-0xFFFF |
+| `flags` | `e_flags` | 0 | 0-0xFFFFFFFF |
+| `version` | `e_version` | 1 (`EV_CURRENT`) | 0-0xFFFFFFFF |
+| `entry` | `e_entry` | 0 | 0-0x7FFFFFFFFFFFFFFF |
+| `osabi` | `e_ident[EI_OSABI]` | the `--osabi` value (0 by default) | 0-0xFF |
+| `abiversion` | `e_ident[EI_ABIVERSION]` | 0 | 0-0xFF |
+
+This is what machine-specific `e_flags` (the ARM EABI version, the RISC-V ABI
+marks) are written with. A field you do not write keeps its default. The values
+are constant expressions.
+
+**Example.** A description of EM_MSP430 (105), a machine axx has no built-in
+table for.
+
+```
+.bits::8
+
+.elfmachine::105::MSP430
+.elfclass::32
+.elfrela::1
+
+.elftype::abs32::1::4
+.elftype::abs16::2::2
+.elftype::pcrel16::4::2::1
+.elftype::abs8::3::1
+
+.elfwidth::4::abs32
+.elfwidth::2::abs16
+.elfwidth::1::abs8
+.elfextern::abs16
+.elfdwarf::abs32
+
+.elfheader::flags::0x2a
+.elfheader::abiversion::1
+
+CALL !t :: 0xb0,0x12,t,t>>8
+.reloc::t::pcrel16
+JMP !t :: 0x00,0x3c,t,t>>8
+.clrreloc::t
+```
+
+```
+        .extern ext1            ->  R_MSP430_ABS16   ext1 + 0
+        call    ext1
+        jmp     start           ->  R_MSP430_PCR16   start + 6
+```
+
+The bundled `elfgen.axx` / `elfgen.s` are a worked example.
 
 ### 3.8 Optional parts (`[[ ]]`)
 
@@ -2399,7 +2517,9 @@ ld b,9
   `.elftype` in the pattern file (section 3.7.6). An unrecognised name is
   warned about and ignored. Write the declaration before the references.
 - `.extern` declares that a name is resolved elsewhere. A relocation type may
-  be attached to an individual name with `:`.
+  be attached to an individual name with `:`. The default type used when no name
+  is written is fixed per machine, and `.elfextern` in the pattern file
+  (section 3.7.7) changes it.
 
 `.extern` and `-i` are designed to be used together: `-i` supplies the actual
 address of an external label and `.extern` declares that the name is resolved
@@ -3076,6 +3196,7 @@ The x86_64 pattern file is also maintained separately at
 | **arrindex.axx** | 860 B | 14 | **arrindex.s** | Array symbols: bare names as items, a name as a subscript, `.index` (3.6.1); test only |
 | **passthru.axx** | 686 B | 6 | **passthru.s** | `.passthru` and `.eol` (3.16 / 3.17); test only |
 | **elftype.axx** | 1.5 KB | 15 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
+| **elfgen.axx** | 2.7 KB | 24 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
 | **vliw.axx** | 178 B | 10 | **vliw.s** | Non-EPIC VLIW; test only |
 | **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck virtual CPU; hello-world demo. Bundled, but not part of `test1` |
@@ -3088,8 +3209,9 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 compares the `-b` raw binaries. For the two pairs that use `.textmode`
 (`textmode.axx` and `8080toz80.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
-`elftype.s` pair is about relocations, so for that one the `-o` ELF objects are
-compared, for twenty-three comparisons in all.
+`elftype.s` and `elfgen.axx` / `elfgen.s` pairs are about relocations and the
+ELF header, so for those two the `-o` ELF objects are compared, for twenty-four
+comparisons in all.
 
 The `aarch64.axx` / `aarch64.s` pair is much the slowest of them: the Python
 implementation takes about twenty seconds on it, against about a second for the

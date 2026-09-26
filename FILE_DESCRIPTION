@@ -56,6 +56,15 @@ elftype.axx                         pattern file for .elftype: a relocation type
                                     (manual 3.7.6)
 elftype.s                           test assemble file for elftype.axx. build it
                                     with -o and -m 62 to see the relocations
+elfgen.axx                          pattern file for the ELF description
+                                    directives .elfmachine / .elfclass /
+                                    .elfrela / .elfwidth / .elfextern /
+                                    .elfdwarf / .elfheader: the whole ELF
+                                    machine description of EM_MSP430, a machine
+                                    axx has no built-in table for (manual 3.7.7)
+elfgen.s                            test assemble file for elfgen.axx. build it
+                                    with -o to see the relocations and the
+                                    ELF header fields
 8080toz80.axx                       pattern file that translates Intel 8080 source
                                     into Zilog Z80 source text: .textmode, `!L`
                                     captures and `{{.exp()}}`, so labels and
@@ -104,6 +113,11 @@ axx_introduction_paper.md           introduction paper (Japanese)
 axx_introduction_paper_en.md        introduction paper (English)
 axx-promotion.md                    introductory article (Japanese)
 axx-promotion-en.md                 introductory article (English)
+elf_generalzation.md                the generalization of the ELF output:
+                                    the .elfmachine / .elfclass / .elfrela /
+                                    .elfwidth / .elfextern / .elfdwarf /
+                                    .elfheader declarations (Japanese)
+elf_generalization_en.md            the same (English)
 axxsemantics                        denotational semantics of axx (Japanese)
 FILE_DESCRIPTION                    this file
 makefile                            build/install rules for caxx and paxx

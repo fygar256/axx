@@ -314,7 +314,9 @@ def _lead_caps(pat_text):
 
 
 _HOIST_TEXT_ONLY = ('.check', '.clrcheck', '.reloc', '.clrreloc',
-                    '.symbolc', '.passthru', '.eol', '.textmode')
+                    '.symbolc', '.passthru', '.eol', '.textmode',
+                    '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
+                    '.elfextern', '.elfdwarf', '.elfheader')
 
 
 def _pat_text_dynamic(t):
@@ -391,6 +393,10 @@ def _pat_dir_line_invariant(i):
         # 型名の表は行ごとに作り直さないので、同じ宣言を毎行やり直す必要はない。
         if not i[1] or any(ch in "!$#@'" for ch in i[1]):
             return False
+        # 幅欄・PC相対欄（省略可）も定数でなければ畳み込まない。
+        for f in i[3:]:
+            if f and not _CONST_SETSYM_RE.match(f):
+                return False
         return bool(_CONST_SETSYM_RE.match(i[2]))
     # `.clearsym` `.map` `.free` `.enum` `.clrenum` `EPIC` は畳み込まない。
     return False
@@ -887,6 +893,110 @@ def _build_elf_machine_tables(raw):
 ELF_MACHINES = _build_elf_machine_tables(_ELF_MACHINE_RAW)
 
 
+# 組み込みの表に無い e_machine を `-m` に渡したときの土台。中身はパターン
+# ファイルの ELF 宣言（`.elfmachine` 以下、マニュアル 3.7.7 節）で埋める。
+# 何も宣言しなければリロケーション型を1つも持たない表になり、型の決まらない
+# 参照はリロケーションを出さずに飛ばす（当てずっぽうの型番号を書くよりよい）。
+_ELF_MACHINE_GENERIC = dict(
+    name='', elfclass=2, is_rela=True, width_guess={}, pc_rel=frozenset(),
+    extern_default=0, named={}, reloc_bytes={}, reverse={}, dwarf_abs=0)
+
+
+def _elf_decl_type(state, named, text):
+    """ELF 宣言の型欄（型名でも型番号でもよい）を型番号にする。読めなければ None。
+
+    名前は `.elftype` で決めたものでもマシンの名前表のものでもよく、大小は
+    区別しない。番号は 10進・0x・0o・0b が書ける。
+    caxx.c の elf_decl_type() と同じ規則である。
+    """
+    if not text:
+        return None
+    s = ''.join(c for c in text if c not in ' \t')
+    if not s:
+        return None
+    try:
+        return int(s, 0)
+    except ValueError:
+        pass
+    key = s.lower()
+    rt = state.elftypes.get(key)
+    if rt is None:
+        rt = named.get(key)
+    return rt
+
+
+def elf_machine_table(state):
+    """`-m` で選んだマシンの表に、パターンファイルの ELF 宣言を重ねた実効表。
+
+    組み込みの ELF_MACHINES は読み取り専用の土台で、その上に `.elftype` /
+    `.elfwidth` / `.elfextern` / `.elfdwarf` / `.elfrela` / `.elfclass` /
+    `.elfmachine`（マニュアル 3.7.7 節）が宣言した内容を重ねる。組み込みの表に
+    無い e_machine でも、宣言さえあればここで表が組み上がる。組み込みの表と
+    同じ e_machine なら、宣言した分だけを差し替える。
+
+    宣言は組み立てを始める前に出そろって以後変わらないのが普通なので、宣言の版
+    （decl_gen）とマシン番号を鍵にして控える。
+    caxx.c の elf_machine_effective() と同じである。
+    """
+    e = state.elf
+    key = (e.machine, e.decl_gen)
+    if e.mach_cache_key == key:
+        return e.mach_cache
+
+    base = ELF_MACHINES.get(e.machine, _ELF_MACHINE_GENERIC)
+    width_guess = dict(base['width_guess'])
+    pc_rel      = set(base['pc_rel'])
+    name        = base['name'] or ("machine %d" % e.machine)
+    elfclass       = base['elfclass']
+    is_rela        = base['is_rela']
+    extern_default = base['extern_default']
+    dwarf_abs      = base['dwarf_abs']
+
+    # 名前の並びは「組み込みの名前のうち `.elftype` で同じ綴りを宣言していない
+    # もの」→「`.elftype` の宣言（宣言順）」。名前引き・逆引き・幅引きはどれも
+    # 先頭から探すので、この並びが caxx.c と同じであることが、両実装の出力が
+    # 同じになる条件である（caxx.c の elf_machine_effective() を参照）。
+    named, reloc_bytes, reverse = {}, {}, {}
+    _merged = [(nm, rt, base['reloc_bytes'].get(rt, 0))
+               for nm, rt in base['named'].items() if nm not in state.elftypes]
+    _merged += [(nm, rt, e.type_width.get(nm, 0)) for nm, rt in state.elftypes.items()]
+    for nm, rt, w in _merged:
+        named.setdefault(nm, rt)
+        reverse.setdefault(rt, nm)
+        if w:
+            reloc_bytes.setdefault(rt, w)
+    for nm in e.type_pcrel:
+        rt = state.elftypes.get(nm)
+        if rt is not None:
+            pc_rel.add(rt)
+
+    for nbytes, text in e.decl_width.items():
+        rt = _elf_decl_type(state, named, text)
+        if rt is not None:
+            width_guess[nbytes] = rt
+    rt = _elf_decl_type(state, named, e.decl_extern)
+    if rt is not None:
+        extern_default = rt
+    rt = _elf_decl_type(state, named, e.decl_dwarf)
+    if rt is not None:
+        dwarf_abs = rt
+    if e.decl_rela is not None:
+        is_rela = bool(e.decl_rela)
+    if e.decl_class is not None:
+        elfclass = e.decl_class
+    # 表示名は、宣言したマシン番号を実際に出しているときだけ使う。
+    if e.decl_name and (e.decl_machine is None or e.decl_machine == e.machine):
+        name = e.decl_name
+
+    tbl = dict(base, name=name, elfclass=elfclass, is_rela=is_rela,
+               width_guess=width_guess, pc_rel=pc_rel,
+               extern_default=extern_default, dwarf_abs=dwarf_abs,
+               named=named, reloc_bytes=reloc_bytes, reverse=reverse)
+    e.mach_cache_key = key
+    e.mach_cache = tbl
+    return tbl
+
+
 def _reloc_named(state, mach, name):
     """型名を型番号にする。無ければ None。
 
@@ -961,12 +1071,19 @@ AARCH64_INSN_RELOCS = {
 }
 
 
-def insn_reloc_field_mask(rtype):
+def insn_reloc_field_mask(rtype, machine=183):
     """命令フィールド型なら、その値が占める 32bit 命令語中のビットマスクを返す。
 
     データ型や未知の型では None。呼び出し側はこれで「通常の加数計算をするか、
     命令フィールドとして扱うか」を振り分ける。
+
+    型番号の意味はマシンごとに違う（AArch64 の 275 = ADR_PREL_PG_HI21 は、他の
+    マシンでは別物か、そもそも無い）。この表は AArch64 のものなので、対象が
+    AArch64 のときだけ引く。`.elftype`（3.7.7 節）で同じ番号を宣言した別機種の
+    型を、命令フィールド型と取り違えないためである。
     """
+    if machine != 183:
+        return None
     fields = AARCH64_INSN_RELOCS.get(rtype)
     if fields is None:
         return None
@@ -1003,7 +1120,25 @@ class ElfState:
         self.osabi: int = 0        # ELF ヘッダの OSABI（0=Linux, 9=FreeBSD）
         self.objfile: str = ""     # -o の出力先。空なら ELF 出力しない
         self.machine: int = 62     # e_machine（62=x86-64）。ELF_MACHINES のキー
-        self.elf_class: int = 2    # 1=ELF32 / 2=ELF64
+        self.elf_class: int | None = None  # -f で明示された 1=ELF32 / 2=ELF64
+                                   # （None ならマシンの慣習クラスに従う）
+
+        # --- パターンファイルの ELF 宣言（マニュアル 3.7.7 節）---
+        # 組み込みのマシン表に重ねる差分。実効表は elf_machine_table() が作る。
+        self.decl_machine = None   # `.elfmachine` の番号
+        self.decl_name = ''        # `.elfmachine` の表示名（診断に出る）
+        self.decl_class = None     # `.elfclass`（1=ELF32 / 2=ELF64）
+        self.decl_rela = None      # `.elfrela`（1=RELA / 0=REL）
+        self.decl_width = {}       # `.elfwidth` バイト幅 → 型欄の文字列
+        self.decl_extern = ''      # `.elfextern` 型欄の文字列
+        self.decl_dwarf = ''       # `.elfdwarf` 型欄の文字列
+        self.decl_hdr = {}         # `.elfheader` 欄名 → 値
+        self.type_width = {}       # `.elftype` の幅欄（型名 → バイト幅）
+        self.type_pcrel = set()    # `.elftype` の PC 相対欄が立った型名
+        self.decl_gen = 0          # 宣言が変わるたびに増える（控えの鍵）
+        self.machine_from_cli = False  # `-m` を明示したか
+        self.mach_cache = None     # elf_machine_table() の控え
+        self.mach_cache_key = None
 
         # --- パス2でのリロケーション収集 ---
         self.relocations = []          # 確定した (セクション, 位置, 名前, 型, 加数, 幅)
@@ -3652,7 +3787,7 @@ class BinaryWriter:
         # 黙って壊れた方が困るので、どの箇所かを添えて知らせる。
         if self.state.elf_objfile:
             _zeroed = [r for r in self.state.relocations
-                       if insn_reloc_field_mask(r[3]) is not None]
+                       if insn_reloc_field_mask(r[3], self.state.elf_machine) is not None]
             if _zeroed:
                 _where = ', '.join(f"{r[0]}+0x{r[1]:x}" for r in _zeroed[:4])
                 if len(_zeroed) > 4:
@@ -3747,6 +3882,7 @@ class DirectiveProcessor:
     _upper_key_cache = {}    # `.setsym` の名前欄 → 大文字にしたもの
     _check_cache = {}        # (変数, 名前並び) → (arrgen, 展開した一覧)
     _elftype_cache = {}      # `.elftype` の値欄 → 型番号（不正なら None）
+    _elfdecl_cache = {}      # ELF 宣言の数値欄 (式, 下限, 上限) → 値（不正なら None）
 
     def set_symbol(self, i):
         if len(i) == 0 or i[0] != '.setsym':
@@ -3981,7 +4117,7 @@ class DirectiveProcessor:
         if not self.state.elf_objfile or not self.state.reloc_constraints:
             return False
         for var, rtype in self.state.reloc_constraints.items():
-            if insn_reloc_field_mask(rtype) is None:
+            if insn_reloc_field_mask(rtype, self.state.elf_machine) is None:
                 continue
             for m in re.finditer(re.escape(var), cond_src):
                 b, e = m.start(), m.end()
@@ -4120,7 +4256,7 @@ class DirectiveProcessor:
         return True
 
     def elftype_processing(self, i):
-        """`.elftype::<名前>::<値>` — リロケーション型名を自分で決める。
+        """`.elftype::<名前>::<値>[::<幅>[::<PC相対>]]` — 型名を自分で決める。
 
         決めた名前は、型名を書けるところ全部で使える。
           パターンファイル: `.reloc::<変数>::<名前>`
@@ -4134,6 +4270,11 @@ class DirectiveProcessor:
 
         名前の読み方は `.reloc` の型名と同じ（空白は落とし、大小は区別しない）。
         値は行によって変わらないので、最初の1回だけ評価して控える。
+
+        4番目の欄は、その型が書き換える欄のバイト幅（1〜8）である。組み込みの
+        名前表に無い型は幅も分からないので、加数の計算や `.RELOCTYPE` の幅照合
+        のためにここで教える。5番目の欄は、0 以外なら「PC 相対の型」という印で、
+        加数に命令アドレスを足す側に回る。どちらも省いてよい。
         caxx.c の elftype_apply() と同じ規則である。
         """
         if len(i) == 0 or i[0] != '.elftype':
@@ -4168,8 +4309,225 @@ class DirectiveProcessor:
             if len(_c) >= 65536:
                 _c.clear()
             _c[value_field] = v
-        if v is not None:
+        if v is None:
+            return True
+        _e = self.state.elf
+        _w = None
+        if len(i) > 3 and i[3] and i[3].strip():
+            _w = self._elf_decl_num('.elftype', i[3], 1, 8)
+            if _w is None:
+                return True
+        _pc = None
+        if len(i) > 4 and i[4] and i[4].strip():
+            _pc = self._elf_decl_num('.elftype', i[4], 0, 1)
+            if _pc is None:
+                return True
+        if self.state.elftypes.get(nm) != v \
+                or _e.type_width.get(nm) != _w \
+                or ((nm in _e.type_pcrel) != bool(_pc)):
             self.state.elftypes[nm] = v
+            if _w is None:
+                _e.type_width.pop(nm, None)
+            else:
+                _e.type_width[nm] = _w
+            if _pc:
+                _e.type_pcrel.add(nm)
+            else:
+                _e.type_pcrel.discard(nm)
+            _e.decl_gen += 1
+        return True
+
+    # ---- ELF 記述のディレクティブ（マニュアル 3.7.7 節）-------------------
+    #
+    # `-m` で選んだ組み込みのマシン表に重ねる差分を宣言する。組み込みの表に
+    # 無い e_machine でも、これだけそろえれば ELF を出せる。宣言はどれも
+    # 行によって変わらないので、`.elftype` と同じく組み立て前に一度登録して
+    # おき（register_elfdecls）、実効表は elf_machine_table() が組み立てる。
+
+    @staticmethod
+    def _elf_decl_fields(i):
+        """ELF 宣言の第1欄・第2欄を取り出す。
+
+        パターン行は `::` が1つだけだと第1欄が空になり値が第2欄に入る
+        （`.elfclass::64` は ['', '64']）。`.elftype` の名前欄と同じ読み方で、
+        書いた欄がそのまま前から詰まっているように見せる。
+        """
+        f1 = i[1] if len(i) > 1 and i[1] and i[1].strip() else ''
+        f2 = i[2] if len(i) > 2 and i[2] else ''
+        return (f1, f2) if f1 else (f2, '')
+
+    def _elf_decl_num(self, dname, field, lo, hi):
+        """ELF 宣言の数値欄を評価する。読めないか範囲外なら診断して None。"""
+        text = field.strip() if field else ''
+        if not text:
+            self.state.diag(f" error - {dname}: a number is required.", set_error=True)
+            return None
+        _c = DirectiveProcessor._elfdecl_cache
+        key = (text, lo, hi)
+        v = _c.get(key, _SETSYM_MISS)
+        if v is not _SETSYM_MISS:
+            if v is None:
+                self.state.diag(f" error - {dname}: value must be an integer in "
+                                f"{lo}..{hi}, got '{text}'.", set_error=True)
+            return v
+        self.state.error_undefined_label = False
+        v, _idx = self.expr_eval.expression_pat(text, 0)
+        try:
+            v = int(v)
+        except (OverflowError, ValueError):
+            v = None
+        if self.state.error_undefined_label or v is None or v < lo or v > hi:
+            self.state.diag(f" error - {dname}: value must be an integer in "
+                            f"{lo}..{hi}, got '{text}'.", set_error=True)
+            v = None
+        self.state.error_undefined_label = False
+        if len(_c) >= 65536:
+            _c.clear()
+        _c[key] = v
+        return v
+
+    def _elf_decl_set(self, attr, value):
+        """宣言を据える。中身が変わったときだけ実効表の版を進める。"""
+        e = self.state.elf
+        if getattr(e, attr) != value:
+            setattr(e, attr, value)
+            e.decl_gen += 1
+
+    def elfmachine_processing(self, i):
+        """`.elfmachine::<e_machine番号>[::<名前>]` — 対象のマシンを宣言する。
+
+        `-m` を書かなかったときは、この宣言が `-m` の代わりになる。`-m` を
+        書いたときはそちらが勝ち（パターンファイルを別のマシン番号で使い回せる）、
+        名前だけは番号が一致したときに診断で使われる。
+        """
+        if len(i) == 0 or i[0] != '.elfmachine':
+            return False
+        _num, _nm = self._elf_decl_fields(i)
+        v = self._elf_decl_num('.elfmachine', _num, 0, 65535)
+        if v is None:
+            return True
+        nm = _nm.strip()
+        self._elf_decl_set('decl_machine', v)
+        self._elf_decl_set('decl_name', nm)
+        # `-m` を書いていなければ、宣言したマシンがそのまま対象になる。
+        e = self.state.elf
+        if not e.machine_from_cli and e.machine != v:
+            e.machine = v
+            e.decl_gen += 1
+        return True
+
+    def elfclass_processing(self, i):
+        """`.elfclass::<32|64>` — 既定の ELF クラス。`-f` を書けばそちらが勝つ。"""
+        if len(i) == 0 or i[0] != '.elfclass':
+            return False
+        text = self._elf_decl_fields(i)[0].strip()
+        if text == '32':
+            self._elf_decl_set('decl_class', 1)
+        elif text == '64':
+            self._elf_decl_set('decl_class', 2)
+        else:
+            self.state.diag(f" error - .elfclass: value must be 32 or 64, got '{text}'.",
+                            set_error=True)
+        return True
+
+    def elfrela_processing(self, i):
+        """`.elfrela::<1|0>` — 1(rela)=加数を専用欄に持つ / 0(rel)=命令語に埋める。"""
+        if len(i) == 0 or i[0] != '.elfrela':
+            return False
+        text = self._elf_decl_fields(i)[0].strip().lower()
+        if text in ('1', 'rela'):
+            self._elf_decl_set('decl_rela', 1)
+        elif text in ('0', 'rel'):
+            self._elf_decl_set('decl_rela', 0)
+        else:
+            self.state.diag(f" error - .elfrela: value must be 1/rela or 0/rel, "
+                            f"got '{text}'.", set_error=True)
+        return True
+
+    def elfwidth_processing(self, i):
+        """`.elfwidth::<バイト幅>::<型>` — その幅の参照に使う既定のリロケーション型。
+
+        ソースが `::型名` を書かなかった参照は、欄のバイト幅からこの表を引く。
+        型は `.elftype` で決めた名前でもマシンの名前表の名前でも型番号でもよい。
+        """
+        if len(i) == 0 or i[0] != '.elfwidth':
+            return False
+        _wf, _tf = self._elf_decl_fields(i)
+        w = self._elf_decl_num('.elfwidth', _wf, 1, 8)
+        if w is None:
+            return True
+        if w not in (1, 2, 4, 8):
+            self.state.diag(f" error - .elfwidth: width must be 1, 2, 4 or 8, got {w}.",
+                            set_error=True)
+            return True
+        t = _tf.strip()
+        if not t:
+            self.state.diag(" error - .elfwidth: relocation type is not specified.",
+                            set_error=True)
+            return True
+        e = self.state.elf
+        if e.decl_width.get(w) != t:
+            e.decl_width[w] = t
+            e.decl_gen += 1
+        return True
+
+    def elfextern_processing(self, i):
+        """`.elfextern::<型>` — `.extern` が型名を書かなかったときの既定型。"""
+        if len(i) == 0 or i[0] != '.elfextern':
+            return False
+        t = self._elf_decl_fields(i)[0].strip()
+        if not t:
+            self.state.diag(" error - .elfextern: relocation type is not specified.",
+                            set_error=True)
+            return True
+        self._elf_decl_set('decl_extern', t)
+        return True
+
+    def elfdwarf_processing(self, i):
+        """`.elfdwarf::<型>` — `-g` の DWARF が書く絶対アドレス参照の型。"""
+        if len(i) == 0 or i[0] != '.elfdwarf':
+            return False
+        t = self._elf_decl_fields(i)[0].strip()
+        if not t:
+            self.state.diag(" error - .elfdwarf: relocation type is not specified.",
+                            set_error=True)
+            return True
+        self._elf_decl_set('decl_dwarf', t)
+        return True
+
+    # `.elfheader` で書ける欄 → (下限, 上限)。値はそのまま ELF ヘッダに入る。
+    _ELF_HDR_FIELDS = {
+        'type':       (0, 0xFFFF),          # e_type（既定 1 = ET_REL）
+        'flags':      (0, 0xFFFFFFFF),      # e_flags（ABI 種別など機種固有）
+        'version':    (0, 0xFFFFFFFF),      # e_version（既定 1 = EV_CURRENT）
+        'entry':      (0, 0x7FFFFFFFFFFFFFFF),  # e_entry（再配置可能形式では 0）
+        'osabi':      (0, 0xFF),            # e_ident[EI_OSABI]（--osabi と同じ欄）
+        'abiversion': (0, 0xFF),            # e_ident[EI_ABIVERSION]
+    }
+
+    def elfheader_processing(self, i):
+        """`.elfheader::<欄名>::<値>` — ELF ヘッダの欄を直に決める。
+
+        欄名は type / flags / version / entry / osabi / abiversion。機種固有の
+        `e_flags`（ARM EABI 版数、RISC-V の ABI 印など）を出すためのもので、
+        書かなかった欄は今までどおりの既定値で出る。
+        """
+        if len(i) == 0 or i[0] != '.elfheader':
+            return False
+        _ff, _vf = self._elf_decl_fields(i)
+        fld = ''.join(c for c in _ff if c not in ' \t').lower()
+        rng = DirectiveProcessor._ELF_HDR_FIELDS.get(fld)
+        if rng is None:
+            self.state.diag(f" error - .elfheader: unknown field '{fld}' (type, flags, "
+                            f"version, entry, osabi, abiversion).", set_error=True)
+            return True
+        v = self._elf_decl_num('.elfheader', _vf, rng[0], rng[1])
+        if v is None:
+            return True
+        e = self.state.elf
+        if e.decl_hdr.get(fld) != v:
+            e.decl_hdr[fld] = v
+            e.decl_gen += 1
         return True
 
     def reloc_processing(self, i):
@@ -4202,10 +4560,10 @@ class DirectiveProcessor:
         # で使い回せるべきで、対象外のときに落ちてはいけない。
         if not self.state.elf_objfile:
             return True
-        mach = ELF_MACHINES.get(self.state.elf_machine)
+        mach = elf_machine_table(self.state)
         rtype = _reloc_named(self.state, mach, tname)
         if rtype is None:
-            _mname = mach['name'] if mach else self.state.elf_machine
+            _mname = mach['name']
             # パターン行は1ソース行ごとに読み直されるので、同じ名前で何度も
             # 出さないよう一度だけ報告する。
             _key = (tname.lower(), self.state.elf_machine)
@@ -4582,7 +4940,8 @@ _PAT_DIRECTIVES = frozenset((
     '.setsym', '.clearsym', '.padding', '.bits', '.symbolc', '.vliw',
     '.check', '.clrcheck', '.reloc', '.clrreloc', '.map', '.free',
     '.passthru', '.eol', '.textmode', '.enum', '.clrenum', '.error',
-    '.elftype'))
+    '.elftype', '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
+    '.elfextern', '.elfdwarf', '.elfheader'))
 
 
 # `.setsym` の値欄が「ソースの行によって変わりようのない定数式」か。
@@ -8090,7 +8449,7 @@ class AssemblyDirectiveProcessor:
                     expr_part = parts[0]
                     rt_str = parts[1].lower()
 
-                    _mach_tbl = ELF_MACHINES.get(self.state.elf_machine)
+                    _mach_tbl = elf_machine_table(self.state)
                     reloc_type = _reloc_named(self.state, _mach_tbl, rt_str)
                     if reloc_type is None:
                         self.state.diag(f" warning - unknown reloctype '{rt_str}' in .EQU"
@@ -8256,7 +8615,7 @@ class AssemblyDirectiveProcessor:
                     idx += 1
                 _rt_str = l2[_rt_start:idx].strip().lower()
                 if _rt_str:
-                    _mach_tbl_g = ELF_MACHINES.get(self.state.elf_machine)
+                    _mach_tbl_g = elf_machine_table(self.state)
                     _rtype_g = _reloc_named(self.state, _mach_tbl_g, _rt_str)
                     if _rtype_g is None:
                         self.state.diag(f" warning - unknown reloc type '{_rt_str}' in .GLOBAL"
@@ -8440,8 +8799,8 @@ class AssemblyDirectiveProcessor:
                 idx -= 1
 
             _em_ext = self.state.elf_machine
-            _mach_tbl_ext = ELF_MACHINES.get(_em_ext)
-            reloc_type = _mach_tbl_ext['extern_default'] if _mach_tbl_ext else 2
+            _mach_tbl_ext = elf_machine_table(self.state)
+            reloc_type = _mach_tbl_ext['extern_default']
             # このEXTERN文自身が `::型名` を明示したかどうか。reloc_type は
             # 明示指定が無ければデフォルト型で埋まってしまうため、reloc_type
             # 自体では「明示されたか」を区別できない。既存ラベルの
@@ -8488,10 +8847,10 @@ class AssemblyDirectiveProcessor:
         if StringUtils.upper(l1) != ".RELOCTYPE":
             return False
 
-        _mach_tbl_rt = ELF_MACHINES.get(self.state.elf_machine)
-        if _mach_tbl_rt is None:
-            self.state.diag(f" warning - .RELOCTYPE: no relocation table for machine "
-                 f"{self.state.elf_machine}", set_error=False)
+        _mach_tbl_rt = elf_machine_table(self.state)
+        if not _mach_tbl_rt['named']:
+            self.state.diag(f" warning - .RELOCTYPE: no relocation type is known for "
+                 f"machine {self.state.elf_machine}; declare them with .elftype", set_error=False)
             return True
 
         _widths = (1, 2, 4, 8)
@@ -10597,7 +10956,7 @@ class Assembler:
                     groups.append((lname, abs_w, widx, gj - gi))
                     gi = gj
 
-                _mach_tbl_la = ELF_MACHINES[self.state.elf_machine]
+                _mach_tbl_la = elf_machine_table(self.state)
                 _rmap = {**_mach_tbl_la['width_guess'], **self.state.reloctype_override}
                 _pc_rel_types_all = _mach_tbl_la['pc_rel']
 
@@ -10611,7 +10970,7 @@ class Assembler:
                     _forced_rtype = None
                     if _hint is not None:
                         _hint_rtype, _hint_addend = _hint
-                        _fmask = insn_reloc_field_mask(_hint_rtype)
+                        _fmask = insn_reloc_field_mask(_hint_rtype, self.state.elf_machine)
                         if _fmask is None:
                             # データ型を宣言した場合。加数は通常どおり出力バイト列
                             # から求まるので、型だけを固定して下の経路へ渡す。
@@ -10765,17 +11124,57 @@ class Assembler:
         self.state.ln += 1
         return f
 
-    def register_elftypes(self, pat):
-        """パターン表の `.elftype` を、組み立てを始める前に一度そろえて登録する。
+    # パターン表から先に拾う ELF 宣言（マニュアル 3.7.7 節）→ 処理する関数名。
+    _ELF_DECL_DIRECTIVES = ('.elftype', '.elfmachine', '.elfclass', '.elfrela',
+                            '.elfwidth', '.elfextern', '.elfdwarf', '.elfheader')
+
+    def register_elfdecls(self, pat):
+        """パターン表の ELF 宣言を、組み立てを始める前に一度そろえて登録する。
 
         型名はソースの `.extern`/`.global`/`.EQU`/`.RELOCTYPE` や取り込み
         ファイルからも引く。これらはパターン表をたどるより前に読まれるので、
         行ごとの実行を待っていると「まだ宣言されていない」ことになってしまう。
-        caxx.c の register_elftypes() と同じである。
+        マシン番号・ELF クラス・ヘッダ欄も同じ理由でここで決める。
+        caxx.c の register_elfdecls() と同じである。
         """
+        d = self.directive_proc
+        table = {
+            '.elftype':    d.elftype_processing,
+            '.elfmachine': d.elfmachine_processing,
+            '.elfclass':   d.elfclass_processing,
+            '.elfrela':    d.elfrela_processing,
+            '.elfwidth':   d.elfwidth_processing,
+            '.elfextern':  d.elfextern_processing,
+            '.elfdwarf':   d.elfdwarf_processing,
+            '.elfheader':  d.elfheader_processing,
+        }
         for i in pat:
-            if i and i[0] == '.elftype':
-                self.directive_proc.elftype_processing(i)
+            if i and i[0] in table:
+                table[i[0]](i)
+        self.check_elfdecls()
+
+    def check_elfdecls(self):
+        """ELF 宣言の型欄が引けるかを、宣言が出そろってから一度だけ見る。
+
+        綴りを間違えた型名を黙って読み飛ばすと、そこだけリロケーションの出ない
+        `.o` が何事もなかったように出てしまう。`-o` を出すときだけ見るのは
+        `.reloc` と同じで、パターンファイルを別のマシンで使い回せるようにする
+        ためである。caxx.c の check_elfdecls() と同じである。
+        """
+        if not self.state.elf_objfile:
+            return
+        e = self.state.elf
+        tbl = elf_machine_table(self.state)
+        named = tbl['named']
+        for w in sorted(e.decl_width):
+            t = e.decl_width[w]
+            if _elf_decl_type(self.state, named, t) is None:
+                self.state.diag(f" warning - .elfwidth: unknown relocation type '{t}' "
+                                f"for {tbl['name']}; ignored.", set_error=False)
+        for dname, t in (('.elfextern', e.decl_extern), ('.elfdwarf', e.decl_dwarf)):
+            if t and _elf_decl_type(self.state, named, t) is None:
+                self.state.diag(f" warning - {dname}: unknown relocation type '{t}' "
+                                f"for {tbl['name']}; ignored.", set_error=False)
 
     def setpatsymbols(self, pat):
         fresh = {}
@@ -10960,7 +11359,7 @@ class Assembler:
             reloc_type = None
             if '::' in label:
                 label, rt_str = label.split('::', 1)
-                _mach_tbl_imp = ELF_MACHINES.get(self.state.elf_machine)
+                _mach_tbl_imp = elf_machine_table(self.state)
                 reloc_type = _reloc_named(self.state, _mach_tbl_imp, rt_str)
                 if reloc_type is None:
                     self.state.diag(f" warning - unknown reloc type '{rt_str}' for imported label '{label}'", set_error=False)
@@ -11024,12 +11423,16 @@ class Assembler:
         if not self.state.gen_debug or not line_map:
             return [], []
 
-        _mach_tbl_dw = ELF_MACHINES.get(machine)
-        _native_dw   = _mach_tbl_dw['elfclass'] if _mach_tbl_dw else 2
+        _mach_tbl_dw = elf_machine_table(self.state)
+        _native_dw   = _mach_tbl_dw['elfclass']
         _eff_class_dw = getattr(self.state, 'elf_class', None) or _native_dw
-        if _mach_tbl_dw is None:
-            self.state.diag(f" warning - DWARF debug info (-g) is not supported for "
-                 f"unknown machine {machine}; skipping debug sections.", set_error=False)
+        if not _mach_tbl_dw['dwarf_abs']:
+            # 絶対アドレス参照の型が分からないマシン。型番号を当てずっぽうで
+            # 書けば黙って壊れたデバッグ情報になるので出さない。`.elfdwarf`
+            # （3.7.7 節）で型を教えれば出せる。
+            self.state.diag(f" warning - DWARF debug info (-g) needs an absolute "
+                 f"relocation type for machine {machine}; declare it with .elfdwarf. "
+                 f"Skipping debug sections.", set_error=False)
             return [], []
 
         import struct as _struct
@@ -11308,7 +11711,8 @@ class Assembler:
         _ei_data  = 1 if _is_le else 2
         _pk       = '<' if _is_le else '>'
 
-        _native_elfclass = ELF_MACHINES.get(machine, {}).get('elfclass', 2)
+        _mach_tbl_w = elf_machine_table(self.state)
+        _native_elfclass = _mach_tbl_w['elfclass']
         _elfclass  = getattr(self.state, 'elf_class', None) or _native_elfclass
         if _elfclass != _native_elfclass:
             self.state.diag(
@@ -11321,18 +11725,28 @@ class Assembler:
         _ehdr_size = 64 if _is_elf64 else 52
         _word_mask = 0xFFFFFFFFFFFFFFFF if _is_elf64 else 0xFFFFFFFF
 
+        # `.elfheader::<欄名>::<値>`（3.7.7 節）で決めた欄。書かれていない欄は
+        # 従来どおりの既定値（e_type=1 ET_REL、e_version=1、e_flags=0、e_entry=0）。
+        _hdr        = self.state.elf.decl_hdr
+        _e_flags    = _hdr.get('flags', 0) & 0xFFFFFFFF
+        _e_version  = _hdr.get('version', 1) & 0xFFFFFFFF
+        _e_entry    = _hdr.get('entry', 0) & _word_mask
+        _ei_osabi   = _hdr.get('osabi', self.state.osabi) & 0xFF
+        _ei_abiver  = _hdr.get('abiversion', 0) & 0xFF
+
         def _pack_ehdr(e_type, e_machine, e_shoff, e_shnum, e_shstrndx):
+            e_type = _hdr.get('type', e_type) & 0xFFFF
             ident = (b'\x7fELF'
-                     + bytes([2 if _is_elf64 else 1, _ei_data, 1, self.state.osabi])
-                     + b'\x00' * 8)
+                     + bytes([2 if _is_elf64 else 1, _ei_data, 1, _ei_osabi, _ei_abiver])
+                     + b'\x00' * 7)
             if _is_elf64:
                 return ident + _struct.pack(f'{_pk}HHIQQQIHHHHHH',
                     e_type, e_machine,
-                    1,
-                    0,
+                    _e_version,
+                    _e_entry,
                     0,
                     e_shoff,
-                    0,
+                    _e_flags,
                     _ehdr_size,
                     0, 0,
                     64,
@@ -11341,11 +11755,11 @@ class Assembler:
             else:
                 return ident + _struct.pack(f'{_pk}HHIIIIIHHHHHH',
                     e_type, e_machine,
-                    1,
-                    0,
+                    _e_version,
+                    _e_entry,
                     0,
                     e_shoff,
-                    0,
+                    _e_flags,
                     _ehdr_size,
                     0, 0,
                     40,
@@ -11444,8 +11858,7 @@ class Assembler:
 
         sec_name_to_idx = {s.name: i + 1 for i, s in enumerate(csecs)}
 
-        _mach_tbl_w = ELF_MACHINES.get(machine, {})
-        _is_rela = _mach_tbl_w.get('is_rela', True)
+        _is_rela = _mach_tbl_w['is_rela']
 
         from collections import defaultdict as _defaultdict
         rela_entries = _defaultdict(list)
@@ -11826,25 +12239,29 @@ class Assembler:
                         metavar='OBJ_FILE',
                         help='Write ELF relocatable object file (.o); class '
                              'selected by -f (default: ELF64)')
-        ap.add_argument('-f', dest='elf_format', type=int, default=64,
+        ap.add_argument('-f', dest='elf_format', type=int, default=None,
                         choices=(32, 64), metavar='{32,64}',
                         help='ELF class for -o output: 64 for ELF64/ELFCLASS64, '
-                             '32 for ELF32/ELFCLASS32 (default: 64). Independent '
-                             'of -m/--machine; a value that does not match the '
-                             'selected machine\'s conventional class (e.g. '
+                             '32 for ELF32/ELFCLASS32. Default: the pattern '
+                             'file\'s .elfclass, or the conventional class of '
+                             'the -m machine (ELF64 if that is unknown too). '
+                             'Independent of -m/--machine; a value that does not '
+                             'match the machine\'s conventional class (e.g. '
                              '-m 62 -f 32, the real x32 ABI\'s EM_X86_64-in-'
                              'ELFCLASS32 layout) is honored, with a warning. '
                              '-g/--gen-debug DWARF output supports both 32 and 64.')
-        ap.add_argument('-m', dest='elf_machine', type=int, default=62,
+        ap.add_argument('-m', dest='elf_machine', type=int, default=None,
                         metavar='MACHINE',
-                        help='ELF e_machine value (default 62=EM_X86_64). '
-                             'Must be one of the architectures axx has '
-                             'relocation-numbering support for -- see '
-                             'ELF_MACHINES near the top of this file for the '
-                             'full list (currently: 3=i386, 4=M68K, '
+                        help='ELF e_machine value (default: the pattern file\'s '
+                             '.elfmachine, else 62=EM_X86_64). axx carries '
+                             'built-in relocation numbering for 3=i386, 4=M68K, '
                              '20=PowerPC, 21=PowerPC64, 22=s390x, 40=ARM, '
-                             '42=SuperH, 43=SPARCV9, 62=x86-64, '
-                             '183=AArch64, 243=RISC-V)')
+                             '42=SuperH, 43=SPARCV9, 62=x86-64, 183=AArch64, '
+                             '243=RISC-V. Any other number is accepted too, but '
+                             'then the relocation types must come from the '
+                             'pattern file (.elftype / .elfwidth / .elfextern, '
+                             'manual 3.7.7); references whose type is unknown '
+                             'get no relocation entry rather than a guessed one.')
         ap.add_argument('-v', '--verbose', dest='verbose', action='store_true',
                         default=False,
                         help='Verbose: print assembly listing to stdout (default: silent)')
@@ -11960,6 +12377,13 @@ class Assembler:
             '.clrenum':  d.clrenum_processing,
             '.error':    d.errmsg_processing,
             '.elftype':  d.elftype_processing,
+            '.elfmachine': d.elfmachine_processing,
+            '.elfclass':   d.elfclass_processing,
+            '.elfrela':    d.elfrela_processing,
+            '.elfwidth':   d.elfwidth_processing,
+            '.elfextern':  d.elfextern_processing,
+            '.elfdwarf':   d.elfdwarf_processing,
+            '.elfheader':  d.elfheader_processing,
         }
         out = []
         for row, i in enumerate(pat):
@@ -12100,17 +12524,29 @@ class Assembler:
         self.state.impfile      = args.impfile
         self.state.elf_objfile  = args.elf_objfile
 
-        if args.elf_machine not in ELF_MACHINES:
-            _known = ', '.join(f"{m} ({ELF_MACHINES[m]['name']})" for m in sorted(ELF_MACHINES))
-            self.state.diag(f" error - -m/--machine value {args.elf_machine} is not a supported "
-                 f"ELF e_machine number. axx only knows correct relocation-type "
-                 f"numbering for: {_known}. Refusing to guess/fall back to x86_64 "
-                 f"numbering for an unrecognized machine, since that would silently "
-                 f"mislabel every relocation in the output.", set_error=False, force=True)
-            return False
-        self.state.elf_machine  = args.elf_machine
+        # `-m` を書かなければパターンファイルの `.elfmachine`（3.7.7 節）が、
+        # それも無ければ従来どおり 62（x86-64）が対象になる。
+        if args.elf_machine is not None:
+            if not 0 <= args.elf_machine <= 65535:
+                self.state.diag(f" error - -m/--machine value {args.elf_machine} is out of "
+                     f"range (an ELF e_machine number is 0..65535).",
+                     set_error=False, force=True)
+                return False
+            self.state.elf_machine = args.elf_machine
+            self.state.elf.machine_from_cli = True
+            if args.elf_machine not in ELF_MACHINES and args.elf_objfile:
+                _known = ', '.join(f"{m} ({ELF_MACHINES[m]['name']})" for m in sorted(ELF_MACHINES))
+                self.state.diag(f" warning - -m/--machine value {args.elf_machine} is not one of "
+                     f"the machines axx has built-in relocation numbering for ({_known}); "
+                     f"relocation types must come from the pattern file (.elftype / "
+                     f".elfwidth / .elfextern). References whose type is not declared get "
+                     f"no relocation entry, rather than a guessed (and wrong) one.",
+                     set_error=False, force=True)
 
-        self.state.elf_class    = 2 if args.elf_format == 64 else 1
+        # `-f` を書かなければ、パターンファイルの `.elfclass`、それも無ければ
+        # マシンの慣習クラスで出す（write_elf_obj() が None を見て決める）。
+        self.state.elf_class    = None if args.elf_format is None else \
+                                  (2 if args.elf_format == 64 else 1)
 
         _osabi_key = args.elf_osabi.lower()
         if _osabi_key not in osabitbl:
@@ -12170,7 +12606,7 @@ class Assembler:
                                 set_error=False, force=True)
                 return False
             self.setpatsymbols(self.state.pat)
-            self.register_elftypes(self.state.pat)
+            self.register_elfdecls(self.state.pat)
             # 破綻点修正: パターンファイル側のディレクティブ評価（.setsym / .bits 等）
             # で出たエラーを誰も拾っていなかったため、" error - ..." を表示しながら
             # 終了コード0で「出力ファイルだけ作られない」無言の失敗になっていた。
@@ -12444,7 +12880,7 @@ class Assembler:
                         if elf == 1:
                             lentry = self.state.labels.get(i[0], [])
                             if len(lentry) > 4 and lentry[4] is not None:
-                                _mach_tbl_exp = ELF_MACHINES.get(self.state.elf_machine)
+                                _mach_tbl_exp = elf_machine_table(self.state)
                                 reloc_type_str = _reloc_reverse(self.state, _mach_tbl_exp, lentry[4])
                                 if reloc_type_str:
                                     reloc_type_str = f'::{reloc_type_str}'

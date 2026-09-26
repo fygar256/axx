@@ -1,0 +1,62 @@
+/* ===================================================================
+/* elfgen.axx -- pattern file for the ELF machine description
+/*               (`.elfmachine` and friends, manual 3.7.7)
+/*
+/* axx carries built-in relocation numbering for eleven architectures.
+/* Any other `e_machine` can be assembled too, as long as the pattern
+/* file says what the ELF object should look like:
+/*
+/*   .elfmachine::<number>[::<name>]   which e_machine (and its name)
+/*   .elfclass::<32|64>                ELF32 or ELF64
+/*   .elfrela::<1|0>                   RELA (1) or REL (0)
+/*   .elftype::<name>::<number>[::<width>[::<pc-relative>]]
+/*                                     a relocation type of this machine
+/*   .elfwidth::<bytes>::<type>        default type for an N-byte field
+/*   .elfextern::<type>                default type for `.extern`
+/*   .elfdwarf::<type>                 absolute type used by -g DWARF
+/*   .elfheader::<field>::<value>      an ELF header field
+/*
+/* The machine below is EM_MSP430 (105), which axx has no built-in
+/* table for; everything the ELF writer needs comes from this file.
+/*
+/* Assemble with:
+/*   axx elfgen.axx elfgen.s -o out.o
+/* ===================================================================
+
+.bits::8
+
+/* --- what kind of ELF object to write ---------------------------- */
+.elfmachine::105::MSP430       /* -m may still override the number   */
+.elfclass::32                  /* -f may still override the class    */
+.elfrela::1                    /* addends live in their own field    */
+
+/* --- the relocation types of this machine ------------------------ */
+/*     name        number  width  pc-relative                        */
+.elftype::abs32::1::4          /* R_MSP430_ABS32                     */
+.elftype::abs16::2::2          /* R_MSP430_ABS16                     */
+.elftype::pcrel16::4::2::1     /* R_MSP430_PCR16                     */
+.elftype::abs8::3::1           /* R_MSP430_ABS8                      */
+
+/* --- which type to use when the source does not say -------------- */
+.elfwidth::4::abs32
+.elfwidth::2::abs16
+.elfwidth::1::abs8
+.elfextern::abs16              /* `.extern` without `::<type>`       */
+.elfdwarf::abs32               /* -g DWARF absolute references       */
+
+/* --- ELF header fields ------------------------------------------- */
+.elfheader::flags::0x2a        /* e_flags: machine specific          */
+.elfheader::abiversion::1      /* e_ident[EI_ABIVERSION]             */
+
+/* --- instructions ------------------------------------------------ */
+CALL !t :: 0xb0,0x12,t,t>>8
+BR !t :: 0x30,0x40,t,t>>8
+
+.reloc::t::pcrel16
+JMP !t :: 0x00,0x3c,t,t>>8
+.clrreloc::t
+
+DB !t :: t
+DW !t :: t,t>>8
+DD !t :: t,t>>8,t>>16,t>>24
+RET :: 0x30,0x41

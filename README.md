@@ -41,7 +41,7 @@ file out.o
 # => out.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
 ```
 
-`-o` emits an ELF32/64 relocatable object for FreeBSD or Linux that you can hand straight to `ld`, with optional DWARF debug info. None of the comparable tools in this space do this (more on that below).
+`-o` emits an ELF32/64 relocatable object for FreeBSD or Linux that you can hand straight to `ld`, with optional DWARF debug info. Eleven architectures have their relocation numbering built in, and any other `e_machine` works too — the pattern file declares the relocation types, the ELF class, RELA/REL and the header fields it needs. None of the comparable tools in this space do this (more on that below).
 
 **The grammar itself is free-form.** axx has no tokenizer; it matches character by character. That means it isn't limited to the conventional "mnemonic plus operands" shape — a register-transfer style instruction like `r1 = r2 + r3` is just as legal a pattern as `MOV A,B`. This isn't incidental: LLVM's assembler-generation machinery (TableGen/AsmMatcher) explicitly assumes mnemonic-led syntax, and had to be specially patched to handle Hexagon's mnemonic-less `r0 = r1` transfer syntax. axx never had that assumption baked in to begin with.
 
