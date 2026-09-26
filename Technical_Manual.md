@@ -37,10 +37,10 @@ axx 8080toz80.axx hello8080.s -V > out.s  # translated text to stdout
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all nineteen bundled pattern/source pairs with both
+exactly that: `test1` assembles all twenty bundled pattern/source pairs with both
 implementations and `cmp`s the results. For the two `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
-`-V`, for twenty-one comparisons in all.
+`-V`, for twenty-two comparisons in all.
 
 **Contents**
 
@@ -3006,11 +3006,16 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 `itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
 `aarch64_logical_mini_demo.s`.
 
-`test1` runs all nineteen of the pairs above through both implementations and
+`test1` runs all twenty of the pairs above through both implementations and
 compares the `-b` raw binaries. For the two pairs that use `.textmode`
 (`textmode.axx` and `8080toz80.axx`) it also compares the translated text each
-implementation writes to standard output under `-V`, for twenty-one comparisons
+implementation writes to standard output under `-V`, for twenty-two comparisons
 in all.
+
+The `aarch64.axx` / `aarch64.s` pair is much the slowest of them: the Python
+implementation takes a little over two minutes on it, against about ten seconds
+for the C one, because every source line is matched against the largest pattern
+set in the tree. It dominates the running time of `test1`.
 
 x86_64 and legacy CPUs make up most of what is currently implemented, but that
 reflects where the work has gone, not the limit of what axx can describe.
@@ -3031,7 +3036,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all nineteen bundled pattern/source pairs with both
+`test1` assembles all twenty bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 two `.textmode` pairs.
 
