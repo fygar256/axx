@@ -7596,7 +7596,7 @@ class ObjectGenerator:
 
     @staticmethod
     def _txt_template_inner(q):
-        """`"..."` の中身を取り出す。`\` は残して展開側に任せる。"""
+        r"""`"..."` の中身を取り出す。`\` は残して展開側に任せる。"""
         out = []
         i = 1
         while i < len(q):
