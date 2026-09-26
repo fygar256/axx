@@ -1127,6 +1127,10 @@ typedef struct {
      * 何行目でも同じものになるので、作り直さずこれを渡す。 */
     void     *chk_cache;
     long long chk_cache_gen;
+    /* `.echo` の引数欄を解いた項目の並び（EchoItem*）。本文行は照合のたびに
+     * 通るので、読み込み時に一度だけ組み立てる。 */
+    void     *echo_items;
+    int       echo_nitems;
 } PatEntry;
 
 typedef struct {
@@ -1146,7 +1150,7 @@ enum {
     PD_VLIW, PD_CHECK, PD_CLRCHECK, PD_RELOC, PD_CLRRELOC, PD_MAP, PD_FREE,
     PD_PASSTHRU, PD_EOL, PD_TEXTMODE, PD_ENUM, PD_CLRENUM, PD_ERRMSG, PD_EPIC,
     PD_ELFTYPE, PD_ELFMACHINE, PD_ELFCLASS, PD_ELFRELA, PD_ELFWIDTH,
-    PD_ELFEXTERN, PD_ELFDWARF, PD_ELFHEADER
+    PD_ELFEXTERN, PD_ELFDWARF, PD_ELFHEADER, PD_ECHO
 };
 
 static int pat_dir_kind(const PatEntry *e){
@@ -1164,7 +1168,7 @@ static int pat_dir_kind(const PatEntry *e){
         { ".elfmachine", PD_ELFMACHINE }, { ".elfclass", PD_ELFCLASS },
         { ".elfrela", PD_ELFRELA }, { ".elfwidth", PD_ELFWIDTH },
         { ".elfextern", PD_ELFEXTERN }, { ".elfdwarf", PD_ELFDWARF },
-        { ".elfheader", PD_ELFHEADER }, { NULL, 0 } };
+        { ".elfheader", PD_ELFHEADER }, { ".echo", PD_ECHO }, { NULL, 0 } };
     if(!e || !e->f[0] || !e->f[0][0]) return PD_NONE;
     const char *n = e->f[0];
     for(int k=0; tbl[k].name; k++) if(strcmp(n, tbl[k].name) == 0) return tbl[k].kind;
@@ -1189,7 +1193,7 @@ static int pat_is_directive(const PatEntry *e){
         ".check", ".clrcheck", ".reloc", ".clrreloc", ".map", ".free",
         ".passthru", ".eol", ".textmode", ".enum", ".clrenum", ".error",
         ".elftype", ".elfmachine", ".elfclass", ".elfrela", ".elfwidth",
-        ".elfextern", ".elfdwarf", ".elfheader", NULL };
+        ".elfextern", ".elfdwarf", ".elfheader", ".echo", NULL };
     if(!e || !e->f[0] || !e->f[0][0]) return 0;
     const char *n = e->f[0];
     for(int k=0; tbl[k]; k++) if(strcmp(n, tbl[k]) == 0) return 1;
@@ -1250,6 +1254,175 @@ static int plain_number_text(const char *s){
     if(n == 0) return 0;
     while(*p==' '||*p=='\t') p++;
     return *p == '\0';
+}
+
+/* `.echo(項目, …)` の 1 項目。is_str なら text は表示する文字列そのもの、
+ * でなければパターン層の式のテキストである。 */
+typedef struct { int is_str; char *text; } EchoItem;
+
+/* `.echo` の文字列リテラルの中身をほどく。逃げ記号はミニ言語と同じ4つ。
+ * 成功なら NULL、誤りならその文言を返す。axx.py の _echo_str_unescape と同じ。 */
+static const char *echo_str_unescape(const char *s, int n, char **out,
+                                     char *eb, size_t ebsz){
+    char *d = malloc((size_t)n + 1);
+    if(!d){ perror("malloc"); exit(1); }
+    int w = 0;
+    for(int k = 0; k < n; k++){
+        char c = s[k];
+        if(c == '\\'){
+            if(k + 1 >= n){ free(d); return "dangling '\\' in a string"; }
+            char e = s[k+1], v;
+            if(e == '\\')      v = '\\';
+            else if(e == '"')  v = '"';
+            else if(e == 'n')  v = '\n';
+            else if(e == 't')  v = '\t';
+            else {
+                snprintf(eb, ebsz, "unknown escape '\\%c' in a string", e);
+                free(d);
+                return eb;
+            }
+            d[w++] = v;
+            k++;
+            continue;
+        }
+        d[w++] = c;
+    }
+    d[w] = 0;
+    *out = d;
+    return NULL;
+}
+
+static void echo_items_free(EchoItem *v, int n){
+    for(int k = 0; k < n; k++) free(v[k].text);
+    free(v);
+}
+
+/* `.echo(項目, …)` の引数欄を項目の並びにする。成功なら NULL を返し、
+ * 書き方の誤りならその文言（eb を使うこともある）を返す。
+ * axx.py の _echo_items_parse() と同じ規則である。 */
+static const char *echo_items_parse(const char *text, EchoItem **outv, int *outn,
+                                    char *eb, size_t ebsz){
+    *outv = NULL;
+    *outn = 0;
+    int n = (int)strlen(text);
+    int i = 0;
+    while(i < n && (text[i]==' ' || text[i]=='\t')) i++;
+    if(i >= n || text[i] != '(') return "needs '.echo(item, item, ...)'";
+    i++;
+    int start = i, end = -1, depth = 0, instr = 0;
+    while(i < n){
+        char c = text[i];
+        if(instr){
+            if(c == '\\'){ i += 2; continue; }
+            if(c == '"') instr = 0;
+            i++;
+            continue;
+        }
+        if(c == '"') instr = 1;
+        else if(c=='(' || c=='[' || c=='{') depth++;
+        else if(c==')' || c==']' || c=='}'){
+            if(depth == 0 && c == ')'){ end = i; break; }
+            if(depth > 0) depth--;
+        }
+        i++;
+    }
+    if(end < 0) return "missing ')'";
+    for(const char *q = text + end + 1; *q; q++)
+        if(*q != ' ' && *q != '\t') return "unexpected text after '.echo(...)'";
+
+    /* 最上位のカンマで切る。文字列と括弧の中のカンマは区切りにしない。 */
+    const char *inner = text + start;
+    int m = end - start;
+    int cap = 8, cnt = 0;
+    int *ps = malloc((size_t)cap * sizeof(int));
+    int *pl = malloc((size_t)cap * sizeof(int));
+    if(!ps || !pl){ perror("malloc"); exit(1); }
+    int bs = 0;
+    depth = 0; instr = 0;
+    for(int k = 0; k <= m; ){
+        if(k == m || (!instr && depth == 0 && inner[k] == ',')){
+            if(cnt == cap){
+                cap *= 2;
+                ps = realloc(ps, (size_t)cap * sizeof(int));
+                pl = realloc(pl, (size_t)cap * sizeof(int));
+                if(!ps || !pl){ perror("realloc"); exit(1); }
+            }
+            ps[cnt] = bs;
+            pl[cnt] = k - bs;
+            cnt++;
+            if(k == m) break;
+            bs = k + 1;
+            k++;
+            continue;
+        }
+        char c = inner[k];
+        if(instr){
+            if(c == '\\' && k + 1 < m){ k += 2; continue; }
+            if(c == '"') instr = 0;
+            k++;
+            continue;
+        }
+        if(c == '"') instr = 1;
+        else if(c=='(' || c=='[' || c=='{') depth++;
+        else if(c==')' || c==']' || c=='}'){ if(depth > 0) depth--; }
+        k++;
+    }
+
+    /* `.echo()` は空行。 */
+    if(cnt == 1){
+        int a = ps[0], b = ps[0] + pl[0];
+        while(a < b && (inner[a]==' ' || inner[a]=='\t')) a++;
+        if(a == b){ free(ps); free(pl); return NULL; }
+    }
+
+    EchoItem *items = malloc((size_t)cnt * sizeof(EchoItem));
+    if(!items){ perror("malloc"); exit(1); }
+    int ni = 0;
+    const char *err = NULL;
+    for(int t = 0; t < cnt; t++){
+        int a = ps[t], b = ps[t] + pl[t];
+        while(a < b && (inner[a]==' ' || inner[a]=='\t')) a++;
+        while(b > a && (inner[b-1]==' ' || inner[b-1]=='\t')) b--;
+        if(a == b){ err = "empty item in the argument list"; break; }
+        if(inner[a] == '"'){
+            int j = a + 1;
+            while(j < b){
+                if(inner[j] == '\\'){ j += 2; continue; }
+                if(inner[j] == '"') break;
+                j++;
+            }
+            if(j >= b){
+                snprintf(eb, ebsz, "unterminated string: '%.*s'", b - a, inner + a);
+                err = eb;
+                break;
+            }
+            if(j != b - 1){
+                snprintf(eb, ebsz, "unexpected text after a string: '%.*s'", b - a, inner + a);
+                err = eb;
+                break;
+            }
+            char *sv = NULL;
+            const char *e2 = echo_str_unescape(inner + a + 1, j - a - 1, &sv, eb, ebsz);
+            if(e2){ err = e2; break; }
+            items[ni].is_str = 1;
+            items[ni].text   = sv;
+            ni++;
+        } else {
+            char *sv = malloc((size_t)(b - a) + 1);
+            if(!sv){ perror("malloc"); exit(1); }
+            memcpy(sv, inner + a, (size_t)(b - a));
+            sv[b - a] = 0;
+            items[ni].is_str = 0;
+            items[ni].text   = sv;
+            ni++;
+        }
+    }
+    free(ps);
+    free(pl);
+    if(err){ echo_items_free(items, ni); return err; }
+    *outv = items;
+    *outn = ni;
+    return NULL;
 }
 
 /* パターン表を読み終えた後に一度だけ呼ぶ。行ごとに変わらない性質を控える。 */
@@ -6749,6 +6922,44 @@ static int dir_errmsg(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.echo(項目, 項目, …)` — パターンファイルの本文行に書けるデバッグ出力。
+ *
+ * ミニ言語の `.echo`（`.func` の本体に書くもの）と同じ体裁で標準エラーへ 1 行
+ * 出す。ワードは出さないので、足しても消しても生成されるバイト列は変わらない。
+ * 項目は `"..."` の文字列リテラルかパターン層の式で、混ぜて書ける。
+ * `.echo()` は空行。
+ *
+ * 照合はソース1行ごとにパターン表をたどり直すので、この行もソース1行につき
+ * 1回実行される。書いた位置で回数は変わらない（照合は一番具体的なパターンを
+ * 選ぶために表を走査しきるため）。命令長を測るだけの試し打ちと収束途中の
+ * パス1では黙るので、組み立てた1行につき1行だけ出る。
+ * axx.py の echo_processing() と同じ規則である。 */
+static int dir_echo(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".echo") != 0) return 0;
+    AsmState *st = &asmb->st;
+    /* 黙る番なら式も評価しない。未定義ラベルの番兵を踏んで
+     * error_undefined_label を立ててしまわないようにするためである。 */
+    if(!should_report_errors(st) || st->pass1_size_mode) return 1;
+    EchoItem *items = (EchoItem*)e->echo_items;
+    int n = e->echo_nitems;
+    if(n <= 0){ m_echo_write(NULL, 0); return 1; }
+    char **parts = malloc((size_t)n * sizeof(char*));
+    if(!parts){ perror("malloc"); exit(1); }
+    for(int k = 0; k < n; k++){
+        if(items[k].is_str){ parts[k] = items[k].text; continue; }
+        int io = 0;
+        uint256_t v = expr_expression_pat(asmb, items[k].text, 0, &io);
+        char cb[96];
+        u256_to_pydec(v, cb, sizeof(cb));
+        parts[k] = strdup(cb);
+        if(!parts[k]){ perror("strdup"); exit(1); }
+    }
+    m_echo_write(parts, n);
+    for(int k = 0; k < n; k++) if(!items[k].is_str) free(parts[k]);
+    free(parts);
+    return 1;
+}
+
 /* この条件式は、リンカが値を決める変数を見ているか。
  *
  * `-o` で命令フィールド型のリロケーションを出す箇所では、命令語のビット欄は 0 で
@@ -9859,6 +10070,28 @@ static void readpat(Assembler *asmb, const char *fn){
                 }
                 continue;
             }
+            /* `.echo(項目, …)` は本文行に書ける。`::` で分解すると文字列の中の
+             * `::` まで欄の区切りにしてしまうので、行のまま1欄に収める。 */
+            if(strcmp(dk, ".ECHO") == 0){
+                if(cur_sub){
+                    axx_diagf(1, 0, " error - '.echo' cannot be written inside "
+                               "'.sub::%s'.\n", cur_sub->name);
+                    continue;
+                }
+                int ea = axx_skipspc(line, 0) + 5;   /* ".echo" の後ろ */
+                EchoItem *eiv = NULL;
+                int ein = 0;
+                char ebuf[512];
+                const char *eerr = echo_items_parse(line + ea, &eiv, &ein,
+                                                    ebuf, sizeof(ebuf));
+                if(eerr) axx_diagf(1, 0, " error - '.echo': %s\n", eerr);
+                PatEntry *pe = pv_push_blank(&asmb->st.pat);
+                pat_set(pe, 0, ".echo");
+                pat_set(pe, 1, line + ea);
+                pe->echo_items  = eiv;
+                pe->echo_nitems = ein;
+                continue;
+            }
         }
 
         char uline[16]={0};
@@ -12908,6 +13141,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         case PD_ENUM:     _dir_done = dir_enum(asmb,i);         break;
         case PD_CLRENUM:  _dir_done = dir_clrenum(asmb,i);      break;
         case PD_ERRMSG:   _dir_done = dir_errmsg(asmb,i);       break;
+        case PD_ECHO:     _dir_done = dir_echo(asmb,i);         break;
         case PD_ELFTYPE:  _dir_done = dir_elftype(asmb,i);      break;
         case PD_ELFMACHINE: _dir_done = dir_elfmachine(asmb,i);  break;
         case PD_ELFCLASS: _dir_done = dir_elfclass(asmb,i);      break;

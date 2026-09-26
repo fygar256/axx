@@ -4749,6 +4749,42 @@ class DirectiveProcessor:
                 self.state.enum_defs.pop(_v, None)
         return True
 
+    def echo_processing(self, i):
+        """`.echo(項目, 項目, …)` — パターンファイルの本文行に書けるデバッグ出力。
+
+        ミニ言語の `.echo`（`.func` の本体に書くもの）と同じ体裁で標準エラーへ
+        1 行出す。ワードは出さないので、足しても消しても生成されるバイト列は
+        変わらない。項目は `"..."` の文字列リテラルかパターン層の式で、混ぜて
+        書ける。`.echo()` は空行。
+
+        照合はソース1行ごとにパターン表をたどり直すので、この行もソース1行に
+        つき1回実行される。書いた位置で回数は変わらない（照合は一番具体的な
+        パターンを選ぶために表を走査しきるため）。命令長を測るだけの試し打ちと
+        収束途中のパス1では黙るので、組み立てた1行につき1行だけ出る。
+        caxx.c の dir_echo() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.echo':
+            return False
+        st = self.state
+        # 黙る番なら式も評価しない。未定義ラベルの番兵を踏んで
+        # error_undefined_label を立ててしまわないようにするためである。
+        if not st.should_report_errors() or st._pass1_size_mode:
+            return True
+        items, err = _echo_items_cached(i[1])
+        if err is not None:
+            return True                  # 読み込み時に報告済み
+        parts = []
+        for k, v in items:
+            if k == 's':
+                parts.append(v)
+            else:
+                val, _idx = self.expr_eval.expression_pat(v, 0)
+                # 表示は 256bit 符号つき 10 進。ミニ言語の `.echo` と同じ体裁に
+                # そろえ、caxx.c の u256_to_pydec() と同じ値にするためである。
+                parts.append(_mini_signed(val))
+        _echo_write(parts)
+        return True
+
     def passthru_processing(self, i):
         """`.passthru[::on|nonl|off]`
 
@@ -4967,6 +5003,7 @@ _PAT_DIRECTIVES = frozenset((
     '.setsym', '.clearsym', '.padding', '.bits', '.symbolc', '.vliw',
     '.check', '.clrcheck', '.reloc', '.clrreloc', '.map', '.free',
     '.passthru', '.eol', '.textmode', '.enum', '.clrenum', '.error',
+    '.echo',
     '.elftype', '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
     '.elfextern', '.elfdwarf', '.elfheader'))
 
@@ -5908,6 +5945,20 @@ class PatternFileReader:
                         cur.depth = 0
                 if l.strip():
                     cur.lines.append((l, fn, _mln))
+                continue
+
+            # `.echo(項目, …)` は本文行に書ける。`::` で分解すると文字列の中の
+            # `::` まで欄の区切りにしてしまうので、行のまま1欄に収める。
+            if _dk == '.ECHO':
+                if cur_sub is not None:
+                    diag(f" error - '.echo' cannot be written inside "
+                         f"'.sub::{cur_sub}'.", set_error=True)
+                    continue
+                _args = l.strip()[5:]
+                _it, _err = _echo_items_cached(_args)
+                if _err is not None:
+                    diag(f" error - '.echo': {_err}", set_error=True)
+                w.append(['.echo', _args, '', '', '', ''])
                 continue
 
             ww = self.include_pat(l, this_dir, _depth=_depth + 1, _chain=_chain)
@@ -9510,6 +9561,155 @@ def _echo_write(items):
     print(' '.join(_as_str(x) for x in items), file=sys.stderr)
 
 
+# `.echo` の引数欄 → (項目の並び, 文言) の控え。パターンの本文行は照合の
+# たびに通るので、1行ごとに解析し直さない。
+_ECHO_CACHE = {}
+
+
+def _echo_str_unescape(s):
+    """`.echo` の文字列リテラルの中身をほどく。逃げ記号はミニ言語と同じ4つ。"""
+    out = []
+    k = 0
+    n = len(s)
+    while k < n:
+        c = s[k]
+        if c == '\\':
+            if k + 1 >= n:
+                return None, "dangling '\\' in a string"
+            e = _MINI_ESC.get(s[k + 1])
+            if e is None:
+                return None, f"unknown escape '\\{s[k + 1]}' in a string"
+            out.append(e)
+            k += 2
+            continue
+        out.append(c)
+        k += 1
+    return ''.join(out), None
+
+
+def _echo_items_parse(text):
+    """`.echo(項目, …)` の引数欄を項目の並びにする。返すのは (並び, 文言)。
+
+    項目の種別は 's'（文字列そのまま）と 'e'（パターン層の式）。文字列の逃げ
+    記号はミニ言語の `.echo` と同じ `\\` `\"` `\n` `\t` の4つである。
+    文言が None でなければ書き方の誤りで、並びは None になる。
+    caxx.c の echo_items_parse() と同じ規則である。
+    """
+    n = len(text)
+    i = 0
+    while i < n and text[i] in ' \t':
+        i += 1
+    if i >= n or text[i] != '(':
+        return None, "needs '.echo(item, item, ...)'"
+    i += 1
+    start = i
+    end = -1
+    depth = 0
+    instr = False
+    while i < n:
+        c = text[i]
+        if instr:
+            if c == '\\':
+                i += 2
+                continue
+            if c == '"':
+                instr = False
+            i += 1
+            continue
+        if c == '"':
+            instr = True
+        elif c in '([{':
+            depth += 1
+        elif c in ')]}':
+            if depth == 0 and c == ')':
+                end = i
+                break
+            if depth > 0:
+                depth -= 1
+        i += 1
+    if end < 0:
+        return None, "missing ')'"
+    for c in text[end + 1:]:
+        if c not in ' \t':
+            return None, "unexpected text after '.echo(...)'"
+    inner = text[start:end]
+
+    # 最上位のカンマで切る。文字列と括弧の中のカンマは区切りにしない。
+    parts = []
+    buf = []
+    depth = 0
+    instr = False
+    k = 0
+    m = len(inner)
+    while k < m:
+        c = inner[k]
+        if instr:
+            buf.append(c)
+            if c == '\\' and k + 1 < m:
+                buf.append(inner[k + 1])
+                k += 2
+                continue
+            if c == '"':
+                instr = False
+            k += 1
+            continue
+        if c == '"':
+            instr = True
+        elif c in '([{':
+            depth += 1
+        elif c in ')]}':
+            if depth > 0:
+                depth -= 1
+        elif c == ',' and depth == 0:
+            parts.append(''.join(buf))
+            buf = []
+            k += 1
+            continue
+        buf.append(c)
+        k += 1
+    parts.append(''.join(buf))
+    if len(parts) == 1 and parts[0].strip() == '':
+        return [], None                  # `.echo()` は空行
+
+    items = []
+    for p in parts:
+        p = p.strip()
+        if p == '':
+            return None, "empty item in the argument list"
+        if p[0] == '"':
+            j = 1
+            pl = len(p)
+            while j < pl:
+                if p[j] == '\\':
+                    j += 2
+                    continue
+                if p[j] == '"':
+                    break
+                j += 1
+            if j >= pl:
+                return None, f"unterminated string: '{p}'"
+            if j != pl - 1:
+                return None, f"unexpected text after a string: '{p}'"
+            sv, err = _echo_str_unescape(p[1:j])
+            if err is not None:
+                return None, err
+            items.append(('s', sv))
+        else:
+            items.append(('e', p))
+    return items, None
+
+
+def _echo_items_cached(text):
+    """`.echo` の引数欄の解析結果を控えから引く。"""
+    ent = _ECHO_CACHE.get(text)
+    if ent is None:
+        ent = _echo_items_parse(text)
+        if len(_ECHO_CACHE) >= 65536:
+            _ECHO_CACHE.clear()
+        _ECHO_CACHE[text] = ent
+    return ent
+
+
 def _cmp_eq(a, b):
     if isinstance(a, str) != isinstance(b, str):
         return False
@@ -12450,6 +12650,7 @@ class Assembler:
             '.enum':     d.enum_processing,
             '.clrenum':  d.clrenum_processing,
             '.error':    d.errmsg_processing,
+            '.echo':     d.echo_processing,
             '.elftype':  d.elftype_processing,
             '.elfmachine': d.elfmachine_processing,
             '.elfclass':   d.elfclass_processing,

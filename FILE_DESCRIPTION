@@ -46,6 +46,12 @@ symcap.axx                          pattern file for the `!Y<set>[<var>]` symbol
                                     spelling can be rewritten into another's
                                     (manual 3.6.3)
 symcap.s                            test assemble file for symcap.axx
+echo.axx                            pattern file for `.echo` written on a body
+                                    line of a pattern file: strings and
+                                    pattern-layer expressions printed to stderr
+                                    once per source line, emitting no words
+                                    (manual 3.14.1)
+echo.s                              test assemble file for echo.axx
 passthru.axx                        pattern file for .passthru and .eol: lines
                                     that match no pattern are let through as
                                     text, one output line per source line

@@ -110,7 +110,8 @@ the items of one call share a line separated by spaces; `.echo()` prints an
 empty line. The layout comes from the same output routine the macro layer's
 `!echo` uses, so the two agree. Nothing is printed while instruction lengths
 are being measured or while pass 1 is still converging, so a line appears once
-per assembled instruction.
+per assembled instruction. The same `.echo` can also be written on a body line
+of a pattern file (Technical_Manual section 3.14.1).
 
 ```
 .echo("Example", n, 1)          /* -> Example 7 1 */

@@ -37,10 +37,11 @@ axx 8080toz80.axx hello8080.s -V > out.s  # translated text to stdout
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all twenty bundled pattern/source pairs with both
-implementations and `cmp`s the results. For the two `.textmode` pairs it also
+exactly that: `test1` assembles all twenty-four bundled pattern/source pairs with
+both implementations and `cmp`s the results. For the two `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
-`-V`, for twenty-two comparisons in all.
+`-V`, and for the `echo.axx` pair the `.echo` lines each one writes to standard
+error, for twenty-seven comparisons in all.
 
 **Contents**
 
@@ -1665,6 +1666,51 @@ the natural style. A code that is never given a message still raises its
 error and still blocks the output file from being written; only the printed
 text stays blank, exactly as for an undeclared code today.
 
+#### 3.14.1 `.echo` — debug output from a body line
+
+```
+.echo(<item>, <item>, ...)
+```
+
+A debug print that can be written on a **body line** of a pattern file. It writes
+one line to stderr and emits no words, so adding or removing it never changes the
+bytes produced.
+
+An item is either a `"..."` string literal or a pattern-layer expression, and the
+two can be mixed. Strings print as they are, values as signed 256-bit decimal, and
+the items of one `.echo` are joined with spaces onto one line. `.echo()` prints an
+empty line. The formatting comes from the routine shared with the mini language's
+`.echo` (section 3.15) and the macro layer's `!echo` (section 7), so all three
+agree.
+
+```
+.setsym::N::7
+.echo("head", 1+2, "#N=", #N)      /* -> head 3 #N= 7 */
+.echo("tab:\there", "colon::ok")   /* -> tab:<TAB>here colon::ok */
+.echo()                            /* -> an empty line */
+```
+
+The escapes in a string are the same four as in the mini language's `.echo` —
+`\\` `\"` `\n` `\t` — and any other `\` is an error. A string cannot contain
+`/*`, which is the pattern file comment opener and is removed before `.echo` reads
+the line. The line is not split into fields on `::`, so a `::` inside a string
+prints as written.
+
+**When it prints.** Matching walks the pattern table again for every source line,
+so an `.echo` line runs once per source line. Where you write it does not change
+that count (matching scans the whole table to pick the most specific pattern). It
+stays silent during the trial encodings that only measure instruction length and
+during pass 1 while relaxation is still converging, so exactly one line is printed
+per assembled line. Running once per source line does slow matching down, so
+remove it once the debugging is done.
+
+The expressions are pattern-layer expressions, so `#name` (a `.setsym` numeric
+symbol), labels and `$$` can be written (section 6.3). Pattern variables `a`-`z`
+are cleared before a directive line is evaluated, so they hold no value there.
+
+`.echo` cannot be written inside a `.sub` (section 3.7.2). An `.echo` in the body
+of a `.func` is a mini language statement (section 3.15).
+
 ### 3.15 Mini language (`.func` / `.call`)
 
 A `binary_list` element may be `.call name(argument, ...)`, which runs a
@@ -1673,7 +1719,8 @@ function produces — the values it passes to `.emit`, followed by its return
 value if it has one. The language has assignment, `.if`/`.elif`, `.while`,
 `.for`, recursion and arrays, so an encoding that cannot be written as a fixed
 expression can be computed instead. `.echo` prints to stderr without emitting
-anything, for working out why a function produced what it did.
+anything, for working out why a function produced what it did (the same `.echo`
+can also be written on a body line of a pattern file; section 3.14.1).
 
 A function is defined at the top level of a pattern file:
 
@@ -3252,6 +3299,8 @@ The x86_64 pattern file is also maintained separately at
 | **textmode.axx** | 1.8 KB | 13 | **textmode.s** | `.textmode`, `!L`, `{{.exp()}}` and `;` comments (3.18); test only |
 | **arrindex.axx** | 860 B | 14 | **arrindex.s** | Array symbols: bare names as items, a name as a subscript, `.index` (3.6.1); test only |
 | **passthru.axx** | 686 B | 6 | **passthru.s** | `.passthru` and `.eol` (3.16 / 3.17); test only |
+| **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
+| **echo.axx** | 1.2 KB | 6 | **echo.s** | `.echo` on a body line (3.14.1); test only |
 | **elftype.axx** | 1.5 KB | 15 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
 | **elfgen.axx** | 2.7 KB | 24 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
@@ -3262,13 +3311,14 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 `itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
 `aarch64_logical_mini_demo.s`.
 
-`test1` runs all twenty of the pairs above through both implementations and
+`test1` runs all twenty-four pairs through both implementations and
 compares the `-b` raw binaries. For the two pairs that use `.textmode`
 (`textmode.axx` and `8080toz80.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
 `elftype.s` and `elfgen.axx` / `elfgen.s` pairs are about relocations and the
-ELF header, so for those two the `-o` ELF objects are compared, for twenty-four
-comparisons in all.
+ELF header, so for those two the `-o` ELF objects are compared. For the
+`echo.axx` / `echo.s` pair the `.echo` lines written to standard error are
+compared as well, for twenty-seven comparisons in all.
 
 The `aarch64.axx` / `aarch64.s` pair is much the slowest of them: the Python
 implementation takes about twenty seconds on it, against about a second for the
@@ -3294,9 +3344,9 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all twenty bundled pattern/source pairs with both
+`test1` assembles all twenty-four bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
-two `.textmode` pairs.
+two `.textmode` pairs and the `.echo` lines of the `echo.axx` pair.
 
 ### C.2 External
 
