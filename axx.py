@@ -313,6 +313,221 @@ def _lead_caps(pat_text):
     return ''.join(p), closed
 
 
+_HOIST_TEXT_ONLY = ('.check', '.clrcheck', '.reloc', '.clrreloc',
+                    '.symbolc', '.passthru', '.eol', '.textmode')
+
+
+def _pat_text_dynamic(t):
+    """ソース行によって値が変わりうる書き方を含むか。
+
+    パターン行の式はパターン変数（小文字）・`$.`/`$$`・`#名前`・`'`・`@` を
+    読めるので（マニュアル 6.3）、これらがあれば行ごとに結果が変わりうる。
+    """
+    for ch in t:
+        if ch in "!$#@'":
+            return True
+        if 'a' <= ch <= 'z':
+            return True
+    return False
+
+
+def _pat_is_name_list(t):
+    """名前の並び（`X0,X1,…`）か。カンマがあれば集合として読まれるので、
+    式の評価（ラベルを読みうる）には落ちない。"""
+    comma = False
+    for ch in t:
+        if ch == ',':
+            comma = True
+        elif ch in ' \t':
+            pass
+        elif not ('A' <= ch <= 'Z' or '0' <= ch <= '9' or ch == '_'):
+            return False
+    return comma
+
+
+def _pat_dir_line_invariant(i):
+    """このディレクティブ行は、どのソース行でも同じ結果になるか。
+
+    判断がつかないものは False を返す（畳み込まない側に倒す）。
+    caxx.c の pat_dir_line_invariant() と同じ規則である。
+    """
+    name = i[0]
+    if name == '.setsym':
+        nm  = i[1] if i[1] else i[2]
+        val = i[2] if i[1] else ''
+        if _pat_text_dynamic(nm):
+            return False
+        if not val:
+            return True                      # 値なし（0 になる）
+        v = val.lstrip(' \t')
+        if v[:1] == '"':
+            return True                      # 文字列シンボル
+        if v[:1] == '[':
+            return False                     # 配列は中身が式になりうる
+        if _CONST_SETSYM_RE.match(val):
+            return True                      # 定数式
+        return _pat_is_name_list(val)        # 名前の集合
+    if name in _HOIST_TEXT_ONLY:
+        # どれも名前や型名の文字どおりの並びだけを見る（式を読まない）。
+        # 変数名の小文字は普通なので _pat_text_dynamic は使わない。
+        for f in i[1:]:
+            if f and any(ch in "!$#@" for ch in f):
+                return False
+        return True
+    if name == '.bits':
+        for f in i[1:]:
+            if f and StringUtils.upper(f) not in ('BIG', 'LITTLE') \
+                    and not _CONST_SETSYM_RE.match(f):
+                return False
+        return True
+    if name in ('.padding', '.vliw'):
+        for f in i[1:]:
+            if f and not _CONST_SETSYM_RE.match(f):
+                return False
+        return True
+    if name == '.error':
+        return bool(_CONST_SETSYM_RE.match(i[1])) and i[2].lstrip(' \t')[:1] == '"'
+    if name == '.elftype':
+        # 型名の表は行ごとに作り直さないので、同じ宣言を毎行やり直す必要はない。
+        if not i[1] or any(ch in "!$#@'" for ch in i[1]):
+            return False
+        return bool(_CONST_SETSYM_RE.match(i[2]))
+    # `.clearsym` `.map` `.free` `.enum` `.clrenum` `EPIC` は畳み込まない。
+    return False
+
+
+def _pat_hoist_scan(pat, isdir):
+    """パターン表の先頭に並ぶ「行によって結果が変わらないディレクティブ行」を
+    どこまで畳み込めるか決める。
+
+    照合はソース1行ごとにパターン表を頭からたどり直すので、レジスタ名の
+    `.setsym` や `.check` が並ぶ前置きも行数ぶん実行していた（aarch64 では
+    1 行につき 573 行）。1度だけ実行して状態を控え、以後は控えた状態を戻す。
+
+    返すのは (畳み込む行数, 前置きが書く欄の集合) である。0 なら畳み込まない。
+    条件は caxx.c の pat_hoist_scan() と同じ。
+      - 先頭から続くのが空行か畳み込めるディレクティブ行だけであること
+        （普通のパターン行が出たらそこで終わり）。
+      - 前置きが読む名前を、前置きより後ろの行が書き換えないこと。
+    """
+    h = 0
+    fields = set()
+    while h < len(pat):
+        i = pat[h]
+        if i is None or not any(i):
+            h += 1
+            continue
+        if not isdir[h] or not _pat_dir_line_invariant(i):
+            break
+        if i[0] == '.bits':
+            fields.add('bits')
+        elif i[0] == '.padding':
+            fields.add('padding')
+        elif i[0] == '.symbolc':
+            fields.add('symbolc')
+        elif i[0] == '.vliw':
+            fields.add('vliw')
+        h += 1
+    if h <= 0 or h >= len(pat):
+        return 0, fields
+
+    # 前置きは名前を読む（`.check` の名前並び、集合の `.setsym` など）。
+    # 配列・文字列シンボルの表は1行ごとに作り直さないので、前置きが読む名前を
+    # 後ろの行が書き換えると控えた状態が古くなる。
+    reads = set()
+    for row in range(h):
+        i = pat[row]
+        if i is None:
+            continue
+        for f in i[1:]:
+            for tok in re.findall(r'[A-Z0-9_]+', f):
+                reads.add(tok)
+    for row in range(h, len(pat)):
+        i = pat[row]
+        if i is None or not isdir[row]:
+            continue
+        nm = i[0]
+        if nm == '.setsym':
+            if not i[1]:
+                return 0, fields
+            if _CONST_SETSYM_RE.match(i[2]):
+                continue                 # 数値だけならシンボル表にしか触らない
+            w = i[1]
+        elif nm in ('.clearsym', '.free'):
+            w = i[2] if i[2] else i[1]
+            if not w:
+                return 0, fields         # 全部消す
+        else:
+            continue
+        if StringUtils.upper(w) in reads:
+            return 0, fields
+    return h, fields
+
+
+def _build_pat_index(pat, isdir):
+    """ニーモニック（パターン先頭の連続する大文字）を鍵にした索引を作る。
+
+    ソース1行ごとにパターン表を頭から全部たどり、1行ずつ _lead_caps() の
+    足切りにかけていた。パターン数 × ソース行数の空回りで、aarch64 の
+    パターンファイル（展開後 1 万行）では 1 行につき 1 万回になる。
+    行のニーモニックで引ける表にしておけば、たどるのは候補だけで済む。
+
+    返すのは (索引, always, 鍵の最大長) である。索引は
+    ニーモニック → (直後が英数字でもよい行, 直後が英数字なら不一致の行)。
+    always はニーモニックを持たない行とディレクティブ行の番号（昇順）で、
+    行ごとに必ずたどる。索引が返す候補と always を合わせた集合は、
+    足切りが通す集合とちょうど同じである。
+    """
+    index = {}
+    always = []
+    maxkey = 0
+    for row, i in enumerate(pat):
+        pfx = ''
+        closed = True
+        if i and i[0]:
+            pfx, closed = _lead_caps(i[0])
+        # ディレクティブ行は名前が大文字のこともある（`EPIC`）が、行ごとに
+        # 必ず実行しなければならないので always に入れる。
+        if not pfx or isdir[row]:
+            always.append(row)
+            continue
+        ent = index.get(pfx)
+        if ent is None:
+            ent = index[pfx] = ([], [])
+        ent[1 if closed else 0].append(row)
+        if len(pfx) > maxkey:
+            maxkey = len(pfx)
+    return index, always, maxkey
+
+
+def _pat_candidates(index, maxkey, lin):
+    """照合にかける行 lin のニーモニックで索引を引き、候補行を昇順で返す。"""
+    if not maxkey:
+        return ()
+    key = []
+    nextraw = []
+    for ci, ch in enumerate(lin):
+        if ch == ' ':
+            continue
+        up = ch.upper()
+        # 1文字にならない大文字化（'ß' → 'SS' 等）はニーモニックに現れない。
+        key.append(up if len(up) == 1 else '\0')
+        nextraw.append(lin[ci + 1] if ci + 1 < len(lin) else '')
+        if len(key) >= maxkey:
+            break
+    cand = []
+    for k in range(1, len(key) + 1):
+        ent = index.get(''.join(key[:k]))
+        if ent is None:
+            continue
+        cand.extend(ent[0])
+        if nextraw[k - 1] not in _PFX_WORD:
+            cand.extend(ent[1])
+    if len(cand) > 1:
+        cand.sort()
+    return cand
+
+
 # パターン記法の基本規約: 大文字＝そのまま照合するリテラル（ニーモニック）、
 # 小文字＝.setsym で定義されたシンボル（レジスタ名等）を取るプレースホルダ。
 CAPITAL = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -672,6 +887,41 @@ def _build_elf_machine_tables(raw):
 ELF_MACHINES = _build_elf_machine_tables(_ELF_MACHINE_RAW)
 
 
+def _reloc_named(state, mach, name):
+    """型名を型番号にする。無ければ None。
+
+    `.elftype::名前::値` で決めた名前を先に引き、無ければ `-m` で選んだマシンの
+    名前表を引く。型名を書けるところ（パターンファイルの `.reloc`、ソースの
+    `.extern`/`.global`/`.EQU`/`.RELOCTYPE`、取り込みファイル）は全部ここを通る。
+    caxx.c の elf_reloc_named() と同じ規則である。
+    """
+    if not name:
+        return None
+    key = name.lower()
+    rt = state.elftypes.get(key)
+    if rt is not None:
+        return rt
+    return mach['named'].get(key) if mach else None
+
+
+def _reloc_reverse(state, mach, rtype):
+    """型番号から型名を引く（`-E` の書き出しに使う）。無ければ ''。
+
+    マシンの名前表を先に引き、無ければ `.elftype` で決めた名前を使う。取り込み
+    側は名前を _reloc_named() で引くので、これで書き出し→取り込みが往復できる。
+    caxx.c の elf_reloc_reverse() と同じ規則である。
+    """
+    if rtype is None:
+        return ''
+    nm = mach['reverse'].get(rtype, '') if mach else ''
+    if nm:
+        return nm
+    for k, v in state.elftypes.items():
+        if v == rtype:
+            return k
+    return ''
+
+
 # AArch64 の「命令フィールド型」リロケーション。
 #
 # データ型（ABS64 など）は対象の値がそのまま連続バイトに並ぶが、こちらは 32bit
@@ -850,6 +1100,15 @@ class AssemblerState:
         self.pat = []            # 読み込んだパターン表
         # pat と同じ並びで「その行がディレクティブか」を持つ表（下記 pat と対）。
         self.pat_isdir = []
+        self.pat_index = {}      # ニーモニック → 候補行（_build_pat_index）
+        self.pat_always = []     # 行ごとに必ずたどる行の番号
+        self.pat_maxkey = 0      # 索引の鍵の最大長
+        self.pat_dirfn = []      # 行ごとのディレクティブ処理（無ければ None）
+        self.hoist_rows = 0      # 畳み込む先頭ディレクティブ行の数（_pat_hoist_scan）
+        self.hoist_fields = set()  # 前置きが書く欄
+        self.hoist_first_ai = 0  # always の並びで最初に来る非前置き行の位置
+        self.hdrsnap = None      # 前置きを実行し終えた状態
+        self.diag_count = 0      # 出そうとした診断の数（前置きの判定に使う）
 
         self.vliw = VLIWState()
 
@@ -939,6 +1198,10 @@ class AssemblerState:
         # `.setsym::名前::[項目,項目,…]` で登録された配列シンボル。項目は数値
         # (int/float) でも文字列 (str) でもよく、`x[3]` や `#x[3]` で引く。
         self.arrsymbols = {}
+        self.arrgen = 0          # 配列シンボルの表が変わった回数（.check の控え用）
+        # `.elftype::名前::値` で決めたリロケーション型名（小文字 → 型番号）。
+        # 型名を書けるところはまずこの表を引き、無ければマシンの名前表を引く。
+        self.elftypes = {}
         # `.passthru` の設定。0=切（マッチしない行は Syntax error）、
         # 1=素通し（マッチしない行をそのままテキストとして出す）。
         self.passthru = 0
@@ -1040,6 +1303,10 @@ class AssemblerState:
         表示できたときに限り True を返す。set_error=True なら同時に had_error を
         立てるので、以降 run() は出力を書かなくなる。
         """
+        # 出そうとした数を、抑止されるものも含めて数える（パスによって
+        # 見え方が変わるので、抑止の判定より前に数える）。前置きの畳み込みが
+        # 「この前置きは診断を出す」と気づくために使う。
+        self.diag_count += 1
         if not force:
             if self._in_match_attempt:
                 if self._diag_pending is not None:
@@ -2204,6 +2471,15 @@ class LabelManager:
         is_imported = False
 
         entry = [v, s, is_equ, is_imported]
+        if reloc_type is None:
+            # リロケーション型の指定（`.global 名前::型名`、`.extern`、
+            # `.EQU x::型名`）はラベルの定義とは別に宣言されるものなので、
+            # 同じ名前を置き直しても消さない。`.global` は宣言がラベル定義より
+            # 前に書かれるのが普通で、ここで消すと指定が効かなかった。
+            # caxx.c の lmap_set() と同じ扱いである。
+            _old = self.state.labels.get(k)
+            if _old is not None and len(_old) > 4 and _old[4] is not None:
+                reloc_type = _old[4]
         if reloc_type is not None:
             entry.append(reloc_type)
 
@@ -3457,23 +3733,47 @@ class DirectiveProcessor:
             self.state.symbols.pop(key, None)
             self.state.strsymbols.pop(key, None)
             self.state.arrsymbols.pop(key, None)
+            self.state.arrgen += 1
         else:
             self.state.symbols = {}
             self.state.strsymbols = {}
             self.state.arrsymbols = {}
+            self.state.arrgen += 1
 
         return True
 
     # 定数と分かった `.setsym` の値欄 → 評価結果。_CONST_SETSYM_RE を参照。
     _const_setsym_cache = {}
+    _upper_key_cache = {}    # `.setsym` の名前欄 → 大文字にしたもの
+    _check_cache = {}        # (変数, 名前並び) → (arrgen, 展開した一覧)
+    _elftype_cache = {}      # `.elftype` の値欄 → 型番号（不正なら None）
 
     def set_symbol(self, i):
         if len(i) == 0 or i[0] != '.setsym':
             return False
 
         if i[1]:
-            key = StringUtils.upper(i[1])
             value_field = i[2]
+            # 前置きの外にある `.setsym` はソース1行ごとに通る。ただの数なら
+            # 名前の大文字化以外に何も要らないので、ここで済ませる。
+            if _PLAIN_NUM_RE.match(value_field):
+                _uc = DirectiveProcessor._upper_key_cache
+                key = _uc.get(i[1])
+                if key is None:
+                    key = StringUtils.upper(i[1])
+                    if len(_uc) >= 65536:
+                        _uc.clear()
+                    _uc[i[1]] = key
+                _c = DirectiveProcessor._const_setsym_cache
+                v = _c.get(value_field, _SETSYM_MISS)
+                if v is _SETSYM_MISS:
+                    v, _idx = self.expr_eval.expression_pat(value_field, 0)
+                    if len(_c) >= 65536:
+                        _c.clear()
+                    _c[value_field] = v
+                self.state.symbols[key] = v
+                return True
+            key = StringUtils.upper(i[1])
         elif i[2]:
             key = StringUtils.upper(i[2])
             value_field = ''
@@ -3488,6 +3788,7 @@ class DirectiveProcessor:
             return True
         if _vf.startswith('['):
             self.state.arrsymbols[key] = arr_items_from_text(self.expr_eval, _vf)
+            self.state.arrgen += 1
             return True
         # `.setsym::y::x` — x が文字列／配列シンボルなら、その写しを作る。
         if symbol_copy_from_name(self.state, key, _vf):
@@ -3795,6 +4096,14 @@ class DirectiveProcessor:
         if var is None:
             self.state.diag(f" error - .check: variable should be a lower case name ('{var_field}').", set_error=True)
             return True
+        # 同じ行を毎行組み立て直さない。もとになる配列シンボルの表が変わって
+        # いなければ、前に作った一覧をそのまま渡す（一覧は作ったあと書き換え
+        # ないので使い回せる）。caxx.c の dir_check() の控えと同じ。
+        _ck = (var, syms_field)
+        _ce = DirectiveProcessor._check_cache.get(_ck)
+        if _ce is not None and _ce[0] == self.state.arrgen:
+            self.state.check_constraints[var] = _ce[1]
+            return True
         syms = []
         for nm in self.elem_list_expand(syms_field):
             if nm == '':
@@ -3804,7 +4113,63 @@ class DirectiveProcessor:
                     syms.append(CHECK_OMIT)
                 continue
             syms.append(nm)
+        if len(DirectiveProcessor._check_cache) >= 65536:
+            DirectiveProcessor._check_cache.clear()
+        DirectiveProcessor._check_cache[_ck] = (self.state.arrgen, syms)
         self.state.check_constraints[var] = syms
+        return True
+
+    def elftype_processing(self, i):
+        """`.elftype::<名前>::<値>` — リロケーション型名を自分で決める。
+
+        決めた名前は、型名を書けるところ全部で使える。
+          パターンファイル: `.reloc::<変数>::<名前>`
+          ソース          : `.extern 名前::<名前>` `.global 名前::<名前>`
+                            `.EQU x::<名前>` `.RELOCTYPE`
+          取り込みファイル: `ラベル::<名前>`
+        値は型番号（ELF の r_info の型欄に入る数）で、1 以上の整数の定数式である
+        （0 は「型を指定しない」の意味で内部的に使っているので取らない）。
+        同じ名前を2度書けば後の宣言が勝つ。`-m` で選んだマシンの名前表に同じ
+        綴りがあっても、この宣言のほうを先に引く（自分の宣言で上書きできる）。
+
+        名前の読み方は `.reloc` の型名と同じ（空白は落とし、大小は区別しない）。
+        値は行によって変わらないので、最初の1回だけ評価して控える。
+        caxx.c の elftype_apply() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.elftype':
+            return False
+        name_field = i[1] if i[1] else i[2]
+        value_field = i[2] if i[1] else ''
+        nm = ''.join(c for c in name_field if c not in ' \t').lower()
+        if not nm:
+            self.state.diag(" error - .elftype: type name is not specified.", set_error=True)
+            return True
+        if not value_field:
+            self.state.diag(f" error - .elftype: type number is not specified ('{nm}').",
+                            set_error=True)
+            return True
+
+        _c = DirectiveProcessor._elftype_cache
+        v = _c.get(value_field, _SETSYM_MISS)
+        if v is _SETSYM_MISS:
+            self.state.error_undefined_label = False
+            v, _idx = self.expr_eval.expression_pat(value_field, 0)
+            try:
+                v = int(v)
+            except (OverflowError, ValueError):
+                v = None
+            if self.state.error_undefined_label or v is None \
+                    or v < 1 or v > 2147483647:
+                self.state.diag(" error - .elftype: type number must be an integer in "
+                                f"1..2147483647, got '{value_field}'.", set_error=True)
+                self.state.error_undefined_label = False
+                v = None
+            self.state.error_undefined_label = False
+            if len(_c) >= 65536:
+                _c.clear()
+            _c[value_field] = v
+        if v is not None:
+            self.state.elftypes[nm] = v
         return True
 
     def reloc_processing(self, i):
@@ -3838,7 +4203,7 @@ class DirectiveProcessor:
         if not self.state.elf_objfile:
             return True
         mach = ELF_MACHINES.get(self.state.elf_machine)
-        rtype = mach['named'].get(tname.lower()) if mach else None
+        rtype = _reloc_named(self.state, mach, tname)
         if rtype is None:
             _mname = mach['name'] if mach else self.state.elf_machine
             # パターン行は1ソース行ごとに読み直されるので、同じ名前で何度も
@@ -3986,6 +4351,7 @@ class DirectiveProcessor:
             self.state.symbols.pop(key, None)
             self.state.strsymbols.pop(key, None)
             self.state.arrsymbols.pop(key, None)
+            self.state.arrgen += 1
             self.state.freed_subs.add(key)
             # `.check` の候補からも外す。候補は大文字で積まれている。
             for var, syms in self.state.check_constraints.items():
@@ -4215,7 +4581,8 @@ _SYM_CORE = set(DIGIT + ALPHABET + '_')
 _PAT_DIRECTIVES = frozenset((
     '.setsym', '.clearsym', '.padding', '.bits', '.symbolc', '.vliw',
     '.check', '.clrcheck', '.reloc', '.clrreloc', '.map', '.free',
-    '.passthru', '.eol', '.textmode', '.enum', '.clrenum', '.error'))
+    '.passthru', '.eol', '.textmode', '.enum', '.clrenum', '.error',
+    '.elftype'))
 
 
 # `.setsym` の値欄が「ソースの行によって変わりようのない定数式」か。
@@ -4226,6 +4593,12 @@ _PAT_DIRECTIVES = frozenset((
 # 1行につき何百回も評価し直している(実測: aarch64 の 120 行で 14 万回、
 # 実行時間の約4割)。定数と分かるものだけ結果を使い回す。
 _CONST_SETSYM_RE = re.compile(r"^[\s0-9+\-*/%()<>|&^~]+$|^\s*0[xX][0-9a-fA-F]+\s*$")
+
+# `.setsym` の値欄が「ただの数」か（10進または 0x…）。こう書かれていれば
+# 文字列・配列・集合のどれにもなり得ないので、その判定列を通さずシンボル表に
+# 入れるだけで済む。集合演算子を含む定数式（`1&2` など）は集合の書き方と
+# 見分けがつかないので、ここでは弾く。caxx.c の plain_number_text() と同じ。
+_PLAIN_NUM_RE = re.compile(r"^\s*(?:0[xX][0-9a-fA-F]+|[0-9]+)\s*$")
 
 _SETSYM_MISS = object()
 
@@ -4877,6 +5250,17 @@ class PatternMatcher:
         return False
 
     def match0_brackets(self, s, t):
+        # 省略可グループ `[[ ]]` を1つも持たないパターンは、試す組み合わせが
+        # 1通りしかない。組み合わせ表も、印の畳み込みも、括弧を落とした写しも
+        # 要らないので、そのまま照合へ回す（ほとんどのパターンがこの道を通る）。
+        # 退避と復元も呼び出し側（match0）と重なるので省く。
+        # caxx.c の pat_match0_brackets() と同じ速い道である。
+        if '[[' not in t and ']]' not in t:
+            if self.match(s, t):
+                self.last_match_score = self.last_score
+                return True
+            return False
+
         t = t.replace('[[', OB).replace(']]', CB)
         cnt = t.count(OB)
         sl = [_ + 1 for _ in range(cnt)]
@@ -7470,7 +7854,15 @@ def symbol_set_from_text(state, dst_upper, value_field):
         items = set_literal_from_text(state, value_field)
     if items is None:
         return False
+    # 同じ中身を入れ直すだけなら何もしない。パターン表のディレクティブ行は
+    # ソース1行ごとにたどり直されるので、同じ `.setsym::名前::A,B,…` が何度も
+    # 来る。表を作り直すと、それを元にしている `.check` の控えまで捨てて
+    # しまうので、中身が変わらないときは表も世代番号も動かさない。
+    # caxx.c の arrsym_install() と同じ。
+    if state.arrsymbols.get(dst_upper) == items:
+        return True
     state.arrsymbols[dst_upper] = items
+    state.arrgen += 1
     return True
 
 
@@ -7495,6 +7887,7 @@ def symbol_copy_from_name(state, dst_upper, value_field):
         if src != dst_upper:
             # 項目は数値か文字列なので、浅い複製で独立した配列になる。
             state.arrsymbols[dst_upper] = list(state.arrsymbols[src])
+            state.arrgen += 1
         return True
     if src in state.strsymbols:
         if src != dst_upper:
@@ -7698,7 +8091,7 @@ class AssemblyDirectiveProcessor:
                     rt_str = parts[1].lower()
 
                     _mach_tbl = ELF_MACHINES.get(self.state.elf_machine)
-                    reloc_type = _mach_tbl['named'].get(rt_str) if _mach_tbl else None
+                    reloc_type = _reloc_named(self.state, _mach_tbl, rt_str)
                     if reloc_type is None:
                         self.state.diag(f" warning - unknown reloctype '{rt_str}' in .EQU"
                              f" for machine {self.state.elf_machine}", set_error=False)
@@ -7849,6 +8242,31 @@ class AssemblyDirectiveProcessor:
             s, idx = self.parser.get_label_word(l2, idx)
             if s == "":
                 break
+            # ラベル名の読み取りが `::` の1つめを食っていたら1文字戻す
+            # （`.extern` と同じ扱い）。
+            if idx > 0 and l2[idx - 1] == ':' and idx < len(l2) and l2[idx] == ':':
+                idx -= 1
+            # `.global 名前::型名` — この名前への参照に使うリロケーション型を
+            # 指定できる。`.extern` と同じ書き方で、`.elftype` で決めた名前も
+            # マシンの名前表の名前も書ける。
+            if idx < len(l2) and l2[idx:idx + 2] == '::':
+                idx += 2
+                _rt_start = idx
+                while idx < len(l2) and l2[idx] not in ' \t,:' + chr(0):
+                    idx += 1
+                _rt_str = l2[_rt_start:idx].strip().lower()
+                if _rt_str:
+                    _mach_tbl_g = ELF_MACHINES.get(self.state.elf_machine)
+                    _rtype_g = _reloc_named(self.state, _mach_tbl_g, _rt_str)
+                    if _rtype_g is None:
+                        self.state.diag(f" warning - unknown reloc type '{_rt_str}' in .GLOBAL"
+                                        f" for machine {self.state.elf_machine}", set_error=False)
+                    else:
+                        _ent_g = self.state.labels.get(s)
+                        if _ent_g is not None:
+                            while len(_ent_g) < 5:
+                                _ent_g.append(None)
+                            _ent_g[4] = _rtype_g
             if idx < len(l2) and l2[idx] == ':':
                 idx += 1
             v = self.label_manager.get_value(s)
@@ -7856,6 +8274,7 @@ class AssemblyDirectiveProcessor:
             _lentry = self.state.labels.get(s, [])
             is_equ = len(_lentry) > 2 and _lentry[2]
             self.state.export_labels[s] = [v, sec, is_equ]
+            idx = StringUtils.skipspc(l2, idx)
             if idx < len(l2) and l2[idx] == ',':
                 idx += 1
         return True
@@ -8037,7 +8456,7 @@ class AssemblyDirectiveProcessor:
                 rt_str = l2[rt_start:idx].strip().lower()
 
                 if rt_str:
-                    reloc_type = _mach_tbl_ext['named'].get(rt_str) if _mach_tbl_ext else None
+                    reloc_type = _reloc_named(self.state, _mach_tbl_ext, rt_str)
                     if reloc_type is None:
                         self.state.diag(f" warning - unknown reloc type '{rt_str}' in .EXTERN"
                              f" for machine {_em_ext}", set_error=False)
@@ -8085,7 +8504,7 @@ class AssemblyDirectiveProcessor:
             _name = _raw_name.strip().lower()
             if not _name:
                 continue
-            _rtype = _mach_tbl_rt['named'].get(_name)
+            _rtype = _reloc_named(self.state, _mach_tbl_rt, _name)
             if _rtype is None:
                 self.state.diag(f" warning - unknown reloc type '{_name}' in "
                      f".RELOCTYPE for machine {self.state.elf_machine}", set_error=False)
@@ -9719,59 +10138,69 @@ class Assembler:
         lin = StringUtils.reduce_spaces((l + ' ' + l2) if l2 else l)
 
         _isdir = self.state.pat_isdir
+        _pat = self.state.pat
+        _dirfn = self.state.pat_dirfn
 
-        for i in self.state.pat:
-            pln += 1
+        # たどる行は「行ごとに必ずたどる行（always）」と「この行のニーモニックで
+        # 索引を引いた候補」の2つの昇順の並びである。パターンファイルの記述順の
+        # まま処理するために、2つを合わせながら進む。
+        _always = self.state.pat_always
+        _cand = _pat_candidates(self.state.pat_index, self.state.pat_maxkey, lin)
+        _na = len(_always)
+        _nc = len(_cand)
+        # 前置きを畳み込んでいるあいだは、always の並びを前置きの後ろから読む。
+        _hoist = self.state.hoist_rows
+        _ai = self.state.hoist_first_ai if (_hoist and self.state.hdrsnap is not None) else 0
+        _ci2 = 0
+        # 前置きの実行で診断が出るようなら畳み込まない（同じ診断が行ごとに
+        # 出る今までの見え方を変えないため）。その判定に使う出力前の数。
+        _hoist_diag0 = self.state.diag_count
+
+        while True:
+            if _ai < _na:
+                _row = _always[_ai]
+                if _ci2 < _nc and _cand[_ci2] < _row:
+                    _row = _cand[_ci2]
+                    _ci2 += 1
+                    _from_always = False
+                else:
+                    _ai += 1
+                    _from_always = True
+            elif _ci2 < _nc:
+                _row = _cand[_ci2]
+                _ci2 += 1
+                _from_always = False
+            else:
+                break
+
+            i = _pat[_row]
+            pln = _row + 1
             pl = i
+
+            # 前置きを通り過ぎるところで、その状態を1度だけ控える。
+            if _hoist and self.state.hdrsnap is None and _row >= _hoist:
+                if self.state.diag_count != _hoist_diag0:
+                    _hoist = 0
+                    self.state.hoist_rows = 0    # 診断が出たので畳み込まない
+                else:
+                    self._hdrsnap_take()
 
             if i is None:
                 continue
 
-            # ディレクティブでない行（＝普通のパターン）は、下の判定列が必ず
-            # 全て False になるので丸ごと飛ばす。
-            if _isdir[pln - 1]:
+            # ディレクティブ行は、読み込み時に決めた処理を1つだけ呼ぶ。
+            if _isdir[_row]:
                 # ディレクティブの値欄も式なので、パターン変数を読みうる
-                # （マニュアル 6.3）。評価の前に空にしておく。
-                self.state.vars = {}
-                self.state.vars_undef = {}
-                self.state.vars_text = {}
-                if self.directive_proc.set_symbol(i):
-                    continue
-                if self.directive_proc.clear_symbol(i):
-                    continue
-                if self.directive_proc.paddingp(i):
-                    continue
-                if self.directive_proc.bits(i):
-                    continue
-                if self.directive_proc.symbolc(i):
-                    continue
-                if self.directive_proc.epic(i):
-                    continue
-                if self.directive_proc.vliwp(i):
-                    continue
-                if self.directive_proc.check_processing(i):
-                    continue
-                if self.directive_proc.clrcheck_processing(i):
-                    continue
-                if self.directive_proc.reloc_processing(i):
-                    continue
-                if self.directive_proc.clrreloc_processing(i):
-                    continue
-                if self.directive_proc.map_processing(i):
-                    continue
-                if self.directive_proc.free_processing(i):
-                    continue
-                if self.directive_proc.passthru_processing(i):
-                    continue
-                if self.directive_proc.eol_processing(i):
-                    continue
-                if self.directive_proc.textmode_processing(i):
-                    continue
-                if self.directive_proc.enum_processing(i):
-                    continue
-                if self.directive_proc.clrenum_processing(i):
-                    continue
-                if self.directive_proc.errmsg_processing(i):
+                # （マニュアル 6.3）。評価の前に空にしておく。空なら作り直す
+                # 必要はない（ディレクティブ行は1行につき何百回も通る）。
+                if self.state.vars:
+                    self.state.vars = {}
+                if self.state.vars_undef:
+                    self.state.vars_undef = {}
+                if self.state.vars_text:
+                    self.state.vars_text = {}
+                _fn = _dirfn[_row]
+                if _fn is not None and _fn(i):
                     continue
 
             if not any(i):
@@ -9786,29 +10215,33 @@ class Assembler:
                     idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                 break
 
-            _pfx, _closed = _lead_caps(i[0])
-            if _pfx:
-                _k = 0
-                _ok = True
-                _end = -1
-                for _ci, _ch in enumerate(lin):
-                    if _ch == ' ':
-                        continue
-                    if _ch.upper() != _pfx[_k]:
+            # 索引から来た候補は先頭一致を済ませてある。always から来た行のうち
+            # ニーモニックを持つもの（`EPIC` のように大文字の名前を持つ
+            # ディレクティブ行で、処理されずに落ちてきたもの）だけここで見る。
+            if _from_always:
+                _pfx, _closed = _lead_caps(i[0])
+                if _pfx:
+                    _k = 0
+                    _ok = True
+                    _end = -1
+                    for _ci, _ch in enumerate(lin):
+                        if _ch == ' ':
+                            continue
+                        if _ch.upper() != _pfx[_k]:
+                            _ok = False
+                            break
+                        _k += 1
+                        if _k == len(_pfx):
+                            _end = _ci + 1
+                            break
+                    if _k < len(_pfx):
                         _ok = False
-                        break
-                    _k += 1
-                    if _k == len(_pfx):
-                        _end = _ci + 1
-                        break
-                if _k < len(_pfx):
-                    _ok = False
-                if _ok and _closed and _end < len(lin) and lin[_end] in _PFX_WORD:
-                    # パターン側はここでニーモニックが終わっているのに、ソース側は
-                    # まだ語が続いている（`MOVE` パターン vs `MOVEM` 行）。
-                    _ok = False
-                if not _ok:
-                    continue
+                    if _ok and _closed and _end < len(lin) and lin[_end] in _PFX_WORD:
+                        # パターン側はここでニーモニックが終わっているのに、
+                        # ソース側はまだ語が続いている（`MOVE` vs `MOVEM`）。
+                        _ok = False
+                    if not _ok:
+                        continue
 
             # ここから先が本当の照合。先頭一致で捨てた分は作り直さなくてよい
             # （変数表は照合と値欄の評価の直前にだけ空であればよい）。
@@ -10042,12 +10475,18 @@ class Assembler:
             return False
         line = StringUtils.resolve_vliw_escapes(line)
 
-        self.state.check_constraints.clear()
-        self.state.reloc_constraints.clear()
-        self.state.enum_defs.clear()
-        self.state.freed_subs.clear()
+        if self.state.hoist_rows and self.state.hdrsnap is not None:
+            # 前置きのディレクティブ行はもうたどらないので、作り直す代わりに
+            # 「前置きを実行し終えた状態」を戻す。
+            self._hdrsnap_restore()
+            self.state.freed_subs.clear()
+        else:
+            self.state.check_constraints.clear()
+            self.state.reloc_constraints.clear()
+            self.state.enum_defs.clear()
+            self.state.freed_subs.clear()
 
-        self.state.symbols = dict(self.state.patsymbols)
+            self.state.symbols = dict(self.state.patsymbols)
 
         self.state.label_text = ''
         line = self.asm_directive_proc.label_processing(line)
@@ -10326,10 +10765,23 @@ class Assembler:
         self.state.ln += 1
         return f
 
+    def register_elftypes(self, pat):
+        """パターン表の `.elftype` を、組み立てを始める前に一度そろえて登録する。
+
+        型名はソースの `.extern`/`.global`/`.EQU`/`.RELOCTYPE` や取り込み
+        ファイルからも引く。これらはパターン表をたどるより前に読まれるので、
+        行ごとの実行を待っていると「まだ宣言されていない」ことになってしまう。
+        caxx.c の register_elftypes() と同じである。
+        """
+        for i in pat:
+            if i and i[0] == '.elftype':
+                self.directive_proc.elftype_processing(i)
+
     def setpatsymbols(self, pat):
         fresh = {}
         self.state.strsymbols = {}
         self.state.arrsymbols = {}
+        self.state.arrgen += 1
         for i in pat:
             if i is None:
                 continue
@@ -10369,10 +10821,12 @@ class Assembler:
                     fresh.pop(key, None)
                     self.state.strsymbols.pop(key, None)
                     self.state.arrsymbols.pop(key, None)
+                    self.state.arrgen += 1
                 else:
                     fresh = {}
                     self.state.strsymbols = {}
                     self.state.arrsymbols = {}
+                    self.state.arrgen += 1
                 continue
             if len(i) > 0 and i[0] == '.map':
                 # `.map` のシンボルもこの前処理の表に積む。ここまでに積んだ
@@ -10394,6 +10848,7 @@ class Assembler:
                     fresh.pop(_k, None)
                     self.state.strsymbols.pop(_k, None)
                     self.state.arrsymbols.pop(_k, None)
+                    self.state.arrgen += 1
                 continue
             if len(i) > 0 and i[0] == '.bits':
                 self.directive_proc.bits(i)
@@ -10506,7 +10961,7 @@ class Assembler:
             if '::' in label:
                 label, rt_str = label.split('::', 1)
                 _mach_tbl_imp = ELF_MACHINES.get(self.state.elf_machine)
-                reloc_type = _mach_tbl_imp['named'].get(rt_str.lower()) if _mach_tbl_imp else None
+                reloc_type = _reloc_named(self.state, _mach_tbl_imp, rt_str)
                 if reloc_type is None:
                     self.state.diag(f" warning - unknown reloc type '{rt_str}' for imported label '{label}'", set_error=False)
             if not label:
@@ -11424,6 +11879,99 @@ class Assembler:
                              'assembling. Useful for debugging pattern-file macros.')
         return ap
 
+    _HOIST_VLIW_FIELDS = ('vliwbits', 'vliwinstbits', 'vliwtemplatebits',
+                          'vliwflag')
+
+    def _hdrsnap_take(self):
+        """前置きのディレクティブ行を実行し終えた状態を控える。
+
+        控えるのは「1行ごとに作り直す欄」（シンボル表・`.check`・`.reloc`・
+        `.enum`）と、「前置きが必ず書く欄」だけである。前置きが書かない欄
+        （`.bits` が前置きに無いときの語長など）は今までどおり前の行から
+        持ち越す。caxx.c の hdrsnap_take() と同じ。
+        """
+        st = self.state
+        snap = {
+            'symbols':           dict(st.symbols),
+            'check_constraints': dict(st.check_constraints),
+            'reloc_constraints': dict(st.reloc_constraints),
+            'enum_defs':         dict(st.enum_defs),
+        }
+        f = st.hoist_fields
+        if 'bits' in f:
+            snap['endian'] = st.endian
+            snap['bts'] = st.bts
+        if 'padding' in f:
+            snap['padding'] = st.padding
+        if 'symbolc' in f:
+            snap['swordchars'] = st.swordchars
+        if 'vliw' in f:
+            for k in self._HOIST_VLIW_FIELDS:
+                snap[k] = getattr(st, k)
+            snap['vliwnop'] = list(st.vliwnop)
+        st.hdrsnap = snap
+
+    def _hdrsnap_restore(self):
+        """控えた前置きの状態に戻す（行ごとの作り直しの代わり）。"""
+        st = self.state
+        snap = st.hdrsnap
+        st.symbols = dict(snap['symbols'])
+        st.check_constraints = dict(snap['check_constraints'])
+        st.reloc_constraints = dict(snap['reloc_constraints'])
+        st.enum_defs = dict(snap['enum_defs'])
+        f = st.hoist_fields
+        if 'bits' in f:
+            st.endian = snap['endian']
+            st.bts = snap['bts']
+        if 'padding' in f:
+            st.padding = snap['padding']
+        if 'symbolc' in f:
+            st.swordchars = snap['swordchars']
+        if 'vliw' in f:
+            for k in self._HOIST_VLIW_FIELDS:
+                setattr(st, k, snap[k])
+            st.vliwnop = list(snap['vliwnop'])
+
+    def _build_dir_dispatch(self, pat, isdir):
+        """行ごとに「その行を処理するディレクティブ関数」を1つ決めておく。
+
+        照合のたびに 19 個の判定を並べて呼んでいたので、ディレクティブ行の
+        数 × ソース行数ぶんの無駄な呼び出しになっていた。名前は行ごとに
+        変わらないので、読み込み時に対応表を引いて控える。
+        """
+        d = self.directive_proc
+        table = {
+            '.setsym':   d.set_symbol,
+            '.clearsym': d.clear_symbol,
+            '.padding':  d.paddingp,
+            '.bits':     d.bits,
+            '.symbolc':  d.symbolc,
+            '.vliw':     d.vliwp,
+            '.check':    d.check_processing,
+            '.clrcheck': d.clrcheck_processing,
+            '.reloc':    d.reloc_processing,
+            '.clrreloc': d.clrreloc_processing,
+            '.map':      d.map_processing,
+            '.free':     d.free_processing,
+            '.passthru': d.passthru_processing,
+            '.eol':      d.eol_processing,
+            '.textmode': d.textmode_processing,
+            '.enum':     d.enum_processing,
+            '.clrenum':  d.clrenum_processing,
+            '.error':    d.errmsg_processing,
+            '.elftype':  d.elftype_processing,
+        }
+        out = []
+        for row, i in enumerate(pat):
+            fn = None
+            if isdir[row] and i and i[0]:
+                fn = table.get(i[0])
+                if fn is None:
+                    # `EPIC`（大小無視）だけは名前引きでは拾えない。
+                    fn = d.epic
+            out.append(fn)
+        return out
+
     def _macro_expand_only(self, sourcefile, dest):
         self.macro_proc.reset_pass()
         try:
@@ -11592,6 +12140,21 @@ class Assembler:
             # どの行がディレクティブかはパターンファイルを読んだ時点で決まる。
             # ソース1行ごとに数千回やり直さないよう、ここで1度だけ作る。
             self.state.pat_isdir = [_pat_is_directive(_p) for _p in self.state.pat]
+            # ニーモニック索引と、行ごとのディレクティブ処理の割り当ても
+            # ここで1度だけ作る（照合のたびに判定列を並べないため）。
+            (self.state.pat_index,
+             self.state.pat_always,
+             self.state.pat_maxkey) = _build_pat_index(self.state.pat,
+                                                       self.state.pat_isdir)
+            # 先頭に並ぶ「行によって結果が変わらない」ディレクティブ行は
+            # 1度だけ実行して状態を控える（以後の行はたどらない）。
+            (self.state.hoist_rows,
+             self.state.hoist_fields) = _pat_hoist_scan(self.state.pat,
+                                                        self.state.pat_isdir)
+            self.state.hoist_first_ai = sum(
+                1 for _r in self.state.pat_always if _r < self.state.hoist_rows)
+            self.state.pat_dirfn = self._build_dir_dispatch(self.state.pat,
+                                                            self.state.pat_isdir)
             self.state.sub_defs = self.pattern_reader.subs
             self.state.func_defs = self.pattern_reader.funcs
             # 破綻点修正: パターンファイルが読めなかった場合、readpat() は
@@ -11607,6 +12170,7 @@ class Assembler:
                                 set_error=False, force=True)
                 return False
             self.setpatsymbols(self.state.pat)
+            self.register_elftypes(self.state.pat)
             # 破綻点修正: パターンファイル側のディレクティブ評価（.setsym / .bits 等）
             # で出たエラーを誰も拾っていなかったため、" error - ..." を表示しながら
             # 終了コード0で「出力ファイルだけ作られない」無言の失敗になっていた。
@@ -11881,7 +12445,7 @@ class Assembler:
                             lentry = self.state.labels.get(i[0], [])
                             if len(lentry) > 4 and lentry[4] is not None:
                                 _mach_tbl_exp = ELF_MACHINES.get(self.state.elf_machine)
-                                reloc_type_str = _mach_tbl_exp['reverse'].get(lentry[4], '') if _mach_tbl_exp else ''
+                                reloc_type_str = _reloc_reverse(self.state, _mach_tbl_exp, lentry[4])
                                 if reloc_type_str:
                                     reloc_type_str = f'::{reloc_type_str}'
 

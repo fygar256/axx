@@ -1,0 +1,49 @@
+/* ===================================================================
+/* elftype.axx -- pattern file for `.elftype` (manual 3.19)
+/*
+/* `.elftype::<name>::<value>` gives a name to an ELF relocation type
+/* number. The name can then be written wherever a relocation type
+/* name is written:
+/*
+/*   .reloc::<var>::<name>          (this file)
+/*   .extern label::<name>          (the source)
+/*   .global label::<name>          (the source)
+/*   label::<name>  in .EQU / .RELOCTYPE / an import TSV
+/*
+/* The three names below are relocation types that x86-64 has but the
+/* built-in name table does not carry, so they can only be reached
+/* through `.elftype`:
+/*
+/*   R_X86_64_GOTPCRELX     41 (0x29)
+/*   R_X86_64_REX_GOTPCRELX 42 (0x2a)
+/*   R_X86_64_TPOFF32       23 (0x17)
+/*
+/* Assemble with:
+/*   axx elftype.axx elftype.s -o out.o -m 62
+/* ===================================================================
+
+.bits::8
+
+.elftype::gotpcrelx::41
+.elftype::rexgotpcrelx::0x2a
+.elftype::tpoff32::20+3
+
+/* the type name is matched without regard to case, and spaces in the
+/* name field are dropped -- just like the type name of `.reloc`. */
+.reloc::t::GotPcRelX
+CALLX !t :: 0xe8,t,t>>8,t>>16,t>>24
+.clrreloc::t
+
+.reloc::t::rexgotpcrelx
+MOVX !t :: 0x48,0x8b,0x05,t,t>>8,t>>16,t>>24
+.clrreloc::t
+
+.reloc::t::tpoff32
+TPOFF !t :: t,t>>8,t>>16,t>>24
+.clrreloc::t
+
+/* no `.reloc`: the type is the one the machine table guesses from the
+/* field width (R_X86_64_32 for 4 bytes). */
+DD !t :: t,t>>8,t>>16,t>>24
+
+RET :: 0xc3

@@ -50,6 +50,12 @@ textmode.axx                        pattern file for .textmode, the `!L` express
                                     replacement keeping labels, expressions and
                                     `;` comments spelled as written (manual 3.18)
 textmode.s                          test assemble file for textmode.axx
+elftype.axx                         pattern file for .elftype: a relocation type
+                                    name defined in the pattern file, written in
+                                    .reloc and in the source's .extern / .global
+                                    (manual 3.7.6)
+elftype.s                           test assemble file for elftype.axx. build it
+                                    with -o and -m 62 to see the relocations
 8080toz80.axx                       pattern file that translates Intel 8080 source
                                     into Zilog Z80 source text: .textmode, `!L`
                                     captures and `{{.exp()}}`, so labels and

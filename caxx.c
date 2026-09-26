@@ -102,6 +102,47 @@ typedef struct { uint256_t val; int is_undef; int is_float; int text_off; } PatV
 #define NVARS 256
 static int    g_nvars = 0;
 static char  *g_varnames[NVARS];   /* スロット i の名前 */
+static int    g_varlen[NVARS];     /* その長さ */
+
+/* 名前 → スロット番号のハッシュ表（同じ籠の中は g_varnext でつなぐ）。 */
+#define VARHASH_NB 256
+static int    g_varhash[VARHASH_NB];
+static int    g_varnext[NVARS];
+static int    g_varhash_init = 0;
+
+/* 使い回しの作業領域。照合は1行につき何百回も呼ばれるので、そのたびに
+ * malloc/free するのをやめる。入れ子で同じ領域が要求されたときだけ malloc に
+ * 落ちる（そうならない作りだが、安全のため）。 */
+typedef struct { char *p; size_t cap; int busy; } ScratchBuf;
+
+static char *sbuf_take(ScratchBuf *b, size_t need){
+    if(b->busy){
+        char *q = malloc(need);
+        if(!q){ perror("malloc"); exit(1); }
+        return q;
+    }
+    if(b->cap < need){
+        char *q = realloc(b->p, need);
+        if(!q){ perror("realloc"); exit(1); }
+        b->p = q; b->cap = need;
+    }
+    b->busy = 1;
+    return b->p;
+}
+
+static void sbuf_give(ScratchBuf *b, char *q){
+    if(q == b->p) b->busy = 0;
+    else free(q);
+}
+
+/* 長さを切って写す。書式付けが要らないところで snprintf を使わないため。 */
+static void axx_copy_trunc(char *dst, size_t dsz, const char *src){
+    if(dsz == 0) return;
+    size_t n = strlen(src);
+    if(n > dsz - 1) n = dsz - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
 
 /* パターン変数の名前は小文字で始まり、小文字・数字・`_` が続く。 */
 static int var_name_len(const char *s){
@@ -123,14 +164,23 @@ static int is_var_name_n(const char *s, int len){
 /* 名前をスロット番号にする。長さは問わない。create が真なら無ければ新しく
  * 割り当てる。見つからない（かつ create でない）ときは -1。 */
 static int var_slot(const char *name, int len, int create){
+    if(!g_varhash_init){
+        for(int i=0;i<VARHASH_NB;i++) g_varhash[i] = -1;
+        g_varhash_init = 1;
+    }
     char lower[256];
     if(len <= 0 || len >= (int)sizeof(lower)) return -1;
     for(int i = 0; i < len; i++) lower[i] = (char)tolower((unsigned char)name[i]);
     lower[len] = '\0';
     if(!is_var_name_n(lower, len)) return -1;
-    for(int i = 0; i < g_nvars; i++)
-        if((int)strlen(g_varnames[i]) == len && memcmp(g_varnames[i], lower, (size_t)len) == 0)
-            return i;
+    /* 名前引きは照合1回あたり何度も呼ばれるので、名前の全走査ではなく
+     * ハッシュで引く（名前の数が増えても遅くならないようにする）。 */
+    unsigned h = 2166136261u;
+    for(int i = 0; i < len; i++){ h ^= (unsigned char)lower[i]; h *= 16777619u; }
+    h &= VARHASH_NB - 1;
+    for(int vi = g_varhash[h]; vi >= 0; vi = g_varnext[vi])
+        if(g_varlen[vi] == len && memcmp(g_varnames[vi], lower, (size_t)len) == 0)
+            return vi;
     if(!create) return -1;
     if(g_nvars >= NVARS){
         fprintf(stderr, " error - too many pattern variable names (maximum %d).\n", NVARS);
@@ -140,6 +190,9 @@ static int var_slot(const char *name, int len, int create){
     if(!dup){ perror("malloc"); exit(1); }
     memcpy(dup, lower, (size_t)len); dup[len] = '\0';
     g_varnames[g_nvars] = dup;
+    g_varlen[g_nvars]   = len;
+    g_varnext[g_nvars]  = g_varhash[h];
+    g_varhash[h]        = g_nvars;
     return g_nvars++;
 }
 
@@ -564,6 +617,40 @@ static AXX_UNUSED void sv_set(StrVec *v, int idx, const char *s){
 typedef struct { StrVec names; char *expr; } EnumDef;
 
 static void enumdef_init(EnumDef *e){ sv_init(&e->names); e->expr=NULL; }
+/* 配列シンボルの表が変わった回数。`.check` の名前一覧は配列シンボルを
+ * 展開して作るので、表が変わっていなければ作り直さず使い回せる。 */
+static long long g_arrgen = 0;
+
+/* ---- `.check` の許容名リスト -----------------------------------------
+ * `.check` が変数に与える名前の一覧は、作ったあと中身を書き換えない。
+ * それでいて写しは多い（ディレクティブ行の実行、候補ごとの退避と復元、
+ * 行ごとの作り直し）。1行につき何千回も strdup していたので、参照数を
+ * 数えて共有し、写しは数を増やすだけにする。
+ * 中身を変える必要があるところ（`.free` で名前を1つ外す）は、新しい
+ * リストを作って置き換える（書くときに写す）。 */
+typedef struct { int refs; StrVec v; } ChkList;
+
+static ChkList *chk_new(void){
+    ChkList *c = malloc(sizeof(*c));
+    if(!c){ perror("malloc"); exit(1); }
+    c->refs = 1;
+    sv_init(&c->v);
+    return c;
+}
+static ChkList *chk_ref(ChkList *c){ if(c) c->refs++; return c; }
+static void chk_unref(ChkList *c){
+    if(!c) return;
+    if(--c->refs == 0){ sv_free(&c->v); free(c); }
+}
+/* slot の中身を nw に差し替える（古いほうを手放す）。 */
+static void chk_install(ChkList **slot, ChkList *nw){
+    ChkList *old = *slot;
+    *slot = nw;
+    chk_unref(old);
+}
+static int chk_len(const ChkList *c){ return c ? c->v.len : 0; }
+static const char *chk_at(const ChkList *c, int i){ return c->v.data[i]; }
+
 static void enumdef_clear(EnumDef *e){
     sv_free(&e->names);
     free(e->expr); e->expr=NULL;
@@ -804,7 +891,10 @@ static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *se
         if(strcmp(e->key,key)==0){
             e->value=val; free(e->section); e->section=strdup(sec); e->is_equ=is_equ; e->is_undef=is_undef;
             e->is_imported = 0;
-            e->reloc_type_override = -1;
+            /* リロケーション型の指定（`.global 名前::型名`、`.extern`、
+             * `.EQU x::型名`）はラベルの定義とは別に宣言されるものなので、
+             * 同じ名前を置き直しても消さない。`.global` は宣言がラベル定義より
+             * 前に書かれるのが普通で、ここで消すと指定が効かなかった。 */
             return;
         }
     }
@@ -901,6 +991,28 @@ static void smap_delete(SymMap*m,const char*key){
     SymEntry**pp=&m->buckets[h];
     while(*pp){ if(strcmp((*pp)->key,key)==0){SymEntry*d=*pp;*pp=d->next;free(d->key);free(d);m->count--;return;} pp=&(*pp)->next; }
 }
+/* dst の中身を src と同じにする。
+ * 素直に「空にして入れ直す」と、項目ごとに calloc と strdup と free が要る。
+ * ここは1行ごとに何度も通る（前置きの状態戻し、候補の退避と復元）ので、
+ * 既にある項目は入れ物ごと使い回し、値だけ書き換える。鍵の集合が同じなら
+ * 確保も解放も1回も起きない。 */
+static void smap_assign(SymMap *dst, const SymMap *src){
+    /* 1. dst にあって src に無い鍵を外し、両方にある鍵は値を移す。 */
+    for(int i=0;i<dst->nb;i++){
+        SymEntry **pp = &dst->buckets[i];
+        while(*pp){
+            SymEntry *e = *pp;
+            SymEntry *se = smap_find((SymMap*)src, e->key);
+            if(se){ e->val = se->val; pp = &e->next; }
+            else { *pp = e->next; free(e->key); free(e); dst->count--; }
+        }
+    }
+    /* 2. src にあって dst に無い鍵を足す。 */
+    for(int i=0;i<src->nb;i++)
+        for(SymEntry *e=src->buckets[i]; e; e=e->next)
+            if(!smap_find(dst, e->key)) smap_set(dst, e->key, e->val);
+}
+
 static void smap_clear(SymMap*m){
     for(int i=0;i<m->nb;i++){
         SymEntry*e=m->buckets[i];
@@ -996,9 +1108,23 @@ typedef struct {
      * 照合はソース1行ごとにパターン表を頭からたどり直すので、行ごとに調べ直すと
      * 「パターン数 × ソース行数」だけ空回りする。 */
     int       is_dir;        /* ディレクティブの行か（pat_is_directive） */
+    int       dir_kind;      /* どのディレクティブか（PD_*、判定列を1回の分岐にする）*/
     int       setsym_const;  /* `.setsym` の値欄が定数式か（const_setsym_text）*/
     int       setsym_done;   /* その値を評価済みか */
     uint256_t setsym_val;    /* 評価した値 */
+    int       setsym_plain;  /* `.setsym::名前::10` のようにただの数か */
+    char     *setsym_key;    /* そのときの大文字にした名前 */
+    int       elftype_done;  /* `.elftype` の値を評価済みか */
+    int       elftype_val;   /* 評価した型番号（0 なら不正で登録しない） */
+    /* ニーモニック（パターン先頭の連続する大文字）。索引の鍵であり、
+     * 行ごとの足切りをやり直さないために読み込み時に切り出しておく。 */
+    char      pfx[64];
+    int       pfxlen;
+    int       pfx_closed;    /* 直後のパターン文字が英数字を食えないか */
+    /* `.check` の行が作る名前一覧の控え。配列シンボルの表が変わらなければ
+     * 何行目でも同じものになるので、作り直さずこれを渡す。 */
+    void     *chk_cache;
+    long long chk_cache_gen;
 } PatEntry;
 
 typedef struct {
@@ -1011,11 +1137,51 @@ static void pv_init(PatVec*v){v->data=NULL;v->len=0;v->cap=0;}
 /* パターン1行がディレクティブか（`EPIC` は大小無視）。
  * 偽なら lineassemble2() のディレクティブ判定列は必ず全て 0 を返す。
  * axx.py の _pat_is_directive() と同じ表である。 */
+/* パターン表のディレクティブ行の種別。照合のたびに 19 個の名前比較を
+ * 並べていたのを、読み込み時に決めた種別1つの分岐で済ませるため。 */
+enum {
+    PD_NONE = 0, PD_SETSYM, PD_CLEARSYM, PD_PADDING, PD_BITS, PD_SYMBOLC,
+    PD_VLIW, PD_CHECK, PD_CLRCHECK, PD_RELOC, PD_CLRRELOC, PD_MAP, PD_FREE,
+    PD_PASSTHRU, PD_EOL, PD_TEXTMODE, PD_ENUM, PD_CLRENUM, PD_ERRMSG, PD_EPIC,
+    PD_ELFTYPE
+};
+
+static int pat_dir_kind(const PatEntry *e){
+    static const struct { const char *name; int kind; } tbl[] = {
+        { ".setsym", PD_SETSYM }, { ".clearsym", PD_CLEARSYM },
+        { ".padding", PD_PADDING }, { ".bits", PD_BITS },
+        { ".symbolc", PD_SYMBOLC }, { ".vliw", PD_VLIW },
+        { ".check", PD_CHECK }, { ".clrcheck", PD_CLRCHECK },
+        { ".reloc", PD_RELOC }, { ".clrreloc", PD_CLRRELOC },
+        { ".map", PD_MAP }, { ".free", PD_FREE },
+        { ".passthru", PD_PASSTHRU }, { ".eol", PD_EOL },
+        { ".textmode", PD_TEXTMODE }, { ".enum", PD_ENUM },
+        { ".clrenum", PD_CLRENUM }, { ".error", PD_ERRMSG },
+        { ".elftype", PD_ELFTYPE }, { NULL, 0 } };
+    if(!e || !e->f[0] || !e->f[0][0]) return PD_NONE;
+    const char *n = e->f[0];
+    for(int k=0; tbl[k].name; k++) if(strcmp(n, tbl[k].name) == 0) return tbl[k].kind;
+    /* axx_strupr_to() はこの位置ではまだ宣言されていないので、4文字だけ
+       その場で大小無視で比べる。 */
+    if(n[0] && n[1] && n[2] && n[3] && !n[4]){
+        static const char epic[] = "EPIC";
+        int k = 0;
+        for(; k < 4; k++){
+            char c = n[k];
+            if(c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+            if(c != epic[k]) break;
+        }
+        if(k == 4) return PD_EPIC;
+    }
+    return PD_NONE;
+}
+
 static int pat_is_directive(const PatEntry *e){
     static const char *tbl[] = {
         ".setsym", ".clearsym", ".padding", ".bits", ".symbolc", ".vliw",
         ".check", ".clrcheck", ".reloc", ".clrreloc", ".map", ".free",
-        ".passthru", ".eol", ".textmode", ".enum", ".clrenum", ".error", NULL };
+        ".passthru", ".eol", ".textmode", ".enum", ".clrenum", ".error",
+        ".elftype", NULL };
     if(!e || !e->f[0] || !e->f[0][0]) return 0;
     const char *n = e->f[0];
     for(int k=0; tbl[k]; k++) if(strcmp(n, tbl[k]) == 0) return 1;
@@ -1058,22 +1224,387 @@ static int const_setsym_text(const char *s){
     return *p == '\0';
 }
 
+/* `.setsym` の値欄が「ただの数」か（10進または 0x…）。
+ * こう書かれていれば文字列・配列・集合のどれにもなり得ないので、実行時に
+ * その判定列を通さずシンボル表へ入れるだけで済む。集合演算子を含む定数式
+ * （`1&2` など）は集合の書き方と見分けがつかないので、ここでは弾く。 */
+static int plain_number_text(const char *s){
+    if(!s) return 0;
+    const char *p = s;
+    while(*p==' '||*p=='\t') p++;
+    int n = 0;
+    if(p[0]=='0' && (p[1]=='x'||p[1]=='X')){
+        p += 2;
+        while(isxdigit((unsigned char)*p)){ p++; n++; }
+    } else {
+        while(isdigit((unsigned char)*p)){ p++; n++; }
+    }
+    if(n == 0) return 0;
+    while(*p==' '||*p=='\t') p++;
+    return *p == '\0';
+}
+
 /* パターン表を読み終えた後に一度だけ呼ぶ。行ごとに変わらない性質を控える。 */
 static void pat_mark_static(PatVec *v){
     for(int pi=0; pi<v->len; pi++){
         PatEntry *e = &v->data[pi];
         e->is_dir       = pat_is_directive(e);
+        e->dir_kind     = e->is_dir ? pat_dir_kind(e) : PD_NONE;
         e->setsym_const = (e->is_dir && strcmp(e->f[0], ".setsym") == 0
                            && e->f[1] && e->f[1][0]
                            && const_setsym_text(e->f[2]));
         e->setsym_done  = 0;
         e->setsym_val   = u256_zero();
+        e->elftype_done = 0;
+        e->elftype_val  = 0;
+        e->chk_cache    = NULL;
+        e->chk_cache_gen = -1;
+        free(e->setsym_key);
+        e->setsym_key   = NULL;
+        e->setsym_plain = (e->is_dir && e->dir_kind == PD_SETSYM
+                           && e->f[1] && e->f[1][0]
+                           && plain_number_text(e->f[2]));
+        if(e->setsym_plain){
+            size_t kl = strlen(e->f[1]) + 1;
+            e->setsym_key = malloc(kl);
+            if(!e->setsym_key){ perror("malloc"); exit(1); }
+            for(size_t ki=0; ki<kl; ki++){
+                char c = e->f[1][ki];
+                e->setsym_key[ki] = (c>='a'&&c<='z') ? (char)(c-32) : c;
+            }
+        }
+
+        /* ニーモニックを切り出す。pat_prefix_matches() と同じ規則である
+         * （空白は飛ばし、大文字が続くあいだを取り、最初の大文字以外で止める）。 */
+        {
+            const char *q = e->f[0] ? e->f[0] : "";
+            int np = 0;
+            for(; *q && np < (int)sizeof(e->pfx)-1; q++){
+                if(*q >= 'A' && *q <= 'Z') e->pfx[np++] = *q;
+                else if(*q == ' ') continue;
+                else break;
+            }
+            e->pfx[np]  = '\0';
+            e->pfxlen   = np;
+            int closed = 1;
+            if(np >= (int)sizeof(e->pfx)-1){
+                closed = 0;              /* 打ち切ったので直後が分からない */
+            } else if(*q){
+                char c = *q;
+                if((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                   || c == '!' || c == '\\' || c == '[') closed = 0;
+            }
+            e->pfx_closed = closed;
+        }
     }
+}
+
+/* 畳み込む先頭行数と、前置きが書く欄の印（pat_hoist_scan が立てる）。 */
+static int g_hoist_rows     = 0;   /* 0 なら畳み込まない */
+static int g_hoist_first_ai = 0;   /* always の並びで最初に来る非前置き行の位置 */
+static int g_hoist_bits     = 0;
+static int g_hoist_padding  = 0;
+static int g_hoist_symbolc  = 0;
+static int g_hoist_vliw     = 0;
+
+/* ---- ニーモニック索引 ------------------------------------------------
+ * ソース1行ごとにパターン表を頭から全部たどり、1行ずつ先頭一致で足切りして
+ * いた。パターン数 × ソース行数の空回りなので、aarch64 のパターンファイル
+ * （展開後 1 万行）では 1 行につき 1 万回の足切りになっていた。
+ *
+ * そこで読み込み時に「パターン先頭の大文字列（＝ニーモニック）」を鍵にした
+ * ハッシュ表を作り、行ごとにはその行のニーモニックで引いた候補だけをたどる。
+ * ニーモニックを持たない行（ディレクティブ、番兵、小文字や `!` で始まる
+ * パターン）は always に入れ、常にたどる。
+ * 索引が返す候補の集合は pat_prefix_matches() が通す集合とちょうど同じで、
+ * たどる順もパターン表の記述順のままである（採用するパターンは変わらない）。 */
+typedef struct { int *rows; int n, cap; } PatRowList;
+
+static void prl_push(PatRowList *l, int row){
+    if(l->n >= l->cap){
+        l->cap = l->cap ? l->cap*2 : 8;
+        l->rows = realloc(l->rows, (size_t)l->cap * sizeof(int));
+        if(!l->rows){ perror("realloc"); exit(1); }
+    }
+    l->rows[l->n++] = row;
+}
+
+typedef struct PatIdxNode {
+    char       key[64];
+    PatRowList open;     /* 直後が英数字でもよい行（pfx_closed==0） */
+    PatRowList closed;   /* 直後に英数字が続いたら不一致の行（pfx_closed==1）*/
+    struct PatIdxNode *next;
+} PatIdxNode;
+
+#define PATIDX_NB 1024
+typedef struct {
+    PatIdxNode *buckets[PATIDX_NB];
+    PatRowList  always;
+    int         maxkeylen;
+    /* 行ごとの候補並べ（使い回す） */
+    int        *cand;
+    int         cand_cap;
+} PatIndex;
+
+static PatIndex g_patidx;
+
+static uint32_t patidx_hash(const char *k, int n){
+    uint32_t h = 2166136261u;
+    for(int i=0;i<n;i++){ h ^= (unsigned char)k[i]; h *= 16777619u; }
+    return h;
+}
+
+static PatIdxNode *patidx_node(PatIndex *ix, const char *k, int n, int create){
+    uint32_t b = patidx_hash(k,n) & (PATIDX_NB-1);
+    for(PatIdxNode *p=ix->buckets[b]; p; p=p->next)
+        if((int)strlen(p->key)==n && memcmp(p->key,k,(size_t)n)==0) return p;
+    if(!create) return NULL;
+    PatIdxNode *p = calloc(1, sizeof(*p));
+    if(!p){ perror("calloc"); exit(1); }
+    memcpy(p->key,k,(size_t)n); p->key[n]='\0';
+    p->next = ix->buckets[b]; ix->buckets[b] = p;
+    return p;
+}
+
+static void patidx_build(PatIndex *ix, PatVec *v){
+    for(int pi=0; pi<v->len; pi++){
+        PatEntry *e = &v->data[pi];
+        /* ディレクティブ行は名前が大文字のこともある（`EPIC`）が、行ごとに
+         * 必ず実行しなければならないので always に入れる。 */
+        if(e->pfxlen == 0 || e->is_dir){ prl_push(&ix->always, pi); continue; }
+        PatIdxNode *nd = patidx_node(ix, e->pfx, e->pfxlen, 1);
+        prl_push(e->pfx_closed ? &nd->closed : &nd->open, pi);
+        if(e->pfxlen > ix->maxkeylen) ix->maxkeylen = e->pfxlen;
+    }
+    /* 前置きを畳み込むとき、always の並びをどこから読み始めればよいか。 */
+    g_hoist_first_ai = 0;
+    while(g_hoist_first_ai < ix->always.n
+          && ix->always.rows[g_hoist_first_ai] < g_hoist_rows) g_hoist_first_ai++;
+}
+
+static int patidx_cmp_int(const void *a, const void *b){
+    int x = *(const int*)a, y = *(const int*)b;
+    return (x>y) - (x<y);
+}
+
+/* 照合にかける行 lin のニーモニックで索引を引き、候補行を昇順に並べる。
+ * 戻り値は候補の個数、*out は使い回しの並びである（always は含めない）。 */
+static int patidx_candidates(PatIndex *ix, const char *lin, int **out){
+    char key[64];
+    char nextraw[65];
+    int  n = 0;
+    int  lim = ix->maxkeylen < (int)sizeof(key) ? ix->maxkeylen : (int)sizeof(key)-1;
+    /* 大文字化は axx_upper_char() と同じ規則（ASCII の a-z だけ）。 */
+    for(const char *q=lin; *q && n<lim; q++){
+        if(*q == ' ') continue;
+        key[n]     = (*q >= 'a' && *q <= 'z') ? (char)(*q - 32) : *q;
+        nextraw[n] = q[1];        /* 直後の「空白を飛ばさない」1文字 */
+        n++;
+    }
+    int cnt = 0;
+    for(int k=1; k<=n; k++){
+        PatIdxNode *nd = patidx_node(ix, key, k, 0);
+        if(!nd) continue;
+        char nx = nextraw[k-1];
+        int take_closed = !((nx>='A'&&nx<='Z')||(nx>='a'&&nx<='z')
+                            ||(nx>='0'&&nx<='9')||nx=='_');
+        int need = cnt + nd->open.n + (take_closed ? nd->closed.n : 0);
+        if(need > ix->cand_cap){
+            ix->cand_cap = need*2;
+            ix->cand = realloc(ix->cand, (size_t)ix->cand_cap * sizeof(int));
+            if(!ix->cand){ perror("realloc"); exit(1); }
+        }
+        for(int j=0;j<nd->open.n;j++) ix->cand[cnt++] = nd->open.rows[j];
+        if(take_closed)
+            for(int j=0;j<nd->closed.n;j++) ix->cand[cnt++] = nd->closed.rows[j];
+    }
+    /* 鍵の長さごとに別の並びから集めたので、記述順に戻す。 */
+    if(cnt > 1) qsort(ix->cand, (size_t)cnt, sizeof(int), patidx_cmp_int);
+    *out = ix->cand;
+    return cnt;
+}
+
+/* 行が空か（どの欄にも何も書かれていない）。 */
+static int pat_row_blank(const PatEntry *e){
+    for(int i=0;i<PAT_FIELDS;i++) if(e->f[i][0]) return 0;
+    return 1;
+}
+
+/* ソース行によって値が変わりうる書き方を含むか。パターン行の式はパターン変数
+ * (小文字)・`$.`/`$$`・`#名前`・`'`・`@` を読めるので、これらの印が1つでも
+ * あればソース行ごとに結果が変わりうる（マニュアル 6.3）。 */
+static int pat_text_dynamic(const char *s){
+    for(const char *p=s; *p; p++){
+        if(*p=='!' || *p=='$' || *p=='#' || *p=='@' || *p=='\'') return 1;
+        if(*p>='a' && *p<='z') return 1;
+    }
+    return 0;
+}
+
+/* 名前の並び（`X0,X1,…`）か。カンマがあれば集合として読まれるので、式評価
+ * （ラベルを読みうる）には落ちない。 */
+static int pat_is_name_list(const char *s){
+    int comma = 0;
+    for(const char *p=s; *p; p++){
+        if(*p==','){ comma = 1; continue; }
+        if(*p==' ' || *p=='\t') continue;
+        if((*p>='A'&&*p<='Z')||(*p>='0'&&*p<='9')||*p=='_') continue;
+        return 0;
+    }
+    return comma;
+}
+
+/* `.bits` の欄（幅の定数式か `big`/`little`）か。 */
+static int pat_bits_field_static(const char *f){
+    if(strcasecmp(f,"big")==0 || strcasecmp(f,"little")==0) return 1;
+    return const_setsym_text(f);
+}
+
+/* このディレクティブ行は、どのソース行でも同じ結果になるか。
+ * 判断がつかないものは 0 を返す（畳み込まない側に倒す）。 */
+static int pat_dir_line_invariant(const PatEntry *e){
+    switch(e->dir_kind){
+    case PD_SETSYM: {
+        const char *name = e->f[1][0] ? e->f[1] : e->f[2];
+        const char *val  = e->f[1][0] ? e->f[2] : "";
+        if(pat_text_dynamic(name)) return 0;
+        if(!val[0]) return 1;                       /* 値なし（0 になる） */
+        { const char *q = val;
+          while(*q==' '||*q=='\t') q++;
+          if(*q=='"') return 1;                     /* 文字列シンボル */
+          if(*q=='[') return 0;                     /* 配列は中身が式になりうる */
+        }
+        if(const_setsym_text(val)) return 1;        /* 定数式 */
+        return pat_is_name_list(val);               /* 名前の集合 */
+    }
+    case PD_CHECK: case PD_CLRCHECK: case PD_RELOC: case PD_CLRRELOC:
+    case PD_SYMBOLC: case PD_PASSTHRU: case PD_EOL: case PD_TEXTMODE:
+        /* どれも名前や型名の文字どおりの並びだけを見る（式を読まない）。
+         * 変数名の小文字は普通なので pat_text_dynamic は使わない。 */
+        for(int i=1;i<PAT_FIELDS;i++)
+            for(const char *q=e->f[i]; *q; q++)
+                if(*q=='!' || *q=='$' || *q=='#' || *q=='@') return 0;
+        return 1;
+    case PD_BITS:
+        for(int i=1;i<PAT_FIELDS;i++)
+            if(e->f[i][0] && !pat_bits_field_static(e->f[i])) return 0;
+        return 1;
+    case PD_PADDING: case PD_VLIW:
+        for(int i=1;i<PAT_FIELDS;i++)
+            if(e->f[i][0] && !const_setsym_text(e->f[i])) return 0;
+        return 1;
+    case PD_ERRMSG: {
+        if(!const_setsym_text(e->f[1])) return 0;
+        const char *q = e->f[2];
+        while(*q==' '||*q=='\t') q++;
+        return *q=='"';
+    }
+    case PD_ELFTYPE:
+        /* 名前は文字どおり、値は定数式のときだけ（型名の表は行ごとに
+           作り直さないので、同じ宣言を毎行やり直す必要はない）。 */
+        if(!e->f[1][0]) return 0;
+        for(const char *q=e->f[1]; *q; q++)
+            if(*q=='!' || *q=='$' || *q=='#' || *q=='@' || *q=='\'') return 0;
+        return const_setsym_text(e->f[2]);
+    default:
+        /* `.clearsym` `.map` `.free` `.enum` `.clrenum` `EPIC` は畳み込まない。 */
+        return 0;
+    }
+}
+
+/* 畳み込める先頭行数を決め、前置きが書く欄の印を立てる。
+ * 条件は2つである。
+ *   - 先頭から続く行が「空行」または「畳み込めるディレクティブ行」だけである
+ *     こと。普通のパターン行が現れたらそこで終わり（その行の照合は前置きの
+ *     途中の状態で行われるべきなので、先に進めてはいけない）。
+ *   - 前置きより後ろに、文字列・配列シンボルを書き換えうる行
+ *     （`.setsym` `.clearsym` `.free`）が無いこと。これらの表は行ごとに
+ *     作り直さないので、後ろで書き換えられると控えた状態が古くなる。 */
+static void pat_hoist_scan(PatVec *v){
+    g_hoist_rows = 0;
+    g_hoist_bits = g_hoist_padding = g_hoist_symbolc = g_hoist_vliw = 0;
+    int h = 0;
+    int f_bits=0, f_padding=0, f_symbolc=0, f_vliw=0;
+    for(; h < v->len; h++){
+        PatEntry *e = &v->data[h];
+        if(pat_row_blank(e)) continue;
+        if(!e->is_dir) break;
+        if(!pat_dir_line_invariant(e)) break;
+        switch(e->dir_kind){
+        case PD_BITS:    f_bits = 1;    break;
+        case PD_PADDING: f_padding = 1; break;
+        case PD_SYMBOLC: f_symbolc = 1; break;
+        case PD_VLIW:    f_vliw = 1;    break;
+        default: break;
+        }
+    }
+    if(h <= 0 || h >= v->len) return;
+
+    /* 前置きの行は名前を読む（`.check` の名前並び、集合の `.setsym` など）。
+     * 配列・文字列シンボルの表は1行ごとに作り直さないので、前置きが読む名前を
+     * 前置きより後ろの行が書き換えると、控えた状態が古くなる。
+     * そこで「前置きが読む名前」を集め、後ろでそれを書き換える行があれば
+     * 畳み込まない。数値を入れるだけの `.setsym` は、1行ごとに作り直す側の
+     * シンボル表にしか触らないので、名前が重なっても差し支えない。 */
+    StrVec reads; sv_init(&reads);
+    for(int i = 0; i < h; i++){
+        PatEntry *e = &v->data[i];
+        for(int fi = 1; fi < PAT_FIELDS; fi++){
+            const char *q = e->f[fi];
+            while(*q){
+                if((*q>='A'&&*q<='Z')||(*q>='0'&&*q<='9')||*q=='_'){
+                    char tok[256]; int n = 0;
+                    while(((*q>='A'&&*q<='Z')||(*q>='0'&&*q<='9')||*q=='_')
+                          && n < (int)sizeof(tok)-1) tok[n++] = *q++;
+                    tok[n] = '\0';
+                    int dup = 0;
+                    for(int k=0;k<reads.len;k++) if(strcmp(reads.data[k],tok)==0){ dup=1; break; }
+                    if(!dup) sv_push(&reads, tok);
+                } else q++;
+            }
+        }
+    }
+
+    int blocked = 0;
+    for(int i = h; i < v->len && !blocked; i++){
+        PatEntry *e = &v->data[i];
+        if(!e->is_dir) continue;
+        const char *wname = NULL;
+        if(e->dir_kind == PD_SETSYM){
+            if(!e->f[1][0]){ blocked = 1; break; }   /* 値欄の位置が読めない */
+            if(const_setsym_text(e->f[2])) continue; /* 数値だけなら関わらない */
+            wname = e->f[1];
+        } else if(e->dir_kind == PD_CLEARSYM){
+            wname = e->f[2][0] ? e->f[2] : e->f[1];
+            if(!wname[0]){ blocked = 1; break; }     /* 全部消す */
+        } else if(e->dir_kind == PD_FREE){
+            wname = e->f[2][0] ? e->f[2] : e->f[1];
+            if(!wname[0]){ blocked = 1; break; }
+        } else continue;
+        /* axx_strupr_to() はこの位置ではまだ宣言されていないので、その場で
+           大文字に直す（規則は同じ: ASCII の a-z だけ）。 */
+        char up[256]; int un = 0;
+        for(const char *q = wname; *q && un < (int)sizeof(up)-1; q++)
+            up[un++] = (*q>='a'&&*q<='z') ? (char)(*q-32) : *q;
+        up[un] = '\0';
+        for(int k=0;k<reads.len;k++)
+            if(strcmp(reads.data[k], up)==0){ blocked = 1; break; }
+    }
+    sv_free(&reads);
+    if(blocked) return;
+    g_hoist_rows    = h;
+    g_hoist_bits    = f_bits;
+    g_hoist_padding = f_padding;
+    g_hoist_symbolc = f_symbolc;
+    g_hoist_vliw    = f_vliw;
 }
 
 static PatEntry *pv_push_blank(PatVec*v){
     if(v->len>=v->cap){v->cap=v->cap?v->cap*2:32;v->data=realloc(v->data,v->cap*sizeof(PatEntry));if(!v->data){perror("realloc");exit(1);}}
     PatEntry *e=&v->data[v->len++];
+    /* realloc で伸ばした領域は初期化されていない。控え場所（ポインタを含む）を
+     * 空にしてから使う。 */
+    memset(e, 0, sizeof(*e));
     for(int i=0;i<PAT_FIELDS;i++) e->f[i]=strdup("");
     return e;
 }
@@ -1444,7 +1975,7 @@ typedef struct {
     int        reloctype_override[4];
 
     /* .check で登録された「変数 a〜z が満たすべき条件」 */
-    StrVec     check_constraints[NVARS];
+    ChkList   *check_constraints[NVARS];  /* 空は NULL（共有・参照数つき）*/
     /* .reloc で登録された「この変数が捕らえたラベル参照はこの型で外に出す」
      * 宣言。変数スロット -> 型番号（0 でなし）。型はオペランドの位置ごとに
      * 決まる（AArch64 では同じシンボルを adrp と add が別の型で参照する）ため、
@@ -1452,6 +1983,12 @@ typedef struct {
     int        reloc_constraints[NVARS];
     char      *reloc_badname[32];   /* 未知型名の報告済み一覧 */
     int        reloc_badname_len;
+
+    /* `.elftype::名前::値` で決めたリロケーション型名（名前は小文字で持つ）。
+     * 型名を書けるところ（`.reloc`、ソースの `::型名`、取り込みファイル）は
+     * まずこの表を引き、無ければマシンごとの名前表を引く。 */
+    struct { char *name; int rtype; } *elftypes;
+    int        elftypes_len, elftypes_cap;
 
     /* .enum で登録された、変数 a〜z の列挙（`!E<変数>` が使う） */
     EnumDef    enum_defs[NVARS];
@@ -1614,8 +2151,14 @@ static void diag_replay(AsmState *st, char **texts, int *seterr, int n){
     }
 }
 
+/* 出そうとした診断の数。抑止されたものも数える（パスによって見え方が
+ * 変わるので、抑止の前に数える）。前置きの畳み込みが「この前置きは診断を
+ * 出す」と気づくために使う。 */
+static long long g_diag_count = 0;
+
 static void axx_diagf(int set_error, int force, const char *fmt, ...){
     AsmState *st = g_active_state;
+    g_diag_count++;
     char buf[2048];
     va_list ap;
     va_start(ap, fmt);
@@ -1848,10 +2391,54 @@ static int elf_machine_named(const ElfMachineInfo *m, const char *name){
     return -1;
 }
 
+/* `.elftype` で決めた型名を引く。無ければ -1。名前の大小は区別しない。 */
+static int elftype_find(const AsmState *st, const char *name){
+    for(int i=0;i<st->elftypes_len;i++)
+        if(strcasecmp(st->elftypes[i].name, name)==0) return st->elftypes[i].rtype;
+    return -1;
+}
+
+/* `.elftype` の名前を据える。同じ名前があれば書き換える（後の宣言が勝つ）。 */
+static void elftype_set(AsmState *st, const char *name, int rtype){
+    for(int i=0;i<st->elftypes_len;i++)
+        if(strcasecmp(st->elftypes[i].name, name)==0){ st->elftypes[i].rtype = rtype; return; }
+    if(st->elftypes_len >= st->elftypes_cap){
+        st->elftypes_cap = st->elftypes_cap ? st->elftypes_cap*2 : 8;
+        st->elftypes = realloc(st->elftypes, (size_t)st->elftypes_cap*sizeof(*st->elftypes));
+        if(!st->elftypes){ perror("realloc"); exit(1); }
+    }
+    st->elftypes[st->elftypes_len].name  = strdup(name);
+    if(!st->elftypes[st->elftypes_len].name){ perror("strdup"); exit(1); }
+    st->elftypes[st->elftypes_len].rtype = rtype;
+    st->elftypes_len++;
+}
+
+/* 型名を番号にする。`.elftype` で決めた名前を先に引き、無ければ `-m` で選んだ
+ * マシンの名前表を引く。型名を書けるところは全部ここを通る。
+ * axx.py の _reloc_named() と同じ規則である。 */
+static int elf_reloc_named(const AsmState *st, const ElfMachineInfo *m, const char *name){
+    if(!name || !name[0]) return -1;
+    int t = elftype_find(st, name);
+    if(t >= 0) return t;
+    return elf_machine_named(m, name);
+}
+
 static const char *elf_machine_reverse(const ElfMachineInfo *m, int rtype){
     if(!m) return NULL;
     for(int i=0; m->named[i].name; i++)
         if(m->named[i].rtype == rtype) return m->named[i].name;
+    return NULL;
+}
+
+/* 型番号から型名を引く（`-E` の書き出しに使う）。マシンの名前表を先に引き、
+ * 無ければ `.elftype` で決めた名前を使う。取り込み側は名前を
+ * elf_reloc_named() で引くので、これで書き出し→取り込みが往復できる。
+ * axx.py の _reloc_reverse() と同じ規則である。 */
+static const char *elf_reloc_reverse(const AsmState *st, const ElfMachineInfo *m, int rtype){
+    const char *nm = elf_machine_reverse(m, rtype);
+    if(nm) return nm;
+    for(int i=0;i<st->elftypes_len;i++)
+        if(st->elftypes[i].rtype == rtype) return st->elftypes[i].name;
     return NULL;
 }
 
@@ -2032,9 +2619,10 @@ static void state_init(AsmState *st) {
     st->reloc_count = 0;
     st->reloc_cap = 0;
     for(int _rti=0; _rti<4; _rti++) st->reloctype_override[_rti] = -1;
-    for(int _ci=0; _ci<NVARS; _ci++) sv_init(&st->check_constraints[_ci]);
+    for(int _ci=0; _ci<NVARS; _ci++) st->check_constraints[_ci] = NULL;
     for(int _ci=0; _ci<NVARS; _ci++) st->reloc_constraints[_ci] = 0;
     st->reloc_badname_len = 0;
+    st->elftypes = NULL; st->elftypes_len = 0; st->elftypes_cap = 0;
     for(int _ci=0; _ci<NVARS; _ci++) enumdef_init(&st->enum_defs[_ci]);
     st->enum_bind_names = NULL;
     st->enum_bind_vals  = NULL;
@@ -3115,8 +3703,119 @@ static uint256_t var_slot_for_mode(AsmState *st, int slot, int want_float){
     if(want_float && !pv->is_float) return double_to_u256(u256_int_to_double(pv->val));
     return pv->val;
 }
+/* ---- パターン変数の巻き戻し記録 --------------------------------------
+ * 候補パターンを1つ試すたびに vars[NVARS] を丸ごと退避・復元していた。
+ * 1行につき数百の候補を試すので、これだけで数百 MB の memcpy になっていた。
+ * 1回の照合が実際に書く変数はふつう数個なので、書いた変数だけを控えておき、
+ * 失敗したらその分だけ書き戻す。vars_mark() で記録の位置を控え、
+ * vars_rollback() でそこまで戻す。成功したときは記録を残したまま先へ進む
+ * （外側の枠がまだ巻き戻せるようにするため）。
+ * axx.py 側は dict の差分で同じことをする。 */
+typedef struct { int slot; PatVar old; } VarUndo;
+static VarUndo *g_vundo = NULL;
+static int      g_vundo_len = 0, g_vundo_cap = 0;
+
+/* 空でない（＝一度でも書いた）変数の一覧。変数表を空にするときに
+ * 全スロットを走らずに済ませる。ここに載っていないスロットは必ず空である。 */
+static int g_vtouched[NVARS];
+static int g_vtouched_list[NVARS];
+static int g_vtouched_n = 0;
+
+/* vars[slot] を書き換える直前に呼ぶ。今の値を記録に積む。 */
+static void var_note_write(AsmState *st, int slot){
+    if(slot < 0 || slot >= NVARS) return;
+    if(g_vundo_len >= g_vundo_cap){
+        g_vundo_cap = g_vundo_cap ? g_vundo_cap * 2 : 64;
+        g_vundo = realloc(g_vundo, (size_t)g_vundo_cap * sizeof(*g_vundo));
+        if(!g_vundo){ perror("realloc"); exit(1); }
+    }
+    g_vundo[g_vundo_len].slot = slot;
+    g_vundo[g_vundo_len].old  = st->vars[slot];
+    g_vundo_len++;
+    if(!g_vtouched[slot]){ g_vtouched[slot] = 1; g_vtouched_list[g_vtouched_n++] = slot; }
+}
+
+static int vars_mark(void){ return g_vundo_len; }
+
+static void vars_rollback(AsmState *st, int mark){
+    while(g_vundo_len > mark){
+        g_vundo_len--;
+        st->vars[g_vundo[g_vundo_len].slot] = g_vundo[g_vundo_len].old;
+    }
+}
+
+/* 変数表を空にする。候補パターンを試す直前にだけ呼ぶ。この位置には巻き戻し
+ * 待ちの外枠が無いので、それまでの記録は捨ててよい。 */
+static void vars_clear_all(AsmState *st){
+    for(int i = 0; i < g_vtouched_n; i++){
+        int sl = g_vtouched_list[i];
+        st->vars[sl].val      = u256_zero();
+        st->vars[sl].is_undef = 0;
+        st->vars[sl].text_off = -1;
+        g_vtouched[sl] = 0;
+    }
+    g_vtouched_n  = 0;
+    g_vundo_len   = 0;
+}
+
+/* vars[] を記録を通さずに丸ごと書き換えたあとに呼ぶ（どのスロットも
+ * 空でないかもしれない、という状態に印を付け直す）。 */
+static void vars_touch_all(void){
+    g_vundo_len  = 0;
+    g_vtouched_n = 0;
+    for(int sl = 0; sl < g_nvars; sl++){ g_vtouched[sl] = 1; g_vtouched_list[g_vtouched_n++] = sl; }
+}
+
+/* ---- 変数→ラベル対応の巻き戻し記録 ----------------------------------
+ * elf_var_to_label[] も候補ごとに NVARS 個ぶん strdup して退避していた。
+ * 書き込みは「変数が捕まえたラベル名を覚える」1か所だけなので、vars と同じ
+ * やり方で書いた分だけ記録する。記録した文字列の持ち主は記録側になり、
+ * 巻き戻せばそのまま配列へ返し、捨てるときに解放する。 */
+typedef struct { int slot; int set; char *label_name; uint64_t label_val; } V2lUndo;
+static V2lUndo *g_v2lundo = NULL;
+static int      g_v2lundo_len = 0, g_v2lundo_cap = 0;
+
+static void v2l_note_write(AsmState *st, int slot){
+    if(slot < 0 || slot >= NVARS) return;
+    if(g_v2lundo_len >= g_v2lundo_cap){
+        g_v2lundo_cap = g_v2lundo_cap ? g_v2lundo_cap * 2 : 32;
+        g_v2lundo = realloc(g_v2lundo, (size_t)g_v2lundo_cap * sizeof(*g_v2lundo));
+        if(!g_v2lundo){ perror("realloc"); exit(1); }
+    }
+    g_v2lundo[g_v2lundo_len].slot       = slot;
+    g_v2lundo[g_v2lundo_len].set        = st->elf_var_to_label[slot].set;
+    g_v2lundo[g_v2lundo_len].label_val  = st->elf_var_to_label[slot].label_val;
+    /* 文字列は写さずに持ち主を移す。書く側は新しい文字列を入れ直す。 */
+    g_v2lundo[g_v2lundo_len].label_name = st->elf_var_to_label[slot].label_name;
+    st->elf_var_to_label[slot].label_name = NULL;
+    g_v2lundo_len++;
+}
+
+static int v2l_mark(void){ return g_v2lundo_len; }
+
+/* 記録を捨てる（巻き戻さない）。持っている古い文字列はここで解放する。
+ * 行の始めに呼ぶ（その位置には巻き戻し待ちの枠が無い）。 */
+static void v2l_forget(void){
+    while(g_v2lundo_len > 0){
+        g_v2lundo_len--;
+        free(g_v2lundo[g_v2lundo_len].label_name);
+    }
+}
+
+static void v2l_rollback(AsmState *st, int mark){
+    while(g_v2lundo_len > mark){
+        g_v2lundo_len--;
+        int sl = g_v2lundo[g_v2lundo_len].slot;
+        free(st->elf_var_to_label[sl].label_name);
+        st->elf_var_to_label[sl].set        = g_v2lundo[g_v2lundo_len].set;
+        st->elf_var_to_label[sl].label_val  = g_v2lundo[g_v2lundo_len].label_val;
+        st->elf_var_to_label[sl].label_name = g_v2lundo[g_v2lundo_len].label_name;
+    }
+}
+
 static void var_slot_put_tagged(AsmState *st, int slot, uint256_t v, int is_undef){
     if(slot<0||slot>=NVARS) return;
+    var_note_write(st, slot);
     st->vars[slot].val=v; st->vars[slot].is_undef=is_undef; st->vars[slot].is_float=st->exp_typ_float;
 }
 static void var_slot_put(AsmState *st, int slot, uint256_t v){
@@ -3150,14 +3849,16 @@ static uint256_t label_get_value(AsmState *st, const char *k){
             if(st->elf_capturing_var >= 0){
                 int vi = st->elf_capturing_var;
                 if(vi >= 0 && vi < g_nvars){
+                    /* v2l_note_write() が今の値を記録へ移すので、
+                     * label_name は呼んだ時点で NULL になっている。 */
                     if(st->elf_var_to_label[vi].set == 0){
+                        v2l_note_write(st, vi);
                         st->elf_var_to_label[vi].set = 1;
-                        free(st->elf_var_to_label[vi].label_name);
                         st->elf_var_to_label[vi].label_name = strdup(k);
                         st->elf_var_to_label[vi].label_val = u256_to_u64(e->value);
                     } else {
+                        v2l_note_write(st, vi);
                         st->elf_var_to_label[vi].set = -1;
-                        free(st->elf_var_to_label[vi].label_name);
                         st->elf_var_to_label[vi].label_name = NULL;
                     }
                 }
@@ -4748,6 +5449,19 @@ static int         symbol_set_from_text(AsmState *st, const char *dst_upper, con
 
 static int dir_set_symbol(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".setsym")!=0) return 0;
+    /* `.setsym::名前::10` のようにただの数なら、文字列・配列・集合の判定を
+     * 通さずシンボル表へ入れる。値は定数なので最初の1回だけ評価する。
+     * 前置きの外にある `.setsym` はソース1行ごとに通るので、この判定列
+     * （名前の大文字化・集合の切り出し）がそのまま行数ぶん積み上がる。 */
+    if(e->setsym_plain){
+        if(!e->setsym_done){
+            int io;
+            e->setsym_val  = expr_expression_pat(asmb, e->f[2], 0, &io);
+            e->setsym_done = 1;
+        }
+        smap_set(&asmb->st.symbols, e->setsym_key, e->setsym_val);
+        return 1;
+    }
     const char *name_field = e->f[1][0] ? e->f[1] : e->f[2];
     const char *value_field = e->f[1][0] ? e->f[2] : "";
     char key[512]; axx_strupr_to(key,name_field,sizeof(key));
@@ -5016,8 +5730,14 @@ static int dir_check(Assembler *asmb, PatEntry *e){
                    var_str);
         return 1;
     }
-    sv_free(&asmb->st.check_constraints[idx]);
-    sv_init(&asmb->st.check_constraints[idx]);
+    /* 同じ行を毎行組み立て直さない。もとになる配列シンボルの表が変わって
+     * いなければ、前に作った一覧をそのまま渡す（参照数を増やすだけ）。 */
+    if(e->chk_cache && e->chk_cache_gen == g_arrgen){
+        chk_install(&asmb->st.check_constraints[idx], chk_ref((ChkList*)e->chk_cache));
+        return 1;
+    }
+
+    ChkList *nl = chk_new();
     StrVec elems; sv_init(&elems);
     elem_list_expand(&asmb->st, syms_str, &elems);
     for(int ei = 0; ei < elems.len; ei++){
@@ -5026,14 +5746,18 @@ static int dir_check(Assembler *asmb, PatEntry *e){
             /* 空文字リテラルは「このオペランドは省略可」の印。
                省略時、変数には 0 が入る。長さ0の要素として積む。 */
             int dup = 0;
-            for(int si = 0; si < asmb->st.check_constraints[idx].len; si++)
-                if(asmb->st.check_constraints[idx].data[si][0] == '\0'){ dup = 1; break; }
-            if(!dup) sv_push(&asmb->st.check_constraints[idx], "");
+            for(int si = 0; si < nl->v.len; si++)
+                if(nl->v.data[si][0] == '\0'){ dup = 1; break; }
+            if(!dup) sv_push(&nl->v, "");
         } else {
-            sv_push(&asmb->st.check_constraints[idx], nm);
+            sv_push(&nl->v, nm);
         }
     }
     sv_free(&elems);
+    chk_unref((ChkList*)e->chk_cache);
+    e->chk_cache     = chk_ref(nl);
+    e->chk_cache_gen = g_arrgen;
+    chk_install(&asmb->st.check_constraints[idx], nl);
     return 1;
 }
 
@@ -5055,6 +5779,68 @@ static int reloc_badname_seen(AsmState *st, const char *name){
  * 型名は `-m` で選んだマシンの名前表（`::pc32` などに使うものと同じ）から引く。
  * AArch64 の `call26` のような命令フィールド型は、値が命令語のビット欄に詰まって
  * いて出力バイト列から加数を逆算できないため、この宣言が要る。 */
+/* `.elftype::<名前>::<値>` — リロケーション型名を自分で決める。
+ *
+ * 決めた名前は、型名を書けるところ全部で使える。
+ *   パターンファイル: `.reloc::<変数>::<名前>`
+ *   ソース          : `.EXTERN 名前::<名前>` `.EQU x::<名前>` `.RELOCTYPE`
+ *   取り込みファイル: `ラベル::<名前>`
+ * 値は型番号（ELF の r_info の型欄に入る数）で、1 以上の整数の定数式である
+ * （0 は「型を指定しない」の意味で内部的に使っているので取らない）。
+ * 同じ名前を2度書けば後の宣言が勝つ。`-m` で選んだマシンの名前表に同じ綴りが
+ * あっても、この宣言のほうを先に引く（自分の宣言で上書きできる）。
+ *
+ * 値は行によって変わらないので、最初の1回だけ評価して控える。
+ * 名前は `.reloc` の型名と同じ読み方（空白は落とし、大小は区別しない）にする。
+ * axx.py の elftype_processing() と同じ規則である。 */
+static int elftype_apply(Assembler *asmb, PatEntry *e){
+    AsmState *st = &asmb->st;
+    const char *name_str = e->f[1][0] ? e->f[1] : e->f[2];
+    const char *val_str  = e->f[1][0] ? e->f[2] : "";
+
+    char nm[64]; size_t nn = 0;
+    for(const char *q = name_str; *q && nn + 1 < sizeof(nm); q++){
+        if(*q == ' ' || *q == '\t') continue;
+        nm[nn++] = (char)tolower((unsigned char)*q);
+    }
+    nm[nn] = '\0';
+    if(!nm[0]){
+        axx_diagf(1, 0, " error - .elftype: type name is not specified.\n");
+        e->elftype_done = 1; e->elftype_val = 0;
+        return 1;
+    }
+    if(!val_str[0]){
+        axx_diagf(1, 0, " error - .elftype: type number is not specified ('%s').\n", nm);
+        e->elftype_done = 1; e->elftype_val = 0;
+        return 1;
+    }
+
+    if(!e->elftype_done){
+        int io;
+        st->error_undefined_label = 0;
+        uint256_t v = expr_expression_pat(asmb, val_str, 0, &io);
+        int64_t n = u256_to_i64(v);
+        if(st->error_undefined_label || u256_is_undef_derived(v)
+           || n < 1 || n > 2147483647 || !u256_eq(v, u256_from_i64(n))){
+            axx_diagf(1, 0, " error - .elftype: type number must be an integer in "
+                            "1..2147483647, got '%s'.\n", val_str);
+            st->error_undefined_label = 0;
+            e->elftype_done = 1; e->elftype_val = 0;
+            return 1;
+        }
+        st->error_undefined_label = 0;
+        e->elftype_val  = (int)n;
+        e->elftype_done = 1;
+    }
+    if(e->elftype_val > 0) elftype_set(st, nm, e->elftype_val);
+    return 1;
+}
+
+static int dir_elftype(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".elftype") != 0) return 0;
+    return elftype_apply(asmb, e);
+}
+
 static int dir_reloc(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".reloc") != 0) return 0;
     const char *var_str  = e->f[1][0] ? e->f[1] : e->f[2];
@@ -5084,7 +5870,7 @@ static int dir_reloc(Assembler *asmb, PatEntry *e){
      * で使い回せるべきで、対象外のときに落ちてはいけない。 */
     if(!asmb->st.elf_objfile[0]) return 1;
     const ElfMachineInfo *m = elf_machine_find(asmb->st.elf_machine);
-    int rtype = elf_machine_named(m, tname);
+    int rtype = elf_reloc_named(&asmb->st, m, tname);
     if(rtype < 0){
         /* パターン行は1ソース行ごとに読み直されるので、同じ名前で何度も
          * 出さないよう一度だけ報告する。 */
@@ -5124,12 +5910,10 @@ static int dir_clrcheck(Assembler *asmb, PatEntry *e){
                        var_str);
             return 1;
         }
-        sv_free(&asmb->st.check_constraints[idx]);
-        sv_init(&asmb->st.check_constraints[idx]);
+        chk_install(&asmb->st.check_constraints[idx], NULL);
     } else {
         for(int i = 0; i < g_nvars; i++){
-            sv_free(&asmb->st.check_constraints[i]);
-            sv_init(&asmb->st.check_constraints[i]);
+            chk_install(&asmb->st.check_constraints[i], NULL);
         }
     }
     return 1;
@@ -5156,13 +5940,17 @@ static void free_one_name(Assembler *asmb, const char *name){
 
     /* `.check` の候補からも外す。候補は大文字で積まれている。 */
     for(int vi=0; vi<g_nvars; vi++){
-        StrVec *cv = &st->check_constraints[vi];
-        int w = 0;
-        for(int k=0; k<cv->len; k++){
-            if(strcmp(cv->data[k], key)==0){ free(cv->data[k]); continue; }
-            cv->data[w++] = cv->data[k];
-        }
-        cv->len = w;
+        ChkList *cv = st->check_constraints[vi];
+        if(!cv) continue;
+        int hit = 0;
+        for(int k=0; k<cv->v.len; k++)
+            if(strcmp(cv->v.data[k], key)==0){ hit = 1; break; }
+        if(!hit) continue;
+        /* リストは他からも参照されうるので、その場で削らずに作り替える。 */
+        ChkList *nl = chk_new();
+        for(int k=0; k<cv->v.len; k++)
+            if(strcmp(cv->v.data[k], key)!=0) sv_push(&nl->v, cv->v.data[k]);
+        chk_install(&st->check_constraints[vi], nl);
     }
 
     /* 名前が変数そのものなら、その変数の制約と列挙ごと外す。 */
@@ -5174,7 +5962,7 @@ static void free_one_name(Assembler *asmb, const char *name){
         if(var_name_len(lower) == n){
             int vi = var_slot(lower, n, 0);
             if(vi >= 0){
-                sv_free(&st->check_constraints[vi]); sv_init(&st->check_constraints[vi]);
+                chk_install(&st->check_constraints[vi], NULL);
                 st->reloc_constraints[vi] = 0;
                 enumdef_clear(&st->enum_defs[vi]);
             }
@@ -5261,18 +6049,18 @@ static void map_apply(Assembler *asmb, PatEntry *e, SymMap *into, int set_check)
     sv_free(&vals);
     if(set_check){
         int idx = vslot;
-        sv_free(&st->check_constraints[idx]);
-        sv_init(&st->check_constraints[idx]);
+        ChkList *nl = chk_new();
         for(int i = 0; i < elems.len; i++){
             if(!elems.data[i][0]){
                 int dup = 0;
-                for(int si = 0; si < st->check_constraints[idx].len; si++)
-                    if(st->check_constraints[idx].data[si][0] == '\0'){ dup = 1; break; }
-                if(!dup) sv_push(&st->check_constraints[idx], "");
+                for(int si = 0; si < nl->v.len; si++)
+                    if(nl->v.data[si][0] == '\0'){ dup = 1; break; }
+                if(!dup) sv_push(&nl->v, "");
             } else {
-                sv_push(&st->check_constraints[idx], elems.data[i]);
+                sv_push(&nl->v, elems.data[i]);
             }
         }
+        chk_install(&st->check_constraints[idx], nl);
     }
     sv_free(&elems);
 }
@@ -5789,19 +6577,21 @@ static int enum_capture(Assembler *asmb, const EnumDef *ed, const char *s, int i
  * 記述順に依存しない。末尾まで両方使い切ったときだけ成功とする。 */
 static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
     AsmState *st=&asmb->st;
-    snprintf(st->deb1, sizeof(st->deb1), "%.*s",
-             (int)(sizeof(st->deb1)-1), s_orig);
-    snprintf(st->deb2, sizeof(st->deb2), "%.*s",
-             (int)(sizeof(st->deb2)-1), t_orig);
+    axx_copy_trunc(st->deb1, sizeof(st->deb1), s_orig);
+    axx_copy_trunc(st->deb2, sizeof(st->deb2), t_orig);
 
-    char *t_nobr=strdup(t_orig);
-    char *t_clean=malloc(strlen(t_nobr)+1); int n2=0;
-    for(int i=0;t_nobr[i];i++) if(t_nobr[i]!=OB_CHAR&&t_nobr[i]!=CB_CHAR) t_clean[n2++]=t_nobr[i];
-    t_clean[n2]=0; free(t_nobr);
-
-    char *s=malloc(strlen(s_orig)+2); strcpy(s,s_orig); s[strlen(s_orig)+1]=0;
-    char *t=malloc(strlen(t_clean)+2); strcpy(t,t_clean); t[strlen(t_clean)+1]=0;
-    free(t_clean);
+    /* 作業領域は使い回す。パターン側は省略可グループの印を落としながら
+     * そのまま写す（以前は strdup → 写し → もう1度写しの3本立てだった）。
+     * 末尾には番兵の '\0' を2つ置く（1文字先読みするところがある）。 */
+    static ScratchBuf sb_s, sb_t;
+    size_t s_len = strlen(s_orig), t_len = strlen(t_orig);
+    char *s = sbuf_take(&sb_s, s_len + 2);
+    memcpy(s, s_orig, s_len); s[s_len] = 0; s[s_len+1] = 0;
+    char *t = sbuf_take(&sb_t, t_len + 2);
+    { int n2=0;
+      for(size_t i=0;i<t_len;i++)
+          if(t_orig[i]!=OB_CHAR && t_orig[i]!=CB_CHAR) t[n2++]=t_orig[i];
+      t[n2]=0; t[n2+1]=0; }
 
     int idx_s=0,idx_t=0;
     idx_s=axx_skipspc(s,idx_s);
@@ -5982,6 +6772,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     if(stopchar && _e > _b && s[_e-1] == stopchar) _e--;
                     while(_b < _e && (s[_b]==' '||s[_b]=='\t')) _b++;
                     while(_e > _b && (s[_e-1]==' '||s[_e-1]=='\t')) _e--;
+                    var_note_write(st, vslot);
                     st->vars[vslot].text_off = captext_put(st, s + _b, _e - _b);
                 }
                 if(st->textmode){
@@ -6061,11 +6852,12 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             if(vi < 0){ result=0; break; }
             idx_t += _nl;
             int prev_idx_s = idx_s;
-            StrVec *cv = &st->check_constraints[vi];
+            ChkList *cv = st->check_constraints[vi];
+            int cv_len = chk_len(cv);
             int allow_omit = 0, n_named = 0;
-            for(int si = 0; si < cv->len; si++){
-                if(cv->data[si][0] == '\0') allow_omit = 1;
-                else                        n_named++;
+            for(int si = 0; si < cv_len; si++){
+                if(chk_at(cv, si)[0] == '\0') allow_omit = 1;
+                else                           n_named++;
             }
 
             char wbuf[512]; size_t wsz;
@@ -6087,10 +6879,10 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             }
             if(ok && idx_s == prev_idx_s) ok = 0;
 
-            if(ok && cv->len > 0){
+            if(ok && cv_len > 0){
                 int hit = 0;
-                for(int si = 0; si < cv->len; si++){
-                    if(cv->data[si][0] != '\0' && strcmp(cv->data[si], w) == 0){
+                for(int si = 0; si < cv_len; si++){
+                    if(chk_at(cv, si)[0] != '\0' && strcmp(chk_at(cv, si), w) == 0){
                         hit = 1;
                         break;
                     }
@@ -6103,8 +6895,8 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                    許可リストの名前そのものを前方一致で取り直す。
                    `MOVa1c3` のように区切り文字なしで連結された書き方を通すため。 */
                 int best_len = 0, best_si = -1;
-                for(int si = 0; si < cv->len; si++){
-                    const char *nm = cv->data[si];
+                for(int si = 0; si < cv_len; si++){
+                    const char *nm = chk_at(cv, si);
                     int nl = (int)strlen(nm);
                     if(nl <= best_len) continue;
                     int k = 0;
@@ -6112,9 +6904,9 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                           && axx_upper_char(s[prev_idx_s + k]) == nm[k]) k++;
                     if(k == nl){ best_len = nl; best_si = si; }
                 }
-                if(best_si >= 0 && strlen(cv->data[best_si]) < wsz
-                   && symbol_get(st, cv->data[best_si], &sv)){
-                    snprintf(w, wsz, "%s", cv->data[best_si]);
+                if(best_si >= 0 && strlen(chk_at(cv, best_si)) < wsz
+                   && symbol_get(st, chk_at(cv, best_si), &sv)){
+                    snprintf(w, wsz, "%s", chk_at(cv, best_si));
                     idx_s = prev_idx_s + best_len;
                     ok = 1;
                 }
@@ -6153,11 +6945,22 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
         }
         else { result=0; break; }
     }
-    free(s); free(t);
+    sbuf_give(&sb_s, s); sbuf_give(&sb_t, t);
     return result;
 }
 
 static int pat_match0_brackets(Assembler *asmb, const char *s, const char *t_orig){
+    /* 省略可グループ `[[ ]]` を1つも持たないパターンは、試す組み合わせが
+     * 1通りしかない。組み合わせ表も、印の畳み込みも、括弧を落とした写しも
+     * 要らないので、そのまま照合へ回す（ほとんどのパターンがこの道を通る）。
+     * 退避・復元も呼び出し側（pat_match0_subs）と重なるので省く。 */
+    {
+        int has_grp = 0;
+        for(const char *q=t_orig; q[0]; q++)
+            if((q[0]=='[' && q[1]=='[') || (q[0]==']' && q[1]==']')){ has_grp = 1; break; }
+        if(!has_grp) return pat_match(asmb, s, t_orig);
+    }
+
     char *t=malloc(strlen(t_orig)+1);
     strcpy(t,t_orig);
     char *out=malloc(strlen(t)*2+4);
@@ -6227,37 +7030,19 @@ static int pat_match0_brackets(Assembler *asmb, const char *s, const char *t_ori
         for(int k=0;k<size;k++) ri[nr++]=sl[comb[k]];
         char *lt=remove_brackets_str(t,ri,nr);
 
-        PatVar    saved_vars[NVARS];
-        memcpy(saved_vars, asmb->st.vars, sizeof(saved_vars));
-
+        /* 1つの組み合わせが書いた分だけを控え、外れたらそこまで戻す。 */
+        int mark_v   = vars_mark();
+        int mark_v2l = v2l_mark();
         int saved_elf_refs_len = asmb->st.elf_refs_len;
-        struct {int set; char *label_name; uint64_t label_val;} saved_vtl[NVARS];
-        /* 退避した個数を控える。評価の途中で変数名が増えても、復元は
-         * 退避した分だけを回す。 */
-        int saved_nvars = g_nvars;
-        for(int vi=0;vi<saved_nvars;vi++){
-            saved_vtl[vi].set       = asmb->st.elf_var_to_label[vi].set;
-            saved_vtl[vi].label_val = asmb->st.elf_var_to_label[vi].label_val;
-            saved_vtl[vi].label_name = asmb->st.elf_var_to_label[vi].label_name
-                                       ? strdup(asmb->st.elf_var_to_label[vi].label_name)
-                                       : NULL;
-        }
 
         if(pat_match(asmb,s,lt)){
             found=1;
-            for(int vi=0;vi<saved_nvars;vi++) free(saved_vtl[vi].label_name);
         } else {
-            memcpy(asmb->st.vars, saved_vars, sizeof(saved_vars));
+            vars_rollback(&asmb->st, mark_v);
             for(int ri2=saved_elf_refs_len; ri2<asmb->st.elf_refs_len; ri2++)
                 free(asmb->st.elf_refs[ri2].name);
             asmb->st.elf_refs_len = saved_elf_refs_len;
-            for(int vi=0;vi<saved_nvars;vi++){
-                free(asmb->st.elf_var_to_label[vi].label_name);
-                asmb->st.elf_var_to_label[vi].set       = saved_vtl[vi].set;
-                asmb->st.elf_var_to_label[vi].label_val = saved_vtl[vi].label_val;
-                asmb->st.elf_var_to_label[vi].label_name = saved_vtl[vi].label_name;
-                saved_vtl[vi].label_name = NULL;
-            }
+            v2l_rollback(&asmb->st, mark_v2l);
         }
         free(lt);
 
@@ -6337,37 +7122,24 @@ static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
     char name[64]; int var; int end;
     int start = pat_find_sub_ref(t, 0, &end, name, sizeof(name), &var);
     if(start < 0){
-        PatVar saved_vars[NVARS];
-        memcpy(saved_vars, asmb->st.vars, sizeof(saved_vars));
+        /* 照合に失敗したときに戻すのは「この照合が書いた分」だけである
+           （vars / elf_var_to_label の巻き戻し記録を使う）。 */
+        int mark_v   = vars_mark();
+        int mark_v2l = v2l_mark();
         int saved_elf_refs_len = asmb->st.elf_refs_len;
-        struct {int set; char *label_name; uint64_t label_val;} saved_vtl[NVARS];
-        int saved_nvars = g_nvars;   /* 復元は退避した個数だけ回す。 */
-        for(int vi=0;vi<saved_nvars;vi++){
-            saved_vtl[vi].set        = asmb->st.elf_var_to_label[vi].set;
-            saved_vtl[vi].label_val  = asmb->st.elf_var_to_label[vi].label_val;
-            saved_vtl[vi].label_name = asmb->st.elf_var_to_label[vi].label_name
-                                       ? strdup(asmb->st.elf_var_to_label[vi].label_name)
-                                       : NULL;
-        }
         if(pat_match0_brackets(asmb, s, t)){
             /* 値欄は照合成功後に評価する。項目のパターンが束縛した変数を
              * 値欄から使えるようにするため。入れ子のときは内側から評価する
              * ので、外側の値欄が内側の変数を使える。 */
             for(int k=nbinds-1;k>=0;k--)
                 var_slot_put(&asmb->st, binds[k].var, pat_sub_value(asmb, binds[k].val));
-            for(int vi=0;vi<saved_nvars;vi++) free(saved_vtl[vi].label_name);
             return 1;
         }
-        memcpy(asmb->st.vars, saved_vars, sizeof(saved_vars));
+        vars_rollback(&asmb->st, mark_v);
         for(int ri=saved_elf_refs_len; ri<asmb->st.elf_refs_len; ri++)
             free(asmb->st.elf_refs[ri].name);
         asmb->st.elf_refs_len = saved_elf_refs_len;
-        for(int vi=0;vi<saved_nvars;vi++){
-            free(asmb->st.elf_var_to_label[vi].label_name);
-            asmb->st.elf_var_to_label[vi].set        = saved_vtl[vi].set;
-            asmb->st.elf_var_to_label[vi].label_val  = saved_vtl[vi].label_val;
-            asmb->st.elf_var_to_label[vi].label_name = saved_vtl[vi].label_name;
-        }
+        v2l_rollback(&asmb->st, mark_v2l);
         return 0;
     }
 
@@ -8915,11 +9687,13 @@ static void arrsym_free_one(struct ArrSym *a){
 static void arrsym_delete(AsmState *st, const char *upper_name){
     int i = arrsym_find(st, upper_name);
     if(i < 0) return;
+    g_arrgen++;
     arrsym_free_one(&st->arrsyms[i]);
     for(int k=i+1;k<st->arrsyms_len;k++) st->arrsyms[k-1] = st->arrsyms[k];
     st->arrsyms_len--;
 }
 static void arrsym_clear_all(AsmState *st){
+    if(st->arrsyms_len) g_arrgen++;
     for(int i=0;i<st->arrsyms_len;i++) arrsym_free_one(&st->arrsyms[i]);
     free(st->arrsyms);
     st->arrsyms = NULL; st->arrsyms_len = 0; st->arrsyms_cap = 0;
@@ -8927,6 +9701,30 @@ static void arrsym_clear_all(AsmState *st){
 
 /* 組み立て済みの項目列をそのまま配列シンボルとして据える（所有権を渡す）。 */
 static void arrsym_install(AsmState *st, const char *dst_upper, SymItem *items, int n){
+    /* 同じ中身を入れ直すだけなら何もしない。パターン表のディレクティブ行は
+     * ソース1行ごとにたどり直されるので、同じ `.setsym::名前::A,B,…` が何度も
+     * 来る。表を作り直すと、それを元にしている `.check` の控えまで捨てて
+     * しまうので、中身が変わらないときは表も世代番号も動かさない。 */
+    {
+        struct ArrSym *old = arrsym_get(st, dst_upper);
+        if(old && old->len == n){
+            int same = 1;
+            for(int i=0;i<n;i++){
+                if(old->items[i].is_str != items[i].is_str){ same = 0; break; }
+                if(items[i].is_str){
+                    const char *a = old->items[i].s ? old->items[i].s : "";
+                    const char *b = items[i].s ? items[i].s : "";
+                    if(strcmp(a,b) != 0){ same = 0; break; }
+                } else if(!u256_eq(old->items[i].v, items[i].v)){ same = 0; break; }
+            }
+            if(same){
+                for(int i=0;i<n;i++) free(items[i].s);
+                free(items);
+                return;
+            }
+        }
+    }
+    g_arrgen++;
     arrsym_delete(st, dst_upper);
     if(st->arrsyms_len >= st->arrsyms_cap){
         st->arrsyms_cap = st->arrsyms_cap ? st->arrsyms_cap*2 : 8;
@@ -9169,6 +9967,7 @@ static int symbol_set_from_text(AsmState *st, const char *dst_upper, const char 
  * 区切りにしない（`[1,(2,3)]` のような書き方で崩れないようにするため）。 */
 static void arrsym_set_from_text(Assembler *asmb, const char *upper_name, const char *q){
     AsmState *st = &asmb->st;
+    g_arrgen++;
     arrsym_delete(st, upper_name);
     if(st->arrsyms_len >= st->arrsyms_cap){
         st->arrsyms_cap = st->arrsyms_cap ? st->arrsyms_cap*2 : 8;
@@ -9964,6 +10763,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         memset(ep_buf, 0, ep_cap);
         if(!first_try){
             memcpy(st->vars, saved_vars, sizeof(saved_vars));
+            vars_touch_all();   /* 記録を通さずに書いたので印を付け直す */
             for(int ri2=saved_elf_refs_len; ri2<st->elf_refs_len; ri2++)
                 free(st->elf_refs[ri2].name);
             st->elf_refs_len = saved_elf_refs_len;
@@ -10413,7 +11213,7 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
                 char rt_lc[64]; int ri=0;
                 while(rt_str[ri] && ri < 63){ rt_lc[ri]=(char)tolower((unsigned char)rt_str[ri]); ri++; }
                 rt_lc[ri]='\0';
-                reloc_type = elf_machine_named(elf_machine_find(st->elf_machine), rt_lc);
+                reloc_type = elf_reloc_named(st, elf_machine_find(st->elf_machine), rt_lc);
                 if(reloc_type < 0)
                     axx_diagf(0, 0, " warning - unknown reloctype '%s' in .EQU for machine %d\n",
                                rt_lc, st->elf_machine);
@@ -10851,6 +11651,34 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
         char *s = axx_word_buf(buf, idx, sbuf, sizeof(sbuf), &ssz);
         idx=axx_get_label_word(buf,idx,st->lwordchars,s,ssz);
         if(!s[0]){ if(s!=sbuf) free(s); break; }
+        /* ラベル名の読み取りが `::` の1つめを食っていたら1文字戻す
+         * （`.extern` と同じ扱い）。 */
+        if(idx > 0 && buf[idx-1]==':' && idx < blen && buf[idx]==':')
+            idx--;
+        /* `.global 名前::型名` — この名前への参照に使うリロケーション型を
+         * 指定できる。`.extern` と同じ書き方で、`.elftype` で決めた名前も
+         * マシンの名前表の名前も書ける。 */
+        if(idx+1 < blen && buf[idx]==':' && buf[idx+1]==':'){
+            idx += 2;
+            int rt_start = idx;
+            while(idx < blen && buf[idx]!=' ' && buf[idx]!='\t'
+                  && buf[idx]!=',' && buf[idx]!=':' && buf[idx]!='\0')
+                idx++;
+            char rt_str[64]={0};
+            int rt_len = idx - rt_start;
+            if(rt_len > 0 && rt_len < (int)sizeof(rt_str)-1){
+                memcpy(rt_str, buf+rt_start, (size_t)rt_len);
+                rt_str[rt_len]=0;
+                for(int _ci=0;rt_str[_ci];_ci++)
+                    if(rt_str[_ci]>='A'&&rt_str[_ci]<='Z') rt_str[_ci]+=32;
+                int rtype = elf_reloc_named(st, elf_machine_find(st->elf_machine), rt_str);
+                if(rtype < 0)
+                    axx_diagf(0, 0, " warning - unknown reloc type '%s' in .GLOBAL for machine %d\n",
+                               rt_str, st->elf_machine);
+                else
+                    lmap_set_reloc_type(&st->labels, s, rtype);
+            }
+        }
         if(buf[idx]==':') idx++;
         uint256_t v=label_get_value(st,s);
         const char *sec=label_get_section(st,s);
@@ -10862,6 +11690,7 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
         }
         lmap_set(&st->export_labels,s,v,sec,is_equ_v,is_undef_v);
         if(s!=sbuf) free(s);
+        idx=axx_skipspc(buf,idx);
         if(buf[idx]==',') idx++;
     }
     return 1;
@@ -10907,7 +11736,7 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
                 rt_str[rt_len]=0;
                 for(int _ci=0;rt_str[_ci];_ci++)
                     if(rt_str[_ci]>='A'&&rt_str[_ci]<='Z') rt_str[_ci]+=32;
-                int rtype = elf_machine_named(_mtbl_ext, rt_str);
+                int rtype = elf_reloc_named(st, _mtbl_ext, rt_str);
                 if(rtype < 0)
                     axx_diagf(0, 0, " warning - unknown reloc type '%s' in .EXTERN for machine %d\n",
                                rt_str, st->elf_machine);
@@ -10974,7 +11803,7 @@ static int adir_reloctype(Assembler *asmb, const char *l, const char *l2){
         }
 
         if(name[0]){
-            int rtype = elf_machine_named(_mtbl_rt, name);
+            int rtype = elf_reloc_named(st, _mtbl_rt, name);
             if(rtype < 0){
                 axx_diagf(0, 0, " warning - unknown reloc type '%s' in "
                            ".RELOCTYPE for machine %d\n", name, st->elf_machine);
@@ -11010,7 +11839,7 @@ typedef struct {
     int       refs_len;
     struct { int set; char *label_name; uint64_t label_val; } vtl[NVARS];
     SymMap    symbols;
-    StrVec    check_constraints[NVARS];
+    ChkList  *check_constraints[NVARS];
     int       reloc_constraints[NVARS];
     EnumDef   enum_defs[NVARS];
     char      swordchars[256];
@@ -11040,7 +11869,7 @@ static void best_free(BestMatch *b){
     free(b->refs);
     for(int i=0;i<g_nvars;i++) free(b->vtl[i].label_name);
     smap_free(&b->symbols);
-    for(int i=0;i<g_nvars;i++) sv_free(&b->check_constraints[i]);
+    for(int i=0;i<g_nvars;i++) chk_unref(b->check_constraints[i]);
     for(int i=0;i<g_nvars;i++) enumdef_clear(&b->enum_defs[i]);
     iv_free(&b->vliwnop);
     vset_free(&b->vliwset);
@@ -11090,9 +11919,7 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
         for(SymEntry *e=st->symbols.buckets[bi]; e; e=e->next)
             smap_set(&b->symbols, e->key, e->val);
     for(int i=0;i<g_nvars;i++){
-        sv_init(&b->check_constraints[i]);
-        for(int j=0;j<st->check_constraints[i].len;j++)
-            sv_push(&b->check_constraints[i], st->check_constraints[i].data[j]);
+        b->check_constraints[i] = chk_ref(st->check_constraints[i]);
         b->reloc_constraints[i] = st->reloc_constraints[i];
         enumdef_init(&b->enum_defs[i]);
         enumdef_copy(&b->enum_defs[i], &st->enum_defs[i]);
@@ -11114,14 +11941,9 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
 }
 
 static void best_restore_dirstate(AsmState *st, const BestMatch *b){
-    smap_clear(&st->symbols);
-    for(int bi=0; bi<b->symbols.nb; bi++)
-        for(SymEntry *e=b->symbols.buckets[bi]; e; e=e->next)
-            smap_set(&st->symbols, e->key, e->val);
+    smap_assign(&st->symbols, &b->symbols);
     for(int i=0;i<g_nvars;i++){
-        sv_free(&st->check_constraints[i]);
-        for(int j=0;j<b->check_constraints[i].len;j++)
-            sv_push(&st->check_constraints[i], b->check_constraints[i].data[j]);
+        chk_install(&st->check_constraints[i], chk_ref(b->check_constraints[i]));
         st->reloc_constraints[i] = b->reloc_constraints[i];
         enumdef_copy(&st->enum_defs[i], &b->enum_defs[i]);
     }
@@ -11138,6 +11960,90 @@ static void best_restore_dirstate(AsmState *st, const BestMatch *b){
     for(int i=0;i<b->vliwset.len;i++)
         vset_add(&st->vliwset, b->vliwset.data[i].idxs,
                  b->vliwset.data[i].nidxs, b->vliwset.data[i].templ);
+}
+
+/* ---- ディレクティブ前置きの畳み込み ----------------------------------
+ * パターンファイルの先頭には、レジスタ名の `.setsym`、`.check`、`.error` と
+ * いった「どのソース行でも同じ結果になる」ディレクティブ行が並ぶ。ところが
+ * 照合はソース1行ごとにパターン表を頭からたどり直すので、この前置きも行数ぶん
+ * 実行していた（aarch64 では 1 行につき 643 行、全体で 112 万回）。
+ *
+ * 前置きは1度だけ実行し、実行し終えた状態をここに控える。以後の行では控えた
+ * 状態を戻すだけにして、前置きの行そのものはたどらない。控える／戻すのは
+ * 「1行ごとに作り直される欄」（シンボル表・`.check`・`.reloc`・`.enum`）と、
+ * 「前置きが必ず書く欄」だけである。前置きが書かない欄（`.bits` が前置きに
+ * 無いときの語長など）は今までどおり前の行から持ち越す。
+ *
+ * 畳み込めるかどうかは pat_hoist_scan() が読み込み時に静的に決める。
+ * 判断がつかない行が出たらそこで前置きは終わりで、その行から後ろは今までと
+ * 同じように毎行たどる。 */
+typedef struct {
+    int       valid;
+    SymMap    symbols;
+    ChkList  *check_constraints[NVARS];
+    int       reloc_constraints[NVARS];
+    EnumDef   enum_defs[NVARS];
+    /* 前置きが書く欄だけ控える（どれを書くかは hoist_* の印で分かる）。 */
+    char      swordchars[256];
+    uint256_t padding;
+    int       bts, endian_big;
+    int       vliwbits, vliwinstbits, vliwtemplatebits, vliwflag;
+    IntVec    vliwnop;
+} DirSnap;
+
+static DirSnap g_hdrsnap;
+
+static void hdrsnap_free(DirSnap *d){
+    if(!d->valid) return;
+    smap_free(&d->symbols);
+    for(int i=0;i<NVARS;i++){ chk_unref(d->check_constraints[i]); d->check_constraints[i]=NULL; }
+    for(int i=0;i<NVARS;i++) enumdef_clear(&d->enum_defs[i]);
+    iv_free(&d->vliwnop);
+    memset(d, 0, sizeof(*d));
+}
+
+static void hdrsnap_take(DirSnap *d, AsmState *st){
+    hdrsnap_free(d);
+    smap_init(&d->symbols);
+    for(int bi=0; bi<st->symbols.nb; bi++)
+        for(SymEntry *e=st->symbols.buckets[bi]; e; e=e->next)
+            smap_set(&d->symbols, e->key, e->val);
+    for(int i=0;i<g_nvars;i++){
+        d->check_constraints[i] = chk_ref(st->check_constraints[i]);
+        d->reloc_constraints[i] = st->reloc_constraints[i];
+        enumdef_init(&d->enum_defs[i]);
+        enumdef_copy(&d->enum_defs[i], &st->enum_defs[i]);
+    }
+    memcpy(d->swordchars, st->swordchars, sizeof(d->swordchars));
+    d->padding          = st->padding;
+    d->bts              = st->bts;
+    d->endian_big       = st->endian_big;
+    d->vliwbits         = st->vliwbits;
+    d->vliwinstbits     = st->vliwinstbits;
+    d->vliwtemplatebits = st->vliwtemplatebits;
+    d->vliwflag         = st->vliwflag;
+    iv_init(&d->vliwnop);
+    iv_copy(&d->vliwnop, &st->vliwnop);
+    d->valid = 1;
+}
+
+static void hdrsnap_restore(DirSnap *d, AsmState *st){
+    smap_assign(&st->symbols, &d->symbols);
+    for(int i=0;i<g_nvars;i++){
+        chk_install(&st->check_constraints[i], chk_ref(d->check_constraints[i]));
+        st->reloc_constraints[i] = d->reloc_constraints[i];
+        enumdef_copy(&st->enum_defs[i], &d->enum_defs[i]);
+    }
+    if(g_hoist_symbolc) memcpy(st->swordchars, d->swordchars, sizeof(st->swordchars));
+    if(g_hoist_padding) st->padding = d->padding;
+    if(g_hoist_bits){ st->bts = d->bts; st->endian_big = d->endian_big; }
+    if(g_hoist_vliw){
+        st->vliwbits         = d->vliwbits;
+        st->vliwinstbits     = d->vliwinstbits;
+        st->vliwtemplatebits = d->vliwtemplatebits;
+        st->vliwflag         = d->vliwflag;
+        iv_copy(&st->vliwnop, &d->vliwnop);
+    }
 }
 
 static void elf_refs_push_copy(AsmState *st, const char *name,
@@ -11275,9 +12181,9 @@ static int adir_done(Assembler *asmb, const char *l, const char *l2,
 }
 
 /* パターン変数表を空にする。照合と、パターン側の式の評価の直前に使う。 */
-#define PAT_VARS_CLEAR() \
-    do { for(int _vi=0;_vi<g_nvars;_vi++){ st->vars[_vi].val=u256_zero(); \
-             st->vars[_vi].is_undef=0; st->vars[_vi].text_off=-1; } } while(0)
+/* 変数表を空にする。空でないスロットは記録してあるので、そこだけを消す
+ * （以前は毎回 g_nvars 個すべてを書き潰していた）。 */
+#define PAT_VARS_CLEAR() vars_clear_all(st)
 
 /* 作業用バッファは呼び出し元（lineassemble2）がソース行の長さに合わせて確保する。
  *
@@ -11439,35 +12345,67 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     else      snprintf(lin,linsz,"%s",l);
     axx_reduce_spaces(lin);
 
-    for(int pi=0;pi<st->pat.len;pi++){
-        PatEntry *i=&st->pat.data[pi];
-        pln++;
+    /* たどる行は「ニーモニックを持たない行（always）」と「この行の
+     * ニーモニックで索引を引いた候補」の2つの昇順の並びである。記述順のまま
+     * 処理するために、2つを合わせながら進む。 */
+    int *cand = NULL;
+    int  ncand = patidx_candidates(&g_patidx, lin, &cand);
+    /* 前置きを畳み込んでいるあいだは、always の並びを前置きの後ろから読む。 */
+    int  ai = (g_hoist_rows && g_hdrsnap.valid) ? g_hoist_first_ai : 0;
+    int  ci = 0;
+    /* 前置きの実行で診断が出るようなら畳み込まない（同じ診断が行ごとに出る
+     * 今までの見え方を変えないため）。その判定に使う出力前の数を控える。 */
+    long long hoist_diag0 = g_diag_count;
 
-        /* ディレクティブでない行（＝普通のパターン）は、下の判定列が必ず全て
+    for(;;){
+        int pi, from_always;
+        {
+            int a = (ai < g_patidx.always.n) ? g_patidx.always.rows[ai] : INT_MAX;
+            int c = (ci < ncand)             ? cand[ci]                 : INT_MAX;
+            if(a == INT_MAX && c == INT_MAX) break;
+            if(a <= c){ pi = a; ai++; from_always = 1; }
+            else      { pi = c; ci++; from_always = 0; }
+        }
+        PatEntry *i=&st->pat.data[pi];
+        pln = pi + 1;
+
+        /* 前置きを通り過ぎるところで、その状態を1度だけ控える。 */
+        if(g_hoist_rows && !g_hdrsnap.valid && pi >= g_hoist_rows){
+            if(g_diag_count != hoist_diag0) g_hoist_rows = 0;   /* 診断が出た */
+            else                            hdrsnap_take(&g_hdrsnap, st);
+        }
+
+        /* ディレクティブでない行（＝普通のパターン）は、下の判定が必ず
          * 0 を返すので丸ごと飛ばす。 */
         if(i->is_dir){
         /* ディレクティブの値欄も式なので、パターン変数を読みうる
          * （マニュアル 6.3）。評価の前に空にしておく。 */
         PAT_VARS_CLEAR();
-        if(dir_set_symbol(asmb,i)) continue;
-        if(dir_clear_symbol(asmb,i)) continue;
-        if(dir_padding(asmb,i)) continue;
-        if(dir_bits(asmb,i)) continue;
-        if(dir_symbolc(asmb,i)) continue;
-        if(dir_epic(asmb,i)) continue;
-        if(dir_vliwp(asmb,i)) continue;
-        if(dir_check(asmb,i)) continue;
-        if(dir_clrcheck(asmb,i)) continue;
-        if(dir_reloc(asmb,i)) continue;
-        if(dir_clrreloc(asmb,i)) continue;
-        if(dir_map(asmb,i)) continue;
-        if(dir_free(asmb,i)) continue;
-        if(dir_passthru(asmb,i)) continue;
-        if(dir_eol(asmb,i)) continue;
-        if(dir_textmode(asmb,i)) continue;
-        if(dir_enum(asmb,i)) continue;
-        if(dir_clrenum(asmb,i)) continue;
-        if(dir_errmsg(asmb,i)) continue;
+        int _dir_done = 0;
+        switch(i->dir_kind){
+        case PD_SETSYM:   _dir_done = dir_set_symbol(asmb,i);   break;
+        case PD_CLEARSYM: _dir_done = dir_clear_symbol(asmb,i); break;
+        case PD_PADDING:  _dir_done = dir_padding(asmb,i);      break;
+        case PD_BITS:     _dir_done = dir_bits(asmb,i);         break;
+        case PD_SYMBOLC:  _dir_done = dir_symbolc(asmb,i);      break;
+        case PD_EPIC:     _dir_done = dir_epic(asmb,i);         break;
+        case PD_VLIW:     _dir_done = dir_vliwp(asmb,i);        break;
+        case PD_CHECK:    _dir_done = dir_check(asmb,i);        break;
+        case PD_CLRCHECK: _dir_done = dir_clrcheck(asmb,i);     break;
+        case PD_RELOC:    _dir_done = dir_reloc(asmb,i);        break;
+        case PD_CLRRELOC: _dir_done = dir_clrreloc(asmb,i);     break;
+        case PD_MAP:      _dir_done = dir_map(asmb,i);          break;
+        case PD_FREE:     _dir_done = dir_free(asmb,i);         break;
+        case PD_PASSTHRU: _dir_done = dir_passthru(asmb,i);     break;
+        case PD_EOL:      _dir_done = dir_eol(asmb,i);          break;
+        case PD_TEXTMODE: _dir_done = dir_textmode(asmb,i);     break;
+        case PD_ENUM:     _dir_done = dir_enum(asmb,i);         break;
+        case PD_CLRENUM:  _dir_done = dir_clrenum(asmb,i);      break;
+        case PD_ERRMSG:   _dir_done = dir_errmsg(asmb,i);       break;
+        case PD_ELFTYPE:  _dir_done = dir_elftype(asmb,i);      break;
+        default: break;
+        }
+        if(_dir_done) continue;
         }
 
         int lw=0; for(int fi=0;fi<PAT_FIELDS;fi++) if(i->f[fi][0]) lw++;
@@ -11484,7 +12422,10 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
             break;
         }
 
-        if(!pat_prefix_matches(i->f[0], lin)) continue;
+        /* 索引から来た候補は先頭一致を済ませてある。always から来た行のうち
+         * ニーモニックを持つもの（`EPIC` のように大文字の名前を持つ
+         * ディレクティブ行で、処理されずに落ちてきたもの）だけここで見る。 */
+        if(from_always && i->pfxlen && !pat_prefix_matches(i->f[0], lin)) continue;
 
         /* ここから先が本当の照合。先頭一致で捨てた分は初期化しなくてよい
          * （変数表は照合と値欄の評価の直前にだけ空であればよい）。 */
@@ -11494,20 +12435,12 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         st->expmode=EXP_ASM;
         st->expcaps=&CAPS_ASM;
 
-        PatVar    saved_vars[NVARS];
-        memcpy(saved_vars, st->vars, sizeof(saved_vars));
+        /* 1つの候補が書いた分だけを控える。候補は1行につき何百も試すので、
+         * ここで vars[] と elf_var_to_label[] を丸ごと写していたのが
+         * 照合そのものより高くついていた。 */
+        int mark_v   = vars_mark();
+        int mark_v2l = v2l_mark();
         int saved_refs_len = st->elf_refs_len;
-        struct { int set; char *label_name; uint64_t label_val; } saved_vtl[NVARS];
-        /* 退避した個数を控える。照合や値欄の評価で新しい変数名が登録されて
-         * g_nvars が増えても、書き戻すのは退避した分だけにする。 */
-        int saved_nvars = g_nvars;
-        for(int vi=0;vi<saved_nvars;vi++){
-            saved_vtl[vi].set        = st->elf_var_to_label[vi].set;
-            saved_vtl[vi].label_val  = st->elf_var_to_label[vi].label_val;
-            saved_vtl[vi].label_name = st->elf_var_to_label[vi].label_name
-                                       ? strdup(st->elf_var_to_label[vi].label_name)
-                                       : NULL;
-        }
 
         st->in_match_attempt = 1;
         diag_capture_begin(st);
@@ -11535,17 +12468,11 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
             for(int di=0; di<_cand_ndiag; di++) free(_cand_diags[di]);
             free(_cand_diags); free(_cand_seterr);
             _cand_diags = NULL; _cand_seterr = NULL; _cand_ndiag = 0;
-            memcpy(st->vars, saved_vars, sizeof(saved_vars));
+            vars_rollback(st, mark_v);
             for(int ri2=saved_refs_len; ri2<st->elf_refs_len; ri2++)
                 free(st->elf_refs[ri2].name);
             st->elf_refs_len = saved_refs_len;
-            for(int vi=0;vi<saved_nvars;vi++){
-                free(st->elf_var_to_label[vi].label_name);
-                st->elf_var_to_label[vi].set        = saved_vtl[vi].set;
-                st->elf_var_to_label[vi].label_val  = saved_vtl[vi].label_val;
-                st->elf_var_to_label[vi].label_name = saved_vtl[vi].label_name;
-                saved_vtl[vi].label_name = NULL;
-            }
+            v2l_rollback(st, mark_v2l);
             st->error_undefined_label=0;
 
             /* 破綻点修正: 「式もシンボルも0個」なら即打ち切っていたが、スコアは
@@ -11562,13 +12489,8 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
              * ループ先頭で毎回ゼロクリアされるが elf_var_to_label には
              * 同様のリセットが無い）。成功時の巻き戻しと対称に、ここでも
              * 保存しておいた値を書き戻す。 */
-            for(int vi=0;vi<saved_nvars;vi++){
-                free(st->elf_var_to_label[vi].label_name);
-                st->elf_var_to_label[vi].set        = saved_vtl[vi].set;
-                st->elf_var_to_label[vi].label_val  = saved_vtl[vi].label_val;
-                st->elf_var_to_label[vi].label_name = saved_vtl[vi].label_name;
-                saved_vtl[vi].label_name = NULL;
-            }
+            vars_rollback(st, mark_v);
+            v2l_rollback(st, mark_v2l);
             st->error_undefined_label=0;
         }
     }
@@ -11580,6 +12502,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
 
         best_restore_dirstate(st, &best);
         memcpy(st->vars, best.vars, sizeof(st->vars));
+        vars_touch_all();   /* 記録を通さずに書いたので印を付け直す */
         for(int ri2=0; ri2<best.refs_len; ri2++)
             elf_refs_push_copy(st, best.refs[ri2].name,
                                best.refs[ri2].val, best.refs[ri2].word_idx,
@@ -11755,18 +12678,27 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     }
     axx_resolve_vliw_escapes(line);
 
-    for(int _ci = 0; _ci < g_nvars; _ci++){
-        sv_free(&asmb->st.check_constraints[_ci]);
-        sv_init(&asmb->st.check_constraints[_ci]);
-        asmb->st.reloc_constraints[_ci] = 0;
-        enumdef_clear(&asmb->st.enum_defs[_ci]);
-    }
-    subv_unfreeze_all(&asmb->st.subs);
+    /* 前の行の巻き戻し記録はもう使わない（記録が持っている文字列を返す）。 */
+    v2l_forget();
 
-    smap_clear(&asmb->st.symbols);
-    for(int pi=0; pi<asmb->st.patsymbols.nb; pi++)
-        for(SymEntry *se=asmb->st.patsymbols.buckets[pi]; se; se=se->next)
-            smap_set(&asmb->st.symbols, se->key, se->val);
+    if(g_hoist_rows && g_hdrsnap.valid){
+        /* 前置きのディレクティブ行はもうたどらないので、作り直す代わりに
+         * 「前置きを実行し終えた状態」を戻す。 */
+        hdrsnap_restore(&g_hdrsnap, &asmb->st);
+        subv_unfreeze_all(&asmb->st.subs);
+    } else {
+        for(int _ci = 0; _ci < g_nvars; _ci++){
+            chk_install(&asmb->st.check_constraints[_ci], NULL);
+            asmb->st.reloc_constraints[_ci] = 0;
+            enumdef_clear(&asmb->st.enum_defs[_ci]);
+        }
+        subv_unfreeze_all(&asmb->st.subs);
+
+        smap_clear(&asmb->st.symbols);
+        for(int pi=0; pi<asmb->st.patsymbols.nb; pi++)
+            for(SymEntry *se=asmb->st.patsymbols.buckets[pi]; se; se=se->next)
+                smap_set(&asmb->st.symbols, se->key, se->val);
+    }
 
     char *processed = malloc(lin_len + 2);
     if(!processed){ perror("malloc"); free(line); return 0; }
@@ -15511,6 +16443,19 @@ done:
     st->ln = is_pop(&st->lnstack);
 }
 
+/* パターン表の `.elftype` を、組み立てを始める前に一度そろえて登録する。
+ * 型名はソースの `.EXTERN`/`.EQU`/`.RELOCTYPE` や取り込みファイルからも引く。
+ * これらはパターン表をたどるより前に読まれるので、行ごとの実行を待っていると
+ * 「まだ宣言されていない」ことになってしまう。
+ * axx.py の register_elftypes() と同じである。 */
+static void register_elftypes(Assembler *asmb){
+    for(int pi=0; pi<asmb->st.pat.len; pi++){
+        PatEntry *e = &asmb->st.pat.data[pi];
+        if(!e->f[0] || strcmp(e->f[0], ".elftype") != 0) continue;
+        elftype_apply(asmb, e);
+    }
+}
+
 static void setpatsymbols(Assembler *asmb){
     SymMap fresh; smap_init(&fresh);
     sv_free(&asmb->st.strsym_names); sv_init(&asmb->st.strsym_names);
@@ -15679,7 +16624,7 @@ static int imp_label(Assembler *asmb, const char *l){
         if(sep){
             *sep = '\0';
             const char *rt_str = sep + 2;
-            reloc_type = elf_machine_named(elf_machine_find(asmb->st.elf_machine), rt_str);
+            reloc_type = elf_reloc_named(&asmb->st, elf_machine_find(asmb->st.elf_machine), rt_str);
             if(reloc_type < 0)
                 axx_diagf(0, 0, " warning - unknown reloc type '%s' for imported label '%s'\n",
                            rt_str, label);
@@ -15964,6 +16909,10 @@ int main(int argc, char *argv[]){
     /* 行ごとに変わらない性質（ディレクティブか、`.setsym` の値が定数か）を
      * ここで一度だけ控える。以降 st->pat は増減しない。 */
     pat_mark_static(&st->pat);
+    /* 畳み込める先頭ディレクティブ行を決め、ニーモニック索引を作る。
+     * どちらも行ごとに変わらないので、ここで一度だけ行う。 */
+    pat_hoist_scan(&st->pat);
+    patidx_build(&g_patidx, &st->pat);
     /* 破綻点修正: パターンファイルが読めなかった場合、readpat() はエラーを
      * 報告して空のパターン表のまま戻るが、そのまま組み立てに進んでいたため、
      * 全ソース行が「どのパターンにも一致しない」となり偽の "Syntax error" が
@@ -15976,6 +16925,7 @@ int main(int argc, char *argv[]){
         exit_code=1; goto cleanup;
     }
     setpatsymbols(asmb);
+    register_elftypes(asmb);
     /* 破綻点修正: パターンファイル側のディレクティブ評価（.setsym / .bits 等）で
      * 出たエラーを誰も拾っていなかったため、" error - ..." を表示しながら
      * 終了コード 0 で「出力ファイルだけ作られない」無言の失敗になっていた。 */
@@ -16076,6 +17026,7 @@ int main(int argc, char *argv[]){
                 for(SymEntry *se2=st->patsymbols.buckets[pi]; se2; se2=se2->next)
                     smap_set(&st->symbols, se2->key, se2->val);
             memcpy(st->vars, initial_vars, sizeof(st->vars));
+            vars_touch_all();
             fileassemble(asmb,sourcefile);
 
             secmap_finalize_current(st);
@@ -16197,6 +17148,7 @@ int main(int argc, char *argv[]){
             for(SymEntry *se2=st->patsymbols.buckets[pi]; se2; se2=se2->next)
                 smap_set(&st->symbols, se2->key, se2->val);
         memcpy(st->vars, initial_vars, sizeof(st->vars));
+        vars_touch_all();
         fileassemble(asmb,sourcefile);
 
         secmap_finalize_current(st);
@@ -16331,8 +17283,8 @@ int main(int argc, char *argv[]){
                     if(elf_){ \
                         LabelEntry *_full=lmap_find(&st->labels,e->key); \
                         if(_full && _full->reloc_type_override>=0){ \
-                            const char *_nm=elf_machine_reverse(elf_machine_find(st->elf_machine), \
-                                                                 _full->reloc_type_override); \
+                            const char *_nm=elf_reloc_reverse(st, elf_machine_find(st->elf_machine), \
+                                                              _full->reloc_type_override); \
                             if(_nm) snprintf(_rtype_sfx,sizeof(_rtype_sfx),"::%s",_nm); \
                         } \
                     } \

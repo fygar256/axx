@@ -1200,7 +1200,10 @@ an earlier one, `.clrreloc::x` takes it back (with no argument, all of them),
 and `.free` clears it too.
 
 The type name comes from the name table of the machine selected with `-m` — the
-same table the source-side `::pc32` spelling uses (section 8.3).
+same table the source-side `::pc32` spelling uses (section 8.3). A name defined
+with `.elftype` (section 3.7.6) may be written here too, and it is looked up
+first, so a definition of your own overrides a built-in name of the same
+spelling.
 
 The declaration only has an effect when `-o` was given. Without it the rows
 below it behave exactly as if it were not there, which is what lets one set of
@@ -1296,6 +1299,70 @@ These are the instruction-field types available for AArch64. The data types
 The two GOT types differ in kind from the rest. Their value is the address of a
 GOT entry the linker builds, so it is not knowable at assembly time: the field
 goes out as 0 and the relocation carries the whole meaning.
+
+#### 3.7.6 `.elftype` — naming a relocation type yourself
+
+```
+.elftype::<name>::<value>
+```
+
+Gives a name to an ELF relocation type number. The name can then be written
+everywhere a relocation type name is written:
+
+| Where | Example |
+|---|---|
+| `.reloc` in a pattern file (section 3.7.5) | `.reloc::t::gotpcrelx` |
+| `.extern` in the source (section 5.6) | `.extern ext1::gotpcrelx` |
+| `.global` in the source (section 5.6) | `.global here::tpoff32` |
+| `.EQU` / `.reloctype` in the source (section 5.5.1) | `.reloctype ,,gotpcrelx,` |
+| An import TSV (section 8.3) | `otherlabel::gotpcrelx	401020` |
+
+- The value is the type number (the type field of the ELF `r_info`): a constant
+  expression whose value is an integer of 1 or more. Decimal, `0x` hex and
+  expressions such as `20+3` all work. 0 is not taken, because it is used
+  internally to mean "no type given".
+- The name is matched without regard to case, and spaces in the name field are
+  dropped — the same way `.reloc` reads a type name. Writing the same name twice
+  lets the later declaration win.
+- The lookup order is "`.elftype` names, then the name table of the machine
+  selected with `-m`". A definition of your own is found first, even when a
+  built-in name has the same spelling.
+- The declarations are all collected once the pattern file has been read. So a
+  declaration written *below* the `.reloc` that uses it still resolves, and so
+  do the source-side `.extern` / `.global`, which are read before the pattern
+  table is ever walked.
+- On the `-E` side the name is used for a type number that the machine's name
+  table has no name for. The import side looks names up the same way, so a write
+  out / read back round trip keeps the type.
+
+**What it is for.** The name tables axx carries hold the types that are commonly
+used on each machine. When you need one that is not in there — `R_X86_64_GOTPCRELX`
+or the TLS types on x86-64, or a type of a machine whose names axx does not know —
+you can name it in the pattern file yourself.
+
+```
+.elftype::gotpcrelx::41            /* R_X86_64_GOTPCRELX */
+.elftype::rexgotpcrelx::0x2a       /* R_X86_64_REX_GOTPCRELX */
+.elftype::tpoff32::23              /* R_X86_64_TPOFF32 */
+
+.reloc::t::gotpcrelx
+CALLX !t :: 0xe8,t,t>>8,t>>16,t>>24
+.clrreloc::t
+```
+
+```
+        .extern ext1::gotpcrelx
+        callx   ext1        ->  R_X86_64_GOTPCRELX  ext1 + 0
+```
+
+Only the number is given, so the field width and whether the type is PC-relative
+are not known from the name table. When the number is one the table does carry,
+its width and PC-relativeness are taken from there; when it is not, the type
+counts as "any width" (it passes the width check of `.reloctype` as well). For a
+type that packs its value into bit fields of an instruction word, combine it with
+`.reloc` (section 3.7.5).
+
+The bundled `elftype.axx` / `elftype.s` are a worked example.
 
 ### 3.8 Optional parts (`[[ ]]`)
 
@@ -2317,13 +2384,20 @@ ld b,9
 .export label
 .export label1,label2,label3
 .global label1,label2
+.global label1::pc32             ; references to label1 use relocation type pc32
 .extern label1,label2
 .extern label1:2,label2          ; label1 uses relocation type 2
+.extern label2::gotpcrel         ; a type name works too
 ```
 
 - `.export` marks labels for `-e` / `-E` output, together with their
   section/segment. Only labels named here are exported.
 - `.global` passes a label externally; it is written out by `-e` / `-E` as well.
+- `.global` and `.extern` both take `::<type name>` after a name to set the
+  relocation type used for references to that name. The name is one from the
+  name table of the machine selected with `-m` (section 8.3) or one defined with
+  `.elftype` in the pattern file (section 3.7.6). An unrecognised name is
+  warned about and ignored. Write the declaration before the references.
 - `.extern` declares that a name is resolved elsewhere. A relocation type may
   be attached to an individual name with `:`.
 
@@ -2734,7 +2808,10 @@ otherlabel::pc32	401020
 The names accepted after `::` are the short names in the `named` table of the
 selected machine in `ELF_MACHINES`. For x86-64: `abs64`, `abs32`, `abs32s`,
 `abs16`, `abs8`, `pc32`, `rel32`, `plt32`, `pc16`, `pc8`, `pc64`, `got32`,
-`gotpcrel`, `got64`. An unrecognized name produces a warning and is ignored.
+`gotpcrel`, `got64`. A name defined with `.elftype` in the pattern file
+(section 3.7.6) may be written here too. An unrecognized name produces a warning
+and is ignored. On the write-out side an `.elftype` name is used for a type
+number the name table has no name for.
 
 The pattern file's `.reloc` (section 3.7.5) takes the same names. An
 instruction-field type such as AArch64's `call26` only means anything there,
@@ -2998,6 +3075,7 @@ The x86_64 pattern file is also maintained separately at
 | **textmode.axx** | 1.8 KB | 13 | **textmode.s** | `.textmode`, `!L`, `{{.exp()}}` and `;` comments (3.18); test only |
 | **arrindex.axx** | 860 B | 14 | **arrindex.s** | Array symbols: bare names as items, a name as a subscript, `.index` (3.6.1); test only |
 | **passthru.axx** | 686 B | 6 | **passthru.s** | `.passthru` and `.eol` (3.16 / 3.17); test only |
+| **elftype.axx** | 1.5 KB | 15 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
 | **vliw.axx** | 178 B | 10 | **vliw.s** | Non-EPIC VLIW; test only |
 | **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck virtual CPU; hello-world demo. Bundled, but not part of `test1` |
@@ -3009,13 +3087,14 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 `test1` runs all twenty of the pairs above through both implementations and
 compares the `-b` raw binaries. For the two pairs that use `.textmode`
 (`textmode.axx` and `8080toz80.axx`) it also compares the translated text each
-implementation writes to standard output under `-V`, for twenty-two comparisons
-in all.
+implementation writes to standard output under `-V`. The `elftype.axx` /
+`elftype.s` pair is about relocations, so for that one the `-o` ELF objects are
+compared, for twenty-three comparisons in all.
 
 The `aarch64.axx` / `aarch64.s` pair is much the slowest of them: the Python
-implementation takes a little over two minutes on it, against about ten seconds
-for the C one, because every source line is matched against the largest pattern
-set in the tree. It dominates the running time of `test1`.
+implementation takes about twenty seconds on it, against about a second for the
+C one, because every source line is matched against the largest pattern set in
+the tree. It dominates the running time of `test1`.
 
 x86_64 and legacy CPUs make up most of what is currently implemented, but that
 reflects where the work has gone, not the limit of what axx can describe.

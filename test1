@@ -22,6 +22,7 @@ caxx 8080toz80.axx hello8080.s -b b18
 caxx textmode.axx textmode.s -V > b19
 caxx 8080toz80.axx hello8080.s -V > b20
 caxx aarch64.axx aarch64.s -b b21
+caxx elftype.axx elftype.s -o b22 -m 62
 
 paxx 4004.axx 4004.s -b a0
 paxx z80.axx z80.s -b a1
@@ -45,6 +46,7 @@ paxx 8080toz80.axx hello8080.s -b a18
 paxx textmode.axx textmode.s -V > a19
 paxx 8080toz80.axx hello8080.s -V > a20
 paxx aarch64.axx aarch64.s -b a21
+paxx elftype.axx elftype.s -o a22 -m 62
 
 FAIL=0
 
@@ -70,6 +72,7 @@ cmp a18 b18 || FAIL=1
 cmp a19 b19 || FAIL=1
 cmp a20 b20 || FAIL=1
 cmp a21 b21 || FAIL=1
+cmp a22 b22 || FAIL=1
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"
