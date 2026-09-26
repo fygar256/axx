@@ -355,6 +355,7 @@ In the `instruction` field:
 | `!Qx` | IEEE-754 bit pattern of a **128-bit** float expression |
 | `!Lx` | Value of an **integer expression**, exactly as `!x`; in addition, the **text of that expression or label as written in the source** is remembered (section 3.18, `{{.exp(x)}}`) |
 | `!Ex` | Value of an **enumerated operand list** declared with `.enum` (section 3.7.1) |
+| `!Yx[z]` | Reads one item name of the **set** `x` (section 3.6.2) and binds its **index** to the variable `z` (section 3.6.3) |
 | `!S{{name}}x` | Value of the matching entry of the **sub table** `name` declared with `.sub` (section 3.7.2) |
 
 Captured values are referenced from `error_patterns` and `binary_list` by the
@@ -859,6 +860,62 @@ that assembled before changes meaning:
 
 Because `-`, `&` and `|` may appear inside a symbol name, an operand is only
 recognised as a set when it is spelled with letters, digits and `_` alone.
+
+#### 3.6.3 Symbol capture (`!Y`)
+
+```
+!Y<set>[<variable>]
+```
+
+At that position in the `instruction` field, one item name of a **set**
+(section 3.6.2) is read and its **index** — the position of the item, counted
+from 0 — is bound to `<variable>`. The index is referenced from
+`error_patterns`, `binary_list` and text templates by the bare name, exactly
+like every other capture.
+
+```
+.setsym::y::R0,R1,R2
+.setsym::x::AX,BX,CX
+MOV !Yx[z],!e::"mov {{y[z]}},0x{{.hex(e)}}"
+```
+
+```
+mov ax,0x12      ->  mov R0,0x12
+mov bx,0x34      ->  mov R1,0x34
+mov cx,0x56      ->  mov R2,0x56
+```
+
+`ax` is item 0 of the set `x`, so `z` becomes 0 and `{{y[z]}}` writes item 0 of
+the set `y`, `R0`. The lookup goes **name to index and index back to name**, so
+two sets listed in the same order let one spelling be rewritten into the other.
+
+Where `.check` only *restricts* the position to one of a set, `!Y` restricts it
+and also hands over **which one it was**. The index is an ordinary integer, so
+it can be written in expressions as well as in template subscripts:
+
+```
+.setsym::x::AX,BX,CX
+ENC !Yx[z] :: 0x40|z          /* enc ax -> 0x40, enc bx -> 0x41, enc cx -> 0x42 */
+```
+
+Notes.
+
+- The **set name** is spelled like a variable name: a lowercase letter followed
+  by lowercase letters, digits and `_`. If no set or array symbol of that name
+  exists at match time, the line does not match.
+- The **variable name** is written in `[` `]`. It is separate from the set
+  name, so it need not repeat it as in `!Yx[x]`.
+- The match is **longest first**. Against `.setsym::over::A,AX,AL`, `al` hits
+  `AL`, not `A`. An item name is not a match when the source continues with a
+  letter, digit or `_` right after it, since that is the middle of a word.
+- Item names are matched **case-insensitively**. Bare names of an array symbol
+  keep the spelling they were written with (section 3.6.1), but both sides are
+  uppercased for the comparison.
+- **Numeric items** (each item of `.setsym::m::[1,2,3]`) have no name, so they
+  are never candidates. Only name items are.
+- Specificity counts it as a **symbol**, not as an expression. Since the
+  spellings it accepts are limited to the items of the set, `!Yx[z]` is chosen
+  over a pattern that writes `!a` at the same position.
 
 ### 3.7 Symbol check (`.check`)
 

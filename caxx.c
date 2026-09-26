@@ -6995,6 +6995,33 @@ static int enum_capture(Assembler *asmb, const EnumDef *ed, const char *s, int i
     return 1;
 }
 
+/* `!Y<集合>` の位置で、集合（`.setsym::x::AX,BX,CX`。中身は名前を項目に持つ
+ * 配列シンボル）の項目名のうち、s の idx 位置から読める最長のものの番号を返す
+ * （読めなければ -1）。直後が英数字・下線なら語の途中なので一致とみなさない
+ * のは `!E` の enum_name_at() と同じ規則である。項目の綴りは書かれたままなので
+ * （`[r0,r1]` は小文字のまま）、突き合わせは両側を大文字にして行う。数値の項目
+ * は名前を持たないので照合の相手にしない。 */
+static int symset_item_at(const char *s, int idx, const struct ArrSym *ar, int *end_out){
+    int best=-1, best_end=idx;
+    for(int k=0;k<ar->len;k++){
+        if(!ar->items[k].is_str || !ar->items[k].s) continue;
+        const char *nm = ar->items[k].s;
+        int n = (int)strlen(nm);
+        if(n <= best_end-idx) continue;
+        int ok=1;
+        for(int j=0;j<n;j++){
+            char c=s[idx+j];
+            if(c=='\0' || axx_upper_char(c)!=axx_upper_char(nm[j])){ ok=0; break; }
+        }
+        if(!ok) continue;
+        char nx=s[idx+n];
+        if((nx>='0'&&nx<='9')||(nx>='A'&&nx<='Z')||(nx>='a'&&nx<='z')||nx=='_') continue;
+        best=k; best_end=idx+n;
+    }
+    *end_out=best_end;
+    return best;
+}
+
 /* ソース行 s_orig をパターン t_orig と照合する（字句解析なしの1文字ずつ突き合わせ）。
  * パターン側の文字の意味:
  *   大文字      大小無視でリテラル一致（ニーモニック）
@@ -7005,6 +7032,7 @@ static int enum_capture(Assembler *asmb, const EnumDef *ed, const char *s, int i
  *   !Lx         式・ラベル捕捉子。!x と同じに値を束縛し、そのうえでソースに
  *               書かれていたままの文字も覚える（{{.exp(x)}} が出す）
  *   !Ex         .enum で決めた列挙要素のリストを読み、その式の値を束縛
+ *   !Yx[z]      集合 x の項目名を1つ読み、その番号を変数 z に束縛
  *   \c          次の1文字をリテラル扱い（エスケープ）
  * 成功時は具体度スコア (式の数, リテラル文字数, シンボル数) を st に残す。
  * 呼び出し側はこれが最も「具体的」なパターンを採用するので、パターンファイル内の
@@ -7234,6 +7262,50 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 if(!enum_capture(asmb, ed, s, idx_s, &ev, &eend)){ result=0; break; }
                 idx_s = eend;
                 var_slot_put(st, vslot, ev);
+                continue;
+            } else if(a=='Y'){
+                /* `!Y<集合>[<変数>]` — シンボル捕捉子。`.setsym::x::AX,BX,CX`
+                 * で作った集合（3.6.2 節）の項目名を1つ読み、その「番号」を
+                 * 変数に束縛する。`.check` が位置を集合の中の1つに限るのに
+                 * 対し、こちらは限るだけでなく何番目だったかを渡すので、
+                 * 別の配列を同じ番号で引ける。
+                 *
+                 *   .setsym::y::R0,R1,R2
+                 *   .setsym::x::AX,BX,CX
+                 *   MOV !Yx[z],!e::"mov {{y[z]}},0x{{.hex(e)}}"
+                 *
+                 * で `mov ax,0x12` は `mov R0,0x12` になる。
+                 * 集合が無い／項目名が読めない位置は不一致にする。
+                 * 具体度は式ではなくシンボルとして数える（取れる綴りが集合の
+                 * 項目に限られるので、`!a` のような式より具体的である）。 */
+                if(idx_t >= tlen){ result=0; break; }
+                int _sl = var_name_len(t+idx_t);
+                if(_sl == 0){ result=0; break; }
+                char _setkey[512];
+                if(_sl >= (int)sizeof(_setkey)){ result=0; break; }
+                for(int _i=0;_i<_sl;_i++)
+                    _setkey[_i] = (char)axx_upper_char(t[idx_t+_i]);
+                _setkey[_sl] = '\0';
+                idx_t += _sl;
+                /* 束縛先の変数は `[` `]` で括って書く。集合の名前と別にして
+                 * おかないと、同じ綴りが集合にも変数にも要ることになる。 */
+                if(idx_t >= tlen || t[idx_t] != '['){ result=0; break; }
+                idx_t++;
+                int _nl = var_name_len(t+idx_t);
+                if(_nl == 0){ result=0; break; }
+                int vslot = var_slot(t+idx_t, _nl, 1);
+                if(vslot < 0){ result=0; break; }
+                idx_t += _nl;
+                if(idx_t >= tlen || t[idx_t] != ']'){ result=0; break; }
+                idx_t++;
+                struct ArrSym *_ys = arrsym_get(st, _setkey);
+                if(!_ys || _ys->len <= 0){ result=0; break; }
+                int _yend = idx_s;
+                int _yk = symset_item_at(s, idx_s, _ys, &_yend);
+                if(_yk < 0){ result=0; break; }
+                idx_s = _yend;
+                var_slot_put(st, vslot, u256_from_u64((uint64_t)_yk));
+                n_expr--; n_sym++;
                 continue;
             } else if(a=='!'){
                 if(idx_t >= tlen){ result=0; break; }

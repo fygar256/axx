@@ -1,0 +1,12 @@
+	mov	ax,0x12
+	mov	bx,0x34
+	mov	cx,0x56
+	mov	dx,0x78
+	add	ax,cl
+	add	cx,al
+	len	a
+	len	ax
+	len	al
+	enc	ax
+	enc	bx
+	enc	cx

@@ -40,6 +40,12 @@ arrindex.axx                        pattern file for the array-symbol features:
                                     bare names as items, a name used as a
                                     subscript, and .index (manual 3.6.1)
 arrindex.s                          test assemble file for arrindex.axx
+symcap.axx                          pattern file for the `!Y<set>[<var>]` symbol
+                                    capture: reads one item name of a set and
+                                    binds its index to a variable, so one set's
+                                    spelling can be rewritten into another's
+                                    (manual 3.6.3)
+symcap.s                            test assemble file for symcap.axx
 passthru.axx                        pattern file for .passthru and .eol: lines
                                     that match no pattern are let through as
                                     text, one output line per source line

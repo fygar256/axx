@@ -2683,6 +2683,33 @@ def _enum_name_at(s, idx, names):
     return best, best_end
 
 
+def _symset_item_at(s, idx, items):
+    """s の idx 位置に一致する集合の項目名のうち最長のものを返す。
+
+    返り値は (項目番号, 終了位置)。一致しなければ (-1, idx)。
+    直後が英数字・下線なら語の途中なので一致とみなさない。項目の綴りは
+    書かれたままなので（`[r0,r1]` は小文字のまま）、突き合わせは両側を
+    大文字にして行う。数値の項目は名前を持たないので照合の相手にしない。
+    caxx.c の symset_item_at() と同じ規則である。
+    """
+    best = -1
+    best_end = idx
+    for k, it in enumerate(items):
+        if not isinstance(it, str):
+            continue
+        n = len(it)
+        if n <= best_end - idx:
+            continue
+        if StringUtils.upper(s[idx:idx + n]) != StringUtils.upper(it):
+            continue
+        e = idx + n
+        if e < len(s) and s[e] in _ENUM_WORD_CHARS:
+            continue
+        best = k
+        best_end = e
+    return best, best_end
+
+
 class ExpressionEvaluator:
     """式評価器。優先順位ごとの再帰下降パーサ。
     
@@ -5379,6 +5406,53 @@ class PatternMatcher:
                         return False
                     v, idx_s = hit
                     self.var_manager.put(a, v)
+                    continue
+                elif a == 'Y':
+                    # `!Y<集合>[<変数>]` — シンボル捕捉子。
+                    # `.setsym::x::AX,BX,CX` で作った集合（3.6.2 節）の項目名を
+                    # 1つ読み、その「番号」を変数に束縛する。`.check` が位置を
+                    # 集合の中の1つに限るのに対し、こちらは限るだけでなく
+                    # 何番目だったかを渡すので、別の配列を同じ番号で引ける。
+                    #
+                    #   .setsym::y::R0,R1,R2
+                    #   .setsym::x::AX,BX,CX
+                    #   MOV !Yx[z],!e::"mov {{y[z]}},0x{{.hex(e)}}"
+                    #
+                    # で `mov ax,0x12` は `mov R0,0x12` になる。
+                    # 集合が無い／項目名が読めない位置は不一致にする。
+                    # 具体度は式ではなくシンボルとして数える（取れる綴りが
+                    # 集合の項目に限られるので、`!a` のような式より具体的
+                    # である）。
+                    if idx_t >= len(t):
+                        return False
+                    _sl = self._var_name_at(t, idx_t)
+                    if _sl == 0:
+                        return False
+                    setkey = StringUtils.upper(t[idx_t:idx_t + _sl])
+                    idx_t += _sl
+                    # 束縛先の変数は `[` `]` で括って書く。集合の名前と別に
+                    # しておかないと、同じ綴りが集合にも変数にも要ることになる。
+                    if idx_t >= len(t) or t[idx_t] != '[':
+                        return False
+                    idx_t += 1
+                    _nl = self._var_name_at(t, idx_t)
+                    if _nl == 0:
+                        return False
+                    a = self._var_declare(t[idx_t:idx_t + _nl])
+                    idx_t += _nl
+                    if idx_t >= len(t) or t[idx_t] != ']':
+                        return False
+                    idx_t += 1
+                    arr = self.state.arrsymbols.get(setkey)
+                    if not arr:
+                        return False
+                    _yk, _yend = _symset_item_at(s, idx_s, arr)
+                    if _yk < 0:
+                        return False
+                    idx_s = _yend
+                    self.var_manager.put(a, _yk)
+                    n_expr -= 1
+                    n_sym += 1
                     continue
                 elif a == '!':
                     if idx_t >= len(t):
