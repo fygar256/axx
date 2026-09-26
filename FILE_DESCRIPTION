@@ -17,6 +17,14 @@ File description
 8080.s                              test assemble file for 8080
 4004.axx                            pattern file for 4004
 4004.s                              test assemble file for 4004
+aarch64.axx                         pattern file for AArch64 (A64): data processing,
+                                    branches, system, loads and stores, scalar
+                                    floating point, Advanced SIMD, cryptography and
+                                    the scalar extensions, plus SVE, SVE2, SME and
+                                    SME2, and the GNU-style relocation modifiers
+                                    (:lo12:, :pg_hi21:, :abs_g0:-:abs_g3:, :got: ...).
+                                    written with the macro layer
+aarch64.s                           test assemble file for aarch64.axx
 aarch64_logical.axx                 pattern file for the AArch64 logical (immediate)
                                     group, AND/ORR/EOR/ANDS/TST, 32 and 64 bit.
                                     the macro-layer version: the rows are
@@ -51,7 +59,8 @@ hello8080.s                         test assemble file for 8080toz80.axx: CP/M
                                     hello world in 8080 mnemonics
 LICENSE                             license
 README.md                           readme
-Technical_Manual.md                 technical manual, full reference
+Technical_Manual.md                 technical manual, full reference (English)
+Technical_Manual_ja.md              technical manual, full reference (Japanese)
 URL_to_newest_article_in_Japanese   as it is
 caxx.c                              axx in C 'Caxx'
 axx.1.gz                            axx man page
@@ -59,6 +68,13 @@ axx.py                              axx in python 'Paxx'
 axxgirl.png                         mascot character picture file
 bf.axx                              pattern file for brainfuck virtual CPU system
 bf.s                                hello world test assemble file for brainfuck virtual CPU
+mandelbrot.bf                       mandelbrot set viewer in brainfuck, by Erik
+                                    Bosman. demo input for bf.axx
+bf_aarch64.s                        brainfuck interpreter written in AArch64
+                                    assembly (axx syntax). assembles with
+                                    aarch64.axx, into an ELF object with -o or a
+                                    flat image with -b
+bf_aarch64                          the AArch64 executable built from bf_aarch64.s
 format_of_exp_imp_file              format description for export/import file
 hello.s                             assembly file of x86_64 hello world. use x86_64.axx
 hello.tsv                           export file of x86_64 hello world
@@ -80,6 +96,8 @@ MINI.md                             mini language reference (Japanese)
 mini_en.md                          mini language reference (English)
 axx_introduction_paper.md           introduction paper (Japanese)
 axx_introduction_paper_en.md        introduction paper (English)
+axx-promotion.md                    introductory article (Japanese)
+axx-promotion-en.md                 introductory article (English)
 axxsemantics                        denotational semantics of axx (Japanese)
 FILE_DESCRIPTION                    this file
 makefile                            build/install rules for caxx and paxx
