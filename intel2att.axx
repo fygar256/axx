@@ -1,0 +1,434 @@
+/* =====================================================================
+/*  intel2att.axx -- x86_64 Intel 記法 -> AT&T 記法 ソース翻訳器
+/*
+/*  使い方:
+/*    caxx intel2att.axx prog_intel.s -V > prog_att.s
+/*    paxx intel2att.axx prog_intel.s -V > prog_att.s
+/*
+/*  方針:
+/*    - オペランドの順序を入れ替える（dst,src -> src,dst）
+/*    - レジスタに % を、即値に $ を付ける
+/*    - [base+index*scale+disp] を disp(%base,%index,scale) にする
+/*    - サイズ（BYTE/WORD/DWORD/QWORD [PTR]）やレジスタ幅から
+/*      接尾辞 b/w/l/q を付ける
+/*    - ラベル・式は !L で拾い {{.exp()}} で出すので、書かれたままの綴りで残る
+/*    - 対応していない行は .textmode によりそのまま素通しされる
+/*
+/*  即値とメモリ参照の区別は NASM / axx の流儀に従う:
+/*    mov rsi,msg     -> movq $msg, %rsi   （アドレスを即値として）
+/*    mov rsi,[msg]   -> movq msg, %rsi    （メモリから読む）
+/*    mov rsi,offset msg も $msg になる（GAS の Intel 記法向け）
+/*
+/*  パターン行はマクロ層（!def / !while）で生成している。
+/*  展開結果は `caxx intel2att.axx -p out.axx` で確認できる。
+/* =====================================================================
+
+.textmode
+
+/* ---------------------------------------------------------------------
+/*  レジスタ（項目名は照合にも、出力の綴りにも使う）
+/* ---------------------------------------------------------------------
+.setsym::r64::[rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi,r8,r9,r10,r11,r12,r13,r14,r15]
+.setsym::r32::[eax,ecx,edx,ebx,esp,ebp,esi,edi,r8d,r9d,r10d,r11d,r12d,r13d,r14d,r15d]
+.setsym::r16::[ax,cx,dx,bx,sp,bp,si,di,r8w,r9w,r10w,r11w,r12w,r13w,r14w,r15w]
+.setsym::r8::[al,cl,dl,bl,spl,bpl,sil,dil,r8b,r9b,r10b,r11b,r12b,r13b,r14b,r15b,ah,ch,dh,bh]
+
+/* ---------------------------------------------------------------------
+/*  命令グループ（Intel と AT&T で綴りが同じもの）
+/* ---------------------------------------------------------------------
+.setsym::op2::[mov,add,sub,adc,sbb,and,or,xor,cmp,test,xchg,xadd,cmpxchg,bt,bts,btr,btc,bsf,bsr,popcnt,lzcnt,tzcnt]
+.setsym::op1::[inc,dec,neg,not,mul,div,idiv,imul]
+.setsym::sh::[shl,shr,sal,sar,rol,ror,rcl,rcr]
+.setsym::br::[jmp,call]
+.setsym::lp::[loop,loope,loopne,loopz,loopnz,jrcxz,jecxz]
+.setsym::cc::[o,no,b,c,nae,ae,nb,nc,e,z,ne,nz,be,na,a,nbe,s,ns,p,pe,np,po,l,nge,ge,nl,le,ng,g,nle]
+.setsym::ext::[movzx,movsx]
+.setsym::extat::[movz,movs]
+
+/*  オペランドなしの命令: Intel の綴り -> AT&T の綴り
+.setsym::z0::[ret,nop,syscall,leave,hlt,cpuid,rdtsc,pause,int3,ud2,clc,stc,cmc,cld,std,cli,sti,cqo,cdq,cdqe,cwde,cbw,cwd,pushfq,popfq,movsb,movsw,movsq,stosb,stosw,stosd,stosq,lodsb,lodsw,lodsd,lodsq,cmpsb,cmpsw,cmpsq,scasb,scasw,scasd,scasq]
+.setsym::z0at::[ret,nop,syscall,leave,hlt,cpuid,rdtsc,pause,int3,ud2,clc,stc,cmc,cld,std,cli,sti,cqto,cltd,cltq,cwtl,cbtw,cwtd,pushfq,popfq,movsb,movsw,movsq,stosb,stosw,stosl,stosq,lodsb,lodsw,lodsl,lodsq,cmpsb,cmpsw,cmpsq,scasb,scasw,scasl,scasq]
+.setsym::rp::[rep,repe,repz,repne,repnz,lock]
+
+/* ---------------------------------------------------------------------
+/*  マクロ: サイズ番号 z（0:64 1:32 2:16 3:8 ビット）ごとの情報
+/* ---------------------------------------------------------------------
+!def rs(z) {
+!if z == 0 !then {
+!return "r64"
+}
+!if z == 1 !then {
+!return "r32"
+}
+!if z == 2 !then {
+!return "r16"
+}
+!return "r8"
+}
+
+!def sx(z) {
+!if z == 0 !then {
+!return "q"
+}
+!if z == 1 !then {
+!return "l"
+}
+!if z == 2 !then {
+!return "w"
+}
+!return "b"
+}
+
+!def pw(z) {
+!if z == 0 !then {
+!return "QWORD"
+}
+!if z == 1 !then {
+!return "DWORD"
+}
+!if z == 2 !then {
+!return "WORD"
+}
+!return "BYTE"
+}
+
+/*  サイズ指定の書き方 v（0: なし 1: "QWORD PTR " 2: "QWORD "）
+!def pre(z, v) {
+!if v == 1 !then {
+!return pw(z) + " PTR "
+}
+!if v == 2 !then {
+!return pw(z) + " "
+}
+!return ""
+}
+
+/* ---------------------------------------------------------------------
+/*  マクロ: メモリオペランド k（0..NMEM-1）の Intel 側の形 mp と AT&T 側の形 ma
+/*    B = ベース（mb）, I = インデックス（mi）, S = スケール, D = 変位（md）
+/* ---------------------------------------------------------------------
+!set NMEM = 28
+
+!def scl(k) {
+!return 1 << ((k - 3) % 4)
+}
+
+!def mp(k) {
+!local B = "!Yr64[mb]"
+!local I = "!Yr64[mi]"
+!if k == 0 !then {
+!return "[" + B + "\\]"
+}
+!if k == 1 !then {
+!return "[" + B + "+!Lmd]"
+}
+!if k == 2 !then {
+!return "[" + B + "-!Lmd]"
+}
+!if k < 7 !then {
+!return "[" + B + "+" + I + "*" + str(scl(k)) + "]"
+}
+!if k < 11 !then {
+!return "[" + B + "+" + I + "*" + str(scl(k)) + "+!Lmd]"
+}
+!if k < 15 !then {
+!return "[" + B + "+" + I + "*" + str(scl(k)) + "-!Lmd]"
+}
+!if k < 19 !then {
+!return "[" + I + "*" + str(scl(k)) + "+!Lmd]"
+}
+!if k < 23 !then {
+!return "[" + I + "*" + str(scl(k)) + "]"
+}
+!if k == 23 !then {
+!return "[" + B + "+" + I + "\\]"
+}
+!if k == 24 !then {
+!return "[" + B + "+" + I + "+!Lmd]"
+}
+!if k == 25 !then {
+!return "[" + B + "+" + I + "-!Lmd]"
+}
+!if k == 26 !then {
+!return "[RIP+!Lmd]"
+}
+!return "[!Lmd]"
+}
+
+!def ma(k) {
+!local B = "%{{r64[mb]}}"
+!local I = "%{{r64[mi]}}"
+!local D = "{{.exp(md)}}"
+!if k == 0 !then {
+!return "(" + B + ")"
+}
+!if k == 1 !then {
+!return D + "(" + B + ")"
+}
+!if k == 2 !then {
+!return "-" + D + "(" + B + ")"
+}
+!if k < 7 !then {
+!return "(" + B + "," + I + "," + str(scl(k)) + ")"
+}
+!if k < 11 !then {
+!return D + "(" + B + "," + I + "," + str(scl(k)) + ")"
+}
+!if k < 15 !then {
+!return "-" + D + "(" + B + "," + I + "," + str(scl(k)) + ")"
+}
+!if k < 19 !then {
+!return D + "(," + I + "," + str(scl(k)) + ")"
+}
+!if k < 23 !then {
+!return "0(," + I + "," + str(scl(k)) + ")"
+}
+!if k == 23 !then {
+!return "(" + B + "," + I + ")"
+}
+!if k == 24 !then {
+!return D + "(" + B + "," + I + ")"
+}
+!if k == 25 !then {
+!return "-" + D + "(" + B + "," + I + ")"
+}
+!if k == 26 !then {
+!return D + "(%rip)"
+}
+!return D
+}
+
+/* ---------------------------------------------------------------------
+/*  2 オペランドの算術・論理・転送命令
+/* ---------------------------------------------------------------------
+!def gen_op2(z) {
+!local R = rs(z)
+!local X = sx(z)
+!Yop2[o] !Y!{R}[a],!Y!{R}[b] :: "{{op2[o]}}!{X} %{{!{R}[b]}}, %{{!{R}[a]}}"
+!Yop2[o] !Y!{R}[a],!Li :: "{{op2[o]}}!{X} ${{.exp(i)}}, %{{!{R}[a]}}"
+!Yop2[o] !Y!{R}[a],OFFSET !Li :: "{{op2[o]}}!{X} ${{.exp(i)}}, %{{!{R}[a]}}"
+!local k = 0
+!while k < NMEM {
+!local v = 0
+!while v < 3 {
+!Yop2[o] !Y!{R}[a],!{pre(z, v)}!{mp(k)} :: "{{op2[o]}}!{X} !{ma(k)}, %{{!{R}[a]}}"
+!Yop2[o] !{pre(z, v)}!{mp(k)},!Y!{R}[a] :: "{{op2[o]}}!{X} %{{!{R}[a]}}, !{ma(k)}"
+!if v > 0 !then {
+!Yop2[o] !{pre(z, v)}!{mp(k)},!Li :: "{{op2[o]}}!{X} ${{.exp(i)}}, !{ma(k)}"
+}
+!set v = v + 1
+}
+!set k = k + 1
+}
+}
+
+/* ---------------------------------------------------------------------
+/*  1 オペランドの命令（inc/dec/neg/not/mul/div/idiv/imul）
+/* ---------------------------------------------------------------------
+!def gen_op1(z) {
+!local R = rs(z)
+!local X = sx(z)
+!Yop1[o] !Y!{R}[a] :: "{{op1[o]}}!{X} %{{!{R}[a]}}"
+!local k = 0
+!while k < NMEM {
+!local v = 1
+!while v < 3 {
+!Yop1[o] !{pre(z, v)}!{mp(k)} :: "{{op1[o]}}!{X} !{ma(k)}"
+!set v = v + 1
+}
+!set k = k + 1
+}
+}
+
+/* ---------------------------------------------------------------------
+/*  シフト・ローテート（reg,CL / reg,imm / reg）
+/* ---------------------------------------------------------------------
+!def gen_sh(z) {
+!local R = rs(z)
+!local X = sx(z)
+!Ysh[o] !Y!{R}[a],CL :: "{{sh[o]}}!{X} %cl, %{{!{R}[a]}}"
+!Ysh[o] !Y!{R}[a],!Li :: "{{sh[o]}}!{X} ${{.exp(i)}}, %{{!{R}[a]}}"
+!Ysh[o] !Y!{R}[a] :: "{{sh[o]}}!{X} %{{!{R}[a]}}"
+!local k = 0
+!while k < NMEM {
+!local v = 1
+!while v < 3 {
+!Ysh[o] !{pre(z, v)}!{mp(k)},CL :: "{{sh[o]}}!{X} %cl, !{ma(k)}"
+!Ysh[o] !{pre(z, v)}!{mp(k)},!Li :: "{{sh[o]}}!{X} ${{.exp(i)}}, !{ma(k)}"
+!Ysh[o] !{pre(z, v)}!{mp(k)} :: "{{sh[o]}}!{X} !{ma(k)}"
+!set v = v + 1
+}
+!set k = k + 1
+}
+}
+
+/* ---------------------------------------------------------------------
+/*  LEA と 2・3 オペランドの IMUL（64/32/16 ビット）
+/* ---------------------------------------------------------------------
+!def gen_lea_imul(z) {
+!local R = rs(z)
+!local X = sx(z)
+IMUL !Y!{R}[a],!Y!{R}[b] :: "imul!{X} %{{!{R}[b]}}, %{{!{R}[a]}}"
+IMUL !Y!{R}[a],!Y!{R}[b],!Li :: "imul!{X} ${{.exp(i)}}, %{{!{R}[b]}}, %{{!{R}[a]}}"
+!local k = 0
+!while k < NMEM {
+LEA !Y!{R}[a],!{mp(k)} :: "lea!{X} !{ma(k)}, %{{!{R}[a]}}"
+!local v = 0
+!while v < 3 {
+IMUL !Y!{R}[a],!{pre(z, v)}!{mp(k)} :: "imul!{X} !{ma(k)}, %{{!{R}[a]}}"
+IMUL !Y!{R}[a],!{pre(z, v)}!{mp(k)},!Li :: "imul!{X} ${{.exp(i)}}, !{ma(k)}, %{{!{R}[a]}}"
+!set v = v + 1
+}
+!set k = k + 1
+}
+}
+
+/* ---------------------------------------------------------------------
+/*  MOVZX / MOVSX（dst のサイズ d, src のサイズ s）と MOVSXD
+/* ---------------------------------------------------------------------
+!def gen_ext(d, s) {
+!local RD = rs(d)
+!local RS = rs(s)
+!local SS = sx(s) + sx(d)
+!Yext[o] !Y!{RD}[a],!Y!{RS}[b] :: "{{extat[o]}}!{SS} %{{!{RS}[b]}}, %{{!{RD}[a]}}"
+!local k = 0
+!while k < NMEM {
+!local v = 1
+!while v < 3 {
+!Yext[o] !Y!{RD}[a],!{pre(s, v)}!{mp(k)} :: "{{extat[o]}}!{SS} !{ma(k)}, %{{!{RD}[a]}}"
+!set v = v + 1
+}
+!set k = k + 1
+}
+}
+
+!def gen_movsxd() {
+MOVSXD !Yr64[a],!Yr32[b] :: "movslq %{{r32[b]}}, %{{r64[a]}}"
+!local k = 0
+!while k < NMEM {
+!local v = 0
+!while v < 3 {
+MOVSXD !Yr64[a],!{pre(1, v)}!{mp(k)} :: "movslq !{ma(k)}, %{{r64[a]}}"
+!set v = v + 1
+}
+!set k = k + 1
+}
+}
+
+/* ---------------------------------------------------------------------
+/*  CMOVcc（64/32/16）と SETcc
+/* ---------------------------------------------------------------------
+!def gen_cmov(z) {
+!local R = rs(z)
+!local X = sx(z)
+CMOV!Ycc[c] !Y!{R}[a],!Y!{R}[b] :: "cmov{{cc[c]}}!{X} %{{!{R}[b]}}, %{{!{R}[a]}}"
+!local k = 0
+!while k < NMEM {
+!local v = 0
+!while v < 3 {
+CMOV!Ycc[c] !Y!{R}[a],!{pre(z, v)}!{mp(k)} :: "cmov{{cc[c]}}!{X} !{ma(k)}, %{{!{R}[a]}}"
+!set v = v + 1
+}
+!set k = k + 1
+}
+}
+
+!def gen_setcc() {
+SET!Ycc[c] !Yr8[a] :: "set{{cc[c]}} %{{r8[a]}}"
+!local k = 0
+!while k < NMEM {
+!local v = 0
+!while v < 3 {
+SET!Ycc[c] !{pre(3, v)}!{mp(k)} :: "set{{cc[c]}} !{ma(k)}"
+!set v = v + 1
+}
+!set k = k + 1
+}
+}
+
+/* ---------------------------------------------------------------------
+/*  PUSH / POP と、間接の JMP / CALL
+/* ---------------------------------------------------------------------
+!def gen_stack_branch() {
+!local k = 0
+!while k < NMEM {
+!local v = 0
+!while v < 3 {
+PUSH !{pre(0, v)}!{mp(k)} :: "pushq !{ma(k)}"
+POP !{pre(0, v)}!{mp(k)} :: "popq !{ma(k)}"
+!Ybr[o] !{pre(0, v)}!{mp(k)} :: "{{br[o]}} *!{ma(k)}"
+!set v = v + 1
+}
+!set k = k + 1
+}
+}
+
+/*  データ定義: DB/DW/DD/DQ（1〜8 個の式）
+!def gen_data(mn, dir) {
+!local n = 1
+!while n <= 8 {
+!local p = "!Le0"
+!local t = "{{.exp(e0)}}"
+!local j = 1
+!while j < n {
+!set p = p + ",!Le" + str(j)
+!set t = t + ", {{.exp(e" + str(j) + ")}}"
+!set j = j + 1
+}
+!{mn} !{p} :: "!{dir} !{t}"
+!set n = n + 1
+}
+}
+
+/* ---------------------------------------------------------------------
+/*  展開
+/* ---------------------------------------------------------------------
+!set z = 0
+!while z < 4 {
+!gen_op2(z)
+!gen_op1(z)
+!gen_sh(z)
+!set z = z + 1
+}
+
+!set z = 0
+!while z < 3 {
+!gen_lea_imul(z)
+!gen_cmov(z)
+!set z = z + 1
+}
+
+!gen_ext(2, 3)
+!gen_ext(1, 3)
+!gen_ext(0, 3)
+!gen_ext(1, 2)
+!gen_ext(0, 2)
+!gen_movsxd()
+!gen_setcc()
+!gen_stack_branch()
+
+!gen_data("DB", ".byte")
+!gen_data("DW", ".word")
+!gen_data("DD", ".long")
+!gen_data("DQ", ".quad")
+
+/* ---------------------------------------------------------------------
+/*  そのまま書ける行
+/* ---------------------------------------------------------------------
+PUSH !Yr64[a] :: "pushq %{{r64[a]}}"
+POP  !Yr64[a] :: "popq %{{r64[a]}}"
+PUSH !Yr16[a] :: "pushw %{{r16[a]}}"
+POP  !Yr16[a] :: "popw %{{r16[a]}}"
+PUSH !Li      :: "pushq ${{.exp(i)}}"
+PUSH OFFSET !Li :: "pushq ${{.exp(i)}}"
+
+!Ybr[o] !Yr64[a] :: "{{br[o]}} *%{{r64[a]}}"
+!Ybr[o] !Lt      :: "{{br[o]}} {{.exp(t)}}"
+J!Ycc[c] !Lt     :: "j{{cc[c]}} {{.exp(t)}}"
+!Ylp[o] !Lt      :: "{{lp[o]}} {{.exp(t)}}"
+
+RET !Li   :: "ret ${{.exp(i)}}"
+INT !Li   :: "int ${{.exp(i)}}"
+
+!Yz0[o]          :: "{{z0at[o]}}"
+!Yrp[p] !Yz0[o]  :: "{{rp[p]}} {{z0at[o]}}"
