@@ -848,6 +848,8 @@ class AssemblerState:
         self.patsymbols = {}     # パターンファイルの .setsym で定義されたもの
         self.export_labels = {}  # .global 等で外部公開するラベル
         self.pat = []            # 読み込んだパターン表
+        # pat と同じ並びで「その行がディレクティブか」を持つ表（下記 pat と対）。
+        self.pat_isdir = []
 
         self.vliw = VLIWState()
 
@@ -1144,10 +1146,24 @@ class StringUtils:
     # 非 ASCII（日本語等）を変換してしまうと .ascii 文字列の内容が壊れるため。
     _ASCII_UPPER = str.maketrans(LOWER, CAPITAL)
 
+    # upper() は照合の最内周から呼ばれ、同じ短い文字列（ニーモニック、
+    # パターンの欄、シンボル名）を何百万回も大文字化する。純粋な関数なので
+    # 結果を使い回す。実測: aarch64 の 120 行で 594 万回。
+    _upper_cache = {}
+
     @staticmethod
     def upper(s):
         """ASCII 英小文字だけを大文字化する（非 ASCII はそのまま）。"""
-        return s.translate(StringUtils._ASCII_UPPER)
+        c = StringUtils._upper_cache
+        v = c.get(s)
+        if v is None:
+            v = s.translate(StringUtils._ASCII_UPPER)
+            # 際限なく溜めない。行全体のような長い文字列は入れても当たらない。
+            if len(s) <= 64:
+                if len(c) >= 65536:
+                    c.clear()
+                c[s] = v
+        return v
 
     @staticmethod
     def join_backslash_continuations(raw_lines):
@@ -3448,6 +3464,9 @@ class DirectiveProcessor:
 
         return True
 
+    # 定数と分かった `.setsym` の値欄 → 評価結果。_CONST_SETSYM_RE を参照。
+    _const_setsym_cache = {}
+
     def set_symbol(self, i):
         if len(i) == 0 or i[0] != '.setsym':
             return False
@@ -3477,7 +3496,14 @@ class DirectiveProcessor:
         if symbol_set_from_text(self.state, key, value_field):
             return True
         if value_field:
-            v, idx = self.expr_eval.expression_pat(value_field, 0)
+            _c = DirectiveProcessor._const_setsym_cache
+            v = _c.get(value_field, _SETSYM_MISS)
+            if v is _SETSYM_MISS:
+                v, idx = self.expr_eval.expression_pat(value_field, 0)
+                if _CONST_SETSYM_RE.match(value_field):
+                    if len(_c) >= 65536:
+                        _c.clear()
+                    _c[value_field] = v
         else:
             v = 0
         self.state.symbols[key] = v
@@ -4177,6 +4203,49 @@ class DirectiveProcessor:
 
 
 _SYM_CORE = set(DIGIT + ALPHABET + '_')
+
+# パターンファイル側のディレクティブの名前。lineassemble2() は1行を訳すたびに
+# パターンを全部走査するので、ディレクティブ判定を1つずつ関数呼び出しで試すと
+# 「パターン数 × ソース行数 × 判定の数」だけ空振りする（x86_64 や aarch64 の
+# ように1万行規模のパターンファイルでは、これだけで実行時間の大半になる）。
+# 各判定関数が見ているのは i[0] がこの名前と一致するかどうかだけなので、
+# ここで一度に振り分けて、ディレクティブでない行は判定列ごと飛ばす。
+# 表を増やすときは、対応する判定関数を lineassemble2() の列にも足すこと。
+# caxx.c の pat_is_directive() と同じ表である。
+_PAT_DIRECTIVES = frozenset((
+    '.setsym', '.clearsym', '.padding', '.bits', '.symbolc', '.vliw',
+    '.check', '.clrcheck', '.reloc', '.clrreloc', '.map', '.free',
+    '.passthru', '.eol', '.textmode', '.enum', '.clrenum', '.error'))
+
+
+# `.setsym` の値欄が「ソースの行によって変わりようのない定数式」か。
+# パターン行の式はラベル・`$.`/`$$`・`#名前`・パターン変数・`'`・`@` を読めるので
+# (マニュアル 6.3)、それらを書ける文字が1つでもあれば行ごとに値が変わりうる。
+# 逆に、数字・16進・演算子・括弧しか無いならどの行で評価しても同じ値になる。
+# 照合は1行ごとにパターン表を頭からたどり直すため、同じ `.setsym` の式を
+# 1行につき何百回も評価し直している(実測: aarch64 の 120 行で 14 万回、
+# 実行時間の約4割)。定数と分かるものだけ結果を使い回す。
+_CONST_SETSYM_RE = re.compile(r"^[\s0-9+\-*/%()<>|&^~]+$|^\s*0[xX][0-9a-fA-F]+\s*$")
+
+_SETSYM_MISS = object()
+
+
+def _pat_is_directive(i):
+    """パターン1行がディレクティブか（`EPIC` は大小無視）。
+
+    偽なら、lineassemble2() のディレクティブ判定列は必ず全て False を返す。
+    """
+    if not i:
+        return False
+    i0 = i[0]
+    if not i0:
+        return False
+    if i0 in _PAT_DIRECTIVES:
+        return True
+    # `EPIC` だけは大小を無視して比べる。upper() は重いので、長さと先頭文字で
+    # 先に落としてから呼ぶ。
+    return len(i0) == 4 and (i0[0] == 'E' or i0[0] == 'e') \
+        and StringUtils.upper(i0) == 'EPIC'
 
 # テキスト置換モード（`.textmode`）で、処理せずテキストとしてだけ出す組み込み
 # アセンブリディレクティブ。いずれも自分でワードや領域を出す（あるいは
@@ -9646,64 +9715,74 @@ class Assembler:
             self.state.vliwset = list(snap['vliwset'])
 
 
+        # 照合にかける行。パターンごとに変わらないので、ループの外で1回だけ作る。
+        lin = StringUtils.reduce_spaces((l + ' ' + l2) if l2 else l)
+
+        _isdir = self.state.pat_isdir
+
         for i in self.state.pat:
             pln += 1
             pl = i
-            self.state.vars = {}
-            self.state.vars_undef = {}
-            self.state.vars_text = {}
 
             if i is None:
                 continue
-            if self.directive_proc.set_symbol(i):
-                continue
-            if self.directive_proc.clear_symbol(i):
-                continue
-            if self.directive_proc.paddingp(i):
-                continue
-            if self.directive_proc.bits(i):
-                continue
-            if self.directive_proc.symbolc(i):
-                continue
-            if self.directive_proc.epic(i):
-                continue
-            if self.directive_proc.vliwp(i):
-                continue
-            if self.directive_proc.check_processing(i):
-                continue
-            if self.directive_proc.clrcheck_processing(i):
-                continue
-            if self.directive_proc.reloc_processing(i):
-                continue
-            if self.directive_proc.clrreloc_processing(i):
-                continue
-            if self.directive_proc.map_processing(i):
-                continue
-            if self.directive_proc.free_processing(i):
-                continue
-            if self.directive_proc.passthru_processing(i):
-                continue
-            if self.directive_proc.eol_processing(i):
-                continue
-            if self.directive_proc.textmode_processing(i):
-                continue
-            if self.directive_proc.enum_processing(i):
-                continue
-            if self.directive_proc.clrenum_processing(i):
-                continue
-            if self.directive_proc.errmsg_processing(i):
-                continue
 
-            lw = len([_ for _ in i if _])
-            if lw == 0:
-                continue
+            # ディレクティブでない行（＝普通のパターン）は、下の判定列が必ず
+            # 全て False になるので丸ごと飛ばす。
+            if _isdir[pln - 1]:
+                # ディレクティブの値欄も式なので、パターン変数を読みうる
+                # （マニュアル 6.3）。評価の前に空にしておく。
+                self.state.vars = {}
+                self.state.vars_undef = {}
+                self.state.vars_text = {}
+                if self.directive_proc.set_symbol(i):
+                    continue
+                if self.directive_proc.clear_symbol(i):
+                    continue
+                if self.directive_proc.paddingp(i):
+                    continue
+                if self.directive_proc.bits(i):
+                    continue
+                if self.directive_proc.symbolc(i):
+                    continue
+                if self.directive_proc.epic(i):
+                    continue
+                if self.directive_proc.vliwp(i):
+                    continue
+                if self.directive_proc.check_processing(i):
+                    continue
+                if self.directive_proc.clrcheck_processing(i):
+                    continue
+                if self.directive_proc.reloc_processing(i):
+                    continue
+                if self.directive_proc.clrreloc_processing(i):
+                    continue
+                if self.directive_proc.map_processing(i):
+                    continue
+                if self.directive_proc.free_processing(i):
+                    continue
+                if self.directive_proc.passthru_processing(i):
+                    continue
+                if self.directive_proc.eol_processing(i):
+                    continue
+                if self.directive_proc.textmode_processing(i):
+                    continue
+                if self.directive_proc.enum_processing(i):
+                    continue
+                if self.directive_proc.clrenum_processing(i):
+                    continue
+                if self.directive_proc.errmsg_processing(i):
+                    continue
 
-            lin = (l + ' ' + l2) if l2 else l
-            lin = StringUtils.reduce_spaces(lin)
+            if not any(i):
+                continue
 
             if i[0] == '':
                 hit_sentinel = True
                 if best is None:
+                    self.state.vars = {}
+                    self.state.vars_undef = {}
+                    self.state.vars_text = {}
                     idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                 break
 
@@ -9730,6 +9809,12 @@ class Assembler:
                     _ok = False
                 if not _ok:
                     continue
+
+            # ここから先が本当の照合。先頭一致で捨てた分は作り直さなくてよい
+            # （変数表は照合と値欄の評価の直前にだけ空であればよい）。
+            self.state.vars = {}
+            self.state.vars_undef = {}
+            self.state.vars_text = {}
 
             self.state.error_undefined_label = False
 
@@ -11504,6 +11589,9 @@ class Assembler:
 
         try:
             self.state.pat = self.pattern_reader.readpat(args.patternfile)
+            # どの行がディレクティブかはパターンファイルを読んだ時点で決まる。
+            # ソース1行ごとに数千回やり直さないよう、ここで1度だけ作る。
+            self.state.pat_isdir = [_pat_is_directive(_p) for _p in self.state.pat]
             self.state.sub_defs = self.pattern_reader.subs
             self.state.func_defs = self.pattern_reader.funcs
             # 破綻点修正: パターンファイルが読めなかった場合、readpat() は

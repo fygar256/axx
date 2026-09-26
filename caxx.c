@@ -992,6 +992,13 @@ static int64_t addr_to_word_offset(SecRangeVec*ranges, const char*name, uint64_t
 #define PAT_FIELDS 6
 typedef struct {
     char *f[PAT_FIELDS];
+    /* 以下はパターンファイルを読んだ直後に一度だけ決める（pat_mark_static）。
+     * 照合はソース1行ごとにパターン表を頭からたどり直すので、行ごとに調べ直すと
+     * 「パターン数 × ソース行数」だけ空回りする。 */
+    int       is_dir;        /* ディレクティブの行か（pat_is_directive） */
+    int       setsym_const;  /* `.setsym` の値欄が定数式か（const_setsym_text）*/
+    int       setsym_done;   /* その値を評価済みか */
+    uint256_t setsym_val;    /* 評価した値 */
 } PatEntry;
 
 typedef struct {
@@ -1001,6 +1008,69 @@ typedef struct {
 } PatVec;
 
 static void pv_init(PatVec*v){v->data=NULL;v->len=0;v->cap=0;}
+/* パターン1行がディレクティブか（`EPIC` は大小無視）。
+ * 偽なら lineassemble2() のディレクティブ判定列は必ず全て 0 を返す。
+ * axx.py の _pat_is_directive() と同じ表である。 */
+static int pat_is_directive(const PatEntry *e){
+    static const char *tbl[] = {
+        ".setsym", ".clearsym", ".padding", ".bits", ".symbolc", ".vliw",
+        ".check", ".clrcheck", ".reloc", ".clrreloc", ".map", ".free",
+        ".passthru", ".eol", ".textmode", ".enum", ".clrenum", ".error", NULL };
+    if(!e || !e->f[0] || !e->f[0][0]) return 0;
+    const char *n = e->f[0];
+    for(int k=0; tbl[k]; k++) if(strcmp(n, tbl[k]) == 0) return 1;
+    /* axx_strupr_to() はこの位置ではまだ宣言されていないので、4文字だけ
+     * その場で大小無視で比べる。 */
+    if(n[0] && n[1] && n[2] && n[3] && !n[4]){
+        static const char epic[] = "EPIC";
+        int k = 0;
+        for(; k < 4; k++){
+            char c = n[k];
+            if(c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+            if(c != epic[k]) break;
+        }
+        if(k == 4) return 1;
+    }
+    return 0;
+}
+
+/* `.setsym` の値欄が「ソースの行によって変わりようのない定数式」か。
+ * パターン行の式はラベル・`$.`/`$$`・`#名前`・パターン変数・`'`・`@` を読めるので
+ * (マニュアル 6.3)、それらを書ける文字が1つでもあれば行ごとに値が変わりうる。
+ * 数字・16進・演算子・括弧しか無いならどの行で評価しても同じ値になる。
+ * axx.py の _CONST_SETSYM_RE と同じ判定である。 */
+static int const_setsym_text(const char *s){
+    if(!s || !s[0]) return 0;
+    int ok = 1;
+    for(const char *p=s; *p; p++){
+        if(isdigit((unsigned char)*p)) continue;
+        if(isspace((unsigned char)*p)) continue;
+        if(strchr("+-*/%()<>|&^~", *p)) continue;
+        ok = 0; break;
+    }
+    if(ok) return 1;
+    const char *p = s;
+    while(isspace((unsigned char)*p)) p++;
+    if(!(p[0]=='0' && (p[1]=='x'||p[1]=='X') && isxdigit((unsigned char)p[2]))) return 0;
+    p += 2;
+    while(isxdigit((unsigned char)*p)) p++;
+    while(isspace((unsigned char)*p)) p++;
+    return *p == '\0';
+}
+
+/* パターン表を読み終えた後に一度だけ呼ぶ。行ごとに変わらない性質を控える。 */
+static void pat_mark_static(PatVec *v){
+    for(int pi=0; pi<v->len; pi++){
+        PatEntry *e = &v->data[pi];
+        e->is_dir       = pat_is_directive(e);
+        e->setsym_const = (e->is_dir && strcmp(e->f[0], ".setsym") == 0
+                           && e->f[1] && e->f[1][0]
+                           && const_setsym_text(e->f[2]));
+        e->setsym_done  = 0;
+        e->setsym_val   = u256_zero();
+    }
+}
+
 static PatEntry *pv_push_blank(PatVec*v){
     if(v->len>=v->cap){v->cap=v->cap?v->cap*2:32;v->data=realloc(v->data,v->cap*sizeof(PatEntry));if(!v->data){perror("realloc");exit(1);}}
     PatEntry *e=&v->data[v->len++];
@@ -4701,7 +4771,15 @@ static int dir_set_symbol(Assembler *asmb, PatEntry *e){
         if(symbol_set_from_text(&asmb->st, key, value_field)) return 1;
     }
     int io;
-    uint256_t v = value_field[0] ? expr_expression_pat(asmb,value_field,0,&io) : u256_zero();
+    uint256_t v;
+    if(e->setsym_const){
+        /* 定数式なので、最初の1回だけ評価して使い回す。 */
+        if(!e->setsym_done){ e->setsym_val = expr_expression_pat(asmb,value_field,0,&io);
+                             e->setsym_done = 1; }
+        v = e->setsym_val;
+    } else {
+        v = value_field[0] ? expr_expression_pat(asmb,value_field,0,&io) : u256_zero();
+    }
     smap_set(&asmb->st.symbols,key,v);
     return 1;
 }
@@ -11196,6 +11274,11 @@ static int adir_done(Assembler *asmb, const char *l, const char *l2,
     return 1;
 }
 
+/* パターン変数表を空にする。照合と、パターン側の式の評価の直前に使う。 */
+#define PAT_VARS_CLEAR() \
+    do { for(int _vi=0;_vi<g_nvars;_vi++){ st->vars[_vi].val=u256_zero(); \
+             st->vars[_vi].is_undef=0; st->vars[_vi].text_off=-1; } } while(0)
+
 /* 作業用バッファは呼び出し元（lineassemble2）がソース行の長さに合わせて確保する。
  *
  * 破綻点修正: ここは l[1024] / l2[4096] / lin[8192] という固定長の自動変数で、
@@ -11351,12 +11434,21 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     BestMatch best;
     best_init(&best);
 
+    /* 照合にかける行。パターンごとに変わらないので、ループの外で1回だけ作る。 */
+    if(l2[0]) snprintf(lin,linsz,"%s %s",l,l2);
+    else      snprintf(lin,linsz,"%s",l);
+    axx_reduce_spaces(lin);
+
     for(int pi=0;pi<st->pat.len;pi++){
         PatEntry *i=&st->pat.data[pi];
         pln++;
-        for(int vi=0;vi<g_nvars;vi++){ st->vars[vi].val=u256_zero(); st->vars[vi].is_undef=0;
-                                       st->vars[vi].text_off=-1; }
 
+        /* ディレクティブでない行（＝普通のパターン）は、下の判定列が必ず全て
+         * 0 を返すので丸ごと飛ばす。 */
+        if(i->is_dir){
+        /* ディレクティブの値欄も式なので、パターン変数を読みうる
+         * （マニュアル 6.3）。評価の前に空にしておく。 */
+        PAT_VARS_CLEAR();
         if(dir_set_symbol(asmb,i)) continue;
         if(dir_clear_symbol(asmb,i)) continue;
         if(dir_padding(asmb,i)) continue;
@@ -11376,18 +11468,16 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         if(dir_enum(asmb,i)) continue;
         if(dir_clrenum(asmb,i)) continue;
         if(dir_errmsg(asmb,i)) continue;
+        }
 
         int lw=0; for(int fi=0;fi<PAT_FIELDS;fi++) if(i->f[fi][0]) lw++;
         if(lw==0) continue;
-
-        if(l2[0]) snprintf(lin,linsz,"%s %s",l,l2);
-        else      snprintf(lin,linsz,"%s",l);
-        axx_reduce_spaces(lin);
 
         if(!i->f[0][0]){
             hit_sentinel=1;
             if(!best.valid){
                 int io2;
+                PAT_VARS_CLEAR();
                 uint256_t idxv2=expr_expression_pat(asmb,i->f[3],0,&io2);
                 idxs_val=(int)u256_to_i64(idxv2);
             }
@@ -11395,6 +11485,10 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         }
 
         if(!pat_prefix_matches(i->f[0], lin)) continue;
+
+        /* ここから先が本当の照合。先頭一致で捨てた分は初期化しなくてよい
+         * （変数表は照合と値欄の評価の直前にだけ空であればよい）。 */
+        PAT_VARS_CLEAR();
 
         st->error_undefined_label=0;
         st->expmode=EXP_ASM;
@@ -15867,6 +15961,9 @@ int main(int argc, char *argv[]){
     }
 
     readpat(asmb,patternfile);
+    /* 行ごとに変わらない性質（ディレクティブか、`.setsym` の値が定数か）を
+     * ここで一度だけ控える。以降 st->pat は増減しない。 */
+    pat_mark_static(&st->pat);
     /* 破綻点修正: パターンファイルが読めなかった場合、readpat() はエラーを
      * 報告して空のパターン表のまま戻るが、そのまま組み立てに進んでいたため、
      * 全ソース行が「どのパターンにも一致しない」となり偽の "Syntax error" が
