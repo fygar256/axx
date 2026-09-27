@@ -1150,7 +1150,7 @@ enum {
     PD_VLIW, PD_CHECK, PD_CLRCHECK, PD_RELOC, PD_CLRRELOC, PD_MAP, PD_FREE,
     PD_PASSTHRU, PD_EOL, PD_TEXTMODE, PD_ENUM, PD_CLRENUM, PD_ERRMSG, PD_EPIC,
     PD_ELFTYPE, PD_ELFMACHINE, PD_ELFCLASS, PD_ELFRELA, PD_ELFWIDTH,
-    PD_ELFEXTERN, PD_ELFDWARF, PD_ELFHEADER, PD_ECHO
+    PD_ELFEXTERN, PD_ELFDWARF, PD_ELFHEADER, PD_ELFSECTION, PD_ECHO
 };
 
 static int pat_dir_kind(const PatEntry *e){
@@ -1168,7 +1168,8 @@ static int pat_dir_kind(const PatEntry *e){
         { ".elfmachine", PD_ELFMACHINE }, { ".elfclass", PD_ELFCLASS },
         { ".elfrela", PD_ELFRELA }, { ".elfwidth", PD_ELFWIDTH },
         { ".elfextern", PD_ELFEXTERN }, { ".elfdwarf", PD_ELFDWARF },
-        { ".elfheader", PD_ELFHEADER }, { ".echo", PD_ECHO }, { NULL, 0 } };
+        { ".elfheader", PD_ELFHEADER }, { ".elfsection", PD_ELFSECTION },
+        { ".echo", PD_ECHO }, { NULL, 0 } };
     if(!e || !e->f[0] || !e->f[0][0]) return PD_NONE;
     const char *n = e->f[0];
     for(int k=0; tbl[k].name; k++) if(strcmp(n, tbl[k].name) == 0) return tbl[k].kind;
@@ -1193,7 +1194,7 @@ static int pat_is_directive(const PatEntry *e){
         ".check", ".clrcheck", ".reloc", ".clrreloc", ".map", ".free",
         ".passthru", ".eol", ".textmode", ".enum", ".clrenum", ".error",
         ".elftype", ".elfmachine", ".elfclass", ".elfrela", ".elfwidth",
-        ".elfextern", ".elfdwarf", ".elfheader", ".echo", NULL };
+        ".elfextern", ".elfdwarf", ".elfheader", ".elfsection", ".echo", NULL };
     if(!e || !e->f[0] || !e->f[0][0]) return 0;
     const char *n = e->f[0];
     for(int k=0; tbl[k]; k++) if(strcmp(n, tbl[k]) == 0) return 1;
@@ -1664,6 +1665,7 @@ static int pat_dir_line_invariant(const PatEntry *e){
     case PD_SYMBOLC: case PD_PASSTHRU: case PD_EOL: case PD_TEXTMODE:
     case PD_ELFMACHINE: case PD_ELFCLASS: case PD_ELFRELA: case PD_ELFWIDTH:
     case PD_ELFEXTERN: case PD_ELFDWARF: case PD_ELFHEADER:
+    case PD_ELFSECTION:
         /* どれも名前や型名の文字どおりの並びだけを見る（式を読まない）。
          * 変数名の小文字は普通なので pat_text_dynamic は使わない。 */
         for(int i=1;i<PAT_FIELDS;i++)
@@ -2197,6 +2199,12 @@ typedef struct {
     char      *elf_decl_dwarf;     /* .elfdwarf の型欄 */
     int        elf_hdr_set[ELF_HDR_NFIELD];  /* .elfheader で書いた欄か */
     uint64_t   elf_hdr_val[ELF_HDR_NFIELD];  /* その値 */
+
+    /* `.elfsection::<名前>::<flags>[::<型>]` で決めたセクションの属性
+     * （マニュアル 3.7.7 節）。名前は書いたままを持ち、引くときだけ大小を
+     * 区別しない。type_set が 0 の行は sh_flags だけを決める。 */
+    struct { char *name; uint32_t flags; int type_set; uint32_t type; } *elf_secs;
+    int        elf_secs_len, elf_secs_cap;
     int        elf_machine_from_cli;  /* -m を明示したか */
     long       elf_decl_gen;       /* 宣言が変わるたびに増える（控えの鍵） */
 
@@ -2692,6 +2700,22 @@ static int elf_machine_is_pcrel(const ElfMachineInfo *m, int rtype){
     return 0;
 }
 
+/* 実効表の先頭から、欄の幅が nbytes で PC 相対性が want_pcrel の型を探す。
+ * 無ければ 0。幅からの既定型の PC 相対性が欄の中身と食い違っていたときの
+ * 取り替え先を引くのに使う。型名でも型番号でもなく「幅と PC 相対性」で引くので、
+ * 組み込みの表を持たない、パターンファイルで宣言したマシンでも同じように働く。
+ * 実効表の並びは両実装で同じなので、先頭から探した結果も同じである。
+ * axx.py の _reloc_same_width() と同じ規則である。 */
+static int elf_reloc_same_width(const ElfMachineInfo *m, int nbytes, int want_pcrel){
+    if(!m) return 0;
+    for(int i=0; m->named[i].name; i++){
+        if(m->named[i].width != nbytes) continue;
+        if(elf_machine_is_pcrel(m, m->named[i].rtype) == (want_pcrel ? 1 : 0))
+            return m->named[i].rtype;
+    }
+    return 0;
+}
+
 static int elf_machine_width_guess(const ElfMachineInfo *m, int nbytes){
     if(!m) return 0;
     switch(nbytes){
@@ -3003,6 +3027,7 @@ static void state_init(AsmState *st) {
     st->elf_decl_extern = NULL;
     st->elf_decl_dwarf = NULL;
     for(int _hi=0;_hi<ELF_HDR_NFIELD;_hi++){ st->elf_hdr_set[_hi]=0; st->elf_hdr_val[_hi]=0; }
+    st->elf_secs = NULL; st->elf_secs_len = 0; st->elf_secs_cap = 0;
     st->elf_machine_from_cli = 0;
     st->elf_decl_gen = 0;
     for(int _ci=0; _ci<NVARS; _ci++) enumdef_init(&st->enum_defs[_ci]);
@@ -6446,6 +6471,95 @@ static int dir_elfheader(Assembler *asmb, PatEntry *e){
         st->elf_decl_gen++;
     }
     return 1;
+}
+
+/* `.elfsection` の宣言を据える。同じ名前があれば書き換える（後の宣言が勝つ）。 */
+static void elf_sec_set(AsmState *st, const char *name, uint32_t flags,
+                        int type_set, uint32_t type){
+    for(int i=0;i<st->elf_secs_len;i++)
+        if(strcasecmp(st->elf_secs[i].name, name)==0){
+            if(st->elf_secs[i].flags != flags
+               || st->elf_secs[i].type_set != type_set
+               || st->elf_secs[i].type != type){
+                st->elf_secs[i].flags    = flags;
+                st->elf_secs[i].type_set = type_set;
+                st->elf_secs[i].type     = type;
+                st->elf_decl_gen++;
+            }
+            return;
+        }
+    if(st->elf_secs_len >= st->elf_secs_cap){
+        st->elf_secs_cap = st->elf_secs_cap ? st->elf_secs_cap*2 : 4;
+        st->elf_secs = realloc(st->elf_secs,
+                               (size_t)st->elf_secs_cap*sizeof(*st->elf_secs));
+        if(!st->elf_secs){ perror("realloc"); exit(1); }
+    }
+    st->elf_secs[st->elf_secs_len].name = strdup(name);
+    if(!st->elf_secs[st->elf_secs_len].name){ perror("strdup"); exit(1); }
+    st->elf_secs[st->elf_secs_len].flags    = flags;
+    st->elf_secs[st->elf_secs_len].type_set = type_set;
+    st->elf_secs[st->elf_secs_len].type     = type;
+    st->elf_secs_len++;
+    st->elf_decl_gen++;
+}
+
+/* セクション名から `.elfsection` の宣言を引く。無ければ -1。名前の大小は
+ * 区別しない。axx.py の _elf_sec_decl() と同じ規則である。 */
+static int elf_sec_find(const AsmState *st, const char *name){
+    for(int i=0;i<st->elf_secs_len;i++)
+        if(strcasecmp(st->elf_secs[i].name, name)==0) return i;
+    return -1;
+}
+
+/* `.elfsection::<名前>::<sh_flags>[::<sh_type>]` — セクションヘッダの属性。
+ *
+ * 書かなかったセクションは従来どおり名前から決まる（`.text` は
+ * SHF_ALLOC|SHF_EXECINSTR、`.data` と `.bss` は SHF_ALLOC|SHF_WRITE、
+ * `.rodata` とそれ以外は SHF_ALLOC、型は `.bss` だけ SHT_NOBITS で他は
+ * SHT_PROGBITS）。名前で決まる規則を持たない、その機種固有のセクションを
+ * 出すための宣言である。axx.py の elfsection_processing() と同じ規則である。 */
+static int dir_elfsection(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".elfsection") != 0) return 0;
+    AsmState *st = &asmb->st;
+    const char *name_str = e->f[1][0] ? e->f[1] : e->f[2];
+    const char *flag_str = e->f[1][0] ? e->f[2] : "";
+    char nm[128]; elf_decl_trim(nm, sizeof(nm), name_str);
+    if(!nm[0]){
+        axx_diagf(1, 0, " error - .elfsection: section name is not specified.\n");
+        return 1;
+    }
+    long long fl;
+    if(!elf_decl_num(asmb, ".elfsection", flag_str, 0, 0xFFFFFFFFll, &fl)) return 1;
+    int type_set = 0; long long ty = 0;
+    if(e->f[3][0]){
+        if(!elf_decl_num(asmb, ".elfsection", e->f[3], 0, 0xFFFFFFFFll, &ty)) return 1;
+        type_set = 1;
+    }
+    elf_sec_set(st, nm, (uint32_t)fl, type_set, (uint32_t)ty);
+    return 1;
+}
+
+/* セクションの sh_flags と sh_type を決める。`.elfsection` の宣言があれば
+ * それを使い、無ければ名前の前方一致で決める従来の規則に従う。
+ * axx.py の _elf_section_attrs() と同じ規則である。 */
+static void elf_section_attrs(const AsmState *st, const char *name,
+                              uint64_t *flags, uint32_t *shtype){
+    char un[64]; int ui=0;
+    for(;name[ui]&&ui<63;ui++) un[ui]=(char)axx_upper_char(name[ui]);
+    un[ui]=0;
+    uint64_t fl;
+    if     (strncmp(un,".TEXT",5)==0)   fl=0x2|0x4;
+    else if(strncmp(un,".DATA",5)==0)   fl=0x2|0x1;
+    else if(strncmp(un,".RODATA",7)==0) fl=0x2;
+    else if(strncmp(un,".BSS",4)==0)    fl=0x2|0x1;
+    else                                fl=0x2;
+    uint32_t sht = (strncmp(un,".BSS",4)==0) ? 8u : 1u;
+    int k = elf_sec_find(st, name);
+    if(k >= 0){
+        fl = st->elf_secs[k].flags;
+        if(st->elf_secs[k].type_set) sht = st->elf_secs[k].type;
+    }
+    *flags = fl; *shtype = sht;
 }
 
 static int dir_reloc(Assembler *asmb, PatEntry *e){
@@ -13150,6 +13264,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         case PD_ELFEXTERN:_dir_done = dir_elfextern(asmb,i);     break;
         case PD_ELFDWARF: _dir_done = dir_elfdwarf(asmb,i);      break;
         case PD_ELFHEADER:_dir_done = dir_elfheader(asmb,i);     break;
+        case PD_ELFSECTION:_dir_done = dir_elfsection(asmb,i);    break;
         default: break;
         }
         if(_dir_done) continue;
@@ -13680,15 +13795,27 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                 /* `.reloc` が宣言された変数が運んだ参照は、命令語のビット欄に値が
                  * 詰まっていて出力バイト列から加数を逆算できない。型と加数は宣言側
                  * で決まっているので、通常の推定経路を通さずに出す。 */
+                /* リロケーション型の優先順位は
+                 *   既定（幅からの推定） < パターンファイルの `.reloc`
+                 *   < ソースファイルの `::型名`
+                 * である。ソースが型を書いていれば、`.reloc` が宣言した型より
+                 * そちらが勝つ（値が命令語のビット欄に入っているという `.reloc`
+                 * 側の知識と加数はそのまま使う）。axx.py の同じ箇所と同じ規則で
+                 * ある。 */
+                LabelEntry *_le_rt = lmap_find(&st->labels, _lname);
+                int _src_rtype = (_le_rt && _le_rt->reloc_type_override >= 0)
+                               ? _le_rt->reloc_type_override : -1;
+
                 int _forced_rtype = 0;
                 if(_valid[_gi].rtype > 0){
-                    uint32_t _fmask = insn_reloc_field_mask(_valid[_gi].rtype, st->elf_machine);
+                    int _hint_rtype = (_src_rtype >= 0) ? _src_rtype : _valid[_gi].rtype;
+                    uint32_t _fmask = insn_reloc_field_mask(_hint_rtype, st->elf_machine);
                     if(_fmask == 0){
                         /* データ型を宣言した場合。加数は通常どおり出力バイト列
                          * から求まるので、型だけを固定して下の経路へ渡す。 */
-                        _forced_rtype = _valid[_gi].rtype;
+                        _forced_rtype = _hint_rtype;
                     } else {
-                        int _ibytes = elf_machine_reloc_bytes(_mtbl_rm, _valid[_gi].rtype);
+                        int _ibytes = elf_machine_reloc_bytes(_mtbl_rm, _hint_rtype);
                         if(_ibytes <= 0) _ibytes = 4;
                         int _iwords = _ibytes / bpw;
                         if(_iwords < 1) _iwords = 1;
@@ -13720,7 +13847,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         st->relocations[st->reloc_count].section    = strdup(sec_name);
                         st->relocations[st->reloc_count].sec_offset = _sec_rel_h;
                         st->relocations[st->reloc_count].sym        = strdup(_lname);
-                        st->relocations[st->reloc_count].rtype      = _valid[_gi].rtype;
+                        st->relocations[st->reloc_count].rtype      = _hint_rtype;
                         st->relocations[st->reloc_count].addend     = _valid[_gi].addend;
                         st->relocations[st->reloc_count].nbytes     = _ibytes;
                         st->reloc_count++;
@@ -13734,9 +13861,8 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                 if(_forced_rtype > 0){
                     _rtype = _forced_rtype;
                 } else {
-                    LabelEntry *_le = lmap_find(&st->labels, _lname);
-                    if(_le && _le->reloc_type_override >= 0){
-                        int _rt_ov = _le->reloc_type_override;
+                    if(_src_rtype >= 0){
+                        int _rt_ov = _src_rtype;
                         int _expected = elf_machine_reloc_bytes(_mtbl_rm, _rt_ov);
                         if(_expected == 0 || _expected == _nbytes)
                             _rtype = _rt_ov;
@@ -13797,37 +13923,33 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     }
                     int64_t _abs_w_bytes = (int64_t)_valid[_gi].val * (int64_t)bpw;
 
-                    if(_rtype_is_default_guess && st->elf_machine == 62
+                    /* 幅からの既定型を使ったとき、その型の PC 相対性が欄の
+                     * 中身と食い違うことがある。欄に入っているのがラベルの
+                     * 絶対値そのものなら、その型は PC 相対ではありえないので、
+                     * 同じ幅の絶対型に取り替える。取り替え先は実効表の先頭から
+                     * 「同じ幅で PC 相対でない型」を引いたもので、マシン番号も
+                     * 型番号も埋め込まない。組み込みの表を持つ 11 機種では
+                     * abs64/abs32/abs16/abs8 が表の先頭に並んでいるので
+                     * 従来と同じ型が引かれ、パターンファイルで宣言したマシンでも
+                     * `.elftype` の宣言順どおりに引ける。
+                     * axx.py の同じ箇所と同じ規則である。 */
+                    if(_rtype_is_default_guess
                        && elf_machine_is_pcrel(_mtbl_rm, _rtype)
                        && (int64_t)_raw_val == _abs_w_bytes){
-                        /* 破綻点修正: 4バイト幅（PC32→abs32=10）しか判定して
-                         * いなかったため、.RELOCTYPE でデフォルト型を
-                         * pc64/pc16/pc8 相当に変えた上でこの自動判定に
-                         * 掛かった場合、8/2/1バイト幅では絶対値型への
-                         * 差し替えが起きず axx.py と食い違っていた。 */
-                        switch(_nbytes){
-                            case 8: _rtype = 1;  break;
-                            case 4: _rtype = 10; break;
-                            case 2: _rtype = 12; break;
-                            case 1: _rtype = 14; break;
-                        }
+                        int _alt = elf_reloc_same_width(_mtbl_rm, _nbytes, 0);
+                        if(_alt > 0) _rtype = _alt;
                     }
 
-                    if(_rtype_is_default_guess && st->elf_machine == 4){
-                        int _is_pcrel_guess_m68k = elf_machine_is_pcrel(_mtbl_rm, _rtype);
-                        if(_is_pcrel_guess_m68k && (int64_t)_raw_val == _abs_w_bytes){
-                            switch(_nbytes){
-                                case 4: _rtype = 1; break;
-                                case 2: _rtype = 2; break;
-                                case 1: _rtype = 3; break;
-                            }
-                        } else if(!_is_pcrel_guess_m68k && (int64_t)_raw_val != _abs_w_bytes){
-                            switch(_nbytes){
-                                case 4: _rtype = 4; break;
-                                case 2: _rtype = 5; break;
-                                case 1: _rtype = 6; break;
-                            }
-                        }
+                    /* 逆向き（既定型が絶対型なのに欄の中身がラベルの値と違う
+                     * ので PC 相対型に取り替える）は m68k だけに掛ける。この
+                     * 判定は「加数の付いた絶対参照」（`dq label+8` など）と
+                     * 見分けが付かないので、他のマシンへは広げない。
+                     * 取り替え先の型番号は上と同じく実効表から引く。 */
+                    if(_rtype_is_default_guess && st->elf_machine == 4
+                       && !elf_machine_is_pcrel(_mtbl_rm, _rtype)
+                       && (int64_t)_raw_val != _abs_w_bytes){
+                        int _alt = elf_reloc_same_width(_mtbl_rm, _nbytes, 1);
+                        if(_alt > 0) _rtype = _alt;
                     }
 
                     int64_t _addend;
@@ -13958,7 +14080,7 @@ static char *file_input_from_stdin(void){
 
 
 typedef struct { uint8_t*b; size_t len,cap; } WBB;
-typedef struct { const char*name; uint64_t bs,bsz,fl; uint8_t*data; } WCS;
+typedef struct { const char*name; uint64_t bs,bsz,fl; uint8_t*data; uint32_t sht; } WCS;
 typedef struct { uint16_t shndx; uint64_t sv; } WSR;
 typedef struct { int64_t off; const char*sym; int rtype; int64_t addend; int nbytes; } WRE;
 typedef struct { WRE*data; int len,cap; } WRL;
@@ -14112,11 +14234,11 @@ static int weo_symof(WSNI*snimap,int snimap_len,const char*nm){
     return 0;
 }
 
+/* ファイルに中身を持たないセクション（SHT_NOBITS）か。従来は名前が `.bss`
+ * で始まるかだけを見ていたが、`.elfsection` で型を宣言できるようになったので、
+ * 決まった sh_type に従う。axx.py の同じ判定と同じ規則である。 */
 static int weo_isno(WCS*csecs,int i){
-    char _n[64]; int _j=0;
-    for(;csecs[i].name[_j]&&_j<63;_j++) _n[_j]=(char)axx_upper_char(csecs[i].name[_j]);
-    _n[_j]=0;
-    return strncmp(_n,".BSS",4)==0;
+    return csecs[i].sht == 8u;
 }
 
 static void weo_pad(FILE*f,uint64_t t){
@@ -14229,24 +14351,19 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     if(st->sections.count==0){
         ncs=1; csecs=calloc(1,sizeof(WCS));
         uint64_t wn=have_w?max_w+1:0;
-        csecs[0]=(WCS){".text",0,wn*(uint64_t)bpw,0x2|0x4,weo_extract(st,bpw,0,wn)};
+        uint64_t _fl0; uint32_t _sht0;
+        elf_section_attrs(st, ".text", &_fl0, &_sht0);
+        csecs[0]=(WCS){".text",0,wn*(uint64_t)bpw,_fl0,weo_extract(st,bpw,0,wn),_sht0};
     } else {
         ncs=st->sections.count; csecs=calloc((size_t)ncs,sizeof(WCS));
         for(int i=0;i<ncs;i++){
             SecEntry *se=st->sections.order[i];
             uint64_t w0=u256_to_u64(se->start);
-            char un[64]; int ui=0;
-            for(;se->name[ui]&&ui<63;ui++) un[ui]=(char)axx_upper_char(se->name[ui]);
-            un[ui]=0;
-            uint64_t fl;
-            if     (strncmp(un,".TEXT",5)==0)   fl=0x2|0x4;
-            else if(strncmp(un,".DATA",5)==0)   fl=0x2|0x1;
-            else if(strncmp(un,".RODATA",7)==0) fl=0x2;
-            else if(strncmp(un,".BSS",4)==0)    fl=0x2|0x1;
-            else                                fl=0x2;
+            uint64_t fl; uint32_t _sht;
+            elf_section_attrs(st, se->name, &fl, &_sht);
             uint64_t _nb;
             uint8_t *_data = weo_extract_ranges(st, bpw, se->name, &_nb);
-            csecs[i]=(WCS){se->name,w0*(uint64_t)bpw,_nb,fl,_data};
+            csecs[i]=(WCS){se->name,w0*(uint64_t)bpw,_nb,fl,_data,_sht};
         }
     }
 
@@ -14672,13 +14789,8 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     weo_pad(fp,shdr_fo);
 
     weo_shdr(fp,_is_le,_is_elf64,0,0,0,0,0,0,0,0,0,0);
-    for(int i=0;i<ncs;i++){
-        char _un[64]; int _ui=0;
-        for(;csecs[i].name[_ui]&&_ui<63;_ui++) _un[_ui]=(char)axx_upper_char(csecs[i].name[_ui]);
-        _un[_ui]=0;
-        uint32_t _sh_type = (strncmp(_un,".BSS",4)==0) ? 8 : 1;
-        weo_shdr(fp,_is_le,_is_elf64,sec_noff[i],_sh_type,csecs[i].fl,0,sec_fo[i],csecs[i].bsz,0,0,16,0);
-    }
+    for(int i=0;i<ncs;i++)
+        weo_shdr(fp,_is_le,_is_elf64,sec_noff[i],csecs[i].sht,csecs[i].fl,0,sec_fo[i],csecs[i].bsz,0,0,16,0);
     {
     uint32_t _word_align = _is_elf64?8:4;
     uint32_t _rel_sh_type = _is_rela_w?4:9;
@@ -17251,6 +17363,7 @@ static void register_elfdecls(Assembler *asmb){
         case PD_ELFEXTERN:  dir_elfextern(asmb, e);   break;
         case PD_ELFDWARF:   dir_elfdwarf(asmb, e);    break;
         case PD_ELFHEADER:  dir_elfheader(asmb, e);   break;
+        case PD_ELFSECTION: dir_elfsection(asmb, e);  break;
         default: break;
         }
     }

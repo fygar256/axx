@@ -316,7 +316,7 @@ def _lead_caps(pat_text):
 _HOIST_TEXT_ONLY = ('.check', '.clrcheck', '.reloc', '.clrreloc',
                     '.symbolc', '.passthru', '.eol', '.textmode',
                     '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
-                    '.elfextern', '.elfdwarf', '.elfheader')
+                    '.elfextern', '.elfdwarf', '.elfheader', '.elfsection')
 
 
 def _pat_text_dynamic(t):
@@ -997,6 +997,52 @@ def elf_machine_table(state):
     return tbl
 
 
+def _reloc_same_width(mach, nbytes, want_pcrel):
+    """実効表の先頭から、欄の幅が nbytes で PC 相対性が want_pcrel の型を探す。
+
+    幅からの既定型の PC 相対性が欄の中身と食い違っていたときの取り替え先を引く
+    のに使う。型名でも型番号でもなく「幅と PC 相対性」で引くので、組み込みの表を
+    持たない、パターンファイルで宣言したマシンでも同じように働く。実効表の並びは
+    両実装で同じなので、先頭から探した結果も同じである。
+    caxx.c の elf_reloc_same_width() と同じ規則である。
+    """
+    if not mach:
+        return None
+    for _nm, rt in mach['named'].items():
+        if mach['reloc_bytes'].get(rt, 0) != nbytes:
+            continue
+        if (rt in mach['pc_rel']) == bool(want_pcrel):
+            return rt
+    return None
+
+
+def _elf_section_attrs(state, name):
+    """セクションの (sh_flags, sh_type) を決める。
+
+    `.elfsection::<名前>::<flags>[::<型>]`（マニュアル 3.7.7 節）で宣言があれば
+    それを使い、無ければ名前の前方一致で決める従来の規則に従う。
+    caxx.c の elf_section_attrs() と同じ規則である。
+    """
+    uname = name.upper()
+    if   uname.startswith('.TEXT'):
+        flags = 0x2 | 0x4
+    elif uname.startswith('.DATA'):
+        flags = 0x2 | 0x1
+    elif uname.startswith('.RODATA'):
+        flags = 0x2
+    elif uname.startswith('.BSS'):
+        flags = 0x2 | 0x1
+    else:
+        flags = 0x2
+    sh_type = 8 if uname.startswith('.BSS') else 1
+    decl = state.elf.decl_sec.get(name.lower())
+    if decl is not None:
+        flags = decl[0]
+        if decl[1] is not None:
+            sh_type = decl[1]
+    return flags, sh_type
+
+
 def _reloc_named(state, mach, name):
     """型名を型番号にする。無ければ None。
 
@@ -1133,6 +1179,7 @@ class ElfState:
         self.decl_extern = ''      # `.elfextern` 型欄の文字列
         self.decl_dwarf = ''       # `.elfdwarf` 型欄の文字列
         self.decl_hdr = {}         # `.elfheader` 欄名 → 値
+        self.decl_sec = {}         # `.elfsection` 名前(小文字) → (sh_flags, sh_type|None)
         self.type_width = {}       # `.elftype` の幅欄（型名 → バイト幅）
         self.type_pcrel = set()    # `.elftype` の PC 相対欄が立った型名
         self.decl_gen = 0          # 宣言が変わるたびに増える（控えの鍵）
@@ -4557,6 +4604,38 @@ class DirectiveProcessor:
             e.decl_gen += 1
         return True
 
+    def elfsection_processing(self, i):
+        """`.elfsection::<名前>::<sh_flags>[::<sh_type>]` — セクションヘッダの属性。
+
+        書かなかったセクションは従来どおり名前から決まる（`.text` は
+        SHF_ALLOC|SHF_EXECINSTR、`.data` と `.bss` は SHF_ALLOC|SHF_WRITE、
+        `.rodata` とそれ以外は SHF_ALLOC、型は `.bss` だけ SHT_NOBITS で他は
+        SHT_PROGBITS）。名前で決まる規則を持たない、その機種固有のセクションを
+        出すための宣言である。caxx.c の dir_elfsection() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.elfsection':
+            return False
+        _nf, _ff = self._elf_decl_fields(i)
+        nm = _nf.strip()
+        if not nm:
+            self.state.diag(" error - .elfsection: section name is not specified.",
+                            set_error=True)
+            return True
+        fl = self._elf_decl_num('.elfsection', _ff, 0, 0xFFFFFFFF)
+        if fl is None:
+            return True
+        ty = None
+        if len(i) > 3 and i[3] and i[3].strip():
+            ty = self._elf_decl_num('.elfsection', i[3], 0, 0xFFFFFFFF)
+            if ty is None:
+                return True
+        e = self.state.elf
+        key = nm.lower()
+        if e.decl_sec.get(key) != (fl, ty):
+            e.decl_sec[key] = (fl, ty)
+            e.decl_gen += 1
+        return True
+
     def reloc_processing(self, i):
         """`.reloc::<変数>::<型名>`
 
@@ -5005,7 +5084,7 @@ _PAT_DIRECTIVES = frozenset((
     '.passthru', '.eol', '.textmode', '.enum', '.clrenum', '.error',
     '.echo',
     '.elftype', '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
-    '.elfextern', '.elfdwarf', '.elfheader'))
+    '.elfextern', '.elfdwarf', '.elfheader', '.elfsection'))
 
 
 # `.setsym` の値欄が「ソースの行によって変わりようのない定数式」か。
@@ -11241,9 +11320,21 @@ class Assembler:
                     # 値が詰まっていて出力バイト列から加数を逆算できない。型と加数
                     # は宣言側で決まっているので、通常の推定経路を通さずに出す。
                     _hint = self.state._elf_insn_reloc_hint.get(first_widx)
+                    lentry = self.state.labels.get(lname)
+                    # リロケーション型の優先順位は
+                    #   既定（幅からの推定） < パターンファイルの `.reloc`
+                    #   < ソースファイルの `::型名`
+                    # である。ソースが型を書いていれば、`.reloc` が宣言した型より
+                    # そちらが勝つ（値が命令語のビット欄に入っているという
+                    # `.reloc` 側の知識と加数はそのまま使う）。caxx.c の同じ箇所
+                    # と同じ規則である。
+                    _src_rtype = lentry[4] if (lentry and len(lentry) > 4
+                                               and lentry[4] is not None) else None
                     _forced_rtype = None
                     if _hint is not None:
                         _hint_rtype, _hint_addend = _hint
+                        if _src_rtype is not None:
+                            _hint_rtype = _src_rtype
                         _fmask = insn_reloc_field_mask(_hint_rtype, self.state.elf_machine)
                         if _fmask is None:
                             # データ型を宣言した場合。加数は通常どおり出力バイト列
@@ -11270,11 +11361,10 @@ class Assembler:
 
                     rtype = 0
                     _rtype_is_default_guess = False
-                    lentry = self.state.labels.get(lname)
                     if _forced_rtype is not None:
                         rtype = _forced_rtype
-                    elif lentry and len(lentry) > 4 and lentry[4] is not None:
-                        rtype_override = lentry[4]
+                    elif _src_rtype is not None:
+                        rtype_override = _src_rtype
                         expected = _mach_tbl_la['reloc_bytes'].get(rtype_override)
                         if expected is None or expected == num_bytes:
                             rtype = rtype_override
@@ -11323,18 +11413,32 @@ class Assembler:
 
                     abs_w_bytes = int(abs_w) * bpw_r
 
+                    # 幅からの既定型を使ったとき、その型の PC 相対性が欄の中身と
+                    # 食い違うことがある。欄に入っているのがラベルの絶対値そのもの
+                    # なら、その型は PC 相対ではありえないので、同じ幅の絶対型に
+                    # 取り替える。取り替え先は実効表の先頭から「同じ幅で PC 相対で
+                    # ない型」を引いたもので、マシン番号も型番号も埋め込まない。
+                    # 組み込みの表を持つ 11 機種では abs64/abs32/abs16/abs8 が表の
+                    # 先頭に並んでいるので従来と同じ型が引かれ、パターンファイルで
+                    # 宣言したマシンでも `.elftype` の宣言順どおりに引ける。
+                    # caxx.c の同じ箇所と同じ規則である。
                     if (_rtype_is_default_guess and rtype in _pc_rel_types_all
-                            and raw_val == abs_w_bytes and self.state.elf_machine == 62):
-                        _rmap_abs_default = {8: 1, 4: 10, 2: 12, 1: 14}
-                        rtype = _rmap_abs_default.get(num_bytes, rtype)
+                            and raw_val == abs_w_bytes):
+                        _alt = _reloc_same_width(_mach_tbl_la, num_bytes, False)
+                        if _alt is not None:
+                            rtype = _alt
 
-                    if _rtype_is_default_guess and self.state.elf_machine == 4:
-                        _m68k_abs_default = {4: 1, 2: 2, 1: 3}
-                        _m68k_pc_default = {4: 4, 2: 5, 1: 6}
-                        if rtype in _pc_rel_types_all and raw_val == abs_w_bytes:
-                            rtype = _m68k_abs_default.get(num_bytes, rtype)
-                        elif rtype not in _pc_rel_types_all and raw_val != abs_w_bytes:
-                            rtype = _m68k_pc_default.get(num_bytes, rtype)
+                    # 逆向き（既定型が絶対型なのに欄の中身がラベルの値と違うので
+                    # PC 相対型に取り替える）は m68k だけに掛ける。この判定は
+                    # 「加数の付いた絶対参照」（`dq label+8` など）と見分けが
+                    # 付かないので、他のマシンへは広げない。取り替え先の型番号は
+                    # 上と同じく実効表から引く。
+                    if (_rtype_is_default_guess and self.state.elf_machine == 4
+                            and rtype not in _pc_rel_types_all
+                            and raw_val != abs_w_bytes):
+                        _alt = _reloc_same_width(_mach_tbl_la, num_bytes, True)
+                        if _alt is not None:
+                            rtype = _alt
 
                     if rtype in _pc_rel_types_all:
                         _P_raw = (self.state.pc + first_widx) * bpw_r
@@ -11400,7 +11504,8 @@ class Assembler:
 
     # パターン表から先に拾う ELF 宣言（マニュアル 3.7.7 節）→ 処理する関数名。
     _ELF_DECL_DIRECTIVES = ('.elftype', '.elfmachine', '.elfclass', '.elfrela',
-                            '.elfwidth', '.elfextern', '.elfdwarf', '.elfheader')
+                            '.elfwidth', '.elfextern', '.elfdwarf', '.elfheader',
+                            '.elfsection')
 
     def register_elfdecls(self, pat):
         """パターン表の ELF 宣言を、組み立てを始める前に一度そろえて登録する。
@@ -11421,6 +11526,7 @@ class Assembler:
             '.elfextern':  d.elfextern_processing,
             '.elfdwarf':   d.elfdwarf_processing,
             '.elfheader':  d.elfheader_processing,
+            '.elfsection': d.elfsection_processing,
         }
         for i in pat:
             if i and i[0] in table:
@@ -12092,21 +12198,24 @@ class Assembler:
             return bytes(data)
 
         class _CSec:
-            __slots__ = ('name', 'byte_start', 'data', 'byte_size', 'flags')
+            __slots__ = ('name', 'byte_start', 'data', 'byte_size', 'flags',
+                         'sh_type')
 
-            def __init__(self, name, byte_start, data, flags):
+            def __init__(self, name, byte_start, data, flags, sh_type):
                 self.name       = name
                 self.byte_start = byte_start
                 self.data       = data
                 self.byte_size  = len(data)
                 self.flags      = flags
+                self.sh_type    = sh_type
 
         csecs = []
         max_w = max(buf.keys(), default=-1)
 
         if not self.state.sections:
             w_count = max_w + 1 if max_w >= 0 else 0
-            csecs.append(_CSec('.text', 0, _extract(0, w_count), 0x2 | 0x4))
+            _fl0, _sht0 = _elf_section_attrs(self.state, '.text')
+            csecs.append(_CSec('.text', 0, _extract(0, w_count), _fl0, _sht0))
         else:
             sec_names = list(self.state.sections.keys())
             for i, sname in enumerate(sec_names):
@@ -12115,18 +12224,8 @@ class Assembler:
                 w0 = ranges[0][0] if ranges else self.state.sections[sname][0]
                 byte_start = w0 * bpw
                 data = b''.join(_extract(rs, rl) for rs, rl in ranges)
-                uname = sname.upper()
-                if   uname.startswith('.TEXT'):
-                    flags = 0x2 | 0x4
-                elif uname.startswith('.DATA'):
-                    flags = 0x2 | 0x1
-                elif uname.startswith('.RODATA'):
-                    flags = 0x2
-                elif uname.startswith('.BSS'):
-                    flags = 0x2 | 0x1
-                else:
-                    flags = 0x2
-                csecs.append(_CSec(sname, byte_start, data, flags))
+                flags, _sht = _elf_section_attrs(self.state, sname)
+                csecs.append(_CSec(sname, byte_start, data, flags, _sht))
 
         ncs = len(csecs)
 
@@ -12347,7 +12446,11 @@ class Assembler:
             rela_datas.append(data)
 
         def _is_nobits(s):
-            return s.name.upper().startswith('.BSS')
+            # ファイルに中身を持たないセクション（SHT_NOBITS）か。従来は名前が
+            # `.bss` で始まるかだけを見ていたが、`.elfsection` で型を宣言できる
+            # ようになったので、決まった sh_type に従う。caxx.c の weo_isno() と
+            # 同じ規則である。
+            return s.sh_type == 8
 
         offset = _ehdr_size
         sec_offsets = []
@@ -12435,7 +12538,7 @@ class Assembler:
             f.write(_pack_shdr(0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
             for i, s in enumerate(csecs):
-                _sh_type_i = 8 if _is_nobits(s) else 1
+                _sh_type_i = s.sh_type
                 f.write(_pack_shdr(
                     sec_name_offs[i], _sh_type_i, s.flags, 0,
                     sec_offsets[i], s.byte_size, 0, 0, 16, 0))
@@ -12659,6 +12762,7 @@ class Assembler:
             '.elfextern':  d.elfextern_processing,
             '.elfdwarf':   d.elfdwarf_processing,
             '.elfheader':  d.elfheader_processing,
+            '.elfsection': d.elfsection_processing,
         }
         out = []
         for row, i in enumerate(pat):

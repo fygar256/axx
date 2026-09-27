@@ -37,7 +37,7 @@ axx 8080toz80.axx hello8080.s -V > out.s  # translated text to stdout
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all twenty-four bundled pattern/source pairs with
+exactly that: `test1` assembles all twenty-six bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the two `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` pair the `.echo` lines each one writes to standard
@@ -1323,6 +1323,10 @@ adrp x0,msg      ->  R_AARCH64_ADR_PREL_PG_HI21  msg + 0
 add  x0,x0,#msg  ->  R_AARCH64_ADD_ABS_LO12_NC   msg + 0
 ```
 
+A per-symbol type written in the source also *beats* the `.reloc` of the pattern
+file (section 3.7.8), so on a symbol referred to this way, do not write one:
+`.extern msg::abs64` would give both instructions above that one type.
+
 Because `t` is the operand variable of nearly every row in a large pattern
 file, the `.clrreloc` matters as much as the `.reloc`: without it the
 declaration stays in force for every row the pattern scan walks past
@@ -1460,6 +1464,7 @@ ELF object should look like.
 | `.elfextern::<type>` | the default type for `.extern` with no type name |
 | `.elfdwarf::<type>` | the absolute type the `-g` DWARF output uses |
 | `.elfheader::<field>::<value>` | a field of the ELF header |
+| `.elfsection::<name>::<sh_flags>[::<sh_type>]` | the attributes of a section header |
 
 - Every declaration is a difference *laid over* the built-in table selected with
   `-m`. On a machine that is in the table, only what you write is replaced — so
@@ -1502,6 +1507,35 @@ This is what machine-specific `e_flags` (the ARM EABI version, the RISC-V ABI
 marks) are written with. A field you do not write keeps its default. The values
 are constant expressions.
 
+**The section attributes `.elfsection` sets.** A section you do not declare gets
+its attributes from its name, as before.
+
+| Name (a prefix) | `sh_flags` | `sh_type` |
+|---|---|---|
+| `.text` | `SHF_ALLOC` + `SHF_EXECINSTR` (6) | `SHT_PROGBITS` (1) |
+| `.data` | `SHF_ALLOC` + `SHF_WRITE` (3) | `SHT_PROGBITS` (1) |
+| `.bss` | `SHF_ALLOC` + `SHF_WRITE` (3) | `SHT_NOBITS` (8) |
+| `.rodata`, anything else | `SHF_ALLOC` (2) | `SHT_PROGBITS` (1) |
+
+```
+.elfsection::.vectors::0x6           /* ALLOC+EXECINSTR, type left alone */
+.elfsection::.noinit::0x3::8         /* ALLOC+WRITE, SHT_NOBITS          */
+.elfsection::.note.axx::0::7         /* no flags, SHT_NOTE               */
+```
+
+This is how a section the name rule does not know — a machine's own vector
+table, an uninitialised region that is not called `.bss`, a note section — gets
+the attributes it needs.
+
+- The section name is matched without regard to case, and only as a whole name
+  (unlike the name rule above, which matches a prefix).
+- `sh_flags` and `sh_type` are both constant expressions in 0-0xFFFFFFFF. With
+  no `sh_type` written, the type stays the one the name rule gives.
+- A section made `SHT_NOBITS` (8) carries only its `sh_size`; its contents are
+  not written to the file, exactly as `.bss` is treated.
+
+The bundled `elfsec.axx` / `elfsec.s` are a worked example.
+
 **Example.** A description of EM_MSP430 (105), a machine axx has no built-in
 table for.
 
@@ -1539,6 +1573,52 @@ JMP !t :: 0x00,0x3c,t,t>>8
 ```
 
 The bundled `elfgen.axx` / `elfgen.s` are a worked example.
+
+#### 3.7.8 The relocation type priority
+
+The type of one reference can be decided in three places. Strongest first:
+
+| Rank | Decided in | Written as |
+|---|---|---|
+| high | the source file | `::<type>` on `.extern` / `.global` / `.EQU` / an import TSV, and `.reloctype` (section 5.5.1) |
+| middle | the pattern file | `.reloc::<variable>::<type>` (section 3.7.5) |
+| low | the default | guessed from the width of the field (`.elfwidth`, the machine's table) |
+
+That is **default < pattern file < source file**: the source has the last word.
+
+- The pattern file says with `.reloc` which type the field of that instruction
+  normally carries. This is what gives a type to the instructions a width guess
+  cannot reach (an AArch64 branch, `adrp`, and so on).
+- A symbol the source typed with `::<type>` is written with that type. One
+  source line can therefore change the type per symbol. Where `.reloc` has said
+  "the value sits in a bit field of the instruction word", that knowledge and
+  the way the addend is computed stay as they are; only the type number is
+  replaced.
+- A reference neither of them typed gets the default type for the width of its
+  field (`.elfwidth`, section 3.7.7).
+
+```
+.reloc::t::pcrel16              /* the pattern: this field is PC relative */
+JMP !t :: 0x00,0x3c,t,t>>8
+.clrreloc::t
+```
+
+```
+        .extern ext::abs16      ; a symbol the source typed
+        .global start
+start:
+        jmp     start           ->  R_MSP430_PCR16   start + 2
+        jmp     ext             ->  R_MSP430_ABS16   ext + 0
+        dw      start           ->  R_MSP430_ABS16   start + 0
+```
+
+**A caution.** In a pattern file that types with `.reloc` the instructions which
+refer to one symbol under two types — the AArch64 `adrp` / `add` pair — do not
+write `::<type>` on that symbol in the source: both instructions would then take
+that one type (section 3.7.5, "Why it cannot be stated on the symbol"). A type
+that belongs to the operand position belongs in the pattern file alone.
+
+The bundled `elfprio.axx` / `elfprio.s` are a worked example.
 
 ### 3.8 Optional parts (`[[ ]]`)
 
@@ -3303,6 +3383,8 @@ The x86_64 pattern file is also maintained separately at
 | **echo.axx** | 1.2 KB | 6 | **echo.s** | `.echo` on a body line (3.14.1); test only |
 | **elftype.axx** | 1.5 KB | 15 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
 | **elfgen.axx** | 2.7 KB | 24 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
+| **elfprio.axx** | 1.7 KB | 19 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
+| **elfsec.axx** | 1.1 KB | 6 | **elfsec.s** | section attributes declared with `.elfsection` (3.7.7); test only |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
 | **vliw.axx** | 178 B | 10 | **vliw.s** | Non-EPIC VLIW; test only |
 | **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck virtual CPU; hello-world demo. Bundled, but not part of `test1` |
@@ -3311,14 +3393,16 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 `itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
 `aarch64_logical_mini_demo.s`.
 
-`test1` runs all twenty-four pairs through both implementations and
+`test1` runs all twenty-six pairs through both implementations and
 compares the `-b` raw binaries. For the two pairs that use `.textmode`
 (`textmode.axx` and `8080toz80.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
 `elftype.s` and `elfgen.axx` / `elfgen.s` pairs are about relocations and the
-ELF header, so for those two the `-o` ELF objects are compared. For the
+ELF header, the `elfprio.axx` / `elfprio.s` pair is about which of the three
+ranks types a relocation, and the `elfsec.axx` / `elfsec.s` pair is about the
+section headers, so for those four the `-o` ELF objects are compared. For the
 `echo.axx` / `echo.s` pair the `.echo` lines written to standard error are
-compared as well, for twenty-seven comparisons in all.
+compared as well, for twenty-nine comparisons in all.
 
 The `aarch64.axx` / `aarch64.s` pair is much the slowest of them: the Python
 implementation takes about twenty seconds on it, against about a second for the
@@ -3344,7 +3428,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all twenty-four bundled pattern/source pairs with both
+`test1` assembles all twenty-six bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 two `.textmode` pairs and the `.echo` lines of the `echo.axx` pair.
 

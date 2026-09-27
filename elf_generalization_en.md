@@ -40,6 +40,7 @@ type is used** and **how the ELF is put together**.
 | `.elfextern::<type>` | the default type for `.extern` with no type name |
 | `.elfdwarf::<type>` | the absolute type the `-g` DWARF output uses |
 | `.elfheader::<field>::<value>` | a field of the ELF header |
+| `.elfsection::<name>::<sh_flags>[::<sh_type>]` | the attributes of a section header |
 
 Rules they share:
 
@@ -83,6 +84,27 @@ This is what machine-specific `e_flags` (the ARM EABI version, the RISC-V ABI
 marks) are written with. A field you do not write keeps its default. The values
 are constant expressions.
 
+### 2.3 `.elfsection` — the attributes of a section header
+
+A section's `sh_flags` and `sh_type` used to come from its name alone (`.text`
+executable, `.data` and `.bss` writable, `.rodata` and anything else allocated
+only, and `SHT_NOBITS` for `.bss` alone). A section the name rule does not know
+came out as an allocated `SHT_PROGBITS`, with no way to change it.
+
+```
+.elfsection::.vectors::0x6           /* ALLOC+EXECINSTR, type left alone */
+.elfsection::.noinit::0x3::8         /* ALLOC+WRITE, SHT_NOBITS          */
+.elfsection::.note.axx::0::7         /* no flags, SHT_NOTE               */
+```
+
+A machine's own vector table, an uninitialised region that is not called
+`.bss`, a note section — this is what writes those. The section name is matched
+without regard to case, as a whole name. With no `sh_type` written, the type
+stays the one the name rule gives. A section made `SHT_NOBITS` carries only its
+`sh_size`; its contents are not written to the file.
+
+The bundled `elfsec.axx` / `elfsec.s` are a worked example.
+
 ---
 
 ## 3. How this relates to `-m` and `-f`
@@ -114,6 +136,15 @@ The rule throughout is **never quietly write a broken `.o`**.
   misspelling is not silently skipped.
 - The `-g` DWARF sections are written only when the absolute type is known, from
   `.elfdwarf` or the built-in table.
+
+The width guess does one more thing. When the type it guessed is PC-relative but
+the field turns out to hold the label's absolute value, the type is replaced by
+the absolute type of the same width. The replacement is found by scanning the
+effective table from the top for a type of that width that is not PC-relative —
+no machine number and no type number is built in. On the eleven built-in
+machines `abs64` / `abs32` / `abs16` / `abs8` head their tables, so the type
+found is the one that was used before, and a machine declared in a pattern file
+resolves it in `.elftype` declaration order.
 
 ---
 
@@ -187,3 +218,44 @@ and the header, as declared:
 ```
 
 ---
+
+## 6. The relocation type priority
+
+The type of one reference can be decided in three places. Strongest first:
+
+| Rank | Decided in | Written as |
+|---|---|---|
+| high | the source file | `::<type>` on `.extern` / `.global` / `.EQU` / an import TSV, and `.reloctype` |
+| middle | the pattern file | `.reloc::<variable>::<type>` |
+| low | the default | guessed from the width of the field (`.elfwidth`, the machine's table) |
+
+That is **default < pattern file < source file**: the source has the last word.
+
+The pattern file says which type the field of that instruction normally carries;
+the source says which type this one symbol takes. When both speak about the same
+reference, the source wins. Where `.reloc` has said "the value sits in a bit
+field of the instruction word", that knowledge and the way the addend is
+computed stay as they are; only the type number is replaced.
+
+```
+.reloc::t::pcrel16              /* the pattern: this field is PC relative */
+JMP !t :: 0x00,0x3c,t,t>>8
+.clrreloc::t
+```
+
+```
+        .extern ext::abs16      ; a symbol the source typed
+        .global start
+start:
+        jmp     start           ->  R_MSP430_PCR16   start + 2
+        jmp     ext             ->  R_MSP430_ABS16   ext + 0
+        dw      start           ->  R_MSP430_ABS16   start + 0
+```
+
+One caution. In a pattern file that types with `.reloc` the instructions which
+refer to one symbol under two types — the AArch64 `adrp` / `add` pair — do not
+write `::<type>` on that symbol in the source: both instructions would then take
+that one type. A type that belongs to the operand position belongs in the
+pattern file alone.
+
+The bundled `elfprio.axx` / `elfprio.s` are a worked example.

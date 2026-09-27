@@ -1,0 +1,49 @@
+/* ===================================================================
+/* elfprio.axx -- pattern file for the relocation type priority
+/*                (manual 3.7.8)
+/*
+/* A reference can be typed in three places, and they are ranked
+/*
+/*   the default (guessed from the field width, `.elfwidth`)
+/*     < the pattern file (`.reloc::<var>::<type>`)
+/*       < the source file (`::<type>` on `.extern` / `.global` /
+/*         `.EQU` / an import file, and `.reloctype`)
+/*
+/* so the source has the last word: the pattern file says what an
+/* instruction's field normally carries, and one source line can still
+/* ask for another type on one symbol.
+/*
+/* The machine is EM_MSP430 (105), which axx has no built-in table for,
+/* so every type below comes from `.elftype` (manual 3.7.7).
+/*
+/* Assemble with:
+/*   axx elfprio.axx elfprio.s -o out.o
+/* ===================================================================
+
+.bits::8
+
+.elfmachine::105::MSP430
+.elfclass::32
+.elfrela::1
+
+/*     name        number  width  pc-relative                        */
+.elftype::abs32::1::4          /* R_MSP430_ABS32                     */
+.elftype::abs16::2::2          /* R_MSP430_ABS16                     */
+.elftype::abs8::3::1           /* R_MSP430_ABS8                      */
+.elftype::pcrel16::4::2::1     /* R_MSP430_PCR16                     */
+
+/* --- the lowest rank: the default for a field of that width ------- */
+.elfwidth::4::abs32
+.elfwidth::2::abs16
+.elfwidth::1::abs8
+.elfextern::abs16
+
+/* --- the middle rank: the type this instruction's field carries --- */
+.reloc::t::pcrel16
+JMP !t :: 0x00,0x3c,t,t>>8
+.clrreloc::t
+
+DB !t :: t
+DW !t :: t,t>>8
+DD !t :: t,t>>8,t>>16,t>>24
+RET :: 0x30,0x41

@@ -1,0 +1,26 @@
+/* ===================================================================
+/* elfsec.axx -- pattern file for `.elfsection` (manual 3.7.7)
+/*
+/*   .elfsection::<name>::<sh_flags>[::<sh_type>]
+/*
+/* A section axx knows by name gets its attributes from that name:
+/* `.text` is SHF_ALLOC|SHF_EXECINSTR, `.data` and `.bss` are
+/* SHF_ALLOC|SHF_WRITE, `.rodata` and everything else are SHF_ALLOC,
+/* and only `.bss` is SHT_NOBITS. This declaration is how a section
+/* the name rule does not know -- a machine's own vector table, an
+/* uninitialised region that is not called `.bss`, a note section --
+/* gets the attributes it needs.
+/*
+/* Assemble with:
+/*   axx elfsec.axx elfsec.s -o out.o
+/* ===================================================================
+
+.bits::8
+
+/*             name        sh_flags  sh_type                          */
+.elfsection::.vectors::0x6           /* ALLOC|EXECINSTR, PROGBITS     */
+.elfsection::.noinit::0x3::8         /* ALLOC|WRITE, NOBITS           */
+.elfsection::.note.axx::0::7         /* no flags, NOTE                */
+
+DB !t :: t
+NOP :: 0x90

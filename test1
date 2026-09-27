@@ -26,6 +26,8 @@ caxx elftype.axx elftype.s -o b22 -m 62
 caxx elfgen.axx elfgen.s -o b23
 caxx symcap.axx symcap.s -b b24
 caxx echo.axx echo.s -b b25 2>&1 | grep -v '^wrote ' > b25e
+caxx elfprio.axx elfprio.s -o b26
+caxx elfsec.axx elfsec.s -o b27
 
 paxx 4004.axx 4004.s -b a0
 paxx z80.axx z80.s -b a1
@@ -53,6 +55,8 @@ paxx elftype.axx elftype.s -o a22 -m 62
 paxx elfgen.axx elfgen.s -o a23
 paxx symcap.axx symcap.s -b a24
 paxx echo.axx echo.s -b a25 2>&1 | grep -v '^wrote ' > a25e
+paxx elfprio.axx elfprio.s -o a26
+paxx elfsec.axx elfsec.s -o a27
 
 FAIL=0
 
@@ -83,6 +87,8 @@ cmp a23 b23 || FAIL=1
 cmp a24 b24 || FAIL=1
 cmp a25 b25 || FAIL=1
 cmp a25e b25e || FAIL=1
+cmp a26 b26 || FAIL=1
+cmp a27 b27 || FAIL=1
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"
