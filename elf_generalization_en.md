@@ -2,7 +2,9 @@
 
 axx's ELF object output (`-o`) has been widened from the eleven machines in the
 built-in table to **any `e_machine`**. The relocation types, the ELF class,
-RELA/REL and the ELF header fields can all be declared in the pattern file.
+RELA/REL and the ELF header fields can all be declared in the pattern file, and
+so can **instruction-field types** — types whose value sits in bit fields of an
+instruction word — with `.elffield`, for any machine.
 
 The work is in both implementations, `axx.py` (Paxx) and `caxx.c` (Caxx), and
 their output is byte-identical.
@@ -41,6 +43,7 @@ type is used** and **how the ELF is put together**.
 | `.elfdwarf::<type>` | the absolute type the `-g` DWARF output uses |
 | `.elfheader::<field>::<value>` | a field of the ELF header |
 | `.elfsection::<name>::<sh_flags>[::<sh_type>[::<align>]]` | the attributes of a section header |
+| `.elffield::<type>::<mask>[::<offset>]` | an instruction-field type (which bits of the instruction hold the value) |
 
 Rules they share:
 
@@ -116,6 +119,57 @@ read the contents. It is 4 rather than 8 even for ELF64 because a note's
 
 The bundled `elfsec.axx` / `elfsec.s` are a worked example.
 
+### 2.4 `.elffield` — instruction-field types
+
+```
+.elffield::<type>::<mask>[::<offset>]
+```
+
+A data reference holds its value as a plain integer across consecutive bytes, so
+the addend is "emitted bytes - label value". A branch or address-forming
+instruction instead packs the value, often scaled, into scattered bit fields of
+the instruction word, and the addend cannot be read back out of the bytes.
+
+AArch64 has types of this kind (`call26`, `adrp`, the `:lo12:` types, ...) in a
+built-in table. Other machines had none, so typing a row with `.reloc` did not
+give a correct relocation. `.elffield` supplies that table for any machine from
+the pattern file. A row typed with `.reloc::<variable>::<type>` for a type
+declared this way
+
+- carries the addend "operand value - label value" (`bl ext+8` gives 8);
+- has its instruction field written as 0, for the linker to fill in (RELA, the
+  shape GNU as produces);
+- leaves the range and alignment checks on that operand to the linker under
+  `-o`.
+
+The fields:
+
+- `<mask>` is the set of bits the linker writes, within the bytes of the type's
+  width (from `.elftype` or the machine's name table) read as an integer in the
+  target byte order. A field split over two instruction words is one 64-bit
+  mask.
+- `<offset>` (default 0) is where the field starts, in bytes from the first word
+  the row emits for that operand; `r_offset` points there. A 16-bit field in the
+  low half of a 32-bit word is at 2 big-endian and at 0 little-endian.
+- The type may be an `.elftype` name, a built-in name or a number. Writing the
+  same type again replaces the earlier declaration.
+
+```
+.elftype::rel24::10::4::1
+.elftype::addr16_ha::6::2
+.elffield::rel24::0x03fffffc            /* PowerPC64 bl: the LI field       */
+.elffield::addr16_ha::0xffff::2         /* the low halfword, big-endian     */
+.elffield::pcrel34::0x0003ffff0000ffff  /* 18 prefix bits + 16 suffix bits  */
+
+.reloc::t::rel24
+BL !t :: .call w4(0x48000001|((t-$$)&0x3fffffc))
+.clrreloc::t
+```
+
+On a machine whose offsets or masks depend on the byte order, writing the
+`.elffield` lines in the wrapper that sets the byte order keeps a single
+instruction-set file (section 7, PowerPC64, is built that way).
+
 ---
 
 ## 3. How this relates to `-m` and `-f`
@@ -142,7 +196,7 @@ The rule throughout is **never quietly write a broken `.o`**.
 - A reference whose type cannot be determined gets no relocation entry, rather
   than a guessed type number. `-d` lists the places that were skipped.
 - Writing `-o` with an `-m` outside the built-in table warns about exactly this.
-- A type name in `.elfwidth` / `.elfextern` / `.elfdwarf` that does not resolve
+- A type name in `.elfwidth` / `.elfextern` / `.elfdwarf` / `.elffield` that does not resolve
   is reported once, after the declarations have all been collected, so that a
   misspelling is not silently skipped.
 - The `-g` DWARF sections are written only when the absolute type is known, from
@@ -242,6 +296,12 @@ The type of one reference can be decided in three places. Strongest first:
 
 That is **default < pattern file < source file**: the source has the last word.
 
+Only a type the source **wrote** counts as "the source file". A `.extern ext`
+with no type name gets the default type of `.elfextern` (or the machine's
+table), but that does not override a type `.reloc` gave: `bl ext` still comes
+out with the `.reloc` type (`REL24` on PowerPC64), and the default is used only
+for references no `.reloc` covers, such as data.
+
 The pattern file says which type the field of that instruction normally carries;
 the source says which type this one symbol takes. When both speak about the same
 reference, the source wins. Where `.reloc` has said "the value sits in a bit
@@ -270,3 +330,63 @@ that one type. A type that belongs to the operand position belongs in the
 pattern file alone.
 
 The bundled `elfprio.axx` / `elfprio.s` are a worked example.
+
+---
+
+## 7. A worked example — PowerPC64 (21)
+
+This one lays declarations over a machine that is in the built-in table. The
+bundled `patfile/ppc64.axx` (big-endian, ELFv1) and `patfile/ppc64le.axx`
+(little-endian, ELFv2) are wrappers that hold only the byte order and the ELF
+description, then include the instruction set `ppc64_isa.axx`.
+
+- `.elftype` declares the types of the 64-bit PowerPC ELF ABI with their names,
+  numbers, widths and PC-relativeness, and `.elffield` gives the
+  instruction-field ones their fields (`REL24`, `ADDR24`, `REL14`, `ADDR14`, the
+  `ADDR16` family, `ADDR16_DS` / `_LO_DS`, `D34`, `PCREL34`). The offset of a
+  16-bit field is 2 big-endian and 0 little-endian.
+- Data uses `ADDR16` / `ADDR32` / `ADDR64` through `.elfwidth`, and a `.extern`
+  with no type name `.elfextern::addr64`.
+- `.elfsection` aligns `.text` to 64 bytes, so that the guarantee that no
+  prefixed instruction crosses a 64-byte boundary survives the link. The ELFv1
+  `.opd` (function descriptors) is writable data aligned to 8, and a type `toc`
+  (`R_PPC64_TOC`) is provided for its TOC word.
+- The little-endian wrapper sets `.elfheader::flags::2` (ELFv2).
+- In the instruction set, every row with an operand that can hold a symbol is
+  enclosed in `.reloc` / `.clrreloc`.
+
+```
+        .extern ext
+        .global start
+start:
+        bl      ext+8
+        addis   3,2,msg@ha
+        addi    3,3,msg@l
+        ld      4,msg@l(3)
+        pld     5,ext@pcrel
+msg:
+        .quad   ext
+```
+
+`axx patfile/ppc64le.axx ex.s -o ex.o`, as `readelf -r` shows it:
+
+```
+ Offset           Type                  Sym. Name + Addend
+0000000000000000  R_PPC64_REL24         ext + 8
+0000000000000004  R_PPC64_ADDR16_HA     msg + 0
+0000000000000008  R_PPC64_ADDR16_LO     msg + 0
+000000000000000c  R_PPC64_ADDR16_LO_DS  msg + 0
+0000000000000010  R_PPC64_PCREL34       ext + 0
+0000000000000018  R_PPC64_ADDR64        ext + 0
+```
+
+With `ppc64.axx` (big-endian) the three 16-bit fields are at `0x6`, `0xa` and
+`0xe`; the rest is the same. The instruction fields are written as 0 and the
+addend goes in the RELA entry.
+
+Checked against GNU as 2.42: for every row that refers to an external symbol, in
+both byte orders, the relocations (offset, type, symbol, addend) match and the
+output linked with GNU ld is identical. With ld.lld 18 the result is the same
+too, apart from the rows whose types ld.lld does not implement (`ADDR24` /
+`ADDR14`, `ADDR16_HIGHA`, `D34`). ld.lld handles only ELFv2 on PowerPC64, so for
+big-endian write the ELFv2 form, without `.opd`.
