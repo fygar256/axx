@@ -1,7 +1,7 @@
 all: caxx paxx
 
 caxx: caxx.c
-	gcc -o caxx caxx.c -lm -O2
+	gcc -o caxx caxx.c -lm -lquadmath -O2
 	sudo cp caxx /usr/local/bin/caxx
 	sudo cp axx.1.gz /usr/share/man/man1/
 paxx: axx.py

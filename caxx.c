@@ -169,27 +169,43 @@ static int var_slot(const char *name, int len, int create){
         for(int i=0;i<VARHASH_NB;i++) g_varhash[i] = -1;
         g_varhash_init = 1;
     }
-    char lower[256];
-    if(len <= 0 || len >= (int)sizeof(lower)) return -1;
+    /* 破綻点修正: ここは char[256] 固定で、256 文字以上の変数名を一律 -1
+     * （変数ではない）としていた。axx.py に長さ制限は無いので、長い変数名を
+     * 使ったパターンファイルで caxx だけが「変数ではない」と言って失敗して
+     * いた。照合1回あたり何度も呼ばれる経路なので、ふだんは自動変数のまま
+     * 使い、収まらないときだけヒープへ逃がす（axx_word_buf と同じ考え方）。 */
+    char stackbuf[256];
+    char *lower = stackbuf;
+    char *lower_heap = NULL;
+    if(len <= 0) return -1;
+    if((size_t)len >= sizeof(stackbuf)){
+        lower_heap = malloc((size_t)len + 1);
+        if(!lower_heap){ perror("malloc"); exit(1); }
+        lower = lower_heap;
+    }
     for(int i = 0; i < len; i++) lower[i] = (char)tolower((unsigned char)name[i]);
     lower[len] = '\0';
-    if(!is_var_name_n(lower, len)) return -1;
+    if(!is_var_name_n(lower, len)){ free(lower_heap); return -1; }
     /* 名前引きは照合1回あたり何度も呼ばれるので、名前の全走査ではなく
      * ハッシュで引く（名前の数が増えても遅くならないようにする）。 */
     unsigned h = 2166136261u;
     for(int i = 0; i < len; i++){ h ^= (unsigned char)lower[i]; h *= 16777619u; }
     h &= VARHASH_NB - 1;
     for(int vi = g_varhash[h]; vi >= 0; vi = g_varnext[vi])
-        if(g_varlen[vi] == len && memcmp(g_varnames[vi], lower, (size_t)len) == 0)
+        if(g_varlen[vi] == len && memcmp(g_varnames[vi], lower, (size_t)len) == 0){
+            free(lower_heap);
             return vi;
-    if(!create) return -1;
+        }
+    if(!create){ free(lower_heap); return -1; }
     if(g_nvars >= NVARS){
         fprintf(stderr, " error - too many pattern variable names (maximum %d).\n", NVARS);
+        free(lower_heap);
         return -1;
     }
     char *dup = malloc((size_t)len + 1);
     if(!dup){ perror("malloc"); exit(1); }
     memcpy(dup, lower, (size_t)len); dup[len] = '\0';
+    free(lower_heap);
     g_varnames[g_nvars] = dup;
     g_varlen[g_nvars]   = len;
     g_varnext[g_nvars]  = g_varhash[h];
@@ -2056,7 +2072,14 @@ typedef struct {
     char lwordchars[256];    /* ラベル名 */
     char swordchars[256];    /* .setsym シンボル名 */
 
-    char current_section[512];
+    /* 破綻点修正: ここは char[512] の固定配列だった。512 文字以上の
+     * セクション名が黙って切り詰められ、完全な名前で登録されている
+     * セクション表から引けなくなって、出力したワードがどのセクションにも
+     * 足されないまま消えていた（長い名前の `.section` が size 0 で出る）。
+     * axx.py に長さ制限は無いのでそこだけ食い違っていた。
+     * st_set_current_section() で名前の長さぶん持つ。 */
+    char      *current_section;
+    size_t     current_section_cap;
     char current_file[512];
 
     /* --- 記号表 --- */
@@ -3054,13 +3077,26 @@ static int64_t equ_section_relative_offset(AsmState *st, const char *sec_name, u
     return -1;
 }
 
+/* 現在のセクション名を据える。長さの上限は無い（上の current_section の
+ * コメントを参照）。axx.py の state.current_section への代入に対応する。 */
+static void st_set_current_section(AsmState *st, const char *name){
+    size_t n = strlen(name) + 1;
+    if(n > st->current_section_cap){
+        char *p = realloc(st->current_section, n);
+        if(!p){ perror("realloc"); exit(1); }
+        st->current_section = p;
+        st->current_section_cap = n;
+    }
+    memcpy(st->current_section, name, n);
+}
+
 static void state_init(AsmState *st) {
     memset(st, 0, sizeof(*st));
     g_active_state = st;
     sv_init(&st->reported_label_errors);
     strcpy(st->lwordchars, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_.");
     strcpy(st->swordchars, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_%$-~&|");
-    strcpy(st->current_section, ".text");
+    st_set_current_section(st, ".text");
     lmap_init(&st->labels);
     secmap_init(&st->sections);
     smap_init(&st->symbols);
@@ -3737,69 +3773,22 @@ static AXX_UNUSED uint64_t ieee754_64_from_str(const char *a){
     (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
      defined(__arm__) || defined(__riscv))
 
-/* 破綻点修正: 10^n を `scale *= base` の逐次乗算で求めると、n が大きいとき
- * （小数部の桁数や指数部）に最大 n 回ぶんの丸め誤差が積み重なり、axx.py
- * （Decimal による正確な計算）と異なるビットパターンになっていた
- * （例: 1e300 の最下位ニブルがずれる）。二分累乗法なら乗算回数が
- * O(log n) で済み、丸め回数を大幅に減らせる。 */
-static __float128 f128_ipow10(int n)
-{
-    __float128 base = (__float128)10;
-    __float128 result = (__float128)1;
-    while(n > 0){
-        if(n & 1) result *= base;
-        base *= base;
-        n >>= 1;
-    }
-    return result;
-}
+/* strtoflt128() のため。libquadmath をリンクする（makefile の -lquadmath）。 */
+#include <quadmath.h>
 
+/* 十進文字列を binary128 のビットパターンにする。
+ *
+ * 破綻点修正: 以前はここで桁を __float128 に逐次乗除して値を組み立てていた
+ * （`int_val*10 + digit` のあと 10^n で割る。10^n は二分累乗法）。乗算回数は
+ * 抑えていたが各段の丸めは残るので最近接丸めにならず、axx.py（Decimal で
+ * 一度だけ丸める）と最下位ビットが 1〜2 ULP 食い違っていた
+ * （`qad{3.14+2.5}` のような普通の式でもずれた）。`1e-4950` のように
+ * binary128 の非正規化数として表せる値を 0 に潰してもいた。
+ * strtoflt128() は正しく丸める標準の変換なので、これに任せる。
+ * ロケールは設定していないので小数点はつねに '.' である。 */
 static __float128 f128_from_decimal(const char *s)
 {
-    const __float128 ten  = (__float128)10;
-
-    int sign = 0;
-    if(*s == '-'){ sign = 1; s++; }
-    else if(*s == '+'){ s++; }
-
-    __float128 int_val    = (__float128)0;
-    int        frac_digits = 0;
-    int        in_frac    = 0;
-
-    while((*s >= '0' && *s <= '9') || *s == '.'){
-        if(*s == '.'){
-            in_frac = 1;
-            s++;
-            continue;
-        }
-        int_val = int_val * ten + (__float128)(*s - '0');
-        if(in_frac) frac_digits++;
-        s++;
-    }
-
-    __float128 denom = f128_ipow10(frac_digits);
-    __float128 result = int_val / denom;
-
-    if(*s == 'e' || *s == 'E'){
-        s++;
-        int esign = 1;
-        if(*s == '-'){ esign = -1; s++; }
-        else if(*s == '+'){ s++; }
-        int eabs = 0;
-        /* 破綻点修正: 指数の桁数に上限が無く、極端に長い指数文字列で
-         * eabs(int) が符号付きオーバーフロー(未定義動作)を起こしうる。
-         * float128 の指数範囲(最大でも5桁程度)よりずっと大きい値で頭打ちにする。 */
-        while(*s >= '0' && *s <= '9'){
-            if(eabs < 1000000) eabs = eabs*10 + (*s-'0');
-            s++;
-        }
-        /* 負の指数は「10^eabs の逆数を掛ける」のではなく「10^eabs で割る」。
-         * 逆数自体が持つ丸め誤差を掛け算で複利させず、割り算1回ぶんに抑える。 */
-        __float128 scale = f128_ipow10(eabs);
-        result = (esign > 0) ? (result * scale) : (result / scale);
-    }
-
-    return sign ? -result : result;
+    return strtoflt128(s, NULL);
 }
 
 typedef struct { __float128 val; const char *end; int ok; } F128R;
@@ -3910,6 +3899,16 @@ static int f128_is_finite(__float128 v)
 static uint256_t f128_eval_text(const char *text, int *ok_out)
 {
     F128R r = f128_expr_fn(text);
+    /* 破綻点修正: 式を最後まで読めたかを見ていなかったため、読めない字句が
+     * 残っていても「そこまでの値」を黙って返していた。`qad{2+inf}` が
+     * エラーにも inf にもならず 2.0 を出していたのがこれである
+     * （axx.py は式全体を読むので inf を返す）。読み残しがあれば失敗とし、
+     * 呼び出し側の xeval 経路へ渡す（そちらも読めなければエラーになる）。 */
+    if(r.ok && r.end){
+        const char *p = r.end;
+        while(*p==' '||*p=='\t') p++;
+        if(*p) r.ok = 0;
+    }
     if(r.ok && !f128_is_finite(r.val)) r.ok = 0;
     if(ok_out) *ok_out = r.ok;
     if(!r.ok)  return u256_zero();
@@ -5249,10 +5248,16 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
 #endif
             {
                 double xv;
-                if(xeval_eval(asmb, expr_buf, &xv)){
+                if(xeval_eval(asmb, expr_buf, &xv) && isfinite(xv)){
                     char fstr[64]; snprintf(fstr,sizeof(fstr),"%.17g",xv);
                     x=ieee754_128_from_str(fstr);
                 } else {
+                    /* 破綻点修正: ここで isfinite() を見ていなかったため、
+                     * `qad{1e4933}` のように binary128 の幅を越えた値が
+                     * "%.17g" で "inf" になり、ieee754_128_from_str() 経由で
+                     * 無限大として黙って通っていた。幅を越えたらエラーにする。
+                     * 明示して書いた `inf` / `-inf` / `nan` は上の分岐が拾うので
+                     * 従来どおり通る（マニュアル 5.4 節）。 */
                     /* 破綻点修正: ここには以前 expr_expression_pat() への
                      * フォールバックがあった。そちらはラベルを引けるので、
                      * `qad{未定義ラベル}` が 0 として黙って通り、誤ったバイナリを
@@ -5367,7 +5372,11 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             else if(strcmp(t,"-inf")==0) bits=0xfff0000000000000ULL;
             else {
                 double xv;
-                if(xeval_eval(asmb, t, &xv)){
+                /* 破綻点修正: isfinite() を見ていなかったため、`dbl{1e309}` の
+                 * ように float64 の幅を越えた値が無限大として黙って通っていた。
+                 * 幅を越えたらエラーにする（qad{} / flt{} と同じ規則）。明示して
+                 * 書いた `inf` / `-inf` / `nan` は上の分岐が拾う。 */
+                if(xeval_eval(asmb, t, &xv) && isfinite(xv)){
                     memcpy(&bits,&xv,8);
                 } else {
                     /* 破綻点修正: qad{} と同じ問題。上のコメントを参照。 */
@@ -5400,8 +5409,15 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             else if(strcmp(t,"-inf")==0) bits=0xff800000u;
             else {
                 double xv;
-                if(xeval_eval(asmb, t, &xv)){
-                    float v = (float)xv;
+                float v = 0;
+                /* 破綻点修正: float32 に落とした結果が有限かを見ていなかったため、
+                 * `flt{1e39}` のように float32 の幅を越えた値が無限大として黙って
+                 * 通っていた（axx.py は struct.pack('>f') が範囲を見るのでエラー
+                 * になり、両実装が食い違っていた）。幅を越えたらエラーにする
+                 * （qad{} / dbl{} と同じ規則）。明示して書いた `inf` / `-inf` /
+                 * `nan` は上の分岐が拾う。 */
+                if(xeval_eval(asmb, t, &xv) && isfinite(xv)
+                   && (v = (float)xv, isfinite(v))){
                     memcpy(&bits,&v,4);
                 } else {
                     /* 破綻点修正: qad{} と同じ問題。上のコメントを参照。 */
@@ -6304,14 +6320,23 @@ static int dir_epic(Assembler *asmb, PatEntry *e){
 static int dir_var_slot(const char *field){
     const char *p = field;
     while(*p==' '||*p=='\t') p++;
-    char lower[64]; int n = 0;
-    while(*p && n < (int)sizeof(lower)-1 && !(*p==' '||*p=='\t'))
+    /* 破綻点修正: ここは char[64] 固定で、64 文字以上の変数名を切り詰めて
+     * いた。切り詰めると後ろに文字が残るので「変数ではない」と判定され、
+     * `.map::<64 文字以上の変数>::…` が caxx だけエラーになっていた
+     * （変数名は複数文字でよい。axx.py に長さ制限は無い）。 */
+    size_t cap = strlen(p) + 1;
+    char *lower = malloc(cap);
+    if(!lower){ perror("malloc"); exit(1); }
+    int n = 0;
+    while(*p && !(*p==' '||*p=='\t'))
         lower[n++] = (char)tolower((unsigned char)*p++);
     lower[n] = '\0';
     while(*p==' '||*p=='\t') p++;
-    if(*p || n == 0) return -1;
-    if(var_name_len(lower) != n) return -1;
-    return var_slot(lower, n, 1);
+    if(*p || n == 0){ free(lower); return -1; }
+    if(var_name_len(lower) != n){ free(lower); return -1; }
+    int slot = var_slot(lower, n, 1);
+    free(lower);
+    return slot;
 }
 
 /* 要素の列挙欄（`.check` `.enum` `.map` の「名前の並び」）を項目に切る。
@@ -6322,11 +6347,18 @@ static int dir_var_slot(const char *field){
  * 名前は大文字化して積み、`""` `''`（省略可の印）と空欄は長さ0の項目にする。 */
 static void elem_list_expand(AsmState *st, const char *text, StrVec *out){
     const char *p = text;
+    /* 破綻点修正: 項目を char[512] に写していたため、512 文字以上の名前が
+     * 黙って切り詰められ、ソース行に書いた完全な名前と一致しなくなって
+     * `.check` / `.enum` / `.map` が効かず Syntax error になっていた
+     * （axx.py に長さ制限は無いので通る）。項目は欄より長くならないので、
+     * 欄の長さから一度だけ枠を取る。 */
+    size_t bufsz = strlen(text) + 1;
+    char *buf = malloc(bufsz);
+    if(!buf){ perror("malloc"); exit(1); }
     while(*p){
         while(*p == ' ' || *p == '\t') p++;
-        char buf[512]; int j = 0;
-        while(*p && *p != ',' && j < (int)sizeof(buf)-1) buf[j++] = axx_upper_char(*p++);
-        while(*p && *p != ',') p++;
+        int j = 0;
+        while(*p && *p != ',') buf[j++] = axx_upper_char(*p++);
         buf[j] = '\0';
         while(j > 0 && (buf[j-1] == ' ' || buf[j-1] == '\t')) buf[--j] = '\0';
 
@@ -6338,8 +6370,12 @@ static void elem_list_expand(AsmState *st, const char *text, StrVec *out){
             if(ar){
                 for(int k = 0; k < ar->len; k++){
                     if(ar->items[k].is_str){
-                        char up[512]; axx_strupr_to(up, ar->items[k].s, sizeof(up));
+                        size_t upsz = strlen(ar->items[k].s) + 1;
+                        char *up = malloc(upsz);
+                        if(!up){ perror("malloc"); exit(1); }
+                        axx_strupr_to(up, ar->items[k].s, upsz);
                         sv_push(out, up);
+                        free(up);
                     } else {
                         char num[96];
                         u256_to_pydec(ar->items[k].v, num, sizeof(num));
@@ -6353,6 +6389,7 @@ static void elem_list_expand(AsmState *st, const char *text, StrVec *out){
         if(*p == ',') p++;
         else break;
     }
+    free(buf);
 }
 
 /* 欄が空白だけか。axx.py はどこも `.strip()` の真偽で見るので、空白だけの欄は
@@ -6499,13 +6536,38 @@ static void elf_decl_trim(char *dst, size_t dsz, const char *src){
     dst[n] = '\0';
 }
 
+/* 宣言の欄を、長さの上限なく取り出す（前後の空白は落とす）。
+ *
+ * 破綻点修正: 呼び出し側はどこも char[32]/[64]/[128] の自動変数を渡していた
+ * ため、それを超える名前が黙って切り詰められ、axx.py（長さ制限なし）と
+ * 食い違っていた。`.elfsection` の宣言が引けず属性が既定のままになる、
+ * `.elftype` の型名が一致せずリロケーション型が解決されない、といった形で
+ * 出ていた。切り詰めは縮める方向しかないので strlen+1 で必ず足りる。
+ * axx_word_buf() と同じ考え方だが、こちらは行ではなく欄を丸ごと写す。
+ * 使い終わりに free() すること。 */
+static char *elf_decl_trim_dup(const char *src){
+    if(!src) src = "";
+    size_t n = strlen(src);
+    char *d = malloc(n + 1);
+    if(!d){ perror("malloc"); exit(1); }
+    elf_decl_trim(d, n + 1, src);
+    return d;
+}
+
 static int elftype_apply(Assembler *asmb, PatEntry *e){
     AsmState *st = &asmb->st;
     const char *name_str = e->f[1][0] ? e->f[1] : e->f[2];
     const char *val_str  = e->f[1][0] ? e->f[2] : "";
 
-    char nm[64]; size_t nn = 0;
-    for(const char *q = name_str; *q && nn + 1 < sizeof(nm); q++){
+    /* 破綻点修正: ここは char[64] だったため、64 文字以上の型名が黙って
+     * 切り詰められ、`.reloc` や `.extern` に書いた同じ名前と一致しなくなって
+     * 「unknown reloc type」の警告だけ出してリロケーション型が解決されずに
+     * いた（axx.py には長さ制限が無いので解決されていた）。長さは名前欄から
+     * 決まるので、そのぶんだけ確保する。 */
+    char *nm = malloc(strlen(name_str) + 1);
+    if(!nm){ perror("malloc"); exit(1); }
+    size_t nn = 0;
+    for(const char *q = name_str; *q; q++){
         if(*q == ' ' || *q == '\t') continue;
         nm[nn++] = (char)tolower((unsigned char)*q);
     }
@@ -6513,11 +6575,13 @@ static int elftype_apply(Assembler *asmb, PatEntry *e){
     if(!nm[0]){
         axx_diagf(1, 0, " error - .elftype: type name is not specified.\n");
         e->elftype_done = 1; e->elftype_val = 0;
+        free(nm);
         return 1;
     }
     if(!val_str[0]){
         axx_diagf(1, 0, " error - .elftype: type number is not specified ('%s').\n", nm);
         e->elftype_done = 1; e->elftype_val = 0;
+        free(nm);
         return 1;
     }
 
@@ -6532,6 +6596,7 @@ static int elftype_apply(Assembler *asmb, PatEntry *e){
                             "1..2147483647, got '%s'.\n", val_str);
             st->error_undefined_label = 0;
             e->elftype_done = 1; e->elftype_val = 0;
+            free(nm);
             return 1;
         }
         st->error_undefined_label = 0;
@@ -6542,6 +6607,7 @@ static int elftype_apply(Assembler *asmb, PatEntry *e){
         if(e->f[3][0]){
             if(!elf_decl_num(asmb, ".elftype", e->f[3], 1, 8, &_w)){
                 e->elftype_done = 1; e->elftype_val = 0;
+                free(nm);
                 return 1;
             }
             e->elftype_wid = (int)_w;
@@ -6549,6 +6615,7 @@ static int elftype_apply(Assembler *asmb, PatEntry *e){
         if(e->f[4][0]){
             if(!elf_decl_num(asmb, ".elftype", e->f[4], 0, 1, &_pc)){
                 e->elftype_done = 1; e->elftype_val = 0;
+                free(nm);
                 return 1;
             }
             e->elftype_pcr = (int)_pc;
@@ -6557,6 +6624,7 @@ static int elftype_apply(Assembler *asmb, PatEntry *e){
     }
     if(e->elftype_val > 0)
         elftype_set(st, nm, e->elftype_val, e->elftype_wid, e->elftype_pcr);
+    free(nm);
     return 1;
 }
 
@@ -6599,14 +6667,16 @@ static int dir_elfclass(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfclass") != 0) return 0;
     AsmState *st = &asmb->st;
     const char *f1, *f2; elf_decl_fields(e, &f1, &f2);
-    char t[32]; elf_decl_trim(t, sizeof(t), f1);
+    char *t = elf_decl_trim_dup(f1);
     int cls = 0;
     if(strcmp(t,"32")==0) cls = 1;
     else if(strcmp(t,"64")==0) cls = 2;
     else {
         axx_diagf(1, 0, " error - .elfclass: value must be 32 or 64, got '%s'.\n", t);
+        free(t);
         return 1;
     }
+    free(t);
     if(st->elf_decl_class != cls){ st->elf_decl_class = cls; st->elf_decl_gen++; }
     return 1;
 }
@@ -6615,15 +6685,17 @@ static int dir_elfrela(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfrela") != 0) return 0;
     AsmState *st = &asmb->st;
     const char *f1, *f2; elf_decl_fields(e, &f1, &f2);
-    char t[32]; elf_decl_trim(t, sizeof(t), f1);
+    char *t = elf_decl_trim_dup(f1);
     for(char *q=t; *q; q++) *q = (char)tolower((unsigned char)*q);
     int r;
     if(strcmp(t,"1")==0 || strcmp(t,"rela")==0) r = 1;
     else if(strcmp(t,"0")==0 || strcmp(t,"rel")==0) r = 0;
     else {
         axx_diagf(1, 0, " error - .elfrela: value must be 1/rela or 0/rel, got '%s'.\n", t);
+        free(t);
         return 1;
     }
+    free(t);
     if(st->elf_decl_rela != r){ st->elf_decl_rela = r; st->elf_decl_gen++; }
     return 1;
 }
@@ -6638,12 +6710,14 @@ static int dir_elfwidth(Assembler *asmb, PatEntry *e){
         axx_diagf(1, 0, " error - .elfwidth: width must be 1, 2, 4 or 8, got %lld.\n", w);
         return 1;
     }
-    char t[128]; elf_decl_trim(t, sizeof(t), tf);
+    char *t = elf_decl_trim_dup(tf);
     if(!t[0]){
         axx_diagf(1, 0, " error - .elfwidth: relocation type is not specified.\n");
+        free(t);
         return 1;
     }
     elf_decl_set_str(st, &st->elf_decl_width[(int)w], t);
+    free(t);
     return 1;
 }
 
@@ -6651,12 +6725,14 @@ static int dir_elfextern(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfextern") != 0) return 0;
     AsmState *st = &asmb->st;
     const char *f1, *f2; elf_decl_fields(e, &f1, &f2);
-    char t[128]; elf_decl_trim(t, sizeof(t), f1);
+    char *t = elf_decl_trim_dup(f1);
     if(!t[0]){
         axx_diagf(1, 0, " error - .elfextern: relocation type is not specified.\n");
+        free(t);
         return 1;
     }
     elf_decl_set_str(st, &st->elf_decl_extern, t);
+    free(t);
     return 1;
 }
 
@@ -6664,12 +6740,14 @@ static int dir_elfdwarf(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfdwarf") != 0) return 0;
     AsmState *st = &asmb->st;
     const char *f1, *f2; elf_decl_fields(e, &f1, &f2);
-    char t[128]; elf_decl_trim(t, sizeof(t), f1);
+    char *t = elf_decl_trim_dup(f1);
     if(!t[0]){
         axx_diagf(1, 0, " error - .elfdwarf: relocation type is not specified.\n");
+        free(t);
         return 1;
     }
     elf_decl_set_str(st, &st->elf_decl_dwarf, t);
+    free(t);
     return 1;
 }
 
@@ -6774,30 +6852,46 @@ static int dir_elfsection(Assembler *asmb, PatEntry *e){
     AsmState *st = &asmb->st;
     const char *name_str = e->f[1][0] ? e->f[1] : e->f[2];
     const char *flag_str = e->f[1][0] ? e->f[2] : "";
-    char nm[128]; elf_decl_trim(nm, sizeof(nm), name_str);
+    /* 破綻点修正: ここは char[128] だったため、128 文字以上のセクション名が
+     * 黙って切り詰められ、ソースの `.section` に書いた同じ名前と一致しなくなって
+     * 宣言が効かず、属性が名前の規則の既定のままになっていた（axx.py には長さ
+     * 制限が無いので効いていた）。 */
+    char *nm = elf_decl_trim_dup(name_str);
     if(!nm[0]){
         axx_diagf(1, 0, " error - .elfsection: section name is not specified.\n");
+        free(nm);
         return 1;
     }
     long long fl;
-    if(!elf_decl_num(asmb, ".elfsection", flag_str, 0, 0xFFFFFFFFll, &fl)) return 1;
+    if(!elf_decl_num(asmb, ".elfsection", flag_str, 0, 0xFFFFFFFFll, &fl)){
+        free(nm);
+        return 1;
+    }
     int type_set = 0; long long ty = 0;
     if(e->f[3][0]){
-        if(!elf_decl_num(asmb, ".elfsection", e->f[3], 0, 0xFFFFFFFFll, &ty)) return 1;
+        if(!elf_decl_num(asmb, ".elfsection", e->f[3], 0, 0xFFFFFFFFll, &ty)){
+            free(nm);
+            return 1;
+        }
         type_set = 1;
     }
     int al_set = 0; long long al = 0;
     if(e->f[4][0]){
-        if(!elf_decl_num(asmb, ".elfsection", e->f[4], 0, 0x40000000ll, &al)) return 1;
+        if(!elf_decl_num(asmb, ".elfsection", e->f[4], 0, 0x40000000ll, &al)){
+            free(nm);
+            return 1;
+        }
         if(al & (al - 1)){
             axx_diagf(1, 0, " error - .elfsection: alignment must be 0 or a "
                             "power of two, got '%lld'.\n", al);
+            free(nm);
             return 1;
         }
         al_set = 1;
     }
     elf_sec_set(st, nm, (uint32_t)fl, type_set, (uint32_t)ty,
                 al_set, (uint32_t)al);
+    free(nm);
     return 1;
 }
 
@@ -6824,8 +6918,13 @@ static uint32_t weo_default_align(uint32_t sh_type, int is_elf64){
 static void elf_section_attrs(const AsmState *st, const char *name,
                               uint64_t *flags, uint32_t *shtype,
                               int *al_set, uint32_t *al){
-    char un[64]; int ui=0;
-    for(;name[ui]&&ui<63;ui++) un[ui]=(char)axx_upper_char(name[ui]);
+    /* 破綻点修正: ここは char[64] だったため、64 文字以上のセクション名が
+     * 切り詰められていた。前方一致で見るのは先頭 7 文字までなので出力は
+     * 変わらなかったが、名前の扱いを他と揃えるため長さぶん確保する。 */
+    char *un = malloc(strlen(name)+1);
+    if(!un){ perror("malloc"); exit(1); }
+    int ui=0;
+    for(;name[ui];ui++) un[ui]=(char)axx_upper_char(name[ui]);
     un[ui]=0;
     uint64_t fl;
     if     (strncmp(un,".TEXT",5)==0)   fl=0x2|0x4;
@@ -6844,6 +6943,7 @@ static void elf_section_attrs(const AsmState *st, const char *name,
     *flags = fl; *shtype = sht;
     if(al_set) *al_set = a_set;
     if(al)     *al     = a_val;
+    free(un);
 }
 
 static int dir_reloc(Assembler *asmb, PatEntry *e){
@@ -10142,15 +10242,26 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *
     int j = idx;
     while(j < slen && (isalnum((unsigned char)s[j]) || s[j] == '_')) j++;
     int namelen = j - idx;
-    char name[512];
-    if(namelen <= 0 || namelen >= (int)sizeof(name)){
+    /* 破綻点修正: ここは char[512] 固定で、512 文字以上の関数名を
+     * 「`.call` の書式が違う」として断っていた（axx.py に長さ制限は無いので
+     * 呼べる）。名前は行の中の一続きなので、行長から枠を決める。 */
+    if(namelen <= 0){
         if(!quiet) axx_diagf(1, 0, " error - '.call' needs 'name(argument, ...)'.\n");
         return slen;
+    }
+    char namestack[512];
+    char *name = namestack;
+    char *name_heap = NULL;
+    if((size_t)namelen >= sizeof(namestack)){
+        name_heap = malloc((size_t)namelen + 1);
+        if(!name_heap){ perror("malloc"); exit(1); }
+        name = name_heap;
     }
     memcpy(name, s + idx, (size_t)namelen); name[namelen] = 0;
     idx = axx_skipspc(s, j);
     if(idx >= slen || s[idx] != '('){
         if(!quiet) axx_diagf(1, 0, " error - '.call' needs 'name(argument, ...)'.\n");
+        free(name_heap);
         return slen;
     }
     int depth = 0, k = idx;
@@ -10161,6 +10272,7 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *
     }
     if(depth != 0 || k >= slen){
         if(!quiet) axx_diagf(1, 0, " error - '.call %s': unbalanced parentheses.\n", name);
+        free(name_heap);
         return slen;
     }
     int arglen = k - idx - 1;
@@ -10175,6 +10287,7 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *
             axx_diagf(1, 0, " error - '.call': no function named '%s' (define it with "
                        "'.func::%s:: ... .endfunc').\n", name, name);
         free(argtext);
+        free(name_heap);
         return idx;
     }
 
@@ -10198,6 +10311,7 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *
                 for(int i = 0; i < nargs; i++) mini_val_free(&args[i]);
                 free(args);
                 free(argtext);
+                free(name_heap);
                 return idx;
             }
             a = io;
@@ -10251,6 +10365,7 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *
     free(r.out.data);
     for(int i = 0; i < nargs; i++) mini_val_free(&args[i]);
     free(args);
+    free(name_heap);
     return idx;
 }
 
@@ -10534,13 +10649,19 @@ static void readpat(Assembler *asmb, const char *fn){
                                    (int)(sizeof(func_stack)/sizeof(func_stack[0])));
                         continue;
                     }
-                    enum { FUNC_PARAM_MAX = 64, FUNC_NAME_MAX = 256 };
-                    char nmbuf[FUNC_NAME_MAX];
+                    enum { FUNC_PARAM_MAX = 64 };
+                    /* 破綻点修正: 名前と引数名の枠は FUNC_NAME_MAX=256 固定で、
+                     * 256 文字以上の `.func` 名を "name is too long" で断って
+                     * いた（axx.py に長さ制限は無いので通る）。名前も引数名も
+                     * その行より長くはならないので、行長から枠を決める。 */
+                    size_t FUNC_NAME_MAX = strlen(line) + 1;
+                    char *nmbuf = malloc(FUNC_NAME_MAX);
+                    if(!nmbuf){ perror("malloc"); exit(1); }
                     char *pbuf = malloc((size_t)FUNC_PARAM_MAX * FUNC_NAME_MAX);
                     if(!pbuf){ perror("malloc"); exit(1); }
                     char errbuf[512];
                     int nparam = 0;
-                    int hdr_err = parse_func_header(line, nmbuf, sizeof(nmbuf),
+                    int hdr_err = parse_func_header(line, nmbuf, FUNC_NAME_MAX,
                                                     pbuf, FUNC_NAME_MAX,
                                                     FUNC_PARAM_MAX, &nparam,
                                                     errbuf, sizeof(errbuf));
@@ -10549,9 +10670,14 @@ static void readpat(Assembler *asmb, const char *fn){
                         axx_diagf(1, 0, "%s", errbuf);
                         ok = 0;
                     } else if(!is_sub_name(nmbuf)){
-                        char _nr[600]; m_pyrepr(nmbuf, _nr, sizeof(_nr));
+                        /* repr はエスケープで最大 4 倍ほどに伸びる。名前を
+                         * 切り詰めると診断が axx.py と食い違うので長さから取る。 */
+                        size_t _nrsz = 4 * strlen(nmbuf) + 16;
+                        char *_nr = malloc(_nrsz); if(!_nr){ perror("malloc"); exit(1); }
+                        m_pyrepr(nmbuf, _nr, _nrsz);
                         axx_diagf(1, 0, " error - '.func' needs a name made of letters, "
                                    "digits and '_': %s\n", _nr);
+                        free(_nr);
                         ok = 0;
                     } else {
                         /* 破綻点修正: 引数名が壊れていても関数を登録して本体を
@@ -10601,6 +10727,7 @@ static void readpat(Assembler *asmb, const char *fn){
                         nf->parent = parent;
                     }
                     free(pbuf);
+                    free(nmbuf);
                     func_stack[nfunc_stack++] = nf;
                     continue;
                 }
@@ -12746,7 +12873,7 @@ static int adir_section(AsmState *st, const char *l, const char *l2){
             }
         }
 
-        snprintf(st->current_section, sizeof(st->current_section), "%s", l2);
+        st_set_current_section(st, l2);
 
         SecEntry *ne = secmap_find(&st->sections, l2);
         if(!ne){
@@ -18599,7 +18726,7 @@ int main(int argc, char *argv[]){
               free(_v); }
             secmap_clear(&st->sections);
             secrangevec_clear(&st->section_ranges);
-            strcpy(st->current_section, ".text");
+            st_set_current_section(st, ".text");
             lmap_free(&st->export_labels); lmap_init(&st->export_labels);
             sv_free(&st->export_order);
             smap_clear(&st->symbols);
@@ -18725,7 +18852,7 @@ int main(int argc, char *argv[]){
         st->line_map_len=0;
         secmap_clear(&st->sections);
         secrangevec_clear(&st->section_ranges);
-        strcpy(st->current_section, ".text");
+        st_set_current_section(st, ".text");
         /* 破綻点修正: pass1 の各リラクゼーション反復は毎回 vars/symbols を
          * initial_vars/patsymbols から作り直してから fileassemble() を
          * 呼んでいたが、pass2 は最後の pass1 反復が実行し終えた後の

@@ -2383,7 +2383,8 @@ class IEEE754Converter:
                 i = skip(s, i)
             for kw, dval in (('inf', Decimal('Infinity')), ('nan', Decimal('NaN'))):
                 if s[i:i + len(kw)] == kw:
-                    v = -dval if neg else dval
+                    # copy_negate() を使う理由は下の return と同じ。
+                    v = dval.copy_negate() if neg else dval
                     return v, i + len(kw)
             if i >= len(s) or s[i] not in '0123456789.':
                 raise ValueError(f"expected number at {i!r}")
@@ -2400,7 +2401,11 @@ class IEEE754Converter:
                 v = Decimal(s[start:i])
             except Exception as _e:
                 raise ValueError(f"invalid decimal literal: {s[start:i]!r}") from _e
-            return (-v if neg else v), i
+            # 単項マイナスは copy_negate() で入れる。Decimal の `-x` は十進算術の
+            # minus 演算なので負のゼロを正のゼロへ正規化してしまい、`-0.0` の符号が
+            # 消えて caxx（__float128 で符号ビットを立てる）と食い違う。
+            # copy_negate() は丸めを通さない符号反転なので、0 以外では `-x` と同じ。
+            return (v.copy_negate() if neg else v), i
 
         def parse_factor(s, i):
             i = skip(s, i)
@@ -2418,7 +2423,8 @@ class IEEE754Converter:
                     v, i = parse_factor(s, i + 1)
                 except RecursionError:
                     raise ValueError("decimal_eval_expr: expression nesting too deep")
-                return -v, i
+                # parse_number と同じ理由で copy_negate()（負のゼロの符号を保つ）
+                return v.copy_negate(), i
             if i < len(s) and s[i] == '+':
                 try:
                     return parse_factor(s, i + 1)
@@ -3184,6 +3190,10 @@ class ExpressionEvaluator:
                 f, t, idx = self.parser.get_curlb(s, idx)
                 if not f:
                     pass
+                elif t in ('nan', 'inf', '-inf'):
+                    # 明示して書いた無限大・非数（マニュアル 5.4 節）。dbl{} /
+                    # flt{} と同じく、式としてではなくそのまま通す。
+                    x = int(IEEE754Converter.decimal_to_ieee754_128bit_hex(t), 16)
                 else:
                     try:
                         h = IEEE754Converter.decimal_eval_expr(t)
@@ -3202,6 +3212,14 @@ class ExpressionEvaluator:
                             else:
                                 h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
                                         str(Decimal(repr(float(v)))))
+                    # 破綻点修正: 結果が binary128 の幅を越えて無限大になっても
+                    # 黙って通していた（`qad{1e4933}` や `qad{inf+2}`）。幅を
+                    # 越えたらエラーにする（dbl{} / flt{} と同じ規則。caxx.c の
+                    # f128_eval_text() が非有限を失敗とするのと揃える）。
+                    # 明示して書いた `inf` / `-inf` / `nan` は上の分岐が拾う。
+                    if (int(h, 16) >> 112) & 0x7fff == 0x7fff:
+                        self.state.diag(f" error - qad{{}}: cannot evaluate expression '{t}'; using 0.", set_error=True)
+                        h = '0' * 32
                     x = int(h, 16)
         elif (idx + 3 <= len(s) and s[idx:idx + 3] == 'dbl'
               and (lambda _j=StringUtils.skipspc(s, idx + 3): _j < len(s) and s[_j] == '{')()):
@@ -3217,6 +3235,13 @@ class ExpressionEvaluator:
                 else:
                     try:
                         v = float(self.xeval(t, None))
+                        # 破綻点修正: 有限かを見ていなかったため、`dbl{1e309}` の
+                        # ように float64 の幅を越えた値が無限大として黙って通って
+                        # いた。幅を越えたらエラーにする（flt{} / qad{} と同じ
+                        # 規則。caxx.c の dbl{} の分岐と同じ）。明示して書いた
+                        # `inf` / `-inf` / `nan` は上の分岐が拾う。
+                        if v != v or v in (float('inf'), float('-inf')):
+                            raise OverflowError('non-finite')
                         x = int.from_bytes(struct.pack('>d', v), "big")
                     except (OverflowError, ValueError, TypeError, struct.error, ZeroDivisionError):
                         self.state.diag(" error - dbl{}: cannot convert expression to float64; using 0.", set_error=True)
@@ -3235,6 +3260,12 @@ class ExpressionEvaluator:
                 else:
                     try:
                         v = float(self.xeval(t, None))
+                        # 破綻点修正: struct.pack('>f') は float32 の範囲を越えた
+                        # 「有限の」値では OverflowError を出すが、すでに無限大に
+                        # なっている値（`flt{1e309}` は float() の段で inf になる）は
+                        # そのまま通していた。dbl{} / qad{} と同じ規則に揃える。
+                        if v != v or v in (float('inf'), float('-inf')):
+                            raise OverflowError('non-finite')
                         x = int.from_bytes(struct.pack('>f', v), "big")
                     except (OverflowError, ValueError, TypeError, struct.error, ZeroDivisionError):
                         self.state.diag(" error - flt{}: cannot convert expression to float32; using 0.", set_error=True)

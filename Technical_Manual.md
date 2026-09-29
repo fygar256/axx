@@ -16,7 +16,9 @@ make                            # builds and installs caxx, paxx, axx and the ma
 To build only the C implementation:
 
 ```sh
-gcc caxx.c -o caxx -lm -O2      # -lm is required: the expression evaluator uses libm
+gcc caxx.c -o caxx -lm -lquadmath -O2   # -lm for the expression evaluator,
+                                        # -lquadmath for the 128-bit float
+                                        # conversion (strtoflt128)
 ```
 
 Assemble:
@@ -2704,6 +2706,24 @@ c1: .equ flt{3.14}
 `:label` inside such an expression refers to the label's value directly.
 `inf`, `-inf` and `nan` are accepted. Use `0b` for binary literals and `0x` for
 hexadecimal.
+
+**A value that overflows the width is an error.** In `!F` / `!D` / `!Q` and in
+`flt{}` / `dbl{}` / `qad{}` alike, a finite computation whose result leaves the
+range of that width is reported as "cannot convert" and stops the assembly; no
+infinity is emitted quietly. `flt{1e39}`, `dbl{1e309}` and `qad{1e4933}` are all
+errors. An **explicitly written `inf` / `-inf` / `nan` still passes**: when the
+braces contain exactly that spelling it is taken as a value, so `qad{inf}` is the
+infinity bit pattern. Mixed into arithmetic, as in `qad{inf+2}`, it is an
+expression and therefore an error.
+
+**Arithmetic inside `qad{}` can disagree in the last bit.** A single value
+(`qad{3.14}`) is identical in both implementations. Only when arithmetic is
+involved do they part: Caxx rounds after each binary128 operation, Paxx computes
+in 60 decimal digits and rounds once at the end, so a decimal fraction that
+binary cannot represent exactly can come out 1 ULP apart (`qad{0.1+0.2}`,
+`qad{3.14+2.5}`). Operands that binary represents exactly (`qad{1/3}`,
+`qad{1e10*1e10}`) agree. `flt{}` and `dbl{}` compute in double in both
+implementations, so they do not have this difference.
 
 ### 5.5 Sections
 
