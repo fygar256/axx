@@ -99,6 +99,23 @@ endsub.axx                          pattern file for closing a `.sub` block with
                                     tables referred to from another table
                                     (manual 3.7.2)
 endsub.s                            test assemble file for endsub.axx
+intel2att.axx                       pattern file that translates x86-64 Intel
+                                    syntax source into AT&T syntax source text:
+                                    .textmode with `!Y` symbol captures for the
+                                    register and mnemonic sets, `!L` captures so
+                                    labels and expressions keep the spelling
+                                    they had in the input, and the macro layer
+                                    (`!def` / `!while`) to generate the 28
+                                    memory-operand shapes for every operand
+                                    size. Swaps the operand order, adds `%` to
+                                    registers and `$` to immediates, rewrites
+                                    [base+index*scale+disp] as
+                                    disp(%base,%index,scale), and derives the
+                                    b/w/l/q suffix (manual 3.18)
+intel2att.s                         test assemble file for intel2att.axx. the
+                                    translated text is valid AT&T assembly:
+                                    `caxx intel2att.axx intel2att.s -V |
+                                    as --64 -o att.o -`
 8080toz80.axx                       pattern file that translates Intel 8080 source
                                     into Zilog Z80 source text: .textmode, `!L`
                                     captures and `{{.exp()}}`, so labels and

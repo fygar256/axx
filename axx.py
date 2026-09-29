@@ -5061,8 +5061,15 @@ class DirectiveProcessor:
                 n_int = int(n)
             except (OverflowError, ValueError, TypeError):
                 n_int = None
-        if n_int is None or n_int != n or n_int < 0:
-            self.state.diag(f" error - .error: error code must be a non-negative integer, got {n_field!r}.", set_error=True)
+        # 破綻点修正: 上限を見ていなかった。エラーコードは self.state.errors の
+        # 添字で、その分だけ空文字列を詰めて伸ばすので、巨大な値を書かれると
+        # 数十億要素の確保でハングする（caxx.c は AXX_ERROR_CODE_MAX で弾く）。
+        # 同じ上限・同じ文面にそろえる。
+        _ERROR_CODE_MAX = 1000000
+        if (n_int is None or n_int != n or n_int < 0
+                or n_int > _ERROR_CODE_MAX):
+            self.state.diag(f" error - .error: error code must be a non-negative integer "
+                            f"(0-{_ERROR_CODE_MAX}), got {n_field!r}.", set_error=True)
             return True
 
         if not msg_field.strip().startswith('"'):
@@ -6754,9 +6761,13 @@ class MiniParser:
             node, i = self._if_chain(i)
             else_b = [node]
         elif nkw == '.ELSE':
-            rest = _mini_lex(self.lines[i][0], pos)[1:]
+            # 破綻点修正: `.else` 行の誤りなのに `.if` 行の位置を報告していた
+            # （caxx.c の msp_if_chain() は `.else` 行の位置を使う）。字句解析に
+            # 渡す位置も同じく `.else` 行にする。
+            epos = (self.lines[i][1], self.lines[i][2])
+            rest = _mini_lex(self.lines[i][0], epos)[1:]
             if rest:
-                raise MiniLangError(f"{f}:{ln}: unexpected text after '.else'")
+                raise MiniLangError(f"{epos[0]}:{epos[1]}: unexpected text after '.else'")
             else_b, i = self._block(i + 1, ('.ENDIF',))
             if i >= len(self.lines):
                 raise MiniLangError(f"{f}:{ln}: '.if' is never closed with '.endif'")

@@ -1919,10 +1919,20 @@ static AXX_UNUSED void bufmap_free(BufMap*m){
     for(int i=0;i<BUFMAP_NB;i++){BufEntry*e=m->buckets[i];while(e){BufEntry*n=e->next;free(e);e=n;}m->buckets[i]=NULL;}
 }
 
-#define OB_CHAR  ((char)0x90)
-#define CB_CHAR  ((char)0x91)
-#define VLIW_SEP_CHAR  ((char)0x92)
-#define VLIW_STOP_CHAR ((char)0x93)
+/* 行の中に一時的に差し込む番兵。
+ *
+ * 破綻点修正: 以前は 0x90〜0x93 を使っていた。axx.py はこれを Python の
+ * 「文字」（U+0092 等）として扱うので日本語の文字と衝突しないが、caxx は
+ * バイト列として扱うため、0x92/0x93 は UTF-8 の継続バイトそのものである。
+ * その結果、`こ`(E3 81 93)・`験`(E9 A8 93)・`げ`(E3 81 92) のような
+ * ありふれた文字を含む行が、引用符の外（.textmode の素通し行など）では
+ * その文字の途中で切り落とされていた（`… の試験ソース` → `… の試<切断>`）。
+ * 正しい UTF-8 には決して現れないバイト 0xFC〜0xFF に移す。こうすると
+ * 番兵は「自分で差し込んだものだけ」になる。 */
+#define OB_CHAR  ((char)0xFC)
+#define CB_CHAR  ((char)0xFD)
+#define VLIW_SEP_CHAR  ((char)0xFE)
+#define VLIW_STOP_CHAR ((char)0xFF)
 #define EXP_PAT  0
 #define EXP_ASM  1
 
@@ -3427,19 +3437,17 @@ static void axx_resolve_vliw_escapes(char *l) {
  * VLIW 区切りの番兵でも切る（`NOP!!NOP` のように空白なしで次スロットが続く
  * 書き方で、ニーモニックが隣のスロットを飲み込まないように）。
  *
- * 番兵の判定は引用符の外だけで行う。番兵を「挿入」する
- * axx_resolve_vliw_escapes() が引用符の中を素通ししている以上、「探す」側も
- * 引用符の中を見てはいけない。番兵の値 0x92/0x93 は UTF-8 の継続バイトでもあり、
- * .ascii "..." の中の多バイト文字（例: 日本語）に生の 0x92/0x93 が正当に現れる
- * ため、引用符内で判定すると文字列の途中で切れてしまう。 */
+ * 破綻点修正: 以前は引用符の中を追って、その中の空白では切らなかった。
+ * axx.py の get_param_to_spc() は引用符を一切見ず、最初の空白で切る。
+ * その違いが呼び出し側の `l` から空白を全部落とす処理（axx.py の
+ * `l = l.replace(' ', '')` と同じもの）と噛み合い、`foo"a b"` のように
+ * 1語目の中に引用符がある行で caxx だけ空白が消えていた
+ * （`.passthru` の素通しで `foo"ab"` になる）。axx.py と同じ規則にそろえる。 */
 static int axx_get_param_to_spc(const char *s, int idx, char *t, size_t tsz) {
     idx=axx_skipspc(s,idx);
     size_t n=0;
-    int in_str=0;
     while(s[idx]&&n<tsz-1){
-        if(!in_str&&(s[idx]==' '||s[idx]==VLIW_SEP_CHAR||s[idx]==VLIW_STOP_CHAR)) break;
-        if(s[idx]=='"') in_str=!in_str;
-        else if(in_str&&s[idx]=='\\'&&s[idx+1]){ t[n++]=s[idx++]; if(n>=tsz-1) break; }
+        if(s[idx]==' '||s[idx]==VLIW_SEP_CHAR||s[idx]==VLIW_STOP_CHAR) break;
         t[n++]=s[idx++];
     }
     t[n]=0;
@@ -3447,15 +3455,12 @@ static int axx_get_param_to_spc(const char *s, int idx, char *t, size_t tsz) {
 }
 
 /* 行の残り（空白を含む＝オペランド部分）を VLIW 区切りの手前まで取る。
- * 番兵の判定を引用符の外だけで行う理由は axx_get_param_to_spc() を参照。 */
+ * 破綻点修正: 引用符を追っていた理由は axx_get_param_to_spc() を参照。 */
 static int axx_get_param_to_eon(const char *s, int idx, char *t, size_t tsz) {
     idx=axx_skipspc(s,idx);
     size_t n=0;
-    int in_str=0;
     while(s[idx]&&n<tsz-1){
-        if(!in_str&&(s[idx]==VLIW_SEP_CHAR||s[idx]==VLIW_STOP_CHAR)) break;
-        if(s[idx]=='"') in_str=!in_str;
-        else if(in_str&&s[idx]=='\\'&&s[idx+1]){ t[n++]=s[idx++]; if(n>=tsz-1) break; }
+        if(s[idx]==VLIW_SEP_CHAR||s[idx]==VLIW_STOP_CHAR) break;
         t[n++]=s[idx++];
     }
     while(n>0&&(t[n-1]==' '||t[n-1]=='\t')) n--;
@@ -4800,6 +4805,7 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
 static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_safe_bitwise_operand(Assembler *asmb, uint256_t v, const char *op_name);
+static int expr_num_operand(Assembler *asmb, uint256_t v, uint256_t *out);
 static uint256_t expr_bitwise_result(Assembler *asmb, uint256_t v);
 static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term3(Assembler *asmb, const char *s, int idx, int *idx_out);
@@ -4966,11 +4972,26 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
                 uint256_t x2=expr_expression(asmb,s,idx+1,&i3); idx=i3;
                 if(s[idx]==')'){
                     idx++;
-                    /* 実装は共有関数 op_byte() 側。マクロ層も同じものを呼ぶ。 */
-                    int neg = 0;
-                    x = op_byte(x, x2, &neg);
-                    if(neg && should_report_errors(st)){
-                        axx_diagf(1, 0, " error - negative byte-extract offset in *(expr, expr).\n");
+                    /* 実装は共有関数 op_byte() 側。マクロ層も同じものを呼ぶ。
+                     * 浮動小数点モードでは値も添字も数に直してから渡す
+                     * （expr_num_operand のコメントを参照）。分岐の順と文面は
+                     * axx.py の op_byte() に合わせる。 */
+                    uint256_t _bv, _bi;
+                    if(!expr_num_operand(asmb, x2, &_bi)){
+                        if(should_report_errors(st))
+                            axx_diagf(1, 0, " error - non-finite byte-extract offset in *(expr, expr).\n");
+                        x = expr_bitwise_result(asmb, u256_zero());
+                    } else if(u256_is_neg256(_bi)){
+                        if(should_report_errors(st))
+                            axx_diagf(1, 0, " error - negative byte-extract offset in *(expr, expr).\n");
+                        x = expr_bitwise_result(asmb, u256_zero());
+                    } else if(!expr_num_operand(asmb, x, &_bv)){
+                        if(should_report_errors(st))
+                            axx_diagf(1, 0, " error - non-finite value in *(expr, expr) byte extract.\n");
+                        x = expr_bitwise_result(asmb, u256_zero());
+                    } else {
+                        int neg = 0;
+                        x = expr_bitwise_result(asmb, op_byte(_bv, _bi, &neg));
                     }
                 } else {
                     if(should_report_errors(st)){
@@ -5792,6 +5813,27 @@ static uint256_t expr_bitwise_result(Assembler *asmb, uint256_t v){
     return v;
 }
 
+/* 浮動小数点モードの値を「数としての整数」に落とす。
+ *
+ * 破綻点修正: `'`（符号拡張）と `*(x,y)`（バイト抽出）だけが、この変換を
+ * 通さずに uint256_t をそのまま共有関数へ渡していた。浮動小数点モードでは
+ * uint256_t は double のビット列なので、`255'8` の幅 8 が
+ * 4620693217682128896（8.0 のビット列）として読まれ、axx.py（int(bits) で
+ * 数に直す）と全く違う結果になっていた。`~`/`@`/`<<`/`&` 等が使っている
+ * 変換と同じものをここにも通す。
+ * 非有限なら 0 を返して *ok=0 相当（返り値 0）にする。axx.py の
+ * op_sext()/op_byte() が int() の例外で分岐するのと同じ位置づけ。 */
+static int expr_num_operand(Assembler *asmb, uint256_t v, uint256_t *out){
+    if(asmb->st.exp_typ_float){
+        double d = u256_to_double(v);
+        if(!isfinite(d)){ *out = u256_zero(); return 0; }
+        *out = double_trunc_to_u256(d);
+        return 1;
+    }
+    *out = v;
+    return 1;
+}
+
 static uint256_t expr_term3(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term2(asmb,s,idx,&idx);
     int slen=expr_slen(s);
@@ -5829,14 +5871,23 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
         int ni=idx+1; ni=axx_skipspc(s,ni);
         if(ni>=slen||((s[ni]<'0'||s[ni]>'9')&&s[ni]!='(')) break;
         uint256_t t=expr_term5(asmb,s,idx+1,&idx);
-        /* 実装は共有関数 op_sext() 側。マクロ層も同じものを呼ぶ。 */
+        /* 実装は共有関数 op_sext() 側。マクロ層も同じものを呼ぶ。
+         * 浮動小数点モードでは値も幅も数に直してから渡す（expr_num_operand）。 */
+        uint256_t _xv, _tv;
+        if(!expr_num_operand(asmb, x, &_xv) || !expr_num_operand(asmb, t, &_tv)){
+            /* 非有限。axx.py の op_sext() は int() の例外で「続行不可」を返し、
+             * 呼び出し側が連鎖を打ち切る（診断は出さない）。 */
+            x = expr_bitwise_result(asmb, u256_zero());
+            break;
+        }
         int warn = 0;
-        x = op_sext(x, t, &warn);
+        uint256_t _sr = op_sext(_xv, _tv, &warn);
         if(warn && should_report_errors(&asmb->st)){
-            char cb[96]; u256_to_pydec(t, cb, sizeof(cb));
+            char cb[96]; u256_to_pydec(_tv, cb, sizeof(cb));
             axx_diagf(0, 0, " warning - sign-extension bit width %s exceeds maximum %d, result set to 0.\n",
                        cb, SEXT_MAX_BITS);
         }
+        x = expr_bitwise_result(asmb, _sr);
     }
     *idx_out=idx; return x;
 }
@@ -6142,7 +6193,10 @@ static int dir_bits(Assembler *asmb, PatEntry *e){
         int64_t nb = u256_to_i64(v);
         if(asmb->st.error_undefined_label || u256_is_undef_derived(v)
            || nb < 1 || nb > 64 || !u256_eq(v, u256_from_i64(nb))){
-            axx_diagf(1, 0, " error - .bits: word width must be an integer in 1..64, got '%s'.\n", wf);
+            /* 破綻点修正: axx.py は `{wf!r}` と Python の repr で出すので、
+             * `\` を含む欄で文面が食い違っていた（'\8' 対 '\\8'）。 */
+            { char _wr[600]; m_pyrepr(wf, _wr, sizeof(_wr));
+              axx_diagf(1, 0, " error - .bits: word width must be an integer in 1..64, got %s.\n", _wr); }
         } else {
             asmb->st.bts = (int)nb;
         }
@@ -7200,7 +7254,13 @@ static int dir_errmsg(Assembler *asmb, PatEntry *e){
     #define AXX_ERROR_CODE_MAX 1000000
     if(st->error_undefined_label || u256_is_undef_derived(n)
        || n_int < 0 || n_int > AXX_ERROR_CODE_MAX || !u256_eq(n, u256_from_i64(n_int))){
-        axx_diagf(1, 0, " error - .error: error code must be a non-negative integer (0-%d), got '%s'.\n", AXX_ERROR_CODE_MAX, n_field);
+        /* 破綻点修正: 同上（axx.py は `{n_field!r}`）。 */
+        { size_t _nsz = strlen(n_field)*4+8; char *_nr = malloc(_nsz);
+          if(!_nr){ perror("malloc"); exit(1); }
+          m_pyrepr(n_field, _nr, _nsz);
+          axx_diagf(1, 0, " error - .error: error code must be a non-negative integer (0-%d), got %s.\n",
+                    AXX_ERROR_CODE_MAX, _nr);
+          free(_nr); }
         st->error_undefined_label = 0;
         return 1;
     }
@@ -7208,7 +7268,12 @@ static int dir_errmsg(Assembler *asmb, PatEntry *e){
 
     int idx0 = axx_skipspc(msg_field, 0);
     if(msg_field[idx0] != '"'){
-        axx_diagf(1, 0, " error - .error: message must be a double-quoted string, got '%s'.\n", msg_field);
+        /* 破綻点修正: 同上（axx.py は `{msg_field!r}`）。 */
+        { size_t _msz = strlen(msg_field)*4+8; char *_mr = malloc(_msz);
+          if(!_mr){ perror("malloc"); exit(1); }
+          m_pyrepr(msg_field, _mr, _msz);
+          axx_diagf(1, 0, " error - .error: message must be a double-quoted string, got %s.\n", _mr);
+          free(_mr); }
         return 1;
     }
 
@@ -10514,8 +10579,13 @@ static void readpat(Assembler *asmb, const char *fn){
                           || strcmp(dk, ".ENDWHILE") == 0){
                     cur->depth--;
                     if(cur->depth < 0){
+                        /* 破綻点修正: axx.py は `{_dk.lower()}` と小文字で出す。 */
+                        char _dkl[32]; size_t _di = 0;
+                        for(; dk[_di] && _di + 1 < sizeof(_dkl); _di++)
+                            _dkl[_di] = (char)tolower((unsigned char)dk[_di]);
+                        _dkl[_di] = '\0';
                         axx_diagf(1, 0, " error - '.func::%s': %s without a matching "
-                                   "block opener.\n", cur->name, dk);
+                                   "block opener.\n", cur->name, _dkl);
                         cur->depth = 0;
                     }
                 }
@@ -15559,6 +15629,21 @@ static void m_pyrepr(const char *s, char *out, size_t outsz){
  * 写していたため、長い式や長い文字列値（`"a"*1295` 等）が途中で切れて
  * axx.py（切り詰めない）と文面が食い違っていた。必要な長さぶんをマクロ層の
  * アリーナから取る（m_fail が longjmp で抜けても漏れない）。 */
+/* `}` の後ろに残った字。axx.py は `.strip()` してから見て、空または `;` で
+ * 始まるならコメントとして許す。空でなければ Python の repr で報告する。
+ * 破綻点修正: caxx は左側しか削らず、`;` のコメントも許していなかったうえ、
+ * repr にもしていなかった。 */
+static char *m_trailer(MacroPP *mp, const char *s){
+    const char *b = s;
+    while(*b == ' ' || *b == '\t') b++;
+    size_t n = strlen(b);
+    while(n > 0 && isspace((unsigned char)b[n-1])) n--;
+    if(n == 0 || b[0] == ';') return NULL;
+    char *r = marena_alloc(&mp->arena, n + 1);
+    memcpy(r, b, n); r[n] = '\0';
+    return r;
+}
+
 static char *m_pyrepr_a(MacroPP *mp, const char *s){
     if(!s) s = "";
     size_t sz = strlen(s) * 4 + 8;
@@ -17105,7 +17190,8 @@ static MNode *m_parse_if(MacroPP *mp, MSrc *src, int *ip, int depth){
 
         char w[64];
         const char *rest = m_statement_word(tail, w, sizeof(w));
-        if(!rest) m_fail(mp, cfile, cline, "unexpected text after '}': %s", tail);
+        if(!rest) m_fail(mp, cfile, cline, "unexpected text after '}': %s",
+                         m_pyrepr_a(mp, tail));
 
         if(strcasecmp(w, "elif") == 0){
             cond = m_parse_header(mp, tail, "elif", cfile, cline);
@@ -17124,9 +17210,10 @@ static MNode *m_parse_if(MacroPP *mp, MSrc *src, int *ip, int depth){
             if(*ip >= src->n)
                 m_fail(mp, cfile, cline, "'!else' block is never closed");
             char *c2 = m_trim(mp, m_strip_comment(mp, src->d[*ip].text));
-            if(*m_lstrip(c2 + 1))
+            { char *_tr = m_trailer(mp, c2 + 1);
+              if(_tr)
                 m_fail(mp, src->d[*ip].file, src->d[*ip].line,
-                       "unexpected text after '}': %s", m_lstrip(c2 + 1));
+                       "unexpected text after '}': %s", m_pyrepr_a(mp, _tr)); }
             (*ip)++;
             return n;
         }
@@ -17144,9 +17231,10 @@ static MNode *m_parse_while(MacroPP *mp, MSrc *src, int *ip, int depth){
     if(*ip >= src->n)
         m_fail(mp, file, line, "'!while' block is never closed with '}'");
     char *c2 = m_trim(mp, m_strip_comment(mp, src->d[*ip].text));
-    if(*m_lstrip(c2 + 1))
+    { char *_tr = m_trailer(mp, c2 + 1);
+      if(_tr)
         m_fail(mp, src->d[*ip].file, src->d[*ip].line,
-               "unexpected text after '}': %s", m_lstrip(c2 + 1));
+               "unexpected text after '}': %s", m_pyrepr_a(mp, _tr)); }
     (*ip)++;
     return n;
 }
@@ -17243,9 +17331,10 @@ static MNode *m_parse_def(MacroPP *mp, MSrc *src, int *ip, int depth){
     if(*ip >= src->n)
         m_fail(mp, file, line, "'!def %s' block is never closed", name);
     char *c2 = m_trim(mp, m_strip_comment(mp, src->d[*ip].text));
-    if(*m_lstrip(c2 + 1))
+    { char *_tr = m_trailer(mp, c2 + 1);
+      if(_tr)
         m_fail(mp, src->d[*ip].file, src->d[*ip].line,
-               "unexpected text after '}': %s", m_lstrip(c2 + 1));
+               "unexpected text after '}': %s", m_pyrepr_a(mp, _tr)); }
     (*ip)++;
     return n;
 }

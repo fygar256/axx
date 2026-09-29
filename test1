@@ -29,6 +29,8 @@ caxx echo.axx echo.s -b b25 2>&1 | grep -v '^wrote ' > b25e
 caxx elfprio.axx elfprio.s -o b26
 caxx elfsec.axx elfsec.s -o b27
 caxx endsub.axx endsub.s -b b28
+caxx intel2att.axx intel2att.s -b b29
+caxx intel2att.axx intel2att.s -V > b30
 
 paxx 4004.axx 4004.s -b a0
 paxx z80.axx z80.s -b a1
@@ -59,6 +61,8 @@ paxx echo.axx echo.s -b a25 2>&1 | grep -v '^wrote ' > a25e
 paxx elfprio.axx elfprio.s -o a26
 paxx elfsec.axx elfsec.s -o a27
 paxx endsub.axx endsub.s -b a28
+paxx intel2att.axx intel2att.s -b a29
+paxx intel2att.axx intel2att.s -V > a30
 
 FAIL=0
 
@@ -92,6 +96,8 @@ cmp a25e b25e || FAIL=1
 cmp a26 b26 || FAIL=1
 cmp a27 b27 || FAIL=1
 cmp a28 b28 || FAIL=1
+cmp a29 b29 || FAIL=1
+cmp a30 b30 || FAIL=1
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

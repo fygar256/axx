@@ -37,11 +37,11 @@ axx 8080toz80.axx hello8080.s -V > out.s  # translated text to stdout
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all twenty-seven bundled pattern/source pairs with
-both implementations and `cmp`s the results. For the two `.textmode` pairs it also
+exactly that: `test1` assembles all twenty-eight bundled pattern/source pairs with
+both implementations and `cmp`s the results. For the three `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` pair the `.echo` lines each one writes to standard
-error, for thirty comparisons in all.
+error, for thirty-two comparisons in all.
 
 **Contents**
 
@@ -2456,6 +2456,56 @@ comes out assembles as it is with `z80.axx`. Sending the text to standard output
 is `-V`'s job, so without it nothing appears on screen (`-b` still writes the
 same text to a file).
 
+#### Example: Intel syntax to AT&T syntax
+
+The bundled `intel2att.axx` is a larger example of the same mode: it rewrites
+x86-64 source written in Intel syntax into AT&T syntax that GNU as takes as it
+is.
+
+```sh
+caxx intel2att.axx intel2att.s -V > att.s
+caxx intel2att.axx intel2att.s -V | as --64 -o att.o -
+```
+
+It does five things:
+
+- swaps the operand order (`dst,src` to `src,dst`);
+- puts `%` on registers and `$` on immediates;
+- rewrites `[base+index*scale+disp]` as `disp(%base,%index,scale)`;
+- derives the `b`/`w`/`l`/`q` suffix from the size override (`QWORD PTR` and
+  friends) or from the register width;
+- substitutes the mnemonics whose spelling differs (`cqo` to `cqto`, `cdq` to
+  `cltd`, `stosd` to `stosl` and so on).
+
+```
+        mov     rsi, offset msg          ->  movq $msg, %rsi
+        mov     eax, 4                   ->  movl $4, %eax
+        add     rsp, 8*4                 ->  addq $8*4, %rsp
+        mov     rax, [rbx+rcx*8+32]      ->  movq 32(%rbx,%rcx,8), %rax
+        mov     byte ptr [rdi+rcx], 0x41 ->  movb $0x41, (%rdi,%rcx)
+        lea     rsi, [rip+msg]           ->  leaq msg(%rip), %rsi
+        movzx   eax, byte ptr [rsi]      ->  movzbl (%rsi), %eax
+        push    qword ptr [rbx+8]        ->  pushq 8(%rbx)
+        jne     start                    ->  jne start
+        cqo                              ->  cqto
+```
+
+Three things carry the weight of how it is written. Register names and mnemonics
+are declared with `.setsym` as sets of names, and `!Yset[variable]`
+([section 3.6.3](#363-symbol-capture-y)) captures the *index* of the one that
+matched. Because it is an index, looking another set up with the same index
+yields the AT&T spelling directly. Labels and expressions are captured with `!L`
+and emitted with `{{.exp(…)}}`, so both `8*4` and `msg` keep the spelling they
+were written with. And writing out the 28 memory-operand shapes (`[B]`, `[B+D]`,
+`[B+I*S+D]`, `[RIP+D]`, …) for four operand sizes and three ways of spelling the
+size override is not something to do by hand, so the macro layer's `!def` and
+`!while` ([section 7](#7-macro-layer)) generate them. The expanded pattern table
+can be read with `caxx intel2att.axx -p out.axx`.
+
+Forms it does not cover (a `lock` prefix on a two-operand instruction,
+`push word ptr`, …) come through unchanged by `.textmode` passthrough, so what
+was translated and what was not is visible in the output.
+
 
 ---
 
@@ -3419,6 +3469,7 @@ The x86_64 pattern file is also maintained separately at
 | **elfprio.axx** | 1.7 KB | 19 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
 | **elfsec.axx** | 1.1 KB | 6 | **elfsec.s** | section attributes declared with `.elfsection` (3.7.7); test only |
 | **endsub.axx** | 1.2 KB | 4 | **endsub.s** | closing a `.sub` block with `.endsub` (3.7.2); test only |
+| **intel2att.axx** | 12 KB | 434 | **intel2att.s** | x86-64 Intel to AT&T source translator; `.textmode`, `!Y`, `!L` and macro-layer pattern generation (3.18). The translated text assembles with GNU as |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
 | **vliw.axx** | 178 B | 10 | **vliw.s** | Non-EPIC VLIW; test only |
 | **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck virtual CPU; hello-world demo. Bundled, but not part of `test1` |
@@ -3427,8 +3478,8 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 `itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
 `aarch64_logical_mini_demo.s`.
 
-`test1` runs all twenty-seven pairs through both implementations and
-compares the `-b` raw binaries. For the two pairs that use `.textmode`
+`test1` runs all twenty-eight pairs through both implementations and
+compares the `-b` raw binaries. For the three pairs that use `.textmode`
 (`textmode.axx` and `8080toz80.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
 `elftype.s` and `elfgen.axx` / `elfgen.s` pairs are about relocations and the
@@ -3436,7 +3487,7 @@ ELF header, the `elfprio.axx` / `elfprio.s` pair is about which of the three
 ranks types a relocation, and the `elfsec.axx` / `elfsec.s` pair is about the
 section headers, so for those four the `-o` ELF objects are compared. For the
 `echo.axx` / `echo.s` pair the `.echo` lines written to standard error are
-compared as well, for thirty comparisons in all.
+compared as well, for thirty-two comparisons in all.
 
 The `aarch64.axx` / `aarch64.s` pair is much the slowest of them: the Python
 implementation takes about twenty seconds on it, against about a second for the
@@ -3464,7 +3515,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 
 `test1` assembles all twenty-six bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
-two `.textmode` pairs and the `.echo` lines of the `echo.axx` pair.
+three `.textmode` pairs and the `.echo` lines of the `echo.axx` pair.
 
 ### C.2 External
 

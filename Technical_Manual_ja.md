@@ -37,10 +37,10 @@ axx 8080toz80.axx hello8080.s -V > out.s  # 翻訳したテキストを標準出
 
 この 2 つは同じ入力に対して**バイト単位で同一の出力**を生成することを意図しています。
 同梱のパターンファイル、テストソース、`test1` スクリプトはまさにそれを検証するために
-存在します。`test1` は同梱の 27 組のパターン/ソースの対を両方の実装でアセンブルし、
+存在します。`test1` は同梱の 28 組のパターン/ソースの対を両方の実装でアセンブルし、
 結果を `cmp` します。さらに `.textmode` の 2 組については、`-V` で標準出力へ流した
 翻訳テキストどうしも、`echo.axx` の組については標準エラーへ出た `.echo` の行どうしも
-`cmp` します（全 30 組）。
+`cmp` します（全 32 組）。
 
 **目次**
 
@@ -2293,6 +2293,51 @@ msg: db 'Hello, world$'
 これを付けないと翻訳結果は画面に出ません（`-b` へ書けばファイルには同じテキストが
 入ります）。
 
+#### 例: Intel 記法から AT&T 記法へ
+
+同梱の `intel2att.axx` は同じモードのもっと大きな実例で、x86-64 の Intel 記法の
+ソースを GNU as がそのまま受け取る AT&T 記法へ書き換えます。
+
+```sh
+caxx intel2att.axx intel2att.s -V > att.s
+caxx intel2att.axx intel2att.s -V | as --64 -o att.o -
+```
+
+やっていることは 5 つです。
+
+- オペランドの順序を入れ替える（`dst,src` → `src,dst`）;
+- レジスタに `%`、即値に `$` を付ける;
+- `[base+index*scale+disp]` を `disp(%base,%index,scale)` にする;
+- サイズ指定（`QWORD PTR` など）かレジスタ幅から接尾辞 `b`/`w`/`l`/`q` を決める;
+- 綴りが変わる命令（`cqo`→`cqto`、`cdq`→`cltd`、`stosd`→`stosl` など）を差し替える。
+
+```
+        mov     rsi, offset msg          ->  movq $msg, %rsi
+        mov     eax, 4                   ->  movl $4, %eax
+        add     rsp, 8*4                 ->  addq $8*4, %rsp
+        mov     rax, [rbx+rcx*8+32]      ->  movq 32(%rbx,%rcx,8), %rax
+        mov     byte ptr [rdi+rcx], 0x41 ->  movb $0x41, (%rdi,%rcx)
+        lea     rsi, [rip+msg]           ->  leaq msg(%rip), %rsi
+        movzx   eax, byte ptr [rsi]      ->  movzbl (%rsi), %eax
+        push    qword ptr [rbx+8]        ->  pushq 8(%rbx)
+        jne     start                    ->  jne start
+        cqo                              ->  cqto
+```
+
+書き方の要点は 3 つです。レジスタ名とニーモニックは配列シンボルの集合として
+`.setsym` で宣言し、`!Y集合[変数]`（[3.6.3 節](#363-シンボル捕捉子-y)）でどれに
+当たったかの*番号*を捕らえます。番号なので、同じ番号で別の集合を引けば AT&T 側の
+綴りがそのまま出ます。ラベルと式は `!L` で拾って `{{.exp(…)}}` で出すので、
+`8*4` も `msg` も書かれたままの綴りで残ります。そしてメモリオペランドの 28 通りの
+形（`[B]`・`[B+D]`・`[B+I*S+D]`・`[RIP+D]` …）を 4 つのオペランドサイズと 3 通りの
+サイズ指定の書き方に対して書き下すのは手作業では無理なので、マクロ層の
+`!def` / `!while`（[7 節](#7-マクロ層)）で生成しています。展開後のパターン表は
+`caxx intel2att.axx -p out.axx` で読めます。
+
+対応していない書き方（`lock` 付きの 2 オペランド命令、`push word ptr` など）は
+`.textmode` の素通しでそのまま出るので、翻訳できたところとできなかったところが
+出力を見れば分かります。
+
 
 ---
 
@@ -3217,6 +3262,7 @@ x86_64 パターンファイルは
 | **elfprio.axx** | 1.7 KB | 19 | **elfprio.s** | リロケーション型の優先順位（既定 < パターンファイル < ソースファイル、3.7.8 節）。テスト専用 |
 | **elfsec.axx** | 1.1 KB | 6 | **elfsec.s** | `.elfsection` で宣言するセクションの属性（3.7.7 節）。テスト専用 |
 | **endsub.axx** | 1.2 KB | 4 | **endsub.s** | `.sub` ブロックを `.endsub` で閉じる（3.7.2 節）。テスト専用 |
+| **intel2att.axx** | 12 KB | 434 | **intel2att.s** | x86-64 Intel 記法 → AT&T 記法 のソース翻訳器。`.textmode`・`!Y`・`!L`・マクロ層でのパターン生成（3.18 節）。翻訳結果は GNU as に通る |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) のスケッチ。未完成 |
 | **vliw.axx** | 178 B | 10 | **vliw.s** | 非 EPIC VLIW。テスト専用 |
 | **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck 仮想 CPU。hello-world デモ。同梱だが `test1` の対象外 |
@@ -3225,14 +3271,14 @@ x86_64 パターンファイルは
 ないことに注意してください。`itanium.axx` も `vliw.s` を使い、
 `aarch64_logical_mini.axx` は `aarch64_logical_mini_demo.s` と対になります。
 
-`test1` は 27 組を両方の実装で実行し、`-b` の生バイナリを比較します。
-`.textmode` を使う 2 組（`textmode.axx` / `8080toz80.axx`）については、`-V` で
+`test1` は 28 組を両方の実装で実行し、`-b` の生バイナリを比較します。
+`.textmode` を使う 3 組（`textmode.axx` / `8080toz80.axx` / `intel2att.axx`）については、`-V` で
 標準出力へ流した翻訳テキストどうしも比較します。`elftype.axx` / `elftype.s` と
 `elfgen.axx` / `elfgen.s`、型の優先順位を見る `elfprio.axx` / `elfprio.s`、
 セクションヘッダを見る `elfsec.axx` / `elfsec.s` の 4 組はリロケーションと
 ELF のヘッダを見るものなので、`-o` の ELF オブジェクトどうしを比較します。
 `echo.axx` / `echo.s` の組は標準エラーへ出た `.echo` の行どうしも比較します。
-比較は全部で 30 組です。
+比較は全部で 32 組です。
 
 `aarch64.axx` / `aarch64.s` の組がこの中で飛び抜けて重く、Python 実装で 20 秒ほど、
 C 実装で 1 秒ほどかかります。ソースの 1 行ごとに、同梱で最大のパターン集合と
@@ -3258,7 +3304,7 @@ C 実装で 1 秒ほどかかります。ソースの 1 行ごとに、同梱で
 | `format_of_exp_imp_file` | エクスポート/インポートファイル形式 |
 | `axx.1.gz` | man ページ |
 
-`test1` は同梱の 27 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
+`test1` は同梱の 28 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
 
 ### C.2 外部
 
