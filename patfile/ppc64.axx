@@ -59,5 +59,9 @@
 /* A prefixed instruction must not cross a 64-byte boundary, so .text
 /* keeps that alignment through the link, as GNU as does. */
 .elfsection::.text::6::1::64
+/* ELFv1 function descriptors live in .opd: writable data, 8-byte aligned.
+/* Their TOC word takes R_PPC64_TOC (write .extern .TOC.::toc, .quad .TOC.). */
+.elftype::toc::51::8
+.elfsection::.opd::3::1::8
 
 .include "ppc64_isa.axx"
