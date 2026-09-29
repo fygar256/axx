@@ -3851,8 +3851,16 @@ class BinaryWriter:
                         data[base_idx + i] = temp_val & 0xff
                         temp_val >>= 8
 
-        with open(self.state.outfile, 'wb') as f:
-            f.write(data)
+        # 破綻点修正: 書き込みの失敗（ディスク満杯・クォータ超過など）を
+        # 捕まえていなかったため、素の OSError トレースバックが出ていた。
+        # caxx.c と同じ文面の診断にして、通常のエラー経路で終わらせる。
+        try:
+            with open(self.state.outfile, 'wb') as f:
+                f.write(data)
+        except OSError as e:
+            self.state.diag(f" error - cannot write '{self.state.outfile}': {e}",
+                            set_error=True)
+            return
         print(f"wrote raw binary {self.state.outfile} ({len(data)} bytes)", file=sys.stderr)
 
         # 命令フィールド型のリロケーションを出した箇所は、RELA の作法どおり命令語の
@@ -6070,9 +6078,12 @@ class PatternFileReader:
                         cur_sub = _nm
                         self.subs[_nm] = []
                     continue
-                if _kw == '.RETURN':
+                # `.sub` ブロックの終わりは `.return` でも `.endsub` でもよい。
+                # `.func … .endfunc` と綴りをそろえたいときのための別名で、
+                # 意味は同じ。
+                if _kw == '.RETURN' or _kw == '.ENDSUB':
                     if cur_sub is None:
-                        diag(" error - '.return' without a matching '.sub'.",
+                        diag(f" error - '{_kw.lower()}' without a matching '.sub'.",
                              set_error=True)
                     cur_sub = None
                     continue
@@ -6130,7 +6141,7 @@ class PatternFileReader:
                  f"is still open (missing closing '*/').", set_error=False)
         if cur_sub is not None:
             diag(f" error - pattern file '{fn}' ends while sub table {cur_sub!r} "
-                 f"is still open (missing '.return').", set_error=True)
+                 f"is still open (missing '.return' or '.endsub').", set_error=True)
         while func_stack:
             _f = func_stack.pop()
             diag(f" error - pattern file '{fn}' ends while function {_f.name!r} "
@@ -9208,9 +9219,16 @@ def _strip_comment(text, pat_mode=False):
 
 class _ExprParser:
 
+    # マクロ式は評価のたびに字句解析からやり直すので、1文字進めるたびに
+    # len() と属性辞書を引いていた分がそのままループ回数に比例して効く。
+    # 長さを一度だけ控え、属性を __slots__ にして取り出しを速くする。
+    # （読み方は変えていない。s は生成後に書き換えない。）
+    __slots__ = ('s', 'i', 'n', 'pp', 'pos', 'suppress')
+
     def __init__(self, text, pp, pos):
         self.s = text
         self.i = 0
+        self.n = len(text)
         self.pp = pp
         self.pos = pos
         self.suppress = 0
@@ -9220,8 +9238,12 @@ class _ExprParser:
         raise MacroError(f"{_fmt_pos(self.pos)}: macro expression: {msg} in {self.s!r}")
 
     def skip(self):
-        while self.i < len(self.s) and self.s[self.i] in ' \t':
-            self.i += 1
+        s = self.s
+        i = self.i
+        n = self.n
+        while i < n and s[i] in ' \t':
+            i += 1
+        self.i = i
 
     def peek(self, n=1):
         self.skip()
@@ -9232,7 +9254,7 @@ class _ExprParser:
         if self.s.startswith(tok, self.i):
             if tok[-1].isalpha():
                 j = self.i + len(tok)
-                if j < len(self.s) and (self.s[j].isalnum() or self.s[j] == '_'):
+                if j < self.n and (self.s[j].isalnum() or self.s[j] == '_'):
                     return False
             self.i += len(tok)
             return True
@@ -9244,7 +9266,7 @@ class _ExprParser:
 
     def at_end(self):
         self.skip()
-        return self.i >= len(self.s)
+        return self.i >= self.n
 
 
     def parse(self):
@@ -13207,7 +13229,14 @@ class Assembler:
                 return False
 
             if self.state.elf_objfile:
-                self.write_elf_obj(self.state.elf_objfile, self.state.elf_machine)
+                # 破綻点修正: 書き込みの失敗（ディスク満杯など）を捕まえて
+                # いなかったため、素の OSError トレースバックが出ていた。
+                # caxx.c と同じ文面の診断にして通常のエラー経路で終わらせる。
+                try:
+                    self.write_elf_obj(self.state.elf_objfile, self.state.elf_machine)
+                except OSError as _we:
+                    self.state.diag(f" error - cannot write "
+                                    f"'{self.state.elf_objfile}': {_we}", set_error=True)
                 if self.state.had_error:
                     self.state.diag(" error - one or more errors were reported during assembly; "
                          "output would be incomplete or wrong.", set_error=False, force=True)
@@ -13266,10 +13295,17 @@ class Assembler:
 
                         label_file.write(f"{i[0]}{reloc_type_str}\t{lbl_addr:#x}\n")
 
-            if self.state.expfile:
-                _write_export(self.state.expfile, elf=0)
-            if self.state.expfile_elf:
-                _write_export(self.state.expfile_elf, elf=1)
+            # 破綻点修正: 同上。ラベル TSV の書き込み失敗も診断にする。
+            for _exp_path, _exp_elf in ((self.state.expfile, 0),
+                                        (self.state.expfile_elf, 1)):
+                if not _exp_path:
+                    continue
+                try:
+                    _write_export(_exp_path, elf=_exp_elf)
+                except OSError as _we:
+                    self.state.diag(f" error - cannot write '{_exp_path}': {_we}",
+                                    set_error=True)
+                    return False
 
         finally:
             if self.state.stdin_tmp_path and os.path.exists(self.state.stdin_tmp_path):
@@ -13278,6 +13314,25 @@ class Assembler:
                 except OSError:
                     pass
                 self.state.stdin_tmp_path = None
+
+        # 破綻点修正: 標準出力（-V の翻訳結果など）が書ききれていないまま
+        # 成功として終わり、Python の "Exception ignored ..." と終了コード 120
+        # に化けていた。caxx.c と同じ文面で失敗させる。
+        try:
+            sys.stdout.flush()
+        except OSError as _oe:
+            print(f" error - cannot write to standard output: {_oe}", file=sys.stderr)
+            # 書けないまま終了すると、インタプリタ終了時の後始末がもう一度
+            # 流そうとして "Exception ignored ..." と終了コード 120 に化ける。
+            # 残りを捨て先へ逃がし、終了コードを 1 にそろえる。
+            try:
+                _devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(_devnull, 1)
+                os.close(_devnull)
+            except OSError:
+                sys.stderr.flush()
+                os._exit(1)
+            return False
 
         return True
 

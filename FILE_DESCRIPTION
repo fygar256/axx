@@ -92,6 +92,13 @@ elfsec.axx                          pattern file for .elfsection: the sh_flags
                                     note section (manual 3.7.7)
 elfsec.s                            test assemble file for elfsec.axx. build it
                                     with -o and read the section headers
+endsub.axx                          pattern file for closing a `.sub` block with
+                                    `.endsub` instead of `.return`: the two
+                                    spellings mean the same thing and can be
+                                    mixed in one pattern file, including for
+                                    tables referred to from another table
+                                    (manual 3.7.2)
+endsub.s                            test assemble file for endsub.axx
 8080toz80.axx                       pattern file that translates Intel 8080 source
                                     into Zilog Z80 source text: .textmode, `!L`
                                     captures and `{{.exp()}}`, so labels and

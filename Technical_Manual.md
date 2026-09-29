@@ -37,11 +37,11 @@ axx 8080toz80.axx hello8080.s -V > out.s  # translated text to stdout
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all twenty-six bundled pattern/source pairs with
+exactly that: `test1` assembles all twenty-seven bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the two `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` pair the `.echo` lines each one writes to standard
-error, for twenty-seven comparisons in all.
+error, for thirty comparisons in all.
 
 **Contents**
 
@@ -1017,7 +1017,7 @@ Notes.
   replaces the earlier one, and `.clrenum::x` (or `.clrenum` with no argument)
   removes it.
 
-#### 3.7.2 Sub tables (`.sub` / `.return`)
+#### 3.7.2 Sub tables (`.sub` / `.return` / `.endsub`)
 
 A sub table is a named set of alternatives that can be spliced into a position
 of an `instruction` field. Where `.check` restricts a position to one *symbol*,
@@ -1029,6 +1029,18 @@ its own value.
 <pattern>::<value list>
 ...
 .return
+```
+
+The block can be closed with either `.return` or `.endsub`. The two spellings
+mean the same thing and may be mixed in one pattern file; use `.endsub` when you
+want the spelling to match `.func … .endfunc`
+([section 3.15](#315-the-mini-language-func--call)).
+
+```
+.sub::<name>
+<pattern>::<value list>
+...
+.endsub
 ```
 
 The table is referenced with `!S{{<name>}}<variable>`. Every entry is tried in
@@ -2784,7 +2796,7 @@ decides, so the feature set changes with the moment of the call:
 | `#symbol` | yes | yes | yes | — |
 | Pattern variables | yes | uppercase only | no | no |
 | `!!!` / `!!!!` | yes | no | no | no |
-| `@`, `'`, `*(x,y)` | yes | yes | yes | yes |
+| `@`, `'`, `*(x,y)` | yes | yes | no | yes |
 
 Pattern variables are dropped for the mini language because nothing has bound
 them while a `.func` body runs — pass them in at the call site instead. `!!!`
@@ -2798,6 +2810,11 @@ macro layer `'` binds looser than the bitwise operators and tighter than `&&`;
 the position differs from the assembler's, where it sits between `^` and the
 comparisons, because macro-layer precedence follows C and there comparisons
 bind tighter than the bitwise operators.
+
+The mini language does not have these three. The operators listed in
+[section 3.15](#315-the-mini-language-func--call) are all of them: `@` and `'`
+are syntax errors there and `*(` reads as multiplication. Write the same thing
+at the `.call` site (on a pattern line) and pass the result in as an argument.
 
 ### 6.4 Very large values and the UNDEF sentinel
 
@@ -2817,9 +2834,25 @@ Above it they part company, each in its own way:
 | bit 255 set | positive, so `>>` shifts in zeros | negative, so `>>` shifts in ones |
 | ≥ `2**256` | kept as-is | wrapped to 256 bits |
 
-Both implementations warn when a value enters the band they cannot judge. This
-is a property of the sentinel design, not of any one operator: giving Caxx an
-out-of-band sentinel would mean widening its value type beyond 256 bits.
+Both implementations warn when a value enters the band they cannot judge (Caxx
+warns once for values at or above `2**192`, and once more when a value is
+wrapped past `2**256`). This is a property of the sentinel design, not of any
+one operator: giving Caxx an out-of-band sentinel would mean widening its value
+type beyond 256 bits.
+
+Because the sentinel itself is spelled differently, **what gets printed after an
+undefined label has been read differs too**. Neither implementation writes an
+output file in that case, so the generated artefacts are unaffected, but the
+following are visible:
+
+- the number in `Line N Error code …` (when an `error_patterns` condition reads
+  the sentinel, the truth of the condition itself can differ between the two);
+- a number embedded in `.textmode` translated text (`LD A,<sentinel>`);
+- whether `!F` / `!D` report that the value cannot be converted;
+- how many labels appear in the "address mismatch between pass1 and pass2" list.
+
+All of these need an undefined label to occur; correctly defined sources never
+see them.
 
 ---
 
@@ -3385,6 +3418,7 @@ The x86_64 pattern file is also maintained separately at
 | **elfgen.axx** | 2.7 KB | 24 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 19 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
 | **elfsec.axx** | 1.1 KB | 6 | **elfsec.s** | section attributes declared with `.elfsection` (3.7.7); test only |
+| **endsub.axx** | 1.2 KB | 4 | **endsub.s** | closing a `.sub` block with `.endsub` (3.7.2); test only |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
 | **vliw.axx** | 178 B | 10 | **vliw.s** | Non-EPIC VLIW; test only |
 | **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck virtual CPU; hello-world demo. Bundled, but not part of `test1` |
@@ -3393,7 +3427,7 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 `itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
 `aarch64_logical_mini_demo.s`.
 
-`test1` runs all twenty-six pairs through both implementations and
+`test1` runs all twenty-seven pairs through both implementations and
 compares the `-b` raw binaries. For the two pairs that use `.textmode`
 (`textmode.axx` and `8080toz80.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
@@ -3402,7 +3436,7 @@ ELF header, the `elfprio.axx` / `elfprio.s` pair is about which of the three
 ranks types a relocation, and the `elfsec.axx` / `elfsec.s` pair is about the
 section headers, so for those four the `-o` ELF objects are compared. For the
 `echo.axx` / `echo.s` pair the `.echo` lines written to standard error are
-compared as well, for twenty-nine comparisons in all.
+compared as well, for thirty comparisons in all.
 
 The `aarch64.axx` / `aarch64.s` pair is much the slowest of them: the Python
 implementation takes about twenty seconds on it, against about a second for the

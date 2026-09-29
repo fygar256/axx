@@ -51,6 +51,7 @@
 
 static void axx_diagf(int set_error, int force, const char *fmt, ...);
 static void m_pyrepr(const char *s, char *out, size_t outsz);
+static void m_pyrepr_n(const char *s, size_t n, char *out, size_t outsz);
 static int  m_utf8(unsigned long cp, char *out);
 #include <unistd.h>
 #include <sys/stat.h>
@@ -503,6 +504,29 @@ static int u256_is_undef_derived(uint256_t a) {
     return av.w[3] != 0;
 }
 
+/* 破綻点修正: uint256_t は 256bit を超えた桁を黙って捨てるので、そこから先は
+ * 多倍長の axx.py と値が食い違う。マニュアル 6.4 は「両実装とも、値が判断
+ * できない帯域に入ったとき警告する」と約束しているのに、この巻き戻りだけが
+ * 無言だった（`30<<300` が 0 になる等）。1 回だけ知らせる。
+ * 2**192 以上の帯域は UNDEF センチネル由来の判定が別に警告するので、
+ * そちらと二重に出さないよう黙っておく。 */
+static int u256_in_undef_band(uint256_t a){
+    int sign = (int)(a.w[3] >> 63);
+    uint256_t av = sign ? u256_neg(a) : a;
+    return av.w[3] != 0;
+}
+static void warn_u256_wrap(const char *op){
+    static int warned = 0;
+    if(warned) return;
+    warned = 1;
+    /* force=1 で出す。巻き戻りは照合の途中（!x の捕捉など）で起きることが
+     * ほとんどで、そこは通常の診断が抑制される場所だが、値が axx.py と
+     * 食い違う事実は採用されるパターンとは無関係に伝える必要がある。 */
+    axx_diagf(0, 1, " warning - a value overflowed 256 bits in '%s' and was wrapped; "
+                    "axx.py keeps the full precision there, so the two implementations "
+                    "disagree above 2**256 (manual 6.4).\n", op);
+}
+
 typedef struct {
     char   *buf;
     size_t  len;
@@ -827,6 +851,11 @@ typedef struct LabelEntry {
     int            is_imported;         /* .extern の仮登録。実定義で上書き可 */
     int            reloc_type_override; /* `::型名` で明示指定されたリロケーション型 */
     int            is_undef;            /* 参照されたが未定義 */
+    /* 破綻点修正: 診断でラベルを並べるとき、caxx はハッシュ籠の順で出していた
+     * のに対し axx.py は dict の挿入順（＝定義順）で出すため、
+     * "address mismatch between pass1 and pass2" の一覧の並びが食い違って
+     * いた。登録順を控えて、表示はその順にそろえる。 */
+    long long      seq;
     struct LabelEntry *next;
 } LabelEntry;
 
@@ -834,6 +863,7 @@ typedef struct {
     LabelEntry **buckets;
     int          nbuckets;
     int          count;
+    long long    seq_next;   /* 次に登録するラベルの登録番号 */
 } LabelMap;
 
 static uint32_t hash_str(const char *s) {
@@ -846,6 +876,27 @@ static void lmap_init(LabelMap *m) {
     m->nbuckets=HASH_INIT_CAP;
     m->buckets=calloc(m->nbuckets,sizeof(LabelEntry*));
     m->count=0;
+    m->seq_next=0;
+}
+
+/* 登録順に並べた要素の配列を返す（呼び出し側が free する）。診断でラベルを
+ * 並べるところと、表から表へ写すところで使う。axx.py の dict の反復順と
+ * 同じ並びになる。 */
+static int lmap_cmp_seq(const void *a, const void *b){
+    const LabelEntry *x = *(const LabelEntry * const *)a;
+    const LabelEntry *y = *(const LabelEntry * const *)b;
+    return (x->seq > y->seq) - (x->seq < y->seq);
+}
+static LabelEntry **lmap_in_order(LabelMap *m, int *nout){
+    int n = 0;
+    LabelEntry **v = malloc((size_t)(m->count ? m->count : 1) * sizeof(LabelEntry*));
+    if(!v){ perror("malloc"); exit(1); }
+    for(int bi=0; bi<m->nbuckets; bi++)
+        for(LabelEntry *e=m->buckets[bi]; e; e=e->next)
+            v[n++] = e;
+    qsort(v, (size_t)n, sizeof(LabelEntry*), lmap_cmp_seq);
+    *nout = n;
+    return v;
 }
 static void lmap_free(LabelMap *m) {
     for(int i=0;i<m->nbuckets;i++){
@@ -901,6 +952,7 @@ static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *se
     LabelEntry *e=calloc(1,sizeof(LabelEntry));
     e->key=strdup(key); e->value=val; e->section=strdup(sec);
     e->is_equ=is_equ; e->is_imported=0; e->reloc_type_override=-1; e->is_undef=is_undef;
+    e->seq=m->seq_next++;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
     lmap_maybe_grow(m);
 }
@@ -922,6 +974,7 @@ static void lmap_set_imported(LabelMap *m, const char *key, uint256_t val, const
     LabelEntry *e=calloc(1,sizeof(LabelEntry));
     e->key=strdup(key); e->value=val; e->section=strdup(sec);
     e->is_equ=0; e->is_imported=1; e->reloc_type_override=reloc_type; e->is_undef=0;
+    e->seq=m->seq_next++;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
     lmap_maybe_grow(m);
 }
@@ -944,6 +997,7 @@ static void lmap_set_full(LabelMap *m, const char *key, uint256_t val,
     e->is_equ=is_equ; e->is_imported=is_imported;
     e->reloc_type_override=reloc_type_override;
     e->is_undef=is_undef;
+    e->seq=m->seq_next++;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
     lmap_maybe_grow(m);
 }
@@ -2333,7 +2387,7 @@ typedef struct {
     char **texts; int *seterr; int n; int cap; int capturing; int in_match;
 } DiagSuppress;
 
-static void diag_suppress_begin(AsmState *st, DiagSuppress *sv){
+static AXX_UNUSED void diag_suppress_begin(AsmState *st, DiagSuppress *sv){
     sv->texts     = st->diag_pending;
     sv->seterr    = st->diag_pending_seterr;
     sv->n         = st->diag_pending_len;
@@ -2348,7 +2402,7 @@ static void diag_suppress_begin(AsmState *st, DiagSuppress *sv){
     st->in_match_attempt    = 1;
 }
 
-static void diag_suppress_end(AsmState *st, DiagSuppress *sv){
+static AXX_UNUSED void diag_suppress_end(AsmState *st, DiagSuppress *sv){
     for(int i=0;i<st->diag_pending_len;i++) free(st->diag_pending[i]);
     free(st->diag_pending);
     free(st->diag_pending_seterr);
@@ -2377,26 +2431,81 @@ static long long g_diag_count = 0;
 static void axx_diagf(int set_error, int force, const char *fmt, ...){
     AsmState *st = g_active_state;
     g_diag_count++;
-    char buf[2048];
+    /* 破綻点修正: 診断文を固定長 2048 バイトに切り詰めていたため、長い式や
+     * 長い文字列値を含むメッセージが axx.py（切り詰めない）と食い違っていた。
+     * まず必要な長さを測り、収まらないときだけヒープへ逃がす。 */
+    char stackbuf[2048];
+    char *buf = stackbuf;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    int need = vsnprintf(stackbuf, sizeof(stackbuf), fmt, ap);
     va_end(ap);
+    if(need >= (int)sizeof(stackbuf)){
+        char *heap = malloc((size_t)need + 1);
+        if(heap){
+            va_start(ap, fmt);
+            vsnprintf(heap, (size_t)need + 1, fmt, ap);
+            va_end(ap);
+            buf = heap;
+        }
+    }
 
     if(st && !force){
         if(st->in_match_attempt){
             if(st->diag_capturing) diag_pending_push(st, buf, set_error);
+            if(buf != stackbuf) free(buf);
             return;
         }
-        if(!should_report_errors(st)) return;
+        if(!should_report_errors(st)){ if(buf != stackbuf) free(buf); return; }
     }
     fputs(buf, stderr);
+    if(buf != stackbuf) free(buf);
     if(st && set_error) st->had_error = 1;
 }
 
 static void axx_oserr_str(const char *fn, int err, char *out, size_t osz){
     char q[1024]; m_pyrepr(fn ? fn : "", q, sizeof(q));
     snprintf(out, osz, "[Errno %d] %s: %s", err, strerror(err), q);
+}
+
+/* 書き込み時のエラー文面。Python の OSError は open() から出たときだけ
+ * ファイル名を含み、write()/close() から出たときは含まない。axx.py と
+ * 同じ文面にそろえるため、こちらは名前なしの形を作る。 */
+static void axx_oserr_nopath(int err, char *out, size_t osz){
+    snprintf(out, osz, "[Errno %d] %s", err, strerror(err));
+}
+
+/* 破綻点修正: 出力の書き込み失敗（ディスク満杯・クォータ超過・パイプ切断）を
+ * どこでも検査しておらず、切り詰められたファイルを「wrote ...」と報告して
+ * 終了コード 0 で終わっていた。axx.py は例外で必ず失敗するので合わせる。
+ * 途中のエラーは ferror で、遅延書き込みのエラーは fclose で拾う。
+ * 戻り値: 0=成功、1=失敗（エラーは報告済み）。 */
+static int axx_close_out(FILE *fp, const char *path){
+    int err = 0;
+    errno = 0;
+    if(fflush(fp) != 0 || ferror(fp)) err = errno ? errno : EIO;
+    errno = 0;
+    if(fclose(fp) != 0 && !err) err = errno ? errno : EIO;
+    if(err){
+        char eb[1200]; axx_oserr_nopath(err, eb, sizeof(eb));
+        axx_diagf(1, 0, " error - cannot write '%s': %s\n", path, eb);
+        return 1;
+    }
+    return 0;
+}
+
+/* 標準出力へ流したときの後始末。閉じずに流しきれたかだけを見る。 */
+static int axx_flush_stdout(const char *path){
+    int err = 0;
+    errno = 0;
+    if(fflush(stdout) != 0 || ferror(stdout)) err = errno ? errno : EIO;
+    if(err){
+        char eb[1200]; axx_oserr_nopath(err, eb, sizeof(eb));
+        axx_diagf(1, 0, " error - cannot write '%s': %s\n", path, eb);
+        clearerr(stdout);
+        return 1;
+    }
+    return 0;
 }
 
 static FILE *axx_open_input(const char *fn, const char *what){
@@ -3900,8 +4009,14 @@ static int axx_isfloatstr(const char *s, int idx){
     if(strncmp(s+idx,"-inf",4)==0) return 1;
     if(strncmp(s+idx,"inf",3)==0) return 1;
     if(strncmp(s+idx,"nan",3)==0) return 1;
+    /* 破綻点修正: axx.py の isfloatstr() は get_floatstr() が1文字でも
+     * 進めたかを見るだけで、get_floatstr() は "0123456789." の並びを取る。
+     * つまり裸の `.` も浮動小数点リテラルの始まりとして扱う。caxx は
+     * 「`.` の次が数字」のときだけ真にしていたため、`.error` 欄（浮動小数点
+     * モード）に書いた `.foo` のような綴りが caxx だけラベル参照として読まれ、
+     * "Label undefined: '.foo'" で中断していた（axx.py は 0 として通す）。 */
     if(is_digit(s[idx])) return 1;
-    if(s[idx]=='.' && is_digit((unsigned char)s[idx+1])) return 1;
+    if(s[idx]=='.') return 1;
     return 0;
 }
 
@@ -4062,9 +4177,17 @@ static void binary_flush(AsmState *st){
         }
     }
     FILE *fp=fopen(st->outfile,"wb");
-    if(!fp){perror(st->outfile);free(data);return;}
-    fwrite(data,1,(size_t)total_size,fp);
-    fclose(fp);
+    if(!fp){
+        char eb[1200]; axx_oserr_str(st->outfile, errno, eb, sizeof(eb));
+        axx_diagf(1, 0, " error - cannot write '%s': %s\n", st->outfile, eb);
+        free(data);
+        return;
+    }
+    if(total_size) fwrite(data,1,(size_t)total_size,fp);
+    /* 破綻点修正: 書き込みと fclose の結果を見ずに「wrote ...」と報告して
+     * いたため、ディスクが一杯のときに切り詰められたファイルが成功として
+     * 残っていた（axx.py は OSError で失敗する）。 */
+    if(axx_close_out(fp, st->outfile)){ free(data); return; }
     fprintf(stderr,"wrote raw binary %s (%llu bytes)\n",st->outfile,(unsigned long long)total_size);
     free(data);
 
@@ -4287,8 +4410,15 @@ static uint256_t label_get_value(AsmState *st, const char *k){
         return ret_val;
     }
     if(st->pas == 1 && st->relax_prev){
+        /* 破綻点修正: 以前は `!pe->is_undef` で「未定義の札が付いた控え」を
+         * 弾いていた。axx.py の _relax_prev_values は札ではなく「値が
+         * UNDEF 由来か」だけで絞るので、両者で前回値の見え方が食い違い、
+         * `label1: .equ label1+2` のような自己参照 .equ が caxx では毎回
+         * 同じ値（前回値を見ない＝0+2）に落ち着いて「収束した」と誤判定され、
+         * パス2だけ別の値になった誤りを黙って出していた。控えを作る側で
+         * UNDEF 由来を外してあるので、ここは見つかればそのまま使う。 */
         LabelEntry *pe = lmap_find(st->relax_prev, k);
-        if(pe && !pe->is_undef){
+        if(pe){
             return pe->value;
         }
     }
@@ -4866,7 +4996,26 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
             x=u256_zero();
         }
     } else {
+        /* 破綻点修正: axx.py はここで「何も読めなかった」ときに
+         * " warning - unrecognized token at position N in expression: ... (treated as 0)"
+         * を出すが、caxx には対応する診断が無く、符号化欄の綴り間違いが
+         * 無言で 0 バイトになっていた（値は一致するので気付けない）。
+         * 判定条件も文面も axx.py の factor() と同じにする。 */
+        int prev_idx = idx;
         x=expr_factor1(asmb,s,idx,&idx);
+        if(idx == prev_idx && idx < slen){
+            char c = s[idx];
+            if(c!='\0' && c!=',' && c!=')' && c!=']' && c!=CB_CHAR && c!=' ' && c!='\t'
+               && !st->in_match_attempt && should_report_errors(st)){
+                /* axx.py の `s[idx:idx+8]` は文字列末尾の chr(0) まで含むので、
+                 * こちらも終端の NUL を 1 個だけ含めた範囲を取る。 */
+                size_t _n = (size_t)(slen + 1 - idx);
+                if(_n > 8) _n = 8;
+                char _tr[64]; m_pyrepr_n(s + idx, _n, _tr, sizeof(_tr));
+                axx_diagf(0, 0, " warning - unrecognized token at position %d in expression: "
+                                "%s (treated as 0)\n", idx, _tr);
+            }
+        }
     }
     idx=axx_skipspc(s,idx);
     *idx_out=idx;
@@ -5082,29 +5231,16 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     char fstr[64]; snprintf(fstr,sizeof(fstr),"%.17g",xv);
                     x=ieee754_128_from_str(fstr);
                 } else {
-                    int io2;
-                    int prev_flt=asmb->st.exp_typ_float;
-                    int _prior_had_error=asmb->st.had_error;
-                    DiagSuppress _sv;
-                    asmb->st.exp_typ_float=1;
-                    diag_suppress_begin(&asmb->st, &_sv);
-                    uint256_t fv=expr_expression_pat(asmb,expr_buf,0,&io2);
-                    int _inner_errs = asmb->st.diag_pending_len;
-                    diag_suppress_end(&asmb->st, &_sv);
-                    asmb->st.exp_typ_float=prev_flt;
-                    int _fallback_errored = _inner_errs > 0
-                                            || (asmb->st.had_error && !_prior_had_error);
-                    asmb->st.had_error=_prior_had_error;
-                    if(_fallback_errored){
-                        if(should_report_errors(&asmb->st)){
-                            axx_diagf(1, 0, " error - qad{}: cannot evaluate expression '%s'; using 0.\n", expr_buf);
-                        }
-                        x=u256_zero();
-                    } else {
-                        double dv=u256_to_double(fv);
-                        char fstr[64]; snprintf(fstr,sizeof(fstr),"%.17g",dv);
-                        x=ieee754_128_from_str(fstr);
+                    /* 破綻点修正: ここには以前 expr_expression_pat() への
+                     * フォールバックがあった。そちらはラベルを引けるので、
+                     * `qad{未定義ラベル}` が 0 として黙って通り、誤ったバイナリを
+                     * 出していた（axx.py の xeval は裸の名前を解決しないので
+                     * 必ずエラーになる）。axx.py と同じく、xeval が読めなければ
+                     * そこでエラーにする。ラベルを読みたいときは `:名前` と書く。 */
+                    if(should_report_errors(&asmb->st)){
+                        axx_diagf(1, 0, " error - qad{}: cannot evaluate expression '%s'; using 0.\n", expr_buf);
                     }
+                    x=u256_zero();
                 }
             }
             }
@@ -5120,8 +5256,26 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         if(f){
             int prev_flt=asmb->st.exp_typ_float;
             asmb->st.exp_typ_float=0;
-            int io2; uint256_t iv=expr_expression_pat(asmb,t,0,&io2);
+            /* 破綻点修正: 式の中の未定義ラベルを見ていなかったため、
+             * `enflt{未定義}` が 0 として黙って通っていた（axx.py は
+             * error_undefined_label を退避・確認してエラーにする）。 */
+            int _outer_undef = asmb->st.error_undefined_label;
+            asmb->st.error_undefined_label = 0;
+            /* 破綻点修正: expr_expression_pat() は能力記述子を CAPS_PAT に
+             * 上書きするため、アセンブリ行から来た式でもパターン変数が有効に
+             * なり、`enflt{nosuch}` の `nosuch` がラベルではなく未束縛の
+             * パターン変数（=0）として読まれていた。axx.py はここで
+             * self.expression() を呼び、いま有効な能力記述子をそのまま使う。 */
+            int io2; uint256_t iv=expr_expression_caps(asmb,t,0,asmb->st.expcaps,&io2);
+            int _inner_undef = asmb->st.error_undefined_label;
+            asmb->st.error_undefined_label = _outer_undef || _inner_undef;
             asmb->st.exp_typ_float=prev_flt;
+            if(_inner_undef){
+                if(should_report_errors(&asmb->st)){
+                    axx_diagf(1, 0, " error - enflt{}: expression contains undefined label.\n");
+                }
+                iv = u256_zero();
+            }
             double fval=enfloat_bits(u256_to_u64(iv));
             /* 破綻点修正: 常に double_to_u256()（ビットキャスト）を格納していたため、
              * 整数モードの文脈では IEEE754 のビット列そのものが整数として読まれ、
@@ -5144,8 +5298,24 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         if(f){
             int prev_flt=asmb->st.exp_typ_float;
             asmb->st.exp_typ_float=0;
-            int io2; uint256_t iv=expr_expression_pat(asmb,t,0,&io2);
+            /* 破綻点修正: enflt{} と同じ問題。上のコメントを参照。 */
+            int _outer_undef = asmb->st.error_undefined_label;
+            asmb->st.error_undefined_label = 0;
+            /* 破綻点修正: expr_expression_pat() は能力記述子を CAPS_PAT に
+             * 上書きするため、アセンブリ行から来た式でもパターン変数が有効に
+             * なり、`enflt{nosuch}` の `nosuch` がラベルではなく未束縛の
+             * パターン変数（=0）として読まれていた。axx.py はここで
+             * self.expression() を呼び、いま有効な能力記述子をそのまま使う。 */
+            int io2; uint256_t iv=expr_expression_caps(asmb,t,0,asmb->st.expcaps,&io2);
+            int _inner_undef = asmb->st.error_undefined_label;
+            asmb->st.error_undefined_label = _outer_undef || _inner_undef;
             asmb->st.exp_typ_float=prev_flt;
+            if(_inner_undef){
+                if(should_report_errors(&asmb->st)){
+                    axx_diagf(1, 0, " error - endbl{}: expression contains undefined label.\n");
+                }
+                iv = u256_zero();
+            }
             double fval=endouble_bits(u256_to_u64(iv));
             /* 破綻点修正: enflt{} と同じ問題。上のコメントを参照。 */
             x = asmb->st.exp_typ_float ? double_to_u256(fval)
@@ -5178,27 +5348,11 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                 if(xeval_eval(asmb, t, &xv)){
                     memcpy(&bits,&xv,8);
                 } else {
-                    int prev_flt = asmb->st.exp_typ_float;
-                    int _prior_had_error = asmb->st.had_error;
-                    DiagSuppress _sv;
-                    asmb->st.exp_typ_float = 1;
-                    diag_suppress_begin(&asmb->st, &_sv);
-                    int io2; uint256_t fv = expr_expression_pat(asmb,t,0,&io2);
-                    int _inner_errs = asmb->st.diag_pending_len;
-                    diag_suppress_end(&asmb->st, &_sv);
-                    asmb->st.exp_typ_float = prev_flt;
-                    int _fallback_errored = _inner_errs > 0
-                                            || (asmb->st.had_error && !_prior_had_error);
-                    asmb->st.had_error = _prior_had_error;
-                    if(_fallback_errored){
-                        if(should_report_errors(&asmb->st)){
-                            axx_diagf(1, 0, " error - dbl{}: cannot convert expression to float64; using 0.\n");
-                        }
-                        bits = 0;
-                    } else {
-                        double v = u256_to_double(fv);
-                        memcpy(&bits,&v,8);
+                    /* 破綻点修正: qad{} と同じ問題。上のコメントを参照。 */
+                    if(should_report_errors(&asmb->st)){
+                        axx_diagf(1, 0, " error - dbl{}: cannot convert expression to float64; using 0.\n");
                     }
+                    bits = 0;
                 }
             }
             x = asmb->st.exp_typ_float ? double_to_u256((double)bits) : u256_from_u64(bits);
@@ -5228,27 +5382,11 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     float v = (float)xv;
                     memcpy(&bits,&v,4);
                 } else {
-                    int prev_flt = asmb->st.exp_typ_float;
-                    int _prior_had_error = asmb->st.had_error;
-                    DiagSuppress _sv;
-                    asmb->st.exp_typ_float = 1;
-                    diag_suppress_begin(&asmb->st, &_sv);
-                    int io2; uint256_t fv = expr_expression_pat(asmb,t,0,&io2);
-                    int _inner_errs = asmb->st.diag_pending_len;
-                    diag_suppress_end(&asmb->st, &_sv);
-                    asmb->st.exp_typ_float = prev_flt;
-                    int _fallback_errored = _inner_errs > 0
-                                            || (asmb->st.had_error && !_prior_had_error);
-                    asmb->st.had_error = _prior_had_error;
-                    if(_fallback_errored){
-                        if(should_report_errors(&asmb->st)){
-                            axx_diagf(1, 0, " error - flt{}: cannot convert expression to float32; using 0.\n");
-                        }
-                        bits = 0;
-                    } else {
-                        float v = (float)u256_to_double(fv);
-                        memcpy(&bits,&v,4);
+                    /* 破綻点修正: qad{} と同じ問題。上のコメントを参照。 */
+                    if(should_report_errors(&asmb->st)){
+                        axx_diagf(1, 0, " error - flt{}: cannot convert expression to float32; using 0.\n");
                     }
+                    bits = 0;
                 }
             }
             x = asmb->st.exp_typ_float ? double_to_u256((double)bits) : u256_from_u64(bits);
@@ -5274,7 +5412,15 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
          * （桁落ちではなく桁ごと消える誤り）。余裕を持って96バイト。 */
         char fs[96];
         idx=axx_get_floatstr(s,idx,fs,sizeof(fs));
-        if(fs[0]) x=double_to_u256(strtod(fs,NULL));
+        /* 破綻点修正: strtod() は読めたところまでで止まるので、`1.2.3` が
+         * 1.2 になっていた。axx.py は float(fs) が ValueError を投げたときに
+         * 0.0 へ倒すので、全部読めなかったら 0.0 にする（`.` 単独も同じ）。 */
+        if(fs[0]){
+            char *_fend = NULL;
+            double _fv = strtod(fs, &_fend);
+            if(_fend && *_fend) _fv = 0.0;
+            x=double_to_u256(_fv);
+        }
     }
     else if(is_digit(s[idx])){
         /* 2**256 は10進78桁なので、正当な256bit値を丸ごと収めるには
@@ -5433,7 +5579,15 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
         if(s[idx]=='*'&&s[idx+1]!='*'){
             uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
             if(flt) x=double_to_u256(u256_to_double(x)*u256_to_double(t));
-            else    x=u256_mul_signed(x,t);
+            else {
+                uint256_t r=u256_mul_signed(x,t);
+                /* 割り戻して元に戻らなければ 256bit を溢れている。 */
+                if(!u256_is_zero(x) && !u256_is_zero(t)
+                   && !u256_in_undef_band(x) && !u256_in_undef_band(t)
+                   && !u256_eq(u256_truncdiv(r,x), t))
+                    warn_u256_wrap("*");
+                x=r;
+            }
         } else if(axx_q(s,slen,"//",idx)){
             uint256_t t=expr_term0_0(asmb,s,idx+2,&idx);
             if(flt){
@@ -5511,11 +5665,26 @@ static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_ou
         if(s[idx]=='+'){
             uint256_t t=expr_term0(asmb,s,idx+1,&idx);
             if(flt) x=double_to_u256(u256_to_double(x)+u256_to_double(t));
-            else    x=u256_add(x,t);
+            else {
+                uint256_t r=u256_add(x,t);
+                /* 同符号どうしを足して符号が変わったら 256bit を溢れている。 */
+                if(u256_is_neg256(x)==u256_is_neg256(t)
+                   && u256_is_neg256(r)!=u256_is_neg256(x)
+                   && !u256_in_undef_band(x) && !u256_in_undef_band(t))
+                    warn_u256_wrap("+");
+                x=r;
+            }
         } else if(s[idx]=='-'){
             uint256_t t=expr_term0(asmb,s,idx+1,&idx);
             if(flt) x=double_to_u256(u256_to_double(x)-u256_to_double(t));
-            else    x=u256_sub(x,t);
+            else {
+                uint256_t r=u256_sub(x,t);
+                if(u256_is_neg256(x)!=u256_is_neg256(t)
+                   && u256_is_neg256(r)!=u256_is_neg256(x)
+                   && !u256_in_undef_band(x) && !u256_in_undef_band(t))
+                    warn_u256_wrap("-");
+                x=r;
+            }
         } else break;
     }
     *idx_out=idx; return x;
@@ -5546,7 +5715,15 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
                     axx_diagf(1, 0, " error - shift count %s exceeds maximum %lld in << expression.\n", _sc, (long long)SHIFT_MAX);
                 }
                 x=u256_zero(); break;
-            } else x=expr_bitwise_result(asmb,u256_shl(expr_safe_bitwise_operand(asmb,x,"<<"),(int)u256_to_i64(sop)));
+            } else {
+                uint256_t _b=expr_safe_bitwise_operand(asmb,x,"<<");
+                int _n=(int)u256_to_i64(sop);
+                /* 符号ビット(255)まで含めて入りきらなければ溢れている。 */
+                if(!u256_is_zero(_b) && !u256_in_undef_band(_b)
+                   && (long long)u256_nbit(_b) + _n > 255)
+                    warn_u256_wrap("<<");
+                x=expr_bitwise_result(asmb,u256_shl(_b,_n));
+            }
         } else if(axx_q(s,slen,">>",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
             uint256_t sop=expr_safe_bitwise_operand(asmb,t,">>");
@@ -6123,11 +6300,20 @@ static void elem_list_expand(AsmState *st, const char *text, StrVec *out){
     }
 }
 
+/* 欄が空白だけか。axx.py はどこも `.strip()` の真偽で見るので、空白だけの欄は
+ * 「書かれていない」と同じ扱いになる。 */
+static int fld_blank(const char *s){
+    for(; *s; s++) if(!isspace((unsigned char)*s)) return 0;
+    return 1;
+}
+
 static int dir_check(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".check") != 0) return 0;
-    const char *var_str  = e->f[1][0] ? e->f[1] : e->f[2];
-    const char *syms_str = e->f[1][0] ? e->f[2] : "";
-    if(!var_str[0]){
+    /* 破綻点修正: 空かどうかを `[0]` で見ていたため、空白だけの欄を
+     * 「書かれている」と扱い、axx.py（.strip() で見る）とずれていた。 */
+    const char *var_str  = !fld_blank(e->f[1]) ? e->f[1] : e->f[2];
+    const char *syms_str = !fld_blank(e->f[1]) ? e->f[2] : "";
+    if(fld_blank(var_str)){
         axx_diagf(1, 0, " error - .check: variable name is not specified.\n");
         return 1;
     }
@@ -6564,9 +6750,13 @@ static void elf_section_attrs(const AsmState *st, const char *name,
 
 static int dir_reloc(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".reloc") != 0) return 0;
-    const char *var_str  = e->f[1][0] ? e->f[1] : e->f[2];
-    const char *type_str = e->f[1][0] ? e->f[2] : "";
-    if(!var_str[0]){
+    /* 破綻点修正: 変数欄が空のとき型欄を変数名として読み直していたため、
+     * `.reloc::t:dbl{` のように `::` が 1 つしかない行で axx.py
+     * （変数欄が空なら「変数名が指定されていない」で打ち切る）と
+     * 違うメッセージを出していた。axx.py と同じく読み直さない。 */
+    const char *var_str  = e->f[1];
+    const char *type_str = e->f[2];
+    if(fld_blank(var_str)){
         axx_diagf(1, 0, " error - .reloc: variable name is not specified.\n");
         return 1;
     }
@@ -7140,20 +7330,30 @@ static int dir_error(Assembler *asmb, const char *s){
          * 無限ループに陥っていた（axx.py はこの歯止めで即座に打ち切る）。 */
         int idx_before = idx;
         int io;
+        /* 破綻点修正: エラーコード欄だけ整数モードで評価していた。axx.py は
+         * 条件とコードの両方を浮動小数点モードで評価するので、`.foo` のような
+         * `.` で始まる綴りの読まれ方が食い違い（浮動小数点モードでは `.` が
+         * リテラルの始まり、整数モードではラベル名の始まり）、caxx だけが
+         * "Label undefined: '.foo'" で中断していた。両方を浮動小数点モードで
+         * 評価し、コードは axx.py の int(t) と同じく切り捨てて整数にする。 */
         int prev_flt = st->exp_typ_float;
         st->exp_typ_float = 1;
         uint256_t u=expr_expression_pat(asmb,buf,idx,&io);
-        st->exp_typ_float = prev_flt;
         idx=io;
         int io_cond = io;          /* 条件式の終端。判定に条件の本文だけを渡す */
         if(buf[idx]==';') idx++;
         uint256_t t=expr_expression_pat(asmb,buf,idx,&io);
+        st->exp_typ_float = prev_flt;
         idx=io;
         if(idx <= idx_before) break;
         if((should_report_errors(st))&&!u256_is_zero(u)
            && !cond_tests_relocated_var(st, buf + idx_before,
                                         (size_t)(io_cond - idx_before))){
-            int64_t tc=u256_to_i64(t);
+            /* axx.py の int(t)（切り捨て）と同じ。非有限や 64bit に収まらない
+             * 値は axx.py が OverflowError を捕まえて 0 にするのに合わせる。 */
+            double _tdv = u256_to_double(t);
+            int64_t tc = (isfinite(_tdv) && _tdv > -9223372036854775808.0
+                          && _tdv < 9223372036854775808.0) ? (int64_t)_tdv : 0;
             fprintf(stderr,"Line %d Error code %lld ",(int)st->ln,(long long)tc);
             if(tc>=0&&tc<st->errors.len) fprintf(stderr,"%s",st->errors.data[tc]);
             fprintf(stderr,": \n");
@@ -8027,6 +8227,33 @@ static void axx_dir_of(const char *path, char *out, size_t osz)
     if(d != out) memmove(out, d, strlen(d) + 1);
 }
 
+/* os.path.dirname(os.path.abspath(path)) と同じ。パターンファイルの
+ * `.INCLUDE` を解決する基準ディレクトリは axx.py が絶対パスで持つので、
+ * 診断に出る綴り（`'././a.axx'` 対 `'/…/w2/./a.axx'`）をそろえるために
+ * こちらも絶対パスにする。循環の検出自体は realpath で行うので変わらない。 */
+static void axx_abs_dir_of(const char *path, char *out, size_t osz)
+{
+    char abs_buf[2*PATH_MAX + 2];
+    if(path && path[0] == '/'){
+        axx_copy_trunc(abs_buf, sizeof(abs_buf), path);
+    } else {
+        char cwd_buf[PATH_MAX];
+        if(getcwd(cwd_buf, sizeof(cwd_buf))){
+            size_t cl = strlen(cwd_buf);
+            axx_copy_trunc(abs_buf, sizeof(abs_buf), cwd_buf);
+            if(cl + 1 < sizeof(abs_buf)){
+                abs_buf[cl] = '/';
+                axx_copy_trunc(abs_buf + cl + 1, sizeof(abs_buf) - cl - 1,
+                               path ? path : "");
+            }
+        } else {
+            axx_copy_trunc(abs_buf, sizeof(abs_buf), path ? path : "");
+        }
+    }
+    char *d = dirname(abs_buf);
+    axx_copy_trunc(out, osz, d ? d : ".");
+}
+
 static void readpat(Assembler *asmb, const char *fn);
 static void include_pat(Assembler *asmb, const char *l, const char *base_dir);
 
@@ -8143,26 +8370,51 @@ enum {
 };
 
 typedef enum { MT_END, MT_NUM, MT_NAME, MT_DOT, MT_OP, MT_STR, MT_CORE } MTKind;
-/* 字句1個ぶん。s は名前／ディレクティブ名を丸ごと収める。axx.py 側に名前の
- * 長さ制限は無いので、実用上ぶつからない幅を取っておく（作業領域はヒープ）。 */
-typedef struct { MTKind k; uint256_t num; char s[512]; } MTok;
+/* 字句1個ぶん。
+ * 破綻点修正: s は以前 char[512] で、名前・記号名・文字列がそれを超えると
+ * "name is too long" 等で打ち切っていた。axx.py に長さ制限は無いので、
+ * 同じ入力で caxx だけが失敗していた。字句の本文は行ごとの作業領域
+ * (MiniLexBuf) に置き、ここは指すだけにする。字句は行の中の互いに重ならない
+ * 範囲なので、作業領域は行長から決まる。 */
+typedef struct { MTKind k; uint256_t num; char *s; } MTok;
+
+/* 1行ぶんの字句列と、その本文を置く作業領域。使い回す。 */
+typedef struct { MTok *tok; int tcap; char *text; size_t tsz; } MiniLexBuf;
 
 typedef struct {
     jmp_buf     jb;
     int         jb_active;
-    char        err[512];
+    /* 破綻点修正: err は char[512] で、長い式や長い名前を含むメッセージを
+     * 切り詰めていた（axx.py は切り詰めない）。必要な長さぶん取る。
+     * 所有者は mini_fail で、読み終えた側が free する。 */
+    char       *err;
     const char *file;
     int         line;
 } MiniCtx;
 
 static void mini_fail(MiniCtx *c, const char *fmt, ...){
     va_list ap;
-    char body[400];
+    char bodybuf[400];
+    char *body = bodybuf;
     va_start(ap, fmt);
-    vsnprintf(body, sizeof(body), fmt, ap);
+    int bneed = vsnprintf(bodybuf, sizeof(bodybuf), fmt, ap);
     va_end(ap);
-    snprintf(c->err, sizeof(c->err), "%s:%d: %s",
-             c->file ? c->file : "?", c->line, body);
+    if(bneed >= (int)sizeof(bodybuf)){
+        char *bh = malloc((size_t)bneed + 1);
+        if(bh){
+            va_start(ap, fmt);
+            vsnprintf(bh, (size_t)bneed + 1, fmt, ap);
+            va_end(ap);
+            body = bh;
+        }
+    }
+    size_t msz = strlen(body) + (c->file ? strlen(c->file) : 1) + 32;
+    char *msg = malloc(msz);
+    if(!msg){ perror("malloc"); exit(1); }
+    snprintf(msg, msz, "%s:%d: %s", c->file ? c->file : "?", c->line, body);
+    if(body != bodybuf) free(body);
+    free(c->err);
+    c->err = msg;
     if(c->jb_active) longjmp(c->jb, 1);
     fprintf(stderr, " error - %s\n", c->err);
     exit(1);
@@ -8257,12 +8509,34 @@ static uint256_t mini_digits(const char *s, int from, int to, int base){
     return acc;
 }
 
-static int mini_lex(MiniCtx *c, const char *t, MTok *out){
+static void minilex_ensure(MiniLexBuf *b, int len){
+    int need_tok = len + 2;
+    if(b->tcap < need_tok){
+        b->tcap = need_tok;
+        b->tok = realloc(b->tok, (size_t)b->tcap * sizeof(MTok));
+        if(!b->tok){ perror("realloc"); exit(1); }
+    }
+    size_t need_txt = (size_t)len * 2 + 8;
+    if(b->tsz < need_txt){
+        b->tsz = need_txt;
+        b->text = realloc(b->text, b->tsz);
+        if(!b->text){ perror("realloc"); exit(1); }
+    }
+}
+
+static int mini_lex(MiniCtx *c, const char *t, MiniLexBuf *b){
     static const char *ops2[] = { "**","<<",">>","<=",">=","==","!=","&&","||", NULL };
     int n = 0, i = 0;
     int len = (int)strlen(t);
+    minilex_ensure(b, len);
+    MTok *out = b->tok;
+    char *txt = b->text;
+    size_t off = 0;
+    /* 次の字句の本文を置く場所を用意する（呼ぶたびに off を進める）。 */
+    #define MLX_BEGIN() (out[n].s = txt + off)
+    #define MLX_PUT(ch_) (txt[off++] = (ch_))
+    #define MLX_END()    (txt[off++] = '\0')
     while(i < len){
-        if(n >= MINI_MAX_TOK - 1) mini_fail(c, "statement is too long");
         char ch = t[i];
         if(ch == ' ' || ch == '\t'){ i++; continue; }
         if(isdigit((unsigned char)ch)){
@@ -8282,14 +8556,15 @@ static int mini_lex(MiniCtx *c, const char *t, MTok *out){
                 while(j < len && (isdigit((unsigned char)t[j]) || t[j] == '_')) j++;
                 out[n].k = MT_NUM; out[n].num = mini_digits(t, i, j, 10);
             }
-            out[n].s[0] = 0; n++; i = j; continue;
+            MLX_BEGIN(); MLX_END(); n++; i = j; continue;
         }
         if(isalpha((unsigned char)ch) || ch == '_'){
             int j = i;
             while(j < len && (isalnum((unsigned char)t[j]) || t[j] == '_')) j++;
-            if(j - i >= (int)sizeof(out[n].s)) mini_fail(c, "name is too long");
             out[n].k = MT_NAME;
-            memcpy(out[n].s, t + i, (size_t)(j - i)); out[n].s[j - i] = 0;
+            MLX_BEGIN();
+            for(int q = i; q < j; q++) MLX_PUT(t[q]);
+            MLX_END();
             n++; i = j; continue;
         }
         if(ch == '$'){
@@ -8297,7 +8572,7 @@ static int mini_lex(MiniCtx *c, const char *t, MTok *out){
              * 実際の値は評価時に本体へ渡して求める。 */
             if(t[i+1] == '$' || t[i+1] == '.'){
                 out[n].k = MT_CORE;
-                out[n].s[0] = t[i]; out[n].s[1] = t[i+1]; out[n].s[2] = 0;
+                MLX_BEGIN(); MLX_PUT(t[i]); MLX_PUT(t[i+1]); MLX_END();
                 n++; i += 2; continue;
             }
             mini_fail(c, "'$' must be written '$$' (location counter) or '$.' "
@@ -8309,15 +8584,17 @@ static int mini_lex(MiniCtx *c, const char *t, MTok *out){
             while(j < len && (isalnum((unsigned char)t[j]) || t[j] == '_'
                               || t[j] == '.' || t[j] == '$')) j++;
             if(j == i + 1) mini_fail(c, "'#' needs a symbol name");
-            if(j - i >= (int)sizeof(out[n].s)) mini_fail(c, "symbol name is too long");
             out[n].k = MT_CORE;
-            memcpy(out[n].s, t + i, (size_t)(j - i)); out[n].s[j - i] = 0;
+            MLX_BEGIN();
+            for(int q = i; q < j; q++) MLX_PUT(t[q]);
+            MLX_END();
             n++; i = j; continue;
         }
         if(ch == '"'){
             /* 文字列リテラル。値は整数と配列だけなので、書けるのは `.echo` の
              * 引数欄だけである（式の中に現れたら mxp_primary が弾く）。 */
-            int j = i + 1, m = 0;
+            int j = i + 1;
+            MLX_BEGIN();
             for(;;){
                 if(j >= len) mini_fail(c, "unterminated string");
                 char cc = t[j];
@@ -8331,16 +8608,14 @@ static int mini_lex(MiniCtx *c, const char *t, MTok *out){
                     else if(e == 'n')  r = '\n';
                     else if(e == 't')  r = '\t';
                     else { mini_fail(c, "unknown escape '\\%c' in a string", e); r = 0; }
-                    if(m >= (int)sizeof(out[n].s) - 1) mini_fail(c, "string is too long");
-                    out[n].s[m++] = r;
+                    MLX_PUT(r);
                     j += 2;
                     continue;
                 }
-                if(m >= (int)sizeof(out[n].s) - 1) mini_fail(c, "string is too long");
-                out[n].s[m++] = cc;
+                MLX_PUT(cc);
                 j++;
             }
-            out[n].s[m] = 0;
+            MLX_END();
             out[n].k = MT_STR;
             n++; i = j; continue;
         }
@@ -8348,10 +8623,10 @@ static int mini_lex(MiniCtx *c, const char *t, MTok *out){
             int j = i + 1;
             while(j < len && (isalnum((unsigned char)t[j]) || t[j] == '_')) j++;
             if(j == i + 1) mini_fail(c, "stray '.'");
-            if(j - i >= (int)sizeof(out[n].s)) mini_fail(c, "directive name is too long");
             out[n].k = MT_DOT;
-            for(int q = i; q < j; q++) out[n].s[q - i] = axx_upper_char(t[q]);
-            out[n].s[j - i] = 0;
+            MLX_BEGIN();
+            for(int q = i; q < j; q++) MLX_PUT(axx_upper_char(t[q]));
+            MLX_END();
             n++; i = j; continue;
         }
         {
@@ -8359,19 +8634,27 @@ static int mini_lex(MiniCtx *c, const char *t, MTok *out){
             for(int q = 0; ops2[q]; q++){
                 if(t[i] == ops2[q][0] && i + 1 < len && t[i+1] == ops2[q][1]){
                     out[n].k = MT_OP;
-                    out[n].s[0] = ops2[q][0]; out[n].s[1] = ops2[q][1]; out[n].s[2] = 0;
+                    MLX_BEGIN(); MLX_PUT(ops2[q][0]); MLX_PUT(ops2[q][1]); MLX_END();
                     n++; i += 2; hit = 1; break;
                 }
             }
             if(hit) continue;
         }
         if(strchr("+-*/%&|^~<>!()[]:,=", ch)){
-            out[n].k = MT_OP; out[n].s[0] = ch; out[n].s[1] = 0;
+            out[n].k = MT_OP;
+            MLX_BEGIN(); MLX_PUT(ch); MLX_END();
             n++; i++; continue;
         }
-        mini_fail(c, "unexpected character '%c'", ch);
+        /* 破綻点修正: axx.py は `{c!r}` と Python の repr で出すので、`'` 自身は
+         * `"'"` になる。ここは常に `'...'` で括っていて文面が食い違っていた。 */
+        { char _cs[2] = { ch, 0 }; char _cr[16]; m_pyrepr(_cs, _cr, sizeof(_cr));
+          mini_fail(c, "unexpected character %s", _cr); }
     }
-    out[n].k = MT_END; out[n].s[0] = 0;
+    out[n].k = MT_END;
+    MLX_BEGIN(); MLX_END();
+    #undef MLX_BEGIN
+    #undef MLX_PUT
+    #undef MLX_END
     return n;
 }
 
@@ -8444,7 +8727,15 @@ static MExpr *mxp_primary(MXP *p){
             mxp_expect(p, ")");
             return e;
         }
-        mini_fail(p->c, "'%s' cannot be used in an expression", tk->s);
+        /* 破綻点修正: axx.py は `{v.lower()!r}` と、小文字化してから Python の
+         * repr で出す。ここは大文字化した綴りを `'...'` で括っていた。 */
+        { size_t _n = strlen(tk->s);
+          char *_lo = mini_alloc(_n + 1);
+          for(size_t _i=0;_i<_n;_i++) _lo[_i] = (char)tolower((unsigned char)tk->s[_i]);
+          _lo[_n] = '\0';
+          char *_r = mini_alloc(_n * 4 + 8);
+          m_pyrepr(_lo, _r, _n * 4 + 8);
+          mini_fail(p->c, "%s cannot be used in an expression", _r); }
     }
     if(mxp_is_op(p, "(")){
         p->i++;
@@ -8652,11 +8943,11 @@ typedef struct {
     MiniFunc *f;
     int       i;
     MiniCtx  *c;
-    /* 字句の作業領域。MTok[MINI_MAX_TOK] は 170KB 近くあり、msp_block は
-     * ブロックの深さぶん再帰するので、各段で自動変数に取るとスタックが尽きる
-     * （40段ほどで落ちていた）。解析は 1 行ぶんずつ完結し、式は木に写してから
-     * 次の段へ進むので、1本を使い回して構わない。 */
-    MTok     *tok;
+    /* 字句の作業領域。msp_block はブロックの深さぶん再帰するので、各段で
+     * 自動変数に取るとスタックが尽きる（40段ほどで落ちていた）。解析は
+     * 1 行ぶんずつ完結し、式は木に写してから次の段へ進むので、1本を
+     * 使い回して構わない。長さは行ごとに必要なだけ伸ばす。 */
+    MiniLexBuf *tok;
     int       loopdepth;   /* `.break` / `.continue` が書ける深さ */
 } MSP;
 
@@ -8714,8 +9005,8 @@ static MStmt *msp_simple(MSP *p, int li){
     const char *text = p->f->lines[li];
     c->file = p->f->lfiles[li];
     c->line = p->f->llines[li];
-    MTok *toks = p->tok;
-    int n = mini_lex(c, text, toks);
+    int n = mini_lex(c, text, p->tok);
+    MTok *toks = p->tok->tok;
     if(n == 0) mini_fail(c, "empty statement");
 
     if(toks[0].k == MT_DOT){
@@ -8787,7 +9078,14 @@ static MStmt *msp_simple(MSP *p, int li){
             if(s->nnames == 0) mini_fail(c, "'.nonlocal' needs variable names");
             return s;
         }
-        mini_fail(c, "unknown statement '%s'", kw);
+        /* 破綻点修正: axx.py は `{v.lower()!r}` と、小文字化してから Python の
+         * repr で出す。ここは大文字化した綴りを `'...'` で括っていた。 */
+        { char _kl[256]; size_t _ki = 0;
+          for(; kw[_ki] && _ki + 1 < sizeof(_kl); _ki++)
+              _kl[_ki] = (char)tolower((unsigned char)kw[_ki]);
+          _kl[_ki] = '\0';
+          char _kr[600]; m_pyrepr(_kl, _kr, sizeof(_kr));
+          mini_fail(c, "unknown statement %s", _kr); }
     }
     if(toks[0].k != MT_NAME)
         mini_fail(c, "statement must be a directive or an assignment");
@@ -8828,8 +9126,8 @@ static MStmt *msp_if_chain(MSP *p, int li){
     for(char *q = low; *q; q++) *q = (char)tolower((unsigned char)*q);
     c->file = p->f->lfiles[li];
     c->line = p->f->llines[li];
-    MTok *toks = p->tok;
-    int n = mini_lex(c, p->f->lines[li], toks);
+    int n = mini_lex(c, p->f->lines[li], p->tok);
+    MTok *toks = p->tok->tok;
     if(n < 2 || toks[n-1].k != MT_DOT || strcmp(toks[n-1].s, ".THEN") != 0)
         mini_fail(c, "'%s' must end with '.then'", low);
     MStmt *s = ms_new(MS_IF, p, li);
@@ -8848,9 +9146,8 @@ static MStmt *msp_if_chain(MSP *p, int li){
         int cap2 = 0;
         ms_push(&s->body2, &s->nbody2, &cap2, inner);
     } else if(strcmp(kw2, ".ELSE") == 0){
-        MTok *t2 = p->tok;
         c->file = p->f->lfiles[p->i]; c->line = p->f->llines[p->i];
-        if(mini_lex(c, p->f->lines[p->i], t2) != 1)
+        if(mini_lex(c, p->f->lines[p->i], p->tok) != 1)
             mini_fail(c, "unexpected text after '.else'");
         p->i++;
         msp_block(p, ".ENDIF", NULL, NULL, &s->body2, &s->nbody2);
@@ -8888,8 +9185,8 @@ static void msp_block(MSP *p, const char *e1, const char *e2, const char *e3,
             continue;
         }
         if(strcmp(kw, ".WHILE") == 0){
-            MTok *toks = p->tok;
-            int n = mini_lex(c, p->f->lines[li], toks);
+            int n = mini_lex(c, p->f->lines[li], p->tok);
+            MTok *toks = p->tok->tok;
             MStmt *s = ms_new(MS_WHILE, p, li);
             MXP ep; ep.t = toks + 1; ep.n = n - 1; ep.i = 0; ep.c = c;
             s->val = mxp_full(&ep);
@@ -8906,8 +9203,8 @@ static void msp_block(MSP *p, const char *e1, const char *e2, const char *e3,
             continue;
         }
         if(strcmp(kw, ".FOR") == 0){
-            MTok *toks = p->tok;
-            int n = mini_lex(c, p->f->lines[li], toks);
+            int n = mini_lex(c, p->f->lines[li], p->tok);
+            MTok *toks = p->tok->tok;
             if(n < 4 || toks[1].k != MT_NAME)
                 mini_fail(c, "'.for' needs 'variable in range(...)'");
             MStmt *s = ms_new(MS_FOR, p, li);
@@ -8940,23 +9237,20 @@ static void msp_block(MSP *p, const char *e1, const char *e2, const char *e3,
 /* 本体の行を文の木にする。エラーは *errout に書いて 0 を返す。 */
 /* 字句の作業領域。解析は 1 関数ずつ順に走るので 1 本で足りる。
  * msp_block の再帰段ごとに自動変数で持つとスタックが尽きるため外に出す。 */
-static MTok *mini_tokbuf(void){
-    static MTok *buf;
-    if(!buf){
-        buf = malloc((size_t)MINI_MAX_TOK * sizeof(MTok));
-        if(!buf){ perror("malloc"); exit(1); }
-    }
-    return buf;
+static MiniLexBuf *mini_tokbuf(void){
+    static MiniLexBuf buf;
+    return &buf;
 }
 
-static int mini_compile_func(MiniFunc *f, char *errout, size_t esz){
+static int mini_compile_func(MiniFunc *f, char **errout){
     MiniCtx c;
-    MTok *tokbuf = mini_tokbuf();
+    MiniLexBuf *tokbuf = mini_tokbuf();
     memset(&c, 0, sizeof(c));
     c.file = f->file; c.line = f->line;
     c.jb_active = 1;
     if(setjmp(c.jb)){
-        snprintf(errout, esz, "%s", c.err);
+        /* 破綻点修正: 固定長へ写して切り詰めていた。所有権を呼び出し側へ渡す。 */
+        *errout = c.err;
         f->body = NULL; f->nbody = 0;
         return 0;
     }
@@ -9669,9 +9963,11 @@ static void mini_func_addline(MiniFunc *f, const char *text, const char *file, i
 /* 読み込みの最後に、集めた本体をまとめて文の木にする。 */
 static void mini_compile_all(MiniFunc **v, int n){
     for(int i = 0; i < n; i++){
-        char err[512];
-        if(!mini_compile_func(v[i], err, sizeof(err)))
-            axx_diagf(1, 0, " error - %s\n", err);
+        char *err = NULL;
+        if(!mini_compile_func(v[i], &err)){
+            axx_diagf(1, 0, " error - %s\n", err ? err : "?");
+            free(err);
+        }
         mini_compile_all(v[i]->children, v[i]->nchildren);
     }
 }
@@ -9702,7 +9998,10 @@ static MiniVal mini_arg_array(Assembler *asmb, char *t, int a, int *out_i, int *
         if(t[i] == ','){ i++; continue; }
         int io;
         uint256_t x = expr_expression_pat(asmb, t, i, &io);
-        if(io <= i) break;
+        /* 破綻点修正: ここに `if(io <= i) break;` があり、1文字も読めない
+         * 綴り（`[}32]` 等）で要素を落としていた。axx.py は読めなくても 0 を
+         * 1 個積んでから、次が `,` かどうかだけで続きを決める（`,` が必ず
+         * 位置を進めるので、止まらなくなることはない）。同じにそろえる。 */
         i = io;
         /* 未定義ラベル由来の巨大な番兵で反復回数が爆発しないよう 0 を渡す。 */
         if(u256_is_undef_derived(x)) x = u256_zero();
@@ -9718,7 +10017,12 @@ static MiniVal mini_arg_array(Assembler *asmb, char *t, int a, int *out_i, int *
     return v;
 }
 
-static int mini_call_binary(Assembler *asmb, const char *s, int idx, IntVec *objl){
+static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *objl){
+    /* 破綻点修正(潜在): 返り値に使う idx は setjmp() をまたいで生きるので、
+     * volatile でないと longjmp 後の値が規格上は不定になる（gcc も
+     * -Wclobbered で指摘する）。実測では壊れていないが、最適化次第で
+     * 壊れうる位置なので volatile にしておく。 */
+    volatile int idx = idx_in;
     AsmState *st = &asmb->st;
     int slen = expr_slen(s);
     /* 命令長を測るだけの試し打ちでも makeobj は走るので、そのときは黙る。 */
@@ -9791,7 +10095,9 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx, IntVec *obj
         } else {
             int io;
             uint256_t v = expr_expression_pat(asmb, argtext, a, &io);
-            if(io <= a) break;
+            /* 破綻点修正: 上と同じ。`f(v,0,0,h,g,}32)` のように 1 文字も
+             * 読めない引数があると、caxx だけ引数を 1 個落として
+             * "takes 6 argument(s), got 5" になっていた。 */
             a = io;
             /* 未定義ラベル由来の巨大な番兵で反復回数が爆発しないよう 0 を渡す。 */
             if(u256_is_undef_derived(v)) v = u256_zero();
@@ -9827,10 +10133,11 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx, IntVec *obj
                 iv_push(objl, r.retval.num);
         }
     } else {
-        if(!quiet) axx_diagf(1, 0, " error - %s\n", r.c.err);
+        if(!quiet) axx_diagf(1, 0, " error - %s\n", r.c.err ? r.c.err : "?");
     }
     for(int i = 0; i < r.nframes; i++) mini_frame_clear(&r.frames[i]);
     free(r.frames);
+    free(r.c.err);
     mini_drop_ret(&r);
     free(r.out.data);
     for(int i = 0; i < nargs; i++) mini_val_free(&args[i]);
@@ -10025,8 +10332,8 @@ static void readpat(Assembler *asmb, const char *fn){
     }
     asmb->st.pat_include_depth++;
 
-    char this_dir[1024];
-    axx_dir_of(fn, this_dir, sizeof(this_dir));
+    char this_dir[PATH_MAX];
+    axx_abs_dir_of(fn, this_dir, sizeof(this_dir));
 
     if(asmb->st.pat_include_depth == 1){
         macro_reset_pass_pattern();
@@ -10133,22 +10440,56 @@ static void readpat(Assembler *asmb, const char *fn){
                         axx_diagf(1, 0, "%s", errbuf);
                         ok = 0;
                     } else if(!is_sub_name(nmbuf)){
+                        char _nr[600]; m_pyrepr(nmbuf, _nr, sizeof(_nr));
                         axx_diagf(1, 0, " error - '.func' needs a name made of letters, "
-                                   "digits and '_': '%s'\n", nmbuf);
+                                   "digits and '_': %s\n", _nr);
                         ok = 0;
-                    }
-                    MiniFunc *parent = nfunc_stack ? func_stack[nfunc_stack-1] : NULL;
-                    MiniFunc *nf = mini_func_new(asmb, parent, ok ? nmbuf : "?", fn, li + 1);
-                    if(ok){
+                    } else {
+                        /* 破綻点修正: 引数名が壊れていても関数を登録して本体を
+                         * 組み立てていたため、axx.py（名前が壊れた関数は登録せず
+                         * 本体も組み立てない）には出ない後続エラーが並んでいた。
+                         * 最初の壊れた引数名で打ち切るのも axx.py と同じ。 */
                         for(int q=0;q<nparam;q++){
                             char *pn = pbuf + (size_t)q*FUNC_NAME_MAX;
                             if(!is_sub_name(pn)){
+                                char _pr[600]; m_pyrepr(pn, _pr, sizeof(_pr));
                                 axx_diagf(1, 0, " error - '.func %s': bad parameter "
-                                           "name '%s'\n", nmbuf, pn);
-                            } else {
-                                mini_func_addparam(nf, pn);
+                                           "name %s\n", nmbuf, _pr);
+                                ok = 0;
+                                break;
                             }
                         }
+                    }
+                    MiniFunc *parent = nfunc_stack ? func_stack[nfunc_stack-1] : NULL;
+                    MiniFunc *nf;
+                    if(ok){
+                        /* 破綻点修正: 同名の再定義を黙って差し替えていた
+                         * （axx.py は警告を出す）。 */
+                        int _dup = 0;
+                        if(parent){
+                            for(int i=0;i<parent->nchildren;i++)
+                                if(strcmp(parent->children[i]->name, nmbuf)==0){ _dup=1; break; }
+                        } else {
+                            MiniFuncVec *_v = &asmb->st.funcs;
+                            for(int i=0;i<_v->len;i++)
+                                if(strcmp(_v->data[i]->name, nmbuf)==0){ _dup=1; break; }
+                        }
+                        if(_dup){
+                            char _nr[600]; m_pyrepr(nmbuf, _nr, sizeof(_nr));
+                            axx_diagf(0, 0, " warning - function %s is defined more than "
+                                       "once; the later definition wins.\n", _nr);
+                        }
+                        nf = mini_func_new(asmb, parent, nmbuf, fn, li + 1);
+                        for(int q=0;q<nparam;q++)
+                            mini_func_addparam(nf, pbuf + (size_t)q*FUNC_NAME_MAX);
+                    } else {
+                        /* 名前が壊れていても本体を取り込んで `.endfunc` の対応を
+                         * 保つ。表には載せないので組み立てもされない（axx.py と同じ）。 */
+                        nf = mini_alloc(sizeof(MiniFunc));
+                        nf->name = mini_strdup("?");
+                        nf->file = mini_strdup(fn);
+                        nf->line = li + 1;
+                        nf->parent = parent;
                     }
                     free(pbuf);
                     func_stack[nfunc_stack++] = nf;
@@ -10219,16 +10560,26 @@ static void readpat(Assembler *asmb, const char *fn){
          * 同じパターンファイルから違うバイト列が出る。行長から必要量が
          * 決まるので、行ごとに確保する。 */
         size_t fsz = strlen(line) + 1;
-        char *fbuf = malloc(8 * fsz);
+        /* 破綻点修正: 欄は最大 8 個までしか切り出していなかったため、7 個目
+         * より後ろが 8 個目にまとめて残り、axx.py が出す
+         * " warning - pattern line has more than 6 fields ..." の内容と
+         * 食い違っていた（そもそもその警告が caxx に無かった）。
+         * `::` の数から必要な個数を決める。 */
+        int fmax = 1;
+        for(const char *q = line; *q; q++)
+            if(q[0]==':' && q[1]==':'){ fmax++; q++; }
+        if(fmax < 8) fmax = 8;
+        char *fbuf = malloc((size_t)fmax * fsz);
         if(!fbuf){ perror("malloc"); exit(1); }
-        char *fields[8];
-        for(int i=0;i<8;i++){ fields[i] = fbuf + (size_t)i*fsz; fields[i][0]=0; }
+        char **fields = malloc((size_t)fmax * sizeof(char*));
+        if(!fields){ perror("malloc"); exit(1); }
+        for(int i=0;i<fmax;i++){ fields[i] = fbuf + (size_t)i*fsz; fields[i][0]=0; }
         int nf=0;
         int idx=0;
         while(1){
             idx=axx_get_params1(line,idx,fields[nf],fsz);
             nf++;
-            if(idx>=(int)strlen(line)||nf>=8) break;
+            if(idx>=(int)strlen(line)||nf>=fmax) break;
         }
 
         /* `.sub::名前 … .return` はパターン層のサブ表。中の項目は本体の
@@ -10257,23 +10608,42 @@ static void readpat(Assembler *asmb, const char *fn){
                                    "than once; the later definition wins.\n", nm);
                     cur_sub = subv_new(&asmb->st.subs, nm);
                 }
-                free(fbuf); continue;
+                free(fields); free(fbuf); continue;
             }
-            if(strcmp(kw,".RETURN")==0){
-                if(!cur_sub)
-                    axx_diagf(1, 0, " error - '.return' without a matching '.sub'.\n");
+            /* `.sub` ブロックの終わりは `.return` でも `.endsub` でもよい。
+             * `.func … .endfunc` と綴りをそろえたいときのための別名で、
+             * 意味は同じ。 */
+            if(strcmp(kw,".RETURN")==0 || strcmp(kw,".ENDSUB")==0){
+                if(!cur_sub){
+                    char _kwl[16];
+                    for(size_t _i=0;_i<sizeof(_kwl);_i++)
+                        _kwl[_i] = (char)tolower((unsigned char)kw[_i]);
+                    _kwl[sizeof(_kwl)-1] = '\0';
+                    axx_diagf(1, 0, " error - '%s' without a matching '.sub'.\n", _kwl);
+                }
                 cur_sub = NULL;
-                free(fbuf); continue;
+                free(fields); free(fbuf); continue;
             }
             if(cur_sub){
                 if(nf<2){
-                    if(pat_trim(fields[0])[0])
-                        axx_diagf(1, 0, " error - sub table '%s': entry has no '::' "
-                                   "field separator: '%s'\n", cur_sub->name, fields[0]);
+                    if(pat_trim(fields[0])[0]){
+                        /* 破綻点修正: axx.py は表名も本文も Python の repr で
+                         * 出す（`{cur_sub!r}` / `{l[0]!r}`）ので、`'` を含む
+                         * 綴りで引用符の選び方が食い違っていた。 */
+                        size_t _esz = strlen(fields[0]) * 4 + 8;
+                        char *_er = malloc(_esz);
+                        char _nr[600];
+                        if(!_er){ perror("malloc"); exit(1); }
+                        m_pyrepr(fields[0], _er, _esz);
+                        m_pyrepr(cur_sub->name, _nr, sizeof(_nr));
+                        axx_diagf(1, 0, " error - sub table %s: entry has no '::' "
+                                   "field separator: %s\n", _nr, _er);
+                        free(_er);
+                    }
                 } else {
                     subdef_push(cur_sub, fields[0], fields[nf-1]);
                 }
-                free(fbuf); continue;
+                free(fields); free(fbuf); continue;
             }
         }
 
@@ -10314,12 +10684,19 @@ static void readpat(Assembler *asmb, const char *fn){
             }
             if(nonblank && strcmp(kw1,".PASSTHRU")!=0 && strcmp(kw1,".EOL")!=0
                         && strcmp(kw1,".TEXTMODE")!=0){
-                axx_diagf(0, 0, " warning - pattern line has no '::' field separator "
-                           "and can never match (a pattern file has no line-"
-                           "continuation mechanism, so this is likely a stray "
-                           "line left over from a multi-line comment, or a "
-                           "binary_list/error_patterns that was continued onto "
-                           "the next physical line): '%s'\n", fields[0]);
+                /* 破綻点修正: axx.py は `{l[0]!r}` と Python の repr で出す。 */
+                { size_t _fl = strlen(fields[0]);
+                  size_t _rsz = _fl * 4 + 8;
+                  char *_fr = malloc(_rsz);
+                  if(!_fr){ perror("malloc"); exit(1); }
+                  m_pyrepr(fields[0], _fr, _rsz);
+                  axx_diagf(0, 0, " warning - pattern line has no '::' field separator "
+                             "and can never match (a pattern file has no line-"
+                             "continuation mechanism, so this is likely a stray "
+                             "line left over from a multi-line comment, or a "
+                             "binary_list/error_patterns that was continued onto "
+                             "the next physical line): %s\n", _fr);
+                  free(_fr); }
             }
         }
         PatEntry *pe=pv_push_blank(&asmb->st.pat);
@@ -10328,7 +10705,28 @@ static void readpat(Assembler *asmb, const char *fn){
         else if(nf==3){ pat_set(pe,0,fields[0]); pat_set(pe,1,fields[1]); pat_set(pe,2,fields[2]); }
         else if(nf==4){ pat_set(pe,0,fields[0]); pat_set(pe,1,fields[1]); pat_set(pe,2,fields[2]); pat_set(pe,3,fields[3]); }
         else if(nf==5){ for(int i=0;i<5;i++) pat_set(pe,i,fields[i]); }
-        else if(nf>=6){ for(int i=0;i<6;i++) pat_set(pe,i,fields[i]); }
+        else if(nf==6){ for(int i=0;i<6;i++) pat_set(pe,i,fields[i]); }
+        else {
+            /* 破綻点修正: axx.py はここで余った欄を挙げて警告するが、caxx には
+             * この警告が無かった。文面は `{l[6:]!r}`（Python のリストの repr）。 */
+            size_t _wsz = 4;
+            for(int i=6;i<nf;i++) _wsz += strlen(fields[i]) * 4 + 8;
+            char *_w = malloc(_wsz);
+            if(!_w){ perror("malloc"); exit(1); }
+            size_t _o = 0;
+            _w[_o++] = '[';
+            for(int i=6;i<nf;i++){
+                if(i>6){ _w[_o++]=','; _w[_o++]=' '; }
+                m_pyrepr(fields[i], _w + _o, _wsz - _o);
+                _o += strlen(_w + _o);
+            }
+            _w[_o++] = ']'; _w[_o] = '\0';
+            axx_diagf(0, 0, " warning - pattern line has more than 6 fields "
+                            "(extra fields ignored): %s\n", _w);
+            free(_w);
+            for(int i=0;i<6;i++) pat_set(pe,i,fields[i]);
+        }
+        free(fields);
         free(fbuf);
     }
     if(in_block_comment){
@@ -10337,7 +10735,7 @@ static void readpat(Assembler *asmb, const char *fn){
     }
     if(cur_sub){
         axx_diagf(1, 0, " error - pattern file '%s' ends while sub table '%s' is "
-                   "still open (missing '.return').\n", fn, cur_sub->name);
+                   "still open (missing '.return' or '.endsub').\n", fn, cur_sub->name);
     }
     while(nfunc_stack > 0){
         axx_diagf(1, 0, " error - pattern file '%s' ends while function '%s' is "
@@ -12582,21 +12980,30 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
             while(idx < blen && buf[idx]!=' ' && buf[idx]!='\t'
                   && buf[idx]!=',' && buf[idx]!=':' && buf[idx]!='\0')
                 idx++;
-            char rt_str[64]={0};
+            /* 破綻点修正: 型名を char[64] に収まるときしか見ていなかったので、
+             * 長い名前は警告も出ずに既定の型のまま通っていた。長さぶん取る。 */
             int rt_len = idx - rt_start;
-            if(rt_len > 0 && rt_len < (int)sizeof(rt_str)-1){
+            if(rt_len > 0){
+                char *rt_str = malloc((size_t)rt_len + 1);
+                if(!rt_str){ perror("malloc"); exit(1); }
                 memcpy(rt_str, buf+rt_start, (size_t)rt_len);
                 rt_str[rt_len]=0;
                 for(int _ci=0;rt_str[_ci];_ci++)
                     if(rt_str[_ci]>='A'&&rt_str[_ci]<='Z') rt_str[_ci]+=32;
                 int rtype = elf_reloc_named(st, _mtbl_ext, rt_str);
-                if(rtype < 0)
+                if(rtype < 0){
+                    /* 破綻点修正: 名前が引けなかったとき reloc_type を既定の
+                     * まま残していたため、axx.py（reloc_type を None にして
+                     * 「型の指定なし」に落とす）と別のリロケーション型を
+                     * 出していた（x86-64 で 2 と 10 の食い違い）。 */
+                    reloc_type = -1;
                     axx_diagf(0, 0, " warning - unknown reloc type '%s' in .EXTERN for machine %d\n",
                                rt_str, st->elf_machine);
-                else {
+                } else {
                     reloc_type = rtype;
                     explicit_reloc_type = 1;
                 }
+                free(rt_str);
             }
         }
         if(idx < blen && buf[idx]==':') idx++;
@@ -14734,9 +15141,8 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
 
     FILE *fp=fopen(path,"wb");
     if(!fp){
-        if(should_report_errors(st)){
-            axx_diagf(1, 0, " error - cannot create ELF output file '%s': %s\n", path, strerror(errno));
-        }
+        char _eb[1200]; axx_oserr_str(path, errno, _eb, sizeof(_eb));
+        axx_diagf(1, 0, " error - cannot write '%s': %s\n", path, _eb);
         goto weo_done;
     }
 
@@ -14811,7 +15217,10 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         weo_shdr(fp,_is_le,_is_elf64,dbg_rela_noff[i],_dbg_rel_sh_type,0x40,0,dbg_rela_fo[i],dbg_rela[i].len,
                  (uint32_t)sym_shidx,(uint32_t)(dbg_base+1+dbg_rela[i].target),_dbg_word_align,(uint64_t)_reloc_entsz);
     }
-    fclose(fp);
+    /* 破綻点修正: fwrite と fclose の結果を見ずに「elf: wrote ...」と報告して
+     * いたため、ディスクが一杯のときに切り詰められた .o が成功として残って
+     * いた（axx.py は OSError で失敗する）。 */
+    if(axx_close_out(fp, path)) goto weo_done;
     {
     /* 破綻点修正: axx.py は ", N debug section(s)" と出すのに対し、ここだけ
      * ", +DWARF debug" という別の文言だった。-g のときだけ両実装の stderr が
@@ -15079,15 +15488,32 @@ static void m_warn(MacroPP *mp, const char *file, int line, const char *fmt, ...
 }
 
 static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...){
-    char body[1024];
+    /* 破綻点修正: 本文を 1024、位置付きの文面を 1200 バイトに切り詰めていた
+     * ため、長い式や長い文字列値を含むエラーが axx.py と食い違っていた。
+     * 必要な長さを測ってから組み立てる。 */
+    char bodybuf[1024];
+    char *body = bodybuf;
     va_list ap; va_start(ap, fmt);
-    vsnprintf(body, sizeof(body), fmt, ap);
+    int bneed = vsnprintf(bodybuf, sizeof(bodybuf), fmt, ap);
     va_end(ap);
-    char msg[1200];
-    if(line < 0) snprintf(msg, sizeof(msg), "%s: %s", file ? file : "?", body);
-    else snprintf(msg, sizeof(msg), "%s:%d: %s", file ? file : "?", line, body);
+    if(bneed >= (int)sizeof(bodybuf)){
+        char *bh = malloc((size_t)bneed + 1);
+        if(bh){
+            va_start(ap, fmt);
+            vsnprintf(bh, (size_t)bneed + 1, fmt, ap);
+            va_end(ap);
+            body = bh;
+        }
+    }
+    size_t msz = strlen(body) + (file ? strlen(file) : 1) + 32;
+    char *msg = malloc(msz);
+    if(!msg){ perror("malloc"); exit(1); }
+    if(line < 0) snprintf(msg, msz, "%s: %s", file ? file : "?", body);
+    else snprintf(msg, msz, "%s:%d: %s", file ? file : "?", line, body);
+    if(body != bodybuf) free(body);
     if(m_first_report(mp, msg))
         axx_diagf(0, 1, " error - %s\n", msg);
+    free(msg);
     mp->had_error = 1;
     if(mp->asmb) mp->asmb->st.had_error = 1;
     if(mp->pending_buf){ free(mp->pending_buf); mp->pending_buf = NULL; }
@@ -15096,15 +15522,21 @@ static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...
 }
 
 
-static void m_pyrepr(const char *s, char *out, size_t outsz){
+/* Python の repr() 相当。n バイトぶんを見るので、途中に NUL があっても
+ * `\x00` として出せる（式の文字列は二重 NUL 終端で、axx.py 側の
+ * `s[idx:idx+8]!r` は終端の chr(0) を含んだ形で出る）。 */
+static void m_pyrepr_n(const char *s, size_t n, char *out, size_t outsz){
     if(outsz < 3){ if(outsz) out[0] = '\0'; return; }
-    int has_sq = strchr(s, '\'') != NULL;
-    int has_dq = strchr(s, '"') != NULL;
+    int has_sq = 0, has_dq = 0;
+    for(size_t k = 0; k < n; k++){
+        if(s[k] == '\'') has_sq = 1;
+        else if(s[k] == '"') has_dq = 1;
+    }
     char q = (has_sq && !has_dq) ? '"' : '\'';
     size_t o = 0;
     out[o++] = q;
-    for(const unsigned char *p = (const unsigned char*)s; *p; p++){
-        unsigned char c = *p;
+    for(size_t k = 0; k < n; k++){
+        unsigned char c = (unsigned char)s[k];
         if(o + 6 >= outsz) break;
         if(c == '\\' || c == (unsigned char)q){ out[o++] = '\\'; out[o++] = (char)c; }
         else if(c == '\n'){ out[o++] = '\\'; out[o++] = 'n'; }
@@ -15117,6 +15549,22 @@ static void m_pyrepr(const char *s, char *out, size_t outsz){
     }
     out[o++] = q;
     out[o] = '\0';
+}
+
+static void m_pyrepr(const char *s, char *out, size_t outsz){
+    m_pyrepr_n(s, strlen(s), out, outsz);
+}
+
+/* 破綻点修正: マクロ層の診断はどこも `char sr[600]` のような固定長に repr を
+ * 写していたため、長い式や長い文字列値（`"a"*1295` 等）が途中で切れて
+ * axx.py（切り詰めない）と文面が食い違っていた。必要な長さぶんをマクロ層の
+ * アリーナから取る（m_fail が longjmp で抜けても漏れない）。 */
+static char *m_pyrepr_a(MacroPP *mp, const char *s){
+    if(!s) s = "";
+    size_t sz = strlen(s) * 4 + 8;
+    char *out = marena_alloc(&mp->arena, sz);
+    m_pyrepr(s, out, sz);
+    return out;
 }
 
 
@@ -15154,10 +15602,8 @@ static void m_echo_write(char *const *items, int n){
 static long long mv_need_int(MacroPP *mp, MVal v, const char *file, int line){
     if(v.is_str){
         if(mp->noeval) return 0;
-        char vr[600], er[600];
-        m_pyrepr(v.s ? v.s : "", vr, sizeof(vr));
-        if(mp->cur_expr) m_pyrepr(mp->cur_expr, er, sizeof(er));
-        else { er[0] = '?'; er[1] = '\0'; }
+        char *vr = m_pyrepr_a(mp, v.s ? v.s : "");
+        char *er = mp->cur_expr ? m_pyrepr_a(mp, mp->cur_expr) : (char*)"?";
         m_fail(mp, file, line, "macro expression: expected an integer, got the string %s in %s", vr, er);
     }
     return v.i;
@@ -15186,7 +15632,7 @@ static inline long long m_i64_abs(long long a){
 static inline long long m_i64_neg_ck(MEP *p, long long a){
     if(a == LLONG_MIN){
         if(p->mp->noeval) return 0;
-        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        char *sr = m_pyrepr_a(p->mp, p->s);
         m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
     }
     return -a;
@@ -15203,7 +15649,7 @@ static inline long long m_i64_add(MEP *p, long long a, long long b){
     long long r;
     if(__builtin_add_overflow(a, b, &r)){
         if(p->mp->noeval) return 0;
-        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        char *sr = m_pyrepr_a(p->mp, p->s);
         m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
     }
     return r;
@@ -15212,7 +15658,7 @@ static inline long long m_i64_sub(MEP *p, long long a, long long b){
     long long r;
     if(__builtin_sub_overflow(a, b, &r)){
         if(p->mp->noeval) return 0;
-        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        char *sr = m_pyrepr_a(p->mp, p->s);
         m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
     }
     return r;
@@ -15221,7 +15667,7 @@ static inline long long m_i64_mul(MEP *p, long long a, long long b){
     long long r;
     if(__builtin_mul_overflow(a, b, &r)){
         if(p->mp->noeval) return 0;
-        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        char *sr = m_pyrepr_a(p->mp, p->s);
         m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
     }
     return r;
@@ -15244,7 +15690,7 @@ static long long m_cdiv(MEP *p, long long a, long long b){
     if(b == 0) return 0;                 /* 取らない側を読み飛ばしている最中 */
     if(a == LLONG_MIN && b == -1){
         if(p->mp->noeval) return 0;
-        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        char *sr = m_pyrepr_a(p->mp, p->s);
         m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
     }
     /* 破綻点修正: m_i64_abs(INT64_MIN) は INT64_MIN のままなので（絶対値が
@@ -15428,9 +15874,9 @@ static int mep_eat(MEP *p, const char *tok){
 }
 static void mep_expect(MEP *p, const char *tok){
     if(!mep_eat(p, tok)){
-        char tokr[16], sr[600];
+        char tokr[16];
         m_pyrepr(tok, tokr, sizeof(tokr));
-        m_pyrepr(p->s, sr, sizeof(sr));
+        char *sr = m_pyrepr_a(p->mp, p->s);
         m_fail(p->mp, p->file, p->line, "macro expression: expected %s in %s", tokr, sr);
     }
 }
@@ -15441,7 +15887,7 @@ static char *mep_ident(MEP *p){
     int j = p->i;
     while(p->s[j] && (isalnum((unsigned char)p->s[j]) || p->s[j] == '_')) j++;
     if(j == p->i){
-        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        char *sr = m_pyrepr_a(p->mp, p->s);
         m_fail(p->mp, p->file, p->line, "macro expression: expected a name in %s", sr);
     }
     char *r = marena_strndup(&p->mp->arena, p->s + p->i, (size_t)(j - p->i));
@@ -15471,7 +15917,7 @@ static MVal mep_number(MEP *p){
         ndig++; j++;
     }
     if(ndig == 0 || j == start){
-        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        char *sr = m_pyrepr_a(p->mp, p->s);
         m_fail(p->mp, p->file, p->line, "macro expression: malformed number in %s", sr);
     }
     p->i = j;
@@ -15501,7 +15947,7 @@ static char *mep_string(MEP *p, char q, int *len_out){
         buf[n++] = c; j++;
     }
     {
-        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        char *sr = m_pyrepr_a(p->mp, p->s);
         m_fail(p->mp, p->file, p->line, "macro expression: unterminated string literal in %s", sr);
     }
     return NULL;
@@ -15511,7 +15957,7 @@ static MVal mep_primary(MEP *p){
     mep_skip(p);
     char c = p->s[p->i];
     if(!c){
-        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        char *sr = m_pyrepr_a(p->mp, p->s);
         m_fail(p->mp, p->file, p->line, "macro expression: unexpected end of expression in %s", sr);
     }
 
@@ -15522,7 +15968,7 @@ static MVal mep_primary(MEP *p){
          * 同種の問題）。axx.py は RecursionError で安全に止まるのに対し、
          * こちらは無防備だったので、同じ上限で止める。 */
         if(p->mp->expr_depth >= EXPR_MAX_DEPTH){
-            char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+            char *sr = m_pyrepr_a(p->mp, p->s);
             m_fail(p->mp, p->file, p->line, "macro expression: nesting too deep in %s", sr);
         }
         p->mp->expr_depth++;
@@ -15582,7 +16028,7 @@ static MVal mep_primary(MEP *p){
         return m_lookup(p->mp, name, p->file, p->line);
     }
     {
-        char cbuf[2] = { c, 0 }, cr[16], sr[600];
+        char cbuf[2] = { c, 0 }, cr[16]; char *sr = m_pyrepr_a(p->mp, p->s);
         m_pyrepr(cbuf, cr, sizeof(cr));
         m_pyrepr(p->s, sr, sizeof(sr));
         m_fail(p->mp, p->file, p->line, "macro expression: unexpected character %s in %s", cr, sr);
@@ -15635,7 +16081,7 @@ static long long m_safe_repeat_len(MacroPP *mp, const char *file, int line,
     if(n == 0 || l == 0) return 0;
     if((unsigned long long)n > (unsigned long long)(MAXLEN) / l){
         if(mp->noeval) return 0;
-        char sr[600]; m_pyrepr(srcline, sr, sizeof(sr));
+        char *sr = m_pyrepr_a(mp, srcline);
         m_fail(mp, file, line, "macro expression: string repetition too large in %s", sr);
     }
     return n * (long long)l;
@@ -15668,14 +16114,18 @@ static MVal mep_mul(MEP *p){
                 b[(size_t)total] = '\0';
                 v = mv_str(b);
             } else {
-                v = mv_int(m_i64_mul(p, mv_need_int(p->mp, v, p->file, p->line),
-                                      mv_need_int(p->mp, r, p->file, p->line)));
+                /* 破綻点修正: 引数の評価順は C では未規定で、gcc は右から
+                  * 評価するため、両方が文字列のとき axx.py（左から）と違う
+                  * ほうの値をエラーに出していた。順序を固定する。 */
+                long long _lv = mv_need_int(p->mp, v, p->file, p->line);
+                long long _rv = mv_need_int(p->mp, r, p->file, p->line);
+                v = mv_int(m_i64_mul(p, _lv, _rv));
             }
         } else if(c == '/'){
             p->i++;
             long long r = mv_need_int(p->mp, mep_unary(p), p->file, p->line);
             if(r == 0 && !p->mp->noeval){
-                char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+                char *sr = m_pyrepr_a(p->mp, p->s);
                 m_fail(p->mp, p->file, p->line, "macro expression: division by zero in %s", sr);
             }
             v = mv_int(m_cdiv(p, mv_need_int(p->mp, v, p->file, p->line), r));
@@ -15683,7 +16133,7 @@ static MVal mep_mul(MEP *p){
             p->i++;
             long long r = mv_need_int(p->mp, mep_unary(p), p->file, p->line);
             if(r == 0 && !p->mp->noeval){
-                char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+                char *sr = m_pyrepr_a(p->mp, p->s);
                 m_fail(p->mp, p->file, p->line, "macro expression: modulo by zero in %s", sr);
             }
             v = mv_int(m_cmod(p, mv_need_int(p->mp, v, p->file, p->line), r));
@@ -15708,8 +16158,10 @@ static MVal mep_add(MEP *p){
             } else v = mv_int(m_i64_add(p, v.i, r.i));
         } else if(c == '-'){
             p->i++;
-            v = mv_int(m_i64_sub(p, mv_need_int(p->mp, v, p->file, p->line),
-                       mv_need_int(p->mp, mep_mul(p), p->file, p->line)));
+            /* 破綻点修正: 同上（評価順の固定）。 */
+            { long long _lv = mv_need_int(p->mp, v, p->file, p->line);
+              long long _rv = mv_need_int(p->mp, mep_mul(p), p->file, p->line);
+              v = mv_int(m_i64_sub(p, _lv, _rv)); }
         } else return v;
     }
 }
@@ -15726,7 +16178,7 @@ static MVal mep_shift(MEP *p){
              * 「shift count out of range」で落ちていた。上限を axx.py に
              * 合わせ、64bit から溢れるかどうかは下の桁溢れ検査で見る。 */
             if((n < 0 || n > 4096) && !p->mp->noeval){
-                char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+                char *sr = m_pyrepr_a(p->mp, p->s);
                 m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range in %s", sr);
             }
             if(n < 0 || n > 4096) n = 0;   /* 取らない側を読み飛ばしている最中 */
@@ -15735,7 +16187,7 @@ static MVal mep_shift(MEP *p){
                 /* 64bit では表せない。0 を何ビット左にずらしても 0 なので、
                  * その場合だけは axx.py と同じ値を返せる。 */
                 if(base != 0 && !p->mp->noeval){
-                    char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+                    char *sr = m_pyrepr_a(p->mp, p->s);
                     m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
                 }
                 v = mv_int(0);
@@ -15746,7 +16198,7 @@ static MVal mep_shift(MEP *p){
              * axx.py(任意精度)と異なる値を無言で返していた。追い出されたビットが
              * あれば(逆シフトで元に戻らなければ)明示的にエラーにする。 */
             if(n > 0 && (shifted >> n) != base && !p->mp->noeval){
-                char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+                char *sr = m_pyrepr_a(p->mp, p->s);
                 m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
             }
             v = mv_int(shifted);
@@ -15757,7 +16209,7 @@ static MVal mep_shift(MEP *p){
              * （符号に応じて 0 か -1 に落ち着く）ので、そこまで含めて
              * axx.py と同じ値を返す。 */
             if((n < 0 || n > 4096) && !p->mp->noeval){
-                char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+                char *sr = m_pyrepr_a(p->mp, p->s);
                 m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range in %s", sr);
             }
             if(n < 0 || n > 4096) n = 0;   /* 取らない側を読み飛ばしている最中 */
@@ -15769,7 +16221,14 @@ static MVal mep_shift(MEP *p){
 
 static int m_order(MEP *p, MVal a, MVal b, int or_equal){
     if(a.is_str != b.is_str){
-        char sr[600]; m_pyrepr(p->s, sr, sizeof(sr));
+        /* 破綻点修正: 三項演算子や `&&`/`||` の「取らない側」を読み飛ばして
+         * いる最中（noeval）でも型の食い違いを本物のエラーにしていたため、
+         * `!{1 ? 0 : "hello" < str(2)}` のように実行されない枝に文字列と
+         * 数値の比較があるだけで失敗していた（axx.py は _cmp_lt_eq() で
+         * suppress を見て False を返す）。他の診断（mv_need_int、除算、
+         * シフト等）は既に noeval を見ている。 */
+        if(p->mp->noeval) return 0;
+        char *sr = m_pyrepr_a(p->mp, p->s);
         m_fail(p->mp, p->file, p->line, "macro expression: cannot order a string against an integer in %s", sr);
     }
     if(a.is_str){
@@ -15814,8 +16273,10 @@ static MVal mep_band(MEP *p){
         mep_skip(p);
         if(p->s[p->i] == '&' && p->s[p->i+1] != '&'){
             p->i++;
-            v = mv_int(mv_need_int(p->mp, v, p->file, p->line) &
-                       mv_need_int(p->mp, mep_eq(p), p->file, p->line));
+            /* 破綻点修正: 同上（評価順の固定）。 */
+            { long long _lv = mv_need_int(p->mp, v, p->file, p->line);
+              long long _rv = mv_need_int(p->mp, mep_eq(p), p->file, p->line);
+              v = mv_int(_lv & _rv); }
         } else return v;
     }
 }
@@ -15825,8 +16286,10 @@ static MVal mep_bxor(MEP *p){
         mep_skip(p);
         if(p->s[p->i] == '^'){
             p->i++;
-            v = mv_int(mv_need_int(p->mp, v, p->file, p->line) ^
-                       mv_need_int(p->mp, mep_band(p), p->file, p->line));
+            /* 破綻点修正: 同上（評価順の固定）。 */
+            { long long _lv = mv_need_int(p->mp, v, p->file, p->line);
+              long long _rv = mv_need_int(p->mp, mep_band(p), p->file, p->line);
+              v = mv_int(_lv ^ _rv); }
         } else return v;
     }
 }
@@ -15836,8 +16299,10 @@ static MVal mep_bor(MEP *p){
         mep_skip(p);
         if(p->s[p->i] == '|' && p->s[p->i+1] != '|'){
             p->i++;
-            v = mv_int(mv_need_int(p->mp, v, p->file, p->line) |
-                       mv_need_int(p->mp, mep_bxor(p), p->file, p->line));
+            /* 破綻点修正: 同上（評価順の固定）。 */
+            { long long _lv = mv_need_int(p->mp, v, p->file, p->line);
+              long long _rv = mv_need_int(p->mp, mep_bxor(p), p->file, p->line);
+              v = mv_int(_lv | _rv); }
         } else return v;
     }
 }
@@ -15976,7 +16441,10 @@ static int m_builtin(MacroPP *mp, const char *name, MVal *a, int n,
         long long v = strtoll(a[0].s ? a[0].s : "", &end, base);
         while(end && (*end == ' ' || *end == '\t')) end++;
         if(!end || end == a[0].s || *end)
-            m_fail(mp, file, line, "int(\"%s\") is not a number", a[0].s ? a[0].s : "");
+            /* 破綻点修正: axx.py は `int({a[0]!r})` と Python の repr で出すので、
+             * 引用符の選び方が違っていた（`int("")` 対 `int('')`）。 */
+            m_fail(mp, file, line, "int(%s) is not a number",
+                   m_pyrepr_a(mp, a[0].s ? a[0].s : ""));
         *out = mv_int(v);
         return 1;
     }
@@ -16110,9 +16578,10 @@ static MVal m_call_value(MacroPP *mp, const char *name, MVal *args, int nargs,
         while(*e0==' '||*e0=='\t'||*e0=='\n'||*e0=='\r'||*e0=='\f'||*e0=='\v') e0++;
         e1 = e0 + strlen(e0);
         while(e1 > e0 && (e1[-1]==' '||e1[-1]=='\t'||e1[-1]=='\n'||e1[-1]=='\r'||e1[-1]=='\f'||e1[-1]=='\v')) e1--;
-        char stripped[600]; size_t sl = (size_t)(e1-e0); if(sl>=sizeof(stripped)) sl=sizeof(stripped)-1;
+        size_t sl = (size_t)(e1-e0);
+        char *stripped = marena_alloc(&mp->arena, sl + 1);
         memcpy(stripped, e0, sl); stripped[sl]='\0';
-        char er[600]; m_pyrepr(stripped, er, sizeof(er));
+        char *er = m_pyrepr_a(mp, stripped);
         m_fail(mp, file, line,
                "macro '%s' emits source text (%s) but was called from inside an "
                "expression, where there is nowhere to put it", name, er);
@@ -16404,7 +16873,7 @@ static char *m_format_value(MacroPP *mp, const char *body, const char *file, int
     int len = (int)strlen(body);
     int spec_at = -1;
     char quote = 0;
-    int par = 0, seen_q = 0;
+    int par = 0;
     for(int k = 0; k < len; k++){
         char c = body[k];
         if(quote){
@@ -16415,8 +16884,17 @@ static char *m_format_value(MacroPP *mp, const char *body, const char *file, int
         if(c == '"' || c == '\'') quote = c;
         else if(c == '(' || c == '[') par++;
         else if(c == ')' || c == ']') par--;
-        else if(c == '?' && par == 0) seen_q = 1;
-        else if(c == ':' && par == 0 && !seen_q){ spec_at = k; break; }
+        else if(c == ':' && par == 0){
+            /* 破綻点修正: 三項演算子の `?` を「括弧の外」でしか数えて
+             * いなかったため、`!{+(a ? b : c):0}` のように括弧の中に `?` が
+             * ある式で `:0` を書式指定と誤読していた（axx.py は
+             * `'?' in body[:k]` と、括弧も引用符も問わず手前の生テキストを
+             * 見る）。同じ規則にそろえる。 */
+            int has_q = 0;
+            for(int j = 0; j < k; j++) if(body[j] == '?'){ has_q = 1; break; }
+            if(has_q) continue;
+            spec_at = k; break;
+        }
     }
     char *expr = (spec_at >= 0) ? marena_strndup(&mp->arena, body, (size_t)spec_at)
                                 : (char*)body;
@@ -16574,13 +17052,16 @@ static char *m_parse_header(MacroPP *mp, const char *text, const char *kw,
         m_fail(mp, file, line, "'!%s' header must end with '{'", kw);
     body[bl-1] = '\0';
     if(strcmp(kw, "if") == 0 || strcmp(kw, "elif") == 0){
-        int at = -1; char quote = 0;
-        for(int k = 0; body[k]; k++){
-            char c = body[k];
-            if(quote){ if(c == '\\'){ k++; continue; } if(c == quote) quote = 0; continue; }
-            if(c == '"' || c == '\'') quote = c;
-            else if(c == '!' && strncasecmp(body + k, "!then", 5) == 0) at = k;
-        }
+        /* 破綻点修正: ここは `'` を無条件に引用符の開きとして扱っていたため、
+         * 条件に符号拡張演算子（`!if (255)'4 !then {`）を書くと、そこから
+         * 行末までが「引用符の中」とみなされて `!then` を見失い、
+         * "'!if' needs '!then' before '{'" という誤ったエラーになっていた。
+         * axx.py の parse_header は引用符を見ず、単に最後の `!then` を
+         * 探す（ヘッダは `{` で終わるので、本物の `!then` が必ず最後に来る）。
+         * 同じ規則にそろえる。 */
+        int at = -1;
+        for(int k = 0; body[k]; k++)
+            if(body[k] == '!' && strncasecmp(body + k, "!then", 5) == 0) at = k;
         if(at < 0) m_fail(mp, file, line, "'!%s' needs '!then' before '{'", kw);
         body[at] = '\0';
     }
@@ -16890,8 +17371,20 @@ static void m_parse_args(MacroPP *mp, const char *argtext, MVal *args, int *narg
         }
     }
     mep_skip(&p);
-    if(p.s[p.i])
-        m_fail(mp, file, line, "unexpected text after macro call: \"%s\"", p.s + p.i);
+    {
+        /* 破綻点修正: axx.py は残りを `.strip()` してから見るので末尾の空白を
+         * 数えず、`;` で始まればコメントとして許す。さらに文面は `{rest!r}` と
+         * Python の repr なので、引用符の選び方も食い違っていた。 */
+        const char *rest = p.s + p.i;
+        size_t rl = strlen(rest);
+        while(rl > 0 && isspace((unsigned char)rest[rl-1])) rl--;
+        if(rl > 0 && rest[0] != ';'){
+            char *rb = marena_alloc(&mp->arena, rl + 1);
+            memcpy(rb, rest, rl); rb[rl] = '\0';
+            m_fail(mp, file, line, "unexpected text after macro call: %s",
+                   m_pyrepr_a(mp, rb));
+        }
+    }
 }
 
 static void m_emit(MacroPP *mp, char *text, const char *file, int line){
@@ -17658,11 +18151,29 @@ int main(int argc, char *argv[]){
                 return 1;
             }
         }
-        else if(strcmp(argv[i],"-m")==0&&i+1<argc&&argv[i+1][0]!='-'){
-            int _mval = atoi(argv[++i]);
-            if(_mval < 0 || _mval > 65535){
-                axx_diagf(0, 0, " error - -m/--machine value %d is out of range "
-                           "(an ELF e_machine number is 0..65535).\n", _mval);
+        /* `-m` の値は負でもよい（範囲外として弾くため）。`-m -1` を「次は
+         * オプション」と見てしまうと "unknown option '-m'" に化けるので、
+         * 符号の直後が数字なら値として取る。 */
+        else if(strcmp(argv[i],"-m")==0&&i+1<argc
+                &&(argv[i+1][0]!='-'
+                   || ((argv[i+1][1]>='0'&&argv[i+1][1]<='9')))){
+            /* 破綻点修正: atoi() は最後まで読めたかを教えないので、
+             * `-m abc` が 0、`-m 12abc` が 12、`-m 0x3e` が 0 として黙って
+             * 通り、誤った e_machine の .o を出していた（axx.py は
+             * argparse の type=int で弾く）。全部を読めたときだけ受ける。 */
+            const char *_mstr = argv[++i];
+            char *_mend = NULL;
+            errno = 0;
+            long _mlong = strtol(_mstr, &_mend, 10);
+            if(_mend == _mstr || *_mend != '\0' || errno == ERANGE){
+                char _mq[600]; m_pyrepr(_mstr, _mq, sizeof(_mq));
+                axx_diagf(0, 0, " error - -m/--machine: invalid int value: %s\n", _mq);
+                return 1;
+            }
+            int _mval = (int)_mlong;
+            if(_mlong < 0 || _mlong > 65535){
+                axx_diagf(0, 0, " error - -m/--machine value %lld is out of range "
+                           "(an ELF e_machine number is 0..65535).\n", (long long)_mlong);
                 return 1;
             }
             /* 組み込みの表に無い番号も受ける。そのときリロケーション型は
@@ -17792,12 +18303,15 @@ int main(int argc, char *argv[]){
         FILE *of = (strcmp(pat_macro_expand_dest,"-")==0) ? stdout
                                                           : fopen(pat_macro_expand_dest,"wt");
         if(!of){
+            char _eb[1200]; axx_oserr_str(pat_macro_expand_dest, errno, _eb, sizeof(_eb));
             axx_diagf(0, 0, " error - cannot write '%s': %s\n",
-                       pat_macro_expand_dest, strerror(errno));
+                       pat_macro_expand_dest, _eb);
             pat_macro_expand_free(_pv,_pn); exit_code=1; goto cleanup;
         }
         for(int _pi=0;_pi<_pn;_pi++) fprintf(of,"%s\n",_pv[_pi]);
-        if(of!=stdout) fclose(of);
+        /* 破綻点修正: 書き込み失敗を検査していなかった。 */
+        if(of!=stdout ? axx_close_out(of, pat_macro_expand_dest)
+                      : axx_flush_stdout(pat_macro_expand_dest)) exit_code=1;
         pat_macro_expand_free(_pv,_pn);
         goto cleanup;
     }
@@ -17821,12 +18335,15 @@ int main(int argc, char *argv[]){
         FILE *of = (strcmp(macro_expand_dest,"-")==0) ? stdout
                                                       : fopen(macro_expand_dest,"wt");
         if(!of){
+            char _eb[1200]; axx_oserr_str(macro_expand_dest, errno, _eb, sizeof(_eb));
             axx_diagf(0, 0, " error - cannot write '%s': %s\n",
-                       macro_expand_dest, strerror(errno));
+                       macro_expand_dest, _eb);
             exit_code=1; goto cleanup;
         }
         for(int _mi=0;_mi<mv.len;_mi++) fprintf(of,"%s\n",mv.d[_mi].text);
-        if(of!=stdout) fclose(of);
+        /* 破綻点修正: 書き込み失敗を検査していなかった。 */
+        if(of!=stdout ? axx_close_out(of, macro_expand_dest)
+                      : axx_flush_stdout(macro_expand_dest)) exit_code=1;
         goto cleanup;
     }
 
@@ -17916,10 +18433,11 @@ int main(int argc, char *argv[]){
 #define MAX_RELAX 16
         LabelMap imported_labels;
         lmap_init(&imported_labels);
-        for(int bi=0; bi<st->labels.nbuckets; bi++)
-            for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
+        { int _n; LabelEntry **_v = lmap_in_order(&st->labels, &_n);
+          for(int _i=0;_i<_n;_i++){ LabelEntry *e=_v[_i];
                 lmap_set_full(&imported_labels, e->key, e->value, e->section,
-                              e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
+                              e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef); }
+          free(_v); }
 
         PatVar    initial_vars[NVARS];
         memcpy(initial_vars, st->vars, sizeof(initial_vars));
@@ -17937,10 +18455,11 @@ int main(int argc, char *argv[]){
             st->relax_optimistic = (relax == 0);
             st->pc=u256_zero(); st->pas=1; st->ln=1;
             lmap_free(&st->labels); lmap_init(&st->labels);
-            for(int bi=0; bi<imported_labels.nbuckets; bi++)
-                for(LabelEntry *e=imported_labels.buckets[bi]; e; e=e->next)
+            { int _n; LabelEntry **_v = lmap_in_order(&imported_labels, &_n);
+              for(int _i=0;_i<_n;_i++){ LabelEntry *e=_v[_i];
                     lmap_set_full(&st->labels, e->key, e->value, e->section,
-                                  e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
+                                  e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef); }
+              free(_v); }
             secmap_clear(&st->sections);
             secrangevec_clear(&st->section_ranges);
             strcpy(st->current_section, ".text");
@@ -17994,9 +18513,15 @@ int main(int argc, char *argv[]){
 
             lmap_free(&prev_labels); lmap_init(&prev_labels);
             for(int bi=0; bi<st->labels.nbuckets; bi++)
-                for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
+                for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next){
+                    /* 破綻点修正: 控えに入れる条件を axx.py の
+                     * _relax_prev_values に合わせる。札（is_undef）ではなく
+                     * 「値が UNDEF 由来か」だけで外す。label_get_value() の
+                     * 該当箇所のコメントも参照。 */
+                    if(u256_is_undef_derived(e->value)) continue;
                     lmap_set_full(&prev_labels, e->key, e->value, e->section,
                                   e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
+                }
 
             /* マクロ層に見せるスナップショット。prev_labels と別に持つのは、
              * prev_labels がパス2の前に解放されるのに対し、こちらは収束後の
@@ -18037,9 +18562,12 @@ int main(int argc, char *argv[]){
         st->relax_optimistic = 0;
 
         if(!converged){
-            axx_diagf(0, 1, " error - Pass1 relaxation did not converge after %d iterations; "
-                       "addresses would be incorrect for variable-length instructions "
-                       "with forward references.\n", MAX_RELAX);
+            /* 文面は axx.py と1バイト違わずそろえる（test1 が -V / 標準エラーを
+             * cmp するため）。 */
+            axx_diagf(0, 1, " error - Pass1 relaxation did not converge after %d iterations.\n",
+                       MAX_RELAX);
+            fprintf(stderr,"         Generated code would have incorrect addresses for\n");
+            fprintf(stderr,"         variable-length instructions with forward references.\n");
             fprintf(stderr,"         Aborting: no output file written.\n");
             lmap_free(&pass1_final);
             exit_code = 1;
@@ -18079,9 +18607,10 @@ int main(int argc, char *argv[]){
         secmap_finalize_current(st);
 
         {
+            int _dn; LabelEntry **_dv = lmap_in_order(&st->labels, &_dn);
             int drift_count = 0;
-            for(int bi=0; bi<st->labels.nbuckets; bi++)
-                for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next){
+            for(int _i=0;_i<_dn;_i++){
+                    LabelEntry *e=_dv[_i];
                     if(e->is_equ) continue;
                     if(u256_is_undef_derived(e->value)) continue;
                     LabelEntry *p = lmap_find(&pass1_final, e->key);
@@ -18100,8 +18629,8 @@ int main(int argc, char *argv[]){
                     fprintf(stderr,"         This usually means pass1 relaxation did "
                         "not fully converge for variable-length forward references.\n");
                 int shown = 0;
-                for(int bi=0; bi<st->labels.nbuckets && shown<10; bi++)
-                    for(LabelEntry *e=st->labels.buckets[bi]; e && shown<10; e=e->next){
+                for(int _i=0;_i<_dn && shown<10;_i++){
+                        LabelEntry *e=_dv[_i];
                         if(e->is_equ) continue;
                         if(u256_is_undef_derived(e->value)) continue;
                         LabelEntry *p = lmap_find(&pass1_final, e->key);
@@ -18116,10 +18645,12 @@ int main(int argc, char *argv[]){
                 if(drift_count > 10)
                     fprintf(stderr,"           ... and %d more.\n", drift_count - 10);
                 fprintf(stderr,"         Aborting: no output file written.\n");
+                free(_dv);
                 lmap_free(&pass1_final);
                 exit_code = 1;
                 goto cleanup;
             }
+            free(_dv);
         }
         lmap_free(&pass1_final);
 
@@ -18159,7 +18690,7 @@ int main(int argc, char *argv[]){
         FILE *lf=fopen((path_),"wt"); \
         if(!lf){ \
             char _experrbuf[1200]; axx_oserr_str((path_), errno, _experrbuf, sizeof(_experrbuf)); \
-            axx_diagf(0, 0, " error - cannot open export file '%s': %s\n", \
+            axx_diagf(0, 0, " error - cannot write '%s': %s\n", \
                        (path_), _experrbuf); \
             exit_code = 1; \
         } else { \
@@ -18216,7 +18747,8 @@ int main(int argc, char *argv[]){
                     fprintf(lf,"%s%s\t%s\n",e->key,_rtype_sfx,_lbl_addr); \
                 } \
             } \
-            fclose(lf); \
+            /* 破綻点修正: 書き込み失敗を検査していなかった。 */ \
+            if(axx_close_out(lf, (path_))) exit_code = 1; \
         } \
     } while(0)
 
@@ -18244,6 +18776,16 @@ cleanup:
 
     macro_free(&g_macro);
     macro_free(&g_pat_macro);
+
+    /* 破綻点修正: 標準出力（-V の翻訳結果や -P/-p の `-` 出力）が書ききれて
+     * いないまま成功として終わっていた。最後に一度だけ流しきれたか見る。 */
+    if(fflush(stdout) != 0 || ferror(stdout)){
+        int _e = errno ? errno : EIO;
+        char _eb[1200]; axx_oserr_nopath(_e, _eb, sizeof(_eb));
+        fprintf(stderr, " error - cannot write to standard output: %s\n", _eb);
+        clearerr(stdout);
+        if(exit_code == 0) exit_code = 1;
+    }
 
     return exit_code;
 }
