@@ -60,4 +60,2517 @@
 /* keeps that alignment through the link, as GNU as does. */
 .elfsection::.text::6::1::64
 
-.include "ppc64_isa.axx"
+
+/* ===================================================================
+/* PowerPC64 (Power ISA v3.1) instruction set -- pattern file for axx
+/*
+/* This file holds the instruction set only. Do not pass it to axx
+/* directly; use one of the two wrappers, which fix the byte order
+/* first and then include this file:
+/*
+/*   ppc64.axx     big-endian    (ELF64 MSB, e_machine 21)
+/*   ppc64le.axx   little-endian (ELF64 LSB, e_machine 21, ELFv2)
+/*
+/* Coverage -- Power ISA v3.1 (POWER10) in the GNU assembler syntax:
+/*   - Branch: I/B/XL forms, BO/BI/BH operands, absolute and link
+/*     variants, and the extended mnemonics (blr, bctr, beq, bnelr+,
+/*     bdnz, bdnzt, bt, bf, ...) with an optional CR field and the
+/*     "+" / "-" prediction hints (the Power ISA "at" bit encoding)
+/*   - CR logical, mcrf, system call (sc, scv), rfid/hrfid/urfid/rfscv
+/*   - Fixed-point: every D/DS/DQ/X load and store incl. update,
+/*     indexed, byte-reversed, multiple/string (big-endian only, as
+/*     the ISA requires; ppc64le.axx reports error 15), load-and-reserve /
+/*     store-conditional, caching-inhibited and atomic memory ops;
+/*     arithmetic (XO forms with o/./o.), multiply-add, modulo,
+/*     compare (incl. cmprb, cmpeqb, setb, setbc...), trap, logical,
+/*     count/popcount/parity, rotate and shift (M/MD/MDS/XS forms),
+/*     isel, the v3.1 bit-manipulation ops (cfuged, pdepd, pextd,
+/*     cntlzdm, brh/brw/brd), and the move to/from SPR/CR/MSR group
+/*   - Extended mnemonics: li, lis, la, subi, subis, subic, sub, subc,
+/*     mr, not, nop, xnop, cmpw/cmpd/cmplw/cmpld(+i), tw<cond>(i),
+/*     td<cond>(i), rotlwi, slwi, srwi, clrlwi, extlwi, inslwi,
+/*     rotldi, sldi, srdi, clrldi, extrdi, insrdi, clrlsldi, ...,
+/*     mflr/mtlr/mfctr/mtctr and many more SPR aliases, crset/crclr/
+/*     crmove/crnot, lwsync/hwsync/ptesync, isellt/iselgt/iseleq
+/*   - The @l, @h, @ha, @high, @higha, @higher, @highera, @highest and
+/*     @highesta operand modifiers on every 16-bit immediate and every
+/*     D-form displacement
+/*   - Storage control: cache ops, sync/eieio/isync, wait, copy/paste,
+/*     msgsnd family, SLB and TLB management, hash{st,chk}[p]
+/*   - Floating point: loads/stores, A/X-form arithmetic, conversions,
+/*     rounding, compares, FPSCR ops (mffs family, mtfsf, mtfsfi, ...)
+/*   - Decimal floating point: arithmetic, quantize, round, compare,
+/*     test, conversion, BCD, insert/extract exponent, shifts (and the
+/*     quad "q" forms)
+/*   - Vector (VMX / AltiVec): VX, VA and VC forms incl. the v2.07,
+/*     v3.0 and v3.1 additions (divide, modulo, mask ops, string ops,
+/*     insert/extract, quad-word ops, BCD, crypto, ...)
+/*   - VSX: loads/stores, scalar and vector DP/SP arithmetic, FMA,
+/*     compare, convert, round, test, logical, permute, splat,
+/*     insert/extract, the quad-precision (xs*qp) group, and moves
+/*     between GPRs and VSRs
+/*   - MMA: xxmfacc/xxmtacc/xxsetaccz, the xv*ger* outer products and
+/*     their prefixed masked forms (pmxv*ger*: XMSK, YMSK, PMSK)
+/*   - Prefixed (8-byte) instructions: paddi/pli/pla, the prefixed
+/*     loads and stores (incl. the @pcrel form), pnop, xxsplti32dx,
+/*     xxspltiw, xxspltidp, xxblendv*, xxpermx, xxeval, pmxv*. One that
+/*     would cross a 64-byte boundary gets a nop in front of it, as GNU
+/*     as does (PC-relative operands count from the instruction itself)
+/*   - Data: .byte/.short/.long/.quad written in the target byte order
+/*
+/* Register spelling. Every register may be written the three ways
+/* GNU as accepts: a bare number (addi 3,1,8), a name (addi r3,r1,8)
+/* or a %-name (addi %r3,%r1,8). The names are r0-r31 (sp = r1,
+/* rtoc = r2), f0-f31, v0-v31, vs0-vs63, cr0-cr7. The CR-bit operands
+/* of bc, crand, isel, ... are plain numbers or expressions (0-31);
+/* the extended branch mnemonics take a CR field instead (beq cr7,x).
+/*
+/* A note on names: every register name above is a pattern-file
+/* symbol, and axx does not let an assembly-source label share a name
+/* with one. Give labels names that no register spelling uses.
+/*
+/* Not covered: the transactional-memory instructions (removed in
+/* v3.1), and the embedded (Book E) and SPE instruction sets.
+/*
+/* ELF output (-o). The wrappers declare the 64-bit PowerPC ELF ABI
+/* relocation types with .elftype / .elffield, and every operand that
+/* can hold a symbol is typed with .reloc, so an object links like one
+/* from GNU as: REL24 / ADDR24 (b, bl, ba), REL14 / ADDR14 (bc and the
+/* extended conditional branches), ADDR16 / _LO / _HI / _HA / _HIGH /
+/* _HIGHA / _HIGHER(A) / _HIGHEST(A) (the @ modifiers), ADDR16_DS /
+/* _LO_DS (DS and DQ forms), D34 / PCREL34 (prefixed), and ADDR16 /
+/* ADDR32 / ADDR64 for data. The field is written as 0 and the addend
+/* goes in the RELA entry. The .elffield directive needs an axx that
+/* has it (added together with this file). Differences from GNU as
+/* that the linker makes disappear: references to a local label are
+/* relocations against that label (GNU as resolves same-section
+/* branches itself and uses the section symbol), and GNU as leaves
+/* the addend in the field of hinted bc and of prefixed instructions.
+/* .align inside code pads with the .padding byte, not with nops.
+/*
+/* Extras beyond GNU as: a zero displacement may be omitted
+/* (lwz 3,(1)), mfpid/mtpid, cp_abort as another name for cpabort, and
+/* the v2.05 lfdp/stfdp(x) pair.
+/*
+/* Verified against GNU as 2.42 (-mpower10) in both byte orders:
+/*   - every pattern row instantiated, byte-for-byte identical;
+/*   - every relocatable row against an external symbol: relocation
+/*     entries (offset, type, symbol, addend) identical, and the linked
+/*     text (GNU ld) identical;
+/*   - the C (caxx) and Python (axx.py) implementations give identical
+/*     output. See ppc64_test.s.
+/* =================================================================== */
+
+/* ===================================================================
+/* Error messages (Technical_Manual.md section 3.14)
+/* =================================================================== */
+.error::2::"branch target out of range or not a multiple of 4"
+.error::3::"immediate value out of range"
+.error::5::"register out of range (an even register is required here)"
+.error::8::"displacement out of range or not suitably aligned"
+.error::10::"shift, mask or field value out of range"
+.error::15::"load/store multiple and string instructions are big-endian only"
+
+/* ===================================================================
+/* Word emitters (mini language, section 3.15)
+/*
+/* PPCLE is set by the wrapper: 0 = big-endian, 1 = little-endian.
+/* A prefixed instruction is two words, prefix first, each word in the
+/* target byte order.
+/* =================================================================== */
+.func w4(z)
+.if #PPCLE .then
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endif
+.return [(z >> 24) & 0xff, (z >> 16) & 0xff, (z >> 8) & 0xff, z & 0xff]
+.endfunc
+
+.func w8(p, s)
+.if #PPCLE .then
+.emit(p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff, (p >> 24) & 0xff)
+.emit(s & 0xff, (s >> 8) & 0xff, (s >> 16) & 0xff, (s >> 24) & 0xff)
+.return
+.endif
+.emit((p >> 24) & 0xff, (p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff)
+.emit((s >> 24) & 0xff, (s >> 16) & 0xff, (s >> 8) & 0xff, s & 0xff)
+.return
+.endfunc
+
+/* data items of 2 and 8 bytes */
+.func w2(z)
+.if #PPCLE .then
+.return [z & 0xff, (z >> 8) & 0xff]
+.endif
+.return [(z >> 8) & 0xff, z & 0xff]
+.endfunc
+
+.func d8(z)
+.if #PPCLE .then
+.emit(z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff)
+.emit((z >> 32) & 0xff, (z >> 40) & 0xff, (z >> 48) & 0xff, (z >> 56) & 0xff)
+.return
+.endif
+.emit((z >> 56) & 0xff, (z >> 48) & 0xff, (z >> 40) & 0xff, (z >> 32) & 0xff)
+.emit((z >> 24) & 0xff, (z >> 16) & 0xff, (z >> 8) & 0xff, z & 0xff)
+.return
+.endfunc
+
+/* rlw(op,rs,ra,sh,mb,me,rc): an M-form rotate word (rlwinm / rlwimi) */
+.func rlw(op, rs, ra, sh, mb, me, rc)
+.return .call w4((op << 26) | (rs << 21) | (ra << 16) | ((sh & 31) << 11) | ((mb & 31) << 6) | ((me & 31) << 1) | rc)
+.endfunc
+
+/* md(xo,rs,ra,sh,mb,rc): an MD-form rotate doubleword. The 6-bit sh
+/* and mb fields are split in the encoding (sh5 at bit 30, mb5 last). */
+.func md(xo, rs, ra, sh, mb, rc)
+m = ((mb & 31) << 1) | ((mb >> 5) & 1)
+.return .call w4(0x78000000 | (rs << 21) | (ra << 16) | ((sh & 31) << 11) | (m << 5) | (xo << 2) | (((sh >> 5) & 1) << 1) | rc)
+.endfunc
+
+/* ===================================================================
+/* Macro helpers (section 7)
+/* =================================================================== */
+!def find(s, c) {
+!local i = 0
+!while i < len(s) {
+!if substr(s, i, 1) == c !then {
+!return i
+}
+!set i = i + 1
+}
+!return -1
+}
+
+/* lst(p, n): the string "p0,p1,...,pn" */
+!def lst(p, n) {
+!local s = p + "0"
+!local i = 1
+!while i <= n {
+!set s = s + "," + p + str(i)
+!set i = i + 1
+}
+!return s
+}
+
+/* xg(nm, base, spec, rc): one instruction row from an operand spec.
+/*
+/*   nm    mnemonic, upper case (it is a pattern literal)
+/*   base  the instruction word with every operand field zero
+/*   spec  the operands in source order, comma separated:
+/*           rt@21      register variable rt, field at bit shift 21
+/*           rt@21e     the same, and the register must be even
+/*           xt@21+0    a 6-bit VSX register: low 5 bits at shift 21,
+/*                      the high bit at shift 0 (TX/AX/BX/CX)
+/*           !u:sh@11/5 an unsigned 5-bit expression at shift 11
+/*           !s:si@0/16 a signed 16-bit expression at shift 0
+/*   rc    1 also emits the record form "nm." with bit 31 set
+/*
+/* The register classes come from the .check lists below, so a
+/* variable name alone decides which register file an operand takes.
+/* The field shifts are LSB-based (shift 21 = the RT/RS/FRT field). */
+!def xg(nm, base, spec, rc = 0) {
+!local ops = ""
+!local fx = ""
+!local er = ""
+!local s = spec + ","
+!local item = ""
+!local i = 0
+!local c = ""
+!local k = ""
+!local v = ""
+!local at = 0
+!local rest = ""
+!local p = 0
+!local bits = 0
+!local mx = 0
+!while i < len(s) {
+!set c = substr(s, i, 1)
+!if c == "," !then {
+!if item != "" !then {
+!set k = ""
+!if substr(item, 0, 1) == "!" !then {
+!set k = substr(item, 1, 1)
+!set item = substr(item, 3)
+}
+!set at = find(item, "@")
+!set v = substr(item, 0, at)
+!set rest = substr(item, at + 1)
+!if ops != "" !then {
+!set ops = ops + ","
+}
+!if k == "" !then {
+!set ops = ops + v
+!if substr(rest, len(rest) - 1, 1) == "e" !then {
+!set rest = substr(rest, 0, len(rest) - 1)
+!if er != "" !then {
+!set er = er + ","
+}
+!set er = er + "(" + v + "&1)!=0;5"
+}
+!set p = find(rest, "+")
+!if p < 0 !then {
+!set fx = fx + "|(" + v + "<<" + rest + ")"
+} !else {
+!set fx = fx + "|((" + v + "&31)<<" + substr(rest, 0, p) + ")|((" + v + ">>5)<<" + substr(rest, p + 1) + ")"
+}
+} !else {
+!set ops = ops + "!" + v
+!set p = find(rest, "/")
+!set bits = int(substr(rest, p + 1))
+!set mx = (1 << bits) - 1
+!set fx = fx + "|((" + v + "&" + str(mx) + ")<<" + substr(rest, 0, p) + ")"
+!if er != "" !then {
+!set er = er + ","
+}
+!if k == "u" !then {
+!set er = er + v + "<0;3," + v + ">" + str(mx) + ";3"
+} !else {
+!set er = er + v + "<" + str(-(1 << (bits - 1))) + ";3," + v + ">" + str((1 << (bits - 1)) - 1) + ";3"
+}
+}
+}
+!set item = ""
+} !else {
+!if c != " " !then {
+!set item = item + c
+}
+}
+!set i = i + 1
+}
+!if ops == "" !then {
+!{nm} :: .call w4(0x!{base:08x})
+!if rc == 1 !then {
+!{nm}. :: .call w4(0x!{base | 1:08x})
+}
+!return
+}
+!{nm} !{ops} :: !{er} :: .call w4(0x!{base:08x}!{fx})
+!if rc == 1 !then {
+!{nm}. !{ops} :: !{er} :: .call w4(0x!{base | 1:08x}!{fx})
+}
+}
+
+/* Shorthands for the common primary opcodes: the extended opcode goes
+/* in as the value the survey tables list (xo<<1 is done here). */
+!def x31(nm, xo, spec, rc = 0) {
+!xg(nm, (31 << 26) | (xo << 1), spec, rc)
+}
+!def x19(nm, xo, spec, rc = 0) {
+!xg(nm, (19 << 26) | (xo << 1), spec, rc)
+}
+!def x63(nm, xo, spec, rc = 0) {
+!xg(nm, (63 << 26) | (xo << 1), spec, rc)
+}
+!def x59(nm, xo, spec, rc = 0) {
+!xg(nm, (59 << 26) | (xo << 1), spec, rc)
+}
+/* op 4 and op 60 carry the whole low 11 bits as the table value */
+!def x4(nm, xo, spec, rc = 0) {
+!xg(nm, (4 << 26) | xo, spec, rc)
+}
+!def x60(nm, xo, spec, rc = 0) {
+!xg(nm, (60 << 26) | xo, spec, rc)
+}
+/* XO form: nm, nm., nmo, nmo. */
+!def xoe(nm, xo, spec) {
+!x31(nm, xo, spec, 1)
+!x31(nm + "O", xo | 512, spec, 1)
+}
+
+/* The @-modifier rows for a 16-bit immediate field (the low 16 bits
+/* of the word). ops is the operand text before the immediate and f
+/* the register-field expression. */
+!def hsfx(nm, ops, base, f) {
+.reloc::v::addr16_lo
+!{nm} !{ops}!v@L :: .call w4(0x!{base:08x}!{f}|(v&0xffff))
+.clrreloc::v
+.reloc::v::addr16_hi
+!{nm} !{ops}!v@H :: .call w4(0x!{base:08x}!{f}|((v>>16)&0xffff))
+.clrreloc::v
+.reloc::v::addr16_ha
+!{nm} !{ops}!v@HA :: .call w4(0x!{base:08x}!{f}|(((v+0x8000)>>16)&0xffff))
+.clrreloc::v
+.reloc::v::addr16_high
+!{nm} !{ops}!v@HIGH :: .call w4(0x!{base:08x}!{f}|((v>>16)&0xffff))
+.clrreloc::v
+.reloc::v::addr16_higha
+!{nm} !{ops}!v@HIGHA :: .call w4(0x!{base:08x}!{f}|(((v+0x8000)>>16)&0xffff))
+.clrreloc::v
+.reloc::v::addr16_higher
+!{nm} !{ops}!v@HIGHER :: .call w4(0x!{base:08x}!{f}|((v>>32)&0xffff))
+.clrreloc::v
+.reloc::v::addr16_highera
+!{nm} !{ops}!v@HIGHERA :: .call w4(0x!{base:08x}!{f}|(((v+0x80008000)>>32)&0xffff))
+.clrreloc::v
+.reloc::v::addr16_highest
+!{nm} !{ops}!v@HIGHEST :: .call w4(0x!{base:08x}!{f}|((v>>48)&0xffff))
+.clrreloc::v
+.reloc::v::addr16_highesta
+!{nm} !{ops}!v@HIGHESTA :: .call w4(0x!{base:08x}!{f}|(((v+0x800080008000)>>48)&0xffff))
+.clrreloc::v
+}
+
+/* ===================================================================
+/* Registers
+/* =================================================================== */
+!def regs(p, n) {
+!local i = 0
+!while i <= n {
+.setsym::!{p}!{i}::!{i}
+.setsym::%!{p}!{i}::!{i}
+!set i = i + 1
+}
+}
+!def nums(n) {
+!local i = 0
+!while i <= n {
+.setsym::!{i}::!{i}
+!set i = i + 1
+}
+}
+!nums(63)
+!regs("R", 31)
+!regs("F", 31)
+!regs("V", 31)
+!regs("VS", 63)
+!regs("CR", 7)
+.setsym::SP::1
+.setsym::RTOC::2
+
+!set N7 = lst("", 7)
+!set N31 = lst("", 31)
+!set N63 = lst("", 63)
+!set GPRS = N31 + "," + lst("R", 31) + "," + lst("%R", 31) + ",SP,RTOC"
+!set FPRS = N31 + "," + lst("F", 31) + "," + lst("%F", 31)
+!set VRS = N31 + "," + lst("V", 31) + "," + lst("%V", 31)
+!set VSRS = N63 + "," + lst("VS", 63) + "," + lst("%VS", 63)
+!set CRS = N7 + "," + lst("CR", 7) + "," + lst("%CR", 7)
+
+/* Variable roles. Every one is positional (.check, section 3.7) and
+/* is set once here, so an operand of the wrong register file is
+/* rejected instead of assembling into wrong bytes.
+/*   rt rs ra rb rc      general registers
+/*   ft fs fa fb fc      floating-point registers
+/*   vt vs va vb vc      vector (VMX) registers
+/*   xt xs xa xb xc      VSX registers 0-63
+/*   bf bfa              CR fields
+/*   acc                 MMA accumulators 0-7 */
+.check::rt::!{GPRS}
+.check::rs::!{GPRS}
+.check::ra::!{GPRS}
+.check::rb::!{GPRS}
+.check::rc::!{GPRS}
+.check::ft::!{FPRS}
+.check::fs::!{FPRS}
+.check::fa::!{FPRS}
+.check::fb::!{FPRS}
+.check::fc::!{FPRS}
+.check::vt::!{VRS}
+.check::vs::!{VRS}
+.check::va::!{VRS}
+.check::vb::!{VRS}
+.check::vc::!{VRS}
+.check::xt::!{VSRS}
+.check::xs::!{VSRS}
+.check::xa::!{VSRS}
+.check::xb::!{VSRS}
+.check::xc::!{VSRS}
+.check::bf::!{CRS}
+.check::bfa::!{CRS}
+.check::acc::!{N7}
+
+/* ===================================================================
+/* Branch
+/* =================================================================== */
+/* I form. The displacement is relative to the branch itself ($$). */
+.reloc::t::rel24
+B !t ::((t-$$)<-33554432)||((t-$$)>33554428)||(((t-$$)&3)!=0);2 :: .call w4(0x48000000|((t-$$)&0x3fffffc))
+.clrreloc::t
+.reloc::t::rel24
+BL !t ::((t-$$)<-33554432)||((t-$$)>33554428)||(((t-$$)&3)!=0);2 :: .call w4(0x48000001|((t-$$)&0x3fffffc))
+.clrreloc::t
+.reloc::t::addr24
+BA !t ::(t<-33554432)||(t>33554428)||((t&3)!=0);2 :: .call w4(0x48000002|(t&0x3fffffc))
+.clrreloc::t
+.reloc::t::addr24
+BLA !t ::(t<-33554432)||(t>33554428)||((t&3)!=0);2 :: .call w4(0x48000003|(t&0x3fffffc))
+.clrreloc::t
+
+/* B form, raw BO,BI */
+.reloc::t::rel14
+BC !bo,!bi,!t ::bo<0;3,bo>31;3,bi<0;3,bi>31;3,((t-$$)<-32768)||((t-$$)>32764)||(((t-$$)&3)!=0);2 :: .call w4(0x40000000|(bo<<21)|(bi<<16)|((t-$$)&0xfffc))
+.clrreloc::t
+.reloc::t::rel14
+BCL !bo,!bi,!t ::bo<0;3,bo>31;3,bi<0;3,bi>31;3,((t-$$)<-32768)||((t-$$)>32764)||(((t-$$)&3)!=0);2 :: .call w4(0x40000001|(bo<<21)|(bi<<16)|((t-$$)&0xfffc))
+.clrreloc::t
+.reloc::t::addr14
+BCA !bo,!bi,!t ::bo<0;3,bo>31;3,bi<0;3,bi>31;3,(t<-32768)||(t>32764)||((t&3)!=0);2 :: .call w4(0x40000002|(bo<<21)|(bi<<16)|(t&0xfffc))
+.clrreloc::t
+.reloc::t::addr14
+BCLA !bo,!bi,!t ::bo<0;3,bo>31;3,bi<0;3,bi>31;3,(t<-32768)||(t>32764)||((t&3)!=0);2 :: .call w4(0x40000003|(bo<<21)|(bi<<16)|(t&0xfffc))
+.clrreloc::t
+
+/* XL form, raw BO,BI[,BH] */
+BCLR !bo,!bi[[,!bh]] ::bo<0;3,bo>31;3,bi<0;3,bi>31;3,bh<0;3,bh>3;3 :: .call w4(0x4c000020|(bo<<21)|(bi<<16)|(bh<<11))
+BCLRL !bo,!bi[[,!bh]] ::bo<0;3,bo>31;3,bi<0;3,bi>31;3,bh<0;3,bh>3;3 :: .call w4(0x4c000021|(bo<<21)|(bi<<16)|(bh<<11))
+BCCTR !bo,!bi[[,!bh]] ::bo<0;3,bo>31;3,bi<0;3,bi>31;3,bh<0;3,bh>3;3 :: .call w4(0x4c000420|(bo<<21)|(bi<<16)|(bh<<11))
+BCCTRL !bo,!bi[[,!bh]] ::bo<0;3,bo>31;3,bi<0;3,bi>31;3,bh<0;3,bh>3;3 :: .call w4(0x4c000421|(bo<<21)|(bi<<16)|(bh<<11))
+BCTAR !bo,!bi[[,!bh]] ::bo<0;3,bo>31;3,bi<0;3,bi>31;3,bh<0;3,bh>3;3 :: .call w4(0x4c000460|(bo<<21)|(bi<<16)|(bh<<11))
+BCTARL !bo,!bi[[,!bh]] ::bo<0;3,bo>31;3,bi<0;3,bi>31;3,bh<0;3,bh>3;3 :: .call w4(0x4c000461|(bo<<21)|(bi<<16)|(bh<<11))
+
+/* Unconditional to LR / CTR */
+BLR :: .call w4(0x4e800020)
+BLRL :: .call w4(0x4e800021)
+BCTR :: .call w4(0x4e800420)
+BCTRL :: .call w4(0x4e800421)
+
+/* Extended conditional branches.
+/*
+/* bcr(nm, h, bo, bi, cf): the shapes of one decrement / CR-bit
+/* condition -- to a target (l, a, la) and to LR / CTR (lrl, ctrl).
+/* h is the "+" / "-" prediction hint, which goes after the whole
+/* mnemonic (bdnzl+, btctr-). cf = 2 means BI is written as an
+/* expression operand (bt / bdnzt family); cf = 0 means there is no
+/* BI at all (bdnz family). */
+!def bcr(nm, h, bo, bi, cf, ctr = 1) {
+!local b = (16 << 26) | (bo << 21) | (bi << 16)
+!local l = (19 << 26) | (bo << 21) | (bi << 16) | (16 << 1)
+!local c = (19 << 26) | (bo << 21) | (bi << 16) | (528 << 1)
+!local rel = "((t-$$)<-32768)||((t-$$)>32764)||(((t-$$)&3)!=0);2"
+!local ab = "(t<-32768)||(t>32764)||((t&3)!=0);2"
+!local bie = "bi<0;3,bi>31;3,"
+!if cf == 0 !then {
+.reloc::t::rel14
+!{nm}!{h} !t ::!{rel} :: .call w4(0x!{b:08x}|((t-$$)&0xfffc))
+.clrreloc::t
+.reloc::t::rel14
+!{nm}L!{h} !t ::!{rel} :: .call w4(0x!{b | 1:08x}|((t-$$)&0xfffc))
+.clrreloc::t
+.reloc::t::addr14
+!{nm}A!{h} !t ::!{ab} :: .call w4(0x!{b | 2:08x}|(t&0xfffc))
+.clrreloc::t
+.reloc::t::addr14
+!{nm}LA!{h} !t ::!{ab} :: .call w4(0x!{b | 3:08x}|(t&0xfffc))
+.clrreloc::t
+!{nm}LR!{h} :: .call w4(0x!{l:08x})
+!{nm}LRL!{h} :: .call w4(0x!{l | 1:08x})
+}
+!if cf == 2 !then {
+.reloc::t::rel14
+!{nm}!{h} !bi,!t ::!{bie}!{rel} :: .call w4(0x!{b:08x}|(bi<<16)|((t-$$)&0xfffc))
+.clrreloc::t
+.reloc::t::rel14
+!{nm}L!{h} !bi,!t ::!{bie}!{rel} :: .call w4(0x!{b | 1:08x}|(bi<<16)|((t-$$)&0xfffc))
+.clrreloc::t
+.reloc::t::addr14
+!{nm}A!{h} !bi,!t ::!{bie}!{ab} :: .call w4(0x!{b | 2:08x}|(bi<<16)|(t&0xfffc))
+.clrreloc::t
+.reloc::t::addr14
+!{nm}LA!{h} !bi,!t ::!{bie}!{ab} :: .call w4(0x!{b | 3:08x}|(bi<<16)|(t&0xfffc))
+.clrreloc::t
+!{nm}LR!{h} !bi ::!{bie} :: .call w4(0x!{l:08x}|(bi<<16))
+!{nm}LRL!{h} !bi ::!{bie} :: .call w4(0x!{l | 1:08x}|(bi<<16))
+!if ctr == 1 !then {
+!{nm}CTR!{h} !bi ::!{bie} :: .call w4(0x!{c:08x}|(bi<<16))
+!{nm}CTRL!{h} !bi ::!{bie} :: .call w4(0x!{c | 1:08x}|(bi<<16))
+}
+}
+}
+
+/* Conditions on a CR field (beq, bnelr+, bgectrl- ...), with an
+/* optional CR field operand in front (beq cr7,x adds 4*crf to BI).
+/* The hints use the Power ISA "at" bits of BO: "+" = at 11 (likely
+/* taken), "-" = at 10 (likely not taken). */
+!def bch(cn, bo, bit) {
+!local sfx = ""
+!local k = 0
+!local b = 0
+!while k < 3 {
+!if k == 0 !then {
+!set sfx = "-"
+!set b = bo | 2
+}
+!if k == 1 !then {
+!set sfx = "+"
+!set b = bo | 3
+}
+!if k == 2 !then {
+!set sfx = ""
+!set b = bo
+}
+!bcx("B" + cn, sfx, b, bit)
+!set k = k + 1
+}
+}
+!def bcx(nm, h, bo, bi) {
+!local b = (16 << 26) | (bo << 21) | (bi << 16)
+!local l = (19 << 26) | (bo << 21) | (bi << 16) | (16 << 1)
+!local c = (19 << 26) | (bo << 21) | (bi << 16) | (528 << 1)
+!local rel = "((t-$$)<-32768)||((t-$$)>32764)||(((t-$$)&3)!=0);2"
+!local ab = "(t<-32768)||(t>32764)||((t&3)!=0);2"
+.reloc::t::rel14
+!{nm}!{h} !t ::!{rel} :: .call w4(0x!{b:08x}|((t-$$)&0xfffc))
+.clrreloc::t
+.reloc::t::rel14
+!{nm}!{h} bf,!t ::!{rel} :: .call w4(0x!{b:08x}|(bf<<18)|((t-$$)&0xfffc))
+.clrreloc::t
+.reloc::t::rel14
+!{nm}L!{h} !t ::!{rel} :: .call w4(0x!{b | 1:08x}|((t-$$)&0xfffc))
+.clrreloc::t
+.reloc::t::rel14
+!{nm}L!{h} bf,!t ::!{rel} :: .call w4(0x!{b | 1:08x}|(bf<<18)|((t-$$)&0xfffc))
+.clrreloc::t
+.reloc::t::addr14
+!{nm}A!{h} !t ::!{ab} :: .call w4(0x!{b | 2:08x}|(t&0xfffc))
+.clrreloc::t
+.reloc::t::addr14
+!{nm}A!{h} bf,!t ::!{ab} :: .call w4(0x!{b | 2:08x}|(bf<<18)|(t&0xfffc))
+.clrreloc::t
+.reloc::t::addr14
+!{nm}LA!{h} !t ::!{ab} :: .call w4(0x!{b | 3:08x}|(t&0xfffc))
+.clrreloc::t
+.reloc::t::addr14
+!{nm}LA!{h} bf,!t ::!{ab} :: .call w4(0x!{b | 3:08x}|(bf<<18)|(t&0xfffc))
+.clrreloc::t
+!{nm}LR!{h} :: .call w4(0x!{l:08x})
+!{nm}LR!{h} bf :: .call w4(0x!{l:08x}|(bf<<18))
+!{nm}LRL!{h} :: .call w4(0x!{l | 1:08x})
+!{nm}LRL!{h} bf :: .call w4(0x!{l | 1:08x}|(bf<<18))
+!{nm}CTR!{h} :: .call w4(0x!{c:08x})
+!{nm}CTR!{h} bf :: .call w4(0x!{c:08x}|(bf<<18))
+!{nm}CTRL!{h} :: .call w4(0x!{c | 1:08x})
+!{nm}CTRL!{h} bf :: .call w4(0x!{c | 1:08x}|(bf<<18))
+}
+
+/* condition   BO (12 = branch if the bit is set, 4 = if clear)  bit */
+!bch("LT", 12, 0)
+!bch("LE", 4, 1)
+!bch("EQ", 12, 2)
+!bch("GE", 4, 0)
+!bch("GT", 12, 1)
+!bch("NL", 4, 0)
+!bch("NE", 4, 2)
+!bch("NG", 4, 1)
+!bch("SO", 12, 3)
+!bch("NS", 4, 3)
+!bch("UN", 12, 3)
+!bch("NU", 4, 3)
+
+/* Decrement CTR: bdnz / bdz, with hints (BO 1a00t: "+" a=1 t=1,
+/* "-" a=1 t=0), and the CR-bit conditional forms. */
+!bcr("BDNZ", "-", 24, 0, 0)
+!bcr("BDNZ", "+", 25, 0, 0)
+!bcr("BDNZ", "", 16, 0, 0)
+!bcr("BDZ", "-", 26, 0, 0)
+!bcr("BDZ", "+", 27, 0, 0)
+!bcr("BDZ", "", 18, 0, 0)
+!bcr("BDNZT", "", 8, 0, 2, 0)
+!bcr("BDNZF", "", 0, 0, 2, 0)
+!bcr("BDZT", "", 10, 0, 2, 0)
+!bcr("BDZF", "", 2, 0, 2, 0)
+/* Branch on a CR bit given as an operand. The hinted rows come
+/* first so that "bt- 5,x" is never read as "bt" with BI = -5. */
+!bcr("BT", "-", 14, 0, 2)
+!bcr("BT", "+", 15, 0, 2)
+!bcr("BT", "", 12, 0, 2)
+!bcr("BF", "-", 6, 0, 2)
+!bcr("BF", "+", 7, 0, 2)
+!bcr("BF", "", 4, 0, 2)
+
+/* ===================================================================
+/* CR logical, system call and return from interrupt
+/* =================================================================== */
+!def crl(nm, xo) {
+!x19(nm, xo, "!u:bt@21/5,!u:ba@16/5,!u:bb@11/5")
+}
+!crl("CRAND", 257)
+!crl("CRNAND", 225)
+!crl("CROR", 449)
+!crl("CRXOR", 193)
+!crl("CRNOR", 33)
+!crl("CREQV", 289)
+!crl("CRANDC", 129)
+!crl("CRORC", 417)
+CRSET !bx ::bx<0;3,bx>31;3 :: .call w4(0x4c000242|(bx<<21)|(bx<<16)|(bx<<11))
+CRCLR !bx ::bx<0;3,bx>31;3 :: .call w4(0x4c000182|(bx<<21)|(bx<<16)|(bx<<11))
+CRMOVE !bx,!by ::bx<0;3,bx>31;3,by<0;3,by>31;3 :: .call w4(0x4c000382|(bx<<21)|(by<<16)|(by<<11))
+CRNOT !bx,!by ::bx<0;3,bx>31;3,by<0;3,by>31;3 :: .call w4(0x4c000042|(bx<<21)|(by<<16)|(by<<11))
+!x19("MCRF", 0, "bf@23,bfa@18")
+
+SC :: .call w4(0x44000002)
+SC !lev ::lev<0;3,lev>127;3 :: .call w4(0x44000002|(lev<<5))
+SCV !lev ::lev<0;3,lev>127;3 :: .call w4(0x44000001|(lev<<5))
+!x19("RFID", 18, "")
+!x19("HRFID", 274, "")
+!x19("URFID", 306, "")
+!x19("RFSCV", 82, "")
+!x19("RFEBB", 146, "!u:s@11/1")
+RFEBB :: .call w4(0x4c000924)
+!x19("STOP", 370, "")
+!x19("ISYNC", 150, "")
+
+/* ===================================================================
+/* Fixed-point loads and stores
+/* =================================================================== */
+/* D form: nm reg,d(ra) and nm reg,sym@l(ra) (plus the other @-forms,
+/* which are rare on a displacement but legal). reg is the register
+/* variable of the data operand (rt, rs, ft, fs). */
+!def dmem(nm, op, reg) {
+!local b = op << 26
+.reloc::d::addr16
+!{nm} !{reg},!d(ra) ::d<-32768;8,d>32767;8 :: .call w4(0x!{b:08x}|(!{reg}<<21)|(ra<<16)|(d&0xffff))
+.clrreloc::d
+!{nm} !{reg},(ra) :: .call w4(0x!{b:08x}|(!{reg}<<21)|(ra<<16))
+.reloc::d::addr16_lo
+!{nm} !{reg},!d@L(ra) :: .call w4(0x!{b:08x}|(!{reg}<<21)|(ra<<16)|(d&0xffff))
+.clrreloc::d
+.reloc::d::addr16_hi
+!{nm} !{reg},!d@H(ra) :: .call w4(0x!{b:08x}|(!{reg}<<21)|(ra<<16)|((d>>16)&0xffff))
+.clrreloc::d
+.reloc::d::addr16_ha
+!{nm} !{reg},!d@HA(ra) :: .call w4(0x!{b:08x}|(!{reg}<<21)|(ra<<16)|(((d+0x8000)>>16)&0xffff))
+.clrreloc::d
+}
+/* DS form: the displacement is a multiple of 4; the low 2 bits hold
+/* the extended opcode. */
+!def dsmem(nm, op, xo, reg, fx = "") {
+!local b = (op << 26) | xo
+.reloc::d::addr16_ds
+!{nm} !{reg},!d(ra) ::d<-32768;8,d>32767;8,(d&3)!=0;8 :: .call w4(0x!{b:08x}|(!{reg}<<21)|(ra<<16)|(d&0xfffc))
+.clrreloc::d
+!{nm} !{reg},(ra) :: .call w4(0x!{b:08x}|(!{reg}<<21)|(ra<<16))
+.reloc::d::addr16_lo_ds
+!{nm} !{reg},!d@L(ra) ::(d&3)!=0;8 :: .call w4(0x!{b:08x}|(!{reg}<<21)|(ra<<16)|(d&0xfffc))
+.clrreloc::d
+}
+
+!dmem("LBZ", 34, "rt")
+!dmem("LBZU", 35, "rt")
+!dmem("LHZ", 40, "rt")
+!dmem("LHZU", 41, "rt")
+!dmem("LHA", 42, "rt")
+!dmem("LHAU", 43, "rt")
+!dmem("LWZ", 32, "rt")
+!dmem("LWZU", 33, "rt")
+!dmem("STB", 38, "rs")
+!dmem("STBU", 39, "rs")
+!dmem("STH", 44, "rs")
+!dmem("STHU", 45, "rs")
+!dmem("STW", 36, "rs")
+!dmem("STWU", 37, "rs")
+/* Load / store multiple: big-endian mode only (Power ISA), so the
+/* little-endian wrapper reports error 15 for them. */
+.reloc::d::addr16
+LMW rt,!d(ra) ::#PPCLE!=0;15,d<-32768;8,d>32767;8 :: .call w4(0xb8000000|(rt<<21)|(ra<<16)|(d&0xffff))
+.clrreloc::d
+LMW rt,(ra) ::#PPCLE!=0;15 :: .call w4(0xb8000000|(rt<<21)|(ra<<16))
+.reloc::d::addr16_lo
+LMW rt,!d@L(ra) ::#PPCLE!=0;15 :: .call w4(0xb8000000|(rt<<21)|(ra<<16)|(d&0xffff))
+.clrreloc::d
+.reloc::d::addr16_hi
+LMW rt,!d@H(ra) ::#PPCLE!=0;15 :: .call w4(0xb8000000|(rt<<21)|(ra<<16)|((d>>16)&0xffff))
+.clrreloc::d
+.reloc::d::addr16_ha
+LMW rt,!d@HA(ra) ::#PPCLE!=0;15 :: .call w4(0xb8000000|(rt<<21)|(ra<<16)|(((d+0x8000)>>16)&0xffff))
+.clrreloc::d
+.reloc::d::addr16
+STMW rs,!d(ra) ::#PPCLE!=0;15,d<-32768;8,d>32767;8 :: .call w4(0xbc000000|(rs<<21)|(ra<<16)|(d&0xffff))
+.clrreloc::d
+STMW rs,(ra) ::#PPCLE!=0;15 :: .call w4(0xbc000000|(rs<<21)|(ra<<16))
+.reloc::d::addr16_lo
+STMW rs,!d@L(ra) ::#PPCLE!=0;15 :: .call w4(0xbc000000|(rs<<21)|(ra<<16)|(d&0xffff))
+.clrreloc::d
+.reloc::d::addr16_hi
+STMW rs,!d@H(ra) ::#PPCLE!=0;15 :: .call w4(0xbc000000|(rs<<21)|(ra<<16)|((d>>16)&0xffff))
+.clrreloc::d
+.reloc::d::addr16_ha
+STMW rs,!d@HA(ra) ::#PPCLE!=0;15 :: .call w4(0xbc000000|(rs<<21)|(ra<<16)|(((d+0x8000)>>16)&0xffff))
+.clrreloc::d
+!dsmem("LD", 58, 0, "rt")
+!dsmem("LDU", 58, 1, "rt")
+!dsmem("LWA", 58, 2, "rt")
+!dsmem("STD", 62, 0, "rs")
+!dsmem("STDU", 62, 1, "rs")
+/* quadword: RTp / RSp is an even register */
+.reloc::d::addr16_ds
+LQ rt,!d(ra) ::(rt&1)!=0;5,d<-32768;8,d>32767;8,(d&15)!=0;8 :: .call w4(0xe0000000|(rt<<21)|(ra<<16)|(d&0xfff0))
+.clrreloc::d
+.reloc::d::addr16_lo_ds
+LQ rt,!d@L(ra) ::(rt&1)!=0;5,(d&15)!=0;8 :: .call w4(0xe0000000|(rt<<21)|(ra<<16)|(d&0xfff0))
+.clrreloc::d
+LQ rt,(ra) ::(rt&1)!=0;5 :: .call w4(0xe0000000|(rt<<21)|(ra<<16))
+.reloc::d::addr16_ds
+STQ rs,!d(ra) ::(rs&1)!=0;5,d<-32768;8,d>32767;8,(d&3)!=0;8 :: .call w4(0xf8000002|(rs<<21)|(ra<<16)|(d&0xfffc))
+.clrreloc::d
+.reloc::d::addr16_lo_ds
+STQ rs,!d@L(ra) ::(rs&1)!=0;5,(d&3)!=0;8 :: .call w4(0xf8000002|(rs<<21)|(ra<<16)|(d&0xfffc))
+.clrreloc::d
+STQ rs,(ra) ::(rs&1)!=0;5 :: .call w4(0xf8000002|(rs<<21)|(ra<<16))
+
+/* X form, indexed */
+!def xld(nm, xo) {
+!x31(nm, xo, "rt@21,ra@16,rb@11")
+}
+!def xst(nm, xo) {
+!x31(nm, xo, "rs@21,ra@16,rb@11")
+}
+!xld("LBZX", 87)
+!xld("LBZUX", 119)
+!xld("LHZX", 279)
+!xld("LHZUX", 311)
+!xld("LHAX", 343)
+!xld("LHAUX", 375)
+!xld("LWZX", 23)
+!xld("LWZUX", 55)
+!xld("LWAX", 341)
+!xld("LWAUX", 373)
+!xld("LDX", 21)
+!xld("LDUX", 53)
+!xst("STBX", 215)
+!xst("STBUX", 247)
+!xst("STHX", 407)
+!xst("STHUX", 439)
+!xst("STWX", 151)
+!xst("STWUX", 183)
+!xst("STDX", 149)
+!xst("STDUX", 181)
+!xld("LHBRX", 790)
+!xld("LWBRX", 534)
+!xld("LDBRX", 532)
+!xst("STHBRX", 918)
+!xst("STWBRX", 662)
+!xst("STDBRX", 660)
+/* Load / store string: big-endian mode only, as above. */
+LSWX rt,ra,rb ::#PPCLE!=0;15 :: .call w4(0x7c00042a|(rt<<21)|(ra<<16)|(rb<<11))
+STSWX rs,ra,rb ::#PPCLE!=0;15 :: .call w4(0x7c00052a|(rs<<21)|(ra<<16)|(rb<<11))
+LSWI rt,ra,!nb ::#PPCLE!=0;15,nb<0;3,nb>31;3 :: .call w4(0x7c0004aa|(rt<<21)|(ra<<16)|((nb&31)<<11))
+STSWI rs,ra,!nb ::#PPCLE!=0;15,nb<0;3,nb>31;3 :: .call w4(0x7c0005aa|(rs<<21)|(ra<<16)|((nb&31)<<11))
+/* caching inhibited (hypervisor) */
+!xld("LBZCIX", 853)
+!xld("LHZCIX", 821)
+!xld("LWZCIX", 789)
+!xld("LDCIX", 885)
+!xst("STBCIX", 981)
+!xst("STHCIX", 949)
+!xst("STWCIX", 917)
+!xst("STDCIX", 1013)
+/* atomic memory operations: FC is a 5-bit function code */
+!x31("LWAT", 582, "rt@21,ra@16,!u:fc@11/5")
+!x31("LDAT", 614, "rt@21,ra@16,!u:fc@11/5")
+!x31("STWAT", 710, "rs@21,ra@16,!u:fc@11/5")
+!x31("STDAT", 742, "rs@21,ra@16,!u:fc@11/5")
+/* load and reserve (optional EH hint), store conditional */
+!def larx(nm, xo, ev = 0) {
+!if ev == 0 !then {
+!x31(nm, xo, "rt@21,ra@16,rb@11")
+!x31(nm, xo, "rt@21,ra@16,rb@11,!u:eh@0/1")
+}
+!if ev == 1 !then {
+!x31(nm, xo, "rt@21e,ra@16,rb@11")
+!x31(nm, xo, "rt@21e,ra@16,rb@11,!u:eh@0/1")
+}
+}
+!larx("LBARX", 52)
+!larx("LHARX", 116)
+!larx("LWARX", 20)
+!larx("LDARX", 84)
+!larx("LQARX", 276, 1)
+!xg("STBCX.", (31 << 26) | (694 << 1) | 1, "rs@21,ra@16,rb@11")
+!xg("STHCX.", (31 << 26) | (726 << 1) | 1, "rs@21,ra@16,rb@11")
+!xg("STWCX.", (31 << 26) | (150 << 1) | 1, "rs@21,ra@16,rb@11")
+!xg("STDCX.", (31 << 26) | (214 << 1) | 1, "rs@21,ra@16,rb@11")
+!xg("STQCX.", (31 << 26) | (182 << 1) | 1, "rs@21e,ra@16,rb@11")
+
+/* ROP protection: hashst / hashchk RB,D(RA), D = -512..-8, step 8 */
+!def hashx(nm, xo) {
+!{nm} rb,!d(ra) ::d<-512;8,d>-8;8,(d&7)!=0;8 :: .call w4(0x!{(31 << 26) | (xo << 1):08x}|(((d>>3)&31)<<21)|(ra<<16)|(rb<<11)|((d>>8)&1))
+}
+!hashx("HASHST", 722)
+!hashx("HASHSTP", 658)
+!hashx("HASHCHK", 754)
+!hashx("HASHCHKP", 690)
+
+/* ===================================================================
+/* Fixed-point arithmetic
+/* =================================================================== */
+/* D form with a signed 16-bit immediate: rt,ra,SI */
+!def dsi(nm, op, lo = -32768, hi = 32767) {
+.reloc::v::addr16
+!{nm} rt,ra,!v ::v<!{lo};3,v>!{hi};3 :: .call w4(0x!{op << 26:08x}|(rt<<21)|(ra<<16)|(v&0xffff))
+.clrreloc::v
+!hsfx(nm, "rt,ra,", op << 26, "|(rt<<21)|(ra<<16)")
+}
+!dsi("ADDI", 14)
+!dsi("ADDIS", 15, -32768, 65535)
+!dsi("ADDIC", 12)
+!dsi("ADDIC.", 13)
+!dsi("SUBFIC", 8)
+!dsi("MULLI", 7)
+/* negated-immediate aliases */
+SUBI rt,ra,!v ::v<-32767;3,v>32768;3 :: .call w4(0x38000000|(rt<<21)|(ra<<16)|((-v)&0xffff))
+SUBIS rt,ra,!v ::v<-65535;3,v>32768;3 :: .call w4(0x3c000000|(rt<<21)|(ra<<16)|((-v)&0xffff))
+SUBIC rt,ra,!v ::v<-32767;3,v>32768;3 :: .call w4(0x30000000|(rt<<21)|(ra<<16)|((-v)&0xffff))
+SUBIC. rt,ra,!v ::v<-32767;3,v>32768;3 :: .call w4(0x34000000|(rt<<21)|(ra<<16)|((-v)&0xffff))
+/* li / lis / la */
+.reloc::v::addr16
+LI rt,!v ::v<-32768;3,v>32767;3 :: .call w4(0x38000000|(rt<<21)|(v&0xffff))
+.clrreloc::v
+!hsfx("LI", "rt,", 14 << 26, "|(rt<<21)")
+.reloc::v::addr16
+LIS rt,!v ::v<-32768;3,v>65535;3 :: .call w4(0x3c000000|(rt<<21)|(v&0xffff))
+.clrreloc::v
+!hsfx("LIS", "rt,", 15 << 26, "|(rt<<21)")
+.reloc::d::addr16
+LA rt,!d(ra) ::d<-32768;3,d>32767;3 :: .call w4(0x38000000|(rt<<21)|(ra<<16)|(d&0xffff))
+.clrreloc::d
+.reloc::d::addr16_lo
+LA rt,!d@L(ra) :: .call w4(0x38000000|(rt<<21)|(ra<<16)|(d&0xffff))
+.clrreloc::d
+/* addpcis: DX form, D split d0:d1:d2; lnia and subpcis */
+ADDPCIS rt,!d ::d<-32768;3,d>32767;3 :: .call w4(0x4c000004|(rt<<21)|(((d>>1)&31)<<16)|(((d>>6)&0x3ff)<<6)|(d&1))
+SUBPCIS rt,!d ::d<-32767;3,d>32768;3 :: .call w4(0x4c000004|(rt<<21)|((((-d)>>1)&31)<<16)|((((-d)>>6)&0x3ff)<<6)|((-d)&1))
+LNIA rt :: .call w4(0x4c000004|(rt<<21))
+
+/* XO form: rt,ra,rb with o / . / o. */
+!def xo3(nm, xo) {
+!xoe(nm, xo, "rt@21,ra@16,rb@11")
+}
+!def xo2(nm, xo) {
+!xoe(nm, xo, "rt@21,ra@16")
+}
+!xo3("ADD", 266)
+!xo3("ADDC", 10)
+!xo3("ADDE", 138)
+!xo3("SUBF", 40)
+!xo3("SUBFC", 8)
+!xo3("SUBFE", 136)
+!xo3("MULLW", 235)
+!xo3("MULLD", 233)
+!xo3("DIVW", 491)
+!xo3("DIVWU", 459)
+!xo3("DIVD", 489)
+!xo3("DIVDU", 457)
+!xo3("DIVWE", 427)
+!xo3("DIVWEU", 395)
+!xo3("DIVDE", 425)
+!xo3("DIVDEU", 393)
+!xo2("ADDME", 234)
+!xo2("ADDZE", 202)
+!xo2("SUBFME", 232)
+!xo2("SUBFZE", 200)
+!xo2("NEG", 104)
+/* sub / subc: subf / subfc with the operands swapped */
+!def xsub(nm, xo) {
+!x31(nm, xo, "rt@21,ra@11,rb@16", 1)
+!x31(nm + "O", xo | 512, "rt@21,ra@11,rb@16", 1)
+}
+!xsub("SUB", 40)
+!xsub("SUBC", 8)
+/* multiply high: no OE */
+!x31("MULHW", 75, "rt@21,ra@16,rb@11", 1)
+!x31("MULHWU", 11, "rt@21,ra@16,rb@11", 1)
+!x31("MULHD", 73, "rt@21,ra@16,rb@11", 1)
+!x31("MULHDU", 9, "rt@21,ra@16,rb@11", 1)
+/* modulo, BCD assist */
+!x31("MODSW", 779, "rt@21,ra@16,rb@11")
+!x31("MODUW", 267, "rt@21,ra@16,rb@11")
+!x31("MODSD", 777, "rt@21,ra@16,rb@11")
+!x31("MODUD", 265, "rt@21,ra@16,rb@11")
+!x31("ADDG6S", 74, "rt@21,ra@16,rb@11")
+/* add extended using alternate carry (CY 21:22) */
+!x31("ADDEX", 170, "rt@21,ra@16,rb@11,!u:cy@9/2")
+/* VA form multiply-add */
+!def madd(nm, xo) {
+!xg(nm, (4 << 26) | xo, "rt@21,ra@16,rb@11,rc@6")
+}
+!madd("MADDHD", 48)
+!madd("MADDHDU", 49)
+!madd("MADDLD", 51)
+!x31("DARN", 755, "rt@21,!u:l@16/2")
+
+/* ===================================================================
+/* Fixed-point compare
+/* =================================================================== */
+CMP bf,!l,ra,rb ::l<0;3,l>1;3 :: .call w4(0x7c000000|(bf<<23)|(l<<21)|(ra<<16)|(rb<<11))
+CMPL bf,!l,ra,rb ::l<0;3,l>1;3 :: .call w4(0x7c000040|(bf<<23)|(l<<21)|(ra<<16)|(rb<<11))
+.reloc::v::addr16
+CMPI bf,!l,ra,!v ::l<0;3,l>1;3,v<-32768;3,v>32767;3 :: .call w4(0x2c000000|(bf<<23)|(l<<21)|(ra<<16)|(v&0xffff))
+.clrreloc::v
+.reloc::v::addr16
+CMPLI bf,!l,ra,!v ::l<0;3,l>1;3,v<0;3,v>65535;3 :: .call w4(0x28000000|(bf<<23)|(l<<21)|(ra<<16)|(v&0xffff))
+.clrreloc::v
+!def cmpx(nm, base) {
+!{nm} ra,rb :: .call w4(0x!{base:08x}|(ra<<16)|(rb<<11))
+!{nm} bf,ra,rb :: .call w4(0x!{base:08x}|(bf<<23)|(ra<<16)|(rb<<11))
+}
+!def cmpxi(nm, base, lo, hi) {
+.reloc::v::addr16
+!{nm} ra,!v ::v<!{lo};3,v>!{hi};3 :: .call w4(0x!{base:08x}|(ra<<16)|(v&0xffff))
+.clrreloc::v
+.reloc::v::addr16
+!{nm} bf,ra,!v ::v<!{lo};3,v>!{hi};3 :: .call w4(0x!{base:08x}|(bf<<23)|(ra<<16)|(v&0xffff))
+.clrreloc::v
+!hsfx(nm, "ra,", base, "|(ra<<16)")
+!hsfx(nm, "bf,ra,", base, "|(bf<<23)|(ra<<16)")
+}
+!cmpx("CMPW", 0x7c000000)
+!cmpx("CMPD", 0x7c200000)
+!cmpx("CMPLW", 0x7c000040)
+!cmpx("CMPLD", 0x7c200040)
+!cmpxi("CMPWI", 0x2c000000, -32768, 32767)
+!cmpxi("CMPDI", 0x2c200000, -32768, 32767)
+!cmpxi("CMPLWI", 0x28000000, 0, 65535)
+!cmpxi("CMPLDI", 0x28200000, 0, 65535)
+!x31("CMPRB", 192, "bf@23,!u:l@21/1,ra@16,rb@11")
+!x31("CMPEQB", 224, "bf@23,ra@16,rb@11")
+!x31("SETB", 128, "rt@21,bfa@18")
+!x31("SETBC", 384, "rt@21,!u:bi@16/5")
+!x31("SETBCR", 416, "rt@21,!u:bi@16/5")
+!x31("SETNBC", 448, "rt@21,!u:bi@16/5")
+!x31("SETNBCR", 480, "rt@21,!u:bi@16/5")
+!x31("MCRXRX", 576, "bf@23")
+
+/* ===================================================================
+/* Fixed-point trap
+/* =================================================================== */
+!x31("TW", 4, "!u:to@21/5,ra@16,rb@11")
+!x31("TD", 68, "!u:to@21/5,ra@16,rb@11")
+.reloc::v::addr16
+TWI !to,ra,!v ::to<0;3,to>31;3,v<-32768;3,v>32767;3 :: .call w4(0x0c000000|(to<<21)|(ra<<16)|(v&0xffff))
+.clrreloc::v
+.reloc::v::addr16
+TDI !to,ra,!v ::to<0;3,to>31;3,v<-32768;3,v>32767;3 :: .call w4(0x08000000|(to<<21)|(ra<<16)|(v&0xffff))
+.clrreloc::v
+TRAP :: .call w4(0x7fe00008)
+!def trp(cn, to) {
+TW!{cn} ra,rb :: .call w4(0x!{(31 << 26) | (to << 21) | (4 << 1):08x}|(ra<<16)|(rb<<11))
+TD!{cn} ra,rb :: .call w4(0x!{(31 << 26) | (to << 21) | (68 << 1):08x}|(ra<<16)|(rb<<11))
+.reloc::v::addr16
+TW!{cn}I ra,!v ::v<-32768;3,v>32767;3 :: .call w4(0x!{(3 << 26) | (to << 21):08x}|(ra<<16)|(v&0xffff))
+.clrreloc::v
+.reloc::v::addr16
+TD!{cn}I ra,!v ::v<-32768;3,v>32767;3 :: .call w4(0x!{(2 << 26) | (to << 21):08x}|(ra<<16)|(v&0xffff))
+.clrreloc::v
+}
+!trp("LT", 16)
+!trp("LE", 20)
+!trp("EQ", 4)
+!trp("GE", 12)
+!trp("GT", 8)
+!trp("NL", 12)
+!trp("NE", 24)
+!trp("NG", 20)
+!trp("LLT", 2)
+!trp("LLE", 6)
+!trp("LGE", 5)
+!trp("LGT", 1)
+!trp("LNL", 5)
+!trp("LNG", 6)
+!trp("U", 31)
+
+/* ===================================================================
+/* Fixed-point logical
+/* =================================================================== */
+/* D form with an unsigned 16-bit immediate: ra,rs,UI */
+!def dui(nm, op) {
+.reloc::v::addr16
+!{nm} ra,rs,!v ::v<0;3,v>65535;3 :: .call w4(0x!{op << 26:08x}|(rs<<21)|(ra<<16)|(v&0xffff))
+.clrreloc::v
+!hsfx(nm, "ra,rs,", op << 26, "|(rs<<21)|(ra<<16)")
+}
+!dui("ANDI.", 28)
+!dui("ANDIS.", 29)
+!dui("ORI", 24)
+!dui("ORIS", 25)
+!dui("XORI", 26)
+!dui("XORIS", 27)
+NOP :: .call w4(0x60000000)
+XNOP :: .call w4(0x68000000)
+/* X form ra,rs,rb */
+!def xlog(nm, xo, rc = 1) {
+!x31(nm, xo, "ra@16,rs@21,rb@11", rc)
+}
+!def xlog1(nm, xo, rc = 1) {
+!x31(nm, xo, "ra@16,rs@21", rc)
+}
+!xlog("AND", 28)
+!xlog("ANDC", 60)
+!xlog("OR", 444)
+!xlog("ORC", 412)
+!xlog("XOR", 316)
+!xlog("NAND", 476)
+!xlog("NOR", 124)
+!xlog("EQV", 284)
+!xlog("CMPB", 508, 0)
+!xlog("BPERMD", 252, 0)
+!xlog("CFUGED", 220, 0)
+!xlog("CNTLZDM", 59, 0)
+!xlog("CNTTZDM", 571, 0)
+!xlog("PDEPD", 156, 0)
+!xlog("PEXTD", 188, 0)
+!xlog1("EXTSB", 954)
+!xlog1("EXTSH", 922)
+!xlog1("EXTSW", 986)
+!xlog1("CNTLZW", 26)
+!xlog1("CNTLZD", 58)
+!xlog1("CNTTZW", 538)
+!xlog1("CNTTZD", 570)
+!xlog1("POPCNTB", 122, 0)
+!xlog1("POPCNTW", 378, 0)
+!xlog1("POPCNTD", 506, 0)
+!xlog1("PRTYW", 154, 0)
+!xlog1("PRTYD", 186, 0)
+!xlog1("CDTBCD", 282, 0)
+!xlog1("CBCDTD", 314, 0)
+!xlog1("BRH", 219, 0)
+!xlog1("BRW", 155, 0)
+!xlog1("BRD", 187, 0)
+/* mr = or ra,rs,rs ; not = nor ra,rs,rs */
+MR ra,rs :: .call w4(0x7c000378|(rs<<21)|(ra<<16)|(rs<<11))
+MR. ra,rs :: .call w4(0x7c000379|(rs<<21)|(ra<<16)|(rs<<11))
+NOT ra,rs :: .call w4(0x7c0000f8|(rs<<21)|(ra<<16)|(rs<<11))
+NOT. ra,rs :: .call w4(0x7c0000f9|(rs<<21)|(ra<<16)|(rs<<11))
+/* integer select */
+!x31("ISEL", 15, "rt@21,ra@16,rb@11,!u:bc@6/5")
+ISELLT rt,ra,rb :: .call w4(0x7c00001e|(rt<<21)|(ra<<16)|(rb<<11))
+ISELGT rt,ra,rb :: .call w4(0x7c00005e|(rt<<21)|(ra<<16)|(rb<<11))
+ISELEQ rt,ra,rb :: .call w4(0x7c00009e|(rt<<21)|(ra<<16)|(rb<<11))
+
+/* ===================================================================
+/* Fixed-point rotate and shift
+/* =================================================================== */
+!def rlwm(nm, op) {
+!{nm} ra,rs,!sh,!mb,!me ::sh<0;10,sh>31;10,mb<0;10,mb>31;10,me<0;10,me>31;10 :: .call rlw(!{op},rs,ra,sh,mb,me,0)
+!{nm}. ra,rs,!sh,!mb,!me ::sh<0;10,sh>31;10,mb<0;10,mb>31;10,me<0;10,me>31;10 :: .call rlw(!{op},rs,ra,sh,mb,me,1)
+}
+!rlwm("RLWINM", 21)
+!rlwm("RLWIMI", 20)
+RLWNM ra,rs,rb,!mb,!me ::mb<0;10,mb>31;10,me<0;10,me>31;10 :: .call w4(0x5c000000|(rs<<21)|(ra<<16)|(rb<<11)|(mb<<6)|(me<<1))
+RLWNM. ra,rs,rb,!mb,!me ::mb<0;10,mb>31;10,me<0;10,me>31;10 :: .call w4(0x5c000001|(rs<<21)|(ra<<16)|(rb<<11)|(mb<<6)|(me<<1))
+!def mdr(nm, xo) {
+!{nm} ra,rs,!sh,!mb ::sh<0;10,sh>63;10,mb<0;10,mb>63;10 :: .call md(!{xo},rs,ra,sh,mb,0)
+!{nm}. ra,rs,!sh,!mb ::sh<0;10,sh>63;10,mb<0;10,mb>63;10 :: .call md(!{xo},rs,ra,sh,mb,1)
+}
+!mdr("RLDICL", 0)
+!mdr("RLDICR", 1)
+!mdr("RLDIC", 2)
+!mdr("RLDIMI", 3)
+!def mdsr(nm, xo) {
+!{nm} ra,rs,rb,!mb ::mb<0;10,mb>63;10 :: .call w4(0x!{(30 << 26) | (xo << 1):08x}|(rs<<21)|(ra<<16)|(rb<<11)|((((mb&31)<<1)|((mb>>5)&1))<<5))
+!{nm}. ra,rs,rb,!mb ::mb<0;10,mb>63;10 :: .call w4(0x!{(30 << 26) | (xo << 1) | 1:08x}|(rs<<21)|(ra<<16)|(rb<<11)|((((mb&31)<<1)|((mb>>5)&1))<<5))
+}
+!mdsr("RLDCL", 8)
+!mdsr("RLDCR", 9)
+!xlog("SLW", 24)
+!xlog("SRW", 536)
+!xlog("SRAW", 792)
+!xlog("SLD", 27)
+!xlog("SRD", 539)
+!xlog("SRAD", 794)
+!x31("SRAWI", 824, "ra@16,rs@21,!u:sh@11/5", 1)
+/* XS form: 6-bit SH, sh5 at bit 30 */
+!def xsf(nm, base) {
+!{nm} ra,rs,!sh ::sh<0;10,sh>63;10 :: .call w4(0x!{base:08x}|(rs<<21)|(ra<<16)|((sh&31)<<11)|(((sh>>5)&1)<<1))
+!{nm}. ra,rs,!sh ::sh<0;10,sh>63;10 :: .call w4(0x!{base | 1:08x}|(rs<<21)|(ra<<16)|((sh&31)<<11)|(((sh>>5)&1)<<1))
+}
+!xsf("SRADI", 0x7c000674)
+!xsf("EXTSWSLI", 0x7c0006f4)
+
+/* Extended rotate mnemonics, word (rlwinm / rlwnm / rlwimi) */
+!def rlwx(sfx, rc) {
+ROTLWI!{sfx} ra,rs,!n ::n<0;10,n>31;10 :: .call rlw(21,rs,ra,n,0,31,!{rc})
+ROTRWI!{sfx} ra,rs,!n ::n<0;10,n>31;10 :: .call rlw(21,rs,ra,32-n,0,31,!{rc})
+SLWI!{sfx} ra,rs,!n ::n<0;10,n>31;10 :: .call rlw(21,rs,ra,n,0,31-n,!{rc})
+SRWI!{sfx} ra,rs,!n ::n<0;10,n>31;10 :: .call rlw(21,rs,ra,32-n,n,31,!{rc})
+CLRLWI!{sfx} ra,rs,!n ::n<0;10,n>31;10 :: .call rlw(21,rs,ra,0,n,31,!{rc})
+CLRRWI!{sfx} ra,rs,!n ::n<0;10,n>31;10 :: .call rlw(21,rs,ra,0,0,31-n,!{rc})
+EXTLWI!{sfx} ra,rs,!n,!b ::n<1;10,b<0;10,n+b>32;10 :: .call rlw(21,rs,ra,b,0,n-1,!{rc})
+EXTRWI!{sfx} ra,rs,!n,!b ::n<1;10,b<0;10,n+b>32;10 :: .call rlw(21,rs,ra,b+n,32-n,31,!{rc})
+INSLWI!{sfx} ra,rs,!n,!b ::n<1;10,b<0;10,n+b>32;10 :: .call rlw(20,rs,ra,32-b,b,b+n-1,!{rc})
+INSRWI!{sfx} ra,rs,!n,!b ::n<1;10,b<0;10,n+b>32;10 :: .call rlw(20,rs,ra,32-(b+n),b,b+n-1,!{rc})
+CLRLSLWI!{sfx} ra,rs,!b,!n ::n<0;10,b<n;10,b>31;10 :: .call rlw(21,rs,ra,n,b-n,31-n,!{rc})
+ROTLW!{sfx} ra,rs,rb :: .call w4(0x!{0x5c00003e | rc:08x}|(rs<<21)|(ra<<16)|(rb<<11))
+}
+!rlwx("", 0)
+!rlwx(".", 1)
+/* Extended rotate mnemonics, doubleword (rldicl / rldicr / rldic /
+/* rldimi / rldcl) */
+!def rldx(sfx, rc) {
+ROTLDI!{sfx} ra,rs,!n ::n<0;10,n>63;10 :: .call md(0,rs,ra,n,0,!{rc})
+ROTRDI!{sfx} ra,rs,!n ::n<0;10,n>63;10 :: .call md(0,rs,ra,(64-n)&63,0,!{rc})
+SLDI!{sfx} ra,rs,!n ::n<0;10,n>63;10 :: .call md(1,rs,ra,n,63-n,!{rc})
+SRDI!{sfx} ra,rs,!n ::n<0;10,n>63;10 :: .call md(0,rs,ra,(64-n)&63,n,!{rc})
+CLRLDI!{sfx} ra,rs,!n ::n<0;10,n>63;10 :: .call md(0,rs,ra,0,n,!{rc})
+CLRRDI!{sfx} ra,rs,!n ::n<0;10,n>63;10 :: .call md(1,rs,ra,0,63-n,!{rc})
+EXTLDI!{sfx} ra,rs,!n,!b ::n<1;10,b<0;10,n+b>64;10 :: .call md(1,rs,ra,b,n-1,!{rc})
+EXTRDI!{sfx} ra,rs,!n,!b ::n<1;10,b<0;10,n+b>64;10 :: .call md(0,rs,ra,(b+n)&63,64-n,!{rc})
+INSRDI!{sfx} ra,rs,!n,!b ::n<1;10,b<0;10,n+b>64;10 :: .call md(3,rs,ra,(64-(b+n))&63,b,!{rc})
+CLRLSLDI!{sfx} ra,rs,!b,!n ::n<0;10,b<n;10,b>63;10 :: .call md(2,rs,ra,n,b-n,!{rc})
+ROTLD!{sfx} ra,rs,rb :: .call w4(0x!{0x78000010 | rc:08x}|(rs<<21)|(ra<<16)|(rb<<11))
+}
+!rldx("", 0)
+!rldx(".", 1)
+
+/* ===================================================================
+/* Move to/from SPR, CR, MSR
+/* =================================================================== */
+/* The SPR number is written with its two 5-bit halves swapped. */
+MFSPR rt,!n ::n<0;3,n>1023;3 :: .call w4(0x7c0002a6|(rt<<21)|((n&31)<<16)|(((n>>5)&31)<<11))
+MTSPR !n,rs ::n<0;3,n>1023;3 :: .call w4(0x7c0003a6|(rs<<21)|((n&31)<<16)|(((n>>5)&31)<<11))
+!def spr(nm, n, rw = 3) {
+!local f = ((n & 31) << 16) | ((n >> 5) << 11)
+!if (rw & 1) != 0 !then {
+MF!{nm} rt :: .call w4(0x!{0x7c0002a6 | f:08x}|(rt<<21))
+}
+!if (rw & 2) != 0 !then {
+MT!{nm} rs :: .call w4(0x!{0x7c0003a6 | f:08x}|(rs<<21))
+}
+}
+!spr("XER", 1)
+!spr("LR", 8)
+!spr("CTR", 9)
+!spr("DSCR", 17)
+!spr("DSISR", 18)
+!spr("DAR", 19)
+!spr("DEC", 22)
+!spr("SDR1", 25)
+!spr("SRR0", 26)
+!spr("SRR1", 27)
+!spr("CFAR", 28)
+!spr("AMR", 29)
+!spr("PID", 48)
+!spr("UAMR", 13)
+!spr("VRSAVE", 256)
+!spr("SPRG0", 272)
+!spr("SPRG1", 273)
+!spr("SPRG2", 274)
+!spr("SPRG3", 275)
+!spr("EAR", 282)
+!spr("PVR", 287, 1)
+!spr("TAR", 815)
+!spr("PPR", 896)
+!spr("PPR32", 898)
+MTTBL rs :: .call w4(0x7c1c43a6|(rs<<21))
+MTTBU rs :: .call w4(0x7c1d43a6|(rs<<21))
+/* mftb / mftbu are written as mfspr 268 / 269, as GNU as does for
+/* POWER4 and later (the old XFX opcode 371 is phased out). */
+MFTB rt :: .call w4(0x7c0c42a6|(rt<<21))
+MFTB rt,!n ::n<0;3,n>1023;3 :: .call w4(0x7c0002a6|(rt<<21)|((n&31)<<16)|(((n>>5)&31)<<11))
+MFTBU rt :: .call w4(0x7c0d42a6|(rt<<21))
+/* CR */
+!x31("MFCR", 19, "rt@21")
+!xg("MFOCRF", (31 << 26) | (1 << 20) | (19 << 1), "rt@21,!u:fxm@12/8")
+/* mtcrf with a single-bit mask is emitted as mtocrf (bit 11 set),
+/* as GNU as does for POWER4 and later. */
+MTCRF !fxm,rs ::fxm<0;3,fxm>255;3 :: .call w4(0x7c000120|(rs<<21)|((fxm&255)<<12)|((((fxm!=0)&&((fxm&(fxm-1))==0))&1)<<20))
+!xg("MTOCRF", (31 << 26) | (1 << 20) | (144 << 1), "!u:fxm@12/8,rs@21")
+MTCR rs :: .call w4(0x7c0ff120|(rs<<21))
+/* MSR */
+!x31("MFMSR", 83, "rt@21")
+!x31("MTMSR", 146, "rs@21")
+!x31("MTMSR", 146, "rs@21,!u:l@16/1")
+!x31("MTMSRD", 178, "rs@21")
+!x31("MTMSRD", 178, "rs@21,!u:l@16/1")
+/* BHRB */
+!x31("MFBHRBE", 302, "rt@21,!u:bhrbe@11/10")
+!x31("CLRBHRB", 430, "")
+
+/* ===================================================================
+/* Storage control, synchronization, messages, SLB / TLB
+/* =================================================================== */
+!x31("DCBT", 278, "ra@16,rb@11")
+!x31("DCBT", 278, "ra@16,rb@11,!u:th@21/5")
+!x31("DCBTST", 246, "ra@16,rb@11")
+!x31("DCBTST", 246, "ra@16,rb@11,!u:th@21/5")
+DCBTT ra,rb :: .call w4(0x7e00022c|(ra<<16)|(rb<<11))
+DCBTSTT ra,rb :: .call w4(0x7e0001ec|(ra<<16)|(rb<<11))
+!x31("DCBZ", 1014, "ra@16,rb@11")
+!xg("DCBZL", (31 << 26) | (1 << 21) | (1014 << 1), "ra@16,rb@11")
+!x31("DCBST", 54, "ra@16,rb@11")
+!x31("DCBF", 86, "ra@16,rb@11")
+!x31("DCBF", 86, "ra@16,rb@11,!u:l@21/3")
+DCBFL ra,rb :: .call w4(0x7c2000ac|(ra<<16)|(rb<<11))
+DCBFLP ra,rb :: .call w4(0x7c6000ac|(ra<<16)|(rb<<11))
+DCBFPS ra,rb :: .call w4(0x7c8000ac|(ra<<16)|(rb<<11))
+DCBSTPS ra,rb :: .call w4(0x7cc000ac|(ra<<16)|(rb<<11))
+!x31("DCBI", 470, "ra@16,rb@11")
+!x31("ICBI", 982, "ra@16,rb@11")
+!x31("ICBT", 22, "!u:ct@21/4,ra@16,rb@11")
+!x31("DST", 342, "ra@16,rb@11,!u:strm@21/2")
+DSTT ra,rb,!strm ::strm<0;3,strm>3;3 :: .call w4(0x7e0002ac|(ra<<16)|(rb<<11)|(strm<<21))
+!x31("DSTST", 374, "ra@16,rb@11,!u:strm@21/2")
+DSTSTT ra,rb,!strm ::strm<0;3,strm>3;3 :: .call w4(0x7e0002ec|(ra<<16)|(rb<<11)|(strm<<21))
+!x31("DSS", 822, "!u:strm@21/2")
+DSSALL :: .call w4(0x7e00066c)
+SYNC :: .call w4(0x7c0004ac)
+!x31("SYNC", 598, "!u:l@21/3")
+!x31("SYNC", 598, "!u:l@21/3,!u:sc@16/2")
+HWSYNC :: .call w4(0x7c0004ac)
+LWSYNC :: .call w4(0x7c2004ac)
+PTESYNC :: .call w4(0x7c4004ac)
+PHWSYNC :: .call w4(0x7c8004ac)
+PLWSYNC :: .call w4(0x7ca004ac)
+STNCISYNC :: .call w4(0x7c2104ac)
+STCISYNC :: .call w4(0x7c0204ac)
+STSYNC :: .call w4(0x7c0304ac)
+!x31("EIEIO", 854, "")
+!x31("MSGSYNC", 886, "")
+WAIT :: .call w4(0x7c00003c)
+!x31("WAIT", 30, "!u:wc@21/2,!u:pl@16/2")
+!xg("COPY", (31 << 26) | (1 << 21) | (774 << 1), "ra@16,rb@11")
+PASTE. ra,rb :: .call w4(0x7c20070d|(ra<<16)|(rb<<11))
+PASTE. ra,rb,!l ::l<0;3,l>1;3 :: .call w4(0x7c00070d|(ra<<16)|(rb<<11)|(l<<21))
+!x31("CPABORT", 838, "")
+!x31("CP_ABORT", 838, "")
+!x31("MSGSND", 206, "rb@11")
+!x31("MSGCLR", 238, "rb@11")
+!x31("MSGSNDP", 142, "rb@11")
+!x31("MSGCLRP", 174, "rb@11")
+!x31("MSGSNDU", 78, "rb@11")
+!x31("MSGCLRU", 110, "rb@11")
+!x31("SLBIE", 434, "rb@11")
+!x31("SLBIEG", 466, "rs@21,rb@11")
+SLBIA :: .call w4(0x7c0003e4)
+!x31("SLBIA", 498, "!u:ih@21/3")
+!x31("SLBIAG", 850, "rs@21")
+!x31("SLBIAG", 850, "rs@21,!u:l@16/1")
+!x31("SLBMTE", 402, "rs@21,rb@11")
+!x31("SLBMFEV", 851, "rt@21,rb@11")
+!x31("SLBMFEV", 851, "rt@21,rb@11,!u:l@16/1")
+!x31("SLBMFEE", 915, "rt@21,rb@11")
+!x31("SLBMFEE", 915, "rt@21,rb@11,!u:l@16/1")
+!xg("SLBFEE.", (31 << 26) | (979 << 1) | 1, "rt@21,rb@11")
+!x31("SLBSYNC", 338, "")
+!x31("TLBIE", 306, "rb@11,rs@21")
+!x31("TLBIE", 306, "rb@11,rs@21,!u:ric@18/2,!u:prs@17/1,!u:r@16/1")
+!x31("TLBIEL", 274, "rb@11")
+!x31("TLBIEL", 274, "rb@11,rs@21,!u:ric@18/2,!u:prs@17/1,!u:r@16/1")
+!x31("TLBSYNC", 566, "")
+
+/* ===================================================================
+/* Floating point
+/* =================================================================== */
+!dmem("LFS", 48, "ft")
+!dmem("LFSU", 49, "ft")
+!dmem("LFD", 50, "ft")
+!dmem("LFDU", 51, "ft")
+!dmem("STFS", 52, "fs")
+!dmem("STFSU", 53, "fs")
+!dmem("STFD", 54, "fs")
+!dmem("STFDU", 55, "fs")
+.reloc::d::addr16_ds
+LFDP ft,!d(ra) ::(ft&1)!=0;5,d<-32768;8,d>32767;8,(d&3)!=0;8 :: .call w4(0xe4000000|(ft<<21)|(ra<<16)|(d&0xfffc))
+.clrreloc::d
+.reloc::d::addr16_lo_ds
+LFDP ft,!d@L(ra) ::(ft&1)!=0;5,(d&3)!=0;8 :: .call w4(0xe4000000|(ft<<21)|(ra<<16)|(d&0xfffc))
+.clrreloc::d
+.reloc::d::addr16_ds
+STFDP fs,!d(ra) ::(fs&1)!=0;5,d<-32768;8,d>32767;8,(d&3)!=0;8 :: .call w4(0xf4000000|(fs<<21)|(ra<<16)|(d&0xfffc))
+.clrreloc::d
+.reloc::d::addr16_lo_ds
+STFDP fs,!d@L(ra) ::(fs&1)!=0;5,(d&3)!=0;8 :: .call w4(0xf4000000|(fs<<21)|(ra<<16)|(d&0xfffc))
+.clrreloc::d
+!def xfl(nm, xo) {
+!x31(nm, xo, "ft@21,ra@16,rb@11")
+}
+!def xfs(nm, xo) {
+!x31(nm, xo, "fs@21,ra@16,rb@11")
+}
+!xfl("LFSX", 535)
+!xfl("LFSUX", 567)
+!xfl("LFDX", 599)
+!xfl("LFDUX", 631)
+!xfl("LFIWAX", 855)
+!xfl("LFIWZX", 887)
+!xfs("STFSX", 663)
+!xfs("STFSUX", 695)
+!xfs("STFDX", 727)
+!xfs("STFDUX", 759)
+!xfs("STFIWX", 983)
+!x31("LFDPX", 791, "ft@21e,ra@16,rb@11")
+!x31("STFDPX", 919, "fs@21e,ra@16,rb@11")
+
+/* A form. fp3: frt,fra,frb ; fpm: frt,fra,frc ; fp4: frt,fra,frc,frb */
+!def fp3(nm, op, xo) {
+!xg(nm, (op << 26) | (xo << 1), "ft@21,fa@16,fb@11", 1)
+}
+!def fpm(nm, op, xo) {
+!xg(nm, (op << 26) | (xo << 1), "ft@21,fa@16,fc@6", 1)
+}
+!def fp4(nm, op, xo) {
+!xg(nm, (op << 26) | (xo << 1), "ft@21,fa@16,fc@6,fb@11", 1)
+}
+!def fp1(nm, op, xo) {
+!xg(nm, (op << 26) | (xo << 1), "ft@21,fb@11", 1)
+}
+!fp3("FADD", 63, 21)
+!fp3("FADDS", 59, 21)
+!fp3("FSUB", 63, 20)
+!fp3("FSUBS", 59, 20)
+!fp3("FDIV", 63, 18)
+!fp3("FDIVS", 59, 18)
+!fpm("FMUL", 63, 25)
+!fpm("FMULS", 59, 25)
+!fp4("FMADD", 63, 29)
+!fp4("FMADDS", 59, 29)
+!fp4("FMSUB", 63, 28)
+!fp4("FMSUBS", 59, 28)
+!fp4("FNMADD", 63, 31)
+!fp4("FNMADDS", 59, 31)
+!fp4("FNMSUB", 63, 30)
+!fp4("FNMSUBS", 59, 30)
+!fp4("FSEL", 63, 23)
+!fp1("FSQRT", 63, 22)
+!fp1("FSQRTS", 59, 22)
+!fp1("FRE", 63, 24)
+!fp1("FRES", 59, 24)
+!fp1("FRSQRTE", 63, 26)
+!fp1("FRSQRTES", 59, 26)
+/* X form */
+!fp1("FMR", 63, 72)
+!fp1("FNEG", 63, 40)
+!fp1("FABS", 63, 264)
+!fp1("FNABS", 63, 136)
+!fp3("FCPSGN", 63, 8)
+!fp1("FRSP", 63, 12)
+!fp1("FCTIW", 63, 14)
+!fp1("FCTIWZ", 63, 15)
+!fp1("FCTIWU", 63, 142)
+!fp1("FCTIWUZ", 63, 143)
+!fp1("FCTID", 63, 814)
+!fp1("FCTIDZ", 63, 815)
+!fp1("FCTIDU", 63, 942)
+!fp1("FCTIDUZ", 63, 943)
+!fp1("FCFID", 63, 846)
+!fp1("FCFIDU", 63, 974)
+!fp1("FCFIDS", 59, 846)
+!fp1("FCFIDUS", 59, 974)
+!fp1("FRIN", 63, 392)
+!fp1("FRIZ", 63, 424)
+!fp1("FRIP", 63, 456)
+!fp1("FRIM", 63, 488)
+!x63("FMRGEW", 966, "ft@21,fa@16,fb@11")
+!x63("FMRGOW", 838, "ft@21,fa@16,fb@11")
+!x63("FCMPU", 0, "bf@23,fa@16,fb@11")
+!x63("FCMPO", 32, "bf@23,fa@16,fb@11")
+!x63("FTDIV", 128, "bf@23,fa@16,fb@11")
+!x63("FTSQRT", 160, "bf@23,fb@11")
+/* FPSCR */
+!x63("MFFS", 583, "ft@21", 1)
+!xg("MFFSCE", (63 << 26) | (583 << 1) | (1 << 16), "ft@21")
+!xg("MFFSCDRN", (63 << 26) | (583 << 1) | (20 << 16), "ft@21,fb@11")
+!xg("MFFSCDRNI", (63 << 26) | (583 << 1) | (21 << 16), "ft@21,!u:drm@11/3")
+!xg("MFFSCRN", (63 << 26) | (583 << 1) | (22 << 16), "ft@21,fb@11")
+!xg("MFFSCRNI", (63 << 26) | (583 << 1) | (23 << 16), "ft@21,!u:rm@11/2")
+!xg("MFFSL", (63 << 26) | (583 << 1) | (24 << 16), "ft@21")
+!x63("MCRFS", 64, "bf@23,bfa@18")
+!x63("MTFSFI", 134, "bf@23,!u:u@12/4", 1)
+!x63("MTFSFI", 134, "bf@23,!u:u@12/4,!u:w@16/1", 1)
+!x63("MTFSF", 711, "!u:flm@17/8,fb@11", 1)
+!x63("MTFSF", 711, "!u:flm@17/8,fb@11,!u:l@25/1,!u:w@16/1", 1)
+!x63("MTFSB0", 70, "!u:bt@21/5", 1)
+!x63("MTFSB1", 38, "!u:bt@21/5", 1)
+
+/* ===================================================================
+/* Decimal floating point (op 59 = long, op 63 = extended "q" forms)
+/* The extended forms operate on even/odd FPR pairs.
+/* =================================================================== */
+!def dfp3(nm, xo) {
+!x59(nm, xo, "ft@21,fa@16,fb@11", 1)
+!x63(nm + "Q", xo, "ft@21e,fa@16e,fb@11e", 1)
+}
+!dfp3("DADD", 2)
+!dfp3("DSUB", 514)
+!dfp3("DMUL", 34)
+!dfp3("DDIV", 546)
+!def dfpc(nm, xo) {
+!x59(nm, xo, "bf@23,fa@16,fb@11")
+!x63(nm + "Q", xo, "bf@23,fa@16e,fb@11e")
+}
+!dfpc("DCMPU", 642)
+!dfpc("DCMPO", 130)
+!dfpc("DTSTEX", 162)
+!def dfpsf(nm, xo) {
+!x59(nm, xo, "bf@23,fa@16,fb@11")
+!x63(nm + "Q", xo, "bf@23,fa@16,fb@11e")
+}
+!dfpsf("DTSTSF", 674)
+!x59("DTSTSFI", 675, "bf@23,!u:uim@16/6,fb@11")
+!x63("DTSTSFIQ", 675, "bf@23,!u:uim@16/6,fb@11e")
+!def dfpt(nm, xo) {
+!x59(nm, xo, "bf@23,fa@16,!u:dcm@10/6")
+!x63(nm + "Q", xo, "bf@23,fa@16e,!u:dcm@10/6")
+}
+!dfpt("DTSTDC", 194)
+!dfpt("DTSTDG", 226)
+/* quantize and round (Z23): RMC at 9 */
+!x59("DQUAI", 67, "!s:te@16/5,ft@21,fb@11,!u:rmc@9/2", 1)
+!x63("DQUAIQ", 67, "!s:te@16/5,ft@21e,fb@11e,!u:rmc@9/2", 1)
+!x59("DQUA", 3, "ft@21,fa@16,fb@11,!u:rmc@9/2", 1)
+!x63("DQUAQ", 3, "ft@21e,fa@16e,fb@11e,!u:rmc@9/2", 1)
+!x59("DRRND", 35, "ft@21,fa@16,fb@11,!u:rmc@9/2", 1)
+!x63("DRRNDQ", 35, "ft@21e,fa@16,fb@11e,!u:rmc@9/2", 1)
+!x59("DRINTX", 99, "!u:r@16/1,ft@21,fb@11,!u:rmc@9/2", 1)
+!x63("DRINTXQ", 99, "!u:r@16/1,ft@21e,fb@11e,!u:rmc@9/2", 1)
+!x59("DRINTN", 227, "!u:r@16/1,ft@21,fb@11,!u:rmc@9/2", 1)
+!x63("DRINTNQ", 227, "!u:r@16/1,ft@21e,fb@11e,!u:rmc@9/2", 1)
+/* conversion */
+!x59("DCTDP", 258, "ft@21,fb@11", 1)
+!x63("DCTQPQ", 258, "ft@21e,fb@11", 1)
+!x59("DRSP", 770, "ft@21,fb@11", 1)
+!x63("DRDPQ", 770, "ft@21e,fb@11e", 1)
+!x59("DCFFIX", 802, "ft@21,fb@11", 1)
+!x63("DCFFIXQ", 802, "ft@21e,fb@11", 1)
+!x59("DCTFIX", 290, "ft@21,fb@11", 1)
+!x63("DCTFIXQ", 290, "ft@21,fb@11e", 1)
+!xg("DCFFIXQQ", (63 << 26) | (994 << 1), "ft@21e,vb@11")
+!xg("DCTFIXQQ", (63 << 26) | (994 << 1) | (1 << 16), "vt@21,fb@11e")
+!x59("DDEDPD", 322, "!u:sp@19/2,ft@21,fb@11", 1)
+!x63("DDEDPDQ", 322, "!u:sp@19/2,ft@21e,fb@11e", 1)
+!x59("DENBCD", 834, "!u:s@20/1,ft@21,fb@11", 1)
+!x63("DENBCDQ", 834, "!u:s@20/1,ft@21e,fb@11e", 1)
+!x59("DXEX", 354, "ft@21,fb@11", 1)
+!x63("DXEXQ", 354, "ft@21,fb@11e", 1)
+!x59("DIEX", 866, "ft@21,fa@16,fb@11", 1)
+!x63("DIEXQ", 866, "ft@21e,fa@16,fb@11e", 1)
+!x59("DSCLI", 66, "ft@21,fa@16,!u:sh@10/6", 1)
+!x63("DSCLIQ", 66, "ft@21e,fa@16e,!u:sh@10/6", 1)
+!x59("DSCRI", 98, "ft@21,fa@16,!u:sh@10/6", 1)
+!x63("DSCRIQ", 98, "ft@21e,fa@16e,!u:sh@10/6", 1)
+
+/* ===================================================================
+/* Vector (VMX / AltiVec)
+/* =================================================================== */
+/* loads and stores (X form, op 31) */
+!def xvl(nm, xo) {
+!x31(nm, xo, "vt@21,ra@16,rb@11")
+}
+!def xvs(nm, xo) {
+!x31(nm, xo, "vs@21,ra@16,rb@11")
+}
+!xvl("LVX", 103)
+!xvl("LVXL", 359)
+!xvl("LVEBX", 7)
+!xvl("LVEHX", 39)
+!xvl("LVEWX", 71)
+!xvl("LVSL", 6)
+!xvl("LVSR", 38)
+!xvs("STVX", 231)
+!xvs("STVXL", 487)
+!xvs("STVEBX", 135)
+!xvs("STVEHX", 167)
+!xvs("STVEWX", 199)
+
+/* VX / VA / VC forms. The table value is the low 11 bits of the word
+/* (VX: XO, VA: vc<<6|XO with vc = 0, VC: Rc<<10|XO), as the GNU
+/* assembler's own opcode table lists them. */
+!x4("VADDUBM", 0, "vt@21,va@16,vb@11")
+!x4("VMUL10CUQ", 1, "vt@21,va@16")
+!x4("VMAXUB", 2, "vt@21,va@16,vb@11")
+!x4("VRLB", 4, "vt@21,va@16,vb@11")
+!x4("VRLQ", 5, "vt@21,va@16,vb@11")
+!x4("VCMPEQUB", 6, "vt@21,va@16,vb@11")
+!x4("VCMPNEB", 7, "vt@21,va@16,vb@11")
+!x4("VMULOUB", 8, "vt@21,va@16,vb@11")
+!x4("VADDFP", 10, "vt@21,va@16,vb@11")
+!x4("VDIVUQ", 11, "vt@21,va@16,vb@11")
+!x4("VMRGHB", 12, "vt@21,va@16,vb@11")
+!x4("VPKUHUM", 14, "vt@21,va@16,vb@11")
+!x4("VINSBVLX", 15, "vt@21,ra@16,vb@11")
+!x4("VSLDBI", 22, "vt@21,va@16,vb@11,!u:sh@6/3")
+!x4("VMSUMCUD", 23, "vt@21,va@16,vb@11,vc@6")
+!x4("VEXTDUBVLX", 24, "vt@21,va@16,vb@11,rc@6")
+!x4("VEXTDUBVRX", 25, "vt@21,va@16,vb@11,rc@6")
+!x4("VEXTDUHVLX", 26, "vt@21,va@16,vb@11,rc@6")
+!x4("VEXTDUHVRX", 27, "vt@21,va@16,vb@11,rc@6")
+!x4("VEXTDUWVLX", 28, "vt@21,va@16,vb@11,rc@6")
+!x4("VEXTDUWVRX", 29, "vt@21,va@16,vb@11,rc@6")
+!x4("VEXTDDVLX", 30, "vt@21,va@16,vb@11,rc@6")
+!x4("VEXTDDVRX", 31, "vt@21,va@16,vb@11,rc@6")
+!x4("VMHADDSHS", 32, "vt@21,va@16,vb@11,vc@6")
+!x4("VMHRADDSHS", 33, "vt@21,va@16,vb@11,vc@6")
+!x4("VMLADDUHM", 34, "vt@21,va@16,vb@11,vc@6")
+!x4("VMSUMUDM", 35, "vt@21,va@16,vb@11,vc@6")
+!x4("VMSUMUBM", 36, "vt@21,va@16,vb@11,vc@6")
+!x4("VMSUMMBM", 37, "vt@21,va@16,vb@11,vc@6")
+!x4("VMSUMUHM", 38, "vt@21,va@16,vb@11,vc@6")
+!x4("VMSUMUHS", 39, "vt@21,va@16,vb@11,vc@6")
+!x4("VMSUMSHM", 40, "vt@21,va@16,vb@11,vc@6")
+!x4("VMSUMSHS", 41, "vt@21,va@16,vb@11,vc@6")
+!x4("VSEL", 42, "vt@21,va@16,vb@11,vc@6")
+!x4("VPERM", 43, "vt@21,va@16,vb@11,vc@6")
+!x4("VSLDOI", 44, "vt@21,va@16,vb@11,!u:shb@6/4")
+!x4("VPERMXOR", 45, "vt@21,va@16,vb@11,vc@6")
+!x4("VMADDFP", 46, "vt@21,va@16,vc@6,vb@11")
+!x4("VNMSUBFP", 47, "vt@21,va@16,vc@6,vb@11")
+!x4("VPERMR", 59, "vt@21,va@16,vb@11,vc@6")
+!x4("VADDEUQM", 60, "vt@21,va@16,vb@11,vc@6")
+!x4("VADDECUQ", 61, "vt@21,va@16,vb@11,vc@6")
+!x4("VSUBEUQM", 62, "vt@21,va@16,vb@11,vc@6")
+!x4("VSUBECUQ", 63, "vt@21,va@16,vb@11,vc@6")
+!x4("VADDUHM", 64, "vt@21,va@16,vb@11")
+!x4("VMUL10ECUQ", 65, "vt@21,va@16,vb@11")
+!x4("VMAXUH", 66, "vt@21,va@16,vb@11")
+!x4("VRLH", 68, "vt@21,va@16,vb@11")
+!x4("VRLQMI", 69, "vt@21,va@16,vb@11")
+!x4("VCMPEQUH", 70, "vt@21,va@16,vb@11")
+!x4("VCMPNEH", 71, "vt@21,va@16,vb@11")
+!x4("VMULOUH", 72, "vt@21,va@16,vb@11")
+!x4("VSUBFP", 74, "vt@21,va@16,vb@11")
+!x4("VMRGHH", 76, "vt@21,va@16,vb@11")
+!x4("VPKUWUM", 78, "vt@21,va@16,vb@11")
+!x4("VINSHVLX", 79, "vt@21,ra@16,vb@11")
+!x4("VADDUWM", 128, "vt@21,va@16,vb@11")
+!x4("VMAXUW", 130, "vt@21,va@16,vb@11")
+!x4("VRLW", 132, "vt@21,va@16,vb@11")
+!x4("VRLWMI", 133, "vt@21,va@16,vb@11")
+!x4("VCMPEQUW", 134, "vt@21,va@16,vb@11")
+!x4("VCMPNEW", 135, "vt@21,va@16,vb@11")
+!x4("VMULOUW", 136, "vt@21,va@16,vb@11")
+!x4("VMULUWM", 137, "vt@21,va@16,vb@11")
+!x4("VDIVUW", 139, "vt@21,va@16,vb@11")
+!x4("VMRGHW", 140, "vt@21,va@16,vb@11")
+!x4("VPKUHUS", 142, "vt@21,va@16,vb@11")
+!x4("VINSWVLX", 143, "vt@21,ra@16,vb@11")
+!x4("VADDUDM", 192, "vt@21,va@16,vb@11")
+!x4("VMAXUD", 194, "vt@21,va@16,vb@11")
+!x4("VRLD", 196, "vt@21,va@16,vb@11")
+!x4("VRLDMI", 197, "vt@21,va@16,vb@11")
+!x4("VCMPEQFP", 198, "vt@21,va@16,vb@11")
+!x4("VCMPEQUD", 199, "vt@21,va@16,vb@11")
+!x4("VMULOUD", 200, "vt@21,va@16,vb@11")
+!x4("VDIVUD", 203, "vt@21,va@16,vb@11")
+!x4("VPKUWUS", 206, "vt@21,va@16,vb@11")
+!x4("VINSW", 207, "vt@21,rb@11,!u:uim@16/4")
+!x4("VADDUQM", 256, "vt@21,va@16,vb@11")
+!x4("VCMPUQ", 257, "bf@23,va@16,vb@11")
+!x4("VMAXSB", 258, "vt@21,va@16,vb@11")
+!x4("VSLB", 260, "vt@21,va@16,vb@11")
+!x4("VSLQ", 261, "vt@21,va@16,vb@11")
+!x4("VCMPNEZB", 263, "vt@21,va@16,vb@11")
+!x4("VMULOSB", 264, "vt@21,va@16,vb@11")
+!x4("VREFP", 266, "vt@21,vb@11")
+!x4("VDIVSQ", 267, "vt@21,va@16,vb@11")
+!x4("VMRGLB", 268, "vt@21,va@16,vb@11")
+!x4("VPKSHUS", 270, "vt@21,va@16,vb@11")
+!x4("VINSBVRX", 271, "vt@21,ra@16,vb@11")
+!x4("VADDCUQ", 320, "vt@21,va@16,vb@11")
+!x4("VCMPSQ", 321, "bf@23,va@16,vb@11")
+!x4("VMAXSH", 322, "vt@21,va@16,vb@11")
+!x4("VSLH", 324, "vt@21,va@16,vb@11")
+!x4("VRLQNM", 325, "vt@21,va@16,vb@11")
+!x4("VCMPNEZH", 327, "vt@21,va@16,vb@11")
+!x4("VMULOSH", 328, "vt@21,va@16,vb@11")
+!x4("VRSQRTEFP", 330, "vt@21,vb@11")
+!x4("VMRGLH", 332, "vt@21,va@16,vb@11")
+!x4("VPKSWUS", 334, "vt@21,va@16,vb@11")
+!x4("VINSHVRX", 335, "vt@21,ra@16,vb@11")
+!x4("VADDCUW", 384, "vt@21,va@16,vb@11")
+!x4("VMAXSW", 386, "vt@21,va@16,vb@11")
+!x4("VSLW", 388, "vt@21,va@16,vb@11")
+!x4("VRLWNM", 389, "vt@21,va@16,vb@11")
+!x4("VCMPNEZW", 391, "vt@21,va@16,vb@11")
+!x4("VMULOSW", 392, "vt@21,va@16,vb@11")
+!x4("VEXPTEFP", 394, "vt@21,vb@11")
+!x4("VDIVSW", 395, "vt@21,va@16,vb@11")
+!x4("VMRGLW", 396, "vt@21,va@16,vb@11")
+!x4("VCLRLB", 397, "vt@21,va@16,rb@11")
+!x4("VPKSHSS", 398, "vt@21,va@16,vb@11")
+!x4("VINSWVRX", 399, "vt@21,ra@16,vb@11")
+!x4("VMAXSD", 450, "vt@21,va@16,vb@11")
+!x4("VSL", 452, "vt@21,va@16,vb@11")
+!x4("VRLDNM", 453, "vt@21,va@16,vb@11")
+!x4("VCMPGEFP", 454, "vt@21,va@16,vb@11")
+!x4("VCMPEQUQ", 455, "vt@21,va@16,vb@11")
+!x4("VMULOSD", 456, "vt@21,va@16,vb@11")
+!x4("VMULLD", 457, "vt@21,va@16,vb@11")
+!x4("VLOGEFP", 458, "vt@21,vb@11")
+!x4("VDIVSD", 459, "vt@21,va@16,vb@11")
+!x4("VCLRRB", 461, "vt@21,va@16,rb@11")
+!x4("VPKSWSS", 462, "vt@21,va@16,vb@11")
+!x4("VINSD", 463, "vt@21,rb@11,!u:uim@16/4")
+!x4("VADDUBS", 512, "vt@21,va@16,vb@11")
+!x4("VMUL10UQ", 513, "vt@21,va@16")
+!x4("VMINUB", 514, "vt@21,va@16,vb@11")
+!x4("VSRB", 516, "vt@21,va@16,vb@11")
+!x4("VSRQ", 517, "vt@21,va@16,vb@11")
+!x4("VCMPGTUB", 518, "vt@21,va@16,vb@11")
+!x4("VMULEUB", 520, "vt@21,va@16,vb@11")
+!x4("VRFIN", 522, "vt@21,vb@11")
+!x4("VDIVEUQ", 523, "vt@21,va@16,vb@11")
+!x4("VSPLTB", 524, "vt@21,vb@11,!u:uim@16/4")
+!x4("VEXTRACTUB", 525, "vt@21,vb@11,!u:uim@16/4")
+!x4("VUPKHSB", 526, "vt@21,vb@11")
+!x4("VINSBLX", 527, "vt@21,ra@16,rb@11")
+!x4("VSRDBI", 534, "vt@21,va@16,vb@11,!u:sh@6/3")
+!x4("VADDUHS", 576, "vt@21,va@16,vb@11")
+!x4("VMUL10EUQ", 577, "vt@21,va@16,vb@11")
+!x4("VMINUH", 578, "vt@21,va@16,vb@11")
+!x4("VSRH", 580, "vt@21,va@16,vb@11")
+!x4("VCMPGTUH", 582, "vt@21,va@16,vb@11")
+!x4("VMULEUH", 584, "vt@21,va@16,vb@11")
+!x4("VRFIZ", 586, "vt@21,vb@11")
+!x4("VSPLTH", 588, "vt@21,vb@11,!u:uim@16/3")
+!x4("VEXTRACTUH", 589, "vt@21,vb@11,!u:uim@16/4")
+!x4("VUPKHSH", 590, "vt@21,vb@11")
+!x4("VINSHLX", 591, "vt@21,ra@16,rb@11")
+!x4("VADDUWS", 640, "vt@21,va@16,vb@11")
+!x4("VMINUW", 642, "vt@21,va@16,vb@11")
+!x4("VSRW", 644, "vt@21,va@16,vb@11")
+!x4("VCMPGTUW", 646, "vt@21,va@16,vb@11")
+!x4("VCMPGTUQ", 647, "vt@21,va@16,vb@11")
+!x4("VMULEUW", 648, "vt@21,va@16,vb@11")
+!x4("VMULHUW", 649, "vt@21,va@16,vb@11")
+!x4("VRFIP", 650, "vt@21,vb@11")
+!x4("VDIVEUW", 651, "vt@21,va@16,vb@11")
+!x4("VSPLTW", 652, "vt@21,vb@11,!u:uim@16/2")
+!x4("VEXTRACTUW", 653, "vt@21,vb@11,!u:uim@16/4")
+!x4("VUPKLSB", 654, "vt@21,vb@11")
+!x4("VINSWLX", 655, "vt@21,ra@16,rb@11")
+!x4("VMINUD", 706, "vt@21,va@16,vb@11")
+!x4("VSR", 708, "vt@21,va@16,vb@11")
+!x4("VCMPGTFP", 710, "vt@21,va@16,vb@11")
+!x4("VCMPGTUD", 711, "vt@21,va@16,vb@11")
+!x4("VMULEUD", 712, "vt@21,va@16,vb@11")
+!x4("VMULHUD", 713, "vt@21,va@16,vb@11")
+!x4("VRFIM", 714, "vt@21,vb@11")
+!x4("VDIVEUD", 715, "vt@21,va@16,vb@11")
+!x4("VEXTRACTD", 717, "vt@21,vb@11,!u:uim@16/4")
+!x4("VUPKLSH", 718, "vt@21,vb@11")
+!x4("VINSDLX", 719, "vt@21,ra@16,rb@11")
+!x4("VADDSBS", 768, "vt@21,va@16,vb@11")
+!x4("VMINSB", 770, "vt@21,va@16,vb@11")
+!x4("VSRAB", 772, "vt@21,va@16,vb@11")
+!x4("VSRAQ", 773, "vt@21,va@16,vb@11")
+!x4("VCMPGTSB", 774, "vt@21,va@16,vb@11")
+!x4("VMULESB", 776, "vt@21,va@16,vb@11")
+!x4("VCFUX", 778, "vt@21,vb@11,!u:uim@16/5")
+!x4("VDIVESQ", 779, "vt@21,va@16,vb@11")
+!x4("VSPLTISB", 780, "vt@21,!s:sim@16/5")
+!x4("VINSERTB", 781, "vt@21,vb@11,!u:uim@16/4")
+!x4("VPKPX", 782, "vt@21,va@16,vb@11")
+!x4("VINSBRX", 783, "vt@21,ra@16,rb@11")
+!x4("VADDSHS", 832, "vt@21,va@16,vb@11")
+!x4("VMINSH", 834, "vt@21,va@16,vb@11")
+!x4("VSRAH", 836, "vt@21,va@16,vb@11")
+!x4("VCMPGTSH", 838, "vt@21,va@16,vb@11")
+!x4("VMULESH", 840, "vt@21,va@16,vb@11")
+!x4("VCFSX", 842, "vt@21,vb@11,!u:uim@16/5")
+!x4("VSPLTISH", 844, "vt@21,!s:sim@16/5")
+!x4("VINSERTH", 845, "vt@21,vb@11,!u:uim@16/4")
+!x4("VUPKHPX", 846, "vt@21,vb@11")
+!x4("VINSHRX", 847, "vt@21,ra@16,rb@11")
+!x4("VADDSWS", 896, "vt@21,va@16,vb@11")
+!x4("VMINSW", 898, "vt@21,va@16,vb@11")
+!x4("VSRAW", 900, "vt@21,va@16,vb@11")
+!x4("VCMPGTSW", 902, "vt@21,va@16,vb@11")
+!x4("VCMPGTSQ", 903, "vt@21,va@16,vb@11")
+!x4("VMULESW", 904, "vt@21,va@16,vb@11")
+!x4("VMULHSW", 905, "vt@21,va@16,vb@11")
+!x4("VCTUXS", 906, "vt@21,vb@11,!u:uim@16/5")
+!x4("VDIVESW", 907, "vt@21,va@16,vb@11")
+!x4("VSPLTISW", 908, "vt@21,!s:sim@16/5")
+!x4("VINSERTW", 909, "vt@21,vb@11,!u:uim@16/4")
+!x4("VINSWRX", 911, "vt@21,ra@16,rb@11")
+!x4("VMINSD", 962, "vt@21,va@16,vb@11")
+!x4("VSRAD", 964, "vt@21,va@16,vb@11")
+!x4("VCMPBFP", 966, "vt@21,va@16,vb@11")
+!x4("VCMPGTSD", 967, "vt@21,va@16,vb@11")
+!x4("VMULESD", 968, "vt@21,va@16,vb@11")
+!x4("VMULHSD", 969, "vt@21,va@16,vb@11")
+!x4("VCTSXS", 970, "vt@21,vb@11,!u:uim@16/5")
+!x4("VDIVESD", 971, "vt@21,va@16,vb@11")
+!x4("VINSERTD", 973, "vt@21,vb@11,!u:uim@16/4")
+!x4("VUPKLPX", 974, "vt@21,vb@11")
+!x4("VINSDRX", 975, "vt@21,ra@16,rb@11")
+!x4("VSUBUBM", 1024, "vt@21,va@16,vb@11")
+!x4("BCDADD.", 1025, "vt@21,va@16,vb@11,!u:ps@9/1")
+!x4("VAVGUB", 1026, "vt@21,va@16,vb@11")
+!x4("VABSDUB", 1027, "vt@21,va@16,vb@11")
+!x4("VAND", 1028, "vt@21,va@16,vb@11")
+!x4("VCMPEQUB.", 1030, "vt@21,va@16,vb@11")
+!x4("VCMPNEB.", 1031, "vt@21,va@16,vb@11")
+!x4("VPMSUMB", 1032, "vt@21,va@16,vb@11")
+!x4("VMAXFP", 1034, "vt@21,va@16,vb@11")
+!x4("VSLO", 1036, "vt@21,va@16,vb@11")
+!x4("VSUBUHM", 1088, "vt@21,va@16,vb@11")
+!x4("BCDSUB.", 1089, "vt@21,va@16,vb@11,!u:ps@9/1")
+!x4("VAVGUH", 1090, "vt@21,va@16,vb@11")
+!x4("VABSDUH", 1091, "vt@21,va@16,vb@11")
+!x4("VANDC", 1092, "vt@21,va@16,vb@11")
+!x4("VCMPEQUH.", 1094, "vt@21,va@16,vb@11")
+!x4("VCMPNEH.", 1095, "vt@21,va@16,vb@11")
+!x4("VPMSUMH", 1096, "vt@21,va@16,vb@11")
+!x4("VMINFP", 1098, "vt@21,va@16,vb@11")
+!x4("VSRO", 1100, "vt@21,va@16,vb@11")
+!x4("VPKUDUM", 1102, "vt@21,va@16,vb@11")
+!x4("VSUBUWM", 1152, "vt@21,va@16,vb@11")
+!x4("BCDUS.", 1153, "vt@21,va@16,vb@11")
+!x4("VAVGUW", 1154, "vt@21,va@16,vb@11")
+!x4("VABSDUW", 1155, "vt@21,va@16,vb@11")
+!x4("VOR", 1156, "vt@21,va@16,vb@11")
+!x4("VCMPEQUW.", 1158, "vt@21,va@16,vb@11")
+!x4("VCMPNEW.", 1159, "vt@21,va@16,vb@11")
+!x4("VPMSUMW", 1160, "vt@21,va@16,vb@11")
+!x4("VSUBUDM", 1216, "vt@21,va@16,vb@11")
+!x4("BCDS.", 1217, "vt@21,va@16,vb@11,!u:ps@9/1")
+!x4("VXOR", 1220, "vt@21,va@16,vb@11")
+!x4("VCMPEQFP.", 1222, "vt@21,va@16,vb@11")
+!x4("VCMPEQUD.", 1223, "vt@21,va@16,vb@11")
+!x4("VPMSUMD", 1224, "vt@21,va@16,vb@11")
+!x4("VGNB", 1228, "rt@21,vb@11,!u:n@16/3")
+!x4("VPKUDUS", 1230, "vt@21,va@16,vb@11")
+!x4("VSUBUQM", 1280, "vt@21,va@16,vb@11")
+!x4("BCDTRUNC.", 1281, "vt@21,va@16,vb@11,!u:ps@9/1")
+!x4("VAVGSB", 1282, "vt@21,va@16,vb@11")
+!x4("VNOR", 1284, "vt@21,va@16,vb@11")
+!x4("VCMPNEZB.", 1287, "vt@21,va@16,vb@11")
+!x4("VCIPHER", 1288, "vt@21,va@16,vb@11")
+!x4("VCIPHERLAST", 1289, "vt@21,va@16,vb@11")
+!x4("VGBBD", 1292, "vt@21,vb@11")
+!x4("VSUBCUQ", 1344, "vt@21,va@16,vb@11")
+!x4("BCDUTRUNC.", 1345, "vt@21,va@16,vb@11")
+!x4("VAVGSH", 1346, "vt@21,va@16,vb@11")
+!x4("VORC", 1348, "vt@21,va@16,vb@11")
+!x4("VCMPNEZH.", 1351, "vt@21,va@16,vb@11")
+!x4("VNCIPHER", 1352, "vt@21,va@16,vb@11")
+!x4("VNCIPHERLAST", 1353, "vt@21,va@16,vb@11")
+!x4("VBPERMQ", 1356, "vt@21,va@16,vb@11")
+!x4("VCFUGED", 1357, "vt@21,va@16,vb@11")
+!x4("VPKSDUS", 1358, "vt@21,va@16,vb@11")
+!x4("VSUBCUW", 1408, "vt@21,va@16,vb@11")
+!x4("VAVGSW", 1410, "vt@21,va@16,vb@11")
+!x4("VNAND", 1412, "vt@21,va@16,vb@11")
+!x4("VCMPNEZW.", 1415, "vt@21,va@16,vb@11")
+!x4("VPEXTD", 1421, "vt@21,va@16,vb@11")
+!x4("BCDSR.", 1473, "vt@21,va@16,vb@11,!u:ps@9/1")
+!x4("VSLD", 1476, "vt@21,va@16,vb@11")
+!x4("VCMPGEFP.", 1478, "vt@21,va@16,vb@11")
+!x4("VCMPEQUQ.", 1479, "vt@21,va@16,vb@11")
+!x4("VSBOX", 1480, "vt@21,va@16")
+!x4("VBPERMD", 1484, "vt@21,va@16,vb@11")
+!x4("VPDEPD", 1485, "vt@21,va@16,vb@11")
+!x4("VPKSDSS", 1486, "vt@21,va@16,vb@11")
+!x4("VSUBUBS", 1536, "vt@21,va@16,vb@11")
+!x4("MFVSCR", 1540, "vt@21")
+!x4("VCMPGTUB.", 1542, "vt@21,va@16,vb@11")
+!x4("VSUM4UBS", 1544, "vt@21,va@16,vb@11")
+!x4("VMODUQ", 1547, "vt@21,va@16,vb@11")
+!x4("VEXTUBLX", 1549, "rt@21,ra@16,vb@11")
+!x4("VSUBUHS", 1600, "vt@21,va@16,vb@11")
+!x4("MTVSCR", 1604, "vb@11")
+!x4("VCMPGTUH.", 1606, "vt@21,va@16,vb@11")
+!x4("VSUM4SHS", 1608, "vt@21,va@16,vb@11")
+!x4("VEXTUHLX", 1613, "rt@21,ra@16,vb@11")
+!x4("VUPKHSW", 1614, "vt@21,vb@11")
+!x4("VSUBUWS", 1664, "vt@21,va@16,vb@11")
+!x4("VEQV", 1668, "vt@21,va@16,vb@11")
+!x4("VCMPGTUW.", 1670, "vt@21,va@16,vb@11")
+!x4("VCMPGTUQ.", 1671, "vt@21,va@16,vb@11")
+!x4("VSUM2SWS", 1672, "vt@21,va@16,vb@11")
+!x4("VMODUW", 1675, "vt@21,va@16,vb@11")
+!x4("VMRGOW", 1676, "vt@21,va@16,vb@11")
+!x4("VEXTUWLX", 1677, "rt@21,ra@16,vb@11")
+!x4("VSRD", 1732, "vt@21,va@16,vb@11")
+!x4("VCMPGTFP.", 1734, "vt@21,va@16,vb@11")
+!x4("VCMPGTUD.", 1735, "vt@21,va@16,vb@11")
+!x4("VMODUD", 1739, "vt@21,va@16,vb@11")
+!x4("VUPKLSW", 1742, "vt@21,vb@11")
+!x4("VSUBSBS", 1792, "vt@21,va@16,vb@11")
+!x4("VCLZB", 1794, "vt@21,vb@11")
+!x4("VPOPCNTB", 1795, "vt@21,vb@11")
+!x4("VSRV", 1796, "vt@21,va@16,vb@11")
+!x4("VCMPGTSB.", 1798, "vt@21,va@16,vb@11")
+!x4("VSUM4SBS", 1800, "vt@21,va@16,vb@11")
+!x4("VMODSQ", 1803, "vt@21,va@16,vb@11")
+!x4("VEXTUBRX", 1805, "rt@21,ra@16,vb@11")
+!x4("VSUBSHS", 1856, "vt@21,va@16,vb@11")
+!x4("VCLZH", 1858, "vt@21,vb@11")
+!x4("VPOPCNTH", 1859, "vt@21,vb@11")
+!x4("VSLV", 1860, "vt@21,va@16,vb@11")
+!x4("VCMPGTSH.", 1862, "vt@21,va@16,vb@11")
+!x4("VEXTUHRX", 1869, "rt@21,ra@16,vb@11")
+!x4("VSUBSWS", 1920, "vt@21,va@16,vb@11")
+!x4("VCLZW", 1922, "vt@21,vb@11")
+!x4("VPOPCNTW", 1923, "vt@21,vb@11")
+!x4("VCLZDM", 1924, "vt@21,va@16,vb@11")
+!x4("VCMPGTSW.", 1926, "vt@21,va@16,vb@11")
+!x4("VCMPGTSQ.", 1927, "vt@21,va@16,vb@11")
+!x4("VSUMSWS", 1928, "vt@21,va@16,vb@11")
+!x4("VMODSW", 1931, "vt@21,va@16,vb@11")
+!x4("VMRGEW", 1932, "vt@21,va@16,vb@11")
+!x4("VEXTUWRX", 1933, "rt@21,ra@16,vb@11")
+!x4("VCLZD", 1986, "vt@21,vb@11")
+!x4("VPOPCNTD", 1987, "vt@21,vb@11")
+!x4("VCTZDM", 1988, "vt@21,va@16,vb@11")
+!x4("VCMPBFP.", 1990, "vt@21,va@16,vb@11")
+!x4("VCMPGTSD.", 1991, "vt@21,va@16,vb@11")
+!x4("VMODSD", 1995, "vt@21,va@16,vb@11")
+/* the forms whose VA field selects the operation */
+!def vsel1(nm, xo, s, spec) {
+!xg(nm, (4 << 26) | (s << 16) | xo, spec)
+}
+!vsel1("VCLZLSBB", 1538, 0, "rt@21,vb@11")
+!vsel1("VCTZLSBB", 1538, 1, "rt@21,vb@11")
+!vsel1("VNEGW", 1538, 6, "vt@21,vb@11")
+!vsel1("VNEGD", 1538, 7, "vt@21,vb@11")
+!vsel1("VPRTYBW", 1538, 8, "vt@21,vb@11")
+!vsel1("VPRTYBD", 1538, 9, "vt@21,vb@11")
+!vsel1("VPRTYBQ", 1538, 10, "vt@21,vb@11")
+!vsel1("VEXTSB2W", 1538, 16, "vt@21,vb@11")
+!vsel1("VEXTSH2W", 1538, 17, "vt@21,vb@11")
+!vsel1("VEXTSB2D", 1538, 24, "vt@21,vb@11")
+!vsel1("VEXTSH2D", 1538, 25, "vt@21,vb@11")
+!vsel1("VEXTSW2D", 1538, 26, "vt@21,vb@11")
+!vsel1("VEXTSD2Q", 1538, 27, "vt@21,vb@11")
+!vsel1("VCTZB", 1538, 28, "vt@21,vb@11")
+!vsel1("VCTZH", 1538, 29, "vt@21,vb@11")
+!vsel1("VCTZW", 1538, 30, "vt@21,vb@11")
+!vsel1("VCTZD", 1538, 31, "vt@21,vb@11")
+!vsel1("VEXPANDBM", 1602, 0, "vt@21,vb@11")
+!vsel1("VEXPANDHM", 1602, 1, "vt@21,vb@11")
+!vsel1("VEXPANDWM", 1602, 2, "vt@21,vb@11")
+!vsel1("VEXPANDDM", 1602, 3, "vt@21,vb@11")
+!vsel1("VEXPANDQM", 1602, 4, "vt@21,vb@11")
+!vsel1("VEXTRACTBM", 1602, 8, "rt@21,vb@11")
+!vsel1("VEXTRACTHM", 1602, 9, "rt@21,vb@11")
+!vsel1("VEXTRACTWM", 1602, 10, "rt@21,vb@11")
+!vsel1("VEXTRACTDM", 1602, 11, "rt@21,vb@11")
+!vsel1("VEXTRACTQM", 1602, 12, "rt@21,vb@11")
+!vsel1("MTVSRBM", 1602, 16, "vt@21,rb@11")
+!vsel1("MTVSRHM", 1602, 17, "vt@21,rb@11")
+!vsel1("MTVSRWM", 1602, 18, "vt@21,rb@11")
+!vsel1("MTVSRDM", 1602, 19, "vt@21,rb@11")
+!vsel1("MTVSRQM", 1602, 20, "vt@21,rb@11")
+!vsel1("VCNTMBB", 1602, 24, "rt@21,vb@11,!u:mp@16/1")
+!vsel1("VCNTMBH", 1602, 26, "rt@21,vb@11,!u:mp@16/1")
+!vsel1("VCNTMBW", 1602, 28, "rt@21,vb@11,!u:mp@16/1")
+!vsel1("VCNTMBD", 1602, 30, "rt@21,vb@11,!u:mp@16/1")
+!vsel1("VSTRIBL", 13, 0, "vt@21,vb@11")
+!vsel1("VSTRIBR", 13, 1, "vt@21,vb@11")
+!vsel1("VSTRIHL", 13, 2, "vt@21,vb@11")
+!vsel1("VSTRIHR", 13, 3, "vt@21,vb@11")
+!vsel1("VSTRIBL.", 1037, 0, "vt@21,vb@11")
+!vsel1("VSTRIBR.", 1037, 1, "vt@21,vb@11")
+!vsel1("VSTRIHL.", 1037, 2, "vt@21,vb@11")
+!vsel1("VSTRIHR.", 1037, 3, "vt@21,vb@11")
+!vsel1("BCDCTSQ.", 1409, 0, "vt@21,vb@11")
+!vsel1("BCDCFSQ.", 1409, 2, "vt@21,vb@11,!u:ps@9/1")
+!vsel1("BCDCTZ.", 1409, 4, "vt@21,vb@11,!u:ps@9/1")
+!vsel1("BCDCTN.", 1409, 5, "vt@21,vb@11")
+!vsel1("BCDCFZ.", 1409, 6, "vt@21,vb@11,!u:ps@9/1")
+!vsel1("BCDCFN.", 1409, 7, "vt@21,vb@11,!u:ps@9/1")
+!vsel1("BCDSETSGN.", 1409, 31, "vt@21,vb@11,!u:ps@9/1")
+/* SHA-2 sigma: ST at 15, SIX at 11 */
+!x4("VSHASIGMAW", 1666, "vt@21,va@16,!u:st@15/1,!u:six@11/4")
+!x4("VSHASIGMAD", 1730, "vt@21,va@16,!u:st@15/1,!u:six@11/4")
+/* mtvsrbmi: DX form, b0 at 6 (10 bits), b1 at 16 (5 bits), b2 at 0 */
+MTVSRBMI vt,!b ::b<0;3,b>65535;3 :: .call w4(0x10000014|(vt<<21)|(((b>>6)&0x3ff)<<6)|(((b>>1)&31)<<16)|(b&1))
+/* vector string/BCD aliases GNU accepts */
+VMR vt,va :: .call w4(0x10000484|(vt<<21)|(va<<16)|(va<<11))
+VNOT vt,va :: .call w4(0x10000504|(vt<<21)|(va<<16)|(va<<11))
+
+/* ===================================================================
+/* VSX
+/* =================================================================== */
+/* XX1 loads and stores: T/S split, TX at bit 0 */
+!def xxl(nm, xo) {
+!x31(nm, xo, "xt@21+0,ra@16,rb@11")
+}
+!def xxs(nm, xo) {
+!x31(nm, xo, "xs@21+0,ra@16,rb@11")
+}
+!xxl("LXSDX", 588)
+!xxl("LXSIWAX", 76)
+!xxl("LXSIWZX", 12)
+!xxl("LXSSPX", 524)
+!xxl("LXVD2X", 844)
+!xxl("LXVDSX", 332)
+!xxl("LXVW4X", 780)
+!xxl("LXVH8X", 812)
+!xxl("LXVB16X", 876)
+!xxl("LXVX", 268)
+!xxl("LXVWSX", 364)
+!xxl("LXSIBZX", 781)
+!xxl("LXSIHZX", 813)
+!xxl("LXVL", 269)
+!xxl("LXVLL", 301)
+!xxl("LXVRBX", 13)
+!xxl("LXVRHX", 45)
+!xxl("LXVRWX", 77)
+!xxl("LXVRDX", 109)
+!xxs("STXSDX", 716)
+!xxs("STXSIWX", 140)
+!xxs("STXSSPX", 652)
+!xxs("STXVD2X", 972)
+!xxs("STXVW4X", 908)
+!xxs("STXVH8X", 940)
+!xxs("STXVB16X", 1004)
+!xxs("STXVX", 396)
+!xxs("STXSIBX", 909)
+!xxs("STXSIHX", 941)
+!xxs("STXVL", 397)
+!xxs("STXVLL", 429)
+!xxs("STXVRBX", 141)
+!xxs("STXVRHX", 173)
+!xxs("STXVRWX", 205)
+!xxs("STXVRDX", 237)
+/* paired vector load/store: XTp = 32*TX + 2*Tp, even */
+LXVPX xt,ra,rb ::(xt&1)!=0;5 :: .call w4(0x7c00029a|(((xt>>1)&15)<<22)|(((xt>>5)&1)<<21)|(ra<<16)|(rb<<11))
+STXVPX xs,ra,rb ::(xs&1)!=0;5 :: .call w4(0x7c00039a|(((xs>>1)&15)<<22)|(((xs>>5)&1)<<21)|(ra<<16)|(rb<<11))
+.reloc::d::addr16_ds
+LXVP xt,!d(ra) ::(xt&1)!=0;5,d<-32768;8,d>32767;8,(d&15)!=0;8 :: .call w4(0x18000000|(((xt>>1)&15)<<22)|(((xt>>5)&1)<<21)|(ra<<16)|(d&0xfff0))
+.clrreloc::d
+.reloc::d::addr16_lo_ds
+LXVP xt,!d@L(ra) ::(xt&1)!=0;5,(d&15)!=0;8 :: .call w4(0x18000000|(((xt>>1)&15)<<22)|(((xt>>5)&1)<<21)|(ra<<16)|(d&0xfff0))
+.clrreloc::d
+.reloc::d::addr16_ds
+STXVP xs,!d(ra) ::(xs&1)!=0;5,d<-32768;8,d>32767;8,(d&15)!=0;8 :: .call w4(0x18000001|(((xs>>1)&15)<<22)|(((xs>>5)&1)<<21)|(ra<<16)|(d&0xfff0))
+.clrreloc::d
+.reloc::d::addr16_lo_ds
+STXVP xs,!d@L(ra) ::(xs&1)!=0;5,(d&15)!=0;8 :: .call w4(0x18000001|(((xs>>1)&15)<<22)|(((xs>>5)&1)<<21)|(ra<<16)|(d&0xfff0))
+.clrreloc::d
+/* DS / DQ form VSX loads and stores (op 57 / 61) */
+!dsmem("LXSD", 57, 2, "vt")
+!dsmem("LXSSP", 57, 3, "vt")
+!dsmem("STXSD", 61, 2, "vs")
+!dsmem("STXSSP", 61, 3, "vs")
+.reloc::d::addr16_ds
+LXV xt,!d(ra) ::d<-32768;8,d>32767;8,(d&15)!=0;8 :: .call w4(0xf4000001|((xt&31)<<21)|(((xt>>5)&1)<<3)|(ra<<16)|(d&0xfff0))
+.clrreloc::d
+.reloc::d::addr16_lo_ds
+LXV xt,!d@L(ra) ::(d&15)!=0;8 :: .call w4(0xf4000001|((xt&31)<<21)|(((xt>>5)&1)<<3)|(ra<<16)|(d&0xfff0))
+.clrreloc::d
+LXV xt,(ra) :: .call w4(0xf4000001|((xt&31)<<21)|(((xt>>5)&1)<<3)|(ra<<16))
+.reloc::d::addr16_ds
+STXV xs,!d(ra) ::d<-32768;8,d>32767;8,(d&15)!=0;8 :: .call w4(0xf4000005|((xs&31)<<21)|(((xs>>5)&1)<<3)|(ra<<16)|(d&0xfff0))
+.clrreloc::d
+.reloc::d::addr16_lo_ds
+STXV xs,!d@L(ra) ::(d&15)!=0;8 :: .call w4(0xf4000005|((xs&31)<<21)|(((xs>>5)&1)<<3)|(ra<<16)|(d&0xfff0))
+.clrreloc::d
+STXV xs,(ra) :: .call w4(0xf4000005|((xs&31)<<21)|(((xs>>5)&1)<<3)|(ra<<16))
+/* moves between GPRs and VSRs (XX1) */
+!x31("MFVSRD", 51, "ra@16,xs@21+0")
+!x31("MFVSRWZ", 115, "ra@16,xs@21+0")
+!x31("MFVSRLD", 307, "ra@16,xs@21+0")
+!x31("MTVSRD", 179, "xt@21+0,ra@16")
+!x31("MTVSRWA", 211, "xt@21+0,ra@16")
+!x31("MTVSRWZ", 243, "xt@21+0,ra@16")
+!x31("MTVSRWS", 403, "xt@21+0,ra@16")
+!x31("MTVSRDD", 435, "xt@21+0,ra@16,rb@11")
+/* the FPR / VR spellings of the same moves */
+!x31("MFFPRD", 51, "ra@16,fs@21")
+!x31("MTFPRD", 179, "ft@21,ra@16")
+!xg("MFVRD", (31 << 26) | (51 << 1) | 1, "ra@16,vs@21")
+!xg("MTVRD", (31 << 26) | (179 << 1) | 1, "vt@21,ra@16")
+
+/* XX2 / XX3 / XX4 arithmetic, compare, convert, logical, permute */
+!x60("XSADDSP", 0, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSMADDASP", 8, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXSLDWI", 16, "xt@21+0,xa@16+2,xb@11+1,!u:shw@8/2")
+!x60("XSCMPEQDP", 24, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSRSQRTESP", 40, "xt@21+0,xb@11+1")
+!x60("XSSQRTSP", 44, "xt@21+0,xb@11+1")
+!x60("XXSEL", 48, "xt@21+0,xa@16+2,xb@11+1,xc@6+3")
+!x60("XSSUBSP", 64, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSMADDMSP", 72, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXPERMDI", 80, "xt@21+0,xa@16+2,xb@11+1,!u:dm@8/2")
+!x60("XSCMPGTDP", 88, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSRESP", 104, "xt@21+0,xb@11+1")
+!x60("XSMULSP", 128, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSMSUBASP", 136, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXMRGHW", 144, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSCMPGEDP", 152, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSDIVSP", 192, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSMSUBMSP", 200, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXPERM", 208, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSADDDP", 256, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSMADDADP", 264, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSCMPUDP", 280, "bf@23,xa@16+2,xb@11+1")
+!x60("XSCVDPUXWS", 288, "xt@21+0,xb@11+1")
+!x60("XSRDPI", 292, "xt@21+0,xb@11+1")
+!x60("XSRSQRTEDP", 296, "xt@21+0,xb@11+1")
+!x60("XSSQRTDP", 300, "xt@21+0,xb@11+1")
+!x60("XSSUBDP", 320, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSMADDMDP", 328, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSCMPODP", 344, "bf@23,xa@16+2,xb@11+1")
+!x60("XSCVDPSXWS", 352, "xt@21+0,xb@11+1")
+!x60("XSRDPIZ", 356, "xt@21+0,xb@11+1")
+!x60("XSREDP", 360, "xt@21+0,xb@11+1")
+!x60("XSMULDP", 384, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSMSUBADP", 392, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXMRGLW", 400, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSRDPIP", 420, "xt@21+0,xb@11+1")
+!x60("XSTSQRTDP", 424, "bf@23,xb@11+1")
+!x60("XSRDPIC", 428, "xt@21+0,xb@11+1")
+!x60("XSDIVDP", 448, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSMSUBMDP", 456, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXPERMR", 464, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSCMPEXPDP", 472, "bf@23,xa@16+2,xb@11+1")
+!x60("XSRDPIM", 484, "xt@21+0,xb@11+1")
+!x60("XSTDIVDP", 488, "bf@23,xa@16+2,xb@11+1")
+!x60("XVADDSP", 512, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVMADDASP", 520, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCMPEQSP", 536, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVSPUXWS", 544, "xt@21+0,xb@11+1")
+!x60("XVRSPI", 548, "xt@21+0,xb@11+1")
+!x60("XVRSQRTESP", 552, "xt@21+0,xb@11+1")
+!x60("XVSQRTSP", 556, "xt@21+0,xb@11+1")
+!x60("XVSUBSP", 576, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVMADDMSP", 584, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCMPGTSP", 600, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVSPSXWS", 608, "xt@21+0,xb@11+1")
+!x60("XVRSPIZ", 612, "xt@21+0,xb@11+1")
+!x60("XVRESP", 616, "xt@21+0,xb@11+1")
+!x60("XVMULSP", 640, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVMSUBASP", 648, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXSPLTW", 656, "xt@21+0,xb@11+1,!u:uim@16/2")
+!x60("XXEXTRACTUW", 660, "xt@21+0,xb@11+1,!u:uim@16/4")
+!x60("XVCMPGESP", 664, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVUXWSP", 672, "xt@21+0,xb@11+1")
+!x60("XVRSPIP", 676, "xt@21+0,xb@11+1")
+!x60("XVTSQRTSP", 680, "bf@23,xb@11+1")
+!x60("XVRSPIC", 684, "xt@21+0,xb@11+1")
+!x60("XVDIVSP", 704, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVMSUBMSP", 712, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXINSERTW", 724, "xt@21+0,xb@11+1,!u:uim@16/4")
+!x60("XVCVSXWSP", 736, "xt@21+0,xb@11+1")
+!x60("XVRSPIM", 740, "xt@21+0,xb@11+1")
+!x60("XVTDIVSP", 744, "bf@23,xa@16+2,xb@11+1")
+!x60("XVADDDP", 768, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVMADDADP", 776, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCMPEQDP", 792, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVDPUXWS", 800, "xt@21+0,xb@11+1")
+!x60("XVRDPI", 804, "xt@21+0,xb@11+1")
+!x60("XVRSQRTEDP", 808, "xt@21+0,xb@11+1")
+!x60("XVSQRTDP", 812, "xt@21+0,xb@11+1")
+!x60("XVSUBDP", 832, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVMADDMDP", 840, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCMPGTDP", 856, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVDPSXWS", 864, "xt@21+0,xb@11+1")
+!x60("XVRDPIZ", 868, "xt@21+0,xb@11+1")
+!x60("XVREDP", 872, "xt@21+0,xb@11+1")
+!x60("XVMULDP", 896, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVMSUBADP", 904, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCMPGEDP", 920, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVUXWDP", 928, "xt@21+0,xb@11+1")
+!x60("XVRDPIP", 932, "xt@21+0,xb@11+1")
+!x60("XVTSQRTDP", 936, "bf@23,xb@11+1")
+!x60("XVRDPIC", 940, "xt@21+0,xb@11+1")
+!x60("XVDIVDP", 960, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVMSUBMDP", 968, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVSXWDP", 992, "xt@21+0,xb@11+1")
+!x60("XVRDPIM", 996, "xt@21+0,xb@11+1")
+!x60("XVTDIVDP", 1000, "bf@23,xa@16+2,xb@11+1")
+!x60("XSMAXCDP", 1024, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSNMADDASP", 1032, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXLAND", 1040, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSCVDPSP", 1060, "xt@21+0,xb@11+1")
+!x60("XSCVDPSPN", 1068, "xt@21+0,xb@11+1")
+!x60("XSMINCDP", 1088, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSNMADDMSP", 1096, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXLANDC", 1104, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSRSP", 1124, "xt@21+0,xb@11+1")
+!x60("XSMAXJDP", 1152, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSNMSUBASP", 1160, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXLOR", 1168, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSCVUXDSP", 1184, "xt@21+0,xb@11+1")
+!x60("XSTSTDCSP", 1192, "bf@23,xb@11+1,!u:dcmx@16/7")
+!x60("XSMINJDP", 1216, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSNMSUBMSP", 1224, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXLXOR", 1232, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSCVSXDSP", 1248, "xt@21+0,xb@11+1")
+!x60("XSMAXDP", 1280, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSNMADDADP", 1288, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXLNOR", 1296, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSCVDPUXDS", 1312, "xt@21+0,xb@11+1")
+!x60("XSCVSPDP", 1316, "xt@21+0,xb@11+1")
+!x60("XSCVSPDPN", 1324, "xt@21+0,xb@11+1")
+!x60("XSMINDP", 1344, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSNMADDMDP", 1352, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXLORC", 1360, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSCVDPSXDS", 1376, "xt@21+0,xb@11+1")
+!x60("XSABSDP", 1380, "xt@21+0,xb@11+1")
+!x60("XSCPSGNDP", 1408, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSNMSUBADP", 1416, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXLNAND", 1424, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSCVUXDDP", 1440, "xt@21+0,xb@11+1")
+!x60("XSNABSDP", 1444, "xt@21+0,xb@11+1")
+!x60("XSTSTDCDP", 1448, "bf@23,xb@11+1,!u:dcmx@16/7")
+!x60("XSNMSUBMDP", 1480, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XXLEQV", 1488, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XSCVSXDDP", 1504, "xt@21+0,xb@11+1")
+!x60("XSNEGDP", 1508, "xt@21+0,xb@11+1")
+!x60("XVMAXSP", 1536, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVNMADDASP", 1544, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCMPEQSP.", 1560, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVSPUXDS", 1568, "xt@21+0,xb@11+1")
+!x60("XVCVDPSP", 1572, "xt@21+0,xb@11+1")
+!x60("XVMINSP", 1600, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVNMADDMSP", 1608, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCMPGTSP.", 1624, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVSPSXDS", 1632, "xt@21+0,xb@11+1")
+!x60("XVABSSP", 1636, "xt@21+0,xb@11+1")
+!x60("XVCPSGNSP", 1664, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVNMSUBASP", 1672, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCMPGESP.", 1688, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVUXDSP", 1696, "xt@21+0,xb@11+1")
+!x60("XVNABSSP", 1700, "xt@21+0,xb@11+1")
+!x60("XVIEXPSP", 1728, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVNMSUBMSP", 1736, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVSXDSP", 1760, "xt@21+0,xb@11+1")
+!x60("XVNEGSP", 1764, "xt@21+0,xb@11+1")
+!x60("XVMAXDP", 1792, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVNMADDADP", 1800, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCMPEQDP.", 1816, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVDPUXDS", 1824, "xt@21+0,xb@11+1")
+!x60("XVCVSPDP", 1828, "xt@21+0,xb@11+1")
+!x60("XXGENPCVBM", 1832, "xt@21+0,vb@11,!u:imm@16/5")
+!x60("XXGENPCVHM", 1834, "xt@21+0,vb@11,!u:imm@16/5")
+!x60("XSIEXPDP", 1836, "xt@21+0,ra@16,rb@11")
+!x60("XVMINDP", 1856, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVNMADDMDP", 1864, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCMPGTDP.", 1880, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVDPSXDS", 1888, "xt@21+0,xb@11+1")
+!x60("XVABSDP", 1892, "xt@21+0,xb@11+1")
+!x60("XXGENPCVWM", 1896, "xt@21+0,vb@11,!u:imm@16/5")
+!x60("XXGENPCVDM", 1898, "xt@21+0,vb@11,!u:imm@16/5")
+!x60("XVCPSGNDP", 1920, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVNMSUBADP", 1928, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCMPGEDP.", 1944, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVUXDDP", 1952, "xt@21+0,xb@11+1")
+!x60("XVNABSDP", 1956, "xt@21+0,xb@11+1")
+!x60("XVIEXPDP", 1984, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVNMSUBMDP", 1992, "xt@21+0,xa@16+2,xb@11+1")
+!x60("XVCVSXDDP", 2016, "xt@21+0,xb@11+1")
+!x60("XVNEGDP", 2020, "xt@21+0,xb@11+1")
+/* splat immediate byte: IMM8 at 11, -128..255 */
+XXSPLTIB xt,!v ::v<-128;3,v>255;3 :: .call w4(0xf00002d0|((xt&31)<<21)|((xt>>5)&1)|((v&0xff)<<11))
+LXVKQ xt,!v ::v<0;3,v>31;3 :: .call w4(0xf01f02d0|((xt&31)<<21)|((xt>>5)&1)|(v<<11))
+/* test data class, vector: DCMX split dc:dm:dx */
+!def xvtst(nm, base) {
+!{nm} xt,xb,!d ::d<0;3,d>127;3 :: .call w4(0x!{base:08x}|((xt&31)<<21)|((xt>>5)&1)|((xb&31)<<11)|(((xb>>5)&1)<<1)|((d&31)<<16)|(((d>>5)&1)<<2)|(((d>>6)&1)<<6))
+}
+!xvtst("XVTSTDCSP", 0xf00006a8)
+!xvtst("XVTSTDCDP", 0xf00007a8)
+/* selector forms (XX2 with bits 16-20 as part of the opcode) */
+!def xsel(nm, xo, s, spec) {
+!xg(nm, (60 << 26) | (s << 16) | xo, spec)
+}
+!xsel("XSXEXPDP", 1388, 0, "rt@21,xb@11+1")
+!xsel("XSXSIGDP", 1388, 1, "rt@21,xb@11+1")
+!xsel("XSCVHPDP", 1388, 16, "xt@21+0,xb@11+1")
+!xsel("XSCVDPHP", 1388, 17, "xt@21+0,xb@11+1")
+!xsel("XVXEXPDP", 1900, 0, "xt@21+0,xb@11+1")
+!xsel("XVXSIGDP", 1900, 1, "xt@21+0,xb@11+1")
+!xsel("XXBRH", 1900, 7, "xt@21+0,xb@11+1")
+!xsel("XVXEXPSP", 1900, 8, "xt@21+0,xb@11+1")
+!xsel("XVXSIGSP", 1900, 9, "xt@21+0,xb@11+1")
+!xsel("XXBRW", 1900, 15, "xt@21+0,xb@11+1")
+!xsel("XVCVBF16SPN", 1900, 16, "xt@21+0,xb@11+1")
+!xsel("XVCVSPBF16", 1900, 17, "xt@21+0,xb@11+1")
+!xsel("XXBRD", 1900, 23, "xt@21+0,xb@11+1")
+!xsel("XVCVHPSP", 1900, 24, "xt@21+0,xb@11+1")
+!xsel("XVCVSPHP", 1900, 25, "xt@21+0,xb@11+1")
+!xsel("XXBRQ", 1900, 31, "xt@21+0,xb@11+1")
+/* extended mnemonics */
+XXMRGHD xt,xa,xb :: .call w4(0xf0000050|((xt&31)<<21)|((xt>>5)&1)|((xa&31)<<16)|(((xa>>5)&1)<<2)|((xb&31)<<11)|(((xb>>5)&1)<<1))
+XXMRGLD xt,xa,xb :: .call w4(0xf0000350|((xt&31)<<21)|((xt>>5)&1)|((xa&31)<<16)|(((xa>>5)&1)<<2)|((xb&31)<<11)|(((xb>>5)&1)<<1))
+XXSWAPD xt,xa :: .call w4(0xf0000250|((xt&31)<<21)|((xt>>5)&1)|((xa&31)<<16)|(((xa>>5)&1)<<2)|((xa&31)<<11)|(((xa>>5)&1)<<1))
+XXSPLTD xt,xa,!d ::d<0;3,d>1;3 :: .call w4(0xf0000050|((d*3)<<8)|((xt&31)<<21)|((xt>>5)&1)|((xa&31)<<16)|(((xa>>5)&1)<<2)|((xa&31)<<11)|(((xa>>5)&1)<<1))
+XXMR xt,xa :: .call w4(0xf0000490|((xt&31)<<21)|((xt>>5)&1)|((xa&31)<<16)|(((xa>>5)&1)<<2)|((xa&31)<<11)|(((xa>>5)&1)<<1))
+XXLNOT xt,xa :: .call w4(0xf0000510|((xt&31)<<21)|((xt>>5)&1)|((xa&31)<<16)|(((xa>>5)&1)<<2)|((xa&31)<<11)|(((xa>>5)&1)<<1))
+
+/* quad-precision (op 63, VR operands). The "o" forms round to odd. */
+!x63("XSADDQP", 4, "vt@21,va@16,vb@11")
+!x63("XSRQPI", 5, "!u:r@16/1,vt@21,vb@11,!u:rmc@9/2")
+!x63("XSMULQP", 36, "vt@21,va@16,vb@11")
+!x63("XSRQPXP", 37, "!u:r@16/1,vt@21,vb@11,!u:rmc@9/2")
+!x63("XSCMPEQQP", 68, "vt@21,va@16,vb@11")
+!x63("XSCPSGNQP", 100, "vt@21,va@16,vb@11")
+!x63("XSCMPOQP", 132, "bf@23,va@16,vb@11")
+!x63("XSCMPEXPQP", 164, "bf@23,va@16,vb@11")
+!x63("XSCMPGEQP", 196, "vt@21,va@16,vb@11")
+!x63("XSCMPGTQP", 228, "vt@21,va@16,vb@11")
+!x63("XSMADDQP", 388, "vt@21,va@16,vb@11")
+!x63("XSMSUBQP", 420, "vt@21,va@16,vb@11")
+!x63("XSNMADDQP", 452, "vt@21,va@16,vb@11")
+!x63("XSNMSUBQP", 484, "vt@21,va@16,vb@11")
+!x63("XSSUBQP", 516, "vt@21,va@16,vb@11")
+!x63("XSDIVQP", 548, "vt@21,va@16,vb@11")
+!x63("XSCMPUQP", 644, "bf@23,va@16,vb@11")
+!x63("XSMAXCQP", 676, "vt@21,va@16,vb@11")
+!x63("XSTSTDCQP", 708, "bf@23,vb@11,!u:dcmx@16/7")
+!x63("XSMINCQP", 740, "vt@21,va@16,vb@11")
+!x63("XSIEXPQP", 868, "vt@21,va@16,vb@11")
+!def qpo(nm, xo) {
+!xg(nm + "O", (63 << 26) | (xo << 1) | 1, "vt@21,va@16,vb@11")
+}
+!qpo("XSADDQP", 4)
+!qpo("XSMULQP", 36)
+!qpo("XSMADDQP", 388)
+!qpo("XSMSUBQP", 420)
+!qpo("XSNMADDQP", 452)
+!qpo("XSNMSUBQP", 484)
+!qpo("XSSUBQP", 516)
+!qpo("XSDIVQP", 548)
+!xg("XSRQPIX", (63 << 26) | (5 << 1) | 1, "!u:r@16/1,vt@21,vb@11,!u:rmc@9/2")
+!def qsel(nm, xo, s, rc = 0) {
+!xg(nm, (63 << 26) | (s << 16) | (xo << 1), "vt@21,vb@11")
+!if rc == 1 !then {
+!xg(nm + "O", (63 << 26) | (s << 16) | (xo << 1) | 1, "vt@21,vb@11")
+}
+}
+!qsel("XSABSQP", 804, 0)
+!qsel("XSXEXPQP", 804, 2)
+!qsel("XSNABSQP", 804, 8)
+!qsel("XSNEGQP", 804, 16)
+!qsel("XSXSIGQP", 804, 18)
+!qsel("XSSQRTQP", 804, 27, 1)
+!qsel("XSCVQPUQZ", 836, 0)
+!qsel("XSCVQPUWZ", 836, 1)
+!qsel("XSCVUDQP", 836, 2)
+!qsel("XSCVUQQP", 836, 3)
+!qsel("XSCVQPSQZ", 836, 8)
+!qsel("XSCVQPSWZ", 836, 9)
+!qsel("XSCVSDQP", 836, 10)
+!qsel("XSCVSQQP", 836, 11)
+!qsel("XSCVQPUDZ", 836, 17)
+!qsel("XSCVQPDP", 836, 20, 1)
+!qsel("XSCVDPQP", 836, 22)
+!qsel("XSCVQPSDZ", 836, 25)
+
+/* ===================================================================
+/* MMA (Matrix-Multiply Assist)
+/* =================================================================== */
+!xg("XXMFACC", (31 << 26) | (177 << 1), "!u:acc@23/3")
+!xg("XXMTACC", (31 << 26) | (1 << 16) | (177 << 1), "!u:acc@23/3")
+!xg("XXSETACCZ", (31 << 26) | (3 << 16) | (177 << 1), "!u:acc@23/3")
+!def ger(nm, xo, pair = 0) {
+!if pair == 0 !then {
+!xg(nm, (59 << 26) | (xo << 3), "!u:acc@23/3,xa@16+2,xb@11+1")
+}
+!if pair == 1 !then {
+!xg(nm, (59 << 26) | (xo << 3), "!u:acc@23/3,xa@16+2e,xb@11+1")
+}
+}
+!ger("XVI4GER8", 35)
+!ger("XVI4GER8PP", 34)
+!ger("XVI8GER4", 3)
+!ger("XVI8GER4PP", 2)
+!ger("XVI8GER4SPP", 99)
+!ger("XVI16GER2", 75)
+!ger("XVI16GER2PP", 107)
+!ger("XVI16GER2S", 43)
+!ger("XVI16GER2SPP", 42)
+!ger("XVF16GER2", 19)
+!ger("XVF16GER2PP", 18)
+!ger("XVF16GER2PN", 146)
+!ger("XVF16GER2NP", 82)
+!ger("XVF16GER2NN", 210)
+!ger("XVBF16GER2", 51)
+!ger("XVBF16GER2PP", 50)
+!ger("XVBF16GER2PN", 178)
+!ger("XVBF16GER2NP", 114)
+!ger("XVBF16GER2NN", 242)
+!ger("XVF32GER", 27)
+!ger("XVF32GERPP", 26)
+!ger("XVF32GERPN", 154)
+!ger("XVF32GERNP", 90)
+!ger("XVF32GERNN", 218)
+!ger("XVF64GER", 59, 1)
+!ger("XVF64GERPP", 58, 1)
+!ger("XVF64GERPN", 186, 1)
+!ger("XVF64GERNP", 122, 1)
+!ger("XVF64GERNN", 250, 1)
+
+/* ===================================================================
+/* Prefixed instructions (Power ISA v3.1), 8 bytes: prefix, suffix
+/*
+/* d is a 34-bit signed displacement split 18:16 over the two words.
+/* R = 1 makes it PC relative (relative to the prefix word); RA must
+/* then be 0. The @pcrel spelling (pld 3,sym@pcrel) computes
+/* sym - $$ and sets R = 1. A prefixed instruction may not cross a
+/* 64-byte boundary.
+/* =================================================================== */
+/* A prefixed instruction may not cross a 64-byte boundary. When it
+/* would (the location counter is 60 mod 64), a nop is emitted first,
+/* as GNU as does; PAD is that optional nop, and PQ the address of the
+/* prefixed instruction itself, which PC-relative operands count from. */
+!set PAD = "@@[(($$&63)==60),0x60*(1-#PPCLE),0,0,0x60*#PPCLE],"
+!set PQ = "($$+((($$&63)==60)*4))"
+
+/* Prefixed masked forms (MMIRR): pmxv<name> AT,XA,XB,XMSK,YMSK[,PMSK].
+/* The prefix holds the masks: XMSK 4 bits, YMSK 4 bits (2 for the
+/* f64 forms), PMSK 8 / 4 / 2 bits for the 4-, 8- and 16-bit element
+/* forms (none for f32 / f64). The suffix is the unprefixed xv*ger*. */
+!def pger(nm, xo, pb) {
+!local sw = (59 << 26) | (xo << 3)
+!local f = "((acc&7)<<23)|((xa&31)<<16)|((xa>>5)<<2)|((xb&31)<<11)|((xb>>5)<<1)"
+!local ce = "acc<0;3,acc>7;3,xm<0;3,xm>15;3"
+!if pb > 0 !then {
+!local pm = (1 << pb) - 1
+!local ps = 16 - pb
+PM!{nm} !acc,xa,xb,!xm,!ym,!pm ::!{ce},ym<0;3,ym>15;3,pm<0;3,pm>!{pm};3 :: !{PAD}.call w8(0x07900000|((pm&!{pm})<<!{ps})|((xm&15)<<4)|(ym&15),0x!{sw:08x}|!{f})
+}
+!if pb == 0 !then {
+PM!{nm} !acc,xa,xb,!xm,!ym ::!{ce},ym<0;3,ym>15;3 :: !{PAD}.call w8(0x07900000|((xm&15)<<4)|(ym&15),0x!{sw:08x}|!{f})
+}
+!if pb < 0 !then {
+PM!{nm} !acc,xa,xb,!xm,!ym ::!{ce},ym<0;3,ym>3;3,(xa&1)!=0;5 :: !{PAD}.call w8(0x07900000|((xm&15)<<4)|((ym&3)<<2),0x!{sw:08x}|!{f})
+}
+}
+!pger("XVI4GER8", 35, 8)
+!pger("XVI4GER8PP", 34, 8)
+!pger("XVI8GER4", 3, 4)
+!pger("XVI8GER4PP", 2, 4)
+!pger("XVI8GER4SPP", 99, 4)
+!pger("XVI16GER2", 75, 2)
+!pger("XVI16GER2PP", 107, 2)
+!pger("XVI16GER2S", 43, 2)
+!pger("XVI16GER2SPP", 42, 2)
+!pger("XVF16GER2", 19, 2)
+!pger("XVF16GER2PP", 18, 2)
+!pger("XVF16GER2PN", 146, 2)
+!pger("XVF16GER2NP", 82, 2)
+!pger("XVF16GER2NN", 210, 2)
+!pger("XVBF16GER2", 51, 2)
+!pger("XVBF16GER2PP", 50, 2)
+!pger("XVBF16GER2PN", 178, 2)
+!pger("XVBF16GER2NP", 114, 2)
+!pger("XVBF16GER2NN", 242, 2)
+!pger("XVF32GER", 27, 0)
+!pger("XVF32GERPP", 26, 0)
+!pger("XVF32GERPN", 154, 0)
+!pger("XVF32GERNP", 90, 0)
+!pger("XVF32GERNN", 218, 0)
+!pger("XVF64GER", 59, -1)
+!pger("XVF64GERPP", 58, -1)
+!pger("XVF64GERPN", 186, -1)
+!pger("XVF64GERNP", 122, -1)
+!pger("XVF64GERNN", 250, -1)
+!set D34 = "d<-8589934592;8,d>8589934591;8"
+/* pfx(nm, ptype, sop, reg, sfx): ptype 0x04000000 (8LS) or
+/* 0x06000000 (MLS); sop is the suffix word with the operand fields
+/* zero; reg is the data operand ("rt", or "xt6" / "xs6" for the VSX
+/* forms whose TX bit sits in the suffix opcode, or "xtp" / "xsp" for
+/* the paired forms). */
+!def pfx(nm, ptype, sop, reg) {
+!local rf = "(" + reg + "<<21)"
+!local rv = reg
+!local er = ""
+!if reg == "xt6" !then {
+!set rv = "xt"
+!set rf = "((xt&31)<<21)|(((xt>>5)&1)<<26)"
+}
+!if reg == "xs6" !then {
+!set rv = "xs"
+!set rf = "((xs&31)<<21)|(((xs>>5)&1)<<26)"
+}
+!if reg == "xtp" !then {
+!set rv = "xt"
+!set rf = "(((xt>>1)&15)<<22)|(((xt>>5)&1)<<21)"
+!set er = "(xt&1)!=0;5,"
+}
+!if reg == "xsp" !then {
+!set rv = "xs"
+!set rf = "(((xs>>1)&15)<<22)|(((xs>>5)&1)<<21)"
+!set er = "(xs&1)!=0;5,"
+}
+!if reg == "rte" !then {
+!set rv = "rt"
+!set rf = "(rt<<21)"
+!set er = "(rt&1)!=0;5,"
+}
+!if reg == "rse" !then {
+!set rv = "rs"
+!set rf = "(rs<<21)"
+!set er = "(rs&1)!=0;5,"
+}
+.reloc::d::d34
+!{nm} !{rv},!d(ra) ::!{er}!{D34} :: !{PAD}.call w8(0x!{ptype:08x}|((d>>16)&0x3ffff),0x!{sop:08x}|!{rf}|(ra<<16)|(d&0xffff))
+.clrreloc::d
+!{nm} !{rv},!d(ra),!r ::!{er}!{D34},r<0;3,r>1;3,(r==1)&&(ra!=0);5 :: !{PAD}.call w8(0x!{ptype:08x}|(r<<20)|((d>>16)&0x3ffff),0x!{sop:08x}|!{rf}|(ra<<16)|(d&0xffff))
+.reloc::t::pcrel34
+!{nm} !{rv},!t@PCREL ::!{er}((t-!{PQ})<-8589934592)||((t-!{PQ})>8589934591);8 :: !{PAD}.call w8(0x!{ptype | 0x100000:08x}|(((t-!{PQ})>>16)&0x3ffff),0x!{sop:08x}|!{rf}|((t-!{PQ})&0xffff))
+.clrreloc::t
+}
+/* MLS: the D-form loads and stores and paddi */
+!pfx("PLBZ", 0x06000000, 34 << 26, "rt")
+!pfx("PLHZ", 0x06000000, 40 << 26, "rt")
+!pfx("PLHA", 0x06000000, 42 << 26, "rt")
+!pfx("PLWZ", 0x06000000, 32 << 26, "rt")
+!pfx("PSTB", 0x06000000, 38 << 26, "rs")
+!pfx("PSTH", 0x06000000, 44 << 26, "rs")
+!pfx("PSTW", 0x06000000, 36 << 26, "rs")
+!pfx("PLFS", 0x06000000, 48 << 26, "ft")
+!pfx("PLFD", 0x06000000, 50 << 26, "ft")
+!pfx("PSTFS", 0x06000000, 52 << 26, "fs")
+!pfx("PSTFD", 0x06000000, 54 << 26, "fs")
+!pfx("PLA", 0x06000000, 14 << 26, "rt")
+/* 8LS: the DS/DQ-form ones, whose suffix has its own opcode */
+!pfx("PLD", 0x04000000, 57 << 26, "rt")
+!pfx("PSTD", 0x04000000, 61 << 26, "rs")
+!pfx("PLWA", 0x04000000, 41 << 26, "rt")
+!pfx("PLQ", 0x04000000, 56 << 26, "rte")
+!pfx("PSTQ", 0x04000000, 60 << 26, "rse")
+!pfx("PLXSD", 0x04000000, 42 << 26, "vt")
+!pfx("PLXSSP", 0x04000000, 43 << 26, "vt")
+!pfx("PSTXSD", 0x04000000, 46 << 26, "vs")
+!pfx("PSTXSSP", 0x04000000, 47 << 26, "vs")
+!pfx("PLXV", 0x04000000, 50 << 26, "xt6")
+!pfx("PSTXV", 0x04000000, 54 << 26, "xs6")
+!pfx("PLXVP", 0x04000000, 58 << 26, "xtp")
+!pfx("PSTXVP", 0x04000000, 62 << 26, "xsp")
+/* paddi / pli */
+.reloc::d::d34
+PADDI rt,ra,!d ::!{D34} :: !{PAD}.call w8(0x06000000|((d>>16)&0x3ffff),0x38000000|(rt<<21)|(ra<<16)|(d&0xffff))
+.clrreloc::d
+PADDI rt,ra,!d,!r ::!{D34},r<0;3,r>1;3,(r==1)&&(ra!=0);5 :: !{PAD}.call w8(0x06000000|(r<<20)|((d>>16)&0x3ffff),0x38000000|(rt<<21)|(ra<<16)|(d&0xffff))
+.reloc::d::d34
+PLI rt,!d ::!{D34} :: !{PAD}.call w8(0x06000000|((d>>16)&0x3ffff),0x38000000|(rt<<21)|(d&0xffff))
+.clrreloc::d
+PNOP :: :: !{PAD}.call w8(0x07000000,0x00000000)
+/* 8RR / MMIRR VSX: the immediate lives in the prefix */
+XXSPLTI32DX xt,!ix,!v ::ix<0;3,ix>1;3,v<-2147483648;3,v>4294967295;3 :: !{PAD}.call w8(0x05000000|((v>>16)&0xffff),0x80000000|((xt&31)<<21)|(ix<<17)|(((xt>>5)&1)<<16)|(v&0xffff))
+XXSPLTIW xt,!v ::v<-2147483648;3,v>4294967295;3 :: !{PAD}.call w8(0x05000000|((v>>16)&0xffff),0x80060000|((xt&31)<<21)|(((xt>>5)&1)<<16)|(v&0xffff))
+XXSPLTIDP xt,!v ::v<-2147483648;3,v>4294967295;3 :: !{PAD}.call w8(0x05000000|((v>>16)&0xffff),0x80040000|((xt&31)<<21)|(((xt>>5)&1)<<16)|(v&0xffff))
+!def xx4p(nm, pw, sw, imm) {
+!local f = "((xt&31)<<21)|((xa&31)<<16)|((xb&31)<<11)|((xc&31)<<6)|(((xc>>5)&1)<<3)|(((xa>>5)&1)<<2)|(((xb>>5)&1)<<1)|((xt>>5)&1)"
+!if imm == 0 !then {
+!{nm} xt,xa,xb,xc :: :: !{PAD}.call w8(0x!{pw:08x},0x!{sw:08x}|!{f})
+}
+!if imm == 3 !then {
+!{nm} xt,xa,xb,xc,!u ::u<0;3,u>7;3 :: !{PAD}.call w8(0x!{pw:08x}|u,0x!{sw:08x}|!{f})
+}
+!if imm == 8 !then {
+!{nm} xt,xa,xb,xc,!u ::u<0;3,u>255;3 :: !{PAD}.call w8(0x!{pw:08x}|u,0x!{sw:08x}|!{f})
+}
+}
+!xx4p("XXBLENDVB", 0x05000000, 0x84000000, 0)
+!xx4p("XXBLENDVH", 0x05000000, 0x84000010, 0)
+!xx4p("XXBLENDVW", 0x05000000, 0x84000020, 0)
+!xx4p("XXBLENDVD", 0x05000000, 0x84000030, 0)
+!xx4p("XXPERMX", 0x05000000, 0x88000000, 3)
+!xx4p("XXEVAL", 0x05000000, 0x88000010, 8)
+
+/* ===================================================================
+/* Data, in the target byte order
+/*
+/* axx itself provides .ascii / .asciz / .zero / .resb ... ; these add
+/* the GNU spellings of the sized integer directives. One value per
+/* line. The bytes are written one list element each, so that under -o
+/* a symbol in the value is seen across the whole field and gets the
+/* data relocation of that width (ADDR16 / ADDR32 / ADDR64).
+/* =================================================================== */
+.BYTE !v :: v&0xff
+.SHORT !v :: @@[2,(v>>(8*(1*(1-#PPCLE)+(%%)*(2*(#PPCLE)-1))))&0xff]
+.HWORD !v :: @@[2,(v>>(8*(1*(1-#PPCLE)+(%%)*(2*(#PPCLE)-1))))&0xff]
+.2BYTE !v :: @@[2,(v>>(8*(1*(1-#PPCLE)+(%%)*(2*(#PPCLE)-1))))&0xff]
+.LONG !v :: @@[4,(v>>(8*(3*(1-#PPCLE)+(%%)*(2*(#PPCLE)-1))))&0xff]
+.WORD !v :: @@[4,(v>>(8*(3*(1-#PPCLE)+(%%)*(2*(#PPCLE)-1))))&0xff]
+.4BYTE !v :: @@[4,(v>>(8*(3*(1-#PPCLE)+(%%)*(2*(#PPCLE)-1))))&0xff]
+.QUAD !v :: @@[8,(v>>(8*(7*(1-#PPCLE)+(%%)*(2*(#PPCLE)-1))))&0xff]
+.8BYTE !v :: @@[8,(v>>(8*(7*(1-#PPCLE)+(%%)*(2*(#PPCLE)-1))))&0xff]
+.FLOAT !Fv :: .call w4(v)
+.DOUBLE !Dv :: .call d8(v)
