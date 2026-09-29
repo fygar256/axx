@@ -1,57 +1,271 @@
 #!/bin/sh
 
-caxx patfile/4004.axx asmsrc/4004.s -b b0
-caxx patfile/z80.axx asmsrc/z80.s -b b1
-caxx patfile/6502.axx asmsrc/6502.s -b b2
-caxx patfile/6800.axx asmsrc/6800.s -b b3
-caxx patfile/6809.axx asmsrc/6809.s -b b4
-caxx patfile/8080.axx asmsrc/8080.s -b b5
-caxx patfile/8048.axx asmsrc/8048.s -b b6
-caxx patfile/8051.axx asmsrc/8051.s -b b7
-caxx patfile/68000.axx asmsrc/68000.s -b b8
-caxx patfile/vliw.axx asmsrc/vliw.s -b b9
-caxx patfile/itanium.axx asmsrc/vliw.s -b b10
-caxx patfile/x86_64.axx asmsrc/hello.s -b b11
-caxx patfile/x86_64m.axx asmsrc/hello.s -b b12
-caxx patfile/bf.axx asmsrc/bf.s -b b13
-caxx patfile/8080toz80.axx asmsrc/hello8080.s -b b14
-caxx patfile/aarch64.axx asmsrc/aarch64.s -b b15
+# パターンファイルとアセンブリソースの置き場。リポジトリでは patfile/ と
+# asmsrc/ に分かれ、作業場ではどちらも同じ階層にある。どちらでもそのまま
+# 走るようにここで決める（パスを手で書き換えると組を落としやすい）。
+P=patfile; [ -d "$P" ] || P=.
+S=asmsrc;  [ -d "$S" ] || S=.
 
-paxx patfile/4004.axx asmsrc/4004.s -b a0
-paxx patfile/z80.axx asmsrc/z80.s -b a1
-paxx patfile/6502.axx asmsrc/6502.s -b a2
-paxx patfile/6800.axx asmsrc/6800.s -b a3
-paxx patfile/6809.axx asmsrc/6809.s -b a4
-paxx patfile/8080.axx asmsrc/8080.s -b a5
-paxx patfile/8048.axx asmsrc/8048.s -b a6
-paxx patfile/8051.axx asmsrc/8051.s -b a7
-paxx patfile/68000.axx asmsrc/68000.s -b a8
-paxx patfile/vliw.axx asmsrc/vliw.s -b a9
-paxx patfile/itanium.axx asmsrc/vliw.s -b a10
-paxx patfile/x86_64.axx asmsrc/hello.s -b a11
-paxx patfile/x86_64m.axx asmsrc/hello.s -b a12
-paxx patfile/bf.axx asmsrc/bf.s -b a13
-paxx patfile/8080toz80.axx asmsrc/hello8080.s -b a14
-paxx patfile/aarch64.axx asmsrc/aarch64.s -b a15
+caxx $P/4004.axx $S/4004.s -b b0
+caxx $P/z80.axx $S/z80.s -b b1
+caxx $P/6502.axx $S/6502.s -b b2
+caxx $P/6800.axx $S/6800.s -b b3
+caxx $P/6809.axx $S/6809.s -b b4
+caxx $P/8080.axx $S/8080.s -b b5
+caxx $P/8048.axx $S/8048.s -b b6
+caxx $P/8051.axx $S/8051.s -b b7
+caxx $P/68000.axx $S/68000.s -b b8
+caxx $P/vliw.axx $S/vliw.s -b b9
+caxx $P/itanium.axx $S/vliw.s -b b10
+caxx $P/x86_64.axx $S/hello.s -b b11
+caxx $P/x86_64m.axx $S/hello.s -b b12
+caxx $P/aarch64_logical_mini.axx $S/aarch64_logical_mini_demo.s -b b13
+caxx $P/bf.axx $S/bf.s -b b14
+caxx $P/arrindex.axx $S/arrindex.s -b b15
+caxx $P/passthru.axx $S/passthru.s -b b16
+caxx $P/textmode.axx $S/textmode.s -b b17
+caxx $P/8080toz80.axx $S/hello8080.s -b b18
+caxx $P/textmode.axx $S/textmode.s -V > b19
+caxx $P/8080toz80.axx $S/hello8080.s -V > b20
+caxx $P/aarch64.axx $S/aarch64.s -b b21
+caxx $P/elftype.axx $S/elftype.s -o b22 -m 62
+caxx $P/elfgen.axx $S/elfgen.s -o b23
+caxx $P/symcap.axx $S/symcap.s -b b24
+caxx $P/echo.axx $S/echo.s -b b25 2>&1 | grep -v '^wrote ' > b25e
+caxx $P/elfprio.axx $S/elfprio.s -o b26
+caxx $P/elfsec.axx $S/elfsec.s -o b27
+caxx $P/endsub.axx $S/endsub.s -b b28
+caxx $P/intel2att.axx $S/intel2att.s -b b29
+caxx $P/intel2att.axx $S/intel2att.s -V > b30
+
+# 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
+# リスティング・テキスト出力の経路が一度も比較されない。
+# 注意: -g は DWARF の comp_dir にカレントディレクトリを埋めるので、caxx 側と
+# paxx 側を必ず同じディレクトリで走らせること。別の場所で走らせると中身が
+# 同じでも食い違う。
+caxx $P/4004.axx $S/4004.s -o b31
+caxx $P/z80.axx $S/z80.s -o b32
+caxx $P/6502.axx $S/6502.s -o b33
+caxx $P/6800.axx $S/6800.s -o b34
+caxx $P/6809.axx $S/6809.s -o b35
+caxx $P/8080.axx $S/8080.s -o b36
+caxx $P/8048.axx $S/8048.s -o b37
+caxx $P/8051.axx $S/8051.s -o b38
+caxx $P/68000.axx $S/68000.s -o b39
+caxx $P/vliw.axx $S/vliw.s -o b40
+caxx $P/itanium.axx $S/vliw.s -o b41
+caxx $P/x86_64.axx $S/hello.s -o b42
+caxx $P/x86_64m.axx $S/hello.s -o b43
+caxx $P/bf.axx $S/bf.s -o b44
+caxx $P/8080toz80.axx $S/hello8080.s -o b45
+caxx $P/aarch64.axx $S/aarch64.s -o b46
+
+caxx $P/4004.axx $S/4004.s -m 3 -f 32 -o b47
+caxx $P/z80.axx $S/z80.s -m 3 -f 32 -o b48
+caxx $P/6502.axx $S/6502.s -m 3 -f 32 -o b49
+caxx $P/6800.axx $S/6800.s -m 3 -f 32 -o b50
+caxx $P/6809.axx $S/6809.s -m 3 -f 32 -o b51
+caxx $P/8080.axx $S/8080.s -m 3 -f 32 -o b52
+caxx $P/8048.axx $S/8048.s -m 3 -f 32 -o b53
+caxx $P/8051.axx $S/8051.s -m 3 -f 32 -o b54
+caxx $P/68000.axx $S/68000.s -m 3 -f 32 -o b55
+caxx $P/vliw.axx $S/vliw.s -m 3 -f 32 -o b56
+caxx $P/itanium.axx $S/vliw.s -m 3 -f 32 -o b57
+caxx $P/x86_64.axx $S/hello.s -m 3 -f 32 -o b58
+caxx $P/x86_64m.axx $S/hello.s -m 3 -f 32 -o b59
+caxx $P/bf.axx $S/bf.s -m 3 -f 32 -o b60
+caxx $P/8080toz80.axx $S/hello8080.s -m 3 -f 32 -o b61
+caxx $P/aarch64.axx $S/aarch64.s -m 3 -f 32 -o b62
+
+caxx $P/4004.axx $S/4004.s -g -o b63
+caxx $P/z80.axx $S/z80.s -g -o b64
+caxx $P/6502.axx $S/6502.s -g -o b65
+caxx $P/6800.axx $S/6800.s -g -o b66
+caxx $P/6809.axx $S/6809.s -g -o b67
+caxx $P/8080.axx $S/8080.s -g -o b68
+caxx $P/8048.axx $S/8048.s -g -o b69
+caxx $P/8051.axx $S/8051.s -g -o b70
+caxx $P/68000.axx $S/68000.s -g -o b71
+caxx $P/vliw.axx $S/vliw.s -g -o b72
+caxx $P/itanium.axx $S/vliw.s -g -o b73
+caxx $P/x86_64.axx $S/hello.s -g -o b74
+caxx $P/x86_64m.axx $S/hello.s -g -o b75
+caxx $P/bf.axx $S/bf.s -g -o b76
+caxx $P/8080toz80.axx $S/hello8080.s -g -o b77
+caxx $P/aarch64.axx $S/aarch64.s -g -o b78
+
+caxx $P/4004.axx $S/4004.s -v -b b79 > b79v
+caxx $P/z80.axx $S/z80.s -v -b b80 > b80v
+caxx $P/6502.axx $S/6502.s -v -b b81 > b81v
+caxx $P/6800.axx $S/6800.s -v -b b82 > b82v
+caxx $P/6809.axx $S/6809.s -v -b b83 > b83v
+caxx $P/8080.axx $S/8080.s -v -b b84 > b84v
+caxx $P/8048.axx $S/8048.s -v -b b85 > b85v
+caxx $P/8051.axx $S/8051.s -v -b b86 > b86v
+caxx $P/68000.axx $S/68000.s -v -b b87 > b87v
+caxx $P/vliw.axx $S/vliw.s -v -b b88 > b88v
+caxx $P/itanium.axx $S/vliw.s -v -b b89 > b89v
+caxx $P/x86_64.axx $S/hello.s -v -b b90 > b90v
+caxx $P/x86_64m.axx $S/hello.s -v -b b91 > b91v
+caxx $P/bf.axx $S/bf.s -v -b b92 > b92v
+caxx $P/8080toz80.axx $S/hello8080.s -v -b b93 > b93v
+caxx $P/aarch64.axx $S/aarch64.s -v -b b94 > b94v
+
+caxx $P/4004.axx $S/4004.s -V -b b95 > b95t
+caxx $P/z80.axx $S/z80.s -V -b b96 > b96t
+caxx $P/6502.axx $S/6502.s -V -b b97 > b97t
+caxx $P/6800.axx $S/6800.s -V -b b98 > b98t
+caxx $P/6809.axx $S/6809.s -V -b b99 > b99t
+caxx $P/8080.axx $S/8080.s -V -b b100 > b100t
+caxx $P/8048.axx $S/8048.s -V -b b101 > b101t
+caxx $P/8051.axx $S/8051.s -V -b b102 > b102t
+caxx $P/68000.axx $S/68000.s -V -b b103 > b103t
+caxx $P/vliw.axx $S/vliw.s -V -b b104 > b104t
+caxx $P/itanium.axx $S/vliw.s -V -b b105 > b105t
+caxx $P/x86_64.axx $S/hello.s -V -b b106 > b106t
+caxx $P/x86_64m.axx $S/hello.s -V -b b107 > b107t
+caxx $P/bf.axx $S/bf.s -V -b b108 > b108t
+caxx $P/8080toz80.axx $S/hello8080.s -V -b b109 > b109t
+caxx $P/aarch64.axx $S/aarch64.s -V -b b110 > b110t
+
+paxx $P/4004.axx $S/4004.s -b a0
+paxx $P/z80.axx $S/z80.s -b a1
+paxx $P/6502.axx $S/6502.s -b a2
+paxx $P/6800.axx $S/6800.s -b a3
+paxx $P/6809.axx $S/6809.s -b a4
+paxx $P/8080.axx $S/8080.s -b a5
+paxx $P/8048.axx $S/8048.s -b a6
+paxx $P/8051.axx $S/8051.s -b a7
+paxx $P/68000.axx $S/68000.s -b a8
+paxx $P/vliw.axx $S/vliw.s -b a9
+paxx $P/itanium.axx $S/vliw.s -b a10
+paxx $P/x86_64.axx $S/hello.s -b a11
+paxx $P/x86_64m.axx $S/hello.s -b a12
+paxx $P/aarch64_logical_mini.axx $S/aarch64_logical_mini_demo.s -b a13
+paxx $P/bf.axx $S/bf.s -b a14
+paxx $P/arrindex.axx $S/arrindex.s -b a15
+paxx $P/passthru.axx $S/passthru.s -b a16
+paxx $P/textmode.axx $S/textmode.s -b a17
+paxx $P/8080toz80.axx $S/hello8080.s -b a18
+paxx $P/textmode.axx $S/textmode.s -V > a19
+paxx $P/8080toz80.axx $S/hello8080.s -V > a20
+paxx $P/aarch64.axx $S/aarch64.s -b a21
+paxx $P/elftype.axx $S/elftype.s -o a22 -m 62
+paxx $P/elfgen.axx $S/elfgen.s -o a23
+paxx $P/symcap.axx $S/symcap.s -b a24
+paxx $P/echo.axx $S/echo.s -b a25 2>&1 | grep -v '^wrote ' > a25e
+paxx $P/elfprio.axx $S/elfprio.s -o a26
+paxx $P/elfsec.axx $S/elfsec.s -o a27
+paxx $P/endsub.axx $S/endsub.s -b a28
+paxx $P/intel2att.axx $S/intel2att.s -b a29
+paxx $P/intel2att.axx $S/intel2att.s -V > a30
+
+paxx $P/4004.axx $S/4004.s -o a31
+paxx $P/z80.axx $S/z80.s -o a32
+paxx $P/6502.axx $S/6502.s -o a33
+paxx $P/6800.axx $S/6800.s -o a34
+paxx $P/6809.axx $S/6809.s -o a35
+paxx $P/8080.axx $S/8080.s -o a36
+paxx $P/8048.axx $S/8048.s -o a37
+paxx $P/8051.axx $S/8051.s -o a38
+paxx $P/68000.axx $S/68000.s -o a39
+paxx $P/vliw.axx $S/vliw.s -o a40
+paxx $P/itanium.axx $S/vliw.s -o a41
+paxx $P/x86_64.axx $S/hello.s -o a42
+paxx $P/x86_64m.axx $S/hello.s -o a43
+paxx $P/bf.axx $S/bf.s -o a44
+paxx $P/8080toz80.axx $S/hello8080.s -o a45
+paxx $P/aarch64.axx $S/aarch64.s -o a46
+
+paxx $P/4004.axx $S/4004.s -m 3 -f 32 -o a47
+paxx $P/z80.axx $S/z80.s -m 3 -f 32 -o a48
+paxx $P/6502.axx $S/6502.s -m 3 -f 32 -o a49
+paxx $P/6800.axx $S/6800.s -m 3 -f 32 -o a50
+paxx $P/6809.axx $S/6809.s -m 3 -f 32 -o a51
+paxx $P/8080.axx $S/8080.s -m 3 -f 32 -o a52
+paxx $P/8048.axx $S/8048.s -m 3 -f 32 -o a53
+paxx $P/8051.axx $S/8051.s -m 3 -f 32 -o a54
+paxx $P/68000.axx $S/68000.s -m 3 -f 32 -o a55
+paxx $P/vliw.axx $S/vliw.s -m 3 -f 32 -o a56
+paxx $P/itanium.axx $S/vliw.s -m 3 -f 32 -o a57
+paxx $P/x86_64.axx $S/hello.s -m 3 -f 32 -o a58
+paxx $P/x86_64m.axx $S/hello.s -m 3 -f 32 -o a59
+paxx $P/bf.axx $S/bf.s -m 3 -f 32 -o a60
+paxx $P/8080toz80.axx $S/hello8080.s -m 3 -f 32 -o a61
+paxx $P/aarch64.axx $S/aarch64.s -m 3 -f 32 -o a62
+
+paxx $P/4004.axx $S/4004.s -g -o a63
+paxx $P/z80.axx $S/z80.s -g -o a64
+paxx $P/6502.axx $S/6502.s -g -o a65
+paxx $P/6800.axx $S/6800.s -g -o a66
+paxx $P/6809.axx $S/6809.s -g -o a67
+paxx $P/8080.axx $S/8080.s -g -o a68
+paxx $P/8048.axx $S/8048.s -g -o a69
+paxx $P/8051.axx $S/8051.s -g -o a70
+paxx $P/68000.axx $S/68000.s -g -o a71
+paxx $P/vliw.axx $S/vliw.s -g -o a72
+paxx $P/itanium.axx $S/vliw.s -g -o a73
+paxx $P/x86_64.axx $S/hello.s -g -o a74
+paxx $P/x86_64m.axx $S/hello.s -g -o a75
+paxx $P/bf.axx $S/bf.s -g -o a76
+paxx $P/8080toz80.axx $S/hello8080.s -g -o a77
+paxx $P/aarch64.axx $S/aarch64.s -g -o a78
+
+paxx $P/4004.axx $S/4004.s -v -b a79 > a79v
+paxx $P/z80.axx $S/z80.s -v -b a80 > a80v
+paxx $P/6502.axx $S/6502.s -v -b a81 > a81v
+paxx $P/6800.axx $S/6800.s -v -b a82 > a82v
+paxx $P/6809.axx $S/6809.s -v -b a83 > a83v
+paxx $P/8080.axx $S/8080.s -v -b a84 > a84v
+paxx $P/8048.axx $S/8048.s -v -b a85 > a85v
+paxx $P/8051.axx $S/8051.s -v -b a86 > a86v
+paxx $P/68000.axx $S/68000.s -v -b a87 > a87v
+paxx $P/vliw.axx $S/vliw.s -v -b a88 > a88v
+paxx $P/itanium.axx $S/vliw.s -v -b a89 > a89v
+paxx $P/x86_64.axx $S/hello.s -v -b a90 > a90v
+paxx $P/x86_64m.axx $S/hello.s -v -b a91 > a91v
+paxx $P/bf.axx $S/bf.s -v -b a92 > a92v
+paxx $P/8080toz80.axx $S/hello8080.s -v -b a93 > a93v
+paxx $P/aarch64.axx $S/aarch64.s -v -b a94 > a94v
+
+paxx $P/4004.axx $S/4004.s -V -b a95 > a95t
+paxx $P/z80.axx $S/z80.s -V -b a96 > a96t
+paxx $P/6502.axx $S/6502.s -V -b a97 > a97t
+paxx $P/6800.axx $S/6800.s -V -b a98 > a98t
+paxx $P/6809.axx $S/6809.s -V -b a99 > a99t
+paxx $P/8080.axx $S/8080.s -V -b a100 > a100t
+paxx $P/8048.axx $S/8048.s -V -b a101 > a101t
+paxx $P/8051.axx $S/8051.s -V -b a102 > a102t
+paxx $P/68000.axx $S/68000.s -V -b a103 > a103t
+paxx $P/vliw.axx $S/vliw.s -V -b a104 > a104t
+paxx $P/itanium.axx $S/vliw.s -V -b a105 > a105t
+paxx $P/x86_64.axx $S/hello.s -V -b a106 > a106t
+paxx $P/x86_64m.axx $S/hello.s -V -b a107 > a107t
+paxx $P/bf.axx $S/bf.s -V -b a108 > a108t
+paxx $P/8080toz80.axx $S/hello8080.s -V -b a109 > a109t
+paxx $P/aarch64.axx $S/aarch64.s -V -b a110 > a110t
 
 FAIL=0
 
-cmp a0 b0 || FAIL=1
-cmp a1 b1 || FAIL=1
-cmp a2 b2 || FAIL=1
-cmp a3 b3 || FAIL=1
-cmp a4 b4 || FAIL=1
-cmp a5 b5 || FAIL=1
-cmp a6 b6 || FAIL=1
-cmp a7 b7 || FAIL=1
-cmp a8 b8 || FAIL=1
-cmp a9 b9 || FAIL=1
-cmp a10 b10 || FAIL=1
-cmp a11 b11 || FAIL=1
-cmp a12 b12 || FAIL=1
-cmp a13 b13 || FAIL=1
-cmp a14 b14 || FAIL=1
-cmp a15 b15 || FAIL=1
+N=0
+while [ $N -le 110 ]; do
+    cmp a$N b$N || FAIL=1
+    N=$((N+1))
+done
+
+cmp a25e b25e || FAIL=1
+
+N=79
+while [ $N -le 94 ]; do
+    cmp a${N}v b${N}v || FAIL=1
+    N=$((N+1))
+done
+
+N=95
+while [ $N -le 110 ]; do
+    cmp a${N}t b${N}t || FAIL=1
+    N=$((N+1))
+done
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

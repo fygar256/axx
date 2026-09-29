@@ -2267,7 +2267,8 @@ typedef struct {
     /* `.elfsection::<名前>::<flags>[::<型>]` で決めたセクションの属性
      * （マニュアル 3.7.7 節）。名前は書いたままを持ち、引くときだけ大小を
      * 区別しない。type_set が 0 の行は sh_flags だけを決める。 */
-    struct { char *name; uint32_t flags; int type_set; uint32_t type; } *elf_secs;
+    struct { char *name; uint32_t flags; int type_set; uint32_t type;
+             int al_set; uint32_t al; } *elf_secs;
     int        elf_secs_len, elf_secs_cap;
     int        elf_machine_from_cli;  /* -m を明示したか */
     long       elf_decl_gen;       /* 宣言が変わるたびに増える（控えの鍵） */
@@ -6715,15 +6716,19 @@ static int dir_elfheader(Assembler *asmb, PatEntry *e){
 
 /* `.elfsection` の宣言を据える。同じ名前があれば書き換える（後の宣言が勝つ）。 */
 static void elf_sec_set(AsmState *st, const char *name, uint32_t flags,
-                        int type_set, uint32_t type){
+                        int type_set, uint32_t type, int al_set, uint32_t al){
     for(int i=0;i<st->elf_secs_len;i++)
         if(strcasecmp(st->elf_secs[i].name, name)==0){
             if(st->elf_secs[i].flags != flags
                || st->elf_secs[i].type_set != type_set
-               || st->elf_secs[i].type != type){
+               || st->elf_secs[i].type != type
+               || st->elf_secs[i].al_set != al_set
+               || st->elf_secs[i].al != al){
                 st->elf_secs[i].flags    = flags;
                 st->elf_secs[i].type_set = type_set;
                 st->elf_secs[i].type     = type;
+                st->elf_secs[i].al_set   = al_set;
+                st->elf_secs[i].al       = al;
                 st->elf_decl_gen++;
             }
             return;
@@ -6739,6 +6744,8 @@ static void elf_sec_set(AsmState *st, const char *name, uint32_t flags,
     st->elf_secs[st->elf_secs_len].flags    = flags;
     st->elf_secs[st->elf_secs_len].type_set = type_set;
     st->elf_secs[st->elf_secs_len].type     = type;
+    st->elf_secs[st->elf_secs_len].al_set   = al_set;
+    st->elf_secs[st->elf_secs_len].al       = al;
     st->elf_secs_len++;
     st->elf_decl_gen++;
 }
@@ -6751,13 +6758,17 @@ static int elf_sec_find(const AsmState *st, const char *name){
     return -1;
 }
 
-/* `.elfsection::<名前>::<sh_flags>[::<sh_type>]` — セクションヘッダの属性。
+/* `.elfsection::<名前>::<sh_flags>[::<sh_type>[::<整列>]]` — セクションヘッダの属性。
  *
  * 書かなかったセクションは従来どおり名前から決まる（`.text` は
  * SHF_ALLOC|SHF_EXECINSTR、`.data` と `.bss` は SHF_ALLOC|SHF_WRITE、
  * `.rodata` とそれ以外は SHF_ALLOC、型は `.bss` だけ SHT_NOBITS で他は
  * SHT_PROGBITS）。名前で決まる規則を持たない、その機種固有のセクションを
- * 出すための宣言である。axx.py の elfsection_processing() と同じ規則である。 */
+ * 出すための宣言である。
+ *
+ * 整列は sh_addralign にそのまま入る。0 か 2 の冪でなければならない
+ * （ELF の要求）。書かなければ weo_default_align() が決める。
+ * axx.py の elfsection_processing() と同じ規則である。 */
 static int dir_elfsection(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfsection") != 0) return 0;
     AsmState *st = &asmb->st;
@@ -6775,15 +6786,44 @@ static int dir_elfsection(Assembler *asmb, PatEntry *e){
         if(!elf_decl_num(asmb, ".elfsection", e->f[3], 0, 0xFFFFFFFFll, &ty)) return 1;
         type_set = 1;
     }
-    elf_sec_set(st, nm, (uint32_t)fl, type_set, (uint32_t)ty);
+    int al_set = 0; long long al = 0;
+    if(e->f[4][0]){
+        if(!elf_decl_num(asmb, ".elfsection", e->f[4], 0, 0x40000000ll, &al)) return 1;
+        if(al & (al - 1)){
+            axx_diagf(1, 0, " error - .elfsection: alignment must be 0 or a "
+                            "power of two, got '%lld'.\n", al);
+            return 1;
+        }
+        al_set = 1;
+    }
+    elf_sec_set(st, nm, (uint32_t)fl, type_set, (uint32_t)ty,
+                al_set, (uint32_t)al);
     return 1;
 }
 
-/* セクションの sh_flags と sh_type を決める。`.elfsection` の宣言があれば
- * それを使い、無ければ名前の前方一致で決める従来の規則に従う。
+/* `.elfsection` で整列を書かなかったセクションの sh_addralign。
+ *
+ * SHT_NOTE (7) だけ 4 にし、他の型は従来どおり 16 のままにする。16 では
+ * binutils が `Corrupt note: alignment 16, expecting 4 or 8` と言って読め
+ * ない。ELF64 でも 4 なのは、note の n_namesz / n_descsz の詰め物が整列値に
+ * 従うからで、`.note.gnu.build-id` のような実在の note が ELF64 でも 4 で
+ * 書かれているのに合わせる。8 が要る note（`.note.gnu.property`）は
+ * `.elfsection` の整列欄に 8 と書く。
+ * axx.py の _elf_default_align() と同じ規則である。 */
+static uint32_t weo_default_align(uint32_t sh_type, int is_elf64){
+    (void)is_elf64;         /* note の整列は ELF クラスによらない */
+    if(sh_type == 7u) return 4u;
+    return 16u;
+}
+
+/* セクションの sh_flags と sh_type、`.elfsection` で整列が書かれていれば
+ * それも決める。宣言が無ければ名前の前方一致で決める従来の規則に従う。
+ * 整列を書いていないときは *al_set を 0 にして返し、既定値は
+ * weo_default_align() が決める。
  * axx.py の _elf_section_attrs() と同じ規則である。 */
 static void elf_section_attrs(const AsmState *st, const char *name,
-                              uint64_t *flags, uint32_t *shtype){
+                              uint64_t *flags, uint32_t *shtype,
+                              int *al_set, uint32_t *al){
     char un[64]; int ui=0;
     for(;name[ui]&&ui<63;ui++) un[ui]=(char)axx_upper_char(name[ui]);
     un[ui]=0;
@@ -6794,12 +6834,16 @@ static void elf_section_attrs(const AsmState *st, const char *name,
     else if(strncmp(un,".BSS",4)==0)    fl=0x2|0x1;
     else                                fl=0x2;
     uint32_t sht = (strncmp(un,".BSS",4)==0) ? 8u : 1u;
+    int a_set = 0; uint32_t a_val = 0;
     int k = elf_sec_find(st, name);
     if(k >= 0){
         fl = st->elf_secs[k].flags;
         if(st->elf_secs[k].type_set) sht = st->elf_secs[k].type;
+        if(st->elf_secs[k].al_set){ a_set = 1; a_val = st->elf_secs[k].al; }
     }
     *flags = fl; *shtype = sht;
+    if(al_set) *al_set = a_set;
+    if(al)     *al     = a_val;
 }
 
 static int dir_reloc(Assembler *asmb, PatEntry *e){
@@ -14557,7 +14601,8 @@ static char *file_input_from_stdin(void){
 
 
 typedef struct { uint8_t*b; size_t len,cap; } WBB;
-typedef struct { const char*name; uint64_t bs,bsz,fl; uint8_t*data; uint32_t sht; } WCS;
+typedef struct { const char*name; uint64_t bs,bsz,fl; uint8_t*data; uint32_t sht;
+                 int al_set; uint32_t al; } WCS;
 typedef struct { uint16_t shndx; uint64_t sv; } WSR;
 typedef struct { int64_t off; const char*sym; int rtype; int64_t addend; int nbytes; } WRE;
 typedef struct { WRE*data; int len,cap; } WRL;
@@ -14828,19 +14873,20 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     if(st->sections.count==0){
         ncs=1; csecs=calloc(1,sizeof(WCS));
         uint64_t wn=have_w?max_w+1:0;
-        uint64_t _fl0; uint32_t _sht0;
-        elf_section_attrs(st, ".text", &_fl0, &_sht0);
-        csecs[0]=(WCS){".text",0,wn*(uint64_t)bpw,_fl0,weo_extract(st,bpw,0,wn),_sht0};
+        uint64_t _fl0; uint32_t _sht0; int _as0; uint32_t _al0;
+        elf_section_attrs(st, ".text", &_fl0, &_sht0, &_as0, &_al0);
+        csecs[0]=(WCS){".text",0,wn*(uint64_t)bpw,_fl0,weo_extract(st,bpw,0,wn),
+                       _sht0,_as0,_al0};
     } else {
         ncs=st->sections.count; csecs=calloc((size_t)ncs,sizeof(WCS));
         for(int i=0;i<ncs;i++){
             SecEntry *se=st->sections.order[i];
             uint64_t w0=u256_to_u64(se->start);
-            uint64_t fl; uint32_t _sht;
-            elf_section_attrs(st, se->name, &fl, &_sht);
+            uint64_t fl; uint32_t _sht; int _as; uint32_t _al;
+            elf_section_attrs(st, se->name, &fl, &_sht, &_as, &_al);
             uint64_t _nb;
             uint8_t *_data = weo_extract_ranges(st, bpw, se->name, &_nb);
-            csecs[i]=(WCS){se->name,w0*(uint64_t)bpw,_nb,fl,_data,_sht};
+            csecs[i]=(WCS){se->name,w0*(uint64_t)bpw,_nb,fl,_data,_sht,_as,_al};
         }
     }
 
@@ -15266,7 +15312,9 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
 
     weo_shdr(fp,_is_le,_is_elf64,0,0,0,0,0,0,0,0,0,0);
     for(int i=0;i<ncs;i++)
-        weo_shdr(fp,_is_le,_is_elf64,sec_noff[i],csecs[i].sht,csecs[i].fl,0,sec_fo[i],csecs[i].bsz,0,0,16,0);
+        weo_shdr(fp,_is_le,_is_elf64,sec_noff[i],csecs[i].sht,csecs[i].fl,0,sec_fo[i],csecs[i].bsz,0,0,
+                 csecs[i].al_set ? csecs[i].al
+                                 : weo_default_align(csecs[i].sht,_is_elf64),0);
     {
     uint32_t _word_align = _is_elf64?8:4;
     uint32_t _rel_sh_type = _is_rela_w?4:9;

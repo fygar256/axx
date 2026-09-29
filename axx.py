@@ -1017,10 +1017,12 @@ def _reloc_same_width(mach, nbytes, want_pcrel):
 
 
 def _elf_section_attrs(state, name):
-    """セクションの (sh_flags, sh_type) を決める。
+    """セクションの (sh_flags, sh_type, sh_addralign) を決める。
 
-    `.elfsection::<名前>::<flags>[::<型>]`（マニュアル 3.7.7 節）で宣言があれば
-    それを使い、無ければ名前の前方一致で決める従来の規則に従う。
+    `.elfsection::<名前>::<flags>[::<型>[::<整列>]]`（マニュアル 3.7.7 節）で
+    宣言があればそれを使い、無ければ名前の前方一致で決める従来の規則に従う。
+    整列を書かなかったときは None を返す。既定値は ELF クラスを知る書き出し側
+    （_elf_default_align()）が決める。
     caxx.c の elf_section_attrs() と同じ規則である。
     """
     uname = name.upper()
@@ -1035,12 +1037,32 @@ def _elf_section_attrs(state, name):
     else:
         flags = 0x2
     sh_type = 8 if uname.startswith('.BSS') else 1
+    align = None
     decl = state.elf.decl_sec.get(name.lower())
     if decl is not None:
         flags = decl[0]
         if decl[1] is not None:
             sh_type = decl[1]
-    return flags, sh_type
+        if len(decl) > 2 and decl[2] is not None:
+            align = decl[2]
+    return flags, sh_type, align
+
+
+def _elf_default_align(sh_type, is_elf64):
+    """`.elfsection` で整列を書かなかったセクションの sh_addralign。
+
+    SHT_NOTE (7) だけ 4 にし、他の型は従来どおり 16 のままにする。16 では
+    binutils が `Corrupt note: alignment 16, expecting 4 or 8` と言って読め
+    ない。ELF64 でも 4 なのは、note の n_namesz / n_descsz の詰め物が整列値に
+    従うからで、`.note.gnu.build-id` のような実在の note が ELF64 でも 4 で
+    書かれているのに合わせる。8 が要る note（`.note.gnu.property`）は
+    `.elfsection` の整列欄に 8 と書く。
+    caxx.c の weo_default_align() と同じ規則である。
+    """
+    del is_elf64            # note の整列は ELF クラスによらない
+    if sh_type == 7:
+        return 4
+    return 16
 
 
 def _reloc_named(state, mach, name):
@@ -1179,7 +1201,7 @@ class ElfState:
         self.decl_extern = ''      # `.elfextern` 型欄の文字列
         self.decl_dwarf = ''       # `.elfdwarf` 型欄の文字列
         self.decl_hdr = {}         # `.elfheader` 欄名 → 値
-        self.decl_sec = {}         # `.elfsection` 名前(小文字) → (sh_flags, sh_type|None)
+        self.decl_sec = {}         # `.elfsection` 名前(小文字) → (sh_flags, sh_type|None, 整列|None)
         self.type_width = {}       # `.elftype` の幅欄（型名 → バイト幅）
         self.type_pcrel = set()    # `.elftype` の PC 相対欄が立った型名
         self.decl_gen = 0          # 宣言が変わるたびに増える（控えの鍵）
@@ -4613,13 +4635,17 @@ class DirectiveProcessor:
         return True
 
     def elfsection_processing(self, i):
-        """`.elfsection::<名前>::<sh_flags>[::<sh_type>]` — セクションヘッダの属性。
+        """`.elfsection::<名前>::<sh_flags>[::<sh_type>[::<整列>]]` — セクションヘッダの属性。
 
         書かなかったセクションは従来どおり名前から決まる（`.text` は
         SHF_ALLOC|SHF_EXECINSTR、`.data` と `.bss` は SHF_ALLOC|SHF_WRITE、
         `.rodata` とそれ以外は SHF_ALLOC、型は `.bss` だけ SHT_NOBITS で他は
         SHT_PROGBITS）。名前で決まる規則を持たない、その機種固有のセクションを
-        出すための宣言である。caxx.c の dir_elfsection() と同じ規則である。
+        出すための宣言である。
+
+        整列は sh_addralign にそのまま入る。0 か 2 の冪でなければならない
+        （ELF の要求）。書かなければ _elf_default_align() が決める。
+        caxx.c の dir_elfsection() と同じ規則である。
         """
         if len(i) == 0 or i[0] != '.elfsection':
             return False
@@ -4637,10 +4663,19 @@ class DirectiveProcessor:
             ty = self._elf_decl_num('.elfsection', i[3], 0, 0xFFFFFFFF)
             if ty is None:
                 return True
+        al = None
+        if len(i) > 4 and i[4] and i[4].strip():
+            al = self._elf_decl_num('.elfsection', i[4], 0, 0x40000000)
+            if al is None:
+                return True
+            if al & (al - 1):
+                self.state.diag(" error - .elfsection: alignment must be 0 or a "
+                                f"power of two, got '{al}'.", set_error=True)
+                return True
         e = self.state.elf
         key = nm.lower()
-        if e.decl_sec.get(key) != (fl, ty):
-            e.decl_sec[key] = (fl, ty)
+        if e.decl_sec.get(key) != (fl, ty, al):
+            e.decl_sec[key] = (fl, ty, al)
             e.decl_gen += 1
         return True
 
@@ -12232,23 +12267,24 @@ class Assembler:
 
         class _CSec:
             __slots__ = ('name', 'byte_start', 'data', 'byte_size', 'flags',
-                         'sh_type')
+                         'sh_type', 'align')
 
-            def __init__(self, name, byte_start, data, flags, sh_type):
+            def __init__(self, name, byte_start, data, flags, sh_type, align):
                 self.name       = name
                 self.byte_start = byte_start
                 self.data       = data
                 self.byte_size  = len(data)
                 self.flags      = flags
                 self.sh_type    = sh_type
+                self.align      = align
 
         csecs = []
         max_w = max(buf.keys(), default=-1)
 
         if not self.state.sections:
             w_count = max_w + 1 if max_w >= 0 else 0
-            _fl0, _sht0 = _elf_section_attrs(self.state, '.text')
-            csecs.append(_CSec('.text', 0, _extract(0, w_count), _fl0, _sht0))
+            _fl0, _sht0, _al0 = _elf_section_attrs(self.state, '.text')
+            csecs.append(_CSec('.text', 0, _extract(0, w_count), _fl0, _sht0, _al0))
         else:
             sec_names = list(self.state.sections.keys())
             for i, sname in enumerate(sec_names):
@@ -12257,8 +12293,8 @@ class Assembler:
                 w0 = ranges[0][0] if ranges else self.state.sections[sname][0]
                 byte_start = w0 * bpw
                 data = b''.join(_extract(rs, rl) for rs, rl in ranges)
-                flags, _sht = _elf_section_attrs(self.state, sname)
-                csecs.append(_CSec(sname, byte_start, data, flags, _sht))
+                flags, _sht, _al = _elf_section_attrs(self.state, sname)
+                csecs.append(_CSec(sname, byte_start, data, flags, _sht, _al))
 
         ncs = len(csecs)
 
@@ -12572,9 +12608,11 @@ class Assembler:
 
             for i, s in enumerate(csecs):
                 _sh_type_i = s.sh_type
+                _al_i = (s.align if s.align is not None
+                         else _elf_default_align(_sh_type_i, _is_elf64))
                 f.write(_pack_shdr(
                     sec_name_offs[i], _sh_type_i, s.flags, 0,
-                    sec_offsets[i], s.byte_size, 0, 0, 16, 0))
+                    sec_offsets[i], s.byte_size, 0, 0, _al_i, 0))
 
             _word_align = 8 if _is_elf64 else 4
             _sym_entsize = 24 if _is_elf64 else 16

@@ -85,13 +85,17 @@ elfprio.axx                         pattern file for the relocation type
 elfprio.s                           test assemble file for elfprio.axx. build it
                                     with -o to see which rank decided each
                                     relocation
-elfsec.axx                          pattern file for .elfsection: the sh_flags
-                                    and sh_type of a section whose name axx has
-                                    no rule for -- a vector table, an
-                                    uninitialised region not called .bss, a
-                                    note section (manual 3.7.7)
+elfsec.axx                          pattern file for .elfsection: the sh_flags,
+                                    sh_type and sh_addralign of a section whose
+                                    name axx has no rule for -- a vector table,
+                                    an uninitialised region not called .bss, a
+                                    note section, and a section whose alignment
+                                    is written out (manual 3.7.7)
 elfsec.s                            test assemble file for elfsec.axx. build it
-                                    with -o and read the section headers
+                                    with -o and read the section headers.
+                                    the .note.axx section is a well-formed ELF
+                                    note, so `readelf -n` reads it and the
+                                    SHT_NOTE alignment can be checked
 endsub.axx                          pattern file for closing a `.sub` block with
                                     `.endsub` instead of `.return`: the two
                                     spellings mean the same thing and can be

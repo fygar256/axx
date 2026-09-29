@@ -41,7 +41,9 @@ exactly that: `test1` assembles all twenty-eight bundled pattern/source pairs wi
 both implementations and `cmp`s the results. For the three `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` pair the `.echo` lines each one writes to standard
-error, for thirty-two comparisons in all.
+error. The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
+and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
+text output are compared too, for a hundred and forty-four comparisons in all.
 
 **Contents**
 
@@ -1476,7 +1478,7 @@ ELF object should look like.
 | `.elfextern::<type>` | the default type for `.extern` with no type name |
 | `.elfdwarf::<type>` | the absolute type the `-g` DWARF output uses |
 | `.elfheader::<field>::<value>` | a field of the ELF header |
-| `.elfsection::<name>::<sh_flags>[::<sh_type>]` | the attributes of a section header |
+| `.elfsection::<name>::<sh_flags>[::<sh_type>[::<align>]]` | the attributes of a section header |
 
 - Every declaration is a difference *laid over* the built-in table selected with
   `-m`. On a machine that is in the table, only what you write is replaced — so
@@ -1532,7 +1534,8 @@ its attributes from its name, as before.
 ```
 .elfsection::.vectors::0x6           /* ALLOC+EXECINSTR, type left alone */
 .elfsection::.noinit::0x3::8         /* ALLOC+WRITE, SHT_NOBITS          */
-.elfsection::.note.axx::0::7         /* no flags, SHT_NOTE               */
+.elfsection::.note.axx::0::7         /* no flags, SHT_NOTE, align 4      */
+.elfsection::.vectors2::0x6::1::2    /* alignment written out: 2         */
 ```
 
 This is how a section the name rule does not know — a machine's own vector
@@ -1545,8 +1548,19 @@ the attributes it needs.
   no `sh_type` written, the type stays the one the name rule gives.
 - A section made `SHT_NOBITS` (8) carries only its `sh_size`; its contents are
   not written to the file, exactly as `.bss` is treated.
+- The fourth field is `sh_addralign`. It must be 0 or a power of two (the ELF
+  requirement); anything else is diagnosed and the declaration ignored.
 
-The bundled `elfsec.axx` / `elfsec.s` are a worked example.
+**The default alignment.** A section with no alignment written gets 16, except
+`SHT_NOTE` (7), which gets 4. A note's `sh_addralign` has to be 4 or 8, and at
+16 binutils reports `Corrupt note: alignment 16, expecting 4 or 8` and cannot
+read the contents. It is 4 rather than 8 even for ELF64 because a note's
+`n_namesz` / `n_descsz` padding follows the alignment, and real notes such as
+`.note.gnu.build-id` are written with 4 in ELF64 too. A note that needs 8
+(`.note.gnu.property`) says 8 in this field.
+
+The bundled `elfsec.axx` / `elfsec.s` are a worked example; `elfsec.s` writes a
+note `readelf -n` can read, so the alignment can be checked.
 
 **Example.** A description of EM_MSP430 (105), a machine axx has no built-in
 table for.
@@ -3467,7 +3481,7 @@ The x86_64 pattern file is also maintained separately at
 | **elftype.axx** | 1.5 KB | 15 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
 | **elfgen.axx** | 2.7 KB | 24 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 19 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
-| **elfsec.axx** | 1.1 KB | 6 | **elfsec.s** | section attributes declared with `.elfsection` (3.7.7); test only |
+| **elfsec.axx** | 1.4 KB | 7 | **elfsec.s** | section attributes and `sh_addralign` declared with `.elfsection` (3.7.7); test only |
 | **endsub.axx** | 1.2 KB | 4 | **endsub.s** | closing a `.sub` block with `.endsub` (3.7.2); test only |
 | **intel2att.axx** | 12 KB | 434 | **intel2att.s** | x86-64 Intel to AT&T source translator; `.textmode`, `!Y`, `!L` and macro-layer pattern generation (3.18). The translated text assembles with GNU as |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
@@ -3487,7 +3501,17 @@ ELF header, the `elfprio.axx` / `elfprio.s` pair is about which of the three
 ranks types a relocation, and the `elfsec.axx` / `elfsec.s` pair is about the
 section headers, so for those four the `-o` ELF objects are compared. For the
 `echo.axx` / `echo.s` pair the `.echo` lines written to standard error are
-compared as well, for thirty-two comparisons in all.
+compared as well.
+
+The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
+`68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
+under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
+listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
+never compares, for a hundred and forty-four comparisons in all.
+
+When comparing under `-g`, run both implementations in the same directory: DWARF
+records the working directory in `DW_AT_comp_dir`, so running them in different
+places makes identical output compare unequal.
 
 The `aarch64.axx` / `aarch64.s` pair is much the slowest of them: the Python
 implementation takes about twenty seconds on it, against about a second for the
