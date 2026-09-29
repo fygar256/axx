@@ -2826,7 +2826,7 @@ Precedence follows Python, loosest last:
 'c'             character code
 :=              assignment
 **              exponentiation
-*, /, //        multiplication, division, integer division
+*, /, //, %     multiplication, division, integer division, remainder
 +, -            addition, subtraction
 <<, >>          shifts
 &               bitwise AND
@@ -2845,6 +2845,17 @@ x?a:b           ternary
 - `@v` gives the bit position of the highest set bit of `v` counted from the
   right. (The Hebimarumatta operator.)
 - `a'24` sign-extends `a`, treating bit 24 as the sign bit. (The SEX operator.)
+- `/` truncates toward zero (`-7/3 == -2`). `%` follows Python: the result takes
+  the sign of the **divisor** (`-7%3 == 2`, `7%-3 == -2`). `a == (a/b)*b + a%b`
+  does not hold between the two.
+- The sign of `%` here is **not** the sign of `%` in the mini language (3.15) or
+  the macro layer (7.3). Those follow C and take the sign of the dividend, so the
+  same `-7%3` is `-1` there. Watch negative values when moving an expression from
+  one layer to another.
+- Inside a `binary_list`, `%0` is not a remainder: it is the term that resets the
+  `@@[]` repeat index to 0 (3.5.1). Writing `x%0` therefore reports no
+  division-by-zero. Write `x % 0` with a space, or parenthesize, when a remainder
+  is what you mean.
 
 ### 6.3 What is available where
 
