@@ -40,7 +40,7 @@ x86-64(62)、AArch64(183)、RISC-V(243) — だけを相手にしていました
 | `.elfextern::<型>` | `.extern` が型名を書かなかったときの既定の型 |
 | `.elfdwarf::<型>` | `-g` の DWARF が書く絶対アドレス参照の型 |
 | `.elfheader::<欄名>::<値>` | ELF ヘッダの欄 |
-| `.elfsection::<名前>::<sh_flags>[::<sh_type>]` | セクションヘッダの属性 |
+| `.elfsection::<名前>::<sh_flags>[::<sh_type>[::<整列>]]` | セクションヘッダの属性 |
 
 共通の決まりです。
 
@@ -90,13 +90,24 @@ x86-64(62)、AArch64(183)、RISC-V(243) — だけを相手にしていました
 ```
 .elfsection::.vectors::0x6           /* ALLOC+EXECINSTR、型は既定のまま */
 .elfsection::.noinit::0x3::8         /* ALLOC+WRITE、SHT_NOBITS         */
-.elfsection::.note.axx::0::7         /* 欄なし、SHT_NOTE                */
+.elfsection::.note.axx::0::7         /* 欄なし、SHT_NOTE、整列は 4      */
+.elfsection::.vectors2::0x6::1::2    /* 整列を明示して 2                */
 ```
 
 その機種のベクタ表、`.bss` という名前ではない未初期化領域、ノートセクション —
 そういうものを出すための宣言です。セクション名は大小を区別せず丸ごと一致で
 引き当てます。`sh_type` を書かなければ名前の規則のまま残ります。`SHT_NOBITS`
-にしたセクションは `sh_size` だけを持ち、中身をファイルに書きません。
+にしたセクションは `sh_size` だけを持ち、中身をファイルに書きません。第 4 欄は
+`sh_addralign` です。0 か 2 の冪でなければならず（ELF の要求）、そうでなければ
+診断して読み飛ばします。
+
+**整列の既定値。** 整列を書かなかったセクションは 16 になります。ただし
+`SHT_NOTE`（7）だけは 4 です。note は `sh_addralign` が 4 か 8 でなければ
+ならず、16 だと binutils が `Corrupt note: alignment 16, expecting 4 or 8`
+と言って中身を読めません。ELF64 でも 8 ではなく 4 なのは、note の
+`n_namesz` / `n_descsz` の詰め物が整列値に従うからで、`.note.gnu.build-id`
+のような実在の note が ELF64 でも 4 で書かれているのに合わせています。8 が
+要る note（`.note.gnu.property`）は、この欄に 8 と書いてください。
 
 実例は同梱の `elfsec.axx` / `elfsec.s` です。
 

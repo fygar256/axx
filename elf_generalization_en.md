@@ -40,7 +40,7 @@ type is used** and **how the ELF is put together**.
 | `.elfextern::<type>` | the default type for `.extern` with no type name |
 | `.elfdwarf::<type>` | the absolute type the `-g` DWARF output uses |
 | `.elfheader::<field>::<value>` | a field of the ELF header |
-| `.elfsection::<name>::<sh_flags>[::<sh_type>]` | the attributes of a section header |
+| `.elfsection::<name>::<sh_flags>[::<sh_type>[::<align>]]` | the attributes of a section header |
 
 Rules they share:
 
@@ -94,14 +94,25 @@ came out as an allocated `SHT_PROGBITS`, with no way to change it.
 ```
 .elfsection::.vectors::0x6           /* ALLOC+EXECINSTR, type left alone */
 .elfsection::.noinit::0x3::8         /* ALLOC+WRITE, SHT_NOBITS          */
-.elfsection::.note.axx::0::7         /* no flags, SHT_NOTE               */
+.elfsection::.note.axx::0::7         /* no flags, SHT_NOTE, align 4      */
+.elfsection::.vectors2::0x6::1::2    /* alignment written out: 2         */
 ```
 
 A machine's own vector table, an uninitialised region that is not called
 `.bss`, a note section — this is what writes those. The section name is matched
 without regard to case, as a whole name. With no `sh_type` written, the type
 stays the one the name rule gives. A section made `SHT_NOBITS` carries only its
-`sh_size`; its contents are not written to the file.
+`sh_size`; its contents are not written to the file. The fourth field is
+`sh_addralign`. It must be 0 or a power of two (the ELF requirement); anything
+else is diagnosed and the declaration ignored.
+
+**The default alignment.** A section with no alignment written gets 16, except
+`SHT_NOTE` (7), which gets 4. A note's `sh_addralign` has to be 4 or 8, and at
+16 binutils reports `Corrupt note: alignment 16, expecting 4 or 8` and cannot
+read the contents. It is 4 rather than 8 even for ELF64 because a note's
+`n_namesz` / `n_descsz` padding follows the alignment, and real notes such as
+`.note.gnu.build-id` are written with 4 in ELF64 too. A note that needs 8
+(`.note.gnu.property`) says 8 in this field.
 
 The bundled `elfsec.axx` / `elfsec.s` are a worked example.
 
