@@ -1,0 +1,64 @@
+/* PowerPC64, little-endian (ELFv2 / ppc64le). See ppc64_isa.axx. */
+.setsym::PPCLE::1
+.bits::little::8
+.elfmachine::21::PowerPC64
+.elfclass::64
+.elfheader::flags::2
+
+/* ELF relocations (-o). Relocation types of the 64-bit PowerPC ELF ABI,
+/* and, for the instruction-field ones, where the field sits (.elffield:
+/* the bits within the field, then its byte offset in the instruction).
+/* A 16-bit field is the low halfword of the word: bytes 2-3 big-endian,
+/* bytes 0-1 little-endian. A 34-bit prefixed field is 18 bits of the
+/* prefix word and 16 bits of the suffix word. */
+.elftype::addr32::1::4
+.elftype::addr24::2::4
+.elftype::addr16::3::2
+.elftype::addr16_lo::4::2
+.elftype::addr16_hi::5::2
+.elftype::addr16_ha::6::2
+.elftype::addr14::7::4
+.elftype::rel24::10::4::1
+.elftype::rel14::11::4::1
+.elftype::addr64::38::8
+.elftype::addr16_higher::39::2
+.elftype::addr16_highera::40::2
+.elftype::addr16_highest::41::2
+.elftype::addr16_highesta::42::2
+.elftype::addr16_ds::56::2
+.elftype::addr16_lo_ds::57::2
+.elftype::addr16_high::110::2
+.elftype::addr16_higha::111::2
+.elftype::d34::128::8
+.elftype::pcrel34::132::8::1
+.elffield::rel24::0x03fffffc
+.elffield::addr24::0x03fffffc
+.elffield::rel14::0xfffc
+.elffield::addr14::0xfffc
+.elffield::addr16::0xffff::0
+.elffield::addr16_lo::0xffff::0
+.elffield::addr16_hi::0xffff::0
+.elffield::addr16_ha::0xffff::0
+.elffield::addr16_high::0xffff::0
+.elffield::addr16_higha::0xffff::0
+.elffield::addr16_higher::0xffff::0
+.elffield::addr16_highera::0xffff::0
+.elffield::addr16_highest::0xffff::0
+.elffield::addr16_highesta::0xffff::0
+/* DS / DQ forms: the low bits of the field hold opcode bits (and TX
+/* for lxv / stxv), which the linker keeps, so they are not cleared. */
+.elffield::addr16_ds::0xfff0::0
+.elffield::addr16_lo_ds::0xfff0::0
+.elffield::d34::0x0000ffff0003ffff
+.elffield::pcrel34::0x0000ffff0003ffff
+/* data: .long / .short / .quad of a symbol, and .extern with no type */
+.elfwidth::8::addr64
+.elfwidth::4::addr32
+.elfwidth::2::addr16
+.elfextern::addr64
+.elfdwarf::addr64
+/* A prefixed instruction must not cross a 64-byte boundary, so .text
+/* keeps that alignment through the link, as GNU as does. */
+.elfsection::.text::6::1::64
+
+.include "ppc64_isa.axx"

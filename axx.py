@@ -316,7 +316,8 @@ def _lead_caps(pat_text):
 _HOIST_TEXT_ONLY = ('.check', '.clrcheck', '.reloc', '.clrreloc',
                     '.symbolc', '.passthru', '.eol', '.textmode',
                     '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
-                    '.elfextern', '.elfdwarf', '.elfheader', '.elfsection')
+                    '.elfextern', '.elfdwarf', '.elfheader', '.elfsection',
+                    '.elffield')
 
 
 def _pat_text_dynamic(t):
@@ -988,10 +989,18 @@ def elf_machine_table(state):
     if e.decl_name and (e.decl_machine is None or e.decl_machine == e.machine):
         name = e.decl_name
 
+    # `.elffield` で命令フィールド型と宣言した型（型番号 → (マスク, オフセット)）。
+    field = {}
+    for text, fo in e.decl_field.items():
+        rt = _elf_decl_type(state, named, text)
+        if rt is not None:
+            field.setdefault(rt, fo)
+
     tbl = dict(base, name=name, elfclass=elfclass, is_rela=is_rela,
                width_guess=width_guess, pc_rel=pc_rel,
                extern_default=extern_default, dwarf_abs=dwarf_abs,
-               named=named, reloc_bytes=reloc_bytes, reverse=reverse)
+               named=named, reloc_bytes=reloc_bytes, reverse=reverse,
+               field=field)
     e.mach_cache_key = key
     e.mach_cache = tbl
     return tbl
@@ -1139,7 +1148,20 @@ AARCH64_INSN_RELOCS = {
 }
 
 
-def insn_reloc_field_mask(rtype, machine=183):
+def insn_reloc_field_decl(state, rtype):
+    """`.elffield` で宣言した命令フィールド型なら (マスク, オフセット)、でなければ None。
+
+    マスクは型の幅（`.elftype` の幅欄かマシンの名前表）ぶんのバイト列を対象の
+    バイト順で読んだ整数の中のビット、オフセットはその欄が命令の先頭から何バイト
+    目に始まるか。r_offset もこの位置になる。caxx.c の insn_reloc_field_decl() と
+    同じである。
+    """
+    if state is None or not state.elf.decl_field:
+        return None
+    return elf_machine_table(state)['field'].get(rtype)
+
+
+def insn_reloc_field_mask(rtype, machine=183, state=None):
     """命令フィールド型なら、その値が占める 32bit 命令語中のビットマスクを返す。
 
     データ型や未知の型では None。呼び出し側はこれで「通常の加数計算をするか、
@@ -1150,6 +1172,9 @@ def insn_reloc_field_mask(rtype, machine=183):
     AArch64 のときだけ引く。`.elftype`（3.7.7 節）で同じ番号を宣言した別機種の
     型を、命令フィールド型と取り違えないためである。
     """
+    _fd = insn_reloc_field_decl(state, rtype)
+    if _fd is not None:
+        return _fd[0]
     if machine != 183:
         return None
     fields = AARCH64_INSN_RELOCS.get(rtype)
@@ -1201,6 +1226,7 @@ class ElfState:
         self.decl_extern = ''      # `.elfextern` 型欄の文字列
         self.decl_dwarf = ''       # `.elfdwarf` 型欄の文字列
         self.decl_hdr = {}         # `.elfheader` 欄名 → 値
+        self.decl_field = {}       # `.elffield` 型欄の文字列 → (マスク, オフセット)
         self.decl_sec = {}         # `.elfsection` 名前(小文字) → (sh_flags, sh_type|None, 整列|None)
         self.type_width = {}       # `.elftype` の幅欄（型名 → バイト幅）
         self.type_pcrel = set()    # `.elftype` の PC 相対欄が立った型名
@@ -1297,6 +1323,7 @@ class AssemblerState:
 
         # --- 記号表 ---
         self.labels = {}         # ソース側ラベル 名 → [値, セクション, is_equ, ...]
+        self.extern_untyped = set()  # 型名なしの `.extern` で宣言したラベル名
         self.sections = {}       # セクション名 → [開始, ワード数, 入口pc]
         self.symbols = {}        # 現在有効なシンボル（patsymbols のコピー＋α）
         self.patsymbols = {}     # パターンファイルの .setsym で定義されたもの
@@ -3922,7 +3949,7 @@ class BinaryWriter:
         # 黙って壊れた方が困るので、どの箇所かを添えて知らせる。
         if self.state.elf_objfile:
             _zeroed = [r for r in self.state.relocations
-                       if insn_reloc_field_mask(r[3], self.state.elf_machine) is not None]
+                       if insn_reloc_field_mask(r[3], self.state.elf_machine, self.state) is not None]
             if _zeroed:
                 _where = ', '.join(f"{r[0]}+0x{r[1]:x}" for r in _zeroed[:4])
                 if len(_zeroed) > 4:
@@ -4252,7 +4279,7 @@ class DirectiveProcessor:
         if not self.state.elf_objfile or not self.state.reloc_constraints:
             return False
         for var, rtype in self.state.reloc_constraints.items():
-            if insn_reloc_field_mask(rtype, self.state.elf_machine) is None:
+            if insn_reloc_field_mask(rtype, self.state.elf_machine, self.state) is None:
                 continue
             for m in re.finditer(re.escape(var), cond_src):
                 b, e = m.start(), m.end()
@@ -4662,6 +4689,37 @@ class DirectiveProcessor:
         e = self.state.elf
         if e.decl_hdr.get(fld) != v:
             e.decl_hdr[fld] = v
+            e.decl_gen += 1
+        return True
+
+    def elffield_processing(self, i):
+        """`.elffield::<型>::<マスク>[::<オフセット>]` — 命令フィールド型のリロケーション。
+
+        `.reloc` でこの型を宣言した変数がラベルを運ぶと、加数は「変数の値 −
+        ラベルの値」になり、欄は 0 で出る（RELA、GNU as と同じ形）。マスクは型の幅
+        ぶんのバイト列を対象のバイト順で読んだ整数の中で、リンカが書き込むビット。
+        オフセットはその欄が命令の先頭（その行が出す最初のワード）から何バイト目
+        かで、r_offset もそこを指す。caxx.c の dir_elffield() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.elffield':
+            return False
+        _tf, _mf = self._elf_decl_fields(i)
+        t = _tf.strip()
+        if not t:
+            self.state.diag(" error - .elffield: relocation type is not specified.",
+                            set_error=True)
+            return True
+        m = self._elf_decl_num('.elffield', _mf, 1, 0x7FFFFFFFFFFFFFFF)
+        if m is None:
+            return True
+        off = 0
+        if len(i) > 3 and i[3] and i[3].strip():
+            off = self._elf_decl_num('.elffield', i[3], 0, 255)
+            if off is None:
+                return True
+        e = self.state.elf
+        if e.decl_field.get(t) != (m, off):
+            e.decl_field[t] = (m, off)
             e.decl_gen += 1
         return True
 
@@ -5165,7 +5223,7 @@ _PAT_DIRECTIVES = frozenset((
     '.passthru', '.eol', '.textmode', '.enum', '.clrenum', '.error',
     '.echo',
     '.elftype', '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
-    '.elfextern', '.elfdwarf', '.elfheader', '.elfsection'))
+    '.elfextern', '.elfdwarf', '.elfheader', '.elfsection', '.elffield'))
 
 
 # `.setsym` の値欄が「ソースの行によって変わりようのない定数式」か。
@@ -9119,6 +9177,14 @@ class AssemblyDirectiveProcessor:
 
             existing = self.state.labels.get(label_part)
 
+            # 型名を書かなかった `.extern` の既定型は、パターンファイルの `.reloc`
+            # が命令フィールド型を決めた参照では使わない（ソースが型を「書いた」
+            # わけではないので、優先順位 3.7.8 の「ソースファイル」に当たらない）。
+            if explicit_reloc_type:
+                self.state.extern_untyped.discard(label_part)
+            elif existing is None:
+                self.state.extern_untyped.add(label_part)
+
             if existing is None:
                 self.state.labels[label_part] = [0, '.text', False, True, reloc_type]
             elif len(existing) > 3 and existing[3]:
@@ -11432,9 +11498,11 @@ class Assembler:
                     _forced_rtype = None
                     if _hint is not None:
                         _hint_rtype, _hint_addend = _hint
-                        if _src_rtype is not None:
+                        if _src_rtype is not None and lname not in self.state.extern_untyped:
                             _hint_rtype = _src_rtype
-                        _fmask = insn_reloc_field_mask(_hint_rtype, self.state.elf_machine)
+                        _fmask = insn_reloc_field_mask(_hint_rtype, self.state.elf_machine, self.state)
+                        _fdecl = insn_reloc_field_decl(self.state, _hint_rtype)
+                        _foff = _fdecl[1] if _fdecl is not None else 0
                         if _fmask is None:
                             # データ型を宣言した場合。加数は通常どおり出力バイト列
                             # から求まるので、型だけを固定して下の経路へ渡す。
@@ -11442,7 +11510,8 @@ class Assembler:
                         else:
                             _insn_bytes = _mach_tbl_la['reloc_bytes'].get(_hint_rtype, 4)
                             _insn_words = max(1, _insn_bytes // bpw_r)
-                            if first_widx + _insn_words <= len(objl):
+                            _fw = first_widx + _foff // bpw_r
+                            if _fw + _insn_words <= len(objl):
                                 # RELA ではリンカが欄を埋めるので、命令語側は 0 に
                                 # しておく（GNU as と同じ形）。
                                 _wmask = (1 << self.state.bts) - 1
@@ -11450,9 +11519,9 @@ class Assembler:
                                     _sh = self.state.bts * _k if self.state.endian == 'little' \
                                         else self.state.bts * (_insn_words - 1 - _k)
                                     _clear = (_fmask >> _sh) & _wmask
-                                    objl[first_widx + _k] = int(objl[first_widx + _k]) & ~_clear & _wmask
+                                    objl[_fw + _k] = int(objl[_fw + _k]) & ~_clear & _wmask
                             _sec_rel_h = (_completed_words
-                                          + (self.state.pc + first_widx - _entry_pc_cur)) * bpw_r
+                                          + (self.state.pc + _fw - _entry_pc_cur)) * bpw_r
                             self.state.relocations.append(
                                 (sec_name_r, _sec_rel_h, lname, _hint_rtype,
                                  _hint_addend, _insn_bytes))
@@ -11604,7 +11673,7 @@ class Assembler:
     # パターン表から先に拾う ELF 宣言（マニュアル 3.7.7 節）→ 処理する関数名。
     _ELF_DECL_DIRECTIVES = ('.elftype', '.elfmachine', '.elfclass', '.elfrela',
                             '.elfwidth', '.elfextern', '.elfdwarf', '.elfheader',
-                            '.elfsection')
+                            '.elfsection', '.elffield')
 
     def register_elfdecls(self, pat):
         """パターン表の ELF 宣言を、組み立てを始める前に一度そろえて登録する。
@@ -11626,6 +11695,7 @@ class Assembler:
             '.elfdwarf':   d.elfdwarf_processing,
             '.elfheader':  d.elfheader_processing,
             '.elfsection': d.elfsection_processing,
+            '.elffield':   d.elffield_processing,
         }
         for i in pat:
             if i and i[0] in table:
@@ -11653,6 +11723,10 @@ class Assembler:
         for dname, t in (('.elfextern', e.decl_extern), ('.elfdwarf', e.decl_dwarf)):
             if t and _elf_decl_type(self.state, named, t) is None:
                 self.state.diag(f" warning - {dname}: unknown relocation type '{t}' "
+                                f"for {tbl['name']}; ignored.", set_error=False)
+        for t in e.decl_field:
+            if _elf_decl_type(self.state, named, t) is None:
+                self.state.diag(f" warning - .elffield: unknown relocation type '{t}' "
                                 f"for {tbl['name']}; ignored.", set_error=False)
 
     def setpatsymbols(self, pat):
@@ -12865,6 +12939,7 @@ class Assembler:
             '.elfdwarf':   d.elfdwarf_processing,
             '.elfheader':  d.elfheader_processing,
             '.elfsection': d.elfsection_processing,
+            '.elffield':   d.elffield_processing,
         }
         out = []
         for row, i in enumerate(pat):

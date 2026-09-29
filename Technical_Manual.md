@@ -1362,7 +1362,8 @@ than letting it pass:
  them in.
 ```
 
-These are the instruction-field types available for AArch64. The data types
+These are the instruction-field types built in for AArch64 (any other machine
+declares its own with `.elffield`, section 3.7.7). The data types
 (`abs64` `abs32` `abs16` `pc64` `pc32` `pc16`) are still inferred without a
 `.reloc`.
 
@@ -1481,6 +1482,7 @@ ELF object should look like.
 | `.elfdwarf::<type>` | the absolute type the `-g` DWARF output uses |
 | `.elfheader::<field>::<value>` | a field of the ELF header |
 | `.elfsection::<name>::<sh_flags>[::<sh_type>[::<align>]]` | the attributes of a section header |
+| `.elffield::<type>::<mask>[::<offset>]` | an instruction-field relocation type (below, "Instruction-field types") |
 
 - Every declaration is a difference *laid over* the built-in table selected with
   `-m`. On a machine that is in the table, only what you write is replaced — so
@@ -1563,6 +1565,48 @@ read the contents. It is 4 rather than 8 even for ELF64 because a note's
 
 The bundled `elfsec.axx` / `elfsec.s` are a worked example; `elfsec.s` writes a
 note `readelf -n` can read, so the alignment can be checked.
+
+**Instruction-field types (`.elffield`).**
+
+```
+.elffield::<type>::<mask>[::<offset>]
+```
+
+Declares that `<type>` packs its value into bit fields of an instruction rather
+than into plain consecutive bytes, the way `.reloc` (section 3.7.5) needs. It
+gives any machine what the built-in table gives AArch64: a row typed with
+`.reloc::t::<type>` then carries the addend "operand value - label value", its
+field is written as 0 (RELA, the shape GNU as produces), and the range and
+alignment checks on that operand are left to the linker.
+
+- `<mask>` is the set of bits the linker writes, within the bytes of the type's
+  width (from `.elftype` or the machine's name table) read as an integer in the
+  target byte order. A 34-bit field split over two instruction words is one
+  64-bit mask.
+- `<offset>` (default 0) is where the field starts, in bytes from the first
+  word the row emits for that operand; `r_offset` points there. A 16-bit field
+  in the low half of a 32-bit word is at 2 big-endian and at 0 little-endian.
+- The type may be an `.elftype` name, a built-in name or a number. Writing the
+  same type again replaces the earlier declaration.
+
+```
+.elftype::rel24::10::4::1
+.elftype::addr16_ha::6::2
+.elffield::rel24::0x03fffffc            /* PowerPC64 bl: the LI field   */
+.elffield::addr16_ha::0xffff::2         /* the low halfword, big-endian */
+
+.reloc::t::rel24
+BL !t :: .call w4(0x48000001|((t-$$)&0x3fffffc))
+.clrreloc::t
+```
+
+```
+bl ext+8        ->  R_PPC64_REL24  ext + 8
+```
+
+A `.extern` written without a type name does not override the type `.reloc`
+gives an instruction field: only a type the source wrote (`.extern ext::abs64`)
+counts as "the source file" in the priority of section 3.7.8.
 
 **Example.** A description of EM_MSP430 (105), a machine axx has no built-in
 table for.

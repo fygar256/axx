@@ -1220,7 +1220,7 @@ enum {
     PD_VLIW, PD_CHECK, PD_CLRCHECK, PD_RELOC, PD_CLRRELOC, PD_MAP, PD_FREE,
     PD_PASSTHRU, PD_EOL, PD_TEXTMODE, PD_ENUM, PD_CLRENUM, PD_ERRMSG, PD_EPIC,
     PD_ELFTYPE, PD_ELFMACHINE, PD_ELFCLASS, PD_ELFRELA, PD_ELFWIDTH,
-    PD_ELFEXTERN, PD_ELFDWARF, PD_ELFHEADER, PD_ELFSECTION, PD_ECHO
+    PD_ELFEXTERN, PD_ELFDWARF, PD_ELFHEADER, PD_ELFSECTION, PD_ECHO, PD_ELFFIELD
 };
 
 static int pat_dir_kind(const PatEntry *e){
@@ -1239,6 +1239,7 @@ static int pat_dir_kind(const PatEntry *e){
         { ".elfrela", PD_ELFRELA }, { ".elfwidth", PD_ELFWIDTH },
         { ".elfextern", PD_ELFEXTERN }, { ".elfdwarf", PD_ELFDWARF },
         { ".elfheader", PD_ELFHEADER }, { ".elfsection", PD_ELFSECTION },
+        { ".elffield", PD_ELFFIELD },
         { ".echo", PD_ECHO }, { NULL, 0 } };
     if(!e || !e->f[0] || !e->f[0][0]) return PD_NONE;
     const char *n = e->f[0];
@@ -1264,7 +1265,7 @@ static int pat_is_directive(const PatEntry *e){
         ".check", ".clrcheck", ".reloc", ".clrreloc", ".map", ".free",
         ".passthru", ".eol", ".textmode", ".enum", ".clrenum", ".error",
         ".elftype", ".elfmachine", ".elfclass", ".elfrela", ".elfwidth",
-        ".elfextern", ".elfdwarf", ".elfheader", ".elfsection", ".echo", NULL };
+        ".elfextern", ".elfdwarf", ".elfheader", ".elfsection", ".echo", ".elffield", NULL };
     if(!e || !e->f[0] || !e->f[0][0]) return 0;
     const char *n = e->f[0];
     for(int k=0; tbl[k]; k++) if(strcmp(n, tbl[k]) == 0) return 1;
@@ -1735,7 +1736,7 @@ static int pat_dir_line_invariant(const PatEntry *e){
     case PD_SYMBOLC: case PD_PASSTHRU: case PD_EOL: case PD_TEXTMODE:
     case PD_ELFMACHINE: case PD_ELFCLASS: case PD_ELFRELA: case PD_ELFWIDTH:
     case PD_ELFEXTERN: case PD_ELFDWARF: case PD_ELFHEADER:
-    case PD_ELFSECTION:
+    case PD_ELFSECTION: case PD_ELFFIELD:
         /* どれも名前や型名の文字どおりの並びだけを見る（式を読まない）。
          * 変数名の小文字は普通なので pat_text_dynamic は使わない。 */
         for(int i=1;i<PAT_FIELDS;i++)
@@ -2293,6 +2294,14 @@ typedef struct {
     struct { char *name; uint32_t flags; int type_set; uint32_t type;
              int al_set; uint32_t al; } *elf_secs;
     int        elf_secs_len, elf_secs_cap;
+    /* `.elffield::<型>::<マスク>[::<オフセット>]` で命令フィールド型と宣言した型。
+     * 型欄は書いたまま持ち、実効マシン表の名前で引く（宣言順）。 */
+    struct { char *type; uint64_t mask; int off; } *elf_fields;
+    int        elf_fields_len, elf_fields_cap;
+    /* 型名を書かなかった `.extern` で宣言したラベル名。その既定型は `.reloc` が
+     * 命令フィールド型を決めた参照では使わない（axx.py の extern_untyped）。 */
+    char     **extern_untyped;
+    int        extern_untyped_len, extern_untyped_cap;
     int        elf_machine_from_cli;  /* -m を明示したか */
     long       elf_decl_gen;       /* 宣言が変わるたびに増える（控えの鍵） */
 
@@ -2717,7 +2726,7 @@ static uint32_t insn_reloc_field_mask_tbl(int rtype){
  * AArch64 のときだけ引く。`.elftype`（3.7.7 節）で同じ番号を宣言した別機種の
  * 型を、命令フィールド型と取り違えないためである。
  * axx.py の insn_reloc_field_mask() と同じ規則である。 */
-static uint32_t insn_reloc_field_mask(int rtype, int machine){
+static uint32_t insn_reloc_field_mask_a64(int rtype, int machine){
     if(machine != 183) return 0;
     return insn_reloc_field_mask_tbl(rtype);
 }
@@ -3005,6 +3014,88 @@ static const ElfMachineInfo *elf_machine_effective(const AsmState *st){
     return &g_elf_mach_eff.info;
 }
 
+/* `.elffield` で宣言した命令フィールド型なら 1 を返し、マスクとオフセットを
+ * 書く。マスクは型の幅ぶんのバイト列を対象のバイト順で読んだ整数の中で
+ * リンカが書き込むビット、オフセットはその欄が命令の先頭から何バイト目に
+ * 始まるか（r_offset もそこを指す）。宣言の型欄は実効マシン表の名前で引き、
+ * 同じ型番号なら先に宣言したものを使う。axx.py の insn_reloc_field_decl() と
+ * 同じである。 */
+static struct { long gen; int machine; int valid; int n;
+                int *rt; uint64_t *mask; int *off; } g_elf_field_eff;
+
+static int insn_reloc_field_decl(const AsmState *st, int rtype,
+                                 uint64_t *mask, int *off){
+    if(!st || st->elf_fields_len == 0) return 0;
+    if(!(g_elf_field_eff.valid && g_elf_field_eff.gen == st->elf_decl_gen
+         && g_elf_field_eff.machine == st->elf_machine)){
+        const ElfMachineInfo *m = elf_machine_effective(st);
+        free(g_elf_field_eff.rt); free(g_elf_field_eff.mask); free(g_elf_field_eff.off);
+        int n = st->elf_fields_len;
+        g_elf_field_eff.rt   = (int*)malloc(sizeof(int) * (size_t)n);
+        g_elf_field_eff.mask = (uint64_t*)malloc(sizeof(uint64_t) * (size_t)n);
+        g_elf_field_eff.off  = (int*)malloc(sizeof(int) * (size_t)n);
+        if(!g_elf_field_eff.rt || !g_elf_field_eff.mask || !g_elf_field_eff.off){
+            perror("malloc"); exit(1);
+        }
+        int k = 0;
+        for(int i = 0; i < n; i++){
+            int rt = elf_decl_type_in(m->named, st->elf_fields[i].type);
+            if(rt < 0) continue;
+            int dup = 0;
+            for(int j = 0; j < k; j++) if(g_elf_field_eff.rt[j] == rt){ dup = 1; break; }
+            if(dup) continue;
+            g_elf_field_eff.rt[k]   = rt;
+            g_elf_field_eff.mask[k] = st->elf_fields[i].mask;
+            g_elf_field_eff.off[k]  = st->elf_fields[i].off;
+            k++;
+        }
+        g_elf_field_eff.n = k;
+        g_elf_field_eff.gen = st->elf_decl_gen;
+        g_elf_field_eff.machine = st->elf_machine;
+        g_elf_field_eff.valid = 1;
+    }
+    for(int j = 0; j < g_elf_field_eff.n; j++)
+        if(g_elf_field_eff.rt[j] == rtype){
+            if(mask) *mask = g_elf_field_eff.mask[j];
+            if(off)  *off  = g_elf_field_eff.off[j];
+            return 1;
+        }
+    return 0;
+}
+
+/* 命令フィールド型なら、その値が占めるビットマスクを返す。データ型や未知の型
+ * では 0。`.elffield` の宣言を先に引き、無ければ AArch64 の組み込み表を引く。
+ * axx.py の insn_reloc_field_mask() と同じ規則である。 */
+static uint64_t insn_reloc_field_mask(const AsmState *st, int rtype, int machine){
+    uint64_t m = 0;
+    if(insn_reloc_field_decl(st, rtype, &m, NULL)) return m;
+    return insn_reloc_field_mask_a64(rtype, machine);
+}
+
+static int extern_untyped_has(const AsmState *st, const char *name){
+    for(int i = 0; i < st->extern_untyped_len; i++)
+        if(strcmp(st->extern_untyped[i], name) == 0) return 1;
+    return 0;
+}
+static void extern_untyped_set(AsmState *st, const char *name, int on){
+    for(int i = 0; i < st->extern_untyped_len; i++)
+        if(strcmp(st->extern_untyped[i], name) == 0){
+            if(!on){
+                free(st->extern_untyped[i]);
+                st->extern_untyped[i] = st->extern_untyped[--st->extern_untyped_len];
+            }
+            return;
+        }
+    if(!on) return;
+    if(st->extern_untyped_len >= st->extern_untyped_cap){
+        st->extern_untyped_cap = st->extern_untyped_cap ? st->extern_untyped_cap * 2 : 16;
+        st->extern_untyped = realloc(st->extern_untyped,
+                                     sizeof(char*) * (size_t)st->extern_untyped_cap);
+        if(!st->extern_untyped){ perror("realloc"); exit(1); }
+    }
+    st->extern_untyped[st->extern_untyped_len++] = strdup(name);
+}
+
 static int reloctype_for(const AsmState *st, const ElfMachineInfo *m, int nbytes){
     int idx;
     switch(nbytes){
@@ -3184,6 +3275,8 @@ static void state_init(AsmState *st) {
     st->elf_decl_dwarf = NULL;
     for(int _hi=0;_hi<ELF_HDR_NFIELD;_hi++){ st->elf_hdr_set[_hi]=0; st->elf_hdr_val[_hi]=0; }
     st->elf_secs = NULL; st->elf_secs_len = 0; st->elf_secs_cap = 0;
+    st->elf_fields = NULL; st->elf_fields_len = 0; st->elf_fields_cap = 0;
+    st->extern_untyped = NULL; st->extern_untyped_len = 0; st->extern_untyped_cap = 0;
     st->elf_machine_from_cli = 0;
     st->elf_decl_gen = 0;
     for(int _ci=0; _ci<NVARS; _ci++) enumdef_init(&st->enum_defs[_ci]);
@@ -4204,7 +4297,7 @@ static void binary_flush(AsmState *st){
         int _nz = 0;
         char _where[256]; size_t _wl = 0; _where[0] = '\0';
         for(int i = 0; i < st->reloc_count; i++){
-            if(insn_reloc_field_mask(st->relocations[i].rtype, st->elf_machine) == 0) continue;
+            if(insn_reloc_field_mask(st, st->relocations[i].rtype, st->elf_machine) == 0) continue;
             _nz++;
             if(_nz <= 4){
                 int _n = snprintf(_where + _wl, sizeof(_where) - _wl, "%s%s+0x%llx",
@@ -6847,6 +6940,51 @@ static int elf_sec_find(const AsmState *st, const char *name){
  * 整列は sh_addralign にそのまま入る。0 か 2 の冪でなければならない
  * （ELF の要求）。書かなければ weo_default_align() が決める。
  * axx.py の elfsection_processing() と同じ規則である。 */
+/* `.elffield::<型>::<マスク>[::<オフセット>]` — 命令フィールド型のリロケーション。
+ * axx.py の elffield_processing() と同じ規則である。 */
+static int dir_elffield(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".elffield") != 0) return 0;
+    AsmState *st = &asmb->st;
+    const char *tf, *mf; elf_decl_fields(e, &tf, &mf);
+    char *t = elf_decl_trim_dup(tf);
+    if(!t[0]){
+        axx_diagf(1, 0, " error - .elffield: relocation type is not specified.\n");
+        free(t);
+        return 1;
+    }
+    long long m;
+    if(!elf_decl_num(asmb, ".elffield", mf, 1, 0x7FFFFFFFFFFFFFFFll, &m)){ free(t); return 1; }
+    long long off = 0;
+    {
+        const char *q = e->f[3];
+        while(*q==' '||*q=='\t') q++;
+        if(*q && !elf_decl_num(asmb, ".elffield", e->f[3], 0, 255, &off)){ free(t); return 1; }
+    }
+    for(int i = 0; i < st->elf_fields_len; i++){
+        if(strcmp(st->elf_fields[i].type, t) == 0){
+            if(st->elf_fields[i].mask != (uint64_t)m || st->elf_fields[i].off != (int)off){
+                st->elf_fields[i].mask = (uint64_t)m;
+                st->elf_fields[i].off  = (int)off;
+                st->elf_decl_gen++;
+            }
+            free(t);
+            return 1;
+        }
+    }
+    if(st->elf_fields_len >= st->elf_fields_cap){
+        st->elf_fields_cap = st->elf_fields_cap ? st->elf_fields_cap * 2 : 16;
+        st->elf_fields = realloc(st->elf_fields,
+                                 sizeof(st->elf_fields[0]) * (size_t)st->elf_fields_cap);
+        if(!st->elf_fields){ perror("realloc"); exit(1); }
+    }
+    st->elf_fields[st->elf_fields_len].type = t;
+    st->elf_fields[st->elf_fields_len].mask = (uint64_t)m;
+    st->elf_fields[st->elf_fields_len].off  = (int)off;
+    st->elf_fields_len++;
+    st->elf_decl_gen++;
+    return 1;
+}
+
 static int dir_elfsection(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfsection") != 0) return 0;
     AsmState *st = &asmb->st;
@@ -7489,7 +7627,7 @@ static int cond_tests_relocated_var(AsmState *st, const char *cond, size_t len){
     if(!st->elf_objfile[0]) return 0;
     for(int vi = 0; vi < g_nvars; vi++){
         int rtype = st->reloc_constraints[vi];
-        if(rtype == 0 || insn_reloc_field_mask(rtype, st->elf_machine) == 0) continue;
+        if(rtype == 0 || insn_reloc_field_mask(st, rtype, st->elf_machine) == 0) continue;
         const char *nm = g_varnames[vi];
         if(!nm || !*nm) continue;
         size_t nl = strlen(nm);
@@ -13249,6 +13387,12 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
         }
         if(idx < blen && buf[idx]==':') idx++;
         LabelEntry *existing=lmap_find(&st->labels,s);
+        /* 型名を書かなかった `.extern` の既定型は、パターンファイルの `.reloc`
+         * が命令フィールド型を決めた参照では使わない（ソースが型を「書いた」
+         * わけではないので、優先順位 3.7.8 の「ソースファイル」に当たらない）。
+         * axx.py の extern_untyped と同じ。 */
+        if(explicit_reloc_type) extern_untyped_set(st, s, 0);
+        else if(!existing) extern_untyped_set(st, s, 1);
         if(!existing){
             lmap_set_imported(&st->labels, s, u256_zero(), ".text", reloc_type);
         } else if(existing->is_imported){
@@ -13913,6 +14057,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         case PD_ELFDWARF: _dir_done = dir_elfdwarf(asmb,i);      break;
         case PD_ELFHEADER:_dir_done = dir_elfheader(asmb,i);     break;
         case PD_ELFSECTION:_dir_done = dir_elfsection(asmb,i);    break;
+        case PD_ELFFIELD: _dir_done = dir_elffield(asmb,i);      break;
         default: break;
         }
         if(_dir_done) continue;
@@ -14456,8 +14601,11 @@ static int lineassemble(Assembler *asmb, const char *line_in){
 
                 int _forced_rtype = 0;
                 if(_valid[_gi].rtype > 0){
-                    int _hint_rtype = (_src_rtype >= 0) ? _src_rtype : _valid[_gi].rtype;
-                    uint32_t _fmask = insn_reloc_field_mask(_hint_rtype, st->elf_machine);
+                    int _hint_rtype = (_src_rtype >= 0 && !extern_untyped_has(st, _lname))
+                                    ? _src_rtype : _valid[_gi].rtype;
+                    uint64_t _fmask = insn_reloc_field_mask(st, _hint_rtype, st->elf_machine);
+                    int _foff = 0;
+                    insn_reloc_field_decl(st, _hint_rtype, NULL, &_foff);
                     if(_fmask == 0){
                         /* データ型を宣言した場合。加数は通常どおり出力バイト列
                          * から求まるので、型だけを固定して下の経路へ渡す。 */
@@ -14467,7 +14615,8 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         if(_ibytes <= 0) _ibytes = 4;
                         int _iwords = _ibytes / bpw;
                         if(_iwords < 1) _iwords = 1;
-                        if(_widx + _iwords <= objl.len){
+                        int _fw = _widx + _foff / bpw;
+                        if(_fw + _iwords <= objl.len){
                             /* RELA ではリンカが欄を埋めるので、命令語側は 0 に
                              * しておく（GNU as と同じ形）。 */
                             uint64_t _wmask_i = axx_word_mask(st->bts);
@@ -14475,16 +14624,16 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                                 int _sh = st->endian_big
                                         ? st->bts * (_iwords - 1 - _k)
                                         : st->bts * _k;
-                                uint64_t _clear = (_sh < 32)
-                                                ? (((uint64_t)_fmask >> _sh) & _wmask_i) : 0;
-                                uint64_t _wv = u256_to_u64(objl.data[_widx + _k]);
-                                objl.data[_widx + _k] =
+                                uint64_t _clear = (_sh < 64)
+                                                ? ((_fmask >> _sh) & _wmask_i) : 0;
+                                uint64_t _wv = u256_to_u64(objl.data[_fw + _k]);
+                                objl.data[_fw + _k] =
                                     u256_from_u64((_wv & ~_clear) & _wmask_i);
                             }
                         }
                         int64_t _sec_rel_h =
                             (int64_t)((sec_completed_words +
-                                       (cur_pc + (uint64_t)_widx - sec_entry_pc_cur))
+                                       (cur_pc + (uint64_t)_fw - sec_entry_pc_cur))
                                       * (uint64_t)bpw);
                         if(st->reloc_count >= st->reloc_cap){
                             st->reloc_cap = st->reloc_cap ? st->reloc_cap*2 : 16;
@@ -18105,6 +18254,10 @@ static void check_elfdecls(Assembler *asmb){
     if(st->elf_decl_dwarf && elf_decl_type_in(m->named, st->elf_decl_dwarf) < 0)
         axx_diagf(0, 0, " warning - .elfdwarf: unknown relocation type '%s' for %s; "
                    "ignored.\n", st->elf_decl_dwarf, m->name);
+    for(int i = 0; i < st->elf_fields_len; i++)
+        if(elf_decl_type_in(m->named, st->elf_fields[i].type) < 0)
+            axx_diagf(0, 0, " warning - .elffield: unknown relocation type '%s' for %s; "
+                       "ignored.\n", st->elf_fields[i].type, m->name);
 }
 
 static void register_elfdecls(Assembler *asmb){
@@ -18121,6 +18274,7 @@ static void register_elfdecls(Assembler *asmb){
         case PD_ELFDWARF:   dir_elfdwarf(asmb, e);    break;
         case PD_ELFHEADER:  dir_elfheader(asmb, e);   break;
         case PD_ELFSECTION: dir_elfsection(asmb, e);  break;
+        case PD_ELFFIELD:   dir_elffield(asmb, e);    break;
         default: break;
         }
     }
