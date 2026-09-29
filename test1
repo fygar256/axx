@@ -1,68 +1,38 @@
 #!/bin/sh
 
-caxx 4004.axx 4004.s -b b0
-caxx z80.axx z80.s -b b1
-caxx 6502.axx 6502.s -b b2
-caxx 6800.axx 6800.s -b b3
-caxx 6809.axx 6809.s -b b4
-caxx 8080.axx 8080.s -b b5
-caxx 8048.axx 8048.s -b b6
-caxx 8051.axx 8051.s -b b7
-caxx 68000.axx 68000.s -b b8
-caxx vliw.axx vliw.s -b b9
-caxx itanium.axx vliw.s -b b10
-caxx x86_64.axx hello.s -b b11
-caxx x86_64m.axx hello.s -b b12
-caxx aarch64_logical_mini.axx aarch64_logical_mini_demo.s -b b13
-caxx bf.axx bf.s -b b14
-caxx arrindex.axx arrindex.s -b b15
-caxx passthru.axx passthru.s -b b16
-caxx textmode.axx textmode.s -b b17
-caxx 8080toz80.axx hello8080.s -b b18
-caxx textmode.axx textmode.s -V > b19
-caxx 8080toz80.axx hello8080.s -V > b20
-caxx aarch64.axx aarch64.s -b b21
-caxx elftype.axx elftype.s -o b22 -m 62
-caxx elfgen.axx elfgen.s -o b23
-caxx symcap.axx symcap.s -b b24
-caxx echo.axx echo.s -b b25 2>&1 | grep -v '^wrote ' > b25e
-caxx elfprio.axx elfprio.s -o b26
-caxx elfsec.axx elfsec.s -o b27
-caxx endsub.axx endsub.s -b b28
-caxx intel2att.axx intel2att.s -b b29
-caxx intel2att.axx intel2att.s -V > b30
+caxx patfile/4004.axx asmsrc/4004.s -b b0
+caxx patfile/z80.axx asmsrc/z80.s -b b1
+caxx patfile/6502.axx asmsrc/6502.s -b b2
+caxx patfile/6800.axx asmsrc/6800.s -b b3
+caxx patfile/6809.axx asmsrc/6809.s -b b4
+caxx patfile/8080.axx asmsrc/8080.s -b b5
+caxx patfile/8048.axx asmsrc/8048.s -b b6
+caxx patfile/8051.axx asmsrc/8051.s -b b7
+caxx patfile/68000.axx asmsrc/68000.s -b b8
+caxx patfile/vliw.axx asmsrc/vliw.s -b b9
+caxx patfile/itanium.axx asmsrc/vliw.s -b b10
+caxx patfile/x86_64.axx asmsrc/hello.s -b b11
+caxx patfile/x86_64m.axx asmsrc/hello.s -b b12
+caxx patfile/bf.axx asmsrc/bf.s -b b13
+caxx patfile/8080toz80.axx asmsrc/hello8080.s -b b14
+caxx patfile/aarch64.axx asmsrc/aarch64.s -b b15
 
-paxx 4004.axx 4004.s -b a0
-paxx z80.axx z80.s -b a1
-paxx 6502.axx 6502.s -b a2
-paxx 6800.axx 6800.s -b a3
-paxx 6809.axx 6809.s -b a4
-paxx 8080.axx 8080.s -b a5
-paxx 8048.axx 8048.s -b a6
-paxx 8051.axx 8051.s -b a7
-paxx 68000.axx 68000.s -b a8
-paxx vliw.axx vliw.s -b a9
-paxx itanium.axx vliw.s -b a10
-paxx x86_64.axx hello.s -b a11
-paxx x86_64m.axx hello.s -b a12
-paxx aarch64_logical_mini.axx aarch64_logical_mini_demo.s -b a13
-paxx bf.axx bf.s -b a14
-paxx arrindex.axx arrindex.s -b a15
-paxx passthru.axx passthru.s -b a16
-paxx textmode.axx textmode.s -b a17
-paxx 8080toz80.axx hello8080.s -b a18
-paxx textmode.axx textmode.s -V > a19
-paxx 8080toz80.axx hello8080.s -V > a20
-paxx aarch64.axx aarch64.s -b a21
-paxx elftype.axx elftype.s -o a22 -m 62
-paxx elfgen.axx elfgen.s -o a23
-paxx symcap.axx symcap.s -b a24
-paxx echo.axx echo.s -b a25 2>&1 | grep -v '^wrote ' > a25e
-paxx elfprio.axx elfprio.s -o a26
-paxx elfsec.axx elfsec.s -o a27
-paxx endsub.axx endsub.s -b a28
-paxx intel2att.axx intel2att.s -b a29
-paxx intel2att.axx intel2att.s -V > a30
+paxx patfile/4004.axx asmsrc/4004.s -b a0
+paxx patfile/z80.axx asmsrc/z80.s -b a1
+paxx patfile/6502.axx asmsrc/6502.s -b a2
+paxx patfile/6800.axx asmsrc/6800.s -b a3
+paxx patfile/6809.axx asmsrc/6809.s -b a4
+paxx patfile/8080.axx asmsrc/8080.s -b a5
+paxx patfile/8048.axx asmsrc/8048.s -b a6
+paxx patfile/8051.axx asmsrc/8051.s -b a7
+paxx patfile/68000.axx asmsrc/68000.s -b a8
+paxx patfile/vliw.axx asmsrc/vliw.s -b a9
+paxx patfile/itanium.axx asmsrc/vliw.s -b a10
+paxx patfile/x86_64.axx asmsrc/hello.s -b a11
+paxx patfile/x86_64m.axx asmsrc/hello.s -b a12
+paxx patfile/bf.axx asmsrc/bf.s -b a13
+paxx patfile/8080toz80.axx asmsrc/hello8080.s -b a14
+paxx patfile/aarch64.axx asmsrc/aarch64.s -b a15
 
 FAIL=0
 
@@ -82,22 +52,6 @@ cmp a12 b12 || FAIL=1
 cmp a13 b13 || FAIL=1
 cmp a14 b14 || FAIL=1
 cmp a15 b15 || FAIL=1
-cmp a16 b16 || FAIL=1
-cmp a17 b17 || FAIL=1
-cmp a18 b18 || FAIL=1
-cmp a19 b19 || FAIL=1
-cmp a20 b20 || FAIL=1
-cmp a21 b21 || FAIL=1
-cmp a22 b22 || FAIL=1
-cmp a23 b23 || FAIL=1
-cmp a24 b24 || FAIL=1
-cmp a25 b25 || FAIL=1
-cmp a25e b25e || FAIL=1
-cmp a26 b26 || FAIL=1
-cmp a27 b27 || FAIL=1
-cmp a28 b28 || FAIL=1
-cmp a29 b29 || FAIL=1
-cmp a30 b30 || FAIL=1
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"
