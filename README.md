@@ -66,11 +66,11 @@ It has assignment, `.if`/`.elif`, `.while`, `.for`, recursion, arrays, and `.ech
 
 ## What's covered today
 
-Bundled and working: **x86_64** (x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512), **AArch64** (the A64 instruction set — data processing, branches, system, loads and stores, scalar floating point, Advanced SIMD, cryptography and the scalar extensions, plus SVE, SVE2, SME and SME2: the Z and P register files, predication, the whole SVE load/store family including gathers and scatters, the SVE2 widening and complex arithmetic, the SME ZA array and outer products, and the SME2 predicate-as-counter registers, ZT0 lookup table and multi-vector operations), **Motorola 6809 / 68000 / 6800**, **MOS 6502**, **Zilog Z80**, **Intel 8080 / 8051 / 8048 / 4004**.
+Bundled and working: **x86_64** (x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512), **AArch64** (the A64 instruction set — data processing, branches, system, loads and stores, scalar floating point, Advanced SIMD, cryptography and the scalar extensions, plus SVE, SVE2, SME and SME2: the Z and P register files, predication, the whole SVE load/store family including gathers and scatters, the SVE2 widening and complex arithmetic, the SME ZA array and outer products, and the SME2 predicate-as-counter registers, ZT0 lookup table and multi-vector operations), **PowerPC64** (Power ISA v3.1 / POWER10, big- and little-endian: fixed point, branches with the extended mnemonics, floating point, decimal floating point, VMX, VSX, quad precision, MMA including the prefixed masked forms, and the prefixed instructions, with a nop inserted before one that would cross a 64-byte boundary; under `-o` the ELF relocations of the 64-bit PowerPC ABI — `REL24`, `REL14`, the `ADDR16` family for `@l` / `@ha` / `@high` / `@highest` ..., `D34` / `PCREL34` — so objects link with GNU ld), **Motorola 6809 / 68000 / 6800**, **MOS 6502**, **Zilog Z80**, **Intel 8080 / 8051 / 8048 / 4004**.
 
 What AArch64 stops short of is SVE2.1, SME2.1 and the optional extensions the reference assembler used for validation does not accept either (FEAT_SME_F16F16, FEAT_SME_B16B16, FEAT_SME_LUTv2, FEAT_FAMINMAX).
 
-ARM (A32/T32), RISC-V, PowerPC, MIPS and SPARC don't have pattern files yet. That's not a design limitation — it's a labor constraint: the author doesn't currently have real hardware or emulators to validate against, and doing it solo is more than one person wants to take on. The pattern-file format itself is fully documented, and there's nothing architecture-specific stopping someone from writing one. The pattern layer proper is deliberately Turing-incomplete, which is what guarantees pattern matching terminates; where an encoding genuinely needs computation, the mini language above is the escape hatch, and it is invoked only from output fields that ask for it by name.
+ARM (A32/T32), RISC-V, MIPS and SPARC don't have pattern files yet (nor 32-bit PowerPC as an ELF32 target; the PowerPC64 file covers the 64-bit ABI). That's not a design limitation — it's a labor constraint: the author doesn't currently have real hardware or emulators to validate against, and doing it solo is more than one person wants to take on. The pattern-file format itself is fully documented, and there's nothing architecture-specific stopping someone from writing one. The pattern layer proper is deliberately Turing-incomplete, which is what guarantees pattern matching terminates; where an encoding genuinely needs computation, the mini language above is the escape hatch, and it is invoked only from output fields that ask for it by name.
 
 ## How it compares
 
@@ -95,9 +95,11 @@ cd axx
 make                              # builds and installs caxx, paxx, axx, and the man page
 axx z80.axx z80.s -v              # assemble the Z80 sample, print the listing
 axx x86_64.axx hello.s -o out.o   # assemble x86_64 hello-world into an ELF object
+axx patfile/ppc64le.axx asmsrc/hello_ppc64le.s -o hello.o   # PowerPC64 LE hello-world
+powerpc64le-linux-gnu-ld hello.o -o hello && qemu-ppc64le ./hello
 ```
 
-Pattern files for ARM (A32/T32), RISC-V, PowerPC, MIPS and SPARC don't exist yet. Getting there — including real hardware/emulator validation — is more than one person can reasonably do alone. If you're interested in taking on one of those, that's where help would matter most.
+Pattern files for ARM (A32/T32), RISC-V, MIPS and SPARC don't exist yet. Getting there — including real hardware/emulator validation — is more than one person can reasonably do alone. If you're interested in taking on one of those, that's where help would matter most.
 
 ---
 

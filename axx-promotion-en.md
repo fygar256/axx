@@ -44,7 +44,7 @@ file out.o
 
 Bundled and working: **x86_64** (x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512), **Motorola 6809 / 68000 / 6800**, **MOS 6502**, **Zilog Z80**, **Intel 8080 / 8051 / 8048 / 4004**.
 
-ARM, AArch64, RISC-V, PowerPC, MIPS and SPARC don't have pattern files yet. That's not a design limitation — it's a labor constraint: the author doesn't currently have real hardware or emulators to validate against, and doing it solo is more than one person wants to take on. The pattern-file format itself is fully documented and, within the "instructions map one-to-one onto machine code" boundary the design deliberately enforces (a Turing-incomplete core guarantees pattern matching terminates), there's nothing architecture-specific stopping someone from writing one.
+ARM, RISC-V, MIPS and SPARC don't have pattern files yet (AArch64 and PowerPC64 now do). That's not a design limitation — it's a labor constraint: the author doesn't currently have real hardware or emulators to validate against, and doing it solo is more than one person wants to take on. The pattern-file format itself is fully documented and, within the "instructions map one-to-one onto machine code" boundary the design deliberately enforces (a Turing-incomplete core guarantees pattern matching terminates), there's nothing architecture-specific stopping someone from writing one.
 
 ## How it compares (honestly)
 
@@ -71,7 +71,7 @@ axx z80.axx z80.s -v              # assemble the Z80 sample, print the listing
 axx x86_64.axx hello.s -o out.o   # assemble x86_64 hello-world into an ELF object
 ```
 
-Pattern files for ARM, RISC-V, PowerPC, MIPS and SPARC don't exist yet. Getting there — including real hardware/emulator validation — is more than one person can reasonably do alone. If you're interested in taking on one of those, that's where help would matter most.
+Pattern files for ARM, RISC-V, MIPS and SPARC don't exist yet. Getting there — including real hardware/emulator validation — is more than one person can reasonably do alone. If you're interested in taking on one of those, that's where help would matter most.
 
 ---
 
