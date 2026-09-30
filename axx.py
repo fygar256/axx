@@ -1517,6 +1517,11 @@ class AssemblerState:
         # `;` ごとそのまま覚えておく置き場。書き換えたテキストの後ろに付け直す。
         # 1行ごとに作り直す。テキスト置換モードでないときは常に空文字である。
         self.comment_text = ''
+        # テキスト置換モード（`.textmode`）で、その行の行頭にあった字下げ
+        # （空白・タブ）を書かれていたまま覚えておく置き場。訳したテキストの
+        # 先頭に付け直すので、ソースの字下げが翻訳結果にもそのまま残る。
+        # 1行ごとに作り直す。テキスト置換モードでないときは常に空文字である。
+        self.indent_text = ''
         # `.setsym::名前::"文字列"` で登録された文字列シンボル。値が数値では
         # ないので式には出せず、文字列テンプレート（3.5.2）の中でだけ使える。
         # 名前は大文字化して持つ（`.setsym` の数値シンボルと同じ規約）。
@@ -11284,8 +11289,10 @@ class Assembler:
         if self.include_asm(l, l2):
             # 取り込んだ行を訳した後にこの行のコメントだけが出てくると、順序が
             # 入れ替わって読めなくなる。この行のコメントは出さない（取り込んだ
-            # 側の行が自分のコメントを出す）。
+            # 側の行が自分のコメントを出す）。字下げも、取り込んだ先の行が1行ごとに
+            # 置き換えてしまうので、ここで消しておく。
             self.state.comment_text = ''
+            self.state.indent_text = ''
             return 0, [], True, idx
         if self.asm_directive_proc.align_processing(l, l2):
             return self._dir_line_done(l, l2, idx)
@@ -11689,6 +11696,16 @@ class Assembler:
         return 0, objl, True, idx
 
     def lineassemble(self, line):
+        # テキスト置換モードでは、行頭の字下げ（空白・タブ）も書かれていたまま
+        # 訳したテキストの前に残す（付け直すのはこの関数の終わりの側）。空白の
+        # 正規化（normalize_ws）が連続する空白を1個に潰してしまう前に覚える。
+        # そうでないときは今までどおり、字下げは残さない。
+        _ind = line[:len(line) - len(line.lstrip(' \t'))]
+        # 覚える長さは caxx.c の indent_text（511 バイト）に合わせて切る。両実装が
+        # 同じテキストを出すための約束である。
+        if len(_ind) > 511:
+            _ind = _ind[:511]
+        self.state.indent_text = _ind if self.state.textmode else ''
         line = StringUtils.normalize_ws(line)
         line, _cmt = StringUtils.split_comment_asm(line)
         # テキスト置換モードでは、ソースに書かれていた `;` コメントも訳した
@@ -11774,6 +11791,29 @@ class Assembler:
             objl.extend(self._text_words(_csfx))
             self.state.asmtext = _cur + _csfx
             self.state.asmtext_disp = '"%s"' % asmtext_escaped(self.state.asmtext)
+
+        # テキスト置換モードでは、行頭にあった字下げ（空白・タブ）を書かれていた
+        # とおりに出力の先頭へ付け直す。照合のために空白を1個に潰してあるので、
+        # ここで元の綴りに戻す。付けるのは `label:` とコメントを付け直した後の行
+        # 全体の先頭なので、字下げと `label:`・`;` コメントの間に余分な空白は
+        # 入らない。対象はテキストを出した行だけで、テキストではなく数値を出した行
+        # （`.ascii` などの組み込みディレクティブ）はデータを壊さないようそのまま
+        # にする。`.vliw` が有効なときは、`.eol` と同じくパケットを壊さないよう
+        # 何もしない。
+        if (self.state.textmode and self.state.indent_text
+                and not self.state.vliwflag
+                and self.state.asmtext):
+            _itxt = self.state.indent_text
+            _ibytes = list(_itxt.encode('utf-8', errors='surrogateescape'))
+            objl[0:0] = _ibytes
+            self.state.asmtext = _itxt + self.state.asmtext
+            self.state.asmtext_disp = '"%s"' % asmtext_escaped(self.state.asmtext)
+            # 前に足したぶん、その行のワード位置がずれる。ELF の再配置は
+            # ワード位置で覚えているので、ラベルを前に足すときと同じだけ送る。
+            if _ibytes:
+                self.state._elf_label_refs_seen = [
+                    (_n, _v, (_w + len(_ibytes)) if _w >= 0 else _w)
+                    for (_n, _v, _w) in self.state._elf_label_refs_seen]
 
         # `.eol` が有効なら、出力を出した行ごとに改行を1ワード足す。標準出力へ
         # 流すテキストには足さない（そちらは行ごとに改行して出しているので、

@@ -2198,6 +2198,13 @@ typedef struct {
      * axx.py の state.comment_text に対応する。 */
     char      *comment_text;
 
+    /* テキスト置換モードで、その行の行頭にあった字下げ（空白・タブ）を書かれて
+     * いたまま覚えておく置き場。訳したテキストの先頭に付け直すので、ソースの
+     * 字下げが翻訳結果にもそのまま残る。1行ごとに作り直し、テキスト置換モードで
+     * ないときは常に空文字である。
+     * axx.py の state.indent_text に対応する。 */
+    char       indent_text[512];
+
     char       cl[4096];
     int        ln;
     StrVec     fnstack;
@@ -3354,6 +3361,7 @@ static void state_init(AsmState *st) {
     st->captext[0] = '\0';
     st->label_text[0] = '\0';
     st->comment_text = NULL;
+    st->indent_text[0] = '\0';
     bufmap_init(&st->buf);
     st->pc = u256_zero();
     st->padding = u256_zero();
@@ -14418,9 +14426,11 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
           /* 取り込んだ行を訳した後にこの行のコメントだけが出てくると、順序が
            * 入れ替わって読めなくなる。この行のコメントは出さない（取り込んだ側の
            * 行が自分のコメントを出す）。取り込んだ先の行も1行ごとに comment_text を
-           * 置き換えるので、消すのは戻ってきたここでなければならない。
+           * 置き換えるので、消すのは戻ってきたここでなければならない。字下げも
+           * 同じように取り込んだ先の行が置き換えてしまうので、ここで消しておく。
            * axx.py の lineassemble2() と同じ規則である。 */
           free(st->comment_text); st->comment_text = NULL;
+          st->indent_text[0] = '\0';
           *idx_out=idx; return 1;
       }
     }
@@ -14788,6 +14798,20 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     if(!line){ perror("malloc"); return 0; }
     memcpy(line, line_in, lin_len + 1);
 
+    /* テキスト置換モードでは、行頭の字下げ（空白・タブ）も書かれていたまま訳した
+     * テキストの前に残す（付け直すのはこの関数の終わりの側）。空白の正規化
+     * （axx_normalize_ws）が連続する空白を1個に潰してしまう前に覚えておく。
+     * そうでないときは今までどおり、字下げは残さない。
+     * axx.py の lineassemble() と同じ規則である。 */
+    st->indent_text[0] = '\0';
+    if(st->textmode){
+        size_t _ni = 0;
+        while(line[_ni]==' ' || line[_ni]=='\t') _ni++;
+        if(_ni > sizeof(st->indent_text)-1) _ni = sizeof(st->indent_text)-1;
+        memcpy(st->indent_text, line, _ni);
+        st->indent_text[_ni] = '\0';
+    }
+
     axx_normalize_ws(line);
     char *cmt = NULL;
     axx_split_comment_asm(line, &cmt);
@@ -14968,6 +14992,41 @@ static int lineassemble(Assembler *asmb, const char *line_in){
         free(st->asmtext_disp);
         st->asmtext_disp = nd.b ? nd.b : strdup("");
         free(cs.b);
+    }
+
+    /* テキスト置換モードでは、行頭にあった字下げ（空白・タブ）を書かれていたとおり
+     * に出力の先頭へ付け直す。照合のために空白を1個に潰してあるので、ここで元の
+     * 綴りに戻す。付けるのは `label:` とコメントを付け直した後の行全体の先頭なので、
+     * 字下げと `label:`・`;` コメントの間に余分な空白は入らない。対象はテキストを
+     * 出した行だけで、テキストではなく数値を出した行（`.ascii` などの組み込み
+     * ディレクティブ）はデータを壊さないようそのままにする。`.vliw` が有効なときは、
+     * `.eol` と同じくパケットを壊さないよう何もしない。
+     * axx.py の lineassemble() と同じ規則である。 */
+    if(st->textmode && st->indent_text[0] && !st->vliwflag
+       && st->asmtext && st->asmtext[0]){
+        const char *ind = st->indent_text;
+        int ilen = (int)strlen(ind);
+        /* 前に足すので、いちど後ろへずらす。 */
+        for(int k=0;k<ilen;k++) iv_push(&objl, u256_zero());
+        for(int k=objl.len-1-ilen; k>=0; k--) objl.data[k+ilen] = objl.data[k];
+        for(int k=0;k<ilen;k++)
+            objl.data[k] = u256_from_u64((uint64_t)(unsigned char)ind[k]);
+        TxtBuf nt; txt_init(&nt);
+        txt_adds(&nt, ind);
+        txt_adds(&nt, st->asmtext);
+        free(st->asmtext);
+        st->asmtext = nt.b ? nt.b : strdup("");
+        if(!st->asmtext){ perror("strdup"); exit(1); }
+        TxtBuf nd; txt_init(&nd);
+        txt_addc(&nd, '"');
+        txt_add_escaped(&nd, st->asmtext);
+        txt_addc(&nd, '"');
+        free(st->asmtext_disp);
+        st->asmtext_disp = nd.b ? nd.b : strdup("");
+        /* 前に足したぶん、その行のワード位置がずれる。ELF の再配置はワード位置で
+         * 覚えているので、ラベルを前に足すときと同じだけ送っておく。 */
+        for(int ri=0; ri<st->elf_refs_len; ri++)
+            if(st->elf_refs[ri].word_idx >= 0) st->elf_refs[ri].word_idx += ilen;
     }
 
     /* `.eol` が有効なら、出力を出した行ごとに改行を1ワード足す。標準出力へ流す

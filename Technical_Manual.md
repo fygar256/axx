@@ -2305,7 +2305,8 @@ What comes out is **the line as it was offered to the matcher**: tabs and runs o
 spaces squeezed to one space, a `;` comment removed, and a leading label
 definition removed (the label is still defined). In text replacement mode
 (section 3.18) that comment and that label definition come back into the output
-spelled as they were written.
+spelled as they were written, and so does the line's leading indentation (spaces
+and tabs).
 
 The pattern file is scanned in full for every source line, so `.passthru` acts as
 a setting for the whole file (the last one in the file wins).
@@ -2359,7 +2360,7 @@ setting for the whole file (the last one in the file wins).
 ### 3.18 `.textmode` — text replacement mode
 
 The setting for rewriting a source into text in another notation (using axx as a
-translator). It does four things at once.
+translator). It does five things at once.
 
 ```
 .textmode          /* same as on */
@@ -2373,6 +2374,8 @@ translator). It does four things at once.
    becomes 0, and `{{.exp()}}` still emits the text as written.
 4. A `;` comment in the source is **not dropped: it comes out after the rewritten
    text** (below).
+5. The line's **leading indentation (spaces and tabs) is not dropped: it comes out
+   before the rewritten text** (below).
 
 `.passthru` and `.eol` move together, so to set one of them differently write that
 directive after this line (directives take effect in the order written).
@@ -2395,6 +2398,9 @@ JMP  !La  :: "JP {{.exp(a)}}"
 	jmp	loop        ->  JP loop
 ```
 
+(The right of the arrow leaves the leading indentation out; the real output carries
+the same indentation as the left — see "Leading indentation" below.)
+
 This is the case where the spelling matters and the value does not. Written with
 `!a` and `{{.hex(a)}}`, a label collapses into a number such as `0x122` and the
 label is gone from the rewritten text. With `!La` and `{{.exp(a)}}`, `msg` stays
@@ -2411,6 +2417,50 @@ label is gone from the rewritten text. With `!La` and `{{.exp(a)}}`, `msg` stays
 - Outside text replacement mode `!L` behaves exactly like `!` (an undefined label
   is an error). The text is remembered either way.
 
+#### Leading indentation
+
+In text replacement mode the **leading indentation (spaces and tabs) of the source
+line comes out at the head of the line, spelled as it was written**. The shape of
+the source is kept in the translation, so the result stays readable and still goes
+through an assembler.
+
+```
+	lxi	h,msg
+here:	nop
+	nop
+	; an indented comment-only line
+```
+
+```
+	LD HL,msg
+here: NOP
+	NOP
+	; an indented comment-only line
+```
+
+- What comes out are the tabs and spaces exactly as written (a tab stays a tab).
+  Runs of spaces are squeezed to one for the matcher (section 3.16), but the
+  indentation is put back as it was here.
+- It is attached at the head of the whole line, after the `label:` and the `;`
+  comment have been put back, so no extra blank creeps in between the indentation
+  and what follows. A line with a label at its head has no indentation, so it comes
+  out from column one as before.
+- An empty line and a line of nothing but whitespace still emit nothing (no line of
+  bare indentation is ever made).
+- The indentation is attached to a line that emitted text. A line that emitted
+  numbers rather than text (`.ascii` and the other built-in directives of section
+  5.3) is left alone, so data is not corrupted. With `.vliw` on it does nothing, as
+  `.eol` does not, so packets stay intact.
+- Outside text replacement mode `.passthru` (section 3.16) is unchanged: the
+  indentation is not kept.
+- The label's value points at the **start of what the line emits, the indentation
+  included**. Both passes emit the same text, so the size of the line and the value
+  of the label agree across the two passes.
+
+The examples in this section that use an arrow (`->`) show only the rewritten part,
+with the leading indentation left out. The real output carries the same indentation
+as the left of the arrow.
+
 #### A leading `label:`
 
 In text replacement mode a label definition at the start of a line **is emitted
@@ -2425,7 +2475,7 @@ msg:
 ```
 
 ```
-LD HL,msg
+	LD HL,msg
 here: NOP
 msg:
 ```
@@ -2435,9 +2485,9 @@ numbers rather than text (`.ascii` and the other built-in directives of section
 5.3) is left alone, so data is not corrupted. With `.vliw` on it does nothing, as
 `.eol` does not, so packets stay intact.
 
-The label's value points at the **start of what the line emits, the label's own
-spelling included**. Both passes emit the same text, so the size of the line and
-the value of the label agree across the two passes.
+The label's value points at the **start of what the line emits, the indentation and
+the label's own spelling included**. Both passes emit the same text, so the size of
+the line and the value of the label agree across the two passes.
 
 #### `;` comments
 
@@ -2520,18 +2570,18 @@ msg:    db 'Hello, world$'
 and the `helloz80.s` that comes out:
 
 ```
-.org 0x100 ; .COM は 0x100 にロードされる
+        .org 0x100 ; .COM は 0x100 にロードされる
 start:
-LD C,9 ; BDOS function 9 = print $-terminated string
-LD DE,msg ; DE = アドレス of msg
-CALL 0x0005 ; BDOS entry at 0005h
-RET ; CP/M に戻る
+        LD C,9 ; BDOS function 9 = print $-terminated string
+        LD DE,msg ; DE = アドレス of msg
+        CALL 0x0005 ; BDOS entry at 0005h
+        RET ; CP/M に戻る
 msg: db 'Hello, world$'
 ```
 
 Its operands are captured with `!L` and emitted with `{{.exp()}}`, so `msg` stays
-a label and `0x0005` keeps the spelling it was written with, and every comment
-stays where it was written. The `helloz80.s` that
+a label and `0x0005` keeps the spelling it was written with, every comment stays
+where it was written, and the leading indentation is the source's own. The `helloz80.s` that
 comes out assembles as it is with `z80.axx`. Sending the text to standard output
 is `-V`'s job, so without it nothing appears on screen (`-b` still writes the
 same text to a file).

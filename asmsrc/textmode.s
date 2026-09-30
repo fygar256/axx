@@ -9,6 +9,9 @@ start:
 	jmp	loop
 loop:	; ラベルの後ろだけコメント
 	mov	a,h
+	; 字下げしたコメントだけの行
+    mov	a,l
+	    nop
 	lda	msg+2
 	jmpc	loop		; 値と綴りの両方を使う行のコメント
 	xyzzy	foo, bar	; マッチしない行のコメント
