@@ -112,6 +112,22 @@ elfsym.s                            test assemble file for elfsym.axx. build it
                                     types, sizes, bindings, visibilities, the
                                     st_other byte and the SHN_COMMON symbol
                                     are all written from the source
+riscv64.axx                         pattern file for RV64I (the base integer
+                                    subset: U/I/S/B/J/R formats, loads and
+                                    stores, branches, jumps, call, li/mv/j/
+                                    ret/nop, ecall/ebreak). no C, M, A, F/D,
+                                    CSR or fence group. it is also the worked
+                                    example of declaring the relocations axx
+                                    has no built-in numbers for: the built-in
+                                    EM_RISCV table holds only the data types,
+                                    so CALL_PLT, BRANCH, JAL, HI20, LO12_I/S
+                                    and the PCREL pair come from .elftype /
+                                    .elffield / .reloc (manual 3.7.5-3.7.7)
+riscv64.s                           test assemble file for riscv64.axx. it
+                                    uses every relocation type the pattern
+                                    file declares, and links and runs:
+                                    axx riscv64.axx riscv64.s -o out.o &&
+                                    ld -m elf64lriscv -o out out.o
 endsub.axx                          pattern file for closing a `.sub` block with
                                     `.endsub` instead of `.return`: the two
                                     spellings mean the same thing and can be

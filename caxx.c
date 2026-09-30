@@ -6723,6 +6723,35 @@ static int elf_decl_num(Assembler *asmb, const char *dname, const char *text,
     return 1;
 }
 
+/* elf_decl_num の符号なし 64 ビット版。`.elffield` のマスクは最上位ビットまで
+ * 使えるので（RISC-V の R_RISCV_CALL_PLT は 8 バイトの欄のビット 63 に届く）、
+ * long long では表せない。診断の文言は elf_decl_num と同じ形で、範囲だけ
+ * 符号なしで出す。axx.py の _elf_decl_num() と同じ規則である。 */
+static int elf_decl_u64(Assembler *asmb, const char *dname, const char *text,
+                        uint64_t lo, uint64_t hi, uint64_t *out){
+    AsmState *st = &asmb->st;
+    while(*text==' '||*text=='\t') text++;
+    if(!*text){
+        axx_diagf(1, 0, " error - %s: a number is required.\n", dname);
+        return 0;
+    }
+    int io;
+    st->error_undefined_label = 0;
+    uint256_t v = expr_expression_pat(asmb, text, 0, &io);
+    uint64_t n = u256_to_u64(v);
+    if(st->error_undefined_label || u256_is_undef_derived(v)
+       || !u256_eq(v, u256_from_u64(n)) || n < lo || n > hi){
+        axx_diagf(1, 0, " error - %s: value must be an integer in %llu..%llu, "
+                        "got '%s'.\n", dname, (unsigned long long)lo,
+                        (unsigned long long)hi, text);
+        st->error_undefined_label = 0;
+        return 0;
+    }
+    st->error_undefined_label = 0;
+    *out = n;
+    return 1;
+}
+
 /* ELF 宣言の第1欄・第2欄を取り出す。パターン行は `::` が1つだけだと第1欄が
  * 空になり、書いた値が第2欄に入る（`.elfclass::64` は ["", "64"]）。
  * axx.py の _elf_decl_fields() と同じ読み方である。 */
@@ -7074,6 +7103,11 @@ static int elf_sec_find(const AsmState *st, const char *name){
  * である（`SHF_MERGE` の文字列表など）。書かなければ 0 になる。
  * axx.py の elfsection_processing() と同じ規則である。 */
 /* `.elffield::<型>::<マスク>[::<オフセット>]` — 命令フィールド型のリロケーション。
+ *
+ * マスクは 64 ビットのどのビットも使える（上限は 0xFFFFFFFFFFFFFFFF）。2 つの
+ * 命令語にまたがる 8 バイトの欄では最上位ビットまで届くことがある — RISC-V の
+ * `R_RISCV_CALL_PLT` は `auipc`+`jalr` の対に当たり、リトルエンディアンで読むと
+ * `jalr` の imm12 がビット 52〜63 に来る。
  * axx.py の elffield_processing() と同じ規則である。 */
 static int dir_elffield(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elffield") != 0) return 0;
@@ -7085,8 +7119,8 @@ static int dir_elffield(Assembler *asmb, PatEntry *e){
         free(t);
         return 1;
     }
-    long long m;
-    if(!elf_decl_num(asmb, ".elffield", mf, 1, 0x7FFFFFFFFFFFFFFFll, &m)){ free(t); return 1; }
+    uint64_t m;
+    if(!elf_decl_u64(asmb, ".elffield", mf, 1, 0xFFFFFFFFFFFFFFFFull, &m)){ free(t); return 1; }
     long long off = 0;
     {
         const char *q = e->f[3];
@@ -7095,8 +7129,8 @@ static int dir_elffield(Assembler *asmb, PatEntry *e){
     }
     for(int i = 0; i < st->elf_fields_len; i++){
         if(strcmp(st->elf_fields[i].type, t) == 0){
-            if(st->elf_fields[i].mask != (uint64_t)m || st->elf_fields[i].off != (int)off){
-                st->elf_fields[i].mask = (uint64_t)m;
+            if(st->elf_fields[i].mask != m || st->elf_fields[i].off != (int)off){
+                st->elf_fields[i].mask = m;
                 st->elf_fields[i].off  = (int)off;
                 st->elf_decl_gen++;
             }
@@ -7111,7 +7145,7 @@ static int dir_elffield(Assembler *asmb, PatEntry *e){
         if(!st->elf_fields){ perror("realloc"); exit(1); }
     }
     st->elf_fields[st->elf_fields_len].type = t;
-    st->elf_fields[st->elf_fields_len].mask = (uint64_t)m;
+    st->elf_fields[st->elf_fields_len].mask = m;
     st->elf_fields[st->elf_fields_len].off  = (int)off;
     st->elf_fields_len++;
     st->elf_decl_gen++;

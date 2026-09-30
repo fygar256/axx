@@ -181,7 +181,10 @@ The fields:
 - `<mask>` is the set of bits the linker writes, within the bytes of the type's
   width (from `.elftype` or the machine's name table) read as an integer in the
   target byte order. A field split over two instruction words is one 64-bit
-  mask.
+  mask. Any of the 64 bits may be used (1 to 0xFFFFFFFFFFFFFFFF). An 8-byte
+  field can reach the top bit: RISC-V's `R_RISCV_CALL_PLT` covers an
+  `auipc`+`jalr` pair, and read little-endian the `jalr` imm12 lands in bits
+  52-63, so its mask is `0xfff00000fffff000`.
 - `<offset>` (default 0) is where the field starts, in bytes from the first word
   the row emits for that operand; `r_offset` points there. A 16-bit field in the
   low half of a 32-bit word is at 2 big-endian and at 0 little-endian.
@@ -203,6 +206,21 @@ BL !t :: .call w4(0x48000001|((t-$$)&0x3fffffc))
 On a machine whose offsets or masks depend on the byte order, writing the
 `.elffield` lines in the wrapper that sets the byte order keeps a single
 instruction-set file (section 8, PowerPC64, is built that way).
+
+The bundled `riscv64.axx` / `riscv64.s` are the example of a machine whose
+built-in table holds **only data types**, where these declarations are all there
+is to go on. The EM_RISCV(243) table has `R_RISCV_64` / `_32` and nothing else, so
+`CALL_PLT` (the 8-byte field over an `auipc`+`jalr` pair), `BRANCH`, `JAL`,
+`HI20`, `LO12_I` / `_S` and `PCREL_HI20` / `PCREL_LO12_I` / `_S` all come from
+`.elftype` and `.elffield`. The object links with `ld -m elf64lriscv`, and the
+linker fills every field exactly as it would one GNU as produced.
+
+RISC-V has no absolute 8- or 16-bit relocation, incidentally. The numbers the
+built-in table carries for those widths are `R_RISCV_ADD8` (33) and
+`R_RISCV_ADD16` (34) — the add half of an ADD/SUB pair, which is not what a lone
+`db symbol` means. `riscv64.axx` switches those widths off with
+`.elfwidth::1::0` and `.elfwidth::2::0`, so such a reference gets no relocation
+and is reported under `-d` instead (section 5).
 
 ---
 

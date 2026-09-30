@@ -4795,6 +4795,11 @@ class DirectiveProcessor:
         ぶんのバイト列を対象のバイト順で読んだ整数の中で、リンカが書き込むビット。
         オフセットはその欄が命令の先頭（その行が出す最初のワード）から何バイト目
         かで、r_offset もそこを指す。caxx.c の dir_elffield() と同じ規則である。
+
+        マスクは 64 ビットのどのビットも使える（上限は 0xFFFFFFFFFFFFFFFF）。
+        2 つの命令語にまたがる 8 バイトの欄では最上位ビットまで届くことがある
+        — RISC-V の `R_RISCV_CALL_PLT` は `auipc`+`jalr` の対に当たり、
+        リトルエンディアンで読むと `jalr` の imm12 がビット 52〜63 に来る。
         """
         if len(i) == 0 or i[0] != '.elffield':
             return False
@@ -4804,7 +4809,7 @@ class DirectiveProcessor:
             self.state.diag(" error - .elffield: relocation type is not specified.",
                             set_error=True)
             return True
-        m = self._elf_decl_num('.elffield', _mf, 1, 0x7FFFFFFFFFFFFFFF)
+        m = self._elf_decl_num('.elffield', _mf, 1, 0xFFFFFFFFFFFFFFFF)
         if m is None:
             return True
         off = 0

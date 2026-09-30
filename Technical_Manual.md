@@ -39,7 +39,7 @@ axx 8080toz80.axx hello8080.s -V > out.s  # translated text to stdout
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all twenty-nine bundled pattern/source pairs with
+exactly that: `test1` assembles all thirty bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the three `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` pair the `.echo` lines each one writes to standard
@@ -1599,7 +1599,10 @@ alignment checks on that operand are left to the linker.
 - `<mask>` is the set of bits the linker writes, within the bytes of the type's
   width (from `.elftype` or the machine's name table) read as an integer in the
   target byte order. A 34-bit field split over two instruction words is one
-  64-bit mask.
+  64-bit mask. Any of the 64 bits may be used (1 to 0xFFFFFFFFFFFFFFFF). An
+  8-byte field can reach the top bit: RISC-V's `R_RISCV_CALL_PLT` covers an
+  `auipc`+`jalr` pair, and read little-endian the `jalr` imm12 lands in bits
+  52-63, so its mask is `0xfff00000fffff000`.
 - `<offset>` (default 0) is where the field starts, in bytes from the first
   word the row emits for that operand; `r_offset` points there. A 16-bit field
   in the low half of a 32-bit word is at 2 big-endian and at 0 little-endian.
@@ -3677,7 +3680,8 @@ The x86_64 pattern file is also maintained separately at
 | **elfgen.axx** | 2.7 KB | 24 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 19 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
 | **elfsec.axx** | 1.4 KB | 7 | **elfsec.s** | section attributes and `sh_addralign` declared with `.elfsection` (3.7.7); test only |
-| **elfsym.axx** | 2.4 KB | 10 | **elfsym.s** | the ELF symbol attributes written from the source (`.type`, `.size`, `.weak`, `.hidden`, `.protected`, `.internal`, `.other`, `.comm`; 5.6.1), together with a field width that is not a power of two (`.elfwidth::3`) and a section element size (the fifth field of `.elfsection`; 3.7.7). The machine is EM_MN10300, which is not in the built-in table; test only |
+| **elfsym.axx** | 2.8 KB | 22 | **elfsym.s** | the ELF symbol attributes written from the source (`.type`, `.size`, `.weak`, `.hidden`, `.protected`, `.internal`, `.other`, `.comm`; 5.6.1), together with a field width that is not a power of two (`.elfwidth::3`) and a section element size (the fifth field of `.elfsection`; 3.7.7). The machine is EM_MN10300, which is not in the built-in table; test only |
+| **riscv64.axx** | 11 KB | 121 | **riscv64.s** | RV64I, the base integer instruction set (U/I/S/B/J/R formats, loads and stores, branches, jumps, `call`, `li`/`mv`/`j`/`ret`/`nop`, `ecall`/`ebreak`). No C, M, A or F/D extension, no CSR instructions, no fence group. It is also the worked example of declaring what axx has no built-in numbers for: the built-in EM_RISCV table holds only the data types, so `CALL_PLT`, `BRANCH`, `JAL`, `HI20`, `LO12_I`/`_S` and the `PCREL` pair come from `.elftype` / `.elffield` / `.reloc` (3.7.5-3.7.7). It links with `ld -m elf64lriscv` and runs |
 | **endsub.axx** | 1.2 KB | 4 | **endsub.s** | closing a `.sub` block with `.endsub` (3.7.2); test only |
 | **intel2att.axx** | 12 KB | 434 | **intel2att.s** | x86-64 Intel to AT&T source translator; `.textmode`, `!Y`, `!L` and macro-layer pattern generation (3.18). The translated text assembles with GNU as |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
@@ -3688,15 +3692,16 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 `itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
 `aarch64_logical_mini_demo.s`.
 
-`test1` runs all twenty-nine pairs through both implementations and
+`test1` runs all thirty pairs through both implementations and
 compares the `-b` raw binaries. For the three pairs that use `.textmode`
 (`textmode.axx` and `8080toz80.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
 `elftype.s` and `elfgen.axx` / `elfgen.s` pairs are about relocations and the
 ELF header, the `elfprio.axx` / `elfprio.s` pair is about which of the three
 ranks types a relocation, the `elfsec.axx` / `elfsec.s` pair is about the
-section headers, and the `elfsym.axx` / `elfsym.s` pair is about the symbol
-table attributes, so for those five the `-o` ELF objects are compared. For the
+section headers, the `elfsym.axx` / `elfsym.s` pair is about the symbol
+table attributes, and the `riscv64.axx` / `riscv64.s` pair is about declared
+instruction-field types, so for those six the `-o` ELF objects are compared. For the
 `echo.axx` / `echo.s` pair the `.echo` lines written to standard error are
 compared as well.
 
@@ -3704,7 +3709,7 @@ The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for a hundred and forty-five comparisons in all.
+never compares, for a hundred and forty-six comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -3734,7 +3739,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all twenty-nine bundled pattern/source pairs with both
+`test1` assembles all thirty bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 three `.textmode` pairs and the `.echo` lines of the `echo.axx` pair.
 

@@ -1,0 +1,281 @@
+/* ===================================================================
+/* riscv64.axx -- RV64I (base integer subset) pattern file for axx
+/*
+/* Scope. The base integer instruction set of RV64I in the GNU
+/* assembler syntax, plus the pseudo-instructions a small program
+/* needs: the U/I/S/B/J/R formats, loads and stores, branches, jumps,
+/* `call`, li / mv / j / ret / nop, and ecall / ebreak. It does not
+/* cover the compressed (C), multiply (M), atomic (A) or floating
+/* point (F/D) extensions, the CSR instructions, or the fence group.
+/*
+/* Why this file exists. axx carries a built-in ELF table for
+/* EM_RISCV (243), but that table holds only the data relocations
+/* (R_RISCV_64 / _32). Everything that packs its value into an
+/* instruction word -- the call, the branches, the lui/addi pair, the
+/* auipc/addi pc-relative pair -- has to be described by the pattern
+/* file: `.elftype` gives the number and the field width, `.elffield`
+/* gives the bits the linker writes, and `.reloc` says which operand
+/* carries them (manual 3.7.5 - 3.7.7). So this file is also the
+/* worked example of writing a linkable `.o` for a machine whose
+/* instruction-field relocations axx does not know.
+/*
+/* Assemble and link with:
+/*   axx riscv64.axx riscv64.s -o out.o
+/*   ld -m elf64lriscv -o out out.o
+/*
+/* Two notes on what is deliberately absent:
+/*
+/*   R_RISCV_RELAX (51) is not emitted. axx writes one relocation per
+/*   reference, so the marker GNU as pairs with a call cannot be
+/*   written. A linker then simply does not relax `auipc`+`jalr` into
+/*   `jal`; the link itself is unaffected.
+/*
+/*   The 1- and 2-byte defaults of the built-in table are switched off
+/*   below. RISC-V has no absolute 8- or 16-bit relocation: the numbers
+/*   the built-in table carries for those widths are R_RISCV_ADD8 (33)
+/*   and R_RISCV_ADD16 (34), the add half of an ADD/SUB pair, which is
+/*   not what a lone `db symbol` means. `.elfwidth::1::0` says "this
+/*   width has no type", so such a reference is reported under -d
+/*   instead of being given a relocation that would be applied wrongly.
+/* =================================================================== */
+
+.bits::8
+.elfmachine::243::RISC-V
+.elfclass::64
+.elfrela::1
+
+/* --- relocation types of the RISC-V psABI ------------------------- */
+/*     name          number width pc-relative                        */
+.elftype::branch::16::4::1        /* R_RISCV_BRANCH                  */
+.elftype::jal::17::4::1           /* R_RISCV_JAL                     */
+.elftype::call::19::8::1          /* R_RISCV_CALL_PLT (auipc + jalr)  */
+.elftype::pcrel_hi20::23::4::1    /* R_RISCV_PCREL_HI20              */
+.elftype::pcrel_lo12_i::24::4::1  /* R_RISCV_PCREL_LO12_I            */
+.elftype::pcrel_lo12_s::25::4::1  /* R_RISCV_PCREL_LO12_S            */
+.elftype::hi20::26::4             /* R_RISCV_HI20  (lui)             */
+.elftype::lo12_i::27::4           /* R_RISCV_LO12_I(addi, load)      */
+.elftype::lo12_s::28::4           /* R_RISCV_LO12_S(store)           */
+
+/* --- which bits of the instruction the linker writes -------------- */
+.elffield::hi20::0xfffff000           /* U-type imm[31:12]           */
+.elffield::pcrel_hi20::0xfffff000
+.elffield::jal::0xfffff000            /* J-type, scattered           */
+.elffield::lo12_i::0xfff00000         /* I-type imm[11:0]            */
+.elffield::pcrel_lo12_i::0xfff00000
+.elffield::lo12_s::0xfe000f80         /* S-type, split               */
+.elffield::pcrel_lo12_s::0xfe000f80
+.elffield::branch::0xfe000f80         /* B-type, split               */
+/* a call is two words: auipc's U field, then jalr's I field, read as
+/* one little-endian 8-byte integer */
+.elffield::call::0xfff00000fffff000
+
+/* --- data references (the built-in table already has these) ------- */
+.elfwidth::8::abs64            /* R_RISCV_64                      */
+.elfwidth::4::abs32            /* R_RISCV_32                      */
+.elfwidth::2::0                /* no absolute 16-bit type exists  */
+.elfwidth::1::0                /* no absolute 8-bit type exists   */
+.elfextern::abs64
+.elfdwarf::abs64
+
+/* ===================================================================
+/* Registers
+/* =================================================================== */
+!def regs(p, n) {
+!local i = 0
+!while i <= n {
+.setsym::!{p}!{i}::!{i}
+!set i = i + 1
+}
+}
+!regs("X", 31)
+.setsym::ZERO::0
+.setsym::RA::1
+.setsym::SP::2
+.setsym::GP::3
+.setsym::TP::4
+.setsym::T0::5
+.setsym::T1::6
+.setsym::T2::7
+.setsym::S0::8
+.setsym::FP::8
+.setsym::S1::9
+!def aregs(p, base, n) {
+!local i = 0
+!while i <= n {
+.setsym::!{p}!{i}::!{base + i}
+!set i = i + 1
+}
+}
+!aregs("A", 10, 7)           /* a0..a7   -> 10..17                   */
+/* s2..s11 -> 18..27. s0 (=fp) and s1 are 8 and 9, set above, so this
+/* run starts at s2; a loop from s0 would overwrite them. */
+!def sregs() {
+!local i = 2
+!while i <= 11 {
+.setsym::S!{i}::!{16 + i}
+!set i = i + 1
+}
+}
+!sregs()
+.setsym::T3::28
+.setsym::T4::29
+.setsym::T5::30
+.setsym::T6::31
+
+/* ===================================================================
+/* Word emitters (mini language, section 3.15)
+/*
+/* One function per instruction format: it builds the 32-bit word and
+/* returns the four little-endian bytes, so binary_list is a single
+/* `.call`. (The mini language takes a call only as a whole expression
+/* or on the right of an assignment, never nested in an argument list.)
+/* =================================================================== */
+.func w4(z)
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+/* U-type: imm[31:12] | rd | opcode  (lui, auipc) */
+.func u4(imm20, rd, op)
+z = ((imm20 & 0xfffff) << 12) | (rd << 7) | op
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+/* I-type: imm[11:0] | rs1 | funct3 | rd | opcode */
+.func i4(imm, rs1, f3, rd, op)
+z = ((imm & 0xfff) << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+/* R-type: funct7 | rs2 | rs1 | funct3 | rd | opcode */
+.func r4(f7, rs2, rs1, f3, rd, op)
+z = (f7 << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+/* S-type: imm[11:5] | rs2 | rs1 | funct3 | imm[4:0] | opcode */
+.func s4(imm, rs2, rs1, f3)
+z = (((imm >> 5) & 0x7f) << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | ((imm & 0x1f) << 7) | 0x23
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+/* B-type: imm[12|10:5] | rs2 | rs1 | funct3 | imm[4:1|11] | opcode */
+.func b4(off, rs2, rs1, f3)
+z = (((off >> 12) & 1) << 31) | (((off >> 5) & 0x3f) << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (((off >> 1) & 0xf) << 8) | (((off >> 11) & 1) << 7) | 0x63
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+/* J-type: imm[20|10:1|11|19:12] | rd | opcode */
+.func j4(off, rd)
+z = (((off >> 20) & 1) << 31) | (((off >> 1) & 0x3ff) << 21) | (((off >> 11) & 1) << 20) | (((off >> 12) & 0xff) << 12) | (rd << 7) | 0x6f
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+/* call: auipc ra,%pcrel_hi(t) ; jalr ra,%pcrel_lo(t)(ra) -- two words,
+/* covered by one R_RISCV_CALL_PLT over the 8-byte pair */
+.func call8(off)
+a = 0x00000097 | ((((off + 0x800) >> 12) & 0xfffff) << 12)
+b = 0x000080e7 | ((off & 0xfff) << 20)
+.emit(a & 0xff, (a >> 8) & 0xff, (a >> 16) & 0xff, (a >> 24) & 0xff)
+.emit(b & 0xff, (b >> 8) & 0xff, (b >> 16) & 0xff, (b >> 24) & 0xff)
+.return
+.endfunc
+
+/* ===================================================================
+/* Instructions
+/*
+/* The %hi / %lo / %pcrel_hi / %pcrel_lo forms come first, so that a
+/* modifier is never read as a plain immediate.
+/* =================================================================== */
+
+/* -- U-type: lui / auipc ------------------------------------------- */
+.reloc::v::hi20
+LUI d,%HI(!v) :: .call u4((v+0x800)>>12,d,0x37)
+.clrreloc::v
+.reloc::v::pcrel_hi20
+AUIPC d,%PCREL_HI(!v) :: .call u4((v-$$+0x800)>>12,d,0x17)
+.clrreloc::v
+LUI d,!v :: .call u4(v,d,0x37)
+AUIPC d,!v :: .call u4(v,d,0x17)
+
+/* -- I-type / S-type with a relocation modifier -------------------- */
+.reloc::v::lo12_i
+ADDI d,s,%LO(!v) :: .call i4(v,s,0,d,0x13)
+LD d,%LO(!v)(s) :: .call i4(v,s,3,d,0x03)
+LW d,%LO(!v)(s) :: .call i4(v,s,2,d,0x03)
+.clrreloc::v
+.reloc::v::pcrel_lo12_i
+ADDI d,s,%PCREL_LO(!v) :: .call i4(v-$$,s,0,d,0x13)
+LD d,%PCREL_LO(!v)(s) :: .call i4(v-$$,s,3,d,0x03)
+LW d,%PCREL_LO(!v)(s) :: .call i4(v-$$,s,2,d,0x03)
+.clrreloc::v
+.reloc::v::pcrel_lo12_s
+SD t,%PCREL_LO(!v)(s) :: .call s4(v-$$,t,s,3)
+SW t,%PCREL_LO(!v)(s) :: .call s4(v-$$,t,s,2)
+.clrreloc::v
+.reloc::v::lo12_s
+SD t,%LO(!v)(s) :: .call s4(v,t,s,3)
+SW t,%LO(!v)(s) :: .call s4(v,t,s,2)
+.clrreloc::v
+
+/* -- ordinary I-type ----------------------------------------------- */
+ADDI d,s,!v :: .call i4(v,s,0,d,0x13)
+ORI  d,s,!v :: .call i4(v,s,6,d,0x13)
+ANDI d,s,!v :: .call i4(v,s,7,d,0x13)
+XORI d,s,!v :: .call i4(v,s,4,d,0x13)
+SLLI d,s,!v :: .call w4(((v&63)<<20)|(s<<15)|(1<<12)|(d<<7)|0x13)
+SRLI d,s,!v :: .call w4(((v&63)<<20)|(s<<15)|(5<<12)|(d<<7)|0x13)
+SRAI d,s,!v :: .call w4((0x10<<26)|((v&63)<<20)|(s<<15)|(5<<12)|(d<<7)|0x13)
+LD  d,!v(s) :: .call i4(v,s,3,d,0x03)
+LW  d,!v(s) :: .call i4(v,s,2,d,0x03)
+LBU d,!v(s) :: .call i4(v,s,4,d,0x03)
+LB  d,!v(s) :: .call i4(v,s,0,d,0x03)
+SD t,!v(s) :: .call s4(v,t,s,3)
+SW t,!v(s) :: .call s4(v,t,s,2)
+SB t,!v(s) :: .call s4(v,t,s,0)
+
+/* -- R-type -------------------------------------------------------- */
+ADD  d,s,t :: .call r4(0x00,t,s,0,d,0x33)
+SUB  d,s,t :: .call r4(0x20,t,s,0,d,0x33)
+OR   d,s,t :: .call r4(0x00,t,s,6,d,0x33)
+AND  d,s,t :: .call r4(0x00,t,s,7,d,0x33)
+XOR  d,s,t :: .call r4(0x00,t,s,4,d,0x33)
+SLT  d,s,t :: .call r4(0x00,t,s,2,d,0x33)
+SLTU d,s,t :: .call r4(0x00,t,s,3,d,0x33)
+
+/* -- branches (B-type) --------------------------------------------- */
+.reloc::v::branch
+BEQ  s,t,!v :: .call b4(v-$$,t,s,0)
+BNE  s,t,!v :: .call b4(v-$$,t,s,1)
+BLT  s,t,!v :: .call b4(v-$$,t,s,4)
+BGE  s,t,!v :: .call b4(v-$$,t,s,5)
+BLTU s,t,!v :: .call b4(v-$$,t,s,6)
+BGEU s,t,!v :: .call b4(v-$$,t,s,7)
+.clrreloc::v
+
+/* -- jumps --------------------------------------------------------- */
+.reloc::v::jal
+JAL d,!v :: .call j4(v-$$,d)
+J !v :: .call j4(v-$$,0)
+.clrreloc::v
+JALR d,!v(s) :: .call i4(v,s,0,d,0x67)
+JALR d,s :: .call i4(0,s,0,d,0x67)
+JR s :: .call i4(0,s,0,0,0x67)
+RET :: .call w4(0x00008067)
+
+/* -- call: auipc + jalr, one R_RISCV_CALL_PLT over the pair -------- */
+.reloc::v::call
+CALL !v :: .call call8(v-$$)
+.clrreloc::v
+
+/* -- pseudos and system -------------------------------------------- */
+MV d,s :: .call i4(0,s,0,d,0x13)
+LI d,!v :: .call i4(v,0,0,d,0x13)
+NOP :: .call w4(0x00000013)
+ECALL :: .call w4(0x00000073)
+EBREAK :: .call w4(0x00100073)
+
+/* -- data ---------------------------------------------------------- */
+DWORD !v :: v,v>>8,v>>16,v>>24
+QUAD !v :: v,v>>8,v>>16,v>>24,v>>32,v>>40,v>>48,v>>56
+DB !v :: v
+HALF !v :: v,v>>8

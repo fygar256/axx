@@ -39,6 +39,7 @@ caxx $P/intel2att.axx $S/intel2att.s -b b29
 caxx $P/intel2att.axx $S/intel2att.s -V > b30
 # 番号が飛んでいるのは、下の 31〜110 を付け替えずに後から足したためである。
 caxx $P/elfsym.axx $S/elfsym.s -o b111
+caxx $P/riscv64.axx $S/riscv64.s -o b112
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -162,6 +163,7 @@ paxx $P/endsub.axx $S/endsub.s -b a28
 paxx $P/intel2att.axx $S/intel2att.s -b a29
 paxx $P/intel2att.axx $S/intel2att.s -V > a30
 paxx $P/elfsym.axx $S/elfsym.s -o a111
+paxx $P/riscv64.axx $S/riscv64.s -o a112
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -251,7 +253,7 @@ paxx $P/aarch64.axx $S/aarch64.s -V -b a110 > a110t
 FAIL=0
 
 N=0
-while [ $N -le 111 ]; do
+while [ $N -le 112 ]; do
     cmp a$N b$N || FAIL=1
     N=$((N+1))
 done
