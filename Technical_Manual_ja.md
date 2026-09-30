@@ -24,11 +24,15 @@ gcc caxx.c -o caxx -lm -lquadmath -O2   # -lm は式評価器が、-lquadmath �
 アセンブル:
 
 ```sh
-axx z80.axx z80.s -v            # リスティングを標準出力へ
-axx z80.axx z80.s -b out.bin    # 生バイナリ
-axx x86_64.axx hello.s -o out.o # ELF 再配置可能オブジェクト
-axx 8080toz80.axx hello8080.s -V > out.s  # 翻訳したテキストを標準出力へ
+axx patfile/z80.axx asmsrc/z80.s -v            # リスティングを標準出力へ
+axx patfile/z80.axx asmsrc/z80.s -b out.bin    # 生バイナリ
+axx patfile/x86_64.axx asmsrc/hello.s -o out.o # ELF 再配置可能オブジェクト
+axx patfile/8080toz80.axx asmsrc/hello8080.s -V > out.s  # 翻訳したテキストを標準出力へ
 ```
+
+リポジトリではパターンファイルが `patfile/`、アセンブリソースが `asmsrc/` に入って
+います。以降の例では読みやすさのためファイル名だけを書きますが、クローンしたままの
+配置で動かすときは上のようにディレクトリを付けてください。
 
 ## 2 つの実装
 
@@ -40,11 +44,11 @@ axx 8080toz80.axx hello8080.s -V > out.s  # 翻訳したテキストを標準出
 この 2 つは同じ入力に対して**バイト単位で同一の出力**を生成することを意図しています。
 同梱のパターンファイル、テストソース、`test1` スクリプトはまさにそれを検証するために
 存在します。`test1` は同梱の 30 組のパターン/ソースの対を両方の実装でアセンブルし、
-結果を `cmp` します。さらに `.textmode` の 2 組については、`-V` で標準出力へ流した
+結果を `cmp` します。さらに `.textmode` の 3 組については、`-V` で標準出力へ流した
 翻訳テキストどうしも、`echo.axx` の組については標準エラーへ出た `.echo` の行どうしも
 `cmp` します。中核の 16 組は `-o`・`-m 3 -f 32 -o`・`-g -o`・`-v`・`-V` でも
 走らせるので、ELF32/ELF64 のオブジェクト、DWARF、リスティング、テキスト出力の
-経路も比較されます（全 144 組）。
+経路も比較されます（全 146 組）。
 
 **目次**
 
@@ -2407,10 +2411,18 @@ msg: db 'Hello, world$'
 
 オペランドは `!L` で拾って `{{.exp()}}` で出しているので、`msg` はラベルのまま、
 `0x0005` は書かれたままの綴りで出ます。コメントも書かれていた場所に残り、行頭の
-字下げもソースのままです。出てきた `helloz80.s` は `z80.axx` で
-そのままアセンブルできます。テキストを標準出力へ流すのは `-V` の仕事なので、
+字下げもソースのままです。テキストを標準出力へ流すのは `-V` の仕事なので、
 これを付けないと翻訳結果は画面に出ません（`-b` へ書けばファイルには同じテキストが
 入ります）。
+
+最後の `msg: db 'Hello, world$'` の行だけは訳されません。`8080toz80.axx` に `DB` の
+パターンが無いので素通しで `db` のまま出ますが、`z80.axx` も `DB` を定義していない
+ので、出てきた `helloz80.s` をそのまま `z80.axx` に渡すとこの行が `Syntax error` に
+なります。訳した結果をそのままアセンブルしたいときは、入力側のデータ行を組み込み
+ディレクティブで書いてください（`msg: .ascii "Hello, world$"`、5.3 節）。組み込み
+ディレクティブの行はテキストとしてそのまま出るので（下記「組み込みディレクティブの
+行」）、`z80.axx` がそのまま受け取れます。素通しそのものは `.textmode` の設計どおりの
+振る舞いで、訳せた行と訳せなかった行が出力を見れば分かるようになっています。
 
 #### 例: Intel 記法から AT&T 記法へ
 
@@ -3468,10 +3480,11 @@ AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v
 
 ## 付録 B. 同梱パターンファイル
 
-`x86_64.axx`、`x86_64m.axx`、`68000.axx`、`z80.axx`、`8080.axx`、`8048.axx`、
-`8051.axx`、`6502.axx`、`6800.axx`、`6809.axx`、`4004.axx` は実用向けです。
-`aarch64_logical_mini.axx` も、カバーする 1 つの命令グループの範囲内では実用向けです。
-残りはテストフィクスチャです。
+`x86_64.axx`、`x86_64m.axx`、`aarch64.axx`、`ppc64.axx`、`ppc64le.axx`、`68000.axx`、
+`z80.axx`、`8080.axx`、`8048.axx`、`8051.axx`、`6502.axx`、`6800.axx`、`6809.axx`、
+`4004.axx` は実用向けです。`riscv64.axx` は RV64I の基本整数部分の範囲で、
+`aarch64_logical.axx` と `aarch64_logical_mini.axx` はカバーする 1 つの命令グループの
+範囲内で実用向けです。残りはテストフィクスチャです。
 
 x86_64 パターンファイルは
 <https://github.com/fygar256/x86_64_pattern_file_for_axx> でも別途メンテナンスされて
@@ -3480,8 +3493,13 @@ x86_64 パターンファイルは
 | パターンファイル | サイズ | `::` 行数 | ソース | 備考 |
 |---|---|---|---|---|
 | **x86_64.axx** | 3.9 MB | 23,923 | **hello.s** | x86_64-v3: セグメントアドレッシング、AVX/AVX2、BMI1/BMI2、x87、EVEX/AVX-512 |
-| **x86_64m.axx** | 935 KB | 5,787 | **hello.s** | マクロで書かれた x86_64-v3。Brainfuck デモでも使用 |
+| **x86_64m.axx** | 935 KB | 5,787（展開後 23,923） | **hello.s** | マクロで書かれた x86_64-v3。Brainfuck デモでも使用 |
+| **aarch64.axx** | 347 KB | 2,068（展開後 9,387） | **aarch64.s** | AArch64 (A64): データ処理、分岐、例外生成、ヒント、バリア、システムレジスタと SYS 別名、ロード／ストア、LSE アトミック、スカラ浮動小数点、Advanced SIMD（LD1〜LD4 / ST1〜ST4 の構造アクセスを含む）、暗号、スカラ拡張（PAuth・MTE・MOPS・FCMA・ドット積・BFloat16・行列積・LS64）。さらに SVE・SVE2（算術、シフト、比較、述語、要素数、置換、リダクション、ギャザー／スキャッタを含むロード／ストア一式、拡幅・縮小群、複素演算、SVE2 暗号）、SME（ストリーミングモード、ZA 配列、整数・浮動小数点・BFloat16 の外積）、SME2（述語カウンタレジスタ、ZT0 参照表、Z レジスタのマルチベクタ演算、ZA への累算、連続形と跨ぎ形のマルチベクタロード／ストア）。GNU 式のリロケーション修飾子（`:lo12:`・`:pg_hi21:`・`:abs_g0:`〜`:abs_g3:`・`:prel_g0:`〜`:prel_g3:`・`:got:`／`:got_lo12:`）は `-o` でリンカ向けのリロケーションとして出し、`-b` では axx 自身が解決する。マクロ層で記述 |
+| **aarch64_logical.axx** | 9.5 KB | 76（展開後 82） | **aarch64_logical_mini_demo.s** | 同じ AArch64 論理（即値）グループのマクロ層版。行を `!def` で生成し、ビットマスク即値は `binary_list` の式で符号化する |
 | **aarch64_logical_mini.axx** | 9.2 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 論理（即値）: AND/ORR/EOR/ANDS/TST、32 ビットと 64 ビット。ビットマスク即値をミニ言語（3.15 節）でエンコード |
+| **ppc64.axx** | 2.1 KB | 48（＋ `ppc64_isa.axx`） | **ppc64_test.s** ほか | PowerPC64 ビッグエンディアン (ELFv1)。バイト順と ELF 記述（`.elftype`／`.elffield`／`.elfsection`）を決めて `ppc64_isa.axx` を include する |
+| **ppc64le.axx** | 2.2 KB | 49（＋ `ppc64_isa.axx`） | **ppc64_test.s** ほか | 同じくリトルエンディアン (ELFv2) |
+| **ppc64_isa.axx** | 95 KB | 452（展開後 4,774） | — | `ppc64.axx` / `ppc64le.axx` が共有する Power ISA v3.1 (POWER10) の命令セット本体。axx に直接渡さない。固定小数点、拡張ニーモニックを含む分岐、浮動小数点、十進浮動小数点、VMX、VSX、四倍精度、前置形マスク付きを含む MMA、前置命令（64 バイト境界を跨ぐ前置命令の前には nop を入れる）。マクロ層とミニ言語で記述 |
 | **6809.axx** | 124 KB | 1,950 | **6809.s** | Motorola 6809 |
 | **68000.axx** | 51 KB | 453 | **68000.s** | Motorola 68000 |
 | **6800.axx** | 18 KB | 271 | **6800.s** | Motorola 6800 |
@@ -3492,26 +3510,33 @@ x86_64 パターンファイルは
 | **8048.axx** | 6.3 KB | 95 | **8048.s** | Intel 8048 |
 | **4004.axx** | 5.4 KB | 53 | **4004.s** | Intel 4004 |
 | **test.axx** | 1.1 KB | 40 | **test.s** | 複数 ISA の断片。テスト専用 |
-| **8080toz80.axx** | 5.8 KB | 117 | **hello8080.s** | Intel 8080 → Zilog Z80 のソース翻訳器。`.textmode`・`!L`・`{{.exp()}}`（3.18 節）の実例 |
-| **textmode.axx** | 1.8 KB | 13 | **textmode.s** | `.textmode`・`!L`・`{{.exp()}}`・`;` コメント（3.18 節）。テスト専用 |
+| **8080toz80.axx** | 5.7 KB | 117 | **hello8080.s** | Intel 8080 → Zilog Z80 のソース翻訳器。`.textmode`・`!L`・`{{.exp()}}`（3.18 節）の実例 |
+| **textmode.axx** | 2.0 KB | 13 | **textmode.s** | `.textmode`・`!L`・`{{.exp()}}`・`;` コメント（3.18 節）。テスト専用 |
 | **arrindex.axx** | 860 B | 14 | **arrindex.s** | 配列シンボルの素の名前・名前の添字・`.index`（3.6.1 節）。テスト専用 |
 | **passthru.axx** | 686 B | 6 | **passthru.s** | `.passthru` と `.eol`（3.16 / 3.17 節）。テスト専用 |
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | シンボル捕捉子 `!Y<集合>[<変数>]`（3.6.3 節）。テスト専用 |
-| **echo.axx** | 1.2 KB | 6 | **echo.s** | 本文行に書く `.echo`（3.14.1 節）。テスト専用 |
-| **elftype.axx** | 1.5 KB | 15 | **elftype.s** | `.elftype` で決めた型名を `.reloc` / `.extern` / `.global` に書く（3.7.6 節）。テスト専用 |
-| **elfgen.axx** | 2.7 KB | 24 | **elfgen.s** | 組み込みの表に無いマシン（EM_MSP430）の ELF 記述（3.7.7 節）。テスト専用 |
-| **elfprio.axx** | 1.7 KB | 19 | **elfprio.s** | リロケーション型の優先順位（既定 < パターンファイル < ソースファイル、3.7.8 節）。テスト専用 |
-| **elfsec.axx** | 1.4 KB | 7 | **elfsec.s** | `.elfsection` で宣言するセクションの属性と `sh_addralign`（3.7.7 節）。テスト専用 |
-| **elfsym.axx** | 2.8 KB | 22 | **elfsym.s** | ソース側の ELF シンボル属性（`.type`・`.size`・`.weak`・`.hidden`・`.protected`・`.internal`・`.other`・`.comm`、5.6.1 節）と、2 の冪でない欄の幅（`.elfwidth::3`）・セクションの要素長（`.elfsection` の第 5 欄、3.7.7 節）。機種は組み込みの表に無い EM_MN10300。テスト専用 |
-| **riscv64.axx** | 11 KB | 121 | **riscv64.s** | RV64I の基本整数命令（U/I/S/B/J/R 形式、ロード／ストア、分岐、ジャンプ、`call`、`li`/`mv`/`j`/`ret`/`nop`、`ecall`/`ebreak`）。C・M・A・F/D 拡張、CSR、fence 群は含みません。組み込みの EM_RISCV 表はデータ型しか持たないので、`CALL_PLT`・`BRANCH`・`JAL`・`HI20`・`LO12_I`/`_S`・`PCREL` 対を `.elftype`／`.elffield`／`.reloc` で宣言する実例でもあります（3.7.5〜3.7.7 節）。`ld -m elf64lriscv` でリンクでき、動きます |
-| **endsub.axx** | 1.2 KB | 4 | **endsub.s** | `.sub` ブロックを `.endsub` で閉じる（3.7.2 節）。テスト専用 |
-| **intel2att.axx** | 12 KB | 434 | **intel2att.s** | x86-64 Intel 記法 → AT&T 記法 のソース翻訳器。`.textmode`・`!Y`・`!L`・マクロ層でのパターン生成（3.18 節）。翻訳結果は GNU as に通る |
+| **echo.axx** | 1.2 KB | 8 | **echo.s** | 本文行に書く `.echo`（3.14.1 節）。テスト専用 |
+| **elftype.axx** | 1.5 KB | 20 | **elftype.s** | `.elftype` で決めた型名を `.reloc` / `.extern` / `.global` に書く（3.7.6 節）。テスト専用 |
+| **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | 組み込みの表に無いマシン（EM_MSP430）の ELF 記述（3.7.7 節）。テスト専用 |
+| **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | リロケーション型の優先順位（既定 < パターンファイル < ソースファイル、3.7.8 節）。テスト専用 |
+| **elfsec.axx** | 1.4 KB | 8 | **elfsec.s** | `.elfsection` で宣言するセクションの属性と `sh_addralign`（3.7.7 節）。テスト専用 |
+| **elfsym.axx** | 2.8 KB | 23 | **elfsym.s** | ソース側の ELF シンボル属性（`.type`・`.size`・`.weak`・`.hidden`・`.protected`・`.internal`・`.other`・`.comm`、5.6.1 節）と、2 の冪でない欄の幅（`.elfwidth::3`）・セクションの要素長（`.elfsection` の第 5 欄、3.7.7 節）。機種は組み込みの表に無い EM_MN10300。テスト専用 |
+| **riscv64.axx** | 11 KB | 122 | **riscv64.s** | RV64I の基本整数命令（U/I/S/B/J/R 形式、ロード／ストア、分岐、ジャンプ、`call`、`li`/`mv`/`j`/`ret`/`nop`、`ecall`/`ebreak`）。C・M・A・F/D 拡張、CSR、fence 群は含みません。組み込みの EM_RISCV 表はデータ型しか持たないので、`CALL_PLT`・`BRANCH`・`JAL`・`HI20`・`LO12_I`/`_S`・`PCREL` 対を `.elftype`／`.elffield`／`.reloc` で宣言する実例でもあります（3.7.5〜3.7.7 節）。`ld -m elf64lriscv` でリンクでき、動きます |
+| **endsub.axx** | 1.2 KB | 20 | **endsub.s** | `.sub` ブロックを `.endsub` で閉じる（3.7.2 節）。テスト専用 |
+| **intel2att.axx** | 12 KB | 60（展開後 3,437） | **intel2att.s** | x86-64 Intel 記法 → AT&T 記法 のソース翻訳器。`.textmode`・`!Y`・`!L`・マクロ層でのパターン生成（3.18 節）。翻訳結果は GNU as に通る |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) のスケッチ。未完成 |
-| **vliw.axx** | 178 B | 10 | **vliw.s** | 非 EPIC VLIW。テスト専用 |
+| **vliw.axx** | 192 B | 10 | **vliw.s** | 非 EPIC VLIW。テスト専用 |
 | **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck 仮想 CPU。hello-world デモ。同梱だが `test1` の対象外 |
 
+`::` 行数は、ファイルに書かれている `::` を含む行の数です。マクロ層で行を生成して
+いるファイルには、括弧内に展開後の行数を添えています（展開後は
+`caxx <パターンファイル> -p <出力>` で書き出せます）。
+
 `x86_64.axx` が対になるのは `hello.s` であって、`x86_64.s` という名前のファイルでは
-ないことに注意してください。`itanium.axx` も `vliw.s` を使い、
+ないことに注意してください。`ppc64.axx` と `ppc64le.axx` は `ppc64_test.s`（1 行 1
+パターン行、GNU as とバイト単位で照合）・`ppc64_reloc_test.s`（`-o` のリロケーション）・
+`hello_ppc64.s`（ビッグエンディアンの hello world）と対になり、`ppc64_isa.axx` は
+その 2 つから include されるので直接は渡しません。`itanium.axx` も `vliw.s` を使い、
 `aarch64_logical_mini.axx` は `aarch64_logical_mini_demo.s` と対になります。
 
 `test1` は 30 組を両方の実装で実行し、`-b` の生バイナリを比較します。

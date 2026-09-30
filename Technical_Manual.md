@@ -24,11 +24,16 @@ gcc caxx.c -o caxx -lm -lquadmath -O2   # -lm for the expression evaluator,
 Assemble:
 
 ```sh
-axx z80.axx z80.s -v            # listing to stdout
-axx z80.axx z80.s -b out.bin    # raw binary
-axx x86_64.axx hello.s -o out.o # ELF relocatable object
-axx 8080toz80.axx hello8080.s -V > out.s  # translated text to stdout
+axx patfile/z80.axx asmsrc/z80.s -v            # listing to stdout
+axx patfile/z80.axx asmsrc/z80.s -b out.bin    # raw binary
+axx patfile/x86_64.axx asmsrc/hello.s -o out.o # ELF relocatable object
+axx patfile/8080toz80.axx asmsrc/hello8080.s -V > out.s  # translated text to stdout
 ```
+
+In the repository the pattern files live in `patfile/` and the assembly sources
+in `asmsrc/`. The examples further down write the bare file names for
+readability; running them on a fresh clone needs the directory in front, as
+above.
 
 ## Two implementations
 
@@ -45,7 +50,7 @@ both implementations and `cmp`s the results. For the three `.textmode` pairs it 
 `-V`, and for the `echo.axx` pair the `.echo` lines each one writes to standard
 error. The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for a hundred and forty-four comparisons in all.
+text output are compared too, for a hundred and forty-six comparisons in all.
 
 **Contents**
 
@@ -2581,10 +2586,20 @@ msg: db 'Hello, world$'
 
 Its operands are captured with `!L` and emitted with `{{.exp()}}`, so `msg` stays
 a label and `0x0005` keeps the spelling it was written with, every comment stays
-where it was written, and the leading indentation is the source's own. The `helloz80.s` that
-comes out assembles as it is with `z80.axx`. Sending the text to standard output
-is `-V`'s job, so without it nothing appears on screen (`-b` still writes the
-same text to a file).
+where it was written, and the leading indentation is the source's own. Sending
+the text to standard output is `-V`'s job, so without it nothing appears on
+screen (`-b` still writes the same text to a file).
+
+The last line, `msg: db 'Hello, world$'`, is the one line that is not
+translated. `8080toz80.axx` has no `DB` pattern, so it is let through as `db`,
+and `z80.axx` does not define `DB` either -- handing the `helloz80.s` that comes
+out straight to `z80.axx` reports `Syntax error` on that line. To assemble the
+translation as it is, write the data line as a built-in directive in the input
+(`msg: .ascii "Hello, world$"`, section 5.3): lines holding a built-in directive
+come out as text unchanged (see "Lines holding a built-in directive" below), so
+`z80.axx` takes them as they are. The passthrough itself is `.textmode` working
+as designed -- it is what makes the translated and untranslated lines tell
+themselves apart in the output.
 
 #### Example: Intel syntax to AT&T syntax
 
@@ -3696,10 +3711,12 @@ AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v
 
 ## Appendix B. Bundled pattern files
 
-`x86_64.axx`, `x86_64m.axx`, `aarch64.axx`, `68000.axx`, `z80.axx`, `8080.axx`,
-`8048.axx`, `8051.axx`, `6502.axx`, `6800.axx`, `6809.axx` and `4004.axx` are
-for practical use, as is `aarch64_logical_mini.axx` within the one instruction
-group it covers. The rest are test fixtures.
+`x86_64.axx`, `x86_64m.axx`, `aarch64.axx`, `ppc64.axx`, `ppc64le.axx`,
+`68000.axx`, `z80.axx`, `8080.axx`, `8048.axx`, `8051.axx`, `6502.axx`,
+`6800.axx`, `6809.axx` and `4004.axx` are for practical use; `riscv64.axx`
+within the RV64I base integer subset, and `aarch64_logical.axx` and
+`aarch64_logical_mini.axx` within the one instruction group they cover. The rest
+are test fixtures.
 
 The x86_64 pattern file is also maintained separately at
 <https://github.com/fygar256/x86_64_pattern_file_for_axx>.
@@ -3707,9 +3724,13 @@ The x86_64 pattern file is also maintained separately at
 | Pattern file | Size | `::` lines | Source | Notes |
 |---|---|---|---|---|
 | **x86_64.axx** | 3.9 MB | 23,923 | **hello.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512 |
-| **x86_64m.axx** | 935 KB | 5,787 | **hello.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo |
-| **aarch64.axx** | 339 KB | 8,214 | **aarch64.s** | AArch64 (A64): data processing, branches, exception generation, hints, barriers, system registers and SYS aliases, loads and stores, LSE atomics, scalar floating point, Advanced SIMD (vector and scalar) including the LD1-LD4 / ST1-ST4 structure accesses, cryptography, and the scalar extensions (PAuth, MTE, MOPS, FCMA, dot product, BFloat16, matrix multiply, LS64), and the GNU-style relocation modifiers `:lo12:`, `:pg_hi21:`, `:abs_g0:`-`:abs_g3:`, `:prel_g0:`-`:prel_g3:` and `:got:` / `:got_lo12:`, which with `-o` are emitted as relocations for the linker to fill in (`R_AARCH64_ADR_PREL_PG_HI21`, `ADD_ABS_LO12_NC`, the `LDST*_ABS_LO12_NC` family, `MOVW_UABS_G*` / `MOVW_PREL_G*`, `ADR_GOT_PAGE` and `LD64_GOT_LO12_NC`) and which with `-b` axx resolves itself, reading the GOT pair as naming the slot. Also SVE and SVE2 -- arithmetic, shifts, compares, predicates, element counts, permutes, reductions, the whole load/store family (contiguous, replicating, non-fault, first-fault, gather, scatter, prefetch), the widening and narrowing groups, complex arithmetic and the SVE2 cryptography -- SME: streaming mode, the ZA array, and the integer, floating-point and BFloat16 outer products -- and SME2: the predicate-as-counter registers, the ZT0 lookup table, the multi-vector operations on Z registers, accumulation into the ZA array, and the multi-vector loads and stores in both their consecutive and strided forms |
+| **x86_64m.axx** | 935 KB | 5,787 (23,923 expanded) | **hello.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo |
+| **aarch64.axx** | 347 KB | 2,068 (9,387 expanded) | **aarch64.s** | AArch64 (A64): data processing, branches, exception generation, hints, barriers, system registers and SYS aliases, loads and stores, LSE atomics, scalar floating point, Advanced SIMD (vector and scalar) including the LD1-LD4 / ST1-ST4 structure accesses, cryptography, and the scalar extensions (PAuth, MTE, MOPS, FCMA, dot product, BFloat16, matrix multiply, LS64), and the GNU-style relocation modifiers `:lo12:`, `:pg_hi21:`, `:abs_g0:`-`:abs_g3:`, `:prel_g0:`-`:prel_g3:` and `:got:` / `:got_lo12:`, which with `-o` are emitted as relocations for the linker to fill in (`R_AARCH64_ADR_PREL_PG_HI21`, `ADD_ABS_LO12_NC`, the `LDST*_ABS_LO12_NC` family, `MOVW_UABS_G*` / `MOVW_PREL_G*`, `ADR_GOT_PAGE` and `LD64_GOT_LO12_NC`) and which with `-b` axx resolves itself, reading the GOT pair as naming the slot. Also SVE and SVE2 -- arithmetic, shifts, compares, predicates, element counts, permutes, reductions, the whole load/store family (contiguous, replicating, non-fault, first-fault, gather, scatter, prefetch), the widening and narrowing groups, complex arithmetic and the SVE2 cryptography -- SME: streaming mode, the ZA array, and the integer, floating-point and BFloat16 outer products -- and SME2: the predicate-as-counter registers, the ZT0 lookup table, the multi-vector operations on Z registers, accumulation into the ZA array, and the multi-vector loads and stores in both their consecutive and strided forms |
+| **aarch64_logical.axx** | 9.5 KB | 76 (82 expanded) | **aarch64_logical_mini_demo.s** | The macro-layer version of the same AArch64 logical (immediate) group: the rows are generated with `!def`, and the bitmask immediate is encoded in a `binary_list` expression |
 | **aarch64_logical_mini.axx** | 9.2 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 logical (immediate): AND/ORR/EOR/ANDS/TST, 32- and 64-bit. Encodes the bitmask immediate with the mini language (section 3.15) |
+| **ppc64.axx** | 2.1 KB | 48 (plus `ppc64_isa.axx`) | **ppc64_test.s** and others | PowerPC64 big-endian (ELFv1): sets the byte order and the ELF description (`.elftype` / `.elffield` / `.elfsection`), then includes `ppc64_isa.axx` |
+| **ppc64le.axx** | 2.2 KB | 49 (plus `ppc64_isa.axx`) | **ppc64_test.s** and others | The same for little-endian PowerPC64 (ELFv2) |
+| **ppc64_isa.axx** | 95 KB | 452 (4,774 expanded) | -- | The PowerPC64 instruction set (Power ISA v3.1, POWER10) shared by `ppc64.axx` and `ppc64le.axx`; not passed to axx directly. Fixed point, branches with the extended mnemonics, floating point, decimal floating point, VMX, VSX, quad precision, MMA including the prefixed masked forms, and the prefixed instructions, with a nop inserted before one that would cross a 64-byte boundary. Written with the macro layer and the mini language |
 | **6809.axx** | 124 KB | 1,950 | **6809.s** | Motorola 6809 |
 | **68000.axx** | 51 KB | 453 | **68000.s** | Motorola 68000 |
 | **6800.axx** | 18 KB | 271 | **6800.s** | Motorola 6800 |
@@ -3720,31 +3741,39 @@ The x86_64 pattern file is also maintained separately at
 | **8048.axx** | 6.3 KB | 95 | **8048.s** | Intel 8048 |
 | **4004.axx** | 5.4 KB | 53 | **4004.s** | Intel 4004 |
 | **test.axx** | 1.1 KB | 40 | **test.s** | Fragments of several ISAs; test only |
-| **8080toz80.axx** | 5.8 KB | 117 | **hello8080.s** | Intel 8080 to Zilog Z80 source translator; `.textmode`, `!L` and `{{.exp()}}` (3.18) at work |
-| **textmode.axx** | 1.8 KB | 13 | **textmode.s** | `.textmode`, `!L`, `{{.exp()}}` and `;` comments (3.18); test only |
+| **8080toz80.axx** | 5.7 KB | 117 | **hello8080.s** | Intel 8080 to Zilog Z80 source translator; `.textmode`, `!L` and `{{.exp()}}` (3.18) at work |
+| **textmode.axx** | 2.0 KB | 13 | **textmode.s** | `.textmode`, `!L`, `{{.exp()}}` and `;` comments (3.18); test only |
 | **arrindex.axx** | 860 B | 14 | **arrindex.s** | Array symbols: bare names as items, a name as a subscript, `.index` (3.6.1); test only |
 | **passthru.axx** | 686 B | 6 | **passthru.s** | `.passthru` and `.eol` (3.16 / 3.17); test only |
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
-| **echo.axx** | 1.2 KB | 6 | **echo.s** | `.echo` on a body line (3.14.1); test only |
-| **elftype.axx** | 1.5 KB | 15 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
-| **elfgen.axx** | 2.7 KB | 24 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
-| **elfprio.axx** | 1.7 KB | 19 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
-| **elfsec.axx** | 1.4 KB | 7 | **elfsec.s** | section attributes and `sh_addralign` declared with `.elfsection` (3.7.7); test only |
-| **elfsym.axx** | 2.8 KB | 22 | **elfsym.s** | the ELF symbol attributes written from the source (`.type`, `.size`, `.weak`, `.hidden`, `.protected`, `.internal`, `.other`, `.comm`; 5.6.1), together with a field width that is not a power of two (`.elfwidth::3`) and a section element size (the fifth field of `.elfsection`; 3.7.7). The machine is EM_MN10300, which is not in the built-in table; test only |
-| **riscv64.axx** | 11 KB | 121 | **riscv64.s** | RV64I, the base integer instruction set (U/I/S/B/J/R formats, loads and stores, branches, jumps, `call`, `li`/`mv`/`j`/`ret`/`nop`, `ecall`/`ebreak`). No C, M, A or F/D extension, no CSR instructions, no fence group. It is also the worked example of declaring what axx has no built-in numbers for: the built-in EM_RISCV table holds only the data types, so `CALL_PLT`, `BRANCH`, `JAL`, `HI20`, `LO12_I`/`_S` and the `PCREL` pair come from `.elftype` / `.elffield` / `.reloc` (3.7.5-3.7.7). It links with `ld -m elf64lriscv` and runs |
-| **endsub.axx** | 1.2 KB | 4 | **endsub.s** | closing a `.sub` block with `.endsub` (3.7.2); test only |
-| **intel2att.axx** | 12 KB | 434 | **intel2att.s** | x86-64 Intel to AT&T source translator; `.textmode`, `!Y`, `!L` and macro-layer pattern generation (3.18). The translated text assembles with GNU as |
+| **echo.axx** | 1.2 KB | 8 | **echo.s** | `.echo` on a body line (3.14.1); test only |
+| **elftype.axx** | 1.5 KB | 20 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
+| **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
+| **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
+| **elfsec.axx** | 1.4 KB | 8 | **elfsec.s** | section attributes and `sh_addralign` declared with `.elfsection` (3.7.7); test only |
+| **elfsym.axx** | 2.8 KB | 23 | **elfsym.s** | the ELF symbol attributes written from the source (`.type`, `.size`, `.weak`, `.hidden`, `.protected`, `.internal`, `.other`, `.comm`; 5.6.1), together with a field width that is not a power of two (`.elfwidth::3`) and a section element size (the fifth field of `.elfsection`; 3.7.7). The machine is EM_MN10300, which is not in the built-in table; test only |
+| **riscv64.axx** | 11 KB | 122 | **riscv64.s** | RV64I, the base integer instruction set (U/I/S/B/J/R formats, loads and stores, branches, jumps, `call`, `li`/`mv`/`j`/`ret`/`nop`, `ecall`/`ebreak`). No C, M, A or F/D extension, no CSR instructions, no fence group. It is also the worked example of declaring what axx has no built-in numbers for: the built-in EM_RISCV table holds only the data types, so `CALL_PLT`, `BRANCH`, `JAL`, `HI20`, `LO12_I`/`_S` and the `PCREL` pair come from `.elftype` / `.elffield` / `.reloc` (3.7.5-3.7.7). It links with `ld -m elf64lriscv` and runs |
+| **endsub.axx** | 1.2 KB | 20 | **endsub.s** | closing a `.sub` block with `.endsub` (3.7.2); test only |
+| **intel2att.axx** | 12 KB | 60 (3,437 expanded) | **intel2att.s** | x86-64 Intel to AT&T source translator; `.textmode`, `!Y`, `!L` and macro-layer pattern generation (3.18). The translated text assembles with GNU as |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
-| **vliw.axx** | 178 B | 10 | **vliw.s** | Non-EPIC VLIW; test only |
+| **vliw.axx** | 192 B | 10 | **vliw.s** | Non-EPIC VLIW; test only |
 | **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck virtual CPU; hello-world demo. Bundled, but not part of `test1` |
+
+The `::` lines column counts the lines containing `::` in the file as written.
+For files whose rows are generated by the macro layer the expanded count follows
+in brackets (`caxx <pattern file> -p <out>` writes the expansion out).
 
 Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 `itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
-`aarch64_logical_mini_demo.s`.
+`aarch64_logical_mini_demo.s`. `ppc64.axx` and `ppc64le.axx` pair with
+`ppc64_test.s` (one line per pattern row, checked against GNU as byte-for-byte),
+`ppc64_reloc_test.s` (the relocations under `-o`) and `hello_ppc64.s` (the
+big-endian hello world); `ppc64_isa.axx` is included by those two and is never
+passed to axx itself.
 
 `test1` runs all thirty pairs through both implementations and
 compares the `-b` raw binaries. For the three pairs that use `.textmode`
-(`textmode.axx` and `8080toz80.axx`) it also compares the translated text each
+(`textmode.axx`, `8080toz80.axx` and `intel2att.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
 `elftype.s` and `elfgen.axx` / `elfgen.s` pairs are about relocations and the
 ELF header, the `elfprio.axx` / `elfprio.s` pair is about which of the three

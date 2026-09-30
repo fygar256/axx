@@ -203,8 +203,6 @@ ppc64_reloc_test.s                  every relocatable row against an external
 hello_ppc64.s                       hello world for big-endian PowerPC64 Linux
                                     (ELFv1 function descriptor in .opd).
                                     caxx ppc64.axx hello_ppc64.s -o hello.o
-hello_ppc64le.s                     hello world for little-endian PowerPC64 Linux.
-                                    caxx ppc64le.axx hello_ppc64le.s -o hello.o
 z80.axx                             pattern file for Z80
 z80.s                               test assemble file for Z80
 vliw.axx                            test pattern file for vliw
