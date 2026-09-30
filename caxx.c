@@ -2292,8 +2292,15 @@ typedef struct {
      * （マニュアル 3.7.7 節）。名前は書いたままを持ち、引くときだけ大小を
      * 区別しない。type_set が 0 の行は sh_flags だけを決める。 */
     struct { char *name; uint32_t flags; int type_set; uint32_t type;
-             int al_set; uint32_t al; } *elf_secs;
+             int al_set; uint32_t al; int es_set; uint32_t es; } *elf_secs;
     int        elf_secs_len, elf_secs_cap;
+    /* `.type`/`.size`/`.weak`/`.hidden`/`.protected`/`.internal`/`.other`/
+     * `.comm` が宣言した ELF シンボルの属性（マニュアル 5.6.1 節）。
+     * 出力にしか効かないので、パス1の反復では消さずに持ち越す。
+     * axx.py の sym_attrs と同じ内容である。 */
+    struct { char *name; int stype; int size_set; uint64_t size;
+             int other; int weak; int common; uint64_t calign; } *sym_attrs;
+    int        sym_attrs_len, sym_attrs_cap;
     /* `.elffield::<型>::<マスク>[::<オフセット>]` で命令フィールド型と宣言した型。
      * 型欄は書いたまま持ち、実効マシン表の名前で引く（宣言順）。 */
     struct { char *type; uint64_t mask; int off; } *elf_fields;
@@ -2577,7 +2584,12 @@ typedef struct {
     int         is_rela;
     int         extern_default;
     int         dwarf_abs;
-    int         wg8, wg4, wg2, wg1;
+    /* 欄のバイト幅（1〜8）→ その幅の参照に使う既定のリロケーション型。
+     * 添字は幅そのもので、0 は「その幅の既定の型を持たない」である。
+     * 2 の冪でない幅（1 ワードが 8 ビットでない機種では普通に現れる）も
+     * `.elfwidth` で書けるので、4 つの欄ではなく幅で引く表にしてある。
+     * axx.py の width_guess と同じ内容である。 */
+    int         wg[9];
     const int  *pc_rel;
     int         pc_rel_n;
     const ElfNamedReloc *named;
@@ -2748,17 +2760,18 @@ static const ElfNamedReloc _named_riscv[] = {
  * （ARM の幅2 はかつて 4 = R_ARM_LDR_PC_G0 という 16bit データ参照ではない
  *   値になっていた。正しくは R_ARM_ABS16 の 5）。 */
 static const ElfMachineInfo ELF_MACHINES[] = {
-    {3,   "i386",      1, 0, 2,   1,   0,  2, 20, 22, _pcrel_i386,    4, _named_i386},
-    {4,   "m68k",       1, 1, 4,   1,   0,  4,  2,  3, _pcrel_m68k,    3, _named_m68k},
-    {20,  "PowerPC",    1, 1, 26,  1,   0, 26,  4,  0, _pcrel_ppc32,   2, _named_ppc32},
-    {21,  "PowerPC64",  2, 1, 26,  38,  38,26,  4,  0, _pcrel_ppc64,   3, _named_ppc64},
-    {22,  "s390x",      2, 1, 5,   22,  22, 5,  3,  1, _pcrel_s390x,   3, _named_s390x},
-    {40,  "ARM",        1, 0, 3,   2,   0,  3,  5,  8, _pcrel_arm,     2, _named_arm},
-    {42,  "SuperH",     1, 1, 2,   1,   0,  2,  0,  0, _pcrel_sh,      1, _named_sh},
-    {43,  "SPARCV9",    2, 1, 6,   32,  32,  6,  2,  1, _pcrel_sparcv9, 4, _named_sparcv9},
-    {62,  "x86-64",     2, 1, 2,   1,   1,  2, 12, 14, _pcrel_x86_64,  6, _named_x86_64},
-    {183, "AArch64",    2, 1, 261, 257, 257,261,262,  0, _pcrel_aarch64, 3, _named_aarch64},
-    {243, "RISC-V",     2, 1, 1,   2,   2,  1, 34, 33, NULL,           0, _named_riscv},
+    /*                       cls rela ext  dwarf   wg[0..8]（添字＝バイト幅）        pc_rel          n  named */
+    {3,   "i386",         1, 0, 2,   1,   {0, 22, 20,0,  2,0,0,0,  0}, _pcrel_i386,    4, _named_i386},
+    {4,   "m68k",         1, 1, 4,   1,   {0,  3,  2,0,  4,0,0,0,  0}, _pcrel_m68k,    3, _named_m68k},
+    {20,  "PowerPC",      1, 1, 26,  1,   {0,  0,  4,0, 26,0,0,0,  0}, _pcrel_ppc32,   2, _named_ppc32},
+    {21,  "PowerPC64",    2, 1, 26,  38,  {0,  0,  4,0, 26,0,0,0, 38}, _pcrel_ppc64,   3, _named_ppc64},
+    {22,  "s390x",        2, 1, 5,   22,  {0,  1,  3,0,  5,0,0,0, 22}, _pcrel_s390x,   3, _named_s390x},
+    {40,  "ARM",          1, 0, 3,   2,   {0,  8,  5,0,  3,0,0,0,  0}, _pcrel_arm,     2, _named_arm},
+    {42,  "SuperH",       1, 1, 2,   1,   {0,  0,  0,0,  2,0,0,0,  0}, _pcrel_sh,      1, _named_sh},
+    {43,  "SPARCV9",      2, 1, 6,   32,  {0,  1,  2,0,  6,0,0,0, 32}, _pcrel_sparcv9, 4, _named_sparcv9},
+    {62,  "x86-64",       2, 1, 2,   1,   {0, 14, 12,0,  2,0,0,0,  1}, _pcrel_x86_64,  6, _named_x86_64},
+    {183, "AArch64",      2, 1, 261, 257, {0,  0,262,0,261,0,0,0,257}, _pcrel_aarch64, 3, _named_aarch64},
+    {243, "RISC-V",       2, 1, 1,   2,   {0, 33, 34,0,  1,0,0,0,  2}, NULL,           0, _named_riscv},
 };
 #define ELF_MACHINES_N ((int)(sizeof(ELF_MACHINES)/sizeof(ELF_MACHINES[0])))
 
@@ -2869,14 +2882,8 @@ static int elf_reloc_same_width(const ElfMachineInfo *m, int nbytes, int want_pc
 }
 
 static int elf_machine_width_guess(const ElfMachineInfo *m, int nbytes){
-    if(!m) return 0;
-    switch(nbytes){
-        case 8: return m->wg8;
-        case 4: return m->wg4;
-        case 2: return m->wg2;
-        case 1: return m->wg1;
-        default: return 0;
-    }
+    if(!m || nbytes < 1 || nbytes > 8) return 0;
+    return m->wg[nbytes];
 }
 
 /* ---------------------------------------------------------------------------
@@ -2971,10 +2978,7 @@ static const ElfMachineInfo *elf_machine_effective(const AsmState *st){
                                                  : (base ? base->is_rela : 1);
     info.extern_default = base ? base->extern_default : 0;
     info.dwarf_abs      = base ? base->dwarf_abs : 0;
-    info.wg8 = base ? base->wg8 : 0;
-    info.wg4 = base ? base->wg4 : 0;
-    info.wg2 = base ? base->wg2 : 0;
-    info.wg1 = base ? base->wg1 : 0;
+    for(int w=0; w<9; w++) info.wg[w] = base ? base->wg[w] : 0;
     info.pc_rel   = pr;
     info.pc_rel_n = prn;
     info.named    = nm;
@@ -2983,8 +2987,7 @@ static const ElfMachineInfo *elf_machine_effective(const AsmState *st){
         if(!st->elf_decl_width[w]) continue;
         int rt = elf_decl_type_in(nm, st->elf_decl_width[w]);
         if(rt < 0) continue;
-        if(w==8) info.wg8 = rt; else if(w==4) info.wg4 = rt;
-        else if(w==2) info.wg2 = rt; else if(w==1) info.wg1 = rt;
+        info.wg[w] = rt;
     }
     { int rt = elf_decl_type_in(nm, st->elf_decl_extern);
       if(rt >= 0) info.extern_default = rt; }
@@ -3107,6 +3110,125 @@ static int reloctype_for(const AsmState *st, const ElfMachineInfo *m, int nbytes
     }
     if(idx>=0 && st->reloctype_override[idx]>=0) return st->reloctype_override[idx];
     return elf_machine_width_guess(m, nbytes);
+}
+
+/* ---------------------------------------------------------------------------
+ * ELF シンボルの属性（マニュアル 5.6.1 節）
+ *
+ * シンボルの型・大きさ・束縛・可視性は ELF のシンボル表の欄で、どの機種でも
+ * 同じ形をしている。リンカがこれを見て仕事を変えるので（STT_FUNC でないシンボル
+ * には ARM/AArch64 の中継命令が作られない、大きさの無いシンボルは
+ * `--gc-sections` で残せない、弱いシンボルは他の定義に負ける）、リンクできる
+ * `.o` を出すには機種の記述だけでは足りない。ソース側の `.type` / `.size` /
+ * `.weak` / `.hidden` / `.protected` / `.internal` / `.other` / `.comm` が
+ * ここへ書き込み、write_elf_obj() が読む。
+ * axx.py の sym_attrs と同じ内容である。
+ * ------------------------------------------------------------------------- */
+
+/* `.type` の種別名 → STT_*。番号を直に書いてもよい（0〜15）。
+ * axx.py の ELF_SYM_TYPES と同じ並びである。 */
+static const struct { const char *name; int v; } ELF_SYM_TYPES[] = {
+    {"notype",0}, {"object",1}, {"func",2}, {"function",2},
+    {"section",3}, {"file",4}, {"common",5}, {"tls",6}, {"tls_object",6},
+    {"gnu_ifunc",10}, {"ifunc",10}, {NULL,0}
+};
+
+/* 属性を1つも宣言していないシンボルの姿。sym_attr_get() が返す。 */
+typedef struct { int stype; int size_set; uint64_t size;
+                 int other; int weak; int common; uint64_t calign; } SymAttrView;
+static const SymAttrView SYM_ATTR_DEFAULT = {0,0,0,0,0,0,0};
+
+/* `name` のシンボル属性を読む。宣言が無ければ既定の姿を返す。
+ * axx.py の _sym_attr() と同じである。 */
+static SymAttrView sym_attr_get(const AsmState *st, const char *name){
+    for(int i=0;i<st->sym_attrs_len;i++)
+        if(strcmp(st->sym_attrs[i].name, name)==0){
+            SymAttrView v;
+            v.stype    = st->sym_attrs[i].stype;
+            v.size_set = st->sym_attrs[i].size_set;
+            v.size     = st->sym_attrs[i].size;
+            v.other    = st->sym_attrs[i].other;
+            v.weak     = st->sym_attrs[i].weak;
+            v.common   = st->sym_attrs[i].common;
+            v.calign   = st->sym_attrs[i].calign;
+            return v;
+        }
+    return SYM_ATTR_DEFAULT;
+}
+
+/* `name` のシンボル属性を書き換えられる形で取り出す（無ければ作る）。
+ * axx.py の _sym_attr_slot() と同じである。 */
+static int sym_attr_slot(AsmState *st, const char *name){
+    for(int i=0;i<st->sym_attrs_len;i++)
+        if(strcmp(st->sym_attrs[i].name, name)==0) return i;
+    if(st->sym_attrs_len >= st->sym_attrs_cap){
+        st->sym_attrs_cap = st->sym_attrs_cap ? st->sym_attrs_cap*2 : 8;
+        st->sym_attrs = realloc(st->sym_attrs,
+                                (size_t)st->sym_attrs_cap*sizeof(*st->sym_attrs));
+        if(!st->sym_attrs){ perror("realloc"); exit(1); }
+    }
+    int k = st->sym_attrs_len++;
+    st->sym_attrs[k].name = strdup(name);
+    if(!st->sym_attrs[k].name){ perror("strdup"); exit(1); }
+    st->sym_attrs[k].stype = 0; st->sym_attrs[k].size_set = 0;
+    st->sym_attrs[k].size = 0;  st->sym_attrs[k].other = 0;
+    st->sym_attrs[k].weak = 0;  st->sym_attrs[k].common = 0;
+    st->sym_attrs[k].calign = 0;
+    return k;
+}
+
+/* シンボルの st_info。束縛は呼び出し側が決め、型は `.type` から取る。
+ *
+ * `.weak` を宣言したシンボルは、呼び出し側が渡した束縛より STB_WEAK(2) が
+ * 勝つ。局所シンボル（STB_LOCAL）に `.weak` は書けない — `.weak` は名前を
+ * `.global` と同じく外へ出すので、そのシンボルは必ず大域側の並びに来る。
+ * axx.py の _sym_st_info() と同じ規則である。 */
+static uint8_t weo_sym_info(const AsmState *st, const char *name, int bind){
+    SymAttrView a = sym_attr_get(st, name);
+    if(a.weak) bind = 2;
+    return (uint8_t)(((bind & 0xF) << 4) | (a.stype & 0xF));
+}
+
+static uint8_t weo_sym_other(const AsmState *st, const char *name){
+    return (uint8_t)(sym_attr_get(st, name).other & 0xFF);
+}
+
+/* シンボルの st_size。`.size` を書いていなければ 0。
+ *
+ * `.size` の値はワード数なので、ラベルの値と同じく1ワードのバイト数を掛けて
+ * バイト数にする（8 ビット機では掛ける数が 1 なので書いたままになる）。
+ * axx.py の _sym_size_of() と同じ規則である。 */
+static uint64_t weo_sym_size(const AsmState *st, const char *name, int bpw){
+    SymAttrView a = sym_attr_get(st, name);
+    if(!a.size_set) return 0;
+    return a.size * (uint64_t)bpw;
+}
+
+/* `.comm` で宣言したシンボルなら、SHN_COMMON の姿に差し替える。
+ *
+ * common シンボルは節に属さず、st_shndx が SHN_COMMON(0xfff2)、st_value が
+ * 整列（バイト）、st_size が大きさ（バイト）になる。リンカが実体を作るので、
+ * このオブジェクト自身は領域を持たない。
+ * axx.py の _sym_common_override() と同じ規則である。 */
+static void weo_sym_common(const AsmState *st, const char *name, int bpw,
+                           uint16_t *shndx, uint64_t *val, uint64_t *size){
+    SymAttrView a = sym_attr_get(st, name);
+    if(!a.common) return;
+    *shndx = 0xfff2;
+    *val   = a.calign;
+    *size  = a.size * (uint64_t)bpw;
+}
+
+/* 名前を「他所で解決される外部シンボル」として登録する。
+ *
+ * 型名を書かなかった `.extern` とまったく同じ登録で、`.weak` と `.comm`
+ * がまだ知らない名前を見たときに使う。すでに知っている名前には何もしない。
+ * axx.py の _sym_declare_extern() と同じ規則である。 */
+static void sym_declare_extern(AsmState *st, const char *name){
+    if(lmap_find(&st->labels, name)) return;
+    const ElfMachineInfo *m = elf_machine_effective(st);
+    extern_untyped_set(st, name, 1);
+    lmap_set_imported(&st->labels, name, u256_zero(), ".text", m->extern_default);
 }
 
 static void secmap_finalize_current(AsmState *st){
@@ -3275,6 +3397,7 @@ static void state_init(AsmState *st) {
     st->elf_decl_dwarf = NULL;
     for(int _hi=0;_hi<ELF_HDR_NFIELD;_hi++){ st->elf_hdr_set[_hi]=0; st->elf_hdr_val[_hi]=0; }
     st->elf_secs = NULL; st->elf_secs_len = 0; st->elf_secs_cap = 0;
+    st->sym_attrs = NULL; st->sym_attrs_len = 0; st->sym_attrs_cap = 0;
     st->elf_fields = NULL; st->elf_fields_len = 0; st->elf_fields_cap = 0;
     st->extern_untyped = NULL; st->extern_untyped_len = 0; st->extern_untyped_cap = 0;
     st->elf_machine_from_cli = 0;
@@ -6798,11 +6921,11 @@ static int dir_elfwidth(Assembler *asmb, PatEntry *e){
     AsmState *st = &asmb->st;
     const char *wf, *tf; elf_decl_fields(e, &wf, &tf);
     long long w;
+    /* 幅は 1〜8 のどれでもよい。2 の冪だけに絞っていたが、1 ワードが 8 ビット
+     * でない機種（`.bits`）では参照の幅が 1 ワードのバイト数の倍数になるので、
+     * 12 ビット機の 3 ワード参照（6 バイト）のような幅が普通に現れる。
+     * axx.py の elfwidth_processing() と同じ規則である。 */
     if(!elf_decl_num(asmb, ".elfwidth", wf, 1, 8, &w)) return 1;
-    if(!(w==1 || w==2 || w==4 || w==8)){
-        axx_diagf(1, 0, " error - .elfwidth: width must be 1, 2, 4 or 8, got %lld.\n", w);
-        return 1;
-    }
     char *t = elf_decl_trim_dup(tf);
     if(!t[0]){
         axx_diagf(1, 0, " error - .elfwidth: relocation type is not specified.\n");
@@ -6887,19 +7010,24 @@ static int dir_elfheader(Assembler *asmb, PatEntry *e){
 
 /* `.elfsection` の宣言を据える。同じ名前があれば書き換える（後の宣言が勝つ）。 */
 static void elf_sec_set(AsmState *st, const char *name, uint32_t flags,
-                        int type_set, uint32_t type, int al_set, uint32_t al){
+                        int type_set, uint32_t type, int al_set, uint32_t al,
+                        int es_set, uint32_t es){
     for(int i=0;i<st->elf_secs_len;i++)
         if(strcasecmp(st->elf_secs[i].name, name)==0){
             if(st->elf_secs[i].flags != flags
                || st->elf_secs[i].type_set != type_set
                || st->elf_secs[i].type != type
                || st->elf_secs[i].al_set != al_set
-               || st->elf_secs[i].al != al){
+               || st->elf_secs[i].al != al
+               || st->elf_secs[i].es_set != es_set
+               || st->elf_secs[i].es != es){
                 st->elf_secs[i].flags    = flags;
                 st->elf_secs[i].type_set = type_set;
                 st->elf_secs[i].type     = type;
                 st->elf_secs[i].al_set   = al_set;
                 st->elf_secs[i].al       = al;
+                st->elf_secs[i].es_set   = es_set;
+                st->elf_secs[i].es       = es;
                 st->elf_decl_gen++;
             }
             return;
@@ -6917,6 +7045,8 @@ static void elf_sec_set(AsmState *st, const char *name, uint32_t flags,
     st->elf_secs[st->elf_secs_len].type     = type;
     st->elf_secs[st->elf_secs_len].al_set   = al_set;
     st->elf_secs[st->elf_secs_len].al       = al;
+    st->elf_secs[st->elf_secs_len].es_set   = es_set;
+    st->elf_secs[st->elf_secs_len].es       = es;
     st->elf_secs_len++;
     st->elf_decl_gen++;
 }
@@ -6929,7 +7059,8 @@ static int elf_sec_find(const AsmState *st, const char *name){
     return -1;
 }
 
-/* `.elfsection::<名前>::<sh_flags>[::<sh_type>[::<整列>]]` — セクションヘッダの属性。
+/* `.elfsection::<名前>::<sh_flags>[::<sh_type>[::<整列>[::<要素長>]]]`
+ * — セクションヘッダの属性。
  *
  * 書かなかったセクションは従来どおり名前から決まる（`.text` は
  * SHF_ALLOC|SHF_EXECINSTR、`.data` と `.bss` は SHF_ALLOC|SHF_WRITE、
@@ -6939,6 +7070,8 @@ static int elf_sec_find(const AsmState *st, const char *name){
  *
  * 整列は sh_addralign にそのまま入る。0 か 2 の冪でなければならない
  * （ELF の要求）。書かなければ weo_default_align() が決める。
+ * 第 5 欄は sh_entsize で、固定長の要素を並べたセクションの1要素のバイト数
+ * である（`SHF_MERGE` の文字列表など）。書かなければ 0 になる。
  * axx.py の elfsection_processing() と同じ規則である。 */
 /* `.elffield::<型>::<マスク>[::<オフセット>]` — 命令フィールド型のリロケーション。
  * axx.py の elffield_processing() と同じ規則である。 */
@@ -7027,8 +7160,16 @@ static int dir_elfsection(Assembler *asmb, PatEntry *e){
         }
         al_set = 1;
     }
+    int es_set = 0; long long es = 0;
+    if(e->f[5][0]){
+        if(!elf_decl_num(asmb, ".elfsection", e->f[5], 0, 0xFFFFFFFFll, &es)){
+            free(nm);
+            return 1;
+        }
+        es_set = 1;
+    }
     elf_sec_set(st, nm, (uint32_t)fl, type_set, (uint32_t)ty,
-                al_set, (uint32_t)al);
+                al_set, (uint32_t)al, es_set, (uint32_t)es);
     free(nm);
     return 1;
 }
@@ -7048,14 +7189,14 @@ static uint32_t weo_default_align(uint32_t sh_type, int is_elf64){
     return 16u;
 }
 
-/* セクションの sh_flags と sh_type、`.elfsection` で整列が書かれていれば
- * それも決める。宣言が無ければ名前の前方一致で決める従来の規則に従う。
+/* セクションの sh_flags と sh_type、`.elfsection` で整列と要素長が書かれて
+ * いればそれも決める。宣言が無ければ名前の前方一致で決める従来の規則に従う。
  * 整列を書いていないときは *al_set を 0 にして返し、既定値は
- * weo_default_align() が決める。
+ * weo_default_align() が決める。要素長は書いていなければ 0 になる。
  * axx.py の _elf_section_attrs() と同じ規則である。 */
 static void elf_section_attrs(const AsmState *st, const char *name,
                               uint64_t *flags, uint32_t *shtype,
-                              int *al_set, uint32_t *al){
+                              int *al_set, uint32_t *al, uint32_t *entsize){
     /* 破綻点修正: ここは char[64] だったため、64 文字以上のセクション名が
      * 切り詰められていた。前方一致で見るのは先頭 7 文字までなので出力は
      * 変わらなかったが、名前の扱いを他と揃えるため長さぶん確保する。 */
@@ -7071,16 +7212,18 @@ static void elf_section_attrs(const AsmState *st, const char *name,
     else if(strncmp(un,".BSS",4)==0)    fl=0x2|0x1;
     else                                fl=0x2;
     uint32_t sht = (strncmp(un,".BSS",4)==0) ? 8u : 1u;
-    int a_set = 0; uint32_t a_val = 0;
+    int a_set = 0; uint32_t a_val = 0; uint32_t es_val = 0;
     int k = elf_sec_find(st, name);
     if(k >= 0){
         fl = st->elf_secs[k].flags;
         if(st->elf_secs[k].type_set) sht = st->elf_secs[k].type;
         if(st->elf_secs[k].al_set){ a_set = 1; a_val = st->elf_secs[k].al; }
+        if(st->elf_secs[k].es_set) es_val = st->elf_secs[k].es;
     }
     *flags = fl; *shtype = sht;
-    if(al_set) *al_set = a_set;
-    if(al)     *al     = a_val;
+    if(al_set)  *al_set  = a_set;
+    if(al)      *al      = a_val;
+    if(entsize) *entsize = es_val;
     free(un);
 }
 
@@ -13406,6 +13549,293 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
     return 1;
 }
 
+/* ---- ELF シンボル属性のディレクティブ（マニュアル 5.6.1 節）-------------
+ *
+ * `.type`／`.size`／`.weak`／`.hidden`／`.protected`／`.internal`／
+ * `.other`／`.comm`。どれも「名前[::欄][::欄], 名前...」という同じ並びを
+ * 取るので、切り出しは sym_decl_next() に集めてある。宣言は出力にしか
+ * 効かないので、記録はパス2（と対話時）だけで行う。ただし `.weak` と
+ * `.comm` は名前を外部シンボルとして登録もするので、そこだけは `.extern`
+ * と同じくどのパスでも行う（パスによって登録が違うとアドレスがずれる）。
+ * axx.py の同名のメソッドと同じ規則である。 */
+
+#define SYM_DECL_MAXF 2
+
+/* `名前[::欄...]` を1つ読む。読めたら 1 を返し、名前を *name_out（呼び出し側が
+ * free する）、欄を fields[0..nfields-1]（同じく free、書かれていなければ
+ * NULL）に置く。欄の切り方は `.extern 名前::型名` と同じで、`::` の直後から
+ * 空白・カンマ・`:` の手前までを1欄とする。
+ * axx.py の _sym_decl_scan() と同じ規則である。 */
+static int sym_decl_next(const AsmState *st, const char *buf, int blen, int *pidx,
+                         char **name_out, char **fields, int nfields){
+    for(int i=0;i<nfields;i++) fields[i] = NULL;
+    *name_out = NULL;
+    int idx = *pidx;
+    if(idx >= blen) return 0;
+    idx = axx_skipspc(buf, idx);
+    char sbuf[512]; size_t ssz;
+    char *s = axx_word_buf(buf, idx, sbuf, sizeof(sbuf), &ssz);
+    s[0] = 0;
+    idx = axx_get_label_word(buf, idx, st->lwordchars, s, ssz);
+    if(!s[0]){ if(s!=sbuf) free(s); *pidx = blen; return 0; }
+    /* ラベル名の読み取りが `::` の1つめを食っていたら1文字戻す
+     * （`.extern` と同じ扱い）。 */
+    if(idx > 0 && buf[idx-1]==':' && idx < blen && buf[idx]==':') idx--;
+    int nf = 0;
+    while(nf < nfields && idx+1 < blen && buf[idx]==':' && buf[idx+1]==':'){
+        idx += 2;
+        int fs = idx;
+        while(idx < blen && buf[idx]!=' ' && buf[idx]!='\t'
+              && buf[idx]!=',' && buf[idx]!=':' && buf[idx]!='\0') idx++;
+        int fl = idx - fs;
+        char *fv = malloc((size_t)fl + 1);
+        if(!fv){ perror("malloc"); exit(1); }
+        memcpy(fv, buf+fs, (size_t)fl);
+        fv[fl] = 0;
+        /* 前後の空白を落とす（axx.py の strip() と同じ）。 */
+        char *b = fv; while(*b==' '||*b=='\t') b++;
+        int bl = (int)strlen(b);
+        while(bl>0 && (b[bl-1]==' '||b[bl-1]=='\t')) b[--bl]=0;
+        if(b != fv) memmove(fv, b, (size_t)bl+1);
+        fields[nf++] = fv;
+    }
+    if(idx < blen && buf[idx]==':') idx++;
+    char *nm = strdup(s);
+    if(!nm){ perror("strdup"); exit(1); }
+    if(s != sbuf) free(s);
+    idx = axx_skipspc(buf, idx);
+    if(idx < blen && buf[idx]==',') idx++;
+    *pidx = idx;
+    *name_out = nm;
+    return 1;
+}
+
+static void sym_decl_free(char **name, char **fields, int nfields){
+    free(*name); *name = NULL;
+    for(int i=0;i<nfields;i++){ free(fields[i]); fields[i] = NULL; }
+}
+
+/* シンボル宣言の数値欄を評価する。読めないか範囲外なら診断して 0 を返す。
+ * axx.py の _sym_decl_num() と同じ規則である。 */
+static int sym_decl_num(Assembler *asmb, const char *dname, const char *name,
+                        const char *text, long long lo, long long hi,
+                        long long *out){
+    AsmState *st = &asmb->st;
+    if(!text || !text[0]){
+        axx_diagf(1, 0, " error - %s: a number is required for '%s'.\n", dname, name);
+        return 0;
+    }
+    int io;
+    st->error_undefined_label = 0;
+    uint256_t v = expr_expression_asm(asmb, text, 0, &io);
+    int64_t n = u256_to_i64(v);
+    if(st->error_undefined_label || u256_is_undef_derived(v)
+       || !u256_eq(v, u256_from_i64(n)) || n < lo || n > hi){
+        axx_diagf(1, 0, " error - %s: value for '%s' must be an integer in "
+                        "%lld..%lld, got '%s'.\n", dname, name, lo, hi, text);
+        st->error_undefined_label = 0;
+        return 0;
+    }
+    st->error_undefined_label = 0;
+    *out = (long long)n;
+    return 1;
+}
+
+/* `.type <名前>::<種別>[, ...]` — シンボルの型（STT_*）。
+ *
+ * 種別は notype / object / func（function）/ section / file / common /
+ * tls / gnu_ifunc（ifunc）、または 0〜15 の番号。大小は区別しない。
+ * axx.py の type_processing() と同じ規則である。 */
+static int adir_type(Assembler *asmb, const char *l, const char *l2){
+    AsmState *st=&asmb->st;
+    char up[16]; axx_strupr_to(up,l,sizeof(up));
+    if(strcmp(up,".TYPE")!=0) return 0;
+    if(!should_report_errors(st)) return 1;
+    const char *buf = l2; int blen=(int)strlen(buf); int idx=0;
+    char *nm; char *fv[SYM_DECL_MAXF];
+    while(sym_decl_next(st, buf, blen, &idx, &nm, fv, 1)){
+        char *kind = fv[0];
+        if(!kind || !kind[0]){
+            axx_diagf(1, 0, " error - .TYPE: a symbol type is required for '%s'.\n", nm);
+            sym_decl_free(&nm, fv, 1);
+            continue;
+        }
+        for(char *q=kind; *q; q++) if(*q>='A'&&*q<='Z') *q = (char)(*q+32);
+        int v = -1;
+        for(int i=0; ELF_SYM_TYPES[i].name; i++)
+            if(strcmp(ELF_SYM_TYPES[i].name, kind)==0){ v = ELF_SYM_TYPES[i].v; break; }
+        if(v < 0){
+            long long n;
+            if(!sym_decl_num(asmb, ".TYPE", nm, kind, 0, 15, &n)){
+                sym_decl_free(&nm, fv, 1);
+                continue;
+            }
+            v = (int)n;
+        }
+        int k = sym_attr_slot(st, nm);
+        st->sym_attrs[k].stype = v;
+        sym_decl_free(&nm, fv, 1);
+    }
+    return 1;
+}
+
+/* `.size <名前>::<式>[, ...]` — シンボルの大きさ（st_size）。
+ *
+ * 式の値はワード数である。ラベルの値と同じく1ワードのバイト数を掛けて
+ * バイト数にするので、8 ビット機では書いたままの数が入る。
+ * axx.py の size_processing() と同じ規則である。 */
+static int adir_size(Assembler *asmb, const char *l, const char *l2){
+    AsmState *st=&asmb->st;
+    char up[16]; axx_strupr_to(up,l,sizeof(up));
+    if(strcmp(up,".SIZE")!=0) return 0;
+    if(!should_report_errors(st)) return 1;
+    const char *buf = l2; int blen=(int)strlen(buf); int idx=0;
+    char *nm; char *fv[SYM_DECL_MAXF];
+    while(sym_decl_next(st, buf, blen, &idx, &nm, fv, 1)){
+        long long n;
+        if(!sym_decl_num(asmb, ".SIZE", nm, fv[0], 0, 0x7FFFFFFFFFFFFFFFll, &n)){
+            sym_decl_free(&nm, fv, 1);
+            continue;
+        }
+        int k = sym_attr_slot(st, nm);
+        st->sym_attrs[k].size_set = 1;
+        st->sym_attrs[k].size = (uint64_t)n;
+        sym_decl_free(&nm, fv, 1);
+    }
+    return 1;
+}
+
+/* `.weak <名前>[, ...]` — 弱いシンボル（STB_WEAK）。
+ *
+ * 定義してある名前なら `.global` と同じく外へ出し、束縛だけ弱くする。
+ * まだ知らない名前は型名なしの `.extern` と同じに登録するので、弱い
+ * 参照（解決できなければ 0 になる参照）がそのまま書ける。
+ * axx.py の weak_processing() と同じ規則である。 */
+static int adir_weak(Assembler *asmb, const char *l, const char *l2){
+    AsmState *st=&asmb->st;
+    char up[16]; axx_strupr_to(up,l,sizeof(up));
+    if(strcmp(up,".WEAK")!=0) return 0;
+    int record = should_report_errors(st);
+    const char *buf = l2; int blen=(int)strlen(buf); int idx=0;
+    char *nm; char *fv[SYM_DECL_MAXF];
+    while(sym_decl_next(st, buf, blen, &idx, &nm, fv, 0)){
+        /* 登録はどのパスでも行う（パスによって違うとアドレスがずれる）。 */
+        sym_declare_extern(st, nm);
+        if(!record){ sym_decl_free(&nm, fv, 0); continue; }
+        int k = sym_attr_slot(st, nm);
+        st->sym_attrs[k].weak = 1;
+        LabelEntry *le = lmap_find(&st->labels, nm);
+        if(!(le && le->is_imported)){
+            /* ここで定義されている名前は `.global` と同じく外へ出す。 */
+            uint256_t v = label_get_value(st, nm);
+            const char *sec = label_get_section(st, nm);
+            int is_equ_v = le ? le->is_equ : 0;
+            int is_undef_v = le ? le->is_undef : 0;
+            if(!lmap_find(&st->export_labels, nm)) sv_push(&st->export_order, nm);
+            lmap_set(&st->export_labels, nm, v, sec, is_equ_v, is_undef_v);
+        }
+        sym_decl_free(&nm, fv, 0);
+    }
+    return 1;
+}
+
+/* `.hidden` / `.protected` / `.internal` `<名前>[, ...]` — 可視性。
+ *
+ * st_other の下位 2 ビット（STV_*）だけを書き換える。上位のビットは
+ * `.other` で書いたものがそのまま残る。
+ * axx.py の visibility_processing() と同じ規則である。 */
+static int adir_visibility(Assembler *asmb, const char *l, const char *l2){
+    AsmState *st=&asmb->st;
+    char up[16]; axx_strupr_to(up,l,sizeof(up));
+    int vis;
+    if     (strcmp(up,".HIDDEN")==0)    vis = 2;
+    else if(strcmp(up,".PROTECTED")==0) vis = 3;
+    else if(strcmp(up,".INTERNAL")==0)  vis = 1;
+    else return 0;
+    if(!should_report_errors(st)) return 1;
+    const char *buf = l2; int blen=(int)strlen(buf); int idx=0;
+    char *nm; char *fv[SYM_DECL_MAXF];
+    while(sym_decl_next(st, buf, blen, &idx, &nm, fv, 0)){
+        int k = sym_attr_slot(st, nm);
+        st->sym_attrs[k].other = (st->sym_attrs[k].other & ~0x03) | vis;
+        sym_decl_free(&nm, fv, 0);
+    }
+    return 1;
+}
+
+/* `.other <名前>::<値>[, ...]` — st_other のバイトそのもの。
+ *
+ * 下位 2 ビットが可視性（STV_*）で、上位 6 ビットは機種ごとの意味を持つ
+ * （PowerPC64 ELFv2 の局所入口のずれはビット 5〜7 にある）。可視性の
+ * ディレクティブと違い、このバイトを丸ごと置き換える。
+ * axx.py の other_processing() と同じ規則である。 */
+static int adir_other(Assembler *asmb, const char *l, const char *l2){
+    AsmState *st=&asmb->st;
+    char up[16]; axx_strupr_to(up,l,sizeof(up));
+    if(strcmp(up,".OTHER")!=0) return 0;
+    if(!should_report_errors(st)) return 1;
+    const char *buf = l2; int blen=(int)strlen(buf); int idx=0;
+    char *nm; char *fv[SYM_DECL_MAXF];
+    while(sym_decl_next(st, buf, blen, &idx, &nm, fv, 1)){
+        long long n;
+        if(!sym_decl_num(asmb, ".OTHER", nm, fv[0], 0, 255, &n)){
+            sym_decl_free(&nm, fv, 1);
+            continue;
+        }
+        int k = sym_attr_slot(st, nm);
+        st->sym_attrs[k].other = (int)n;
+        sym_decl_free(&nm, fv, 1);
+    }
+    return 1;
+}
+
+/* `.comm <名前>::<大きさ>[::<整列>][, ...]` — 共通シンボル。
+ *
+ * SHN_COMMON のシンボルを出す。実体はリンカが作るので、このオブジェクト
+ * 自身は領域を持たない。大きさはワード数（`.size` と同じ）、整列は
+ * バイトで、書かなければ 1 になる。型は `.type` を書かなければ
+ * STT_OBJECT(1) にする（GNU as と同じ）。
+ * axx.py の comm_processing() と同じ規則である。 */
+static int adir_comm(Assembler *asmb, const char *l, const char *l2){
+    AsmState *st=&asmb->st;
+    char up[16]; axx_strupr_to(up,l,sizeof(up));
+    if(strcmp(up,".COMM")!=0) return 0;
+    int record = should_report_errors(st);
+    const char *buf = l2; int blen=(int)strlen(buf); int idx=0;
+    char *nm; char *fv[SYM_DECL_MAXF];
+    while(sym_decl_next(st, buf, blen, &idx, &nm, fv, 2)){
+        /* 登録はどのパスでも行う（`.weak` と同じ理由）。 */
+        sym_declare_extern(st, nm);
+        if(!record){ sym_decl_free(&nm, fv, 2); continue; }
+        long long sz;
+        if(!sym_decl_num(asmb, ".COMM", nm, fv[0], 0, 0x7FFFFFFFFFFFFFFFll, &sz)){
+            sym_decl_free(&nm, fv, 2);
+            continue;
+        }
+        long long al = 1;
+        if(fv[1] && fv[1][0]){
+            if(!sym_decl_num(asmb, ".COMM", nm, fv[1], 0, 0x40000000ll, &al)){
+                sym_decl_free(&nm, fv, 2);
+                continue;
+            }
+            if(al & (al - 1)){
+                axx_diagf(1, 0, " error - .COMM: alignment must be 0 or a power "
+                                "of two, got '%lld' for '%s'.\n", al, nm);
+                sym_decl_free(&nm, fv, 2);
+                continue;
+            }
+        }
+        int k = sym_attr_slot(st, nm);
+        st->sym_attrs[k].common   = 1;
+        st->sym_attrs[k].size_set = 1;
+        st->sym_attrs[k].size     = (uint64_t)sz;
+        st->sym_attrs[k].calign   = (uint64_t)al;
+        if(st->sym_attrs[k].stype == 0) st->sym_attrs[k].stype = 1;  /* STT_OBJECT */
+        sym_decl_free(&nm, fv, 2);
+    }
+    return 1;
+}
+
 static int adir_reloctype(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
@@ -13966,6 +14396,12 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     if(adir_extern(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
     if(adir_reloctype(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
     if(adir_export(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_type(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_size(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_weak(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_visibility(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_other(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_comm(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
 
 
     if(!l[0]){
@@ -14878,7 +15314,7 @@ static char *file_input_from_stdin(void){
 
 typedef struct { uint8_t*b; size_t len,cap; } WBB;
 typedef struct { const char*name; uint64_t bs,bsz,fl; uint8_t*data; uint32_t sht;
-                 int al_set; uint32_t al; } WCS;
+                 int al_set; uint32_t al; uint32_t es; } WCS;
 typedef struct { uint16_t shndx; uint64_t sv; } WSR;
 typedef struct { int64_t off; const char*sym; int rtype; int64_t addend; int nbytes; } WRE;
 typedef struct { WRE*data; int len,cap; } WRL;
@@ -15149,20 +15585,20 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     if(st->sections.count==0){
         ncs=1; csecs=calloc(1,sizeof(WCS));
         uint64_t wn=have_w?max_w+1:0;
-        uint64_t _fl0; uint32_t _sht0; int _as0; uint32_t _al0;
-        elf_section_attrs(st, ".text", &_fl0, &_sht0, &_as0, &_al0);
+        uint64_t _fl0; uint32_t _sht0; int _as0; uint32_t _al0; uint32_t _es0;
+        elf_section_attrs(st, ".text", &_fl0, &_sht0, &_as0, &_al0, &_es0);
         csecs[0]=(WCS){".text",0,wn*(uint64_t)bpw,_fl0,weo_extract(st,bpw,0,wn),
-                       _sht0,_as0,_al0};
+                       _sht0,_as0,_al0,_es0};
     } else {
         ncs=st->sections.count; csecs=calloc((size_t)ncs,sizeof(WCS));
         for(int i=0;i<ncs;i++){
             SecEntry *se=st->sections.order[i];
             uint64_t w0=u256_to_u64(se->start);
-            uint64_t fl; uint32_t _sht; int _as; uint32_t _al;
-            elf_section_attrs(st, se->name, &fl, &_sht, &_as, &_al);
+            uint64_t fl; uint32_t _sht; int _as; uint32_t _al; uint32_t _es;
+            elf_section_attrs(st, se->name, &fl, &_sht, &_as, &_al, &_es);
             uint64_t _nb;
             uint8_t *_data = weo_extract_ranges(st, bpw, se->name, &_nb);
-            csecs[i]=(WCS){se->name,w0*(uint64_t)bpw,_nb,fl,_data,_sht,_as,_al};
+            csecs[i]=(WCS){se->name,w0*(uint64_t)bpw,_nb,fl,_data,_sht,_as,_al,_es};
         }
     }
 
@@ -15258,28 +15694,86 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         WSR sr = (larr[i].is_equ && !_equ_has_reloc)
                  ? (WSR){0xfff1, larr[i].val}
                  : weo_shndx(st,csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section,bpw);
+        /* `.type` / `.size` / `.other`（マニュアル 5.6.1 節）。局所シンボル
+         * なので束縛は STB_LOCAL のままで、`.weak` は下の大域側へ回る。 */
+        uint16_t _shx = sr.shndx; uint64_t _sval = sr.sv;
+        uint64_t _ssz = weo_sym_size(st, larr[i].name, bpw);
+        weo_sym_common(st, larr[i].name, bpw, &_shx, &_sval, &_ssz);
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
         snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
-        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,0x00,0,sr.shndx,sr.sv,0);
+        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,
+                weo_sym_info(st,larr[i].name,0),weo_sym_other(st,larr[i].name),
+                _shx,_sval,_ssz);
     }
     int first_global=nsyms;
     for(int i=0;i<nl;i++){
         if(!larr[i].is_imported) continue;
         if(weo_isexp(earr,ne,larr[i].name)) continue;
+        /* 未定義（他所で解決される）シンボル。`.comm` を宣言していれば
+         * SHN_COMMON の姿になり、`.weak` を宣言していれば束縛が弱くなる。 */
+        uint16_t _shx = 0; uint64_t _sval = 0;
+        uint64_t _ssz = weo_sym_size(st, larr[i].name, bpw);
+        weo_sym_common(st, larr[i].name, bpw, &_shx, &_sval, &_ssz);
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
         snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
-        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,0x10,0,0,0,0);
+        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,
+                weo_sym_info(st,larr[i].name,1),weo_sym_other(st,larr[i].name),
+                _shx,_sval,_ssz);
     }
     for(int i=0;i<ne;i++){
         int _equ_has_reloc = earr[i].is_equ && (earr[i].reloc_type_override >= 0);
         WSR sr = (earr[i].is_equ && !_equ_has_reloc)
                  ? (WSR){0xfff1, earr[i].val}
                  : weo_shndx(st,csecs,ncs,earr[i].val*(uint64_t)bpw,earr[i].section,bpw);
+        uint16_t _shx = sr.shndx; uint64_t _sval = sr.sv;
+        uint64_t _ssz = weo_sym_size(st, earr[i].name, bpw);
+        weo_sym_common(st, earr[i].name, bpw, &_shx, &_sval, &_ssz);
         uint32_t noff=wbb_str(&strtab_bb,earr[i].name);
         snimap[snimap_len++]=(WSNI){earr[i].name,nsyms};
-        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,0x10,0,sr.shndx,sr.sv,0);
+        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,
+                weo_sym_info(st,earr[i].name,1),weo_sym_other(st,earr[i].name),
+                _shx,_sval,_ssz);
     }
 
+
+    /* ELF32 の r_info は型欄が 8 ビット、シンボル番号欄が 24 ビットしかない。
+     * 組み込みの表を持つ機種の ELF32 側（i386・m68k・PowerPC・ARM・SuperH）
+     * は型番号がどれも 255 以下だが、`.elftype` は 2147483647 まで書けるので、
+     * ELF32 で 255 を超える型を宣言すると黙って切り詰められる。切り詰めた
+     * 型番号は別の型に化けるため、リンカは診断も出さず間違った修正をする。
+     * 型ごとに一度だけ知らせる。axx.py の同じ箇所と同じ規則である。 */
+    if(!_is_elf64){
+        int *warned = NULL; int nwarned = 0, cwarned = 0; int warned_sym = 0;
+        for(int ri2=0;ri2<nrela;ri2++){
+            WRL *rl=&rela_lists[rs_idx[ri2]];
+            for(int ei=0;ei<rl->len;ei++){
+                int rt = rl->data[ei].rtype;
+                if(rt > 0xFF){
+                    int seen = 0;
+                    for(int k=0;k<nwarned;k++) if(warned[k]==rt){ seen=1; break; }
+                    if(!seen){
+                        if(nwarned >= cwarned){
+                            cwarned = cwarned ? cwarned*2 : 8;
+                            warned = realloc(warned, sizeof(int)*(size_t)cwarned);
+                            if(!warned){ perror("realloc"); exit(1); }
+                        }
+                        warned[nwarned++] = rt;
+                        axx_diagf(0, 0, " warning - relocation type %d does not fit the "
+                                        "8-bit type field of an ELF32 r_info; it is "
+                                        "written as %d.\n", rt, rt & 0xFF);
+                    }
+                }
+                if(!warned_sym
+                   && weo_symof(snimap,snimap_len,rl->data[ei].sym) > 0xFFFFFF){
+                    warned_sym = 1;
+                    axx_diagf(0, 0, " warning - more than 16777215 symbols: the symbol "
+                                    "index does not fit the 24-bit field of an ELF32 "
+                                    "r_info.\n");
+                }
+            }
+        }
+        free(warned);
+    }
 
     int _reloc_entsz = _is_elf64 ? (_is_rela_w?24:16) : (_is_rela_w?12:8);
     uint8_t **rela_bufs=calloc((size_t)(nrela?nrela:1),sizeof(uint8_t*));
@@ -15590,7 +16084,8 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int i=0;i<ncs;i++)
         weo_shdr(fp,_is_le,_is_elf64,sec_noff[i],csecs[i].sht,csecs[i].fl,0,sec_fo[i],csecs[i].bsz,0,0,
                  csecs[i].al_set ? csecs[i].al
-                                 : weo_default_align(csecs[i].sht,_is_elf64),0);
+                                 : weo_default_align(csecs[i].sht,_is_elf64),
+                 (uint64_t)csecs[i].es);
     {
     uint32_t _word_align = _is_elf64?8:4;
     uint32_t _rel_sh_type = _is_rela_w?4:9;

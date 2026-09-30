@@ -1026,12 +1026,13 @@ def _reloc_same_width(mach, nbytes, want_pcrel):
 
 
 def _elf_section_attrs(state, name):
-    """セクションの (sh_flags, sh_type, sh_addralign) を決める。
+    """セクションの (sh_flags, sh_type, sh_addralign, sh_entsize) を決める。
 
-    `.elfsection::<名前>::<flags>[::<型>[::<整列>]]`（マニュアル 3.7.7 節）で
-    宣言があればそれを使い、無ければ名前の前方一致で決める従来の規則に従う。
-    整列を書かなかったときは None を返す。既定値は ELF クラスを知る書き出し側
-    （_elf_default_align()）が決める。
+    `.elfsection::<名前>::<flags>[::<型>[::<整列>[::<要素長>]]]`（マニュアル
+    3.7.7 節）で宣言があればそれを使い、無ければ名前の前方一致で決める従来の
+    規則に従う。整列を書かなかったときは None を返す。既定値は ELF クラスを
+    知る書き出し側（_elf_default_align()）が決める。要素長は書かなければ 0
+    （＝固定長の要素を持たないセクション）である。
     caxx.c の elf_section_attrs() と同じ規則である。
     """
     uname = name.upper()
@@ -1047,6 +1048,7 @@ def _elf_section_attrs(state, name):
         flags = 0x2
     sh_type = 8 if uname.startswith('.BSS') else 1
     align = None
+    entsize = 0
     decl = state.elf.decl_sec.get(name.lower())
     if decl is not None:
         flags = decl[0]
@@ -1054,7 +1056,9 @@ def _elf_section_attrs(state, name):
             sh_type = decl[1]
         if len(decl) > 2 and decl[2] is not None:
             align = decl[2]
-    return flags, sh_type, align
+        if len(decl) > 3 and decl[3] is not None:
+            entsize = decl[3]
+    return flags, sh_type, align, entsize
 
 
 def _elf_default_align(sh_type, is_elf64):
@@ -1072,6 +1076,93 @@ def _elf_default_align(sh_type, is_elf64):
     if sh_type == 7:
         return 4
     return 16
+
+
+# ---------------------------------------------------------------------------
+# ELF シンボルの属性（マニュアル 5.6.1 節）
+#
+# シンボルの型・大きさ・束縛・可視性は ELF のシンボル表の欄で、どの機種でも
+# 同じ形をしている。リンカがこれを見て仕事を変えるので（STT_FUNC でないシンボル
+# には ARM/AArch64 の中継命令が作られない、大きさの無いシンボルは
+# `--gc-sections` で残せない、弱いシンボルは他の定義に負ける）、リンクできる
+# `.o` を出すには機種の記述だけでは足りない。ソース側の `.type` / `.size` /
+# `.weak` / `.hidden` / `.protected` / `.internal` / `.other` / `.comm` が
+# ここへ書き込み、write_elf_obj() が読む。
+# ---------------------------------------------------------------------------
+
+# `.type` の種別名 → STT_*。番号を直に書いてもよい（0〜15）。
+ELF_SYM_TYPES = {
+    'notype': 0, 'object': 1, 'func': 2, 'function': 2,
+    'section': 3, 'file': 4, 'common': 5, 'tls': 6, 'tls_object': 6,
+    'gnu_ifunc': 10, 'ifunc': 10,
+}
+
+# 属性を1つも宣言していないシンボルの姿。`sym_attrs` に無い名前はこれになる。
+#   [型, 大きさを書いたか, 大きさ, st_other, weak か, common か, common の整列]
+_SYM_ATTR_DEFAULT = (0, 0, 0, 0, 0, 0, 0)
+
+_SA_TYPE, _SA_SIZE_SET, _SA_SIZE, _SA_OTHER, _SA_WEAK, _SA_COMMON, _SA_ALIGN = range(7)
+
+
+def _sym_attr(state, name):
+    """`name` のシンボル属性を読む。宣言が無ければ既定の姿を返す。
+
+    caxx.c の sym_attr_get() と同じである。
+    """
+    return state.sym_attrs.get(name, _SYM_ATTR_DEFAULT)
+
+
+def _sym_attr_slot(state, name):
+    """`name` のシンボル属性を書き換えられる形で取り出す（無ければ作る）。
+
+    caxx.c の sym_attr_slot() と同じである。
+    """
+    a = state.sym_attrs.get(name)
+    if a is None:
+        a = list(_SYM_ATTR_DEFAULT)
+        state.sym_attrs[name] = a
+    return a
+
+
+def _sym_st_info(state, name, bind):
+    """シンボルの st_info。束縛は呼び出し側が決め、型は `.type` から取る。
+
+    `.weak` を宣言したシンボルは、呼び出し側が渡した束縛より STB_WEAK(2) が
+    勝つ。局所シンボル（STB_LOCAL）に `.weak` は書けない — `.weak` は名前を
+    `.global` と同じく外へ出すので、そのシンボルは必ず大域側の並びに来る。
+    caxx.c の weo_sym_info() と同じ規則である。
+    """
+    a = _sym_attr(state, name)
+    if a[_SA_WEAK]:
+        bind = 2
+    return ((bind & 0xF) << 4) | (a[_SA_TYPE] & 0xF)
+
+
+def _sym_common_override(state, name, bpw, shndx, value, size):
+    """`.comm` で宣言したシンボルなら、SHN_COMMON の姿に差し替える。
+
+    common シンボルは節に属さず、st_shndx が SHN_COMMON(0xfff2)、st_value が
+    整列（バイト）、st_size が大きさ（バイト）になる。リンカが実体を作るので、
+    このオブジェクト自身は領域を持たない。
+    caxx.c の weo_sym_common() と同じ規則である。
+    """
+    a = _sym_attr(state, name)
+    if not a[_SA_COMMON]:
+        return shndx, value, size
+    return 0xfff2, a[_SA_ALIGN], a[_SA_SIZE] * bpw
+
+
+def _sym_size_of(state, name, bpw):
+    """シンボルの st_size。`.size` を書いていなければ 0。
+
+    `.size` の値はワード数なので、ラベルの値と同じく1ワードのバイト数を掛けて
+    バイト数にする（8 ビット機では掛ける数が 1 なので書いたままになる）。
+    caxx.c の weo_sym_size() と同じ規則である。
+    """
+    a = _sym_attr(state, name)
+    if not a[_SA_SIZE_SET]:
+        return 0
+    return a[_SA_SIZE] * bpw
 
 
 def _reloc_named(state, mach, name):
@@ -1324,6 +1415,10 @@ class AssemblerState:
         # --- 記号表 ---
         self.labels = {}         # ソース側ラベル 名 → [値, セクション, is_equ, ...]
         self.extern_untyped = set()  # 型名なしの `.extern` で宣言したラベル名
+        # `.type`/`.size`/`.weak`/`.hidden`/`.protected`/`.internal`/`.other`/
+        # `.comm` が宣言した ELF シンボルの属性（_SYM_ATTR_DEFAULT の並び）。
+        # 出力にしか効かないので、パス1の反復では消さずに持ち越す。
+        self.sym_attrs = {}
         self.sections = {}       # セクション名 → [開始, ワード数, 入口pc]
         self.symbols = {}        # 現在有効なシンボル（patsymbols のコピー＋α）
         self.patsymbols = {}     # パターンファイルの .setsym で定義されたもの
@@ -4611,16 +4706,16 @@ class DirectiveProcessor:
 
         ソースが `::型名` を書かなかった参照は、欄のバイト幅からこの表を引く。
         型は `.elftype` で決めた名前でもマシンの名前表の名前でも型番号でもよい。
+
+        幅は 1〜8 のどれでもよい。2 の冪だけに絞っていたが、1 ワードが 8 ビット
+        でない機種（`.bits`）では参照の幅が 1 ワードのバイト数の倍数になるので、
+        12 ビット機の 3 ワード参照（6 バイト）のような幅が普通に現れる。
         """
         if len(i) == 0 or i[0] != '.elfwidth':
             return False
         _wf, _tf = self._elf_decl_fields(i)
         w = self._elf_decl_num('.elfwidth', _wf, 1, 8)
         if w is None:
-            return True
-        if w not in (1, 2, 4, 8):
-            self.state.diag(f" error - .elfwidth: width must be 1, 2, 4 or 8, got {w}.",
-                            set_error=True)
             return True
         t = _tf.strip()
         if not t:
@@ -4724,7 +4819,7 @@ class DirectiveProcessor:
         return True
 
     def elfsection_processing(self, i):
-        """`.elfsection::<名前>::<sh_flags>[::<sh_type>[::<整列>]]` — セクションヘッダの属性。
+        """`.elfsection::<名前>::<sh_flags>[::<sh_type>[::<整列>[::<要素長>]]]` — セクションヘッダの属性。
 
         書かなかったセクションは従来どおり名前から決まる（`.text` は
         SHF_ALLOC|SHF_EXECINSTR、`.data` と `.bss` は SHF_ALLOC|SHF_WRITE、
@@ -4734,6 +4829,11 @@ class DirectiveProcessor:
 
         整列は sh_addralign にそのまま入る。0 か 2 の冪でなければならない
         （ELF の要求）。書かなければ _elf_default_align() が決める。
+
+        第 5 欄は sh_entsize で、そのセクションが固定長の要素を並べたもので
+        あるときの1要素のバイト数である。`SHF_MERGE` を立てた文字列表
+        （`.rodata.str1.1` は要素長 1）のように、リンカが要素単位で扱う
+        セクションはこれが 0 でないことを要求する。書かなければ 0 になる。
         caxx.c の dir_elfsection() と同じ規則である。
         """
         if len(i) == 0 or i[0] != '.elfsection':
@@ -4761,10 +4861,15 @@ class DirectiveProcessor:
                 self.state.diag(" error - .elfsection: alignment must be 0 or a "
                                 f"power of two, got '{al}'.", set_error=True)
                 return True
+        es = None
+        if len(i) > 5 and i[5] and i[5].strip():
+            es = self._elf_decl_num('.elfsection', i[5], 0, 0xFFFFFFFF)
+            if es is None:
+                return True
         e = self.state.elf
         key = nm.lower()
-        if e.decl_sec.get(key) != (fl, ty, al):
-            e.decl_sec[key] = (fl, ty, al)
+        if e.decl_sec.get(key) != (fl, ty, al, es):
+            e.decl_sec[key] = (fl, ty, al, es)
             e.decl_gen += 1
         return True
 
@@ -9201,6 +9306,233 @@ class AssemblyDirectiveProcessor:
 
         return True
 
+    # ---- ELF シンボル属性のディレクティブ（マニュアル 5.6.1 節）-----------
+    #
+    # `.type`／`.size`／`.weak`／`.hidden`／`.protected`／`.internal`／
+    # `.other`／`.comm`。どれも「名前[::欄][::欄], 名前...」という同じ並びを
+    # 取るので、切り出しは _sym_decl_scan() に集めてある。宣言は出力にしか
+    # 効かないので、記録はパス2（と対話時）だけで行う。ただし `.weak` と
+    # `.comm` は名前を外部シンボルとして登録もするので、そこだけは `.extern`
+    # と同じくどのパスでも行う（パスによって登録が違うとアドレスがずれる）。
+
+    def _sym_decl_scan(self, l2, nfields):
+        """`名前[::欄...]` をカンマ区切りで読み、(名前, [欄...]) を順に返す。
+
+        欄の切り方は `.extern 名前::型名` と同じで、`::` の直後から空白・
+        カンマ・`:` の手前までを1欄とする。欄を書かなかったところは '' に
+        なる。caxx.c の sym_decl_scan() と同じ規則である。
+        """
+        out = []
+        idx = 0
+        buf = l2 + chr(0)
+        while idx < len(buf) and buf[idx] != chr(0):
+            idx = StringUtils.skipspc(buf, idx)
+            name, idx = self.parser.get_label_word(buf, idx)
+            if not name:
+                break
+            # ラベル名の読み取りが `::` の1つめを食っていたら1文字戻す
+            # （`.extern` と同じ扱い）。
+            if idx > 0 and buf[idx - 1] == ':' and idx < len(buf) and buf[idx] == ':':
+                idx -= 1
+            fields = []
+            while len(fields) < nfields and buf[idx:idx + 2] == '::':
+                idx += 2
+                _s = idx
+                while idx < len(buf) and buf[idx] not in ' \t,:' + chr(0):
+                    idx += 1
+                fields.append(buf[_s:idx].strip())
+            while len(fields) < nfields:
+                fields.append('')
+            if idx < len(buf) and buf[idx] == ':':
+                idx += 1
+            out.append((name, fields))
+            idx = StringUtils.skipspc(buf, idx)
+            if idx < len(buf) and buf[idx] == ',':
+                idx += 1
+        return out
+
+    def _sym_decl_num(self, dname, name, text, lo, hi):
+        """シンボル宣言の数値欄を評価する。読めないか範囲外なら診断して None。"""
+        if not text:
+            self.state.diag(f" error - {dname}: a number is required for '{name}'.",
+                            set_error=True)
+            return None
+        self.state.error_undefined_label = False
+        v, _idx = self.expr_eval.expression_asm(text, 0)
+        _undef = _is_undef_derived(v)
+        try:
+            v = int(v)
+        except (OverflowError, ValueError):
+            v = None
+        if self.state.error_undefined_label or _undef or v is None \
+                or v < lo or v > hi:
+            self.state.diag(f" error - {dname}: value for '{name}' must be an integer "
+                            f"in {lo}..{hi}, got '{text}'.", set_error=True)
+            v = None
+        self.state.error_undefined_label = False
+        return v
+
+    def _sym_declare_extern(self, name):
+        """名前を「他所で解決される外部シンボル」として登録する。
+
+        型名を書かなかった `.extern` とまったく同じ登録で、`.weak` と `.comm`
+        がまだ知らない名前を見たときに使う。すでに知っている名前には何もしない。
+        caxx.c の sym_declare_extern() と同じ規則である。
+        """
+        if name in self.state.labels:
+            return
+        reloc_type = elf_machine_table(self.state)['extern_default']
+        self.state.extern_untyped.add(name)
+        self.state.labels[name] = [0, '.text', False, True, reloc_type]
+
+    def type_processing(self, l1, l2):
+        """`.type <名前>::<種別>[, ...]` — シンボルの型（STT_*）。
+
+        種別は notype / object / func（function）/ section / file / common /
+        tls / gnu_ifunc（ifunc）、または 0〜15 の番号。大小は区別しない。
+        caxx.c の adir_type() と同じ規則である。
+        """
+        if StringUtils.upper(l1) != ".TYPE":
+            return False
+        if not self.state.should_report_errors():
+            return True
+        for name, f in self._sym_decl_scan(l2, 1):
+            kind = f[0].lower()
+            if not kind:
+                self.state.diag(f" error - .TYPE: a symbol type is required for "
+                                f"'{name}'.", set_error=True)
+                continue
+            v = ELF_SYM_TYPES.get(kind)
+            if v is None:
+                v = self._sym_decl_num('.TYPE', name, kind, 0, 15)
+                if v is None:
+                    continue
+            _sym_attr_slot(self.state, name)[_SA_TYPE] = v
+        return True
+
+    def size_processing(self, l1, l2):
+        """`.size <名前>::<式>[, ...]` — シンボルの大きさ（st_size）。
+
+        式の値はワード数である。ラベルの値と同じく1ワードのバイト数を掛けて
+        バイト数にするので、8 ビット機では書いたままの数が入る。
+        caxx.c の adir_size() と同じ規則である。
+        """
+        if StringUtils.upper(l1) != ".SIZE":
+            return False
+        if not self.state.should_report_errors():
+            return True
+        for name, f in self._sym_decl_scan(l2, 1):
+            v = self._sym_decl_num('.SIZE', name, f[0], 0, 0x7FFFFFFFFFFFFFFF)
+            if v is None:
+                continue
+            a = _sym_attr_slot(self.state, name)
+            a[_SA_SIZE_SET] = 1
+            a[_SA_SIZE] = v
+        return True
+
+    def weak_processing(self, l1, l2):
+        """`.weak <名前>[, ...]` — 弱いシンボル（STB_WEAK）。
+
+        定義してある名前なら `.global` と同じく外へ出し、束縛だけ弱くする。
+        まだ知らない名前は型名なしの `.extern` と同じに登録するので、弱い
+        参照（解決できなければ 0 になる参照）がそのまま書ける。
+        caxx.c の adir_weak() と同じ規則である。
+        """
+        if StringUtils.upper(l1) != ".WEAK":
+            return False
+        _record = self.state.should_report_errors()
+        for name, _f in self._sym_decl_scan(l2, 0):
+            # 登録はどのパスでも行う（パスによって違うとアドレスがずれる）。
+            self._sym_declare_extern(name)
+            if not _record:
+                continue
+            _sym_attr_slot(self.state, name)[_SA_WEAK] = 1
+            _lentry = self.state.labels.get(name, [])
+            _is_imported = len(_lentry) > 3 and _lentry[3]
+            if not _is_imported:
+                # ここで定義されている名前は `.global` と同じく外へ出す。
+                v = self.label_manager.get_value(name)
+                sec = self.label_manager.get_section(name)
+                is_equ = len(_lentry) > 2 and _lentry[2]
+                self.state.export_labels[name] = [v, sec, is_equ]
+        return True
+
+    _VIS_DIRS = {'.HIDDEN': 2, '.PROTECTED': 3, '.INTERNAL': 1}
+
+    def visibility_processing(self, l1, l2):
+        """`.hidden` / `.protected` / `.internal` `<名前>[, ...]` — 可視性。
+
+        st_other の下位 2 ビット（STV_*）だけを書き換える。上位のビットは
+        `.other` で書いたものがそのまま残る。
+        caxx.c の adir_visibility() と同じ規則である。
+        """
+        vis = self._VIS_DIRS.get(StringUtils.upper(l1))
+        if vis is None:
+            return False
+        if not self.state.should_report_errors():
+            return True
+        for name, _f in self._sym_decl_scan(l2, 0):
+            a = _sym_attr_slot(self.state, name)
+            a[_SA_OTHER] = (a[_SA_OTHER] & ~0x03) | vis
+        return True
+
+    def other_processing(self, l1, l2):
+        """`.other <名前>::<値>[, ...]` — st_other のバイトそのもの。
+
+        下位 2 ビットが可視性（STV_*）で、上位 6 ビットは機種ごとの意味を持つ
+        （PowerPC64 ELFv2 の局所入口のずれはビット 5〜7 にある）。可視性の
+        ディレクティブと違い、このバイトを丸ごと置き換える。
+        caxx.c の adir_other() と同じ規則である。
+        """
+        if StringUtils.upper(l1) != ".OTHER":
+            return False
+        if not self.state.should_report_errors():
+            return True
+        for name, f in self._sym_decl_scan(l2, 1):
+            v = self._sym_decl_num('.OTHER', name, f[0], 0, 255)
+            if v is None:
+                continue
+            _sym_attr_slot(self.state, name)[_SA_OTHER] = v
+        return True
+
+    def comm_processing(self, l1, l2):
+        """`.comm <名前>::<大きさ>[::<整列>][, ...]` — 共通シンボル。
+
+        SHN_COMMON のシンボルを出す。実体はリンカが作るので、このオブジェクト
+        自身は領域を持たない。大きさはワード数（`.size` と同じ）、整列は
+        バイトで、書かなければ 1 になる。型は `.type` を書かなければ
+        STT_OBJECT(1) にする（GNU as と同じ）。
+        caxx.c の adir_comm() と同じ規則である。
+        """
+        if StringUtils.upper(l1) != ".COMM":
+            return False
+        _record = self.state.should_report_errors()
+        for name, f in self._sym_decl_scan(l2, 2):
+            # 登録はどのパスでも行う（`.weak` と同じ理由）。
+            self._sym_declare_extern(name)
+            if not _record:
+                continue
+            sz = self._sym_decl_num('.COMM', name, f[0], 0, 0x7FFFFFFFFFFFFFFF)
+            if sz is None:
+                continue
+            al = 1
+            if f[1]:
+                al = self._sym_decl_num('.COMM', name, f[1], 0, 0x40000000)
+                if al is None:
+                    continue
+                if al & (al - 1):
+                    self.state.diag(" error - .COMM: alignment must be 0 or a power "
+                                    f"of two, got '{al}' for '{name}'.", set_error=True)
+                    continue
+            a = _sym_attr_slot(self.state, name)
+            a[_SA_COMMON] = 1
+            a[_SA_SIZE_SET] = 1
+            a[_SA_SIZE] = sz
+            a[_SA_ALIGN] = al
+            if a[_SA_TYPE] == 0:
+                a[_SA_TYPE] = 1          # STT_OBJECT
+        return True
+
     def reloctype_processing(self, l1, l2):
         if StringUtils.upper(l1) != ".RELOCTYPE":
             return False
@@ -10962,6 +11294,18 @@ class Assembler:
             return self._dir_line_done(l, l2, idx)
         if self.asm_directive_proc.export_processing(l, l2):
             return self._dir_line_done(l, l2, idx)
+        if self.asm_directive_proc.type_processing(l, l2):
+            return self._dir_line_done(l, l2, idx)
+        if self.asm_directive_proc.size_processing(l, l2):
+            return self._dir_line_done(l, l2, idx)
+        if self.asm_directive_proc.weak_processing(l, l2):
+            return self._dir_line_done(l, l2, idx)
+        if self.asm_directive_proc.visibility_processing(l, l2):
+            return self._dir_line_done(l, l2, idx)
+        if self.asm_directive_proc.other_processing(l, l2):
+            return self._dir_line_done(l, l2, idx)
+        if self.asm_directive_proc.comm_processing(l, l2):
+            return self._dir_line_done(l, l2, idx)
 
         if l == "":
             # テキスト置換モードでラベルだけの行とコメントだけの行は、落とした
@@ -12330,6 +12674,10 @@ class Assembler:
                 sh_size, sh_link, sh_info, sh_addralign, sh_entsize)
 
         def _pack_sym(st_name, st_info, st_other, st_shndx, st_value, st_size):
+            # st_value と st_size は ELF32 では 32 ビット欄なので、クラスに
+            # 合わせて切る（caxx.c の weo_sym() が weo_w4 で切るのと同じ）。
+            st_value &= _word_mask
+            st_size  &= _word_mask
             if _is_elf64:
                 return _struct.pack(f'{_pk}IBBHQQ',
                     st_name, st_info, st_other, st_shndx, st_value, st_size)
@@ -12372,9 +12720,10 @@ class Assembler:
 
         class _CSec:
             __slots__ = ('name', 'byte_start', 'data', 'byte_size', 'flags',
-                         'sh_type', 'align')
+                         'sh_type', 'align', 'entsize')
 
-            def __init__(self, name, byte_start, data, flags, sh_type, align):
+            def __init__(self, name, byte_start, data, flags, sh_type, align,
+                         entsize):
                 self.name       = name
                 self.byte_start = byte_start
                 self.data       = data
@@ -12382,14 +12731,16 @@ class Assembler:
                 self.flags      = flags
                 self.sh_type    = sh_type
                 self.align      = align
+                self.entsize    = entsize
 
         csecs = []
         max_w = max(buf.keys(), default=-1)
 
         if not self.state.sections:
             w_count = max_w + 1 if max_w >= 0 else 0
-            _fl0, _sht0, _al0 = _elf_section_attrs(self.state, '.text')
-            csecs.append(_CSec('.text', 0, _extract(0, w_count), _fl0, _sht0, _al0))
+            _fl0, _sht0, _al0, _es0 = _elf_section_attrs(self.state, '.text')
+            csecs.append(_CSec('.text', 0, _extract(0, w_count), _fl0, _sht0,
+                               _al0, _es0))
         else:
             sec_names = list(self.state.sections.keys())
             for i, sname in enumerate(sec_names):
@@ -12398,8 +12749,8 @@ class Assembler:
                 w0 = ranges[0][0] if ranges else self.state.sections[sname][0]
                 byte_start = w0 * bpw
                 data = b''.join(_extract(rs, rl) for rs, rl in ranges)
-                flags, _sht, _al = _elf_section_attrs(self.state, sname)
-                csecs.append(_CSec(sname, byte_start, data, flags, _sht, _al))
+                flags, _sht, _al, _es = _elf_section_attrs(self.state, sname)
+                csecs.append(_CSec(sname, byte_start, data, flags, _sht, _al, _es))
 
         ncs = len(csecs)
 
@@ -12518,9 +12869,17 @@ class Assembler:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr, _lsec)
             sym_val = int(sym_val) & _word_mask
+            # `.type` / `.size` / `.other`（マニュアル 5.6.1 節）。局所シンボル
+            # なので束縛は STB_LOCAL のままで、`.weak` は下の大域側へ回る。
+            _sa = _sym_attr(self.state, name)
+            _sz = _sym_size_of(self.state, name, bpw)
+            shndx, sym_val, _sz = _sym_common_override(
+                self.state, name, bpw, shndx, sym_val, _sz)
             name_off = len(strtab)
             strtab += name.encode() + b'\x00'
-            syms.append(_pack_sym(name_off, 0x00, 0, shndx, sym_val, 0))
+            syms.append(_pack_sym(name_off, _sym_st_info(self.state, name, 0),
+                                  _sa[_SA_OTHER], shndx,
+                                  int(sym_val) & _word_mask, _sz))
 
         first_global = len(syms)
 
@@ -12528,9 +12887,16 @@ class Assembler:
             is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
             if not is_imported or name in export_keys:
                 continue
+            # 未定義（他所で解決される）シンボル。`.comm` を宣言していれば
+            # SHN_COMMON の姿になり、`.weak` を宣言していれば束縛が弱くなる。
+            _sa = _sym_attr(self.state, name)
+            _shndx, _sval, _sz = _sym_common_override(
+                self.state, name, bpw, 0, 0, _sym_size_of(self.state, name, bpw))
             name_off = len(strtab)
             strtab += name.encode() + b'\x00'
-            syms.append(_pack_sym(name_off, 0x10, 0, 0, 0, 0))
+            syms.append(_pack_sym(name_off, _sym_st_info(self.state, name, 1),
+                                  _sa[_SA_OTHER], _shndx,
+                                  int(_sval) & _word_mask, _sz))
 
         for name, *_eentry in sorted(self.state.export_labels.items()):
             val, _sec = _eentry[0][0], _eentry[0][1]
@@ -12545,9 +12911,15 @@ class Assembler:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr, _sec)
             sym_val = int(sym_val) & _word_mask
+            _sa = _sym_attr(self.state, name)
+            shndx, sym_val, _sz = _sym_common_override(
+                self.state, name, bpw, shndx, sym_val,
+                _sym_size_of(self.state, name, bpw))
             name_off = len(strtab)
             strtab += name.encode() + b'\x00'
-            syms.append(_pack_sym(name_off, 0x10, 0, shndx, sym_val, 0))
+            syms.append(_pack_sym(name_off, _sym_st_info(self.state, name, 1),
+                                  _sa[_SA_OTHER], shndx,
+                                  int(sym_val) & _word_mask, _sz))
 
         symtab = b''.join(syms)
         strtab = bytes(strtab)
@@ -12603,6 +12975,30 @@ class Assembler:
                 return _struct.pack(f'{_pk}QQ', r_offset, r_info)
             r_info = ((r_sym & 0xffffff) << 8) | (r_type & 0xff)
             return _struct.pack(f'{_pk}II', r_offset, r_info)
+
+        # ELF32 の r_info は型欄が 8 ビット、シンボル番号欄が 24 ビットしかない。
+        # 組み込みの表を持つ機種の ELF32 側（i386・m68k・PowerPC・ARM・SuperH）
+        # は型番号がどれも 255 以下だが、`.elftype` は 2147483647 まで書けるので、
+        # ELF32 で 255 を超える型を宣言すると黙って切り詰められる。切り詰めた
+        # 型番号は別の型に化けるため、リンカは診断も出さず間違った修正をする。
+        # 型ごとに一度だけ知らせる。caxx.c の同じ箇所と同じ規則である。
+        if not _is_elf64:
+            _warned_rt = set()
+            _warned_sym = False
+            for sidx in rela_sec_order:
+                for (_off, _sn, _rt, _ad, _nb) in rela_entries[sidx]:
+                    if _rt > 0xFF and _rt not in _warned_rt:
+                        _warned_rt.add(_rt)
+                        self.state.diag(
+                            f" warning - relocation type {_rt} does not fit the "
+                            f"8-bit type field of an ELF32 r_info; it is written "
+                            f"as {_rt & 0xFF}.", set_error=False)
+                    if not _warned_sym and sym_name_to_idx.get(_sn, 0) > 0xFFFFFF:
+                        _warned_sym = True
+                        self.state.diag(
+                            " warning - more than 16777215 symbols: the symbol "
+                            "index does not fit the 24-bit field of an ELF32 "
+                            "r_info.", set_error=False)
 
         rela_datas = []
         for sidx in rela_sec_order:
@@ -12717,7 +13113,7 @@ class Assembler:
                          else _elf_default_align(_sh_type_i, _is_elf64))
                 f.write(_pack_shdr(
                     sec_name_offs[i], _sh_type_i, s.flags, 0,
-                    sec_offsets[i], s.byte_size, 0, 0, _al_i, 0))
+                    sec_offsets[i], s.byte_size, 0, 0, _al_i, s.entsize))
 
             _word_align = 8 if _is_elf64 else 4
             _sym_entsize = 24 if _is_elf64 else 16

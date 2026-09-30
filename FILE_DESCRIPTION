@@ -96,6 +96,22 @@ elfsec.s                            test assemble file for elfsec.axx. build it
                                     the .note.axx section is a well-formed ELF
                                     note, so `readelf -n` reads it and the
                                     SHT_NOTE alignment can be checked
+elfsym.axx                          pattern file for the pieces that make the
+                                    output a linkable .o for any CPU: the ELF
+                                    symbol attributes of the source
+                                    (.type / .size / .weak / .hidden /
+                                    .protected / .internal / .other / .comm,
+                                    manual 5.6.1), a relocation field width
+                                    that is not a power of two (.elfwidth::3)
+                                    and a section element size (the fifth
+                                    field of .elfsection). the machine is
+                                    EM_MN10300, which axx has no built-in
+                                    table for
+elfsym.s                            test assemble file for elfsym.axx. build it
+                                    with -o and read the symbol table: the
+                                    types, sizes, bindings, visibilities, the
+                                    st_other byte and the SHN_COMMON symbol
+                                    are all written from the source
 endsub.axx                          pattern file for closing a `.sub` block with
                                     `.endsub` instead of `.return`: the two
                                     spellings mean the same thing and can be
@@ -153,6 +169,25 @@ secsort.py                          execution file of section sort
 test1                               assemble test for all pattern file
 test.axx                            test pattern file of some CPUs 
 test.s                              test assemble file of some CPUs
+ppc64.axx                           pattern file for PowerPC64, big-endian (ELFv1):
+                                    sets the byte order and the ELF description
+                                    (.elftype / .elffield / .elfsection), then
+                                    includes ppc64_isa.axx
+ppc64le.axx                         the same for little-endian PowerPC64 (ELFv2)
+ppc64_isa.axx                       the PowerPC64 instruction set (Power ISA v3.1,
+                                    POWER10) shared by ppc64.axx and ppc64le.axx;
+                                    not passed to axx directly. written with the
+                                    macro layer and the mini language
+ppc64_test.s                        test assemble file for ppc64.axx / ppc64le.axx:
+                                    one line per pattern row, checked against
+                                    GNU as byte-for-byte
+ppc64_reloc_test.s                  every relocatable row against an external
+                                    symbol, for -o; relocations match GNU as
+hello_ppc64.s                       hello world for big-endian PowerPC64 Linux
+                                    (ELFv1 function descriptor in .opd).
+                                    caxx ppc64.axx hello_ppc64.s -o hello.o
+hello_ppc64le.s                     hello world for little-endian PowerPC64 Linux.
+                                    caxx ppc64le.axx hello_ppc64le.s -o hello.o
 z80.axx                             pattern file for Z80
 z80.s                               test assemble file for Z80
 vliw.axx                            test pattern file for vliw
@@ -168,11 +203,16 @@ axx_introduction_paper.md           introduction paper (Japanese)
 axx_introduction_paper_en.md        introduction paper (English)
 axx-promotion.md                    introductory article (Japanese)
 axx-promotion-en.md                 introductory article (English)
-elf_generalization.md               the generalization of the ELF output:
-                                    the .elfmachine / .elfclass / .elfrela /
-                                    .elfwidth / .elfextern / .elfdwarf /
-                                    .elfheader / .elfsection declarations, and
-                                    the relocation type priority (Japanese)
+elf_generalization.md               the generalization of the ELF output, for
+                                    writing a linkable .o for any CPU: the
+                                    machine half (.elfmachine / .elfclass /
+                                    .elfrela / .elftype / .elfwidth /
+                                    .elfextern / .elfdwarf / .elfheader /
+                                    .elfsection / .elffield in the pattern
+                                    file), the symbol half (.type / .size /
+                                    .weak / .hidden / .protected / .internal /
+                                    .other / .comm in the source), and the
+                                    relocation type priority (Japanese)
 elf_generalization_en.md            the same (English)
 axxsemantics                        denotational semantics of axx (Japanese)
 FILE_DESCRIPTION                    this file

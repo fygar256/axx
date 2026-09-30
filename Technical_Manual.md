@@ -39,7 +39,7 @@ axx 8080toz80.axx hello8080.s -V > out.s  # translated text to stdout
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all twenty-eight bundled pattern/source pairs with
+exactly that: `test1` assembles all twenty-nine bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the three `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` pair the `.echo` lines each one writes to standard
@@ -1481,7 +1481,7 @@ ELF object should look like.
 | `.elfextern::<type>` | the default type for `.extern` with no type name |
 | `.elfdwarf::<type>` | the absolute type the `-g` DWARF output uses |
 | `.elfheader::<field>::<value>` | a field of the ELF header |
-| `.elfsection::<name>::<sh_flags>[::<sh_type>[::<align>]]` | the attributes of a section header |
+| `.elfsection::<name>::<sh_flags>[::<sh_type>[::<align>[::<entsize>]]]` | the attributes of a section header |
 | `.elffield::<type>::<mask>[::<offset>]` | an instruction-field relocation type (below, "Instruction-field types") |
 
 - Every declaration is a difference *laid over* the built-in table selected with
@@ -1491,8 +1491,12 @@ ELF object should look like.
 - Wherever `<type>` is written, an `.elftype` name, a built-in name, or a type
   number (decimal or `0x` hex) is accepted. Names are matched without regard to
   case.
-- The width of `.elfwidth` is 1, 2, 4 or 8. A reference whose source wrote no
-  `::<type name>` looks up this table by the byte width of its field.
+- The width of `.elfwidth` is any of 1 to 8. A reference whose source wrote no
+  `::<type name>` looks up this table by the byte width of its field. Widths
+  that are not powers of two are accepted because on a machine whose word is not
+  8 bits (`.bits`, section 3.10) the width of a reference is a multiple of the
+  bytes per word: a three-word reference on a 12-bit machine is 6 bytes. Even on
+  an 8-bit machine some ISAs have a 3-byte field (`R_MN10300_24`, for one).
 - The declarations may be written anywhere. Like `.elftype` they are all
   collected once the pattern file has been read, so a declaration below its
   first use still resolves.
@@ -1540,11 +1544,14 @@ its attributes from its name, as before.
 .elfsection::.noinit::0x3::8         /* ALLOC+WRITE, SHT_NOBITS          */
 .elfsection::.note.axx::0::7         /* no flags, SHT_NOTE, align 4      */
 .elfsection::.vectors2::0x6::1::2    /* alignment written out: 2         */
+.elfsection::.rodata.str1.1::0x32::1::1::1
+                                     /* ALLOC+MERGE+STRINGS, entsize 1   */
 ```
 
 This is how a section the name rule does not know — a machine's own vector
-table, an uninitialised region that is not called `.bss`, a note section — gets
-the attributes it needs.
+table, an uninitialised region that is not called `.bss`, a note section, a
+string table the linker handles element by element — gets the attributes it
+needs.
 
 - The section name is matched without regard to case, and only as a whole name
   (unlike the name rule above, which matches a prefix).
@@ -1554,6 +1561,16 @@ the attributes it needs.
   not written to the file, exactly as `.bss` is treated.
 - The fourth field is `sh_addralign`. It must be 0 or a power of two (the ELF
   requirement); anything else is diagnosed and the declaration ignored.
+- The fifth field is `sh_entsize`: the size in bytes of one element, for a
+  section that is an array of fixed-size elements. It is a constant expression
+  in 0-0xFFFFFFFF, and 0 (no fixed-size element) when not written. A section
+  with `SHF_MERGE` (0x10) set requires a non-zero value, since the linker cannot
+  fold duplicates without knowing how wide an element is; for a string table
+  (`SHF_MERGE|SHF_STRINGS`, 0x30) it is 1.
+
+There is no field for `sh_link` or `sh_info`. In a relocatable object the only
+sections where those two mean anything are `.rela.*` and `.symtab`, both of
+which axx builds itself and fills with the right section numbers.
 
 **The default alignment.** A section with no alignment written gets 16, except
 `SHT_NOTE` (7), which gets 4. A note's `sh_addralign` has to be 4 or 8, and at
@@ -2851,6 +2868,109 @@ elsewhere. When both name the same label, the value brought in by `-i` wins.
 
 `.global` and `.extern` are consumed by the ELF object writer.
 
+#### 5.6.1 ELF symbol attributes
+
+Besides a name and an address, the symbol table `-o` writes carries a **type, a
+size, a binding and a visibility**. A linker changes what it does based on them
+— no ARM / AArch64 veneer is built for a symbol that is not `STT_FUNC`, a symbol
+with no size cannot be kept by `--gc-sections`, and a weak symbol loses to any
+other definition. A complete machine description (section 3.7.7) is therefore
+not enough to make a linkable `.o` if these fields stay at their defaults; the
+source fills them in.
+
+| Declaration | What it sets |
+|---|---|
+| `.type <name>::<kind>` | the type field of `st_info` (`STT_*`) |
+| `.size <name>::<expr>` | `st_size` |
+| `.weak <name>` | makes the binding `STB_WEAK` |
+| `.hidden <name>` / `.protected <name>` / `.internal <name>` | the visibility in `st_other` (`STV_*`) |
+| `.other <name>::<value>` | the `st_other` byte itself |
+| `.comm <name>::<size>[::<align>]` | an `SHN_COMMON` symbol |
+
+- Each takes a comma-separated list: `name1::…, name2::…`. The `::` after a name
+  is the same separator as in `.extern name::type` (section 5.6).
+- A declaration may be written anywhere, though as with `.extern` it is safest
+  before the references. The attributes affect the output only, so no address
+  moves.
+- A symbol with no declaration is written as before: `STT_NOTYPE`, size 0,
+  visibility `STV_DEFAULT`.
+
+**The kinds `.type` takes.** Either a name or a number (0-15). Names are matched
+without regard to case.
+
+| Kind | `STT_*` | Where it is used |
+|---|---|---|
+| `notype` | 0 | says nothing about the type (the default) |
+| `object` | 1 | data |
+| `func` (`function`) | 2 | the entry point of a function |
+| `section` | 3 | a section symbol |
+| `file` | 4 | a file-name symbol |
+| `common` | 5 | a common symbol |
+| `tls` (`tls_object`) | 6 | thread-local data |
+| `gnu_ifunc` (`ifunc`) | 10 | a GNU indirect function |
+
+**The value of `.size` is a word count.** Like a label's value it is multiplied
+by the bytes per word before it goes into `st_size`. On an 8-bit machine (the
+`.bits` default) the multiplier is 1, so the number goes in as written. The usual
+form is the difference against a label placed at the end of the function, as in
+`.size func::func_end-func`.
+
+**`.weak` passes the name out.** If the name is defined in this file, it is
+exported exactly as `.global` does, with only the binding weakened. A name not
+yet known is registered exactly as an `.extern` with no type name, so writing
+`.weak maybe` alone gives a weak reference — one that becomes 0 if it is never
+resolved. A symbol declared `.weak` always lands in the global part of the
+symbol table, so a local symbol cannot be made weak (ELF does not allow it).
+
+**`.other` replaces the whole byte.** Its low 2 bits are the visibility
+(`STV_*`) and its high 6 bits have a machine-specific meaning (the PowerPC64
+ELFv2 local-entry offset lives in bits 5-7). A visibility declaration such as
+`.hidden` rewrites only the low 2 bits, so writing a visibility after `.other`
+keeps the high bits; written the other way round, `.other` overwrites the
+visibility.
+
+**`.comm` writes an `SHN_COMMON` symbol.** The linker creates the storage, so
+this object holds none itself. `st_value` becomes the alignment (in bytes, 1 if
+not written, and 0 or a power of two) and `st_size` the size (the word count
+times the bytes per word). The type is made `STT_OBJECT` unless `.type` says
+otherwise, as in GNU as. The name is registered as an external symbol just as
+`.extern` does, so it can be referenced directly and relocations are emitted
+against that name.
+
+```
+        .extern printf                  ; an ordinary external reference
+        .weak   maybe                   ; a weak reference: undefined is ok
+        .comm   sharedbuf::64::8        ; 64 words, aligned to 8 bytes
+
+        .global func
+        .type   func::func
+        .other  func::0x60              ; st_other written out as a byte
+
+        .global datum
+        .type   datum::object
+        .size   datum::4
+        .protected datum
+
+        .section .text
+func:
+        nop
+        dd      printf
+        ret
+func_end:
+        .size   func::func_end-func
+```
+
+```
+   Num:    Value  Size Type    Bind   Vis        Ndx Name
+     6: 00000000     0 NOTYPE  WEAK   DEFAULT    UND maybe
+     7: 00000000     0 NOTYPE  GLOBAL DEFAULT    UND printf
+     8: 00000008    64 OBJECT  GLOBAL DEFAULT    COM sharedbuf
+    10: 00000000     4 OBJECT  GLOBAL PROTECTED    2 datum
+    11: 00000000    12 FUNC    GLOBAL [<other>: 60]  1 func
+```
+
+The bundled `elfsym.axx` / `elfsym.s` are a worked example.
+
 ### 5.7 Include
 
 ```
@@ -3557,6 +3677,7 @@ The x86_64 pattern file is also maintained separately at
 | **elfgen.axx** | 2.7 KB | 24 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 19 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
 | **elfsec.axx** | 1.4 KB | 7 | **elfsec.s** | section attributes and `sh_addralign` declared with `.elfsection` (3.7.7); test only |
+| **elfsym.axx** | 2.4 KB | 10 | **elfsym.s** | the ELF symbol attributes written from the source (`.type`, `.size`, `.weak`, `.hidden`, `.protected`, `.internal`, `.other`, `.comm`; 5.6.1), together with a field width that is not a power of two (`.elfwidth::3`) and a section element size (the fifth field of `.elfsection`; 3.7.7). The machine is EM_MN10300, which is not in the built-in table; test only |
 | **endsub.axx** | 1.2 KB | 4 | **endsub.s** | closing a `.sub` block with `.endsub` (3.7.2); test only |
 | **intel2att.axx** | 12 KB | 434 | **intel2att.s** | x86-64 Intel to AT&T source translator; `.textmode`, `!Y`, `!L` and macro-layer pattern generation (3.18). The translated text assembles with GNU as |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
@@ -3567,14 +3688,15 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 `itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
 `aarch64_logical_mini_demo.s`.
 
-`test1` runs all twenty-eight pairs through both implementations and
+`test1` runs all twenty-nine pairs through both implementations and
 compares the `-b` raw binaries. For the three pairs that use `.textmode`
 (`textmode.axx` and `8080toz80.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
 `elftype.s` and `elfgen.axx` / `elfgen.s` pairs are about relocations and the
 ELF header, the `elfprio.axx` / `elfprio.s` pair is about which of the three
-ranks types a relocation, and the `elfsec.axx` / `elfsec.s` pair is about the
-section headers, so for those four the `-o` ELF objects are compared. For the
+ranks types a relocation, the `elfsec.axx` / `elfsec.s` pair is about the
+section headers, and the `elfsym.axx` / `elfsym.s` pair is about the symbol
+table attributes, so for those five the `-o` ELF objects are compared. For the
 `echo.axx` / `echo.s` pair the `.echo` lines written to standard error are
 compared as well.
 
@@ -3582,7 +3704,7 @@ The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for a hundred and forty-four comparisons in all.
+never compares, for a hundred and forty-five comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -3612,7 +3734,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all twenty-six bundled pattern/source pairs with both
+`test1` assembles all twenty-nine bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 three `.textmode` pairs and the `.echo` lines of the `echo.axx` pair.
 

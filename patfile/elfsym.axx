@@ -1,0 +1,58 @@
+/* ===================================================================
+/* elfsym.axx -- pattern file for the ELF symbol attributes
+/*               (manual 5.6.1) and for the two remaining pieces of
+/*               the ELF machine description: a relocation field width
+/*               that is not a power of two (`.elfwidth::3`) and a
+/*               section element size (`.elfsection`'s fifth field).
+/*
+/* The machine is EM_MN10300 (89), which axx has no built-in table
+/* for. It is chosen because its ABI really does have an 8, a 16, a
+/* 24 and a 32 bit absolute relocation, so the 3-byte field below is
+/* a real relocation type and not an invented one.
+/*
+/* Everything the ELF writer needs about the machine comes from this
+/* file; everything it needs about the symbols -- their type, size,
+/* binding and visibility -- comes from the source. Those are the two
+/* halves that make the output a relocatable object a linker accepts.
+/*
+/* Assemble with:
+/*   axx elfsym.axx elfsym.s -o out.o
+/* ===================================================================
+
+.bits::8
+
+/* --- what kind of ELF object to write ---------------------------- */
+.elfmachine::89::MN10300
+.elfclass::32
+.elfrela::1
+
+/* --- the relocation types of this machine ------------------------ */
+/*     name        number  width  pc-relative                        */
+.elftype::abs32::1::4          /* R_MN10300_32                       */
+.elftype::abs16::2::2          /* R_MN10300_16                       */
+.elftype::abs8::3::1           /* R_MN10300_8                        */
+.elftype::abs24::9::3          /* R_MN10300_24  -- a 3-byte field     */
+.elftype::pcrel8::6::1::1      /* R_MN10300_PCREL8                   */
+
+/* --- which type to use when the source does not say -------------- */
+.elfwidth::4::abs32
+.elfwidth::3::abs24            /* a width that is not a power of two */
+.elfwidth::2::abs16
+.elfwidth::1::abs8
+.elfextern::abs32              /* `.extern` without `::<type>`       */
+.elfdwarf::abs32               /* -g DWARF absolute references       */
+
+/* --- section attributes ------------------------------------------ */
+/*           name              sh_flags sh_type align entsize        */
+/* SHF_ALLOC|SHF_MERGE|SHF_STRINGS with a 1-byte element: the linker  */
+/* merges equal strings only when sh_entsize says how wide an element */
+/* is, so the fifth field is what makes this section usable.          */
+.elfsection::.rodata.str1.1::0x32::1::1::1
+
+/* --- instructions ------------------------------------------------ */
+NOP :: 0xcb
+RET :: 0xfe
+DB !t :: t                     /* 1 byte -> abs8                     */
+DW !t :: t,t>>8                /* 2 bytes -> abs16                   */
+DT !t :: t,t>>8,t>>16          /* 3 bytes -> abs24                   */
+DD !t :: t,t>>8,t>>16,t>>24    /* 4 bytes -> abs32                   */

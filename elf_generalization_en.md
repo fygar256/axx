@@ -1,10 +1,18 @@
 # Generalizing the ELF output
 
 axx's ELF object output (`-o`) has been widened from the eleven machines in the
-built-in table to **any `e_machine`**. The relocation types, the ELF class,
-RELA/REL and the ELF header fields can all be declared in the pattern file, and
-so can **instruction-field types** — types whose value sits in bit fields of an
-instruction word — with `.elffield`, for any machine.
+built-in table to **any CPU**. The goal is to write a linkable relocatable
+object (`.o`) for any CPU, and that has two halves.
+
+- **The machine-dependent half** — the relocation types, the ELF class,
+  RELA/REL, the ELF header fields and the section header attributes. These are
+  declared in the pattern file (section 2). So are **instruction-field types** —
+  types whose value sits in bit fields of an instruction word — with
+  `.elffield`, for any machine.
+- **The machine-independent half** — the type, size, binding and visibility of
+  each symbol. These fields have the same shape on every machine, but a linker
+  acts on them, so an object whose symbol table is all defaults is not linkable.
+  These are declared in the source (section 3).
 
 The work is in both implementations, `axx.py` (Paxx) and `caxx.c` (Caxx), and
 their output is byte-identical.
@@ -28,6 +36,15 @@ This follows on from `.elftype` (naming a relocation type yourself). Where
 `.elftype` settled "name → type number", these declarations settle **where each
 type is used** and **how the ELF is put together**.
 
+A complete machine description is still not an object a linker will take. Every
+symbol came out as `STT_NOTYPE`, size 0, visibility `STV_DEFAULT`, so an ARM /
+AArch64 linker — which reads `STT_FUNC` to decide where a veneer is needed —
+could not find a function entry, `--gc-sections` had no size to keep a symbol
+by, and there was no way to write a weak symbol at all. The symbol table can
+carry machine-specific meaning too: the PowerPC64 ELFv2 local-entry offset lives
+in bits 5-7 of `st_other`. Filling those fields in from the source is the other
+half of this work (section 3).
+
 ---
 
 ## 2. The declarations (pattern file)
@@ -42,7 +59,7 @@ type is used** and **how the ELF is put together**.
 | `.elfextern::<type>` | the default type for `.extern` with no type name |
 | `.elfdwarf::<type>` | the absolute type the `-g` DWARF output uses |
 | `.elfheader::<field>::<value>` | a field of the ELF header |
-| `.elfsection::<name>::<sh_flags>[::<sh_type>[::<align>]]` | the attributes of a section header |
+| `.elfsection::<name>::<sh_flags>[::<sh_type>[::<align>[::<entsize>]]]` | the attributes of a section header |
 | `.elffield::<type>::<mask>[::<offset>]` | an instruction-field type (which bits of the instruction hold the value) |
 
 Rules they share:
@@ -57,7 +74,11 @@ Rules they share:
 - The declarations may be written anywhere. Like `.elftype`, they are all
   collected once the pattern file has been read, so a declaration below its
   first use still resolves.
-- The width of `.elfwidth` is 1, 2, 4 or 8.
+- The width of `.elfwidth` is any of 1 to 8. Widths that are not powers of two
+  are accepted because on a machine whose word is not 8 bits (`.bits`) the width
+  of a reference is a multiple of the bytes per word: a three-word reference on a
+  12-bit machine is 6 bytes. Even on an 8-bit machine some ISAs have a 3-byte
+  field (`R_MN10300_24`, for one).
 
 ### 2.1 The `.elftype` extension
 
@@ -99,15 +120,28 @@ came out as an allocated `SHT_PROGBITS`, with no way to change it.
 .elfsection::.noinit::0x3::8         /* ALLOC+WRITE, SHT_NOBITS          */
 .elfsection::.note.axx::0::7         /* no flags, SHT_NOTE, align 4      */
 .elfsection::.vectors2::0x6::1::2    /* alignment written out: 2         */
+.elfsection::.rodata.str1.1::0x32::1::1::1
+                                     /* ALLOC+MERGE+STRINGS, entsize 1   */
 ```
 
 A machine's own vector table, an uninitialised region that is not called
-`.bss`, a note section — this is what writes those. The section name is matched
+`.bss`, a note section, a string table the linker handles element by element —
+this is what writes those. The section name is matched
 without regard to case, as a whole name. With no `sh_type` written, the type
 stays the one the name rule gives. A section made `SHT_NOBITS` carries only its
 `sh_size`; its contents are not written to the file. The fourth field is
 `sh_addralign`. It must be 0 or a power of two (the ELF requirement); anything
 else is diagnosed and the declaration ignored.
+
+The fifth field is `sh_entsize` — the size in bytes of one element, for a section
+that is an array of fixed-size elements. It is 0 (no fixed-size element) when not
+written. A section with `SHF_MERGE` (0x10) set requires a non-zero value, since
+the linker cannot fold duplicates without knowing how wide an element is; for a
+string table (`SHF_MERGE|SHF_STRINGS`, 0x30) it is 1.
+
+There is no field for `sh_link` or `sh_info`. In a relocatable object the only
+sections where those two mean anything are `.rela.*` and `.symtab`, both of which
+axx builds itself and fills with the right section numbers.
 
 **The default alignment.** A section with no alignment written gets 16, except
 `SHT_NOTE` (7), which gets 4. A note's `sh_addralign` has to be 4 or 8, and at
@@ -168,11 +202,189 @@ BL !t :: .call w4(0x48000001|((t-$$)&0x3fffffc))
 
 On a machine whose offsets or masks depend on the byte order, writing the
 `.elffield` lines in the wrapper that sets the byte order keeps a single
-instruction-set file (section 7, PowerPC64, is built that way).
+instruction-set file (section 8, PowerPC64, is built that way).
 
 ---
 
-## 3. How this relates to `-m` and `-f`
+## 3. The declarations (source file) — the symbol table attributes
+
+Besides a name and an address, the symbol table `-o` writes carries a **type, a
+size, a binding and a visibility**. All four have the same shape on every
+machine, so they do not belong in the machine description (section 2). A linker
+nonetheless acts on them.
+
+- No ARM / AArch64 veneer is built for a symbol that is not `STT_FUNC`, so a call
+  too far to reach becomes a link error.
+- A symbol of size 0 gives `--gc-sections` no extent to keep, so it cannot be
+  kept.
+- Without a weak binding (`STB_WEAK`) there is no way to build the library-side
+  object whose default implementation another definition may override.
+- Without `SHN_COMMON` symbols the ordinary idiom — declaring the same variable
+  in several objects and letting the linker fold them into one — cannot be
+  written.
+- The high bits of `st_other` carry machine-specific meaning: the PowerPC64
+  ELFv2 local-entry offset is in bits 5-7.
+
+So there are now declarations that fill the symbol table fields in from the
+source. They are source directives, following axx's division of labour: the
+pattern file describes the machine, the source describes the program.
+
+| Declaration | What it sets |
+|---|---|
+| `.type <name>::<kind>` | the type field of `st_info` (`STT_*`) |
+| `.size <name>::<expr>` | `st_size` |
+| `.weak <name>` | makes the binding `STB_WEAK` |
+| `.hidden <name>` / `.protected <name>` / `.internal <name>` | the visibility in `st_other` (`STV_*`) |
+| `.other <name>::<value>` | the `st_other` byte itself |
+| `.comm <name>::<size>[::<align>]` | an `SHN_COMMON` symbol |
+
+Rules they share:
+
+- Each takes a comma-separated list: `name1::…, name2::…`. The `::` after a name
+  is the same separator as in `.extern name::type`.
+- A declaration may be written anywhere, though as with `.extern` it is safest
+  before the references. The attributes affect the output only, so no address
+  moves.
+- A symbol with no declaration is written as before: `STT_NOTYPE`, size 0,
+  visibility `STV_DEFAULT`.
+
+### 3.1 The kinds `.type` takes
+
+Either a name or a number (0-15). Names are matched without regard to case.
+
+| Kind | `STT_*` | Where it is used |
+|---|---|---|
+| `notype` | 0 | says nothing about the type (the default) |
+| `object` | 1 | data |
+| `func` (`function`) | 2 | the entry point of a function |
+| `section` | 3 | a section symbol |
+| `file` | 4 | a file-name symbol |
+| `common` | 5 | a common symbol |
+| `tls` (`tls_object`) | 6 | thread-local data |
+| `gnu_ifunc` (`ifunc`) | 10 | a GNU indirect function |
+
+### 3.2 `.size` — the value is a word count
+
+Like a label's value it is multiplied by the bytes per word before it goes into
+`st_size`. On an 8-bit machine (the `.bits` default) the multiplier is 1, so the
+number goes in as written. The usual form is the difference against a label
+placed at the end of the function.
+
+```
+func:
+        ...
+func_end:
+        .size   func::func_end-func
+```
+
+### 3.3 `.weak` — it passes the name out
+
+If the name is defined in this file, it is exported exactly as `.global` does,
+with only the binding weakened. A name not yet known is registered exactly as an
+`.extern` with no type name — which is why writing `.weak maybe` alone gives a
+weak reference, one that becomes 0 if it is never resolved.
+
+A symbol declared `.weak` always lands in the global part of the symbol table. It
+has to: ELF does not allow a local symbol to be weak.
+
+### 3.4 `.other` — it replaces the whole byte
+
+The low 2 bits are the visibility (`STV_*`), the high 6 are machine-specific. A
+visibility declaration such as `.hidden` rewrites only the low 2 bits, so writing
+a visibility after `.other` keeps the high bits; written the other way round,
+`.other` overwrites the visibility.
+
+### 3.5 `.comm` — common symbols
+
+Writes an `SHN_COMMON` symbol. The linker creates the storage, so this object
+holds none itself. `st_value` becomes the alignment (in bytes, 1 if not written,
+and 0 or a power of two) and `st_size` the size (the word count times the bytes
+per word). The type is made `STT_OBJECT` unless `.type` says otherwise, as in GNU
+as. The name is registered as an external symbol just as `.extern` does, so it
+can be referenced directly and relocations are emitted against that name.
+
+### 3.6 A worked example
+
+The declarations are ordinary source lines (the machine is described the way
+section 6 describes one; the bundled `elfsym.axx` describes EM_MN10300(89)).
+
+```
+        .extern printf                  ; an ordinary external reference
+        .weak   maybe                   ; a weak reference: undefined is ok
+        .comm   sharedbuf::64::8        ; 64 words, aligned to 8 bytes
+
+        .global func
+        .type   func::func
+        .other  func::0x60              ; st_other written out as a byte
+
+        .weak   altentry                ; a weak definition
+        .type   altentry::func
+
+        .type   helper::func            ; stays local: not in the global part
+        .internal helper
+
+        .global datum
+        .type   datum::object
+        .size   datum::4
+        .protected datum
+
+        .section .text
+func:
+altentry:
+        nop
+        dd      printf
+        dt      datum                   ; a 3-byte field -> R_MN10300_24
+        dw      datum
+        db      datum
+        ret
+func_end:
+        .size   func::func_end-func
+
+helper:
+        nop
+        ret
+
+        .section .data
+datum:
+        dd      sharedbuf
+        dd      maybe
+```
+
+Under `readelf -s`:
+
+```
+   Num:    Value  Size Type    Bind   Vis      Ndx Name
+     0: 00000000     0 NOTYPE  LOCAL  DEFAULT  UND
+     1: 00000000     0 SECTION LOCAL  DEFAULT    1 .text
+     2: 00000000     0 SECTION LOCAL  DEFAULT    2 .data
+     3: 0000000c     0 NOTYPE  LOCAL  DEFAULT    1 func_end
+     4: 0000000c     0 FUNC    LOCAL  INTERNAL    1 helper
+     5: 00000000     0 NOTYPE  WEAK   DEFAULT  UND maybe
+     6: 00000000     0 NOTYPE  GLOBAL DEFAULT  UND printf
+     7: 00000008    64 OBJECT  GLOBAL DEFAULT  COM sharedbuf
+     8: 00000000     0 FUNC    WEAK   DEFAULT    1 altentry
+     9: 00000000     4 OBJECT  GLOBAL PROTECTED    2 datum
+    10: 00000000    12 FUNC    GLOBAL DEFAULT [<other>: 60]     1 func
+```
+
+`func` is `STT_FUNC` with size 12 and the `st_other` byte written as 0x60;
+`altentry` is a weak definition at the same address; `helper` stays local and
+`STV_INTERNAL`; `sharedbuf` is `SHN_COMMON` (`Ndx COM`) with `st_value` the
+alignment 8 and `st_size` 64; `maybe` is a weak reference left undefined.
+
+The bundled `elfsym.axx` / `elfsym.s` are the worked example in the tree. Its
+machine is EM_MN10300(89), which is not in the built-in table, and it also shows
+the field width that is not a power of two (`.elfwidth::3` → `R_MN10300_24`) and
+the section element size (the fifth field of `.elfsection`).
+
+This was checked against a real linker. An object using the same declarations for
+x86-64 passes through GNU ld's `-r` with its types, sizes, weak bindings,
+visibilities and common symbols intact, and a full link gives the common symbol a
+real address and resolves the relocations against it.
+
+---
+
+## 4. How this relates to `-m` and `-f`
 
 | | Written | Not written |
 |---|---|---|
@@ -189,7 +401,7 @@ machine (`-m 62 -f 32`, the real x32 ABI layout) with a warning.
 
 ---
 
-## 4. When a declaration is missing
+## 5. When a declaration is missing
 
 The rule throughout is **never quietly write a broken `.o`**.
 
@@ -201,6 +413,11 @@ The rule throughout is **never quietly write a broken `.o`**.
   misspelling is not silently skipped.
 - The `-g` DWARF sections are written only when the absolute type is known, from
   `.elfdwarf` or the built-in table.
+- An ELF32 `r_info` has only an 8-bit type field. `.elftype` accepts numbers up
+  to 2147483647, so a type above 255 declared for ELF32 would be truncated — and
+  a truncated number **becomes a different type**, which a linker applies wrongly
+  with no diagnostic of its own. Each such type is reported once (and so is a
+  symbol index that does not fit the 24-bit field).
 
 The width guess does one more thing. When the type it guessed is PC-relative but
 the field turns out to hold the label's absolute value, the type is replaced by
@@ -213,7 +430,7 @@ resolves it in `.elftype` declaration order.
 
 ---
 
-## 5. A worked example — EM_MSP430 (105)
+## 6. A worked example — EM_MSP430 (105)
 
 The whole description of a machine axx has no built-in table for:
 
@@ -284,7 +501,7 @@ and the header, as declared:
 
 ---
 
-## 6. The relocation type priority
+## 7. The relocation type priority
 
 The type of one reference can be decided in three places. Strongest first:
 
@@ -333,7 +550,7 @@ The bundled `elfprio.axx` / `elfprio.s` are a worked example.
 
 ---
 
-## 7. A worked example — PowerPC64 (21)
+## 8. A worked example — PowerPC64 (21)
 
 This one lays declarations over a machine that is in the built-in table. The
 bundled `patfile/ppc64.axx` (big-endian, ELFv1) and `patfile/ppc64le.axx`
