@@ -965,11 +965,21 @@ CMP WSP,wm[[,LSL #!a]] ::a<0;10,a>4;10 :: .call w4((1<<30)|(1<<29)|(0x0b<<24)|(1
 /* Branches, exception generation, hints, barriers and system
 /* =================================================================== */
 
-/* Unconditional branch (immediate) */
+/* Unconditional branch (immediate)
+/*
+/* Every branch below holds a word displacement in a bit field of the
+/* instruction word, so with `-o` the field is left to the linker the
+/* same way as ADR/ADRP above. Each group names its type with `.reloc`
+/* and takes it back with `.clrreloc`. */
+.reloc::t::jump26
 B !t ::((t-$$)<-134217728)||((t-$$)>134217724);2 :: .call w4(0x14000000|(((t-$$)>>2)&0x3ffffff))
+.clrreloc::t
+.reloc::t::call26
 BL !t ::((t-$$)<-134217728)||((t-$$)>134217724);2 :: .call w4(0x94000000|(((t-$$)>>2)&0x3ffffff))
+.clrreloc::t
 
 /* Conditional branch */
+.reloc::t::condbr19
 B.cnd !t ::((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4(0x54000000|((((t-$$)>>2)&0x7ffff)<<5)|cnd)
 
 /* Compare and branch */
@@ -980,8 +990,10 @@ B.cnd !t ::((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4(0x54000000|((((t-$$
 !cb("CBZ", 0, "wt", 0)
 !cb("CBNZ", 1, "xt", 1)
 !cb("CBNZ", 1, "wt", 0)
+.clrreloc::t
 
 /* Test bit and branch */
+.reloc::t::tstbr14
 !def tb(nm, op, rt, mx) {
 !{nm} !{rt},#!b,!t ::b<0;3,b>!{mx};3,((t-$$)<-32768)||((t-$$)>32764);2 :: .call w4(((b>>5)<<31)|(0x1b<<25)|(!{op}<<24)|((b&31)<<19)|((((t-$$)>>2)&0x3fff)<<5)|!{rt})
 }
@@ -989,6 +1001,7 @@ B.cnd !t ::((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4(0x54000000|((((t-$$
 !tb("TBZ", 0, "wt", 31)
 !tb("TBNZ", 1, "xt", 63)
 !tb("TBNZ", 1, "wt", 31)
+.clrreloc::t
 
 /* Unconditional branch (register) */
 BR xn :: .call w4(0xd61f0000|(xn<<5))
@@ -1365,7 +1378,9 @@ SYSL xt,#!p,crn,crm,#!q ::p<0;3,p>7;3,q<0;3,q>7;3 :: .call w4(0xd5280000|(p<<16)
 !lsur("STUR", "ff", 3, 1, 0)
 !lsur("LDUR", "ff", 3, 1, 1)
 
-/* Load register (literal) */
+/* Load register (literal). The 19-bit word displacement is the
+/* linker's under `-o`, as for the branches. */
+.reloc::t::ld_prel_lo19
 !def lslit(mn, rt, opc, v) {
 !{mn} !{rt},!t ::((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4((!{opc}<<30)|(3<<27)|(!{v}<<26)|((((t-$$)>>2)&0x7ffff)<<5)|!{rt})
 }
@@ -1376,11 +1391,14 @@ SYSL xt,#!p,crn,crm,#!q ::p<0;3,p>7;3,q<0;3,q>7;3 :: .call w4(0xd5280000|(p<<16)
 !lslit("LDR", "fs", 0, 1)
 !lslit("LDR", "ff", 1, 1)
 !lslit("LDR", "fq", 2, 1)
+.clrreloc::t
 
 /* PRFM also accepts the raw 5-bit prefetch operand in place of a name */
 PRFM #!p,[xb[[,#!o]]] ::p<0;3,p>31;3 :: .call lsoff(3,0,2,o,xb,p,3)
 PRFM #!p,[xb,xm[[,LSL #!a]]] ::p<0;3,p>31;3,(a!=0)&&(a!=3);10 :: .call w4((3<<30)|(7<<27)|(2<<22)|(1<<21)|(xm<<16)|(3<<13)|((a==3?1:0)<<12)|(2<<10)|(xb<<5)|p)
+.reloc::t::ld_prel_lo19
 PRFM #!p,!t ::p<0;3,p>31;3,((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4((3<<30)|(3<<27)|((((t-$$)>>2)&0x7ffff)<<5)|p)
+.clrreloc::t
 PRFUM #!p,[xb[[,#!o]]] ::p<0;3,p>31;3,o<-256;8,o>255;8 :: .call w4((3<<30)|(7<<27)|(2<<22)|((o&0x1ff)<<12)|(xb<<5)|p)
 
 /* Load/store pair. sh is the log2 of the access size, so the scaled

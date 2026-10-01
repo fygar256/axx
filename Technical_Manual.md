@@ -1377,6 +1377,7 @@ declares its own with `.elffield`, section 3.7.7). The data types
 | `call26` / `jump26` | 283 / 282 | imm26 of `bl` / `b` |
 | `condbr19` | 280 | imm19 of `b.cond`, `cbz` |
 | `tstbr14` | 279 | imm14 of `tbz` / `tbnz` |
+| `ld_prel_lo19` | 273 | imm19 of a literal `ldr` / `ldrsw` / `prfm` |
 | `adr_prel_lo21` | 274 | immlo/immhi of `adr` |
 | `adr_prel_pg_hi21` (`adrp`) | 275 | immlo/immhi of `adrp` |
 | `adr_prel_pg_hi21_nc` | 276 | the same, without the overflow check |

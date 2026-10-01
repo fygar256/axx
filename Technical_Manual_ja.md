@@ -1284,6 +1284,7 @@ AArch64 で使える命令フィールド型は次のとおりです。データ
 | `call26` / `jump26` | 283 / 282 | `bl` / `b` の imm26 |
 | `condbr19` | 280 | `b.cond`、`cbz` の imm19 |
 | `tstbr14` | 279 | `tbz` / `tbnz` の imm14 |
+| `ld_prel_lo19` | 273 | リテラル `ldr` / `ldrsw` / `prfm` の imm19 |
 | `adr_prel_lo21` | 274 | `adr` の immlo/immhi |
 | `adr_prel_pg_hi21` (`adrp`) | 275 | `adrp` の immlo/immhi |
 | `adr_prel_pg_hi21_nc` | 276 | 同上、オーバーフロー検査なし |

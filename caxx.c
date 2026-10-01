@@ -2444,6 +2444,7 @@ static const ElfNamedReloc _named_aarch64[] = {
     {"movw_prel_g1", 289, 4}, {"movw_prel_g1_nc", 290, 4},
     {"movw_prel_g2", 291, 4}, {"movw_prel_g2_nc", 292, 4},
     {"movw_prel_g3", 293, 4},
+    {"ld_prel_lo19", 273, 4},
     {"adr_prel_lo21", 274, 4},
     {"adr_prel_pg_hi21", 275, 4}, {"adrp", 275, 4},
     {"adr_prel_pg_hi21_nc", 276, 4},
@@ -2476,7 +2477,7 @@ static uint32_t insn_reloc_field_mask_tbl(int rtype){
     case 286: case 299:
         return 0xfffu << 10;
     case 279: return 0x3fffu << 5;
-    case 280: case 309: return 0x7ffffu << 5;
+    case 273: case 280: case 309: return 0x7ffffu << 5;
     case 311: return (3u << 29) | (0x7ffffu << 5);
     case 312: case 313: return 0xfffu << 10;
     case 282: case 283: return 0x3ffffffu;
