@@ -153,6 +153,9 @@ bf_riscv64.s                        brainfuck interpreter written in RISC-V
                                     riscv64full.axx into an ELF object (-o);
                                     links with ld.lld / GNU ld and runs under
                                     qemu-riscv64: qemu-riscv64 ./bf prog.bf
+bf_riscv64_freebsd.s                the same for FreeBSD/riscv64 (syscall number
+                                    in t0, FreeBSD numbers, errors in t0);
+                                    assembly checked only
 endsub.axx                          pattern file for closing a `.sub` block with
                                     `.endsub` instead of `.return`: the two
                                     spellings mean the same thing and can be
