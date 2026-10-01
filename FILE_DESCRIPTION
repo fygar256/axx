@@ -147,6 +147,12 @@ riscv64full.s                       test assemble file for riscv64full.axx:
 riscv64full_reloc.s                 every relocation riscv64full.axx declares,
                                     against external symbols, for -o:
                                     axx riscv64full.axx riscv64full_reloc.s -o out.o
+bf_riscv64.s                        brainfuck interpreter written in RISC-V
+                                    assembly (axx syntax), a port of
+                                    bf_aarch64.s. assembles with
+                                    riscv64full.axx into an ELF object (-o);
+                                    links with ld.lld / GNU ld and runs under
+                                    qemu-riscv64: qemu-riscv64 ./bf prog.bf
 endsub.axx                          pattern file for closing a `.sub` block with
                                     `.endsub` instead of `.return`: the two
                                     spellings mean the same thing and can be
