@@ -1,0 +1,2186 @@
+/* ===================================================================
+/* riscv64full.axx -- RISC-V (RV64) pattern file for axx, full coverage
+/*
+/* A superset of riscv64.axx, in the same style: the macro layer writes
+/* the regular tables, the mini language does the encodings that no
+/* single expression can state (li, the scattered B / J fields, the
+/* vector configuration). The syntax is that of the GNU / LLVM
+/* assemblers; an instruction can be written in either case with any
+/* spacing, and a comment starts with ';' (as in every axx source).
+/*
+/* Coverage
+/*   RV64I (and the RV32I subset)   every instruction of the base set;
+/*                   FENCE with its pred/succ sets, FENCE.TSO, PAUSE,
+/*                   ECALL, EBREAK, FENCE.I (Zifencei); Zicsr with the
+/*                   CSR names of the user, supervisor, hypervisor,
+/*                   machine and debug levels or a number
+/*   M               MUL / DIV / REM and the W forms
+/*   A               LR / SC / AMO, .W .D (and Zabha .B .H), each with
+/*                   the .aq / .rl / .aqrl suffixes; Zacas (AMOCAS
+/*                   .W .D .Q); Zawrs
+/*   F D Q Zfh Zfa   loads and stores, arithmetic with the optional
+/*                   rounding-mode operand, fused multiply-add,
+/*                   conversions, compares, classify, moves, the
+/*                   Zfhmin / Zfbfmin conversions, Zfa (FLI, FMINM,
+/*                   FMAXM, FROUND, FROUNDNX, FLEQ, FLTQ, FCVTMOD.W.D)
+/*   C               the RVC set of RV64 with the double precision
+/*                   loads and stores (Zca, Zcd), Zcb, Zcmp, Zcmt, Zcmop
+/*   B and K         Zba Zbb Zbc Zbs, Zbkb Zbkc Zbkx, and the scalar
+/*                   cryptography Zknd Zkne Zknh Zksed Zksh
+/*   Zicond, Zicbom / Zicboz / Zicbop, Zihintntl, Zimop, Zicfiss and
+/*   Zicfilp (SSPUSH, SSPOPCHK, SSRDP, SSAMOSWAP, LPAD)
+/*   Privileged      SRET MRET MNRET DRET WFI, SFENCE.VMA and the
+/*                   Svinval group, the H extension (HFENCE.*, HINVAL.*,
+/*                   HLV.*, HLVX.*, HSV.*)
+/*   V               the vector extension 1.0: vsetvli / vsetivli /
+/*                   vsetvl; unit-stride, strided, indexed, segment,
+/*                   fault-only-first, mask and whole-register loads and
+/*                   stores; integer, fixed point, floating point,
+/*                   widening, narrowing, reduction, mask, permutation
+/*                   and conversion operations, with the optional v0.t
+/*                   mask; Zvbb, Zvbc, Zvkg, Zvkned, Zvknha / Zvknhb,
+/*                   Zvksed, Zvksh, Zvfbfmin, Zvfbfwma
+/*   Pseudo          nop, li (any 64-bit constant), mv, not, neg, negw,
+/*                   sext.w, zext.b / .h / .w, seqz, snez, sltz, sgtz,
+/*                   beqz ... bleu, j, jr, jalr, ret, call, tail, jump,
+/*                   la, lla, the global load and store forms (lw a0,sym
+/*                   / sw a0,sym,t0 / flw ft0,sym,t0 ...), csrr / csrw /
+/*                   csrs / csrc and their immediate forms, rdcycle,
+/*                   rdtime, rdinstret, frcsr ... fsflagsi, fmv.s /
+/*                   fabs.s / fneg.s (.d .h .q), fgt / fge, vmv.v.*,
+/*                   vneg, vnot, vfneg, vfabs, vmmv, vmclr, vmset,
+/*                   vmnot, vncvt, vwcvt, vmsgt.vv ... vmsgeu.vi, and
+/*                   the pre-1.0 vector names (vpopc.m, vmandnot.mm ...)
+/*
+/* Not covered
+/*   - the RV32-only forms (the *H CSRs, rdcycleh, zip / unzip, fmvh.x.d,
+/*     fmvp.d.x, c.jal, c.flw, c.fsw ...);
+/*   - Zfinx / Zdinx / Zhinx (floating point in the integer registers);
+/*   - vmsge.vx and vmsgeu.vx, which GNU as expands to two instructions;
+/*   - the GOT / TLS pseudos lga, la.tls.ie, la.tls.gd, tls_le ... and
+/*     %tprel_add, whose relocation pairs cannot be written as one row;
+/*   - the vendor extensions (Xthead*, Xventana*, ...).
+/*
+/* Registers. x0-x31, the ABI names (zero ra sp gp tp t0-t6 s0-s11 fp
+/* a0-a7), f0-f31, the floating point ABI names (ft0-ft11 fs0-fs11
+/* fa0-fa7) and v0-v31. They are pattern-file symbols, so an assembly
+/* label may not share a name with one (a label called f1 or v2 is
+/* refused; give labels longer names).
+/*
+/* Compressed instructions are only ever written explicitly (c.addi,
+/* c.lw ...). Nothing is compressed on its own, as with
+/* `.option norvc`, and a branch is never relaxed or inverted.
+/*
+/* Data directives. DB, HALF (2 bytes), WORD and DWORD (4 bytes), QUAD
+/* (8 bytes), FLOAT and DOUBLE. DWORD stays 4 bytes as in riscv64.axx.
+/* A symbol in WORD / DWORD / QUAD gets R_RISCV_32 / R_RISCV_64.
+/*
+/* ELF output (-o). The relocation types of the RISC-V psABI that an
+/* instruction can carry are declared below and every operand that can
+/* hold a symbol is typed with .reloc, so an object links with GNU ld
+/* and LLD: BRANCH, JAL, CALL_PLT, PCREL_HI20 / LO12_I / LO12_S, HI20,
+/* LO12_I / LO12_S, GOT_HI20, TLS_GOT_HI20, TLS_GD_HI20, TPREL_HI20,
+/* TPREL_LO12_I / LO12_S, RVC_BRANCH and RVC_JUMP.
+/*
+/* Limits of a one-row-one-instruction model
+/*   - R_RISCV_RELAX is not emitted, so a linker does not relax.
+/*   - %pcrel_lo(label) names the label of the AUIPC. In the object the
+/*     relocation is right; in a flat binary (-b) its field is 0.
+/*   - la / lla and the global load / store forms work out the
+/*     pc-relative offset themselves, so they are exact for a target in
+/*     the same section (or in a flat binary), and not for a symbol of
+/*     another section or an external one. There, write the explicit
+/*     auipc + addi / %pcrel_hi / %pcrel_lo pair, which carries the
+/*     relocations. call, tail and jump are one relocation over the
+/*     auipc + jalr pair and work for an external symbol.
+/*   - li of a label or an expression is encoded once the value is
+/*     known, so its length can differ between the passes.
+/*   - li chooses the same instruction sequence as LLVM for nearly every
+/*     constant; where it differs (LLVM splits a last out-of-range addi
+/*     in two) the sequence is as short or one instruction longer, and
+/*     always loads the same value.
+/*
+/* Verification. Every row was assembled with LLVM's llvm-mc (version
+/* 18, RISC-V target, every extension enabled) and with axx, over many
+/* operand choices (every register file, the limits of every immediate,
+/* every rounding mode, every aq / rl combination, every EEW and segment
+/* count, masked and unmasked), and the bytes are identical. With -o the
+/* relocation entries (offset, type, symbol, addend) and the linked
+/* image (ld.lld) are identical to those of llvm-mc, except that LLVM
+/* turns a conditional branch to an external symbol into an inverted
+/* branch plus a jal, where this file, like GNU as, writes R_RISCV_BRANCH.
+/* The C (caxx) and Python (axx.py) implementations give identical
+/* output. What the LLVM version above does not know was written from
+/* the specifications and is not checked against an assembler: the Q
+/* instructions (checked against the D encodings with the format field
+/* changed), Zabha, vwsll, mnret, c.ntl.*, c.sspush and c.sspopchk. See
+/* riscv64full.s (the rows) and riscv64full_reloc.s (every relocation).
+/*
+/* Assemble and link with:
+/*   axx riscv64full.axx prog.s -o out.o
+/*   ld -m elf64lriscv -o out out.o
+/* =================================================================== */
+
+.bits::8
+.elfmachine::243::RISC-V
+.elfclass::64
+.elfrela::1
+/* .elfheader::flags::5 would mark RVC + the double-float ABI. It is left
+/* at 0 so the object mixes with any other; set it for your own ABI. */
+
+.error::2::"branch or jump target out of range, or not a multiple of 2"
+.error::3::"immediate value out of range"
+.error::5::"register out of range for this instruction"
+.error::8::"displacement out of range or not suitably aligned"
+.error::10::"shift amount, mask or field value out of range"
+
+/* --- relocation types of the RISC-V psABI ------------------------- */
+/*     name             number width pc-relative                      */
+.elftype::branch::16::4::1          /* R_RISCV_BRANCH                  */
+.elftype::jal::17::4::1             /* R_RISCV_JAL                     */
+.elftype::call::19::8::1            /* R_RISCV_CALL_PLT (auipc + jalr)  */
+.elftype::got_hi20::20::4::1        /* R_RISCV_GOT_HI20                */
+.elftype::tls_got_hi20::21::4::1    /* R_RISCV_TLS_GOT_HI20            */
+.elftype::tls_gd_hi20::22::4::1     /* R_RISCV_TLS_GD_HI20             */
+.elftype::pcrel_hi20::23::4::1      /* R_RISCV_PCREL_HI20              */
+.elftype::pcrel_lo12_i::24::4::1    /* R_RISCV_PCREL_LO12_I            */
+.elftype::pcrel_lo12_s::25::4::1    /* R_RISCV_PCREL_LO12_S            */
+.elftype::hi20::26::4               /* R_RISCV_HI20  (lui)             */
+.elftype::lo12_i::27::4             /* R_RISCV_LO12_I                  */
+.elftype::lo12_s::28::4             /* R_RISCV_LO12_S                  */
+.elftype::tprel_hi20::29::4         /* R_RISCV_TPREL_HI20              */
+.elftype::tprel_lo12_i::30::4       /* R_RISCV_TPREL_LO12_I            */
+.elftype::tprel_lo12_s::31::4       /* R_RISCV_TPREL_LO12_S            */
+.elftype::rvc_branch::44::2::1      /* R_RISCV_RVC_BRANCH              */
+.elftype::rvc_jump::45::2::1        /* R_RISCV_RVC_JUMP                */
+
+/* --- which bits of the instruction the linker writes -------------- */
+.elffield::hi20::0xfffff000
+.elffield::got_hi20::0xfffff000
+.elffield::tls_got_hi20::0xfffff000
+.elffield::tls_gd_hi20::0xfffff000
+.elffield::pcrel_hi20::0xfffff000
+.elffield::tprel_hi20::0xfffff000
+.elffield::jal::0xfffff000            /* J-type, scattered           */
+.elffield::lo12_i::0xfff00000         /* I-type imm[11:0]            */
+.elffield::pcrel_lo12_i::0xfff00000
+.elffield::tprel_lo12_i::0xfff00000
+.elffield::lo12_s::0xfe000f80         /* S-type, split               */
+.elffield::pcrel_lo12_s::0xfe000f80
+.elffield::tprel_lo12_s::0xfe000f80
+.elffield::branch::0xfe000f80         /* B-type, split               */
+.elffield::rvc_branch::0x1c7c         /* CB-type, scattered          */
+.elffield::rvc_jump::0x1ffc           /* CJ-type, scattered          */
+/* a call is two words: auipc's U field, then jalr's I field, read as
+/* one little-endian 8-byte integer */
+.elffield::call::0xfff00000fffff000
+
+/* --- data references (the built-in table already has these) ------- */
+.elfwidth::8::abs64            /* R_RISCV_64                      */
+.elfwidth::4::abs32            /* R_RISCV_32                      */
+.elfwidth::2::0                /* no absolute 16-bit type exists  */
+.elfwidth::1::0                /* no absolute 8-bit type exists   */
+.elfextern::abs64
+.elfdwarf::abs64
+
+/* ===================================================================
+/* Registers
+/* =================================================================== */
+!def regs(p, n) {
+!local i = 0
+!while i <= n {
+.setsym::!{p}!{i}::!{i}
+!set i = i + 1
+}
+}
+!regs("X", 31)
+!regs("F", 31)
+!regs("V", 31)
+.setsym::ZERO::0
+.setsym::RA::1
+.setsym::SP::2
+.setsym::GP::3
+.setsym::TP::4
+.setsym::T0::5
+.setsym::T1::6
+.setsym::T2::7
+.setsym::S0::8
+.setsym::FP::8
+.setsym::S1::9
+!def aregs(p, base, n) {
+!local i = 0
+!while i <= n {
+.setsym::!{p}!{i}::!{base + i}
+!set i = i + 1
+}
+}
+!aregs("A", 10, 7)           /* a0..a7   -> 10..17                   */
+!aregs("FT", 0, 7)           /* ft0..ft7 -> f0..f7                   */
+!aregs("FA", 10, 7)          /* fa0..fa7 -> f10..f17                 */
+/* s2..s11 -> 18..27 (s0 = fp and s1 are 8 and 9, set above) */
+!def sregs() {
+!local i = 2
+!while i <= 11 {
+.setsym::S!{i}::!{16 + i}
+.setsym::FS!{i}::!{16 + i}
+!set i = i + 1
+}
+}
+!sregs()
+.setsym::FS0::8
+.setsym::FS1::9
+.setsym::T3::28
+.setsym::T4::29
+.setsym::T5::30
+.setsym::T6::31
+.setsym::FT8::28
+.setsym::FT9::29
+.setsym::FT10::30
+.setsym::FT11::31
+
+/* The register classes, as sets (section 3.6.2), and the variable
+/* names that carry them. A variable name alone decides which register
+/* file an operand takes:
+/*   d s t        integer rd rs1 rs2
+/*   fd fs ft fu  floating point rd rs1 rs2 rs3
+/*   vd vs vt     vector vd vs2 vs1 (see the V section)
+/*   cd cs ct     compressed integer x8-x15 (rd' rs1' rs2')
+/*   cfd cft      compressed floating point f8-f15 */
+!def regset(nm, p, n, abi) {
+!local i = 0
+!local l = ""
+!while i <= n {
+!if i > 0 !then {
+!set l = l + ","
+}
+!set l = l + p + str(i)
+!set i = i + 1
+}
+.setsym::!{nm}::!{l}!{abi}
+}
+!regset("XN", "X", 31, "")
+!regset("FN", "F", 31, "")
+!regset("VN", "V", 31, "")
+.setsym::XABI::ZERO,RA,SP,GP,TP,T0,T1,T2,S0,FP,S1,A0,A1,A2,A3,A4,A5,A6,A7,S2,S3,S4,S5,S6,S7,S8,S9,S10,S11,T3,T4,T5,T6
+.setsym::FABI::FT0,FT1,FT2,FT3,FT4,FT5,FT6,FT7,FS0,FS1,FA0,FA1,FA2,FA3,FA4,FA5,FA6,FA7,FS2,FS3,FS4,FS5,FS6,FS7,FS8,FS9,FS10,FS11,FT8,FT9,FT10,FT11
+.setsym::GPR::XN,XABI
+.setsym::FPR::FN,FABI
+.setsym::CGPR::X8,X9,X10,X11,X12,X13,X14,X15,S0,FP,S1,A0,A1,A2,A3,A4,A5
+.setsym::CFPR::F8,F9,F10,F11,F12,F13,F14,F15,FS0,FS1,FA0,FA1,FA2,FA3,FA4,FA5
+.check::d::GPR
+.check::s::GPR
+.check::t::GPR
+.check::fd::FPR
+.check::fs::FPR
+.check::ft::FPR
+.check::fu::FPR
+.check::vd::VN
+.check::vs::VN
+.check::vt::VN
+.check::cd::CGPR
+.check::cs::CGPR
+.check::ct::CGPR
+.check::cfd::CFPR
+.check::cft::CFPR
+
+/* ===================================================================
+/* Word emitters (mini language, section 3.15)
+/*
+/* w4: a 32-bit word, little endian. w2: a 16-bit word.
+/* b4 / j4: the scattered B-type and J-type words.
+/* =================================================================== */
+.func w4(z)
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+.func w2(z)
+.return [z & 0xff, (z >> 8) & 0xff]
+.endfunc
+
+/* B-type: imm[12|10:5] | rs2 | rs1 | funct3 | imm[4:1|11] | opcode */
+.func b4(off, rs2, rs1, f3)
+z = (((off >> 12) & 1) << 31) | (((off >> 5) & 0x3f) << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (((off >> 1) & 0xf) << 8) | (((off >> 11) & 1) << 7) | 0x63
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+/* J-type: imm[20|10:1|11|19:12] | rd | opcode */
+.func j4(off, rd)
+z = (((off >> 20) & 1) << 31) | (((off >> 1) & 0x3ff) << 21) | (((off >> 11) & 1) << 20) | (((off >> 12) & 0xff) << 12) | (rd << 7) | 0x6f
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+/* two words: auipc / lui style first word, then a second word */
+.func w8(a, b)
+.emit(a & 0xff, (a >> 8) & 0xff, (a >> 16) & 0xff, (a >> 24) & 0xff)
+.emit(b & 0xff, (b >> 8) & 0xff, (b >> 16) & 0xff, (b >> 24) & 0xff)
+.return
+.endfunc
+
+/* pc-relative pair: auipc rd,%pcrel_hi(off) ; second word with
+/* the %pcrel_lo(off) in its I-type field (second = base word without
+/* the immediate; rs/rd already in it). op2 is a function of the
+/* low 12 bits: second | ((off & 0xfff) << 20) for I-type,
+/* S-type split for a store. */
+.func pair_i(off, rd, second)
+a = 0x00000017 | ((((off + 0x800) >> 12) & 0xfffff) << 12) | (rd << 7)
+b = second | ((off & 0xfff) << 20)
+.emit(a & 0xff, (a >> 8) & 0xff, (a >> 16) & 0xff, (a >> 24) & 0xff)
+.emit(b & 0xff, (b >> 8) & 0xff, (b >> 16) & 0xff, (b >> 24) & 0xff)
+.return
+.endfunc
+
+.func pair_s(off, rt, second)
+a = 0x00000017 | ((((off + 0x800) >> 12) & 0xfffff) << 12) | (rt << 7)
+b = second | (((off >> 5) & 0x7f) << 25) | ((off & 0x1f) << 7)
+.emit(a & 0xff, (a >> 8) & 0xff, (a >> 16) & 0xff, (a >> 24) & 0xff)
+.emit(b & 0xff, (b >> 8) & 0xff, (b >> 16) & 0xff, (b >> 24) & 0xff)
+.return
+.endfunc
+
+/* li: the constant materialisation LLVM and GNU use for RV64.
+/* lseq returns the sequence as pairs [kind, imm, kind, imm ...]:
+/*   kind 0 LUI   1 ADDI   2 ADDIW   3 SLLI   4 SRLI
+/* li4 turns one into words; the sequence starts from the value
+/* split into a low 12 bits and a (shifted) remainder, and is tried
+/* again from the value with its trailing zeros removed and from -1
+/* shifted right, keeping the shortest. */
+.func lseq(val)
+r = []
+lo = ((val & 0xfff) ^ 0x800) - 0x800
+.if val >= -2147483648 && val <= 2147483647 .then
+hi = ((val + 0x800) >> 12) & 0xfffff
+n = 0
+.if hi != 0 .then
+r[n] = 0
+r[n + 1] = hi
+n = n + 2
+.endif
+.if lo != 0 || hi == 0 .then
+r[n] = 1
+.if hi != 0 .then
+r[n] = 2
+.endif
+r[n + 1] = lo
+.endif
+.return r
+.endif
+hi52 = (val + 0x800) >> 12
+sh = 12
+.while (hi52 & 1) == 0
+hi52 = hi52 >> 1
+sh = sh + 1
+.endwhile
+.if sh > 12 && (hi52 < -2048 || hi52 > 2047) .then
+t = hi52 << 12
+.if t >= -2147483648 && t <= 2147483647 .then
+sh = sh - 12
+hi52 = t
+.endif
+.endif
+r = .call lseq(hi52)
+n = .len(r)
+r[n] = 3
+r[n + 1] = sh
+.if lo != 0 .then
+r[n + 2] = 1
+r[n + 3] = lo
+.endif
+.return r
+.endfunc
+
+.func li4(rd, val)
+val = ((val & 0xffffffffffffffff) ^ 0x8000000000000000) - 0x8000000000000000
+q = .call lseq(val)
+.if (val & 0xfff) != 0 && (val & 1) == 0 && .len(q) >= 4 .then
+tz = 0
+.while ((val >> tz) & 1) == 0
+tz = tz + 1
+.endwhile
+sv = val >> tz
+q2 = .call lseq(sv)
+q2[.len(q2)] = 3
+q2[.len(q2)] = tz
+.if .len(q2) < .len(q) || (sv >= -32 && sv <= 31) .then
+q = q2
+.endif
+.endif
+.if val > 0 && .len(q) > 4 .then
+lz = 0
+.while ((val >> (63 - lz)) & 1) == 0
+lz = lz + 1
+.endwhile
+sv = (((val << lz) & 0xffffffffffffffff) | ((1 << lz) - 1))
+sv = (sv ^ 0x8000000000000000) - 0x8000000000000000
+q2 = .call lseq(sv)
+q2[.len(q2)] = 4
+q2[.len(q2)] = lz
+.if .len(q2) < .len(q) .then
+q = q2
+.endif
+.endif
+rs = 0
+.for i in range(.len(q) / 2)
+kd = q[i * 2]
+im = q[i * 2 + 1]
+.if kd == 0 .then
+w = (im << 12) | (rd << 7) | 0x37
+.elif kd == 1 .then
+w = ((im & 0xfff) << 20) | (rs << 15) | (rd << 7) | 0x13
+.elif kd == 2 .then
+w = ((im & 0xfff) << 20) | (rs << 15) | (rd << 7) | 0x1b
+.elif kd == 3 .then
+w = (im << 20) | (rs << 15) | (1 << 12) | (rd << 7) | 0x13
+.else
+w = (im << 20) | (rs << 15) | (5 << 12) | (rd << 7) | 0x13
+.endif
+.emit(w & 0xff, (w >> 8) & 0xff, (w >> 16) & 0xff, (w >> 24) & 0xff)
+rs = rd
+.next
+.return
+.endfunc
+
+/* ===================================================================
+/* Row generators (macro layer, section 7)
+/*
+/* Z emits one row: nm, the operand text, the error list, the constant
+/* part of the word, and the operand fields or'ed into it.
+/* =================================================================== */
+!def Z(nm, ops, er, base, fx) {
+!local head = nm
+!if ops != "" !then {
+!set head = nm + " " + ops
+}
+!if er == "" !then {
+!{head} :: .call w4(0x!{base:08x}!{fx})
+} !else {
+!{head} :: !{er} :: .call w4(0x!{base:08x}!{fx})
+}
+}
+
+/* the range tests */
+!def E12() {
+!return "v>2047||v<-2048;3"
+}
+!def EBR() {
+!return "(v-$$)>4094||(v-$$)<-4096||((v-$$)&1)!=0;2"
+}
+!def EJ() {
+!return "(v-$$)>1048574||(v-$$)<-1048576||((v-$$)&1)!=0;2"
+}
+
+/* R-type: nm d,s,t */
+!def Rr(nm, f7, f3, op) {
+!Z(nm, "d,s,t", "", (f7 << 25) | (f3 << 12) | op, "|(t<<20)|(s<<15)|(d<<7)")
+}
+
+/* I-type arithmetic: plain, %lo, %pcrel_lo, %tprel_lo */
+!def Ri(nm, f3, op) {
+!local b = (f3 << 12) | op
+!Z(nm, "d,s,!v", E12(), b, "|((v&0xfff)<<20)|(s<<15)|(d<<7)")
+.reloc::v::lo12_i
+!Z(nm, "d,s,%LO(!v)", "", b, "|((v&0xfff)<<20)|(s<<15)|(d<<7)")
+.clrreloc::v
+.reloc::v::pcrel_lo12_i
+!Z(nm, "d,s,%PCREL_LO(!v)", "", b, "|((v&0)<<20)|(s<<15)|(d<<7)")
+.clrreloc::v
+.reloc::v::tprel_lo12_i
+!Z(nm, "d,s,%TPREL_LO(!v)", "", b, "|((v&0xfff)<<20)|(s<<15)|(d<<7)")
+.clrreloc::v
+}
+
+/* shift by an immediate: bits is 6 (RV64) or 5 (the W forms) */
+!def Rsh(nm, hi, f3, op, bits) {
+!Z(nm, "d,s,!v", "v<0||v>" + str((1 << bits) - 1) + ";10", (hi << 20) | (f3 << 12) | op, "|(v<<20)|(s<<15)|(d<<7)")
+}
+
+/* loads: rd is d for the integer file, fd for the floating one */
+!def ldm(nm, f3, op, rd) {
+!local b = (f3 << 12) | op
+!Z(nm, rd + ",!v(s)", "v>2047||v<-2048;8", b, "|((v&0xfff)<<20)|(s<<15)|(" + rd + "<<7)")
+!Z(nm, rd + ",(s)", "", b, "|(s<<15)|(" + rd + "<<7)")
+.reloc::v::lo12_i
+!Z(nm, rd + ",%LO(!v)(s)", "", b, "|((v&0xfff)<<20)|(s<<15)|(" + rd + "<<7)")
+.clrreloc::v
+.reloc::v::pcrel_lo12_i
+!Z(nm, rd + ",%PCREL_LO(!v)(s)", "", b, "|((v&0)<<20)|(s<<15)|(" + rd + "<<7)")
+.clrreloc::v
+.reloc::v::tprel_lo12_i
+!Z(nm, rd + ",%TPREL_LO(!v)(s)", "", b, "|((v&0xfff)<<20)|(s<<15)|(" + rd + "<<7)")
+.clrreloc::v
+}
+
+/* stores: rt is t for the integer file, ft for the floating one */
+!def stm(nm, f3, op, rt) {
+!local b = (f3 << 12) | op
+!local sp = "|(((v>>5)&0x7f)<<25)|((v&0x1f)<<7)|(" + rt + "<<20)|(s<<15)"
+!Z(nm, rt + ",!v(s)", "v>2047||v<-2048;8", b, sp)
+!Z(nm, rt + ",(s)", "", b, "|(s<<15)|(" + rt + "<<20)")
+.reloc::v::lo12_s
+!Z(nm, rt + ",%LO(!v)(s)", "", b, sp)
+.clrreloc::v
+.reloc::v::pcrel_lo12_s
+!Z(nm, rt + ",%PCREL_LO(!v)(s)", "", b, "|((v&0)<<7)|(s<<15)|(" + rt + "<<20)")
+.clrreloc::v
+.reloc::v::tprel_lo12_s
+!Z(nm, rt + ",%TPREL_LO(!v)(s)", "", b, sp)
+.clrreloc::v
+}
+
+/* conditional branches. Bc: nm s,t,target. Bs: the operands swapped
+/* (bgt, ble ...). Bz: against zero, side 0 = rs1, side 1 = rs2. */
+!def Bc(nm, f3) {
+.reloc::v::branch
+!{nm} s,t,!v :: !{EBR()} :: .call b4(v-$$,t,s,!{f3})
+.clrreloc::v
+}
+!def Bs(nm, f3) {
+.reloc::v::branch
+!{nm} s,t,!v :: !{EBR()} :: .call b4(v-$$,s,t,!{f3})
+.clrreloc::v
+}
+!def Bz(nm, f3, side) {
+.reloc::v::branch
+!if side == 0 !then {
+!{nm} s,!v :: !{EBR()} :: .call b4(v-$$,0,s,!{f3})
+} !else {
+!{nm} s,!v :: !{EBR()} :: .call b4(v-$$,s,0,!{f3})
+}
+.clrreloc::v
+}
+
+/* ===================================================================
+/* RV32I / RV64I
+/* =================================================================== */
+
+/* -- U-type: lui / auipc, and the modifiers ------------------------ */
+.reloc::v::hi20
+LUI d,%HI(!v) :: .call w4(0x37|((((v+0x800)>>12)&0xfffff)<<12)|(d<<7))
+.clrreloc::v
+.reloc::v::tprel_hi20
+LUI d,%TPREL_HI(!v) :: .call w4(0x37|((((v+0x800)>>12)&0xfffff)<<12)|(d<<7))
+.clrreloc::v
+.reloc::v::pcrel_hi20
+AUIPC d,%PCREL_HI(!v) :: .call w4(0x17|((((v-$$+0x800)>>12)&0xfffff)<<12)|(d<<7))
+.clrreloc::v
+.reloc::v::got_hi20
+AUIPC d,%GOT_PCREL_HI(!v) :: .call w4(0x17|((v&0)<<12)|(d<<7))
+.clrreloc::v
+.reloc::v::tls_got_hi20
+AUIPC d,%TLS_IE_PCREL_HI(!v) :: .call w4(0x17|((v&0)<<12)|(d<<7))
+.clrreloc::v
+.reloc::v::tls_gd_hi20
+AUIPC d,%TLS_GD_PCREL_HI(!v) :: .call w4(0x17|((v&0)<<12)|(d<<7))
+.clrreloc::v
+LUI d,!v :: v>1048575||v<-524288;3 :: .call w4(0x37|((v&0xfffff)<<12)|(d<<7))
+AUIPC d,!v :: v>1048575||v<-524288;3 :: .call w4(0x17|((v&0xfffff)<<12)|(d<<7))
+
+/* -- jumps --------------------------------------------------------- */
+.reloc::v::jal
+JAL d,!v :: !{EJ()} :: .call j4(v-$$,d)
+JAL !v :: !{EJ()} :: .call j4(v-$$,1)
+J !v :: !{EJ()} :: .call j4(v-$$,0)
+.clrreloc::v
+!Z("JALR", "d,!v(s)", E12(), 0x67, "|((v&0xfff)<<20)|(s<<15)|(d<<7)")
+!Z("JALR", "d,s,!v", E12(), 0x67, "|((v&0xfff)<<20)|(s<<15)|(d<<7)")
+!Z("JALR", "d,(s)", "", 0x67, "|(s<<15)|(d<<7)")
+!Z("JALR", "d,s", "", 0x67, "|(s<<15)|(d<<7)")
+!Z("JALR", "s", "", 0x67 | (1 << 7), "|(s<<15)")
+.reloc::v::lo12_i
+!Z("JALR", "d,%LO(!v)(s)", "", 0x67, "|((v&0xfff)<<20)|(s<<15)|(d<<7)")
+.clrreloc::v
+.reloc::v::pcrel_lo12_i
+!Z("JALR", "d,%PCREL_LO(!v)(s)", "", 0x67, "|((v&0)<<20)|(s<<15)|(d<<7)")
+.clrreloc::v
+!Z("JR", "s", "", 0x67, "|(s<<15)")
+!Z("RET", "", "", 0x00008067, "")
+
+/* -- branches ------------------------------------------------------ */
+!Bc("BEQ", 0)
+!Bc("BNE", 1)
+!Bc("BLT", 4)
+!Bc("BGE", 5)
+!Bc("BLTU", 6)
+!Bc("BGEU", 7)
+!Bs("BGT", 4)
+!Bs("BLE", 5)
+!Bs("BGTU", 6)
+!Bs("BLEU", 7)
+!Bz("BEQZ", 0, 0)
+!Bz("BNEZ", 1, 0)
+!Bz("BLTZ", 4, 0)
+!Bz("BGEZ", 5, 0)
+!Bz("BGTZ", 4, 1)
+!Bz("BLEZ", 5, 1)
+
+/* -- loads and stores ---------------------------------------------- */
+!ldm("LB", 0, 0x03, "d")
+!ldm("LH", 1, 0x03, "d")
+!ldm("LW", 2, 0x03, "d")
+!ldm("LD", 3, 0x03, "d")
+!ldm("LBU", 4, 0x03, "d")
+!ldm("LHU", 5, 0x03, "d")
+!ldm("LWU", 6, 0x03, "d")
+!stm("SB", 0, 0x23, "t")
+!stm("SH", 1, 0x23, "t")
+!stm("SW", 2, 0x23, "t")
+!stm("SD", 3, 0x23, "t")
+
+/* -- OP-IMM / OP-IMM-32 -------------------------------------------- */
+!Ri("ADDI", 0, 0x13)
+!Ri("SLTI", 2, 0x13)
+!Ri("SLTIU", 3, 0x13)
+!Ri("XORI", 4, 0x13)
+!Ri("ORI", 6, 0x13)
+!Ri("ANDI", 7, 0x13)
+!Ri("ADDIW", 0, 0x1b)
+!Rsh("SLLI", 0x000, 1, 0x13, 6)
+!Rsh("SRLI", 0x000, 5, 0x13, 6)
+!Rsh("SRAI", 0x400, 5, 0x13, 6)
+!Rsh("SLLIW", 0x000, 1, 0x1b, 5)
+!Rsh("SRLIW", 0x000, 5, 0x1b, 5)
+!Rsh("SRAIW", 0x400, 5, 0x1b, 5)
+
+/* -- OP / OP-32 ---------------------------------------------------- */
+!Rr("ADD", 0x00, 0, 0x33)
+!Rr("SUB", 0x20, 0, 0x33)
+!Rr("SLL", 0x00, 1, 0x33)
+!Rr("SLT", 0x00, 2, 0x33)
+!Rr("SLTU", 0x00, 3, 0x33)
+!Rr("XOR", 0x00, 4, 0x33)
+!Rr("SRL", 0x00, 5, 0x33)
+!Rr("SRA", 0x20, 5, 0x33)
+!Rr("OR", 0x00, 6, 0x33)
+!Rr("AND", 0x00, 7, 0x33)
+!Rr("ADDW", 0x00, 0, 0x3b)
+!Rr("SUBW", 0x20, 0, 0x3b)
+!Rr("SLLW", 0x00, 1, 0x3b)
+!Rr("SRLW", 0x00, 5, 0x3b)
+!Rr("SRAW", 0x20, 5, 0x3b)
+
+/* -- fences and system --------------------------------------------- */
+/* the predecessor / successor sets: any non-empty subset of iorw */
+.sub::fs
+!def fsub() {
+!local m = 1
+!while m < 16 {
+!local nm = ""
+!if (m & 8) != 0 !then {
+!set nm = nm + "I"
+}
+!if (m & 4) != 0 !then {
+!set nm = nm + "O"
+}
+!if (m & 2) != 0 !then {
+!set nm = nm + "R"
+}
+!if (m & 1) != 0 !then {
+!set nm = nm + "W"
+}
+!{nm}::!{m}
+!set m = m + 1
+}
+}
+!fsub()
+.endsub
+FENCE !S{{fs}}p,!S{{fs}}q :: .call w4(0x0f|(p<<24)|(q<<20))
+FENCE :: .call w4(0x0ff0000f)
+FENCE.TSO :: .call w4(0x8330000f)
+FENCE.I :: .call w4(0x0000100f)
+PAUSE :: .call w4(0x0100000f)
+ECALL :: .call w4(0x00000073)
+EBREAK :: .call w4(0x00100073)
+NOP :: .call w4(0x00000013)
+
+/* -- pseudo-instructions of the base set --------------------------- */
+!Z("MV", "d,s", "", 0x13, "|(s<<15)|(d<<7)")
+!Z("NOT", "d,s", "", 0xfff04013, "|(s<<15)|(d<<7)")
+!Z("NEG", "d,t", "", 0x40000033, "|(t<<20)|(d<<7)")
+!Z("NEGW", "d,t", "", 0x4000003b, "|(t<<20)|(d<<7)")
+!Z("SEXT.W", "d,s", "", 0x1b, "|(s<<15)|(d<<7)")
+!Z("ZEXT.B", "d,s", "", 0x0ff07013, "|(s<<15)|(d<<7)")
+!Z("SEQZ", "d,s", "", 0x00103013, "|(s<<15)|(d<<7)")
+!Z("SNEZ", "d,t", "", 0x00003033, "|(t<<20)|(d<<7)")
+!Z("SLTZ", "d,s", "", 0x2033, "|(s<<15)|(d<<7)")
+!Z("SGTZ", "d,t", "", 0x2033, "|(t<<20)|(d<<7)")
+LI d,!v :: .call li4(d,v)
+
+/* -- call, tail, la: pc-relative pairs ------------------------------ */
+/* call: auipc ra,%pcrel_hi(t) ; jalr ra,%pcrel_lo(t)(ra) -- two words,
+/* covered by one R_RISCV_CALL_PLT over the 8-byte pair. call d,t uses
+/* d as the link register, tail uses t1 and does not link. */
+.func call8(off, rd, rt)
+a = 0x00000017 | ((((off + 0x800) >> 12) & 0xfffff) << 12) | (rt << 7)
+b = 0x00000067 | ((off & 0xfff) << 20) | (rt << 15) | (rd << 7)
+.emit(a & 0xff, (a >> 8) & 0xff, (a >> 16) & 0xff, (a >> 24) & 0xff)
+.emit(b & 0xff, (b >> 8) & 0xff, (b >> 16) & 0xff, (b >> 24) & 0xff)
+.return
+.endfunc
+.reloc::v::call
+CALL !v :: .call call8(v-$$,1,1)
+CALL d,!v :: .call call8(v-$$,d,d)
+TAIL !v :: .call call8(v-$$,0,6)
+JUMP !v,s :: .call call8(v-$$,0,s)
+.clrreloc::v
+/* la / lla: auipc + addi, the offset worked out here */
+LA d,!v :: .call pair_i(v-$$,d,0x13|(d<<15)|(d<<7))
+LLA d,!v :: .call pair_i(v-$$,d,0x13|(d<<15)|(d<<7))
+/* the global load / store forms: auipc + load, auipc + store */
+!def gl(nm, f3, op, rd) {
+!{nm} !{rd},!v :: .call pair_i(v-$$,!{rd},0x!{(f3 << 12) | op:x}|(!{rd}<<15)|(!{rd}<<7))
+}
+!def gs(nm, f3, op, rt) {
+!{nm} !{rt},!v,s :: .call pair_s(v-$$,s,0x!{(f3 << 12) | op:x}|(s<<15)|(!{rt}<<20))
+}
+!gl("LB", 0, 0x03, "d")
+!gl("LH", 1, 0x03, "d")
+!gl("LW", 2, 0x03, "d")
+!gl("LD", 3, 0x03, "d")
+!gl("LBU", 4, 0x03, "d")
+!gl("LHU", 5, 0x03, "d")
+!gl("LWU", 6, 0x03, "d")
+!gs("SB", 0, 0x23, "t")
+!gs("SH", 1, 0x23, "t")
+!gs("SW", 2, 0x23, "t")
+!gs("SD", 3, 0x23, "t")
+
+/* ===================================================================
+/* M: multiply and divide
+/* =================================================================== */
+!Rr("MUL", 0x01, 0, 0x33)
+!Rr("MULH", 0x01, 1, 0x33)
+!Rr("MULHSU", 0x01, 2, 0x33)
+!Rr("MULHU", 0x01, 3, 0x33)
+!Rr("DIV", 0x01, 4, 0x33)
+!Rr("DIVU", 0x01, 5, 0x33)
+!Rr("REM", 0x01, 6, 0x33)
+!Rr("REMU", 0x01, 7, 0x33)
+!Rr("MULW", 0x01, 0, 0x3b)
+!Rr("DIVW", 0x01, 4, 0x3b)
+!Rr("DIVUW", 0x01, 5, 0x3b)
+!Rr("REMW", 0x01, 6, 0x3b)
+!Rr("REMUW", 0x01, 7, 0x3b)
+
+/* ===================================================================
+/* A: atomics. nm, nm.aq, nm.rl, nm.aqrl, each with (rs1) or 0(rs1)
+/* =================================================================== */
+!def amo1(nm, f5, f3, lr) {
+!local sfx = ""
+!local a = 0
+!while a < 4 {
+!if a == 0 !then {
+!set sfx = ""
+} !elif a == 1 !then {
+!set sfx = ".RL"
+} !elif a == 2 !then {
+!set sfx = ".AQ"
+} !else {
+!set sfx = ".AQRL"
+}
+!if lr == 1 !then {
+!Z(nm + sfx, "d,(s)", "", (f5 << 27) | (f3 << 12) | 0x2f | (a << 25), "|(s<<15)|(d<<7)")
+!Z(nm + sfx, "d,!v(s)", "v!=0;3", (f5 << 27) | (f3 << 12) | 0x2f | (a << 25), "|(s<<15)|(d<<7)")
+} !else {
+!Z(nm + sfx, "d,t,(s)", "", (f5 << 27) | (f3 << 12) | 0x2f | (a << 25), "|(t<<20)|(s<<15)|(d<<7)")
+!Z(nm + sfx, "d,t,!v(s)", "v!=0;3", (f5 << 27) | (f3 << 12) | 0x2f | (a << 25), "|(t<<20)|(s<<15)|(d<<7)")
+}
+!set a = a + 1
+}
+}
+!def amo(nm, f5) {
+!amo1(nm + ".W", f5, 2, 0)
+!amo1(nm + ".D", f5, 3, 0)
+}
+!amo1("LR.W", 0x02, 2, 1)
+!amo1("LR.D", 0x02, 3, 1)
+!amo("SC", 0x03)
+!amo("AMOSWAP", 0x01)
+!amo("AMOADD", 0x00)
+!amo("AMOXOR", 0x04)
+!amo("AMOAND", 0x0c)
+!amo("AMOOR", 0x08)
+!amo("AMOMIN", 0x10)
+!amo("AMOMAX", 0x14)
+!amo("AMOMINU", 0x18)
+!amo("AMOMAXU", 0x1c)
+
+/* ===================================================================
+/* Zicsr: the CSR instructions, with the symbolic names
+/* =================================================================== */
+!def cs(nm, n) {
+!{nm}::!{n}
+}
+.sub::csr
+!def csrtab() {
+!cs("FFLAGS", 0x001)
+!cs("FRM", 0x002)
+!cs("FCSR", 0x003)
+!cs("VSTART", 0x008)
+!cs("VXSAT", 0x009)
+!cs("VXRM", 0x00a)
+!cs("VCSR", 0x00f)
+!cs("SEED", 0x015)
+!cs("SSP", 0x011)
+!cs("SSTATUS", 0x100)
+!cs("SIE", 0x104)
+!cs("STVEC", 0x105)
+!cs("SCOUNTEREN", 0x106)
+!cs("SENVCFG", 0x10a)
+!cs("SSTATEEN0", 0x10c)
+!cs("SSTATEEN1", 0x10d)
+!cs("SSTATEEN2", 0x10e)
+!cs("SSTATEEN3", 0x10f)
+!cs("SCOUNTINHIBIT", 0x120)
+!cs("SSCRATCH", 0x140)
+!cs("SEPC", 0x141)
+!cs("SCAUSE", 0x142)
+!cs("STVAL", 0x143)
+!cs("SIP", 0x144)
+!cs("STIMECMP", 0x14d)
+!cs("SISELECT", 0x150)
+!cs("SIREG", 0x151)
+!cs("STOPEI", 0x15c)
+!cs("SATP", 0x180)
+!cs("SCONTEXT", 0x5a8)
+!cs("VSSTATUS", 0x200)
+!cs("VSIE", 0x204)
+!cs("VSTVEC", 0x205)
+!cs("VSSCRATCH", 0x240)
+!cs("VSEPC", 0x241)
+!cs("VSCAUSE", 0x242)
+!cs("VSTVAL", 0x243)
+!cs("VSIP", 0x244)
+!cs("VSATP", 0x280)
+!cs("VSISELECT", 0x250)
+!cs("VSIREG", 0x251)
+!cs("VSTOPEI", 0x25c)
+!cs("VSTOPI", 0xeb0)
+!cs("STOPI", 0xdb0)
+!cs("MSTATUS", 0x300)
+!cs("MISA", 0x301)
+!cs("MEDELEG", 0x302)
+!cs("MIDELEG", 0x303)
+!cs("MIE", 0x304)
+!cs("MTVEC", 0x305)
+!cs("MCOUNTEREN", 0x306)
+!cs("MVIEN", 0x308)
+!cs("MVIP", 0x309)
+!cs("MENVCFG", 0x30a)
+!cs("MSTATEEN0", 0x30c)
+!cs("MSTATEEN1", 0x30d)
+!cs("MSTATEEN2", 0x30e)
+!cs("MSTATEEN3", 0x30f)
+!cs("MCOUNTINHIBIT", 0x320)
+!cs("MSCRATCH", 0x340)
+!cs("MEPC", 0x341)
+!cs("MCAUSE", 0x342)
+!cs("MTVAL", 0x343)
+!cs("MIP", 0x344)
+!cs("MTINST", 0x34a)
+!cs("MTVAL2", 0x34b)
+!cs("MISELECT", 0x350)
+!cs("MIREG", 0x351)
+!cs("MTOPEI", 0x35c)
+!cs("MTOPI", 0xfb0)
+!cs("MNSCRATCH", 0x740)
+!cs("MNEPC", 0x741)
+!cs("MNCAUSE", 0x742)
+!cs("MNSTATUS", 0x744)
+!cs("MSECCFG", 0x747)
+!cs("TSELECT", 0x7a0)
+!cs("TDATA1", 0x7a1)
+!cs("TDATA2", 0x7a2)
+!cs("TDATA3", 0x7a3)
+!cs("MCONTEXT", 0x7a8)
+!cs("DCSR", 0x7b0)
+!cs("DPC", 0x7b1)
+!cs("DSCRATCH0", 0x7b2)
+!cs("DSCRATCH1", 0x7b3)
+!cs("HSTATUS", 0x600)
+!cs("HEDELEG", 0x602)
+!cs("HIDELEG", 0x603)
+!cs("HIE", 0x604)
+!cs("HTIMEDELTA", 0x605)
+!cs("HCOUNTEREN", 0x606)
+!cs("HGEIE", 0x607)
+!cs("HVIEN", 0x608)
+!cs("HVICTL", 0x609)
+!cs("HENVCFG", 0x60a)
+!cs("HSTATEEN0", 0x60c)
+!cs("HSTATEEN1", 0x60d)
+!cs("HSTATEEN2", 0x60e)
+!cs("HSTATEEN3", 0x60f)
+!cs("HTVAL", 0x643)
+!cs("HIP", 0x644)
+!cs("HVIP", 0x645)
+!cs("HVIPRIO1", 0x646)
+!cs("HVIPRIO2", 0x647)
+!cs("HTINST", 0x64a)
+!cs("HGATP", 0x680)
+!cs("HCONTEXT", 0x6a8)
+!cs("HGEIP", 0xe12)
+!cs("CYCLE", 0xc00)
+!cs("TIME", 0xc01)
+!cs("INSTRET", 0xc02)
+!cs("VL", 0xc20)
+!cs("VTYPE", 0xc21)
+!cs("VLENB", 0xc22)
+!cs("MVENDORID", 0xf11)
+!cs("MARCHID", 0xf12)
+!cs("MIMPID", 0xf13)
+!cs("MHARTID", 0xf14)
+!cs("MCONFIGPTR", 0xf15)
+!cs("MCYCLE", 0xb00)
+!cs("MINSTRET", 0xb02)
+!local i = 3
+!while i <= 31 {
+!cs("HPMCOUNTER" + str(i), 0xc00 + i)
+!cs("MHPMCOUNTER" + str(i), 0xb00 + i)
+!cs("MHPMEVENT" + str(i), 0x320 + i)
+!set i = i + 1
+}
+/* pmpcfg1, 3 ... exist on RV32 only */
+!set i = 0
+!while i < 16 {
+!cs("PMPCFG" + str(i), 0x3a0 + i)
+!set i = i + 2
+}
+!set i = 0
+!while i < 64 {
+!cs("PMPADDR" + str(i), 0x3b0 + i)
+!set i = i + 1
+}
+}
+!csrtab()
+!n::n
+.endsub
+!def csrops(nm, f3) {
+!Z(nm, "d,!S{{csr}}c,s", "c>4095||c<0;3", (f3 << 12) | 0x73, "|(c<<20)|(s<<15)|(d<<7)")
+!Z(nm + "I", "d,!S{{csr}}c,!v", "c>4095||c<0||v>31||v<0;3", ((f3 + 4) << 12) | 0x73, "|(c<<20)|(v<<15)|(d<<7)")
+}
+!csrops("CSRRW", 1)
+!csrops("CSRRS", 2)
+!csrops("CSRRC", 3)
+!Z("CSRR", "d,!S{{csr}}c", "c>4095||c<0;3", (2 << 12) | 0x73, "|(c<<20)|(d<<7)")
+!def csrp(nm, f3) {
+!Z(nm, "!S{{csr}}c,s", "c>4095||c<0;3", (f3 << 12) | 0x73, "|(c<<20)|(s<<15)")
+!Z(nm, "!S{{csr}}c,!v", "c>4095||c<0||v>31||v<0;3", ((f3 + 4) << 12) | 0x73, "|(c<<20)|(v<<15)")
+!Z(nm + "I", "!S{{csr}}c,!v", "c>4095||c<0||v>31||v<0;3", ((f3 + 4) << 12) | 0x73, "|(c<<20)|(v<<15)")
+}
+!csrp("CSRW", 1)
+!csrp("CSRS", 2)
+!csrp("CSRC", 3)
+/* rdcycle, rdtime, rdinstret (the RV32 high halves do not exist on RV64) */
+!def rdc(nm, c) {
+!Z(nm, "d", "", (2 << 12) | 0x73, "|(" + str(c) + "<<20)|(d<<7)")
+}
+!rdc("RDCYCLE", 0xc00)
+!rdc("RDTIME", 0xc01)
+!rdc("RDINSTRET", 0xc02)
+/* the floating point CSR group */
+!Z("FRCSR", "d", "", (2 << 12) | 0x73 | (3 << 20), "|(d<<7)")
+!Z("FSCSR", "d,s", "", (1 << 12) | 0x73 | (3 << 20), "|(s<<15)|(d<<7)")
+!Z("FSCSR", "s", "", (1 << 12) | 0x73 | (3 << 20), "|(s<<15)")
+!Z("FRRM", "d", "", (2 << 12) | 0x73 | (2 << 20), "|(d<<7)")
+!Z("FSRM", "d,s", "", (1 << 12) | 0x73 | (2 << 20), "|(s<<15)|(d<<7)")
+!Z("FSRM", "s", "", (1 << 12) | 0x73 | (2 << 20), "|(s<<15)")
+!Z("FSRMI", "d,!v", "v>31||v<0;3", (5 << 12) | 0x73 | (2 << 20), "|(v<<15)|(d<<7)")
+!Z("FSRMI", "!v", "v>31||v<0;3", (5 << 12) | 0x73 | (2 << 20), "|(v<<15)")
+!Z("FRFLAGS", "d", "", (2 << 12) | 0x73 | (1 << 20), "|(d<<7)")
+!Z("FSFLAGS", "d,s", "", (1 << 12) | 0x73 | (1 << 20), "|(s<<15)|(d<<7)")
+!Z("FSFLAGS", "s", "", (1 << 12) | 0x73 | (1 << 20), "|(s<<15)")
+!Z("FSFLAGSI", "d,!v", "v>31||v<0;3", (5 << 12) | 0x73 | (1 << 20), "|(v<<15)|(d<<7)")
+!Z("FSFLAGSI", "!v", "v>31||v<0;3", (5 << 12) | 0x73 | (1 << 20), "|(v<<15)")
+
+/* ===================================================================
+/* Data
+/* =================================================================== */
+DB !v :: v
+HALF !v :: v,v>>8
+WORD !v :: v,v>>8,v>>16,v>>24
+DWORD !v :: v,v>>8,v>>16,v>>24
+QUAD !v :: v,v>>8,v>>16,v>>24,v>>32,v>>40,v>>48,v>>56
+FLOAT !Fv :: v,v>>8,v>>16,v>>24
+DOUBLE !Dv :: v,v>>8,v>>16,v>>24,v>>32,v>>40,v>>48,v>>56
+
+/* ===================================================================
+/* F, D, Q, Zfh, Zfa: floating point
+/*
+/* A row with a rounding mode written out uses the rm table; one without
+/* encodes the dynamic mode (7). fmt is 0 for S, 1 for D, 2 for H and
+/* 3 for Q.
+/* =================================================================== */
+.sub::rm
+RNE::0
+RTZ::1
+RDN::2
+RUP::3
+RMM::4
+DYN::7
+.endsub
+
+/* Fm: nm ops and nm ops,rm */
+!def Fm(nm, ops, base, fx) {
+!{nm} !{ops} :: .call w4(0x!{base | (7 << 12):08x}!{fx})
+!{nm} !{ops},!S{{rm}}r :: .call w4(0x!{base:08x}!{fx}|(r<<12))
+}
+
+/* Fz: the same, but the form without a mode encodes rm = 0 (conversions
+/* that are exact: widening, and integer to double / quad) */
+!def Fz(nm, ops, base, fx) {
+!{nm} !{ops} :: .call w4(0x!{base:08x}!{fx})
+!{nm} !{ops},!S{{rm}}r :: .call w4(0x!{base:08x}!{fx}|(r<<12))
+}
+
+!def fpf(sfx, fmt) {
+!local f = fmt << 25
+!local S = "." + sfx
+!Fm("FADD" + S, "fd,fs,ft", (0x00 << 27) | f | 0x53, "|(ft<<20)|(fs<<15)|(fd<<7)")
+!Fm("FSUB" + S, "fd,fs,ft", (0x01 << 27) | f | 0x53, "|(ft<<20)|(fs<<15)|(fd<<7)")
+!Fm("FMUL" + S, "fd,fs,ft", (0x02 << 27) | f | 0x53, "|(ft<<20)|(fs<<15)|(fd<<7)")
+!Fm("FDIV" + S, "fd,fs,ft", (0x03 << 27) | f | 0x53, "|(ft<<20)|(fs<<15)|(fd<<7)")
+!Fm("FSQRT" + S, "fd,fs", (0x0b << 27) | f | 0x53, "|(fs<<15)|(fd<<7)")
+!Z("FSGNJ" + S, "fd,fs,ft", "", (0x04 << 27) | f | (0 << 12) | 0x53, "|(ft<<20)|(fs<<15)|(fd<<7)")
+!Z("FSGNJN" + S, "fd,fs,ft", "", (0x04 << 27) | f | (1 << 12) | 0x53, "|(ft<<20)|(fs<<15)|(fd<<7)")
+!Z("FSGNJX" + S, "fd,fs,ft", "", (0x04 << 27) | f | (2 << 12) | 0x53, "|(ft<<20)|(fs<<15)|(fd<<7)")
+!Z("FMIN" + S, "fd,fs,ft", "", (0x05 << 27) | f | (0 << 12) | 0x53, "|(ft<<20)|(fs<<15)|(fd<<7)")
+!Z("FMAX" + S, "fd,fs,ft", "", (0x05 << 27) | f | (1 << 12) | 0x53, "|(ft<<20)|(fs<<15)|(fd<<7)")
+!Z("FEQ" + S, "d,fs,ft", "", (0x14 << 27) | f | (2 << 12) | 0x53, "|(ft<<20)|(fs<<15)|(d<<7)")
+!Z("FLT" + S, "d,fs,ft", "", (0x14 << 27) | f | (1 << 12) | 0x53, "|(ft<<20)|(fs<<15)|(d<<7)")
+!Z("FLE" + S, "d,fs,ft", "", (0x14 << 27) | f | (0 << 12) | 0x53, "|(ft<<20)|(fs<<15)|(d<<7)")
+!Z("FGT" + S, "d,fs,ft", "", (0x14 << 27) | f | (1 << 12) | 0x53, "|(fs<<20)|(ft<<15)|(d<<7)")
+!Z("FGE" + S, "d,fs,ft", "", (0x14 << 27) | f | (0 << 12) | 0x53, "|(fs<<20)|(ft<<15)|(d<<7)")
+!Z("FCLASS" + S, "d,fs", "", (0x1c << 27) | f | (1 << 12) | 0x53, "|(fs<<15)|(d<<7)")
+!Z("FMV" + S, "fd,fs", "", (0x04 << 27) | f | (0 << 12) | 0x53, "|(fs<<20)|(fs<<15)|(fd<<7)")
+!Z("FNEG" + S, "fd,fs", "", (0x04 << 27) | f | (1 << 12) | 0x53, "|(fs<<20)|(fs<<15)|(fd<<7)")
+!Z("FABS" + S, "fd,fs", "", (0x04 << 27) | f | (2 << 12) | 0x53, "|(fs<<20)|(fs<<15)|(fd<<7)")
+!Fm("FMADD" + S, "fd,fs,ft,fu", f | 0x43, "|(fu<<27)|(ft<<20)|(fs<<15)|(fd<<7)")
+!Fm("FMSUB" + S, "fd,fs,ft,fu", f | 0x47, "|(fu<<27)|(ft<<20)|(fs<<15)|(fd<<7)")
+!Fm("FNMSUB" + S, "fd,fs,ft,fu", f | 0x4b, "|(fu<<27)|(ft<<20)|(fs<<15)|(fd<<7)")
+!Fm("FNMADD" + S, "fd,fs,ft,fu", f | 0x4f, "|(fu<<27)|(ft<<20)|(fs<<15)|(fd<<7)")
+/* conversions to and from the integer registers */
+!Fm("FCVT.W" + S, "d,fs", (0x18 << 27) | f | (0 << 20) | 0x53, "|(fs<<15)|(d<<7)")
+!Fm("FCVT.WU" + S, "d,fs", (0x18 << 27) | f | (1 << 20) | 0x53, "|(fs<<15)|(d<<7)")
+!Fm("FCVT.L" + S, "d,fs", (0x18 << 27) | f | (2 << 20) | 0x53, "|(fs<<15)|(d<<7)")
+!Fm("FCVT.LU" + S, "d,fs", (0x18 << 27) | f | (3 << 20) | 0x53, "|(fs<<15)|(d<<7)")
+!if fmt == 1 || fmt == 3 !then {
+!Fz("FCVT" + S + ".W", "fd,s", (0x1a << 27) | f | (0 << 20) | 0x53, "|(s<<15)|(fd<<7)")
+!Fz("FCVT" + S + ".WU", "fd,s", (0x1a << 27) | f | (1 << 20) | 0x53, "|(s<<15)|(fd<<7)")
+} !else {
+!Fm("FCVT" + S + ".W", "fd,s", (0x1a << 27) | f | (0 << 20) | 0x53, "|(s<<15)|(fd<<7)")
+!Fm("FCVT" + S + ".WU", "fd,s", (0x1a << 27) | f | (1 << 20) | 0x53, "|(s<<15)|(fd<<7)")
+}
+!if fmt == 3 !then {
+!Fz("FCVT" + S + ".L", "fd,s", (0x1a << 27) | f | (2 << 20) | 0x53, "|(s<<15)|(fd<<7)")
+!Fz("FCVT" + S + ".LU", "fd,s", (0x1a << 27) | f | (3 << 20) | 0x53, "|(s<<15)|(fd<<7)")
+} !else {
+!Fm("FCVT" + S + ".L", "fd,s", (0x1a << 27) | f | (2 << 20) | 0x53, "|(s<<15)|(fd<<7)")
+!Fm("FCVT" + S + ".LU", "fd,s", (0x1a << 27) | f | (3 << 20) | 0x53, "|(s<<15)|(fd<<7)")
+}
+/* Zfa */
+!Z("FMINM" + S, "fd,fs,ft", "", (0x05 << 27) | f | (2 << 12) | 0x53, "|(ft<<20)|(fs<<15)|(fd<<7)")
+!Z("FMAXM" + S, "fd,fs,ft", "", (0x05 << 27) | f | (3 << 12) | 0x53, "|(ft<<20)|(fs<<15)|(fd<<7)")
+!Z("FLEQ" + S, "d,fs,ft", "", (0x14 << 27) | f | (4 << 12) | 0x53, "|(ft<<20)|(fs<<15)|(d<<7)")
+!Z("FLTQ" + S, "d,fs,ft", "", (0x14 << 27) | f | (5 << 12) | 0x53, "|(ft<<20)|(fs<<15)|(d<<7)")
+!Fm("FROUND" + S, "fd,fs", (0x08 << 27) | f | (4 << 20) | 0x53, "|(fs<<15)|(fd<<7)")
+!Fm("FROUNDNX" + S, "fd,fs", (0x08 << 27) | f | (5 << 20) | 0x53, "|(fs<<15)|(fd<<7)")
+!{"FLI" + S} fd,!Fv :: .call fli4(0x!{(0x1e << 27) | f | (1 << 20) | 0x53:08x},fd,v)
+!Z("FLI" + S, "fd,MIN", "", (0x1e << 27) | f | (1 << 20) | 0x53, "|(1<<15)|(fd<<7)")
+!Z("FLI" + S, "fd,INF", "", (0x1e << 27) | f | (1 << 20) | 0x53, "|(30<<15)|(fd<<7)")
+!Z("FLI" + S, "fd,NAN", "", (0x1e << 27) | f | (1 << 20) | 0x53, "|(31<<15)|(fd<<7)")
+}
+!fpf("S", 0)
+!fpf("D", 1)
+!fpf("H", 2)
+!fpf("Q", 3)
+
+/* fli: the 32 constants of Zfa, found from the binary32 pattern of the
+/* operand (the same table serves .s .d .h and .q); index 1 is the
+/* minimum normal number, reached with the name MIN */
+.func fli4(base, rd, v)
+t = [0xbf800000, 0x00800000, 0x37800000, 0x38000000, 0x3b800000, 0x3c000000, 0x3d800000, 0x3e000000, 0x3e800000, 0x3ea00000, 0x3ec00000, 0x3ee00000, 0x3f000000, 0x3f200000, 0x3f400000, 0x3f600000, 0x3f800000, 0x3fa00000, 0x3fc00000, 0x3fe00000, 0x40000000, 0x40200000, 0x40400000, 0x40800000, 0x41000000, 0x41800000, 0x43000000, 0x43800000, 0x47000000, 0x47800000, 0x7f800000, 0x7fc00000]
+ix = 32
+.for i in range(32)
+.if i != 1 && t[i] == (v & 0xffffffff) .then
+ix = i
+.endif
+.next
+.if ix == 32 .then
+.raise 3
+.return
+.endif
+z = base | (ix << 15) | (rd << 7)
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+/* moves between the register files */
+!Z("FMV.X.W", "d,fs", "", (0x1c << 27) | (0 << 25) | 0x53, "|(fs<<15)|(d<<7)")
+!Z("FMV.W.X", "fd,s", "", (0x1e << 27) | (0 << 25) | 0x53, "|(s<<15)|(fd<<7)")
+!Z("FMV.X.D", "d,fs", "", (0x1c << 27) | (1 << 25) | 0x53, "|(fs<<15)|(d<<7)")
+!Z("FMV.D.X", "fd,s", "", (0x1e << 27) | (1 << 25) | 0x53, "|(s<<15)|(fd<<7)")
+!Z("FMV.X.H", "d,fs", "", (0x1c << 27) | (2 << 25) | 0x53, "|(fs<<15)|(d<<7)")
+!Z("FMV.H.X", "fd,s", "", (0x1e << 27) | (2 << 25) | 0x53, "|(s<<15)|(fd<<7)")
+
+/* conversions between the floating point formats: FCVT.dst.src. A
+/* widening one is exact, so without a mode it encodes rm = 0. */
+!def fcc(dst, df, src, sf, rm) {
+!local b = (0x08 << 27) | (df << 25) | (sf << 20) | 0x53
+!if rm == 1 !then {
+!Fm("FCVT." + dst + "." + src, "fd,fs", b, "|(fs<<15)|(fd<<7)")
+} !else {
+!Fz("FCVT." + dst + "." + src, "fd,fs", b, "|(fs<<15)|(fd<<7)")
+}
+}
+!fcc("S", 0, "D", 1, 1)
+!fcc("D", 1, "S", 0, 0)
+!fcc("S", 0, "H", 2, 0)
+!fcc("H", 2, "S", 0, 1)
+!fcc("D", 1, "H", 2, 0)
+!fcc("H", 2, "D", 1, 1)
+!fcc("S", 0, "Q", 3, 1)
+!fcc("Q", 3, "S", 0, 0)
+!fcc("D", 1, "Q", 3, 1)
+!fcc("Q", 3, "D", 1, 0)
+!fcc("H", 2, "Q", 3, 1)
+!fcc("Q", 3, "H", 2, 0)
+/* Zfa: fcvtmod.w.d takes only the round-towards-zero mode */
+!Z("FCVTMOD.W.D", "d,fs,RTZ", "", (0x18 << 27) | (1 << 25) | (8 << 20) | (1 << 12) | 0x53, "|(fs<<15)|(d<<7)")
+
+/* loads and stores */
+!ldm("FLH", 1, 0x07, "fd")
+!ldm("FLW", 2, 0x07, "fd")
+!ldm("FLD", 3, 0x07, "fd")
+!ldm("FLQ", 4, 0x07, "fd")
+!stm("FSH", 1, 0x27, "ft")
+!stm("FSW", 2, 0x27, "ft")
+!stm("FSD", 3, 0x27, "ft")
+!stm("FSQ", 4, 0x27, "ft")
+/* the global forms: flw ft0,sym,t0 / fsw ft0,sym,t0 */
+!def glf(nm, f3, rd) {
+!{nm} !{rd},!v,s :: .call pair_i(v-$$,s,0x!{(f3 << 12) | 0x07:x}|(s<<15)|(!{rd}<<7))
+}
+!def gsf(nm, f3, rt) {
+!{nm} !{rt},!v,s :: .call pair_s(v-$$,s,0x!{(f3 << 12) | 0x27:x}|(s<<15)|(!{rt}<<20))
+}
+!glf("FLH", 1, "fd")
+!glf("FLW", 2, "fd")
+!glf("FLD", 3, "fd")
+!glf("FLQ", 4, "fd")
+!gsf("FSH", 1, "ft")
+!gsf("FSW", 2, "ft")
+!gsf("FSD", 3, "ft")
+!gsf("FSQ", 4, "ft")
+
+/* ===================================================================
+/* C: the compressed instructions (Zca, Zcf-less RV64, Zcd, Zcb), and
+/* Zcmp / Zcmt / Zcmop. Two-byte words; rd' rs1' rs2' are x8-x15 and
+/* written cd cs ct (cfd cft for f8-f15).
+/* =================================================================== */
+!def Cz(nm, ops, er, base, fx) {
+!local head = nm
+!if ops != "" !then {
+!set head = nm + " " + ops
+}
+!if er == "" !then {
+!{head} :: .call w2(0x!{base:04x}!{fx})
+} !else {
+!{head} :: !{er} :: .call w2(0x!{base:04x}!{fx})
+}
+}
+
+/* register-based loads and stores of the quadrant 0.
+/*   w4: word access (offset multiple of 4, up to 124)
+/*   w8: doubleword access (offset multiple of 8, up to 248)
+/* rd is cd / cfd for a load, ct / cft for a store */
+!def Cw4(nm, f3, rg) {
+!Cz(nm, rg + ",!v(cs)", "v<0||v>124||(v&3)!=0;8", (f3 << 13), "|(((v>>3)&7)<<10)|((cs-8)<<7)|(((v>>2)&1)<<6)|(((v>>6)&1)<<5)|((" + rg + "-8)<<2)")
+!Cz(nm, rg + ",(cs)", "", (f3 << 13), "|((cs-8)<<7)|((" + rg + "-8)<<2)")
+}
+!def Cw8(nm, f3, rg) {
+!Cz(nm, rg + ",!v(cs)", "v<0||v>248||(v&7)!=0;8", (f3 << 13), "|(((v>>3)&7)<<10)|((cs-8)<<7)|(((v>>6)&3)<<5)|((" + rg + "-8)<<2)")
+!Cz(nm, rg + ",(cs)", "", (f3 << 13), "|((cs-8)<<7)|((" + rg + "-8)<<2)")
+}
+!Cw4("C.LW", 2, "cd")
+!Cw8("C.LD", 3, "cd")
+!Cw8("C.FLD", 1, "cfd")
+!Cw4("C.SW", 6, "ct")
+!Cw8("C.SD", 7, "ct")
+!Cw8("C.FSD", 5, "cft")
+
+/* stack-pointer relative loads and stores of the quadrant 2 */
+!def Cs4(nm, f3, rd, nz) {
+!local e = "v<0||v>252||(v&3)!=0;8"
+!if nz == 1 !then {
+!set e = e + ",d==0;5"
+}
+!Cz(nm, rd + ",!v(SP)", e, (f3 << 13) | 2, "|(((v>>5)&1)<<12)|(" + rd + "<<7)|(((v>>2)&7)<<4)|(((v>>6)&3)<<2)")
+!Cz(nm, rd + ",(SP)", "", (f3 << 13) | 2, "|(" + rd + "<<7)")
+}
+!def Cs8(nm, f3, rd, nz) {
+!local e = "v<0||v>504||(v&7)!=0;8"
+!if nz == 1 !then {
+!set e = e + ",d==0;5"
+}
+!Cz(nm, rd + ",!v(SP)", e, (f3 << 13) | 2, "|(((v>>5)&1)<<12)|(" + rd + "<<7)|(((v>>3)&3)<<5)|(((v>>6)&7)<<2)")
+!Cz(nm, rd + ",(SP)", "", (f3 << 13) | 2, "|(" + rd + "<<7)")
+}
+!def Ss4(nm, f3, rs) {
+!Cz(nm, rs + ",!v(SP)", "v<0||v>252||(v&3)!=0;8", (f3 << 13) | 2, "|(((v>>2)&15)<<9)|(((v>>6)&3)<<7)|(" + rs + "<<2)")
+!Cz(nm, rs + ",(SP)", "", (f3 << 13) | 2, "|(" + rs + "<<2)")
+}
+!def Ss8(nm, f3, rs) {
+!Cz(nm, rs + ",!v(SP)", "v<0||v>504||(v&7)!=0;8", (f3 << 13) | 2, "|(((v>>3)&7)<<10)|(((v>>6)&7)<<7)|(" + rs + "<<2)")
+!Cz(nm, rs + ",(SP)", "", (f3 << 13) | 2, "|(" + rs + "<<2)")
+}
+!Cs4("C.LWSP", 2, "d", 1)
+!Cs8("C.LDSP", 3, "d", 1)
+!Cs8("C.FLDSP", 1, "fd", 0)
+!Ss4("C.SWSP", 6, "t")
+!Ss8("C.SDSP", 7, "t")
+!Ss8("C.FSDSP", 5, "ft")
+
+/* arithmetic */
+!Cz("C.NOP", "", "", 0x0001, "")
+!Cz("C.ADDI", "d,!v", "v<-32||v>31||v==0||d==0;3", 0x0001, "|(((v>>5)&1)<<12)|(d<<7)|((v&31)<<2)")
+!Cz("C.ADDIW", "d,!v", "v<-32||v>31||d==0;3", 0x2001, "|(((v>>5)&1)<<12)|(d<<7)|((v&31)<<2)")
+!Cz("C.LI", "d,!v", "v<-32||v>31||d==0;3", 0x4001, "|(((v>>5)&1)<<12)|(d<<7)|((v&31)<<2)")
+!Cz("C.ADDI16SP", "SP,!v", "v<-512||v>496||(v&15)!=0||v==0;3", 0x6101, "|(((v>>9)&1)<<12)|(((v>>4)&1)<<6)|(((v>>6)&1)<<5)|(((v>>7)&3)<<3)|(((v>>5)&1)<<2)")
+!Cz("C.ADDI4SPN", "cd,SP,!v", "v<=0||v>1020||(v&3)!=0;3", 0x0000, "|(((v>>4)&3)<<11)|(((v>>6)&15)<<7)|(((v>>2)&1)<<6)|(((v>>3)&1)<<5)|((cd-8)<<2)")
+.func clui(rd, v)
+n = v & 63
+.if v >= 1 && v <= 31 .then
+.elif v >= 0xfffe1 && v <= 0xfffff .then
+.elif v >= -31 && v <= -1 .then
+.else
+.raise 3
+.return
+.endif
+.if rd == 0 || rd == 2 .then
+.raise 5
+.return
+.endif
+z = 0x6001 | (((n >> 5) & 1) << 12) | (rd << 7) | ((n & 31) << 2)
+.return [z & 0xff, (z >> 8) & 0xff]
+.endfunc
+C.LUI d,!v :: .call clui(d,v)
+!Cz("C.SLLI", "d,!v", "v<1||v>63||d==0;10", 0x0002, "|(((v>>5)&1)<<12)|(d<<7)|((v&31)<<2)")
+!Cz("C.SRLI", "cs,!v", "v<1||v>63;10", 0x8001, "|(((v>>5)&1)<<12)|((cs-8)<<7)|((v&31)<<2)")
+!Cz("C.SRAI", "cs,!v", "v<1||v>63;10", 0x8401, "|(((v>>5)&1)<<12)|((cs-8)<<7)|((v&31)<<2)")
+!Cz("C.ANDI", "cs,!v", "v<-32||v>31;3", 0x8801, "|(((v>>5)&1)<<12)|((cs-8)<<7)|((v&31)<<2)")
+!def Cab(nm, base) {
+!Cz(nm, "cs,ct", "", base, "|((cs-8)<<7)|((ct-8)<<2)")
+}
+!Cab("C.SUB", 0x8c01)
+!Cab("C.XOR", 0x8c21)
+!Cab("C.OR", 0x8c41)
+!Cab("C.AND", 0x8c61)
+!Cab("C.SUBW", 0x9c01)
+!Cab("C.ADDW", 0x9c21)
+!Cz("C.MV", "d,t", "d==0||t==0;5", 0x8002, "|(d<<7)|(t<<2)")
+!Cz("C.ADD", "d,t", "d==0||t==0;5", 0x9002, "|(d<<7)|(t<<2)")
+!Cz("C.JR", "s", "s==0;5", 0x8002, "|(s<<7)")
+!Cz("C.JALR", "s", "s==0;5", 0x9002, "|(s<<7)")
+!Cz("C.EBREAK", "", "", 0x9002, "")
+!Cz("C.UNIMP", "", "", 0x0000, "")
+UNIMP :: .call w4(0xc0001073)
+
+/* jumps and branches */
+.reloc::v::rvc_jump
+C.J !v :: (v-$$)>2046||(v-$$)<-2048||((v-$$)&1)!=0;2 :: .call w2(0xa001|((((v-$$)>>11)&1)<<12)|((((v-$$)>>4)&1)<<11)|((((v-$$)>>8)&3)<<9)|((((v-$$)>>10)&1)<<8)|((((v-$$)>>6)&1)<<7)|((((v-$$)>>7)&1)<<6)|((((v-$$)>>1)&7)<<3)|((((v-$$)>>5)&1)<<2))
+.clrreloc::v
+.reloc::v::rvc_branch
+C.BEQZ cs,!v :: (v-$$)>254||(v-$$)<-256||((v-$$)&1)!=0;2 :: .call w2(0xc001|((((v-$$)>>8)&1)<<12)|((((v-$$)>>3)&3)<<10)|((cs-8)<<7)|((((v-$$)>>6)&3)<<5)|((((v-$$)>>1)&3)<<3)|((((v-$$)>>5)&1)<<2))
+C.BNEZ cs,!v :: (v-$$)>254||(v-$$)<-256||((v-$$)&1)!=0;2 :: .call w2(0xe001|((((v-$$)>>8)&1)<<12)|((((v-$$)>>3)&3)<<10)|((cs-8)<<7)|((((v-$$)>>6)&3)<<5)|((((v-$$)>>1)&3)<<3)|((((v-$$)>>5)&1)<<2))
+.clrreloc::v
+
+/* Zcb */
+!Cz("C.LBU", "cd,!v(cs)", "v<0||v>3;8", 0x8000, "|((cs-8)<<7)|((v&1)<<6)|(((v>>1)&1)<<5)|((cd-8)<<2)")
+!Cz("C.LBU", "cd,(cs)", "", 0x8000, "|((cs-8)<<7)|((cd-8)<<2)")
+!Cz("C.LHU", "cd,!v(cs)", "v!=0&&v!=2;8", 0x8400, "|((cs-8)<<7)|(((v>>1)&1)<<5)|((cd-8)<<2)")
+!Cz("C.LHU", "cd,(cs)", "", 0x8400, "|((cs-8)<<7)|((cd-8)<<2)")
+!Cz("C.LH", "cd,!v(cs)", "v!=0&&v!=2;8", 0x8440, "|((cs-8)<<7)|(((v>>1)&1)<<5)|((cd-8)<<2)")
+!Cz("C.LH", "cd,(cs)", "", 0x8440, "|((cs-8)<<7)|((cd-8)<<2)")
+!Cz("C.SB", "ct,!v(cs)", "v<0||v>3;8", 0x8800, "|((cs-8)<<7)|((v&1)<<6)|(((v>>1)&1)<<5)|((ct-8)<<2)")
+!Cz("C.SB", "ct,(cs)", "", 0x8800, "|((cs-8)<<7)|((ct-8)<<2)")
+!Cz("C.SH", "ct,!v(cs)", "v!=0&&v!=2;8", 0x8c00, "|((cs-8)<<7)|(((v>>1)&1)<<5)|((ct-8)<<2)")
+!Cz("C.SH", "ct,(cs)", "", 0x8c00, "|((cs-8)<<7)|((ct-8)<<2)")
+!Cz("C.ZEXT.B", "cs", "", 0x9c61, "|((cs-8)<<7)")
+!Cz("C.SEXT.B", "cs", "", 0x9c65, "|((cs-8)<<7)")
+!Cz("C.ZEXT.H", "cs", "", 0x9c69, "|((cs-8)<<7)")
+!Cz("C.SEXT.H", "cs", "", 0x9c6d, "|((cs-8)<<7)")
+!Cz("C.ZEXT.W", "cs", "", 0x9c71, "|((cs-8)<<7)")
+!Cz("C.NOT", "cs", "", 0x9c75, "|((cs-8)<<7)")
+!Cz("C.MUL", "cs,ct", "", 0x9c41, "|((cs-8)<<7)|((ct-8)<<2)")
+
+/* Zcmop: c.mop.1, c.mop.3 ... c.mop.15 */
+!def cmop() {
+!local n = 1
+!while n < 16 {
+C.MOP.!{n} :: .call w2(0x!{0x6081 | (((n - 1) / 2) << 8):04x})
+!set n = n + 2
+}
+}
+!cmop()
+
+/* Zcmt: the jump table instructions */
+!Cz("CM.JT", "!v", "v<0||v>31;3", 0xa002, "|(v<<2)")
+!Cz("CM.JALT", "!v", "v<32||v>255;3", 0xa002, "|(v<<2)")
+
+/* Zcmp: push, pop and the move pairs. The register list is written
+/* {ra}, {ra,s0}, {ra,s0-s1} ... {ra,s0-s11}; its number is rlist. */
+.sub::rl
+!def rltab() {
+!local n = 4
+!while n < 16 {
+!local t = "{RA"
+!if n == 5 !then {
+!set t = "{RA,S0"
+}
+!if n == 15 !then {
+!set t = "{RA,S0-S11"
+} !elif n > 5 !then {
+!set t = "{RA,S0-S" + str(n - 5)
+}
+!{t}}::!{n}
+!set n = n + 1
+}
+}
+!rltab()
+.endsub
+/* the stack adjustment base of each rlist (RV64), then 4 steps of 16 */
+.func cmpp(base, rl, adj, push)
+t = [16, 16, 32, 32, 48, 48, 64, 64, 80, 80, 96, 112]
+bs = t[rl - 4]
+a = adj
+.if push != 0 .then
+a = -adj
+.endif
+.if a < bs || a > bs + 48 || (a & 15) != 0 .then
+.raise 3
+.return
+.endif
+z = base | (rl << 4) | (((a - bs) >> 4) << 2)
+.return [z & 0xff, (z >> 8) & 0xff]
+.endfunc
+CM.PUSH !S{{rl}}r,!v :: .call cmpp(0xb802,r,v,1)
+CM.POP !S{{rl}}r,!v :: .call cmpp(0xba02,r,v,0)
+CM.POPRETZ !S{{rl}}r,!v :: .call cmpp(0xbc02,r,v,0)
+CM.POPRET !S{{rl}}r,!v :: .call cmpp(0xbe02,r,v,0)
+/* cm.mva01s / cm.mvsa01 take two of s0-s7 (x8 x9 x18-x23) */
+.func cmmv(base, a, b)
+ca = a - 16
+.if a < 10 .then
+ca = a - 8
+.endif
+cb = b - 16
+.if b < 10 .then
+cb = b - 8
+.endif
+z = base | (ca << 7) | (cb << 2)
+.return [z & 0xff, (z >> 8) & 0xff]
+.endfunc
+.setsym::SREG::S0,S1,S2,S3,S4,S5,S6,S7,X8,X9,X18,X19,X20,X21,X22,X23,FP
+.check::m1::SREG
+.check::m2::SREG
+CM.MVA01S m1,m2 :: .call cmmv(0xac62,m1,m2)
+CM.MVSA01 m1,m2 :: m1==m2;5 :: .call cmmv(0xac22,m1,m2)
+
+/* ===================================================================
+/* Zba, Zbb, Zbc, Zbs, Zbkb, Zbkc, Zbkx: bit manipulation
+/* =================================================================== */
+!def Ru(nm, base) {
+!Z(nm, "d,s", "", base, "|(s<<15)|(d<<7)")
+}
+!Rr("SH1ADD", 0x10, 2, 0x33)
+!Rr("SH2ADD", 0x10, 4, 0x33)
+!Rr("SH3ADD", 0x10, 6, 0x33)
+!Rr("ADD.UW", 0x04, 0, 0x3b)
+!Rr("SH1ADD.UW", 0x10, 2, 0x3b)
+!Rr("SH2ADD.UW", 0x10, 4, 0x3b)
+!Rr("SH3ADD.UW", 0x10, 6, 0x3b)
+!Z("SLLI.UW", "d,s,!v", "v<0||v>63;10", 0x0800101b, "|(v<<20)|(s<<15)|(d<<7)")
+!Ru("ZEXT.W", 0x0800003b)
+!Rr("ANDN", 0x20, 7, 0x33)
+!Rr("ORN", 0x20, 6, 0x33)
+!Rr("XNOR", 0x20, 4, 0x33)
+!Ru("CLZ", 0x60001013)
+!Ru("CTZ", 0x60101013)
+!Ru("CPOP", 0x60201013)
+!Ru("CLZW", 0x6000101b)
+!Ru("CTZW", 0x6010101b)
+!Ru("CPOPW", 0x6020101b)
+!Rr("MAX", 0x05, 6, 0x33)
+!Rr("MAXU", 0x05, 7, 0x33)
+!Rr("MIN", 0x05, 4, 0x33)
+!Rr("MINU", 0x05, 5, 0x33)
+!Ru("SEXT.B", 0x60401013)
+!Ru("SEXT.H", 0x60501013)
+!Ru("ZEXT.H", 0x0800403b)
+!Rr("ROL", 0x30, 1, 0x33)
+!Rr("ROR", 0x30, 5, 0x33)
+!Rr("ROLW", 0x30, 1, 0x3b)
+!Rr("RORW", 0x30, 5, 0x3b)
+!Rsh("RORI", 0x600, 5, 0x13, 6)
+!Rsh("RORIW", 0x600, 5, 0x1b, 5)
+!Ru("ORC.B", 0x28705013)
+!Ru("REV8", 0x6b805013)
+!Ru("BREV8", 0x68705013)
+!Rr("CLMUL", 0x05, 1, 0x33)
+!Rr("CLMULR", 0x05, 2, 0x33)
+!Rr("CLMULH", 0x05, 3, 0x33)
+!Rr("BCLR", 0x24, 1, 0x33)
+!Rr("BEXT", 0x24, 5, 0x33)
+!Rr("BINV", 0x34, 1, 0x33)
+!Rr("BSET", 0x14, 1, 0x33)
+!Rsh("BCLRI", 0x480, 1, 0x13, 6)
+!Rsh("BEXTI", 0x480, 5, 0x13, 6)
+!Rsh("BINVI", 0x680, 1, 0x13, 6)
+!Rsh("BSETI", 0x280, 1, 0x13, 6)
+!Rr("PACK", 0x04, 4, 0x33)
+!Rr("PACKH", 0x04, 7, 0x33)
+!Rr("PACKW", 0x04, 4, 0x3b)
+!Rr("XPERM4", 0x14, 2, 0x33)
+!Rr("XPERM8", 0x14, 4, 0x33)
+
+/* ===================================================================
+/* Scalar cryptography: Zknd, Zkne, Zknh, Zksed, Zksh
+/* =================================================================== */
+!Rr("AES64DS", 0x1d, 0, 0x33)
+!Rr("AES64DSM", 0x1f, 0, 0x33)
+!Rr("AES64ES", 0x19, 0, 0x33)
+!Rr("AES64ESM", 0x1b, 0, 0x33)
+!Rr("AES64KS2", 0x3f, 0, 0x33)
+!Ru("AES64IM", 0x30001013)
+!Z("AES64KS1I", "d,s,!v", "v<0||v>10;10", 0x31001013, "|(v<<20)|(s<<15)|(d<<7)")
+!Ru("SHA256SUM0", 0x10001013)
+!Ru("SHA256SUM1", 0x10101013)
+!Ru("SHA256SIG0", 0x10201013)
+!Ru("SHA256SIG1", 0x10301013)
+!Ru("SHA512SUM0", 0x10401013)
+!Ru("SHA512SUM1", 0x10501013)
+!Ru("SHA512SIG0", 0x10601013)
+!Ru("SHA512SIG1", 0x10701013)
+!Z("SM4ED", "d,s,t,!v", "v<0||v>3;10", 0x30000033, "|(v<<30)|(t<<20)|(s<<15)|(d<<7)")
+!Z("SM4KS", "d,s,t,!v", "v<0||v>3;10", 0x34000033, "|(v<<30)|(t<<20)|(s<<15)|(d<<7)")
+!Ru("SM3P0", 0x10801013)
+!Ru("SM3P1", 0x10901013)
+
+/* ===================================================================
+/* Zicond, cache-block operations, hints, may-be-operations
+/* =================================================================== */
+!Rr("CZERO.EQZ", 0x07, 5, 0x33)
+!Rr("CZERO.NEZ", 0x07, 7, 0x33)
+!def cbo(nm, base) {
+!Z(nm, "(s)", "", base, "|(s<<15)")
+!Z(nm, "!v(s)", "v!=0;3", base, "|(s<<15)")
+}
+!cbo("CBO.INVAL", 0x0000200f)
+!cbo("CBO.CLEAN", 0x0010200f)
+!cbo("CBO.FLUSH", 0x0020200f)
+!cbo("CBO.ZERO", 0x0040200f)
+!def pf(nm, base) {
+!Z(nm, "!v(s)", "v<-2048||v>2016||(v&31)!=0;3", base, "|((v&0xfe0)<<20)|(s<<15)")
+!Z(nm, "(s)", "", base, "|(s<<15)")
+}
+!pf("PREFETCH.I", 0x00006013)
+!pf("PREFETCH.R", 0x00106013)
+!pf("PREFETCH.W", 0x00306013)
+NTL.P1 :: .call w4(0x00200033)
+NTL.PALL :: .call w4(0x00300033)
+NTL.S1 :: .call w4(0x00400033)
+NTL.ALL :: .call w4(0x00500033)
+C.NTL.P1 :: .call w2(0x900a)
+C.NTL.PALL :: .call w2(0x900e)
+C.NTL.S1 :: .call w2(0x9012)
+C.NTL.ALL :: .call w2(0x9016)
+!def mops() {
+!local n = 0
+!while n < 32 {
+MOP.R.!{n} d,s :: .call w4(0x!{0x81c04073 | (((n >> 4) & 1) << 30) | (((n >> 2) & 3) << 26) | ((n & 3) << 20):08x}|(s<<15)|(d<<7))
+!if n < 8 !then {
+MOP.RR.!{n} d,s,t :: .call w4(0x!{0x82004073 | (((n >> 2) & 1) << 30) | ((n & 3) << 26):08x}|(t<<20)|(s<<15)|(d<<7))
+}
+!set n = n + 1
+}
+}
+!mops()
+/* Zicfiss and Zicfilp: shadow stack, landing pad */
+!Z("SSPUSH", "t", "t!=1&&t!=5;5", 0xce004073, "|(t<<20)")
+!Z("SSPOPCHK", "s", "s!=1&&s!=5;5", 0xcdc04073, "|(s<<15)")
+!Z("SSRDP", "d", "", 0xcdc04073, "|(d<<7)")
+!Z("LPAD", "!v", "v<0||v>1048575;3", 0x17, "|(v<<12)")
+!amo1("SSAMOSWAP.W", 0x09, 2, 0)
+!amo1("SSAMOSWAP.D", 0x09, 3, 0)
+/* Zacas: compare-and-swap; the quad form takes even register pairs */
+!amo1("AMOCAS.W", 0x05, 2, 0)
+!amo1("AMOCAS.D", 0x05, 3, 0)
+!def amoq() {
+!local a = 0
+!local sfx = ""
+!while a < 4 {
+!if a == 0 !then {
+!set sfx = ""
+} !elif a == 1 !then {
+!set sfx = ".RL"
+} !elif a == 2 !then {
+!set sfx = ".AQ"
+} !else {
+!set sfx = ".AQRL"
+}
+!Z("AMOCAS.Q" + sfx, "d,t,(s)", "(d&1)!=0||(t&1)!=0;5", (0x05 << 27) | (4 << 12) | 0x2f | (a << 25), "|(t<<20)|(s<<15)|(d<<7)")
+!set a = a + 1
+}
+}
+!amoq()
+/* Zawrs */
+WRS.NTO :: .call w4(0x00d00073)
+WRS.STO :: .call w4(0x01d00073)
+
+/* ===================================================================
+/* Privileged: return and wait, address translation fences, the H
+/* extension
+/* =================================================================== */
+SRET :: .call w4(0x10200073)
+MRET :: .call w4(0x30200073)
+MNRET :: .call w4(0x70200073)
+DRET :: .call w4(0x7b200073)
+WFI :: .call w4(0x10500073)
+SFENCE.W.INVAL :: .call w4(0x18000073)
+SFENCE.INVAL.IR :: .call w4(0x18100073)
+!def fv(nm, base) {
+!Z(nm, "", "", base, "")
+!Z(nm, "s", "", base, "|(s<<15)")
+!Z(nm, "s,t", "", base, "|(t<<20)|(s<<15)")
+}
+!fv("SFENCE.VMA", 0x12000073)
+!fv("SINVAL.VMA", 0x16000073)
+!fv("HFENCE.VVMA", 0x22000073)
+!fv("HFENCE.GVMA", 0x62000073)
+!fv("HINVAL.VVMA", 0x26000073)
+!fv("HINVAL.GVMA", 0x66000073)
+!def hl(nm, base) {
+!Z(nm, "d,(s)", "", base, "|(s<<15)|(d<<7)")
+}
+!def hs(nm, base) {
+!Z(nm, "t,(s)", "", base, "|(t<<20)|(s<<15)")
+}
+!hl("HLV.B", 0x60004073)
+!hl("HLV.BU", 0x60104073)
+!hl("HLV.H", 0x64004073)
+!hl("HLV.HU", 0x64104073)
+!hl("HLVX.HU", 0x64304073)
+!hl("HLV.W", 0x68004073)
+!hl("HLV.WU", 0x68104073)
+!hl("HLVX.WU", 0x68304073)
+!hl("HLV.D", 0x6c004073)
+!hs("HSV.B", 0x62004073)
+!hs("HSV.H", 0x66004073)
+!hs("HSV.W", 0x6a004073)
+!hs("HSV.D", 0x6e004073)
+
+/* ===================================================================
+/* V: the vector extension 1.0
+/*
+/* vd, vs (= vs2) and vt (= vs1) are the vector register variables.
+/* An operation that may be masked is written twice: without a mask
+/* (vm = 1) and with the ,v0.t operand (vm = 0). In the instructions
+/* that name the operands "vd,vs1,vs2" (vmacc, vmadd, vnmsac ...) the
+/* order of the source text is kept, as the GNU assembler has it.
+/* =================================================================== */
+
+/* vsetvli / vsetivli: vtype is sew[,lmul][,ta|tu][,ma|mu] or a number */
+!def lmname(l) {
+!if l == 0 !then {
+!return "M1"
+} !elif l == 1 !then {
+!return "M2"
+} !elif l == 2 !then {
+!return "M4"
+} !elif l == 3 !then {
+!return "M8"
+} !elif l == 4 !then {
+!return "MF2"
+} !elif l == 5 !then {
+!return "MF4"
+}
+!return "MF8"
+}
+!def lmval(l) {
+!if l <= 3 !then {
+!return l
+}
+!return 11 - l
+}
+.sub::vtype
+!def vtt() {
+!local s = 0
+!local l = 0
+!local t = 0
+!local m = 0
+!local lt = ""
+!local lv = 0
+!local tt = ""
+!local tv = 0
+!local mt = ""
+!local mv = 0
+!while s < 4 {
+!set l = -1
+!while l < 7 {
+!set lt = ""
+!set lv = 0
+!if l >= 0 !then {
+!set lt = "," + lmname(l)
+!set lv = lmval(l)
+}
+!set t = 0
+!while t < 3 {
+!set tt = ""
+!set tv = 0
+!if t == 1 !then {
+!set tt = ",TU"
+}
+!if t == 2 !then {
+!set tt = ",TA"
+!set tv = 1
+}
+!set m = 0
+!while m < 3 {
+!set mt = ""
+!set mv = 0
+!if m == 1 !then {
+!set mt = ",MU"
+}
+!if m == 2 !then {
+!set mt = ",MA"
+!set mv = 1
+}
+E!{8 << s}!{lt}!{tt}!{mt}::!{(mv << 7) | (tv << 6) | (s << 3) | lv}
+!set m = m + 1
+}
+!set t = t + 1
+}
+!set l = l + 1
+}
+!set s = s + 1
+}
+}
+!vtt()
+!n::n
+.endsub
+VSETVLI d,s,!S{{vtype}}z :: z<0||z>2047;3 :: .call w4(0x00007057|(z<<20)|(s<<15)|(d<<7))
+VSETIVLI d,!v,!S{{vtype}}z :: v<0||v>31||z<0||z>1023;3 :: .call w4(0xc0007057|(z<<20)|(v<<15)|(d<<7))
+VSETVL d,s,t :: .call w4(0x80007057|(t<<20)|(s<<15)|(d<<7))
+
+/* Vm: nm ops (vm = 1) and nm ops,v0.t (vm = 0), with an error list */
+!def Vme(nm, ops, er, base, fx) {
+!Z(nm, ops, er, base | (1 << 25), fx)
+!Z(nm, ops + ",V0.T", er, base, fx)
+}
+
+/* ---- loads and stores -------------------------------------------- */
+!def wcode(e) {
+!if e == 8 !then {
+!return 0
+} !elif e == 16 !then {
+!return 5
+} !elif e == 32 !then {
+!return 6
+}
+!return 7
+}
+/* kind u: (rs1)   s: (rs1),rs2   x: (rs1),vs2. vmfix 1 = never masked */
+!def Vmem(nm, op, w, mop, lumop, nf, kind, vmfix) {
+!local b = op | (w << 12) | ((nf - 1) << 29) | (mop << 26) | (lumop << 20)
+!local ops = "vd,(s)"
+!local fx = "|(s<<15)|(vd<<7)"
+!if kind == "s" !then {
+!set ops = "vd,(s),t"
+!set fx = "|(t<<20)|(s<<15)|(vd<<7)"
+}
+!if kind == "x" !then {
+!set ops = "vd,(s),vs"
+!set fx = "|(vs<<20)|(s<<15)|(vd<<7)"
+}
+!if vmfix == 1 !then {
+!Z(nm, ops, "", b | (1 << 25), fx)
+} !else {
+!Vme(nm, ops, "", b, fx)
+}
+}
+!def vmems() {
+!local e = 8
+!local w = 0
+!local nf = 2
+!local en = ""
+!while e <= 64 {
+!set w = wcode(e)
+!set en = str(e)
+!Vmem("VLE" + en + ".V", 0x07, w, 0, 0, 1, "u", 0)
+!Vmem("VLE" + en + "FF.V", 0x07, w, 0, 0x10, 1, "u", 0)
+!Vmem("VSE" + en + ".V", 0x27, w, 0, 0, 1, "u", 0)
+!Vmem("VLSE" + en + ".V", 0x07, w, 2, 0, 1, "s", 0)
+!Vmem("VSSE" + en + ".V", 0x27, w, 2, 0, 1, "s", 0)
+!Vmem("VLUXEI" + en + ".V", 0x07, w, 1, 0, 1, "x", 0)
+!Vmem("VLOXEI" + en + ".V", 0x07, w, 3, 0, 1, "x", 0)
+!Vmem("VSUXEI" + en + ".V", 0x27, w, 1, 0, 1, "x", 0)
+!Vmem("VSOXEI" + en + ".V", 0x27, w, 3, 0, 1, "x", 0)
+!set nf = 2
+!while nf <= 8 {
+!local ns = str(nf)
+!Vmem("VLSEG" + ns + "E" + en + ".V", 0x07, w, 0, 0, nf, "u", 0)
+!Vmem("VLSEG" + ns + "E" + en + "FF.V", 0x07, w, 0, 0x10, nf, "u", 0)
+!Vmem("VSSEG" + ns + "E" + en + ".V", 0x27, w, 0, 0, nf, "u", 0)
+!Vmem("VLSSEG" + ns + "E" + en + ".V", 0x07, w, 2, 0, nf, "s", 0)
+!Vmem("VSSSEG" + ns + "E" + en + ".V", 0x27, w, 2, 0, nf, "s", 0)
+!Vmem("VLUXSEG" + ns + "EI" + en + ".V", 0x07, w, 1, 0, nf, "x", 0)
+!Vmem("VLOXSEG" + ns + "EI" + en + ".V", 0x07, w, 3, 0, nf, "x", 0)
+!Vmem("VSUXSEG" + ns + "EI" + en + ".V", 0x27, w, 1, 0, nf, "x", 0)
+!Vmem("VSOXSEG" + ns + "EI" + en + ".V", 0x27, w, 3, 0, nf, "x", 0)
+!set nf = nf + 1
+}
+!set nf = 1
+!while nf <= 8 {
+!Vmem("VL" + str(nf) + "RE" + en + ".V", 0x07, w, 0, 8, nf, "u", 1)
+!set nf = nf * 2
+}
+!set e = e * 2
+}
+!set nf = 1
+!while nf <= 8 {
+!Vmem("VL" + str(nf) + "R.V", 0x07, 0, 0, 8, nf, "u", 1)
+!Vmem("VS" + str(nf) + "R.V", 0x27, 0, 0, 8, nf, "u", 1)
+!set nf = nf * 2
+}
+!Vmem("VLM.V", 0x07, 0, 0, 0x0b, 1, "u", 1)
+!Vmem("VSM.V", 0x27, 0, 0, 0x0b, 1, "u", 1)
+}
+!vmems()
+
+/* ---- arithmetic -------------------------------------------------- */
+/* Vg: nm+sfx with funct6 f6 and funct3 f3, operand kind:
+/*   v  vd,vs,vt      x  vd,vs,s       i  vd,vs,simm5    u  vd,vs,uimm5
+/*   f  vd,vs,fs      V  vd,vt,vs      X  vd,s,vs        F  vd,fs,vs
+/* (V X F are the vd,vs1,vs2 order of the multiply-add group) */
+!def Vg(nm, sfx, f6, f3, kind) {
+!local b = (f6 << 26) | (f3 << 12) | 0x57
+!if kind == "v" !then {
+!Vme(nm + sfx, "vd,vs,vt", "", b, "|(vs<<20)|(vt<<15)|(vd<<7)")
+} !elif kind == "x" !then {
+!Vme(nm + sfx, "vd,vs,s", "", b, "|(vs<<20)|(s<<15)|(vd<<7)")
+} !elif kind == "i" !then {
+!Vme(nm + sfx, "vd,vs,!v", "v<-16||v>15;3", b, "|(vs<<20)|((v&31)<<15)|(vd<<7)")
+} !elif kind == "u" !then {
+!Vme(nm + sfx, "vd,vs,!v", "v<0||v>31;3", b, "|(vs<<20)|(v<<15)|(vd<<7)")
+} !elif kind == "f" !then {
+!Vme(nm + sfx, "vd,vs,fs", "", b, "|(vs<<20)|(fs<<15)|(vd<<7)")
+} !elif kind == "V" !then {
+!Vme(nm + sfx, "vd,vs,vt", "", b, "|(vt<<20)|(vs<<15)|(vd<<7)")
+} !elif kind == "X" !then {
+!Vme(nm + sfx, "vd,s,vs", "", b, "|(vs<<20)|(s<<15)|(vd<<7)")
+} !else {
+!Vme(nm + sfx, "vd,fs,vs", "", b, "|(vs<<20)|(fs<<15)|(vd<<7)")
+}
+}
+/* integer group: V X I (signed) / V X U (shifts) / V X / X I ... */
+!def Vvxi(nm, f6) {
+!Vg(nm, ".VV", f6, 0, "v")
+!Vg(nm, ".VX", f6, 4, "x")
+!Vg(nm, ".VI", f6, 3, "i")
+}
+!def Vvxu(nm, f6) {
+!Vg(nm, ".VV", f6, 0, "v")
+!Vg(nm, ".VX", f6, 4, "x")
+!Vg(nm, ".VI", f6, 3, "u")
+}
+!def Vvx(nm, f6) {
+!Vg(nm, ".VV", f6, 0, "v")
+!Vg(nm, ".VX", f6, 4, "x")
+}
+!def Vxi(nm, f6) {
+!Vg(nm, ".VX", f6, 4, "x")
+!Vg(nm, ".VI", f6, 3, "i")
+}
+!def Vxu(nm, f6) {
+!Vg(nm, ".VX", f6, 4, "x")
+!Vg(nm, ".VI", f6, 3, "u")
+}
+/* narrowing: .WV .WX .WI */
+!def Vwn(nm, f6) {
+!Vg(nm, ".WV", f6, 0, "v")
+!Vg(nm, ".WX", f6, 4, "x")
+!Vg(nm, ".WI", f6, 3, "u")
+}
+/* mask group, multiply, widening (OPMVV / OPMVX) */
+!def Vmm(nm, f6) {
+!Vg(nm, ".VV", f6, 2, "v")
+!Vg(nm, ".VX", f6, 6, "x")
+}
+!def Vmw(nm, f6) {
+!Vg(nm, ".WV", f6, 2, "v")
+!Vg(nm, ".WX", f6, 6, "x")
+}
+!def Vmac(nm, f6) {
+!Vg(nm, ".VV", f6, 2, "V")
+!Vg(nm, ".VX", f6, 6, "X")
+}
+/* floating point (OPFVV / OPFVF) */
+!def Vff(nm, f6) {
+!Vg(nm, ".VV", f6, 1, "v")
+!Vg(nm, ".VF", f6, 5, "f")
+}
+!def Vfw(nm, f6) {
+!Vg(nm, ".WV", f6, 1, "v")
+!Vg(nm, ".WF", f6, 5, "f")
+}
+!def Vfmac(nm, f6) {
+!Vg(nm, ".VV", f6, 1, "V")
+!Vg(nm, ".VF", f6, 5, "F")
+}
+/* unary: nm vd,vs with the vs1 field fixed */
+!def Vun(nm, f6, f3, c) {
+!Vme(nm, "vd,vs", "", (f6 << 26) | (f3 << 12) | (c << 15) | 0x57, "|(vs<<20)|(vd<<7)")
+}
+/* never masked */
+!def Vnm(nm, ops, f6, f3, fx) {
+!Z(nm, ops, "", (f6 << 26) | (1 << 25) | (f3 << 12) | 0x57, fx)
+}
+
+!Vvxi("VADD", 0x00)
+!Vvx("VSUB", 0x02)
+!Vxi("VRSUB", 0x03)
+!Vvx("VMINU", 0x04)
+!Vvx("VMIN", 0x05)
+!Vvx("VMAXU", 0x06)
+!Vvx("VMAX", 0x07)
+!Vvxi("VAND", 0x09)
+!Vvxi("VOR", 0x0a)
+!Vvxi("VXOR", 0x0b)
+!Vvxu("VRGATHER", 0x0c)
+!Vg("VRGATHEREI16", ".VV", 0x0e, 0, "v")
+!Vxu("VSLIDEUP", 0x0e)
+!Vxu("VSLIDEDOWN", 0x0f)
+!Vvxi("VMSEQ", 0x18)
+!Vvxi("VMSNE", 0x19)
+!Vvx("VMSLTU", 0x1a)
+!Vvx("VMSLT", 0x1b)
+!Vvxi("VMSLEU", 0x1c)
+!Vvxi("VMSLE", 0x1d)
+!Vxi("VMSGTU", 0x1e)
+!Vxi("VMSGT", 0x1f)
+!Vvxi("VSADDU", 0x20)
+!Vvxi("VSADD", 0x21)
+!Vvx("VSSUBU", 0x22)
+!Vvx("VSSUB", 0x23)
+!Vvxu("VSLL", 0x25)
+!Vvx("VSMUL", 0x27)
+!Vvxu("VSRL", 0x28)
+!Vvxu("VSRA", 0x29)
+!Vvxu("VSSRL", 0x2a)
+!Vvxu("VSSRA", 0x2b)
+!Vwn("VNSRL", 0x2c)
+!Vwn("VNSRA", 0x2d)
+!Vwn("VNCLIPU", 0x2e)
+!Vwn("VNCLIP", 0x2f)
+!Vg("VWREDSUMU", ".VS", 0x30, 0, "v")
+!Vg("VWREDSUM", ".VS", 0x31, 0, "v")
+/* carry and merge: the mask v0 is a written operand, vm = 0 */
+!def Vcy(nm, f6, withi) {
+!local b = (f6 << 26) | 0x57
+!Z(nm + ".VVM", "vd,vs,vt,V0", "", b, "|(vs<<20)|(vt<<15)|(vd<<7)")
+!Z(nm + ".VXM", "vd,vs,s,V0", "", b | (4 << 12), "|(vs<<20)|(s<<15)|(vd<<7)")
+!if withi == 1 !then {
+!Z(nm + ".VIM", "vd,vs,!v,V0", "v<-16||v>15;3", b | (3 << 12), "|(vs<<20)|((v&31)<<15)|(vd<<7)")
+}
+}
+!Vcy("VADC", 0x10, 1)
+!Vcy("VSBC", 0x12, 0)
+!Vcy("VMADC", 0x11, 1)
+!Vcy("VMSBC", 0x13, 0)
+!Vcy("VMERGE", 0x17, 1)
+!Vnm("VMADC.VV", "vd,vs,vt", 0x11, 0, "|(vs<<20)|(vt<<15)|(vd<<7)")
+!Vnm("VMADC.VX", "vd,vs,s", 0x11, 4, "|(vs<<20)|(s<<15)|(vd<<7)")
+!Vnm("VMADC.VI", "vd,vs,!v", 0x11, 3, "|(vs<<20)|((v&31)<<15)|(vd<<7)")
+!Vnm("VMSBC.VV", "vd,vs,vt", 0x13, 0, "|(vs<<20)|(vt<<15)|(vd<<7)")
+!Vnm("VMSBC.VX", "vd,vs,s", 0x13, 4, "|(vs<<20)|(s<<15)|(vd<<7)")
+!Vnm("VMV.V.V", "vd,vt", 0x17, 0, "|(vt<<15)|(vd<<7)")
+!Vnm("VMV.V.X", "vd,s", 0x17, 4, "|(s<<15)|(vd<<7)")
+!Z("VMV.V.I", "vd,!v", "v<-16||v>15;3", (0x17 << 26) | (1 << 25) | (3 << 12) | 0x57, "|((v&31)<<15)|(vd<<7)")
+!Z("VFMERGE.VFM", "vd,vs,fs,V0", "", (0x17 << 26) | (5 << 12) | 0x57, "|(vs<<20)|(fs<<15)|(vd<<7)")
+!Vnm("VFMV.V.F", "vd,fs", 0x17, 5, "|(fs<<15)|(vd<<7)")
+!def vmvr() {
+!local n = 1
+!while n <= 8 {
+!Z("VMV" + str(n) + "R.V", "vd,vs", "", (0x27 << 26) | (1 << 25) | (3 << 12) | 0x57 | ((n - 1) << 15), "|(vs<<20)|(vd<<7)")
+!set n = n * 2
+}
+}
+!vmvr()
+
+/* OPMVV / OPMVX */
+!Vmm("VAADDU", 0x08)
+!Vmm("VAADD", 0x09)
+!Vmm("VASUBU", 0x0a)
+!Vmm("VASUB", 0x0b)
+!Vmm("VDIVU", 0x20)
+!Vmm("VDIV", 0x21)
+!Vmm("VREMU", 0x22)
+!Vmm("VREM", 0x23)
+!Vmm("VMULHU", 0x24)
+!Vmm("VMUL", 0x25)
+!Vmm("VMULHSU", 0x26)
+!Vmm("VMULH", 0x27)
+!Vmm("VWADDU", 0x30)
+!Vmm("VWADD", 0x31)
+!Vmm("VWSUBU", 0x32)
+!Vmm("VWSUB", 0x33)
+!Vmw("VWADDU", 0x34)
+!Vmw("VWADD", 0x35)
+!Vmw("VWSUBU", 0x36)
+!Vmw("VWSUB", 0x37)
+!Vmm("VWMULU", 0x38)
+!Vmm("VWMULSU", 0x3a)
+!Vmm("VWMUL", 0x3b)
+!Vmac("VMADD", 0x29)
+!Vmac("VNMSUB", 0x2b)
+!Vmac("VMACC", 0x2d)
+!Vmac("VNMSAC", 0x2f)
+!Vmac("VWMACCU", 0x3c)
+!Vmac("VWMACC", 0x3d)
+!Vg("VWMACCUS", ".VX", 0x3e, 6, "X")
+!Vmac("VWMACCSU", 0x3f)
+!Vg("VSLIDE1UP", ".VX", 0x0e, 6, "x")
+!Vg("VSLIDE1DOWN", ".VX", 0x0f, 6, "x")
+!Vg("VREDSUM", ".VS", 0x00, 2, "v")
+!Vg("VREDAND", ".VS", 0x01, 2, "v")
+!Vg("VREDOR", ".VS", 0x02, 2, "v")
+!Vg("VREDXOR", ".VS", 0x03, 2, "v")
+!Vg("VREDMINU", ".VS", 0x04, 2, "v")
+!Vg("VREDMIN", ".VS", 0x05, 2, "v")
+!Vg("VREDMAXU", ".VS", 0x06, 2, "v")
+!Vg("VREDMAX", ".VS", 0x07, 2, "v")
+!def Vmk(nm, f6) {
+!Vnm(nm + ".MM", "vd,vs,vt", f6, 2, "|(vs<<20)|(vt<<15)|(vd<<7)")
+}
+!Vmk("VMANDN", 0x18)
+!Vmk("VMAND", 0x19)
+!Vmk("VMOR", 0x1a)
+!Vmk("VMXOR", 0x1b)
+!Vmk("VMORN", 0x1c)
+!Vmk("VMNAND", 0x1d)
+!Vmk("VMNOR", 0x1e)
+!Vmk("VMXNOR", 0x1f)
+!Vnm("VCOMPRESS.VM", "vd,vs,vt", 0x17, 2, "|(vs<<20)|(vt<<15)|(vd<<7)")
+!Vnm("VMV.X.S", "d,vs", 0x10, 2, "|(vs<<20)|(d<<7)")
+!Vnm("VMV.S.X", "vd,s", 0x10, 6, "|(s<<15)|(vd<<7)")
+!Vme("VCPOP.M", "d,vs", "", (0x10 << 26) | (2 << 12) | (0x10 << 15) | 0x57, "|(vs<<20)|(d<<7)")
+!Vme("VFIRST.M", "d,vs", "", (0x10 << 26) | (2 << 12) | (0x11 << 15) | 0x57, "|(vs<<20)|(d<<7)")
+!Vun("VZEXT.VF8", 0x12, 2, 2)
+!Vun("VSEXT.VF8", 0x12, 2, 3)
+!Vun("VZEXT.VF4", 0x12, 2, 4)
+!Vun("VSEXT.VF4", 0x12, 2, 5)
+!Vun("VZEXT.VF2", 0x12, 2, 6)
+!Vun("VSEXT.VF2", 0x12, 2, 7)
+!Vun("VMSBF.M", 0x14, 2, 1)
+!Vun("VMSOF.M", 0x14, 2, 2)
+!Vun("VMSIF.M", 0x14, 2, 3)
+!Vun("VIOTA.M", 0x14, 2, 0x10)
+!Vme("VID.V", "vd", "", (0x14 << 26) | (2 << 12) | (0x11 << 15) | 0x57, "|(vd<<7)")
+
+/* OPFVV / OPFVF */
+!Vff("VFADD", 0x00)
+!Vff("VFSUB", 0x02)
+!Vff("VFMIN", 0x04)
+!Vff("VFMAX", 0x06)
+!Vff("VFSGNJ", 0x08)
+!Vff("VFSGNJN", 0x09)
+!Vff("VFSGNJX", 0x0a)
+!Vff("VFDIV", 0x20)
+!Vff("VMFEQ", 0x18)
+!Vff("VMFLE", 0x19)
+!Vff("VMFLT", 0x1b)
+!Vff("VMFNE", 0x1c)
+!Vff("VFMUL", 0x24)
+!Vff("VFWADD", 0x30)
+!Vff("VFWSUB", 0x32)
+!Vff("VFWMUL", 0x38)
+!Vfw("VFWADD", 0x34)
+!Vfw("VFWSUB", 0x36)
+!Vg("VFRSUB", ".VF", 0x27, 5, "f")
+!Vg("VFRDIV", ".VF", 0x21, 5, "f")
+!Vg("VMFGT", ".VF", 0x1d, 5, "f")
+!Vg("VMFGE", ".VF", 0x1f, 5, "f")
+!Vg("VFSLIDE1UP", ".VF", 0x0e, 5, "f")
+!Vg("VFSLIDE1DOWN", ".VF", 0x0f, 5, "f")
+!Vfmac("VFMADD", 0x28)
+!Vfmac("VFNMADD", 0x29)
+!Vfmac("VFMSUB", 0x2a)
+!Vfmac("VFNMSUB", 0x2b)
+!Vfmac("VFMACC", 0x2c)
+!Vfmac("VFNMACC", 0x2d)
+!Vfmac("VFMSAC", 0x2e)
+!Vfmac("VFNMSAC", 0x2f)
+!Vfmac("VFWMACC", 0x3c)
+!Vfmac("VFWNMACC", 0x3d)
+!Vfmac("VFWMSAC", 0x3e)
+!Vfmac("VFWNMSAC", 0x3f)
+!Vg("VFREDUSUM", ".VS", 0x01, 1, "v")
+!Vg("VFREDOSUM", ".VS", 0x03, 1, "v")
+!Vg("VFREDMIN", ".VS", 0x05, 1, "v")
+!Vg("VFREDMAX", ".VS", 0x07, 1, "v")
+!Vg("VFWREDUSUM", ".VS", 0x31, 1, "v")
+!Vg("VFWREDOSUM", ".VS", 0x33, 1, "v")
+!Vnm("VFMV.F.S", "fd,vs", 0x10, 1, "|(vs<<20)|(fd<<7)")
+!Vnm("VFMV.S.F", "vd,fs", 0x10, 5, "|(fs<<15)|(vd<<7)")
+!Vun("VFCVT.XU.F.V", 0x12, 1, 0)
+!Vun("VFCVT.X.F.V", 0x12, 1, 1)
+!Vun("VFCVT.F.XU.V", 0x12, 1, 2)
+!Vun("VFCVT.F.X.V", 0x12, 1, 3)
+!Vun("VFCVT.RTZ.XU.F.V", 0x12, 1, 6)
+!Vun("VFCVT.RTZ.X.F.V", 0x12, 1, 7)
+!Vun("VFWCVT.XU.F.V", 0x12, 1, 8)
+!Vun("VFWCVT.X.F.V", 0x12, 1, 9)
+!Vun("VFWCVT.F.XU.V", 0x12, 1, 10)
+!Vun("VFWCVT.F.X.V", 0x12, 1, 11)
+!Vun("VFWCVT.F.F.V", 0x12, 1, 12)
+!Vun("VFWCVT.RTZ.XU.F.V", 0x12, 1, 14)
+!Vun("VFWCVT.RTZ.X.F.V", 0x12, 1, 15)
+!Vun("VFNCVT.XU.F.W", 0x12, 1, 16)
+!Vun("VFNCVT.X.F.W", 0x12, 1, 17)
+!Vun("VFNCVT.F.XU.W", 0x12, 1, 18)
+!Vun("VFNCVT.F.X.W", 0x12, 1, 19)
+!Vun("VFNCVT.F.F.W", 0x12, 1, 20)
+!Vun("VFNCVT.ROD.F.F.W", 0x12, 1, 21)
+!Vun("VFNCVT.RTZ.XU.F.W", 0x12, 1, 22)
+!Vun("VFNCVT.RTZ.X.F.W", 0x12, 1, 23)
+!Vun("VFSQRT.V", 0x13, 1, 0)
+!Vun("VFRSQRT7.V", 0x13, 1, 4)
+!Vun("VFREC7.V", 0x13, 1, 5)
+!Vun("VFCLASS.V", 0x13, 1, 16)
+
+/* ---- pseudo-instructions of the vector unit ---------------------- */
+!Vme("VNEG.V", "vd,vs", "", (0x03 << 26) | (4 << 12) | 0x57, "|(vs<<20)|(vd<<7)")
+!Vme("VNOT.V", "vd,vs", "", (0x0b << 26) | (3 << 12) | (31 << 15) | 0x57, "|(vs<<20)|(vd<<7)")
+!Vme("VFNEG.V", "vd,vs", "", (0x09 << 26) | (1 << 12) | 0x57, "|(vs<<20)|(vs<<15)|(vd<<7)")
+!Vme("VFABS.V", "vd,vs", "", (0x0a << 26) | (1 << 12) | 0x57, "|(vs<<20)|(vs<<15)|(vd<<7)")
+!Vnm("VMMV.M", "vd,vs", 0x19, 2, "|(vs<<20)|(vs<<15)|(vd<<7)")
+!Vnm("VMCLR.M", "vd", 0x1b, 2, "|(vd<<20)|(vd<<15)|(vd<<7)")
+!Vnm("VMSET.M", "vd", 0x1f, 2, "|(vd<<20)|(vd<<15)|(vd<<7)")
+!Vnm("VMNOT.M", "vd,vs", 0x1d, 2, "|(vs<<20)|(vs<<15)|(vd<<7)")
+!Vme("VNCVT.X.X.W", "vd,vs", "", (0x2c << 26) | (4 << 12) | 0x57, "|(vs<<20)|(vd<<7)")
+!Vme("VWCVT.X.X.V", "vd,vs", "", (0x31 << 26) | (6 << 12) | 0x57, "|(vs<<20)|(vd<<7)")
+!Vme("VWCVTU.X.X.V", "vd,vs", "", (0x30 << 26) | (6 << 12) | 0x57, "|(vs<<20)|(vd<<7)")
+/* the greater-than forms, written as the swapped less-than ones */
+!def Vsw(nm, f6) {
+!Vme(nm, "vd,vs,vt", "", (f6 << 26) | 0x57, "|(vt<<20)|(vs<<15)|(vd<<7)")
+}
+!Vsw("VMSGT.VV", 0x1b)
+!Vsw("VMSGTU.VV", 0x1a)
+!Vsw("VMSGE.VV", 0x1d)
+!Vsw("VMSGEU.VV", 0x1c)
+!Vme("VMFGT.VV", "vd,vs,vt", "", (0x1b << 26) | (1 << 12) | 0x57, "|(vt<<20)|(vs<<15)|(vd<<7)")
+!Vme("VMFGE.VV", "vd,vs,vt", "", (0x19 << 26) | (1 << 12) | 0x57, "|(vt<<20)|(vs<<15)|(vd<<7)")
+/* vmslt.vi vd,vs,imm is vmsle.vi vd,vs,imm-1, and so on */
+!def Vdec(nm, f6) {
+!Vme(nm, "vd,vs,!v", "v<-15||v>16;3", (f6 << 26) | (3 << 12) | 0x57, "|(vs<<20)|(((v-1)&31)<<15)|(vd<<7)")
+}
+!Vdec("VMSLT.VI", 0x1d)
+!Vdec("VMSLTU.VI", 0x1c)
+!Vdec("VMSGE.VI", 0x1f)
+!Vdec("VMSGEU.VI", 0x1e)
+
+/* ===================================================================
+/* Vector bit manipulation and cryptography: Zvbb, Zvbc, Zvkg, Zvkned,
+/* Zvknha / Zvknhb, Zvksed, Zvksh
+/* =================================================================== */
+!Vg("VANDN", ".VV", 0x01, 0, "v")
+!Vg("VANDN", ".VX", 0x01, 4, "x")
+!Vun("VBREV8.V", 0x12, 2, 0x08)
+!Vun("VREV8.V", 0x12, 2, 0x09)
+!Vun("VBREV.V", 0x12, 2, 0x0a)
+!Vun("VCLZ.V", 0x12, 2, 0x0c)
+!Vun("VCTZ.V", 0x12, 2, 0x0d)
+!Vun("VCPOP.V", 0x12, 2, 0x0e)
+!Vg("VROL", ".VV", 0x15, 0, "v")
+!Vg("VROL", ".VX", 0x15, 4, "x")
+!Vg("VROR", ".VV", 0x14, 0, "v")
+!Vg("VROR", ".VX", 0x14, 4, "x")
+!Vme("VROR.VI", "vd,vs,!v", "v<0||v>63;3", (0x14 << 26) | (3 << 12) | 0x57, "|(((v>>5)&1)<<26)|(vs<<20)|((v&31)<<15)|(vd<<7)")
+!Vg("VWSLL", ".VV", 0x35, 0, "v")
+!Vg("VWSLL", ".VX", 0x35, 4, "x")
+!Vg("VWSLL", ".VI", 0x35, 3, "u")
+!Vg("VCLMUL", ".VV", 0x0c, 2, "v")
+!Vg("VCLMUL", ".VX", 0x0c, 6, "x")
+!Vg("VCLMULH", ".VV", 0x0d, 2, "v")
+!Vg("VCLMULH", ".VX", 0x0d, 6, "x")
+/* the vector crypto instructions (opcode OP-VE), never masked */
+!def Vk2(nm, f6, c) {
+!Z(nm, "vd,vs", "", (f6 << 26) | (1 << 25) | (2 << 12) | (c << 15) | 0x77, "|(vs<<20)|(vd<<7)")
+}
+!def Vk3(nm, f6) {
+!Z(nm, "vd,vs,vt", "", (f6 << 26) | (1 << 25) | (2 << 12) | 0x77, "|(vs<<20)|(vt<<15)|(vd<<7)")
+}
+!def Vki(nm, f6) {
+!Z(nm, "vd,vs,!v", "v<0||v>31;3", (f6 << 26) | (1 << 25) | (2 << 12) | 0x77, "|(vs<<20)|(v<<15)|(vd<<7)")
+}
+!Vk2("VAESDM.VV", 0x28, 0)
+!Vk2("VAESDM.VS", 0x29, 0)
+!Vk2("VAESDF.VV", 0x28, 1)
+!Vk2("VAESDF.VS", 0x29, 1)
+!Vk2("VAESEM.VV", 0x28, 2)
+!Vk2("VAESEM.VS", 0x29, 2)
+!Vk2("VAESEF.VV", 0x28, 3)
+!Vk2("VAESEF.VS", 0x29, 3)
+!Vk2("VAESZ.VS", 0x29, 7)
+!Vk2("VSM4R.VV", 0x28, 16)
+!Vk2("VSM4R.VS", 0x29, 16)
+!Vk2("VGMUL.VV", 0x28, 17)
+!Vki("VAESKF1.VI", 0x22)
+!Vki("VAESKF2.VI", 0x2a)
+!Vki("VSM4K.VI", 0x21)
+!Vki("VSM3C.VI", 0x2b)
+!Vk3("VSM3ME.VV", 0x20)
+!Vk3("VGHSH.VV", 0x2c)
+!Vk3("VSHA2MS.VV", 0x2d)
+!Vk3("VSHA2CH.VV", 0x2e)
+!Vk3("VSHA2CL.VV", 0x2f)
+
+/* ===================================================================
+/* Later and small extensions: Zfbfmin / Zvfbfmin / Zvfbfwma (bf16),
+/* Zabha (byte and halfword atomics), c.sspush / c.sspopchk (Zicfiss)
+/* =================================================================== */
+!Fm("FCVT.BF16.S", "fd,fs", 0x44800053, "|(fs<<15)|(fd<<7)")
+!Fm("FCVT.S.BF16", "fd,fs", 0x40600053, "|(fs<<15)|(fd<<7)")
+!Vun("VFNCVTBF16.F.F.W", 0x12, 1, 0x1d)
+!Vun("VFWCVTBF16.F.F.V", 0x12, 1, 0x0d)
+!Vfmac("VFWMACCBF16", 0x3b)
+!def amob(nm, f5) {
+!amo1(nm + ".B", f5, 0, 0)
+!amo1(nm + ".H", f5, 1, 0)
+}
+!amob("AMOSWAP", 0x01)
+!amob("AMOADD", 0x00)
+!amob("AMOXOR", 0x04)
+!amob("AMOAND", 0x0c)
+!amob("AMOOR", 0x08)
+!amob("AMOMIN", 0x10)
+!amob("AMOMAX", 0x14)
+!amob("AMOMINU", 0x18)
+!amob("AMOMAXU", 0x1c)
+!amob("AMOCAS", 0x05)
+C.SSPUSH X1 :: .call w2(0x6081)
+C.SSPUSH RA :: .call w2(0x6081)
+C.SSPOPCHK X5 :: .call w2(0x6281)
+C.SSPOPCHK T0 :: .call w2(0x6281)
+
+/* ===================================================================
+/* Other spellings the assemblers accept
+/* =================================================================== */
+!Z("FMV.X.S", "d,fs", "", (0x1c << 27) | (0 << 25) | 0x53, "|(fs<<15)|(d<<7)")
+!Z("FMV.S.X", "fd,s", "", (0x1e << 27) | (0 << 25) | 0x53, "|(s<<15)|(fd<<7)")
+!Z("JR", "!v(s)", E12(), 0x67, "|((v&0xfff)<<20)|(s<<15)")
+!Z("JALR", "!v(s)", E12(), 0x67 | (1 << 7), "|((v&0xfff)<<20)|(s<<15)")
+/* the names the vector extension had before 1.0 */
+!Vme("VPOPC.M", "d,vs", "", (0x10 << 26) | (2 << 12) | (0x10 << 15) | 0x57, "|(vs<<20)|(d<<7)")
+!Vmk("VMANDNOT", 0x18)
+!Vmk("VMORNOT", 0x1c)
+!Vg("VFREDSUM", ".VS", 0x01, 1, "v")
+!Vg("VFWREDSUM", ".VS", 0x31, 1, "v")

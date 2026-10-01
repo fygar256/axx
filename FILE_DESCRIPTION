@@ -129,6 +129,24 @@ riscv64.s                           test assemble file for riscv64.axx. it
                                     file declares, and links and runs:
                                     axx riscv64.axx riscv64.s -o out.o &&
                                     ld -m elf64lriscv -o out out.o
+riscv64full.axx                     pattern file for RISC-V RV64, the whole
+                                    ISA: I, M, A, F, D, Q, Zfh, Zfa, C (Zca
+                                    Zcd Zcb Zcmp Zcmt Zcmop), Zba Zbb Zbc Zbs,
+                                    Zbk* and the scalar cryptography, Zicond,
+                                    Zicbo*, Zicsr with the CSR names,
+                                    privileged and H instructions, V 1.0 with
+                                    its crypto and bit-manipulation parts,
+                                    and the GNU pseudo-instructions (li of
+                                    any 64-bit constant, call, la ...). a
+                                    superset of riscv64.axx, written with the
+                                    macro layer and the mini language; checked
+                                    against llvm-mc byte for byte, and the
+                                    relocations (-o) against its objects
+riscv64full.s                       test assemble file for riscv64full.axx:
+                                    lines for the rows, every operand class
+riscv64full_reloc.s                 every relocation riscv64full.axx declares,
+                                    against external symbols, for -o:
+                                    axx riscv64full.axx riscv64full_reloc.s -o out.o
 endsub.axx                          pattern file for closing a `.sub` block with
                                     `.endsub` instead of `.return`: the two
                                     spellings mean the same thing and can be

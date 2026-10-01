@@ -3482,7 +3482,7 @@ AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v
 
 `x86_64.axx`、`x86_64m.axx`、`aarch64.axx`、`ppc64.axx`、`ppc64le.axx`、`68000.axx`、
 `z80.axx`、`8080.axx`、`8048.axx`、`8051.axx`、`6502.axx`、`6800.axx`、`6809.axx`、
-`4004.axx` は実用向けです。`riscv64.axx` は RV64I の基本整数部分の範囲で、
+`4004.axx`、`riscv64full.axx` は実用向けです。`riscv64.axx` は RV64I の基本整数部分の範囲で、
 `aarch64_logical.axx` と `aarch64_logical_mini.axx` はカバーする 1 つの命令グループの
 範囲内で実用向けです。残りはテストフィクスチャです。
 
@@ -3522,6 +3522,7 @@ x86_64 パターンファイルは
 | **elfsec.axx** | 1.4 KB | 8 | **elfsec.s** | `.elfsection` で宣言するセクションの属性と `sh_addralign`（3.7.7 節）。テスト専用 |
 | **elfsym.axx** | 2.8 KB | 23 | **elfsym.s** | ソース側の ELF シンボル属性（`.type`・`.size`・`.weak`・`.hidden`・`.protected`・`.internal`・`.other`・`.comm`、5.6.1 節）と、2 の冪でない欄の幅（`.elfwidth::3`）・セクションの要素長（`.elfsection` の第 5 欄、3.7.7 節）。機種は組み込みの表に無い EM_MN10300。テスト専用 |
 | **riscv64.axx** | 11 KB | 122 | **riscv64.s** | RV64I の基本整数命令（U/I/S/B/J/R 形式、ロード／ストア、分岐、ジャンプ、`call`、`li`/`mv`/`j`/`ret`/`nop`、`ecall`/`ebreak`）。C・M・A・F/D 拡張、CSR、fence 群は含みません。組み込みの EM_RISCV 表はデータ型しか持たないので、`CALL_PLT`・`BRANCH`・`JAL`・`HI20`・`LO12_I`/`_S`・`PCREL` 対を `.elftype`／`.elffield`／`.reloc` で宣言する実例でもあります（3.7.5〜3.7.7 節）。`ld -m elf64lriscv` でリンクでき、動きます |
+| **riscv64full.axx** | 75 KB | 2,186（展開後 4,137） | **riscv64full.s**、**riscv64full_reloc.s** | RISC-V RV64 の全体: I、M、A（Zabha・Zacas・Zawrs を含む）、F、D、Q、Zfh、Zfa、C（Zca・Zcd・Zcb・Zcmp・Zcmt・Zcmop）、Zba / Zbb / Zbc / Zbs、Zbkb / Zbkc / Zbkx、Zknd / Zkne / Zknh / Zksed / Zksh、Zicond、Zicbom / Zicboz / Zicbop、Zihintntl、Zimop、Zicfiss / Zicfilp、CSR 名つきの Zicsr、特権命令と H 拡張、V 1.0（Zvbb・Zvbc・Zvkg・Zvkned・Zvknh・Zvksed・Zvksh と bf16 の部分を含む）。GNU の疑似命令（任意の 64 ビット定数の `li`、`call`、`tail`、`la`、グローバルのロード／ストアなど）と、丸めモードや `v0.t` マスクの省略可能な指定にも対応します。`riscv64.axx` の上位版で、命令が持つ RISC-V psABI のリロケーションを宣言します。llvm-mc 18 とバイト単位で照合し、`-o` のリロケーションとリンク後のイメージも LLVM のものと照合しました。LLVM 18 に無い部分（Q、Zabha、`vwsll`、`mnret`、`c.ntl.*`、`c.sspush`）は仕様書から起こしています。`riscv64full.s` は各行の実行例、`riscv64full_reloc.s` は `-o` 用 |
 | **endsub.axx** | 1.2 KB | 20 | **endsub.s** | `.sub` ブロックを `.endsub` で閉じる（3.7.2 節）。テスト専用 |
 | **intel2att.axx** | 12 KB | 60（展開後 3,437） | **intel2att.s** | x86-64 Intel 記法 → AT&T 記法 のソース翻訳器。`.textmode`・`!Y`・`!L`・マクロ層でのパターン生成（3.18 節）。翻訳結果は GNU as に通る |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) のスケッチ。未完成 |
