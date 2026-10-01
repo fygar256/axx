@@ -186,6 +186,33 @@ literals. Parts of an ISA that resist structure can simply be enumerated.
 The execution platform is not significant. `chr(13)` at the end of DOS lines is
 ignored, and Paxx runs anywhere Python 3 runs.
 
+### 1.6 Implementation limits
+
+Section 1.3 describes the scope of the model. This section collects the concrete
+limits imposed by the code of the implementations (`axx.py` and `caxx.c`).
+Ordinary von Neumann processors rarely come near any of them.
+
+**What cannot be assembled**
+
+| Target | Reason (where it comes from in the code) |
+|---|---|
+| Machines whose minimum addressable unit is wider than 64 bits | The `.bits` word width is limited to 1–64 (`bits()` in Paxx and the `.bits` handling in Caxx both require `1..64`). An instruction may span several words, so this limits the addressable unit, not the instruction length |
+| Non-binary machines (e.g. the ternary Setun) | Output is written as binary integers, each word masked with `(1 << bts) - 1` (`_store()` / `flush()`). There is no way to represent trits or other non-binary values. Decimal machines that store digits in binary (BCD) are handled without trouble |
+| Machines whose encoding depends on execution history (e.g. the Mill CPU) | Pattern matching fixes the binary for each line statically. Operand references that depend on run-time state cannot be expressed in principle |
+
+**Minor limits**
+
+- The `.vliw` NOP value is truncated to 64 bits (Paxx applies
+  `& 0xFFFFFFFFFFFFFFFF`, Caxx takes it as a `uint64_t`). When an instruction slot is
+  wider than 64 bits the upper part is filled with 0, so a non-zero NOP encoding wider
+  than 64 bits cannot be given through `.vliw` alone.
+- Integers in expressions and in the mini language wrap at 256 bits (`_MINI_BITS = 256`;
+  `uint256_t` in Caxx). Since output can be split across several words, this is rarely a
+  practical issue.
+- Floating-point conversion (`enfloat()`) supports IEEE 754 formats only (half through
+  quadruple precision). IBM hexadecimal floating point and VAX formats cannot be emitted
+  by the built-in directives. This is a limit on data definitions, not on instructions.
+
 ---
 
 ## 2. Command line
