@@ -1,32 +1,40 @@
 #!/usr/bin/env python3
-"""axx — パターンファイル駆動の汎用アセンブラ。
+"""axx — パターンファイル駆動の汎用アセンブラ（Python 実装、愛称 Paxx）。
 
-通常のアセンブラが特定の命令セットをコードに埋め込むのに対し、axx は
-命令セットの仕様を外部のテキストファイル（`.axx` パターンファイル）から
-読み込む。パターンファイルは「ニーモニックの書式 → バイナリエンコーディング」
-の対応を1行1エントリで記述したもので、これを差し替えるだけで同じエンジンが
-任意の ISA（x86_64 / ARM64 / Z80 / VLIW・EPIC 等）を扱える。
+普通のアセンブラは特定の命令セットをコードの中に持つが、axx は持たない。
+「ニーモニックの書式 → 機械語のバイト列」という対応はすべて外部のテキスト
+ファイル（`.axx` パターンファイル）にあり、これを差し替えるだけで同じエンジンが
+別の ISA（x86_64 / AArch64 / Z80 / VLIW・EPIC ...）を扱う。
 
     axx.py <パターンファイル.axx> <ソース.s> -o <出力.o>
 
-全体の流れ（Assembler.run() が入口）:
+パターンファイルの 1 行は 3 欄でできている:
 
-  1. パターンファイル読み込み        PatternFileReader.readpat()
-       `.INCLUDE` を再帰展開し、各行を "::" 区切りで最大6フィールドに分解する。
-  2. マクロ展開                      MacroPreprocessor.expand()
-       `!if` / `!while` / `!def` 等の行指向マクロを先に潰しておく。
-  3. パス1（サイズ収束）             最大 MAX_RELAX 回反復
-       前方参照ラベルの値が確定しないと命令長が決まらない（可変長命令）ため、
-       「前回の反復で得た値」を推定値として使い、全ラベルのアドレスが前回と
+    命令の書式 :: エラー条件 :: 出力バイト列
+
+処理の流れ（入口は Assembler.run()）:
+
+  1. パターンファイル読み込み      PatternFileReader.readpat()
+       `.INCLUDE` を再帰で展開し、各行を "::" で最大 6 欄に割る。
+  2. マクロ展開                    MacroPreprocessor.expand()
+       `!def` / `!if` / `!while` 等の行指向マクロを、アセンブルの前に潰す。
+  3. パス1（長さの収束）           最大 MAX_RELAX 回
+       可変長命令の長さが前方参照ラベルの値で決まるので、1 回では確定しない。
+       前回の反復で得た値を推定値として使い、全ラベルのアドレスが前回と
        一致するまで繰り返す。これをリラクゼーションと呼ぶ。
-  4. パス2（コード生成）             1回のみ
-       確定したアドレスで実際のバイト列と ELF リロケーションを生成する。
-       パス1とパス2でアドレスがずれていたら明示的にエラーにする（誤ったバイナリを
-       黙って出力しない安全策）。
-  5. 出力                            ELF オブジェクト / 生バイナリ / ラベル TSV
+  4. パス2（コード生成）           1 回だけ
+       確定したアドレスで実際のバイト列と ELF リロケーションを作る。パス1と
+       アドレスが食い違っていたら明示的にエラーにし、誤ったバイナリは出さない。
+  5. 出力                          ELF オブジェクト / 生バイナリ / ラベル TSV
 
-対になる C 移植版が同じディレクトリの caxx.c にあり、両者は同一の入力に対して
-同一のバイト列を出すことを目標に保守されている。
+計算能力は 3 層に分かれており、停止性の扱いがそれぞれ違う:
+
+  マクロ層    MacroPreprocessor  アセンブル前のテキスト変換。制限は無い
+  パターン層  PatternMatcher     意図的にチューリング不完全。照合の停止性を保証
+  ミニ言語    MiniInterp         `.call` で名指しされたときだけ動く。上限付き
+
+C に移した caxx.c が同じディレクトリにあり、両者は同じ入力に対して同じバイト列を
+出すことを目標に保守されている。食い違いが出たらどちらかのバグとして扱う。
 """
 
 
@@ -47,25 +55,23 @@ import tempfile
 import uuid
 
 
-# パス1のリラクゼーション中、「まだ一度も値が確定していない」ことを
-# 「値が 0 である」と区別するための番兵。None や 0 を使うと、正当に 0 番地に
-# あるラベルと区別できなくなる。
+# パス1の反復中、「まだ一度も値が確定していない」ことを「値が 0 である」と
+# 区別するための番兵。None や 0 を使うと、本当に 0 番地にあるラベルと
+# 見分けが付かなくなる。
 _RELAXATION_SENTINEL = object()
 
 
-# 現在動作中の AssemblerState。モジュール関数の diag() から参照される。
-# 「エラーを今表示してよいパスか（パス2か対話モードか）」の判定と had_error の
-# 設定は AssemblerState 側が持っているため、状態を持たない場所から診断を出す
-# ときの橋渡しとして使う。
+# いま動いている AssemblerState。状態を持たないモジュール関数の diag() が
+# ここを見る。「今のパスで診断を出してよいか」の判定と had_error の管理は
+# AssemblerState 側にあるので、その橋渡しとして使う。
 _ACTIVE_STATE = None
 
 
 def diag(text, set_error=True, force=False):
-    """診断メッセージを1本化して出す入口。
+    """診断行を 1 本出す。
 
-    状態がまだ無い（起動直後など）ときは素直に stderr へ出し、そうでなければ
-    AssemblerState.diag() に委譲して「表示してよいパスか」の判定と had_error の
-    設定を任せる。set_error=True なら、表示された時点でビルドは失敗扱いになる。
+    set_error で had_error を立てるかを、force でパスに関わらず出すかを選ぶ。
+    AssemblerState がまだ無い時期（引数解析中など）は stderr へ直接書く。
     """
     st = _ACTIVE_STATE
     if st is None:
@@ -75,36 +81,27 @@ def diag(text, set_error=True, force=False):
 
 
 def diag_error(msg, force=False):
-    """" error - ..." 形式のエラー。表示されるとビルドは失敗（出力を書かない）。"""
+    """エラーとして 1 行出し、had_error を立てる。"""
     return diag(f" error - {msg}", set_error=True, force=force)
 
 
 def diag_warning(msg, force=False):
-    """" warning - ..." 形式の警告。表示されてもビルドは継続する。"""
+    """警告として 1 行出す。had_error は立てないので出力は作られる。"""
     return diag(f" warning - {msg}", set_error=False, force=force)
 
 
-# 式を評価している文脈。パターンファイル側の式か、アセンブリソース側の式かで
-# 使える記法（`!!!` 等のパターン専用トークン）が変わる。
+# 式をどちらの文脈で読んでいるか。パターンファイル側とアセンブリソース側で
+# 使える記法が違う（`!!!` などはパターン専用）。
 EXP_PAT = 0
 EXP_ASM = 1
 
 
 class ExprCaps:
-    """式評価器の「この場では何が書けるか」を表す能力記述子。
+    """式評価器で使える項の集合を表す記述子。
 
-    本体・マクロ層・ミニ言語の 3 つの層が同じ式評価器を呼ぶが、呼ぶ時点で
-    意味を成す項目は層ごとに違う。たとえばパターン変数 `a` は、パターン行を
-    符号化している最中にしか束縛されていないし、`!!!` は VLIW のパターン行
-    でしか意味がない。どの項目が生きているかを 1 か所にまとめ、評価器は
-    `state.expcaps` を見て判断する。呼ぶタイミングが変われば記述子が変わり、
-    使える機能が変わる。
-
-    - `patvars` … パターン変数（`a` でも `var_2` でも同じ）
-    - `vliw`    … `!!!` / `!!!!`
-    - `labels`  … ラベル名・`.equ` 名の参照
-    - `loc`     … `$$` / `$.`
-    - `syms`    … `#name` と `.setsym` の記号
+    同じ評価器をパターン行・アセンブリ行・ミニ言語・マクロ層から呼ぶが、
+    どこでも全部の項が意味を持つわけではない。どれを許すかをこの記述子に
+    持たせ、評価器本体は呼び出し元を知らずにこれだけを見る。
     """
 
     __slots__ = ('name', 'patvars', 'vliw', 'labels', 'loc', 'syms')
@@ -122,65 +119,70 @@ class ExprCaps:
         return f"<ExprCaps {self.name}>"
 
 
-# パターンファイルの式。すべて使える。
+# パターン行はすべて使える。アセンブリ行にはパターン変数と VLIW 計数が無い。
+# ミニ言語はラベル・`$$`・`#記号` は読めるが、`.func` 本体の実行中は
+# パターン変数を束縛しているものが無いので、それだけ落とす。
 CAPS_PAT = ExprCaps('pattern', patvars=True, vliw=True)
-# アセンブリソース行の式。パターン変数と VLIW 計数は無い。
 CAPS_ASM = ExprCaps('assembly')
-# ミニ言語 (`.func` 本体) から呼ぶとき。ラベル・`$$`・`#記号` は読めるが、
-# パターン変数はその場で束縛されていないので落とす。
 CAPS_MINI = ExprCaps('mini language')
-exp_typ = 'i'          # 'i'=整数モード / 'f'=浮動小数点モード
+# 式の評価モード。'i' が整数、'f' が IEEE-754 倍精度。error_patterns と
+# 浮動小数点オペランドの評価で 'f' に切り替わる。
+# 実際に読まれるのは AssemblerState.exp_typ のほうで、このモジュール変数は
+# 現在どこからも参照されていない。
+exp_typ = 'i'
 
 
-# パターン中の "[[" / "]]"（省略可能グループ）を1文字に潰した内部表現。
-# 2文字のままだと以降の走査が全て2文字先読みを強いられるため、
-# 印字不可能な1文字に置き換えてから扱う。
+# パターン中の `[[` / `]]`（省略可能グループ）を 1 文字に潰した内部表現。
+# 2 文字のままだと以降の走査がすべて 2 文字先読みを強いられるので、
+# 印字できない 1 文字に置き換えてから扱う。
 OB = chr(0x90)
 CB = chr(0x91)
 
-# ソース行の「本物の」VLIW スロット区切り "!!" / 終端 "!!!!" を1文字に潰した内部表現。
-# `\!\!` とエスケープされた「文字としての !!」と区別するために使う。
-# 詳しくは StringUtils.resolve_vliw_escapes() を参照。
+# ソース行の「本物の」VLIW スロット区切り `!!` と終端 `!!!!` を 1 文字に
+# 潰した内部表現。`\!\!` とエスケープされた「文字としての !!」と
+# 区別するために使う。StringUtils.resolve_vliw_escapes() を参照。
 VLIW_SEP = chr(0x92)
 VLIW_STOP = chr(0x93)
 
 
 # 未定義ラベルの値を表す番兵。None ではなく巨大な整数にしてあるのは、
-# ラベル値が `label+4` や `label-$$` のように普通の算術に流れ込むため。
-# 整数にしておけば例外を出さずに「未定義性」が計算結果へ伝播していく。
+# ラベル値が `label+4` や `label-$$` のように普通の算術へ流れ込むため。
+# 整数にしておけば例外を出さずに「未定義性」が計算結果へ伝わっていく。
+# VAR_UNDEF はパターン変数側の未束縛値で、マッチしなかった省略可能
+# オペランドが 0 として読まれるのと同じ 0。
 UNDEF = (1 << 1024) - 1
 VAR_UNDEF = 0
 
-# .check の許可リストに `""` が書かれたときに積む印。
-# 「そのオペランドは省略可、省略時は VAR_UNDEF(0)」を意味する。
-# シンボル名は get_symbol_word で必ず1文字以上・大文字化されるため、
-# 空文字は実在のシンボル名と衝突しない。
+# `.check` の許可リストに `""` が書かれたときに積む印。「その位置は省略可、
+# 省略時は VAR_UNDEF」を意味する。シンボル名は get_symbol_word() で必ず
+# 1 文字以上・大文字化されるため、空文字が実在のシンボル名と衝突しない。
 CHECK_OMIT = ''
 
-# UNDEF から算術で派生した値を「未定義由来」と判定する閾値。
-# UNDEF そのものと完全一致しなくても（UNDEF+4 等）、この大きさなら未定義由来とみなす。
+# UNDEF から算術で派生した値を「未定義由来」と判定する閾値。UNDEF そのものと
+# 完全一致しなくても（`UNDEF+4` など）、この大きさなら未定義由来とみなす。
 _UNDEF_DERIVED_THRESHOLD = 1 << 768
 
 
-# axx は 256bit 整数・128bit 浮動小数点まで正当に扱うため、2**256 程度までは
-# 本物の値でありうる。その帯域に入った値については、上の閾値ヒューリスティックが
-# 誤判定しうることを一度だけ警告する。
+# axx は 256bit 整数・128bit 浮動小数点までを正当に扱うので、2**256 程度までは
+# 本物の値でありうる。その帯に入った値については上の閾値ヒューリスティックが
+# 誤判定しうることを、一度だけ警告する。
 _UNDEF_SANE_CEILING = 1 << 256
 _undef_ceiling_warned = False
 
 # `*(値, 位置)` のバイト抽出でシフトさせる最大ビット数。これを超えると結果は
-# 符号（0 か -1）にしかならないので、頭打ちにしても値は変わらず、
-# 巨大なシフト量を渡されたときの暴走だけを防げる。
+# 符号（0 か -1）にしかならないので、頭打ちにしても値は変わらず、巨大な
+# シフト量を渡されたときの暴走だけを防げる。_SEXT_MAX_BITS は `x'bits` の
+# 符号拡張幅の上限で、超えたら 0 にして警告する。
 _BYTE_EXTRACT_SHIFT_MAX = 1 << 20
 _SEXT_MAX_BITS = 128
 
 
-# 本体の式評価器が持つ単項/後置演算子の実装。マクロ層からも同じ意味で呼べる
-# ように、評価器の外へ出して 1 か所にまとめてある。どれも診断は出さず、
-# 「値と、あれば伝えるべき文言」を返すだけにして、報告はそれぞれの層に任せる。
 
 def op_msb(v):
-    """`@v` … 最上位の立っているビットの位置を右から数えた値。"""
+    """`@v` — 最上位の立っているビットの位置を右から数えて返す。
+
+    ヘビマルマッタ演算子。非数・無限は 0 とする。
+    """
     if isinstance(v, float):
         if v != v or v in (float('inf'), float('-inf')):
             return 0
@@ -196,10 +198,9 @@ def op_msb(v):
 
 
 def op_sext(x, bits):
-    """`x'bits` … ビット `bits-1` を符号ビットとみなした符号拡張。
+    """`x'bits` — ビット bits-1 を符号ビットとみなした符号拡張。
 
-    返り値は (値, 警告文 or None, 続行してよいか)。非有限の浮動小数点値が
-    来たときだけ「続行してよいか」が False になり、呼び出し側は連鎖を打ち切る。
+    返り値は (値, 伝えるべき文言か None, 成否)。報告はせず呼び出し側に任せる。
     """
     try:
         x = int(x)
@@ -216,10 +217,9 @@ def op_sext(x, bits):
 
 
 def op_byte(x, index):
-    """`*(x, index)` … 下位から数えて `index` バイト目より上を残した値。
+    """`*(x, index)` — 下位から数えて index バイト目より上を残した値。
 
-    返り値は (値, エラー文 or None)。上限を超える分は符号で埋まるだけなので
-    頭打ちにする（caxx.c の 256bit 算術シフトと同じ結果になる）。
+    返り値は (値, 伝えるべき文言か None)。シフト量は上限で頭打ちにする。
     """
     try:
         index = int(index)
@@ -235,13 +235,11 @@ def op_byte(x, index):
 
 
 def _ieee_pow(a, b):
-    """C の pow(a,b) と同じ IEEE754 のべき乗セマンティクスで計算する。
+    """`**` の浮動小数点版。IEEE-754 の定義域外の答えを C 側とそろえる。
 
-    Python の ** / math.pow は範囲外（OverflowError）や定義域外
-    （負の底に非整数指数、ValueError）で例外を投げるが、Cの pow() は
-    例外を投げず ±inf / nan を返す。caxx.c の浮動小数点モード(exp_typ_float)
-    はまさに pow() をそのまま呼ぶので、同一入力で「Python はエラーで0、
-    C は inf/nan のビットパターン」という食い違いが起きないよう揃える。
+    負の底に非整数指数を与えた定義域エラーでは、glibc の pow() が符号ビットの
+    立った nan (0xfff8...) を返す。caxx.c と突き合わせて実測で確認したうえで、
+    同じビットパターンになるよう copysign で符号を付けている。
     """
     a = float(a)
     b = float(b)
@@ -250,8 +248,6 @@ def _ieee_pow(a, b):
     if a == 0.0 and b < 0.0:
         return float('inf')
     if a < 0.0 and b != math.floor(b):
-        # glibc の pow() は負の底・非整数指数の定義域エラーで、符号ビットが
-        # 立った nan (0xfff8...) を返す。実測で caxx.c と突き合わせて確認済み。
         return math.copysign(float('nan'), -1.0)
     try:
         return math.pow(a, b)
@@ -264,7 +260,11 @@ def _ieee_pow(a, b):
 
 
 def _is_undef_derived(v):
-    """値が UNDEF（未定義ラベル）に由来するか判定する。"""
+    """値が未定義ラベル由来かを閾値で判定する。
+
+    _UNDEF_SANE_CEILING と閾値の間に入った値は正当な巨大値と区別が付かない
+    ので、そのときだけ一度警告してから「未定義由来ではない」と答える。
+    """
     global _undef_ceiling_warned
     if v == UNDEF:
         return True
@@ -282,19 +282,13 @@ def _is_undef_derived(v):
 
 @functools.lru_cache(maxsize=None)
 def _lead_caps(pat_text):
-    """パターン先頭の連続する大文字（＝ニーモニック部分）と、その直後が
-    「英数字を食える書き方か」を返す。
+    """命令書式の先頭にある大文字の連なりを返す。
 
-    パターン照合は1行につき数千個のパターンを試すため、本格的な照合に入る前の
-    足切りに使う。ソース行の先頭がこの文字列で始まっていなければ、そのパターンは
-    絶対にマッチしないので即座に捨てられる。結果は lru_cache で使い回す。
-
-    第2要素 closed が True なら、ニーモニック直後のパターン文字は英数字を
-    絶対に食えない（`.` `,` `(` `#` 等のリテラル、またはパターン終端）。この場合
-    ソース側がそこで英数字を続けていれば不一致が確定するので、`MOVE` 系の
-    パターンを `MOVEM` の行に試す、といった無駄打ちを消せる。
-    小文字（シンボル）・`!`（式）・`\\`（エスケープ）・`[`（省略可グループ）・
-    数字は英数字を食いうるので closed は False にする。
+    パターン索引の鍵に使う。空白は読み飛ばし、大文字以外が出たところで止める。
+    返り値は (大文字の連なり, その直後が索引を閉じてよい文字か)。閉じてよいのは
+    次が小文字・数字・`!`・`\\`・`[` のいずれでもないとき、つまりニーモニックが
+    そこで終わっているときだけで、そうでなければ前方一致の見落としが起きる。
+    lru_cache にしてあるのは、同じ書式が照合のたびに何度も問われるため。
     """
     p = []
     i = 0
@@ -313,6 +307,9 @@ def _lead_caps(pat_text):
     return ''.join(p), closed
 
 
+# 行の位置によらず効き方が変わらないディレクティブ。パターンファイルの先頭に
+# 並ぶこれらは、ソースを 1 行読むたびに解釈し直す必要がないので、
+# _pat_hoist_scan() が「先に 1 回だけ処理してよい塊」として切り出す。
 _HOIST_TEXT_ONLY = ('.check', '.clrcheck', '.reloc', '.clrreloc',
                     '.symbolc', '.passthru', '.eol', '.textmode',
                     '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
@@ -321,10 +318,10 @@ _HOIST_TEXT_ONLY = ('.check', '.clrcheck', '.reloc', '.clrreloc',
 
 
 def _pat_text_dynamic(t):
-    """ソース行によって値が変わりうる書き方を含むか。
+    """欄の中身がソース行ごとに変わりうるか。
 
-    パターン行の式はパターン変数（小文字）・`$.`/`$$`・`#名前`・`'`・`@` を
-    読めるので（マニュアル 6.3）、これらがあれば行ごとに結果が変わりうる。
+    `!` `$` `#` `@` `'` と小文字（パターン変数）のどれかを含めば、
+    行をまたいで使い回せないので持ち上げの対象から外す。
     """
     for ch in t:
         if ch in "!$#@'":
@@ -335,8 +332,7 @@ def _pat_text_dynamic(t):
 
 
 def _pat_is_name_list(t):
-    """名前の並び（`X0,X1,…`）か。カンマがあれば集合として読まれるので、
-    式の評価（ラベルを読みうる）には落ちない。"""
+    """欄が「大文字の名前をカンマで並べたもの」だけで出来ているか。"""
     comma = False
     for ch in t:
         if ch == ',':
@@ -349,10 +345,10 @@ def _pat_is_name_list(t):
 
 
 def _pat_dir_line_invariant(i):
-    """このディレクティブ行は、どのソース行でも同じ結果になるか。
+    """このディレクティブ行を、ソースを読む前に 1 回だけ処理してよいか。
 
-    判断がつかないものは False を返す（畳み込まない側に倒す）。
-    caxx.c の pat_dir_line_invariant() と同じ規則である。
+    値が定数で、評価の時点に依存しないものだけを真にする。判断に迷うものは
+    必ず偽を返す（持ち上げないだけなので遅くなるだけで、結果は変わらない）。
     """
     name = i[0]
     if name == '.setsym':
@@ -361,18 +357,16 @@ def _pat_dir_line_invariant(i):
         if _pat_text_dynamic(nm):
             return False
         if not val:
-            return True                      # 値なし（0 になる）
+            return True
         v = val.lstrip(' \t')
         if v[:1] == '"':
-            return True                      # 文字列シンボル
+            return True
         if v[:1] == '[':
-            return False                     # 配列は中身が式になりうる
+            return False
         if _CONST_SETSYM_RE.match(val):
-            return True                      # 定数式
-        return _pat_is_name_list(val)        # 名前の集合
+            return True
+        return _pat_is_name_list(val)
     if name in _HOIST_TEXT_ONLY:
-        # どれも名前や型名の文字どおりの並びだけを見る（式を読まない）。
-        # 変数名の小文字は普通なので _pat_text_dynamic は使わない。
         for f in i[1:]:
             if f and any(ch in "!$#@" for ch in f):
                 return False
@@ -391,31 +385,21 @@ def _pat_dir_line_invariant(i):
     if name == '.error':
         return bool(_CONST_SETSYM_RE.match(i[1])) and i[2].lstrip(' \t')[:1] == '"'
     if name == '.elftype':
-        # 型名の表は行ごとに作り直さないので、同じ宣言を毎行やり直す必要はない。
         if not i[1] or any(ch in "!$#@'" for ch in i[1]):
             return False
-        # 幅欄・PC相対欄（省略可）も定数でなければ畳み込まない。
         for f in i[3:]:
             if f and not _CONST_SETSYM_RE.match(f):
                 return False
         return bool(_CONST_SETSYM_RE.match(i[2]))
-    # `.clearsym` `.map` `.free` `.enum` `.clrenum` `EPIC` は畳み込まない。
     return False
 
 
 def _pat_hoist_scan(pat, isdir):
-    """パターン表の先頭に並ぶ「行によって結果が変わらないディレクティブ行」を
-    どこまで畳み込めるか決める。
+    """先頭から何行を事前処理に持ち上げられるかを数える。
 
-    照合はソース1行ごとにパターン表を頭からたどり直すので、レジスタ名の
-    `.setsym` や `.check` が並ぶ前置きも行数ぶん実行していた（aarch64 では
-    1 行につき 573 行）。1度だけ実行して状態を控え、以後は控えた状態を戻す。
-
-    返すのは (畳み込む行数, 前置きが書く欄の集合) である。0 なら畳み込まない。
-    条件は caxx.c の pat_hoist_scan() と同じ。
-      - 先頭から続くのが空行か畳み込めるディレクティブ行だけであること
-        （普通のパターン行が出たらそこで終わり）。
-      - 前置きが読む名前を、前置きより後ろの行が書き換えないこと。
+    返り値は (持ち上げる行数, その中で設定される欄の名前の集合)。
+    持ち上げた範囲が読んでいる名前を、あとの行の `.setsym` / `.clearsym` /
+    `.free` が書き換えている場合は、順序依存が壊れるので持ち上げを諦める。
     """
     h = 0
     fields = set()
@@ -438,9 +422,6 @@ def _pat_hoist_scan(pat, isdir):
     if h <= 0 or h >= len(pat):
         return 0, fields
 
-    # 前置きは名前を読む（`.check` の名前並び、集合の `.setsym` など）。
-    # 配列・文字列シンボルの表は1行ごとに作り直さないので、前置きが読む名前を
-    # 後ろの行が書き換えると控えた状態が古くなる。
     reads = set()
     for row in range(h):
         i = pat[row]
@@ -458,12 +439,12 @@ def _pat_hoist_scan(pat, isdir):
             if not i[1]:
                 return 0, fields
             if _CONST_SETSYM_RE.match(i[2]):
-                continue                 # 数値だけならシンボル表にしか触らない
+                continue
             w = i[1]
         elif nm in ('.clearsym', '.free'):
             w = i[2] if i[2] else i[1]
             if not w:
-                return 0, fields         # 全部消す
+                return 0, fields
         else:
             continue
         if StringUtils.upper(w) in reads:
@@ -472,18 +453,12 @@ def _pat_hoist_scan(pat, isdir):
 
 
 def _build_pat_index(pat, isdir):
-    """ニーモニック（パターン先頭の連続する大文字）を鍵にした索引を作る。
+    """先頭の大文字列をキーにしたパターン索引を作る。
 
-    ソース1行ごとにパターン表を頭から全部たどり、1行ずつ _lead_caps() の
-    足切りにかけていた。パターン数 × ソース行数の空回りで、aarch64 の
-    パターンファイル（展開後 1 万行）では 1 行につき 1 万回になる。
-    行のニーモニックで引ける表にしておけば、たどるのは候補だけで済む。
-
-    返すのは (索引, always, 鍵の最大長) である。索引は
-    ニーモニック → (直後が英数字でもよい行, 直後が英数字なら不一致の行)。
-    always はニーモニックを持たない行とディレクティブ行の番号（昇順）で、
-    行ごとに必ずたどる。索引が返す候補と always を合わせた集合は、
-    足切りが通す集合とちょうど同じである。
+    照合は全パターンを試して最良のものを選ぶ方式なので、素直に書くと 1 行あたり
+    全件走査になる。ニーモニック先頭の大文字で先に絞り、どのキーにも属さない
+    もの（先頭が大文字でない書式とディレクティブ）だけを always に入れて
+    常に試す。これで結果を変えずに候補数を落とせる。
     """
     index = {}
     always = []
@@ -493,8 +468,6 @@ def _build_pat_index(pat, isdir):
         closed = True
         if i and i[0]:
             pfx, closed = _lead_caps(i[0])
-        # ディレクティブ行は名前が大文字のこともある（`EPIC`）が、行ごとに
-        # 必ず実行しなければならないので always に入れる。
         if not pfx or isdir[row]:
             always.append(row)
             continue
@@ -508,7 +481,16 @@ def _build_pat_index(pat, isdir):
 
 
 def _pat_candidates(index, maxkey, lin):
-    """照合にかける行 lin のニーモニックで索引を引き、候補行を昇順で返す。"""
+    """ソース行 1 行に対して、照合を試す価値のあるパターン行番号を返す。
+
+    行の先頭から空白を飛ばしつつ大文字化した文字を積み、1 文字目・2 文字目…と
+    伸ばした鍵で索引を引く。索引の片側（ent[0]）はニーモニックがそこで終わって
+    いない書式なので常に候補になり、もう片側（ent[1]）はそこで終わっている
+    書式なので、ソース側の次の文字が語を続ける文字でないときだけ候補にする。
+    これを外すと `ADD` のパターンが `ADDS` の行に当たってしまう。
+    返す番号は昇順にそろえる。パターンの採択は特異度スコアで決まるので
+    順序は結果に影響しないが、診断の出る順を実装間でそろえるために並べる。
+    """
     if not maxkey:
         return ()
     key = []
@@ -517,7 +499,6 @@ def _pat_candidates(index, maxkey, lin):
         if ch == ' ':
             continue
         up = ch.upper()
-        # 1文字にならない大文字化（'ß' → 'SS' 等）はニーモニックに現れない。
         key.append(up if len(up) == 1 else '\0')
         nextraw.append(lin[ci + 1] if ci + 1 < len(lin) else '')
         if len(key) >= maxkey:
@@ -535,34 +516,33 @@ def _pat_candidates(index, maxkey, lin):
     return cand
 
 
-# パターン記法の基本規約: 大文字＝そのまま照合するリテラル（ニーモニック）、
-# 小文字＝.setsym で定義されたシンボル（レジスタ名等）を取るプレースホルダ。
+# 照合で使う文字クラス。パターンの `instruction` 欄では大文字が文字定数、
+# 小文字がパターン変数という約束なので、この 2 つの区別が構文そのものを決める。
 CAPITAL = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 LOWER = "abcdefghijklmnopqrstuvwxyz"
-# 集合式の演算子（`.setsym::x::a&b` など）。
 SET_OPS = "&|^+-"
 DIGIT = '0123456789'
 XDIGIT = "0123456789ABCDEF"
 ALPHABET = LOWER + CAPITAL
 
-# _lead_caps 用。ニーモニック直後に来ると「英数字を食いうる」パターン文字。
-#   小文字 … .setsym シンボルのプレースホルダ
-#   '!'    … 式
-#   '\'    … 次の1文字をリテラル化するエスケープ
-#   '['    … [[ ]] 省略可グループの開き
-#   数字   … リテラルの数字
+# _PFX_OPEN … 先頭大文字列の直後にこれが来たら、ニーモニックはまだ続いている
+#             （小文字のオペランド、`!` の式捕捉、`[[` の省略可能部分など）。
+# _PFX_WORD … 語を構成する文字。ソース側で鍵の直後がこれなら語の途中なので、
+#             そこで終わる書式を候補に入れてはいけない。
 _PFX_OPEN = frozenset(LOWER + DIGIT + '!\\[')
-# 足切りで「ニーモニックが途中で終わっていないか」を見るときの語構成文字。
 _PFX_WORD = frozenset(ALPHABET + DIGIT + '_')
 
 
 def _is_sub_name(s):
-    """`.sub::名前` / `!S{{名前}}` に書けるサブ表の名前か。"""
+    """`.sub::名前` / `!S{{名前}}` に書ける名前かを見る。"""
     return bool(s) and all(c in _PFX_WORD for c in s)
 
 
 def _dot_kw(s):
-    """行頭の `.word` を大文字で返す。`.` で始まらなければ空文字。"""
+    """行頭のドット付きキーワードを大文字で取り出す。
+
+    `.setsym::x::1` なら `.SETSYM`。ドットで始まらない行は空文字を返す。
+    """
     t = s.strip()
     if not t.startswith('.'):
         return ''
@@ -573,13 +553,12 @@ def _dot_kw(s):
 
 
 def _parse_func_header(l):
-    """`.func 名前(引数, 引数)` の見出しを (名前, 引数リスト, エラー文) に分解する。
+    """`.func` のヘッダを読み、(関数名, 引数名のリスト, エラー文言) を返す。
 
-    引数欄は丸ごと省略できる（`.func name`）。空の括弧 `.func name()` も同じ
-    意味。`.call 名前(引数)` の呼び出し側と同じ書き方にそろえるための形。
-
-    旧来の `.func::名前::引数,引数` も読める。`.func` の直後が `::` のときだけ
-    そちらに切り替えるので、新しい形と取り違えることはない。
+    書き方が 2 通りある。`.func 名前(引数, ...)` が現在の形で、`.func::名前::引数`
+    が古い形。`.func` の直後に `::` が来るかどうかだけで選び分けるので、
+    古いパターンファイルはそのまま動く。引数が無いときは `()` も省けるため、
+    名前だけで行が終わる形も受ける。エラー文言は None なら成功。
     """
     t = l.strip()
     i = 1
@@ -588,7 +567,6 @@ def _parse_func_header(l):
     i = StringUtils.skipspc(t, i)
 
     if t[i:i + 2] == '::':
-        # 旧形式。`::` で最大3欄に割る。
         hdr = []
         hi = 0
         while True:
@@ -628,19 +606,18 @@ def _parse_func_header(l):
     return nm, ps, None
 
 
-# ミニ言語のブロック開始・終了キーワード。パターンファイルを読む段階で
-# `.endfunc`（関数本体を閉じる）が `.if`/`.while`/`.for` の中で来ていないか
-# 見分けるために使う。`.return` はここでは特別扱いしない（早期リターン文と
-# して本体にそのまま積むだけで、関数を閉じるのは常に `.endfunc`）。
+# ミニ言語の入れ子を数えるための開き／閉じキーワード。`.func` 本体を読む段階で
+# 深さを数え、`.endfunc` がどの入れ子を閉じるのかを決めるのに使う。
 _MINI_OPEN = frozenset(('.IF', '.FOR', '.WHILE'))
 _MINI_CLOSE = frozenset(('.ENDIF', '.NEXT', '.ENDWHILE'))
 
 
 class _MiniFunc:
-    """`.func::名前::引数 … .endfunc` で定義されたミニ言語の関数。
+    """ミニ言語の関数 1 個。`.func` から `.endfunc` までを持つ。
 
-    入れ子で定義された関数は children に入り、名前解決は自分 → 親 → … →
-    トップレベルの順に外側へたどる。body は読み込み時に文の木へ変換する。
+    lines は読み込んだ生の行で、body は MiniParser が構文木にしたもの。
+    parent / children を持つのは入れ子定義のためで、呼び出し名の解決は
+    内側から外側へたどる。file と line は診断にそのまま出す定義位置。
     """
 
     __slots__ = ('name', 'params', 'lines', 'body', 'parent', 'children',
@@ -658,8 +635,10 @@ class _MiniFunc:
         self.depth = 0
 
 
-# パターンファイルの第2フィールド（エラー条件）が返す番号 → メッセージ。
-# 例: `ADD A,R!n :: n>7;5 :: ...` は n>7 のとき番号5（レジスタ範囲外）を報告する。
+# error_patterns の `;` のあとに書く番号から引く文言。番号 0 は使わない。
+# 4 と 7 以上が空文字なのは意図したもので、エラーは起こるがメッセージは
+# 出ない。パターンファイル側から `.error::n::"文言"` で追加・上書きできる。
+# caxx.c の ERRORS と同じ並びでなければならない。
 ERRORS = [
     "",
     "Invalid syntax.",
@@ -671,28 +650,24 @@ ERRORS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# アーキテクチャ別 ELF 情報テーブル
+# `-o` の ELF 出力でリロケーションを書くための、マシンごとの組み込み表。
+# 鍵は ELF の e_machine 値。各欄の意味:
 #
-# キーは ELF ヘッダの e_machine 値（-m オプションで指定する番号）。
-# 各エントリの意味:
+#   name           診断に出す名前
+#   elfclass       慣習的な ELF クラス。1 が ELF32、2 が ELF64。`-f` 未指定時の既定
+#   is_rela        真なら .rela（加数をセクションに持つ）、偽なら .rel
+#   width_guess    欄の幅（バイト）→ 型番号。型が明示されないラベル参照を
+#                  幅から推測するときに使う。優先順位はこれが最も低い
+#   pc_rel         PC 相対の型番号。加数の計算が絶対参照と変わる
+#   extern_default 外部シンボル参照の既定の型
+#   named          ソースの `::型名` とパターンの `.reloc` で書ける名前
+#                  → (型番号, 欄の幅)
+#   dwarf_abs      DWARF セクション内の絶対参照に使う型
 #
-#   elfclass       1=ELF32 / 2=ELF64。ヘッダ・シンボル・リロケーション各構造体の
-#                  サイズとフィールド並びが変わる（Elf32_Sym と Elf64_Sym は
-#                  幅だけでなくフィールドの順序自体が異なる点に注意）。
-#   is_rela        True=RELA（加数を専用フィールドに持つ）/ False=REL（加数を
-#                  命令バイト列自体に埋め込む）。i386 と ARM(32) だけが REL。
-#   width_guess    リロケーション対象フィールドのバイト幅 → 既定のリロケーション型。
-#                  ソース側が `::型名` を明示しなかったときに使う。
-#   pc_rel         PC 相対のリロケーション型番号の集合。加数の計算に命令アドレスを
-#                  含める必要があるかどうかの判定に使う。
-#   extern_default `.extern` で宣言された外部シンボル参照の既定型。
-#   named          ソースに書ける記号名（`label::pc32` 等）→ (型番号, バイト幅)。
-#   dwarf_abs      DWARF セクション内の絶対アドレス参照に使う型番号。
-#
-# reloc_bytes（型番号→幅）と reverse（型番号→名前）は named から自動生成される。
-# 下の _build_elf_machine_tables() を参照。
-# ---------------------------------------------------------------------------
+# ここに無い e_machine も `-m` に書ける。そのときは型も欄もパターンファイルの
+# ELF 記述（.elfmachine / .elftype / .elffield ...）から来る。RISC-V の欄が
+# データ型だけで pc_rel が空なのはそのためで、CALL_PLT / BRANCH / JAL / HI20 /
+# LO12 といった命令側の型は riscv64.axx が自分で宣言している。
 _ELF_MACHINE_RAW = {
     3: dict(
         name='i386', elfclass=1, is_rela=False,
@@ -761,9 +736,6 @@ _ELF_MACHINE_RAW = {
     ),
     40: dict(
         name='ARM', elfclass=1, is_rela=False,
-        # 幅2の既定は R_ARM_ABS16(5)。かつて 4 と書かれていたが、ARM の 4 は
-        # R_ARM_LDR_PC_G0（32bit 命令フィールド用）で 16bit データ参照ではなく、
-        # 下の named にも reloc_bytes にも現れない値だった。
         width_guess={4: 3, 2: 5, 1: 8},
         pc_rel={1, 3},
         extern_default=3,
@@ -819,8 +791,6 @@ _ELF_MACHINE_RAW = {
             'pc64': (260, 8), 'rel64': (260, 8),
             'pc32': (261, 4), 'rel32': (261, 4),
             'pc16': (262, 2), 'rel16': (262, 2),
-            # 命令フィールド型。値は命令語のビット欄に詰められるため、素の整数が
-            # 並ぶデータ型とは扱いが異なる（AARCH64_INSN_RELOCS を参照）。
             'movw_uabs_g0': (263, 4), 'movw_uabs_g0_nc': (264, 4),
             'movw_uabs_g1': (265, 4), 'movw_uabs_g1_nc': (266, 4),
             'movw_uabs_g2': (267, 4), 'movw_uabs_g2_nc': (268, 4),
@@ -840,8 +810,6 @@ _ELF_MACHINE_RAW = {
             'ldst32_abs_lo12_nc': (285, 4),
             'ldst64_abs_lo12_nc': (286, 4),
             'ldst128_abs_lo12_nc': (299, 4),
-            # GOT 経由。リンカが GOT エントリを作るので、値はアセンブル時には
-            # 決まらない。欄は 0 で出し、リンカが埋める。
             'got_ld_prel19': (309, 4),
             'got_page': (311, 4), 'adr_got_page': (311, 4),
             'got_lo12': (312, 4), 'ld64_got_lo12_nc': (312, 4),
@@ -863,17 +831,11 @@ _ELF_MACHINE_RAW = {
 
 
 def _build_elf_machine_tables(raw):
-    """_ELF_MACHINE_RAW から派生ビューを作って完成形のテーブルを返す。
+    """生の表から、引きやすい 3 つの写像を作る。
 
-    `named` は "名前 → (型番号, バイト幅)" という1つの表に情報をまとめてあるが、
-    実際に引きたい向きは3通りあるので、ここで展開しておく:
-
-      named       名前 → 型番号          （ソースの `::pc32` を解決する）
-      reloc_bytes 型番号 → バイト幅      （加数の計算に必要）
-      reverse     型番号 → 名前          （-E での TSV 書き出しに使う）
-
-    reverse は setdefault なので、同じ型番号に別名が複数ある場合（`pc32` と
-    `rel32` が同じ型番号を指す等）は先に書いた方が正式名として採用される。
+    named が名前 → 型番号、reloc_bytes が型番号 → 欄の幅、reverse が
+    型番号 → 名前。reverse は setdefault なので、同じ型番号に別名が
+    付いている場合（pc32 と rel32 など）は先に書いたほうが診断に出る。
     """
     out = {}
     for machine, entry in raw.items():
@@ -889,26 +851,22 @@ def _build_elf_machine_tables(raw):
     return out
 
 
-# 対応アーキテクチャ: i386(3) m68k(4) PowerPC(20) PowerPC64(21) s390x(22)
-# ARM(40) SuperH(42) SPARCV9(43) x86-64(62) AArch64(183) RISC-V(243)
 ELF_MACHINES = _build_elf_machine_tables(_ELF_MACHINE_RAW)
 
 
-# 組み込みの表に無い e_machine を `-m` に渡したときの土台。中身はパターン
-# ファイルの ELF 宣言（`.elfmachine` 以下、マニュアル 3.7.7 節）で埋める。
-# 何も宣言しなければリロケーション型を1つも持たない表になり、型の決まらない
-# 参照はリロケーションを出さずに飛ばす（当てずっぽうの型番号を書くよりよい）。
+# 組み込みの表に無いマシンの土台。型が 1 つも無いので、パターンファイルが
+# 何も宣言しなければ型の決まらない参照はリロケーションを出さない。
+# 当てずっぽうの型番号を書いてリンカを騙すよりは、出さないほうを選ぶ。
 _ELF_MACHINE_GENERIC = dict(
     name='', elfclass=2, is_rela=True, width_guess={}, pc_rel=frozenset(),
     extern_default=0, named={}, reloc_bytes={}, reverse={}, dwarf_abs=0)
 
 
 def _elf_decl_type(state, named, text):
-    """ELF 宣言の型欄（型名でも型番号でもよい）を型番号にする。読めなければ None。
+    """パターンファイルに書かれた型の綴りを型番号にする。
 
-    名前は `.elftype` で決めたものでもマシンの名前表のものでもよく、大小は
-    区別しない。番号は 10進・0x・0o・0b が書ける。
-    caxx.c の elf_decl_type() と同じ規則である。
+    数値ならそのまま、名前なら `.elftype` が宣言したもの、次に組み込みの表を
+    見る。どれでもなければ None を返し、呼び出し側はその宣言を無視する。
     """
     if not text:
         return None
@@ -927,17 +885,14 @@ def _elf_decl_type(state, named, text):
 
 
 def elf_machine_table(state):
-    """`-m` で選んだマシンの表に、パターンファイルの ELF 宣言を重ねた実効表。
+    """いま有効な ELF マシン記述を組み立てて返す。
 
-    組み込みの ELF_MACHINES は読み取り専用の土台で、その上に `.elftype` /
-    `.elfwidth` / `.elfextern` / `.elfdwarf` / `.elfrela` / `.elfclass` /
-    `.elfmachine`（マニュアル 3.7.7 節）が宣言した内容を重ねる。組み込みの表に
-    無い e_machine でも、宣言さえあればここで表が組み上がる。組み込みの表と
-    同じ e_machine なら、宣言した分だけを差し替える。
-
-    宣言は組み立てを始める前に出そろって以後変わらないのが普通なので、宣言の版
-    （decl_gen）とマシン番号を鍵にして控える。
-    caxx.c の elf_machine_effective() と同じである。
+    組み込みの表を土台に、パターンファイルの宣言（.elftype / .elffield /
+    .elfclass / .elfrela / .elfwidth / .elfextern / .elfdwarf / .elfheader）を
+    かぶせたものがここで出来る。同じ名前なら宣言のほうが組み込みに勝つ。
+    これを 1 行ごとに作り直すと重いので (machine, decl_gen) を鍵にして覚える。
+    decl_gen は宣言が増えるたびに進む世代番号なので、宣言を読み終えた時点で
+    鍵が変わり、古い表が残ることはない。
     """
     e = state.elf
     key = (e.machine, e.decl_gen)
@@ -953,10 +908,6 @@ def elf_machine_table(state):
     extern_default = base['extern_default']
     dwarf_abs      = base['dwarf_abs']
 
-    # 名前の並びは「組み込みの名前のうち `.elftype` で同じ綴りを宣言していない
-    # もの」→「`.elftype` の宣言（宣言順）」。名前引き・逆引き・幅引きはどれも
-    # 先頭から探すので、この並びが caxx.c と同じであることが、両実装の出力が
-    # 同じになる条件である（caxx.c の elf_machine_effective() を参照）。
     named, reloc_bytes, reverse = {}, {}, {}
     _merged = [(nm, rt, base['reloc_bytes'].get(rt, 0))
                for nm, rt in base['named'].items() if nm not in state.elftypes]
@@ -985,11 +936,9 @@ def elf_machine_table(state):
         is_rela = bool(e.decl_rela)
     if e.decl_class is not None:
         elfclass = e.decl_class
-    # 表示名は、宣言したマシン番号を実際に出しているときだけ使う。
     if e.decl_name and (e.decl_machine is None or e.decl_machine == e.machine):
         name = e.decl_name
 
-    # `.elffield` で命令フィールド型と宣言した型（型番号 → (マスク, オフセット)）。
     field = {}
     for text, fo in e.decl_field.items():
         rt = _elf_decl_type(state, named, text)
@@ -1007,13 +956,10 @@ def elf_machine_table(state):
 
 
 def _reloc_same_width(mach, nbytes, want_pcrel):
-    """実効表の先頭から、欄の幅が nbytes で PC 相対性が want_pcrel の型を探す。
+    """欄の幅と PC 相対かどうかが一致する型を 1 つ探す。
 
-    幅からの既定型の PC 相対性が欄の中身と食い違っていたときの取り替え先を引く
-    のに使う。型名でも型番号でもなく「幅と PC 相対性」で引くので、組み込みの表を
-    持たない、パターンファイルで宣言したマシンでも同じように働く。実効表の並びは
-    両実装で同じなので、先頭から探した結果も同じである。
-    caxx.c の elf_reloc_same_width() と同じ規則である。
+    辞書を順に見て最初に当たったものを返すので、同じ幅の型が複数あるときは
+    表に書いた順が結果を決める。見つからなければ None。
     """
     if not mach:
         return None
@@ -1026,14 +972,13 @@ def _reloc_same_width(mach, nbytes, want_pcrel):
 
 
 def _elf_section_attrs(state, name):
-    """セクションの (sh_flags, sh_type, sh_addralign, sh_entsize) を決める。
+    """セクション名から (sh_flags, sh_type, 整列, 要素サイズ) を決める。
 
-    `.elfsection::<名前>::<flags>[::<型>[::<整列>[::<要素長>]]]`（マニュアル
-    3.7.7 節）で宣言があればそれを使い、無ければ名前の前方一致で決める従来の
-    規則に従う。整列を書かなかったときは None を返す。既定値は ELF クラスを
-    知る書き出し側（_elf_default_align()）が決める。要素長は書かなければ 0
-    （＝固定長の要素を持たないセクション）である。
-    caxx.c の elf_section_attrs() と同じ規則である。
+    名前の先頭を `.text` / `.data` / `.rodata` / `.bss` と照合して既定を作る。
+    flags は 0x1 が WRITE、0x2 が ALLOC、0x4 が EXECINSTR。`.bss` だけ
+    sh_type を 8 (SHT_NOBITS) にしてファイルに中身を持たせない。
+    `.elfsection` の宣言があれば、名前からの推測を丸ごと置き換える。
+    axx が名前の規則を持たないセクション（ベクタ表、note など）はこれで書く。
     """
     uname = name.upper()
     if   uname.startswith('.TEXT'):
@@ -1062,60 +1007,43 @@ def _elf_section_attrs(state, name):
 
 
 def _elf_default_align(sh_type, is_elf64):
-    """`.elfsection` で整列を書かなかったセクションの sh_addralign。
+    """整列が書かれていないセクションの既定値。
 
-    SHT_NOTE (7) だけ 4 にし、他の型は従来どおり 16 のままにする。16 では
-    binutils が `Corrupt note: alignment 16, expecting 4 or 8` と言って読め
-    ない。ELF64 でも 4 なのは、note の n_namesz / n_descsz の詰め物が整列値に
-    従うからで、`.note.gnu.build-id` のような実在の note が ELF64 でも 4 で
-    書かれているのに合わせる。8 が要る note（`.note.gnu.property`）は
-    `.elfsection` の整列欄に 8 と書く。
-    caxx.c の weo_default_align() と同じ規則である。
+    SHT_NOTE (7) だけ 4、ほかは 16。is_elf64 は現在使っていないが、
+    caxx.c 側と呼び出し形をそろえるために残してある。
     """
-    del is_elf64            # note の整列は ELF クラスによらない
+    del is_elf64
     if sh_type == 7:
         return 4
     return 16
 
 
-# ---------------------------------------------------------------------------
-# ELF シンボルの属性（マニュアル 5.6.1 節）
-#
-# シンボルの型・大きさ・束縛・可視性は ELF のシンボル表の欄で、どの機種でも
-# 同じ形をしている。リンカがこれを見て仕事を変えるので（STT_FUNC でないシンボル
-# には ARM/AArch64 の中継命令が作られない、大きさの無いシンボルは
-# `--gc-sections` で残せない、弱いシンボルは他の定義に負ける）、リンクできる
-# `.o` を出すには機種の記述だけでは足りない。ソース側の `.type` / `.size` /
-# `.weak` / `.hidden` / `.protected` / `.internal` / `.other` / `.comm` が
-# ここへ書き込み、write_elf_obj() が読む。
-# ---------------------------------------------------------------------------
 
-# `.type` の種別名 → STT_*。番号を直に書いてもよい（0〜15）。
+# ソースの `.type` に書ける名前 → ELF の STT_* 値。
 ELF_SYM_TYPES = {
     'notype': 0, 'object': 1, 'func': 2, 'function': 2,
     'section': 3, 'file': 4, 'common': 5, 'tls': 6, 'tls_object': 6,
     'gnu_ifunc': 10, 'ifunc': 10,
 }
 
-# 属性を1つも宣言していないシンボルの姿。`sym_attrs` に無い名前はこれになる。
-#   [型, 大きさを書いたか, 大きさ, st_other, weak か, common か, common の整列]
+# シンボル 1 個ぶんの属性。ソースの `.type` / `.size` / `.weak` / `.hidden` /
+# `.protected` / `.internal` / `.other` / `.comm` がここに溜まる。
+# 添字の名前が _SA_* で、タプルのまま持つのはシンボル数ぶん作られるため。
 _SYM_ATTR_DEFAULT = (0, 0, 0, 0, 0, 0, 0)
 
 _SA_TYPE, _SA_SIZE_SET, _SA_SIZE, _SA_OTHER, _SA_WEAK, _SA_COMMON, _SA_ALIGN = range(7)
 
 
 def _sym_attr(state, name):
-    """`name` のシンボル属性を読む。宣言が無ければ既定の姿を返す。
-
-    caxx.c の sym_attr_get() と同じである。
-    """
+    """シンボルの属性を読む。無ければ既定のタプルを返す（表は増やさない）。"""
     return state.sym_attrs.get(name, _SYM_ATTR_DEFAULT)
 
 
 def _sym_attr_slot(state, name):
-    """`name` のシンボル属性を書き換えられる形で取り出す（無ければ作る）。
+    """シンボルの属性を書くための枠を返す。無ければリストで作って登録する。
 
-    caxx.c の sym_attr_slot() と同じである。
+    読むだけの _sym_attr と分けてあるのは、参照しただけのシンボルに
+    属性の枠を作らせないため。
     """
     a = state.sym_attrs.get(name)
     if a is None:
@@ -1125,13 +1053,7 @@ def _sym_attr_slot(state, name):
 
 
 def _sym_st_info(state, name, bind):
-    """シンボルの st_info。束縛は呼び出し側が決め、型は `.type` から取る。
-
-    `.weak` を宣言したシンボルは、呼び出し側が渡した束縛より STB_WEAK(2) が
-    勝つ。局所シンボル（STB_LOCAL）に `.weak` は書けない — `.weak` は名前を
-    `.global` と同じく外へ出すので、そのシンボルは必ず大域側の並びに来る。
-    caxx.c の weo_sym_info() と同じ規則である。
-    """
+    """st_info を組む。`.weak` があればバインドを STB_WEAK に差し替える。"""
     a = _sym_attr(state, name)
     if a[_SA_WEAK]:
         bind = 2
@@ -1139,12 +1061,10 @@ def _sym_st_info(state, name, bind):
 
 
 def _sym_common_override(state, name, bpw, shndx, value, size):
-    """`.comm` で宣言したシンボルなら、SHN_COMMON の姿に差し替える。
+    """`.comm` のシンボルを共通シンボルに書き換える。
 
-    common シンボルは節に属さず、st_shndx が SHN_COMMON(0xfff2)、st_value が
-    整列（バイト）、st_size が大きさ（バイト）になる。リンカが実体を作るので、
-    このオブジェクト自身は領域を持たない。
-    caxx.c の weo_sym_common() と同じ規則である。
+    SHN_COMMON (0xfff2) に置き、st_value を整列、st_size をワード数×ワード幅に
+    する。`.comm` でなければ渡された 3 つをそのまま返す。
     """
     a = _sym_attr(state, name)
     if not a[_SA_COMMON]:
@@ -1153,12 +1073,7 @@ def _sym_common_override(state, name, bpw, shndx, value, size):
 
 
 def _sym_size_of(state, name, bpw):
-    """シンボルの st_size。`.size` を書いていなければ 0。
-
-    `.size` の値はワード数なので、ラベルの値と同じく1ワードのバイト数を掛けて
-    バイト数にする（8 ビット機では掛ける数が 1 なので書いたままになる）。
-    caxx.c の weo_sym_size() と同じ規則である。
-    """
+    """`.size` の値をバイト数で返す。ソースにはワード数で書くので幅をかける。"""
     a = _sym_attr(state, name)
     if not a[_SA_SIZE_SET]:
         return 0
@@ -1166,13 +1081,7 @@ def _sym_size_of(state, name, bpw):
 
 
 def _reloc_named(state, mach, name):
-    """型名を型番号にする。無ければ None。
-
-    `.elftype::名前::値` で決めた名前を先に引き、無ければ `-m` で選んだマシンの
-    名前表を引く。型名を書けるところ（パターンファイルの `.reloc`、ソースの
-    `.extern`/`.global`/`.EQU`/`.RELOCTYPE`、取り込みファイル）は全部ここを通る。
-    caxx.c の elf_reloc_named() と同じ規則である。
-    """
+    """リロケーション型の名前を番号にする。`.elftype` が組み込みの表に勝つ。"""
     if not name:
         return None
     key = name.lower()
@@ -1183,11 +1092,9 @@ def _reloc_named(state, mach, name):
 
 
 def _reloc_reverse(state, mach, rtype):
-    """型番号から型名を引く（`-E` の書き出しに使う）。無ければ ''。
+    """リロケーション型の番号を名前にする（診断とリスティング用）。
 
-    マシンの名前表を先に引き、無ければ `.elftype` で決めた名前を使う。取り込み
-    側は名前を _reloc_named() で引くので、これで書き出し→取り込みが往復できる。
-    caxx.c の elf_reloc_reverse() と同じ規則である。
+    組み込みの表に無ければ `.elftype` の宣言を逆から探す。それも無ければ空文字。
     """
     if rtype is None:
         return ''
@@ -1200,68 +1107,52 @@ def _reloc_reverse(state, mach, rtype):
     return ''
 
 
-# AArch64 の「命令フィールド型」リロケーション。
-#
-# データ型（ABS64 など）は対象の値がそのまま連続バイトに並ぶが、こちらは 32bit
-# 命令語の中の飛び飛びのビット欄に、しかも語単位・ページ単位に縮めた形で詰まる。
-# そのため加数を「出力バイト列 − ラベル値」で逆算する通常の経路が使えない。
-# 該当する型では代わりに、パターンが捕らえたオペランド値とラベル値の差をそのまま
-# 加数とし、命令語側のビット欄は 0 にして出す（GNU as と同じ形。RELA なので
-# リンカが欄を埋める）。
-#
-#   fields  値を詰めるビット欄を「値の下位側から」 (命令語の開始ビット, ビット数)
-#           で並べたもの。ADR/ADRP だけは immlo(2bit)/immhi(19bit) に分かれる。
+# AArch64 の「命令の中の欄を書き換える」リロケーションが、32bit 命令語の
+# どのビットに値を置くか。各要素が (最下位ビット位置, ビット数) で、
+# ADR/ADRP だけは値が 2 つの欄に分かれて入る（下位 2bit と上位 19bit）。
+# 組み込みで持っているのは AArch64 のぶんだけで、他のマシンでは
+# パターンファイルの `.elffield` が同じことを宣言する。
 _A64_ADR_FIELDS = ((29, 2), (5, 19))
 _A64_LO12_FIELD = ((10, 12),)
 _A64_MOVW_FIELD = ((5, 16),)
 AARCH64_INSN_RELOCS = {
-    263: _A64_MOVW_FIELD, 264: _A64_MOVW_FIELD,   # MOVW_UABS_G0 / _NC
-    265: _A64_MOVW_FIELD, 266: _A64_MOVW_FIELD,   # MOVW_UABS_G1 / _NC
-    267: _A64_MOVW_FIELD, 268: _A64_MOVW_FIELD,   # MOVW_UABS_G2 / _NC
-    269: _A64_MOVW_FIELD,                         # MOVW_UABS_G3
-    287: _A64_MOVW_FIELD, 288: _A64_MOVW_FIELD,   # MOVW_PREL_G0 / _NC
-    289: _A64_MOVW_FIELD, 290: _A64_MOVW_FIELD,   # MOVW_PREL_G1 / _NC
-    291: _A64_MOVW_FIELD, 292: _A64_MOVW_FIELD,   # MOVW_PREL_G2 / _NC
-    293: _A64_MOVW_FIELD,                         # MOVW_PREL_G3
-    274: _A64_ADR_FIELDS,                         # ADR_PREL_LO21
-    275: _A64_ADR_FIELDS, 276: _A64_ADR_FIELDS,   # ADR_PREL_PG_HI21 / _NC
-    277: _A64_LO12_FIELD,                         # ADD_ABS_LO12_NC
-    278: _A64_LO12_FIELD,                         # LDST8_ABS_LO12_NC
-    279: ((5, 14),),                              # TSTBR14
-    280: ((5, 19),),                              # CONDBR19
-    282: ((0, 26),), 283: ((0, 26),),             # JUMP26 / CALL26
-    284: _A64_LO12_FIELD, 285: _A64_LO12_FIELD,   # LDST16 / LDST32
-    286: _A64_LO12_FIELD, 299: _A64_LO12_FIELD,   # LDST64 / LDST128
-    309: ((5, 19),),                              # GOT_LD_PREL19
-    311: _A64_ADR_FIELDS,                         # ADR_GOT_PAGE
-    312: _A64_LO12_FIELD,                         # LD64_GOT_LO12_NC
-    313: _A64_LO12_FIELD,                         # LD64_GOTPAGE_LO15
+    263: _A64_MOVW_FIELD, 264: _A64_MOVW_FIELD,
+    265: _A64_MOVW_FIELD, 266: _A64_MOVW_FIELD,
+    267: _A64_MOVW_FIELD, 268: _A64_MOVW_FIELD,
+    269: _A64_MOVW_FIELD,
+    287: _A64_MOVW_FIELD, 288: _A64_MOVW_FIELD,
+    289: _A64_MOVW_FIELD, 290: _A64_MOVW_FIELD,
+    291: _A64_MOVW_FIELD, 292: _A64_MOVW_FIELD,
+    293: _A64_MOVW_FIELD,
+    274: _A64_ADR_FIELDS,
+    275: _A64_ADR_FIELDS, 276: _A64_ADR_FIELDS,
+    277: _A64_LO12_FIELD,
+    278: _A64_LO12_FIELD,
+    279: ((5, 14),),
+    280: ((5, 19),),
+    282: ((0, 26),), 283: ((0, 26),),
+    284: _A64_LO12_FIELD, 285: _A64_LO12_FIELD,
+    286: _A64_LO12_FIELD, 299: _A64_LO12_FIELD,
+    309: ((5, 19),),
+    311: _A64_ADR_FIELDS,
+    312: _A64_LO12_FIELD,
+    313: _A64_LO12_FIELD,
 }
 
 
 def insn_reloc_field_decl(state, rtype):
-    """`.elffield` で宣言した命令フィールド型なら (マスク, オフセット)、でなければ None。
-
-    マスクは型の幅（`.elftype` の幅欄かマシンの名前表）ぶんのバイト列を対象の
-    バイト順で読んだ整数の中のビット、オフセットはその欄が命令の先頭から何バイト
-    目に始まるか。r_offset もこの位置になる。caxx.c の insn_reloc_field_decl() と
-    同じである。
-    """
+    """`.elffield` で宣言された命令欄の記述を引く。無ければ None。"""
     if state is None or not state.elf.decl_field:
         return None
     return elf_machine_table(state)['field'].get(rtype)
 
 
 def insn_reloc_field_mask(rtype, machine=183, state=None):
-    """命令フィールド型なら、その値が占める 32bit 命令語中のビットマスクを返す。
+    """その型が命令語のどのビットを使うかのマスク。
 
-    データ型や未知の型では None。呼び出し側はこれで「通常の加数計算をするか、
-    命令フィールドとして扱うか」を振り分ける。
-
-    型番号の意味はマシンごとに違う（AArch64 の 275 = ADR_PREL_PG_HI21 は、他の
-    マシンでは別物か、そもそも無い）。この表は AArch64 のものなので、対象が
-    AArch64 のときだけ引く。`.elftype`（3.7.7 節）で同じ番号を宣言した別機種の
-    型を、命令フィールド型と取り違えないためである。
+    `.elffield` の宣言が最優先。無ければ AArch64 の組み込み表だけを見る。
+    どちらも無ければ None で、「命令の中の欄ではない」ふつうのデータ
+    リロケーションとして扱われる。
     """
     _fd = insn_reloc_field_decl(state, rtype)
     if _fd is not None:
@@ -1278,273 +1169,235 @@ def insn_reloc_field_mask(rtype, machine=183, state=None):
 
 
 class VLIWState:
-    """VLIW / EPIC パケット組み立ての設定と作業状態。
+    """`.vliw` の宣言と、組み立て中のバンドルの状態。
 
-    パターンファイルの `.vliw::<パケット幅>::<命令幅>::<テンプレート幅>::<NOP値>`
-    ディレクティブで設定され、1行に `!!` で区切って並べた複数命令を1つの固定幅
-    パケットに詰め込むために使う。
+    bits がバンドル全体のビット数、instbits が命令 1 個のビット数、
+    templatebits がテンプレート欄のビット数（0 なら非 EPIC、負なら左端に置く）、
+    nop が隙間を埋める NOP、slotset が `EPIC::` 行で宣言されたスロットの
+    組み合わせ、cnt が `!!` で結合された命令の数、stop がストップビット。
     """
 
     def __init__(self):
-        self.instbits = 41        # 命令スロト1個のビット幅
-        self.nop = []             # スロットが余ったときに詰める NOP のバイト列
-        self.bits = 128           # パケット全体のビット幅
-        self.slotset = []         # EPIC: スロットの組み合わせ → テンプレート値
-        self.flag = False         # .vliw が宣言済みか
-        self.templatebits = 0x00  # テンプレートフィールドのビット幅
-                                  # （負ならパケットの上位側に配置する）
-        self.stop = 0             # この行が `!!!!`（ストップビット）で終わったか
-        self.cnt = 1              # この行に含まれるスロット数
+        self.instbits = 41
+        self.nop = []
+        self.bits = 128
+        self.slotset = []
+        self.flag = False
+        self.templatebits = 0x00
+        self.stop = 0
+        self.cnt = 1
 
 
 class ElfState:
-    """ELF オブジェクト出力（-o）に関わる設定と、パス2で集める情報。"""
+    """`-o` の ELF 出力に関わる状態をまとめたもの。
 
-    def __init__(self):
-        self.osabi: int = 0        # ELF ヘッダの OSABI（0=Linux, 9=FreeBSD）
-        self.objfile: str = ""     # -o の出力先。空なら ELF 出力しない
-        self.machine: int = 62     # e_machine（62=x86-64）。ELF_MACHINES のキー
-        self.elf_class: int | None = None  # -f で明示された 1=ELF32 / 2=ELF64
-                                   # （None ならマシンの慣習クラスに従う）
-
-        # --- パターンファイルの ELF 宣言（マニュアル 3.7.7 節）---
-        # 組み込みのマシン表に重ねる差分。実効表は elf_machine_table() が作る。
-        self.decl_machine = None   # `.elfmachine` の番号
-        self.decl_name = ''        # `.elfmachine` の表示名（診断に出る）
-        self.decl_class = None     # `.elfclass`（1=ELF32 / 2=ELF64）
-        self.decl_rela = None      # `.elfrela`（1=RELA / 0=REL）
-        self.decl_width = {}       # `.elfwidth` バイト幅 → 型欄の文字列
-        self.decl_extern = ''      # `.elfextern` 型欄の文字列
-        self.decl_dwarf = ''       # `.elfdwarf` 型欄の文字列
-        self.decl_hdr = {}         # `.elfheader` 欄名 → 値
-        self.decl_field = {}       # `.elffield` 型欄の文字列 → (マスク, オフセット)
-        self.decl_sec = {}         # `.elfsection` 名前(小文字) → (sh_flags, sh_type|None, 整列|None)
-        self.type_width = {}       # `.elftype` の幅欄（型名 → バイト幅）
-        self.type_pcrel = set()    # `.elftype` の PC 相対欄が立った型名
-        self.decl_gen = 0          # 宣言が変わるたびに増える（控えの鍵）
-        self.machine_from_cli = False  # `-m` を明示したか
-        self.mach_cache = None     # elf_machine_table() の控え
-        self.mach_cache_key = None
-
-        # --- パス2でのリロケーション収集 ---
-        self.relocations = []          # 確定した (セクション, 位置, 名前, 型, 加数, 幅)
-        self.tracking = False          # いま収集中か（パス2かつ -o のときだけ真）
-        self.label_refs_seen = []      # 1命令分の (ラベル名, 生値, ワード番号)
-        self.current_word_idx: int = -1  # 生成中のオブジェクトコードの何ワード目か
-        self.var_to_label: dict = {}   # パターン変数 → 束縛元のラベル名
-        self.capturing_var: str | None = None  # いま `!x` で捕捉中の変数
-        # .reloc 宣言付きの変数がラベルを運んだ箇所。
-        # ワード番号 → (型番号, 加数)。加数は「変数が持っていた値 − ラベル値」で、
-        # `bl func` なら 0、`bl func+8` なら 8 になる。
-        self.insn_reloc_hint: dict = {}
-
-        # --- DWARF デバッグ情報（-g） ---
-        self.gen_debug: bool = False
-        self.line_map: list = []   # (セクション, pc, ファイル, 行) の対応表
-
-        self.reloctype_override: dict = {}  # `.EQU 値::型名` で明示指定された型
-
-
-class RelaxationState:
-    """パス1のサイズ収束（リラクゼーション）に関する状態。
-
-    可変長命令では「ジャンプ先が遠いか近いか」で命令長が変わり、その命令長が
-    後続ラベルのアドレスを動かし、それがまたジャンプ距離を変える……という
-    循環がある。そこでパス1を複数回まわし、全ラベルのアドレスが前回と一致
-    （＝収束）するまで繰り返す。
+    decl_* はパターンファイルの ELF 記述（.elfmachine / .elfclass / .elfrela /
+    .elfwidth / .elfextern / .elfdwarf / .elfheader / .elfsection / .elffield）が
+    書き込む先で、組み込みの表にかぶせて elf_machine_table() が実表を作る。
+    decl_gen はそのキャッシュを捨てるための世代番号。
     """
 
     def __init__(self):
-        self.pas = 0   # 0=対話モード / 1=パス1（収束中） / 2=パス2（最終）
+        self.osabi: int = 0
+        self.objfile: str = ""
+        self.machine: int = 62
+        self.elf_class: int | None = None
 
-        # サイズだけ知りたい試行中か。真のときは実バイトを出力しない。
+        # パターンファイルの ELF 記述。読んだ時点では綴りのまま置いておき、
+        # 型番号への解決は elf_machine_table() まで遅らせる。`.elftype` の
+        # 宣言より先に `.reloc` が現れても解けるようにするため。
+        self.decl_machine = None
+        self.decl_name = ''
+        self.decl_class = None
+        self.decl_rela = None
+        self.decl_width = {}
+        self.decl_extern = ''
+        self.decl_dwarf = ''
+        self.decl_hdr = {}
+        self.decl_field = {}
+        self.decl_sec = {}
+        self.type_width = {}
+        self.type_pcrel = set()
+        self.decl_gen = 0
+        self.machine_from_cli = False
+        self.mach_cache = None
+        self.mach_cache_key = None
+
+        # パス2で集まるリロケーション。tracking 中に式評価器がラベル参照を
+        # 見つけると label_refs_seen に積まれ、どの出力ワードのどの変数から
+        # 来たか（current_word_idx / var_to_label / capturing_var）を頼りに
+        # 型と位置を決める。命令の中の欄に入る型は insn_reloc_hint で伝える。
+        self.relocations = []
+        self.tracking = False
+        self.label_refs_seen = []
+        self.current_word_idx: int = -1
+        self.var_to_label: dict = {}
+        self.capturing_var: str | None = None
+        self.insn_reloc_hint: dict = {}
+
+        # `-g` の DWARF 出力。line_map が .debug_line を作るための
+        # 「アドレス ↔ ソース行」の対応。
+        self.gen_debug: bool = False
+        self.line_map: list = []
+
+        self.reloctype_override: dict = {}
+
+
+class RelaxationState:
+    """パス1の反復（リラクゼーション）に属する状態。
+
+    可変長命令の長さが前方参照ラベルの値で決まるため、1 回読んだだけでは
+    アドレスが確定しない。前回の反復の値を推定値として使い、全ラベルの
+    アドレスが前回と一致するまで繰り返す。繰り返しの上限は Assembler 側の
+    MAX_RELAX (16) で、収束しなければ出力を書かずに中断する。
+    """
+
+    def __init__(self):
+        # 現在のパス。0 が対話モード、1 が長さの収束、2 がコード生成。
+        # 診断を出してよいのは 0 と 2 だけ（should_report_errors）。
+        # パス1は推定値で動いているので、そこで出る「範囲外」は本物とは限らない。
+        self.pas = 0
+
+        # パス1で長さだけを知りたい区間。ここでは診断を抑える。
         self.pass1_size_mode = False
 
-        # 前回反復での「ラベル→アドレス」。これが今回と一致したら収束とみなす。
-        # 番兵は「まだ1回も反復していない」ことを表す（空辞書と区別するため）。
+        # 前回の反復で得たラベル → アドレス。番兵のままなら反復は未実施。
         self.pass1_prev_label_pcs = _RELAXATION_SENTINEL
 
-        # 前方参照ラベルの推定値（前回反復の確定値）。
+        # 前回の反復での値。今回の反復で前方参照の推定値として読む。
         self.relax_prev_values = {}
 
-        # 収束を早めるため、未確定の前方参照を「近い」と楽観的に仮定するモード。
+        # 最初の反復（relax_iter == 0）だけ真。まだ何も分かっていない段階で
+        # 未定義ラベルを楽観的に扱い、短い符号化から試させるためのもの。
         self.relax_optimistic = False
 
-        # `[[...]]` の組み合わせ爆発を警告済みのパターンを覚えておき、
-        # 同じ警告を何度も出さないようにする。
+        # 組み合わせ数の上限に当たったことを行ごとに一度だけ警告するための印。
         self.combo_budget_warned = set()
 
 
 class AssemblerState:
-    """アセンブル中の全状態を1か所に集めた入れ物。
+    """アセンブル中の状態すべて。
 
-    パターン照合・式評価・ディレクティブ処理・出力生成の各クラスは、
-    自前の状態を持たずに全てこのオブジェクトを共有して読み書きする。
+    もともと平らな属性の集まりだったものを、VLIW / ELF / リラクゼーションの
+    3 群だけ下位オブジェクトへ切り出してある。古い平らな名前は末尾の
+    _FORWARDED_ATTRS が生成するプロパティで今も通るので、呼び出し側は
+    どちらの綴りでも書ける。
+
+    生成時に自分をモジュール変数 _ACTIVE_STATE へ入れる。状態を持たない
+    モジュール関数の diag() がそこを見て診断の宛先を知る。
     """
 
     def __init__(self):
         global _ACTIVE_STATE
-        # モジュール関数 diag() がここへ委譲できるように自身を登録する。
         _ACTIVE_STATE = self
 
-        # パターン照合の試行中に出た診断を溜めておく箱（None なら捕捉していない）。
-        # 「試したが不採用だったパターン」のエラーを表示しないために使う。
         self._diag_pending = None
 
-        # --- 出力先 ---
-        self.outfile = ""       # -b 生バイナリ
-        self.expfile = ""       # -e ラベル TSV（素の形式）
-        self.expfile_elf = ""   # -E ラベル TSV（ELF セクションフラグ付き）
-        self.impfile = ""       # -i ラベル TSV の取り込み
+        self.outfile = ""
+        self.expfile = ""
+        self.expfile_elf = ""
+        self.impfile = ""
 
-        # --- 位置カウンタ ---
-        self.pc = 0             # 現在のプログラムカウンタ（ワード単位）
-        self.padding = 0        # .padding の詰め物バイト値
+        self.pc = 0
+        self.padding = 0
 
-        self.pc_instr_start = 0   # いま組み立て中の命令の先頭アドレス（`$$`）
-        self.pc_instr_end = 0     # その次の命令のアドレス（`$.`）
-        self._in_binary_list = False  # オブジェクトコード生成の最中か
+        self.pc_instr_start = 0
+        self.pc_instr_end = 0
+        self._in_binary_list = False
 
-        # 識別子に使える文字集合。パターンファイルの .labelc 等で変更できる。
-        self.lwordchars = DIGIT + ALPHABET + "_."   # ラベル名
-        self.swordchars = DIGIT + ALPHABET + "_%$-~&|"  # .setsym シンボル名
+        # ラベルとシンボルに使える文字。`.labelc` / `.symbolc` で広げられる。
+        # シンボル側に `-` が入っているのが、`(IX-5)` のような負の変位を
+        # シンボルの続きとして一度試してから後退できる理由。
+        self.lwordchars = DIGIT + ALPHABET + "_."
+        self.swordchars = DIGIT + ALPHABET + "_%$-~&|"
 
         self.current_section = ".text"
         self.current_file = ""
 
-        # --- 記号表 ---
-        self.labels = {}         # ソース側ラベル 名 → [値, セクション, is_equ, ...]
-        self.extern_untyped = set()  # 型名なしの `.extern` で宣言したラベル名
-        # `.type`/`.size`/`.weak`/`.hidden`/`.protected`/`.internal`/`.other`/
-        # `.comm` が宣言した ELF シンボルの属性（_SYM_ATTR_DEFAULT の並び）。
-        # 出力にしか効かないので、パス1の反復では消さずに持ち越す。
+        # ラベル・シンボルの各表。patsymbols はパターンファイルが定義した
+        # シンボルで、ソースのラベルと名前が衝突したらエラーにする。
+        # pat / pat_isdir が読み込んだパターン行とそれがディレクティブかの印、
+        # pat_index / pat_always / pat_maxkey が照合を絞るための索引、
+        # hoist_* が「ソースを読む前に 1 回だけ処理してよい先頭の塊」。
+        self.labels = {}
+        self.extern_untyped = set()
         self.sym_attrs = {}
-        self.sections = {}       # セクション名 → [開始, ワード数, 入口pc]
-        self.symbols = {}        # 現在有効なシンボル（patsymbols のコピー＋α）
-        self.patsymbols = {}     # パターンファイルの .setsym で定義されたもの
-        self.export_labels = {}  # .global 等で外部公開するラベル
-        self.pat = []            # 読み込んだパターン表
-        # pat と同じ並びで「その行がディレクティブか」を持つ表（下記 pat と対）。
+        self.sections = {}
+        self.symbols = {}
+        self.patsymbols = {}
+        self.export_labels = {}
+        self.pat = []
         self.pat_isdir = []
-        self.pat_index = {}      # ニーモニック → 候補行（_build_pat_index）
-        self.pat_always = []     # 行ごとに必ずたどる行の番号
-        self.pat_maxkey = 0      # 索引の鍵の最大長
-        self.pat_dirfn = []      # 行ごとのディレクティブ処理（無ければ None）
-        self.hoist_rows = 0      # 畳み込む先頭ディレクティブ行の数（_pat_hoist_scan）
-        self.hoist_fields = set()  # 前置きが書く欄
-        self.hoist_first_ai = 0  # always の並びで最初に来る非前置き行の位置
-        self.hdrsnap = None      # 前置きを実行し終えた状態
-        self.diag_count = 0      # 出そうとした診断の数（前置きの判定に使う）
+        self.pat_index = {}
+        self.pat_always = []
+        self.pat_maxkey = 0
+        self.pat_dirfn = []
+        self.hoist_rows = 0
+        self.hoist_fields = set()
+        self.hoist_first_ai = 0
+        self.hdrsnap = None
+        self.diag_count = 0
 
         self.vliw = VLIWState()
 
-        self.expmode = EXP_PAT   # いま評価中の式がパターン側かソース側か
-        self.expcaps = CAPS_PAT  # いま評価中の式で使える項目（ExprCaps）
+        # いまどちらの文脈の式を読んでいるか。expcaps がそれに対応する
+        # 使える項の集合で、評価器はこの 2 つだけを見る。
+        self.expmode = EXP_PAT
+        self.expcaps = CAPS_PAT
 
-        # 直近の式評価で未定義ラベルを踏んだか。重要な約束として、この旗は
-        # 「失敗したときに立てる」だけで、成功しても勝手に降ろさない。
-        # 1つの式の途中で複数のラベルを引くため、途中で降ろすと先に立った
-        # 失敗の情報が消えてしまう。降ろすのは、真新しく判定したい側
-        # （.ORG/.RESB/.ZERO/.ALIGN/.EQU 等）が評価直前に自分で行う。
         self.error_undefined_label = False
 
-        # 既に報告したラベル定義の誤り。パス1はリラクゼーションで何度も走るので、
-        # 同じ誤りを反復回数だけ並べないための記録（LabelManager が使う）。
         self.reported_label_errors = set()
 
-        # ユーザ向けの " error - ..." を1度でも表示したら立ち、以後降ろさない。
-        # run() はパス2の後にこれを見て、エラーが出ていたら出力を書かずに
-        # 終了コード1で終わる（不完全・誤ったバイナリを黙って残さないため）。
         self.had_error = False
 
-        # パターン照合の試行中か。試行中のエラーは本物の失敗とは限らないので
-        # 表示を抑制する。
         self._in_match_attempt = False
 
-        # --- 出力語の形 ---
-        self.align = 16          # .align の既定値
-        self.bts = 8             # 1ワードのビット幅（.bits。8以外も可）
+        # 出力ワードの形。bts が 1 ワードのビット数（`.bits`）、endian が
+        # バイト順、align と padding が `.align` の既定値と詰め物の値。
+        self.align = 16
+        self.bts = 8
         self.endian = 'little'
         self.byte = 'yes'
         self.debug = False
 
-        # --- 現在行の位置情報（エラー表示と DWARF 用） ---
-        self.cl = ""             # 現在行のテキスト
-        self.ln = 0              # 行番号
-        self.fnstack = []        # .INCLUDE のファイル名スタック
-        self.lnstack = []        # 同、行番号スタック
+        # いま処理している行とその位置。fnstack / lnstack は `.include` で
+        # 入れ子になったファイル名と行番号で、診断にそのまま出す。
+        self.cl = ""
+        self.ln = 0
+        self.fnstack = []
+        self.lnstack = []
 
-        # パターン変数 a〜z の束縛値。
-        # 変数名（小文字1文字でも `var_2` のように長くてもよい）→ 値。
+        # パターン変数の束縛。vars_undef が「この行では束縛されなかった」印、
+        # vars_text が `!L` が覚えたソースに書かれていたままの綴り。
         self.vars = {}
 
-        # 同じ添字で「その値が未定義ラベル由来か」を覚えておく札。
-        # 値そのものの大きさ（_is_undef_derived）だけでは、`UNDEF-UNDEF` や
-        # `UNDEF%UNDEF`、`UNDEF&0` のように算術で番兵が消えた場合を取りこぼす。
-        # 束縛した時点で判っている事実なので、値とは別に持ち回る
-        # （caxx.c の PatVar.is_undef に対応）。
-        # vars を退避・復元する箇所は必ずこちらも一緒に扱うこと。
         self.vars_undef = {}
 
-        # `!L<名前>` が拾った「ソースに書かれていたままの式・ラベルの文字」。
-        # 変数名 → 文字列。テキストテンプレートの `{{.exp(<名前>)}}` がこれを
-        # そのまま出す（3.5.2 節）。値（vars）とは別物で、vars を退避・復元する
-        # 箇所では必ずこちらも一緒に扱うこと（caxx.c の PatVar.text_off に対応）。
         self.vars_text = {}
 
-        self.deb1 = ""           # 照合デバッグ用（ソース側の残り）
-        self.deb2 = ""           # 同（パターン側の残り）
+        self.deb1 = ""
+        self.deb2 = ""
 
-        self.exp_typ: str = 'i'  # 'i'=整数 / 'f'=浮動小数点
+        self.exp_typ: str = 'i'
 
         self.relax = RelaxationState()
 
         self.verbose: bool = False
-        # `-V` の設定。真なら、文字列テンプレートで組み立てたテキストを素のまま
-        # 標準出力へ流す（トランスレータとしての出力）。既定は無出力で、`-b`/`-o`
-        # を付けずに走らせても画面には何も出ない。caxx.c の AsmState.text_output
-        # と同じ意味である。
         self.text_output: bool = False
-        # パターンのエンコーディング欄が文字列テンプレート "..." だったときに、
-        # そこから組み立てたアセンブリ結果のテキスト。1行ごとに作り直す。
         self.asmtext = None
         self.asmtext_disp = None
-        # テキスト置換モード（`.textmode`）で、その行の先頭にあった `label:` の
-        # 綴りをそのまま覚えておく置き場。書き換えたテキストの前に付け直す。
-        # 1行ごとに作り直す。
         self.label_text = ''
-        # テキスト置換モード（`.textmode`）で、その行に書かれていた `;` コメントを
-        # `;` ごとそのまま覚えておく置き場。書き換えたテキストの後ろに付け直す。
-        # 1行ごとに作り直す。テキスト置換モードでないときは常に空文字である。
         self.comment_text = ''
-        # テキスト置換モード（`.textmode`）で、その行の行頭にあった字下げ
-        # （空白・タブ）を書かれていたまま覚えておく置き場。訳したテキストの
-        # 先頭に付け直すので、ソースの字下げが翻訳結果にもそのまま残る。
-        # 1行ごとに作り直す。テキスト置換モードでないときは常に空文字である。
         self.indent_text = ''
-        # `.setsym::名前::"文字列"` で登録された文字列シンボル。値が数値では
-        # ないので式には出せず、文字列テンプレート（3.5.2）の中でだけ使える。
-        # 名前は大文字化して持つ（`.setsym` の数値シンボルと同じ規約）。
         self.strsymbols = {}
-        # `.setsym::名前::[項目,項目,…]` で登録された配列シンボル。項目は数値
-        # (int/float) でも文字列 (str) でもよく、`x[3]` や `#x[3]` で引く。
         self.arrsymbols = {}
-        self.arrgen = 0          # 配列シンボルの表が変わった回数（.check の控え用）
-        # `.elftype::名前::値` で決めたリロケーション型名（小文字 → 型番号）。
-        # 型名を書けるところはまずこの表を引き、無ければマシンの名前表を引く。
+        self.arrgen = 0
         self.elftypes = {}
-        # `.passthru` の設定。0=切（マッチしない行は Syntax error）、
-        # 1=素通し（マッチしない行をそのままテキストとして出す）。
         self.passthru = 0
-        # `.eol` の設定。真なら、出力を出した行ごとに改行を1ワード足す。
         self.eol = 0
-        # `.textmode` の設定。真なら「テキスト置換モード」。ソースを別の書式の
-        # テキストへ書き換えるための設定で、`.passthru` と `.eol` を一緒に立て、
-        # `!L<名前>` が拾った式・ラベルの中の未定義ラベルをエラーにしない
-        # （値は 0 になり、文字は書かれたとおりに出る）。
         self.textmode = 0
 
-        # 標準入力から読んだソースを置く一時ファイル（全パスで再利用する）。
         self.stdin_tmp_path: str | None = None
 
         self.elf = ElfState()
@@ -1552,67 +1405,27 @@ class AssemblerState:
         self.init_func: str | None = None
         self.fini_func: str | None = None
 
-        # .check で登録された「この変数はこの条件を満たすこと」という制約。
-        # パターンが宣言した変数名（`a` でも `var_2` でも同じ）。式の中で
-        # 変数と読むかどうかは綴りだけで決まるので、この集合は `.free` の
-        # 取り消しと診断のための記録である。
         self.varnames: set = set()
         self.check_constraints: dict = {}
 
-        # .reloc で登録された「この変数が捕らえたラベル参照は、この ELF
-        # リロケーション型で外に出す」という宣言。変数名 -> 型番号。
-        # 型はオペランドの位置ごとに決まる（AArch64 では同じシンボルを adrp が
-        # ADR_PREL_PG_HI21、add が ADD_ABS_LO12_NC で参照する）ため、シンボル側
-        # ではなくパターン側の、この変数単位でしか表せない。
         self.reloc_constraints: dict = {}
-        # 未知の型名を報告済みかどうか。(型名, マシン) の集合。
         self._reloc_badname_seen: set = set()
 
-        # .enum で登録された列挙。変数1文字 -> (要素名のタプル, 式の文字列)。
-        # `!Ex` の照合と値の算出に使う。
         self.enum_defs: dict = {}
 
-        # .enum の式を評価している間だけ立つ束縛表。[(要素名, 値), ...]。
-        # 要素名は「出現していれば .setsym の値、非出現なら 0」に束縛される。
         self.enum_bindings: list | None = None
 
-        # `.sub::名前 ... .return` で登録されたサブ表。
-        # 名前 -> [(照合パターン, 値欄), ...]。`!S{{名前}}変数` の展開に使う。
         self.sub_defs: dict = {}
-        # `.free` で「この行から先は使わない」と印を付けたサブ表の名前
-        # (大文字化)。`.sub` はパターンを読むときに一度だけ組み立てられ、
-        # `.setsym` のようにソース1行ごとに作り直されはしないので、消して
-        # しまうと `.free` より前に書かれたパターンまで2行目以降に使えなく
-        # なる。印は行の頭で落とす。
         self.freed_subs: set = set()
 
-        # `.func::名前::引数 ... .endfunc` で登録されたミニ言語の関数。
-        # 名前 -> _MiniFunc。`binary_list` 欄の `.call` から呼ぶ。
         self.func_defs: dict = {}
 
-        # error_patterns 欄（例: `n>7;5`）が返すエラーコード → メッセージ文字列。
-        # 実行ごとに独立した可変コピーとして持ち、モジュール定数 ERRORS を汚さない。
-        # .error::n::"Message" ディレクティブで上書き・拡張できる。
         self.errors: list = list(ERRORS)
 
-        # セクションは .section / .endsection の出入りで断片化しうる。
-        # その断片ごとの (名前, 開始, ワード数) を順に記録する。
         self.section_ranges: list = []
 
-        # .EQU の右辺が複数セクションのラベルにまたがっていないかの検査用。
         self._equ_sections_touched = None
 
-        # マクロ層からラベル値・.equ・$/$$ を参照するための、前回リラクゼーション
-        # 反復のスナップショット。マクロ展開はアドレス確定より前に走るので、
-        # 「今回の値」は原理的に存在しない。代わりに前回反復の値を使い、収束は
-        # リラクゼーションループ（反復上限・振動検出・未収束なら出力しない）に
-        # 委ねる。None は「まだ一度も反復していない＝何も分からない」の意味で、
-        # このとき未知の名前は 0・defined() は偽になる。
-        #   _macro_label_values : 名前 -> 値（値が確定しているものだけ）
-        #   _macro_label_names  : 前回反復で存在が確認できたラベル名の集合。
-        #                         値が未確定でも「綴り間違いではない」と判定する
-        #                         ために、値とは別に持つ。
-        #   _macro_line_pcs     : 展開後の行番号 -> その行のアドレス($$ 用)
         self._macro_label_values = None
         self._macro_label_names = None
         self._macro_line_pcs = None
@@ -1620,23 +1433,12 @@ class AssemblerState:
 
 
     def diag(self, text, set_error=True, force=False):
-        """診断メッセージを表示し、必要なら had_error を立てる。
+        """診断を 1 行出す。出すかどうかはパスと照合の状況で決まる。
 
-        表示するかどうかは3段階で決まる:
-          1. force=True なら常に表示する（コマンドライン引数の誤り等、
-             パスの概念より前に起きる問題用）。
-          2. パターン照合の試行中なら表示しない。捕捉中（_diag_pending）なら
-             溜めておき、そのパターンが最終的に採用されたときだけ再生する。
-          3. それ以外は should_report_errors()、すなわちパス2か対話モードのときだけ。
-             パス1で表示しないのは、前方参照が「まだ解決していない」だけで
-             本当のエラーではない場合が多いため。
-
-        表示できたときに限り True を返す。set_error=True なら同時に had_error を
-        立てるので、以降 run() は出力を書かなくなる。
+        照合の試行中は、その試行が採択されるとは限らないので溜めるだけにする
+        （diag_capture_begin / take / replay）。報告してよいパスでなければ
+        捨てる。force はその両方を無視して必ず出す。
         """
-        # 出そうとした数を、抑止されるものも含めて数える（パスによって
-        # 見え方が変わるので、抑止の判定より前に数える）。前置きの畳み込みが
-        # 「この前置きは診断を出す」と気づくために使う。
         self.diag_count += 1
         if not force:
             if self._in_match_attempt:
@@ -1651,20 +1453,17 @@ class AssemblerState:
         return True
 
     def diag_capture_begin(self):
-        """以後の診断を表示せず溜め始める（パターン照合の試行前に呼ぶ）。"""
+        """以降の診断を溜め始める（照合の試行に入るとき）。"""
         self._diag_pending = []
 
     def diag_capture_take(self):
-        """溜めた診断を取り出して捕捉を終える。"""
+        """溜めた診断を取り出して、溜めるのをやめる。"""
         out = self._diag_pending if self._diag_pending is not None else []
         self._diag_pending = None
         return out
 
     def diag_replay(self, items):
-        """捕捉しておいた診断を実際に表示する。
-
-        採用が確定したパターンの分だけを後から出すために使う。
-        """
+        """溜めた診断を出す。採択されたパターンのぶんだけ流すために使う。"""
         for text, set_error in items:
             if self.should_report_errors():
                 print(text, file=sys.stderr)
@@ -1672,23 +1471,23 @@ class AssemblerState:
                     self.had_error = True
 
     def diag_error(self, msg, force=False):
+        """エラーとして 1 行出し、had_error を立てる。"""
         return self.diag(f" error - {msg}", set_error=True, force=force)
 
     def diag_warning(self, msg, force=False):
+        """警告として 1 行出す。had_error は立てない。"""
         return self.diag(f" warning - {msg}", set_error=False, force=force)
 
     def should_report_errors(self):
-        """ユーザ向けエラーを今表示してよいパスか。
+        """いま診断を出してよいパスか。パス2と対話モードだけ真。
 
-        パス2（最終）と対話モードのみ。パス1のリラクゼーション中は同じエラーが
-        反復回数だけ重複するうえ、前方参照が未解決なだけの偽エラーも多い。
+        パス1は推定値で動いているので、そこで出る「範囲外」は本物とは限らない。
         """
         return self.pas == 2 or self.pas == 0
 
-    # 旧来のフラットな属性名（state.vliwbits 等）を、分割後のサブ状態
-    # （state.vliw.bits 等）へ転送するための対応表。呼び出し側を一斉に
-    # 書き換えずに状態を整理できるようにしてある。実際の転送は、この表から
-    # クラス定義時に生成する property（すぐ下のループ）が行う。
+    # 下位オブジェクトへ切り出した属性の、古い平らな名前。
+    # 下の内包でそれぞれ property を作るので、state.vliwbits のような
+    # 既存の書き方が state.vliw.bits として通り続ける。読み書きの両方が通る。
     _FORWARDED_ATTRS = {
         'pas':                   ('relax', 'pas'),
         '_pass1_size_mode':      ('relax', 'pass1_size_mode'),
@@ -1734,29 +1533,31 @@ class AssemblerState:
 
 
 class StringUtils:
-    """行の前処理（コメント除去・エスケープ解決・トークン切り出し）の小道具。
+    """行とトークンの文字列処理。どれも状態を持たない。
 
-    axx は字句解析器を持たず、1文字ずつ見ながら照合する設計なので、
-    「どこまでが1つの語か」を決める処理がこのクラスに集まっている。
+    ここに集めてあるのは、アセンブリ行・パターン行・マクロ行のどこからでも
+    同じ意味で呼べる必要があるものだけ。文字列リテラル `"..."` と文字定数
+    `'c'` の中は触らない、という規則を全員が共有している点が要。`'` は
+    符号拡張演算子でもあるので、文字定数かどうかの判定は 1 か所
+    (skip_squote_literal) に閉じてある。
     """
 
-    # ASCII 専用の大文字化テーブル。str.upper() を使わないのは、
-    # 非 ASCII（日本語等）を変換してしまうと .ascii 文字列の内容が壊れるため。
     _ASCII_UPPER = str.maketrans(LOWER, CAPITAL)
 
-    # upper() は照合の最内周から呼ばれ、同じ短い文字列（ニーモニック、
-    # パターンの欄、シンボル名）を何百万回も大文字化する。純粋な関数なので
-    # 結果を使い回す。実測: aarch64 の 120 行で 594 万回。
     _upper_cache = {}
 
     @staticmethod
     def upper(s):
-        """ASCII 英小文字だけを大文字化する（非 ASCII はそのまま）。"""
+        """ASCII だけを大文字にする。
+
+        str.upper() を使わないのは、非 ASCII まで畳むと caxx.c の toupper() と
+        結果が食い違うため。照合のたびに呼ばれるので表を引く形にし、
+        短い文字列だけを上限付きで覚える（溢れたら捨てて作り直す）。
+        """
         c = StringUtils._upper_cache
         v = c.get(s)
         if v is None:
             v = s.translate(StringUtils._ASCII_UPPER)
-            # 際限なく溜めない。行全体のような長い文字列は入れても当たらない。
             if len(s) <= 64:
                 if len(c) >= 65536:
                     c.clear()
@@ -1765,19 +1566,10 @@ class StringUtils:
 
     @staticmethod
     def join_backslash_continuations(raw_lines):
-        """行末が '\\' で終わる行を、次の行と1つの論理行に連結する。
+        """行末の `\\` で続く行をつなぐ。
 
-        パターンファイル・ソースファイルのどちらも1物理行=1パターン/1命令が
-        前提の実装なので、複雑な式を複数行に分けて書くとそこで暗黙に切れて
-        しまう(README Appendix A.3 の AND immediate 例がまさにこれで、警告
-        も出さずに後半のフィールドを取りこぼしていた)。'\\' を末尾に置けば
-        次の行と連結されるようにして、書き手が意図して複数行に分けられる
-        ようにする。
-
-        要素数は変えない: 継続元の行は空文字列に置き換え、連結された内容は
-        継続が終わった行の位置にまとめる。呼び出し側は行番号を「リスト内で
-        の位置」で数えていることが多いので、これで既存の行番号処理に影響を
-        与えない。
+        つないだぶんだけ空行を残すので、行数が入力と変わらない。診断に出す
+        行番号をソースの見た目と合わせるために、詰めずに空行を置いている。
         """
         out = []
         pending = ''
@@ -1799,22 +1591,23 @@ class StringUtils:
 
     @staticmethod
     def q(s, t, idx):
-        """s の idx 位置が文字列 t で始まるか（大小文字を無視して）判定する。"""
+        """s の idx の位置に t があるか（大文字小文字を区別しない）。"""
         return StringUtils.upper(s[idx:idx + len(t)]) == StringUtils.upper(t)
 
     @staticmethod
     def skipspc(s, idx):
-        """空白・タブを読み飛ばした位置を返す。"""
+        """空白とタブを飛ばした位置を返す。"""
         while idx < len(s) and s[idx] in ' \t':
             idx += 1
         return idx
 
     @staticmethod
     def skip_squote_literal(s, i):
-        """i が開き引用符の文字リテラル（'a' '\\n' '\\x41'）の直後位置を返す。
+        """i の `'` が文字定数なら、その直後の位置を返す。
 
-        コメント除去が、文字リテラル中の ';' をコメント開始と誤認しないために使う。
-        閉じ引用符が見つからなければ「ただの引用符1文字」とみなして i+1 を返す。
+        `'c'` `'\\n'` `'\\xHH'` を認める。文字定数でなければ i+1 を返すので、
+        呼び出し側はその `'` をふつうの 1 文字（符号拡張演算子）として読む。
+        この判定を 1 か所に閉じてあるので、どの層でも同じ切り分けになる。
         """
         j = i + 1
         if j < len(s) and s[j] == '\\' and j + 1 < len(s):
@@ -1835,11 +1628,7 @@ class StringUtils:
 
     @staticmethod
     def parse_hex_char_literal(s, idx):
-        """'\\xHH' 形式の文字リテラルを評価する（16進1〜2桁）。
-
-        戻り値は (成功したか, 値, 次の位置)。形が違えば idx を変えずに
-        (False, 0, idx) を返すので、呼び出し側は他のリテラル形式へ進める。
-        """
+        """`'\\xHH'` を読む。返り値は (読めたか, 値, 次の位置)。"""
         if not (idx + 3 <= len(s) and s[idx] == "'" and s[idx + 1] == '\\'
                 and s[idx + 2] in 'xX'):
             return False, 0, idx
@@ -1856,22 +1645,18 @@ class StringUtils:
 
     @staticmethod
     def reduce_spaces(text):
+        """空白の連なりを 1 個に潰す。リテラルの中身も区別せず潰す。
+
+        中身を守る必要があるところでは normalize_ws() を使う。
+        """
         return StringUtils._SPACE_RUNS.sub(' ', text)
 
     @staticmethod
     def normalize_ws(l):
-        """アセンブリソース1行の空白を整える（引用符の中は手を付けない）。
+        """空白の連なりを 1 個に潰す。ただし `"..."` と `'c'` の中は触らない。
 
-        引用符の外では タブ・CR・LF を空白に直し、連続する空白を1個に潰す。
-        照合は空白の個数を見ないので、こうしておくと `MOV  A , B` のような
-        書き方の揺れを吸収できる。
-
-        破綻点修正: 以前は行全体に一律で適用していたため、文字列リテラルの
-        中身まで潰していた。`.ascii "a    b"` が 3 バイトの `a b` になり、
-        生のタブは空白へ化けていた（診断は一切出ない）。文字列は「そのままの
-        バイト列を置く」のがアセンブラの仕事なので、引用符の中は素通しする。
-
-        `"..."` と `'x'` の扱いは split_comment_asm() と同じ規約に従う。
+        照合は空白の数を問わないので先に潰しておくが、文字列テンプレートが
+        出すテキストは書いたままでなければならない。その両立のための版。
         """
         out = []
         in_dquote = False
@@ -1920,17 +1705,12 @@ class StringUtils:
 
     @staticmethod
     def remove_comment(l, in_comment=False):
-        """パターンファイルのコメント `/* ... */` を落とす。
+        """パターンファイルの `/* ... */` を落とす。
 
-        破綻点修正: 以前は「行単位で扱うので閉じ記号は不要」という設計で、
-        その行に現れた `/*` から行末までを問答無用で切り捨てるだけだった。
-        実際のパターンファイルは何十行にもまたがる本物の C 形式ブロック
-        コメントを書いており、開始行以降・終了行までの中身が「'::' の
-        無い迷子の行」として毎行 warning を出していた。呼び出し元が
-        ファイル全体で共有する in_comment を渡し、複数行にまたがる
-        ブロックコメントとして正しく扱う。戻り値は (削った行, 更新後の
-        in_comment) のタプル。同じ行内に閉じ記号があれば、その後ろの
-        内容は通常どおり生かす。
+        返り値は (落としたあとの行, まだコメントの中か)。複数行にまたがる
+        コメントは呼び出し側がこの第 2 返り値を次の行へ渡して続ける。
+        「`/*` だけ並べた古い書き方ではコメントを次行へ延長しない」という
+        後方互換の判断は PatternFileReader 側にあり、ここは素の状態機械。
         """
         out = []
         i = 0
@@ -1953,19 +1733,11 @@ class StringUtils:
 
     @staticmethod
     def split_comment_asm(l):
-        """アセンブリソース1行を「コードの部分」と「`;` コメントの部分」に分ける。
+        """アセンブリ行を (コード, `;` コメント) に割る。
 
-        返すのは (コード, コメント) の対。コメントは `;` から行末までを書かれた
-        まま（末尾の空白だけ落として）返し、コメントが無ければ空文字を返す。
-
-        ただし文字列 "..." や文字リテラル 'x' の中の `;` は本物のデータなので
-        残す（コメントの始まりとはしない）。引用符の外の `\\;` はエスケープとして
-        扱い、バックスラッシュを外したリテラルな `;` に変える（コメントを
-        開始させない）。
-
-        コメントを捨てずに返すのは、テキスト置換モード（`.textmode`、3.18 節）が
-        コメントも訳したテキストに残すからである。caxx.c の
-        axx_split_comment_asm() と同じ規則である。
+        `"..."` と `'c'` の中の `;` は区切らない。`\\;` は文字としての `;` で、
+        ここで `;` 1 文字に開かれる。コメントを捨てずに返すのは、テキスト置換
+        モードが書かれていたままの綴りで出力に残すため。
         """
         in_dquote = False
         out = []
@@ -2006,25 +1778,11 @@ class StringUtils:
 
     @staticmethod
     def resolve_vliw_escapes(l):
-        """ソース行の `\\!` を解決し、本物の VLIW 区切りを番兵に置き換える。
+        """ソース行の `!!` と `!!!!` を 1 文字の内部表現に置き換える。
 
-        処理は2つあるが、必ず1回の左→右走査で同時に行う必要がある:
-
-          * `\\!` → リテラルな `!`（バックスラッシュを外す）
-          * 本物の（エスケープされていない）`!!` → VLIW_SEP
-            同じく `!!!!` → VLIW_STOP
-
-        なぜ同時でなければならないか。仮に先に `\\!\\!` を `!!` へ戻してしまうと、
-        後から区切りを探す別の走査からは、それが「エスケープ由来のただの !!」なのか
-        「本物の区切り」なのか区別できない。後続の走査は「どの !! がエスケープ
-        だったか」を覚えていないからである。ここで一度だけ判定して本物だけを
-        番兵にしておけば、以降の全ての箇所（lineassemble() の後処理、
-        VLIWProcessor のスロット走査、get_param_to_spc()/get_param_to_eon()）は
-        番兵だけを見ればよく、取り違えが原理的に起きない。
-
-        文字列 "..." と文字リテラル 'x' の中身はそのまま素通しする。
-        呼ぶのは split_comment_asm() が `\\;` を解決しコメントを分けた後なので、
-        ここで面倒を見るのは `\\!` だけでよい。
+        `\\!` は文字としての `!` なので、先に `!` 1 文字へ開いてから見る。
+        これで「スロット区切り」と「エスケープされた !!」が以降は
+        1 文字か 2 文字かだけで区別できる。文字列の中は触らない。
         """
         out = []
         in_dquote = False
@@ -2073,16 +1831,7 @@ class StringUtils:
 
     @staticmethod
     def get_param_to_spc(s, idx):
-        """空白区切りで1語（ニーモニック部分）を切り出す。
-
-        VLIW 区切りの番兵でも切る。番兵で切らないと、`NOP!!NOP` のように
-        空白なしで next スロットが続く書き方でニーモニックが隣のスロットを
-        飲み込んでしまう。
-
-        素の "!!" では切らないことに注意。ここへ来る時点で本物の区切りは
-        resolve_vliw_escapes() が番兵に変換済みなので、残っている "!!" は
-        `\\!\\!` を解決したただの文字列であり、区切りとして扱ってはいけない。
-        """
+        """空白か VLIW スロット境界まで読む。返り値は (読んだ文字, 次の位置)。"""
         t = ""
         idx = StringUtils.skipspc(s, idx)
         while idx < len(s) and s[idx] != ' ' and s[idx] not in (VLIW_SEP, VLIW_STOP):
@@ -2092,7 +1841,7 @@ class StringUtils:
 
     @staticmethod
     def get_param_to_eon(s, idx):
-        """行の残り（空白を含む＝オペランド部分）を、VLIW 区切りの手前まで取る。"""
+        """VLIW スロット境界まで読む（空白は含めて読む）。"""
         t = ""
         idx = StringUtils.skipspc(s, idx)
         while idx < len(s) and s[idx] not in (VLIW_SEP, VLIW_STOP):
@@ -2102,10 +1851,11 @@ class StringUtils:
 
     @staticmethod
     def get_string(l2):
-        """`"..."` 形式の文字列リテラルを解釈して中身を返す。
+        """ダブルクォートの文字列リテラルを 1 個読んで、中身を返す。
 
-        C 風のエスケープ \\n \\t \\r \\" \\\\ と、\\xHH / \\uHHHH / \\UHHHHHHHH に対応する。
-        先頭が `"` でなければ空文字列を返す（.ascii 等の引数検査に使う）。
+        エスケープは `\\n` `\\t` `\\r` `\\\\` `\\"` と `\\xHH`、`\\uXXXX`、
+        `\\UXXXXXXXX`。桁が足りない・多い場合は警告して、書かれた文字を
+        そのまま採る（エラーにして止めない）。閉じられていない場合も警告だけ。
         """
         idx = 0
         idx = StringUtils.skipspc(l2, idx)
@@ -2177,17 +1927,19 @@ class StringUtils:
 
 
 class Parser:
-    """パターン/ソース双方から「1つの語」を切り出す下位パーサ群。
-    
-    数値リテラル・浮動小数点リテラル・`{...}` で囲まれた本体・シンボル名・
-    ラベル名など、文字種の規約に従って可変長のトークンを読み取る。
-    どれも (取り出した文字列, 次の位置) の形で返すのが共通の約束。
+    """行から 1 個ずつトークンを切り出す低位の読み取り器。
+
+    どのメソッドも (読んだもの, 次の位置) を返し、読めなければ位置を動かさない。
+    照合は後退しながら何度も試すので、失敗が副作用を残さないことが要。
+    使える文字の集合は state の lwordchars / swordchars から引くため、
+    `.labelc` / `.symbolc` の拡張がそのまま効く。
     """
 
     def __init__(self, state):
         self.state = state
 
     def get_intstr(self, s, idx):
+        """続く 10 進数字を綴りのまま取る。"""
         fs = ''
         while idx < len(s) and s[idx] in DIGIT:
             fs += s[idx]
@@ -2195,6 +1947,11 @@ class Parser:
         return fs, idx
 
     def get_floatstr(self, s, idx):
+        """浮動小数点の綴りを取る。`inf` / `-inf` / `nan` も読む。
+
+        指数部は `e` のあとに数字が無ければ指数ではないので、`e` の前まで
+        巻き戻す。`1e` で終わる行や、`1eax` のような続きがある場合のため。
+        """
         if s[idx:idx + 4] == '-inf':
             return '-inf', idx + 4
         elif s[idx:idx + 3] == 'inf':
@@ -2224,6 +1981,7 @@ class Parser:
             return fs, idx
 
     def isfloatstr(self, s, idx):
+        """その位置から浮動小数点として読めるか（位置は動かさない）。"""
         sidx = idx
         v, idx = self.get_floatstr(s, idx)
         if idx == sidx:
@@ -2232,6 +1990,10 @@ class Parser:
             return True
 
     def get_curlb(self, s, idx):
+        """`{ ... }` の中身を取る。返り値は (あったか, 中身, 次の位置)。
+
+        閉じ括弧が無ければ診断を出し、行の末尾まで消費したことにする。
+        """
         idx = StringUtils.skipspc(s, idx)
         f = False
         t = ''
@@ -2242,18 +2004,8 @@ class Parser:
             while idx < len(s) and s[idx] != '}':
                 t += s[idx]
                 idx += 1
-            # 末尾の空白と、式文字列に付く終端 NUL を落とす（caxx.c の
-            # axx_get_curlb() と揃える）。`}` が閉じていない失敗経路では
-            # 行末までを取り込むためこれらが混ざり、エラーメッセージに
-            # そのまま出ていた。
             t = t.rstrip(' \t\r\n\x00')
             if idx >= len(s):
-                # 破綻点修正: 通常の diag() はパターン照合の試行中は抑制されるため、
-                # この「`}` が閉じていない」という具体的な原因が握り潰され、
-                # 呼び出し元の総称的な "Illegal syntax ..." だけが出ていた
-                # （caxx.c は照合中でも表示するので、両実装で診断が食い違っていた）。
-                # 閉じ括弧の欠落はどのパターンで試しても同じく失敗する構文上の誤りで、
-                # 特定パターンの不採用とは無関係なので、照合中の抑制を迂回して報告する。
                 if self.state.should_report_errors():
                     self.state.diag(f" error - missing closing '}}' in expression: '{{{t}'",
                                     set_error=True, force=True)
@@ -2264,6 +2016,10 @@ class Parser:
         return f, t, idx
 
     def get_symbol_word(self, s, idx):
+        """シンボル名を 1 個取り、大文字化して返す。
+
+        数字で始まる綴りはシンボルではない。使える文字は `.symbolc` 次第。
+        """
         t = ""
         if idx < len(s) and s[idx] not in DIGIT and s[idx] in self.state.swordchars:
             t = s[idx]
@@ -2274,18 +2030,11 @@ class Parser:
         return StringUtils.upper(t), idx
 
     def get_label_word(self, s, idx, eat_colon=True):
-        """ラベル名を1語切り出す。
+        """ラベル名を 1 個取る。大文字化はしない（ラベルは区別する）。
 
-        eat_colon=True のときは、名前の直後の `:` も一緒に読み飛ばす。
-        `foo: NOP` の行頭ラベルや `.EXTERN foo::pc32` を切り出すための約束で、
-        呼び出し側は `l[idx-1] == ':'` を見て「ラベル定義だったか」を判定する。
-
-        破綻点修正: 式の評価（ExpressionEvaluator.factor1）からも同じ関数を
-        呼んでいたため、三項演算子の `:` がラベル名の一部として食われていた。
-        `0?foo:bar` は bar ではなく 0 になり（term11 が `:` を見つけられず
-        else 節ごと消える）、しかも診断は一切出なかった。`foo :bar` のように
-        空白を入れたときだけ正しく動くという再現条件の分かりにくい誤りだったので、
-        式の文脈からは eat_colon=False で呼ぶ。"""
+        定義側の `label:` の `:` まで食べるのが既定だが、`:=`（代入）の
+        `:` は食べない。参照側で `:` を残したいときは eat_colon を偽にする。
+        """
         t = ""
         if idx < len(s) and (s[idx] == '.' or (s[idx] not in DIGIT and s[idx] in self.state.lwordchars)):
             t = s[idx]
@@ -2301,6 +2050,7 @@ class Parser:
         return t, idx
 
     def get_params1(self, l, idx):
+        """`::` までを 1 欄として取る。パターン行とディレクティブ行の分解に使う。"""
         idx = StringUtils.skipspc(l, idx)
 
         if idx >= len(l):
@@ -2318,6 +2068,11 @@ class Parser:
 
 
 def enfloat(a):
+    """32bit の整数ビットパターンを、同じビットの float として読み直す。
+
+    `!F` で捕らえた値を式の中で数として扱うときの逆方向。壊れた入力では
+    例外を投げずに 0.0 を返し、診断は呼び出し側に任せる。
+    """
     try:
         float_value = struct.unpack('f', struct.pack('I', int(a) & 0xFFFFFFFF))[0]
     except (struct.error, OverflowError, ValueError):
@@ -2326,6 +2081,7 @@ def enfloat(a):
 
 
 def endouble(a):
+    """64bit の整数ビットパターンを、同じビットの double として読み直す。"""
     try:
         double_value = struct.unpack('d', struct.pack('Q', int(a) & 0xFFFFFFFFFFFFFFFF))[0]
     except (struct.error, OverflowError, ValueError):
@@ -2338,16 +2094,16 @@ endbl = endouble
 
 
 class IEEE754Converter:
-    """10進表記の数値を IEEE754 のビットパターンへ変換する。
-    
-    32/64bit は struct で足りるが、128bit（四倍精度）は Python に型が無いため
-    Decimal を高精度モードで使って手組みで組み立てる。
-    decimal_eval_expr() は `3.14*2+1` のような定数式を、途中で float に落とさず
-    Decimal のまま評価するためのもの（丸め誤差を持ち込まないため）。
+    """10 進表記 → IEEE-754 のビットパターン（16 進文字列）。
+
+    32bit と 64bit は struct に任せられるが、128bit は Python に型が無いので
+    Decimal で手で組む。パターンの `!Q` と `.float` がこれを通る。
+    inf / nan / -0.0 の形まで caxx.c（strtoflt128）と一致させる必要がある。
     """
 
     @staticmethod
     def decimal_to_ieee754_32bit_hex(a):
+        """`!F` 用。32bit 単精度のビットパターンを 16 進 8 桁で返す。"""
         if a == 'inf':
             return "0x7F800000"
         elif a == '-inf':
@@ -2367,6 +2123,7 @@ class IEEE754Converter:
 
     @staticmethod
     def decimal_to_ieee754_64bit_hex(a):
+        """`!D` 用。64bit 倍精度のビットパターンを 16 進 16 桁で返す。"""
         if a == 'inf':
             return "0x7FF0000000000000"
         elif a == '-inf':
@@ -2386,12 +2143,25 @@ class IEEE754Converter:
 
     @staticmethod
     def decimal_to_ieee754_128bit_hex(a):
+        """`!Q` 用。128bit 四倍精度のビットパターンを 16 進 32 桁で返す。
+
+        Decimal の精度を 60 桁に上げた文脈で実装を呼ぶ。既定の 28 桁では
+        112bit の仮数を丸めきれない。
+        """
         with localcontext() as _ctx:
             _ctx.prec = 60
             return IEEE754Converter._decimal_to_ieee754_128bit_hex_impl(a)
 
     @staticmethod
     def _decimal_to_ieee754_128bit_hex_impl(a):
+        """128bit 変換の本体。符号・指数・仮数を自分で組む。
+
+        指数の初期推定を 10 進桁数から作り、1 <= 仮数 < 2 になるまで 2 で
+        掛け割りして正規化する。推定が外れても収束するはずだが、壊れた入力で
+        回り続けないよう反復数に上限を置き、超えたら例外にする。
+        指数が上に溢れたら無限、下に溢れたら非正規化数として詰める。
+        丸めは偶数丸め。0 は符号付きゼロを保つ。
+        """
         BIAS = 16383
         SIGNIFICAND_BITS = 112
         EXPONENT_BITS = 15
@@ -2426,13 +2196,6 @@ class IEEE754Converter:
 
             two = Decimal(2)
 
-            # 破綻点修正: 従来は scaled = int(d * 2**112) で2進指数を求めていたが、
-            # d の指数が巨大な場合（qad{1e500000} や qad{1e-500000} 等）、
-            # Decimal→巨大整数の変換や以降の1ビットずつの正規化ループが指数の
-            # 桁数にほぼ比例して重くなり、事実上ハングしていた。
-            # d.adjusted()（10進の桁指数。内部タプルの参照だけで求まり O(1)）を
-            # 2進指数へ換算した近似値から出発すれば、以降の補正ループは
-            # 桁数によらず数回で 1<=normalized<2 に収束する。
             exp_unbiased = int(d.adjusted() * math.log2(10))
 
             scale = two ** exp_unbiased
@@ -2488,12 +2251,22 @@ class IEEE754Converter:
 
     @staticmethod
     def decimal_eval_expr(text):
+        """128bit 精度のまま浮動小数点式を評価し、ビットパターンを返す。
+
+        `qad{...}` の中身がここを通る。途中を double に落とさないので、
+        34 桁の有効数字が最後まで残る。
+        """
         with localcontext() as _ctx:
             _ctx.prec = 60
             return IEEE754Converter._decimal_eval_expr_impl(text)
 
     @staticmethod
     def _decimal_eval_expr_impl(text):
+        """上の本体。Decimal 上の再帰下降で `+ - * / // %` と括弧を解く。
+
+        `//` は C と同じゼロ方向ではなく負の無限方向へ丸める（下の補正）。
+        入れ子が深すぎる式は RecursionError を拾って文言に変える。
+        """
         text = text.strip()
 
         def skip(s, i):
@@ -2510,7 +2283,6 @@ class IEEE754Converter:
                 i = skip(s, i)
             for kw, dval in (('inf', Decimal('Infinity')), ('nan', Decimal('NaN'))):
                 if s[i:i + len(kw)] == kw:
-                    # copy_negate() を使う理由は下の return と同じ。
                     v = dval.copy_negate() if neg else dval
                     return v, i + len(kw)
             if i >= len(s) or s[i] not in '0123456789.':
@@ -2528,10 +2300,6 @@ class IEEE754Converter:
                 v = Decimal(s[start:i])
             except Exception as _e:
                 raise ValueError(f"invalid decimal literal: {s[start:i]!r}") from _e
-            # 単項マイナスは copy_negate() で入れる。Decimal の `-x` は十進算術の
-            # minus 演算なので負のゼロを正のゼロへ正規化してしまい、`-0.0` の符号が
-            # 消えて caxx（__float128 で符号ビットを立てる）と食い違う。
-            # copy_negate() は丸めを通さない符号反転なので、0 以外では `-x` と同じ。
             return (v.copy_negate() if neg else v), i
 
         def parse_factor(s, i):
@@ -2550,7 +2318,6 @@ class IEEE754Converter:
                     v, i = parse_factor(s, i + 1)
                 except RecursionError:
                     raise ValueError("decimal_eval_expr: expression nesting too deep")
-                # parse_number と同じ理由で copy_negate()（負のゼロの符号を保つ）
                 return v.copy_negate(), i
             if i < len(s) and s[i] == '+':
                 try:
@@ -2570,7 +2337,7 @@ class IEEE754Converter:
                     t, i = parse_factor(s, i + 2)
                     if t == 0:
                         raise ZeroDivisionError("floor division by zero in qad{}")
-                    tq = v // t  # Decimal '//' truncates toward zero, not floor
+                    tq = v // t
                     if tq * t != v and (v < 0) != (t < 0):
                         tq -= 1
                     v = Decimal(int(tq))
@@ -2607,15 +2374,12 @@ class IEEE754Converter:
 
 
 class VariableManager:
-    """パターン変数の束縛を管理する。
-    
-    `!x` や `!Fx` でソースから捕捉した値の置き場。状態は state.vars（名前→値の表）で、
-    このクラスは名前の正規化と未定義判定を隠すだけの薄い層。捕捉されていない
-    名前を引くと 0 を返す。
+    """パターン変数の束縛を読み書きする。
 
-    値とは別に「未定義ラベル由来か」の札（state.vars_undef）も持つ。put() は
-    札を降ろし、put_tagged() は明示した札を立てる。捕捉時に判っている事実を
-    そのまま覚えておくためで、理由は state.vars_undef のコメントを参照。
+    変数は小文字で始まり小文字・数字・`_` が続く綴りで、長さは問わない。
+    綴りがそれに合わないものは変数ではないので、読めば VAR_UNDEF、
+    書けば黙って捨てる。束縛はパターン行ごとに消えるため、マッチしなかった
+    省略可能オペランドは 0 として読まれる。
     """
 
     def __init__(self, state):
@@ -2623,10 +2387,7 @@ class VariableManager:
 
     @staticmethod
     def _index(s):
-        """変数名を正規化する。小文字1文字でも `var_2` のように長くてもよい。
-
-        名前として読めなければ None。caxx.c の var_slot() にあたる。
-        """
+        """変数名を正規の鍵（小文字）にする。変数名でなければ None。"""
         if not s:
             return None
         u = s.lower()
@@ -2638,28 +2399,33 @@ class VariableManager:
         return u
 
     def get(self, s):
+        """変数の値。未束縛・名前でない場合は VAR_UNDEF。"""
         i = self._index(s)
         if i is None:
             return VAR_UNDEF
         return self.state.vars.get(i, VAR_UNDEF)
 
     def is_undef(self, s):
+        """その変数が未定義ラベル由来の値を持っているか。"""
         i = self._index(s)
         if i is None:
             return False
         return self.state.vars_undef.get(i, False)
 
     def put(self, s, v):
+        """変数に値を束縛する（未定義由来の印は付けない）。"""
         self.put_tagged(s, v, False)
 
     def put_tagged(self, s, v, is_undef):
-        # 破綻点修正: `'' in CAPITAL` は True なので、空文字を渡されると
-        # 直後の ord('') が TypeError になっていた（`len == 1` の判定が要る）。
+        """変数に値と「未定義由来か」の印を束縛する。
+
+        Decimal と float は、整数で表せるなら int に落として入れる。
+        以降の演算とリスティングの見え方を caxx.c とそろえるため、
+        「整数になる値は整数で持つ」を入口で揃えておく。
+        """
         c = self._index(s)
         if c is None:
             return
-        # caxx.c が束縛のときスロットを作るのに合わせ、名前を覚えておく。
-        # 文字列テンプレートが「これは変数の名前か」を見るのに使う。
         self.state.varnames.add(c)
         if isinstance(v, Decimal):
             if not v.is_finite():
@@ -2679,21 +2445,22 @@ class VariableManager:
 
 
 class LabelManager:
-    """ソース側ラベルの定義と参照を管理する。
-    
-    値の取得（get_value）で未定義だった場合は state.error_undefined_label を
-    「立てる」だけで、成功しても降ろさないのが重要な約束。
-    1つの式が複数のラベルを引くため、途中で降ろすと先に起きた失敗が消えてしまう。
-    
-    put_value はパスによって意味が変わる:
-      パス1 … 新規定義。既に在れば二重定義エラー（.extern の仮登録だけは上書き可）。
-      パス2 … 既にパス1で在るはず。無ければ両パスで見た入力が違うという異常。
+    """ラベルの定義と参照。リラクゼーションとリロケーションの要。
+
+    参照のたびに、いまが何パスか・パターン照合の途中かによって答えを変える。
+    パス1では値が未確定でも止まれないので推定値を返し、パス2では確定値を
+    返す。`-o` のとき参照そのものを ElfState に記録するのもここ。
     """
 
     def __init__(self, state):
         self.state = state
 
     def _section_relative_offset(self, name, word_pc):
+        """絶対のワードアドレスを、そのセクション先頭からの相対位置に直す。
+
+        セクションはソース中で何度も開き直せるので、同じ名前の範囲を書かれた
+        順にたどって累積する。範囲に入らなければ None。
+        """
         ranges = [(rs, rl) for (rn, rs, rl) in self.state.section_ranges if rn == name]
         cum = 0
         for rs, rl in ranges:
@@ -2708,6 +2475,7 @@ class LabelManager:
         return None
 
     def get_section(self, k):
+        """ラベルが属するセクション名。未定義なら UNDEF を返して印を立てる。"""
         try:
             v = self.state.labels[k][1]
         except (KeyError, IndexError):
@@ -2716,6 +2484,21 @@ class LabelManager:
         return v
 
     def get_value(self, k):
+        """ラベルの値を読む。パスごとに「未確定」の扱いが変わる。
+
+        未定義のときの答えは、
+          - パス1で前回の反復の値があればそれ（収束のための推定値）、
+          - パス1の最初の反復なら現在の PC（楽観的に短い符号化から試す）、
+          - 長さだけ見ている区間なら 0、
+          - それ以外は UNDEF。
+        診断を出すのは、照合の試行中ではなく、かつ報告してよいパスのときだけ。
+        照合は失敗する試行を何度も通るので、そこで出すと嘘の診断が溢れる。
+
+        `-o` の追跡中は、この参照がどの変数・どの出力ワードから来たかを
+        ElfState に積む。あとでリロケーションの型と位置を決めるのに使う。
+        `.equ` のラベルは再配置情報を失う定数なので、型が付いている場合を
+        除いて積まない。
+        """
         try:
             v = self.state.labels[k][0]
         except (KeyError, IndexError):
@@ -2731,9 +2514,6 @@ class LabelManager:
             if not self.state._in_match_attempt and (self.state.should_report_errors()):
                 _fn = self.state.current_file or ""
                 _ln = self.state.ln
-                # 破綻点修正: set_error=False で出していたため had_error が立たず、
-                # この診断だけが出る経路（パターンファイル側ディレクティブの式など）
-                # では「エラーを表示しながら終了コード0」になっていた。
                 self.state.diag(f" error - Label undefined: '{k}'"
                      f"  [{_fn}:{_ln}]", set_error=True)
             return v
@@ -2765,17 +2545,9 @@ class LabelManager:
         return v
 
     def _report_definition_error(self, key, msg):
-        """ラベル定義の誤りを、1つにつき1回だけ必ず表示する。
+        """ラベル定義のエラーを、同じ原因について 1 回だけ出す。
 
-        破綻点修正: これらは had_error を立てながら通常の diag() で出していた。
-        しかし定義の衝突が見つかるのはパス1で、パス1の診断は抑制される。
-        パス2では「既に在るラベル」に見えるので二度と検出されず、結果として
-        ユーザには具体的な原因が一度も表示されないまま、
-        " error - one or more errors were reported during assembly" だけ、
-        あるいは（値がずれた場合）「パス1/パス2のアドレス不一致 ＝ リラクゼーション
-        未収束」という全く無関係なメッセージが出ていた。
-        パス1の抑制を迂回して出す代わりに、リラクゼーションの反復回数だけ
-        重複しないよう、同じ誤りは1回に抑える。
+        パス1とパス2で同じ行を 2 回通るので、鍵で重複を抑える。
         """
         self.state.had_error = True
         if key in self.state.reported_label_errors:
@@ -2786,6 +2558,12 @@ class LabelManager:
                         set_error=True, force=True)
 
     def put_value(self, k, v, s, is_equ=False, reloc_type=None):
+        """ラベルを定義する。定義できたかを返す。
+
+        弾くのは、同じ名前の二重定義（インポートされたものの上書きは可）、
+        パス1に無くパス2で現れた名前、パターンファイルのシンボルとの衝突。
+        リロケーション型が渡されなければ、前の定義が持っていた型を引き継ぐ。
+        """
         if self.state.pas == 1 or self.state.pas == 0:
             if k in self.state.labels:
                 existing = self.state.labels[k]
@@ -2809,11 +2587,6 @@ class LabelManager:
 
         entry = [v, s, is_equ, is_imported]
         if reloc_type is None:
-            # リロケーション型の指定（`.global 名前::型名`、`.extern`、
-            # `.EQU x::型名`）はラベルの定義とは別に宣言されるものなので、
-            # 同じ名前を置き直しても消さない。`.global` は宣言がラベル定義より
-            # 前に書かれるのが普通で、ここで消すと指定が効かなかった。
-            # caxx.c の lmap_set() と同じ扱いである。
             _old = self.state.labels.get(k)
             if _old is not None and len(_old) > 4 and _old[4] is not None:
                 reloc_type = _old[4]
@@ -2824,6 +2597,7 @@ class LabelManager:
         return True
 
     def printlabels(self):
+        """ラベル表を標準エラーへ並べる。プロンプトモードの `?` の中身。"""
         result = {}
         for key, value in self.state.labels.items():
             num = value[0]
@@ -2843,31 +2617,25 @@ class LabelManager:
 
 
 class SymbolManager:
-    """パターンファイルの `.setsym` で定義されたシンボルを引く。
-    
-    レジスタ名などの「小文字で始まる名前のパターン」が照合時にここを参照する。
-    名前は大小文字を区別せずに解決する。
-    """
+    """パターンファイルが定義したシンボルを引く。名前は大文字で正規化する。"""
 
     def __init__(self, state):
         self.state = state
 
     def get(self, w):
+        """シンボルの値。無ければ空文字を返す。"""
         w = StringUtils.upper(w)
         return self.state.symbols.get(w, "")
 
 
-# 列挙要素名が「語として」そこで終わっているかの判定に使う文字集合。
-# 記号文字（.symbolc の既定に含まれる `-` など）を入れると `A0-A1` の `-` が
-# 語の一部に見えて範囲指定も減算も書けなくなるので、英数字と下線に限る。
 _ENUM_WORD_CHARS = set(DIGIT + ALPHABET + '_')
 
 
 def _enum_name_at(s, idx, names):
-    """s の idx 位置に一致する列挙要素名のうち最長のものを返す。
+    """その位置にある `.enum` の要素名を最長一致で読む。
 
-    返り値は (要素番号, 終了位置)。一致しなければ (-1, idx)。
-    直後が英数字・下線なら語の途中なので一致とみなさない。
+    返り値は (要素の番号, 次の位置)。無ければ (-1, idx)。名前の直後が
+    英数字・下線なら語の途中なので一致とみなさない。
     """
     best = -1
     best_end = idx
@@ -2886,13 +2654,10 @@ def _enum_name_at(s, idx, names):
 
 
 def _symset_item_at(s, idx, items):
-    """s の idx 位置に一致する集合の項目名のうち最長のものを返す。
+    """その位置にある集合の項目名を最長一致で読む（`!Y` の照合）。
 
-    返り値は (項目番号, 終了位置)。一致しなければ (-1, idx)。
-    直後が英数字・下線なら語の途中なので一致とみなさない。項目の綴りは
-    書かれたままなので（`[r0,r1]` は小文字のまま）、突き合わせは両側を
-    大文字にして行う。数値の項目は名前を持たないので照合の相手にしない。
-    caxx.c の symset_item_at() と同じ規則である。
+    返り値は (項目の番号, 次の位置)。数値の項目は名前を持たないので候補外。
+    `A,AX,AL` に対して `al` が `A` ではなく `AL` に当たるのは最長一致のため。
     """
     best = -1
     best_end = idx
@@ -2913,22 +2678,31 @@ def _symset_item_at(s, idx, items):
 
 
 class ExpressionEvaluator:
-    """式評価器。優先順位ごとの再帰下降パーサ。
-    
-    下から順に:
-      factor / factor1  リテラル・ラベル・`$$`/`$.`・`#sym`・qad{}/dbl{}/flt{}・
-                        単項 -,~,@・バイト抽出 *(値,位置)・not(...)
-      term0_0           `**`
-      term0             `*` `/` `//` `%`
-      term1             `+` `-`
-      term2             `<<` `>>`
-      term3/4/5         `&` `|` `^`
-      term6             `'`（任意ビット位置からの符号拡張）
-      term7             比較
-      term8〜11         論理演算と三項演算子
-    
-    xeval() だけは系統が違い、qad{}/dbl{}/flt{} の中身専用の制限付き評価器。
-    Python の ast で解析し、`:ラベル名` 参照と enfloat/endouble 等の呼び出しを許す。
+    """式評価器。優先順位ごとに 1 メソッドの再帰下降。
+
+    どのメソッドも (値, 次の位置) を返し、読めなければ位置を動かさない。
+    アセンブリ行・パターン行・ミニ言語・マクロ層がすべてこの 1 つを通るので、
+    どの層でも同じ式が同じ値になる。使える項の違いは state.expcaps
+    (ExprCaps) だけで表し、評価器は呼び出し元を知らない。
+    state.exp_typ が 'f' のときは浮動小数点として計算する。
+
+    優先順位（緩いものが外側、Python に倣う）:
+
+      term11   ?:
+      term10   ||
+      term9    &&
+      term8    （段を空けてある。下へ素通し）
+      term7    <= < >= > == !=
+      term6    '   符号拡張
+      term5    ^
+      term4    |
+      term3    &
+      term2    << >>
+      term1    + -
+      term0    * / // %
+      term0_0  **
+      factor   単項 - ~ @、`*(x,y)`、`!!!` `!!!!`
+      factor1  項そのもの（数値・ラベル・シンボル・変数・`$$` ...）
     """
 
     def __init__(self, state, var_manager, label_manager, symbol_manager, parser):
@@ -2939,14 +2713,23 @@ class ExpressionEvaluator:
         self.parser = parser
 
     def nbit(self, l):
-        # 実装は共有関数 op_msb() 側。マクロ層も同じものを呼ぶ。
+        """`@` 演算子。最上位の立っているビットの位置。"""
         return op_msb(l)
 
     def err(self, m):
+        """文言を標準エラーへ出して -1 を返す。"""
         print(m, file=sys.stderr)
         return -1
 
     def factor(self, s, idx):
+        """単項演算子と括弧つきの組み込み項を処理し、残りを factor1 に渡す。
+
+        扱うのは `-` `~` `@`、バイト抽出 `*(x,y)`、VLIW の `!!!`（結合された
+        命令の数）と `!!!!`（ストップビット）。VLIW の 2 つは expcaps が
+        許していなければ読まない。再帰が深すぎる式は RecursionError を拾って
+        診断にする。factor1 が 1 文字も進めず、しかも区切り文字でもない
+        ときだけ「読めない字」の警告を出す（照合の試行中は出さない）。
+        """
         idx = StringUtils.skipspc(s, idx)
         x = 0
 
@@ -2999,10 +2782,6 @@ class ExpressionEvaluator:
                     x = 0
             else:
                 self.state.diag(" error - expected '(' after '*' in *(expr,expr) expression.", set_error=True)
-                # 破綻点修正: idx を '*' の次へ進めないと、呼び出し元の乗算ループ
-                # (term0)が同じ未消費の '*' を通常の乗算演算子として再度読み、
-                # "5+*x" のような壊れた式が 0 * <次の因子> という誤った値へ
-                # 静かに縮退してしまう。エラー後は '*' を読み飛ばす。
                 idx += 1
         else:
             prev_idx = idx
@@ -3018,6 +2797,15 @@ class ExpressionEvaluator:
         return x, idx
 
     def xeval(self, x, _=None):
+        """`:ラベル` を含む Python 構文の式を、安全に評価する。
+
+        eval() は使わない。ラベル参照を衝突しない placeholder に置き換えてから
+        ast で解析し、許可した節と演算子だけを自分で畳む。呼べる関数は
+        enfloat / endouble とその別名の 4 つだけで、それ以外の名前・呼び出し・
+        節はすべて拒否する。べき乗とシフトには上限も掛ける。
+        ラベル名をそのまま式に埋めないのは、名前が Python の構文に化けるのを
+        防ぐため。現在このメソッドはどこからも呼ばれていない。
+        """
         def _cc_escape(chars):
             out = []
             for c in chars:
@@ -3194,14 +2982,19 @@ class ExpressionEvaluator:
         return result
 
     def factor1(self, s, idx):
+        """項そのものを 1 個読む。
+
+        数値（10 進・16 進・2 進・浮動小数点）、文字定数、ラベル、`#シンボル`、
+        パターン変数、`$$`／`$.`、`%%`、括弧、`:=` の代入、配列シンボルの
+        添字引き、`.enum` や集合の項目など、式の葉になるものすべて。
+        どれにも当たらなければ位置を動かさず 0 を返し、判断は factor に任せる。
+        """
         x = 0
         idx = StringUtils.skipspc(s, idx)
 
         if idx >= len(s):
             return x, idx
 
-        # .enum の式を評価している間だけ、列挙要素名をその束縛値として読む。
-        # `#name` は先に別の枝で処理されるので、そちらは素の .setsym 値になる。
         _enum_hit = None
         if self.state.enum_bindings is not None:
             _enames, _evals = self.state.enum_bindings
@@ -3270,7 +3063,6 @@ class ExpressionEvaluator:
         elif StringUtils.q(s, '#', idx):
             idx += 1
             t, idx = self.parser.get_symbol_word(s, idx)
-            # `#x[3]` は配列シンボルの項目。添字は式で、0 から数える。
             _akey = StringUtils.upper(t)
             _arr = self.state.arrsymbols.get(_akey)
             if _arr is not None and idx < len(s) and s[idx] == '[':
@@ -3318,8 +3110,6 @@ class ExpressionEvaluator:
                 if not f:
                     pass
                 elif t in ('nan', 'inf', '-inf'):
-                    # 明示して書いた無限大・非数（マニュアル 5.4 節）。dbl{} /
-                    # flt{} と同じく、式としてではなくそのまま通す。
                     x = int(IEEE754Converter.decimal_to_ieee754_128bit_hex(t), 16)
                 else:
                     try:
@@ -3339,11 +3129,6 @@ class ExpressionEvaluator:
                             else:
                                 h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
                                         str(Decimal(repr(float(v)))))
-                    # 破綻点修正: 結果が binary128 の幅を越えて無限大になっても
-                    # 黙って通していた（`qad{1e4933}` や `qad{inf+2}`）。幅を
-                    # 越えたらエラーにする（dbl{} / flt{} と同じ規則。caxx.c の
-                    # f128_eval_text() が非有限を失敗とするのと揃える）。
-                    # 明示して書いた `inf` / `-inf` / `nan` は上の分岐が拾う。
                     if (int(h, 16) >> 112) & 0x7fff == 0x7fff:
                         self.state.diag(f" error - qad{{}}: cannot evaluate expression '{t}'; using 0.", set_error=True)
                         h = '0' * 32
@@ -3362,11 +3147,6 @@ class ExpressionEvaluator:
                 else:
                     try:
                         v = float(self.xeval(t, None))
-                        # 破綻点修正: 有限かを見ていなかったため、`dbl{1e309}` の
-                        # ように float64 の幅を越えた値が無限大として黙って通って
-                        # いた。幅を越えたらエラーにする（flt{} / qad{} と同じ
-                        # 規則。caxx.c の dbl{} の分岐と同じ）。明示して書いた
-                        # `inf` / `-inf` / `nan` は上の分岐が拾う。
                         if v != v or v in (float('inf'), float('-inf')):
                             raise OverflowError('non-finite')
                         x = int.from_bytes(struct.pack('>d', v), "big")
@@ -3387,10 +3167,6 @@ class ExpressionEvaluator:
                 else:
                     try:
                         v = float(self.xeval(t, None))
-                        # 破綻点修正: struct.pack('>f') は float32 の範囲を越えた
-                        # 「有限の」値では OverflowError を出すが、すでに無限大に
-                        # なっている値（`flt{1e309}` は float() の段で inf になる）は
-                        # そのまま通していた。dbl{} / qad{} と同じ規則に揃える。
                         if v != v or v in (float('inf'), float('-inf')):
                             raise OverflowError('non-finite')
                         x = int.from_bytes(struct.pack('>f', v), "big")
@@ -3444,15 +3220,6 @@ class ExpressionEvaluator:
                 self.state.diag(" error - missing closing ')' in not(...) expression.", set_error=True)
             x = 0 if x else 1
         elif self.state.exp_typ == 'i' and idx < len(s) and s[idx] in DIGIT:
-                # 破綻点修正: str.isdigit() は '²'（上付き2）のような Unicode の
-                # 「digit」だが「decimal」ではない文字にも True を返す。
-                # 一方 get_intstr() は ASCII の '0'-'9' しか消費しないため、
-                # そのような文字では fs='' のまま返ってきて int('') が
-                # 未捕捉の ValueError を投げ、生のトレースバックで落ちていた
-                # （caxx.c は ASCII のみを見るので同じ入力を正しく構文エラーに
-                # する）。ここを get_intstr が実際に消費する文字集合（DIGIT、
-                # ASCII '0'-'9'）と揃え、Unicode digit を「数字の先頭ではない」
-                # として後続の一般トークン処理に委ねる。
                 fs, idx = self.parser.get_intstr(s, idx)
                 x = int(fs)
         elif self.state.exp_typ == 'f' and idx < len(s) and (self.parser.isfloatstr(s, idx)):
@@ -3468,8 +3235,6 @@ class ExpressionEvaluator:
             _vnl = self._patvar_len_at(s, idx)
             ch = s[idx:idx + _vnl]
             if idx + _vnl + 2 <= len(s) and s[idx + _vnl:idx + _vnl + 2] == ':=':
-                # 代入の右辺だけが未定義かどうかを見たいので、旗を一度降ろして
-                # 評価し、結果を変数の札にしてから元の旗と OR で戻す。
                 _assign_prior = self.state.error_undefined_label
                 self.state.error_undefined_label = False
                 x, idx = self.expression(s, idx + _vnl + 2)
@@ -3479,9 +3244,6 @@ class ExpressionEvaluator:
             else:
                 x = self.var_manager.get(ch)
                 idx += _vnl
-                # 破綻点修正: 値の大きさ（_is_undef_derived）だけで判定していたため、
-                # `UNDEF-UNDEF` や `UNDEF%UNDEF` のように算術で番兵が消える式では
-                # 未定義を見逃し、0 を黙って出力していた。束縛時に付けた札も見る。
                 if (not self.state._in_match_attempt
                         and not self.state._pass1_size_mode
                         and (self.state.should_report_errors())
@@ -3498,9 +3260,6 @@ class ExpressionEvaluator:
                             (lname, lval, self.state._elf_current_word_idx))
                         _rt = self.state.reloc_constraints.get(ch)
                         if _rt is not None and not _is_undef_derived(x):
-                            # 加数は「変数が持っていた値 − ラベル値」。`bl func` なら
-                            # 0、`bl func+8` なら 8。命令語のビット欄を逆算しなくて
-                            # 済むので、欄の分割や語単位の縮尺に左右されない。
                             self.state._elf_insn_reloc_hint.setdefault(
                                 self.state._elf_current_word_idx, (_rt, int(x) - int(lval)))
         elif idx < len(s) and s[idx] in self.state.lwordchars:
@@ -3513,33 +3272,21 @@ class ExpressionEvaluator:
         return x, idx
 
     def term0_0(self, s, idx):
+        """`**`。桁が溢れないよう指数と結果のビット数に上限を置く。
+
+        浮動小数点モードでは _ieee_pow に渡して C 版と同じ nan を作る。
+        整数モードでは、負の指数・1024 を超える指数・結果が 256bit の帯を
+        超える場合をエラーにして 0 にする。連鎖した `**` で爆発させないため。
+        """
         x, idx = self.factor(s, idx)
         while idx < len(s) and StringUtils.q(s, '**', idx):
             t, idx = self.factor(s, idx + 2)
 
             if self.state.exp_typ == 'f':
-                # 浮動小数点モードでは caxx.c の pow(a,b) と同じ、実数のべき乗を
-                # そのまま計算する。以下の桁数上限・負指数拒否ガードは、任意精度
-                # Python整数が際限なく育つのを防ぐための整数モード専用の安全策で、
-                # 有限精度のdoubleしか扱わない浮動小数点モードには無関係。
-                # (このガードを素通りさせないと、x が float であるという理由だけで
-                # _base_bits が「不明な巨大さ」を意味する1024にフォールバックし、
-                # 指数の値に関係なく常にエラー・結果0になっていた。)
-                #
-                # C の pow(a,b) は範囲外・定義域外でも例外を投げず ±inf/nan を
-                # 返す（IEEE754のpowのセマンティクス）。Python の ** / math.pow は
-                # 同じ入力で OverflowError / ValueError を投げるため、そのまま
-                # 使うとエラー終了と inf/nan のビットパターンとで出力が食い違う。
-                # _ieee_pow() で C 側と同じ「例外を投げず ±inf/nan を返す」挙動に
-                # 揃える。
                 x = _ieee_pow(x, t)
                 continue
 
             _EXP_MAX = 1024
-            # axx が本物の値として保証するのは 2**256 まで（_UNDEF_SANE_CEILING）。
-            # これを超えて _UNDEF_DERIVED_THRESHOLD (2**768) に近づくと、
-            # 正当な ** の結果が「未定義ラベル由来」に誤判定されてしまうため、
-            # 上限もこの設計に合わせて 256bit に揃える。
             _EXP_RESULT_MAX_BITS = _UNDEF_SANE_CEILING.bit_length() - 1
 
             try:
@@ -3555,10 +3302,6 @@ class ExpressionEvaluator:
                 x = 0
                 break
 
-            # 指数 0/1 は結果がベースより大きくならない（0乗は常に1、1乗は
-            # ベースそのもの）ので、ベースの桁数がどうであれ「掛け合わせで
-            # 際限なく育つ」ことはない。既に成立しているベースの値をこの
-            # チェックで巻き戻さないよう、桁数ガードの対象から外す。
             if t_int == 0:
                 x = 1
                 continue
@@ -3585,6 +3328,13 @@ class ExpressionEvaluator:
         return x, idx
 
     def term0(self, s, idx):
+        """`*` `/` `//` `%`。
+
+        整数モードの `/` はゼロ方向へ切り捨てる（`-7/3 == -2`）。`%` は Python と
+        同じで結果が除数の符号に従う（`-7%3 == 2`）ので、両者のあいだに
+        `a == (a/b)*b + a%b` は成り立たない。ミニ言語とマクロ層の `%` は C と
+        同じ被除数の符号なので、層をまたいで式を写すときは負の値に注意。
+        """
         x, idx = self.term0_0(s, idx)
         while idx < len(s):
             if s[idx] == '*' and (idx + 1 >= len(s) or s[idx + 1] != '*'):
@@ -3624,6 +3374,7 @@ class ExpressionEvaluator:
         return x, idx
 
     def term1(self, s, idx):
+        """`+` `-`。"""
         x, idx = self.term0(s, idx)
         while idx < len(s):
             if s[idx] == '+':
@@ -3637,6 +3388,7 @@ class ExpressionEvaluator:
         return x, idx
 
     def term2(self, s, idx):
+        """`<<` `>>`。負のシフト量と 65536 を超えるシフト量はエラーにする。"""
         x, idx = self.term1(s, idx)
         _SHIFT_MAX = 65536
         while idx < len(s):
@@ -3679,6 +3431,7 @@ class ExpressionEvaluator:
         return x, idx
 
     def _safe_int(self, v, op_name):
+        """ビット演算の前に整数へ落とす。非有限値は警告して 0 にする。"""
         try:
             return int(v)
         except (OverflowError, ValueError):
@@ -3688,6 +3441,7 @@ class ExpressionEvaluator:
             return 0
 
     def term3(self, s, idx):
+        """`&`。`&&` は論理積なのでここでは食べない。"""
         x, idx = self.term2(s, idx)
         while idx < len(s) and s[idx] == '&' and (idx + 1 >= len(s) or s[idx + 1] != '&'):
             t, idx = self.term2(s, idx + 1)
@@ -3695,6 +3449,7 @@ class ExpressionEvaluator:
         return x, idx
 
     def term4(self, s, idx):
+        """`|`。`||` は論理和なのでここでは食べない。"""
         x, idx = self.term3(s, idx)
         while idx < len(s) and s[idx] == '|' and (idx + 1 >= len(s) or s[idx + 1] != '|'):
             t, idx = self.term3(s, idx + 1)
@@ -3702,6 +3457,7 @@ class ExpressionEvaluator:
         return x, idx
 
     def term5(self, s, idx):
+        """`^`。"""
         x, idx = self.term4(s, idx)
         while idx < len(s) and s[idx] == '^':
             t, idx = self.term4(s, idx + 1)
@@ -3709,6 +3465,11 @@ class ExpressionEvaluator:
         return x, idx
 
     def term6(self, s, idx):
+        """`'` — 符号拡張。
+
+        `'` は文字定数の引用符でもあるので、直後が数字か `(` のときだけ
+        演算子として読む。そうでなければ手を付けず上の層に残す。
+        """
         x, idx = self.term5(s, idx)
         while idx < len(s) and s[idx] == '\'':
             next_idx = idx + 1
@@ -3716,7 +3477,6 @@ class ExpressionEvaluator:
             if next_idx >= len(s) or (s[next_idx] not in DIGIT and s[next_idx] != '('):
                 break
             t, idx = self.term5(s, idx + 1)
-            # 実装は共有関数 op_sext() 側。マクロ層も同じものを呼ぶ。
             x, _warn, _go = op_sext(x, t)
             if _warn:
                 self.state.diag(f" warning - {_warn}.", set_error=False)
@@ -3725,6 +3485,7 @@ class ExpressionEvaluator:
         return x, idx
 
     def term7(self, s, idx):
+        """比較 `<=` `<` `>=` `>` `==` `!=`。結果は 1 か 0。"""
         x, idx = self.term6(s, idx)
         while idx < len(s):
             if StringUtils.q(s, '<=', idx):
@@ -3750,9 +3511,14 @@ class ExpressionEvaluator:
         return x, idx
 
     def term8(self, s, idx):
+        """空けてある段。term7 へ素通しする。
+
+        caxx.c と段の番号をそろえておくために残してある。
+        """
         return self.term7(s, idx)
 
     def term9(self, s, idx):
+        """`&&`。結果は 1 か 0。"""
         x, idx = self.term8(s, idx)
         while idx < len(s) and StringUtils.q(s, '&&', idx):
             t, idx = self.term8(s, idx + 2)
@@ -3760,17 +3526,16 @@ class ExpressionEvaluator:
         return x, idx
 
     def term10(self, s, idx):
+        """`||`。結果は 1 か 0。"""
         x, idx = self.term9(s, idx)
         while idx < len(s) and StringUtils.q(s, '||', idx):
             t, idx = self.term9(s, idx + 2)
             x = 1 if x or t else 0
         return x, idx
 
-    # 三項演算子の「取らない側」を、評価せずに字面だけで読み飛ばすための走査。
-    # 括弧・角括弧・省略可グループの入れ子は数えて、深さ0の `?` `,` `;` と、
-    # `:=`（代入）ではない `:` で止まる。
     @staticmethod
     def _skip_subexpr(s, idx):
+        """括弧の対応を数えながら、部分式 1 個を読み飛ばした位置を返す。"""
         paren = brack = ob = 0
         n = len(s)
         while idx < n and s[idx] != chr(0):
@@ -3810,6 +3575,7 @@ class ExpressionEvaluator:
 
     @classmethod
     def _skip_ternary_expr(cls, s, idx):
+        """三項演算子の、選ばれなかった側を読み飛ばす。"""
         n = len(s)
         idx = cls._skip_subexpr(s, idx)
         if idx < n and s[idx] == '?' and (idx + 1 >= n or s[idx + 1] != '='):
@@ -3822,17 +3588,11 @@ class ExpressionEvaluator:
         return idx
 
     def term11(self, s, idx):
-        """三項演算子 `cond ? a : b`。
+        """`?:` — 三項演算子。
 
-        破綻点修正: 以前は両辺を必ず評価し、取らなかった側の副作用
-        （変数束縛・未定義ラベル旗・ELF リロケーション参照）を後から巻き戻して
-        いた。しかし diag() で「表示済み」になった診断だけは巻き戻せないため、
-        `1 ? 5 : nosuchlabel` のように取らない側に未定義ラベルがあると、
-        値は正しいのに " error - Label undefined: 'nosuchlabel'" が出て
-        ビルドが失敗していた。加えて、取らない側の解析位置に依存する作りだった
-        ので、真側がラベルで終わると `:` を見失って else 節ごと消えていた。
-
-        caxx.c と同じく、取らない側は評価せず字面で読み飛ばす短絡評価に統一する。
+        選ばれなかった側は評価せずに読み飛ばす。副作用（`:=` の代入）が
+        走らないようにするためで、`:` の直後が `=` のときは代入演算子なので
+        三項の区切りとは読まない。
         """
         x, idx = self.term10(s, idx)
         n = len(s)
@@ -3854,6 +3614,7 @@ class ExpressionEvaluator:
         return x, idx
 
     def expression(self, s, idx):
+        """式を 1 個評価する。優先順位の一番上から入る。"""
         try:
             idx0 = StringUtils.skipspc(s, idx)
             x, idx0 = self.term11(s, idx0)
@@ -3863,19 +3624,13 @@ class ExpressionEvaluator:
             return 0, idx
 
     def _terminate(self, s):
+        """末尾に NUL を足して、式の終わりを確定させる。"""
         if not s or s[-1] != chr(0):
             return s + chr(0)
         return s
 
     def _patvar_len_at(self, s, idx):
-        """位置 idx から読めるパターン変数名の長さ。変数でなければ 0。
-
-        小文字で始まり小文字・数字・`_` が続くひと続きを、長さによらず
-        パターン変数の名前とする。`a` も `var_2` も同じ規則で、宣言や
-        捕捉の有無は問わない（捕捉されていない変数は 0 を返す）。
-        直後にラベル構成文字（大文字や `.`）が続くときだけ、変数ではなく
-        ラベルとして読む。caxx.c の pat_var_len_at() と同じ規則である。
-        """
+        """その位置のパターン変数名の長さ。直後がラベル文字なら変数ではない。"""
         n = PatternMatcher._var_name_at(s, idx)
         if n == 0:
             return 0
@@ -3884,13 +3639,19 @@ class ExpressionEvaluator:
         return n
 
     def expression_pat(self, s, idx):
+        """パターン行の式として評価する（すべての項が使える）。"""
         return self._expression_in(s, idx, EXP_PAT, CAPS_PAT)
 
     def expression_caps(self, s, idx, caps):
-        """能力記述子を指定して評価する。マクロ層・ミニ言語からの委譲用。"""
+        """使える項を明示して評価する（ミニ言語などが自分の制限で呼ぶ）。"""
         return self._expression_in(s, idx, EXP_PAT, caps)
 
     def _expression_in(self, s, idx, mode, caps):
+        """文脈を差し替えて評価し、必ず元に戻す。
+
+        評価中に例外が出ても finally で戻すので、文脈が漏れて次の行の
+        解釈を変えることはない。
+        """
         prev = self.state.expmode
         prev_caps = self.state.expcaps
         self.state.expmode = mode
@@ -3902,9 +3663,15 @@ class ExpressionEvaluator:
             self.state.expcaps = prev_caps
 
     def expression_asm(self, s, idx):
+        """アセンブリ行の式として評価する（パターン変数と VLIW 計数は使えない）。"""
         return self._expression_in(s, idx, EXP_ASM, CAPS_ASM)
 
     def expression_esc(self, s, idx, stopchar):
+        """入れ子の外側にある stopchar までを 1 つの式として評価する。
+
+        `(` `[` `[[` の対応を数えるので、括弧の内側にある stopchar では
+        切らない。パターンの欄が `,` などで区切られているところで使う。
+        """
         result = list(s[:idx])
 
         OPEN_TO_CLOSE = {'(': ')', '[': ']', OB: CB}
@@ -3920,10 +3687,6 @@ class ExpressionEvaluator:
                 stack.append(ch)
                 result.append(ch)
             elif ch in CLOSE_CHARS:
-                # 種類が不一致でも（例: "(...]"）深さは1段閉じたものとして扱う。
-                # 型を厳密に照合してポップを拒否すると、不正な入力に対して
-                # stack が空に戻らなくなり、以降 stopchar が永久に見つからなく
-                # なってしまう（未対応の閉じ括弧のまま行末まで飲み込まれる）。
                 if stack:
                     stack.pop()
                 result.append(ch)
@@ -3934,6 +3697,7 @@ class ExpressionEvaluator:
         return self.expression(self._terminate(replaced), idx)
 
     def expression_esc_float(self, s, idx, stopchar):
+        """expression_esc の浮動小数点版。評価後に必ずモードを戻す。"""
         prev_typ  = self.state.exp_typ
         prev_mode = self.state.expmode
         prev_caps = self.state.expcaps
@@ -3948,11 +3712,11 @@ class ExpressionEvaluator:
 
 
 class BinaryWriter:
-    """生成したワードを出力バッファへ書き込む。
-    
-    アドレスをキーにした疎な辞書で保持するので、`.ORG` でアドレスが飛んでも
-    その間を無駄に埋めずに済む。1ワードのビット幅（state.bts）は 8 とは限らず、
-    書き込み時にその幅でマスクし、エンディアンに従ってバイトへ展開する。
+    """出力ワードを溜めて、`-b` の生バイナリを書く。
+
+    溜め方が連続した配列ではなく「位置 → ワード」の辞書なのは、`.org` で
+    いくらでも飛べるため。間が空いたところは書き出すときに `.padding` で
+    埋める。1 ワードのビット数は `.bits` 次第で 8 とは限らない。
     """
 
     def __init__(self, state):
@@ -3960,6 +3724,7 @@ class BinaryWriter:
         self._buffer = {}
 
     def _store(self, position, word_val):
+        """1 ワードを溜める。ワード幅で切り、負の位置は捨てる。"""
         if self.state.bts <= 0:
             return
         if position < 0:
@@ -3968,13 +3733,19 @@ class BinaryWriter:
         self._buffer[position] = word_val & mask
 
     def flush(self):
+        """溜めたワードを `-b` のファイルへ書き出す。
+
+        最大位置までを 1 枚の配列にするので、`.org` の飛び先が極端だと
+        巨大なファイルになる。1GB を超えたら、書く代わりに `.org` を
+        疑うよう促してやめる。隙間は `.padding` の値で埋め、各ワードは
+        `.bits` から決まるバイト数で、`.bits::big/little` の順に並べる。
+
+        `-o` と併用されているときは、リンカのために 0 のまま残した命令欄が
+        あればそれを警告する。その生バイナリはリンク後にしか正しくない。
+        """
         if not self.state.outfile:
             return
 
-        # 破綻点修正: この検査は `not self._buffer` の後ろに置かれていたが、
-        # bts<=0 のときは _store() が何も溜めないので _buffer は必ず空であり、
-        # 警告に到達できないデッドコードだった（結果として何も言わずに
-        # 出力ファイルが作られないだけになる）。バッファ判定より前に出す。
         if self.state.bts <= 0:
             self.state.diag(f" error - flush: bts={self.state.bts} is invalid (<=0); "
                  f"no output written to '{self.state.outfile}'.", set_error=True)
@@ -4031,9 +3802,6 @@ class BinaryWriter:
                         data[base_idx + i] = temp_val & 0xff
                         temp_val >>= 8
 
-        # 破綻点修正: 書き込みの失敗（ディスク満杯・クォータ超過など）を
-        # 捕まえていなかったため、素の OSError トレースバックが出ていた。
-        # caxx.c と同じ文面の診断にして、通常のエラー経路で終わらせる。
         try:
             with open(self.state.outfile, 'wb') as f:
                 f.write(data)
@@ -4043,10 +3811,6 @@ class BinaryWriter:
             return
         print(f"wrote raw binary {self.state.outfile} ({len(data)} bytes)", file=sys.stderr)
 
-        # 命令フィールド型のリロケーションを出した箇所は、RELA の作法どおり命令語の
-        # ビット欄を 0 にしてある（リンカが埋める）。同じ実行で -b も書いていると、
-        # その 0 がそのまま生バイナリに残り、リンカを通さない側だけが壊れる。
-        # 黙って壊れた方が困るので、どの箇所かを添えて知らせる。
         if self.state.elf_objfile:
             _zeroed = [r for r in self.state.relocations
                        if insn_reloc_field_mask(r[3], self.state.elf_machine, self.state) is not None]
@@ -4061,6 +3825,7 @@ class BinaryWriter:
                     set_error=False, force=True)
 
     def fwrite(self, position, x, prt):
+        """1 ワードを溜める。prt が真ならリスティング用に 16 進でも出す。"""
         if self.state.bts <= 0:
             return 0
         mask = (1 << self.state.bts) - 1
@@ -4075,6 +3840,7 @@ class BinaryWriter:
         return 1
 
     def outbin2(self, a, x):
+        """1 ワードを溜める（リスティングには出さない）。"""
         if self.state.should_report_errors():
             try:
                 self.fwrite(a, int(x), 0)
@@ -4082,6 +3848,7 @@ class BinaryWriter:
                 self.state.diag(f" error - non-finite value {x!r} cannot be written as binary word.", set_error=True)
 
     def outbin(self, a, x):
+        """1 ワードを溜め、`-v` のパス2か対話モードならリスティングにも出す。"""
         if self.state.should_report_errors():
             _prt = 1 if ((self.state.pas == 2 and self.state.verbose) or self.state.pas == 0) else 0
             try:
@@ -4090,6 +3857,7 @@ class BinaryWriter:
                 self.state.diag(f" error - non-finite value {x!r} cannot be written as binary word.", set_error=True)
 
     def align_(self, addr):
+        """アドレスを現在の `.align` の倍数まで繰り上げる。"""
         if self.state.align <= 0:
             return addr
         a = addr % self.state.align
@@ -4100,13 +3868,11 @@ class BinaryWriter:
 
 class DirectiveProcessor:
     """パターンファイル側のディレクティブを処理する。
-    
-    `.setsym`（シンボル定義）、`.bits`（語長とエンディアン）、`.vliw` / `EPIC`
-    （VLIW パケットの形）、`.padding`、`.check` / `.clrcheck`（オペランド制約）など、
-    「命令表そのものではなく、命令表の読み方を決める」指示を扱う。
-    
-    これらはパターン走査の途中でも出現順に副作用を及ぼすため、採用パターンが
-    確定したときには「そのパターンに到達した時点の状態」へ巻き戻す必要がある。
+
+    各ハンドラは「自分の担当でなければ False、処理したら True」を返す決まりで、
+    呼び出し側は順に試す。ディレクティブは書かれた位置から効くので
+    （`.check` も `.setsym` も後のものが前を上書きする）、ここでの処理は
+    パターン行の照合とは違って順序に依存する。
     """
 
     def __init__(self, state, expr_eval, binary_writer, symbol_manager=None, parser=None):
@@ -4117,11 +3883,13 @@ class DirectiveProcessor:
         self.parser = parser
 
     def add_avoiding_dup(self, l, e):
+        """リストに無ければ足す。"""
         if e not in l:
             l.append(e)
         return l
 
     def clear_symbol(self, i):
+        """`.clearsym` — 名前を 1 つ、または引数なしで全部のシンボルを消す。"""
         if len(i) == 0 or i[0] != '.clearsym':
             return False
 
@@ -4139,21 +3907,27 @@ class DirectiveProcessor:
 
         return True
 
-    # 定数と分かった `.setsym` の値欄 → 評価結果。_CONST_SETSYM_RE を参照。
     _const_setsym_cache = {}
-    _upper_key_cache = {}    # `.setsym` の名前欄 → 大文字にしたもの
-    _check_cache = {}        # (変数, 名前並び) → (arrgen, 展開した一覧)
-    _elftype_cache = {}      # `.elftype` の値欄 → 型番号（不正なら None）
-    _elfdecl_cache = {}      # ELF 宣言の数値欄 (式, 下限, 上限) → 値（不正なら None）
+    _upper_key_cache = {}
+    _check_cache = {}
+    _elftype_cache = {}
+    _elfdecl_cache = {}
 
     def set_symbol(self, i):
+        """`.setsym` — あらゆる種類のシンボルを定義する。
+
+        どの種類になるかは値欄の見た目で決まる。`"..."` が文字列シンボル、
+        `[...]` が配列シンボル、名前をカンマで並べたものが集合、集合式
+        (`a&b` など) が計算された集合、裸の名前がコピーかその名前を保持する
+        文字列シンボル、どれでもなければ数値式。特殊形の判定が数値解釈より
+        先に来るが、集合になりえない欄は必ず数値解釈へ譲るので、以前
+        アセンブルできていたものの意味は変わらない。
+        """
         if len(i) == 0 or i[0] != '.setsym':
             return False
 
         if i[1]:
             value_field = i[2]
-            # 前置きの外にある `.setsym` はソース1行ごとに通る。ただの数なら
-            # 名前の大文字化以外に何も要らないので、ここで済ませる。
             if _PLAIN_NUM_RE.match(value_field):
                 _uc = DirectiveProcessor._upper_key_cache
                 key = _uc.get(i[1])
@@ -4179,7 +3953,6 @@ class DirectiveProcessor:
             self.state.diag(" error - .setsym directive requires at least a symbol name", set_error=True)
             return False
 
-        # 値が `"..."` なら文字列シンボル、`[...]` なら配列シンボル。
         _vf = value_field.lstrip(' \t')
         if _vf.startswith('"'):
             self.state.strsymbols[key] = ObjectGenerator._txt_template_inner(_vf)
@@ -4188,10 +3961,8 @@ class DirectiveProcessor:
             self.state.arrsymbols[key] = arr_items_from_text(self.expr_eval, _vf)
             self.state.arrgen += 1
             return True
-        # `.setsym::y::x` — x が文字列／配列シンボルなら、その写しを作る。
         if symbol_copy_from_name(self.state, key, _vf):
             return True
-        # `名前,名前,…` は名前の集合、`a&b` などは集合どうしの演算。
         if symbol_set_from_text(self.state, key, value_field):
             return True
         if value_field:
@@ -4209,24 +3980,10 @@ class DirectiveProcessor:
         return True
 
     def bits(self, i):
-        """`.bits[::<big|little>][::<幅>]` — ワード長とエンディアン。
-
-        破綻点修正: 幅の検証が一切無かった。パターン表の行は常に6要素なので
-        `len(i) >= 3` が必ず真になり、`.bits::big`（幅の書き忘れ。この形では
-        'big' は i[2] に入る）でも i[2] を式として評価してしまい、未定義ラベル
-        'big' の番兵 (1<<1024)-1 がそのままワード長になっていた。以降の出力は
-        1ワードごとに OverflowError で潰れ、しかもその診断は had_error を
-        立てないため「エラーを表示しながら終了コード0・出力ファイル無し」という
-        無言の失敗になっていた。欄の解釈を整理し、1..64 の整数だけを受け付ける。
-        """
+        """`.bits` — 出力ワードのビット数とバイト順を決める。"""
         if len(i) == 0 or i[0] != '.bits':
             return False
 
-        # 破綻点修正: 欄の意味を位置(第1欄=エンディアン,第2欄=幅)で固定していたため
-        # `.bits::<幅>::<big|little>`（順序が逆）を書くと、幅の値が捨てられた上で
-        # 診断なしにエンディアンだけが適用されていた。位置ではなく内容
-        # ('big'/'little' かどうか)でフィールドの役割を判定し、順序に依らず両方
-        # 正しく解釈する。
         fields = []
         if len(i) >= 2 and i[1] != '':
             fields.append(i[1])
@@ -4267,6 +4024,7 @@ class DirectiveProcessor:
         return True
 
     def paddingp(self, i):
+        """`.padding` — 隙間を埋める値。"""
         if len(i) == 0 or i[0] != '.padding':
             return False
 
@@ -4283,6 +4041,7 @@ class DirectiveProcessor:
         return True
 
     def symbolc(self, i):
+        """`.symbolc` — シンボルに使える文字を増やす。"""
         if len(i) == 0 or i[0] != '.symbolc':
             return False
 
@@ -4291,6 +4050,7 @@ class DirectiveProcessor:
         return True
 
     def vliwp(self, i):
+        """`.vliw` — バンドル幅・命令幅・テンプレート幅・NOP を宣言する。"""
         if len(i) == 0 or i[0] != ".vliw":
             return False
 
@@ -4311,10 +4071,6 @@ class DirectiveProcessor:
             self.state.diag(" error - .vliw: non-finite parameter value.", set_error=True)
             return True
 
-        # 破綻点修正: v1〜v3 だけ int() を通していて v4（NOP 値）は生のまま
-        # `v4 & 0xff` / `v4 >>= 8` に渡していた。float なら TypeError、負値なら
-        # Python の算術シフトが 0xff を無限に生み続けて caxx.c（uint64 で
-        # いずれ 0 になる）と食い違っていた。64bit の符号なし値に揃える。
         try:
             v4 = int(v4) & 0xFFFFFFFFFFFFFFFF
         except (OverflowError, ValueError):
@@ -4337,6 +4093,7 @@ class DirectiveProcessor:
         return True
 
     def epic(self, i):
+        """`EPIC::` — インデックスコードの組み合わせごとにテンプレートを宣言する。"""
         if len(i) == 0 or StringUtils.upper(i[0]) != "EPIC":
             return False
 
@@ -4363,18 +4120,12 @@ class DirectiveProcessor:
         return True
 
     def _cond_tests_relocated_var(self, cond_src):
-        """この条件式は、リンカが値を決める変数を見ているか。
+        """そのエラー条件が、リンカが埋める変数を見ているか。
 
-        `-o` で命令フィールド型のリロケーションを出す箇所では、命令語のビット欄は
-        0 で出してリンカが埋める。つまり `t` の値はアセンブル時には確定しておらず、
-        axx が持っているのは自分の仮レイアウト上の値にすぎない。その値に対する
-        整列・範囲チェックは判定できないものを判定していることになり、正しいソース
-        まで弾く。範囲や整列が本当に外れていればリンカが報告する（例:
-        `improper alignment for relocation R_AARCH64_LDST64_ABS_LO12_NC`）ので、
-        ここでは黙って通す。
-
-        対象は「その変数を読んでいる条件」だけ。同じ行の他のオペランドを見る条件
-        （PRFM の `p<0` 等）はそのまま働く。
+        `-o` では命令欄に入る値をまだ 0 にしてあるので、その変数に対する
+        範囲検査は今の時点では意味を持たない。ここで真になった条件は
+        報告しない。そうしないと、リンク後には正しいコードが
+        「範囲外」で落ちてしまう。名前は語として一致したときだけ数える。
         """
         if not self.state.elf_objfile or not self.state.reloc_constraints:
             return False
@@ -4383,8 +4134,6 @@ class DirectiveProcessor:
                 continue
             for m in re.finditer(re.escape(var), cond_src):
                 b, e = m.start(), m.end()
-                # 変数名は単独の語として現れたときだけ。`t` が `tmp` や `xt` の
-                # 一部であるものを拾わない。
                 if b > 0 and (cond_src[b - 1].isalnum() or cond_src[b - 1] == '_'):
                     continue
                 if e < len(cond_src) and (cond_src[e].isalnum() or cond_src[e] == '_'):
@@ -4393,6 +4142,12 @@ class DirectiveProcessor:
         return False
 
     def error(self, s):
+        """error_patterns 欄を評価する。返り値は (発生したか, エラーコード)。
+
+        `条件;コード` をカンマで並べたものを順に見る。評価は浮動小数点モードで
+        行う（ビット演算とシフトは内部で補正するので、書いたとおりに読める）。
+        リンカが埋める変数を見ている条件は _cond_tests_relocated_var で外す。
+        """
         ss = s.replace(' ', '')
         if ss == "":
             return False, 0
@@ -4442,10 +4197,7 @@ class DirectiveProcessor:
         return triggered, error_code
 
     def _dir_var(self, field):
-        """ディレクティブの変数欄を読む。1文字でも `var_2` のように長くてもよい。
-
-        名前として読めなければ None。caxx.c の dir_var_slot() にあたる。
-        """
+        """ディレクティブの変数名欄を正規化する。変数名でなければ None。"""
         v = (field or '').strip().lower()
         if not v or not v.isascii() or not ('a' <= v[0] <= 'z'):
             return None
@@ -4456,14 +4208,10 @@ class DirectiveProcessor:
         return v
 
     def elem_list_expand(self, text):
-        """要素の列挙欄（`.check` `.enum` `.map` の「名前の並び」）を項目に切る。
+        """要素リストを展開する。配列シンボルの名前はその中身に開く。
 
-        項目が配列シンボルの名前なら、その内容をその場に展開する。つまり
-            .setsym::regs::["R0","R1","R2"]
-            .check::x::regs
-        は `.check::x::R0,R1,R2` と同じ意味になる。配列と素の名前は混ぜて
-        書ける。名前は大文字化して積み、`""` `''`（省略可の印）と空欄は
-        空文字の項目にする。caxx.c の elem_list_expand() と同じ規則である。
+        `""` は省略可能の印（CHECK_OMIT）として空文字で残す。これで
+        レジスタ名の並びを一度書いて `.check` / `.enum` / `.map` で使い回せる。
         """
         out = []
         for tok in (text or '').split(','):
@@ -4481,6 +4229,7 @@ class DirectiveProcessor:
         return out
 
     def check_processing(self, i):
+        """`.check` — その変数が捕らえてよいシンボルを制限する。"""
         if len(i) == 0 or i[0] != '.check':
             return False
         if i[1].strip():
@@ -4494,9 +4243,6 @@ class DirectiveProcessor:
         if var is None:
             self.state.diag(f" error - .check: variable should be a lower case name ('{var_field}').", set_error=True)
             return True
-        # 同じ行を毎行組み立て直さない。もとになる配列シンボルの表が変わって
-        # いなければ、前に作った一覧をそのまま渡す（一覧は作ったあと書き換え
-        # ないので使い回せる）。caxx.c の dir_check() の控えと同じ。
         _ck = (var, syms_field)
         _ce = DirectiveProcessor._check_cache.get(_ck)
         if _ce is not None and _ce[0] == self.state.arrgen:
@@ -4505,8 +4251,6 @@ class DirectiveProcessor:
         syms = []
         for nm in self.elem_list_expand(syms_field):
             if nm == '':
-                # 空文字リテラルは「このオペランドは省略してよい」印。
-                # 省略時、変数には VAR_UNDEF(0) が入る。
                 if CHECK_OMIT not in syms:
                     syms.append(CHECK_OMIT)
                 continue
@@ -4518,27 +4262,7 @@ class DirectiveProcessor:
         return True
 
     def elftype_processing(self, i):
-        """`.elftype::<名前>::<値>[::<幅>[::<PC相対>]]` — 型名を自分で決める。
-
-        決めた名前は、型名を書けるところ全部で使える。
-          パターンファイル: `.reloc::<変数>::<名前>`
-          ソース          : `.extern 名前::<名前>` `.global 名前::<名前>`
-                            `.EQU x::<名前>` `.RELOCTYPE`
-          取り込みファイル: `ラベル::<名前>`
-        値は型番号（ELF の r_info の型欄に入る数）で、1 以上の整数の定数式である
-        （0 は「型を指定しない」の意味で内部的に使っているので取らない）。
-        同じ名前を2度書けば後の宣言が勝つ。`-m` で選んだマシンの名前表に同じ
-        綴りがあっても、この宣言のほうを先に引く（自分の宣言で上書きできる）。
-
-        名前の読み方は `.reloc` の型名と同じ（空白は落とし、大小は区別しない）。
-        値は行によって変わらないので、最初の1回だけ評価して控える。
-
-        4番目の欄は、その型が書き換える欄のバイト幅（1〜8）である。組み込みの
-        名前表に無い型は幅も分からないので、加数の計算や `.RELOCTYPE` の幅照合
-        のためにここで教える。5番目の欄は、0 以外なら「PC 相対の型」という印で、
-        加数に命令アドレスを足す側に回る。どちらも省いてよい。
-        caxx.c の elftype_apply() と同じ規則である。
-        """
+        """`.elftype` — リロケーション型の名前と番号を自分で決める。"""
         if len(i) == 0 or i[0] != '.elftype':
             return False
         name_field = i[1] if i[1] else i[2]
@@ -4599,27 +4323,21 @@ class DirectiveProcessor:
             _e.decl_gen += 1
         return True
 
-    # ---- ELF 記述のディレクティブ（マニュアル 3.7.7 節）-------------------
-    #
-    # `-m` で選んだ組み込みのマシン表に重ねる差分を宣言する。組み込みの表に
-    # 無い e_machine でも、これだけそろえれば ELF を出せる。宣言はどれも
-    # 行によって変わらないので、`.elftype` と同じく組み立て前に一度登録して
-    # おき（register_elfdecls）、実効表は elf_machine_table() が組み立てる。
 
     @staticmethod
     def _elf_decl_fields(i):
-        """ELF 宣言の第1欄・第2欄を取り出す。
-
-        パターン行は `::` が1つだけだと第1欄が空になり値が第2欄に入る
-        （`.elfclass::64` は ['', '64']）。`.elftype` の名前欄と同じ読み方で、
-        書いた欄がそのまま前から詰まっているように見せる。
-        """
+        """ELF 宣言の欄を (値, 名前) に整える。欄の詰め方の違いを吸収する。"""
         f1 = i[1] if len(i) > 1 and i[1] and i[1].strip() else ''
         f2 = i[2] if len(i) > 2 and i[2] else ''
         return (f1, f2) if f1 else (f2, '')
 
     def _elf_decl_num(self, dname, field, lo, hi):
-        """ELF 宣言の数値欄を評価する。読めないか範囲外なら診断して None。"""
+        """ELF 宣言の数値欄を lo..hi の整数として読む。範囲外なら None。
+
+        同じ綴りが何度も現れるので結果を覚える。未定義ラベルを含む式は
+        エラーにし、覚えた印 (error_undefined_label) は呼び出しの前後で
+        必ず落として、関係のない行へ漏らさない。
+        """
         text = field.strip() if field else ''
         if not text:
             self.state.diag(f" error - {dname}: a number is required.", set_error=True)
@@ -4649,19 +4367,17 @@ class DirectiveProcessor:
         return v
 
     def _elf_decl_set(self, attr, value):
-        """宣言を据える。中身が変わったときだけ実効表の版を進める。"""
+        """ELF 宣言を書き込む。実際に変わったときだけ世代番号を進める。
+
+        elf_machine_table() のキャッシュはこの世代番号で捨てられる。
+        """
         e = self.state.elf
         if getattr(e, attr) != value:
             setattr(e, attr, value)
             e.decl_gen += 1
 
     def elfmachine_processing(self, i):
-        """`.elfmachine::<e_machine番号>[::<名前>]` — 対象のマシンを宣言する。
-
-        `-m` を書かなかったときは、この宣言が `-m` の代わりになる。`-m` を
-        書いたときはそちらが勝ち（パターンファイルを別のマシン番号で使い回せる）、
-        名前だけは番号が一致したときに診断で使われる。
-        """
+        """`.elfmachine` — e_machine の既定値（`-m` より弱い）。"""
         if len(i) == 0 or i[0] != '.elfmachine':
             return False
         _num, _nm = self._elf_decl_fields(i)
@@ -4671,7 +4387,6 @@ class DirectiveProcessor:
         nm = _nm.strip()
         self._elf_decl_set('decl_machine', v)
         self._elf_decl_set('decl_name', nm)
-        # `-m` を書いていなければ、宣言したマシンがそのまま対象になる。
         e = self.state.elf
         if not e.machine_from_cli and e.machine != v:
             e.machine = v
@@ -4679,7 +4394,7 @@ class DirectiveProcessor:
         return True
 
     def elfclass_processing(self, i):
-        """`.elfclass::<32|64>` — 既定の ELF クラス。`-f` を書けばそちらが勝つ。"""
+        """`.elfclass` — ELF32 / ELF64 の既定値（`-f` より弱い）。"""
         if len(i) == 0 or i[0] != '.elfclass':
             return False
         text = self._elf_decl_fields(i)[0].strip()
@@ -4693,7 +4408,7 @@ class DirectiveProcessor:
         return True
 
     def elfrela_processing(self, i):
-        """`.elfrela::<1|0>` — 1(rela)=加数を専用欄に持つ / 0(rel)=命令語に埋める。"""
+        """`.elfrela` — .rela（加数を欄に持つ）か .rel かを決める。"""
         if len(i) == 0 or i[0] != '.elfrela':
             return False
         text = self._elf_decl_fields(i)[0].strip().lower()
@@ -4707,14 +4422,9 @@ class DirectiveProcessor:
         return True
 
     def elfwidth_processing(self, i):
-        """`.elfwidth::<バイト幅>::<型>` — その幅の参照に使う既定のリロケーション型。
+        """`.elfwidth` — 欄の幅から型を推測するときの対応を宣言する。
 
-        ソースが `::型名` を書かなかった参照は、欄のバイト幅からこの表を引く。
-        型は `.elftype` で決めた名前でもマシンの名前表の名前でも型番号でもよい。
-
-        幅は 1〜8 のどれでもよい。2 の冪だけに絞っていたが、1 ワードが 8 ビット
-        でない機種（`.bits`）では参照の幅が 1 ワードのバイト数の倍数になるので、
-        12 ビット機の 3 ワード参照（6 バイト）のような幅が普通に現れる。
+        幅は 2 のべき乗でなくてもよい（`.elfwidth::3` など）。
         """
         if len(i) == 0 or i[0] != '.elfwidth':
             return False
@@ -4734,7 +4444,7 @@ class DirectiveProcessor:
         return True
 
     def elfextern_processing(self, i):
-        """`.elfextern::<型>` — `.extern` が型名を書かなかったときの既定型。"""
+        """`.elfextern` — 外部シンボル参照に使う既定の型。"""
         if len(i) == 0 or i[0] != '.elfextern':
             return False
         t = self._elf_decl_fields(i)[0].strip()
@@ -4746,7 +4456,7 @@ class DirectiveProcessor:
         return True
 
     def elfdwarf_processing(self, i):
-        """`.elfdwarf::<型>` — `-g` の DWARF が書く絶対アドレス参照の型。"""
+        """`.elfdwarf` — DWARF セクション内の絶対参照に使う型。"""
         if len(i) == 0 or i[0] != '.elfdwarf':
             return False
         t = self._elf_decl_fields(i)[0].strip()
@@ -4757,23 +4467,17 @@ class DirectiveProcessor:
         self._elf_decl_set('decl_dwarf', t)
         return True
 
-    # `.elfheader` で書ける欄 → (下限, 上限)。値はそのまま ELF ヘッダに入る。
     _ELF_HDR_FIELDS = {
-        'type':       (0, 0xFFFF),          # e_type（既定 1 = ET_REL）
-        'flags':      (0, 0xFFFFFFFF),      # e_flags（ABI 種別など機種固有）
-        'version':    (0, 0xFFFFFFFF),      # e_version（既定 1 = EV_CURRENT）
-        'entry':      (0, 0x7FFFFFFFFFFFFFFF),  # e_entry（再配置可能形式では 0）
-        'osabi':      (0, 0xFF),            # e_ident[EI_OSABI]（--osabi と同じ欄）
-        'abiversion': (0, 0xFF),            # e_ident[EI_ABIVERSION]
+        'type':       (0, 0xFFFF),
+        'flags':      (0, 0xFFFFFFFF),
+        'version':    (0, 0xFFFFFFFF),
+        'entry':      (0, 0x7FFFFFFFFFFFFFFF),
+        'osabi':      (0, 0xFF),
+        'abiversion': (0, 0xFF),
     }
 
     def elfheader_processing(self, i):
-        """`.elfheader::<欄名>::<値>` — ELF ヘッダの欄を直に決める。
-
-        欄名は type / flags / version / entry / osabi / abiversion。機種固有の
-        `e_flags`（ARM EABI 版数、RISC-V の ABI 印など）を出すためのもので、
-        書かなかった欄は今までどおりの既定値で出る。
-        """
+        """`.elfheader` — ELF ヘッダの欄（e_flags など）を直接書く。"""
         if len(i) == 0 or i[0] != '.elfheader':
             return False
         _ff, _vf = self._elf_decl_fields(i)
@@ -4793,18 +4497,10 @@ class DirectiveProcessor:
         return True
 
     def elffield_processing(self, i):
-        """`.elffield::<型>::<マスク>[::<オフセット>]` — 命令フィールド型のリロケーション。
+        """`.elffield` — 命令語の中のどのビットに値が入るかを宣言する。
 
-        `.reloc` でこの型を宣言した変数がラベルを運ぶと、加数は「変数の値 −
-        ラベルの値」になり、欄は 0 で出る（RELA、GNU as と同じ形）。マスクは型の幅
-        ぶんのバイト列を対象のバイト順で読んだ整数の中で、リンカが書き込むビット。
-        オフセットはその欄が命令の先頭（その行が出す最初のワード）から何バイト目
-        かで、r_offset もそこを指す。caxx.c の dir_elffield() と同じ規則である。
-
-        マスクは 64 ビットのどのビットも使える（上限は 0xFFFFFFFFFFFFFFFF）。
-        2 つの命令語にまたがる 8 バイトの欄では最上位ビットまで届くことがある
-        — RISC-V の `R_RISCV_CALL_PLT` は `auipc`+`jalr` の対に当たり、
-        リトルエンディアンで読むと `jalr` の imm12 がビット 52〜63 に来る。
+        AArch64 だけは組み込みの表を持っているが、ほかのマシンで
+        命令欄リロケーションを使うにはこの宣言が要る。
         """
         if len(i) == 0 or i[0] != '.elffield':
             return False
@@ -4829,22 +4525,10 @@ class DirectiveProcessor:
         return True
 
     def elfsection_processing(self, i):
-        """`.elfsection::<名前>::<sh_flags>[::<sh_type>[::<整列>[::<要素長>]]]` — セクションヘッダの属性。
+        """`.elfsection` — 名前から推測できないセクションの属性を宣言する。
 
-        書かなかったセクションは従来どおり名前から決まる（`.text` は
-        SHF_ALLOC|SHF_EXECINSTR、`.data` と `.bss` は SHF_ALLOC|SHF_WRITE、
-        `.rodata` とそれ以外は SHF_ALLOC、型は `.bss` だけ SHT_NOBITS で他は
-        SHT_PROGBITS）。名前で決まる規則を持たない、その機種固有のセクションを
-        出すための宣言である。
-
-        整列は sh_addralign にそのまま入る。0 か 2 の冪でなければならない
-        （ELF の要求）。書かなければ _elf_default_align() が決める。
-
-        第 5 欄は sh_entsize で、そのセクションが固定長の要素を並べたもので
-        あるときの1要素のバイト数である。`SHF_MERGE` を立てた文字列表
-        （`.rodata.str1.1` は要素長 1）のように、リンカが要素単位で扱う
-        セクションはこれが 0 でないことを要求する。書かなければ 0 になる。
-        caxx.c の dir_elfsection() と同じ規則である。
+        sh_flags / sh_type / 整列 / 要素サイズ。ベクタ表、`.bss` ではない
+        未初期化領域、note セクションなどのため。
         """
         if len(i) == 0 or i[0] != '.elfsection':
             return False
@@ -4884,15 +4568,7 @@ class DirectiveProcessor:
         return True
 
     def reloc_processing(self, i):
-        """`.reloc::<変数>::<型名>`
-
-        その変数が捕らえたラベル参照を、指定の ELF リロケーション型で書き出す。
-        `.check` と同じく位置依存で、後の `.reloc` が前のものを置き換える。
-
-        型名は `-m` で選んだマシンの名前表（`::pc32` などに使うものと同じ）から
-        引く。AArch64 の `call26` のような命令フィールド型は、値が命令語のビット欄
-        に詰まっていて出力バイト列から加数を逆算できないため、この宣言が要る。
-        """
+        """`.reloc` — その変数が捕らえたラベル参照に使う型を宣言する。"""
         if len(i) == 0 or i[0] != '.reloc':
             return False
         if i[1].strip():
@@ -4908,17 +4584,12 @@ class DirectiveProcessor:
         if not tname:
             self.state.diag(" error - .reloc: relocation type is not specified.", set_error=True)
             return True
-        # リロケーションは `-o` の ELF 出力にしか現れない。`-b` などでは宣言は
-        # 無意味なので、型名を照合せずに受け流す。パターンファイルは複数の `-m`
-        # で使い回せるべきで、対象外のときに落ちてはいけない。
         if not self.state.elf_objfile:
             return True
         mach = elf_machine_table(self.state)
         rtype = _reloc_named(self.state, mach, tname)
         if rtype is None:
             _mname = mach['name']
-            # パターン行は1ソース行ごとに読み直されるので、同じ名前で何度も
-            # 出さないよう一度だけ報告する。
             _key = (tname.lower(), self.state.elf_machine)
             if _key not in self.state._reloc_badname_seen:
                 self.state._reloc_badname_seen.add(_key)
@@ -4930,6 +4601,7 @@ class DirectiveProcessor:
         return True
 
     def clrreloc_processing(self, i):
+        """`.clrreloc` — `.reloc` の宣言を外す（引数なしで全部）。"""
         if len(i) == 0 or i[0] != '.clrreloc':
             return False
         var_field = i[2].strip() if len(i) >= 3 and i[2] else ''
@@ -4946,6 +4618,7 @@ class DirectiveProcessor:
         return True
 
     def clrcheck_processing(self, i):
+        """`.clrcheck` — `.check` の制限を外す（引数なしで全部）。"""
         if len(i) == 0 or i[0] != '.clrcheck':
             return False
         var_field = i[2].strip() if len(i) >= 3 and i[2] else ''
@@ -4960,38 +4633,13 @@ class DirectiveProcessor:
         return True
 
     def map_apply(self, i, into=None, set_check=True):
-        """`.map::<変数>::<名前の並び>::<式>`
-        `.map::<変数>::<名前の並び>::<値,値,…>`
+        """`.map` の本体。名前の並びに値を与え、同時に `.check` も設定する。
 
-        並びの各名前に値を与える `.setsym` と、その変数の `.check` をまとめて
-        書くための省略形。式の中の変数は「その名前が並びの何番目か」
-        (0 から数える) を指す。
-
-            .map::x::R0,R1,R2::1<<x
-        は
-            .setsym::R0::1<<(0)
-            .setsym::R1::1<<(1)
-            .setsym::R2::1<<(2)
-            .check::x::R0,R1,R2
-        と等価である。式を省くと変数そのもの、すなわち 0 からの連番になる。
-
-        値欄を最上位のカンマで区切って書くと、並びと1対1で対応する値の
-        リストになる。
-
-            .map::x::R0,R1,R2,R3::9,7,14,41
-        は
-            .setsym::R0::9
-            .setsym::R1::7
-            .setsym::R2::14
-            .setsym::R3::41
-            .check::x::R0,R1,R2,R3
-        と等価である。個数が合わないときはエラーにする。各項目は式なので、
-        変数（＝並びの番号）を書いてもよい。
-
-        並びには配列シンボルの名前を書ける（elem_list_expand() が展開する）。
-
-        into が与えられればシンボルはそこへ、なければ state.symbols へ入れる。
-        caxx.c の map_apply() と同じ規則である。
+        値欄は 2 通りに読める。1 つの式なら、その中の変数は「リスト中の
+        その名前の位置」（0 起点）に置き換わる。カンマで区切った複数項目なら
+        名前と 1 対 1 で対応し、長さが違えば何も定義せずにエラーにする。
+        `""` の位置は値も名前も消費せずに番号だけ進め、`.check` では
+        省略可能の印として積む。
         """
         var_str = i[1].strip() if len(i) >= 2 else ''
         syms_str = i[2] if len(i) >= 3 else ''
@@ -5002,15 +4650,12 @@ class DirectiveProcessor:
         target = self.state.symbols if into is None else into
 
         elems = self.elem_list_expand(syms_str)
-        # 値欄が最上位のカンマで区切られていれば、並びと1対1の値のリスト。
-        # 1項目しか無ければ従来どおり「変数を含む式」1本として扱う。
         vals = split_top_commas(expr_str)
         if len(vals) > 1 and len(vals) != len(elems):
             self.state.diag(f" error - .map: the value list has {len(vals)} items "
                             f"but the name list has {len(elems)}.", set_error=True)
             return
         for n, nm in enumerate(elems):
-            # 空の要素（`""` の省略可印など）は番号だけ消費して何も定義しない。
             if nm == '':
                 continue
             src = vals[n] if len(vals) > 1 else expr_str
@@ -5028,24 +4673,18 @@ class DirectiveProcessor:
             self.state.check_constraints[var] = syms
 
     def map_processing(self, i):
-        """`.map` をパターン走査中に適用する。"""
+        """`.map` — シンボル表とそのチェックを 1 行で書く。"""
         if len(i) == 0 or i[0] != '.map':
             return False
         self.map_apply(i)
         return True
 
     def free_processing(self, i):
-        """`.free::名前,名前,…`
+        """`.free` — 名前をすべての表から外して、作り直せるようにする。
 
-        その名前を、パターン層のあらゆる表から外す。置き場所ごとに
-        `.clearsym` `.clrcheck` `.clrenum` と書き分けなくても、名前ひとつで
-        「もうこの名前は使わない」と宣言できるようにするためのもの。外すのは
-          - `.setsym` の数値シンボル・文字列シンボル・配列シンボル
-          - `.sub` の表
-          - `.check` の候補（どの変数の一覧に入っていても取り除く）
-          - 名前が変数として読める綴りなら、その変数の `.check` と `.enum` ごと
-        で、`.clearsym` などと同じく書かれた位置から先に効く。
-        caxx.c の dir_free() と同じ規則である。
+        消すのは `.setsym` の各種シンボル、`.sub` 表、`.check` の候補、
+        そしてその名前が変数として読めるならその `.check` / `.enum` / `.reloc`。
+        位置依存なので、上のパターンからはまだ見える。
         """
         if len(i) == 0 or i[0] != '.free':
             return False
@@ -5064,10 +4703,8 @@ class DirectiveProcessor:
             self.state.arrsymbols.pop(key, None)
             self.state.arrgen += 1
             self.state.freed_subs.add(key)
-            # `.check` の候補からも外す。候補は大文字で積まれている。
             for var, syms in self.state.check_constraints.items():
                 self.state.check_constraints[var] = [x for x in syms if x != key]
-            # 名前が変数そのものなら、その変数の制約と列挙ごと外す。
             _v = nm.lower()
             if _v and PatternMatcher._var_name_at(_v, 0) == len(_v):
                 self.state.check_constraints.pop(_v, None)
@@ -5076,61 +4713,27 @@ class DirectiveProcessor:
         return True
 
     def echo_processing(self, i):
-        """`.echo(項目, 項目, …)` — パターンファイルの本文行に書けるデバッグ出力。
-
-        ミニ言語の `.echo`（`.func` の本体に書くもの）と同じ体裁で標準エラーへ
-        1 行出す。ワードは出さないので、足しても消しても生成されるバイト列は
-        変わらない。項目は `"..."` の文字列リテラルかパターン層の式で、混ぜて
-        書ける。`.echo()` は空行。
-
-        照合はソース1行ごとにパターン表をたどり直すので、この行もソース1行に
-        つき1回実行される。書いた位置で回数は変わらない（照合は一番具体的な
-        パターンを選ぶために表を走査しきるため）。命令長を測るだけの試し打ちと
-        収束途中のパス1では黙るので、組み立てた1行につき1行だけ出る。
-        caxx.c の dir_echo() と同じ規則である。
-        """
+        """`.echo` — 本文行から標準エラーへ印字する。ワードは出さない。"""
         if len(i) == 0 or i[0] != '.echo':
             return False
         st = self.state
-        # 黙る番なら式も評価しない。未定義ラベルの番兵を踏んで
-        # error_undefined_label を立ててしまわないようにするためである。
         if not st.should_report_errors() or st._pass1_size_mode:
             return True
         items, err = _echo_items_cached(i[1])
         if err is not None:
-            return True                  # 読み込み時に報告済み
+            return True
         parts = []
         for k, v in items:
             if k == 's':
                 parts.append(v)
             else:
                 val, _idx = self.expr_eval.expression_pat(v, 0)
-                # 表示は 256bit 符号つき 10 進。ミニ言語の `.echo` と同じ体裁に
-                # そろえ、caxx.c の u256_to_pydec() と同じ値にするためである。
                 parts.append(_mini_signed(val))
         _echo_write(parts)
         return True
 
     def passthru_processing(self, i):
-        """`.passthru[::on|nonl|off]`
-
-        どのパターンにもマッチしなかったソース行を、エラーにする代わりに
-        そのままテキストとして出す（トランスレータとしての使い方のため）。
-        その行はパターンのエンコーディング欄が `"<行>"` というテキスト
-        テンプレートだったのと同じ扱いになり、UTF-8 の 1 バイトが 1 ワードに
-        なってロケーションカウンタもその分進む。
-
-            .passthru          on と同じ
-            .passthru::on      素通しする
-            .passthru::off     素通しをやめる（既定）
-
-        行末の改行はこのディレクティブの仕事ではない。1行が1行になるように
-        したいときは `.eol` を併せて書く。
-
-        パターンファイルは1行ごとに全部走査されるので、これはファイル全体に
-        かかる設定として働く（同じファイルに複数書いた場合は最後のものが
-        効く）。caxx.c の dir_passthru() と同じ規則である。
-        """
+        """`.passthru` — どのパターンにも当たらない行を、エラーにせず素通しする。"""
         if len(i) == 0 or i[0] != '.passthru':
             return False
         arg = ''
@@ -5148,26 +4751,7 @@ class DirectiveProcessor:
         return True
 
     def eol_processing(self, i):
-        """`.eol[::on|off]`
-
-        テキスト変換のための設定で、出力を出した行ごとに改行（`\n`）を
-        1ワード足す。パターンのテキストテンプレートに `\n` を書いて回らなくても、
-        ソースの1行が出力の1行になる。
-
-            .eol          on と同じ
-            .eol::on      行ごとに改行を足す
-            .eol::off     足さない（既定）
-
-        足すのは出力ワード列の側だけで、標準出力へ流すテキスト（トランスレータ
-        としての出力）には足さない。そちらは行ごとに改行して出しているので、
-        二重に改行してしまわないようにしてある。出力ワードを1つも出さなかった行
-        （コメントだけの行や、何も出さないパターン）には足さない。`.vliw` が
-        有効なときは、パケットを壊さないよう何もしない。
-
-        パターンファイルは1行ごとに全部走査されるので、これはファイル全体に
-        かかる設定として働く（同じファイルに複数書いた場合は最後のものが
-        効く）。caxx.c の dir_eol() と同じ規則である。
-        """
+        """`.eol` — 1 ソース行につき 1 行の改行を自動で入れる。"""
         if len(i) == 0 or i[0] != '.eol':
             return False
         arg = ''
@@ -5185,26 +4769,10 @@ class DirectiveProcessor:
         return True
 
     def textmode_processing(self, i):
-        """`.textmode[::on|off]`
+        """`.textmode` — テキスト置換モードに切り替える。
 
-        テキスト置換モード。ソースを別の書式のテキストへ書き換える
-        （トランスレータとしての）使い方のための設定で、次の3つをまとめて行う。
-
-          1. `.passthru` を立てる（マッチしない行はそのまま出す）
-          2. `.eol` を立てる（出力を出した行ごとに改行を1ワード足す）
-          3. `!L<名前>`（式・ラベル捕捉子）の中の未定義ラベルをエラーにしない。
-             値は 0 になり、`{{.exp(<名前>)}}` が書かれたとおりの文字を出す。
-
-            .textmode          on と同じ
-            .textmode::on      テキスト置換モードにする
-            .textmode::off     やめる（既定）
-
-        3 つまとめて動くので、`.passthru` や `.eol` だけを別にしたいときは
-        この行の後ろでそちらを書けばよい（ディレクティブは書いた順に効く）。
-
-        パターンファイルは1行ごとに全部走査されるので、これはファイル全体に
-        かかる設定として働く（同じファイルに複数書いた場合は最後のものが
-        効く）。caxx.c の dir_textmode() と同じ規則である。
+        ラベル・式・`;` コメント・行頭の字下げを、書かれていたままの綴りで
+        出力に残す。ソース間トランスレータを書くためのモード。
         """
         if len(i) == 0 or i[0] != '.textmode':
             return False
@@ -5227,12 +4795,7 @@ class DirectiveProcessor:
         return True
 
     def enum_processing(self, i):
-        """`.enum::<変数>::<要素名の並び>::<式>`。
-
-        `!E<変数>` が拾う「要素名のリスト」の語彙と、そこから値を作る式を決める。
-        式の中では各要素名が「そのリストに現れていれば .setsym の値、
-        現れていなければ 0」に束縛される。
-        """
+        """`.enum` — 要素のリストを取る位置を宣言する（68000 の MOVEM など）。"""
         if len(i) == 0 or i[0] != '.enum':
             return False
         var_field = i[1].strip() if len(i) >= 2 else ''
@@ -5256,6 +4819,7 @@ class DirectiveProcessor:
         return True
 
     def clrenum_processing(self, i):
+        """`.clrenum` — `.enum` の宣言を外す（引数なしで全部）。"""
         if len(i) == 0 or i[0] != '.clrenum':
             return False
         var_field = i[2].strip() if len(i) >= 3 and i[2] else ''
@@ -5270,14 +4834,9 @@ class DirectiveProcessor:
         return True
 
     def errmsg_processing(self, i):
-        """`.error::n::"Message"` — error_patterns 欄（`n>7;5` の `5` のような
-        エラーコード）に対応するメッセージ文字列を ERRORS テーブルに登録する。
+        """`.error` — エラーコードの文言を足す・上書きする。
 
-        組み込みの ERRORS が文言を持たないコード（4 や 7 以上）にも新しく
-        メッセージを追加できるし、既存コード（1・2・3・5・6）の文言を
-        上書きすることもできる。n がテーブルの現在の大きさを超える場合は
-        空文字列で埋めて拡張する（README 9章の「文言の無いコードは空文字列で
-        表示される」という既定動作と整合する）。
+        これがあるので、実装のソースを触らずに自分の文言を持てる。
         """
         if len(i) == 0 or i[0] != '.error':
             return False
@@ -5300,10 +4859,6 @@ class DirectiveProcessor:
                 n_int = int(n)
             except (OverflowError, ValueError, TypeError):
                 n_int = None
-        # 破綻点修正: 上限を見ていなかった。エラーコードは self.state.errors の
-        # 添字で、その分だけ空文字列を詰めて伸ばすので、巨大な値を書かれると
-        # 数十億要素の確保でハングする（caxx.c は AXX_ERROR_CODE_MAX で弾く）。
-        # 同じ上限・同じ文面にそろえる。
         _ERROR_CODE_MAX = 1000000
         if (n_int is None or n_int != n or n_int < 0
                 or n_int > _ERROR_CODE_MAX):
@@ -5324,14 +4879,6 @@ class DirectiveProcessor:
 
 _SYM_CORE = set(DIGIT + ALPHABET + '_')
 
-# パターンファイル側のディレクティブの名前。lineassemble2() は1行を訳すたびに
-# パターンを全部走査するので、ディレクティブ判定を1つずつ関数呼び出しで試すと
-# 「パターン数 × ソース行数 × 判定の数」だけ空振りする（x86_64 や aarch64 の
-# ように1万行規模のパターンファイルでは、これだけで実行時間の大半になる）。
-# 各判定関数が見ているのは i[0] がこの名前と一致するかどうかだけなので、
-# ここで一度に振り分けて、ディレクティブでない行は判定列ごと飛ばす。
-# 表を増やすときは、対応する判定関数を lineassemble2() の列にも足すこと。
-# caxx.c の pat_is_directive() と同じ表である。
 _PAT_DIRECTIVES = frozenset((
     '.setsym', '.clearsym', '.padding', '.bits', '.symbolc', '.vliw',
     '.check', '.clrcheck', '.reloc', '.clrreloc', '.map', '.free',
@@ -5341,29 +4888,15 @@ _PAT_DIRECTIVES = frozenset((
     '.elfextern', '.elfdwarf', '.elfheader', '.elfsection', '.elffield'))
 
 
-# `.setsym` の値欄が「ソースの行によって変わりようのない定数式」か。
-# パターン行の式はラベル・`$.`/`$$`・`#名前`・パターン変数・`'`・`@` を読めるので
-# (マニュアル 6.3)、それらを書ける文字が1つでもあれば行ごとに値が変わりうる。
-# 逆に、数字・16進・演算子・括弧しか無いならどの行で評価しても同じ値になる。
-# 照合は1行ごとにパターン表を頭からたどり直すため、同じ `.setsym` の式を
-# 1行につき何百回も評価し直している(実測: aarch64 の 120 行で 14 万回、
-# 実行時間の約4割)。定数と分かるものだけ結果を使い回す。
 _CONST_SETSYM_RE = re.compile(r"^[\s0-9+\-*/%()<>|&^~]+$|^\s*0[xX][0-9a-fA-F]+\s*$")
 
-# `.setsym` の値欄が「ただの数」か（10進または 0x…）。こう書かれていれば
-# 文字列・配列・集合のどれにもなり得ないので、その判定列を通さずシンボル表に
-# 入れるだけで済む。集合演算子を含む定数式（`1&2` など）は集合の書き方と
-# 見分けがつかないので、ここでは弾く。caxx.c の plain_number_text() と同じ。
 _PLAIN_NUM_RE = re.compile(r"^\s*(?:0[xX][0-9a-fA-F]+|[0-9]+)\s*$")
 
 _SETSYM_MISS = object()
 
 
 def _pat_is_directive(i):
-    """パターン1行がディレクティブか（`EPIC` は大小無視）。
-
-    偽なら、lineassemble2() のディレクティブ判定列は必ず全て False を返す。
-    """
+    """そのパターン行がディレクティブか。`EPIC::` も含める。"""
     if not i:
         return False
     i0 = i[0]
@@ -5371,48 +4904,39 @@ def _pat_is_directive(i):
         return False
     if i0 in _PAT_DIRECTIVES:
         return True
-    # `EPIC` だけは大小を無視して比べる。upper() は重いので、長さと先頭文字で
-    # 先に落としてから呼ぶ。
     return len(i0) == 4 and (i0[0] == 'E' or i0[0] == 'e') \
         and StringUtils.upper(i0) == 'EPIC'
 
-# テキスト置換モード（`.textmode`）で、処理せずテキストとしてだけ出す組み込み
-# アセンブリディレクティブ。いずれも自分でワードや領域を出す（あるいは
-# ロケーションカウンタを飛ばす）ものなので、テキストとして出したうえで
-# さらに出させると中身が二重になり、翻訳結果のテキストに詰め物や生データが
-# 混ざってしまう。テキスト置換モードでの出力は「書き換えたテキストそのもの」
-# なので、行はテキストとして残し、出力の側は何も出さない。
-# caxx.c の textmode_text_only_dir() と同じ表である。
+# テキスト置換モードで、バイトを出さずに綴りだけ通すべき組み込みディレクティブ。
 _TEXTMODE_TEXT_ONLY_DIRS = frozenset((
     '.ORG', '.ALIGN', '.ZERO', '.ASCII', '.ASCIZ',
     '.RESB', '.RESW', '.RESD', '.RESQ'))
 
 
 def _expects_expr(t, idx):
+    """その位置でパターンが式捕捉 `!` を待っているか。"""
     while idx < len(t) and t[idx] in ' \t':
         idx += 1
     return idx < len(t) and t[idx] == '!'
 
 
 class PatternMatcher:
-    r"""ソース行とパターンの照合を行う。
-    
-    字句解析をせず1文字ずつ突き合わせる。パターン側の文字の意味は:
-      大文字        大小無視でリテラル一致（ニーモニック）
-      小文字の名前  .setsym のシンボル（レジスタ名等）を取る
-      `!x`          任意の式を読んで変数 x に束縛
-      `!!x`         式ではなく factor 1個だけを束縛
-      `!Fx`/`!Dx`/`!Qx`  浮動小数点式を IEEE754 の 32/64/128bit として束縛
-      `!Lx`         式・ラベル捕捉子。`!x` と同じに値を束縛し、そのうえで
-                    ソースに書かれていたままの文字も覚える（`{{.exp(x)}}`）
-      `!S{{名前}}x` `.sub::名前 … .return` のサブ表のどれか1項目に一致させ、
-                    その項目の値欄を評価した結果を変数 x に束縛
-      `\c`          次の1文字をリテラル扱い（エスケープ）
-      `[[ ... ]]`   省略可能グループ。含む/含まないの全組合せを試す
-    
-    照合が成功すると具体度スコア (式の数, -リテラル文字数, シンボル数) を残す。
-    呼び出し側はこれが最小のパターンを採用する（＝最も具体的なものが勝つ）ので、
-    パターンファイル内の記述順に依存しない。
+    """アセンブリ行とパターンの `instruction` 欄を照合する。
+
+    照合は 3 段に分かれている。
+
+      match0          `!S{{表}}` のサブ表参照を実際の選択肢に展開して試す
+      match0_brackets `[[ ]]` の省略可能部分を、組み合わせを変えて試す
+      match           1 文字ずつ突き合わせる本体。スコアを付ける
+
+    axx は最初に当たったパターンで止まらない。すべて試し、当たったものに
+    特異度スコア (n_expr, -n_lit, n_sym) を付け、**最小**のものを採る:
+    式捕捉が少ないもの、同点ならリテラル一致が多いもの、同点ならシンボル
+    捕捉が少ないもの。これによりパターンファイル中の行の順序が結果に
+    影響しない。特殊形を一般形の前に並べる手作業が要らないのはこのため。
+
+    失敗した試行が状態を汚さないことが要。変数の束縛と、`-o` 用に積んだ
+    ラベル参照は、試行ごとに保存して失敗時に巻き戻す。
     """
 
     def __init__(self, state, expr_eval, var_manager, symbol_manager, parser):
@@ -5425,6 +4949,10 @@ class PatternMatcher:
         self.last_match_score = None
 
     def remove_brackets(self, s, l):
+        """指定した番号の `[[ ]]` 群を、中身ごと取り除く。
+
+        番号は開き括弧の出現順（1 起点）。入れ子の対応は数えて取る。
+        """
         serial = 0
         stack = []
         bracket_pairs = {}
@@ -5449,11 +4977,7 @@ class PatternMatcher:
 
     @staticmethod
     def _var_name_at(t, i):
-        """パターン文字列 t の位置 i から変数名を読む。長さを返す（0 なら無し）。
-
-        名前は小文字で始まり、小文字・数字・`_` が続く。
-        caxx.c の var_name_len() と同じ規則である。
-        """
+        """その位置のパターン変数名の長さ。変数名でなければ 0。"""
         if i >= len(t) or not ('a' <= t[i] <= 'z'):
             return 0
         n = 1
@@ -5463,20 +4987,18 @@ class PatternMatcher:
         return n
 
     def _var_declare(self, name):
-        """名前を「この表の変数」として登録する。長さは問わない。"""
+        """変数名を「この行で使われた名前」として登録する。"""
         if name:
             self.state.varnames.add(name)
         return name
 
     def _enum_capture(self, s, idx, edef):
-        """`!E<変数>` の位置から列挙要素のリストを読み、式の値を返す。
+        """`!E` の位置で、要素のリストをソースから読む。
 
-        受け付けるのは `A0`、`A0-A2`（列挙順での範囲）、およびそれらを `,` か
-        `/` で並べたもの。区切り記号は「その先に要素名が続くとき」だけ消費する
-        ので、`MOVEM !Ex,-(SP)` のようにパターン側が後ろで `,` を使っていても
-        リストの一部と取り違えない。
-
-        返り値は (値, 読み終えた位置)。一致しなければ None。
+        `,` と `/` がどちらも区切りで、`first-last` は列挙順序の範囲。
+        逆順の範囲 (`a2-a0`) は範囲として読まず、`-` をパターンに委ねる。
+        区切り文字は次の要素が続くときだけ消費するので、リストの後ろで
+        パターンが `,` を使い続けられる。返り値は (値, 次の位置) か None。
         """
         names = edef[0]
         present = set()
@@ -5492,7 +5014,6 @@ class PatternMatcher:
                     present.update(range(k1, k2 + 1))
                     pos = e2
                 else:
-                    # 範囲として読めない `-` は、減算などパターン側の続きに残す。
                     present.add(k1)
             else:
                 present.add(k1)
@@ -5509,7 +5030,11 @@ class PatternMatcher:
         return v, pos
 
     def _enum_eval(self, edef, present):
-        """列挙の式を、出現した要素だけ .setsym の値に束縛して評価する。"""
+        """`.enum` の式を、現れた要素だけ値を持つ状態で評価する。
+
+        現れなかった要素は 0。`.setsym` 定義を持たない要素があれば None を
+        返してパターンを不一致にする（黙って 0 を寄与させない）。
+        """
         names, expr = edef
         values = []
         for k, nm in enumerate(names):
@@ -5518,8 +5043,6 @@ class PatternMatcher:
                 continue
             v = self.symbol_manager.get(nm)
             if v == "":
-                # 現れた要素に .setsym が無い ＝ パターンファイル側の書き損じ。
-                # 0 を黙って混ぜて誤ったバイトを出すより、不一致にして知らせる。
                 return None
             values.append(v)
         prev = self.state.enum_bindings
@@ -5531,6 +5054,14 @@ class PatternMatcher:
         return v
 
     def match(self, s, t):
+        """ソース行 s とパターン t を 1 文字ずつ突き合わせる本体。
+
+        トークナイザは無い。大文字・数字・記号は文字定数、小文字の名前は
+        シンボル、`!x` は式、`!!x` は因子、`!F/!D/!Q` は浮動小数点、`!L` は
+        式とその綴り、`!E` は列挙リスト、`!Y集合[変数]` は集合の項目番号。
+        当たるたびに値を変数へ束縛し、同時に n_expr / n_lit / n_sym を数えて
+        last_score に特異度スコアを残す。
+        """
         self.state.deb1 = s
         self.state.deb2 = t
 
@@ -5565,13 +5096,6 @@ class PatternMatcher:
 
             if a == '\\':
                 idx_t += 1
-                # 破綻点修正: 上限を len(t) で見ていたが、t は末尾に番兵の
-                # chr(0) を1個足してある。パターン欄が `\` で終わると
-                # その番兵を「エスケープされた文字」として b（同じく番兵）に
-                # 一致させてしまい、idx_s が s の外へ出て IndexError になった。
-                # 例外は呼び出し元が握り潰すので、症状は「そのパターンが
-                # 永久に一致しない」＋原因不明の Illegal syntax だった。
-                # caxx.c と同じく、番兵の手前までを本文として扱う。
                 if idx_t < len(t) - 1 and t[idx_t] == b:
                     lit_alnum = t[idx_t].isalnum()
                     if lit_alnum and prev_alnum and word_break:
@@ -5711,13 +5235,6 @@ class PatternMatcher:
                         idx_s += 1
                     continue
                 elif a == 'L':
-                    # `!L<名前>` — 式・ラベル捕捉子。`!<名前>` と同じように式を
-                    # 1つ読んで値を束縛し、そのうえで「ソースに書かれていたまま
-                    # の文字」も覚えておく。テキストテンプレートの
-                    # `{{.exp(<名前>)}}` がその文字をそのまま出す（3.5.2 節）。
-                    # テキスト置換モード（`.textmode`）では、拾った式の中の
-                    # 未定義ラベルをエラーにせず値を 0 にする。書き換え先の
-                    # テキストに要るのは値ではなく綴りそのものだからである。
                     if idx_t >= len(t):
                         return False
                     _nl = self._var_name_at(t, idx_t)
@@ -5748,8 +5265,6 @@ class PatternMatcher:
                     self.state.vars_text[a] = raw_text.strip(' \t' + chr(0))
 
                     if self.state.textmode:
-                        # テキストへ書き換えるだけの行なので、値が決まらない
-                        # ことは誤りではない。番兵を持ち回らず 0 にしておく。
                         self.state.error_undefined_label = _cap_prior
                         if _cap_undef or _is_undef_derived(v):
                             v = 0
@@ -5778,21 +5293,6 @@ class PatternMatcher:
                     self.var_manager.put(a, v)
                     continue
                 elif a == 'Y':
-                    # `!Y<集合>[<変数>]` — シンボル捕捉子。
-                    # `.setsym::x::AX,BX,CX` で作った集合（3.6.2 節）の項目名を
-                    # 1つ読み、その「番号」を変数に束縛する。`.check` が位置を
-                    # 集合の中の1つに限るのに対し、こちらは限るだけでなく
-                    # 何番目だったかを渡すので、別の配列を同じ番号で引ける。
-                    #
-                    #   .setsym::y::R0,R1,R2
-                    #   .setsym::x::AX,BX,CX
-                    #   MOV !Yx[z],!e::"mov {{y[z]}},0x{{.hex(e)}}"
-                    #
-                    # で `mov ax,0x12` は `mov R0,0x12` になる。
-                    # 集合が無い／項目名が読めない位置は不一致にする。
-                    # 具体度は式ではなくシンボルとして数える（取れる綴りが
-                    # 集合の項目に限られるので、`!a` のような式より具体的
-                    # である）。
                     if idx_t >= len(t):
                         return False
                     _sl = self._var_name_at(t, idx_t)
@@ -5800,8 +5300,6 @@ class PatternMatcher:
                         return False
                     setkey = StringUtils.upper(t[idx_t:idx_t + _sl])
                     idx_t += _sl
-                    # 束縛先の変数は `[` `]` で括って書く。集合の名前と別に
-                    # しておかないと、同じ綴りが集合にも変数にも要ることになる。
                     if idx_t >= len(t) or t[idx_t] != '[':
                         return False
                     idx_t += 1
@@ -5833,8 +5331,6 @@ class PatternMatcher:
                     a = self._var_declare(t[idx_t:idx_t + _nl])
                     idx_t += _nl
                     self.state._elf_capturing_var = a
-                    # 捕捉した式だけが未定義だったかを見たいので旗を一度降ろす。
-                    # 結果は変数の札に移し、外側の旗は OR で戻す。
                     _cap_prior = self.state.error_undefined_label
                     self.state.error_undefined_label = False
                     try:
@@ -5846,7 +5342,6 @@ class PatternMatcher:
                     self.var_manager.put_tagged(a, v, _cap_undef)
                     continue
                 else:
-                    # `!name` の名前。直前で1文字読み進めてあるので測り直す。
                     _nl = self._var_name_at(t, idx_t - 1)
                     if _nl == 0:
                         return False
@@ -5875,7 +5370,6 @@ class PatternMatcher:
                     continue
             elif a in LOWER:
                 prev_alnum = False
-                # シンボルを取る位置。名前は1文字でも `var_2` のように長くてもよい。
                 _nl = self._var_name_at(t, idx_t)
                 a = self._var_declare(t[idx_t:idx_t + _nl])
                 idx_t += _nl
@@ -5898,9 +5392,6 @@ class PatternMatcher:
                 if ok and allowed is not None and w not in allowed:
                     ok = False
                 if not ok and allowed:
-                    # 語として切り出せなかった／許可リストに無かった場合、
-                    # 許可リストの名前そのものを前方一致で取り直す。
-                    # `MOVa1c3` のように区切り文字なしで連結された書き方を通すため。
                     _best = ''
                     for _nm in allowed:
                         if not _nm or len(_nm) <= len(_best):
@@ -5917,7 +5408,6 @@ class PatternMatcher:
                 if not ok:
                     if not allow_omit:
                         return False
-                    # 省略とみなす。ソースは1文字も消費せず、変数は未代入(0)。
                     idx_s = prev_idx_s
                     self.var_manager.put(a, VAR_UNDEF)
                     n_sym += 1
@@ -5948,7 +5438,12 @@ class PatternMatcher:
 
     @staticmethod
     def _find_sub_ref(t, start=0):
-        """`!S{{名前}}変数` を探し、(開始, 終了, 名前, 変数) を返す。無ければ None。"""
+        """パターン中の最初の `!S{{表}}変数` を探す。
+
+        返り値は (開始, 終了, 表の名前, 変数名) か None。`\\` で逃がされた
+        ものは飛ばす。表の名前として読めない綴りや、変数名が続かないものも
+        参照とみなさない。
+        """
         i = start
         while True:
             i = t.find('!S{{', i)
@@ -5957,23 +5452,23 @@ class PatternMatcher:
             j = t.find('}}', i + 4)
             if j < 0:
                 return None
-            # `\!` とエスケープされていれば式ではなくリテラルの `!`。
             if i > 0 and t[i - 1] == '\\':
                 i = j + 2
                 continue
             name = t[i + 4:j]
             k = j + 2
-            # 変数名は1文字でも `var_2` のように長くてもよい。
             vl = PatternMatcher._var_name_at(t, k)
             if _is_sub_name(name) and vl > 0:
                 return i, k + vl, name, t[k:k + vl]
             i = j + 2
 
     def _sub_variants(self, t, depth=0):
-        """`!S{{名前}}x` をサブ表の各項目で置換した候補を、表の記述順に生成する。
+        """サブ表参照を実際の選択肢に展開し、(パターン, 束縛) を順に生む。
 
-        返すのは (置換後のパターン, ((変数, 値欄), ...)) の組。値欄は照合が
-        成功してから評価する（項目のパターンが束縛した変数を使えるように）。
+        エントリのパターンがさらに別の表を参照していれば再帰する。これが
+        入れ子の表し方で、`.sub` を `.sub` の中に書くことはできない。
+        連鎖は 8 段まで。未知の表名はパターンファイルを読むときに報告する。
+        内側の変数が先に束縛されるので、外側の値リストはそれを使える。
         """
         ref = self._find_sub_ref(t)
         if ref is not None:
@@ -5989,7 +5484,7 @@ class PatternMatcher:
             return
         entries = self.state.sub_defs.get(name)
         if StringUtils.upper(name) in self.state.freed_subs:
-            entries = None          # `.free` で解放済み
+            entries = None
         if entries is None:
             self.state.diag(f" error - {ref_text}: no sub table named {name!r} "
                             f"(define it with '.sub::{name} ... .return').",
@@ -6001,11 +5496,10 @@ class PatternMatcher:
                 yield vt, ((var, ent_val),) + binds
 
     def _sub_value(self, expr_text):
-        """サブ表の値欄を評価する。
+        """サブ表エントリの値リストを 1 つの値にまとめる。
 
-        カンマ区切りで複数書かれていれば、先頭を上位として `.bits` 幅ずつ
-        詰めた1つの整数にする（`0x01,0x02` は 8bit 幅なら 0x0102）。
-        1つだけなら値そのもの。
+        2 要素以上なら、最初が最上位になるよう `.bits` 幅ずつ詰める。
+        単一要素はその値そのもの。
         """
         s = expr_text + chr(0)
         idx = 0
@@ -6032,6 +5526,11 @@ class PatternMatcher:
         return acc
 
     def match0(self, s, t):
+        """サブ表の選択肢を順に試す。当たったら変数へ値を束縛して True。
+
+        失敗した試行のぶんは、変数の束縛と ELF のラベル参照をすべて
+        巻き戻す。巻き戻さないと、当たらなかった選択肢が出力に化けて出る。
+        """
         for vt, binds in self._sub_variants(t):
             saved_vars = dict(self.state.vars)
             saved_vars_undef = dict(self.state.vars_undef)
@@ -6040,7 +5539,6 @@ class PatternMatcher:
             saved_v2l = dict(self.state._elf_var_to_label)
             saved_hint = dict(self.state._elf_insn_reloc_hint)
             if self.match0_brackets(s, vt):
-                # 入れ子のときは内側から。外側の値欄が内側の変数を使える。
                 for var, ent_val in reversed(binds):
                     self.var_manager.put(var, self._sub_value(ent_val))
                 return True
@@ -6053,11 +5551,15 @@ class PatternMatcher:
         return False
 
     def match0_brackets(self, s, t):
-        # 省略可グループ `[[ ]]` を1つも持たないパターンは、試す組み合わせが
-        # 1通りしかない。組み合わせ表も、印の畳み込みも、括弧を落とした写しも
-        # 要らないので、そのまま照合へ回す（ほとんどのパターンがこの道を通る）。
-        # 退避と復元も呼び出し側（match0）と重なるので省く。
-        # caxx.c の pat_match0_brackets() と同じ速い道である。
+        """`[[ ]]` の省略可能部分を、組み合わせを変えて試す。
+
+        取り除く群の数を 0 個から増やしていくので、省略可能部分は
+        「できるだけ残す」方向から試される。群の数は 20 までで、
+        それを超えたぶんは常に含める。組み合わせの総数にも上限 (65536) が
+        あり、超えたパターンは不一致として扱い、行ごとに一度だけ警告する。
+        組み合わせ爆発でアセンブルが止まらなくなるのを防ぐため。
+        ここも試行ごとに状態を保存して巻き戻す。
+        """
         if '[[' not in t and ']]' not in t:
             if self.match(s, t):
                 self.last_match_score = self.last_score
@@ -6113,25 +5615,32 @@ class PatternMatcher:
 
 
 class PatternFileReader:
-    """`.axx` パターンファイルを読み、パターン表に変換する。
-    
-    各行を "::" 区切りで最大6フィールドに分解する。`.INCLUDE` は再帰的に展開し、
-    循環と深すぎる入れ子は検出して打ち切る。
-    
-    ソース側とは別インスタンスのマクロ層を通す。名前空間を分けてあるので、
-    パターンファイルのマクロがソースの展開に影響することはない。
+    """パターンファイルを読んで、行を欄に割った表にする。
+
+    `.INCLUDE` を再帰で展開し、各行をマクロ層に通してから `::` で最大 6 欄に
+    割る。`.sub` ブロックと `.func` ブロックはここで本文を集めて別に持つので、
+    その中の行が普通のパターン行として照合されることはない。
     """
 
     def __init__(self, parser, macro_proc=None):
         self.parser = parser
         self.macro_proc = macro_proc if macro_proc is not None \
             else MacroPreprocessor(None, pat_mode=True)
-        # `.sub::名前 ... .return` で集めたサブ表。名前 -> [(パターン, 値欄), ...]。
         self.subs = {}
-        # `.func::名前::引数 ... .endfunc` で集めたミニ言語の関数。名前 -> _MiniFunc。
         self.funcs = {}
 
     def readpat(self, fn, base_dir=None, _depth=0, _chain=None):
+        """パターンファイル 1 つを読み、パターン行の表を返す。
+
+        `.INCLUDE` は 50 段まで。同じ実パスが連鎖に現れたら循環として
+        報告して飛ばす。相対パスはそのファイルのある場所から解決する。
+
+        コメントの扱いに後方互換の規則がある。`/*` は本来ブロックコメントを
+        開くが、コメント行すべての先頭に `/*` を書く古い書き方のために、
+        「すぐ次の行も `/*` で始まる」か「以降どこにも `*/` が無い」ときは
+        自分の行を超えて延長しない。後者を先に知る必要があるので、
+        rest_has_close で後ろから `*/` の有無を数えておく。
+        """
         if fn == '':
             return []
 
@@ -6173,21 +5682,6 @@ class PatternFileReader:
             return []
         raw_lines = StringUtils.join_backslash_continuations(raw_lines)
 
-        # 破綻点修正: 「本物の複数行ブロックコメント(閉じ記号が後の行にあり、
-        # 中身の行は '/*' で始まらない)」と「開始記号を単なる行末コメントの
-        # 目印として毎行書くだけの古い流儀(コメントの各行が '/*' で始まり、
-        # 閉じ記号は無いか、あっても離れた場所にある別の無関係なコメントの
-        # ものでしかない)」の2つの書き方が実在のパターンファイルに混在している。
-        # 「次の1行だけ」を見て判定すると、旧来スタイルの連続コメントの最後の
-        # 1行(次の行はもう普通のコード)を誤って「本物のブロックコメント開始」
-        # と誤認し、たまたま遠く離れた場所にある無関係な閉じ記号まで実際の
-        # パターン行を丸ごと呑み込んでしまう(8080.axx で発生)。そこで、
-        # 「直前の行も '/*' で始まる行で、かつ単発扱い(旧来スタイル)と
-        # 判定されていたか」を legacy_chain として引き継ぎ、旧来スタイルの
-        # 連続コメントは何行続いても・最後の1行であっても単発行として扱う。
-        # legacy_chain が途切れた(=直前が普通のコードだった)場合のみ、次の
-        # 行が '/*' で始まらずかつこの位置より後ろに閉じ記号が本当に存在する
-        # ときに限り、新規のブロックコメントとして正しく閉じるまで追跡する。
         expanded = list(self.macro_proc.expand(raw_lines, fn))
         rest_has_close = [False] * (len(expanded) + 1)
         for i in range(len(expanded) - 1, -1, -1):
@@ -6205,8 +5699,6 @@ class PatternFileReader:
             was_in_comment = in_block_comment
             l, in_block_comment = StringUtils.remove_comment(l, in_block_comment)
             if not in_block_comment:
-                # このコメントはこの行の中で完結した(あるいは元々コメントで
-                # なかった)ので、旧来スタイルの連鎖はここで途切れる。
                 legacy_chain = False
             elif not was_in_comment:
                 this_is_bare_open = _starts_with_open_comment(expanded[_li][0])
@@ -6226,7 +5718,6 @@ class PatternFileReader:
             l = l.replace('\n', '')
             l = StringUtils.reduce_spaces(l)
 
-            # ミニ言語の `.func` 本体は `::` で分解せず、行のまま集める。
             _dk = _dot_kw(l)
             if func_stack or _dk == '.FUNC':
                 if _dk == '.FUNC':
@@ -6255,14 +5746,10 @@ class PatternFileReader:
                         target[_nm] = _fn_obj
                         func_stack.append(_fn_obj)
                     else:
-                        # 名前が壊れていても本体を取り込んで `.endfunc` の対応を保つ。
                         func_stack.append(_MiniFunc('?', [], parent, fn, _mln))
                     continue
                 cur = func_stack[-1]
                 if _dk == '.ENDFUNC':
-                    # 本体を閉じるのは `.endfunc` のみ。`.if`/`.while`/`.for` が
-                    # 閉じきらないまま来たら壊れたパターンなので報告するが、
-                    # 後続行を巻き込まないよう関数はここで閉じてしまう。
                     if cur.depth != 0:
                         diag(f" error - '.func {cur.name}': '.endfunc' while a block "
                              f"('.if'/'.while'/'.for') is still open.", set_error=True)
@@ -6280,8 +5767,6 @@ class PatternFileReader:
                     cur.lines.append((l, fn, _mln))
                 continue
 
-            # `.echo(項目, …)` は本文行に書ける。`::` で分解すると文字列の中の
-            # `::` まで欄の区切りにしてしまうので、行のまま1欄に収める。
             if _dk == '.ECHO':
                 if cur_sub is not None:
                     diag(f" error - '.echo' cannot be written inside "
@@ -6324,9 +5809,6 @@ class PatternFileReader:
                         cur_sub = _nm
                         self.subs[_nm] = []
                     continue
-                # `.sub` ブロックの終わりは `.return` でも `.endsub` でもよい。
-                # `.func … .endfunc` と綴りをそろえたいときのための別名で、
-                # 意味は同じ。
                 if _kw == '.RETURN' or _kw == '.ENDSUB':
                     if cur_sub is None:
                         diag(f" error - '{_kw.lower()}' without a matching '.sub'.",
@@ -6342,10 +5824,6 @@ class PatternFileReader:
                     self.subs[cur_sub].append((l[0], l[-1]))
                     continue
 
-                # `.map::<変数>::<名前の並び>::<式>` の書式検査。展開は
-                # setpatsymbols() と map_processing() で行う（並びに配列
-                # シンボルを書けるようにするため。配列はパターンを読み終えて
-                # から登録される）。
                 if _kw == '.MAP':
                     var_str = l[1].strip() if len(l) > 2 else ''
                     if len(l) < 3 or var_str == '':
@@ -6401,7 +5879,7 @@ class PatternFileReader:
 
     @staticmethod
     def _dir_var_name(field):
-        """ディレクティブの変数欄として読めるなら正規化した名前、駄目なら None。"""
+        """ディレクティブの変数名欄を読む（読み込み時用の軽い版）。"""
         v = (field or '').strip().lower()
         if not v or not v.isascii() or not ('a' <= v[0] <= 'z'):
             return None
@@ -6412,12 +5890,10 @@ class PatternFileReader:
 
     @staticmethod
     def _map_subst_index(expr, var, i):
-        """`.map` の式の中の変数を、並びの番号に置き換えた新しい式を作る。
+        """`.map` の式の中の変数を、その名前の位置 i に置き換える。
 
-        置き換えるのは語として独立している出現だけで、`0xff` の `x` のように
-        英数字に挟まれたものは触らない。番号は `(3)` と括って埋めるので、
-        `1<<x` は `1<<(3)` となり、前後の演算子の優先順位は変わらない。
-        caxx.c の map_subst_index() と同じ規則である。
+        括弧で包んで入れるので演算子の優先順位は変わらない。置き換えるのは
+        変数が単語として現れた箇所だけなので、`0xff` の `x` は無事。
         """
         num = '(%d)' % i
         vl = len(var)
@@ -6437,15 +5913,7 @@ class PatternFileReader:
         return ''.join(out)
 
     def compile_funcs(self):
-        """集めた関数の本体を、読み込み時に文の木へ変換する。
-
-        1ソース行ごとに解析し直すのは無駄なので一度だけ。文法の誤りも
-        組み立てが始まる前にまとめて報告できる。
-
-        ブロックの入れ子と括弧の深さはそのまま Python の再帰になるので、
-        マクロ展開と同じように上限を一時的に上げ、それでも足りなければ
-        トレースバックではなく診断として報告する。
-        """
+        """集めた `.func` の本文を構文木にする（ミニ言語の構文解析）。"""
         saved_reclimit = sys.getrecursionlimit()
         if saved_reclimit < _MINI_RECLIMIT:
             sys.setrecursionlimit(_MINI_RECLIMIT)
@@ -6467,11 +5935,11 @@ class PatternFileReader:
             sys.setrecursionlimit(saved_reclimit)
 
     def check_sub_refs(self, pat):
-        """`!S{{名前}}` の参照を読み込み時に検算する。
+        """`!S{{表}}` の参照が解決できるかを、読み込み時に一度だけ検査する。
 
-        照合中に出した診断は「採用されなかった候補のもの」として捨てられるので、
-        名前の綴り違いや循環参照はそのままだと全行が素の Syntax error になる。
-        パターンファイル側の誤りはここで一度だけ報告する。
+        表は使用箇所より後に定義してよいので、ファイル全体を読んでから見る。
+        未知の表名と循環参照をここで報告しておけば、照合中に毎行
+        同じ診断が出ることはない。
         """
         def refs(t):
             out, i = [], 0
@@ -6496,7 +5964,6 @@ class PatternFileReader:
             for ent_pat, _ in entries:
                 check_unknown(f"sub table {nm!r}", ent_pat)
 
-        # 展開が終わらなくなる循環参照。
         mark = {}
 
         def walk(nm, stack):
@@ -6518,6 +5985,7 @@ class PatternFileReader:
             walk(nm, [])
 
     def include_pat(self, l, base_dir=None, _depth=0, _chain=None):
+        """`.INCLUDE` の行を処理して、読み込んだ表を返す。"""
         idx = StringUtils.skipspc(l, 0)
         i = l[idx:idx + 8]
         i = i.upper()
@@ -6543,27 +6011,24 @@ class PatternFileReader:
 
 
 class MiniLangError(Exception):
-    """ミニ言語の構文・実行時エラー。読み込み時と組み立て時の両方で使う。"""
+    """ミニ言語の実行時エラー。行と桁を文言に持つ。"""
+    pass
 
 
 class _MiniBreak(Exception):
-    """`.break` 文。いちばん内側の `.while` / `.for` を抜ける。"""
+    """`.break` を外側のループへ伝えるための内部例外。"""
 
     __slots__ = ()
 
 
 class _MiniContinue(Exception):
-    """`.continue` 文。いちばん内側の `.while` / `.for` の次の反復へ進む。"""
+    """`.continue` を外側のループへ伝えるための内部例外。"""
 
     __slots__ = ()
 
 
 class _MiniReturn(Exception):
-    """`.return` 文。関数1段ぶんだけ脱出する。
-
-    `.return 式` なら value にその値（整数か配列）を運ぶ。値のない `.return`
-    は value が None で、呼び出し元が `var = .call ...` の形だとエラーになる。
-    """
+    """`.return` を呼び出し元へ伝えるための内部例外。値を持つことがある。"""
 
     __slots__ = ('value',)
 
@@ -6572,36 +6037,37 @@ class _MiniReturn(Exception):
         self.value = value
 
 
-# ミニ言語の解析・実行中だけ上げる再帰上限。ブロックの入れ子と括弧の深さが
-# そのまま Python の再帰になるので、既定の 1000 では浅い入れ子で尽きてしまう。
-# caxx 側は再帰の深さに固定の上限を持たないので、届く範囲を揃えておく。
 _MINI_RECLIMIT = 20000
 
-# ミニ言語の整数は axx の式と同じ 256bit 2の補数。Python と C で同じ値に
-# なるよう、演算のたびに幅を合わせる。
+# ミニ言語の整数は 256bit で回り込む。Python 側は多倍長なので自然には
+# 回らないため、演算のたびにマスクして caxx.c と同じ結果にそろえる。
 _MINI_BITS = 256
 _MINI_MASK = (1 << _MINI_BITS) - 1
 
 
 def _mini_wrap(v):
+    """値を 256bit に丸める（符号なしの表現）。"""
     return int(v) & _MINI_MASK
 
 
 def _mini_signed(v):
+    """値を 256bit の符号付きとして読み直す。"""
     v = int(v) & _MINI_MASK
     return v - (1 << _MINI_BITS) if v >> (_MINI_BITS - 1) else v
 
 
+# ミニ言語の字句。2 文字の演算子を 1 文字より先に試す必要がある。
 _MINI_OPS2 = ('**', '<<', '>>', '<=', '>=', '==', '!=', '&&', '||')
 _MINI_OPS1 = frozenset('+-*/%&|^~<>!()[]:,=')
 
-# 文字列リテラルで使える逃げ記号。値は整数と配列だけなので、文字列が書けるのは
-# `.echo` の引数欄だけである。
 _MINI_ESC = {'\\': '\\', '"': '"', 'n': '\n', 't': '\t'}
 
 
 def _mini_lex(text, pos):
-    """1行を字句に分解する。返すのは (種別, 値) の並び。"""
+    """ミニ言語の 1 行をトークンに割る。
+
+    返す各トークンは種類と値と位置を持ち、位置は診断にそのまま出る。
+    """
     toks = []
     t = text
     i = 0
@@ -6650,8 +6116,6 @@ def _mini_lex(text, pos):
             i = j
             continue
         if c == '$':
-            # `$$` / `$.` は本体の式評価器が持つ項。ここでは字面を覚えるだけで、
-            # 実際の値は評価時に本体へ渡して求める。
             if t[i:i + 2] in ('$$', '$.'):
                 toks.append(('core', t[i:i + 2]))
                 i += 2
@@ -6660,7 +6124,6 @@ def _mini_lex(text, pos):
                                 f"'$$' (location counter) or '$.' "
                                 f"(start of the next instruction)")
         if c == '#':
-            # `#name` も本体の式評価器が持つ項（`.setsym` の記号）。
             j = i + 1
             while j < n and (t[j].isalnum() or t[j] in '_.$'):
                 j += 1
@@ -6707,12 +6170,10 @@ def _mini_lex(text, pos):
 
 
 class _MiniExprParser:
-    """字句列から式の木を作る再帰下降パーサ。
+    """ミニ言語の式を構文木にする。優先順位ごとに 1 メソッドの再帰下降。
 
-    優先順位は低いほうから `|| && ! 比較 | ^ & シフト +- */% 単項 ** 添字`。
-    返す木は ('num',値) ('var',名) ('arr',[式]) ('index',式,式)
-    ('slice',式,式|None,式|None) ('len',式) ('callexpr',名,[式])
-    ('bin',演算子,左,右) ('un',演算子,式)。
+    演算子は C に倣う（本体の式評価器とは `%` の符号などが違う）。
+    構文木を作るだけで、評価は MiniInterp が行う。
     """
 
     def __init__(self, toks, pos):
@@ -6721,30 +6182,37 @@ class _MiniExprParser:
         self.pos = pos
 
     def fail(self, msg):
+        """現在位置を添えて構文エラーにする。"""
         raise MiniLangError(f"{self.pos[0]}:{self.pos[1]}: {msg}")
 
     def peek(self):
+        """次のトークンを消費せずに見る。"""
         return self.toks[self.i] if self.i < len(self.toks) else ('end', None)
 
     def at_op(self, *ops):
+        """次がこれらの演算子のどれかか。"""
         k, v = self.peek()
         return k == 'op' and v in ops
 
     def eat_op(self, op):
+        """次がその演算子なら消費して真。"""
         if self.at_op(op):
             self.i += 1
             return True
         return False
 
     def expect_op(self, op):
+        """その演算子を必ず 1 つ消費する。無ければ構文エラー。"""
         if not self.eat_op(op):
             k, v = self.peek()
             self.fail(f"expected {op!r}, found {v if k != 'end' else 'end of line'!r}")
 
     def at_end(self):
+        """トークンを読み切ったか。"""
         return self.i >= len(self.toks)
 
     def parse(self):
+        """式を 1 個解析する。優先順位の一番上から入る。"""
         e = self.or_()
         if not self.at_end():
             k, v = self.peek()
@@ -6752,6 +6220,7 @@ class _MiniExprParser:
         return e
 
     def or_(self):
+        """`||`。"""
         e = self.and_()
         while self.at_op('||'):
             self.i += 1
@@ -6759,6 +6228,7 @@ class _MiniExprParser:
         return e
 
     def and_(self):
+        """`&&`。"""
         e = self.not_()
         while self.at_op('&&'):
             self.i += 1
@@ -6766,12 +6236,14 @@ class _MiniExprParser:
         return e
 
     def not_(self):
+        """単項 `!`。"""
         if self.at_op('!'):
             self.i += 1
             return ('un', '!', self.not_())
         return self.cmp_()
 
     def cmp_(self):
+        """比較 `== != < <= > >=`。"""
         e = self.bitor_()
         while self.at_op('==', '!=', '<=', '>=', '<', '>'):
             op = self.peek()[1]
@@ -6780,6 +6252,7 @@ class _MiniExprParser:
         return e
 
     def bitor_(self):
+        """`|`。"""
         e = self.bitxor_()
         while self.at_op('|'):
             self.i += 1
@@ -6787,6 +6260,7 @@ class _MiniExprParser:
         return e
 
     def bitxor_(self):
+        """`^`。"""
         e = self.bitand_()
         while self.at_op('^'):
             self.i += 1
@@ -6794,6 +6268,7 @@ class _MiniExprParser:
         return e
 
     def bitand_(self):
+        """`&`。"""
         e = self.shift_()
         while self.at_op('&'):
             self.i += 1
@@ -6801,6 +6276,7 @@ class _MiniExprParser:
         return e
 
     def shift_(self):
+        """`<<` `>>`。"""
         e = self.add_()
         while self.at_op('<<', '>>'):
             op = self.peek()[1]
@@ -6809,6 +6285,7 @@ class _MiniExprParser:
         return e
 
     def add_(self):
+        """`+` `-`。"""
         e = self.mul_()
         while self.at_op('+', '-'):
             op = self.peek()[1]
@@ -6817,6 +6294,7 @@ class _MiniExprParser:
         return e
 
     def mul_(self):
+        """`*` `/` `%`。"""
         e = self.unary_()
         while self.at_op('*', '/', '%'):
             op = self.peek()[1]
@@ -6825,6 +6303,7 @@ class _MiniExprParser:
         return e
 
     def unary_(self):
+        """単項 `-` `+` `~`。"""
         if self.at_op('-', '+', '~'):
             op = self.peek()[1]
             self.i += 1
@@ -6832,6 +6311,7 @@ class _MiniExprParser:
         return self.power_()
 
     def power_(self):
+        """`**`。"""
         e = self.postfix_()
         if self.at_op('**'):
             self.i += 1
@@ -6839,6 +6319,7 @@ class _MiniExprParser:
         return e
 
     def postfix_(self):
+        """後置の添字 `名前[式]`。"""
         e = self.primary_()
         while self.at_op('['):
             self.i += 1
@@ -6855,6 +6336,7 @@ class _MiniExprParser:
         return e
 
     def primary_(self):
+        """項そのもの。数値、名前、`(式)`、配列リテラル、`.call`、組み込み。"""
         k, v = self.peek()
         if k == 'str':
             self.fail("a string can only be used in '.echo'")
@@ -6875,7 +6357,6 @@ class _MiniExprParser:
                 self.expect_op(')')
                 return ('len', e)
             if v == '.CALL':
-                # 式の途中の `.call 名前(引数, ...)`。呼んだ関数の返り値になる。
                 self.i += 1
                 k2, v2 = self.peek()
                 if k2 != 'name':
@@ -6907,7 +6388,7 @@ class _MiniExprParser:
         self.fail(f"expected a value, found {v if k != 'end' else 'end of line'!r}")
 
     def parse_list(self):
-        """カンマ区切りの式の並び。空なら空リスト。"""
+        """カンマ区切りの式の並びを解析する（引数と配列リテラル）。"""
         items = []
         if self.at_end():
             return items
@@ -6921,16 +6402,21 @@ class _MiniExprParser:
 
 
 class MiniParser:
-    """`.func` 本体の行の並びを文の木にする。"""
+    """`.func` の本文を文の構文木にする。
+
+    `.if` / `.elif` / `.else` / `.endif`、`.while` / `.endwhile`、`.for` / `.next`
+    の対応をここで取る。入れ子は行の並びから数える（字下げは見ない）。
+    """
 
     _ENDERS = frozenset(('.ELIF', '.ELSE', '.ENDIF', '.NEXT', '.ENDWHILE'))
 
     def __init__(self, func):
         self.func = func
         self.lines = func.lines
-        self.loopdepth = 0   # `.break` / `.continue` が書ける深さ
+        self.loopdepth = 0
 
     def parse_body(self):
+        """関数本体を丸ごと解析する。"""
         body, i = self._block(0, ())
         if i < len(self.lines):
             text, f, ln = self.lines[i]
@@ -6938,6 +6424,7 @@ class MiniParser:
         return body
 
     def _block(self, i, enders):
+        """enders のどれかが現れるまでを 1 ブロックとして解析する。"""
         out = []
         while i < len(self.lines):
             text, f, ln = self.lines[i]
@@ -6978,12 +6465,7 @@ class MiniParser:
         return out, i
 
     def _if_chain(self, i):
-        """`.if`／`.elif` の 1 段を読む。戻り値は (文, `.endif` の行番号)。
-
-        `.elif` は「`.else` の中に `.if` が 1 つだけある」形に展開する。連鎖の
-        途中では `.endif` を読み飛ばさないので、いちばん外側の呼び出し元だけが
-        1 行進めればよい。
-        """
+        """`.if` / `.elif` / `.else` / `.endif` の連なりを解析する。"""
         text, f, ln = self.lines[i]
         pos = (f, ln)
         kw = _dot_kw(text)
@@ -7000,9 +6482,6 @@ class MiniParser:
             node, i = self._if_chain(i)
             else_b = [node]
         elif nkw == '.ELSE':
-            # 破綻点修正: `.else` 行の誤りなのに `.if` 行の位置を報告していた
-            # （caxx.c の msp_if_chain() は `.else` 行の位置を使う）。字句解析に
-            # 渡す位置も同じく `.else` 行にする。
             epos = (self.lines[i][1], self.lines[i][2])
             rest = _mini_lex(self.lines[i][0], epos)[1:]
             if rest:
@@ -7013,6 +6492,7 @@ class MiniParser:
         return ('if', cond, then_b, else_b, pos), i
 
     def _for_header(self, text, pos):
+        """`.for` のヘッダ（変数と範囲）を解析する。"""
         toks = _mini_lex(text, pos)
         f, ln = pos
         if len(toks) < 4 or toks[1][0] != 'name':
@@ -7035,6 +6515,7 @@ class MiniParser:
         return var, args
 
     def _simple(self, text, pos):
+        """単純文 1 個を解析する。代入、`.emit`、`.echo`、`.raise`、`.return` など。"""
         f, ln = pos
         toks = _mini_lex(text, pos)
         if not toks:
@@ -7046,8 +6527,6 @@ class MiniParser:
                     return ('return', _MiniExprParser(toks[1:], pos).parse(), pos)
                 return ('return', None, pos)
             if v == '.RAISE':
-                # `.raise n` … error_patterns 欄の `条件;n` と同じ形でエラーコード n を
-                # 報告する。`.error::n::"文言"` で登録した文言もそのまま使われる。
                 if len(toks) <= 1:
                     raise MiniLangError(f"{f}:{ln}: '.raise' needs an error code")
                 return ('raise', _MiniExprParser(toks[1:], pos).parse(), pos)
@@ -7066,7 +6545,6 @@ class MiniParser:
                     raise MiniLangError(f"{f}:{ln}: '.emit' needs at least one value")
                 return ('emit', args, pos)
             if v == '.ECHO':
-                # 項目は文字列リテラルか式。文字列はそのまま、式は値を表示する。
                 p = _MiniExprParser(toks[1:], pos)
                 p.expect_op('(')
                 items = []
@@ -7112,7 +6590,6 @@ class MiniParser:
                     raise MiniLangError(f"{f}:{ln}: '.nonlocal' needs variable names")
                 return ('nonlocal', names, pos)
             raise MiniLangError(f"{f}:{ln}: unknown statement {v.lower()!r}")
-        # 代入。左辺は名前か、名前への添字1つ。
         if k != 'name':
             raise MiniLangError(f"{f}:{ln}: statement must be a directive or an assignment")
         name = v
@@ -7124,7 +6601,6 @@ class MiniParser:
             p.expect_op(']')
         p.expect_op('=')
         rest = p.toks[p.i:]
-        # `var = .call f(...)` は呼んだ関数の返り値を代入する。
         if rest and rest[0] == ('dot', '.CALL'):
             fname, args = self._call_tail(rest, pos)
             return ('callassign', name, idx, fname, args, pos)
@@ -7132,7 +6608,7 @@ class MiniParser:
         return ('assign', name, idx, val, pos)
 
     def _call_tail(self, toks, pos):
-        """`.call 名前(引数, ...)` を読んで (名前, 引数の式) を返す。"""
+        """`.call 名前(引数, ...)` の引数部を解析する。"""
         f, ln = pos
         if len(toks) < 2 or toks[1][0] != 'name':
             raise MiniLangError(f"{f}:{ln}: '.call' needs a function name")
@@ -7151,12 +6627,18 @@ class MiniParser:
 
 
 class MiniInterp:
-    """ミニ言語を実行して `.emit` されたワードを集める。
+    """ミニ言語の評価器。`.call` から呼ばれて出力ワードを作る。
 
-    変数は関数呼び出しごとのフレームに持つ。`.nonlocal` を宣言した名前は、
-    外側の呼び出しフレームのうち、その名前を持つ一番内側のものを指す。
+    この言語はチューリング完全なので、バグのあるパターンファイルが
+    そのままではアセンブラを止められなくしてしまう。4 つの上限がそれを防ぎ、
+    代わりに問題の行を報告する。未定義ラベルから来た引数は 0 として渡るので、
+    前方参照が最初のパスでループ回数を吹き飛ばすこともない。
+    パターン変数はここでは使えない（`.func` 本体の実行中はそれを束縛して
+    いるものが無い）。必要なら `.call` の引数として渡す。
     """
 
+    # 1 回の `.call` で実行する文の数、呼び出しの入れ子、出力ワード数、
+    # 配列長の上限。超えたらその行をエラーにして止める。
     MAX_STEPS = 4_000_000
     MAX_DEPTH = 128
     MAX_EMIT = 1 << 20
@@ -7164,35 +6646,31 @@ class MiniInterp:
 
     def __init__(self, state, expr_eval=None):
         self.state = state
-        self.expr_eval = expr_eval   # 本体の式評価器。`$$`・`#記号`・ラベルの委譲先
+        self.expr_eval = expr_eval
         self.out = []
         self.steps = 0
         self.frames = []
 
-    # --- 値の入れ物 --------------------------------------------------------
     @staticmethod
     def _is_arr(v):
+        """値が配列か。"""
         return isinstance(v, list)
 
     @classmethod
     def _echo_value(cls, v):
-        """`.echo` の 1 項目を `_echo_write` に渡せる値にする。
-
-        ミニ言語の整数は 256bit を符号なしで持っているので、表示のために符号つき
-        へ直す。配列はそのまま渡せば `_as_str` が `[1, 2, 3]` の体裁にする。
-        """
+        """`.echo` に出す形に整える。"""
         if cls._is_arr(v):
             return [_mini_signed(e) for e in v]
         return _mini_signed(v)
 
     def _need_int(self, v, pos, what):
+        """整数を要求する。配列が来たらエラーにする。"""
         if self._is_arr(v):
             raise MiniLangError(f"{pos[0]}:{pos[1]}: {what} must be a number, not an array")
         return _mini_wrap(v)
 
-    # --- 変数 --------------------------------------------------------------
     def _frame_for(self, name):
-        """`.nonlocal` 宣言があれば外側のフレームを、なければ現フレームを返す。"""
+        """その名前を持つスコープを探す。`.nonlocal` なら外側へたどる。"""
         top = self.frames[-1]
         if name not in top['nonlocal']:
             return top
@@ -7202,13 +6680,10 @@ class MiniInterp:
         return None
 
     def _core_eval(self, text, pos):
-        """`$$` `$.` `#記号` ラベル名を本体の式評価器に評価してもらう。
+        """本体の式評価器に委譲する（ラベル・`$$`・`#記号` を読むため）。
 
-        ミニ言語は本体と同じ 256bit の値を扱うので、結果はそのまま使える。
-        能力記述子は CAPS_MINI を渡す。パターン変数 `a`〜`z` と `!!!` は、
-        `.func` の本体が走っている時点では束縛されていないか意味を持たない
-        ので、ここで落とす。未定義ラベル由来の値は 0 にする。`.call` の引数を
-        評価するときと同じ扱いで、番兵の巨大な値で反復回数が爆発するのを防ぐ。
+        未定義ラベル由来の値は 0 にする。巨大な番兵をミニ言語の演算へ
+        流し込まないため。
         """
         if self.expr_eval is None:
             raise MiniLangError(f"{pos[0]}:{pos[1]}: {text!r} is not available here")
@@ -7218,7 +6693,7 @@ class MiniInterp:
         return _mini_wrap(v)
 
     def _core_name(self, name):
-        """その名前をアセンブラ本体が知っているか（ラベル / `.setsym` 記号）。"""
+        """その名前が、本体側（ラベル・シンボル・前回の反復の値）にあるか。"""
         st = self.state
         if st is None:
             return False
@@ -7229,15 +6704,16 @@ class MiniInterp:
         return name in st._relax_prev_values
 
     def _get(self, name, pos):
+        """変数を読む。無ければ本体側の名前として解決を試みる。
+
+        パス2で本体側にも無い名前は「設定前に使われた」エラーにする。
+        パス1ではまだ値が無いのが普通なので、そこでは通す。
+        """
         fr = self._frame_for(name)
         if fr is None:
             raise MiniLangError(f"{pos[0]}:{pos[1]}: '.nonlocal {name}' found no "
                                 f"enclosing definition of {name!r}")
         if name not in fr['vars']:
-            # ローカルに無い名前は、アセンブラ本体のラベル / `.setsym` 記号として
-            # 読み直す。パス2では本体の表が揃っているので「そんな名前は無い」と
-            # 断定でき、綴り間違いは従来どおりミニ言語のエラーになる。パス1では
-            # まだ前方参照が埋まっていないので、判断を本体側に預ける。
             if self.expr_eval is not None and self.state is not None \
                     and (self._core_name(name) or self.state.pas != 2):
                 return self._core_eval(name, pos)
@@ -7245,14 +6721,15 @@ class MiniInterp:
         return fr['vars'][name]
 
     def _set(self, name, value, pos):
+        """変数へ代入する。"""
         fr = self._frame_for(name)
         if fr is None:
             raise MiniLangError(f"{pos[0]}:{pos[1]}: '.nonlocal {name}' found no "
                                 f"enclosing definition of {name!r}")
         fr['vars'][name] = value
 
-    # --- 式 ----------------------------------------------------------------
     def eval(self, e, pos):
+        """式の構文木を評価する。"""
         k = e[0]
         if k == 'num':
             return e[1]
@@ -7281,7 +6758,6 @@ class MiniInterp:
             idx = _mini_signed(self._need_int(self.eval(e[2], pos), pos, 'an index'))
             if not self._is_arr(base):
                 raise MiniLangError(f"{pos[0]}:{pos[1]}: only an array can be indexed")
-            # 範囲外の読み出しは 0。配列は書き込みで伸びるので、読みでは伸ばさない。
             if idx < 0 or idx >= len(base):
                 return 0
             return base[idx]
@@ -7312,6 +6788,7 @@ class MiniInterp:
         raise MiniLangError(f"{pos[0]}:{pos[1]}: bad expression")
 
     def _binop(self, e, pos):
+        """二項演算を評価する。`/` と `%` は C と同じゼロ方向の切り捨て。"""
         op = e[1]
         if op == '&&':
             if _mini_signed(self._need_int(self.eval(e[2], pos), pos, 'an operand')) == 0:
@@ -7345,8 +6822,6 @@ class MiniInterp:
         if op == '**':
             if sb < 0:
                 raise MiniLangError(f"{pos[0]}:{pos[1]}: negative exponent")
-            # 剰余つきべき乗。C 側の u256_pow（2乗しながら 256bit で回る）と
-            # 同じ値になり、指数が大きくても計算量が爆発しない。
             return _mini_wrap(pow(sa, sb, 1 << _MINI_BITS))
         if op == '<<':
             if sb < 0 or sb >= _MINI_BITS:
@@ -7376,9 +6851,8 @@ class MiniInterp:
             return 1 if sa == sb else 0
         return 1 if sa != sb else 0
 
-    # --- 文 ----------------------------------------------------------------
     def _store(self, name, idx, v, pos):
-        """`name = v` / `name[idx] = v` を実行する。v は整数か配列。"""
+        """変数か配列要素へ代入する。配列は必要なら伸ばす（上限あり）。"""
         if idx is None:
             self._set(name, list(v) if self._is_arr(v) else _mini_wrap(v), pos)
             return
@@ -7391,22 +6865,24 @@ class MiniInterp:
         arr = self._get(name, pos)
         if not self._is_arr(arr):
             raise MiniLangError(f"{pos[0]}:{pos[1]}: {name!r} is not an array")
-        # 足りない分は 0 で埋めて伸ばす。
         if i >= len(arr):
             arr.extend([0] * (i + 1 - len(arr)))
         arr[i] = self._need_int(v, pos, 'an array element')
 
     def _tick(self, pos):
+        """実行した文を 1 つ数える。上限を超えたらエラーにする。"""
         self.steps += 1
         if self.steps > self.MAX_STEPS:
             raise MiniLangError(f"{pos[0]}:{pos[1]}: mini language ran more than "
                                 f"{self.MAX_STEPS} statements; assuming a runaway loop")
 
     def exec_block(self, body):
+        """文の並びを順に実行する。"""
         for st in body:
             self._exec(st)
 
     def _exec(self, st):
+        """文 1 個を実行する。"""
         kind = st[0]
         pos = st[-1]
         self._tick(pos)
@@ -7440,13 +6916,9 @@ class MiniInterp:
             if self._is_arr(v):
                 raise MiniLangError(f"{pos[0]}:{pos[1]}: '.raise' needs a number, "
                                     f"not an array")
-            # 命令長を測るだけの試し打ちと、収束途中のパス1では黙る（`.echo` と同じ）。
-            # 同じ行が反復回数だけ重複して報告されるのを防ぐため。
-            # 報告の体裁は error_patterns 欄（error()）と揃えてある。
             if (self.state is not None
                     and self.state.should_report_errors()
                     and not self.state._pass1_size_mode):
-                # caxx.c の u256_to_i64（下位64bitを符号つきで読む）と同じ値にする。
                 _lo = int(v) & 0xFFFFFFFFFFFFFFFF
                 code = _lo - (1 << 64) if _lo >> 63 else _lo
                 print(f"Line {self.state.ln} Error code {code} ", end="",
@@ -7459,8 +6931,6 @@ class MiniInterp:
         if kind == 'echo':
             parts = [x if k2 == 's' else self._echo_value(self.eval(x, pos))
                      for k2, x in st[1]]
-            # 命令長を測るだけの試し打ちと、収束途中のパス1では黙る。
-            # 同じ行が反復回数だけ重複して出るのを防ぐため。
             if (self.state is not None
                     and self.state.should_report_errors()
                     and not self.state._pass1_size_mode):
@@ -7531,8 +7001,8 @@ class MiniInterp:
             return
         raise MiniLangError(f"{pos[0]}:{pos[1]}: bad statement")
 
-    # --- 関数 --------------------------------------------------------------
     def _lookup(self, name, pos):
+        """呼び出す関数を名前で探す。内側の定義から外側へたどる。"""
         fn = self.frames[-1]['func'] if self.frames else None
         while fn is not None:
             if name in fn.children:
@@ -7544,6 +7014,7 @@ class MiniInterp:
         return fn
 
     def call(self, func, args, pos):
+        """関数を 1 回呼ぶ。新しいスコープを積み、入れ子の深さを検査する。"""
         if len(self.frames) >= self.MAX_DEPTH:
             raise MiniLangError(f"{pos[0]}:{pos[1]}: call nesting deeper than "
                                 f"{self.MAX_DEPTH}; assuming runaway recursion")
@@ -7564,10 +7035,7 @@ class MiniInterp:
         return ret
 
     def run(self, func, args, pos):
-        """関数を1回走らせ、(`.emit` したワード列, 返り値) を返す。
-
-        返り値は整数か配列。値を返さずに戻った場合は None。
-        """
+        """`.call` の入口。関数を走らせ、出力ワードの並びを返す。"""
         self.out = []
         self.steps = 0
         self.frames = []
@@ -7575,33 +7043,23 @@ class MiniInterp:
         return self.out, ret
 
 
-# 文字列テンプレート（3.5.2）の中で解くエスケープ。ここに無い `\x` は
-# x をそのままの字として出す（小文字の逃げ道）。caxx.c の txt_render() と同じ。
 _TXT_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', '\\': '\\', '"': '"'}
 
 _ASMTEXT_SHOW = {'\n': '\\n', '\t': '\\t', '\r': '\\r', '\\': '\\\\', '"': '\\"'}
 
 
 def asmtext_escaped(s):
-    """-v の診断行に埋める文字列。
-
-    行が折れないよう、テキストの中の改行やタブは `\\n` `\\t` と書いたまま
-    見せる。素のまま流す方（トランスレータとしての標準出力）は解いた文字の
-    ままで、こちらは表示用の写しだけを変える。caxx.c の
-    txt_add_escaped() と同じ規則である。
-    """
+    """テキストを 1 行の診断に収まる形にエスケープする（改行を `\\n` に）。"""
     return ''.join(_ASMTEXT_SHOW.get(c, c) for c in s)
 
 
 class ObjectGenerator:
-    """パターンのエンコーディング欄を評価してワード列を作る。
-    
-      replace_percent_with_index  `%%` を 0,1,2,... の連番に置き換える
-      e_p                         `@@[個数, 式]` を個数分だけ展開する
-      makeobj                     カンマ区切りの各式を評価してワード列にする
-    
-    `;` で始まる要素は条件付き出力で、値が 0 なら何も出さない
-    （x86 の REX プレフィックスの有無のような分岐に使う）。
+    """`binary_list`（出力欄）から、その行のワード列を作る。
+
+    欄の要素はカンマ区切りで、数値式のほか、文字列テンプレート `"..."`、
+    繰り返し `@@[n,...]`、ミニ言語の呼び出し `.call f(...)` が書ける。
+    要素の頭の `;` はその値が 0 なら出力を抑え、`;;` は評価だけして捨てる。
+    空要素はアラインメントになる。
     """
 
     def __init__(self, state, expr_eval, binary_writer):
@@ -7610,12 +7068,14 @@ class ObjectGenerator:
         self.binary_writer = binary_writer
 
     def replace_percent_with_index(self, s):
+        """`%%` を繰り返しインデックスの値に、`%0` をその 0 復帰に置き換える。
+
+        文字列リテラルの中は触らない。
+        """
         count = 0
         result = []
         i = 0
         while i < len(s):
-            # `"..."` の中身は文字列テンプレート（3.5.2）の材料なので、
-            # 連番置換の対象にせずそのまま写す。
             if s[i] == '"':
                 result.append(s[i])
                 i += 1
@@ -7640,6 +7100,10 @@ class ObjectGenerator:
         return ''.join(result)
 
     def e_p(self, pattern):
+        """`@@[n, 中身]` の繰り返しを展開する。返り値は (展開後, 失敗したか)。
+
+        入れ子と文字列リテラルを数えながら対応する `]` を探す。
+        """
         result = []
         has_content = False
         i = 0
@@ -7651,7 +7115,6 @@ class ObjectGenerator:
                 comma_pos = -1
 
                 while i < len(pattern) and depth > 0:
-                    # `"..."` の中の `[` `]` `,` は区切りとして数えない。
                     if pattern[i] == '"':
                         i += 1
                         while i < len(pattern):
@@ -7675,12 +7138,6 @@ class ObjectGenerator:
                     expr = pattern[expr_start:comma_pos]
                     rep_pattern = pattern[comma_pos + 1:i]
 
-                    # 破綻点修正: 繰り返し回数の未定義判定のために旗を降ろした
-                    # まま復元していなかったため、オペランド捕捉の段階で立った
-                    # 「未定義ラベルを踏んだ」という情報が、`@@[]` を含むパターン
-                    # では必ず消えていた。makeobj() は e_p() の呼び出し「後」に
-                    # 旗を退避するので、呼び出し元の状態ごと失われ、未定義ラベル
-                    # を含む命令が診断なしで 0 として出力されていた。
                     _rep_prior = self.state.error_undefined_label
                     self.state.error_undefined_label = False
                     n, idx = self.expr_eval.expression_pat(expr, 0)
@@ -7694,8 +7151,6 @@ class ObjectGenerator:
                     except (ValueError, OverflowError):
                         n_int = 0
                     if n_int > _N_MAX:
-                        # 表示だけで had_error を立てないと、切り詰めた誤った
-                        # バイト列がそのまま出力されてしまうので失敗扱いにする。
                         self.state.diag(f" error - @@[n,...]: repeat count {n_int} exceeds maximum {_N_MAX}.", set_error=True)
                         n_int = 0
                     if n_int > 0:
@@ -7713,7 +7168,6 @@ class ObjectGenerator:
                     result.append('@@[')
                     has_content = True
             elif pattern[i] == '"':
-                # `"..."` の中は `@@[` の展開対象にせず、そのまま写す。
                 result.append(pattern[i]); i += 1
                 has_content = True
                 while i < len(pattern):
@@ -7731,17 +7185,15 @@ class ObjectGenerator:
         return ''.join(result), not has_content
 
     def _mini_diag(self, msg):
-        # 命令長を測るだけの試し打ちでも makeobj が走るので、同じエラーが
-        # 二重に出る。試し打ちのときは黙って、本番の評価でだけ報告する。
+        """ミニ言語からのエラーを診断として出す。"""
         if not self.state._pass1_size_mode:
             self.state.diag(msg, set_error=True)
 
     def mini_call(self, s, idx):
-        """`binary_list` 欄の `.call 名前(引数, ...)` を実行し、(ワード列, 次の位置)。
+        """`.call 名前(引数, ...)` を実行し、生まれたワード列を返す。
 
-        引数はパターン層の式として評価するので、`a` や `b` は捕捉済みの
-        パターン変数を指す。未定義ラベル由来の値は 0 として渡す。パス1で
-        大きさを測るときに、番兵の巨大な値で反復回数が爆発しないようにするため。
+        引数は呼び出し側（パターン行）の式なので、ここでパターン変数が
+        解決されてから関数へ渡る。関数の内側ではそれが引数になる。
         """
         idx += 5
         idx = StringUtils.skipspc(s, idx)
@@ -7785,7 +7237,6 @@ class ObjectGenerator:
             if arg_text_z[a] == ',':
                 a += 1
                 continue
-            # `[式, 式, ...]` は配列の引数。要素もパターン層の式。
             if arg_text_z[a] == '[':
                 v, a = self._mini_arg_array(arg_text_z, a, name)
                 if v is None:
@@ -7814,16 +7265,12 @@ class ObjectGenerator:
             return [], idx
         finally:
             sys.setrecursionlimit(saved_reclimit)
-        # 返り値もワードになる。配列なら添字 0 から順に、スカラーなら 1 ワード。
         if ret is not None:
             words = words + (list(ret) if isinstance(ret, list) else [ret])
         return words, idx
 
     def _mini_arg_array(self, t, a, name):
-        """`.call` の引数欄の `[式, 式, ...]` を読んで配列の値にする。
-
-        戻り値は (要素のリスト, `]` の次の位置)。読めなければ (None, 末尾)。
-        """
+        """`[e1, e2, ...]` と書かれた引数を配列として評価する。"""
         depth = 0
         k = a
         while k < len(t) and t[k] != chr(0):
@@ -7857,47 +7304,16 @@ class ObjectGenerator:
             break
         return out, k + 1
 
-    # ==================== 文字列テンプレートのエンコーディング欄 ====================
-    # パターンの3欄目が `"..."` で始まるとき、その行は式の並びではなく
-    # 「アセンブリ結果のテキスト」を作る。別の書式のニーモニックへ書き換える
-    # ための欄で、たとえば
-    #
-    #     MOV R!r,!e:: "LD R{{r}},0x{{.hex(e)}}"
-    #
-    # に `MOV R1,0x10` を与えると `LD R1,0x10` を出す。
-    #
-    # 置き換わるのは `{{ }}` で囲んだところだけで、それ以外は書いたままの字
-    # が出る。`{{ }}` の中には
-    #   - `式`                          … 評価して10進で埋める
-    #   - `.hex(式)` `.dec(式)` `.bin(式)` `.float(式)`
-    #                                   … 16進/10進/2進/浮動小数の文字列にする
-    #                                     （桁だけで、`0x` などの接頭辞は付か
-    #                                      ないので、要るなら外に書く）
-    #   - `名前` `名前[添字]`           … 文字列シンボル／配列シンボル、
-    #                                     どちらでもなければパターン変数の値
-    #   - `.index 名前[添字]`           … その参照が使う添字そのもの
-    #                                     （名前から番号を引くのに使う）
-    #                                     （添字は名前・`"名前"`・式のいずれでもよい）
-    #   - `.exp(変数)`                  … `!L変数` が拾った式・ラベルを、ソースに
-    #                                     書かれていたままの文字で出す
-    # が書ける。文字列の外と同じく `\n` `\t` `\r` `\\` `\"` は解く。
-    #
-    # 組み上がったテキストはそのままバイナリとしても出る。`.ascii` と同じく
-    # UTF-8 の 1 バイトが 1 ワードになり、ロケーションカウンタもその分進んで
-    # バイナリ／ELF 出力に載る。標準出力へのテキスト出力（トランスレータと
-    # しての使い方）はそのまま残るので、同じパターンで両方が得られる。
     _TXT_CONVS = (('float', 3), ('hex', 0), ('dec', 1), ('bin', 2))
 
     @staticmethod
     def _arr_split(q):
-        """`[...]` の中身を項目の文字列に切る。
+        """配列リテラルをトップレベルのカンマで項目に割る。
 
-        区切りは最上位のカンマだけで、`"..."` の中や入れ子の括弧の中のカンマは
-        区切りにしない（`[1,(2,3)]` のような書き方で崩れないようにするため）。
-        caxx.c の arrsym_set_from_text() と同じ規則である。
+        `"..."` の中や入れ子の括弧・ブラケットの中のカンマでは割らない。
         """
         items = []
-        i = 1                      # `[` の次から
+        i = 1
         n = len(q)
         while i < n:
             while i < n and q[i] in ' \t':
@@ -7936,7 +7352,7 @@ class ObjectGenerator:
 
     @staticmethod
     def _txt_template_inner(q):
-        r"""`"..."` の中身を取り出す。`\` は残して展開側に任せる。"""
+        """文字列テンプレートの外側のダブルクォートを外す。"""
         out = []
         i = 1
         while i < len(q):
@@ -7949,7 +7365,7 @@ class ObjectGenerator:
 
     @staticmethod
     def _txt_radix(v, radix):
-        """radix 進の桁だけの文字列。接頭辞は付けず、負なら `-` を付ける。"""
+        """値をその基数の数字だけで書く（基数プレフィックスは付けない）。"""
         n = int(v)
         neg = n < 0
         if neg:
@@ -7964,16 +7380,11 @@ class ObjectGenerator:
                 n //= radix
         return ('-' + body) if neg else body
 
-    # `.float(式)` は値を10進128ビット浮動小数点数（有効数字34桁）として書く。
     _TXT_FLOAT_PREC = 34
 
     @classmethod
     def _txt_float_parts(cls, neg, digits, exp10):
-        """digits を d1.d2d3… ×10^exp10 と読んで文字列にする。
-
-        指数が小さいうちは普通の小数表記にし、小数部が無ければ `.0` を付ける
-        （16 なら `16.0`）。caxx.c の txt_float_emit() と同じ規則である。
-        """
+        """`.float` の出力を、符号・数字列・指数から組み立てる。"""
         digits = digits.rstrip('0') or '0'
         n = len(digits)
         if -6 <= exp10 < cls._TXT_FLOAT_PREC:
@@ -7991,7 +7402,12 @@ class ObjectGenerator:
 
     @classmethod
     def _txt_float(cls, v):
-        """整数・実数のどちらで束縛された値でも、34桁に丸めて書く。"""
+        """`{{.float(x)}}` — 値を 10 進 128bit 浮動小数点として書く。
+
+        有効数字 34 桁、偶数丸め。小数部が無い値にも小数部を付けるので
+        `16` は `16.0` になる。34 桁を超える場合と極端に小さい値では
+        指数形式に切り替わる。両実装が同じテキストを出す必要がある。
+        """
         prec = cls._TXT_FLOAT_PREC
         if isinstance(v, float):
             if v != v or v in (float('inf'), float('-inf')):
@@ -8001,12 +7417,11 @@ class ObjectGenerator:
             d = Context(prec=prec).create_decimal(Decimal(int(v)))
         sign, digits, dexp = d.as_tuple()
         digits = ''.join(str(x) for x in digits) or '0'
-        # as_tuple() の指数は最下位桁の重み。d1.d2… ×10^exp10 の形へ直す。
         return cls._txt_float_parts(sign == 1, digits, len(digits) - 1 + dexp)
 
     @staticmethod
     def _txt_close_paren(s, i):
-        """丸括弧の対応を取り、閉じ括弧の位置を返す。無ければ -1。"""
+        """対応する `)` の位置を返す。"""
         depth = 0
         while i < len(s):
             if s[i] == '(':
@@ -8020,7 +7435,7 @@ class ObjectGenerator:
 
     @classmethod
     def _txt_conv_name(cls, s):
-        """`.hex` などなら (名前の長さ, 種別) を返す。違えば (0, -1)。"""
+        """`{{ }}` の中の変換名（`.hex` `.dec` `.bin` `.float` ...）を読む。"""
         u = StringUtils.upper(s)
         for name, kind in cls._TXT_CONVS:
             if u.startswith(StringUtils.upper(name)) and s[len(name):len(name) + 1] == '(':
@@ -8028,7 +7443,7 @@ class ObjectGenerator:
         return 0, -1
 
     def _txt_emit_expr(self, parts, expr, kind):
-        """式を評価し、kind に従って parts に積む。"""
+        """`{{ }}` の 1 個を評価して、テキストとして積む。"""
         saved_undef = self.state.error_undefined_label
         self.state.error_undefined_label = False
         v, _ = self.expr_eval.expression_pat(expr, 0)
@@ -8046,14 +7461,19 @@ class ObjectGenerator:
             parts.append(self._txt_radix(v, 10))
 
     def _txt_render(self, s):
-        """テンプレート本文を展開して文字列にする。"""
+        """文字列テンプレートを展開して、出来上がったテキストを返す。
+
+        置き換えるのは `{{ }}` の中だけで、それ以外はバックスラッシュ
+        エスケープを除いて書いたままの文字が出る。`{{ }}` の中に単独で
+        書かれた名前は、文字列シンボル → 配列シンボル → 式の順で解決する。
+        数値の `.setsym` シンボルは 1 番目では引かないので、ただの単語が
+        黙って数値に化けることはない（欲しいときは `{{#NAME}}`）。
+        """
         parts = []
         i = 0
         while i < len(s):
             c = s[i]
             if c == '\\' and i + 1 < len(s):
-                # `.ascii` と同じ逃げ方をする制御文字だけを解き、それ以外の
-                # `\x` は x をそのままの字として出す（小文字の逃げ道）。
                 parts.append(_TXT_ESCAPES.get(s[i + 1], s[i + 1])); i += 2; continue
             if s.startswith('{{', i):
                 e = s.find('}}', i + 2)
@@ -8065,13 +7485,11 @@ class ObjectGenerator:
                     j += 1
                 done = False
                 if inner[j:j + 1] == '.':
-                    # `.exp(変数)` は `!L変数` が拾った式・ラベルの文字そのもの。
                     en = self._txt_exp_call(inner[j + 1:])
                     if en is not None:
                         parts.append(self._txt_exp_text(en))
                         done = True
                 if not done and inner[j:j + 1] == '.':
-                    # `.index 配列[式]` は、その参照が使う添字そのものを返す。
                     nm, ix = self._txt_index_call(inner[j + 1:])
                     if nm is not None:
                         parts.append(self._txt_index_text(nm, ix))
@@ -8084,13 +7502,11 @@ class ObjectGenerator:
                             self._txt_emit_expr(parts, inner[j + 1 + nl + 1:cp], kind)
                             done = True
                 if not done:
-                    # `{{x[3]}}` のように名前と添字なら、配列シンボルを引く。
                     nm, ix = self._txt_bare_indexed(inner)
                     if nm is not None:
                         parts.append(self._txt_indexed_text(nm, ix))
                         done = True
                 if not done:
-                    # `{{x}}` のように名前ひとつなら、文字列／配列シンボルを先に見る。
                     bare = self._txt_bare_name(inner)
                     if bare is not None and (bare in self.state.strsymbols
                                              or bare in self.state.arrsymbols):
@@ -8106,7 +7522,7 @@ class ObjectGenerator:
 
     @classmethod
     def _txt_bare_indexed(cls, inner):
-        """`{{...}}` の中身が `名前[式]` だけなら (名前, 添字の式) を返す。"""
+        """`{{名前[式]}}` の形か調べて、名前と添字に割る。"""
         t = inner.strip()
         if not t.isascii() or not t[:1].isalpha() and t[:1] != '_':
             return None, None
@@ -8125,7 +7541,7 @@ class ObjectGenerator:
 
     @staticmethod
     def _txt_bare_name(inner):
-        """`{{...}}` の中身が名前ひとつだけなら、大文字化した名前を返す。"""
+        """`{{名前}}` の形か調べて、その名前を返す。"""
         t = inner.strip()
         if not t.isascii() or not (t[:1].isalpha() or t[:1] == '_'):
             return None
@@ -8135,29 +7551,13 @@ class ObjectGenerator:
         return StringUtils.upper(t)
 
     def _txt_name_text(self, name):
-        """テンプレートの中の名前を解決する。
-
-        優先順位は
-          1. `.setsym::名前::"文字列"` の文字列シンボル … その文字列
-          2. 変数として使われている名前                 … パターン変数の値（10進）
-          3. どれでもない                               … 書かれたままの文字
-        で、`Rr` の `r` は 2 に、`{{x}}` の `x` は 1 に当たる。
-        数値シンボルをここで引かないのは、`num=` のような普通の文（たまたま
-        `.setsym::NUM` がある）が黙って数字に化けるのを避けるため。数値が要る
-        ときは `{{#NUM}}` と書けば本体の式評価器が引く。
-        caxx.c の txt_emit_name() と同じ規則である。
-        """
+        """`{{名前}}` を解決してテキストにする。"""
         key = StringUtils.upper(name)
         if key in self.state.strsymbols:
             return self.state.strsymbols[key]
-        # 添字なしの配列は、全項目を `,` でつないで出す。
         if key in self.state.arrsymbols:
             return ','.join(v if isinstance(v, str) else self._txt_radix(v, 10)
                             for v in self.state.arrsymbols[key])
-        # パターン変数（`a` でも `var_2` でも同じ規則）。パターンファイルが
-        # その名前を変数として使っていれば値を、そうでなければ書かれたままの
-        # 文字を出す。ふつうの単語が黙って数字に化けないようにするためで、
-        # 変数と決まっている名前が未束縛なら 0 になる。
         _v = name.lower()
         if _v == name and _v in self.state.varnames:
             return self._txt_radix(self.state.vars.get(_v, VAR_UNDEF), 10)
@@ -8165,7 +7565,7 @@ class ObjectGenerator:
 
     @staticmethod
     def _txt_close_bracket(s, i):
-        """名前の直後の `[...]` の閉じ位置を返す。無ければ -1。"""
+        """対応する `]` の位置を返す。"""
         depth = 0
         while i < len(s):
             if s[i] == '[':
@@ -8178,11 +7578,7 @@ class ObjectGenerator:
         return -1
 
     def _txt_indexed_text(self, name, idxtext):
-        """`x[3]` のような添字つきの参照。添字は 0 から数える。
-
-        配列でない名前や範囲外の添字は診断して空文字を返す。添字の解き方は
-        `_arr_index_of()` にまとめてあり、`.index` と同じである。
-        """
+        """`{{配列[添字]}}` を解決してテキストにする。"""
         key = StringUtils.upper(name)
         if key not in self.state.arrsymbols:
             self.state.diag(f" error - '{key}' is not an array symbol; "
@@ -8197,16 +7593,12 @@ class ObjectGenerator:
 
     @classmethod
     def _txt_index_call(cls, s):
-        """`.index 配列[式]` なら (配列名, 添字の式) を返す。違えば (None, None)。
-
-        `.index(配列[式])` と括弧で括って書いてもよい。
-        caxx.c の txt_index_call() と同じ規則である。
-        """
+        """`{{.index 名前[添字]}}` と `{{.index(名前[添字])}}` の両方を読む。"""
         if StringUtils.upper(s[:5]) != 'INDEX':
             return None, None
         rest = s[5:]
         if rest[:1] not in (' ', '\t', '('):
-            return None, None          # `.indexof` のような別の名前
+            return None, None
         rest = rest.strip()
         if rest.startswith('('):
             cp = cls._txt_close_paren(rest, 0)
@@ -8216,10 +7608,11 @@ class ObjectGenerator:
         return cls._txt_bare_indexed(rest)
 
     def _txt_index_text(self, name, idxtext):
-        """`.index 配列[式]` の値。0 から数えた添字を10進で返す。
+        """`{{.index 配列[添字]}}` — 項目ではなく添字そのものを 10 進で書く。
 
-        `{{arr[e]}}` が引く項目の、その添字そのものである。配列でない名前や
-        解けない添字は診断して空文字を返す。
+        添字の解決は項目を引くときと同じ規則（文字列シンボル → パターン変数
+        → その配列の項目名、無ければ同名の数値シンボル → ふつうの式）。
+        名前から番号への引き当てがこれで書ける。
         """
         key = StringUtils.upper(name)
         if key not in self.state.arrsymbols:
@@ -8232,17 +7625,12 @@ class ObjectGenerator:
 
     @classmethod
     def _txt_exp_call(cls, s):
-        """`.exp(変数)` なら変数名を返す。違えば None。
-
-        中に書けるのは変数名ひとつだけで、式は書けない。`!L変数` が拾った
-        「ソースに書かれていたままの式・ラベルの文字」を指す名前である。
-        caxx.c の txt_exp_call() と同じ規則である。
-        """
+        """`{{.exp(変数)}}` の形を読む。"""
         if StringUtils.upper(s[:3]) != 'EXP':
             return None
         rest = s[3:]
         if rest[:1] not in (' ', '\t', '('):
-            return None                # `.expand` のような別の名前
+            return None
         rest = rest.strip()
         if rest[:1] != '(':
             return None
@@ -8251,15 +7639,11 @@ class ObjectGenerator:
             return None
         nm = rest[1:cb].strip()
         if not nm or PatternMatcher._var_name_at(nm, 0) != len(nm):
-            return None                # 変数名でなければ `.exp` ではない
+            return None
         return nm
 
     def _txt_exp_text(self, name):
-        """`.exp(変数)` の中身。`!L変数` が拾った文字をそのまま返す。
-
-        その行で拾っていなければ（省略可部分に入っていた等）空文字を返す。
-        そもそも変数として使われていない名前なら書き損じなので診断する。
-        """
+        """`{{.exp(変数)}}` — `!L` が覚えた綴りを、ソースに書かれていたまま出す。"""
         if name not in self.state.varnames:
             self.state.diag(f" error - '{name}' is not a pattern variable; "
                             f"'.exp({name})' needs '!L{name}' in the "
@@ -8269,12 +7653,9 @@ class ObjectGenerator:
 
     @staticmethod
     def _txt_quoted_text(t):
-        """欄が `"..."` ひとつだけなら、逃げ方を解いた中身を返す。でなければ None。
+        """添字に書かれた文字列リテラルを、その中身に開く。
 
-        `.index arrb["CX"]` の `"CX"` のように、名前をそのまま書くための形である。
-        テンプレートの中では `"` が文字列の終わりなので `\"CX\"` と逃がして書く
-        ことになる。その形も同じに受ける。
-        caxx.c の txt_quoted_text() と同じ規則である。
+        これがあるので `arrb["CX"]` は `arrb[CX]` と同じに読まれる。
         """
         if t.startswith('\\"'):
             delim = '\\"'
@@ -8290,23 +7671,14 @@ class ObjectGenerator:
             if t[i] == '\\' and i + 1 < len(t):
                 out.append(_TXT_ESCAPES.get(t[i + 1], t[i + 1])); i += 2; continue
             out.append(t[i]); i += 1
-        return None                    # 閉じ `"` が無い
+        return None
 
     def _arr_index_of(self, key, idxtext):
-        """添字の欄を配列 key の添字（0 起点）に解く。解けなければ None。
+        """配列の添字を解決して整数にする。
 
-        まず `"..."` と書かれた欄はその中身に開く（`arrb["CX"]` は `arrb[CX]` と
-        同じに読む）。そのうえで
-          1. 文字列シンボルの名前ひとつ … その文字列を添字の欄として読み直す
-          2. パターン変数の名前ひとつ   … 4 へ（変数の値で引く）
-          3. 配列の項目名そのもの       … その項目の位置
-             それが無ければ同じ名前の `.setsym`／`.map` の数値シンボル … その値
-          4. どれでもない               … ふつうの式として評価した値
-        の順に解く。`.setsym::var1::BX` のときの `arrb[var1]` は 1 を通り、`BX`
-        が `.map::r::AX,BX,CX` で 1 になっているので添字 1 になる。`arrb["CX"]`
-        なら同じく 3 の後半で 2 になる。名前の並びをそのまま持つ配列
-        （`[AX,BX,CX]`）なら 3 の前半で位置が決まる。
-        caxx.c の txt_arr_index_of() と同じ規則である。
+        順序は、文字列シンボルの名前（中身を添字として読み直す）、
+        パターン変数（その値）、その配列の項目名（その位置）、無ければ
+        同名の `.setsym` / `.map` の数値シンボル、どれでもなければ式。
         """
         arr = self.state.arrsymbols[key]
         t = (idxtext or '').strip()
@@ -8317,8 +7689,6 @@ class ObjectGenerator:
         if nm is not None and nm in self.state.strsymbols:
             t = self.state.strsymbols[nm].strip()
             nm = self._txt_bare_name(t)
-        # 変数の綴り（小文字で書かれ、パターンファイルが変数として使っている
-        # 名前）は、名前ではなく値として読む。
         _v = t.lower()
         is_var = (_v == t and _v in self.state.varnames)
         if nm is not None and not is_var:
@@ -8336,7 +7706,7 @@ class ObjectGenerator:
         return self._arr_index_check(key, arr, v)
 
     def _arr_index_check(self, key, arr, v):
-        """添字が配列の範囲に入っていれば int で返す。外なら診断して None。"""
+        """添字が範囲内かを検査する。範囲外はエラーとして報告する。"""
         try:
             n = int(v)
         except (OverflowError, ValueError, TypeError):
@@ -8348,9 +7718,14 @@ class ObjectGenerator:
         return n
 
     def makeobj(self, s):
-        # 行に現れた `"..."` の展開結果をつないでおく。_txtacc は素のまま流す
-        # 用（トランスレータとしての使い方）、_dispacc は -v の診断行に見せる
-        # 用で、`"A","B"` のように欄に書いたとおり分けて括る。
+        """`binary_list` を評価して、その行のワード列を返す。
+
+        先に `@@[]` の繰り返しと `%%` の添字を展開し、残りをカンマで 1 要素ずつ
+        見る。要素はダブルクォートならテキストテンプレート（UTF-8 の 1 バイトが
+        1 ワードになる。ワード幅を超えるバイトは警告して切る）、`.call` なら
+        ミニ言語、空ならアラインメント、ほかは式。`;` 付きは値が 0 のとき、
+        文字列なら描画結果が空のときに飛ばし、`;;` 付きは評価して捨てる。
+        """
         _txtacc = []
         _dispacc = []
 
@@ -8381,24 +7756,19 @@ class ObjectGenerator:
                 if s[idx] == ';':
                     semicolon = True
                     idx += 1
-                    # `;;要素` は評価だけして何も出さない。
                     if idx < len(s) and s[idx] == ';':
                         drop = True
                         idx += 1
 
-                # `"..."` はテキストとして展開し、そのバイト列をワードとして出す。
                 _qs = idx
                 while _qs < len(s) and s[_qs] in ' \t':
                     _qs += 1
                 if _qs < len(s) and s[_qs] == '"':
-                    # s の末尾には番兵の chr(0) が付いている。閉じ `"` を欠く
-                    # 文字列でそれを拾わないよう、最初の chr(0) で切る。
                     _src = s[_qs:]
                     _nul = _src.find(chr(0))
                     if _nul >= 0:
                         _src = _src[:_nul]
                     _txt = self._txt_render(self._txt_template_inner(_src))
-                    # `;;` は何も出さず、`;` は中身が空なら出さない。
                     if not (drop or (semicolon and _txt == '')):
                         _word_mask = (1 << self.state.bts) - 1 if self.state.bts > 0 else 0xFF
                         _vals = list(_txt.encode('utf-8', errors='surrogateescape'))
@@ -8411,7 +7781,6 @@ class ObjectGenerator:
                         objl += _vals
                         _txtacc.append(_txt)
                         _dispacc.append('"%s"' % asmtext_escaped(_txt))
-                    # 閉じ `"` の次まで読み飛ばす。
                     _closed = False
                     idx = _qs + 1
                     while idx < len(s) and s[idx] != chr(0):
@@ -8433,12 +7802,8 @@ class ObjectGenerator:
 
                 if StringUtils.upper(s[idx:idx + 5]) == '.CALL' and (
                         idx + 5 >= len(s) or s[idx + 5] not in _SYM_CORE):
-                    # 引数はふつうのパターン式なので、ここでも何ワード目かを
-                    # 立てておく。そうしないと `.call` に渡したラベル参照が
-                    # 追跡されず、`.reloc` を宣言してもリロケーションが出ない。
                     self.state._elf_current_word_idx = len(objl)
                     words, idx = self.mini_call(s, idx)
-                    # `;` 付きは、出したワードが 1 個で 0 のときだけ何も出さない。
                     if drop or (semicolon and len(words) == 1 and words[0] == 0):
                         words = []
                     if not words:
@@ -8490,10 +7855,10 @@ class ObjectGenerator:
 
 
 def bare_name_of(text):
-    """欄が識別子ひとつなら、その名前を書かれたまま返す。でなければ None。
+    """欄が「裸の名前」1 個だけなら、その綴りを返す。でなければ None。
 
-    先頭は英字か `_`、続きは英数字か `_` で、前後の空白は無視する。
-    caxx.c の bare_name_of() と同じ規則である。
+    綴りはそのまま保つ（大文字化しない）。配列シンボルの項目が書かれた
+    ままの綴りで残るのはこれが理由。
     """
     t = (text or '').strip()
     if not t.isascii() or not (t[:1].isalpha() or t[:1] == '_'):
@@ -8505,16 +7870,10 @@ def bare_name_of(text):
 
 
 def arr_items_from_text(expr_eval, q):
-    """`.setsym` の `[...]` を項目の並びにする。
+    """`[...]` の中身を配列シンボルの項目リストにする。
 
-    項目は
-      - `"文字列"`           … そのまま文字列 (str)
-      - 素の名前（`R0` など） … 書かれたままの文字列 (str)
-      - それ以外              … 式として評価した数値
-    になる。`[R0,R1,R2]` と `["R0","R1","R2"]` が同じ意味になるのは2番目の枝で、
-    名前は綴りをそのまま持つ（`[r0,r1]` なら小文字のまま出る）。その名前に
-    `.setsym`／`.map` で与えた数値が要るときは `[#R0,#R1]` と書く。
-    caxx.c の arrsym_set_from_text() と同じ規則である。
+    `"..."` は文字列、裸の名前は綴りのままの文字列、それ以外は式として
+    評価した数値。空の項目は 0。
     """
     out = []
     for item in ObjectGenerator._arr_split(q):
@@ -8534,12 +7893,7 @@ def arr_items_from_text(expr_eval, q):
 
 
 def split_top_commas(text):
-    """文字列を最上位のカンマで切る。
-
-    括弧の中のカンマは区切りにしない（`*(x,1)` のような式がそのまま1項目に
-    なるようにするため）。深さの数え方は expression_esc() と同じで、閉じ括弧の
-    種類は厳密に照合しない。caxx.c の split_top_commas() と同じ規則である。
-    """
+    """トップレベルのカンマだけで割る。括弧・ブラケットの中では割らない。"""
     items = []
     buf = []
     depth = 0
@@ -8559,11 +7913,7 @@ def split_top_commas(text):
 
 
 def _set_name_token(t):
-    """集合の要素として書ける名前なら大文字化して返す。でなければ None。
-
-    数字で始まるものと空白を含むものは名前とみなさない。`.setsym::X::1,2` の
-    ような数式が集合に化けないようにするためである。
-    """
+    """集合リストの 1 項目として読める名前か。読めれば大文字化して返す。"""
     t = t.strip()
     if not t or not t.isascii() or t[0] in DIGIT:
         return None
@@ -8574,7 +7924,7 @@ def _set_name_token(t):
 
 
 def set_items_dedupe(items):
-    """並び順は保ったまま重複を落とす。集合なので同じ要素は1つだけ持つ。"""
+    """順序を保ったまま重複を落とす。最初に現れた位置が残る。"""
     out = []
     for it in items:
         if it not in out:
@@ -8583,10 +7933,11 @@ def set_items_dedupe(items):
 
 
 def set_literal_from_text(state, text):
-    """`名前,名前,…` を集合の項目にする。集合として読めなければ None。
+    """`r0,r1,r2` の形を集合として読む。
 
-    項目に既存の集合の名前を書くと、その中身をその場に展開する。
-    caxx.c の set_literal_from_text() と同じ規則である。
+    項目がそれ自体集合（配列シンボル）ならその場で展開する。名前でない項目が
+    1 つでもあれば None を返し、数値解釈へ譲る。2 項目以上ないと集合にしない
+    ので、単一の名前はコピーとして扱われる。
     """
     parts = split_top_commas(text)
     if len(parts) < 2:
@@ -8605,7 +7956,11 @@ def set_literal_from_text(state, text):
 
 
 def _set_operand(state, t):
-    """集合式の被演算子。素の識別子で、既にある集合ならその項目を返す。"""
+    """集合式のオペランドを読む。既存の集合を指す裸の識別子のみ。
+
+    `-` `&` `|` はシンボル名の中にも現れうるので、文字・数字・`_` だけで
+    綴られている場合に限って集合と認める。
+    """
     t = t.strip()
     if not t or not t.isascii():
         return None
@@ -8619,16 +7974,12 @@ def _set_operand(state, t):
 
 
 def set_expr_from_text(state, text):
-    """集合どうしの演算を評価する。集合式として読めなければ None。
+    """集合式 `a&b` `a|b` `a^b` `a+b` `a-b` を計算する。
 
-        a&b   積集合（and 集合）
-        a|b   和集合（or 集合）
-        a^b   対称差（xor 集合）
-        a+b   和集合
-        a-b   差集合
-
-    被演算子はすべて既にある集合であること。演算子は左から順に適用し、
-    優先順位は無い。caxx.c の set_expr_from_text() と同じ規則である。
+    演算子に固有の優先順位は無く、左から右へ適用するので `a&b|c` は
+    `(a&b)|c`。結果は毎回新しいリストなので、あとで `a` を再定義しても
+    影響せず、`.setsym::a::a|b` のような自己参照も安全。
+    集合として読めなければ None を返し、数値解釈へ譲る。
     """
     toks = []
     cur = []
@@ -8641,7 +7992,7 @@ def set_expr_from_text(state, text):
             cur.append(ch)
     toks.append(''.join(cur))
     if len(toks) < 3:
-        return None                     # 演算子が1つも無い
+        return None
     acc = _set_operand(state, toks[0])
     if acc is None:
         return None
@@ -8665,24 +8016,16 @@ def set_expr_from_text(state, text):
 
 
 def symbol_set_from_text(state, dst_upper, value_field):
-    """値欄が集合の書き方なら、その集合を作って True を返す。
+    """値欄を集合として解釈し、配列シンボルとして登録する。
 
-        .setsym::a::a1,a2,a3      名前の集合
-        .setsym::x::a&b           既にある集合どうしの演算
-
-    結果は写しなので、あとで元の集合を書き換えても影響しない。
-    caxx.c の symbol_set_from_text() と同じ規則である。
+    中身が変わったときだけ世代番号を進める。`.check` の名前一覧は配列
+    シンボルを参照するので、無駄に進めるとそのキャッシュが無意味に落ちる。
     """
     items = set_expr_from_text(state, value_field)
     if items is None:
         items = set_literal_from_text(state, value_field)
     if items is None:
         return False
-    # 同じ中身を入れ直すだけなら何もしない。パターン表のディレクティブ行は
-    # ソース1行ごとにたどり直されるので、同じ `.setsym::名前::A,B,…` が何度も
-    # 来る。表を作り直すと、それを元にしている `.check` の控えまで捨てて
-    # しまうので、中身が変わらないときは表も世代番号も動かさない。
-    # caxx.c の arrsym_install() と同じ。
     if state.arrsymbols.get(dst_upper) == items:
         return True
     state.arrsymbols[dst_upper] = items
@@ -8691,17 +8034,11 @@ def symbol_set_from_text(state, dst_upper, value_field):
 
 
 def symbol_copy_from_name(state, dst_upper, value_field):
-    """値欄が「名前ひとつ」のときの `.setsym`。拾ったら True を返す。
+    """値欄が裸の名前のときの `.setsym`。
 
-    その名前が文字列／配列シンボルなら写しを作り（`.setsym::y::x`）、どちらでも
-    なければ「その名前そのもの」を指す文字列シンボルにする。つまり
-
-        .setsym::var1::BX
-
-    は `var1` が BX という名前を指す、という意味になり、`{{var1}}` は `BX` と
-    出る。名前に与えた数値が要るときは `#BX`、ラベルの値が要るときは `BX+0` の
-    ように式にして書く（素の名前はここで文字列として拾われる）。
-    caxx.c の symbol_copy_from_name() と同じ規則である。
+    その名前が配列シンボルか文字列シンボルならコピーし（独立したコピーなので
+    元を再定義しても変わらない）、どちらでもなければ「その名前を保持する
+    文字列シンボル」にする。名前を持ち回って添字に使えるのはこれのため。
     """
     t = bare_name_of(value_field)
     if t is None:
@@ -8709,7 +8046,6 @@ def symbol_copy_from_name(state, dst_upper, value_field):
     src = StringUtils.upper(t)
     if src in state.arrsymbols:
         if src != dst_upper:
-            # 項目は数値か文字列なので、浅い複製で独立した配列になる。
             state.arrsymbols[dst_upper] = list(state.arrsymbols[src])
             state.arrgen += 1
         return True
@@ -8717,18 +8053,16 @@ def symbol_copy_from_name(state, dst_upper, value_field):
         if src != dst_upper:
             state.strsymbols[dst_upper] = state.strsymbols[src]
         return True
-    # どの表にも無い素の名前は、その名前そのものを指す文字列シンボルにする。
     state.strsymbols[dst_upper] = t
     return True
 
 
 class VLIWProcessor:
-    """`!!` 区切りで並んだ複数命令を1つの VLIW パケットに詰める。
-    
-    各スロットを vliwinstbits 幅のフィールドに詰め、余ったスロットは NOP で埋め、
-    EPIC ならスロットの組み合わせに対応するテンプレート値を合成して、
-    パケット幅ぶんのバイト列として出力する。
-    テンプレート幅が負のときはテンプレートをパケットの上位側に置く。
+    """VLIW / EPIC のバンドルを組み立てる。
+
+    ソースで `!!` で結合された命令をスロットに詰め、テンプレート欄と
+    ストップビットを付けてバンドル 1 個ぶんのワード列にする。
+    埋まらないスロットは `.vliw` で宣言した NOP で埋める。
     """
 
     def __init__(self, state, expr_eval, binary_writer):
@@ -8737,6 +8071,13 @@ class VLIWProcessor:
         self.binary_writer = binary_writer
 
     def vliwprocess(self, line, idxs, objl, flag, idx, lineassemble2_func):
+        """1 バンドルを組み立てて出力する。
+
+        各スロットを lineassemble2_func で個別にアセンブルし、得られた
+        インデックスコードの並びで `EPIC::` の宣言を引いてテンプレートを決める。
+        テンプレート幅が正なら右端、負なら絶対値を幅として左端に置く。
+        バイト順は `.bits::big/little` に従う。
+        """
         objs = [objl]
         idxlst = [idxs]
         self.state.vliwstop = 0
@@ -8778,10 +8119,6 @@ class VLIWProcessor:
                 im = 2 ** self.state.vliwinstbits - 1
                 tm = 2 ** abs(self.state.vliwtemplatebits) - 1
                 pm = 2 ** vbits - 1
-                # 破綻点修正: VLIW/EPIC テンプレート式が未定義値を踏んでも
-                # error_undefined_label は factor1 側で立つだけで、lineassemble2
-                # の通常経路と違ってここでは誰も had_error に変換していなかった。
-                # メッセージは出るのに exit 0 になり、不完全な出力が書かれていた。
                 _tmpl_prior_undef = self.state.error_undefined_label
                 self.state.error_undefined_label = False
                 x, idx = self.expr_eval.expression_pat(k[1], 0)
@@ -8871,14 +8208,10 @@ class VLIWProcessor:
 
 class AssemblyDirectiveProcessor:
     """アセンブリソース側のディレクティブを処理する。
-    
-    `.section`/`.endsection`、`.EQU`、`.RESB`/`.ZERO`（領域確保）、
-    `.ASCII`/`.ASCIZ`（文字列）、`.ORG`（配置アドレス）、`.ALIGN`、
-    `.global`/`.extern`（外部シンボル）など。
-    
-    領域確保や配置系は引数に未定義ラベルが混ざっていると意味を成さないため、
-    評価の直前に state.error_undefined_label を自分で降ろしてから評価し、
-    立っていたらエラーにする（LabelManager の「立てるだけ」規約との対）。
+
+    パターンファイルに関係なく常に使えるのはここにあるものだけで、`DB` の
+    ようなバイト出力ニーモニックは組み込みではない（パターンファイルが
+    定義したときだけ存在する）。
     """
 
     def __init__(self, state, expr_eval, binary_writer, label_manager, parser):
@@ -8889,6 +8222,7 @@ class AssemblyDirectiveProcessor:
         self.parser = parser
 
     def labelc_processing(self, l, ll):
+        """`.labelc` — ラベルに使える文字を増やす。"""
         if l.upper() != '.LABELC':
             return False
         if ll:
@@ -8896,6 +8230,10 @@ class AssemblyDirectiveProcessor:
         return True
 
     def label_processing(self, l):
+        """行頭の `label:` と `.equ` を処理する。
+
+        `.equ` で定義したラベルは再配置情報を失い、定数として扱われる。
+        """
         if l == "":
             return ""
 
@@ -8943,9 +8281,6 @@ class AssemblyDirectiveProcessor:
                 if self.state.error_undefined_label and self.state.should_report_errors():
                     self.state.diag(f" error - .EQU '{label}': expression contains undefined label.", set_error=True)
                 ok = self.label_manager.put_value(label, u, self.state.current_section, is_equ=True, reloc_type=reloc_type)
-                # テキスト置換モードでは `label: .equ 式` の行もテキストとして
-                # 出す。ラベルの綴りは lineassemble() が前に付け直し、残りの
-                # `.equ 式` はどのパターンにも当たらないので素通しで出る。
                 if self.state.textmode:
                     self.state.label_text = l[:lidx]
                     return l[lidx:]
@@ -8954,13 +8289,12 @@ class AssemblyDirectiveProcessor:
                 ok = self.label_manager.put_value(label, self.state.pc, self.state.current_section, is_equ=False)
                 if ok is False:
                     return ""
-                # テキスト置換モードでは、落とした `label:` を出力の先頭に
-                # 付け直すため、書かれていたとおりの綴りを覚えておく。
                 self.state.label_text = l[:lidx]
                 return l[lidx:]
         return l
 
     def asciistr(self, l2):
+        """`.ascii` / `.asciz` の文字列をバイト列にする。"""
         idx = 0
         if l2 == '' or l2[idx] != '"':
             return False
@@ -8971,7 +8305,7 @@ class AssemblyDirectiveProcessor:
 
         while idx < len(l2) and not l2[idx] == '"':
             ch = None
-            _is_literal = False   # ソース中の生の文字か、エスケープ由来か
+            _is_literal = False
             if l2[idx:idx + 2] == '\\0':
                 idx += 2
                 ch = chr(0)
@@ -9023,14 +8357,6 @@ class AssemblyDirectiveProcessor:
                 idx += 1
                 _is_literal = True
             if ch is not None:
-                # 破綻点修正: 以前は文字を常に ord(ch)（コードポイント）1個として
-                # 出力していたため、ソースに直接書かれた非ASCII文字が語長で
-                # 切り捨てられ無意味な値になっていた（"こ"=U+3053 → 0x53）。
-                # アセンブラとしては元のバイト列をそのまま置くのが正しく、
-                # caxx.c もそう動く（C はバイト列で処理するため自然にそうなる）。
-                # ソース中の生の文字だけを UTF-8 バイト列に展開する。
-                # \xHH などのエスケープは「バイト値の指定」なので1バイトのまま扱う
-                # （ここを UTF-8 符号化すると \xFF が 2 バイトになってしまう）。
                 if _is_literal:
                     _vals = list(ch.encode('utf-8', errors='surrogateescape'))
                 else:
@@ -9049,13 +8375,10 @@ class AssemblyDirectiveProcessor:
         return True
 
     def export_processing(self, l1, l2):
+        """ラベルを TSV にエクスポートする指定を処理する。"""
         _l1u = StringUtils.upper(l1)
         if _l1u != ".EXPORT" and _l1u != ".GLOBAL":
             return False
-        # 破綻点修正: パス1では False（＝未処理）を返していたため、`.global foo`
-        # の行がパス1だけパターン照合へ流れ、たまたま一致するパターンがあると
-        # パス1でだけバイトが出てパス1/パス2のアドレスがずれた。
-        # ディレクティブとしては必ず消費し、記録だけをパス2/対話時に限る。
         if not (self.state.should_report_errors()):
             return True
 
@@ -9066,13 +8389,8 @@ class AssemblyDirectiveProcessor:
             s, idx = self.parser.get_label_word(l2, idx)
             if s == "":
                 break
-            # ラベル名の読み取りが `::` の1つめを食っていたら1文字戻す
-            # （`.extern` と同じ扱い）。
             if idx > 0 and l2[idx - 1] == ':' and idx < len(l2) and l2[idx] == ':':
                 idx -= 1
-            # `.global 名前::型名` — この名前への参照に使うリロケーション型を
-            # 指定できる。`.extern` と同じ書き方で、`.elftype` で決めた名前も
-            # マシンの名前表の名前も書ける。
             if idx < len(l2) and l2[idx:idx + 2] == '::':
                 idx += 2
                 _rt_start = idx
@@ -9106,6 +8424,7 @@ class AssemblyDirectiveProcessor:
     _RES_UNITS = {'.RESB': 1, '.RESW': 2, '.RESD': 4, '.RESQ': 8}
 
     def resb_processing(self, l1, l2):
+        """`.resb` / `.resw` / `.resd` / `.resq` — バイトを出さず領域だけ予約する。"""
         _directive = StringUtils.upper(l1)
         _mul = self._RES_UNITS.get(_directive)
         if _mul is None:
@@ -9132,6 +8451,7 @@ class AssemblyDirectiveProcessor:
         return True
 
     def zero_processing(self, l1, l2):
+        """`.zero` — ゼロバイトを並べる。"""
         if StringUtils.upper(l1) != ".ZERO":
             return False
         self.state.error_undefined_label = False
@@ -9157,11 +8477,13 @@ class AssemblyDirectiveProcessor:
         return True
 
     def ascii_processing(self, l1, l2):
+        """`.ascii` — 文字列のバイト列を出す。"""
         if StringUtils.upper(l1) != ".ASCII":
             return False
         return self.asciistr(l2)
 
     def asciiz_processing(self, l1, l2):
+        """`.asciz` — 文字列のバイト列と末尾の 0 を出す。"""
         if StringUtils.upper(l1) != ".ASCIZ":
             return False
         if not self.asciistr(l2):
@@ -9172,6 +8494,11 @@ class AssemblyDirectiveProcessor:
         return True
 
     def section_processing(self, l1, l2):
+        """`.section` / `.segment` — セクションを切り替える。
+
+        これがセクションを切り替える唯一の方法で、`.text` のような短縮形は
+        組み込みではない（単独で書けば構文エラー）。
+        """
         if StringUtils.upper(l1) != ".SECTION" and StringUtils.upper(l1) != ".SEGMENT":
             return False
 
@@ -9202,6 +8529,7 @@ class AssemblyDirectiveProcessor:
         return True
 
     def align_processing(self, l1, l2):
+        """`.align` — 整列する。引数なしなら前回（または既定）の値を使う。"""
         if StringUtils.upper(l1) != ".ALIGN":
             return False
 
@@ -9229,6 +8557,7 @@ class AssemblyDirectiveProcessor:
         return True
 
     def endsection_processing(self, l1, l2):
+        """`.endsection` / `.endsegment` — セクションを閉じる。"""
         if StringUtils.upper(l1) != ".ENDSECTION" and StringUtils.upper(l1) != ".ENDSEGMENT":
             return False
         if self.state.current_section not in self.state.sections:
@@ -9249,6 +8578,7 @@ class AssemblyDirectiveProcessor:
         return True
 
     def extern_processing(self, l1, l2):
+        """`.extern` / `.global` — シンボルを外部と結び付ける。"""
         if StringUtils.upper(l1) != ".EXTERN":
             return False
 
@@ -9266,11 +8596,6 @@ class AssemblyDirectiveProcessor:
             _em_ext = self.state.elf_machine
             _mach_tbl_ext = elf_machine_table(self.state)
             reloc_type = _mach_tbl_ext['extern_default']
-            # このEXTERN文自身が `::型名` を明示したかどうか。reloc_type は
-            # 明示指定が無ければデフォルト型で埋まってしまうため、reloc_type
-            # 自体では「明示されたか」を区別できない。既存ラベルの
-            # reloc_type_override は明示指定があったときだけ上書きしたいので、
-            # 別のフラグで覚えておく。
             explicit_reloc_type = False
             if idx < len(l2) and l2[idx:idx + 2] == '::':
                 idx += 2
@@ -9292,9 +8617,6 @@ class AssemblyDirectiveProcessor:
 
             existing = self.state.labels.get(label_part)
 
-            # 型名を書かなかった `.extern` の既定型は、パターンファイルの `.reloc`
-            # が命令フィールド型を決めた参照では使わない（ソースが型を「書いた」
-            # わけではないので、優先順位 3.7.8 の「ソースファイル」に当たらない）。
             if explicit_reloc_type:
                 self.state.extern_untyped.discard(label_part)
             elif existing is None:
@@ -9316,22 +8638,9 @@ class AssemblyDirectiveProcessor:
 
         return True
 
-    # ---- ELF シンボル属性のディレクティブ（マニュアル 5.6.1 節）-----------
-    #
-    # `.type`／`.size`／`.weak`／`.hidden`／`.protected`／`.internal`／
-    # `.other`／`.comm`。どれも「名前[::欄][::欄], 名前...」という同じ並びを
-    # 取るので、切り出しは _sym_decl_scan() に集めてある。宣言は出力にしか
-    # 効かないので、記録はパス2（と対話時）だけで行う。ただし `.weak` と
-    # `.comm` は名前を外部シンボルとして登録もするので、そこだけは `.extern`
-    # と同じくどのパスでも行う（パスによって登録が違うとアドレスがずれる）。
 
     def _sym_decl_scan(self, l2, nfields):
-        """`名前[::欄...]` をカンマ区切りで読み、(名前, [欄...]) を順に返す。
-
-        欄の切り方は `.extern 名前::型名` と同じで、`::` の直後から空白・
-        カンマ・`:` の手前までを1欄とする。欄を書かなかったところは '' に
-        なる。caxx.c の sym_decl_scan() と同じ規則である。
-        """
+        """シンボル属性ディレクティブの欄を切り出す。"""
         out = []
         idx = 0
         buf = l2 + chr(0)
@@ -9340,8 +8649,6 @@ class AssemblyDirectiveProcessor:
             name, idx = self.parser.get_label_word(buf, idx)
             if not name:
                 break
-            # ラベル名の読み取りが `::` の1つめを食っていたら1文字戻す
-            # （`.extern` と同じ扱い）。
             if idx > 0 and buf[idx - 1] == ':' and idx < len(buf) and buf[idx] == ':':
                 idx -= 1
             fields = []
@@ -9362,7 +8669,7 @@ class AssemblyDirectiveProcessor:
         return out
 
     def _sym_decl_num(self, dname, name, text, lo, hi):
-        """シンボル宣言の数値欄を評価する。読めないか範囲外なら診断して None。"""
+        """シンボル属性の数値欄を lo..hi の整数として読む。"""
         if not text:
             self.state.diag(f" error - {dname}: a number is required for '{name}'.",
                             set_error=True)
@@ -9383,12 +8690,7 @@ class AssemblyDirectiveProcessor:
         return v
 
     def _sym_declare_extern(self, name):
-        """名前を「他所で解決される外部シンボル」として登録する。
-
-        型名を書かなかった `.extern` とまったく同じ登録で、`.weak` と `.comm`
-        がまだ知らない名前を見たときに使う。すでに知っている名前には何もしない。
-        caxx.c の sym_declare_extern() と同じ規則である。
-        """
+        """その名前を外部シンボルとして登録する。"""
         if name in self.state.labels:
             return
         reloc_type = elf_machine_table(self.state)['extern_default']
@@ -9396,12 +8698,7 @@ class AssemblyDirectiveProcessor:
         self.state.labels[name] = [0, '.text', False, True, reloc_type]
 
     def type_processing(self, l1, l2):
-        """`.type <名前>::<種別>[, ...]` — シンボルの型（STT_*）。
-
-        種別は notype / object / func（function）/ section / file / common /
-        tls / gnu_ifunc（ifunc）、または 0〜15 の番号。大小は区別しない。
-        caxx.c の adir_type() と同じ規則である。
-        """
+        """`.type` — ELF シンボルの種別（STT_*）を書く。"""
         if StringUtils.upper(l1) != ".TYPE":
             return False
         if not self.state.should_report_errors():
@@ -9421,12 +8718,7 @@ class AssemblyDirectiveProcessor:
         return True
 
     def size_processing(self, l1, l2):
-        """`.size <名前>::<式>[, ...]` — シンボルの大きさ（st_size）。
-
-        式の値はワード数である。ラベルの値と同じく1ワードのバイト数を掛けて
-        バイト数にするので、8 ビット機では書いたままの数が入る。
-        caxx.c の adir_size() と同じ規則である。
-        """
+        """`.size` — シンボルの大きさを書く。値はワード数で、出力時に幅をかける。"""
         if StringUtils.upper(l1) != ".SIZE":
             return False
         if not self.state.should_report_errors():
@@ -9441,18 +8733,11 @@ class AssemblyDirectiveProcessor:
         return True
 
     def weak_processing(self, l1, l2):
-        """`.weak <名前>[, ...]` — 弱いシンボル（STB_WEAK）。
-
-        定義してある名前なら `.global` と同じく外へ出し、束縛だけ弱くする。
-        まだ知らない名前は型名なしの `.extern` と同じに登録するので、弱い
-        参照（解決できなければ 0 になる参照）がそのまま書ける。
-        caxx.c の adir_weak() と同じ規則である。
-        """
+        """`.weak` — 弱シンボルにする（バインドが STB_WEAK になる）。"""
         if StringUtils.upper(l1) != ".WEAK":
             return False
         _record = self.state.should_report_errors()
         for name, _f in self._sym_decl_scan(l2, 0):
-            # 登録はどのパスでも行う（パスによって違うとアドレスがずれる）。
             self._sym_declare_extern(name)
             if not _record:
                 continue
@@ -9460,7 +8745,6 @@ class AssemblyDirectiveProcessor:
             _lentry = self.state.labels.get(name, [])
             _is_imported = len(_lentry) > 3 and _lentry[3]
             if not _is_imported:
-                # ここで定義されている名前は `.global` と同じく外へ出す。
                 v = self.label_manager.get_value(name)
                 sec = self.label_manager.get_section(name)
                 is_equ = len(_lentry) > 2 and _lentry[2]
@@ -9470,12 +8754,7 @@ class AssemblyDirectiveProcessor:
     _VIS_DIRS = {'.HIDDEN': 2, '.PROTECTED': 3, '.INTERNAL': 1}
 
     def visibility_processing(self, l1, l2):
-        """`.hidden` / `.protected` / `.internal` `<名前>[, ...]` — 可視性。
-
-        st_other の下位 2 ビット（STV_*）だけを書き換える。上位のビットは
-        `.other` で書いたものがそのまま残る。
-        caxx.c の adir_visibility() と同じ規則である。
-        """
+        """`.hidden` / `.protected` / `.internal` — 可視性を書く。"""
         vis = self._VIS_DIRS.get(StringUtils.upper(l1))
         if vis is None:
             return False
@@ -9487,13 +8766,7 @@ class AssemblyDirectiveProcessor:
         return True
 
     def other_processing(self, l1, l2):
-        """`.other <名前>::<値>[, ...]` — st_other のバイトそのもの。
-
-        下位 2 ビットが可視性（STV_*）で、上位 6 ビットは機種ごとの意味を持つ
-        （PowerPC64 ELFv2 の局所入口のずれはビット 5〜7 にある）。可視性の
-        ディレクティブと違い、このバイトを丸ごと置き換える。
-        caxx.c の adir_other() と同じ規則である。
-        """
+        """`.other` — st_other バイトを丸ごと置き換える。"""
         if StringUtils.upper(l1) != ".OTHER":
             return False
         if not self.state.should_report_errors():
@@ -9506,19 +8779,11 @@ class AssemblyDirectiveProcessor:
         return True
 
     def comm_processing(self, l1, l2):
-        """`.comm <名前>::<大きさ>[::<整列>][, ...]` — 共通シンボル。
-
-        SHN_COMMON のシンボルを出す。実体はリンカが作るので、このオブジェクト
-        自身は領域を持たない。大きさはワード数（`.size` と同じ）、整列は
-        バイトで、書かなければ 1 になる。型は `.type` を書かなければ
-        STT_OBJECT(1) にする（GNU as と同じ）。
-        caxx.c の adir_comm() と同じ規則である。
-        """
+        """`.comm` — 共通シンボル（SHN_COMMON）にする。"""
         if StringUtils.upper(l1) != ".COMM":
             return False
         _record = self.state.should_report_errors()
         for name, f in self._sym_decl_scan(l2, 2):
-            # 登録はどのパスでも行う（`.weak` と同じ理由）。
             self._sym_declare_extern(name)
             if not _record:
                 continue
@@ -9540,10 +8805,11 @@ class AssemblyDirectiveProcessor:
             a[_SA_SIZE] = sz
             a[_SA_ALIGN] = al
             if a[_SA_TYPE] == 0:
-                a[_SA_TYPE] = 1          # STT_OBJECT
+                a[_SA_TYPE] = 1
         return True
 
     def reloctype_processing(self, l1, l2):
+        """`.reloctype` — このソースでの幅推測リロケーション型を上書きする。"""
         if StringUtils.upper(l1) != ".RELOCTYPE":
             return False
 
@@ -9580,6 +8846,10 @@ class AssemblyDirectiveProcessor:
         return True
 
     def org_processing(self, l1, l2):
+        """`.org` — ロケーションカウンタを設定する。
+
+        `,p` を付けると、カウンタが目標より下にある場合その隙間を埋める。
+        """
         if StringUtils.upper(l1) != ".ORG":
             return False
         self.state.error_undefined_label = False
@@ -9622,6 +8892,7 @@ _MACRO_KEYWORDS = frozenset((
 
 
 class MacroError(Exception):
+    """マクロ展開中のエラー。位置を含む文言を持つ。"""
 
     def __init__(self, msg):
         super().__init__(msg)
@@ -9629,20 +8900,24 @@ class MacroError(Exception):
 
 
 class _MacroBreak(Exception):
+    """`!break` を `!while` へ伝えるための内部例外。"""
     pass
 
 
 class _MacroContinue(Exception):
+    """`!continue` を `!while` へ伝えるための内部例外。"""
     pass
 
 
 class _MacroReturn(Exception):
+    """`!return` を呼び出し元へ伝えるための内部例外。値を持つ。"""
     def __init__(self, value):
         super().__init__(value)
         self.value = value
 
 
 class _MacroFunc:
+    """`!def` で定義されたマクロ 1 個。引数名、既定値、本文、定義位置。"""
 
     __slots__ = ('name', 'params', 'defaults', 'body', 'pos')
 
@@ -9655,11 +8930,7 @@ class _MacroFunc:
 
 
 def _sext_tick_at(s, i):
-    """`s[i]` の `'` が符号拡張の演算子か（右に幅が続くか）を見分ける。
-
-    文字定数 `'A'` と区別するため、本体の評価器と同じく「続く文字が数字か `(`」
-    を条件にする。`!{...}` の走査とマクロ式パーサの両方から使う。
-    """
+    """その位置の `'` が符号拡張演算子か（文字定数の引用符ではないか）。"""
     j = i + 1
     while j < len(s) and s[j] in ' \t':
         j += 1
@@ -9667,10 +8938,16 @@ def _sext_tick_at(s, i):
 
 
 def _fmt_pos(pos):
+    """診断に出す「ファイル:行」の形に整える。"""
     return f"{pos[0]}:{pos[1]}"
 
 
 def _strip_comment(text, pat_mode=False):
+    """マクロ行のコメントを落とす。
+
+    ソース側は `;`、パターン側は `/* */` がコメントなので、pat_mode で
+    切り替える。文字列リテラルの中は触らない。
+    """
     quote = ''
     i = 0
     while i < len(text):
@@ -9684,12 +8961,6 @@ def _strip_comment(text, pat_mode=False):
         elif c == '"':
             quote = c
         elif c == "'":
-            # 破綻点修正: `'` を無条件に引用符の開きとして扱っていた。しかし
-            # パターンファイルでは `'` は「任意ビット位置からの符号拡張」演算子
-            # （`!x'8` 等）でもあり、行に1個しか無い場合そこから行末までが
-            # 「引用符の中」とみなされ、以降の `/*` コメントが除去されなくなって
-            # マクロ層の行判定が狂っていた。対になる `'` が同じ行にあるときだけ
-            # 文字リテラルとみなす。
             if text.find("'", i + 1) >= 0:
                 quote = c
         elif pat_mode:
@@ -9703,11 +8974,13 @@ def _strip_comment(text, pat_mode=False):
 
 
 class _ExprParser:
+    """マクロ層の式を解析して値にする。優先順位ごとに 1 メソッドの再帰下降。
 
-    # マクロ式は評価のたびに字句解析からやり直すので、1文字進めるたびに
-    # len() と属性辞書を引いていた分がそのままループ回数に比例して効く。
-    # 長さを一度だけ控え、属性を __slots__ にして取り出しを速くする。
-    # （読み方は変えていない。s は生成後に書き換えない。）
+    値は整数と文字列の 2 種類で、演算子は C に倣う。本体の式評価器とは
+    別物なので、`%` の符号（C と同じ被除数の符号）と `'` の結合位置が違う。
+    `@` `'` `*(x,y)` は本体と同じ実装を呼ぶので意味は一致する。
+    """
+
     __slots__ = ('s', 'i', 'n', 'pp', 'pos', 'suppress')
 
     def __init__(self, text, pp, pos):
@@ -9720,9 +8993,11 @@ class _ExprParser:
 
 
     def err(self, msg):
+        """現在位置を添えて MacroError にする。"""
         raise MacroError(f"{_fmt_pos(self.pos)}: macro expression: {msg} in {self.s!r}")
 
     def skip(self):
+        """空白を飛ばす。"""
         s = self.s
         i = self.i
         n = self.n
@@ -9731,10 +9006,12 @@ class _ExprParser:
         self.i = i
 
     def peek(self, n=1):
+        """先の文字を消費せずに見る。"""
         self.skip()
         return self.s[self.i:self.i + n]
 
     def eat(self, tok):
+        """次がそのトークンなら消費して真。"""
         self.skip()
         if self.s.startswith(tok, self.i):
             if tok[-1].isalpha():
@@ -9746,21 +9023,25 @@ class _ExprParser:
         return False
 
     def expect(self, tok):
+        """そのトークンを必ず消費する。無ければエラー。"""
         if not self.eat(tok):
             self.err(f"expected {tok!r}")
 
     def at_end(self):
+        """読み切ったか。"""
         self.skip()
         return self.i >= self.n
 
 
     def parse(self):
+        """式を 1 個解析して値を返す。"""
         v = self.ternary()
         if not self.at_end():
             self.err(f"unexpected trailing text {self.s[self.i:]!r}")
         return v
 
     def ternary(self):
+        """`?:`。"""
         c = self.logic_or()
         if self.eat('?'):
             if _truth(c):
@@ -9784,6 +9065,7 @@ class _ExprParser:
         return c
 
     def logic_or(self):
+        """`||`。"""
         v = self.logic_and()
         while self.eat('||'):
             if _truth(v):
@@ -9799,6 +9081,7 @@ class _ExprParser:
         return v
 
     def logic_and(self):
+        """`&&`。"""
         v = self.sext()
         while self.eat('&&'):
             if not _truth(v):
@@ -9814,13 +9097,10 @@ class _ExprParser:
         return v
 
     def sext(self):
-        """本体の `'`（任意ビット位置からの符号拡張）をマクロ式でも使えるようにする。
+        """`'` — 符号拡張。マクロ層ではビット演算より緩く `&&` よりきつい。
 
-        実装は本体と同じ共有関数 op_sext()。位置はビット演算子より緩く `&&` より
-        きつい段に置く。本体では `^` と比較のあいだだが、マクロ層の優先順位は C
-        に合わせてあり比較のほうがビット演算子よりきついので、同じ相対位置は
-        取れない。`'` の右は幅を書くところなので、`'` に続く文字が数字か `(`
-        のときだけ演算子として読む（`'A'` の文字定数と衝突させないため）。
+        本体の評価器での位置（`^` と比較の間）とは違う。マクロ層の優先順位が
+        C に倣っていて、そこでは比較がビット演算よりきつく結合するため。
         """
         v = self.bit_or()
         while True:
@@ -9839,6 +9119,7 @@ class _ExprParser:
         return v
 
     def bit_or(self):
+        """`|`。"""
         v = self.bit_xor()
         while True:
             self.skip()
@@ -9851,12 +9132,14 @@ class _ExprParser:
         return v
 
     def bit_xor(self):
+        """`^`。"""
         v = self.bit_and()
         while self.eat('^'):
             v = _as_int(self, v) ^ _as_int(self, self.bit_and())
         return v
 
     def bit_and(self):
+        """`&`。"""
         v = self.equality()
         while True:
             self.skip()
@@ -9869,6 +9152,7 @@ class _ExprParser:
         return v
 
     def equality(self):
+        """`==` `!=`。"""
         v = self.relational()
         while True:
             if self.eat('=='):
@@ -9879,6 +9163,7 @@ class _ExprParser:
                 return v
 
     def relational(self):
+        """`<` `<=` `>` `>=`。"""
         v = self.shift()
         while True:
             self.skip()
@@ -9894,6 +9179,7 @@ class _ExprParser:
                 return v
 
     def shift(self):
+        """`<<` `>>`。"""
         v = self.additive()
         while True:
             if self.eat('<<'):
@@ -9916,6 +9202,7 @@ class _ExprParser:
                 return v
 
     def additive(self):
+        """`+` `-`。どちらかが文字列なら `+` は連結。"""
         v = self.multiplicative()
         while True:
             self.skip()
@@ -9933,6 +9220,10 @@ class _ExprParser:
                 return v
 
     def multiplicative(self):
+        """`*` `/` `%`。`/` と `%` は C と同じゼロ方向の切り捨て。
+
+        文字列 `* 整数` は繰り返し。
+        """
         v = self.unary()
         while True:
             self.skip()
@@ -9969,6 +9260,7 @@ class _ExprParser:
                 return v
 
     def unary(self):
+        """単項 `-` `+` `~` `!`。"""
         self.skip()
         if self.eat('!'):
             return 0 if _truth(self.unary()) else 1
@@ -9978,11 +9270,8 @@ class _ExprParser:
             return -_as_int(self, self.unary())
         if self.eat('+'):
             return self.unary()
-        # 本体の `@`（最上位ビット位置）。実装は共有関数 op_msb()。
         if self.eat('@'):
             return op_msb(_as_int(self, self.unary()))
-        # 本体の `*(値, 位置)`（バイト抽出）。値が来る位置の `*` だけが
-        # これで、中置の `*` は従来どおり掛け算（本体の評価器と同じ見分け方）。
         if self.i < len(self.s) and self.s[self.i] == '*' \
                 and self.s[self.i + 1:self.i + 2] == '(':
             self.i += 2
@@ -9997,6 +9286,7 @@ class _ExprParser:
         return self.primary()
 
     def primary(self):
+        """項そのもの。数値、文字列、名前、`(式)`、組み込み関数、`@` `*(x,y)`。"""
         self.skip()
         if self.i >= len(self.s):
             self.err("unexpected end of expression")
@@ -10018,9 +9308,6 @@ class _ExprParser:
             return t
 
         if c == '$':
-            # 位置カウンタ。`$` と `$$` は同義（アセンブラ本体では `$$` が
-            # 位置カウンタなので、そちらの綴りも受ける）。空白を挟んだ
-            # `$ $` を `$$` と読まないよう、次の文字は素で見る。
             self.i += 1
             if self.s[self.i:self.i + 1] == '$':
                 self.i += 1
@@ -10058,6 +9345,7 @@ class _ExprParser:
         self.err(f"unexpected character {c!r}")
 
     def read_ident(self):
+        """識別子を 1 個読む。"""
         self.skip()
         j = self.i
         while j < len(self.s) and (self.s[j].isalnum() or self.s[j] == '_'):
@@ -10069,6 +9357,7 @@ class _ExprParser:
         return name
 
     def read_number(self):
+        """整数リテラルを読む。10 進・`0x`・`0b`・`0o`、アンダースコア可。"""
         s = self.s
         j = self.i
         if s.startswith('0x', j) or s.startswith('0X', j):
@@ -10101,6 +9390,7 @@ class _ExprParser:
             self.err("malformed number")
 
     def read_string(self, q):
+        """文字列リテラルを読む。`'A'` は 1 文字なら文字コードになる。"""
         s = self.s
         j = self.i + 1
         out = []
@@ -10121,12 +9411,14 @@ class _ExprParser:
 
 
 def _truth(v):
+    """マクロ層での真偽判定。"""
     if isinstance(v, str):
         return v != ''
     return v != 0
 
 
 def _as_int(p, v):
+    """値を整数として要求する。"""
     if isinstance(v, str):
         if getattr(p, 'suppress', 0):
             return 0
@@ -10135,25 +9427,23 @@ def _as_int(p, v):
 
 
 def _as_str(v):
+    """値を文字列として読む。"""
     return v if isinstance(v, str) else str(v)
 
 
 def _echo_write(items):
-    """マクロ層の `!echo` とミニ言語の `.echo` に共通の出力ルーチン。
+    """`!echo` / `.echo` の出力を標準エラーへ書く。
 
-    項目を `_as_str` で文字列にし、空白区切りで 1 行にまとめて標準エラーへ出す。
-    体裁を 1 か所に集めておくため、どちらの層もここを通す。
+    マクロ層とミニ言語で同じ体裁にするため、書き出しは 1 か所にしてある。
     """
     print(' '.join(_as_str(x) for x in items), file=sys.stderr)
 
 
-# `.echo` の引数欄 → (項目の並び, 文言) の控え。パターンの本文行は照合の
-# たびに通るので、1行ごとに解析し直さない。
 _ECHO_CACHE = {}
 
 
 def _echo_str_unescape(s):
-    """`.echo` の文字列リテラルの中身をほどく。逃げ記号はミニ言語と同じ4つ。"""
+    """`.echo` の文字列リテラルのエスケープを開く。"""
     out = []
     k = 0
     n = len(s)
@@ -10174,13 +9464,7 @@ def _echo_str_unescape(s):
 
 
 def _echo_items_parse(text):
-    """`.echo(項目, …)` の引数欄を項目の並びにする。返すのは (並び, 文言)。
-
-    項目の種別は 's'（文字列そのまま）と 'e'（パターン層の式）。文字列の逃げ
-    記号はミニ言語の `.echo` と同じ `\\` `\"` `\n` `\t` の4つである。
-    文言が None でなければ書き方の誤りで、並びは None になる。
-    caxx.c の echo_items_parse() と同じ規則である。
-    """
+    """`.echo` の引数を、文字列と式の並びに割る。"""
     n = len(text)
     i = 0
     while i < n and text[i] in ' \t':
@@ -10220,7 +9504,6 @@ def _echo_items_parse(text):
             return None, "unexpected text after '.echo(...)'"
     inner = text[start:end]
 
-    # 最上位のカンマで切る。文字列と括弧の中のカンマは区切りにしない。
     parts = []
     buf = []
     depth = 0
@@ -10255,7 +9538,7 @@ def _echo_items_parse(text):
         k += 1
     parts.append(''.join(buf))
     if len(parts) == 1 and parts[0].strip() == '':
-        return [], None                  # `.echo()` は空行
+        return [], None
 
     items = []
     for p in parts:
@@ -10286,7 +9569,7 @@ def _echo_items_parse(text):
 
 
 def _echo_items_cached(text):
-    """`.echo` の引数欄の解析結果を控えから引く。"""
+    """同じ `.echo` 行の解析結果を覚えて使い回す。"""
     ent = _ECHO_CACHE.get(text)
     if ent is None:
         ent = _echo_items_parse(text)
@@ -10297,12 +9580,14 @@ def _echo_items_cached(text):
 
 
 def _cmp_eq(a, b):
+    """`==` の比較。整数と文字列が混ざる場合の規則をここに閉じる。"""
     if isinstance(a, str) != isinstance(b, str):
         return False
     return a == b
 
 
 def _cmp_lt_eq(p, a, b, or_equal):
+    """`<` と `<=` の比較。"""
     if isinstance(a, str) != isinstance(b, str):
         if getattr(p, 'suppress', 0):
             return False
@@ -10311,16 +9596,33 @@ def _cmp_lt_eq(p, a, b, or_equal):
 
 
 def _c_div(a, b):
+    """C と同じゼロ方向の切り捨て除算（`-7/2 == -3`）。"""
     q = abs(a) // abs(b)
     return q if (a >= 0) == (b >= 0) else -q
 
 
 def _c_mod(a, b):
+    """C と同じ剰余。結果は被除数の符号に従う（`-7%3 == -1`）。"""
     return a - _c_div(a, b) * b
 
 
 
 class MacroPreprocessor:
+    """行指向のマクロ層。アセンブラ本体の前に走るソース間変換。
+
+    文はすべて行頭の `!` で始まる（`!def` `!if` `!while` `!set` ...）。補間は
+    `!{式}` で、`!{式:04x}` の書式指定は Python のフォーマットミニ言語。
+
+    ソース側のマクロはラベル値・`.equ`・`$` / `$$` を読めるが、見えるのは
+    *前回の*リラクゼーション反復の値（最初の反復では未定義）。展開が反復ごとに
+    変わりうるので、収束はリラクゼーションループ自体が強制する。
+    パターンファイル側のマクロはソースのアセンブル前に走るため、ラベルも
+    ロケーションカウンタも存在しない（pat_mode がそれを表す）。
+
+    caxx.c と同じ仕様だが、数の表現だけ違う。こちらは多倍長整数、
+    あちらは int64。食い違うのはマクロ時の計算が 64bit を超える場合だけで、
+    マクロ層はテキストを出すので本体の 256bit 式評価には影響しない。
+    """
 
     def __init__(self, state=None, pat_mode=False):
         self.state = state
@@ -10329,12 +9631,14 @@ class MacroPreprocessor:
 
 
     def reset(self):
+        """状態をすべて初期化する。"""
         self.enabled = True
         self.had_error = False
         self._reported = set()
         self.reset_pass()
 
     def reset_pass(self):
+        """1 パスぶんの状態を初期化する（定義・スコープ・出力）。"""
         self.funcs = {}
         self.declared = set()
         self.globals = {}
@@ -10347,30 +9651,20 @@ class MacroPreprocessor:
 
 
     def scope(self):
+        """現在のスコープ（変数の辞書）。"""
         return self.scopes[-1]
 
     def asm_label(self, name):
-        """アセンブラ側のラベル / .equ を引く。
+        """ラベルの値を引く。返り値は (種別, 値)。
 
-        マクロ展開はアドレス確定より前に走るので「今の値」は存在しない。
-        前回リラクゼーション反復のスナップショット（AssemblerState 側が反復
-        ごとに更新する）を見て、次の3状態を返す。
-
-          ('val', 値) … 前回反復で値が確定していた
-          ('unk', 0)  … ラベルとしては存在するが値がまだ確定していない
-                        （初回反復では全ての名前がこれになる）
-          ('no',  0)  … そんなラベルは無い（＝綴り間違い）
-
-        パターンファイル側のマクロ層はソースのアセンブル前に走るため、
-        ここは常に 'no' を返してラベル参照そのものを認めない。
+        種別は 'val'（前回の反復の値がある）、'unk'（名前は知っているが値が
+        まだ無い）、'no'（そんな名前は無い）。パターンファイル側のマクロでは
+        常に 'no' で、読めるラベルがそもそも存在しない。
         """
         if self.pat_mode or self.state is None:
             return ('no', 0)
         values = self.state._macro_label_values
         if values is None:
-            # まだ一度も反復していない。この時点では「前方参照でまだ値が
-            # 無い」のか「綴り間違い」なのか区別できないので、エラーにせず
-            # 未確定として扱う。綴り間違いは次の反復で 'no' として捕まる。
             return ('unk', 0)
         if name in values:
             return ('val', values[name])
@@ -10379,11 +9673,10 @@ class MacroPreprocessor:
         return ('no', 0)
 
     def loc_counter(self, pos):
-        """マクロ展開時の位置カウンタ（$ / $$）。
+        """`$` / `$$` の値。前回の反復で記録した行ごとの PC から引く。
 
-        ラベルと違って名前ではなく位置で決まる値なので、前回反復で記録した
-        「展開後 N 行目のアドレス」を返す。初回反復や、展開行数が変わって
-        対応する行がまだ無い場合は 0。
+        パターンファイル側のマクロではエラーにする。ソースをアセンブルする
+        前にロケーションカウンタは存在しない。
         """
         if self.pat_mode or self.state is None:
             raise MacroError(f"{_fmt_pos(pos)}: '$'/'$$' is not available in "
@@ -10399,6 +9692,7 @@ class MacroPreprocessor:
         return lst[i] if 0 <= i < len(lst) else 0
 
     def lookup(self, name, pos):
+        """名前を解決する。内側のスコープから外側へたどる。"""
         for sc in reversed(self.scopes):
             if name in sc:
                 return sc[name]
@@ -10411,6 +9705,7 @@ class MacroPreprocessor:
         raise MacroError(f"{_fmt_pos(pos)}: undefined macro variable '{name}'")
 
     def is_defined(self, name):
+        """その名前が定義済みか。"""
         if name in self.funcs:
             return True
         if any(name in sc for sc in self.scopes):
@@ -10418,6 +9713,7 @@ class MacroPreprocessor:
         return self.asm_label(name)[0] == 'val'
 
     def assign(self, name, value):
+        """`!set` の代入。内側から外側へ探し、無ければ現在のスコープに作る。"""
         for sc in reversed(self.scopes):
             if name in sc:
                 sc[name] = value
@@ -10426,12 +9722,14 @@ class MacroPreprocessor:
 
 
     def eval(self, text, pos):
+        """マクロ式を 1 個評価する。"""
         text = text.strip()
         if text == '':
             raise MacroError(f"{_fmt_pos(pos)}: empty macro expression")
         return _ExprParser(text, self, pos).parse()
 
     def call_value(self, name, args, pos):
+        """マクロを式として呼び、`!return` の値を得る。"""
         if name in _BUILTINS:
             return _BUILTINS[name](self, args, pos)
         if name not in self.funcs:
@@ -10447,6 +9745,7 @@ class MacroPreprocessor:
         return value
 
     def invoke(self, fn, args, pos):
+        """マクロを 1 回展開する。引数を束縛し、新しいスコープで本文を走らせる。"""
         nreq = len(fn.params) - sum(1 for d in fn.defaults if d is not None)
         if len(args) > len(fn.params) or len(args) < nreq:
             raise MacroError(f"{_fmt_pos(pos)}: macro '{fn.name}' takes "
@@ -10483,6 +9782,7 @@ class MacroPreprocessor:
 
 
     def interpolate(self, text, pos):
+        """行の中の `!{式}` を展開する。`\\!{` はリテラルな `!{`。"""
         if '!{' not in text:
             return text
         out = []
@@ -10509,9 +9809,6 @@ class MacroPreprocessor:
                     if c == quote:
                         quote = ''
                 elif c == "'" and _sext_tick_at(text, j):
-                    # 符号拡張の `'`（右が数字か `(`）は文字定数の開始では
-                    # ないので、引用符として数えない。式パーサ側の見分け方と
-                    # 同じにしておかないと `!{v'8}` が閉じられなくなる。
                     pass
                 elif c in '"\'':
                     quote = c
@@ -10530,14 +9827,18 @@ class MacroPreprocessor:
         return ''.join(out)
 
     def format_value(self, body, pos):
+        """`!{式:書式}` の書式指定を適用する。
+
+        Python のフォーマットミニ言語をそのまま受け、同じ指定を拒否し、
+        エラーの文面も caxx.c と合わせる。既知の相違が 2 つある。
+        指定の前後の空白を解釈前に落とすので空白を符号とする形式
+        （`!{5: d}`）は表現できず、`!{0:c}` はこちらでは NUL 文字を返すが
+        C 文字列は内部に NUL を持てないので Caxx では空文字列になる。
+        """
         spec = None
         quote = ''
         par = 0
         k = 0
-        # 破綻点修正: 引用符の中の `\` を見たとき次の1文字を飛ばさずに continue
-        # していたため（interpolate() は j += 2 で正しく飛ばしている）、
-        # `!{ "a\"b" : spec }` のようにエスケープされた引用符を含むと
-        # そこで引用符が閉じたと誤認し、書式指定の `:` の位置を取り違えていた。
         while k < len(body):
             c = body[k]
             if quote:
@@ -10576,6 +9877,7 @@ class MacroPreprocessor:
 
     @staticmethod
     def statement_word(text):
+        """行頭の `!` 文のキーワードと残りを取り出す。"""
         t = text.lstrip()
         if not t.startswith('!') or t.startswith('!!'):
             return None, None
@@ -10587,6 +9889,7 @@ class MacroPreprocessor:
         return t[1:j], t[j:]
 
     def parse_block(self, lines, i, depth):
+        """1 ブロックを構文木にする。入れ子の深さに上限がある。"""
         nodes = []
         n = len(lines)
         while i < n:
@@ -10634,10 +9937,12 @@ class MacroPreprocessor:
 
     @staticmethod
     def looks_like_call(rest):
+        """行の残りがマクロ呼び出しの形か。"""
         r = rest.strip()
         return r.startswith('(')
 
     def parse_simple(self, lw, word, rest, pos):
+        """単純文 1 個を解析する。"""
         if lw == 'set':
             if '=' not in rest:
                 raise MacroError(f"{_fmt_pos(pos)}: '!set' needs 'name = expression'")
@@ -10663,6 +9968,7 @@ class MacroPreprocessor:
         return ('call', word, rest.strip(), pos)
 
     def parse_header(self, text, kw, pos):
+        """ブロック文のヘッダを解析する。開き `{` はヘッダ行の最後に要る。"""
         t = text.strip()
         body = t[len(kw) + 1:]
         if not body.rstrip().endswith('{'):
@@ -10677,6 +9983,7 @@ class MacroPreprocessor:
         return body.strip()
 
     def parse_if(self, lines, i, depth):
+        """`!if` / `!elif` / `!else` の連なりを解析する。"""
         text, fn, ln = lines[i]
         pos = (fn, ln)
         cond = self.parse_header(_strip_comment(text, self.pat_mode), 'if', pos)
@@ -10716,6 +10023,7 @@ class MacroPreprocessor:
             raise MacroError(f"{_fmt_pos(cpos)}: unexpected '!{w}' after '}}'")
 
     def parse_while(self, lines, i, depth):
+        """`!while` を解析する。"""
         text, fn, ln = lines[i]
         pos = (fn, ln)
         cond = self.parse_header(_strip_comment(text, self.pat_mode), 'while', pos)
@@ -10729,6 +10037,7 @@ class MacroPreprocessor:
         return ('while', cond, body, pos), i + 1
 
     def parse_def(self, lines, i, depth):
+        """`!def` を解析する。既定値付きの引数を受ける。"""
         text, fn, ln = lines[i]
         pos = (fn, ln)
         t = _strip_comment(text, self.pat_mode).strip()[4:].strip()
@@ -10779,16 +10088,19 @@ class MacroPreprocessor:
 
 
     def emit(self, text, pos):
+        """展開結果の 1 行を出力に積む。"""
         if len(self.out) >= _MACRO_MAX_LINES:
             raise MacroError(f"{_fmt_pos(pos)}: macro expansion produced more than "
                              f"{_MACRO_MAX_LINES} lines; assuming a runaway macro")
         self.out.append((text, pos[0], pos[1]))
 
     def exec_block(self, nodes):
+        """文の並びを順に実行する。"""
         for node in nodes:
             self.exec_node(node)
 
     def exec_node(self, node):
+        """文 1 個を実行する。"""
         kind = node[0]
 
         if kind == 'text':
@@ -10894,6 +10206,7 @@ class MacroPreprocessor:
         raise MacroError(f"internal: unknown macro node {kind!r}")
 
     def parse_args(self, argtext, pos):
+        """マクロ呼び出しの引数を解析する。"""
         t = argtext.strip()
         if t.startswith(';') or t == '':
             return []
@@ -10918,6 +10231,7 @@ class MacroPreprocessor:
         return args
 
     def do_include(self, name, pos):
+        """`!include` — 展開時にテキストを取り込む。"""
         if not isinstance(name, str):
             raise MacroError(f"{_fmt_pos(pos)}: '!include' needs a file name string")
         path = name
@@ -10949,17 +10263,14 @@ class MacroPreprocessor:
 
 
     def warn(self, msg):
+        """`!warning` の出力。"""
         if msg in self._reported:
             return
         self._reported.add(msg)
         diag(f" warning - {msg}", set_error=False, force=True)
 
     def fail(self, msg):
-        # 破綻点修正: None 検査より前に self.state.diag() を呼んでいた。
-        # PatternFileReader は既定でマクロ層を state=None で作る（3行下の
-        # コンストラクタ）ので、その経路でマクロエラーが起きると
-        # AttributeError で落ちていた。warn() と同じくモジュール関数の diag()
-        # に委ねる（状態が無ければそのまま stderr へ出る）。
+        """マクロ展開を失敗として記録する。"""
         if msg not in self._reported:
             self._reported.add(msg)
             diag(f" error - {msg}", set_error=False, force=True)
@@ -10969,6 +10280,7 @@ class MacroPreprocessor:
 
 
     def contains_macros(self, raw):
+        """ソース側に展開すべきものがあるか（軽い前判定）。"""
         for t in raw:
             if '!' in t or t.lstrip().startswith('}'):
                 return True
@@ -10976,6 +10288,7 @@ class MacroPreprocessor:
 
     @staticmethod
     def has_interpolation(t):
+        """その行に `!{...}` の補間があるか。"""
         i = t.find('!{')
         while i >= 0:
             if i == 0 or t[i - 1] != '\\':
@@ -10984,6 +10297,7 @@ class MacroPreprocessor:
         return False
 
     def has_macro_constructs(self, raw):
+        """パターン側に展開すべきものがあるか（軽い前判定）。"""
         for t in raw:
             s = t.lstrip()
             if s.startswith('}'):
@@ -10999,6 +10313,12 @@ class MacroPreprocessor:
         return False
 
     def expand(self, raw, filename):
+        """行の並びをマクロ展開して返す。
+
+        展開すべきものが 1 つも無ければ、解析せずにそのまま返す。これが
+        マクロを使わないパターンファイルの速さを保っている。
+        展開中は再帰上限を一時的に上げ、finally で必ず元に戻す。
+        """
         lines = [(t.rstrip('\r\n'), filename, k + 1) for k, t in enumerate(raw)]
         if not self.enabled:
             return lines
@@ -11011,8 +10331,6 @@ class MacroPreprocessor:
             return []
         saved_out = self.out
         saved_expand_key = self._expand_key
-        # $/$$ は「展開後の何行目か」で引くので、どのファイルの展開中かを
-        # 覚えておく（AssemblerState 側の記録も同じキーで積まれている）。
         self._expand_key = filename
         self.out = []
         saved_reclimit = sys.getrecursionlimit()
@@ -11044,6 +10362,7 @@ class MacroPreprocessor:
 
 
 def _bi_check(pp, args, pos, name, lo, hi=None):
+    """組み込み関数の引数の数を検査する。"""
     hi = lo if hi is None else hi
     if not (lo <= len(args) <= hi):
         raise MacroError(f"{_fmt_pos(pos)}: {name}() takes {lo}..{hi} argument(s), "
@@ -11051,11 +10370,13 @@ def _bi_check(pp, args, pos, name, lo, hi=None):
 
 
 def _bi_len(pp, a, pos):
+    """`len(s)` — 文字列の長さ。"""
     _bi_check(pp, a, pos, 'len', 1)
     return len(a[0]) if isinstance(a[0], str) else len(str(a[0]))
 
 
 def _bi_hex(pp, a, pos):
+    """`hex(n)` — 16 進表記。"""
     _bi_check(pp, a, pos, 'hex', 1, 2)
     v = a[0]
     if isinstance(v, str):
@@ -11071,11 +10392,13 @@ def _bi_hex(pp, a, pos):
 
 
 def _bi_str(pp, a, pos):
+    """`str(v)` — 文字列化。"""
     _bi_check(pp, a, pos, 'str', 1)
     return _as_str(a[0])
 
 
 def _bi_int(pp, a, pos):
+    """`int(v)` — 整数化。"""
     _bi_check(pp, a, pos, 'int', 1, 2)
     if isinstance(a[0], int):
         return a[0]
@@ -11087,16 +10410,19 @@ def _bi_int(pp, a, pos):
 
 
 def _bi_upper(pp, a, pos):
+    """`upper(s)`。"""
     _bi_check(pp, a, pos, 'upper', 1)
     return _as_str(a[0]).upper()
 
 
 def _bi_lower(pp, a, pos):
+    """`lower(s)`。"""
     _bi_check(pp, a, pos, 'lower', 1)
     return _as_str(a[0]).lower()
 
 
 def _bi_substr(pp, a, pos):
+    """`substr(s, start[, len])`。"""
     _bi_check(pp, a, pos, 'substr', 2, 3)
     s = _as_str(a[0])
     start = a[1]
@@ -11121,6 +10447,7 @@ def _bi_substr(pp, a, pos):
 
 
 def _bi_abs(pp, a, pos):
+    """`abs(n)`。"""
     _bi_check(pp, a, pos, 'abs', 1)
     if isinstance(a[0], str):
         raise MacroError(f"{_fmt_pos(pos)}: abs() needs an integer")
@@ -11128,10 +10455,7 @@ def _bi_abs(pp, a, pos):
 
 
 def _bi_minmax(pp, a, pos, want_min):
-    # 破綻点修正: 組込 min()/max() をそのまま呼んでいたため、文字列と整数が
-    # 混ざると MacroError ではなく素の TypeError が飛び、expand() の捕捉対象外
-    # なので Python のトレースバックがそのままユーザに出ていた。
-    # 他の比較（`<` 等）と同じ経路を通して同じ診断を出す。
+    """`min` / `max` の共通実装。"""
     p = _ExprParser('', pp, pos)
     best = a[0]
     for v in a[1:]:
@@ -11142,28 +10466,26 @@ def _bi_minmax(pp, a, pos, want_min):
 
 
 def _bi_min(pp, a, pos):
+    """`min(...)`。"""
     _bi_check(pp, a, pos, 'min', 1, 64)
     return _bi_minmax(pp, a, pos, True)
 
 
 def _bi_max(pp, a, pos):
+    """`max(...)`。"""
     _bi_check(pp, a, pos, 'max', 1, 64)
     return _bi_minmax(pp, a, pos, False)
 
 
 def _bi_uid(pp, a, pos):
+    """`uid()` — 展開ごとに違う番号。生成したラベル名の衝突を避けるため。"""
     _bi_check(pp, a, pos, 'uid', 0)
     pp.uid += 1
     return pp.uid
 
 
 def _bi_label(pp, a, pos):
-    """label("名前") — アセンブラ側のラベル / .equ の値。
-
-    裸の識別子でも同じ値を引けるが、`.L1` のようにマクロの識別子として
-    書けない名前はこちらでしか参照できない。解決規則は裸の識別子と同一で、
-    存在しない名前はエラーになる。
-    """
+    """`label(name)` — ラベルの値。前回の反復の値が見える。"""
     _bi_check(pp, a, pos, 'label', 1)
     name = a[0]
     if not isinstance(name, str):
@@ -11191,6 +10513,12 @@ _BUILTINS = {
 
 
 class Assembler:
+    """アセンブラ全体の組み立てと駆動。入口は run()。
+
+    各部品（式評価器・照合器・ディレクティブ処理・出力生成）を作って
+    つなぎ、パターンファイルとソースを読み、パス1とパス2を回して
+    出力を書く。
+    """
 
     def __init__(self):
         self.state = AssemblerState()
@@ -11215,6 +10543,7 @@ class Assembler:
         self._imp_sections: dict = {}
 
     def include_asm(self, l1, l2):
+        """ソース側の `.include` を処理する。"""
         if StringUtils.upper(l1) != ".INCLUDE":
             return False
         s = StringUtils.get_string(l2)
@@ -11242,27 +10571,24 @@ class Assembler:
         return True
 
     def _dir_line_done(self, l, l2, idx):
-        """組み込みアセンブリディレクティブを処理し終えた行の返り値。
-
-        テキスト置換モード（`.textmode`）では、その行もテキストとして出す。
-        翻訳結果から `.section` や `.global` のような行が消えないようにするため
-        である。そうでなければ今までどおり、出力を出さない行として返す。
-        caxx.c の adir_done() と同じ規則である。
-        """
+        """ディレクティブ行を処理し終えたときの後片付け。"""
         if self.state.textmode:
             return self._passthru_line(l, l2, idx)
         return 0, [], True, idx
 
     def lineassemble2(self, line, idx):
+        """1 命令（VLIW なら 1 スロット）をアセンブルする。
+
+        候補のパターンを順に照合し、当たったものに特異度スコアを付けて
+        最良のものを選ぶ。選んだパターンの error_patterns を評価し、
+        通れば binary_list からワード列を作る。
+        """
         l, idx = StringUtils.get_param_to_spc(line, idx)
         l2, idx = StringUtils.get_param_to_eon(line, idx)
         l = l.rstrip()
         l2 = l2.rstrip()
         l = l.replace(' ', '')
 
-        # テキスト置換モードでは、自分でワードや領域を出すディレクティブは
-        # 処理せず、行をテキストとしてだけ出す（_TEXTMODE_TEXT_ONLY_DIRS の
-        # コメントを参照）。
         if self.state.textmode and StringUtils.upper(l) in _TEXTMODE_TEXT_ONLY_DIRS:
             return self._passthru_line(l, l2, idx)
 
@@ -11285,12 +10611,7 @@ class Assembler:
             if not _ok and (self.state.should_report_errors()):
                 self.state.diag(f" error - .ASCIZ: failed to process string argument: {l2!r}", set_error=True)
             return 0, [], True, idx
-        # `.include` は取り込んだ行そのものが訳されて出るので、この行は出さない。
         if self.include_asm(l, l2):
-            # 取り込んだ行を訳した後にこの行のコメントだけが出てくると、順序が
-            # 入れ替わって読めなくなる。この行のコメントは出さない（取り込んだ
-            # 側の行が自分のコメントを出す）。字下げも、取り込んだ先の行が1行ごとに
-            # 置き換えてしまうので、ここで消しておく。
             self.state.comment_text = ''
             self.state.indent_text = ''
             return 0, [], True, idx
@@ -11320,9 +10641,6 @@ class Assembler:
             return self._dir_line_done(l, l2, idx)
 
         if l == "":
-            # テキスト置換モードでラベルだけの行とコメントだけの行は、落とした
-            # `label:` と `;` コメントを出力に戻す仕事が残っているので、出力なしの
-            # 成功として返す（付け直すのは lineassemble() の側）。
             if self.state.textmode and (self.state.label_text
                                         or self.state.comment_text):
                 return 0, [], True, idx
@@ -11367,26 +10685,19 @@ class Assembler:
             self.state.vliwset = list(snap['vliwset'])
 
 
-        # 照合にかける行。パターンごとに変わらないので、ループの外で1回だけ作る。
         lin = StringUtils.reduce_spaces((l + ' ' + l2) if l2 else l)
 
         _isdir = self.state.pat_isdir
         _pat = self.state.pat
         _dirfn = self.state.pat_dirfn
 
-        # たどる行は「行ごとに必ずたどる行（always）」と「この行のニーモニックで
-        # 索引を引いた候補」の2つの昇順の並びである。パターンファイルの記述順の
-        # まま処理するために、2つを合わせながら進む。
         _always = self.state.pat_always
         _cand = _pat_candidates(self.state.pat_index, self.state.pat_maxkey, lin)
         _na = len(_always)
         _nc = len(_cand)
-        # 前置きを畳み込んでいるあいだは、always の並びを前置きの後ろから読む。
         _hoist = self.state.hoist_rows
         _ai = self.state.hoist_first_ai if (_hoist and self.state.hdrsnap is not None) else 0
         _ci2 = 0
-        # 前置きの実行で診断が出るようなら畳み込まない（同じ診断が行ごとに
-        # 出る今までの見え方を変えないため）。その判定に使う出力前の数。
         _hoist_diag0 = self.state.diag_count
 
         while True:
@@ -11410,22 +10721,17 @@ class Assembler:
             pln = _row + 1
             pl = i
 
-            # 前置きを通り過ぎるところで、その状態を1度だけ控える。
             if _hoist and self.state.hdrsnap is None and _row >= _hoist:
                 if self.state.diag_count != _hoist_diag0:
                     _hoist = 0
-                    self.state.hoist_rows = 0    # 診断が出たので畳み込まない
+                    self.state.hoist_rows = 0
                 else:
                     self._hdrsnap_take()
 
             if i is None:
                 continue
 
-            # ディレクティブ行は、読み込み時に決めた処理を1つだけ呼ぶ。
             if _isdir[_row]:
-                # ディレクティブの値欄も式なので、パターン変数を読みうる
-                # （マニュアル 6.3）。評価の前に空にしておく。空なら作り直す
-                # 必要はない（ディレクティブ行は1行につき何百回も通る）。
                 if self.state.vars:
                     self.state.vars = {}
                 if self.state.vars_undef:
@@ -11448,9 +10754,6 @@ class Assembler:
                     idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                 break
 
-            # 索引から来た候補は先頭一致を済ませてある。always から来た行のうち
-            # ニーモニックを持つもの（`EPIC` のように大文字の名前を持つ
-            # ディレクティブ行で、処理されずに落ちてきたもの）だけここで見る。
             if _from_always:
                 _pfx, _closed = _lead_caps(i[0])
                 if _pfx:
@@ -11470,14 +10773,10 @@ class Assembler:
                     if _k < len(_pfx):
                         _ok = False
                     if _ok and _closed and _end < len(lin) and lin[_end] in _PFX_WORD:
-                        # パターン側はここでニーモニックが終わっているのに、
-                        # ソース側はまだ語が続いている（`MOVE` vs `MOVEM`）。
                         _ok = False
                     if not _ok:
                         continue
 
-            # ここから先が本当の照合。先頭一致で捨てた分は作り直さなくてよい
-            # （変数表は照合と値欄の評価の直前にだけ空であればよい）。
             self.state.vars = {}
             self.state.vars_undef = {}
             self.state.vars_text = {}
@@ -11536,13 +10835,6 @@ class Assembler:
                 self.state._elf_var_to_label = saved_v2l
                 self.state._elf_insn_reloc_hint = saved_hint
 
-                # 破綻点修正: 以前は「式もシンボルも0個」なら即打ち切っていたが、
-                # スコアは (式の数, -リテラル数, シンボル数) の辞書順最小が勝ちで、
-                # あとからもっとリテラルの多い（＝より具体的な）パターンが
-                # 現れうるため、これでは取りこぼしがあった。健全な打ち切り条件を
-                # 作るのは `+`/`-` の読み替え（ソースを消費せずリテラル数だけ
-                # 増える）があるため難しく、全パターンを見ても実測で十分速いので、
-                # 打ち切り自体をやめて常に最良スコアを選ぶ。
 
             self.state.error_undefined_label = False
 
@@ -11631,8 +10923,6 @@ class Assembler:
             pln = 0
             pl = ""
 
-        # `.passthru` が有効なら、マッチしなかった行はエラーにせずそのまま出す。
-        # 診断の抑止（パス1）に関わらず出すので、両パスで行の大きさが揃う。
         if se and self.state.passthru:
             return self._passthru_line(l, l2, idx)
 
@@ -11648,11 +10938,6 @@ class Assembler:
                 return 0, [], False, idx
             if oerr:
                 self.state.had_error = True
-                # 破綻点修正: パターン番号と生の6フィールド配列という内部表現を
-                # 常にユーザ向けメッセージへ混ぜており、-d の有無に関わらず
-                # 出力されていた。さらに " error - " より前に "; pat ..." が付くため、
-                # 他の全診断が従う書式からも外れていた。
-                # 詳細は -d 指定時だけ、本文とは別行で出す。
                 self.state.diag(f" error - Illegal syntax in assemble line or pattern line.{_loc}", set_error=False)
                 if self.state.debug:
                     self.state.diag(f"   (pattern {pln}: {pl})", set_error=False)
@@ -11661,13 +10946,7 @@ class Assembler:
         return idxs, objl, True, idx
 
     def _text_words(self, txt):
-        """テキストを出力ワードの並びにする。
-
-        1文字が1ワードである。出力ワード幅（`.bits`）に収まらない文字があれば
-        警告する（切り捨てはワードを書く側が行う）。テキストを出す道すじ
-        （`.passthru` の素通し、テキスト置換モードのコメント付け直し）で共通に
-        使う。caxx.c の text_words() と同じ規則である。
-        """
+        """テキストを出力ワードの並びにする（UTF-8 の 1 バイトが 1 ワード）。"""
         words = list(txt.encode('utf-8', errors='surrogateescape'))
         _word_mask = (1 << self.state.bts) - 1 if self.state.bts > 0 else 0xFF
         if (any(_v > _word_mask for _v in words)
@@ -11679,16 +10958,8 @@ class Assembler:
         return words
 
     def _passthru_line(self, l, l2, idx):
-        """`.passthru` のとき、マッチしなかった行をそのままテキストとして出す。
-
-        出るのは照合にかけた形の行、つまり空白を1つに詰め、`;` コメントと
-        行頭のラベル定義を落としたあとの行である。行末の改行は付けない —
-        1行が1行になるようにしたいときは `.eol` を書く。
-        caxx.c の passthru_line() と同じ規則である。
-        """
+        """`.passthru` が有効なとき、当たらなかった行をそのまま出す。"""
         txt = (l + ' ' + l2) if l2 else l
-        # 素通しする行は式として読まないので、照合の途中で立った未定義ラベルの
-        # 印はこの行には関わらない。
         self.state.error_undefined_label = False
         objl = self._text_words(txt)
         self.state.asmtext = txt
@@ -11696,31 +10967,23 @@ class Assembler:
         return 0, objl, True, idx
 
     def lineassemble(self, line):
-        # テキスト置換モードでは、行頭の字下げ（空白・タブ）も書かれていたまま
-        # 訳したテキストの前に残す（付け直すのはこの関数の終わりの側）。空白の
-        # 正規化（normalize_ws）が連続する空白を1個に潰してしまう前に覚える。
-        # そうでないときは今までどおり、字下げは残さない。
+        """ソース 1 行を処理する。
+
+        ラベル定義、ソース側ディレクティブ、`!!` のバンドル分解、
+        テキスト置換モードの扱いを済ませてから lineassemble2 を呼ぶ。
+        """
         _ind = line[:len(line) - len(line.lstrip(' \t'))]
-        # 覚える長さは caxx.c の indent_text（511 バイト）に合わせて切る。両実装が
-        # 同じテキストを出すための約束である。
         if len(_ind) > 511:
             _ind = _ind[:511]
         self.state.indent_text = _ind if self.state.textmode else ''
         line = StringUtils.normalize_ws(line)
         line, _cmt = StringUtils.split_comment_asm(line)
-        # テキスト置換モードでは、ソースに書かれていた `;` コメントも訳した
-        # テキストに残す（後ろに付け直すのはこの関数の終わりの側）。落として
-        # しまうと書き換えた結果からコメントが消えてしまうためである。
-        # そうでないときは今までどおり落とす。
         self.state.comment_text = _cmt if self.state.textmode else ''
-        # コメントだけの行も、テキスト置換モードなら1行として出す。
         if line == '' and not self.state.comment_text:
             return False
         line = StringUtils.resolve_vliw_escapes(line)
 
         if self.state.hoist_rows and self.state.hdrsnap is not None:
-            # 前置きのディレクティブ行はもうたどらないので、作り直す代わりに
-            # 「前置きを実行し終えた状態」を戻す。
             self._hdrsnap_restore()
             self.state.freed_subs.clear()
         else:
@@ -11753,11 +11016,6 @@ class Assembler:
         if not flag:
             return False
 
-        # テキスト置換モードでは、行頭にあった `label:` をそのまま出力の先頭に
-        # 付け直す。照合のために落としてあるので、ここで書かれていたとおりの
-        # 綴りで戻す。テキストを作った行と、ラベルだけの行が対象で、テキスト
-        # ではなく数値を出した行（`.ascii` などの組み込みディレクティブ）は
-        # データを壊さないようそのままにする。
         if (self.state.textmode and self.state.label_text
                 and not self.state.vliwflag
                 and (self.state.asmtext is not None or not objl)):
@@ -11769,19 +11027,11 @@ class Assembler:
             objl[0:0] = _lbytes
             self.state.asmtext = _lpfx + (_ltxt or '')
             self.state.asmtext_disp = '"%s"' % asmtext_escaped(self.state.asmtext)
-            # 前に足したぶん、その行のワード位置がずれる。ELF の再配置は
-            # ワード位置で覚えているので、同じだけ送っておく。
             if _lbytes:
                 self.state._elf_label_refs_seen = [
                     (_n, _v, (_w + len(_lbytes)) if _w >= 0 else _w)
                     for (_n, _v, _w) in self.state._elf_label_refs_seen]
 
-        # テキスト置換モードでは、ソースにあった `;` コメントを訳したテキストの
-        # 後ろに付け直す。照合のために落としてあるので、ここで書かれていたとおりの
-        # 綴りで戻す。テキストを作った行と、コメントだけ・ラベルだけの行が対象で、
-        # テキストではなく数値を出した行（`.ascii` などの組み込みディレクティブ）は
-        # データを壊さないようそのままにする。後ろに足すだけなので、ラベルを前に
-        # 足すときと違って ELF のワード位置はずれない。
         if (self.state.textmode and self.state.comment_text
                 and not self.state.vliwflag
                 and (self.state.asmtext is not None or not objl)):
@@ -11792,14 +11042,6 @@ class Assembler:
             self.state.asmtext = _cur + _csfx
             self.state.asmtext_disp = '"%s"' % asmtext_escaped(self.state.asmtext)
 
-        # テキスト置換モードでは、行頭にあった字下げ（空白・タブ）を書かれていた
-        # とおりに出力の先頭へ付け直す。照合のために空白を1個に潰してあるので、
-        # ここで元の綴りに戻す。付けるのは `label:` とコメントを付け直した後の行
-        # 全体の先頭なので、字下げと `label:`・`;` コメントの間に余分な空白は
-        # 入らない。対象はテキストを出した行だけで、テキストではなく数値を出した行
-        # （`.ascii` などの組み込みディレクティブ）はデータを壊さないようそのまま
-        # にする。`.vliw` が有効なときは、`.eol` と同じくパケットを壊さないよう
-        # 何もしない。
         if (self.state.textmode and self.state.indent_text
                 and not self.state.vliwflag
                 and self.state.asmtext):
@@ -11808,16 +11050,11 @@ class Assembler:
             objl[0:0] = _ibytes
             self.state.asmtext = _itxt + self.state.asmtext
             self.state.asmtext_disp = '"%s"' % asmtext_escaped(self.state.asmtext)
-            # 前に足したぶん、その行のワード位置がずれる。ELF の再配置は
-            # ワード位置で覚えているので、ラベルを前に足すときと同じだけ送る。
             if _ibytes:
                 self.state._elf_label_refs_seen = [
                     (_n, _v, (_w + len(_ibytes)) if _w >= 0 else _w)
                     for (_n, _v, _w) in self.state._elf_label_refs_seen]
 
-        # `.eol` が有効なら、出力を出した行ごとに改行を1ワード足す。標準出力へ
-        # 流すテキストには足さない（そちらは行ごとに改行して出しているので、
-        # 二重になってしまう）。
         if self.state.eol and objl and not self.state.vliwflag:
             objl.append(ord('\n'))
 
@@ -11870,18 +11107,8 @@ class Assembler:
                 for lname, abs_w, first_widx, num_words in groups:
                     num_bytes = num_words * bpw_r
 
-                    # `.reloc` が宣言された変数が運んだ参照は、命令語のビット欄に
-                    # 値が詰まっていて出力バイト列から加数を逆算できない。型と加数
-                    # は宣言側で決まっているので、通常の推定経路を通さずに出す。
                     _hint = self.state._elf_insn_reloc_hint.get(first_widx)
                     lentry = self.state.labels.get(lname)
-                    # リロケーション型の優先順位は
-                    #   既定（幅からの推定） < パターンファイルの `.reloc`
-                    #   < ソースファイルの `::型名`
-                    # である。ソースが型を書いていれば、`.reloc` が宣言した型より
-                    # そちらが勝つ（値が命令語のビット欄に入っているという
-                    # `.reloc` 側の知識と加数はそのまま使う）。caxx.c の同じ箇所
-                    # と同じ規則である。
                     _src_rtype = lentry[4] if (lentry and len(lentry) > 4
                                                and lentry[4] is not None) else None
                     _forced_rtype = None
@@ -11893,16 +11120,12 @@ class Assembler:
                         _fdecl = insn_reloc_field_decl(self.state, _hint_rtype)
                         _foff = _fdecl[1] if _fdecl is not None else 0
                         if _fmask is None:
-                            # データ型を宣言した場合。加数は通常どおり出力バイト列
-                            # から求まるので、型だけを固定して下の経路へ渡す。
                             _forced_rtype = _hint_rtype
                         else:
                             _insn_bytes = _mach_tbl_la['reloc_bytes'].get(_hint_rtype, 4)
                             _insn_words = max(1, _insn_bytes // bpw_r)
                             _fw = first_widx + _foff // bpw_r
                             if _fw + _insn_words <= len(objl):
-                                # RELA ではリンカが欄を埋めるので、命令語側は 0 に
-                                # しておく（GNU as と同じ形）。
                                 _wmask = (1 << self.state.bts) - 1
                                 for _k in range(_insn_words):
                                     _sh = self.state.bts * _k if self.state.endian == 'little' \
@@ -11935,10 +11158,6 @@ class Assembler:
                     if first_widx >= len(objl):
                         continue
                     if rtype == 0:
-                        # この幅のリロケーション型を持たない ISA では、アセンブラが
-                        # 自分で解決し終えた参照（分岐や adrp/:lo12: 等）が必ずここに
-                        # 落ちる。出力は正しいのに毎回警告が出て本物の診断を埋めて
-                        # しまうため、詳細は -d 指定時だけ出す。
                         if self.state.debug:
                             self.state.diag(
                                 f" warning - no relocation type available for a {num_bytes}-byte "
@@ -11970,26 +11189,12 @@ class Assembler:
 
                     abs_w_bytes = int(abs_w) * bpw_r
 
-                    # 幅からの既定型を使ったとき、その型の PC 相対性が欄の中身と
-                    # 食い違うことがある。欄に入っているのがラベルの絶対値そのもの
-                    # なら、その型は PC 相対ではありえないので、同じ幅の絶対型に
-                    # 取り替える。取り替え先は実効表の先頭から「同じ幅で PC 相対で
-                    # ない型」を引いたもので、マシン番号も型番号も埋め込まない。
-                    # 組み込みの表を持つ 11 機種では abs64/abs32/abs16/abs8 が表の
-                    # 先頭に並んでいるので従来と同じ型が引かれ、パターンファイルで
-                    # 宣言したマシンでも `.elftype` の宣言順どおりに引ける。
-                    # caxx.c の同じ箇所と同じ規則である。
                     if (_rtype_is_default_guess and rtype in _pc_rel_types_all
                             and raw_val == abs_w_bytes):
                         _alt = _reloc_same_width(_mach_tbl_la, num_bytes, False)
                         if _alt is not None:
                             rtype = _alt
 
-                    # 逆向き（既定型が絶対型なのに欄の中身がラベルの値と違うので
-                    # PC 相対型に取り替える）は m68k だけに掛ける。この判定は
-                    # 「加数の付いた絶対参照」（`dq label+8` など）と見分けが
-                    # 付かないので、他のマシンへは広げない。取り替え先の型番号は
-                    # 上と同じく実効表から引く。
                     if (_rtype_is_default_guess and self.state.elf_machine == 4
                             and rtype not in _pc_rel_types_all
                             and raw_val != abs_w_bytes):
@@ -12033,6 +11238,7 @@ class Assembler:
         return True
 
     def lineassemble0(self, line):
+        """1 行を処理する外枠。行の前処理と診断の文脈を整える。"""
         cleaned = line.replace('\n', '').replace('\r', '')
         _show = (self.state.pas == 2 and self.state.verbose) or self.state.pas == 0
         if _show:
@@ -12042,11 +11248,6 @@ class Assembler:
         self.state.asmtext = None
         self.state.asmtext_disp = None
         f = self.lineassemble(cleaned)
-        # パターンが文字列テンプレートだった行は、バイナリ出力とは別に、
-        # アセンブリ結果をテキストでも出す。
-        # -v の診断行の中では `` ではなく "" で括って見せる。素のまま標準出力へ
-        # 流す（トランスレータとしての出力）のは `-V` を付けたときだけで、既定は
-        # 無出力である。caxx.c の lineassemble0() と同じ規則である。
         if self.state.asmtext is not None and self.state.pas in (0, 2):
             if _show:
                 print(' %s' % (self.state.asmtext_disp or ''), end='')
@@ -12059,20 +11260,12 @@ class Assembler:
         self.state.ln += 1
         return f
 
-    # パターン表から先に拾う ELF 宣言（マニュアル 3.7.7 節）→ 処理する関数名。
     _ELF_DECL_DIRECTIVES = ('.elftype', '.elfmachine', '.elfclass', '.elfrela',
                             '.elfwidth', '.elfextern', '.elfdwarf', '.elfheader',
                             '.elfsection', '.elffield')
 
     def register_elfdecls(self, pat):
-        """パターン表の ELF 宣言を、組み立てを始める前に一度そろえて登録する。
-
-        型名はソースの `.extern`/`.global`/`.EQU`/`.RELOCTYPE` や取り込み
-        ファイルからも引く。これらはパターン表をたどるより前に読まれるので、
-        行ごとの実行を待っていると「まだ宣言されていない」ことになってしまう。
-        マシン番号・ELF クラス・ヘッダ欄も同じ理由でここで決める。
-        caxx.c の register_elfdecls() と同じである。
-        """
+        """パターンファイル中の ELF 記述ディレクティブを先に読んでおく。"""
         d = self.directive_proc
         table = {
             '.elftype':    d.elftype_processing,
@@ -12092,13 +11285,7 @@ class Assembler:
         self.check_elfdecls()
 
     def check_elfdecls(self):
-        """ELF 宣言の型欄が引けるかを、宣言が出そろってから一度だけ見る。
-
-        綴りを間違えた型名を黙って読み飛ばすと、そこだけリロケーションの出ない
-        `.o` が何事もなかったように出てしまう。`-o` を出すときだけ見るのは
-        `.reloc` と同じで、パターンファイルを別のマシンで使い回せるようにする
-        ためである。caxx.c の check_elfdecls() と同じである。
-        """
+        """ELF 記述の宣言が揃っているか、矛盾がないかを検査する。"""
         if not self.state.elf_objfile:
             return
         e = self.state.elf
@@ -12119,6 +11306,11 @@ class Assembler:
                                 f"for {tbl['name']}; ignored.", set_error=False)
 
     def setpatsymbols(self, pat):
+        """パターンファイルが定義するシンボルを先に集める。
+
+        ソースのラベルがこれらと衝突したらエラーにできるようにするため、
+        アセンブルを始める前に名前を知っておく必要がある。
+        """
         fresh = {}
         self.state.strsymbols = {}
         self.state.arrsymbols = {}
@@ -12131,8 +11323,6 @@ class Assembler:
                     key = StringUtils.upper(i[1])
                     self.state.symbols = dict(fresh)
                     value_field = i[2] if len(i) >= 3 else ''
-                    # 値が `"..."` なら数値ではなく文字列シンボル。式には出せない
-                    # が、文字列テンプレート（3.5.2）の中から名前で呼び出せる。
                     _vf = value_field.lstrip(' \t')
                     if _vf.startswith('"'):
                         self.state.strsymbols[key] = \
@@ -12141,10 +11331,8 @@ class Assembler:
                     if _vf.startswith('['):
                         self.state.arrsymbols[key] = arr_items_from_text(self.expr_eval, _vf)
                         continue
-                    # `.setsym::y::x` — x が文字列／配列シンボルなら写しを作る。
                     if symbol_copy_from_name(self.state, key, _vf):
                         continue
-                    # `名前,名前,…` は名前の集合、`a&b` などは集合どうしの演算。
                     if symbol_set_from_text(self.state, key, value_field):
                         continue
                     if value_field:
@@ -12170,15 +11358,9 @@ class Assembler:
                     self.state.arrgen += 1
                 continue
             if len(i) > 0 and i[0] == '.map':
-                # `.map` のシンボルもこの前処理の表に積む。ここまでに積んだ
-                # ものを公開してから展開するので、並びに書いた配列シンボルも、
-                # 値の式に書いた `#記号` も解決できる。
                 self.state.symbols = dict(fresh)
                 self.directive_proc.map_apply(i, into=fresh, set_check=False)
                 continue
-            # `.free` はシンボルもこの前処理の表から外す（本体の走査でも同じ
-            # ことをするが、ここで外しておかないと後続の `.setsym` の値の式から
-            # 見えたままになる）。
             if len(i) > 0 and i[0] == '.free':
                 _names = (i[2] if len(i) >= 3 and i[2] else (i[1] if len(i) >= 2 else ''))
                 for _nm in _names.split(','):
@@ -12198,6 +11380,7 @@ class Assembler:
         self.state.symbols = dict(fresh)
 
     def fileassemble(self, fn):
+        """ソースファイル 1 つを 1 行ずつアセンブルする。"""
 
         if not self.state.fnstack:
             self.macro_proc.reset_pass()
@@ -12250,9 +11433,6 @@ class Assembler:
                 return
             af = StringUtils.join_backslash_continuations(af)
 
-            # マクロ層の $/$$ は「展開後の何行目か」で決まる値なので、名前で
-            # 引けるラベルと違って行番号でしか対応が取れない。この反復での
-            # 行番号→アドレスを記録しておき、次の反復の展開時にそれを返す。
             _expkey = self.state.current_file
             _line_pcs = []
             self.state._macro_line_pcs_cur[_expkey] = _line_pcs
@@ -12267,6 +11447,10 @@ class Assembler:
             self.state.ln = self.state.lnstack.pop()
 
     def file_input_from_stdin(self):
+        """プロンプトモード。`>>` で行を読み、`?` でラベル表を出す。
+
+        このモードではマクロ層を通らない。
+        """
         af = ""
         while True:
             line = sys.stdin.readline()
@@ -12276,6 +11460,7 @@ class Assembler:
         return af
 
     def imp_label(self, l):
+        """`-i` のインポートファイルの 1 行からラベルを取り込む。"""
         l = l.rstrip('\r\n')
         if not l:
             return False
@@ -12339,9 +11524,11 @@ class Assembler:
         return False
 
     def printaddr(self, pc):
+        """リスティングの行頭のアドレスを出す。"""
         print("%016x: " % pc, end='')
 
     def _section_word_ranges(self, name):
+        """そのセクションが占めるワード範囲の並びを返す。"""
         ranges = [(rs, rl) for (rn, rs, rl) in self.state.section_ranges if rn == name]
         if ranges:
             return ranges
@@ -12351,6 +11538,7 @@ class Assembler:
         return []
 
     def _addr_to_word_offset(self, name, word_pc):
+        """絶対アドレスを、そのセクション内のワードオフセットに直す。"""
         if not self.state.sections:
             return word_pc
         cum = 0
@@ -12361,6 +11549,11 @@ class Assembler:
         return None
 
     def _build_dwarf_sections(self, csecs, sec_name_to_idx, bpw, machine):
+        """`-g` の DWARF セクションを作る。
+
+        `.debug_info` / `.debug_abbrev` / `.debug_line` を組み、行表は
+        パス2で集めた line_map（アドレスとソース行の対応）から作る。
+        """
         line_map = self.state.line_map
         if not self.state.gen_debug or not line_map:
             return [], []
@@ -12369,9 +11562,6 @@ class Assembler:
         _native_dw   = _mach_tbl_dw['elfclass']
         _eff_class_dw = getattr(self.state, 'elf_class', None) or _native_dw
         if not _mach_tbl_dw['dwarf_abs']:
-            # 絶対アドレス参照の型が分からないマシン。型番号を当てずっぽうで
-            # 書けば黙って壊れたデバッグ情報になるので出さない。`.elfdwarf`
-            # （3.7.7 節）で型を教えれば出せる。
             self.state.diag(f" warning - DWARF debug info (-g) needs an absolute "
                  f"relocation type for machine {machine}; declare it with .elfdwarf. "
                  f"Skipping debug sections.", set_error=False)
@@ -12388,10 +11578,6 @@ class Assembler:
             v &= (1 << (addr_sz * 8)) - 1
             return _struct.pack(f'{_pk}I', v) if addr_sz == 4 else _struct.pack(f'{_pk}Q', v)
 
-        # DWARF が書く絶対アドレス参照の欄幅は addr_sz（= -f で決まる ELF クラス）
-        # だが、dwarf_abs はマシンごとの固定値。`-f` がそのマシンの慣習クラスと
-        # 違うときは両者がずれ、4バイトの欄に 8バイト型（あるいはその逆）の
-        # リロケーションを張ることになる。欄と同じ幅の型に取り替える。
         abs64 = _mach_tbl_dw['dwarf_abs']
         if _mach_tbl_dw['reloc_bytes'].get(abs64) != addr_sz:
             _want = 'abs64' if addr_sz == 8 else 'abs32'
@@ -12399,8 +11585,6 @@ class Assembler:
             if _alt is not None and _mach_tbl_dw['reloc_bytes'].get(_alt) == addr_sz:
                 abs64 = _alt
             else:
-                # 幅の合う絶対型を持たないマシン（32bit 機を -f 64 で出した場合）。
-                # 幅の違う型を張れば黙って壊れたデバッグ情報になるので出さない。
                 self.state.diag(
                     f" warning - DWARF debug info (-g) needs a {addr_sz}-byte absolute "
                     f"relocation, which {_mach_tbl_dw['name']} does not have; "
@@ -12455,15 +11639,11 @@ class Assembler:
         DW_FORM_addr, DW_FORM_data2, DW_FORM_data8 = 0x01, 0x05, 0x07
         DW_FORM_string, DW_FORM_sec_offset = 0x08, 0x17
 
-        # 子 DIE になるラベルを先に集める。CU の DW_CHILDREN は「子があるか」を
-        # 宣言するもので、ラベルを1つも持たないソース（命令だけのファイル）では
-        # 子なしになる。宣言と中身が食い違うと DWARF の検証器が指摘するため、
-        # 表を組む前に確定させる。
         _dbg_labels = []
         for _name, *_rest in sorted(self.state.labels.items()):
             _entry = _rest[0]
             if (len(_entry) > 2 and _entry[2]) or (len(_entry) > 3 and _entry[3]):
-                continue                      # .equ と取り込みラベルは持たない
+                continue
             try:
                 _byte_addr = int(_entry[0]) * bpw
             except (TypeError, ValueError, OverflowError):
@@ -12522,8 +11702,6 @@ class Assembler:
             info_relas.append((len(die), sidx, abs64, off))
             die += _pack_addr(0 if is_rela_dw else off)
         if _dbg_labels:
-            # 子の連鎖を閉じる null DIE。DW_CHILDREN_no のときは連鎖自体が無いので
-            # 置いてはいけない（読み手が余分な abbrev コード 0 を拾ってしまう）。
             die += _uleb(0)
 
         info_body = (_struct.pack(f'{_pk}H', 4)
@@ -12644,6 +11822,14 @@ class Assembler:
         return prog_sections, rela_list
 
     def write_elf_obj(self, path: str, machine: int = 62) -> None:
+        """ELF 再配置可能オブジェクトを書く。
+
+        セクション・シンボル表・リロケーションを組み、必要なら DWARF も
+        付ける。マシン記述は elf_machine_table() が返す実表から取るので、
+        組み込みの表に無い CPU でもパターンファイルの宣言だけで出せる。
+        型の決まらない参照はリロケーションを出さない（当てずっぽうの
+        型番号を書いてリンカを騙さないため）。
+        """
         import struct as _struct
 
         bpw = max(1, (self.state.bts + 7) // 8)
@@ -12667,8 +11853,6 @@ class Assembler:
         _ehdr_size = 64 if _is_elf64 else 52
         _word_mask = 0xFFFFFFFFFFFFFFFF if _is_elf64 else 0xFFFFFFFF
 
-        # `.elfheader::<欄名>::<値>`（3.7.7 節）で決めた欄。書かれていない欄は
-        # 従来どおりの既定値（e_type=1 ET_REL、e_version=1、e_flags=0、e_entry=0）。
         _hdr        = self.state.elf.decl_hdr
         _e_flags    = _hdr.get('flags', 0) & 0xFFFFFFFF
         _e_version  = _hdr.get('version', 1) & 0xFFFFFFFF
@@ -12719,8 +11903,6 @@ class Assembler:
                 sh_size, sh_link, sh_info, sh_addralign, sh_entsize)
 
         def _pack_sym(st_name, st_info, st_other, st_shndx, st_value, st_size):
-            # st_value と st_size は ELF32 では 32 ビット欄なので、クラスに
-            # 合わせて切る（caxx.c の weo_sym() が weo_w4 で切るのと同じ）。
             st_value &= _word_mask
             st_size  &= _word_mask
             if _is_elf64:
@@ -12764,6 +11946,7 @@ class Assembler:
             return bytes(data)
 
         class _CSec:
+            """ELF へ書くセクション 1 つぶん。名前、位置、中身、属性。"""
             __slots__ = ('name', 'byte_start', 'data', 'byte_size', 'flags',
                          'sh_type', 'align', 'entsize')
 
@@ -12810,9 +11993,6 @@ class Assembler:
             if sidx:
                 rela_entries[sidx].append((off, sym_name, rtype, addend, nbytes))
             else:
-                # 破綻点修正: セクション名が一致しないリロケーションを無警告で
-                # 捨てていたため、修正が抜け落ちた「見た目は正常な」.oファイルが
-                # 静かに生成されていた。診断を出す。
                 if self.state.should_report_errors():
                     self.state.diag(
                         f" error - relocation references unknown section '{sname}'; dropped from output.",
@@ -12914,8 +12094,6 @@ class Assembler:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr, _lsec)
             sym_val = int(sym_val) & _word_mask
-            # `.type` / `.size` / `.other`（マニュアル 5.6.1 節）。局所シンボル
-            # なので束縛は STB_LOCAL のままで、`.weak` は下の大域側へ回る。
             _sa = _sym_attr(self.state, name)
             _sz = _sym_size_of(self.state, name, bpw)
             shndx, sym_val, _sz = _sym_common_override(
@@ -12932,8 +12110,6 @@ class Assembler:
             is_imported = len(_lentry[0]) > 3 and _lentry[0][3]
             if not is_imported or name in export_keys:
                 continue
-            # 未定義（他所で解決される）シンボル。`.comm` を宣言していれば
-            # SHN_COMMON の姿になり、`.weak` を宣言していれば束縛が弱くなる。
             _sa = _sym_attr(self.state, name)
             _shndx, _sval, _sz = _sym_common_override(
                 self.state, name, bpw, 0, 0, _sym_size_of(self.state, name, bpw))
@@ -13021,12 +12197,6 @@ class Assembler:
             r_info = ((r_sym & 0xffffff) << 8) | (r_type & 0xff)
             return _struct.pack(f'{_pk}II', r_offset, r_info)
 
-        # ELF32 の r_info は型欄が 8 ビット、シンボル番号欄が 24 ビットしかない。
-        # 組み込みの表を持つ機種の ELF32 側（i386・m68k・PowerPC・ARM・SuperH）
-        # は型番号がどれも 255 以下だが、`.elftype` は 2147483647 まで書けるので、
-        # ELF32 で 255 を超える型を宣言すると黙って切り詰められる。切り詰めた
-        # 型番号は別の型に化けるため、リンカは診断も出さず間違った修正をする。
-        # 型ごとに一度だけ知らせる。caxx.c の同じ箇所と同じ規則である。
         if not _is_elf64:
             _warned_rt = set()
             _warned_sym = False
@@ -13061,10 +12231,6 @@ class Assembler:
             rela_datas.append(data)
 
         def _is_nobits(s):
-            # ファイルに中身を持たないセクション（SHT_NOBITS）か。従来は名前が
-            # `.bss` で始まるかだけを見ていたが、`.elfsection` で型を宣言できる
-            # ようになったので、決まった sh_type に従う。caxx.c の weo_isno() と
-            # 同じ規則である。
             return s.sh_type == 8
 
         offset = _ehdr_size
@@ -13200,6 +12366,7 @@ class Assembler:
               file=sys.stderr)
 
     def _build_arg_parser(self):
+        """コマンドライン引数の定義。"""
         import argparse
         ap = argparse.ArgumentParser(
             prog='axx',
@@ -13211,10 +12378,6 @@ class Assembler:
         ap.add_argument('sourcefile', nargs='?', default=None,
                         help='Assembly source file (.s). Omit for interactive mode.')
 
-        # 破綻点修正: 既定値が FreeBSD(9) 固定だったため、--osabi を指定しない
-        # 通常の使い方では、標準的な Linux 環境の ld が OSABI ミスマッチで
-        # 生成された .o を拒否し得た（axxelfbug 参照）。既定値を、実行環境として
-        # 最も一般的な Linux(0) に変更する。
         ap.add_argument('--osabi', dest='elf_osabi', type=str, default='Linux',
                         help='ELF OSABI value (default: Linux; FreeBSD/Linux, case-insensitive)')
         ap.add_argument('-b', dest='outfile', default='',
@@ -13294,12 +12457,10 @@ class Assembler:
                           'vliwflag')
 
     def _hdrsnap_take(self):
-        """前置きのディレクティブ行を実行し終えた状態を控える。
+        """持ち上げたディレクティブを処理し終えた状態を写し取る。
 
-        控えるのは「1行ごとに作り直す欄」（シンボル表・`.check`・`.reloc`・
-        `.enum`）と、「前置きが必ず書く欄」だけである。前置きが書かない欄
-        （`.bits` が前置きに無いときの語長など）は今までどおり前の行から
-        持ち越す。caxx.c の hdrsnap_take() と同じ。
+        リラクゼーションの反復ごとにここまで巻き戻せば、先頭の
+        ディレクティブを読み直さずに済む。
         """
         st = self.state
         snap = {
@@ -13323,7 +12484,7 @@ class Assembler:
         st.hdrsnap = snap
 
     def _hdrsnap_restore(self):
-        """控えた前置きの状態に戻す（行ごとの作り直しの代わり）。"""
+        """写し取った状態へ戻す。"""
         st = self.state
         snap = st.hdrsnap
         st.symbols = dict(snap['symbols'])
@@ -13344,11 +12505,9 @@ class Assembler:
             st.vliwnop = list(snap['vliwnop'])
 
     def _build_dir_dispatch(self, pat, isdir):
-        """行ごとに「その行を処理するディレクティブ関数」を1つ決めておく。
+        """ディレクティブ行ごとに、呼ぶべきハンドラを先に決めておく。
 
-        照合のたびに 19 個の判定を並べて呼んでいたので、ディレクティブ行の
-        数 × ソース行数ぶんの無駄な呼び出しになっていた。名前は行ごとに
-        変わらないので、読み込み時に対応表を引いて控える。
+        毎行すべてのハンドラを試すのをやめるための前処理。
         """
         d = self.directive_proc
         table = {
@@ -13388,12 +12547,12 @@ class Assembler:
             if isdir[row] and i and i[0]:
                 fn = table.get(i[0])
                 if fn is None:
-                    # `EPIC`（大小無視）だけは名前引きでは拾えない。
                     fn = d.epic
             out.append(fn)
         return out
 
     def _macro_expand_only(self, sourcefile, dest):
+        """`-P` — ソースをマクロ展開して書き出し、アセンブルせずに終わる。"""
         self.macro_proc.reset_pass()
         try:
             with open(sourcefile, "rt", encoding="utf-8", errors="surrogateescape") as f:
@@ -13425,6 +12584,7 @@ class Assembler:
         return True
 
     def _pat_macro_expand_only(self, patternfile, dest):
+        """`-p` — パターンファイルをマクロ展開して書き出して終わる。"""
         self.pat_macro_proc.reset_pass()
         try:
             with open(patternfile, "rt", encoding="utf-8", errors="surrogateescape") as f:
@@ -13457,6 +12617,7 @@ class Assembler:
 
     @staticmethod
     def _normalise_macro_expand_argv(argv):
+        """`-P` / `-p` の省略可能なファイル名を引数解析器に合う形へ整える。"""
         _with_arg = {'--osabi', '-b', '-e', '-E', '-f', '-i', '-o', '-m'}
         out, positional, i = [], 0, 0
         while i < len(argv):
@@ -13469,8 +12630,6 @@ class Assembler:
                 need = 1 if a in ('-p', '--macro-expand-pattern') else 2
                 nxt = argv[i + 1] if i + 1 < len(argv) else None
                 if nxt == '-':
-                    # An explicit "-" always names stdout. Consume it here so
-                    # that argparse never sees it as a stray positional.
                     out += [a, '-']
                     i += 2
                 elif (nxt is not None and not nxt.startswith('-')
@@ -13478,11 +12637,6 @@ class Assembler:
                     out += [a, nxt]
                     i += 2
                 elif nxt is not None and not nxt.startswith('-'):
-                    # 破綻点修正: 位置引数が揃う前に `-P out.txt pat.axx src.s`
-                    # と書かれた場合、この分岐は `-P` を引数なしと解釈し、
-                    # out.txt を位置引数（＝パターンファイル）へ流していた。
-                    # 「out.txt は -P の出力先」なのか「パターンファイル」なのか
-                    # は原理的に決められないので、黙って一方に倒さず断る。
                     _long = ('--macro-expand-pattern'
                              if a in ('-p', '--macro-expand-pattern')
                              else '--macro-expand')
@@ -13505,6 +12659,18 @@ class Assembler:
         return out
 
     def run(self):
+        """入口。引数を読み、パターンとソースを読み、出力を書く。
+
+        パス1はリラクゼーションで、最大 MAX_RELAX (16) 回まわす。各反復の
+        終わりに「ラベル → (アドレス, セクション)」の写しを取り、過去の写しと
+        同じものが出たら、周期 1 なら収束として抜け、周期 2 以上なら振動として
+        報告し中断する。単純な繰り返しでは収束しないことが決まるからで、
+        誤ったアドレスのコードを出すよりは何も出さない。16 回で終わらない
+        場合も同様に中断し、まだ動いているラベル名を挙げる。
+
+        パス2は確定アドレスで 1 回だけ回し、バイト列とリロケーションを作る。
+        パス1と食い違っていればそこでもエラーにする。
+        """
         ap = self._build_arg_parser()
 
         if len(sys.argv) == 1:
@@ -13521,8 +12687,6 @@ class Assembler:
         self.state.impfile      = args.impfile
         self.state.elf_objfile  = args.elf_objfile
 
-        # `-m` を書かなければパターンファイルの `.elfmachine`（3.7.7 節）が、
-        # それも無ければ従来どおり 62（x86-64）が対象になる。
         if args.elf_machine is not None:
             if not 0 <= args.elf_machine <= 65535:
                 self.state.diag(f" error - -m/--machine value {args.elf_machine} is out of "
@@ -13540,8 +12704,6 @@ class Assembler:
                      f"no relocation entry, rather than a guessed (and wrong) one.",
                      set_error=False, force=True)
 
-        # `-f` を書かなければ、パターンファイルの `.elfclass`、それも無ければ
-        # マシンの慣習クラスで出す（write_elf_obj() が None を見て決める）。
         self.state.elf_class    = None if args.elf_format is None else \
                                   (2 if args.elf_format == 64 else 1)
 
@@ -13570,17 +12732,11 @@ class Assembler:
 
         try:
             self.state.pat = self.pattern_reader.readpat(args.patternfile)
-            # どの行がディレクティブかはパターンファイルを読んだ時点で決まる。
-            # ソース1行ごとに数千回やり直さないよう、ここで1度だけ作る。
             self.state.pat_isdir = [_pat_is_directive(_p) for _p in self.state.pat]
-            # ニーモニック索引と、行ごとのディレクティブ処理の割り当ても
-            # ここで1度だけ作る（照合のたびに判定列を並べないため）。
             (self.state.pat_index,
              self.state.pat_always,
              self.state.pat_maxkey) = _build_pat_index(self.state.pat,
                                                        self.state.pat_isdir)
-            # 先頭に並ぶ「行によって結果が変わらない」ディレクティブ行は
-            # 1度だけ実行して状態を控える（以後の行はたどらない）。
             (self.state.hoist_rows,
              self.state.hoist_fields) = _pat_hoist_scan(self.state.pat,
                                                         self.state.pat_isdir)
@@ -13590,11 +12746,6 @@ class Assembler:
                                                             self.state.pat_isdir)
             self.state.sub_defs = self.pattern_reader.subs
             self.state.func_defs = self.pattern_reader.funcs
-            # 破綻点修正: パターンファイルが読めなかった場合、readpat() は
-            # エラーを報告して空のパターン表を返すが、そのまま組み立てに進んで
-            # いたため、全ソース行が「どのパターンにも一致しない」となり
-            # 偽の "Syntax error" が行数ぶん並んで真の原因が埋もれていた。
-            # （終了コードが 1 になっていたのはその偽エラーの副作用にすぎない。）
             if self.state.had_error:
                 self.state.diag(" error - one or more errors were reported during assembly; "
                                 "output would be incomplete or wrong.",
@@ -13604,9 +12755,6 @@ class Assembler:
                 return False
             self.setpatsymbols(self.state.pat)
             self.register_elfdecls(self.state.pat)
-            # 破綻点修正: パターンファイル側のディレクティブ評価（.setsym / .bits 等）
-            # で出たエラーを誰も拾っていなかったため、" error - ..." を表示しながら
-            # 終了コード0で「出力ファイルだけ作られない」無言の失敗になっていた。
             if self.state.had_error:
                 self.state.diag(" error - one or more errors were reported while reading "
                                 "the pattern file; output would be incomplete or wrong.",
@@ -13638,10 +12786,6 @@ class Assembler:
                     if len(fields) == 2:
                         self.imp_label(l)
 
-            # 破綻点修正: ここで既存の -b 出力を先に消すと、この後リラクゼーションが
-            # 失敗して "no output written" と表示した場合でも、実際には直前の
-            # 正常なビルド成果物が既に失われてしまう。書き込み側 (open(..,'wb'))
-            # が成功時に上書き・切り詰めを行うので、ここでの事前削除は不要かつ有害。
 
             if args.sourcefile is None:
                 self.state.pc = 0
@@ -13712,15 +12856,8 @@ class Assembler:
                         if not _is_undef_derived(v[0])
                     }
 
-                    # マクロ層に見せるスナップショット。次の反復の展開はこれを
-                    # 使って評価される。名前の集合を値とは別に持つのは、値が
-                    # まだ未確定なラベルを「綴り間違い」と誤判定しないため。
                     self.state._macro_label_values = dict(self.state._relax_prev_values)
                     self.state._macro_label_names = set(self.state.labels)
-                    # dict() で複製するのは必須。同じ辞書を共有すると、次に
-                    # fileassemble() が今回ぶんの記録を積み直すときに、まさに
-                    # 展開中の式が読んでいるリストを空で上書きしてしまう
-                    # （パス2で $ が 0 に化け、パス1と食い違う）。
                     self.state._macro_line_pcs = dict(self.state._macro_line_pcs_cur)
                     if not has_undef:
                         _pcs_key = frozenset(current_pcs.items())
@@ -13792,10 +12929,6 @@ class Assembler:
                     self.state.diag(" error - address mismatch between pass1 and pass2 "
                                     f"({len(_drift)} label(s)); output addresses are "
                                     f"UNRELIABLE.", set_error=False, force=True)
-                    # ラベル定義の誤りを既に報告している場合、ずれはその結果に
-                    # すぎない（パス1では定義を拒否し、パス2では通ってしまう）。
-                    # リラクゼーションの話を持ち出すと原因を見誤らせるので、
-                    # そのときは上の報告を指す案内に差し替える。
                     if self.state.reported_label_errors:
                         print("         This is a consequence of the label definition "
                               "error(s) reported above; fix those first.", file=sys.stderr)
@@ -13825,9 +12958,6 @@ class Assembler:
                 return False
 
             if self.state.elf_objfile:
-                # 破綻点修正: 書き込みの失敗（ディスク満杯など）を捕まえて
-                # いなかったため、素の OSError トレースバックが出ていた。
-                # caxx.c と同じ文面の診断にして通常のエラー経路で終わらせる。
                 try:
                     self.write_elf_obj(self.state.elf_objfile, self.state.elf_machine)
                 except OSError as _we:
@@ -13891,7 +13021,6 @@ class Assembler:
 
                         label_file.write(f"{i[0]}{reloc_type_str}\t{lbl_addr:#x}\n")
 
-            # 破綻点修正: 同上。ラベル TSV の書き込み失敗も診断にする。
             for _exp_path, _exp_elf in ((self.state.expfile, 0),
                                         (self.state.expfile_elf, 1)):
                 if not _exp_path:
@@ -13911,16 +13040,10 @@ class Assembler:
                     pass
                 self.state.stdin_tmp_path = None
 
-        # 破綻点修正: 標準出力（-V の翻訳結果など）が書ききれていないまま
-        # 成功として終わり、Python の "Exception ignored ..." と終了コード 120
-        # に化けていた。caxx.c と同じ文面で失敗させる。
         try:
             sys.stdout.flush()
         except OSError as _oe:
             print(f" error - cannot write to standard output: {_oe}", file=sys.stderr)
-            # 書けないまま終了すると、インタプリタ終了時の後始末がもう一度
-            # 流そうとして "Exception ignored ..." と終了コード 120 に化ける。
-            # 残りを捨て先へ逃がし、終了コードを 1 にそろえる。
             try:
                 _devnull = os.open(os.devnull, os.O_WRONLY)
                 os.dup2(_devnull, 1)
@@ -13934,6 +13057,7 @@ class Assembler:
 
 
 def main():
+    """コマンドとしての入口。終了コードを決める。"""
     assembler = Assembler()
     return assembler.run()
 

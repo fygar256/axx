@@ -1,42 +1,48 @@
 
+
 /*
- * caxx — axx 汎用アセンブラの C 実装
+ * caxx — axx 汎用アセンブラの C 実装（愛称 Caxx）。
  *
- * 同じディレクトリの axx.py（Python 版・こちらが原典）の移植であり、
- * 同一の入力に対して同一のバイト列を出すことを目標に保守されている。
- * 仕様・設計の説明は axx.py 冒頭のコメントを参照。
+ * 同じディレクトリの axx.py（Python 版・こちらが原典）の移植で、同じ入力に対して
+ * 同じバイト列を出すことを目標に保守されている。食い違いが出たらどちらかのバグ。
+ * 仕様と設計の説明は axx.py 冒頭を参照。こちらははるかに速いが、新機能は
+ * まず Python 側に入るので、ときどき遅れる。
  *
- * axx は命令セットをコードに埋め込まず、外部のパターンファイル（.axx）から
- * 「ニーモニックの書式 → バイナリエンコーディング」の対応を読み込む。
- * パターンファイルを差し替えるだけで任意の ISA を扱える。
+ * axx は命令セットをコードに持たず、外部のパターンファイル（.axx）から
+ * 「ニーモニックの書式 → 機械語のバイト列」の対応を読む。パターンファイルを
+ * 差し替えるだけで任意の ISA を扱える。
  *
  *     caxx <パターンファイル.axx> <ソース.s> -o <出力.o>
  *
  * 処理の流れ:
- *   1. パターンファイル読み込み（readpat / .INCLUDE を再帰展開）
+ *   1. パターンファイル読み込み（readpat、.INCLUDE を再帰展開）
  *   2. マクロ展開（macro_expand）
- *   3. パス1: サイズ収束。可変長命令の長さが前方参照ラベルの値に依存するため、
- *      全ラベルのアドレスが前回反復と一致するまで繰り返す（リラクゼーション）
- *   4. パス2: 確定アドレスで実バイト列と ELF リロケーションを生成
+ *   3. パス1: 長さの収束。可変長命令の長さが前方参照ラベルの値で決まるため、
+ *      全ラベルのアドレスが前回の反復と一致するまで繰り返す（リラクゼーション）
+ *   4. パス2: 確定アドレスでバイト列と ELF リロケーションを作る
  *   5. 出力: ELF オブジェクト / 生バイナリ / ラベル TSV
  *
- * このファイルの大まかな構成（上から順に）:
- *   - uint256_t          256bit 整数演算（アドレスと即値の内部表現）
- *   - 各種コンテナ       ラベル表・シンボル表・セクション表・出力バッファ
- *   - AsmState           アセンブル中の全状態
- *   - axx_*              行の前処理（コメント除去・エスケープ・トークン切り出し）
- *   - IEEE754 変換       32/64/128bit 浮動小数点のビットパターン生成
- *   - expr_*             式評価器（優先順位ごとの再帰下降）
- *   - pat_*              パターン照合
- *   - dir_* / adir_*     パターン側 / ソース側のディレクティブ処理
- *   - makeobj            エンコーディング欄からワード列を作る
- *   - vliwprocess        VLIW/EPIC パケット組み立て
- *   - lineassemble       1行を処理する主ループ
- *   - write_elf_obj      ELF オブジェクト出力
- *   - macro_*            行指向マクロ層（!if / !while / !def）
- *   - main               コマンドライン処理と全体の駆動
+ * 計算能力は 3 層に分かれ、停止性の扱いが違う。マクロ層（macro_*）は制限なし、
+ * パターン層は意図的にチューリング不完全で照合の停止性を保証、ミニ言語
+ * （mini_*）は `.call` で名指しされたときだけ動き、上限付き。
+ *
+ * ファイルの構成（上から順に）:
+ *   - uint256_t      256bit 整数演算。アドレスと即値の内部表現
+ *   - 各種コンテナ   ラベル表・シンボル表・セクション表・出力バッファ
+ *   - AsmState       アセンブル中の全状態
+ *   - axx_*          行の前処理（コメント除去・エスケープ・トークン切り出し）
+ *   - IEEE754 変換   32/64/128bit 浮動小数点のビットパターン生成
+ *   - expr_*         式評価器（優先順位ごとの再帰下降）
+ *   - pat_*          パターン照合
+ *   - dir_* / adir_* パターン側 / ソース側のディレクティブ処理
+ *   - makeobj        出力欄からワード列を作る
+ *   - vliwprocess    VLIW/EPIC バンドルの組み立て
+ *   - lineassemble   1 行を処理する主ループ
+ *   - write_elf_obj  ELF オブジェクト出力
+ *   - macro_*        行指向マクロ層（!def / !if / !while）
+ *   - mini_*         ミニ言語（.func / .call）
+ *   - main           コマンドライン処理と全体の駆動
  */
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,57 +71,35 @@ static int  m_utf8(unsigned long cp, char *out);
 #  define AXX_UNUSED
 #endif
 
-/* =========================================================
- * uint256_t — 256bit 整数
- *
- * アドレス・即値・ラベル値の内部表現。w[0] が最下位ワード。
- * 256bit も必要なのは、axx が 128bit 浮動小数点（四倍精度）のビットパターンを
- * 整数として扱うことと、未定義ラベルを巨大な番兵値で表現するため。
- * 符号付きとして解釈する場合は最上位ビット（w[3] の bit63）が符号になる。
- *
- * 浮動小数点モード（st.exp_typ_float）では、同じ uint256_t を「C の double の
- * ビットを w[0] にコピーしたもの」として使う。数値変換ではなくビット再解釈
- * である点に注意（u256_to_double / double_to_u256 は memcpy で実装されている）。
- * ========================================================= */
+/* アドレスと即値の内部表現。64bit を 4 本並べた 256bit 整数で、w[0] が最下位。
+   Python 側が多倍長で計算するところを同じ幅にそろえるための型。 */
 typedef struct { uint64_t w[4]; } uint256_t;
 static void u256_to_pydec(uint256_t a, char *out, size_t outsz);
-/* マクロ層とミニ言語で共通の `echo` 出力（定義はマクロ層側）。 */
 static void m_echo_write(char *const *items, int n);
 
-/* パターン変数（a〜z）1個ぶんの束縛。is_undef は「まだ束縛されていない」印。
- * is_float は、val が「C の double のビットパターン」（true）なのか
- * 「そのままの256bit整数値」（false）なのかを覚えておく印。浮動小数点モード
- * では同じ uint256_t をどちらの意味でも使うため、書き込み時にどちらの
- * 意味で書いたかを追跡しないと、読み出し側（浮動小数点モードの比較・算術）
- * が整数値をdoubleのビット列として誤って再解釈してしまう（破綻点修正、
- * var_get_for_mode 呼び出し側と var_put/var_put_tagged を参照）。
- * !F/!D/!Q での束縛は対象外: axx.py 自身がそれを struct.pack したビット列を
- * int.from_bytes() で普通の Python int として var_manager.put() に渡して
- * いる（put_tagged ではない）ため、そちら側は is_float=0（整数扱い）の
- * ままにして axx.py の実際の挙動に合わせる。 */
+/* パターン変数 1 個ぶんの束縛。is_undef は未定義ラベル由来、is_float は
+   浮動小数点として捕らえた値、text_off は `!L` が覚えたソースの綴りの位置。 */
 typedef struct { uint256_t val; int is_undef; int is_float; int text_off; } PatVar;
 
 /* パターン変数の置き場。名前は綴りだけで決まり、長さは問わない（`a` でも
- * `var_2` でも同じ扱い）。名前はパターンファイルを読むときに登録し、以後は
- * 添字（スロット番号）で扱う。g_nvars は登録した個数で、変数を走査する
- * ループの上限である。捕捉も代入もされていない名前にはスロットを作らず、
- * 式の中で読むと 0 になる。 */
+   `var_2` でも同じ規則）。g_varhash が名前 → スロット番号の表で、同じ籠に
+   入った名前は g_varnext でつなぐ。名前引きは照合 1 回あたり何度も呼ばれる
+   ので、全走査ではなくこの表を引く。 */
 #define NVARS 256
 static int    g_nvars = 0;
-static char  *g_varnames[NVARS];   /* スロット i の名前 */
-static int    g_varlen[NVARS];     /* その長さ */
+static char  *g_varnames[NVARS];
+static int    g_varlen[NVARS];
 
-/* 名前 → スロット番号のハッシュ表（同じ籠の中は g_varnext でつなぐ）。 */
 #define VARHASH_NB 256
 static int    g_varhash[VARHASH_NB];
 static int    g_varnext[NVARS];
 static int    g_varhash_init = 0;
 
-/* 使い回しの作業領域。照合は1行につき何百回も呼ばれるので、そのたびに
- * malloc/free するのをやめる。入れ子で同じ領域が要求されたときだけ malloc に
- * 落ちる（そうならない作りだが、安全のため）。 */
+/* 使い回しの作業領域。照合は 1 行につき何百回も呼ばれるので、そのたびに
+   malloc/free しないための札付きバッファ。busy の間は貸し出し中。 */
 typedef struct { char *p; size_t cap; int busy; } ScratchBuf;
 
+/* 作業領域を借りる。足りなければ伸ばす。貸し出し中なら自分で確保して返す。 */
 static char *sbuf_take(ScratchBuf *b, size_t need){
     if(b->busy){
         char *q = malloc(need);
@@ -131,6 +115,7 @@ static char *sbuf_take(ScratchBuf *b, size_t need){
     return b->p;
 }
 
+/* 借りた作業領域を返す。自分で確保したものならここで解放する。 */
 static void sbuf_give(ScratchBuf *b, char *q){
     if(q == b->p) b->busy = 0;
     else free(q);
@@ -145,7 +130,7 @@ static void axx_copy_trunc(char *dst, size_t dsz, const char *src){
     dst[n] = '\0';
 }
 
-/* パターン変数の名前は小文字で始まり、小文字・数字・`_` が続く。 */
+/* パターン変数名の長さ。小文字で始まり、小文字・数字・`_` が続く。 */
 static int var_name_len(const char *s){
     if(!(s[0] >= 'a' && s[0] <= 'z')) return 0;
     int n = 1;
@@ -153,7 +138,7 @@ static int var_name_len(const char *s){
     return n;
 }
 
-/* 先頭 len 文字がちょうど変数名ひとつか。 */
+/* 先頭 len 文字がちょうど変数名 1 個か。 */
 static int is_var_name_n(const char *s, int len){
     if(len <= 0) return 0;
     if(!(s[0] >= 'a' && s[0] <= 'z')) return 0;
@@ -162,18 +147,12 @@ static int is_var_name_n(const char *s, int len){
     return 1;
 }
 
-/* 名前をスロット番号にする。長さは問わない。create が真なら無ければ新しく
- * 割り当てる。見つからない（かつ create でない）ときは -1。 */
+/* 名前をスロット番号にする。長さは問わない。create が真なら無ければ作る。 */
 static int var_slot(const char *name, int len, int create){
     if(!g_varhash_init){
         for(int i=0;i<VARHASH_NB;i++) g_varhash[i] = -1;
         g_varhash_init = 1;
     }
-    /* 破綻点修正: ここは char[256] 固定で、256 文字以上の変数名を一律 -1
-     * （変数ではない）としていた。axx.py に長さ制限は無いので、長い変数名を
-     * 使ったパターンファイルで caxx だけが「変数ではない」と言って失敗して
-     * いた。照合1回あたり何度も呼ばれる経路なので、ふだんは自動変数のまま
-     * 使い、収まらないときだけヒープへ逃がす（axx_word_buf と同じ考え方）。 */
     char stackbuf[256];
     char *lower = stackbuf;
     char *lower_heap = NULL;
@@ -186,8 +165,6 @@ static int var_slot(const char *name, int len, int create){
     for(int i = 0; i < len; i++) lower[i] = (char)tolower((unsigned char)name[i]);
     lower[len] = '\0';
     if(!is_var_name_n(lower, len)){ free(lower_heap); return -1; }
-    /* 名前引きは照合1回あたり何度も呼ばれるので、名前の全走査ではなく
-     * ハッシュで引く（名前の数が増えても遅くならないようにする）。 */
     unsigned h = 2166136261u;
     for(int i = 0; i < len; i++){ h ^= (unsigned char)lower[i]; h *= 16777619u; }
     h &= VARHASH_NB - 1;
@@ -213,22 +190,30 @@ static int var_slot(const char *name, int len, int create){
     return g_nvars++;
 }
 
-/* 診断に出すための名前。 */
+/* 診断に出すためのスロットの名前。 */
 static const char *var_slot_name(int slot){
     if(slot < 0 || slot >= g_nvars) return "?";
     return g_varnames[slot];
 }
 
-/* 配列シンボルの1項目。数値か文字列のどちらかを持つ。 */
 typedef struct { int is_str; char *s; uint256_t v; } SymItem;
 struct ArrSym { char *name; SymItem *items; int len; };
 
+/* ---- 256bit 整数演算 ----------------------------------------------------
+   アドレスと即値はすべてこの型で持つ。Python の多倍長整数と結果をそろえる
+   のが目的なので、符号付き演算は 2 の補数、シフトは算術シフト、除算と剰余は
+   本体の式評価器の規則（`/` はゼロ方向、`%` は除数の符号）に合わせた
+   専用の関数を用意してある。256bit を超えた桁は黙って落ちるので、
+   そこから先は warn_u256_wrap で一度だけ警告する。
+   ------------------------------------------------------------------------ */
 static uint256_t u256_zero(void) {
     uint256_t r; memset(&r,0,sizeof(r)); return r;
 }
+/* 1。 */
 static uint256_t u256_one(void) {
     uint256_t r = u256_zero(); r.w[0]=1; return r;
 }
+/* 符号付き 64bit から作る（符号拡張する）。 */
 static uint256_t u256_from_i64(int64_t v) {
     uint256_t r;
     r.w[0] = (uint64_t)v;
@@ -236,15 +221,19 @@ static uint256_t u256_from_i64(int64_t v) {
     r.w[1]=r.w[2]=r.w[3]=fill;
     return r;
 }
+/* 符号なし 64bit から作る。 */
 static uint256_t u256_from_u64(uint64_t v) {
     uint256_t r = u256_zero(); r.w[0]=v; return r;
 }
+/* 0 か。 */
 static int u256_is_zero(uint256_t a) {
     return (a.w[0]|a.w[1]|a.w[2]|a.w[3]) == 0;
 }
+/* 等しいか。 */
 static int u256_eq(uint256_t a, uint256_t b) {
     return a.w[0]==b.w[0] && a.w[1]==b.w[1] && a.w[2]==b.w[2] && a.w[3]==b.w[3];
 }
+/* 符号付きで a < b か。 */
 static int u256_lt_signed(uint256_t a, uint256_t b) {
     int sa = (int)(a.w[3] >> 63);
     int sb = (int)(b.w[3] >> 63);
@@ -254,12 +243,14 @@ static int u256_lt_signed(uint256_t a, uint256_t b) {
     if (a.w[1] != b.w[1]) return a.w[1] < b.w[1];
     return a.w[0] < b.w[0];
 }
+/* 符号付きで a <= b か。 */
 static int u256_le_signed(uint256_t a, uint256_t b) {
     return u256_eq(a,b) || u256_lt_signed(a,b);
 }
 static int u256_gt_signed(uint256_t a, uint256_t b) { return u256_lt_signed(b,a); }
 static int u256_ge_signed(uint256_t a, uint256_t b) { return u256_le_signed(b,a); }
 
+/* 加算（桁上がりを下から伝える）。 */
 static uint256_t u256_add(uint256_t a, uint256_t b) {
     uint256_t r;
     uint64_t carry = 0;
@@ -270,26 +261,33 @@ static uint256_t u256_add(uint256_t a, uint256_t b) {
     }
     return r;
 }
+/* 符号反転（2 の補数）。 */
 static uint256_t u256_neg(uint256_t a) {
     uint256_t r;
     for(int i=0;i<4;i++) r.w[i]=~a.w[i];
     return u256_add(r, u256_one());
 }
+/* 減算。 */
 static uint256_t u256_sub(uint256_t a, uint256_t b) {
     return u256_add(a, u256_neg(b));
 }
+/* ビット NOT。 */
 static uint256_t u256_not(uint256_t a) {
     uint256_t r; for(int i=0;i<4;i++) r.w[i]=~a.w[i]; return r;
 }
+/* ビット AND。 */
 static uint256_t u256_and(uint256_t a, uint256_t b) {
     uint256_t r; for(int i=0;i<4;i++) r.w[i]=a.w[i]&b.w[i]; return r;
 }
+/* ビット OR。 */
 static uint256_t u256_or(uint256_t a, uint256_t b) {
     uint256_t r; for(int i=0;i<4;i++) r.w[i]=a.w[i]|b.w[i]; return r;
 }
+/* ビット XOR。 */
 static uint256_t u256_xor(uint256_t a, uint256_t b) {
     uint256_t r; for(int i=0;i<4;i++) r.w[i]=a.w[i]^b.w[i]; return r;
 }
+/* 左シフト。n が幅以上なら 0。 */
 static uint256_t u256_shl(uint256_t a, int n) {
     if (n <= 0) return a;
     if (n >= 256) return u256_zero();
@@ -303,6 +301,7 @@ static uint256_t u256_shl(uint256_t a, int n) {
     }
     return r;
 }
+/* 算術右シフト。符号を保つ。 */
 static uint256_t u256_sar(uint256_t a, int n) {
     if (n <= 0) return a;
     if (n >= 256) {
@@ -326,6 +325,7 @@ static uint256_t u256_sar(uint256_t a, int n) {
     }
     return r;
 }
+/* 乗算。256bit を超えた桁は落ちる。 */
 static uint256_t u256_mul(uint256_t a, uint256_t b) {
     uint256_t r = u256_zero();
     for (int i=0;i<4;i++){
@@ -338,9 +338,11 @@ static uint256_t u256_mul(uint256_t a, uint256_t b) {
     }
     return r;
 }
+/* 符号付き乗算。 */
 static uint256_t u256_mul_signed(uint256_t a, uint256_t b) {
     return u256_mul(a,b);
 }
+/* 符号なし除算。 */
 static uint256_t u256_udiv(uint256_t a, uint256_t b) {
     if (u256_is_zero(b)) return u256_zero();
     uint256_t q = u256_zero();
@@ -359,6 +361,7 @@ static uint256_t u256_udiv(uint256_t a, uint256_t b) {
     }
     return q;
 }
+/* `//` … 負の無限方向へ丸める除算。 */
 static uint256_t u256_floordiv(uint256_t a, uint256_t b) {
     if (u256_is_zero(b)) { fprintf(stderr,"Division by zero\n"); return u256_zero(); }
     int sa = (int)(a.w[3]>>63);
@@ -373,6 +376,7 @@ static uint256_t u256_floordiv(uint256_t a, uint256_t b) {
     }
     return q;
 }
+/* `/` … ゼロ方向へ切り捨てる除算（`-7/3 == -2`）。 */
 static uint256_t u256_truncdiv(uint256_t a, uint256_t b) {
     if (u256_is_zero(b)) { fprintf(stderr,"Division by zero\n"); return u256_zero(); }
     int sa = (int)(a.w[3]>>63);
@@ -383,12 +387,16 @@ static uint256_t u256_truncdiv(uint256_t a, uint256_t b) {
     if (sa != sb) q = u256_neg(q);
     return q;
 }
+/* `%` … 結果が除数の符号に従う剰余（`-7%3 == 2`）。Python と同じで、
+   C の `%` とは違う。ミニ言語とマクロ層の `%` は C と同じなので、
+   層をまたいで式を写すときは負の値に注意。 */
 static uint256_t u256_mod(uint256_t a, uint256_t b) {
     if (u256_is_zero(b)) { fprintf(stderr,"Division by zero\n"); return u256_zero(); }
     uint256_t q = u256_floordiv(a,b);
     return u256_sub(a, u256_mul(q,b));
 }
 
+/* `**` … べき乗。桁が溢れる前に打ち切る。 */
 static uint256_t u256_pow(uint256_t base, uint256_t exp) {
     uint256_t r = u256_one();
     for (int wi = 0; wi < 4; wi++) {
@@ -411,19 +419,15 @@ static uint256_t u256_pow(uint256_t base, uint256_t exp) {
 
 static int64_t u256_to_i64(uint256_t a) { return (int64_t)a.w[0]; }
 static uint64_t u256_to_u64(uint256_t a) { return a.w[0]; }
-/* u256_to_i64/u64 は下位64bitしか見ないため、シフト量や指数のように
- * 「安全な範囲に収まっているか」を判定する用途にそのまま使うと、上位ワードに
- * 値が乗っている(=64bitを大きく超える)ケースで切り詰められた小さい値として
- * 誤判定してしまう(境界チェックの回避を許してしまう)。符号と、小さな定数
- * 上限との大小関係を上位ワードも含めて正しく判定するヘルパー。 */
 static int u256_is_neg256(uint256_t v){ return (int)(v.w[3]>>63); }
+/* 非負の v が max を超えるか。シフト量や指数のように下位 64bit だけ見ると
+   危ない場所で、上位の桁が立っていないことまで確かめるために使う。 */
 static int u256_nonneg_gt_i64(uint256_t v, int64_t max){
-    /* v は非負であることが呼び出し側で確認済みという前提。max は 64bit に
-     * 収まる小さな正の定数であることが前提(EXP_MAX/SHIFT_MAX 用途)。 */
     if(v.w[1] || v.w[2] || v.w[3]) return 1;
     return v.w[0] > (uint64_t)max;
 }
 
+/* `@` 演算子。最上位の立っているビットの位置を右から数える。 */
 static int u256_nbit(uint256_t v) {
     int sign = (int)(v.w[3] >> 63);
     if(sign){
@@ -446,18 +450,13 @@ static int u256_nbit(uint256_t v) {
     return b;
 }
 
-/* 本体の式評価器が持つ単項/後置演算子の実装。マクロ層からも同じ意味で呼べる
- * ように評価器の外へ出してある。どれも診断は出さず「値と、あれば伝えるべき
- * 文言」を返すだけにして、報告はそれぞれの層に任せる。
- * axx.py の op_msb / op_sext / op_byte と同じ。 */
 
 #define SEXT_MAX_BITS 128
 
-/* `@v` … 最上位の立っているビットの位置を右から数えた値。 */
 static int op_msb(uint256_t v){ return u256_nbit(v); }
 
-/* `x'bits` … ビット bits-1 を符号ビットとみなした符号拡張。
- * warn_out には上限超えのときだけ 1 が入る（表示は呼び出し側）。 */
+/* `x'bits` … ビット bits-1 を符号ビットとみなした符号拡張。幅が大きすぎる
+   ときは warn_out に印を立て、報告は呼び出し側に任せる。 */
 static uint256_t op_sext(uint256_t x, uint256_t bits, int *warn_out){
     *warn_out = 0;
     if(u256_is_neg256(bits) || u256_is_zero(bits)) return u256_zero();
@@ -471,9 +470,7 @@ static uint256_t op_sext(uint256_t x, uint256_t bits, int *warn_out){
     return x;
 }
 
-/* `*(x, index)` … 下位から数えて index バイト目より上を残した値。
- * index が負なら neg_out に 1 を入れて 0 を返す（表示は呼び出し側）。
- * 256 を超える分は符号で埋まるだけなので先に頭打ちにする。 */
+/* `*(x, index)` … 下位から数えて index バイト目より上を残した値。 */
 static uint256_t op_byte(uint256_t x, uint256_t index, int *neg_out){
     *neg_out = 0;
     if(u256_is_neg256(index)){ *neg_out = 1; return u256_zero(); }
@@ -481,28 +478,16 @@ static uint256_t op_byte(uint256_t x, uint256_t index, int *neg_out){
     return u256_sar(x, shift);
 }
 
-/* 未定義ラベルの値を表す番兵。
- *
- * 破綻点修正: 以前は ~0（全ビット1）だった。これは二の補数では -1 そのものなので、
- * 式が正当に -1 を返しただけで「未定義ラベル由来」と誤判定していた
- * （`MVI A,-1` がアセンブルできない、等）。axx.py の番兵 (1<<1024)-1 は
- * 巨大な「正」の値で -1 とは別物であり、C 側だけが衝突していた。
- *
- * uint256_t には 256bit を超える帯域外の余地が無いため、代わりに
- * 「符号付きで表せる最大値」= 0x7FFF...FFFF を番兵に使う。こうすると
- *   - -1 は符号付き絶対値が 1 なので未定義由来と判定されない
- *   - 番兵そのものと、そこから算術で派生した値（UNDEF+4 等）は
- *     符号付き絶対値が 2**192 以上のままなので従来どおり検出できる
- * という両立ができる。2**192 以上の正当な巨大定数を誤判定しうる点は
- * 従来と変わらない（下の警告を参照）。 */
+/* 未定義ラベルの値を表す番兵。巨大な整数にしてあるので、`label+4` のように
+   普通の算術に流れ込んでも未定義性が計算結果へ伝わっていく。 */
 static uint256_t UNDEF_VAL(void) {
     uint256_t r = u256_not(u256_zero());
     r.w[3] &= 0x7FFFFFFFFFFFFFFFULL;
     return r;
 }
 static int u256_is_undef(uint256_t a) { return u256_eq(a, UNDEF_VAL()); }
+/* 値が未定義ラベル由来かを閾値で判定する。 */
 static int u256_is_undef_derived(uint256_t a) {
-    /* 番兵そのものは確定なので、下のヒューリスティック警告を出さずに返す。 */
     if (u256_is_undef(a)) return 1;
     int sign = (int)(a.w[3] >> 63);
     uint256_t av = sign ? u256_neg(a) : a;
@@ -520,24 +505,18 @@ static int u256_is_undef_derived(uint256_t a) {
     return av.w[3] != 0;
 }
 
-/* 破綻点修正: uint256_t は 256bit を超えた桁を黙って捨てるので、そこから先は
- * 多倍長の axx.py と値が食い違う。マニュアル 6.4 は「両実装とも、値が判断
- * できない帯域に入ったとき警告する」と約束しているのに、この巻き戻りだけが
- * 無言だった（`30<<300` が 0 になる等）。1 回だけ知らせる。
- * 2**192 以上の帯域は UNDEF センチネル由来の判定が別に警告するので、
- * そちらと二重に出さないよう黙っておく。 */
+/* 正当な巨大値と未定義由来の区別が付かない帯に入っているか。
+   この帯では上の判定が誤りうることを一度だけ警告する。 */
 static int u256_in_undef_band(uint256_t a){
     int sign = (int)(a.w[3] >> 63);
     uint256_t av = sign ? u256_neg(a) : a;
     return av.w[3] != 0;
 }
+/* 256bit を超えて桁が落ちたことを一度だけ警告する。 */
 static void warn_u256_wrap(const char *op){
     static int warned = 0;
     if(warned) return;
     warned = 1;
-    /* force=1 で出す。巻き戻りは照合の途中（!x の捕捉など）で起きることが
-     * ほとんどで、そこは通常の診断が抑制される場所だが、値が axx.py と
-     * 食い違う事実は採用されるパターンとは無関係に伝える必要がある。 */
     axx_diagf(0, 1, " warning - a value overflowed 256 bits in '%s' and was wrapped; "
                     "axx.py keeps the full precision there, so the two implementations "
                     "disagree above 2**256 (manual 6.4).\n", op);
@@ -551,6 +530,11 @@ typedef struct {
 
 static void ds_init(DynStr *d) { d->buf=NULL; d->len=0; d->cap=0; }
 static AXX_UNUSED void ds_free(DynStr *d) { free(d->buf); ds_init(d); }
+/* ---- 可変長の文字列とベクタ -------------------------------------------
+   DynStr が伸びる文字列、IntVec が 256bit 整数の列、StrVec が文字列の列。
+   どれも必要なときだけ倍々に伸ばす。AXX_UNUSED が付いているものは、
+   対称性のために置いてあって今は呼ばれていない。
+   ------------------------------------------------------------------------ */
 static void ds_ensure(DynStr *d, size_t need) {
     if (d->cap >= need+1) return;
     size_t nc = (need+1)*2;
@@ -559,22 +543,26 @@ static void ds_ensure(DynStr *d, size_t need) {
     if(!d->buf){perror("realloc");exit(1);}
     d->cap = nc;
 }
+/* 文字列を設定する（現在は未使用）。 */
 static AXX_UNUSED void ds_set(DynStr *d, const char *s) {
     size_t l = strlen(s);
     ds_ensure(d, l);
     memcpy(d->buf, s, l+1);
     d->len = l;
 }
+/* 1 文字を設定する（現在は未使用）。 */
 static AXX_UNUSED void ds_setc(DynStr *d, char c) {
     ds_ensure(d,1);
     d->buf[0]=c; d->buf[1]=0; d->len=1;
 }
+/* 文字列を足す（現在は未使用）。 */
 static AXX_UNUSED void ds_append(DynStr *d, const char *s) {
     size_t l=strlen(s);
     ds_ensure(d, d->len+l);
     memcpy(d->buf+d->len, s, l+1);
     d->len+=l;
 }
+/* 1 文字を足す（現在は未使用）。 */
 static AXX_UNUSED void ds_appendc(DynStr *d, char c) {
     ds_ensure(d, d->len+1);
     d->buf[d->len++]=c;
@@ -590,6 +578,7 @@ typedef struct {
 
 static void iv_init(IntVec *v) { v->data=NULL; v->len=0; v->cap=0; }
 static void iv_free(IntVec *v) { free(v->data); iv_init(v); }
+/* 整数列に 1 個積む。 */
 static void iv_push(IntVec *v, uint256_t x) {
     if(v->len>=v->cap){
         v->cap = v->cap ? v->cap*2 : 8;
@@ -599,18 +588,17 @@ static void iv_push(IntVec *v, uint256_t x) {
     v->data[v->len++]=x;
 }
 static void iv_clear(IntVec *v) { v->len=0; }
+/* 整数列を写す。 */
 static void iv_copy(IntVec *dst, const IntVec *src) {
     iv_clear(dst);
     for(int i=0;i<src->len;i++) iv_push(dst, src->data[i]);
 }
+/* 整数列を連結する（現在は未使用）。 */
 static AXX_UNUSED void iv_append(IntVec *dst, const IntVec *src) {
     for(int i=0;i<src->len;i++) iv_push(dst, src->data[i]);
 }
 
-/* 破綻点修正: VLIW パケットのスロット添字列（vliwprocess の idxlst）が
- * 固定256要素で確保されていて、それを超えると axx.py には無いエラーで
- * 打ち切っていた（axx.py はただの list なので無制限）。他の可変長配列
- * (IntVec)と同じ倍々伸長で置き換える。 */
+/* 素の int 配列に 1 個積む（必要なら伸ばす）。 */
 static void ilst_push(int **arr, int *n, int *cap, int v) {
     if(*n >= *cap){
         *cap = *cap ? *cap*2 : 256;
@@ -626,6 +614,7 @@ typedef struct {
     int    cap;
 } StrVec;
 static void sv_init(StrVec *v){v->data=NULL;v->len=0;v->cap=0;}
+/* 文字列列に 1 個積む。 */
 static void sv_push(StrVec *v, const char *s){
     if(v->len>=v->cap){
         v->cap=v->cap?v->cap*2:8;
@@ -634,15 +623,16 @@ static void sv_push(StrVec *v, const char *s){
     }
     v->data[v->len++]=strdup(s);
 }
+/* 文字列列から 1 個外す。 */
 static void sv_pop(StrVec *v){
     if(v->len>0){free(v->data[--v->len]);}
 }
+/* 文字列列を解放する（現在は未使用）。 */
 static AXX_UNUSED void sv_free(StrVec *v){
     for(int i=0;i<v->len;i++)free(v->data[i]);
     free(v->data); sv_init(v);
 }
-/* 添字 idx の要素を s に置き換える。len<=idx なら空文字列で埋めて伸ばす。
- * .error::n::"Message" のような「番号を指定して差し替える」用途向け。 */
+/* 添字の要素を差し替える。足りなければ空文字で伸ばす（現在は未使用）。 */
 static AXX_UNUSED void sv_set(StrVec *v, int idx, const char *s){
     while(v->len<=idx) sv_push(v, "");
     char *dup = strdup(s);
@@ -651,25 +641,16 @@ static AXX_UNUSED void sv_set(StrVec *v, int idx, const char *s){
     v->data[idx] = dup;
 }
 
-/* .enum で登録された列挙。names は要素名（大文字化済み）を列挙順に、
- * expr は `!E<変数>` が拾ったリストから値を作る式を持つ。
- * expr が NULL なら、その変数に列挙は定義されていない。 */
 typedef struct { StrVec names; char *expr; } EnumDef;
 
 static void enumdef_init(EnumDef *e){ sv_init(&e->names); e->expr=NULL; }
-/* 配列シンボルの表が変わった回数。`.check` の名前一覧は配列シンボルを
- * 展開して作るので、表が変わっていなければ作り直さず使い回せる。 */
 static long long g_arrgen = 0;
 
-/* ---- `.check` の許容名リスト -----------------------------------------
- * `.check` が変数に与える名前の一覧は、作ったあと中身を書き換えない。
- * それでいて写しは多い（ディレクティブ行の実行、候補ごとの退避と復元、
- * 行ごとの作り直し）。1行につき何千回も strdup していたので、参照数を
- * 数えて共有し、写しは数を増やすだけにする。
- * 中身を変える必要があるところ（`.free` で名前を1つ外す）は、新しい
- * リストを作って置き換える（書くときに写す）。 */
 typedef struct { int refs; StrVec v; } ChkList;
 
+/* `.check` の許容名リスト。`.check` は配列シンボルを参照できるので、
+   同じリストが複数の変数から共有されうる。参照数を数えて、最後の持ち主が
+   手放したときだけ解放する。 */
 static ChkList *chk_new(void){
     ChkList *c = malloc(sizeof(*c));
     if(!c){ perror("malloc"); exit(1); }
@@ -678,11 +659,12 @@ static ChkList *chk_new(void){
     return c;
 }
 static ChkList *chk_ref(ChkList *c){ if(c) c->refs++; return c; }
+/* 参照を 1 つ手放す。0 になったら解放する。 */
 static void chk_unref(ChkList *c){
     if(!c) return;
     if(--c->refs == 0){ sv_free(&c->v); free(c); }
 }
-/* slot の中身を nw に差し替える（古いほうを手放す）。 */
+/* スロットの中身を差し替える（古いほうを手放す）。 */
 static void chk_install(ChkList **slot, ChkList *nw){
     ChkList *old = *slot;
     *slot = nw;
@@ -691,25 +673,25 @@ static void chk_install(ChkList **slot, ChkList *nw){
 static int chk_len(const ChkList *c){ return c ? c->v.len : 0; }
 static const char *chk_at(const ChkList *c, int i){ return c->v.data[i]; }
 
+/* `.enum` の登録を捨てる。 */
 static void enumdef_clear(EnumDef *e){
     sv_free(&e->names);
     free(e->expr); e->expr=NULL;
 }
+/* `.enum` の登録を写す。 */
 static void enumdef_copy(EnumDef *dst, const EnumDef *src){
     enumdef_clear(dst);
     for(int i=0;i<src->names.len;i++) sv_push(&dst->names, src->names.data[i]);
     dst->expr = src->expr ? strdup(src->expr) : NULL;
 }
 
-/* `.sub::名前 … .return` で登録されたサブ表。
- * pat は項目の照合パターン、val は値欄（カンマ区切りの式）。
- * `!S{{名前}}<変数>` は、この表のどれか1項目に一致したとき、その項目の値欄を
- * 評価した結果をその変数に束縛する。 */
 typedef struct { char *pat; char *val; } SubEntry;
 typedef struct { char *name; SubEntry *e; int n; int cap; int freed; } SubDef;
 typedef struct { SubDef *data; int len; int cap; } SubVec;
 
 static void subv_init(SubVec*v){ v->data=NULL; v->len=0; v->cap=0; }
+/* `.sub::名前 … .return` で登録されたサブ表。参照は `!S{{名前}}` で、
+   使用箇所より後に定義してよいので、ファイル全体を読んでから解決する。 */
 static void subv_free(SubVec*v){
     for(int i=0;i<v->len;i++){
         for(int j=0;j<v->data[i].n;j++){
@@ -721,22 +703,22 @@ static void subv_free(SubVec*v){
     }
     free(v->data); subv_init(v);
 }
+/* 名前でサブ表を引く。 */
 static SubDef *subv_find(SubVec*v, const char *name){
     for(int i=0;i<v->len;i++) if(strcmp(v->data[i].name,name)==0) return &v->data[i];
     return NULL;
 }
-/* `.free` で「この行から先は使わない」と印を付ける。表そのものは消さない。
- * `.sub` はパターンを読むときに一度だけ組み立てられ、`.setsym` のように
- * ソース1行ごとに作り直されはしないので、消してしまうと `.free` より前に
- * 書かれたパターンまで2行目以降に使えなくなる。印は行の頭で落とす。 */
+/* `.free` で「この行から先は使わない」と印を付ける。表そのものは消さない。 */
 static int subv_mark_freed(SubVec*v, const char *name){
     for(int i=0;i<v->len;i++)
         if(strcasecmp(v->data[i].name, name)==0){ v->data[i].freed = 1; return 1; }
     return 0;
 }
+/* すべてのサブ表の印を外す。 */
 static void subv_unfreeze_all(SubVec*v){
     for(int i=0;i<v->len;i++) v->data[i].freed = 0;
 }
+/* サブ表を 1 つ作る。 */
 static SubDef *subv_new(SubVec*v, const char *name){
     SubDef *old = subv_find(v, name);
     if(old){
@@ -755,6 +737,7 @@ static SubDef *subv_new(SubVec*v, const char *name){
     if(!d->name){ perror("strdup"); exit(1); }
     return d;
 }
+/* サブ表にエントリ（パターンと値リスト）を 1 つ足す。 */
 static void subdef_push(SubDef *d, const char *pat, const char *val){
     if(d->n>=d->cap){
         d->cap = d->cap ? d->cap*2 : 8;
@@ -775,9 +758,6 @@ static int is_sub_name(const char *s){
     return 1;
 }
 
-/* ==================== ミニ言語 (`.func` / `.call`) の型 ====================
- * `binary_list` 欄の `.call 名前(引数,…)` から呼ばれる、チューリング完全な
- * 小さな手続き型言語。値は 256bit 2の補数の整数か、その配列。 */
 
 typedef struct {
     int        is_arr;
@@ -788,9 +768,9 @@ typedef struct {
 
 typedef enum {
     MX_NUM, MX_VAR, MX_ARRLIT, MX_INDEX, MX_SLICE, MX_LEN, MX_BIN, MX_UN,
-    MX_CALL, /* 式の途中の `.call 名前(引数, ...)`。name と items を使う */
-    MX_STR,  /* `.echo` の文字列リテラル専用。式としては評価されない */
-    MX_CORE  /* `$$` `$.` `#記号` … 本体の式評価器に委譲する項 */
+    MX_CALL,
+    MX_STR,
+    MX_CORE
 } MXKind;
 
 typedef struct MExpr {
@@ -810,17 +790,17 @@ typedef enum {
 
 typedef struct MStmt {
     MSKind         k;
-    char          *name;       /* 代入先 / 呼ぶ関数名 / .for の変数 */
-    char          *fname;      /* `var = .call f(...)` の呼ぶ関数名 */
-    MExpr         *idx;        /* 代入先の添字。無ければ NULL */
-    MExpr         *val;        /* 代入する式 / .if .while の条件 / .return の値 */
-    MExpr        **args;       /* .emit .call の引数, .for の range 引数 */
+    char          *name;
+    char          *fname;
+    MExpr         *idx;
+    MExpr         *val;
+    MExpr        **args;
     int            nargs;
-    struct MStmt **body;       /* .if の then / .while .for の本体 */
+    struct MStmt **body;
     int            nbody;
-    struct MStmt **body2;      /* .if の else */
+    struct MStmt **body2;
     int            nbody2;
-    char         **names;      /* .nonlocal の名前 */
+    char         **names;
     int            nnames;
     const char    *file;
     int            line;
@@ -830,18 +810,18 @@ typedef struct MiniFunc {
     char             *name;
     char            **params;
     int               nparams;
-    char            **lines;     /* 読み込み時に集めた本体の行 */
+    char            **lines;
     char            **lfiles;
     int              *llines;
     int               nlines, clines;
-    MStmt           **body;      /* 解析済みの文の並び */
+    MStmt           **body;
     int               nbody;
     struct MiniFunc  *parent;
     struct MiniFunc **children;
     int               nchildren, cchildren;
     char             *file;
     int               line;
-    int               depth;     /* 読み込み中のブロック深さ */
+    int               depth;
 } MiniFunc;
 
 typedef struct { MiniFunc **data; int len; int cap; } MiniFuncVec;
@@ -850,6 +830,7 @@ static void mfv_init(MiniFuncVec *v){ v->data = NULL; v->len = 0; v->cap = 0; }
 
 typedef struct { int *data; int len; int cap; } IStack;
 static void is_init(IStack*v){v->data=NULL;v->len=0;v->cap=0;}
+/* int のスタックに 1 個積む。 */
 static void is_push(IStack*v,int x){
     if(v->len>=v->cap){v->cap=v->cap?v->cap*2:8;v->data=realloc(v->data,v->cap*sizeof(int));if(!v->data){perror("realloc");exit(1);}}
     v->data[v->len++]=x;
@@ -858,19 +839,14 @@ static int is_pop(IStack*v){return v->len>0?v->data[--v->len]:0;}
 
 #define HASH_INIT_CAP 64
 
-/* ラベル1個ぶんの定義。ハッシュ表 LabelMap のチェイン要素でもある。 */
 typedef struct LabelEntry {
-    char          *key;                 /* ラベル名 */
-    uint256_t      value;               /* 値（.EQU なら定数、通常はアドレス） */
-    char          *section;             /* 属するセクション名 */
-    int            is_equ;              /* .EQU 由来か（アドレスではなく定数） */
-    int            is_imported;         /* .extern の仮登録。実定義で上書き可 */
-    int            reloc_type_override; /* `::型名` で明示指定されたリロケーション型 */
-    int            is_undef;            /* 参照されたが未定義 */
-    /* 破綻点修正: 診断でラベルを並べるとき、caxx はハッシュ籠の順で出していた
-     * のに対し axx.py は dict の挿入順（＝定義順）で出すため、
-     * "address mismatch between pass1 and pass2" の一覧の並びが食い違って
-     * いた。登録順を控えて、表示はその順にそろえる。 */
+    char          *key;
+    uint256_t      value;
+    char          *section;
+    int            is_equ;
+    int            is_imported;
+    int            reloc_type_override;
+    int            is_undef;
     long long      seq;
     struct LabelEntry *next;
 } LabelEntry;
@@ -879,15 +855,20 @@ typedef struct {
     LabelEntry **buckets;
     int          nbuckets;
     int          count;
-    long long    seq_next;   /* 次に登録するラベルの登録番号 */
+    long long    seq_next;
 } LabelMap;
 
+/* ---- ラベル表とシンボル表 ---------------------------------------------
+   どちらも開番地法のハッシュ表。ラベル表は定義順（seq）も覚えていて、
+   エクスポートとリスティングを書かれた順に出せるようにしてある。
+   ------------------------------------------------------------------------ */
 static uint32_t hash_str(const char *s) {
     uint32_t h=5381;
     unsigned char c;
     while((c=(unsigned char)*s++)) h=((h<<5)+h)+c;
     return h;
 }
+/* ラベル表を初期化する。 */
 static void lmap_init(LabelMap *m) {
     m->nbuckets=HASH_INIT_CAP;
     m->buckets=calloc(m->nbuckets,sizeof(LabelEntry*));
@@ -895,14 +876,13 @@ static void lmap_init(LabelMap *m) {
     m->seq_next=0;
 }
 
-/* 登録順に並べた要素の配列を返す（呼び出し側が free する）。診断でラベルを
- * 並べるところと、表から表へ写すところで使う。axx.py の dict の反復順と
- * 同じ並びになる。 */
+/* 定義順に並べるための比較関数。 */
 static int lmap_cmp_seq(const void *a, const void *b){
     const LabelEntry *x = *(const LabelEntry * const *)a;
     const LabelEntry *y = *(const LabelEntry * const *)b;
     return (x->seq > y->seq) - (x->seq < y->seq);
 }
+/* ラベルを定義順に並べた配列を返す。出力の順を実装間でそろえるため。 */
 static LabelEntry **lmap_in_order(LabelMap *m, int *nout){
     int n = 0;
     LabelEntry **v = malloc((size_t)(m->count ? m->count : 1) * sizeof(LabelEntry*));
@@ -914,6 +894,7 @@ static LabelEntry **lmap_in_order(LabelMap *m, int *nout){
     *nout = n;
     return v;
 }
+/* ラベル表を解放する。 */
 static void lmap_free(LabelMap *m) {
     for(int i=0;i<m->nbuckets;i++){
         LabelEntry *e=m->buckets[i];
@@ -921,15 +902,13 @@ static void lmap_free(LabelMap *m) {
     }
     free(m->buckets); m->buckets=NULL; m->count=0; m->nbuckets=0;
 }
-/* 破綻点修正: バケット数が 64 固定でリハッシュしなかったため、ラベルが増えると
- * チェインが伸びて検索が O(n) になり、全体が O(n^2) になっていた（大きなソースで
- * 目に見えて遅くなる）。要素数がバケット数の4倍を超えたら4倍に広げる。 */
+/* 詰まってきたら表を倍にして詰め直す。 */
 static void lmap_maybe_grow(LabelMap *m) {
     if(!m->buckets || m->nbuckets <= 0) return;
     if(m->count < m->nbuckets * 4) return;
     int nb = m->nbuckets * 4;
     LabelEntry **nbuf = calloc((size_t)nb, sizeof(LabelEntry*));
-    if(!nbuf) return;                    /* 広げられなくても動作は正しいまま */
+    if(!nbuf) return;
     for(int i=0;i<m->nbuckets;i++){
         LabelEntry *e = m->buckets[i];
         while(e){
@@ -943,6 +922,7 @@ static void lmap_maybe_grow(LabelMap *m) {
     m->buckets = nbuf; m->nbuckets = nb;
 }
 
+/* ラベルを引く。 */
 static LabelEntry *lmap_find(LabelMap *m, const char *key) {
     if(!m->nbuckets) return NULL;
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
@@ -951,6 +931,7 @@ static LabelEntry *lmap_find(LabelMap *m, const char *key) {
     return NULL;
 }
 static int lmap_contains(LabelMap *m, const char *key) { return lmap_find(m,key)!=NULL; }
+/* ラベルを定義する。`.equ` のものは再配置情報を持たない定数として扱う。 */
 static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *sec, int is_equ, int is_undef) {
     if(!m->nbuckets) return;
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
@@ -958,10 +939,6 @@ static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *se
         if(strcmp(e->key,key)==0){
             e->value=val; free(e->section); e->section=strdup(sec); e->is_equ=is_equ; e->is_undef=is_undef;
             e->is_imported = 0;
-            /* リロケーション型の指定（`.global 名前::型名`、`.extern`、
-             * `.EQU x::型名`）はラベルの定義とは別に宣言されるものなので、
-             * 同じ名前を置き直しても消さない。`.global` は宣言がラベル定義より
-             * 前に書かれるのが普通で、ここで消すと指定が効かなかった。 */
             return;
         }
     }
@@ -972,10 +949,12 @@ static void lmap_set(LabelMap *m, const char *key, uint256_t val, const char *se
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
     lmap_maybe_grow(m);
 }
+/* ラベルにリロケーション型を付ける。 */
 static void lmap_set_reloc_type(LabelMap *m, const char *key, int reloc_type) {
     LabelEntry *e = lmap_find(m, key);
     if(e) e->reloc_type_override = reloc_type;
 }
+/* `-i` で取り込んだラベルを登録する。これは後から上書きしてよい。 */
 static void lmap_set_imported(LabelMap *m, const char *key, uint256_t val, const char *sec, int reloc_type) {
     if(!m->nbuckets) return;
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
@@ -1017,6 +996,7 @@ static void lmap_set_full(LabelMap *m, const char *key, uint256_t val,
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
     lmap_maybe_grow(m);
 }
+/* ラベルを消す（現在は未使用）。 */
 static AXX_UNUSED void lmap_delete(LabelMap *m, const char *key) {
     uint32_t h=hash_str(key)%(uint32_t)m->nbuckets;
     LabelEntry **pp=&m->buckets[h];
@@ -1029,6 +1009,7 @@ static AXX_UNUSED void lmap_delete(LabelMap *m, const char *key) {
     }
 }
 typedef void (*lmap_iter_fn)(const char*key, uint256_t val, const char*sec, void*user);
+/* ラベルを順に渡す（現在は未使用）。 */
 static AXX_UNUSED void lmap_iter(LabelMap *m, lmap_iter_fn fn, void*user){
     for(int i=0;i<m->nbuckets;i++)
         for(LabelEntry*e=m->buckets[i];e;e=e->next)
@@ -1038,36 +1019,36 @@ static AXX_UNUSED void lmap_iter(LabelMap *m, lmap_iter_fn fn, void*user){
 typedef struct SymEntry { char*key; uint256_t val; struct SymEntry*next; } SymEntry;
 typedef struct { SymEntry**buckets; int nb; int count; } SymMap;
 static void smap_init(SymMap*m){m->nb=HASH_INIT_CAP;m->buckets=calloc(m->nb,sizeof(SymEntry*));m->count=0;}
+/* シンボル表を解放する。 */
 static void smap_free(SymMap*m){
     for(int i=0;i<m->nb;i++){SymEntry*e=m->buckets[i];while(e){SymEntry*n=e->next;free(e->key);free(e);e=n;}}
     free(m->buckets);m->buckets=NULL;
 }
+/* シンボルを引く。 */
 static SymEntry *smap_find(SymMap*m,const char*key){
     uint32_t h=hash_str(key)%(uint32_t)m->nb;
     for(SymEntry*e=m->buckets[h];e;e=e->next) if(strcmp(e->key,key)==0)return e;
     return NULL;
 }
+/* シンボルの値を取る。無ければ 0 を返して値は触らない。 */
 static int smap_get(SymMap*m,const char*key,uint256_t*out){
     SymEntry*e=smap_find(m,key); if(e){*out=e->val;return 1;} return 0;
 }
+/* シンボルを定義する。同じ名前は上書きする。 */
 static void smap_set(SymMap*m,const char*key,uint256_t val){
     uint32_t h=hash_str(key)%(uint32_t)m->nb;
     for(SymEntry*e=m->buckets[h];e;e=e->next) if(strcmp(e->key,key)==0){e->val=val;return;}
     SymEntry*e=calloc(1,sizeof(SymEntry)); e->key=strdup(key); e->val=val;
     e->next=m->buckets[h]; m->buckets[h]=e; m->count++;
 }
+/* シンボルを消す。 */
 static void smap_delete(SymMap*m,const char*key){
     uint32_t h=hash_str(key)%(uint32_t)m->nb;
     SymEntry**pp=&m->buckets[h];
     while(*pp){ if(strcmp((*pp)->key,key)==0){SymEntry*d=*pp;*pp=d->next;free(d->key);free(d);m->count--;return;} pp=&(*pp)->next; }
 }
-/* dst の中身を src と同じにする。
- * 素直に「空にして入れ直す」と、項目ごとに calloc と strdup と free が要る。
- * ここは1行ごとに何度も通る（前置きの状態戻し、候補の退避と復元）ので、
- * 既にある項目は入れ物ごと使い回し、値だけ書き換える。鍵の集合が同じなら
- * 確保も解放も1回も起きない。 */
+/* シンボル表を丸ごと写す。反復の頭で初期状態へ戻すのに使う。 */
 static void smap_assign(SymMap *dst, const SymMap *src){
-    /* 1. dst にあって src に無い鍵を外し、両方にある鍵は値を移す。 */
     for(int i=0;i<dst->nb;i++){
         SymEntry **pp = &dst->buckets[i];
         while(*pp){
@@ -1077,12 +1058,12 @@ static void smap_assign(SymMap *dst, const SymMap *src){
             else { *pp = e->next; free(e->key); free(e); dst->count--; }
         }
     }
-    /* 2. src にあって dst に無い鍵を足す。 */
     for(int i=0;i<src->nb;i++)
         for(SymEntry *e=src->buckets[i]; e; e=e->next)
             if(!smap_find(dst, e->key)) smap_set(dst, e->key, e->val);
 }
 
+/* シンボル表を空にする。 */
 static void smap_clear(SymMap*m){
     for(int i=0;i<m->nb;i++){
         SymEntry*e=m->buckets[i];
@@ -1092,23 +1073,27 @@ static void smap_clear(SymMap*m){
     m->count=0;
 }
 
-/* セクション1個ぶん。.section / .endsection の出入りで複数回訪れうる。 */
 typedef struct SecEntry {
     char       *name;
-    uint256_t   start;      /* 開始アドレス（ワード単位） */
-    uint256_t   size;       /* 累計ワード数 */
-    uint256_t   entry_pc;   /* 今回このセクションに入ったときの pc */
-    int         confirmed;  /* パス1で確定済みか */
+    uint256_t   start;
+    uint256_t   size;
+    uint256_t   entry_pc;
+    int         confirmed;
     struct SecEntry *next;
 } SecEntry;
 typedef struct { SecEntry**buckets; int nb; SecEntry**order; int count; int cap; } SecMap;
 static void secmap_init(SecMap*m){m->nb=16;m->buckets=calloc(m->nb,sizeof(SecEntry*));m->count=0;m->cap=16;m->order=calloc(m->cap,sizeof(SecEntry*));}
+/* ---- セクション ---------------------------------------------------------
+   セクションは書かれた順に並ぶ。同じ名前を何度も開き直せるので、占めた範囲を
+   SecRangeVec に順に積んでおき、セクション内の相対位置はその累積から出す。
+   ------------------------------------------------------------------------ */
 static SecEntry *secmap_find(SecMap*m,const char*name){
     uint32_t h=hash_str(name)%(uint32_t)m->nb;
     for(SecEntry*e=m->buckets[h];e;e=e->next) if(strcmp(e->name,name)==0)return e;
     return NULL;
 }
 
+/* セクション表を解放する（現在は未使用）。 */
 static AXX_UNUSED void secmap_free(SecMap*m){
     for(int i=0;i<m->nb;i++){
         SecEntry*e=m->buckets[i];
@@ -1118,6 +1103,7 @@ static AXX_UNUSED void secmap_free(SecMap*m){
     free(m->buckets); free(m->order);
     m->buckets=NULL; m->order=NULL; m->count=0; m->cap=0; m->nb=0;
 }
+/* セクション表を空にする。 */
 static void secmap_clear(SecMap*m){
     for(int i=0;i<m->nb;i++){
         SecEntry*e=m->buckets[i];
@@ -1131,6 +1117,7 @@ static void secmap_clear(SecMap*m){
 typedef struct { char *name; uint256_t start; uint256_t len; } SecRange;
 typedef struct { SecRange *data; int len; int cap; } SecRangeVec;
 AXX_UNUSED static void secrangevec_init(SecRangeVec*v){v->data=NULL;v->len=0;v->cap=0;}
+/* セクションが占めた範囲を 1 つ積む。 */
 static void secrangevec_push(SecRangeVec*v, const char*name, uint256_t start, uint256_t len){
     if(v->len>=v->cap){
         v->cap = v->cap ? v->cap*2 : 8;
@@ -1143,14 +1130,18 @@ static void secrangevec_push(SecRangeVec*v, const char*name, uint256_t start, ui
     v->data[v->len].len = len;
     v->len++;
 }
+/* 範囲の記録を空にする。 */
 static void secrangevec_clear(SecRangeVec*v){
     for(int i=0;i<v->len;i++) free(v->data[i].name);
     v->len = 0;
 }
+/* 範囲の記録を解放する（現在は未使用）。 */
 AXX_UNUSED static void secrangevec_free(SecRangeVec*v){
     secrangevec_clear(v);
     free(v->data); v->data=NULL; v->cap=0;
 }
+/* 絶対のワードアドレスを、そのセクション先頭からの相対位置に直す。
+   同じ名前の範囲を書かれた順にたどって累積する。範囲外なら -1。 */
 static int64_t addr_to_word_offset(SecRangeVec*ranges, const char*name, uint64_t word_pc){
     uint64_t cum = 0;
     for(int i=0;i<ranges->len;i++){
@@ -1164,41 +1155,25 @@ static int64_t addr_to_word_offset(SecRangeVec*ranges, const char*name, uint64_t
 }
 
 
-/* パターンファイル1行ぶん。"::" 区切りで最大6フィールドに分解して持つ。
- *   f[0] 照合パターン（ニーモニックの書式）
- *   f[1] エラー条件（`条件;番号` 形式。ERRORS_TABLE の番号を返す）
- *   f[2] エンコーディング（カンマ区切りの式。ここを評価してバイト列を作る）
- *   f[3] サイズ / VLIW スロット番号
- *   f[4..5] 予備
- * 注意: 2フィールドしか書かれていない行は f[1] ではなく f[2] に入る。 */
 #define PAT_FIELDS 6
 typedef struct {
     char *f[PAT_FIELDS];
-    /* 以下はパターンファイルを読んだ直後に一度だけ決める（pat_mark_static）。
-     * 照合はソース1行ごとにパターン表を頭からたどり直すので、行ごとに調べ直すと
-     * 「パターン数 × ソース行数」だけ空回りする。 */
-    int       is_dir;        /* ディレクティブの行か（pat_is_directive） */
-    int       dir_kind;      /* どのディレクティブか（PD_*、判定列を1回の分岐にする）*/
-    int       setsym_const;  /* `.setsym` の値欄が定数式か（const_setsym_text）*/
-    int       setsym_done;   /* その値を評価済みか */
-    uint256_t setsym_val;    /* 評価した値 */
-    int       setsym_plain;  /* `.setsym::名前::10` のようにただの数か */
-    char     *setsym_key;    /* そのときの大文字にした名前 */
-    int       elftype_done;  /* `.elftype` の値を評価済みか */
-    int       elftype_val;   /* 評価した型番号（0 なら不正で登録しない） */
-    int       elftype_wid;   /* `.elftype` の幅欄（0 なら書かれていない） */
-    int       elftype_pcr;   /* `.elftype` の PC 相対欄 */
-    /* ニーモニック（パターン先頭の連続する大文字）。索引の鍵であり、
-     * 行ごとの足切りをやり直さないために読み込み時に切り出しておく。 */
+    int       is_dir;
+    int       dir_kind;
+    int       setsym_const;
+    int       setsym_done;
+    uint256_t setsym_val;
+    int       setsym_plain;
+    char     *setsym_key;
+    int       elftype_done;
+    int       elftype_val;
+    int       elftype_wid;
+    int       elftype_pcr;
     char      pfx[64];
     int       pfxlen;
-    int       pfx_closed;    /* 直後のパターン文字が英数字を食えないか */
-    /* `.check` の行が作る名前一覧の控え。配列シンボルの表が変わらなければ
-     * 何行目でも同じものになるので、作り直さずこれを渡す。 */
+    int       pfx_closed;
     void     *chk_cache;
     long long chk_cache_gen;
-    /* `.echo` の引数欄を解いた項目の並び（EchoItem*）。本文行は照合のたびに
-     * 通るので、読み込み時に一度だけ組み立てる。 */
     void     *echo_items;
     int       echo_nitems;
 } PatEntry;
@@ -1210,11 +1185,6 @@ typedef struct {
 } PatVec;
 
 static void pv_init(PatVec*v){v->data=NULL;v->len=0;v->cap=0;}
-/* パターン1行がディレクティブか（`EPIC` は大小無視）。
- * 偽なら lineassemble2() のディレクティブ判定列は必ず全て 0 を返す。
- * axx.py の _pat_is_directive() と同じ表である。 */
-/* パターン表のディレクティブ行の種別。照合のたびに 19 個の名前比較を
- * 並べていたのを、読み込み時に決めた種別1つの分岐で済ませるため。 */
 enum {
     PD_NONE = 0, PD_SETSYM, PD_CLEARSYM, PD_PADDING, PD_BITS, PD_SYMBOLC,
     PD_VLIW, PD_CHECK, PD_CLRCHECK, PD_RELOC, PD_CLRRELOC, PD_MAP, PD_FREE,
@@ -1223,6 +1193,7 @@ enum {
     PD_ELFEXTERN, PD_ELFDWARF, PD_ELFHEADER, PD_ELFSECTION, PD_ECHO, PD_ELFFIELD
 };
 
+/* パターン行がどのディレクティブか（種別の番号）。 */
 static int pat_dir_kind(const PatEntry *e){
     static const struct { const char *name; int kind; } tbl[] = {
         { ".setsym", PD_SETSYM }, { ".clearsym", PD_CLEARSYM },
@@ -1244,8 +1215,6 @@ static int pat_dir_kind(const PatEntry *e){
     if(!e || !e->f[0] || !e->f[0][0]) return PD_NONE;
     const char *n = e->f[0];
     for(int k=0; tbl[k].name; k++) if(strcmp(n, tbl[k].name) == 0) return tbl[k].kind;
-    /* axx_strupr_to() はこの位置ではまだ宣言されていないので、4文字だけ
-       その場で大小無視で比べる。 */
     if(n[0] && n[1] && n[2] && n[3] && !n[4]){
         static const char epic[] = "EPIC";
         int k = 0;
@@ -1259,6 +1228,7 @@ static int pat_dir_kind(const PatEntry *e){
     return PD_NONE;
 }
 
+/* パターン行がディレクティブか。`EPIC::` も含める。 */
 static int pat_is_directive(const PatEntry *e){
     static const char *tbl[] = {
         ".setsym", ".clearsym", ".padding", ".bits", ".symbolc", ".vliw",
@@ -1269,8 +1239,6 @@ static int pat_is_directive(const PatEntry *e){
     if(!e || !e->f[0] || !e->f[0][0]) return 0;
     const char *n = e->f[0];
     for(int k=0; tbl[k]; k++) if(strcmp(n, tbl[k]) == 0) return 1;
-    /* axx_strupr_to() はこの位置ではまだ宣言されていないので、4文字だけ
-     * その場で大小無視で比べる。 */
     if(n[0] && n[1] && n[2] && n[3] && !n[4]){
         static const char epic[] = "EPIC";
         int k = 0;
@@ -1284,11 +1252,7 @@ static int pat_is_directive(const PatEntry *e){
     return 0;
 }
 
-/* `.setsym` の値欄が「ソースの行によって変わりようのない定数式」か。
- * パターン行の式はラベル・`$.`/`$$`・`#名前`・パターン変数・`'`・`@` を読めるので
- * (マニュアル 6.3)、それらを書ける文字が1つでもあれば行ごとに値が変わりうる。
- * 数字・16進・演算子・括弧しか無いならどの行で評価しても同じ値になる。
- * axx.py の _CONST_SETSYM_RE と同じ判定である。 */
+/* 欄が定数式だけで出来ているか（持ち上げの判定に使う）。 */
 static int const_setsym_text(const char *s){
     if(!s || !s[0]) return 0;
     int ok = 1;
@@ -1308,10 +1272,7 @@ static int const_setsym_text(const char *s){
     return *p == '\0';
 }
 
-/* `.setsym` の値欄が「ただの数」か（10進または 0x…）。
- * こう書かれていれば文字列・配列・集合のどれにもなり得ないので、実行時に
- * その判定列を通さずシンボル表へ入れるだけで済む。集合演算子を含む定数式
- * （`1&2` など）は集合の書き方と見分けがつかないので、ここでは弾く。 */
+/* 欄がただの数値か。 */
 static int plain_number_text(const char *s){
     if(!s) return 0;
     const char *p = s;
@@ -1328,12 +1289,8 @@ static int plain_number_text(const char *s){
     return *p == '\0';
 }
 
-/* `.echo(項目, …)` の 1 項目。is_str なら text は表示する文字列そのもの、
- * でなければパターン層の式のテキストである。 */
 typedef struct { int is_str; char *text; } EchoItem;
 
-/* `.echo` の文字列リテラルの中身をほどく。逃げ記号はミニ言語と同じ4つ。
- * 成功なら NULL、誤りならその文言を返す。axx.py の _echo_str_unescape と同じ。 */
 static const char *echo_str_unescape(const char *s, int n, char **out,
                                      char *eb, size_t ebsz){
     char *d = malloc((size_t)n + 1);
@@ -1364,14 +1321,12 @@ static const char *echo_str_unescape(const char *s, int n, char **out,
     return NULL;
 }
 
+/* `.echo` の解析結果を解放する。 */
 static void echo_items_free(EchoItem *v, int n){
     for(int k = 0; k < n; k++) free(v[k].text);
     free(v);
 }
 
-/* `.echo(項目, …)` の引数欄を項目の並びにする。成功なら NULL を返し、
- * 書き方の誤りならその文言（eb を使うこともある）を返す。
- * axx.py の _echo_items_parse() と同じ規則である。 */
 static const char *echo_items_parse(const char *text, EchoItem **outv, int *outn,
                                     char *eb, size_t ebsz){
     *outv = NULL;
@@ -1402,7 +1357,6 @@ static const char *echo_items_parse(const char *text, EchoItem **outv, int *outn
     for(const char *q = text + end + 1; *q; q++)
         if(*q != ' ' && *q != '\t') return "unexpected text after '.echo(...)'";
 
-    /* 最上位のカンマで切る。文字列と括弧の中のカンマは区切りにしない。 */
     const char *inner = text + start;
     int m = end - start;
     int cap = 8, cnt = 0;
@@ -1440,7 +1394,6 @@ static const char *echo_items_parse(const char *text, EchoItem **outv, int *outn
         k++;
     }
 
-    /* `.echo()` は空行。 */
     if(cnt == 1){
         int a = ps[0], b = ps[0] + pl[0];
         while(a < b && (inner[a]==' ' || inner[a]=='\t')) a++;
@@ -1497,7 +1450,8 @@ static const char *echo_items_parse(const char *text, EchoItem **outv, int *outn
     return NULL;
 }
 
-/* パターン表を読み終えた後に一度だけ呼ぶ。行ごとに変わらない性質を控える。 */
+/* 各パターン行が「ソース行ごとに変わらない」かを先に印付けする。
+   変わらない行は解釈し直さずに済む。 */
 static void pat_mark_static(PatVec *v){
     for(int pi=0; pi<v->len; pi++){
         PatEntry *e = &v->data[pi];
@@ -1529,8 +1483,6 @@ static void pat_mark_static(PatVec *v){
             }
         }
 
-        /* ニーモニックを切り出す。pat_prefix_matches() と同じ規則である
-         * （空白は飛ばし、大文字が続くあいだを取り、最初の大文字以外で止める）。 */
         {
             const char *q = e->f[0] ? e->f[0] : "";
             int np = 0;
@@ -1543,7 +1495,7 @@ static void pat_mark_static(PatVec *v){
             e->pfxlen   = np;
             int closed = 1;
             if(np >= (int)sizeof(e->pfx)-1){
-                closed = 0;              /* 打ち切ったので直後が分からない */
+                closed = 0;
             } else if(*q){
                 char c = *q;
                 if((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
@@ -1554,27 +1506,16 @@ static void pat_mark_static(PatVec *v){
     }
 }
 
-/* 畳み込む先頭行数と、前置きが書く欄の印（pat_hoist_scan が立てる）。 */
-static int g_hoist_rows     = 0;   /* 0 なら畳み込まない */
-static int g_hoist_first_ai = 0;   /* always の並びで最初に来る非前置き行の位置 */
+static int g_hoist_rows     = 0;
+static int g_hoist_first_ai = 0;
 static int g_hoist_bits     = 0;
 static int g_hoist_padding  = 0;
 static int g_hoist_symbolc  = 0;
 static int g_hoist_vliw     = 0;
 
-/* ---- ニーモニック索引 ------------------------------------------------
- * ソース1行ごとにパターン表を頭から全部たどり、1行ずつ先頭一致で足切りして
- * いた。パターン数 × ソース行数の空回りなので、aarch64 のパターンファイル
- * （展開後 1 万行）では 1 行につき 1 万回の足切りになっていた。
- *
- * そこで読み込み時に「パターン先頭の大文字列（＝ニーモニック）」を鍵にした
- * ハッシュ表を作り、行ごとにはその行のニーモニックで引いた候補だけをたどる。
- * ニーモニックを持たない行（ディレクティブ、番兵、小文字や `!` で始まる
- * パターン）は always に入れ、常にたどる。
- * 索引が返す候補の集合は pat_prefix_matches() が通す集合とちょうど同じで、
- * たどる順もパターン表の記述順のままである（採用するパターンは変わらない）。 */
 typedef struct { int *rows; int n, cap; } PatRowList;
 
+/* パターン行番号のリストに 1 個積む。 */
 static void prl_push(PatRowList *l, int row){
     if(l->n >= l->cap){
         l->cap = l->cap ? l->cap*2 : 8;
@@ -1586,8 +1527,8 @@ static void prl_push(PatRowList *l, int row){
 
 typedef struct PatIdxNode {
     char       key[64];
-    PatRowList open;     /* 直後が英数字でもよい行（pfx_closed==0） */
-    PatRowList closed;   /* 直後に英数字が続いたら不一致の行（pfx_closed==1）*/
+    PatRowList open;
+    PatRowList closed;
     struct PatIdxNode *next;
 } PatIdxNode;
 
@@ -1596,19 +1537,25 @@ typedef struct {
     PatIdxNode *buckets[PATIDX_NB];
     PatRowList  always;
     int         maxkeylen;
-    /* 行ごとの候補並べ（使い回す） */
     int        *cand;
     int         cand_cap;
 } PatIndex;
 
 static PatIndex g_patidx;
 
+/* ---- パターン索引 -------------------------------------------------------
+   照合は全パターンを試して最良のものを選ぶ方式なので、素直に書くと 1 行あたり
+   全件走査になる。ニーモニック先頭の大文字列を鍵にして候補を絞る。
+   鍵のどれにも属さない行（先頭が大文字でない書式とディレクティブ）だけは
+   always として常に試すので、絞っても結果は変わらない。
+   ------------------------------------------------------------------------ */
 static uint32_t patidx_hash(const char *k, int n){
     uint32_t h = 2166136261u;
     for(int i=0;i<n;i++){ h ^= (unsigned char)k[i]; h *= 16777619u; }
     return h;
 }
 
+/* 鍵に対応する索引の節を引く（create なら作る）。 */
 static PatIdxNode *patidx_node(PatIndex *ix, const char *k, int n, int create){
     uint32_t b = patidx_hash(k,n) & (PATIDX_NB-1);
     for(PatIdxNode *p=ix->buckets[b]; p; p=p->next)
@@ -1621,39 +1568,39 @@ static PatIdxNode *patidx_node(PatIndex *ix, const char *k, int n, int create){
     return p;
 }
 
+/* パターン表から索引を作る。 */
 static void patidx_build(PatIndex *ix, PatVec *v){
     for(int pi=0; pi<v->len; pi++){
         PatEntry *e = &v->data[pi];
-        /* ディレクティブ行は名前が大文字のこともある（`EPIC`）が、行ごとに
-         * 必ず実行しなければならないので always に入れる。 */
         if(e->pfxlen == 0 || e->is_dir){ prl_push(&ix->always, pi); continue; }
         PatIdxNode *nd = patidx_node(ix, e->pfx, e->pfxlen, 1);
         prl_push(e->pfx_closed ? &nd->closed : &nd->open, pi);
         if(e->pfxlen > ix->maxkeylen) ix->maxkeylen = e->pfxlen;
     }
-    /* 前置きを畳み込むとき、always の並びをどこから読み始めればよいか。 */
     g_hoist_first_ai = 0;
     while(g_hoist_first_ai < ix->always.n
           && ix->always.rows[g_hoist_first_ai] < g_hoist_rows) g_hoist_first_ai++;
 }
 
+/* 候補の行番号を昇順に並べるための比較関数。 */
 static int patidx_cmp_int(const void *a, const void *b){
     int x = *(const int*)a, y = *(const int*)b;
     return (x>y) - (x<y);
 }
 
-/* 照合にかける行 lin のニーモニックで索引を引き、候補行を昇順に並べる。
- * 戻り値は候補の個数、*out は使い回しの並びである（always は含めない）。 */
+/* ソース行 1 行に対して、照合を試す価値のある行番号を返す。
+   鍵を 1 文字ずつ伸ばして引く。ニーモニックがそこで終わっている書式は、
+   ソース側の次の文字が語を続ける文字でないときだけ候補にする。これを外すと
+   `ADD` のパターンが `ADDS` の行に当たってしまう。 */
 static int patidx_candidates(PatIndex *ix, const char *lin, int **out){
     char key[64];
     char nextraw[65];
     int  n = 0;
     int  lim = ix->maxkeylen < (int)sizeof(key) ? ix->maxkeylen : (int)sizeof(key)-1;
-    /* 大文字化は axx_upper_char() と同じ規則（ASCII の a-z だけ）。 */
     for(const char *q=lin; *q && n<lim; q++){
         if(*q == ' ') continue;
         key[n]     = (*q >= 'a' && *q <= 'z') ? (char)(*q - 32) : *q;
-        nextraw[n] = q[1];        /* 直後の「空白を飛ばさない」1文字 */
+        nextraw[n] = q[1];
         n++;
     }
     int cnt = 0;
@@ -1673,21 +1620,18 @@ static int patidx_candidates(PatIndex *ix, const char *lin, int **out){
         if(take_closed)
             for(int j=0;j<nd->closed.n;j++) ix->cand[cnt++] = nd->closed.rows[j];
     }
-    /* 鍵の長さごとに別の並びから集めたので、記述順に戻す。 */
     if(cnt > 1) qsort(ix->cand, (size_t)cnt, sizeof(int), patidx_cmp_int);
     *out = ix->cand;
     return cnt;
 }
 
-/* 行が空か（どの欄にも何も書かれていない）。 */
+/* パターン行が空か。 */
 static int pat_row_blank(const PatEntry *e){
     for(int i=0;i<PAT_FIELDS;i++) if(e->f[i][0]) return 0;
     return 1;
 }
 
-/* ソース行によって値が変わりうる書き方を含むか。パターン行の式はパターン変数
- * (小文字)・`$.`/`$$`・`#名前`・`'`・`@` を読めるので、これらの印が1つでも
- * あればソース行ごとに結果が変わりうる（マニュアル 6.3）。 */
+/* 欄の中身がソース行ごとに変わりうるか。 */
 static int pat_text_dynamic(const char *s){
     for(const char *p=s; *p; p++){
         if(*p=='!' || *p=='$' || *p=='#' || *p=='@' || *p=='\'') return 1;
@@ -1696,8 +1640,7 @@ static int pat_text_dynamic(const char *s){
     return 0;
 }
 
-/* 名前の並び（`X0,X1,…`）か。カンマがあれば集合として読まれるので、式評価
- * （ラベルを読みうる）には落ちない。 */
+/* 欄が「大文字の名前をカンマで並べたもの」か。 */
 static int pat_is_name_list(const char *s){
     int comma = 0;
     for(const char *p=s; *p; p++){
@@ -1709,36 +1652,34 @@ static int pat_is_name_list(const char *s){
     return comma;
 }
 
-/* `.bits` の欄（幅の定数式か `big`/`little`）か。 */
+/* `.bits` の欄が定数か。 */
 static int pat_bits_field_static(const char *f){
     if(strcasecmp(f,"big")==0 || strcasecmp(f,"little")==0) return 1;
     return const_setsym_text(f);
 }
 
-/* このディレクティブ行は、どのソース行でも同じ結果になるか。
- * 判断がつかないものは 0 を返す（畳み込まない側に倒す）。 */
+/* このディレクティブ行を、ソースを読む前に 1 回だけ処理してよいか。
+   判断に迷うものは必ず偽を返す（持ち上げないだけで結果は変わらない）。 */
 static int pat_dir_line_invariant(const PatEntry *e){
     switch(e->dir_kind){
     case PD_SETSYM: {
         const char *name = e->f[1][0] ? e->f[1] : e->f[2];
         const char *val  = e->f[1][0] ? e->f[2] : "";
         if(pat_text_dynamic(name)) return 0;
-        if(!val[0]) return 1;                       /* 値なし（0 になる） */
+        if(!val[0]) return 1;
         { const char *q = val;
           while(*q==' '||*q=='\t') q++;
-          if(*q=='"') return 1;                     /* 文字列シンボル */
-          if(*q=='[') return 0;                     /* 配列は中身が式になりうる */
+          if(*q=='"') return 1;
+          if(*q=='[') return 0;
         }
-        if(const_setsym_text(val)) return 1;        /* 定数式 */
-        return pat_is_name_list(val);               /* 名前の集合 */
+        if(const_setsym_text(val)) return 1;
+        return pat_is_name_list(val);
     }
     case PD_CHECK: case PD_CLRCHECK: case PD_RELOC: case PD_CLRRELOC:
     case PD_SYMBOLC: case PD_PASSTHRU: case PD_EOL: case PD_TEXTMODE:
     case PD_ELFMACHINE: case PD_ELFCLASS: case PD_ELFRELA: case PD_ELFWIDTH:
     case PD_ELFEXTERN: case PD_ELFDWARF: case PD_ELFHEADER:
     case PD_ELFSECTION: case PD_ELFFIELD:
-        /* どれも名前や型名の文字どおりの並びだけを見る（式を読まない）。
-         * 変数名の小文字は普通なので pat_text_dynamic は使わない。 */
         for(int i=1;i<PAT_FIELDS;i++)
             for(const char *q=e->f[i]; *q; q++)
                 if(*q=='!' || *q=='$' || *q=='#' || *q=='@') return 0;
@@ -1758,29 +1699,20 @@ static int pat_dir_line_invariant(const PatEntry *e){
         return *q=='"';
     }
     case PD_ELFTYPE:
-        /* 名前は文字どおり、値は定数式のときだけ（型名の表は行ごとに
-           作り直さないので、同じ宣言を毎行やり直す必要はない）。 */
         if(!e->f[1][0]) return 0;
         for(const char *q=e->f[1]; *q; q++)
             if(*q=='!' || *q=='$' || *q=='#' || *q=='@' || *q=='\'') return 0;
-        /* 幅欄・PC相対欄（省略可）も定数でなければ畳み込まない。 */
         for(int i=3;i<PAT_FIELDS;i++)
             if(e->f[i][0] && !const_setsym_text(e->f[i])) return 0;
         return const_setsym_text(e->f[2]);
     default:
-        /* `.clearsym` `.map` `.free` `.enum` `.clrenum` `EPIC` は畳み込まない。 */
         return 0;
     }
 }
 
-/* 畳み込める先頭行数を決め、前置きが書く欄の印を立てる。
- * 条件は2つである。
- *   - 先頭から続く行が「空行」または「畳み込めるディレクティブ行」だけである
- *     こと。普通のパターン行が現れたらそこで終わり（その行の照合は前置きの
- *     途中の状態で行われるべきなので、先に進めてはいけない）。
- *   - 前置きより後ろに、文字列・配列シンボルを書き換えうる行
- *     （`.setsym` `.clearsym` `.free`）が無いこと。これらの表は行ごとに
- *     作り直さないので、後ろで書き換えられると控えた状態が古くなる。 */
+/* 先頭から何行を事前処理に持ち上げられるかを数える。
+   持ち上げた範囲が読んでいる名前を、あとの行の `.setsym` / `.clearsym` /
+   `.free` が書き換えている場合は、順序依存が壊れるので諦める。 */
 static void pat_hoist_scan(PatVec *v){
     g_hoist_rows = 0;
     g_hoist_bits = g_hoist_padding = g_hoist_symbolc = g_hoist_vliw = 0;
@@ -1801,12 +1733,6 @@ static void pat_hoist_scan(PatVec *v){
     }
     if(h <= 0 || h >= v->len) return;
 
-    /* 前置きの行は名前を読む（`.check` の名前並び、集合の `.setsym` など）。
-     * 配列・文字列シンボルの表は1行ごとに作り直さないので、前置きが読む名前を
-     * 前置きより後ろの行が書き換えると、控えた状態が古くなる。
-     * そこで「前置きが読む名前」を集め、後ろでそれを書き換える行があれば
-     * 畳み込まない。数値を入れるだけの `.setsym` は、1行ごとに作り直す側の
-     * シンボル表にしか触らないので、名前が重なっても差し支えない。 */
     StrVec reads; sv_init(&reads);
     for(int i = 0; i < h; i++){
         PatEntry *e = &v->data[i];
@@ -1832,18 +1758,16 @@ static void pat_hoist_scan(PatVec *v){
         if(!e->is_dir) continue;
         const char *wname = NULL;
         if(e->dir_kind == PD_SETSYM){
-            if(!e->f[1][0]){ blocked = 1; break; }   /* 値欄の位置が読めない */
-            if(const_setsym_text(e->f[2])) continue; /* 数値だけなら関わらない */
+            if(!e->f[1][0]){ blocked = 1; break; }
+            if(const_setsym_text(e->f[2])) continue;
             wname = e->f[1];
         } else if(e->dir_kind == PD_CLEARSYM){
             wname = e->f[2][0] ? e->f[2] : e->f[1];
-            if(!wname[0]){ blocked = 1; break; }     /* 全部消す */
+            if(!wname[0]){ blocked = 1; break; }
         } else if(e->dir_kind == PD_FREE){
             wname = e->f[2][0] ? e->f[2] : e->f[1];
             if(!wname[0]){ blocked = 1; break; }
         } else continue;
-        /* axx_strupr_to() はこの位置ではまだ宣言されていないので、その場で
-           大文字に直す（規則は同じ: ASCII の a-z だけ）。 */
         char up[256]; int un = 0;
         for(const char *q = wname; *q && un < (int)sizeof(up)-1; q++)
             up[un++] = (*q>='a'&&*q<='z') ? (char)(*q-32) : *q;
@@ -1860,19 +1784,20 @@ static void pat_hoist_scan(PatVec *v){
     g_hoist_vliw    = f_vliw;
 }
 
+/* パターン表に空の行を 1 つ足す。 */
 static PatEntry *pv_push_blank(PatVec*v){
     if(v->len>=v->cap){v->cap=v->cap?v->cap*2:32;v->data=realloc(v->data,v->cap*sizeof(PatEntry));if(!v->data){perror("realloc");exit(1);}}
     PatEntry *e=&v->data[v->len++];
-    /* realloc で伸ばした領域は初期化されていない。控え場所（ポインタを含む）を
-     * 空にしてから使う。 */
     memset(e, 0, sizeof(*e));
     for(int i=0;i<PAT_FIELDS;i++) e->f[i]=strdup("");
     return e;
 }
+/* パターン表を解放する（現在は未使用）。 */
 static AXX_UNUSED void pv_free(PatVec*v){
     for(int i=0;i<v->len;i++) for(int j=0;j<PAT_FIELDS;j++) free(v->data[i].f[j]);
     free(v->data); pv_init(v);
 }
+/* パターン行の idx 番目の欄を設定する。 */
 static void pat_set(PatEntry*e,int idx,const char*s){
     free(e->f[idx]); e->f[idx]=strdup(s);
 }
@@ -1890,14 +1815,17 @@ typedef struct {
 } VliwSet;
 
 static void vset_init(VliwSet*v){v->data=NULL;v->len=0;v->cap=0;}
+/* `EPIC::` の宣言を解放する（現在は未使用）。 */
 static AXX_UNUSED void vset_free(VliwSet*v){
     for(int i=0;i<v->len;i++){free(v->data[i].idxs);free(v->data[i].templ);}
     free(v->data);vset_init(v);
 }
+/* `EPIC::` の宣言を空にする。 */
 static void vset_clear(VliwSet*v){
     for(int i=0;i<v->len;i++){free(v->data[i].idxs);free(v->data[i].templ);}
     v->len=0;
 }
+/* `EPIC::` の宣言を 1 つ足す。インデックスコードの並びとテンプレート。 */
 static void vset_add(VliwSet*v,int*idxs,int n,const char*templ){
     for(int i=0;i<v->len;i++){
         if(v->data[i].nidxs==n && memcmp(v->data[i].idxs,idxs,n*sizeof(int))==0
@@ -1911,19 +1839,20 @@ static void vset_add(VliwSet*v,int*idxs,int n,const char*templ){
     v->len++;
 }
 
-/* 出力バッファ。アドレス→ワード値の疎なハッシュ表として持つので、
- * .ORG でアドレスが大きく飛んでもその間を埋めずに済む。 */
 typedef struct BufEntry { uint64_t pos; uint64_t val; struct BufEntry*next; } BufEntry;
 #define BUFMAP_NB 4096
 typedef struct { BufEntry *buckets[BUFMAP_NB]; } BufMap;
 
 static void bufmap_init(BufMap*m){ memset(m->buckets,0,sizeof(m->buckets)); }
+/* 出力ワードの置き場。連続した配列ではなく「位置 → ワード」の表なのは、
+   `.org` でいくらでも飛べるため。隙間は書き出すときに `.padding` で埋める。 */
 static void bufmap_set(BufMap*m, uint64_t pos, uint64_t val){
     uint32_t h=(uint32_t)(pos % BUFMAP_NB);
     for(BufEntry*e=m->buckets[h];e;e=e->next) if(e->pos==pos){e->val=val;return;}
     BufEntry*e=malloc(sizeof(BufEntry)); if(!e){perror("malloc");exit(1);} e->pos=pos; e->val=val;
     e->next=m->buckets[h]; m->buckets[h]=e;
 }
+/* 書かれた最大の位置。出力の大きさを決めるのに使う。 */
 static uint64_t bufmap_max_key(BufMap*m, int *found_out){
     uint64_t mx=0; int found=0;
     for(int i=0;i<BUFMAP_NB;i++) for(BufEntry*e=m->buckets[i];e;e=e->next){
@@ -1932,20 +1861,11 @@ static uint64_t bufmap_max_key(BufMap*m, int *found_out){
     if(found_out) *found_out=found;
     return found?mx:0;
 }
+/* 出力バッファを解放する（現在は未使用）。 */
 static AXX_UNUSED void bufmap_free(BufMap*m){
     for(int i=0;i<BUFMAP_NB;i++){BufEntry*e=m->buckets[i];while(e){BufEntry*n=e->next;free(e);e=n;}m->buckets[i]=NULL;}
 }
 
-/* 行の中に一時的に差し込む番兵。
- *
- * 破綻点修正: 以前は 0x90〜0x93 を使っていた。axx.py はこれを Python の
- * 「文字」（U+0092 等）として扱うので日本語の文字と衝突しないが、caxx は
- * バイト列として扱うため、0x92/0x93 は UTF-8 の継続バイトそのものである。
- * その結果、`こ`(E3 81 93)・`験`(E9 A8 93)・`げ`(E3 81 92) のような
- * ありふれた文字を含む行が、引用符の外（.textmode の素通し行など）では
- * その文字の途中で切り落とされていた（`… の試験ソース` → `… の試<切断>`）。
- * 正しい UTF-8 には決して現れないバイト 0xFC〜0xFF に移す。こうすると
- * 番兵は「自分で差し込んだものだけ」になる。 */
 #define OB_CHAR  ((char)0xFC)
 #define CB_CHAR  ((char)0xFD)
 #define VLIW_SEP_CHAR  ((char)0xFE)
@@ -1953,28 +1873,17 @@ static AXX_UNUSED void bufmap_free(BufMap*m){
 #define EXP_PAT  0
 #define EXP_ASM  1
 
-/* 式評価器の「この場では何が書けるか」を表す能力記述子。
- * 本体・マクロ層・ミニ言語の 3 つの層が同じ式評価器を呼ぶが、呼ぶ時点で意味を
- * 成す項目は層ごとに違う。たとえばパターン変数 `a` はパターン行を符号化して
- * いる最中にしか束縛されていないし、`!!!` は VLIW のパターン行でしか意味が
- * ない。どの項目が生きているかを 1 か所にまとめ、評価器は st->expcaps を見て
- * 判断する。呼ぶタイミングが変われば記述子が変わり、使える機能が変わる。
- * axx.py の ExprCaps と同じ構成。 */
 typedef struct {
     const char *name;
-    int patvars;   /* 小文字 1 文字のパターン変数 a〜z */
-    int vliw;      /* `!!!` / `!!!!` */
-    int labels;    /* ラベル名・.equ 名の参照 */
-    int loc;       /* `$$` / `$.` */
-    int syms;      /* `#name` と .setsym の記号 */
+    int patvars;
+    int vliw;
+    int labels;
+    int loc;
+    int syms;
 } ExprCaps;
 
-/* パターンファイルの式。すべて使える。 */
 static const ExprCaps CAPS_PAT  = { "pattern",       1, 1, 1, 1, 1 };
-/* アセンブリソース行の式。パターン変数と VLIW 計数は無い。 */
 static const ExprCaps CAPS_ASM  = { "assembly",      0, 0, 1, 1, 1 };
-/* ミニ言語 (`.func` 本体) から呼ぶとき。ラベル・`$$`・`#記号` は読めるが、
- * パターン変数はその場で束縛されていないので落とす。 */
 static const ExprCaps CAPS_MINI = { "mini language", 0, 0, 1, 1, 1 };
 
 static const char *ERRORS_TABLE[] = {
@@ -1988,28 +1897,19 @@ static const char *ERRORS_TABLE[] = {
 };
 #define ERRORS_COUNT 7
 
-/* =========================================================
- * AsmState — アセンブル中の全状態
- *
- * 式評価・パターン照合・ディレクティブ処理・出力生成の各関数は自前の状態を
- * 持たず、全てこの構造体を共有して読み書きする（axx.py の AssemblerState に対応）。
- * ========================================================= */
-/* マクロ層の $/$$ 用。「あるファイルの展開後 N 行目が、直前の反復でどの
- * アドレスに置かれたか」を覚えておくための表。ファイル1つぶんが
- * MacroLinePcs、それをファイル名で引くのが MacroLinePcsVec。 */
 typedef struct { char *file; long long *pcs; int len, cap; } MacroLinePcs;
 typedef struct { MacroLinePcs *d; int len, cap; } MacroLinePcsVec;
 
+/* マクロ層が読む「行ごとの PC」の記録。ソース側のマクロは `$` / `$$` を
+   読めるが、見えるのは前回のリラクゼーション反復の値なので、反復ごとに
+   ここへ記録して次の反復で引く。 */
 static void mlp_vec_free(MacroLinePcsVec *v){
     for(int i=0;i<v->len;i++){ free(v->d[i].file); free(v->d[i].pcs); }
     free(v->d);
     v->d=NULL; v->len=v->cap=0;
 }
 
-/* file 用の記録欄を新しく開く（同名が既にあれば作り直す）。戻り値は欄の
- * 添字。ポインタを返さないのは、.INCLUDE で fileassemble が再帰すると
- * この配列が realloc されて既存のポインタが無効になるため。欄は追加しか
- * しないので、添字なら再帰をまたいでも有効なまま。 */
+/* そのファイルぶんの記録を始める。 */
 static int mlp_begin(MacroLinePcsVec *v, const char *file){
     for(int i=0;i<v->len;i++){
         if(strcmp(v->d[i].file, file)==0){
@@ -2030,6 +1930,7 @@ static int mlp_begin(MacroLinePcsVec *v, const char *file){
     return v->len - 1;
 }
 
+/* 行 idx の PC を記録する。 */
 static void mlp_push(MacroLinePcsVec *v, int idx, long long pc){
     if(idx < 0 || idx >= v->len) return;
     MacroLinePcs *e = &v->d[idx];
@@ -2041,7 +1942,7 @@ static void mlp_push(MacroLinePcsVec *v, int idx, long long pc){
     e->pcs[e->len++] = pc;
 }
 
-/* 展開後 idx 行目のアドレス。記録が無ければ 0。 */
+/* 記録した PC を引く。 */
 static long long mlp_get(const MacroLinePcsVec *v, const char *file, int idx){
     if(!file || idx < 0) return 0;
     for(int i=0;i<v->len;i++)
@@ -2050,94 +1951,63 @@ static long long mlp_get(const MacroLinePcsVec *v, const char *file, int idx){
     return 0;
 }
 
-/* `.elfheader::<欄名>::<値>`（マニュアル 3.7.7 節）で書ける ELF ヘッダの欄。
- * axx.py の DirectiveProcessor._ELF_HDR_FIELDS と同じ並びである。 */
 enum { EHF_TYPE = 0, EHF_FLAGS, EHF_VERSION, EHF_ENTRY, EHF_OSABI,
        EHF_ABIVERSION, ELF_HDR_NFIELD };
 
 typedef struct {
-    /* --- 出力先 --- */
-    char outfile[512];       /* -b 生バイナリ */
-    char expfile[512];       /* -e ラベル TSV */
-    char expfile_elf[512];   /* -E ラベル TSV（ELF フラグ付き） */
-    char impfile[512];       /* -i ラベル TSV の取り込み */
-    uint256_t pc_overflow_max;  /* pc が 64bit を超えた場合の記録（警告用） */
+    char outfile[512];
+    char expfile[512];
+    char expfile_elf[512];
+    char impfile[512];
+    uint256_t pc_overflow_max;
     int       pc_overflow_set;
-    int  osabi;              /* ELF ヘッダの OSABI（0=Linux, 9=FreeBSD） */
+    int  osabi;
 
-    /* --- 位置カウンタ --- */
-    uint256_t pc;            /* 現在のプログラムカウンタ（ワード単位） */
-    uint256_t padding;       /* .padding の詰め物値 */
+    uint256_t pc;
+    uint256_t padding;
 
-    /* 識別子に使える文字集合（.labelc 等で変更可能） */
-    char lwordchars[256];    /* ラベル名 */
-    char swordchars[256];    /* .setsym シンボル名 */
+    char lwordchars[256];
+    char swordchars[256];
 
-    /* 破綻点修正: ここは char[512] の固定配列だった。512 文字以上の
-     * セクション名が黙って切り詰められ、完全な名前で登録されている
-     * セクション表から引けなくなって、出力したワードがどのセクションにも
-     * 足されないまま消えていた（長い名前の `.section` が size 0 で出る）。
-     * axx.py に長さ制限は無いのでそこだけ食い違っていた。
-     * st_set_current_section() で名前の長さぶん持つ。 */
     char      *current_section;
     size_t     current_section_cap;
     char current_file[512];
 
-    /* --- 記号表 --- */
-    LabelMap   labels;         /* ソース側ラベル */
-    SecMap     sections;       /* セクション */
-    SymMap     symbols;        /* 現在有効なシンボル */
-    SymMap     patsymbols;     /* パターンファイルの .setsym 由来 */
-    /* `.setsym::名前::"文字列"` で登録された文字列シンボル。値が数値では
-     * ないので式には出せず、文字列テンプレート（3.5.2）の中でだけ使える。
-     * 名前は大文字化して names に、中身をそのまま vals に、同じ添字で持つ。 */
+    LabelMap   labels;
+    SecMap     sections;
+    SymMap     symbols;
+    SymMap     patsymbols;
     StrVec     strsym_names;
     StrVec     strsym_vals;
 
-    /* `.setsym::名前::[項目,項目,…]` で登録された配列シンボル。項目は数値でも
-     * 文字列でもよく、`x[3]`（テンプレート）や `#x[3]`（式）で引く。 */
     struct ArrSym *arrsyms;
     int        arrsyms_len;
     int        arrsyms_cap;
-    LabelMap   export_labels;  /* .global 等で外部公開するラベル */
-    StrVec     export_order;   /* 公開順（出力の再現性のため） */
-    PatVec     pat;            /* 読み込んだパターン表 */
-    SubVec     subs;           /* `.sub … .return` のサブ表 */
-    MiniFuncVec funcs;         /* `.func … .return` のミニ言語の関数 */
+    LabelMap   export_labels;
+    StrVec     export_order;
+    PatVec     pat;
+    SubVec     subs;
+    MiniFuncVec funcs;
 
-    /* --- VLIW / EPIC --- */
-    int        vliwinstbits;     /* 命令スロット1個のビット幅 */
-    IntVec     vliwnop;          /* 余ったスロットを埋める NOP バイト列 */
-    int        vliwbits;         /* パケット全体のビット幅 */
-    VliwSet    vliwset;          /* EPIC: スロット組み合わせ→テンプレート値 */
-    int        vliwflag;         /* .vliw が宣言済みか */
-    int        vliwtemplatebits; /* テンプレート幅（負なら上位側に配置） */
-    int        vliwstop;         /* この行が `!!!!` で終わったか */
-    int        vcnt;             /* この行のスロット数 */
+    int        vliwinstbits;
+    IntVec     vliwnop;
+    int        vliwbits;
+    VliwSet    vliwset;
+    int        vliwflag;
+    int        vliwtemplatebits;
+    int        vliwstop;
+    int        vcnt;
 
-    /* --- 式評価とエラー状態 --- */
-    int        expmode;        /* EXP_PAT=パターン側 / EXP_ASM=ソース側 */
-    const ExprCaps *expcaps;   /* いま評価中の式で使える項目 */
-    int        exp_typ_float;  /* 浮動小数点モードか */
+    int        expmode;
+    const ExprCaps *expcaps;
+    int        exp_typ_float;
 
-    /* 直近の式評価で未定義ラベルを踏んだか。「失敗時に立てる」だけで
-     * 成功しても降ろさない（1つの式が複数ラベルを引くため、途中で降ろすと
-     * 先に起きた失敗が消える）。降ろすのは .ORG/.RESB/.ZERO/.ALIGN/.EQU 等、
-     * 新規に判定したい側が評価直前に自分で行う。 */
     int        error_undefined_label;
 
-    /* 既に報告したラベル定義の誤り（"種別:名前" の一覧）。パス1はリラクゼーション
-     * で何度も走るので、同じ誤りを反復回数だけ並べないための記録。
-     * report_definition_error() が使う。 */
     StrVec     reported_label_errors;
 
-    /* ユーザ向けの " error - ..." を1度でも表示したら立ち、以後降ろさない。
-     * 最後にこれを見て、立っていれば出力を書かず終了コード1で終わる
-     * （不完全・誤ったバイナリを黙って残さないため）。 */
     int        had_error;
 
-    /* パターン照合の試行中か。試行中のエラーは本物の失敗とは限らないので
-     * 表示を抑制する。 */
     int        in_match_attempt;
 
     int        match_score_expr;
@@ -2154,55 +2024,22 @@ typedef struct {
     int        pas;
     int        debug;
     int        verbose;
-    /* `-V` の設定。真なら、文字列テンプレートで組み立てたテキストを素のまま
-     * 標準出力へ流す（トランスレータとしての出力）。既定は無出力で、`-b`/`-o`
-     * を付けずに走らせても画面には何も出ない。axx.py の AsmState.text_output
-     * と同じ意味である。 */
     int        text_output;
 
-    /* パターンのエンコーディング欄が文字列テンプレート "..." だったときに、
-     * そこから組み立てたアセンブリ結果のテキスト。1行ごとに作り直す。
-     * asmtext は素のまま流す用につないだもの、asmtext_disp は -v の診断行に
-     * 見せる用で、`"A","B"` のように欄に書いたとおり分けて括ってある。 */
     char      *asmtext;
     char      *asmtext_disp;
 
-    /* `.passthru` の設定。0=切（マッチしない行は Syntax error）、
-     * 1=素通し（マッチしない行をそのままテキストとして出す）。 */
     int        passthru;
-    /* `.eol` の設定。真なら、出力を出した行ごとに改行を1ワード足す。 */
     int        eol;
-    /* `.textmode` の設定。真なら「テキスト置換モード」。ソースを別の書式の
-     * テキストへ書き換えるための設定で、`.passthru` と `.eol` を一緒に立て、
-     * `!L<名前>` が拾った式・ラベルの中の未定義ラベルをエラーにしない
-     * （値は 0 になり、文字は書かれたとおりに出る）。 */
     int        textmode;
 
-    /* `!L<名前>` が拾った「ソースに書かれていたままの式・ラベルの文字」を置く
-     * 1行ぶんのアリーナ。PatVar.text_off がこの中の位置を指す（-1 なら無し）。
-     * 位置で持つのは、候補パターンごとに vars[] を memcpy で退避・復元するため
-     * である（ポインタを持たせると所有権が二重になる）。ソース1行ごとに空にする。
-     * テキストテンプレートの `{{.exp(<名前>)}}` がここの文字をそのまま出す。
-     * axx.py の state.vars_text に対応する。 */
     char       captext[8192];
     int        captext_len;
 
-    /* テキスト置換モードで、その行の先頭にあった `label:` の綴りをそのまま
-     * 覚えておく置き場。書き換えたテキストの前に付け直す。1行ごとに作り直す。
-     * axx.py の state.label_text に対応する。 */
     char       label_text[512];
 
-    /* テキスト置換モードで、その行に書かれていた `;` コメントを `;` ごとそのまま
-     * 覚えておく置き場。書き換えたテキストの後ろに付け直す。1行ごとに作り直し、
-     * コメントが無い行とテキスト置換モードでないときは NULL である。
-     * axx.py の state.comment_text に対応する。 */
     char      *comment_text;
 
-    /* テキスト置換モードで、その行の行頭にあった字下げ（空白・タブ）を書かれて
-     * いたまま覚えておく置き場。訳したテキストの先頭に付け直すので、ソースの
-     * 字下げが翻訳結果にもそのまま残る。1行ごとに作り直し、テキスト置換モードで
-     * ないときは常に空文字である。
-     * axx.py の state.indent_text に対応する。 */
     char       indent_text[512];
 
     char       cl[4096];
@@ -2225,21 +2062,12 @@ typedef struct {
     int        elf_machine;
     int        elf_class;
 
-    /* --- DWARF デバッグ情報（-g） --- */
     int        gen_debug;
-    /* pc とソース行の対応表。.debug_line の生成に使う */
     struct { char *section; uint64_t word_pc; char *file; int line; } *line_map;
     int        line_map_len;
     int        line_map_cap;
 
-    /* --- パス2でのリロケーション収集 ---
-     * 式評価中にラベル参照を見つけるたび elf_refs へ (名前, 生値, 何ワード目か)
-     * を積む。1命令ぶん組み立て終わった時点でこれをまとめ、同じラベルへの
-     * 連続した参照を1つのリロケーションに束ねて relocations へ確定させる。 */
     int        elf_tracking;
-    /* rtype>0 なら `.reloc` が宣言された変数が運んだ参照。命令語のビット欄に
-     * 値が詰まっていて加数を逆算できないので、型と加数をここに持って回る。
-     * 加数は「変数が持っていた値 − ラベル値」で、`bl func` なら 0。 */
     struct { char *name; uint64_t val; int word_idx;
              int rtype; int64_t addend; } *elf_refs;
     int        elf_refs_len;
@@ -2250,7 +2078,7 @@ typedef struct {
         char    *label_name;
         uint64_t label_val;
     }          elf_var_to_label[NVARS];
-    int        elf_capturing_var;   /* 捕捉中の変数スロット。-1 でなし */
+    int        elf_capturing_var;
     struct {
         char   *section;
         int64_t sec_offset;
@@ -2264,97 +2092,53 @@ typedef struct {
 
     int        reloctype_override[4];
 
-    /* .check で登録された「変数 a〜z が満たすべき条件」 */
-    ChkList   *check_constraints[NVARS];  /* 空は NULL（共有・参照数つき）*/
-    /* .reloc で登録された「この変数が捕らえたラベル参照はこの型で外に出す」
-     * 宣言。変数スロット -> 型番号（0 でなし）。型はオペランドの位置ごとに
-     * 決まる（AArch64 では同じシンボルを adrp と add が別の型で参照する）ため、
-     * シンボル側ではなくパターン側の、この変数単位でしか表せない。 */
+    ChkList   *check_constraints[NVARS];
     int        reloc_constraints[NVARS];
-    char      *reloc_badname[32];   /* 未知型名の報告済み一覧 */
+    char      *reloc_badname[32];
     int        reloc_badname_len;
 
-    /* `.elftype::名前::値[::幅[::PC相対]]` で決めたリロケーション型名（名前は
-     * 小文字で持つ）。型名を書けるところ（`.reloc`、ソースの `::型名`、
-     * 取り込みファイル）はまずこの表を引き、無ければマシンごとの名前表を引く。
-     * width は書き換える欄のバイト幅（0 なら書かれていない）、pcrel は
-     * PC 相対の型かどうかである。 */
     struct { char *name; int rtype; int width; int pcrel; } *elftypes;
     int        elftypes_len, elftypes_cap;
 
-    /* --- パターンファイルの ELF 宣言（マニュアル 3.7.7 節）---
-     * `-m` で選んだ組み込みのマシン表に重ねる差分。実効表は
-     * elf_machine_effective() が組み立てる。 */
-    int        elf_decl_machine;   /* .elfmachine の番号（-1 でなし） */
-    char       elf_decl_name[64];  /* .elfmachine の表示名 */
-    int        elf_decl_class;     /* .elfclass（0=なし / 1=ELF32 / 2=ELF64） */
-    int        elf_decl_rela;      /* .elfrela（-1=なし / 0=REL / 1=RELA） */
-    char      *elf_decl_width[9];  /* .elfwidth バイト幅 → 型欄（NULL でなし） */
-    char      *elf_decl_extern;    /* .elfextern の型欄 */
-    char      *elf_decl_dwarf;     /* .elfdwarf の型欄 */
-    int        elf_hdr_set[ELF_HDR_NFIELD];  /* .elfheader で書いた欄か */
-    uint64_t   elf_hdr_val[ELF_HDR_NFIELD];  /* その値 */
+    int        elf_decl_machine;
+    char       elf_decl_name[64];
+    int        elf_decl_class;
+    int        elf_decl_rela;
+    char      *elf_decl_width[9];
+    char      *elf_decl_extern;
+    char      *elf_decl_dwarf;
+    int        elf_hdr_set[ELF_HDR_NFIELD];
+    uint64_t   elf_hdr_val[ELF_HDR_NFIELD];
 
-    /* `.elfsection::<名前>::<flags>[::<型>]` で決めたセクションの属性
-     * （マニュアル 3.7.7 節）。名前は書いたままを持ち、引くときだけ大小を
-     * 区別しない。type_set が 0 の行は sh_flags だけを決める。 */
     struct { char *name; uint32_t flags; int type_set; uint32_t type;
              int al_set; uint32_t al; int es_set; uint32_t es; } *elf_secs;
     int        elf_secs_len, elf_secs_cap;
-    /* `.type`/`.size`/`.weak`/`.hidden`/`.protected`/`.internal`/`.other`/
-     * `.comm` が宣言した ELF シンボルの属性（マニュアル 5.6.1 節）。
-     * 出力にしか効かないので、パス1の反復では消さずに持ち越す。
-     * axx.py の sym_attrs と同じ内容である。 */
     struct { char *name; int stype; int size_set; uint64_t size;
              int other; int weak; int common; uint64_t calign; } *sym_attrs;
     int        sym_attrs_len, sym_attrs_cap;
-    /* `.elffield::<型>::<マスク>[::<オフセット>]` で命令フィールド型と宣言した型。
-     * 型欄は書いたまま持ち、実効マシン表の名前で引く（宣言順）。 */
     struct { char *type; uint64_t mask; int off; } *elf_fields;
     int        elf_fields_len, elf_fields_cap;
-    /* 型名を書かなかった `.extern` で宣言したラベル名。その既定型は `.reloc` が
-     * 命令フィールド型を決めた参照では使わない（axx.py の extern_untyped）。 */
     char     **extern_untyped;
     int        extern_untyped_len, extern_untyped_cap;
-    int        elf_machine_from_cli;  /* -m を明示したか */
-    long       elf_decl_gen;       /* 宣言が変わるたびに増える（控えの鍵） */
+    int        elf_machine_from_cli;
+    long       elf_decl_gen;
 
-    /* .enum で登録された、変数 a〜z の列挙（`!E<変数>` が使う） */
     EnumDef    enum_defs[NVARS];
 
-    /* .enum の式を評価している間だけ非 NULL。要素名を「出現していれば
-     * .setsym の値、非出現なら 0」に束縛した表を指す。 */
     const StrVec    *enum_bind_names;
     const uint256_t *enum_bind_vals;
 
-    /* error_patterns 欄が返すエラーコード → メッセージ文字列。
-     * ERRORS_TABLE の実行時可変コピーとして state_init() で複製する。
-     * .error::n::"Message" ディレクティブで上書き・拡張できる。 */
     StrVec     errors;
 
-    /* 式の再帰深度。深すぎる入れ子でネイティブスタックを溢れさせない番人 */
     int        expr_depth;
 
-    /* --- パス1のリラクゼーション（サイズ収束） ---
-     * relax_prev は前回反復での「ラベル→アドレス」。今回と一致したら収束。
-     * relax_optimistic は未確定の前方参照を「近い」と仮定して収束を早めるモード。 */
     LabelMap  *relax_prev;
 
     int        relax_optimistic;
 
-    /* --- マクロ層からラベル値・.equ・$/$$ を参照するためのスナップショット ---
-     * マクロ展開はアドレス確定より前に走るので「今の値」は原理的に無い。
-     * 前回リラクゼーション反復の値を使い、収束はリラクゼーションループ
-     * （反復上限・振動検出・未収束なら出力しない）に委ねる。
-     * macro_labels_valid==0 は「まだ一度も反復していない＝何も分からない」で、
-     * このとき未知の名前は 0・defined() は偽になる。
-     * relax_prev と別に持つのは、relax_prev がパス2の前に解放されるのに対し、
-     * こちらは収束後の展開をパス2でも再現するため生かしておく必要があるため。 */
     LabelMap   macro_labels;
     int        macro_labels_valid;
 
-    /* $/$$ 用。ラベルと違って位置で決まる値なので、展開後の行番号でしか
-     * 対応が取れない。macro_line_pcs が前回反復の記録、_cur が今回ぶん。 */
     MacroLinePcsVec macro_line_pcs;
     MacroLinePcsVec macro_line_pcs_cur;
 
@@ -2371,8 +2155,6 @@ typedef struct {
     char       equ_first_section[64];
     int        equ_multi_section;
 
-    /* パターン照合の試行中に出た診断を溜める箱。
-     * そのパターンが最終的に採用されたときだけ再生して表示する。 */
     char     **diag_pending;
     int       *diag_pending_seterr;
     int        diag_pending_len;
@@ -2380,9 +2162,8 @@ typedef struct {
     int        diag_capturing;
 } AsmState;
 
-/* ユーザ向けエラーを今表示してよいパスか。
- * パス2（最終）と対話モード(0)のみ。パス1のリラクゼーション中は同じエラーが
- * 反復回数だけ重複するうえ、前方参照が未解決なだけの偽エラーも多い。 */
+/* いま診断を出してよいパスか。パス2と対話モードだけ真。パス1は推定値で
+   動いているので、そこで出る「範囲外」は本物とは限らない。 */
 static inline int should_report_errors(const AsmState *st) {
     return st->pas == 2 || st->pas == 0;
 }
@@ -2390,15 +2171,11 @@ static inline int should_report_errors(const AsmState *st) {
 
 static AsmState *g_active_state = NULL;
 
+/* 照合の試行中の診断を溜める。その試行が採択されるとは限らないため。 */
 static void diag_pending_push(AsmState *st, const char *text, int set_error){
     if(st->diag_pending_len >= st->diag_pending_cap){
         int nc = st->diag_pending_cap ? st->diag_pending_cap*2 : 8;
         char **nt = realloc(st->diag_pending, (size_t)nc*sizeof(char*));
-        /* 破綻点修正: nt と ns を別々に realloc していたため、nt は成功したが
-         * ns は失敗した場合、両方を free して抜けていた。しかし realloc が
-         * 成功した時点で古いブロックは既に解放/移動済みなので、そこで
-         * st->diag_pending を更新しないまま抜けるとダングリングポインタが
-         * 残る。成功した側だけでも必ず反映してから抜ける。 */
         if(nt) st->diag_pending = nt;
         int *ns = realloc(st->diag_pending_seterr, (size_t)nc*sizeof(int));
         if(ns) st->diag_pending_seterr = ns;
@@ -2412,12 +2189,14 @@ static void diag_pending_push(AsmState *st, const char *text, int set_error){
     st->diag_pending_len++;
 }
 
+/* 以降の診断を溜め始める。 */
 static void diag_capture_begin(AsmState *st){
     for(int i=0;i<st->diag_pending_len;i++) free(st->diag_pending[i]);
     st->diag_pending_len = 0;
     st->diag_capturing   = 1;
 }
 
+/* 溜めた診断を取り出し、溜めるのをやめる。 */
 static void diag_capture_take(AsmState *st, char ***texts, int **seterr, int *n){
     *texts  = st->diag_pending;
     *seterr = st->diag_pending_seterr;
@@ -2429,21 +2208,11 @@ static void diag_capture_take(AsmState *st, char ***texts, int **seterr, int *n)
     st->diag_capturing      = 0;
 }
 
-/* 内側の評価器が出す診断を一時的に飲み込むための退避/復元。
- *
- * qad{}/dbl{}/flt{} の「予備の評価器」を呼ぶときに使う。予備側で起きた
- * ゼロ除算等の内部エラーをそのまま表示すると、axx.py が出す
- * "dbl{}: cannot convert ..." とは別の文言（"Division by 0 error."）が
- * 混ざって両実装の出力が食い違うため、内側の分は捨てて呼び出し側が
- * 正しい文言を1本だけ出す。
- *
- * axx_diagf() は in_match_attempt かつ diag_capturing のときだけ溜め込む
- * ので、両方立てる。既に外側で捕捉中の場合を壊さないよう、現在の捕捉
- * バッファごと退避してから始め、終了時に元へ戻す。 */
 typedef struct {
     char **texts; int *seterr; int n; int cap; int capturing; int in_match;
 } DiagSuppress;
 
+/* 診断を一時的に止める（現在は未使用）。 */
 static AXX_UNUSED void diag_suppress_begin(AsmState *st, DiagSuppress *sv){
     sv->texts     = st->diag_pending;
     sv->seterr    = st->diag_pending_seterr;
@@ -2459,6 +2228,7 @@ static AXX_UNUSED void diag_suppress_begin(AsmState *st, DiagSuppress *sv){
     st->in_match_attempt    = 1;
 }
 
+/* 診断の抑制を解く（現在は未使用）。 */
 static AXX_UNUSED void diag_suppress_end(AsmState *st, DiagSuppress *sv){
     for(int i=0;i<st->diag_pending_len;i++) free(st->diag_pending[i]);
     free(st->diag_pending);
@@ -2471,6 +2241,7 @@ static AXX_UNUSED void diag_suppress_end(AsmState *st, DiagSuppress *sv){
     st->in_match_attempt    = sv->in_match;
 }
 
+/* 溜めた診断を出す。採択されたパターンのぶんだけ流す。 */
 static void diag_replay(AsmState *st, char **texts, int *seterr, int n){
     for(int i=0;i<n;i++){
         if(should_report_errors(st)){
@@ -2480,17 +2251,13 @@ static void diag_replay(AsmState *st, char **texts, int *seterr, int n){
     }
 }
 
-/* 出そうとした診断の数。抑止されたものも数える（パスによって見え方が
- * 変わるので、抑止の前に数える）。前置きの畳み込みが「この前置きは診断を
- * 出す」と気づくために使う。 */
 static long long g_diag_count = 0;
 
+/* 診断を 1 行出す。set_error で had_error を立て、force でパスと照合の
+   状況を無視して必ず出す。 */
 static void axx_diagf(int set_error, int force, const char *fmt, ...){
     AsmState *st = g_active_state;
     g_diag_count++;
-    /* 破綻点修正: 診断文を固定長 2048 バイトに切り詰めていたため、長い式や
-     * 長い文字列値を含むメッセージが axx.py（切り詰めない）と食い違っていた。
-     * まず必要な長さを測り、収まらないときだけヒープへ逃がす。 */
     char stackbuf[2048];
     char *buf = stackbuf;
     va_list ap;
@@ -2520,23 +2287,18 @@ static void axx_diagf(int set_error, int force, const char *fmt, ...){
     if(st && set_error) st->had_error = 1;
 }
 
+/* errno を、ファイル名を添えた文言にする。 */
 static void axx_oserr_str(const char *fn, int err, char *out, size_t osz){
     char q[1024]; m_pyrepr(fn ? fn : "", q, sizeof(q));
     snprintf(out, osz, "[Errno %d] %s: %s", err, strerror(err), q);
 }
 
-/* 書き込み時のエラー文面。Python の OSError は open() から出たときだけ
- * ファイル名を含み、write()/close() から出たときは含まない。axx.py と
- * 同じ文面にそろえるため、こちらは名前なしの形を作る。 */
+/* errno を文言にする（ファイル名なし）。 */
 static void axx_oserr_nopath(int err, char *out, size_t osz){
     snprintf(out, osz, "[Errno %d] %s", err, strerror(err));
 }
 
-/* 破綻点修正: 出力の書き込み失敗（ディスク満杯・クォータ超過・パイプ切断）を
- * どこでも検査しておらず、切り詰められたファイルを「wrote ...」と報告して
- * 終了コード 0 で終わっていた。axx.py は例外で必ず失敗するので合わせる。
- * 途中のエラーは ferror で、遅延書き込みのエラーは fclose で拾う。
- * 戻り値: 0=成功、1=失敗（エラーは報告済み）。 */
+/* 出力を閉じ、書き込みが成功したかを確かめる。 */
 static int axx_close_out(FILE *fp, const char *path){
     int err = 0;
     errno = 0;
@@ -2551,7 +2313,7 @@ static int axx_close_out(FILE *fp, const char *path){
     return 0;
 }
 
-/* 標準出力へ流したときの後始末。閉じずに流しきれたかだけを見る。 */
+/* 標準出力を流し、失敗を報告する。 */
 static int axx_flush_stdout(const char *path){
     int err = 0;
     errno = 0;
@@ -2565,6 +2327,7 @@ static int axx_flush_stdout(const char *path){
     return 0;
 }
 
+/* 入力を開く。失敗したら文言を出して NULL を返す。 */
 static FILE *axx_open_input(const char *fn, const char *what){
     char eb[1200];
     struct stat sb;
@@ -2591,11 +2354,6 @@ typedef struct {
     int         is_rela;
     int         extern_default;
     int         dwarf_abs;
-    /* 欄のバイト幅（1〜8）→ その幅の参照に使う既定のリロケーション型。
-     * 添字は幅そのもので、0 は「その幅の既定の型を持たない」である。
-     * 2 の冪でない幅（1 ワードが 8 ビットでない機種では普通に現れる）も
-     * `.elfwidth` で書けるので、4 つの欄ではなく幅で引く表にしてある。
-     * axx.py の width_guess と同じ内容である。 */
     int         wg[9];
     const int  *pc_rel;
     int         pc_rel_n;
@@ -2678,8 +2436,6 @@ static const ElfNamedReloc _named_aarch64[] = {
     {"pc64", 260, 8}, {"rel64", 260, 8},
     {"pc32", 261, 4}, {"rel32", 261, 4},
     {"pc16", 262, 2}, {"rel16", 262, 2},
-    /* 命令フィールド型。値は命令語のビット欄に詰まるため、素の整数が並ぶ
-     * データ型とは扱いが異なる（insn_reloc_field_mask を参照）。 */
     {"movw_uabs_g0", 263, 4}, {"movw_uabs_g0_nc", 264, 4},
     {"movw_uabs_g1", 265, 4}, {"movw_uabs_g1_nc", 266, 4},
     {"movw_uabs_g2", 267, 4}, {"movw_uabs_g2_nc", 268, 4},
@@ -2699,8 +2455,6 @@ static const ElfNamedReloc _named_aarch64[] = {
     {"ldst32_abs_lo12_nc", 285, 4},
     {"ldst64_abs_lo12_nc", 286, 4},
     {"ldst128_abs_lo12_nc", 299, 4},
-    /* GOT 経由。リンカが GOT エントリを作るので、値はアセンブル時には決まらない。
-     * 欄は 0 で出し、リンカが埋める。 */
     {"got_ld_prel19", 309, 4},
     {"got_page", 311, 4}, {"adr_got_page", 311, 4},
     {"got_lo12", 312, 4}, {"ld64_got_lo12_nc", 312, 4},
@@ -2708,43 +2462,30 @@ static const ElfNamedReloc _named_aarch64[] = {
     {NULL, 0, 0},
 };
 
-/* AArch64 の「命令フィールド型」リロケーションが占める、32bit 命令語中の
- * ビットマスクを返す。データ型や未知の型では 0。
- *
- * データ型（ABS64 など）は値がそのまま連続バイトに並ぶが、こちらは命令語の
- * 飛び飛びのビット欄に、語単位・ページ単位に縮めた形で詰まる。そのため加数を
- * 「出力バイト列 − ラベル値」で逆算する通常の経路が使えない。該当する型では
- * 代わりに、パターンが捕らえたオペランド値とラベル値の差を加数とし、命令語側の
- * ビット欄は 0 にして出す（GNU as と同じ形。RELA なのでリンカが欄を埋める）。 */
+/* `.elffield` で宣言された命令欄のマスク。 */
 static uint32_t insn_reloc_field_mask_tbl(int rtype){
     switch(rtype){
     case 263: case 264: case 265: case 266:
     case 267: case 268: case 269:
     case 287: case 288: case 289: case 290:
     case 291: case 292: case 293:
-        return 0xffffu << 5;                    /* MOVW_UABS/PREL_G0..G3  imm16 */
+        return 0xffffu << 5;
     case 274: case 275: case 276:
-        return (3u << 29) | (0x7ffffu << 5);    /* ADR/ADRP  immlo+immhi */
+        return (3u << 29) | (0x7ffffu << 5);
     case 277: case 278: case 284: case 285:
     case 286: case 299:
-        return 0xfffu << 10;                    /* ADD/LDST lo12  imm12 */
-    case 279: return 0x3fffu << 5;              /* TSTBR14  */
-    case 280: case 309: return 0x7ffffu << 5;   /* CONDBR19 / GOT_LD_PREL19 */
-    case 311: return (3u << 29) | (0x7ffffu << 5);  /* ADR_GOT_PAGE */
-    case 312: case 313: return 0xfffu << 10;    /* LD64_GOT_LO12_NC / GOTPAGE_LO15 */
-    case 282: case 283: return 0x3ffffffu;      /* JUMP26 / CALL26 */
+        return 0xfffu << 10;
+    case 279: return 0x3fffu << 5;
+    case 280: case 309: return 0x7ffffu << 5;
+    case 311: return (3u << 29) | (0x7ffffu << 5);
+    case 312: case 313: return 0xfffu << 10;
+    case 282: case 283: return 0x3ffffffu;
     default: return 0;
     }
 }
 
-/* 命令フィールド型なら、その値が占める 32bit 命令語中のビットマスクを返す。
- * データ型や未知の型では 0。
- *
- * 型番号の意味はマシンごとに違う（AArch64 の 275 = ADR_PREL_PG_HI21 は、他の
- * マシンでは別物か、そもそも無い）。上の表は AArch64 のものなので、対象が
- * AArch64 のときだけ引く。`.elftype`（3.7.7 節）で同じ番号を宣言した別機種の
- * 型を、命令フィールド型と取り違えないためである。
- * axx.py の insn_reloc_field_mask() と同じ規則である。 */
+/* AArch64 の命令欄リロケーションのマスク（組み込みの表）。
+   ほかのマシンでは `.elffield` が同じことを宣言する。 */
 static uint32_t insn_reloc_field_mask_a64(int rtype, int machine){
     if(machine != 183) return 0;
     return insn_reloc_field_mask_tbl(rtype);
@@ -2755,19 +2496,7 @@ static const ElfNamedReloc _named_riscv[] = {
     {NULL, 0, 0},
 };
 
-/* アーキテクチャ別 ELF 情報表（axx.py の ELF_MACHINES に対応）。
- * 列の意味は左から（ElfMachineInfo の宣言順そのまま）:
- *   e_machine, 名前, elfclass(1=32/2=64), is_rela(1=RELA/0=REL),
- *   外部シンボルの既定型, DWARF絶対参照の型,
- *   幅8の既定型, 幅4の既定型, 幅2の既定型, 幅1の既定型,
- *   PC相対型の一覧, その個数, 記号名テーブル
- * REL（加数を命令バイト列に埋め込む形式）を使うのは i386 と ARM(32) だけで、
- * 他は全て RELA（加数を専用フィールドに持つ）。
- * 幅N の既定型は、必ずその名前表(named)に現れて幅も一致していること
- * （ARM の幅2 はかつて 4 = R_ARM_LDR_PC_G0 という 16bit データ参照ではない
- *   値になっていた。正しくは R_ARM_ABS16 の 5）。 */
 static const ElfMachineInfo ELF_MACHINES[] = {
-    /*                       cls rela ext  dwarf   wg[0..8]（添字＝バイト幅）        pc_rel          n  named */
     {3,   "i386",         1, 0, 2,   1,   {0, 22, 20,0,  2,0,0,0,  0}, _pcrel_i386,    4, _named_i386},
     {4,   "m68k",         1, 1, 4,   1,   {0,  3,  2,0,  4,0,0,0,  0}, _pcrel_m68k,    3, _named_m68k},
     {20,  "PowerPC",      1, 1, 26,  1,   {0,  0,  4,0, 26,0,0,0,  0}, _pcrel_ppc32,   2, _named_ppc32},
@@ -2782,12 +2511,14 @@ static const ElfMachineInfo ELF_MACHINES[] = {
 };
 #define ELF_MACHINES_N ((int)(sizeof(ELF_MACHINES)/sizeof(ELF_MACHINES[0])))
 
+/* e_machine から組み込みのマシン記述を引く。 */
 static const ElfMachineInfo *elf_machine_find(int machine){
     for(int i=0;i<ELF_MACHINES_N;i++)
         if(ELF_MACHINES[i].machine == machine) return &ELF_MACHINES[i];
     return NULL;
 }
 
+/* 組み込みの表で型名を番号にする。 */
 static int elf_machine_named(const ElfMachineInfo *m, const char *name){
     if(!m) return -1;
     for(int i=0; m->named[i].name; i++)
@@ -2795,15 +2526,14 @@ static int elf_machine_named(const ElfMachineInfo *m, const char *name){
     return -1;
 }
 
-/* `.elftype` で決めた型名を引く。無ければ -1。名前の大小は区別しない。 */
+/* `.elftype` が宣言した型名を番号にする。 */
 static int elftype_find(const AsmState *st, const char *name){
     for(int i=0;i<st->elftypes_len;i++)
         if(strcasecmp(st->elftypes[i].name, name)==0) return st->elftypes[i].rtype;
     return -1;
 }
 
-/* `.elftype` の名前を据える。同じ名前があれば書き換える（後の宣言が勝つ）。
- * 中身が変わったときだけ実効表の版を進める（毎行同じ宣言を通るため）。 */
+/* `.elftype` の宣言を登録する。 */
 static void elftype_set(AsmState *st, const char *name, int rtype, int width, int pcrel){
     for(int i=0;i<st->elftypes_len;i++)
         if(strcasecmp(st->elftypes[i].name, name)==0){
@@ -2830,9 +2560,7 @@ static void elftype_set(AsmState *st, const char *name, int rtype, int width, in
     st->elf_decl_gen++;
 }
 
-/* 型名を番号にする。`.elftype` で決めた名前を先に引き、無ければ `-m` で選んだ
- * マシンの名前表を引く。型名を書けるところは全部ここを通る。
- * axx.py の _reloc_named() と同じ規則である。 */
+/* 型名を番号にする。`.elftype` の宣言が組み込みの表に勝つ。 */
 static int elf_reloc_named(const AsmState *st, const ElfMachineInfo *m, const char *name){
     if(!name || !name[0]) return -1;
     int t = elftype_find(st, name);
@@ -2840,6 +2568,7 @@ static int elf_reloc_named(const AsmState *st, const ElfMachineInfo *m, const ch
     return elf_machine_named(m, name);
 }
 
+/* 組み込みの表で型番号を名前にする。 */
 static const char *elf_machine_reverse(const ElfMachineInfo *m, int rtype){
     if(!m) return NULL;
     for(int i=0; m->named[i].name; i++)
@@ -2847,10 +2576,7 @@ static const char *elf_machine_reverse(const ElfMachineInfo *m, int rtype){
     return NULL;
 }
 
-/* 型番号から型名を引く（`-E` の書き出しに使う）。マシンの名前表を先に引き、
- * 無ければ `.elftype` で決めた名前を使う。取り込み側は名前を
- * elf_reloc_named() で引くので、これで書き出し→取り込みが往復できる。
- * axx.py の _reloc_reverse() と同じ規則である。 */
+/* 型番号を名前にする（診断とリスティング用）。 */
 static const char *elf_reloc_reverse(const AsmState *st, const ElfMachineInfo *m, int rtype){
     const char *nm = elf_machine_reverse(m, rtype);
     if(nm) return nm;
@@ -2859,6 +2585,7 @@ static const char *elf_reloc_reverse(const AsmState *st, const ElfMachineInfo *m
     return NULL;
 }
 
+/* その型が使う欄の幅（バイト）。 */
 static int elf_machine_reloc_bytes(const ElfMachineInfo *m, int rtype){
     if(!m) return 0;
     for(int i=0; m->named[i].name; i++)
@@ -2866,18 +2593,14 @@ static int elf_machine_reloc_bytes(const ElfMachineInfo *m, int rtype){
     return 0;
 }
 
+/* その型が PC 相対か。 */
 static int elf_machine_is_pcrel(const ElfMachineInfo *m, int rtype){
     if(!m) return 0;
     for(int i=0;i<m->pc_rel_n;i++) if(m->pc_rel[i]==rtype) return 1;
     return 0;
 }
 
-/* 実効表の先頭から、欄の幅が nbytes で PC 相対性が want_pcrel の型を探す。
- * 無ければ 0。幅からの既定型の PC 相対性が欄の中身と食い違っていたときの
- * 取り替え先を引くのに使う。型名でも型番号でもなく「幅と PC 相対性」で引くので、
- * 組み込みの表を持たない、パターンファイルで宣言したマシンでも同じように働く。
- * 実効表の並びは両実装で同じなので、先頭から探した結果も同じである。
- * axx.py の _reloc_same_width() と同じ規則である。 */
+/* 欄の幅と PC 相対かどうかが一致する型を 1 つ探す。 */
 static int elf_reloc_same_width(const ElfMachineInfo *m, int nbytes, int want_pcrel){
     if(!m) return 0;
     for(int i=0; m->named[i].name; i++){
@@ -2888,39 +2611,25 @@ static int elf_reloc_same_width(const ElfMachineInfo *m, int nbytes, int want_pc
     return 0;
 }
 
+/* 欄の幅から型を推測する（優先順位は最も低い）。 */
 static int elf_machine_width_guess(const ElfMachineInfo *m, int nbytes){
     if(!m || nbytes < 1 || nbytes > 8) return 0;
     return m->wg[nbytes];
 }
 
-/* ---------------------------------------------------------------------------
- * 実効マシン表
- *
- * 組み込みの ELF_MACHINES は読み取り専用の土台で、その上にパターンファイルの
- * ELF 宣言（`.elftype` / `.elfwidth` / `.elfextern` / `.elfdwarf` / `.elfrela`
- * / `.elfclass` / `.elfmachine`、マニュアル 3.7.7 節）を重ねたものが、実際に
- * 引かれる表である。組み込みの表に無い e_machine でも、宣言さえそろえば
- * ここで表が組み上がる。
- *
- * 名前の並びは「組み込みの名前のうち `.elftype` で同じ綴りを宣言していない
- * もの」→「`.elftype` の宣言（宣言順）」である。名前引き・逆引き・幅引きは
- * どれも先頭から探すので、この並びが両実装で同じであることが、出力が同じに
- * なる条件になる。axx.py の elf_machine_table() と同じ並びである。
- * --------------------------------------------------------------------------- */
 typedef struct {
     ElfMachineInfo  info;
-    ElfNamedReloc  *named;     /* 末尾は {NULL,0,0} */
+    ElfNamedReloc  *named;
     int            *pc_rel;
     char            name_buf[80];
-    long            gen;       /* 組み立てたときの宣言の版 */
-    int             machine;   /* 組み立てたときのマシン番号 */
+    long            gen;
+    int             machine;
     int             valid;
 } ElfMachEff;
 
 static ElfMachEff g_elf_mach_eff;
 
-/* ELF 宣言の型欄（型名でも型番号でもよい）を型番号にする。読めなければ -1。
- * axx.py の _elf_decl_type() と同じ規則である。 */
+/* 宣言に書かれた型の綴りを番号にする。 */
 static int elf_decl_type_in(const ElfNamedReloc *named, const char *text){
     if(!text) return -1;
     char buf[128]; size_t n = 0;
@@ -2938,6 +2647,10 @@ static int elf_decl_type_in(const ElfNamedReloc *named, const char *text){
     return -1;
 }
 
+/* いま有効な ELF マシン記述を組み立てて返す。
+   組み込みの表を土台に、パターンファイルの宣言をかぶせたものがここで出来る。
+   同じ名前なら宣言のほうが勝つ。1 行ごとに作り直すと重いので、宣言の
+   世代番号を鍵にして覚える。 */
 static const ElfMachineInfo *elf_machine_effective(const AsmState *st){
     if(g_elf_mach_eff.valid && g_elf_mach_eff.gen == st->elf_decl_gen
        && g_elf_mach_eff.machine == st->elf_machine)
@@ -3001,7 +2714,6 @@ static const ElfMachineInfo *elf_machine_effective(const AsmState *st){
     { int rt = elf_decl_type_in(nm, st->elf_decl_dwarf);
       if(rt >= 0) info.dwarf_abs = rt; }
 
-    /* 表示名。宣言した番号を実際に出しているときだけ `.elfmachine` の名前を使う。 */
     if(st->elf_decl_name[0]
        && (st->elf_decl_machine < 0 || st->elf_decl_machine == st->elf_machine))
         snprintf(g_elf_mach_eff.name_buf, sizeof(g_elf_mach_eff.name_buf), "%s",
@@ -3024,12 +2736,6 @@ static const ElfMachineInfo *elf_machine_effective(const AsmState *st){
     return &g_elf_mach_eff.info;
 }
 
-/* `.elffield` で宣言した命令フィールド型なら 1 を返し、マスクとオフセットを
- * 書く。マスクは型の幅ぶんのバイト列を対象のバイト順で読んだ整数の中で
- * リンカが書き込むビット、オフセットはその欄が命令の先頭から何バイト目に
- * 始まるか（r_offset もそこを指す）。宣言の型欄は実効マシン表の名前で引き、
- * 同じ型番号なら先に宣言したものを使う。axx.py の insn_reloc_field_decl() と
- * 同じである。 */
 static struct { long gen; int machine; int valid; int n;
                 int *rt; uint64_t *mask; int *off; } g_elf_field_eff;
 
@@ -3073,20 +2779,21 @@ static int insn_reloc_field_decl(const AsmState *st, int rtype,
     return 0;
 }
 
-/* 命令フィールド型なら、その値が占めるビットマスクを返す。データ型や未知の型
- * では 0。`.elffield` の宣言を先に引き、無ければ AArch64 の組み込み表を引く。
- * axx.py の insn_reloc_field_mask() と同じ規則である。 */
+/* その型が命令語のどのビットを使うかのマスク。`.elffield` が最優先で、
+   無ければ AArch64 の組み込み表。どちらも無ければ 0（命令欄ではない）。 */
 static uint64_t insn_reloc_field_mask(const AsmState *st, int rtype, int machine){
     uint64_t m = 0;
     if(insn_reloc_field_decl(st, rtype, &m, NULL)) return m;
     return insn_reloc_field_mask_a64(rtype, machine);
 }
 
+/* 型の付いていない外部シンボルとして登録されているか。 */
 static int extern_untyped_has(const AsmState *st, const char *name){
     for(int i = 0; i < st->extern_untyped_len; i++)
         if(strcmp(st->extern_untyped[i], name) == 0) return 1;
     return 0;
 }
+/* その登録を付け外しする。 */
 static void extern_untyped_set(AsmState *st, const char *name, int on){
     for(int i = 0; i < st->extern_untyped_len; i++)
         if(strcmp(st->extern_untyped[i], name) == 0){
@@ -3106,6 +2813,7 @@ static void extern_untyped_set(AsmState *st, const char *name, int on){
     st->extern_untyped[st->extern_untyped_len++] = strdup(name);
 }
 
+/* 欄の幅からリロケーション型を決める。ソースの `.reloctype` が上書きできる。 */
 static int reloctype_for(const AsmState *st, const ElfMachineInfo *m, int nbytes){
     int idx;
     switch(nbytes){
@@ -3119,34 +2827,18 @@ static int reloctype_for(const AsmState *st, const ElfMachineInfo *m, int nbytes
     return elf_machine_width_guess(m, nbytes);
 }
 
-/* ---------------------------------------------------------------------------
- * ELF シンボルの属性（マニュアル 5.6.1 節）
- *
- * シンボルの型・大きさ・束縛・可視性は ELF のシンボル表の欄で、どの機種でも
- * 同じ形をしている。リンカがこれを見て仕事を変えるので（STT_FUNC でないシンボル
- * には ARM/AArch64 の中継命令が作られない、大きさの無いシンボルは
- * `--gc-sections` で残せない、弱いシンボルは他の定義に負ける）、リンクできる
- * `.o` を出すには機種の記述だけでは足りない。ソース側の `.type` / `.size` /
- * `.weak` / `.hidden` / `.protected` / `.internal` / `.other` / `.comm` が
- * ここへ書き込み、write_elf_obj() が読む。
- * axx.py の sym_attrs と同じ内容である。
- * ------------------------------------------------------------------------- */
 
-/* `.type` の種別名 → STT_*。番号を直に書いてもよい（0〜15）。
- * axx.py の ELF_SYM_TYPES と同じ並びである。 */
 static const struct { const char *name; int v; } ELF_SYM_TYPES[] = {
     {"notype",0}, {"object",1}, {"func",2}, {"function",2},
     {"section",3}, {"file",4}, {"common",5}, {"tls",6}, {"tls_object",6},
     {"gnu_ifunc",10}, {"ifunc",10}, {NULL,0}
 };
 
-/* 属性を1つも宣言していないシンボルの姿。sym_attr_get() が返す。 */
 typedef struct { int stype; int size_set; uint64_t size;
                  int other; int weak; int common; uint64_t calign; } SymAttrView;
 static const SymAttrView SYM_ATTR_DEFAULT = {0,0,0,0,0,0,0};
 
-/* `name` のシンボル属性を読む。宣言が無ければ既定の姿を返す。
- * axx.py の _sym_attr() と同じである。 */
+/* シンボルの属性を読む（無ければ既定値）。 */
 static SymAttrView sym_attr_get(const AsmState *st, const char *name){
     for(int i=0;i<st->sym_attrs_len;i++)
         if(strcmp(st->sym_attrs[i].name, name)==0){
@@ -3163,8 +2855,8 @@ static SymAttrView sym_attr_get(const AsmState *st, const char *name){
     return SYM_ATTR_DEFAULT;
 }
 
-/* `name` のシンボル属性を書き換えられる形で取り出す（無ければ作る）。
- * axx.py の _sym_attr_slot() と同じである。 */
+/* シンボルの属性を書くための枠を返す。読むだけの場合に枠を作らせないため、
+   取得と分けてある。 */
 static int sym_attr_slot(AsmState *st, const char *name){
     for(int i=0;i<st->sym_attrs_len;i++)
         if(strcmp(st->sym_attrs[i].name, name)==0) return i;
@@ -3184,39 +2876,25 @@ static int sym_attr_slot(AsmState *st, const char *name){
     return k;
 }
 
-/* シンボルの st_info。束縛は呼び出し側が決め、型は `.type` から取る。
- *
- * `.weak` を宣言したシンボルは、呼び出し側が渡した束縛より STB_WEAK(2) が
- * 勝つ。局所シンボル（STB_LOCAL）に `.weak` は書けない — `.weak` は名前を
- * `.global` と同じく外へ出すので、そのシンボルは必ず大域側の並びに来る。
- * axx.py の _sym_st_info() と同じ規則である。 */
+/* st_info を組む。`.weak` があればバインドを STB_WEAK に差し替える。 */
 static uint8_t weo_sym_info(const AsmState *st, const char *name, int bind){
     SymAttrView a = sym_attr_get(st, name);
     if(a.weak) bind = 2;
     return (uint8_t)(((bind & 0xF) << 4) | (a.stype & 0xF));
 }
 
+/* st_other を組む（`.other` は丸ごと置き換える）。 */
 static uint8_t weo_sym_other(const AsmState *st, const char *name){
     return (uint8_t)(sym_attr_get(st, name).other & 0xFF);
 }
 
-/* シンボルの st_size。`.size` を書いていなければ 0。
- *
- * `.size` の値はワード数なので、ラベルの値と同じく1ワードのバイト数を掛けて
- * バイト数にする（8 ビット機では掛ける数が 1 なので書いたままになる）。
- * axx.py の _sym_size_of() と同じ規則である。 */
+/* st_size を組む。`.size` はワード数で書くので幅をかける。 */
 static uint64_t weo_sym_size(const AsmState *st, const char *name, int bpw){
     SymAttrView a = sym_attr_get(st, name);
     if(!a.size_set) return 0;
     return a.size * (uint64_t)bpw;
 }
 
-/* `.comm` で宣言したシンボルなら、SHN_COMMON の姿に差し替える。
- *
- * common シンボルは節に属さず、st_shndx が SHN_COMMON(0xfff2)、st_value が
- * 整列（バイト）、st_size が大きさ（バイト）になる。リンカが実体を作るので、
- * このオブジェクト自身は領域を持たない。
- * axx.py の _sym_common_override() と同じ規則である。 */
 static void weo_sym_common(const AsmState *st, const char *name, int bpw,
                            uint16_t *shndx, uint64_t *val, uint64_t *size){
     SymAttrView a = sym_attr_get(st, name);
@@ -3226,11 +2904,7 @@ static void weo_sym_common(const AsmState *st, const char *name, int bpw,
     *size  = a.size * (uint64_t)bpw;
 }
 
-/* 名前を「他所で解決される外部シンボル」として登録する。
- *
- * 型名を書かなかった `.extern` とまったく同じ登録で、`.weak` と `.comm`
- * がまだ知らない名前を見たときに使う。すでに知っている名前には何もしない。
- * axx.py の _sym_declare_extern() と同じ規則である。 */
+/* その名前を外部シンボルとして登録する。 */
 static void sym_declare_extern(AsmState *st, const char *name){
     if(lmap_find(&st->labels, name)) return;
     const ElfMachineInfo *m = elf_machine_effective(st);
@@ -3238,6 +2912,7 @@ static void sym_declare_extern(AsmState *st, const char *name){
     lmap_set_imported(&st->labels, name, u256_zero(), ".text", m->extern_default);
 }
 
+/* いま開いているセクションの範囲を閉じて記録する。 */
 static void secmap_finalize_current(AsmState *st){
     SecEntry *e = secmap_find(&st->sections, st->current_section);
     if(!e) return;
@@ -3249,13 +2924,7 @@ static void secmap_finalize_current(AsmState *st){
     e->entry_pc = st->pc;
 }
 
-/* axx.py の Assembler._addr_to_word_offset() 相当。
- *
- * 破綻点修正: 以前は section_ranges しか見ていなかったため、そのセクションの
- * 断片が1つも記録されていない場合（.section/.endsection を跨がずに終わった等）
- * にオフセットが求まらず、シンボルのセクション所属や DWARF のアドレスが
- * axx.py と食い違っていた。axx.py の _section_word_ranges() と同じく、
- * 断片が無いときだけ sections 表の (start, size) を1つの断片とみなす。 */
+/* セクション内のワードオフセットを出す。 */
 static int64_t sec_word_offset(AsmState *st, const char *name, uint64_t word_pc){
     if(st->sections.count == 0) return (int64_t)word_pc;
     uint64_t cum = 0;
@@ -3279,12 +2948,14 @@ static int64_t sec_word_offset(AsmState *st, const char *name, uint64_t word_pc)
     return -1;
 }
 
+/* DWARF に書くためのバイトオフセットを出す。 */
 static uint64_t dwarf_word_offset(AsmState *st, const char *sec_name, uint64_t word_pc, int bpw){
     if(st->sections.count == 0) return word_pc * (uint64_t)bpw;
     int64_t o = sec_word_offset(st, sec_name, word_pc);
     return (uint64_t)(o >= 0 ? o : 0) * (uint64_t)bpw;
 }
 
+/* `.equ` の値をセクション相対に直す。 */
 static int64_t equ_section_relative_offset(AsmState *st, const char *sec_name, uint64_t word_pc){
     int64_t o = addr_to_word_offset(&st->section_ranges, sec_name, word_pc);
     if(o >= 0) return o;
@@ -3297,8 +2968,7 @@ static int64_t equ_section_relative_offset(AsmState *st, const char *sec_name, u
     return -1;
 }
 
-/* 現在のセクション名を据える。長さの上限は無い（上の current_section の
- * コメントを参照）。axx.py の state.current_section への代入に対応する。 */
+/* 現在のセクションを切り替える。 */
 static void st_set_current_section(AsmState *st, const char *name){
     size_t n = strlen(name) + 1;
     if(n > st->current_section_cap){
@@ -3310,6 +2980,7 @@ static void st_set_current_section(AsmState *st, const char *name){
     memcpy(st->current_section, name, n);
 }
 
+/* アセンブル状態をすべて初期値にする。 */
 static void state_init(AsmState *st) {
     memset(st, 0, sizeof(*st));
     g_active_state = st;
@@ -3372,7 +3043,7 @@ static void state_init(AsmState *st) {
     st->expfile_elf[0] = '\0';
     st->elf_objfile[0] = '\0';
     st->elf_machine = 62;
-    st->elf_class = 0;         /* -f を書いたときだけ 1/2 になる */
+    st->elf_class = 0;
     st->gen_debug = 0;
     st->line_map = NULL;
     st->line_map_len = 0;
@@ -3417,30 +3088,36 @@ static void state_init(AsmState *st) {
     for(int _ei=0; _ei<ERRORS_COUNT; _ei++) sv_push(&st->errors, ERRORS_TABLE[_ei]);
 }
 
+/* ---- 行とトークンの文字列処理 -------------------------------------------
+   大文字化は ASCII だけを畳む。locale 依存の toupper() に任せると axx.py 側の
+   結果と食い違うため。文字列リテラル `"..."` と文字定数 `'c'` の中は触らない
+   という規則を、この一群が共有している。
+   ------------------------------------------------------------------------ */
 static char axx_upper_char(char c) {
     if(c>='a'&&c<='z') return c-32;
     return c;
 }
 static int is_digit(char c){ return c>='0'&&c<='9'; }
+/* 大文字の 16 進数字か。 */
 static int is_xdigit_upper(char c){
     return (c>='0'&&c<='9')||(c>='A'&&c<='F');
 }
 static AXX_UNUSED int is_alpha(char c){ return (c>='A'&&c<='Z')||(c>='a'&&c<='z'); }
 
+/* その場で ASCII 大文字化する。 */
 static char *axx_strupr(char *s) {
     for(char*p=s;*p;p++) *p=axx_upper_char(*p);
     return s;
 }
+/* 大文字化して写す。 */
 static void axx_strupr_to(char *dst, const char *src, size_t maxlen) {
     size_t i=0;
     for(;src[i]&&i<maxlen-1;i++) dst[i]=axx_upper_char(src[i]);
     dst[i]=0;
 }
 
-/* s の idx 位置に一致する列挙要素名のうち最長のものの番号を返す（無ければ -1）。
- * 直後が英数字・下線なら語の途中なので一致とみなさない。記号文字（.symbolc の
- * 既定に含まれる `-` 等）まで語の一部と見なすと `A0-A1` の範囲指定も減算も
- * 書けなくなるので、英数字と下線だけを見る。 */
+/* その位置にある `.enum` の要素名を最長一致で読む。名前の直後が英数字・
+   下線なら語の途中なので一致とみなさない。 */
 static int enum_name_at(const char *s, int idx, const StrVec *names, int *end_out){
     int best=-1, best_end=idx;
     for(int k=0;k<names->len;k++){
@@ -3461,6 +3138,7 @@ static int enum_name_at(const char *s, int idx, const StrVec *names, int *end_ou
     return best;
 }
 
+/* s の idx に t があるか（大文字小文字を区別しない）。 */
 static int axx_q(const char *s, int slen, const char *t, int idx) {
     int tlen=(int)strlen(t);
     if(idx+tlen>slen) return 0;
@@ -3469,34 +3147,21 @@ static int axx_q(const char *s, int slen, const char *t, int idx) {
     return 1;
 }
 
+/* 空白とタブを飛ばす。 */
 static int axx_skipspc(const char *s, int idx) {
     while(s[idx]==' ') idx++;
     return idx;
 }
 
-/* Portable ISO C replacement for the GCC-only `({ ... })` statement-expression
- * that used to be inlined at each qad{}/dbl{}/flt{}/enflt{}/endbl{} lookahead
- * site: returns 1 if, after skipping spaces from idx, the next character is
- * '{' and still within bounds. */
+/* 次の非空白が `{` か。 */
 static int axx_next_nonspace_is_brace(const char *s, int slen, int idx) {
     int j = axx_skipspc(s, idx);
     return j < slen && s[j] == '{';
 }
 
-/* アセンブリソース1行の空白を整える（引用符の中は手を付けない）。
- *
- * 引用符の外では タブ・CR・LF を空白に直し、連続する空白を1個に潰す。
- * 照合は空白の個数を見ないので、こうしておくと `MOV  A , B` のような書き方の
- * 揺れを吸収できる。
- *
- * 破綻点修正: 以前は行全体に一律で適用していた（\t を空白に置換するループ＋
- * axx_reduce_spaces()）ため、文字列リテラルの中身まで潰していた。
- * `.ascii "a    b"` が 3 バイトの `a b` になり、生のタブは空白へ化けていた
- * （診断は一切出ない）。文字列は「そのままのバイト列を置く」のがアセンブラの
- * 仕事なので、引用符の中は素通しする。
- *
- * `"..."` と `'x'` の扱いは axx_split_comment_asm() と同じ規約に従う。
- * 常に w <= i なので同じバッファを上書きしても安全。 */
+/* 空白の連なりを 1 個に潰す。ただし `"..."` と `'c'` の中は触らない。
+   照合は空白の数を問わないので先に潰すが、テキストテンプレートが出す
+   文字列は書いたままでなければならない。 */
 static void axx_normalize_ws(char *l) {
     int in_str=0, in_ws=0;
     int i=0, w=0;
@@ -3531,6 +3196,7 @@ static void axx_normalize_ws(char *l) {
     l[w]=0;
 }
 
+/* 空白の連なりを 1 個に潰す（リテラルの中も区別しない版）。 */
 static void axx_reduce_spaces(char *s) {
     char *src=s, *dst=s;
     int in_ws=0;
@@ -3543,19 +3209,10 @@ static void axx_reduce_spaces(char *s) {
     *dst=0;
 }
 
-/* パターンファイルのコメント(スラッシュ+アスタリスクで始まりアスタリスク+
- * スラッシュで終わるブロックコメント)を落とす。
- *
- * 破綻点修正: 以前は「行単位で扱うので閉じ記号は不要」という設計で、
- * その行に現れた開始記号から行末までを問答無用で切り捨てるだけだった。
- * 実際のパターンファイル（got.axx 等）は何十行にもまたがる本物の
- * C 形式ブロックコメントを書いており、開始行以降・終了行までの中身
- * (説明文や区切り線など) が「'::' の無い迷子の行」として毎行
- * warning を出しながらパターン表に無害だが無駄なエントリとして
- * 積まれていた。呼び出し元がファイル全体で共有する *in_comment 経由で
- * 状態を引き継ぎ、複数行にまたがるブロックコメントとして正しく扱う。
- * 同じ行内に閉じ記号があれば、その後ろの内容は通常どおり生かす
- * (閉じ記号の直後に続く内容が消えていた副作用も合わせて直る)。 */
+/* パターンファイルのブロックコメントを落とす。複数行にまたがるコメントは
+   in_comment を次の行へ持ち越して続ける。古い書き方のための後方互換の
+   判断（コメント行すべての頭に開きだけを書く流儀）は読み込み側にあり、
+   ここは素の状態機械。 */
 static void axx_remove_comment(char *l, int *in_comment) {
     int i=0, w=0;
     while(l[i]){
@@ -3569,20 +3226,8 @@ static void axx_remove_comment(char *l, int *in_comment) {
     l[w]=0;
 }
 
-/* アセンブリソース1行を「コードの部分」と「`;` コメントの部分」に分ける。
- * コードは l を in-place で詰め直したもの、コメントは cmt_out に `;` から行末まで
- * を書かれたまま（末尾の空白だけ落として）malloc して返す。コメントが無ければ
- * NULL である（cmt_out に NULL を渡せばコメントは捨てる — 単に落としたいときの
- * 使い方）。
- * 文字列 "..." や文字リテラル 'x' の中の `;` は本物のデータなので残す。
- * 引用符の外の `\;` はエスケープとして扱い、バックスラッシュを外した
- * リテラルな `;` に変える（コメントを開始させない）。
- * 文字列が縮むので、読み位置 i と書き位置 w を分けた in-place 詰め直しで行う
- * （常に w <= i なので同じバッファを上書きしても安全。`;` に来た時点で l+i から
- * 先は手つかずなので、そこからコメントをそのまま写せる）。
- * コメントを捨てずに返すのは、テキスト置換モード（`.textmode`）がコメントも
- * 訳したテキストに残すからである。
- * axx.py の split_comment_asm() と同じ規則である。 */
+/* アセンブリ行を (コード, `;` コメント) に割る。`\;` は文字としての `;`。
+   コメントを捨てずに返すのは、テキスト置換モードが綴りを残すため。 */
 static void axx_split_comment_asm(char *l, char **cmt_out) {
     if(cmt_out) *cmt_out = NULL;
     char *orig = strdup(l);
@@ -3636,23 +3281,8 @@ static void axx_split_comment_asm(char *l, char **cmt_out) {
     free(orig);
 }
 
-/* ソース行の `\!` を解決し、本物の VLIW 区切りを番兵に置き換える。
- *
- * 2つの処理を必ず1回の左→右走査で同時に行う:
- *   `\!`   → リテラルな `!`（バックスラッシュを外す）
- *   `!!`   → VLIW_SEP_CHAR   （本物のスロット区切り）
- *   `!!!!` → VLIW_STOP_CHAR  （本物のストップビット）
- *
- * 同時でなければならない理由: 先に `\!\!` を `!!` へ戻してしまうと、後から
- * 区切りを探す別の走査からは「エスケープ由来のただの !!」と「本物の区切り」を
- * 区別できない。後続の走査はどの !! がエスケープだったかを覚えていないからである。
- * ここで一度だけ判定して本物だけを番兵にしておけば、以降の全ての箇所
- * （lineassemble() の後処理、vliwprocess() のスロット走査、
- * axx_get_param_to_spc()/axx_get_param_to_eon()）は番兵だけを見ればよい。
- *
- * 文字列 "..." と文字リテラル 'x' の中身はそのまま素通しする。
- * 呼ぶのは axx_split_comment_asm() が `\;` を解決した後なので、ここで面倒を
- * 見るのは `\!` だけでよい。 */
+/* ソース行の `!!` と `!!!!` を 1 文字の内部表現に置き換える。
+   `\!` は文字としての `!` なので先に開く。 */
 static void axx_resolve_vliw_escapes(char *l) {
     int in_str=0;
     int i=0, w=0;
@@ -3694,16 +3324,7 @@ static void axx_resolve_vliw_escapes(char *l) {
     l[w]=0;
 }
 
-/* 空白区切りで1語（ニーモニック部分）を切り出す。
- * VLIW 区切りの番兵でも切る（`NOP!!NOP` のように空白なしで次スロットが続く
- * 書き方で、ニーモニックが隣のスロットを飲み込まないように）。
- *
- * 破綻点修正: 以前は引用符の中を追って、その中の空白では切らなかった。
- * axx.py の get_param_to_spc() は引用符を一切見ず、最初の空白で切る。
- * その違いが呼び出し側の `l` から空白を全部落とす処理（axx.py の
- * `l = l.replace(' ', '')` と同じもの）と噛み合い、`foo"a b"` のように
- * 1語目の中に引用符がある行で caxx だけ空白が消えていた
- * （`.passthru` の素通しで `foo"ab"` になる）。axx.py と同じ規則にそろえる。 */
+/* 空白か VLIW スロット境界まで読む。 */
 static int axx_get_param_to_spc(const char *s, int idx, char *t, size_t tsz) {
     idx=axx_skipspc(s,idx);
     size_t n=0;
@@ -3715,8 +3336,7 @@ static int axx_get_param_to_spc(const char *s, int idx, char *t, size_t tsz) {
     return idx;
 }
 
-/* 行の残り（空白を含む＝オペランド部分）を VLIW 区切りの手前まで取る。
- * 破綻点修正: 引用符を追っていた理由は axx_get_param_to_spc() を参照。 */
+/* VLIW スロット境界まで読む。 */
 static int axx_get_param_to_eon(const char *s, int idx, char *t, size_t tsz) {
     idx=axx_skipspc(s,idx);
     size_t n=0;
@@ -3729,6 +3349,9 @@ static int axx_get_param_to_eon(const char *s, int idx, char *t, size_t tsz) {
     return idx;
 }
 
+/* ダブルクォートの文字列リテラルの中身を取る。エスケープは `\n` `\t` `\r`
+   `\\` `\"` と `\xHH` `\uXXXX` `\UXXXXXXXX`。桁が足りない・多い場合は
+   警告して書かれた文字をそのまま採る。 */
 static void axx_get_string(const char *l2, char *out, size_t osz) {
     int idx=axx_skipspc(l2,0);
     out[0]=0;
@@ -3760,10 +3383,6 @@ static void axx_get_string(const char *l2, char *out, size_t osz) {
                     if(n<osz-1) out[n++]='x';
                 }
             }
-            /* 破綻点修正: \u / \U を解釈していなかったため（axx.py は解釈する）、
-             * `.INCLUDE "é..."` のようなファイル名で両実装が別のパスを開いていた。
-             * axx.py は chr(コードポイント) を文字列に入れ、開くときに UTF-8 へ
-             * 符号化されるので、ここでも UTF-8 バイト列を書き込む。 */
             else if(nc=='u'||nc=='U'){
                 int want = (nc=='u') ? 4 : 8;
                 idx+=2;
@@ -3797,16 +3416,13 @@ static void axx_get_string(const char *l2, char *out, size_t osz) {
         axx_diagf(0, 0, " warning - unterminated string literal: %s\n", l2);
 }
 
+/* 文字が集合に含まれるか。 */
 static int char_in(char c, const char *set){
     return strchr(set,c)!=NULL;
 }
 
+/* 続く 10 進数字を綴りのまま取る。 */
 static int axx_get_intstr(const char *s, int idx, char *fs, size_t fsz){
-    /* 破綻点修正: 旧実装は桁数がバッファ上限に達すると idx を進めるのを
-     * やめてしまい、残った数字がそのまま次のトークンとして解析され
-     * "Syntax error" に化けていた（axx.py は無制限精度なので桁数の上限が
-     * 無く、この desync が起きない）。桁数が上限を超えても数字である間は
-     * idx を進め続け、バッファに書き込む桁だけを先頭 fsz-1 桁に絞る。 */
     size_t n=0;
     while(s[idx]&&is_digit(s[idx])){
         if(n<fsz-1) fs[n++]=s[idx];
@@ -3816,15 +3432,9 @@ static int axx_get_intstr(const char *s, int idx, char *fs, size_t fsz){
     return idx;
 }
 
+/* 浮動小数点の綴りを取る。`inf` / `-inf` / `nan` も読む。指数部は `e` の
+   あとに数字が無ければ指数ではないので巻き戻す。 */
 static int axx_get_floatstr(const char *s, int idx, char *fs, size_t fsz){
-    /* 破綻点修正: axx_get_intstr と同じ desync バグがここにもあった。
-     * バッファ上限に達すると idx を進めるのをやめてしまい、残った桁が
-     * 次のトークンとして誤読されていた（axx.py は無制限）。さらに、
-     * 仮数部だけでバッファが埋まっていると、指数部の数字が実在しても
-     * `n<fsz-1` が false になって while が一度も回らず、"e/E の直後に
-     * 数字が無い" と誤認して指数部ごと巻き戻す不具合もあった。数字/'.'/
-     * 'e'/符号である間は常に idx を進め、バッファに書き込む文字数だけを
-     * 先頭 fsz-1 文字に絞る。 */
     if(strncmp(s+idx,"-inf",4)==0){strcpy(fs,"-inf");return idx+4;}
     if(strncmp(s+idx,"inf",3)==0){strcpy(fs,"inf");return idx+3;}
     if(strncmp(s+idx,"nan",3)==0){strcpy(fs,"nan");return idx+3;}
@@ -3856,12 +3466,7 @@ static int axx_get_floatstr(const char *s, int idx, char *fs, size_t fsz){
     return idx;
 }
 
-/* 破綻点修正: 以前は本文を呼び出し側の固定長 char[512] に写していたため、
- * 512 文字を超える式で本文が途中で切れ、しかも切れた位置は "}" ではない
- * ので、その次の走査は "}" を読み飛ばすつもりで無関係な1文字を読み飛ばし、
- * 以降の構文解析全体がずれる（axx.py には長さ制限が無い）。まず区切り位置
- * だけを走査してから実際の長さぶんだけ動的に確保し、呼び出し側に
- * 所有権を渡す（使い終わったら free() すること）。 */
+/* `{ ... }` の中身を取る。 */
 static int axx_get_curlb(AsmState *st, const char *s, int idx, int *f_out, char **t_out){
     idx=axx_skipspc(s,idx);
     *f_out=0; *t_out=NULL;
@@ -3889,6 +3494,7 @@ static int axx_get_curlb(AsmState *st, const char *s, int idx, int *f_out, char 
     return idx;
 }
 
+/* シンボル名を 1 個取り、大文字化して返す。使える文字は `.symbolc` 次第。 */
 static int axx_get_symbol_word(const char *s, int idx, const char *swordchars, char *t_out, size_t tsz){
     t_out[0]=0;
     if(!s[idx]||is_digit(s[idx])||!char_in(s[idx],swordchars)) return idx;
@@ -3908,25 +3514,6 @@ static int axx_get_symbol_word(const char *s, int idx, const char *swordchars, c
     return idx;
 }
 
-/* ラベル名を1語切り出す。
- *
- * eat_colon が真のときは、名前の直後の `:` も一緒に読み飛ばす。
- * `foo: NOP` の行頭ラベルや `.EXTERN foo::pc32` を切り出すための約束で、
- * 呼び出し側は l[idx-1]==':' を見て「ラベル定義だったか」を判定する。
- *
- * 破綻点修正: 式の評価（expr_factor1）からも同じ関数を呼んでいたため、
- * 三項演算子の `:` がラベル名の一部として食われていた。`1?foo:bar` は
- * `foo` の直後で `:` を失い、残った `bar` が解析されない余りとして残って
- * Syntax error になっていた（`foo :bar` と空白を入れたときだけ通るという
- * 再現条件の分かりにくい誤り）。式の文脈からは eat_colon=0 で呼ぶ。 */
-/* ラベル名／シンボル名を切り出すための作業バッファを用意する。
- *
- * 破綻点修正: 呼び出し側はどこも char[512] の自動変数を渡していたため、
- * 511 文字を超える名前が（警告は出るものの）切り詰められ、axx.py には長さの
- * 制限が無いのでシンボル表が食い違っていた。語の長さは「入力の残り長」で
- * 上限が決まるので、そこに収まらないときだけヒープへ逃がす
- * （ふだんは自動変数のままなので、ラベル参照ごとの確保は起きない）。
- * 戻り値が stackbuf と違うときは、使い終わりに free() すること。 */
 static char *axx_word_buf(const char *s, int idx, char *stackbuf, size_t stacksz,
                           size_t *szout){
     size_t rem = strlen(s + idx) + 1;
@@ -3958,10 +3545,12 @@ static int axx_get_label_word_ex(const char *s, int idx, const char *lwordchars,
     return idx;
 }
 
+/* ラベル名を 1 個取る。大文字化はしない（ラベルは区別する）。 */
 static int axx_get_label_word(const char *s, int idx, const char *lwordchars, char *t_out, size_t tsz){
     return axx_get_label_word_ex(s, idx, lwordchars, t_out, tsz, 1);
 }
 
+/* `::` までを 1 欄として取る。 */
 static int axx_get_params1(const char *l, int idx, char *s_out, size_t ssz){
     idx=axx_skipspc(l,idx);
     if(!l[idx]){ s_out[0]=0; return idx; }
@@ -3976,6 +3565,11 @@ static int axx_get_params1(const char *l, int idx, char *s_out, size_t ssz){
     return idx;
 }
 
+/* ---- IEEE-754 変換 -----------------------------------------------------
+   `!F` / `!D` / `!Q` と `.float` が通る。128bit は __float128 と
+   strtoflt128 を使い、axx.py 側（Decimal で手組み）と同じビットになるよう
+   inf / nan / -0.0 の形までそろえてある。
+   ------------------------------------------------------------------------ */
 static AXX_UNUSED uint32_t ieee754_32_from_str(const char *a){
     if(strcmp(a,"inf")==0) return 0x7F800000u;
     if(strcmp(a,"-inf")==0) return 0xFF800000u;
@@ -3983,6 +3577,7 @@ static AXX_UNUSED uint32_t ieee754_32_from_str(const char *a){
     float f=(float)strtod(a,NULL);
     uint32_t r; memcpy(&r,&f,4); return r;
 }
+/* 64bit 倍精度のビットパターン（現在は未使用）。 */
 static AXX_UNUSED uint64_t ieee754_64_from_str(const char *a){
     if(strcmp(a,"inf")==0) return 0x7FF0000000000000ULL;
     if(strcmp(a,"-inf")==0) return 0xFFF0000000000000ULL;
@@ -3997,19 +3592,9 @@ static AXX_UNUSED uint64_t ieee754_64_from_str(const char *a){
     (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
      defined(__arm__) || defined(__riscv))
 
-/* strtoflt128() のため。libquadmath をリンクする（makefile の -lquadmath）。 */
 #include <quadmath.h>
 
-/* 十進文字列を binary128 のビットパターンにする。
- *
- * 破綻点修正: 以前はここで桁を __float128 に逐次乗除して値を組み立てていた
- * （`int_val*10 + digit` のあと 10^n で割る。10^n は二分累乗法）。乗算回数は
- * 抑えていたが各段の丸めは残るので最近接丸めにならず、axx.py（Decimal で
- * 一度だけ丸める）と最下位ビットが 1〜2 ULP 食い違っていた
- * （`qad{3.14+2.5}` のような普通の式でもずれた）。`1e-4950` のように
- * binary128 の非正規化数として表せる値を 0 に潰してもいた。
- * strtoflt128() は正しく丸める標準の変換なので、これに任せる。
- * ロケールは設定していないので小数点はつねに '.' である。 */
+/* 10 進表記を __float128 にする。 */
 static __float128 f128_from_decimal(const char *s)
 {
     return strtoflt128(s, NULL);
@@ -4019,6 +3604,7 @@ typedef struct { __float128 val; const char *end; int ok; } F128R;
 
 static F128R f128_expr_fn(const char *s);
 
+/* 128bit 式の因子（数値・括弧・単項）。 */
 static F128R f128_factor_fn(const char *s)
 {
     while(*s==' '||*s=='\t') s++;
@@ -4048,6 +3634,7 @@ static F128R f128_factor_fn(const char *s)
     r.ok=0; return r;
 }
 
+/* 128bit 式の乗除。 */
 static F128R f128_term_fn(const char *s)
 {
     while(*s==' '||*s=='\t') s++;
@@ -4071,6 +3658,7 @@ static F128R f128_term_fn(const char *s)
     return r;
 }
 
+/* 128bit 式の加減。`qad{...}` の中身がここを通る。 */
 static F128R f128_expr_fn(const char *s)
 {
     while(*s==' '||*s=='\t') s++;
@@ -4090,6 +3678,7 @@ static F128R f128_expr_fn(const char *s)
     return r;
 }
 
+/* __float128 のビットパターンを 256bit 整数に移す。 */
 static uint256_t f128_to_u256(__float128 v)
 {
     unsigned char raw[16];
@@ -4105,14 +3694,7 @@ static uint256_t f128_to_u256(__float128 v)
     return res;
 }
 
-/* 破綻点修正: ここは元々 `(double)r.val` を isfinite() で見ていたため、
- * __float128 としては有限な正当な値（1e400 や 1e4900 のように quad の
- * 指数範囲 [~1e-4932, ~1e4932] には収まるが double の範囲 [~1e-308, 1e308]
- * には収まらない値）まで「非有限」と誤判定し、精度の落ちる strtold 経路
- * （x86 拡張倍精度なら 64bit 仮数、long double == double な環境なら 53bit
- * 仮数）へ不必要にフォールバックさせ、112bit 仮数で計算できるはずの値を
- * 誤ったビットパターンにしていた。__float128 の生のビット列から指数
- * フィールドを直接見れば、quad 自身の範囲内かどうかを正しく判定できる。 */
+/* 有限値か。 */
 static int f128_is_finite(__float128 v)
 {
     uint256_t u = f128_to_u256(v);
@@ -4120,14 +3702,10 @@ static int f128_is_finite(__float128 v)
     return exp != 0x7FFFu;
 }
 
+/* 128bit 精度のまま式を評価し、ビットパターンを返す。 */
 static uint256_t f128_eval_text(const char *text, int *ok_out)
 {
     F128R r = f128_expr_fn(text);
-    /* 破綻点修正: 式を最後まで読めたかを見ていなかったため、読めない字句が
-     * 残っていても「そこまでの値」を黙って返していた。`qad{2+inf}` が
-     * エラーにも inf にもならず 2.0 を出していたのがこれである
-     * （axx.py は式全体を読むので inf を返す）。読み残しがあれば失敗とし、
-     * 呼び出し側の xeval 経路へ渡す（そちらも読めなければエラーになる）。 */
     if(r.ok && r.end){
         const char *p = r.end;
         while(*p==' '||*p=='\t') p++;
@@ -4141,6 +3719,7 @@ static uint256_t f128_eval_text(const char *text, int *ok_out)
 
 #endif
 
+/* `!Q` 用。128bit 四倍精度のビットパターン。 */
 static uint256_t ieee754_128_from_str(const char *a){
     if(strcmp(a,"inf")==0){
         uint256_t r=u256_zero(); r.w[1]=0x7FFF000000000000ULL; return r;
@@ -4171,8 +3750,6 @@ static uint256_t ieee754_128_from_str(const char *a){
     }
     long double ld = strtold(a, NULL);
     if(ld == 0.0L){
-        /* 破綻点修正: -0.0 と +0.0 は == で等しいため、符号を見ずに常に
-         * u256_zero() を返すと "-0.0" の符号ビットが消えていた。 */
         uint256_t r = u256_zero();
         if(signbit(ld)) r.w[1] = (uint64_t)1ULL<<63;
         return r;
@@ -4191,10 +3768,6 @@ static uint256_t ieee754_128_from_str(const char *a){
         r.w[1] = (uint64_t)(sign?1ULL:0ULL)<<63 | 0x7FFF000000000000ULL;
         return r;
     }
-    /* 破綻点修正: 非正規化数(biased_exp==0)には暗黙の先頭1ビットが無い。
-     * 正規化された sig (1.xxx 形式) からそのまま sig-1.0 で仮数部を作ると
-     * 非正規化数のビットパターンを誤って符号化する。sig を 2^-subnorm_shift
-     * だけ右シフトしてから仮数部を抽出する（十分小さければ自然に0へ丸まる）。 */
     long double frac_part = (subnorm_shift > 0) ? ldexpl(sig, -subnorm_shift) : (sig - 1.0L);
     uint64_t hi = 0;
     for(int b=47;b>=0;b--){
@@ -4214,36 +3787,30 @@ static uint256_t ieee754_128_from_str(const char *a){
     return result;
 }
 
+/* 32bit のビットパターンを float として読み直す。 */
 static double enfloat_bits(uint64_t a){
     uint32_t u=(uint32_t)a; float f; memcpy(&f,&u,4); return (double)f;
 }
+/* 64bit のビットパターンを double として読み直す。 */
 static double endouble_bits(uint64_t a){
     double d; memcpy(&d,&a,8); return d;
 }
 
+/* 256bit 整数のビットを double として読む。 */
 static inline double u256_to_double(uint256_t v){
     double d; memcpy(&d, &v.w[0], 8); return d;
 }
+/* double のビットを 256bit 整数に移す。 */
 static inline uint256_t double_to_u256(double d){
     uint256_t r = u256_zero(); memcpy(&r.w[0], &d, 8); return r;
 }
-/* 定義は後方(expr_bitwise_result 付近)にある u256_int_to_double を
- * ここより前で使うための前方宣言。u256_to_double(memcpyでビット列を
- * そのまま取り出す)とは違い、こちらは「符号付き256bit整数としての値」を
- * 実際に数値変換して最も近いdoubleにする。PatVar が整数のまま
- * 浮動小数点モードの式に読み込まれたときに使う（var_get_for_mode 参照）。 */
 static double u256_int_to_double(uint256_t v);
+/* その位置から浮動小数点として読めるか。 */
 static int axx_isfloatstr(const char *s, int idx){
     if(!s[idx]) return 0;
     if(strncmp(s+idx,"-inf",4)==0) return 1;
     if(strncmp(s+idx,"inf",3)==0) return 1;
     if(strncmp(s+idx,"nan",3)==0) return 1;
-    /* 破綻点修正: axx.py の isfloatstr() は get_floatstr() が1文字でも
-     * 進めたかを見るだけで、get_floatstr() は "0123456789." の並びを取る。
-     * つまり裸の `.` も浮動小数点リテラルの始まりとして扱う。caxx は
-     * 「`.` の次が数字」のときだけ真にしていたため、`.error` 欄（浮動小数点
-     * モード）に書いた `.foo` のような綴りが caxx だけラベル参照として読まれ、
-     * "Label undefined: '.foo'" で中断していた（axx.py は 0 として通す）。 */
     if(is_digit(s[idx])) return 1;
     if(s[idx]=='.') return 1;
     return 0;
@@ -4266,11 +3833,13 @@ struct Assembler {
     SecRangeVec imp_sections;
 };
 
+/* 部品をつないでアセンブラを組み立てる。 */
 static void assembler_init(Assembler *a){
     state_init(&a->st);
     secrangevec_init(&a->imp_sections);
 }
 
+/* アドレスを現在の `.align` の倍数まで繰り上げる。 */
 static uint256_t align_addr256(AsmState *st, uint256_t addr){
     if(u256_is_zero(st->align)) return addr;
     uint256_t q = u256_udiv(addr, st->align);
@@ -4279,22 +3848,21 @@ static uint256_t align_addr256(AsmState *st, uint256_t addr){
     return u256_add(addr, u256_sub(st->align, a));
 }
 
-/* ワード幅ぶんのマスク。
- * 破綻点修正: 以前は `(uint64_t)1 << st->bts` を直に書いていたため、
- * `.bits` に 0 以下や 64 以上が入ると未定義動作（負シフト／幅以上のシフト）に
- * なっていた。.bits 側でも 1..64 を検証するようにしたが、ここでも守る。 */
+/* 出力ワードのビット数から下位マスクを作る。 */
 static uint64_t axx_word_mask(int bts){
     if(bts <= 0)  return 0;
     if(bts >= 64) return (uint64_t)-1;
     return ((uint64_t)1 << bts) - 1;
 }
 
+/* 1 ワードを出力バッファに溜める。 */
 static void outbin_store(AsmState *st, uint64_t position, uint256_t word_val){
-    if(st->bts <= 0) return;   /* axx.py の _store と同じく何も書かない */
+    if(st->bts <= 0) return;
     uint64_t v = u256_to_u64(word_val) & axx_word_mask(st->bts);
     bufmap_set(&st->buf, position, v);
 }
 
+/* 1 ワードを溜め、prt ならリスティングにも 16 進で出す。 */
 static void fwrite_word(AsmState *st, uint64_t position, uint256_t x, int prt){
     if(st->bts <= 0) return;
     uint64_t mask = axx_word_mask(st->bts);
@@ -4306,15 +3874,21 @@ static void fwrite_word(AsmState *st, uint64_t position, uint256_t x, int prt){
     outbin_store(st, position, u256_from_u64(val));
 }
 
+/* 1 ワードを溜め、`-v` のパス2か対話モードならリスティングにも出す。 */
 static void outbin(AsmState *st, uint256_t a, uint256_t x){
     if(should_report_errors(st))
         fwrite_word(st, u256_to_u64(a), x, (st->pas==0)||st->verbose);
 }
+/* 1 ワードを溜める（リスティングには出さない）。 */
 static void outbin2(AsmState *st, uint256_t a, uint256_t x){
     if(should_report_errors(st))
         fwrite_word(st, u256_to_u64(a), x, 0);
 }
 
+/* 溜めたワードを `-b` のファイルへ書き出す。隙間は `.padding` で埋め、
+   各ワードは `.bits` のバイト数とバイト順で並べる。`.org` の飛び先が極端で
+   出力が大きすぎるときは、書く代わりにそれを疑うよう促してやめる。
+   `-o` と併用のときは、リンカのために 0 で残した命令欄があれば警告する。 */
 static void binary_flush(AsmState *st){
     if(!st->outfile[0]) return;
     int buf_found = 0;
@@ -4340,11 +3914,6 @@ static void binary_flush(AsmState *st){
                   _tb, (unsigned long long)((uint64_t)1<<30));
         return;
     }
-    /* 破綻点修正: max_pos が2^64に近い場合、(max_pos+1)*bytes_per_word が
-     * 64bit算術でラップアラウンドし、小さな total_size を通してしまっていた
-     * （巨大な .ORG + 複数バイト幅のワードで再現）。pc_overflow_set /
-     * max_pos==-1 の特別扱いと同じく、256bit演算でオーバーフローさせずに
-     * MAX_OUTPUT_BYTES と比較してから初めて64bitへ落とす。 */
     uint256_t _tot256 = u256_mul(u256_add(u256_from_u64(max_pos), u256_from_u64(1)),
                                   u256_from_u64((uint64_t)bytes_per_word));
     const uint64_t MAX_OUTPUT_BYTES = (uint64_t)1<<30;
@@ -4413,17 +3982,10 @@ static void binary_flush(AsmState *st){
         return;
     }
     if(total_size) fwrite(data,1,(size_t)total_size,fp);
-    /* 破綻点修正: 書き込みと fclose の結果を見ずに「wrote ...」と報告して
-     * いたため、ディスクが一杯のときに切り詰められたファイルが成功として
-     * 残っていた（axx.py は OSError で失敗する）。 */
     if(axx_close_out(fp, st->outfile)){ free(data); return; }
     fprintf(stderr,"wrote raw binary %s (%llu bytes)\n",st->outfile,(unsigned long long)total_size);
     free(data);
 
-    /* 命令フィールド型のリロケーションを出した箇所は、RELA の作法どおり命令語の
-     * ビット欄を 0 にしてある（リンカが埋める）。同じ実行で -b も書いていると、
-     * その 0 がそのまま生バイナリに残り、リンカを通さない側だけが壊れる。
-     * 黙って壊れた方が困るので、どの箇所かを添えて知らせる。 */
     if(st->elf_objfile[0]){
         int _nz = 0;
         char _where[256]; size_t _wl = 0; _where[0] = '\0';
@@ -4448,39 +4010,28 @@ static void binary_flush(AsmState *st){
     }
 }
 
+/* その変数が未定義ラベル由来の値を持っているか。 */
 static int var_slot_is_undef(AsmState *st, int slot){
     if(slot>=0 && slot<NVARS) return st->vars[slot].is_undef;
     return 0;
 }
-/* 浮動小数点モード評価の直前に呼ぶ。整数のまま束縛された変数
- * (is_float==0) だけ数値変換し、既にdoubleのビット列として束縛済みの
- * 変数(is_float==1、例: !D で束縛、または flt モード下での `:=` 代入)は
- * そのまま通す（二重変換でビット列を壊さないため）。 */
+/* 変数の値を、整数／浮動小数点どちらの読み方で返すか選ぶ。 */
 static uint256_t var_slot_for_mode(AsmState *st, int slot, int want_float){
     if(slot<0||slot>=NVARS) return u256_zero();
     PatVar *pv = &st->vars[slot];
     if(want_float && !pv->is_float) return double_to_u256(u256_int_to_double(pv->val));
     return pv->val;
 }
-/* ---- パターン変数の巻き戻し記録 --------------------------------------
- * 候補パターンを1つ試すたびに vars[NVARS] を丸ごと退避・復元していた。
- * 1行につき数百の候補を試すので、これだけで数百 MB の memcpy になっていた。
- * 1回の照合が実際に書く変数はふつう数個なので、書いた変数だけを控えておき、
- * 失敗したらその分だけ書き戻す。vars_mark() で記録の位置を控え、
- * vars_rollback() でそこまで戻す。成功したときは記録を残したまま先へ進む
- * （外側の枠がまだ巻き戻せるようにするため）。
- * axx.py 側は dict の差分で同じことをする。 */
 typedef struct { int slot; PatVar old; } VarUndo;
 static VarUndo *g_vundo = NULL;
 static int      g_vundo_len = 0, g_vundo_cap = 0;
 
-/* 空でない（＝一度でも書いた）変数の一覧。変数表を空にするときに
- * 全スロットを走らずに済ませる。ここに載っていないスロットは必ず空である。 */
 static int g_vtouched[NVARS];
 static int g_vtouched_list[NVARS];
 static int g_vtouched_n = 0;
 
-/* vars[slot] を書き換える直前に呼ぶ。今の値を記録に積む。 */
+/* 変数を書き換えたことを記録する。照合の試行が失敗したときに、
+   ここまで巻き戻すために使う。 */
 static void var_note_write(AsmState *st, int slot){
     if(slot < 0 || slot >= NVARS) return;
     if(g_vundo_len >= g_vundo_cap){
@@ -4496,6 +4047,8 @@ static void var_note_write(AsmState *st, int slot){
 
 static int vars_mark(void){ return g_vundo_len; }
 
+/* 変数の束縛を mark の時点まで巻き戻す。巻き戻さないと、当たらなかった
+   試行の束縛が出力に化けて出る。 */
 static void vars_rollback(AsmState *st, int mark){
     while(g_vundo_len > mark){
         g_vundo_len--;
@@ -4503,8 +4056,7 @@ static void vars_rollback(AsmState *st, int mark){
     }
 }
 
-/* 変数表を空にする。候補パターンを試す直前にだけ呼ぶ。この位置には巻き戻し
- * 待ちの外枠が無いので、それまでの記録は捨ててよい。 */
+/* すべての変数の束縛を消す。 */
 static void vars_clear_all(AsmState *st){
     for(int i = 0; i < g_vtouched_n; i++){
         int sl = g_vtouched_list[i];
@@ -4517,23 +4069,18 @@ static void vars_clear_all(AsmState *st){
     g_vundo_len   = 0;
 }
 
-/* vars[] を記録を通さずに丸ごと書き換えたあとに呼ぶ（どのスロットも
- * 空でないかもしれない、という状態に印を付け直す）。 */
+/* すべての変数を「書き換えた」ことにする。 */
 static void vars_touch_all(void){
     g_vundo_len  = 0;
     g_vtouched_n = 0;
     for(int sl = 0; sl < g_nvars; sl++){ g_vtouched[sl] = 1; g_vtouched_list[g_vtouched_n++] = sl; }
 }
 
-/* ---- 変数→ラベル対応の巻き戻し記録 ----------------------------------
- * elf_var_to_label[] も候補ごとに NVARS 個ぶん strdup して退避していた。
- * 書き込みは「変数が捕まえたラベル名を覚える」1か所だけなので、vars と同じ
- * やり方で書いた分だけ記録する。記録した文字列の持ち主は記録側になり、
- * 巻き戻せばそのまま配列へ返し、捨てるときに解放する。 */
 typedef struct { int slot; int set; char *label_name; uint64_t label_val; } V2lUndo;
 static V2lUndo *g_v2lundo = NULL;
 static int      g_v2lundo_len = 0, g_v2lundo_cap = 0;
 
+/* 変数 → ラベルの対応を書き換えたことを記録する（`-o` の追跡用）。 */
 static void v2l_note_write(AsmState *st, int slot){
     if(slot < 0 || slot >= NVARS) return;
     if(g_v2lundo_len >= g_v2lundo_cap){
@@ -4544,7 +4091,6 @@ static void v2l_note_write(AsmState *st, int slot){
     g_v2lundo[g_v2lundo_len].slot       = slot;
     g_v2lundo[g_v2lundo_len].set        = st->elf_var_to_label[slot].set;
     g_v2lundo[g_v2lundo_len].label_val  = st->elf_var_to_label[slot].label_val;
-    /* 文字列は写さずに持ち主を移す。書く側は新しい文字列を入れ直す。 */
     g_v2lundo[g_v2lundo_len].label_name = st->elf_var_to_label[slot].label_name;
     st->elf_var_to_label[slot].label_name = NULL;
     g_v2lundo_len++;
@@ -4552,8 +4098,7 @@ static void v2l_note_write(AsmState *st, int slot){
 
 static int v2l_mark(void){ return g_v2lundo_len; }
 
-/* 記録を捨てる（巻き戻さない）。持っている古い文字列はここで解放する。
- * 行の始めに呼ぶ（その位置には巻き戻し待ちの枠が無い）。 */
+/* その記録を捨てる。 */
 static void v2l_forget(void){
     while(g_v2lundo_len > 0){
         g_v2lundo_len--;
@@ -4561,6 +4106,7 @@ static void v2l_forget(void){
     }
 }
 
+/* その記録を mark の時点まで巻き戻す。 */
 static void v2l_rollback(AsmState *st, int mark){
     while(g_v2lundo_len > mark){
         g_v2lundo_len--;
@@ -4572,19 +4118,22 @@ static void v2l_rollback(AsmState *st, int mark){
     }
 }
 
+/* 変数に値と「未定義由来か」の印を束縛する。 */
 static void var_slot_put_tagged(AsmState *st, int slot, uint256_t v, int is_undef){
     if(slot<0||slot>=NVARS) return;
     var_note_write(st, slot);
     st->vars[slot].val=v; st->vars[slot].is_undef=is_undef; st->vars[slot].is_float=st->exp_typ_float;
 }
+/* 変数に値を束縛する。 */
 static void var_slot_put(AsmState *st, int slot, uint256_t v){
     var_slot_put_tagged(st, slot, v, 0);
 }
 
-/* ラベルの値を引く。
- * 見つからなければ st->error_undefined_label を「立てる」。成功しても降ろさない
- * のが重要な約束で、1つの式が複数のラベルを引くため、途中で降ろすと先に起きた
- * 失敗の情報が消えてしまう。新規に判定したい側が評価直前に自分で降ろす。 */
+/* ラベルの値を読む。パスごとに「未確定」の扱いが変わる。
+   パス1で前回の反復の値があればそれ、最初の反復なら現在の PC（楽観的に
+   短い符号化から試す）、長さだけ見ている区間なら 0、それ以外は UNDEF。
+   診断を出すのは照合の試行中でなく、かつ報告してよいパスのときだけ。
+   `-o` の追跡中は、この参照がどの変数・どの出力ワードから来たかを記録する。 */
 static uint256_t label_get_value(AsmState *st, const char *k){
     LabelEntry *e=lmap_find(&st->labels,k);
     if(e){
@@ -4608,8 +4157,6 @@ static uint256_t label_get_value(AsmState *st, const char *k){
             if(st->elf_capturing_var >= 0){
                 int vi = st->elf_capturing_var;
                 if(vi >= 0 && vi < g_nvars){
-                    /* v2l_note_write() が今の値を記録へ移すので、
-                     * label_name は呼んだ時点で NULL になっている。 */
                     if(st->elf_var_to_label[vi].set == 0){
                         v2l_note_write(st, vi);
                         st->elf_var_to_label[vi].set = 1;
@@ -4639,13 +4186,6 @@ static uint256_t label_get_value(AsmState *st, const char *k){
         return ret_val;
     }
     if(st->pas == 1 && st->relax_prev){
-        /* 破綻点修正: 以前は `!pe->is_undef` で「未定義の札が付いた控え」を
-         * 弾いていた。axx.py の _relax_prev_values は札ではなく「値が
-         * UNDEF 由来か」だけで絞るので、両者で前回値の見え方が食い違い、
-         * `label1: .equ label1+2` のような自己参照 .equ が caxx では毎回
-         * 同じ値（前回値を見ない＝0+2）に落ち着いて「収束した」と誤判定され、
-         * パス2だけ別の値になった誤りを黙って出していた。控えを作る側で
-         * UNDEF 由来を外してあるので、ここは見つかればそのまま使う。 */
         LabelEntry *pe = lmap_find(st->relax_prev, k);
         if(pe){
             return pe->value;
@@ -4658,35 +4198,18 @@ static uint256_t label_get_value(AsmState *st, const char *k){
     st->error_undefined_label = 1;
     if(st->pass1_size_mode) return u256_zero();
     if(!st->in_match_attempt && should_report_errors(st)){
-        /* 破綻点修正: set_error=0 で出していたため had_error が立たず、
-         * この診断だけが出る経路（パターンファイル側ディレクティブの式など）では
-         * エラー表示ありで終了コード 0 になっていた。 */
         axx_diagf(1, 0, " error - Label undefined: '%s'  [%s:%d]\n",
                    k, st->current_file, (int)st->ln);
     }
     return UNDEF_VAL();
 }
+/* ラベルが属するセクション名。 */
 static const char *label_get_section(AsmState *st, const char *k){
     LabelEntry *e=lmap_find(&st->labels,k);
     if(e) return e->section;
     st->error_undefined_label=1;
     return "";
 }
-/* ラベルを定義する。パスによって意味が変わる:
- *   パス1/対話 … 新規定義。既に在れば二重定義エラー。ただし .extern による
- *                 仮登録(is_imported)は実体を持たないので上書きを許す。
- *   パス2      … パス1で既に在るはず。無ければ両パスで見た入力が違うという異常。
- * パターンファイルの .setsym と同名なら衝突として拒否する。 */
-/* ラベル定義の誤りを、1つにつき1回だけ必ず表示する。
- *
- * 破綻点修正: これらは had_error を立てながら通常の axx_diagf() で出していた。
- * しかし定義の衝突が見つかるのはパス1で、パス1の診断は抑制される。パス2では
- * 「既に在るラベル」に見えるので二度と検出されず、結果としてユーザには具体的な
- * 原因が一度も表示されないまま、
- * " error - one or more errors were reported during assembly" だけ、あるいは
- * （値がずれた場合）「パス1/パス2のアドレス不一致＝リラクゼーション未収束」という
- * 全く無関係なメッセージが出ていた。パス1の抑制を迂回して出す代わりに、
- * リラクゼーションの反復回数だけ重複しないよう、同じ誤りは1回に抑える。 */
 static void report_definition_error(AsmState *st, const char *kind, const char *key,
                                     const char *fmt, ...){
     st->had_error = 1;
@@ -4704,6 +4227,8 @@ static void report_definition_error(AsmState *st, const char *kind, const char *
               body, st->current_file, (int)st->ln);
 }
 
+/* ラベルを定義する。二重定義、パス1に無くパス2で現れた名前、パターン
+   ファイルのシンボルとの衝突を弾く。 */
 static int label_put_value(AsmState *st, const char *k, uint256_t v, const char *sec, int is_equ, int reloc_type, int is_undef){
     if(st->pas==1||st->pas==0){
         LabelEntry *_existing = lmap_find(&st->labels,k);
@@ -4717,10 +4242,6 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
             return 0;
         }
     }
-    /* 破綻点修正: 固定長 char uk[512] へ無言で切り詰めていたため、511バイトを
-     * 超える長さのラベル名同士が先頭511文字の一致だけで誤って衝突扱いになったり、
-     * 逆に本来の衝突が511バイト以降の差異のせいで見逃されたりし得た。他の箇所
-     * と同じく axx_word_buf() で必要なら収まらない分をヒープへ逃がす。 */
     char uk_stackbuf[512]; size_t uk_sz;
     char *uk = axx_word_buf(k, 0, uk_stackbuf, sizeof(uk_stackbuf), &uk_sz);
     axx_strupr_to(uk,k,uk_sz);
@@ -4740,13 +4261,8 @@ static int label_put_value(AsmState *st, const char *k, uint256_t v, const char 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 #endif
+/* 256bit 整数を Python の hex() と同じ綴りにする。 */
 static void u256_to_pyhex(uint256_t a, char *out, size_t outsz){
-    /* a is a 256-bit value, so buf can never hold more than 64 hex digits
-     * (4 words x 16 hex digits via %llx/%016llx, both bounded by the 64-bit
-     * width of unsigned long long); with the sign and "0x" prefix that is at
-     * most 67 characters plus the terminator, well inside buf's 96 bytes.
-     * GCC's -Wformat-truncation cannot prove that loop bound, hence the
-     * diagnostic suppression above rather than an unbounded buffer. */
     char buf[96]; size_t n=0; int neg=0;
     if((a.w[3]>>63)&1ULL){ neg=1; a=u256_neg(a); }
     int hi=3; while(hi>0 && a.w[hi]==0) hi--;
@@ -4759,6 +4275,7 @@ static void u256_to_pyhex(uint256_t a, char *out, size_t outsz){
 #pragma GCC diagnostic pop
 #endif
 
+/* 256bit 整数を 10 進の綴りにする。 */
 static void u256_to_pydec(uint256_t a, char *out, size_t outsz){
     char buf[96]; int n=0; int neg=0;
     if((a.w[3]>>63)&1ULL){ neg=1; a=u256_neg(a); }
@@ -4777,12 +4294,14 @@ static void u256_to_pydec(uint256_t a, char *out, size_t outsz){
     snprintf(out,outsz,"%s",rev);
 }
 
+/* ラベル名を並べるための比較関数。 */
 static int label_key_cmp(const void *pa, const void *pb){
     const LabelEntry *a = *(const LabelEntry *const *)pa;
     const LabelEntry *b = *(const LabelEntry *const *)pb;
     return strcmp(a->key, b->key);
 }
 
+/* ラベル表を標準エラーへ並べる。プロンプトモードの `?` の中身。 */
 static void label_print_all(AsmState *st){
     int n=0;
     for(int i=0;i<st->labels.nbuckets;i++)
@@ -4803,14 +4322,15 @@ static void label_print_all(AsmState *st){
     free(v);
 }
 
-/* 配列シンボル（`.setsym::名前::[…]`）。定義は後方にある。 */
 static struct ArrSym *arrsym_get(AsmState *st, const char *upper_name);
 
+/* シンボルの値を取る。 */
 static int symbol_get(AsmState *st, const char *w, uint256_t *out){
     char uw[512]; axx_strupr_to(uw,w,sizeof(uw));
     return smap_get(&st->symbols,uw,out);
 }
 
+/* 256bit 整数のビットを long double として読む。 */
 static long double u256_to_long_double(uint256_t v){
     int neg = (int)((v.w[3] >> 63) & 1);
     uint256_t m = v;
@@ -4834,10 +4354,15 @@ typedef struct { const char *s; int i; int len; int ok; Assembler *asmb; } XEP;
 
 static long double xeval_expr(XEP *p);
 
+/* ---- long double での式評価 ---------------------------------------------
+   浮動小数点のリテラルと部分式を、本体の 256bit 評価器とは別に long double で
+   解くための小さな再帰下降。`!F` / `!D` / `!Q` の値を作るときに使う。
+   ------------------------------------------------------------------------ */
 static void xeval_skip(XEP *p){
     while(p->i<p->len && (p->s[p->i]==' '||p->s[p->i]=='\t')) p->i++;
 }
 
+/* 項そのもの（数値・括弧）。 */
 static long double xeval_primary(XEP *p){
     xeval_skip(p);
     if(!p->ok || p->i>=p->len){ p->ok=0; return 0; }
@@ -4905,6 +4430,7 @@ static long double xeval_primary(XEP *p){
 
 static long double xeval_unary(XEP *p);
 
+/* `**`。 */
 static long double xeval_power(XEP *p){
     long double base = xeval_primary(p);
     xeval_skip(p);
@@ -4916,6 +4442,7 @@ static long double xeval_power(XEP *p){
     return base;
 }
 
+/* 単項 `-` `+` `~`。 */
 static long double xeval_unary(XEP *p){
     xeval_skip(p);
     if(p->ok && p->i<p->len && p->s[p->i]=='+'){ p->i++; return xeval_unary(p); }
@@ -4928,6 +4455,7 @@ static long double xeval_unary(XEP *p){
     return xeval_power(p);
 }
 
+/* `*` `/` `%`。 */
 static long double xeval_term(XEP *p){
     long double v = xeval_unary(p);
     while(p->ok){
@@ -4952,6 +4480,7 @@ static long double xeval_term(XEP *p){
     return v;
 }
 
+/* `+` `-`。 */
 static long double xeval_addsub(XEP *p){
     long double v = xeval_term(p);
     while(p->ok){
@@ -4963,6 +4492,7 @@ static long double xeval_addsub(XEP *p){
     return v;
 }
 
+/* `<<` `>>`。 */
 static long double xeval_shift(XEP *p){
     long double v = xeval_addsub(p);
     while(p->ok){
@@ -4982,6 +4512,7 @@ static long double xeval_shift(XEP *p){
     return v;
 }
 
+/* `&`。 */
 static long double xeval_band(XEP *p){
     long double v = xeval_shift(p);
     while(p->ok){
@@ -4992,6 +4523,7 @@ static long double xeval_band(XEP *p){
     return v;
 }
 
+/* `^`。 */
 static long double xeval_bxor(XEP *p){
     long double v = xeval_band(p);
     while(p->ok){
@@ -5002,6 +4534,7 @@ static long double xeval_bxor(XEP *p){
     return v;
 }
 
+/* 式を 1 個解く。 */
 static long double xeval_expr(XEP *p){
     long double v = xeval_bxor(p);
     while(p->ok){
@@ -5012,6 +4545,7 @@ static long double xeval_expr(XEP *p){
     return v;
 }
 
+/* テキストを評価して double で返す。読めなければ 0 を返す。 */
 static int xeval_eval(Assembler *asmb, const char *text, double *out){
     XEP p; p.s=text; p.i=0; p.len=(int)strlen(text); p.ok=1; p.asmb=asmb;
     long double v = xeval_expr(&p);
@@ -5042,20 +4576,20 @@ static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_ou
 static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_out);
 static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_out);
 
-/* 破綻点修正(性能): 符号化欄は `@@[n,...]` の展開で要素数に比例して長くなる
- * 一方、要素ごとの評価は「文字列全体」に対して expr_terminate() の複製と
- * 各優先順位関数の strlen() を掛け直していたため、出力バイト数に対して
- * 二乗の時間が掛かっていた（axx.py は len() が O(1) なので線形）。
- * 評価の間だけ「この文字列の長さは既知で、二重 NUL 終端済み」と覚えておき、
- * 複製と再計測を省く。覚えている間その領域は解放されないので、別の割り当てが
- * 同じ番地を取ることはなく、値が古くなることはない。 */
 static const char *g_expr_slen_ptr = NULL;
 static int         g_expr_slen_len = 0;
+/* ---- 式評価器 -----------------------------------------------------------
+   優先順位ごとに 1 関数の再帰下降。アセンブリ行・パターン行・ミニ言語・
+   マクロ層がすべてこれを通るので、どの層でも同じ式が同じ値になる。
+   使える項の違いは状態の expmode / expcaps だけで表し、評価器は呼び出し元を
+   知らない。優先順位は Python に倣う。
+   ------------------------------------------------------------------------ */
 static inline int expr_slen(const char *s){
     if(s == g_expr_slen_ptr) return g_expr_slen_len;
     return (int)strlen(s);
 }
 
+/* 末尾に NUL を足して式の終わりを確定させる。 */
 static char *expr_terminate(const char *s){
     size_t l = strlen(s);
     char *r = malloc(l + 2);
@@ -5066,6 +4600,7 @@ static char *expr_terminate(const char *s){
     return r;
 }
 
+/* パターン行の式として評価する（すべての項が使える）。 */
 static uint256_t expr_expression_pat(Assembler *asmb, const char *s, int idx, int *idx_out){
     asmb->st.expmode=EXP_PAT;
     asmb->st.expcaps=&CAPS_PAT;
@@ -5075,7 +4610,6 @@ static uint256_t expr_expression_pat(Assembler *asmb, const char *s, int idx, in
     free(ts);
     return r;
 }
-/* 能力記述子を指定して評価する。マクロ層・ミニ言語からの委譲用。 */
 static uint256_t expr_expression_caps(Assembler *asmb, const char *s, int idx,
                                        const ExprCaps *caps, int *idx_out){
     int prev_mode = asmb->st.expmode;
@@ -5089,6 +4623,7 @@ static uint256_t expr_expression_caps(Assembler *asmb, const char *s, int idx,
     asmb->st.expcaps=prev_caps;
     return r;
 }
+/* アセンブリ行の式として評価する（パターン変数と VLIW 計数は無い）。 */
 static uint256_t expr_expression_asm(Assembler *asmb, const char *s, int idx, int *idx_out){
     asmb->st.expmode=EXP_ASM;
     asmb->st.expcaps=&CAPS_ASM;
@@ -5097,6 +4632,7 @@ static uint256_t expr_expression_asm(Assembler *asmb, const char *s, int idx, in
     free(ts);
     return r;
 }
+/* 入れ子の外側にある stopchar までを 1 つの式として評価する。 */
 static uint256_t expr_expression_esc(Assembler *asmb, const char *s, int idx, char stopchar, int *idx_out){
     size_t l = strlen(s);
     char *buf = malloc(l + 2);
@@ -5114,10 +4650,6 @@ static uint256_t expr_expression_esc(Assembler *asmb, const char *s, int idx, ch
             if(stkp < (int)(sizeof(stk)-1)) stk[stkp++] = c;
             buf[i] = c;
         } else if(c == ')' || c == ']' || c == CB_CHAR){
-            /* 種類が不一致でも（例: "(...]"）深さは1段閉じたものとして扱う。
-             * 型を厳密に照合してポップを拒否すると、不正な入力に対して
-             * stkp が0に戻らなくなり、以降 stopchar を永久に見つけられなく
-             * なってしまう（axx.py の expression_esc と同じ修正）。 */
             if(stkp > 0) stkp--;
             buf[i] = c;
         } else {
@@ -5136,6 +4668,7 @@ static uint256_t expr_expression_esc(Assembler *asmb, const char *s, int idx, ch
 }
 
 
+/* 単項演算子と組み込み項（`*(x,y)`、`!!!`、`!!!!`）。 */
 static uint256_t expr_factor(Assembler *asmb, const char *s, int idx, int *idx_out){
     AsmState *st=&asmb->st;
     if(st->expr_depth >= EXPR_MAX_DEPTH){
@@ -5150,6 +4683,7 @@ static uint256_t expr_factor(Assembler *asmb, const char *s, int idx, int *idx_o
     st->expr_depth--;
     return r;
 }
+/* expr_factor の本体。 */
 static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *idx_out){
     AsmState *st=&asmb->st;
     idx=axx_skipspc(s,idx);
@@ -5172,16 +4706,9 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
         }
     } else if(s[idx]=='~'){
         x=expr_factor(asmb,s,idx+1,&idx);
-        /* 破綻点修正: float 型式では x が IEEE754 の生ビットを保持しているため、
-         * その生ビットに直接 u256_not() を掛けると axx.py の `~int(x)`（数値へ
-         * 変換してから NOT する）と全く違う結果になっていた。<< / >> と同じ
-         * expr_safe_bitwise_operand/expr_bitwise_result で整数域へ変換して
-         * 演算する。 */
         x=expr_bitwise_result(asmb,u256_not(expr_safe_bitwise_operand(asmb,x,"~")));
     } else if(s[idx]=='@'){
         x=expr_factor(asmb,s,idx+1,&idx);
-        /* 同上: nbit() は数値としてのビット長を求めるものなので、float 型式では
-         * 生ビットではなく数値へ変換してから渡す(axx.py の nbit(x) と同じ)。 */
         int nb = op_msb(expr_safe_bitwise_operand(asmb,x,"@"));
         if(asmb->st.exp_typ_float)
             x=double_to_u256((double)nb);
@@ -5196,10 +4723,6 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
                 uint256_t x2=expr_expression(asmb,s,idx+1,&i3); idx=i3;
                 if(s[idx]==')'){
                     idx++;
-                    /* 実装は共有関数 op_byte() 側。マクロ層も同じものを呼ぶ。
-                     * 浮動小数点モードでは値も添字も数に直してから渡す
-                     * （expr_num_operand のコメントを参照）。分岐の順と文面は
-                     * axx.py の op_byte() に合わせる。 */
                     uint256_t _bv, _bi;
                     if(!expr_num_operand(asmb, x2, &_bi)){
                         if(should_report_errors(st))
@@ -5233,27 +4756,16 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
             if(should_report_errors(st)){
                 axx_diagf(1, 0, " error - expected '(' after '*' in *(expr,expr) expression.\n");
             }
-            /* 破綻点修正: ここで idx を '*' の次へ進めないと、呼び出し元の
-             * 乗算ループ(term0)が同じ未消費の '*' を通常の乗算演算子として
-             * 再度読み、"5+*x" のような壊れた式が 0 * <次の因子> という
-             * 誤った値へ静かに縮退していた。エラー後は '*' を読み飛ばす。 */
             idx++;
             x=u256_zero();
         }
     } else {
-        /* 破綻点修正: axx.py はここで「何も読めなかった」ときに
-         * " warning - unrecognized token at position N in expression: ... (treated as 0)"
-         * を出すが、caxx には対応する診断が無く、符号化欄の綴り間違いが
-         * 無言で 0 バイトになっていた（値は一致するので気付けない）。
-         * 判定条件も文面も axx.py の factor() と同じにする。 */
         int prev_idx = idx;
         x=expr_factor1(asmb,s,idx,&idx);
         if(idx == prev_idx && idx < slen){
             char c = s[idx];
             if(c!='\0' && c!=',' && c!=')' && c!=']' && c!=CB_CHAR && c!=' ' && c!='\t'
                && !st->in_match_attempt && should_report_errors(st)){
-                /* axx.py の `s[idx:idx+8]` は文字列末尾の chr(0) まで含むので、
-                 * こちらも終端の NUL を 1 個だけ含めた範囲を取る。 */
                 size_t _n = (size_t)(slen + 1 - idx);
                 if(_n > 8) _n = 8;
                 char _tr[64]; m_pyrepr_n(s + idx, _n, _tr, sizeof(_tr));
@@ -5267,6 +4779,7 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
     return x;
 }
 
+/* `'\xHH'` を読む。読めたかを返し、値と次の位置を書く。 */
 static int parse_hex_char_literal(const char *s, int idx, int slen, int *val, int *out_idx){
     if(!(idx+3<=slen && s[idx]=='\'' && s[idx+1]=='\\' && (s[idx+2]=='x'||s[idx+2]=='X')))
         return 0;
@@ -5283,6 +4796,10 @@ static int parse_hex_char_literal(const char *s, int idx, int slen, int *val, in
     return 0;
 }
 
+/* 項そのものを 1 個読む。数値（10 進・16 進・2 進・浮動小数点）、文字定数、
+   ラベル、`#シンボル`、パターン変数、`$$` / `$.`、`%%`、括弧、`:=` の代入、
+   配列シンボルの添字引き、`.enum` や集合の項目など、式の葉になるものすべて。
+   どれにも当たらなければ位置を動かさず 0 を返す。 */
 static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_out){
     AsmState *st=&asmb->st;
     uint256_t x=u256_zero();
@@ -5290,9 +4807,8 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
     int slen=expr_slen(s);
     int _hexlit_val=0, _hexlit_end=idx;
     int _hexlit_ok = parse_hex_char_literal(s, idx, slen, &_hexlit_val, &_hexlit_end);
-    /* .enum の式を評価している間だけ使う、列挙要素名の束縛。 */
     int _en_k=-1, _en_end=idx;
-    int _vnl=0;   /* ここで読んだパターン変数名の長さ */
+    int _vnl=0;
 
     if(idx>=slen||s[idx]=='\0'){ *idx_out=idx; return x; }
 
@@ -5356,7 +4872,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         char *t = axx_word_buf(s, idx, tbuf, sizeof(tbuf), &tsz);
         idx=axx_get_symbol_word(s,idx,st->swordchars,t,tsz);
         uint256_t sv;
-        /* `#x[3]` は配列シンボルの項目。添字は式で、0 から数える。 */
         char akey[512]; axx_strupr_to(akey,t,sizeof(akey));
         struct ArrSym *ar = arrsym_get(st, akey);
         if(ar && idx < slen && s[idx]=='['){
@@ -5418,10 +4933,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         idx=axx_skipspc(s,idx);
         if(s[idx]=='{'){
             idx++;
-            /* 破綻点修正: 以前は式本体を固定長 char[1024] に写していたため、
-             * 1024 文字を超える式が診断もなく途中で切れ、axx.py（長さ制限なし）
-             * と違う値になっていた。まず区切り位置だけを走査してから、
-             * 実際の長さぶんだけ動的に確保する。 */
             int start=idx; int depth=0;
             while(s[idx]){
                 if(s[idx]=='('||s[idx]=='[') depth++;
@@ -5435,10 +4946,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             memcpy(expr_buf, s+start, en);
             expr_buf[en]='\0';
             if(s[idx]!='}'){
-                /* 破綻点修正: 閉じ '}' が無いまま行末（や文字列末尾）に達した
-                 * 場合、以前はそれを無視してそのまま式を評価し、黙って値を
-                 * 出力していた（axx.py は "missing closing '}'" エラーで
-                 * 中断する）。ここで揃える。 */
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - missing closing '}' in expression: '{%s'\n", expr_buf);
                 }
@@ -5448,9 +4955,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             else {
             idx++;
             if(en==0){
-                /* 破綻点修正: 空の `qad{}` を、以前は評価器に一切通さず
-                 * そのまま 0 として黙って成功させていた（axx.py は
-                 * "cannot evaluate expression ''" エラーで中断する）。 */
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - qad{}: cannot evaluate expression '%s'; using 0.\n", expr_buf);
                 }
@@ -5476,18 +4980,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     char fstr[64]; snprintf(fstr,sizeof(fstr),"%.17g",xv);
                     x=ieee754_128_from_str(fstr);
                 } else {
-                    /* 破綻点修正: ここで isfinite() を見ていなかったため、
-                     * `qad{1e4933}` のように binary128 の幅を越えた値が
-                     * "%.17g" で "inf" になり、ieee754_128_from_str() 経由で
-                     * 無限大として黙って通っていた。幅を越えたらエラーにする。
-                     * 明示して書いた `inf` / `-inf` / `nan` は上の分岐が拾うので
-                     * 従来どおり通る（マニュアル 5.4 節）。 */
-                    /* 破綻点修正: ここには以前 expr_expression_pat() への
-                     * フォールバックがあった。そちらはラベルを引けるので、
-                     * `qad{未定義ラベル}` が 0 として黙って通り、誤ったバイナリを
-                     * 出していた（axx.py の xeval は裸の名前を解決しないので
-                     * 必ずエラーになる）。axx.py と同じく、xeval が読めなければ
-                     * そこでエラーにする。ラベルを読みたいときは `:名前` と書く。 */
                     if(should_report_errors(&asmb->st)){
                         axx_diagf(1, 0, " error - qad{}: cannot evaluate expression '%s'; using 0.\n", expr_buf);
                     }
@@ -5507,16 +4999,8 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         if(f){
             int prev_flt=asmb->st.exp_typ_float;
             asmb->st.exp_typ_float=0;
-            /* 破綻点修正: 式の中の未定義ラベルを見ていなかったため、
-             * `enflt{未定義}` が 0 として黙って通っていた（axx.py は
-             * error_undefined_label を退避・確認してエラーにする）。 */
             int _outer_undef = asmb->st.error_undefined_label;
             asmb->st.error_undefined_label = 0;
-            /* 破綻点修正: expr_expression_pat() は能力記述子を CAPS_PAT に
-             * 上書きするため、アセンブリ行から来た式でもパターン変数が有効に
-             * なり、`enflt{nosuch}` の `nosuch` がラベルではなく未束縛の
-             * パターン変数（=0）として読まれていた。axx.py はここで
-             * self.expression() を呼び、いま有効な能力記述子をそのまま使う。 */
             int io2; uint256_t iv=expr_expression_caps(asmb,t,0,asmb->st.expcaps,&io2);
             int _inner_undef = asmb->st.error_undefined_label;
             asmb->st.error_undefined_label = _outer_undef || _inner_undef;
@@ -5528,13 +5012,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                 iv = u256_zero();
             }
             double fval=enfloat_bits(u256_to_u64(iv));
-            /* 破綻点修正: 常に double_to_u256()（ビットキャスト）を格納していたため、
-             * 整数モードの文脈では IEEE754 のビット列そのものが整数として読まれ、
-             * 例えば enflt{0x3f800000}（=1.0）が 0x3FF0000000000000 の下位バイト、
-             * すなわち 0 になっていた（axx.py は 1 を返す）。
-             * dbl{}/flt{} で既に使っている規約に合わせ、浮動小数点モードのときだけ
-             * ビットキャストし、整数モードでは数値そのものを切り捨てて格納する。
-             * 非有限値は (int64_t) キャストが未定義動作なので 0 に倒す。 */
             x = asmb->st.exp_typ_float ? double_to_u256(fval)
                                        : (isfinite(fval) ? u256_from_i64((int64_t)fval)
                                                          : u256_zero());
@@ -5549,14 +5026,8 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         if(f){
             int prev_flt=asmb->st.exp_typ_float;
             asmb->st.exp_typ_float=0;
-            /* 破綻点修正: enflt{} と同じ問題。上のコメントを参照。 */
             int _outer_undef = asmb->st.error_undefined_label;
             asmb->st.error_undefined_label = 0;
-            /* 破綻点修正: expr_expression_pat() は能力記述子を CAPS_PAT に
-             * 上書きするため、アセンブリ行から来た式でもパターン変数が有効に
-             * なり、`enflt{nosuch}` の `nosuch` がラベルではなく未束縛の
-             * パターン変数（=0）として読まれていた。axx.py はここで
-             * self.expression() を呼び、いま有効な能力記述子をそのまま使う。 */
             int io2; uint256_t iv=expr_expression_caps(asmb,t,0,asmb->st.expcaps,&io2);
             int _inner_undef = asmb->st.error_undefined_label;
             asmb->st.error_undefined_label = _outer_undef || _inner_undef;
@@ -5568,7 +5039,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                 iv = u256_zero();
             }
             double fval=endouble_bits(u256_to_u64(iv));
-            /* 破綻点修正: enflt{} と同じ問題。上のコメントを参照。 */
             x = asmb->st.exp_typ_float ? double_to_u256(fval)
                                        : (isfinite(fval) ? u256_from_i64((int64_t)fval)
                                                          : u256_zero());
@@ -5582,9 +5052,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         idx=axx_get_curlb(&asmb->st,s,idx,&f,&t);
         if(f){
             uint64_t bits;
-            /* 破綻点修正: 空の `dbl{}` を xeval_eval("") が「空式=0.0」として
-             * 黙って成功させていた（axx.py の ast.parse は空式を構文エラーと
-             * するので "cannot convert expression" エラーで中断する）。 */
             if(t[0]=='\0'){
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - dbl{}: cannot convert expression to float64; using 0.\n");
@@ -5596,14 +5063,9 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             else if(strcmp(t,"-inf")==0) bits=0xfff0000000000000ULL;
             else {
                 double xv;
-                /* 破綻点修正: isfinite() を見ていなかったため、`dbl{1e309}` の
-                 * ように float64 の幅を越えた値が無限大として黙って通っていた。
-                 * 幅を越えたらエラーにする（qad{} / flt{} と同じ規則）。明示して
-                 * 書いた `inf` / `-inf` / `nan` は上の分岐が拾う。 */
                 if(xeval_eval(asmb, t, &xv) && isfinite(xv)){
                     memcpy(&bits,&xv,8);
                 } else {
-                    /* 破綻点修正: qad{} と同じ問題。上のコメントを参照。 */
                     if(should_report_errors(&asmb->st)){
                         axx_diagf(1, 0, " error - dbl{}: cannot convert expression to float64; using 0.\n");
                     }
@@ -5621,7 +5083,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         idx=axx_get_curlb(&asmb->st,s,idx,&f,&t);
         if(f){
             uint32_t bits;
-            /* 破綻点修正: dbl{} と同じ問題。上のコメントを参照。 */
             if(t[0]=='\0'){
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - flt{}: cannot convert expression to float32; using 0.\n");
@@ -5634,17 +5095,10 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             else {
                 double xv;
                 float v = 0;
-                /* 破綻点修正: float32 に落とした結果が有限かを見ていなかったため、
-                 * `flt{1e39}` のように float32 の幅を越えた値が無限大として黙って
-                 * 通っていた（axx.py は struct.pack('>f') が範囲を見るのでエラー
-                 * になり、両実装が食い違っていた）。幅を越えたらエラーにする
-                 * （qad{} / dbl{} と同じ規則）。明示して書いた `inf` / `-inf` /
-                 * `nan` は上の分岐が拾う。 */
                 if(xeval_eval(asmb, t, &xv) && isfinite(xv)
                    && (v = (float)xv, isfinite(v))){
                     memcpy(&bits,&v,4);
                 } else {
-                    /* 破綻点修正: qad{} と同じ問題。上のコメントを参照。 */
                     if(should_report_errors(&asmb->st)){
                         axx_diagf(1, 0, " error - flt{}: cannot convert expression to float32; using 0.\n");
                     }
@@ -5667,16 +5121,8 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         x=u256_from_i64(u256_is_zero(x)?1:0);
     }
     else if(asmb->st.exp_typ_float && axx_isfloatstr(s,idx)){
-        /* 128bit(四倍精度)を正しく往復させるには仮数部だけで最大36桁前後
-         * 要る。旧来の64バイトだと、仮数部だけでバッファが埋まった場合に
-         * 指数部を書き込む余地が無くなり、idx はその先まで正しく進んでも
-         * strtod に渡る文字列からは指数だけ丸ごと消えてしまっていた
-         * （桁落ちではなく桁ごと消える誤り）。余裕を持って96バイト。 */
         char fs[96];
         idx=axx_get_floatstr(s,idx,fs,sizeof(fs));
-        /* 破綻点修正: strtod() は読めたところまでで止まるので、`1.2.3` が
-         * 1.2 になっていた。axx.py は float(fs) が ValueError を投げたときに
-         * 0.0 へ倒すので、全部読めなかったら 0.0 にする（`.` 単独も同じ）。 */
         if(fs[0]){
             char *_fend = NULL;
             double _fv = strtod(fs, &_fend);
@@ -5685,30 +5131,20 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         }
     }
     else if(is_digit(s[idx])){
-        /* 2**256 は10進78桁なので、正当な256bit値を丸ごと収めるには
-         * 64バイトでは足りない（axx.py は無制限精度）。余裕を持って128バイト。 */
         char fs[128];
         idx=axx_get_intstr(s,idx,fs,sizeof(fs));
         x=u256_zero();
         uint256_t ten=u256_from_u64(10);
         for(int di=0;fs[di];di++) x=u256_add(u256_mul(x,ten),u256_from_u64((uint64_t)(fs[di]-'0')));
     }
-    /* .enum の式の中では、列挙要素名はその束縛値として読む。`#name` は
-     * これより前の枝で処理されるので、そちらは素の .setsym 値になる。 */
     else if(st->enum_bind_names
             && (_en_k=enum_name_at(s, idx, st->enum_bind_names, &_en_end)) >= 0){
         x = st->enum_bind_vals[_en_k];
         idx = _en_end;
     }
-    /* パターン変数は「小文字で始まる名前で、直後がラベル構成文字でない」とき。
-     * 長さは問わず、`a` も `var_2` も同じ規則でラベルより先にここで読む。
-     * 直後の文字を見るのは、`aB` や `a.b` のようにラベル構成文字（大文字や
-     * `.`）が続く綴りをラベルとして残すためである。
-     * 捕捉も代入もされていない名前にはスロットが無いので、値は 0 になる。 */
     else if(st->expcaps->patvars
             && (_vnl = var_name_len(s+idx)) > 0
             && (s[idx+_vnl]=='\0' || !char_in(s[idx+_vnl], st->lwordchars))){
-        /* 場所を作るのは代入のときだけ。読むだけの名前は増やさない。 */
         int _is_assign = (idx+_vnl+2<=slen && s[idx+_vnl]==':' && s[idx+_vnl+1]=='=');
         int vslot = var_slot(s+idx, _vnl, _is_assign);
         if(_is_assign){
@@ -5719,27 +5155,11 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
             st->error_undefined_label = _assign_prior_eul || _assign_this_undef;
             var_slot_put_tagged(st,vslot,x,_assign_this_undef);
         } else {
-            /* 破綻点修正: 通常(整数)モードで束縛されたパターン変数を
-             * 浮動小数点モードの式（.error の error_patterns 等）で
-             * そのまま読むと、後続の演算子が u256_to_double() で
-             * 「整数のビット列」を無変換で「doubleのビット列」として
-             * 再解釈してしまい、桁の大きい値の比較・算術が意味不明な
-             * 結果になっていた（axx.py はPythonのint/float混在比較・
-             * 算術がそもそも精度を失わないため、この問題が起きない）。
-             * is_float タグを見て、整数のまま束縛された値だけ、ここで
-             * 数値としてdoubleへ変換する。 */
             x=var_slot_for_mode(st,vslot,asmb->st.exp_typ_float);
             idx+=_vnl;
             if(!st->in_match_attempt
                && !st->pass1_size_mode
                && should_report_errors(st)){
-                /* 破綻点修正: 束縛時に付けたタグ(var_get_is_undef)だけを見ていたため、
-                 * 「ラベル自体は定義されているが、その値が未定義由来」という場合を
-                 * 取りこぼしていた。例: `L: .equ NOSUCH` は L を定義するが値は
-                 * UNDEF 由来になる。`!x` が L に束縛されてもラベル検索自体は成功して
-                 * いるのでタグは付かず、結果として 0xff 等のゴミを黙って生成していた
-                 * （axx.py は値そのものを _is_undef_derived() で見るので検出できる）。
-                 * axx.py と同じく値も検査する。 */
                 if(var_slot_is_undef(st, vslot) || u256_is_undef_derived(x)){
                     st->error_undefined_label = 1;
                     axx_diagf(0, 0, " error - Label undefined: variable '%s' contains undefined value"
@@ -5760,9 +5180,6 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     st->elf_refs[st->elf_refs_len].val      = st->elf_var_to_label[_vi].label_val;
                     st->elf_refs[st->elf_refs_len].word_idx = st->elf_current_word_idx;
                     st->elf_refs[st->elf_refs_len].rtype    = st->reloc_constraints[_vi];
-                    /* 加数は「変数が持っていた値 − ラベル値」。`bl func` なら 0、
-                     * `bl func+8` なら 8。命令語のビット欄を逆算しなくて済むので、
-                     * 欄の分割や語単位の縮尺に左右されない。 */
                     st->elf_refs[st->elf_refs_len].addend   =
                         (int64_t)(u256_to_u64(x) - st->elf_var_to_label[_vi].label_val);
                     st->elf_refs_len++;
@@ -5788,6 +5205,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
     return x;
 }
 
+/* `**`。指数と結果のビット数に上限を置き、連鎖で爆発させない。 */
 static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_factor(asmb,s,idx,&idx);
     int slen=expr_slen(s);
@@ -5798,9 +5216,6 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
             x=double_to_u256(pow(a,b));
         } else {
             const int64_t EXP_MAX = 1024;
-            /* axx.py の _EXP_RESULT_MAX_BITS ( _UNDEF_SANE_CEILING(1<<256).bit_length()-1 )
-             * に合わせる。1<<20 のままだと base_bits(<=256)*exp_factor(<=1024) が
-             * 構造的にこの上限を超えられず、桁溢れ検出が常に不発になっていた。 */
             const int64_t EXP_RESULT_MAX_BITS = 256;
             if(u256_is_neg256(t)){
                 if(should_report_errors(&asmb->st)){
@@ -5833,6 +5248,8 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
     *idx_out=idx; return x;
 }
 
+/* `*` `/` `//` `%`。整数モードの `/` はゼロ方向へ切り捨て、`%` は結果が
+   除数の符号に従う（Python と同じ）。 */
 static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term0_0(asmb,s,idx,&idx);
     int slen=expr_slen(s);
@@ -5843,7 +5260,6 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             if(flt) x=double_to_u256(u256_to_double(x)*u256_to_double(t));
             else {
                 uint256_t r=u256_mul_signed(x,t);
-                /* 割り戻して元に戻らなければ 256bit を溢れている。 */
                 if(!u256_is_zero(x) && !u256_is_zero(t)
                    && !u256_in_undef_band(x) && !u256_in_undef_band(t)
                    && !u256_eq(u256_truncdiv(r,x), t))
@@ -5919,6 +5335,7 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
+/* `+` `-`。 */
 static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term0(asmb,s,idx,&idx);
     int slen=expr_slen(s);
@@ -5929,7 +5346,6 @@ static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_ou
             if(flt) x=double_to_u256(u256_to_double(x)+u256_to_double(t));
             else {
                 uint256_t r=u256_add(x,t);
-                /* 同符号どうしを足して符号が変わったら 256bit を溢れている。 */
                 if(u256_is_neg256(x)==u256_is_neg256(t)
                    && u256_is_neg256(r)!=u256_is_neg256(x)
                    && !u256_in_undef_band(x) && !u256_in_undef_band(t))
@@ -5952,6 +5368,7 @@ static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
+/* `<<` `>>`。負のシフト量と大きすぎるシフト量はエラーにする。 */
 static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term1(asmb,s,idx,&idx);
     int slen=expr_slen(s);
@@ -5961,15 +5378,10 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
             uint256_t sop=expr_safe_bitwise_operand(asmb,t,"<<");
             if(u256_is_neg256(sop)){
-                /* 破綻点修正: シフト量を %lld へ切り詰めて表示していたため、
-                 * 64bit に収まらない値が別の数（や 0）として報告されていた。
-                 * axx.py と同じく元の値をそのまま出す。 */
                 char _sc[96]; u256_to_pydec(sop, _sc, sizeof(_sc));
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - negative shift count (%s) in << expression.\n", _sc);
                 }
-                /* 破綻点修正: エラー後もループを続けていたため、axx.py（ここで
-                 * 打ち切る）には出ない後続の診断まで余計に出ていた。 */
                 x=u256_zero(); break;
             } else if(u256_nonneg_gt_i64(sop,SHIFT_MAX)){
                 char _sc[96]; u256_to_pydec(sop, _sc, sizeof(_sc));
@@ -5980,7 +5392,6 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
             } else {
                 uint256_t _b=expr_safe_bitwise_operand(asmb,x,"<<");
                 int _n=(int)u256_to_i64(sop);
-                /* 符号ビット(255)まで含めて入りきらなければ溢れている。 */
                 if(!u256_is_zero(_b) && !u256_in_undef_band(_b)
                    && (long long)u256_nbit(_b) + _n > 255)
                     warn_u256_wrap("<<");
@@ -5990,15 +5401,10 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
             uint256_t sop=expr_safe_bitwise_operand(asmb,t,">>");
             if(u256_is_neg256(sop)){
-                /* 破綻点修正: シフト量を %lld へ切り詰めて表示していたため、
-                 * 64bit に収まらない値が別の数（や 0）として報告されていた。
-                 * axx.py と同じく元の値をそのまま出す。 */
                 char _sc[96]; u256_to_pydec(sop, _sc, sizeof(_sc));
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - negative shift count (%s) in >> expression.\n", _sc);
                 }
-                /* 破綻点修正: エラー後もループを続けていたため、axx.py（ここで
-                 * 打ち切る）には出ない後続の診断まで余計に出ていた。 */
                 x=u256_zero(); break;
             } else if(u256_nonneg_gt_i64(sop,SHIFT_MAX)){
                 char _sc[96]; u256_to_pydec(sop, _sc, sizeof(_sc));
@@ -6013,6 +5419,7 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
 }
 
 
+/* double を整数に切り捨てて 256bit に入れる。 */
 static uint256_t double_trunc_to_u256(double d){
     const double LIMB = 18446744073709551616.0;
     int neg = (d < 0.0);
@@ -6026,6 +5433,7 @@ static uint256_t double_trunc_to_u256(double d){
     return neg ? u256_neg(r) : r;
 }
 
+/* 256bit 整数を double の値にする。 */
 static double u256_int_to_double(uint256_t v){
     const double LIMB = 18446744073709551616.0;
     int neg = (int)((v.w[3] >> 63) & 1u);
@@ -6035,6 +5443,7 @@ static double u256_int_to_double(uint256_t v){
     return neg ? -d : d;
 }
 
+/* ビット演算の前に整数へ落とす。非有限値は警告して 0 にする。 */
 static uint256_t expr_safe_bitwise_operand(Assembler *asmb, uint256_t v, const char *op_name){
     if(asmb->st.exp_typ_float){
         double d = u256_to_double(v);
@@ -6049,21 +5458,13 @@ static uint256_t expr_safe_bitwise_operand(Assembler *asmb, uint256_t v, const c
     return v;
 }
 
+/* ビット演算の結果を、現在のモードに合う形に整える。 */
 static uint256_t expr_bitwise_result(Assembler *asmb, uint256_t v){
     if(asmb->st.exp_typ_float) return double_to_u256(u256_int_to_double(v));
     return v;
 }
 
-/* 浮動小数点モードの値を「数としての整数」に落とす。
- *
- * 破綻点修正: `'`（符号拡張）と `*(x,y)`（バイト抽出）だけが、この変換を
- * 通さずに uint256_t をそのまま共有関数へ渡していた。浮動小数点モードでは
- * uint256_t は double のビット列なので、`255'8` の幅 8 が
- * 4620693217682128896（8.0 のビット列）として読まれ、axx.py（int(bits) で
- * 数に直す）と全く違う結果になっていた。`~`/`@`/`<<`/`&` 等が使っている
- * 変換と同じものをここにも通す。
- * 非有限なら 0 を返して *ok=0 相当（返り値 0）にする。axx.py の
- * op_sext()/op_byte() が int() の例外で分岐するのと同じ位置づけ。 */
+/* 数値として扱えるオペランドか確かめる。 */
 static int expr_num_operand(Assembler *asmb, uint256_t v, uint256_t *out){
     if(asmb->st.exp_typ_float){
         double d = u256_to_double(v);
@@ -6075,6 +5476,7 @@ static int expr_num_operand(Assembler *asmb, uint256_t v, uint256_t *out){
     return 1;
 }
 
+/* `&`。`&&` は論理積なので食べない。 */
 static uint256_t expr_term3(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term2(asmb,s,idx,&idx);
     int slen=expr_slen(s);
@@ -6085,6 +5487,7 @@ static uint256_t expr_term3(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
+/* `|`。`||` は論理和なので食べない。 */
 static uint256_t expr_term4(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term3(asmb,s,idx,&idx);
     int slen=expr_slen(s);
@@ -6095,6 +5498,7 @@ static uint256_t expr_term4(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
+/* `^`。 */
 static uint256_t expr_term5(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term4(asmb,s,idx,&idx);
     int slen=expr_slen(s);
@@ -6105,6 +5509,8 @@ static uint256_t expr_term5(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
+/* `'` — 符号拡張。`'` は文字定数の引用符でもあるので、直後が数字か `(` の
+   ときだけ演算子として読む。 */
 static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term5(asmb,s,idx,&idx);
     int slen=expr_slen(s);
@@ -6112,12 +5518,8 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
         int ni=idx+1; ni=axx_skipspc(s,ni);
         if(ni>=slen||((s[ni]<'0'||s[ni]>'9')&&s[ni]!='(')) break;
         uint256_t t=expr_term5(asmb,s,idx+1,&idx);
-        /* 実装は共有関数 op_sext() 側。マクロ層も同じものを呼ぶ。
-         * 浮動小数点モードでは値も幅も数に直してから渡す（expr_num_operand）。 */
         uint256_t _xv, _tv;
         if(!expr_num_operand(asmb, x, &_xv) || !expr_num_operand(asmb, t, &_tv)){
-            /* 非有限。axx.py の op_sext() は int() の例外で「続行不可」を返し、
-             * 呼び出し側が連鎖を打ち切る（診断は出さない）。 */
             x = expr_bitwise_result(asmb, u256_zero());
             break;
         }
@@ -6133,6 +5535,7 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
+/* 比較 `<=` `<` `>=` `>` `==` `!=`。結果は 1 か 0。 */
 static uint256_t expr_term7(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term6(asmb,s,idx,&idx);
     int slen=expr_slen(s);
@@ -6167,16 +5570,14 @@ static uint256_t expr_term7(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
+/* 空けてある段。下へ素通しする。axx.py と段の番号をそろえるために残してある。 */
 static uint256_t expr_term8(Assembler *asmb, const char *s, int idx, int *idx_out){
     return expr_term7(asmb,s,idx,idx_out);
 }
 
 static int skip_subexpr(const char *s, int idx);
 
-/* 破綻点修正: `&&` / `||` を短絡評価していたが、axx.py は必ず両辺を評価する
- * （`x = 1 if x and t else 0`）。式には `a:=...` の代入や、パス2の ELF
- * リロケーション収集（ラベル参照の記録）といった副作用があるため、右辺を
- * 読み飛ばすと生成コードが変わってしまう。両辺を評価する形に揃える。 */
+/* `&&`。 */
 static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term8(asmb,s,idx,&idx);
     int slen=expr_slen(s);
@@ -6187,6 +5588,7 @@ static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
+/* `||`。 */
 static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term9(asmb,s,idx,&idx);
     int slen=expr_slen(s);
@@ -6198,6 +5600,7 @@ static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_o
 }
 
 
+/* 括弧の対応を数えて部分式 1 個を読み飛ばす。 */
 static int skip_subexpr(const char *s, int idx) {
     int slen = expr_slen(s);
     int paren_depth = 0;
@@ -6229,10 +5632,8 @@ static int skip_subexpr(const char *s, int idx) {
     return idx;
 }
 
+/* 三項演算子の片側を読み飛ばす（深さ付き）。 */
 static int skip_ternary_expr_d(const char *s, int idx, int depth) {
-    /* 破綻点修正: 深くネストした三項式の偽側を読み飛ばす再帰に上限が無く、
-     * expr_factor の EXPR_MAX_DEPTH ガードも経由しないため、巨大な連鎖
-     * `?:` でCスタックオーバーフローしうる。expr_factor と同じ上限で止める。 */
     if(depth > EXPR_MAX_DEPTH) return idx;
     int slen = expr_slen(s);
     idx = skip_subexpr(s, idx);
@@ -6249,18 +5650,18 @@ static int skip_ternary_expr_d(const char *s, int idx, int depth) {
     }
     return idx;
 }
+/* 三項演算子の、選ばれなかった側を読み飛ばす。 */
 static int skip_ternary_expr(const char *s, int idx) {
     return skip_ternary_expr_d(s, idx, 0);
 }
 
+/* `?:` — 三項演算子。選ばれなかった側は評価せずに飛ばす。`:=` の代入が
+   走らないようにするためで、`:` の直後が `=` なら区切りとは読まない。 */
 static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_out){
     AsmState *st = &asmb->st;
     uint256_t x = expr_term10(asmb, s, idx, &idx);
     int slen = expr_slen(s);
     if(idx < slen && axx_q(s, slen, "?", idx)){
-        /* 破綻点修正: 連鎖した `?:` の再帰は expr_factor を経由しないため
-         * EXPR_MAX_DEPTH の深さガードが効かず、巨大な連鎖式でCスタック
-         * オーバーフローしうる。expr_factor と同じカウンタを共有して防ぐ。 */
         if(st->expr_depth >= EXPR_MAX_DEPTH){
             if(should_report_errors(st)){
                 axx_diagf(1, 0, " error - expression nesting too deep.\n");
@@ -6288,14 +5689,9 @@ static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_o
                 x = u256_zero();
             }
         } else {
-            /* 破綻点修正: 真側を expr_term10 で解析していたため、
-             * `c1 ? c2 ? a : b : d` のような括弧なしの入れ子三項が
-             * axx.py（真側も term11 で解析する）と違う結び付きになっていた。 */
             x = expr_term11(asmb, s, idx, &idx);
             idx = axx_skipspc(s, idx);
             if(axx_q(s, slen, ":", idx) && s[idx+1] != '='){
-                /* 偽側は評価しない。skip_ternary_expr() は字面を追うだけで
-                 * 副作用が無いので、変数や旗の退避・復元は要らない。 */
                 idx = skip_ternary_expr(s, axx_skipspc(s, idx + 1));
             }
         }
@@ -6305,30 +5701,32 @@ static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_o
     return x;
 }
 
+/* 式を 1 個評価する。優先順位の一番上から入る。 */
 static uint256_t expr_expression(Assembler *asmb, const char *s, int idx, int *idx_out){
     idx=axx_skipspc(s,idx);
     return expr_term11(asmb,s,idx,idx_out);
 }
 
-/* 文字列シンボル（`.setsym::名前::"文字列"`）。定義は後方にある。 */
 static void        strsym_set(AsmState *st, const char *upper_name, const char *val);
 static void        strsym_delete(AsmState *st, const char *upper_name);
 static const char *strsym_get(AsmState *st, const char *upper_name);
 static char       *txt_template_inner(const char *q);
-/* 配列シンボル（`.setsym::名前::[…]`）。定義は後方にある。 */
 static void        arrsym_set_from_text(Assembler *asmb, const char *upper_name, const char *q);
 static void        arrsym_delete(AsmState *st, const char *upper_name);
 static void        arrsym_clear_all(AsmState *st);
 static int         symbol_copy_from_name(AsmState *st, const char *dst_upper, const char *value_field);
-/* 集合（`.setsym::a::a1,a2,a3` / `.setsym::x::a&b`）。定義は後方にある。 */
 static int         symbol_set_from_text(AsmState *st, const char *dst_upper, const char *value_field);
 
+/* ---- パターン側ディレクティブ -------------------------------------------
+   各ハンドラは「自分の担当でなければ 0、処理したら 1」を返し、呼び出し側が
+   順に試す。ディレクティブは書かれた位置から効くので、パターン行の照合と
+   違って順序に依存する。
+   ------------------------------------------------------------------------ */
+/* `.setsym` — あらゆる種類のシンボルを定義する。どの種類になるかは値欄の
+   見た目で決まる（文字列・配列・集合・集合式・コピー・数値式）。特殊形の
+   判定が数値解釈より先に来るが、集合になりえない欄は必ず数値解釈へ譲る。 */
 static int dir_set_symbol(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".setsym")!=0) return 0;
-    /* `.setsym::名前::10` のようにただの数なら、文字列・配列・集合の判定を
-     * 通さずシンボル表へ入れる。値は定数なので最初の1回だけ評価する。
-     * 前置きの外にある `.setsym` はソース1行ごとに通るので、この判定列
-     * （名前の大文字化・集合の切り出し）がそのまま行数ぶん積み上がる。 */
     if(e->setsym_plain){
         if(!e->setsym_done){
             int io;
@@ -6341,7 +5739,6 @@ static int dir_set_symbol(Assembler *asmb, PatEntry *e){
     const char *name_field = e->f[1][0] ? e->f[1] : e->f[2];
     const char *value_field = e->f[1][0] ? e->f[2] : "";
     char key[512]; axx_strupr_to(key,name_field,sizeof(key));
-    /* 値が `"..."` なら文字列シンボル、`[...]` なら配列シンボル。 */
     {
         const char *q = value_field;
         while(*q==' '||*q=='\t') q++;
@@ -6355,15 +5752,12 @@ static int dir_set_symbol(Assembler *asmb, PatEntry *e){
             arrsym_set_from_text(asmb, key, q);
             return 1;
         }
-        /* `.setsym::y::x` — x が文字列／配列シンボルなら、その写しを作る。 */
         if(symbol_copy_from_name(&asmb->st, key, value_field)) return 1;
-        /* `名前,名前,…` は名前の集合、`a&b` などは集合どうしの演算。 */
         if(symbol_set_from_text(&asmb->st, key, value_field)) return 1;
     }
     int io;
     uint256_t v;
     if(e->setsym_const){
-        /* 定数式なので、最初の1回だけ評価して使い回す。 */
         if(!e->setsym_done){ e->setsym_val = expr_expression_pat(asmb,value_field,0,&io);
                              e->setsym_done = 1; }
         v = e->setsym_val;
@@ -6374,6 +5768,7 @@ static int dir_set_symbol(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.clearsym` — 名前を 1 つ、または引数なしで全部消す。 */
 static int dir_clear_symbol(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".clearsym")!=0) return 0;
     if(e->f[2][0]){
@@ -6390,28 +5785,10 @@ static int dir_clear_symbol(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* `.bits[::<big|little>][::<幅>]`
- *
- * 破綻点修正1: 以前は endian_big を無条件に
- *   `strcasecmp(f[1],"big")==0`
- * で上書きしていたため、エンディアン欄を書かない2欄形式（`.bits::16`、
- * このとき f[1] は空）が来るたびにビッグエンディアン指定が黙って
- * リトルに戻っていた（axx.py はエンディアン欄が big/little のときしか
- * 変更しないので、同じパターンファイルで両者のバイト順が食い違う）。
- * 欄が big/little のときだけ設定する。
- *
- * 破綻点修正2: 幅の検証が無く、`.bits::big`（幅を書き忘れた形。この形では
- * "big" が f[2] に入る）だと "big" をラベルとして評価しようとして未定義
- * ラベルになり、そのゴミ値がワード幅になっていた。1〜64 の範囲を検証し、
- * 外れていたらエラーにして従来の幅を保つ。 */
+/* `.bits` — 出力ワードのビット数とバイト順。 */
 static int dir_bits(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".bits")!=0) return 0;
 
-    /* 破綻点修正: 欄の意味を位置（第1欄=エンディアン,第2欄=幅）で固定していた
-     * ため、`.bits::<幅>::<big|little>`（順序が逆）を書くと幅の値が捨てられた
-     * 上で診断なしにエンディアンだけが適用されていた（axx.py の bits() と
-     * 同じ問題を移植時に作り込んでいた）。位置ではなく内容('big'/'little'か
-     * どうか)でフィールドの役割を判定し、順序に依らず両方正しく解釈する。 */
     const char *fields[2]; int nfields=0;
     if(e->f[1][0]) fields[nfields++] = e->f[1];
     if(e->f[2][0]) fields[nfields++] = e->f[2];
@@ -6434,8 +5811,6 @@ static int dir_bits(Assembler *asmb, PatEntry *e){
         int64_t nb = u256_to_i64(v);
         if(asmb->st.error_undefined_label || u256_is_undef_derived(v)
            || nb < 1 || nb > 64 || !u256_eq(v, u256_from_i64(nb))){
-            /* 破綻点修正: axx.py は `{wf!r}` と Python の repr で出すので、
-             * `\` を含む欄で文面が食い違っていた（'\8' 対 '\\8'）。 */
             { char _wr[600]; m_pyrepr(wf, _wr, sizeof(_wr));
               axx_diagf(1, 0, " error - .bits: word width must be an integer in 1..64, got %s.\n", _wr); }
         } else {
@@ -6446,9 +5821,9 @@ static int dir_bits(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.padding` — 隙間を埋める値。 */
 static int dir_padding(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".padding")!=0) return 0;
-    /* axx.py と同じく f[2] を優先し、空なら f[1] を見る。 */
     const char *pf = e->f[2][0] ? e->f[2] : (e->f[1][0] ? e->f[1] : "");
     int io;
     uint256_t v = pf[0] ? expr_expression_pat(asmb,pf,0,&io) : u256_zero();
@@ -6456,6 +5831,7 @@ static int dir_padding(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.symbolc` — シンボルに使える文字を増やす。 */
 static int dir_symbolc(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".symbolc")!=0) return 0;
     if(e->f[2][0]){
@@ -6466,6 +5842,7 @@ static int dir_symbolc(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.vliw` — バンドル幅・命令幅・テンプレート幅・NOP を宣言する。 */
 static int dir_vliwp(Assembler *asmb, PatEntry *e){
     if(!e||strcmp(e->f[0],".vliw")!=0) return 0;
     int io;
@@ -6474,12 +5851,6 @@ static int dir_vliwp(Assembler *asmb, PatEntry *e){
     uint256_t v3=expr_expression_pat(asmb,e->f[3],0,&io);
     uint256_t v4=expr_expression_pat(asmb,e->f[4],0,&io);
 
-    /* 破綻点修正: vliwbits/vliwinstbits/vliwtemplatebits を範囲検証なしに
-     * int へ切り詰めていた。2^32 の倍数だけずれた値は int へのキャストで
-     * 別の（たまたま範囲内に見える）値に化けて検証をすり抜けてしまい、
-     * さらに vliwbits/vliwtemplatebits が INT_MIN だと vliwprocess() 側の
-     * 符号反転(-vliwbits)が未定義動作になり得た。dir_bits と同じ
-     * 「256bit値への往復チェック」で切り詰め前の値を検証してから代入する。 */
     int64_t vb64 = u256_to_i64(v1);
     int64_t vi64 = u256_to_i64(v2);
     int64_t vt64 = u256_to_i64(v3);
@@ -6510,6 +5881,7 @@ static int dir_vliwp(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `EPIC::` — インデックスコードの組み合わせごとのテンプレートを宣言する。 */
 static int dir_epic(Assembler *asmb, PatEntry *e){
     if(!e) return 0;
     char uf[16]; axx_strupr_to(uf,e->f[0],sizeof(uf));
@@ -6517,10 +5889,6 @@ static int dir_epic(Assembler *asmb, PatEntry *e){
     if(!e->f[1][0]) return 0;
     const char *s=e->f[1];
     int idx=0;
-    /* 破綻点修正: int idxs[64] の固定長で、65 個目以降を診断もなく捨てていた。
-     * axx.py には個数の制限が無いので、スロットの組み合わせが一致せず
-     * 「No vliw instruction-set defined.」になったり別のテンプレートが選ばれたり
-     * していた。要素数はカンマの数で上限が決まるので、そのぶん確保する。 */
     int cap=1;
     for(const char *q=s; *q; q++) if(*q==',') cap++;
     int *idxs=malloc((size_t)cap*sizeof(int));
@@ -6539,15 +5907,10 @@ static int dir_epic(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* ディレクティブの変数欄を読む。1文字でも `var_2` のように長くてもよい。
- * 名前全体を使い切っていなければ -1（綴りの誤り）。 */
+/* ディレクティブの変数名欄をスロット番号にする。 */
 static int dir_var_slot(const char *field){
     const char *p = field;
     while(*p==' '||*p=='\t') p++;
-    /* 破綻点修正: ここは char[64] 固定で、64 文字以上の変数名を切り詰めて
-     * いた。切り詰めると後ろに文字が残るので「変数ではない」と判定され、
-     * `.map::<64 文字以上の変数>::…` が caxx だけエラーになっていた
-     * （変数名は複数文字でよい。axx.py に長さ制限は無い）。 */
     size_t cap = strlen(p) + 1;
     char *lower = malloc(cap);
     if(!lower){ perror("malloc"); exit(1); }
@@ -6563,19 +5926,10 @@ static int dir_var_slot(const char *field){
     return slot;
 }
 
-/* 要素の列挙欄（`.check` `.enum` `.map` の「名前の並び」）を項目に切る。
- * 項目が配列シンボルの名前なら、その内容をその場に展開する。つまり
- *   .setsym::regs::["R0","R1","R2"]
- *   .check::x::regs
- * は `.check::x::R0,R1,R2` と同じ意味になる。配列と素の名前は混ぜて書ける。
- * 名前は大文字化して積み、`""` `''`（省略可の印）と空欄は長さ0の項目にする。 */
+/* 要素リストを展開する。配列シンボルの名前はその中身に開き、`""` は
+   省略可能の印として空文字で残す。 */
 static void elem_list_expand(AsmState *st, const char *text, StrVec *out){
     const char *p = text;
-    /* 破綻点修正: 項目を char[512] に写していたため、512 文字以上の名前が
-     * 黙って切り詰められ、ソース行に書いた完全な名前と一致しなくなって
-     * `.check` / `.enum` / `.map` が効かず Syntax error になっていた
-     * （axx.py に長さ制限は無いので通る）。項目は欄より長くならないので、
-     * 欄の長さから一度だけ枠を取る。 */
     size_t bufsz = strlen(text) + 1;
     char *buf = malloc(bufsz);
     if(!buf){ perror("malloc"); exit(1); }
@@ -6616,17 +5970,15 @@ static void elem_list_expand(AsmState *st, const char *text, StrVec *out){
     free(buf);
 }
 
-/* 欄が空白だけか。axx.py はどこも `.strip()` の真偽で見るので、空白だけの欄は
- * 「書かれていない」と同じ扱いになる。 */
+/* 欄が空白だけか。 */
 static int fld_blank(const char *s){
     for(; *s; s++) if(!isspace((unsigned char)*s)) return 0;
     return 1;
 }
 
+/* `.check` — その変数が捕らえてよいシンボルを制限する。 */
 static int dir_check(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".check") != 0) return 0;
-    /* 破綻点修正: 空かどうかを `[0]` で見ていたため、空白だけの欄を
-     * 「書かれている」と扱い、axx.py（.strip() で見る）とずれていた。 */
     const char *var_str  = !fld_blank(e->f[1]) ? e->f[1] : e->f[2];
     const char *syms_str = !fld_blank(e->f[1]) ? e->f[2] : "";
     if(fld_blank(var_str)){
@@ -6639,8 +5991,6 @@ static int dir_check(Assembler *asmb, PatEntry *e){
                    var_str);
         return 1;
     }
-    /* 同じ行を毎行組み立て直さない。もとになる配列シンボルの表が変わって
-     * いなければ、前に作った一覧をそのまま渡す（参照数を増やすだけ）。 */
     if(e->chk_cache && e->chk_cache_gen == g_arrgen){
         chk_install(&asmb->st.check_constraints[idx], chk_ref((ChkList*)e->chk_cache));
         return 1;
@@ -6652,8 +6002,6 @@ static int dir_check(Assembler *asmb, PatEntry *e){
     for(int ei = 0; ei < elems.len; ei++){
         const char *nm = elems.data[ei];
         if(!nm[0]){
-            /* 空文字リテラルは「このオペランドは省略可」の印。
-               省略時、変数には 0 が入る。長さ0の要素として積む。 */
             int dup = 0;
             for(int si = 0; si < nl->v.len; si++)
                 if(nl->v.data[si][0] == '\0'){ dup = 1; break; }
@@ -6670,8 +6018,7 @@ static int dir_check(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* 未知の型名を報告済みか。報告済みなら 1。パターン行は1ソース行ごとに
- * 読み直されるため、これが無いと同じ診断が何度も出る。 */
+/* 解決できなかった型名を、同じ名前について一度だけ報告するための印。 */
 static int reloc_badname_seen(AsmState *st, const char *name){
     for(int i = 0; i < st->reloc_badname_len; i++)
         if(strcmp(st->reloc_badname[i], name) == 0) return 1;
@@ -6680,33 +6027,6 @@ static int reloc_badname_seen(AsmState *st, const char *name){
     return 0;
 }
 
-/* `.reloc::<変数>::<型名>`
- *
- * その変数が捕らえたラベル参照を、指定の ELF リロケーション型で書き出す。
- * `.check` と同じく位置依存で、後の `.reloc` が前のものを置き換える。
- *
- * 型名は `-m` で選んだマシンの名前表（`::pc32` などに使うものと同じ）から引く。
- * AArch64 の `call26` のような命令フィールド型は、値が命令語のビット欄に詰まって
- * いて出力バイト列から加数を逆算できないため、この宣言が要る。 */
-/* `.elftype::<名前>::<値>` — リロケーション型名を自分で決める。
- *
- * 決めた名前は、型名を書けるところ全部で使える。
- *   パターンファイル: `.reloc::<変数>::<名前>`
- *   ソース          : `.EXTERN 名前::<名前>` `.EQU x::<名前>` `.RELOCTYPE`
- *   取り込みファイル: `ラベル::<名前>`
- * 値は型番号（ELF の r_info の型欄に入る数）で、1 以上の整数の定数式である
- * （0 は「型を指定しない」の意味で内部的に使っているので取らない）。
- * 同じ名前を2度書けば後の宣言が勝つ。`-m` で選んだマシンの名前表に同じ綴りが
- * あっても、この宣言のほうを先に引く（自分の宣言で上書きできる）。
- *
- * 4番目の欄はその型が書き換える欄のバイト幅（1〜8）、5番目の欄は 0 以外なら
- * 「PC 相対の型」という印である。どちらも省いてよい。
- *
- * 値は行によって変わらないので、最初の1回だけ評価して控える。
- * 名前は `.reloc` の型名と同じ読み方（空白は落とし、大小は区別しない）にする。
- * axx.py の elftype_processing() と同じ規則である。 */
-/* ELF 宣言の数値欄を評価する。読めないか範囲外なら診断して 0 を返す。
- * axx.py の DirectiveProcessor._elf_decl_num() と同じ規則である。 */
 static int elf_decl_num(Assembler *asmb, const char *dname, const char *text,
                         long long lo, long long hi, long long *out){
     AsmState *st = &asmb->st;
@@ -6731,10 +6051,6 @@ static int elf_decl_num(Assembler *asmb, const char *dname, const char *text,
     return 1;
 }
 
-/* elf_decl_num の符号なし 64 ビット版。`.elffield` のマスクは最上位ビットまで
- * 使えるので（RISC-V の R_RISCV_CALL_PLT は 8 バイトの欄のビット 63 に届く）、
- * long long では表せない。診断の文言は elf_decl_num と同じ形で、範囲だけ
- * 符号なしで出す。axx.py の _elf_decl_num() と同じ規則である。 */
 static int elf_decl_u64(Assembler *asmb, const char *dname, const char *text,
                         uint64_t lo, uint64_t hi, uint64_t *out){
     AsmState *st = &asmb->st;
@@ -6760,9 +6076,7 @@ static int elf_decl_u64(Assembler *asmb, const char *dname, const char *text,
     return 1;
 }
 
-/* ELF 宣言の第1欄・第2欄を取り出す。パターン行は `::` が1つだけだと第1欄が
- * 空になり、書いた値が第2欄に入る（`.elfclass::64` は ["", "64"]）。
- * axx.py の _elf_decl_fields() と同じ読み方である。 */
+/* ELF 宣言の欄を取り出す（欄の詰め方の違いを吸収する）。 */
 static void elf_decl_fields(const PatEntry *e, const char **f1, const char **f2){
     const char *q = e->f[1];
     while(*q==' '||*q=='\t') q++;
@@ -6770,7 +6084,7 @@ static void elf_decl_fields(const PatEntry *e, const char **f1, const char **f2)
     else  { *f1 = e->f[2]; *f2 = ""; }
 }
 
-/* 宣言の文字列欄を据える。中身が変わったときだけ実効表の版を進める。 */
+/* ELF 宣言の文字列欄を差し替え、変わったら世代番号を進める。 */
 static void elf_decl_set_str(AsmState *st, char **slot, const char *text){
     if(*slot && strcmp(*slot, text)==0) return;
     free(*slot);
@@ -6779,7 +6093,7 @@ static void elf_decl_set_str(AsmState *st, char **slot, const char *text){
     st->elf_decl_gen++;
 }
 
-/* 前後の空白を落として写す。 */
+/* ELF 宣言の欄から空白を落として写す。 */
 static void elf_decl_trim(char *dst, size_t dsz, const char *src){
     while(*src==' '||*src=='\t') src++;
     size_t n = strlen(src);
@@ -6789,15 +6103,7 @@ static void elf_decl_trim(char *dst, size_t dsz, const char *src){
     dst[n] = '\0';
 }
 
-/* 宣言の欄を、長さの上限なく取り出す（前後の空白は落とす）。
- *
- * 破綻点修正: 呼び出し側はどこも char[32]/[64]/[128] の自動変数を渡していた
- * ため、それを超える名前が黙って切り詰められ、axx.py（長さ制限なし）と
- * 食い違っていた。`.elfsection` の宣言が引けず属性が既定のままになる、
- * `.elftype` の型名が一致せずリロケーション型が解決されない、といった形で
- * 出ていた。切り詰めは縮める方向しかないので strlen+1 で必ず足りる。
- * axx_word_buf() と同じ考え方だが、こちらは行ではなく欄を丸ごと写す。
- * 使い終わりに free() すること。 */
+/* 同じものを確保して返す。 */
 static char *elf_decl_trim_dup(const char *src){
     if(!src) src = "";
     size_t n = strlen(src);
@@ -6807,16 +6113,12 @@ static char *elf_decl_trim_dup(const char *src){
     return d;
 }
 
+/* `.elftype` の宣言を登録する本体。 */
 static int elftype_apply(Assembler *asmb, PatEntry *e){
     AsmState *st = &asmb->st;
     const char *name_str = e->f[1][0] ? e->f[1] : e->f[2];
     const char *val_str  = e->f[1][0] ? e->f[2] : "";
 
-    /* 破綻点修正: ここは char[64] だったため、64 文字以上の型名が黙って
-     * 切り詰められ、`.reloc` や `.extern` に書いた同じ名前と一致しなくなって
-     * 「unknown reloc type」の警告だけ出してリロケーション型が解決されずに
-     * いた（axx.py には長さ制限が無いので解決されていた）。長さは名前欄から
-     * 決まるので、そのぶんだけ確保する。 */
     char *nm = malloc(strlen(name_str) + 1);
     if(!nm){ perror("malloc"); exit(1); }
     size_t nn = 0;
@@ -6881,19 +6183,14 @@ static int elftype_apply(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.elftype` — リロケーション型の名前と番号を自分で決める。 */
 static int dir_elftype(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elftype") != 0) return 0;
     return elftype_apply(asmb, e);
 }
 
-/* ---- ELF 記述のディレクティブ（マニュアル 3.7.7 節）----------------------
- *
- * `-m` で選んだ組み込みのマシン表に重ねる差分を宣言する。組み込みの表に無い
- * e_machine でも、これだけそろえれば ELF を出せる。宣言はどれも行によって
- * 変わらないので、`.elftype` と同じく組み立て前に一度登録しておき
- * （register_elfdecls）、実効表は elf_machine_effective() が組み立てる。
- * axx.py の elfmachine_processing() 以下と同じ規則である。 */
 
+/* `.elfmachine` — e_machine の既定値（`-m` より弱い）。 */
 static int dir_elfmachine(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfmachine") != 0) return 0;
     AsmState *st = &asmb->st;
@@ -6908,7 +6205,6 @@ static int dir_elfmachine(Assembler *asmb, PatEntry *e){
         snprintf(st->elf_decl_name, sizeof(st->elf_decl_name), "%s", nm);
         st->elf_decl_gen++;
     }
-    /* `-m` を書いていなければ、宣言したマシンがそのまま対象になる。 */
     if(!st->elf_machine_from_cli && st->elf_machine != (int)v){
         st->elf_machine = (int)v;
         st->elf_decl_gen++;
@@ -6916,6 +6212,7 @@ static int dir_elfmachine(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.elfclass` — ELF32 / ELF64 の既定値（`-f` より弱い）。 */
 static int dir_elfclass(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfclass") != 0) return 0;
     AsmState *st = &asmb->st;
@@ -6934,6 +6231,7 @@ static int dir_elfclass(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.elfrela` — .rela か .rel かを決める。 */
 static int dir_elfrela(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfrela") != 0) return 0;
     AsmState *st = &asmb->st;
@@ -6953,15 +6251,13 @@ static int dir_elfrela(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.elfwidth` — 欄の幅から型を推測する対応を宣言する。幅は 2 のべき乗
+   でなくてもよい。 */
 static int dir_elfwidth(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfwidth") != 0) return 0;
     AsmState *st = &asmb->st;
     const char *wf, *tf; elf_decl_fields(e, &wf, &tf);
     long long w;
-    /* 幅は 1〜8 のどれでもよい。2 の冪だけに絞っていたが、1 ワードが 8 ビット
-     * でない機種（`.bits`）では参照の幅が 1 ワードのバイト数の倍数になるので、
-     * 12 ビット機の 3 ワード参照（6 バイト）のような幅が普通に現れる。
-     * axx.py の elfwidth_processing() と同じ規則である。 */
     if(!elf_decl_num(asmb, ".elfwidth", wf, 1, 8, &w)) return 1;
     char *t = elf_decl_trim_dup(tf);
     if(!t[0]){
@@ -6974,6 +6270,7 @@ static int dir_elfwidth(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.elfextern` — 外部シンボル参照に使う既定の型。 */
 static int dir_elfextern(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfextern") != 0) return 0;
     AsmState *st = &asmb->st;
@@ -6989,6 +6286,7 @@ static int dir_elfextern(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.elfdwarf` — DWARF セクション内の絶対参照に使う型。 */
 static int dir_elfdwarf(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfdwarf") != 0) return 0;
     AsmState *st = &asmb->st;
@@ -7004,7 +6302,6 @@ static int dir_elfdwarf(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* `.elfheader` で書ける欄。axx.py の _ELF_HDR_FIELDS と同じ表である。 */
 static const struct { const char *name; int idx; long long lo, hi; } _elf_hdr_fields[] = {
     { "type",       EHF_TYPE,       0, 0xFFFFll },
     { "flags",      EHF_FLAGS,      0, 0xFFFFFFFFll },
@@ -7015,6 +6312,7 @@ static const struct { const char *name; int idx; long long lo, hi; } _elf_hdr_fi
     { NULL, 0, 0, 0 }
 };
 
+/* `.elfheader` — ELF ヘッダの欄（e_flags など）を直接書く。 */
 static int dir_elfheader(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfheader") != 0) return 0;
     AsmState *st = &asmb->st;
@@ -7045,7 +6343,6 @@ static int dir_elfheader(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* `.elfsection` の宣言を据える。同じ名前があれば書き換える（後の宣言が勝つ）。 */
 static void elf_sec_set(AsmState *st, const char *name, uint32_t flags,
                         int type_set, uint32_t type, int al_set, uint32_t al,
                         int es_set, uint32_t es){
@@ -7088,35 +6385,15 @@ static void elf_sec_set(AsmState *st, const char *name, uint32_t flags,
     st->elf_decl_gen++;
 }
 
-/* セクション名から `.elfsection` の宣言を引く。無ければ -1。名前の大小は
- * 区別しない。axx.py の _elf_sec_decl() と同じ規則である。 */
+/* `.elfsection` の宣言を名前で引く。 */
 static int elf_sec_find(const AsmState *st, const char *name){
     for(int i=0;i<st->elf_secs_len;i++)
         if(strcasecmp(st->elf_secs[i].name, name)==0) return i;
     return -1;
 }
 
-/* `.elfsection::<名前>::<sh_flags>[::<sh_type>[::<整列>[::<要素長>]]]`
- * — セクションヘッダの属性。
- *
- * 書かなかったセクションは従来どおり名前から決まる（`.text` は
- * SHF_ALLOC|SHF_EXECINSTR、`.data` と `.bss` は SHF_ALLOC|SHF_WRITE、
- * `.rodata` とそれ以外は SHF_ALLOC、型は `.bss` だけ SHT_NOBITS で他は
- * SHT_PROGBITS）。名前で決まる規則を持たない、その機種固有のセクションを
- * 出すための宣言である。
- *
- * 整列は sh_addralign にそのまま入る。0 か 2 の冪でなければならない
- * （ELF の要求）。書かなければ weo_default_align() が決める。
- * 第 5 欄は sh_entsize で、固定長の要素を並べたセクションの1要素のバイト数
- * である（`SHF_MERGE` の文字列表など）。書かなければ 0 になる。
- * axx.py の elfsection_processing() と同じ規則である。 */
-/* `.elffield::<型>::<マスク>[::<オフセット>]` — 命令フィールド型のリロケーション。
- *
- * マスクは 64 ビットのどのビットも使える（上限は 0xFFFFFFFFFFFFFFFF）。2 つの
- * 命令語にまたがる 8 バイトの欄では最上位ビットまで届くことがある — RISC-V の
- * `R_RISCV_CALL_PLT` は `auipc`+`jalr` の対に当たり、リトルエンディアンで読むと
- * `jalr` の imm12 がビット 52〜63 に来る。
- * axx.py の elffield_processing() と同じ規則である。 */
+/* `.elffield` — 命令語のどのビットに値が入るかを宣言する。AArch64 以外で
+   命令欄リロケーションを使うには、この宣言が要る。 */
 static int dir_elffield(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elffield") != 0) return 0;
     AsmState *st = &asmb->st;
@@ -7160,15 +6437,13 @@ static int dir_elffield(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.elfsection` — 名前から推測できないセクションの属性を宣言する。
+   sh_flags / sh_type / 整列 / 要素サイズ。 */
 static int dir_elfsection(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfsection") != 0) return 0;
     AsmState *st = &asmb->st;
     const char *name_str = e->f[1][0] ? e->f[1] : e->f[2];
     const char *flag_str = e->f[1][0] ? e->f[2] : "";
-    /* 破綻点修正: ここは char[128] だったため、128 文字以上のセクション名が
-     * 黙って切り詰められ、ソースの `.section` に書いた同じ名前と一致しなくなって
-     * 宣言が効かず、属性が名前の規則の既定のままになっていた（axx.py には長さ
-     * 制限が無いので効いていた）。 */
     char *nm = elf_decl_trim_dup(name_str);
     if(!nm[0]){
         axx_diagf(1, 0, " error - .elfsection: section name is not specified.\n");
@@ -7216,32 +6491,17 @@ static int dir_elfsection(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* `.elfsection` で整列を書かなかったセクションの sh_addralign。
- *
- * SHT_NOTE (7) だけ 4 にし、他の型は従来どおり 16 のままにする。16 では
- * binutils が `Corrupt note: alignment 16, expecting 4 or 8` と言って読め
- * ない。ELF64 でも 4 なのは、note の n_namesz / n_descsz の詰め物が整列値に
- * 従うからで、`.note.gnu.build-id` のような実在の note が ELF64 でも 4 で
- * 書かれているのに合わせる。8 が要る note（`.note.gnu.property`）は
- * `.elfsection` の整列欄に 8 と書く。
- * axx.py の _elf_default_align() と同じ規則である。 */
+/* 整列が書かれていないセクションの既定値。SHT_NOTE だけ 4、ほかは 16。
+   is_elf64 は現在使っていないが、axx.py 側と呼び出し形をそろえて残してある。 */
 static uint32_t weo_default_align(uint32_t sh_type, int is_elf64){
-    (void)is_elf64;         /* note の整列は ELF クラスによらない */
+    (void)is_elf64;
     if(sh_type == 7u) return 4u;
     return 16u;
 }
 
-/* セクションの sh_flags と sh_type、`.elfsection` で整列と要素長が書かれて
- * いればそれも決める。宣言が無ければ名前の前方一致で決める従来の規則に従う。
- * 整列を書いていないときは *al_set を 0 にして返し、既定値は
- * weo_default_align() が決める。要素長は書いていなければ 0 になる。
- * axx.py の _elf_section_attrs() と同じ規則である。 */
 static void elf_section_attrs(const AsmState *st, const char *name,
                               uint64_t *flags, uint32_t *shtype,
                               int *al_set, uint32_t *al, uint32_t *entsize){
-    /* 破綻点修正: ここは char[64] だったため、64 文字以上のセクション名が
-     * 切り詰められていた。前方一致で見るのは先頭 7 文字までなので出力は
-     * 変わらなかったが、名前の扱いを他と揃えるため長さぶん確保する。 */
     char *un = malloc(strlen(name)+1);
     if(!un){ perror("malloc"); exit(1); }
     int ui=0;
@@ -7269,12 +6529,9 @@ static void elf_section_attrs(const AsmState *st, const char *name,
     free(un);
 }
 
+/* `.reloc` — その変数が捕らえたラベル参照に使う型を宣言する。 */
 static int dir_reloc(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".reloc") != 0) return 0;
-    /* 破綻点修正: 変数欄が空のとき型欄を変数名として読み直していたため、
-     * `.reloc::t:dbl{` のように `::` が 1 つしかない行で axx.py
-     * （変数欄が空なら「変数名が指定されていない」で打ち切る）と
-     * 違うメッセージを出していた。axx.py と同じく読み直さない。 */
     const char *var_str  = e->f[1];
     const char *type_str = e->f[2];
     if(fld_blank(var_str)){
@@ -7297,15 +6554,10 @@ static int dir_reloc(Assembler *asmb, PatEntry *e){
         axx_diagf(1, 0, " error - .reloc: relocation type is not specified.\n");
         return 1;
     }
-    /* リロケーションは `-o` の ELF 出力にしか現れない。`-b` などでは宣言は
-     * 無意味なので、型名を照合せずに受け流す。パターンファイルは複数の `-m`
-     * で使い回せるべきで、対象外のときに落ちてはいけない。 */
     if(!asmb->st.elf_objfile[0]) return 1;
     const ElfMachineInfo *m = elf_machine_effective(&asmb->st);
     int rtype = elf_reloc_named(&asmb->st, m, tname);
     if(rtype < 0){
-        /* パターン行は1ソース行ごとに読み直されるので、同じ名前で何度も
-         * 出さないよう一度だけ報告する。 */
         if(!reloc_badname_seen(&asmb->st, tname))
             axx_diagf(1, 0, " error - .reloc: unknown relocation type '%s' for %s.\n",
                        tname, m->name);
@@ -7315,6 +6567,7 @@ static int dir_reloc(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.clrreloc` — `.reloc` の宣言を外す。 */
 static int dir_clrreloc(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".clrreloc") != 0) return 0;
     const char *var_str = e->f[2][0] ? e->f[2] : e->f[1];
@@ -7332,6 +6585,7 @@ static int dir_clrreloc(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+/* `.clrcheck` — `.check` の制限を外す。 */
 static int dir_clrcheck(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".clrcheck") != 0) return 0;
     const char *var_str = e->f[2];
@@ -7351,15 +6605,8 @@ static int dir_clrcheck(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* `.free::名前,名前,…`
- * その名前を、パターン層のあらゆる表から外す。置き場所ごとに
- * `.clearsym` `.clrcheck` `.clrenum` と書き分けなくても、名前ひとつで
- * 「もうこの名前は使わない」と宣言できるようにするためのもの。外すのは
- *   - `.setsym` の数値シンボル・文字列シンボル・配列シンボル
- *   - `.sub` の表
- *   - `.check` の候補（どの変数の一覧に入っていても取り除く）
- *   - 名前が小文字1文字なら、その変数の `.check` と `.enum` ごと
- * で、`.clearsym` などと同じく書かれた位置から先に効く。 */
+/* `.free` の 1 名前ぶん。シンボル・サブ表・`.check` の候補、そして変数名と
+   して読めるならその `.check` / `.enum` / `.reloc` をすべて外す。 */
 static void free_one_name(Assembler *asmb, const char *name){
     AsmState *st = &asmb->st;
     if(!name[0]) return;
@@ -7370,7 +6617,6 @@ static void free_one_name(Assembler *asmb, const char *name){
     arrsym_delete(st, key);
     subv_mark_freed(&st->subs, name);
 
-    /* `.check` の候補からも外す。候補は大文字で積まれている。 */
     for(int vi=0; vi<g_nvars; vi++){
         ChkList *cv = st->check_constraints[vi];
         if(!cv) continue;
@@ -7378,14 +6624,12 @@ static void free_one_name(Assembler *asmb, const char *name){
         for(int k=0; k<cv->v.len; k++)
             if(strcmp(cv->v.data[k], key)==0){ hit = 1; break; }
         if(!hit) continue;
-        /* リストは他からも参照されうるので、その場で削らずに作り替える。 */
         ChkList *nl = chk_new();
         for(int k=0; k<cv->v.len; k++)
             if(strcmp(cv->v.data[k], key)!=0) sv_push(&nl->v, cv->v.data[k]);
         chk_install(&st->check_constraints[vi], nl);
     }
 
-    /* 名前が変数そのものなら、その変数の制約と列挙ごと外す。 */
     {
         char lower[64]; int n = 0;
         for(const char *q = name; *q && n < (int)sizeof(lower)-1; q++)
@@ -7402,29 +6646,10 @@ static void free_one_name(Assembler *asmb, const char *name){
     }
 }
 
-/* 定義は後方にある。 */
 static char *pat_trim(char *s);
 static char *map_subst_index(const char *expr, const char *var, int i);
 
-/* `.map::<変数>::<名前の並び>::<式>`
- * 並びの各名前に値を与える `.setsym` と、その変数の `.check` をまとめて書く
- * ための省略形。式の中の変数は「その名前が並びの何番目か」(0 から数える)。
- *
- *   .map::x::R0,R1,R2::1<<x
- * は
- *   .setsym::R0::1<<(0)
- *   .setsym::R1::1<<(1)
- *   .setsym::R2::1<<(2)
- *   .check::x::R0,R1,R2
- * と等価である。式を省くと変数そのもの、すなわち 0 からの連番になる。
- * 並びには配列シンボルの名前を書ける（elem_list_expand() が展開する）。
- *
- * into が非NULLならシンボルはそこへ、NULLなら st->symbols へ入れる。
- * set_check が真なら `.check` も設定する。 */
-/* 文字列を最上位のカンマで切る。括弧の中のカンマは区切りにしない
- * （`*(x,1)` のような式がそのまま1項目になるようにするため）。深さの数え方は
- * expr_expression_esc() と同じで、閉じ括弧の種類は厳密に照合しない。
- * axx.py の split_top_commas() と同じ規則である。 */
+/* トップレベルのカンマだけで割る。括弧の中では割らない。 */
 static void split_top_commas(const char *text, StrVec *out){
     int depth = 0;
     const char *b = text;
@@ -7446,6 +6671,9 @@ static void split_top_commas(const char *text, StrVec *out){
     }
 }
 
+/* `.map` の本体。名前の並びに値を与え、同時に `.check` も設定する。
+   値欄は 1 つの式（変数はリスト中の位置に置き換わる）か、名前と 1 対 1 で
+   対応する値のリスト。長さが違えば何も定義せずにエラーにする。 */
 static void map_apply(Assembler *asmb, PatEntry *e, SymMap *into, int set_check){
     AsmState *st = &asmb->st;
     const char *var_str  = e->f[1][0] ? pat_trim(e->f[1]) : "";
@@ -7458,8 +6686,6 @@ static void map_apply(Assembler *asmb, PatEntry *e, SymMap *into, int set_check)
 
     StrVec elems; sv_init(&elems);
     elem_list_expand(st, syms_str, &elems);
-    /* 値欄が最上位のカンマで区切られていれば、並びと1対1の値のリスト。
-     * 1項目しか無ければ従来どおり「変数を含む式」1本として扱う。 */
     StrVec vals; sv_init(&vals);
     split_top_commas(expr_str, &vals);
     if(vals.len > 1 && vals.len != elems.len){
@@ -7469,7 +6695,6 @@ static void map_apply(Assembler *asmb, PatEntry *e, SymMap *into, int set_check)
         return;
     }
     for(int i = 0; i < elems.len; i++){
-        /* 空の要素（`""` の省略可印など）は番号だけ消費して何も定義しない。 */
         if(!elems.data[i][0]) continue;
         const char *src = (vals.len > 1) ? vals.data[i] : expr_str;
         char *val = map_subst_index(src, vname, i);
@@ -7497,12 +6722,14 @@ static void map_apply(Assembler *asmb, PatEntry *e, SymMap *into, int set_check)
     sv_free(&elems);
 }
 
+/* `.map` — シンボル表とそのチェックを 1 行で書く。 */
 static int dir_map(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".map") != 0) return 0;
     map_apply(asmb, e, NULL, 1);
     return 1;
 }
 
+/* `.free` — 名前をすべての表から外す。位置依存。 */
 static int dir_free(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".free") != 0) return 0;
     const char *names = e->f[2][0] ? e->f[2] : e->f[1];
@@ -7524,19 +6751,7 @@ static int dir_free(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* `.passthru[::on|nonl|off]`
- * どのパターンにもマッチしなかったソース行を、エラーにする代わりにそのまま
- * テキストとして出す（トランスレータとしての使い方のため）。その行はパターンの
- * エンコーディング欄が `"<行>"` というテキストテンプレートだったのと同じ扱いに
- * なり、UTF-8 の 1 バイトが 1 ワードになってロケーションカウンタも進む。
- *   .passthru        on と同じ
- *   .passthru::on    素通しする
- *   .passthru::off   素通しをやめる（既定）
- * 行末の改行はこのディレクティブの仕事ではない。1行が1行になるようにしたいとき
- * は `.eol` を併せて書く。
- * パターンファイルは1行ごとに全部走査されるので、これはファイル全体にかかる
- * 設定として働く（同じファイルに複数書いた場合は最後のものが効く）。
- * axx.py の passthru_processing() と同じ規則である。 */
+/* `.passthru` — 当たらない行をエラーにせず素通しする。 */
 static int dir_passthru(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".passthru") != 0) return 0;
     char arg[32]; arg[0] = '\0';
@@ -7554,20 +6769,7 @@ static int dir_passthru(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* `.eol[::on|off]`
- * テキスト変換のための設定で、出力を出した行ごとに改行（`\n`）を1ワード足す。
- * パターンのテキストテンプレートに `\n` を書いて回らなくても、ソースの1行が
- * 出力の1行になる。
- *   .eol         on と同じ
- *   .eol::on     行ごとに改行を足す
- *   .eol::off    足さない（既定）
- * 足すのは出力ワード列の側だけで、標準出力へ流すテキスト（トランスレータとして
- * の出力）には足さない。そちらは行ごとに改行して出しているので、二重に改行して
- * しまわないようにしてある。出力ワードを1つも出さなかった行には足さない。
- * `.vliw` が有効なときは、パケットを壊さないよう何もしない。
- * パターンファイルは1行ごとに全部走査されるので、これはファイル全体にかかる
- * 設定として働く（同じファイルに複数書いた場合は最後のものが効く）。
- * axx.py の eol_processing() と同じ規則である。 */
+/* `.eol` — 1 ソース行につき 1 行の改行を入れる。 */
 static int dir_eol(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".eol") != 0) return 0;
     char arg[32]; arg[0] = '\0';
@@ -7585,21 +6787,8 @@ static int dir_eol(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* `.textmode[::on|off]`
- * テキスト置換モード。ソースを別の書式のテキストへ書き換える（トランスレータ
- * としての）使い方のための設定で、次の3つをまとめて行う。
- *   1. `.passthru` を立てる（マッチしない行はそのまま出す）
- *   2. `.eol` を立てる（出力を出した行ごとに改行を1ワード足す）
- *   3. `!L<名前>`（式・ラベル捕捉子）の中の未定義ラベルをエラーにしない。
- *      値は 0 になり、`{{.exp(<名前>)}}` が書かれたとおりの文字を出す。
- *   .textmode        on と同じ
- *   .textmode::on    テキスト置換モードにする
- *   .textmode::off   やめる（既定）
- * 3つまとめて動くので、`.passthru` や `.eol` だけを別にしたいときはこの行の
- * 後ろでそちらを書けばよい（ディレクティブは書いた順に効く）。
- * パターンファイルは1行ごとに全部走査されるので、これはファイル全体にかかる
- * 設定として働く（同じファイルに複数書いた場合は最後のものが効く）。
- * axx.py の textmode_processing() と同じ規則である。 */
+/* `.textmode` — テキスト置換モード。ラベル・式・コメント・字下げを
+   書かれていたままの綴りで出力に残す。 */
 static int dir_textmode(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".textmode") != 0) return 0;
     char arg[32]; arg[0] = '\0';
@@ -7623,10 +6812,7 @@ static int dir_textmode(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* `.enum::<変数>::<要素名の並び>::<式>`
- * `!E<変数>` が拾う「要素名のリスト」の語彙と、そこから値を作る式を決める。
- * 式の中では各要素名が「そのリストに現れていれば .setsym の値、
- * 現れていなければ 0」に束縛される。 */
+/* `.enum` — 要素のリストを取る位置を宣言する。 */
 static int dir_enum(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".enum") != 0) return 0;
     const char *var_str   = e->f[1];
@@ -7666,12 +6852,13 @@ static int dir_enum(Assembler *asmb, PatEntry *e){
     }
 
     enumdef_clear(&asmb->st.enum_defs[idx]);
-    asmb->st.enum_defs[idx].names = names;   /* 所有権を移す */
+    asmb->st.enum_defs[idx].names = names;
     asmb->st.enum_defs[idx].expr  = strdup(expr_str);
     if(!asmb->st.enum_defs[idx].expr){ perror("strdup"); exit(1); }
     return 1;
 }
 
+/* `.clrenum` — `.enum` の宣言を外す。 */
 static int dir_clrenum(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".clrenum") != 0) return 0;
     const char *var_str = e->f[2];
@@ -7689,12 +6876,8 @@ static int dir_clrenum(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* `.error::n::"Message"` — error_patterns 欄（`n>7;5` の `5` のような
- * エラーコード）に対応するメッセージ文字列を errors テーブルに登録する。
- * 組み込みの ERRORS_TABLE が文言を持たないコード（4 や 7 以上）にも
- * 新しくメッセージを追加できるし、既存コード（1・2・3・5・6）の文言を
- * 上書きすることもできる。n がテーブルの現在の大きさを超える場合は
- * 空文字列で埋めて拡張する（axx.py の errmsg_processing と対応）。 */
+/* `.error` — エラーコードの文言を足す・上書きする。実装のソースを触らずに
+   自分の文言を持てる。 */
 static int dir_errmsg(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".error") != 0) return 0;
 
@@ -7714,14 +6897,9 @@ static int dir_errmsg(Assembler *asmb, PatEntry *e){
     int io;
     uint256_t n = expr_expression_pat(asmb, n_field, 0, &io);
     int64_t n_int = u256_to_i64(n);
-    /* エラーコードは errors StrVec の添字として (int) にキャストされ、
-     * 添字ぶんだけ空文字列で埋めて伸長する。上限を設けないと、
-     * INT_MAX を超える値がキャストで負値に化けて配列外アクセスになったり、
-     * 巨大な正値が数十億要素の伸長でハング/OOM したりする。 */
     #define AXX_ERROR_CODE_MAX 1000000
     if(st->error_undefined_label || u256_is_undef_derived(n)
        || n_int < 0 || n_int > AXX_ERROR_CODE_MAX || !u256_eq(n, u256_from_i64(n_int))){
-        /* 破綻点修正: 同上（axx.py は `{n_field!r}`）。 */
         { size_t _nsz = strlen(n_field)*4+8; char *_nr = malloc(_nsz);
           if(!_nr){ perror("malloc"); exit(1); }
           m_pyrepr(n_field, _nr, _nsz);
@@ -7735,7 +6913,6 @@ static int dir_errmsg(Assembler *asmb, PatEntry *e){
 
     int idx0 = axx_skipspc(msg_field, 0);
     if(msg_field[idx0] != '"'){
-        /* 破綻点修正: 同上（axx.py は `{msg_field!r}`）。 */
         { size_t _msz = strlen(msg_field)*4+8; char *_mr = malloc(_msz);
           if(!_mr){ perror("malloc"); exit(1); }
           m_pyrepr(msg_field, _mr, _msz);
@@ -7744,8 +6921,6 @@ static int dir_errmsg(Assembler *asmb, PatEntry *e){
         return 1;
     }
 
-    /* 復号後の文字列はエスケープの分だけ短くなりこそすれ伸びないので、
-     * 元欄の長さ+1 を出力バッファに取れば絶対に切り詰まらない。 */
     size_t mlen = strlen(msg_field);
     char stackbuf[512];
     char *msg = (mlen < sizeof(stackbuf)) ? stackbuf : malloc(mlen + 1);
@@ -7758,23 +6933,10 @@ static int dir_errmsg(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* `.echo(項目, 項目, …)` — パターンファイルの本文行に書けるデバッグ出力。
- *
- * ミニ言語の `.echo`（`.func` の本体に書くもの）と同じ体裁で標準エラーへ 1 行
- * 出す。ワードは出さないので、足しても消しても生成されるバイト列は変わらない。
- * 項目は `"..."` の文字列リテラルかパターン層の式で、混ぜて書ける。
- * `.echo()` は空行。
- *
- * 照合はソース1行ごとにパターン表をたどり直すので、この行もソース1行につき
- * 1回実行される。書いた位置で回数は変わらない（照合は一番具体的なパターンを
- * 選ぶために表を走査しきるため）。命令長を測るだけの試し打ちと収束途中の
- * パス1では黙るので、組み立てた1行につき1行だけ出る。
- * axx.py の echo_processing() と同じ規則である。 */
+/* `.echo` — 本文行から標準エラーへ印字する。ワードは出さない。 */
 static int dir_echo(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".echo") != 0) return 0;
     AsmState *st = &asmb->st;
-    /* 黙る番なら式も評価しない。未定義ラベルの番兵を踏んで
-     * error_undefined_label を立ててしまわないようにするためである。 */
     if(!should_report_errors(st) || st->pass1_size_mode) return 1;
     EchoItem *items = (EchoItem*)e->echo_items;
     int n = e->echo_nitems;
@@ -7796,18 +6958,9 @@ static int dir_echo(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
-/* この条件式は、リンカが値を決める変数を見ているか。
- *
- * `-o` で命令フィールド型のリロケーションを出す箇所では、命令語のビット欄は 0 で
- * 出してリンカが埋める。つまりその変数の値はアセンブル時には確定しておらず、axx が
- * 持っているのは自分の仮レイアウト上の値にすぎない。その値に対する整列・範囲
- * チェックは判定できないものを判定していることになり、正しいソースまで弾く。範囲や
- * 整列が本当に外れていればリンカが報告する（例: `improper alignment for relocation
- * R_AARCH64_LDST64_ABS_LO12_NC`）ので、ここでは黙って通す。
- *
- * 対象は「その変数を読んでいる条件」だけ。同じ行の他のオペランドを見る条件
- * （PRFM の `p<0` 等）はそのまま働く。axx.py の
- * DirectiveProcessor._cond_tests_relocated_var() と同じ判定。 */
+/* そのエラー条件が、リンカが埋める変数を見ているか。`-o` では命令欄の値を
+   まだ 0 にしてあるので、その変数への範囲検査は意味を持たない。真になった
+   条件は報告しない。そうしないとリンク後には正しいコードが落ちてしまう。 */
 static int cond_tests_relocated_var(AsmState *st, const char *cond, size_t len){
     if(!st->elf_objfile[0]) return 0;
     for(int vi = 0; vi < g_nvars; vi++){
@@ -7819,8 +6972,6 @@ static int cond_tests_relocated_var(AsmState *st, const char *cond, size_t len){
         if(nl > len) continue;
         for(size_t b = 0; b + nl <= len; b++){
             if(memcmp(cond + b, nm, nl) != 0) continue;
-            /* 変数名は単独の語として現れたときだけ。`t` が `tmp` や `xt` の
-             * 一部であるものを拾わない。 */
             if(b > 0){
                 char c = cond[b - 1];
                 if(isalnum((unsigned char)c) || c == '_') continue;
@@ -7835,16 +6986,14 @@ static int cond_tests_relocated_var(AsmState *st, const char *cond, size_t len){
     return 0;
 }
 
+/* error_patterns 欄を評価する。`条件;コード` をカンマで並べたものを順に見る。
+   評価は浮動小数点モードで行う。 */
 static int dir_error(Assembler *asmb, const char *s){
     AsmState *st=&asmb->st;
     int has_content=0;
     for(const char*p=s;*p;p++) if(*p!=' '){has_content=1;break;}
     if(!has_content) return 0;
 
-    /* 破綻点修正: 固定長 char buf[4096] へ無言で切り詰めていたため、
-     * condition;errorcode の対応リストが4096バイトを超えるパターンファイルでは
-     * 条件とエラーコードの対応がずれ得た。他の箇所と同じく、収まらないときだけ
-     * ヒープへ逃がす。 */
     char stackbuf[4096];
     size_t l=strlen(s);
     char *buf = (l < sizeof(stackbuf)) ? stackbuf : malloc(l+1);
@@ -7856,23 +7005,13 @@ static int dir_error(Assembler *asmb, const char *s){
     while(1){
         if(!buf[idx]) break;
         if(buf[idx]==','){idx++;continue;}
-        /* 破綻点修正: axx.py の error() は idx が全く進まなかった場合に
-         * ループを打ち切る（axx.py:3235-3236）。ここにその歯止めが無かった
-         * ため、式評価器が1文字も消費できないトークン（例: 単独の ')'）で
-         * 無限ループに陥っていた（axx.py はこの歯止めで即座に打ち切る）。 */
         int idx_before = idx;
         int io;
-        /* 破綻点修正: エラーコード欄だけ整数モードで評価していた。axx.py は
-         * 条件とコードの両方を浮動小数点モードで評価するので、`.foo` のような
-         * `.` で始まる綴りの読まれ方が食い違い（浮動小数点モードでは `.` が
-         * リテラルの始まり、整数モードではラベル名の始まり）、caxx だけが
-         * "Label undefined: '.foo'" で中断していた。両方を浮動小数点モードで
-         * 評価し、コードは axx.py の int(t) と同じく切り捨てて整数にする。 */
         int prev_flt = st->exp_typ_float;
         st->exp_typ_float = 1;
         uint256_t u=expr_expression_pat(asmb,buf,idx,&io);
         idx=io;
-        int io_cond = io;          /* 条件式の終端。判定に条件の本文だけを渡す */
+        int io_cond = io;
         if(buf[idx]==';') idx++;
         uint256_t t=expr_expression_pat(asmb,buf,idx,&io);
         st->exp_typ_float = prev_flt;
@@ -7881,8 +7020,6 @@ static int dir_error(Assembler *asmb, const char *s){
         if((should_report_errors(st))&&!u256_is_zero(u)
            && !cond_tests_relocated_var(st, buf + idx_before,
                                         (size_t)(io_cond - idx_before))){
-            /* axx.py の int(t)（切り捨て）と同じ。非有限や 64bit に収まらない
-             * 値は axx.py が OverflowError を捕まえて 0 にするのに合わせる。 */
             double _tdv = u256_to_double(t);
             int64_t tc = (isfinite(_tdv) && _tdv > -9223372036854775808.0
                           && _tdv < 9223372036854775808.0) ? (int64_t)_tdv : 0;
@@ -7908,6 +7045,7 @@ static uint256_t expr_expression_esc_float(Assembler *asmb, const char *s,
 }
 
 
+/* 指定した番号の省略可能部分を、中身ごと取り除いた文字列を作る。 */
 static char *remove_brackets_str(const char *s, int *remove_idx, int nr){
     int len=(int)strlen(s);
     typedef struct { int serial; int pos; int is_open; } BP;
@@ -7945,12 +7083,11 @@ static char *remove_brackets_str(const char *s, int *remove_idx, int nr){
 }
 
 
+/* その位置でパターンが式捕捉を待っているか。 */
 static int pat_expects_expr(const char *t, int idx){
     while(t[idx]==' '||t[idx]=='\t') idx++;
     return t[idx]=='!';
 }
-/* .enum の式を、出現した要素だけ .setsym の値に束縛して評価する。
- * 現れた要素に .setsym が無ければ *ok_out=0（不一致）にする。 */
 static uint256_t enum_eval(Assembler *asmb, const EnumDef *ed,
                            const unsigned char *present, int *ok_out){
     AsmState *st=&asmb->st;
@@ -7961,8 +7098,6 @@ static uint256_t enum_eval(Assembler *asmb, const EnumDef *ed,
         if(!present[k]){ vals[k]=u256_zero(); continue; }
         uint256_t sv;
         if(!smap_get(&st->symbols, ed->names.data[k], &sv)){
-            /* 現れた要素に .setsym が無い ＝ パターンファイル側の書き損じ。
-             * 0 を黙って混ぜて誤ったバイトを出すより、不一致にして知らせる。 */
             free(vals);
             *ok_out = 0;
             return u256_zero();
@@ -7977,8 +7112,6 @@ static uint256_t enum_eval(Assembler *asmb, const EnumDef *ed,
     st->enum_bind_vals  = vals;
     int io=0;
     uint256_t r = expr_expression_pat(asmb, ed->expr, 0, &io);
-    /* expr_expression_pat() は expmode を戻さないので、照合中の EXP_ASM を
-     * 壊さないようここで自分で戻す。 */
     st->expmode = prev_expmode;
     st->expcaps = prev_expcaps;
     st->enum_bind_names = prev_names;
@@ -7988,10 +7121,7 @@ static uint256_t enum_eval(Assembler *asmb, const EnumDef *ed,
     return r;
 }
 
-/* `!L<名前>` が拾った文字を、その行ぶんのアリーナに写して位置を返す。
- * 入らなければ -1（そのときは `{{.exp(…)}}` が空文字を出す）。ポインタではなく
- * 位置で持つのは、候補パターンごとに vars[] を memcpy で退避・復元するためで、
- * アリーナはソース1行のあいだ動かないので位置は退避・復元しても有効である。 */
+/* `!L` が覚えるソースの綴りを置き場に積み、その位置を返す。 */
 static int captext_put(AsmState *st, const char *p, int n){
     if(n < 0) n = 0;
     if(st->captext_len + n + 1 > (int)sizeof(st->captext)) return -1;
@@ -8002,12 +7132,6 @@ static int captext_put(AsmState *st, const char *p, int n){
     return off;
 }
 
-/* `!E<変数>` の位置から列挙要素のリストを読む。
- * 受け付けるのは `A0`、`A0-A2`（列挙順での範囲）、およびそれらを `,` か `/` で
- * 並べたもの。区切り記号は「その先に要素名が続くとき」だけ消費するので、
- * `MOVEM !Ex,-(SP)` のようにパターン側が後ろで `,` を使っていても
- * リストの一部と取り違えない。
- * 成功時は 1 を返し、*val_out に値、*idx_out に読み終えた位置を入れる。 */
 static int enum_capture(Assembler *asmb, const EnumDef *ed, const char *s, int idx,
                         uint256_t *val_out, int *idx_out){
     const StrVec *names = &ed->names;
@@ -8029,7 +7153,6 @@ static int enum_capture(Assembler *asmb, const EnumDef *ed, const char *s, int i
                 for(int k=k1;k<=k2;k++) present[k]=1;
                 pos = e2;
             } else {
-                /* 範囲として読めない `-` は、減算などパターン側の続きに残す。 */
                 present[k1]=1;
             }
         } else {
@@ -8052,12 +7175,8 @@ static int enum_capture(Assembler *asmb, const EnumDef *ed, const char *s, int i
     return 1;
 }
 
-/* `!Y<集合>` の位置で、集合（`.setsym::x::AX,BX,CX`。中身は名前を項目に持つ
- * 配列シンボル）の項目名のうち、s の idx 位置から読める最長のものの番号を返す
- * （読めなければ -1）。直後が英数字・下線なら語の途中なので一致とみなさない
- * のは `!E` の enum_name_at() と同じ規則である。項目の綴りは書かれたままなので
- * （`[r0,r1]` は小文字のまま）、突き合わせは両側を大文字にして行う。数値の項目
- * は名前を持たないので照合の相手にしない。 */
+/* その位置にある集合の項目名を最長一致で読む（`!Y` の照合）。数値の項目は
+   名前を持たないので候補外。 */
 static int symset_item_at(const char *s, int idx, const struct ArrSym *ar, int *end_out){
     int best=-1, best_end=idx;
     for(int k=0;k<ar->len;k++){
@@ -8079,29 +7198,16 @@ static int symset_item_at(const char *s, int idx, const struct ArrSym *ar, int *
     return best;
 }
 
-/* ソース行 s_orig をパターン t_orig と照合する（字句解析なしの1文字ずつ突き合わせ）。
- * パターン側の文字の意味:
- *   大文字      大小無視でリテラル一致（ニーモニック）
- *   小文字1文字 .setsym のシンボル（レジスタ名等）を取る
- *   !x          任意の式を読んで変数 x に束縛
- *   !!x         式ではなく factor 1個だけを束縛
- *   !Fx/!Dx/!Qx 浮動小数点式を IEEE754 の 32/64/128bit として束縛
- *   !Lx         式・ラベル捕捉子。!x と同じに値を束縛し、そのうえでソースに
- *               書かれていたままの文字も覚える（{{.exp(x)}} が出す）
- *   !Ex         .enum で決めた列挙要素のリストを読み、その式の値を束縛
- *   !Yx[z]      集合 x の項目名を1つ読み、その番号を変数 z に束縛
- *   \c          次の1文字をリテラル扱い（エスケープ）
- * 成功時は具体度スコア (式の数, リテラル文字数, シンボル数) を st に残す。
- * 呼び出し側はこれが最も「具体的」なパターンを採用するので、パターンファイル内の
- * 記述順に依存しない。末尾まで両方使い切ったときだけ成功とする。 */
+/* ソース行とパターンを 1 文字ずつ突き合わせる本体。
+   トークナイザは無い。大文字・数字・記号は文字定数、小文字の名前はシンボル、
+   `!x` は式、`!!x` は因子、`!F/!D/!Q` は浮動小数点、`!L` は式とその綴り、
+   `!E` は列挙リスト、`!Y集合[変数]` は集合の項目番号。当たるたびに値を変数へ
+   束縛し、同時に特異度スコア (n_expr, -n_lit, n_sym) を数える。 */
 static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
     AsmState *st=&asmb->st;
     axx_copy_trunc(st->deb1, sizeof(st->deb1), s_orig);
     axx_copy_trunc(st->deb2, sizeof(st->deb2), t_orig);
 
-    /* 作業領域は使い回す。パターン側は省略可グループの印を落としながら
-     * そのまま写す（以前は strdup → 写し → もう1度写しの3本立てだった）。
-     * 末尾には番兵の '\0' を2つ置く（1文字先読みするところがある）。 */
     static ScratchBuf sb_s, sb_t;
     size_t s_len = strlen(s_orig), t_len = strlen(t_orig);
     char *s = sbuf_take(&sb_s, s_len + 2);
@@ -8160,10 +7266,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             prev_alnum=0;
             n_expr++;
             idx_t++;
-            /* 破綻点修正: パターンが `!` で終わっている等、変数名が無い／小文字で
-             * ない場合の不一致判定が無かった。axx.py は False を返して次の
-             * パターンを試すが、C は '\0' を変数名として扱い、代入も行われない
-             * まま照合を続けてしまっていた。 */
             if(idx_t >= tlen){ result=0; break; }
             a=t[idx_t]; idx_t++;
             if(a=='\0'){ result=0; break; }
@@ -8179,8 +7281,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 char stopchar = '\0';
                 if(idx_t < tlen && t[idx_t] == '\\'){
                     idx_t++;
-                    /* axx.py は `\` の直後の1文字をそのまま停止文字にする
-                     * （空白読み飛ばしを挟まない）ので、ここでも挟まない。 */
                     stopchar = (idx_t < tlen) ? t[idx_t] : '\0';
                     idx_t++;
                 }
@@ -8197,16 +7297,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                         }
                         fval = 0.0f;
                     }
-                    /* 破綻点修正: axx.py の !F/!D/!Q 捕捉は struct.pack した
-                     * ビット列を int.from_bytes() でただの Python int として
-                     * var_manager.put() に渡している（put_tagged ではない）。
-                     * つまり axx.py 自身、!D 等で束縛した変数をその後
-                     * error_patterns 等で比較・算術に使うときは「doubleの値」
-                     * ではなく「ビット列を整数値とみなした値」として扱われる
-                     * （これが axx.py の実際の挙動である以上、caxx.c 側も
-                     * "既にdoubleとして正しい" と特別扱いしてはいけない。
-                     * var_put_float ではなく var_put で is_float=0 のまま
-                     * 束縛する）。 */
                     uint32_t bits; memcpy(&bits, &fval, 4);
                     var_slot_put(st, vslot, u256_from_u64((uint64_t)bits));
                 } else if(ftype == 'D'){
@@ -8258,14 +7348,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 }
                 continue;
             } else if(a=='L'){
-                /* `!L<名前>` — 式・ラベル捕捉子。`!<名前>` と同じように式を1つ
-                 * 読んで値を束縛し、そのうえで「ソースに書かれていたままの文字」
-                 * も覚えておく。テキストテンプレートの `{{.exp(<名前>)}}` が
-                 * その文字をそのまま出す（3.5.2 節）。テキスト置換モード
-                 * （`.textmode`）では、拾った式の中の未定義ラベルをエラーにせず
-                 * 値を 0 にする。書き換え先のテキストに要るのは値ではなく綴り
-                 * そのものだからである。
-                 * axx.py の pat_match の `!L` 分岐と同じ規則である。 */
                 if(idx_t >= tlen){ result=0; break; }
                 int _nl = var_name_len(t+idx_t);
                 if(_nl == 0){ result=0; break; }
@@ -8286,7 +7368,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 uint256_t v = expr_expression_esc(asmb,s,idx_s,stopchar,&idx_s);
                 int _cap_undef_l = st->error_undefined_label;
                 st->elf_capturing_var = -1;
-                {   /* 拾った範囲の文字をそのまま覚える（前後の空白は落とす）。 */
+                {
                     int _b = idx_s_text_start, _e = idx_s;
                     if(stopchar && _e > _b && s[_e-1] == stopchar) _e--;
                     while(_b < _e && (s[_b]==' '||s[_b]=='\t')) _b++;
@@ -8295,8 +7377,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     st->vars[vslot].text_off = captext_put(st, s + _b, _e - _b);
                 }
                 if(st->textmode){
-                    /* テキストへ書き換えるだけの行なので、値が決まらないことは
-                     * 誤りではない。番兵を持ち回らず 0 にしておく。 */
                     st->error_undefined_label = _cap_prior_l;
                     if(_cap_undef_l || u256_is_undef_derived(v)) v = u256_zero();
                     var_slot_put_tagged(st,vslot,v,0);
@@ -8321,20 +7401,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 var_slot_put(st, vslot, ev);
                 continue;
             } else if(a=='Y'){
-                /* `!Y<集合>[<変数>]` — シンボル捕捉子。`.setsym::x::AX,BX,CX`
-                 * で作った集合（3.6.2 節）の項目名を1つ読み、その「番号」を
-                 * 変数に束縛する。`.check` が位置を集合の中の1つに限るのに
-                 * 対し、こちらは限るだけでなく何番目だったかを渡すので、
-                 * 別の配列を同じ番号で引ける。
-                 *
-                 *   .setsym::y::R0,R1,R2
-                 *   .setsym::x::AX,BX,CX
-                 *   MOV !Yx[z],!e::"mov {{y[z]}},0x{{.hex(e)}}"
-                 *
-                 * で `mov ax,0x12` は `mov R0,0x12` になる。
-                 * 集合が無い／項目名が読めない位置は不一致にする。
-                 * 具体度は式ではなくシンボルとして数える（取れる綴りが集合の
-                 * 項目に限られるので、`!a` のような式より具体的である）。 */
                 if(idx_t >= tlen){ result=0; break; }
                 int _sl = var_name_len(t+idx_t);
                 if(_sl == 0){ result=0; break; }
@@ -8344,8 +7410,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     _setkey[_i] = (char)axx_upper_char(t[idx_t+_i]);
                 _setkey[_sl] = '\0';
                 idx_t += _sl;
-                /* 束縛先の変数は `[` `]` で括って書く。集合の名前と別にして
-                 * おかないと、同じ綴りが集合にも変数にも要ることになる。 */
                 if(idx_t >= tlen || t[idx_t] != '['){ result=0; break; }
                 idx_t++;
                 int _nl = var_name_len(t+idx_t);
@@ -8381,8 +7445,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 var_slot_put_tagged(st,vslot,v,_cap_this_undef);
                 continue;
             } else {
-                /* `!name` の名前は小文字で始まり、小文字・数字・`_` が続く。
-                 * 直前で1文字だけ読み進めてあるので、そこから測り直す。 */
                 int _nl = var_name_len(t+idx_t-1);
                 if(_nl == 0){ result=0; break; }
                 int vslot = var_slot(t+idx_t-1, _nl, 1);
@@ -8392,7 +7454,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 char stopchar='\0';
                 if(idx_t<tlen && t[idx_t]=='\\'){
                     idx_t++;
-                    /* axx.py と同じく `\` の直後の1文字をそのまま停止文字にする。 */
                     stopchar=(idx_t<tlen) ? t[idx_t] : '\0';
                     idx_t++;
                 }
@@ -8409,7 +7470,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             }
         } else if(a>='a'&&a<='z'){
             prev_alnum=0;
-            /* シンボルを取る位置。名前は1文字でも `var_2` のように長くてもよい。 */
             int _nl = var_name_len(t+idx_t);
             int vi = var_slot(t+idx_t, _nl, 1);
             if(vi < 0){ result=0; break; }
@@ -8454,9 +7514,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             }
 
             if(!ok && n_named > 0){
-                /* 語として切り出せなかった／許可リストに無かった場合、
-                   許可リストの名前そのものを前方一致で取り直す。
-                   `MOVa1c3` のように区切り文字なしで連結された書き方を通すため。 */
                 int best_len = 0, best_si = -1;
                 for(int si = 0; si < cv_len; si++){
                     const char *nm = chk_at(cv, si);
@@ -8479,7 +7536,6 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
 
             if(!ok){
                 if(!allow_omit){ result=0; break; }
-                /* 省略とみなす。ソースは1文字も消費せず、変数は未代入(0)。 */
                 idx_s = prev_idx_s;
                 var_slot_put(st, vi, u256_zero());
                 n_sym++;
@@ -8512,11 +7568,11 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
     return result;
 }
 
+/* 省略可能部分の組み合わせを変えて試す。取り除く数を 0 個から増やすので、
+   省略可能部分は「できるだけ残す」方向から試される。群の数と組み合わせの
+   総数に上限があり、超えたパターンは不一致として扱って一度だけ警告する。
+   試行ごとに変数の束縛とラベル参照の記録を巻き戻す。 */
 static int pat_match0_brackets(Assembler *asmb, const char *s, const char *t_orig){
-    /* 省略可グループ `[[ ]]` を1つも持たないパターンは、試す組み合わせが
-     * 1通りしかない。組み合わせ表も、印の畳み込みも、括弧を落とした写しも
-     * 要らないので、そのまま照合へ回す（ほとんどのパターンがこの道を通る）。
-     * 退避・復元も呼び出し側（pat_match0_subs）と重なるので省く。 */
     {
         int has_grp = 0;
         for(const char *q=t_orig; q[0]; q++)
@@ -8551,14 +7607,6 @@ static int pat_match0_brackets(Assembler *asmb, const char *s, const char *t_ori
     const uint64_t MAX_COMBINATIONS = (uint64_t)1 << 16;
     uint64_t tried = 0;
 
-    /* `[[...]]` の省略可グループの組み合わせを、削除する個数の少ない順・
-     * 同じ個数なら添字の辞書順で試す（axx.py の
-     * `for i in range(len(sl)+1): for j in itertools.combinations(sl, i)` と同じ順）。
-     *
-     * 破綻点修正: 以前はビットマスクの昇順（0,1,2,3,...）で回していた。これは
-     * 削除個数の順ではないため、グループが3個以上あって複数の組み合わせが
-     * 一致する場合に採用される組み合わせが axx.py と食い違っていた
-     * （例: 3個なら Python は {3} を先に試すのに対し C は {1,2} を先に試す）。 */
     int found=0;
     int comb[MAX_OPT_GROUPS + 1];
     for(int size=0; size<=cnt && !found; size++){
@@ -8593,7 +7641,6 @@ static int pat_match0_brackets(Assembler *asmb, const char *s, const char *t_ori
         for(int k=0;k<size;k++) ri[nr++]=sl[comb[k]];
         char *lt=remove_brackets_str(t,ri,nr);
 
-        /* 1つの組み合わせが書いた分だけを控え、外れたらそこまで戻す。 */
         int mark_v   = vars_mark();
         int mark_v2l = v2l_mark();
         int saved_elf_refs_len = asmb->st.elf_refs_len;
@@ -8609,8 +7656,6 @@ static int pat_match0_brackets(Assembler *asmb, const char *s, const char *t_ori
         }
         free(lt);
 
-        /* 次の組み合わせ（同じ個数のまま辞書順で1つ進める）。
-           進められなければこの個数は打ち止め。 */
         int k = size - 1;
         while(k >= 0 && comb[k] == cnt - size + k) k--;
         if(k < 0) break;
@@ -8623,14 +7668,10 @@ combo_done:
     return found;
 }
 
-/* `!S{{名前}}<変数>` を探す。見つかれば開始位置を返し、*end に変数の次の位置、
- * name に表名、*var に変数名を書く。無ければ -1。 */
-/* `!S{{表名}}変数` を探す。変数名は1文字でも `var_2` のように長くてもよく、
- * 見つけた名前はスロット番号にして返す。 */
+/* パターン中の最初のサブ表参照を探す。逃がされたものは飛ばす。 */
 static int pat_find_sub_ref(const char *t, int start, int *end, char *name, size_t nsz, int *var){
     for(int i=start; t[i]; i++){
         if(!(t[i]=='!' && t[i+1]=='S' && t[i+2]=='{' && t[i+3]=='{')) continue;
-        /* `\!` とエスケープされていれば式ではなくリテラルの `!`。 */
         if(i>0 && t[i-1]=='\\') continue;
         const char *cb = strstr(t+i+4, "}}");
         if(!cb) return -1;
@@ -8649,8 +7690,8 @@ static int pat_find_sub_ref(const char *t, int start, int *end, char *name, size
     return -1;
 }
 
-/* サブ表の値欄を評価する。カンマ区切りで複数書かれていれば、先頭を上位として
- * `.bits` 幅ずつ詰めた1つの値にする（`0x01,0x02` は 8bit 幅なら 0x0102）。 */
+/* サブ表エントリの値リストを 1 つの値にまとめる。2 要素以上なら最初が
+   最上位になるよう `.bits` 幅ずつ詰める。 */
 static uint256_t pat_sub_value(Assembler *asmb, const char *expr){
     AsmState *st=&asmb->st;
     int bts = st->bts > 0 ? st->bts : 8;
@@ -8685,15 +7726,10 @@ static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
     char name[64]; int var; int end;
     int start = pat_find_sub_ref(t, 0, &end, name, sizeof(name), &var);
     if(start < 0){
-        /* 照合に失敗したときに戻すのは「この照合が書いた分」だけである
-           （vars / elf_var_to_label の巻き戻し記録を使う）。 */
         int mark_v   = vars_mark();
         int mark_v2l = v2l_mark();
         int saved_elf_refs_len = asmb->st.elf_refs_len;
         if(pat_match0_brackets(asmb, s, t)){
-            /* 値欄は照合成功後に評価する。項目のパターンが束縛した変数を
-             * 値欄から使えるようにするため。入れ子のときは内側から評価する
-             * ので、外側の値欄が内側の変数を使える。 */
             for(int k=nbinds-1;k>=0;k--)
                 var_slot_put(&asmb->st, binds[k].var, pat_sub_value(asmb, binds[k].val));
             return 1;
@@ -8712,7 +7748,7 @@ static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
         return 0;
     }
     SubDef *d = subv_find(&asmb->st.subs, name);
-    if(d && d->freed) d = NULL;   /* `.free` で解放済み */
+    if(d && d->freed) d = NULL;
     if(!d){
         axx_diagf(1, 0, " error - !S{{%s}}: no sub table named '%s' (define it with "
                    "'.sub::%s ... .return').\n", name, name, name);
@@ -8737,6 +7773,9 @@ static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
     return 0;
 }
 
+/* サブ表参照を実際の選択肢に展開して順に試す。エントリのパターンがさらに
+   別の表を参照していれば再帰する。連鎖は 8 段まで。失敗した試行のぶんは
+   すべて巻き戻す。 */
 static int pat_match0(Assembler *asmb, const char *s, const char *t_orig){
     SubBind binds[SUB_MAX_DEPTH];
     return pat_match0_subs(asmb, s, t_orig, binds, 0, 0);
@@ -8752,6 +7791,7 @@ static void axx_resolve_path(const char *base_dir, const char *fn,
     snprintf(out, osz, "%s/%s", base_dir, fn);
 }
 
+/* パスのディレクトリ部分を取る。 */
 static void axx_dir_of(const char *path, char *out, size_t osz)
 {
     snprintf(out, osz, "%s", path ? path : "");
@@ -8759,10 +7799,7 @@ static void axx_dir_of(const char *path, char *out, size_t osz)
     if(d != out) memmove(out, d, strlen(d) + 1);
 }
 
-/* os.path.dirname(os.path.abspath(path)) と同じ。パターンファイルの
- * `.INCLUDE` を解決する基準ディレクトリは axx.py が絶対パスで持つので、
- * 診断に出る綴り（`'././a.axx'` 対 `'/…/w2/./a.axx'`）をそろえるために
- * こちらも絶対パスにする。循環の検出自体は realpath で行うので変わらない。 */
+/* パスのディレクトリ部分を絶対パスで取る。 */
 static void axx_abs_dir_of(const char *path, char *out, size_t osz)
 {
     char abs_buf[2*PATH_MAX + 2];
@@ -8793,6 +7830,8 @@ static char **pat_macro_expand(FILE *f, const char *display, int *nlines);
 static void pat_macro_expand_free(char **v, int n);
 static void macro_reset_pass_pattern(void);
 
+/* `.INCLUDE` を処理する。相対パスはそのファイルのある場所から解決し、
+   入れ子の深さと循環を検査する。 */
 static void include_pat(Assembler *asmb, const char *l, const char *base_dir){
     int idx=axx_skipspc(l,0);
     char upper8[16]={0};
@@ -8821,10 +7860,7 @@ static void include_pat(Assembler *asmb, const char *l, const char *base_dir){
     readpat(asmb, resolved);
 }
 
-/* `!S{{名前}}` の参照を読み込み時に検算する。
- * 照合中に出した診断は「採用されなかった候補のもの」として捨てられるので、
- * 名前の綴り違いや循環参照はそのままだと全行が素の Syntax error になる。
- * パターンファイル側の誤りはここで一度だけ報告する。 */
+/* 未知のサブ表名を報告する。 */
 static void sub_check_unknown(Assembler *asmb, const char *where, const char *t){
     char name[64]; int var; int end, i = 0;
     while((i = pat_find_sub_ref(t, i, &end, name, sizeof(name), &var)) >= 0){
@@ -8836,6 +7872,7 @@ static void sub_check_unknown(Assembler *asmb, const char *where, const char *t)
     }
 }
 
+/* サブ表参照の循環をたどって見つける。 */
 static void sub_walk_cycle(Assembler *asmb, int idx, char *mark, int *stack, int nstack){
     SubVec *sv = &asmb->st.subs;
     if(mark[idx] == 2) return;
@@ -8865,6 +7902,9 @@ static void sub_walk_cycle(Assembler *asmb, int idx, char *mark, int *stack, int
     mark[idx] = 2;
 }
 
+/* サブ表参照が解決できるかを読み込み時に一度だけ検査する。表は使用箇所より
+   後に定義してよいので、ファイル全体を読んでから見る。ここで報告しておけば
+   照合中に毎行同じ診断が出ることはない。 */
 static void check_sub_refs(Assembler *asmb){
     SubVec *sv = &asmb->st.subs;
     for(int i = 0; i < asmb->st.pat.len; i++){
@@ -8885,13 +7925,6 @@ static void check_sub_refs(Assembler *asmb){
     free(mark); free(stack);
 }
 
-/* ==================== ミニ言語: 実装 ====================
- * `.func::名前::引数 … .endfunc` で定義し、`binary_list` 欄の
- * `.call 名前(引数,…)` から呼ぶ。`.emit` した値がその位置のワードになる。
- * `.return` / `.return 式` は本体中どこでも(トップレベルでも `.if`/`.while`/
- * `.for` の中でも、何回でも)書ける早期リターン文で、関数の終わりを示す
- * ものではない。本体そのものを閉じるのは `.endfunc` だけ。
- * axx.py の MiniParser / MiniInterp の移植で、同じ入力に同じ値を出す。 */
 
 enum {
     MINI_MAX_STEPS = 4000000,
@@ -8902,28 +7935,26 @@ enum {
 };
 
 typedef enum { MT_END, MT_NUM, MT_NAME, MT_DOT, MT_OP, MT_STR, MT_CORE } MTKind;
-/* 字句1個ぶん。
- * 破綻点修正: s は以前 char[512] で、名前・記号名・文字列がそれを超えると
- * "name is too long" 等で打ち切っていた。axx.py に長さ制限は無いので、
- * 同じ入力で caxx だけが失敗していた。字句の本文は行ごとの作業領域
- * (MiniLexBuf) に置き、ここは指すだけにする。字句は行の中の互いに重ならない
- * 範囲なので、作業領域は行長から決まる。 */
 typedef struct { MTKind k; uint256_t num; char *s; } MTok;
 
-/* 1行ぶんの字句列と、その本文を置く作業領域。使い回す。 */
 typedef struct { MTok *tok; int tcap; char *text; size_t tsz; } MiniLexBuf;
 
 typedef struct {
     jmp_buf     jb;
     int         jb_active;
-    /* 破綻点修正: err は char[512] で、長い式や長い名前を含むメッセージを
-     * 切り詰めていた（axx.py は切り詰めない）。必要な長さぶん取る。
-     * 所有者は mini_fail で、読み終えた側が free する。 */
     char       *err;
     const char *file;
     int         line;
 } MiniCtx;
 
+/* ---- ミニ言語 (.func / .call) -------------------------------------------
+   `binary_list` から `.call` で呼ばれる小さな手続き型言語。チューリング完全
+   なので、文の数・呼び出しの入れ子・出力ワード数・配列長に上限を置いて、
+   バグのあるパターンファイルがアセンブラを止められなくするのを防ぐ。
+   整数は 256bit で回り込む。パターン変数はここでは使えないので、必要なら
+   `.call` の引数として渡す。
+   ------------------------------------------------------------------------ */
+/* ミニ言語の実行時エラー。行と桁を添える。 */
 static void mini_fail(MiniCtx *c, const char *fmt, ...){
     va_list ap;
     char bodybuf[400];
@@ -8952,35 +7983,37 @@ static void mini_fail(MiniCtx *c, const char *fmt, ...){
     exit(1);
 }
 
+/* ミニ言語用の確保。失敗したら止まる。 */
 static void *mini_alloc(size_t n){
     void *p = calloc(1, n);
     if(!p){ perror("calloc"); exit(1); }
     return p;
 }
 
+/* 文字列を複製する。 */
 static char *mini_strdup(const char *s){
     char *p = strdup(s ? s : "");
     if(!p){ perror("strdup"); exit(1); }
     return p;
 }
 
-/* --------------------------- 値 --------------------------- */
 
-/* ミニ言語の値を、マクロ層の `!echo` と同じ体裁の文字列にする。整数は符号つき
- * 10 進、配列は `[1, 2, 3]`。返り値は free() すること。 */
 static char *mini_echo_text(MiniVal *v);
 
+/* 値を解放する（配列なら中身ごと）。 */
 static void mini_val_free(MiniVal *v){
     if(v->arr) free(v->arr);
     v->arr = NULL; v->n = v->cap = 0; v->is_arr = 0;
 }
 
+/* 数値の値を作る。 */
 static MiniVal mini_num(uint256_t x){
     MiniVal v; memset(&v, 0, sizeof(v));
     v.num = x;
     return v;
 }
 
+/* 値を複製する。配列はコピーとして渡る。 */
 static MiniVal mini_val_copy(const MiniVal *src){
     MiniVal v; memset(&v, 0, sizeof(v));
     v.is_arr = src->is_arr;
@@ -8993,6 +8026,7 @@ static MiniVal mini_val_copy(const MiniVal *src){
     return v;
 }
 
+/* 配列を必要な長さまで伸ばす（上限あり）。 */
 static void mini_arr_reserve(MiniVal *v, int want){
     if(want <= v->cap) return;
     int cap = v->cap ? v->cap : 8;
@@ -9002,13 +8036,12 @@ static void mini_arr_reserve(MiniVal *v, int want){
     v->arr = na; v->cap = cap;
 }
 
+/* `.echo` に出す形に整える。 */
 static char *mini_echo_text(MiniVal *v){
     if(!v->is_arr){
         char cb[96]; u256_to_pydec(v->num, cb, sizeof(cb));
         return mini_strdup(cb);
     }
-    /* 1 要素あたり 256bit 符号つき 10 進は最長 78 桁 + 符号。区切りの ", " を
-     * 足して 98 文字を見ておけば足りる。 */
     size_t cap = (size_t)v->n * 98 + 4;
     char *b = mini_alloc(cap);
     size_t len = 0;
@@ -9024,8 +8057,8 @@ static char *mini_echo_text(MiniVal *v){
     return b;
 }
 
-/* --------------------------- 字句 --------------------------- */
 
+/* 数字の並びをその基数で読む。 */
 static uint256_t mini_digits(const char *s, int from, int to, int base){
     uint256_t acc = u256_zero();
     uint256_t b = u256_from_u64((uint64_t)base);
@@ -9041,6 +8074,7 @@ static uint256_t mini_digits(const char *s, int from, int to, int base){
     return acc;
 }
 
+/* 字句解析のバッファを確保する。 */
 static void minilex_ensure(MiniLexBuf *b, int len){
     int need_tok = len + 2;
     if(b->tcap < need_tok){
@@ -9056,6 +8090,7 @@ static void minilex_ensure(MiniLexBuf *b, int len){
     }
 }
 
+/* ミニ言語の 1 行をトークンに割る。位置も覚える。 */
 static int mini_lex(MiniCtx *c, const char *t, MiniLexBuf *b){
     static const char *ops2[] = { "**","<<",">>","<=",">=","==","!=","&&","||", NULL };
     int n = 0, i = 0;
@@ -9064,7 +8099,6 @@ static int mini_lex(MiniCtx *c, const char *t, MiniLexBuf *b){
     MTok *out = b->tok;
     char *txt = b->text;
     size_t off = 0;
-    /* 次の字句の本文を置く場所を用意する（呼ぶたびに off を進める）。 */
     #define MLX_BEGIN() (out[n].s = txt + off)
     #define MLX_PUT(ch_) (txt[off++] = (ch_))
     #define MLX_END()    (txt[off++] = '\0')
@@ -9100,8 +8134,6 @@ static int mini_lex(MiniCtx *c, const char *t, MiniLexBuf *b){
             n++; i = j; continue;
         }
         if(ch == '$'){
-            /* `$$` / `$.` は本体の式評価器が持つ項。ここでは字面を覚えるだけで、
-             * 実際の値は評価時に本体へ渡して求める。 */
             if(t[i+1] == '$' || t[i+1] == '.'){
                 out[n].k = MT_CORE;
                 MLX_BEGIN(); MLX_PUT(t[i]); MLX_PUT(t[i+1]); MLX_END();
@@ -9111,7 +8143,6 @@ static int mini_lex(MiniCtx *c, const char *t, MiniLexBuf *b){
                          "(start of the next instruction)");
         }
         if(ch == '#'){
-            /* `#name` も本体の式評価器が持つ項（`.setsym` の記号）。 */
             int j = i + 1;
             while(j < len && (isalnum((unsigned char)t[j]) || t[j] == '_'
                               || t[j] == '.' || t[j] == '$')) j++;
@@ -9123,8 +8154,6 @@ static int mini_lex(MiniCtx *c, const char *t, MiniLexBuf *b){
             n++; i = j; continue;
         }
         if(ch == '"'){
-            /* 文字列リテラル。値は整数と配列だけなので、書けるのは `.echo` の
-             * 引数欄だけである（式の中に現れたら mxp_primary が弾く）。 */
             int j = i + 1;
             MLX_BEGIN();
             for(;;){
@@ -9177,8 +8206,6 @@ static int mini_lex(MiniCtx *c, const char *t, MiniLexBuf *b){
             MLX_BEGIN(); MLX_PUT(ch); MLX_END();
             n++; i++; continue;
         }
-        /* 破綻点修正: axx.py は `{c!r}` と Python の repr で出すので、`'` 自身は
-         * `"'"` になる。ここは常に `'...'` で括っていて文面が食い違っていた。 */
         { char _cs[2] = { ch, 0 }; char _cr[16]; m_pyrepr(_cs, _cr, sizeof(_cr));
           mini_fail(c, "unexpected character %s", _cr); }
     }
@@ -9190,27 +8217,30 @@ static int mini_lex(MiniCtx *c, const char *t, MiniLexBuf *b){
     return n;
 }
 
-/* --------------------------- 式の構文解析 --------------------------- */
 
 typedef struct { MTok *t; int n; int i; MiniCtx *c; } MXP;
 
 static MExpr *mxp_or(MXP *p);
 
+/* 式の節を 1 つ作る。 */
 static MExpr *mx_new(MXKind k){
     MExpr *e = mini_alloc(sizeof(MExpr));
     e->k = k;
     return e;
 }
 
+/* 次がその演算子か。 */
 static int mxp_is_op(MXP *p, const char *op){
     return p->i < p->n && p->t[p->i].k == MT_OP && strcmp(p->t[p->i].s, op) == 0;
 }
 
+/* 次がその演算子なら消費して真。 */
 static int mxp_eat(MXP *p, const char *op){
     if(mxp_is_op(p, op)){ p->i++; return 1; }
     return 0;
 }
 
+/* その演算子を必ず消費する。 */
 static void mxp_expect(MXP *p, const char *op){
     if(!mxp_eat(p, op)){
         if(p->i < p->n) mini_fail(p->c, "expected '%s', found '%s'", op, p->t[p->i].s);
@@ -9220,6 +8250,7 @@ static void mxp_expect(MXP *p, const char *op){
 
 static int mxp_end(MXP *p){ return p->i >= p->n; }
 
+/* 項そのもの。数値、名前、括弧、配列リテラル、`.call`、組み込み。 */
 static MExpr *mxp_primary(MXP *p){
     if(mxp_end(p)) mini_fail(p->c, "expected a value, found end of line");
     MTok *tk = &p->t[p->i];
@@ -9237,7 +8268,6 @@ static MExpr *mxp_primary(MXP *p){
             return e;
         }
         if(strcmp(tk->s, ".CALL") == 0){
-            /* 式の途中の `.call 名前(引数, ...)`。呼んだ関数の返り値になる。 */
             p->i++;
             if(p->i >= p->n || p->t[p->i].k != MT_NAME)
                 mini_fail(p->c, "'.call' needs a function name");
@@ -9259,8 +8289,6 @@ static MExpr *mxp_primary(MXP *p){
             mxp_expect(p, ")");
             return e;
         }
-        /* 破綻点修正: axx.py は `{v.lower()!r}` と、小文字化してから Python の
-         * repr で出す。ここは大文字化した綴りを `'...'` で括っていた。 */
         { size_t _n = strlen(tk->s);
           char *_lo = mini_alloc(_n + 1);
           for(size_t _i=0;_i<_n;_i++) _lo[_i] = (char)tolower((unsigned char)tk->s[_i]);
@@ -9296,6 +8324,7 @@ static MExpr *mxp_primary(MXP *p){
     return NULL;
 }
 
+/* 後置の添字 `名前[式]`。 */
 static MExpr *mxp_postfix(MXP *p){
     MExpr *e = mxp_primary(p);
     while(mxp_is_op(p, "[")){
@@ -9320,6 +8349,7 @@ static MExpr *mxp_postfix(MXP *p){
 
 static MExpr *mxp_unary(MXP *p);
 
+/* `**`。 */
 static MExpr *mxp_power(MXP *p){
     MExpr *e = mxp_postfix(p);
     if(mxp_is_op(p, "**")){
@@ -9331,6 +8361,7 @@ static MExpr *mxp_power(MXP *p){
     return e;
 }
 
+/* 単項 `-` `+` `~`。 */
 static MExpr *mxp_unary(MXP *p){
     if(mxp_is_op(p, "-") || mxp_is_op(p, "+") || mxp_is_op(p, "~")){
         char op[3]; strcpy(op, p->t[p->i].s);
@@ -9343,8 +8374,8 @@ static MExpr *mxp_unary(MXP *p){
     return mxp_power(p);
 }
 
+/* 二項演算子の 1 段。表で優先順位を回す。 */
 static MExpr *mxp_binlevel(MXP *p, int level){
-    /* level: 0=| 1=^ 2=& 3=shift 4=add 5=mul */
     static const char *tbl[6][3] = {
         { "|",  NULL, NULL },
         { "^",  NULL, NULL },
@@ -9370,6 +8401,7 @@ static MExpr *mxp_binlevel(MXP *p, int level){
     return e;
 }
 
+/* 比較。 */
 static MExpr *mxp_cmp(MXP *p){
     static const char *ops[] = { "==","!=","<=",">=","<",">", NULL };
     MExpr *e = mxp_binlevel(p, 0);
@@ -9386,6 +8418,7 @@ static MExpr *mxp_cmp(MXP *p){
     return e;
 }
 
+/* 単項 `!`。 */
 static MExpr *mxp_not(MXP *p){
     if(mxp_is_op(p, "!")){
         p->i++;
@@ -9397,6 +8430,7 @@ static MExpr *mxp_not(MXP *p){
     return mxp_cmp(p);
 }
 
+/* `&&`。 */
 static MExpr *mxp_and(MXP *p){
     MExpr *e = mxp_not(p);
     while(mxp_is_op(p, "&&")){
@@ -9408,6 +8442,7 @@ static MExpr *mxp_and(MXP *p){
     return e;
 }
 
+/* `||`。 */
 static MExpr *mxp_or(MXP *p){
     MExpr *e = mxp_and(p);
     while(mxp_is_op(p, "||")){
@@ -9419,15 +8454,14 @@ static MExpr *mxp_or(MXP *p){
     return e;
 }
 
+/* 式を 1 個解析する。 */
 static MExpr *mxp_full(MXP *p){
     MExpr *e = mxp_or(p);
     if(!mxp_end(p)) mini_fail(p->c, "unexpected '%s' in expression", p->t[p->i].s);
     return e;
 }
 
-/* `(` の直後から `)` までのカンマ区切りの式を読む。 */
-/* `.echo` の引数欄。項目は文字列リテラルか式。文字列は MX_STR のまま持ち回り、
- * 表示のときだけ取り出す（式としては評価しない）。 */
+/* `.echo` の引数（文字列と式の混在）を解析する。 */
 static void mxp_echo_arglist(MXP *p, MExpr ***outv, int *outn){
     mxp_expect(p, "(");
     int cap = 0;
@@ -9452,6 +8486,7 @@ static void mxp_echo_arglist(MXP *p, MExpr ***outv, int *outn){
     mxp_expect(p, ")");
 }
 
+/* カンマ区切りの式の並びを解析する。 */
 static void mxp_arglist(MXP *p, MExpr ***outv, int *outn){
     mxp_expect(p, "(");
     int cap = 0;
@@ -9469,20 +8504,16 @@ static void mxp_arglist(MXP *p, MExpr ***outv, int *outn){
     mxp_expect(p, ")");
 }
 
-/* --------------------------- 文の構文解析 --------------------------- */
 
 typedef struct {
     MiniFunc *f;
     int       i;
     MiniCtx  *c;
-    /* 字句の作業領域。msp_block はブロックの深さぶん再帰するので、各段で
-     * 自動変数に取るとスタックが尽きる（40段ほどで落ちていた）。解析は
-     * 1 行ぶんずつ完結し、式は木に写してから次の段へ進むので、1本を
-     * 使い回して構わない。長さは行ごとに必要なだけ伸ばす。 */
     MiniLexBuf *tok;
-    int       loopdepth;   /* `.break` / `.continue` が書ける深さ */
+    int       loopdepth;
 } MSP;
 
+/* 文の並びに 1 つ積む。 */
 static void ms_push(MStmt ***v, int *n, int *cap, MStmt *s){
     if(*n >= *cap){
         *cap = *cap ? *cap * 2 : 8;
@@ -9492,6 +8523,7 @@ static void ms_push(MStmt ***v, int *n, int *cap, MStmt *s){
     (*v)[(*n)++] = s;
 }
 
+/* 文の節を 1 つ作る。 */
 static MStmt *ms_new(MSKind k, MSP *p, int li){
     MStmt *s = mini_alloc(sizeof(MStmt));
     s->k = k;
@@ -9500,6 +8532,7 @@ static MStmt *ms_new(MSKind k, MSP *p, int li){
     return s;
 }
 
+/* 行頭のドット付きキーワードを大文字で取り出す。 */
 static void mini_dotkw(const char *s, char *out, size_t osz){
     int i = axx_skipspc(s, 0);
     out[0] = 0;
@@ -9512,6 +8545,7 @@ static void mini_dotkw(const char *s, char *out, size_t osz){
     out[n] = 0;
 }
 
+/* それがブロックを閉じるキーワードか。 */
 static int mini_is_ender(const char *kw){
     return strcmp(kw, ".ELIF") == 0 || strcmp(kw, ".ELSE") == 0
         || strcmp(kw, ".ENDIF") == 0
@@ -9522,7 +8556,6 @@ static void msp_block(MSP *p, const char *e1, const char *e2, const char *e3,
                       MStmt ***outv, int *outn);
 static MStmt *msp_if_chain(MSP *p, int li);
 
-/* `.call 名前(引数, ...)` の後半を読む。toks[0] は '.CALL'。 */
 static void ms_call_tail(MiniCtx *c, MTok *toks, int n, char **namep,
                          MExpr ***argv, int *argn){
     if(n < 2 || toks[1].k != MT_NAME) mini_fail(c, "'.call' needs a function name");
@@ -9532,6 +8565,7 @@ static void ms_call_tail(MiniCtx *c, MTok *toks, int n, char **namep,
     if(!mxp_end(&ep)) mini_fail(c, "unexpected text after '.call'");
 }
 
+/* 単純文 1 個を解析する。代入、`.emit`、`.echo`、`.raise`、`.return` など。 */
 static MStmt *msp_simple(MSP *p, int li){
     MiniCtx *c = p->c;
     const char *text = p->f->lines[li];
@@ -9552,8 +8586,6 @@ static MStmt *msp_simple(MSP *p, int li){
             return s;
         }
         if(strcmp(kw, ".RAISE") == 0){
-            /* `.raise n` … error_patterns 欄の `条件;n` と同じ形でエラーコード n を
-             * 報告する。`.error::n::"文言"` で登録した文言もそのまま使われる。 */
             if(n <= 1) mini_fail(c, "'.raise' needs an error code");
             MStmt *s = ms_new(MS_RAISE, p, li);
             MXP ep; ep.t = toks + 1; ep.n = n - 1; ep.i = 0; ep.c = c;
@@ -9610,8 +8642,6 @@ static MStmt *msp_simple(MSP *p, int li){
             if(s->nnames == 0) mini_fail(c, "'.nonlocal' needs variable names");
             return s;
         }
-        /* 破綻点修正: axx.py は `{v.lower()!r}` と、小文字化してから Python の
-         * repr で出す。ここは大文字化した綴りを `'...'` で括っていた。 */
         { char _kl[256]; size_t _ki = 0;
           for(; kw[_ki] && _ki + 1 < sizeof(_kl); _ki++)
               _kl[_ki] = (char)tolower((unsigned char)kw[_ki]);
@@ -9633,7 +8663,6 @@ static MStmt *msp_simple(MSP *p, int li){
         mxp_expect(&ep, "=");
         MTok *rt = ep.t + ep.i;
         int rn = ep.n - ep.i;
-        /* `var = .call f(...)` は呼んだ関数の返り値を代入する。 */
         if(rn > 0 && rt[0].k == MT_DOT && strcmp(rt[0].s, ".CALL") == 0){
             s->k = MS_CALLASSIGN;
             ms_call_tail(c, rt, rn, &s->fname, &s->args, &s->nargs);
@@ -9645,10 +8674,7 @@ static MStmt *msp_simple(MSP *p, int li){
     }
 }
 
-/* `.if` / `.elif` の 1 段を読む。戻り値の文を返した時点で p->i は対応する
- * `.endif` の行を指している。`.elif` は「`.else` の中に `.if` が 1 つだけある」
- * 形へ展開するので、連鎖の途中では `.endif` を読み飛ばさない。1 行進めるのは
- * いちばん外側の呼び出し元（msp_block）だけでよい。 */
+/* `.if` / `.elif` / `.else` / `.endif` の連なりを解析する。 */
 static MStmt *msp_if_chain(MSP *p, int li){
     MiniCtx *c = p->c;
     char kw[32];
@@ -9766,14 +8792,13 @@ static void msp_block(MSP *p, const char *e1, const char *e2, const char *e3,
     }
 }
 
-/* 本体の行を文の木にする。エラーは *errout に書いて 0 を返す。 */
-/* 字句の作業領域。解析は 1 関数ずつ順に走るので 1 本で足りる。
- * msp_block の再帰段ごとに自動変数で持つとスタックが尽きるため外に出す。 */
+/* 字句解析のバッファを使い回すために 1 個だけ持つ。 */
 static MiniLexBuf *mini_tokbuf(void){
     static MiniLexBuf buf;
     return &buf;
 }
 
+/* `.func` の本文を文の構文木にする。 */
 static int mini_compile_func(MiniFunc *f, char **errout){
     MiniCtx c;
     MiniLexBuf *tokbuf = mini_tokbuf();
@@ -9781,7 +8806,6 @@ static int mini_compile_func(MiniFunc *f, char **errout){
     c.file = f->file; c.line = f->line;
     c.jb_active = 1;
     if(setjmp(c.jb)){
-        /* 破綻点修正: 固定長へ写して切り詰めていた。所有権を呼び出し側へ渡す。 */
         *errout = c.err;
         f->body = NULL; f->nbody = 0;
         return 0;
@@ -9795,7 +8819,6 @@ static int mini_compile_func(MiniFunc *f, char **errout){
     return 1;
 }
 
-/* --------------------------- 実行 --------------------------- */
 
 typedef struct { char *name; MiniVal v; } MiniBind;
 
@@ -9812,9 +8835,9 @@ typedef struct {
     long       steps;
     MiniFrame *frames; int nframes, cframes;
     int        returning;
-    int        loopctl;  /* 1 = `.break` 実行中, 2 = `.continue` 実行中 */
-    MiniVal    retval;   /* 直前の `.return 式` の値。整数でも配列でもよい */
-    int        has_ret;  /* retval が有効か。値なしの `.return` なら 0 */
+    int        loopctl;
+    MiniVal    retval;
+    int        has_ret;
 } MiniRun;
 
 static MiniVal mini_eval(MiniRun *r, MExpr *e);
@@ -9824,9 +8847,7 @@ static void mini_call_func(MiniRun *r, MiniFunc *f, MiniVal *args, int nargs);
 
 static void mini_at(MiniRun *r, MStmt *s){ r->c.file = s->file; r->c.line = s->line; }
 
-/* 添字やスライス境界のように「範囲外なら丸める」場所で使う飽和変換。
- * axx.py は多倍長のまま比較するので、long long に収まらない値でエラーに
- * せず、符号の向きに振り切った値として扱えば同じ結果になる。 */
+/* 256bit 値を long long に飽和させて落とす。 */
 static long long mini_to_ll_sat(uint256_t v){
     if(u256_is_neg256(v)){
         uint256_t p = u256_neg(v);
@@ -9837,6 +8858,7 @@ static long long mini_to_ll_sat(uint256_t v){
     return (long long)u256_to_u64(v);
 }
 
+/* 256bit 値を long long にする。範囲外はエラーにする。 */
 static long long mini_to_ll(MiniRun *r, uint256_t v){
     if(u256_is_neg256(v)){
         uint256_t p = u256_neg(v);
@@ -9849,6 +8871,7 @@ static long long mini_to_ll(MiniRun *r, uint256_t v){
     return (long long)u256_to_u64(v);
 }
 
+/* 数値を要求する。配列が来たらエラーにする。 */
 static uint256_t mini_need_num(MiniRun *r, MiniVal v, const char *what){
     if(v.is_arr){
         mini_val_free(&v);
@@ -9857,6 +8880,7 @@ static uint256_t mini_need_num(MiniRun *r, MiniVal v, const char *what){
     return v.num;
 }
 
+/* その名前を持つスコープを探す。 */
 static MiniFrame *mini_frame_for(MiniRun *r, const char *name, int *found){
     MiniFrame *top = &r->frames[r->nframes - 1];
     *found = 1;
@@ -9871,12 +8895,14 @@ static MiniFrame *mini_frame_for(MiniRun *r, const char *name, int *found){
     return NULL;
 }
 
+/* スコープの中で名前を引く。 */
 static MiniBind *mini_find(MiniFrame *fr, const char *name){
     for(int i = 0; i < fr->nvars; i++)
         if(strcmp(fr->vars[i].name, name) == 0) return &fr->vars[i];
     return NULL;
 }
 
+/* スコープに名前を 1 つ作る。 */
 static MiniBind *mini_bind_new(MiniFrame *fr, const char *name){
     if(fr->nvars >= fr->cvars){
         fr->cvars = fr->cvars ? fr->cvars * 2 : 8;
@@ -9889,13 +8915,8 @@ static MiniBind *mini_bind_new(MiniFrame *fr, const char *name){
     return b;
 }
 
-/* `$$` `$.` `#記号` ラベル名を本体の式評価器に評価してもらう。
- * ミニ言語は本体と同じ 256bit の値を扱うので、結果はそのまま使える。
- * 能力記述子は CAPS_MINI。パターン変数 a〜z と `!!!` は `.func` の本体が
- * 走っている時点では束縛されていないか意味を持たないので、そこで落とす。
- * 未定義ラベル由来の値は 0 にする。`.call` の引数を評価するときと同じ扱いで、
- * 番兵の巨大な値で反復回数が爆発するのを防ぐ。
- * axx.py の MiniInterp._core_eval と同じ。 */
+/* 本体の式評価器に委譲する（ラベル・`$$`・`#記号` を読むため）。未定義ラベル
+   由来の値は 0 にして、巨大な番兵をミニ言語の演算へ流し込まない。 */
 static uint256_t mini_core_eval(MiniRun *r, const char *text){
     if(!r->asmb) mini_fail(&r->c, "'%s' is not available here", text);
     int io = 0;
@@ -9904,7 +8925,7 @@ static uint256_t mini_core_eval(MiniRun *r, const char *text){
     return v;
 }
 
-/* その名前をアセンブラ本体が知っているか（ラベル / `.setsym` 記号）。 */
+/* その名前が本体側（ラベル・シンボル・前回の反復の値）にあるか。 */
 static int mini_core_name(MiniRun *r, const char *name){
     if(!r->asmb) return 0;
     AsmState *st = &r->asmb->st;
@@ -9918,6 +8939,8 @@ static int mini_core_name(MiniRun *r, const char *name){
     return 0;
 }
 
+/* 変数を読む。無ければ本体側の名前として解決を試みる。パス2で本体側にも
+   無い名前は「設定前に使われた」エラーにする。 */
 static MiniVal mini_get(MiniRun *r, const char *name){
     int found;
     MiniFrame *fr = mini_frame_for(r, name, &found);
@@ -9925,10 +8948,6 @@ static MiniVal mini_get(MiniRun *r, const char *name){
         mini_fail(&r->c, "'.nonlocal %s' found no enclosing definition of '%s'", name, name);
     MiniBind *b = mini_find(fr, name);
     if(!b){
-        /* ローカルに無い名前は、アセンブラ本体のラベル / `.setsym` 記号として
-         * 読み直す。パス2では本体の表が揃っているので「そんな名前は無い」と
-         * 断定でき、綴り間違いは従来どおりミニ言語のエラーになる。パス1では
-         * まだ前方参照が埋まっていないので、判断を本体側に預ける。 */
         if(r->asmb && (mini_core_name(r, name) || r->asmb->st.pas != 2))
             return mini_num(mini_core_eval(r, name));
         mini_fail(&r->c, "'%s' is used before it is set", name);
@@ -9936,6 +8955,7 @@ static MiniVal mini_get(MiniRun *r, const char *name){
     return mini_val_copy(&b->v);
 }
 
+/* 変数へ代入する。 */
 static void mini_set(MiniRun *r, const char *name, MiniVal v){
     int found;
     MiniFrame *fr = mini_frame_for(r, name, &found);
@@ -9949,7 +8969,7 @@ static void mini_set(MiniRun *r, const char *name, MiniVal v){
     b->v = v;
 }
 
-/* 代入で伸ばすため、変数そのものへの参照を得る。 */
+/* 変数の枠を得る（無ければ作る）。 */
 static MiniBind *mini_ref(MiniRun *r, const char *name){
     int found;
     MiniFrame *fr = mini_frame_for(r, name, &found);
@@ -9962,6 +8982,8 @@ static MiniBind *mini_ref(MiniRun *r, const char *name){
 
 static uint256_t mini_bool(int b){ return b ? u256_one() : u256_zero(); }
 
+/* 二項演算。`/` と `%` は C と同じゼロ方向の切り捨てで、本体の式評価器の
+   `%`（除数の符号）とは違う。 */
 static uint256_t mini_binop(MiniRun *r, const char *op, uint256_t a, uint256_t b){
     if(strcmp(op, "+") == 0) return u256_add(a, b);
     if(strcmp(op, "-") == 0) return u256_sub(a, b);
@@ -9972,8 +8994,6 @@ static uint256_t mini_binop(MiniRun *r, const char *op, uint256_t a, uint256_t b
     }
     if(strcmp(op, "%") == 0){
         if(u256_is_zero(b)) mini_fail(&r->c, "division by zero");
-        /* 0 方向への切り捨て除算と対になる剰余（符号は被除数に従う）。
-         * u256_mod は floor 除算が前提で符号の扱いが違うので使わない。 */
         return u256_sub(a, u256_mul(u256_truncdiv(a, b), b));
     }
     if(strcmp(op, "**") == 0){
@@ -10002,13 +9022,12 @@ static uint256_t mini_binop(MiniRun *r, const char *op, uint256_t a, uint256_t b
     return mini_bool(!u256_eq(a, b));
 }
 
+/* 式の構文木を評価する。 */
 static MiniVal mini_eval(MiniRun *r, MExpr *e){
     switch(e->k){
-    /* MX_STR は `.echo` の表示側でしか取り出さない。式として来たら構文解析の
-     * 取りこぼしなので、黙って 0 にせず止める。 */
     case MX_STR:
         mini_fail(&r->c, "a string can only be used in '.echo'");
-        return mini_num(u256_zero());   /* mini_fail は longjmp で戻らない */
+        return mini_num(u256_zero());
     case MX_CORE: return mini_num(mini_core_eval(r, e->name));
     case MX_NUM: return mini_num(e->num);
     case MX_VAR: return mini_get(r, e->name);
@@ -10024,7 +9043,6 @@ static MiniVal mini_eval(MiniRun *r, MExpr *e){
         MiniFunc *f = mini_lookup(r, e->name);
         MiniVal *vals = e->nitems ? mini_alloc((size_t)e->nitems * sizeof(MiniVal)) : NULL;
         for(int i = 0; i < e->nitems; i++) vals[i] = mini_eval(r, e->items[i]);
-        /* 呼んだ先で進む診断位置を、戻ったあとに元の行へ戻す。 */
         const char *sfile = r->c.file;
         int sline = r->c.line;
         mini_call_func(r, f, vals, e->nitems);
@@ -10034,7 +9052,7 @@ static MiniVal mini_eval(MiniRun *r, MExpr *e){
         if(!r->has_ret)
             mini_fail(&r->c, "'%s' returned no value; give it a "
                       "'.return <expression>'", e->name);
-        MiniVal ret = r->retval;          /* 所有権をここで引き取る */
+        MiniVal ret = r->retval;
         memset(&r->retval, 0, sizeof(r->retval));
         r->has_ret = 0;
         return ret;
@@ -10051,7 +9069,6 @@ static MiniVal mini_eval(MiniRun *r, MExpr *e){
         if(!b.is_arr){ mini_val_free(&b); mini_fail(&r->c, "only an array can be indexed"); }
         uint256_t iv = mini_need_num(r, mini_eval(r, e->b), "an index");
         long long i = mini_to_ll_sat(iv);
-        /* 範囲外の読み出しは 0。配列は書き込みで伸びるので読みでは伸ばさない。 */
         uint256_t out = (i < 0 || i >= b.n) ? u256_zero() : b.arr[i];
         mini_val_free(&b);
         return mini_num(out);
@@ -10105,12 +9122,14 @@ static MiniVal mini_eval(MiniRun *r, MExpr *e){
     return mini_num(u256_zero());
 }
 
+/* 実行した文を 1 つ数える。上限を超えたらエラーにする。 */
 static void mini_tick(MiniRun *r){
     if(++r->steps > MINI_MAX_STEPS)
         mini_fail(&r->c, "mini language ran more than %d statements; "
                   "assuming a runaway loop", MINI_MAX_STEPS);
 }
 
+/* 呼ぶ関数を名前で探す。内側の定義から外側へたどる。 */
 static MiniFunc *mini_lookup(MiniRun *r, const char *name){
     MiniFunc *f = r->nframes ? r->frames[r->nframes - 1].func : NULL;
     while(f){
@@ -10127,7 +9146,7 @@ static MiniFunc *mini_lookup(MiniRun *r, const char *name){
 
 static void mini_call_func(MiniRun *r, MiniFunc *f, MiniVal *args, int nargs);
 
-/* `name = v` / `name[idx] = v`。v の所有権はこの関数が引き取る。 */
+/* 変数か配列要素へ代入する。配列は必要なら伸ばす。 */
 static void mini_store(MiniRun *r, MStmt *s, MiniVal v){
     if(!s->idx){ mini_set(r, s->name, v); return; }
     uint256_t iv = mini_need_num(r, mini_eval(r, s->idx), "an index");
@@ -10154,11 +9173,12 @@ static void mini_store(MiniRun *r, MStmt *s, MiniVal v){
     b->v.arr[i] = elem;
 }
 
-/* 直前の呼び出しが置いていった返り値を捨てる。 */
+/* 返り値を捨てる。 */
 static void mini_drop_ret(MiniRun *r){
     if(r->has_ret){ mini_val_free(&r->retval); r->has_ret = 0; }
 }
 
+/* 文 1 個を実行する。 */
 static void mini_exec(MiniRun *r, MStmt *s){
     mini_at(r, s);
     mini_tick(r);
@@ -10185,9 +9205,6 @@ static void mini_exec(MiniRun *r, MStmt *s){
             mini_val_free(&ev);
             mini_fail(&r->c, "'.raise' needs a number, not an array");
         }
-        /* 命令長を測るだけの試し打ちと、収束途中のパス1では黙る（`.echo` と同じ）。
-         * 同じ行が反復回数だけ重複して報告されるのを防ぐため。
-         * 報告の体裁は error_patterns 欄（dir_error）と揃えてある。 */
         if(r->asmb && should_report_errors(&r->asmb->st)
            && !r->asmb->st.pass1_size_mode){
             AsmState *st = &r->asmb->st;
@@ -10201,8 +9218,6 @@ static void mini_exec(MiniRun *r, MStmt *s){
         return;
     }
     case MS_ECHO: {
-        /* 命令長を測るだけの試し打ちと、収束途中のパス1では黙る。
-         * 同じ行が反復回数だけ重複して出るのを防ぐため。 */
         int show = r->asmb && should_report_errors(&r->asmb->st)
                    && !r->asmb->st.pass1_size_mode;
         char **items = s->nargs ? mini_alloc((size_t)s->nargs * sizeof(char*)) : NULL;
@@ -10228,7 +9243,7 @@ static void mini_exec(MiniRun *r, MStmt *s){
         mini_call_func(r, f, vals, s->nargs);
         for(int i = 0; i < s->nargs; i++) mini_val_free(&vals[i]);
         free(vals);
-        mini_drop_ret(r);   /* 文としての `.call` は返り値を使わない */
+        mini_drop_ret(r);
         return;
     }
     case MS_CALLASSIGN: {
@@ -10243,7 +9258,7 @@ static void mini_exec(MiniRun *r, MStmt *s){
         if(!r->has_ret)
             mini_fail(&r->c, "'%s' returned no value; give it a "
                       "'.return <expression>'", s->fname);
-        MiniVal ret = r->retval;          /* 所有権をここで引き取る */
+        MiniVal ret = r->retval;
         memset(&r->retval, 0, sizeof(r->retval));
         r->has_ret = 0;
         mini_store(r, s, ret);
@@ -10296,8 +9311,6 @@ static void mini_exec(MiniRun *r, MStmt *s){
         }
         return;
     case MS_FOR: {
-        /* 反復変数は 256bit のまま回す。long long に落とすと、範囲の端が
-         * 64bit を超えるだけで axx.py（多倍長）と挙動が食い違うため。 */
         uint256_t v[3];
         v[0] = v[1] = v[2] = u256_zero();
         for(int i = 0; i < s->nargs; i++)
@@ -10316,8 +9329,6 @@ static void mini_exec(MiniRun *r, MStmt *s){
             mini_exec_block(r, s->body, s->nbody);
             if(r->returning) return;
             if(r->loopctl){ int lc = r->loopctl; r->loopctl = 0; if(lc == 1) return; }
-            /* axx.py の反復変数は桁あふれしない整数なので、256bit の符号付き
-             * 範囲を越えた時点で必ず停止条件を満たす。同じ所で打ち切る。 */
             uint256_t nx = u256_add(i, step);
             if(up ? (!u256_is_neg256(i) && u256_is_neg256(nx))
                   : (u256_is_neg256(i) && !u256_is_neg256(nx)))
@@ -10329,6 +9340,7 @@ static void mini_exec(MiniRun *r, MStmt *s){
     }
 }
 
+/* 文の並びを順に実行する。 */
 static void mini_exec_block(MiniRun *r, MStmt **body, int n){
     for(int i = 0; i < n; i++){
         mini_exec(r, body[i]);
@@ -10336,6 +9348,7 @@ static void mini_exec_block(MiniRun *r, MStmt **body, int n){
     }
 }
 
+/* スコープを空にする。 */
 static void mini_frame_clear(MiniFrame *fr){
     for(int i = 0; i < fr->nvars; i++){
         free(fr->vars[i].name);
@@ -10347,6 +9360,7 @@ static void mini_frame_clear(MiniFrame *fr){
     memset(fr, 0, sizeof(*fr));
 }
 
+/* 関数を 1 回呼ぶ。新しいスコープを積み、入れ子の深さを検査する。 */
 static void mini_call_func(MiniRun *r, MiniFunc *f, MiniVal *args, int nargs){
     if(r->nframes >= MINI_MAX_DEPTH)
         mini_fail(&r->c, "call nesting deeper than %d; assuming runaway recursion",
@@ -10373,8 +9387,8 @@ static void mini_call_func(MiniRun *r, MiniFunc *f, MiniVal *args, int nargs){
     r->nframes--;
 }
 
-/* --------------------------- 関数表 --------------------------- */
 
+/* 式の構文木を解放する。 */
 static void mini_expr_free(MExpr *e){
     if(!e) return;
     mini_expr_free(e->a); mini_expr_free(e->b); mini_expr_free(e->c);
@@ -10384,6 +9398,7 @@ static void mini_expr_free(MExpr *e){
     free(e);
 }
 
+/* 文の構文木を解放する。 */
 static void mini_stmt_free(MStmt *s){
     if(!s) return;
     mini_expr_free(s->idx);
@@ -10401,6 +9416,7 @@ static void mini_stmt_free(MStmt *s){
     free(s);
 }
 
+/* 関数定義を解放する。 */
 static void mini_func_free(MiniFunc *f){
     if(!f) return;
     for(int i = 0; i < f->nchildren; i++) mini_func_free(f->children[i]);
@@ -10415,20 +9431,20 @@ static void mini_func_free(MiniFunc *f){
     free(f);
 }
 
+/* 関数定義の並びを解放する。 */
 static void mfv_free(MiniFuncVec *v){
     for(int i = 0; i < v->len; i++) mini_func_free(v->data[i]);
     free(v->data);
     mfv_init(v);
 }
 
+/* 関数定義を名前で引く。 */
 static MiniFunc *mfv_find(MiniFuncVec *v, const char *name){
     for(int i = 0; i < v->len; i++)
         if(strcmp(v->data[i]->name, name) == 0) return v->data[i];
     return NULL;
 }
 
-/* 親が NULL ならトップレベル、そうでなければ親の children に入れる。
- * 同名が既にあればそれを捨てて置き換える（後の定義が勝つ）。 */
 static MiniFunc *mini_func_new(Assembler *asmb, MiniFunc *parent, const char *name,
                                const char *file, int line){
     MiniFunc *f = mini_alloc(sizeof(MiniFunc));
@@ -10472,12 +9488,14 @@ static MiniFunc *mini_func_new(Assembler *asmb, MiniFunc *parent, const char *na
     return f;
 }
 
+/* 関数に引数名を 1 つ足す。 */
 static void mini_func_addparam(MiniFunc *f, const char *p){
     f->params = realloc(f->params, (size_t)(f->nparams + 1) * sizeof(char*));
     if(!f->params){ perror("realloc"); exit(1); }
     f->params[f->nparams++] = mini_strdup(p);
 }
 
+/* 関数本体に行を 1 つ足す。 */
 static void mini_func_addline(MiniFunc *f, const char *text, const char *file, int line){
     if(f->nlines >= f->clines){
         f->clines = f->clines ? f->clines * 2 : 16;
@@ -10492,7 +9510,7 @@ static void mini_func_addline(MiniFunc *f, const char *text, const char *file, i
     f->nlines++;
 }
 
-/* 読み込みの最後に、集めた本体をまとめて文の木にする。 */
+/* 集めた関数すべてを構文木にする。 */
 static void mini_compile_all(MiniFunc **v, int n){
     for(int i = 0; i < n; i++){
         char *err = NULL;
@@ -10504,11 +9522,8 @@ static void mini_compile_all(MiniFunc **v, int n){
     }
 }
 
-/* --------------------------- binary_list からの呼び出し --------------------------- */
 
-/* `.call 名前(引数, …)` を実行して objl に積む。戻り値は次に読む位置。 */
-/* `.call` の引数欄の `[式, 式, ...]` を読んで配列の値にする。
- * t は書き換えてよい作業用バッファ。ok に 0 を返したら読めなかったということ。 */
+/* `[e1, e2, ...]` と書かれた引数を配列として評価する。 */
 static MiniVal mini_arg_array(Assembler *asmb, char *t, int a, int *out_i, int *ok){
     MiniVal v; memset(&v, 0, sizeof(v));
     v.is_arr = 1;
@@ -10521,7 +9536,6 @@ static MiniVal mini_arg_array(Assembler *asmb, char *t, int a, int *out_i, int *
         k++;
     }
     if(depth != 0 || k >= len || t[k] != ']'){ *out_i = len; return v; }
-    /* 中身だけを見せるため、いったん `]` を終端にする。 */
     t[k] = 0;
     int i = a + 1;
     while(1){
@@ -10530,12 +9544,7 @@ static MiniVal mini_arg_array(Assembler *asmb, char *t, int a, int *out_i, int *
         if(t[i] == ','){ i++; continue; }
         int io;
         uint256_t x = expr_expression_pat(asmb, t, i, &io);
-        /* 破綻点修正: ここに `if(io <= i) break;` があり、1文字も読めない
-         * 綴り（`[}32]` 等）で要素を落としていた。axx.py は読めなくても 0 を
-         * 1 個積んでから、次が `,` かどうかだけで続きを決める（`,` が必ず
-         * 位置を進めるので、止まらなくなることはない）。同じにそろえる。 */
         i = io;
-        /* 未定義ラベル由来の巨大な番兵で反復回数が爆発しないよう 0 を渡す。 */
         if(u256_is_undef_derived(x)) x = u256_zero();
         mini_arr_reserve(&v, v.n + 1);
         v.arr[v.n++] = x;
@@ -10549,15 +9558,12 @@ static MiniVal mini_arg_array(Assembler *asmb, char *t, int a, int *out_i, int *
     return v;
 }
 
+/* `.call 名前(引数, ...)` を実行し、生まれたワード列を積む。引数は呼び出し側の
+   パターン式なので、ここでパターン変数が解決されてから関数へ渡る。 */
 static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *objl){
-    /* 破綻点修正(潜在): 返り値に使う idx は setjmp() をまたいで生きるので、
-     * volatile でないと longjmp 後の値が規格上は不定になる（gcc も
-     * -Wclobbered で指摘する）。実測では壊れていないが、最適化次第で
-     * 壊れうる位置なので volatile にしておく。 */
     volatile int idx = idx_in;
     AsmState *st = &asmb->st;
     int slen = expr_slen(s);
-    /* 命令長を測るだけの試し打ちでも makeobj は走るので、そのときは黙る。 */
     int quiet = st->pass1_size_mode;
 
     idx += 5;
@@ -10565,9 +9571,6 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *
     int j = idx;
     while(j < slen && (isalnum((unsigned char)s[j]) || s[j] == '_')) j++;
     int namelen = j - idx;
-    /* 破綻点修正: ここは char[512] 固定で、512 文字以上の関数名を
-     * 「`.call` の書式が違う」として断っていた（axx.py に長さ制限は無いので
-     * 呼べる）。名前は行の中の一続きなので、行長から枠を決める。 */
     if(namelen <= 0){
         if(!quiet) axx_diagf(1, 0, " error - '.call' needs 'name(argument, ...)'.\n");
         return slen;
@@ -10622,7 +9625,6 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *
         if(a >= alen || !argtext[a]) break;
         if(argtext[a] == ','){ a++; continue; }
         MiniVal av;
-        /* `[式, 式, ...]` は配列の引数。要素もパターン層の式。 */
         if(argtext[a] == '['){
             int ok, io;
             av = mini_arg_array(asmb, argtext, a, &io, &ok);
@@ -10641,11 +9643,7 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *
         } else {
             int io;
             uint256_t v = expr_expression_pat(asmb, argtext, a, &io);
-            /* 破綻点修正: 上と同じ。`f(v,0,0,h,g,}32)` のように 1 文字も
-             * 読めない引数があると、caxx だけ引数を 1 個落として
-             * "takes 6 argument(s), got 5" になっていた。 */
             a = io;
-            /* 未定義ラベル由来の巨大な番兵で反復回数が爆発しないよう 0 を渡す。 */
             if(u256_is_undef_derived(v)) v = u256_zero();
             av = mini_num(v);
         }
@@ -10671,7 +9669,6 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *
     if(setjmp(r.c.jb) == 0){
         mini_call_func(&r, f, args, nargs);
         for(int i = 0; i < r.out.len; i++) iv_push(objl, r.out.data[i]);
-        /* 返り値もワードになる。配列なら添字 0 から順に、スカラーなら 1 ワード。 */
         if(r.has_ret){
             if(r.retval.is_arr)
                 for(int i = 0; i < r.retval.n; i++) iv_push(objl, r.retval.arr[i]);
@@ -10692,7 +9689,7 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *
     return idx;
 }
 
-/* 前後の空白を落とす（s は書き換え可能であること）。 */
+/* パターン欄の前後の空白を落とす。 */
 static char *pat_trim(char *s){
     char *p = s + axx_skipspc(s, 0);
     size_t n = strlen(p);
@@ -10700,15 +9697,6 @@ static char *pat_trim(char *s){
     return p;
 }
 
-/* `.func 名前(引数, 引数)` の見出しを名前と引数名の配列に分解する。
- * 引数欄は丸ごと省略できる（`.func name`）。空の括弧 `.func name()` も同じ。
- * `.call 名前(引数)` の呼び出し側と同じ書き方にそろえるための形。
- *
- * 旧来の `.func::名前::引数,引数` も読める。`.func` の直後が `::` のときだけ
- * そちらに切り替えるので、新しい形と取り違えることはない。
- *
- * 戻り値: 0=成功。0以外ならエラーで、errbuf に理由が入る。
- * name / params は呼び出し側が用意した領域に書く（params は最大 npmax 個）。 */
 static int parse_func_header(const char *l, char *name, size_t nsz,
                              char *params, size_t psz, int npmax, int *np,
                              char *errbuf, size_t esz){
@@ -10716,18 +9704,16 @@ static int parse_func_header(const char *l, char *name, size_t nsz,
     *np = 0;
     errbuf[0] = '\0';
 
-    /* 行頭の空白を落とし、末尾の空白も見ないよう長さを詰める。 */
     int b = axx_skipspc(l, 0);
     const char *t = l + b;
     int tlen = (int)strlen(t);
     while(tlen > 0 && isspace((unsigned char)t[tlen-1])) tlen--;
 
-    int i = 1;   /* t[0] は '.' */
+    int i = 1;
     while(i < tlen && (isalnum((unsigned char)t[i]) || t[i]=='_')) i++;
     i = axx_skipspc(t, i);
 
     if(t[i]==':' && t[i+1]==':'){
-        /* 旧形式。`::` で最大3欄に割る。 */
         size_t hsz = (size_t)tlen + 1;
         char *hbuf = malloc(3 * hsz);
         if(!hbuf){ perror("malloc"); exit(1); }
@@ -10771,7 +9757,7 @@ static int parse_func_header(const char *l, char *name, size_t nsz,
     name[j - i] = '\0';
 
     int k = axx_skipspc(t, j);
-    if(k >= tlen) return 0;                 /* `.func name` — 引数なし */
+    if(k >= tlen) return 0;
     if(t[k] != '('){
         snprintf(errbuf, esz, " error - '.func': expected '(' or end of line after "
                  "the name, got '%.*s'\n", tlen - k, t + k);
@@ -10786,7 +9772,6 @@ static int parse_func_header(const char *l, char *name, size_t nsz,
     }
     for(int q = e + 1; q < tlen; q++){
         if(!isspace((unsigned char)t[q])){
-            /* 前後の空白は落として報告する（axx.py の strip() と揃える）。 */
             int ts = e + 1, te = tlen;
             while(ts < te && isspace((unsigned char)t[ts])) ts++;
             while(te > ts && isspace((unsigned char)t[te-1])) te--;
@@ -10796,8 +9781,6 @@ static int parse_func_header(const char *l, char *name, size_t nsz,
         }
     }
 
-    /* 括弧の中をカンマで割る。strtok は使わず自前で刻む（呼び出し側の
-     * バッファを壊さないため）。 */
     int q = k + 1;
     while(q < e){
         int st2 = q;
@@ -10819,15 +9802,13 @@ static int parse_func_header(const char *l, char *name, size_t nsz,
             params[(size_t)(*np)*psz + plen] = '\0';
             (*np)++;
         }
-        if(q < e) q++;  /* ',' を飛ばす */
+        if(q < e) q++;
     }
     return 0;
 }
 
-/* `.map` の式の中の変数を、並びの番号に置き換えた新しい式を作る。
- * 置き換えるのは語として独立している出現だけで、`0xff` の `x` のように
- * 英数字に挟まれたものは触らない。番号は `(3)` と括って埋めるので、
- * `1<<x` は `1<<(3)` となり、前後の演算子の優先順位は変わらない。 */
+/* `.map` の式の中の変数を、その名前の位置 i に置き換える。括弧で包むので
+   優先順位は変わらず、置き換えるのは単語として現れた箇所だけ。 */
 static char *map_subst_index(const char *expr, const char *var, int i){
     char num[32];
     snprintf(num, sizeof(num), "(%d)", i);
@@ -10848,6 +9829,12 @@ static char *map_subst_index(const char *expr, const char *var, int i){
     return out;
 }
 
+/* パターンファイルを読み、各行をマクロ層に通してから `::` で欄に割る。
+   `.sub` と `.func` のブロックは本文を集めて別に持つので、その中の行が
+   普通のパターン行として照合されることはない。
+   コメントには後方互換の規則がある。開きだけをコメント行の頭に並べる古い
+   書き方のために、すぐ次の行も開きで始まるか、以降どこにも閉じが無いときは
+   自分の行を超えて延長しない。 */
 static void readpat(Assembler *asmb, const char *fn){
     if(!fn||!fn[0]) return;
 
@@ -10893,21 +9880,6 @@ static void readpat(Assembler *asmb, const char *fn){
     fclose(f);
     f = NULL;
 
-    /* 破綻点修正: 「本物の複数行ブロックコメント(閉じ記号が後の行にあり、
-     * 中身の行は開始記号で始まらない)」と「開始記号を単なる行末コメントの
-     * 目印として毎行書くだけの古い流儀(コメントの各行が開始記号で始まり、
-     * 閉じ記号は無いか、あっても離れた場所にある別の無関係なコメントの
-     * ものでしかない)」の2つの書き方が実在のパターンファイルに混在している。
-     * 「次の1行だけ」を見て判定すると、旧来スタイルの連続コメントの最後の
-     * 1行(次の行はもう普通のコード)を誤って「本物のブロックコメント開始」
-     * と誤認し、たまたま遠く離れた場所にある無関係な閉じ記号まで実際の
-     * パターン行を丸ごと呑み込んでしまう(8080.axx で発生)。そこで、
-     * 「直前の行も開始記号で始まる行で、かつ単発扱い(旧来スタイル)と
-     * 判定されていたか」を legacy_chain として引き継ぎ、旧来スタイルの
-     * 連続コメントは何行続いても・最後の1行であっても単発行として扱う。
-     * legacy_chain が途切れた(=直前が普通のコードだった)場合のみ、次の
-     * 行が開始記号で始まらずかつこの位置より後ろに閉じ記号が本当に存在する
-     * ときに限り、新規のブロックコメントとして正しく閉じるまで追跡する。 */
     int *rest_has_close = malloc(sizeof(int) * (size_t)(nexp + 1));
     if(!rest_has_close){ perror("malloc"); exit(1); }
     rest_has_close[nexp] = 0;
@@ -10932,8 +9904,6 @@ static void readpat(Assembler *asmb, const char *fn){
         int was_in_comment = in_block_comment;
         axx_remove_comment(line, &in_block_comment);
         if(!in_block_comment){
-            /* このコメントはこの行の中で完結した(あるいは元々コメントで
-             * なかった)ので、旧来スタイルの連鎖はここで途切れる。 */
             legacy_chain = 0;
         } else if(!was_in_comment){
             int oi = axx_skipspc(exp[li], 0);
@@ -10961,7 +9931,6 @@ static void readpat(Assembler *asmb, const char *fn){
         while(l>0&&(line[l-1]=='\n'||line[l-1]=='\r')) line[--l]=0;
         axx_reduce_spaces(line);
 
-        /* ミニ言語の `.func` 本体は `::` で分解せず、行のまま集める。 */
         {
             char dk[32];
             mini_dotkw(line, dk, sizeof(dk));
@@ -10973,10 +9942,6 @@ static void readpat(Assembler *asmb, const char *fn){
                         continue;
                     }
                     enum { FUNC_PARAM_MAX = 64 };
-                    /* 破綻点修正: 名前と引数名の枠は FUNC_NAME_MAX=256 固定で、
-                     * 256 文字以上の `.func` 名を "name is too long" で断って
-                     * いた（axx.py に長さ制限は無いので通る）。名前も引数名も
-                     * その行より長くはならないので、行長から枠を決める。 */
                     size_t FUNC_NAME_MAX = strlen(line) + 1;
                     char *nmbuf = malloc(FUNC_NAME_MAX);
                     if(!nmbuf){ perror("malloc"); exit(1); }
@@ -10993,8 +9958,6 @@ static void readpat(Assembler *asmb, const char *fn){
                         axx_diagf(1, 0, "%s", errbuf);
                         ok = 0;
                     } else if(!is_sub_name(nmbuf)){
-                        /* repr はエスケープで最大 4 倍ほどに伸びる。名前を
-                         * 切り詰めると診断が axx.py と食い違うので長さから取る。 */
                         size_t _nrsz = 4 * strlen(nmbuf) + 16;
                         char *_nr = malloc(_nrsz); if(!_nr){ perror("malloc"); exit(1); }
                         m_pyrepr(nmbuf, _nr, _nrsz);
@@ -11003,10 +9966,6 @@ static void readpat(Assembler *asmb, const char *fn){
                         free(_nr);
                         ok = 0;
                     } else {
-                        /* 破綻点修正: 引数名が壊れていても関数を登録して本体を
-                         * 組み立てていたため、axx.py（名前が壊れた関数は登録せず
-                         * 本体も組み立てない）には出ない後続エラーが並んでいた。
-                         * 最初の壊れた引数名で打ち切るのも axx.py と同じ。 */
                         for(int q=0;q<nparam;q++){
                             char *pn = pbuf + (size_t)q*FUNC_NAME_MAX;
                             if(!is_sub_name(pn)){
@@ -11021,8 +9980,6 @@ static void readpat(Assembler *asmb, const char *fn){
                     MiniFunc *parent = nfunc_stack ? func_stack[nfunc_stack-1] : NULL;
                     MiniFunc *nf;
                     if(ok){
-                        /* 破綻点修正: 同名の再定義を黙って差し替えていた
-                         * （axx.py は警告を出す）。 */
                         int _dup = 0;
                         if(parent){
                             for(int i=0;i<parent->nchildren;i++)
@@ -11041,8 +9998,6 @@ static void readpat(Assembler *asmb, const char *fn){
                         for(int q=0;q<nparam;q++)
                             mini_func_addparam(nf, pbuf + (size_t)q*FUNC_NAME_MAX);
                     } else {
-                        /* 名前が壊れていても本体を取り込んで `.endfunc` の対応を
-                         * 保つ。表には載せないので組み立てもされない（axx.py と同じ）。 */
                         nf = mini_alloc(sizeof(MiniFunc));
                         nf->name = mini_strdup("?");
                         nf->file = mini_strdup(fn);
@@ -11056,9 +10011,6 @@ static void readpat(Assembler *asmb, const char *fn){
                 }
                 MiniFunc *cur = func_stack[nfunc_stack-1];
                 if(strcmp(dk, ".ENDFUNC") == 0){
-                    /* 本体を閉じるのは `.endfunc` のみ。`.if`/`.while`/`.for` が
-                     * 閉じきらないまま来たら壊れたパターンなので報告するが、
-                     * 後続行を巻き込まないよう関数はここで閉じてしまう。 */
                     if(cur->depth != 0){
                         axx_diagf(1, 0, " error - '.func %s': '.endfunc' while a block "
                                    "('.if'/'.while'/'.for') is still open.\n", cur->name);
@@ -11073,7 +10025,6 @@ static void readpat(Assembler *asmb, const char *fn){
                           || strcmp(dk, ".ENDWHILE") == 0){
                     cur->depth--;
                     if(cur->depth < 0){
-                        /* 破綻点修正: axx.py は `{_dk.lower()}` と小文字で出す。 */
                         char _dkl[32]; size_t _di = 0;
                         for(; dk[_di] && _di + 1 < sizeof(_dkl); _di++)
                             _dkl[_di] = (char)tolower((unsigned char)dk[_di]);
@@ -11089,15 +10040,13 @@ static void readpat(Assembler *asmb, const char *fn){
                 }
                 continue;
             }
-            /* `.echo(項目, …)` は本文行に書ける。`::` で分解すると文字列の中の
-             * `::` まで欄の区切りにしてしまうので、行のまま1欄に収める。 */
             if(strcmp(dk, ".ECHO") == 0){
                 if(cur_sub){
                     axx_diagf(1, 0, " error - '.echo' cannot be written inside "
                                "'.sub::%s'.\n", cur_sub->name);
                     continue;
                 }
-                int ea = axx_skipspc(line, 0) + 5;   /* ".echo" の後ろ */
+                int ea = axx_skipspc(line, 0) + 5;
                 EchoItem *eiv = NULL;
                 int ein = 0;
                 char ebuf[512];
@@ -11118,17 +10067,7 @@ static void readpat(Assembler *asmb, const char *fn){
         for(int i=0;i<8&&line[si+i];i++) uline[i]=axx_upper_char(line[si+i]);
         if(strcmp(uline,".INCLUDE")==0){ include_pat(asmb,line+si,this_dir); continue; }
 
-        /* 破綻点修正: フィールドを char[8][1024] の固定長に写していたため、
-         * 1023 文字を超える欄（長い三項式や @@[] を並べた符号化欄など）が
-         * 診断もなく途中で切れていた。axx.py には長さの制限が無いので、
-         * 同じパターンファイルから違うバイト列が出る。行長から必要量が
-         * 決まるので、行ごとに確保する。 */
         size_t fsz = strlen(line) + 1;
-        /* 破綻点修正: 欄は最大 8 個までしか切り出していなかったため、7 個目
-         * より後ろが 8 個目にまとめて残り、axx.py が出す
-         * " warning - pattern line has more than 6 fields ..." の内容と
-         * 食い違っていた（そもそもその警告が caxx に無かった）。
-         * `::` の数から必要な個数を決める。 */
         int fmax = 1;
         for(const char *q = line; *q; q++)
             if(q[0]==':' && q[1]==':'){ fmax++; q++; }
@@ -11146,12 +10085,9 @@ static void readpat(Assembler *asmb, const char *fn){
             if(idx>=(int)strlen(line)||nf>=fmax) break;
         }
 
-        /* `.sub::名前 … .return` はパターン層のサブ表。中の項目は本体の
-         * パターン表には積まず、サブ表として別に覚えておく。 */
         {
             char kw[16]={0};
             {
-                /* fields[0] は書き換えずに、前後の空白を除いた大文字の写しを作る。 */
                 int a = axx_skipspc(fields[0], 0);
                 int e = (int)strlen(fields[0]);
                 while(e > a && isspace((unsigned char)fields[0][e-1])) e--;
@@ -11174,9 +10110,6 @@ static void readpat(Assembler *asmb, const char *fn){
                 }
                 free(fields); free(fbuf); continue;
             }
-            /* `.sub` ブロックの終わりは `.return` でも `.endsub` でもよい。
-             * `.func … .endfunc` と綴りをそろえたいときのための別名で、
-             * 意味は同じ。 */
             if(strcmp(kw,".RETURN")==0 || strcmp(kw,".ENDSUB")==0){
                 if(!cur_sub){
                     char _kwl[16];
@@ -11191,9 +10124,6 @@ static void readpat(Assembler *asmb, const char *fn){
             if(cur_sub){
                 if(nf<2){
                     if(pat_trim(fields[0])[0]){
-                        /* 破綻点修正: axx.py は表名も本文も Python の repr で
-                         * 出す（`{cur_sub!r}` / `{l[0]!r}`）ので、`'` を含む
-                         * 綴りで引用符の選び方が食い違っていた。 */
                         size_t _esz = strlen(fields[0]) * 4 + 8;
                         char *_er = malloc(_esz);
                         char _nr[600];
@@ -11211,9 +10141,6 @@ static void readpat(Assembler *asmb, const char *fn){
             }
         }
 
-        /* `.map::<変数>::<名前の並び>::<式>` の書式検査。展開は
-         * setpatsymbols() と dir_map() で行う（並びに配列シンボルを書けるよう
-         * にするため。配列はパターンを読み終えてから登録される）。 */
         {
             char kw[16]={0};
             int a = axx_skipspc(fields[0], 0);
@@ -11236,8 +10163,6 @@ static void readpat(Assembler *asmb, const char *fn){
         if(nf==1){
             int nonblank=0;
             for(const char*p=fields[0];*p;p++){ if(!isspace((unsigned char)*p)){ nonblank=1; break; } }
-            /* 引数を省いた `.passthru` は欄がひとつだけの正しい書き方なので、
-             * 取りこぼしの警告からは外す。 */
             char kw1[16]={0};
             {
                 int a = axx_skipspc(fields[0], 0);
@@ -11248,7 +10173,6 @@ static void readpat(Assembler *asmb, const char *fn){
             }
             if(nonblank && strcmp(kw1,".PASSTHRU")!=0 && strcmp(kw1,".EOL")!=0
                         && strcmp(kw1,".TEXTMODE")!=0){
-                /* 破綻点修正: axx.py は `{l[0]!r}` と Python の repr で出す。 */
                 { size_t _fl = strlen(fields[0]);
                   size_t _rsz = _fl * 4 + 8;
                   char *_fr = malloc(_rsz);
@@ -11271,8 +10195,6 @@ static void readpat(Assembler *asmb, const char *fn){
         else if(nf==5){ for(int i=0;i<5;i++) pat_set(pe,i,fields[i]); }
         else if(nf==6){ for(int i=0;i<6;i++) pat_set(pe,i,fields[i]); }
         else {
-            /* 破綻点修正: axx.py はここで余った欄を挙げて警告するが、caxx には
-             * この警告が無かった。文面は `{l[6:]!r}`（Python のリストの repr）。 */
             size_t _wsz = 4;
             for(int i=6;i<nf;i++) _wsz += strlen(fields[i]) * 4 + 8;
             char *_w = malloc(_wsz);
@@ -11322,11 +10244,11 @@ static void readpat(Assembler *asmb, const char *fn){
     }
 }
 
+/* `%%` を繰り返しインデックスの値に、`%0` をその 0 復帰に置き換える。
+   文字列リテラルの中は触らない。 */
 static int replace_percent_with_index(const char *s, char *out, size_t osz){
     int count=0,i=0; size_t n=0; int truncated=0;
     while(s[i]){
-        /* `"..."` の中身は文字列テンプレート（3.5.2）の材料なので、
-         * 連番置換の対象にせずそのまま写す。 */
         if(s[i]=='"'){
             if(n<osz-1) out[n++]=s[i]; else truncated=1;
             i++;
@@ -11359,10 +10281,8 @@ static int replace_percent_with_index(const char *s, char *out, size_t osz){
     return truncated;
 }
 
-/* エンコーディング欄の `@@[個数, 式]` を個数分だけ展開する。
- * 例: `0xe8,@@[4,*(e-$.,%%)]` は 4 バイトのリトルエンディアン展開になる。
- * is_empty には「展開の結果ワードが1つも無い」ことを返す（`;` 条件付き出力で
- * 何も出さない命令を、長さ0として扱うため）。 */
+/* `@@[n, 中身]` の繰り返しを展開する。入れ子と文字列リテラルを数えて
+   対応する閉じを探す。 */
 static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assembler *asmb, int ep_depth){
     enum { MAX_EP_DEPTH = 200 };
     if(ep_depth > MAX_EP_DEPTH){
@@ -11379,7 +10299,6 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
             i+=3;
             int depth=1, expr_start=i, comma_pos=-1;
             while(i<plen&&depth>0){
-                /* `"..."` の中の `[` `]` `,` は区切りとして数えない。 */
                 if(pattern[i]=='"'){
                     i++;
                     while(i<plen){
@@ -11395,10 +10314,6 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
                 i++;
             }
             if(comma_pos>0){
-                /* 破綻点修正: 1024 バイトの自動変数に写していたため、長い
-                 * `@@[n, ...]` の反復パターン（や回数の式）が診断もなく途中で
-                 * 切れていた。axx.py には制限が無いので同じパターンファイルから
-                 * 違うバイト列が出る。実際の長さぶんだけ確保する。 */
                 int el=comma_pos-expr_start;
                 int rl=i-comma_pos-1;
                 if(el<0) el=0;
@@ -11409,26 +10324,14 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
                 memcpy(expr_part,pattern+expr_start,(size_t)el); expr_part[el]=0;
                 memcpy(rep_pat,pattern+comma_pos+1,(size_t)rl); rep_pat[rl]=0;
                 int io;
-                /* 破綻点修正: 繰り返し回数の未定義判定のために旗を降ろしたまま
-                 * 復元していなかったため、オペランド捕捉の段階で立った
-                 * 「未定義ラベルを踏んだ」という情報が、`@@[]` を含むパターンでは
-                 * 必ず消えていた。makeobj() は e_p() の呼び出し「後」に旗を退避
-                 * するので、呼び出し元の状態ごと失われていた。 */
                 int _rep_prior = asmb->st.error_undefined_label;
                 asmb->st.error_undefined_label = 0;
                 uint256_t nv=expr_expression_pat(asmb,expr_part,0,&io);
                 int _rep_undef = asmb->st.error_undefined_label;
                 asmb->st.error_undefined_label = _rep_prior || _rep_undef;
                 int64_t nrep=u256_to_i64(nv);
-                /* 破綻点修正: 繰り返し回数について、未定義ラベルの判定も上限の
-                 * チェックも無かった（axx.py はどちらも行う）。未定義なら 0 回、
-                 * 上限 (1<<24) 超はエラーにして 0 回に倒す。 */
                 const int64_t N_MAX = (int64_t)1 << 24;
                 if(_rep_undef || u256_is_undef_derived(nv)) nrep = 0;
-                /* 破綻点修正: nrep は u256_to_i64() で下位64bitに切り詰めた値
-                 * なので、2**64+3 のような回数が 3 に化けて上限チェックを
-                 * すり抜けていた（axx.py はエラーにする）。元の 256bit 値でも
-                 * 判定し、表示も切り詰めない値で行う。 */
                 else if(u256_gt_signed(nv, u256_from_i64(N_MAX))){
                     char cb[96]; u256_to_pydec(nv, cb, sizeof(cb));
                     axx_diagf(0, 0, " error - @@[n,...]: repeat count %s exceeds maximum %lld.\n",
@@ -11438,10 +10341,6 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
                 }
                 if(nrep>0){
                     has_content=1;
-                    /* 破綻点修正: rep_pat をそのまま複製していたため、その中に
-                     * ネストした @@[...] があっても再帰展開されず、
-                     * axx.py（e_p を再帰呼び出しして展開する）と食い違って
-                     * いた。展開してから複製する。 */
                     char *exp_rep = malloc(osz);
                     if(!exp_rep){ perror("malloc"); exit(1); }
                     int rep_empty=0;
@@ -11461,7 +10360,6 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
                 if(n+3<osz){ out[n++]='@'; out[n++]='@'; out[n++]='['; has_content=1; }
             }
         } else if(pattern[i]=='"'){
-            /* `"..."` の中は `@@[` の展開対象にせず、そのまま写す。 */
             out[n++]=pattern[i++]; has_content=1;
             while(i<plen&&n<osz-1){
                 if(pattern[i]=='\\' && i+1<plen && n+1<osz-1){
@@ -11479,26 +10377,27 @@ static void e_p(const char *pattern, char *out, size_t osz, int *is_empty, Assem
     *is_empty=!has_content;
 }
 
-/* ==================== 配列シンボル ====================
- * `.setsym::名前::[項目,項目,…]` で登録する。項目は数値の式でも
- * `"文字列"` でもよく、混ざっていてもよい。添字は 0 から数える。
- *   x[3]      … 文字列テンプレート（3.5.2）の中から
- *   #x[3]     … 式の中から（数値の項目のみ）
- * 数は多くないので、文字列シンボルと同じく素直な線形探索で引く。 */
+/* ---- 配列シンボルと集合 -------------------------------------------------
+   `.setsym` の値欄が `[...]` なら配列シンボル、名前のカンマ並びなら集合。
+   集合は名前を項目に持つ配列シンボルなので、同じ置き場を使う。
+   ------------------------------------------------------------------------ */
 static int arrsym_find(AsmState *st, const char *upper_name){
     for(int i=0;i<st->arrsyms_len;i++)
         if(strcmp(st->arrsyms[i].name, upper_name)==0) return i;
     return -1;
 }
+/* 配列シンボルを引く。 */
 static struct ArrSym *arrsym_get(AsmState *st, const char *upper_name){
     int i = arrsym_find(st, upper_name);
     return (i < 0) ? NULL : &st->arrsyms[i];
 }
+/* 配列シンボル 1 個を解放する。 */
 static void arrsym_free_one(struct ArrSym *a){
     for(int i=0;i<a->len;i++) free(a->items[i].s);
     free(a->items); free(a->name);
     a->items = NULL; a->name = NULL; a->len = 0;
 }
+/* 配列シンボルを消す。 */
 static void arrsym_delete(AsmState *st, const char *upper_name){
     int i = arrsym_find(st, upper_name);
     if(i < 0) return;
@@ -11507,6 +10406,7 @@ static void arrsym_delete(AsmState *st, const char *upper_name){
     for(int k=i+1;k<st->arrsyms_len;k++) st->arrsyms[k-1] = st->arrsyms[k];
     st->arrsyms_len--;
 }
+/* 配列シンボルをすべて消す。 */
 static void arrsym_clear_all(AsmState *st){
     if(st->arrsyms_len) g_arrgen++;
     for(int i=0;i<st->arrsyms_len;i++) arrsym_free_one(&st->arrsyms[i]);
@@ -11514,12 +10414,10 @@ static void arrsym_clear_all(AsmState *st){
     st->arrsyms = NULL; st->arrsyms_len = 0; st->arrsyms_cap = 0;
 }
 
-/* 組み立て済みの項目列をそのまま配列シンボルとして据える（所有権を渡す）。 */
+/* 配列シンボルを登録する。中身が変わったときだけ世代番号を進める。
+   `.check` の名前一覧がこれを参照するので、無駄に進めるとそのキャッシュが
+   意味なく落ちる。 */
 static void arrsym_install(AsmState *st, const char *dst_upper, SymItem *items, int n){
-    /* 同じ中身を入れ直すだけなら何もしない。パターン表のディレクティブ行は
-     * ソース1行ごとにたどり直されるので、同じ `.setsym::名前::A,B,…` が何度も
-     * 来る。表を作り直すと、それを元にしている `.check` の控えまで捨てて
-     * しまうので、中身が変わらないときは表も世代番号も動かさない。 */
     {
         struct ArrSym *old = arrsym_get(st, dst_upper);
         if(old && old->len == n){
@@ -11552,11 +10450,10 @@ static void arrsym_install(AsmState *st, const char *dst_upper, SymItem *items, 
     a->len = n;
 }
 
-/* 既にある配列シンボルをそのまま複製する。`.setsym::y::x` 用。 */
+/* 配列シンボルを複製する。独立したコピーなので元を再定義しても変わらない。 */
 static void arrsym_copy(AsmState *st, const char *dst_upper, const char *src_upper){
     struct ArrSym *src = arrsym_get(st, src_upper);
     if(!src) return;
-    /* 自分自身への代入は何もしない（複製元を消してしまわないように）。 */
     if(strcmp(dst_upper, src_upper)==0) return;
     int n = src->len;
     SymItem *items = n ? malloc((size_t)n*sizeof(SymItem)) : NULL;
@@ -11569,9 +10466,8 @@ static void arrsym_copy(AsmState *st, const char *dst_upper, const char *src_upp
     arrsym_install(st, dst_upper, items, n);
 }
 
-/* 欄が識別子ひとつなら、書かれたままの名前を out に入れて真を返す。
- * 先頭は英字か `_`、続きは英数字か `_` で、前後の空白は無視する。
- * axx.py の bare_name_of() と同じ規則である。 */
+/* 欄が「裸の名前」1 個だけなら、その綴りをそのまま返す。大文字化はしない。
+   配列シンボルの項目が書かれたままの綴りで残るのはこれが理由。 */
 static int bare_name_of(const char *text, char *out, size_t cap){
     const char *q = text ? text : "";
     while(*q==' '||*q=='\t') q++;
@@ -11580,21 +10476,16 @@ static int bare_name_of(const char *text, char *out, size_t cap){
     while(isalnum((unsigned char)*q) || *q=='_') q++;
     size_t n = (size_t)(q - b);
     while(*q==' '||*q=='\t') q++;
-    if(*q) return 0;                 /* 名前だけの欄ではない */
+    if(*q) return 0;
     if(n >= cap) return 0;
     memcpy(out, b, n);
     out[n] = '\0';
     return 1;
 }
 
-/* 値欄が「名前ひとつ」のときの `.setsym`。拾ったら真を返す。
- * その名前が文字列／配列シンボルなら写しを作り（`.setsym::y::x`）、どちらでも
- * なければ「その名前そのもの」を指す文字列シンボルにする。つまり
- *   .setsym::var1::BX
- * は `var1` が BX という名前を指す、という意味になり、`{{var1}}` は `BX` と
- * 出る。名前に与えた数値が要るときは `#BX`、ラベルの値が要るときは `BX+0` の
- * ように式にして書く（素の名前はここで文字列として拾われる）。
- * axx.py の symbol_copy_from_name() と同じ規則である。 */
+/* 値欄が裸の名前のときの `.setsym`。配列か文字列シンボルならコピーし、
+   どちらでもなければ「その名前を保持する文字列シンボル」にする。
+   名前を持ち回って添字に使えるのはこれのため。 */
 static int symbol_copy_from_name(AsmState *st, const char *dst_upper, const char *value_field){
     char name[512];
     if(!bare_name_of(value_field, name, sizeof(name))) return 0;
@@ -11611,24 +10502,21 @@ static int symbol_copy_from_name(AsmState *st, const char *dst_upper, const char
         free(dup);
         return 1;
     }
-    /* どの表にも無い素の名前は、その名前そのものを指す文字列シンボルにする。 */
     strsym_set(st, dst_upper, name);
     return 1;
 }
 
-/* ==================== 集合（名前の並び）====================
- * `.setsym::a::a1,a2,a3` は名前の集合を作り、`.setsym::x::a&b` のように
- * 既にある集合どうしを演算できる。集合は配列シンボルとして持つので、
- * `.check` `.enum` `.map` の並び欄や `{{a}}` からそのまま使える。 */
 
 typedef struct { SymItem *data; int len, cap; } ItemVec;
 
 static void itv_init(ItemVec *v){ v->data = NULL; v->len = 0; v->cap = 0; }
+/* 項目の並びを解放する。 */
 static void itv_free(ItemVec *v){
     for(int i=0;i<v->len;i++) free(v->data[i].s);
     free(v->data);
     itv_init(v);
 }
+/* 項目を 1 つ積む。 */
 static void itv_push(ItemVec *v, const SymItem *it){
     if(v->len >= v->cap){
         v->cap = v->cap ? v->cap*2 : 8;
@@ -11640,21 +10528,24 @@ static void itv_push(ItemVec *v, const SymItem *it){
     d->v      = it->v;
     d->s      = it->s ? strdup(it->s) : NULL;
 }
+/* 項目が等しいか。 */
 static int symitem_eq(const SymItem *a, const SymItem *b){
     if(a->is_str != b->is_str) return 0;
     if(a->is_str) return strcmp(a->s ? a->s : "", b->s ? b->s : "") == 0;
     return u256_eq(a->v, b->v);
 }
+/* 項目が既にあるか。 */
 static int itv_has(const ItemVec *v, const SymItem *it){
     for(int i=0;i<v->len;i++) if(symitem_eq(&v->data[i], it)) return 1;
     return 0;
 }
-/* 集合なので同じ要素は1つだけ持つ。並び順は最初に現れた順。 */
+/* 重複しなければ項目を積む（順序は最初に現れた位置）。 */
 static void itv_push_unique(ItemVec *v, const SymItem *it){
     if(!itv_has(v, it)) itv_push(v, it);
 }
 
-/* acc に rhs を演算子 op で作用させる。演算子は左から順に適用する。 */
+/* 集合演算 1 つを適用する。`&` 積、`|` と `+` 和、`^` 対称差、`-` 差。
+   固有の優先順位は無く、左から右へ適用するので `a&b|c` は `(a&b)|c`。 */
 static void set_op_apply(ItemVec *acc, const ItemVec *rhs, char op){
     ItemVec out; itv_init(&out);
     if(op == '&'){
@@ -11668,7 +10559,7 @@ static void set_op_apply(ItemVec *acc, const ItemVec *rhs, char op){
             if(!itv_has(rhs, &acc->data[i])) itv_push_unique(&out, &acc->data[i]);
         for(int i=0;i<rhs->len;i++)
             if(!itv_has(acc, &rhs->data[i])) itv_push_unique(&out, &rhs->data[i]);
-    } else {   /* '-' */
+    } else {
         for(int i=0;i<acc->len;i++)
             if(!itv_has(rhs, &acc->data[i])) itv_push_unique(&out, &acc->data[i]);
     }
@@ -11676,9 +10567,7 @@ static void set_op_apply(ItemVec *acc, const ItemVec *rhs, char op){
     *acc = out;
 }
 
-/* 集合の要素として書ける名前なら大文字化して out へ。でなければ 0。
- * 数字で始まるものと空白を含むものは名前とみなさない（`.setsym::X::1,2` の
- * ような数式が集合に化けないようにするため）。 */
+/* 集合リストの 1 項目として読める名前か。 */
 static int set_name_token(const char *t, char *out, size_t outsz){
     while(*t==' '||*t=='\t') t++;
     const char *e = t + strlen(t);
@@ -11692,7 +10581,8 @@ static int set_name_token(const char *t, char *out, size_t outsz){
     return 1;
 }
 
-/* 集合式の被演算子。素の識別子で、既にある集合ならその項目を out へ。 */
+/* 集合式のオペランドを読む。既存の集合を指す裸の識別子のみ。`-` `&` `|` は
+   シンボル名にも現れうるので、文字・数字・下線だけの綴りに限る。 */
 static int set_operand(AsmState *st, const char *b, int n, ItemVec *out){
     while(n > 0 && (*b==' '||*b=='\t')){ b++; n--; }
     while(n > 0 && (b[n-1]==' '||b[n-1]=='\t')) n--;
@@ -11711,9 +10601,7 @@ static int set_operand(AsmState *st, const char *b, int n, ItemVec *out){
     return 1;
 }
 
-/* `a&b` `a|b` `a^b` `a+b` `a-b` の集合式を評価する。
- * 被演算子はすべて既にある集合であること。集合式として読めなければ 0。
- * axx.py の set_expr_from_text() と同じ規則である。 */
+/* 集合式を計算する。集合として読めなければ失敗を返し、数値解釈へ譲る。 */
 static int set_expr_from_text(AsmState *st, const char *text, ItemVec *out){
     ItemVec acc; itv_init(&acc);
     int have = 0, nops = 0;
@@ -11733,14 +10621,13 @@ static int set_expr_from_text(AsmState *st, const char *text, ItemVec *out){
             b  = p + 1;
         }
     }
-    if(nops == 0){ itv_free(&acc); return 0; }   /* 演算子が無ければ集合式ではない */
+    if(nops == 0){ itv_free(&acc); return 0; }
     *out = acc;
     return 1;
 }
 
-/* `名前,名前,…` を集合の項目にする。集合として読めなければ 0。
- * 項目に既存の集合の名前を書くと、その中身をその場に展開する。
- * axx.py の set_literal_from_text() と同じ規則である。 */
+/* 名前のカンマ並びを集合として読む。項目がそれ自体集合ならその場で展開する。
+   2 項目以上ないと集合にしないので、単一の名前はコピーとして扱われる。 */
 static int set_literal_from_text(AsmState *st, const char *text, ItemVec *out){
     StrVec parts; sv_init(&parts);
     split_top_commas(text, &parts);
@@ -11764,22 +10651,17 @@ static int set_literal_from_text(AsmState *st, const char *text, ItemVec *out){
     return 1;
 }
 
-/* 値欄が集合の書き方なら、その集合を作って真を返す。
- *   .setsym::a::a1,a2,a3   名前の集合
- *   .setsym::x::a&b        既にある集合どうしの演算
- * 結果は写しなので、あとで元の集合を書き換えても影響しない。
- * axx.py の symbol_set_from_text() と同じ規則である。 */
+/* 値欄を集合として解釈し、配列シンボルとして登録する。 */
 static int symbol_set_from_text(AsmState *st, const char *dst_upper, const char *value_field){
     ItemVec items;
     if(!set_expr_from_text(st, value_field, &items)
        && !set_literal_from_text(st, value_field, &items)) return 0;
-    arrsym_install(st, dst_upper, items.data, items.len);   /* 所有権を移す */
+    arrsym_install(st, dst_upper, items.data, items.len);
     return 1;
 }
 
-/* `[...]` の中身を項目に切って登録する。q は `[` を指していること。
- * 区切りは最上位のカンマだけで、`"..."` の中や入れ子の括弧の中のカンマは
- * 区切りにしない（`[1,(2,3)]` のような書き方で崩れないようにするため）。 */
+/* `[...]` の中身を配列シンボルとして登録する。文字列は文字列、裸の名前は
+   綴りのままの文字列、ほかは式として評価した数値。 */
 static void arrsym_set_from_text(Assembler *asmb, const char *upper_name, const char *q){
     AsmState *st = &asmb->st;
     g_arrgen++;
@@ -11794,11 +10676,10 @@ static void arrsym_set_from_text(Assembler *asmb, const char *upper_name, const 
     a->items = NULL; a->len = 0;
     int cap = 0;
 
-    const char *p = q + 1;         /* `[` の次から */
+    const char *p = q + 1;
     while(*p){
         while(*p==' '||*p=='\t') p++;
         if(*p==']' || !*p) break;
-        /* 1項目ぶんの範囲を測る。 */
         const char *b = p;
         int depth = 0, inq = 0;
         while(*p){
@@ -11830,9 +10711,6 @@ static void arrsym_set_from_text(Assembler *asmb, const char *upper_name, const 
             it->is_str = 1;
             it->s = txt_template_inner(item);
         } else if(bare_name_of(item, nm, sizeof(nm))){
-            /* 素の名前（`R0` など）は書かれたままの文字列。`[R0,R1,R2]` と
-             * `["R0","R1","R2"]` は同じ意味になる。その名前に `.setsym`／
-             * `.map` で与えた数値が要るときは `[#R0,#R1]` と書く。 */
             it->is_str = 1;
             it->s = strdup(nm);
             if(!it->s){ perror("strdup"); exit(1); }
@@ -11846,23 +10724,25 @@ static void arrsym_set_from_text(Assembler *asmb, const char *upper_name, const 
     }
 }
 
-/* 文字列シンボルの表。数は多くないので素直な線形探索で引く。
- * 名前は大文字化した形で覚える（`.setsym` の数値シンボルと同じ規約）。 */
+/* 文字列シンボルを探す。 */
 static int strsym_find(AsmState *st, const char *upper_name){
     for(int i=0;i<st->strsym_names.len;i++)
         if(strcmp(st->strsym_names.data[i], upper_name)==0) return i;
     return -1;
 }
+/* 文字列シンボルの中身。 */
 static const char *strsym_get(AsmState *st, const char *upper_name){
     int i = strsym_find(st, upper_name);
     return (i < 0) ? NULL : st->strsym_vals.data[i];
 }
+/* 文字列シンボルを定義する。 */
 static void strsym_set(AsmState *st, const char *upper_name, const char *val){
     int i = strsym_find(st, upper_name);
     if(i >= 0){ free(st->strsym_vals.data[i]); st->strsym_vals.data[i] = strdup(val); return; }
     sv_push(&st->strsym_names, upper_name);
     sv_push(&st->strsym_vals,  val);
 }
+/* 文字列シンボルを消す。 */
 static void strsym_delete(AsmState *st, const char *upper_name){
     int i = strsym_find(st, upper_name);
     if(i < 0) return;
@@ -11876,39 +10756,16 @@ static void strsym_delete(AsmState *st, const char *upper_name){
     st->strsym_vals.len--;
 }
 
-/* ==================== 文字列テンプレートのエンコーディング欄 ====================
- * パターンの3欄目が `"..."` で始まるとき、その行は式の並びではなく
- * 「アセンブリ結果のテキスト」を作る。別の書式のニーモニックへ書き換える
- * ための欄で、たとえば
- *
- *     MOV R!r,!e:: "LD R{{r}},0x{{.hex(e)}}"
- *
- * に `MOV R1,0x10` を与えると `LD R1,0x10` を出す。
- *
- * 置き換わるのは `{{ }}` で囲んだところだけで、それ以外は書いたままの字が
- * 出る。`{{ }}` の中には
- *   - `式`                          … 評価して10進で埋める
- *   - `.hex(式)` `.dec(式)` `.bin(式)` `.float(式)`
- *                                   … 16進/10進/2進/浮動小数の文字列にする
- *                                     （桁だけで、`0x` などの接頭辞は付かない
- *                                      ので、要るなら外に書く）
- *   - `名前` `名前[添字]`           … 文字列シンボル／配列シンボル、
- *                                     どちらでもなければパターン変数の値
- *   - `.index 名前[添字]`           … その参照が使う添字そのもの
- *                                     （名前から番号を引くのに使う）
- *                                     （添字は名前・`"名前"`・式のいずれでもよい）
- *   - `.exp(変数)`                  … `!L変数` が拾った式・ラベルを、ソースに
- *                                     書かれていたままの文字で出す
- * が書ける。文字列の外と同じく `\n` `\t` `\r` `\\` `\"` は解く。
- *
- * 組み上がったテキストはそのままバイナリとしても出る。`.ascii` と同じく
- * UTF-8 の 1 バイトが 1 ワードになり、ロケーションカウンタもその分進んで
- * バイナリ／ELF 出力に載る。標準出力へのテキスト出力（トランスレータとしての
- * 使い方）はそのまま残るので、同じパターンで両方が得られる。 */
 
 typedef struct { char *b; size_t len, cap; } TxtBuf;
 
 static void txt_init(TxtBuf *t){ t->b=NULL; t->len=0; t->cap=0; }
+/* ---- テキストテンプレート -----------------------------------------------
+   出力欄の `"..."` を展開してテキストを作る。置き換えるのは二重波括弧の中
+   だけで、それ以外はバックスラッシュエスケープを除いて書いたままの文字が出る。
+   同じテキストは 1 バイト 1 ワードでバイナリにも出るので、1 つのパターン
+   ファイルが翻訳とアセンブルの両方を果たす。
+   ------------------------------------------------------------------------ */
 static void txt_addn(TxtBuf *t, const char *s, size_t n){
     if(t->len + n + 1 > t->cap){
         size_t nc = t->cap ? t->cap : 64;
@@ -11924,9 +10781,7 @@ static void txt_addn(TxtBuf *t, const char *s, size_t n){
 static void txt_addc(TxtBuf *t, char c){ txt_addn(t, &c, 1); }
 static void txt_adds(TxtBuf *t, const char *s){ txt_addn(t, s, strlen(s)); }
 
-/* -v の診断行に見せる写し。行が折れないよう、テキストの中の改行やタブは
- * `\n` `\t` と書いたまま見せる。素のまま流す方（トランスレータとしての
- * 標準出力）は解いた文字のままで、こちらは表示用の写しだけを変える。 */
+/* 診断に収まる形にエスケープして積む。 */
 static void txt_add_escaped(TxtBuf *t, const char *s){
     for(const unsigned char *p=(const unsigned char *)s; *p; p++){
         switch(*p){
@@ -11940,8 +10795,7 @@ static void txt_add_escaped(TxtBuf *t, const char *s){
     }
 }
 
-/* 値を radix 進の桁だけの文字列にする（`0x` のような接頭辞は付けない）。
- * 負の値は 2 の補数のままではなく `-` を付けた絶対値で出す。 */
+/* 値をその基数の数字だけで書く（基数プレフィックスは付けない）。 */
 static void txt_radix(TxtBuf *t, uint256_t v, int radix){
     int neg = 0;
     if(u256_lt_signed(v, u256_zero())){ neg = 1; v = u256_sub(u256_zero(), v); }
@@ -11959,12 +10813,9 @@ static void txt_radix(TxtBuf *t, uint256_t v, int radix){
     while(n > 0) txt_addc(t, tmp[--n]);
 }
 
-/* `.float(式)` は値を10進128ビット浮動小数点数（有効数字34桁）として書く。
- * 表記は「digits を d1.d2d3… ×10^exp10 と読む」形に正規化してから組み立てる。
- * 指数が小さいうちは普通の小数表記にし、小数部が無ければ `.0` を付ける
- * （16 なら `16.0`）。axx.py の _txt_float_parts() と同じ規則である。 */
 #define TXT_FLOAT_PREC 34
 
+/* 符号・数字列・指数から浮動小数点の表記を組む。 */
 static void txt_float_emit(TxtBuf *t, int neg, char *digits, int ndig, int exp10){
     while(ndig > 1 && digits[ndig-1] == '0') digits[--ndig] = '\0';
     if(neg) txt_addc(t, '-');
@@ -11993,8 +10844,7 @@ static void txt_float_emit(TxtBuf *t, int neg, char *digits, int ndig, int exp10
     }
 }
 
-/* 整数として束縛された値。10進の桁をそのまま取り出し、34桁を超える分は
- * 四捨五入して落とす。 */
+/* 整数を浮動小数点の表記で書く（`16` が `16.0` になる）。 */
 static void txt_float_int(TxtBuf *t, uint256_t v){
     int neg = 0;
     if(u256_lt_signed(v, u256_zero())){ neg = 1; v = u256_sub(u256_zero(), v); }
@@ -12021,14 +10871,13 @@ static void txt_float_int(TxtBuf *t, uint256_t v){
                 if(all[i] != '9'){ all[i]++; break; }
                 all[i--] = '0';
             }
-            /* 全桁が繰り上がったら桁が1つ増える。 */
             if(i < 0){ memmove(all+1, all, (size_t)n+1); all[0] = '1'; exp10++; }
         }
     }
     txt_float_emit(t, neg, all, n, exp10);
 }
 
-/* 浮動小数として束縛された値。34桁に正しく丸めた10進を取り出す。 */
+/* double を浮動小数点の表記で書く。 */
 static void txt_float_double(TxtBuf *t, double d){
     if(!(d == d) || d > 1.0e308*10 || d < -1.0e308*10){
         txt_adds(t, (d == d) ? (d > 0 ? "inf" : "-inf") : "nan");
@@ -12047,7 +10896,7 @@ static void txt_float_double(TxtBuf *t, double d){
     txt_float_emit(t, neg, digits, n, exp10);
 }
 
-/* テンプレート中の丸括弧の対応を取り、閉じ括弧の位置を返す。 */
+/* 対応する閉じ括弧の位置。 */
 static int txt_close_paren(const char *s, int i){
     int depth = 0;
     for(; s[i]; i++){
@@ -12057,7 +10906,7 @@ static int txt_close_paren(const char *s, int i){
     return -1;
 }
 
-/* `.hex` `.dec` `.bin` `.float` のどれかなら、名前の長さを返す。違えば 0。 */
+/* 変換名（`.hex` `.dec` `.bin` `.float` など）を読む。 */
 static int txt_conv_name(const char *s, int *kind){
     static const struct { const char *n; int k; } tbl[] = {
         {"float",3},{"hex",0},{"dec",1},{"bin",2},{NULL,0}
@@ -12071,7 +10920,7 @@ static int txt_conv_name(const char *s, int *kind){
     return 0;
 }
 
-/* 式を評価し、kind（-1/1:10進 0:16進 2:2進 3:浮動小数）に従って積む。 */
+/* 式を評価してテキストとして積む。 */
 static void txt_emit_expr(Assembler *asmb, TxtBuf *t, const char *expr, int kind){
     AsmState *st = &asmb->st;
     int io;
@@ -12085,7 +10934,6 @@ static void txt_emit_expr(Assembler *asmb, TxtBuf *t, const char *expr, int kind
     case 0: txt_radix(t, v, 16); break;
     case 2: txt_radix(t, v, 2);  break;
     case 3:
-        /* 浮動小数として評価された式はビット列を、そうでなければ整数値を読む。 */
         if(st->exp_typ_float) txt_float_double(t, u256_to_double(v));
         else                  txt_float_int(t, v);
         break;
@@ -12093,15 +10941,8 @@ static void txt_emit_expr(Assembler *asmb, TxtBuf *t, const char *expr, int kind
     }
 }
 
-/* テンプレートの中の名前を解決して積む。
- * 優先順位は
- *   1. `.setsym::名前::"文字列"` の文字列シンボル … その文字列
- *   2. 変数として使われている名前                 … パターン変数の値（10進）
- *   3. どれでもない                               … 書かれたままの文字
- * で、`{{x}}` の `x` は 1 に、`{{r}}` の `r` は 2 に当たる。
- * 数値シンボルをここで引かないのは、`num=` のような普通の文（たまたま
- * `.setsym::NUM` がある）が黙って数字に化けるのを避けるため。数値が要る
- * ときは `{{#NUM}}` と書けば本体の式評価器が引く。 */
+/* 単独の名前を解決して積む。順序は文字列シンボル、配列シンボル、式。
+   数値シンボルは 1 番目では引かないので、ただの単語が黙って数値に化けない。 */
 static void txt_emit_name(Assembler *asmb, TxtBuf *t, const char *name, int len){
     AsmState *st = &asmb->st;
     char key[512];
@@ -12112,7 +10953,6 @@ static void txt_emit_name(Assembler *asmb, TxtBuf *t, const char *name, int len)
     const char *sv = strsym_get(st, key);
     if(sv){ txt_adds(t, sv); return; }
 
-    /* 添字なしの配列は、全項目を `,` でつないで出す。 */
     struct ArrSym *ar = arrsym_get(st, key);
     if(ar){
         for(int k=0;k<ar->len;k++){
@@ -12123,10 +10963,6 @@ static void txt_emit_name(Assembler *asmb, TxtBuf *t, const char *name, int len)
         return;
     }
 
-    /* パターン変数（`a` でも `var_2` でも同じ規則）。パターンファイルが
-     * その名前を変数として使っていれば値を、そうでなければ書かれたままの
-     * 文字を出す。ふつうの単語が黙って数字に化けないようにするためで、
-     * 変数と決まっている名前が未束縛なら 0 になる。 */
     if(is_var_name_n(name, len)){
         int vs = var_slot(name, len, 0);
         if(vs >= 0){ txt_radix(t, st->vars[vs].val, 10); return; }
@@ -12134,7 +10970,6 @@ static void txt_emit_name(Assembler *asmb, TxtBuf *t, const char *name, int len)
     txt_addn(t, name, (size_t)len);
 }
 
-/* 添字が配列の範囲に入っていれば *out に入れて真を返す。外なら診断して偽。 */
 static int txt_arr_index_check(Assembler *asmb, struct ArrSym *ar, const char *key,
                                int64_t n, int64_t *out){
     if(n < 0 || n >= ar->len){
@@ -12147,11 +10982,8 @@ static int txt_arr_index_check(Assembler *asmb, struct ArrSym *ar, const char *k
     return 1;
 }
 
-/* 欄が `"..."` ひとつだけなら、逃げ方を解いた中身を out に入れて真を返す。
- * `.index arrb["CX"]` の `"CX"` のように、名前をそのまま書くための形である。
- * テンプレートの中では `"` が文字列の終わりなので `\"CX\"` と逃がして書くこと
- * になる。その形も同じに受ける。
- * axx.py の _txt_quoted_text() と同じ規則である。 */
+/* 添字に書かれた文字列リテラルを中身に開く。これがあるので `arr["CX"]` は
+   `arr[CX]` と同じに読まれる。 */
 static int txt_quoted_text(const char *t, char *out, size_t cap){
     const char *delim;
     size_t dl;
@@ -12163,7 +10995,7 @@ static int txt_quoted_text(const char *t, char *out, size_t cap){
         if(strncmp(t+i, delim, dl)==0){
             const char *tail = t + i + dl;
             while(*tail==' '||*tail=='\t') tail++;
-            if(*tail) return 0;                /* 閉じたあとに何か書いてある */
+            if(*tail) return 0;
             out[w] = '\0';
             return 1;
         }
@@ -12182,22 +11014,9 @@ static int txt_quoted_text(const char *t, char *out, size_t cap){
         if(w + 1 >= cap) return 0;
         out[w++] = c;
     }
-    return 0;                                  /* 閉じ `"` が無い */
+    return 0;
 }
 
-/* 添字の欄を配列 ar の添字（0 起点）に解く。解けたら真を返して *out に入れる。
- * まず `"..."` と書かれた欄はその中身に開く（`arrb["CX"]` は `arrb[CX]` と同じ
- * に読む）。そのうえで
- *   1. 文字列シンボルの名前ひとつ … その文字列を添字の欄として読み直す
- *   2. パターン変数の名前ひとつ   … 4 へ（変数の値で引く）
- *   3. 配列の項目名そのもの       … その項目の位置
- *      それが無ければ同じ名前の `.setsym`／`.map` の数値シンボル … その値
- *   4. どれでもない               … ふつうの式として評価した値
- * の順に解く。`.setsym::var1::BX` のときの `arrb[var1]` は 1 を通り、`BX` が
- * `.map::r::AX,BX,CX` で 1 になっているので添字 1 になる。`arrb["CX"]` なら同じ
- * く 3 の後半で 2 になる。名前の並びをそのまま持つ配列（`[AX,BX,CX]`）なら 3 の
- * 前半で位置が決まる。
- * axx.py の _arr_index_of() と同じ規則である。 */
 static int txt_arr_index_of(Assembler *asmb, struct ArrSym *ar, const char *key,
                             const char *idxtext, int64_t *out){
     AsmState *st = &asmb->st;
@@ -12214,14 +11033,11 @@ static int txt_arr_index_of(Assembler *asmb, struct ArrSym *ar, const char *key,
         axx_strupr_to(up, nm, sizeof(up));
         const char *sv = strsym_get(st, up);
         if(sv){
-            /* 文字列シンボルの中身を、添字の欄として読み直す。 */
             snprintf(cur, sizeof(cur), "%s", sv);
             have = bare_name_of(cur, nm, sizeof(nm));
             if(have) axx_strupr_to(up, nm, sizeof(up));
         }
     }
-    /* 変数の綴り（小文字で書かれ、パターンファイルが変数として使っている
-     * 名前）は、名前ではなく値として読む。 */
     int is_var = 0;
     if(have){
         int len = (int)strlen(nm);
@@ -12247,9 +11063,6 @@ static int txt_arr_index_of(Assembler *asmb, struct ArrSym *ar, const char *key,
     return txt_arr_index_check(asmb, ar, key, u256_to_i64(iv), out);
 }
 
-/* `x[3]` のような添字つきの参照を積む。添字は 0 から数える。
- * 配列でない名前や解けない添字は診断して何も出さない。添字の解き方は
- * txt_arr_index_of() にまとめてあり、`.index` と同じである。 */
 static void txt_emit_indexed(Assembler *asmb, TxtBuf *t,
                              const char *name, int len, const char *idxtext){
     AsmState *st = &asmb->st;
@@ -12271,7 +11084,7 @@ static void txt_emit_indexed(Assembler *asmb, TxtBuf *t,
     else                    txt_radix(t, ar->items[n].v, 10);
 }
 
-/* 名前の直後の `[...]` の閉じ位置を返す。無ければ -1。 */
+/* 対応する閉じブラケットの位置。 */
 static int txt_close_bracket(const char *s, int i){
     int depth = 0;
     for(; s[i]; i++){
@@ -12281,7 +11094,7 @@ static int txt_close_bracket(const char *s, int i){
     return -1;
 }
 
-/* `{{...}}` の中身が名前ひとつだけかどうか。そうなら長さを返す。 */
+/* 単独の名前の長さ。 */
 static int txt_bare_name_len(const char *s){
     int i = 0;
     while(s[i]==' '||s[i]=='\t') i++;
@@ -12294,14 +11107,12 @@ static int txt_bare_name_len(const char *s){
     return s[i] ? 0 : len;
 }
 
-/* `.index 配列[式]` なら、配列名を name に、添字の式を *idx に（malloc した
- * 写し）入れて真を返す。`.index(配列[式])` と括弧で括って書いてもよい。
- * axx.py の _txt_index_call() と同じ規則である。 */
+/* `.index` の 2 つの書き方の両方を読む。 */
 static int txt_index_call(const char *s, char *name, size_t ncap, char **idx){
     static const char *w = "INDEX";
     int k = 0;
     for(; k < 5; k++) if(axx_upper_char(s[k]) != w[k]) return 0;
-    if(!(s[k]==' ' || s[k]=='\t' || s[k]=='(')) return 0;  /* `.indexof` など別の名前 */
+    if(!(s[k]==' ' || s[k]=='\t' || s[k]=='(')) return 0;
     char *body = strdup(s + k);
     if(!body){ perror("strdup"); exit(1); }
     char *b = body;
@@ -12320,7 +11131,6 @@ static int txt_index_call(const char *s, char *name, size_t ncap, char **idx){
         bl = strlen(b);
         while(bl > 0 && (b[bl-1]==' '||b[bl-1]=='\t')) b[--bl] = '\0';
     }
-    /* ここからは `名前[式]` の形でなければならない。 */
     char *p = b;
     if(!(isalpha((unsigned char)*p) || *p=='_')){ free(body); return 0; }
     char *nb = p;
@@ -12342,8 +11152,7 @@ static int txt_index_call(const char *s, char *name, size_t ncap, char **idx){
     return 1;
 }
 
-/* `.index 配列[式]` の値を積む。`{{arr[e]}}` が引く項目の、その添字そのもの
- * （0 起点）を10進で出す。配列でない名前や解けない添字は診断して何も出さない。 */
+/* 項目ではなく添字そのものを 10 進で積む。名前から番号への引き当て。 */
 static void txt_emit_index(Assembler *asmb, TxtBuf *t, const char *name, const char *idxtext){
     AsmState *st = &asmb->st;
     char key[512];
@@ -12360,16 +11169,13 @@ static void txt_emit_index(Assembler *asmb, TxtBuf *t, const char *name, const c
     txt_radix(t, u256_from_i64(n), 10);
 }
 
-/* `.exp(変数)` なら変数名を name に入れて真を返す。中に書けるのは変数名
- * ひとつだけで、式は書けない。`!L変数` が拾った「ソースに書かれていたままの
- * 式・ラベルの文字」を指す名前である。
- * axx.py の _txt_exp_call() と同じ規則である。 */
+/* `.exp(変数)` の形を読む。 */
 static int txt_exp_call(const char *s, char *name, size_t ncap){
     static const char *w = "EXP";
     int k = 0;
     for(; k < 3; k++) if(axx_upper_char(s[k]) != w[k]) return 0;
     if(!(s[k]==' ' || s[k]=='\t' || s[k]=='('))
-        return 0;                      /* `.expand` など別の名前 */
+        return 0;
     char *body = strdup(s + k);
     if(!body){ perror("strdup"); exit(1); }
     char *b = body;
@@ -12387,7 +11193,6 @@ static int txt_exp_call(const char *s, char *name, size_t ncap){
     while(*nm==' '||*nm=='\t') nm++;
     size_t nl2 = strlen(nm);
     while(nl2 > 0 && (nm[nl2-1]==' '||nm[nl2-1]=='\t')) nm[--nl2] = '\0';
-    /* 変数名でなければ `.exp` ではない。 */
     if(nl2 == 0 || (int)nl2 != var_name_len(nm) || nl2 >= ncap){
         free(body); return 0;
     }
@@ -12396,9 +11201,7 @@ static int txt_exp_call(const char *s, char *name, size_t ncap){
     return 1;
 }
 
-/* `.exp(変数)` の中身を積む。`!L変数` が拾った文字をそのまま出す。
- * その行で拾っていなければ（省略可部分に入っていた等）何も出さない。そもそも
- * 変数として使われていない名前なら書き損じなので診断する。 */
+/* `!L` が覚えた綴りを、ソースに書かれていたまま積む。 */
 static void txt_emit_exp(Assembler *asmb, TxtBuf *t, const char *name){
     AsmState *st = &asmb->st;
     int slot = var_slot(name, (int)strlen(name), 0);
@@ -12413,13 +11216,11 @@ static void txt_emit_exp(Assembler *asmb, TxtBuf *t, const char *name){
     txt_adds(t, st->captext + off);
 }
 
-/* テンプレート本文（引用符の中身）を展開して t に積む。 */
+/* テンプレートを展開してテキストを作る。 */
 static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
     AsmState *st = &asmb->st;
     for(int i = 0; s[i]; ){
         if(s[i]=='\\' && s[i+1]){
-            /* `.ascii` と同じ逃げ方をする制御文字だけを解き、それ以外の
-             * `\x` は x をそのままの字として出す（小文字の逃げ道）。 */
             switch(s[i+1]){
             case 'n':  txt_addc(t, '\n');  break;
             case 't':  txt_addc(t, '\t');  break;
@@ -12437,12 +11238,10 @@ static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
             char *inner = malloc((size_t)n + 1);
             if(!inner){ perror("malloc"); exit(1); }
             memcpy(inner, s+i+2, (size_t)n); inner[n] = '\0';
-            /* `{{.hex(e)}}` のように中身が変換関数ならそれを使う。 */
             int j = 0; while(inner[j]==' ') j++;
             int kind = -1, nl = 0;
             int done = 0;
             if(inner[j]=='.'){
-                /* `.exp(変数)` は `!L変数` が拾った式・ラベルの文字そのもの。 */
                 char enm[512];
                 if(txt_exp_call(inner+j+1, enm, sizeof(enm))){
                     txt_emit_exp(asmb, t, enm);
@@ -12450,7 +11249,6 @@ static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
                 }
             }
             if(!done && inner[j]=='.'){
-                /* `.index 配列[式]` は、その参照が使う添字そのものを返す。 */
                 char inm[512]; char *iex = NULL;
                 if(txt_index_call(inner+j+1, inm, sizeof(inm), &iex)){
                     txt_emit_index(asmb, t, inm, iex);
@@ -12468,7 +11266,6 @@ static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
                 }
             }
             if(!done){
-                /* `{{x[3]}}` のように名前と添字なら、配列シンボルを引く。 */
                 int bs = 0; while(inner[bs]==' '||inner[bs]=='\t') bs++;
                 int be = bs;
                 if((inner[be]>='a'&&inner[be]<='z')||(inner[be]>='A'&&inner[be]<='Z')
@@ -12491,7 +11288,6 @@ static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
                 }
             }
             if(!done){
-                /* `{{x}}` のように名前ひとつなら、文字列／配列シンボルを先に見る。 */
                 int bl = txt_bare_name_len(inner);
                 if(bl > 0){
                     char bk[512];
@@ -12514,7 +11310,7 @@ static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
     }
 }
 
-/* `"..."` から中身を取り出す。`\` はそのまま残して txt_render() に任せる。 */
+/* テンプレートの外側の引用符を外す。 */
 static char *txt_template_inner(const char *q){
     size_t n = strlen(q);
     char *r = malloc(n + 1);
@@ -12529,18 +11325,15 @@ static char *txt_template_inner(const char *q){
     return r;
 }
 
-/* パターンのエンコーディング欄を評価して、出力ワード列 objl を作る。
- * s_in はカンマ区切りの式の並び。`%%`(連番) と `@@[]`(反復) は呼び出し前に
- * 展開済み。要素が `;` で始まるものは条件付き出力で、値が 0 なら何も出さない
- * （x86 の REX プレフィックスの有無のような分岐に使う）。
- * 要素が `"..."` のときは文字列テンプレート（3.5.2）で、展開したテキストの
- * バイト列がそのままワードになる。式と混ぜて並べてよい。 */
+/* 出力欄を評価して、その行のワード列を作る。
+   先に繰り返しと `%%` の添字を展開し、残りをカンマで 1 要素ずつ見る。要素は
+   二重引用符ならテキストテンプレート（UTF-8 の 1 バイトが 1 ワード。ワード幅を
+   超えるバイトは警告して切る）、`.call` ならミニ言語、空ならアラインメント、
+   ほかは式。頭の `;` は値が 0 のとき飛ばし、`;;` は評価して捨てる。 */
 static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     AsmState *st=&asmb->st;
     iv_clear(objl);
 
-    /* 行に現れた `"..."` の展開結果をつないでおく。標準出力へのテキスト出力
-     * （トランスレータとしての使い方）に使う。 */
     TxtBuf txtacc;  txt_init(&txtacc);
     TxtBuf dispacc; txt_init(&dispacc);
     int have_text = 0;
@@ -12549,19 +11342,10 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     char *ep_buf = NULL;
     int is_empty = 0;
 
-    /* 破綻点修正: バッファが小さすぎて再試行するとき、e_p() はキャプチャ
-     * スロット(vars / elf_var_to_label / elf_refs)を書き換える副作用を
-     * 持つ。捨てられる1回目の評価の副作用が2回目の評価に持ち越されると、
-     * 「同じキャプチャ参照の2回目の出現」と誤判定されて曖昧扱いになり、
-     * 有効なラベル→変数キャプチャが静かに失われることがあった。
-     * combo_done 側の既存パターンと同じく、再試行のたびに退避した状態へ
-     * 復元してから e_p() を呼び直す。 */
     PatVar saved_vars[NVARS];
     memcpy(saved_vars, st->vars, sizeof(saved_vars));
     int saved_elf_refs_len = st->elf_refs_len;
     struct {int set; char *label_name; uint64_t label_val;} saved_vtl[NVARS];
-    /* 退避した個数を控える。e_p() の評価中に `名前:=式` で変数名が増えても、
-     * 復元は退避した分だけを回す。 */
     int saved_nvars = g_nvars;
     for(int vi=0;vi<saved_nvars;vi++){
         saved_vtl[vi].set       = st->elf_var_to_label[vi].set;
@@ -12578,7 +11362,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         memset(ep_buf, 0, ep_cap);
         if(!first_try){
             memcpy(st->vars, saved_vars, sizeof(saved_vars));
-            vars_touch_all();   /* 記録を通さずに書いたので印を付け直す */
+            vars_touch_all();
             for(int ri2=saved_elf_refs_len; ri2<st->elf_refs_len; ri2++)
                 free(st->elf_refs[ri2].name);
             st->elf_refs_len = saved_elf_refs_len;
@@ -12621,9 +11405,6 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
     free(ep_buf);
 
     int slen = (int)strlen(s);
-    /* 破綻点修正(性能): 要素ごとの評価に「長さは既知・二重NUL終端済み」を
-     * 教えて、文字列全体の複製と strlen() の掛け直しを省く。s はこのループが
-     * 終わるまで解放されないので、番地が使い回されて古くなることはない。 */
     if((size_t)slen + 1 < s_cap) s[slen+1] = '\0';
     else { char *s2 = realloc(s, (size_t)slen + 2); if(s2){ s = s2; s_cap = (size_t)slen + 2; s[slen+1] = '\0'; } }
     const char *_prev_slen_ptr = g_expr_slen_ptr;
@@ -12645,10 +11426,8 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         int semicolon=0, drop=0;
         if(s[idx]==';'){
             semicolon=1; idx++;
-            /* `;;要素` は評価だけして何も出さない。 */
             if(s[idx]==';'){ drop=1; idx++; }
         }
-        /* `"..."` はテキストとして展開し、そのバイト列をワードとして出す。 */
         {
             int qs = idx;
             while(s[qs]==' '||s[qs]=='\t') qs++;
@@ -12658,7 +11437,6 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
                 txt_render(asmb, &t, inner);
                 free(inner);
                 const char *txt = t.b ? t.b : "";
-                /* `;;` は何も出さず、`;` は中身が空なら出さない。 */
                 if(!(drop || (semicolon && txt[0]=='\0'))){
                     uint64_t word_mask = (st->bts > 0) ? axx_word_mask(st->bts) : 0xFFu;
                     int trunc = 0;
@@ -12673,7 +11451,6 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
                                         "(high bits discarded): %s\n", st->bts, r);
                     }
                     txt_adds(&txtacc, txt);
-                    /* 診断行では欄に書いたとおり `"A","B"` と分けて見せる。 */
                     if(have_text) txt_addc(&dispacc, ',');
                     txt_addc(&dispacc, '"');
                     txt_add_escaped(&dispacc, txt);
@@ -12681,7 +11458,6 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
                     have_text = 1;
                 }
                 free(t.b);
-                /* 閉じ `"` の次まで読み飛ばす。 */
                 int closed = 0;
                 idx = qs + 1;
                 while(s[idx]){
@@ -12703,13 +11479,9 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
            && axx_upper_char(s[idx+3])=='L' && axx_upper_char(s[idx+4])=='L'
            && !(isalnum((unsigned char)s[idx+5]) || s[idx+5]=='_')){
             IntVec callw; iv_init(&callw);
-            /* 引数はふつうのパターン式なので、ここでも何ワード目かを立てておく。
-             * そうしないと `.call` に渡したラベル参照が追跡されず、`.reloc` を
-             * 宣言してもリロケーションが出ない。 */
             int _call_widx = objl->len;
             st->elf_current_word_idx = _call_widx;
             idx = mini_call_binary(asmb, s, idx, &callw);
-            /* `;` 付きは、出したワードが 1 個で 0 のときだけ何も出さない。 */
             if(!(drop || (semicolon && callw.len == 1 && u256_is_zero(callw.data[0])))){
                 for(int q = 0; q < callw.len; q++) iv_push(objl, callw.data[q]);
             } else {
@@ -12727,8 +11499,6 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
             if(s[idx]==','){ idx++; continue; }
             break;
         }
-        /* ワード番号は「いま objl に積まれている数」。`;` 付きで出力されなかった
-         * 要素は番号を消費しない（axx.py の `_elf_current_word_idx = len(objl)`）。 */
         int cur_widx = objl->len;
         st->elf_current_word_idx = cur_widx;
         if(st->pas==1) st->pass1_size_mode=1;
@@ -12736,9 +11506,6 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
         uint256_t x=expr_expression_pat(asmb,s,idx,&io);
         if(st->pas==1){ st->pass1_size_mode=0; st->error_undefined_label=0; }
         idx=io;
-        /* 破綻点修正: 以前は未定義ラベルを含むワードを objl に積まずに読み飛ばして
-         * いたため、命令長と `$.` が axx.py（値がゴミでも必ず積む）とずれていた。
-         * 未定義は error_undefined_label の伝播だけで表現し、長さは変えない。 */
         if(!drop && (semicolon ? !u256_is_zero(x) : 1)){
             iv_push(objl,x);
         } else {
@@ -12773,6 +11540,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
 
 typedef struct { IntVec *data; int len; int cap; } IVVec;
 static void ivv_init(IVVec*v){v->data=NULL;v->len=0;v->cap=0;}
+/* ワード列の並びに 1 本積む。 */
 static void ivv_push(IVVec*v,IntVec*iv){
     if(v->len>=v->cap){
         v->cap=v->cap?v->cap*2:8;
@@ -12781,26 +11549,18 @@ static void ivv_push(IVVec*v,IntVec*iv){
     }
     IntVec *dst=&v->data[v->len++]; iv_init(dst); iv_copy(dst,iv);
 }
+/* ワード列の並びを解放する。 */
 static void ivv_free(IVVec*v){
     for(int i=0;i<v->len;i++) iv_free(&v->data[i]);
     free(v->data); ivv_init(v);
 }
 
+/* int の比較関数（現在は未使用）。 */
 AXX_UNUSED static int int_cmp(const void*a,const void*b){
     int ia=*(const int*)a, ib=*(const int*)b;
     return (ia > ib) - (ia < ib);
 }
 
-/* `!!` 区切りで並んだ複数命令を1つの VLIW パケットに詰めて出力する。
- *
- * 各スロットを lineassemble2() で個別に組み立て、vliwinstbits 幅のフィールドへ
- * 順に詰め、余ったスロットは vliwnop で埋める。EPIC ならスロットの組み合わせに
- * 対応するテンプレート値を合成する（テンプレート幅が負ならパケットの上位側に置く）。
- * 最後にパケット幅ぶんのバイト列として書き出し、pc をパケット1個分進める。
- *
- * 注意: パケット全体を書き終えるまで pc は進まないので、スロットの中身が
- * .section 等のディレクティブだと誤った pc を基準に副作用が起きる。
- * そのためスロット内のディレクティブは明確なエラーとして弾く。 */
 static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVec *objl_in,
                        int idx, int *idx_out){
     AsmState *st=&asmb->st;
@@ -12869,10 +11629,6 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
 
     for(int ki=0;ki<st->vliwset.len;ki++){
         VliwSetEntry *k=&st->vliwset.data[ki];
-        /* 破綻点修正: 以前は両方の並びをソートしてから比較していたため、
-         * スロットの「順序」が違うだけの EPIC テンプレートまで一致扱いになり、
-         * axx.py（`list(k[0]) == list(idxlst)` で順序込みの比較）と
-         * 違うテンプレート値を選ぶことがあった。順序込みで比較する。 */
         int match = (k->nidxs == nidxlst);
         if(match){
             for(int mi=0; mi<nidxlst; mi++)
@@ -12914,11 +11670,6 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
                 fprintf(stderr,"warning-VLIW:%d values exceed slot capacity %d,truncating.\n",values.len,target_len);
             values.len=target_len;
         } else {
-            /* 破綻点修正: 以前は「不足数 × NOP のバイト数」個を積んでいた
-             * （必要なのは不足数ぶんだけ）。使われるのは先頭 target_len 個なので
-             * 出力は変わらないが、NOP 1個ぶんのバイト数倍の無駄な確保をしていた。
-             * NOP パターンを周期的に繰り返して、不足数ちょうどを積む
-             * （axx.py の「NOP を full 個＋余り」と同じ並びになる）。 */
             int needed=target_len-values.len;
             for(int pi=0;pi<needed;pi++){
                 uint256_t nv = (st->vliwnop.len > 0)
@@ -12987,6 +11738,12 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
     return found;
 }
 
+/* ---- ソース側ディレクティブ ---------------------------------------------
+   パターンファイルに関係なく常に使えるのはここにあるものだけ。`DB` のような
+   バイト出力ニーモニックは組み込みではなく、パターンファイルが定義したときに
+   だけ存在する。
+   ------------------------------------------------------------------------ */
+/* `.labelc` — ラベルに使える文字を増やす。 */
 static int adir_labelc(AsmState *st, const char *l, const char *ll){
     char up[32]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".LABELC")!=0) return 0;
@@ -12997,6 +11754,8 @@ static int adir_labelc(AsmState *st, const char *l, const char *ll){
     return 1;
 }
 
+/* 行頭の `label:` と `.equ` を処理する。`.equ` のラベルは再配置情報を失い、
+   定数として扱われる。 */
 static char *adir_label_processing(Assembler *asmb, const char *l, char *out, size_t osz){
     AsmState *st=&asmb->st;
     if(!l[0]){ out[0]=0; return out; }
@@ -13014,9 +11773,6 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
             const char *expr_tail = l + idx;
             int reloc_type = -1;
             const char *dcolon = strstr(expr_tail, "::");
-            /* 破綻点修正: `.EQU 式::型名` の式を 1024 バイトの自動変数に写して
-             * いたため、長い式が診断もなく途中で切れて axx.py と違う値になって
-             * いた。実際の長さぶんだけ確保する。 */
             char *expr_buf = NULL;
             if(dcolon){
                 size_t elen = (size_t)(dcolon - expr_tail);
@@ -13064,9 +11820,6 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
             label_put_value(st,label,u,st->current_section,1,reloc_type,st->error_undefined_label);
             free(expr_buf);
             if(label!=lblbuf) free(label);
-            /* テキスト置換モードでは `label: .equ 式` の行もテキストとして出す。
-             * ラベルの綴りは lineassemble() が前に付け直し、残りの `.equ 式` は
-             * どのパターンにも当たらないので素通しで出る。 */
             if(st->textmode){
                 int _n = lidx;
                 if(_n > (int)sizeof(st->label_text)-1) _n = (int)sizeof(st->label_text)-1;
@@ -13078,8 +11831,6 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
         } else {
             label_put_value(st,label,st->pc,st->current_section,0,-1,0);
             if(label!=lblbuf) free(label);
-            /* テキスト置換モードでは、落とした `label:` を出力の先頭に付け直す
-             * ため、書かれていたとおりの綴りを覚えておく。 */
             { int _n = lidx;
               if(_n > (int)sizeof(st->label_text)-1) _n = (int)sizeof(st->label_text)-1;
               memcpy(st->label_text, l, (size_t)_n);
@@ -13092,6 +11843,7 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
     strncpy(out,l,osz-1); out[osz-1]=0; return out;
 }
 
+/* `.ascii` / `.asciz` の文字列をバイト列にする。 */
 static int asciistr(Assembler *asmb, const char *l2){
     AsmState *st=&asmb->st;
     if(!l2[0]||l2[0]!='"') return 0;
@@ -13159,6 +11911,8 @@ static int asciistr(Assembler *asmb, const char *l2){
     return 1;
 }
 
+/* `.section` / `.segment` — セクションを切り替える。これが唯一の方法で、
+   `.text` のような短縮形は組み込みではない。 */
 static int adir_section(AsmState *st, const char *l, const char *l2){
     char up[32]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".SECTION")!=0 && strcmp(up,".SEGMENT")!=0) return 0;
@@ -13230,6 +11984,7 @@ static int adir_section(AsmState *st, const char *l, const char *l2){
     }
     return 1;
 }
+/* `.endsection` / `.endsegment` — セクションを閉じる。 */
 static int adir_endsection(AsmState *st, const char *l){
     char up[32]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ENDSECTION")!=0 && strcmp(up,".ENDSEGMENT")!=0) return 0;
@@ -13241,13 +11996,6 @@ static int adir_endsection(AsmState *st, const char *l){
     }
     uint256_t delta = u256_sub(st->pc, e->entry_pc);
     if(u256_lt_signed(delta, u256_zero())){
-        /* 破綻点修正: delta が負（.org でセクション内の pc を巻き戻した後に
-         * .ENDSECTION した場合）でも entry_pc・confirmed を無条件に更新して
-         * いたため、次にこのセクションを測る基準点が「既に (旧entry_pc,pc)
-         * として section_ranges へ記録済みの範囲」の内側まで後退し、
-         * アセンブリ終了時の最終クローズ処理がその範囲と重複するバイト域を
-         * 二重に積んでいた（axx.py はこの分岐で entry_pc を変更せずに抜ける
-         * ので重複しない。また axx.py はここで警告も出す）。 */
         char db[96]; u256_to_pydec(delta, db, sizeof(db));
         if(should_report_errors(st)){
             axx_diagf(0, 0, " warning - ENDSECTION: computed block size %s < 0 for "
@@ -13276,8 +12024,6 @@ static int adir_resX(Assembler *asmb, const char *l, const char *l2,
         return 1;
     }
     int64_t cnt=u256_to_i64(x);
-    /* 64bit へ切り詰めた値だけで判定すると、2**64 の倍数のような値が 0 に
-     * 見えて検査をすり抜けるので、元の 256bit 値でも比較する。 */
     if(u256_lt_signed(x, u256_zero())){
         if(should_report_errors(&asmb->st)){
             char cb[96]; u256_to_pydec(x, cb, sizeof(cb));
@@ -13302,18 +12048,23 @@ static int adir_resX(Assembler *asmb, const char *l, const char *l2,
     return 1;
 }
 
+/* `.resb` — バイトを出さず n バイト予約する。 */
 static int adir_resb(Assembler *asmb, const char *l, const char *l2){
     return adir_resX(asmb,l,l2,".RESB",1);
 }
+/* `.resw` — n ワード予約する。 */
 static int adir_resw(Assembler *asmb, const char *l, const char *l2){
     return adir_resX(asmb,l,l2,".RESW",2);
 }
+/* `.resd` — n ダブルワード予約する。 */
 static int adir_resd(Assembler *asmb, const char *l, const char *l2){
     return adir_resX(asmb,l,l2,".RESD",4);
 }
+/* `.resq` — n クワッドワード予約する。 */
 static int adir_resq(Assembler *asmb, const char *l, const char *l2){
     return adir_resX(asmb,l,l2,".RESQ",8);
 }
+/* `.zero` — ゼロバイトを並べる。 */
 static int adir_zero(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ZERO")!=0) return 0;
@@ -13334,10 +12085,6 @@ static int adir_zero(Assembler *asmb, const char *l, const char *l2){
         }
         return 1;
     }
-    /* 破綻点修正: 上限チェックが無く、巨大な .ZERO で事実上ハングしていた
-     * （axx.py は 1<<28 で打ち切る）。同じ上限を入れる。
-     * 64bit に収まらない値は u256_to_i64() の切り捨てで小さく見えうるので、
-     * 元の 256bit 値でも判定する。 */
     {
         const int64_t ZERO_MAX = (int64_t)1 << 28;
         if(cnt > ZERO_MAX || u256_gt_signed(x, u256_from_i64(ZERO_MAX))){
@@ -13355,11 +12102,13 @@ static int adir_zero(Assembler *asmb, const char *l, const char *l2){
     }
     return 1;
 }
+/* `.ascii` — 文字列のバイト列を出す。 */
 static int adir_ascii(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ASCII")!=0) return 0;
     return asciistr(asmb,l2);
 }
+/* `.asciz` — 文字列のバイト列と末尾の 0 を出す。 */
 static int adir_asciiz(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ASCIZ")!=0) return 0;
@@ -13374,6 +12123,7 @@ static int adir_asciiz(Assembler *asmb, const char *l, const char *l2){
     asmb->st.pc=u256_add(asmb->st.pc,u256_one());
     return 1;
 }
+/* `.align` — 整列する。引数なしなら前回の値を使う。 */
 static int adir_align(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ALIGN")!=0) return 0;
@@ -13406,6 +12156,8 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
     }
     return 1;
 }
+/* `.org` — ロケーションカウンタを設定する。`,p` を付けるとカウンタが目標より
+   下にある場合その隙間を埋める。 */
 static int adir_org(Assembler *asmb, const char *l, const char *l2){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".ORG")!=0) return 0;
@@ -13445,19 +12197,12 @@ static int adir_org(Assembler *asmb, const char *l, const char *l2){
     asmb->st.pc=u;
     return 1;
 }
+/* ラベルのエクスポート指定を処理する。 */
 static int adir_export(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".EXPORT")!=0 && strcmp(up,".GLOBAL")!=0) return 0;
-    /* 破綻点修正: パス1では 0 を返して「未処理」扱いにしていたため、
-     * `.global foo` の行がパス1だけパターン照合へ流れ、たまたま一致する
-     * パターンがあるとパス1でだけバイトが出てパス1/パス2のアドレスがずれた。
-     * ディレクティブとして必ず消費し、記録だけをパス2/対話時に限る。 */
     if(st->pas!=2&&st->pas!=0) return 1;
-    /* 破綻点修正: 4096 バイトの自動変数に写してから走査していたため、
-     * ラベルを多数並べた `.global a,b,c,...` が診断もなく途中で切れていた
-     * （実測: 600 個並べると caxx だけ 513 個しか登録されない）。
-     * このバッファは書き換えないので、写さず l2 をそのまま読めばよい。 */
     const char *buf = l2;
     int idx=0; int blen=(int)strlen(buf);
     while(idx<blen&&buf[idx]){
@@ -13466,13 +12211,8 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
         char *s = axx_word_buf(buf, idx, sbuf, sizeof(sbuf), &ssz);
         idx=axx_get_label_word(buf,idx,st->lwordchars,s,ssz);
         if(!s[0]){ if(s!=sbuf) free(s); break; }
-        /* ラベル名の読み取りが `::` の1つめを食っていたら1文字戻す
-         * （`.extern` と同じ扱い）。 */
         if(idx > 0 && buf[idx-1]==':' && idx < blen && buf[idx]==':')
             idx--;
-        /* `.global 名前::型名` — この名前への参照に使うリロケーション型を
-         * 指定できる。`.extern` と同じ書き方で、`.elftype` で決めた名前も
-         * マシンの名前表の名前も書ける。 */
         if(idx+1 < blen && buf[idx]==':' && buf[idx+1]==':'){
             idx += 2;
             int rt_start = idx;
@@ -13511,14 +12251,11 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
     return 1;
 }
 
+/* `.extern` / `.global` — シンボルを外部と結び付ける。 */
 static int adir_extern(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".EXTERN")!=0) return 0;
-    /* 破綻点修正: 4096 バイトの自動変数に写してから走査していたため、
-     * ラベルを多数並べた `.global a,b,c,...` が診断もなく途中で切れていた
-     * （実測: 600 個並べると caxx だけ 513 個しか登録されない）。
-     * このバッファは書き換えないので、写さず l2 をそのまま読めばよい。 */
     const char *buf = l2;
     int idx=0; int blen=(int)strlen(buf);
     while(idx<blen&&buf[idx]){
@@ -13532,11 +12269,6 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
             idx--;
         const ElfMachineInfo *_mtbl_ext = elf_machine_effective(st);
         int reloc_type = _mtbl_ext->extern_default;
-        /* このEXTERN文自身が `::型名` を明示したかどうか。reloc_type は
-         * 明示指定が無ければデフォルト型で埋まってしまうため、reloc_type
-         * 自体では「明示されたか」を区別できない。既存ラベルの
-         * reloc_type_override は明示指定があったときだけ上書きしたいので、
-         * 別のフラグで覚えておく。 */
         int explicit_reloc_type = 0;
         if(idx+1 < blen && buf[idx]==':' && buf[idx+1]==':'){
             idx += 2;
@@ -13544,8 +12276,6 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
             while(idx < blen && buf[idx]!=' ' && buf[idx]!='\t'
                   && buf[idx]!=',' && buf[idx]!=':' && buf[idx]!='\0')
                 idx++;
-            /* 破綻点修正: 型名を char[64] に収まるときしか見ていなかったので、
-             * 長い名前は警告も出ずに既定の型のまま通っていた。長さぶん取る。 */
             int rt_len = idx - rt_start;
             if(rt_len > 0){
                 char *rt_str = malloc((size_t)rt_len + 1);
@@ -13556,10 +12286,6 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
                     if(rt_str[_ci]>='A'&&rt_str[_ci]<='Z') rt_str[_ci]+=32;
                 int rtype = elf_reloc_named(st, _mtbl_ext, rt_str);
                 if(rtype < 0){
-                    /* 破綻点修正: 名前が引けなかったとき reloc_type を既定の
-                     * まま残していたため、axx.py（reloc_type を None にして
-                     * 「型の指定なし」に落とす）と別のリロケーション型を
-                     * 出していた（x86-64 で 2 と 10 の食い違い）。 */
                     reloc_type = -1;
                     axx_diagf(0, 0, " warning - unknown reloc type '%s' in .EXTERN for machine %d\n",
                                rt_str, st->elf_machine);
@@ -13572,10 +12298,6 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
         }
         if(idx < blen && buf[idx]==':') idx++;
         LabelEntry *existing=lmap_find(&st->labels,s);
-        /* 型名を書かなかった `.extern` の既定型は、パターンファイルの `.reloc`
-         * が命令フィールド型を決めた参照では使わない（ソースが型を「書いた」
-         * わけではないので、優先順位 3.7.8 の「ソースファイル」に当たらない）。
-         * axx.py の extern_untyped と同じ。 */
         if(explicit_reloc_type) extern_untyped_set(st, s, 0);
         else if(!existing) extern_untyped_set(st, s, 1);
         if(!existing){
@@ -13591,23 +12313,9 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
     return 1;
 }
 
-/* ---- ELF シンボル属性のディレクティブ（マニュアル 5.6.1 節）-------------
- *
- * `.type`／`.size`／`.weak`／`.hidden`／`.protected`／`.internal`／
- * `.other`／`.comm`。どれも「名前[::欄][::欄], 名前...」という同じ並びを
- * 取るので、切り出しは sym_decl_next() に集めてある。宣言は出力にしか
- * 効かないので、記録はパス2（と対話時）だけで行う。ただし `.weak` と
- * `.comm` は名前を外部シンボルとして登録もするので、そこだけは `.extern`
- * と同じくどのパスでも行う（パスによって登録が違うとアドレスがずれる）。
- * axx.py の同名のメソッドと同じ規則である。 */
 
 #define SYM_DECL_MAXF 2
 
-/* `名前[::欄...]` を1つ読む。読めたら 1 を返し、名前を *name_out（呼び出し側が
- * free する）、欄を fields[0..nfields-1]（同じく free、書かれていなければ
- * NULL）に置く。欄の切り方は `.extern 名前::型名` と同じで、`::` の直後から
- * 空白・カンマ・`:` の手前までを1欄とする。
- * axx.py の _sym_decl_scan() と同じ規則である。 */
 static int sym_decl_next(const AsmState *st, const char *buf, int blen, int *pidx,
                          char **name_out, char **fields, int nfields){
     for(int i=0;i<nfields;i++) fields[i] = NULL;
@@ -13620,8 +12328,6 @@ static int sym_decl_next(const AsmState *st, const char *buf, int blen, int *pid
     s[0] = 0;
     idx = axx_get_label_word(buf, idx, st->lwordchars, s, ssz);
     if(!s[0]){ if(s!=sbuf) free(s); *pidx = blen; return 0; }
-    /* ラベル名の読み取りが `::` の1つめを食っていたら1文字戻す
-     * （`.extern` と同じ扱い）。 */
     if(idx > 0 && buf[idx-1]==':' && idx < blen && buf[idx]==':') idx--;
     int nf = 0;
     while(nf < nfields && idx+1 < blen && buf[idx]==':' && buf[idx+1]==':'){
@@ -13634,7 +12340,6 @@ static int sym_decl_next(const AsmState *st, const char *buf, int blen, int *pid
         if(!fv){ perror("malloc"); exit(1); }
         memcpy(fv, buf+fs, (size_t)fl);
         fv[fl] = 0;
-        /* 前後の空白を落とす（axx.py の strip() と同じ）。 */
         char *b = fv; while(*b==' '||*b=='\t') b++;
         int bl = (int)strlen(b);
         while(bl>0 && (b[bl-1]==' '||b[bl-1]=='\t')) b[--bl]=0;
@@ -13652,13 +12357,12 @@ static int sym_decl_next(const AsmState *st, const char *buf, int blen, int *pid
     return 1;
 }
 
+/* シンボル属性ディレクティブの作業領域を解放する。 */
 static void sym_decl_free(char **name, char **fields, int nfields){
     free(*name); *name = NULL;
     for(int i=0;i<nfields;i++){ free(fields[i]); fields[i] = NULL; }
 }
 
-/* シンボル宣言の数値欄を評価する。読めないか範囲外なら診断して 0 を返す。
- * axx.py の _sym_decl_num() と同じ規則である。 */
 static int sym_decl_num(Assembler *asmb, const char *dname, const char *name,
                         const char *text, long long lo, long long hi,
                         long long *out){
@@ -13683,11 +12387,7 @@ static int sym_decl_num(Assembler *asmb, const char *dname, const char *name,
     return 1;
 }
 
-/* `.type <名前>::<種別>[, ...]` — シンボルの型（STT_*）。
- *
- * 種別は notype / object / func（function）/ section / file / common /
- * tls / gnu_ifunc（ifunc）、または 0〜15 の番号。大小は区別しない。
- * axx.py の type_processing() と同じ規則である。 */
+/* `.type` — ELF シンボルの種別を書く。 */
 static int adir_type(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
@@ -13721,11 +12421,7 @@ static int adir_type(Assembler *asmb, const char *l, const char *l2){
     return 1;
 }
 
-/* `.size <名前>::<式>[, ...]` — シンボルの大きさ（st_size）。
- *
- * 式の値はワード数である。ラベルの値と同じく1ワードのバイト数を掛けて
- * バイト数にするので、8 ビット機では書いたままの数が入る。
- * axx.py の size_processing() と同じ規則である。 */
+/* `.size` — 大きさを書く。値はワード数で、出力時に幅をかける。 */
 static int adir_size(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
@@ -13747,12 +12443,7 @@ static int adir_size(Assembler *asmb, const char *l, const char *l2){
     return 1;
 }
 
-/* `.weak <名前>[, ...]` — 弱いシンボル（STB_WEAK）。
- *
- * 定義してある名前なら `.global` と同じく外へ出し、束縛だけ弱くする。
- * まだ知らない名前は型名なしの `.extern` と同じに登録するので、弱い
- * 参照（解決できなければ 0 になる参照）がそのまま書ける。
- * axx.py の weak_processing() と同じ規則である。 */
+/* `.weak` — 弱シンボルにする。 */
 static int adir_weak(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
@@ -13761,14 +12452,12 @@ static int adir_weak(Assembler *asmb, const char *l, const char *l2){
     const char *buf = l2; int blen=(int)strlen(buf); int idx=0;
     char *nm; char *fv[SYM_DECL_MAXF];
     while(sym_decl_next(st, buf, blen, &idx, &nm, fv, 0)){
-        /* 登録はどのパスでも行う（パスによって違うとアドレスがずれる）。 */
         sym_declare_extern(st, nm);
         if(!record){ sym_decl_free(&nm, fv, 0); continue; }
         int k = sym_attr_slot(st, nm);
         st->sym_attrs[k].weak = 1;
         LabelEntry *le = lmap_find(&st->labels, nm);
         if(!(le && le->is_imported)){
-            /* ここで定義されている名前は `.global` と同じく外へ出す。 */
             uint256_t v = label_get_value(st, nm);
             const char *sec = label_get_section(st, nm);
             int is_equ_v = le ? le->is_equ : 0;
@@ -13781,11 +12470,7 @@ static int adir_weak(Assembler *asmb, const char *l, const char *l2){
     return 1;
 }
 
-/* `.hidden` / `.protected` / `.internal` `<名前>[, ...]` — 可視性。
- *
- * st_other の下位 2 ビット（STV_*）だけを書き換える。上位のビットは
- * `.other` で書いたものがそのまま残る。
- * axx.py の visibility_processing() と同じ規則である。 */
+/* `.hidden` / `.protected` / `.internal` — 可視性を書く。 */
 static int adir_visibility(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
@@ -13805,12 +12490,7 @@ static int adir_visibility(Assembler *asmb, const char *l, const char *l2){
     return 1;
 }
 
-/* `.other <名前>::<値>[, ...]` — st_other のバイトそのもの。
- *
- * 下位 2 ビットが可視性（STV_*）で、上位 6 ビットは機種ごとの意味を持つ
- * （PowerPC64 ELFv2 の局所入口のずれはビット 5〜7 にある）。可視性の
- * ディレクティブと違い、このバイトを丸ごと置き換える。
- * axx.py の other_processing() と同じ規則である。 */
+/* `.other` — st_other バイトを丸ごと置き換える。 */
 static int adir_other(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
@@ -13831,13 +12511,7 @@ static int adir_other(Assembler *asmb, const char *l, const char *l2){
     return 1;
 }
 
-/* `.comm <名前>::<大きさ>[::<整列>][, ...]` — 共通シンボル。
- *
- * SHN_COMMON のシンボルを出す。実体はリンカが作るので、このオブジェクト
- * 自身は領域を持たない。大きさはワード数（`.size` と同じ）、整列は
- * バイトで、書かなければ 1 になる。型は `.type` を書かなければ
- * STT_OBJECT(1) にする（GNU as と同じ）。
- * axx.py の comm_processing() と同じ規則である。 */
+/* `.comm` — 共通シンボルにする。 */
 static int adir_comm(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
@@ -13846,7 +12520,6 @@ static int adir_comm(Assembler *asmb, const char *l, const char *l2){
     const char *buf = l2; int blen=(int)strlen(buf); int idx=0;
     char *nm; char *fv[SYM_DECL_MAXF];
     while(sym_decl_next(st, buf, blen, &idx, &nm, fv, 2)){
-        /* 登録はどのパスでも行う（`.weak` と同じ理由）。 */
         sym_declare_extern(st, nm);
         if(!record){ sym_decl_free(&nm, fv, 2); continue; }
         long long sz;
@@ -13872,12 +12545,13 @@ static int adir_comm(Assembler *asmb, const char *l, const char *l2){
         st->sym_attrs[k].size_set = 1;
         st->sym_attrs[k].size     = (uint64_t)sz;
         st->sym_attrs[k].calign   = (uint64_t)al;
-        if(st->sym_attrs[k].stype == 0) st->sym_attrs[k].stype = 1;  /* STT_OBJECT */
+        if(st->sym_attrs[k].stype == 0) st->sym_attrs[k].stype = 1;
         sym_decl_free(&nm, fv, 2);
     }
     return 1;
 }
 
+/* `.reloctype` — 幅推測リロケーション型を上書きする。 */
 static int adir_reloctype(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
     char up[16]; axx_strupr_to(up,l,sizeof(up));
@@ -13891,7 +12565,6 @@ static int adir_reloctype(Assembler *asmb, const char *l, const char *l2){
     }
     static const int _widths[4] = {1, 2, 4, 8};
 
-    /* 写さずに読む（理由は adir_export のコメント参照）。 */
     const char *buf = l2;
     int blen=(int)strlen(buf);
     int idx=0, pos=0;
@@ -13973,10 +12646,16 @@ typedef struct {
     int       diags_len;
 } BestMatch;
 
+/* ---- 最良パターンの選択 -------------------------------------------------
+   最初に当たったパターンで止めない。すべて試し、当たったものに特異度スコアを
+   付けて最小のものを採る。これによりパターンファイル中の行の順序が結果に
+   影響しないので、特殊形を一般形の前に並べる手作業が要らない。
+   ------------------------------------------------------------------------ */
 static void best_init(BestMatch *b){
     memset(b, 0, sizeof(*b));
 }
 
+/* 候補の記録を解放する。 */
 static void best_free(BestMatch *b){
     for(int i=0;i<b->diags_len;i++) free(b->diags[i]);
     free(b->diags); free(b->diag_seterr);
@@ -13993,6 +12672,8 @@ static void best_free(BestMatch *b){
     memset(b, 0, sizeof(*b));
 }
 
+/* 特異度スコアの比較。式捕捉が少ないほう、同点ならリテラル一致が多いほう、
+   同点ならシンボル捕捉が少ないほうが勝つ。 */
 static int score_less(int e1,int s1,int l1, int e2,int s2,int l2){
     if(e1 != e2) return e1 < e2;
     if(l1 != l2) return l1 > l2;
@@ -14057,6 +12738,7 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
                  st->vliwset.data[i].nidxs, st->vliwset.data[i].templ);
 }
 
+/* 採択したパターンの時点のディレクティブ状態へ戻す。 */
 static void best_restore_dirstate(AsmState *st, const BestMatch *b){
     smap_assign(&st->symbols, &b->symbols);
     for(int i=0;i<g_nvars;i++){
@@ -14079,28 +12761,12 @@ static void best_restore_dirstate(AsmState *st, const BestMatch *b){
                  b->vliwset.data[i].nidxs, b->vliwset.data[i].templ);
 }
 
-/* ---- ディレクティブ前置きの畳み込み ----------------------------------
- * パターンファイルの先頭には、レジスタ名の `.setsym`、`.check`、`.error` と
- * いった「どのソース行でも同じ結果になる」ディレクティブ行が並ぶ。ところが
- * 照合はソース1行ごとにパターン表を頭からたどり直すので、この前置きも行数ぶん
- * 実行していた（aarch64 では 1 行につき 643 行、全体で 112 万回）。
- *
- * 前置きは1度だけ実行し、実行し終えた状態をここに控える。以後の行では控えた
- * 状態を戻すだけにして、前置きの行そのものはたどらない。控える／戻すのは
- * 「1行ごとに作り直される欄」（シンボル表・`.check`・`.reloc`・`.enum`）と、
- * 「前置きが必ず書く欄」だけである。前置きが書かない欄（`.bits` が前置きに
- * 無いときの語長など）は今までどおり前の行から持ち越す。
- *
- * 畳み込めるかどうかは pat_hoist_scan() が読み込み時に静的に決める。
- * 判断がつかない行が出たらそこで前置きは終わりで、その行から後ろは今までと
- * 同じように毎行たどる。 */
 typedef struct {
     int       valid;
     SymMap    symbols;
     ChkList  *check_constraints[NVARS];
     int       reloc_constraints[NVARS];
     EnumDef   enum_defs[NVARS];
-    /* 前置きが書く欄だけ控える（どれを書くかは hoist_* の印で分かる）。 */
     char      swordchars[256];
     uint256_t padding;
     int       bts, endian_big;
@@ -14110,6 +12776,7 @@ typedef struct {
 
 static DirSnap g_hdrsnap;
 
+/* 持ち上げ状態の写しを解放する。 */
 static void hdrsnap_free(DirSnap *d){
     if(!d->valid) return;
     smap_free(&d->symbols);
@@ -14119,6 +12786,8 @@ static void hdrsnap_free(DirSnap *d){
     memset(d, 0, sizeof(*d));
 }
 
+/* 先頭の持ち上げたディレクティブを処理し終えた状態を写し取る。反復ごとに
+   ここまで戻せば、先頭のディレクティブを読み直さずに済む。 */
 static void hdrsnap_take(DirSnap *d, AsmState *st){
     hdrsnap_free(d);
     smap_init(&d->symbols);
@@ -14144,6 +12813,7 @@ static void hdrsnap_take(DirSnap *d, AsmState *st){
     d->valid = 1;
 }
 
+/* 写し取った状態へ戻す。 */
 static void hdrsnap_restore(DirSnap *d, AsmState *st){
     smap_assign(&st->symbols, &d->symbols);
     for(int i=0;i<g_nvars;i++){
@@ -14180,6 +12850,7 @@ static void elf_refs_push_copy(AsmState *st, const char *name,
     st->elf_refs_len++;
 }
 
+/* パターンの先頭がその行に当たりうるかの粗い前判定。 */
 static int pat_prefix_matches(const char *pat, const char *lin){
     char pfx[64];
     int np = 0;
@@ -14191,14 +12862,9 @@ static int pat_prefix_matches(const char *pat, const char *lin){
     }
     if(np == 0) return 1;
 
-    /* ニーモニック直後のパターン文字が英数字を食える種類かどうか。
-       小文字（シンボル）, '!'（式）, '\\'（エスケープ）, '['（[[ ]] の開き）,
-       数字（リテラル）は食いうる。それ以外（'.' ',' '(' '#' 等のリテラル、
-       またはパターン終端）は食えないので、ソース側がそこで語を続けていれば
-       不一致が確定する。`MOVE` のパターンを `MOVEM` の行に試さないための足切り。 */
     int closed = 1;
     if(np >= (int)sizeof(pfx)-1){
-        closed = 0;               /* 打ち切ったので直後の文字が分からない */
+        closed = 0;
     } else if(*p){
         char c = *p;
         if((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
@@ -14222,11 +12888,7 @@ static int pat_prefix_matches(const char *pat, const char *lin){
     return 0;
 }
 
-/* テキストを出力ワードの並びにする。1文字が1ワードである。
- * 出力ワード幅（`.bits`）に収まらない文字があれば警告する（切り捨てそのものは
- * ワードを書く側が行う）。テキストを出す道すじ（`.passthru` の素通し、テキスト
- * 置換モードのコメント付け直し）で共通に使う。
- * axx.py の _text_words() と同じ規則である。 */
+/* テキストを出力ワードの並びにする。 */
 static void text_words(AsmState *st, const char *txt, IntVec *objl_out){
     uint64_t word_mask = (st->bts > 0) ? axx_word_mask(st->bts) : 0xFFu;
     int trunc = 0;
@@ -14242,11 +12904,6 @@ static void text_words(AsmState *st, const char *txt, IntVec *objl_out){
     }
 }
 
-/* `.passthru` のとき、マッチしなかった行をそのままテキストとして出す。
- * 出るのは照合にかけた形の行、つまり空白を1つに詰め、`;` コメントと行頭の
- * ラベル定義を落としたあとの行である。行末の改行は付けない — 1行が1行になる
- * ようにしたいときは `.eol` を書く。
- * axx.py の _passthru_line() と同じ規則である。 */
 static void passthru_line(Assembler *asmb, const char *l, const char *l2,
                           IntVec *objl_out){
     AsmState *st = &asmb->st;
@@ -14254,8 +12911,6 @@ static void passthru_line(Assembler *asmb, const char *l, const char *l2,
     txt_adds(&t, l);
     if(l2 && l2[0]){ txt_addc(&t, ' '); txt_adds(&t, l2); }
     const char *txt = t.b ? t.b : "";
-    /* 素通しする行は式として読まないので、照合の途中で立った未定義ラベルの
-     * 印はこの行には関わらない。 */
     st->error_undefined_label = 0;
     text_words(st, txt, objl_out);
     free(st->asmtext);
@@ -14270,13 +12925,7 @@ static void passthru_line(Assembler *asmb, const char *l, const char *l2,
     free(t.b);
 }
 
-/* テキスト置換モード（`.textmode`）で、処理せずテキストとしてだけ出す組み込み
- * アセンブリディレクティブか。いずれも自分でワードや領域を出す（あるいは
- * ロケーションカウンタを飛ばす）ものなので、テキストとして出したうえでさらに
- * 出させると中身が二重になり、翻訳結果のテキストに詰め物や生データが混ざって
- * しまう。テキスト置換モードでの出力は「書き換えたテキストそのもの」なので、
- * 行はテキストとして残し、出力の側は何も出さない。
- * axx.py の _TEXTMODE_TEXT_ONLY_DIRS と同じ表である。 */
+/* テキスト置換モードで、バイトを出さずに綴りだけ通すべき組み込みディレクティブか。 */
 static int textmode_text_only_dir(const char *l){
     static const char *tbl[] = { ".ORG", ".ALIGN", ".ZERO", ".ASCII", ".ASCIZ",
                                  ".RESB", ".RESW", ".RESD", ".RESQ", NULL };
@@ -14285,11 +12934,6 @@ static int textmode_text_only_dir(const char *l){
     return 0;
 }
 
-/* 組み込みアセンブリディレクティブを処理し終えた行の返り値。
- * テキスト置換モードでは、その行もテキストとして出す。翻訳結果から `.section`
- * や `.global` のような行が消えないようにするためである。そうでなければ今まで
- * どおり、出力を出さない行として返す。
- * axx.py の _dir_line_done() と同じ規則である。 */
 static int adir_done(Assembler *asmb, const char *l, const char *l2,
                      IntVec *objl_out, int idx, int *idx_out){
     if(asmb->st.textmode) passthru_line(asmb, l, l2, objl_out);
@@ -14297,20 +12941,8 @@ static int adir_done(Assembler *asmb, const char *l, const char *l2,
     return 1;
 }
 
-/* パターン変数表を空にする。照合と、パターン側の式の評価の直前に使う。 */
-/* 変数表を空にする。空でないスロットは記録してあるので、そこだけを消す
- * （以前は毎回 g_nvars 個すべてを書き潰していた）。 */
 #define PAT_VARS_CLEAR() vars_clear_all(st)
 
-/* 作業用バッファは呼び出し元（lineassemble2）がソース行の長さに合わせて確保する。
- *
- * 破綻点修正: ここは l[1024] / l2[4096] / lin[8192] という固定長の自動変数で、
- * それを超える行は診断もなく黙って切り捨てていた。`.ascii "…"` に 4096 文字を
- * 超える文字列を書くと axx.py は全部出すのに caxx は途中で打ち切る、という形で
- * 生成物が食い違っていた（実測: 5000 文字 → axx.py 5000 バイト / caxx 4086 バイト）。
- * バッファ長は行長から決まるので、上限そのものを無くす。
- *   lbuf, l2buf, nsbuf : 各 bufsz バイト（行長+2）
- *   linbuf             : linsz バイト（"l l2" が入る長さ）*/
 static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
                               IntVec *idxs_out, IntVec *objl_out, int *idx_out,
                               char *l, char *l2, char *l_nospace, size_t bufsz,
@@ -14327,8 +12959,6 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     l_nospace[nn]=0;
     memcpy(l, l_nospace, (size_t)nn+1);
 
-    /* テキスト置換モードでは、自分でワードや領域を出すディレクティブは処理せず、
-     * 行をテキストとしてだけ出す（textmode_text_only_dir() のコメントを参照）。 */
     if(st->textmode && textmode_text_only_dir(l)){
         passthru_line(asmb, l, l2, objl_out);
         *idx_out=idx; return 1;
@@ -14358,19 +12988,10 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
             *idx_out=idx; return 1;
         }
     }
-    /* `.include` は取り込んだ行そのものが訳されて出るので、この行は出さない。 */
     { char up[16]; axx_strupr_to(up,l,sizeof(up));
       if(strcmp(up,".INCLUDE")==0){
           char raw[512]; axx_get_string(l2,raw,sizeof(raw));
           if(!raw[0]){
-              /* 破綻点修正: axx_get_string() は引用符で始まらない文字列に
-               * 常に空を返す。axx.py の include_asm はこの場合、①引用符
-               * なしのファイル名らしき語があれば警告した上でそれを使う、
-               * ②本当に何もなければエラーにする、のどちらかを必ず行うのに、
-               * caxx はここで何もせずに行を読み飛ばしていた（インクルード
-               * されるはずの内容が無言でオブジェクトファイルに反映されない、
-               * このプロジェクトが最も嫌う「黙って間違った結果を出す」
-               * 失敗モードそのもの）。axx.py と同じ2分岐に揃える。 */
               char trimmed[512]; size_t tn=0;
               { int ti=axx_skipspc(l2,0);
                 while(l2[ti] && tn < sizeof(trimmed)-1) trimmed[tn++]=l2[ti++];
@@ -14423,12 +13044,6 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
               }
               fileassemble(asmb,resolved);
           }
-          /* 取り込んだ行を訳した後にこの行のコメントだけが出てくると、順序が
-           * 入れ替わって読めなくなる。この行のコメントは出さない（取り込んだ側の
-           * 行が自分のコメントを出す）。取り込んだ先の行も1行ごとに comment_text を
-           * 置き換えるので、消すのは戻ってきたここでなければならない。字下げも
-           * 同じように取り込んだ先の行が置き換えてしまうので、ここで消しておく。
-           * axx.py の lineassemble2() と同じ規則である。 */
           free(st->comment_text); st->comment_text = NULL;
           st->indent_text[0] = '\0';
           *idx_out=idx; return 1;
@@ -14449,9 +13064,6 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
 
 
     if(!l[0]){
-        /* テキスト置換モードでラベルだけの行とコメントだけの行は、落とした
-         * `label:` と `;` コメントを出力に戻す仕事が残っているので、出力なしの
-         * 成功として返す（付け直すのは lineassemble() の側）。 */
         *idx_out=idx;
         return (st->textmode && (st->label_text[0]
                 || (st->comment_text && st->comment_text[0]))) ? 1 : 0;
@@ -14465,21 +13077,14 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     BestMatch best;
     best_init(&best);
 
-    /* 照合にかける行。パターンごとに変わらないので、ループの外で1回だけ作る。 */
     if(l2[0]) snprintf(lin,linsz,"%s %s",l,l2);
     else      snprintf(lin,linsz,"%s",l);
     axx_reduce_spaces(lin);
 
-    /* たどる行は「ニーモニックを持たない行（always）」と「この行の
-     * ニーモニックで索引を引いた候補」の2つの昇順の並びである。記述順のまま
-     * 処理するために、2つを合わせながら進む。 */
     int *cand = NULL;
     int  ncand = patidx_candidates(&g_patidx, lin, &cand);
-    /* 前置きを畳み込んでいるあいだは、always の並びを前置きの後ろから読む。 */
     int  ai = (g_hoist_rows && g_hdrsnap.valid) ? g_hoist_first_ai : 0;
     int  ci = 0;
-    /* 前置きの実行で診断が出るようなら畳み込まない（同じ診断が行ごとに出る
-     * 今までの見え方を変えないため）。その判定に使う出力前の数を控える。 */
     long long hoist_diag0 = g_diag_count;
 
     for(;;){
@@ -14494,17 +13099,12 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         PatEntry *i=&st->pat.data[pi];
         pln = pi + 1;
 
-        /* 前置きを通り過ぎるところで、その状態を1度だけ控える。 */
         if(g_hoist_rows && !g_hdrsnap.valid && pi >= g_hoist_rows){
-            if(g_diag_count != hoist_diag0) g_hoist_rows = 0;   /* 診断が出た */
+            if(g_diag_count != hoist_diag0) g_hoist_rows = 0;
             else                            hdrsnap_take(&g_hdrsnap, st);
         }
 
-        /* ディレクティブでない行（＝普通のパターン）は、下の判定が必ず
-         * 0 を返すので丸ごと飛ばす。 */
         if(i->is_dir){
-        /* ディレクティブの値欄も式なので、パターン変数を読みうる
-         * （マニュアル 6.3）。評価の前に空にしておく。 */
         PAT_VARS_CLEAR();
         int _dir_done = 0;
         switch(i->dir_kind){
@@ -14557,22 +13157,14 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
             break;
         }
 
-        /* 索引から来た候補は先頭一致を済ませてある。always から来た行のうち
-         * ニーモニックを持つもの（`EPIC` のように大文字の名前を持つ
-         * ディレクティブ行で、処理されずに落ちてきたもの）だけここで見る。 */
         if(from_always && i->pfxlen && !pat_prefix_matches(i->f[0], lin)) continue;
 
-        /* ここから先が本当の照合。先頭一致で捨てた分は初期化しなくてよい
-         * （変数表は照合と値欄の評価の直前にだけ空であればよい）。 */
         PAT_VARS_CLEAR();
 
         st->error_undefined_label=0;
         st->expmode=EXP_ASM;
         st->expcaps=&CAPS_ASM;
 
-        /* 1つの候補が書いた分だけを控える。候補は1行につき何百も試すので、
-         * ここで vars[] と elf_var_to_label[] を丸ごと写していたのが
-         * 照合そのものより高くついていた。 */
         int mark_v   = vars_mark();
         int mark_v2l = v2l_mark();
         int saved_refs_len = st->elf_refs_len;
@@ -14610,20 +13202,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
             v2l_rollback(st, mark_v2l);
             st->error_undefined_label=0;
 
-            /* 破綻点修正: 「式もシンボルも0個」なら即打ち切っていたが、スコアは
-             * (式の数が少ない, リテラル数が多い, シンボル数が少ない) の順で勝つので、
-             * あとからもっとリテラルの多い（より具体的な）パターンが現れうる。
-             * 健全な打ち切り条件は `+`/`-` の読み替え（ソースを消費せずリテラル数
-             * だけ増える）があるため作りにくく、全走査でも実測で十分速いので、
-             * 打ち切り自体をやめて常に最良スコアを選ぶ。 */
         } else {
-            /* 破綻点修正: マッチに失敗した候補でも pat_match0() 内の式評価が
-             * elf_var_to_label[] を書き換え得る。ここで saved_vtl を書き戻さず
-             * label_name を解放するだけだと、失敗した候補による汚染がそのまま
-             * 次の候補の pat_match0() に持ち越されてしまう（st->vars は
-             * ループ先頭で毎回ゼロクリアされるが elf_var_to_label には
-             * 同様のリセットが無い）。成功時の巻き戻しと対称に、ここでも
-             * 保存しておいた値を書き戻す。 */
             vars_rollback(st, mark_v);
             v2l_rollback(st, mark_v2l);
             st->error_undefined_label=0;
@@ -14637,7 +13216,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
 
         best_restore_dirstate(st, &best);
         memcpy(st->vars, best.vars, sizeof(st->vars));
-        vars_touch_all();   /* 記録を通さずに書いたので印を付け直す */
+        vars_touch_all();
         for(int ri2=0; ri2<best.refs_len; ri2++)
             elf_refs_push_copy(st, best.refs[ri2].name,
                                best.refs[ri2].val, best.refs[ri2].word_idx,
@@ -14698,8 +13277,6 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
 
     if(loopflag){ se=1; pln=0; }
 
-    /* `.passthru` が有効なら、マッチしなかった行はエラーにせずそのまま出す。
-     * 診断の抑止（パス1）に関わらず出すので、両パスで行の大きさが揃う。 */
     if(se && st->passthru){
         passthru_line(asmb, l, l2, objl_out);
         *idx_out=idx; return 1;
@@ -14717,12 +13294,6 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
             *idx_out=idx; return 0;
         }
         if(oerr){
-            /* 破綻点修正: パターン番号と生の6フィールド配列という内部表現を
-             * 常にユーザ向けメッセージへ混ぜており、-d の有無に関わらず
-             * 出力されていた。さらに " error - " より前に "; pat ..." が付くため、
-             * 他の全診断が従う書式からも外れ、axx_diagf() を通さない生の
-             * fprintf だったため表示制御からも外れていた。
-             * 詳細は -d 指定時だけ、本文とは別行で出す。 */
             axx_diagf(1, 0, " error - Illegal syntax in assemble line or pattern line.  [%s:%d]\n",
                       st->current_file, (int)st->ln);
             if(st->debug){
@@ -14745,8 +13316,6 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     return 1;
 }
 
-/* 作業用バッファを行長に合わせて確保し、本体へ渡す薄い皮。
- * 本体には途中 return が多数あるので、確保と解放はここ1か所に集める。 */
 static int lineassemble2(Assembler *asmb, const char *line, int idx,
                          IntVec *idxs_out, IntVec *objl_out, int *idx_out){
     size_t n = strlen(line);
@@ -14767,29 +13336,18 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
 typedef struct { const char *name; uint64_t val; int word_idx; int ord;
                  int rtype; int64_t addend; } ElfRef;
 
-/* ワード番号の昇順。同じワード番号なら元の出現順（ord）を保つ。
- * 破綻点修正: qsort は安定ソートではないので、ワード番号だけで比較すると
- * 同一ワードに複数の参照があるときの並びが不定になり、あとの重複排除
- * （直前の要素としか比較しない）の結果が実行ごとに変わりうる。axx.py は
- * 安定ソートなので、ここでも出現順をタイブレークに使って揃える。 */
+/* ラベル参照を出力ワードの順に並べるための比較関数。 */
 static int elf_ref_cmp(const void *a, const void *b){
     const ElfRef *x = (const ElfRef *)a, *y = (const ElfRef *)b;
     if(x->word_idx != y->word_idx) return (x->word_idx > y->word_idx) - (x->word_idx < y->word_idx);
     return (x->ord > y->ord) - (x->ord < y->ord);
 }
 
-/* ソース1行を処理する主関数。
- *
- *   1. タブ・改行の正規化 → コメント除去 → `\!` エスケープ解決
- *   2. 行頭の `label:` / `.EQU` を処理
- *   3. VLIW スロット数を数える
- *   4. lineassemble2() でパターン照合とエンコードを行う
- *   5. VLIW 継続なら vliwprocess() へ、そうでなければバイト列を出力
- *   6. パス2かつ -o なら、この命令ぶんの ELF リロケーションを確定させる
- *
- * リロケーションは、式評価中に集めた (ラベル名, 生値, ワード番号) の並びを、
- * 同じラベルへの連続参照ごとにまとめて1件にし、加数を
- * 「生値 - 対象フィールドの絶対位置 [+ PC相対なら命令アドレス]」で求める。 */
+/* ソース 1 行を処理する主ループ。
+   ラベル定義とソース側ディレクティブを済ませ、`!!` があればバンドルに分け、
+   候補のパターンを順に照合して特異度スコア最小のものを採り、error_patterns を
+   評価してから出力欄でワード列を作る。テキスト置換モードのときは、綴りを
+   保ったテキストを作る経路へ回す。 */
 static int lineassemble(Assembler *asmb, const char *line_in){
     AsmState *st=&asmb->st;
 
@@ -14798,11 +13356,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     if(!line){ perror("malloc"); return 0; }
     memcpy(line, line_in, lin_len + 1);
 
-    /* テキスト置換モードでは、行頭の字下げ（空白・タブ）も書かれていたまま訳した
-     * テキストの前に残す（付け直すのはこの関数の終わりの側）。空白の正規化
-     * （axx_normalize_ws）が連続する空白を1個に潰してしまう前に覚えておく。
-     * そうでないときは今までどおり、字下げは残さない。
-     * axx.py の lineassemble() と同じ規則である。 */
     st->indent_text[0] = '\0';
     if(st->textmode){
         size_t _ni = 0;
@@ -14815,24 +13368,16 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     axx_normalize_ws(line);
     char *cmt = NULL;
     axx_split_comment_asm(line, &cmt);
-    /* テキスト置換モードでは、ソースに書かれていた `;` コメントも訳したテキストに
-     * 残す（後ろに付け直すのはこの関数の終わりの側）。落としてしまうと書き換えた
-     * 結果からコメントが消えてしまうためである。そうでないときは今までどおり
-     * 落とす。 */
     free(st->comment_text); st->comment_text = NULL;
     if(st->textmode) st->comment_text = cmt; else free(cmt);
-    /* コメントだけの行も、テキスト置換モードなら1行として出す。 */
     if(!line[0] && !(st->comment_text && st->comment_text[0])){
         free(line); return 0;
     }
     axx_resolve_vliw_escapes(line);
 
-    /* 前の行の巻き戻し記録はもう使わない（記録が持っている文字列を返す）。 */
     v2l_forget();
 
     if(g_hoist_rows && g_hdrsnap.valid){
-        /* 前置きのディレクティブ行はもうたどらないので、作り直す代わりに
-         * 「前置きを実行し終えた状態」を戻す。 */
         hdrsnap_restore(&g_hdrsnap, &asmb->st);
         subv_unfreeze_all(&asmb->st.subs);
     } else {
@@ -14851,7 +13396,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
 
     char *processed = malloc(lin_len + 2);
     if(!processed){ perror("malloc"); free(line); return 0; }
-    /* `!L` が拾った文字の置き場と、行頭の `label:` の綴りは1行ごとに作り直す。 */
     st->captext_len = 0;
     st->captext[0] = '\0';
     st->label_text[0] = '\0';
@@ -14865,9 +13409,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
         }
     }
 
-    /* VLIW スロット数を数える。
-     * 番兵の判定は引用符・文字リテラルの外だけで行う（理由は
-     * axx_get_param_to_spc() のコメントを参照）。 */
     {
         int _vcnt = 0;
         int _has_content = 0;
@@ -14927,11 +13468,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
 
     if(!flag){ free(processed); iv_free(&idxs); iv_free(&objl); return 0; }
 
-    /* テキスト置換モードでは、行頭にあった `label:` をそのまま出力の先頭に
-     * 付け直す。照合のために落としてあるので、ここで書かれていたとおりの綴りで
-     * 戻す。テキストを作った行と、ラベルだけの行が対象で、テキストではなく数値を
-     * 出した行（`.ascii` などの組み込みディレクティブ）はデータを壊さないよう
-     * そのままにする。axx.py の lineassemble() と同じ規則である。 */
     if(st->textmode && st->label_text[0] && !st->vliwflag
        && (st->asmtext || objl.len == 0)){
         TxtBuf lp; txt_init(&lp);
@@ -14940,7 +13476,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
         const char *pfx = lp.b ? lp.b : "";
         int plen = (int)strlen(pfx);
         if(plen > 0){
-            /* 前に足すので、いちど後ろへずらす。 */
             for(int k=0;k<plen;k++) iv_push(&objl, u256_zero());
             for(int k=objl.len-1-plen; k>=0; k--) objl.data[k+plen] = objl.data[k];
             for(int k=0;k<plen;k++)
@@ -14958,20 +13493,11 @@ static int lineassemble(Assembler *asmb, const char *line_in){
         txt_addc(&nd, '"');
         free(st->asmtext_disp);
         st->asmtext_disp = nd.b ? nd.b : strdup("");
-        /* 前に足したぶん、その行のワード位置がずれる。ELF の再配置はワード位置で
-         * 覚えているので、同じだけ送っておく。 */
         for(int ri=0; ri<st->elf_refs_len; ri++)
             if(st->elf_refs[ri].word_idx >= 0) st->elf_refs[ri].word_idx += plen;
         free(lp.b);
     }
 
-    /* テキスト置換モードでは、ソースにあった `;` コメントを訳したテキストの後ろに
-     * 付け直す。照合のために落としてあるので、ここで書かれていたとおりの綴りで
-     * 戻す。テキストを作った行と、コメントだけ・ラベルだけの行が対象で、テキスト
-     * ではなく数値を出した行（`.ascii` などの組み込みディレクティブ）はデータを
-     * 壊さないようそのままにする。後ろに足すだけなので、ラベルを前に足すときと
-     * 違って ELF のワード位置はずれない。
-     * axx.py の lineassemble() と同じ規則である。 */
     if(st->textmode && st->comment_text && st->comment_text[0] && !st->vliwflag
        && (st->asmtext || objl.len == 0)){
         TxtBuf cs; txt_init(&cs);
@@ -14994,19 +13520,10 @@ static int lineassemble(Assembler *asmb, const char *line_in){
         free(cs.b);
     }
 
-    /* テキスト置換モードでは、行頭にあった字下げ（空白・タブ）を書かれていたとおり
-     * に出力の先頭へ付け直す。照合のために空白を1個に潰してあるので、ここで元の
-     * 綴りに戻す。付けるのは `label:` とコメントを付け直した後の行全体の先頭なので、
-     * 字下げと `label:`・`;` コメントの間に余分な空白は入らない。対象はテキストを
-     * 出した行だけで、テキストではなく数値を出した行（`.ascii` などの組み込み
-     * ディレクティブ）はデータを壊さないようそのままにする。`.vliw` が有効なときは、
-     * `.eol` と同じくパケットを壊さないよう何もしない。
-     * axx.py の lineassemble() と同じ規則である。 */
     if(st->textmode && st->indent_text[0] && !st->vliwflag
        && st->asmtext && st->asmtext[0]){
         const char *ind = st->indent_text;
         int ilen = (int)strlen(ind);
-        /* 前に足すので、いちど後ろへずらす。 */
         for(int k=0;k<ilen;k++) iv_push(&objl, u256_zero());
         for(int k=objl.len-1-ilen; k>=0; k--) objl.data[k+ilen] = objl.data[k];
         for(int k=0;k<ilen;k++)
@@ -15023,14 +13540,10 @@ static int lineassemble(Assembler *asmb, const char *line_in){
         txt_addc(&nd, '"');
         free(st->asmtext_disp);
         st->asmtext_disp = nd.b ? nd.b : strdup("");
-        /* 前に足したぶん、その行のワード位置がずれる。ELF の再配置はワード位置で
-         * 覚えているので、ラベルを前に足すときと同じだけ送っておく。 */
         for(int ri=0; ri<st->elf_refs_len; ri++)
             if(st->elf_refs[ri].word_idx >= 0) st->elf_refs[ri].word_idx += ilen;
     }
 
-    /* `.eol` が有効なら、出力を出した行ごとに改行を1ワード足す。標準出力へ流す
-     * テキストには足さない（そちらは行ごとに改行して出しているので二重になる）。 */
     if(st->eol && objl.len > 0 && !st->vliwflag)
         iv_push(&objl, u256_from_u64((uint64_t)'\n'));
 
@@ -15066,12 +13579,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
             }
             qsort(_valid, (size_t)_nvalid, sizeof(ElfRef), elf_ref_cmp);
 
-            /* 破綻点修正1: 重複排除が「直前に残した要素」としか比較していなかった
-             * ため、同じ (ラベル, ワード番号) の組が離れて並ぶと重複が残っていた
-             * （axx.py は集合で全体を見る）。同一ワード内を総当たりで見る。
-             * 破綻点修正2: 「同じワード位置に別々のラベルの参照がある」曖昧な場合を
-             * 落とす処理が無かった（axx.py の _ambiguous）。どちらのラベルに対する
-             * リロケーションなのか決められないので、そのワードは丸ごと除外する。 */
             {
                 int _w2 = 0;
                 for(int _r2 = 0; _r2 < _nvalid; _r2++){
@@ -15114,16 +13621,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                 int _nwords = _gj - _gi;
                 int _nbytes = _nwords * bpw;
 
-                /* `.reloc` が宣言された変数が運んだ参照は、命令語のビット欄に値が
-                 * 詰まっていて出力バイト列から加数を逆算できない。型と加数は宣言側
-                 * で決まっているので、通常の推定経路を通さずに出す。 */
-                /* リロケーション型の優先順位は
-                 *   既定（幅からの推定） < パターンファイルの `.reloc`
-                 *   < ソースファイルの `::型名`
-                 * である。ソースが型を書いていれば、`.reloc` が宣言した型より
-                 * そちらが勝つ（値が命令語のビット欄に入っているという `.reloc`
-                 * 側の知識と加数はそのまま使う）。axx.py の同じ箇所と同じ規則で
-                 * ある。 */
                 LabelEntry *_le_rt = lmap_find(&st->labels, _lname);
                 int _src_rtype = (_le_rt && _le_rt->reloc_type_override >= 0)
                                ? _le_rt->reloc_type_override : -1;
@@ -15136,8 +13633,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     int _foff = 0;
                     insn_reloc_field_decl(st, _hint_rtype, NULL, &_foff);
                     if(_fmask == 0){
-                        /* データ型を宣言した場合。加数は通常どおり出力バイト列
-                         * から求まるので、型だけを固定して下の経路へ渡す。 */
                         _forced_rtype = _hint_rtype;
                     } else {
                         int _ibytes = elf_machine_reloc_bytes(_mtbl_rm, _hint_rtype);
@@ -15146,8 +13641,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         if(_iwords < 1) _iwords = 1;
                         int _fw = _widx + _foff / bpw;
                         if(_fw + _iwords <= objl.len){
-                            /* RELA ではリンカが欄を埋めるので、命令語側は 0 に
-                             * しておく（GNU as と同じ形）。 */
                             uint64_t _wmask_i = axx_word_mask(st->bts);
                             for(int _k = 0; _k < _iwords; _k++){
                                 int _sh = st->endian_big
@@ -15201,11 +13694,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         _rtype_is_default_guess = 1;
                     }
                 }
-                /* リロケーション型が決まらないとき、axx.py は「型が無いので省いた」
-                 * と警告してから捨てる。ただしこの幅の型を持たない ISA では、
-                 * アセンブラが自分で解決し終えた参照（分岐や adrp/:lo12: 等）が
-                 * 必ずここに落ちる。出力は正しいのに毎回警告が出て本物の診断を
-                 * 埋めてしまうため、両者そろえて詳細は -d 指定時だけ出す。 */
                 if(_rtype == 0 && _widx < objl.len && st->debug)
                     axx_diagf(0, 0, " warning - no relocation type available for a %d-byte "
                                "reference to '%s'; relocation omitted.\n", _nbytes, _lname);
@@ -15221,11 +13709,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                             int _wk = _widx + _k;
                             if(_wk < objl.len){
                                 uint64_t _wv = u256_to_u64(objl.data[_wk]) & _wmask;
-                                /* 破綻点修正: bts*_k が64以上になりうる(例: 32bit幅
-                                 * ワードが3つ以上連なるリロケーション)場合、uint64_t
-                                 * を64以上シフトするのは未定義動作になるため避ける。
-                                 * 64bitの蓄積先に収まらない上位語は元々表現できない
-                                 * ので寄与を0とする。 */
                                 int _sh = _bts * _k;
                                 if(_sh < 64) _raw_val |= _wv << _sh;
                             }
@@ -15249,16 +13732,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     }
                     int64_t _abs_w_bytes = (int64_t)_valid[_gi].val * (int64_t)bpw;
 
-                    /* 幅からの既定型を使ったとき、その型の PC 相対性が欄の
-                     * 中身と食い違うことがある。欄に入っているのがラベルの
-                     * 絶対値そのものなら、その型は PC 相対ではありえないので、
-                     * 同じ幅の絶対型に取り替える。取り替え先は実効表の先頭から
-                     * 「同じ幅で PC 相対でない型」を引いたもので、マシン番号も
-                     * 型番号も埋め込まない。組み込みの表を持つ 11 機種では
-                     * abs64/abs32/abs16/abs8 が表の先頭に並んでいるので
-                     * 従来と同じ型が引かれ、パターンファイルで宣言したマシンでも
-                     * `.elftype` の宣言順どおりに引ける。
-                     * axx.py の同じ箇所と同じ規則である。 */
                     if(_rtype_is_default_guess
                        && elf_machine_is_pcrel(_mtbl_rm, _rtype)
                        && (int64_t)_raw_val == _abs_w_bytes){
@@ -15266,11 +13739,6 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         if(_alt > 0) _rtype = _alt;
                     }
 
-                    /* 逆向き（既定型が絶対型なのに欄の中身がラベルの値と違う
-                     * ので PC 相対型に取り替える）は m68k だけに掛ける。この
-                     * 判定は「加数の付いた絶対参照」（`dq label+8` など）と
-                     * 見分けが付かないので、他のマシンへは広げない。
-                     * 取り替え先の型番号は上と同じく実効表から引く。 */
                     if(_rtype_is_default_guess && st->elf_machine == 4
                        && !elf_machine_is_pcrel(_mtbl_rm, _rtype)
                        && (int64_t)_raw_val != _abs_w_bytes){
@@ -15337,14 +13805,10 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     return 1;
 }
 
+/* 1 行を処理する外枠。行の前処理と診断の文脈を整える。 */
 static int lineassemble0(Assembler *asmb, const char *line){
     AsmState *st=&asmb->st;
 
-    /* 破綻点修正: 改行を落とした行を st->cl（表示用の cl[4096]）に strncpy して
-     * から、その「切り詰められた写し」を lineassemble() に渡していた。
-     * 4095 文字を超える行は診断もなく途中で切れ、例えば 5000 文字の
-     * `.ascii "…"` が 4086 バイトしか出ないという形で axx.py と食い違っていた。
-     * 組み立てには元の行をそのまま渡し、st->cl はあくまで表示用の写しに留める。 */
     size_t n = strlen(line);
     char *cleaned = malloc(n + 1);
     if(!cleaned){ perror("malloc"); exit(1); }
@@ -15364,11 +13828,6 @@ static int lineassemble0(Assembler *asmb, const char *line){
     free(st->asmtext); st->asmtext=NULL;
     free(st->asmtext_disp); st->asmtext_disp=NULL;
     int f=lineassemble(asmb,cleaned);
-    /* パターンが文字列テンプレートだった行は、バイナリ出力とは別に、
-     * アセンブリ結果をテキストでも出す。
-     * -v の診断行の中では `` ではなく "" で括って見せる。素のまま標準出力へ
-     * 流す（トランスレータとしての出力）のは `-V` を付けたときだけで、既定は
-     * 無出力である。axx.py の lineassemble0() と同じ規則である。 */
     if(st->asmtext && (st->pas==0 || st->pas==2)){
         if(show)                printf(" %s", st->asmtext_disp ? st->asmtext_disp : "");
         else if(st->text_output) printf("%s\n", st->asmtext);
@@ -15381,6 +13840,8 @@ static int lineassemble0(Assembler *asmb, const char *line){
     return f;
 }
 
+/* プロンプトモードの 1 行入力。`?` でラベル表を出す。このモードでは
+   マクロ層を通らない。 */
 static char *file_input_from_stdin(void){
     size_t total=0, cap=4096;
     char *buf=malloc(cap);
@@ -15420,14 +13881,24 @@ typedef struct { uint64_t off; int sym; int rtype; int64_t addend; } DRE;
 typedef struct { DRE*d; int len,cap; } DRV;
 typedef struct { uint64_t wpc; int file; int line; } LROW;
 
+/* ---- ELF オブジェクト出力 -----------------------------------------------
+   セクション・シンボル表・リロケーションを組み、必要なら DWARF も付ける。
+   マシン記述は elf_machine_effective() が返す実表から取るので、組み込みの表に
+   無い CPU でもパターンファイルの宣言だけでリンクできる .o を出せる。
+   型の決まらない参照はリロケーションを出さない（当てずっぽうの型番号で
+   リンカを騙さないため）。
+   ------------------------------------------------------------------------ */
+/* 16bit を指定のバイト順で書く。 */
 static void weo_w2(uint8_t*p,uint16_t v,int is_le){
     if(is_le){ p[0]=v&0xff; p[1]=(v>>8)&0xff; }
     else     { p[1]=v&0xff; p[0]=(v>>8)&0xff; }
 }
+/* 32bit を指定のバイト順で書く。 */
 static void weo_w4(uint8_t*p,uint32_t v,int is_le){
     if(is_le){ p[0]=v&0xff;p[1]=(v>>8)&0xff;p[2]=(v>>16)&0xff;p[3]=(v>>24)&0xff; }
     else     { p[3]=v&0xff;p[2]=(v>>8)&0xff;p[1]=(v>>16)&0xff;p[0]=(v>>24)&0xff; }
 }
+/* 64bit を指定のバイト順で書く。 */
 static void weo_w8(uint8_t*p,uint64_t v,int is_le){
     if(is_le){ for(int j=0;j<8;j++){p[j]=(uint8_t)(v&0xff);v>>=8;} }
     else     { for(int j=7;j>=0;j--){p[j]=(uint8_t)(v&0xff);v>>=8;} }
@@ -15435,17 +13906,21 @@ static void weo_w8(uint8_t*p,uint64_t v,int is_le){
 static void weo_w8s(uint8_t*p,int64_t v,int is_le){ weo_w8(p,(uint64_t)v,is_le); }
 
 static void wbb_init(WBB*w){ w->b=calloc(1,64); w->len=1; w->cap=64; }
+/* 書き出しバッファを伸ばす。 */
 static void wbb_grow(WBB*w, size_t need){
     while(w->len+need>w->cap){w->cap*=2;w->b=realloc(w->b,w->cap);if(!w->b){perror("realloc");exit(1);}}
 }
+/* 文字列表に 1 個足し、その添字を返す。 */
 static uint32_t wbb_str(WBB*w, const char*s){
     size_t l=strlen(s)+1; uint32_t off=(uint32_t)w->len;
     wbb_grow(w,l); memcpy(w->b+w->len,s,l); w->len+=l; return off;
 }
+/* バッファにバイト列を足す。 */
 static void wbb_app(WBB*w, const void*src, size_t n){
     wbb_grow(w,n); memcpy(w->b+w->len,src,n); w->len+=n;
 }
 
+/* 出力バッファの範囲を、セクションの中身として切り出す。 */
 static uint8_t *weo_extract(AsmState*st,int bpw,uint64_t w0,uint64_t wn){
     uint64_t nb=wn*(uint64_t)bpw;
     if(!nb) return calloc(1,1);
@@ -15469,6 +13944,8 @@ static uint8_t *weo_extract(AsmState*st,int bpw,uint64_t w0,uint64_t wn){
     return d;
 }
 
+/* 同じ名前のセクションが何度も開かれている場合、その範囲を書かれた順に
+   つないで 1 本の中身にする。 */
 static uint8_t *weo_extract_ranges(AsmState*st, int bpw, const char*name, uint64_t *out_nb){
     uint64_t total_words = 0;
     int have_range = 0;
@@ -15477,8 +13954,6 @@ static uint8_t *weo_extract_ranges(AsmState*st, int bpw, const char*name, uint64
             have_range = 1;
             total_words += u256_to_u64(st->section_ranges.data[i].len);
         }
-    /* 破綻点修正: 断片が1つも記録されていないセクションで中身が空になっていた。
-     * axx.py の _section_word_ranges() と同じく sections 表を代わりに使う。 */
     if(!have_range){
         SecEntry *fe = secmap_find(&st->sections, name);
         if(fe && !u256_is_zero(fe->size)){
@@ -15551,23 +14026,24 @@ static void weo_sym(WBB*symtab_bb,int*nsyms,int is_le,int is_elf64,
 
 static int cmp_wlk(const void*a,const void*b){ return strcmp(((const WLK*)a)->name,((const WLK*)b)->name); }
 
+/* そのラベルが外部に出すものか。 */
 static int weo_isexp(WLK*earr,int ne,const char*nm){
     for(int i=0;i<ne;i++) if(!strcmp(earr[i].name,nm)) return 1;
     return 0;
 }
 
+/* 名前からシンボル表の添字を引く。 */
 static int weo_symof(WSNI*snimap,int snimap_len,const char*nm){
     for(int i=0;i<snimap_len;i++) if(!strcmp(snimap[i].name,nm)) return snimap[i].idx;
     return 0;
 }
 
-/* ファイルに中身を持たないセクション（SHT_NOBITS）か。従来は名前が `.bss`
- * で始まるかだけを見ていたが、`.elfsection` で型を宣言できるようになったので、
- * 決まった sh_type に従う。axx.py の同じ判定と同じ規則である。 */
+/* そのセクションが SHT_NOBITS（中身を持たない）か。 */
 static int weo_isno(WCS*csecs,int i){
     return csecs[i].sht == 8u;
 }
 
+/* ファイル位置を目標まで 0 で詰める。 */
 static void weo_pad(FILE*f,uint64_t t){
     long c=ftell(f);
     if(c < 0){ fprintf(stderr,"weo_pad: ftell failed\n"); return; }
@@ -15601,13 +14077,16 @@ static void rb_sleb(RB*r,int64_t v){ for(;;){ uint8_t b=(uint8_t)(v&0x7f); v>>=7
 static void rb_w2(RB*r,uint16_t v,int is_le){ uint8_t t[2]; weo_w2(t,v,is_le); rb_app(r,t,2); }
 static void rb_w4(RB*r,uint32_t v,int is_le){ uint8_t t[4]; weo_w4(t,v,is_le); rb_app(r,t,4); }
 static void rb_w8(RB*r,uint64_t v,int is_le){ uint8_t t[8]; weo_w8(t,v,is_le); rb_app(r,t,8); }
+/* DWARF にアドレスを 1 個書く。 */
 static void rb_waddr(RB*r,uint64_t v,int addr_sz,int is_le){
     if(addr_sz==8) rb_w8(r,v,is_le); else rb_w4(r,(uint32_t)v,is_le);
 }
+/* DWARF セクション用のリロケーションを 1 個積む。 */
 static void drv_add(DRV*v,uint64_t off,int sym,int rtype,int64_t add){
     if(v->len>=v->cap){ v->cap=v->cap?v->cap*2:8; v->d=realloc(v->d,(size_t)v->cap*sizeof(DRE)); if(!v->d){perror("realloc");exit(1);} }
     v->d[v->len++]=(DRE){off,sym,rtype,add};
 }
+/* 積んだリロケーションを .rela/.rel の形に詰める。 */
 static uint8_t* dwarf_pack_relocs(DRV*v,size_t*outlen,int is_le,int is_elf64,int is_rela){
     size_t entsz = is_elf64 ? (is_rela?24:16) : (is_rela?12:8);
     size_t n=(size_t)v->len*entsz; uint8_t*b=calloc(1,n?n:1);
@@ -15627,10 +14106,7 @@ static uint8_t* dwarf_pack_relocs(DRV*v,size_t*outlen,int is_le,int is_elf64,int
 }
 static int lrow_cmp(const void*a,const void*b){ uint64_t x=((const LROW*)a)->wpc,y=((const LROW*)b)->wpc; return x<y?-1:(x>y?1:0); }
 
-/* ELF リロケータブルオブジェクト(.o)を書き出す。
- * elfclass に応じて ELF32/ELF64 を、is_rela に応じて .rel/.rela を出し分ける。
- * Elf32_Sym と Elf64_Sym はフィールドの幅だけでなく並び順自体が違う点に注意。
- * -g 指定時は .debug_info/.debug_abbrev/.debug_line も生成する（64bit のみ）。 */
+/* ELF 再配置可能オブジェクトを書く。 */
 static void write_elf_obj(AsmState *st, const char *path, int machine){
     int bpw = (st->bts+7)/8; if(bpw<1) bpw=1;
 
@@ -15700,9 +14176,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         int sidx=-1;
         for(int i=0;i<ncs;i++) if(strcmp(st->relocations[ri].section,csecs[i].name)==0){sidx=i;break;}
         if(sidx<0){
-            /* 破綻点修正: セクション名が一致しないリロケーションを無警告で
-             * 捨てていたため、修正が抜け落ちた「見た目は正常な」.oファイルが
-             * 静かに生成されていた。診断を出す。 */
             if(should_report_errors(st)){
                 axx_diagf(1, 0, " error - relocation references unknown section '%s'; dropped from output.\n",
                            st->relocations[ri].section);
@@ -15787,8 +14260,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         WSR sr = (larr[i].is_equ && !_equ_has_reloc)
                  ? (WSR){0xfff1, larr[i].val}
                  : weo_shndx(st,csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section,bpw);
-        /* `.type` / `.size` / `.other`（マニュアル 5.6.1 節）。局所シンボル
-         * なので束縛は STB_LOCAL のままで、`.weak` は下の大域側へ回る。 */
         uint16_t _shx = sr.shndx; uint64_t _sval = sr.sv;
         uint64_t _ssz = weo_sym_size(st, larr[i].name, bpw);
         weo_sym_common(st, larr[i].name, bpw, &_shx, &_sval, &_ssz);
@@ -15802,8 +14273,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int i=0;i<nl;i++){
         if(!larr[i].is_imported) continue;
         if(weo_isexp(earr,ne,larr[i].name)) continue;
-        /* 未定義（他所で解決される）シンボル。`.comm` を宣言していれば
-         * SHN_COMMON の姿になり、`.weak` を宣言していれば束縛が弱くなる。 */
         uint16_t _shx = 0; uint64_t _sval = 0;
         uint64_t _ssz = weo_sym_size(st, larr[i].name, bpw);
         weo_sym_common(st, larr[i].name, bpw, &_shx, &_sval, &_ssz);
@@ -15829,12 +14298,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     }
 
 
-    /* ELF32 の r_info は型欄が 8 ビット、シンボル番号欄が 24 ビットしかない。
-     * 組み込みの表を持つ機種の ELF32 側（i386・m68k・PowerPC・ARM・SuperH）
-     * は型番号がどれも 255 以下だが、`.elftype` は 2147483647 まで書けるので、
-     * ELF32 で 255 を超える型を宣言すると黙って切り詰められる。切り詰めた
-     * 型番号は別の型に化けるため、リンカは診断も出さず間違った修正をする。
-     * 型ごとに一度だけ知らせる。axx.py の同じ箇所と同じ規則である。 */
     if(!_is_elf64){
         int *warned = NULL; int nwarned = 0, cwarned = 0; int warned_sym = 0;
         for(int ri2=0;ri2<nrela;ri2++){
@@ -15900,9 +14363,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
 
     const ElfMachineInfo *_mtbl_dbg = elf_machine_effective(st);
     if(st->gen_debug && st->line_map_len>0 && !_mtbl_dbg->dwarf_abs){
-        /* 絶対アドレス参照の型が分からないマシン。型番号を当てずっぽうで書けば
-         * 黙って壊れたデバッグ情報になるので出さない。`.elfdwarf`（3.7.7 節）で
-         * 型を教えれば出せる。 */
         axx_diagf(0, 0, " warning - DWARF debug info (-g) needs an absolute relocation "
                    "type for machine %d; declare it with .elfdwarf. Skipping debug "
                    "sections.\n", machine);
@@ -15913,18 +14373,12 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         int addr_sz = _is_elf64 ? 8 : 4;
         int is_rela_dbg = _is_rela_w;
 
-        /* DWARF が書く絶対アドレス参照の欄幅は addr_sz（= -f で決まる ELF クラス）
-         * だが、dwarf_abs はマシンごとの固定値。`-f` がそのマシンの慣習クラスと
-         * 違うときは両者がずれ、4バイトの欄に 8バイト型（あるいはその逆）の
-         * リロケーションを張ることになる。欄と同じ幅の型に取り替える。 */
         int abs64 = _mtbl_dbg->dwarf_abs;
         if(elf_machine_reloc_bytes(_mtbl_dbg, abs64) != addr_sz){
             int _alt = elf_machine_named(_mtbl_dbg, addr_sz == 8 ? "abs64" : "abs32");
             if(_alt > 0 && elf_machine_reloc_bytes(_mtbl_dbg, _alt) == addr_sz){
                 abs64 = _alt;
             } else {
-                /* 幅の合う絶対型を持たないマシン（32bit 機を -f 64 で出した場合）。
-                 * 幅の違う型を張れば黙って壊れたデバッグ情報になるので出さない。 */
                 axx_diagf(0, 0, " warning - DWARF debug info (-g) needs a %d-byte absolute "
                            "relocation, which %s does not have; skipping debug sections.\n",
                            addr_sz, _mtbl_dbg->name);
@@ -15933,10 +14387,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         }
 
         RB abv; rb_init(&abv);
-        /* 子 DIE になるラベルを先に数える。CU の DW_CHILDREN は「子があるか」を
-         * 宣言するもので、ラベルを1つも持たないソース（命令だけのファイル）では
-         * 子なしになる。宣言と中身が食い違うと DWARF の検証器が指摘するため、
-         * 表を組む前に確定させる。axx.py の _dbg_labels と同じ判定。 */
         int _dbg_nchild = 0;
         for(int i=0;i<nl;i++){
             if(larr[i].is_equ || larr[i].is_imported) continue;
@@ -15967,10 +14417,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
 
         char cwd[1024]; if(!getcwd(cwd,sizeof(cwd))) strcpy(cwd,".");
         const char *cu_name = st->line_map[0].file[0]?st->line_map[0].file:"(source)";
-        /* 破綻点修正: axx.py は "(DWARF4)" なので、-g を付けると DW_AT_producer
-          * の長さが違い、.debug_info（と先頭の unit_length）がずれて、両実装の
-          * .o が同一バイト列にならなかった。DW_AT_producer は「どのツールが
-          * 作ったか」を書く欄で、実装言語を区別する場所ではない。文言を揃える。 */
         const char *producer = "axx general assembler (DWARF4)";
 
         DRV info_relas={0,0,0};
@@ -15993,8 +14439,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
             drv_add(&info_relas,die.len,(int)sr.shndx,abs64,(int64_t)sr.sv);
             rb_waddr(&die,is_rela_dbg?0:sr.sv,addr_sz,_is_le);
         }
-        /* 子の連鎖を閉じる null DIE。DW_CHILDREN_no のときは連鎖自体が無いので
-         * 置いてはいけない（読み手が余分な abbrev コード 0 を拾ってしまう）。 */
         if(_dbg_nchild) rb_uleb(&die,0);
         RB info; rb_init(&info);
         rb_w4(&info,(uint32_t)(2+4+1+die.len),_is_le);
@@ -16103,13 +14547,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     int sym_shidx=ncs+nrela+1;
     int str_shidx=ncs+nrela+2;
 
-    /* 破綻点修正: tot_sh/shstrndx は ELF ヘッダの e_shnum/e_shstrndx
-     * (uint16_t) へ無言でキャストされていたため、セクションヘッダ総数が
-     * 65535 を超えるソースでは値が 65536 でラップし、readelf/objdump が
-     * セクション数を誤解釈する壊れた .o が黙って生成されていた。
-     * (axx.py 側は struct.pack('H', ...) がこの場合に例外で落ちるので、
-     * 少なくとも壊れた出力は書かれない。) SHN_XINDEX 拡張には対応せず、
-     * 明示的にエラーで打ち切る。 */
     if(tot_sh > 0xFFFF || shstrndx > 0xFFFF){
         if(should_report_errors(st)){
             axx_diagf(1, 0, " error - too many ELF section headers (%d) to represent in e_shnum; "
@@ -16125,9 +14562,6 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         goto weo_done;
     }
 
-    /* `.elfheader::<欄名>::<値>`（3.7.7 節）で決めた欄。書かれていない欄は
-     * 従来どおりの既定値（e_type=1 ET_REL、e_version=1、e_flags=0、e_entry=0）。
-     * axx.py の write_elf_obj() の _pack_ehdr() と同じである。 */
     uint16_t _e_type   = st->elf_hdr_set[EHF_TYPE]   ? (uint16_t)st->elf_hdr_val[EHF_TYPE] : 1;
     uint32_t _e_flags  = st->elf_hdr_set[EHF_FLAGS]  ? (uint32_t)st->elf_hdr_val[EHF_FLAGS] : 0;
     uint32_t _e_vers   = st->elf_hdr_set[EHF_VERSION]? (uint32_t)st->elf_hdr_val[EHF_VERSION] : 1;
@@ -16199,14 +14633,8 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         weo_shdr(fp,_is_le,_is_elf64,dbg_rela_noff[i],_dbg_rel_sh_type,0x40,0,dbg_rela_fo[i],dbg_rela[i].len,
                  (uint32_t)sym_shidx,(uint32_t)(dbg_base+1+dbg_rela[i].target),_dbg_word_align,(uint64_t)_reloc_entsz);
     }
-    /* 破綻点修正: fwrite と fclose の結果を見ずに「elf: wrote ...」と報告して
-     * いたため、ディスクが一杯のときに切り詰められた .o が成功として残って
-     * いた（axx.py は OSError で失敗する）。 */
     if(axx_close_out(fp, path)) goto weo_done;
     {
-    /* 破綻点修正: axx.py は ", N debug section(s)" と出すのに対し、ここだけ
-     * ", +DWARF debug" という別の文言だった。-g のときだけ両実装の stderr が
-     * 食い違い、出力比較による回帰検査をすり抜けていた。 */
     char _dbg_msg[64];
     if(n_dbg_prog) snprintf(_dbg_msg,sizeof(_dbg_msg),", %d debug section(s)",n_dbg_prog);
     else           _dbg_msg[0]='\0';
@@ -16317,11 +14745,6 @@ struct MacroPP {
     MLineVec  *out;
     int        depth;
     int        expr_depth;
-    /* 破綻点修正: `&&` `||` `?:` の「取らない側」を評価しないための印。
-     * この評価器は式のテキストを直接たどるので、取らない側も構文としては
-     * 最後まで読まないと位置が合わない。読みはするが、実行時のエラー
-     * （0除算・桁溢れ・未定義の名前）と副作用（uid() の採番、マクロ呼び出し）
-     * だけを止める。axx.py は木を組んでから評価するので初めから短絡している。 */
     int        noeval;
     long long  uid;
     long       nemitted;
@@ -16349,6 +14772,19 @@ struct MacroPP {
 };
 
 
+/* ---- マクロ層 -----------------------------------------------------------
+   アセンブラ本体の前に走る行指向のソース間変換。文はすべて行頭の `!` で始まり、
+   補間は波括弧付きの `!{...}`。書式指定は Python のフォーマットミニ言語で、
+   axx.py 側と同じ指定を受け、同じものを拒否し、文面もそろえてある。
+   ソース側のマクロはラベル値と `$` / `$$` を読めるが、見えるのは前回の
+   リラクゼーション反復の値。パターン側のマクロはソースのアセンブル前に
+   走るので、ラベルもロケーションカウンタも存在しない。
+   数は int64 で扱う。axx.py は多倍長なので、マクロ時の計算が 64bit を超える
+   場合だけ結果が食い違いうる（マクロ層はテキストを出すので、本体の 256bit
+   式評価には影響しない）。
+   展開中の確保はアリーナにまとめ、1 パスの終わりに一度で捨てる。
+   ------------------------------------------------------------------------ */
+/* アリーナから確保する。個別に解放しない。 */
 static void *marena_alloc(MArena *a, size_t n){
     n = (n + 15) & ~(size_t)15;
     if(a->head && a->head->cap - a->head->used >= n){
@@ -16366,21 +14802,25 @@ static void *marena_alloc(MArena *a, size_t n){
     a->total += cap;
     return b->data;
 }
+/* アリーナを巻き戻してまとめて捨てる。 */
 static void marena_reset(MArena *a){
     MArenaBlk *b = a->head;
     while(b){ MArenaBlk *n = b->next; free(b->data); free(b); b = n; }
     a->head = NULL; a->total = 0;
 }
+/* アリーナ上に長さ付きで複製する。 */
 static char *marena_strndup(MArena *a, const char *s, size_t n){
     char *p = marena_alloc(a, n + 1);
     memcpy(p, s, n); p[n] = '\0';
     return p;
 }
+/* アリーナ上に複製する。 */
 static char *marena_strdup(MArena *a, const char *s){
     return marena_strndup(a, s, strlen(s));
 }
 
 
+/* ブロックに文を 1 つ積む。 */
 static void mblock_push(MacroPP *mp, MBlock *b, MNode *n){
     if(b->len >= b->cap){
         int nc = b->cap ? b->cap * 2 : 8;
@@ -16390,6 +14830,7 @@ static void mblock_push(MacroPP *mp, MBlock *b, MNode *n){
     }
     b->d[b->len++] = n;
 }
+/* 展開結果の行を 1 つ積む（位置も覚える）。 */
 static void mlinevec_push(MacroPP *mp, MLineVec *v, char *text, const char *file, int line){
     if(v->len >= v->cap){
         int nc = v->cap ? v->cap * 2 : 64;
@@ -16404,11 +14845,13 @@ static void mlinevec_push(MacroPP *mp, MLineVec *v, char *text, const char *file
 }
 
 
+/* マクロ層を初期化する。 */
 static void macro_init(MacroPP *mp, Assembler *asmb){
     memset(mp, 0, sizeof(*mp));
     mp->asmb = asmb;
     mp->enabled = 1;
 }
+/* 1 パスぶんの状態を初期化する。 */
 static void macro_reset_pass(MacroPP *mp){
     for(int i = 0; i < mp->nscopes; i++){
         free(mp->scopes[i]->names);
@@ -16432,6 +14875,7 @@ static void macro_reset_pass(MacroPP *mp){
     if(!g){ perror("calloc"); exit(1); }
     mp->scopes[mp->nscopes++] = g;
 }
+/* マクロ層を解放する。 */
 static void macro_free(MacroPP *mp){
     macro_reset_pass(mp);
     for(int i = 0; i < mp->nscopes; i++){
@@ -16444,6 +14888,7 @@ static void macro_free(MacroPP *mp){
 }
 
 
+/* 同じ文言を一度だけ報告するための判定。 */
 static int m_first_report(MacroPP *mp, const char *msg){
     for(int i = 0; i < mp->nreported; i++)
         if(strcmp(mp->reported[i], msg) == 0) return 0;
@@ -16457,6 +14902,7 @@ static int m_first_report(MacroPP *mp, const char *msg){
     return 1;
 }
 
+/* `!warning` の出力。 */
 static void m_warn(MacroPP *mp, const char *file, int line, const char *fmt, ...){
     char body[1024];
     va_list ap; va_start(ap, fmt);
@@ -16469,10 +14915,8 @@ static void m_warn(MacroPP *mp, const char *file, int line, const char *fmt, ...
         axx_diagf(0, 1, " warning - %s\n", msg);
 }
 
+/* マクロ展開を失敗として記録する。 */
 static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...){
-    /* 破綻点修正: 本文を 1024、位置付きの文面を 1200 バイトに切り詰めていた
-     * ため、長い式や長い文字列値を含むエラーが axx.py と食い違っていた。
-     * 必要な長さを測ってから組み立てる。 */
     char bodybuf[1024];
     char *body = bodybuf;
     va_list ap; va_start(ap, fmt);
@@ -16504,9 +14948,8 @@ static void m_fail(MacroPP *mp, const char *file, int line, const char *fmt, ...
 }
 
 
-/* Python の repr() 相当。n バイトぶんを見るので、途中に NUL があっても
- * `\x00` として出せる（式の文字列は二重 NUL 終端で、axx.py 側の
- * `s[idx:idx+8]!r` は終端の chr(0) を含んだ形で出る）。 */
+/* 文字列を Python の repr() と同じ綴りにする。診断の文面を axx.py と
+   一字一句そろえるために必要。 */
 static void m_pyrepr_n(const char *s, size_t n, char *out, size_t outsz){
     if(outsz < 3){ if(outsz) out[0] = '\0'; return; }
     int has_sq = 0, has_dq = 0;
@@ -16533,18 +14976,12 @@ static void m_pyrepr_n(const char *s, size_t n, char *out, size_t outsz){
     out[o] = '\0';
 }
 
+/* 同じものを NUL 終端の文字列に対して行う。 */
 static void m_pyrepr(const char *s, char *out, size_t outsz){
     m_pyrepr_n(s, strlen(s), out, outsz);
 }
 
-/* 破綻点修正: マクロ層の診断はどこも `char sr[600]` のような固定長に repr を
- * 写していたため、長い式や長い文字列値（`"a"*1295` 等）が途中で切れて
- * axx.py（切り詰めない）と文面が食い違っていた。必要な長さぶんをマクロ層の
- * アリーナから取る（m_fail が longjmp で抜けても漏れない）。 */
-/* `}` の後ろに残った字。axx.py は `.strip()` してから見て、空または `;` で
- * 始まるならコメントとして許す。空でなければ Python の repr で報告する。
- * 破綻点修正: caxx は左側しか削らず、`;` のコメントも許していなかったうえ、
- * repr にもしていなかった。 */
+/* 診断に添える行の末尾を作る。 */
 static char *m_trailer(MacroPP *mp, const char *s){
     const char *b = s;
     while(*b == ' ' || *b == '\t') b++;
@@ -16556,6 +14993,7 @@ static char *m_trailer(MacroPP *mp, const char *s){
     return r;
 }
 
+/* repr() 形式の綴りをアリーナ上に作る。 */
 static char *m_pyrepr_a(MacroPP *mp, const char *s){
     if(!s) s = "";
     size_t sz = strlen(s) * 4 + 8;
@@ -16569,6 +15007,7 @@ static MVal mv_int(long long v){ MVal r; r.is_str = 0; r.i = v; r.s = NULL; retu
 static MVal mv_str(char *s){ MVal r; r.is_str = 1; r.i = 0; r.s = s; return r; }
 static int  mv_truth(MVal v){ return v.is_str ? (v.s && v.s[0]) : (v.i != 0); }
 
+/* マクロ値をテキストにする。 */
 static char *mv_to_text(MacroPP *mp, MVal v){
     if(v.is_str) return v.s ? v.s : (char*)"";
     char buf[32];
@@ -16576,19 +15015,14 @@ static char *mv_to_text(MacroPP *mp, MVal v){
     return marena_strdup(&mp->arena, buf);
 }
 
-/* マクロ層の `!echo` とミニ言語の `.echo` に共通の出力ルーチン。
- * 項目を空白区切りで 1 行にまとめて標準エラーへ出す。体裁を 1 か所に
- * 集めておくため、どちらの層もここを通す（axx.py の _echo_write と同じ）。 */
-/* `s[i]` の `'` が符号拡張の演算子か（右に幅が続くか）を見分ける。
- * 文字定数 `'A'` と区別するため、本体の評価器と同じく「続く文字が数字か `(`」
- * を条件にする。`!{...}` の走査とマクロ式パーサの両方から使う。
- * axx.py の _sext_tick_at と同じ。 */
+/* その位置の `'` が符号拡張演算子か（文字定数の引用符ではないか）。 */
 static int m_sext_tick_at(const char *s, int i){
     int j = i + 1;
     while(s[j] == ' ' || s[j] == '\t') j++;
     return (s[j] >= '0' && s[j] <= '9') || s[j] == '(';
 }
 
+/* `!echo` の出力を標準エラーへ書く。ミニ言語の `.echo` と体裁を共有する。 */
 static void m_echo_write(char *const *items, int n){
     for(int i = 0; i < n; i++){
         if(i) fputc(' ', stderr);
@@ -16596,6 +15030,7 @@ static void m_echo_write(char *const *items, int n){
     }
     fputc('\n', stderr);
 }
+/* 整数を要求する。 */
 static long long mv_need_int(MacroPP *mp, MVal v, const char *file, int line){
     if(v.is_str){
         if(mp->noeval) return 0;
@@ -16605,27 +15040,15 @@ static long long mv_need_int(MacroPP *mp, MVal v, const char *file, int line){
     }
     return v.i;
 }
-/* 破綻点修正: マクロ時の int64 演算は、MACRO.md が明言するとおり axx.py の
- * 多倍長整数と違って 64bit で切り捨てる仕様である。しかし従来の実装は
- * その切り捨てを素の `+`/`-`/`*`/単項 `-`/`<<` で行っており、これらは
- * オペランドが INT64_MIN や桁あふれを起こす値のとき C の符号付き整数
- * オーバーフロー（未定義動作）を踏む。UBSan はこれを多数検出する
- * （`9223372036854775807+1`、`INT64_MIN` の単項 `-` や abs()、
- * 負値の `<<` など）。未定義動作である以上、最適化次第で「64bit 切り捨て」
- * にすらならない壊れ方をしうるので、意図した2の補数の折り返しを
- * 符号なし演算で明示的に行い、結果だけ符号付きへ戻す。
- * （符号なし→符号付きの変換は実装依存だが、実用上の全処理系で
- * 2の補数として素通しされ、これは C 標準でも許容された実装依存動作であって
- * 未定義動作ではない。） */
+/* 符号反転（検査なし）。 */
 static inline long long m_i64_neg(long long a){
     return (long long)(0ULL - (unsigned long long)a);
 }
+/* 絶対値（検査なし）。 */
 static inline long long m_i64_abs(long long a){
     return a < 0 ? m_i64_neg(a) : a;
 }
-/* 破綻点修正: 単項 '-' と abs() だけが桁溢れ検査を通っておらず、
- * INT64_MIN に対して黙ってラップアラウンド（符号付きオーバーフロー）していた。
- * 他の演算子と同じく、表現できない結果は明示的なエラーにする。 */
+/* 符号反転。溢れたらエラーにする。 */
 static inline long long m_i64_neg_ck(MEP *p, long long a){
     if(a == LLONG_MIN){
         if(p->mp->noeval) return 0;
@@ -16634,14 +15057,11 @@ static inline long long m_i64_neg_ck(MEP *p, long long a){
     }
     return -a;
 }
+/* 絶対値。溢れたらエラーにする。 */
 static inline long long m_i64_abs_ck(MEP *p, long long a){
     return a < 0 ? m_i64_neg_ck(p, a) : a;
 }
-/* 破綻点修正: 以前は +,-,* を unsigned キャスト経由で無言のままラップアラウンド
- * させていた。axx.py 側は任意精度整数なので、64bit を超えるマクロ計算では
- * 両実装が黙って別々の(誤った)値を返す食い違いが起きていた。完全な任意精度化
- * はここでは行わないが、64bit をオーバーフローする場合は黙って間違った値を
- * 返す代わりに、呼び出し元(MEP*)経由で明示的にエラーにする。 */
+/* 加算。溢れたらエラーにする。 */
 static inline long long m_i64_add(MEP *p, long long a, long long b){
     long long r;
     if(__builtin_add_overflow(a, b, &r)){
@@ -16651,6 +15071,7 @@ static inline long long m_i64_add(MEP *p, long long a, long long b){
     }
     return r;
 }
+/* 減算。溢れたらエラーにする。 */
 static inline long long m_i64_sub(MEP *p, long long a, long long b){
     long long r;
     if(__builtin_sub_overflow(a, b, &r)){
@@ -16660,6 +15081,7 @@ static inline long long m_i64_sub(MEP *p, long long a, long long b){
     }
     return r;
 }
+/* 乗算。溢れたらエラーにする。 */
 static inline long long m_i64_mul(MEP *p, long long a, long long b){
     long long r;
     if(__builtin_mul_overflow(a, b, &r)){
@@ -16669,36 +15091,30 @@ static inline long long m_i64_mul(MEP *p, long long a, long long b){
     }
     return r;
 }
+/* 左シフト。 */
 static inline long long m_i64_shl(long long a, int n){
     return (long long)((unsigned long long)a << n);
 }
-/* 数値リテラルの桁読み取り専用: 例えば 0xFFFFFFFFFFFFFFFF のような
- * 64bit いっぱいのビットパターンは、signed long long としては
- * 「ラップアラウンドして -1 になる」のがビットパターンとして正しい表現であり、
- * 演算子の桁溢れとは性質が違う。ここでは意図的に無言のラップアラウンドを保つ。 */
+/* 加算（検査なし）。 */
 static inline long long m_i64_add_raw(long long a, long long b){
     return (long long)((unsigned long long)a + (unsigned long long)b);
 }
+/* 乗算（検査なし）。 */
 static inline long long m_i64_mul_raw(long long a, long long b){
     return (long long)((unsigned long long)a * (unsigned long long)b);
 }
 
+/* C と同じゼロ方向の切り捨て除算。 */
 static long long m_cdiv(MEP *p, long long a, long long b){
-    if(b == 0) return 0;                 /* 取らない側を読み飛ばしている最中 */
+    if(b == 0) return 0;
     if(a == LLONG_MIN && b == -1){
         if(p->mp->noeval) return 0;
         char *sr = m_pyrepr_a(p->mp, p->s);
         m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
     }
-    /* 破綻点修正: m_i64_abs(INT64_MIN) は INT64_MIN のままなので（絶対値が
-     * 表現できない）、商が既に負のところへさらに符号反転がかかり、
-     * INT64_MIN/2 が +4611686018427387904 という符号の逆な値になっていた。
-     * 絶対値は符号なしで取れば必ず正しく表せるので、そちらで割る。 */
     unsigned long long ua = (a < 0) ? (0ULL - (unsigned long long)a) : (unsigned long long)a;
     unsigned long long ub = (b < 0) ? (0ULL - (unsigned long long)b) : (unsigned long long)b;
     unsigned long long q = ua / ub;
-    /* 符号が違えば商は 2**63 以下なので -q は必ず表現できる。符号が同じ
-     * 場合、a==INT64_MIN && b==-1 は上で弾いてあるので q は INT64_MAX 以下。 */
     return ((a >= 0) == (b >= 0)) ? (long long)q : (long long)(0ULL - q);
 }
 static long long m_cmod(MEP *p, long long a, long long b){ return m_i64_sub(p, a, m_i64_mul(p, m_cdiv(p, a, b), b)); }
@@ -16706,11 +15122,13 @@ static long long m_cmod(MEP *p, long long a, long long b){ return m_i64_sub(p, a
 
 static MScope *m_scope(MacroPP *mp){ return mp->scopes[mp->nscopes - 1]; }
 
+/* スコープの中で名前を引く。 */
 static MVal *m_scope_find(MScope *sc, const char *name){
     for(int i = 0; i < sc->len; i++)
         if(strcmp(sc->names[i], name) == 0) return &sc->vals[i];
     return NULL;
 }
+/* スコープに名前と値を置く。 */
 static void m_scope_set(MScope *sc, char *name, MVal v){
     MVal *p = m_scope_find(sc, name);
     if(p){ *p = v; return; }
@@ -16724,6 +15142,7 @@ static void m_scope_set(MScope *sc, char *name, MVal v){
     sc->vals[sc->len]  = v;
     sc->len++;
 }
+/* スコープから名前を消す。 */
 static void m_scope_del(MScope *sc, const char *name){
     for(int i = 0; i < sc->len; i++)
         if(strcmp(sc->names[i], name) == 0){
@@ -16736,11 +15155,13 @@ static void m_scope_del(MScope *sc, const char *name){
         }
 }
 
+/* マクロ定義を名前で引く。 */
 static MFunc *m_func_find(MacroPP *mp, const char *name){
     for(int i = 0; i < mp->nfuncs; i++)
         if(strcmp(mp->funcs[i].name, name) == 0) return &mp->funcs[i];
     return NULL;
 }
+/* マクロ定義を 1 つ作る。 */
 static MFunc *m_func_add(MacroPP *mp, const char *name){
     if(mp->nfuncs >= mp->cfuncs){
         int nc = mp->cfuncs ? mp->cfuncs * 2 : 16;
@@ -16754,11 +15175,13 @@ static MFunc *m_func_add(MacroPP *mp, const char *name){
     f->name = marena_strdup(&mp->arena, name);
     return f;
 }
+/* その名前が宣言済みか。 */
 static int m_declared(MacroPP *mp, const char *name){
     for(int i = 0; i < mp->ndecl; i++)
         if(strcmp(mp->declared[i], name) == 0) return 1;
     return 0;
 }
+/* その名前を宣言済みにする。 */
 static void m_declare(MacroPP *mp, const char *name){
     if(m_declared(mp, name)) return;
     if(mp->ndecl >= mp->cdecl){
@@ -16770,30 +15193,15 @@ static void m_declare(MacroPP *mp, const char *name){
     mp->declared[mp->ndecl++] = marena_strdup(&mp->arena, name);
 }
 
-/* アセンブラ側のラベル / .equ を引いた結果。 */
 typedef enum { MLBL_NO = 0, MLBL_UNKNOWN, MLBL_VALUE } MLabelStatus;
 
-/* アセンブラ側のラベル / .equ を引く。
- *
- * マクロ展開はアドレス確定より前に走るので「今の値」は存在しない。前回
- * リラクゼーション反復のスナップショット(st->macro_labels)を見て、
- *   MLBL_VALUE   … 前回反復で値が確定していた（*out に値）
- *   MLBL_UNKNOWN … ラベルとしては在るが値が未確定（初回反復では全ての名前）
- *   MLBL_NO      … そんなラベルは無い（＝綴り間違い）
- * を返す。パターンファイル側のマクロ層はソースのアセンブル前に走るので、
- * そこでは常に MLBL_NO。
- *
- * 値が確定しているかの判定に LabelEntry::is_undef を使わず値だけを見るのは、
- * axx.py 側にこのフラグが無く、値で判定しているため。両実装でマクロ層から
- * 見える世界を一致させる。 */
+/* ラベルの値を引く。「値がある」「名前は知っているが値はまだ無い」「無い」を
+   区別する。パターン側のマクロでは常に「無い」で、読めるラベルが存在しない。 */
 static MLabelStatus m_asm_label(MacroPP *mp, const char *name, long long *out){
     if(out) *out = 0;
     if(mp->pat_mode || !mp->asmb) return MLBL_NO;
     AsmState *st = &mp->asmb->st;
     if(!st->macro_labels_valid){
-        /* まだ一度も反復していない。前方参照なのか綴り間違いなのかを区別
-         * できないので、エラーにせず未確定として扱う。綴り間違いは次の
-         * 反復で MLBL_NO として捕まる。 */
         return MLBL_UNKNOWN;
     }
     LabelEntry *e = lmap_find(&st->macro_labels, name);
@@ -16803,9 +15211,8 @@ static MLabelStatus m_asm_label(MacroPP *mp, const char *name, long long *out){
     return MLBL_VALUE;
 }
 
-/* マクロ展開時の位置カウンタ（$ / $$）。ラベルと違って名前ではなく位置で
- * 決まる値なので、前回反復で記録した「展開後 N 行目のアドレス」を返す。
- * 初回反復や、展開行数が変わって対応する行がまだ無い場合は 0。 */
+/* `$` / `$$` の値。前回の反復で記録した行ごとの PC から引く。パターン側の
+   マクロではエラーにする。 */
 static long long m_loc_counter(MacroPP *mp, const char *file, int line){
     if(mp->pat_mode || !mp->asmb){
         m_fail(mp, file, line,
@@ -16818,18 +15225,16 @@ static long long m_loc_counter(MacroPP *mp, const char *file, int line){
     return mlp_get(&st->macro_line_pcs, st->current_file, idx);
 }
 
+/* その名前が定義済みか。 */
 static int m_is_defined(MacroPP *mp, const char *name){
-    /* 破綻点修正: `!undef` はマクロを表から消さず defined=0 にするだけなのに、
-     * ここは存在するかどうかしか見ていなかった。そのため `!undef foo` のあとも
-     * `defined(foo)` が真を返し、axx.py（funcs から削除する）と食い違っていた。 */
     MFunc *_f = m_func_find(mp, name);
     if(_f && _f->defined) return 1;
     for(int i = mp->nscopes - 1; i >= 0; i--)
         if(m_scope_find(mp->scopes[i], name)) return 1;
     return m_asm_label(mp, name, NULL) == MLBL_VALUE;
 }
+/* 名前を解決する。内側のスコープから外側へたどる。 */
 static MVal m_lookup(MacroPP *mp, const char *name, const char *file, int line){
-    /* 取らない側を読み飛ばしている最中は、名前を引かない。 */
     if(mp->noeval) return mv_int(0);
     for(int i = mp->nscopes - 1; i >= 0; i--){
         MVal *p = m_scope_find(mp->scopes[i], name);
@@ -16847,6 +15252,7 @@ static MVal m_lookup(MacroPP *mp, const char *name, const char *file, int line){
     m_fail(mp, file, line, "undefined macro variable '%s'", name);
     return mv_int(0);
 }
+/* `!set` の代入。内側から外側へ探し、無ければ現在のスコープに作る。 */
 static void m_assign(MacroPP *mp, const char *name, MVal v){
     for(int i = mp->nscopes - 1; i >= 0; i--){
         MVal *p = m_scope_find(mp->scopes[i], name);
@@ -16862,6 +15268,9 @@ static MVal m_call_value(MacroPP *mp, const char *name, MVal *args, int nargs,
 
 static void mep_skip(MEP *p){ while(p->s[p->i] == ' ' || p->s[p->i] == '\t') p->i++; }
 
+/* マクロ式の再帰下降。値は整数と文字列の 2 種類で、演算子は C に倣う。
+   本体の式評価器とは別物なので、`%` の符号と `'` の結合位置が違う。 */
+/* 次がそのトークンなら消費して真。 */
 static int mep_eat(MEP *p, const char *tok){
     mep_skip(p);
     size_t n = strlen(tok);
@@ -16869,6 +15278,7 @@ static int mep_eat(MEP *p, const char *tok){
     p->i += (int)n;
     return 1;
 }
+/* そのトークンを必ず消費する。 */
 static void mep_expect(MEP *p, const char *tok){
     if(!mep_eat(p, tok)){
         char tokr[16];
@@ -16879,6 +15289,7 @@ static void mep_expect(MEP *p, const char *tok){
 }
 static char mep_peek(MEP *p){ mep_skip(p); return p->s[p->i]; }
 
+/* 識別子を 1 個読む。 */
 static char *mep_ident(MEP *p){
     mep_skip(p);
     int j = p->i;
@@ -16892,6 +15303,7 @@ static char *mep_ident(MEP *p){
     return r;
 }
 
+/* 整数リテラルを読む。10 進・0x・0b・0o、アンダースコア可。 */
 static MVal mep_number(MEP *p){
     const char *s = p->s;
     int j = p->i, base = 10, start;
@@ -16921,6 +15333,7 @@ static MVal mep_number(MEP *p){
     return mv_int(v);
 }
 
+/* 文字列リテラルを読む。`'A'` は 1 文字なら文字コードになる。 */
 static char *mep_string(MEP *p, char q, int *len_out){
     const char *s = p->s;
     int j = p->i + 1;
@@ -16950,6 +15363,7 @@ static char *mep_string(MEP *p, char q, int *len_out){
     return NULL;
 }
 
+/* 項そのもの。数値、文字列、名前、括弧、組み込み関数。 */
 static MVal mep_primary(MEP *p){
     mep_skip(p);
     char c = p->s[p->i];
@@ -16959,11 +15373,6 @@ static MVal mep_primary(MEP *p){
     }
 
     if(c == '('){
-        /* 破綻点修正: mep_primary〜mep_ternary の相互再帰に上限が無く、
-         * `(` の深いネスト（!set/!if/!while の式に現れうる）でCスタックを
-         * 使い果たしてクラッシュしうた（expr_factor 側の EXPR_MAX_DEPTH と
-         * 同種の問題）。axx.py は RecursionError で安全に止まるのに対し、
-         * こちらは無防備だったので、同じ上限で止める。 */
         if(p->mp->expr_depth >= EXPR_MAX_DEPTH){
             char *sr = m_pyrepr_a(p->mp, p->s);
             m_fail(p->mp, p->file, p->line, "macro expression: nesting too deep in %s", sr);
@@ -16987,9 +15396,6 @@ static MVal mep_primary(MEP *p){
         return mv_str(t);
     }
     if(c == '$'){
-        /* 位置カウンタ。`$` と `$$` は同義（アセンブラ本体では `$$` が位置
-         * カウンタなので、そちらの綴りも受ける）。空白を挟んだ `$ $` を
-         * `$$` と読まないよう、次の文字は素で見る。 */
         p->i++;
         if(p->s[p->i] == '$') p->i++;
         return mv_int(m_loc_counter(p->mp, p->file, p->line));
@@ -17033,20 +15439,18 @@ static MVal mep_primary(MEP *p){
     return mv_int(0);
 }
 
+/* 単項 `-` `+` `~` `!`。 */
 static MVal mep_unary(MEP *p){
     mep_skip(p);
     if(p->s[p->i] == '!' && p->s[p->i+1] != '='){ p->i++; return mv_int(mv_truth(mep_unary(p)) ? 0 : 1); }
     if(p->s[p->i] == '~'){ p->i++; return mv_int(~mv_need_int(p->mp, mep_unary(p), p->file, p->line)); }
     if(p->s[p->i] == '-'){ p->i++; return mv_int(m_i64_neg_ck(p, mv_need_int(p->mp, mep_unary(p), p->file, p->line))); }
     if(p->s[p->i] == '+'){ p->i++; return mep_unary(p); }
-    /* 本体の `@`（最上位ビット位置）。実装は共有関数 op_msb()。 */
     if(p->s[p->i] == '@'){
         p->i++;
         long long xv = mv_need_int(p->mp, mep_unary(p), p->file, p->line);
         return mv_int(op_msb(u256_from_i64(xv)));
     }
-    /* 本体の `*(値, 位置)`（バイト抽出）。値が来る位置の `*` だけがこれで、
-     * 中置の `*` は従来どおり掛け算（本体の評価器と同じ見分け方）。 */
     if(p->s[p->i] == '*' && p->s[p->i+1] == '('){
         p->i += 2;
         MVal xa = mep_ternary(p);
@@ -17065,12 +15469,6 @@ static MVal mep_unary(MEP *p){
     return mep_primary(p);
 }
 
-/* 破綻点修正: `n * (long long)l` は n が大きいと符号付きオーバーフロー（UB）を
- * 起こし、上限チェック自体をすり抜けてから marena_alloc() に渡っていた
- * （ヒープバッファオーバーフロー。ASan で確認済み）。しかも文字列側が右辺に
- * 来る形（!v.is_str && r.is_str）には上限チェックが一切無かった。
- * 掛け算をせずに割り算で判定すれば、n・l がどちらも非負である前提のもとで
- * オーバーフローなしに「n*l が上限を超えるか」を判定できる。 */
 static long long m_safe_repeat_len(MacroPP *mp, const char *file, int line,
                                     const char *srcline, long long n, size_t l){
     if(n < 0) n = 0;
@@ -17084,6 +15482,7 @@ static long long m_safe_repeat_len(MacroPP *mp, const char *file, int line,
     return n * (long long)l;
 }
 
+/* `*` `/` `%`。文字列 `*` 整数は繰り返し。 */
 static MVal mep_mul(MEP *p){
     MVal v = mep_unary(p);
     for(;;){
@@ -17111,9 +15510,6 @@ static MVal mep_mul(MEP *p){
                 b[(size_t)total] = '\0';
                 v = mv_str(b);
             } else {
-                /* 破綻点修正: 引数の評価順は C では未規定で、gcc は右から
-                  * 評価するため、両方が文字列のとき axx.py（左から）と違う
-                  * ほうの値をエラーに出していた。順序を固定する。 */
                 long long _lv = mv_need_int(p->mp, v, p->file, p->line);
                 long long _rv = mv_need_int(p->mp, r, p->file, p->line);
                 v = mv_int(m_i64_mul(p, _lv, _rv));
@@ -17138,6 +15534,7 @@ static MVal mep_mul(MEP *p){
     }
 }
 
+/* `+` `-`。どちらかが文字列なら `+` は連結。 */
 static MVal mep_add(MEP *p){
     MVal v = mep_mul(p);
     for(;;){
@@ -17155,7 +15552,6 @@ static MVal mep_add(MEP *p){
             } else v = mv_int(m_i64_add(p, v.i, r.i));
         } else if(c == '-'){
             p->i++;
-            /* 破綻点修正: 同上（評価順の固定）。 */
             { long long _lv = mv_need_int(p->mp, v, p->file, p->line);
               long long _rv = mv_need_int(p->mp, mep_mul(p), p->file, p->line);
               v = mv_int(m_i64_sub(p, _lv, _rv)); }
@@ -17163,6 +15559,7 @@ static MVal mep_add(MEP *p){
     }
 }
 
+/* `<<` `>>`。 */
 static MVal mep_shift(MEP *p){
     MVal v = mep_add(p);
     for(;;){
@@ -17170,19 +15567,13 @@ static MVal mep_shift(MEP *p){
         if(p->s[p->i] == '<' && p->s[p->i+1] == '<'){
             p->i += 2;
             long long n = mv_need_int(p->mp, mep_add(p), p->file, p->line);
-            /* 破綻点修正: 上限を 63 にしていたため、axx.py が受け付ける
-             * 0〜4096 のシフト量のうち 64 以上が、値の大小に関わらず
-             * 「shift count out of range」で落ちていた。上限を axx.py に
-             * 合わせ、64bit から溢れるかどうかは下の桁溢れ検査で見る。 */
             if((n < 0 || n > 4096) && !p->mp->noeval){
                 char *sr = m_pyrepr_a(p->mp, p->s);
                 m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range in %s", sr);
             }
-            if(n < 0 || n > 4096) n = 0;   /* 取らない側を読み飛ばしている最中 */
+            if(n < 0 || n > 4096) n = 0;
             long long base = mv_need_int(p->mp, v, p->file, p->line);
             if(n > 63){
-                /* 64bit では表せない。0 を何ビット左にずらしても 0 なので、
-                 * その場合だけは axx.py と同じ値を返せる。 */
                 if(base != 0 && !p->mp->noeval){
                     char *sr = m_pyrepr_a(p->mp, p->s);
                     m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
@@ -17191,9 +15582,6 @@ static MVal mep_shift(MEP *p){
                 continue;
             }
             long long shifted = m_i64_shl(base, (int)n);
-            /* 破綻点修正: 64bit を超えて追い出されたビットを黙って捨てていたため、
-             * axx.py(任意精度)と異なる値を無言で返していた。追い出されたビットが
-             * あれば(逆シフトで元に戻らなければ)明示的にエラーにする。 */
             if(n > 0 && (shifted >> n) != base && !p->mp->noeval){
                 char *sr = m_pyrepr_a(p->mp, p->s);
                 m_fail(p->mp, p->file, p->line, "macro expression: integer overflow (64-bit) in %s", sr);
@@ -17202,28 +15590,20 @@ static MVal mep_shift(MEP *p){
         } else if(p->s[p->i] == '>' && p->s[p->i+1] == '>'){
             p->i += 2;
             long long n = mv_need_int(p->mp, mep_add(p), p->file, p->line);
-            /* 破綻点修正: 同上。右シフトは 64 以上でも結果が 64bit に収まる
-             * （符号に応じて 0 か -1 に落ち着く）ので、そこまで含めて
-             * axx.py と同じ値を返す。 */
             if((n < 0 || n > 4096) && !p->mp->noeval){
                 char *sr = m_pyrepr_a(p->mp, p->s);
                 m_fail(p->mp, p->file, p->line, "macro expression: shift count out of range in %s", sr);
             }
-            if(n < 0 || n > 4096) n = 0;   /* 取らない側を読み飛ばしている最中 */
+            if(n < 0 || n > 4096) n = 0;
             long long rbase = mv_need_int(p->mp, v, p->file, p->line);
             v = mv_int(n > 63 ? (rbase < 0 ? -1 : 0) : (rbase >> n));
         } else return v;
     }
 }
 
+/* 大小比較。整数と文字列が混ざる場合の規則をここに閉じる。 */
 static int m_order(MEP *p, MVal a, MVal b, int or_equal){
     if(a.is_str != b.is_str){
-        /* 破綻点修正: 三項演算子や `&&`/`||` の「取らない側」を読み飛ばして
-         * いる最中（noeval）でも型の食い違いを本物のエラーにしていたため、
-         * `!{1 ? 0 : "hello" < str(2)}` のように実行されない枝に文字列と
-         * 数値の比較があるだけで失敗していた（axx.py は _cmp_lt_eq() で
-         * suppress を見て False を返す）。他の診断（mv_need_int、除算、
-         * シフト等）は既に noeval を見ている。 */
         if(p->mp->noeval) return 0;
         char *sr = m_pyrepr_a(p->mp, p->s);
         m_fail(p->mp, p->file, p->line, "macro expression: cannot order a string against an integer in %s", sr);
@@ -17235,6 +15615,7 @@ static int m_order(MEP *p, MVal a, MVal b, int or_equal){
     return or_equal ? (a.i <= b.i) : (a.i < b.i);
 }
 
+/* `<` `<=` `>` `>=`。 */
 static MVal mep_rel(MEP *p){
     MVal v = mep_shift(p);
     for(;;){
@@ -17249,12 +15630,14 @@ static MVal mep_rel(MEP *p){
     }
 }
 
+/* 等値比較。 */
 static int m_equal(MVal a, MVal b){
     if(a.is_str != b.is_str) return 0;
     if(a.is_str) return strcmp(a.s ? a.s : "", b.s ? b.s : "") == 0;
     return a.i == b.i;
 }
 
+/* `==` `!=`。 */
 static MVal mep_eq(MEP *p){
     MVal v = mep_rel(p);
     for(;;){
@@ -17264,50 +15647,48 @@ static MVal mep_eq(MEP *p){
     }
 }
 
+/* `&`。 */
 static MVal mep_band(MEP *p){
     MVal v = mep_eq(p);
     for(;;){
         mep_skip(p);
         if(p->s[p->i] == '&' && p->s[p->i+1] != '&'){
             p->i++;
-            /* 破綻点修正: 同上（評価順の固定）。 */
             { long long _lv = mv_need_int(p->mp, v, p->file, p->line);
               long long _rv = mv_need_int(p->mp, mep_eq(p), p->file, p->line);
               v = mv_int(_lv & _rv); }
         } else return v;
     }
 }
+/* `^`。 */
 static MVal mep_bxor(MEP *p){
     MVal v = mep_band(p);
     for(;;){
         mep_skip(p);
         if(p->s[p->i] == '^'){
             p->i++;
-            /* 破綻点修正: 同上（評価順の固定）。 */
             { long long _lv = mv_need_int(p->mp, v, p->file, p->line);
               long long _rv = mv_need_int(p->mp, mep_band(p), p->file, p->line);
               v = mv_int(_lv ^ _rv); }
         } else return v;
     }
 }
+/* `|`。 */
 static MVal mep_bor(MEP *p){
     MVal v = mep_bxor(p);
     for(;;){
         mep_skip(p);
         if(p->s[p->i] == '|' && p->s[p->i+1] != '|'){
             p->i++;
-            /* 破綻点修正: 同上（評価順の固定）。 */
             { long long _lv = mv_need_int(p->mp, v, p->file, p->line);
               long long _rv = mv_need_int(p->mp, mep_bxor(p), p->file, p->line);
               v = mv_int(_lv | _rv); }
         } else return v;
     }
 }
-/* 本体の `'`（任意ビット位置からの符号拡張）をマクロ式でも使えるようにする。
- * 実装は本体と同じ共有関数 op_sext()。位置はビット演算子より緩く `&&` より
- * きつい段。本体では `^` と比較のあいだだが、マクロ層の優先順位は C に
- * 合わせてあり比較のほうがビット演算子よりきついので、同じ相対位置は取れない。
- * axx.py の _ExprParser.sext と同じ。 */
+/* `'` — 符号拡張。マクロ層ではビット演算より緩く `&&` よりきつい。本体の
+   評価器での位置とは違う。マクロ層の優先順位が C に倣っていて、そこでは
+   比較がビット演算よりきつく結合するため。 */
 static MVal mep_sext(MEP *p){
     MVal v = mep_bor(p);
     for(;;){
@@ -17330,10 +15711,10 @@ static MVal mep_sext(MEP *p){
     return v;
 }
 
+/* `&&`。 */
 static MVal mep_land(MEP *p){
     MVal v = mep_sext(p);
     while(mep_eat(p, "&&")){
-        /* 左が偽なら右は評価しない（C と同じ短絡）。 */
         int skip = !p->mp->noeval && !mv_truth(v);
         if(skip) p->mp->noeval++;
         MVal r = mep_sext(p);
@@ -17342,11 +15723,10 @@ static MVal mep_land(MEP *p){
     }
     return v;
 }
+/* `||`。 */
 static MVal mep_lor(MEP *p){
     MVal v = mep_land(p);
     while(mep_eat(p, "||")){
-        /* 左が真なら右は評価しない（C と同じ短絡）。テキストをたどる評価器
-         * なので読み飛ばしはせず、noeval を立てたまま最後まで読む。 */
         int skip = !p->mp->noeval && mv_truth(v);
         if(skip) p->mp->noeval++;
         MVal r = mep_land(p);
@@ -17355,13 +15735,13 @@ static MVal mep_lor(MEP *p){
     }
     return v;
 }
+/* `?:`。 */
 static MVal mep_ternary(MEP *p){
     MVal c = mep_lor(p);
     mep_skip(p);
     if(p->s[p->i] == '?'){
         p->i++;
         int taken = p->mp->noeval ? 0 : (mv_truth(c) ? 1 : 2);
-        /* 取る側だけを評価する。取らない側は noeval のまま読む。 */
         if(taken == 2) p->mp->noeval++;
         MVal a = mep_ternary(p);
         if(taken == 2) p->mp->noeval--;
@@ -17374,15 +15754,11 @@ static MVal mep_ternary(MEP *p){
     return c;
 }
 
+/* マクロ式を 1 個評価する。 */
 static MVal m_eval(MacroPP *mp, const char *text, const char *file, int line){
     while(*text == ' ' || *text == '\t') text++;
     if(!*text) m_fail(mp, file, line, "empty macro expression");
-    /* 破綻点修正: m_fail は longjmp で抜けるため、エラーで打ち切られた前回の
-     * 評価が mep_primary の '(' で加算した expr_depth を減算し損ねたまま
-     * 残ることがある。各トップレベル評価の開始時に必ず 0 へ戻す。 */
     mp->expr_depth = 0;
-    /* 同上: 取らない側を読んでいる途中で m_fail に飛ばれると noeval が
-     * 立ったまま残り、以後の実行時エラーが黙って握り潰される。 */
     mp->noeval = 0;
     const char *saved_cur_expr = mp->cur_expr;
     mp->cur_expr = text;
@@ -17438,8 +15814,6 @@ static int m_builtin(MacroPP *mp, const char *name, MVal *a, int n,
         long long v = strtoll(a[0].s ? a[0].s : "", &end, base);
         while(end && (*end == ' ' || *end == '\t')) end++;
         if(!end || end == a[0].s || *end)
-            /* 破綻点修正: axx.py は `int({a[0]!r})` と Python の repr で出すので、
-             * 引用符の選び方が違っていた（`int("")` 対 `int('')`）。 */
             m_fail(mp, file, line, "int(%s) is not a number",
                    m_pyrepr_a(mp, a[0].s ? a[0].s : ""));
         *out = mv_int(v);
@@ -17470,8 +15844,6 @@ static int m_builtin(MacroPP *mp, const char *name, MVal *a, int n,
     if(strcmp(name, "abs") == 0){
         m_bi_argc(mp, "abs", n, 1, 1, file, line);
         long long v = mv_need_int(mp, a[0], file, line);
-        /* 破綻点修正: abs(INT64_MIN) は 64bit で表現できない。黙って
-         * INT64_MIN のまま返さず、他の演算子と同じくエラーにする。 */
         if(v == LLONG_MIN)
             m_fail(mp, file, line, "macro expression: integer overflow (64-bit) in abs()");
         *out = mv_int(v < 0 ? -v : v);
@@ -17494,9 +15866,6 @@ static int m_builtin(MacroPP *mp, const char *name, MVal *a, int n,
         return 1;
     }
     if(strcmp(name, "label") == 0){
-        /* label("名前") — アセンブラ側のラベル / .equ の値。裸の識別子でも
-         * 同じ値を引けるが、`.L1` のようにマクロの識別子として書けない名前は
-         * こちらでしか参照できない。解決規則は裸の識別子と同一。 */
         m_bi_argc(mp, "label", n, 1, 1, file, line);
         if(!a[0].is_str)
             m_fail(mp, file, line, "label() needs a string");
@@ -17528,12 +15897,6 @@ static MVal m_invoke(MacroPP *mp, MFunc *f, MVal *args, int nargs,
     MScope *sc = calloc(1, sizeof(MScope));
     if(!sc){ perror("calloc"); exit(1); }
 
-    /* 破綻点修正: 引数のデフォルト式を新しいスコープを push する前に評価
-     * していたため、`!def f(a, b=a+1)` の b のデフォルトが呼び出し元の
-     * スコープの 'a' を参照してしまっていた(axx.py 側にも同じ破綻点があり
-     * 併せて修正済み)。先にスコープを push し、仮引数を確定させるたびに
-     * そのスコープへ書き込みながら進めることで、後続のデフォルト式から
-     * 前方の仮引数を正しく参照できるようにする。 */
     mp->scopes[mp->nscopes++] = sc;
     for(int i = 0; i < f->nparams; i++){
         MVal v = (i < nargs) ? args[i] : m_eval(mp, f->defaults[i], file, line);
@@ -17558,8 +15921,6 @@ static MVal m_invoke(MacroPP *mp, MFunc *f, MVal *args, int nargs,
 
 static MVal m_call_value(MacroPP *mp, const char *name, MVal *args, int nargs,
                          const char *file, int line){
-    /* 取らない側を読み飛ばしている最中は呼ばない。uid() の採番や
-     * マクロ本体の副作用が起きてしまうため。 */
     if(mp->noeval) return mv_int(0);
     MVal out;
     if(m_builtin(mp, name, args, nargs, file, line, &out)) return out;
@@ -17603,10 +15964,13 @@ typedef struct {
     char type;
 } MFmt;
 
+/* 書式指定の整列文字か。 */
 static int m_is_align(char c){
     return c == '<' || c == '>' || c == '=' || c == '^';
 }
 
+/* 書式指定を解析する。Python のフォーマットミニ言語の部分集合で、axx.py が
+   受けるものを受け、拒否するものを拒否する。 */
 static int m_fmt_parse(const char *spec, MFmt *f){
     memset(f, 0, sizeof(*f));
     f->fill = ' ';
@@ -17647,10 +16011,12 @@ static int m_fmt_parse(const char *spec, MFmt *f){
     return *p == '\0';
 }
 
+/* 桁区切りを入れたあとの長さ。 */
 static int m_group_len(int n, int iv){
     return n + (n - 1) / iv;
 }
 
+/* 桁区切りを入れて書く。 */
 static int m_group_emit(char *out, const char *digits, int n, int iv, char sep){
     int lead = n % iv;
     if(lead == 0) lead = iv;
@@ -17664,6 +16030,7 @@ static int m_group_emit(char *out, const char *digits, int n, int iv, char sep){
     return o;
 }
 
+/* UTF-8 の文字数（バイト数ではない）。 */
 static int m_utf8_len(const char *s){
     int n = 0;
     for(const unsigned char *p = (const unsigned char*)s; *p; p++)
@@ -17671,6 +16038,7 @@ static int m_utf8_len(const char *s){
     return n;
 }
 
+/* n 文字目のバイト位置。 */
 static size_t m_utf8_off(const char *s, int n){
     const unsigned char *p = (const unsigned char*)s;
     size_t i = 0;
@@ -17722,6 +16090,7 @@ static char *m_fmt_pad(MacroPP *mp, const char *head, const char *body,
     return r;
 }
 
+/* コードポイントを UTF-8 に符号化する。 */
 static int m_utf8(unsigned long cp, char *out){
     if(cp < 0x80){ out[0] = (char)cp; return 1; }
     if(cp < 0x800){
@@ -17742,6 +16111,8 @@ static int m_utf8(unsigned long cp, char *out){
     return 4;
 }
 
+/* 整数に書式を適用する。`!{0:c}` はここで空文字列になる。C 文字列は内部に
+   NUL を持てないためで、axx.py では NUL 文字が返る。これは既知の相違。 */
 static char *m_fmt_int(MacroPP *mp, long long iv, MFmt *f, int *err){
     char type = f->type ? f->type : 'd';
     int isfloat = (type=='e'||type=='E'||type=='f'||type=='F'
@@ -17856,6 +16227,7 @@ static char *m_fmt_int(MacroPP *mp, long long iv, MFmt *f, int *err){
                      (f->zeropad && !f->align) ? '=' : '>');
 }
 
+/* 文字列に書式を適用する。 */
 static char *m_fmt_str(MacroPP *mp, const char *s, MFmt *f, int *err){
     if(f->type && f->type != 's'){ *err = 1; return NULL; }
     if(f->sign || f->alt || f->group || f->zcoerce){ *err = 1; return NULL; }
@@ -17866,6 +16238,7 @@ static char *m_fmt_str(MacroPP *mp, const char *s, MFmt *f, int *err){
     return m_fmt_pad(mp, "", body, f, '<');
 }
 
+/* `!{式:書式}` の全体を処理する。 */
 static char *m_format_value(MacroPP *mp, const char *body, const char *file, int line){
     int len = (int)strlen(body);
     int spec_at = -1;
@@ -17882,11 +16255,6 @@ static char *m_format_value(MacroPP *mp, const char *body, const char *file, int
         else if(c == '(' || c == '[') par++;
         else if(c == ')' || c == ']') par--;
         else if(c == ':' && par == 0){
-            /* 破綻点修正: 三項演算子の `?` を「括弧の外」でしか数えて
-             * いなかったため、`!{+(a ? b : c):0}` のように括弧の中に `?` が
-             * ある式で `:0` を書式指定と誤読していた（axx.py は
-             * `'?' in body[:k]` と、括弧も引用符も問わず手前の生テキストを
-             * 見る）。同じ規則にそろえる。 */
             int has_q = 0;
             for(int j = 0; j < k; j++) if(body[j] == '?'){ has_q = 1; break; }
             if(has_q) continue;
@@ -17916,6 +16284,7 @@ static char *m_format_value(MacroPP *mp, const char *body, const char *file, int
     return out;
 }
 
+/* 行の中の補間を展開する。逃がされた開きはリテラルとして残す。 */
 static char *m_interpolate(MacroPP *mp, const char *text, const char *file, int line){
     if(!strstr(text, "!{")) return (char*)text;
     size_t cap = strlen(text) + 256, n = 0;
@@ -17941,7 +16310,6 @@ static char *m_interpolate(MacroPP *mp, const char *text, const char *file, int 
                 if(c == '\\'){ j += 2; continue; }
                 if(c == quote) quote = 0;
             } else if(c == '\'' && m_sext_tick_at(text, j)) {
-                /* 符号拡張の `'` は文字定数の開始ではないので数えない。 */
             } else if(c == '"' || c == '\'') quote = c;
             else if(c == '{') depth++;
             else if(c == '}'){ if(--depth == 0) break; }
@@ -17969,6 +16337,8 @@ static char *m_interpolate(MacroPP *mp, const char *text, const char *file, int 
 }
 
 
+/* マクロ行のコメントを落とす。ソース側は `;`、パターン側はブロックコメント。
+   文字列リテラルの中は触らない。 */
 static char *m_strip_comment(MacroPP *mp, const char *text){
     int i = 0; char quote = 0;
     while(text[i]){
@@ -17978,11 +16348,6 @@ static char *m_strip_comment(MacroPP *mp, const char *text){
             if(c == quote) quote = 0;
         } else if(c == '"') quote = c;
         else if(c == '\''){
-            /* 破綻点修正: `'` を無条件に引用符の開きとして扱っていた。しかし
-             * パターンファイルでは `'` は符号拡張演算子（`!x'8` 等）でもあり、
-             * 行に1個しか無いとそこから行末までが「引用符の中」になって
-             * 以降のブロックコメント開始記号が除去されず、マクロ層の行判定が狂っていた。
-             * 対になる `'` が同じ行にあるときだけ文字リテラルとみなす。 */
             if(strchr(text + i + 1, '\'')) quote = c;
         }
         else if(mp->pat_mode){
@@ -17995,10 +16360,12 @@ static char *m_strip_comment(MacroPP *mp, const char *text){
     return marena_strndup(&mp->arena, text, (size_t)i);
 }
 
+/* 先頭の空白を飛ばす。 */
 static const char *m_lstrip(const char *s){
     while(*s == ' ' || *s == '\t') s++;
     return s;
 }
+/* 末尾の空白を落とす。 */
 static char *m_rstrip(MacroPP *mp, const char *s){
     size_t n = strlen(s);
     while(n > 0 && (s[n-1] == ' ' || s[n-1] == '\t')) n--;
@@ -18006,6 +16373,7 @@ static char *m_rstrip(MacroPP *mp, const char *s){
 }
 static char *m_trim(MacroPP *mp, const char *s){ return m_rstrip(mp, m_lstrip(s)); }
 
+/* 行頭の `!` 文のキーワードと残りを取り出す。 */
 static const char *m_statement_word(const char *text, char *word, size_t wsz){
     const char *t = m_lstrip(text);
     if(t[0] != '!' || t[1] == '!') return NULL;
@@ -18018,6 +16386,7 @@ static const char *m_statement_word(const char *text, char *word, size_t wsz){
     return t + j;
 }
 
+/* それがマクロのキーワードか。 */
 static int m_is_keyword(const char *w){
     static const char *kw[] = { "if","then","else","elif","while","def","return",
                                 "set","local","break","continue","error","warning",
@@ -18031,6 +16400,7 @@ typedef struct { MLine *d; int n; } MSrc;
 
 static MBlock *m_parse_block(MacroPP *mp, MSrc *src, int *ip, int depth);
 
+/* 文の節を 1 つ作る。 */
 static MNode *m_node(MacroPP *mp, MNKind k, const char *file, int line){
     MNode *n = marena_alloc(&mp->arena, sizeof(MNode));
     memset(n, 0, sizeof(*n));
@@ -18049,13 +16419,6 @@ static char *m_parse_header(MacroPP *mp, const char *text, const char *kw,
         m_fail(mp, file, line, "'!%s' header must end with '{'", kw);
     body[bl-1] = '\0';
     if(strcmp(kw, "if") == 0 || strcmp(kw, "elif") == 0){
-        /* 破綻点修正: ここは `'` を無条件に引用符の開きとして扱っていたため、
-         * 条件に符号拡張演算子（`!if (255)'4 !then {`）を書くと、そこから
-         * 行末までが「引用符の中」とみなされて `!then` を見失い、
-         * "'!if' needs '!then' before '{'" という誤ったエラーになっていた。
-         * axx.py の parse_header は引用符を見ず、単に最後の `!then` を
-         * 探す（ヘッダは `{` で終わるので、本物の `!then` が必ず最後に来る）。
-         * 同じ規則にそろえる。 */
         int at = -1;
         for(int k = 0; body[k]; k++)
             if(body[k] == '!' && strncasecmp(body + k, "!then", 5) == 0) at = k;
@@ -18065,6 +16428,7 @@ static char *m_parse_header(MacroPP *mp, const char *text, const char *kw,
     return m_trim(mp, body);
 }
 
+/* `!if` / `!elif` / `!else` の連なりを解析する。 */
 static MNode *m_parse_if(MacroPP *mp, MSrc *src, int *ip, int depth){
     const char *file = src->d[*ip].file;
     int line = src->d[*ip].line;
@@ -18133,6 +16497,7 @@ static MNode *m_parse_if(MacroPP *mp, MSrc *src, int *ip, int depth){
     }
 }
 
+/* `!while` を解析する。 */
 static MNode *m_parse_while(MacroPP *mp, MSrc *src, int *ip, int depth){
     const char *file = src->d[*ip].file;
     int line = src->d[*ip].line;
@@ -18151,6 +16516,7 @@ static MNode *m_parse_while(MacroPP *mp, MSrc *src, int *ip, int depth){
     return n;
 }
 
+/* `!def` を解析する。既定値付きの引数を受ける。 */
 static MNode *m_parse_def(MacroPP *mp, MSrc *src, int *ip, int depth){
     const char *file = src->d[*ip].file;
     int line = src->d[*ip].line;
@@ -18296,11 +16662,9 @@ static MNode *m_parse_simple(MacroPP *mp, const char *w, const char *rest,
     return n;
 }
 
+/* 1 ブロックを構文木にする。開き波括弧はヘッダ行の最後、閉じは行頭に要る。
+   入れ子の深さに上限がある。 */
 static MBlock *m_parse_block(MacroPP *mp, MSrc *src, int *ip, int depth){
-    /* 破綻点修正: !if/!while/!def のブロック入れ子に上限が無く、深すぎる
-     * ネストでパース時のC再帰がスタックオーバーフローしうる。
-     * MACRO_MAX_DEPTH は呼び出し(実行)時の深さガードなので、
-     * パース時のブロック入れ子はここで別途止める。 */
     if(depth > MACRO_MAX_DEPTH){
         const char *f = (*ip < src->n) ? src->d[*ip].file : (src->n ? src->d[src->n-1].file : "?");
         int l = (*ip < src->n) ? src->d[*ip].line : (src->n ? src->d[src->n-1].line : 0);
@@ -18357,7 +16721,7 @@ static void m_parse_args(MacroPP *mp, const char *argtext, MVal *args, int *narg
     const char *t = m_lstrip(argtext);
     if(!*t) return;
     if(*t != '(') m_fail(mp, file, line, "macro call needs parentheses");
-    mp->noeval = 0;     /* m_eval と同じく、前回の打ち切りの取りこぼしを消す */
+    mp->noeval = 0;
     MEP p; p.s = t; p.i = 0; p.mp = mp; p.file = file; p.line = line;
     mep_expect(&p, "(");
     if(mep_peek(&p) == ')') p.i++;
@@ -18373,9 +16737,6 @@ static void m_parse_args(MacroPP *mp, const char *argtext, MVal *args, int *narg
     }
     mep_skip(&p);
     {
-        /* 破綻点修正: axx.py は残りを `.strip()` してから見るので末尾の空白を
-         * 数えず、`;` で始まればコメントとして許す。さらに文面は `{rest!r}` と
-         * Python の repr なので、引用符の選び方も食い違っていた。 */
         const char *rest = p.s + p.i;
         size_t rl = strlen(rest);
         while(rl > 0 && isspace((unsigned char)rest[rl-1])) rl--;
@@ -18388,6 +16749,7 @@ static void m_parse_args(MacroPP *mp, const char *argtext, MVal *args, int *narg
     }
 }
 
+/* 展開結果の 1 行を出力に積む。 */
 static void m_emit(MacroPP *mp, char *text, const char *file, int line){
     if(mp->nemitted >= MACRO_MAX_LINES)
         m_fail(mp, file, line, "macro expansion produced more than %ld lines; "
@@ -18399,6 +16761,7 @@ static void m_emit(MacroPP *mp, char *text, const char *file, int line){
     mlinevec_push(mp, mp->out, text, file, line);
 }
 
+/* 文 1 個を実行する。 */
 static void m_exec_node(MacroPP *mp, MNode *n){
     switch(n->kind){
     case MN_TEXT:
@@ -18509,6 +16872,7 @@ static void m_exec_node(MacroPP *mp, MNode *n){
     }
 }
 
+/* 文の並びを順に実行する。 */
 static void m_exec_block(MacroPP *mp, MBlock *b){
     for(int i = 0; i < b->len; i++){
         m_exec_node(mp, b->d[i]);
@@ -18517,13 +16881,9 @@ static void m_exec_block(MacroPP *mp, MBlock *b){
 }
 
 
+/* 行を読み込む。行末のバックスラッシュで続く行はつなぎ、つないだぶんだけ
+   空行を残すので行番号は入力とずれない。 */
 static void m_read_lines(MacroPP *mp, FILE *f, const char *display, MSrc *out){
-    /* 行末が '\' の行は次の行と連結する(行継続)。パターンファイル・ソース
-     * ファイルのどちらも1物理行=1パターン/1命令が前提の実装なので、複雑な
-     * 式を複数行に分けて書くとそこで暗黙に切れてしまう(README Appendix A.3
-     * の AND immediate 例がまさにこれで、警告も出さずに後半のフィールドを
-     * 取りこぼしていた)。要素数(=行番号の基準)は変えず、継続元の行は空文字
-     * 列にして、連結された内容は継続が終わった行の位置にまとめる。 */
     int cap = 256, n = 0;
     MLine *d = marena_alloc(&mp->arena, (size_t)cap * sizeof(MLine));
     char *line = NULL; size_t lcap = 0;
@@ -18581,11 +16941,8 @@ static void m_read_lines(MacroPP *mp, FILE *f, const char *display, MSrc *out){
     out->d = d; out->n = n;
 }
 
+/* `!include` — 展開時にテキストを取り込む。 */
 static void m_do_include(MacroPP *mp, const char *name, const char *file, int line){
-    /* 破綻点修正: path は char[1024] の固定長だった。長いパスが黙って切り詰め
-     * られ、意図しないファイルを読むか「開けない」で止まっていた。必要量は
-     * name と file の長さで決まる。m_fail() は longjmp で抜けるので、解放を
-     * 気にしなくてよいマクロ用アリーナから取る（reset_pass でまとめて戻る）。 */
     size_t psz = strlen(name) + (file ? strlen(file) : 0) + 4;
     char *path = marena_alloc(&mp->arena, psz);
     size_t dsz = (file ? strlen(file) : 0) + 4;
@@ -18621,6 +16978,7 @@ static void m_do_include(MacroPP *mp, const char *name, const char *file, int li
     mp->ninc--;
 }
 
+/* ソース側に展開すべきものがあるか（軽い前判定）。 */
 static int m_contains_macros(MSrc *src){
     for(int i = 0; i < src->n; i++){
         if(strchr(src->d[i].text, '!')) return 1;
@@ -18629,12 +16987,14 @@ static int m_contains_macros(MSrc *src){
     return 0;
 }
 
+/* その行に補間があるか。 */
 static int m_has_interpolation(const char *t){
     for(const char *p = strstr(t, "!{"); p; p = strstr(p + 2, "!{"))
         if(p == t || p[-1] != '\\') return 1;
     return 0;
 }
 
+/* パターン側に展開すべきものがあるか（軽い前判定）。 */
 static int m_has_macro_constructs(MacroPP *mp, MSrc *src){
     for(int i = 0; i < src->n; i++){
         const char *t = src->d[i].text;
@@ -18649,6 +17009,8 @@ static int m_has_macro_constructs(MacroPP *mp, MSrc *src){
     return 0;
 }
 
+/* 行の並びをマクロ展開して返す。展開すべきものが 1 つも無ければ解析せずに
+   そのまま返す。これがマクロを使わないパターンファイルの速さを保っている。 */
 static MLineVec macro_expand(MacroPP *mp, FILE *f, const char *display){
     MLineVec result;
     memset(&result, 0, sizeof(result));
@@ -18701,15 +17063,18 @@ static MacroPP g_macro;
 
 static MacroPP g_pat_macro;
 
+/* パターンファイル用のマクロ層を初期化する。 */
 static void macro_init_pattern(Assembler *asmb){
     macro_init(&g_pat_macro, asmb);
     g_pat_macro.pat_mode = 1;
 }
 
+/* その 1 パスぶんの状態を初期化する。 */
 static void macro_reset_pass_pattern(void){
     macro_reset_pass(&g_pat_macro);
 }
 
+/* パターンファイルをマクロ展開する。 */
 static char **pat_macro_expand(FILE *f, const char *display, int *nlines){
     MLineVec v = macro_expand(&g_pat_macro, f, display);
     char **out = malloc(sizeof(char*) * (size_t)(v.len + 1));
@@ -18723,12 +17088,14 @@ static char **pat_macro_expand(FILE *f, const char *display, int *nlines){
     return out;
 }
 
+/* 展開結果を解放する。 */
 static void pat_macro_expand_free(char **v, int n){
     if(!v) return;
     for(int i = 0; i < n; i++) free(v[i]);
     free(v);
 }
 
+/* ソースファイル 1 つを 1 行ずつアセンブルする。 */
 static void fileassemble(Assembler *asmb, const char *fn){
     AsmState *st=&asmb->st;
 
@@ -18787,10 +17154,6 @@ static void fileassemble(Assembler *asmb, const char *fn){
     f=axx_open_input(fn, "source file");
     if(!f) goto done;
     {
-        /* マクロ層の $/$$ は「展開後の何行目か」で決まる値なので、この反復で
-         * 各行がどのアドレスに置かれたかを記録しておき、次の反復の展開時に
-         * 参照する。読む先(macro_line_pcs)と書く先(_cur)は別の表なので、
-         * 展開中に自分が読んでいる記録を壊すことはない。 */
         char _expkey[sizeof(st->current_file)];
         strncpy(_expkey, st->current_file, sizeof(_expkey)-1);
         _expkey[sizeof(_expkey)-1]='\0';
@@ -18815,17 +17178,7 @@ done:
     st->ln = is_pop(&st->lnstack);
 }
 
-/* パターン表の ELF 宣言を、組み立てを始める前に一度そろえて登録する。
- * 型名はソースの `.EXTERN`/`.EQU`/`.RELOCTYPE` や取り込みファイルからも引く。
- * これらはパターン表をたどるより前に読まれるので、行ごとの実行を待っていると
- * 「まだ宣言されていない」ことになってしまう。マシン番号・ELF クラス・
- * ヘッダ欄も同じ理由でここで決める。
- * axx.py の register_elfdecls() と同じである。 */
-/* ELF 宣言の型欄が引けるかを、宣言が出そろってから一度だけ見る。
- * 綴りを間違えた型名を黙って読み飛ばすと、そこだけリロケーションの出ない
- * `.o` が何事もなかったように出てしまう。`-o` を出すときだけ見るのは
- * `.reloc` と同じで、パターンファイルを別のマシンで使い回せるようにする
- * ためである。axx.py の check_elfdecls() と同じである。 */
+/* ELF 記述の宣言が揃っているか、矛盾がないかを検査する。 */
 static void check_elfdecls(Assembler *asmb){
     AsmState *st = &asmb->st;
     if(!st->elf_objfile[0]) return;
@@ -18848,6 +17201,7 @@ static void check_elfdecls(Assembler *asmb){
                        "ignored.\n", st->elf_fields[i].type, m->name);
 }
 
+/* パターンファイル中の ELF 記述ディレクティブを先に読んでおく。 */
 static void register_elfdecls(Assembler *asmb){
     for(int pi=0; pi<asmb->st.pat.len; pi++){
         PatEntry *e = &asmb->st.pat.data[pi];
@@ -18869,6 +17223,8 @@ static void register_elfdecls(Assembler *asmb){
     check_elfdecls(asmb);
 }
 
+/* パターンファイルが定義するシンボルを先に集める。ソースのラベルがこれらと
+   衝突したらエラーにできるようにするため、アセンブルの前に名前を知っておく。 */
 static void setpatsymbols(Assembler *asmb){
     SymMap fresh; smap_init(&fresh);
     sv_free(&asmb->st.strsym_names); sv_init(&asmb->st.strsym_names);
@@ -18883,20 +17239,10 @@ static void setpatsymbols(Assembler *asmb){
             const char *name_field = e->f[1][0] ? e->f[1] : e->f[2];
             const char *value_field = e->f[1][0] ? e->f[2] : "";
             char key[512]; axx_strupr_to(key,name_field,sizeof(key));
-            /* 破綻点修正: axx.py は各 .setsym の値を評価する直前に、それまで
-             * 積み上げた fresh を毎回 st->symbols へ再公開している
-             * (axx.py:6732)。これにより `#symbol1` のようなここまでの
-             * .setsym 参照が値の式の中で解決できる（README 3.6）。caxx.c は
-             * ループが終わってから一括でしか smap_set していなかったため、
-             * `.setsym::symbol2::#symbol1` が常に「未定義シンボル」で失敗
-             * していた（機能が丸ごと壊れていた）。 */
             smap_clear(&asmb->st.symbols);
             for(int fi=0; fi<fresh.nb; fi++)
                 for(SymEntry *fe=fresh.buckets[fi]; fe; fe=fe->next)
                     smap_set(&asmb->st.symbols, fe->key, fe->val);
-            /* 値が `"..."` なら文字列シンボル、`[...]` なら配列シンボル。
-             * どちらも数値ではないので式には直接出せず、文字列テンプレート
-             * （3.5.2）や `#名前[添字]` から引く。 */
             {
                 const char *q = value_field;
                 while(*q==' '||*q=='\t') q++;
@@ -18910,9 +17256,7 @@ static void setpatsymbols(Assembler *asmb){
                     arrsym_set_from_text(asmb, key, q);
                     continue;
                 }
-                /* `.setsym::y::x` — x が文字列／配列シンボルなら写しを作る。 */
                 if(symbol_copy_from_name(&asmb->st, key, value_field)) continue;
-                /* `名前,名前,…` は名前の集合、`a&b` などは集合どうしの演算。 */
                 if(symbol_set_from_text(&asmb->st, key, value_field)) continue;
             }
             int io;
@@ -18935,9 +17279,6 @@ static void setpatsymbols(Assembler *asmb){
             continue;
         }
         if(strcmp(e->f[0],".map")==0){
-            /* `.map` のシンボルもこの前処理の表に積む。ここまでに積んだ
-             * ものを公開してから展開するので、並びに書いた配列シンボルも、
-             * 値の式に書いた `#記号` も解決できる。 */
             smap_clear(&asmb->st.symbols);
             for(int fi=0; fi<fresh.nb; fi++)
                 for(SymEntry *fe=fresh.buckets[fi]; fe; fe=fe->next)
@@ -18945,9 +17286,6 @@ static void setpatsymbols(Assembler *asmb){
             map_apply(asmb, e, &fresh, 0);
             continue;
         }
-        /* `.free` はシンボルもこの前処理の表から外す（本体の走査でも同じ
-         * ことをするが、ここで外しておかないと後続の `.setsym` の値の式から
-         * 見えたままになる）。 */
         if(strcmp(e->f[0],".free")==0){
             const char *names = e->f[2][0] ? e->f[2] : e->f[1];
             const char *p = names;
@@ -18983,15 +17321,13 @@ static void setpatsymbols(Assembler *asmb){
     smap_free(&fresh);
 }
 
-/* imp_label の16進フィールド検査で使う。axx.py の int(s,16) は前後の空白を
- * 許容しつつも、それ以外の余分な文字が混じっていれば ValueError にする。
- * strtoull は末尾を切り詰めるだけなので、endp から先が空白だけであることを
- * 別途確認する。 */
+/* インポートファイルの 16 進欄を最後まで読めたか。 */
 static int hexfield_fully_consumed(const char *endp){
     while(*endp==' '||*endp=='\t') endp++;
     return *endp=='\0';
 }
 
+/* インポートファイルの 1 行からラベルを取り込む。 */
 static int imp_label(Assembler *asmb, const char *l){
 
     char buf[4096];
@@ -19013,11 +17349,6 @@ static int imp_label(Assembler *asmb, const char *l){
     if(nfields >= 3){
         const char *sname = fields[0];
         char *endp;
-        /* 破綻点修正: strtoull は末尾に余分な非16進文字があっても、先頭が
-         * 数字であれば途中までを黙って解釈して成功扱いにする。axx.py の
-         * int(s,16) はフィールド全体が正当な16進数でなければ ValueError に
-         * なりインポート行ごと捨てる。endp が文字列末尾まで届いているかも
-         * 確認しないと、壊れた値をそのまま採用して「成功」してしまう。 */
         uint64_t start = strtoull(fields[1], &endp, 16);
         if(endp == fields[1] || !hexfield_fully_consumed(endp)) return 0;
         uint64_t size  = strtoull(fields[2], &endp, 16);
@@ -19066,6 +17397,7 @@ static int imp_label(Assembler *asmb, const char *l){
     return 0;
 }
 
+/* 使い方を出す。caxx は `-h` を取らないので、引数なしで実行したときに出る。 */
 static void print_usage(const char *prog){
     printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-f {32,64}] [-m machine] [-v] [-V] [-d] [-g] [--no-macro] [-P [file]] [-p [file]]\n",prog);
     printf("  -V           print the text built from string-template patterns (.textmode translation output) to stdout\n");
@@ -19075,6 +17407,7 @@ static void print_usage(const char *prog){
     printf("axx general assembler programmed and designed by Taisuke Maekawa\n");
 }
 
+/* 2 つのラベル表が同じか。リラクゼーションの収束判定に使う。 */
 static int label_maps_equal(LabelMap *a, LabelMap *b) {
     if (a->count != b->count) return 0;
     for (int bi = 0; bi < a->nbuckets; bi++)
@@ -19087,6 +17420,7 @@ static int label_maps_equal(LabelMap *a, LabelMap *b) {
         }
     return 1;
 }
+/* ラベル表を写す。反復の頭で初期状態へ戻すのに使う。 */
 static void label_map_copy_from(LabelMap *dst, LabelMap *src) {
     lmap_init(dst);
     for (int bi = 0; bi < src->nbuckets; bi++)
@@ -19102,6 +17436,7 @@ typedef struct {
 
 static OSABIENT osabitbl[]={{"Linux",0},{"linux",0},{"FreeBSD",9},{"freebsd",9},{"EOTBL",-1}};
 
+/* `--osabi` の名前を ELF の OSABI 値にする。大文字小文字を区別しない。 */
 int find_osabi( char *osname ) {
     int idx = 0;
     while (1) {
@@ -19114,6 +17449,11 @@ int find_osabi( char *osname ) {
 }
 
 
+/* 入口。引数を読み、パターンとソースを読み、出力を書く。
+   パス1はリラクゼーションで、ラベル表が前回の反復と一致するまで繰り返す。
+   上限まで回っても一致しない場合と、過去の状態に戻って振動している場合は、
+   誤ったアドレスのコードを出すよりは何も出さないほうを選んで中断する。
+   パス2は確定アドレスで 1 回だけ回し、バイト列とリロケーションを作る。 */
 int main(int argc, char *argv[]){
     if(argc==1){ print_usage(argv[0]); return 0; }
 
@@ -19125,22 +17465,10 @@ int main(int argc, char *argv[]){
     macro_init_pattern(asmb);
 
     const char *patternfile=NULL, *sourcefile=NULL;
-    /* 破綻点修正: 既定値が FreeBSD(9) 固定だったため、--osabi を指定しない
-     * 通常の使い方では、標準的な Linux 環境の ld が OSABI ミスマッチで
-     * 生成された .o を拒否し得た（axxelfbug 参照）。axx.py と同じく既定値を
-     * Linux(0) に変更する。 */
     char osabistr[16]="Linux";
     const char *macro_expand_dest=NULL;
     const char *pat_macro_expand_dest=NULL;
 
-    /* 破綻点修正: 値を取るオプションが `i+1<argc` だけを見て次の argv を
-     * 無条件に値として飲み込んでいたため、値を書き忘れて後ろに別のフラグが
-     * 続く場合（例: `-b -o`）、そのフラグ文字列がそのままファイル名として
-     * 採用されてしまっていた（axx.py の argparse は "expected one argument"
-     * で即座に拒否する）。同じファイル内で -p/-P に既にある「次の argv が
-     * '-' で始まっていたら値として食わない」規約を、値を取る単純なフラグ
-     * 全部に揃える。値を食わずに条件が外れれば、末尾の catch-all が
-     * "unknown option" として拒否する。 */
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--osabi")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(osabistr,argv[++i],sizeof(osabistr)-1); }
         else if(strcmp(argv[i],"-b")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(st->outfile,argv[++i],sizeof(st->outfile)-1); }
@@ -19157,16 +17485,9 @@ int main(int argc, char *argv[]){
                 return 1;
             }
         }
-        /* `-m` の値は負でもよい（範囲外として弾くため）。`-m -1` を「次は
-         * オプション」と見てしまうと "unknown option '-m'" に化けるので、
-         * 符号の直後が数字なら値として取る。 */
         else if(strcmp(argv[i],"-m")==0&&i+1<argc
                 &&(argv[i+1][0]!='-'
                    || ((argv[i+1][1]>='0'&&argv[i+1][1]<='9')))){
-            /* 破綻点修正: atoi() は最後まで読めたかを教えないので、
-             * `-m abc` が 0、`-m 12abc` が 12、`-m 0x3e` が 0 として黙って
-             * 通り、誤った e_machine の .o を出していた（axx.py は
-             * argparse の type=int で弾く）。全部を読めたときだけ受ける。 */
             const char *_mstr = argv[++i];
             char *_mend = NULL;
             errno = 0;
@@ -19182,8 +17503,6 @@ int main(int argc, char *argv[]){
                            "(an ELF e_machine number is 0..65535).\n", (long long)_mlong);
                 return 1;
             }
-            /* 組み込みの表に無い番号も受ける。そのときリロケーション型は
-             * パターンファイルの宣言（3.7.7 節）から来る。下で知らせる。 */
             st->elf_machine = _mval;
             st->elf_machine_from_cli = 1;
         }
@@ -19197,8 +17516,6 @@ int main(int argc, char *argv[]){
             if(!*pat_macro_expand_dest) pat_macro_expand_dest="-";
         }
         else if(strcmp(argv[i],"-p")==0||strcmp(argv[i],"--macro-expand-pattern")==0){
-            /* An explicit "-" always names stdout; consume it so that it is
-               not left behind to be reported as an unknown option. */
             if(i+1<argc && strcmp(argv[i+1],"-")==0){
                 pat_macro_expand_dest="-";
                 i++;
@@ -19206,10 +17523,6 @@ int main(int argc, char *argv[]){
             else if(i+1<argc && argv[i+1][0]!='-' && patternfile)
                 pat_macro_expand_dest=argv[++i];
             else if(i+1<argc && argv[i+1][0]!='-'){
-                /* 破綻点修正: 位置引数が揃う前に `-p out.txt pat.axx` と
-                 * 書かれた場合、ここは -p を引数なしと解釈し、out.txt を
-                 * 位置引数（＝パターンファイル）へ流していた。どちらの意味かは
-                 * 原理的に決められないので、黙って一方に倒さず断る。 */
                 fprintf(stderr," error - '%s %s' is ambiguous here: '%s' could be "
                         "%s's output file or a positional argument. Write "
                         "'--macro-expand-pattern=%s', or put %s after the pattern file.\n",
@@ -19224,8 +17537,6 @@ int main(int argc, char *argv[]){
             if(!*macro_expand_dest) macro_expand_dest="-";
         }
         else if(strcmp(argv[i],"-P")==0||strcmp(argv[i],"--macro-expand")==0){
-            /* An explicit "-" always names stdout; consume it so that it is
-               not left behind to be reported as an unknown option. */
             if(i+1<argc && strcmp(argv[i+1],"-")==0){
                 macro_expand_dest="-";
                 i++;
@@ -19233,7 +17544,6 @@ int main(int argc, char *argv[]){
             else if(i+1<argc && argv[i+1][0]!='-' && patternfile && sourcefile)
                 macro_expand_dest=argv[++i];
             else if(i+1<argc && argv[i+1][0]!='-'){
-                /* 曖昧な指定を黙って取り違えない。理由は -p 側のコメント参照。 */
                 fprintf(stderr," error - '%s %s' is ambiguous here: '%s' could be "
                         "%s's output file or a positional argument. Write "
                         "'--macro-expand=%s', or put %s after the pattern/source files.\n",
@@ -19268,8 +17578,6 @@ int main(int argc, char *argv[]){
     }
     st->osabi = osa;
 
-    /* `-m` に組み込みの表に無い番号を書いたとき。誤った型番号を書くよりは
-     * リロケーションを出さない側に倒すので、そのことを知らせる。 */
     if(st->elf_machine_from_cli && st->elf_objfile[0]
        && !elf_machine_find(st->elf_machine)){
         char _known[512]; int _kn=0;
@@ -19315,7 +17623,6 @@ int main(int argc, char *argv[]){
             pat_macro_expand_free(_pv,_pn); exit_code=1; goto cleanup;
         }
         for(int _pi=0;_pi<_pn;_pi++) fprintf(of,"%s\n",_pv[_pi]);
-        /* 破綻点修正: 書き込み失敗を検査していなかった。 */
         if(of!=stdout ? axx_close_out(of, pat_macro_expand_dest)
                       : axx_flush_stdout(pat_macro_expand_dest)) exit_code=1;
         pat_macro_expand_free(_pv,_pn);
@@ -19347,25 +17654,15 @@ int main(int argc, char *argv[]){
             exit_code=1; goto cleanup;
         }
         for(int _mi=0;_mi<mv.len;_mi++) fprintf(of,"%s\n",mv.d[_mi].text);
-        /* 破綻点修正: 書き込み失敗を検査していなかった。 */
         if(of!=stdout ? axx_close_out(of, macro_expand_dest)
                       : axx_flush_stdout(macro_expand_dest)) exit_code=1;
         goto cleanup;
     }
 
     readpat(asmb,patternfile);
-    /* 行ごとに変わらない性質（ディレクティブか、`.setsym` の値が定数か）を
-     * ここで一度だけ控える。以降 st->pat は増減しない。 */
     pat_mark_static(&st->pat);
-    /* 畳み込める先頭ディレクティブ行を決め、ニーモニック索引を作る。
-     * どちらも行ごとに変わらないので、ここで一度だけ行う。 */
     pat_hoist_scan(&st->pat);
     patidx_build(&g_patidx, &st->pat);
-    /* 破綻点修正: パターンファイルが読めなかった場合、readpat() はエラーを
-     * 報告して空のパターン表のまま戻るが、そのまま組み立てに進んでいたため、
-     * 全ソース行が「どのパターンにも一致しない」となり偽の "Syntax error" が
-     * 行数ぶん並んで真の原因が埋もれていた。
-     * （終了コードが 1 になっていたのはその偽エラーの副作用にすぎない。） */
     if(st->had_error){
         fprintf(stderr," error - one or more errors were reported during assembly; "
                        "output would be incomplete or wrong.\n");
@@ -19374,9 +17671,6 @@ int main(int argc, char *argv[]){
     }
     setpatsymbols(asmb);
     register_elfdecls(asmb);
-    /* 破綻点修正: パターンファイル側のディレクティブ評価（.setsym / .bits 等）で
-     * 出たエラーを誰も拾っていなかったため、" error - ..." を表示しながら
-     * 終了コード 0 で「出力ファイルだけ作られない」無言の失敗になっていた。 */
     if(st->had_error){
         fprintf(stderr," error - one or more errors were reported while reading the "
                        "pattern file; output would be incomplete or wrong.\n");
@@ -19387,11 +17681,6 @@ int main(int argc, char *argv[]){
     if(st->impfile[0]){
         FILE *lf=axx_open_input(st->impfile, "import file");
         if(!lf){ exit_code=1; goto cleanup; }
-        /* 破綻点修正: 1回の走査で処理していたため、ラベル行がセクション行より
-         * 前に置かれた TSV では、そのラベルの所属セクションを決めるための
-         * 範囲情報がまだ登録されておらず、常に .text 扱いになっていた。
-         * axx.py と同じく「3欄以上（セクション範囲）を先に全部」→
-         * 「2欄（ラベル）をあとで全部」の2パスで読む。 */
         StrVec _implines; sv_init(&_implines);
         { char *l=NULL; size_t lc=0;
           while(getline(&l,&lc,lf)!=-1) sv_push(&_implines, l);
@@ -19411,11 +17700,6 @@ int main(int argc, char *argv[]){
         sv_free(&_implines);
     }
 
-    /* 破綻点修正: ここで既存の -b 出力を先に消すと、この後リラクゼーションが
-     * 振動/非収束で失敗して "no output file written" と表示した場合でも、
-     * 実際には直前の正常なビルド成果物が既に失われてしまう。binary_flush()
-     * の fopen(..,"wb") が成功時に上書き・切り詰めを行うので、ここでの
-     * 事前削除は不要かつ有害。 */
     if(!sourcefile){
         st->pc=u256_zero(); st->pas=0; st->ln=1;
         strncpy(st->current_file,"(stdin)",sizeof(st->current_file)-1);
@@ -19520,18 +17804,11 @@ int main(int argc, char *argv[]){
             lmap_free(&prev_labels); lmap_init(&prev_labels);
             for(int bi=0; bi<st->labels.nbuckets; bi++)
                 for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next){
-                    /* 破綻点修正: 控えに入れる条件を axx.py の
-                     * _relax_prev_values に合わせる。札（is_undef）ではなく
-                     * 「値が UNDEF 由来か」だけで外す。label_get_value() の
-                     * 該当箇所のコメントも参照。 */
                     if(u256_is_undef_derived(e->value)) continue;
                     lmap_set_full(&prev_labels, e->key, e->value, e->section,
                                   e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
                 }
 
-            /* マクロ層に見せるスナップショット。prev_labels と別に持つのは、
-             * prev_labels がパス2の前に解放されるのに対し、こちらは収束後の
-             * 展開をパス2でも同じに再現するため生かしておく必要があるため。 */
             lmap_free(&st->macro_labels); lmap_init(&st->macro_labels);
             for(int bi=0; bi<st->labels.nbuckets; bi++)
                 for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next)
@@ -19539,9 +17816,6 @@ int main(int argc, char *argv[]){
                                   e->is_equ, e->is_imported, e->reloc_type_override, e->is_undef);
             st->macro_labels_valid = 1;
 
-            /* 行番号→アドレスの記録は「複製」ではなく「移動」する。同じ表を
-             * 共有すると、次に fileassemble() が今回ぶんを積み直すときに、
-             * まさに展開中の式が読んでいる記録を壊してしまう。 */
             mlp_vec_free(&st->macro_line_pcs);
             st->macro_line_pcs = st->macro_line_pcs_cur;
             memset(&st->macro_line_pcs_cur, 0, sizeof(st->macro_line_pcs_cur));
@@ -19568,8 +17842,6 @@ int main(int argc, char *argv[]){
         st->relax_optimistic = 0;
 
         if(!converged){
-            /* 文面は axx.py と1バイト違わずそろえる（test1 が -V / 標準エラーを
-             * cmp するため）。 */
             axx_diagf(0, 1, " error - Pass1 relaxation did not converge after %d iterations.\n",
                        MAX_RELAX);
             fprintf(stderr,"         Generated code would have incorrect addresses for\n");
@@ -19595,13 +17867,6 @@ int main(int argc, char *argv[]){
         secmap_clear(&st->sections);
         secrangevec_clear(&st->section_ranges);
         st_set_current_section(st, ".text");
-        /* 破綻点修正: pass1 の各リラクゼーション反復は毎回 vars/symbols を
-         * initial_vars/patsymbols から作り直してから fileassemble() を
-         * 呼んでいたが、pass2 は最後の pass1 反復が実行し終えた後の
-         * vars/symbols をそのまま引き継いでいた。.setsym 等でシンボル・
-         * 変数を書き換えるソースでは pass2 の開始状態が pass1 のどの反復
-         * とも食い違い、アドレスに影響しなければ後段のドリフト検査（ラベル
-         * アドレスのみ比較）もすり抜けて出力の値が静かに誤り得た。 */
         smap_clear(&st->symbols);
         for(int pi=0; pi<st->patsymbols.nb; pi++)
             for(SymEntry *se2=st->patsymbols.buckets[pi]; se2; se2=se2->next)
@@ -19625,9 +17890,6 @@ int main(int argc, char *argv[]){
             if(drift_count){
                 axx_diagf(0, 0, " error - address mismatch between pass1 and pass2 "
                            "(%d label(s)); output addresses are UNRELIABLE.\n", drift_count);
-                /* ラベル定義の誤りを既に報告している場合、ずれはその結果に
-                 * すぎない（パス1では定義を拒否し、パス2では通ってしまう）。
-                 * リラクゼーションの話を持ち出すと原因を見誤らせる。 */
                 if(st->reported_label_errors.len > 0)
                     fprintf(stderr,"         This is a consequence of the label definition "
                         "error(s) reported above; fix those first.\n");
@@ -19733,9 +17995,7 @@ int main(int argc, char *argv[]){
                 LabelEntry*e=lmap_find(&st->export_labels, st->export_order.data[i]); \
                 { \
                     if(!e || e->is_undef) continue;  \
-                    /* 破綻点修正: 64bit 符号なしに丸めて出していたため、負の .EQU が \
-                     * 0xffffffffffffffff になっていた（axx.py は -0x1）。 \
-                     * 256bit のまま計算し、符号付きの Python 表記で出す。 */ \
+ \
                     uint256_t _lv = e->is_equ \
                                   ? e->value \
                                   : u256_mul_signed(e->value, u256_from_u64((uint64_t)_bpw_export)); \
@@ -19753,7 +18013,7 @@ int main(int argc, char *argv[]){
                     fprintf(lf,"%s%s\t%s\n",e->key,_rtype_sfx,_lbl_addr); \
                 } \
             } \
-            /* 破綻点修正: 書き込み失敗を検査していなかった。 */ \
+             \
             if(axx_close_out(lf, (path_))) exit_code = 1; \
         } \
     } while(0)
@@ -19783,8 +18043,6 @@ cleanup:
     macro_free(&g_macro);
     macro_free(&g_pat_macro);
 
-    /* 破綻点修正: 標準出力（-V の翻訳結果や -P/-p の `-` 出力）が書ききれて
-     * いないまま成功として終わっていた。最後に一度だけ流しきれたか見る。 */
     if(fflush(stdout) != 0 || ferror(stdout)){
         int _e = errno ? errno : EIO;
         char _eb[1200]; axx_oserr_nopath(_e, _eb, sizeof(_eb));
