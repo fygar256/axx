@@ -86,6 +86,37 @@ elfprio.axx                         pattern file for the relocation type
 elfprio.s                           test assemble file for elfprio.axx. build it
                                     with -o to see which rank decided each
                                     relocation
+elfpair.axx                         pattern file for relocations that come in
+                                    pairs or with a companion, section groups
+                                    and sh_link, on RISC-V (riscv64.axx is
+                                    included): .elfextra adds R_RISCV_RELAX to
+                                    every call, .elfdiff writes a label
+                                    difference as an ADD/SUB pair, .elfgroup
+                                    makes a COMDAT group and .elflink sets the
+                                    sh_link of a link-order section (manual
+                                    3.7.10)
+elfpair.s                           test assemble file for elfpair.axx. the
+                                    relocations, the group and the section
+                                    headers match llvm-mc's for the same code
+elfmips.axx                         pattern file for .elfencode: MIPS32 (REL)
+                                    whose R_MIPS_HI16 field is written back by a
+                                    mini-language function ((addend+0x8000)>>16),
+                                    with R_MIPS_26 and R_MIPS_LO16 through
+                                    .elffield (manual 3.7.10)
+elfmips.s                           test assemble file for elfmips.axx. the
+                                    words and relocations match llvm-mc's, and
+                                    so does the result of linking with ld.lld
+elfmips64.axx                       pattern file for .elfrinfo: MIPS64 (n64,
+                                    little-endian), whose r_info puts the type
+                                    in the top byte; a mini-language function
+                                    lays it out (manual 3.7.10)
+elfmips64.s                         test assemble file for elfmips64.axx.
+                                    readelf -r shows the three types of each
+                                    entry, as for llvm-mc's object
+elfword.axx                         pattern file for .elfunit: a toy machine
+                                    with 16-bit words whose addends and symbol
+                                    values are counted in words (manual 3.7.10)
+elfword.s                           test assemble file for elfword.axx
 elfsec.axx                          pattern file for .elfsection: the sh_flags,
                                     sh_type and sh_addralign of a section whose
                                     name axx has no rule for -- a vector table,

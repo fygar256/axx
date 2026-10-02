@@ -402,6 +402,29 @@ i=i+1
   element evaluates it but emits no word. A `binary_list` of just `;;n` has
   length 0.
 
+## Functions called while writing the ELF
+
+Besides `.call` in a `binary_list`, two declarations have axx call a function
+while it writes the `-o` ELF (Technical Manual section 3.7.10).
+
+| Declaration | Arguments | Return value |
+|---|---|---|
+| `.elfencode::<type>::<function>` | (the field's value, the addend) | the new field written back under REL |
+| `.elfrinfo::<function>` | (symbol index, type number) | the `r_info` of a relocation entry |
+
+- Two arguments, and a number (not an array) returned; anything else is an
+  error.
+- The addend may be negative. It arrives as a 256-bit two's complement value,
+  so `>>` and `&` pick out the bits needed.
+- `.emit` produces no output words here; only the return value is used.
+
+```
+.elfencode::hi16::hi16enc
+.func hi16enc(f, a)
+.return (f & 0xffff0000) | (((a + 0x8000) >> 16) & 0xffff)
+.endfunc
+```
+
 ## Runaway guards
 
 The language is Turing complete, so a mistake in a pattern file could otherwise

@@ -1,0 +1,66 @@
+/* ===================================================================
+/* elfmips64.axx -- pattern file for an r_info whose layout is not the
+/*                  ELF64 default (manual 3.7.10)
+/*
+/* The machine is MIPS64 (EM_MIPS, 8), little-endian, n64, RELA. Its
+/* ELF64 r_info is not (sym << 32) | type: the symbol comes first and
+/* is followed by r_ssym and three one-byte types, type3 / type2 /
+/* type, so read as a little-endian 64-bit number it is
+/*
+/*   sym | type3 << 40 | type2 << 48 | type << 56
+/*
+/*   .elfrinfo::<function>
+/*        the function gets (symbol index, type number) and returns
+/*        r_info. A composite type (type, type2, type3 in one entry)
+/*        is a type number with the three bytes packed in, declared
+/*        with .elftype like any other.
+/*
+/* The relocation entries match llvm-mc's for the same code, byte for
+/* byte (see elfmips64.s).
+/*
+/* Assemble with:
+/*   axx elfmips64.axx elfmips64.s -o out.o
+/* =================================================================== */
+
+.bits::8                       /* little-endian, the default          */
+
+.elfbuiltin::0
+.elfmachine::8::MIPS
+.elfclass::64
+.elfrela::1
+.elfheader::flags::0x60000001  /* mips64, noreorder                   */
+
+/*     name     number width        type  [type2  [type3]]            */
+.elftype::r32::2::4            /* R_MIPS_32                           */
+.elftype::hi16::5::4           /* R_MIPS_HI16                         */
+.elftype::lo16::6::4           /* R_MIPS_LO16                         */
+.elftype::r64::18::8           /* R_MIPS_64                           */
+.elffield::hi16::0xffff
+.elffield::lo16::0xffff
+.elfwidth::8::r64
+.elfwidth::4::r32
+.elfextern::r64
+.elfdwarf::r64
+
+/* --- r_info: type in the top byte, then type2, type3 --------------- */
+.elfrinfo::rinfo64
+.func rinfo64(sym, t)
+.return sym | (((t >> 16) & 0xff) << 40) | (((t >> 8) & 0xff) << 48) | ((t & 0xff) << 56)
+.endfunc
+
+/* --- one 32-bit little-endian word --------------------------------- */
+.func w4(z)
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+/* --- instructions -------------------------------------------------- */
+.reloc::v::hi16
+LUI !t,%HI(!v) :: .call w4(0x3c000000 | (t << 16) | (((v + 0x8000) >> 16) & 0xffff))
+.clrreloc::v
+.reloc::v::lo16
+DADDIU !t,!s,%LO(!v) :: .call w4(0x64000000 | (s << 21) | (t << 16) | (v & 0xffff))
+.clrreloc::v
+JR !s :: .call w4(0x00000008 | (s << 21))
+NOP :: .call w4(0)
+WORD !v :: v,v>>8,v>>16,v>>24
+DWORD !v :: v,v>>8,v>>16,v>>24,v>>32,v>>40,v>>48,v>>56

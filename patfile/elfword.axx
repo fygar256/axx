@@ -1,0 +1,45 @@
+/* ===================================================================
+/* elfword.axx -- pattern file for a machine that counts addresses in
+/*                words, not bytes (manual 3.7.10)
+/*
+/* A toy machine with 16-bit words (.bits::16): every address is a
+/* word number. ELF itself counts in bytes -- r_offset and sh_size
+/* always are -- but the ABI of such a machine says what unit the
+/* addends and the symbol values are in:
+/*
+/*   .elfunit::byte   (default) addends and st_value / st_size in
+/*                    bytes: a word address times the bytes per word
+/*   .elfunit::word   addends and st_value / st_size in words, as the
+/*                    assembler counts them
+/*
+/* This file says word. With it, `j f+3` has the addend 3 and `mid`
+/* (the second word) has st_value 1; with .elfunit::byte they would be
+/* 6 and 2.
+/*
+/* Assemble with:
+/*   axx elfword.axx elfword.s -o out.o
+/* =================================================================== */
+
+.bits::16                      /* 16-bit words, little-endian         */
+
+.elfbuiltin::0
+.elfmachine::0x5757::W16       /* a made-up e_machine                 */
+.elfclass::32
+.elfrela::1
+.elfunit::word                 /* addends and symbols in words        */
+
+.elftype::abs32::1::4          /* two words                           */
+.elftype::abs16::2::2          /* one word                            */
+.elftype::jmp12::3::2          /* the low 12 bits of one word         */
+.elffield::jmp12::0x0fff
+.elfwidth::4::abs32
+.elfwidth::2::abs16
+.elfextern::abs32
+.elfdwarf::abs32
+
+NOP :: 0
+.reloc::v::jmp12
+J !v :: 0xa000|(v&0xfff)
+.clrreloc::v
+DW !v :: v
+DD !v :: v,v>>16

@@ -44,7 +44,7 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all thirty-one bundled pattern/source pairs with
+exactly that: `test1` assembles all thirty-five bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the three `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` pair the `.echo` lines each one writes to standard
@@ -1524,6 +1524,13 @@ ELF object should look like.
 | `.elffield::<type>::<mask>[::<offset>[::<shift>[::<bias>]]]` | an instruction-field relocation type (below, "Instruction-field types") |
 | `.elfpcguess::<0>` / `<1>` | whether a width-guessed absolute type is swapped for a PC-relative one (section 3.7.9) |
 | `.elfbuiltin::<0>` / `<1>` | whether the built-in table is the base (section 3.7.9) |
+| `.elfextra::<type>::<companion>[::<symbol>]` | a relocation added at the same offset (section 3.7.10) |
+| `.elfdiff::<width>::<add type>::<subtract type>` | a label difference as an add/subtract pair (section 3.7.10) |
+| `.elfencode::<type>::<function>` | the function that writes a REL addend back into its field (section 3.7.10) |
+| `.elfrinfo::<function>` | the function that lays out `r_info` (section 3.7.10) |
+| `.elfunit::<byte>` / `<word>` | the unit of addends and symbol values (section 3.7.10) |
+| `.elfgroup::<name>::<signature>::<flags>::<member>[,...]` | a section group (section 3.7.10) |
+| `.elflink::<section>::<sh_link>[::<sh_info>]` | the `sh_link` / `sh_info` of a section (section 3.7.10) |
 
 - Every declaration is a difference *laid over* the built-in table selected with
   `-m`. On a machine that is in the table, only what you write is replaced — so
@@ -1844,15 +1851,184 @@ eleven built-in machines and the bundled ELF pattern files. To describe a new
 machine close to one in the table, copying that machine's `--elfdesc` and
 editing it is the quick way.
 
-Types are written by name, and by number where they have none. `.elfheader`
-and `.elfsection` appear only when the pattern file wrote them (the built-in
-tables carry neither).
+Types are written by name, and by number where they have none. `.elfheader`,
+`.elfsection`, `.elflink` and `.elfgroup` appear only when the pattern file wrote
+them (the built-in tables carry none of them). The `.elfunit`, `.elfdiff`,
+`.elfextra`, `.elfencode` and `.elfrinfo` of section 3.7.10 are printed too. The
+functions `.elfencode` and `.elfrinfo` name are not printed, so use the output
+together with the pattern file that defines them.
 
 The bundled `elfrel.axx` / `elfrel.s` are a worked example. They describe ARM
 (EM_ARM, 40) with `.elfbuiltin::0`, with no built-in table, and write REL
 instruction-field types (`R_ARM_CALL`, `R_ARM_JUMP24`, `R_ARM_MOVW_ABS_NC`,
 `R_ARM_MOVT_ABS`). The instruction words and relocations match llvm-mc's, and
 so does the result of linking with `ld.lld -m armelf`.
+
+#### 3.7.10 Paired relocations, write-back functions, `r_info`, units and groups
+
+The declarations of sections 3.7.6-3.7.9 describe a machine that writes one
+relocation per reference, whose fields are runs of bits, and whose `r_info` has
+the ELF default layout. The declarations of this section cover the machines
+outside that: ones whose linker shrinks code, ones whose REL fields are written
+in an involved way, ones whose `r_info` is laid out differently, and ones that
+count addresses in words.
+
+| Declaration | What it sets |
+|---|---|
+| `.elfextra::<type>::<companion>[::<symbol>]` | every relocation of `<type>` gets another at the same offset |
+| `.elfdiff::<width>::<add type>::<subtract type>` | the difference of two labels as an add/subtract pair |
+| `.elfencode::<type>::<function>` | under REL, the function that writes the addend back into the field |
+| `.elfrinfo::<function>` | the function that lays out the `r_info` of each entry |
+| `.elfunit::<byte>` / `<word>` | the unit of addends and symbol values (`st_value` / `st_size`) |
+| `.elfgroup::<name>::<signature>::<flags>::<member>[,<member>...]` | a section group (`SHT_GROUP`) |
+| `.elflink::<section>::<sh_link>[::<sh_info>]` | the `sh_link` and `sh_info` of a section header |
+
+**`.elfextra` — a companion relocation.** Each time a relocation of `<type>` is
+written, `<companion>` follows it at the same `r_offset` with addend 0. With
+`<symbol>` 0 (the default) the companion's symbol index is 0; with 1 it is the
+same symbol. RISC-V's `R_RISCV_RELAX` on a `call` is one: seeing it, the linker
+may shrink `auipc`+`jalr` into a `jal`. A type may have several.
+
+```
+.elftype::relax::51
+.elfextra::call::relax          /* call ext -> R_RISCV_CALL_PLT ext, R_RISCV_RELAX */
+```
+
+**`.elfdiff` — label differences.** A reference whose value is the difference
+of two labels, such as `dword a-b`, gets two relocations at the same offset when
+`.elfdiff` is declared for its width:
+
+- `<add type>` against `a`, with the constant part as its addend (4 for `a-b+4`);
+- `<subtract type>` against `b`, with addend 0.
+
+On a machine whose linker shrinks instructions, even a difference within one
+section changes at link time, so the pair is needed (RISC-V's `R_RISCV_ADD32` /
+`R_RISCV_SUB32` and the like).
+
+- The captured expression is `<label> - <label>`, optionally plus or minus
+  constants. Which label is subtracted is read from the captured text: the one
+  directly preceded (spaces aside) by `-`. An expression where this cannot be
+  told (`-(a-b)`, for one) is ambiguous and gets no relocation.
+- Under RELA the field itself is written as 0: these types add to and subtract
+  from what is in the field, so the constant goes in the addend (the shape GNU
+  as and llvm-mc write). Under REL the constant is in the field.
+- A width with no `.elfdiff` gets no relocation (`-d` reports it).
+
+**Several entries at one offset (REL).** An `.elfdiff` pair or an `.elfextra`
+companion puts two or more entries at the same `r_offset`. Under REL only the
+first entry at an offset writes its addend back into the field, so that the
+others' 0 does not wipe it out.
+
+**`.elfencode` — a write-back function.** Under REL the addend is put back into
+the field. For a run of bits the mask, shift and bias of `.elffield` are enough,
+but not every field is one:
+
+- MIPS `R_MIPS_HI16`: the linker adds back the sign-extended low half of the
+  following `LO16`, so the field must hold `(addend + 0x8000) >> 16`, rounded.
+- Thumb `BL`: some of its bits are the exclusive or of other bits (J1 / J2).
+
+`.elfencode::<type>::<function>` hands the write-back of the type to a
+mini-language function (section 3.15). It gets (the field's value, the addend)
+and returns the new field. The field's value is the type's width of words read
+as an integer in the target byte order (the reading `.elffield`'s mask uses);
+the addend may be negative. When `.elffield` is declared too, `.elfencode`
+does the write-back (`.elffield` still places the relocation and zeroes the field
+under RELA). It is not called under RELA.
+
+```
+.elftype::hi16::5::4
+.elffield::hi16::0xffff
+.elfencode::hi16::hi16enc
+
+.func hi16enc(f, a)
+.return (f & 0xffff0000) | (((a + 0x8000) >> 16) & 0xffff)
+.endfunc
+```
+
+```
+lui 3,%hi(ext+0x18000)    ->  3c03 0002   R_MIPS_HI16 ext      ((0x18000 + 0x8000) >> 16)
+```
+
+**`.elfrinfo` — the layout of `r_info`.** By default an ELF64 `r_info` is
+`(symbol index << 32) | type` and an ELF32 one `(symbol index << 8) | type`.
+MIPS64 follows the symbol index with three one-byte types (`type3` / `type2` /
+`type`), so read little-endian the type is in the top byte. The function of
+`.elfrinfo::<function>` gets (symbol index, type number) and returns `r_info`.
+A composite type (three types in one entry) is a type number with the three
+bytes packed in, declared with `.elftype`. The same function lays out the
+relocations of the `-g` DWARF sections. The ELF32 warning about type numbers
+above 255 (section 3.7.7) is not given when a function lays out `r_info`.
+
+```
+.elfrinfo::rinfo64
+.func rinfo64(sym, t)
+.return sym | (((t >> 16) & 0xff) << 40) | (((t >> 8) & 0xff) << 48) | ((t & 0xff) << 56)
+.endfunc
+```
+
+The function must take two arguments and return a number. A function that does
+not exist, or takes a different number of arguments, is an error once the
+pattern file has been read.
+
+**`.elfunit` — the unit of addends and symbol values.** On a machine whose
+words are not 8 bits (`.bits`, section 3.10) axx counts addresses in words.
+ELF's `r_offset` and `sh_size` are always bytes, but which unit the addends and
+the symbol values are in is the machine ABI's choice.
+
+| Value | Addends | `st_value` / `st_size` |
+|---|---|---|
+| `byte` (default) | bytes (a word difference times the bytes per word) | bytes |
+| `word` | words (as axx counts them) | words |
+
+On a machine with 8-bit words both give the same values.
+
+**`.elfgroup` — section groups.** Writes an `SHT_GROUP` section, for a group the
+linker folds with others of the same signature, as with COMDAT (flags 1,
+`GRP_COMDAT`).
+
+- `<name>` is the group section's name (usually `.group`) and `<signature>` the
+  name of the signature symbol. A signature that is not in the symbol table but
+  is a section's name uses that section's symbol; failing both, a warning is
+  given and 0 written.
+- Member sections get `SHF_GROUP` (0x200), and their relocation sections join
+  the group too.
+- Group sections come first in the section header table (before their members,
+  as the gABI requires).
+- A member that is not in the output is skipped with a warning; a group with no
+  member left is not written.
+
+**`.elflink` — `sh_link` and `sh_info`.** The two fields `.elfsection`
+(section 3.7.7) does not write: for a `SHF_LINK_ORDER` (0x80) section pointing
+at its related section, for instance. A value is a section name (an output
+section, a `.rela.*` / `.rel.*`, `.symtab`, `.strtab`, `.shstrtab` or a `-g`
+DWARF section, case-insensitive) or a number (decimal or `0x` hex). A name that
+is not found is written as 0, with a warning.
+
+```
+.elfsection::.meta::0x82               /* ALLOC+LINK_ORDER  */
+.elflink::.meta::.text                 /* sh_link -> .text  */
+.elfsection::.text.foo::0x6
+.elfgroup::.group::foo::1::.text.foo   /* COMDAT [foo]      */
+```
+
+**Examples.** Four bundled pairs, each checked against llvm-mc assembling the
+same code.
+
+| Pattern / source | Machine | What it shows |
+|---|---|---|
+| `elfpair.axx` / `elfpair.s` | RISC-V (includes `riscv64.axx`) | `.elfextra` (`R_RISCV_RELAX`), `.elfdiff` (`ADD32`/`SUB32`, `ADD64`/`SUB64`), `.elfgroup` (COMDAT), `.elflink` (`SHF_LINK_ORDER`). The relocations, the group and the section headers match llvm-mc, and the differences shrink correctly through `ld.lld`'s relaxation |
+| `elfmips.axx` / `elfmips.s` | MIPS32 (REL, big-endian) | `.elfencode` (`R_MIPS_HI16`) and `.elffield` (`R_MIPS_26`, `R_MIPS_LO16`). The words and relocations match llvm-mc, and the `.text` linked with `ld.lld` matches byte for byte |
+| `elfmips64.axx` / `elfmips64.s` | MIPS64 (n64, little-endian) | `.elfrinfo`. `readelf -r` reads the three types of each entry as it does for llvm-mc's object |
+| `elfword.axx` / `elfword.s` | a toy machine with 16-bit words | `.elfunit::word`: addends and symbol values written in words |
+
+**Outside the scope — executables and shared libraries.** axx writes
+relocatable objects (`ET_REL`). Inside a `binary_list` a label of the same
+section and `$$` are filled in relative to the section start (the linker decides
+where it goes), so writing an executable (`ET_EXEC`, with program headers) would
+mean axx resolving every relocation itself, type by type. That is the linker's
+job, and so is a shared library (`ET_DYN`, with `.dynamic`, `.dynsym` and the hash
+table). For a raw image at fixed addresses use `-b`; for an executable, hand the
+`-o` output to a linker.
 
 ### 3.8 Optional parts (`[[ ]]`)
 
@@ -2387,6 +2563,21 @@ working variables cannot collide with the pattern layer's captured ones, and
 that one body serves both widths — the 32-bit forms only bound the element-size
 search to 32 instead of 64, where the `binary_list` version needs the width
 folded into the expression.
+
+#### Functions called while writing the ELF
+
+Besides `.call` in a `binary_list`, two declarations have axx call a function
+while it writes the `-o` ELF (section 3.7.10).
+
+| Declaration | Arguments | Return value |
+|---|---|---|
+| `.elfencode::<type>::<function>` | (the field's value, the addend) | the new field written back under REL |
+| `.elfrinfo::<function>` | (symbol index, type number) | the `r_info` of a relocation entry |
+
+They take two arguments and return a number (not an array); anything else is an
+error. The addend may be negative (it arrives as a 256-bit two's complement
+value, so `>>` and `&` pick out the bits needed). Values passed to `.emit` here
+produce no output words.
 
 #### Limits
 
@@ -3888,6 +4079,10 @@ The x86_64 pattern file is also maintained separately at
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
 | **elfsec.axx** | 1.4 KB | 8 | **elfsec.s** | section attributes and `sh_addralign` declared with `.elfsection` (3.7.7); test only |
+| **elfpair.axx** | 2.6 KB | 16 (+ `riscv64.axx`) | **elfpair.s** | paired and companion relocations (`.elfextra`, `.elfdiff`), a section group (`.elfgroup`) and `sh_link` (`.elflink`), on RISC-V. The relocations, the group and the section headers match llvm-mc (3.7.10); test only |
+| **elfmips.axx** | 3.1 KB | 31 | **elfmips.s** | a REL write-back function (`.elfencode`, `R_MIPS_HI16`) on MIPS32. The words, relocations and linked `.text` match llvm-mc / ld.lld (3.7.10); test only |
+| **elfmips64.axx** | 2.5 KB | 28 | **elfmips64.s** | a function that lays out `r_info` (`.elfrinfo`), MIPS64 n64 (3.7.10); test only |
+| **elfword.axx** | 1.7 KB | 24 | **elfword.s** | the unit of addends and symbol values (`.elfunit::word`) on a toy machine with 16-bit words (3.7.10); test only |
 | **elfrel.axx** | 4.1 KB | 41 | **elfrel.s** | ARM (EM_ARM) described with `.elfbuiltin::0`, without the built-in table, and the REL instruction-field types (the shift and bias of `.elffield`; 3.7.7, 3.7.9). The instruction words and relocations match llvm-mc; test only |
 | **elfsym.axx** | 2.8 KB | 23 | **elfsym.s** | the ELF symbol attributes written from the source (`.type`, `.size`, `.weak`, `.hidden`, `.protected`, `.internal`, `.other`, `.comm`; 5.6.1), together with a field width that is not a power of two (`.elfwidth::3`) and a section element size (the fifth field of `.elfsection`; 3.7.7). The machine is EM_MN10300, which is not in the built-in table; test only |
 | **riscv64.axx** | 11 KB | 122 | **riscv64.s** | RV64I, the base integer instruction set (U/I/S/B/J/R formats, loads and stores, branches, jumps, `call`, `li`/`mv`/`j`/`ret`/`nop`, `ecall`/`ebreak`). No C, M, A or F/D extension, no CSR instructions, no fence group. It is also the worked example of declaring what axx has no built-in numbers for: the built-in EM_RISCV table holds only the data types, so `CALL_PLT`, `BRANCH`, `JAL`, `HI20`, `LO12_I`/`_S` and the `PCREL` pair come from `.elftype` / `.elffield` / `.reloc` (3.7.5-3.7.7). It links with `ld -m elf64lriscv` and runs |
@@ -3910,7 +4105,7 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 big-endian hello world); `ppc64_isa.axx` is included by those two and is never
 passed to axx itself.
 
-`test1` runs all thirty-one pairs through both implementations and
+`test1` runs all thirty-five pairs through both implementations and
 compares the `-b` raw binaries. For the three pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx` and `intel2att.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
@@ -3919,10 +4114,12 @@ ELF header, the `elfprio.axx` / `elfprio.s` pair is about which of the three
 ranks types a relocation, the `elfsec.axx` / `elfsec.s` pair is about the
 section headers, the `elfsym.axx` / `elfsym.s` pair is about the symbol
 table attributes, the `riscv64.axx` / `riscv64.s` pair is about declared
-instruction-field types, and the `elfrel.axx` / `elfrel.s` pair is about REL
-instruction-field types, so for those seven the `-o` ELF objects are compared.
-For `aarch64.axx` the `-m 183 --elfdesc` output (the built-in table rewritten as
-declarations) is compared too. For the
+instruction-field types, the `elfrel.axx` / `elfrel.s` pair is about REL
+instruction-field types, and the `elfpair`, `elfmips`, `elfmips64` and `elfword`
+pairs are about the declarations of section 3.7.10, so for those eleven the `-o`
+ELF objects are compared. For `aarch64.axx` (`-m 183`) and `elfpair.axx` the
+`--elfdesc` output (the description rewritten as declarations) is compared too.
+For the
 `echo.axx` / `echo.s` pair the `.echo` lines written to standard error are
 compared as well.
 
@@ -3930,7 +4127,7 @@ The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for a hundred and forty-eight comparisons in all.
+never compares, for a hundred and fifty-three comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -3960,7 +4157,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all thirty-one bundled pattern/source pairs with both
+`test1` assembles all thirty-five bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 three `.textmode` pairs and the `.echo` lines of the `echo.axx` pair.
 

@@ -42,6 +42,11 @@ caxx $P/elfsym.axx $S/elfsym.s -o b111
 caxx $P/riscv64.axx $S/riscv64.s -o b112
 caxx $P/elfrel.axx $S/elfrel.s -o b113
 caxx $P/aarch64.axx -m 183 --elfdesc > b114
+caxx $P/elfpair.axx $S/elfpair.s -o b115
+caxx $P/elfmips.axx $S/elfmips.s -o b116
+caxx $P/elfmips64.axx $S/elfmips64.s -o b117
+caxx $P/elfword.axx $S/elfword.s -o b118
+caxx $P/elfpair.axx --elfdesc > b119
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -168,6 +173,11 @@ paxx $P/elfsym.axx $S/elfsym.s -o a111
 paxx $P/riscv64.axx $S/riscv64.s -o a112
 paxx $P/elfrel.axx $S/elfrel.s -o a113
 paxx $P/aarch64.axx -m 183 --elfdesc > a114
+paxx $P/elfpair.axx $S/elfpair.s -o a115
+paxx $P/elfmips.axx $S/elfmips.s -o a116
+paxx $P/elfmips64.axx $S/elfmips64.s -o a117
+paxx $P/elfword.axx $S/elfword.s -o a118
+paxx $P/elfpair.axx --elfdesc > a119
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -257,7 +267,7 @@ paxx $P/aarch64.axx $S/aarch64.s -V -b a110 > a110t
 FAIL=0
 
 N=0
-while [ $N -le 114 ]; do
+while [ $N -le 119 ]; do
     cmp a$N b$N || FAIL=1
     N=$((N+1))
 done

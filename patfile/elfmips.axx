@@ -1,0 +1,77 @@
+/* ===================================================================
+/* elfmips.axx -- pattern file for a REL field that a mask cannot
+/*                describe, written back by a function (manual 3.7.10)
+/*
+/* The machine is MIPS32 (EM_MIPS, 8), big-endian, o32: REL, so every
+/* addend lives in the instruction itself. Two of its fields are plain
+/* bit fields and `.elffield` alone puts the addend back:
+/*
+/*   R_MIPS_26    jal       the addend >> 2 in bits 0-25
+/*   R_MIPS_LO16  addiu/lw  the low 16 bits of the addend
+/*
+/* R_MIPS_HI16 is not: the linker pairs it with the following LO16 and
+/* adds the sign-extended low half back, so the field must hold
+/* (addend + 0x8000) >> 16, rounded. A mask cannot say "add 0x8000
+/* first", so the write-back is a mini-language function:
+/*
+/*   .elfencode::<type>::<function>
+/*        under REL, the function gets (the field as it stands, the
+/*        addend) and returns the new field. Any encoding can be
+/*        written this way -- rounding, scrambled bits, or bits that
+/*        are a function of other bits (Thumb's J1/J2).
+/*
+/* The words and relocations match llvm-mc's for the same code (see
+/* elfmips.s).
+/*
+/* Assemble with:
+/*   axx elfmips.axx elfmips.s -o out.o
+/* =================================================================== */
+
+.bits::big::8
+
+/* --- what kind of ELF object to write ------------------------------ */
+.elfbuiltin::0
+.elfmachine::8::MIPS
+.elfclass::32
+.elfrela::0                    /* REL                                 */
+.elfheader::flags::0x50001001  /* mips32, o32, noreorder              */
+
+/* --- relocation types of the MIPS ABI ------------------------------ */
+.elftype::r32::2::4            /* R_MIPS_32                           */
+.elftype::r26::4::4            /* R_MIPS_26                           */
+.elftype::hi16::5::4           /* R_MIPS_HI16 (r_offset = the word)   */
+.elftype::lo16::6::4           /* R_MIPS_LO16                         */
+
+.elffield::r26::0x03ffffff::0::2   /* instr_index, in words           */
+.elffield::hi16::0xffff            /* the immediate half              */
+.elffield::lo16::0xffff
+.elfencode::hi16::hi16enc          /* (addend + 0x8000) >> 16         */
+
+.elfwidth::4::r32
+.elfextern::r32
+.elfdwarf::r32
+
+/* --- the write-back of R_MIPS_HI16 --------------------------------- */
+.func hi16enc(f, a)
+.return (f & 0xffff0000) | (((a + 0x8000) >> 16) & 0xffff)
+.endfunc
+
+/* --- one 32-bit big-endian word ------------------------------------ */
+.func w4(z)
+.return [(z >> 24) & 0xff, (z >> 16) & 0xff, (z >> 8) & 0xff, z & 0xff]
+.endfunc
+
+/* --- instructions -------------------------------------------------- */
+.reloc::v::hi16
+LUI !t,%HI(!v) :: .call w4(0x3c000000 | (t << 16) | (((v + 0x8000) >> 16) & 0xffff))
+.clrreloc::v
+.reloc::v::lo16
+ADDIU !t,!s,%LO(!v) :: .call w4(0x24000000 | (s << 21) | (t << 16) | (v & 0xffff))
+LW !t,%LO(!v)(!s) :: .call w4(0x8c000000 | (s << 21) | (t << 16) | (v & 0xffff))
+.clrreloc::v
+.reloc::v::r26
+JAL !v :: .call w4(0x0c000000 | ((v >> 2) & 0x3ffffff))
+.clrreloc::v
+JR !s :: .call w4(0x00000008 | (s << 21))
+NOP :: .call w4(0)
+WORD !v :: v>>24,v>>16,v>>8,v

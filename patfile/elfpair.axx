@@ -1,0 +1,54 @@
+/* ===================================================================
+/* elfpair.axx -- pattern file for relocations that come in pairs or
+/*                with a companion, section groups and sh_link
+/*                (manual 3.7.10)
+/*
+/* The machine is RISC-V (EM_RISCV, 243): riscv64.axx gives the
+/* instructions, and this file adds what a linker that relaxes code
+/* needs from an object:
+/*
+/*   .elfextra::<type>::<companion>[::<symbol>]
+/*        every relocation of <type> gets <companion> at the same
+/*        offset with addend 0; <symbol> 0 (default) writes symbol
+/*        index 0, 1 the same symbol. A `call` gets R_RISCV_RELAX,
+/*        as GNU as and llvm-mc write it.
+/*   .elfdiff::<width>::<add type>::<subtract type>
+/*        a <width>-byte field holding the difference of two labels
+/*        (a-b, a-b+c) gets the add type against a with the constant
+/*        as its addend and the subtract type against b. Under RELA
+/*        the field itself is written as 0, because these types add
+/*        to and subtract from what is in it.
+/*   .elfgroup::<name>::<signature>::<flags>::<member>[,<member>...]
+/*        a section group (SHT_GROUP); flags 1 is GRP_COMDAT.
+/*   .elflink::<section>::<sh_link>[::<sh_info>]
+/*        the sh_link / sh_info of a section, by section name or
+/*        number.
+/*
+/* The relocations, the group and the section header fields match
+/* what llvm-mc writes for the same code (see elfpair.s).
+/*
+/* Assemble with:
+/*   axx elfpair.axx elfpair.s -o out.o
+/* =================================================================== */
+
+.include "riscv64.axx"
+
+/* --- types this file adds to riscv64.axx -------------------------- */
+.elftype::add32::35            /* R_RISCV_ADD32                     */
+.elftype::add64::36            /* R_RISCV_ADD64                     */
+.elftype::sub32::39            /* R_RISCV_SUB32                     */
+.elftype::sub64::40            /* R_RISCV_SUB64                     */
+.elftype::relax::51            /* R_RISCV_RELAX                     */
+
+/* --- a call may be relaxed: R_RISCV_RELAX rides along -------------- */
+.elfextra::call::relax
+
+/* --- label differences in data ------------------------------------ */
+.elfdiff::4::add32::sub32
+.elfdiff::8::add64::sub64
+
+/* --- a COMDAT group and a link-order section ------------------------ */
+.elfsection::.text.foo::0x6            /* ALLOC+EXECINSTR             */
+.elfgroup::.group::foo::1::.text.foo   /* GRP_COMDAT, signature foo   */
+.elfsection::.meta::0x82               /* ALLOC+LINK_ORDER            */
+.elflink::.meta::.text                 /* sh_link -> .text            */

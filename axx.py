@@ -314,7 +314,9 @@ _HOIST_TEXT_ONLY = ('.check', '.clrcheck', '.reloc', '.clrreloc',
                     '.symbolc', '.passthru', '.eol', '.textmode',
                     '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
                     '.elfextern', '.elfdwarf', '.elfheader', '.elfsection',
-                    '.elffield', '.elfpcguess', '.elfbuiltin')
+                    '.elffield', '.elfpcguess', '.elfbuiltin', '.elfextra',
+                    '.elfdiff', '.elfencode', '.elfrinfo', '.elfunit', '.elflink',
+                    '.elfgroup')
 
 
 def _pat_text_dynamic(t):
@@ -1005,11 +1007,35 @@ def elf_machine_table(state):
     for rt, fo in base['field'].items():
         field.setdefault(rt, fo)
 
+    # 添えるリロケーション。宣言の順に並べ、別名で同じ型に当たれば続けて足す。
+    extra = {}
+    for text, comps in e.decl_extra.items():
+        rt = _elf_decl_type(state, named, text)
+        if rt is None:
+            continue
+        lst = extra.setdefault(rt, [])
+        for ctext, csym in comps.items():
+            crt = _elf_decl_type(state, named, ctext)
+            if crt is not None:
+                lst.append((crt, csym))
+    diff = {}
+    for w, (ta, tb) in e.decl_diff.items():
+        ra = _elf_decl_type(state, named, ta)
+        rb = _elf_decl_type(state, named, tb)
+        if ra is not None and rb is not None:
+            diff[w] = (ra, rb)
+    encode = {}
+    for text, fn in e.decl_encode.items():
+        rt = _elf_decl_type(state, named, text)
+        if rt is not None:
+            encode.setdefault(rt, fn)
+
     tbl = dict(base, name=name, elfclass=elfclass, is_rela=is_rela,
                width_guess=width_guess, pc_rel=pc_rel,
                extern_default=extern_default, dwarf_abs=dwarf_abs,
                named=named, reloc_bytes=reloc_bytes, reverse=reverse,
-               pcrel_guess=pcrel_guess, field=field)
+               pcrel_guess=pcrel_guess, field=field, extra=extra, diff=diff,
+               encode=encode, rinfo=e.decl_rinfo, unit=e.decl_unit or 'byte')
     e.mach_cache_key = key
     e.mach_cache = tbl
     return tbl
@@ -1189,6 +1215,70 @@ def insn_reloc_field_mask(rtype, state=None):
     return None if _fd is None else _fd[0]
 
 
+def _elf_v2l_second(state, prev, k, v):
+    """取り込み中の変数に 2 つ目のラベルが見えたときの記録。
+
+    `.elfdiff` が宣言されていれば、ラベル差の候補として 2 つを並べた
+    リストにする（取り込みが終わってから _elf_diff_resolve が足す側と
+    引く側を決める）。それ以外、または 3 つ目以降は「曖昧」の None。
+    caxx.c の label_get_value() と同じ規則である。
+    """
+    if state.elf.decl_diff and isinstance(prev, tuple) and len(prev) == 2:
+        return [prev, (k, v)]
+    return None
+
+
+_DIFF_WORD = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.$')
+
+
+def _elf_label_sign(text, name):
+    """text の中でラベル name に付いている符号。'+' / '-'、決まらなければ ''。
+
+    名前は大小を区別せず、前後が名前の文字でない所だけを数える。2 回以上
+    現れたら決めない。直前（空白を飛ばす）が `-` なら '-'、`+`・`(`・先頭なら
+    '+'。caxx.c の elf_label_sign() と同じ規則である。
+    """
+    t = text.upper()
+    n = name.upper()
+    pos = -1
+    i = t.find(n)
+    while i >= 0:
+        e = i + len(n)
+        if (i == 0 or t[i - 1] not in _DIFF_WORD) and (e >= len(t) or t[e] not in _DIFF_WORD):
+            if pos >= 0:
+                return ''
+            pos = i
+        i = t.find(n, i + 1)
+    if pos < 0:
+        return ''
+    j = pos - 1
+    while j >= 0 and t[j] in ' \t':
+        j -= 1
+    if j < 0 or t[j] in '+(':
+        return '+'
+    if t[j] == '-':
+        return '-'
+    return ''
+
+
+def _elf_diff_resolve(text, pair):
+    """ラベル差の候補 [(名前, 値), (名前, 値)] を (足す, 足す−引く, 引く, 引くの値) にする。
+
+    取り込んだ式の綴り text から、どちらが引かれているかを決める。片方が
+    '+'、もう片方が '-' でなければ None（従来どおり曖昧として扱う）。
+    """
+    (n1, v1), (n2, v2) = pair
+    if n1.upper() == n2.upper():
+        return None
+    s1 = _elf_label_sign(text, n1)
+    s2 = _elf_label_sign(text, n2)
+    if s1 == '+' and s2 == '-':
+        return (n1, int(v1) - int(v2), n2, int(v2))
+    if s1 == '-' and s2 == '+':
+        return (n2, int(v2) - int(v1), n1, int(v1))
+    return None
+
+
 def _field_deposit(mask, value):
     """value の下位ビットから順に、mask の立っているビットへ下から詰める。
 
@@ -1233,7 +1323,8 @@ class ElfState:
 
     decl_* はパターンファイルの ELF 記述（.elfmachine / .elfclass / .elfrela /
     .elfwidth / .elfextern / .elfdwarf / .elfheader / .elfsection / .elffield /
-    .elfpcguess / .elfbuiltin）が
+    .elfpcguess / .elfbuiltin / .elfextra / .elfdiff / .elfencode / .elfrinfo /
+    .elfunit / .elflink / .elfgroup）が
     書き込む先で、組み込みの表にかぶせて elf_machine_table() が実表を作る。
     decl_gen はそのキャッシュを捨てるための世代番号。
     """
@@ -1259,6 +1350,18 @@ class ElfState:
         self.decl_sec = {}
         self.decl_pcguess = None
         self.decl_builtin = None
+        # 添えるリロケーション（型の綴り → {添える型の綴り: シンボルを持つか}）、
+        # ラベル差の対（幅 → (足す型, 引く型)）、REL の書き戻し関数
+        # （型の綴り → 関数名）、r_info を組む関数、加数とシンボル値の単位、
+        # sh_link / sh_info（セクション名の小文字 → (綴り, 綴り)）、
+        # セクショングループ（(名前の小文字, 署名) → (名前, 署名, フラグ, メンバー)）。
+        self.decl_extra = {}
+        self.decl_diff = {}
+        self.decl_encode = {}
+        self.decl_rinfo = ''
+        self.decl_unit = None
+        self.decl_link = {}
+        self.decl_group = {}
         self.type_width = {}
         self.type_pcrel = set()
         self.decl_gen = 0
@@ -2581,7 +2684,8 @@ class LabelManager:
                 if cv not in self.state._elf_var_to_label:
                     self.state._elf_var_to_label[cv] = (k, v)
                 else:
-                    self.state._elf_var_to_label[cv] = None
+                    self.state._elf_var_to_label[cv] = _elf_v2l_second(
+                        self.state, self.state._elf_var_to_label[cv], k, v)
             elif self.state._elf_current_word_idx >= 0:
                 self.state._elf_label_refs_seen.append(
                     (k, v, self.state._elf_current_word_idx))
@@ -2891,7 +2995,8 @@ class ExpressionEvaluator:
                     if cv not in self.state._elf_var_to_label:
                         self.state._elf_var_to_label[cv] = (label_name, val)
                     else:
-                        self.state._elf_var_to_label[cv] = None
+                        self.state._elf_var_to_label[cv] = _elf_v2l_second(
+                            self.state, self.state._elf_var_to_label[cv], label_name, val)
                 elif self.state._elf_current_word_idx >= 0:
                     self.state._elf_label_refs_seen.append(
                         (label_name, val, self.state._elf_current_word_idx))
@@ -3297,7 +3402,15 @@ class ExpressionEvaluator:
                 if (self.state._elf_tracking
                         and self.state._elf_current_word_idx >= 0):
                     entry = self.state._elf_var_to_label.get(ch)
-                    if entry is not None:
+                    if isinstance(entry, tuple) and len(entry) == 4:
+                        # ラベル差 a-b。足す側を参照に積み、引く側はヒントの
+                        # 辞書に ('d', ワード位置) の鍵で添える。
+                        self.state._elf_label_refs_seen.append(
+                            (entry[0], entry[1], self.state._elf_current_word_idx))
+                        self.state._elf_insn_reloc_hint.setdefault(
+                            ('d', self.state._elf_current_word_idx), entry[2])
+                        entry = None
+                    if isinstance(entry, tuple):
                         lname, lval = entry
                         self.state._elf_label_refs_seen.append(
                             (lname, lval, self.state._elf_current_word_idx))
@@ -4615,6 +4728,159 @@ class DirectiveProcessor:
                             set_error=True)
         return True
 
+    def elfextra_processing(self, i):
+        """`.elfextra` — その型のリロケーションに、同じ位置へもう 1 つ添える。
+
+        `.elfextra::<型>::<添える型>[::<シンボル>]`。シンボルが 0（既定）なら
+        添えるほうはシンボル番号 0・加数 0（R_RISCV_RELAX など）、1 なら
+        元と同じシンボルで加数 0。caxx.c の dir_elfextra() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.elfextra':
+            return False
+        t = (i[1] if len(i) > 1 else '').strip()
+        c = (i[2] if len(i) > 2 else '').strip()
+        if not t or not c:
+            self.state.diag(" error - .elfextra: two relocation types are required.",
+                            set_error=True)
+            return True
+        sym = 0
+        if len(i) > 3 and i[3] and i[3].strip():
+            sym = self._elf_decl_num('.elfextra', i[3], 0, 1)
+            if sym is None:
+                return True
+        e = self.state.elf
+        comps = e.decl_extra.get(t)
+        if comps is None or comps.get(c) != sym:
+            comps = dict(comps or {})
+            comps[c] = sym
+            e.decl_extra[t] = comps
+            e.decl_gen += 1
+        return True
+
+    def elfdiff_processing(self, i):
+        """`.elfdiff` — 2 つのラベルの差を、足す型と引く型の対で出す。
+
+        `.elfdiff::<幅>::<足す型>::<引く型>`。`a-b` の値を持つその幅の欄に、
+        a への足す型（加数は定数部）と b への引く型（加数 0）を同じ位置へ出す。
+        caxx.c の dir_elfdiff() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.elfdiff':
+            return False
+        w = self._elf_decl_num('.elfdiff', i[1] if len(i) > 1 else '', 1, 8)
+        if w is None:
+            return True
+        a = (i[2] if len(i) > 2 else '').strip()
+        b = (i[3] if len(i) > 3 else '').strip()
+        if not a or not b:
+            self.state.diag(" error - .elfdiff: an add type and a subtract type are required.",
+                            set_error=True)
+            return True
+        e = self.state.elf
+        if e.decl_diff.get(w) != (a, b):
+            e.decl_diff[w] = (a, b)
+            e.decl_gen += 1
+        return True
+
+    def elfencode_processing(self, i):
+        """`.elfencode` — REL で加数を欄へ書き戻す関数を型ごとに決める。
+
+        `.elfencode::<型>::<関数>`。関数は (欄の値, 加数) を受け取り、新しい
+        欄の値を返す。caxx.c の dir_elfencode() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.elfencode':
+            return False
+        t = (i[1] if len(i) > 1 else '').strip()
+        f = (i[2] if len(i) > 2 else '').strip()
+        if not t or not f:
+            self.state.diag(" error - .elfencode: a relocation type and a function name are required.",
+                            set_error=True)
+            return True
+        e = self.state.elf
+        if e.decl_encode.get(t) != f:
+            e.decl_encode[t] = f
+            e.decl_gen += 1
+        return True
+
+    def elfrinfo_processing(self, i):
+        """`.elfrinfo` — r_info を組む関数を決める。
+
+        関数は (シンボル番号, 型番号) を受け取り、r_info の値を返す。
+        caxx.c の dir_elfrinfo() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.elfrinfo':
+            return False
+        f = self._elf_decl_fields(i)[0].strip()
+        if not f:
+            self.state.diag(" error - .elfrinfo: a function name is required.", set_error=True)
+            return True
+        self._elf_decl_set('decl_rinfo', f)
+        return True
+
+    def elfunit_processing(self, i):
+        """`.elfunit` — 加数とシンボル値の単位（byte / word）。
+
+        caxx.c の dir_elfunit() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.elfunit':
+            return False
+        text = self._elf_decl_fields(i)[0].strip().lower()
+        if text in ('byte', 'word'):
+            self._elf_decl_set('decl_unit', text)
+        else:
+            self.state.diag(f" error - .elfunit: value must be byte or word, got '{text}'.",
+                            set_error=True)
+        return True
+
+    def elflink_processing(self, i):
+        """`.elflink` — セクションの sh_link と sh_info を決める。
+
+        `.elflink::<セクション>::<sh_link>[::<sh_info>]`。値はセクション名か数。
+        caxx.c の dir_elflink() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.elflink':
+            return False
+        nm = (i[1] if len(i) > 1 else '').strip()
+        lk = (i[2] if len(i) > 2 else '').strip()
+        inf = (i[3] if len(i) > 3 else '').strip()
+        if not nm:
+            self.state.diag(" error - .elflink: section name is not specified.", set_error=True)
+            return True
+        e = self.state.elf
+        key = nm.lower()
+        if e.decl_link.get(key) != (lk, inf):
+            e.decl_link[key] = (lk, inf)
+            e.decl_gen += 1
+        return True
+
+    def elfgroup_processing(self, i):
+        """`.elfgroup` — セクショングループ（SHT_GROUP）を宣言する。
+
+        `.elfgroup::<グループ名>::<署名シンボル>::<フラグ>::<メンバー>[,<メンバー>...]`。
+        caxx.c の dir_elfgroup() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.elfgroup':
+            return False
+        gn = (i[1] if len(i) > 1 else '').strip()
+        sig = (i[2] if len(i) > 2 else '').strip()
+        if not gn or not sig:
+            self.state.diag(" error - .elfgroup: a group name and a signature symbol are required.",
+                            set_error=True)
+            return True
+        fl = self._elf_decl_num('.elfgroup', i[3] if len(i) > 3 else '', 0, 0xFFFFFFFF)
+        if fl is None:
+            return True
+        mem = tuple(m.strip() for m in (i[4] if len(i) > 4 else '').split(',') if m.strip())
+        if not mem:
+            self.state.diag(" error - .elfgroup: no member section is given.", set_error=True)
+            return True
+        e = self.state.elf
+        key = (gn.lower(), sig)
+        val = (gn, sig, fl, mem)
+        if e.decl_group.get(key) != val:
+            e.decl_group[key] = val
+            e.decl_gen += 1
+        return True
+
     def elfsection_processing(self, i):
         """`.elfsection` — 名前から推測できないセクションの属性を宣言する。
 
@@ -4977,7 +5243,8 @@ _PAT_DIRECTIVES = frozenset((
     '.echo',
     '.elftype', '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
     '.elfextern', '.elfdwarf', '.elfheader', '.elfsection', '.elffield',
-    '.elfpcguess', '.elfbuiltin'))
+    '.elfpcguess', '.elfbuiltin', '.elfextra', '.elfdiff', '.elfencode',
+    '.elfrinfo', '.elfunit', '.elflink', '.elfgroup'))
 
 
 _CONST_SETSYM_RE = re.compile(r"^[\s0-9+\-*/%()<>|&^~]+$|^\s*0[xX][0-9a-fA-F]+\s*$")
@@ -5355,6 +5622,9 @@ class PatternMatcher:
                     if stopchar != chr(0) and raw_text.endswith(stopchar):
                         raw_text = raw_text[:-1]
                     self.state.vars_text[a] = raw_text.strip(' \t' + chr(0))
+                    _pend = self.state._elf_var_to_label.get(a)
+                    if isinstance(_pend, list):
+                        self.state._elf_var_to_label[a] = _elf_diff_resolve(raw_text, _pend)
 
                     if self.state.textmode:
                         self.state.error_undefined_label = _cap_prior
@@ -5425,10 +5695,15 @@ class PatternMatcher:
                     self.state._elf_capturing_var = a
                     _cap_prior = self.state.error_undefined_label
                     self.state.error_undefined_label = False
+                    _cap_start = idx_s
                     try:
                         v, idx_s = self.expr_eval.factor(s, idx_s)
                     finally:
                         self.state._elf_capturing_var = None
+                    _pend = self.state._elf_var_to_label.get(a)
+                    if isinstance(_pend, list):
+                        self.state._elf_var_to_label[a] = _elf_diff_resolve(
+                            s[_cap_start:idx_s], _pend)
                     _cap_undef = self.state.error_undefined_label
                     self.state.error_undefined_label = _cap_prior or _cap_undef
                     self.var_manager.put_tagged(a, v, _cap_undef)
@@ -5450,10 +5725,15 @@ class PatternMatcher:
                     self.state._elf_capturing_var = a
                     _cap_prior = self.state.error_undefined_label
                     self.state.error_undefined_label = False
+                    _cap_start = idx_s
                     try:
                         v, idx_s = self.expr_eval.expression_esc(s, idx_s, stopchar)
                     finally:
                         self.state._elf_capturing_var = None
+                    _pend = self.state._elf_var_to_label.get(a)
+                    if isinstance(_pend, list):
+                        self.state._elf_var_to_label[a] = _elf_diff_resolve(
+                            s[_cap_start:idx_s], _pend)
                     _cap_undef = self.state.error_undefined_label
                     self.state.error_undefined_label = _cap_prior or _cap_undef
                     self.var_manager.put_tagged(a, v, _cap_undef)
@@ -11195,9 +11475,54 @@ class Assembler:
                 _mach_tbl_la = elf_machine_table(self.state)
                 _rmap = {**_mach_tbl_la['width_guess'], **self.state.reloctype_override}
                 _pc_rel_types_all = _mach_tbl_la['pc_rel']
+                # 加数の単位。byte なら 1 ワードのバイト数を掛け、word ならワードのまま。
+                _scale = 1 if _mach_tbl_la['unit'] == 'word' else bpw_r
+
+                def _field_raw(first, nwords):
+                    # 欄のワード列を対象のバイト順で 1 つの整数に読み、符号を付ける。
+                    _wm = (1 << self.state.bts) - 1
+                    rv = 0
+                    for k in range(nwords):
+                        wk = first + k
+                        if wk >= len(objl):
+                            continue
+                        if self.state.endian == 'little':
+                            rv |= (int(objl[wk]) & _wm) << (self.state.bts * k)
+                        else:
+                            rv |= (int(objl[wk]) & _wm) << (self.state.bts * (nwords - 1 - k))
+                    fb = nwords * self.state.bts
+                    if fb > 0 and rv >= (1 << (fb - 1)):
+                        rv -= (1 << fb)
+                    return rv
 
                 for lname, abs_w, first_widx, num_words in groups:
                     num_bytes = num_words * bpw_r
+
+                    _dminus = self.state._elf_insn_reloc_hint.get(('d', first_widx))
+                    if _dminus is not None:
+                        # ラベル差 lname - _dminus。`.elfdiff` の対を同じ位置に出す。
+                        if first_widx >= len(objl):
+                            continue
+                        _dpair = _mach_tbl_la['diff'].get(num_bytes)
+                        if _dpair is None:
+                            if self.state.debug:
+                                self.state.diag(
+                                    f" warning - no .elfdiff pair for a {num_bytes}-byte "
+                                    f"difference '{lname}-{_dminus}'; relocation omitted.",
+                                    set_error=False)
+                            continue
+                        _dconst = (_field_raw(first_widx, num_words) - int(abs_w)) * _scale
+                        _dsec = (_completed_words + (self.state.pc + first_widx - _entry_pc_cur)) * bpw_r
+                        if _mach_tbl_la['is_rela']:
+                            # 足す型・引く型は欄の中身に足し引きするので、欄は 0 で出す。
+                            for _k in range(num_words):
+                                if first_widx + _k < len(objl):
+                                    objl[first_widx + _k] = 0
+                        self.state.relocations.append(
+                            (sec_name_r, _dsec, lname, _dpair[0], _dconst, num_bytes))
+                        self.state.relocations.append(
+                            (sec_name_r, _dsec, _dminus, _dpair[1], 0, num_bytes))
+                        continue
 
                     _hint = self.state._elf_insn_reloc_hint.get(first_widx)
                     lentry = self.state.labels.get(lname)
@@ -11228,7 +11553,7 @@ class Assembler:
                             # 加数は「オペランドの値 − ラベルの値」に補正を足したもの。
                             self.state.relocations.append(
                                 (sec_name_r, _sec_rel_h, lname, _hint_rtype,
-                                 _hint_addend + _fbias, _insn_bytes))
+                                 _hint_addend * _scale + _fbias, _insn_bytes))
                             continue
 
                     rtype = 0
@@ -11279,31 +11604,29 @@ class Assembler:
                     if _field_bits > 0 and raw_val >= (1 << (_field_bits - 1)):
                         raw_val -= (1 << _field_bits)
 
-                    abs_w_bytes = int(abs_w) * bpw_r
+                    abs_wi = int(abs_w)
 
                     if (_rtype_is_default_guess and rtype in _pc_rel_types_all
-                            and raw_val == abs_w_bytes):
+                            and raw_val == abs_wi):
                         _alt = _reloc_same_width(_mach_tbl_la, num_bytes, False)
                         if _alt is not None:
                             rtype = _alt
 
                     if (_rtype_is_default_guess and _mach_tbl_la['pcrel_guess']
                             and rtype not in _pc_rel_types_all
-                            and raw_val != abs_w_bytes):
+                            and raw_val != abs_wi):
                         _alt = _reloc_same_width(_mach_tbl_la, num_bytes, True)
                         if _alt is not None:
                             rtype = _alt
 
+                    # 加数はワードで求めてから単位（.elfunit）に直す。
                     if rtype in _pc_rel_types_all:
-                        _P_raw = (self.state.pc + first_widx) * bpw_r
                         _P_adj = self.label_manager._section_relative_offset(
                             self.state.current_section, self.state.pc + first_widx)
-                        P_asm_bytes = _P_adj * bpw_r if _P_adj is not None else _P_raw
-
-                        addend = raw_val - abs_w_bytes + P_asm_bytes
-
+                        _P_w = _P_adj if _P_adj is not None else self.state.pc + first_widx
+                        addend = (raw_val - abs_wi + _P_w) * _scale
                     else:
-                        addend = raw_val - abs_w_bytes
+                        addend = (raw_val - abs_wi) * _scale
 
                     self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend, num_bytes))
 
@@ -11355,7 +11678,8 @@ class Assembler:
     _ELF_DECL_DIRECTIVES = ('.elftype', '.elfmachine', '.elfclass', '.elfrela',
                             '.elfwidth', '.elfextern', '.elfdwarf', '.elfheader',
                             '.elfsection', '.elffield', '.elfpcguess',
-                            '.elfbuiltin')
+                            '.elfbuiltin', '.elfextra', '.elfdiff', '.elfencode',
+                            '.elfrinfo', '.elfunit', '.elflink', '.elfgroup')
 
     def register_elfdecls(self, pat):
         """パターンファイル中の ELF 記述ディレクティブを先に読んでおく。"""
@@ -11373,6 +11697,13 @@ class Assembler:
             '.elffield':   d.elffield_processing,
             '.elfpcguess': d.elfpcguess_processing,
             '.elfbuiltin': d.elfbuiltin_processing,
+            '.elfextra':   d.elfextra_processing,
+            '.elfdiff':    d.elfdiff_processing,
+            '.elfencode':  d.elfencode_processing,
+            '.elfrinfo':   d.elfrinfo_processing,
+            '.elfunit':    d.elfunit_processing,
+            '.elflink':    d.elflink_processing,
+            '.elfgroup':   d.elfgroup_processing,
         }
         for i in pat:
             if i and i[0] in table:
@@ -11423,6 +11754,17 @@ class Assembler:
         out.append(".elfextern::%s" % tname(tbl['extern_default']))
         out.append(".elfdwarf::%s" % tname(tbl['dwarf_abs']))
         out.append(".elfpcguess::%d" % (1 if tbl['pcrel_guess'] else 0))
+        out.append(".elfunit::%s" % tbl['unit'])
+        for w in sorted(tbl['diff']):
+            ra, rb = tbl['diff'][w]
+            out.append(".elfdiff::%d::%s::%s" % (w, tname(ra), tname(rb)))
+        for rt in sorted(tbl['extra']):
+            for crt, csym in tbl['extra'][rt]:
+                out.append(".elfextra::%s::%s::%d" % (tname(rt), tname(crt), csym))
+        for rt in sorted(tbl['encode']):
+            out.append(".elfencode::%s::%s" % (tname(rt), tbl['encode'][rt]))
+        if tbl['rinfo']:
+            out.append(".elfrinfo::%s" % tbl['rinfo'])
         for rt in sorted(tbl['field']):
             m, off, sh, bias = tbl['field'][rt]
             out.append(".elffield::%s::0x%x::%d::%d::%d" % (tname(rt), m, off, sh, bias))
@@ -11438,6 +11780,11 @@ class Assembler:
             for v in rest:
                 line += "::" + ('' if v is None else "%d" % v)
             out.append(line)
+        for sn in sorted(e.decl_link):
+            lk, inf = e.decl_link[sn]
+            out.append(".elflink::%s::%s%s" % (sn, lk, ("::" + inf) if inf else ''))
+        for (gn, sig, fl, mem) in e.decl_group.values():
+            out.append(".elfgroup::%s::%s::0x%x::%s" % (gn, sig, fl, ','.join(mem)))
         return '\n'.join(out) + '\n'
 
     def check_elfdecls(self):
@@ -11460,6 +11807,30 @@ class Assembler:
             if _elf_decl_type(self.state, named, t) is None:
                 self.state.diag(f" warning - .elffield: unknown relocation type '{t}' "
                                 f"for {tbl['name']}; ignored.", set_error=False)
+        for t, comps in e.decl_extra.items():
+            for tt in (t,) + tuple(comps):
+                if _elf_decl_type(self.state, named, tt) is None:
+                    self.state.diag(f" warning - .elfextra: unknown relocation type '{tt}' "
+                                    f"for {tbl['name']}; ignored.", set_error=False)
+        for w in sorted(e.decl_diff):
+            for tt in e.decl_diff[w]:
+                if _elf_decl_type(self.state, named, tt) is None:
+                    self.state.diag(f" warning - .elfdiff: unknown relocation type '{tt}' "
+                                    f"for {tbl['name']}; ignored.", set_error=False)
+        for t, fn in e.decl_encode.items():
+            if _elf_decl_type(self.state, named, t) is None:
+                self.state.diag(f" warning - .elfencode: unknown relocation type '{t}' "
+                                f"for {tbl['name']}; ignored.", set_error=False)
+        _fchk = [('.elfencode', fn) for fn in e.decl_encode.values()]
+        if e.decl_rinfo:
+            _fchk.append(('.elfrinfo', e.decl_rinfo))
+        for dname, fn in _fchk:
+            f = self.state.func_defs.get(fn)
+            if f is None:
+                self.state.diag(f" error - {dname}: no function named '{fn}'.", set_error=True)
+            elif len(f.params) != 2:
+                self.state.diag(f" error - {dname}: function '{fn}' must take 2 arguments.",
+                                set_error=True)
 
     def setpatsymbols(self, pat):
         """パターンファイルが定義するシンボルを先に集める。
@@ -11944,22 +12315,21 @@ class Assembler:
                 if is_elf64_dw:
                     _MAX, _MIN = (1 << 63) - 1, -(1 << 63)
                     for (off, sym, rtype, addend) in entries:
-                        r_info = (sym << 32) | (rtype & 0xffffffff)
+                        r_info = self._elf_r_info(sym, rtype, True)
                         a = min(_MAX, max(_MIN, addend))
                         out += _struct.pack(f'{_pk}QQq', off, r_info, a)
                 else:
                     _MAX, _MIN = (1 << 31) - 1, -(1 << 31)
                     for (off, sym, rtype, addend) in entries:
-                        r_info = ((sym & 0xffffff) << 8) | (rtype & 0xff)
+                        r_info = self._elf_r_info(sym, rtype, False)
                         a = min(_MAX, max(_MIN, addend))
                         out += _struct.pack(f'{_pk}IIi', off, r_info, a)
             else:
                 for (off, sym, rtype, _addend) in entries:
+                    r_info = self._elf_r_info(sym, rtype, is_elf64_dw)
                     if is_elf64_dw:
-                        r_info = (sym << 32) | (rtype & 0xffffffff)
                         out += _struct.pack(f'{_pk}QQ', off, r_info)
                     else:
-                        r_info = ((sym & 0xffffff) << 8) | (rtype & 0xff)
                         out += _struct.pack(f'{_pk}II', off, r_info)
             return bytes(out)
 
@@ -11976,6 +12346,47 @@ class Assembler:
             rela_list.append((f'{_dbg_prefix}.debug_line', '.debug_line', _pack_dbg_relocs(line_relas)))
 
         return prog_sections, rela_list
+
+    def _elf_call_func(self, dname, fname, args):
+        """`.elfencode` / `.elfrinfo` の関数を呼び、返した数を返す（失敗は None）。
+
+        関数はパターンファイルのミニ言語（3.15 節）で書く。数を返さなければ
+        診断して None。caxx.c の elf_call_func() と同じ規則である。
+        """
+        fn = self.state.func_defs.get(fname)
+        if fn is None:
+            return None
+        saved_reclimit = sys.getrecursionlimit()
+        if saved_reclimit < _MINI_RECLIMIT:
+            sys.setrecursionlimit(_MINI_RECLIMIT)
+        try:
+            _words, ret = MiniInterp(self.state, self.expr_eval).run(
+                fn, list(args), (fn.file, fn.line))
+        except MiniLangError as e:
+            self.state.diag(f" error - {dname}: {e}", set_error=True)
+            return None
+        except RecursionError:
+            self.state.diag(f" error - {dname}: '{fname}': expression nesting too deep.",
+                            set_error=True)
+            return None
+        finally:
+            sys.setrecursionlimit(saved_reclimit)
+        if ret is None or isinstance(ret, list):
+            self.state.diag(f" error - {dname}: function '{fname}' must return a number.",
+                            set_error=True)
+            return None
+        return _mini_wrap(ret)
+
+    def _elf_r_info(self, sym, rtype, is_elf64):
+        """r_info を組む。`.elfrinfo` があればその関数、無ければ ELF の決まりの形。"""
+        fn = elf_machine_table(self.state)['rinfo']
+        if fn:
+            v = self._elf_call_func('.elfrinfo', fn, [sym, rtype])
+            v = 0 if v is None else v
+            return v & (0xFFFFFFFFFFFFFFFF if is_elf64 else 0xFFFFFFFF)
+        if is_elf64:
+            return (sym << 32) | (rtype & 0xffffffff)
+        return ((sym & 0xffffff) << 8) | (rtype & 0xff)
 
     def write_elf_obj(self, path: str, machine: int = 62) -> None:
         """ELF 再配置可能オブジェクトを書く。
@@ -12144,10 +12555,15 @@ class Assembler:
 
         from collections import defaultdict as _defaultdict
         rela_entries = _defaultdict(list)
+        _extra_w = _mach_tbl_w['extra']
         for (sname, off, sym_name, rtype, addend, nbytes) in self.state.relocations:
             sidx = sec_name_to_idx.get(sname, 0)
             if sidx:
                 rela_entries[sidx].append((off, sym_name, rtype, addend, nbytes))
+                # `.elfextra` の添えるリロケーション。同じ位置、加数 0。
+                for (_crt, _csym) in _extra_w.get(rtype, ()):
+                    rela_entries[sidx].append(
+                        (off, sym_name if _csym else None, _crt, 0, nbytes))
             else:
                 if self.state.should_report_errors():
                     self.state.diag(
@@ -12156,11 +12572,39 @@ class Assembler:
 
         if not _is_rela:
             _wmask_r = (1 << self.state.bts) - 1
+            _enc_w = _mach_tbl_w['encode']
             for sidx, entries in rela_entries.items():
                 csec = csecs[sidx - 1]
                 patched = bytearray(csec.data)
+                # 同じ位置に複数の項目があるとき（`.elfdiff` の対、`.elfextra`）は
+                # 最初の項目の加数だけを書き戻す。後の項目の 0 で消さないため。
+                _written = set()
                 for (off, _sym_name, _rtype, addend, nbytes) in entries:
+                    if off in _written:
+                        continue
+                    _written.add(off)
                     _fd = _mach_tbl_w['field'].get(_rtype)
+                    _enc = _enc_w.get(_rtype)
+                    if _enc is not None:
+                        # `.elfencode` の関数が (欄の値, 加数) から新しい欄を作る。
+                        _nw = max(1, nbytes // bpw)
+                        if not (0 <= off and off + _nw * bpw <= len(patched)):
+                            continue
+                        _iv = 0
+                        for k in range(_nw):
+                            _b = patched[off + k * bpw: off + (k + 1) * bpw]
+                            _sh = self.state.bts * (k if _is_le else (_nw - 1 - k))
+                            _iv |= (int.from_bytes(_b, 'little' if _is_le else 'big')
+                                    & _wmask_r) << _sh
+                        _nv = self._elf_call_func('.elfencode', _enc, [_iv, addend])
+                        if _nv is None:
+                            continue
+                        for k in range(_nw):
+                            _sh = self.state.bts * (k if _is_le else (_nw - 1 - k))
+                            _wv = (_nv >> _sh) & _wmask_r
+                            patched[off + k * bpw: off + (k + 1) * bpw] = \
+                                _wv.to_bytes(bpw, 'little' if _is_le else 'big')
+                        continue
                     if _fd is not None:
                         # 命令欄の型。加数をシフトしてマスクのビットへ下から
                         # 詰め、欄の外（命令の残り）はそのまま残す。
@@ -12195,6 +12639,32 @@ class Assembler:
         rela_sec_order = [i + 1 for i, s in enumerate(csecs) if (i + 1) in rela_entries]
         nrela = len(rela_sec_order)
 
+        # `.elfgroup` のセクショングループ。グループのセクションは、メンバーより
+        # 前に来なければならない（gABI）ので、セクションヘッダ表の先頭に置き、
+        # 残りの番号を G だけずらす。グループが無ければ G は 0 で、配置は従来どおり。
+        _groups = []
+        for (_gn, _gsig, _gfl, _gmem) in self.state.elf.decl_group.values():
+            _nums = []
+            for _m in _gmem:
+                _k = next((i + 1 for i, cs in enumerate(csecs)
+                           if cs.name.lower() == _m.lower()), None)
+                if _k is None:
+                    self.state.diag(f" warning - .elfgroup: member section '{_m}' of group "
+                                    f"'{_gn}' is not in the output; ignored.", set_error=False)
+                elif _k not in _nums:
+                    _nums.append(_k)
+            if _nums:
+                _groups.append((_gn, _gsig, _gfl, _nums))
+            else:
+                self.state.diag(f" warning - .elfgroup: group '{_gn}' has no member in the "
+                                f"output; not written.", set_error=False)
+        G = len(_groups)
+        _grp_members = set()
+        for (_gn, _gsig, _gfl, _nums) in _groups:
+            for _k in _nums:
+                csecs[_k - 1].flags |= 0x200
+                _grp_members.add(_k)
+
         dbg_prog, dbg_rela = self._build_dwarf_sections(
             csecs, sec_name_to_idx, bpw, machine)
 
@@ -12222,6 +12692,10 @@ class Assembler:
         for (rname, _tname, _rdata) in dbg_rela:
             dbg_rela_name_offs.append(len(shstrtab))
             shstrtab += rname.encode() + b'\x00'
+        grp_name_offs = []
+        for (_gn, _gsig, _gfl, _nums) in _groups:
+            grp_name_offs.append(len(shstrtab))
+            shstrtab += _gn.encode() + b'\x00'
         shstrtab = bytes(shstrtab)
 
         def _find_shndx(byte_addr, sec_name=None):
@@ -12231,11 +12705,11 @@ class Assembler:
                 if _idx is not None:
                     _woff = self._addr_to_word_offset(sec_name, word_pc)
                     if _woff is not None:
-                        return _idx, _woff * bpw
+                        return _idx + G, _woff * bpw
             for i, s in enumerate(csecs):
                 _woff = self._addr_to_word_offset(s.name, word_pc)
                 if _woff is not None:
-                    return i + 1, _woff * bpw
+                    return i + 1 + G, _woff * bpw
             if csecs:
                 best_i = 0
                 best_start = csecs[0].byte_start
@@ -12246,16 +12720,20 @@ class Assembler:
                 sym_val = byte_addr - csecs[best_i].byte_start
                 if sym_val < 0:
                     sym_val = 0
-                return best_i + 1, sym_val
+                return best_i + 1 + G, sym_val
             return 0xfff1, byte_addr
 
         strtab = bytearray(b'\x00')
         syms   = []
 
+        # `.elfunit::word` ならシンボルの値と大きさはワード単位で書く。
+        _word_unit = (_mach_tbl_w['unit'] == 'word')
+        _bpw_sym = 1 if _word_unit else bpw
+
         syms.append(_pack_sym(0, 0, 0, 0, 0, 0))
 
         for i in range(ncs):
-            syms.append(_pack_sym(0, 0x03, 0, i + 1, 0, 0))
+            syms.append(_pack_sym(0, 0x03, 0, i + 1 + G, 0, 0))
 
         export_keys = set(self.state.export_labels.keys())
 
@@ -12272,11 +12750,13 @@ class Assembler:
             else:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr, _lsec)
+                if _word_unit:
+                    sym_val = int(sym_val) // bpw
             sym_val = int(sym_val) & _word_mask
             _sa = _sym_attr(self.state, name)
-            _sz = _sym_size_of(self.state, name, bpw)
+            _sz = _sym_size_of(self.state, name, _bpw_sym)
             shndx, sym_val, _sz = _sym_common_override(
-                self.state, name, bpw, shndx, sym_val, _sz)
+                self.state, name, _bpw_sym, shndx, sym_val, _sz)
             name_off = len(strtab)
             strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, _sym_st_info(self.state, name, 0),
@@ -12291,7 +12771,7 @@ class Assembler:
                 continue
             _sa = _sym_attr(self.state, name)
             _shndx, _sval, _sz = _sym_common_override(
-                self.state, name, bpw, 0, 0, _sym_size_of(self.state, name, bpw))
+                self.state, name, _bpw_sym, 0, 0, _sym_size_of(self.state, name, _bpw_sym))
             name_off = len(strtab)
             strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, _sym_st_info(self.state, name, 1),
@@ -12310,11 +12790,13 @@ class Assembler:
             else:
                 byte_addr = val * bpw
                 shndx, sym_val = _find_shndx(byte_addr, _sec)
+                if _word_unit:
+                    sym_val = int(sym_val) // bpw
             sym_val = int(sym_val) & _word_mask
             _sa = _sym_attr(self.state, name)
             shndx, sym_val, _sz = _sym_common_override(
-                self.state, name, bpw, shndx, sym_val,
-                _sym_size_of(self.state, name, bpw))
+                self.state, name, _bpw_sym, shndx, sym_val,
+                _sym_size_of(self.state, name, _bpw_sym))
             name_off = len(strtab)
             strtab += name.encode() + b'\x00'
             syms.append(_pack_sym(name_off, _sym_st_info(self.state, name, 1),
@@ -12353,15 +12835,14 @@ class Assembler:
         _REL_ENTSIZE_ACTIVE = _RELA_ENTSIZE if _is_rela else _REL_ENTSIZE
 
         def _pack_rela(r_offset, r_sym, r_type, r_addend):
+            r_info = self._elf_r_info(r_sym, r_type, _is_elf64)
             if _is_elf64:
-                r_info = (r_sym << 32) | (r_type & 0xffffffff)
                 _MAX, _MIN = (1 << 63) - 1, -(1 << 63)
                 if r_addend > _MAX:
                     r_addend = _MAX
                 elif r_addend < _MIN:
                     r_addend = _MIN
                 return _struct.pack(f'{_pk}QQq', r_offset, r_info, r_addend)
-            r_info = ((r_sym & 0xffffff) << 8) | (r_type & 0xff)
             _MAX, _MIN = (1 << 31) - 1, -(1 << 31)
             if r_addend > _MAX:
                 r_addend = _MAX
@@ -12370,13 +12851,13 @@ class Assembler:
             return _struct.pack(f'{_pk}IIi', r_offset, r_info, r_addend)
 
         def _pack_rel(r_offset, r_sym, r_type):
+            r_info = self._elf_r_info(r_sym, r_type, _is_elf64)
             if _is_elf64:
-                r_info = (r_sym << 32) | (r_type & 0xffffffff)
                 return _struct.pack(f'{_pk}QQ', r_offset, r_info)
-            r_info = ((r_sym & 0xffffff) << 8) | (r_type & 0xff)
             return _struct.pack(f'{_pk}II', r_offset, r_info)
 
-        if not _is_elf64:
+        # `.elfrinfo` が r_info の形を決めているときは、型欄の幅の警告は出さない。
+        if not _is_elf64 and not _mach_tbl_w['rinfo']:
             _warned_rt = set()
             _warned_sym = False
             for sidx in rela_sec_order:
@@ -12438,7 +12919,7 @@ class Assembler:
         shstrtab_off = offset
         offset += len(shstrtab)
 
-        base_idx = ncs + nrela + 3
+        base_idx = ncs + nrela + 3 + G
         dbg_prog_offsets = []
         dbg_prog_shndx = {}
         for i, (dname, ddata) in enumerate(dbg_prog):
@@ -12452,14 +12933,71 @@ class Assembler:
             dbg_rela_offsets.append(offset)
             offset += len(rdata)
 
+        ndbg = len(dbg_prog) + len(dbg_rela)
+        total_shdrs = 1 + ncs + nrela + 3 + ndbg + G
+        shstrndx    = ncs + nrela + 3 + G
+        symtab_shidx = ncs + nrela + 1 + G
+        strtab_shidx = ncs + nrela + 2 + G
+        symtab_link = strtab_shidx
+
+        # グループの中身: フラグの語、続いてメンバーのセクション番号（メンバーの
+        # リロケーションセクションも同じグループに入れる）。sh_info は署名の
+        # シンボル番号。署名がセクション名ならそのセクションシンボル。
+        _rela_hidx = {sidx: ncs + 1 + ri + G for ri, sidx in enumerate(rela_sec_order)}
+        grp_datas = []
+        grp_info = []
+        for (_gn, _gsig, _gfl, _nums) in _groups:
+            _words = [_gfl]
+            for _k in _nums:
+                _words.append(_k + G)
+            for _k in _nums:
+                if _k in _rela_hidx:
+                    _words.append(_rela_hidx[_k])
+            grp_datas.append(b''.join(_struct.pack(f'{_pk}I', w & 0xFFFFFFFF) for w in _words))
+            _si = sym_name_to_idx.get(_gsig)
+            if _si is None:
+                _si = next((i + 1 for i, cs in enumerate(csecs) if cs.name == _gsig), None)
+            if _si is None:
+                self.state.diag(f" warning - .elfgroup: signature symbol '{_gsig}' of group "
+                                f"'{_gn}' is not in the symbol table.", set_error=False)
+                _si = 0
+            grp_info.append(_si)
+        grp_offsets = []
+        for gd in grp_datas:
+            offset = _align_up(offset, 4)
+            grp_offsets.append(offset)
+            offset += len(gd)
+
         shdr_off    = _align_up(offset, 8)
 
-        ndbg = len(dbg_prog) + len(dbg_rela)
-        total_shdrs = 1 + ncs + nrela + 3 + ndbg
-        shstrndx    = ncs + nrela + 3
-        symtab_shidx = ncs + nrela + 1
-        strtab_shidx = ncs + nrela + 2
-        symtab_link = strtab_shidx
+        # `.elflink` の sh_link / sh_info。値はセクション名か数（10 進か 0x 付き 16 進）。
+        def _shidx_of(text, sname, what):
+            if not text:
+                return 0
+            t = text.strip()
+            if t.isdigit():
+                return int(t, 10)
+            if t[:2].lower() == '0x' and len(t) > 2 and all(c in '0123456789abcdefABCDEF' for c in t[2:]):
+                return int(t, 16)
+            tl = t.lower()
+            for i, cs in enumerate(csecs):
+                if cs.name.lower() == tl:
+                    return i + 1 + G
+            for ri, sidx in enumerate(rela_sec_order):
+                if (_rela_prefix + csecs[sidx - 1].name).lower() == tl:
+                    return ncs + 1 + ri + G
+            if tl == '.symtab':
+                return symtab_shidx
+            if tl == '.strtab':
+                return strtab_shidx
+            if tl == '.shstrtab':
+                return shstrndx
+            for dname in dbg_prog_shndx:
+                if dname.lower() == tl:
+                    return dbg_prog_shndx[dname]
+            self.state.diag(f" warning - .elflink: {what} of '{sname}': no section "
+                            f"named '{t}'; written as 0.", set_error=False)
+            return 0
 
         try:
             _elf_file = open(path, 'wb')
@@ -12497,27 +13035,41 @@ class Assembler:
                 f.write(b'\x00' * (dbg_rela_offsets[i] - cur))
                 f.write(rdata)
 
+            for i, gd in enumerate(grp_datas):
+                cur = f.tell()
+                f.write(b'\x00' * (grp_offsets[i] - cur))
+                f.write(gd)
+
             cur = f.tell()
             f.write(b'\x00' * (shdr_off - cur))
 
             f.write(_pack_shdr(0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
+            for i, gd in enumerate(grp_datas):
+                f.write(_pack_shdr(
+                    grp_name_offs[i], 17, 0, 0, grp_offsets[i], len(gd),
+                    symtab_shidx, grp_info[i], 4, 4))
+
             for i, s in enumerate(csecs):
                 _sh_type_i = s.sh_type
                 _al_i = (s.align if s.align is not None
                          else _elf_default_align(_sh_type_i, _is_elf64))
+                _lk_t, _inf_t = self.state.elf.decl_link.get(s.name.lower(), ('', ''))
                 f.write(_pack_shdr(
                     sec_name_offs[i], _sh_type_i, s.flags, 0,
-                    sec_offsets[i], s.byte_size, 0, 0, _al_i, s.entsize))
+                    sec_offsets[i], s.byte_size,
+                    _shidx_of(_lk_t, s.name, 'sh_link'),
+                    _shidx_of(_inf_t, s.name, 'sh_info'), _al_i, s.entsize))
 
             _word_align = 8 if _is_elf64 else 4
             _sym_entsize = 24 if _is_elf64 else 16
             _rela_sh_type = 4 if _is_rela else 9
             for ri, sidx in enumerate(rela_sec_order):
                 f.write(_pack_shdr(
-                    rela_name_offs[ri], _rela_sh_type, 0x40, 0,
+                    rela_name_offs[ri], _rela_sh_type,
+                    0x40 | (0x200 if sidx in _grp_members else 0), 0,
                     rela_offsets[ri], len(rela_datas[ri]),
-                    symtab_shidx, sidx, _word_align, _REL_ENTSIZE_ACTIVE))
+                    symtab_shidx, sidx + G, _word_align, _REL_ENTSIZE_ACTIVE))
 
             f.write(_pack_shdr(
                 symtab_name_off, 2, 0, 0,
@@ -12735,6 +13287,13 @@ class Assembler:
             '.elffield':   d.elffield_processing,
             '.elfpcguess': d.elfpcguess_processing,
             '.elfbuiltin': d.elfbuiltin_processing,
+            '.elfextra':   d.elfextra_processing,
+            '.elfdiff':    d.elfdiff_processing,
+            '.elfencode':  d.elfencode_processing,
+            '.elfrinfo':   d.elfrinfo_processing,
+            '.elfunit':    d.elfunit_processing,
+            '.elflink':    d.elflink_processing,
+            '.elfgroup':   d.elfgroup_processing,
         }
         out = []
         for row, i in enumerate(pat):
