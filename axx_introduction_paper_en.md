@@ -1,74 +1,103 @@
 # axx: Generalizing Imperative Assembly Language — Design and Implementation of a General Assembler Based on a Free-Syntax Pattern Language and a Three-Layer Architecture
 
-**An introductory paper on axx.py / caxx.c by Taisuke Maekawa (fygar256)**
+**An introductory paper on axx.py / caxx.c by Taisuke Maekawa (fygar256) — October 2026 edition**
 
 ## Abstract
 
-axx (Arbitrary eXtended X assembler) departs from the conventional practice of implementing a dedicated assembler for each processor. It is built on a single insight: every imperative assembly language can be reduced to one pattern form, `instruction :: error_patterns :: binary_list`. This paper presents the central invention of axx — its free-syntax pattern language — together with three design decisions that follow from it: tokenizer-less character-level matching, order-independent pattern matching driven by a specificity score, and the separation of computational power from the declarative core. It further positions the current version of axx as a three-layer architecture: a macro layer that computes before reading, a declarative pattern layer, and a mini language invoked during encoding. The original design secured termination by keeping the whole pattern file Turing incomplete; the current version preserves that guarantee while handing control to a Turing-complete mini language exactly when the author writes `.call`. The paper argues that isolating computational power as a separately invoked language, rather than mixing it into the pattern notation, is the means by which axx reconciles declarativeness with expressive power. It further discusses how allowing the macro layer of the current version to read label values, `.equ` definitions and the location counter turns expansion into a participant in the relaxation fixed-point iteration, moving the securing of convergence from a static guarantee to run-time detection. Finally, it shows that extensions such as VLIW/EPIC support, non-8-bit word widths, and ELF64 relocatable object output sit naturally on top of the minimal core; it places axx within the historical lineage of meta-assemblers; and it discusses its significance in an era in which AI can generate pattern files.
+axx (Arbitrary eXtended X assembler) departs from the conventional practice of implementing a dedicated assembler for each processor. It is built on a single insight: every imperative assembly language can be reduced to one pattern form, `instruction :: error_patterns :: binary_list`. This paper presents the central invention of axx — its free-syntax pattern language — together with the design decisions that follow from it: tokenizer-less character-level matching, order-independent pattern matching driven by a specificity score, and the separation of computational power from the declarative core. The current version of axx has a three-layer architecture: a macro layer that computes before reading, a declarative pattern layer, and a mini language invoked during encoding. The pattern layer guarantees termination of matching as a property of the language, and hands control to a Turing-complete mini language only when the author explicitly writes `.call`.
+
+This edition newly discusses two major milestones that the current specification has reached since the previous edition. The first is the **generalization of ELF**. Branching on the machine number has been removed from the code that writes ELF, so that everything from relocation types, ELF class, RELA/REL, bit fields within instruction words, paired relocations, the layout of `r_info` and the unit of addends, through section groups and CFI, can be described purely by declarations in the pattern file. The built-in tables for eleven machines are nothing more than such declarations written in advance. The second is **source-to-source translation through text output**. Now that `binary_list` can contain string templates, a pattern file is at once a binary generator and a translator between assembly languages; part of the direction the author laid out as the axx2 concept has thus been realized on the current declarative core. In addition, the paper reports the enriched symbol system (sets and set algebra, the symbol capturer `!Y`), practical pattern files covering AArch64 (through SVE/SME2), PowerPC64 (POWER10) and the whole of RISC-V RV64, and a verification regime that cross-checks the two implementations in 155 comparisons. It places axx within the historical lineage of meta-assemblers and discusses its significance in an era in which AI generates pattern files.
 
 ## 1. Introduction
 
 Assemblers have conventionally been implemented in one-to-one correspondence with a particular instruction set architecture (ISA). Even in a multi-target assembler such as GNU as, each target exists as a backend hard-coded into the program, and supporting a new processor means modifying the assembler itself.
 
-axx inverts this arrangement. The assembler proper is a minimal matching engine that holds no knowledge of any ISA; all processor-specific knowledge resides in external declarative data — the pattern file, or processor description file. A user obtains an assembler for a given processor simply by transcribing that processor's specification into a pattern file. The targets of axx are not limited to virtual CPUs: they include "abstracted real CPUs," and converting the specification of an actual processor into a pattern file makes it directly assemblable.
+axx inverts this arrangement. The assembler proper is a minimal matching engine with no knowledge of any ISA; all knowledge of individual processors lives in external declarative data — the pattern file (processor description file). A user obtains an assembler for a processor simply by transcribing its specification into a pattern file. axx targets not only virtual CPUs but "abstracted real CPUs": once a real processor's specification has been turned into a pattern file, it can be assembled for directly.
 
-The idea originated in 1986, while the author was working part-time at Tokyo Denshi Sekkei during his university years; the name AXX and a prototype in C already existed at that point. Working code was published in 2024, after the original program listing was rediscovered 38 years later and rewritten in Python. What matters here is that those 38 years were not a mere gap: they served as a validation period, during which the idea remained applicable across the diversification of hardware — VLIW, EPIC, and processors with non-8-bit word widths.
+In the current version, the principle that "the engine does not know the machine" extends beyond instruction encoding to object file generation. Which CPU a linkable ELF is produced for is likewise determined solely by declarations in the pattern file (Section 7).
+
+The idea dates from 1986, when the author was a university student working part-time at Tokyo Denshi Sekkei; the name AXX and a prototype in C already existed at that time. The working code was published in 2024, after the original program listing resurfaced 38 years later and was rewritten in Python. What matters is that those 38 years were not mere dormancy: they served as a validation period showing that the idea remained valid through the diversification of hardware — VLIW, EPIC, processors whose word size is not 8 bits, and scalable vector extensions.
 
 ## 2. The Central Invention: Reduction to a Single Pattern Form
 
-The most essential claim of axx is that every imperative assembly language — with the exception of EPIC/VLIW, whose machine code carries meta-level complexity — reduces to the structure
+The most fundamental claim of axx is that every imperative assembly language, except EPIC/VLIW with their meta-level complexity in machine code, can be reduced to the structure
 
 ```
 instruction :: error_patterns :: binary_list
 ```
 
-Omitting error checking simplifies this further to `instruction :: binary_list`. This is a minimization of the definition "an assembler is a grammar for instructions plus binary generation based on it." It amounts to extracting what is common to imperative ISAs of the von Neumann architecture, metamodeling the ISA, and formalizing it through pattern matching.
+Omitting error checking, this simplifies further to `instruction :: binary_list`. This is a minimization of the definition "an assembler is the grammar of instructions plus binary generation based on it"; it amounts to extracting what is common to imperative ISAs of the von Neumann architecture, meta-modelling the ISA, and formalizing the result as pattern matching.
 
-An `instruction` is defined as a combination of five elements: string literals, symbols replaceable by integer values, integer expressions, integer factors, and floating-point expressions. The reduction claim states that these five elements alone suffice to process any imperative assembly language; any processor whose instructions map one-to-one onto machine code can be handled.
+An instruction is defined as a combination of string literals, symbols replaceable by integer values, integer expressions, integer factors and floating-point expressions. The content of the reduction thesis is that combinations of these five elements suffice to handle any imperative assembly language; any processor whose instructions correspond one-to-one to machine code can be handled.
 
-For example, the x86_64 RET instruction is complete in a single line:
+The x86_64 RET instruction, for example, is complete in a single line:
 
 ```
 RET :: 0xc3
 ```
 
-Instructions with operands also fit on one line, using variables and expressions. In the 8048 example,
+Instructions with operands also fit in one line as combinations of variables and expressions. For the 8048,
 
 ```
 ADD A,R!n :: n>7;5 :: n|0x68
 ```
 
-`add a,r1` generates 0x69, and a register number out of range returns error code 5 (Register out of range). Instruction syntax, validity checking, and code generation are declared as a single line of correspondence. This granularity — one line per instruction pattern — is what guarantees transcribability from a specification document.
+produces 0x69 from `add a,r1`, and returns error code 5 (Register out of range) if the register number is out of range. Syntax, validity checking and code generation are declared as a single-line correspondence. This granularity of "one line = one instruction pattern" is what guarantees that a specification can be transcribed.
 
-In practice, `binary_list` also carries complex expression evaluation, alignment, and the `;` prefix modifier that suppresses output when the value is 0; but these are unnecessary in the minimal model. The core remains the one line above.
+In practice, binary_list also offers complex expression evaluation, alignment, the `;` prefix that suppresses output when the value is 0, and the `;;` prefix that evaluates without emitting; but these are not needed by the minimal model. The core is the single line above.
 
 ## 3. Design as a Free-Syntax Pattern Language
 
 ### 3.1 A grammar without a grammar
 
-Although the pattern language of axx (the `instruction` part) is a DSL, it has no fixed grammar. It is a free-syntax language in which users construct their own grammar by combining string literals, symbols, integer expressions, integer factors, and floating-point expressions. Consequently it is not bound to the traditional `mnemonic operand` form: an ISA with assignment-style notation such as `r1 = r2 + r3`, and ARM64 SIMD notation such as `{v0.4s}`, can both be described within the same framework. Because of this property, axx functions as a general-purpose binary generator as well as an assembler.
+The pattern language of axx (the instruction field) is a DSL, yet it has no fixed grammar. It is a free-syntax language in which users build their own grammar from string literals, symbols, integer expressions, integer factors and floating-point expressions. As a result, it is not bound to the traditional `mnemonic operand` form: an ISA with assignment-style notation such as `r1 = r2 + r3`, and ARM64 SIMD notation such as `{v0.4s}`, can be described in the same framework. This property makes axx not only an assembler but also a general-purpose binary generator.
 
-The name reflects the design intent. axx is not a *general-purpose* assembler in the sense of "widely usable," but a *general* assembler in the sense of "common to everything."
+This stands out in contrast to existing large-scale infrastructure. LLVM's assembler-generation machinery (TableGen/AsmMatcher) assumes mnemonic-led syntax and needed special handling for Hexagon's mnemonic-less `r0 = r1` transfer syntax. axx never had that assumption built in.
+
+The name reflects the design philosophy. axx is not a general-purpose assembler in the sense of "widely usable", but a general assembler in the sense of "common to everything".
 
 ### 3.2 Tokenizer-less character-level matching
 
-axx has no lexical analyzer; it matches patterns character by character. This is a deliberate design decision rather than an implementation shortcut. To handle syntax in which mnemonics contain symbol sequences — and real ISAs contain many register names and mnemonics with `.`, `$`, or `%` — it is advantageous not to fix the notion of a token in advance.
+axx has no lexical analyzer; it matches patterns character by character. This is a deliberate design decision: to handle syntax in which mnemonics contain symbol characters (real ISAs have many register names and mnemonics containing `.`, `$` or `%`), it is better not to fix the notion of a token in advance.
 
-The convention is simple. Uppercase letters, digits, and symbols in the pattern file are treated as character constants (uppercase matches both cases on the assembly line), while a name starting with a lowercase letter (`a`, `var1`, `var_2` — all read by the same rule) is a variable to which the value of the symbol at that position is assigned. Prefixing `!` assigns the value of an integer expression, `!!` an integer factor, and `!F` / `!D` / `!Q` the value of a 32/64/128-bit floating-point expression. All unassigned variables are initialized to 0. With only this minimal convention in place, the decision of where lexis ends and syntax begins is left to the pattern author.
+The conventions are simple. In a pattern file, uppercase letters, digits and symbols are character constants (an uppercase letter matches both upper and lower case in the assembly line), and a name beginning with a lowercase letter (`a`, `var1` and `var_2` all follow the same rule) is a variable bound to the value of the symbol at that position. Prefixing `!` binds an integer expression, `!!` an integer factor, and `!F` / `!D` / `!Q` the value of a 32/64/128-bit floating-point expression. The current version adds `!L`, which also keeps the source spelling of an expression; `!E` for enumerated operand lists; `!Y`, which captures the index of an item in a set; and `!S` for referring to subtables (Section 3.6, Section 6). All unbound variables are initialized to 0. Given only these minimal conventions, deciding where the boundary between lexis and syntax lies is left to the pattern author.
 
 ### 3.3 The character set itself is configurable
 
-A consequence of the tokenizer-less design is that even the question "which characters constitute an identifier?" is declared from the pattern file. `.symbolc` specifies the character set used for symbols and `.labelc` that used for labels (the defaults are alphanumerics plus `_%$-~&|`, and alphanumerics plus underscore and period, respectively). This mechanism is why MIPS register notation such as `$s5` and `$v0` can be written as ordinary symbols without special-casing. That even the lexical rules are not fixed in the processing system is a consistent extension of the free-syntax design.
+A consequence of the tokenizer-less design is that even "which characters make up an identifier" can be declared from the pattern file. `.symbolc` extends the character set used for symbols, and `.labelc` the character set used for labels. This is how MIPS register notations such as `$s5` and `$v0` can be written as symbols without special treatment. That even lexical rules are not fixed by the implementation is a consistent extension of the free-syntax design.
 
 ### 3.4 Order-independent matching via a specificity score
 
-In a pattern file, directives such as `.setsym` are order-dependent, but the patterns themselves are not. This is achieved by automatic ordering based on the specificity score tuple `(n_expr, -n_lit, n_sym)`, which frees pattern authors from the implicit burden of conventional table-driven assemblers — that of writing more specific patterns first. The pattern evaluation ordering problem has been solved by extending this specificity-score-based automatic ordering to general pattern matching.
+In a pattern file, directives (`.setsym` and so on) are order-dependent, but patterns themselves are not. axx does not stop at the first matching pattern; it assigns a specificity tuple `(n_expr, -n_lit, n_sym)` to every pattern that matches and selects the smallest. That is, the pattern with the fewest expression captures wins; ties go to the one with the most literal characters matched, then to the one with the fewest symbol captures.
 
-### 3.5 Symbols and pre-checking
+```
+MOV A,!d :: 0xAA,d
+MOV A,B  :: 0xBB
+```
 
-Symbols are defined with `.setsym::name::value`. Redefinition of the same name takes the later definition, and this is used to express naturally, through ordering within the pattern file, situations in which the same character carries different values in different contexts (such as the Z80 register `C` and the condition flag `C`).
+Swapping these two lines does not change the result. Pattern authors are freed from the implicit burden of table-driven assemblers: "write the more specific pattern first". This matters most in large pattern files such as x86_64, where special cases sit far from the general rules they override.
 
-Additionally, `.check::x::r1,r2,r3` restricts, by enumeration, which symbols may appear at the position of variable x. This is a mechanism equivalent to type checking of register classes, and it makes it possible to write unambiguously separate patterns for register groups that serve the same role at different widths, such as `AL`/`BL` versus `AX`/`BX`:
+### 3.5 The symbol system — numbers, strings, arrays and sets
+
+`.setsym::name::value` is a single directive that defines different kinds of symbol depending on how the value field looks.
+
+| Value field | Defines |
+|---|---|
+| `0x20`, `#OTHER+1` | numeric symbol |
+| `"LD"` | string symbol (for text templates) |
+| `[1,"A",#B]` | array symbol |
+| `r0,r1,r2` | set |
+| `a&b`, `a\|b`, `a^b`, `a+b`, `a-b` | set computed from other sets |
+
+A later definition of the same name overrides an earlier one, which lets a situation in which "the same characters have different values depending on context" (such as the Z80 register `C` and the condition flag `C`) be expressed naturally through the order of description in the pattern file.
+
+Sets can be combined by intersection, union, symmetric difference and difference, and each result is kept as an independent copy. Because a register class can be defined by set operations, as in "general registers minus the stack pointer", operand constraints appearing in a specification can be transcribed in the form they take there. Importantly, the set interpretation is tried before the numeric one, but a field that cannot be a set always falls back to the numeric reading as before, so the meaning of existing pattern files does not change.
+
+### 3.6 Constraining and capturing positions
+
+On top of the symbol system sit mechanisms for constraining and capturing operand positions.
+
+`.check::x::r1,r2,r3` restricts which symbols may appear at the position of variable x. This is equivalent to type checking of register classes, and it makes it possible to write groups of registers with the same role but different widths — `AL`/`BL` and `AX`/`BX` — as separate patterns without ambiguity.
 
 ```
 .check::s::AL,BL
@@ -77,37 +106,69 @@ MOV s,!a  :: 0xb0|s,a
 MOV t,!a  :: 0xb8|t,a,a>>8
 ```
 
-Resolving hard-to-structure parts of an ISA by enumeration is a consistent policy throughout axx.
+`.map::x::R0,R1,R2,R3::1<<x` combines giving values to a list of names and the `.check` for that position into one line. `.enum` captures register *lists* (including `-` ranges) such as those of the 68000 `MOVEM` and folds their composition into a single value. `.sub` gathers the alternatives that may appear at a position into a named *table of patterns*, referred to by `!S{{name}}variable`. Whereas `.check` restricts a symbol, a subtable lets a pattern stand at that position.
+
+The symbol capturer `!Yset[variable]`, added in the current version, reads one item name of a set at that position and binds its *index* to the variable.
+
+```
+.setsym::x::AX,BX,CX
+ENC !Yx[z] :: 0x40|z
+```
+
+Whereas `.check` merely restricts a position, `!Y` restricts it and also passes on "which one it was". Because the lookup runs from name to index and from index to name, two sets with the same ordering let one spelling be mapped onto the other. This plays a central role in the source-to-source translation of Section 6.
+
+Finally, `.free` releases the given names from every table the pattern layer holds, so that a name can be reused without remembering which directive defined it. It keeps things hygienic when large pattern files are combined as modules.
+
+The consistent policy of axx is that the parts of an ISA that resist structuring are resolved by these enumeration and capture mechanisms.
 
 ## 4. Isolating Computational Power — A Declarative Core and Computation That Must Be Asked For
 
-The pattern notation of axx is itself Turing incomplete. The control constructs available in `binary_list` are limited to five: assignment (`:=`), the ternary operator, the `;` prefix modifier (no output when the value is 0), alignment, and `@@[]` (repetition).
+The pattern notation of axx itself is Turing incomplete. binary_list has only five control constructs: assignment (`:=`), the ternary operator, the `;` prefix, alignment, and `@@[]` (repetition).
 
-This is a design choice, not a deficiency in capability. If the notation itself were Turing complete the whole DSL would become a *program*, and the guarantee that pattern matching terminates would be lost. Processor architectures can be made arbitrarily complex if one chooses; a Turing-complete description language could follow them anywhere, but at the cost of turning the pattern file from declarative data into code. axx chose "being declarative data" and "guaranteed termination."
+This is a design choice, not a lack of capability. Making the notation Turing complete would turn the whole DSL into a "program" and lose the guarantee that pattern matching terminates. Processor architectures can be made arbitrarily complex if one so chooses; a Turing-complete notation could follow any architecture, but at the cost of the pattern file becoming code rather than declarative data. axx chose to remain declarative data with guaranteed termination.
 
-The current version, however, does not leave that choice as a constraint with no way out. When — and only when — a `binary_list` element is written as `.call name(arguments, ...)`, control passes to a function of the mini language defined by `.func::name::parameters ... .endfunc`. The mini language is a Turing-complete procedural language with assignment, `.if`/`.elif`/`.else`/`.endif`, `.while`, `.for ... in range(...)`, recursion and growable arrays; the values it passes to `.emit` become the words at that position. For debugging there is `.echo`, which mixes string literals and values on one line of stderr and never affects the output.
+The current version does not, however, make this choice an inescapable constraint. Only when an element of binary_list is written as `.call name(args, …)` does control pass to a function in the mini language defined by `.func` … `.endfunc`. The mini language is a Turing-complete procedural language with assignment, `.if`/`.elif`/`.else`/`.endif`, `.while`, `.for`, recursion and variable-length arrays; values passed to `.emit` become the words at that position. When it detects an out-of-range value or the like, it can report an error code with `.raise`, and `.echo` provides debugging output that does not affect the result. Labels, the location counter and `.setsym` symbols can be read through the assembler's own expression evaluator.
 
-What matters is that this computational power is not mixed into the pattern notation. Computation appears only as a separate language, called by name, when the author explicitly writes `.call`. Matching still terminates as before, and an instruction that can be written declaratively stays declarative and stays on one line. Whether to step into unbounded computation is a per-line decision, not a property of the pattern file as a whole. Termination on the mini-language side is secured not by the language specification but by resource limits (Section 5.2).
+```
+BR !t :: .call rel8(t)
 
-ISAs outside the scope of axx still exist, but the reason is the reduction claim itself rather than computational power. The following three lie outside the model in which instructions correspond one-to-one with machine code, so no amount of added computational power would reach them:
+.func rel8(target)
+d = target - $.
+.if d < -128 || d > 127 .then
+.raise 2
+.endif
+.emit(d & 0xff)
+.return
+.endfunc
+```
 
-| Processor | Reason it is out of scope |
+As a real example, the AArch64 logical immediate requires a search that decomposes a bitmask into `N:immr:imms`, an encoding hard to express with a fixed expression. The bundled `aarch64_logical_mini.axx` writes it in the mini language and fits the whole instruction group into 86 pattern lines.
+
+What matters is that this computational power is not mixed into the pattern notation. Computation appears only as a separate language called by name, when the author explicitly writes `.call`. Matching terminates as before, and instructions that can be written declaratively remain declarative single lines. Whether to step into unbounded computation is a per-line choice, not a property of the pattern file as a whole.
+
+In the current version the mini language has gained one more entry point besides binary_list. When writing ELF, write-back into fields in REL format (`.elfencode`) and the construction of `r_info` (`.elfrinfo`) can be delegated to functions written in the pattern file (Section 7). Here too, computation appears only as functions declared by name, and the ELF-writing code itself stays ignorant of the machine. This shows that the principle of isolating computational power is applied consistently even outside encoding.
+
+ISAs outside the scope still exist, but the reason lies in the reduction thesis itself, not in computational power. The following three lie outside the model of "one-to-one correspondence between instructions and machine code", so no amount of added computational power reaches them.
+
+| Processor | Why it is out of scope |
 |---|---|
-| Mill CPU | Belt architecture |
-| ZISC | No instructions |
-| Thinking Machines | Massively parallel |
+| Mill CPU | belt architecture: operand references depend on execution history |
+| ZISC | there are no instructions |
+| Thinking Machines | massively parallel; there is no per-instruction encoding to target |
 
-Documenting the boundary of applicability as part of the specification stands as an honest contrast to tool designs that tend to advertise universality.
+The current technical manual also documents implementation limits explicitly. Machines whose smallest addressable unit exceeds 64 bits and non-binary machines such as the ternary Setun are not handled, and conversion of floating-point data is limited to IEEE 754 formats (half to quadruple precision). Stating the boundaries of applicability as specification, in terms of both the model and the implementation, is an honest contrast to tool designs that tend to proclaim themselves "universal".
 
 ## 5. The Three-Layer Architecture — Macro Layer, Pattern Layer, Mini Language
 
-The current version of axx consists of three layers of differing character.
+The current version of axx consists of three layers of different character.
 
-1. **The macro layer.** A source-to-source transformation stage that runs before the source is handed to the assembler proper. With `!def`/`!if`/`!while` it is syntactically capable of general computation.
-2. **The pattern layer.** The declarative core that performs matching and encoding. Its notation is Turing incomplete, and matching always terminates.
-3. **The mini language.** A procedural language invoked from `.call` in the middle of encoding. Turing complete.
+1. **Macro layer.** A source-to-source transformation stage that runs before the source reaches the assembler proper. It has `!def`/`!if`/`!while` and is syntactically capable of general computation.
+2. **Pattern layer.** The declarative core responsible for matching and encoding. Its notation is Turing incomplete, and matching always terminates.
+3. **Mini language.** A procedural language called by name during encoding (and during ELF writing). Turing complete.
 
-What this paper regards as significant, in relation to the design decision of Section 4, is that both layers carrying computational power are added **as separate layers, independent of the pattern layer**, leaving the declarativeness of the pattern layer itself intact. The macro layer sits before reading and the mini language at the point of encoding, and each is started only when an explicit notation is written — a statement beginning with `!`, or `.call`. Both are implemented with identical specifications in `axx.py` and `caxx.c`.
+The important point is that both layers with computational power are added **as layers separate from the pattern layer**, so the declarativeness of the pattern layer itself is preserved. The macro layer sits before reading and the mini language at encoding time, and each is activated only when an explicit notation is written (a statement beginning with `!`, a `.call`, or a function named in a declaration). Both are implemented to the same specification in `axx.py` and `caxx.c`.
+
+The practical effect of the macro layer is substantial. The x86_64 pattern set through AVX-512 is 23,923 lines when written flat, but `x86_64m.axx`, written with macros, is 5,787 lines — about a quarter — and expands at load time into a byte-for-byte identical pattern set. AArch64 (2,068 lines → 9,387), Power ISA (452 → 4,774) and the whole of RISC-V (2,186 → 4,137) are likewise written with the macro layer.
 
 ### 5.1 Syntax
 
@@ -115,101 +176,203 @@ Every statement begins with `!` at the start of a line.
 
 | Syntax | Meaning |
 |---|---|
-| `!def name(p1, p2, p3 = default) { ... }` | Macro / compile-time function definition |
-| `!return expr` | Return value; also an early exit from the body |
-| `!if expr !then { ... } !elif ... !else { ... }` | Conditional branching |
-| `!while expr { ... }` | Loop |
-| `!break` / `!continue` | Loop control |
-| `!set` / `!local` / `!undef` | Assign, declare, delete a variable |
-| `!include "file"` | Text inclusion at macro-expansion time |
-| `!error` / `!warning` / `!echo` | Abort expansion / diagnostic output |
+| `!def name(p1, p2, p3 = default) { ... }` | macro / compile-time function definition |
+| `!return expr` | return value; also exits the body early |
+| `!if expr !then { ... } !elif ... !else { ... }` | conditional |
+| `!while expr { ... }` | loop |
+| `!break` / `!continue` | loop control |
+| `!set` / `!local` / `!undef` | assign, declare, delete a variable |
+| `!include "file"` | textual inclusion at expansion time |
+| `!error` / `!warning` / `!echo` | abort expansion / diagnostics |
 
-Embedding into text is done with `!{expr}`, or `!{expr:04x}` with Python-style formatting. Values are limited to integers and strings, and operators follow C (with `/` and `%` truncating toward zero). Built-in functions include `len`, `hex`, `str`, `int`, `upper`, `lower`, `substr`, `abs`, `min`, `max`, `uid`, `label`, and `defined`; within a macro, `__id__` (unique per invocation, for generating local labels) and `__name__` are implicitly defined.
+Values are interpolated with `!{expr}`, and with Python-style format specifications as `!{expr:04x}`. Format specifications follow Python's format mini-language; both implementations accept the same specifications and reject the same ones. Values are limited to integers and strings, and operators follow C (`/` and `%` truncate toward zero). Inside a macro, `__id__`, unique per call (for generating local labels), and `__name__` are implicitly defined.
 
 ### 5.2 A different approach to termination
 
-Because the macro layer has `!while` and recursion, it is syntactically capable of general computation. However, limits are imposed on execution resources: exceeding 200 levels of recursion, 1,000,000 `!while` iterations, 2,000,000 generated lines, or 64 levels of `!include` nesting raises an error and aborts the remainder of the expansion. The mini language is the same: exceeding 4,000,000 executed statements per `.call`, 128 levels of call nesting, 1,048,576 emitted words, or an array length of 1,048,576 raises an error that names the offending line. In these two resource-bounded layers, termination is thus secured not by *removing expressive power from the language* but by *bounding its resources*.
+Because the macro layer has `!while` and recursion, it is syntactically capable of general computation. However, resource limits are imposed on execution: exceeding 200 levels of recursion, 1 million `!while` iterations, 2 million generated lines or 64 levels of `!include` nesting raises an error and aborts further expansion. The mini language is similar: exceeding 4 million executed statements, 128 levels of call nesting, 1,048,576 output words or an array length of 1,048,576 per `.call` raises an error pointing at the offending line. In these two layers, termination is secured not by "cutting down the expressiveness of the language" but by "imposing resource limits".
 
-Here lies the point of the three-layer architecture. The pattern layer remains declarative data and guarantees the termination of matching as a property of the language specification, while the portions that require computational power are isolated into separate layers — the preceding source-to-source transformation, and a mini language called by name during encoding — each protected by resource limits. The choice of a declarative core described in Section 4 has not been retracted by the addition of these layers; it has been preserved with its scope of influence separated. This reading is the assessment of the present paper, though the fact that the layers adopt different means of guaranteeing termination is stated explicitly in the documentation.
+Herein lies the meaning of the three-layer architecture. The pattern layer remains declarative data and guarantees termination of matching as a property of the language. The parts that need computational power are isolated in separate layers — a preceding source-to-source transformation and a mini language called by name — which are protected by resource limits. The choice of a "declarative core" described in Section 4 has not been withdrawn by adding these layers; it has been preserved by separating their scope of influence.
 
 ### 5.3 Reading assembler-side values, and how convergence is secured
 
-In the current version the macro layer can read values from the assembler proper, in source files (`.s`) only. Label values and `.equ` definitions are read through bare identifiers (a macro variable is looked up first, and a label only if none is found), names that cannot be written as macro identifiers are read through `label("...")`, and the location counter is read as `$` / `$$`. Pattern-file macros run before any source is assembled and are therefore excluded; there `$` / `$$` raises an explicit error. The declarative pattern layer itself is untouched by this change.
+In the current version, the macro layer can read values from the assembler proper, on the source side (`.s`) only. Label values and `.equ` definitions are read as bare identifiers, names that cannot be written as macro identifiers through `label("...")`, and the location counter through `$` / `$$`. Macros on the pattern-file side run before the source is assembled and so are outside this facility; the declarative pattern layer itself is unaffected.
 
-What can be read is not "the current value". Macro expansion runs before addresses are settled, so no such value exists at that point. What is actually read is the value obtained in the *previous relaxation iteration*; on the first iteration nothing is known yet, so labels read as 0, `defined()` is false, and `$` / `$$` are 0. Labels can be looked up by name, but `$` / `$$` are determined by position, so they are resolved against the previous iteration's record keyed by "which line of the expanded output this is".
+What can be read here is not "the current value". Macro expansion runs before addresses are fixed, so at that moment the value does not exist in principle. What is actually read is the value obtained in *the previous relaxation iteration*; in the first iteration, labels are 0, `defined()` is false and `$` / `$$` are 0.
 
-What this design gives up is precisely what the earlier version of this section called a guarantee: the idempotence of expansion. Once the expanded result depends on label values, expansion is no longer a function of the source text alone and may differ from one iteration to the next. The macro layer has ceased to be a pre-pass that runs once before assembly and has become a participant in the relaxation fixed-point iteration.
+What this design gives up is the idempotence of expansion. Since the result of expansion depends on label values, expansion is no longer a function of the source text alone and may change from iteration to iteration. The macro layer has become not "a preceding stage that runs once before assembly" but a component participating in the relaxation fixed-point iteration.
 
-Securing convergence accordingly moves from a guarantee by construction to detection at run time. The relaxation loop caps the number of iterations, treats a matching label layout across iterations as convergence, detects periodic oscillation, and, if it does not converge, terminates with an error without writing an output file. The important point is that this is not a safety net newly added for the present change. The mechanism already existed for the very same problem axx has carried from the beginning: forward references to variable-length instructions. What the change increases is not the class of hazard but its entry points. Previously only a source containing forward references could fail to converge; now the way a macro is written can produce non-convergence as well. In either case, an incorrect binary is never emitted silently.
+The securing of convergence thus moves from a structural guarantee to run-time detection. The relaxation loop has an upper bound on iterations, judges convergence when label placement agrees between iterations, detects periodic oscillation, and if it fails to converge, exits with an error without writing the output file. This is not a newly added safety net: the mechanism already existed for the problem axx had from the start — forward references in variable-length instructions. What the change added is not a new kind of danger but a new entry point to it. In either case, a wrong binary is never silently written.
 
-In relation to Sections 4 and 5.2, termination and convergence are now secured at three levels. Matching in the pattern layer is secured as a property of the language specification (through the Turing incompleteness of the notation), an individual macro expansion and a mini-language run by resource limits, and the *sequence* of expansions by the relaxation fixed point. That the first two are static guarantees while only the third is run-time detection is an asymmetry in the design worth stating explicitly. The earlier restriction on references was the choice that obtained this third one for free; lifting it was possible only because the run-time detection mechanism was already in operation beforehand.
+Termination and convergence are now secured in three tiers: matching in the pattern layer by the language specification, individual macro expansions and mini-language executions by resource limits, and the sequence of expansions by the relaxation fixed point. The first two are static guarantees, while only the third is run-time detection; this design asymmetry deserves to be stated explicitly. It is also given a semantic position by the bundled `axxsemantics`, which formalizes relaxation as a fixed point over label environments.
 
 ### 5.4 Semantics across the two implementations
 
-`axx.py` and `caxx.c` share identical specifications for the macro layer; the only difference is numeric representation. The Python version uses arbitrary-precision integers and the C version uses `int64`, so results differ only when a macro-time computation exceeds 64 bits. Since the macro layer emits source text, this difference does not propagate into the 256-bit expression evaluation of the assembler proper. Making the location and reach of the divergence explicit is practically important for maintaining a two-implementation arrangement.
+`axx.py` and `caxx.c` implement the same specification for the macro layer; the only difference is numeric representation. The Python version uses arbitrary-precision integers and the C version `int64`, so results differ only when macro-time computation exceeds 64 bits. Because the output of the macro layer is source text, this difference does not propagate into the assembler's own 256-bit expression evaluation. That the location and reach of the difference are documented is practically important for maintaining two implementations.
 
 ### 5.5 Current limitations
 
-Assembler-level `.include` directives bypass the macro layer, so `!include` must be used to import macro definition files. Interactive mode (when no source file is specified) also bypasses the macro layer. Notations that combine a ternary operator with a format specifier, such as `!{a ? b : c:04x}`, cannot currently be parsed. Output for sources containing no macros is identical to previous behavior, so backward compatibility is preserved. `--no-macro` disables the layer entirely, and `-P` emits only the expanded result. Note that `-P` performs no assembly, so the assembler-side values described in Section 5.3 are all unsettled (labels read as 0); the result does not match the expansion performed during an actual assembly.
+The source-side `.include` does not pass through the macro layer, so `!include` must be used to bring in macro definition files (the pattern-side `.include` does pass through the layer). Interactive mode (when no source file is given) bypasses the macro layer. A notation combining the ternary operator with a format specification, such as `!{a ? b : c:04x}`, cannot currently be parsed. Output for sources without macros is identical to before, so backward compatibility is maintained. `--no-macro` disables the whole layer, and `-P` / `-p` output only the expansion of the source side and pattern side respectively. Note, however, that `-P` does not assemble, so all assembler-side values are expanded as undetermined, and the result does not match the expansion during actual assembly.
 
-## 6. Demonstrated Extensibility
+## 6. Two Kinds of Output — Binary and Text
 
-Evidence that a minimal core has been carved out correctly is that later extensions can be added without changing the core. In axx, the following demonstrate this.
+### 6.1 Text templates
 
-**VLIW/EPIC support.** A declaration such as `.vliw::128::41::5::00` specifies bundle bit count, instruction bit count, template bit count, and NOP code; with only a few added notations — `!!` (instruction concatenation), `!!!` (number of concatenated instructions), and `!!!!` (stop bit) — VLIW processors including Itanium-style EPIC are handled. A positive template bit count places the template at the right end and a negative one at the left end, with the bit count taken as the absolute value. The exclusion clause of the reduction claim in Section 2 ("except EPIC/VLIW") is thereby recovered through extension.
+In the current version, an element of binary_list can be a double-quoted string instead of an expression. Inside the string only the parts enclosed in `{{ }}` are evaluated: `{{e}}` (decimal), `{{.hex(e)}}`, `{{.bin(e)}}`, `{{.float(e)}}` (128-bit floating point, 34 significant digits), references to string and array symbols, and `{{.exp(x)}}`, which emits an expression captured by `!L` exactly as it was spelled in the source.
 
-**Non-8-bit word widths.** A declaration such as `.bits::12` handles bit-slice processors and processors whose machine-code words are not byte-sized (4-bit, 11-bit, 12-bit, and so on), including endianness specification. Output is emitted in 8-bit units, with surplus bits masked to 0. When `.bits` is specified, addresses are counted in words.
+```
+MOV R!r,!e:: "LD R{{r}},0x{{.hex(e)}}"
+```
 
-**Floating-point immediates.** `!F` (32-bit), `!D` (64-bit), and `!Q` (128-bit) evaluate floating-point expressions as integer bit patterns. An instruction such as ARM64's `vmov.f32 s0,#3.14` can be described by a single-line pattern.
+This one line rewrites `MOV R1,0x10` into `LD R1,0x10`. The same text is also emitted as binary, one byte per word, and the location counter advances accordingly, so labels after a line that emits text are still placed correctly. With `-V`, the assembled text is streamed as-is to standard output. The pattern file has become, at the same time as a binary generator, a **source-to-source translator**.
 
-**Optional parts.** Portions of an `instruction` enclosed in `[[ ]]` become optional, and the variable's initial value of 0 is used when they are omitted. This mechanism is why the Z80's `inc (ix)` and `inc (ix+d)` fit on one line.
+### 6.2 Text replacement mode
 
-**Sub tables.** `.sub::name ... .return` groups "the alternatives that may appear at this position" into a named table. Referencing it from an `instruction` field as `!S{{name}}variable` splices each entry's pattern into that position for matching, and binds the matched entry's value to that variable. Where `.check` restricts a position to one *symbol*, a sub table lets that position be a *pattern*. An entry's pattern may itself capture, and a table may reference other tables (nesting). Tables may be referenced before they are defined; misspelled names and circular references are reported once, when the pattern file is read.
+`.textmode` sets up translator use with a single directive. It turns on `.passthru`, which passes through lines that match no pattern, and `.eol`, which makes one source line into one output line; in addition, it does not treat undefined labels in expressions captured by `!L` as errors, and it carries the source's `;` comments and leading indentation over to the rewritten text. Only the lines to be rewritten need patterns; the rest flows through verbatim.
 
-**Custom operators.** The expression language integrates operators specialized for binary generation: the prefix `@` returning the position of the most significant bit of a value (the Hebimarumatta operator), the binary `'` performing sign extension from an arbitrary bit position (the SEX operator), `#` for symbol value reference, and `*(x,y)` taking the n-th byte from the least significant end. These make it possible to fit addressing-mode encoding into a single-line expression — for example, the scale-value bit position computation `((@h)-1)<<6|t<<3|s` in the x86_64 LEAQ instruction.
+The bundled `8080toz80.axx` translates Intel 8080 source into Zilog Z80 notation, and `intel2att.axx` translates x86-64 Intel syntax into AT&T syntax. The latter combines spelling maps built from sets and `!Y` with pattern generation in the macro layer; its 60 lines expand into 3,437 patterns. The translated output passes through GNU as.
 
-## 7. Implementation and Practicality
+### 6.3 Significance
 
-axx has a Python implementation (axx.py, nicknamed Paxx) and a C implementation (caxx.c, nicknamed Caxx), and runs on FreeBSD and Linux. The C version is faster, while feature additions land first in the Python version.
+What this extension shows is that the right-hand side of the reduction thesis, `binary_list`, is not limited to "machine code". The structure — match the syntax of an instruction and assemble another representation from the captured values — is the same whether the output is a byte sequence or text. axx achieves this extension without changing either the declarativeness or the Turing incompleteness of the pattern layer. As Section 12 explains, it is also a partial realization, on the current core, of the direction the author sketched in the axx2 concept: "add string literals and string operations to binary_list, enabling translation between assembly languages".
 
-Beyond a research core, the following have been achieved on the practical side. ELF64 relocatable object output (`-o`) works primarily for x86-64, and `-m` specifies the e_machine value for header generation targeting AArch64, RISC-V, i386, PPC, ARM, and others. External symbol linkage via `.global` / `.extern`, export/import of label and section information in TSV format (`-e` / `-E` / `-i`), and generation of DWARF debug information (.debug_info / .debug_abbrev / .debug_line) via the `-g` option together enable source-level debugging in gdb/lldb. The generated objects have been verified to link with both GNU ld and LLVM's ld.lld, and the work has reached the point of calling C library functions and creating shared objects.
+## 7. The Generalization of ELF
 
-The execution platform is likewise system-independent. A trailing `chr(13)` in DOS-format files is ignored, and it should run on any system where Python runs.
+### 7.1 Principle: the code that writes ELF does not know the machine
 
-That an abstract conception — the "general assembler" — has acquired a concrete outlet connecting it to an actual toolchain is important as evidence of the conception's reality.
+At the time of the previous edition, ELF64 relocatable object output via `-o` worked mainly for x86-64. In the current version this has been generalized to any CPU. The key to the design is splitting the knowledge needed to build an ELF into two parts and placing each where it belongs.
 
-## 8. Position in the Lineage
+- **Machine-dependent knowledge** — relocation types, ELF class, RELA/REL, ELF header fields, section header attributes, the shape of fields within instruction words, paired and accompanying relocations, the layout of `r_info`, the unit of addends, section groups, and CIE fields for CFI. These are declared in the **pattern file**.
+- **Program-dependent knowledge** — symbol type, size, binding, visibility, common symbols, and per-function CFI (`.cfi_*`). These are declared in the **source file**.
 
-The idea of a table-driven assembler, or of a meta-assembler, has precedents in computing history: the meta-assemblers of the 1960s, and in the present day LLVM's instruction descriptions via TableGen belong to a related lineage. Within that lineage, the distinctiveness of axx lies in the following three points.
+The code that writes ELF contains no processing that branches on the machine number. axx has built-in tables for eleven machines — i386, M68K, PowerPC, PowerPC64, s390x, ARM, SuperH, SPARCV9, x86-64, AArch64 and RISC-V — but these are merely declarations written in advance, and with `.elfbuiltin::0` an ELF can be built from declarations alone without using the tables. `--elfdesc` writes out the effective description, combining built-in tables and declarations, in the form of pattern-file declarations. The implementation itself thus provides a way to confirm that tables and declarations have the same expressive power.
 
-First, the granularity and freedom of description. Whereas TableGen is a description language tightly coupled to a C++ backend, the pattern file of axx is free-syntax text completely separated from the processing system, and can be written to look almost isomorphic to the instruction table in a specification document.
-A tokenizer-less DSL with free-form syntax is unprecedented. 
-Second, the explicit adoption of Turing incompleteness. Many existing meta-assemblers moved toward general computational power as an extension of their macro facilities; axx moved in the opposite direction, toward minimality and a termination guarantee, and split the part requiring computational power into a separate layer. Third, order-independent pattern matching. The "care about definition order" implicitly demanded by table-driven approaches is made unnecessary by the specificity score.
+### 7.2 The vocabulary of declarations
 
-As the author himself states, the purpose of axx is not adoption as a tool but the presentation of an academic insight: that every imperative assembly language can be compressed into a single pattern form. axx is positioned one layer below an ordinary assembler — as a tool of the meta-layer that defines assemblers.
+The declarations are designed as a small vocabulary corresponding one-to-one with the individual elements of ELF.
 
-## 9. Significance in the Age of AI
+| Declaration | Describes |
+|---|---|
+| `.elftype` | name, number and field width of a relocation type, and whether it is PC-relative |
+| `.elfclass` / `.elfrela` / `.elfheader` | ELF32/64, RELA/REL, ELF header fields |
+| `.elfsection` / `.elflink` / `.elfgroup` | section type, flags, alignment and entry size; `sh_link`/`sh_info`; COMDAT groups |
+| `.elffield` | bit fields within instruction words (mask, offset, shift, adjustment) |
+| `.elfencode` | function that writes back into a field in REL format (mini language) |
+| `.elfextra` / `.elfdiff` | paired and accompanying relocations; sums and differences of labels |
+| `.elfrinfo` | construction of `r_info` (mini language) |
+| `.elfunit` | unit of addends and symbol values (byte/word) |
+| `.elfcfi` / `.elfcfiinit` / `.elfcfireg` | CIE and initial instructions of `.eh_frame`, register names |
 
-Creating pattern files for large ISAs is laborious for humans, but the conversion from specification document to pattern file is transcription work in a fixed format, and therefore well suited to AI. Once created, a pattern file is a finished artifact for that ISA and can be reused. If assemblers were originally born to make machine code easier for humans to understand, then in an era where AI writes code, an intermediate representation layer in the form of a generalized assembler addressed to both humans and machines gains in significance. Because pattern files and source files are separated, generating machine code for different processors from a common source is possible in principle, which suggests applicability as a simple retargetable code-generation substrate.
+With these, the same writing code handles not only RELA machines such as x86-64 and AArch64 but also ARM and MIPS32, which embed addends back into instruction fields under REL; MIPS64 n64, which packs three types into `r_info`; RISC-V, which attaches `R_RISCV_RELAX` for linker relaxation and expresses label differences as `ADD`/`SUB` pairs; and even a hypothetical machine with 16-bit words and word addressing. MSP430 and MN10300, which have no built-in tables, also produce ELF from pattern-file declarations alone. The priority of relocation types is defined as "built-in table < pattern file < source file", and type names can also be specified from the source side via `.reloc` / `.extern` / `.global`.
 
-## 10. Future Work — The axx2 Concept
+ELF32 or ELF64 can be chosen with `-f` independently of `-m`, and `-g` adds DWARF (`.debug_info` / `.debug_abbrev` / `.debug_line`). Writing the same `.cfi_*` directives as GNU as in the source builds `.eh_frame`. There is no limit on the number of sections; when it exceeds `SHN_LORESERVE`, axx follows the ELF convention of using `.symtab_shndx`.
 
-The author has published a concept for a next-generation version, axx2. It would migrate the description language for pattern files from a pattern-data form to a more descriptive, multi-line metalanguage, renaming `binary_list` to `object_list` and the pattern file to the processor specification file. Introducing string literals, string operations, and control statements would bring intermediate-language generation and assembly-language-to-assembly-language converters into view. In that case the pattern file side would become Turing complete and even Lisp machines would in principle be tractable, but self-reference checking would become necessary, and infinite loops inside the processing system would make debugging difficult. The author's view is that confining evaluation to within the pattern file preserves debuggability while allowing loop and branch structures.
+### 7.3 Verification
 
-The part of that concept concerned with introducing loops and branches into the pattern file and confining evaluation within it has since been realized ahead of the rest, as the mini language of the current version (Section 4). Rather than migrating the whole description language to a metalanguage, it leaves the existing pattern notation declarative and calls out with `.call` only where computation is required. To the concern about debugging infinite loops, the answer taken is to stop at the point a resource limit is exceeded and name the line responsible.
+The correctness of the generalization is backed by comparison with external toolchains. For the bundled test fixtures, the outputs for ARM (REL instruction fields), RISC-V (paired relocations, COMDAT, `SHF_LINK_ORDER`, label differences and CFI after linker relaxation), MIPS32 (write-back of `R_MIPS_HI16`, `.text` after linking), MIPS64 (`r_info`) and x86-64 (`.eh_frame`) have been confirmed to match those of llvm-mc / ld.lld. Among the practical pattern files, PowerPC64 ELF objects link with GNU ld using the relocations of the 64-bit PowerPC ABI (`REL24`, `REL14`, the `@l` / `@ha` / `@high` / `@highest` family, `D34` / `PCREL34`), and RISC-V ELF objects link with `ld -m elf64lriscv`.
 
-As for the current version, the pattern-data form is noted as more intuitive, and converting to a descriptive metalanguage would require drastic rewriting. Now that the core is complete, expanding the set of pattern files and adding high-performance macros that translate structured and functional assembly into imperative assembly, together with optimization features, would complete the system — though the author's present assessment is that a project of that size is large for one person to finish.
+### 7.4 How failure is handled, and the scope
 
-## 11. Conclusion
+In the generalization of ELF as well, axx keeps to its policy of **never silently producing something broken**. It emits no relocation for references whose type cannot be determined or for label differences of undeclared width (reporting them with `-d`), warns once when a type name in a declaration cannot be resolved, and treats a missing write-back function or a mismatched argument count as an error. Type numbers that do not fit the default ELF32 `r_info` produce a warning. This is the same attitude as the relaxation of Section 5.3, which writes no output when it fails to converge, and shows the consistency of design across axx as a whole.
 
-The invention of axx converges on three points: a single reduction claim (`instruction :: error_patterns :: binary_list`), a free-syntax pattern language for expressing it, and the design decision to separate computational power from the declarative core. The macro layer and the mini language added in the current version do not retract the third point; they are what gives it concrete form. Computation is isolated into the preceding source transformation and into a separate language that appears only when a name is called with `.call` during encoding, while the pattern layer remains declarative data and continues to guarantee the termination of matching as a property of the language specification. Expressive power has widened as far as Turing completeness by way of the mini language, but the cost is localized into a per-line decision about whether to step into unbounded computation. Letting the macro layer read assembler-side values has given up the secondary guarantee of idempotent expansion, but that burden is carried by an existing run-time mechanism — the relaxation fixed point — and the declarative character of the pattern layer itself is unchanged.
+The output is limited to relocatable objects (`ET_REL`). Generating executables (`ET_EXEC`) or shared libraries (`ET_DYN`) — resolving relocations by per-type formulas and building program headers and dynamic-linking tables — is the linker's job and is deliberately placed outside the scope. When an image with fixed addresses is needed, it can be obtained as a raw binary with `-b`. It is a generalization that correctly confines the assembler's responsibility to the assembler's domain.
 
-That an idea from 1986 was validated by an implementation in 2024, and that extensions — VLIW/EPIC, arbitrary word widths, ELF64 object output, DWARF debug information, and the macro layer — accumulated without altering the design of the core, is a demonstration that the extracted "essence" was correct. The conception of handling everything from homemade processors to supercomputers with a single matching engine redefines the assembler: from an artifact implemented per ISA into a metalanguage processor for describing ISAs.
+## 8. Demonstrated Extensibility
+
+Evidence that the minimal core has been correctly carved out is that later extensions sit on it without changing the core. In addition to Sections 6 and 7, axx demonstrates this with the following.
+
+**VLIW/EPIC support.** Declaring the bundle bit count, instruction bit count, template bit count and NOP code, as in `.vliw::128::41::5::00`, and adding only a few symbols — `!!` (instruction concatenation), `!!!` (number of concatenated instructions) and `!!!!` (stop bit) — handles VLIW processors including Itanium-style EPIC. EPIC patterns take an index code as a fourth field, and the template is determined by the combination of indices. Template bits are placed at the right end if the count is positive and at the left end if negative. The part excluded from the reduction thesis in Section 2 ("except EPIC/VLIW") is recovered by extension.
+
+**Non-8-bit word widths.** A declaration such as `.bits::12` handles bit-slice processors and processors whose machine words are not byte-sized (4, 11, 12 bits and so on, from 1 to 64 bits), endianness included. When `.bits` is set, addresses are in words, and in ELF output `.elfunit::word` makes addends and symbol values word-based as well.
+
+**Floating-point immediates.** `!F` (32-bit), `!D` (64-bit) and `!Q` (128-bit) evaluate a floating-point expression to an integer bit pattern. An instruction such as ARM64's `vmov.f32 s0,#3.14` can be written as a one-line pattern.
+
+**Optional parts.** A part of the instruction enclosed in `[[ ]]` is optional; when omitted, the variable's initial value 0 is used. This is how Z80 `inc (ix)` and `inc (ix+d)` can be written in one line.
+
+**Describing diagnostics.** `.error::n::"text"` gives text to an error code, and `.echo` written on a body line provides debug output for pattern files. Diagnostics, too, are declared on the pattern-file side.
+
+**Original operators.** Operators specialized for binary generation are integrated into the expression language: the prefix operator `@`, which returns the position of the most significant set bit (the Hebimarumatta operator); the binary operator `'`, which sign-extends from an arbitrary bit position (the SEX operator); symbol-value reference `#`; and `*(x,y)`, which takes the y-th byte from the bottom. Integers in expressions and in the mini language wrap around at 256 bits. These make it possible to fit the encoding of addressing modes into a one-line expression (for example, computing the bit position of the scale value in x86_64 LEAQ: `((@h)-1)<<6|t<<3|s`).
+
+## 9. Implementation, Verification and Practicality
+
+### 9.1 Two implementations
+
+axx has a Python implementation (axx.py, nicknamed Paxx, the reference implementation) and a C implementation (caxx.c, nicknamed Caxx), and runs on FreeBSD and Linux. At the time of writing they are about 14,000 and about 20,000 lines respectively. New features land in Paxx first, and Caxx is far faster (assembling hello world against the roughly 24,000 x86_64 patterns finishes in well under a second). The two implementations are maintained with the goal of producing byte-for-byte identical output for the same input.
+
+### 9.2 Cross-checking the two implementations
+
+The bundled `test1` assembles 36 pattern/source pairs with both implementations and compares the raw `-b` binaries with `cmp`. For pairs using `.textmode` it also compares the `-V` text; for the `.echo` pair, the standard-error output; for pairs that verify ELF declarations, the `-o` objects; and for `aarch64.axx` and others, the `--elfdesc` output. The sixteen core pairs are additionally run with `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (listing) and `-V` (text output), for 155 comparisons in all. That two independent implementations continue to agree — from raw binaries through object files, debug information and translated text — is strong evidence that the specification is defined independently of either implementation.
+
+### 9.3 Practical pattern files
+
+The pattern files bundled for practical use now range from legacy CPUs to today's major ISAs.
+
+| ISA | Coverage |
+|---|---|
+| x86_64 | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512 |
+| AArch64 | A64 in general, Advanced SIMD, cryptography, scalar extensions, SVE/SVE2, SME/SME2; GNU-style relocation modifiers |
+| PowerPC64 | Power ISA v3.1 (POWER10), big/little endian; VMX, VSX, quad precision, MMA, prefixed instructions (with a nop inserted before one that would cross a 64-byte boundary) |
+| RISC-V | the whole of RV64: I/M/A/F/D/Q/Zfh/C and derivatives, bit manipulation, scalar crypto, CSRs, privileged and H extension, V 1.0 and its vector crypto, GNU pseudo-instructions |
+| Legacy | Motorola 68000 / 6809 / 6800, MOS 6502, Zilog Z80, Intel 8080 / 8051 / 8048 / 4004 |
+
+PowerPC64 has been checked byte-for-byte against GNU as, and RISC-V against llvm-mc. Demonstrations are also available, such as a Brainfuck virtual CPU and Brainfuck interpreters assembled with axx (AArch64, PowerPC64 and RISC-V versions; the x86_64 version lives in a separate repository).
+
+### 9.4 Connecting to toolchains
+
+The toolchain connections are in place: external symbol linkage via `.global` / `.extern`; ELF symbol attributes on the source side (`.type`, `.size`, `.weak`, `.hidden`, `.protected`, `.comm` and so on); export/import of label and section information in TSV format (`-e` / `-E` / `-i`); and source-level debugging in gdb/lldb through DWARF. Generated objects link with GNU ld and LLVM ld.lld, and have reached the point of calling C library functions and building shared objects.
+
+The execution platform is not tied to any particular system. DOS-style `chr(13)` line endings are ignored, and Paxx runs wherever Python runs.
+
+That the abstract idea of a "general assembler" now has concrete outlets connecting to real toolchains, including major ISAs, is important in demonstrating that the idea is real.
+
+## 10. Position in the Lineage
+
+The idea of a table-driven assembler or meta-assembler itself has precedents in computing history. The meta-assemblers of the 1960s, and in modern times LLVM's TableGen instruction descriptions, CGEN (which generates parts of GNU binutils), and customasm (written in Rust), belong to a related lineage. Within this lineage, the originality of axx lies in the following points.
+
+First, the granularity and freedom of description. Whereas TableGen is tightly coupled to C++ backends and practical targets carry thousands of lines of hand-written C++, axx pattern files are free-syntax text fully separated from the implementation and can be written to look almost isomorphic to the instruction tables in a specification. Whereas CGEN describes the *semantics* of instructions in an RTL-like form, axx describes the correspondence between surface syntax and encoding. A tokenizer-less free-syntax DSL has no precedent.
+
+Second, the explicit adoption of Turing incompleteness. Many existing meta-assemblers moved toward general computational power as extensions of their macro facilities; axx went the opposite way, toward minimality and guaranteed termination, and carved out the parts needing computational power as separate layers.
+
+Third, order-independent pattern matching. The specificity score removes the need for the "careful ordering of definitions" implicitly required by table-driven approaches.
+
+Fourth, the generalization of object output. customasm shares the idea of describing an ISA declaratively, but its output stops at binaries and dump formats, with no relocatable objects. LLVM MC is a production-grade infrastructure handling ELF, COFF and Mach-O, but per-machine object output is implemented as code. axx generates linkable ELF from declarations rather than per-machine code. That a declarative pattern description and a declarative ELF description live together in the same file is unique to axx within this lineage.
+
+As the author himself states, the aim of axx is not its spread as a tool per se but the presentation of an academic insight: that all imperative assembly languages can be pressed into a single pattern form. axx is positioned one layer below ordinary assemblers, as a tool of the meta layer that defines assemblers. The bundled `axxsemantics` formalizes this structure from the standpoint of denotational semantics as a meaning function Assembly Source → Pattern Matching → Environment → Binary → Object, an attempt to describe axx as a meta layer theoretically.
+
+## 11. Significance in the Age of AI
+
+Writing pattern files for huge ISAs is laborious for humans, but converting a specification into a pattern file is a transcription task of fixed form, well suited to AI. Once written, a pattern file is a finished product for that ISA and can be reused. That in the current version enormous instruction sets such as AArch64 SVE/SME2, Power ISA v3.1 and the whole of RISC-V were turned into pattern files in a short time and checked byte-for-byte against external assemblers shows that this prospect has become reality.
+
+If assemblers were originally born "to make machine code understandable to humans", then in an age when AI writes code, the significance of a generalized-assembler layer serving both humans and computers as an intermediate representation is growing. The separation of pattern files and source files makes it possible in principle to generate machine code for different processors from common source, and combined with the source-to-source translation of Section 6, it opens the possibility of application as a simple retargetable infrastructure linking assembly languages with one another.
+
+## 12. Future Work — The axx2 Concept and What the Current Version Has Reached
+
+The author has published a concept for a next-generation axx2. It would move the description language of pattern files from a pattern-data format to a more descriptive multi-line meta-language, renaming binary_list to object_list and the pattern file to processor_specification_file. Introducing string literals, string operations and control statements would bring the generation of intermediate languages and of translators between assembly languages into view. The pattern file would then be Turing complete and could in principle handle even Lisp machines, but self-reference checks would become necessary, and infinite loops inside the implementation would make debugging difficult. The author's view is that confining evaluation to the pattern file would allow loops and branches while preserving debuggability.
+
+The current version has realized two parts of this concept ahead of time, without rebuilding the whole description language.
+
+One is the part "introduce loops and branches into the pattern file and confine evaluation within it", realized as the mini language (Section 4). It keeps the existing pattern notation declarative and calls by name only where computation is needed, and it answers the concern about debugging infinite loops by stopping as soon as a resource limit is exceeded and naming the offending line.
+
+The other is the part "add string literals and string operations to binary_list, enabling translation between assembly languages", realized as text templates and `.textmode` (Section 6). Though binary_list keeps its name, it already has the character of an object_list, in the sense that its output may be either bytes or text.
+
+Regarding the remaining tasks, the author notes that the pattern-data format is more intuitive and that a descriptive meta-language would require a major rewrite. He also considers that high-performance macros translating structured and functional assembly into imperative assembly, optimization features, and pattern files for ARM (A32/T32), MIPS, SPARC, 32-bit PowerPC and RV32 — including validation on real hardware or emulators — are too large for one person to complete, and welcomes collaborators. These are constraints of labour, not of design, and the pattern-file format is fully documented.
+
+## 13. Conclusion
+
+The invention of axx comes down to three points: a single reduction thesis (`instruction :: error_patterns :: binary_list`), a free-syntax pattern language for writing it, and the design decision to separate computational power from the declarative core. The macro layer and mini language added in the current version do not withdraw the third point; they make it concrete. Computation is isolated in a preceding source transformation and in a separate language that appears only when called by name, and the pattern layer remains declarative data, continuing to guarantee termination of matching as a property of the language.
+
+The two milestones reached since the previous edition have greatly widened the reach of this design. The generalization of ELF pushes the principle that "the engine does not know the machine" from instruction encoding all the way to object file generation, making it possible to produce linkable ELF from declarations rather than per-machine code. Text output shows that the right-hand side of the reduction thesis is not limited to machine code, and turns the pattern file into a translator between assembly languages. Both sit on the core without changing its declarativeness or Turing incompleteness, and both share the attitude of "never silently producing wrong output".
+
+The 1986 idea was validated by the 2024 implementation; extensions — VLIW/EPIC, arbitrary word widths, ELF32/64 object output and its machine independence, DWARF and CFI, the macro layer, the mini language and source-to-source translation — have accumulated without changing the design of the core; and today's major ISAs, x86_64, AArch64, PowerPC64 and RISC-V, obtain output on top of it that matches external toolchains. All this demonstrates that the extracted "essence" was correct. The idea of handling everything from homemade processors to supercomputers with a single matching engine has redefined the assembler — from a per-ISA implementation artifact into a meta-language processor for describing ISAs.
 
 ## References
 
 - GitHub repository: https://github.com/fygar256/axx
-- Pattern files for x86_64 / z80 / 8048: https://github.com/fygar256/x86_64_pattern_file_for_axx
+- Technical manual: `Technical_Manual.md` / `Technical_Manual_ja.md`
+- Generalization of ELF: `elf_generalization_en.md` / `elf_generalization.md`
+- Macro layer reference: `macro_en.md` / `MACRO.md`
+- Mini language reference: `mini_en.md` / `MINI.md`
+- Formalization in denotational semantics: `axxsemantics`
+- x86_64 pattern file: https://github.com/fygar256/x86_64_pattern_file_for_axx
 - Relocatable ELF generation: https://github.com/fygar256/axx_relocatable_elf_generation
 - Demonstration of a brainfuck interpreter assembled with axx: https://github.com/fygar256/brainfuck_interpreter_for_axx_on_freebsd_of_x86_64
 - Original article in Japanese (Qiita: fygar256): https://qiita.com/fygar256/items/1d06fb757ac422796e31
