@@ -1192,7 +1192,8 @@ enum {
     PD_ELFTYPE, PD_ELFMACHINE, PD_ELFCLASS, PD_ELFRELA, PD_ELFWIDTH,
     PD_ELFEXTERN, PD_ELFDWARF, PD_ELFHEADER, PD_ELFSECTION, PD_ECHO, PD_ELFFIELD,
     PD_ELFPCGUESS, PD_ELFBUILTIN, PD_ELFEXTRA, PD_ELFDIFF, PD_ELFENCODE,
-    PD_ELFRINFO, PD_ELFUNIT, PD_ELFLINK, PD_ELFGROUP
+    PD_ELFRINFO, PD_ELFUNIT, PD_ELFLINK, PD_ELFGROUP, PD_ELFCFI, PD_ELFCFIINIT,
+    PD_ELFCFIREG
 };
 
 /* パターン行がどのディレクティブか（種別の番号）。 */
@@ -1218,6 +1219,8 @@ static int pat_dir_kind(const PatEntry *e){
         { ".elfencode", PD_ELFENCODE }, { ".elfrinfo", PD_ELFRINFO },
         { ".elfunit", PD_ELFUNIT }, { ".elflink", PD_ELFLINK },
         { ".elfgroup", PD_ELFGROUP },
+        { ".elfcfi", PD_ELFCFI }, { ".elfcfiinit", PD_ELFCFIINIT },
+        { ".elfcfireg", PD_ELFCFIREG },
         { ".echo", PD_ECHO }, { NULL, 0 } };
     if(!e || !e->f[0] || !e->f[0][0]) return PD_NONE;
     const char *n = e->f[0];
@@ -1244,7 +1247,8 @@ static int pat_is_directive(const PatEntry *e){
         ".elftype", ".elfmachine", ".elfclass", ".elfrela", ".elfwidth",
         ".elfextern", ".elfdwarf", ".elfheader", ".elfsection", ".echo", ".elffield",
         ".elfpcguess", ".elfbuiltin", ".elfextra", ".elfdiff", ".elfencode",
-        ".elfrinfo", ".elfunit", ".elflink", ".elfgroup", NULL };
+        ".elfrinfo", ".elfunit", ".elflink", ".elfgroup", ".elfcfi", ".elfcfiinit",
+        ".elfcfireg", NULL };
     if(!e || !e->f[0] || !e->f[0][0]) return 0;
     const char *n = e->f[0];
     for(int k=0; tbl[k]; k++) if(strcmp(n, tbl[k]) == 0) return 1;
@@ -1690,7 +1694,8 @@ static int pat_dir_line_invariant(const PatEntry *e){
     case PD_ELFEXTERN: case PD_ELFDWARF: case PD_ELFHEADER:
     case PD_ELFSECTION: case PD_ELFFIELD: case PD_ELFPCGUESS: case PD_ELFBUILTIN:
     case PD_ELFEXTRA: case PD_ELFDIFF: case PD_ELFENCODE: case PD_ELFRINFO:
-    case PD_ELFUNIT: case PD_ELFLINK: case PD_ELFGROUP:
+    case PD_ELFUNIT: case PD_ELFLINK: case PD_ELFGROUP: case PD_ELFCFI:
+    case PD_ELFCFIINIT: case PD_ELFCFIREG:
         for(int i=1;i<PAT_FIELDS;i++)
             for(const char *q=e->f[i]; *q; q++)
                 if(*q=='!' || *q=='$' || *q=='#' || *q=='@') return 0;
@@ -1965,6 +1970,21 @@ static long long mlp_get(const MacroLinePcsVec *v, const char *file, int idx){
 enum { EHF_TYPE = 0, EHF_FLAGS, EHF_VERSION, EHF_ENTRY, EHF_OSABI,
        EHF_ABIVERSION, ELF_HDR_NFIELD };
 
+/* ソースの `.cfi_*` 指令 1 つ（位置はセクション先頭からのワード数）と、
+   `.cfi_startproc` から `.cfi_endproc` までの 1 関数ぶん。axx.py の
+   ElfState.cfi_fdes の要素と同じ中身。 */
+typedef struct { int64_t off; char op[64]; int nv; int64_t *v; } CfiOp;
+typedef struct {
+    char   *sec;
+    int64_t start, end;
+    int     simple;
+    CfiOp  *ops; int nops, cops;
+    int     ra;
+    int     signal;
+    int     pers_enc; char *pers_sym;
+    int     lsda_enc; char *lsda_sym;
+} CfiFde;
+
 typedef struct {
     char outfile[512];
     char expfile[512];
@@ -2123,10 +2143,19 @@ typedef struct {
     int        elf_extras_len, elf_extras_cap;
     char      *elf_diff_add[9];
     char      *elf_diff_sub[9];
+    struct { char *type; char *add; char *sub; } *elf_diff_t;
+    int        elf_diff_t_len, elf_diff_t_cap;
     struct { char *type; char *fn; } *elf_encodes;
     int        elf_encodes_len, elf_encodes_cap;
     char      *elf_decl_rinfo;
     int        elf_decl_unit;
+    /* CFI: `.elfcfi` の欄、`.elfcfiinit` の命令、`.elfcfireg` の名前、
+       ソースの `.cfi_*` から集めた関数。 */
+    int        elf_cfi_set, elf_cfi_ra, elf_cfi_code, elf_cfi_data, elf_cfi_pad;
+    char     **elf_cfiinit; int elf_cfiinit_len, elf_cfiinit_cap;
+    struct { char *name; int num; } *elf_cfireg; int elf_cfireg_len, elf_cfireg_cap;
+    CfiFde    *cfi_fdes; int cfi_fdes_len, cfi_fdes_cap;
+    CfiFde     cfi_curf; int cfi_open;
     struct { char *sec; char *link; char *info; } *elf_links;
     int        elf_links_len, elf_links_cap;
     struct { char *name; char *sig; uint32_t flags; char **mem; int nmem; } *elf_groups;
@@ -2910,6 +2939,22 @@ static int elf_diff_of(const AsmState *st, int nbytes, int *add, int *sub){
 /* `.elfdiff` が 1 つでも宣言されているか。 */
 static int elf_diff_any(const AsmState *st){
     for(int w = 1; w < 9; w++) if(st->elf_diff_add[w]) return 1;
+    return st->elf_diff_t_len > 0;
+}
+
+/* 型付きの `.elfdiff`（`.reloc` がその型を付けた欄）の対を引く。最初に
+   当たった宣言を使う。無ければ 0。 */
+static int elf_diff_t_of(const AsmState *st, int rtype, int *add, int *sub){
+    if(st->elf_diff_t_len == 0) return 0;
+    const ElfMachineInfo *m = elf_machine_effective(st);
+    for(int i = 0; i < st->elf_diff_t_len; i++){
+        if(elf_decl_type_in(m->named, st->elf_diff_t[i].type) != rtype) continue;
+        int a = elf_decl_type_in(m->named, st->elf_diff_t[i].add);
+        int b = elf_decl_type_in(m->named, st->elf_diff_t[i].sub);
+        if(a < 0 || b < 0) continue;
+        *add = a; *sub = b;
+        return 1;
+    }
     return 0;
 }
 
@@ -3032,7 +3077,7 @@ static uint64_t weo_sym_size(const AsmState *st, const char *name, int bpw){
 }
 
 static void weo_sym_common(const AsmState *st, const char *name, int bpw,
-                           uint16_t *shndx, uint64_t *val, uint64_t *size){
+                           uint32_t *shndx, uint64_t *val, uint64_t *size){
     SymAttrView a = sym_attr_get(st, name);
     if(!a.common) return;
     *shndx = 0xfff2;
@@ -3211,9 +3256,15 @@ static void state_init(AsmState *st) {
     st->elf_decl_builtin = -1;
     st->elf_extras = NULL; st->elf_extras_len = 0; st->elf_extras_cap = 0;
     for(int _wi=0;_wi<9;_wi++){ st->elf_diff_add[_wi] = NULL; st->elf_diff_sub[_wi] = NULL; }
+    st->elf_diff_t = NULL; st->elf_diff_t_len = 0; st->elf_diff_t_cap = 0;
     st->elf_encodes = NULL; st->elf_encodes_len = 0; st->elf_encodes_cap = 0;
     st->elf_decl_rinfo = NULL;
     st->elf_decl_unit = -1;
+    st->elf_cfi_set = 0; st->elf_cfi_ra = 0; st->elf_cfi_code = 0; st->elf_cfi_data = 0; st->elf_cfi_pad = 0;
+    st->elf_cfiinit = NULL; st->elf_cfiinit_len = 0; st->elf_cfiinit_cap = 0;
+    st->elf_cfireg = NULL; st->elf_cfireg_len = 0; st->elf_cfireg_cap = 0;
+    st->cfi_fdes = NULL; st->cfi_fdes_len = 0; st->cfi_fdes_cap = 0;
+    memset(&st->cfi_curf, 0, sizeof(st->cfi_curf)); st->cfi_open = 0;
     st->elf_links = NULL; st->elf_links_len = 0; st->elf_links_cap = 0;
     st->elf_groups = NULL; st->elf_groups_len = 0; st->elf_groups_cap = 0;
     for(int _wi=0;_wi<9;_wi++) st->elf_decl_width[_wi] = NULL;
@@ -4274,73 +4325,162 @@ static void var_slot_put(AsmState *st, int slot, uint256_t v){
     var_slot_put_tagged(st, slot, v, 0);
 }
 
-/* ラベル差の候補の 2 つ目のラベル。取り込み 1 回の間だけ使う。 */
-static char    *g_v2l_pend_name[NVARS];
-static uint64_t g_v2l_pend_val[NVARS];
+/* ラベル差の候補の 2 つ目以降のラベル。取り込み 1 回の間だけ使う。 */
+static char   **g_v2l_pend_name[NVARS];
+static uint64_t *g_v2l_pend_val[NVARS];
+static int      g_v2l_pend_n[NVARS], g_v2l_pend_cap[NVARS];
 
-/* text の中でラベル name に付いている符号。'+' / '-'、決まらなければ 0。
-   axx.py の _elf_label_sign() と同じ規則である。 */
+static void elf_v2l_pend_clear(int vi){
+    for(int i = 0; i < g_v2l_pend_n[vi]; i++) free(g_v2l_pend_name[vi][i]);
+    g_v2l_pend_n[vi] = 0;
+}
+static void elf_v2l_pend_push(int vi, const char *k, uint64_t v){
+    if(g_v2l_pend_n[vi] >= g_v2l_pend_cap[vi]){
+        g_v2l_pend_cap[vi] = g_v2l_pend_cap[vi] ? g_v2l_pend_cap[vi] * 2 : 4;
+        g_v2l_pend_name[vi] = realloc(g_v2l_pend_name[vi], sizeof(char*) * (size_t)g_v2l_pend_cap[vi]);
+        g_v2l_pend_val[vi]  = realloc(g_v2l_pend_val[vi], sizeof(uint64_t) * (size_t)g_v2l_pend_cap[vi]);
+        if(!g_v2l_pend_name[vi] || !g_v2l_pend_val[vi]){ perror("realloc"); exit(1); }
+    }
+    g_v2l_pend_name[vi][g_v2l_pend_n[vi]] = strdup(k);
+    g_v2l_pend_val[vi][g_v2l_pend_n[vi]] = v;
+    g_v2l_pend_n[vi]++;
+}
+
 static int elf_diff_wordch(int c){
     return isalnum(c) || c == '_' || c == '.' || c == '$';
 }
-static int elf_label_sign(const char *text, int len, const char *name){
-    int nl = (int)strlen(name);
-    int pos = -1;
-    for(int i = 0; i + nl <= len; i++){
-        int k = 0;
-        while(k < nl && toupper((unsigned char)text[i+k]) == toupper((unsigned char)name[k])) k++;
-        if(k < nl) continue;
-        int e = i + nl;
-        if((i == 0 || !elf_diff_wordch((unsigned char)text[i-1]))
-           && (e >= len || !elf_diff_wordch((unsigned char)text[e]))){
-            if(pos >= 0) return 0;
-            pos = i;
+
+/* 取り込んだ式の綴りから、ラベルの 1 次結合（ラベル差）を読み取る。式が
+   `+` `-` `(` `)`、数、ラベルだけでできていて、どのラベルの係数も +1 か -1
+   なら、項を「符号と名前」を \x01 で区切って並べた文字列を返し、Σ符号×値を
+   *sum に置く。項は綴りに初めて現れた順。それ以外は NULL（曖昧）。
+   axx.py の _elf_diff_resolve() と同じ規則である。 */
+static char *elf_diff_resolve(const char *t, int L, char **names, const uint64_t *vals, int n,
+                              uint64_t *sum){
+    for(int a = 0; a < n; a++)
+        for(int b = a + 1; b < n; b++)
+            if(strcasecmp(names[a], names[b]) == 0) return NULL;
+    int *coef = calloc((size_t)n, sizeof(int));
+    int *ord = calloc((size_t)n, sizeof(int));
+    int *seen = calloc((size_t)n, sizeof(int));
+    int *stk = malloc(sizeof(int) * (size_t)(L + 2));
+    if(!coef || !ord || !seen || !stk){ perror("alloc"); exit(1); }
+    int nord = 0, sp = 0, sign = 1, expect = 1, ok = 1;
+    stk[0] = 1;
+    int i = 0;
+    while(i < L && ok){
+        char c = t[i];
+        if(c == ' ' || c == '\t' || c == '\0'){ i++; continue; }
+        if(c == '+' || c == '-'){
+            int sg = c == '-' ? -1 : 1;
+            if(expect) sign *= sg; else { sign = sg; expect = 1; }
+            i++; continue;
         }
+        if(c == '('){
+            if(!expect){ ok = 0; break; }
+            stk[sp + 1] = stk[sp] * sign; sp++;
+            sign = 1; i++; continue;
+        }
+        if(c == ')'){
+            if(sp == 0 || expect){ ok = 0; break; }
+            sp--; i++; continue;
+        }
+        if(elf_diff_wordch((unsigned char)c) || c == '\''){
+            if(!expect){ ok = 0; break; }
+            int j;
+            if(c == '\''){
+                j = i + 1;
+                while(j < L && t[j] != '\'') j++;
+                if(j >= L){ ok = 0; break; }
+                j++;
+            } else {
+                j = i;
+                while(j < L && elf_diff_wordch((unsigned char)t[j])) j++;
+                for(int k = 0; k < n; k++){
+                    if((int)strlen(names[k]) == j - i && strncasecmp(names[k], t + i, (size_t)(j - i)) == 0){
+                        if(!seen[k]){ seen[k] = 1; ord[nord++] = k; }
+                        coef[k] += stk[sp] * sign;
+                        break;
+                    }
+                }
+            }
+            expect = 0; sign = 1; i = j; continue;
+        }
+        ok = 0;
     }
-    if(pos < 0) return 0;
-    int j = pos - 1;
-    while(j >= 0 && (text[j] == ' ' || text[j] == '\t')) j--;
-    if(j < 0 || text[j] == '+' || text[j] == '(') return '+';
-    if(text[j] == '-') return '-';
-    return 0;
+    if(sp != 0 || expect || nord != n) ok = 0;
+    for(int k = 0; ok && k < n; k++) if(coef[k] != 1 && coef[k] != -1) ok = 0;
+    char *out = NULL;
+    if(ok){
+        size_t tot = 1;
+        for(int k = 0; k < n; k++) tot += strlen(names[k]) + 2;
+        out = malloc(tot);
+        if(!out){ perror("malloc"); exit(1); }
+        size_t p = 0;
+        uint64_t sv = 0;
+        for(int q = 0; q < nord; q++){
+            int k = ord[q];
+            if(q) out[p++] = '\x01';
+            out[p++] = coef[k] > 0 ? '+' : '-';
+            size_t l = strlen(names[k]);
+            memcpy(out + p, names[k], l); p += l;
+            sv += coef[k] > 0 ? vals[k] : (uint64_t)0 - vals[k];
+        }
+        out[p] = '\0';
+        *sum = sv;
+    }
+    free(coef); free(ord); free(seen); free(stk);
+    return out;
 }
 
-/* 変数の取り込みが終わったところで、ラベル差の候補を決める。足す側と
-   引く側が決まれば、名前を「足す\x01引く」、値を「足す − 引く」にして
-   set を 3 にする。決まらなければ従来どおり曖昧（-1）。axx.py の
-   _elf_diff_resolve() と同じ規則である。 */
+/* 変数の取り込みが終わったところで、ラベル差の候補を決める。決まれば名前を
+   項の並び（elf_diff_resolve() の形）、値を Σ符号×値にして set を 3 にする。
+   決まらなければ曖昧（-1）。 */
 static void elf_v2l_finish(AsmState *st, int vi, const char *text, int len){
-    if(vi < 0 || vi >= NVARS || st->elf_var_to_label[vi].set != 2) return;
-    const char *n1 = st->elf_var_to_label[vi].label_name;
-    const char *n2 = g_v2l_pend_name[vi] ? g_v2l_pend_name[vi] : "";
-    uint64_t v1 = st->elf_var_to_label[vi].label_val, v2 = g_v2l_pend_val[vi];
-    int s1 = 0, s2 = 0;
-    if(strcasecmp(n1, n2) != 0){
-        s1 = elf_label_sign(text, len, n1);
-        s2 = elf_label_sign(text, len, n2);
+    if(!st->elf_tracking || vi < 0 || vi >= NVARS) return;
+    if(st->elf_var_to_label[vi].set == 1){
+        /* ラベルが 1 つでも符号が負（`-a+5` など）なら、`.elfdiff` があれば引く型
+           だけのラベル差に、無ければ曖昧にする。axx.py の _elf_v2l_finish() と同じ。 */
+        char *nm1[1] = { st->elf_var_to_label[vi].label_name };
+        uint64_t v1[1] = { st->elf_var_to_label[vi].label_val };
+        uint64_t sv1 = 0;
+        char *c1 = elf_diff_resolve(text, len, nm1, v1, 1, &sv1);
+        if(c1 && c1[0] == '-'){
+            v2l_note_write(st, vi);
+            if(elf_diff_any(st)){
+                st->elf_var_to_label[vi].set = 3;
+                st->elf_var_to_label[vi].label_name = c1;
+                st->elf_var_to_label[vi].label_val = sv1;
+                c1 = NULL;
+            } else {
+                st->elf_var_to_label[vi].set = -1;
+                st->elf_var_to_label[vi].label_name = NULL;
+            }
+        }
+        free(c1);
+        return;
     }
-    char *comb = NULL;
-    uint64_t cv = 0;
-    if((s1 == '+' && s2 == '-') || (s1 == '-' && s2 == '+')){
-        const char *pn = s1 == '+' ? n1 : n2, *mn = s1 == '+' ? n2 : n1;
-        uint64_t pv = s1 == '+' ? v1 : v2, mv = s1 == '+' ? v2 : v1;
-        size_t a = strlen(pn), b = strlen(mn);
-        comb = malloc(a + b + 2);
-        if(!comb){ perror("malloc"); exit(1); }
-        memcpy(comb, pn, a); comb[a] = '\x01'; memcpy(comb + a + 1, mn, b + 1);
-        cv = pv - mv;
-    }
+    if(st->elf_var_to_label[vi].set != 2) return;
+    int n = 1 + g_v2l_pend_n[vi];
+    char **names = malloc(sizeof(char*) * (size_t)n);
+    uint64_t *vals = malloc(sizeof(uint64_t) * (size_t)n);
+    if(!names || !vals){ perror("malloc"); exit(1); }
+    names[0] = st->elf_var_to_label[vi].label_name;
+    vals[0] = st->elf_var_to_label[vi].label_val;
+    for(int k = 1; k < n; k++){ names[k] = g_v2l_pend_name[vi][k-1]; vals[k] = g_v2l_pend_val[vi][k-1]; }
+    uint64_t sv = 0;
+    char *comb = elf_diff_resolve(text, len, names, vals, n, &sv);
+    free(names); free(vals);
     v2l_note_write(st, vi);
     if(comb){
         st->elf_var_to_label[vi].set = 3;
         st->elf_var_to_label[vi].label_name = comb;
-        st->elf_var_to_label[vi].label_val = cv;
+        st->elf_var_to_label[vi].label_val = sv;
     } else {
         st->elf_var_to_label[vi].set = -1;
         st->elf_var_to_label[vi].label_name = NULL;
     }
-    free(g_v2l_pend_name[vi]);
-    g_v2l_pend_name[vi] = NULL;
+    elf_v2l_pend_clear(vi);
 }
 
 /* ラベルの値を読む。パスごとに「未確定」の扱いが変わる。
@@ -4377,8 +4517,8 @@ static uint256_t label_get_value(AsmState *st, const char *k){
                         st->elf_var_to_label[vi].label_name = strdup(k);
                         st->elf_var_to_label[vi].label_val = u256_to_u64(e->value);
                     } else if(st->elf_var_to_label[vi].set == 1 && elf_diff_any(st)){
-                        /* `.elfdiff` があればラベル差の候補にする。足す側と
-                           引く側は取り込みが終わってから elf_v2l_finish() が
+                        /* `.elfdiff` があればラベル差の候補にする。各ラベルの
+                           符号は取り込みが終わってから elf_v2l_finish() が
                            決める。axx.py の _elf_v2l_second() と同じ規則。 */
                         char *first = strdup(st->elf_var_to_label[vi].label_name);
                         uint64_t fv = st->elf_var_to_label[vi].label_val;
@@ -4386,9 +4526,10 @@ static uint256_t label_get_value(AsmState *st, const char *k){
                         st->elf_var_to_label[vi].set = 2;
                         st->elf_var_to_label[vi].label_name = first;
                         st->elf_var_to_label[vi].label_val = fv;
-                        free(g_v2l_pend_name[vi]);
-                        g_v2l_pend_name[vi] = strdup(k);
-                        g_v2l_pend_val[vi] = u256_to_u64(e->value);
+                        elf_v2l_pend_clear(vi);
+                        elf_v2l_pend_push(vi, k, u256_to_u64(e->value));
+                    } else if(st->elf_var_to_label[vi].set == 2){
+                        elf_v2l_pend_push(vi, k, u256_to_u64(e->value));
                     } else {
                         v2l_note_write(st, vi);
                         st->elf_var_to_label[vi].set = -1;
@@ -5409,8 +5550,11 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     st->elf_refs[st->elf_refs_len].name     = strdup(st->elf_var_to_label[_vi].label_name);
                     st->elf_refs[st->elf_refs_len].val      = st->elf_var_to_label[_vi].label_val;
                     st->elf_refs[st->elf_refs_len].word_idx = st->elf_current_word_idx;
-                    st->elf_refs[st->elf_refs_len].rtype    = _isdiff ? 0 : st->reloc_constraints[_vi];
-                    st->elf_refs[st->elf_refs_len].addend   = _isdiff ? 0 :
+                    /* ラベル差でも `.reloc` の型（型付きの差）と定数部を持たせる。 */
+                    (void)_isdiff;
+                    st->elf_refs[st->elf_refs_len].rtype    = st->reloc_constraints[_vi];
+                    st->elf_refs[st->elf_refs_len].addend   =
+                        u256_is_undef_derived(x) && _isdiff ? 0 :
                         (int64_t)(u256_to_u64(x) - st->elf_var_to_label[_vi].label_val);
                     st->elf_refs_len++;
                 }
@@ -6771,6 +6915,46 @@ static int dir_elfextra(Assembler *asmb, PatEntry *e){
 static int dir_elfdiff(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfdiff") != 0) return 0;
     AsmState *st = &asmb->st;
+    {
+        /* 第 1 欄が数でなければ型名: 型付きの差。 */
+        char *f1 = elf_decl_trim_dup(e->f[1]);
+        int isnum = f1[0] != '\0';
+        if(isnum){
+            if(f1[0] == '0' && (f1[1] == 'x' || f1[1] == 'X') && f1[2]){
+                for(const char *q = f1 + 2; *q; q++) if(!isxdigit((unsigned char)*q)){ isnum = 0; break; }
+            } else {
+                for(const char *q = f1; *q; q++) if(!isdigit((unsigned char)*q)){ isnum = 0; break; }
+            }
+        }
+        if(f1[0] && !isnum){
+            char *a = elf_decl_trim_dup(e->f[2]);
+            char *b = elf_decl_trim_dup(e->f[3]);
+            if(!a[0] || !b[0]){
+                axx_diagf(1, 0, " error - .elfdiff: an add type and a subtract type are required.\n");
+                free(f1); free(a); free(b);
+                return 1;
+            }
+            for(int i = 0; i < st->elf_diff_t_len; i++)
+                if(strcmp(st->elf_diff_t[i].type, f1) == 0){
+                    if(strcmp(st->elf_diff_t[i].add, a) != 0 || strcmp(st->elf_diff_t[i].sub, b) != 0){
+                        free(st->elf_diff_t[i].add); free(st->elf_diff_t[i].sub);
+                        st->elf_diff_t[i].add = a; st->elf_diff_t[i].sub = b;
+                        st->elf_decl_gen++;
+                    } else { free(a); free(b); }
+                    free(f1);
+                    return 1;
+                }
+            st->elf_diff_t = elf_decl_grow(st->elf_diff_t, &st->elf_diff_t_cap,
+                                           st->elf_diff_t_len, sizeof(st->elf_diff_t[0]));
+            st->elf_diff_t[st->elf_diff_t_len].type = f1;
+            st->elf_diff_t[st->elf_diff_t_len].add  = a;
+            st->elf_diff_t[st->elf_diff_t_len].sub  = b;
+            st->elf_diff_t_len++;
+            st->elf_decl_gen++;
+            return 1;
+        }
+        free(f1);
+    }
     long long w;
     if(!elf_decl_num(asmb, ".elfdiff", e->f[1], 1, 8, &w)) return 1;
     char *a = elf_decl_trim_dup(e->f[2]);
@@ -6894,6 +7078,107 @@ static int dir_elflink(Assembler *asmb, PatEntry *e){
     st->elf_links_len++;
     st->elf_decl_gen++;
     return 1;
+}
+
+/* `.elfcfi` — CFI（.eh_frame）の CIE の欄を決める。
+   axx.py の elfcfi_processing() と同じ規則である。 */
+static int dir_elfcfi(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".elfcfi") != 0) return 0;
+    AsmState *st = &asmb->st;
+    long long ra, ca, da, pad = 0;
+    if(!elf_decl_num(asmb, ".elfcfi", e->f[1], 0, 0xFFFF, &ra)) return 1;
+    if(!elf_decl_num(asmb, ".elfcfi", e->f[2], 1, 0xFFFF, &ca)) return 1;
+    if(!elf_decl_num(asmb, ".elfcfi", e->f[3], -0xFFFF, 0xFFFF, &da)) return 1;
+    if(da == 0){
+        axx_diagf(1, 0, " error - .elfcfi: the data alignment factor must not be 0.\n");
+        return 1;
+    }
+    {
+        const char *q = e->f[4];
+        while(*q==' '||*q=='\t') q++;
+        if(*q){
+            if(!elf_decl_num(asmb, ".elfcfi", e->f[4], 1, 64, &pad)) return 1;
+            if(pad & (pad - 1)){
+                axx_diagf(1, 0, " error - .elfcfi: the padding alignment must be a power "
+                                "of two, got '%lld'.\n", pad);
+                return 1;
+            }
+        }
+    }
+    if(!st->elf_cfi_set || st->elf_cfi_ra != (int)ra || st->elf_cfi_code != (int)ca
+       || st->elf_cfi_data != (int)da || st->elf_cfi_pad != (int)pad){
+        st->elf_cfi_set = 1; st->elf_cfi_ra = (int)ra; st->elf_cfi_code = (int)ca;
+        st->elf_cfi_data = (int)da; st->elf_cfi_pad = (int)pad;
+        st->elf_decl_gen++;
+    }
+    return 1;
+}
+
+/* `.elfcfiinit` — CIE の初期命令を 1 つ足す。空白の並びは 1 つにそろえる。
+   axx.py の elfcfiinit_processing() と同じ規則である。 */
+static int dir_elfcfiinit(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".elfcfiinit") != 0) return 0;
+    AsmState *st = &asmb->st;
+    const char *f1, *f2; elf_decl_fields(e, &f1, &f2);
+    size_t n = strlen(f1);
+    char *t = malloc(n + 1);
+    if(!t){ perror("malloc"); exit(1); }
+    size_t k = 0; int sp = 0;
+    for(const char *q = f1; *q; q++){
+        if(isspace((unsigned char)*q)){ sp = 1; continue; }
+        if(sp && k){ t[k++] = ' '; }
+        sp = 0;
+        t[k++] = *q;
+    }
+    t[k] = '\0';
+    if(!t[0]){
+        axx_diagf(1, 0, " error - .elfcfiinit: an instruction is required.\n");
+        free(t);
+        return 1;
+    }
+    for(int i = 0; i < st->elf_cfiinit_len; i++)
+        if(strcmp(st->elf_cfiinit[i], t) == 0){ free(t); return 1; }
+    st->elf_cfiinit = elf_decl_grow(st->elf_cfiinit, &st->elf_cfiinit_cap,
+                                    st->elf_cfiinit_len, sizeof(char*));
+    st->elf_cfiinit[st->elf_cfiinit_len++] = t;
+    st->elf_decl_gen++;
+    return 1;
+}
+
+/* `.elfcfireg` — CFI の指令に書くレジスタ名と DWARF のレジスタ番号。
+   axx.py の elfcfireg_processing() と同じ規則である。 */
+static int dir_elfcfireg(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".elfcfireg") != 0) return 0;
+    AsmState *st = &asmb->st;
+    char *nm = elf_decl_trim_dup(e->f[1]);
+    for(char *q = nm; *q; q++) *q = (char)tolower((unsigned char)*q);
+    if(!nm[0]){
+        axx_diagf(1, 0, " error - .elfcfireg: a register name is required.\n");
+        free(nm);
+        return 1;
+    }
+    long long v;
+    if(!elf_decl_num(asmb, ".elfcfireg", e->f[2], 0, 0xFFFF, &v)){ free(nm); return 1; }
+    for(int i = 0; i < st->elf_cfireg_len; i++)
+        if(strcmp(st->elf_cfireg[i].name, nm) == 0){
+            if(st->elf_cfireg[i].num != (int)v){ st->elf_cfireg[i].num = (int)v; st->elf_decl_gen++; }
+            free(nm);
+            return 1;
+        }
+    st->elf_cfireg = elf_decl_grow(st->elf_cfireg, &st->elf_cfireg_cap,
+                                   st->elf_cfireg_len, sizeof(st->elf_cfireg[0]));
+    st->elf_cfireg[st->elf_cfireg_len].name = nm;
+    st->elf_cfireg[st->elf_cfireg_len].num  = (int)v;
+    st->elf_cfireg_len++;
+    st->elf_decl_gen++;
+    return 1;
+}
+
+/* `.elfcfireg` の名前を引く（大小を区別しない）。無ければ -1。 */
+static int elf_cfireg_find(const AsmState *st, const char *name){
+    for(int i = 0; i < st->elf_cfireg_len; i++)
+        if(strcasecmp(st->elf_cfireg[i].name, name) == 0) return st->elf_cfireg[i].num;
+    return -1;
 }
 
 /* `.elfgroup` — セクショングループ（SHT_GROUP）を宣言する。
@@ -12923,6 +13208,184 @@ static int sym_decl_num(Assembler *asmb, const char *dname, const char *name,
     return 1;
 }
 
+/* ソースの `.cfi_*` 指令 → 引数の種類（r: レジスタ、n: 数、s: シンボル名、
+   *: 1 つ以上のバイト）。axx.py の _CFI_OPS と同じ表。 */
+static const struct { const char *op; const char *spec; } CFI_OPS[] = {
+    {"startproc", ""}, {"endproc", ""}, {"sections", ""},
+    {"def_cfa", "rn"}, {"def_cfa_offset", "n"}, {"def_cfa_register", "r"},
+    {"adjust_cfa_offset", "n"}, {"offset", "rn"}, {"val_offset", "rn"},
+    {"rel_offset", "rn"}, {"restore", "r"}, {"undefined", "r"}, {"same_value", "r"},
+    {"register", "rr"}, {"remember_state", ""}, {"restore_state", ""},
+    {"return_column", "r"}, {"signal_frame", ""}, {"window_save", ""},
+    {"negate_ra_state", ""}, {"escape", "*"}, {"personality", "ns"}, {"lsda", "ns"},
+    {NULL, NULL}
+};
+static const char *cfi_spec(const char *op){
+    for(int i = 0; CFI_OPS[i].op; i++) if(strcmp(CFI_OPS[i].op, op) == 0) return CFI_OPS[i].spec;
+    return NULL;
+}
+
+/* CFI 指令の数の引数を読む。定数でなければ診断して 0。 */
+static int cfi_num(Assembler *asmb, const char *op, const char *text, int64_t *out){
+    AsmState *st = &asmb->st;
+    int io;
+    st->error_undefined_label = 0;
+    uint256_t v = expr_expression_asm(asmb, text, 0, &io);
+    int und = st->error_undefined_label || u256_is_undef_derived(v);
+    st->error_undefined_label = 0;
+    if(und){
+        axx_diagf(1, 0, " error - .cfi_%s: '%s' is not a constant.\n", op, text);
+        return 0;
+    }
+    *out = u256_to_i64(v);
+    return 1;
+}
+
+/* CFI 指令のレジスタの引数を読む。`.elfcfireg` の名前か、0 以上の数。 */
+static int cfi_reg(Assembler *asmb, const char *op, const char *text, int64_t *out){
+    int r = elf_cfireg_find(&asmb->st, text);
+    if(r >= 0){ *out = r; return 1; }
+    if(!cfi_num(asmb, op, text, out)) return 0;
+    if(*out < 0){
+        axx_diagf(1, 0, " error - .cfi_%s: '%s' is not a register.\n", op, text);
+        return 0;
+    }
+    return 1;
+}
+
+/* `.cfi_*` — CFI の指令を、その位置（セクション先頭からのワード数）と一緒に
+   記録する。記録するのはパス2で `-o` のときだけ。axx.py の cfi_processing()
+   と同じ規則である。 */
+static int adir_cfi(Assembler *asmb, const char *l, const char *l2){
+    AsmState *st = &asmb->st;
+    if(strncasecmp(l, ".cfi_", 5) != 0) return 0;
+    if(!(should_report_errors(st) && st->elf_objfile[0])) return 1;
+    char op[64];
+    snprintf(op, sizeof(op), "%s", l + 5);
+    for(char *q = op; *q; q++) *q = (char)tolower((unsigned char)*q);
+    const char *spec = cfi_spec(op);
+    if(!spec){
+        axx_diagf(1, 0, " error - unknown CFI directive '%s'.\n", l);
+        return 1;
+    }
+    if(strcmp(op, "sections") == 0) return 1;
+    /* 引数をカンマで切る */
+    char *args[64]; int na = 0;
+    char *buf = strdup(l2 ? l2 : "");
+    if(!buf){ perror("strdup"); exit(1); }
+    {
+        int allsp = 1;
+        for(const char *q = buf; *q; q++) if(!isspace((unsigned char)*q)){ allsp = 0; break; }
+        if(!allsp){
+            char *q = buf;
+            while(na < 64){
+                char *c = strchr(q, ',');
+                if(c) *c = '\0';
+                char *b = q; while(isspace((unsigned char)*b)) b++;
+                char *e2 = b + strlen(b); while(e2 > b && isspace((unsigned char)e2[-1])) *--e2 = '\0';
+                args[na++] = b;
+                if(!c) break;
+                q = c + 1;
+            }
+        }
+    }
+    const char *sec = st->current_section;
+    int64_t off = equ_section_relative_offset(st, sec, u256_to_u64(st->pc));
+    if(off < 0) off = (int64_t)u256_to_u64(st->pc);
+    char l2t[512];
+    {
+        const char *b = l2 ? l2 : ""; while(isspace((unsigned char)*b)) b++;
+        snprintf(l2t, sizeof(l2t), "%s", b);
+        size_t n = strlen(l2t); while(n > 0 && isspace((unsigned char)l2t[n-1])) l2t[--n] = '\0';
+    }
+    if(strcmp(op, "startproc") == 0){
+        if(st->cfi_open){
+            axx_diagf(1, 0, " error - .cfi_startproc: the previous .cfi_startproc has "
+                            "no .cfi_endproc.\n");
+            free(buf); return 1;
+        }
+        if(na > 0 && !(na == 1 && strcasecmp(args[0], "simple") == 0)){
+            axx_diagf(1, 0, " error - .cfi_startproc: unknown argument '%s'.\n", l2t);
+            free(buf); return 1;
+        }
+        memset(&st->cfi_curf, 0, sizeof(st->cfi_curf));
+        st->cfi_curf.sec = strdup(sec);
+        st->cfi_curf.start = off; st->cfi_curf.end = off;
+        st->cfi_curf.simple = na > 0;
+        st->cfi_curf.ra = -1; st->cfi_curf.pers_enc = -1; st->cfi_curf.lsda_enc = -1;
+        st->cfi_open = 1;
+        free(buf); return 1;
+    }
+    if(!st->cfi_open){
+        axx_diagf(1, 0, " error - .cfi_%s: not inside .cfi_startproc.\n", op);
+        free(buf); return 1;
+    }
+    CfiFde *cur = &st->cfi_curf;
+    if(strcmp(sec, cur->sec) != 0){
+        axx_diagf(1, 0, " error - .cfi_%s: the section changed inside the function.\n", op);
+        free(buf); return 1;
+    }
+    int star = strcmp(spec, "*") == 0;
+    if(star){
+        if(na == 0){
+            axx_diagf(1, 0, " error - .cfi_%s: at least one argument is required.\n", op);
+            free(buf); return 1;
+        }
+    } else if(na != (int)strlen(spec)){
+        axx_diagf(1, 0, " error - .cfi_%s: %d argument(s) expected.\n", op, (int)strlen(spec));
+        free(buf); return 1;
+    }
+    int64_t vals[64];
+    const char *symarg = NULL;
+    for(int k = 0; k < na; k++){
+        char kind = star ? '*' : spec[k];
+        if(kind == 'r'){
+            if(!cfi_reg(asmb, op, args[k], &vals[k])){ free(buf); return 1; }
+        } else if(kind == 's'){
+            symarg = args[k]; vals[k] = 0;
+        } else {
+            if(!cfi_num(asmb, op, args[k], &vals[k])){ free(buf); return 1; }
+            if(kind == '*' && (vals[k] < 0 || vals[k] > 255)){
+                axx_diagf(1, 0, " error - .cfi_%s: '%s' is not a byte.\n", op, args[k]);
+                free(buf); return 1;
+            }
+        }
+    }
+    if(strcmp(op, "endproc") == 0){
+        cur->end = off;
+        st->cfi_fdes = elf_decl_grow(st->cfi_fdes, &st->cfi_fdes_cap, st->cfi_fdes_len, sizeof(CfiFde));
+        st->cfi_fdes[st->cfi_fdes_len++] = *cur;
+        memset(cur, 0, sizeof(*cur));
+        st->cfi_open = 0;
+    } else if(strcmp(op, "return_column") == 0){
+        cur->ra = (int)vals[0];
+    } else if(strcmp(op, "signal_frame") == 0){
+        cur->signal = 1;
+    } else if(strcmp(op, "personality") == 0 || strcmp(op, "lsda") == 0){
+        if(vals[0] < 0 || vals[0] > 255){
+            axx_diagf(1, 0, " error - .cfi_%s: '%s' is not an encoding byte.\n", op, args[0]);
+            free(buf); return 1;
+        }
+        int isp = op[0] == 'p';
+        int *enc = isp ? &cur->pers_enc : &cur->lsda_enc;
+        char **sym = isp ? &cur->pers_sym : &cur->lsda_sym;
+        free(*sym); *sym = NULL;
+        *enc = -1;
+        if(vals[0] != 0xff){ *enc = (int)vals[0]; *sym = strdup(symarg); }
+    } else {
+        cur->ops = elf_decl_grow(cur->ops, &cur->cops, cur->nops, sizeof(CfiOp));
+        CfiOp *o = &cur->ops[cur->nops++];
+        o->off = off;
+        snprintf(o->op, sizeof(o->op), "%s", op);
+        o->nv = na;
+        o->v = malloc(sizeof(int64_t) * (size_t)(na ? na : 1));
+        if(!o->v){ perror("malloc"); exit(1); }
+        for(int k = 0; k < na; k++) o->v[k] = vals[k];
+    }
+    free(buf);
+    return 1;
+}
+
 /* `.type` — ELF シンボルの種別を書く。 */
 static int adir_type(Assembler *asmb, const char *l, const char *l2){
     AsmState *st=&asmb->st;
@@ -13591,6 +14054,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     if(adir_extern(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
     if(adir_reloctype(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
     if(adir_export(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_cfi(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
     if(adir_type(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
     if(adir_size(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
     if(adir_weak(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
@@ -13683,6 +14147,9 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         case PD_ELFUNIT:  _dir_done = dir_elfunit(asmb,i);       break;
         case PD_ELFLINK:  _dir_done = dir_elflink(asmb,i);       break;
         case PD_ELFGROUP: _dir_done = dir_elfgroup(asmb,i);      break;
+        case PD_ELFCFI:   _dir_done = dir_elfcfi(asmb,i);        break;
+        case PD_ELFCFIINIT:_dir_done = dir_elfcfiinit(asmb,i);   break;
+        case PD_ELFCFIREG:_dir_done = dir_elfcfireg(asmb,i);     break;
         default: break;
         }
         if(_dir_done) continue;
@@ -14169,62 +14636,131 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                 int64_t _scale = (st->elf_decl_unit == 1) ? 1 : (int64_t)bpw;
 
                 {
-                    /* ラベル差（名前が「足す\x01引く」）。`.elfdiff` の対を同じ位置に
-                       出す。axx.py の lineassemble() のラベル差の処理と同じ規則。 */
-                    const char *_dsep = strchr(_lname, '\x01');
-                    if(_dsep){
+                    /* ラベル差（名前が「±名前」を \x01 で区切った並び。ラベル名は
+                       `+` `-` で始まらないので先頭の文字で見分ける）。足す項には
+                       足す型、引く項には引く型を同じ位置に出す。axx.py の
+                       lineassemble() のラベル差の処理と同じ規則。 */
+                    if(_lname[0] == '+' || _lname[0] == '-'){
                         if(_widx >= objl.len){ _gi = _gj; continue; }
-                        size_t _pl = (size_t)(_dsep - _lname);
-                        char *_plus = malloc(_pl + 1);
-                        if(!_plus){ perror("malloc"); exit(1); }
-                        memcpy(_plus, _lname, _pl); _plus[_pl] = '\0';
-                        const char *_minus = _dsep + 1;
-                        int _da, _ds;
-                        if(!elf_diff_of(st, _nbytes, &_da, &_ds)){
-                            if(st->debug)
-                                axx_diagf(0, 0, " warning - no .elfdiff pair for a %d-byte "
-                                           "difference '%s-%s'; relocation omitted.\n",
-                                           _nbytes, _plus, _minus);
-                            free(_plus);
+                        /* 項を取り出す */
+                        int _nt = 1;
+                        for(const char *q = _lname; *q; q++) if(*q == '\x01') _nt++;
+                        char **_tn = malloc(sizeof(char*) * (size_t)_nt);
+                        int *_ts = malloc(sizeof(int) * (size_t)_nt);
+                        if(!_tn || !_ts){ perror("malloc"); exit(1); }
+                        {
+                            const char *q = _lname; int k = 0;
+                            while(k < _nt){
+                                const char *e2 = strchr(q, '\x01');
+                                size_t l = e2 ? (size_t)(e2 - q) : strlen(q);
+                                _ts[k] = q[0] == '-' ? -1 : 1;
+                                _tn[k] = malloc(l);
+                                if(!_tn[k]){ perror("malloc"); exit(1); }
+                                memcpy(_tn[k], q + 1, l - 1); _tn[k][l-1] = '\0';
+                                k++;
+                                q = e2 ? e2 + 1 : q + l;
+                            }
+                        }
+                        int _drt = _valid[_gi].rtype;
+                        int _da = 0, _ds = 0, _okp;
+                        const ElfFieldInfo *_dfd = NULL;
+                        if(_drt > 0){
+                            _okp = elf_diff_t_of(st, _drt, &_da, &_ds);
+                            _dfd = insn_reloc_field_decl(st, _drt);
+                        } else {
+                            _okp = elf_diff_of(st, _nbytes, &_da, &_ds);
+                        }
+                        if(!_okp){
+                            if(st->debug){
+                                char _ex[1024]; size_t _ep = 0;
+                                for(int k = 0; k < _nt; k++){
+                                    int _w = snprintf(_ex + _ep, sizeof(_ex) - _ep, "%s%s",
+                                                      (_ts[k] < 0) ? "-" : (k ? "+" : ""), _tn[k]);
+                                    if(_w > 0 && (size_t)_w < sizeof(_ex) - _ep) _ep += (size_t)_w;
+                                }
+                                axx_diagf(0, 0, " warning - no .elfdiff pair for the difference "
+                                           "'%s'; relocation omitted.\n", _ex);
+                            }
+                            for(int k = 0; k < _nt; k++) free(_tn[k]);
+                            free(_tn); free(_ts);
                             _gi = _gj;
                             continue;
                         }
-                        int _bts = st->bts;
-                        uint64_t _wm = axx_word_mask(_bts);
-                        uint64_t _rv = 0;
-                        for(int _k = 0; _k < _nwords; _k++){
-                            int _wk = _widx + _k;
-                            if(_wk >= objl.len) continue;
-                            uint64_t _wv = u256_to_u64(objl.data[_wk]) & _wm;
-                            int _sh = st->endian_big ? _bts * (_nwords - 1 - _k) : _bts * _k;
-                            if(_sh < 64) _rv |= _wv << _sh;
-                        }
-                        int _fb = _nwords * _bts;
-                        if(_fb > 0 && _fb < 64 && _rv >= ((uint64_t)1 << (_fb - 1)))
-                            _rv -= ((uint64_t)1 << _fb);
-                        int64_t _dconst = ((int64_t)_rv - (int64_t)_valid[_gi].val) * _scale;
-                        int64_t _dsec = (int64_t)((sec_completed_words +
-                                                   (cur_pc + (uint64_t)_widx - sec_entry_pc_cur))
-                                                  * (uint64_t)bpw);
-                        if(_mtbl_rm->is_rela)
-                            for(int _k = 0; _k < _nwords; _k++)
-                                if(_widx + _k < objl.len) objl.data[_widx + _k] = u256_zero();
-                        for(int _p = 0; _p < 2; _p++){
-                            if(st->reloc_count >= st->reloc_cap){
-                                st->reloc_cap = st->reloc_cap ? st->reloc_cap*2 : 16;
-                                st->relocations = realloc(st->relocations,
-                                    (size_t)st->reloc_cap * sizeof(st->relocations[0]));
-                                if(!st->relocations){ perror("realloc"); exit(1); }
+                        int64_t _dconst;
+                        int _dw, _dnb;
+                        if(_drt > 0){
+                            /* 型付きの差: 欄は `.elffield` があればその位置と幅、
+                               無ければこの参照のワード列そのもの。 */
+                            _dconst = _valid[_gi].addend * _scale;
+                            _dw = _widx + (_dfd ? _dfd->off / bpw : 0);
+                            if(_dfd){
+                                _dnb = elf_machine_reloc_bytes(_mtbl_rm, _drt);
+                                if(_dnb <= 0) _dnb = _nbytes;
+                            } else _dnb = _nbytes;
+                            if(_dfd && _mtbl_rm->is_rela){
+                                int _nw2 = _dnb / bpw; if(_nw2 < 1) _nw2 = 1;
+                                if(_dw + _nw2 <= objl.len){
+                                    uint64_t _wm = axx_word_mask(st->bts);
+                                    for(int _k = 0; _k < _nw2; _k++){
+                                        int _sh = st->endian_big ? st->bts * (_nw2 - 1 - _k) : st->bts * _k;
+                                        uint64_t _clr = (_sh < 64) ? ((_dfd->mask >> _sh) & _wm) : 0;
+                                        uint64_t _wv = u256_to_u64(objl.data[_dw + _k]);
+                                        objl.data[_dw + _k] = u256_from_u64((_wv & ~_clr) & _wm);
+                                    }
+                                }
                             }
-                            st->relocations[st->reloc_count].section    = strdup(sec_name);
-                            st->relocations[st->reloc_count].sec_offset = _dsec;
-                            st->relocations[st->reloc_count].sym        = strdup(_p ? _minus : _plus);
-                            st->relocations[st->reloc_count].rtype      = _p ? _ds : _da;
-                            st->relocations[st->reloc_count].addend     = _p ? 0 : _dconst;
-                            st->relocations[st->reloc_count].nbytes     = _nbytes;
-                            st->reloc_count++;
+                        } else {
+                            int _bts = st->bts;
+                            uint64_t _wm = axx_word_mask(_bts);
+                            uint64_t _rv = 0;
+                            for(int _k = 0; _k < _nwords; _k++){
+                                int _wk = _widx + _k;
+                                if(_wk >= objl.len) continue;
+                                uint64_t _wv = u256_to_u64(objl.data[_wk]) & _wm;
+                                int _sh = st->endian_big ? _bts * (_nwords - 1 - _k) : _bts * _k;
+                                if(_sh < 64) _rv |= _wv << _sh;
+                            }
+                            int _fb = _nwords * _bts;
+                            if(_fb > 0 && _fb < 64 && _rv >= ((uint64_t)1 << (_fb - 1)))
+                                _rv -= ((uint64_t)1 << _fb);
+                            _dconst = ((int64_t)_rv - (int64_t)_valid[_gi].val) * _scale;
+                            _dw = _widx;
+                            _dnb = _nbytes;
+                            if(_mtbl_rm->is_rela)
+                                for(int _k = 0; _k < _nwords; _k++)
+                                    if(_widx + _k < objl.len) objl.data[_widx + _k] = u256_zero();
                         }
-                        free(_plus);
+                        int64_t _dsec = (int64_t)((sec_completed_words +
+                                                   (cur_pc + (uint64_t)_dw - sec_entry_pc_cur))
+                                                  * (uint64_t)bpw);
+                        int _has_plus = 0;
+                        for(int k = 0; k < _nt; k++) if(_ts[k] > 0){ _has_plus = 1; break; }
+                        int _dput = 0;
+                        /* 足す項を先に、引く項を後に並べる。 */
+                        for(int _pass = 0; _pass < 2; _pass++)
+                            for(int k = 0; k < _nt; k++){
+                                if((_pass == 0) != (_ts[k] > 0)) continue;
+                                int64_t _ad = 0;
+                                if(!_dput && (_ts[k] > 0 || !_has_plus)){
+                                    _ad = _ts[k] > 0 ? _dconst : -_dconst;
+                                    _dput = 1;
+                                }
+                                if(st->reloc_count >= st->reloc_cap){
+                                    st->reloc_cap = st->reloc_cap ? st->reloc_cap*2 : 16;
+                                    st->relocations = realloc(st->relocations,
+                                        (size_t)st->reloc_cap * sizeof(st->relocations[0]));
+                                    if(!st->relocations){ perror("realloc"); exit(1); }
+                                }
+                                st->relocations[st->reloc_count].section    = strdup(sec_name);
+                                st->relocations[st->reloc_count].sec_offset = _dsec;
+                                st->relocations[st->reloc_count].sym        = strdup(_tn[k]);
+                                st->relocations[st->reloc_count].rtype      = _ts[k] > 0 ? _da : _ds;
+                                st->relocations[st->reloc_count].addend     = _ad;
+                                st->relocations[st->reloc_count].nbytes     = _dnb;
+                                st->reloc_count++;
+                            }
+                        for(int k = 0; k < _nt; k++) free(_tn[k]);
+                        free(_tn); free(_ts);
                         _gi = _gj;
                         continue;
                     }
@@ -14481,7 +15017,7 @@ static char *file_input_from_stdin(void){
 typedef struct { uint8_t*b; size_t len,cap; } WBB;
 typedef struct { const char*name; uint64_t bs,bsz,fl; uint8_t*data; uint32_t sht;
                  int al_set; uint32_t al; uint32_t es; } WCS;
-typedef struct { uint16_t shndx; uint64_t sv; } WSR;
+typedef struct { uint32_t shndx; uint64_t sv; } WSR;
 typedef struct { int64_t off; const char*sym; int rtype; int64_t addend; int nbytes; } WRE;
 typedef struct { WRE*data; int len,cap; } WRL;
 typedef struct { const char*name; int idx; } WSNI;
@@ -14600,13 +15136,13 @@ static WSR weo_shndx(AsmState*st,WCS*csecs,int ncs,uint64_t ba,const char*sec_na
         for(int i=0;i<ncs;i++){
             if(strcmp(csecs[i].name,sec_name)==0){
                 int64_t woff = sec_word_offset(st, sec_name, word_pc);
-                if(woff >= 0) return (WSR){(uint16_t)(i+1), (uint64_t)woff*(uint64_t)bpw};
+                if(woff >= 0) return (WSR){(uint32_t)(i+1), (uint64_t)woff*(uint64_t)bpw};
             }
         }
     }
     for(int i=0;i<ncs;i++){
         int64_t woff = sec_word_offset(st, csecs[i].name, word_pc);
-        if(woff >= 0) return (WSR){(uint16_t)(i+1), (uint64_t)woff*(uint64_t)bpw};
+        if(woff >= 0) return (WSR){(uint32_t)(i+1), (uint64_t)woff*(uint64_t)bpw};
     }
     if(ncs>0){
         int best_i=0; uint64_t best_start=0; int found=0;
@@ -14615,7 +15151,7 @@ static WSR weo_shndx(AsmState*st,WCS*csecs,int ncs,uint64_t ba,const char*sec_na
         }
         uint64_t sv = ba - csecs[best_i].bs;
         if(!found || ba < csecs[best_i].bs) sv = 0;
-        return (WSR){(uint16_t)(best_i+1), sv};
+        return (WSR){(uint32_t)(best_i+1), sv};
     }
     return (WSR){0xfff1,ba};
 }
@@ -14769,6 +15305,420 @@ static uint8_t* dwarf_pack_relocs(DRV*v,size_t*outlen,int is_le,int is_elf64,int
     *outlen=n; return b;
 }
 static int lrow_cmp(const void*a,const void*b){ uint64_t x=((const LROW*)a)->wpc,y=((const LROW*)b)->wpc; return x<y?-1:(x>y?1:0); }
+
+/* 欄の幅が nbytes の、PC 相対のデータ型（命令欄の型を除く）を 1 つ探す。
+   axx.py の _reloc_data_pcrel() と同じ規則である。 */
+static int elf_reloc_data_pcrel(const AsmState *st, const ElfMachineInfo *m, int nbytes){
+    for(int i = 0; m->named[i].name; i++){
+        int rt = m->named[i].rtype;
+        if(elf_machine_reloc_bytes(m, rt) != nbytes || !elf_machine_is_pcrel(m, rt)) continue;
+        if(insn_reloc_field_decl(st, rt)) continue;
+        return rt;
+    }
+    return 0;
+}
+
+/* CFI の状態: CFA のレジスタとオフセット、remember_state の積み。 */
+typedef struct { int64_t reg, off; int64_t *stk; int nstk, cstk; } CfiStt;
+
+/* CFI の命令 1 つを DW_CFA_* のバイト列にする。誤りは err に書いて 0 を返す。
+   axx.py の _cfi_op_bytes() と同じ規則である。 */
+static int cfi_op_bytes(RB *out, const char *op, const int64_t *v, int nv, CfiStt *stt,
+                        int64_t da, char *err, size_t esz){
+    #define CFI_FAC(o_, f_) do { if((o_) % da != 0){ \
+        snprintf(err, esz, "offset %lld is not a multiple of the data alignment factor %lld", \
+                 (long long)(o_), (long long)da); return 0; } (f_) = (o_) / da; } while(0)
+    int64_t f;
+    if(strcmp(op, "def_cfa") == 0){
+        stt->reg = v[0]; stt->off = v[1];
+        if(v[1] >= 0){ rb_u8(out, 0x0c); rb_uleb(out, (uint64_t)v[0]); rb_uleb(out, (uint64_t)v[1]); return 1; }
+        CFI_FAC(v[1], f);
+        rb_u8(out, 0x12); rb_uleb(out, (uint64_t)v[0]); rb_sleb(out, f); return 1;
+    }
+    if(strcmp(op, "def_cfa_offset") == 0 || strcmp(op, "adjust_cfa_offset") == 0){
+        int64_t o = op[0] == 'd' ? v[0] : stt->off + v[0];
+        stt->off = o;
+        if(o >= 0){ rb_u8(out, 0x0e); rb_uleb(out, (uint64_t)o); return 1; }
+        CFI_FAC(o, f);
+        rb_u8(out, 0x13); rb_sleb(out, f); return 1;
+    }
+    if(strcmp(op, "def_cfa_register") == 0){
+        stt->reg = v[0];
+        rb_u8(out, 0x0d); rb_uleb(out, (uint64_t)v[0]); return 1;
+    }
+    if(strcmp(op, "offset") == 0 || strcmp(op, "rel_offset") == 0 || strcmp(op, "val_offset") == 0){
+        int64_t r = v[0], o = v[1];
+        if(op[0] == 'r') o = o - stt->off;
+        CFI_FAC(o, f);
+        if(op[0] == 'v'){
+            if(f >= 0){ rb_u8(out, 0x14); rb_uleb(out, (uint64_t)r); rb_uleb(out, (uint64_t)f); }
+            else { rb_u8(out, 0x15); rb_uleb(out, (uint64_t)r); rb_sleb(out, f); }
+            return 1;
+        }
+        if(f >= 0){
+            if(r < 64){ rb_u8(out, (uint8_t)(0x80 | r)); rb_uleb(out, (uint64_t)f); }
+            else { rb_u8(out, 0x05); rb_uleb(out, (uint64_t)r); rb_uleb(out, (uint64_t)f); }
+            return 1;
+        }
+        rb_u8(out, 0x11); rb_uleb(out, (uint64_t)r); rb_sleb(out, f); return 1;
+    }
+    if(strcmp(op, "restore") == 0){
+        if(v[0] < 64) rb_u8(out, (uint8_t)(0xc0 | v[0]));
+        else { rb_u8(out, 0x06); rb_uleb(out, (uint64_t)v[0]); }
+        return 1;
+    }
+    if(strcmp(op, "undefined") == 0){ rb_u8(out, 0x07); rb_uleb(out, (uint64_t)v[0]); return 1; }
+    if(strcmp(op, "same_value") == 0){ rb_u8(out, 0x08); rb_uleb(out, (uint64_t)v[0]); return 1; }
+    if(strcmp(op, "register") == 0){
+        rb_u8(out, 0x09); rb_uleb(out, (uint64_t)v[0]); rb_uleb(out, (uint64_t)v[1]); return 1;
+    }
+    if(strcmp(op, "remember_state") == 0){
+        if(stt->nstk + 2 > stt->cstk){
+            stt->cstk = stt->cstk ? stt->cstk * 2 : 8;
+            stt->stk = realloc(stt->stk, sizeof(int64_t) * (size_t)stt->cstk);
+            if(!stt->stk){ perror("realloc"); exit(1); }
+        }
+        stt->stk[stt->nstk++] = stt->reg; stt->stk[stt->nstk++] = stt->off;
+        rb_u8(out, 0x0a); return 1;
+    }
+    if(strcmp(op, "restore_state") == 0){
+        if(stt->nstk < 2){ snprintf(err, esz, "restore_state without remember_state"); return 0; }
+        stt->off = stt->stk[--stt->nstk]; stt->reg = stt->stk[--stt->nstk];
+        rb_u8(out, 0x0b); return 1;
+    }
+    if(strcmp(op, "window_save") == 0 || strcmp(op, "negate_ra_state") == 0){ rb_u8(out, 0x2d); return 1; }
+    if(strcmp(op, "escape") == 0){
+        for(int i = 0; i < nv; i++) rb_u8(out, (uint8_t)v[i]);
+        return 1;
+    }
+    snprintf(err, esz, "'%s' cannot be used here", op);
+    return 0;
+    #undef CFI_FAC
+}
+
+/* ポインタの符号化 enc の大きさ（バイト）。対応しないものは 0。 */
+static int cfi_ptr_size(int enc, int psize){
+    switch(enc & 0x0f){
+    case 0x00: return psize;
+    case 0x02: case 0x0a: return 2;
+    case 0x03: case 0x0b: return 4;
+    case 0x04: case 0x0c: return 8;
+    default: return 0;
+    }
+}
+
+/* リンカ緩和の機種で CFI が局所シンボルを要る位置の並び（初めて現れた順）。
+   axx.py の _cfi_points() と同じ並び。 */
+typedef struct { const char *sec; int64_t b; char *name; int sym; } CfiPt;
+static int cfi_points(const AsmState *st, int bpw, CfiPt **out){
+    CfiPt *p = NULL; int n = 0, c = 0;
+    for(int i = 0; i < st->cfi_fdes_len; i++){
+        const CfiFde *f = &st->cfi_fdes[i];
+        int64_t cand[2048]; int nc = 0;
+        int64_t *big = NULL;
+        int64_t *pts = cand;
+        int maxp = f->nops + 2;
+        if(maxp > 2048){ big = malloc(sizeof(int64_t) * (size_t)maxp); if(!big){ perror("malloc"); exit(1); } pts = big; }
+        int64_t cur = f->start * bpw;
+        pts[nc++] = cur;
+        for(int k = 0; k < f->nops; k++){
+            int64_t ob = f->ops[k].off * bpw;
+            if(ob > cur){ pts[nc++] = ob; cur = ob; }
+        }
+        pts[nc++] = f->end * bpw;
+        for(int k = 0; k < nc; k++){
+            int dup = 0;
+            for(int j = 0; j < n; j++) if(p[j].b == pts[k] && strcmp(p[j].sec, f->sec) == 0){ dup = 1; break; }
+            if(dup) continue;
+            p = elf_decl_grow(p, &c, n, sizeof(CfiPt));
+            p[n].sec = f->sec; p[n].b = pts[k]; p[n].name = NULL; p[n].sym = 0; n++;
+        }
+        free(big);
+    }
+    *out = p;
+    return n;
+}
+static int cfi_pt_sym(const CfiPt *p, int n, const char *sec, int64_t b){
+    for(int i = 0; i < n; i++) if(p[i].b == b && strcmp(p[i].sec, sec) == 0) return p[i].sym;
+    return 0;
+}
+
+typedef struct { int64_t off; int sym; int rt; int64_t addend; } EhRel;
+typedef struct { EhRel *d; int n, c; } EhRelV;
+static void ehrel_push(EhRelV *v, int64_t off, int sym, int rt, int64_t addend){
+    v->d = elf_decl_grow(v->d, &v->c, v->n, sizeof(EhRel));
+    v->d[v->n++] = (EhRel){off, sym, rt, addend};
+}
+
+/* 符号化 enc のポインタのリロケーションを足す（欄は呼ぶ側が 0 で置く）。
+   axx.py の _build_eh_frame() の ptr() と同じ規則である。 */
+static void cfi_ptr_reloc(AsmState *st, const ElfMachineInfo *m, int enc, const char *sym,
+                          int64_t at, int psize, WSNI *snimap, int snimap_len, EhRelV *rel){
+    int n = cfi_ptr_size(enc, psize);
+    int app = enc & 0x70;
+    if(n == 0 || (app != 0x00 && app != 0x10)){
+        axx_diagf(1, 0, " error - CFI: pointer encoding 0x%02x is not supported.\n", enc);
+        return;
+    }
+    int rt = app == 0x10 ? elf_reloc_data_pcrel(st, m, n) : (n <= 8 ? m->wg[n] : 0);
+    if(!rt){
+        axx_diagf(1, 0, " error - CFI: no relocation type for a %d-byte pointer "
+                        "(encoding 0x%02x).\n", n, enc);
+        return;
+    }
+    int si = weo_symof(snimap, snimap_len, sym);
+    if(!si){
+        axx_diagf(1, 0, " error - CFI: unknown symbol '%s'.\n", sym);
+        return;
+    }
+    ehrel_push(rel, at, si, rt, 0);
+}
+
+/* ソースの `.cfi_*` から `.eh_frame` の中身とリロケーションを組む。
+   axx.py の _build_eh_frame() と同じ規則である。 */
+static void build_eh_frame(AsmState *st, const ElfMachineInfo *m, int is_elf64, int is_rela,
+                           int is_le, int bpw, WCS *csecs, int ncs, const CfiPt *pts, int npts,
+                           WSNI *snimap, int snimap_len, RB *data, EhRelV *rel){
+    if(st->cfi_fdes_len == 0) return;
+    if(!st->elf_cfi_set){
+        axx_diagf(1, 0, " error - CFI: the pattern file has no .elfcfi declaration.\n");
+        return;
+    }
+    int64_t ra0 = st->elf_cfi_ra, code = st->elf_cfi_code, da = st->elf_cfi_data;
+    int psize = is_elf64 ? 8 : 4;
+    int pad = st->elf_cfi_pad ? st->elf_cfi_pad : psize;
+    int pcrel4 = elf_reloc_data_pcrel(st, m, 4);
+    if(!pcrel4){
+        axx_diagf(1, 0, " error - CFI: no 4-byte PC-relative relocation type for the "
+                        "FDE address; declare one with .elftype.\n");
+        return;
+    }
+    int radd = 0, rsub = 0;
+    int relax = elf_diff_of(st, 4, &radd, &rsub);
+    if(relax && code != 1){
+        axx_diagf(1, 0, " error - CFI: relocated advances need a code alignment factor of 1.\n");
+        return;
+    }
+    /* 初期命令 */
+    int ni = st->elf_cfiinit_len;
+    CfiOp *init = calloc((size_t)(ni ? ni : 1), sizeof(CfiOp));
+    if(!init){ perror("calloc"); exit(1); }
+    for(int i = 0; i < ni; i++){
+        const char *t = st->elf_cfiinit[i];
+        const char *sp = strchr(t, ' ');
+        size_t ol = sp ? (size_t)(sp - t) : strlen(t);
+        char op[64]; if(ol >= sizeof(op)) ol = sizeof(op) - 1;
+        memcpy(op, t, ol); op[ol] = '\0';
+        for(char *q = op; *q; q++) *q = (char)tolower((unsigned char)*q);
+        const char *spec = cfi_spec(op);
+        static const char *bad[] = {"startproc","endproc","sections","return_column","signal_frame",
+                                    "personality","lsda","adjust_cfa_offset","rel_offset",
+                                    "remember_state","restore_state",NULL};
+        int ok = spec != NULL;
+        for(int k = 0; ok && bad[k]; k++) if(strcmp(op, bad[k]) == 0) ok = 0;
+        char *args[64]; int na = 0;
+        char *buf = strdup(sp ? sp + 1 : "");
+        if(!buf){ perror("strdup"); exit(1); }
+        {
+            int allsp = 1;
+            for(const char *q = buf; *q; q++) if(!isspace((unsigned char)*q)){ allsp = 0; break; }
+            if(!allsp){
+                char *q = buf;
+                while(na < 64){
+                    char *c2 = strchr(q, ',');
+                    if(c2) *c2 = '\0';
+                    char *b = q; while(isspace((unsigned char)*b)) b++;
+                    char *e2 = b + strlen(b); while(e2 > b && isspace((unsigned char)e2[-1])) *--e2 = '\0';
+                    args[na++] = b;
+                    if(!c2) break;
+                    q = c2 + 1;
+                }
+            }
+        }
+        if(ok && strcmp(spec, "*") != 0 && na != (int)strlen(spec)) ok = 0;
+        int64_t vals[64];
+        for(int k = 0; ok && k < na; k++){
+            int r = elf_cfireg_find(st, args[k]);
+            int64_t rv;
+            if(r >= 0) rv = r;
+            else {
+                const char *a = args[k];
+                int neg = 0;
+                if(*a == '+' || *a == '-'){ neg = *a == '-'; a++; }
+                if(a[0] == '0' && (a[1] == 'x' || a[1] == 'X') && a[2]){
+                    for(const char *q = a + 2; *q; q++) if(!isxdigit((unsigned char)*q)){ ok = 0; break; }
+                    if(ok) rv = (int64_t)strtoull(a + 2, NULL, 16);
+                } else if(a[0]){
+                    for(const char *q = a; *q; q++) if(!isdigit((unsigned char)*q)){ ok = 0; break; }
+                    if(ok) rv = (int64_t)strtoull(a, NULL, 10);
+                } else ok = 0;
+                if(!ok) break;
+                if(neg) rv = -rv;
+            }
+            if(strcmp(spec, "*") == 0 && (rv < 0 || rv > 255)){ ok = 0; break; }
+            vals[k] = rv;
+        }
+        if(!ok){
+            axx_diagf(1, 0, " error - .elfcfiinit: cannot use '%s'.\n", t);
+            free(buf);
+            for(int k = 0; k < i; k++) free(init[k].v);
+            free(init);
+            return;
+        }
+        snprintf(init[i].op, sizeof(init[i].op), "%s", op);
+        init[i].nv = na;
+        init[i].v = malloc(sizeof(int64_t) * (size_t)(na ? na : 1));
+        if(!init[i].v){ perror("malloc"); exit(1); }
+        for(int k = 0; k < na; k++) init[i].v[k] = vals[k];
+        free(buf);
+    }
+
+    /* CIE の鍵ごとの位置 */
+    typedef struct { int64_t ra; int signal, simple, penc; const char *psym; int lenc; int64_t off; } CieK;
+    CieK *cies = NULL; int ncie = 0, ccie = 0;
+    char err[256];
+
+    #define EH_RUN(ops_, nops_, stt_, body_) do { \
+        for(int _q = 0; _q < (nops_); _q++){ \
+            if(!cfi_op_bytes((body_), (ops_)[_q].op, (ops_)[_q].v, (ops_)[_q].nv, (stt_), da, err, sizeof(err))) \
+                axx_diagf(1, 0, " error - CFI: .cfi_%s: %s.\n", (ops_)[_q].op, err); \
+        } } while(0)
+    #define EH_EMIT(body_) do { \
+        size_t _tot = 4 + (body_).len; \
+        size_t _pd = (size_t)((pad - (int64_t)(_tot % (size_t)pad)) % pad); \
+        for(size_t _z = 0; _z < _pd; _z++) rb_u8(&(body_), 0); \
+        rb_w4(data, (uint32_t)(body_).len, is_le); rb_app(data, (body_).b, (body_).len); \
+        free((body_).b); } while(0)
+
+    for(int fi = 0; fi < st->cfi_fdes_len; fi++){
+        const CfiFde *fd = &st->cfi_fdes[fi];
+        int sidx = 0;
+        for(int i = 0; i < ncs; i++) if(strcmp(csecs[i].name, fd->sec) == 0){ sidx = i + 1; break; }
+        if(!sidx){
+            axx_diagf(1, 0, " error - CFI: section '%s' of a function is not in the output.\n", fd->sec);
+            continue;
+        }
+        int64_t ra = fd->ra >= 0 ? fd->ra : ra0;
+        int ci = -1;
+        for(int k = 0; k < ncie; k++)
+            if(cies[k].ra == ra && cies[k].signal == fd->signal && cies[k].simple == fd->simple
+               && cies[k].penc == fd->pers_enc && cies[k].lenc == fd->lsda_enc
+               && (fd->pers_enc < 0 || strcmp(cies[k].psym, fd->pers_sym) == 0)){ ci = k; break; }
+        if(ci < 0){
+            int64_t c_off = (int64_t)data->len;
+            cies = elf_decl_grow(cies, &ccie, ncie, sizeof(CieK));
+            cies[ncie] = (CieK){ra, fd->signal, fd->simple, fd->pers_enc, fd->pers_sym, fd->lsda_enc, c_off};
+            ci = ncie++;
+            RB body; rb_init(&body);
+            rb_w4(&body, 0, is_le);
+            int ver = ra <= 255 ? 1 : 3;
+            rb_u8(&body, (uint8_t)ver);
+            char aug[8]; int al = 0;
+            aug[al++] = 'z';
+            if(fd->pers_enc >= 0) aug[al++] = 'P';
+            if(fd->lsda_enc >= 0) aug[al++] = 'L';
+            aug[al++] = 'R';
+            if(fd->signal) aug[al++] = 'S';
+            rb_app(&body, aug, (size_t)al); rb_u8(&body, 0);
+            rb_uleb(&body, (uint64_t)code); rb_sleb(&body, da);
+            if(ver == 1) rb_u8(&body, (uint8_t)ra); else rb_uleb(&body, (uint64_t)ra);
+            RB augd; rb_init(&augd);
+            int p_pos = -1, p_n = 0;
+            if(fd->pers_enc >= 0){
+                rb_u8(&augd, (uint8_t)fd->pers_enc);
+                p_pos = (int)augd.len;
+                p_n = cfi_ptr_size(fd->pers_enc, psize);
+                for(int z = 0; z < p_n; z++) rb_u8(&augd, 0);
+            }
+            if(fd->lsda_enc >= 0) rb_u8(&augd, (uint8_t)fd->lsda_enc);
+            rb_u8(&augd, 0x1b);
+            RB lb; rb_init(&lb); rb_uleb(&lb, augd.len);
+            if(p_pos >= 0){
+                int64_t at = c_off + 4 + (int64_t)body.len + (int64_t)lb.len + p_pos;
+                cfi_ptr_reloc(st, m, fd->pers_enc, fd->pers_sym, at, psize, snimap, snimap_len, rel);
+            }
+            rb_app(&body, lb.b, lb.len); rb_app(&body, augd.b, augd.len);
+            free(lb.b); free(augd.b);
+            if(!fd->simple){
+                CfiStt s0; memset(&s0, 0, sizeof(s0));
+                EH_RUN(init, ni, &s0, &body);
+                free(s0.stk);
+            }
+            EH_EMIT(body);
+        }
+        int64_t c_off = cies[ci].off;
+        int64_t f_off = (int64_t)data->len;
+        CfiStt stt; memset(&stt, 0, sizeof(stt));
+        if(!fd->simple){
+            RB scratch; rb_init(&scratch);
+            EH_RUN(init, ni, &stt, &scratch);
+            free(scratch.b);
+            stt.nstk = 0;
+        }
+        int64_t sb = fd->start * bpw, eb = fd->end * bpw;
+        RB body; rb_init(&body);
+        rb_w4(&body, (uint32_t)((f_off + 4) - c_off), is_le);
+        int64_t at = f_off + 4 + (int64_t)body.len;
+        if(relax){
+            ehrel_push(rel, at, cfi_pt_sym(pts, npts, fd->sec, sb), pcrel4, 0);
+            rb_w4(&body, 0, is_le);
+        } else {
+            ehrel_push(rel, at, sidx, pcrel4, sb);
+            rb_w4(&body, is_rela ? 0 : (uint32_t)sb, is_le);
+        }
+        at = f_off + 4 + (int64_t)body.len;
+        if(relax){
+            ehrel_push(rel, at, cfi_pt_sym(pts, npts, fd->sec, eb), radd, 0);
+            ehrel_push(rel, at, cfi_pt_sym(pts, npts, fd->sec, sb), rsub, 0);
+            rb_w4(&body, 0, is_le);
+        } else {
+            rb_w4(&body, (uint32_t)(eb - sb), is_le);
+        }
+        if(fd->lsda_enc >= 0){
+            int n = cfi_ptr_size(fd->lsda_enc, psize);
+            rb_uleb(&body, (uint64_t)n);
+            at = f_off + 4 + (int64_t)body.len;
+            cfi_ptr_reloc(st, m, fd->lsda_enc, fd->lsda_sym, at, psize, snimap, snimap_len, rel);
+            for(int z = 0; z < n; z++) rb_u8(&body, 0);
+        } else rb_uleb(&body, 0);
+        int64_t cur = sb;
+        for(int k = 0; k < fd->nops; k++){
+            const CfiOp *o = &fd->ops[k];
+            int64_t ob = o->off * bpw;
+            if(ob < cur){
+                axx_diagf(1, 0, " error - CFI: a .cfi_%s is placed before the previous one.\n", o->op);
+                continue;
+            }
+            if(ob > cur){
+                if(relax){
+                    at = f_off + 4 + (int64_t)body.len + 1;
+                    ehrel_push(rel, at, cfi_pt_sym(pts, npts, fd->sec, ob), radd, 0);
+                    ehrel_push(rel, at, cfi_pt_sym(pts, npts, fd->sec, cur), rsub, 0);
+                    rb_u8(&body, 0x04); rb_w4(&body, 0, is_le);
+                } else {
+                    int64_t d = ob - cur;
+                    if(d % code != 0)
+                        axx_diagf(1, 0, " error - CFI: an advance of %lld bytes is not a multiple "
+                                        "of the code alignment factor %lld.\n", (long long)d, (long long)code);
+                    int64_t f = d / code;
+                    if(f < 64) rb_u8(&body, (uint8_t)(0x40 | f));
+                    else if(f <= 0xff){ rb_u8(&body, 0x02); rb_u8(&body, (uint8_t)f); }
+                    else if(f <= 0xffff){ rb_u8(&body, 0x03); rb_w2(&body, (uint16_t)f, is_le); }
+                    else { rb_u8(&body, 0x04); rb_w4(&body, (uint32_t)f, is_le); }
+                }
+                cur = ob;
+            }
+            EH_RUN(o, 1, &stt, &body);
+        }
+        free(stt.stk);
+        EH_EMIT(body);
+    }
+    #undef EH_RUN
+    #undef EH_EMIT
+    free(cies);
+    for(int k = 0; k < ni; k++) free(init[k].v);
+    free(init);
+}
 
 /* `.elflink` の sh_link / sh_info の綴りをセクション番号にする。数（10 進か
    0x 付き 16 進）ならそのまま、名前なら出力するセクションから引く。
@@ -15051,8 +16001,42 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     WSNI *snimap=calloc((size_t)(st->labels.count+st->export_labels.count+8),sizeof(WSNI));
     int snimap_len=0;
 
-    weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,0,0,0,0,0,0);
-    for(int i=0;i<ncs;i++) weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,0,0x03,0,(uint16_t)(i+1+G),0,0);
+    /* 節番号が SHN_LORESERVE (0xff00) 以上のセクションがあれば、st_shndx に
+       SHN_XINDEX (0xffff) を書き、本当の番号を `.symtab_shndx` に置く。
+       axx.py の write_elf_obj() の _psym() と同じ規則である。 */
+    int _need_xidx = (ncs + G) >= 0xff00;
+    uint32_t *sym_xidx = NULL; int n_xidx = 0, c_xidx = 0;
+    #define WEO_PSYM(nm_, info_, oth_, shx_, special_, val_, sz_) do { \
+        uint32_t _s32 = (shx_); uint32_t _xv = 0; \
+        if(!(special_) && _s32 >= 0xff00){ _xv = _s32; _s32 = 0xffff; } \
+        sym_xidx = elf_decl_grow(sym_xidx, &c_xidx, n_xidx, sizeof(uint32_t)); \
+        sym_xidx[n_xidx++] = _xv; \
+        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,(nm_),(info_),(oth_),(uint16_t)_s32,(val_),(sz_)); \
+    } while(0)
+    WEO_PSYM(0,0,0,0,1,0,0);
+    for(int i=0;i<ncs;i++) WEO_PSYM(0,0x03,0,(uint32_t)(i+1+G),0,0,0);
+
+    /* リンカ緩和の機種の CFI が使う局所シンボル（.Lcfi<n>）。 */
+    CfiPt *cfi_pts = NULL; int n_cfi_pts = 0;
+    {
+        int _ra, _rs;
+        if(st->cfi_fdes_len > 0 && elf_diff_of(st, 4, &_ra, &_rs)){
+            n_cfi_pts = cfi_points(st, bpw, &cfi_pts);
+            for(int k = 0; k < n_cfi_pts; k++){
+                char nm[64]; snprintf(nm, sizeof(nm), ".Lcfi%d", k);
+                size_t L = strlen(nm);
+                char *name = malloc(L + 64);
+                if(!name){ perror("malloc"); exit(1); }
+                memcpy(name, nm, L + 1);
+                while(lmap_find(&st->labels, name) || lmap_find(&st->export_labels, name)){
+                    name = realloc(name, strlen(name) + 2);
+                    if(!name){ perror("realloc"); exit(1); }
+                    strcat(name, "_");
+                }
+                cfi_pts[k].name = name;
+            }
+        }
+    }
 
     int nl=0;
     WLK *larr=calloc((size_t)(st->labels.count?st->labels.count:1),sizeof(WLK));
@@ -15081,31 +16065,40 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         WSR sr = !_via_sec
                  ? (WSR){0xfff1, larr[i].val}
                  : weo_shndx(st,csecs,ncs,larr[i].val*(uint64_t)bpw,larr[i].section,bpw);
-        uint16_t _shx = sr.shndx; uint64_t _sval = sr.sv;
+        uint32_t _shx = sr.shndx; uint64_t _sval = sr.sv;
+        int _special = !_via_sec || ncs == 0;
         if(_via_sec){
-            if(_shx != 0xfff1) _shx = (uint16_t)(_shx + G);
+            if(ncs > 0) _shx = _shx + (uint32_t)G;
             if(_word_unit) _sval /= (uint64_t)bpw;
         }
         uint64_t _ssz = weo_sym_size(st, larr[i].name, _bpw_sym);
+        if(sym_attr_get(st, larr[i].name).common) _special = 1;
         weo_sym_common(st, larr[i].name, _bpw_sym, &_shx, &_sval, &_ssz);
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
         snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
-        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,
-                weo_sym_info(st,larr[i].name,0),weo_sym_other(st,larr[i].name),
-                _shx,_sval,_ssz);
+        WEO_PSYM(noff, weo_sym_info(st,larr[i].name,0), weo_sym_other(st,larr[i].name),
+                 _shx, _special, _sval, _ssz);
+    }
+    for(int k = 0; k < n_cfi_pts; k++){
+        int _si = 0;
+        for(int i = 0; i < ncs; i++) if(strcmp(csecs[i].name, cfi_pts[k].sec) == 0){ _si = i + 1; break; }
+        if(!_si) continue;
+        uint32_t noff = wbb_str(&strtab_bb, cfi_pts[k].name);
+        cfi_pts[k].sym = nsyms;
+        uint64_t _cv = _word_unit ? (uint64_t)cfi_pts[k].b / (uint64_t)bpw : (uint64_t)cfi_pts[k].b;
+        WEO_PSYM(noff, 0, 0, (uint32_t)(_si + G), 0, _cv, 0);
     }
     int first_global=nsyms;
     for(int i=0;i<nl;i++){
         if(!larr[i].is_imported) continue;
         if(weo_isexp(earr,ne,larr[i].name)) continue;
-        uint16_t _shx = 0; uint64_t _sval = 0;
+        uint32_t _shx = 0; uint64_t _sval = 0;
         uint64_t _ssz = weo_sym_size(st, larr[i].name, _bpw_sym);
         weo_sym_common(st, larr[i].name, _bpw_sym, &_shx, &_sval, &_ssz);
         uint32_t noff=wbb_str(&strtab_bb,larr[i].name);
         snimap[snimap_len++]=(WSNI){larr[i].name,nsyms};
-        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,
-                weo_sym_info(st,larr[i].name,1),weo_sym_other(st,larr[i].name),
-                _shx,_sval,_ssz);
+        WEO_PSYM(noff, weo_sym_info(st,larr[i].name,1), weo_sym_other(st,larr[i].name),
+                 _shx, 1, _sval, _ssz);
     }
     for(int i=0;i<ne;i++){
         int _equ_has_reloc = earr[i].is_equ && (earr[i].reloc_type_override >= 0);
@@ -15113,18 +16106,19 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         WSR sr = !_via_sec
                  ? (WSR){0xfff1, earr[i].val}
                  : weo_shndx(st,csecs,ncs,earr[i].val*(uint64_t)bpw,earr[i].section,bpw);
-        uint16_t _shx = sr.shndx; uint64_t _sval = sr.sv;
+        uint32_t _shx = sr.shndx; uint64_t _sval = sr.sv;
+        int _special = !_via_sec || ncs == 0;
         if(_via_sec){
-            if(_shx != 0xfff1) _shx = (uint16_t)(_shx + G);
+            if(ncs > 0) _shx = _shx + (uint32_t)G;
             if(_word_unit) _sval /= (uint64_t)bpw;
         }
         uint64_t _ssz = weo_sym_size(st, earr[i].name, _bpw_sym);
+        if(sym_attr_get(st, earr[i].name).common) _special = 1;
         weo_sym_common(st, earr[i].name, _bpw_sym, &_shx, &_sval, &_ssz);
         uint32_t noff=wbb_str(&strtab_bb,earr[i].name);
         snimap[snimap_len++]=(WSNI){earr[i].name,nsyms};
-        weo_sym(&symtab_bb,&nsyms,_is_le,_is_elf64,noff,
-                weo_sym_info(st,earr[i].name,1),weo_sym_other(st,earr[i].name),
-                _shx,_sval,_ssz);
+        WEO_PSYM(noff, weo_sym_info(st,earr[i].name,1), weo_sym_other(st,earr[i].name),
+                 _shx, _special, _sval, _ssz);
     }
 
 
@@ -15356,6 +16350,38 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     uint32_t *grp_noff = calloc((size_t)(G ? G : 1), sizeof(uint32_t));
     if(!grp_noff){ perror("calloc"); exit(1); }
     for(int g = 0; g < G; g++) grp_noff[g] = wbb_str(&shstr, st->elf_groups[grp_of[g]].name);
+    /* `.eh_frame`（ソースの `.cfi_*` から）。 */
+    if(st->cfi_open)
+        axx_diagf(1, 0, " error - .cfi_startproc without .cfi_endproc.\n");
+    int _has_eh = st->cfi_fdes_len > 0;
+    uint32_t eh_noff = 0, ehr_noff = 0;
+    if(_has_eh){
+        eh_noff = wbb_str(&shstr, ".eh_frame");
+        ehr_noff = wbb_str(&shstr, _is_rela_w ? ".rela.eh_frame" : ".rel.eh_frame");
+    }
+    uint32_t xidx_noff = _need_xidx ? wbb_str(&shstr, ".symtab_shndx") : 0;
+    RB eh_data; rb_init(&eh_data);
+    EhRelV eh_rel = {NULL, 0, 0};
+    uint8_t *eh_rbuf = NULL; size_t eh_rlen = 0;
+    if(_has_eh){
+        build_eh_frame(st, _mtbl_w, _is_elf64, _is_rela_w, _is_le, bpw, csecs, ncs,
+                       cfi_pts, n_cfi_pts, snimap, snimap_len, &eh_data, &eh_rel);
+        eh_rlen = (size_t)eh_rel.n * (size_t)_reloc_entsz;
+        eh_rbuf = calloc(1, eh_rlen ? eh_rlen : 1);
+        if(!eh_rbuf){ perror("calloc"); exit(1); }
+        for(int k = 0; k < eh_rel.n; k++){
+            uint8_t *rp = eh_rbuf + (size_t)k * (size_t)_reloc_entsz;
+            if(_is_elf64){
+                weo_w8(rp, (uint64_t)eh_rel.d[k].off, _is_le);
+                weo_w8(rp + 8, weo_rinfo(eh_rel.d[k].sym, eh_rel.d[k].rt, 1), _is_le);
+                if(_is_rela_w) weo_w8s(rp + 16, eh_rel.d[k].addend, _is_le);
+            } else {
+                weo_w4(rp, (uint32_t)eh_rel.d[k].off, _is_le);
+                weo_w4(rp + 4, (uint32_t)weo_rinfo(eh_rel.d[k].sym, eh_rel.d[k].rt, 0), _is_le);
+                if(_is_rela_w) weo_w4(rp + 8, (uint32_t)eh_rel.d[k].addend, _is_le);
+            }
+        }
+    }
 
     uint64_t foff=_is_elf64?64:52;
     uint64_t *sec_fo=calloc((size_t)ncs,sizeof(uint64_t));
@@ -15418,15 +16444,22 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         grp_info[g] = (uint32_t)si;
     }
     for(int g = 0; g < G; g++){ foff = WEO_ALIGN(foff, 4); grp_fo[g] = foff; foff += grp_len[g]; }
+    uint64_t xidx_fo = 0;
+    uint64_t eh_fo = 0, ehr_fo = 0; int eh_shidx = 0;
+    uint64_t eh_fl; uint32_t eh_ty; int eh_as; uint32_t eh_al, eh_es;
+    elf_section_attrs(st, ".eh_frame", &eh_fl, &eh_ty, &eh_as, &eh_al, &eh_es);
+    if(!eh_as) eh_al = st->elf_cfi_set && st->elf_cfi_pad ? (uint32_t)st->elf_cfi_pad : (_is_elf64 ? 8u : 4u);
+    if(_has_eh){
+        foff = WEO_ALIGN(foff, eh_al ? eh_al : 1); eh_fo = foff; foff += eh_data.len;
+        foff = WEO_ALIGN(foff, 8); ehr_fo = foff; foff += eh_rlen;
+        eh_shidx = tot_sh; tot_sh += 2;
+    }
+    if(_need_xidx){ foff = WEO_ALIGN(foff, 4); xidx_fo = foff; foff += (uint64_t)n_xidx * 4; tot_sh++; }
     uint64_t shdr_fo=WEO_ALIGN(foff,8);
 
-    if(tot_sh > 0xFFFF || shstrndx > 0xFFFF){
-        if(should_report_errors(st)){
-            axx_diagf(1, 0, " error - too many ELF section headers (%d) to represent in e_shnum; "
-                       "cannot write ELF object.\n", tot_sh);
-        }
-        goto weo_done;
-    }
+    /* SHN_LORESERVE 以上の数は 0 番目のセクションヘッダに置く（ELF の決まり）。 */
+    uint16_t _e_shnum    = tot_sh >= 0xff00 ? 0 : (uint16_t)tot_sh;
+    uint16_t _e_shstrndx = shstrndx >= 0xff00 ? 0xffff : (uint16_t)shstrndx;
 
     FILE *fp=fopen(path,"wb");
     if(!fp){
@@ -15452,7 +16485,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         WEO_LE8(eh+40,shdr_fo);
         WEO_LE4(eh+48,_e_flags);
         WEO_LE2(eh+52,64); WEO_LE2(eh+58,64);
-        WEO_LE2(eh+60,(uint16_t)tot_sh); WEO_LE2(eh+62,(uint16_t)shstrndx);
+        WEO_LE2(eh+60,_e_shnum); WEO_LE2(eh+62,_e_shstrndx);
         fwrite(eh,1,64,fp);
     } else {
         uint8_t eh[52]={0};
@@ -15463,7 +16496,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         WEO_LE4(eh+32,(uint32_t)shdr_fo);
         WEO_LE4(eh+36,_e_flags);
         WEO_LE2(eh+40,52); WEO_LE2(eh+46,40);
-        WEO_LE2(eh+48,(uint16_t)tot_sh); WEO_LE2(eh+50,(uint16_t)shstrndx);
+        WEO_LE2(eh+48,_e_shnum); WEO_LE2(eh+50,_e_shstrndx);
         fwrite(eh,1,52,fp);
     }
 
@@ -15479,9 +16512,19 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int i=0;i<n_dbg_prog;i++){ weo_pad(fp,dbg_prog_fo[i]); if(dbg_prog[i].len) fwrite(dbg_prog[i].data,1,dbg_prog[i].len,fp); }
     for(int i=0;i<n_dbg_rela;i++){ weo_pad(fp,dbg_rela_fo[i]); if(dbg_rela[i].len) fwrite(dbg_rela[i].data,1,dbg_rela[i].len,fp); }
     for(int g=0;g<G;g++){ weo_pad(fp,grp_fo[g]); fwrite(grp_data[g],1,grp_len[g],fp); }
+    if(_has_eh){
+        weo_pad(fp,eh_fo); if(eh_data.len) fwrite(eh_data.b,1,eh_data.len,fp);
+        weo_pad(fp,ehr_fo); if(eh_rlen) fwrite(eh_rbuf,1,eh_rlen,fp);
+    }
+    if(_need_xidx){
+        weo_pad(fp,xidx_fo);
+        for(int k=0;k<n_xidx;k++){ uint8_t b4[4]; weo_w4(b4,sym_xidx[k],_is_le); fwrite(b4,1,4,fp); }
+    }
     weo_pad(fp,shdr_fo);
 
-    weo_shdr(fp,_is_le,_is_elf64,0,0,0,0,0,0,0,0,0,0);
+    weo_shdr(fp,_is_le,_is_elf64,0,0,0,0,0,
+             tot_sh >= 0xff00 ? (uint64_t)tot_sh : 0,
+             shstrndx >= 0xff00 ? (uint32_t)shstrndx : 0,0,0,0);
     for(int g=0;g<G;g++)
         weo_shdr(fp,_is_le,_is_elf64,grp_noff[g],17,0,0,grp_fo[g],grp_len[g],
                  (uint32_t)sym_shidx,grp_info[g],4,4);
@@ -15522,6 +16565,14 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         weo_shdr(fp,_is_le,_is_elf64,dbg_rela_noff[i],_dbg_rel_sh_type,0x40,0,dbg_rela_fo[i],dbg_rela[i].len,
                  (uint32_t)sym_shidx,(uint32_t)(dbg_base+1+dbg_rela[i].target),_dbg_word_align,(uint64_t)_reloc_entsz);
     }
+    if(_has_eh){
+        weo_shdr(fp,_is_le,_is_elf64,eh_noff,eh_ty,eh_fl,0,eh_fo,eh_data.len,0,0,eh_al,(uint64_t)eh_es);
+        weo_shdr(fp,_is_le,_is_elf64,ehr_noff,_is_rela_w?4:9,0x40,0,ehr_fo,eh_rlen,
+                 (uint32_t)sym_shidx,(uint32_t)eh_shidx,_is_elf64?8:4,(uint64_t)_reloc_entsz);
+    }
+    if(_need_xidx)
+        weo_shdr(fp,_is_le,_is_elf64,xidx_noff,18,0,0,xidx_fo,(uint64_t)n_xidx*4,
+                 (uint32_t)sym_shidx,0,4,4);
     if(axx_close_out(fp, path)) goto weo_done;
     {
     char _dbg_msg[64];
@@ -15532,6 +16583,11 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     }
 
 weo_done:
+    free(sym_xidx);
+    for(int k = 0; k < n_cfi_pts; k++) free(cfi_pts[k].name);
+    free(cfi_pts);
+    free(eh_data.b); free(eh_rel.d); free(eh_rbuf);
+    #undef WEO_PSYM
     for(int g=0;g<G;g++){ free(grp_nums[g]); free(grp_data[g]); }
     free(grp_of); free(grp_nums); free(grp_nnum); free(grp_member);
     free(grp_noff); free(grp_data); free(grp_len); free(grp_info); free(grp_fo);
@@ -18111,6 +19167,13 @@ static void check_elfdecls(Assembler *asmb){
                 axx_diagf(0, 0, " warning - .elfdiff: unknown relocation type '%s' for %s; "
                            "ignored.\n", tt[k], m->name);
     }
+    for(int i = 0; i < st->elf_diff_t_len; i++){
+        const char *tt[3] = { st->elf_diff_t[i].type, st->elf_diff_t[i].add, st->elf_diff_t[i].sub };
+        for(int k = 0; k < 3; k++)
+            if(elf_decl_type_in(m->named, tt[k]) < 0)
+                axx_diagf(0, 0, " warning - .elfdiff: unknown relocation type '%s' for %s; "
+                           "ignored.\n", tt[k], m->name);
+    }
     for(int i = 0; i < st->elf_encodes_len; i++)
         if(elf_decl_type_in(m->named, st->elf_encodes[i].type) < 0)
             axx_diagf(0, 0, " warning - .elfencode: unknown relocation type '%s' for %s; "
@@ -18185,6 +19248,29 @@ static void elf_desc_print(AsmState *st, FILE *fp){
                 elf_desc_tname(m, rb, b2, sizeof(b2)));
     }
     {
+        /* 型付きの差は型番号の小さい順（同じ型は最初の宣言）。 */
+        int *rts = NULL; int nrt = 0, crt_ = 0;
+        for(int i = 0; i < st->elf_diff_t_len; i++){
+            int rt = elf_decl_type_in(m->named, st->elf_diff_t[i].type);
+            int ra, rb;
+            if(rt < 0 || !elf_diff_t_of(st, rt, &ra, &rb)) continue;
+            int dup = 0;
+            for(int k = 0; k < nrt; k++) if(rts[k] == rt){ dup = 1; break; }
+            if(dup) continue;
+            rts = elf_decl_grow(rts, &crt_, nrt, sizeof(int));
+            rts[nrt++] = rt;
+        }
+        for(int a = 1; a < nrt; a++)
+            for(int b = a; b > 0 && rts[b-1] > rts[b]; b--){ int t = rts[b]; rts[b] = rts[b-1]; rts[b-1] = t; }
+        for(int k = 0; k < nrt; k++){
+            int ra, rb; char b2[32], b3[32];
+            elf_diff_t_of(st, rts[k], &ra, &rb);
+            fprintf(fp, ".elfdiff::%s::%s::%s\n", elf_desc_tname(m, rts[k], b1, sizeof(b1)),
+                    elf_desc_tname(m, ra, b2, sizeof(b2)), elf_desc_tname(m, rb, b3, sizeof(b3)));
+        }
+        free(rts);
+    }
+    {
         /* 添えるリロケーションと書き戻し関数は、型番号の小さい順。 */
         int *rts = NULL; int nrt = 0, crt_ = 0;
         for(int i = 0; i < st->elf_extras_len + st->elf_encodes_len; i++){
@@ -18216,6 +19302,25 @@ static void elf_desc_print(AsmState *st, FILE *fp){
         free(rts);
     }
     if(st->elf_decl_rinfo) fprintf(fp, ".elfrinfo::%s\n", st->elf_decl_rinfo);
+    if(st->elf_cfi_set){
+        fprintf(fp, ".elfcfi::%d::%d::%d", st->elf_cfi_ra, st->elf_cfi_code, st->elf_cfi_data);
+        if(st->elf_cfi_pad) fprintf(fp, "::%d", st->elf_cfi_pad);
+        fprintf(fp, "\n");
+    }
+    for(int i = 0; i < st->elf_cfiinit_len; i++) fprintf(fp, ".elfcfiinit::%s\n", st->elf_cfiinit[i]);
+    {
+        int nr = st->elf_cfireg_len;
+        int *ord = malloc(sizeof(int) * (size_t)(nr + 1));
+        if(!ord){ perror("malloc"); exit(1); }
+        for(int i = 0; i < nr; i++) ord[i] = i;
+        for(int a = 1; a < nr; a++)
+            for(int b = a; b > 0 && strcmp(st->elf_cfireg[ord[b-1]].name, st->elf_cfireg[ord[b]].name) > 0; b--){
+                int t = ord[b]; ord[b] = ord[b-1]; ord[b-1] = t;
+            }
+        for(int i = 0; i < nr; i++)
+            fprintf(fp, ".elfcfireg::%s::%d\n", st->elf_cfireg[ord[i]].name, st->elf_cfireg[ord[i]].num);
+        free(ord);
+    }
     elf_field_effective(st);
     int nf = g_elf_field_eff.n;
     ElfFieldInfo *fs = (ElfFieldInfo*)malloc(sizeof(ElfFieldInfo) * (size_t)(nf + 1));
@@ -18312,6 +19417,9 @@ static void register_elfdecls(Assembler *asmb){
         case PD_ELFUNIT:    dir_elfunit(asmb, e);     break;
         case PD_ELFLINK:    dir_elflink(asmb, e);     break;
         case PD_ELFGROUP:   dir_elfgroup(asmb, e);    break;
+        case PD_ELFCFI:     dir_elfcfi(asmb, e);      break;
+        case PD_ELFCFIINIT: dir_elfcfiinit(asmb, e);  break;
+        case PD_ELFCFIREG:  dir_elfcfireg(asmb, e);   break;
         default: break;
         }
     }

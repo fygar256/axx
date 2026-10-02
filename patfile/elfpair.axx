@@ -13,11 +13,18 @@
 /*        index 0, 1 the same symbol. A `call` gets R_RISCV_RELAX,
 /*        as GNU as and llvm-mc write it.
 /*   .elfdiff::<width>::<add type>::<subtract type>
-/*        a <width>-byte field holding the difference of two labels
-/*        (a-b, a-b+c) gets the add type against a with the constant
-/*        as its addend and the subtract type against b. Under RELA
-/*        the field itself is written as 0, because these types add
-/*        to and subtract from what is in it.
+/*        a <width>-byte field holding a sum and difference of labels
+/*        (a-b, a-b+c-d+4, -(a-b)) gets the add type against each
+/*        added label (the first one carries the constant) and the
+/*        subtract type against each subtracted one. Under RELA the
+/*        field itself is written as 0, because these types add to
+/*        and subtract from what is in it.
+/*   .elfdiff::<type>::<add type>::<subtract type>
+/*        the same for a field `.reloc` gives <type>: a ULEB128 or the
+/*        6-bit field of DW_CFA_advance_loc.
+/*   .elfcfi / .elfcfiinit / .elfcfireg
+/*        call frame information; the advances of the .eh_frame use
+/*        the .elfdiff::4 pair, so they shrink with relaxed code.
 /*   .elfgroup::<name>::<signature>::<flags>::<member>[,<member>...]
 /*        a section group (SHT_GROUP); flags 1 is GRP_COMDAT.
 /*   .elflink::<section>::<sh_link>[::<sh_info>]
@@ -46,6 +53,51 @@
 /* --- label differences in data ------------------------------------ */
 .elfdiff::4::add32::sub32
 .elfdiff::8::add64::sub64
+
+/* --- typed differences: a ULEB128 field and a 6-bit field ---------- */
+/* A difference in a field `.reloc` types gets the pair declared for  */
+/* that type. The ULEB128 keeps its assembled bytes (the linker       */
+/* rewrites it in place, keeping its length); the 6-bit field is the  */
+/* low bits of a byte, as in DW_CFA_advance_loc.                      */
+.elftype::set6::53::1          /* R_RISCV_SET6                      */
+.elftype::sub6::52::1          /* R_RISCV_SUB6                      */
+.elftype::set_uleb128::60      /* R_RISCV_SET_ULEB128               */
+.elftype::sub_uleb128::61      /* R_RISCV_SUB_ULEB128               */
+.elffield::set6::0x3f
+.elfdiff::set6::set6::sub6
+.elfdiff::set_uleb128::set_uleb128::sub_uleb128
+
+.func uleb(v)
+a = []
+i = 0
+.while(1)
+b = v & 0x7f
+v = v >> 7
+.if v == 0 .then
+a[i] = b
+.return a
+.endif
+a[i] = b | 0x80
+i = i + 1
+.endwhile
+.endfunc
+
+.reloc::v::set_uleb128
+ULEB !v :: .call uleb(v)
+.clrreloc::v
+.reloc::v::set6
+ADV6 !v :: 0x40|(v&0x3f)
+.clrreloc::v
+
+/* --- call frame information (manual 3.7.11) ------------------------ */
+/* With .elfdiff::4 declared, the function length and every advance  */
+/* of the CFI are written as ADD32/SUB32 pairs on local symbols, so   */
+/* they stay right when the linker relaxes the code.                  */
+.elftype::pcrel32::57::4::1    /* R_RISCV_32_PCREL: the FDE address */
+.elfcfi::1::1::-8              /* RA = x1, code 1, data -8          */
+.elfcfiinit::def_cfa sp, 0
+.elfcfireg::ra::1
+.elfcfireg::sp::2
 
 /* --- a COMDAT group and a link-order section ------------------------ */
 .elfsection::.text.foo::0x6            /* ALLOC+EXECINSTR             */

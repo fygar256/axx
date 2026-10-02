@@ -90,14 +90,24 @@ elfpair.axx                         pattern file for relocations that come in
                                     pairs or with a companion, section groups
                                     and sh_link, on RISC-V (riscv64.axx is
                                     included): .elfextra adds R_RISCV_RELAX to
-                                    every call, .elfdiff writes a label
-                                    difference as an ADD/SUB pair, .elfgroup
+                                    every call, .elfdiff writes sums and
+                                    differences of labels as ADD/SUB pairs
+                                    (also a ULEB128 and a 6-bit field, and the
+                                    advances of a relaxed .eh_frame), .elfgroup
                                     makes a COMDAT group and .elflink sets the
                                     sh_link of a link-order section (manual
                                     3.7.10)
 elfpair.s                           test assemble file for elfpair.axx. the
                                     relocations, the group and the section
                                     headers match llvm-mc's for the same code
+elfcfi.axx                          pattern file for call frame information:
+                                    the source's .cfi_* directives become an
+                                    .eh_frame; .elfcfi / .elfcfiinit /
+                                    .elfcfireg describe the CIE and the DWARF
+                                    register numbers (x86-64, manual 3.7.11)
+elfcfi.s                            test assemble file for elfcfi.axx. the
+                                    .eh_frame rows llvm-dwarfdump reads match
+                                    those of llvm-mc's object for the same code
 elfmips.axx                         pattern file for .elfencode: MIPS32 (REL)
                                     whose R_MIPS_HI16 field is written back by a
                                     mini-language function ((addend+0x8000)>>16),

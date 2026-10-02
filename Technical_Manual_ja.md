@@ -43,7 +43,7 @@ axx patfile/8080toz80.axx asmsrc/hello8080.s -V > out.s  # 翻訳したテキス
 
 この 2 つは同じ入力に対して**バイト単位で同一の出力**を生成することを意図しています。
 同梱のパターンファイル、テストソース、`test1` スクリプトはまさにそれを検証するために
-存在します。`test1` は同梱の 35 組のパターン/ソースの対を両方の実装でアセンブルし、
+存在します。`test1` は同梱の 36 組のパターン/ソースの対を両方の実装でアセンブルし、
 結果を `cmp` します。さらに `.textmode` の 3 組については、`-V` で標準出力へ流した
 翻訳テキストどうしも、`echo.axx` の組については標準エラーへ出た `.echo` の行どうしも
 `cmp` します。中核の 16 組は `-o`・`-m 3 -f 32 -o`・`-g -o`・`-v`・`-V` でも
@@ -268,6 +268,11 @@ ELF クラス・RELA/REL・ヘッダの欄は、パターンファイルの ELF 
 来ます。宣言が無ければ、型の決まらない参照はリロケーションを出しません
 （当てずっぽうの型番号を書かないためです）。`-m` を書かなければ、パターンの
 `.elfmachine` が、それも無ければ 62（x86-64）が対象になります。
+
+セクションの数に上限はありません。節番号が `SHN_LORESERVE`（0xff00）以上の
+セクションがあるときは、ELF の決まりどおり `e_shnum` / `e_shstrndx` を 0 番目の
+セクションヘッダに置き、シンボルの節番号を `.symtab_shndx`（`SHT_SYMTAB_SHNDX`）に
+書きます。
 
 上の表の中身も、パターンファイルの宣言で書けるものだけでできています。
 ELF を書くコードには機種番号で分かれる処理がありません。表を使わずに記述を
@@ -1423,7 +1428,10 @@ SuperH(42) SPARCV9(43) x86-64(62) AArch64(183) RISC-V(243) — のリロケー�
 | `.elfpcguess::<0>` / `<1>` | 幅から推定した絶対型を PC 相対型に取り替えるか（3.7.9 節） |
 | `.elfbuiltin::<0>` / `<1>` | 組み込みの表を土台にするか（3.7.9 節） |
 | `.elfextra::<型>::<添える型>[::<シンボル>]` | 同じ位置に添えるリロケーション（3.7.10 節） |
-| `.elfdiff::<幅>::<足す型>::<引く型>` | ラベル差を足す型と引く型の対で出す（3.7.10 節） |
+| `.elfdiff::<幅または型>::<足す型>::<引く型>` | ラベルの和と差を足す型と引く型の組で出す（3.7.10 節） |
+| `.elfcfi::<戻り番地の列>::<コード整列>::<データ整列>[::<詰め>]` | CFI（`.eh_frame`）の CIE の欄（3.7.11 節） |
+| `.elfcfiinit::<命令>` | CIE の初期命令（3.7.11 節） |
+| `.elfcfireg::<名前>::<DWARF 番号>` | CFI の指令に書くレジスタ名（3.7.11 節） |
 | `.elfencode::<型>::<関数>` | REL で加数を欄へ書き戻す関数（3.7.10 節） |
 | `.elfrinfo::<関数>` | `r_info` を組む関数（3.7.10 節） |
 | `.elfunit::<byte>` / `<word>` | 加数とシンボル値の単位（3.7.10 節） |
@@ -1734,7 +1742,7 @@ $ axx aarch64.axx -m 183 --elfdesc
 型は名前で書き、名前の無い型は番号で書きます。`.elfheader`・`.elfsection`・
 `.elflink`・`.elfgroup` はパターンファイルに書いたものだけが出ます（組み込みの表は
 これらを持ちません）。3.7.10 節の `.elfunit`・`.elfdiff`・`.elfextra`・`.elfencode`・
-`.elfrinfo` も書き出します。`.elfencode` と `.elfrinfo` が名前を挙げる関数そのものは
+`.elfrinfo` と、3.7.11 節の `.elfcfi`・`.elfcfiinit`・`.elfcfireg` も書き出します。`.elfencode` と `.elfrinfo` が名前を挙げる関数そのものは
 書き出さないので、関数を定義したパターンファイルと一緒に使ってください。
 
 実例は同梱の `elfrel.axx` / `elfrel.s` です。ARM（EM_ARM、40）を `.elfbuiltin::0`
@@ -1753,7 +1761,8 @@ $ axx aarch64.axx -m 183 --elfdesc
 | 宣言 | 決めるもの |
 |---|---|
 | `.elfextra::<型>::<添える型>[::<シンボル>]` | その型のリロケーションに、同じ位置へもう 1 つ添える |
-| `.elfdiff::<幅>::<足す型>::<引く型>` | 2 つのラベルの差を、足す型と引く型の対で出す |
+| `.elfdiff::<幅>::<足す型>::<引く型>` | ラベルの和と差（`a-b`、`a-b+c-d+4`、`-(a-b)`）を、足す型と引く型の組で出す |
+| `.elfdiff::<型>::<足す型>::<引く型>` | 同じことを `.reloc` でその型を付けた欄（ULEB128、6 ビットの欄など）に |
 | `.elfencode::<型>::<関数>` | REL のとき、加数を欄へ書き戻す関数 |
 | `.elfrinfo::<関数>` | リロケーション項目の `r_info` を組む関数 |
 | `.elfunit::<byte>` / `<word>` | 加数とシンボル値（`st_value` / `st_size`）の単位 |
@@ -1771,24 +1780,54 @@ $ axx aarch64.axx -m 183 --elfdesc
 .elfextra::call::relax          /* call ext -> R_RISCV_CALL_PLT ext, R_RISCV_RELAX */
 ```
 
-**`.elfdiff` — ラベル差。** `dword a-b` のように、欄の値が 2 つのラベルの差
-になっている参照には、`.elfdiff` がその幅の欄に
+**`.elfdiff` — ラベルの和と差。** `dword a-b` のように、欄の値がラベルの
+足し引きでできている参照には、`.elfdiff` がその幅の欄に
 
-- `a` への `<足す型>`（加数は定数部。`a-b+4` なら 4）
-- `b` への `<引く型>`（加数 0）
+- 足されるラベルそれぞれへの `<足す型>`
+- 引かれるラベルそれぞれへの `<引く型>`
 
-の 2 つを同じ位置に出します。リンカが命令を縮める機種では、同じセクションの中の
-差でもリンク後に値が変わるので、この対が要ります（RISC-V の `R_RISCV_ADD32` /
-`R_RISCV_SUB32` など）。
+を同じ位置に出します。定数部（`a-b+4` なら 4）は最初の足す型の加数に置き、足す
+ラベルが無い式（`-a+5`）では最初の引く型の加数に符号を反転して置きます。項目は
+足す型を先に、引く型を後に並べます（欄を上書きする SET 型が先に効くように）。
+リンカが命令を縮める機種では、同じセクションの中の差でもリンク後に値が変わるので、
+この組が要ります（RISC-V の `R_RISCV_ADD32` / `R_RISCV_SUB32` など）。
 
-- 取り込む式は `<ラベル> - <ラベル>`（前後に定数を足し引きしてよい）の形です。
-  どちらが引かれているかは、取り込んだ式の綴りで、ラベルの直前（空白を除く）が
-  `-` かどうかで決めます。決まらない式（`-(a-b)` など）は曖昧として
-  リロケーションを出しません。
+- 取り込む式は、ラベル・数・`+`・`-`・括弧だけでできたものです。各ラベルの符号は
+  取り込んだ式の綴りから決め、括弧の前の `-` は中の符号を反転します。
+  `a-b+c-d+4`、`-(a-b)`、`a-(b-c)` が書けます。掛け算などを含む式、同じラベルが
+  2 回現れる式は曖昧としてリロケーションを出しません。
+- ラベルが 1 つでも符号が負（`-a+5`）なら、`.elfdiff` があれば引く型だけで出し、
+  無ければ出しません（足す型の加数では表せないため）。
 - RELA では欄そのものは 0 で出します。この種の型は欄の中身に足し引きするので、
   定数は加数の側に置きます（GNU as・llvm-mc と同じ形）。REL では定数が欄に入ります。
 - その幅に `.elfdiff` が無ければ、リロケーションを出しません（`-d` で
   報告されます）。
+
+**型付きの差。** `.elfdiff` の第 1 欄に幅ではなく型名を書くと、`.reloc` で
+その型を付けた欄に同じ組を出します。
+
+```
+.elftype::set6::53::1
+.elftype::sub6::52::1
+.elffield::set6::0x3f                  /* バイトの下位 6 ビット */
+.elfdiff::set6::set6::sub6
+.reloc::v::set6
+ADV6 !v :: 0x40|(v&0x3f)               /* DW_CFA_advance_loc の形 */
+.clrreloc::v
+
+.elftype::set_uleb128::60
+.elftype::sub_uleb128::61
+.elfdiff::set_uleb128::set_uleb128::sub_uleb128
+.reloc::v::set_uleb128
+ULEB !v :: .call uleb(v)               /* 長さの変わる欄 */
+.clrreloc::v
+```
+
+- 欄の位置と幅は、その型に `.elffield` があればそれに従い、RELA ではマスクの
+  ビットを 0 にします。`.elffield` が無ければ、この参照が出したワード列そのもの
+  が欄で、中身は組み立てた値のまま残します（ULEB128 は、リンカが既存の長さを保って
+  書き直すため）。
+- 定数部は `.reloc` の欄と同じく「オペランドの値 − ラベルの和と差」です。
 
 **同じ位置に複数の項目があるとき（REL）。** `.elfdiff` の対や `.elfextra` の
 添え物は、同じ `r_offset` に 2 つ以上の項目を作ります。REL では、加数を欄へ書き
@@ -1886,7 +1925,7 @@ COMDAT（フラグ 1、`GRP_COMDAT`）のように、リンカが同じ署名の
 
 | パターン / ソース | 機種 | 見るもの |
 |---|---|---|
-| `elfpair.axx` / `elfpair.s` | RISC-V（`riscv64.axx` を include） | `.elfextra`（`R_RISCV_RELAX`）、`.elfdiff`（`ADD32`/`SUB32`、`ADD64`/`SUB64`）、`.elfgroup`（COMDAT）、`.elflink`（`SHF_LINK_ORDER`）。リロケーション・グループ・セクションヘッダが llvm-mc と一致し、`ld.lld` のリンカ緩和の後も差の値が正しく縮みます |
+| `elfpair.axx` / `elfpair.s` | RISC-V（`riscv64.axx` を include） | `.elfextra`（`R_RISCV_RELAX`）、`.elfdiff`（`ADD32`/`SUB32`、`ADD64`/`SUB64`、多項の式、`-(a-b)`、型付きの `SET_ULEB128`/`SUB_ULEB128` と `SET6`/`SUB6`）、`.elfgroup`（COMDAT）、`.elflink`（`SHF_LINK_ORDER`）、リンカ緩和の機種の CFI。リロケーション・グループ・セクションヘッダが llvm-mc と一致し、`ld.lld` のリンカ緩和の後も差の値と CFI の表が正しく縮みます |
 | `elfmips.axx` / `elfmips.s` | MIPS32（REL、ビッグエンディアン） | `.elfencode`（`R_MIPS_HI16`）と `.elffield`（`R_MIPS_26`、`R_MIPS_LO16`）。命令語・リロケーションが llvm-mc と一致し、`ld.lld` でリンクした `.text` もバイト単位で一致します |
 | `elfmips64.axx` / `elfmips64.s` | MIPS64（n64、リトルエンディアン） | `.elfrinfo`。`readelf -r` が各項目の 3 つの型を llvm-mc の出力と同じに読みます |
 | `elfword.axx` / `elfword.s` | 1 ワード 16 ビットの架空の機種 | `.elfunit::word`。加数とシンボル値がワードで書かれます |
@@ -1899,6 +1938,70 @@ COMDAT（フラグ 1、`GRP_COMDAT`）のように、リンカが同じ署名の
 共有ライブラリ（`ET_DYN`、`.dynamic` / `.dynsym` / ハッシュ表）も同じです。
 番地の決まった生のイメージが要るときは `-b` を、実行ファイルが要るときは `-o` の
 出力をリンカに渡してください。
+
+#### 3.7.11 CFI — `.cfi_*` から `.eh_frame` を組む
+
+ソースに GNU as と同じ `.cfi_*` 指令を書くと、`-o` の ELF に `.eh_frame`
+（CIE と FDE）とそのリロケーションセクションが加わります。例外の巻き戻しや
+デバッガが、各命令の位置で「呼び出し元のフレームがどこにあるか」を知るための表です。
+機種に依存する部分は、パターンファイルで宣言します。
+
+| 宣言（パターンファイル） | 決めるもの |
+|---|---|
+| `.elfcfi::<戻り番地の列>::<コード整列>::<データ整列>[::<詰め>]` | CIE の戻り番地のレジスタ番号、コード整列係数、データ整列係数、CIE と FDE を詰める単位（省略時はポインタの大きさ） |
+| `.elfcfiinit::<命令>` | CIE の初期命令。`.cfi_` を除いた指令の形で書き、書いた順に並ぶ（`def_cfa rsp, 8`） |
+| `.elfcfireg::<名前>::<DWARF 番号>` | `.cfi_*` に書くレジスタ名と、DWARF のレジスタ番号 |
+
+```
+.elfcfi::16::1::-8                     /* x86-64: RA = rip(16)、code 1、data -8 */
+.elfcfiinit::def_cfa rsp, 8
+.elfcfiinit::offset rip, -8
+.elfcfireg::rbp::6
+.elfcfireg::rsp::7
+.elfcfireg::rip::16
+.elfsection::.eh_frame::0x2::0x70000001   /* SHT_X86_64_UNWIND */
+```
+
+**ソースの指令。** 書ける指令は次のとおりです。レジスタは `.elfcfireg` の名前か
+数、オフセットは定数式です。
+
+| 指令 | 意味 |
+|---|---|
+| `.cfi_startproc [simple]` / `.cfi_endproc` | 関数（FDE）の始まりと終わり。`simple` は CIE の初期命令を使わない |
+| `.cfi_def_cfa r, off` / `.cfi_def_cfa_offset off` / `.cfi_def_cfa_register r` / `.cfi_adjust_cfa_offset n` | CFA（呼び出し元のフレーム）の規則 |
+| `.cfi_offset r, off` / `.cfi_rel_offset r, off` / `.cfi_val_offset r, off` | レジスタの保存場所 |
+| `.cfi_restore r` / `.cfi_undefined r` / `.cfi_same_value r` / `.cfi_register r1, r2` | レジスタの規則 |
+| `.cfi_remember_state` / `.cfi_restore_state` | 規則の退避と復元 |
+| `.cfi_return_column r` / `.cfi_signal_frame` | CIE の戻り番地の列、シグナルフレーム（拡張文字 `S`） |
+| `.cfi_window_save` / `.cfi_negate_ra_state` | `DW_CFA_GNU_window_save`（0x2d） |
+| `.cfi_escape b, ...` | 命令のバイトをそのまま書く |
+| `.cfi_personality enc, sym` / `.cfi_lsda enc, sym` | パーソナリティ関数と LSDA（拡張文字 `P` / `L`）。符号化は絶対（0x00）か PC 相対（0x10）の 2・4・8 バイトとポインタの大きさ、間接（0x80）の印も書ける。0xff は「無し」 |
+| `.cfi_sections ...` | 読み飛ばす（`.eh_frame` だけを出す） |
+
+**組み立て。** CIE は拡張文字列 `zR`（必要なら `P`・`L`・`S`）、FDE の番地の
+符号化は `DW_EH_PE_pcrel|sdata4`（0x1b）です。同じ設定の関数は 1 つの CIE を
+共有します。命令の位置の進みは 6 ビット・1・2・4 バイトのうち収まる最小の形で
+書き、各命令は GNU as・llvm-mc と同じ形を選びます（オフセットが負なら `_sf` 形）。
+FDE の番地には、実効表の型を宣言順に見て最初の「4 バイトの PC 相対のデータ型
+（命令欄の型を除く）」を使います（x86-64 は `R_X86_64_PC32`、AArch64 は
+`R_AARCH64_PREL32`。RISC-V は `R_RISCV_32_PCREL` を `.elftype` で宣言します）。
+
+**リンカ緩和の機種。** `.elfdiff::4` が宣言されていれば、関数の長さと命令の
+位置の進みを、その足す型・引く型の組で書きます（進みは `DW_CFA_advance_loc4`）。
+そのための局所シンボル `.Lcfi<n>` を、関数の始まり・進む位置・終わりに置きます。
+FDE の番地もその局所シンボルに対して書きます。こうすると、リンカがコードを縮めても
+表が正しく縮みます。このときコード整列係数は 1 でなければなりません。
+
+**誤り。** `.cfi_startproc` の外の指令、閉じていない関数、データ整列係数で
+割り切れないオフセット、`remember_state` の無い `restore_state`、知らない
+シンボルや符号化、`.elfcfi` の無いパターンファイルは、エラーにします。
+
+実例は同梱の `elfcfi.axx` / `elfcfi.s`（x86-64）と、`elfpair.axx` / `elfpair.s`
+（RISC-V、リンカ緩和）です。x86-64 では `llvm-dwarfdump --eh-frame` が読む表が
+llvm-mc の出力と一致し、詰めを 4（`.elfcfi` の第 4 欄）にすると `.eh_frame` は
+バイト単位で一致します。AArch64 でも一致を確かめています。RISC-V では、`ld.lld` の
+リンカ緩和で `call` が `jal` に縮んだ後の表が、llvm-mc の出力をリンクしたものと
+同じ位置になります。
 
 ### 3.8 省略可能部分 (`[[ ]]`)
 
@@ -3828,7 +3931,8 @@ x86_64 パターンファイルは
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | 組み込みの表に無いマシン（EM_MSP430）の ELF 記述（3.7.7 節）。テスト専用 |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | リロケーション型の優先順位（既定 < パターンファイル < ソースファイル、3.7.8 節）。テスト専用 |
 | **elfsec.axx** | 1.4 KB | 8 | **elfsec.s** | `.elfsection` で宣言するセクションの属性と `sh_addralign`（3.7.7 節）。テスト専用 |
-| **elfpair.axx** | 2.6 KB | 16（＋ `riscv64.axx`） | **elfpair.s** | 対になるリロケーションと添え物（`.elfextra`・`.elfdiff`）、セクショングループ（`.elfgroup`）、`sh_link`（`.elflink`）。RISC-V。リロケーション・グループ・セクションヘッダは llvm-mc と一致（3.7.10 節）。テスト専用 |
+| **elfpair.axx** | 4.5 KB | 37（＋ `riscv64.axx`） | **elfpair.s** | 対になるリロケーションと添え物（`.elfextra`・`.elfdiff`、多項の式・型付きの差を含む）、セクショングループ（`.elfgroup`）、`sh_link`（`.elflink`）、リンカ緩和の機種の CFI。RISC-V。リロケーション・グループ・セクションヘッダは llvm-mc と一致（3.7.10・3.7.11 節）。テスト専用 |
+| **elfcfi.axx** | 2.0 KB | 29 | **elfcfi.s** | CFI（`.cfi_*` から `.eh_frame`、`.elfcfi`・`.elfcfiinit`・`.elfcfireg`）。x86-64。`.eh_frame` の表は llvm-mc と一致（3.7.11 節）。テスト専用 |
 | **elfmips.axx** | 3.1 KB | 31 | **elfmips.s** | REL の書き戻し関数（`.elfencode`、`R_MIPS_HI16`）。MIPS32。命令語・リロケーション・リンク後の `.text` は llvm-mc / ld.lld と一致（3.7.10 節）。テスト専用 |
 | **elfmips64.axx** | 2.5 KB | 28 | **elfmips64.s** | `r_info` を組む関数（`.elfrinfo`）。MIPS64 n64（3.7.10 節）。テスト専用 |
 | **elfword.axx** | 1.7 KB | 24 | **elfword.s** | 加数とシンボル値の単位（`.elfunit::word`）。1 ワード 16 ビットの架空の機種（3.7.10 節）。テスト専用 |
@@ -3853,14 +3957,15 @@ x86_64 パターンファイルは
 その 2 つから include されるので直接は渡しません。`itanium.axx` も `vliw.s` を使い、
 `aarch64_logical_mini.axx` は `aarch64_logical_mini_demo.s` と対になります。
 
-`test1` は 35 組を両方の実装で実行し、`-b` の生バイナリを比較します。
+`test1` は 36 組を両方の実装で実行し、`-b` の生バイナリを比較します。
 `.textmode` を使う 3 組（`textmode.axx` / `8080toz80.axx` / `intel2att.axx`）については、`-V` で
 標準出力へ流した翻訳テキストどうしも比較します。`elftype.axx` / `elftype.s` と
 `elfgen.axx` / `elfgen.s`、型の優先順位を見る `elfprio.axx` / `elfprio.s`、
 セクションヘッダを見る `elfsec.axx` / `elfsec.s`、シンボル表の属性を見る
 `elfsym.axx` / `elfsym.s`、宣言した命令フィールド型を見る `riscv64.axx` /
 `riscv64.s`、REL の命令フィールド型を見る `elfrel.axx` / `elfrel.s`、
-3.7.10 節の宣言を見る `elfpair`・`elfmips`・`elfmips64`・`elfword` の 11 組は
+3.7.10 節の宣言を見る `elfpair`・`elfmips`・`elfmips64`・`elfword`、CFI を見る
+`elfcfi` の 12 組は
 リロケーションと ELF のヘッダ・シンボル表を見るものなので、`-o` の ELF
 オブジェクトどうしを比較します。`aarch64.axx`（`-m 183`）と `elfpair.axx` は
 `--elfdesc` の出力（記述を宣言に書き直したもの）どうしも比較します。
@@ -3870,7 +3975,8 @@ x86_64 パターンファイルは
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`）は、
 `-b` だけでは一度も比較されない経路を通すために、`-o`（ELF64）、`-m 3 -f 32 -o`
 （ELF32）、`-g -o`（DWARF 付き）、`-v`（リスティング）、`-V`（テキスト出力）
-でも走らせて突き合わせます。比較は全部で 153 組です。
+でも走らせて突き合わせます。`elfcfi` は ELF32（`-m 3 -f 32`、REL）でも比較します。
+比較は全部で 155 組です。
 
 `-g` を比較するときは、両実装を必ず同じディレクトリで走らせてください。DWARF は
 `DW_AT_comp_dir` にカレントディレクトリを埋めるので、別の場所で走らせると中身が
@@ -3900,7 +4006,7 @@ C 実装で 1 秒ほどかかります。ソースの 1 行ごとに、同梱で
 | `format_of_exp_imp_file` | エクスポート/インポートファイル形式 |
 | `axx.1.gz` | man ページ |
 
-`test1` は同梱の 35 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
+`test1` は同梱の 36 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
 
 ### C.2 外部
 

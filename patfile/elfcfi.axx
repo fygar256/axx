@@ -1,0 +1,53 @@
+/* ===================================================================
+/* elfcfi.axx -- pattern file for call frame information: the source's
+/*               .cfi_* directives become an .eh_frame (manual 3.7.11)
+/*
+/* The machine is x86-64, with just the instructions a frame needs.
+/* What the .eh_frame depends on is declared here:
+/*
+/*   .elfcfi::<RA column>::<code align>::<data align>[::<padding>]
+/*        the CIE fields: the return address column, the code and data
+/*        alignment factors, and the alignment CIEs and FDEs are padded
+/*        to (default: the pointer size)
+/*   .elfcfiinit::<instruction>
+/*        one initial instruction of the CIE, written like a .cfi_
+/*        directive without the prefix ("def_cfa 7, 8"); in order
+/*   .elfcfireg::<name>::<DWARF number>
+/*        a register name the .cfi_ directives may use
+/*
+/* The FDE address is written with the machine's 4-byte PC-relative
+/* type (R_X86_64_PC32 here). .elfsection gives the section the
+/* x86-64 unwind type, as the psABI asks.
+/*
+/* Assemble with:
+/*   axx elfcfi.axx elfcfi.s -o out.o
+/* =================================================================== */
+
+.bits::8
+
+.elfcfi::16::1::-8                     /* RA = rip (16), code 1, data -8 */
+.elfcfiinit::def_cfa rsp, 8            /* CFA = rsp + 8                   */
+.elfcfiinit::offset rip, -8            /* rip saved at CFA - 8            */
+.elfcfireg::rax::0
+.elfcfireg::rdx::1
+.elfcfireg::rcx::2
+.elfcfireg::rbx::3
+.elfcfireg::rsi::4
+.elfcfireg::rdi::5
+.elfcfireg::rbp::6
+.elfcfireg::rsp::7
+.elfcfireg::rip::16
+.elfsection::.eh_frame::0x2::0x70000001   /* SHT_X86_64_UNWIND        */
+
+PUSH RBP :: 0x55
+PUSH RBX :: 0x53
+POP RBP :: 0x5d
+POP RBX :: 0x5b
+MOV RBP,RSP :: 0x48,0x89,0xe5
+SUB RSP,!n :: 0x48,0x81,0xec,n,n>>8,n>>16,n>>24
+ADD RSP,!n :: 0x48,0x81,0xc4,n,n>>8,n>>16,n>>24
+.reloc::v::plt32
+CALL !v :: 0xe8,v-$$-5,(v-$$-5)>>8,(v-$$-5)>>16,(v-$$-5)>>24
+.clrreloc::v
+RET :: 0xc3
+NOP :: 0x90

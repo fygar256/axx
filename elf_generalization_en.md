@@ -7,11 +7,11 @@ places.
 - **What depends on the machine** — the relocation types, the ELF class,
   RELA/REL, the ELF header fields, the section header attributes, the shape of
   fields inside instruction words, paired and companion relocations, the layout
-  of `r_info`, the unit of addends, section groups. These are declared in the
-  **pattern file** (section 2).
+  of `r_info`, the unit of addends, section groups, the CIE fields of the CFI.
+  These are declared in the **pattern file** (section 2).
 - **What depends on the program** — the type, size, binding and visibility of
-  each symbol, and common symbols. These are declared in the **source file**
-  (section 3).
+  each symbol, common symbols, and each function's CFI (`.cfi_*`). These are
+  declared in the **source file** (sections 3 and 2.14).
 
 axx carries built-in tables for eleven machines, but a table is nothing more
 than pattern-file declarations written in advance. The code that writes the ELF
@@ -59,9 +59,10 @@ What the effective table holds:
 | instruction fields | type → (mask, offset, shift, bias) | `.elffield` |
 | write-back functions | type → function name (REL) | `.elfencode` |
 | companions | type → [(companion type, keeps the symbol)] | `.elfextra` |
-| difference pairs | width → (add type, subtract type) | `.elfdiff` |
+| label sums and differences | width → (add type, subtract type), type → (add type, subtract type) | `.elfdiff` |
 | `r_info` function | function name | `.elfrinfo` |
 | unit | byte / word | `.elfunit` |
+| CFI | the CIE fields, initial instructions, register names | `.elfcfi`, `.elfcfiinit`, `.elfcfireg` |
 
 ### 1.2 Tracking references
 
@@ -70,11 +71,14 @@ label.
 
 - When a pattern variable (`!t` and the like) captures a source operand, the
   labels its expression referenced are bound to the variable: one label is that
-  label; two labels with `.elfdiff` declared are a label-difference candidate;
-  anything else is *ambiguous*.
-- A difference candidate is settled from the captured text: the label directly
-  preceded (spaces aside) by `-` is subtracted, the one preceded by `+`, `(` or
-  nothing is added. If that cannot be told, it is ambiguous.
+  label; two or more labels with `.elfdiff` declared are a candidate sum and
+  difference of labels; anything else is *ambiguous*.
+- A candidate is settled by reading each label's sign from the captured text. If
+  the expression is made of labels, numbers, `+`, `-` and parentheses, and every
+  label's coefficient is +1 or -1, it is a sum and difference; otherwise it is
+  ambiguous. A `-` before parentheses negates what is inside. A single label with
+  a negative sign is a sum and difference of one subtracted term when `.elfdiff`
+  is declared, and ambiguous otherwise.
 - When a `binary_list` element uses the variable, the label is recorded at that
   output word. A variable under `.reloc::<variable>::<type>` also records the type
   and "operand value - label value" (the instruction-field hint).
@@ -118,7 +122,8 @@ The addend is found in words and then converted to the unit of `.elfunit`
 | data, absolute type | field value - label value | the field value |
 | data, PC-relative type | field value - label value + field position (from the section start) | the field value |
 | instruction field (a `.elffield` type) | operand value - label value + bias | the mask bits zeroed |
-| label difference (`.elfdiff`) | add type: the constant part; subtract type: 0 | 0 |
+| label sum and difference (`.elfdiff`, width) | the first add type: the constant part; the rest: 0 | 0 |
+| label sum and difference (`.elfdiff`, type) | the same (the constant part is operand value - the sum and difference) | the mask bits zeroed with `.elffield`, else the assembled value |
 
 A field value is the field's words read as one integer in the target byte order
 and sign-extended at the field's width.
@@ -148,6 +153,13 @@ written.
   (`(symbol << 32) | type` for ELF64, `(symbol << 8) | type` for ELF32).
 - **DWARF** — `.debug_info` / `.debug_abbrev` / `.debug_line` and their
   relocations (the `.elfdwarf` type; `r_info` by the same rule).
+- **CFI** — an `.eh_frame` and `.rela.eh_frame` from the source's `.cfi_*`
+  (section 2.14). On a relaxing machine the local symbols `.Lcfi<n>` the table
+  uses follow the local symbols.
+- **Section count** — when a section's index is `SHN_LORESERVE` (0xff00) or
+  above, `e_shnum` / `e_shstrndx` go in section header 0 and the symbols' section
+  indices in `.symtab_shndx` (`SHT_SYMTAB_SHNDX`), `st_shndx` being `SHN_XINDEX`.
+  There is no limit on the number of sections.
 
 ---
 
@@ -170,10 +182,13 @@ written.
 | `.elffield::<type>::<mask>[::<offset>[::<shift>[::<bias>]]]` | an instruction-field type |
 | `.elfencode::<type>::<function>` | the function that writes a REL addend back |
 | `.elfextra::<type>::<companion>[::<symbol>]` | a relocation added at the same offset |
-| `.elfdiff::<width>::<add type>::<subtract type>` | a label difference as an add/subtract pair |
+| `.elfdiff::<width or type>::<add type>::<subtract type>` | sums and differences of labels as add/subtract relocations |
 | `.elfrinfo::<function>` | the function that lays out `r_info` |
 | `.elfunit::<byte>` / `<word>` | the unit of addends and symbol values |
 | `.elfbuiltin::<0>` / `<1>` | whether the built-in table is the base |
+| `.elfcfi::<RA column>::<code align>::<data align>[::<padding>]` | the CIE fields of the CFI |
+| `.elfcfiinit::<instruction>` | an initial instruction of the CIE |
+| `.elfcfireg::<name>::<DWARF number>` | a register name for the CFI directives |
 
 Common rules:
 
@@ -346,19 +361,29 @@ Every relocation of `<type>` is followed at the same offset by `<companion>`
 with addend 0. With `<symbol>` 0 (the default) its symbol index is 0; with 1 it
 is the same symbol. RISC-V's `R_RISCV_RELAX` is one.
 
-### 2.10 `.elfdiff` — label differences
+### 2.10 `.elfdiff` — sums and differences of labels
 
 ```
 .elfdiff::<width>::<add type>::<subtract type>
+.elfdiff::<type>::<add type>::<subtract type>
 ```
 
-A field whose value is `<label> - <label>` (with constants added or subtracted)
-gets `<add type>` against the added label (its addend the constant part) and
-`<subtract type>` against the subtracted label (addend 0) at the same offset.
-Under RELA the field is written as 0, because these types add to and subtract
-from what is in it. On a machine whose linker shrinks code, even a difference
-within one section needs the pair. A difference of a width with no declaration
-gets no relocation.
+A field whose value is labels added and subtracted (`a-b`, `a-b+c-d+4`,
+`-(a-b)`, `a-(b-c)` and so on) gets `<add type>` against each added label and
+`<subtract type>` against each subtracted label at the same offset. The add types
+come first; the constant part goes in the addend of the first add type (or,
+negated, of the first subtract type when no label is added).
+
+- With a width in the first field, a data field of that width is meant. Under
+  RELA the field is written as 0, because these types add to and subtract from
+  what is in it.
+- With a type name in the first field, a field `.reloc` gives that type is meant.
+  Its position and width follow the type's `.elffield`; without one, the field is
+  the words the reference emitted, and their assembled value is kept (for a field
+  such as a ULEB128, which a linker rewrites in place, keeping its length).
+- On a machine whose linker shrinks code, even a difference within one section
+  needs the relocations. A sum and difference of a width with no declaration gets
+  no relocation.
 
 ### 2.11 `.elfunit` — the unit
 
@@ -395,6 +420,38 @@ number; anything else is an error.
 `.elfpcguess::1` turns on the absolute-to-PC-relative swap of section 1.3 (the
 built-in m68k table sets it). `.elfbuiltin::0` builds the description from the
 pattern file's declarations alone, with no built-in table as the base.
+
+### 2.14 CFI — `.elfcfi` / `.elfcfiinit` / `.elfcfireg` and `.cfi_*`
+
+An `.eh_frame` is built from the source's `.cfi_*` directives (written as for GNU
+as). What depends on the machine is declared in the pattern file.
+
+```
+.elfcfi::16::1::-8                     /* RA column, code align, data align */
+.elfcfiinit::def_cfa rsp, 8            /* CIE initial instructions, in order */
+.elfcfiinit::offset rip, -8
+.elfcfireg::rsp::7                     /* register name -> DWARF number    */
+.elfcfireg::rip::16
+```
+
+- The fourth field is the unit CIEs and FDEs are padded to (default: the pointer
+  size).
+- A CIE has the augmentation `zR` (`P` with `.cfi_personality`, `L` with
+  `.cfi_lsda`, `S` with `.cfi_signal_frame`), and an FDE address is encoded
+  `DW_EH_PE_pcrel|sdata4`, written with the first 4-byte PC-relative data type
+  (not an instruction-field type) of the effective table, in declaration order.
+  Functions with the same settings share a CIE.
+- An advance takes the smallest of the 6-bit, 1-, 2- and 4-byte forms that fits,
+  and every instruction takes the form GNU as and llvm-mc use.
+- With `.elfdiff::4` declared (a relaxing machine), the function length and the
+  advances are written with its add and subtract types, on local symbols
+  `.Lcfi<n>`. The code alignment factor must then be 1.
+- Directives the source may use: `startproc [simple]`, `endproc`, `def_cfa`,
+  `def_cfa_offset`, `def_cfa_register`, `adjust_cfa_offset`, `offset`,
+  `rel_offset`, `val_offset`, `restore`, `undefined`, `same_value`, `register`,
+  `remember_state`, `restore_state`, `return_column`, `signal_frame`,
+  `window_save`, `negate_ra_state`, `escape`, `personality`, `lsda`, and
+  `sections` (ignored).
 
 ---
 
@@ -528,6 +585,10 @@ The policy is **never to write a broken `.o` silently**.
   when the declarations are complete.
 - An `.elfencode` / `.elfrinfo` function that does not exist, takes a different
   number of arguments or returns no number is an error.
+- For CFI, a directive outside `.cfi_startproc`, a function left open, an offset
+  the data alignment factor does not divide, a `restore_state` with no
+  `remember_state`, an unknown symbol or encoding, and a pattern file with no
+  `.elfcfi` are errors.
 - `-g` DWARF is written only when an absolute type is known.
 - The default ELF32 `r_info` has an 8-bit type field. A type number above 255
   would turn into another type, so it is warned about once per type (and so is a
@@ -651,15 +712,25 @@ with `.elftype` and `.elffield`, and writes a `.o` that links with
 ```
 
 ```
-call  ext          ->  R_RISCV_CALL_PLT ext + 0, R_RISCV_RELAX
-dword lend-_start  ->  R_RISCV_ADD32 lend + 0,   R_RISCV_SUB32 _start + 0
-dword ext-_start+4 ->  R_RISCV_ADD32 ext + 4,    R_RISCV_SUB32 _start + 0
-quad  foo-d0       ->  R_RISCV_ADD64 foo + 0,    R_RISCV_SUB64 d0 + 0
+call  ext                ->  R_RISCV_CALL_PLT ext + 0, R_RISCV_RELAX
+dword lend-_start        ->  R_RISCV_ADD32 lend + 0,   R_RISCV_SUB32 _start + 0
+dword ext-_start+4       ->  R_RISCV_ADD32 ext + 4,    R_RISCV_SUB32 _start + 0
+quad  foo-d0             ->  R_RISCV_ADD64 foo + 0,    R_RISCV_SUB64 d0 + 0
+dword lend-_start+d0-d1+4 -> ADD32 lend + 4, ADD32 d0, SUB32 _start, SUB32 d1
+dword -(lend-_start)     ->  R_RISCV_ADD32 _start + 0, R_RISCV_SUB32 lend + 0
+uleb  lend-_start+300    ->  R_RISCV_SET_ULEB128 lend + 300, R_RISCV_SUB_ULEB128 _start
+adv6  lend-_start        ->  R_RISCV_SET6 lend + 0,    R_RISCV_SUB6 _start
 ```
 
 The relocations, the COMDAT group and the `SHF_LINK_ORDER` section header match
-llvm-mc's, and after `ld.lld`'s relaxation shrinks each `call` into a `jal`,
-`lend-_start` still comes out right.
+llvm-mc's. After `ld.lld`'s relaxation shrinks each `call` into a `jal`, every
+difference still comes out right (the ULEB128 keeps its length, the 6-bit field
+its high bits).
+
+The same file declares CFI too (`.elfcfi::1::1::-8`, `R_RISCV_32_PCREL`); with
+`.elfdiff::4` declared, the function length and the advances are written as
+ADD32/SUB32 on `.Lcfi<n>`. After linking, the rows sit where they do in
+llvm-mc's object linked the same way.
 
 ### 8.5 MIPS (8) — a write-back function and `r_info`
 
@@ -680,7 +751,28 @@ matches byte for byte.
 `r_info` with `.elfrinfo`; `readelf -r` reads each entry as
 `R_MIPS_64/R_MIPS_NONE/R_MIPS_NONE` and so on, as it does for llvm-mc's object.
 
-### 8.6 A machine with 16-bit words — the unit
+### 8.6 x86-64 — CFI
+
+`elfcfi.axx` holds a few x86-64 instructions and declares CFI.
+
+```
+f:
+        .cfi_startproc
+        push    rbp
+        .cfi_def_cfa_offset 16
+        .cfi_offset rbp, -16
+        mov     rbp,rsp
+        .cfi_def_cfa_register rbp
+        ...
+        ret
+        .cfi_endproc
+```
+
+The rows `llvm-dwarfdump --eh-frame` reads (`0x1: CFA=RSP+16: RBP=[CFA-16],
+RIP=[CFA-8]` and so on) match llvm-mc's, and with padding 4 the `.eh_frame`
+matches byte for byte. AArch64 (`R_AARCH64_PREL32`) matches too.
+
+### 8.7 A machine with 16-bit words — the unit
 
 `elfword.axx` is a toy machine with `.bits::16`; `.elfunit::word` makes the
 addends and symbol values word counts.
@@ -703,9 +795,12 @@ other.
 | effective table | `elf_machine_table()` | `elf_machine_effective()`, `elf_field_effective()` |
 | instruction-field description | `insn_reloc_field_decl()` | `insn_reloc_field_decl()` |
 | bit write-back | `_field_deposit()` | `field_deposit()` |
-| label differences | `_elf_v2l_second()`, `_elf_diff_resolve()`, `_elf_label_sign()` | `label_get_value()`, `elf_v2l_finish()`, `elf_label_sign()` |
+| label sums and differences | `_elf_v2l_second()`, `_elf_v2l_finish()`, `_elf_diff_resolve()` | `label_get_value()`, `elf_v2l_finish()`, `elf_diff_resolve()` |
 | calling a function | `_elf_call_func()` | `elf_call_func()` |
 | `r_info` | `_elf_r_info()` | `weo_rinfo()` |
+| recording CFI | `cfi_processing()` | `adir_cfi()` |
+| CFI instructions | `_cfi_op_bytes()` | `cfi_op_bytes()` |
+| `.eh_frame` | `_build_eh_frame()`, `_cfi_points()` | `build_eh_frame()`, `cfi_points()` |
 | writing | `write_elf_obj()` | `write_elf_obj()` |
 | `--elfdesc` | `elf_desc_text()` | `elf_desc_print()` |
 | declaration checks | `check_elfdecls()` | `check_elfdecls()` |

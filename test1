@@ -47,6 +47,8 @@ caxx $P/elfmips.axx $S/elfmips.s -o b116
 caxx $P/elfmips64.axx $S/elfmips64.s -o b117
 caxx $P/elfword.axx $S/elfword.s -o b118
 caxx $P/elfpair.axx --elfdesc > b119
+caxx $P/elfcfi.axx $S/elfcfi.s -o b120
+caxx $P/elfcfi.axx $S/elfcfi.s -m 3 -f 32 -o b121
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -178,6 +180,8 @@ paxx $P/elfmips.axx $S/elfmips.s -o a116
 paxx $P/elfmips64.axx $S/elfmips64.s -o a117
 paxx $P/elfword.axx $S/elfword.s -o a118
 paxx $P/elfpair.axx --elfdesc > a119
+paxx $P/elfcfi.axx $S/elfcfi.s -o a120
+paxx $P/elfcfi.axx $S/elfcfi.s -m 3 -f 32 -o a121
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -267,7 +271,7 @@ paxx $P/aarch64.axx $S/aarch64.s -V -b a110 > a110t
 FAIL=0
 
 N=0
-while [ $N -le 119 ]; do
+while [ $N -le 121 ]; do
     cmp a$N b$N || FAIL=1
     N=$((N+1))
 done
