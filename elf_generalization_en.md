@@ -14,6 +14,12 @@ object (`.o`) for any CPU, and that has two halves.
   acts on them, so an object whose symbol table is all defaults is not linkable.
   These are declared in the source (section 3).
 
+Beyond that, the built-in tables of the eleven machines are themselves made only
+of things a pattern file can declare. No branch on the machine number is left in
+the code that writes the ELF (section 9). With `.elfbuiltin::0` the whole
+description is written in the pattern file with no table at all, and
+`--elfdesc` prints a built-in table as declarations.
+
 The work is in both implementations, `axx.py` (Paxx) and `caxx.c` (Caxx), and
 their output is byte-identical.
 
@@ -60,7 +66,9 @@ half of this work (section 3).
 | `.elfdwarf::<type>` | the absolute type the `-g` DWARF output uses |
 | `.elfheader::<field>::<value>` | a field of the ELF header |
 | `.elfsection::<name>::<sh_flags>[::<sh_type>[::<align>[::<entsize>]]]` | the attributes of a section header |
-| `.elffield::<type>::<mask>[::<offset>]` | an instruction-field type (which bits of the instruction hold the value) |
+| `.elffield::<type>::<mask>[::<offset>[::<shift>[::<bias>]]]` | an instruction-field type (which bits of the instruction hold the value) |
+| `.elfpcguess::<0>` / `<1>` | whether a width-guessed absolute type is swapped for a PC-relative one (section 9) |
+| `.elfbuiltin::<0>` / `<1>` | whether the built-in table is the base (section 9) |
 
 Rules they share:
 
@@ -156,7 +164,7 @@ The bundled `elfsec.axx` / `elfsec.s` are a worked example.
 ### 2.4 `.elffield` — instruction-field types
 
 ```
-.elffield::<type>::<mask>[::<offset>]
+.elffield::<type>::<mask>[::<offset>[::<shift>[::<bias>]]]
 ```
 
 A data reference holds its value as a plain integer across consecutive bytes, so
@@ -170,9 +178,12 @@ give a correct relocation. `.elffield` supplies that table for any machine from
 the pattern file. A row typed with `.reloc::<variable>::<type>` for a type
 declared this way
 
-- carries the addend "operand value - label value" (`bl ext+8` gives 8);
-- has its instruction field written as 0, for the linker to fill in (RELA, the
-  shape GNU as produces);
+- carries the addend "operand value - label value + bias" (`bl ext+8` gives 8);
+- under RELA, has its instruction field written as 0, for the linker to fill in
+  (the shape GNU as produces);
+- under REL, has the addend shifted right by `<shift>` bits and put back into
+  the field, filling the set bits of the mask from the bottom up; the bits
+  outside the mask (the rest of the instruction) are kept;
 - leaves the range and alignment checks on that operand to the linker under
   `-o`.
 
@@ -188,8 +199,17 @@ The fields:
 - `<offset>` (default 0) is where the field starts, in bytes from the first word
   the row emits for that operand; `r_offset` points there. A 16-bit field in the
   low half of a 32-bit word is at 2 big-endian and at 0 little-endian.
+- `<shift>` (default 0, 0 to 63) is how far REL shifts the addend right before
+  writing it into the field: 2 for a field counted in words (ARM's `bl` imm24).
+  RELA does not use it.
+- `<bias>` (default 0) is a constant added to the addend: how far ahead of the
+  instruction the PC points. An ARM branch counts from the instruction address
+  plus 8, so it is -8.
 - The type may be an `.elftype` name, a built-in name or a number. Writing the
   same type again replaces the earlier declaration.
+- Because the mask is filled from the bottom up, a type whose field reorders the
+  bits of the value (RISC-V's B format, for one) cannot be written back under
+  REL. Describe such a machine with RELA, as the real ABIs do.
 
 ```
 .elftype::rel24::10::4::1
@@ -625,3 +645,133 @@ output linked with GNU ld is identical. With ld.lld 18 the result is the same
 too, apart from the rows whose types ld.lld does not implement (`ADDR24` /
 `ADDR14`, `ADDR16_HIGHA`, `D34`). ld.lld handles only ELFv2 on PowerPC64, so for
 big-endian write the ELFv2 form, without `.opd`.
+
+---
+
+## 9. The built-in tables are declarations too — complete generalization
+
+Three machine-dependent spots were still left in the code:
+
+- the AArch64 table of instruction-field types (looked up only when
+  `machine == 183`);
+- a guess only m68k made: when the type guessed from a field's width was
+  absolute but the field did not hold the label's value, it was swapped for the
+  PC-relative type (active only when `machine == 4`);
+- on a REL machine an instruction-field type had its addend written over the
+  whole instruction word (it was put back as plain bytes, with no knowledge of
+  the field's shape).
+
+They are settled as follows.
+
+| Before | Now |
+|---|---|
+| the AArch64 fields were a table of their own in the code | the `field` entry of the built-in table, in the shape of `.elffield`; a declaration wins |
+| the m68k guess was a `machine == 4` branch | the `pcrel_guess` entry of the built-in table, and `.elfpcguess`, which any machine may write |
+| REL broke instruction fields | the `<shift>` and `<bias>` of `.elffield` put the addend back into the bits of the mask |
+| the built-in table could not be left out | `.elfbuiltin::0` builds the description from declarations alone |
+
+The built-in tables are now "declarations written in advance", and every entry
+can be written as a declaration.
+
+| Table entry | Declaration |
+|---|---|
+| the machine's name | `.elfmachine::<number>::<name>` |
+| the conventional ELF class | `.elfclass` |
+| RELA or REL | `.elfrela` |
+| type names, numbers, widths, PC-relativity | `.elftype` |
+| the default type per width | `.elfwidth` |
+| the default type of `.extern` | `.elfextern` |
+| the absolute type of DWARF | `.elfdwarf` |
+| instruction-field types | `.elffield` |
+| the absolute-to-PC-relative guess | `.elfpcguess` |
+
+### 9.1 `--elfdesc` — printing a table as declarations
+
+`--elfdesc` prints the description in effect (the built-in table of the `-m`
+machine with the pattern file's declarations laid over it) to standard output as
+a run of declarations headed by `.elfbuiltin::0`, and stops. No source file is
+needed.
+
+```
+$ axx test.axx -m 4 --elfdesc
+.elfbuiltin::0
+.elfmachine::4::m68k
+.elfclass::32
+.elfrela::1
+.elftype::abs32::1::4
+.elftype::abs16::2::2
+.elftype::abs8::3::1
+.elftype::pc32::4::4::1
+.elftype::rel32::4::4::1
+.elftype::pc16::5::2::1
+.elftype::pc8::6::1::1
+.elfwidth::1::abs8
+.elfwidth::2::abs16
+.elfwidth::4::pc32
+.elfextern::pc32
+.elfdwarf::abs32
+.elfpcguess::1
+```
+
+Pasting this into a pattern file (or including it) gives the same ELF with no
+built-in table. This was checked on 43 runs — all eleven built-in machines (the
+x86_64, 68000 and z80 patterns, each with `-m` set to every machine, `-g`
+included), AArch64, PowerPC64 in both byte orders, RISC-V and the bundled ELF
+pattern files (`elfgen`, `elfsym`, `elfsec`, `elfprio`, `elftype`): the output
+through `--elfdesc` matched the original byte for byte. The `--elfdesc` output of
+the two implementations matches too.
+
+### 9.2 Example — ARM (40) with no table, under REL
+
+The bundled `elfrel.axx` / `elfrel.s` describe ARM with `.elfbuiltin::0`, with no
+built-in table, and write REL instruction-field types.
+
+```
+.elfbuiltin::0
+.elfmachine::40::ARM
+.elfclass::32
+.elfrela::0
+.elfheader::flags::0x05000000          /* EF_ARM_EABI_VER5 */
+
+.elftype::abs32::2::4
+.elftype::call::28::4::1
+.elftype::jump24::29::4::1
+.elftype::movw_abs_nc::43::4
+.elftype::movt_abs::44::4
+
+.elffield::call::0x00ffffff::0::2::-8  /* imm24, in words, PC+8 */
+.elffield::jump24::0x00ffffff::0::2::-8
+.elffield::movw_abs_nc::0x000f0fff     /* imm4:imm12            */
+.elffield::movt_abs::0x000f0fff
+```
+
+`axx elfrel.axx elfrel.s -o out.o` as seen by `llvm-objdump -dr`:
+
+```
+       0: ebfffffe      bl      ...     R_ARM_CALL        ext
+       4: eb000002      bl      ...     R_ARM_CALL        ext
+       8: eafffffe      b       ...     R_ARM_JUMP24      ext2
+       c: e3000000                      R_ARM_MOVW_ABS_NC dat
+      10: e3400000                      R_ARM_MOVT_ABS    dat
+      14: e3021345                      R_ARM_MOVW_ABS_NC dat
+      18: e3421345                      R_ARM_MOVT_ABS    dat
+      1c: e12fff1e
+      20: 00000000                      R_ARM_ABS32       dat
+      24: 00000004                      R_ARM_ABS32       dat
+```
+
+The field `0xfffffe` of `bl ext` is (0 - 8) >> 2, the `0x000002` of `bl ext+16`
+is (16 - 8) >> 2, and the `0x2345` of `movw r1,%lo16(dat+0x12345)` puts the low
+12 bits in imm12 and the next 4 in imm4. Both the instruction words and the
+relocations match llvm-mc's for the same code, and linking with
+`ld.lld -m armelf` gives the same result too (apart from the layout).
+
+### 9.3 Other changes
+
+- A section's position in the file now follows its `sh_addralign` (with 16 as
+  the floor). A section given a large alignment such as 64 with `.elfsection`
+  starts on that boundary in the file, as GNU as writes it.
+- The C implementation's i386 table did not list `plt32` (`R_386_PLT32`, 4) as
+  PC-relative. It now does, as the Python implementation always had.
+- In the C implementation, when one type number has several names, the field
+  width is taken from the first name that gives one (the Python rule).

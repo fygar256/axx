@@ -1,0 +1,99 @@
+/* ===================================================================
+/* elfrel.axx -- pattern file for a REL machine whose relocations live
+/*               in instruction fields (manual 3.7.9)
+/*
+/* The machine is EM_ARM (40), A32 state, little-endian. axx has a
+/* built-in table for it, but this file switches the table off with
+/* `.elfbuiltin::0` and describes the whole machine itself, so every
+/* number, width, field and bias below comes from here:
+/*
+/*   .elfbuiltin::0           start from an empty description
+/*   .elfrela::0              REL: the addend is kept in the field
+/*                            itself, not in the relocation entry
+/*   .elffield::<type>::<mask>::<offset>::<shift>::<bias>
+/*                            the bits the linker rewrites, how far
+/*                            the addend is shifted right before it
+/*                            is put into those bits (REL only), and
+/*                            a constant added to every addend
+/*
+/* An ARM branch counts from the instruction address plus 8, so the
+/* addend of `bl ext` is -8 and the field holds -8 >> 2 = 0xfffffe,
+/* exactly what GNU as and llvm-mc write. MOVW / MOVT keep the low 16
+/* bits of the addend in the split imm4:imm12 field; the bits of the
+/* mask are filled from the bottom up, so imm12 gets bits 0-11 and
+/* imm4 gets bits 12-15.
+/*
+/* Assemble and link with:
+/*   axx elfrel.axx elfrel.s -o out.o
+/*   ld.lld -m armelf out.o other.o -o out
+/* =================================================================== */
+
+.bits::8                       /* little-endian, the default         */
+
+/* --- what kind of ELF object to write ------------------------------ */
+.elfbuiltin::0                 /* no built-in table: all of it is here */
+.elfmachine::40::ARM
+.elfclass::32
+.elfrela::0                    /* REL                                 */
+.elfheader::flags::0x05000000  /* EF_ARM_EABI_VER5                    */
+
+/* --- relocation types of the ARM ELF ABI --------------------------- */
+/*     name             number width pc-relative                      */
+.elftype::abs32::2::4                  /* R_ARM_ABS32                 */
+.elftype::rel32::3::4::1               /* R_ARM_REL32                 */
+.elftype::call::28::4::1               /* R_ARM_CALL                  */
+.elftype::jump24::29::4::1             /* R_ARM_JUMP24                */
+.elftype::movw_abs_nc::43::4           /* R_ARM_MOVW_ABS_NC           */
+.elftype::movt_abs::44::4              /* R_ARM_MOVT_ABS              */
+
+/* --- the instruction fields ---------------------------------------- */
+/*     type         mask        offset shift bias                      */
+.elffield::call::0x00ffffff::0::2::-8  /* imm24, words, PC+8          */
+.elffield::jump24::0x00ffffff::0::2::-8
+.elffield::movw_abs_nc::0x000f0fff     /* imm4:imm12                  */
+.elffield::movt_abs::0x000f0fff
+
+/* --- data references and defaults ---------------------------------- */
+.elfwidth::4::abs32
+.elfextern::abs32
+.elfdwarf::abs32
+
+/* --- registers ----------------------------------------------------- */
+!def regs(p, n) {
+!local i = 0
+!while i <= n {
+.setsym::!{p}!{i}::!{i}
+!set i = i + 1
+}
+}
+!regs("R", 15)
+.setsym::SP::13
+.setsym::LR::14
+.setsym::PC::15
+
+/* --- one 32-bit little-endian word --------------------------------- */
+.func w4(z)
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+/* MOVW / MOVT: cond | 0011 0x00 | imm4 | Rd | imm12 */
+.func mov16(op, d, v)
+z = op | (((v >> 12) & 0xf) << 16) | (d << 12) | (v & 0xfff)
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+
+/* --- instructions -------------------------------------------------- */
+.reloc::v::call
+BL !v :: .call w4(0xeb000000 | (((v - $$ - 8) >> 2) & 0xffffff))
+.clrreloc::v
+.reloc::v::jump24
+B !v :: .call w4(0xea000000 | (((v - $$ - 8) >> 2) & 0xffffff))
+.clrreloc::v
+.reloc::v::movw_abs_nc
+MOVW d,%LO16(!v) :: .call mov16(0xe3000000, d, v & 0xffff)
+.clrreloc::v
+.reloc::v::movt_abs
+MOVT d,%HI16(!v) :: .call mov16(0xe3400000, d, (v >> 16) & 0xffff)
+.clrreloc::v
+BX d :: .call w4(0xe12fff10 | d)
+DD !v :: v,v>>8,v>>16,v>>24

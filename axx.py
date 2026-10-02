@@ -314,7 +314,7 @@ _HOIST_TEXT_ONLY = ('.check', '.clrcheck', '.reloc', '.clrreloc',
                     '.symbolc', '.passthru', '.eol', '.textmode',
                     '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
                     '.elfextern', '.elfdwarf', '.elfheader', '.elfsection',
-                    '.elffield')
+                    '.elffield', '.elfpcguess', '.elfbuiltin')
 
 
 def _pat_text_dynamic(t):
@@ -663,11 +663,55 @@ ERRORS = [
 #   named          ソースの `::型名` とパターンの `.reloc` で書ける名前
 #                  → (型番号, 欄の幅)
 #   dwarf_abs      DWARF セクション内の絶対参照に使う型
+#   pcrel_guess    真なら、幅から推定した絶対型の欄にラベルの値と違う値が
+#                  入っていたとき、同じ幅の PC 相対型に取り替える（m68k）
+#   field          命令欄の型 → (マスク, オフセット, シフト, 補正)。
+#                  `.elffield` と同じ形（AArch64）
+#
+# どの項目もパターンファイルの宣言で同じものが書ける（.elfmachine /
+# .elfclass / .elfrela / .elftype / .elfwidth / .elfextern / .elfdwarf /
+# .elfpcguess / .elffield）。表は「宣言をあらかじめ書いておいたもの」に
+# すぎず、コードのどこにも機種番号で分かれる処理は無い。`.elfbuiltin::0`
+# と書けば表を土台にせず、パターンファイルの宣言だけで記述が組まれる。
 #
 # ここに無い e_machine も `-m` に書ける。そのときは型も欄もパターンファイルの
 # ELF 記述（.elfmachine / .elftype / .elffield ...）から来る。RISC-V の欄が
 # データ型だけで pc_rel が空なのはそのためで、CALL_PLT / BRANCH / JAL / HI20 /
 # LO12 といった命令側の型は riscv64.axx が自分で宣言している。
+# AArch64 の「命令の中の欄を書き換える」リロケーションが、32bit 命令語の
+# どのビットに値を置くか。マスクの形は `.elffield` の第 2 欄と同じで、
+# ADR/ADRP だけは値が 2 つの欄に分かれて入る（下位 2bit と上位 19bit）。
+# 下の _ELF_MACHINE_RAW[183] の field がこれを
+# `.elffield::<型>::<マスク>` と同じ (マスク, 0, 0, 0) の形で持つ。
+_A64_ADR_MASK  = (0x3 << 29) | (0x7ffff << 5)
+_A64_LO12_MASK = 0xfff << 10
+_A64_MOVW_MASK = 0xffff << 5
+_A64_FIELD_MASKS = {
+    263: _A64_MOVW_MASK, 264: _A64_MOVW_MASK,
+    265: _A64_MOVW_MASK, 266: _A64_MOVW_MASK,
+    267: _A64_MOVW_MASK, 268: _A64_MOVW_MASK,
+    269: _A64_MOVW_MASK,
+    287: _A64_MOVW_MASK, 288: _A64_MOVW_MASK,
+    289: _A64_MOVW_MASK, 290: _A64_MOVW_MASK,
+    291: _A64_MOVW_MASK, 292: _A64_MOVW_MASK,
+    293: _A64_MOVW_MASK,
+    274: _A64_ADR_MASK,
+    275: _A64_ADR_MASK, 276: _A64_ADR_MASK,
+    277: _A64_LO12_MASK,
+    278: _A64_LO12_MASK,
+    273: 0x7ffff << 5,
+    279: 0x3fff << 5,
+    280: 0x7ffff << 5,
+    282: 0x3ffffff, 283: 0x3ffffff,
+    284: _A64_LO12_MASK, 285: _A64_LO12_MASK,
+    286: _A64_LO12_MASK, 299: _A64_LO12_MASK,
+    309: 0x7ffff << 5,
+    311: _A64_ADR_MASK,
+    312: _A64_LO12_MASK,
+    313: _A64_LO12_MASK,
+}
+
+
 _ELF_MACHINE_RAW = {
     3: dict(
         name='i386', elfclass=1, is_rela=False,
@@ -694,6 +738,7 @@ _ELF_MACHINE_RAW = {
             'pc16': (5, 2), 'pc8': (6, 1),
         },
         dwarf_abs=1,
+        pcrel_guess=True,
     ),
     20: dict(
         name='PowerPC', elfclass=1, is_rela=True,
@@ -817,6 +862,7 @@ _ELF_MACHINE_RAW = {
             'ld64_gotpage_lo15': (313, 4),
         },
         dwarf_abs=257,
+        field={rt: (m, 0, 0, 0) for rt, m in _A64_FIELD_MASKS.items()},
     ),
     243: dict(
         name='RISC-V', elfclass=2, is_rela=True,
@@ -848,7 +894,9 @@ def _build_elf_machine_tables(raw):
         out[machine] = dict(entry,
                              named=named_types,
                              reloc_bytes=reloc_bytes,
-                             reverse=reverse)
+                             reverse=reverse,
+                             pcrel_guess=bool(entry.get('pcrel_guess', False)),
+                             field=dict(entry.get('field', {})))
     return out
 
 
@@ -860,7 +908,8 @@ ELF_MACHINES = _build_elf_machine_tables(_ELF_MACHINE_RAW)
 # 当てずっぽうの型番号を書いてリンカを騙すよりは、出さないほうを選ぶ。
 _ELF_MACHINE_GENERIC = dict(
     name='', elfclass=2, is_rela=True, width_guess={}, pc_rel=frozenset(),
-    extern_default=0, named={}, reloc_bytes={}, reverse={}, dwarf_abs=0)
+    extern_default=0, named={}, reloc_bytes={}, reverse={}, dwarf_abs=0,
+    pcrel_guess=False, field={})
 
 
 def _elf_decl_type(state, named, text):
@@ -889,8 +938,9 @@ def elf_machine_table(state):
     """いま有効な ELF マシン記述を組み立てて返す。
 
     組み込みの表を土台に、パターンファイルの宣言（.elftype / .elffield /
-    .elfclass / .elfrela / .elfwidth / .elfextern / .elfdwarf / .elfheader）を
-    かぶせたものがここで出来る。同じ名前なら宣言のほうが組み込みに勝つ。
+    .elfclass / .elfrela / .elfwidth / .elfextern / .elfdwarf / .elfpcguess /
+    .elfheader）をかぶせたものがここで出来る。同じ名前なら宣言のほうが
+    組み込みに勝つ。`.elfbuiltin::0` なら土台は空の表で、宣言だけが残る。
     これを 1 行ごとに作り直すと重いので (machine, decl_gen) を鍵にして覚える。
     decl_gen は宣言が増えるたびに進む世代番号なので、宣言を読み終えた時点で
     鍵が変わり、古い表が残ることはない。
@@ -900,7 +950,10 @@ def elf_machine_table(state):
     if e.mach_cache_key == key:
         return e.mach_cache
 
-    base = ELF_MACHINES.get(e.machine, _ELF_MACHINE_GENERIC)
+    if e.decl_builtin == 0:
+        base = _ELF_MACHINE_GENERIC
+    else:
+        base = ELF_MACHINES.get(e.machine, _ELF_MACHINE_GENERIC)
     width_guess = dict(base['width_guess'])
     pc_rel      = set(base['pc_rel'])
     name        = base['name'] or ("machine %d" % e.machine)
@@ -908,6 +961,7 @@ def elf_machine_table(state):
     is_rela        = base['is_rela']
     extern_default = base['extern_default']
     dwarf_abs      = base['dwarf_abs']
+    pcrel_guess    = base['pcrel_guess']
 
     named, reloc_bytes, reverse = {}, {}, {}
     _merged = [(nm, rt, base['reloc_bytes'].get(rt, 0))
@@ -937,20 +991,25 @@ def elf_machine_table(state):
         is_rela = bool(e.decl_rela)
     if e.decl_class is not None:
         elfclass = e.decl_class
+    if e.decl_pcguess is not None:
+        pcrel_guess = bool(e.decl_pcguess)
     if e.decl_name and (e.decl_machine is None or e.decl_machine == e.machine):
         name = e.decl_name
 
+    # 宣言した欄が先、組み込みの欄はその型の宣言が無いときだけ残る。
     field = {}
     for text, fo in e.decl_field.items():
         rt = _elf_decl_type(state, named, text)
         if rt is not None:
             field.setdefault(rt, fo)
+    for rt, fo in base['field'].items():
+        field.setdefault(rt, fo)
 
     tbl = dict(base, name=name, elfclass=elfclass, is_rela=is_rela,
                width_guess=width_guess, pc_rel=pc_rel,
                extern_default=extern_default, dwarf_abs=dwarf_abs,
                named=named, reloc_bytes=reloc_bytes, reverse=reverse,
-               field=field)
+               pcrel_guess=pcrel_guess, field=field)
     e.mach_cache_key = key
     e.mach_cache = tbl
     return tbl
@@ -1108,66 +1167,45 @@ def _reloc_reverse(state, mach, rtype):
     return ''
 
 
-# AArch64 の「命令の中の欄を書き換える」リロケーションが、32bit 命令語の
-# どのビットに値を置くか。各要素が (最下位ビット位置, ビット数) で、
-# ADR/ADRP だけは値が 2 つの欄に分かれて入る（下位 2bit と上位 19bit）。
-# 組み込みで持っているのは AArch64 のぶんだけで、他のマシンでは
-# パターンファイルの `.elffield` が同じことを宣言する。
-_A64_ADR_FIELDS = ((29, 2), (5, 19))
-_A64_LO12_FIELD = ((10, 12),)
-_A64_MOVW_FIELD = ((5, 16),)
-AARCH64_INSN_RELOCS = {
-    263: _A64_MOVW_FIELD, 264: _A64_MOVW_FIELD,
-    265: _A64_MOVW_FIELD, 266: _A64_MOVW_FIELD,
-    267: _A64_MOVW_FIELD, 268: _A64_MOVW_FIELD,
-    269: _A64_MOVW_FIELD,
-    287: _A64_MOVW_FIELD, 288: _A64_MOVW_FIELD,
-    289: _A64_MOVW_FIELD, 290: _A64_MOVW_FIELD,
-    291: _A64_MOVW_FIELD, 292: _A64_MOVW_FIELD,
-    293: _A64_MOVW_FIELD,
-    273: ((5, 19),),
-    274: _A64_ADR_FIELDS,
-    275: _A64_ADR_FIELDS, 276: _A64_ADR_FIELDS,
-    277: _A64_LO12_FIELD,
-    278: _A64_LO12_FIELD,
-    279: ((5, 14),),
-    280: ((5, 19),),
-    282: ((0, 26),), 283: ((0, 26),),
-    284: _A64_LO12_FIELD, 285: _A64_LO12_FIELD,
-    286: _A64_LO12_FIELD, 299: _A64_LO12_FIELD,
-    309: ((5, 19),),
-    311: _A64_ADR_FIELDS,
-    312: _A64_LO12_FIELD,
-    313: _A64_LO12_FIELD,
-}
-
-
 def insn_reloc_field_decl(state, rtype):
-    """`.elffield` で宣言された命令欄の記述を引く。無ければ None。"""
-    if state is None or not state.elf.decl_field:
+    """命令欄の記述 (マスク, オフセット, シフト, 補正) を引く。無ければ None。
+
+    実表の field は `.elffield` の宣言と組み込みの表（AArch64）を合わせた
+    もので、どちらから来たかでは区別しない。caxx.c の
+    insn_reloc_field_decl() と同じ規則である。
+    """
+    if state is None:
         return None
     return elf_machine_table(state)['field'].get(rtype)
 
 
-def insn_reloc_field_mask(rtype, machine=183, state=None):
+def insn_reloc_field_mask(rtype, state=None):
     """その型が命令語のどのビットを使うかのマスク。
 
-    `.elffield` の宣言が最優先。無ければ AArch64 の組み込み表だけを見る。
-    どちらも無ければ None で、「命令の中の欄ではない」ふつうのデータ
-    リロケーションとして扱われる。
+    命令欄の記述が無ければ None で、「命令の中の欄ではない」ふつうの
+    データリロケーションとして扱われる。
     """
     _fd = insn_reloc_field_decl(state, rtype)
-    if _fd is not None:
-        return _fd[0]
-    if machine != 183:
-        return None
-    fields = AARCH64_INSN_RELOCS.get(rtype)
-    if fields is None:
-        return None
-    mask = 0
-    for lo, nbits in fields:
-        mask |= ((1 << nbits) - 1) << lo
-    return mask
+    return None if _fd is None else _fd[0]
+
+
+def _field_deposit(mask, value):
+    """value の下位ビットから順に、mask の立っているビットへ下から詰める。
+
+    REL（加数を欄に持つ）で命令欄の型の加数を命令語へ書き戻すときに使う。
+    mask の外のビットは 0 のまま返すので、呼び出し側は元の語から mask を
+    消してからこれを OR する。caxx.c の field_deposit() と同じ規則である。
+    """
+    out = 0
+    bit = 0
+    m = mask
+    while m:
+        low = m & -m
+        if (value >> bit) & 1:
+            out |= low
+        bit += 1
+        m ^= low
+    return out
 
 
 class VLIWState:
@@ -1194,7 +1232,8 @@ class ElfState:
     """`-o` の ELF 出力に関わる状態をまとめたもの。
 
     decl_* はパターンファイルの ELF 記述（.elfmachine / .elfclass / .elfrela /
-    .elfwidth / .elfextern / .elfdwarf / .elfheader / .elfsection / .elffield）が
+    .elfwidth / .elfextern / .elfdwarf / .elfheader / .elfsection / .elffield /
+    .elfpcguess / .elfbuiltin）が
     書き込む先で、組み込みの表にかぶせて elf_machine_table() が実表を作る。
     decl_gen はそのキャッシュを捨てるための世代番号。
     """
@@ -1218,6 +1257,8 @@ class ElfState:
         self.decl_hdr = {}
         self.decl_field = {}
         self.decl_sec = {}
+        self.decl_pcguess = None
+        self.decl_builtin = None
         self.type_width = {}
         self.type_pcrel = set()
         self.decl_gen = 0
@@ -3815,7 +3856,7 @@ class BinaryWriter:
 
         if self.state.elf_objfile:
             _zeroed = [r for r in self.state.relocations
-                       if insn_reloc_field_mask(r[3], self.state.elf_machine, self.state) is not None]
+                       if insn_reloc_field_mask(r[3], self.state) is not None]
             if _zeroed:
                 _where = ', '.join(f"{r[0]}+0x{r[1]:x}" for r in _zeroed[:4])
                 if len(_zeroed) > 4:
@@ -4132,7 +4173,7 @@ class DirectiveProcessor:
         if not self.state.elf_objfile or not self.state.reloc_constraints:
             return False
         for var, rtype in self.state.reloc_constraints.items():
-            if insn_reloc_field_mask(rtype, self.state.elf_machine, self.state) is None:
+            if insn_reloc_field_mask(rtype, self.state) is None:
                 continue
             for m in re.finditer(re.escape(var), cond_src):
                 b, e = m.start(), m.end()
@@ -4501,8 +4542,11 @@ class DirectiveProcessor:
     def elffield_processing(self, i):
         """`.elffield` — 命令語の中のどのビットに値が入るかを宣言する。
 
-        AArch64 だけは組み込みの表を持っているが、ほかのマシンで
-        命令欄リロケーションを使うにはこの宣言が要る。
+        `.elffield::<型>::<マスク>[::<オフセット>[::<シフト>[::<補正>]]]`。
+        シフトは REL のとき加数を欄へ書き戻す前に右へずらすビット数、
+        補正は加数に足す定数（PC が命令の先頭より先を指す機種のずれ）。
+        AArch64 の組み込みの表も同じ形の記述を持っている。
+        caxx.c の dir_elffield() と同じ規則である。
         """
         if len(i) == 0 or i[0] != '.elffield':
             return False
@@ -4520,10 +4564,55 @@ class DirectiveProcessor:
             off = self._elf_decl_num('.elffield', i[3], 0, 255)
             if off is None:
                 return True
+        sh = 0
+        if len(i) > 4 and i[4] and i[4].strip():
+            sh = self._elf_decl_num('.elffield', i[4], 0, 63)
+            if sh is None:
+                return True
+        bias = 0
+        if len(i) > 5 and i[5] and i[5].strip():
+            bias = self._elf_decl_num('.elffield', i[5], -0x7FFFFFFF, 0x7FFFFFFF)
+            if bias is None:
+                return True
+        fo = (m, off, sh, bias)
         e = self.state.elf
-        if e.decl_field.get(t) != (m, off):
-            e.decl_field[t] = (m, off)
+        if e.decl_field.get(t) != fo:
+            e.decl_field[t] = fo
             e.decl_gen += 1
+        return True
+
+    def elfpcguess_processing(self, i):
+        """`.elfpcguess` — 幅からの推定で絶対型を PC 相対型に取り替えるか。
+
+        1 なら、幅から推定した型が絶対型で、欄の値がラベルの値と違うとき、
+        同じ幅の PC 相対型に替える（m68k の組み込みの表はこれが 1）。
+        0 なら替えない。caxx.c の dir_elfpcguess() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.elfpcguess':
+            return False
+        text = self._elf_decl_fields(i)[0].strip()
+        if text in ('0', '1'):
+            self._elf_decl_set('decl_pcguess', int(text))
+        else:
+            self.state.diag(f" error - .elfpcguess: value must be 0 or 1, got '{text}'.",
+                            set_error=True)
+        return True
+
+    def elfbuiltin_processing(self, i):
+        """`.elfbuiltin` — 組み込みのマシン表を土台にするか。
+
+        0 なら -m の番号に組み込みの表があっても使わず、パターンファイルの
+        宣言だけで記述を組む。1（既定）なら表に宣言を重ねる。
+        caxx.c の dir_elfbuiltin() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.elfbuiltin':
+            return False
+        text = self._elf_decl_fields(i)[0].strip()
+        if text in ('0', '1'):
+            self._elf_decl_set('decl_builtin', int(text))
+        else:
+            self.state.diag(f" error - .elfbuiltin: value must be 0 or 1, got '{text}'.",
+                            set_error=True)
         return True
 
     def elfsection_processing(self, i):
@@ -4887,7 +4976,8 @@ _PAT_DIRECTIVES = frozenset((
     '.passthru', '.eol', '.textmode', '.enum', '.clrenum', '.error',
     '.echo',
     '.elftype', '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
-    '.elfextern', '.elfdwarf', '.elfheader', '.elfsection', '.elffield'))
+    '.elfextern', '.elfdwarf', '.elfheader', '.elfsection', '.elffield',
+    '.elfpcguess', '.elfbuiltin'))
 
 
 _CONST_SETSYM_RE = re.compile(r"^[\s0-9+\-*/%()<>|&^~]+$|^\s*0[xX][0-9a-fA-F]+\s*$")
@@ -11118,12 +11208,11 @@ class Assembler:
                         _hint_rtype, _hint_addend = _hint
                         if _src_rtype is not None and lname not in self.state.extern_untyped:
                             _hint_rtype = _src_rtype
-                        _fmask = insn_reloc_field_mask(_hint_rtype, self.state.elf_machine, self.state)
                         _fdecl = insn_reloc_field_decl(self.state, _hint_rtype)
-                        _foff = _fdecl[1] if _fdecl is not None else 0
-                        if _fmask is None:
+                        if _fdecl is None:
                             _forced_rtype = _hint_rtype
                         else:
+                            _fmask, _foff, _fsh, _fbias = _fdecl
                             _insn_bytes = _mach_tbl_la['reloc_bytes'].get(_hint_rtype, 4)
                             _insn_words = max(1, _insn_bytes // bpw_r)
                             _fw = first_widx + _foff // bpw_r
@@ -11136,9 +11225,10 @@ class Assembler:
                                     objl[_fw + _k] = int(objl[_fw + _k]) & ~_clear & _wmask
                             _sec_rel_h = (_completed_words
                                           + (self.state.pc + _fw - _entry_pc_cur)) * bpw_r
+                            # 加数は「オペランドの値 − ラベルの値」に補正を足したもの。
                             self.state.relocations.append(
                                 (sec_name_r, _sec_rel_h, lname, _hint_rtype,
-                                 _hint_addend, _insn_bytes))
+                                 _hint_addend + _fbias, _insn_bytes))
                             continue
 
                     rtype = 0
@@ -11197,7 +11287,7 @@ class Assembler:
                         if _alt is not None:
                             rtype = _alt
 
-                    if (_rtype_is_default_guess and self.state.elf_machine == 4
+                    if (_rtype_is_default_guess and _mach_tbl_la['pcrel_guess']
                             and rtype not in _pc_rel_types_all
                             and raw_val != abs_w_bytes):
                         _alt = _reloc_same_width(_mach_tbl_la, num_bytes, True)
@@ -11264,7 +11354,8 @@ class Assembler:
 
     _ELF_DECL_DIRECTIVES = ('.elftype', '.elfmachine', '.elfclass', '.elfrela',
                             '.elfwidth', '.elfextern', '.elfdwarf', '.elfheader',
-                            '.elfsection', '.elffield')
+                            '.elfsection', '.elffield', '.elfpcguess',
+                            '.elfbuiltin')
 
     def register_elfdecls(self, pat):
         """パターンファイル中の ELF 記述ディレクティブを先に読んでおく。"""
@@ -11280,11 +11371,74 @@ class Assembler:
             '.elfheader':  d.elfheader_processing,
             '.elfsection': d.elfsection_processing,
             '.elffield':   d.elffield_processing,
+            '.elfpcguess': d.elfpcguess_processing,
+            '.elfbuiltin': d.elfbuiltin_processing,
         }
         for i in pat:
             if i and i[0] in table:
                 table[i[0]](i)
         self.check_elfdecls()
+
+    def elf_desc_text(self):
+        """`--elfdesc` — いま有効な ELF マシン記述を宣言の形で返す。
+
+        組み込みの表と `.elf*` の宣言を合わせた実表（elf_machine_table）を、
+        先頭に `.elfbuiltin::0` を置いたパターンファイルの宣言に書き直す。
+        これを命令のパターンと一緒に読ませると、組み込みの表なしで同じ
+        ELF が出る。型は名前で書き、名前の無い型は番号で書く。
+        caxx.c の elf_desc_print() と同じ並びと書式である。
+        """
+        st = self.state
+        e = st.elf
+        tbl = elf_machine_table(st)
+        named = tbl['named']
+
+        def tname(rt):
+            nm = tbl['reverse'].get(rt, '')
+            if nm and named.get(nm) == rt:
+                return nm
+            return str(rt)
+
+        out = ['.elfbuiltin::0']
+        nm = tbl['name']
+        if nm and nm != "machine %d" % e.machine:
+            out.append(".elfmachine::%d::%s" % (e.machine, nm))
+        else:
+            out.append(".elfmachine::%d" % e.machine)
+        out.append(".elfclass::%d" % (64 if tbl['elfclass'] == 2 else 32))
+        out.append(".elfrela::%d" % (1 if tbl['is_rela'] else 0))
+        for tn, rt in named.items():
+            w = tbl['reloc_bytes'].get(rt, 0)
+            pc = rt in tbl['pc_rel']
+            line = ".elftype::%s::%d" % (tn, rt)
+            if w or pc:
+                line += "::%s" % (str(w) if w else '')
+            if pc:
+                line += "::1"
+            out.append(line)
+        # 型 0（その幅には型が無い）は書かない。書かなければ 0 のままである。
+        for nb in sorted(tbl['width_guess']):
+            if tbl['width_guess'][nb]:
+                out.append(".elfwidth::%d::%s" % (nb, tname(tbl['width_guess'][nb])))
+        out.append(".elfextern::%s" % tname(tbl['extern_default']))
+        out.append(".elfdwarf::%s" % tname(tbl['dwarf_abs']))
+        out.append(".elfpcguess::%d" % (1 if tbl['pcrel_guess'] else 0))
+        for rt in sorted(tbl['field']):
+            m, off, sh, bias = tbl['field'][rt]
+            out.append(".elffield::%s::0x%x::%d::%d::%d" % (tname(rt), m, off, sh, bias))
+        for fld in ('type', 'flags', 'version', 'entry', 'osabi', 'abiversion'):
+            if fld in e.decl_hdr:
+                out.append(".elfheader::%s::0x%x" % (fld, e.decl_hdr[fld]))
+        for sn in sorted(e.decl_sec):
+            d = e.decl_sec[sn]
+            line = ".elfsection::%s::0x%x" % (sn, d[0])
+            rest = [d[k] if len(d) > k else None for k in (1, 2, 3)]
+            while rest and rest[-1] is None:
+                rest.pop()
+            for v in rest:
+                line += "::" + ('' if v is None else "%d" % v)
+            out.append(line)
+        return '\n'.join(out) + '\n'
 
     def check_elfdecls(self):
         """ELF 記述の宣言が揃っているか、矛盾がないかを検査する。"""
@@ -12001,10 +12155,33 @@ class Assembler:
                         set_error=True)
 
         if not _is_rela:
+            _wmask_r = (1 << self.state.bts) - 1
             for sidx, entries in rela_entries.items():
                 csec = csecs[sidx - 1]
                 patched = bytearray(csec.data)
                 for (off, _sym_name, _rtype, addend, nbytes) in entries:
+                    _fd = _mach_tbl_w['field'].get(_rtype)
+                    if _fd is not None:
+                        # 命令欄の型。加数をシフトしてマスクのビットへ下から
+                        # 詰め、欄の外（命令の残り）はそのまま残す。
+                        _nw = max(1, nbytes // bpw)
+                        if not (0 <= off and off + _nw * bpw <= len(patched)):
+                            continue
+                        _ws = []
+                        for k in range(_nw):
+                            _b = patched[off + k * bpw: off + (k + 1) * bpw]
+                            _ws.append(int.from_bytes(_b, 'little' if _is_le else 'big'))
+                        _iv = 0
+                        for k in range(_nw):
+                            _sh = self.state.bts * (k if _is_le else (_nw - 1 - k))
+                            _iv |= (_ws[k] & _wmask_r) << _sh
+                        _iv = (_iv & ~_fd[0]) | _field_deposit(_fd[0], addend >> _fd[2])
+                        for k in range(_nw):
+                            _sh = self.state.bts * (k if _is_le else (_nw - 1 - k))
+                            _wv = (_iv >> _sh) & _wmask_r
+                            patched[off + k * bpw: off + (k + 1) * bpw] = \
+                                _wv.to_bytes(bpw, 'little' if _is_le else 'big')
+                        continue
                     field = addend & ((1 << (nbytes * 8)) - 1)
                     if self.state.endian == 'little':
                         field_bytes = bytes((field >> (8 * j)) & 0xff for j in range(nbytes))
@@ -12238,7 +12415,12 @@ class Assembler:
         offset = _ehdr_size
         sec_offsets = []
         for s in csecs:
-            offset = _align_up(offset, 16)
+            # ファイル内の位置も sh_addralign に合わせる（16 を下限）。
+            # `.elfsection` で 64 などの大きな整列を書いたセクションも、
+            # GNU as と同じくファイル上でその境界から始まる。
+            _al_f = s.align if s.align is not None \
+                else _elf_default_align(s.sh_type, _is_elf64)
+            offset = _align_up(offset, max(16, _al_f or 1))
             sec_offsets.append(offset)
             if not _is_nobits(s):
                 offset += s.byte_size
@@ -12447,6 +12629,15 @@ class Assembler:
                         help='Macro-expand the source file and write the resulting '
                              'assembly to FILE (or stdout if FILE is omitted or "-") '
                              'without assembling it. Useful for debugging macros.')
+        ap.add_argument('--elfdesc', dest='elf_desc', action='store_true',
+                        default=False,
+                        help='Print the effective ELF machine description (the '
+                             'built-in table of the -m machine with the pattern '
+                             'file\'s .elf* declarations laid over it) as pattern-'
+                             'file declarations headed by .elfbuiltin::0, and exit '
+                             'without assembling. Pasting the output into a pattern '
+                             'file reproduces the same ELF output with no built-in '
+                             'table (manual 3.7.9).')
         ap.add_argument('-p', '--macro-expand-pattern', dest='macro_expand_pattern',
                         nargs='?', const='-', default=None, metavar='FILE',
                         help='The pattern-file counterpart of -P: macro-expand the '
@@ -12542,6 +12733,8 @@ class Assembler:
             '.elfheader':  d.elfheader_processing,
             '.elfsection': d.elfsection_processing,
             '.elffield':   d.elffield_processing,
+            '.elfpcguess': d.elfpcguess_processing,
+            '.elfbuiltin': d.elfbuiltin_processing,
         }
         out = []
         for row, i in enumerate(pat):
@@ -12764,6 +12957,9 @@ class Assembler:
                 self.state.diag("         Aborting: no output file written.",
                                 set_error=False, force=True)
                 return False
+            if args.elf_desc:
+                sys.stdout.write(self.elf_desc_text())
+                return True
 
             if self.state.impfile:
 

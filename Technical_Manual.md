@@ -44,7 +44,7 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all thirty bundled pattern/source pairs with
+exactly that: `test1` assembles all thirty-one bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the three `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` pair the `.echo` lines each one writes to standard
@@ -248,6 +248,7 @@ axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV]
 | `--no-macro` | Disable the macro layer on both the source and pattern side |
 | `-P [FILE]` | Macro-expand the source and write it out without assembling |
 | `-p [FILE]` | Macro-expand the pattern file and write it out without assembling |
+| `--elfdesc` | Print the effective ELF machine description (the built-in table plus the pattern file's declarations) as pattern-file declarations to stdout, and stop without assembling (section 3.7.9) |
 | `-h`, `--help` | Usage |
 
 If no output option is given, nothing is written; `-v` is what makes the run
@@ -276,6 +277,11 @@ the pattern file's ELF description (section 3.7.7); with no declarations, a
 reference whose type cannot be determined gets no relocation entry, rather than
 a guessed type number. With no `-m` at all, the pattern file's `.elfmachine` is
 the target, and failing that 62 (x86-64).
+
+The table above is itself made only of things a pattern file can declare: the
+code that writes the ELF has no branch on the machine number. The whole
+description can also be written in the pattern file, with no table at all
+(`.elfbuiltin::0`, section 3.7.9).
 
 `-f` selects ELF32 or ELF64 independently of `-m`. Without it the class comes
 from the pattern file's `.elfclass`, and failing that from the conventional
@@ -1515,7 +1521,9 @@ ELF object should look like.
 | `.elfdwarf::<type>` | the absolute type the `-g` DWARF output uses |
 | `.elfheader::<field>::<value>` | a field of the ELF header |
 | `.elfsection::<name>::<sh_flags>[::<sh_type>[::<align>[::<entsize>]]]` | the attributes of a section header |
-| `.elffield::<type>::<mask>[::<offset>]` | an instruction-field relocation type (below, "Instruction-field types") |
+| `.elffield::<type>::<mask>[::<offset>[::<shift>[::<bias>]]]` | an instruction-field relocation type (below, "Instruction-field types") |
+| `.elfpcguess::<0>` / `<1>` | whether a width-guessed absolute type is swapped for a PC-relative one (section 3.7.9) |
+| `.elfbuiltin::<0>` / `<1>` | whether the built-in table is the base (section 3.7.9) |
 
 - Every declaration is a difference *laid over* the built-in table selected with
   `-m`. On a machine that is in the table, only what you write is replaced — so
@@ -1619,15 +1627,21 @@ note `readelf -n` can read, so the alignment can be checked.
 **Instruction-field types (`.elffield`).**
 
 ```
-.elffield::<type>::<mask>[::<offset>]
+.elffield::<type>::<mask>[::<offset>[::<shift>[::<bias>]]]
 ```
 
 Declares that `<type>` packs its value into bit fields of an instruction rather
 than into plain consecutive bytes, the way `.reloc` (section 3.7.5) needs. It
 gives any machine what the built-in table gives AArch64: a row typed with
-`.reloc::t::<type>` then carries the addend "operand value - label value", its
-field is written as 0 (RELA, the shape GNU as produces), and the range and
-alignment checks on that operand are left to the linker.
+`.reloc::t::<type>` then carries the addend "operand value - label value +
+`<bias>`", and the range and alignment checks on that operand are left to the
+linker. What the field holds depends on RELA or REL:
+
+- Under RELA (`.elfrela::1`) the field is written as 0 and the addend goes in
+  the relocation entry (the shape GNU as produces).
+- Under REL (`.elfrela::0`) the addend is shifted right by `<shift>` bits and
+  put back into the field, filling the set bits of `<mask>` **from the bottom
+  up**. The bits outside the mask (the rest of the instruction) are kept.
 
 - `<mask>` is the set of bits the linker writes, within the bytes of the type's
   width (from `.elftype` or the machine's name table) read as an integer in the
@@ -1639,8 +1653,19 @@ alignment checks on that operand are left to the linker.
 - `<offset>` (default 0) is where the field starts, in bytes from the first
   word the row emits for that operand; `r_offset` points there. A 16-bit field
   in the low half of a 32-bit word is at 2 big-endian and at 0 little-endian.
+- `<shift>` (default 0, 0 to 63) is how far the addend is shifted right before
+  REL writes it into the field: 2 for a field counted in 4-byte words, like
+  ARM's `bl`. RELA does not use it.
+- `<bias>` (default 0, -2147483647 to 2147483647) is a constant added to the
+  addend. It tells the linker how far ahead of the instruction the PC points on
+  machines where it does: an ARM branch counts from the instruction address
+  plus 8, so the bias is -8 (GNU as gives `bl ext` the addend -8 too).
 - The type may be an `.elftype` name, a built-in name or a number. Writing the
   same type again replaces the earlier declaration.
+- Because the bits of the mask are filled from the bottom up, a type whose
+  field reorders the bits of the value (RISC-V's B format, for one) cannot be
+  written back under REL. Describe such a machine with RELA, as the real ABIs
+  do.
 
 ```
 .elftype::rel24::10::4::1
@@ -1655,6 +1680,22 @@ BL !t :: .call w4(0x48000001|((t-$$)&0x3fffffc))
 
 ```
 bl ext+8        ->  R_PPC64_REL24  ext + 8
+```
+
+A REL example (ARM, the bundled `elfrel.axx`):
+
+```
+.elfrela::0
+.elftype::call::28::4::1
+.elftype::movw_abs_nc::43::4
+.elffield::call::0x00ffffff::0::2::-8   /* imm24, in words, PC+8 */
+.elffield::movw_abs_nc::0x000f0fff      /* imm4:imm12            */
+```
+
+```
+bl   ext                   ->  eb fffffe   R_ARM_CALL         ((0 - 8) >> 2)
+bl   ext+16                ->  eb 000002   R_ARM_CALL         ((16 - 8) >> 2)
+movw r1,%lo16(dat+0x12345) ->  e302 1345   R_ARM_MOVW_ABS_NC  (imm12 <- low 12 bits, imm4 <- the next 4)
 ```
 
 A `.extern` written without a type name does not override the type `.reloc`
@@ -1744,6 +1785,74 @@ that one type (section 3.7.5, "Why it cannot be stated on the symbol"). A type
 that belongs to the operand position belongs in the pattern file alone.
 
 The bundled `elfprio.axx` / `elfprio.s` are a worked example.
+
+#### 3.7.9 The built-in tables are declarations too — `.elfbuiltin` / `.elfpcguess` / `--elfdesc`
+
+The built-in tables axx carries for eleven machines (section 2.2) are nothing
+more than pattern-file declarations written in advance. Every entry can be
+written with the declarations of sections 3.7.6-3.7.7, and the code that writes
+the ELF has no branch on the machine number.
+
+| Table entry | The declaration that says the same |
+|---|---|
+| the machine's name | `.elfmachine::<number>::<name>` |
+| the conventional ELF class | `.elfclass` |
+| RELA or REL | `.elfrela` |
+| type names, numbers, widths, PC-relativity | `.elftype` |
+| the default type per width | `.elfwidth` |
+| the default type of `.extern` | `.elfextern` |
+| the absolute type of DWARF | `.elfdwarf` |
+| instruction-field types (AArch64) | `.elffield` |
+| the absolute-to-PC-relative guess (m68k) | `.elfpcguess` |
+
+**`.elfbuiltin::<0|1>`.** Writing 0 leaves the built-in table out even when the
+`-m` number has one, so the description is made of the pattern file's
+declarations alone. The default 1 lays the declarations over the table
+(section 3.7.7). Use it for a closed description that no type of the table can
+leak into.
+
+**`.elfpcguess::<0|1>`.** With 1, when the type guessed from a field's width is
+absolute but the field does not hold the label's value (a PC-relative
+expression such as `dc.w label-*`), the type is swapped for the PC-relative type
+of the same width. Of the built-in tables only m68k sets it; any machine may.
+
+**`--elfdesc`.** Prints the description in effect — the built-in table of the
+`-m` machine with the pattern file's declarations laid over it — to standard
+output as a run of declarations headed by `.elfbuiltin::0`, and stops without
+assembling. No source file is needed.
+
+```
+$ axx aarch64.axx -m 183 --elfdesc
+.elfbuiltin::0
+.elfmachine::183::AArch64
+.elfclass::64
+.elfrela::1
+.elftype::abs64::257::8
+.elftype::abs32::258::4
+...
+.elfwidth::8::abs64
+.elfextern::pc32
+.elfdwarf::abs64
+.elfpcguess::0
+.elffield::movw_uabs_g0::0x1fffe0::0::0::0
+...
+```
+
+Pasting this into a pattern file (or including it) gives the same ELF with no
+built-in table. That the output matches byte for byte has been checked for all
+eleven built-in machines and the bundled ELF pattern files. To describe a new
+machine close to one in the table, copying that machine's `--elfdesc` and
+editing it is the quick way.
+
+Types are written by name, and by number where they have none. `.elfheader`
+and `.elfsection` appear only when the pattern file wrote them (the built-in
+tables carry neither).
+
+The bundled `elfrel.axx` / `elfrel.s` are a worked example. They describe ARM
+(EM_ARM, 40) with `.elfbuiltin::0`, with no built-in table, and write REL
+instruction-field types (`R_ARM_CALL`, `R_ARM_JUMP24`, `R_ARM_MOVW_ABS_NC`,
+`R_ARM_MOVT_ABS`). The instruction words and relocations match llvm-mc's, and
+so does the result of linking with `ld.lld -m armelf`.
 
 ### 3.8 Optional parts (`[[ ]]`)
 
@@ -3779,6 +3888,7 @@ The x86_64 pattern file is also maintained separately at
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
 | **elfsec.axx** | 1.4 KB | 8 | **elfsec.s** | section attributes and `sh_addralign` declared with `.elfsection` (3.7.7); test only |
+| **elfrel.axx** | 4.1 KB | 41 | **elfrel.s** | ARM (EM_ARM) described with `.elfbuiltin::0`, without the built-in table, and the REL instruction-field types (the shift and bias of `.elffield`; 3.7.7, 3.7.9). The instruction words and relocations match llvm-mc; test only |
 | **elfsym.axx** | 2.8 KB | 23 | **elfsym.s** | the ELF symbol attributes written from the source (`.type`, `.size`, `.weak`, `.hidden`, `.protected`, `.internal`, `.other`, `.comm`; 5.6.1), together with a field width that is not a power of two (`.elfwidth::3`) and a section element size (the fifth field of `.elfsection`; 3.7.7). The machine is EM_MN10300, which is not in the built-in table; test only |
 | **riscv64.axx** | 11 KB | 122 | **riscv64.s** | RV64I, the base integer instruction set (U/I/S/B/J/R formats, loads and stores, branches, jumps, `call`, `li`/`mv`/`j`/`ret`/`nop`, `ecall`/`ebreak`). No C, M, A or F/D extension, no CSR instructions, no fence group. It is also the worked example of declaring what axx has no built-in numbers for: the built-in EM_RISCV table holds only the data types, so `CALL_PLT`, `BRANCH`, `JAL`, `HI20`, `LO12_I`/`_S` and the `PCREL` pair come from `.elftype` / `.elffield` / `.reloc` (3.7.5-3.7.7). It links with `ld -m elf64lriscv` and runs |
 | **riscv64full.axx** | 75 KB | 2,186 (4,137 expanded) | **riscv64full.s**, **riscv64full_reloc.s** | RISC-V RV64 in full: I, M, A (with Zabha, Zacas, Zawrs), F, D, Q, Zfh, Zfa, C (Zca, Zcd, Zcb, Zcmp, Zcmt, Zcmop), Zba / Zbb / Zbc / Zbs, Zbkb / Zbkc / Zbkx, Zknd / Zkne / Zknh / Zksed / Zksh, Zicond, Zicbom / Zicboz / Zicbop, Zihintntl, Zimop, Zicfiss / Zicfilp, Zicsr with the CSR names, the privileged and H instructions, and V 1.0 with Zvbb, Zvbc, Zvkg, Zvkned, Zvknh, Zvksed, Zvksh and the bf16 parts; the GNU pseudo-instructions (`li` of any 64-bit constant, `call`, `tail`, `la`, the global loads and stores ...); optional rounding modes and `v0.t` masks. A superset of `riscv64.axx` that declares the RISC-V psABI relocations the instructions carry. Checked against llvm-mc 18 byte for byte, its `-o` relocations and linked images against LLVM's; the part of the ISA that LLVM 18 does not have (Q, Zabha, `vwsll`, `mnret`, `c.ntl.*`, `c.sspush`) is from the specifications. `riscv64full.s` exercises the rows; `riscv64full_reloc.s` is for `-o` |
@@ -3800,7 +3910,7 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 big-endian hello world); `ppc64_isa.axx` is included by those two and is never
 passed to axx itself.
 
-`test1` runs all thirty pairs through both implementations and
+`test1` runs all thirty-one pairs through both implementations and
 compares the `-b` raw binaries. For the three pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx` and `intel2att.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
@@ -3808,8 +3918,11 @@ implementation writes to standard output under `-V`. The `elftype.axx` /
 ELF header, the `elfprio.axx` / `elfprio.s` pair is about which of the three
 ranks types a relocation, the `elfsec.axx` / `elfsec.s` pair is about the
 section headers, the `elfsym.axx` / `elfsym.s` pair is about the symbol
-table attributes, and the `riscv64.axx` / `riscv64.s` pair is about declared
-instruction-field types, so for those six the `-o` ELF objects are compared. For the
+table attributes, the `riscv64.axx` / `riscv64.s` pair is about declared
+instruction-field types, and the `elfrel.axx` / `elfrel.s` pair is about REL
+instruction-field types, so for those seven the `-o` ELF objects are compared.
+For `aarch64.axx` the `-m 183 --elfdesc` output (the built-in table rewritten as
+declarations) is compared too. For the
 `echo.axx` / `echo.s` pair the `.echo` lines written to standard error are
 compared as well.
 
@@ -3817,7 +3930,7 @@ The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for a hundred and forty-six comparisons in all.
+never compares, for a hundred and forty-eight comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -3847,7 +3960,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all thirty bundled pattern/source pairs with both
+`test1` assembles all thirty-one bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 three `.textmode` pairs and the `.echo` lines of the `echo.axx` pair.
 

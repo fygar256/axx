@@ -113,6 +113,18 @@ elfsym.s                            test assemble file for elfsym.axx. build it
                                     types, sizes, bindings, visibilities, the
                                     st_other byte and the SHN_COMMON symbol
                                     are all written from the source
+elfrel.axx                          pattern file for a REL machine whose
+                                    relocations live in instruction fields:
+                                    ARM (EM_ARM) described with .elfbuiltin::0,
+                                    so no built-in table is used, and the
+                                    shift and bias fields of .elffield that
+                                    put the addend back into the instruction
+                                    (manual 3.7.7, 3.7.9)
+elfrel.s                            test assemble file for elfrel.axx. build it
+                                    with -o: the instruction words and the
+                                    relocations match llvm-mc's for the same
+                                    code, and the object links with
+                                    ld.lld -m armelf
 riscv64.axx                         pattern file for RV64I (the base integer
                                     subset: U/I/S/B/J/R formats, loads and
                                     stores, branches, jumps, call, li/mv/j/

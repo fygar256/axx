@@ -1190,7 +1190,8 @@ enum {
     PD_VLIW, PD_CHECK, PD_CLRCHECK, PD_RELOC, PD_CLRRELOC, PD_MAP, PD_FREE,
     PD_PASSTHRU, PD_EOL, PD_TEXTMODE, PD_ENUM, PD_CLRENUM, PD_ERRMSG, PD_EPIC,
     PD_ELFTYPE, PD_ELFMACHINE, PD_ELFCLASS, PD_ELFRELA, PD_ELFWIDTH,
-    PD_ELFEXTERN, PD_ELFDWARF, PD_ELFHEADER, PD_ELFSECTION, PD_ECHO, PD_ELFFIELD
+    PD_ELFEXTERN, PD_ELFDWARF, PD_ELFHEADER, PD_ELFSECTION, PD_ECHO, PD_ELFFIELD,
+    PD_ELFPCGUESS, PD_ELFBUILTIN
 };
 
 /* パターン行がどのディレクティブか（種別の番号）。 */
@@ -1211,6 +1212,7 @@ static int pat_dir_kind(const PatEntry *e){
         { ".elfextern", PD_ELFEXTERN }, { ".elfdwarf", PD_ELFDWARF },
         { ".elfheader", PD_ELFHEADER }, { ".elfsection", PD_ELFSECTION },
         { ".elffield", PD_ELFFIELD },
+        { ".elfpcguess", PD_ELFPCGUESS }, { ".elfbuiltin", PD_ELFBUILTIN },
         { ".echo", PD_ECHO }, { NULL, 0 } };
     if(!e || !e->f[0] || !e->f[0][0]) return PD_NONE;
     const char *n = e->f[0];
@@ -1235,7 +1237,8 @@ static int pat_is_directive(const PatEntry *e){
         ".check", ".clrcheck", ".reloc", ".clrreloc", ".map", ".free",
         ".passthru", ".eol", ".textmode", ".enum", ".clrenum", ".error",
         ".elftype", ".elfmachine", ".elfclass", ".elfrela", ".elfwidth",
-        ".elfextern", ".elfdwarf", ".elfheader", ".elfsection", ".echo", ".elffield", NULL };
+        ".elfextern", ".elfdwarf", ".elfheader", ".elfsection", ".echo", ".elffield",
+        ".elfpcguess", ".elfbuiltin", NULL };
     if(!e || !e->f[0] || !e->f[0][0]) return 0;
     const char *n = e->f[0];
     for(int k=0; tbl[k]; k++) if(strcmp(n, tbl[k]) == 0) return 1;
@@ -1679,7 +1682,7 @@ static int pat_dir_line_invariant(const PatEntry *e){
     case PD_SYMBOLC: case PD_PASSTHRU: case PD_EOL: case PD_TEXTMODE:
     case PD_ELFMACHINE: case PD_ELFCLASS: case PD_ELFRELA: case PD_ELFWIDTH:
     case PD_ELFEXTERN: case PD_ELFDWARF: case PD_ELFHEADER:
-    case PD_ELFSECTION: case PD_ELFFIELD:
+    case PD_ELFSECTION: case PD_ELFFIELD: case PD_ELFPCGUESS: case PD_ELFBUILTIN:
         for(int i=1;i<PAT_FIELDS;i++)
             for(const char *q=e->f[i]; *q; q++)
                 if(*q=='!' || *q=='$' || *q=='#' || *q=='@') return 0;
@@ -2104,6 +2107,8 @@ typedef struct {
     char       elf_decl_name[64];
     int        elf_decl_class;
     int        elf_decl_rela;
+    int        elf_decl_pcguess;
+    int        elf_decl_builtin;
     char      *elf_decl_width[9];
     char      *elf_decl_extern;
     char      *elf_decl_dwarf;
@@ -2116,7 +2121,7 @@ typedef struct {
     struct { char *name; int stype; int size_set; uint64_t size;
              int other; int weak; int common; uint64_t calign; } *sym_attrs;
     int        sym_attrs_len, sym_attrs_cap;
-    struct { char *type; uint64_t mask; int off; } *elf_fields;
+    struct { char *type; uint64_t mask; int off; int shift; long long bias; } *elf_fields;
     int        elf_fields_len, elf_fields_cap;
     char     **extern_untyped;
     int        extern_untyped_len, extern_untyped_cap;
@@ -2347,6 +2352,15 @@ static FILE *axx_open_input(const char *fn, const char *what){
 
 typedef struct { const char *name; int rtype; int width; } ElfNamedReloc;
 
+/* 命令欄の記述 1 つ。`.elffield::<型>::<マスク>::<オフセット>::<シフト>::<補正>`
+   と同じ形。 */
+typedef struct { int rtype; uint64_t mask; int off; int shift; long long bias; } ElfFieldInfo;
+
+/* 組み込みのマシン記述。どの項目もパターンファイルの宣言で同じものが
+   書ける（.elfmachine / .elfclass / .elfrela / .elftype / .elfwidth /
+   .elfextern / .elfdwarf / .elfpcguess / .elffield）。表は「宣言を
+   あらかじめ書いておいたもの」にすぎず、コードのどこにも機種番号で
+   分かれる処理は無い。axx.py の _ELF_MACHINE_RAW と同じ中身である。 */
 typedef struct {
     int         machine;
     const char *name;
@@ -2358,9 +2372,12 @@ typedef struct {
     const int  *pc_rel;
     int         pc_rel_n;
     const ElfNamedReloc *named;
+    int         pcrel_guess;
+    const ElfFieldInfo *field;
+    int         field_n;
 } ElfMachineInfo;
 
-static const int _pcrel_i386[]    = {2, 13, 21, 23};
+static const int _pcrel_i386[]    = {2, 4, 13, 21, 23};
 static const int _pcrel_m68k[]    = {4, 5, 6};
 static const int _pcrel_ppc32[]   = {10, 26};
 static const int _pcrel_ppc64[]   = {10, 26, 44};
@@ -2463,34 +2480,37 @@ static const ElfNamedReloc _named_aarch64[] = {
     {NULL, 0, 0},
 };
 
-/* `.elffield` で宣言された命令欄のマスク。 */
-static uint32_t insn_reloc_field_mask_tbl(int rtype){
-    switch(rtype){
-    case 263: case 264: case 265: case 266:
-    case 267: case 268: case 269:
-    case 287: case 288: case 289: case 290:
-    case 291: case 292: case 293:
-        return 0xffffu << 5;
-    case 274: case 275: case 276:
-        return (3u << 29) | (0x7ffffu << 5);
-    case 277: case 278: case 284: case 285:
-    case 286: case 299:
-        return 0xfffu << 10;
-    case 279: return 0x3fffu << 5;
-    case 273: case 280: case 309: return 0x7ffffu << 5;
-    case 311: return (3u << 29) | (0x7ffffu << 5);
-    case 312: case 313: return 0xfffu << 10;
-    case 282: case 283: return 0x3ffffffu;
-    default: return 0;
-    }
-}
-
-/* AArch64 の命令欄リロケーションのマスク（組み込みの表）。
-   ほかのマシンでは `.elffield` が同じことを宣言する。 */
-static uint32_t insn_reloc_field_mask_a64(int rtype, int machine){
-    if(machine != 183) return 0;
-    return insn_reloc_field_mask_tbl(rtype);
-}
+/* AArch64 の命令欄リロケーションが 32bit 命令語のどのビットに値を置くか。
+   `.elffield::<型>::<マスク>` と同じ形で持つ。axx.py の _A64_FIELD_MASKS
+   と同じ中身・同じ並びである。 */
+#define A64_ADR_MASK  ((0x3ull << 29) | (0x7ffffull << 5))
+#define A64_LO12_MASK (0xfffull << 10)
+#define A64_MOVW_MASK (0xffffull << 5)
+static const ElfFieldInfo _field_aarch64[] = {
+    {263, A64_MOVW_MASK, 0, 0, 0}, {264, A64_MOVW_MASK, 0, 0, 0},
+    {265, A64_MOVW_MASK, 0, 0, 0}, {266, A64_MOVW_MASK, 0, 0, 0},
+    {267, A64_MOVW_MASK, 0, 0, 0}, {268, A64_MOVW_MASK, 0, 0, 0},
+    {269, A64_MOVW_MASK, 0, 0, 0},
+    {287, A64_MOVW_MASK, 0, 0, 0}, {288, A64_MOVW_MASK, 0, 0, 0},
+    {289, A64_MOVW_MASK, 0, 0, 0}, {290, A64_MOVW_MASK, 0, 0, 0},
+    {291, A64_MOVW_MASK, 0, 0, 0}, {292, A64_MOVW_MASK, 0, 0, 0},
+    {293, A64_MOVW_MASK, 0, 0, 0},
+    {274, A64_ADR_MASK, 0, 0, 0},
+    {275, A64_ADR_MASK, 0, 0, 0}, {276, A64_ADR_MASK, 0, 0, 0},
+    {277, A64_LO12_MASK, 0, 0, 0},
+    {278, A64_LO12_MASK, 0, 0, 0},
+    {273, 0x7ffffull << 5, 0, 0, 0},
+    {279, 0x3fffull << 5, 0, 0, 0},
+    {280, 0x7ffffull << 5, 0, 0, 0},
+    {282, 0x3ffffffull, 0, 0, 0}, {283, 0x3ffffffull, 0, 0, 0},
+    {284, A64_LO12_MASK, 0, 0, 0}, {285, A64_LO12_MASK, 0, 0, 0},
+    {286, A64_LO12_MASK, 0, 0, 0}, {299, A64_LO12_MASK, 0, 0, 0},
+    {309, 0x7ffffull << 5, 0, 0, 0},
+    {311, A64_ADR_MASK, 0, 0, 0},
+    {312, A64_LO12_MASK, 0, 0, 0},
+    {313, A64_LO12_MASK, 0, 0, 0},
+};
+#define FIELD_AARCH64_N ((int)(sizeof(_field_aarch64)/sizeof(_field_aarch64[0])))
 
 static const ElfNamedReloc _named_riscv[] = {
     {"abs64", 2, 8}, {"abs32", 1, 4}, {"abs16", 34, 2}, {"abs8", 33, 1},
@@ -2498,8 +2518,9 @@ static const ElfNamedReloc _named_riscv[] = {
 };
 
 static const ElfMachineInfo ELF_MACHINES[] = {
-    {3,   "i386",         1, 0, 2,   1,   {0, 22, 20,0,  2,0,0,0,  0}, _pcrel_i386,    4, _named_i386},
-    {4,   "m68k",         1, 1, 4,   1,   {0,  3,  2,0,  4,0,0,0,  0}, _pcrel_m68k,    3, _named_m68k},
+    {3,   "i386",         1, 0, 2,   1,   {0, 22, 20,0,  2,0,0,0,  0}, _pcrel_i386,    5, _named_i386},
+    {4,   "m68k",         1, 1, 4,   1,   {0,  3,  2,0,  4,0,0,0,  0}, _pcrel_m68k,    3, _named_m68k,
+          1, NULL, 0},
     {20,  "PowerPC",      1, 1, 26,  1,   {0,  0,  4,0, 26,0,0,0,  0}, _pcrel_ppc32,   2, _named_ppc32},
     {21,  "PowerPC64",    2, 1, 26,  38,  {0,  0,  4,0, 26,0,0,0, 38}, _pcrel_ppc64,   3, _named_ppc64},
     {22,  "s390x",        2, 1, 5,   22,  {0,  1,  3,0,  5,0,0,0, 22}, _pcrel_s390x,   3, _named_s390x},
@@ -2507,7 +2528,8 @@ static const ElfMachineInfo ELF_MACHINES[] = {
     {42,  "SuperH",       1, 1, 2,   1,   {0,  0,  0,0,  2,0,0,0,  0}, _pcrel_sh,      1, _named_sh},
     {43,  "SPARCV9",      2, 1, 6,   32,  {0,  1,  2,0,  6,0,0,0, 32}, _pcrel_sparcv9, 4, _named_sparcv9},
     {62,  "x86-64",       2, 1, 2,   1,   {0, 14, 12,0,  2,0,0,0,  1}, _pcrel_x86_64,  6, _named_x86_64},
-    {183, "AArch64",      2, 1, 261, 257, {0,  0,262,0,261,0,0,0,257}, _pcrel_aarch64, 3, _named_aarch64},
+    {183, "AArch64",      2, 1, 261, 257, {0,  0,262,0,261,0,0,0,257}, _pcrel_aarch64, 3, _named_aarch64,
+          0, _field_aarch64, FIELD_AARCH64_N},
     {243, "RISC-V",       2, 1, 1,   2,   {0, 33, 34,0,  1,0,0,0,  2}, NULL,           0, _named_riscv},
 };
 #define ELF_MACHINES_N ((int)(sizeof(ELF_MACHINES)/sizeof(ELF_MACHINES[0])))
@@ -2586,11 +2608,12 @@ static const char *elf_reloc_reverse(const AsmState *st, const ElfMachineInfo *m
     return NULL;
 }
 
-/* その型が使う欄の幅（バイト）。 */
+/* その型が使う欄の幅（バイト）。同じ型番号に名前が複数あるときは、幅を
+   書いた最初のもの（axx.py の reloc_bytes の setdefault と同じ）。 */
 static int elf_machine_reloc_bytes(const ElfMachineInfo *m, int rtype){
     if(!m) return 0;
     for(int i=0; m->named[i].name; i++)
-        if(m->named[i].rtype == rtype) return m->named[i].width;
+        if(m->named[i].rtype == rtype && m->named[i].width) return m->named[i].width;
     return 0;
 }
 
@@ -2648,16 +2671,23 @@ static int elf_decl_type_in(const ElfNamedReloc *named, const char *text){
     return -1;
 }
 
+/* `.elfbuiltin::0` でなければ、-m の番号の組み込みの表を返す。 */
+static const ElfMachineInfo *elf_machine_base(const AsmState *st){
+    if(st->elf_decl_builtin == 0) return NULL;
+    return elf_machine_find(st->elf_machine);
+}
+
 /* いま有効な ELF マシン記述を組み立てて返す。
    組み込みの表を土台に、パターンファイルの宣言をかぶせたものがここで出来る。
-   同じ名前なら宣言のほうが勝つ。1 行ごとに作り直すと重いので、宣言の
-   世代番号を鍵にして覚える。 */
+   同じ名前なら宣言のほうが勝つ。`.elfbuiltin::0` なら土台は空の表で、
+   宣言だけが残る。1 行ごとに作り直すと重いので、宣言の世代番号を鍵にして
+   覚える。axx.py の elf_machine_table() と同じ規則である。 */
 static const ElfMachineInfo *elf_machine_effective(const AsmState *st){
     if(g_elf_mach_eff.valid && g_elf_mach_eff.gen == st->elf_decl_gen
        && g_elf_mach_eff.machine == st->elf_machine)
         return &g_elf_mach_eff.info;
 
-    const ElfMachineInfo *base = elf_machine_find(st->elf_machine);
+    const ElfMachineInfo *base = elf_machine_base(st);
     int base_n = 0;
     if(base) while(base->named[base_n].name) base_n++;
 
@@ -2692,6 +2722,7 @@ static const ElfMachineInfo *elf_machine_effective(const AsmState *st){
     }
 
     ElfMachineInfo info;
+    memset(&info, 0, sizeof(info));
     info.machine        = st->elf_machine;
     info.elfclass       = st->elf_decl_class ? st->elf_decl_class
                                              : (base ? base->elfclass : 2);
@@ -2699,6 +2730,8 @@ static const ElfMachineInfo *elf_machine_effective(const AsmState *st){
                                                  : (base ? base->is_rela : 1);
     info.extern_default = base ? base->extern_default : 0;
     info.dwarf_abs      = base ? base->dwarf_abs : 0;
+    info.pcrel_guess    = st->elf_decl_pcguess >= 0 ? st->elf_decl_pcguess
+                                                    : (base ? base->pcrel_guess : 0);
     for(int w=0; w<9; w++) info.wg[w] = base ? base->wg[w] : 0;
     info.pc_rel   = pr;
     info.pc_rel_n = prn;
@@ -2738,54 +2771,80 @@ static const ElfMachineInfo *elf_machine_effective(const AsmState *st){
 }
 
 static struct { long gen; int machine; int valid; int n;
-                int *rt; uint64_t *mask; int *off; } g_elf_field_eff;
+                ElfFieldInfo *f; } g_elf_field_eff;
 
-static int insn_reloc_field_decl(const AsmState *st, int rtype,
-                                 uint64_t *mask, int *off){
-    if(!st || st->elf_fields_len == 0) return 0;
-    if(!(g_elf_field_eff.valid && g_elf_field_eff.gen == st->elf_decl_gen
-         && g_elf_field_eff.machine == st->elf_machine)){
-        const ElfMachineInfo *m = elf_machine_effective(st);
-        free(g_elf_field_eff.rt); free(g_elf_field_eff.mask); free(g_elf_field_eff.off);
-        int n = st->elf_fields_len;
-        g_elf_field_eff.rt   = (int*)malloc(sizeof(int) * (size_t)n);
-        g_elf_field_eff.mask = (uint64_t*)malloc(sizeof(uint64_t) * (size_t)n);
-        g_elf_field_eff.off  = (int*)malloc(sizeof(int) * (size_t)n);
-        if(!g_elf_field_eff.rt || !g_elf_field_eff.mask || !g_elf_field_eff.off){
-            perror("malloc"); exit(1);
-        }
-        int k = 0;
-        for(int i = 0; i < n; i++){
-            int rt = elf_decl_type_in(m->named, st->elf_fields[i].type);
-            if(rt < 0) continue;
-            int dup = 0;
-            for(int j = 0; j < k; j++) if(g_elf_field_eff.rt[j] == rt){ dup = 1; break; }
-            if(dup) continue;
-            g_elf_field_eff.rt[k]   = rt;
-            g_elf_field_eff.mask[k] = st->elf_fields[i].mask;
-            g_elf_field_eff.off[k]  = st->elf_fields[i].off;
-            k++;
-        }
-        g_elf_field_eff.n = k;
-        g_elf_field_eff.gen = st->elf_decl_gen;
-        g_elf_field_eff.machine = st->elf_machine;
-        g_elf_field_eff.valid = 1;
+/* いま有効な命令欄の記述の表を作る（宣言が先、組み込みの欄はその型の
+   宣言が無いときだけ残る）。axx.py の elf_machine_table() の field と
+   同じ規則である。 */
+static void elf_field_effective(const AsmState *st){
+    if(g_elf_field_eff.valid && g_elf_field_eff.gen == st->elf_decl_gen
+       && g_elf_field_eff.machine == st->elf_machine)
+        return;
+    const ElfMachineInfo *m = elf_machine_effective(st);
+    const ElfMachineInfo *base = elf_machine_base(st);
+    int nb = base ? base->field_n : 0;
+    free(g_elf_field_eff.f);
+    g_elf_field_eff.f = (ElfFieldInfo*)malloc(sizeof(ElfFieldInfo)
+                                              * (size_t)(st->elf_fields_len + nb + 1));
+    if(!g_elf_field_eff.f){ perror("malloc"); exit(1); }
+    int k = 0;
+    for(int i = 0; i < st->elf_fields_len; i++){
+        int rt = elf_decl_type_in(m->named, st->elf_fields[i].type);
+        if(rt < 0) continue;
+        int dup = 0;
+        for(int j = 0; j < k; j++) if(g_elf_field_eff.f[j].rtype == rt){ dup = 1; break; }
+        if(dup) continue;
+        g_elf_field_eff.f[k].rtype = rt;
+        g_elf_field_eff.f[k].mask  = st->elf_fields[i].mask;
+        g_elf_field_eff.f[k].off   = st->elf_fields[i].off;
+        g_elf_field_eff.f[k].shift = st->elf_fields[i].shift;
+        g_elf_field_eff.f[k].bias  = st->elf_fields[i].bias;
+        k++;
     }
-    for(int j = 0; j < g_elf_field_eff.n; j++)
-        if(g_elf_field_eff.rt[j] == rtype){
-            if(mask) *mask = g_elf_field_eff.mask[j];
-            if(off)  *off  = g_elf_field_eff.off[j];
-            return 1;
-        }
-    return 0;
+    for(int i = 0; i < nb; i++){
+        int dup = 0;
+        for(int j = 0; j < k; j++)
+            if(g_elf_field_eff.f[j].rtype == base->field[i].rtype){ dup = 1; break; }
+        if(dup) continue;
+        g_elf_field_eff.f[k++] = base->field[i];
+    }
+    g_elf_field_eff.n = k;
+    g_elf_field_eff.gen = st->elf_decl_gen;
+    g_elf_field_eff.machine = st->elf_machine;
+    g_elf_field_eff.valid = 1;
 }
 
-/* その型が命令語のどのビットを使うかのマスク。`.elffield` が最優先で、
-   無ければ AArch64 の組み込み表。どちらも無ければ 0（命令欄ではない）。 */
-static uint64_t insn_reloc_field_mask(const AsmState *st, int rtype, int machine){
-    uint64_t m = 0;
-    if(insn_reloc_field_decl(st, rtype, &m, NULL)) return m;
-    return insn_reloc_field_mask_a64(rtype, machine);
+/* 命令欄の記述を引く。無ければ NULL。axx.py の insn_reloc_field_decl()
+   と同じ規則である。 */
+static const ElfFieldInfo *insn_reloc_field_decl(const AsmState *st, int rtype){
+    if(!st) return NULL;
+    elf_field_effective(st);
+    for(int j = 0; j < g_elf_field_eff.n; j++)
+        if(g_elf_field_eff.f[j].rtype == rtype) return &g_elf_field_eff.f[j];
+    return NULL;
+}
+
+/* その型が命令語のどのビットを使うかのマスク。命令欄の記述が無ければ 0
+   （命令欄ではない、ふつうのデータリロケーション）。 */
+static uint64_t insn_reloc_field_mask(const AsmState *st, int rtype){
+    const ElfFieldInfo *f = insn_reloc_field_decl(st, rtype);
+    return f ? f->mask : 0;
+}
+
+/* value の下位ビットから順に、mask の立っているビットへ下から詰める。
+   REL で命令欄の型の加数を命令語へ書き戻すときに使う。axx.py の
+   _field_deposit() と同じ規則である。 */
+static uint64_t field_deposit(uint64_t mask, int64_t value){
+    uint64_t out = 0;
+    int bit = 0;
+    while(mask){
+        uint64_t low = mask & (~mask + 1);
+        int64_t b = (bit < 63) ? ((value >> bit) & 1) : (value < 0 ? 1 : 0);
+        if(b) out |= low;
+        bit++;
+        mask ^= low;
+    }
+    return out;
 }
 
 /* 型の付いていない外部シンボルとして登録されているか。 */
@@ -3072,6 +3131,8 @@ static void state_init(AsmState *st) {
     st->elf_decl_name[0] = '\0';
     st->elf_decl_class = 0;
     st->elf_decl_rela = -1;
+    st->elf_decl_pcguess = -1;
+    st->elf_decl_builtin = -1;
     for(int _wi=0;_wi<9;_wi++) st->elf_decl_width[_wi] = NULL;
     st->elf_decl_extern = NULL;
     st->elf_decl_dwarf = NULL;
@@ -3991,7 +4052,7 @@ static void binary_flush(AsmState *st){
         int _nz = 0;
         char _where[256]; size_t _wl = 0; _where[0] = '\0';
         for(int i = 0; i < st->reloc_count; i++){
-            if(insn_reloc_field_mask(st, st->relocations[i].rtype, st->elf_machine) == 0) continue;
+            if(insn_reloc_field_mask(st, st->relocations[i].rtype) == 0) continue;
             _nz++;
             if(_nz <= 4){
                 int _n = snprintf(_where + _wl, sizeof(_where) - _wl, "%s%s+0x%llx",
@@ -6393,8 +6454,10 @@ static int elf_sec_find(const AsmState *st, const char *name){
     return -1;
 }
 
-/* `.elffield` — 命令語のどのビットに値が入るかを宣言する。AArch64 以外で
-   命令欄リロケーションを使うには、この宣言が要る。 */
+/* `.elffield` — 命令語のどのビットに値が入るかを宣言する。
+   `.elffield::<型>::<マスク>[::<オフセット>[::<シフト>[::<補正>]]]`。
+   シフトは REL のとき加数を欄へ書き戻す前に右へずらすビット数、補正は
+   加数に足す定数。axx.py の elffield_processing() と同じ規則である。 */
 static int dir_elffield(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elffield") != 0) return 0;
     AsmState *st = &asmb->st;
@@ -6413,11 +6476,28 @@ static int dir_elffield(Assembler *asmb, PatEntry *e){
         while(*q==' '||*q=='\t') q++;
         if(*q && !elf_decl_num(asmb, ".elffield", e->f[3], 0, 255, &off)){ free(t); return 1; }
     }
+    long long sh = 0;
+    {
+        const char *q = e->f[4];
+        while(*q==' '||*q=='\t') q++;
+        if(*q && !elf_decl_num(asmb, ".elffield", e->f[4], 0, 63, &sh)){ free(t); return 1; }
+    }
+    long long bias = 0;
+    {
+        const char *q = e->f[5];
+        while(*q==' '||*q=='\t') q++;
+        if(*q && !elf_decl_num(asmb, ".elffield", e->f[5], -0x7FFFFFFFll, 0x7FFFFFFFll, &bias)){
+            free(t); return 1;
+        }
+    }
     for(int i = 0; i < st->elf_fields_len; i++){
         if(strcmp(st->elf_fields[i].type, t) == 0){
-            if(st->elf_fields[i].mask != m || st->elf_fields[i].off != (int)off){
-                st->elf_fields[i].mask = m;
-                st->elf_fields[i].off  = (int)off;
+            if(st->elf_fields[i].mask != m || st->elf_fields[i].off != (int)off
+               || st->elf_fields[i].shift != (int)sh || st->elf_fields[i].bias != bias){
+                st->elf_fields[i].mask  = m;
+                st->elf_fields[i].off   = (int)off;
+                st->elf_fields[i].shift = (int)sh;
+                st->elf_fields[i].bias  = bias;
                 st->elf_decl_gen++;
             }
             free(t);
@@ -6430,12 +6510,46 @@ static int dir_elffield(Assembler *asmb, PatEntry *e){
                                  sizeof(st->elf_fields[0]) * (size_t)st->elf_fields_cap);
         if(!st->elf_fields){ perror("realloc"); exit(1); }
     }
-    st->elf_fields[st->elf_fields_len].type = t;
-    st->elf_fields[st->elf_fields_len].mask = m;
-    st->elf_fields[st->elf_fields_len].off  = (int)off;
+    st->elf_fields[st->elf_fields_len].type  = t;
+    st->elf_fields[st->elf_fields_len].mask  = m;
+    st->elf_fields[st->elf_fields_len].off   = (int)off;
+    st->elf_fields[st->elf_fields_len].shift = (int)sh;
+    st->elf_fields[st->elf_fields_len].bias  = bias;
     st->elf_fields_len++;
     st->elf_decl_gen++;
     return 1;
+}
+
+/* `.elfpcguess` / `.elfbuiltin` の 0 / 1 を読む本体。 */
+static int dir_elf_flag(Assembler *asmb, PatEntry *e, const char *dname, int *slot){
+    AsmState *st = &asmb->st;
+    const char *f1, *f2; elf_decl_fields(e, &f1, &f2);
+    char *t = elf_decl_trim_dup(f1);
+    int v;
+    if(strcmp(t, "0") == 0) v = 0;
+    else if(strcmp(t, "1") == 0) v = 1;
+    else {
+        axx_diagf(1, 0, " error - %s: value must be 0 or 1, got '%s'.\n", dname, t);
+        free(t);
+        return 1;
+    }
+    free(t);
+    if(*slot != v){ *slot = v; st->elf_decl_gen++; }
+    return 1;
+}
+
+/* `.elfpcguess` — 幅からの推定で絶対型を PC 相対型に取り替えるか。
+   axx.py の elfpcguess_processing() と同じ規則である。 */
+static int dir_elfpcguess(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".elfpcguess") != 0) return 0;
+    return dir_elf_flag(asmb, e, ".elfpcguess", &asmb->st.elf_decl_pcguess);
+}
+
+/* `.elfbuiltin` — 組み込みのマシン表を土台にするか。
+   axx.py の elfbuiltin_processing() と同じ規則である。 */
+static int dir_elfbuiltin(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".elfbuiltin") != 0) return 0;
+    return dir_elf_flag(asmb, e, ".elfbuiltin", &asmb->st.elf_decl_builtin);
 }
 
 /* `.elfsection` — 名前から推測できないセクションの属性を宣言する。
@@ -6966,7 +7080,7 @@ static int cond_tests_relocated_var(AsmState *st, const char *cond, size_t len){
     if(!st->elf_objfile[0]) return 0;
     for(int vi = 0; vi < g_nvars; vi++){
         int rtype = st->reloc_constraints[vi];
-        if(rtype == 0 || insn_reloc_field_mask(st, rtype, st->elf_machine) == 0) continue;
+        if(rtype == 0 || insn_reloc_field_mask(st, rtype) == 0) continue;
         const char *nm = g_varnames[vi];
         if(!nm || !*nm) continue;
         size_t nl = strlen(nm);
@@ -13139,6 +13253,8 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         case PD_ELFHEADER:_dir_done = dir_elfheader(asmb,i);     break;
         case PD_ELFSECTION:_dir_done = dir_elfsection(asmb,i);    break;
         case PD_ELFFIELD: _dir_done = dir_elffield(asmb,i);      break;
+        case PD_ELFPCGUESS:_dir_done = dir_elfpcguess(asmb,i);   break;
+        case PD_ELFBUILTIN:_dir_done = dir_elfbuiltin(asmb,i);   break;
         default: break;
         }
         if(_dir_done) continue;
@@ -13630,12 +13746,12 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                 if(_valid[_gi].rtype > 0){
                     int _hint_rtype = (_src_rtype >= 0 && !extern_untyped_has(st, _lname))
                                     ? _src_rtype : _valid[_gi].rtype;
-                    uint64_t _fmask = insn_reloc_field_mask(st, _hint_rtype, st->elf_machine);
-                    int _foff = 0;
-                    insn_reloc_field_decl(st, _hint_rtype, NULL, &_foff);
-                    if(_fmask == 0){
+                    const ElfFieldInfo *_fdecl = insn_reloc_field_decl(st, _hint_rtype);
+                    if(!_fdecl){
                         _forced_rtype = _hint_rtype;
                     } else {
+                        uint64_t _fmask = _fdecl->mask;
+                        int _foff = _fdecl->off;
                         int _ibytes = elf_machine_reloc_bytes(_mtbl_rm, _hint_rtype);
                         if(_ibytes <= 0) _ibytes = 4;
                         int _iwords = _ibytes / bpw;
@@ -13668,7 +13784,9 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         st->relocations[st->reloc_count].sec_offset = _sec_rel_h;
                         st->relocations[st->reloc_count].sym        = strdup(_lname);
                         st->relocations[st->reloc_count].rtype      = _hint_rtype;
-                        st->relocations[st->reloc_count].addend     = _valid[_gi].addend;
+                        /* 加数は「オペランドの値 − ラベルの値」に補正を足したもの。 */
+                        st->relocations[st->reloc_count].addend     =
+                            _valid[_gi].addend + (int64_t)_fdecl->bias;
                         st->relocations[st->reloc_count].nbytes     = _ibytes;
                         st->reloc_count++;
                         _gi = _gj;
@@ -13740,7 +13858,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         if(_alt > 0) _rtype = _alt;
                     }
 
-                    if(_rtype_is_default_guess && st->elf_machine == 4
+                    if(_rtype_is_default_guess && _mtbl_rm->pcrel_guess
                        && !elf_machine_is_pcrel(_mtbl_rm, _rtype)
                        && (int64_t)_raw_val != _abs_w_bytes){
                         int _alt = elf_reloc_same_width(_mtbl_rm, _nbytes, 1);
@@ -14191,11 +14309,44 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     }
 
     if(!_is_rela_w){
+        uint64_t _wmask_r = axx_word_mask(st->bts);
         for(int i=0;i<ncs;i++){
             WRL *rl=&rela_lists[i];
             for(int ei=0;ei<rl->len;ei++){
                 int64_t off = rl->data[ei].off;
                 int nb = rl->data[ei].nbytes;
+                const ElfFieldInfo *_fd = insn_reloc_field_decl(st, rl->data[ei].rtype);
+                if(_fd){
+                    /* 命令欄の型。加数をシフトしてマスクのビットへ下から詰め、
+                       欄の外（命令の残り）はそのまま残す。axx.py の
+                       write_elf_obj() と同じ規則である。 */
+                    int _nw = nb / bpw; if(_nw < 1) _nw = 1;
+                    if(off < 0 || (uint64_t)(off + (int64_t)_nw * bpw) > csecs[i].bsz) continue;
+                    uint8_t *dp = csecs[i].data + off;
+                    uint64_t _iv = 0;
+                    for(int k=0;k<_nw;k++){
+                        uint64_t _wv = 0;
+                        for(int j=0;j<bpw;j++){
+                            int bj = _is_le ? (bpw - 1 - j) : j;
+                            _wv = (_wv << 8) | dp[k*bpw + bj];
+                        }
+                        int _sh = st->bts * (_is_le ? k : (_nw - 1 - k));
+                        if(_sh < 64) _iv |= (_wv & _wmask_r) << _sh;
+                    }
+                    int64_t _ad = rl->data[ei].addend;
+                    int64_t _sv = (_fd->shift < 64) ? (_ad >> _fd->shift) : (_ad < 0 ? -1 : 0);
+                    _iv = (_iv & ~_fd->mask) | field_deposit(_fd->mask, _sv);
+                    for(int k=0;k<_nw;k++){
+                        int _sh = st->bts * (_is_le ? k : (_nw - 1 - k));
+                        uint64_t _wv = (_sh < 64) ? ((_iv >> _sh) & _wmask_r) : 0;
+                        for(int j=0;j<bpw;j++){
+                            int bj = _is_le ? j : (bpw - 1 - j);
+                            dp[k*bpw + bj] = (uint8_t)(_wv & 0xff);
+                            _wv >>= 8;
+                        }
+                    }
+                    continue;
+                }
                 if(nb<=0 || off<0 || (uint64_t)(off+nb) > csecs[i].bsz) continue;
                 uint64_t field = (uint64_t)rl->data[ei].addend & ((nb>=8)?~(uint64_t)0:(((uint64_t)1<<(nb*8))-1));
                 uint8_t *dp = csecs[i].data + off;
@@ -14527,7 +14678,12 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     uint64_t foff=_is_elf64?64:52;
     uint64_t *sec_fo=calloc((size_t)ncs,sizeof(uint64_t));
     for(int i=0;i<ncs;i++){
-        foff=WEO_ALIGN(foff,16); sec_fo[i]=foff;
+        /* ファイル内の位置も sh_addralign に合わせる（16 を下限）。 */
+        { uint64_t _al_f = csecs[i].al_set ? csecs[i].al
+                                           : weo_default_align(csecs[i].sht,_is_elf64);
+          if(_al_f < 16) _al_f = 16;
+          foff=WEO_ALIGN(foff,_al_f); }
+        sec_fo[i]=foff;
         if(!weo_isno(csecs,i)) foff+=csecs[i].bsz;
     }
     uint64_t *rela_fo=calloc((size_t)(nrela?nrela:1),sizeof(uint64_t));
@@ -17202,6 +17358,101 @@ static void check_elfdecls(Assembler *asmb){
                        "ignored.\n", st->elf_fields[i].type, m->name);
 }
 
+static int elf_field_rt_cmp(const void *a, const void *b){
+    int x = ((const ElfFieldInfo*)a)->rtype, y = ((const ElfFieldInfo*)b)->rtype;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+static int elf_sec_name_cmp(const void *a, const void *b){
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* 型番号を宣言に書く綴りにする（名前があれば名前、無ければ番号）。 */
+static const char *elf_desc_tname(const ElfMachineInfo *m, int rt, char *buf, size_t bsz){
+    const char *nm = elf_machine_reverse(m, rt);
+    if(nm && elf_machine_named(m, nm) == rt) return nm;
+    snprintf(buf, bsz, "%d", rt);
+    return buf;
+}
+
+/* `--elfdesc` — いま有効な ELF マシン記述を、先頭に `.elfbuiltin::0` を
+   置いたパターンファイルの宣言として書き出す。これを命令のパターンと
+   一緒に読ませると、組み込みの表なしで同じ ELF が出る。axx.py の
+   elf_desc_text() と同じ並びと書式である。 */
+static void elf_desc_print(AsmState *st, FILE *fp){
+    const ElfMachineInfo *m = elf_machine_effective(st);
+    char b1[32];
+    fprintf(fp, ".elfbuiltin::0\n");
+    char dflt[48]; snprintf(dflt, sizeof(dflt), "machine %d", st->elf_machine);
+    if(m->name && m->name[0] && strcmp(m->name, dflt) != 0)
+        fprintf(fp, ".elfmachine::%d::%s\n", st->elf_machine, m->name);
+    else
+        fprintf(fp, ".elfmachine::%d\n", st->elf_machine);
+    fprintf(fp, ".elfclass::%d\n", m->elfclass == 2 ? 64 : 32);
+    fprintf(fp, ".elfrela::%d\n", m->is_rela ? 1 : 0);
+    for(int i = 0; m->named[i].name; i++){
+        int rt = m->named[i].rtype;
+        int w = elf_machine_reloc_bytes(m, rt);
+        int pc = elf_machine_is_pcrel(m, rt);
+        fprintf(fp, ".elftype::%s::%d", m->named[i].name, rt);
+        if(w || pc){
+            if(w) fprintf(fp, "::%d", w); else fprintf(fp, "::");
+        }
+        if(pc) fprintf(fp, "::1");
+        fprintf(fp, "\n");
+    }
+    for(int w = 1; w < 9; w++)
+        if(m->wg[w])
+            fprintf(fp, ".elfwidth::%d::%s\n", w, elf_desc_tname(m, m->wg[w], b1, sizeof(b1)));
+    fprintf(fp, ".elfextern::%s\n", elf_desc_tname(m, m->extern_default, b1, sizeof(b1)));
+    fprintf(fp, ".elfdwarf::%s\n", elf_desc_tname(m, m->dwarf_abs, b1, sizeof(b1)));
+    fprintf(fp, ".elfpcguess::%d\n", m->pcrel_guess ? 1 : 0);
+    elf_field_effective(st);
+    int nf = g_elf_field_eff.n;
+    ElfFieldInfo *fs = (ElfFieldInfo*)malloc(sizeof(ElfFieldInfo) * (size_t)(nf + 1));
+    if(!fs){ perror("malloc"); exit(1); }
+    if(nf) memcpy(fs, g_elf_field_eff.f, sizeof(ElfFieldInfo) * (size_t)nf);
+    qsort(fs, (size_t)nf, sizeof(ElfFieldInfo), elf_field_rt_cmp);
+    for(int i = 0; i < nf; i++)
+        fprintf(fp, ".elffield::%s::0x%llx::%d::%d::%lld\n",
+                elf_desc_tname(m, fs[i].rtype, b1, sizeof(b1)),
+                (unsigned long long)fs[i].mask, fs[i].off, fs[i].shift, fs[i].bias);
+    free(fs);
+    for(int k = 0; _elf_hdr_fields[k].name; k++){
+        int ix = _elf_hdr_fields[k].idx;
+        if(st->elf_hdr_set[ix])
+            fprintf(fp, ".elfheader::%s::0x%llx\n", _elf_hdr_fields[k].name,
+                    (unsigned long long)st->elf_hdr_val[ix]);
+    }
+    int ns = st->elf_secs_len;
+    char **names = (char**)malloc(sizeof(char*) * (size_t)(ns + 1));
+    if(!names){ perror("malloc"); exit(1); }
+    for(int i = 0; i < ns; i++){
+        names[i] = strdup(st->elf_secs[i].name);
+        if(!names[i]){ perror("strdup"); exit(1); }
+        for(char *q = names[i]; *q; q++) *q = (char)tolower((unsigned char)*q);
+    }
+    qsort(names, (size_t)ns, sizeof(char*), elf_sec_name_cmp);
+    for(int i = 0; i < ns; i++){
+        int k = elf_sec_find(st, names[i]);
+        fprintf(fp, ".elfsection::%s::0x%llx", names[i],
+                (unsigned long long)st->elf_secs[k].flags);
+        int last = st->elf_secs[k].es_set ? 3 : st->elf_secs[k].al_set ? 2
+                 : st->elf_secs[k].type_set ? 1 : 0;
+        if(last >= 1){
+            if(st->elf_secs[k].type_set) fprintf(fp, "::%u", st->elf_secs[k].type);
+            else fprintf(fp, "::");
+        }
+        if(last >= 2){
+            if(st->elf_secs[k].al_set) fprintf(fp, "::%u", st->elf_secs[k].al);
+            else fprintf(fp, "::");
+        }
+        if(last >= 3) fprintf(fp, "::%u", st->elf_secs[k].es);
+        fprintf(fp, "\n");
+        free(names[i]);
+    }
+    free(names);
+}
+
 /* パターンファイル中の ELF 記述ディレクティブを先に読んでおく。 */
 static void register_elfdecls(Assembler *asmb){
     for(int pi=0; pi<asmb->st.pat.len; pi++){
@@ -17218,6 +17469,8 @@ static void register_elfdecls(Assembler *asmb){
         case PD_ELFHEADER:  dir_elfheader(asmb, e);   break;
         case PD_ELFSECTION: dir_elfsection(asmb, e);  break;
         case PD_ELFFIELD:   dir_elffield(asmb, e);    break;
+        case PD_ELFPCGUESS: dir_elfpcguess(asmb, e);  break;
+        case PD_ELFBUILTIN: dir_elfbuiltin(asmb, e);  break;
         default: break;
         }
     }
@@ -17405,6 +17658,7 @@ static void print_usage(const char *prog){
     printf("  --no-macro   disable the macro preprocessor layer (!if/!while/!def/!return/!set and !{...})\n");
     printf("  -P [file]    macro-expand the source and write it out (stdout if file is omitted), then stop\n");
     printf("  -p [file]    macro-expand the pattern file and write it out (stdout if file is omitted), then stop\n");
+    printf("  --elfdesc    print the effective ELF machine description as pattern-file declarations, then stop\n");
     printf("axx general assembler programmed and designed by Taisuke Maekawa\n");
 }
 
@@ -17469,6 +17723,7 @@ int main(int argc, char *argv[]){
     char osabistr[16]="Linux";
     const char *macro_expand_dest=NULL;
     const char *pat_macro_expand_dest=NULL;
+    int elf_desc_only=0;
 
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--osabi")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(osabistr,argv[++i],sizeof(osabistr)-1); }
@@ -17512,6 +17767,7 @@ int main(int argc, char *argv[]){
         else if(strcmp(argv[i],"-d")==0||strcmp(argv[i],"--debug")==0){ st->debug=1; }
         else if(strcmp(argv[i],"-g")==0||strcmp(argv[i],"--gen-debug")==0){ st->gen_debug=1; }
         else if(strcmp(argv[i],"--no-macro")==0){ g_macro.enabled=0; g_pat_macro.enabled=0; }
+        else if(strcmp(argv[i],"--elfdesc")==0){ elf_desc_only=1; }
         else if(strncmp(argv[i],"--macro-expand-pattern=",23)==0){
             pat_macro_expand_dest=argv[i]+23;
             if(!*pat_macro_expand_dest) pat_macro_expand_dest="-";
@@ -17677,6 +17933,10 @@ int main(int argc, char *argv[]){
                        "pattern file; output would be incomplete or wrong.\n");
         fprintf(stderr,"         Aborting: no output file written.\n");
         exit_code=1; goto cleanup;
+    }
+    if(elf_desc_only){
+        elf_desc_print(st, stdout);
+        goto cleanup;
     }
 
     if(st->impfile[0]){
