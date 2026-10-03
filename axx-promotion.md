@@ -24,7 +24,7 @@ axxのアイデアと名前、そしてCで書かれた試作コードは、作�
 
 宣伝文句ではなく、実際に手を動かして確かめられることだけを書きます。
 
-**2つの独立実装がバイト単位で一致する。** axxにはPython実装（`axx.py`、通称Paxx、14,646行）とC実装（`caxx.c`、通称Caxx、20,265行）があります。同梱の`test1`スクリプトは、4004からx86_64、AArch64、PowerPC64、MIPS、Brainfuck仮想CPUまで、同梱の40組のパターン/ソースの対を両実装でアセンブルし、`cmp`でバイト単位比較します。中核の16組は`-o`・`-m 3 -f 32 -o`・`-g -o`・`-v`・`-V`でも走らせるので、ELF32/ELF64のオブジェクト、DWARF、リスティング、テキスト出力まで比較され、比較は全部で163組に及びます。実行すると`test all passed`——本当に一致します。これは主張ではなく、誰でもクローンして5分で再現できる事実です。
+**2つの独立実装がバイト単位で一致する。** axxにはPython実装（`axx.py`、通称Paxx、14,646行）とC実装（`caxx.c`、通称Caxx、20,265行）があります。同梱の`test1`スクリプトは、4004からx86_64、AArch64、PowerPC64、MIPS、Brainfuck仮想CPUまで、同梱の48組のパターン/ソースの対を両実装でアセンブルし、`cmp`でバイト単位比較します。中核の16組は`-o`・`-m 3 -f 32 -o`・`-g -o`・`-v`・`-V`でも走らせるので、ELF32/ELF64のオブジェクト、DWARF、リスティング、テキスト出力まで比較され、比較は全部で179組に及びます。実行すると`test all passed`——本当に一致します。これは主張ではなく、誰でもクローンして5分で再現できる事実です。
 
 **実際にELFオブジェクトが生成できる。**
 
@@ -65,7 +65,7 @@ d = target - $.
 - **AArch64**(A64命令セット——データ処理、分岐、システム、ロード/ストア、スカラ浮動小数点、Advanced SIMD、暗号とスカラ拡張、さらにSVE、SVE2、SME、SME2: Z/Pレジスタファイル、プレディケーション、ギャザー/スキャッターを含むSVEロード/ストア全体、SVE2の拡幅・複素演算、SMEのZA配列と外積、SME2のpredicate-as-counterレジスタ、ZT0ルックアップテーブル、マルチベクタ演算)
 - **PowerPC64**(Power ISA v3.1 / POWER10、ビッグエンディアン/リトルエンディアン: 固定小数点、拡張ニーモニック付きの分岐、浮動小数点、10進浮動小数点、VMX、VSX、4倍精度、プレフィックス付きマスク形式を含むMMA、プレフィックス命令。64バイト境界をまたぐプレフィックス命令の前にはnopを挿入。`-o`では64ビットPowerPC ABIのELFリロケーション——`REL24`、`REL14`、`@l` / `@ha` / `@high` / `@highest`などの`ADDR16`系、`D34` / `PCREL34`——を出すので、GNU ldでリンクできる)
 - **RISC-V**(RV64: 基本命令セット、M、A、F、D、Q、Zfh、Cとその Zcb / Zcmp / Zcmt、ビット操作とスカラ暗号の各グループ、Zicond、キャッシュブロック命令、名前によるCSR指定、特権命令とハイパーバイザ命令、暗号・ビット操作部分を含むベクトル拡張1.0、GNUの擬似命令——`riscv64full.axx`。LLVMのアセンブラと突き合わせて確認済み。`-o`のRISC-Vリロケーションは`ld -m elf64lriscv`でリンクできる。`riscv64.axx`はリロケーションの宣言方法を示す小さなRV64Iのファイル)
-- **MIPS**(MIPS64 Release 5とそれ以前の全レベル、ビッグエンディアン/リトルエンディアン、o32とn64: Release 2のビット欄・バイト入れ替え命令を含む整数命令一式、特権命令、ペアドシングルとCOP1Xを含むFPU、COP2、`$at`を使わない範囲のGNUの擬似命令、`%hi` / `%lo` / `%higher` / `%highest` / `%got` / `%call16` / TLS系のリロケーション修飾子——`mips.axx`・`mipsel.axx`・`mips64.axx`・`mips64el.axx`。GNU asとバイト単位で照合済み。`-o`ではo32はELF32のREL、n64はELF64のRELAで出し、どちらもGNU ldでリンクできる)
+- **MIPS**(MIPS IからMIPS64 Release 6まで、ビッグエンディアン/リトルエンディアン、o32とn64: Release 2のビット欄・バイト入れ替え命令を含む整数命令一式、特権命令、ペアドシングルとCOP1Xを含むFPU、COP2、拡張のDSP・MSA・MT・VZ・EVA・MIPS-3D・SmartMIPS・MCU・XPA・CRC・GINV、Release 6で符号の変わった命令と新命令(コンパクト分岐、PC相対ロードと`auipc`、3オペランドの乗除算、`cmp.cond.fmt`など)、`$at`を使わない範囲のGNUの擬似命令、`%hi` / `%lo` / `%higher` / `%highest` / `%got` / `%call16` / TLS系 / `%pcrel`のリロケーション修飾子——`mips.axx`・`mipsel.axx`・`mips64.axx`・`mips64el.axx`とRelease 6の`mipsr6.axx`・`mipsr6el.axx`・`mips64r6.axx`・`mips64r6el.axx`。基本命令はGNU asと、拡張とRelease 6はllvm-mcとバイト単位で照合済み。`-o`ではo32はELF32のREL、n64はELF64のRELAで出し、どちらもGNU ldでリンクできる)
 - **Motorola 6809 / 68000 / 6800**、**MOS 6502**、**Zilog Z80**、**Intel 8080 / 8051 / 8048 / 4004**
 
 AArch64で未対応なのは、SVE2.1、SME2.1、および検証に使った参照アセンブラ自体も受け付けないオプション拡張(FEAT_SME_F16F16、FEAT_SME_B16B16、FEAT_SME_LUTv2、FEAT_FAMINMAX)です。
