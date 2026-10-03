@@ -43,12 +43,12 @@ axx patfile/8080toz80.axx asmsrc/hello8080.s -V > out.s  # 翻訳したテキス
 
 この 2 つは同じ入力に対して**バイト単位で同一の出力**を生成することを意図しています。
 同梱のパターンファイル、テストソース、`test1` スクリプトはまさにそれを検証するために
-存在します。`test1` は同梱の 36 組のパターン/ソースの対を両方の実装でアセンブルし、
+存在します。`test1` は同梱の 40 組のパターン/ソースの対を両方の実装でアセンブルし、
 結果を `cmp` します。さらに `.textmode` の 3 組については、`-V` で標準出力へ流した
 翻訳テキストどうしも、`echo.axx` の組については標準エラーへ出た `.echo` の行どうしも
 `cmp` します。中核の 16 組は `-o`・`-m 3 -f 32 -o`・`-g -o`・`-v`・`-V` でも
 走らせるので、ELF32/ELF64 のオブジェクト、DWARF、リスティング、テキスト出力の
-経路も比較されます（全 146 組）。
+経路も比較されます（全 163 組）。
 
 **目次**
 
@@ -3893,7 +3893,8 @@ AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v
 
 `x86_64.axx`、`x86_64m.axx`、`aarch64.axx`、`ppc64.axx`、`ppc64le.axx`、`68000.axx`、
 `z80.axx`、`8080.axx`、`8048.axx`、`8051.axx`、`6502.axx`、`6800.axx`、`6809.axx`、
-`4004.axx`、`riscv64full.axx` は実用向けです。`riscv64.axx` は RV64I の基本整数部分の範囲で、
+`4004.axx`、`riscv64full.axx`、`mips.axx`、`mipsel.axx`、`mips64.axx`、`mips64el.axx`
+は実用向けです。`riscv64.axx` は RV64I の基本整数部分の範囲で、
 `aarch64_logical.axx` と `aarch64_logical_mini.axx` はカバーする 1 つの命令グループの
 範囲内で実用向けです。残りはテストフィクスチャです。
 
@@ -3911,6 +3912,11 @@ x86_64 パターンファイルは
 | **ppc64.axx** | 2.1 KB | 48（＋ `ppc64_isa.axx`） | **ppc64_test.s** ほか | PowerPC64 ビッグエンディアン (ELFv1)。バイト順と ELF 記述（`.elftype`／`.elffield`／`.elfsection`）を決めて `ppc64_isa.axx` を include する |
 | **ppc64le.axx** | 2.2 KB | 49（＋ `ppc64_isa.axx`） | **ppc64_test.s** ほか | 同じくリトルエンディアン (ELFv2) |
 | **ppc64_isa.axx** | 95 KB | 452（展開後 4,774） | — | `ppc64.axx` / `ppc64le.axx` が共有する Power ISA v3.1 (POWER10) の命令セット本体。axx に直接渡さない。固定小数点、拡張ニーモニックを含む分岐、浮動小数点、十進浮動小数点、VMX、VSX、四倍精度、前置形マスク付きを含む MMA、前置命令（64 バイト境界を跨ぐ前置命令の前には nop を入れる）。マクロ層とミニ言語で記述 |
+| **mips.axx** | 864 B | 1（＋ `mips_isa.axx`） | **mips.s** | MIPS ビッグエンディアン、o32（ELF32、REL）。バイト順と ABI を決めて `mips_isa.axx` を include する |
+| **mipsel.axx** | 871 B | 1（＋ `mips_isa.axx`） | **mips.s** | 同じくリトルエンディアン、o32 |
+| **mips64.axx** | 873 B | 1（＋ `mips_isa.axx`） | **mips.s** | MIPS64 ビッグエンディアン、n64（ELF64、RELA） |
+| **mips64el.axx** | 880 B | 1（＋ `mips_isa.axx`） | **mips.s** | 同じくリトルエンディアン、n64 |
+| **mips_isa.axx** | 39 KB | 110（展開後 約 3,690） | — | 上の 4 つが共有する MIPS の命令セット本体。axx に直接渡さない。MIPS64 Release 5 とそれ以前の全レベル（MIPS I〜V、MIPS32 / MIPS64 Release 1〜5）: 整数命令一式（Release 2 のビット欄・バイト入れ替え命令を含む）、特権命令（COP0、TLB）、FPU（S・D・W・L・PS の各形式、16 種の `c.cond`、COP1X）、COP2、GNU の疑似命令（`li`・`dli`・`la`・`dla`・`move`・`b` など、`$at` を使わない範囲）、リロケーション修飾子（`%hi`・`%lo`・`%higher`・`%highest`・`%gp_rel`・`%got` 系・`%call16` 系・TLS 系）。構文は `.set noreorder` / `.set noat` の GNU as。Release 6、microMIPS / MIPS16e、DSP・MSA などの拡張は含まない。`-o` では o32 は REL（加数を欄に書き戻す）、n64 は RELA（`r_info` に 3 つの型）で出す。マクロ層とミニ言語で記述 |
 | **6809.axx** | 124 KB | 1,950 | **6809.s** | Motorola 6809 |
 | **68000.axx** | 51 KB | 453 | **68000.s** | Motorola 68000 |
 | **6800.axx** | 18 KB | 271 | **6800.s** | Motorola 6800 |
@@ -3954,10 +3960,13 @@ x86_64 パターンファイルは
 ないことに注意してください。`ppc64.axx` と `ppc64le.axx` は `ppc64_test.s`（1 行 1
 パターン行、GNU as とバイト単位で照合）・`ppc64_reloc_test.s`（`-o` のリロケーション）・
 `hello_ppc64.s`（ビッグエンディアンの hello world）と対になり、`ppc64_isa.axx` は
-その 2 つから include されるので直接は渡しません。`itanium.axx` も `vliw.s` を使い、
+その 2 つから include されるので直接は渡しません。`mips.axx`・`mipsel.axx`・`mips64.axx`・
+`mips64el.axx` はどれも `mips.s`（`mips_isa.axx` の全行、GNU as 2.42 の n64 出力と
+バイト単位で照合）と対になり、`mips_isa.axx` はその 4 つから include されるので
+直接は渡しません。`itanium.axx` も `vliw.s` を使い、
 `aarch64_logical_mini.axx` は `aarch64_logical_mini_demo.s` と対になります。
 
-`test1` は 36 組を両方の実装で実行し、`-b` の生バイナリを比較します。
+`test1` は 40 組を両方の実装で実行し、`-b` の生バイナリを比較します。
 `.textmode` を使う 3 組（`textmode.axx` / `8080toz80.axx` / `intel2att.axx`）については、`-V` で
 標準出力へ流した翻訳テキストどうしも比較します。`elftype.axx` / `elftype.s` と
 `elfgen.axx` / `elfgen.s`、型の優先順位を見る `elfprio.axx` / `elfprio.s`、
@@ -3970,21 +3979,25 @@ x86_64 パターンファイルは
 オブジェクトどうしを比較します。`aarch64.axx`（`-m 183`）と `elfpair.axx` は
 `--elfdesc` の出力（記述を宣言に書き直したもの）どうしも比較します。
 `echo.axx` / `echo.s` の組は標準エラーへ出た `.echo` の行どうしも比較します。
+MIPS の 4 組（`mips.axx`・`mipsel.axx`・`mips64.axx`・`mips64el.axx` と `mips.s`）は、
+`-b` に加えて `-o` の ELF オブジェクト（o32 は ELF32 の REL、n64 は ELF64 の RELA）
+どうしも比較します。
 
 さらに中核の 16 組（`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`）は、
 `-b` だけでは一度も比較されない経路を通すために、`-o`（ELF64）、`-m 3 -f 32 -o`
 （ELF32）、`-g -o`（DWARF 付き）、`-v`（リスティング）、`-V`（テキスト出力）
 でも走らせて突き合わせます。`elfcfi` は ELF32（`-m 3 -f 32`、REL）でも比較します。
-比較は全部で 155 組です。
+比較は全部で 163 組です。
 
 `-g` を比較するときは、両実装を必ず同じディレクトリで走らせてください。DWARF は
 `DW_AT_comp_dir` にカレントディレクトリを埋めるので、別の場所で走らせると中身が
 同じでも食い違います。
 
-`aarch64.axx` / `aarch64.s` の組がこの中で飛び抜けて重く、Python 実装で 20 秒ほど、
-C 実装で 1 秒ほどかかります。ソースの 1 行ごとに、同梱で最大のパターン集合と
-照合するためです。`test1` の所要時間はほぼこの組で決まります。
+`aarch64.axx` / `aarch64.s` の組と MIPS の 4 組が飛び抜けて重く、どれも 1 回あたり
+Python 実装で 20 秒ほど、C 実装で 1 秒ほどかかります。ソースの 1 行ごとに大きな
+パターン集合と照合するためです（MIPS は 4 組を `-b` と `-o` の 2 通りで走らせるので
+計 8 回）。`test1` の所要時間はほぼこれらの組で決まります。
 `test.axx` / `test.s` は同梱の対のうち唯一カバーされていないものです。
 
 現在実装されているものの大半は x86_64 とレガシー CPU ですが、これは作業が向けられた
@@ -4006,7 +4019,7 @@ C 実装で 1 秒ほどかかります。ソースの 1 行ごとに、同梱で
 | `format_of_exp_imp_file` | エクスポート/インポートファイル形式 |
 | `axx.1.gz` | man ページ |
 
-`test1` は同梱の 36 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
+`test1` は同梱の 40 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
 
 ### C.2 外部
 

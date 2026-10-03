@@ -49,6 +49,15 @@ caxx $P/elfword.axx $S/elfword.s -o b118
 caxx $P/elfpair.axx --elfdesc > b119
 caxx $P/elfcfi.axx $S/elfcfi.s -o b120
 caxx $P/elfcfi.axx $S/elfcfi.s -m 3 -f 32 -o b121
+# MIPS 4 種（mips_isa.axx を共有する前置きファイル）で mips.s の全行を組む。
+caxx $P/mips.axx $S/mips.s -b b122
+caxx $P/mipsel.axx $S/mips.s -b b123
+caxx $P/mips64.axx $S/mips.s -b b124
+caxx $P/mips64el.axx $S/mips.s -b b125
+caxx $P/mips.axx $S/mips.s -o b126
+caxx $P/mipsel.axx $S/mips.s -o b127
+caxx $P/mips64.axx $S/mips.s -o b128
+caxx $P/mips64el.axx $S/mips.s -o b129
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -182,6 +191,14 @@ paxx $P/elfword.axx $S/elfword.s -o a118
 paxx $P/elfpair.axx --elfdesc > a119
 paxx $P/elfcfi.axx $S/elfcfi.s -o a120
 paxx $P/elfcfi.axx $S/elfcfi.s -m 3 -f 32 -o a121
+paxx $P/mips.axx $S/mips.s -b a122
+paxx $P/mipsel.axx $S/mips.s -b a123
+paxx $P/mips64.axx $S/mips.s -b a124
+paxx $P/mips64el.axx $S/mips.s -b a125
+paxx $P/mips.axx $S/mips.s -o a126
+paxx $P/mipsel.axx $S/mips.s -o a127
+paxx $P/mips64.axx $S/mips.s -o a128
+paxx $P/mips64el.axx $S/mips.s -o a129
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -271,7 +288,7 @@ paxx $P/aarch64.axx $S/aarch64.s -V -b a110 > a110t
 FAIL=0
 
 N=0
-while [ $N -le 121 ]; do
+while [ $N -le 129 ]; do
     cmp a$N b$N || FAIL=1
     N=$((N+1))
 done

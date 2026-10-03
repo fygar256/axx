@@ -1,0 +1,30 @@
+/* ===================================================================
+/* mips64el.axx -- MIPS64, little-endian, n64 (ELF64 RELA)
+/*
+/* The instruction set is in mips_isa.axx (see its header for the
+/* coverage, the syntax and the ELF output); this file fixes the byte
+/* order and the ABI and includes it.
+/*
+/* Assemble with:
+/*   axx mips64el.axx prog.s -b out.bin       (a flat binary)
+/*   axx mips64el.axx prog.s -o out.o         (an ELF relocatable object)
+/* =================================================================== */
+.bits::8
+
+!def BE() {
+!return 0
+}
+!def N64() {
+!return 1
+}
+
+/* one 32-bit word, little-endian: as a byte list, and emitted */
+.func w4(z)
+.return [z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff]
+.endfunc
+.func ew(z)
+.emit(z & 0xff, (z >> 8) & 0xff, (z >> 16) & 0xff, (z >> 24) & 0xff)
+.return
+.endfunc
+
+.include "mips_isa.axx"

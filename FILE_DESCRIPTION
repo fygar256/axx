@@ -283,6 +283,24 @@ ppc64_reloc_test.s                  every relocatable row against an external
 hello_ppc64.s                       hello world for big-endian PowerPC64 Linux
                                     (ELFv1 function descriptor in .opd).
                                     caxx ppc64.axx hello_ppc64.s -o hello.o
+mips.axx                            pattern file for MIPS, big-endian, o32
+                                    (ELF32 REL): sets the byte order and the
+                                    ABI, then includes mips_isa.axx
+mipsel.axx                          the same for little-endian MIPS, o32
+mips64.axx                          the same for big-endian MIPS64, n64 (ELF64
+                                    RELA)
+mips64el.axx                        the same for little-endian MIPS64, n64
+mips_isa.axx                        the MIPS instruction set (MIPS64 Release 5
+                                    and every earlier level: integer,
+                                    privileged, FPU with paired single, COP1X,
+                                    COP2, the GNU pseudo-instructions and the
+                                    %hi / %lo / %got ... relocation modifiers)
+                                    shared by the four files above; not passed
+                                    to axx directly
+mips.s                              test assemble file for mips.axx / mipsel.axx
+                                    / mips64.axx / mips64el.axx: every row of
+                                    mips_isa.axx, checked against GNU as 2.42
+                                    byte-for-byte (n64)
 z80.axx                             pattern file for Z80
 z80.s                               test assemble file for Z80
 vliw.axx                            test pattern file for vliw
