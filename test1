@@ -76,6 +76,7 @@ caxx $P/mipsr6.axx $S/mipsr6.s -o b142
 caxx $P/mipsr6el.axx $S/mipsr6.s -o b143
 caxx $P/mips64r6.axx $S/mipsr6.s -o b144
 caxx $P/mips64r6el.axx $S/mipsr6.s -o b145
+caxx $P/unordered.axx $S/unordered.s -b b146
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -233,6 +234,7 @@ paxx $P/mipsr6.axx $S/mipsr6.s -o a142
 paxx $P/mipsr6el.axx $S/mipsr6.s -o a143
 paxx $P/mips64r6.axx $S/mipsr6.s -o a144
 paxx $P/mips64r6el.axx $S/mipsr6.s -o a145
+paxx $P/unordered.axx $S/unordered.s -b a146
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -322,7 +324,7 @@ paxx $P/aarch64.axx $S/aarch64.s -V -b a110 > a110t
 FAIL=0
 
 N=0
-while [ $N -le 145 ]; do
+while [ $N -le 146 ]; do
     cmp a$N b$N || FAIL=1
     N=$((N+1))
 done

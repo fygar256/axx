@@ -454,6 +454,147 @@ def _pat_hoist_scan(pat, isdir):
     return h, fields
 
 
+# `.unordered` のファイルで使えないディレクティブ。どれも「ここから先は」という
+# 位置の意味しか持たないので、順序に依存しない読み方では意味をなさない。
+_UNORDERED_BANNED = ('.clearsym', '.clrcheck', '.clrenum', '.clrreloc', '.free')
+
+# 先に処理する設定もの。シンボルの読み方やワード幅を変えるので、
+# `.setsym` や `.check` より前に済ませておく。
+_UNORDERED_FIRST = ('.unordered', '.symbolc', '.bits', '.padding', '.vliw',
+                    '.passthru', '.eol', '.textmode')
+
+
+def _unordered_key(i):
+    """`.unordered` での重複検査の鍵と、エラーで名指す言い方を返す。
+
+    同じ鍵を持つ行は 1 つの定義を奪い合うので、中身が違えば矛盾になる。
+    鍵を持たないディレクティブ（ELF の表など）は何度書いてもよい。
+    """
+    name = i[0]
+    if name == '.setsym':
+        nm = (i[1] if i[1] else i[2]).strip()
+        up = StringUtils.upper(nm)
+        return '.setsym ' + up, f"symbol '{up}'"
+    if name in ('.check', '.map', '.enum', '.reloc'):
+        var = (i[1] if i[1].strip() else i[2]).strip().lower()
+        grp = 'check' if name in ('.check', '.map') else name[1:]
+        return grp + ' ' + var, f"variable '{var}' ({'.check/.map' if grp == 'check' else name})"
+    if name == '.error':
+        code = i[1].strip()
+        return '.error ' + code, f"error code {code}"
+    if name in _UNORDERED_FIRST and name != '.unordered':
+        return name, f"'{name}'"
+    if _pat_is_directive(i) and name not in _PAT_DIRECTIVES:
+        return 'EPIC', "'EPIC'"
+    return None, None
+
+
+def _unordered_refs(text):
+    """`.setsym` の値欄に現れる名前（大文字にしたもの）を拾う。
+
+    文字・数字・`_` の連なりを 1 語とし、`"..."` の中は読まない。
+    """
+    out = []
+    n = len(text)
+    k = 0
+    while k < n:
+        ch = text[k]
+        if ch == '"':
+            k += 1
+            while k < n and text[k] != '"':
+                k += 2 if text[k] == '\\' else 1
+            k += 1
+            continue
+        if ch.isascii() and (ch.isalnum() or ch == '_'):
+            b = k
+            while k < n and text[k].isascii() and (text[k].isalnum() or text[k] == '_'):
+                k += 1
+            out.append(StringUtils.upper(text[b:k]))
+            continue
+        k += 1
+    return out
+
+
+def _pat_unordered_plan(pat, isdir):
+    """`.unordered` の宣言があれば、ディレクティブ行を処理する順を決める。
+
+    宣言が無ければ None を返す（従来どおり上から順に処理する）。宣言が
+    あれば、すべてのディレクティブがファイル全体に効くので、パターンより
+    先に 1 度ずつ処理する。その順は
+
+      1. 設定もの（_UNORDERED_FIRST と EPIC）
+      2. `.setsym` — 値が別の `.setsym` の名前を読むなら、その定義を先に
+      3. その他（`.check`、`.map`、`.enum`、`.reloc`、`.error`、ELF の表など）
+
+    で、各組の中は書かれた順。書く場所で意味が変わらないように、同じ名前・
+    同じ変数への中身の違う定義と、_UNORDERED_BANNED のディレクティブは
+    エラーにする。caxx.c の pat_unordered_plan() と同じ規則である。
+    """
+    if not any(isdir[r] and pat[r] and pat[r][0] == '.unordered'
+               for r in range(len(pat))):
+        return None
+    first, syms, rest = [], [], []
+    seen = {}
+    for r, i in enumerate(pat):
+        if not isdir[r] or not i:
+            continue
+        name = i[0]
+        if name in _UNORDERED_BANNED:
+            diag(f" error - {name}: cannot be used in an .unordered pattern file "
+                 f"(pattern line {r + 1}); there every definition holds for the "
+                 f"whole file.", set_error=True)
+        key, label = _unordered_key(i)
+        if key is not None:
+            text = '::'.join(f.strip() for f in i)
+            prev = seen.get(key)
+            if prev is None:
+                seen[key] = (r, text)
+            elif prev[1] != text:
+                diag(f" error - .unordered: pattern lines {prev[0] + 1} and {r + 1} "
+                     f"give {label} two different definitions.", set_error=True)
+        if name in _UNORDERED_FIRST or key == 'EPIC':
+            first.append(r)
+        elif name == '.setsym':
+            syms.append(r)
+        else:
+            rest.append(r)
+
+    definer = {}
+    for r in syms:
+        i = pat[r]
+        definer.setdefault(StringUtils.upper((i[1] if i[1] else i[2]).strip()), r)
+    deps = {}
+    for r in syms:
+        i = pat[r]
+        val = i[2] if i[1] else ''
+        d = set()
+        for tok in _unordered_refs(val):
+            w = definer.get(tok)
+            if w is not None and w != r:
+                d.add(w)
+        deps[r] = d
+    done = set()
+    order = []
+    pending = list(syms)
+    while pending:
+        nxt = None
+        for r in pending:
+            if deps[r] <= done:
+                nxt = r
+                break
+        if nxt is None:
+            names = ', '.join("'" + StringUtils.upper((pat[r][1] if pat[r][1] else pat[r][2]).strip()) + "'"
+                              for r in pending)
+            diag(f" error - .unordered: the .setsym definitions of {names} refer to "
+                 f"each other in a cycle.", set_error=True)
+            order.extend(pending)
+            break
+        order.append(nxt)
+        done.add(nxt)
+        pending.remove(nxt)
+    return first + order + rest
+
+
 def _build_pat_index(pat, isdir):
     """先頭の大文字列をキーにしたパターン索引を作る。
 
@@ -1676,6 +1817,8 @@ class AssemblerState:
         # pat / pat_isdir が読み込んだパターン行とそれがディレクティブかの印、
         # pat_index / pat_always / pat_maxkey が照合を絞るための索引、
         # hoist_* が「ソースを読む前に 1 回だけ処理してよい先頭の塊」。
+        # unordered は `.unordered` の宣言があったか、pat_dirorder はそのとき
+        # ディレクティブ行を処理する順（_pat_unordered_plan() が決める）。
         self.labels = {}
         self.extern_untyped = set()
         self.sym_attrs = {}
@@ -1692,6 +1835,8 @@ class AssemblerState:
         self.hoist_rows = 0
         self.hoist_fields = set()
         self.hoist_first_ai = 0
+        self.unordered = False
+        self.pat_dirorder = []
         self.hdrsnap = None
         self.diag_count = 0
 
@@ -1764,6 +1909,8 @@ class AssemblerState:
 
         self.varnames: set = set()
         self.check_constraints: dict = {}
+        # `.unordered` のときだけ使う、変数ごとの名前と値の表（`.map` が作る）。
+        self.var_tables: dict = {}
 
         self.reloc_constraints: dict = {}
         self._reloc_badname_seen: set = set()
@@ -5332,8 +5479,23 @@ class DirectiveProcessor:
         """`.map` — シンボル表とそのチェックを 1 行で書く。"""
         if len(i) == 0 or i[0] != '.map':
             return False
+        if self.state.unordered:
+            # 名前と値はその変数だけの表に入れる。同じ名前を別の変数が別の値で
+            # 持てるので、`.setsym` を書き直さずに Z80 の C（レジスタ）と
+            # C（キャリー）のような使い分けができる。
+            var = self._dir_var(i[1].strip() if len(i) >= 2 else '')
+            if var is None:
+                return True
+            tbl = {}
+            self.map_apply(i, into=tbl)
+            self.state.var_tables[var] = tbl
+            return True
         self.map_apply(i)
         return True
+
+    def unordered_processing(self, i):
+        """`.unordered` — 宣言だけ。中身は _pat_unordered_plan() が読み込み時に扱う。"""
+        return len(i) > 0 and i[0] == '.unordered'
 
     def free_processing(self, i):
         """`.free` — 名前をすべての表から外して、作り直せるようにする。
@@ -5539,7 +5701,7 @@ _PAT_DIRECTIVES = frozenset((
     '.setsym', '.clearsym', '.padding', '.bits', '.symbolc', '.vliw',
     '.check', '.clrcheck', '.reloc', '.clrreloc', '.map', '.free',
     '.passthru', '.eol', '.textmode', '.enum', '.clrenum', '.error',
-    '.echo',
+    '.echo', '.unordered',
     '.elftype', '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
     '.elfextern', '.elfdwarf', '.elfheader', '.elfsection', '.elffield',
     '.elfpcguess', '.elfbuiltin', '.elfextra', '.elfdiff', '.elfencode',
@@ -6040,13 +6202,18 @@ class PatternMatcher:
                 prev_idx_s = idx_s
                 allowed = self.state.check_constraints.get(a)
                 allow_omit = allowed is not None and CHECK_OMIT in allowed
+                # `.unordered` の `.map` が作った変数ごとの表があれば、
+                # 値はそこから引く（caxx.c の cap_sym_get() と同じ）。
+                _tbl = self.state.var_tables.get(a)
+                _sget = self.symbol_manager.get if _tbl is None \
+                    else (lambda _w, _t=_tbl: _t.get(StringUtils.upper(_w), ""))
                 w, idx_s = self.parser.get_symbol_word(s, idx_s)
-                v = self.symbol_manager.get(w)
+                v = _sget(w)
                 if v == "":
                     for _cut in range(len(w) - 1, 0, -1):
                         if w[_cut] in _SYM_CORE:
                             continue
-                        _v = self.symbol_manager.get(w[:_cut])
+                        _v = _sget(w[:_cut])
                         if _v != "":
                             w = w[:_cut]
                             v = _v
@@ -6063,7 +6230,7 @@ class PatternMatcher:
                         if StringUtils.upper(s[prev_idx_s:prev_idx_s + len(_nm)]) == _nm:
                             _best = _nm
                     if _best:
-                        _v = self.symbol_manager.get(_best)
+                        _v = _sget(_best)
                         if _v != "":
                             w = _best
                             v = _v
@@ -6500,7 +6667,7 @@ class PatternFileReader:
 
                 if len(l) == 1:
                     if l[0].strip() != '' and _kw not in ('.PASSTHRU', '.EOL',
-                                                         '.TEXTMODE'):
+                                                         '.TEXTMODE', '.UNORDERED'):
                         diag(f" warning - pattern line has no '::' field separator "
                              f"and can never match (a pattern file has no line-"
                              f"continuation mechanism, so this is likely a stray "
@@ -11479,6 +11646,17 @@ class Assembler:
         _ci2 = 0
         _hoist_diag0 = self.state.diag_count
 
+        if self.state.unordered:
+            # `.unordered` ではディレクティブ行は _always に入っていない。
+            # 決めておいた順にここで全部処理してから、パターンだけを試す。
+            for _row in self.state.pat_dirorder:
+                self.state.vars = {}
+                self.state.vars_undef = {}
+                self.state.vars_text = {}
+                _fn = _dirfn[_row]
+                if _fn is not None:
+                    _fn(_pat[_row])
+
         while True:
             if _ai < _na:
                 _row = _always[_ai]
@@ -12347,6 +12525,8 @@ class Assembler:
                     self.state.arrgen += 1
                 continue
             if len(i) > 0 and i[0] == '.map':
+                if self.state.unordered:
+                    continue
                 self.state.symbols = dict(fresh)
                 self.directive_proc.map_apply(i, into=fresh, set_check=False)
                 continue
@@ -14094,6 +14274,7 @@ class Assembler:
             '.clrenum':  d.clrenum_processing,
             '.error':    d.errmsg_processing,
             '.echo':     d.echo_processing,
+            '.unordered': d.unordered_processing,
             '.elftype':  d.elftype_processing,
             '.elfmachine': d.elfmachine_processing,
             '.elfclass':   d.elfclass_processing,
@@ -14318,6 +14499,14 @@ class Assembler:
                                                         self.state.pat_isdir)
             self.state.hoist_first_ai = sum(
                 1 for _r in self.state.pat_always if _r < self.state.hoist_rows)
+            _dirorder = _pat_unordered_plan(self.state.pat, self.state.pat_isdir)
+            self.state.unordered = _dirorder is not None
+            self.state.pat_dirorder = _dirorder or []
+            if self.state.unordered:
+                self.state.pat_always = [_r for _r in self.state.pat_always
+                                         if not self.state.pat_isdir[_r]]
+                self.state.hoist_rows = 0
+                self.state.hoist_first_ai = 0
             self.state.pat_dirfn = self._build_dir_dispatch(self.state.pat,
                                                             self.state.pat_isdir)
             self.state.sub_defs = self.pattern_reader.subs
@@ -14329,7 +14518,10 @@ class Assembler:
                 self.state.diag("         Aborting: no output file written.",
                                 set_error=False, force=True)
                 return False
-            self.setpatsymbols(self.state.pat)
+            if self.state.unordered:
+                self.setpatsymbols([self.state.pat[_r] for _r in self.state.pat_dirorder])
+            else:
+                self.setpatsymbols(self.state.pat)
             self.register_elfdecls(self.state.pat)
             if self.state.had_error:
                 self.state.diag(" error - one or more errors were reported while reading "

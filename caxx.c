@@ -1193,7 +1193,7 @@ enum {
     PD_ELFEXTERN, PD_ELFDWARF, PD_ELFHEADER, PD_ELFSECTION, PD_ECHO, PD_ELFFIELD,
     PD_ELFPCGUESS, PD_ELFBUILTIN, PD_ELFEXTRA, PD_ELFDIFF, PD_ELFENCODE,
     PD_ELFRINFO, PD_ELFUNIT, PD_ELFLINK, PD_ELFGROUP, PD_ELFCFI, PD_ELFCFIINIT,
-    PD_ELFCFIREG
+    PD_ELFCFIREG, PD_UNORDERED
 };
 
 /* パターン行がどのディレクティブか（種別の番号）。 */
@@ -1221,7 +1221,7 @@ static int pat_dir_kind(const PatEntry *e){
         { ".elfgroup", PD_ELFGROUP },
         { ".elfcfi", PD_ELFCFI }, { ".elfcfiinit", PD_ELFCFIINIT },
         { ".elfcfireg", PD_ELFCFIREG },
-        { ".echo", PD_ECHO }, { NULL, 0 } };
+        { ".echo", PD_ECHO }, { ".unordered", PD_UNORDERED }, { NULL, 0 } };
     if(!e || !e->f[0] || !e->f[0][0]) return PD_NONE;
     const char *n = e->f[0];
     for(int k=0; tbl[k].name; k++) if(strcmp(n, tbl[k].name) == 0) return tbl[k].kind;
@@ -1248,7 +1248,7 @@ static int pat_is_directive(const PatEntry *e){
         ".elfextern", ".elfdwarf", ".elfheader", ".elfsection", ".echo", ".elffield",
         ".elfpcguess", ".elfbuiltin", ".elfextra", ".elfdiff", ".elfencode",
         ".elfrinfo", ".elfunit", ".elflink", ".elfgroup", ".elfcfi", ".elfcfiinit",
-        ".elfcfireg", NULL };
+        ".elfcfireg", ".unordered", NULL };
     if(!e || !e->f[0] || !e->f[0][0]) return 0;
     const char *n = e->f[0];
     for(int k=0; tbl[k]; k++) if(strcmp(n, tbl[k]) == 0) return 1;
@@ -1528,6 +1528,11 @@ static int g_hoist_vliw     = 0;
 
 typedef struct { int *rows; int n, cap; } PatRowList;
 
+/* `.unordered` の宣言があったか、そのときディレクティブ行を処理する順
+   （pat_unordered_plan() が決める）。 */
+static int        g_unordered = 0;
+static PatRowList g_dirorder;
+
 /* パターン行番号のリストに 1 個積む。 */
 static void prl_push(PatRowList *l, int row){
     if(l->n >= l->cap){
@@ -1585,6 +1590,7 @@ static PatIdxNode *patidx_node(PatIndex *ix, const char *k, int n, int create){
 static void patidx_build(PatIndex *ix, PatVec *v){
     for(int pi=0; pi<v->len; pi++){
         PatEntry *e = &v->data[pi];
+        if(e->is_dir && g_unordered) continue;
         if(e->pfxlen == 0 || e->is_dir){ prl_push(&ix->always, pi); continue; }
         PatIdxNode *nd = patidx_node(ix, e->pfx, e->pfxlen, 1);
         prl_push(e->pfx_closed ? &nd->closed : &nd->open, pi);
@@ -1798,6 +1804,246 @@ static void pat_hoist_scan(PatVec *v){
     g_hoist_padding = f_padding;
     g_hoist_symbolc = f_symbolc;
     g_hoist_vliw    = f_vliw;
+}
+
+/* ---- `.unordered` --------------------------------------------------------
+   宣言があれば、すべてのディレクティブがファイル全体に効くので、パターン
+   より先に 1 度ずつ処理する。その順は
+     1. 設定もの（.unordered .symbolc .bits .padding .vliw .passthru .eol
+        .textmode と EPIC）
+     2. .setsym — 値が別の .setsym の名前を読むなら、その定義を先に
+     3. その他（.check .map .enum .reloc .error ELF の表など）
+   で、各組の中は書かれた順。同じ名前・同じ変数への中身の違う定義と、
+   位置の意味しか持たないディレクティブ（.clearsym .clrcheck .clrenum
+   .clrreloc .free）はエラーにする。axx.py の _pat_unordered_plan() と
+   同じ規則である。
+   ------------------------------------------------------------------------ */
+/* 欄の前後の空白を除いた写しを作る（呼び出し側が free する）。 */
+static char *unord_trim_dup(const char *s){
+    while(*s==' '||*s=='\t') s++;
+    size_t n = strlen(s);
+    while(n > 0 && (s[n-1]==' '||s[n-1]=='\t')) n--;
+    char *r = malloc(n + 1);
+    if(!r){ perror("malloc"); exit(1); }
+    memcpy(r, s, n); r[n] = '\0';
+    return r;
+}
+
+/* ASCII の小文字を大文字にする（その場で）。 */
+static void unord_upper(char *s){
+    for(; *s; s++) if(*s >= 'a' && *s <= 'z') *s = (char)(*s - 32);
+}
+
+/* `.setsym` が定義する名前（大文字、free する）。 */
+static char *unord_setsym_name(const PatEntry *e){
+    char *r = unord_trim_dup(e->f[1][0] ? e->f[1] : e->f[2]);
+    unord_upper(r);
+    return r;
+}
+
+/* 重複検査の鍵とエラーで名指す言い方を作る。鍵を持たなければ 0 を返す。 */
+static int unord_key(const PatEntry *e, char *key, size_t ksz, char *label, size_t lsz){
+    const char *name = e->f[0];
+    switch(e->dir_kind){
+    case PD_SETSYM: {
+        char *up = unord_setsym_name(e);
+        snprintf(key, ksz, ".setsym %s", up);
+        snprintf(label, lsz, "symbol '%s'", up);
+        free(up);
+        return 1;
+    }
+    case PD_CHECK: case PD_MAP: case PD_ENUM: case PD_RELOC: {
+        char *t1 = unord_trim_dup(e->f[1]);
+        char *var = t1[0] ? t1 : unord_trim_dup(e->f[2]);
+        for(char *q = var; *q; q++) *q = (char)tolower((unsigned char)*q);
+        int chk = (e->dir_kind == PD_CHECK || e->dir_kind == PD_MAP);
+        snprintf(key, ksz, "%s %s", chk ? "check" : name + 1, var);
+        snprintf(label, lsz, "variable '%s' (%s)", var, chk ? ".check/.map" : name);
+        if(var != t1) free(var);
+        free(t1);
+        return 1;
+    }
+    case PD_ERRMSG: {
+        char *code = unord_trim_dup(e->f[1]);
+        snprintf(key, ksz, ".error %s", code);
+        snprintf(label, lsz, "error code %s", code);
+        free(code);
+        return 1;
+    }
+    case PD_SYMBOLC: case PD_BITS: case PD_PADDING: case PD_VLIW:
+    case PD_PASSTHRU: case PD_EOL: case PD_TEXTMODE:
+        snprintf(key, ksz, "%s", name);
+        snprintf(label, lsz, "'%s'", name);
+        return 1;
+    case PD_EPIC:
+        snprintf(key, ksz, "EPIC");
+        snprintf(label, lsz, "'EPIC'");
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* 重複検査で比べる中身。各欄の前後の空白を除いて `::` でつなぐ。 */
+static char *unord_text(const PatEntry *e){
+    size_t n = 1;
+    for(int fi = 0; fi < PAT_FIELDS; fi++) n += strlen(e->f[fi]) + 2;
+    char *r = malloc(n);
+    if(!r){ perror("malloc"); exit(1); }
+    r[0] = '\0';
+    for(int fi = 0; fi < PAT_FIELDS; fi++){
+        char *t = unord_trim_dup(e->f[fi]);
+        if(fi) strcat(r, "::");
+        strcat(r, t);
+        free(t);
+    }
+    return r;
+}
+
+/* 行 pi の `.setsym` の値欄が、名前 nm（大文字）を読んでいるか。
+   文字・数字・`_` の連なりを 1 語とし、`"..."` の中は読まない。 */
+static int unord_reads(const PatEntry *e, const char *nm){
+    const char *t = e->f[1][0] ? e->f[2] : "";
+    size_t nl = strlen(nm);
+    const char *q = t;
+    while(*q){
+        if(*q == '"'){
+            q++;
+            while(*q && *q != '"'){
+                if(*q == '\\' && q[1]) q += 2; else q++;
+            }
+            if(*q) q++;
+            continue;
+        }
+        unsigned char c = (unsigned char)*q;
+        if(c < 128 && (isalnum(c) || c == '_')){
+            const char *b = q;
+            while(*q && (unsigned char)*q < 128
+                  && (isalnum((unsigned char)*q) || *q == '_')) q++;
+            if((size_t)(q - b) == nl){
+                size_t k = 0;
+                for(; k < nl; k++){
+                    char ch = b[k];
+                    if(ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
+                    if(ch != nm[k]) break;
+                }
+                if(k == nl) return 1;
+            }
+            continue;
+        }
+        q++;
+    }
+    return 0;
+}
+
+/* `.unordered` の宣言があれば g_unordered を立て、g_dirorder を決める。 */
+static void pat_unordered_plan(PatVec *v){
+    g_unordered = 0;
+    g_dirorder.n = 0;
+    for(int pi = 0; pi < v->len; pi++)
+        if(v->data[pi].is_dir && v->data[pi].dir_kind == PD_UNORDERED){ g_unordered = 1; break; }
+    if(!g_unordered) return;
+
+    PatRowList first = {0}, syms = {0}, rest = {0};
+    StrVec keys; sv_init(&keys);
+    StrVec texts; sv_init(&texts);
+    PatRowList keyrows = {0};
+    for(int pi = 0; pi < v->len; pi++){
+        PatEntry *e = &v->data[pi];
+        if(!e->is_dir) continue;
+        int k = e->dir_kind;
+        if(k == PD_CLEARSYM || k == PD_CLRCHECK || k == PD_CLRENUM
+           || k == PD_CLRRELOC || k == PD_FREE)
+            axx_diagf(1, 0, " error - %s: cannot be used in an .unordered pattern file "
+                            "(pattern line %d); there every definition holds for the "
+                            "whole file.\n", e->f[0], pi + 1);
+        char key[600], label[600];
+        if(unord_key(e, key, sizeof(key), label, sizeof(label))){
+            char *text = unord_text(e);
+            int found = -1;
+            for(int j = 0; j < keys.len; j++)
+                if(strcmp(keys.data[j], key) == 0){ found = j; break; }
+            if(found < 0){
+                sv_push(&keys, key);
+                sv_push(&texts, text);
+                prl_push(&keyrows, pi);
+            } else if(strcmp(texts.data[found], text) != 0){
+                axx_diagf(1, 0, " error - .unordered: pattern lines %d and %d "
+                                "give %s two different definitions.\n",
+                          keyrows.rows[found] + 1, pi + 1, label);
+            }
+            free(text);
+        }
+        if(k == PD_UNORDERED || k == PD_SYMBOLC || k == PD_BITS || k == PD_PADDING
+           || k == PD_VLIW || k == PD_PASSTHRU || k == PD_EOL || k == PD_TEXTMODE
+           || k == PD_EPIC)
+            prl_push(&first, pi);
+        else if(k == PD_SETSYM)
+            prl_push(&syms, pi);
+        else
+            prl_push(&rest, pi);
+    }
+    for(int j = 0; j < keys.len; j++){ free(keys.data[j]); free(texts.data[j]); }
+    free(keys.data); free(texts.data); free(keyrows.rows);
+
+    /* .setsym の依存。deps[a*n+b] が真なら a は b の定義を先に要る。
+       同じ名前の定義が複数あるときは最初のものを定義元とする。 */
+    int n = syms.n;
+    char **names = calloc((size_t)(n ? n : 1), sizeof(char*));
+    unsigned char *deps = calloc((size_t)(n ? n : 1) * (size_t)(n ? n : 1), 1);
+    unsigned char *done = calloc((size_t)(n ? n : 1), 1);
+    if(!names || !deps || !done){ perror("calloc"); exit(1); }
+    for(int a = 0; a < n; a++) names[a] = unord_setsym_name(&v->data[syms.rows[a]]);
+    for(int b = 0; b < n; b++){
+        int first_def = 1;
+        for(int c = 0; c < b; c++) if(strcmp(names[c], names[b]) == 0){ first_def = 0; break; }
+        if(!first_def) continue;
+        for(int a = 0; a < n; a++)
+            if(a != b && unord_reads(&v->data[syms.rows[a]], names[b]))
+                deps[(size_t)a * (size_t)n + (size_t)b] = 1;
+    }
+    for(int r = 0; r < first.n; r++) prl_push(&g_dirorder, first.rows[r]);
+    int left = n;
+    while(left > 0){
+        int nxt = -1;
+        for(int a = 0; a < n && nxt < 0; a++){
+            if(done[a]) continue;
+            int ok = 1;
+            for(int b = 0; b < n; b++)
+                if(deps[(size_t)a * (size_t)n + (size_t)b] && !done[b]){ ok = 0; break; }
+            if(ok) nxt = a;
+        }
+        if(nxt < 0){
+            size_t cap = 64;
+            for(int a = 0; a < n; a++) if(!done[a]) cap += strlen(names[a]) + 4;
+            char *lst = malloc(cap);
+            if(!lst){ perror("malloc"); exit(1); }
+            lst[0] = '\0';
+            int firstn = 1;
+            for(int a = 0; a < n; a++){
+                if(done[a]) continue;
+                if(!firstn) strcat(lst, ", ");
+                strcat(lst, "'"); strcat(lst, names[a]); strcat(lst, "'");
+                firstn = 0;
+            }
+            axx_diagf(1, 0, " error - .unordered: the .setsym definitions of %s refer to "
+                            "each other in a cycle.\n", lst);
+            free(lst);
+            for(int a = 0; a < n; a++)
+                if(!done[a]){ prl_push(&g_dirorder, syms.rows[a]); done[a] = 1; }
+            break;
+        }
+        prl_push(&g_dirorder, syms.rows[nxt]);
+        done[nxt] = 1;
+        left--;
+    }
+    for(int r = 0; r < rest.n; r++) prl_push(&g_dirorder, rest.rows[r]);
+    for(int a = 0; a < n; a++) free(names[a]);
+    free(names); free(deps); free(done);
+    free(first.rows); free(syms.rows); free(rest.rows);
+
+    g_hoist_rows = 0;
+    g_hoist_bits = g_hoist_padding = g_hoist_symbolc = g_hoist_vliw = 0;
 }
 
 /* パターン表に空の行を 1 つ足す。 */
@@ -2124,6 +2370,8 @@ typedef struct {
     int        reloctype_override[4];
 
     ChkList   *check_constraints[NVARS];
+    /* `.unordered` のときだけ使う、変数ごとの名前と値の表（`.map` が作る）。 */
+    SymMap    *var_tables[NVARS];
     int        reloc_constraints[NVARS];
     char      *reloc_badname[32];
     int        reloc_badname_len;
@@ -3245,6 +3493,7 @@ static void state_init(AsmState *st) {
     st->reloc_cap = 0;
     for(int _rti=0; _rti<4; _rti++) st->reloctype_override[_rti] = -1;
     for(int _ci=0; _ci<NVARS; _ci++) st->check_constraints[_ci] = NULL;
+    for(int _ci=0; _ci<NVARS; _ci++) st->var_tables[_ci] = NULL;
     for(int _ci=0; _ci<NVARS; _ci++) st->reloc_constraints[_ci] = 0;
     st->reloc_badname_len = 0;
     st->elftypes = NULL; st->elftypes_len = 0; st->elftypes_cap = 0;
@@ -4696,6 +4945,15 @@ static struct ArrSym *arrsym_get(AsmState *st, const char *upper_name);
 static int symbol_get(AsmState *st, const char *w, uint256_t *out){
     char uw[512]; axx_strupr_to(uw,w,sizeof(uw));
     return smap_get(&st->symbols,uw,out);
+}
+
+/* 変数 vi が捕らえるシンボルの値を引く。`.unordered` の `.map` が作った
+   変数ごとの表があればそこから引く（axx.py の match() の _sget と同じ）。 */
+static int cap_sym_get(AsmState *st, int vi, const char *w, uint256_t *out){
+    SymMap *tb = (vi >= 0 && vi < NVARS) ? st->var_tables[vi] : NULL;
+    if(!tb) return symbol_get(st, w, out);
+    char uw[512]; axx_strupr_to(uw,w,sizeof(uw));
+    return smap_get(tb,uw,out);
 }
 
 /* 256bit 整数のビットを long double として読む。 */
@@ -7541,8 +7799,31 @@ static void map_apply(Assembler *asmb, PatEntry *e, SymMap *into, int set_check)
 /* `.map` — シンボル表とそのチェックを 1 行で書く。 */
 static int dir_map(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".map") != 0) return 0;
+    if(g_unordered){
+        /* 名前と値はその変数だけの表に入れる。同じ名前を別の変数が別の値で
+           持てるので、`.setsym` を書き直さずに Z80 の C（レジスタ）と
+           C（キャリー）のような使い分けができる。 */
+        int vslot = dir_var_slot(e->f[1]);
+        if(vslot < 0) return 1;
+        SymMap **tp = &asmb->st.var_tables[vslot];
+        if(!*tp){
+            *tp = malloc(sizeof(SymMap));
+            if(!*tp){ perror("malloc"); exit(1); }
+            smap_init(*tp);
+        } else {
+            smap_clear(*tp);
+        }
+        map_apply(asmb, e, *tp, 1);
+        return 1;
+    }
     map_apply(asmb, e, NULL, 1);
     return 1;
+}
+
+/* `.unordered` — 宣言だけ。中身は pat_unordered_plan() が読み込み時に扱う。 */
+static int dir_unordered(Assembler *asmb, PatEntry *e){
+    (void)asmb;
+    return e && strcmp(e->f[0], ".unordered") == 0;
 }
 
 /* `.free` — 名前をすべての表から外す。位置依存。 */
@@ -8309,14 +8590,14 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
             idx_s=axx_get_symbol_word(s,idx_s,st->swordchars,w,wsz);
             uint256_t sv = u256_zero();
             int ok = 1;
-            if(!symbol_get(st,w,&sv)){
+            if(!cap_sym_get(st,vi,w,&sv)){
                 int _wl = (int)strlen(w), _hit = 0;
                 for(int _cut = _wl - 1; _cut > 0; _cut--){
                     unsigned char _ch = (unsigned char)w[_cut];
                     if(isalnum(_ch) || _ch=='_') continue;
                     char _save = w[_cut];
                     w[_cut] = '\0';
-                    if(symbol_get(st,w,&sv)){ idx_s = prev_idx_s + _cut; _hit = 1; break; }
+                    if(cap_sym_get(st,vi,w,&sv)){ idx_s = prev_idx_s + _cut; _hit = 1; break; }
                     w[_cut] = _save;
                 }
                 if(!_hit) ok = 0;
@@ -8346,7 +8627,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     if(k == nl){ best_len = nl; best_si = si; }
                 }
                 if(best_si >= 0 && strlen(chk_at(cv, best_si)) < wsz
-                   && symbol_get(st, chk_at(cv, best_si), &sv)){
+                   && cap_sym_get(st, vi, chk_at(cv, best_si), &sv)){
                     snprintf(w, wsz, "%s", chk_at(cv, best_si));
                     idx_s = prev_idx_s + best_len;
                     ok = 1;
@@ -10993,7 +11274,7 @@ static void readpat(Assembler *asmb, const char *fn){
                     for(int k = a; k < e; k++) kw1[k-a] = axx_upper_char(fields[0][k]);
             }
             if(nonblank && strcmp(kw1,".PASSTHRU")!=0 && strcmp(kw1,".EOL")!=0
-                        && strcmp(kw1,".TEXTMODE")!=0){
+                        && strcmp(kw1,".TEXTMODE")!=0 && strcmp(kw1,".UNORDERED")!=0){
                 { size_t _fl = strlen(fields[0]);
                   size_t _rsz = _fl * 4 + 8;
                   char *_fr = malloc(_rsz);
@@ -13942,6 +14223,58 @@ static int adir_done(Assembler *asmb, const char *l, const char *l2,
 
 #define PAT_VARS_CLEAR() vars_clear_all(st)
 
+/* ディレクティブ行 1 行を処理する。処理したら 1 を返す。 */
+static int pat_dir_exec(Assembler *asmb, PatEntry *i){
+    int _dir_done = 0;
+    switch(i->dir_kind){
+    case PD_SETSYM:   _dir_done = dir_set_symbol(asmb,i);   break;
+    case PD_CLEARSYM: _dir_done = dir_clear_symbol(asmb,i); break;
+    case PD_PADDING:  _dir_done = dir_padding(asmb,i);      break;
+    case PD_BITS:     _dir_done = dir_bits(asmb,i);         break;
+    case PD_SYMBOLC:  _dir_done = dir_symbolc(asmb,i);      break;
+    case PD_EPIC:     _dir_done = dir_epic(asmb,i);         break;
+    case PD_VLIW:     _dir_done = dir_vliwp(asmb,i);        break;
+    case PD_CHECK:    _dir_done = dir_check(asmb,i);        break;
+    case PD_CLRCHECK: _dir_done = dir_clrcheck(asmb,i);     break;
+    case PD_RELOC:    _dir_done = dir_reloc(asmb,i);        break;
+    case PD_CLRRELOC: _dir_done = dir_clrreloc(asmb,i);     break;
+    case PD_MAP:      _dir_done = dir_map(asmb,i);          break;
+    case PD_FREE:     _dir_done = dir_free(asmb,i);         break;
+    case PD_PASSTHRU: _dir_done = dir_passthru(asmb,i);     break;
+    case PD_EOL:      _dir_done = dir_eol(asmb,i);          break;
+    case PD_TEXTMODE: _dir_done = dir_textmode(asmb,i);     break;
+    case PD_ENUM:     _dir_done = dir_enum(asmb,i);         break;
+    case PD_CLRENUM:  _dir_done = dir_clrenum(asmb,i);      break;
+    case PD_ERRMSG:   _dir_done = dir_errmsg(asmb,i);       break;
+    case PD_ECHO:     _dir_done = dir_echo(asmb,i);         break;
+    case PD_ELFTYPE:  _dir_done = dir_elftype(asmb,i);      break;
+    case PD_ELFMACHINE: _dir_done = dir_elfmachine(asmb,i);  break;
+    case PD_ELFCLASS: _dir_done = dir_elfclass(asmb,i);      break;
+    case PD_ELFRELA:  _dir_done = dir_elfrela(asmb,i);       break;
+    case PD_ELFWIDTH: _dir_done = dir_elfwidth(asmb,i);      break;
+    case PD_ELFEXTERN:_dir_done = dir_elfextern(asmb,i);     break;
+    case PD_ELFDWARF: _dir_done = dir_elfdwarf(asmb,i);      break;
+    case PD_ELFHEADER:_dir_done = dir_elfheader(asmb,i);     break;
+    case PD_ELFSECTION:_dir_done = dir_elfsection(asmb,i);    break;
+    case PD_ELFFIELD: _dir_done = dir_elffield(asmb,i);      break;
+    case PD_ELFPCGUESS:_dir_done = dir_elfpcguess(asmb,i);   break;
+    case PD_ELFBUILTIN:_dir_done = dir_elfbuiltin(asmb,i);   break;
+    case PD_ELFEXTRA: _dir_done = dir_elfextra(asmb,i);      break;
+    case PD_ELFDIFF:  _dir_done = dir_elfdiff(asmb,i);       break;
+    case PD_ELFENCODE:_dir_done = dir_elfencode(asmb,i);     break;
+    case PD_ELFRINFO: _dir_done = dir_elfrinfo(asmb,i);      break;
+    case PD_ELFUNIT:  _dir_done = dir_elfunit(asmb,i);       break;
+    case PD_ELFLINK:  _dir_done = dir_elflink(asmb,i);       break;
+    case PD_ELFGROUP: _dir_done = dir_elfgroup(asmb,i);      break;
+    case PD_ELFCFI:   _dir_done = dir_elfcfi(asmb,i);        break;
+    case PD_ELFCFIINIT:_dir_done = dir_elfcfiinit(asmb,i);   break;
+    case PD_ELFCFIREG:_dir_done = dir_elfcfireg(asmb,i);     break;
+    case PD_UNORDERED:_dir_done = dir_unordered(asmb,i);    break;
+    default: break;
+    }
+    return _dir_done;
+}
+
 static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
                               IntVec *idxs_out, IntVec *objl_out, int *idx_out,
                               char *l, char *l2, char *l_nospace, size_t bufsz,
@@ -14087,6 +14420,15 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     int  ci = 0;
     long long hoist_diag0 = g_diag_count;
 
+    if(g_unordered){
+        /* `.unordered` ではディレクティブ行は always に入っていない。
+           決めておいた順にここで全部処理してから、パターンだけを試す。 */
+        for(int _di = 0; _di < g_dirorder.n; _di++){
+            PAT_VARS_CLEAR();
+            pat_dir_exec(asmb, &st->pat.data[g_dirorder.rows[_di]]);
+        }
+    }
+
     for(;;){
         int pi, from_always;
         {
@@ -14106,53 +14448,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
 
         if(i->is_dir){
         PAT_VARS_CLEAR();
-        int _dir_done = 0;
-        switch(i->dir_kind){
-        case PD_SETSYM:   _dir_done = dir_set_symbol(asmb,i);   break;
-        case PD_CLEARSYM: _dir_done = dir_clear_symbol(asmb,i); break;
-        case PD_PADDING:  _dir_done = dir_padding(asmb,i);      break;
-        case PD_BITS:     _dir_done = dir_bits(asmb,i);         break;
-        case PD_SYMBOLC:  _dir_done = dir_symbolc(asmb,i);      break;
-        case PD_EPIC:     _dir_done = dir_epic(asmb,i);         break;
-        case PD_VLIW:     _dir_done = dir_vliwp(asmb,i);        break;
-        case PD_CHECK:    _dir_done = dir_check(asmb,i);        break;
-        case PD_CLRCHECK: _dir_done = dir_clrcheck(asmb,i);     break;
-        case PD_RELOC:    _dir_done = dir_reloc(asmb,i);        break;
-        case PD_CLRRELOC: _dir_done = dir_clrreloc(asmb,i);     break;
-        case PD_MAP:      _dir_done = dir_map(asmb,i);          break;
-        case PD_FREE:     _dir_done = dir_free(asmb,i);         break;
-        case PD_PASSTHRU: _dir_done = dir_passthru(asmb,i);     break;
-        case PD_EOL:      _dir_done = dir_eol(asmb,i);          break;
-        case PD_TEXTMODE: _dir_done = dir_textmode(asmb,i);     break;
-        case PD_ENUM:     _dir_done = dir_enum(asmb,i);         break;
-        case PD_CLRENUM:  _dir_done = dir_clrenum(asmb,i);      break;
-        case PD_ERRMSG:   _dir_done = dir_errmsg(asmb,i);       break;
-        case PD_ECHO:     _dir_done = dir_echo(asmb,i);         break;
-        case PD_ELFTYPE:  _dir_done = dir_elftype(asmb,i);      break;
-        case PD_ELFMACHINE: _dir_done = dir_elfmachine(asmb,i);  break;
-        case PD_ELFCLASS: _dir_done = dir_elfclass(asmb,i);      break;
-        case PD_ELFRELA:  _dir_done = dir_elfrela(asmb,i);       break;
-        case PD_ELFWIDTH: _dir_done = dir_elfwidth(asmb,i);      break;
-        case PD_ELFEXTERN:_dir_done = dir_elfextern(asmb,i);     break;
-        case PD_ELFDWARF: _dir_done = dir_elfdwarf(asmb,i);      break;
-        case PD_ELFHEADER:_dir_done = dir_elfheader(asmb,i);     break;
-        case PD_ELFSECTION:_dir_done = dir_elfsection(asmb,i);    break;
-        case PD_ELFFIELD: _dir_done = dir_elffield(asmb,i);      break;
-        case PD_ELFPCGUESS:_dir_done = dir_elfpcguess(asmb,i);   break;
-        case PD_ELFBUILTIN:_dir_done = dir_elfbuiltin(asmb,i);   break;
-        case PD_ELFEXTRA: _dir_done = dir_elfextra(asmb,i);      break;
-        case PD_ELFDIFF:  _dir_done = dir_elfdiff(asmb,i);       break;
-        case PD_ELFENCODE:_dir_done = dir_elfencode(asmb,i);     break;
-        case PD_ELFRINFO: _dir_done = dir_elfrinfo(asmb,i);      break;
-        case PD_ELFUNIT:  _dir_done = dir_elfunit(asmb,i);       break;
-        case PD_ELFLINK:  _dir_done = dir_elflink(asmb,i);       break;
-        case PD_ELFGROUP: _dir_done = dir_elfgroup(asmb,i);      break;
-        case PD_ELFCFI:   _dir_done = dir_elfcfi(asmb,i);        break;
-        case PD_ELFCFIINIT:_dir_done = dir_elfcfiinit(asmb,i);   break;
-        case PD_ELFCFIREG:_dir_done = dir_elfcfireg(asmb,i);     break;
-        default: break;
-        }
-        if(_dir_done) continue;
+        if(pat_dir_exec(asmb, i)) continue;
         }
 
         int lw=0; for(int fi=0;fi<PAT_FIELDS;fi++) if(i->f[fi][0]) lw++;
@@ -19434,7 +19730,9 @@ static void setpatsymbols(Assembler *asmb){
     sv_free(&asmb->st.strsym_vals);  sv_init(&asmb->st.strsym_vals);
     arrsym_clear_all(&asmb->st);
 
-    for(int pi=0; pi<asmb->st.pat.len; pi++){
+    int npat = g_unordered ? g_dirorder.n : asmb->st.pat.len;
+    for(int pk=0; pk<npat; pk++){
+        int pi = g_unordered ? g_dirorder.rows[pk] : pk;
         PatEntry *e=&asmb->st.pat.data[pi];
         if(!e) continue;
 
@@ -19482,6 +19780,7 @@ static void setpatsymbols(Assembler *asmb){
             continue;
         }
         if(strcmp(e->f[0],".map")==0){
+            if(g_unordered) continue;
             smap_clear(&asmb->st.symbols);
             for(int fi=0; fi<fresh.nb; fi++)
                 for(SymEntry *fe=fresh.buckets[fi]; fe; fe=fe->next)
@@ -19868,6 +20167,7 @@ int main(int argc, char *argv[]){
     readpat(asmb,patternfile);
     pat_mark_static(&st->pat);
     pat_hoist_scan(&st->pat);
+    pat_unordered_plan(&st->pat);
     patidx_build(&g_patidx, &st->pat);
     if(st->had_error){
         fprintf(stderr," error - one or more errors were reported during assembly; "

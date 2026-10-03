@@ -1,0 +1,50 @@
+/*  ==================================================================
+/*  unordered.axx -- .unordered のテスト
+/*
+/*  Technical_Manual 3.19 のテスト。パターンを先に、ディレクティブを後に、
+/*  しかもディレクティブ同士もばらばらの順に書いてある。.unordered の
+/*  ファイルではどれもファイル全体に効くので、書く場所で意味は変わらない。
+/*
+/*  Z80 の C は、レジスタとしては 1、条件（キャリー）としては 3 である。
+/*  .map の名前と値はその変数だけの表に入るので、r と cc が同じ C を
+/*  別々の値で持てる。.setsym を書き直す必要はない。エンコーディングは
+/*  本物の Z80 と同じ。
+/*  ==================================================================
+
+LD r,r2 :: 0x40|r<<3|r2
+LD r,!n :: 0x06|r<<3,n
+INC r :: 0x04|r<<3
+INC rp :: 0x03|rp<<4
+ADD HL,rp :: 0x09|rp<<4
+INC ix :: ix,0x23
+PUSH qq :: 0xc5|qq<<4
+POP qq :: 0xc1|qq<<4
+JP cc,!nn :: 0xc2|cc<<3,nn&0xff,nn>>8
+JP !nn :: 0xc3,nn&0xff,nn>>8
+JR jc,!e :: 0x20|jc<<3,e-$$-2
+JR !e :: 0x18,e-$$-2
+RET cc :: 0xc0|cc<<3
+RET :: 0xc9
+SIG :: #HI,#LO
+
+/* 値が別の .setsym を読むときは、読まれる側が後に書かれていてもよい。
+.setsym::LO::#HI+0x10
+.setsym::HI::#BASE+1
+
+.map::r2::B,C,D,E,H,L,A::0,1,2,3,4,5,7
+.map::cc::NZ,Z,NC,C,PO,PE,P,M
+.map::jc::NZ,Z,NC,C
+.map::r::B,C,D,E,H,L,A::0,1,2,3,4,5,7
+.map::rp::BC,DE,HL,SP
+.map::qq::BC,DE,HL,AF
+
+/* .check が読む配列シンボルも後でよい。
+.check::ix::idxregs
+.setsym::idxregs::[IX,IY]
+.setsym::IX::0xdd
+.setsym::IY::0xfd
+
+.setsym::BASE::0x40
+
+/* 宣言そのものもどこに書いてもよい。
+.unordered

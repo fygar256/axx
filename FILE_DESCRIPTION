@@ -63,6 +63,12 @@ textmode.axx                        pattern file for .textmode, the `!L` express
                                     `;` comments and the leading indentation
                                     spelled as written (manual 3.18)
 textmode.s                          test assemble file for textmode.axx
+unordered.axx                       pattern file for .unordered: directives that
+                                    hold for the whole file wherever they are
+                                    written, and .map tables per variable, so
+                                    the Z80 C is a register for one variable
+                                    and carry for another (manual 3.19)
+unordered.s                         test assemble file for unordered.axx
 elftype.axx                         pattern file for .elftype: a relocation type
                                     name defined in the pattern file, written in
                                     .reloc and in the source's .extern / .global

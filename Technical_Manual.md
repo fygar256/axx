@@ -44,13 +44,13 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all forty-eight bundled pattern/source pairs with
+exactly that: `test1` assembles all forty-nine bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the three `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` pair the `.echo` lines each one writes to standard
 error. The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for a hundred and seventy-nine comparisons in all.
+text output are compared too, for a hundred and eighty comparisons in all.
 
 **Contents**
 
@@ -357,6 +357,8 @@ may be mixed freely within one file.
 
 Directive definitions **are** order-dependent — a later `.setsym` overrides an
 earlier one, and `.check` applies from where it appears. **Patterns are not.**
+To make the directives order-independent as well, write `.unordered` in the
+pattern file ([3.19](#319-unordered--order-independent-directives)).
 
 axx does not stop at the first pattern that matches. It tries every pattern,
 scores each successful match, and emits the best one. The score is the tuple
@@ -677,6 +679,9 @@ ADD A,s              /* C here is 1
 .setsym::C ::3
 RET s                /* C here is 3
 ```
+
+An `.unordered` file (3.19) cannot redefine a name; give each variable its own
+values with `.map` instead.
 
 To define a symbol from another symbol, use `#`:
 
@@ -3093,6 +3098,72 @@ Forms it does not cover (a `lock` prefix on a two-operand instruction,
 `push word ptr`, …) come through unchanged by `.textmode` passthrough, so what
 was translated and what was not is visible in the output.
 
+### 3.19 `.unordered` — order-independent directives
+
+```
+.unordered
+```
+
+Patterns do not depend on the order they are written in (3.2). In an ordinary
+pattern file the directives do — a later `.setsym` overrides an earlier one and
+`.check` applies from where it appears. In a pattern file that contains the one
+line `.unordered`, **the directives no longer depend on order either**. Every
+directive holds for the whole file, so it means the same whether it is written
+before or after the patterns, and however the directives are arranged among
+themselves. The declaration itself may go anywhere (an included file counts too).
+
+**Rules.**
+
+- All directives are processed before the patterns are tried for each source
+  line, in this order: (1) the settings (`.symbolc`, `.bits`, `.padding`,
+  `.vliw`, `EPIC`, `.passthru`, `.eol`, `.textmode`), (2) `.setsym`, (3) the rest
+  (`.check`, `.map`, `.enum`, `.reloc`, `.error`, `.echo`, the ELF description and
+  so on).
+- When a `.setsym` value reads the name of another `.setsym`, the one it reads is
+  processed first, so `.setsym::HI::#BASE+1` works when written above
+  `.setsym::BASE::0x40`. Names are picked up as runs of letters, digits and `_`.
+  Definitions that read each other are reported as a cycle.
+- Each thing has one definition. Writing a `.setsym` of the same name, a `.check` /
+  `.map` of the same variable, an `.enum` of the same variable, a `.reloc` of the
+  same variable, an `.error` of the same code, or the same setting twice **with
+  different contents** is an error. Repeating it word for word is fine.
+- `.clearsym`, `.clrcheck`, `.clrenum`, `.clrreloc` and `.free`, which only mean
+  "from here on", cannot be used (error).
+- The ELF description (`.elf*`) can be written as many times as before.
+
+**`.map` builds a table per variable.** In an ordinary pattern file `.map`
+defines the names as symbols (3.7.3). In an `.unordered` file the names and
+values go into **a table of that variable alone**, and take those values only when
+that variable captures them. Different variables can hold the same name with
+different values, so there is no need to redefine a name with `.setsym`. On the
+Z80, `C` is 1 as a register and 3 as a condition (carry):
+
+```
+.unordered
+LD r,r2 :: 0x40|r<<3|r2
+JP cc,!nn :: 0xc2|cc<<3,nn&0xff,nn>>8
+RET cc :: 0xc0|cc<<3
+.map::r::B,C,D,E,H,L,A::0,1,2,3,4,5,7
+.map::r2::B,C,D,E,H,L,A::0,1,2,3,4,5,7
+.map::cc::NZ,Z,NC,C,PO,PE,P,M
+```
+
+```
+ld a,c          -> 79
+jp c,0x1234     -> da 34 12
+ret c           -> d8
+```
+
+The names in such a table are not visible to `#C` in an expression; define a name
+with `.setsym` when an expression needs its value. `.check` takes its candidates
+from the `.setsym` symbols as before.
+
+**Existing pattern files.** A file without `.unordered` is read from top to bottom
+as before, and its output does not change.
+
+The bundled `unordered.axx` / `unordered.s` test this section. The patterns come
+first, the directives after them, and the directives are in no particular order.
+
 
 ---
 
@@ -4198,6 +4269,7 @@ The x86_64 pattern file is also maintained separately at
 | **textmode.axx** | 2.0 KB | 13 | **textmode.s** | `.textmode`, `!L`, `{{.exp()}}` and `;` comments (3.18); test only |
 | **arrindex.axx** | 860 B | 14 | **arrindex.s** | Array symbols: bare names as items, a name as a subscript, `.index` (3.6.1); test only |
 | **passthru.axx** | 686 B | 6 | **passthru.s** | `.passthru` and `.eol` (3.16 / 3.17); test only |
+| **unordered.axx** | 1.7 KB | 28 | **unordered.s** | `.unordered` and per-variable `.map` (3.19): the Z80 `C` as a register and as carry; test only |
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | `.echo` on a body line (3.14.1); test only |
 | **elftype.axx** | 1.5 KB | 20 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
