@@ -24,31 +24,50 @@ That gap wasn't just dormancy — it doubled as a validation period. VLIW, EPIC,
 
 Not marketing copy — things you can reproduce yourself in a few minutes.
 
-**Two independent implementations agree byte-for-byte.** axx ships a Python implementation (`axx.py`, nicknamed Paxx, 9,789 lines) and a C implementation (`caxx.c`, nicknamed Caxx, 13,538 lines). The bundled `test1` script assembles 15 pattern/source pairs — from the 4004 to x86_64 to a Brainfuck virtual CPU — with both implementations and `cmp`s the results. Run it and you get `test all passed`. This isn't a claim; it's reproducible in five minutes from a fresh clone.
+**Two independent implementations agree byte-for-byte.** axx ships a Python implementation (`axx.py`, nicknamed Paxx, 14,646 lines) and a C implementation (`caxx.c`, nicknamed Caxx, 20,265 lines). The bundled `test1` script assembles all thirty-six bundled pattern/source pairs — from the 4004 to x86_64 to AArch64 to PowerPC64 to a Brainfuck virtual CPU — with both implementations and `cmp`s the results, 155 comparisons in all: the sixteen core pairs also go through `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v` and `-V`, so the ELF32 and ELF64 objects, the DWARF, the listing and the text output are compared too. Run it and you get `test all passed`. This isn't a claim; it's reproducible in five minutes from a fresh clone.
 
 **It produces real ELF objects.**
 
 ```sh
-axx x86_64.axx hello.s -o out.o
+axx patfile/x86_64.axx asmsrc/hello.s -o out.o
 file out.o
 # => out.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
 ```
 
-`-o` emits an ELF32/64 relocatable object for FreeBSD or Linux that you can hand straight to `ld`, with optional DWARF debug info. None of the comparable tools in this space do this (more on that below).
+`-o` emits an ELF32/64 relocatable object for FreeBSD or Linux that you can hand straight to `ld`, with optional DWARF debug info. Eleven architectures have their relocation numbering built in, and any other `e_machine` works too — the pattern file declares the relocation types, the ELF class, RELA/REL, the header fields and the section attributes it needs. None of the comparable tools in this space do this (more on that below).
 
 **The grammar itself is free-form.** axx has no tokenizer; it matches character by character. That means it isn't limited to the conventional "mnemonic plus operands" shape — a register-transfer style instruction like `r1 = r2 + r3` is just as legal a pattern as `MOV A,B`. This isn't incidental: LLVM's assembler-generation machinery (TableGen/AsmMatcher) explicitly assumes mnemonic-led syntax, and had to be specially patched to handle Hexagon's mnemonic-less `r0 = r1` transfer syntax. axx never had that assumption baked in to begin with.
 
-**A macro layer keeps large ISAs maintainable.** The full x86_64 pattern set (through AVX-512/EVEX) is 23,923 pattern lines written flat. The macro-based version is 5,787 — a quarter of the size — and expands back to an identical, byte-for-byte matching pattern set at load time. Runtime cost of matching against ~24,000 patterns is still sub-second in the C implementation.
+**A macro layer keeps large ISAs maintainable.** The full x86_64 pattern set (through AVX-512/EVEX) is 23,923 pattern lines written flat. The macro-based version is 5,787 — a quarter of the size — and expands back to an identical, byte-for-byte matching pattern set at load time. Runtime cost of matching against ~24,000 patterns is still sub-second in the C implementation (0.2 s to assemble `hello.s`).
+
+**When an encoding can't be written as an expression, compute it.** The output field of a pattern is normally just data — `0x03,d` emits two bytes — but it can also be `.call f(d)`, which runs a function written in a small procedural language kept in the same pattern file:
+
+```
+BR !t :: .call rel8(t)
+
+.func rel8(target)
+d = target - $.
+.if d < -128 || d > 127 .then
+.raise 2
+.endif
+.emit(d & 0xff)
+.return
+.endfunc
+```
+
+It has assignment, `.if`/`.elif`, `.while`, `.for`, recursion, arrays, and `.echo` for debugging, and it can read labels, the location counter and `.setsym` symbols through the assembler's own expression evaluator. `aarch64_logical_mini.axx` uses it for real: AArch64's logical-immediate encoding is a bitmask-to-`N:immr:imms` search that no fixed expression can express, and the whole instruction group fits in 86 pattern lines because of it. Both implementations run the language to the same spec, down to 256-bit wraparound. [MINI.md](MINI.md) / [mini_en.md](mini_en.md) are the reference.
 
 ## What's covered today
 
-Bundled and working: **x86_64** (x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512), **Motorola 6809 / 68000 / 6800**, **MOS 6502**, **Zilog Z80**, **Intel 8080 / 8051 / 8048 / 4004**.
+Bundled and working: **x86_64** (x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512), **AArch64** (the A64 instruction set — data processing, branches, system, loads and stores, scalar floating point, Advanced SIMD, cryptography and the scalar extensions, plus SVE, SVE2, SME and SME2: the Z and P register files, predication, the whole SVE load/store family including gathers and scatters, the SVE2 widening and complex arithmetic, the SME ZA array and outer products, and the SME2 predicate-as-counter registers, ZT0 lookup table and multi-vector operations), **PowerPC64** (Power ISA v3.1 / POWER10, big- and little-endian: fixed point, branches with the extended mnemonics, floating point, decimal floating point, VMX, VSX, quad precision, MMA including the prefixed masked forms, and the prefixed instructions, with a nop inserted before one that would cross a 64-byte boundary; under `-o` the ELF relocations of the 64-bit PowerPC ABI — `REL24`, `REL14`, the `ADDR16` family for `@l` / `@ha` / `@high` / `@highest` ..., `D34` / `PCREL34` — so objects link with GNU ld), **Motorola 6809 / 68000 / 6800**, **MOS 6502**, **Zilog Z80**, **Intel 8080 / 8051 / 8048 / 4004**, and **RISC-V** (RV64: the base set, M, A, F, D, Q, Zfh, C and its Zcb / Zcmp / Zcmt, the bit-manipulation and scalar cryptography groups, Zicond, the cache-block instructions, CSRs by name, the privileged and hypervisor instructions, and the vector extension 1.0 with its crypto and bit-manipulation parts, plus the GNU pseudo-instructions — `riscv64full.axx`, checked against LLVM's assembler; under `-o` the RISC-V relocations link with `ld -m elf64lriscv`. `riscv64.axx` is the small RV64I file that shows how the relocations are declared).
 
-ARM, RISC-V, MIPS and SPARC don't have pattern files yet (AArch64 and PowerPC64 now do). That's not a design limitation — it's a labor constraint: the author doesn't currently have real hardware or emulators to validate against, and doing it solo is more than one person wants to take on. The pattern-file format itself is fully documented and, within the "instructions map one-to-one onto machine code" boundary the design deliberately enforces (a Turing-incomplete core guarantees pattern matching terminates), there's nothing architecture-specific stopping someone from writing one.
+What AArch64 stops short of is SVE2.1, SME2.1 and the optional extensions the reference assembler used for validation does not accept either (FEAT_SME_F16F16, FEAT_SME_B16B16, FEAT_SME_LUTv2, FEAT_FAMINMAX).
 
-## How it compares (honestly)
+ARM (A32/T32), MIPS and SPARC don't have pattern files yet (nor 32-bit PowerPC as an ELF32 target; the PowerPC64 file covers the 64-bit ABI). RISC-V has one for RV64 (not for RV32). That's not a design limitation — it's a labor constraint: the author doesn't currently have real hardware or emulators to validate against, and doing it solo is more than one person wants to take on. The pattern-file format itself is fully documented, and there's nothing architecture-specific stopping someone from writing one. The pattern layer proper is deliberately Turing-incomplete, which is what guarantees pattern matching terminates; where an encoding genuinely needs computation, the mini language above is the escape hatch, and it is invoked only from output fields that ask for it by name.
 
-**customasm** (Rust, actively maintained) shares the same core idea — describe an ISA declaratively, get an assembler for it — and its `#subruledef` composition system is more structured than axx's flat pattern model. But its output formats (binary, hexdump, intelhex, and similar dump formats) stop short of anything like ELF; there's no relocatable-object output at all. If you're building a toy VM or an FPGA CPU, customasm is the better fit. If you need something that links into a real OS binary, axx is the one that does that.
+## How it compares
+
+**customasm** (Rust, actively maintained) shares the same core idea — describe an ISA declaratively, get an assembler for it .  Its output formats (binary, hexdump, intelhex, and similar dump formats) stop short of anything like ELF; there's no relocatable-object output at all. If you're building a toy VM or an FPGA CPU, customasm is the better fit. If you need something that links into a real OS binary, axx is the one that does that.
 
 **LLVM MC** is the production-grade backend actually used by clang and rustc, with object-format support (ELF, COFF, Mach-O, wasm) and target coverage that axx doesn't come close to. But TableGen alone rarely suffices for a real target — most non-trivial backends carry thousands of lines of hand-written C++ alongside the declarative description. If you need a mainstream architecture in production today, use LLVM. If you want a historical or unusual ISA running from a single file you can actually read end to end, that's axx's territory.
 
@@ -67,12 +86,15 @@ ARM, RISC-V, MIPS and SPARC don't have pattern files yet (AArch64 and PowerPC64 
 git clone https://github.com/fygar256/axx.git
 cd axx
 make                              # builds and installs caxx, paxx, axx, and the man page
-axx z80.axx z80.s -v              # assemble the Z80 sample, print the listing
-axx x86_64.axx hello.s -o out.o   # assemble x86_64 hello-world into an ELF object
+axx patfile/z80.axx asmsrc/z80.s -v              # assemble the Z80 sample, print the listing
+axx patfile/x86_64.axx asmsrc/hello.s -o out.o   # assemble x86_64 hello-world into an ELF object
+axx patfile/ppc64.axx asmsrc/hello_ppc64.s -o hello.o        # PowerPC64 BE hello-world
+powerpc64-linux-gnu-ld hello.o -o hello                      # links with GNU ld
 ```
 
-Pattern files for ARM, RISC-V, MIPS and SPARC don't exist yet. Getting there — including real hardware/emulator validation — is more than one person can reasonably do alone. If you're interested in taking on one of those, that's where help would matter most.
+Pattern files for ARM (A32/T32), MIPS and SPARC don't exist yet. Getting there — including real hardware/emulator validation — is more than one person can reasonably do alone. If you're interested in taking on one of those, that's where help would matter most.
 
 ---
 
-*Every verification claim in this document (byte-identical dual implementations, actual ELF object generation, the line-count comparison) was checked by cloning, building, and running the repository directly — not taken from the README on faith.*
+*Every verification claim in this document (byte-identical dual implementations, actual ELF object generation, the line-count comparison) was checked by cloning, building, and running the repository directly
+
