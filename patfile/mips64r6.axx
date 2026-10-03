@@ -1,13 +1,13 @@
 /* ===================================================================
-/* mips64.axx -- MIPS64, big-endian, n64 (ELF64 RELA)
+/* mips64r6.axx -- MIPS64 Release 6, big-endian, n64 (ELF64 RELA)
 /*
 /* The instruction set is in mips_isa.axx (see its header for the
 /* coverage, the syntax and the ELF output); this file fixes the byte
-/* order, the ABI and the release (up to Release 5) and includes it.
+/* order, the ABI and the release (Release 6) and includes it.
 /*
 /* Assemble with:
-/*   axx mips64.axx prog.s -b out.bin       (a flat binary)
-/*   axx mips64.axx prog.s -o out.o         (an ELF relocatable object)
+/*   axx mips64r6.axx prog.s -b out.bin       (a flat binary)
+/*   axx mips64r6.axx prog.s -o out.o         (an ELF relocatable object)
 /* =================================================================== */
 .bits::big::8
 
@@ -18,7 +18,7 @@
 !return 1
 }
 !def R6() {
-!return 0
+!return 1
 }
 
 /* one 32-bit word, big-endian: as a byte list, and emitted */

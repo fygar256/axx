@@ -3,7 +3,7 @@
 /*
 /* The instruction set is in mips_isa.axx (see its header for the
 /* coverage, the syntax and the ELF output); this file fixes the byte
-/* order and the ABI and includes it.
+/* order, the ABI and the release (up to Release 5) and includes it.
 /*
 /* Assemble with:
 /*   axx mipsel.axx prog.s -b out.bin       (a flat binary)
@@ -15,6 +15,9 @@
 !return 0
 }
 !def N64() {
+!return 0
+}
+!def R6() {
 !return 0
 }
 

@@ -2,14 +2,19 @@
 /* mips_isa.axx -- the MIPS instruction set for axx (shared body)
 /*
 /* Do not pass this file to axx directly. It is included by one of the
-/* four front files, which fix the byte order and the ABI:
+/* eight front files, which fix the byte order, the ABI and the
+/* release:
 /*
-/*   mips.axx      big-endian,    o32 (ELF32, REL)
-/*   mipsel.axx    little-endian, o32 (ELF32, REL)
-/*   mips64.axx    big-endian,    n64 (ELF64, RELA)
-/*   mips64el.axx  little-endian, n64 (ELF64, RELA)
+/*   mips.axx        big-endian,    o32 (ELF32, REL),  up to Release 5
+/*   mipsel.axx      little-endian, o32 (ELF32, REL),  up to Release 5
+/*   mips64.axx      big-endian,    n64 (ELF64, RELA), up to Release 5
+/*   mips64el.axx    little-endian, n64 (ELF64, RELA), up to Release 5
+/*   mipsr6.axx      big-endian,    o32,               Release 6
+/*   mipsr6el.axx    little-endian, o32,               Release 6
+/*   mips64r6.axx    big-endian,    n64,               Release 6
+/*   mips64r6el.axx  little-endian, n64,               Release 6
 /*
-/* Each front file defines the macros BE() and N64() and the word
+/* Each front file defines the macros BE(), N64() and R6() and the word
 /* emitters w4 (one word as a byte list) and ew (emit one word), then
 /* includes this file.
 /*
@@ -65,12 +70,65 @@
 /*                %call_hi %call_lo %tlsgd %tlsldm %dtprel_hi
 /*                %dtprel_lo %gottprel %tprel_hi %tprel_lo, on every
 /*                16-bit immediate and every load / store displacement
+/*                (Release 6 adds %pcrel_lo, and %pcrel_hi on auipc /
+/*                aluipc)
+/*   MIPS I       lwc3 / ldc3 / swc3 / sdc3, bc0f / bc0t / bc3f / bc3t
+/*                (and the likely forms), c3 / cop3, rfe
+/*
+/* The application specific extensions
+/*   DSP          Release 1 and 2: the SIMD arithmetic on .qb / .ph /
+/*                .w, the dot products and multiply-accumulates on
+/*                $ac0-$ac3, extr / extp / shilo / mthlip, rddsp /
+/*                wrdsp, the indexed loads lbux / lhx / lwx, insv,
+/*                bposge32, and the accumulator forms of mult / multu /
+/*                madd / maddu / msub / msubu / mfhi / mflo / mthi / mtlo
+/*   MSA          every instruction on $w0-$w31 with every element
+/*                format, element indices ($w1[3]), ld / st with the
+/*                scaled 10-bit offset, bz / bnz, cfcmsa / ctcmsa (by
+/*                number or $msair ... $msaunmap), lsa / dlsa
+/*   MT           dmt / emt / dvpe / evpe, fork, yield, mftr / mttr and
+/*                every named form (mftgpr mftc0 mftc1 mfthc1 mftc2
+/*                mfthc2 cftc1 cftc2 mftlo mfthi mftacx mftdsp and the
+/*                mtt* ones)
+/*   VZ           mfgc0 / mtgc0 / dmfgc0 / dmtgc0 / mfhgc0 / mthgc0,
+/*                hypcall, tlbgp / tlbgr / tlbgwi / tlbgwr / tlbginv /
+/*                tlbginvf
+/*   EVA          lbe lbue lhe lhue lwe sbe she swe lle sce lwle lwre
+/*                swle swre cachee prefe
+/*   MIPS-3D      addr.ps mulr.ps cvt.ps.pw cvt.pw.ps recip1 recip2
+/*                rsqrt1 rsqrt2, bc1any2f / bc1any2t / bc1any4f /
+/*                bc1any4t, cabs.cond.fmt
+/*   SmartMIPS    lwxs maddp pperm mflhxu mtlhx
+/*   MCU          aclr aset iret
+/*   XPA          mfhc0 / mthc0 (above, with COP0)
+/*
+/* Release 6 (R6() = 1). The instructions Release 6 removes are not
+/* accepted (branch likely, mult / div ... on HI / LO, mfhi ..., madd
+/* ..., lwl / lwr / swl / swr / ldl / ldr / sdl / sdr, movz / movn /
+/* movf / movt, addi / daddi, the trap immediates, jalx, the FP
+/* condition codes (c.cond, bc1f ...), paired single, COP1X, MIPS-3D,
+/* SmartMIPS, MCU, lwle ...). The re-encoded ones take their Release 6
+/* form: clz clo dclz dclo, ll sc lld scd cache pref (9-bit offset),
+/* lwc2 swc2 ldc2 sdc2 (11-bit offset), jr / jr.hb (jalr $0), sdbbp,
+/* rdhwr with a select. New:
+/*   mul muh mulu muhu div mod divu modu and the d* forms (also with
+/*   two registers, rd,rt = rd,rd,rt), seleqz / selnez, align / dalign,
+/*   bitswap / dbitswap, aui / daui / dahi / dati, addiupc / lapc /
+/*   lwpc / lwupc / ldpc / auipc / aluipc, the compact branches (beqc
+/*   bnec bovc bnvc bgec bltc bgeuc bltuc blec bgtc bleuc bgtuc blezc
+/*   bgezc bgtzc bltzc blezalc bgezalc bgtzalc bltzalc beqzalc bnezalc
+/*   beqzc bnezc bc balc), jic / jialc / jrc / jalrc, nal, sigrie,
+/*   bc1eqz / bc1nez / bc2eqz / bc2nez, crc32b ... crc32cd, ginvi /
+/*   ginvt, dvp / evp, llwp / lldp / scwp / scdp / llwpe / scwpe, and
+/*   on the FPU cmp.cond.fmt (every condition), class, rint, sel,
+/*   seleqz, selnez, maddf, msubf, min, mina, max, maxa.
+/* MSA, DSP (Release 3), MT, VZ and EVA stay available under Release 6.
 /*
 /* Not covered
-/*   - MIPS Release 6, which re-encodes much of the set (a file of its
-/*     own); microMIPS and MIPS16e (the compressed encodings);
-/*   - the application specific extensions: DSP, MSA, MT, VZ, EVA, MCU,
-/*     MIPS-3D, MDMX, SmartMIPS, CRC, GINV;
+/*   - microMIPS and MIPS16e, the compressed encodings (other
+/*     instruction streams, not other words of this one);
+/*   - MDMX, the 64-bit DSP of GNU as, and the vendor extensions
+/*     (Octeon, Loongson, R5900, VR4100 ...);
 /*   - the GNU macros that need $at or expand into branches: the
 /*     three-operand div / rem / mul with an immediate, seq / sne / sge
 /*     ..., blt / bgt / ble / bge ..., abs, ulw / usw ..., loads and
@@ -84,7 +142,9 @@
 /* $ta0-$ta3 = $12-$15; n64: $a4-$a7 = $ta0-$ta3 = $8-$11, $t0-$t3 =
 /* $12-$15), $f0-$f31, $fcc0-$fcc7 and, for COP2 branches, $cc0-$cc7.
 /* COP0, COP2, FPU control and hardware registers are written by number
-/* ($12, $31 ...).
+/* ($12, $31 ...). The extensions add $ac0-$ac3 (DSP), $w0-$w31 (MSA)
+/* and the MSA control register names $msair $msacsr $msaaccess
+/* $msasave $msamodify $msarequest $msamap $msaunmap.
 /*
 /* Data. DB / BYTE (1 byte), HALF (2), WORD (4), DWORD (8, as GNU's
 /* .dword), FLOAT and DOUBLE, in the byte order of the front file.
@@ -96,7 +156,10 @@
 /* the TLS types. WORD and DWORD take R_MIPS_32 and R_MIPS_64. o32 is
 /* REL, so the addend is written back into the field (HI16 rounded, as
 /* the linker adds back the signed LO16); n64 is RELA with the three
-/* types per entry of the MIPS64 r_info.
+/* types per entry of the MIPS64 r_info. Release 6 adds PC21_S2 (beqzc
+/* bnezc), PC26_S2 (bc balc), PC19_S2 (addiupc lapc lwpc lwupc),
+/* PC18_S3 (ldpc), PCHI16 and PCLO16 (%pcrel_hi %pcrel_lo); its
+/* 16-bit compact branches take PC16.
 /*
 /* li of a label, la and dla compute the address themselves and carry
 /* no relocation (one row cannot carry two types). They are exact in a
@@ -107,18 +170,33 @@
 /*   - div / divu / ddiv / ddivu rs,rt is the instruction itself, as
 /*     the architecture defines it (GNU as makes it a macro with a
 /*     divide-by-zero trap); the three-register form takes only $zero.
+/*     Under Release 6 div ... rd,rs,rt is the instruction of Release 6,
+/*     and div rd,rt is div rd,rd,rt.
 /*   - .set noreorder, .set noat and .set nomacro are accepted and do
 /*     nothing: they describe what this file always does.
 /*
-/* Verification. Every row was assembled with GNU as 2.42 and with axx
-/* (caxx and axx.py give identical output), and the bytes are
-/* identical:
+/* Verification. caxx and axx.py give identical output. The base rows
+/* were assembled with GNU as 2.42 and the extensions and Release 6
+/* with llvm-mc 19, and the bytes are identical:
 /*   asmsrc/mips.s     every row, about 2200 instructions including
 /*                     200 random 64-bit dli constants; n64 with
 /*                     mips64.axx and mips64el.axx against
 /*                     mips64-linux-gnuabi64-as -mabi=64 -mips64r5 -mxpa
 /*   asmsrc/mips32.s   the 32-bit rows, o32 with mips.axx and mipsel.axx
 /*                     against -mabi=32 -mips32r5 -mfp64 -mxpa
+/*   asmsrc/mips_ase.s the extensions up to Release 5, about 1900
+/*                     rows, against llvm-mc 19 (-mcpu=mips64r5 /
+/*                     mips32r5 with +msa +mt +virt +eva +dspr2
+/*                     +mips3d) in all four front files; the rows
+/*                     llvm-mc does not have (the rest of MIPS-3D,
+/*                     SmartMIPS, MCU, MIPS I ...) follow the GNU opcode
+/*                     table
+/*   asmsrc/mipsr6.s   Release 6, against llvm-mc 19 (-mcpu=mips64r6 /
+/*                     mips32r6) in the four Release 6 front files, the
+/*                     relocations of every PC-relative form (PC21_S2
+/*                     PC26_S2 PC19_S2 PC18_S3 PCHI16 PCLO16) included.
+/*                     j through a register is jalr $0 like jr, where
+/*                     llvm-mc writes the jr of earlier releases
 /* With -o, the relocations of asmsrc/mips_reloc.s (o32) and
 /* asmsrc/mips64_reloc.s (n64) are those of GNU as (type, offset,
 /* addend), except that a local label is named by its own symbol where
@@ -143,14 +221,25 @@
 .elfbuiltin::0
 .elfmachine::8::MIPS
 
+/* e_flags: noreorder, the ABI (o32 0x1000) and the architecture (the
+/* Release 2 value up to Release 5, as GNU as writes it; Release 6
+/* also sets nan2008, 0x400) */
 !if N64() !then {
 .elfclass::64
 .elfrela::1
+!if R6() !then {
+.elfheader::flags::0xa0000401
+} !else {
 .elfheader::flags::0x80000001
+}
 } !else {
 .elfclass::32
 .elfrela::0
+!if R6() !then {
+.elfheader::flags::0x90001401
+} !else {
 .elfheader::flags::0x70001001
+}
 }
 
 /*     name             number  width  pc-relative
@@ -182,11 +271,21 @@
 .elftype::tls_gottprel::46::4
 .elftype::tls_tprel_hi16::49::4
 .elftype::tls_tprel_lo16::50::4
+.elftype::pc21_s2::60::4::1
+.elftype::pc26_s2::61::4::1
+.elftype::pc18_s3::62::4::1
+.elftype::pc19_s2::63::4::1
+.elftype::pchi16::64::4::1
+.elftype::pclo16::65::4::1
 
 /* The fields, read as one 32-bit word in the byte order of the file:
 /* the immediate is the low half of the word in either order. */
 .elffield::r26::0x03ffffff::0::2
 .elffield::pc16::0xffff::0::2::-4
+.elffield::pc21_s2::0x1fffff::0::2::-4
+.elffield::pc26_s2::0x3ffffff::0::2::-4
+.elffield::pc19_s2::0x7ffff::0::2
+.elffield::pc18_s3::0x3ffff::0::3
 !def F16(ty) {
 .elffield::!{ty}::0xffff
 }
@@ -211,6 +310,8 @@
 !F16("tls_gottprel")
 !F16("tls_tprel_hi16")
 !F16("tls_tprel_lo16")
+!F16("pchi16")
+!F16("pclo16")
 
 /* REL: the linker adds the signed LO16 back, so a HI16-type field
 /* holds the rounded upper half of the addend. */
@@ -220,6 +321,7 @@
 .elfencode::call_hi16::hi16enc
 .elfencode::tls_dtprel_hi16::hi16enc
 .elfencode::tls_tprel_hi16::hi16enc
+.elfencode::pchi16::hi16enc
 }
 .func hi16enc(f, a)
 .return (f & 0xffff0000) | (((a + 0x8000) >> 16) & 0xffff)
@@ -652,6 +754,9 @@ w = .call dsh(0x38, rd, rd, 16)
 !M1(nm, pre, post, base, fx, "GOTTPREL", "tls_gottprel", "v&0")
 !M1(nm, pre, post, base, fx, "TPREL\\_HI", "tls_tprel_hi16", "v&0")
 !M1(nm, pre, post, base, fx, "TPREL\\_LO", "tls_tprel_lo16", "v&0")
+!if R6() !then {
+!M1(nm, pre, post, base, fx, "PCREL\\_LO", "pclo16", "(v-$$)&0xffff")
+}
 }
 
 /* field strings */
@@ -676,6 +781,9 @@ w = .call dsh(0x38, rd, rd, 16)
 /* 2 signed with the value negated (sub -> addi). */
 !def R3I(nm, fn, iop, kind) {
 !R3(nm, fn)
+!if R6() && (iop == 8 || iop == 24) !then {
+!return
+}
 !local b = iop << 26
 !if kind == 0 !then {
 !Z(nm, "t,s,!v", ES16(), b, "|(s<<21)|(t<<16)|(v&0xffff)")
@@ -704,9 +812,11 @@ w = .call dsh(0x38, rd, rd, 16)
 !R3I("DADDU", 0x2d, 25, 0)
 !R3I("DSUB", 0x2e, 24, 2)
 !R3I("DSUBU", 0x2f, 25, 2)
+!if R6() == 0 !then {
 !Z("MOVZ", "d,s,t", "", 0x0a, RF())
 !Z("MOVN", "d,s,t", "", 0x0b, RF())
 !Z("MUL", "d,s,t", "", 0x70000002, RF())
+}
 
 /* I-type: nm t,s,!v / nm t,!v / every modifier */
 !def RI(nm, op, er) {
@@ -715,14 +825,16 @@ w = .call dsh(0x38, rd, rd, 16)
 !Z(nm, "t,!v", er, b, "|(t<<21)|(t<<16)|(v&0xffff)")
 !MODS(nm, "t,s,", "", b, IFLD())
 }
+!if R6() == 0 !then {
 !RI("ADDI", 8, ES16())
+!RI("DADDI", 24, ES16())
+}
 !RI("ADDIU", 9, ES16())
 !RI("SLTI", 10, ES16())
 !RI("SLTIU", 11, ES16())
 !RI("ANDI", 12, EU16())
 !RI("ORI", 13, EU16())
 !RI("XORI", 14, EU16())
-!RI("DADDI", 24, ES16())
 !RI("DADDIU", 25, ES16())
 !Z("LUI", "t,!v", EU16(), 0x3c000000, "|(t<<16)|(v&0xffff)")
 !MODS("LUI", "t,", "", 0x3c000000, "|(t<<16)")
@@ -773,6 +885,7 @@ w = .call dsh(0x38, rd, rd, 16)
 /* multiply and divide: nm s,t. The divides also take $zero,s,t (the
 /* explicit form of GNU as); any other first register is the GNU
 /* macro, which is not provided. */
+!if R6() == 0 !then {
 !def MD(nm, fn) {
 !Z(nm, "s,t", "", fn, "|(s<<21)|(t<<16)")
 }
@@ -796,11 +909,23 @@ w = .call dsh(0x38, rd, rd, 16)
 !Z("MTHI", "s", "", 0x11, "|(s<<21)")
 !Z("MFLO", "d", "", 0x12, "|(d<<11)")
 !Z("MTLO", "s", "", 0x13, "|(s<<21)")
+}
 
 /* count leading zeros / ones: rd is written to both rd and rt */
 !def CL(nm, fn) {
+!if R6() !then {
+!Z(nm, "d,s", "", fn, "|(s<<21)|(d<<11)")
+} !else {
 !Z(nm, "d,s", "", fn, "|(s<<21)|(d<<16)|(d<<11)")
 }
+}
+!if R6() !then {
+/* Release 6: SPECIAL with sa = 1, rt = 0 */
+!CL("CLZ", 0x00000050)
+!CL("CLO", 0x00000051)
+!CL("DCLZ", 0x00000052)
+!CL("DCLO", 0x00000053)
+} !else {
 !CL("CLZ", 0x70000020)
 !CL("CLO", 0x70000021)
 !CL("DCLZ", 0x70000024)
@@ -809,6 +934,7 @@ w = .call dsh(0x38, rd, rd, 16)
 /* conditional move on an FP condition code */
 !Z("MOVF", "d,s,c", "", 0x01, "|(s<<21)|(c<<18)|(d<<11)")
 !Z("MOVT", "d,s,c", "", 0x00010001, "|(s<<21)|(c<<18)|(d<<11)")
+}
 
 /* Release 2 bit fields and byte swaps */
 !Z("EXT", "t,s,!p,!z", "p<0||p>31||z<1||z>32||p+z>32;10", 0x7c000000, "|(s<<21)|(t<<16)|((z-1)<<11)|(p<<6)")
@@ -829,6 +955,9 @@ DINS t,s,!p,!z :: .call dinsf(t,s,p,z)
 !BS("DSBH", 0x7c0000a4)
 !BS("DSHD", 0x7c000164)
 !Z("RDHWR", "t,n", "", 0x7c00003b, "|(t<<16)|(n<<11)")
+!if R6() !then {
+!Z("RDHWR", "t,n,!q", "q<0||q>7;10", 0x7c00003b, "|(t<<16)|(n<<11)|((q&7)<<6)")
+}
 
 /* ===================================================================
 /* Assembler options of GNU as that describe what this file always
@@ -882,33 +1011,40 @@ LA t,!v :: .call la32(t,v)
 }
 !BR2("BEQ", 0x10000000)
 !BR2("BNE", 0x14000000)
-!BR2("BEQL", 0x50000000)
-!BR2("BNEL", 0x54000000)
 !BR1("BLEZ", 0x18000000)
 !BR1("BGTZ", 0x1c000000)
-!BR1("BLEZL", 0x58000000)
-!BR1("BGTZL", 0x5c000000)
 !BR1("BLTZ", 0x04000000)
 !BR1("BGEZ", 0x04010000)
+!if R6() == 0 !then {
+!BR2("BEQL", 0x50000000)
+!BR2("BNEL", 0x54000000)
+!BR1("BLEZL", 0x58000000)
+!BR1("BGTZL", 0x5c000000)
 !BR1("BLTZL", 0x04020000)
 !BR1("BGEZL", 0x04030000)
+}
 /* the linking forms write $31, so it cannot be the source */
 !def BRL(nm, base) {
 .reloc::v::pc16
 !Z(nm, "s,!v", "s==31;5," + EBR(), base, "|(s<<21)" + FBR())
 .clrreloc::v
 }
+!if R6() == 0 !then {
 !BRL("BLTZAL", 0x04100000)
 !BRL("BGEZAL", 0x04110000)
 !BRL("BLTZALL", 0x04120000)
 !BRL("BGEZALL", 0x04130000)
-/* pseudo branches */
+}
+/* pseudo branches (bal is bgezal $0, an instruction of its own in
+/* Release 6) */
 !BR0("B", 0x10000000)
 !BR0("BAL", 0x04110000)
 !BR1("BEQZ", 0x10000000)
 !BR1("BNEZ", 0x14000000)
+!if R6() == 0 !then {
 !BR1("BEQZL", 0x50000000)
 !BR1("BNEZL", 0x54000000)
+}
 
 /* the FP and COP2 condition branches: nm [cc,]target */
 !def BCC(nm, base, cv) {
@@ -917,6 +1053,7 @@ LA t,!v :: .call la32(t,v)
 !Z(nm, cv + ",!v", EBR(), base, "|(" + cv + "<<18)" + FBR())
 .clrreloc::v
 }
+!if R6() == 0 !then {
 !BCC("BC1F", 0x45000000, "c")
 !BCC("BC1T", 0x45010000, "c")
 !BCC("BC1FL", 0x45020000, "c")
@@ -925,21 +1062,30 @@ LA t,!v :: .call la32(t,v)
 !BCC("BC2T", 0x49010000, "e")
 !BCC("BC2FL", 0x49020000, "e")
 !BCC("BC2TL", 0x49030000, "e")
+}
 
 /* jumps in the current 256 MB region */
 .reloc::v::r26
 !Z("J", "!v", EJ(), 0x08000000, "|((v>>2)&0x3ffffff)")
 !Z("JAL", "!v", EJ(), 0x0c000000, "|((v>>2)&0x3ffffff)")
+!if R6() == 0 !then {
 !Z("JALX", "!v", EJ(), 0x74000000, "|((v>>2)&0x3ffffff)")
+}
 .clrreloc::v
-/* jumps through a register */
+/* jumps through a register (Release 6: jr is jalr $0) */
+!if R6() !then {
+!Z("JR", "s", "", 0x00000009, "|(s<<21)")
+!Z("JR.HB", "s", "", 0x00000409, "|(s<<21)")
+!Z("J", "s", "", 0x00000009, "|(s<<21)")
+} !else {
 !Z("JR", "s", "", 0x00000008, "|(s<<21)")
 !Z("JR.HB", "s", "", 0x00000408, "|(s<<21)")
+!Z("J", "s", "", 0x00000008, "|(s<<21)")
+}
 !Z("JALR", "s", "s==31;5", 0x0000f809, "|(s<<21)")
 !Z("JALR", "d,s", "", 0x00000009, "|(s<<21)|(d<<11)")
 !Z("JALR.HB", "s", "s==31;5", 0x0000fc09, "|(s<<21)")
 !Z("JALR.HB", "d,s", "", 0x00000409, "|(s<<21)|(d<<11)")
-!Z("J", "s", "", 0x00000008, "|(s<<21)")
 !Z("JAL", "s", "s==31;5", 0x0000f809, "|(s<<21)")
 !Z("JAL", "d,s", "", 0x00000009, "|(s<<21)|(d<<11)")
 
@@ -959,20 +1105,27 @@ LA t,!v :: .call la32(t,v)
 !def TI(nm, rt) {
 !Z(nm, "s,!v", ES16(), 0x04000000 | (rt << 16), "|(s<<21)|(v&0xffff)")
 }
+!if R6() == 0 !then {
 !TI("TGEI", 8)
 !TI("TGEIU", 9)
 !TI("TLTI", 10)
 !TI("TLTIU", 11)
 !TI("TEQI", 12)
 !TI("TNEI", 14)
+}
 
 !Z("SYSCALL", "", "", 0x0000000c, "")
 !Z("SYSCALL", "!v", "v<0||v>0xfffff;10", 0x0000000c, "|((v&0xfffff)<<6)")
 !Z("BREAK", "", "", 0x0000000d, "")
 !Z("BREAK", "!v", "v<0||v>1023;10", 0x0000000d, "|((v&0x3ff)<<16)")
 !Z("BREAK", "!v,!w", "v<0||v>1023||w<0||w>1023;10", 0x0000000d, "|((v&0x3ff)<<16)|((w&0x3ff)<<6)")
+!if R6() !then {
+!Z("SDBBP", "", "", 0x0000000e, "")
+!Z("SDBBP", "!v", "v<0||v>0xfffff;10", 0x0000000e, "|((v&0xfffff)<<6)")
+} !else {
 !Z("SDBBP", "", "", 0x7000003f, "")
 !Z("SDBBP", "!v", "v<0||v>0xfffff;10", 0x7000003f, "|((v&0xfffff)<<6)")
+}
 !Z("SYNC", "", "", 0x0000000f, "")
 !Z("SYNC", "!v", "v<0||v>31;10", 0x0000000f, "|((v&31)<<6)")
 !Z("SYNC\\_WMB", "", "", 0x0000010f, "")
@@ -982,13 +1135,34 @@ LA t,!v :: .call la32(t,v)
 !Z("SYNC\\_RMB", "", "", 0x000004cf, "")
 !Z("SYNCI", "!v(s)", ED16(), 0x041f0000, "|(s<<21)|(v&0xffff)")
 !Z("SYNCI", "(s)", "", 0x041f0000, "|(s<<21)")
+/* SPECIAL3 loads and stores with a 9-bit offset in bits 15-7 (EVA, and
+/* ll / sc / cache / pref of Release 6): nm rt,offset(base) and
+/* nm op,offset(base) */
+!def E9(nm, fn, rt, rtf) {
+!Z(nm, rt + ",!v(s)", "v<-256||v>255;8", 0x7c000000 | fn, "|(s<<21)|" + rtf + "|((v&0x1ff)<<7)")
+!Z(nm, rt + ",(s)", "", 0x7c000000 | fn, "|(s<<21)|" + rtf)
+}
+!def E9G(nm, fn) {
+!E9(nm, fn, "t", "(t<<16)")
+}
+!def E9H(nm, fn) {
+!Z(nm, "!h,!v(s)", "h<0||h>31;10,v<-256||v>255;8", 0x7c000000 | fn, "|(s<<21)|((h&31)<<16)|((v&0x1ff)<<7)")
+!Z(nm, "!h,(s)", "h<0||h>31;10", 0x7c000000 | fn, "|(s<<21)|((h&31)<<16)")
+}
+
 /* cache and pref: an operation / hint number 0-31, then the address */
 !def CP(nm, op) {
 !Z(nm, "!h,!v(s)", "h<0||h>31;10," + ED16(), op << 26, "|(s<<21)|((h&31)<<16)|(v&0xffff)")
 !Z(nm, "!h,(s)", "h<0||h>31;10", op << 26, "|(s<<21)|((h&31)<<16)")
 }
+!if R6() !then {
+/* Release 6: SPECIAL3 with a 9-bit offset */
+!E9H("CACHE", 0x25)
+!E9H("PREF", 0x35)
+} !else {
 !CP("CACHE", 47)
 !CP("PREF", 51)
+}
 
 /* ===================================================================
 /* Loads and stores
@@ -1004,27 +1178,35 @@ LA t,!v :: .call la32(t,v)
 }
 !LSG("LB", 32)
 !LSG("LH", 33)
-!LSG("LWL", 34)
 !LSG("LW", 35)
 !LSG("LBU", 36)
 !LSG("LHU", 37)
-!LSG("LWR", 38)
 !LSG("LWU", 39)
 !LSG("SB", 40)
 !LSG("SH", 41)
-!LSG("SWL", 42)
 !LSG("SW", 43)
+!LSG("LD", 55)
+!LSG("SD", 63)
+!if R6() !then {
+/* Release 6: SPECIAL3 with a 9-bit offset */
+!E9G("LL", 0x36)
+!E9G("LLD", 0x37)
+!E9G("SC", 0x26)
+!E9G("SCD", 0x27)
+} !else {
+!LSG("LWL", 34)
+!LSG("LWR", 38)
+!LSG("SWL", 42)
+!LSG("SWR", 46)
 !LSG("SDL", 44)
 !LSG("SDR", 45)
-!LSG("SWR", 46)
-!LSG("LL", 48)
-!LSG("LLD", 52)
-!LSG("LD", 55)
-!LSG("SC", 56)
-!LSG("SCD", 60)
-!LSG("SD", 63)
 !LSG("LDL", 26)
 !LSG("LDR", 27)
+!LSG("LL", 48)
+!LSG("LLD", 52)
+!LSG("SC", 56)
+!LSG("SCD", 60)
+}
 !def LSF(nm, op) {
 !LS(nm, op, "ft", "(ft<<16)")
 }
@@ -1039,10 +1221,22 @@ LA t,!v :: .call la32(t,v)
 !def LSC(nm, op) {
 !LS(nm, op, "n", "(n<<16)")
 }
+!if R6() !then {
+/* Release 6: COP2 with an 11-bit offset */
+!def LSC6(nm, base) {
+!Z(nm, "n,!v(s)", "v<-1024||v>1023;8", base, "|(n<<16)|(s<<11)|(v&0x7ff)")
+!Z(nm, "n,(s)", "", base, "|(n<<16)|(s<<11)")
+}
+!LSC6("LWC2", 0x49400000)
+!LSC6("SWC2", 0x49600000)
+!LSC6("LDC2", 0x49c00000)
+!LSC6("SDC2", 0x49e00000)
+} !else {
 !LSC("LWC2", 50)
 !LSC("LDC2", 54)
 !LSC("SWC2", 58)
 !LSC("SDC2", 62)
+}
 
 /* ===================================================================
 /* Privileged (COP0)
@@ -1121,13 +1315,18 @@ LA t,!v :: .call la32(t,v)
 !F2(nm, fn, "S")
 !F2(nm, fn, "D")
 }
+/* the paired single format (PS) is not in Release 6 */
 !def FALL3(nm, fn) {
 !FSD3(nm, fn)
+!if R6() == 0 !then {
 !F3(nm, fn, "PS")
+}
 }
 !def FALL2(nm, fn) {
 !FSD2(nm, fn)
+!if R6() == 0 !then {
 !F2(nm, fn, "PS")
+}
 }
 !FALL3("ADD", 0)
 !FALL3("SUB", 1)
@@ -1158,6 +1357,7 @@ LA t,!v :: .call la32(t,v)
 !F2("CVT.W", 36, "D")
 !F2("CVT.L", 37, "S")
 !F2("CVT.L", 37, "D")
+!if R6() == 0 !then {
 !F3("CVT.PS", 38, "S")
 !Z("CVT.S.PL", "fd,fs", "", FB("PS", 40), "|(fs<<11)|(fd<<6)")
 !Z("CVT.S.PU", "fd,fs", "", FB("PS", 32), "|(fs<<11)|(fd<<6)")
@@ -1228,6 +1428,7 @@ LA t,!v :: .call la32(t,v)
 !FMA("MSUB", 40)
 !FMA("NMADD", 48)
 !FMA("NMSUB", 56)
+}
 
 /* ===================================================================
 /* COP2
@@ -1242,6 +1443,985 @@ LA t,!v :: .call la32(t,v)
 !MC("MTHC2", 0x48e00000)
 !Z("C2", "!v", "v<0||v>0x1ffffff;3", 0x4a000000, "|(v&0x1ffffff)")
 !Z("COP2", "!v", "v<0||v>0x1ffffff;3", 0x4a000000, "|(v&0x1ffffff)")
+
+/* ===================================================================
+/* Registers of the extensions: the DSP accumulators $ac0-$ac3 (ac),
+/* the MSA vector registers $w0-$w31 (wd ws wt) and the MSA control
+/* registers $0-$7 or $msair $msacsr $msaaccess $msasave $msamodify
+/* $msarequest $msamap $msaunmap (mc)
+/* =================================================================== */
+!regs("$AC", 3)
+!regs("$W", 31)
+!nm("MSAIR", 0)
+!nm("MSACSR", 1)
+!nm("MSAACCESS", 2)
+!nm("MSASAVE", 3)
+!nm("MSAMODIFY", 4)
+!nm("MSAREQUEST", 5)
+!nm("MSAMAP", 6)
+!nm("MSAUNMAP", 7)
+!regset("ACR", "$AC", 3)
+!regset("WR", "$W", 31)
+!regset("MSACN", "$", 7)
+.setsym::MSACR::MSACN,$MSAIR,$MSACSR,$MSAACCESS,$MSASAVE,$MSAMODIFY,$MSAREQUEST,$MSAMAP,$MSAUNMAP
+.check::ac::ACR
+.check::wd::WR
+.check::ws::WR
+.check::wt::WR
+.check::mc::MSACR
+
+!if R6() == 0 !then {
+/* ===================================================================
+/* MIPS I coprocessor 3 and COP0 forms (dropped in later levels; their
+/* opcodes were reused, but the mnemonics are unambiguous)
+/* =================================================================== */
+!LSC("LWC3", 51)
+!LSC("LDC3", 55)
+!LSC("SWC3", 59)
+!LSC("SDC3", 63)
+!Z("RFE", "", "", 0x42000010, "")
+!BCC("BC0F", 0x41000000, "e")
+!BCC("BC0T", 0x41010000, "e")
+!BCC("BC0FL", 0x41020000, "e")
+!BCC("BC0TL", 0x41030000, "e")
+!BCC("BC3F", 0x4d000000, "e")
+!BCC("BC3T", 0x4d010000, "e")
+!BCC("BC3FL", 0x4d020000, "e")
+!BCC("BC3TL", 0x4d030000, "e")
+!Z("C3", "!v", "v<0||v>0x1ffffff;3", 0x4e000000, "|(v&0x1ffffff)")
+!Z("COP3", "!v", "v<0||v>0x1ffffff;3", 0x4e000000, "|(v&0x1ffffff)")
+
+/* ===================================================================
+/* MIPS-3D
+/* =================================================================== */
+!F3("ADDR", 0x18, "PS")
+!F3("MULR", 0x1a, "PS")
+!Z("CVT.PS.PW", "fd,fs", "", FB("W", 0x26), "|(fs<<11)|(fd<<6)")
+!Z("CVT.PW.PS", "fd,fs", "", FB("PS", 0x24), "|(fs<<11)|(fd<<6)")
+!FALL3("RECIP2", 0x1c)
+!FALL2("RECIP1", 0x1d)
+!FALL2("RSQRT1", 0x1e)
+!FALL3("RSQRT2", 0x1f)
+/* the condition code of the "any" branches is a multiple of 2 or 4 */
+!def BANY(nm, base, m) {
+.reloc::v::pc16
+!Z(nm, "c,!v", "(c&" + str(m) + ")!=0;10," + EBR(), base, "|(c<<18)" + FBR())
+.clrreloc::v
+}
+!BANY("BC1ANY2F", 0x45200000, 1)
+!BANY("BC1ANY2T", 0x45210000, 1)
+!BANY("BC1ANY4F", 0x45400000, 3)
+!BANY("BC1ANY4T", 0x45410000, 3)
+/* cabs.<cond>.<fmt> [cc,]fs,ft: c.cond with the absolute bit (6) */
+!def FCABS(cn, i) {
+!local k = 0
+!local f = ""
+!while k < 3 {
+!set f = substr("SDP", k, 1)
+!if f == "P" !then {
+!set f = "PS"
+}
+!Z("CABS." + cn + "." + f, "fs,ft", "", FB(f, 112 + i), "|(ft<<16)|(fs<<11)")
+!Z("CABS." + cn + "." + f, "c,fs,ft", "", FB(f, 112 + i), "|(ft<<16)|(fs<<11)|(c<<8)")
+!set k = k + 1
+}
+}
+!FCABS("F", 0)
+!FCABS("UN", 1)
+!FCABS("EQ", 2)
+!FCABS("UEQ", 3)
+!FCABS("OLT", 4)
+!FCABS("ULT", 5)
+!FCABS("OLE", 6)
+!FCABS("ULE", 7)
+!FCABS("SF", 8)
+!FCABS("NGLE", 9)
+!FCABS("SEQ", 10)
+!FCABS("NGL", 11)
+!FCABS("LT", 12)
+!FCABS("NGE", 13)
+!FCABS("LE", 14)
+!FCABS("NGT", 15)
+
+/* ===================================================================
+/* SmartMIPS
+/* =================================================================== */
+!Z("LWXS", "d,t(s)", "", 0x70000088, RF())
+!Z("MADDP", "s,t", "", 0x70000441, "|(s<<21)|(t<<16)")
+!Z("PPERM", "s,t", "", 0x70000481, "|(s<<21)|(t<<16)")
+!Z("MFLHXU", "d", "", 0x00000052, "|(d<<11)")
+!Z("MTLHX", "s", "", 0x00000053, "|(s<<21)")
+
+/* ===================================================================
+/* MCU
+/* =================================================================== */
+!def ABIT(nm, base) {
+!Z(nm, "!b,!v(s)", "b<0||b>7;10,v<-2048||v>2047;8", base, "|(s<<21)|((b&7)<<12)|(v&0xfff)")
+!Z(nm, "!b,(s)", "b<0||b>7;10", base, "|(s<<21)|((b&7)<<12)")
+}
+!ABIT("ACLR", 0x04070000)
+!ABIT("ASET", 0x04078000)
+!Z("IRET", "", "", 0x42000038, "")
+}
+
+/* ===================================================================
+/* EVA: user-space loads and stores from kernel mode, 9-bit offset
+/* =================================================================== */
+!E9G("LBE", 0x2c)
+!E9G("LBUE", 0x28)
+!E9G("LHE", 0x2d)
+!E9G("LHUE", 0x29)
+!E9G("LWE", 0x2f)
+!E9G("SBE", 0x1c)
+!E9G("SHE", 0x1d)
+!E9G("SWE", 0x1f)
+!E9G("LLE", 0x2e)
+!E9G("SCE", 0x1e)
+!if R6() == 0 !then {
+!E9G("LWLE", 0x19)
+!E9G("LWRE", 0x1a)
+!E9G("SWLE", 0x21)
+!E9G("SWRE", 0x22)
+}
+!E9H("CACHEE", 0x1b)
+!E9H("PREFE", 0x23)
+
+/* ===================================================================
+/* VZ (virtualization)
+/* =================================================================== */
+!MC("MFGC0", 0x40600000)
+!MC("DMFGC0", 0x40600100)
+!MC("MTGC0", 0x40600200)
+!MC("DMTGC0", 0x40600300)
+!MC("MFHGC0", 0x40600400)
+!MC("MTHGC0", 0x40600600)
+!Z("HYPCALL", "", "", 0x42000028, "")
+!Z("HYPCALL", "!v", "v<0||v>1023;10", 0x42000028, "|((v&0x3ff)<<11)")
+!Z("TLBGR", "", "", 0x42000009, "")
+!Z("TLBGWI", "", "", 0x4200000a, "")
+!Z("TLBGINV", "", "", 0x4200000b, "")
+!Z("TLBGINVF", "", "", 0x4200000c, "")
+!Z("TLBGWR", "", "", 0x4200000e, "")
+!Z("TLBGP", "", "", 0x42000010, "")
+
+/* ===================================================================
+/* MT (multi-threading)
+/* =================================================================== */
+!def MT0(nm, base) {
+!Z(nm, "", "", base, "")
+!Z(nm, "t", "", base, "|(t<<16)")
+}
+!MT0("DMT", 0x41600bc1)
+!MT0("EMT", 0x41600be1)
+!MT0("DVPE", 0x41600001)
+!MT0("EVPE", 0x41600021)
+!Z("FORK", "d,s,t", "", 0x7c000008, RF())
+!Z("YIELD", "s", "", 0x7c000009, "|(s<<21)")
+!Z("YIELD", "d,s", "", 0x7c000009, "|(s<<21)|(d<<11)")
+/* mftr rd,rt,u,sel,h reads rt of the target thread into rd; mttr
+/* rt,rd,u,sel,h writes rt into rd of the target thread */
+!Z("MFTR", "d,t,!u,!q,!h", "u<0||u>1||q<0||q>7||h<0||h>1;10", 0x41000000, "|(t<<16)|(d<<11)|(u<<5)|(h<<4)|q")
+!Z("MTTR", "t,d,!u,!q,!h", "u<0||u>1||q<0||q>7||h<0||h>1;10", 0x41800000, "|(t<<16)|(d<<11)|(u<<5)|(h<<4)|q")
+/* the named forms: from (mft*) the target register is in rt, to
+/* (mtt*) it is in rd */
+!Z("MFTGPR", "d,t", "", 0x41000020, "|(t<<16)|(d<<11)")
+!Z("MTTGPR", "t,d", "", 0x41800020, "|(t<<16)|(d<<11)")
+!Z("MFTC0", "d,n", "", 0x41000000, "|(n<<16)|(d<<11)")
+!Z("MFTC0", "d,n,!q", "q<0||q>7;10", 0x41000000, "|(n<<16)|(d<<11)|(q&7)")
+!Z("MTTC0", "t,n", "", 0x41800000, "|(t<<16)|(n<<11)")
+!Z("MTTC0", "t,n,!q", "q<0||q>7;10", 0x41800000, "|(t<<16)|(n<<11)|(q&7)")
+!def MFTX(nm, sel, cls) {
+!Z("MFT" + nm, "d," + cls, "", 0x41000020 | sel, "|(" + cls + "<<16)|(d<<11)")
+!Z("MTT" + nm, "t," + cls, "", 0x41800020 | sel, "|(t<<16)|(" + cls + "<<11)")
+}
+!MFTX("C1", 0x02, "fs")
+!MFTX("HC1", 0x12, "fs")
+!MFTX("C2", 0x04, "n")
+!MFTX("HC2", 0x14, "n")
+!Z("CFTC1", "d,n", "", 0x41000023, "|(n<<16)|(d<<11)")
+!Z("CTTC1", "t,n", "", 0x41800023, "|(t<<16)|(n<<11)")
+!Z("CFTC2", "d,n", "", 0x41000025, "|(n<<16)|(d<<11)")
+!Z("CTTC2", "t,n", "", 0x41800025, "|(t<<16)|(n<<11)")
+/* the DSP accumulators of the target thread: register 0 lo, 1 hi,
+/* 2 acx of accumulator ac (bits 3-2), 16 the DSP control register */
+!def MFTA(nm, r) {
+!Z("MFT" + nm, "d", "", 0x41000021 | (r << 16), "|(d<<11)")
+!Z("MFT" + nm, "d,ac", "", 0x41000021 | (r << 16), "|(ac<<18)|(d<<11)")
+!Z("MTT" + nm, "t", "", 0x41800021 | (r << 11), "|(t<<16)")
+!Z("MTT" + nm, "t,ac", "", 0x41800021 | (r << 11), "|(t<<16)|(ac<<13)")
+}
+!MFTA("LO", 0)
+!MFTA("HI", 1)
+!MFTA("ACX", 2)
+!Z("MFTDSP", "d", "", 0x41100021, "|(d<<11)")
+!Z("MTTDSP", "t", "", 0x41808021, "|(t<<16)")
+
+/* ===================================================================
+/* DSP ASE, Release 1 and 2
+/*
+/* The accumulators are $ac0-$ac3 (ac); $ac0 is HI / LO.
+/* =================================================================== */
+/* three registers: rd,rs,rt */
+!def D3(nm, base) {
+!Z(nm, "d,s,t", "", base, RF())
+}
+!D3("ADDU.QB", 0x7c000010)
+!D3("ADDU\\_S.QB", 0x7c000110)
+!D3("SUBU.QB", 0x7c000050)
+!D3("SUBU\\_S.QB", 0x7c000150)
+!D3("ADDQ.PH", 0x7c000290)
+!D3("ADDQ\\_S.PH", 0x7c000390)
+!D3("SUBQ.PH", 0x7c0002d0)
+!D3("SUBQ\\_S.PH", 0x7c0003d0)
+!D3("ADDQ\\_S.W", 0x7c000590)
+!D3("SUBQ\\_S.W", 0x7c0005d0)
+!D3("ADDSC", 0x7c000410)
+!D3("ADDWC", 0x7c000450)
+!D3("MODSUB", 0x7c000490)
+!D3("MULEU\\_S.PH.QBL", 0x7c000190)
+!D3("MULEU\\_S.PH.QBR", 0x7c0001d0)
+!D3("MULQ\\_RS.PH", 0x7c0007d0)
+!D3("MULEQ\\_S.W.PHL", 0x7c000710)
+!D3("MULEQ\\_S.W.PHR", 0x7c000750)
+!D3("CMPGU.EQ.QB", 0x7c000111)
+!D3("CMPGU.LT.QB", 0x7c000151)
+!D3("CMPGU.LE.QB", 0x7c000191)
+!D3("PICK.QB", 0x7c0000d1)
+!D3("PICK.PH", 0x7c0002d1)
+!D3("PACKRL.PH", 0x7c000391)
+!D3("PRECRQ.QB.PH", 0x7c000311)
+!D3("PRECRQ.PH.W", 0x7c000511)
+!D3("PRECRQ\\_RS.PH.W", 0x7c000551)
+!D3("PRECRQU\\_S.QB.PH", 0x7c0003d1)
+!D3("ADDU.PH", 0x7c000210)
+!D3("ADDU\\_S.PH", 0x7c000310)
+!D3("SUBU.PH", 0x7c000250)
+!D3("SUBU\\_S.PH", 0x7c000350)
+!D3("ADDUH.QB", 0x7c000018)
+!D3("ADDUH\\_R.QB", 0x7c000098)
+!D3("SUBUH.QB", 0x7c000058)
+!D3("SUBUH\\_R.QB", 0x7c0000d8)
+!D3("ADDQH.PH", 0x7c000218)
+!D3("ADDQH\\_R.PH", 0x7c000298)
+!D3("ADDQH.W", 0x7c000418)
+!D3("ADDQH\\_R.W", 0x7c000498)
+!D3("SUBQH.PH", 0x7c000258)
+!D3("SUBQH\\_R.PH", 0x7c0002d8)
+!D3("SUBQH.W", 0x7c000458)
+!D3("SUBQH\\_R.W", 0x7c0004d8)
+!D3("MUL.PH", 0x7c000318)
+!D3("MUL\\_S.PH", 0x7c000398)
+!D3("MULQ\\_S.PH", 0x7c000790)
+!D3("MULQ\\_RS.W", 0x7c0005d8)
+!D3("MULQ\\_S.W", 0x7c000598)
+!D3("CMPGDU.EQ.QB", 0x7c000611)
+!D3("CMPGDU.LT.QB", 0x7c000651)
+!D3("CMPGDU.LE.QB", 0x7c000691)
+!D3("PRECR.QB.PH", 0x7c000351)
+/* rd,rt */
+!def D2(nm, base) {
+!Z(nm, "d,t", "", base, "|(t<<16)|(d<<11)")
+}
+!D2("ABSQ\\_S.QB", 0x7c000052)
+!D2("ABSQ\\_S.PH", 0x7c000252)
+!D2("ABSQ\\_S.W", 0x7c000452)
+!D2("PRECEQ.W.PHL", 0x7c000312)
+!D2("PRECEQ.W.PHR", 0x7c000352)
+!D2("PRECEQU.PH.QBL", 0x7c000112)
+!D2("PRECEQU.PH.QBR", 0x7c000152)
+!D2("PRECEQU.PH.QBLA", 0x7c000192)
+!D2("PRECEQU.PH.QBRA", 0x7c0001d2)
+!D2("PRECEU.PH.QBL", 0x7c000712)
+!D2("PRECEU.PH.QBR", 0x7c000752)
+!D2("PRECEU.PH.QBLA", 0x7c000792)
+!D2("PRECEU.PH.QBRA", 0x7c0007d2)
+!D2("REPLV.QB", 0x7c0000d2)
+!D2("REPLV.PH", 0x7c0002d2)
+!D2("BITREV", 0x7c0006d2)
+!Z("RADDU.W.QB", "d,s", "", 0x7c000510, "|(s<<21)|(d<<11)")
+/* shifts: rd,rt,sa (sa in the rs field, 3 4 or 5 bits) and rd,rt,rs */
+!def DSI(nm, base, mx) {
+!Z(nm, "d,t,!v", "v<0||v>" + str(mx) + ";10", base, "|((v&31)<<21)|(t<<16)|(d<<11)")
+}
+!DSI("SHLL.QB", 0x7c000013, 7)
+!DSI("SHRL.QB", 0x7c000053, 7)
+!DSI("SHRA.QB", 0x7c000113, 7)
+!DSI("SHRA\\_R.QB", 0x7c000153, 7)
+!DSI("SHLL.PH", 0x7c000213, 15)
+!DSI("SHLL\\_S.PH", 0x7c000313, 15)
+!DSI("SHRA.PH", 0x7c000253, 15)
+!DSI("SHRA\\_R.PH", 0x7c000353, 15)
+!DSI("SHRL.PH", 0x7c000653, 15)
+!DSI("SHLL\\_S.W", 0x7c000513, 31)
+!DSI("SHRA\\_R.W", 0x7c000553, 31)
+!def DSV(nm, base) {
+!Z(nm, "d,t,s", "", base, RF())
+}
+!DSV("SHLLV.QB", 0x7c000093)
+!DSV("SHRLV.QB", 0x7c0000d3)
+!DSV("SHRAV.QB", 0x7c000193)
+!DSV("SHRAV\\_R.QB", 0x7c0001d3)
+!DSV("SHLLV.PH", 0x7c000293)
+!DSV("SHLLV\\_S.PH", 0x7c000393)
+!DSV("SHRAV.PH", 0x7c0002d3)
+!DSV("SHRAV\\_R.PH", 0x7c0003d3)
+!DSV("SHRLV.PH", 0x7c0006d3)
+!DSV("SHLLV\\_S.W", 0x7c000593)
+!DSV("SHRAV\\_R.W", 0x7c0005d3)
+/* accumulator operations: ac,rs,rt (ac in bits 12-11) */
+!def DA(nm, base) {
+!Z(nm, "ac,s,t", "", base, "|(s<<21)|(t<<16)|(ac<<11)")
+}
+!DA("DPAU.H.QBL", 0x7c0000f0)
+!DA("DPAU.H.QBR", 0x7c0001f0)
+!DA("DPSU.H.QBL", 0x7c0002f0)
+!DA("DPSU.H.QBR", 0x7c0003f0)
+!DA("DPAQ\\_S.W.PH", 0x7c000130)
+!DA("DPSQ\\_S.W.PH", 0x7c000170)
+!DA("MULSAQ\\_S.W.PH", 0x7c0001b0)
+!DA("DPAQ\\_SA.L.W", 0x7c000330)
+!DA("DPSQ\\_SA.L.W", 0x7c000370)
+!DA("MAQ\\_S.W.PHL", 0x7c000530)
+!DA("MAQ\\_S.W.PHR", 0x7c0005b0)
+!DA("MAQ\\_SA.W.PHL", 0x7c000430)
+!DA("MAQ\\_SA.W.PHR", 0x7c0004b0)
+!DA("DPA.W.PH", 0x7c000030)
+!DA("DPS.W.PH", 0x7c000070)
+!DA("MULSA.W.PH", 0x7c0000b0)
+!DA("DPAX.W.PH", 0x7c000230)
+!DA("DPSX.W.PH", 0x7c000270)
+!DA("DPAQX\\_S.W.PH", 0x7c000630)
+!DA("DPAQX\\_SA.W.PH", 0x7c0006b0)
+!DA("DPSQX\\_S.W.PH", 0x7c000670)
+!DA("DPSQX\\_SA.W.PH", 0x7c0006f0)
+/* the base multiplies on an accumulator, and HI / LO of one */
+!DA("MULT", 0x00000018)
+!DA("MULTU", 0x00000019)
+!DA("MADD", 0x70000000)
+!DA("MADDU", 0x70000001)
+!DA("MSUB", 0x70000004)
+!DA("MSUBU", 0x70000005)
+!Z("MFHI", "d,ac", "", 0x10, "|(ac<<21)|(d<<11)")
+!Z("MFLO", "d,ac", "", 0x12, "|(ac<<21)|(d<<11)")
+!Z("MTHI", "s,ac", "", 0x11, "|(s<<21)|(ac<<11)")
+!Z("MTLO", "s,ac", "", 0x13, "|(s<<21)|(ac<<11)")
+/* extract from an accumulator: rt,ac,size and rt,ac,rs */
+!def DX(nm, base) {
+!Z(nm, "t,ac,!v", "v<0||v>31;10", base, "|((v&31)<<21)|(t<<16)|(ac<<11)")
+}
+!DX("EXTR.W", 0x7c000038)
+!DX("EXTR\\_R.W", 0x7c000138)
+!DX("EXTR\\_RS.W", 0x7c0001b8)
+!DX("EXTR\\_S.H", 0x7c0003b8)
+!DX("EXTP", 0x7c0000b8)
+!DX("EXTPDP", 0x7c0002b8)
+!def DXV(nm, base) {
+!Z(nm, "t,ac,s", "", base, "|(s<<21)|(t<<16)|(ac<<11)")
+}
+!DXV("EXTRV.W", 0x7c000078)
+!DXV("EXTRV\\_R.W", 0x7c000178)
+!DXV("EXTRV\\_RS.W", 0x7c0001f8)
+!DXV("EXTRV\\_S.H", 0x7c0003f8)
+!DXV("EXTPV", 0x7c0000f8)
+!DXV("EXTPDPV", 0x7c0002f8)
+!Z("SHILO", "ac,!v", "v<-32||v>31;10", 0x7c0006b8, "|((v&0x3f)<<20)|(ac<<11)")
+!Z("SHILOV", "ac,s", "", 0x7c0006f8, "|(s<<21)|(ac<<11)")
+!Z("MTHLIP", "s,ac", "", 0x7c0007f8, "|(s<<21)|(ac<<11)")
+/* the DSP control register, with a mask of its fields (default 0x1f) */
+!Z("RDDSP", "d", "", 0x7c1f04b8, "|(d<<11)")
+!Z("RDDSP", "d,!v", "v<0||v>1023;10", 0x7c0004b8, "|((v&0x3ff)<<16)|(d<<11)")
+!Z("WRDSP", "s", "", 0x7c00fcf8, "|(s<<21)")
+!Z("WRDSP", "s,!v", "v<0||v>1023;10", 0x7c0004f8, "|(s<<21)|((v&0x3ff)<<11)")
+/* compares that set the condition bits */
+!def DC(nm, base) {
+!Z(nm, "s,t", "", base, "|(s<<21)|(t<<16)")
+}
+!DC("CMPU.EQ.QB", 0x7c000011)
+!DC("CMPU.LT.QB", 0x7c000051)
+!DC("CMPU.LE.QB", 0x7c000091)
+!DC("CMP.EQ.PH", 0x7c000211)
+!DC("CMP.LT.PH", 0x7c000251)
+!DC("CMP.LE.PH", 0x7c000291)
+!Z("REPL.QB", "d,!v", "v<0||v>255;3", 0x7c000092, "|((v&0xff)<<16)|(d<<11)")
+!Z("REPL.PH", "d,!v", "v<-512||v>511;3", 0x7c000292, "|((v&0x3ff)<<16)|(d<<11)")
+/* indexed loads: rd,index(base) */
+!def DLX(nm, base) {
+!Z(nm, "d,t(s)", "", base, RF())
+}
+!DLX("LBUX", 0x7c00018a)
+!DLX("LHX", 0x7c00010a)
+!DLX("LWX", 0x7c00000a)
+!Z("INSV", "t,s", "", 0x7c00000c, "|(s<<21)|(t<<16)")
+/* rt,rs,sa with sa in the rd field */
+!def DSA(nm, base, mx) {
+!Z(nm, "t,s,!v", "v<0||v>" + str(mx) + ";10", base, "|(s<<21)|(t<<16)|((v&31)<<11)")
+}
+!DSA("APPEND", 0x7c000031, 31)
+!DSA("PREPEND", 0x7c000071, 31)
+!DSA("BALIGN", 0x7c000431, 3)
+!DSA("PRECR\\_SRA.PH.W", 0x7c000791, 31)
+!DSA("PRECR\\_SRA\\_R.PH.W", 0x7c0007d1, 31)
+!BR0("BPOSGE32", 0x041c0000)
+
+/* ===================================================================
+/* MSA (SIMD)
+/*
+/* $w0-$w31; df is the element format B H W D, written as the
+/* suffix. An element index is written as $w1[n]; sld and splat take
+/* a general register there, $w1[$t0].
+/* =================================================================== */
+!def MDF(f) {
+!if f == "B" !then {
+!return 0
+}
+!if f == "H" !then {
+!return 1
+}
+!if f == "W" !then {
+!return 2
+}
+!return 3
+}
+/* 3R: wd,ws,wt; op in bits 25-23, df in 22-21 */
+!def M3R(nm, minor, op, dfs) {
+!local i = 0
+!local f = ""
+!while i < len(dfs) {
+!set f = substr(dfs, i, 1)
+!Z(nm + "." + f, "wd,ws,wt", "", 0x78000000 | (op << 23) | (MDF(f) << 21) | minor, "|(wt<<16)|(ws<<11)|(wd<<6)")
+!set i = i + 1
+}
+}
+!M3R("SLL", 0x0d, 0, "BHWD")
+!M3R("SRA", 0x0d, 1, "BHWD")
+!M3R("SRL", 0x0d, 2, "BHWD")
+!M3R("BCLR", 0x0d, 3, "BHWD")
+!M3R("BSET", 0x0d, 4, "BHWD")
+!M3R("BNEG", 0x0d, 5, "BHWD")
+!M3R("BINSL", 0x0d, 6, "BHWD")
+!M3R("BINSR", 0x0d, 7, "BHWD")
+!M3R("ADDV", 0x0e, 0, "BHWD")
+!M3R("SUBV", 0x0e, 1, "BHWD")
+!M3R("MAX\\_S", 0x0e, 2, "BHWD")
+!M3R("MAX\\_U", 0x0e, 3, "BHWD")
+!M3R("MIN\\_S", 0x0e, 4, "BHWD")
+!M3R("MIN\\_U", 0x0e, 5, "BHWD")
+!M3R("MAX\\_A", 0x0e, 6, "BHWD")
+!M3R("MIN\\_A", 0x0e, 7, "BHWD")
+!M3R("CEQ", 0x0f, 0, "BHWD")
+!M3R("CLT\\_S", 0x0f, 2, "BHWD")
+!M3R("CLT\\_U", 0x0f, 3, "BHWD")
+!M3R("CLE\\_S", 0x0f, 4, "BHWD")
+!M3R("CLE\\_U", 0x0f, 5, "BHWD")
+!M3R("ADD\\_A", 0x10, 0, "BHWD")
+!M3R("ADDS\\_A", 0x10, 1, "BHWD")
+!M3R("ADDS\\_S", 0x10, 2, "BHWD")
+!M3R("ADDS\\_U", 0x10, 3, "BHWD")
+!M3R("AVE\\_S", 0x10, 4, "BHWD")
+!M3R("AVE\\_U", 0x10, 5, "BHWD")
+!M3R("AVER\\_S", 0x10, 6, "BHWD")
+!M3R("AVER\\_U", 0x10, 7, "BHWD")
+!M3R("SUBS\\_S", 0x11, 0, "BHWD")
+!M3R("SUBS\\_U", 0x11, 1, "BHWD")
+!M3R("SUBSUS\\_U", 0x11, 2, "BHWD")
+!M3R("SUBSUU\\_S", 0x11, 3, "BHWD")
+!M3R("ASUB\\_S", 0x11, 4, "BHWD")
+!M3R("ASUB\\_U", 0x11, 5, "BHWD")
+!M3R("MULV", 0x12, 0, "BHWD")
+!M3R("MADDV", 0x12, 1, "BHWD")
+!M3R("MSUBV", 0x12, 2, "BHWD")
+!M3R("DIV\\_S", 0x12, 4, "BHWD")
+!M3R("DIV\\_U", 0x12, 5, "BHWD")
+!M3R("MOD\\_S", 0x12, 6, "BHWD")
+!M3R("MOD\\_U", 0x12, 7, "BHWD")
+!M3R("DOTP\\_S", 0x13, 0, "HWD")
+!M3R("DOTP\\_U", 0x13, 1, "HWD")
+!M3R("DPADD\\_S", 0x13, 2, "HWD")
+!M3R("DPADD\\_U", 0x13, 3, "HWD")
+!M3R("DPSUB\\_S", 0x13, 4, "HWD")
+!M3R("DPSUB\\_U", 0x13, 5, "HWD")
+!M3R("PCKEV", 0x14, 2, "BHWD")
+!M3R("PCKOD", 0x14, 3, "BHWD")
+!M3R("ILVL", 0x14, 4, "BHWD")
+!M3R("ILVR", 0x14, 5, "BHWD")
+!M3R("ILVEV", 0x14, 6, "BHWD")
+!M3R("ILVOD", 0x14, 7, "BHWD")
+!M3R("VSHF", 0x15, 0, "BHWD")
+!M3R("SRAR", 0x15, 1, "BHWD")
+!M3R("SRLR", 0x15, 2, "BHWD")
+!M3R("HADD\\_S", 0x15, 4, "HWD")
+!M3R("HADD\\_U", 0x15, 5, "HWD")
+!M3R("HSUB\\_S", 0x15, 6, "HWD")
+!M3R("HSUB\\_U", 0x15, 7, "HWD")
+/* sld / splat: wd,ws[rt] */
+!def M3G(nm, op) {
+!local i = 0
+!local f = ""
+!while i < 4 {
+!set f = substr("BHWD", i, 1)
+!Z(nm + "." + f, "wd,ws[t]", "", 0x78000014 | (op << 23) | (i << 21), "|(t<<16)|(ws<<11)|(wd<<6)")
+!set i = i + 1
+}
+}
+!M3G("SLD", 0)
+!M3G("SPLAT", 1)
+/* 3RF: op in bits 25-22, the format in bit 21 (W D, or H W for the
+/* fixed point and the narrowing ones) */
+!def M3F(nm, minor, op, dfs) {
+!local i = 0
+!while i < 2 {
+!Z(nm + "." + substr(dfs, i, 1), "wd,ws,wt", "", 0x78000000 | (op << 22) | (i << 21) | minor, "|(wt<<16)|(ws<<11)|(wd<<6)")
+!set i = i + 1
+}
+}
+!M3F("FCAF", 0x1a, 0, "WD")
+!M3F("FCUN", 0x1a, 1, "WD")
+!M3F("FCEQ", 0x1a, 2, "WD")
+!M3F("FCUEQ", 0x1a, 3, "WD")
+!M3F("FCLT", 0x1a, 4, "WD")
+!M3F("FCULT", 0x1a, 5, "WD")
+!M3F("FCLE", 0x1a, 6, "WD")
+!M3F("FCULE", 0x1a, 7, "WD")
+!M3F("FSAF", 0x1a, 8, "WD")
+!M3F("FSUN", 0x1a, 9, "WD")
+!M3F("FSEQ", 0x1a, 10, "WD")
+!M3F("FSUEQ", 0x1a, 11, "WD")
+!M3F("FSLT", 0x1a, 12, "WD")
+!M3F("FSULT", 0x1a, 13, "WD")
+!M3F("FSLE", 0x1a, 14, "WD")
+!M3F("FSULE", 0x1a, 15, "WD")
+!M3F("FADD", 0x1b, 0, "WD")
+!M3F("FSUB", 0x1b, 1, "WD")
+!M3F("FMUL", 0x1b, 2, "WD")
+!M3F("FDIV", 0x1b, 3, "WD")
+!M3F("FMADD", 0x1b, 4, "WD")
+!M3F("FMSUB", 0x1b, 5, "WD")
+!M3F("FEXP2", 0x1b, 7, "WD")
+!M3F("FEXDO", 0x1b, 8, "HW")
+!M3F("FTQ", 0x1b, 10, "HW")
+!M3F("FMIN", 0x1b, 12, "WD")
+!M3F("FMIN\\_A", 0x1b, 13, "WD")
+!M3F("FMAX", 0x1b, 14, "WD")
+!M3F("FMAX\\_A", 0x1b, 15, "WD")
+!M3F("FCOR", 0x1c, 1, "WD")
+!M3F("FCUNE", 0x1c, 2, "WD")
+!M3F("FCNE", 0x1c, 3, "WD")
+!M3F("MUL\\_Q", 0x1c, 4, "HW")
+!M3F("MADD\\_Q", 0x1c, 5, "HW")
+!M3F("MSUB\\_Q", 0x1c, 6, "HW")
+!M3F("FSOR", 0x1c, 9, "WD")
+!M3F("FSUNE", 0x1c, 10, "WD")
+!M3F("FSNE", 0x1c, 11, "WD")
+!M3F("MULR\\_Q", 0x1c, 12, "HW")
+!M3F("MADDR\\_Q", 0x1c, 13, "HW")
+!M3F("MSUBR\\_Q", 0x1c, 14, "HW")
+/* 2R: wd,ws (fill: wd,rs) */
+!def M2R(nm, op) {
+!local i = 0
+!while i < 4 {
+!Z(nm + "." + substr("BHWD", i, 1), "wd,ws", "", 0x7b00001e | (op << 18) | (i << 16), "|(ws<<11)|(wd<<6)")
+!set i = i + 1
+}
+}
+!M2R("PCNT", 1)
+!M2R("NLOC", 2)
+!M2R("NLZC", 3)
+!def MFILL(f, i) {
+!Z("FILL." + f, "wd,s", "", 0x7b00001e | (i << 16), "|(s<<11)|(wd<<6)")
+}
+!MFILL("B", 0)
+!MFILL("H", 1)
+!MFILL("W", 2)
+!MFILL("D", 3)
+/* 2RF: wd,ws, W D */
+!def M2F(nm, op) {
+!Z(nm + ".W", "wd,ws", "", 0x7b20001e | (op << 17), "|(ws<<11)|(wd<<6)")
+!Z(nm + ".D", "wd,ws", "", 0x7b21001e | (op << 17), "|(ws<<11)|(wd<<6)")
+}
+!M2F("FCLASS", 0)
+!M2F("FTRUNC\\_S", 1)
+!M2F("FTRUNC\\_U", 2)
+!M2F("FSQRT", 3)
+!M2F("FRSQRT", 4)
+!M2F("FRCP", 5)
+!M2F("FRINT", 6)
+!M2F("FLOG2", 7)
+!M2F("FEXUPL", 8)
+!M2F("FEXUPR", 9)
+!M2F("FFQL", 10)
+!M2F("FFQR", 11)
+!M2F("FTINT\\_S", 12)
+!M2F("FTINT\\_U", 13)
+!M2F("FFINT\\_S", 14)
+!M2F("FFINT\\_U", 15)
+/* I5: wd,ws,imm5, signed (sg = 1) or unsigned */
+!def MI5(nm, minor, op, sg) {
+!local i = 0
+!local er = "v<0||v>31;3"
+!if sg !then {
+!set er = "v<-16||v>15;3"
+}
+!while i < 4 {
+!Z(nm + "." + substr("BHWD", i, 1), "wd,ws,!v", er, 0x78000000 | (op << 23) | (i << 21) | minor, "|((v&31)<<16)|(ws<<11)|(wd<<6)")
+!set i = i + 1
+}
+}
+!MI5("ADDVI", 6, 0, 0)
+!MI5("SUBVI", 6, 1, 0)
+!MI5("MAXI\\_S", 6, 2, 1)
+!MI5("MAXI\\_U", 6, 3, 0)
+!MI5("MINI\\_S", 6, 4, 1)
+!MI5("MINI\\_U", 6, 5, 0)
+!MI5("CEQI", 7, 0, 1)
+!MI5("CLTI\\_S", 7, 2, 1)
+!MI5("CLTI\\_U", 7, 3, 0)
+!MI5("CLEI\\_S", 7, 4, 1)
+!MI5("CLEI\\_U", 7, 5, 0)
+!def MLDI(f, i) {
+!Z("LDI." + f, "wd,!v", "v<-512||v>511;3", 0x7b000007 | (i << 21), "|((v&0x3ff)<<11)|(wd<<6)")
+}
+!MLDI("B", 0)
+!MLDI("H", 1)
+!MLDI("W", 2)
+!MLDI("D", 3)
+/* I8: wd,ws,imm8 */
+!def MI8(nm, base) {
+!Z(nm, "wd,ws,!v", "v<0||v>255;3", base, "|((v&0xff)<<16)|(ws<<11)|(wd<<6)")
+}
+!MI8("ANDI.B", 0x78000000)
+!MI8("ORI.B", 0x79000000)
+!MI8("NORI.B", 0x7a000000)
+!MI8("XORI.B", 0x7b000000)
+!MI8("BMNZI.B", 0x78000001)
+!MI8("BMZI.B", 0x79000001)
+!MI8("BSELI.B", 0x7a000001)
+!MI8("SHF.B", 0x78000002)
+!MI8("SHF.H", 0x79000002)
+!MI8("SHF.W", 0x7a000002)
+/* BIT: wd,ws,m, the bit number m of the element size; the format and
+/* m share bits 22-16 (B 1110mmm, H 110mmmm, W 10mmmmm, D 0mmmmmm) */
+!def MBIT(nm, minor, op) {
+!Z(nm + ".B", "wd,ws,!v", "v<0||v>7;10", 0x78700000 | (op << 23) | minor, "|((v&7)<<16)|(ws<<11)|(wd<<6)")
+!Z(nm + ".H", "wd,ws,!v", "v<0||v>15;10", 0x78600000 | (op << 23) | minor, "|((v&15)<<16)|(ws<<11)|(wd<<6)")
+!Z(nm + ".W", "wd,ws,!v", "v<0||v>31;10", 0x78400000 | (op << 23) | minor, "|((v&31)<<16)|(ws<<11)|(wd<<6)")
+!Z(nm + ".D", "wd,ws,!v", "v<0||v>63;10", 0x78000000 | (op << 23) | minor, "|((v&63)<<16)|(ws<<11)|(wd<<6)")
+}
+!MBIT("SLLI", 9, 0)
+!MBIT("SRAI", 9, 1)
+!MBIT("SRLI", 9, 2)
+!MBIT("BCLRI", 9, 3)
+!MBIT("BSETI", 9, 4)
+!MBIT("BNEGI", 9, 5)
+!MBIT("BINSLI", 9, 6)
+!MBIT("BINSRI", 9, 7)
+!MBIT("SAT\\_S", 10, 0)
+!MBIT("SAT\\_U", 10, 1)
+!MBIT("SRARI", 10, 2)
+!MBIT("SRLRI", 10, 3)
+/* ELM: an element index n; the format and n share bits 21-16
+/* (B 00nnnn, H 100nnn, W 1100nn, D 11100n) */
+!def MDN(i) {
+!if i == 0 !then {
+!return 0
+}
+!if i == 1 !then {
+!return 0x20
+}
+!if i == 2 !then {
+!return 0x30
+}
+!return 0x38
+}
+!def MELM(nm, op, pat, fx, dfs) {
+!local i = 0
+!local f = ""
+!while i < 4 {
+!set f = substr("BHWD", i, 1)
+!if substr(dfs, i, 1) != "-" !then {
+!Z(nm + "." + f, pat, "n<0||n>" + str((16 >> i) - 1) + ";10", 0x78000019 | (op << 22) | (MDN(i) << 16), "|(n<<16)" + fx)
+}
+!set i = i + 1
+}
+}
+!MELM("SLDI", 0, "wd,ws[!n]", "|(ws<<11)|(wd<<6)", "BHWD")
+!MELM("SPLATI", 1, "wd,ws[!n]", "|(ws<<11)|(wd<<6)", "BHWD")
+!MELM("COPY\\_S", 2, "d,ws[!n]", "|(ws<<11)|(d<<6)", "BHWD")
+!MELM("COPY\\_U", 3, "d,ws[!n]", "|(ws<<11)|(d<<6)", "BHW-")
+!MELM("INSERT", 4, "wd[!n],s", "|(s<<11)|(wd<<6)", "BHWD")
+!MELM("INSVE", 5, "wd[!n],ws[0]", "|(ws<<11)|(wd<<6)", "BHWD")
+!Z("MOVE.V", "wd,ws", "", 0x78be0019, "|(ws<<11)|(wd<<6)")
+/* the MSA control registers: $0-$7 or by name */
+!Z("CFCMSA", "d,mc", "", 0x787e0019, "|(mc<<11)|(d<<6)")
+!Z("CTCMSA", "mc,s", "", 0x783e0019, "|(s<<11)|(mc<<6)")
+/* VEC: wd,ws,wt */
+!def MVEC(nm, op) {
+!Z(nm + ".V", "wd,ws,wt", "", 0x7800001e | (op << 21), "|(wt<<16)|(ws<<11)|(wd<<6)")
+}
+!MVEC("AND", 0)
+!MVEC("OR", 1)
+!MVEC("NOR", 2)
+!MVEC("XOR", 3)
+!MVEC("BMNZ", 4)
+!MVEC("BMZ", 5)
+!MVEC("BSEL", 6)
+/* MI10: wd,offset(rs), the offset a multiple of the element size and
+/* stored divided by it */
+!def MLS(nm, minor) {
+!local i = 0
+!local f = ""
+!local sz = 1
+!while i < 4 {
+!set f = substr("BHWD", i, 1)
+!set sz = 1 << i
+!Z(nm + "." + f, "wd,!v(s)", "v<" + str(-512 * sz) + "||v>" + str(511 * sz) + "||(v&" + str(sz - 1) + ")!=0;8", 0x78000000 | minor | i, "|(((v>>" + str(i) + ")&0x3ff)<<16)|(s<<11)|(wd<<6)")
+!Z(nm + "." + f, "wd,(s)", "", 0x78000000 | minor | i, "|(s<<11)|(wd<<6)")
+!set i = i + 1
+}
+}
+!MLS("LD", 0x20)
+!MLS("ST", 0x24)
+/* branches on a vector: wt,target */
+!def MBR(nm, base) {
+.reloc::v::pc16
+!Z(nm, "wt,!v", EBR(), base, "|(wt<<16)" + FBR())
+.clrreloc::v
+}
+!MBR("BZ.V", 0x45600000)
+!MBR("BNZ.V", 0x45e00000)
+!MBR("BZ.B", 0x47000000)
+!MBR("BZ.H", 0x47200000)
+!MBR("BZ.W", 0x47400000)
+!MBR("BZ.D", 0x47600000)
+!MBR("BNZ.B", 0x47800000)
+!MBR("BNZ.H", 0x47a00000)
+!MBR("BNZ.W", 0x47c00000)
+!MBR("BNZ.D", 0x47e00000)
+/* lsa / dlsa rd,rs,rt,sa: rd = (rs << sa) + rt, sa 1-4 */
+!Z("LSA", "d,s,t,!v", "v<1||v>4;10", 0x00000005, RF() + "|(((v-1)&3)<<6)")
+!Z("DLSA", "d,s,t,!v", "v<1||v>4;10", 0x00000015, RF() + "|(((v-1)&3)<<6)")
+
+/* ===================================================================
+/* Release 6 (front files with R6() = 1)
+/*
+/* Release 6 drops what the !if R6() == 0 blocks above hold (branch
+/* likely, HI / LO multiply and divide, lwl / lwr ..., movz / movn,
+/* the FP condition codes and paired single, COP1X, the trap
+/* immediates, jalx, addi / daddi, MIPS-3D, SmartMIPS, MCU), re-encodes
+/* clz / clo / dclz / dclo, ll / sc / lld / scd, cache / pref,
+/* lwc2 / swc2 / ldc2 / sdc2, jr and sdbbp (above, by R6()), and adds
+/* the instructions below.
+/* =================================================================== */
+!if R6() !then {
+/* multiply and divide into a general register: rd,rs,rt or rd,rt
+/* (rd,rd,rt) */
+!def M6(nm, fn) {
+!Z(nm, "d,s,t", "", fn, RF())
+!Z(nm, "d,t", "", fn, "|(d<<21)|(t<<16)|(d<<11)")
+}
+!M6("MUL", 0x98)
+!M6("MUH", 0xd8)
+!M6("MULU", 0x99)
+!M6("MUHU", 0xd9)
+!M6("DIV", 0x9a)
+!M6("MOD", 0xda)
+!M6("DIVU", 0x9b)
+!M6("MODU", 0xdb)
+!M6("DMUL", 0x9c)
+!M6("DMUH", 0xdc)
+!M6("DMULU", 0x9d)
+!M6("DMUHU", 0xdd)
+!M6("DDIV", 0x9e)
+!M6("DMOD", 0xde)
+!M6("DDIVU", 0x9f)
+!M6("DMODU", 0xdf)
+!Z("SELEQZ", "d,s,t", "", 0x35, RF())
+!Z("SELNEZ", "d,s,t", "", 0x37, RF())
+/* align / dalign rd,rs,rt,bp: the byte position bp in bits 8-6 */
+!Z("ALIGN", "d,s,t,!v", "v<0||v>3;10", 0x7c000220, RF() + "|((v&3)<<6)")
+!Z("DALIGN", "d,s,t,!v", "v<0||v>7;10", 0x7c000224, RF() + "|((v&7)<<6)")
+!Z("BITSWAP", "d,t", "", 0x7c000020, "|(t<<16)|(d<<11)")
+!Z("DBITSWAP", "d,t", "", 0x7c000024, "|(t<<16)|(d<<11)")
+/* add an upper immediate: aui rt,rs,imm (lui is aui with rs = $0),
+/* daui (rs not $0), dahi / dati rs,imm (also rs,rs,imm) */
+!Z("AUI", "t,s,!v", EU16(), 0x3c000000, "|(s<<21)|(t<<16)|(v&0xffff)")
+!MODS("AUI", "t,s,", "", 0x3c000000, IFLD())
+!Z("DAUI", "t,s,!v", "s==0;5," + EU16(), 0x74000000, "|(s<<21)|(t<<16)|(v&0xffff)")
+!MODS("DAUI", "t,s,", "", 0x74000000, IFLD())
+!def DAH(nm, base) {
+!Z(nm, "s,!v", EU16(), base, "|(s<<21)|(v&0xffff)")
+!Z(nm, "s,t,!v", "s!=t;5," + EU16(), base, "|(s<<21)|(v&0xffff)")
+}
+!DAH("DAHI", 0x04060000)
+!DAH("DATI", 0x041e0000)
+/* PC-relative: addiupc / lwpc / lwupc rs,target (19 bits, words),
+/* ldpc (18 bits, doublewords from the doubleword of the pc), auipc /
+/* aluipc rs,imm and rs,%pcrel_hi(target) */
+.reloc::v::pc19_s2
+!def PC19(nm, base) {
+!Z(nm, "s,!v", "(v-$$)>1048572||(v-$$)<-1048576||((v-$$)&3)!=0;2", base, "|(s<<21)|(((v-$$)>>2)&0x7ffff)")
+}
+!PC19("ADDIUPC", 0xec000000)
+!PC19("LAPC", 0xec000000)
+!PC19("LWPC", 0xec080000)
+!PC19("LWUPC", 0xec100000)
+.reloc::v::pc18_s3
+!Z("LDPC", "s,!v", "(v-$$+($$&7))>1048568||(v-$$+($$&7))<-1048576||(v&7)!=0;2", 0xec180000, "|(s<<21)|(((v-$$+($$&7))>>3)&0x3ffff)")
+.clrreloc::v
+!Z("AUIPC", "s,!v", EU16(), 0xec1e0000, "|(s<<21)|(v&0xffff)")
+!Z("ALUIPC", "s,!v", EU16(), 0xec1f0000, "|(s<<21)|(v&0xffff)")
+.reloc::v::pchi16
+!Z("AUIPC", "s,%PCREL\\_HI(!v)", "", 0xec1e0000, "|(s<<21)|(((v-$$+0x8000)>>16)&0xffff)")
+!Z("ALUIPC", "s,%PCREL\\_HI(!v)", "", 0xec1f0000, "|(s<<21)|(((v-$$+0x8000)>>16)&0xffff)")
+.clrreloc::v
+
+/* compact branches (no delay slot). The two-register forms take
+/* their registers in the order the encoding needs: beqc / bnec put
+/* the smaller number in rs, bovc / bnvc the larger. */
+!def MINR() {
+!return "((s<t)*s+(s>=t)*t)"
+}
+!def MAXR() {
+!return "((s<t)*t+(s>=t)*s)"
+}
+.reloc::v::pc16
+!def BCE(nm, base) {
+!Z(nm, "s,t,!v", "s==t||s==0||t==0;5," + EBR(), base, "|(" + MINR() + "<<21)|(" + MAXR() + "<<16)" + FBR())
+}
+!BCE("BEQC", 0x20000000)
+!BCE("BNEC", 0x60000000)
+!def BCV(nm, base) {
+!Z(nm, "s,t,!v", EBR(), base, "|(" + MAXR() + "<<21)|(" + MINR() + "<<16)" + FBR())
+}
+!BCV("BOVC", 0x20000000)
+!BCV("BNVC", 0x60000000)
+/* bgec / bltc / bgeuc / bltuc rs,rt; blec / bgtc / bleuc / bgtuc are
+/* the same with the registers exchanged */
+!def BCC2(nm, swnm, base) {
+!Z(nm, "s,t,!v", "s==t||s==0||t==0;5," + EBR(), base, "|(s<<21)|(t<<16)" + FBR())
+!Z(swnm, "t,s,!v", "s==t||s==0||t==0;5," + EBR(), base, "|(s<<21)|(t<<16)" + FBR())
+}
+!BCC2("BGEC", "BLEC", 0x58000000)
+!BCC2("BLTC", "BGTC", 0x5c000000)
+!BCC2("BGEUC", "BLEUC", 0x18000000)
+!BCC2("BLTUC", "BGTUC", 0x1c000000)
+/* against zero: rt alone (rs = 0) or rt twice (rs = rt) */
+!def BCZ(nm, base, twice) {
+!local f = "|(t<<16)"
+!if twice !then {
+!set f = "|(t<<21)|(t<<16)"
+}
+!Z(nm, "t,!v", "t==0;5," + EBR(), base, f + FBR())
+}
+!BCZ("BLEZC", 0x58000000, 0)
+!BCZ("BGEZC", 0x58000000, 1)
+!BCZ("BGTZC", 0x5c000000, 0)
+!BCZ("BLTZC", 0x5c000000, 1)
+!BCZ("BLEZALC", 0x18000000, 0)
+!BCZ("BGEZALC", 0x18000000, 1)
+!BCZ("BGTZALC", 0x1c000000, 0)
+!BCZ("BLTZALC", 0x1c000000, 1)
+!BCZ("BEQZALC", 0x20000000, 0)
+!BCZ("BNEZALC", 0x60000000, 0)
+/* the FP and COP2 branches on a register */
+!Z("BC1EQZ", "ft,!v", EBR(), 0x45200000, "|(ft<<16)" + FBR())
+!Z("BC1NEZ", "ft,!v", EBR(), 0x45a00000, "|(ft<<16)" + FBR())
+!Z("BC2EQZ", "n,!v", EBR(), 0x49200000, "|(n<<16)" + FBR())
+!Z("BC2NEZ", "n,!v", EBR(), 0x49a00000, "|(n<<16)" + FBR())
+!Z("NAL", "", "", 0x04100000, "")
+.clrreloc::v
+/* beqzc / bnezc rs,target: 21 bits */
+.reloc::v::pc21_s2
+!def B21(nm, base) {
+!Z(nm, "s,!v", "s==0;5,(v-$$-4)>4194300||(v-$$-4)<-4194304||((v-$$)&3)!=0;2", base, "|(s<<21)|(((v-$$-4)>>2)&0x1fffff)")
+}
+!B21("BEQZC", 0xd8000000)
+!B21("BNEZC", 0xf8000000)
+/* bc / balc target: 26 bits */
+.reloc::v::pc26_s2
+!def B26(nm, base) {
+!Z(nm, "!v", "(v-$$-4)>134217724||(v-$$-4)<-134217728||((v-$$)&3)!=0;2", base, "|(((v-$$-4)>>2)&0x3ffffff)")
+}
+!B26("BC", 0xc8000000)
+!B26("BALC", 0xe8000000)
+.clrreloc::v
+/* jumps through a register plus an offset */
+!Z("JIC", "t,!v", ES16(), 0xd8000000, "|(t<<16)|(v&0xffff)")
+!Z("JIALC", "t,!v", ES16(), 0xf8000000, "|(t<<16)|(v&0xffff)")
+!Z("JRC", "t", "", 0xd8000000, "|(t<<16)")
+!Z("JALRC", "t", "", 0xf8000000, "|(t<<16)")
+!Z("SIGRIE", "!v", EU16(), 0x04170000, "|(v&0xffff)")
+!Z("SIGRIE", "", "", 0x04170000, "")
+
+/* CRC32: rt,rs,rt (the result replaces rt) */
+!def CRC(nm, k) {
+!Z(nm, "t,s,d", "d!=t;5", 0x7c00000f | (k << 6), "|(s<<21)|(t<<16)")
+}
+!CRC("CRC32B", 0)
+!CRC("CRC32H", 1)
+!CRC("CRC32W", 2)
+!CRC("CRC32D", 3)
+!CRC("CRC32CB", 4)
+!CRC("CRC32CH", 5)
+!CRC("CRC32CW", 6)
+!CRC("CRC32CD", 7)
+/* GINV */
+!Z("GINVI", "s", "", 0x7c00003d, "|(s<<21)")
+!Z("GINVT", "s,!v", "v<0||v>3;10", 0x7c0000bd, "|(s<<21)|((v&3)<<8)")
+/* virtual processors */
+!MT0("DVP", 0x41600024)
+!MT0("EVP", 0x41600004)
+/* paired load linked / store conditional: rt,rd,(base) */
+!def LLP(nm, base) {
+!Z(nm, "t,d,(s)", "", base, RF())
+!Z(nm, "t,d,s", "", base, RF())
+}
+!LLP("LLWP", 0x7c000076)
+!LLP("LLDP", 0x7c000077)
+!LLP("SCWP", 0x7c000066)
+!LLP("SCDP", 0x7c000067)
+!LLP("LLWPE", 0x7c00006e)
+!LLP("SCWPE", 0x7c00005e)
+
+/* floating point */
+!FSD2("CLASS", 0x1b)
+!FSD2("RINT", 0x1a)
+!FSD3("SEL", 0x10)
+!FSD3("SELEQZ", 0x14)
+!FSD3("SELNEZ", 0x17)
+!FSD3("MADDF", 0x18)
+!FSD3("MSUBF", 0x19)
+!FSD3("MIN", 0x1c)
+!FSD3("MINA", 0x1d)
+!FSD3("MAX", 0x1e)
+!FSD3("MAXA", 0x1f)
+/* cmp.<cond>.<fmt> fd,fs,ft: fmt field W (20) for S and L (21) for D */
+!def CMP6(cn, i) {
+!Z("CMP." + cn + ".S", "fd,fs,ft", "", 0x46800000 | i, "|(ft<<16)|(fs<<11)|(fd<<6)")
+!Z("CMP." + cn + ".D", "fd,fs,ft", "", 0x46a00000 | i, "|(ft<<16)|(fs<<11)|(fd<<6)")
+}
+!CMP6("AF", 0)
+!CMP6("UN", 1)
+!CMP6("EQ", 2)
+!CMP6("UEQ", 3)
+!CMP6("LT", 4)
+!CMP6("ULT", 5)
+!CMP6("LE", 6)
+!CMP6("ULE", 7)
+!CMP6("SAF", 8)
+!CMP6("SUN", 9)
+!CMP6("SEQ", 10)
+!CMP6("SUEQ", 11)
+!CMP6("SLT", 12)
+!CMP6("SULT", 13)
+!CMP6("SLE", 14)
+!CMP6("SULE", 15)
+!CMP6("OR", 17)
+!CMP6("UNE", 18)
+!CMP6("NE", 19)
+!CMP6("SOR", 25)
+!CMP6("SUNE", 26)
+!CMP6("SNE", 27)
+}
 
 /* ===================================================================
 /* Data

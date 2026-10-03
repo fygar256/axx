@@ -58,6 +58,24 @@ caxx $P/mips.axx $S/mips.s -o b126
 caxx $P/mipsel.axx $S/mips.s -o b127
 caxx $P/mips64.axx $S/mips.s -o b128
 caxx $P/mips64el.axx $S/mips.s -o b129
+# 拡張（DSP・MSA・MT・VZ・EVA ほか）を mips_ase.s で、Release 6 を R6 の前置き
+# ファイル 4 種と mipsr6.s で組む。
+caxx $P/mips.axx $S/mips_ase.s -b b130
+caxx $P/mipsel.axx $S/mips_ase.s -b b131
+caxx $P/mips64.axx $S/mips_ase.s -b b132
+caxx $P/mips64el.axx $S/mips_ase.s -b b133
+caxx $P/mips.axx $S/mips_ase.s -o b134
+caxx $P/mipsel.axx $S/mips_ase.s -o b135
+caxx $P/mips64.axx $S/mips_ase.s -o b136
+caxx $P/mips64el.axx $S/mips_ase.s -o b137
+caxx $P/mipsr6.axx $S/mipsr6.s -b b138
+caxx $P/mipsr6el.axx $S/mipsr6.s -b b139
+caxx $P/mips64r6.axx $S/mipsr6.s -b b140
+caxx $P/mips64r6el.axx $S/mipsr6.s -b b141
+caxx $P/mipsr6.axx $S/mipsr6.s -o b142
+caxx $P/mipsr6el.axx $S/mipsr6.s -o b143
+caxx $P/mips64r6.axx $S/mipsr6.s -o b144
+caxx $P/mips64r6el.axx $S/mipsr6.s -o b145
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -199,6 +217,22 @@ paxx $P/mips.axx $S/mips.s -o a126
 paxx $P/mipsel.axx $S/mips.s -o a127
 paxx $P/mips64.axx $S/mips.s -o a128
 paxx $P/mips64el.axx $S/mips.s -o a129
+paxx $P/mips.axx $S/mips_ase.s -b a130
+paxx $P/mipsel.axx $S/mips_ase.s -b a131
+paxx $P/mips64.axx $S/mips_ase.s -b a132
+paxx $P/mips64el.axx $S/mips_ase.s -b a133
+paxx $P/mips.axx $S/mips_ase.s -o a134
+paxx $P/mipsel.axx $S/mips_ase.s -o a135
+paxx $P/mips64.axx $S/mips_ase.s -o a136
+paxx $P/mips64el.axx $S/mips_ase.s -o a137
+paxx $P/mipsr6.axx $S/mipsr6.s -b a138
+paxx $P/mipsr6el.axx $S/mipsr6.s -b a139
+paxx $P/mips64r6.axx $S/mipsr6.s -b a140
+paxx $P/mips64r6el.axx $S/mipsr6.s -b a141
+paxx $P/mipsr6.axx $S/mipsr6.s -o a142
+paxx $P/mipsr6el.axx $S/mipsr6.s -o a143
+paxx $P/mips64r6.axx $S/mipsr6.s -o a144
+paxx $P/mips64r6el.axx $S/mipsr6.s -o a145
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -288,7 +322,7 @@ paxx $P/aarch64.axx $S/aarch64.s -V -b a110 > a110t
 FAIL=0
 
 N=0
-while [ $N -le 129 ]; do
+while [ $N -le 145 ]; do
     cmp a$N b$N || FAIL=1
     N=$((N+1))
 done

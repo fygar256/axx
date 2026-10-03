@@ -298,23 +298,45 @@ hello_ppc64.s                       hello world for big-endian PowerPC64 Linux
                                     (ELFv1 function descriptor in .opd).
                                     caxx ppc64.axx hello_ppc64.s -o hello.o
 mips.axx                            pattern file for MIPS, big-endian, o32
-                                    (ELF32 REL): sets the byte order and the
-                                    ABI, then includes mips_isa.axx
+                                    (ELF32 REL), up to Release 5: sets the byte
+                                    order, the ABI and the release, then
+                                    includes mips_isa.axx
 mipsel.axx                          the same for little-endian MIPS, o32
 mips64.axx                          the same for big-endian MIPS64, n64 (ELF64
                                     RELA)
 mips64el.axx                        the same for little-endian MIPS64, n64
-mips_isa.axx                        the MIPS instruction set (MIPS64 Release 5
-                                    and every earlier level: integer,
-                                    privileged, FPU with paired single, COP1X,
-                                    COP2, the GNU pseudo-instructions and the
-                                    %hi / %lo / %got ... relocation modifiers)
-                                    shared by the four files above; not passed
-                                    to axx directly
+mipsr6.axx                          the same for MIPS32 Release 6, big-endian,
+                                    o32
+mipsr6el.axx                        the same for MIPS32 Release 6,
+                                    little-endian, o32
+mips64r6.axx                        the same for MIPS64 Release 6, big-endian,
+                                    n64
+mips64r6el.axx                      the same for MIPS64 Release 6,
+                                    little-endian, n64
+mips_isa.axx                        the MIPS instruction set (MIPS I to MIPS64
+                                    Release 6: integer, privileged, FPU with
+                                    paired single, COP1X, COP2, the extensions
+                                    DSP, MSA, MT, VZ, EVA, MIPS-3D, SmartMIPS,
+                                    MCU, XPA, CRC and GINV, the GNU
+                                    pseudo-instructions and the %hi / %lo /
+                                    %got / %pcrel ... relocation modifiers)
+                                    shared by the eight files above; not
+                                    passed to axx directly
 mips.s                              test assemble file for mips.axx / mipsel.axx
                                     / mips64.axx / mips64el.axx: every row of
-                                    mips_isa.axx, checked against GNU as 2.42
-                                    byte-for-byte (n64)
+                                    the base set of mips_isa.axx, checked
+                                    against GNU as 2.42 byte-for-byte (n64)
+mips_ase.s                          test assemble file for the same four files:
+                                    every row of the extensions (DSP, MSA, MT,
+                                    VZ, EVA, MIPS-3D, SmartMIPS, MCU, MIPS I
+                                    COP3), checked against llvm-mc 19
+                                    byte-for-byte where llvm-mc has the row
+mipsr6.s                            test assemble file for mipsr6.axx /
+                                    mipsr6el.axx / mips64r6.axx /
+                                    mips64r6el.axx: the re-encoded and the new
+                                    instructions of Release 6, checked against
+                                    llvm-mc 19 byte-for-byte (relocations
+                                    included)
 z80.axx                             pattern file for Z80
 z80.s                               test assemble file for Z80
 vliw.axx                            test pattern file for vliw
