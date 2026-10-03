@@ -1,33 +1,27 @@
 ; Brainfuck interpreter
-; Linux / MIPS32 o32 (big- or little-endian)
-; axx syntax
+; MIPS32 o32 / FreeBSD (qemu-mips bsd-user, or FreeBSD/mips)
+; axx syntax; the FreeBSD version of bf_mips.s (which is for Linux)
 ;
-; Port of bf_ppc64.s.
-;
-; build, via a linker:
-;   axx mips.axx bf_mips.s -o bf.o          ; big-endian    (qemu-mips)
-;   axx mipsel.axx bf_mips.s -o bf.o        ; little-endian (qemu-mipsel)
+; build:
+;   axx --osabi freebsd mips.axx bf_mips_freebsd.s -o bf.o      ; big-endian
+;   axx --osabi freebsd mipsel.axx bf_mips_freebsd.s -o bf.o    ; little-endian
 ;   ld.lld -static -o bf bf.o
+; ld.lld copies the OS/ABI of the object, so the executable is branded
+; FreeBSD. With a linker that writes "System V", brand it by hand:
+;   elfedit --output-osabi FreeBSD bf
 ;
 ; run:
-;   ./bf program.bf
-;   qemu-mips-static ./bf program.bf        ; on a non-MIPS host
+;   qemu-mips-static ./bf program.bf        ; qemu-mipsel-static for -EL
 ;
-; The source does not depend on the byte order: it touches memory only
-; with byte loads and stores, and with the word loads of argc / argv.
-;
-; MIPS o32 Linux syscall ABI:
-;   v0     = syscall number (4000 + the o32 number)
-;   a0-a3  = arguments
-;   syscall
-;   v0     = result.  An error is flagged by a3 != 0, not by a negative v0,
-;            so every call site tests a3, as the PowerPC version tests
-;            CR0.SO.
-;
-; At process entry the stack holds argc and argv:
-;   0($sp) = argc,  4($sp) = argv[0],  8($sp) = argv[1] ...
-; Unlike PowerPC, nothing is handed over in registers.  No stack frame is
-; set up because nothing in this program calls anything.
+; What differs from the Linux file:
+;   - the numbers are FreeBSD's: exit 1, read 3, write 4, close 6,
+;     openat 499 (the Linux o32 numbers are 4000 higher);
+;   - open is done with openat(AT_FDCWD, ...);
+;   - at process entry a0 points at argc, argv[0], argv[1] ... (sp is the
+;     same place, rounded down for alignment); the code reads them
+;     through a0.
+; The rest is the same: the number goes in v0, the arguments in a0-a3,
+; and a failed syscall sets a3 != 0 and returns the errno in v0.
 ;
 ; The kernel preserves s0-s7 across syscall, so all interpreter state lives
 ; there and survives every syscall:
@@ -36,17 +30,12 @@
 ;   s5 = current byte   s6 = scratch pointer    s7 = loop nesting depth
 ; t0 / t1 are only used between syscalls.
 ;
-; MIPS has delayed branches: the instruction after a branch or a jump is
-; executed before the branch takes effect.  axx (like GNU as under
-; .set noreorder) puts nothing there on its own, so every delay slot is
-; written out: a nop, or an instruction that is harmless on both paths.
-; In the dispatch below, the slot loads the next character to compare,
-; which does no harm if the branch is taken.
+; Every delay slot is written out (axx, like GNU as under .set noreorder,
+; puts nothing there on its own): a nop, or an instruction that is harmless
+; on both paths.
 ;
-; Addresses are formed with lui/addiu (%hi and %lo), which is absolute, not
-; position independent: under -o the linker resolves R_MIPS_HI16 and
-; R_MIPS_LO16, and the image must run at the address it was linked for,
-; as in the PowerPC version.
+; Addresses are formed with lui/addiu (%hi and %lo), so the image must run
+; at the address it was linked for.
 
     .set noreorder
     .set noat
@@ -54,11 +43,12 @@
 TAPE_SIZE:  .equ 65536
 PROG_SIZE:  .equ 1048576
 
-SYS_exit:   .equ 4001
-SYS_read:   .equ 4003
-SYS_write:  .equ 4004
-SYS_open:   .equ 4005
-SYS_close:  .equ 4006
+SYS_exit:   .equ 1
+SYS_read:   .equ 3
+SYS_write:  .equ 4
+SYS_close:  .equ 6
+SYS_openat: .equ 499
+AT_FDCWD:   .equ -100
 
 ; __start is the default entry of ld.lld (and GNU ld) on MIPS; _start is
 ; kept for -e _start.
@@ -68,8 +58,8 @@ SYS_close:  .equ 4006
 
 __start:
 _start:
-    lw $t0,0($sp)                 ; argc
-    addiu $s0,$sp,4               ; argv
+    lw $t0,0($a0)                 ; argc
+    addiu $s0,$a0,4               ; argv
     slti $t1,$t0,2
     beqz $t1,_open_file
     nop
@@ -85,11 +75,12 @@ _start:
     nop
 
 _open_file:
-    ; open(argv[1], O_RDONLY, 0)
-    lw $a0,4($s0)                 ; argv[1]
-    li $v0,SYS_open
-    li $a1,0                      ; O_RDONLY
-    li $a2,0                      ; mode
+    ; openat(AT_FDCWD, argv[1], O_RDONLY, 0)
+    lw $a1,4($s0)                 ; argv[1]
+    li $v0,SYS_openat
+    li $a0,AT_FDCWD
+    li $a2,0                      ; O_RDONLY
+    li $a3,0                      ; mode
     syscall
     bnez $a3,_exit_error
     nop
