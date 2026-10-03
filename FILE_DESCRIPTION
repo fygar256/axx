@@ -258,6 +258,14 @@ bf_aarch64.s                        brainfuck interpreter written in AArch64
                                     aarch64.axx, into an ELF object with -o or a
                                     flat image with -b
 bf_aarch64                          the AArch64 executable built from bf_aarch64.s
+bf_mips.s                           brainfuck interpreter for Linux / MIPS32 o32,
+                                    ported from bf_ppc64.s. the same source
+                                    assembles with mips.axx (big-endian) and
+                                    mipsel.axx (little-endian); link with
+                                    ld.lld -static -e _start, run with
+                                    qemu-mips-static / qemu-mipsel-static
+bf_mips                             the big-endian MIPS executable built from
+                                    bf_mips.s
 format_of_exp_imp_file              format description for export/import file
 hello.s                             assembly file of x86_64 hello world. use x86_64.axx
 hello.tsv                           export file of x86_64 hello world
