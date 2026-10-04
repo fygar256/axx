@@ -4039,7 +4039,7 @@ x86_64 パターンファイルは
 渡しません。`itanium.axx` も `vliw.s` を使い、
 `aarch64_logical_mini.axx` は `aarch64_logical_mini_demo.s` と対になります。
 
-`test1` は 48 組を両方の実装で実行し、`-b` の生バイナリを比較します。
+`test1` は 49 組を両方の実装で実行し、`-b` の生バイナリを比較します。
 `.textmode` を使う 3 組（`textmode.axx` / `8080toz80.axx` / `intel2att.axx`）については、`-V` で
 標準出力へ流した翻訳テキストどうしも比較します。`elftype.axx` / `elftype.s` と
 `elfgen.axx` / `elfgen.s`、型の優先順位を見る `elfprio.axx` / `elfprio.s`、
@@ -4061,7 +4061,7 @@ MIPS の 12 組（`mips.axx`・`mipsel.axx`・`mips64.axx`・`mips64el.axx` と 
 `-b` だけでは一度も比較されない経路を通すために、`-o`（ELF64）、`-m 3 -f 32 -o`
 （ELF32）、`-g -o`（DWARF 付き）、`-v`（リスティング）、`-V`（テキスト出力）
 でも走らせて突き合わせます。`elfcfi` は ELF32（`-m 3 -f 32`、REL）でも比較します。
-比較は全部で 179 組です。
+比較は全部で 180 組です。
 
 `-g` を比較するときは、両実装を必ず同じディレクトリで走らせてください。DWARF は
 `DW_AT_comp_dir` にカレントディレクトリを埋めるので、別の場所で走らせると中身が
@@ -4092,7 +4092,7 @@ MIPS の 12 組（`mips.axx`・`mipsel.axx`・`mips64.axx`・`mips64el.axx` と 
 | `format_of_exp_imp_file` | エクスポート/インポートファイル形式 |
 | `axx.1.gz` | man ページ |
 
-`test1` は同梱の 48 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
+`test1` は同梱の 49 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
 
 ### C.2 外部
 

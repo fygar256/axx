@@ -4310,7 +4310,7 @@ re-encoded and the new instructions of Release 6, checked against llvm-mc 19
 down to the relocations). `mips_isa.axx` is included by those eight and is never
 passed to axx itself.
 
-`test1` runs all forty-eight pairs through both implementations and
+`test1` runs all forty-nine pairs through both implementations and
 compares the `-b` raw binaries. For the three pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx` and `intel2att.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
@@ -4336,7 +4336,7 @@ The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for a hundred and seventy-nine comparisons in all.
+never compares, for a hundred and eighty comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -4367,7 +4367,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all forty-eight bundled pattern/source pairs with both
+`test1` assembles all forty-nine bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 three `.textmode` pairs and the `.echo` lines of the `echo.axx` pair.
 
