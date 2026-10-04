@@ -253,6 +253,13 @@ a64rt_axx_freebsd.s                 the same runtime for FreeBSD/amd64; also
                                     (link with -e __a64_start)
 a64ext.s                            one-line .extern declaration of the runtime
                                     names, put in front of the translated text
+bf_x64_freebsd.sh                   build script: translates bf_aarch64.s with
+                                    a64tox64_axx.axx and links a FreeBSD/amd64
+                                    executable, build_bf_freebsd/bf (manual 3.18)
+bf_x64_linux.sh                     the same for Linux/x86_64, build_bf_linux/bf;
+                                    on FreeBSD it re-brands the result with
+                                    brandelf -t Linux so it runs under the
+                                    Linuxulator (manual 3.18)
 8080toz80.axx                       pattern file that translates Intel 8080 source
                                     into Zilog Z80 source text: .textmode, `!L`
                                     captures and `{{.exp()}}`, so labels and

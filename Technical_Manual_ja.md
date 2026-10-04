@@ -2903,6 +2903,13 @@ ld -static -e __a64_start bf.o a64rt.o -o bf
 Linux では `a64rt_axx.s` を `--osabi Linux` で組み、`-e _start` でリンクします。
 `a64ext.s` はランタイムの名前を `.extern` で宣言する 1 行で、翻訳結果の先頭に付けます。
 
+この手順は同梱のスクリプト `bf_x64_freebsd.sh` と `bf_x64_linux.sh` にまとめてあり、
+`build_bf_freebsd/bf` または `build_bf_linux/bf` を作ります。引数に `.bf` ファイルを
+渡すと、作ったあとでそれを走らせます。`AXX=paxx` で Python 版を使えます。
+Linux 版は FreeBSD の Linuxulator（`linux64.ko`）でも動きます。FreeBSD の `ld` は
+出力に FreeBSD のブランドを付けるので、FreeBSD 上で実行した `bf_x64_linux.sh` は
+リンクの後で `brandelf -t Linux` を付け直します。
+
 ```
         ldr x19, [sp]               ->  mov rbx, [rsp]
         cmp x19, #2                 ->  cmp rbx, 2

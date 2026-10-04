@@ -3118,6 +3118,14 @@ On Linux, build `a64rt_axx.s` with `--osabi Linux` and link with `-e _start`.
 `a64ext.s` is one line that declares the runtime's names with `.extern`; it goes
 in front of the translated text.
 
+The bundled scripts `bf_x64_freebsd.sh` and `bf_x64_linux.sh` run these steps
+and build `build_bf_freebsd/bf` or `build_bf_linux/bf`. Given a `.bf` file as an
+argument, they run it afterwards. `AXX=paxx` makes them use the Python
+implementation. The Linux build also runs under FreeBSD's Linuxulator
+(`linux64.ko`). FreeBSD's `ld` brands its output as FreeBSD, so when
+`bf_x64_linux.sh` runs on FreeBSD it re-brands the result with
+`brandelf -t Linux` after linking.
+
 ```
         ldr x19, [sp]               ->  mov rbx, [rsp]
         cmp x19, #2                 ->  cmp rbx, 2
