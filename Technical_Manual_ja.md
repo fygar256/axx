@@ -43,12 +43,12 @@ axx patfile/8080toz80.axx asmsrc/hello8080.s -V > out.s  # 翻訳したテキス
 
 この 2 つは同じ入力に対して**バイト単位で同一の出力**を生成することを意図しています。
 同梱のパターンファイル、テストソース、`test1` スクリプトはまさにそれを検証するために
-存在します。`test1` は同梱の 49 組のパターン/ソースの対を両方の実装でアセンブルし、
-結果を `cmp` します。さらに `.textmode` の 3 組については、`-V` で標準出力へ流した
+存在します。`test1` は同梱の 50 組のパターン/ソースの対を両方の実装でアセンブルし、
+結果を `cmp` します。さらに `.textmode` の 4 組については、`-V` で標準出力へ流した
 翻訳テキストどうしも、`echo.axx` の組については標準エラーへ出た `.echo` の行どうしも
 `cmp` します。中核の 16 組は `-o`・`-m 3 -f 32 -o`・`-g -o`・`-v`・`-V` でも
 走らせるので、ELF32/ELF64 のオブジェクト、DWARF、リスティング、テキスト出力の
-経路も比較されます（全 180 組）。
+経路も比較されます（全 182 組）。
 
 **目次**
 
@@ -2885,6 +2885,65 @@ caxx intel2att.axx intel2att.s -V | as --64 -o att.o -
 `.textmode` の素通しでそのまま出るので、翻訳できたところとできなかったところが
 出力を見れば分かります。
 
+#### 例: AArch64 から x86_64 へ — bf インタプリタの移植
+
+同梱の `a64tox64_axx.axx` は、AArch64 のアセンブリを x86_64 のアセンブリへ翻訳します。
+出力は axx の `x86_64.axx` でそのままアセンブルできる記法なので、翻訳からリンクまで
+axx だけで閉じます。実例として、AArch64 で書いた Brainfuck インタプリタ
+`bf_aarch64.s` を x86_64 の実行ファイルにできます。
+
+```sh
+caxx a64tox64_axx.axx bf_aarch64.s -V | cat a64ext.s - > bf_x64.s
+caxx x86_64.axx bf_x64.s --osabi FreeBSD -o bf.o
+caxx x86_64.axx a64rt_axx_freebsd.s --osabi FreeBSD -o a64rt.o
+ld -static -e __a64_start bf.o a64rt.o -o bf
+./bf mandelbrot.bf
+```
+
+Linux では `a64rt_axx.s` を `--osabi Linux` で組み、`-e _start` でリンクします。
+`a64ext.s` はランタイムの名前を `.extern` で宣言する 1 行で、翻訳結果の先頭に付けます。
+
+```
+        ldr x19, [sp]               ->  mov rbx, [rsp]
+        cmp x19, #2                 ->  cmp rbx, 2
+        b.ge open                   ->  jge open
+        adrp x1, usage              ->  lea rsi, [RIP+usage]
+        add  x1, x1, :lo12:usage    ->  ; :lo12:usage (adrp で計算済み)
+        ldrb w9, [x20, x21]         ->  movzx r10, [r12+r13*1]
+                                        mov [RIP+__a64_x9], r10
+        cbz  w9, done               ->  mov r11, [RIP+__a64_x9]
+                                        test r11d, r11d
+                                        jz done
+        svc  #0                     ->  call __a64_svc
+        bl   putc                   ->  call putc
+                                        mov rdi, rax
+        ret                         ->  mov rax, rdi
+                                        ret
+```
+
+やっていることは 4 つです。
+
+- **レジスタの対応。** 引数の `x0`〜`x5` を SysV と同じ順の `rdi` `rsi` `rdx` `rcx`
+  `r8` `r9` に、`x8` を `rax` に、callee-saved の `x19`〜`x23` を `rbx` `r12`〜`r15`
+  に置きます。x86 に入りきらない `x6` `x7` `x9`〜`x18` `x24`〜`x28` はランタイムの
+  8 バイトの置き場所（`__a64_x9` など）に置き、`r10` `r11` を作業用に使います。
+- **呼び出し規約のつなぎ。** `ret` は戻り値を `rdi`（x0）から `rax` へ、`bl` は
+  `rax` から `rdi` へ移します。`stp x29, x30, [sp, #-N]!` のようなフレームの
+  出入りも対応づけます。
+- **システムコール。** `svc #0` はランタイムの `__a64_svc` を呼びます。AArch64 Linux
+  の番号を表で引き直して `syscall` し、FreeBSD 版はキャリーフラグ方式のエラーを
+  Linux の負の戻り値に直します。
+- **プロセスの入口。** 翻訳元は入口で `[sp]` を argc として読みます。FreeBSD/amd64
+  のカーネルは argc の場所を `rdi` で渡し、`rsp` を 16 バイト境界合わせのために
+  8 バイトずらすので、FreeBSD 版ランタイムの `__a64_start` が `rsp` を `rdi` に
+  合わせてから `_start` へ飛びます。
+
+152 行の記述が、マクロ層（[7 節](#7-マクロ層)）で展開後 1,903 行のパターンになります。
+レジスタ名の集合と `!Y`（[3.6.3 節](#363-シンボル捕捉子-y)）でどのレジスタかの番号を
+捕らえ、同じ番号で x86 側の綴りを引く書き方は `intel2att.axx` と同じです。
+翻訳した bf は `mandelbrot.bf` を走らせ、C で書いた参照用インタプリタと同じ出力
+（48 行、6,240 バイト）を出すことを FreeBSD/amd64 で確かめてあります。
+
 ### 3.19 `.unordered` — ディレクティブも順序に依存させない
 
 ```
@@ -4018,6 +4077,7 @@ x86_64 パターンファイルは
 | **riscv64full.axx** | 75 KB | 2,186（展開後 4,137） | **riscv64full.s**、**riscv64full_reloc.s** | RISC-V RV64 の全体: I、M、A（Zabha・Zacas・Zawrs を含む）、F、D、Q、Zfh、Zfa、C（Zca・Zcd・Zcb・Zcmp・Zcmt・Zcmop）、Zba / Zbb / Zbc / Zbs、Zbkb / Zbkc / Zbkx、Zknd / Zkne / Zknh / Zksed / Zksh、Zicond、Zicbom / Zicboz / Zicbop、Zihintntl、Zimop、Zicfiss / Zicfilp、CSR 名つきの Zicsr、特権命令と H 拡張、V 1.0（Zvbb・Zvbc・Zvkg・Zvkned・Zvknh・Zvksed・Zvksh と bf16 の部分を含む）。GNU の疑似命令（任意の 64 ビット定数の `li`、`call`、`tail`、`la`、グローバルのロード／ストアなど）と、丸めモードや `v0.t` マスクの省略可能な指定にも対応します。`riscv64.axx` の上位版で、命令が持つ RISC-V psABI のリロケーションを宣言します。llvm-mc 18 とバイト単位で照合し、`-o` のリロケーションとリンク後のイメージも LLVM のものと照合しました。LLVM 18 に無い部分（Q、Zabha、`vwsll`、`mnret`、`c.ntl.*`、`c.sspush`）は仕様書から起こしています。`riscv64full.s` は各行の実行例、`riscv64full_reloc.s` は `-o` 用 |
 | **endsub.axx** | 1.2 KB | 20 | **endsub.s** | `.sub` ブロックを `.endsub` で閉じる（3.7.2 節）。テスト専用 |
 | **intel2att.axx** | 12 KB | 60（展開後 3,437） | **intel2att.s** | x86-64 Intel 記法 → AT&T 記法 のソース翻訳器。`.textmode`・`!Y`・`!L`・マクロ層でのパターン生成（3.18 節）。翻訳結果は GNU as に通る |
+| **a64tox64_axx.axx** | 32 KB | 152（展開後 1,903） | **bf_aarch64.s** | AArch64 → x86_64 のソース翻訳器。出力は `x86_64.axx` でアセンブルできる記法。ランタイム `a64rt_axx.s`（Linux）・`a64rt_axx_freebsd.s`（FreeBSD）と宣言 `a64ext.s` を使う（3.18 節） |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) のスケッチ。未完成 |
 | **vliw.axx** | 192 B | 10 | **vliw.s** | 非 EPIC VLIW。テスト専用 |
 | **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck 仮想 CPU。hello-world デモ。同梱だが `test1` の対象外 |
@@ -4039,8 +4099,8 @@ x86_64 パターンファイルは
 渡しません。`itanium.axx` も `vliw.s` を使い、
 `aarch64_logical_mini.axx` は `aarch64_logical_mini_demo.s` と対になります。
 
-`test1` は 49 組を両方の実装で実行し、`-b` の生バイナリを比較します。
-`.textmode` を使う 3 組（`textmode.axx` / `8080toz80.axx` / `intel2att.axx`）については、`-V` で
+`test1` は 50 組を両方の実装で実行し、`-b` の生バイナリを比較します。
+`.textmode` を使う 4 組（`textmode.axx` / `8080toz80.axx` / `intel2att.axx` / `a64tox64_axx.axx`）については、`-V` で
 標準出力へ流した翻訳テキストどうしも比較します。`elftype.axx` / `elftype.s` と
 `elfgen.axx` / `elfgen.s`、型の優先順位を見る `elfprio.axx` / `elfprio.s`、
 セクションヘッダを見る `elfsec.axx` / `elfsec.s`、シンボル表の属性を見る
@@ -4061,7 +4121,7 @@ MIPS の 12 組（`mips.axx`・`mipsel.axx`・`mips64.axx`・`mips64el.axx` と 
 `-b` だけでは一度も比較されない経路を通すために、`-o`（ELF64）、`-m 3 -f 32 -o`
 （ELF32）、`-g -o`（DWARF 付き）、`-v`（リスティング）、`-V`（テキスト出力）
 でも走らせて突き合わせます。`elfcfi` は ELF32（`-m 3 -f 32`、REL）でも比較します。
-比較は全部で 180 組です。
+比較は全部で 182 組です。
 
 `-g` を比較するときは、両実装を必ず同じディレクトリで走らせてください。DWARF は
 `DW_AT_comp_dir` にカレントディレクトリを埋めるので、別の場所で走らせると中身が
@@ -4092,7 +4152,7 @@ MIPS の 12 組（`mips.axx`・`mipsel.axx`・`mips64.axx`・`mips64el.axx` と 
 | `format_of_exp_imp_file` | エクスポート/インポートファイル形式 |
 | `axx.1.gz` | man ページ |
 
-`test1` は同梱の 49 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
+`test1` は同梱の 50 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
 
 ### C.2 外部
 

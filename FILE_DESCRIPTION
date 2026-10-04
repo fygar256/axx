@@ -239,6 +239,20 @@ intel2att.s                         test assemble file for intel2att.axx. the
                                     translated text is valid AT&T assembly:
                                     `caxx intel2att.axx intel2att.s -V |
                                     as --64 -o att.o -`
+a64tox64_axx.axx                    pattern file that translates AArch64 assembly
+                                    into x86_64 assembly in the notation of
+                                    x86_64.axx: register mapping, calling-
+                                    convention glue and syscall remapping via a
+                                    small runtime. ported bf_aarch64.s runs
+                                    mandelbrot.bf (manual 3.18)
+a64rt_axx.s                         runtime for a64tox64_axx.axx output on Linux:
+                                    slots for the AArch64 registers x86 has no
+                                    room for, and __a64_svc (syscall remapping)
+a64rt_axx_freebsd.s                 the same runtime for FreeBSD/amd64; also
+                                    __a64_start, the entry that sets rsp to argc
+                                    (link with -e __a64_start)
+a64ext.s                            one-line .extern declaration of the runtime
+                                    names, put in front of the translated text
 8080toz80.axx                       pattern file that translates Intel 8080 source
                                     into Zilog Z80 source text: .textmode, `!L`
                                     captures and `{{.exp()}}`, so labels and

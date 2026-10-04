@@ -44,13 +44,13 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all forty-nine bundled pattern/source pairs with
-both implementations and `cmp`s the results. For the three `.textmode` pairs it also
+exactly that: `test1` assembles all fifty bundled pattern/source pairs with
+both implementations and `cmp`s the results. For the four `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` pair the `.echo` lines each one writes to standard
 error. The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for a hundred and eighty comparisons in all.
+text output are compared too, for a hundred and eighty-two comparisons in all.
 
 **Contents**
 
@@ -3098,6 +3098,71 @@ Forms it does not cover (a `lock` prefix on a two-operand instruction,
 `push word ptr`, …) come through unchanged by `.textmode` passthrough, so what
 was translated and what was not is visible in the output.
 
+#### Example: AArch64 to x86_64 — porting a bf interpreter
+
+The bundled `a64tox64_axx.axx` translates AArch64 assembly into x86_64
+assembly. The output is in the notation axx's own `x86_64.axx` assembles, so the
+whole path from translation to linking stays inside axx. As a worked example it
+turns `bf_aarch64.s`, a Brainfuck interpreter written for AArch64, into an
+x86_64 executable.
+
+```sh
+caxx a64tox64_axx.axx bf_aarch64.s -V | cat a64ext.s - > bf_x64.s
+caxx x86_64.axx bf_x64.s --osabi FreeBSD -o bf.o
+caxx x86_64.axx a64rt_axx_freebsd.s --osabi FreeBSD -o a64rt.o
+ld -static -e __a64_start bf.o a64rt.o -o bf
+./bf mandelbrot.bf
+```
+
+On Linux, build `a64rt_axx.s` with `--osabi Linux` and link with `-e _start`.
+`a64ext.s` is one line that declares the runtime's names with `.extern`; it goes
+in front of the translated text.
+
+```
+        ldr x19, [sp]               ->  mov rbx, [rsp]
+        cmp x19, #2                 ->  cmp rbx, 2
+        b.ge open                   ->  jge open
+        adrp x1, usage              ->  lea rsi, [RIP+usage]
+        add  x1, x1, :lo12:usage    ->  ; :lo12:usage (adrp で計算済み)
+        ldrb w9, [x20, x21]         ->  movzx r10, [r12+r13*1]
+                                        mov [RIP+__a64_x9], r10
+        cbz  w9, done               ->  mov r11, [RIP+__a64_x9]
+                                        test r11d, r11d
+                                        jz done
+        svc  #0                     ->  call __a64_svc
+        bl   putc                   ->  call putc
+                                        mov rdi, rax
+        ret                         ->  mov rax, rdi
+                                        ret
+```
+
+It does four things.
+
+- **Register mapping.** The argument registers `x0`–`x5` go to `rdi` `rsi` `rdx`
+  `rcx` `r8` `r9` in SysV order, `x8` to `rax`, and the callee-saved `x19`–`x23`
+  to `rbx` and `r12`–`r15`. The ones x86 has no room for (`x6`, `x7`, `x9`–`x18`,
+  `x24`–`x28`) live in 8-byte slots in the runtime (`__a64_x9` and so on), with
+  `r10` and `r11` as scratch registers.
+- **Calling-convention glue.** `ret` moves the return value from `rdi` (x0) to
+  `rax`, and `bl` moves it from `rax` back to `rdi`. Frame entry and exit such as
+  `stp x29, x30, [sp, #-N]!` are mapped too.
+- **System calls.** `svc #0` calls the runtime's `__a64_svc`, which looks the
+  AArch64 Linux number up in a table and issues `syscall`; the FreeBSD runtime
+  also turns FreeBSD's carry-flag error convention into Linux's negative return
+  value.
+- **Process entry.** The source reads argc from `[sp]` at entry. The FreeBSD/amd64
+  kernel passes the address of argc in `rdi` and moves `rsp` 8 bytes off it to
+  keep 16-byte alignment, so the FreeBSD runtime's `__a64_start` sets `rsp` to
+  `rdi` before it jumps to `_start`.
+
+Its 152 lines expand into 1,903 patterns through the macro layer
+([7](#7-macro-layer)). Register names are sets, `!Y`
+([3.6.3](#363-symbol-capture-y)) captures which register matched by number, and
+the same number picks the x86 spelling, the same technique as `intel2att.axx`.
+The translated bf runs `mandelbrot.bf` and gives the same output (48 lines,
+6,240 bytes) as a reference interpreter written in C; this was checked on
+FreeBSD/amd64.
+
 ### 3.19 `.unordered` — order-independent directives
 
 ```
@@ -4287,6 +4352,7 @@ The x86_64 pattern file is also maintained separately at
 | **riscv64full.axx** | 75 KB | 2,186 (4,137 expanded) | **riscv64full.s**, **riscv64full_reloc.s** | RISC-V RV64 in full: I, M, A (with Zabha, Zacas, Zawrs), F, D, Q, Zfh, Zfa, C (Zca, Zcd, Zcb, Zcmp, Zcmt, Zcmop), Zba / Zbb / Zbc / Zbs, Zbkb / Zbkc / Zbkx, Zknd / Zkne / Zknh / Zksed / Zksh, Zicond, Zicbom / Zicboz / Zicbop, Zihintntl, Zimop, Zicfiss / Zicfilp, Zicsr with the CSR names, the privileged and H instructions, and V 1.0 with Zvbb, Zvbc, Zvkg, Zvkned, Zvknh, Zvksed, Zvksh and the bf16 parts; the GNU pseudo-instructions (`li` of any 64-bit constant, `call`, `tail`, `la`, the global loads and stores ...); optional rounding modes and `v0.t` masks. A superset of `riscv64.axx` that declares the RISC-V psABI relocations the instructions carry. Checked against llvm-mc 18 byte for byte, its `-o` relocations and linked images against LLVM's; the part of the ISA that LLVM 18 does not have (Q, Zabha, `vwsll`, `mnret`, `c.ntl.*`, `c.sspush`) is from the specifications. `riscv64full.s` exercises the rows; `riscv64full_reloc.s` is for `-o` |
 | **endsub.axx** | 1.2 KB | 20 | **endsub.s** | closing a `.sub` block with `.endsub` (3.7.2); test only |
 | **intel2att.axx** | 12 KB | 60 (3,437 expanded) | **intel2att.s** | x86-64 Intel to AT&T source translator; `.textmode`, `!Y`, `!L` and macro-layer pattern generation (3.18). The translated text assembles with GNU as |
+| **a64tox64_axx.axx** | 32 KB | 152 (1,903 expanded) | **bf_aarch64.s** | AArch64 to x86_64 source translator whose output `x86_64.axx` assembles; uses the runtimes `a64rt_axx.s` (Linux) and `a64rt_axx_freebsd.s` (FreeBSD) and the declaration file `a64ext.s` (3.18) |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
 | **vliw.axx** | 192 B | 10 | **vliw.s** | Non-EPIC VLIW; test only |
 | **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck virtual CPU; hello-world demo. Bundled, but not part of `test1` |
@@ -4310,8 +4376,8 @@ re-encoded and the new instructions of Release 6, checked against llvm-mc 19
 down to the relocations). `mips_isa.axx` is included by those eight and is never
 passed to axx itself.
 
-`test1` runs all forty-nine pairs through both implementations and
-compares the `-b` raw binaries. For the three pairs that use `.textmode`
+`test1` runs all fifty pairs through both implementations and
+compares the `-b` raw binaries. For the four pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx` and `intel2att.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
 `elftype.s` and `elfgen.axx` / `elfgen.s` pairs are about relocations and the
@@ -4336,7 +4402,7 @@ The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for a hundred and eighty comparisons in all.
+never compares, for a hundred and eighty-two comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -4367,9 +4433,9 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all forty-nine bundled pattern/source pairs with both
+`test1` assembles all fifty bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
-three `.textmode` pairs and the `.echo` lines of the `echo.axx` pair.
+four `.textmode` pairs and the `.echo` lines of the `echo.axx` pair.
 
 ### C.2 External
 

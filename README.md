@@ -31,7 +31,7 @@ That gap wasn't just dormancy — it doubled as a validation period. VLIW, EPIC,
 
 Not marketing copy — things you can reproduce yourself in a few minutes.
 
-**Two independent implementations agree byte-for-byte.** axx ships a Python implementation (`axx.py`, nicknamed Paxx, 14,838 lines) and a C implementation (`caxx.c`, nicknamed Caxx, 20,565 lines). The bundled `test1` script assembles all forty-nine bundled pattern/source pairs — from the 4004 to x86_64 to AArch64 to PowerPC64 to MIPS to a Brainfuck virtual CPU — with both implementations and `cmp`s the results, 180 comparisons in all: the sixteen core pairs also go through `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v` and `-V`, so the ELF32 and ELF64 objects, the DWARF, the listing and the text output are compared too. Run it and you get `test all passed`. This isn't a claim; it's reproducible in five minutes from a fresh clone.
+**Two independent implementations agree byte-for-byte.** axx ships a Python implementation (`axx.py`, nicknamed Paxx, 14,838 lines) and a C implementation (`caxx.c`, nicknamed Caxx, 20,565 lines). The bundled `test1` script assembles all fifty bundled pattern/source pairs — from the 4004 to x86_64 to AArch64 to PowerPC64 to MIPS to a Brainfuck virtual CPU — with both implementations and `cmp`s the results, 182 comparisons in all: the sixteen core pairs also go through `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v` and `-V`, so the ELF32 and ELF64 objects, the DWARF, the listing and the text output are compared too. Run it and you get `test all passed`. This isn't a claim; it's reproducible in five minutes from a fresh clone.
 
 **It produces real ELF objects.**
 
