@@ -2630,6 +2630,7 @@ and both implementations give the same values.
 | `s < t` and so on | Byte-wise lexicographic order; a string and an integer cannot be ordered (error) |
 | `s[i]` | The value (0–255) of byte `i`; `0` when out of range or negative |
 | `s[lo:hi]` | Substring, clamped like an array slice; `hi` is not included |
+| `s[i] = v` | Rewrites byte `i`; `v` is an integer 0–255 or a one-byte string. Past the end, the string is extended with NUL (0) bytes |
 | `.len(s)` | Number of bytes |
 | `.str(v)` | An integer as a signed decimal string; a string is returned as is |
 | `.chr(n)` | The one-byte string of value `n` (0–255) |
@@ -2645,8 +2646,9 @@ t = s + ":" + n           /* "loop:3" */
 ```
 
 Both `.emit(s)` and a string returned by a function called from `binary_list`
-output each byte as one word, in order. A string cannot be changed in place
-(`s[i] = v` is an error), is not an array element, and is not usable as a
+output each byte as one word, in order. A string can be rewritten a byte at a
+time (`s[i] = 65` and `s[i] = "A"` mean the same; strings are passed as copies,
+so other variables are unaffected), can be an array element, and is not usable as a
 condition or in arithmetic (`.if s .then`, `s - 1`). The escapes are `\\`,
 `\"`, `\n` and `\t`; any other `\` is an error. A NUL is made with `.chr(0)`.
 A string cannot contain `/*` — that is the pattern file's comment marker,
@@ -4467,7 +4469,7 @@ The x86_64 pattern file is also maintained separately at
 | **unordered.axx** | 1.7 KB | 28 | **unordered.s** | `.unordered` and per-variable `.map` (3.19): the Z80 `C` as a register and as carry; test only |
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | `.echo` on a body line (3.14.1); test only |
-| **ministr.axx** | 4.4 KB | 10 | **ministr.s** | Strings, arrays of strings and `.for ... in <array>` in the mini language (3.15); test only |
+| **ministr.axx** | 4.9 KB | 11 | **ministr.s** | Strings, arrays of strings and `.for ... in <array>` in the mini language (3.15); test only |
 | **elftype.axx** | 1.5 KB | 20 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |

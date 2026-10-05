@@ -11,3 +11,4 @@ label1:
 	named	4
 	sarr	2+1
 	forin
+	poke

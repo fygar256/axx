@@ -326,6 +326,7 @@ and both implementations give the same values.
 | `s < t` and so on | Byte-wise lexicographic order; a string and an integer cannot be ordered (error) |
 | `s[i]` | The value (0–255) of byte `i`; `0` when out of range or negative |
 | `s[lo:hi]` | Substring, clamped like an array slice; `hi` is not included |
+| `s[i] = v` | Rewrites byte `i`; `v` is an integer 0–255 or a one-byte string. Past the end, the string is extended with NUL (0) bytes |
 | `.len(s)` | Number of bytes |
 | `.str(v)` | An integer as a signed decimal string; a string is returned as is |
 | `.chr(n)` | The one-byte string of value `n` (0–255) |
@@ -342,8 +343,11 @@ t = s + ":" + n           /* "loop:3" */
 
 - **Output is one word per byte.** Both `.emit(s)` and a string returned by a
   function called from `binary_list` output each byte as one word, in order.
-- **Strings cannot be changed in place.** `s[i] = v` is an error; build a new
-  string with `+` and `[lo:hi]`.
+- **Strings can be rewritten a byte at a time.** `s[i] = 65` and `s[i] = "A"`
+  mean the same. A negative index, a value outside 0–255 and a string of two or
+  more bytes are errors. To change the length, build a new string with `+` and
+  `[lo:hi]`. Strings are passed as copies, so rewriting one never changes the
+  caller's variable it was passed from, or a copy held in another variable.
 - **A string can be an array element.** `a = ["ab", 1]` and `a[i] = "x"` are
   allowed and `a[i]` reads the string back. `.echo` prints such an array as
   `["ab", 1]`, quoting only the string elements.

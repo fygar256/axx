@@ -7936,10 +7936,21 @@ class MiniInterp:
         elem = self._need_elem(v, pos)
         arr = self._get(name, pos)
         if self._is_str(arr):
-            raise MiniLangError(f"{pos[0]}:{pos[1]}: {name!r} is a string; a string "
-                                f"cannot be changed in place")
+            # 文字列の 1 バイトを書き換える。値は 0〜255 の整数か 1 バイトの文字列で、
+            # 末尾より先なら NUL で埋めて伸ばす。caxx.c の mini_store() と同じ規則。
+            if self._is_str(elem):
+                b = elem[0] if len(elem) == 1 else -1
+            else:
+                b = _mini_signed(elem)
+            if not 0 <= b <= 255:
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: a byte of a string must be "
+                                    f"a value from 0 to 255 or a one-byte string")
+            if i >= len(arr):
+                arr = arr + b'\0' * (i + 1 - len(arr))
+            self._set(name, arr[:i] + bytes((b,)) + arr[i + 1:], pos)
+            return
         if not self._is_arr(arr):
-            raise MiniLangError(f"{pos[0]}:{pos[1]}: {name!r} is not an array")
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: {name!r} is not an array or a string")
         if i >= len(arr):
             arr.extend([0] * (i + 1 - len(arr)))
         arr[i] = elem

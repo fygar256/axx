@@ -10656,10 +10656,35 @@ static void mini_store(MiniRun *r, MStmt *s, MiniVal v){
     }
     MiniBind *b = mini_ref(r, s->name);
     if(b->v.is_str){
+        /* 文字列の 1 バイトを書き換える。値は 0〜255 の整数か 1 バイトの文字列で、
+           末尾より先なら NUL で埋めて伸ばす。axx.py の MiniInterp._store() と同じ規則。 */
+        int ok = 1;
+        unsigned char byte = 0;
+        if(v.is_str){
+            if(v.slen == 1) byte = v.str[0]; else ok = 0;
+        } else if(u256_is_neg256(v.num) || u256_nonneg_gt_i64(v.num, 255)){
+            ok = 0;
+        } else {
+            byte = (unsigned char)u256_to_u64(v.num);
+        }
         mini_val_free(&v);
-        mini_fail(&r->c, "'%s' is a string; a string cannot be changed in place", s->name);
+        if(!ok)
+            mini_fail(&r->c, "a byte of a string must be a value from 0 to 255 or "
+                      "a one-byte string");
+        if(i >= b->v.slen){
+            unsigned char *ns = realloc(b->v.str, (size_t)i + 2);
+            if(!ns){ perror("realloc"); exit(1); }
+            memset(ns + b->v.slen, 0, (size_t)(i + 2 - b->v.slen));
+            b->v.str = ns;
+            b->v.slen = (int)i + 1;
+        }
+        b->v.str[i] = byte;
+        return;
     }
-    if(!b->v.is_arr){ mini_val_free(&v); mini_fail(&r->c, "'%s' is not an array", s->name); }
+    if(!b->v.is_arr){
+        mini_val_free(&v);
+        mini_fail(&r->c, "'%s' is not an array or a string", s->name);
+    }
     if(i >= b->v.n){
         mini_arr_reserve(&b->v, (int)i + 1);
         for(int q = b->v.n; q <= (int)i; q++) b->v.arr[q] = u256_zero();
