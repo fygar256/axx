@@ -5,8 +5,8 @@ caxx: caxx.c
 paxx: axx.py
 	chmod +x axx.py
 install:
-	sudo cp axx.py paxx
-	sudo cp axx.py axx
-	sudo cp paxx /usr/local/bin/paxx
-	sudo cp axx.1.gz /usr/share/man/man1/
-	sudo cp caxx /usr/local/bin/caxx
+	cp axx.py paxx
+	cp axx.py axx
+	cp paxx /usr/local/bin/paxx
+	cp axx.1.gz /usr/share/man/man1/
+	cp caxx /usr/local/bin/caxx
