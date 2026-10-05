@@ -63,6 +63,12 @@ textmode.axx                        pattern file for .textmode, the `!L` express
                                     `;` comments and the leading indentation
                                     spelled as written (manual 3.18)
 textmode.s                          test assemble file for textmode.axx
+expcap.axx                          pattern file for `{{.exp(x)}}` on every
+                                    capture: a lowercase variable, `!`, `!!`,
+                                    `!F`/`!D`/`!Q`, `!E`, `!S{{name}}`, `!L`
+                                    and `!Y` all keep the source spelling
+                                    along with the value (manual 3.18)
+expcap.s                            test assemble file for expcap.axx
 unordered.axx                       pattern file for .unordered: directives that
                                     hold for the whole file wherever they are
                                     written, and .map tables per variable, so

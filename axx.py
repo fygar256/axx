@@ -138,6 +138,13 @@ exp_typ = 'i'
 OB = chr(0x90)
 CB = chr(0x91)
 
+# `!S{{表}}変数` を展開したときに、差し込んだエントリのパターンの前後に置く
+# 印。どちらも直後の 1 文字が展開の段（'0' から）を表す。照合はこの印を
+# 読み飛ばしながら、ソース上の位置を覚えて変数の綴りにする。
+# caxx.c の SUB_OPEN_CHAR / SUB_CLOSE_CHAR と同じ。
+SUB_OPEN = chr(0x1e)
+SUB_CLOSE = chr(0x1f)
+
 # ソース行の「本物の」VLIW スロット区切り `!!` と終端 `!!!!` を 1 文字に
 # 潰した内部表現。`\!\!` とエスケープされた「文字としての !!」と
 # 区別するために使う。StringUtils.resolve_vliw_escapes() を参照。
@@ -1871,7 +1878,7 @@ class AssemblerState:
         self.lnstack = []
 
         # パターン変数の束縛。vars_undef が「この行では束縛されなかった」印、
-        # vars_text が `!L` が覚えたソースに書かれていたままの綴り。
+        # vars_text が捕捉した変数のソースに書かれていたままの綴り。
         self.vars = {}
 
         self.vars_undef = {}
@@ -5736,8 +5743,8 @@ _TEXTMODE_TEXT_ONLY_DIRS = frozenset((
 
 def _expects_expr(t, idx):
     """その位置でパターンが式捕捉 `!` を待っているか。"""
-    while idx < len(t) and t[idx] in ' \t':
-        idx += 1
+    while idx < len(t) and t[idx] in ' \t' + SUB_OPEN + SUB_CLOSE:
+        idx += 1 if t[idx] in ' \t' else 2
     return idx < len(t) and t[idx] == '!'
 
 
@@ -5768,6 +5775,7 @@ class PatternMatcher:
         self.parser = parser
         self.last_score = None
         self.last_match_score = None
+        self._sub_spans = {}
 
     def remove_brackets(self, s, l):
         """指定した番号の `[[ ]]` 群を、中身ごと取り除く。
@@ -5874,6 +5882,45 @@ class PatternMatcher:
             self.state.enum_bindings = prev
         return v
 
+    def _cap_text(self, a, s, b, e, stopchar=chr(0)):
+        """捕捉した範囲 s[b:e] の綴りを変数 a に覚えさせる。
+
+        止め文字と前後の空白は落とす。`{{.exp(変数)}}` がこれを出す。
+        caxx.c の cap_text_set() と同じ規則である。
+        """
+        raw = s[b:e]
+        if stopchar != chr(0) and raw.endswith(stopchar):
+            raw = raw[:-1]
+        self.state.vars_text[a] = raw.strip(' \t' + chr(0))
+
+    @staticmethod
+    def _var_stopchar(t, idx_t):
+        """変数名の後ろの `\\c` 止め文字を読む。
+
+        返り値は (止め文字, 次の位置, 閉じ印の段の並び)。`!S{{表}}` の
+        閉じ印が変数名と `\\c` のあいだに入っても止め文字として読み、その
+        閉じ印は式を読み終えた位置で閉じる。止め文字が無ければ閉じ印は
+        そのまま残し、照合の本体が読む。
+        caxx.c の pat_var_stopchar() と同じ規則である。
+        """
+        j = StringUtils.skipspc(t, idx_t)
+        closes = []
+        while j + 1 < len(t) and t[j] == SUB_CLOSE:
+            closes.append(t[j + 1])
+            j = StringUtils.skipspc(t, j + 2)
+        if j < len(t) and t[j] == '\\':
+            j += 1
+            stopchar = t[j] if j < len(t) else chr(0)
+            return stopchar, j + 1, closes
+        return chr(0), StringUtils.skipspc(t, idx_t), []
+
+    def _sub_mark(self, m, k, idx_s):
+        """`!S{{表}}` の開き印・閉じ印に当たったソース上の位置を覚える。"""
+        if m == SUB_OPEN:
+            self._sub_spans[k] = [idx_s, idx_s]
+        else:
+            self._sub_spans.setdefault(k, [idx_s, idx_s])[1] = idx_s
+
     def match(self, s, t):
         """ソース行 s とパターン t を 1 文字ずつ突き合わせる本体。
 
@@ -5899,6 +5946,7 @@ class PatternMatcher:
         t += chr(0)
 
         prev_alnum = False
+        self._sub_spans = {}
 
         while True:
 
@@ -5906,6 +5954,12 @@ class PatternMatcher:
             t_sp = idx_t < len(t) and t[idx_t] in ' \t'
             idx_s = StringUtils.skipspc(s, idx_s)
             idx_t = StringUtils.skipspc(t, idx_t)
+            while t[idx_t] == SUB_OPEN or t[idx_t] == SUB_CLOSE:
+                self._sub_mark(t[idx_t], t[idx_t + 1], idx_s)
+                idx_t += 2
+                if t[idx_t] in ' \t':
+                    t_sp = True
+                idx_t = StringUtils.skipspc(t, idx_t)
 
             word_break = s_sp and not t_sp
             b = s[idx_s]
@@ -5957,18 +6011,16 @@ class PatternMatcher:
                     if _nl == 0:
                         return False
                     a = self._var_declare(t[idx_t:idx_t + _nl])
-                    idx_t = StringUtils.skipspc(t, idx_t + _nl)
-                    if idx_t < len(t) and t[idx_t] == '\\':
-                        idx_t += 1
-                        stopchar = t[idx_t] if idx_t < len(t) else chr(0)
-                        idx_t += 1
-                    else:
-                        stopchar = chr(0)
+                    stopchar, idx_t, _closes = self._var_stopchar(t, idx_t + _nl)
 
+                    _cap_start = idx_s
                     try:
                         v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
                     finally:
                         self.state._elf_capturing_var = None
+                    for _k in _closes:
+                        self._sub_mark(SUB_CLOSE, _k, idx_s)
+                    self._cap_text(a, s, _cap_start, idx_s, stopchar)
                     try:
                         v = float(v)
                         v = int.from_bytes(struct.pack('>f', v), "big")
@@ -5986,18 +6038,16 @@ class PatternMatcher:
                     if _nl == 0:
                         return False
                     a = self._var_declare(t[idx_t:idx_t + _nl])
-                    idx_t = StringUtils.skipspc(t, idx_t + _nl)
-                    if idx_t < len(t) and t[idx_t] == '\\':
-                        idx_t += 1
-                        stopchar = t[idx_t] if idx_t < len(t) else chr(0)
-                        idx_t += 1
-                    else:
-                        stopchar = chr(0)
+                    stopchar, idx_t, _closes = self._var_stopchar(t, idx_t + _nl)
 
+                    _cap_start = idx_s
                     try:
                         v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
                     finally:
                         self.state._elf_capturing_var = None
+                    for _k in _closes:
+                        self._sub_mark(SUB_CLOSE, _k, idx_s)
+                    self._cap_text(a, s, _cap_start, idx_s, stopchar)
                     try:
                         v = float(v)
                         v = int.from_bytes(struct.pack('>d', v), "big")
@@ -6015,13 +6065,7 @@ class PatternMatcher:
                     if _nl == 0:
                         return False
                     a = self._var_declare(t[idx_t:idx_t + _nl])
-                    idx_t = StringUtils.skipspc(t, idx_t + _nl)
-                    if idx_t < len(t) and t[idx_t] == '\\':
-                        idx_t += 1
-                        stopchar = t[idx_t] if idx_t < len(t) else chr(0)
-                        idx_t += 1
-                    else:
-                        stopchar = chr(0)
+                    stopchar, idx_t, _closes = self._var_stopchar(t, idx_t + _nl)
 
                     idx_s_q_start = idx_s
 
@@ -6029,6 +6073,9 @@ class PatternMatcher:
                         v, idx_s_after = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
                     finally:
                         self.state._elf_capturing_var = None
+                    for _k in _closes:
+                        self._sub_mark(SUB_CLOSE, _k, idx_s_after)
+                    self._cap_text(a, s, idx_s_q_start, idx_s_after, stopchar)
 
                     raw_text = s[idx_s_q_start:idx_s_after]
                     if stopchar != chr(0) and raw_text.endswith(stopchar):
@@ -6062,13 +6109,7 @@ class PatternMatcher:
                     if _nl == 0:
                         return False
                     a = self._var_declare(t[idx_t:idx_t + _nl])
-                    idx_t = StringUtils.skipspc(t, idx_t + _nl)
-                    if idx_t < len(t) and t[idx_t] == '\\':
-                        idx_t += 1
-                        stopchar = t[idx_t] if idx_t < len(t) else chr(0)
-                        idx_t += 1
-                    else:
-                        stopchar = chr(0)
+                    stopchar, idx_t, _closes = self._var_stopchar(t, idx_t + _nl)
 
                     idx_s_text_start = idx_s
                     self.state._elf_capturing_var = a
@@ -6079,11 +6120,13 @@ class PatternMatcher:
                     finally:
                         self.state._elf_capturing_var = None
                     _cap_undef = self.state.error_undefined_label
+                    for _k in _closes:
+                        self._sub_mark(SUB_CLOSE, _k, idx_s)
 
                     raw_text = s[idx_s_text_start:idx_s]
                     if stopchar != chr(0) and raw_text.endswith(stopchar):
                         raw_text = raw_text[:-1]
-                    self.state.vars_text[a] = raw_text.strip(' \t' + chr(0))
+                    self._cap_text(a, s, idx_s_text_start, idx_s, stopchar)
                     _elf_v2l_finish(self.state, a, raw_text)
 
                     if self.state.textmode:
@@ -6111,8 +6154,10 @@ class PatternMatcher:
                     hit = self._enum_capture(s, idx_s, edef)
                     if hit is None:
                         return False
+                    _cap_start = idx_s
                     v, idx_s = hit
                     self.var_manager.put(a, v)
+                    self._cap_text(a, s, _cap_start, idx_s)
                     continue
                 elif a == 'Y':
                     if idx_t >= len(t):
@@ -6139,6 +6184,7 @@ class PatternMatcher:
                     _yk, _yend = _symset_item_at(s, idx_s, arr)
                     if _yk < 0:
                         return False
+                    self._cap_text(a, s, idx_s, _yend)
                     idx_s = _yend
                     self.var_manager.put(a, _yk)
                     n_expr -= 1
@@ -6161,6 +6207,7 @@ class PatternMatcher:
                     finally:
                         self.state._elf_capturing_var = None
                     _elf_v2l_finish(self.state, a, s[_cap_start:idx_s])
+                    self._cap_text(a, s, _cap_start, idx_s)
                     _cap_undef = self.state.error_undefined_label
                     self.state.error_undefined_label = _cap_prior or _cap_undef
                     self.var_manager.put_tagged(a, v, _cap_undef)
@@ -6170,14 +6217,7 @@ class PatternMatcher:
                     if _nl == 0:
                         return False
                     a = self._var_declare(t[idx_t - 1:idx_t - 1 + _nl])
-                    idx_t += _nl - 1
-                    idx_t = StringUtils.skipspc(t, idx_t)
-                    if idx_t < len(t) and t[idx_t] == '\\':
-                        idx_t += 1
-                        stopchar = t[idx_t] if idx_t < len(t) else chr(0)
-                        idx_t += 1
-                    else:
-                        stopchar = chr(0)
+                    stopchar, idx_t, _closes = self._var_stopchar(t, idx_t - 1 + _nl)
 
                     self.state._elf_capturing_var = a
                     _cap_prior = self.state.error_undefined_label
@@ -6187,7 +6227,10 @@ class PatternMatcher:
                         v, idx_s = self.expr_eval.expression_esc(s, idx_s, stopchar)
                     finally:
                         self.state._elf_capturing_var = None
+                    for _k in _closes:
+                        self._sub_mark(SUB_CLOSE, _k, idx_s)
                     _elf_v2l_finish(self.state, a, s[_cap_start:idx_s])
+                    self._cap_text(a, s, _cap_start, idx_s, stopchar)
                     _cap_undef = self.state.error_undefined_label
                     self.state.error_undefined_label = _cap_prior or _cap_undef
                     self.var_manager.put_tagged(a, v, _cap_undef)
@@ -6241,9 +6284,11 @@ class PatternMatcher:
                         return False
                     idx_s = prev_idx_s
                     self.var_manager.put(a, VAR_UNDEF)
+                    self.state.vars_text[a] = ''
                     n_sym += 1
                     continue
                 self.var_manager.put(a, v)
+                self._cap_text(a, s, prev_idx_s, idx_s)
                 n_sym += 1
                 continue
             elif a == '+' and b == '-' and _expects_expr(t, idx_t + 1):
@@ -6321,8 +6366,12 @@ class PatternMatcher:
                             f"(define it with '.sub::{name} ... .return').",
                             set_error=True)
             return
+        # 差し込んだ範囲を印ではさむ。印の後ろの 1 文字が段で、束縛の並び
+        # での位置と同じになる（段ごとに 1 つずつ前に足すため）。
+        k = chr(ord('0') + depth)
         for ent_pat, ent_val in entries:
-            nt = t[:start] + ent_pat + t[end:]
+            nt = (t[:start] + SUB_OPEN + k + ent_pat + SUB_CLOSE + k
+                  + t[end:])
             for vt, binds in self._sub_variants(nt, depth + 1):
                 yield vt, ((var, ent_val),) + binds
 
@@ -6370,8 +6419,15 @@ class PatternMatcher:
             saved_v2l = dict(self.state._elf_var_to_label)
             saved_hint = dict(self.state._elf_insn_reloc_hint)
             if self.match0_brackets(s, vt):
+                spans = self._sub_spans
                 for var, ent_val in reversed(binds):
                     self.var_manager.put(var, self._sub_value(ent_val))
+                for k, (var, _ent_val) in enumerate(binds):
+                    sp = spans.get(chr(ord('0') + k))
+                    if sp is None:
+                        self.state.vars_text[var] = ''
+                    else:
+                        self._cap_text(var, s, sp[0], sp[1])
                 return True
             self.state.vars = saved_vars
             self.state.vars_undef = saved_vars_undef
@@ -8474,10 +8530,10 @@ class ObjectGenerator:
         return nm
 
     def _txt_exp_text(self, name):
-        """`{{.exp(変数)}}` — `!L` が覚えた綴りを、ソースに書かれていたまま出す。"""
+        """`{{.exp(変数)}}` — 変数が捕捉した綴りを、ソースに書かれていたまま出す。"""
         if name not in self.state.varnames:
             self.state.diag(f" error - '{name}' is not a pattern variable; "
-                            f"'.exp({name})' needs '!L{name}' in the "
+                            f"'.exp({name})' needs '{name}' captured in the "
                             f"instruction field.", set_error=True)
             return ''
         return self.state.vars_text.get(name, '')

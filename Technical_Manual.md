@@ -44,8 +44,8 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all fifty bundled pattern/source pairs with
-both implementations and `cmp`s the results. For the four `.textmode` pairs it also
+exactly that: `test1` assembles all fifty-one bundled pattern/source pairs with
+both implementations and `cmp`s the results. For the five `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` pair the `.echo` lines each one writes to standard
 error. The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
@@ -408,6 +408,10 @@ In the `instruction` field:
 | `!Yx[z]` | Reads one item name of the **set** `x` (section 3.6.2) and binds its **index** to the variable `z` (section 3.6.3) |
 | `!S{{name}}x` | Value of the matching entry of the **sub table** `name` declared with `.sub` (section 3.7.2) |
 
+Whichever form captures a variable, the variable remembers the **text as written
+in the source** along with its value. The text template `{{.exp(x)}}` emits that
+text (section 3.18).
+
 Captured values are referenced from `error_patterns` and `binary_list` by the
 bare name — the `!` prefix is not repeated there. Every variable is reset to 0
 for each pattern line, so an unmatched optional operand reads as 0.
@@ -546,7 +550,7 @@ out unchanged. The only other thing read is a backslash escape.
 | `{{.float(<expr>)}}` | The value as a decimal 128-bit floating point number, 34 significant digits (`16` becomes `16.0`) |
 | `{{<name>}}` `{{<name>[<expr>]}}` | A string symbol or array symbol, else a pattern variable — see below |
 | `{{.index <name>[<expr>]}}` | The subscript that `{{<name>[<expr>]}}` uses, in decimal (3.6.1) |
-| `{{.exp(<variable>)}}` | The expression or label captured by `!L<variable>`, spelled exactly as in the source (3.18) |
+| `{{.exp(<variable>)}}` | The expression, label, symbol and so on captured by the variable, spelled exactly as in the source (3.18) |
 | `\n` `\t` `\r` `\\` `\"` | Newline, tab, carriage return, backslash, double quote |
 | `\<char>` | any other `<char>` literally |
 
@@ -2869,6 +2873,50 @@ label is gone from the rewritten text. With `!La` and `{{.exp(a)}}`, `msg` stays
 - Outside text replacement mode `!L` behaves exactly like `!` (an undefined label
   is an error). The text is remembered either way.
 
+#### Every capture remembers its text
+
+`!L` is not the only capture that remembers its text. A variable captured by any
+form of the `instruction` field keeps both its value and its text, as `!L` does,
+and `{{.exp(<variable>)}}` emits that text. The only difference left in `!L` is
+that it lets an undefined label through in text replacement mode.
+
+| Form | Text emitted by `{{.exp()}}` |
+|---|---|
+| lowercase variable | The name of the symbol that matched (`b`, `cx` and so on) |
+| `!x` | The integer expression read |
+| `!!x` | The integer factor read |
+| `!Fx` `!Dx` `!Qx` | The floating-point expression read |
+| `!Ex` | The whole enumerated list (`a0-a2` and so on) |
+| `!S{{name}}x` | The whole extent matched by the entry's pattern |
+| `!Lx` | The expression or label read |
+| `!Yx[z]` | The item name read (`z` remembers it) |
+
+```
+.textmode
+.check::r::B,C,D
+MOV r,r2       :: "mov {{.exp(r)}}<-{{.exp(r2)}} ; {{.hex(r)}},{{.hex(r2)}}"
+EXPR !a        :: "expr [{{.exp(a)}}] = {{.hex(a)}}"
+LD!S{{sz}}s !a :: "ld [{{.exp(s)}}] = {{.hex(s)}} [{{.exp(a)}}]"
+.sub::sz
+.B::1
+.W::2
+.endsub
+```
+
+```
+	mov	c , b      ->  mov c<-b ; 1,0
+	expr	1+2*3      ->  expr [1+2*3] = 7
+	ld.b	0x10+1     ->  ld [.b] = 1 [0x10+1]
+```
+
+- Surrounding blanks and a stop character such as `\,` are not part of the text.
+- `!S{{name}}` may be nested; the outer variable's text contains the inner extent
+  (when an entry `X!S{{inner}}i` matches `x2`, the outer text is `x2` and the
+  inner one is `2`).
+- A variable inside `[[ ]]` that was not taken that time, and a lowercase variable
+  left out because `.check` allows omitting it, have empty text.
+- The bundled `expcap.axx` / `expcap.s` pair is the test that covers every form.
+
 #### Leading indentation
 
 In text replacement mode the **leading indentation (spaces and tabs) of the source
@@ -4340,6 +4388,7 @@ The x86_64 pattern file is also maintained separately at
 | **test.axx** | 1.1 KB | 40 | **test.s** | Fragments of several ISAs; test only |
 | **8080toz80.axx** | 5.7 KB | 117 | **hello8080.s** | Intel 8080 to Zilog Z80 source translator; `.textmode`, `!L` and `{{.exp()}}` (3.18) at work |
 | **textmode.axx** | 2.0 KB | 13 | **textmode.s** | `.textmode`, `!L`, `{{.exp()}}` and `;` comments (3.18); test only |
+| **expcap.axx** | 2.9 KB | 41 | **expcap.s** | `{{.exp()}}` emits the text of every kind of capture (3.18); test only |
 | **arrindex.axx** | 860 B | 14 | **arrindex.s** | Array symbols: bare names as items, a name as a subscript, `.index` (3.6.1); test only |
 | **passthru.axx** | 686 B | 6 | **passthru.s** | `.passthru` and `.eol` (3.16 / 3.17); test only |
 | **unordered.axx** | 1.7 KB | 28 | **unordered.s** | `.unordered` and per-variable `.map` (3.19): the Z80 `C` as a register and as carry; test only |
@@ -4384,9 +4433,9 @@ re-encoded and the new instructions of Release 6, checked against llvm-mc 19
 down to the relocations). `mips_isa.axx` is included by those eight and is never
 passed to axx itself.
 
-`test1` runs all fifty pairs through both implementations and
-compares the `-b` raw binaries. For the four pairs that use `.textmode`
-(`textmode.axx`, `8080toz80.axx` and `intel2att.axx`) it also compares the translated text each
+`test1` runs all fifty-one pairs through both implementations and
+compares the `-b` raw binaries. For the five pairs that use `.textmode`
+(`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
 `elftype.s` and `elfgen.axx` / `elfgen.s` pairs are about relocations and the
 ELF header, the `elfprio.axx` / `elfprio.s` pair is about which of the three
@@ -4441,9 +4490,9 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all fifty bundled pattern/source pairs with both
+`test1` assembles all fifty-one bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
-four `.textmode` pairs and the `.echo` lines of the `echo.axx` pair.
+five `.textmode` pairs and the `.echo` lines of the `echo.axx` pair.
 
 ### C.2 External
 

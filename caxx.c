@@ -2130,6 +2130,12 @@ static AXX_UNUSED void bufmap_free(BufMap*m){
 
 #define OB_CHAR  ((char)0xFC)
 #define CB_CHAR  ((char)0xFD)
+/* `!S{{表}}変数` を展開したときに、差し込んだエントリのパターンの前後に置く
+   印。どちらも直後の 1 文字が展開の段（'0' から）を表す。照合はこの印を
+   読み飛ばしながら、ソース上の位置を覚えて変数の綴りにする。
+   axx.py の SUB_OPEN / SUB_CLOSE と同じ。 */
+#define SUB_OPEN_CHAR  ((char)0x1E)
+#define SUB_CLOSE_CHAR ((char)0x1F)
 #define VLIW_SEP_CHAR  ((char)0xFE)
 #define VLIW_STOP_CHAR ((char)0xFF)
 #define EXP_PAT  0
@@ -8182,7 +8188,8 @@ static char *remove_brackets_str(const char *s, int *remove_idx, int nr){
 
 /* その位置でパターンが式捕捉を待っているか。 */
 static int pat_expects_expr(const char *t, int idx){
-    while(t[idx]==' '||t[idx]=='\t') idx++;
+    while(t[idx]==' '||t[idx]=='\t'||t[idx]==SUB_OPEN_CHAR||t[idx]==SUB_CLOSE_CHAR)
+        idx += (t[idx]==' '||t[idx]=='\t') ? 1 : 2;
     return t[idx]=='!';
 }
 static uint256_t enum_eval(Assembler *asmb, const EnumDef *ed,
@@ -8218,7 +8225,7 @@ static uint256_t enum_eval(Assembler *asmb, const EnumDef *ed,
     return r;
 }
 
-/* `!L` が覚えるソースの綴りを置き場に積み、その位置を返す。 */
+/* 捕捉した変数が覚えるソースの綴りを置き場に積み、その位置を返す。 */
 static int captext_put(AsmState *st, const char *p, int n){
     if(n < 0) n = 0;
     if(st->captext_len + n + 1 > (int)sizeof(st->captext)) return -1;
@@ -8227,6 +8234,69 @@ static int captext_put(AsmState *st, const char *p, int n){
     st->captext[off + n] = '\0';
     st->captext_len = off + n + 1;
     return off;
+}
+
+/* 捕捉した範囲 s[b..e) の綴りを変数に覚えさせる。止め文字と前後の空白は
+   落とす。`{{.exp(変数)}}` がこれを出す。
+   axx.py の PatternMatcher._cap_text() と同じ規則である。 */
+static void cap_text_set(AsmState *st, int slot, const char *s, int b, int e, char stopchar){
+    if(slot < 0 || slot >= NVARS) return;
+    if(e < b) e = b;
+    if(stopchar && e > b && s[e-1] == stopchar) e--;
+    while(b < e && (s[b]==' '||s[b]=='\t')) b++;
+    while(e > b && (s[e-1]==' '||s[e-1]=='\t')) e--;
+    var_note_write(st, slot);
+    st->vars[slot].text_off = captext_put(st, s + b, e - b);
+}
+
+/* 変数の綴りを空にする。 */
+static void cap_text_clear(AsmState *st, int slot){
+    if(slot < 0 || slot >= NVARS) return;
+    var_note_write(st, slot);
+    st->vars[slot].text_off = -1;
+}
+
+enum { SUB_MAX_DEPTH = 8 };
+
+/* `!S{{表}}` の開き印・閉じ印に当たったソース上の位置。段ごとに持つ。 */
+static int g_sub_span[SUB_MAX_DEPTH][2];
+
+/* 開き印・閉じ印に当たった位置を覚える。
+   axx.py の PatternMatcher._sub_mark() と同じ規則である。 */
+static void sub_span_mark(char m, char k, int idx_s){
+    int i = (unsigned char)k - '0';
+    if(i < 0 || i >= SUB_MAX_DEPTH) return;
+    if(m == SUB_OPEN_CHAR || g_sub_span[i][0] < 0) g_sub_span[i][0] = idx_s;
+    g_sub_span[i][1] = idx_s;
+}
+
+/* 変数名の後ろの `\c` 止め文字を読み、次の位置を返す。`!S{{表}}` の閉じ印
+   が変数名と `\c` のあいだに入っても止め文字として読み、その閉じ印の段を
+   closes に返す（式を読み終えた位置で閉じる）。止め文字が無ければ閉じ印は
+   そのまま残し、照合の本体が読む。
+   axx.py の PatternMatcher._var_stopchar() と同じ規則である。 */
+static int pat_var_stopchar(const char *t, int tlen, int idx_t, char *stop,
+                            char *closes, int *nclose){
+    int j = axx_skipspc(t, idx_t);
+    int nc = 0;
+    while(j + 1 < tlen && t[j] == SUB_CLOSE_CHAR){
+        if(nc < SUB_MAX_DEPTH) closes[nc++] = t[j+1];
+        j = axx_skipspc(t, j + 2);
+    }
+    if(j < tlen && t[j] == '\\'){
+        j++;
+        *stop = (j < tlen) ? t[j] : '\0';
+        *nclose = nc;
+        return j + 1;
+    }
+    *stop = '\0';
+    *nclose = 0;
+    return axx_skipspc(t, idx_t);
+}
+
+/* 止め文字の前で閉じる閉じ印を、式を読み終えた位置で閉じる。 */
+static void sub_span_close_all(const char *closes, int nclose, int idx_s){
+    for(int i = 0; i < nclose; i++) sub_span_mark(SUB_CLOSE_CHAR, closes[i], idx_s);
 }
 
 static int enum_capture(Assembler *asmb, const EnumDef *ed, const char *s, int idx,
@@ -8325,11 +8395,22 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
 
     int prev_alnum=0;
 
+    /* 当たらなかったときは、この試行で積んだ綴りを置き場から下ろす。 */
+    int captext_len0 = st->captext_len;
+    for(int k=0;k<SUB_MAX_DEPTH;k++){ g_sub_span[k][0] = -1; g_sub_span[k][1] = -1; }
+    char closes[SUB_MAX_DEPTH]; int nclose = 0;
+
     while(1){
         int s_sp = (s[idx_s]==' '||s[idx_s]=='\t');
         int t_sp = (t[idx_t]==' '||t[idx_t]=='\t');
         idx_s=axx_skipspc(s,idx_s);
         idx_t=axx_skipspc(t,idx_t);
+        while(t[idx_t]==SUB_OPEN_CHAR || t[idx_t]==SUB_CLOSE_CHAR){
+            sub_span_mark(t[idx_t], t[idx_t+1], idx_s);
+            idx_t += 2;
+            if(t[idx_t]==' '||t[idx_t]=='\t') t_sp = 1;
+            idx_t=axx_skipspc(t,idx_t);
+        }
         int word_break = s_sp && !t_sp;
         char b=s[idx_s], a=t[idx_t];
 
@@ -8373,16 +8454,12 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 if(_nl == 0){ result=0; break; }
                 int vslot = var_slot(t+idx_t, _nl, 1);
                 if(vslot < 0){ result=0; break; }
-                idx_t += _nl;
-                idx_t = axx_skipspc(t, idx_t);
                 char stopchar = '\0';
-                if(idx_t < tlen && t[idx_t] == '\\'){
-                    idx_t++;
-                    stopchar = (idx_t < tlen) ? t[idx_t] : '\0';
-                    idx_t++;
-                }
+                idx_t = pat_var_stopchar(t, tlen, idx_t + _nl, &stopchar, closes, &nclose);
                 int idx_s_q_start = idx_s;
                 uint256_t fv = expr_expression_esc_float(asmb, s, idx_s, stopchar, &idx_s);
+                sub_span_close_all(closes, nclose, idx_s);
+                cap_text_set(st, vslot, s, idx_s_q_start, idx_s, stopchar);
                 double dv = u256_to_double(fv);
                 if(stopchar != '\0' && idx_s < (int)strlen(s) && s[idx_s] == stopchar)
                     idx_s++;
@@ -8450,14 +8527,8 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 if(_nl == 0){ result=0; break; }
                 int vslot = var_slot(t+idx_t, _nl, 1);
                 if(vslot < 0){ result=0; break; }
-                idx_t += _nl;
-                idx_t = axx_skipspc(t, idx_t);
                 char stopchar = '\0';
-                if(idx_t < tlen && t[idx_t] == '\\'){
-                    idx_t++;
-                    stopchar = (idx_t < tlen) ? t[idx_t] : '\0';
-                    idx_t++;
-                }
+                idx_t = pat_var_stopchar(t, tlen, idx_t + _nl, &stopchar, closes, &nclose);
                 int idx_s_text_start = idx_s;
                 st->elf_capturing_var = vslot;
                 int _cap_prior_l = st->error_undefined_label;
@@ -8465,15 +8536,9 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 uint256_t v = expr_expression_esc(asmb,s,idx_s,stopchar,&idx_s);
                 int _cap_undef_l = st->error_undefined_label;
                 st->elf_capturing_var = -1;
+                sub_span_close_all(closes, nclose, idx_s);
                 elf_v2l_finish(st, vslot, s + idx_s_text_start, idx_s - idx_s_text_start);
-                {
-                    int _b = idx_s_text_start, _e = idx_s;
-                    if(stopchar && _e > _b && s[_e-1] == stopchar) _e--;
-                    while(_b < _e && (s[_b]==' '||s[_b]=='\t')) _b++;
-                    while(_e > _b && (s[_e-1]==' '||s[_e-1]=='\t')) _e--;
-                    var_note_write(st, vslot);
-                    st->vars[vslot].text_off = captext_put(st, s + _b, _e - _b);
-                }
+                cap_text_set(st, vslot, s, idx_s_text_start, idx_s, stopchar);
                 if(st->textmode){
                     st->error_undefined_label = _cap_prior_l;
                     if(_cap_undef_l || u256_is_undef_derived(v)) v = u256_zero();
@@ -8495,8 +8560,10 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 if(!ed->expr){ result=0; break; }
                 uint256_t ev; int eend=idx_s;
                 if(!enum_capture(asmb, ed, s, idx_s, &ev, &eend)){ result=0; break; }
+                int _cap_start_e = idx_s;
                 idx_s = eend;
                 var_slot_put(st, vslot, ev);
+                cap_text_set(st, vslot, s, _cap_start_e, idx_s, '\0');
                 continue;
             } else if(a=='Y'){
                 if(idx_t >= tlen){ result=0; break; }
@@ -8522,6 +8589,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 int _yend = idx_s;
                 int _yk = symset_item_at(s, idx_s, _ys, &_yend);
                 if(_yk < 0){ result=0; break; }
+                cap_text_set(st, vslot, s, idx_s, _yend, '\0');
                 idx_s = _yend;
                 var_slot_put(st, vslot, u256_from_u64((uint64_t)_yk));
                 n_expr--; n_sym++;
@@ -8542,6 +8610,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 st->error_undefined_label = _cap_prior_eul || _cap_this_undef;
                 st->elf_capturing_var = -1;
                 elf_v2l_finish(st, vslot, s + _cap_start, idx_s - _cap_start);
+                cap_text_set(st, vslot, s, _cap_start, idx_s, '\0');
                 var_slot_put_tagged(st,vslot,v,_cap_this_undef);
                 continue;
             } else {
@@ -8549,14 +8618,8 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 if(_nl == 0){ result=0; break; }
                 int vslot = var_slot(t+idx_t-1, _nl, 1);
                 if(vslot < 0){ result=0; break; }
-                idx_t += _nl - 1;
-                idx_t=axx_skipspc(t,idx_t);
                 char stopchar='\0';
-                if(idx_t<tlen && t[idx_t]=='\\'){
-                    idx_t++;
-                    stopchar=(idx_t<tlen) ? t[idx_t] : '\0';
-                    idx_t++;
-                }
+                idx_t = pat_var_stopchar(t, tlen, idx_t - 1 + _nl, &stopchar, closes, &nclose);
                 st->elf_capturing_var = vslot;
                 int _cap_prior_eul2 = st->error_undefined_label;
                 st->error_undefined_label = 0;
@@ -8565,7 +8628,9 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 int _cap_this_undef2 = st->error_undefined_label;
                 st->error_undefined_label = _cap_prior_eul2 || _cap_this_undef2;
                 st->elf_capturing_var = -1;
+                sub_span_close_all(closes, nclose, idx_s);
                 elf_v2l_finish(st, vslot, s + _cap_start2, idx_s - _cap_start2);
+                cap_text_set(st, vslot, s, _cap_start2, idx_s, stopchar);
                 var_slot_put_tagged(st,vslot,v,_cap_this_undef2);
                 if(stopchar && s[idx_s]==stopchar) idx_s++;
                 continue;
@@ -8640,11 +8705,13 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 if(!allow_omit){ result=0; break; }
                 idx_s = prev_idx_s;
                 var_slot_put(st, vi, u256_zero());
+                cap_text_clear(st, vi);
                 n_sym++;
                 continue;
             }
 
             var_slot_put(st,vi,sv);
+            cap_text_set(st, vi, s, prev_idx_s, idx_s, '\0');
             n_sym++;
             continue;
         } else if(a=='[' || a==']'){
@@ -8666,6 +8733,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
         }
         else { result=0; break; }
     }
+    if(!result) st->captext_len = captext_len0;
     sbuf_give(&sb_s, s); sbuf_give(&sb_t, t);
     return result;
 }
@@ -8821,8 +8889,6 @@ static uint256_t pat_sub_value(Assembler *asmb, const char *expr){
 
 typedef struct { int var; const char *val; } SubBind;
 
-enum { SUB_MAX_DEPTH = 8 };
-
 static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
                            SubBind *binds, int nbinds, int depth){
     char name[64]; int var; int end;
@@ -8832,8 +8898,14 @@ static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
         int mark_v2l = v2l_mark();
         int saved_elf_refs_len = asmb->st.elf_refs_len;
         if(pat_match0_brackets(asmb, s, t)){
+            int spans[SUB_MAX_DEPTH][2];
+            memcpy(spans, g_sub_span, sizeof(spans));
             for(int k=nbinds-1;k>=0;k--)
                 var_slot_put(&asmb->st, binds[k].var, pat_sub_value(asmb, binds[k].val));
+            for(int k=0;k<nbinds;k++){
+                if(spans[k][0] < 0) cap_text_clear(&asmb->st, binds[k].var);
+                else cap_text_set(&asmb->st, binds[k].var, s, spans[k][0], spans[k][1], '\0');
+            }
             return 1;
         }
         vars_rollback(&asmb->st, mark_v);
@@ -8858,13 +8930,20 @@ static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
     }
     if(nbinds >= SUB_MAX_DEPTH) return 0;
 
+    /* 差し込んだ範囲を印ではさむ。印の後ろの 1 文字が段で、束縛の並び
+       での位置と同じになる（段ごとに 1 つずつ前に足すため）。 */
     int tlen = (int)strlen(t);
+    char open_mark[3]  = { SUB_OPEN_CHAR,  (char)('0' + depth), '\0' };
+    char close_mark[3] = { SUB_CLOSE_CHAR, (char)('0' + depth), '\0' };
     for(int k=0; k<d->n; k++){
-        size_t nl = (size_t)start + strlen(d->e[k].pat) + (size_t)(tlen-end) + 1;
+        size_t nl = (size_t)start + strlen(d->e[k].pat) + (size_t)(tlen-end) + 5;
         char *nt = malloc(nl);
         if(!nt){ perror("malloc"); exit(1); }
         memcpy(nt, t, (size_t)start);
-        strcpy(nt + start, d->e[k].pat);
+        nt[start] = '\0';
+        strcat(nt + start, open_mark);
+        strcat(nt + start, d->e[k].pat);
+        strcat(nt + start, close_mark);
         strcat(nt + start, t + end);
         binds[nbinds].var = var;
         binds[nbinds].val = d->e[k].val;
@@ -12303,14 +12382,14 @@ static int txt_exp_call(const char *s, char *name, size_t ncap){
     return 1;
 }
 
-/* `!L` が覚えた綴りを、ソースに書かれていたまま積む。 */
+/* 変数が捕捉した綴りを、ソースに書かれていたまま積む。 */
 static void txt_emit_exp(Assembler *asmb, TxtBuf *t, const char *name){
     AsmState *st = &asmb->st;
     int slot = var_slot(name, (int)strlen(name), 0);
     if(slot < 0){
         if(should_report_errors(st))
             axx_diagf(1, 0, " error - '%s' is not a pattern variable; '.exp(%s)' "
-                       "needs '!L%s' in the instruction field.\n", name, name, name);
+                       "needs '%s' captured in the instruction field.\n", name, name, name);
         return;
     }
     int off = st->vars[slot].text_off;
@@ -14476,6 +14555,8 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         int mark_v   = vars_mark();
         int mark_v2l = v2l_mark();
         int saved_refs_len = st->elf_refs_len;
+        /* 選ばれなかった試行の綴りは置き場から下ろす。 */
+        int captext_len_try = st->captext_len;
 
         st->in_match_attempt = 1;
         diag_capture_begin(st);
@@ -14499,6 +14580,8 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
                 best.diag_seterr = _cand_seterr;
                 best.diags_len   = _cand_ndiag;
                 _cand_diags = NULL; _cand_seterr = NULL; _cand_ndiag = 0;
+            } else {
+                st->captext_len = captext_len_try;
             }
             for(int di=0; di<_cand_ndiag; di++) free(_cand_diags[di]);
             free(_cand_diags); free(_cand_seterr);
@@ -14514,6 +14597,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
             vars_rollback(st, mark_v);
             v2l_rollback(st, mark_v2l);
             st->error_undefined_label=0;
+            st->captext_len = captext_len_try;
         }
     }
 

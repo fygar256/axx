@@ -79,6 +79,7 @@ caxx $P/mips64r6el.axx $S/mipsr6.s -o b145
 caxx $P/unordered.axx $S/unordered.s -b b146
 caxx $P/a64tox64_axx.axx $S/bf_aarch64.s -V > b147
 caxx $P/a64tox64_axx.axx $S/bf_aarch64.s -b b148
+caxx $P/expcap.axx $S/expcap.s -V -b b149 > b149t
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -239,6 +240,7 @@ paxx $P/mips64r6el.axx $S/mipsr6.s -o a145
 paxx $P/unordered.axx $S/unordered.s -b a146
 paxx $P/a64tox64_axx.axx $S/bf_aarch64.s -V > a147
 paxx $P/a64tox64_axx.axx $S/bf_aarch64.s -b a148
+paxx $P/expcap.axx $S/expcap.s -V -b a149 > a149t
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -338,7 +340,7 @@ check() {
 }
 
 N=0
-while [ $N -le 148 ]; do
+while [ $N -le 149 ]; do
     check a$N b$N
     N=$((N+1))
 done
@@ -356,6 +358,8 @@ while [ $N -le 110 ]; do
     check a${N}t b${N}t
     N=$((N+1))
 done
+
+check a149t b149t
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"
