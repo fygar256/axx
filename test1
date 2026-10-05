@@ -327,23 +327,33 @@ paxx $P/aarch64.axx $S/aarch64.s -V -b a110 > a110t
 
 FAIL=0
 
+# 一組を突き合わせ、一致すれば両方消す。食い違った組だけを調べられるように
+# 残す。ワイルドカードは使わず、作った名前だけを消す。
+check() {
+    if cmp "$1" "$2"; then
+        rm -f "$1" "$2"
+    else
+        FAIL=1
+    fi
+}
+
 N=0
 while [ $N -le 148 ]; do
-    cmp a$N b$N || FAIL=1
+    check a$N b$N
     N=$((N+1))
 done
 
-cmp a25e b25e || FAIL=1
+check a25e b25e
 
 N=79
 while [ $N -le 94 ]; do
-    cmp a${N}v b${N}v || FAIL=1
+    check a${N}v b${N}v
     N=$((N+1))
 done
 
 N=95
 while [ $N -le 110 ]; do
-    cmp a${N}t b${N}t || FAIL=1
+    check a${N}t b${N}t
     N=$((N+1))
 done
 
