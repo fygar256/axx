@@ -45,6 +45,38 @@ expressions too. `[]` is the empty array.
 LOG !v :: .call table([0x11,0x22,v],3)
 ```
 
+An argument written `"..."` is a string (see "Strings" below). A comma or a
+parenthesis inside the string does not split the arguments.
+
+```
+MSG !n :: .call func1(n,"text")
+```
+
+An argument written `.exp(variable)` passes, as a string, the text that pattern
+variable captured from the source. It is the same text the template
+`{{.exp(variable)}}` emits (Technical_Manual section 3.18), and any capture form
+works, not only `!L`.
+
+```
+SPELL !x,r :: .call func1(x,.exp(x),.exp(r))
+```
+
+```
+spell 1+2*3,rb       -> func1(7, "1+2*3", "rb")
+```
+
+An argument that is just the name of a string symbol (`.setsym::name::"..."`)
+passes that string. It is read as if `.call func1(10,"...")` had been written,
+so the same four escapes are opened. The name is case-insensitive. When the name
+is part of an expression, as in `msg+1`, it is read as an expression as before.
+A pattern variable of the same name does not hide it: as with `{{name}}`, the
+string symbol is found first.
+
+```
+.setsym::msg::"text"
+MSG :: .call func1(10,msg)          /* func1(10, "text") */
+```
+
 A function may be defined after the place that uses it; references are resolved
 once the whole pattern file has been read.
 
@@ -118,11 +150,8 @@ of a pattern file (Technical_Manual section 3.14.1).
 .echo("n=", n, "arr=", a)       /* -> n= 7 arr= [7, 14] */
 ```
 
-Strings may appear only in the argument list of `.echo`. Values are integers
-and arrays only, so a string cannot be assigned to a variable or used in an
-expression. The escapes are `\\`, `\"`, `\n` and `\t`; any other `\` is an error.
-A string cannot contain `/*`: that is the pattern file's comment marker and is
-stripped before the mini language sees the line.
+An item may also be a string built by an expression (`.echo("n=" + n)`). A
+string prints as its bytes, except that a NUL (`.chr(0)`) prints as `\0`.
 
 ## Reporting an error
 
@@ -234,14 +263,16 @@ Loosest first.
 - The exponent of `**` may not be negative. The result wraps within 256 bits.
 - Comparisons and logical operators yield 1 or 0. `&&` and `||` short-circuit.
 - Numbers may be decimal, `0x` hex or `0b` binary, with `_` as a digit separator.
-- `.len(expr)` is the length of an array.
+- `.len(expr)` is the length of an array or a string.
+- `+` `*` `==` `!=` `<` `<=` `>` `>=` with a string on either side are string
+  operations (see "Strings" below).
 
 Only 0 is false.
 
 ## Values and arrays
 
-A value is an integer or an array. Array elements are integers; arrays of arrays
-do not exist.
+A value is an integer, an array or a string (next section). Array elements are
+integers; arrays of arrays do not exist.
 
 ```
 a = []
@@ -262,6 +293,55 @@ b = a[1:3]        /* [0,0] — the end index is not included */
 
 Reading a name before it is assigned is an error, so a misspelling does not
 silently read as 0.
+
+## Strings
+
+Besides integers and arrays, a value can be a string. A string is written
+`"..."` and can be used anywhere: in an expression, assigned to a variable, as an
+argument and as a return value. From a `binary_list` it is passed as in
+`.call func1(10,"text")`.
+
+A string is **a sequence of bytes**. The characters written in the source go in
+as their UTF-8 bytes, so `"あ"` has length 3. Lengths and subscripts count bytes,
+and both implementations give the same values.
+
+| Written | Result |
+|---|---|
+| `"ab" + "cd"` | `"abcd"` (concatenation) |
+| `"n=" + 7`, `7 + "!"` | `"n=7"`, `"7!"` (an integer is joined as signed decimal) |
+| `"ab" * 3`, `3 * "ab"` | `"ababab"` (repetition; `""` for 0 or less) |
+| `s == t`, `s != t` | Whether the contents are the same; a string never equals an integer |
+| `s < t` and so on | Byte-wise lexicographic order; a string and an integer cannot be ordered (error) |
+| `s[i]` | The value (0–255) of byte `i`; `0` when out of range or negative |
+| `s[lo:hi]` | Substring, clamped like an array slice; `hi` is not included |
+| `.len(s)` | Number of bytes |
+| `.str(v)` | An integer as a signed decimal string; a string is returned as is |
+| `.chr(n)` | The one-byte string of value `n` (0–255) |
+| `.int(s)` | Reads a string as an integer: surrounding blanks, `+` `-`, `0x` `0b` and `_` are accepted; anything else is an error |
+
+```
+.func label(n, s)
+t = s + ":" + n           /* "loop:3" */
+.emit(.len(t))
+.emit(t)                  /* one word per byte */
+.return t[0:1] * 2        /* "ll" */
+.endfunc
+```
+
+- **Output is one word per byte.** Both `.emit(s)` and a string returned by a
+  function called from `binary_list` output each byte as one word, in order.
+- **Strings cannot be changed in place.** `s[i] = v` is an error; build a new
+  string with `+` and `[lo:hi]`.
+- **A string is not an array element.** Array elements are integers only.
+- **Not for conditions or arithmetic.** `.if s .then`, `s - 1`, `-s` and the
+  like are errors.
+- **Escapes** are `\\`, `\"`, `\n` and `\t`; any other `\` is an error. Use
+  `.chr(0)` for a NUL.
+- A string cannot contain `/*`: that is the pattern file's comment marker and is
+  stripped before the mini language sees the line. For the same reason a string
+  passed to `.call` in a `binary_list` cannot contain the field separator `::`
+  (it can inside a `.func` body).
+- The length limit is the same as for arrays, 1,048,576 bytes.
 
 ## Scope and nesting
 
@@ -312,7 +392,7 @@ v = .call hypot2(a,b)
 .endfunc
 ```
 
-- **The value may be a number or an array.** An array is passed as a copy, so
+- **The value may be a number, an array or a string.** An array is passed as a copy, so
   changing it in the caller does not affect the callee's variable.
 - **The target may be an array element.** `a[i] = .call f(x)` is allowed; the
   returned value must then be a number.
@@ -326,7 +406,8 @@ v = .call hypot2(a,b)
   `.return expr` may appear anywhere in the body — top level or nested inside
   `.if`/`.while`/`.for` — any number of times, as an early-exit statement.
 - **The return value of a function called from `binary_list` becomes output.**
-  A number is one word; an array is one word per element from index 0. It
+  A number is one word; an array is one word per element from index 0; a
+  string is one word per byte. It
   follows whatever the function passed to `.emit`, so a function that only
   `.emit`s and returns nothing behaves exactly as before.
 
@@ -383,7 +464,9 @@ i=i+1
 - **Arguments are pattern-layer expressions.** In `.call f(a,b)`, `a` and `b` mean
   the captured pattern variables. Anything writable in `binary_list` works —
   labels, `.equ`, `$.` — including forward-referenced labels. An array argument
-  is written `[expr, expr, ...]`.
+  is written `[expr, expr, ...]`, a string argument `"..."`, and `.exp(variable)`
+  passes the text a pattern variable captured, as a string. The bare name of a
+  string symbol passes that string.
 - **Variable namespaces are separate.** Mini-language variables have nothing to do
   with pattern variables or with `.setsym` symbols; pass what you need as
   an argument.
@@ -412,7 +495,7 @@ while it writes the `-o` ELF (Technical Manual section 3.7.10).
 | `.elfencode::<type>::<function>` | (the field's value, the addend) | the new field written back under REL |
 | `.elfrinfo::<function>` | (symbol index, type number) | the `r_info` of a relocation entry |
 
-- Two arguments, and a number (not an array) returned; anything else is an
+- Two arguments, and a number (not an array or a string) returned; anything else is an
   error.
 - The addend may be negative. It arrives as a 256-bit two's complement value,
   so `>>` and `&` pick out the bits needed.
@@ -436,7 +519,7 @@ the offending line.
 | Statements executed per `.call` | 4,000,000 |
 | Call nesting | 128 |
 | Words emitted per `.call` | 1,048,576 |
-| Array length | 1,048,576 |
+| Array length, string bytes | 1,048,576 |
 
 Syntax errors are reported when the pattern file is read, run-time errors when
 that instruction is assembled; both carry a file name and line number.

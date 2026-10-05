@@ -6950,6 +6950,20 @@ _MINI_OPS1 = frozenset('+-*/%&|^~<>!()[]:,=')
 _MINI_ESC = {'\\': '\\', '"': '"', 'n': '\n', 't': '\t'}
 
 
+def _mini_bytes(text):
+    """ソースに書かれた文字列をミニ言語の文字列（バイト列）にする。
+
+    ミニ言語の文字列は UTF-8 のバイトの並びで、長さも添字もバイト単位。
+    caxx.c は C の文字列をそのまま持つので、こうしておくと両者がそろう。
+    """
+    return text.encode('utf-8', 'surrogateescape')
+
+
+def _mini_dec(v):
+    """整数を符号付き 10 進の文字列（バイト列）にする。"""
+    return str(_mini_signed(v)).encode('ascii')
+
+
 def _mini_lex(text, pos):
     """ミニ言語の 1 行をトークンに割る。
 
@@ -7041,7 +7055,7 @@ def _mini_lex(text, pos):
                     continue
                 buf.append(ch)
                 j += 1
-            toks.append(('str', ''.join(buf)))
+            toks.append(('str', _mini_bytes(''.join(buf))))
             i = j
             continue
         if t[i:i + 2] in _MINI_OPS2:
@@ -7226,7 +7240,8 @@ class _MiniExprParser:
         """項そのもの。数値、名前、`(式)`、配列リテラル、`.call`、組み込み。"""
         k, v = self.peek()
         if k == 'str':
-            self.fail("a string can only be used in '.echo'")
+            self.i += 1
+            return ('str', v)
         if k == 'core':
             self.i += 1
             return ('core', v)
@@ -7237,12 +7252,13 @@ class _MiniExprParser:
             self.i += 1
             return ('var', v)
         if k == 'dot':
-            if v == '.LEN':
+            if v in ('.LEN', '.STR', '.CHR', '.INT'):
                 self.i += 1
                 self.expect_op('(')
                 e = self.or_()
                 self.expect_op(')')
-                return ('len', e)
+                return ({'.LEN': 'len', '.STR': 'tostr', '.CHR': 'chr',
+                         '.INT': 'toint'}[v], e)
             if v == '.CALL':
                 self.i += 1
                 k2, v2 = self.peek()
@@ -7437,12 +7453,7 @@ class MiniParser:
                 items = []
                 if not p.at_op(')'):
                     while True:
-                        k2, v2 = p.peek()
-                        if k2 == 'str':
-                            p.i += 1
-                            items.append(('s', v2))
-                        else:
-                            items.append(('e', p.or_()))
+                        items.append(p.or_())
                         if not p.eat_op(','):
                             break
                 p.expect_op(')')
@@ -7543,18 +7554,94 @@ class MiniInterp:
         """値が配列か。"""
         return isinstance(v, list)
 
+    @staticmethod
+    def _is_str(v):
+        """値が文字列（バイト列）か。"""
+        return isinstance(v, bytes)
+
+    @classmethod
+    def _copy(cls, v):
+        """値を複製する。配列はコピーとして渡り、文字列は書き換えられないので
+        そのまま共有する。"""
+        if cls._is_arr(v):
+            return list(v)
+        if cls._is_str(v):
+            return v
+        return _mini_wrap(v)
+
     @classmethod
     def _echo_value(cls, v):
-        """`.echo` に出す形に整える。"""
+        """`.echo` に出す形に整える。文字列の NUL は `\\0` と書いて出す。"""
         if cls._is_arr(v):
             return [_mini_signed(e) for e in v]
+        if cls._is_str(v):
+            return v.replace(b'\0', b'\\0')
         return _mini_signed(v)
 
+    @staticmethod
+    def _echo_out(parts):
+        """`.echo` の 1 行を標準エラーへ書く。
+
+        文字列はバイト列のまま書くので、caxx.c と同じバイトが出る。項目の
+        区切りと数・配列の体裁はマクロ層の `!echo`（_echo_write）と同じ。
+        """
+        line = b' '.join(x if isinstance(x, bytes) else _as_str(x).encode('utf-8')
+                         for x in parts) + b'\n'
+        sys.stderr.flush()
+        buf = getattr(sys.stderr, 'buffer', None)
+        if buf is None:
+            sys.stderr.write(line.decode('utf-8', 'surrogateescape'))
+        else:
+            buf.write(line)
+            buf.flush()
+
     def _need_int(self, v, pos, what):
-        """整数を要求する。配列が来たらエラーにする。"""
+        """整数を要求する。配列か文字列が来たらエラーにする。"""
         if self._is_arr(v):
             raise MiniLangError(f"{pos[0]}:{pos[1]}: {what} must be a number, not an array")
+        if self._is_str(v):
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: {what} must be a number, not a string")
         return _mini_wrap(v)
+
+    def _need_strlen(self, n, pos):
+        """作った文字列の長さを検査する。配列と同じ上限を使う。"""
+        if n > self.MAX_ARRAY:
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: string longer than the "
+                                f"maximum length {self.MAX_ARRAY}")
+
+    def _text_of(self, v, pos):
+        """`+` で文字列とつなぐ側を文字列にする。整数は符号付き 10 進。"""
+        if self._is_str(v):
+            return v
+        return _mini_dec(self._need_int(v, pos, 'an operand'))
+
+    def _to_int(self, v, pos):
+        """`.int(文字列)` — 文字列を整数として読む。
+
+        前後の空白、符号、`0x` / `0b`、桁区切りの `_` を受け付ける。
+        caxx.c の mini_str_to_int() と同じ規則である。
+        """
+        if self._is_arr(v):
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: '.int' needs a number or a string")
+        if not self._is_str(v):
+            return _mini_wrap(v)
+        t = v.strip(b' \t')
+        neg = False
+        if t[:1] in (b'+', b'-'):
+            neg = t[:1] == b'-'
+            t = t[1:]
+        base = 10
+        if t[:2] in (b'0x', b'0X'):
+            base, t = 16, t[2:]
+        elif t[:2] in (b'0b', b'0B'):
+            base, t = 2, t[2:]
+        digits = {10: b'0123456789', 16: b'0123456789abcdefABCDEF', 2: b'01'}[base]
+        if not t or any(c not in digits and c != 0x5f for c in t) \
+                or all(c == 0x5f for c in t):
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: '.int' cannot read the string "
+                                f"as a number")
+        x = int(t.replace(b'_', b'').decode('ascii'), base)
+        return _mini_wrap(-x if neg else x)
 
     def _frame_for(self, name):
         """その名前を持つスコープを探す。`.nonlocal` なら外側へたどる。"""
@@ -7620,6 +7707,8 @@ class MiniInterp:
         k = e[0]
         if k == 'num':
             return e[1]
+        if k == 'str':
+            return e[1]
         if k == 'core':
             return self._core_eval(e[1], pos)
         if k == 'var':
@@ -7637,21 +7726,35 @@ class MiniInterp:
             return ret
         if k == 'len':
             v = self.eval(e[1], pos)
-            if not self._is_arr(v):
-                raise MiniLangError(f"{pos[0]}:{pos[1]}: '.len' needs an array")
+            if not self._is_arr(v) and not self._is_str(v):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: '.len' needs an array or a string")
             return _mini_wrap(len(v))
+        if k == 'tostr':
+            v = self.eval(e[1], pos)
+            if self._is_arr(v):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: '.str' needs a number or a string")
+            return v if self._is_str(v) else _mini_dec(v)
+        if k == 'chr':
+            c = _mini_signed(self._need_int(self.eval(e[1], pos), pos, "'.chr' argument"))
+            if c < 0 or c > 255:
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: '.chr' needs a value from 0 to 255")
+            return bytes((c,))
+        if k == 'toint':
+            return self._to_int(self.eval(e[1], pos), pos)
         if k == 'index':
             base = self.eval(e[1], pos)
+            if not self._is_arr(base) and not self._is_str(base):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: only an array or a string "
+                                    f"can be indexed")
             idx = _mini_signed(self._need_int(self.eval(e[2], pos), pos, 'an index'))
-            if not self._is_arr(base):
-                raise MiniLangError(f"{pos[0]}:{pos[1]}: only an array can be indexed")
             if idx < 0 or idx >= len(base):
                 return 0
             return base[idx]
         if k == 'slice':
             base = self.eval(e[1], pos)
-            if not self._is_arr(base):
-                raise MiniLangError(f"{pos[0]}:{pos[1]}: only an array can be sliced")
+            if not self._is_arr(base) and not self._is_str(base):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: only an array or a string "
+                                    f"can be sliced")
             n = len(base)
             lo = 0 if e[2] is None else _mini_signed(
                 self._need_int(self.eval(e[2], pos), pos, 'a slice bound'))
@@ -7687,8 +7790,12 @@ class MiniInterp:
                 return 1
             return 1 if _mini_signed(
                 self._need_int(self.eval(e[3], pos), pos, 'an operand')) != 0 else 0
-        a = self._need_int(self.eval(e[2], pos), pos, 'an operand')
-        b = self._need_int(self.eval(e[3], pos), pos, 'an operand')
+        a = self.eval(e[2], pos)
+        b = self.eval(e[3], pos)
+        if self._is_str(a) or self._is_str(b):
+            return self._str_binop(op, a, b, pos)
+        a = self._need_int(a, pos, 'an operand')
+        b = self._need_int(b, pos, 'an operand')
         sa, sb = _mini_signed(a), _mini_signed(b)
         if op == '+':
             return _mini_wrap(sa + sb)
@@ -7738,10 +7845,51 @@ class MiniInterp:
             return 1 if sa == sb else 0
         return 1 if sa != sb else 0
 
+    def _str_binop(self, op, a, b, pos):
+        """片方でも文字列のときの二項演算。
+
+        `+` は連結（整数は符号付き 10 進にしてつなぐ）、`*` は繰り返し、
+        `==` `!=` は種類も含めた一致、`<` などはバイト順の辞書式比較。
+        caxx.c の mini_str_binop() と同じ規則である。
+        """
+        if op == '+':
+            r = self._text_of(a, pos) + self._text_of(b, pos)
+            self._need_strlen(len(r), pos)
+            return r
+        if op == '*':
+            if self._is_str(a) and self._is_str(b):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: a string can only be "
+                                    f"repeated by a number")
+            t, n = (a, b) if self._is_str(a) else (b, a)
+            n = _mini_signed(self._need_int(n, pos, 'a repeat count'))
+            if n <= 0:
+                return b''
+            self._need_strlen(len(t) * n, pos)
+            return t * n
+        if op in ('==', '!='):
+            if self._is_arr(a) or self._is_arr(b):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: an operand must be a "
+                                    f"number, not an array")
+            eq = self._is_str(a) and self._is_str(b) and a == b
+            return 1 if eq == (op == '==') else 0
+        if op in ('<', '<=', '>', '>='):
+            if not (self._is_str(a) and self._is_str(b)):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: cannot order a string "
+                                    f"against a number")
+            if op == '<':
+                return 1 if a < b else 0
+            if op == '<=':
+                return 1 if a <= b else 0
+            if op == '>':
+                return 1 if a > b else 0
+            return 1 if a >= b else 0
+        raise MiniLangError(f"{pos[0]}:{pos[1]}: an operand of '{op}' must be "
+                            f"a number, not a string")
+
     def _store(self, name, idx, v, pos):
         """変数か配列要素へ代入する。配列は必要なら伸ばす（上限あり）。"""
         if idx is None:
-            self._set(name, list(v) if self._is_arr(v) else _mini_wrap(v), pos)
+            self._set(name, self._copy(v), pos)
             return
         i = _mini_signed(self._need_int(self.eval(idx, pos), pos, 'an index'))
         if i < 0:
@@ -7749,12 +7897,16 @@ class MiniInterp:
         if i >= self.MAX_ARRAY:
             raise MiniLangError(f"{pos[0]}:{pos[1]}: array index {i} exceeds the "
                                 f"maximum length {self.MAX_ARRAY}")
+        elem = self._need_int(v, pos, 'an array element')
         arr = self._get(name, pos)
+        if self._is_str(arr):
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: {name!r} is a string; a string "
+                                f"cannot be changed in place")
         if not self._is_arr(arr):
             raise MiniLangError(f"{pos[0]}:{pos[1]}: {name!r} is not an array")
         if i >= len(arr):
             arr.extend([0] * (i + 1 - len(arr)))
-        arr[i] = self._need_int(v, pos, 'an array element')
+        arr[i] = elem
 
     def _tick(self, pos):
         """実行した文を 1 つ数える。上限を超えたらエラーにする。"""
@@ -7793,16 +7945,21 @@ class MiniInterp:
                 if self._is_arr(v):
                     raise MiniLangError(f"{pos[0]}:{pos[1]}: '.emit' needs numbers, "
                                         f"not an array")
-                if len(self.out) >= self.MAX_EMIT:
-                    raise MiniLangError(f"{pos[0]}:{pos[1]}: '.emit' produced more than "
-                                        f"{self.MAX_EMIT} words")
-                self.out.append(v)
+                # 文字列は 1 バイトを 1 ワードとして出す。
+                for w in (v if self._is_str(v) else (v,)):
+                    if len(self.out) >= self.MAX_EMIT:
+                        raise MiniLangError(f"{pos[0]}:{pos[1]}: '.emit' produced more "
+                                            f"than {self.MAX_EMIT} words")
+                    self.out.append(w)
             return
         if kind == 'raise':
             v = self.eval(st[1], pos)
             if self._is_arr(v):
                 raise MiniLangError(f"{pos[0]}:{pos[1]}: '.raise' needs a number, "
                                     f"not an array")
+            if self._is_str(v):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: '.raise' needs a number, "
+                                    f"not a string")
             if (self.state is not None
                     and self.state.should_report_errors()
                     and not self.state._pass1_size_mode):
@@ -7816,12 +7973,11 @@ class MiniInterp:
                 self.state.had_error = True
             return
         if kind == 'echo':
-            parts = [x if k2 == 's' else self._echo_value(self.eval(x, pos))
-                     for k2, x in st[1]]
+            parts = [self._echo_value(self.eval(x, pos)) for x in st[1]]
             if (self.state is not None
                     and self.state.should_report_errors()
                     and not self.state._pass1_size_mode):
-                _echo_write(parts)
+                self._echo_out(parts)
             return
         if kind == 'call':
             _, name, args, _ = st
@@ -7910,7 +8066,7 @@ class MiniInterp:
                                 f"{len(func.params)} argument(s), got {len(args)}")
         frame = {'vars': {}, 'nonlocal': set(), 'func': func}
         for nm, v in zip(func.params, args):
-            frame['vars'][nm] = list(v) if self._is_arr(v) else _mini_wrap(v)
+            frame['vars'][nm] = self._copy(v)
         self.frames.append(frame)
         ret = None
         try:
@@ -8095,6 +8251,9 @@ class ObjectGenerator:
         depth = 0
         k = idx
         while k < len(s) and s[k] != chr(0):
+            if s[k] == '"':
+                k = self._mini_skip_str(s, k)
+                continue
             if s[k] in '([':
                 depth += 1
             elif s[k] in ')]':
@@ -8129,6 +8288,23 @@ class ObjectGenerator:
                 if v is None:
                     return [], idx
                 args.append(v)
+            elif arg_text_z[a] == '"':
+                v, a = self._mini_arg_str(arg_text_z, a, name)
+                if v is None:
+                    return [], idx
+                args.append(v)
+            elif self._mini_is_exp(arg_text_z, a):
+                v, a = self._mini_arg_exp(arg_text_z, a, name)
+                if v is None:
+                    return [], idx
+                args.append(v)
+            elif self._mini_strsym_at(arg_text_z, a) is not None:
+                key, a = self._mini_strsym_at(arg_text_z, a)
+                v, _ = self._mini_arg_str(
+                    '"' + self.state.strsymbols[key] + '"' + chr(0), 0, name)
+                if v is None:
+                    return [], idx
+                args.append(v)
             else:
                 v, a = self.expr_eval.expression_pat(arg_text_z, a)
                 args.append(0 if _is_undef_derived(v) else v)
@@ -8153,8 +8329,103 @@ class ObjectGenerator:
         finally:
             sys.setrecursionlimit(saved_reclimit)
         if ret is not None:
-            words = words + (list(ret) if isinstance(ret, list) else [ret])
+            words = words + (list(ret) if isinstance(ret, (list, bytes)) else [ret])
         return words, idx
+
+    @staticmethod
+    def _mini_skip_str(s, k):
+        """s[k] の `"` から始まる文字列リテラルの次の位置を返す。
+
+        閉じていなければ行末の位置。caxx.c の mini_skip_str() と同じ。
+        """
+        k += 1
+        while k < len(s) and s[k] != chr(0):
+            if s[k] == '\\' and k + 1 < len(s):
+                k += 2
+                continue
+            if s[k] == '"':
+                return k + 1
+            k += 1
+        return k
+
+    @staticmethod
+    def _mini_is_exp(t, a):
+        """t[a] から `.exp(` が始まるか。`.expx` のような別の名前は除く。"""
+        if StringUtils.upper(t[a:a + 4]) != '.EXP':
+            return False
+        k = a + 4
+        if k < len(t) and t[k] in _SYM_CORE:
+            return False
+        k = StringUtils.skipspc(t, k)
+        return k < len(t) and t[k] == '('
+
+    def _mini_strsym_at(self, t, a):
+        """t[a] からの引数が文字列シンボルの名前 1 つだけなら (名前, 次の位置)。
+
+        `.setsym::名前::"..."` の名前で、後ろが `,` か引数の終わりのときだけ
+        当たる。式の一部（`msg+1` など）は今までどおり式として読む。
+        caxx.c の mini_strsym_at() と同じ規則である。
+        """
+        k = a
+        while k < len(t) and t[k] in _SYM_CORE:
+            k += 1
+        if k == a:
+            return None
+        e = StringUtils.skipspc(t, k)
+        if e < len(t) and t[e] not in (',', chr(0)):
+            return None
+        key = StringUtils.upper(t[a:k])
+        if key not in self.state.strsymbols:
+            return None
+        return key, e
+
+    def _mini_arg_exp(self, t, a, name):
+        """`.exp(変数)` と書かれた引数を、その変数が捕捉した綴りの文字列にする。
+
+        綴りは `{{.exp(変数)}}` が出すものと同じ。
+        caxx.c の mini_arg_exp() と同じ規則である。
+        """
+        k = StringUtils.skipspc(t, a + 4) + 1
+        e = t.find(')', k)
+        nm = t[k:e].strip(' \t') if e >= 0 else ''
+        if e < 0 or not nm or PatternMatcher._var_name_at(nm, 0) != len(nm):
+            self._mini_diag(f" error - '.call {name}': '.exp' needs "
+                            f"'.exp(variable)'.")
+            return None, len(t)
+        if nm not in self.state.varnames:
+            self._mini_diag(f" error - '{nm}' is not a pattern variable; "
+                            f"'.exp({nm})' needs '{nm}' captured in the "
+                            f"instruction field.")
+            return None, len(t)
+        return _mini_bytes(self.state.vars_text.get(nm, '')), e + 1
+
+    def _mini_arg_str(self, t, a, name):
+        """`"..."` と書かれた引数を文字列として読む。
+
+        逃げ記号はミニ言語の文字列と同じ `\\\\` `\\"` `\\n` `\\t` の 4 つ。
+        caxx.c の mini_arg_str() と同じ規則である。
+        """
+        out = []
+        k = a + 1
+        while True:
+            if k >= len(t) or t[k] == chr(0):
+                self._mini_diag(f" error - '.call {name}': unterminated string "
+                                f"in the argument list.")
+                return None, len(t)
+            c = t[k]
+            if c == '"':
+                return _mini_bytes(''.join(out)), k + 1
+            if c == '\\':
+                e = t[k + 1] if k + 1 < len(t) else chr(0)
+                if e not in _MINI_ESC:
+                    self._mini_diag(f" error - '.call {name}': unknown escape in a "
+                                    f"string in the argument list.")
+                    return None, len(t)
+                out.append(_MINI_ESC[e])
+                k += 2
+                continue
+            out.append(c)
+            k += 1
 
     def _mini_arg_array(self, t, a, name):
         """`[e1, e2, ...]` と書かれた引数を配列として評価する。"""
@@ -13069,7 +13340,7 @@ class Assembler:
             return None
         finally:
             sys.setrecursionlimit(saved_reclimit)
-        if ret is None or isinstance(ret, list):
+        if ret is None or isinstance(ret, (list, bytes)):
             self.state.diag(f" error - {dname}: function '{fname}' must return a number.",
                             set_error=True)
             return None

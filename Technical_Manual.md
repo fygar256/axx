@@ -44,13 +44,13 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all fifty-one bundled pattern/source pairs with
+exactly that: `test1` assembles all fifty-two bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the five `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
-`-V`, and for the `echo.axx` pair the `.echo` lines each one writes to standard
+`-V`, and for the `echo.axx` and `ministr.axx` pairs the `.echo` lines each one writes to standard
 error. The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for a hundred and eighty-two comparisons in all.
+text output are compared too, for a hundred and eighty-six comparisons in all.
 
 **Contents**
 
@@ -2330,7 +2330,7 @@ A `binary_list` element may be `.call name(argument, ...)`, which runs a
 function written in a small procedural language and emits the words that
 function produces — the values it passes to `.emit`, followed by its return
 value if it has one. The language has assignment, `.if`/`.elif`, `.while`,
-`.for`, recursion and arrays, so an encoding that cannot be written as a fixed
+`.for`, recursion, arrays and strings, so an encoding that cannot be written as a fixed
 expression can be computed instead. `.echo` prints to stderr without emitting
 anything, for working out why a function produced what it did (the same `.echo`
 can also be written on a body line of a pattern file; section 3.14.1).
@@ -2367,6 +2367,33 @@ expressions too. `[]` is the empty array.
 
 ```
 LOG !v :: .call table([0x11,0x22,v],3)
+```
+
+An argument written `"..."` is a **string** (see "Strings" below). A comma or a
+parenthesis inside the string does not split the arguments.
+
+```
+MSG !n :: .call func1(n,"text")
+```
+
+An argument written `.exp(variable)` is the **string** of text that pattern
+variable captured from the source. It is the same text the template
+`{{.exp(variable)}}` emits (section 3.18), and any capture form works.
+
+```
+SPELL !x,r :: .call func1(x,.exp(x),.exp(r))     /* spell 1+2*3,rb → func1(7, "1+2*3", "rb") */
+```
+
+An argument that is just the name of a string symbol (section 3.6,
+`.setsym::name::"..."`) passes that **string**. It is read as if
+`.call func1(10,"...")` had been written, so the same escapes are opened. The
+name is case-insensitive. When the name is part of an expression, as in `msg+1`,
+it is read as an expression as before; a pattern variable of the same name does
+not hide it — as with `{{name}}`, the string symbol is found first.
+
+```
+.setsym::msg::"text"
+MSG :: .call func1(10,msg)          /* func1(10, "text") */
 ```
 
 The `;` modifier of [section 3.5](#35-binary_list) applies to `.call` as well:
@@ -2430,11 +2457,8 @@ assembler is measuring instruction lengths or converging in pass 1, so each
 line appears once per assembled instruction, not once per relaxation
 iteration.
 
-Strings may appear only in the argument list of `.echo`. Values are integers
-and arrays only, so a string cannot be assigned to a variable or used in an
-expression. The escapes are `\\`, `\"`, `\n` and `\t`; any other `\` is an
-error. A string cannot contain `/*` — that is the pattern file's comment
-marker, stripped before the mini language sees the line.
+An item may also be a string built by an expression (`.echo("n=" + n)`). A
+string prints as its bytes, except that a NUL (`.chr(0)`) prints as `\0`.
 
 `.raise <expr>` reports an error whose error code is the value of `<expr>`, in
 exactly the format an `error_patterns` field produces for `condition;code`
@@ -2581,7 +2605,51 @@ b = a[1:3]        /* [0,0] — the end index is not included */
 Assigning past the end extends the array with zeros. Reading past the end, or
 at a negative index, gives `0` and leaves the array alone. Slice bounds are
 clamped to the array. `.len(x)` is the length. Array elements are numbers, not
-arrays.
+arrays or strings.
+
+#### Strings
+
+Besides integers and arrays, a value can be a **string**. It is written `"..."`
+and can be used anywhere: in an expression, assigned to a variable, as an
+argument and as a return value. From a `binary_list` it is passed as in
+`.call func1(10,"text")`.
+
+A string is **a sequence of bytes**. The characters written in the source go in
+as their UTF-8 bytes, so `"あ"` has length 3. Lengths and subscripts count bytes,
+and both implementations give the same values.
+
+| Written | Result |
+|---|---|
+| `"ab" + "cd"` | `"abcd"` (concatenation) |
+| `"n=" + 7`, `7 + "!"` | `"n=7"`, `"7!"` (an integer is joined as signed decimal) |
+| `"ab" * 3`, `3 * "ab"` | `"ababab"` (repetition; `""` for 0 or less) |
+| `s == t`, `s != t` | Whether the contents are the same; a string never equals an integer |
+| `s < t` and so on | Byte-wise lexicographic order; a string and an integer cannot be ordered (error) |
+| `s[i]` | The value (0–255) of byte `i`; `0` when out of range or negative |
+| `s[lo:hi]` | Substring, clamped like an array slice; `hi` is not included |
+| `.len(s)` | Number of bytes |
+| `.str(v)` | An integer as a signed decimal string; a string is returned as is |
+| `.chr(n)` | The one-byte string of value `n` (0–255) |
+| `.int(s)` | Reads a string as an integer: surrounding blanks, `+` `-`, `0x` `0b` and `_` are accepted; anything else is an error |
+
+```
+.func label(n, s)
+t = s + ":" + n           /* "loop:3" */
+.emit(.len(t))
+.emit(t)                  /* one word per byte */
+.return t[0:1] * 2        /* "ll" */
+.endfunc
+```
+
+Both `.emit(s)` and a string returned by a function called from `binary_list`
+output each byte as one word, in order. A string cannot be changed in place
+(`s[i] = v` is an error), is not an array element, and is not usable as a
+condition or in arithmetic (`.if s .then`, `s - 1`). The escapes are `\\`,
+`\"`, `\n` and `\t`; any other `\` is an error. A NUL is made with `.chr(0)`.
+A string cannot contain `/*` — that is the pattern file's comment marker,
+stripped before the mini language sees the line. For the same reason a string
+passed to `.call` in a `binary_list` cannot contain the field separator `::`
+(it can inside a `.func` body). The length limit is the same as for arrays.
 
 #### Scope and nesting
 
@@ -2697,7 +2765,7 @@ while it writes the `-o` ELF (section 3.7.10).
 | `.elfencode::<type>::<function>` | (the field's value, the addend) | the new field written back under REL |
 | `.elfrinfo::<function>` | (symbol index, type number) | the `r_info` of a relocation entry |
 
-They take two arguments and return a number (not an array); anything else is an
+They take two arguments and return a number (not an array or a string); anything else is an
 error. The addend may be negative (it arrives as a 256-bit two's complement
 value, so `>>` and `&` pick out the bits needed). Values passed to `.emit` here
 produce no output words.
@@ -2712,7 +2780,7 @@ the assembler. Four caps stop that and report the offending line instead:
 | Statements executed per `.call` | 4,000,000 |
 | Call nesting | 128 |
 | Words emitted per `.call` | 1,048,576 |
-| Array length | 1,048,576 |
+| Array length, string bytes | 1,048,576 |
 
 An argument that came from an undefined label is passed as `0`, so a
 forward reference cannot blow a loop count up during the first pass.
@@ -2877,7 +2945,9 @@ label is gone from the rewritten text. With `!La` and `{{.exp(a)}}`, `msg` stays
 
 `!L` is not the only capture that remembers its text. A variable captured by any
 form of the `instruction` field keeps both its value and its text, as `!L` does,
-and `{{.exp(<variable>)}}` emits that text. The only difference left in `!L` is
+and `{{.exp(<variable>)}}` emits that text. Written as an argument of the mini
+language's `.call`, `.exp(<variable>)` passes the same text to the function as a
+string (section 3.15). The only difference left in `!L` is
 that it lets an undefined label through in text replacement mode.
 
 | Form | Text emitted by `{{.exp()}}` |
@@ -4394,6 +4464,7 @@ The x86_64 pattern file is also maintained separately at
 | **unordered.axx** | 1.7 KB | 28 | **unordered.s** | `.unordered` and per-variable `.map` (3.19): the Z80 `C` as a register and as carry; test only |
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | `.echo` on a body line (3.14.1); test only |
+| **ministr.axx** | 3.3 KB | 8 | **ministr.s** | Strings in the mini language (3.15); test only |
 | **elftype.axx** | 1.5 KB | 20 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
@@ -4433,7 +4504,7 @@ re-encoded and the new instructions of Release 6, checked against llvm-mc 19
 down to the relocations). `mips_isa.axx` is included by those eight and is never
 passed to axx itself.
 
-`test1` runs all fifty-one pairs through both implementations and
+`test1` runs all fifty-two pairs through both implementations and
 compares the `-b` raw binaries. For the five pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
@@ -4449,7 +4520,7 @@ CFI, so for those twelve the `-o` ELF objects are compared (`elfcfi` under ELF32
 `-m 3 -f 32`, REL, too). For `aarch64.axx` (`-m 183`) and `elfpair.axx` the
 `--elfdesc` output (the description rewritten as declarations) is compared too.
 For the
-`echo.axx` / `echo.s` pair the `.echo` lines written to standard error are
+`echo.axx` / `echo.s` and `ministr.axx` / `ministr.s` pairs the `.echo` lines written to standard error are
 compared as well. The twelve MIPS pairs (`mips.axx`, `mipsel.axx`, `mips64.axx`
 and `mips64el.axx` with `mips.s` and with `mips_ase.s`, the four Release 6 files
 with `mipsr6.s`) also compare their `-o` ELF objects (ELF32 REL for o32, ELF64
@@ -4459,7 +4530,7 @@ The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for a hundred and eighty-two comparisons in all.
+never compares, for a hundred and eighty-six comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -4490,9 +4561,9 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all fifty-one bundled pattern/source pairs with both
+`test1` assembles all fifty-two bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
-five `.textmode` pairs and the `.echo` lines of the `echo.axx` pair.
+five `.textmode` pairs and the `.echo` lines of the `echo.axx` and `ministr.axx` pairs.
 
 ### C.2 External
 

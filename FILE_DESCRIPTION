@@ -69,6 +69,15 @@ expcap.axx                          pattern file for `{{.exp(x)}}` on every
                                     and `!Y` all keep the source spelling
                                     along with the value (manual 3.18)
 expcap.s                            test assemble file for expcap.axx
+ministr.axx                         pattern file for strings in the mini
+                                    language: `.call f(10,"text")`, `+` `*`
+                                    and comparisons, byte subscripts and
+                                    slices, `.str` / `.chr` / `.int`, and
+                                    `.emit` / `.echo` of a string, and
+                                    `.call f(x,.exp(x))` passing a pattern
+                                    variable's captured text, and a string
+                                    symbol passed by its name (MINI.md)
+ministr.s                           test assemble file for ministr.axx
 unordered.axx                       pattern file for .unordered: directives that
                                     hold for the whole file wherever they are
                                     written, and .map tables per variable, so

@@ -1,0 +1,99 @@
+/*  ==================================================================
+/*  ministr.axx -- ミニ言語の文字列
+/*
+/*  MINI.md「文字列」のテスト。
+/*    - `.call f(10,"text")` のように binary_list から文字列を渡せること
+/*      （文字列の中のカンマや括弧で引数が割れないこと）
+/*    - 文字列リテラルを式の中・変数・配列でない値として使えること
+/*    - `+` の連結（整数は符号付き 10 進）、`*` の繰り返し、`==` `!=`、
+/*      `<` などの辞書式比較
+/*    - `.len` `s[i]` `s[lo:hi]` がバイト単位であること（UTF-8 も含む）
+/*    - `.str` `.chr` `.int` の変換
+/*    - `.emit(文字列)` と文字列の返り値が 1 バイト 1 ワードになること
+/*    - `.echo` が文字列をそのまま出し、NUL を `\0` と書くこと
+/*    - `.call f(x,.exp(x))` で、パターン変数が捕捉した綴りを文字列として
+/*      渡せること
+/*    - `.call f(10,msg)` で、文字列シンボル `.setsym::msg::"..."` を
+/*      文字列として渡せること（逃げ記号は `"..."` と直接書いたときと同じ）
+/*  を確かめる。paxx と caxx が同じバイト列と同じ標準エラーを出すことも
+/*  確かめる。
+/*  ==================================================================
+
+.bits::8
+
+/*  binary_list から数と文字列を渡す。返り値の文字列もそのまま出る。 */
+GREET !n :: 0xaa,.call greet(n,"Hi"),0xbb
+.func greet(n, s)
+.emit(.len(s))
+.emit(s)
+.return s + "!" + n
+.endfunc
+
+/*  文字列の中のカンマ・括弧・逃げ記号。 */
+QUOTE :: .call show("a,b)", "q\"t\\n\t")
+.func show(a, b)
+.echo("a=", a, "b=", b)
+.emit(.len(a), .len(b))
+.return a + b
+.endfunc
+
+/*  連結・繰り返し・比較。 */
+OPS !n :: .call ops(n)
+.func ops(n)
+s = "ab" * 3
+.emit(.len(s))
+t = "-" + n + "-"
+.echo(s, t)
+.emit(s == "ababab", s != "ababab", "x" == 120, "x" != 120)
+.emit("abc" < "abd", "abc" < "ab", "b" > "abc", "ab" <= "ab", "" >= "")
+.emit("ab" * 0 == "", 2 * "z" == "zz")
+.endfunc
+
+/*  添字・切り出し・長さはバイト単位。UTF-8 の文字は 3 バイト。 */
+BYTES :: .call bytes("aあb")
+.func bytes(s)
+.emit(.len(s), s[0], s[1], s[4], s[99], s[-1])
+.return s[1:4] + s[4:] + s[:1]
+.endfunc
+
+/*  変換。 */
+CONV !n :: .call conv(n)
+.func conv(n)
+.emit(.int(" -0x1_0 "), .int("+25"), .int("0b101"), .int(n))
+.echo(.str(n), .str(-n), .str("keep"), .chr(65) + .chr(0x42))
+z = .chr(0) + "x"
+.echo(z, .len(z))
+.emit(z)
+.endfunc
+
+/*  関数のあいだで文字列を受け渡す。配列とは別の値である。 */
+PASS :: .call pass()
+.func pass()
+v = .call twice("ok")
+w = 1 + .len(.call twice("abc"))
+a = [1, 2]
+.echo(v, w, a, .len(v + "!"))
+.return v
+.endfunc
+.func twice(s)
+.return s + s
+.endfunc
+
+/*  `.exp(変数)` は、その変数が捕捉した綴りの文字列になる。`{{.exp()}}` と同じ。 */
+.setsym::RA::1
+.setsym::RB::2
+.check::r::RA,RB
+SPELL !x, r :: .call spell(x, .exp(x), .exp( r ))
+.func spell(v, s, t)
+.echo(v, s, t, .len(s))
+.emit(.len(s))
+.return s + "/" + t
+.endfunc
+
+/*  文字列シンボルの名前 1 つだけの引数は、その文字列になる。 */
+.setsym::msg::"say \"hi\""
+NAMED !n :: .call named(n, msg, MSG)
+.func named(n, s, t)
+.echo(n, s, s == t)
+.return s
+.endfunc
