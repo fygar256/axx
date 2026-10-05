@@ -2363,7 +2363,8 @@ MIX !e :: 0x90,.call rep(e),0xff
 ```
 
 An argument written `[e1, e2, ...]` is an **array**; its elements are pattern
-expressions too. `[]` is the empty array.
+expressions too, and `"..."`, `.exp(variable)` or the name of a string symbol
+makes a string element. `[]` is the empty array.
 
 ```
 LOG !v :: .call table([0x11,0x22,v],3)
@@ -2416,6 +2417,7 @@ f(a)` runs the call and discards its output.
 | `.if <expr> .then` / `.elif <expr> .then` / `.else` / `.endif` | Conditional; `.elif` may repeat, `.else` is optional |
 | `.while(<expr>)` / `.endwhile` | Loop while the condition is non-zero |
 | `.for <name> in range(...)` / `.next` | Loop over `range(stop)`, `range(start, stop)` or `range(start, stop, step)` |
+| `.for <name> in <array>` / `.next` | Loop over the array's elements (integers or strings) from index 0. The array is copied before the loop starts, so changing it in the body does not change the elements visited |
 | `.nonlocal a, b` | Bind these names to the enclosing call instead of locally |
 | `.return` | Return from the function. May appear anywhere in the body (top level or inside `.if`/`.while`/`.for`), any number of times |
 | `.return <expr>` | Return a value from the function |
@@ -2450,7 +2452,7 @@ and the two may be mixed:
 ```
 
 A string prints as written, an integer as signed decimal, an array as
-`[1, 2, 3]`, and the items of one call share a line separated by spaces — the
+`[1, 2, 3]` (string elements quoted, as in `["ab", 1]`), and the items of one call share a line separated by spaces — the
 same output routine the macro layer's `!echo` uses, so the two agree.
 `.echo()` with no item prints an empty line. Nothing is printed while the
 assembler is measuring instruction lengths or converging in pass 1, so each
@@ -2533,9 +2535,9 @@ v = .call hypot2(a,b)
 .endfunc
 ```
 
-The value may be a number or an array; an array is passed as a copy. The target
-may be an array element (`a[i] = .call f(x)`), in which case the returned value
-must be a number. Calling a function that returns nothing in that form is an
+The value may be a number, an array or a string; an array is passed as a copy.
+The target may be an array element (`a[i] = .call f(x)`), in which case the
+returned value must be a number or a string. Calling a function that returns nothing in that form is an
 error.
 
 `.call name(args)` may also appear as a term *inside* a larger expression, where
@@ -2567,7 +2569,8 @@ i=i+1
 ```
 
 When a function is called straight from `binary_list`, its return value becomes
-output: a number is one word, an array is one word per element from index 0.
+output: a number is one word, an array is one word per element from index 0
+(a string element one word per byte).
 That is in addition to whatever it passed to `.emit`, so a function that only
 `.emit`s and returns nothing behaves exactly as before.
 
@@ -2604,8 +2607,8 @@ b = a[1:3]        /* [0,0] — the end index is not included */
 
 Assigning past the end extends the array with zeros. Reading past the end, or
 at a negative index, gives `0` and leaves the array alone. Slice bounds are
-clamped to the array. `.len(x)` is the length. Array elements are numbers, not
-arrays or strings.
+clamped to the array. `.len(x)` is the length. Array elements are numbers or
+strings, never arrays (`a = ["ab", 1]`, `a[i] = "x"`).
 
 #### Strings
 
@@ -4464,7 +4467,7 @@ The x86_64 pattern file is also maintained separately at
 | **unordered.axx** | 1.7 KB | 28 | **unordered.s** | `.unordered` and per-variable `.map` (3.19): the Z80 `C` as a register and as carry; test only |
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | `.echo` on a body line (3.14.1); test only |
-| **ministr.axx** | 3.3 KB | 8 | **ministr.s** | Strings in the mini language (3.15); test only |
+| **ministr.axx** | 4.4 KB | 10 | **ministr.s** | Strings, arrays of strings and `.for ... in <array>` in the mini language (3.15); test only |
 | **elftype.axx** | 1.5 KB | 20 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |

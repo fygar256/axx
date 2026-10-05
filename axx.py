@@ -7070,6 +7070,21 @@ def _mini_lex(text, pos):
     return toks
 
 
+def _mini_tok_repr(k, v):
+    """診断に出すためにトークンを書く。数は 10 進、行末は 'end of line'。
+
+    文字列はバイト列なので、ソースの綴りに戻してから repr を取る。
+    caxx.c の mxp_tokdesc() と同じ。
+    """
+    if k == 'end':
+        return repr('end of line')
+    if k == 'num':
+        return str(v)
+    if k == 'str':
+        return repr(v.decode('utf-8', 'surrogateescape'))
+    return repr(v)
+
+
 class _MiniExprParser:
     """ミニ言語の式を構文木にする。優先順位ごとに 1 メソッドの再帰下降。
 
@@ -7106,7 +7121,7 @@ class _MiniExprParser:
         """その演算子を必ず 1 つ消費する。無ければ構文エラー。"""
         if not self.eat_op(op):
             k, v = self.peek()
-            self.fail(f"expected {op!r}, found {v if k != 'end' else 'end of line'!r}")
+            self.fail(f"expected {op!r}, found {_mini_tok_repr(k, v)}")
 
     def at_end(self):
         """トークンを読み切ったか。"""
@@ -7117,7 +7132,7 @@ class _MiniExprParser:
         e = self.or_()
         if not self.at_end():
             k, v = self.peek()
-            self.fail(f"unexpected {v!r} in expression")
+            self.fail(f"unexpected {_mini_tok_repr(k, v)} in expression")
         return e
 
     def or_(self):
@@ -7288,7 +7303,7 @@ class _MiniExprParser:
                     items.append(self.or_())
             self.expect_op(']')
             return ('arr', items)
-        self.fail(f"expected a value, found {v if k != 'end' else 'end of line'!r}")
+        self.fail(f"expected a value, found {_mini_tok_repr(k, v)}")
 
     def parse_list(self):
         """カンマ区切りの式の並びを解析する（引数と配列リテラル）。"""
@@ -7300,7 +7315,7 @@ class _MiniExprParser:
             items.append(self.or_())
         if not self.at_end():
             k, v = self.peek()
-            self.fail(f"unexpected {v!r} after expression list")
+            self.fail(f"unexpected {_mini_tok_repr(k, v)} after expression list")
         return items
 
 
@@ -7354,13 +7369,13 @@ class MiniParser:
                 i += 1
                 continue
             if kw == '.FOR':
-                var, args = self._for_header(text, pos)
+                var, kind, args = self._for_header(text, pos)
                 self.loopdepth += 1
                 body, i = self._block(i + 1, ('.NEXT',))
                 self.loopdepth -= 1
                 if i >= len(self.lines):
                     raise MiniLangError(f"{f}:{ln}: '.for' is never closed with '.next'")
-                out.append(('for', var, args, body, pos))
+                out.append((kind, var, args, body, pos))
                 i += 1
                 continue
             out.append(self._simple(text, pos))
@@ -7395,14 +7410,23 @@ class MiniParser:
         return ('if', cond, then_b, else_b, pos), i
 
     def _for_header(self, text, pos):
-        """`.for` のヘッダ（変数と範囲）を解析する。"""
+        """`.for` のヘッダ（変数と範囲）を解析する。
+
+        `in` の後ろが `range(` なら数の範囲で ('for', 変数, 引数) を、それ以外は
+        式として読んで ('forin', 変数, 式) を返す。式の値は配列でなければならず、
+        その要素を順に回す。caxx.c の msp_block() の `.FOR` と同じ規則である。
+        """
         toks = _mini_lex(text, pos)
         f, ln = pos
         if len(toks) < 4 or toks[1][0] != 'name':
-            raise MiniLangError(f"{f}:{ln}: '.for' needs 'variable in range(...)'")
+            raise MiniLangError(f"{f}:{ln}: '.for' needs 'variable in range(...)' "
+                                f"or 'variable in array'")
         var = toks[1][1]
-        if toks[2] != ('name', 'in') or toks[3] != ('name', 'range'):
-            raise MiniLangError(f"{f}:{ln}: '.for {var}' must be followed by 'in range(...)'")
+        if toks[2] != ('name', 'in'):
+            raise MiniLangError(f"{f}:{ln}: '.for {var}' must be followed by "
+                                f"'in range(...)' or 'in array'")
+        if toks[3] != ('name', 'range') or len(toks) < 5 or toks[4] != ('op', '('):
+            return var, 'forin', _MiniExprParser(toks[3:], pos).parse()
         p = _MiniExprParser(toks[4:], pos)
         p.expect_op('(')
         args = []
@@ -7415,7 +7439,7 @@ class MiniParser:
             raise MiniLangError(f"{f}:{ln}: unexpected text after 'range(...)'")
         if not 1 <= len(args) <= 3:
             raise MiniLangError(f"{f}:{ln}: range() takes 1 to 3 arguments, got {len(args)}")
-        return var, args
+        return var, 'for', args
 
     def _simple(self, text, pos):
         """単純文 1 個を解析する。代入、`.emit`、`.echo`、`.raise`、`.return` など。"""
@@ -7571,9 +7595,15 @@ class MiniInterp:
 
     @classmethod
     def _echo_value(cls, v):
-        """`.echo` に出す形に整える。文字列の NUL は `\\0` と書いて出す。"""
+        """`.echo` に出す形に整える。文字列の NUL は `\\0` と書いて出す。
+
+        配列は `[1, "ab", 3]` の形で、文字列の要素だけ `"` で囲む。
+        caxx.c の mini_echo_text() と同じ体裁である。
+        """
         if cls._is_arr(v):
-            return [_mini_signed(e) for e in v]
+            return b'[' + b', '.join(
+                b'"' + e.replace(b'\0', b'\\0') + b'"' if cls._is_str(e)
+                else str(_mini_signed(e)).encode('ascii') for e in v) + b']'
         if cls._is_str(v):
             return v.replace(b'\0', b'\\0')
         return _mini_signed(v)
@@ -7602,6 +7632,13 @@ class MiniInterp:
         if self._is_str(v):
             raise MiniLangError(f"{pos[0]}:{pos[1]}: {what} must be a number, not a string")
         return _mini_wrap(v)
+
+    def _need_elem(self, v, pos):
+        """配列の要素にできる値（整数か文字列）を要求する。"""
+        if self._is_arr(v):
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: an array element must be a "
+                                f"number or a string, not an array")
+        return v if self._is_str(v) else _mini_wrap(v)
 
     def _need_strlen(self, n, pos):
         """作った文字列の長さを検査する。配列と同じ上限を使う。"""
@@ -7714,8 +7751,7 @@ class MiniInterp:
         if k == 'var':
             return self._get(e[1], pos)
         if k == 'arr':
-            return [self._need_int(self.eval(x, pos), pos, 'an array element')
-                    for x in e[1]]
+            return [self._need_elem(self.eval(x, pos), pos) for x in e[1]]
         if k == 'callexpr':
             fn = self._lookup(e[1], pos)
             vals = [self.eval(a, pos) for a in e[2]]
@@ -7897,7 +7933,7 @@ class MiniInterp:
         if i >= self.MAX_ARRAY:
             raise MiniLangError(f"{pos[0]}:{pos[1]}: array index {i} exceeds the "
                                 f"maximum length {self.MAX_ARRAY}")
-        elem = self._need_int(v, pos, 'an array element')
+        elem = self._need_elem(v, pos)
         arr = self._get(name, pos)
         if self._is_str(arr):
             raise MiniLangError(f"{pos[0]}:{pos[1]}: {name!r} is a string; a string "
@@ -8041,6 +8077,22 @@ class MiniInterp:
                 except _MiniBreak:
                     break
                 i += step
+            return
+        if kind == 'forin':
+            _, var, expr, body, _ = st
+            arr = self.eval(expr, pos)
+            if not self._is_arr(arr):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: '.for {var} in' needs an array")
+            # 回り始める前に写しを取る。本体で配列を書き換えても回る順番は変わらない。
+            for elem in list(arr):
+                self._tick(pos)
+                self._set(var, self._copy(elem), pos)
+                try:
+                    self.exec_block(body)
+                except _MiniContinue:
+                    pass
+                except _MiniBreak:
+                    break
             return
         raise MiniLangError(f"{pos[0]}:{pos[1]}: bad statement")
 
@@ -8283,31 +8335,10 @@ class ObjectGenerator:
             if arg_text_z[a] == ',':
                 a += 1
                 continue
-            if arg_text_z[a] == '[':
-                v, a = self._mini_arg_array(arg_text_z, a, name)
-                if v is None:
-                    return [], idx
-                args.append(v)
-            elif arg_text_z[a] == '"':
-                v, a = self._mini_arg_str(arg_text_z, a, name)
-                if v is None:
-                    return [], idx
-                args.append(v)
-            elif self._mini_is_exp(arg_text_z, a):
-                v, a = self._mini_arg_exp(arg_text_z, a, name)
-                if v is None:
-                    return [], idx
-                args.append(v)
-            elif self._mini_strsym_at(arg_text_z, a) is not None:
-                key, a = self._mini_strsym_at(arg_text_z, a)
-                v, _ = self._mini_arg_str(
-                    '"' + self.state.strsymbols[key] + '"' + chr(0), 0, name)
-                if v is None:
-                    return [], idx
-                args.append(v)
-            else:
-                v, a = self.expr_eval.expression_pat(arg_text_z, a)
-                args.append(0 if _is_undef_derived(v) else v)
+            v, a = self._mini_arg_one(arg_text_z, a, name, False)
+            if v is None:
+                return [], idx
+            args.append(v)
             a = StringUtils.skipspc(arg_text_z, a)
             if a < len(arg_text_z) and arg_text_z[a] == ',':
                 a += 1
@@ -8329,6 +8360,9 @@ class ObjectGenerator:
         finally:
             sys.setrecursionlimit(saved_reclimit)
         if ret is not None:
+            # 配列は要素ごとに、文字列の要素は 1 バイト 1 ワードで出す。
+            if isinstance(ret, list):
+                ret = [w for e in ret for w in (e if isinstance(e, bytes) else (e,))]
             words = words + (list(ret) if isinstance(ret, (list, bytes)) else [ret])
         return words, idx
 
@@ -8427,11 +8461,44 @@ class ObjectGenerator:
             out.append(c)
             k += 1
 
+    def _mini_arg_one(self, t, a, name, in_array):
+        """`.call` の引数を 1 つ読む。返り値は (値, 次の位置)、失敗は (None, _)。
+
+        `[...]` は配列、`"..."` は文字列、`.exp(変数)` は捕捉した綴り、
+        文字列シンボルの名前 1 つは その文字列、それ以外はパターン層の式。
+        配列の要素も同じ規則で読むが、配列の中に配列は書けない。
+        caxx.c の mini_arg_one() と同じ規則である。
+        """
+        if t[a] == '[':
+            if in_array:
+                self._mini_diag(f" error - '.call {name}': an array element "
+                                f"cannot be an array.")
+                return None, len(t)
+            return self._mini_arg_array(t, a, name)
+        if t[a] == '"':
+            return self._mini_arg_str(t, a, name)
+        if self._mini_is_exp(t, a):
+            return self._mini_arg_exp(t, a, name)
+        hit = self._mini_strsym_at(t, a)
+        if hit is not None:
+            key, a = hit
+            v, _ = self._mini_arg_str(
+                '"' + self.state.strsymbols[key] + '"' + chr(0), 0, name)
+            return v, a
+        v, a = self.expr_eval.expression_pat(t, a)
+        return _mini_wrap(0 if _is_undef_derived(v) else v), a
+
     def _mini_arg_array(self, t, a, name):
-        """`[e1, e2, ...]` と書かれた引数を配列として評価する。"""
+        """`[e1, e2, ...]` と書かれた引数を配列として評価する。
+
+        要素は整数か文字列で、書き方は引数 1 つと同じ（_mini_arg_one）。
+        """
         depth = 0
         k = a
         while k < len(t) and t[k] != chr(0):
+            if t[k] == '"':
+                k = self._mini_skip_str(t, k)
+                continue
             if t[k] in '([':
                 depth += 1
             elif t[k] in ')]':
@@ -8453,8 +8520,10 @@ class ObjectGenerator:
             if inner[i] == ',':
                 i += 1
                 continue
-            v, i = self.expr_eval.expression_pat(inner, i)
-            out.append(_mini_wrap(0 if _is_undef_derived(v) else v))
+            v, i = self._mini_arg_one(inner, i, name, True)
+            if v is None:
+                return None, len(t)
+            out.append(v)
             i = StringUtils.skipspc(inner, i)
             if i < len(inner) and inner[i] == ',':
                 i += 1

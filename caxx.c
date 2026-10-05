@@ -760,12 +760,15 @@ static int is_sub_name(const char *s){
 
 
 /* ミニ言語の値。整数・配列・文字列のどれか。文字列は UTF-8 のバイトの並びで、
-   NUL も入りうるので長さを別に持つ。 */
+   NUL も入りうるので長さを別に持つ。配列の要素は整数か文字列で、文字列の
+   要素があるときだけ astr / alen を持つ（astr[i] が NULL なら arr[i] が整数）。 */
 typedef struct {
     int        is_arr;
     int        is_str;
     uint256_t  num;
     uint256_t *arr;
+    unsigned char **astr;
+    int       *alen;
     int        n, cap;
     unsigned char *str;
     int        slen;
@@ -9190,6 +9193,12 @@ static char *mini_echo_text(MiniVal *v);
 /* 値を解放する（配列・文字列なら中身ごと）。 */
 static void mini_val_free(MiniVal *v){
     if(v->arr) free(v->arr);
+    if(v->astr){
+        for(int i = 0; i < v->n; i++) free(v->astr[i]);
+        free(v->astr);
+        free(v->alen);
+    }
+    v->astr = NULL; v->alen = NULL;
     v->arr = NULL; v->n = v->cap = 0; v->is_arr = 0;
     if(v->str) free(v->str);
     v->str = NULL; v->slen = 0; v->is_str = 0;
@@ -9222,6 +9231,16 @@ static MiniVal mini_val_copy(const MiniVal *src){
         v.arr = mini_alloc((size_t)src->n * sizeof(uint256_t));
         memcpy(v.arr, src->arr, (size_t)src->n * sizeof(uint256_t));
         v.n = v.cap = src->n;
+        if(src->astr){
+            v.astr = mini_alloc((size_t)src->n * sizeof(unsigned char*));
+            v.alen = mini_alloc((size_t)src->n * sizeof(int));
+            for(int i = 0; i < src->n; i++){
+                if(!src->astr[i]) continue;
+                v.astr[i] = mini_alloc((size_t)src->alen[i] + 1);
+                if(src->alen[i] > 0) memcpy(v.astr[i], src->astr[i], (size_t)src->alen[i]);
+                v.alen[i] = src->alen[i];
+            }
+        }
     }
     return v;
 }
@@ -9233,10 +9252,46 @@ static void mini_arr_reserve(MiniVal *v, int want){
     while(cap < want) cap *= 2;
     uint256_t *na = realloc(v->arr, (size_t)cap * sizeof(uint256_t));
     if(!na){ perror("realloc"); exit(1); }
-    v->arr = na; v->cap = cap;
+    v->arr = na;
+    if(v->astr){
+        unsigned char **ns = realloc(v->astr, (size_t)cap * sizeof(unsigned char*));
+        int *nl = realloc(v->alen, (size_t)cap * sizeof(int));
+        if(!ns || !nl){ perror("realloc"); exit(1); }
+        for(int i = v->cap; i < cap; i++){ ns[i] = NULL; nl[i] = 0; }
+        v->astr = ns; v->alen = nl;
+    }
+    v->cap = cap;
 }
 
-/* `.echo` に出す形に整える。文字列の NUL は `\0` と書いて出す。 */
+/* 配列の i 番目に値を置く。e は消費する（文字列ならその中身を引き取る）。
+   i は確保済みの範囲であること。 */
+static void mini_arr_put(MiniVal *v, int i, MiniVal e){
+    if(e.is_str){
+        if(!v->astr){
+            int c = v->cap > 0 ? v->cap : 1;
+            v->astr = mini_alloc((size_t)c * sizeof(unsigned char*));
+            v->alen = mini_alloc((size_t)c * sizeof(int));
+        }
+        free(v->astr[i]);
+        v->astr[i] = e.str;
+        v->alen[i] = e.slen;
+        v->arr[i] = u256_zero();
+        return;
+    }
+    if(v->astr){ free(v->astr[i]); v->astr[i] = NULL; v->alen[i] = 0; }
+    v->arr[i] = e.num;
+    mini_val_free(&e);
+}
+
+/* 配列の i 番目の値を複製して返す。 */
+static MiniVal mini_arr_get(const MiniVal *v, int i){
+    if(v->astr && v->astr[i]) return mini_strval(v->astr[i], v->alen[i]);
+    return mini_num(v->arr[i]);
+}
+
+/* `.echo` に出す形に整える。文字列の NUL は `\0` と書いて出す。配列は
+   `[1, "ab", 3]` の形で、文字列の要素だけ `"` で囲む。
+   axx.py の MiniInterp._echo_value() と同じ体裁である。 */
 static char *mini_echo_text(MiniVal *v){
     if(v->is_str){
         char *b = mini_alloc((size_t)v->slen * 2 + 1);
@@ -9253,11 +9308,23 @@ static char *mini_echo_text(MiniVal *v){
         return mini_strdup(cb);
     }
     size_t cap = (size_t)v->n * 98 + 4;
+    if(v->astr)
+        for(int i = 0; i < v->n; i++)
+            if(v->astr[i]) cap += (size_t)v->alen[i] * 2 + 2;
     char *b = mini_alloc(cap);
     size_t len = 0;
     b[len++] = '[';
     for(int i = 0; i < v->n; i++){
         if(i){ b[len++] = ','; b[len++] = ' '; }
+        if(v->astr && v->astr[i]){
+            b[len++] = '"';
+            for(int q = 0; q < v->alen[i]; q++){
+                if(v->astr[i][q] == 0){ b[len++] = '\\'; b[len++] = '0'; }
+                else b[len++] = (char)v->astr[i][q];
+            }
+            b[len++] = '"';
+            continue;
+        }
         char cb[96]; u256_to_pydec(v->arr[i], cb, sizeof(cb));
         size_t l = strlen(cb);
         memcpy(b + len, cb, l); len += l;
@@ -9450,11 +9517,33 @@ static int mxp_eat(MXP *p, const char *op){
     return 0;
 }
 
+/* 診断に出すためにトークンを Python の repr の形で書く。数は 10 進、行末は
+   'end of line'。axx.py の _mini_tok_repr() と同じ。返した文字列は解放すること。 */
+static char *mxp_tokdesc(MXP *p){
+    if(p->i >= p->n){
+        char *b = mini_alloc(32);
+        m_pyrepr("end of line", b, 32);
+        return b;
+    }
+    const MTok *tk = &p->t[p->i];
+    if(tk->k == MT_NUM){
+        char *b = mini_alloc(96);
+        u256_to_pydec(tk->num, b, 96);
+        return b;
+    }
+    size_t sz = strlen(tk->s) * 4 + 8;
+    char *b = mini_alloc(sz);
+    m_pyrepr(tk->s, b, sz);
+    return b;
+}
+
 /* その演算子を必ず消費する。 */
 static void mxp_expect(MXP *p, const char *op){
     if(!mxp_eat(p, op)){
-        if(p->i < p->n) mini_fail(p->c, "expected '%s', found '%s'", op, p->t[p->i].s);
-        else mini_fail(p->c, "expected '%s', found end of line", op);
+        char *d = mxp_tokdesc(p);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "expected '%s', found ", op);
+        mini_fail(p->c, "%s%s", msg, d);
     }
 }
 
@@ -9462,7 +9551,7 @@ static int mxp_end(MXP *p){ return p->i >= p->n; }
 
 /* 項そのもの。数値、名前、括弧、配列リテラル、`.call`、組み込み。 */
 static MExpr *mxp_primary(MXP *p){
-    if(mxp_end(p)) mini_fail(p->c, "expected a value, found end of line");
+    if(mxp_end(p)){ char *d = mxp_tokdesc(p); mini_fail(p->c, "expected a value, found %s", d); }
     MTok *tk = &p->t[p->i];
     if(tk->k == MT_STR){ p->i++; MExpr *e = mx_new(MX_STR); e->name = mini_strdup(tk->s); return e; }
     if(tk->k == MT_CORE){ p->i++; MExpr *e = mx_new(MX_CORE); e->name = mini_strdup(tk->s); return e; }
@@ -9533,7 +9622,7 @@ static MExpr *mxp_primary(MXP *p){
         mxp_expect(p, "]");
         return e;
     }
-    mini_fail(p->c, "expected a value, found '%s'", tk->s);
+    { char *d = mxp_tokdesc(p); mini_fail(p->c, "expected a value, found %s", d); }
     return NULL;
 }
 
@@ -9670,7 +9759,7 @@ static MExpr *mxp_or(MXP *p){
 /* 式を 1 個解析する。 */
 static MExpr *mxp_full(MXP *p){
     MExpr *e = mxp_or(p);
-    if(!mxp_end(p)) mini_fail(p->c, "unexpected '%s' in expression", p->t[p->i].s);
+    if(!mxp_end(p)){ char *d = mxp_tokdesc(p); mini_fail(p->c, "unexpected %s in expression", d); }
     return e;
 }
 
@@ -9970,17 +10059,25 @@ static void msp_block(MSP *p, const char *e1, const char *e2, const char *e3,
             int n = mini_lex(c, p->f->lines[li], p->tok);
             MTok *toks = p->tok->tok;
             if(n < 4 || toks[1].k != MT_NAME)
-                mini_fail(c, "'.for' needs 'variable in range(...)'");
+                mini_fail(c, "'.for' needs 'variable in range(...)' or 'variable in array'");
             MStmt *s = ms_new(MS_FOR, p, li);
             s->name = mini_strdup(toks[1].s);
-            if(!(toks[2].k == MT_NAME && strcmp(toks[2].s, "in") == 0) ||
-               !(toks[3].k == MT_NAME && strcmp(toks[3].s, "range") == 0))
-                mini_fail(c, "'.for %s' must be followed by 'in range(...)'", s->name);
-            MXP ep; ep.t = toks + 4; ep.n = n - 4; ep.i = 0; ep.c = c;
-            mxp_arglist(&ep, &s->args, &s->nargs);
-            if(!mxp_end(&ep)) mini_fail(c, "unexpected text after 'range(...)'");
-            if(s->nargs < 1 || s->nargs > 3)
-                mini_fail(c, "range() takes 1 to 3 arguments, got %d", s->nargs);
+            if(!(toks[2].k == MT_NAME && strcmp(toks[2].s, "in") == 0))
+                mini_fail(c, "'.for %s' must be followed by 'in range(...)' or 'in array'",
+                          s->name);
+            /* `in` の後ろが `range(` なら数の範囲、それ以外は配列の式（s->val）で、
+               その要素を順に回す。axx.py の MiniParser._for_header() と同じ規則である。 */
+            if(!(toks[3].k == MT_NAME && strcmp(toks[3].s, "range") == 0)
+               || n < 5 || !(toks[4].k == MT_OP && strcmp(toks[4].s, "(") == 0)){
+                MXP ep; ep.t = toks + 3; ep.n = n - 3; ep.i = 0; ep.c = c;
+                s->val = mxp_full(&ep);
+            } else {
+                MXP ep; ep.t = toks + 4; ep.n = n - 4; ep.i = 0; ep.c = c;
+                mxp_arglist(&ep, &s->args, &s->nargs);
+                if(!mxp_end(&ep)) mini_fail(c, "unexpected text after 'range(...)'");
+                if(s->nargs < 1 || s->nargs > 3)
+                    mini_fail(c, "range() takes 1 to 3 arguments, got %d", s->nargs);
+            }
             p->i = li + 1;
             p->loopdepth++;
             msp_block(p, ".NEXT", NULL, NULL, &s->body, &s->nbody);
@@ -10393,8 +10490,16 @@ static MiniVal mini_eval(MiniRun *r, MExpr *e){
         MiniVal v; memset(&v, 0, sizeof(v));
         v.is_arr = 1;
         mini_arr_reserve(&v, e->nitems > 0 ? e->nitems : 1);
-        for(int i = 0; i < e->nitems; i++)
-            v.arr[v.n++] = mini_need_num(r, mini_eval(r, e->items[i]), "an array element");
+        for(int i = 0; i < e->nitems; i++){
+            MiniVal ev = mini_eval(r, e->items[i]);
+            if(ev.is_arr){
+                mini_val_free(&ev); mini_val_free(&v);
+                mini_fail(&r->c, "an array element must be a number or a string, "
+                          "not an array");
+            }
+            v.n++;
+            mini_arr_put(&v, v.n - 1, ev);
+        }
         return v;
     }
     case MX_CALL: {
@@ -10433,13 +10538,13 @@ static MiniVal mini_eval(MiniRun *r, MExpr *e){
         }
         uint256_t iv = mini_need_num(r, mini_eval(r, e->b), "an index");
         long long i = mini_to_ll_sat(iv);
-        uint256_t out;
+        MiniVal out;
         if(b.is_str)
-            out = (i < 0 || i >= b.slen) ? u256_zero() : u256_from_u64(b.str[i]);
+            out = mini_num((i < 0 || i >= b.slen) ? u256_zero() : u256_from_u64(b.str[i]));
         else
-            out = (i < 0 || i >= b.n) ? u256_zero() : b.arr[i];
+            out = (i < 0 || i >= b.n) ? mini_num(u256_zero()) : mini_arr_get(&b, (int)i);
         mini_val_free(&b);
-        return mini_num(out);
+        return out;
     }
     case MX_SLICE: {
         MiniVal b = mini_eval(r, e->a);
@@ -10464,7 +10569,10 @@ static MiniVal mini_eval(MiniRun *r, MExpr *e){
         v.is_arr = 1;
         if(hi > lo){
             mini_arr_reserve(&v, (int)(hi - lo));
-            for(long long i = lo; i < hi; i++) v.arr[v.n++] = b.arr[i];
+            for(long long i = lo; i < hi; i++){
+                v.n++;
+                mini_arr_put(&v, v.n - 1, mini_arr_get(&b, (int)i));
+            }
         }
         mini_val_free(&b);
         return v;
@@ -10542,17 +10650,22 @@ static void mini_store(MiniRun *r, MStmt *s, MiniVal v){
                   nb, MINI_MAX_ARRAY);
     }
     long long i = mini_to_ll(r, iv);
-    uint256_t elem = mini_need_num(r, v, "an array element");
+    if(v.is_arr){
+        mini_val_free(&v);
+        mini_fail(&r->c, "an array element must be a number or a string, not an array");
+    }
     MiniBind *b = mini_ref(r, s->name);
-    if(b->v.is_str)
+    if(b->v.is_str){
+        mini_val_free(&v);
         mini_fail(&r->c, "'%s' is a string; a string cannot be changed in place", s->name);
-    if(!b->v.is_arr) mini_fail(&r->c, "'%s' is not an array", s->name);
+    }
+    if(!b->v.is_arr){ mini_val_free(&v); mini_fail(&r->c, "'%s' is not an array", s->name); }
     if(i >= b->v.n){
         mini_arr_reserve(&b->v, (int)i + 1);
         for(int q = b->v.n; q <= (int)i; q++) b->v.arr[q] = u256_zero();
         b->v.n = (int)i + 1;
     }
-    b->v.arr[i] = elem;
+    mini_arr_put(&b->v, (int)i, v);
 }
 
 /* 返り値を捨てる。 */
@@ -10706,6 +10819,24 @@ static void mini_exec(MiniRun *r, MStmt *s){
         }
         return;
     case MS_FOR: {
+        if(s->val){
+            MiniVal arr = mini_eval(r, s->val);
+            if(!arr.is_arr){
+                mini_val_free(&arr);
+                mini_fail(&r->c, "'.for %s in' needs an array", s->name);
+            }
+            /* 回り始める前に写しを取る。本体で配列を書き換えても回る順番は変わらない。 */
+            for(int i = 0; i < arr.n; i++){
+                mini_at(r, s);
+                mini_tick(r);
+                mini_set(r, s->name, mini_arr_get(&arr, i));
+                mini_exec_block(r, s->body, s->nbody);
+                if(r->returning) break;
+                if(r->loopctl){ int lc = r->loopctl; r->loopctl = 0; if(lc == 1) break; }
+            }
+            mini_val_free(&arr);
+            return;
+        }
         uint256_t v[3];
         v[0] = v[1] = v[2] = u256_zero();
         for(int i = 0; i < s->nargs; i++)
@@ -10918,41 +11049,6 @@ static void mini_compile_all(MiniFunc **v, int n){
 }
 
 
-/* `[e1, e2, ...]` と書かれた引数を配列として評価する。 */
-static MiniVal mini_arg_array(Assembler *asmb, char *t, int a, int *out_i, int *ok){
-    MiniVal v; memset(&v, 0, sizeof(v));
-    v.is_arr = 1;
-    *ok = 0;
-    int len = (int)strlen(t);
-    int depth = 0, k = a;
-    while(k < len){
-        if(t[k] == '(' || t[k] == '[') depth++;
-        else if(t[k] == ')' || t[k] == ']'){ depth--; if(depth == 0) break; }
-        k++;
-    }
-    if(depth != 0 || k >= len || t[k] != ']'){ *out_i = len; return v; }
-    t[k] = 0;
-    int i = a + 1;
-    while(1){
-        i = axx_skipspc(t, i);
-        if(!t[i]) break;
-        if(t[i] == ','){ i++; continue; }
-        int io;
-        uint256_t x = expr_expression_pat(asmb, t, i, &io);
-        i = io;
-        if(u256_is_undef_derived(x)) x = u256_zero();
-        mini_arr_reserve(&v, v.n + 1);
-        v.arr[v.n++] = x;
-        i = axx_skipspc(t, i);
-        if(t[i] == ','){ i++; continue; }
-        break;
-    }
-    t[k] = ']';
-    *out_i = k + 1;
-    *ok = 1;
-    return v;
-}
-
 /* s[k] の `"` から始まる文字列リテラルの次の位置を返す。閉じていなければ
    行末の位置。axx.py の ObjectGenerator._mini_skip_str() と同じ。 */
 static int mini_skip_str(const char *s, int k, int len){
@@ -11081,6 +11177,103 @@ static const char *mini_strsym_at(AsmState *st, const char *t, int a, int *out_i
     return sv;
 }
 
+static MiniVal mini_arg_one(Assembler *asmb, char *t, int a, int *out_i, int *ok,
+                            const char *name, int quiet, int in_array);
+
+/* `[e1, e2, ...]` と書かれた引数を配列として評価する。要素は整数か文字列で、
+   書き方は引数 1 つと同じ（mini_arg_one）。
+   axx.py の ObjectGenerator._mini_arg_array() と同じ規則である。 */
+static MiniVal mini_arg_array(Assembler *asmb, char *t, int a, int *out_i, int *ok,
+                              const char *name, int quiet){
+    MiniVal v; memset(&v, 0, sizeof(v));
+    v.is_arr = 1;
+    *ok = 0;
+    int len = (int)strlen(t);
+    int depth = 0, k = a;
+    while(k < len){
+        if(t[k] == '"'){ k = mini_skip_str(t, k, len); continue; }
+        if(t[k] == '(' || t[k] == '[') depth++;
+        else if(t[k] == ')' || t[k] == ']'){ depth--; if(depth == 0) break; }
+        k++;
+    }
+    if(depth != 0 || k >= len || t[k] != ']'){
+        if(!quiet)
+            axx_diagf(1, 0, " error - '.call %s': unbalanced '[' in the "
+                       "argument list.\n", name);
+        *out_i = len;
+        return v;
+    }
+    t[k] = 0;
+    int i = a + 1;
+    while(1){
+        i = axx_skipspc(t, i);
+        if(!t[i]) break;
+        if(t[i] == ','){ i++; continue; }
+        int io, eok;
+        MiniVal e = mini_arg_one(asmb, t, i, &io, &eok, name, quiet, 1);
+        if(!eok){
+            mini_val_free(&e);
+            mini_val_free(&v);
+            t[k] = ']';
+            *out_i = len;
+            return v;
+        }
+        i = io;
+        mini_arr_reserve(&v, v.n + 1);
+        v.n++;
+        mini_arr_put(&v, v.n - 1, e);
+        i = axx_skipspc(t, i);
+        if(t[i] == ','){ i++; continue; }
+        break;
+    }
+    t[k] = ']';
+    *out_i = k + 1;
+    *ok = 1;
+    return v;
+}
+
+/* `.call` の引数を 1 つ読む。`[...]` は配列、`"..."` は文字列、`.exp(変数)` は
+   捕捉した綴り、文字列シンボルの名前 1 つはその文字列、それ以外はパターン層の
+   式。配列の要素も同じ規則で読むが、配列の中に配列は書けない。失敗したら
+   *ok を 0 にして診断する。
+   axx.py の ObjectGenerator._mini_arg_one() と同じ規則である。 */
+static MiniVal mini_arg_one(Assembler *asmb, char *t, int a, int *out_i, int *ok,
+                            const char *name, int quiet, int in_array){
+    AsmState *st = &asmb->st;
+    *ok = 0;
+    if(t[a] == '['){
+        if(in_array){
+            if(!quiet)
+                axx_diagf(1, 0, " error - '.call %s': an array element cannot be "
+                           "an array.\n", name);
+            *out_i = (int)strlen(t);
+            return mini_num(u256_zero());
+        }
+        return mini_arg_array(asmb, t, a, out_i, ok, name, quiet);
+    }
+    if(t[a] == '"') return mini_arg_str(t, a, out_i, ok, name, quiet);
+    if(mini_is_exp(t, a)) return mini_arg_exp(asmb, t, a, out_i, ok, name, quiet);
+    int e;
+    const char *sv = mini_strsym_at(st, t, a, &e);
+    if(sv){
+        /* `.call f("…")` と書いたのと同じに読む。 */
+        int sio;
+        size_t svl = strlen(sv);
+        char *q = mini_alloc(svl + 3);
+        q[0] = '"'; memcpy(q + 1, sv, svl); q[svl + 1] = '"'; q[svl + 2] = 0;
+        MiniVal v = mini_arg_str(q, 0, &sio, ok, name, quiet);
+        free(q);
+        *out_i = e;
+        return v;
+    }
+    int io;
+    uint256_t v = expr_expression_pat(asmb, t, a, &io);
+    if(u256_is_undef_derived(v)) v = u256_zero();
+    *out_i = io;
+    *ok = 1;
+    return mini_num(v);
+}
+
 /* `.call 名前(引数, ...)` を実行し、生まれたワード列を積む。引数は呼び出し側の
    パターン式なので、ここでパターン変数が解決されてから関数へ渡る。 */
 static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *objl){
@@ -11148,58 +11341,17 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *
         a = axx_skipspc(argtext, a);
         if(a >= alen || !argtext[a]) break;
         if(argtext[a] == ','){ a++; continue; }
-        MiniVal av;
-        if(argtext[a] == '['){
-            int ok, io;
-            av = mini_arg_array(asmb, argtext, a, &io, &ok);
-            if(!ok){
-                mini_val_free(&av);
-                if(!quiet)
-                    axx_diagf(1, 0, " error - '.call %s': unbalanced '[' in the "
-                               "argument list.\n", name);
-                for(int i = 0; i < nargs; i++) mini_val_free(&args[i]);
-                free(args);
-                free(argtext);
-                free(name_heap);
-                return idx;
-            }
-            a = io;
-        } else if(argtext[a] == '"' || mini_is_exp(argtext, a)){
-            int ok, io;
-            av = argtext[a] == '"' ? mini_arg_str(argtext, a, &io, &ok, name, quiet)
-                                   : mini_arg_exp(asmb, argtext, a, &io, &ok, name, quiet);
-            if(!ok){
-                for(int i = 0; i < nargs; i++) mini_val_free(&args[i]);
-                free(args);
-                free(argtext);
-                free(name_heap);
-                return idx;
-            }
-            a = io;
-        } else if(mini_strsym_at(st, argtext, a, &(int){0})){
-            /* `.call f("…")` と書いたのと同じに読む。 */
-            int io, ok, sio;
-            const char *sv = mini_strsym_at(st, argtext, a, &io);
-            size_t svl = strlen(sv);
-            char *q = mini_alloc(svl + 3);
-            q[0] = '"'; memcpy(q + 1, sv, svl); q[svl + 1] = '"'; q[svl + 2] = 0;
-            av = mini_arg_str(q, 0, &sio, &ok, name, quiet);
-            free(q);
-            if(!ok){
-                for(int i = 0; i < nargs; i++) mini_val_free(&args[i]);
-                free(args);
-                free(argtext);
-                free(name_heap);
-                return idx;
-            }
-            a = io;
-        } else {
-            int io;
-            uint256_t v = expr_expression_pat(asmb, argtext, a, &io);
-            a = io;
-            if(u256_is_undef_derived(v)) v = u256_zero();
-            av = mini_num(v);
+        int io, aok;
+        MiniVal av = mini_arg_one(asmb, argtext, a, &io, &aok, name, quiet, 0);
+        if(!aok){
+            mini_val_free(&av);
+            for(int i = 0; i < nargs; i++) mini_val_free(&args[i]);
+            free(args);
+            free(argtext);
+            free(name_heap);
+            return idx;
         }
+        a = io;
         if(nargs >= cargs){
             cargs = cargs ? cargs * 2 : 8;
             args = realloc(args, (size_t)cargs * sizeof(MiniVal));
@@ -11223,8 +11375,15 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *
         mini_call_func(&r, f, args, nargs);
         for(int i = 0; i < r.out.len; i++) iv_push(objl, r.out.data[i]);
         if(r.has_ret){
+            /* 配列は要素ごとに、文字列の要素は 1 バイト 1 ワードで出す。 */
             if(r.retval.is_arr)
-                for(int i = 0; i < r.retval.n; i++) iv_push(objl, r.retval.arr[i]);
+                for(int i = 0; i < r.retval.n; i++){
+                    if(r.retval.astr && r.retval.astr[i])
+                        for(int q = 0; q < r.retval.alen[i]; q++)
+                            iv_push(objl, u256_from_u64(r.retval.astr[i][q]));
+                    else
+                        iv_push(objl, r.retval.arr[i]);
+                }
             else if(r.retval.is_str)
                 for(int i = 0; i < r.retval.slen; i++)
                     iv_push(objl, u256_from_u64(r.retval.str[i]));

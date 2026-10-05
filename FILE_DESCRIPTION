@@ -76,7 +76,8 @@ ministr.axx                         pattern file for strings in the mini
                                     `.emit` / `.echo` of a string, and
                                     `.call f(x,.exp(x))` passing a pattern
                                     variable's captured text, and a string
-                                    symbol passed by its name (MINI.md)
+                                    symbol passed by its name, arrays holding
+                                    strings, and `.for x in <array>` (MINI.md)
 ministr.s                           test assemble file for ministr.axx
 unordered.axx                       pattern file for .unordered: directives that
                                     hold for the whole file wherever they are

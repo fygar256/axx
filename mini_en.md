@@ -38,7 +38,8 @@ MOV a,!b,!c :: .call name(a,b,c)
 MIX !e :: 0x90,.call rep(e),0xff
 ```
 
-An argument written `[expr, expr, ...]` is an array; its elements are pattern
+An argument written `[expr, expr, ...]` is an array; `"..."`, `.exp(variable)`
+or the name of a string symbol makes a string element, and its other elements are pattern
 expressions too. `[]` is the empty array.
 
 ```
@@ -96,6 +97,7 @@ One statement per line.
 | `.if expr .then` / `.elif expr .then` / `.else` / `.endif` | Conditional; `.elif` may repeat, `.else` is optional |
 | `.while(expr)` / `.endwhile` | Repeat while the value is non-zero |
 | `.for name in range(...)` / `.next` | `range(stop)`, `range(start, stop)`, `range(start, stop, step)` |
+| `.for name in array` / `.next` | Loop over the array's elements (integers or strings) from index 0 |
 | `.break` | Leave the innermost `.while` / `.for` loop |
 | `.continue` | Skip to the next iteration of the innermost `.while` / `.for` loop |
 | `.nonlocal a, b` | Treat these names as belonging to an enclosing call |
@@ -108,6 +110,16 @@ branches may follow an `.if`, and an `.else` may close the chain; a single
 `.endif` ends the whole chain. The condition of `.while` needs no
 parentheses of its own (`(expr)` simply reads as a parenthesized expression). The
 `step` of `range()` must not be 0.
+In `.for name in expr`, anything after `in` other than `range(` is read as an
+expression; its value must be an array, and its elements are assigned to the name
+in turn. The array is copied before the loop starts, so changing it in the body
+does not change the elements visited.
+
+```
+.for op in ["mov", "add", "jmp"]
+.emit(.len(op))
+.next
+```
 `.break` and `.continue` may only appear inside a `.while` or `.for` body;
 outside a loop they are an error at parse time. Each affects only the innermost
 loop.
@@ -272,7 +284,7 @@ Only 0 is false.
 ## Values and arrays
 
 A value is an integer, an array or a string (next section). Array elements are
-integers; arrays of arrays do not exist.
+integers or strings; arrays of arrays do not exist.
 
 ```
 a = []
@@ -332,7 +344,9 @@ t = s + ":" + n           /* "loop:3" */
   function called from `binary_list` output each byte as one word, in order.
 - **Strings cannot be changed in place.** `s[i] = v` is an error; build a new
   string with `+` and `[lo:hi]`.
-- **A string is not an array element.** Array elements are integers only.
+- **A string can be an array element.** `a = ["ab", 1]` and `a[i] = "x"` are
+  allowed and `a[i]` reads the string back. `.echo` prints such an array as
+  `["ab", 1]`, quoting only the string elements.
 - **Not for conditions or arithmetic.** `.if s .then`, `s - 1`, `-s` and the
   like are errors.
 - **Escapes** are `\\`, `\"`, `\n` and `\t`; any other `\` is an error. Use
@@ -395,7 +409,7 @@ v = .call hypot2(a,b)
 - **The value may be a number, an array or a string.** An array is passed as a copy, so
   changing it in the caller does not affect the callee's variable.
 - **The target may be an array element.** `a[i] = .call f(x)` is allowed; the
-  returned value must then be a number.
+  returned value must then be a number or a string.
 - **Calling a function that returns nothing with `var = .call ...` is an error.**
   That covers both a valueless `.return` and a body that ends without reaching
   one.
@@ -406,8 +420,8 @@ v = .call hypot2(a,b)
   `.return expr` may appear anywhere in the body — top level or nested inside
   `.if`/`.while`/`.for` — any number of times, as an early-exit statement.
 - **The return value of a function called from `binary_list` becomes output.**
-  A number is one word; an array is one word per element from index 0; a
-  string is one word per byte. It
+  A number is one word; an array is one word per element from index 0 (a
+  string element one word per byte); a string is one word per byte. It
   follows whatever the function passed to `.emit`, so a function that only
   `.emit`s and returns nothing behaves exactly as before.
 

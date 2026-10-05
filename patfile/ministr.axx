@@ -15,6 +15,10 @@
 /*      渡せること
 /*    - `.call f(10,msg)` で、文字列シンボル `.setsym::msg::"..."` を
 /*      文字列として渡せること（逃げ記号は `"..."` と直接書いたときと同じ）
+/*    - 配列の要素に文字列を入れられること（リテラル・代入・切り出し・
+/*      `binary_list` からの `["..", .exp(x), 名前]`・返り値・`.echo` の体裁）
+/*    - `.for 変数 in 配列` が要素を順に回すこと（`.continue` / `.break`、
+/*      本体で配列を書き換えても回る順番が変わらないこと、空の配列）
 /*  を確かめる。paxx と caxx が同じバイト列と同じ標準エラーを出すことも
 /*  確かめる。
 /*  ==================================================================
@@ -96,4 +100,44 @@ NAMED !n :: .call named(n, msg, MSG)
 .func named(n, s, t)
 .echo(n, s, s == t)
 .return s
+.endfunc
+
+/*  配列の要素は整数か文字列。返した配列は、文字列の要素を 1 バイト 1 ワードで出す。 */
+SARR !n :: .call sarr(n, ["ab", n, .exp(n), msg])
+.func sarr(n, a)
+a[5] = "z" + n
+b = a[1:3]
+.echo(a, .len(a), a[0] + a[4], b)
+c = ["p", .chr(0) + "q", 3]
+c[0] = 7
+.echo(c, c[1] == .chr(0) + "q")
+.return ["ok", 0, c[1]]
+.endfunc
+
+/*  `.for 変数 in 配列` は要素を順に回す。文字列の配列でも整数の配列でもよい。 */
+FORIN :: .call forin(["mov", "add", "", "jmp", "sub"])
+.func forin(ops)
+out = ""
+.for op in ops
+.if op == "" .then
+.continue
+.endif
+.if op == "jmp" .then
+.break
+.endif
+out = out + op + ","
+ops[1] = "changed"
+.next
+.for x in [1, "two", 3]
+.echo(x)
+.next
+n = 0
+.for e in []
+n = n + 1
+.next
+range = ["r"]
+.for r in range
+.echo(out, n, r, ops)
+.next
+.return out
 .endfunc
