@@ -260,6 +260,15 @@ A value derived from an undefined label comes through as 0, the same treatment
 misspelling is still a mini-language error: by pass 2 the assembler's tables are
 complete, so "no such name" can be stated with certainty.
 
+A name the assembler does not know is let through as a possible forward-referenced
+label only in the first iteration of pass 1. From the second iteration on, every
+label of the previous iteration is known, so a name that is still missing is
+reported at once as used before it is set (pass-1 errors are not shown). Even in
+the first iteration, if a call that let such a name through hits the runaway
+guard, the name is taken to be a misspelling and the rest of that iteration's
+calls stop on it at once — so a loop broken by a misspelling does not run to the
+guard on every line.
+
 ## Expressions and operators
 
 Loosest first.

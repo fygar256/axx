@@ -58,6 +58,7 @@
 static void axx_diagf(int set_error, int force, const char *fmt, ...);
 static void m_pyrepr(const char *s, char *out, size_t outsz);
 static void m_pyrepr_n(const char *s, size_t n, char *out, size_t outsz);
+static size_t utf8_prefix_bytes(const char *s, size_t avail, int nchars);
 static int  m_utf8(unsigned long cp, char *out);
 #include <unistd.h>
 #include <sys/stat.h>
@@ -486,6 +487,10 @@ static uint256_t UNDEF_VAL(void) {
     return r;
 }
 static int u256_is_undef(uint256_t a) { return u256_eq(a, UNDEF_VAL()); }
+/* 式の演算の毒。オペランドのどちらかが未定義そのものなら結果も未定義にする。
+   未定義の値どうしの算術が、番兵の大きさの違い（axx.py は 2**1024-1）によって
+   両実装で別の値になるのを防ぐ。axx.py の _undef() と同じ判定。 */
+#define UNDEF2(a, b) (u256_is_undef(a) || u256_is_undef(b))
 /* 値が未定義ラベル由来かを閾値で判定する。 */
 static int u256_is_undef_derived(uint256_t a) {
     if (u256_is_undef(a)) return 1;
@@ -622,6 +627,11 @@ static void sv_push(StrVec *v, const char *s){
         if(!v->data){perror("realloc");exit(1);}
     }
     v->data[v->len++]=strdup(s);
+}
+/* 文字列列にその文字列が含まれるか。 */
+static int sv_contains(const StrVec *v, const char *s){
+    for(int i = 0; i < v->len; i++) if(strcmp(v->data[i], s) == 0) return 1;
+    return 0;
 }
 /* 文字列列から 1 個外す。 */
 static void sv_pop(StrVec *v){
@@ -2270,6 +2280,8 @@ typedef struct {
     SymMap     symbols;
     SymMap     patsymbols;
     StrVec     strsym_names;
+    /* ミニ言語で「綴り間違いの疑い」とした名前（mini_tick() を参照）。 */
+    StrVec     mini_suspects;
     StrVec     strsym_vals;
 
     struct ArrSym *arrsyms;
@@ -3463,6 +3475,7 @@ static void state_init(AsmState *st) {
     st->passthru = 0;
     st->eol = 0;
     sv_init(&st->strsym_names);
+    sv_init(&st->mini_suspects);
     sv_init(&st->strsym_vals);
     st->arrsyms = NULL; st->arrsyms_len = 0; st->arrsyms_cap = 0;
     st->osabi = 0;
@@ -3861,6 +3874,9 @@ static void axx_get_string(const char *l2, char *out, size_t osz) {
                 if(hn>0){
                     out[n++]=(char)(int)strtol(hex,NULL,16);
                 } else {
+                    char r[600]; m_pyrepr(l2, r, sizeof(r));
+                    axx_diagf(0, 0, " warning - '\\x' escape requires at least one hex digit; "
+                                    "treated as literal 'x' in: %s\n", r);
                     if(n<osz-1) out[n++]='x';
                 }
             }
@@ -3893,8 +3909,10 @@ static void axx_get_string(const char *l2, char *out, size_t osz) {
         }
     }
     out[n]=0;
-    if(!l2[idx])
-        axx_diagf(0, 0, " warning - unterminated string literal: %s\n", l2);
+    if(!l2[idx]){
+        char r[600]; m_pyrepr(l2, r, sizeof(r));
+        axx_diagf(0, 0, " warning - unterminated string literal: %s\n", r);
+    }
 }
 
 /* 文字が集合に含まれるか。 */
@@ -4506,7 +4524,8 @@ static int var_slot_is_undef(AsmState *st, int slot){
 static uint256_t var_slot_for_mode(AsmState *st, int slot, int want_float){
     if(slot<0||slot>=NVARS) return u256_zero();
     PatVar *pv = &st->vars[slot];
-    if(want_float && !pv->is_float) return double_to_u256(u256_int_to_double(pv->val));
+    if(want_float && !pv->is_float && !u256_is_undef(pv->val))
+        return double_to_u256(u256_int_to_double(pv->val));
     return pv->val;
 }
 typedef struct { int slot; PatVar old; } VarUndo;
@@ -5366,7 +5385,9 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
         if(asmb->st.exp_typ_float) x=double_to_u256((double)st->vcnt);
     } else if(s[idx]=='-'){
         x=expr_factor(asmb,s,idx+1,&idx);
-        if(asmb->st.exp_typ_float){
+        if(u256_is_undef(x)){
+            /* 未定義のまま */
+        } else if(asmb->st.exp_typ_float){
             double d=u256_to_double(x);
             x=double_to_u256(-d);
         } else {
@@ -5374,14 +5395,17 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
         }
     } else if(s[idx]=='~'){
         x=expr_factor(asmb,s,idx+1,&idx);
-        x=expr_bitwise_result(asmb,u256_not(expr_safe_bitwise_operand(asmb,x,"~")));
+        if(!u256_is_undef(x))
+            x=expr_bitwise_result(asmb,u256_not(expr_safe_bitwise_operand(asmb,x,"~")));
     } else if(s[idx]=='@'){
         x=expr_factor(asmb,s,idx+1,&idx);
-        int nb = op_msb(expr_safe_bitwise_operand(asmb,x,"@"));
-        if(asmb->st.exp_typ_float)
-            x=double_to_u256((double)nb);
-        else
-            x=u256_from_i64(nb);
+        if(!u256_is_undef(x)){
+            int nb = op_msb(expr_safe_bitwise_operand(asmb,x,"@"));
+            if(asmb->st.exp_typ_float)
+                x=double_to_u256((double)nb);
+            else
+                x=u256_from_i64(nb);
+        }
     } else if(s[idx]=='*'){
         if(idx+1<slen && s[idx+1]=='('){
             int i2;
@@ -5392,7 +5416,9 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
                 if(s[idx]==')'){
                     idx++;
                     uint256_t _bv, _bi;
-                    if(!expr_num_operand(asmb, x2, &_bi)){
+                    if(UNDEF2(x, x2)){
+                        x = UNDEF_VAL();
+                    } else if(!expr_num_operand(asmb, x2, &_bi)){
                         if(should_report_errors(st))
                             axx_diagf(1, 0, " error - non-finite byte-extract offset in *(expr, expr).\n");
                         x = expr_bitwise_result(asmb, u256_zero());
@@ -5434,9 +5460,10 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
             char c = s[idx];
             if(c!='\0' && c!=',' && c!=')' && c!=']' && c!=CB_CHAR && c!=' ' && c!='\t'
                && !st->in_match_attempt && should_report_errors(st)){
-                size_t _n = (size_t)(slen + 1 - idx);
-                if(_n > 8) _n = 8;
-                char _tr[64]; m_pyrepr_n(s + idx, _n, _tr, sizeof(_tr));
+                /* axx.py の s[idx:idx + 8] と同じく 8 文字ぶん（UTF-8 の文字単位。
+                   読めないバイトは 1 文字）を出す。終端の NUL も 1 文字に数える。 */
+                size_t _n = utf8_prefix_bytes(s + idx, (size_t)(slen + 1 - idx), 8);
+                char _tr[160]; m_pyrepr_n(s + idx, _n, _tr, sizeof(_tr));
                 axx_diagf(0, 0, " warning - unrecognized token at position %d in expression: "
                                 "%s (treated as 0)\n", idx, _tr);
             }
@@ -5445,6 +5472,24 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
     idx=axx_skipspc(s,idx);
     *idx_out=idx;
     return x;
+}
+
+/* s の先頭 avail バイトのうち、UTF-8 で nchars 文字ぶんのバイト数。読めない
+   バイトは 1 文字として数える（axx.py が surrogateescape で読むのと同じ）。 */
+static size_t utf8_prefix_bytes(const char *s, size_t avail, int nchars){
+    size_t i = 0;
+    for(int c = 0; c < nchars && i < avail; c++){
+        unsigned char b = (unsigned char)s[i];
+        size_t len = b < 0x80 ? 1 : (b >= 0xC2 && b <= 0xDF) ? 2
+                   : (b >= 0xE0 && b <= 0xEF) ? 3 : (b >= 0xF0 && b <= 0xF4) ? 4 : 1;
+        if(len > 1){
+            if(i + len > avail) len = 1;
+            for(size_t k = 1; k < len; k++)
+                if(((unsigned char)s[i+k] & 0xC0) != 0x80){ len = 1; break; }
+        }
+        i += len;
+    }
+    return i;
 }
 
 /* `'\xHH'` を読む。読めたかを返し、値と次の位置を書く。 */
@@ -5868,7 +5913,9 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         if(new_idx!=idx){
             idx=new_idx;
             x=label_get_value(st,w);
-            if(asmb->st.exp_typ_float && !st->error_undefined_label)
+            /* 未定義のラベルは番兵のまま残す（浮動小数点にすると毒の判定が
+               できなくなる）。行全体の印ではなく、この値そのもので決める。 */
+            if(asmb->st.exp_typ_float && !u256_is_undef(x))
                 x=double_to_u256(u256_int_to_double(x));
         }
         if(w!=wbuf) free(w);
@@ -5885,6 +5932,7 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
     int slen=expr_slen(s);
     while(idx<slen && axx_q(s,slen,"**",idx)){
         uint256_t t=expr_factor(asmb,s,idx+2,&idx);
+        if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
         if(asmb->st.exp_typ_float){
             double a=u256_to_double(x), b=u256_to_double(t);
             x=double_to_u256(pow(a,b));
@@ -5931,7 +5979,8 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
         int flt=asmb->st.exp_typ_float;
         if(s[idx]=='*'&&s[idx+1]!='*'){
             uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
-            if(flt) x=double_to_u256(u256_to_double(x)*u256_to_double(t));
+            if(UNDEF2(x, t)) x = UNDEF_VAL();
+            else if(flt) x=double_to_u256(u256_to_double(x)*u256_to_double(t));
             else {
                 uint256_t r=u256_mul_signed(x,t);
                 if(!u256_is_zero(x) && !u256_is_zero(t)
@@ -5942,7 +5991,8 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             }
         } else if(axx_q(s,slen,"//",idx)){
             uint256_t t=expr_term0_0(asmb,s,idx+2,&idx);
-            if(flt){
+            if(UNDEF2(x, t)) x = UNDEF_VAL();
+            else if(flt){
                 double b=u256_to_double(t);
                 if(b==0.0){
                     if(should_report_errors(&asmb->st)){
@@ -5962,7 +6012,8 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             }
         } else if(s[idx]=='/'&&s[idx+1]!='/'){
             uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
-            if(flt){
+            if(UNDEF2(x, t)) x = UNDEF_VAL();
+            else if(flt){
                 double b=u256_to_double(t);
                 if(b==0.0){
                     if(should_report_errors(&asmb->st)){
@@ -5982,7 +6033,8 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             }
         } else if(s[idx]=='%'){
             uint256_t t=expr_term0_0(asmb,s,idx+1,&idx);
-            if(flt){
+            if(UNDEF2(x, t)) x = UNDEF_VAL();
+            else if(flt){
                 double b=u256_to_double(t);
                 if(b==0.0){
                     if(should_report_errors(&asmb->st)){
@@ -6017,7 +6069,8 @@ static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_ou
         int flt=asmb->st.exp_typ_float;
         if(s[idx]=='+'){
             uint256_t t=expr_term0(asmb,s,idx+1,&idx);
-            if(flt) x=double_to_u256(u256_to_double(x)+u256_to_double(t));
+            if(UNDEF2(x, t)) x = UNDEF_VAL();
+            else if(flt) x=double_to_u256(u256_to_double(x)+u256_to_double(t));
             else {
                 uint256_t r=u256_add(x,t);
                 if(u256_is_neg256(x)==u256_is_neg256(t)
@@ -6028,7 +6081,8 @@ static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_ou
             }
         } else if(s[idx]=='-'){
             uint256_t t=expr_term0(asmb,s,idx+1,&idx);
-            if(flt) x=double_to_u256(u256_to_double(x)-u256_to_double(t));
+            if(UNDEF2(x, t)) x = UNDEF_VAL();
+            else if(flt) x=double_to_u256(u256_to_double(x)-u256_to_double(t));
             else {
                 uint256_t r=u256_sub(x,t);
                 if(u256_is_neg256(x)!=u256_is_neg256(t)
@@ -6050,6 +6104,7 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
     while(idx<slen){
         if(axx_q(s,slen,"<<",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
+            if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
             uint256_t sop=expr_safe_bitwise_operand(asmb,t,"<<");
             if(u256_is_neg256(sop)){
                 char _sc[96]; u256_to_pydec(sop, _sc, sizeof(_sc));
@@ -6073,6 +6128,7 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
             }
         } else if(axx_q(s,slen,">>",idx)){
             uint256_t t=expr_term1(asmb,s,idx+2,&idx);
+            if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
             uint256_t sop=expr_safe_bitwise_operand(asmb,t,">>");
             if(u256_is_neg256(sop)){
                 char _sc[96]; u256_to_pydec(sop, _sc, sizeof(_sc));
@@ -6156,6 +6212,7 @@ static uint256_t expr_term3(Assembler *asmb, const char *s, int idx, int *idx_ou
     int slen=expr_slen(s);
     while(idx<slen && s[idx]=='&' && s[idx+1]!='&'){
         uint256_t t=expr_term2(asmb,s,idx+1,&idx);
+        if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
         x=expr_bitwise_result(asmb,u256_and(expr_safe_bitwise_operand(asmb,x,"&"),expr_safe_bitwise_operand(asmb,t,"&")));
     }
     *idx_out=idx; return x;
@@ -6167,6 +6224,7 @@ static uint256_t expr_term4(Assembler *asmb, const char *s, int idx, int *idx_ou
     int slen=expr_slen(s);
     while(idx<slen && s[idx]=='|' && s[idx+1]!='|'){
         uint256_t t=expr_term3(asmb,s,idx+1,&idx);
+        if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
         x=expr_bitwise_result(asmb,u256_or(expr_safe_bitwise_operand(asmb,x,"|"),expr_safe_bitwise_operand(asmb,t,"|")));
     }
     *idx_out=idx; return x;
@@ -6178,6 +6236,7 @@ static uint256_t expr_term5(Assembler *asmb, const char *s, int idx, int *idx_ou
     int slen=expr_slen(s);
     while(idx<slen && s[idx]=='^'){
         uint256_t t=expr_term4(asmb,s,idx+1,&idx);
+        if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
         x=expr_bitwise_result(asmb,u256_xor(expr_safe_bitwise_operand(asmb,x,"^"),expr_safe_bitwise_operand(asmb,t,"^")));
     }
     *idx_out=idx; return x;
@@ -6192,6 +6251,7 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
         int ni=idx+1; ni=axx_skipspc(s,ni);
         if(ni>=slen||((s[ni]<'0'||s[ni]>'9')&&s[ni]!='(')) break;
         uint256_t t=expr_term5(asmb,s,idx+1,&idx);
+        if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
         uint256_t _xv, _tv;
         if(!expr_num_operand(asmb, x, &_xv) || !expr_num_operand(asmb, t, &_tv)){
             x = expr_bitwise_result(asmb, u256_zero());
@@ -6209,6 +6269,21 @@ static uint256_t expr_term6(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
+/* 比較と論理演算の結果（1 か 0）を、今のモードの値にする。浮動小数点の文脈では
+   1.0 / 0.0 の倍精度で持つ（axx.py は int の 1 / 0 を返し、そのまま浮動小数点と
+   混ぜて計算できる）。整数のビットのままだと、倍精度として読んだときに
+   4.9e-324 のような値になってしまう。 */
+static uint256_t expr_bool(Assembler *asmb, int b){
+    if(asmb->st.exp_typ_float) return double_to_u256(b ? 1.0 : 0.0);
+    return u256_from_i64(b);
+}
+
+/* 値が偽か。浮動小数点の文脈では 0.0 と -0.0 が偽（axx.py の 0.0 / -0.0 と同じ）。 */
+static int expr_is_false(Assembler *asmb, uint256_t v){
+    if(asmb->st.exp_typ_float && !u256_is_undef(v)) return u256_to_double(v) == 0.0;
+    return u256_is_zero(v);
+}
+
 /* 比較 `<=` `<` `>=` `>` `==` `!=`。結果は 1 か 0。 */
 static uint256_t expr_term7(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term6(asmb,s,idx,&idx);
@@ -6217,27 +6292,33 @@ static uint256_t expr_term7(Assembler *asmb, const char *s, int idx, int *idx_ou
         int flt=asmb->st.exp_typ_float;
         if(axx_q(s,slen,"<=",idx)){
             uint256_t t=expr_term6(asmb,s,idx+2,&idx);
-            x=u256_from_i64(flt ? (u256_to_double(x)<=u256_to_double(t)?1:0)
+            if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
+            x=expr_bool(asmb, flt ? (u256_to_double(x)<=u256_to_double(t)?1:0)
                                 : (u256_le_signed(x,t)?1:0));
         } else if(s[idx]=='<'&&s[idx+1]!='<'){
             uint256_t t=expr_term6(asmb,s,idx+1,&idx);
-            x=u256_from_i64(flt ? (u256_to_double(x)< u256_to_double(t)?1:0)
+            if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
+            x=expr_bool(asmb, flt ? (u256_to_double(x)< u256_to_double(t)?1:0)
                                 : (u256_lt_signed(x,t)?1:0));
         } else if(axx_q(s,slen,">=",idx)){
             uint256_t t=expr_term6(asmb,s,idx+2,&idx);
-            x=u256_from_i64(flt ? (u256_to_double(x)>=u256_to_double(t)?1:0)
+            if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
+            x=expr_bool(asmb, flt ? (u256_to_double(x)>=u256_to_double(t)?1:0)
                                 : (u256_ge_signed(x,t)?1:0));
         } else if(s[idx]=='>'&&s[idx+1]!='>'){
             uint256_t t=expr_term6(asmb,s,idx+1,&idx);
-            x=u256_from_i64(flt ? (u256_to_double(x)> u256_to_double(t)?1:0)
+            if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
+            x=expr_bool(asmb, flt ? (u256_to_double(x)> u256_to_double(t)?1:0)
                                 : (u256_gt_signed(x,t)?1:0));
         } else if(axx_q(s,slen,"==",idx)){
             uint256_t t=expr_term6(asmb,s,idx+2,&idx);
-            x=u256_from_i64(flt ? (u256_to_double(x)==u256_to_double(t)?1:0)
+            if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
+            x=expr_bool(asmb, flt ? (u256_to_double(x)==u256_to_double(t)?1:0)
                                 : (u256_eq(x,t)?1:0));
         } else if(axx_q(s,slen,"!=",idx)){
             uint256_t t=expr_term6(asmb,s,idx+2,&idx);
-            x=u256_from_i64(flt ? (u256_to_double(x)!=u256_to_double(t)?1:0)
+            if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
+            x=expr_bool(asmb, flt ? (u256_to_double(x)!=u256_to_double(t)?1:0)
                                 : (!u256_eq(x,t)?1:0));
         } else break;
     }
@@ -6257,7 +6338,8 @@ static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_ou
     int slen=expr_slen(s);
     while(idx<slen && axx_q(s,slen,"&&",idx)){
         uint256_t t=expr_term8(asmb,s,idx+2,&idx);
-        x=u256_from_i64((!u256_is_zero(x) && !u256_is_zero(t))?1:0);
+        if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
+        x=expr_bool(asmb, (!expr_is_false(asmb,x) && !expr_is_false(asmb,t))?1:0);
     }
     *idx_out=idx; return x;
 }
@@ -6268,7 +6350,8 @@ static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_o
     int slen=expr_slen(s);
     while(idx<slen && axx_q(s,slen,"||",idx)){
         uint256_t t=expr_term9(asmb,s,idx+2,&idx);
-        x=u256_from_i64((!u256_is_zero(x) || !u256_is_zero(t))?1:0);
+        if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
+        x=expr_bool(asmb, (!expr_is_false(asmb,x) || !expr_is_false(asmb,t))?1:0);
     }
     *idx_out=idx; return x;
 }
@@ -6353,7 +6436,7 @@ static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_o
         st->expr_depth++;
         idx++;
         idx = axx_skipspc(s, idx);
-        if(u256_is_zero(x)){
+        if(expr_is_false(asmb, x)){
             int skip_end = skip_subexpr(s, idx);
             if(axx_q(s, slen, ":", skip_end) && s[skip_end+1] != '='){
                 int false_start = axx_skipspc(s, skip_end + 1);
@@ -6409,6 +6492,11 @@ static int dir_set_symbol(Assembler *asmb, PatEntry *e){
         }
         smap_set(&asmb->st.symbols, e->setsym_key, e->setsym_val);
         return 1;
+    }
+    if(!e->f[1][0] && !e->f[2][0]){
+        /* axx.py の set_symbol() と同じく、名前の無い `.setsym` は誤り。 */
+        axx_diagf(1, 0, " error - .setsym directive requires at least a symbol name\n");
+        return 0;
     }
     const char *name_field = e->f[1][0] ? e->f[1] : e->f[2];
     const char *value_field = e->f[1][0] ? e->f[2] : "";
@@ -6701,53 +6789,89 @@ static int reloc_badname_seen(AsmState *st, const char *name){
     return 0;
 }
 
-static int elf_decl_num(Assembler *asmb, const char *dname, const char *text,
-                        long long lo, long long hi, long long *out){
+/* ELF 宣言の数値欄の読み取り結果。同じ綴りが何度も現れるので覚えておく。
+   axx.py の DirectiveProcessor._elfdecl_cache と同じく、鍵は (綴り, 下限, 上限)。
+   2 回目からは式を評価しないので、式の中で出る警告も 1 回だけになる。 */
+typedef struct { char *text; uint64_t lo, hi; int is_u64; int ok; uint64_t val; } ElfDeclMemo;
+static ElfDeclMemo *g_elfdecl_memo = NULL;
+static int g_elfdecl_memo_n = 0, g_elfdecl_memo_cap = 0;
+
+/* 宣言の数値欄を lo..hi の整数として読む。is_u64 なら符号なし 64 ビット。
+   axx.py の _elf_decl_num() と同じ規則である。 */
+static int elf_decl_read(Assembler *asmb, const char *dname, const char *text_in,
+                         uint64_t lo, uint64_t hi, int is_u64, uint64_t *out){
     AsmState *st = &asmb->st;
-    while(*text==' '||*text=='\t') text++;
-    if(!*text){
+    while(*text_in==' '||*text_in=='\t') text_in++;
+    size_t tl = strlen(text_in);
+    while(tl > 0 && (text_in[tl-1]==' '||text_in[tl-1]=='\t')) tl--;
+    if(tl == 0){
         axx_diagf(1, 0, " error - %s: a number is required.\n", dname);
         return 0;
+    }
+    char *text = malloc(tl + 1);
+    if(!text){ perror("malloc"); exit(1); }
+    memcpy(text, text_in, tl); text[tl] = '\0';
+    char lob[32], hib[32];
+    if(is_u64){
+        snprintf(lob, sizeof(lob), "%llu", (unsigned long long)lo);
+        snprintf(hib, sizeof(hib), "%llu", (unsigned long long)hi);
+    } else {
+        snprintf(lob, sizeof(lob), "%lld", (long long)lo);
+        snprintf(hib, sizeof(hib), "%lld", (long long)hi);
+    }
+    for(int i = 0; i < g_elfdecl_memo_n; i++){
+        ElfDeclMemo *m = &g_elfdecl_memo[i];
+        if(m->lo == lo && m->hi == hi && m->is_u64 == is_u64 && strcmp(m->text, text) == 0){
+            if(!m->ok)
+                axx_diagf(1, 0, " error - %s: value must be an integer in %s..%s, "
+                                "got '%s'.\n", dname, lob, hib, text);
+            else *out = m->val;
+            free(text);
+            return m->ok;
+        }
     }
     int io;
     st->error_undefined_label = 0;
     uint256_t v = expr_expression_pat(asmb, text, 0, &io);
-    int64_t n = u256_to_i64(v);
-    if(st->error_undefined_label || u256_is_undef_derived(v)
-       || !u256_eq(v, u256_from_i64(n)) || n < lo || n > hi){
-        axx_diagf(1, 0, " error - %s: value must be an integer in %lld..%lld, "
-                        "got '%s'.\n", dname, lo, hi, text);
-        st->error_undefined_label = 0;
-        return 0;
+    int ok;
+    uint64_t val = 0;
+    if(is_u64){
+        uint64_t n = u256_to_u64(v);
+        ok = !(st->error_undefined_label || u256_is_undef_derived(v)
+               || !u256_eq(v, u256_from_u64(n)) || n < lo || n > hi);
+        val = n;
+    } else {
+        int64_t n = u256_to_i64(v);
+        ok = !(st->error_undefined_label || u256_is_undef_derived(v)
+               || !u256_eq(v, u256_from_i64(n)) || n < (int64_t)lo || n > (int64_t)hi);
+        val = (uint64_t)n;
     }
+    if(!ok)
+        axx_diagf(1, 0, " error - %s: value must be an integer in %s..%s, "
+                        "got '%s'.\n", dname, lob, hib, text);
     st->error_undefined_label = 0;
-    *out = (long long)n;
+    if(g_elfdecl_memo_n >= g_elfdecl_memo_cap){
+        g_elfdecl_memo_cap = g_elfdecl_memo_cap ? g_elfdecl_memo_cap * 2 : 16;
+        g_elfdecl_memo = realloc(g_elfdecl_memo, (size_t)g_elfdecl_memo_cap * sizeof(ElfDeclMemo));
+        if(!g_elfdecl_memo){ perror("realloc"); exit(1); }
+    }
+    ElfDeclMemo *m = &g_elfdecl_memo[g_elfdecl_memo_n++];
+    m->text = text; m->lo = lo; m->hi = hi; m->is_u64 = is_u64; m->ok = ok; m->val = val;
+    if(ok) *out = val;
+    return ok;
+}
+
+static int elf_decl_num(Assembler *asmb, const char *dname, const char *text,
+                        long long lo, long long hi, long long *out){
+    uint64_t v;
+    if(!elf_decl_read(asmb, dname, text, (uint64_t)lo, (uint64_t)hi, 0, &v)) return 0;
+    *out = (long long)v;
     return 1;
 }
 
 static int elf_decl_u64(Assembler *asmb, const char *dname, const char *text,
                         uint64_t lo, uint64_t hi, uint64_t *out){
-    AsmState *st = &asmb->st;
-    while(*text==' '||*text=='\t') text++;
-    if(!*text){
-        axx_diagf(1, 0, " error - %s: a number is required.\n", dname);
-        return 0;
-    }
-    int io;
-    st->error_undefined_label = 0;
-    uint256_t v = expr_expression_pat(asmb, text, 0, &io);
-    uint64_t n = u256_to_u64(v);
-    if(st->error_undefined_label || u256_is_undef_derived(v)
-       || !u256_eq(v, u256_from_u64(n)) || n < lo || n > hi){
-        axx_diagf(1, 0, " error - %s: value must be an integer in %llu..%llu, "
-                        "got '%s'.\n", dname, (unsigned long long)lo,
-                        (unsigned long long)hi, text);
-        st->error_undefined_label = 0;
-        return 0;
-    }
-    st->error_undefined_label = 0;
-    *out = n;
-    return 1;
+    return elf_decl_read(asmb, dname, text, lo, hi, 1, out);
 }
 
 /* ELF 宣言の欄を取り出す（欄の詰め方の違いを吸収する）。 */
@@ -8087,7 +8211,9 @@ static int dir_echo(Assembler *asmb, PatEntry *e){
         int io = 0;
         uint256_t v = expr_expression_pat(asmb, items[k].text, 0, &io);
         char cb[96];
-        u256_to_pydec(v, cb, sizeof(cb));
+        /* 未定義は番兵の数字ではなく UNDEF と出す（axx.py と同じ）。 */
+        if(u256_is_undef(v)) snprintf(cb, sizeof(cb), "UNDEF");
+        else u256_to_pydec(v, cb, sizeof(cb));
         parts[k] = strdup(cb);
         if(!parts[k]){ perror("strdup"); exit(1); }
     }
@@ -8148,15 +8274,23 @@ static int dir_error(Assembler *asmb, const char *s){
         int io;
         int prev_flt = st->exp_typ_float;
         st->exp_typ_float = 1;
+        /* 条件が未定義のラベル・変数に触れたら、その条件では判定しない。未定義は
+           すでに報告済みで、番兵の値で範囲を判定しても意味がない。
+           axx.py の DirectiveProcessor.error() と同じ規則である。 */
+        int undef_prior = st->error_undefined_label;
+        st->error_undefined_label = 0;
         uint256_t u=expr_expression_pat(asmb,buf,idx,&io);
+        int cond_undef = st->error_undefined_label || u256_is_undef(u);
+        int cond_false = expr_is_false(asmb, u);
         idx=io;
         int io_cond = io;
         if(buf[idx]==';') idx++;
         uint256_t t=expr_expression_pat(asmb,buf,idx,&io);
         st->exp_typ_float = prev_flt;
+        st->error_undefined_label = undef_prior || st->error_undefined_label;
         idx=io;
         if(idx <= idx_before) break;
-        if((should_report_errors(st))&&!u256_is_zero(u)
+        if((should_report_errors(st))&&!cond_false&&!cond_undef
            && !cond_tests_relocated_var(st, buf + idx_before,
                                         (size_t)(io_cond - idx_before))){
             double _tdv = u256_to_double(t);
@@ -8494,6 +8628,9 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 idx_t = pat_var_stopchar(t, tlen, idx_t + _nl, &stopchar, closes, &nclose);
                 int idx_s_q_start = idx_s;
                 uint256_t fv = expr_expression_esc_float(asmb, s, idx_s, stopchar, &idx_s);
+                /* 未定義は 0（未定義はすでに報告済み）。axx.py と同じ。 */
+                int fv_undef = u256_is_undef(fv);
+                if(fv_undef) fv = double_to_u256(0.0);
                 sub_span_close_all(closes, nclose, idx_s);
                 cap_text_set(st, vslot, s, idx_s_q_start, idx_s, stopchar);
                 double dv = u256_to_double(fv);
@@ -8518,6 +8655,9 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                        s[idx_s_q_start + raw_len - 1] == stopchar)
                         raw_len--;
                     uint256_t qbits;
+                    if(fv_undef){
+                        qbits = u256_zero();
+                    } else
 #if defined(__GNUC__) && !defined(__STRICT_ANSI__) && \
     (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
      defined(__arm__) || defined(__riscv))
@@ -9043,7 +9183,7 @@ static void axx_abs_dir_of(const char *path, char *out, size_t osz)
 static void readpat(Assembler *asmb, const char *fn);
 static void include_pat(Assembler *asmb, const char *l, const char *base_dir);
 
-static char **pat_macro_expand(FILE *f, const char *display, int *nlines);
+static char **pat_macro_expand(FILE *f, const char *display, int *nlines, int **lines_out);
 static void pat_macro_expand_free(char **v, int n);
 static void macro_reset_pass_pattern(void);
 
@@ -9510,7 +9650,9 @@ static int mini_lex(MiniCtx *c, const char *t, MiniLexBuf *b){
             MLX_BEGIN(); MLX_PUT(ch); MLX_END();
             n++; i++; continue;
         }
-        { char _cs[2] = { ch, 0 }; char _cr[16]; m_pyrepr(_cs, _cr, sizeof(_cr));
+        { /* axx.py と同じく 1 文字（UTF-8）を repr の形で引用する。 */
+          size_t _cl = utf8_prefix_bytes(t + i, (size_t)(len - i), 1);
+          char _cr[32]; m_pyrepr_n(t + i, _cl, _cr, sizeof(_cr));
           mini_fail(c, "unexpected character %s", _cr); }
     }
     out[n].k = MT_END;
@@ -10176,6 +10318,8 @@ typedef struct {
     int        returning;
     int        loopctl;
     MiniVal    retval;
+    /* この呼び出しが前方参照のラベルとして許した名前（式の節の名前を指す）。 */
+    const char **fb; int nfb, cfb;
     int        has_ret;
 } MiniRun;
 
@@ -10426,8 +10570,28 @@ static MiniVal mini_get(MiniRun *r, const char *name){
         mini_fail(&r->c, "'.nonlocal %s' found no enclosing definition of '%s'", name, name);
     MiniBind *b = mini_find(fr, name);
     if(!b){
-        if(r->asmb && (mini_core_name(r, name) || r->asmb->st.pas != 2))
+        /* 本体側に無い名前を前方参照のラベルとして許すのは、ラベルがまだ揃って
+           いないパス 1 の最初の反復だけ。2 回目からは前回の反復の値が全部あるので、
+           それでも無い名前は綴り間違いとしてすぐ止める（暴走の上限まで回らない）。
+           axx.py の MiniInterp._get() と同じ。 */
+        int permissive = r->asmb && r->asmb->st.pas != 2
+                         && !(r->asmb->st.pas == 1 && !r->asmb->st.relax_optimistic);
+        if(permissive && sv_contains(&r->asmb->st.mini_suspects, name)) permissive = 0;
+        if(r->asmb && (mini_core_name(r, name) || permissive)){
+            if(permissive && !mini_core_name(r, name)){
+                int seen = 0;
+                for(int i = 0; i < r->nfb; i++) if(strcmp(r->fb[i], name) == 0){ seen = 1; break; }
+                if(!seen){
+                    if(r->nfb >= r->cfb){
+                        r->cfb = r->cfb ? r->cfb * 2 : 8;
+                        r->fb = realloc(r->fb, (size_t)r->cfb * sizeof(char*));
+                        if(!r->fb){ perror("realloc"); exit(1); }
+                    }
+                    r->fb[r->nfb++] = name;
+                }
+            }
             return mini_num(mini_core_eval(r, name));
+        }
         mini_fail(&r->c, "'%s' is used before it is set", name);
     }
     return mini_val_copy(&b->v);
@@ -10648,9 +10812,17 @@ static MiniVal mini_eval(MiniRun *r, MExpr *e){
 
 /* 実行した文を 1 つ数える。上限を超えたらエラーにする。 */
 static void mini_tick(MiniRun *r){
-    if(++r->steps > MINI_MAX_STEPS)
+    if(++r->steps > MINI_MAX_STEPS){
+        /* パス 1 の最初の反復で上限に達したら、この呼び出しが前方参照として許した
+           名前を「綴り間違いの疑い」として覚える（mini_get がその名前ですぐ止める）。
+           axx.py の MiniInterp._tick() と同じ。 */
+        if(r->asmb && r->asmb->st.pas == 1 && r->asmb->st.relax_optimistic)
+            for(int i = 0; i < r->nfb; i++)
+                if(!sv_contains(&r->asmb->st.mini_suspects, r->fb[i]))
+                    sv_push(&r->asmb->st.mini_suspects, r->fb[i]);
         mini_fail(&r->c, "mini language ran more than %d statements; "
                   "assuming a runaway loop", MINI_MAX_STEPS);
+    }
 }
 
 /* 呼ぶ関数を名前で探す。内側の定義から外側へたどる。 */
@@ -11596,6 +11768,7 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *
     }
     for(int i = 0; i < r.nframes; i++) mini_frame_clear(&r.frames[i]);
     free(r.frames);
+    free(r.fb);
     free(r.c.err);
     mini_drop_ret(&r);
     free(r.out.data);
@@ -11675,8 +11848,10 @@ static int parse_func_header(const char *l, char *name, size_t nsz,
     int k = axx_skipspc(t, j);
     if(k >= tlen) return 0;
     if(t[k] != '('){
+        /* axx.py と同じく Python の repr の形で引用する（' を含めば "…"）。 */
+        char gr[400]; m_pyrepr_n(t + k, (size_t)(tlen - k), gr, sizeof(gr));
         snprintf(errbuf, esz, " error - '.func': expected '(' or end of line after "
-                 "the name, got '%.*s'\n", tlen - k, t + k);
+                 "the name, got %s\n", gr);
         return 1;
     }
     int e = -1;
@@ -11735,9 +11910,11 @@ static char *map_subst_index(const char *expr, const char *var, int i){
     if(!out){ perror("malloc"); exit(1); }
     size_t w = 0;
     for(size_t k = 0; expr[k]; ){
+        /* 一致したときだけ後ろの文字を見る。一致しなければ k+vl は文字列の
+           終わりを越えうる。 */
         int is_var = (strncasecmp(expr+k, var, vl) == 0);
         int lsep = (k == 0) || !(isalnum((unsigned char)expr[k-1]) || expr[k-1]=='_');
-        int rsep = !(isalnum((unsigned char)expr[k+vl]) || expr[k+vl]=='_');
+        int rsep = is_var && !(isalnum((unsigned char)expr[k+vl]) || expr[k+vl]=='_');
         if(is_var && lsep && rsep){ memcpy(out+w, num, nl); w += nl; k += vl; }
         else out[w++] = expr[k++];
     }
@@ -11792,7 +11969,8 @@ static void readpat(Assembler *asmb, const char *fn){
     }
 
     int nexp = 0;
-    char **exp = pat_macro_expand(f, fn, &nexp);
+    int *expln = NULL;
+    char **exp = pat_macro_expand(f, fn, &nexp, &expln);
     fclose(f);
     f = NULL;
 
@@ -11910,14 +12088,14 @@ static void readpat(Assembler *asmb, const char *fn){
                             axx_diagf(0, 0, " warning - function %s is defined more than "
                                        "once; the later definition wins.\n", _nr);
                         }
-                        nf = mini_func_new(asmb, parent, nmbuf, fn, li + 1);
+                        nf = mini_func_new(asmb, parent, nmbuf, fn, expln[li]);
                         for(int q=0;q<nparam;q++)
                             mini_func_addparam(nf, pbuf + (size_t)q*FUNC_NAME_MAX);
                     } else {
                         nf = mini_alloc(sizeof(MiniFunc));
                         nf->name = mini_strdup("?");
                         nf->file = mini_strdup(fn);
-                        nf->line = li + 1;
+                        nf->line = expln[li];
                         nf->parent = parent;
                     }
                     free(pbuf);
@@ -11952,7 +12130,7 @@ static void readpat(Assembler *asmb, const char *fn){
                 }
                 {
                     int nb = axx_skipspc(line, 0);
-                    if(line[nb]) mini_func_addline(cur, line, fn, li + 1);
+                    if(line[nb]) mini_func_addline(cur, line, fn, expln[li]);
                 }
                 continue;
             }
@@ -12150,7 +12328,7 @@ static void readpat(Assembler *asmb, const char *fn){
     }
     free(rest_has_close);
     free(line);
-    pat_macro_expand_free(exp, nexp);
+    pat_macro_expand_free(exp, nexp); free(expln);
     asmb->st.pat_include_depth--;
     if(asmb->st.pat_include_depth >= 0
        && asmb->st.pat_include_depth < (int)(sizeof(asmb->st.pat_include_chain)
@@ -12713,6 +12891,9 @@ static void txt_add_escaped(TxtBuf *t, const char *s){
 
 /* 値をその基数の数字だけで書く（基数プレフィックスは付けない）。 */
 static void txt_radix(TxtBuf *t, uint256_t v, int radix){
+    /* 未定義は数字にせず UNDEF と書く。番兵の大きさは両実装で違うので、数字で
+       出すと出力がそろわない。axx.py の _txt_radix() と同じ。 */
+    if(u256_is_undef(v)){ txt_adds(t, "UNDEF"); return; }
     int neg = 0;
     if(u256_lt_signed(v, u256_zero())){ neg = 1; v = u256_sub(u256_zero(), v); }
     char tmp[300];
@@ -12846,6 +13027,7 @@ static void txt_emit_expr(Assembler *asmb, TxtBuf *t, const char *expr, int kind
     if(st->error_undefined_label) saved_undef = 1;
     st->error_undefined_label = saved_undef;
 
+    if(u256_is_undef(v)){ txt_adds(t, "UNDEF"); return; }
     switch(kind){
     case 0: txt_radix(t, v, 16); break;
     case 2: txt_radix(t, v, 2);  break;
@@ -12968,7 +13150,8 @@ static int txt_arr_index_of(Assembler *asmb, struct ArrSym *ar, const char *key,
         }
         uint256_t sv2;
         if(smap_get(&st->symbols, up, &sv2))
-            return txt_arr_index_check(asmb, ar, key, u256_to_i64(sv2), out);
+            return u256_is_undef(sv2) ? 0
+                 : txt_arr_index_check(asmb, ar, key, u256_to_i64(sv2), out);
     }
     int io;
     int saved_undef = st->error_undefined_label;
@@ -12976,6 +13159,9 @@ static int txt_arr_index_of(Assembler *asmb, struct ArrSym *ar, const char *key,
     uint256_t iv = expr_expression_pat(asmb, cur, 0, &io);
     if(st->error_undefined_label) saved_undef = 1;
     st->error_undefined_label = saved_undef;
+    /* 添字が未定義なら、未定義はすでに報告済みなので、範囲外とは報告せずに
+       引けなかったことにする。axx.py の _arr_index_check() と同じ。 */
+    if(u256_is_undef(iv)) return 0;
     return txt_arr_index_check(asmb, ar, key, u256_to_i64(iv), out);
 }
 
@@ -13686,19 +13872,23 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
         char ue[256]; axx_strupr_to(ue,e,sizeof(ue));
         if(strcmp(ue,".EQU")==0){
             int io;
-            const char *expr_tail = l + idx;
+            /* 式の部分は前後の空白を落としてから評価する（axx.py の
+               `l[idx:].strip()` と同じ）。診断に出す位置がそろう。 */
+            const char *expr_tail = l + axx_skipspc(l, idx);
             int reloc_type = -1;
             const char *dcolon = strstr(expr_tail, "::");
-            char *expr_buf = NULL;
+            size_t elen = dcolon ? (size_t)(dcolon - expr_tail) : strlen(expr_tail);
+            while(elen > 0 && (expr_tail[elen-1]==' ' || expr_tail[elen-1]=='\t')) elen--;
+            char *expr_buf = malloc(elen + 1);
+            if(!expr_buf){ perror("malloc"); exit(1); }
+            memcpy(expr_buf, expr_tail, elen); expr_buf[elen] = '\0';
+            expr_tail = expr_buf;
             if(dcolon){
-                size_t elen = (size_t)(dcolon - expr_tail);
-                expr_buf = malloc(elen + 1);
-                if(!expr_buf){ perror("malloc"); exit(1); }
-                memcpy(expr_buf, expr_tail, elen); expr_buf[elen] = '\0';
-                expr_tail = expr_buf;
                 const char *rt_str = dcolon + 2;
+                rt_str += axx_skipspc(rt_str, 0);
                 char rt_lc[64]; int ri=0;
                 while(rt_str[ri] && ri < 63){ rt_lc[ri]=(char)tolower((unsigned char)rt_str[ri]); ri++; }
+                while(ri > 0 && (rt_lc[ri-1]==' ' || rt_lc[ri-1]=='\t')) ri--;
                 rt_lc[ri]='\0';
                 reloc_type = elf_reloc_named(st, elf_machine_effective(st), rt_lc);
                 if(reloc_type < 0)
@@ -14221,6 +14411,11 @@ static int adir_extern(Assembler *asmb, const char *l, const char *l2){
         } else if(existing->is_imported){
             if(explicit_reloc_type && existing->reloc_type_override >= 0)
                 existing->reloc_type_override = reloc_type;
+        } else {
+            /* axx.py の extern_processing() と同じく、ここで定義済みの名前は
+               外部にしない。 */
+            axx_diagf(0, 0, " warning - .EXTERN: '%s' is already defined locally; "
+                            "ignoring extern declaration\n", s);
         }
         if(s!=sbuf) free(s);
         idx=axx_skipspc(buf,idx);
@@ -15105,6 +15300,11 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     l_nospace[nn]=0;
     memcpy(l, l_nospace, (size_t)nn+1);
 
+    /* 未定義ラベルの印はこの命令の評価だけのもの。前の行で立ったものを持ち越すと、
+       照合を 1 回も試さない行が「未定義ラベル」と報告される。axx.py の
+       lineassemble2() と同じ。 */
+    st->error_undefined_label = 0;
+
     if(st->textmode && textmode_text_only_dir(l)){
         passthru_line(asmb, l, l2, objl_out);
         *idx_out=idx; return 1;
@@ -15392,7 +15592,10 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         } else {
             iv_clear(objl_out);
         }
-        if(!oerr){
+        {
+            /* 4 つ目の欄（EPIC の番号）は binary_list の結果に関係なく評価する。
+               axx.py の lineassemble2() と同じで、ここに未定義のラベルがあれば
+               それも報告される。 */
             int io;
             uint256_t idxv=expr_expression_pat(asmb,i->f[3],0,&io);
             idxs_val=(int)u256_to_i64(idxv);
@@ -16378,6 +16581,7 @@ static int elf_call_func(AsmState *st, const char *dname, const char *fname,
     }
     for(int i = 0; i < r.nframes; i++) mini_frame_clear(&r.frames[i]);
     free(r.frames);
+    free(r.fb);
     free(r.c.err);
     mini_drop_ret(&r);
     free(r.out.data);
@@ -18033,6 +18237,20 @@ static void m_pyrepr_n(const char *s, size_t n, char *out, size_t outsz){
         else if(c < 0x20 || c == 0x7f){
             int nn = snprintf(out + o, outsz - o, "\\x%02x", c);
             o += (nn > 0) ? (size_t)nn : 0;
+        } else if(c >= 0x80){
+            /* UTF-8 の 1 文字はまとめて写す。読めないバイトは、Python が
+               surrogateescape で読んだ文字を '\udcXX' と repr するのに合わせる。 */
+            size_t L = utf8_prefix_bytes(s + k, n - k, 1);
+            if(L == 1){
+                if(o + 8 >= outsz) break;
+                int nn = snprintf(out + o, outsz - o, "\\udc%02x", c);
+                o += (nn > 0) ? (size_t)nn : 0;
+            } else {
+                if(o + L + 2 >= outsz) break;
+                memcpy(out + o, s + k, L);
+                o += L;
+                k += L - 1;
+            }
         } else out[o++] = (char)c;
     }
     out[o++] = q;
@@ -18496,7 +18714,6 @@ static MVal mep_primary(MEP *p){
     {
         char cbuf[2] = { c, 0 }, cr[16]; char *sr = m_pyrepr_a(p->mp, p->s);
         m_pyrepr(cbuf, cr, sizeof(cr));
-        m_pyrepr(p->s, sr, sizeof(sr));
         m_fail(p->mp, p->file, p->line, "macro expression: unexpected character %s in %s", cr, sr);
     }
     return mv_int(0);
@@ -19988,16 +20205,10 @@ static void m_read_lines(MacroPP *mp, FILE *f, const char *display, MSrc *out){
         n++;
     }
     if(pending){
-        if(n >= cap){
-            int nc = cap + 1;
-            MLine *nd = marena_alloc(&mp->arena, (size_t)nc * sizeof(MLine));
-            memcpy(nd, d, (size_t)n * sizeof(MLine));
-            d = nd; cap = nc;
-        }
-        d[n].text = marena_strdup(&mp->arena, pending);
-        d[n].file = name;
-        d[n].line = n + 1;
-        n++;
+        /* ファイルの最後で続きが途切れたら、つないだ中身を塊の最後の物理行に
+           置く。新しい行は足さないので、行数も行番号も入力のまま。axx.py の
+           join_backslash_continuations() と同じ。 */
+        d[n-1].text = marena_strdup(&mp->arena, pending);
         free(pending); pending = NULL;
     }
     free(line);
@@ -20138,13 +20349,21 @@ static void macro_reset_pass_pattern(void){
 }
 
 /* パターンファイルをマクロ展開する。 */
-static char **pat_macro_expand(FILE *f, const char *display, int *nlines){
+/* パターンファイルをマクロ層に通す。lines_out が NULL でなければ、各行の展開前の
+   行番号（axx.py の expand() が返す 3 つ組の行番号）を並べて返す。呼び出し側が
+   free する。 */
+static char **pat_macro_expand(FILE *f, const char *display, int *nlines, int **lines_out){
     MLineVec v = macro_expand(&g_pat_macro, f, display);
     char **out = malloc(sizeof(char*) * (size_t)(v.len + 1));
     if(!out){ perror("malloc"); exit(1); }
+    if(lines_out){
+        *lines_out = malloc(sizeof(int) * (size_t)(v.len + 1));
+        if(!*lines_out){ perror("malloc"); exit(1); }
+    }
     for(int i = 0; i < v.len; i++){
         out[i] = strdup(v.d[i].text ? v.d[i].text : "");
         if(!out[i]){ perror("strdup"); exit(1); }
+        if(lines_out) (*lines_out)[i] = v.d[i].line;
     }
     out[v.len] = NULL;
     *nlines = v.len;
@@ -20933,7 +21152,7 @@ int main(int argc, char *argv[]){
         }
         macro_reset_pass_pattern();
         int _pn=0;
-        char **_pv=pat_macro_expand(pf, patternfile, &_pn);
+        char **_pv=pat_macro_expand(pf, patternfile, &_pn, NULL);
         fclose(pf);
         if(g_pat_macro.had_error || st->had_error){
             pat_macro_expand_free(_pv,_pn); exit_code=1; goto cleanup;

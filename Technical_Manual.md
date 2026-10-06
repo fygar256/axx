@@ -3605,14 +3605,18 @@ braces contain exactly that spelling it is taken as a value, so `qad{inf}` is th
 infinity bit pattern. Mixed into arithmetic, as in `qad{inf+2}`, it is an
 expression and therefore an error.
 
-**Arithmetic inside `qad{}` can disagree in the last bit.** A single value
-(`qad{3.14}`) is identical in both implementations. Only when arithmetic is
-involved do they part: Caxx rounds after each binary128 operation, Paxx computes
-in 60 decimal digits and rounds once at the end, so a decimal fraction that
-binary cannot represent exactly can come out 1 ULP apart (`qad{0.1+0.2}`,
-`qad{3.14+2.5}`). Operands that binary represents exactly (`qad{1/3}`,
-`qad{1e10*1e10}`) agree. `flt{}` and `dbl{}` compute in double in both
-implementations, so they do not have this difference.
+**`!Q` and `qad{}` arithmetic rounds to binary128 after every operation.** Numbers
+are read correctly rounded to binary128, and every `+ - * /` rounds to binary128
+(ties to even) — the `__float128` arithmetic of Caxx, which Paxx reproduces with
+exact rationals. The grammar is numbers, parentheses, unary `+ -` and `+ - * /`
+only; on division by zero, a non-finite result or unreadable trailing text, the
+value computed in double is written out with `%.17g` and converted to binary128.
+Both implementations produce the same bits on either path.
+
+**Integers are read as 256-bit signed values.** When a `!F` / `!D` / `!Q`
+expression yields an integer, it is converted to floating point as a 256-bit
+two's complement value; a 64-digit `0xfff…f` is `-1` and becomes `-1.0`. In a
+floating-point context comparisons return `1.0` / `0.0`, and `-0.0` is false.
 
 ### 5.5 Sections
 
@@ -3927,19 +3931,30 @@ wrapped past `2**256`). This is a property of the sentinel design, not of any
 one operator: giving Caxx an out-of-band sentinel would mean widening its value
 type beyond 256 bits.
 
-Because the sentinel itself is spelled differently, **what gets printed after an
-undefined label has been read differs too**. Neither implementation writes an
-output file in that case, so the generated artefacts are unaffected, but the
-following are visible:
+The sentinel has a different size in each implementation, but **what happens
+after an undefined label has been read is the same in both**, by these rules:
 
-- the number in `Line N Error code …` (when an `error_patterns` condition reads
-  the sentinel, the truth of the condition itself can differ between the two);
-- a number embedded in `.textmode` translated text (`LD A,<sentinel>`);
-- whether `!F` / `!D` report that the value cannot be converted;
-- how many labels appear in the "address mismatch between pass1 and pass2" list.
+- **Poisoning.** When either operand of an operator (`+ - * / // % ** << >> & | ^ '`,
+  the comparisons, `&& ||`, unary `- ~ @`, `*(x,y)`) is undefined, the result is
+  undefined itself. Arithmetic on undefined values never turns into different
+  values because of the sentinels' different sizes, and the diagnostics such a
+  value would otherwise trigger (division by zero, an oversized shift count) are
+  not issued.
+- **`error_patterns`.** A condition whose evaluation touched an undefined label or
+  variable is not judged (no error code is reported); the undefined label has
+  already been reported.
+- **Text output.** Templates `{{ }}` (including `.hex` and friends) and `.echo` on
+  a body line write an undefined value as `UNDEF` rather than as a number. An
+  undefined array-symbol subscript is not reported as out of range; the lookup
+  simply fails.
+- **Floating-point captures.** A value captured by `!F` / `!D` / `!Q` that is
+  undefined becomes 0 instead of a conversion error.
+- An undefined value passed as a `.call` argument of the mini language arrives
+  as 0, as before.
 
-All of these need an undefined label to occur; correctly defined sources never
-see them.
+In every case the assembly ends with an undefined-label error and no output file
+is written; the rules only make the diagnostics and the `-V` text on the way
+there identical between the two implementations.
 
 ---
 

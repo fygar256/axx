@@ -39,6 +39,7 @@ C に移した caxx.c が同じディレクトリにあり、両者は同じ入�
 
 
 from decimal import Decimal, Context, localcontext, ROUND_HALF_EVEN
+from fractions import Fraction
 try:
     import readline
 except ImportError:
@@ -264,6 +265,41 @@ def _ieee_pow(a, b):
         return float('inf')
     except ValueError:
         return math.copysign(float('nan'), -1.0)
+
+
+def _undef(v):
+    """値が未定義そのもの（番兵 UNDEF）か。
+
+    式の演算はオペランドのどちらかがこれなら結果もこれにする（毒）。こうして
+    おくと、未定義の値どうしの算術が番兵の大きさの違い（caxx.c は 2**255-1）に
+    よって両実装で別の値になることがない。caxx.c の u256_is_undef() と同じ判定。
+    """
+    return type(v) is int and v == UNDEF
+
+
+def _float_int(v):
+    """浮動小数点にする前の整数を、caxx.c と同じ 256 ビットの符号付きに読み直す。"""
+    if type(v) is int:
+        v &= (1 << 256) - 1
+        return v - (1 << 256) if v >> 255 else v
+    return v
+
+
+def _float_of(v):
+    """値を倍精度にする（整数は 256 ビットの符号付き、溢れたら inf）。"""
+    try:
+        return float(_float_int(v))
+    except OverflowError:
+        return float('inf')
+
+
+def _g17(f):
+    """C の printf("%.17g") と同じ書き方（inf / nan も C と同じ綴り）。"""
+    if math.isnan(f):
+        return '-nan' if math.copysign(1.0, f) < 0 else 'nan'
+    if math.isinf(f):
+        return 'inf' if f > 0 else '-inf'
+    return '%.17g' % f
 
 
 def _is_undef_derived(v):
@@ -1885,6 +1921,9 @@ class AssemblerState:
 
         self.vars_text = {}
 
+        # ミニ言語で「綴り間違いの疑い」とした名前（MiniInterp._tick を参照）。
+        self._mini_suspects = set()
+
         self.deb1 = ""
         self.deb2 = ""
 
@@ -2084,6 +2123,7 @@ class StringUtils:
         """
         out = []
         pending = ''
+        open_cont = False
         for raw in raw_lines:
             body, ending = raw, ''
             if body.endswith('\r\n'):
@@ -2093,11 +2133,16 @@ class StringUtils:
             if body.endswith('\\'):
                 pending += body[:-1]
                 out.append('')
+                open_cont = True
             else:
                 out.append(pending + body + ending)
                 pending = ''
-        if pending:
-            out.append(pending)
+                open_cont = False
+        if open_cont:
+            # ファイルの最後で続きが途切れたら、つないだ中身を塊の最後の物理行に
+            # 置く。新しい行は足さないので、行数も行番号も入力のまま。
+            # caxx.c の m_read_lines() と同じ。
+            out[-1] = pending
         return out
 
     @staticmethod
@@ -2453,7 +2498,8 @@ class StringUtils:
                             s += chr(int(hex_str, 16))
                         except (ValueError, OverflowError):
                             diag(f" warning - invalid \\{next_char} escape in: {l2!r}", set_error=False)
-                            s += next_char
+                            # caxx.c と同じく、桁数が足りないときと同じに文字のまま残す。
+                            s += next_char + hex_str
                     else:
                         diag(f" warning - '\\{next_char}' escape requires {_ndigits} hex digits; "
                              f"treated as literal characters in: {l2!r}", set_error=False)
@@ -2525,13 +2571,17 @@ class Parser:
             return fs, idx
 
     def isfloatstr(self, s, idx):
-        """その位置から浮動小数点として読めるか（位置は動かさない）。"""
-        sidx = idx
-        v, idx = self.get_floatstr(s, idx)
-        if idx == sidx:
+        """その位置から浮動小数点の数が始まるか（位置は動かさない）。
+
+        数字か `.` で始まるか、`inf` / `-inf` / `nan` のときだけ真。`e0` のように
+        数字の無い指数だけの綴りは数ではない（変数やラベルの名前でありうる）。
+        caxx.c の axx_isfloatstr() と同じ判定。
+        """
+        if idx >= len(s):
             return False
-        else:
+        if s[idx:idx + 4] == '-inf' or s[idx:idx + 3] in ('inf', 'nan'):
             return True
+        return s[idx] in '0123456789.'
 
     def get_curlb(self, s, idx):
         """`{ ... }` の中身を取る。返り値は (あったか, 中身, 次の位置)。
@@ -2803,126 +2853,238 @@ class IEEE754Converter:
 
     @staticmethod
     def decimal_eval_expr(text):
-        """128bit 精度のまま浮動小数点式を評価し、ビットパターンを返す。
+        """`!Q` と `qad{...}` の式を 128 ビット浮動小数点で評価し、ビットパターンを
+        16 進 32 桁で返す。評価できなければ ValueError。
 
-        `qad{...}` の中身がここを通る。途中を double に落とさないので、
-        34 桁の有効数字が最後まで残る。
+        caxx.c の f128_eval_text() と同じ計算をする。数は 4 倍精度へ正しく丸め、
+        `+ - * /` のたびに 4 倍精度へ丸める（__float128 の演算と同じ）。文法も
+        同じで、括弧・単項の `+ -`・数（数字と `.` の並び、指数）だけを読む。
+        閉じ括弧は省略してよく、0 で割る・結果が有限でない・後ろに読めない
+        文字が残る場合は評価できないとする。
         """
-        with localcontext() as _ctx:
-            _ctx.prec = 60
-            return IEEE754Converter._decimal_eval_expr_impl(text)
+        r = _F128Eval(text).run()
+        if r is None:
+            raise ValueError("cannot evaluate as a 128-bit expression")
+        return r
+
+
+class _F128Eval:
+    """IEEE754Converter.decimal_eval_expr() の本体。caxx.c の f128_*_fn() を写す。
+
+    値は (Fraction, 負のゼロか) の組、または inf / nan を表す float で持つ。
+    Fraction は 4 倍精度で表せる値に丸めてから持つ。
+    """
+
+    _P = 113
+    _EMIN = -16382
+    _EMAX = 16383
+    _NUM_RE = re.compile(r'[0-9]*\.?[0-9]*')
+
+    def __init__(self, text):
+        self.s = text + chr(0)
+
+    @classmethod
+    def _round(cls, q):
+        """正の有理数 q を 4 倍精度へ偶数丸めする。溢れたら inf。"""
+        e = q.numerator.bit_length() - q.denominator.bit_length()
+        if Fraction(2) ** e > q:
+            e -= 1
+        if e < cls._EMIN:
+            e = cls._EMIN
+        quantum = Fraction(2) ** (e - (cls._P - 1))
+        m, rem = divmod(q, quantum)
+        m = int(m)
+        if rem * 2 > quantum or (rem * 2 == quantum and m & 1):
+            m += 1
+        r = m * quantum
+        if r >= Fraction(2) ** (cls._EMAX + 1):
+            return float('inf')
+        return r
+
+    @classmethod
+    def _make(cls, q, neg_zero=False):
+        """有理数を 4 倍精度の値にする。"""
+        if q == 0:
+            return (Fraction(0), neg_zero)
+        if q > 0:
+            r = cls._round(q)
+            return r if isinstance(r, float) else (r, False)
+        r = cls._round(-q)
+        return -r if isinstance(r, float) else (-r, False)
 
     @staticmethod
-    def _decimal_eval_expr_impl(text):
-        """上の本体。Decimal 上の再帰下降で `+ - * / // %` と括弧を解く。
+    def _rep(v):
+        """特別な値との演算のために、有限の値を符号つきの 0 か ±1 の float にする。"""
+        if isinstance(v, float):
+            return v
+        q, nz = v
+        if q == 0:
+            return -0.0 if nz else 0.0
+        return 1.0 if q > 0 else -1.0
 
-        `//` は C と同じゼロ方向ではなく負の無限方向へ丸める（下の補正）。
-        入れ子が深すぎる式は RecursionError を拾って文言に変える。
-        """
-        text = text.strip()
+    def _op(self, op, a, b):
+        """IEEE の規則で 1 回の演算をし、4 倍精度へ丸める。"""
+        if isinstance(a, float) or isinstance(b, float):
+            x, y = self._rep(a), self._rep(b)
+            if op == '+':
+                r = x + y
+            elif op == '-':
+                r = x - y
+            elif op == '*':
+                r = x * y
+            else:
+                r = x / y
+            if math.isinf(r) or math.isnan(r):
+                return r
+            return (Fraction(0), math.copysign(1.0, r) < 0)
+        (p, pz), (q, qz) = a, b
+        if op == '+' or op == '-':
+            if op == '-':
+                q, qz = -q, not qz
+            r = p + q
+            if r == 0:
+                # 丸めは最近接なので、ゼロの和が負になるのは両方が -0 のときだけ
+                return (Fraction(0), p == 0 and q == 0 and pz and qz)
+            return self._make(r)
+        sign = ((p < 0) or (p == 0 and pz)) != ((q < 0) or (q == 0 and qz))
+        if op == '*':
+            r = p * q
+        else:
+            r = p / q
+        if r == 0:
+            return (Fraction(0), sign)
+        return self._make(r)
 
-        def skip(s, i):
-            while i < len(s) and s[i] in ' \t':
+    def _skip(self, i):
+        while self.s[i] in ' \t':
+            i += 1
+        return i
+
+    def _number(self, i):
+        """数字と `.` の並び（と指数）を集め、その先頭の正しい数を値にする。"""
+        s = self.s
+        buf = []
+        while (s[i].isdigit() and s[i].isascii() or s[i] == '.') and len(buf) < 78:
+            buf.append(s[i])
+            i += 1
+        if s[i] in 'eE' and len(buf) < 77:
+            buf.append(s[i])
+            i += 1
+            if s[i] in '+-' and len(buf) < 77:
+                buf.append(s[i])
                 i += 1
-            return i
-
-        def parse_number(s, i):
-            i = skip(s, i)
-            neg = False
-            if i < len(s) and s[i] == '-':
-                neg = True
+            while s[i].isdigit() and s[i].isascii() and len(buf) < 78:
+                buf.append(s[i])
                 i += 1
-                i = skip(s, i)
-            for kw, dval in (('inf', Decimal('Infinity')), ('nan', Decimal('NaN'))):
-                if s[i:i + len(kw)] == kw:
-                    v = dval.copy_negate() if neg else dval
-                    return v, i + len(kw)
-            if i >= len(s) or s[i] not in '0123456789.':
-                raise ValueError(f"expected number at {i!r}")
-            start = i
-            while i < len(s) and s[i] in '0123456789.':
+        b = ''.join(buf)
+        m = self._NUM_RE.match(b).group(0)
+        if not any(c.isdigit() for c in m):
+            return (Fraction(0), False), i
+        rest = b[len(m):]
+        exp = 0
+        em = re.match(r'[eE]([+-]?[0-9]+)', rest)
+        if em:
+            exp = int(em.group(1))
+        q = Fraction(m if m[0] != '.' else '0' + m) if m not in ('.',) else Fraction(0)
+        if exp:
+            q *= Fraction(10) ** exp
+        return self._make(q), i
+
+    def _factor(self, i):
+        i = self._skip(i)
+        s = self.s
+        if s[i] == '(':
+            r, i = self._expr(i + 1)
+            if r is None:
+                return None, i
+            i = self._skip(i)
+            if s[i] == ')':
                 i += 1
-            if i < len(s) and s[i] in 'eE':
-                i += 1
-                if i < len(s) and s[i] in '+-':
-                    i += 1
-                while i < len(s) and s[i] in '0123456789':
-                    i += 1
-            try:
-                v = Decimal(s[start:i])
-            except Exception as _e:
-                raise ValueError(f"invalid decimal literal: {s[start:i]!r}") from _e
-            return (v.copy_negate() if neg else v), i
+            return r, i
+        if s[i] == '-':
+            r, i = self._factor(i + 1)
+            if r is None:
+                return None, i
+            if isinstance(r, float):
+                return -r, i
+            return (-r[0], not r[1]) if r[0] == 0 else (-r[0], False), i
+        if s[i] == '+':
+            return self._factor(i + 1)
+        if (s[i].isdigit() and s[i].isascii()) or s[i] == '.':
+            return self._number(i)
+        return None, i
 
-        def parse_factor(s, i):
-            i = skip(s, i)
-            if i < len(s) and s[i] == '(':
-                try:
-                    v, i = parse_expr(s, i + 1)
-                except RecursionError:
-                    raise ValueError("decimal_eval_expr: expression nesting too deep")
-                i = skip(s, i)
-                if i < len(s) and s[i] == ')':
-                    i += 1
-                return v, i
-            if i < len(s) and s[i] == '-':
-                try:
-                    v, i = parse_factor(s, i + 1)
-                except RecursionError:
-                    raise ValueError("decimal_eval_expr: expression nesting too deep")
-                return v.copy_negate(), i
-            if i < len(s) and s[i] == '+':
-                try:
-                    return parse_factor(s, i + 1)
-                except RecursionError:
-                    raise ValueError("decimal_eval_expr: expression nesting too deep")
-            return parse_number(s, i)
+    def _term(self, i):
+        r, i = self._factor(i)
+        if r is None:
+            return None, i
+        while True:
+            p = self._skip(i)
+            c = self.s[p]
+            if c != '*' and c != '/':
+                break
+            r2, j = self._factor(p + 1)
+            if r2 is None:
+                break
+            if c == '/':
+                if not isinstance(r2, float) and r2[0] == 0:
+                    return None, i
+                if isinstance(r2, float) and r2 == 0:
+                    return None, i
+            r = self._op(c, r, r2)
+            i = j
+        return r, i
 
-        def parse_term(s, i):
-            v, i = parse_factor(s, i)
-            while True:
-                i = skip(s, i)
-                if i < len(s) and s[i] == '*':
-                    t, i = parse_factor(s, i + 1)
-                    v *= t
-                elif i + 1 < len(s) and s[i] == '/' and s[i + 1] == '/':
-                    t, i = parse_factor(s, i + 2)
-                    if t == 0:
-                        raise ZeroDivisionError("floor division by zero in qad{}")
-                    tq = v // t
-                    if tq * t != v and (v < 0) != (t < 0):
-                        tq -= 1
-                    v = Decimal(int(tq))
-                elif i < len(s) and s[i] == '/' and (i + 1 >= len(s) or s[i + 1] != '/'):
-                    t, i = parse_factor(s, i + 1)
-                    if t == 0:
-                        raise ZeroDivisionError("division by zero in qad{}")
-                    v /= t
-                elif i < len(s) and s[i] == '%':
-                    t, i = parse_factor(s, i + 1)
-                    if t == 0:
-                        raise ZeroDivisionError("modulo by zero in qad{}")
-                    v = Decimal(int(v) % int(t))
-                else:
-                    break
-            return v, i
+    def _expr(self, i):
+        i = self._skip(i)
+        r, i = self._term(i)
+        if r is None:
+            return None, i
+        while True:
+            p = self._skip(i)
+            c = self.s[p]
+            if c != '+' and c != '-':
+                break
+            r2, j = self._term(p + 1)
+            if r2 is None:
+                break
+            r = self._op(c, r, r2)
+            i = j
+        return r, i
 
-        def parse_expr(s, i):
-            v, i = parse_term(s, i)
-            while True:
-                i = skip(s, i)
-                if i < len(s) and s[i] == '+':
-                    t, i = parse_term(s, i + 1)
-                    v += t
-                elif i < len(s) and s[i] == '-':
-                    t, i = parse_term(s, i + 1)
-                    v -= t
-                else:
-                    break
-            return v, i
+    def run(self):
+        """式全体を評価し、16 進 32 桁を返す。評価できなければ None。"""
+        try:
+            r, i = self._expr(0)
+        except RecursionError:
+            return None
+        if r is None:
+            return None
+        if self.s[self._skip(i)] != chr(0):
+            return None
+        if isinstance(r, float):
+            return None
+        q, nz = r
+        return _f128_bits_hex(q, nz)
 
-        val, _ = parse_expr(text, 0)
-        return IEEE754Converter.decimal_to_ieee754_128bit_hex(str(val))
+
+def _f128_bits_hex(q, neg_zero):
+    """4 倍精度で表せる有理数を、ビットパターンの 16 進 32 桁にする。"""
+    if q == 0:
+        return ('8' if neg_zero else '0') + '0' * 31
+    sign = 1 if q < 0 else 0
+    q = abs(q)
+    e = q.numerator.bit_length() - q.denominator.bit_length()
+    if Fraction(2) ** e > q:
+        e -= 1
+    if e < _F128Eval._EMIN:
+        exp_field = 0
+        frac = int(q / Fraction(2) ** (_F128Eval._EMIN - 112))
+    else:
+        exp_field = e + 16383
+        frac = int(q / Fraction(2) ** (e - 112)) - (1 << 112)
+    bits = (sign << 127) | (exp_field << 112) | frac
+    return '%032x' % bits
 
 
 class VariableManager:
@@ -3298,7 +3460,14 @@ class ExpressionEvaluator:
             except RecursionError:
                 self.state.diag(" error - expression nesting too deep (RecursionError) in unary '-'.", set_error=True)
                 return 0, idx
-            x = -x
+            if _undef(x):
+                pass
+            elif self.state.exp_typ == 'f' and type(x) is int and x == 0:
+                # 浮動小数点の文脈の 0 は 0.0 なので、符号を反転すると -0.0。
+                # caxx.c は値を倍精度で持つので、こうしないとビットがずれる。
+                x = -0.0
+            else:
+                x = -x
         elif idx < len(s) and s[idx] == '~':
             try:
                 x, idx = self.factor(s, idx + 1)
@@ -3306,7 +3475,7 @@ class ExpressionEvaluator:
                 self.state.diag(" error - expression nesting too deep (RecursionError) in unary '~'.", set_error=True)
                 return 0, idx
             try:
-                x = ~int(x)
+                x = x if _undef(x) else ~int(x)
             except (OverflowError, ValueError):
                 self.state.diag(" error - cannot apply bitwise NOT (~) to non-finite float value.", set_error=True)
                 x = 0
@@ -3316,7 +3485,7 @@ class ExpressionEvaluator:
             except RecursionError:
                 self.state.diag(" error - expression nesting too deep (RecursionError) in unary '@'.", set_error=True)
                 return 0, idx
-            x = self.nbit(x)
+            x = x if _undef(x) else self.nbit(x)
         elif idx < len(s) and s[idx] == '*':
             if idx + 1 < len(s) and s[idx + 1] == '(':
                 x, idx = self.expression(s, idx + 2)
@@ -3324,9 +3493,12 @@ class ExpressionEvaluator:
                     x2, idx = self.expression(s, idx + 1)
                     if idx < len(s) and s[idx] == ')':
                         idx += 1
-                        x, _err = op_byte(x, x2)
-                        if _err:
-                            self.state.diag(f" error - {_err}.", set_error=True)
+                        if _undef(x) or _undef(x2):
+                            x = UNDEF
+                        else:
+                            x, _err = op_byte(x, x2)
+                            if _err:
+                                self.state.diag(f" error - {_err}.", set_error=True)
                     else:
                         self.state.diag(" error - missing ')' in *(expr, expr) expression.", set_error=True)
                         x = 0
@@ -3676,13 +3848,10 @@ class ExpressionEvaluator:
                             self.state.diag(f" error - qad{{}}: cannot evaluate expression '{t}'; using 0.", set_error=True)
                             h = '0' * 32
                         else:
-                            if isinstance(v, int) or (
-                                    isinstance(v, float) and v.is_integer()):
-                                h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
-                                        str(int(v)))
-                            else:
-                                h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
-                                        str(Decimal(repr(float(v)))))
+                            # caxx.c と同じく、倍精度の値を %.17g で書いてから変換する。
+                            fv = _float_of(v)
+                            h = (IEEE754Converter.decimal_to_ieee754_128bit_hex(_g17(fv))
+                                 if math.isfinite(fv) else '7fff' + '0' * 28)
                     if (int(h, 16) >> 112) & 0x7fff == 0x7fff:
                         self.state.diag(f" error - qad{{}}: cannot evaluate expression '{t}'; using 0.", set_error=True)
                         h = '0' * 32
@@ -3848,6 +4017,9 @@ class ExpressionEvaluator:
         x, idx = self.factor(s, idx)
         while idx < len(s) and StringUtils.q(s, '**', idx):
             t, idx = self.factor(s, idx + 2)
+            if _undef(x) or _undef(t):
+                x = UNDEF
+                continue
 
             if self.state.exp_typ == 'f':
                 x = _ieee_pow(x, t)
@@ -3906,21 +4078,25 @@ class ExpressionEvaluator:
         while idx < len(s):
             if s[idx] == '*' and (idx + 1 >= len(s) or s[idx + 1] != '*'):
                 t, idx = self.term0_0(s, idx + 1)
-                x *= t
+                x = UNDEF if _undef(x) or _undef(t) else x * t
             elif StringUtils.q(s, '//', idx):
                 t, idx = self.term0_0(s, idx + 2)
-                if t == 0:
+                if _undef(x) or _undef(t):
+                    x = UNDEF
+                elif t == 0:
                     self.state.diag(" error - Division by 0 error.", set_error=True)
+                    # caxx.c と同じく、0 にして式の残りは読み続ける。
                     x = 0
-                    break
                 else:
                     x //= t
             elif s[idx] == '/':
                 t, idx = self.term0_0(s, idx + 1)
-                if t == 0:
+                if _undef(x) or _undef(t):
+                    x = UNDEF
+                elif t == 0:
                     self.state.diag(" error - Division by 0 error.", set_error=True)
+                    # caxx.c と同じく、0 にして式の残りは読み続ける。
                     x = 0
-                    break
                 else:
                     if (self.state.exp_typ == 'i'
                             and isinstance(x, int) and isinstance(t, int)):
@@ -3930,10 +4106,12 @@ class ExpressionEvaluator:
                         x = x / t
             elif s[idx] == '%':
                 t, idx = self.term0_0(s, idx + 1)
-                if t == 0:
+                if _undef(x) or _undef(t):
+                    x = UNDEF
+                elif t == 0:
                     self.state.diag(" error - Division by 0 error.", set_error=True)
+                    # caxx.c と同じく、0 にして式の残りは読み続ける。
                     x = 0
-                    break
                 else:
                     x = x % t
             else:
@@ -3946,10 +4124,10 @@ class ExpressionEvaluator:
         while idx < len(s):
             if s[idx] == '+':
                 t, idx = self.term0(s, idx + 1)
-                x += t
+                x = UNDEF if _undef(x) or _undef(t) else x + t
             elif s[idx] == '-':
                 t, idx = self.term0(s, idx + 1)
-                x -= t
+                x = UNDEF if _undef(x) or _undef(t) else x - t
             else:
                 break
         return x, idx
@@ -3961,6 +4139,9 @@ class ExpressionEvaluator:
         while idx < len(s):
             if StringUtils.q(s, '<<', idx):
                 t, idx = self.term1(s, idx + 2)
+                if _undef(x) or _undef(t):
+                    x = UNDEF
+                    continue
                 try:
                     x = int(x)
                     t = int(t)
@@ -3978,6 +4159,9 @@ class ExpressionEvaluator:
                 x <<= t
             elif StringUtils.q(s, '>>', idx):
                 t, idx = self.term1(s, idx + 2)
+                if _undef(x) or _undef(t):
+                    x = UNDEF
+                    continue
                 try:
                     x = int(x)
                     t = int(t)
@@ -4012,7 +4196,8 @@ class ExpressionEvaluator:
         x, idx = self.term2(s, idx)
         while idx < len(s) and s[idx] == '&' and (idx + 1 >= len(s) or s[idx + 1] != '&'):
             t, idx = self.term2(s, idx + 1)
-            x = self._safe_int(x, '&') & self._safe_int(t, '&')
+            x = UNDEF if _undef(x) or _undef(t) else \
+                self._safe_int(x, '&') & self._safe_int(t, '&')
         return x, idx
 
     def term4(self, s, idx):
@@ -4020,7 +4205,8 @@ class ExpressionEvaluator:
         x, idx = self.term3(s, idx)
         while idx < len(s) and s[idx] == '|' and (idx + 1 >= len(s) or s[idx + 1] != '|'):
             t, idx = self.term3(s, idx + 1)
-            x = self._safe_int(x, '|') | self._safe_int(t, '|')
+            x = UNDEF if _undef(x) or _undef(t) else \
+                self._safe_int(x, '|') | self._safe_int(t, '|')
         return x, idx
 
     def term5(self, s, idx):
@@ -4028,7 +4214,8 @@ class ExpressionEvaluator:
         x, idx = self.term4(s, idx)
         while idx < len(s) and s[idx] == '^':
             t, idx = self.term4(s, idx + 1)
-            x = self._safe_int(x, '^') ^ self._safe_int(t, '^')
+            x = UNDEF if _undef(x) or _undef(t) else \
+                self._safe_int(x, '^') ^ self._safe_int(t, '^')
         return x, idx
 
     def term6(self, s, idx):
@@ -4044,6 +4231,9 @@ class ExpressionEvaluator:
             if next_idx >= len(s) or (s[next_idx] not in DIGIT and s[next_idx] != '('):
                 break
             t, idx = self.term5(s, idx + 1)
+            if _undef(x) or _undef(t):
+                x = UNDEF
+                continue
             x, _warn, _go = op_sext(x, t)
             if _warn:
                 self.state.diag(f" warning - {_warn}.", set_error=False)
@@ -4056,25 +4246,34 @@ class ExpressionEvaluator:
         x, idx = self.term6(s, idx)
         while idx < len(s):
             if StringUtils.q(s, '<=', idx):
-                t, idx = self.term6(s, idx + 2)
-                x = 1 if x <= t else 0
+                op, w = '<=', 2
             elif s[idx] == '<':
-                t, idx = self.term6(s, idx + 1)
-                x = 1 if x < t else 0
+                op, w = '<', 1
             elif StringUtils.q(s, '>=', idx):
-                t, idx = self.term6(s, idx + 2)
-                x = 1 if x >= t else 0
+                op, w = '>=', 2
             elif s[idx] == '>':
-                t, idx = self.term6(s, idx + 1)
-                x = 1 if x > t else 0
+                op, w = '>', 1
             elif StringUtils.q(s, '==', idx):
-                t, idx = self.term6(s, idx + 2)
-                x = 1 if x == t else 0
+                op, w = '==', 2
             elif StringUtils.q(s, '!=', idx):
-                t, idx = self.term6(s, idx + 2)
-                x = 1 if x != t else 0
+                op, w = '!=', 2
             else:
                 break
+            t, idx = self.term6(s, idx + w)
+            if _undef(x) or _undef(t):
+                x = UNDEF
+            elif op == '<=':
+                x = 1 if x <= t else 0
+            elif op == '<':
+                x = 1 if x < t else 0
+            elif op == '>=':
+                x = 1 if x >= t else 0
+            elif op == '>':
+                x = 1 if x > t else 0
+            elif op == '==':
+                x = 1 if x == t else 0
+            else:
+                x = 1 if x != t else 0
         return x, idx
 
     def term8(self, s, idx):
@@ -4089,7 +4288,7 @@ class ExpressionEvaluator:
         x, idx = self.term8(s, idx)
         while idx < len(s) and StringUtils.q(s, '&&', idx):
             t, idx = self.term8(s, idx + 2)
-            x = 1 if x and t else 0
+            x = UNDEF if _undef(x) or _undef(t) else (1 if x and t else 0)
         return x, idx
 
     def term10(self, s, idx):
@@ -4097,7 +4296,7 @@ class ExpressionEvaluator:
         x, idx = self.term9(s, idx)
         while idx < len(s) and StringUtils.q(s, '||', idx):
             t, idx = self.term9(s, idx + 2)
-            x = 1 if x or t else 0
+            x = UNDEF if _undef(x) or _undef(t) else (1 if x or t else 0)
         return x, idx
 
     @staticmethod
@@ -4631,9 +4830,7 @@ class DirectiveProcessor:
         v4, idx = self.expr_eval.expression_pat(i[4], 0)
 
         try:
-            self.state.vliwbits        = int(v1)
-            self.state.vliwinstbits    = int(v2)
-            self.state.vliwtemplatebits = int(v3)
+            b, n, t = int(v1), int(v2), int(v3)
         except (OverflowError, ValueError):
             self.state.diag(" error - .vliw: non-finite parameter value.", set_error=True)
             return True
@@ -4644,11 +4841,26 @@ class DirectiveProcessor:
             self.state.diag(" error - .vliw: non-finite nop value.", set_error=True)
             return True
 
+        # caxx.c の dir_vliwp() と同じ順・同じ範囲で検査する。値は 64 ビットに
+        # 収まらなければ範囲外で、表示は下位 64 ビットを符号付きで読んだもの。
+        def _i64(x):
+            return ((x & 0xFFFFFFFFFFFFFFFF) ^ (1 << 63)) - (1 << 63)
         _VLIW_INSTBITS_MAX = 8192
-        if not (0 <= self.state.vliwinstbits <= _VLIW_INSTBITS_MAX):
-            self.state.diag(f" error - .vliw: vliwinstbits {self.state.vliwinstbits} is out of range "
+        if not (-8192 <= b <= 8192):
+            self.state.diag(" error - .vliw: vliwbits is out of range (must be -8192..8192).",
+                            set_error=True)
+            return True
+        if not (0 <= n <= _VLIW_INSTBITS_MAX):
+            self.state.diag(f" error - .vliw: vliwinstbits {_i64(n)} is out of range "
                  f"(must be 0-{_VLIW_INSTBITS_MAX}).", set_error=True)
             return True
+        if not (-8192 <= t <= 8192):
+            self.state.diag(" error - .vliw: vliwtemplatebits is out of range (must be -8192..8192).",
+                            set_error=True)
+            return True
+        self.state.vliwbits = b
+        self.state.vliwinstbits = n
+        self.state.vliwtemplatebits = t
 
         self.state.vliwflag = True
 
@@ -4735,24 +4947,33 @@ class DirectiveProcessor:
             idx_before = idx
             prev_typ = self.expr_eval.state.exp_typ
             self.expr_eval.state.exp_typ = 'f'
+            # 条件が未定義のラベル・変数に触れたら、その条件では判定しない。
+            # 未定義はすでに報告済みで、番兵の値で範囲を判定しても意味がない。
+            # caxx.c の dir_error() と同じ規則である。
+            _undef_prior = self.state.error_undefined_label
+            self.state.error_undefined_label = False
             try:
                 u, idxn = self.expr_eval.expression_pat(s, idx)
+                _cond_undef = self.state.error_undefined_label or _undef(u)
                 idx = idxn
                 if idx < len(s) and s[idx] == ';':
                     idx += 1
                 t, idx = self.expr_eval.expression_pat(s, idx)
             finally:
                 self.expr_eval.state.exp_typ = prev_typ
+                self.state.error_undefined_label = (_undef_prior
+                                                    or self.state.error_undefined_label)
 
             if idx <= idx_before:
                 break
 
-            if (self.state.should_report_errors()) and u \
+            if (self.state.should_report_errors()) and u and not _cond_undef \
                     and not self._cond_tests_relocated_var(s[idx_before:idx]):
-                try:
-                    t_int = int(t)
-                except (OverflowError, ValueError):
-                    t_int = 0
+                # caxx.c と同じく、倍精度を経て 64 ビットの範囲で読む。範囲外・
+                # 有限でない・未定義は 0。
+                _tf = 0.0 if _undef(t) else _float_of(t)
+                t_int = int(_tf) if (math.isfinite(_tf)
+                                     and -9223372036854775808.0 < _tf < 9223372036854775808.0) else 0
                 print(f"Line {self.state.ln} Error code {t_int} ", end="", file=sys.stderr)
                 if 0 <= t_int < len(self.state.errors):
                     print(f"{self.state.errors[t_int]}", end='', file=sys.stderr)
@@ -5594,7 +5815,8 @@ class DirectiveProcessor:
                 parts.append(v)
             else:
                 val, _idx = self.expr_eval.expression_pat(v, 0)
-                parts.append(_mini_signed(val))
+                # 未定義は番兵の数字ではなく UNDEF と出す（caxx.c と同じ）。
+                parts.append('UNDEF' if _undef(val) else _mini_signed(val))
         _echo_write(parts)
         return True
 
@@ -6063,7 +6285,9 @@ class PatternMatcher:
                         self._sub_mark(SUB_CLOSE, _k, idx_s)
                     self._cap_text(a, s, _cap_start, idx_s, stopchar)
                     try:
-                        v = float(v)
+                        # 未定義は 0（未定義はすでに報告済み）。整数は caxx.c と
+                        # 同じく 256 ビットの符号付きとして浮動小数点にする。
+                        v = 0.0 if _undef(v) else float(_float_int(v))
                         v = int.from_bytes(struct.pack('>f', v), "big")
                     except (OverflowError, ValueError, struct.error):
                         self.state.diag(" error - !F: cannot convert value to float32; using 0.", set_error=True)
@@ -6090,7 +6314,7 @@ class PatternMatcher:
                         self._sub_mark(SUB_CLOSE, _k, idx_s)
                     self._cap_text(a, s, _cap_start, idx_s, stopchar)
                     try:
-                        v = float(v)
+                        v = 0.0 if _undef(v) else float(_float_int(v))
                         v = int.from_bytes(struct.pack('>d', v), "big")
                     except (OverflowError, ValueError, struct.error):
                         self.state.diag(" error - !D: cannot convert value to float64; using 0.", set_error=True)
@@ -6121,21 +6345,29 @@ class PatternMatcher:
                     raw_text = s[idx_s_q_start:idx_s_after]
                     if stopchar != chr(0) and raw_text.endswith(stopchar):
                         raw_text = raw_text[:-1]
-                    raw_text = raw_text.strip()
+                    # caxx.c と同じく前後の空白は落とさない（4 倍精度の評価は
+                    # 空白を読み飛ばす）。文字列の終端の NUL だけは落とす。
+                    raw_text = raw_text.split(chr(0), 1)[0]
 
-                    if raw_text.startswith('qad{') and raw_text.endswith('}'):
-                        raw_text = raw_text[4:-1].strip()
+                    if len(raw_text) > 4 and raw_text.startswith('qad{') and raw_text.endswith('}'):
+                        raw_text = raw_text[4:-1]
 
-                    try:
-                        h = IEEE754Converter.decimal_eval_expr(raw_text)
-                    except (ValueError, ZeroDivisionError):
-                        if isinstance(v, int) or (
-                                isinstance(v, float) and v.is_integer()):
-                            h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
-                                    str(int(v)))
-                        else:
-                            h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
-                                    repr(float(v)))
+                    # caxx.c と同じ順に試す: 4 倍精度の式として評価し、
+                    # だめなら倍精度の値を %.17g で書いてから変換する。
+                    # 未定義は 0（未定義はすでに報告済み）。
+                    if _undef(v):
+                        h = '0' * 32
+                    else:
+                        try:
+                            if not 0 < len(raw_text) < 1024:
+                                raise ValueError
+                            h = IEEE754Converter.decimal_eval_expr(raw_text)
+                        except (ValueError, ZeroDivisionError):
+                            if raw_text in ('inf', '-inf', 'nan'):
+                                h = IEEE754Converter.decimal_to_ieee754_128bit_hex(raw_text)
+                            else:
+                                h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
+                                        _g17(_float_of(v)))
 
                     x = int(h, 16)
                     self.var_manager.put(a, x)
@@ -7005,6 +7237,16 @@ def _mini_dec(v):
     return str(_mini_signed(v)).encode('ascii')
 
 
+def _ascii_alpha(c):
+    """ASCII の英字か。ミニ言語の名前は ASCII の英数字と `_`（caxx.c と同じ）。"""
+    return ('a' <= c <= 'z') or ('A' <= c <= 'Z')
+
+
+def _ascii_alnum(c):
+    """ASCII の英数字か。"""
+    return _ascii_alpha(c) or ('0' <= c <= '9')
+
+
 def _mini_lex(text, pos):
     """ミニ言語の 1 行をトークンに割る。
 
@@ -7019,7 +7261,7 @@ def _mini_lex(text, pos):
         if c in ' \t':
             i += 1
             continue
-        if c.isdigit():
+        if c in '0123456789':
             if c == '0' and i + 1 < n and t[i + 1] in 'xX':
                 j = i + 2
                 while j < n and (t[j] in '0123456789abcdefABCDEF_'):
@@ -7036,21 +7278,21 @@ def _mini_lex(text, pos):
                 toks.append(('num', int(t[i + 2:j].replace('_', ''), 2)))
             else:
                 j = i
-                while j < n and (t[j].isdigit() or t[j] == '_'):
+                while j < n and (t[j] in '0123456789' or t[j] == '_'):
                     j += 1
                 toks.append(('num', int(t[i:j].replace('_', ''))))
             i = j
             continue
-        if c.isalpha() or c == '_':
+        if _ascii_alpha(c) or c == '_':
             j = i
-            while j < n and (t[j].isalnum() or t[j] == '_'):
+            while j < n and (_ascii_alnum(t[j]) or t[j] == '_'):
                 j += 1
             toks.append(('name', t[i:j]))
             i = j
             continue
         if c == '.':
             j = i + 1
-            while j < n and (t[j].isalnum() or t[j] == '_'):
+            while j < n and (_ascii_alnum(t[j]) or t[j] == '_'):
                 j += 1
             if j == i + 1:
                 raise MiniLangError(f"{pos[0]}:{pos[1]}: stray '.'")
@@ -7067,7 +7309,7 @@ def _mini_lex(text, pos):
                                 f"(start of the next instruction)")
         if c == '#':
             j = i + 1
-            while j < n and (t[j].isalnum() or t[j] in '_.$'):
+            while j < n and (_ascii_alnum(t[j]) or t[j] in '_.$'):
                 j += 1
             if j == i + 1:
                 raise MiniLangError(f"{pos[0]}:{pos[1]}: '#' needs a symbol name")
@@ -7619,6 +7861,7 @@ class MiniInterp:
         self.out = []
         self.steps = 0
         self.frames = []
+        self.fallback_names = set()
 
     @staticmethod
     def _is_arr(v):
@@ -7772,8 +8015,19 @@ class MiniInterp:
             raise MiniLangError(f"{pos[0]}:{pos[1]}: '.nonlocal {name}' found no "
                                 f"enclosing definition of {name!r}")
         if name not in fr['vars']:
+            # 本体側に無い名前を前方参照のラベルとして許すのは、ラベルがまだ
+            # 揃っていないパス 1 の最初の反復だけ。2 回目からは前回の反復の値が
+            # 全部あるので、それでも無い名前は綴り間違いとしてすぐ止める
+            # （暴走の上限まで回らない）。caxx.c の mini_get() と同じ。
+            st = self.state
+            permissive = st is not None and st.pas != 2 and not (
+                st.pas == 1 and not st._relax_optimistic)
+            if permissive and name in st._mini_suspects:
+                permissive = False
             if self.expr_eval is not None and self.state is not None \
-                    and (self._core_name(name) or self.state.pas != 2):
+                    and (self._core_name(name) or permissive):
+                if permissive and not self._core_name(name):
+                    self.fallback_names.add(name)
                 return self._core_eval(name, pos)
             raise MiniLangError(f"{pos[0]}:{pos[1]}: {name!r} is used before it is set")
         return fr['vars'][name]
@@ -8044,9 +8298,17 @@ class MiniInterp:
         arr[i] = elem
 
     def _tick(self, pos):
-        """実行した文を 1 つ数える。上限を超えたらエラーにする。"""
+        """実行した文を 1 つ数える。上限を超えたらエラーにする。
+
+        パス 1 の最初の反復で上限に達したら、その呼び出しが前方参照として
+        許した名前を「綴り間違いの疑い」として覚える（_get がその名前で
+        すぐ止める）。caxx.c の mini_tick() と同じ。
+        """
         self.steps += 1
         if self.steps > self.MAX_STEPS:
+            st = self.state
+            if st is not None and st.pas == 1 and st._relax_optimistic:
+                st._mini_suspects.update(self.fallback_names)
             raise MiniLangError(f"{pos[0]}:{pos[1]}: mini language ran more than "
                                 f"{self.MAX_STEPS} statements; assuming a runaway loop")
 
@@ -8237,6 +8499,7 @@ class MiniInterp:
         self.out = []
         self.steps = 0
         self.frames = []
+        self.fallback_names = set()
         ret = self.call(func, args, pos)
         return self.out, ret
 
@@ -8725,7 +8988,13 @@ class ObjectGenerator:
 
     @staticmethod
     def _txt_radix(v, radix):
-        """値をその基数の数字だけで書く（基数プレフィックスは付けない）。"""
+        """値をその基数の数字だけで書く（基数プレフィックスは付けない）。
+
+        未定義の値は数字にせず `UNDEF` と書く。番兵の大きさは両実装で違うので、
+        数字で出すと出力がそろわない。caxx.c の txt_radix() と同じ。
+        """
+        if _undef(v):
+            return 'UNDEF'
         n = int(v)
         neg = n < 0
         if neg:
@@ -8811,7 +9080,9 @@ class ObjectGenerator:
             saved_undef = True
         self.state.error_undefined_label = saved_undef
 
-        if kind == 0:
+        if _undef(v):
+            parts.append('UNDEF')
+        elif kind == 0:
             parts.append(self._txt_radix(v, 16))
         elif kind == 2:
             parts.append(self._txt_radix(v, 2))
@@ -9066,7 +9337,13 @@ class ObjectGenerator:
         return self._arr_index_check(key, arr, v)
 
     def _arr_index_check(self, key, arr, v):
-        """添字が範囲内かを検査する。範囲外はエラーとして報告する。"""
+        """添字が範囲内かを検査する。範囲外はエラーとして報告する。
+
+        添字が未定義なら、未定義はすでに報告済みなので、範囲外とは報告せずに
+        引けなかったことにする。caxx.c の txt_arr_index_check() と同じ。
+        """
+        if _undef(v):
+            return None
         try:
             n = int(v)
         except (OverflowError, ValueError, TypeError):
@@ -12061,6 +12338,11 @@ class Assembler:
         l = l.rstrip()
         l2 = l2.rstrip()
         l = l.replace(' ', '')
+
+        # 未定義ラベルの印はこの命令の評価だけのもの。前の行（`.global` など）で
+        # 立ったものを持ち越すと、当たらなかった行が「未定義ラベル」と報告される。
+        # caxx.c は照合の試行ごとに印を消してから評価するので、それと同じ。
+        self.state.error_undefined_label = False
 
         if self.state.textmode and StringUtils.upper(l) in _TEXTMODE_TEXT_ONLY_DIRS:
             return self._passthru_line(l, l2, idx)
