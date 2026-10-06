@@ -17,5 +17,11 @@
 # アセンブル・実行の残骸
 *.o
 *.core
+bf_aarch64
+bf_mips
+bf_mips_freebsd
+paxx
+caxx
+
 
 __pycache__/
