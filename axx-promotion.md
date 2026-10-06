@@ -24,7 +24,7 @@ axxのアイデアと名前、そしてCで書かれた試作コードは、作�
 
 宣伝文句ではなく、実際に手を動かして確かめられることだけを書きます。
 
-**2つの独立実装がバイト単位で一致する。** axxにはPython実装（`axx.py`、通称Paxx、14,838行）とC実装（`caxx.c`、通称Caxx、20,565行）があります。同梱の`test1`スクリプトは、4004からx86_64、AArch64、PowerPC64、MIPS、Brainfuck仮想CPUまで、同梱の50組のパターン/ソースの対を両実装でアセンブルし、`cmp`でバイト単位比較します。中核の16組は`-o`・`-m 3 -f 32 -o`・`-g -o`・`-v`・`-V`でも走らせるので、ELF32/ELF64のオブジェクト、DWARF、リスティング、テキスト出力まで比較され、比較は全部で182組に及びます。実行すると`test all passed`——本当に一致します。これは主張ではなく、誰でもクローンして5分で再現できる事実です。
+**2つの独立実装がバイト単位で一致する。** axxにはPython実装（`axx.py`、通称Paxx、15,367行）とC実装（`caxx.c`、通称Caxx、21,384行）があります。同梱の`test1`スクリプトは、4004からx86_64、AArch64、PowerPC64、MIPS、Brainfuck仮想CPUまで、同梱の52組のパターン/ソースの対を両実装でアセンブルし、`cmp`でバイト単位比較します。中核の16組は`-o`・`-m 3 -f 32 -o`・`-g -o`・`-v`・`-V`でも走らせるので、ELF32/ELF64のオブジェクト、DWARF、リスティング、テキスト出力まで比較され、比較は全部で186組に及びます。実行すると`test all passed`——本当に一致します。これは主張ではなく、誰でもクローンして5分で再現できる事実です。
 
 **実際にELFオブジェクトが生成できる。**
 
@@ -55,7 +55,7 @@ d = target - $.
 .endfunc
 ```
 
-代入、`.if`/`.elif`、`.while`、`.for`、再帰、配列、デバッグ用の`.echo`を備え、アセンブラ本体の式評価器を通してラベル、ロケーションカウンタ、`.setsym`のシンボルも読めます。実例が`aarch64_logical_mini.axx`です。AArch64の論理即値は、ビットマスクを`N:immr:imms`に分解する探索が必要で、固定の式では表せませんが、ミニ言語のおかげで命令群全体が86行のパターンに収まっています。両実装は256ビットの回り込みまで同一仕様でこの言語を実行します。リファレンスは[MINI.md](MINI.md) / [mini_en.md](mini_en.md)です。
+代入、`.if`/`.elif`、`.while`、`.for`、再帰、配列、文字列、デバッグ用の`.echo`を備え、アセンブラ本体の式評価器を通してラベル、ロケーションカウンタ、`.setsym`のシンボルも読めます。実例が`aarch64_logical_mini.axx`です。AArch64の論理即値は、ビットマスクを`N:immr:imms`に分解する探索が必要で、固定の式では表せませんが、ミニ言語のおかげで命令群全体が86行のパターンに収まっています。両実装は256ビットの回り込みまで同一仕様でこの言語を実行します。リファレンスは[MINI.md](MINI.md) / [mini_en.md](mini_en.md)です。
 
 ## 対象アーキテクチャ
 
@@ -92,10 +92,11 @@ ARM(A32/T32)・SPARCは、まだパターンファイルがありません（ELF
 ```sh
 git clone https://github.com/fygar256/axx.git
 cd axx
-make                                                     # caxx・paxx・axx・man pageをビルド/インストール
-axx patfile/z80.axx asmsrc/z80.s -v                      # Z80のサンプルをアセンブルしてリスト表示
-axx patfile/x86_64.axx asmsrc/hello.s -o out.o           # x86_64のhello worldをELFオブジェクトに
-axx patfile/ppc64.axx asmsrc/hello_ppc64.s -o hello.o    # PowerPC64 BEのhello world
+make                                                     # caxx・paxx・axxをこのディレクトリにビルド
+sudo make install                                        # 任意: caxx・paxxを/usr/local/binに、man pageを/usr/share/man/man1に入れる
+./axx patfile/z80.axx asmsrc/z80.s -v                    # Z80のサンプルをアセンブルしてリスト表示
+./axx patfile/x86_64.axx asmsrc/hello.s -o out.o         # x86_64のhello worldをELFオブジェクトに
+./axx patfile/ppc64.axx asmsrc/hello_ppc64.s -o hello.o  # PowerPC64 BEのhello world
 powerpc64-linux-gnu-ld hello.o -o hello                  # GNU ldでリンクできる
 ```
 

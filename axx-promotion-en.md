@@ -24,7 +24,7 @@ That gap wasn't just dormancy — it doubled as a validation period. VLIW, EPIC,
 
 Not marketing copy — things you can reproduce yourself in a few minutes.
 
-**Two independent implementations agree byte-for-byte.** axx ships a Python implementation (`axx.py`, nicknamed Paxx, 14,838 lines) and a C implementation (`caxx.c`, nicknamed Caxx, 20,565 lines). The bundled `test1` script assembles all fifty bundled pattern/source pairs — from the 4004 to x86_64 to AArch64 to PowerPC64 to MIPS to a Brainfuck virtual CPU — with both implementations and `cmp`s the results, 182 comparisons in all: the sixteen core pairs also go through `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v` and `-V`, so the ELF32 and ELF64 objects, the DWARF, the listing and the text output are compared too. Run it and you get `test all passed`. This isn't a claim; it's reproducible in five minutes from a fresh clone.
+**Two independent implementations agree byte-for-byte.** axx ships a Python implementation (`axx.py`, nicknamed Paxx, 15,367 lines) and a C implementation (`caxx.c`, nicknamed Caxx, 21,384 lines). The bundled `test1` script assembles all fifty-two bundled pattern/source pairs — from the 4004 to x86_64 to AArch64 to PowerPC64 to MIPS to a Brainfuck virtual CPU — with both implementations and `cmp`s the results, 186 comparisons in all: the sixteen core pairs also go through `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v` and `-V`, so the ELF32 and ELF64 objects, the DWARF, the listing and the text output are compared too. Run it and you get `test all passed`. This isn't a claim; it's reproducible in five minutes from a fresh clone.
 
 **It produces real ELF objects.**
 
@@ -55,7 +55,7 @@ d = target - $.
 .endfunc
 ```
 
-It has assignment, `.if`/`.elif`, `.while`, `.for`, recursion, arrays, and `.echo` for debugging, and it can read labels, the location counter and `.setsym` symbols through the assembler's own expression evaluator. `aarch64_logical_mini.axx` uses it for real: AArch64's logical-immediate encoding is a bitmask-to-`N:immr:imms` search that no fixed expression can express, and the whole instruction group fits in 86 pattern lines because of it. Both implementations run the language to the same spec, down to 256-bit wraparound. [MINI.md](MINI.md) / [mini_en.md](mini_en.md) are the reference.
+It has assignment, `.if`/`.elif`, `.while`, `.for`, recursion, arrays, strings, and `.echo` for debugging, and it can read labels, the location counter and `.setsym` symbols through the assembler's own expression evaluator. `aarch64_logical_mini.axx` uses it for real: AArch64's logical-immediate encoding is a bitmask-to-`N:immr:imms` search that no fixed expression can express, and the whole instruction group fits in 86 pattern lines because of it. Both implementations run the language to the same spec, down to 256-bit wraparound. [MINI.md](MINI.md) / [mini_en.md](mini_en.md) are the reference.
 
 ## What's covered today
 
@@ -85,10 +85,11 @@ ARM (A32/T32) and SPARC don't have pattern files yet (nor 32-bit PowerPC as an E
 ```sh
 git clone https://github.com/fygar256/axx.git
 cd axx
-make                              # builds and installs caxx, paxx, axx, and the man page
-axx patfile/z80.axx asmsrc/z80.s -v              # assemble the Z80 sample, print the listing
-axx patfile/x86_64.axx asmsrc/hello.s -o out.o   # assemble x86_64 hello-world into an ELF object
-axx patfile/ppc64.axx asmsrc/hello_ppc64.s -o hello.o        # PowerPC64 BE hello-world
+make                              # builds caxx, paxx and axx in this directory
+sudo make install                 # optional: caxx and paxx into /usr/local/bin, the man page into /usr/share/man/man1
+./axx patfile/z80.axx asmsrc/z80.s -v              # assemble the Z80 sample, print the listing
+./axx patfile/x86_64.axx asmsrc/hello.s -o out.o   # assemble x86_64 hello-world into an ELF object
+./axx patfile/ppc64.axx asmsrc/hello_ppc64.s -o hello.o        # PowerPC64 BE hello-world
 powerpc64-linux-gnu-ld hello.o -o hello                      # links with GNU ld
 ```
 

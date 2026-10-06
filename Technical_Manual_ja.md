@@ -10,7 +10,9 @@ axx (**A**rbitrary e**X**tended **X** assembler) は*汎用*アセンブラで�
 ```sh
 git clone https://github.com/fygar256/axx.git
 cd axx
-make                            # caxx, paxx, axx と man ページをビルド・インストール（sudo を使用）
+make                            # caxx, paxx, axx をこのディレクトリにビルド
+sudo make install               # 任意: caxx と paxx を /usr/local/bin に、man ページを
+                                # /usr/share/man/man1 に入れる
 ```
 
 C 実装だけをビルドする場合:
@@ -24,11 +26,16 @@ gcc caxx.c -o caxx -lm -lquadmath -O2   # -lm は式評価器が、-lquadmath �
 アセンブル:
 
 ```sh
-axx patfile/z80.axx asmsrc/z80.s -v            # リスティングを標準出力へ
-axx patfile/z80.axx asmsrc/z80.s -b out.bin    # 生バイナリ
-axx patfile/x86_64.axx asmsrc/hello.s -o out.o # ELF 再配置可能オブジェクト
-axx patfile/8080toz80.axx asmsrc/hello8080.s -V > out.s  # 翻訳したテキストを標準出力へ
+./axx patfile/z80.axx asmsrc/z80.s -v            # リスティングを標準出力へ
+./axx patfile/z80.axx asmsrc/z80.s -b out.bin    # 生バイナリ
+./axx patfile/x86_64.axx asmsrc/hello.s -o out.o # ELF 再配置可能オブジェクト
+./axx patfile/8080toz80.axx asmsrc/hello8080.s -V > out.s  # 翻訳したテキストを標準出力へ
 ```
+
+`axx` は `axx.py` の写し（Python 版）で、`make` がこのディレクトリに作ります。
+`make install` は `axx` を入れないので、インストールしたものを使うときは `paxx`
+（Python 版）か `caxx`（C 版）と打ちます。以降の例の `axx` は、これらのどれと
+読み替えても同じです。
 
 リポジトリではパターンファイルが `patfile/`、アセンブリソースが `asmsrc/` に入って
 います。以降の例では読みやすさのためファイル名だけを書きますが、クローンしたままの

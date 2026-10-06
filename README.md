@@ -92,10 +92,11 @@ ARM (A32/T32) and SPARC don't have pattern files yet (nor 32-bit PowerPC as an E
 ```sh
 git clone https://github.com/fygar256/axx.git
 cd axx
-make                              # builds and installs caxx, paxx, axx, and the man page
-axx patfile/z80.axx asmsrc/z80.s -v              # assemble the Z80 sample, print the listing
-axx patfile/x86_64.axx asmsrc/hello.s -o out.o   # assemble x86_64 hello-world into an ELF object
-axx patfile/ppc64.axx asmsrc/hello_ppc64.s -o hello.o        # PowerPC64 BE hello-world
+make                              # builds caxx, paxx and axx in this directory
+sudo make install                 # optional: caxx and paxx into /usr/local/bin, the man page into /usr/share/man/man1
+./axx patfile/z80.axx asmsrc/z80.s -v              # assemble the Z80 sample, print the listing
+./axx patfile/x86_64.axx asmsrc/hello.s -o out.o   # assemble x86_64 hello-world into an ELF object
+./axx patfile/ppc64.axx asmsrc/hello_ppc64.s -o hello.o        # PowerPC64 BE hello-world
 powerpc64-linux-gnu-ld hello.o -o hello                      # links with GNU ld
 ```
 

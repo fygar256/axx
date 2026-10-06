@@ -10,7 +10,9 @@ Writing a pattern file for a processor gives you an assembler for it.
 ```sh
 git clone https://github.com/fygar256/axx.git
 cd axx
-make                            # builds and installs caxx, paxx, axx and the man page (uses sudo)
+make                            # builds caxx, paxx and axx in this directory
+sudo make install               # optional: caxx and paxx into /usr/local/bin, the man
+                                # page into /usr/share/man/man1
 ```
 
 To build only the C implementation:
@@ -24,11 +26,16 @@ gcc caxx.c -o caxx -lm -lquadmath -O2   # -lm for the expression evaluator,
 Assemble:
 
 ```sh
-axx patfile/z80.axx asmsrc/z80.s -v            # listing to stdout
-axx patfile/z80.axx asmsrc/z80.s -b out.bin    # raw binary
-axx patfile/x86_64.axx asmsrc/hello.s -o out.o # ELF relocatable object
-axx patfile/8080toz80.axx asmsrc/hello8080.s -V > out.s  # translated text to stdout
+./axx patfile/z80.axx asmsrc/z80.s -v            # listing to stdout
+./axx patfile/z80.axx asmsrc/z80.s -b out.bin    # raw binary
+./axx patfile/x86_64.axx asmsrc/hello.s -o out.o # ELF relocatable object
+./axx patfile/8080toz80.axx asmsrc/hello8080.s -V > out.s  # translated text to stdout
 ```
+
+`axx` is a copy of `axx.py` (the Python implementation) that `make` creates in
+this directory. `make install` does not install `axx`, so with the installed
+programs type `paxx` (Python) or `caxx` (C) instead. The `axx` in the examples
+that follow can be read as any of them.
 
 In the repository the pattern files live in `patfile/` and the assembly sources
 in `asmsrc/`. The examples further down write the bare file names for
