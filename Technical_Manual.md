@@ -216,6 +216,9 @@ Ordinary von Neumann processors rarely come near any of them.
 - Integers in expressions and in the mini language wrap at 256 bits (`_MINI_BITS = 256`;
   `uint256_t` in Caxx). Since output can be split across several words, this is rarely a
   practical issue.
+- Expressions nest at most 500 levels deep (parentheses, unary `-` `~` `@`, and the
+  ternary `?:`; `_EXPR_MAX_DEPTH` in Paxx, `EXPR_MAX_DEPTH` in Caxx). Beyond that,
+  `expression nesting too deep.` is reported and that part reads as 0.
 - Floating-point conversion (`enfloat()`) supports IEEE 754 formats only (half through
   quadruple precision). IBM hexadecimal floating point and VAX formats cannot be emitted
   by the built-in directives. This is a limit on data definitions, not on instructions.
@@ -306,7 +309,6 @@ honored, with a warning.
 
 `caxx` takes the same option names as `axx.py`, except:
 
-- `-h` / `--help` is not accepted. Run `caxx` with no arguments for usage.
 - `-d` / `--debug` is not implemented.
 - Because the filename after `-P` may be omitted, `caxx` treats the next
   argument as the output file only when both the pattern file and the source
@@ -2822,7 +2824,7 @@ produce no output words.
 #### Limits
 
 The language is Turing complete, so a buggy pattern file could otherwise hang
-the assembler. Four caps stop that and report the offending line instead:
+the assembler. These caps stop that and report the offending line instead:
 
 | Cap | Value |
 |---|---|
@@ -2830,6 +2832,10 @@ the assembler. Four caps stop that and report the offending line instead:
 | Call nesting | 128 |
 | Words emitted per `.call` | 1,048,576 |
 | Array length, string bytes | 1,048,576 |
+| Expression nesting (parentheses, `[ ]`, unary `-` `+` `~` `!`) | 1,000 |
+| Statement nesting (`.if` `.elif` `.while` `.for`) | 1,000 |
+
+The last two are syntax limits and are reported when the pattern file is read.
 
 An argument that came from an undefined label is passed as `0`, so a
 forward reference cannot blow a loop count up during the first pass.

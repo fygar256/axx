@@ -1832,6 +1832,9 @@ class AssemblerState:
         global _ACTIVE_STATE
         _ACTIVE_STATE = self
 
+        # 式の入れ子の深さ（factor と三項演算子で数える）。_EXPR_MAX_DEPTH まで。
+        self.expr_depth = 0
+
         self._diag_pending = None
 
         self.outfile = ""
@@ -3437,13 +3440,29 @@ class ExpressionEvaluator:
         return -1
 
     def factor(self, s, idx):
+        """factor の入り口。入れ子の深さを数え、_EXPR_MAX_DEPTH 段で打ち切る。
+
+        caxx.c の expr_factor と同じ数え方なので、どちらも同じ深さまで読む。
+        打ち切ったときは 0 を返し、位置は進めない。
+        """
+        st = self.state
+        if st.expr_depth >= _EXPR_MAX_DEPTH:
+            if st.should_report_errors():
+                st.diag(" error - expression nesting too deep.", set_error=True)
+            return 0, idx
+        st.expr_depth += 1
+        try:
+            return self._factor_impl(s, idx)
+        finally:
+            st.expr_depth -= 1
+
+    def _factor_impl(self, s, idx):
         """単項演算子と括弧つきの組み込み項を処理し、残りを factor1 に渡す。
 
         扱うのは `-` `~` `@`、バイト抽出 `*(x,y)`、VLIW の `!!!`（結合された
         命令の数）と `!!!!`（ストップビット）。VLIW の 2 つは expcaps が
-        許していなければ読まない。再帰が深すぎる式は RecursionError を拾って
-        診断にする。factor1 が 1 文字も進めず、しかも区切り文字でもない
-        ときだけ「読めない字」の警告を出す（照合の試行中は出さない）。
+        許していなければ読まない。factor1 が 1 文字も進めず、しかも区切り
+        文字でもないときだけ「読めない字」の警告を出す（照合の試行中は出さない）。
         """
         idx = StringUtils.skipspc(s, idx)
         x = 0
@@ -3455,11 +3474,7 @@ class ExpressionEvaluator:
             x = self.state.vcnt
             idx += 3
         elif idx < len(s) and s[idx] == '-':
-            try:
-                x, idx = self.factor(s, idx + 1)
-            except RecursionError:
-                self.state.diag(" error - expression nesting too deep (RecursionError) in unary '-'.", set_error=True)
-                return 0, idx
+            x, idx = self.factor(s, idx + 1)
             if _undef(x):
                 pass
             elif self.state.exp_typ == 'f' and type(x) is int and x == 0:
@@ -3469,22 +3484,14 @@ class ExpressionEvaluator:
             else:
                 x = -x
         elif idx < len(s) and s[idx] == '~':
-            try:
-                x, idx = self.factor(s, idx + 1)
-            except RecursionError:
-                self.state.diag(" error - expression nesting too deep (RecursionError) in unary '~'.", set_error=True)
-                return 0, idx
+            x, idx = self.factor(s, idx + 1)
             try:
                 x = x if _undef(x) else ~int(x)
             except (OverflowError, ValueError):
                 self.state.diag(" error - cannot apply bitwise NOT (~) to non-finite float value.", set_error=True)
                 x = 0
         elif idx < len(s) and s[idx] == '@':
-            try:
-                x, idx = self.factor(s, idx + 1)
-            except RecursionError:
-                self.state.diag(" error - expression nesting too deep (RecursionError) in unary '@'.", set_error=True)
-                return 0, idx
+            x, idx = self.factor(s, idx + 1)
             x = x if _undef(x) else self.nbit(x)
         elif idx < len(s) and s[idx] == '*':
             if idx + 1 < len(s) and s[idx + 1] == '(':
@@ -4340,17 +4347,19 @@ class ExpressionEvaluator:
         return idx
 
     @classmethod
-    def _skip_ternary_expr(cls, s, idx):
-        """三項演算子の、選ばれなかった側を読み飛ばす。"""
+    def _skip_ternary_expr(cls, s, idx, depth=0):
+        """三項演算子の、選ばれなかった側を読み飛ばす。深さは _EXPR_MAX_DEPTH まで。"""
+        if depth > _EXPR_MAX_DEPTH:
+            return idx
         n = len(s)
         idx = cls._skip_subexpr(s, idx)
         if idx < n and s[idx] == '?' and (idx + 1 >= n or s[idx + 1] != '='):
             idx = StringUtils.skipspc(s, idx + 1)
-            idx = cls._skip_ternary_expr(s, idx)
+            idx = cls._skip_ternary_expr(s, idx, depth + 1)
             idx = StringUtils.skipspc(s, idx)
             if idx < n and s[idx] == ':' and (idx + 1 >= n or s[idx + 1] != '='):
                 idx = StringUtils.skipspc(s, idx + 1)
-                idx = cls._skip_ternary_expr(s, idx)
+                idx = cls._skip_ternary_expr(s, idx, depth + 1)
         return idx
 
     def term11(self, s, idx):
@@ -4363,20 +4372,35 @@ class ExpressionEvaluator:
         x, idx = self.term10(s, idx)
         n = len(s)
         if idx < n and s[idx] == '?':
-            idx = StringUtils.skipspc(s, idx + 1)
-            if x == 0:
-                skip_end = self._skip_ternary_expr(s, idx)
-                if (skip_end < n and s[skip_end] == ':'
-                        and (skip_end + 1 >= n or s[skip_end + 1] != '=')):
-                    x, idx = self.term11(s, StringUtils.skipspc(s, skip_end + 1))
-                else:
-                    idx = skip_end
-                    x = 0
-            else:
-                x, idx = self.term11(s, idx)
+            st = self.state
+            if st.expr_depth >= _EXPR_MAX_DEPTH:
+                # 深すぎる。両側とも読み飛ばして 0 にする（caxx.c と同じ）。
+                if st.should_report_errors():
+                    st.diag(" error - expression nesting too deep.", set_error=True)
+                idx = StringUtils.skipspc(s, idx + 1)
+                idx = self._skip_ternary_expr(s, idx)
                 idx = StringUtils.skipspc(s, idx)
                 if idx < n and s[idx] == ':' and (idx + 1 >= n or s[idx + 1] != '='):
                     idx = self._skip_ternary_expr(s, StringUtils.skipspc(s, idx + 1))
+                return 0, idx
+            st.expr_depth += 1
+            try:
+                idx = StringUtils.skipspc(s, idx + 1)
+                if x == 0:
+                    skip_end = self._skip_ternary_expr(s, idx)
+                    if (skip_end < n and s[skip_end] == ':'
+                            and (skip_end + 1 >= n or s[skip_end + 1] != '=')):
+                        x, idx = self.term11(s, StringUtils.skipspc(s, skip_end + 1))
+                    else:
+                        idx = skip_end
+                        x = 0
+                else:
+                    x, idx = self.term11(s, idx)
+                    idx = StringUtils.skipspc(s, idx)
+                    if idx < n and s[idx] == ':' and (idx + 1 >= n or s[idx + 1] != '='):
+                        idx = self._skip_ternary_expr(s, StringUtils.skipspc(s, idx + 1))
+            finally:
+                st.expr_depth -= 1
         return x, idx
 
     def expression(self, s, idx):
@@ -4386,7 +4410,7 @@ class ExpressionEvaluator:
             x, idx0 = self.term11(s, idx0)
             return x, idx0
         except RecursionError:
-            self.state.diag(" error - expression nesting too deep (RecursionError).", set_error=True)
+            self.state.diag(" error - expression nesting too deep.", set_error=True)
             return 0, idx
 
     def _terminate(self, s):
@@ -7199,6 +7223,17 @@ class _MiniReturn(Exception):
 
 _MINI_RECLIMIT = 20000
 
+# ミニ言語の式の入れ子の上限（caxx.c の MINI_EXPR_MAX_DEPTH と同じ）。
+_MINI_EXPR_MAX_DEPTH = 1000
+
+# ミニ言語の文（.if/.elif/.while/.for）の入れ子の上限（caxx.c の MINI_BLOCK_MAX_DEPTH と同じ）。
+_MINI_BLOCK_MAX_DEPTH = 1000
+
+# アセンブラ本体の式の入れ子の上限（caxx.c の EXPR_MAX_DEPTH と同じ）。
+# 括弧 1 段で十数フレームを使うので、上限まで読めるよう再帰の上限を上げておく。
+_EXPR_MAX_DEPTH = 500
+_EXPR_RECLIMIT = 20000
+
 # ミニ言語の整数は 256bit で回り込む。Python 側は多倍長なので自然には
 # 回らないため、演算のたびにマスクして caxx.c と同じ結果にそろえる。
 _MINI_BITS = 256
@@ -7379,10 +7414,20 @@ class _MiniExprParser:
         self.toks = toks
         self.i = 0
         self.pos = pos
+        self.depth = 0
 
     def fail(self, msg):
         """現在位置を添えて構文エラーにする。"""
         raise MiniLangError(f"{self.pos[0]}:{self.pos[1]}: {msg}")
+
+    def enter(self):
+        """式の入れ子を 1 段深くする。_MINI_EXPR_MAX_DEPTH を超えたら構文エラー。
+
+        caxx.c の mxp_enter と同じ数え方（`||` の段・単項 `-` `+` `~`・`!`）。
+        """
+        self.depth += 1
+        if self.depth > _MINI_EXPR_MAX_DEPTH:
+            self.fail(f"expression nests too deeply (more than {_MINI_EXPR_MAX_DEPTH} levels)")
 
     def peek(self):
         """次のトークンを消費せずに見る。"""
@@ -7420,10 +7465,12 @@ class _MiniExprParser:
 
     def or_(self):
         """`||`。"""
+        self.enter()
         e = self.and_()
         while self.at_op('||'):
             self.i += 1
             e = ('bin', '||', e, self.and_())
+        self.depth -= 1
         return e
 
     def and_(self):
@@ -7438,7 +7485,10 @@ class _MiniExprParser:
         """単項 `!`。"""
         if self.at_op('!'):
             self.i += 1
-            return ('un', '!', self.not_())
+            self.enter()
+            e = ('un', '!', self.not_())
+            self.depth -= 1
+            return e
         return self.cmp_()
 
     def cmp_(self):
@@ -7506,7 +7556,10 @@ class _MiniExprParser:
         if self.at_op('-', '+', '~'):
             op = self.peek()[1]
             self.i += 1
-            return ('un', op, self.unary_())
+            self.enter()
+            e = ('un', op, self.unary_())
+            self.depth -= 1
+            return e
         return self.power_()
 
     def power_(self):
@@ -7615,6 +7668,17 @@ class MiniParser:
         self.func = func
         self.lines = func.lines
         self.loopdepth = 0
+        self.nest = 0
+
+    def _nest(self, pos):
+        """文の入れ子を 1 段深くする。_MINI_BLOCK_MAX_DEPTH を超えたら構文エラー。
+
+        caxx.c の msp_nest と同じ数え方（`.if` `.elif` `.while` `.for` の開き）。
+        """
+        self.nest += 1
+        if self.nest > _MINI_BLOCK_MAX_DEPTH:
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: '.if'/'.while'/'.for' blocks nest "
+                                f"too deeply (more than {_MINI_BLOCK_MAX_DEPTH} levels)")
 
     def parse_body(self):
         """関数本体を丸ごと解析する。"""
@@ -7641,6 +7705,7 @@ class MiniParser:
                 i += 1
                 continue
             if kw == '.WHILE':
+                self._nest(pos)
                 toks = _mini_lex(text, pos)
                 cond = _MiniExprParser(toks[1:], pos).parse()
                 self.loopdepth += 1
@@ -7648,16 +7713,19 @@ class MiniParser:
                 self.loopdepth -= 1
                 if i >= len(self.lines):
                     raise MiniLangError(f"{f}:{ln}: '.while' is never closed with '.endwhile'")
+                self.nest -= 1
                 out.append(('while', cond, body, pos))
                 i += 1
                 continue
             if kw == '.FOR':
+                self._nest(pos)
                 var, kind, args = self._for_header(text, pos)
                 self.loopdepth += 1
                 body, i = self._block(i + 1, ('.NEXT',))
                 self.loopdepth -= 1
                 if i >= len(self.lines):
                     raise MiniLangError(f"{f}:{ln}: '.for' is never closed with '.next'")
+                self.nest -= 1
                 out.append((kind, var, args, body, pos))
                 i += 1
                 continue
@@ -7670,6 +7738,7 @@ class MiniParser:
         text, f, ln = self.lines[i]
         pos = (f, ln)
         kw = _dot_kw(text)
+        self._nest(pos)
         toks = _mini_lex(text, pos)
         if not toks or toks[-1] != ('dot', '.THEN'):
             raise MiniLangError(f"{f}:{ln}: '{kw.lower()}' must end with '.then'")
@@ -7690,6 +7759,7 @@ class MiniParser:
             else_b, i = self._block(i + 1, ('.ENDIF',))
             if i >= len(self.lines):
                 raise MiniLangError(f"{f}:{ln}: '.if' is never closed with '.endif'")
+        self.nest -= 1
         return ('if', cond, then_b, else_b, pos), i
 
     def _for_header(self, text, pos):
@@ -15640,6 +15710,8 @@ class Assembler:
 
 def main():
     """コマンドとしての入口。終了コードを決める。"""
+    if sys.getrecursionlimit() < _EXPR_RECLIMIT:
+        sys.setrecursionlimit(_EXPR_RECLIMIT)
     assembler = Assembler()
     return assembler.run()
 

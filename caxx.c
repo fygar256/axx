@@ -2257,10 +2257,11 @@ typedef struct {
 } CfiFde;
 
 typedef struct {
-    char outfile[512];
-    char expfile[512];
-    char expfile_elf[512];
-    char impfile[512];
+    /* コマンド行で与えたファイル名（argv をそのまま指す。長さの制限はない）。 */
+    const char *outfile;
+    const char *expfile;
+    const char *expfile_elf;
+    const char *impfile;
     uint256_t pc_overflow_max;
     int       pc_overflow_set;
     int  osabi;
@@ -2273,7 +2274,7 @@ typedef struct {
 
     char      *current_section;
     size_t     current_section_cap;
-    char current_file[512];
+    char *current_file;       /* 読んでいるファイルの名前（set_current_file で書く） */
 
     LabelMap   labels;
     SecMap     sections;
@@ -2362,7 +2363,7 @@ typedef struct {
 
     char       stdin_tmp_path[512];
 
-    char       elf_objfile[512];
+    const char *elf_objfile;
     int        elf_machine;
     int        elf_class;
 
@@ -2476,7 +2477,7 @@ typedef struct {
     char      *pat_include_chain[64];
     int        pat_include_depth;
 
-    char       combo_budget_warned_file[64][512];
+    char      *combo_budget_warned_file[64];
     int        combo_budget_warned_line[64];
     int        combo_budget_warned_count;
 
@@ -2637,7 +2638,7 @@ static int axx_close_out(FILE *fp, const char *path){
     errno = 0;
     if(fclose(fp) != 0 && !err) err = errno ? errno : EIO;
     if(err){
-        char eb[1200]; axx_oserr_nopath(err, eb, sizeof(eb));
+        char eb[2*PATH_MAX + 256]; axx_oserr_nopath(err, eb, sizeof(eb));
         axx_diagf(1, 0, " error - cannot write '%s': %s\n", path, eb);
         return 1;
     }
@@ -2650,7 +2651,7 @@ static int axx_flush_stdout(const char *path){
     errno = 0;
     if(fflush(stdout) != 0 || ferror(stdout)) err = errno ? errno : EIO;
     if(err){
-        char eb[1200]; axx_oserr_nopath(err, eb, sizeof(eb));
+        char eb[2*PATH_MAX + 256]; axx_oserr_nopath(err, eb, sizeof(eb));
         axx_diagf(1, 0, " error - cannot write '%s': %s\n", path, eb);
         clearerr(stdout);
         return 1;
@@ -2660,7 +2661,7 @@ static int axx_flush_stdout(const char *path){
 
 /* 入力を開く。失敗したら文言を出して NULL を返す。 */
 static FILE *axx_open_input(const char *fn, const char *what){
-    char eb[1200];
+    char eb[2*PATH_MAX + 256];
     struct stat sb;
     if(stat(fn, &sb)==0 && S_ISDIR(sb.st_mode)){
         axx_oserr_str(fn, EISDIR, eb, sizeof(eb));
@@ -3437,6 +3438,14 @@ static void st_set_current_section(AsmState *st, const char *name){
 }
 
 /* アセンブル状態をすべて初期値にする。 */
+/* 読んでいるファイルの名前を書き換える。長さの制限はない。 */
+static void set_current_file(AsmState *st, const char *fn){
+    char *d = strdup(fn ? fn : "");
+    if(!d){ perror("strdup"); exit(1); }
+    free(st->current_file);
+    st->current_file = d;
+}
+
 static void state_init(AsmState *st) {
     memset(st, 0, sizeof(*st));
     g_active_state = st;
@@ -3497,8 +3506,13 @@ static void state_init(AsmState *st) {
     st->pc_instr_end   = u256_zero();
     st->pass1_size_mode = 0;
     st->stdin_tmp_path[0] = '\0';
-    st->expfile_elf[0] = '\0';
-    st->elf_objfile[0] = '\0';
+    st->current_file = strdup("");
+    if(!st->current_file){ perror("strdup"); exit(1); }
+    st->outfile = "";
+    st->expfile = "";
+    st->expfile_elf = "";
+    st->impfile = "";
+    st->elf_objfile = "";
     st->elf_machine = 62;
     st->elf_class = 0;
     st->gen_debug = 0;
@@ -4481,7 +4495,7 @@ static void binary_flush(AsmState *st){
     }
     FILE *fp=fopen(st->outfile,"wb");
     if(!fp){
-        char eb[1200]; axx_oserr_str(st->outfile, errno, eb, sizeof(eb));
+        char eb[2*PATH_MAX + 256]; axx_oserr_str(st->outfile, errno, eb, sizeof(eb));
         axx_diagf(1, 0, " error - cannot write '%s': %s\n", st->outfile, eb);
         free(data);
         return;
@@ -7784,25 +7798,30 @@ static int dir_reloc(Assembler *asmb, PatEntry *e){
                    var_str);
         return 1;
     }
-    char tname[64]; size_t tn = 0;
-    for(const char *q = type_str; *q && tn + 1 < sizeof(tname); q++){
+    char *tname = malloc(strlen(type_str) + 1);
+    if(!tname){ perror("malloc"); exit(1); }
+    size_t tn = 0;
+    for(const char *q = type_str; *q; q++){
         if(*q == ' ' || *q == '\t') continue;
         tname[tn++] = (char)tolower((unsigned char)*q);
     }
     tname[tn] = '\0';
     if(!tname[0]){
         axx_diagf(1, 0, " error - .reloc: relocation type is not specified.\n");
+        free(tname);
         return 1;
     }
-    if(!asmb->st.elf_objfile[0]) return 1;
+    if(!asmb->st.elf_objfile[0]){ free(tname); return 1; }
     const ElfMachineInfo *m = elf_machine_effective(&asmb->st);
     int rtype = elf_reloc_named(&asmb->st, m, tname);
     if(rtype < 0){
         if(!reloc_badname_seen(&asmb->st, tname))
             axx_diagf(1, 0, " error - .reloc: unknown relocation type '%s' for %s.\n",
                        tname, m->name);
+        free(tname);
         return 1;
     }
+    free(tname);
     asmb->st.reloc_constraints[idx] = rtype;
     return 1;
 }
@@ -8971,9 +8990,8 @@ static int pat_match0_brackets(Assembler *asmb, const char *s, const char *t_ori
                 if(asmb->st.combo_budget_warned_count <
                         (int)(sizeof(asmb->st.combo_budget_warned_line)/sizeof(int))){
                     int _wi = asmb->st.combo_budget_warned_count++;
-                    snprintf(asmb->st.combo_budget_warned_file[_wi],
-                             sizeof(asmb->st.combo_budget_warned_file[_wi]),
-                             "%s", asmb->st.current_file);
+                    asmb->st.combo_budget_warned_file[_wi] = strdup(asmb->st.current_file);
+                    if(!asmb->st.combo_budget_warned_file[_wi]){ perror("strdup"); exit(1); }
                     asmb->st.combo_budget_warned_line[_wi] = asmb->st.ln;
                 }
                 axx_diagf(0, 0, " warning - a pattern with %d optional group(s) exceeded the "
@@ -9067,9 +9085,14 @@ typedef struct { int var; const char *val; } SubBind;
 
 static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
                            SubBind *binds, int nbinds, int depth){
-    char name[64]; int var; int end;
-    int start = pat_find_sub_ref(t, 0, &end, name, sizeof(name), &var);
+    /* 表の名前は t の一部なので、t と同じ長さがあれば必ず入る。 */
+    size_t name_sz = strlen(t) + 1;
+    char *name = malloc(name_sz);
+    if(!name){ perror("malloc"); exit(1); }
+    int var; int end;
+    int start = pat_find_sub_ref(t, 0, &end, name, name_sz, &var);
     if(start < 0){
+        free(name);
         int mark_v   = vars_mark();
         int mark_v2l = v2l_mark();
         int saved_elf_refs_len = asmb->st.elf_refs_len;
@@ -9095,6 +9118,7 @@ static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
     if(depth >= SUB_MAX_DEPTH){
         axx_diagf(1, 0, " error - !S{{%s}}: sub table expansion exceeds maximum "
                    "depth %d.\n", name, SUB_MAX_DEPTH);
+        free(name);
         return 0;
     }
     SubDef *d = subv_find(&asmb->st.subs, name);
@@ -9102,8 +9126,10 @@ static int pat_match0_subs(Assembler *asmb, const char *s, const char *t,
     if(!d){
         axx_diagf(1, 0, " error - !S{{%s}}: no sub table named '%s' (define it with "
                    "'.sub::%s ... .return').\n", name, name, name);
+        free(name);
         return 0;
     }
+    free(name);
     if(nbinds >= SUB_MAX_DEPTH) return 0;
 
     /* 差し込んだ範囲を印ではさむ。印の後ろの 1 文字が段で、束縛の並び
@@ -9219,14 +9245,18 @@ static void include_pat(Assembler *asmb, const char *l, const char *base_dir){
 
 /* 未知のサブ表名を報告する。 */
 static void sub_check_unknown(Assembler *asmb, const char *where, const char *t){
-    char name[64]; int var; int end, i = 0;
-    while((i = pat_find_sub_ref(t, i, &end, name, sizeof(name), &var)) >= 0){
+    size_t name_sz = strlen(t) + 1;
+    char *name = malloc(name_sz);
+    if(!name){ perror("malloc"); exit(1); }
+    int var; int end, i = 0;
+    while((i = pat_find_sub_ref(t, i, &end, name, name_sz, &var)) >= 0){
         if(!subv_find(&asmb->st.subs, name))
             axx_diagf(1, 0, " error - !S{{%s}} in %s: no sub table named '%s' "
                        "(define it with '.sub::%s ... .return').\n",
                        name, where, name, name);
         i = end;
     }
+    free(name);
 }
 
 /* サブ表参照の循環をたどって見つける。 */
@@ -9234,20 +9264,27 @@ static void sub_walk_cycle(Assembler *asmb, int idx, char *mark, int *stack, int
     SubVec *sv = &asmb->st.subs;
     if(mark[idx] == 2) return;
     if(mark[idx] == 1){
-        char path[512]; size_t n = 0;
+        size_t psz = strlen(sv->data[idx].name) + 1;
+        for(int k = 0; k < nstack; k++) psz += strlen(sv->data[stack[k]].name) + 4;
+        char *path = malloc(psz);
+        if(!path){ perror("malloc"); exit(1); }
+        size_t n = 0;
         for(int k = 0; k < nstack; k++)
-            n += (size_t)snprintf(path+n, n<sizeof(path)?sizeof(path)-n:0,
-                                  "%s -> ", sv->data[stack[k]].name);
-        snprintf(path+n, n<sizeof(path)?sizeof(path)-n:0, "%s", sv->data[idx].name);
+            n += (size_t)snprintf(path+n, psz-n, "%s -> ", sv->data[stack[k]].name);
+        snprintf(path+n, psz-n, "%s", sv->data[idx].name);
         axx_diagf(1, 0, " error - sub table '%s' is circular (%s); expansion would "
                    "not terminate.\n", sv->data[idx].name, path);
+        free(path);
         return;
     }
     mark[idx] = 1;
     SubDef *d = &sv->data[idx];
     for(int k = 0; k < d->n; k++){
-        char name[64]; int var; int end, i = 0;
-        while((i = pat_find_sub_ref(d->e[k].pat, i, &end, name, sizeof(name), &var)) >= 0){
+        size_t name_sz = strlen(d->e[k].pat) + 1;
+        char *name = malloc(name_sz);
+        if(!name){ perror("malloc"); exit(1); }
+        int var; int end, i = 0;
+        while((i = pat_find_sub_ref(d->e[k].pat, i, &end, name, name_sz, &var)) >= 0){
             SubDef *tgt = subv_find(sv, name);
             if(tgt && nstack < sv->len){
                 stack[nstack] = idx;
@@ -9255,6 +9292,7 @@ static void sub_walk_cycle(Assembler *asmb, int idx, char *mark, int *stack, int
             }
             i = end;
         }
+        free(name);
     }
     mark[idx] = 2;
 }
@@ -9302,6 +9340,7 @@ typedef struct {
     char       *err;
     const char *file;
     int         line;
+    int         pdepth;   /* 式の構文解析の入れ子の深さ（mxp_enter） */
 } MiniCtx;
 
 /* ---- ミニ言語 (.func / .call) -------------------------------------------
@@ -9668,6 +9707,15 @@ typedef struct { MTok *t; int n; int i; MiniCtx *c; } MXP;
 
 static MExpr *mxp_or(MXP *p);
 
+/* 式の入れ子を 1 段深くする。MINI_EXPR_MAX_DEPTH を超えたら構文エラー。
+   C のスタックを使い切って落ちないための上限で、axx.py も同じ段数で止まる。 */
+#define MINI_EXPR_MAX_DEPTH 1000
+static void mxp_enter(MXP *p){
+    if(++p->c->pdepth > MINI_EXPR_MAX_DEPTH)
+        mini_fail(p->c, "expression nests too deeply (more than %d levels)",
+                  MINI_EXPR_MAX_DEPTH);
+}
+
 /* 式の節を 1 つ作る。 */
 static MExpr *mx_new(MXKind k){
     MExpr *e = mini_alloc(sizeof(MExpr));
@@ -9839,7 +9887,9 @@ static MExpr *mxp_unary(MXP *p){
         p->i++;
         MExpr *e = mx_new(MX_UN);
         strcpy(e->op, op);
+        mxp_enter(p);
         e->a = mxp_unary(p);
+        p->c->pdepth--;
         return e;
     }
     return mxp_power(p);
@@ -9895,7 +9945,9 @@ static MExpr *mxp_not(MXP *p){
         p->i++;
         MExpr *e = mx_new(MX_UN);
         strcpy(e->op, "!");
+        mxp_enter(p);
         e->a = mxp_not(p);
+        p->c->pdepth--;
         return e;
     }
     return mxp_cmp(p);
@@ -9915,6 +9967,7 @@ static MExpr *mxp_and(MXP *p){
 
 /* `||`。 */
 static MExpr *mxp_or(MXP *p){
+    mxp_enter(p);
     MExpr *e = mxp_and(p);
     while(mxp_is_op(p, "||")){
         p->i++;
@@ -9922,6 +9975,7 @@ static MExpr *mxp_or(MXP *p){
         strcpy(b->op, "||"); b->a = e; b->b = mxp_and(p);
         e = b;
     }
+    p->c->pdepth--;
     return e;
 }
 
@@ -9975,7 +10029,17 @@ typedef struct {
     MiniCtx  *c;
     MiniLexBuf *tok;
     int       loopdepth;
+    int       nest;       /* .if/.elif/.while/.for の入れ子（msp_nest） */
 } MSP;
+
+/* 文の入れ子を 1 段深くする。MINI_BLOCK_MAX_DEPTH を超えたら構文エラー。
+   C のスタックを使い切って落ちないための上限で、axx.py も同じ段数で止まる。 */
+#define MINI_BLOCK_MAX_DEPTH 1000
+static void msp_nest(MSP *p){
+    if(++p->nest > MINI_BLOCK_MAX_DEPTH)
+        mini_fail(p->c, "'.if'/'.while'/'.for' blocks nest too deeply (more than %d levels)",
+                  MINI_BLOCK_MAX_DEPTH);
+}
 
 /* 文の並びに 1 つ積む。 */
 static void ms_push(MStmt ***v, int *n, int *cap, MStmt *s){
@@ -10157,6 +10221,7 @@ static MStmt *msp_if_chain(MSP *p, int li){
     for(char *q = low; *q; q++) *q = (char)tolower((unsigned char)*q);
     c->file = p->f->lfiles[li];
     c->line = p->f->llines[li];
+    msp_nest(p);
     int n = mini_lex(c, p->f->lines[li], p->tok);
     MTok *toks = p->tok->tok;
     if(n < 2 || toks[n-1].k != MT_DOT || strcmp(toks[n-1].s, ".THEN") != 0)
@@ -10187,6 +10252,7 @@ static MStmt *msp_if_chain(MSP *p, int li){
             mini_fail(c, "'.if' is never closed with '.endif'");
         }
     }
+    p->nest--;
     return s;
 }
 
@@ -10216,6 +10282,7 @@ static void msp_block(MSP *p, const char *e1, const char *e2, const char *e3,
             continue;
         }
         if(strcmp(kw, ".WHILE") == 0){
+            msp_nest(p);
             int n = mini_lex(c, p->f->lines[li], p->tok);
             MTok *toks = p->tok->tok;
             MStmt *s = ms_new(MS_WHILE, p, li);
@@ -10229,11 +10296,13 @@ static void msp_block(MSP *p, const char *e1, const char *e2, const char *e3,
                 c->file = s->file; c->line = s->line;
                 mini_fail(c, "'.while' is never closed with '.endwhile'");
             }
+            p->nest--;
             p->i++;
             ms_push(outv, outn, &cap, s);
             continue;
         }
         if(strcmp(kw, ".FOR") == 0){
+            msp_nest(p);
             int n = mini_lex(c, p->f->lines[li], p->tok);
             MTok *toks = p->tok->tok;
             if(n < 4 || toks[1].k != MT_NAME)
@@ -10264,6 +10333,7 @@ static void msp_block(MSP *p, const char *e1, const char *e2, const char *e3,
                 c->file = s->file; c->line = s->line;
                 mini_fail(c, "'.for' is never closed with '.next'");
             }
+            p->nest--;
             p->i++;
             ms_push(outv, outn, &cap, s);
             continue;
@@ -10291,7 +10361,7 @@ static int mini_compile_func(MiniFunc *f, char **errout){
         f->body = NULL; f->nbody = 0;
         return 0;
     }
-    MSP p; p.f = f; p.i = 0; p.c = &c; p.tok = tokbuf; p.loopdepth = 0;
+    MSP p; p.f = f; p.i = 0; p.c = &c; p.tok = tokbuf; p.loopdepth = 0; p.nest = 0;
     msp_block(&p, NULL, NULL, NULL, &f->body, &f->nbody);
     if(p.i < f->nlines){
         c.file = f->lfiles[p.i]; c.line = f->llines[p.i];
@@ -13886,14 +13956,17 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
             if(dcolon){
                 const char *rt_str = dcolon + 2;
                 rt_str += axx_skipspc(rt_str, 0);
-                char rt_lc[64]; int ri=0;
-                while(rt_str[ri] && ri < 63){ rt_lc[ri]=(char)tolower((unsigned char)rt_str[ri]); ri++; }
+                char *rt_lc = malloc(strlen(rt_str) + 1);
+                if(!rt_lc){ perror("malloc"); exit(1); }
+                int ri=0;
+                while(rt_str[ri]){ rt_lc[ri]=(char)tolower((unsigned char)rt_str[ri]); ri++; }
                 while(ri > 0 && (rt_lc[ri-1]==' ' || rt_lc[ri-1]=='\t')) ri--;
                 rt_lc[ri]='\0';
                 reloc_type = elf_reloc_named(st, elf_machine_effective(st), rt_lc);
                 if(reloc_type < 0)
                     axx_diagf(0, 0, " warning - unknown reloctype '%s' in .EQU for machine %d\n",
                                rt_lc, st->elf_machine);
+                free(rt_lc);
             }
 
             uint256_t u;
@@ -14325,9 +14398,10 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
             while(idx < blen && buf[idx]!=' ' && buf[idx]!='\t'
                   && buf[idx]!=',' && buf[idx]!=':' && buf[idx]!='\0')
                 idx++;
-            char rt_str[64]={0};
             int rt_len = idx - rt_start;
-            if(rt_len > 0 && rt_len < (int)sizeof(rt_str)-1){
+            if(rt_len > 0){
+                char *rt_str = malloc((size_t)rt_len + 1);
+                if(!rt_str){ perror("malloc"); exit(1); }
                 memcpy(rt_str, buf+rt_start, (size_t)rt_len);
                 rt_str[rt_len]=0;
                 for(int _ci=0;rt_str[_ci];_ci++)
@@ -14338,6 +14412,7 @@ static int adir_export(Assembler *asmb, const char *l, const char *l2){
                                rt_str, st->elf_machine);
                 else
                     lmap_set_reloc_type(&st->labels, s, rtype);
+                free(rt_str);
             }
         }
         if(buf[idx]==':') idx++;
@@ -14869,12 +14944,13 @@ static int adir_reloctype(Assembler *asmb, const char *l, const char *l2){
             break;
         }
 
-        char name[64]={0};
         int a=tok_start, b=idx;
         while(a<b && (buf[a]==' '||buf[a]=='\t')) a++;
         while(b>a && (buf[b-1]==' '||buf[b-1]=='\t')) b--;
         int nlen = b - a;
-        if(nlen > 0 && nlen < (int)sizeof(name)-1){
+        char *name = calloc((size_t)(nlen > 0 ? nlen : 0) + 1, 1);
+        if(!name){ perror("calloc"); exit(1); }
+        if(nlen > 0){
             memcpy(name, buf+a, (size_t)nlen);
             name[nlen]=0;
             for(int _ci=0; name[_ci]; _ci++)
@@ -14899,6 +14975,7 @@ static int adir_reloctype(Assembler *asmb, const char *l, const char *l2){
                 }
             }
         }
+        free(name);
 
         pos++;
         if(idx>=blen) break;
@@ -15363,18 +15440,18 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
               }
           }
           if(raw[0]){
-              char resolved[2048];
+              char resolved[2*PATH_MAX + 2];
               const char *cur = st->current_file;
               if(strcmp(raw,"stdin")==0){
                   strncpy(resolved, raw, sizeof(resolved)-1);
                   resolved[sizeof(resolved)-1]='\0';
               } else if(cur && cur[0] && strcmp(cur,"(stdin)")!=0 && strcmp(cur,"stdin")!=0){
-                  char abs_buf[2048], dir_buf[2048];
+                  char abs_buf[2*PATH_MAX + 2], dir_buf[2*PATH_MAX + 2];
                   if(cur[0]=='/'){
                       strncpy(abs_buf, cur, sizeof(abs_buf)-1);
                       abs_buf[sizeof(abs_buf)-1]='\0';
                   } else {
-                      char cwd_buf[1024];
+                      char cwd_buf[PATH_MAX];
                       if(getcwd(cwd_buf, sizeof(cwd_buf)))
                           snprintf(abs_buf, sizeof(abs_buf), "%s/%s", cwd_buf, cur);
                       else {
@@ -17059,9 +17136,12 @@ static uint32_t weo_shidx_of(AsmState *st, const char *text, const char *sname, 
     for(int i = 0; i < ncs; i++)
         if(strcasecmp(csecs[i].name, text) == 0) return (uint32_t)(i + 1 + G);
     for(int ri = 0; ri < nrela; ri++){
-        char rn[512];
-        snprintf(rn, sizeof(rn), "%s%s", is_rela ? ".rela" : ".rel", csecs[rs_idx[ri]].name);
-        if(strcasecmp(rn, text) == 0) return (uint32_t)(ncs + 1 + ri + G);
+        /* `.rel` / `.rela` に節の名前を続けた名前と比べる（長さの制限なし）。 */
+        const char *pfx = is_rela ? ".rela" : ".rel";
+        size_t pl = strlen(pfx);
+        if(strncasecmp(text, pfx, pl) == 0
+           && strcasecmp(text + pl, csecs[rs_idx[ri]].name) == 0)
+            return (uint32_t)(ncs + 1 + ri + G);
     }
     if(strcasecmp(text, ".symtab") == 0) return (uint32_t)sym_shidx;
     if(strcasecmp(text, ".strtab") == 0) return (uint32_t)str_shidx;
@@ -17307,8 +17387,13 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int i=0;i<ncs;i++) sec_noff[i]=wbb_str(&shstr,csecs[i].name);
     uint32_t *rela_noff=calloc((size_t)(nrela?nrela:1),sizeof(uint32_t));
     for(int ri2=0;ri2<nrela;ri2++){
-        char rn[256]; snprintf(rn,sizeof(rn),"%s%s",_is_rela_w?".rela":".rel",csecs[rs_idx[ri2]].name);
+        const char *_rpfx = _is_rela_w ? ".rela" : ".rel";
+        size_t _rnsz = strlen(_rpfx) + strlen(csecs[rs_idx[ri2]].name) + 1;
+        char *rn = malloc(_rnsz);
+        if(!rn){ perror("malloc"); exit(1); }
+        snprintf(rn, _rnsz, "%s%s", _rpfx, csecs[rs_idx[ri2]].name);
         rela_noff[ri2]=wbb_str(&shstr,rn);
+        free(rn);
     }
     uint32_t sym_noff  =wbb_str(&shstr,".symtab");
     uint32_t str_noff  =wbb_str(&shstr,".strtab");
@@ -20404,13 +20489,11 @@ static void fileassemble(Assembler *asmb, const char *fn){
         }
     }
 
-    char _caller_file[512];
-    strncpy(_caller_file, st->current_file, sizeof(_caller_file)-1);
-    _caller_file[sizeof(_caller_file)-1] = '\0';
+    char *_caller_file = strdup(st->current_file);
+    if(!_caller_file){ perror("strdup"); exit(1); }
     sv_push(&st->fnstack, fn);
     is_push(&st->lnstack, st->ln);
-    strncpy(st->current_file,fn,sizeof(st->current_file)-1);
-    st->current_file[sizeof(st->current_file)-1]='\0';
+    set_current_file(st, fn);
     st->ln=1;
 
     FILE *f=NULL;
@@ -20436,26 +20519,25 @@ static void fileassemble(Assembler *asmb, const char *fn){
     f=axx_open_input(fn, "source file");
     if(!f) goto done;
     {
-        char _expkey[sizeof(st->current_file)];
-        strncpy(_expkey, st->current_file, sizeof(_expkey)-1);
-        _expkey[sizeof(_expkey)-1]='\0';
+        char *_expkey = strdup(st->current_file);
+        if(!_expkey){ perror("strdup"); exit(1); }
         MLineVec _mexp = macro_expand(&g_macro, f, st->current_file);
         fclose(f); f=NULL;
         int _lp = mlp_begin(&st->macro_line_pcs_cur, _expkey);
         for(int _mi=0; _mi<_mexp.len; _mi++){
             mlp_push(&st->macro_line_pcs_cur, _lp, (long long)u256_to_u64(st->pc));
-            strncpy(st->current_file, _mexp.d[_mi].file, sizeof(st->current_file)-1);
-            st->current_file[sizeof(st->current_file)-1]='\0';
+            set_current_file(st, _mexp.d[_mi].file);
             st->ln = _mexp.d[_mi].line;
             lineassemble0(asmb, _mexp.d[_mi].text);
         }
+        free(_expkey);
     }
     if(f) fclose(f);
 
 done:
     free(stdin_buf);
-    strncpy(st->current_file, _caller_file, sizeof(st->current_file)-1);
-    st->current_file[sizeof(st->current_file)-1] = '\0';
+    set_current_file(st, _caller_file);
+    free(_caller_file);
     sv_pop(&st->fnstack);
     st->ln = is_pop(&st->lnstack);
 }
@@ -20899,10 +20981,10 @@ static int imp_label(Assembler *asmb, const char *l){
     }
 
     if(nfields == 2){
-        char labelbuf[512];
-        strncpy(labelbuf, fields[0], sizeof(labelbuf)-1); labelbuf[sizeof(labelbuf)-1]='\0';
+        char *labelbuf = strdup(fields[0]);
+        if(!labelbuf){ perror("strdup"); exit(1); }
         const char *label = labelbuf;
-        if(!label[0]) return 0;
+        if(!label[0]){ free(labelbuf); return 0; }
         int reloc_type = -1;
         char *sep = strstr(labelbuf, "::");
         if(sep){
@@ -20913,10 +20995,10 @@ static int imp_label(Assembler *asmb, const char *l){
                 axx_diagf(0, 0, " warning - unknown reloc type '%s' for imported label '%s'\n",
                            rt_str, label);
         }
-        if(!label[0]) return 0;
+        if(!label[0]){ free(labelbuf); return 0; }
         char *endp;
         uint64_t v = strtoull(fields[1], &endp, 16);
-        if(endp == fields[1] || !hexfield_fully_consumed(endp)) return 0;
+        if(endp == fields[1] || !hexfield_fully_consumed(endp)){ free(labelbuf); return 0; }
 
         const char *section = ".text";
         for(int i = 0; i < asmb->imp_sections.len; i++){
@@ -20931,13 +21013,14 @@ static int imp_label(Assembler *asmb, const char *l){
             v /= (uint64_t)_bpw;
         }
         lmap_set_imported(&asmb->st.labels, label, u256_from_u64(v), section, reloc_type);
+        free(labelbuf);
         return 1;
     }
 
     return 0;
 }
 
-/* 使い方を出す。caxx は `-h` を取らないので、引数なしで実行したときに出る。 */
+/* 使い方を出す。引数なしで実行したときと、コマンド行の誤りのときに出る。 */
 static void print_usage(const char *prog){
     printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-f {32,64}] [-m machine] [-v] [-V] [-d] [-g] [--no-macro] [-P [file]] [-p [file]]\n",prog);
     printf("  -V           print the text built from string-template patterns (.textmode translation output) to stdout\n");
@@ -20946,6 +21029,46 @@ static void print_usage(const char *prog){
     printf("  -p [file]    macro-expand the pattern file and write it out (stdout if file is omitted), then stop\n");
     printf("  --elfdesc    print the effective ELF machine description as pattern-file declarations, then stop\n");
     printf("axx general assembler programmed and designed by Taisuke Maekawa\n");
+}
+
+/* `-h` / `--help` の説明。axx.py（argparse）の -h と同じ項目を並べる。 */
+static void print_help(const char *prog){
+    printf("usage: %s patternfile [sourcefile] [options]\n\n", prog);
+    printf("axx general assembler programmed and designed by Taisuke Maekawa\n\n");
+    printf("positional arguments:\n");
+    printf("  patternfile           Pattern definition file (.axx)\n");
+    printf("  sourcefile            Assembly source file (.s). Omit for interactive mode.\n\n");
+    printf("options:\n");
+    printf("  -h, --help            show this help message and exit\n");
+    printf("  --osabi ELF_OSABI     ELF OSABI value (default: Linux; FreeBSD/Linux,\n"
+           "                        case-insensitive)\n");
+    printf("  -b OUTFILE            Output binary file\n");
+    printf("  -e EXPORT_TSV         Export labels to TSV file (plain format)\n");
+    printf("  -E EXPORT_ELF_TSV     Export labels to TSV file (ELF section flags format)\n");
+    printf("  -i IMPORT_TSV         Import labels from TSV file\n");
+    printf("  -o OBJ_FILE           Write ELF relocatable object file (.o); class selected\n"
+           "                        by -f (default: ELF64)\n");
+    printf("  -f {32,64}            ELF class for -o output (default: the pattern file's\n"
+           "                        .elfclass, or the conventional class of the -m machine)\n");
+    printf("  -m MACHINE            ELF e_machine value (default: the pattern file's\n"
+           "                        .elfmachine, else 62=EM_X86_64)\n");
+    printf("  -v, --verbose         Verbose: print assembly listing to stdout\n");
+    printf("  -V, --text-output     Print the text built from string-template patterns\n"
+           "                        (.textmode translation output) to stdout\n");
+    printf("  -d, --debug           Enable debug output (forward-ref fallback, relaxation\n"
+           "                        log, etc.)\n");
+    printf("  -g, --gen-debug       Generate DWARF debug information in the ELF object\n"
+           "                        (effective only together with -o)\n");
+    printf("  --no-macro            Disable the macro preprocessor layer\n"
+           "                        (!if/!while/!def/!return/!set and !{...})\n");
+    printf("  -P [FILE], --macro-expand [FILE]\n"
+           "                        Macro-expand the source file and write it to FILE\n"
+           "                        (stdout if omitted or \"-\") without assembling\n");
+    printf("  --elfdesc             Print the effective ELF machine description as\n"
+           "                        pattern-file declarations and exit\n");
+    printf("  -p [FILE], --macro-expand-pattern [FILE]\n"
+           "                        Macro-expand the pattern file and write it to FILE\n"
+           "                        (stdout if omitted or \"-\") without assembling\n");
 }
 
 /* 2 つのラベル表が同じか。リラクゼーションの収束判定に使う。 */
@@ -21012,12 +21135,16 @@ int main(int argc, char *argv[]){
     int elf_desc_only=0;
 
     for(int i=1;i<argc;i++){
+        if(strcmp(argv[i],"-h")==0||strcmp(argv[i],"--help")==0){
+            print_help(argv[0]);
+            return 0;
+        }
         if(strcmp(argv[i],"--osabi")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(osabistr,argv[++i],sizeof(osabistr)-1); }
-        else if(strcmp(argv[i],"-b")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(st->outfile,argv[++i],sizeof(st->outfile)-1); }
-        else if(strcmp(argv[i],"-e")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(st->expfile,argv[++i],sizeof(st->expfile)-1); }
-        else if(strcmp(argv[i],"-E")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(st->expfile_elf,argv[++i],sizeof(st->expfile_elf)-1); }
-        else if(strcmp(argv[i],"-i")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(st->impfile,argv[++i],sizeof(st->impfile)-1); }
-        else if(strcmp(argv[i],"-o")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(st->elf_objfile,argv[++i],sizeof(st->elf_objfile)-1); }
+        else if(strcmp(argv[i],"-b")==0&&i+1<argc&&argv[i+1][0]!='-'){ st->outfile = argv[++i]; }
+        else if(strcmp(argv[i],"-e")==0&&i+1<argc&&argv[i+1][0]!='-'){ st->expfile = argv[++i]; }
+        else if(strcmp(argv[i],"-E")==0&&i+1<argc&&argv[i+1][0]!='-'){ st->expfile_elf = argv[++i]; }
+        else if(strcmp(argv[i],"-i")==0&&i+1<argc&&argv[i+1][0]!='-'){ st->impfile = argv[++i]; }
+        else if(strcmp(argv[i],"-o")==0&&i+1<argc&&argv[i+1][0]!='-'){ st->elf_objfile = argv[++i]; }
         else if(strcmp(argv[i],"-f")==0&&i+1<argc&&argv[i+1][0]!='-'){
             const char *_fs = argv[++i];
             if(strcmp(_fs,"64")==0){ st->elf_class = 2; }
@@ -21105,10 +21232,20 @@ int main(int argc, char *argv[]){
                 return 1;
             }
         }
+        else if(strcmp(argv[i],"--osabi")==0||strcmp(argv[i],"-b")==0
+                ||strcmp(argv[i],"-e")==0||strcmp(argv[i],"-E")==0
+                ||strcmp(argv[i],"-i")==0||strcmp(argv[i],"-o")==0
+                ||strcmp(argv[i],"-f")==0||strcmp(argv[i],"-m")==0){
+            /* 値を取るオプションの後ろに値が無い（行末か、次が '-' で始まる）。
+               axx.py（argparse）と同じく終了コード 2 で止める。 */
+            fprintf(stderr,"error: option '%s' requires an argument.\n",argv[i]);
+            print_usage(argv[0]);
+            return 2;
+        }
         else{
             fprintf(stderr,"error: unknown option '%s'.\n",argv[i]);
             print_usage(argv[0]);
-            return 1;
+            return 2;
         }
     }
 
@@ -21145,7 +21282,7 @@ int main(int argc, char *argv[]){
         }
         FILE *pf=fopen(patternfile,"rt");
         if(!pf){
-            { char eb[1200]; axx_oserr_str(patternfile, errno, eb, sizeof(eb));
+            { char eb[2*PATH_MAX + 256]; axx_oserr_str(patternfile, errno, eb, sizeof(eb));
               axx_diagf(0, 0, " error - cannot open pattern file '%s': %s\n",
                         patternfile, eb); }
             exit_code=1; goto cleanup;
@@ -21179,7 +21316,7 @@ int main(int argc, char *argv[]){
         }
         FILE *mf=fopen(sourcefile,"rt");
         if(!mf){
-            { char eb[1200]; axx_oserr_str(sourcefile, errno, eb, sizeof(eb));
+            { char eb[2*PATH_MAX + 256]; axx_oserr_str(sourcefile, errno, eb, sizeof(eb));
               axx_diagf(0, 0, " error - cannot open source file '%s': %s\n",
                         sourcefile, eb); }
             exit_code=1; goto cleanup;
@@ -21250,7 +21387,7 @@ int main(int argc, char *argv[]){
 
     if(!sourcefile){
         st->pc=u256_zero(); st->pas=0; st->ln=1;
-        strncpy(st->current_file,"(stdin)",sizeof(st->current_file)-1);
+        set_current_file(st, "(stdin)");
         char *line=NULL; size_t lcap=0;
         while(1){
             printf("%016llx: >> ",(unsigned long long)u256_to_u64(st->pc));

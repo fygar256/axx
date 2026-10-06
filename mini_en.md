@@ -574,6 +574,10 @@ the offending line.
 | Call nesting | 128 |
 | Words emitted per `.call` | 1,048,576 |
 | Array length, string bytes | 1,048,576 |
+| Expression nesting (parentheses, `[ ]`, unary `-` `+` `~` `!`) | 1,000 |
+| Statement nesting (`.if` `.elif` `.while` `.for`) | 1,000 |
+
+The last two are syntax limits and are reported when the pattern file is read.
 
 Syntax errors are reported when the pattern file is read, run-time errors when
 that instruction is assembled; both carry a file name and line number.
