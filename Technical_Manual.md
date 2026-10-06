@@ -411,14 +411,18 @@ In the `instruction` field:
 | `!Fx` | IEEE-754 bit pattern of a **32-bit** float expression |
 | `!Dx` | IEEE-754 bit pattern of a **64-bit** float expression |
 | `!Qx` | IEEE-754 bit pattern of a **128-bit** float expression |
-| `!Lx` | Value of an **integer expression**, exactly as `!x`; in addition, the **text of that expression or label as written in the source** is remembered (section 3.18, `{{.exp(x)}}`) |
+| `!Lx` | Value of an **integer expression**, exactly as `!x`; the only difference is that in text replacement mode a label defined nowhere in the source is not an error (section 3.18) |
 | `!Ex` | Value of an **enumerated operand list** declared with `.enum` (section 3.7.1) |
 | `!Yx[z]` | Reads one item name of the **set** `x` (section 3.6.2) and binds its **index** to the variable `z` (section 3.6.3) |
 | `!S{{name}}x` | Value of the matching entry of the **sub table** `name` declared with `.sub` (section 3.7.2) |
 
-Whichever form captures a variable, the variable remembers the **text as written
-in the source** along with its value. The text template `{{.exp(x)}}` emits that
-text (section 3.18).
+Not only `!L`: **whichever form captures a variable**, the variable remembers the
+**text as written in the source** along with its value. That text can be taken
+out as a string by the text template `{{.exp(x)}}` (section 3.18) and by `.exp(x)`
+as an argument of the mini language's `.call` (section 3.15). A lowercase
+variable gives the name of the symbol that matched (`b`, `cx`), `!x` the
+expression read (`1+2*3`), `!E` the whole list (`a0-a2`); the table in section
+3.18, "Every capture remembers its text", lists every form.
 
 Captured values are referenced from `error_patterns` and `binary_list` by the
 bare name — the `!` prefix is not repeated there. Every variable is reset to 0
@@ -2630,6 +2634,20 @@ at a negative index, gives `0` and leaves the array alone. Slice bounds are
 clamped to the array. `.len(x)` is the length. Array elements are numbers or
 strings, never arrays (`a = ["ab", 1]`, `a[i] = "x"`).
 
+The right side of an array range replacement `a[lo:hi] = right` must be an
+array. A string is not split into elements; writing one is an error. To put a
+single string in as one element, wrap it in `[...]` as a one-element array.
+
+```
+a = [1, 2, 3]
+a[1:2] = "qwert"       /* error: an array slice can only be given an array */
+a[1:2] = ["qwert"]     /* [1, "qwert", 3] — one element replaced by one string */
+a[1:2] = [7, 8, 9]     /* [1, 7, 8, 9, 3] — one element replaced by three; the length changes */
+a[1:2] = []            /* [1, 3] — the element is removed */
+```
+
+(Each line shows the result when written against `a = [1, 2, 3]`.)
+
 #### Strings
 
 Besides integers and arrays, a value can be a **string**. It is written `"..."`
@@ -2932,7 +2950,10 @@ directive after this line (directives take effect in the order written).
 
 Reads one expression and binds its value exactly as `!<variable>` does (3.3), and
 **in addition remembers the text as written in the source**. The text template
-`{{.exp(<variable>)}}` emits that text verbatim.
+`{{.exp(<variable>)}}` emits that text verbatim. Every capture remembers its text,
+not only `!L` (see "Every capture remembers its text" below); what sets `!L` apart
+is that in text replacement mode it does not reject a label defined nowhere in
+the source.
 
 ```
 .textmode
@@ -2950,9 +2971,13 @@ JMP  !La  :: "JP {{.exp(a)}}"
 the same indentation as the left — see "Leading indentation" below.)
 
 This is the case where the spelling matters and the value does not. Written with
-`!a` and `{{.hex(a)}}`, a label collapses into a number such as `0x122` and the
-label is gone from the rewritten text. With `!La` and `{{.exp(a)}}`, `msg` stays
-`msg` and `0x1234+2` stays `0x1234+2`.
+`{{.hex(a)}}`, a label collapses into a number such as `0x122` and the label is
+gone from the rewritten text. With `{{.exp(a)}}`, `msg` stays `msg` and
+`0x1234+2` stays `0x1234+2`. The operand is captured with `!La` rather than `!a`
+because the source being translated often names labels defined nowhere in that
+file (ones defined in another file, for example). `!a` would reject such a label
+as an error; `!La` reads the value as 0 and carries on. A forward reference to a
+label defined later in the same file is fine with either.
 
 - The value side keeps working. One line may use both `{{.exp(a)}}` and
   `{{.hex(a)}}`, and `error_patterns` may still test `a>0xffff;2`.

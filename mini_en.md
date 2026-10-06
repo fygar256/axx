@@ -316,6 +316,20 @@ b = a[1:3]        /* [0,0] — the end index is not included */
 | `a[lo:hi] = b` | Replaces the range with the array `b`; the length may change. The bounds are clamped as for `a[lo:hi]`; `lo == hi` inserts |
 | `.len(a)` | Length |
 
+The right side of an array range replacement `a[lo:hi] = right` must be an
+array. A string is not split into elements; writing one is an error. To put a
+single string in as one element, wrap it in `[...]` as a one-element array.
+
+```
+a = [1, 2, 3]
+a[1:2] = "qwert"       /* error: an array slice can only be given an array */
+a[1:2] = ["qwert"]     /* [1, "qwert", 3] — one element replaced by one string */
+a[1:2] = [7, 8, 9]     /* [1, 7, 8, 9, 3] — one element replaced by three; the length changes */
+a[1:2] = []            /* [1, 3] — the element is removed */
+```
+
+(Each line shows the result when written against `a = [1, 2, 3]`.)
+
 Reading a name before it is assigned is an error, so a misspelling does not
 silently read as 0.
 
