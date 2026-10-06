@@ -2215,6 +2215,33 @@ class StringUtils:
         return ''.join(out)
 
     @staticmethod
+    def quoted_span(l, i):
+        """l[i] から始まる、文字列として読み飛ばす部分の長さ。無ければ 0。
+
+        `"..."` は同じ行に閉じる `"` があるときだけ文字列で、中の `\\` は次の
+        1 文字を逃がす。閉じない `"`、`\\"`、文字定数 `'"'` は文字列を開かない。
+        パターンファイルのコメント `/*` と欄の区切り `::` を、文字列の中では
+        効かせないために使う。caxx.c の axx_quoted_span() と同じ規則である。
+        """
+        c = l[i]
+        if c == '\\' and l[i + 1:i + 2] == '"':
+            return 2
+        if c == "'" and l[i + 1:i + 3] == '"\'':
+            return 3
+        if c != '"':
+            return 0
+        n = len(l)
+        j = i + 1
+        while j < n:
+            if l[j] == '\\' and j + 1 < n:
+                j += 2
+                continue
+            if l[j] == '"':
+                return j + 1 - i
+            j += 1
+        return 0
+
+    @staticmethod
     def remove_comment(l, in_comment=False):
         """パターンファイルの `/* ... */` を落とす。
 
@@ -2222,6 +2249,7 @@ class StringUtils:
         コメントは呼び出し側がこの第 2 返り値を次の行へ渡して続ける。
         「`/*` だけ並べた古い書き方ではコメントを次行へ延長しない」という
         後方互換の判断は PatternFileReader 側にあり、ここは素の状態機械。
+        `"..."` の中の `/*` はコメントにしない（quoted_span）。
         """
         out = []
         i = 0
@@ -2233,6 +2261,11 @@ class StringUtils:
                     i += 2
                     continue
                 i += 1
+                continue
+            q = StringUtils.quoted_span(l, i)
+            if q:
+                out.append(l[i:i + q])
+                i += q
                 continue
             if l[i:i + 2] == '/*':
                 in_comment = True
@@ -2561,7 +2594,10 @@ class Parser:
         return t, idx
 
     def get_params1(self, l, idx):
-        """`::` までを 1 欄として取る。パターン行とディレクティブ行の分解に使う。"""
+        """`::` までを 1 欄として取る。パターン行とディレクティブ行の分解に使う。
+
+        `"..."` の中の `::` では割らない（StringUtils.quoted_span）。
+        """
         idx = StringUtils.skipspc(l, idx)
 
         if idx >= len(l):
@@ -2569,6 +2605,11 @@ class Parser:
 
         s = ""
         while idx < len(l):
+            q = StringUtils.quoted_span(l, idx)
+            if q:
+                s += l[idx:idx + q]
+                idx += q
+                continue
             if l[idx:idx + 2] == '::':
                 idx += 2
                 break
@@ -7519,7 +7560,13 @@ class MiniParser:
         idx = None
         if p.at_op('['):
             p.i += 1
-            idx = p.or_()
+            lo = None if p.at_op(':') else p.or_()
+            if p.eat_op(':'):
+                # `名前[lo:hi] = 値` は範囲の置き換え。
+                hi = None if p.at_op(']') else p.or_()
+                idx = ('slicetarget', lo, hi)
+            else:
+                idx = lo
             p.expect_op(']')
         p.expect_op('=')
         rest = p.toks[p.i:]
@@ -7922,10 +7969,51 @@ class MiniInterp:
         raise MiniLangError(f"{pos[0]}:{pos[1]}: an operand of '{op}' must be "
                             f"a number, not a string")
 
+    def _bound(self, e, default, pos):
+        """切り出しの境界を 1 つ読む。省略なら default。"""
+        if e is None:
+            return default
+        return _mini_signed(self._need_int(self.eval(e, pos), pos, 'a slice bound'))
+
+    def _store_slice(self, name, lo_e, hi_e, v, pos):
+        """`名前[lo:hi] = 値` — lo から hi の手前までを値で置き換える。
+
+        境界は読み出しの `[lo:hi]` と同じく範囲に切り詰め、`lo == hi` なら
+        その位置への挿入になる。値の長さが違えば全体の長さが変わる。
+        文字列には文字列を、配列には配列を書く。
+        caxx.c の mini_store_slice() と同じ規則である。
+        """
+        lo = self._bound(lo_e, None, pos)
+        hi = self._bound(hi_e, None, pos)
+        cur = self._get(name, pos)
+        if not self._is_arr(cur) and not self._is_str(cur):
+            raise MiniLangError(f"{pos[0]}:{pos[1]}: {name!r} is not an array or a string")
+        n = len(cur)
+        lo = 0 if lo is None else max(0, min(lo, n))
+        hi = n if hi is None else max(lo, min(hi, n))
+        if self._is_str(cur):
+            if not self._is_str(v):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: a string slice can only be "
+                                    f"given a string")
+            r = cur[:lo] + v + cur[hi:]
+            self._need_strlen(len(r), pos)
+        else:
+            if not self._is_arr(v):
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: an array slice can only be "
+                                    f"given an array")
+            r = cur[:lo] + list(v) + cur[hi:]
+            if len(r) > self.MAX_ARRAY:
+                raise MiniLangError(f"{pos[0]}:{pos[1]}: array longer than the "
+                                    f"maximum length {self.MAX_ARRAY}")
+        self._set(name, r, pos)
+
     def _store(self, name, idx, v, pos):
         """変数か配列要素へ代入する。配列は必要なら伸ばす（上限あり）。"""
         if idx is None:
             self._set(name, self._copy(v), pos)
+            return
+        if idx[0] == 'slicetarget':
+            self._store_slice(name, idx[1], idx[2], v, pos)
             return
         i = _mini_signed(self._need_int(self.eval(idx, pos), pos, 'an index'))
         if i < 0:
@@ -7989,11 +8077,15 @@ class MiniInterp:
         if kind == 'emit':
             for x in st[1]:
                 v = self.eval(x, pos)
+                # 文字列は 1 バイトを 1 ワードとして出す。配列は要素ごとに出し、
+                # 文字列の要素も 1 バイト 1 ワード。caxx.c の MS_EMIT と同じ。
                 if self._is_arr(v):
-                    raise MiniLangError(f"{pos[0]}:{pos[1]}: '.emit' needs numbers, "
-                                        f"not an array")
-                # 文字列は 1 バイトを 1 ワードとして出す。
-                for w in (v if self._is_str(v) else (v,)):
+                    ws = [w for e in v for w in (e if self._is_str(e) else (e,))]
+                elif self._is_str(v):
+                    ws = v
+                else:
+                    ws = (v,)
+                for w in ws:
                     if len(self.out) >= self.MAX_EMIT:
                         raise MiniLangError(f"{pos[0]}:{pos[1]}: '.emit' produced more "
                                             f"than {self.MAX_EMIT} words")
@@ -8404,12 +8496,12 @@ class ObjectGenerator:
         k = StringUtils.skipspc(t, k)
         return k < len(t) and t[k] == '('
 
-    def _mini_strsym_at(self, t, a):
-        """t[a] からの引数が文字列シンボルの名前 1 つだけなら (名前, 次の位置)。
+    def _mini_symname_at(self, t, a, table):
+        """t[a] からの引数が table にあるシンボルの名前 1 つだけなら
+        (名前, 次の位置)。
 
-        `.setsym::名前::"..."` の名前で、後ろが `,` か引数の終わりのときだけ
-        当たる。式の一部（`msg+1` など）は今までどおり式として読む。
-        caxx.c の mini_strsym_at() と同じ規則である。
+        後ろが `,` か引数の終わりのときだけ当たる。式の一部（`msg+1` など）は
+        今までどおり式として読む。caxx.c の mini_symname_at() と同じ規則である。
         """
         k = a
         while k < len(t) and t[k] in _SYM_CORE:
@@ -8420,9 +8512,31 @@ class ObjectGenerator:
         if e < len(t) and t[e] not in (',', chr(0)):
             return None
         key = StringUtils.upper(t[a:k])
-        if key not in self.state.strsymbols:
+        if key not in table:
             return None
         return key, e
+
+    def _mini_strsym_at(self, t, a):
+        """文字列シンボル（`.setsym::名前::"..."`）の名前 1 つだけの引数か。"""
+        return self._mini_symname_at(t, a, self.state.strsymbols)
+
+    def _mini_arrsym_value(self, key, name):
+        """配列シンボル（`.setsym::名前::[...]`）を引数の配列にする。
+
+        数の項目は整数、`"..."` と裸の名前の項目は文字列（`{{名前[i]}}` が
+        出すもの）で、文字列は `"..."` と直接書いたのと同じに逃げ記号を開く。
+        caxx.c の mini_arrsym_value() と同じ規則である。
+        """
+        out = []
+        for it in self.state.arrsymbols[key]:
+            if isinstance(it, str):
+                v, _ = self._mini_arg_str('"' + it + '"' + chr(0), 0, name)
+                if v is None:
+                    return None
+                out.append(v)
+            else:
+                out.append(_mini_wrap(0 if _is_undef_derived(it) else it))
+        return out
 
     def _mini_arg_exp(self, t, a, name):
         """`.exp(変数)` と書かれた引数を、その変数が捕捉した綴りの文字列にする。
@@ -8496,6 +8610,14 @@ class ObjectGenerator:
             v, _ = self._mini_arg_str(
                 '"' + self.state.strsymbols[key] + '"' + chr(0), 0, name)
             return v, a
+        hit = self._mini_symname_at(t, a, self.state.arrsymbols)
+        if hit is not None:
+            key, a = hit
+            if in_array:
+                self._mini_diag(f" error - '.call {name}': an array element "
+                                f"cannot be an array.")
+                return None, len(t)
+            return self._mini_arrsym_value(key, name), a
         v, a = self.expr_eval.expression_pat(t, a)
         return _mini_wrap(0 if _is_undef_derived(v) else v), a
 

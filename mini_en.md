@@ -78,6 +78,17 @@ string symbol is found first.
 MSG :: .call func1(10,msg)          /* func1(10, "text") */
 ```
 
+An argument that is just the name of an array symbol (`.setsym::name::[...]`)
+passes that array. Numeric items become integers; `"..."` items and bare-name
+items (`AX` and so on) become strings — the same text `{{name[i]}}` emits —
+with the escapes opened as if `"..."` had been written. A string symbol of the
+same name is found first. It cannot be written inside an array (`[regs]`).
+
+```
+.setsym::regs::[AX,BX,0x10]
+REGS :: .call func1(regs)           /* func1(["AX", "BX", 16]) */
+```
+
 A function may be defined after the place that uses it; references are resolved
 once the whole pattern file has been read.
 
@@ -89,7 +100,8 @@ One statement per line.
 |---|---|
 | `name = expr` | Assign to a local variable |
 | `name[index] = expr` | Assign to an array element |
-| `.emit(e1, e2, ...)` | Output one word per value |
+| `name[lo:hi] = expr` | Replace a range: from `lo` up to but not including `hi`, with the right side (a string for a string, an array for an array). The length may change |
+| `.emit(e1, e2, ...)` | Output one word per integer; a string one word per byte, an array element by element (a string element one word per byte) |
 | `.echo(item, item, ...)` | Print strings and values to stderr; outputs no word |
 | `.raise expr` | Report an error whose error code is the value of `expr` |
 | `.call name(args)` | Call another function |
@@ -301,6 +313,7 @@ b = a[1:3]        /* [0,0] — the end index is not included */
 | `a[i]` (out of range, or negative) | Gives `0`; the array is unchanged |
 | `a[i] = v` (`i` negative) | Error |
 | `a[lo:hi]` | Clamped to the array; `hi` is not included |
+| `a[lo:hi] = b` | Replaces the range with the array `b`; the length may change. The bounds are clamped as for `a[lo:hi]`; `lo == hi` inserts |
 | `.len(a)` | Length |
 
 Reading a name before it is assigned is an error, so a misspelling does not
@@ -327,6 +340,7 @@ and both implementations give the same values.
 | `s[i]` | The value (0–255) of byte `i`; `0` when out of range or negative |
 | `s[lo:hi]` | Substring, clamped like an array slice; `hi` is not included |
 | `s[i] = v` | Rewrites byte `i`; `v` is an integer 0–255 or a one-byte string. Past the end, the string is extended with NUL (0) bytes |
+| `s[lo:hi] = t` | Replaces the range with the string `t`; the length may change (`s[1:2] = "10000"` on `"abc"` gives `"a10000c"`). The bounds are clamped as for `s[lo:hi]`; `lo == hi` inserts |
 | `.len(s)` | Number of bytes |
 | `.str(v)` | An integer as a signed decimal string; a string is returned as is |
 | `.chr(n)` | The one-byte string of value `n` (0–255) |
@@ -355,10 +369,8 @@ t = s + ":" + n           /* "loop:3" */
   like are errors.
 - **Escapes** are `\\`, `\"`, `\n` and `\t`; any other `\` is an error. Use
   `.chr(0)` for a NUL.
-- A string cannot contain `/*`: that is the pattern file's comment marker and is
-  stripped before the mini language sees the line. For the same reason a string
-  passed to `.call` in a `binary_list` cannot contain the field separator `::`
-  (it can inside a `.func` body).
+- A string may contain both `/*` and `::`. Inside `"..."` they are neither a
+  comment nor a field separator (Technical_Manual section 3.1).
 - The length limit is the same as for arrays, 1,048,576 bytes.
 
 ## Scope and nesting
@@ -484,7 +496,8 @@ i=i+1
   labels, `.equ`, `$.` — including forward-referenced labels. An array argument
   is written `[expr, expr, ...]`, a string argument `"..."`, and `.exp(variable)`
   passes the text a pattern variable captured, as a string. The bare name of a
-  string symbol passes that string.
+  string symbol passes that string, and the bare name of an array symbol
+  passes that array.
 - **Variable namespaces are separate.** Mini-language variables have nothing to do
   with pattern variables or with `.setsym` symbols; pass what you need as
   an argument.

@@ -78,7 +78,11 @@ ministr.axx                         pattern file for strings in the mini
                                     variable's captured text, and a string
                                     symbol passed by its name, arrays holding
                                     strings, `.for x in <array>`, and
-                                    rewriting a byte with `s[i] = v` (MINI.md)
+                                    rewriting a byte with `s[i] = v`, and
+                                    `/*` and `::` inside strings, and `.emit`
+                                    of an array, and an array symbol passed
+                                    by its name, and replacing a range with
+                                    `x[lo:hi] = v` (MINI.md)
 ministr.s                           test assemble file for ministr.axx
 unordered.axx                       pattern file for .unordered: directives that
                                     hold for the whole file wherever they are

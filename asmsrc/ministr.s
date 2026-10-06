@@ -12,3 +12,7 @@ label1:
 	sarr	2+1
 	forin
 	poke
+	sep
+	emita
+	arrsym
+	splice

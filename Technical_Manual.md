@@ -353,6 +353,14 @@ In short: closing every block comment with its own `*/`, and opening every
 commented line with its own `/*`, are both fully supported conventions and
 may be mixed freely within one file.
 
+**Inside strings.** Inside `"..."`, `/*` does not open a comment and `::` does
+not separate fields. `.setsym::msg::"a::b"`, `.error::3::"x /* y"`,
+`.call f("p::q")` and the mini language's `u = "/* r */"` all give the string
+as written. A `"` opens a string only when a closing `"` follows on the same
+line; an unclosed `"`, `\"` and the character constant `'"'` are read as plain
+characters, so a `"` written in the `instruction` field never turns the rest of
+the line into a string.
+
 ### 3.2 Pattern order does not matter
 
 Directive definitions **are** order-dependent — a later `.setsym` overrides an
@@ -2397,6 +2405,17 @@ not hide it — as with `{{name}}`, the string symbol is found first.
 MSG :: .call func1(10,msg)          /* func1(10, "text") */
 ```
 
+An argument that is just the name of an array symbol (section 3.6.1,
+`.setsym::name::[...]`) passes that **array**. Numeric items become integers;
+`"..."` items and bare-name items (`AX` and so on) become strings — the same
+text `{{name[i]}}` emits. A string symbol of the same name is found first, and
+it cannot be written inside an array (`[regs]`).
+
+```
+.setsym::regs::[AX,BX,0x10]
+REGS :: .call func1(regs)           /* func1(["AX", "BX", 16]) */
+```
+
 The `;` modifier of [section 3.5](#35-binary_list) applies to `.call` as well:
 `;.call f(a)` emits nothing when the call's whole output is a single word equal
 to 0, which is how a prefix byte that is sometimes absent is written. `;;.call
@@ -2408,7 +2427,8 @@ f(a)` runs the call and discards its output.
 |---|---|
 | `name = expression` | Assign to a local variable |
 | `name[index] = expression` | Assign to an array element |
-| `.emit(e1, e2, ...)` | Append one word per value to the output |
+| `name[lo:hi] = expression` | Replace a range: from `lo` up to but not including `hi`, with the right side (a string for a string, an array for an array). The length may change |
+| `.emit(e1, e2, ...)` | Append one word per integer to the output; a string one word per byte, an array element by element (a string element one word per byte) |
 | `.echo(item, item, ...)` | Print strings and values to stderr — for debugging only, emits nothing |
 | `.raise <expr>` | Report an error whose error code is the value of `<expr>` |
 | `.call name(args)` | Call another function |
@@ -2631,6 +2651,7 @@ and both implementations give the same values.
 | `s[i]` | The value (0–255) of byte `i`; `0` when out of range or negative |
 | `s[lo:hi]` | Substring, clamped like an array slice; `hi` is not included |
 | `s[i] = v` | Rewrites byte `i`; `v` is an integer 0–255 or a one-byte string. Past the end, the string is extended with NUL (0) bytes |
+| `s[lo:hi] = t` | Replaces the range with the string `t`; the length may change (`s[1:2] = "10000"` on `"abc"` gives `"a10000c"`). The bounds are clamped as for `s[lo:hi]`; `lo == hi` inserts |
 | `.len(s)` | Number of bytes |
 | `.str(v)` | An integer as a signed decimal string; a string is returned as is |
 | `.chr(n)` | The one-byte string of value `n` (0–255) |
@@ -2651,10 +2672,8 @@ time (`s[i] = 65` and `s[i] = "A"` mean the same; strings are passed as copies,
 so other variables are unaffected), can be an array element, and is not usable as a
 condition or in arithmetic (`.if s .then`, `s - 1`). The escapes are `\\`,
 `\"`, `\n` and `\t`; any other `\` is an error. A NUL is made with `.chr(0)`.
-A string cannot contain `/*` — that is the pattern file's comment marker,
-stripped before the mini language sees the line. For the same reason a string
-passed to `.call` in a `binary_list` cannot contain the field separator `::`
-(it can inside a `.func` body). The length limit is the same as for arrays.
+A string may contain both `/*` and `::` (section 3.1, "Inside strings"). The
+length limit is the same as for arrays.
 
 #### Scope and nesting
 
@@ -4469,7 +4488,7 @@ The x86_64 pattern file is also maintained separately at
 | **unordered.axx** | 1.7 KB | 28 | **unordered.s** | `.unordered` and per-variable `.map` (3.19): the Z80 `C` as a register and as carry; test only |
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | `.echo` on a body line (3.14.1); test only |
-| **ministr.axx** | 4.9 KB | 11 | **ministr.s** | Strings, arrays of strings and `.for ... in <array>` in the mini language (3.15); test only |
+| **ministr.axx** | 6.4 KB | 15 | **ministr.s** | Strings, arrays of strings and `.for ... in <array>` in the mini language (3.15); test only |
 | **elftype.axx** | 1.5 KB | 20 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |

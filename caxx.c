@@ -3669,10 +3669,29 @@ static void axx_reduce_spaces(char *s) {
     *dst=0;
 }
 
+/* l[i] から始まる、文字列として読み飛ばす部分の長さ。無ければ 0。`"..."` は
+   同じ行に閉じる `"` があるときだけ文字列で、中の `\` は次の 1 文字を逃がす。
+   閉じない `"`、`\"`、文字定数 `'"'` は文字列を開かない。パターンファイルの
+   コメントの開きと欄の区切り `::` を、文字列の中では効かせないために使う。
+   axx.py の StringUtils.quoted_span() と同じ規則である。 */
+static int axx_quoted_span(const char *l, int i){
+    char c = l[i];
+    if(c == '\\' && l[i+1] == '"') return 2;
+    if(c == '\'' && l[i+1] == '"' && l[i+2] == '\'') return 3;
+    if(c != '"') return 0;
+    int j = i + 1;
+    while(l[j]){
+        if(l[j] == '\\' && l[j+1]){ j += 2; continue; }
+        if(l[j] == '"') return j + 1 - i;
+        j++;
+    }
+    return 0;
+}
+
 /* パターンファイルのブロックコメントを落とす。複数行にまたがるコメントは
    in_comment を次の行へ持ち越して続ける。古い書き方のための後方互換の
    判断（コメント行すべての頭に開きだけを書く流儀）は読み込み側にあり、
-   ここは素の状態機械。 */
+   ここは素の状態機械。`"..."` の中のコメントの開きはコメントにしない。 */
 static void axx_remove_comment(char *l, int *in_comment) {
     int i=0, w=0;
     while(l[i]){
@@ -3680,6 +3699,8 @@ static void axx_remove_comment(char *l, int *in_comment) {
             if(l[i]=='*'&&l[i+1]=='/'){ *in_comment=0; i+=2; continue; }
             i++; continue;
         }
+        int q = axx_quoted_span(l, i);
+        if(q){ while(q-- > 0) l[w++]=l[i++]; continue; }
         if(l[i]=='/'&&l[i+1]=='*'){ *in_comment=1; i+=2; continue; }
         l[w++]=l[i++];
     }
@@ -4010,12 +4031,18 @@ static int axx_get_label_word(const char *s, int idx, const char *lwordchars, ch
     return axx_get_label_word_ex(s, idx, lwordchars, t_out, tsz, 1);
 }
 
-/* `::` までを 1 欄として取る。 */
+/* `::` までを 1 欄として取る。`"..."` の中の `::` では割らない
+   （axx_quoted_span）。 */
 static int axx_get_params1(const char *l, int idx, char *s_out, size_t ssz){
     idx=axx_skipspc(l,idx);
     if(!l[idx]){ s_out[0]=0; return idx; }
     size_t n=0;
     while(l[idx]){
+        int q = axx_quoted_span(l, idx);
+        if(q){
+            while(q-- > 0){ if(n<ssz-1) s_out[n++]=l[idx]; idx++; }
+            continue;
+        }
         if(l[idx]==':'&&l[idx+1]==':'){idx+=2;break;}
         if(n<ssz-1) s_out[n++]=l[idx];
         idx++;
@@ -9952,7 +9979,16 @@ static MStmt *msp_simple(MSP *p, int li){
         MXP ep; ep.t = toks + 1; ep.n = n - 1; ep.i = 0; ep.c = c;
         if(mxp_is_op(&ep, "[")){
             ep.i++;
-            s->idx = mxp_or(&ep);
+            MExpr *lo = mxp_is_op(&ep, ":") ? NULL : mxp_or(&ep);
+            if(mxp_eat(&ep, ":")){
+                /* `名前[lo:hi] = 値` は範囲の置き換え。a が NULL の MX_SLICE で表す。 */
+                MExpr *sl = mx_new(MX_SLICE);
+                sl->b = lo;
+                sl->c = mxp_is_op(&ep, "]") ? NULL : mxp_or(&ep);
+                s->idx = sl;
+            } else {
+                s->idx = lo;
+            }
             mxp_expect(&ep, "]");
         }
         mxp_expect(&ep, "=");
@@ -10634,9 +10670,77 @@ static MiniFunc *mini_lookup(MiniRun *r, const char *name){
 
 static void mini_call_func(MiniRun *r, MiniFunc *f, MiniVal *args, int nargs);
 
+/* `名前[lo:hi] = 値` — lo から hi の手前までを値で置き換える。境界は読み出しの
+   `[lo:hi]` と同じく範囲に切り詰め、`lo == hi` ならその位置への挿入になる。値の
+   長さが違えば全体の長さが変わる。文字列には文字列を、配列には配列を書く。
+   v は消費する。axx.py の MiniInterp._store_slice() と同じ規則である。 */
+static void mini_store_slice(MiniRun *r, MStmt *s, MiniVal v){
+    int has_lo = s->idx->b != NULL, has_hi = s->idx->c != NULL;
+    long long lo = 0, hi = 0;
+    if(has_lo){
+        MiniVal bv = mini_eval(r, s->idx->b);
+        if(bv.is_arr || bv.is_str) mini_val_free(&v);
+        lo = mini_to_ll_sat(mini_need_num(r, bv, "a slice bound"));
+    }
+    if(has_hi){
+        MiniVal bv = mini_eval(r, s->idx->c);
+        if(bv.is_arr || bv.is_str) mini_val_free(&v);
+        hi = mini_to_ll_sat(mini_need_num(r, bv, "a slice bound"));
+    }
+    MiniBind *b = mini_ref(r, s->name);
+    if(!b->v.is_arr && !b->v.is_str){
+        mini_val_free(&v);
+        mini_fail(&r->c, "'%s' is not an array or a string", s->name);
+    }
+    long long n = b->v.is_str ? b->v.slen : b->v.n;
+    if(!has_lo) lo = 0;
+    if(lo < 0) lo = 0;
+    if(lo > n) lo = n;
+    if(!has_hi) hi = n;
+    if(hi < lo) hi = lo;
+    if(hi > n) hi = n;
+    if(b->v.is_str){
+        if(!v.is_str){
+            mini_val_free(&v);
+            mini_fail(&r->c, "a string slice can only be given a string");
+        }
+        long long nl = lo + v.slen + (n - hi);
+        if(nl > MINI_MAX_ARRAY) mini_val_free(&v);
+        mini_need_strlen(r, nl);
+        unsigned char *ns = mini_alloc((size_t)nl + 1);
+        memcpy(ns, b->v.str, (size_t)lo);
+        if(v.slen > 0) memcpy(ns + lo, v.str, (size_t)v.slen);
+        memcpy(ns + lo + v.slen, b->v.str + hi, (size_t)(n - hi));
+        free(b->v.str);
+        b->v.str = ns;
+        b->v.slen = (int)nl;
+        mini_val_free(&v);
+        return;
+    }
+    if(!v.is_arr){
+        mini_val_free(&v);
+        mini_fail(&r->c, "an array slice can only be given an array");
+    }
+    long long nl = lo + v.n + (n - hi);
+    if(nl > MINI_MAX_ARRAY){
+        mini_val_free(&v);
+        mini_fail(&r->c, "array longer than the maximum length %d", MINI_MAX_ARRAY);
+    }
+    MiniVal na; memset(&na, 0, sizeof(na));
+    na.is_arr = 1;
+    mini_arr_reserve(&na, nl > 0 ? (int)nl : 1);
+    for(long long i = 0; i < lo; i++){ na.n++; mini_arr_put(&na, na.n - 1, mini_arr_get(&b->v, (int)i)); }
+    for(int i = 0; i < v.n; i++){ na.n++; mini_arr_put(&na, na.n - 1, mini_arr_get(&v, i)); }
+    for(long long i = hi; i < n; i++){ na.n++; mini_arr_put(&na, na.n - 1, mini_arr_get(&b->v, (int)i)); }
+    mini_val_free(&v);
+    mini_val_free(&b->v);
+    b->v = na;
+}
+
 /* 変数か配列要素へ代入する。配列は必要なら伸ばす。 */
 static void mini_store(MiniRun *r, MStmt *s, MiniVal v){
     if(!s->idx){ mini_set(r, s->name, v); return; }
+    if(s->idx->k == MX_SLICE && !s->idx->a){ mini_store_slice(r, s, v); return; }
     uint256_t iv = mini_need_num(r, mini_eval(r, s->idx), "an index");
     if(u256_is_neg256(iv)){
         char nb[96]; u256_to_pydec(iv, nb, sizeof(nb));
@@ -10710,8 +10814,22 @@ static void mini_exec(MiniRun *r, MStmt *s){
         for(int i = 0; i < s->nargs; i++){
             MiniVal ev = mini_eval(r, s->args[i]);
             if(ev.is_arr){
+                /* 配列は要素ごとに出し、文字列の要素は 1 バイト 1 ワード。
+                   axx.py の MiniInterp._exec() の 'emit' と同じ。 */
+                for(int k = 0; k < ev.n; k++){
+                    int ns = (ev.astr && ev.astr[k]) ? ev.alen[k] : 1;
+                    for(int q = 0; q < ns; q++){
+                        if(r->out.len >= MINI_MAX_EMIT){
+                            mini_val_free(&ev);
+                            mini_fail(&r->c, "'.emit' produced more than %d words",
+                                      MINI_MAX_EMIT);
+                        }
+                        iv_push(&r->out, (ev.astr && ev.astr[k])
+                                         ? u256_from_u64(ev.astr[k][q]) : ev.arr[k]);
+                    }
+                }
                 mini_val_free(&ev);
-                mini_fail(&r->c, "'.emit' needs numbers, not an array");
+                continue;
             }
             if(ev.is_str){
                 /* 文字列は 1 バイトを 1 ワードとして出す。 */
@@ -11186,17 +11304,26 @@ static MiniVal mini_arg_exp(Assembler *asmb, const char *t, int a, int *out_i, i
    次の位置にする。`.setsym::名前::"..."` の名前で、後ろが `,` か引数の終わりの
    ときだけ当たる。式の一部（`msg+1` など）は今までどおり式として読む。
    axx.py の ObjectGenerator._mini_strsym_at() と同じ規則である。 */
-static const char *mini_strsym_at(AsmState *st, const char *t, int a, int *out_i){
+/* t[a] からの引数が名前 1 つだけなら、その名前を大文字で key に置き、次の位置を
+   返す。後ろが `,` か引数の終わりでなければ -1。
+   axx.py の ObjectGenerator._mini_symname_at() と同じ規則である。 */
+static int mini_symname_at(const char *t, int a, char *key, size_t ksz){
     int k = a;
     while(isalnum((unsigned char)t[k]) || t[k] == '_') k++;
-    if(k == a) return NULL;
+    if(k == a) return -1;
     int e = axx_skipspc(t, k);
-    if(t[e] && t[e] != ',') return NULL;
-    char key[512];
+    if(t[e] && t[e] != ',') return -1;
     int n = k - a;
-    if(n >= (int)sizeof(key)) return NULL;
+    if(n >= (int)ksz) return -1;
     for(int i = 0; i < n; i++) key[i] = (char)axx_upper_char(t[a+i]);
     key[n] = 0;
+    return e;
+}
+
+static const char *mini_strsym_at(AsmState *st, const char *t, int a, int *out_i){
+    char key[512];
+    int e = mini_symname_at(t, a, key, sizeof(key));
+    if(e < 0) return NULL;
     const char *sv = strsym_get(st, key);
     if(sv) *out_i = e;
     return sv;
@@ -11204,6 +11331,39 @@ static const char *mini_strsym_at(AsmState *st, const char *t, int a, int *out_i
 
 static MiniVal mini_arg_one(Assembler *asmb, char *t, int a, int *out_i, int *ok,
                             const char *name, int quiet, int in_array);
+
+/* 配列シンボル（`.setsym::名前::[...]`）を引数の配列にする。数の項目は整数、
+   `"..."` と裸の名前の項目は文字列（`{{名前[i]}}` が出すもの）で、文字列は
+   `"..."` と直接書いたのと同じに逃げ記号を開く。失敗したら *ok を 0 にする。
+   axx.py の ObjectGenerator._mini_arrsym_value() と同じ規則である。 */
+static MiniVal mini_arrsym_value(const struct ArrSym *ar, int *ok, const char *name,
+                                 int quiet){
+    MiniVal v; memset(&v, 0, sizeof(v));
+    v.is_arr = 1;
+    *ok = 0;
+    for(int k = 0; k < ar->len; k++){
+        MiniVal e;
+        if(ar->items[k].is_str){
+            const char *sv = ar->items[k].s ? ar->items[k].s : "";
+            size_t svl = strlen(sv);
+            char *q = mini_alloc(svl + 3);
+            q[0] = '"'; memcpy(q + 1, sv, svl); q[svl + 1] = '"'; q[svl + 2] = 0;
+            int sio, eok;
+            e = mini_arg_str(q, 0, &sio, &eok, name, quiet);
+            free(q);
+            if(!eok){ mini_val_free(&e); mini_val_free(&v); return v; }
+        } else {
+            uint256_t x = ar->items[k].v;
+            if(u256_is_undef_derived(x)) x = u256_zero();
+            e = mini_num(x);
+        }
+        mini_arr_reserve(&v, v.n + 1);
+        v.n++;
+        mini_arr_put(&v, v.n - 1, e);
+    }
+    *ok = 1;
+    return v;
+}
 
 /* `[e1, e2, ...]` と書かれた引数を配列として評価する。要素は整数か文字列で、
    書き方は引数 1 つと同じ（mini_arg_one）。
@@ -11290,6 +11450,22 @@ static MiniVal mini_arg_one(Assembler *asmb, char *t, int a, int *out_i, int *ok
         free(q);
         *out_i = e;
         return v;
+    }
+    {
+        char key[512];
+        int e2 = mini_symname_at(t, a, key, sizeof(key));
+        struct ArrSym *ar = e2 >= 0 ? arrsym_get(st, key) : NULL;
+        if(ar){
+            if(in_array){
+                if(!quiet)
+                    axx_diagf(1, 0, " error - '.call %s': an array element cannot be "
+                               "an array.\n", name);
+                *out_i = (int)strlen(t);
+                return mini_num(u256_zero());
+            }
+            *out_i = e2;
+            return mini_arrsym_value(ar, ok, name, quiet);
+        }
     }
     int io;
     uint256_t v = expr_expression_pat(asmb, t, a, &io);
