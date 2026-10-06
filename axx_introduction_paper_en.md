@@ -359,7 +359,29 @@ The other is the part "add string literals and string operations to binary_list,
 
 Regarding the remaining tasks, the author notes that the pattern-data format is more intuitive and that a descriptive meta-language would require a major rewrite. He also considers that high-performance macros translating structured and functional assembly into imperative assembly, optimization features, and pattern files for ARM (A32/T32), SPARC, 32-bit PowerPC and RV32 — including validation on real hardware or emulators — are too large for one person to complete, and welcomes collaborators. These are constraints of labour, not of design, and the pattern-file format is fully documented.
 
-## 13. Conclusion
+## 13. Strengths
+
+This section gathers, from the preceding sections, the eight strengths that characterize axx. The first five belong to the core of the idea and its design; the last three are milestones that drew out the reach that core already had.
+
+**(1) The one-line reduction.** Reducing every imperative assembly language to the single form `instruction :: error_patterns :: binary_list` (Section 2). This redefines an assembler from "a program written for each ISA" to "data that describes an ISA". That one line, `RET :: 0xc3`, is a complete assembler for one instruction shows the depth of the reduction directly.
+
+**(2) Matching without a tokenizer.** The decision not to fix token boundaries in advance and to match character by character (Section 3.2). This single decision lets a mnemonic-less syntax such as `r1 = r2 + r3`, and names containing symbols such as `$v0`, be written with no special treatment. What LLVM needed a special case for was never a problem for axx in the first place.
+
+**(3) Order-independent matching.** Choosing, among the patterns that match, the most specific one by a specificity score (Section 3.4). This removes by mechanism the implicit rule that table-driven assemblers have always imposed — "write the more specific pattern first". It is this property that makes pattern files tens of thousands of lines long maintainable.
+
+**(4) Isolating computational power.** Keeping the pattern layer Turing-incomplete, so that the termination of matching is a property of the language, and handing only the parts that need computation to a separate layer called by name with `.call` (Sections 4 and 5). Expressiveness and safety are reconciled by separating the layers.
+
+**(5) A skeleton that lasted 38 years.** The 1986 idea absorbed what appeared afterwards — VLIW, EPIC, word sizes other than 8 bits, scalable vector extensions, text translation, machine-independent ELF — without changing the core (Section 8). That later additions sit on the core without breaking it is evidence that the essence extracted at the start was correct.
+
+**(6) A free-syntax DSL.** The pattern language has no fixed grammar: by arranging just five elements — string literals, symbols, integer expressions, integer factors and floating-point expressions — the writer creates the grammar itself (Section 3.1). By not carrying the assembler's self-evident premise of "mnemonic plus operands", axx goes beyond the assembler and becomes a general binary generator. A tokenizer-less free-syntax DSL has no precedent.
+
+**(7) The generalization of ELF.** Carrying the principle "the core knows no machine" past instruction encoding all the way to object-file generation (Section 7). Relocation types, REL and RELA, bit fields inside instruction words, the layout of `r_info`, and even CFI can be written purely as declarations in the pattern file; even the built-in tables for eleven machines are nothing more than declarations written in advance. Producing a linkable ELF from declarations rather than from per-machine code is a milestone not found in comparable tools.
+
+**(8) Source-to-source translation with `.textmode`.** Widening the output of `binary_list` from bytes to text, which turns the assembler into a translator between assembly languages (Section 6). This did not add a new mechanism; it showed that the original structure — "match, then assemble the output from the captured values" — never depended on what the output was. It realizes part of the axx2 concept ahead of time, without changing either the declarativeness or the Turing incompleteness of the core.
+
+What the eight have in common is that none of them bolts a new feature on from outside; each draws out the reach the original idea already had. That is why every one of these milestones sits on the core without breaking it. In a word, the greatest strength of axx is that it defines, small and precisely, what an assembler is.
+
+## 14. Conclusion
 
 The invention of axx comes down to three points: a single reduction thesis (`instruction :: error_patterns :: binary_list`), a free-syntax pattern language for writing it, and the design decision to separate computational power from the declarative core. The macro layer and mini language added in the current version do not withdraw the third point; they make it concrete. Computation is isolated in a preceding source transformation and in a separate language that appears only when called by name, and the pattern layer remains declarative data, continuing to guarantee termination of matching as a property of the language.
 
