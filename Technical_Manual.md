@@ -1287,7 +1287,7 @@ absent:
 .check::a::a1,a2,a3,""
 .check::b::b1,b2,b3,""
 .check::c::c1,c2,c3,""
-MOVabc:: ::a*100+b*10+c
+MOV a b c :: ::a*100+b*10+c
 ```
 
 ```
@@ -1297,6 +1297,14 @@ mova1c3            103
 movb2               20
 movb2c1             21
 ```
+
+Separate adjacent variables with a space. A variable name runs over lowercase
+letters, digits and `_`, so `MOVabc` written without spaces is a single variable
+`abc`. A space in a pattern matches whether or not the source has one there, so
+the pattern still matches source written run together, such as `mova1c3`. The
+matcher decides where such a run splits: at each position it takes the longest
+word it can and then backs off to the longest prefix that is a defined symbol, so
+`a1c3` splits into `a1` and `c3`.
 
 AVX-512 masking notation uses the same mechanism:
 
@@ -1308,14 +1316,19 @@ AVX-512 masking notation uses the same mechanism:
 .setsym::{K2}::2
 .check::x::EAX,EBX
 .check::k::{K1},{K2},""
-FOO xk,y :: :: 0x90,k,x,y
+FOO x k,y :: :: 0x90,k,x,y
 ```
 
 ```
 FOO EAX,EBX          -> 0x90 0x00 0x00 0x01   (k omitted)
 FOO EAX{K1},EBX      -> 0x90 0x01 0x00 0x01
 FOO EAX{K2},EBX      -> 0x90 0x02 0x00 0x01
+FOO EAX {K1},EBX     -> 0x90 0x01 0x00 0x01   (a space is allowed too)
 ```
+
+`.symbolc::{}` makes `{` and `}` symbol characters, so at `x` the matcher first
+takes all of `EAX{K1}`, backs off to `EAX`, and then `k` reads the remaining
+`{K1}`.
 
 #### 3.7.4 `.free` — release a name from every table
 
@@ -4351,7 +4364,7 @@ While the pattern file is not Turing-complete, when computation is required, you
 
 Because a pattern file has no explicit structure, it suits unstructured
 instruction encodings well; `.check` (section 3.6) is what lets you impose
-structure — such as an instruction `MOVabc r,s` where `a`, `b`, `c` each range
+structure — such as an instruction `MOV a b c r,s` where `a`, `b`, `c` each range
 over a fixed set — when you want it.
 
 ---
