@@ -51,13 +51,14 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all fifty-two bundled pattern/source pairs with
+exactly that: `test1` assembles all fifty-four bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the five `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` and `ministr.axx` pairs the `.echo` lines each one writes to standard
-error. The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
+error, and for the `regress.axx` regression test its `-V` text and its diagnostics.
+The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for a hundred and eighty-six comparisons in all.
+text output are compared too, for a hundred and eighty-eight comparisons in all.
 
 **Contents**
 
@@ -4298,6 +4299,11 @@ Diagnostics raised by the assembler itself:
 | Malformed assembler or pattern line | *Illegal syntax in assembler line or pattern line* |
 | An EPIC template is not set | *No VLIW instruction-set defined* |
 | A malformed VLIW pattern file | reported during interpretation |
+| The output (`-b` raw binary, or the contents of the `-o` ELF) exceeds 1 GiB | *output size ... exceeds maximum* (usually a wrong `.org`) |
+
+When a label cannot be defined (the first two rows above), the instruction written
+after it on the same line is not assembled either. Both implementations handle this
+the same way, so the diagnostics that follow the error agree as well.
 
 Errors raised by `error_patterns`, selected by the code after `;`:
 
@@ -4555,6 +4561,7 @@ The x86_64 pattern file is also maintained separately at
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | `.echo` on a body line (3.14.1); test only |
 | **ministr.axx** | 6.4 KB | 15 | **ministr.s** | Strings, arrays of strings and `.for ... in <array>` in the mini language (3.15); test only |
+| **regress.axx** | 1.3 KB | 4 | **regress.s**, **regresserr.s** | Regression test for the disagreements between the two implementations found by differential fuzzing and fixed (nested `?:`, long numeric literals, pow() special cases, the macro layer's `int()`, `hex()` and format specs, the diagnostics after an error); test only |
 | **elftype.axx** | 1.5 KB | 20 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
@@ -4594,7 +4601,7 @@ re-encoded and the new instructions of Release 6, checked against llvm-mc 19
 down to the relocations). `mips_isa.axx` is included by those eight and is never
 passed to axx itself.
 
-`test1` runs all fifty-two pairs through both implementations and
+`test1` runs all fifty-four pairs through both implementations and
 compares the `-b` raw binaries. For the five pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
@@ -4611,7 +4618,8 @@ CFI, so for those twelve the `-o` ELF objects are compared (`elfcfi` under ELF32
 `--elfdesc` output (the description rewritten as declarations) is compared too.
 For the
 `echo.axx` / `echo.s` and `ministr.axx` / `ministr.s` pairs the `.echo` lines written to standard error are
-compared as well. The twelve MIPS pairs (`mips.axx`, `mipsel.axx`, `mips64.axx`
+compared as well. The `regress.axx` regression test compares `regress.s` by its `-V` text and
+`regresserr.s` (only lines that end in an error) by its diagnostics on standard error. The twelve MIPS pairs (`mips.axx`, `mipsel.axx`, `mips64.axx`
 and `mips64el.axx` with `mips.s` and with `mips_ase.s`, the four Release 6 files
 with `mipsr6.s`) also compare their `-o` ELF objects (ELF32 REL for o32, ELF64
 RELA for n64) besides the `-b` binaries.
@@ -4620,7 +4628,7 @@ The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for a hundred and eighty-six comparisons in all.
+never compares, for a hundred and eighty-eight comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -4651,9 +4659,10 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all fifty-two bundled pattern/source pairs with both
+`test1` assembles all fifty-four bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
-five `.textmode` pairs and the `.echo` lines of the `echo.axx` and `ministr.axx` pairs.
+five `.textmode` pairs, the `.echo` lines of the `echo.axx` and `ministr.axx` pairs,
+and the `-V` text and diagnostics of the `regress.axx` regression test.
 
 ### C.2 External
 

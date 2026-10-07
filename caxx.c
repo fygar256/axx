@@ -339,6 +339,18 @@ static uint256_t u256_mul(uint256_t a, uint256_t b) {
     }
     return r;
 }
+/* x*m+d（m と d は 64 ビットに収まる小さな数）。256 ビットを溢れたら *ovf を
+   立てる。数値リテラルを読むときに桁あふれを見つけるのに使う。 */
+static uint256_t u256_muladd_small(uint256_t x, uint64_t m, uint64_t d, int *ovf){
+    __uint128_t carry = d;
+    for(int i=0;i<4;i++){
+        __uint128_t t = (__uint128_t)x.w[i]*m + carry;
+        x.w[i] = (uint64_t)t;
+        carry = t >> 64;
+    }
+    if(carry) *ovf = 1;
+    return x;
+}
 /* 符号付き乗算。 */
 static uint256_t u256_mul_signed(uint256_t a, uint256_t b) {
     return u256_mul(a,b);
@@ -2484,8 +2496,10 @@ typedef struct {
     SecRangeVec section_ranges;
 
     int        equ_section_tracking;
-    char       equ_first_section[64];
-    int        equ_multi_section;
+    /* `.EQU` の式が触れたセクション名の集合（重複なし）。axx.py の
+       _equ_sections_touched と同じ。 */
+    char     **equ_secs;
+    int        equ_nsecs, equ_secs_cap;
 
     char     **diag_pending;
     int       *diag_pending_seterr;
@@ -3935,16 +3949,6 @@ static int char_in(char c, const char *set){
 }
 
 /* 続く 10 進数字を綴りのまま取る。 */
-static int axx_get_intstr(const char *s, int idx, char *fs, size_t fsz){
-    size_t n=0;
-    while(s[idx]&&is_digit(s[idx])){
-        if(n<fsz-1) fs[n++]=s[idx];
-        idx++;
-    }
-    fs[n]=0;
-    return idx;
-}
-
 /* 浮動小数点の綴りを取る。`inf` / `-inf` / `nan` も読む。指数部は `e` の
    あとに数字が無ければ指数ではないので巻き戻す。 */
 static int axx_get_floatstr(const char *s, int idx, char *fs, size_t fsz){
@@ -4138,15 +4142,21 @@ static F128R f128_factor_fn(const char *s)
     if(*s=='-'){ r=f128_factor_fn(s+1); r.val=-r.val; return r; }
     if(*s=='+'){ return f128_factor_fn(s+1); }
     if((*s>='0'&&*s<='9')||*s=='.'){
-        char buf[80]; int n=0;
-        while(((*s>='0'&&*s<='9')||*s=='.')&&n<78) buf[n++]=*s++;
-        if((*s=='e'||*s=='E')&&n<77){
-            buf[n++]=*s++;
-            if((*s=='+'||*s=='-')&&n<77) buf[n++]=*s++;
-            while(*s>='0'&&*s<='9'&&n<78) buf[n++]=*s++;
+        /* 綴りの終わりを先に測り、長さに上限を置かずに写す（以前は 78 文字で
+           止まり、残りの桁が「読めない文字」になって倍精度の経路へ落ちていた）。 */
+        const char *b=s;
+        while((*s>='0'&&*s<='9')||*s=='.') s++;
+        if(*s=='e'||*s=='E'){
+            s++;
+            if(*s=='+'||*s=='-') s++;
+            while(*s>='0'&&*s<='9') s++;
         }
-        buf[n]='\0';
+        size_t n=(size_t)(s-b);
+        char *buf=malloc(n+1);
+        if(!buf){ perror("malloc"); exit(1); }
+        memcpy(buf,b,n); buf[n]='\0';
         r.val=f128_from_decimal(buf);
+        free(buf);
         r.end=s;
         return r;
     }
@@ -4818,11 +4828,18 @@ static uint256_t label_get_value(AsmState *st, const char *k){
         uint256_t ret_val = e->value;
         const char *sec = e->section ? e->section : "";
         if(st->equ_section_tracking){
-            if(!st->equ_first_section[0]){
-                strncpy(st->equ_first_section, sec, sizeof(st->equ_first_section)-1);
-                st->equ_first_section[sizeof(st->equ_first_section)-1]='\0';
-            } else if(strcmp(st->equ_first_section, sec) != 0){
-                st->equ_multi_section = 1;
+            int _seen = 0;
+            for(int _i = 0; _i < st->equ_nsecs; _i++)
+                if(strcmp(st->equ_secs[_i], sec) == 0){ _seen = 1; break; }
+            if(!_seen){
+                if(st->equ_nsecs >= st->equ_secs_cap){
+                    st->equ_secs_cap = st->equ_secs_cap ? st->equ_secs_cap * 2 : 4;
+                    st->equ_secs = realloc(st->equ_secs, (size_t)st->equ_secs_cap * sizeof(char*));
+                    if(!st->equ_secs){ perror("realloc"); exit(1); }
+                }
+                st->equ_secs[st->equ_nsecs] = strdup(sec);
+                if(!st->equ_secs[st->equ_nsecs]){ perror("strdup"); exit(1); }
+                st->equ_nsecs++;
             }
             int64_t _adj = equ_section_relative_offset(st, sec, u256_to_u64(e->value));
             if(_adj >= 0) ret_val = u256_from_u64((uint64_t)_adj);
@@ -5636,21 +5653,25 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
     }
     else if(axx_q(s,slen,"0b",idx)){
         idx+=2;
+        int _ovf=0;
         while(s[idx]=='0'||s[idx]=='1'){
-            x=u256_add(u256_mul(x,u256_from_u64(2)), u256_from_u64(s[idx]-'0'));
+            x=u256_muladd_small(x,2,(uint64_t)(s[idx]-'0'),&_ovf);
             idx++;
         }
+        if(_ovf) warn_u256_wrap("literal");
         if(asmb->st.exp_typ_float)
             x=double_to_u256(u256_int_to_double(x));
     }
     else if(axx_q(s,slen,"0x",idx)){
         idx+=2;
+        int _ovf=0;
         while(s[idx]&&is_xdigit_upper(axx_upper_char(s[idx]))){
             int d; char c=axx_upper_char(s[idx]);
             d=(c>='A')?(c-'A'+10):(c-'0');
-            x=u256_add(u256_mul(x,u256_from_u64(16)), u256_from_u64((uint64_t)d));
+            x=u256_muladd_small(x,16,(uint64_t)d,&_ovf);
             idx++;
         }
+        if(_ovf) warn_u256_wrap("literal");
         if(asmb->st.exp_typ_float)
             x=double_to_u256(u256_int_to_double(x));
     }
@@ -5848,21 +5869,30 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         x=u256_from_i64(u256_is_zero(x)?1:0);
     }
     else if(asmb->st.exp_typ_float && axx_isfloatstr(s,idx)){
-        char fs[96];
-        idx=axx_get_floatstr(s,idx,fs,sizeof(fs));
+        /* 綴りの長さに上限を置かない（以前は 95 文字で黙って切っていたので、
+           桁の多いリテラルの値が変わった）。 */
+        char fsb[96];
+        size_t _need = (size_t)(slen > idx ? slen - idx : 0) + 8;
+        char *fs = (_need <= sizeof(fsb)) ? fsb : malloc(_need);
+        if(!fs){ perror("malloc"); exit(1); }
+        idx=axx_get_floatstr(s,idx,fs,(_need <= sizeof(fsb)) ? sizeof(fsb) : _need);
         if(fs[0]){
             char *_fend = NULL;
             double _fv = strtod(fs, &_fend);
             if(_fend && *_fend) _fv = 0.0;
             x=double_to_u256(_fv);
         }
+        if(fs != fsb) free(fs);
     }
     else if(is_digit(s[idx])){
-        char fs[128];
-        idx=axx_get_intstr(s,idx,fs,sizeof(fs));
+        /* 桁数に上限を置かずに読む（以前は 127 桁で黙って切っていた）。 */
         x=u256_zero();
-        uint256_t ten=u256_from_u64(10);
-        for(int di=0;fs[di];di++) x=u256_add(u256_mul(x,ten),u256_from_u64((uint64_t)(fs[di]-'0')));
+        int _ovf=0;
+        while(s[idx]&&is_digit(s[idx])){
+            x=u256_muladd_small(x,10,(uint64_t)(s[idx]-'0'),&_ovf);
+            idx++;
+        }
+        if(_ovf) warn_u256_wrap("literal");
     }
     else if(st->enum_bind_names
             && (_en_k=enum_name_at(s, idx, st->enum_bind_names, &_en_end)) >= 0){
@@ -5940,7 +5970,9 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
     return x;
 }
 
-/* `**`。指数と結果のビット数に上限を置き、連鎖で爆発させない。 */
+/* `**`。指数と結果のビット数に上限を置き、連鎖で爆発させない。エラーのあとも
+   0 にして残りの `**` を読み進める（途中で抜けると残りが宙に浮き、行が
+   パターンに当たらなくなる）。axx.py の term0_0() と同じ規則である。 */
 static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_factor(asmb,s,idx,&idx);
     int slen=expr_slen(s);
@@ -5958,7 +5990,7 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
                     axx_diagf(1, 0, " error - Negative exponent in ** expression; result set to 0.\n");
                 }
                 x = u256_zero();
-                break;
+                continue;
             }
             if(u256_nonneg_gt_i64(t, EXP_MAX)){
                 if(should_report_errors(&asmb->st)){
@@ -5966,7 +5998,7 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
                     axx_diagf(1, 0, " error - Exponent %s exceeds maximum %lld in ** expression; result set to 0.\n", _ec, (long long)EXP_MAX);
                 }
                 x = u256_zero();
-                break;
+                continue;
             }
             int64_t t_int = u256_to_i64(t);
             int64_t base_bits = u256_nbit(x);
@@ -5976,7 +6008,7 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
                     axx_diagf(1, 0, " error - ** result would exceed %lld bits (chained exponentiation); result set to 0.\n",(long long)EXP_RESULT_MAX_BITS);
                 }
                 x = u256_zero();
-                break;
+                continue;
             }
             x=u256_pow(x,t);
         }
@@ -6110,7 +6142,8 @@ static uint256_t expr_term1(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
-/* `<<` `>>`。負のシフト量と大きすぎるシフト量はエラーにする。 */
+/* `<<` `>>`。負のシフト量と大きすぎるシフト量はエラーにする。エラーのあとも
+   0 にして残りのシフトを読み進める。axx.py の term2() と同じ規則である。 */
 static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term1(asmb,s,idx,&idx);
     int slen=expr_slen(s);
@@ -6125,13 +6158,13 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - negative shift count (%s) in << expression.\n", _sc);
                 }
-                x=u256_zero(); break;
+                x=u256_zero(); continue;
             } else if(u256_nonneg_gt_i64(sop,SHIFT_MAX)){
                 char _sc[96]; u256_to_pydec(sop, _sc, sizeof(_sc));
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - shift count %s exceeds maximum %lld in << expression.\n", _sc, (long long)SHIFT_MAX);
                 }
-                x=u256_zero(); break;
+                x=u256_zero(); continue;
             } else {
                 uint256_t _b=expr_safe_bitwise_operand(asmb,x,"<<");
                 int _n=(int)u256_to_i64(sop);
@@ -6149,13 +6182,13 @@ static uint256_t expr_term2(Assembler *asmb, const char *s, int idx, int *idx_ou
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - negative shift count (%s) in >> expression.\n", _sc);
                 }
-                x=u256_zero(); break;
+                x=u256_zero(); continue;
             } else if(u256_nonneg_gt_i64(sop,SHIFT_MAX)){
                 char _sc[96]; u256_to_pydec(sop, _sc, sizeof(_sc));
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - shift count %s exceeds maximum %lld in >> expression.\n", _sc, (long long)SHIFT_MAX);
                 }
-                x=u256_zero(); break;
+                x=u256_zero(); continue;
             } else x=expr_bitwise_result(asmb,u256_sar(expr_safe_bitwise_operand(asmb,x,">>"),(int)u256_to_i64(sop)));
         } else break;
     }
@@ -6451,7 +6484,9 @@ static uint256_t expr_term11(Assembler *asmb, const char *s, int idx, int *idx_o
         idx++;
         idx = axx_skipspc(s, idx);
         if(expr_is_false(asmb, x)){
-            int skip_end = skip_subexpr(s, idx);
+            /* 真の側が入れ子の三項（`0?a?b:c:d`）でも丸ごと飛ばす。
+               axx.py の term11() と同じく _skip_ternary_expr 相当を使う。 */
+            int skip_end = skip_ternary_expr(s, idx);
             if(axx_q(s, slen, ":", skip_end) && s[skip_end+1] != '='){
                 int false_start = axx_skipspc(s, skip_end + 1);
                 x = expr_term11(asmb, s, false_start, &idx);
@@ -8680,19 +8715,19 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
 #if defined(__GNUC__) && !defined(__STRICT_ANSI__) && \
     (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
      defined(__arm__) || defined(__riscv))
-                    if(raw_len > 0 && raw_len < 1024){
-                        char expr_text[1024];
+                    if(raw_len > 0){
+                        /* 綴りの長さに上限を置かない（以前は 1024 文字以上を倍精度へ
+                           落としていた。axx.py の !Q 捕捉と同じ規則である）。 */
+                        char *expr_text = malloc((size_t)raw_len + 1);
+                        if(!expr_text){ perror("malloc"); exit(1); }
                         memcpy(expr_text, s + idx_s_q_start, (size_t)raw_len);
                         expr_text[raw_len] = '\0';
                         const char *f128_text = expr_text;
-                        char stripped[1024];
                         if(raw_len > 4 &&
                            strncmp(expr_text, "qad{", 4) == 0 &&
                            expr_text[raw_len-1] == '}'){
-                            int inner = raw_len - 5;
-                            memcpy(stripped, expr_text + 4, (size_t)inner);
-                            stripped[inner] = '\0';
-                            f128_text = stripped;
+                            expr_text[raw_len-1] = '\0';
+                            f128_text = expr_text + 4;
                         }
                         int q_ok = 0;
                         qbits = f128_eval_text(f128_text, &q_ok);
@@ -8706,6 +8741,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                                 qbits = ieee754_128_from_str(fstr);
                             }
                         }
+                        free(expr_text);
                     } else
 #endif
                     {
@@ -13928,6 +13964,7 @@ static int adir_labelc(AsmState *st, const char *l, const char *ll){
 
 /* 行頭の `label:` と `.equ` を処理する。`.equ` のラベルは再配置情報を失い、
    定数として扱われる。 */
+static int elf_sec_name_cmp(const void *a, const void *b);
 static char *adir_label_processing(Assembler *asmb, const char *l, char *out, size_t osz){
     AsmState *st=&asmb->st;
     if(!l[0]){ out[0]=0; return out; }
@@ -13977,18 +14014,30 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
             int track_sections = (reloc_type < 0);
             if(track_sections){
                 st->equ_section_tracking = 1;
-                st->equ_first_section[0] = '\0';
-                st->equ_multi_section = 0;
+                for(int _i = 0; _i < st->equ_nsecs; _i++) free(st->equ_secs[_i]);
+                st->equ_nsecs = 0;
             }
             u = expr_expression_asm(asmb, expr_tail, 0, &io);
             st->pass1_size_mode = saved_mode;
             if(track_sections){
                 st->equ_section_tracking = 0;
-                if(st->equ_multi_section && should_report_errors(st)){
+                if(st->equ_nsecs > 1 && should_report_errors(st)){
+                    /* 名前を並べて ", " でつなぐ（axx.py の sorted() と同じ順）。 */
+                    qsort(st->equ_secs, (size_t)st->equ_nsecs, sizeof(char*), elf_sec_name_cmp);
+                    size_t _ln = 1;
+                    for(int _i = 0; _i < st->equ_nsecs; _i++) _ln += strlen(st->equ_secs[_i]) + 2;
+                    char *_lst = malloc(_ln);
+                    if(!_lst){ perror("malloc"); exit(1); }
+                    _lst[0] = '\0';
+                    for(int _i = 0; _i < st->equ_nsecs; _i++){
+                        if(_i) strcat(_lst, ", ");
+                        strcat(_lst, st->equ_secs[_i]);
+                    }
                     axx_diagf(0, 0, " warning - .EQU '%s': expression combines labels from "
-                               "multiple sections without an explicit ::reloctype; the resulting "
+                               "multiple sections (%s) without an explicit ::reloctype; the resulting "
                                "constant assumes a specific section layout and will NOT be "
-                               "relocated by the linker.\n", label);
+                               "relocated by the linker.\n", label, _lst);
+                    free(_lst);
                 }
             }
             if(st->error_undefined_label && should_report_errors(st)){
@@ -14008,8 +14057,11 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
             }
             out[0]=0; return out;
         } else {
-            label_put_value(st,label,st->pc,st->current_section,0,-1,0);
+            int _ok = label_put_value(st,label,st->pc,st->current_section,0,-1,0);
             if(label!=lblbuf) free(label);
+            /* 定義できなかった行（二重定義・パターンファイルのシンボルとの衝突
+               など）は残りも組まない。axx.py の label_processing() と同じ。 */
+            if(!_ok){ out[0]=0; return out; }
             { int _n = lidx;
               if(_n > (int)sizeof(st->label_text)-1) _n = (int)sizeof(st->label_text)-1;
               memcpy(st->label_text, l, (size_t)_n);
@@ -16648,7 +16700,7 @@ static int elf_call_func(AsmState *st, const char *dname, const char *fname,
     r.c.file = f->file;
     r.c.line = f->line;
     r.c.jb_active = 1;
-    int ok = 0;
+    volatile int ok = 0;   /* longjmp をまたぐので volatile */
     if(setjmp(r.c.jb) == 0){
         mini_call_func(&r, f, av, nargs);
         if(r.has_ret && !r.retval.is_arr && !r.retval.is_str){ *out = r.retval.num; ok = 1; }
@@ -17197,6 +17249,37 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     for(int i=0;i<BUFMAP_NB;i++)
         for(BufEntry*be=st->buf.buckets[i];be;be=be->next)
             if(!have_w||be->pos>max_w){max_w=be->pos;have_w=1;}
+
+    /* 中身の大きさに -b と同じ上限を置く。`.org` の誤りで巨大なファイルを
+       書き始めないため。axx.py の write_elf_obj() と同じ数え方である。 */
+    {
+        uint256_t _tw = u256_zero();
+        if(st->sections.count==0){
+            if(st->pc_overflow_set) _tw = u256_add(st->pc_overflow_max, u256_from_u64(1));
+            else if(have_w) _tw = u256_add(u256_from_u64(max_w), u256_from_u64(1));
+        } else {
+            for(int i=0;i<st->sections.count;i++){
+                SecEntry *se=st->sections.order[i];
+                int _hr=0;
+                for(int k=0;k<st->section_ranges.len;k++)
+                    if(strcmp(st->section_ranges.data[k].name,se->name)==0){
+                        _hr=1; _tw=u256_add(_tw, st->section_ranges.data[k].len);
+                    }
+                if(!_hr && !u256_is_zero(se->size) && !u256_is_neg256(se->size))
+                    _tw=u256_add(_tw, se->size);
+            }
+        }
+        uint256_t _tot = u256_mul(_tw, u256_from_u64((uint64_t)bpw));
+        const uint64_t MAX_OUTPUT_BYTES = (uint64_t)1<<30;
+        if(u256_gt_signed(_tot, u256_from_u64(MAX_OUTPUT_BYTES))){
+            char _tb[96]; u256_to_pydec(_tot, _tb, sizeof(_tb));
+            axx_diagf(1, 1, " error - output size %s bytes exceeds maximum %llu."
+                            " Check for incorrect .ORG or address values.\n",
+                      _tb, (unsigned long long)MAX_OUTPUT_BYTES);
+            g_weo_st = NULL;
+            return;
+        }
+    }
 
     int ncs=0; WCS *csecs=NULL;
     if(st->sections.count==0){
@@ -19147,6 +19230,61 @@ static void m_bi_argc(MacroPP *mp, const char *name, int n, int lo, int hi,
         m_fail(mp, file, line, "%s() takes %d..%d argument(s), got %d", name, lo, hi, n);
 }
 
+/* Python の int(s, base) と同じ規則で文字列を整数にする（ASCII のみ）。
+   前後の空白、符号、基数 0 のときの 0x/0o/0b 接頭辞（基数 16/8/2 でも可）、
+   数字のあいだと接頭辞の直後の 1 個の `_` を認め、基数 0 の 10 進では
+   `012` のような先頭の 0 を拒む。axx.py の _bi_int() が呼ぶ int() と同じ
+   受理範囲である。返り値は 0 = 成功、1 = 数ではない、2 = 64 ビットを超える。 */
+static int m_py_int(const char *s, long long base, long long *out){
+    static const char ws[] = " \t\n\r\v\f\x1c\x1d\x1e\x1f";
+    if(base != 0 && (base < 2 || base > 36)) return 1;
+    for(const char *t = s; *t; t++) if((unsigned char)*t >= 0x80) return 1;
+    while(*s && strchr(ws, *s)) s++;
+    int neg = 0;
+    if(*s == '+' || *s == '-'){ neg = (*s == '-'); s++; }
+    int b = (int)base, prefixed = 0;
+    if(s[0] == '0'){
+        int c = tolower((unsigned char)s[1]);
+        if((c == 'x' && (b == 0 || b == 16)) || (c == 'o' && (b == 0 || b == 8))
+           || (c == 'b' && (b == 0 || b == 2))){
+            b = (c == 'x') ? 16 : (c == 'o') ? 8 : 2;
+            s += 2;
+            prefixed = 1;
+        }
+    }
+    int zero_only = 0;
+    if(b == 0){ b = 10; zero_only = (s[0] == '0'); }
+    unsigned long long acc = 0;
+    unsigned long long lim = neg ? (1ULL << 63) : (1ULL << 63) - 1;
+    int ndig = 0, last_us = 0, ov = 0;
+    if(prefixed && *s == '_'){ s++; last_us = 1; }
+    for(; *s; s++){
+        int c = (unsigned char)*s, d;
+        if(c == '_'){
+            if(last_us || ndig == 0) return 1;
+            last_us = 1;
+            continue;
+        }
+        if(c >= '0' && c <= '9') d = c - '0';
+        else if(isalpha(c)) d = tolower(c) - 'a' + 10;
+        else break;
+        if(d >= b) return 1;
+        if(zero_only && d != 0) return 1;
+        last_us = 0;
+        ndig++;
+        if(!ov){
+            if(acc > (lim - (unsigned long long)d) / (unsigned long long)b) ov = 1;
+            else acc = acc * (unsigned long long)b + (unsigned long long)d;
+        }
+    }
+    if(ndig == 0 || last_us) return 1;
+    while(*s && strchr(ws, *s)) s++;
+    if(*s) return 1;
+    if(ov) return 2;
+    *out = neg ? (long long)(0ULL - acc) : (long long)acc;
+    return 0;
+}
+
 static int m_builtin(MacroPP *mp, const char *name, MVal *a, int n,
                      const char *file, int line, MVal *out){
     if(strcmp(name, "len") == 0){
@@ -19161,26 +19299,36 @@ static int m_builtin(MacroPP *mp, const char *name, MVal *a, int n,
     }
     if(strcmp(name, "hex") == 0){
         m_bi_argc(mp, "hex", n, 1, 2, file, line);
-        long long v = mv_need_int(mp, a[0], file, line);
-        long long w = (n > 1) ? mv_need_int(mp, a[1], file, line) : 0;
-        if(w < 0 || w > 64) w = 0;
-        char buf[80];
-        unsigned long long uv = (v < 0) ? (unsigned long long)(-v) : (unsigned long long)v;
-        snprintf(buf, sizeof(buf), "%s%0*llx", v < 0 ? "-" : "", (int)w, uv);
-        *out = mv_str(marena_strdup(&mp->arena, buf));
+        if(a[0].is_str) m_fail(mp, file, line, "hex() needs an integer");
+        if(n > 1 && a[1].is_str) m_fail(mp, file, line, "hex() width must be an integer");
+        long long v = a[0].i;
+        long long w = (n > 1) ? a[1].i : 0;
+        char digits[24];
+        /* LLONG_MIN の符号反転は桁あふれするので、符号なしで反転する。 */
+        unsigned long long uv = (v < 0) ? 0ULL - (unsigned long long)v : (unsigned long long)v;
+        snprintf(digits, sizeof(digits), "%llx", uv);
+        long long dl = (long long)strlen(digits);
+        long long pad = (w > dl) ? w - dl : 0;   /* 幅に上限は無い（axx.py の _bi_hex() と同じ） */
+        char *buf = marena_alloc(&mp->arena, (size_t)(pad + dl + 2));
+        char *q = buf;
+        if(v < 0) *q++ = '-';
+        memset(q, '0', (size_t)pad); q += pad;
+        memcpy(q, digits, (size_t)dl + 1);
+        *out = mv_str(buf);
         return 1;
     }
     if(strcmp(name, "int") == 0){
         m_bi_argc(mp, "int", n, 1, 2, file, line);
         if(!a[0].is_str){ *out = a[0]; return 1; }
-        int base = (n > 1) ? (int)mv_need_int(mp, a[1], file, line) : 0;
-        errno = 0;
-        char *end = NULL;
-        long long v = strtoll(a[0].s ? a[0].s : "", &end, base);
-        while(end && (*end == ' ' || *end == '\t')) end++;
-        if(!end || end == a[0].s || *end)
+        if(n > 1 && a[1].is_str) m_fail(mp, file, line, "int() base must be an integer");
+        long long base = (n > 1) ? a[1].i : 0;
+        long long v = 0;
+        int rc = m_py_int(a[0].s ? a[0].s : "", base, &v);
+        if(rc == 1)
             m_fail(mp, file, line, "int(%s) is not a number",
                    m_pyrepr_a(mp, a[0].s ? a[0].s : ""));
+        if(rc == 2)
+            m_fail(mp, file, line, "macro expression: integer overflow (64-bit) in int()");
         *out = mv_int(v);
         return 1;
     }
@@ -19197,10 +19345,12 @@ static int m_builtin(MacroPP *mp, const char *name, MVal *a, int n,
         m_bi_argc(mp, "substr", n, 2, 3, file, line);
         char *t = mv_to_text(mp, a[0]);
         long long l = (long long)strlen(t);
-        long long st = mv_need_int(mp, a[1], file, line);
+        if(a[1].is_str) m_fail(mp, file, line, "substr() index must be an integer");
+        long long st = a[1].i;
         if(st < 0) st = 0;
         if(st > l) st = l;
-        long long cnt = (n > 2) ? mv_need_int(mp, a[2], file, line) : l - st;
+        if(n > 2 && a[2].is_str) m_fail(mp, file, line, "substr() length must be an integer");
+        long long cnt = (n > 2) ? a[2].i : l - st;
         if(cnt < 0) cnt = 0;
         if(st + cnt > l) cnt = l - st;
         *out = mv_str(marena_strndup(&mp->arena, t + st, (size_t)cnt));
@@ -19208,7 +19358,8 @@ static int m_builtin(MacroPP *mp, const char *name, MVal *a, int n,
     }
     if(strcmp(name, "abs") == 0){
         m_bi_argc(mp, "abs", n, 1, 1, file, line);
-        long long v = mv_need_int(mp, a[0], file, line);
+        if(a[0].is_str) m_fail(mp, file, line, "abs() needs an integer");
+        long long v = a[0].i;
         if(v == LLONG_MIN)
             m_fail(mp, file, line, "macro expression: integer overflow (64-bit) in abs()");
         *out = mv_int(v < 0 ? -v : v);
@@ -19631,8 +19782,13 @@ static char *m_format_value(MacroPP *mp, const char *body, const char *file, int
     const char *spec = (spec_at >= 0) ? body + spec_at + 1 : NULL;
     MVal v = m_eval(mp, expr, file, line);
     if(!spec) return mv_to_text(mp, v);
-    while(*spec == ' ') spec++;
-    if(!*spec) return mv_to_text(mp, v);
+    /* 前後の空白を落とす（axx.py の format_value() の spec.strip() と同じ）。 */
+    static const char ws[] = " \t\n\r\v\f\x1c\x1d\x1e\x1f";
+    while(*spec && strchr(ws, *spec)) spec++;
+    size_t sl = strlen(spec);
+    while(sl > 0 && strchr(ws, spec[sl-1])) sl--;
+    if(!sl) return mv_to_text(mp, v);
+    spec = marena_strndup(&mp->arena, spec, sl);
 
     MFmt f;
     int err = 0;
@@ -19642,8 +19798,8 @@ static char *m_format_value(MacroPP *mp, const char *body, const char *file, int
     else out = m_fmt_int(mp, v.i, &f, &err);
     if(err || !out){
         if(v.is_str)
-            m_fail(mp, file, line, "bad format spec ':%s' for value '%s'",
-                   spec, v.s ? v.s : "");
+            m_fail(mp, file, line, "bad format spec ':%s' for value %s",
+                   spec, m_pyrepr_a(mp, v.s ? v.s : ""));
         m_fail(mp, file, line, "bad format spec ':%s' for value %lld", spec, v.i);
     }
     return out;
@@ -20319,12 +20475,21 @@ static void m_do_include(MacroPP *mp, const char *name, const char *file, int li
     if(!realpath(path, real)){ snprintf(real, sizeof(real), "%s", path); }
     for(int i = 0; i < mp->ninc; i++)
         if(strcmp(mp->inc_stack[i], real) == 0)
-            m_fail(mp, file, line, "circular '!include' of \"%s\"", name);
+            m_fail(mp, file, line, "circular '!include' of %s", m_pyrepr_a(mp, name));
     if(mp->ninc >= MACRO_MAX_INCLUDE_DEPTH)
         m_fail(mp, file, line, "'!include' nested deeper than %d", MACRO_MAX_INCLUDE_DEPTH);
 
-    FILE *f = fopen(path, "rt");
-    if(!f) m_fail(mp, file, line, "cannot '!include' \"%s\": %s", name, strerror(errno));
+    /* ディレクトリは fopen() が通ってしまうことがあるので先に弾く
+       （axx.py の open() は IsADirectoryError になる）。 */
+    struct stat isb;
+    FILE *f = (stat(path, &isb) == 0 && S_ISDIR(isb.st_mode)) ? (errno = EISDIR, NULL)
+                                                              : fopen(path, "rt");
+    if(!f){
+        /* axx.py は OSError をそのまま文字列にするので、その体裁に合わせる。 */
+        char eb[1400];
+        axx_oserr_str(path, errno, eb, sizeof(eb));
+        m_fail(mp, file, line, "cannot '!include' %s: %s", m_pyrepr_a(mp, name), eb);
+    }
 
     MSrc src;
     m_read_lines(mp, f, path, &src);

@@ -50,12 +50,13 @@ gcc caxx.c -o caxx -lm -lquadmath -O2   # -lm は式評価器が、-lquadmath �
 
 この 2 つは同じ入力に対して**バイト単位で同一の出力**を生成することを意図しています。
 同梱のパターンファイル、テストソース、`test1` スクリプトはまさにそれを検証するために
-存在します。`test1` は同梱の 52 組のパターン/ソースの対を両方の実装でアセンブルし、
+存在します。`test1` は同梱の 54 組のパターン/ソースの対を両方の実装でアセンブルし、
 結果を `cmp` します。さらに `.textmode` の 5 組については、`-V` で標準出力へ流した
 翻訳テキストどうしも、`echo.axx` と `ministr.axx` の組については標準エラーへ出た `.echo` の行どうしも
+`cmp` します。回帰テストの `regress.axx` は `-V` のテキストと標準エラーの診断を
 `cmp` します。中核の 16 組は `-o`・`-m 3 -f 32 -o`・`-g -o`・`-v`・`-V` でも
 走らせるので、ELF32/ELF64 のオブジェクト、DWARF、リスティング、テキスト出力の
-経路も比較されます（全 186 組）。
+経路も比較されます（全 188 組）。
 
 **目次**
 
@@ -4013,6 +4014,10 @@ label3	2
 | アセンブラ行またはパターン行の形式が不正 | *Illegal syntax in assembler line or pattern line* |
 | EPIC テンプレートが設定されていない | *No VLIW instruction-set defined* |
 | VLIW パターンファイルの形式が不正 | 解釈中に報告される |
+| 出力（`-b` の生バイナリ、`-o` の ELF の中身）が 1 GiB を超える | *output size ... exceeds maximum*（たいていは `.org` の誤り） |
+
+ラベルの定義に失敗した行（上の表の最初の 2 つ）は、ラベルの後ろに書かれた命令も
+組みません。両実装はこの扱いをそろえており、エラーのあとに続く診断も一致します。
 
 `error_patterns` が発生させ、`;` の後のコードで選ばれるエラー:
 
@@ -4264,6 +4269,7 @@ x86_64 パターンファイルは
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | シンボル捕捉子 `!Y<集合>[<変数>]`（3.6.3 節）。テスト専用 |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | 本文行に書く `.echo`（3.14.1 節）。テスト専用 |
 | **ministr.axx** | 6.4 KB | 15 | **ministr.s** | ミニ言語の文字列・文字列の配列・`.for ... in 配列`（3.15 節）。テスト専用 |
+| **regress.axx** | 1.3 KB | 4 | **regress.s**、**regresserr.s** | 差分ファジングで見つけて直した両実装の食い違いの回帰テスト（入れ子の三項、桁の多い数値リテラル、pow の特別な場合、マクロ層の `int()`・`hex()`・書式指定、エラー後の診断）。テスト専用 |
 | **elftype.axx** | 1.5 KB | 20 | **elftype.s** | `.elftype` で決めた型名を `.reloc` / `.extern` / `.global` に書く（3.7.6 節）。テスト専用 |
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | 組み込みの表に無いマシン（EM_MSP430）の ELF 記述（3.7.7 節）。テスト専用 |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | リロケーション型の優先順位（既定 < パターンファイル < ソースファイル、3.7.8 節）。テスト専用 |
@@ -4301,7 +4307,7 @@ x86_64 パターンファイルは
 渡しません。`itanium.axx` も `vliw.s` を使い、
 `aarch64_logical_mini.axx` は `aarch64_logical_mini_demo.s` と対になります。
 
-`test1` は 52 組を両方の実装で実行し、`-b` の生バイナリを比較します。
+`test1` は 54 組を両方の実装で実行し、`-b` の生バイナリを比較します。
 `.textmode` を使う 5 組（`textmode.axx` / `8080toz80.axx` / `intel2att.axx` / `a64tox64_axx.axx` / `expcap.axx`）については、`-V` で
 標準出力へ流した翻訳テキストどうしも比較します。`elftype.axx` / `elftype.s` と
 `elfgen.axx` / `elfgen.s`、型の優先順位を見る `elfprio.axx` / `elfprio.s`、
@@ -4314,6 +4320,8 @@ x86_64 パターンファイルは
 オブジェクトどうしを比較します。`aarch64.axx`（`-m 183`）と `elfpair.axx` は
 `--elfdesc` の出力（記述を宣言に書き直したもの）どうしも比較します。
 `echo.axx` / `echo.s` と `ministr.axx` / `ministr.s` の組は標準エラーへ出た `.echo` の行どうしも比較します。
+回帰テストの `regress.axx` は、`regress.s` を `-V` のテキストで、`regresserr.s` を標準エラーの
+診断で比較します（後者はエラーになる行だけを集めたものです）。
 MIPS の 12 組（`mips.axx`・`mipsel.axx`・`mips64.axx`・`mips64el.axx` と `mips.s`・
 `mips_ase.s`、R6 の 4 つと `mipsr6.s`）は、`-b` に加えて `-o` の ELF オブジェクト
 （o32 は ELF32 の REL、n64 は ELF64 の RELA）どうしも比較します。
@@ -4323,7 +4331,7 @@ MIPS の 12 組（`mips.axx`・`mipsel.axx`・`mips64.axx`・`mips64el.axx` と 
 `-b` だけでは一度も比較されない経路を通すために、`-o`（ELF64）、`-m 3 -f 32 -o`
 （ELF32）、`-g -o`（DWARF 付き）、`-v`（リスティング）、`-V`（テキスト出力）
 でも走らせて突き合わせます。`elfcfi` は ELF32（`-m 3 -f 32`、REL）でも比較します。
-比較は全部で 186 組です。
+比較は全部で 188 組です。
 
 `-g` を比較するときは、両実装を必ず同じディレクトリで走らせてください。DWARF は
 `DW_AT_comp_dir` にカレントディレクトリを埋めるので、別の場所で走らせると中身が
@@ -4354,7 +4362,7 @@ MIPS の 12 組（`mips.axx`・`mipsel.axx`・`mips64.axx`・`mips64el.axx` と 
 | `format_of_exp_imp_file` | エクスポート/インポートファイル形式 |
 | `axx.1.gz` | man ページ |
 
-`test1` は同梱の 52 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
+`test1` は同梱の 54 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
 
 ### C.2 外部
 

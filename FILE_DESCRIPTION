@@ -84,6 +84,17 @@ ministr.axx                         pattern file for strings in the mini
                                     by its name, and replacing a range with
                                     `x[lo:hi] = v` (MINI.md)
 ministr.s                           test assemble file for ministr.axx
+regress.axx                         regression test for disagreements between
+                                    the two implementations found by
+                                    differential fuzzing (2026-10-07): nested
+                                    `?:`, long numeric literals, pow() special
+                                    cases, macro int()/hex()/format specs, and
+                                    the diagnostics after `**`/shift errors,
+                                    failed label definitions and .EQU across
+                                    sections
+regress.s                           test assemble file for regress.axx (-V text)
+regresserr.s                        test assemble file for regress.axx (the
+                                    diagnostics on standard error)
 unordered.axx                       pattern file for .unordered: directives that
                                     hold for the whole file wherever they are
                                     written, and .map tables per variable, so

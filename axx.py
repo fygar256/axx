@@ -251,16 +251,24 @@ def _ieee_pow(a, b):
     """
     a = float(a)
     b = float(b)
+    # 特別な場合は C99 附属書 F.9.4.4 の pow() に従う（caxx.c は libm の pow()
+    # をそのまま呼ぶ）。pow(x, ±0) と pow(+1, y) は nan が相手でも 1。
+    if b == 0.0 or a == 1.0:
+        return 1.0
     if math.isnan(a) or math.isnan(b):
         return float('nan')
+    # 指数が無限大のとき math.floor() は例外になるので、整数判定は有限に限る。
+    b_is_int = math.isfinite(b) and b == math.floor(b)
+    b_is_odd = b_is_int and math.fmod(b, 2.0) != 0.0
     if a == 0.0 and b < 0.0:
-        return float('inf')
-    if a < 0.0 and b != math.floor(b):
+        # pow(±0, 負の奇数) は ±inf、それ以外の負の指数は +inf。
+        return math.copysign(float('inf'), a) if b_is_odd else float('inf')
+    if a < 0.0 and math.isfinite(a) and math.isfinite(b) and not b_is_int:
         return math.copysign(float('nan'), -1.0)
     try:
         return math.pow(a, b)
     except OverflowError:
-        if a < 0.0 and int(b) % 2 != 0:
+        if a < 0.0 and b_is_odd:
             return float('-inf')
         return float('inf')
     except ValueError:
@@ -2964,33 +2972,64 @@ class _F128Eval:
         return i
 
     def _number(self, i):
-        """数字と `.` の並び（と指数）を集め、その先頭の正しい数を値にする。"""
+        """数字と `.` の並び（と指数）を集め、その先頭の正しい数を値にする。
+
+        綴りの長さに上限は置かない（caxx.c の f128_factor_fn() と同じ。以前は
+        78 文字で止め、残りを読めない文字として倍精度の経路へ落としていた）。
+        値の大きさが 4 倍精度の範囲をはるかに外れるときは、10 の累乗を正確に
+        作らずに inf / 0 と決める（`1e9999999` で何十秒も止まらないように）。
+        """
         s = self.s
         buf = []
-        while (s[i].isdigit() and s[i].isascii() or s[i] == '.') and len(buf) < 78:
+        while s[i].isdigit() and s[i].isascii() or s[i] == '.':
             buf.append(s[i])
             i += 1
-        if s[i] in 'eE' and len(buf) < 77:
+        if s[i] in 'eE':
             buf.append(s[i])
             i += 1
-            if s[i] in '+-' and len(buf) < 77:
+            if s[i] in '+-':
                 buf.append(s[i])
                 i += 1
-            while s[i].isdigit() and s[i].isascii() and len(buf) < 78:
+            while s[i].isdigit() and s[i].isascii():
                 buf.append(s[i])
                 i += 1
         b = ''.join(buf)
         m = self._NUM_RE.match(b).group(0)
         if not any(c.isdigit() for c in m):
             return (Fraction(0), False), i
+        ip, _, fp = m.partition('.')
+        if not (ip + fp).strip('0'):
+            return (Fraction(0), False), i
         rest = b[len(m):]
         exp = 0
-        em = re.match(r'[eE]([+-]?[0-9]+)', rest)
+        em = re.match(r'[eE]([+-]?)([0-9]+)', rest)
         if em:
-            exp = int(em.group(1))
-        q = Fraction(m if m[0] != '.' else '0' + m) if m not in ('.',) else Fraction(0)
-        if exp:
-            q *= Fraction(10) ** exp
+            ed = em.group(2).lstrip('0') or '0'
+            exp = int(ed) if len(ed) <= 9 else 10 ** 10
+            if em.group(1) == '-':
+                exp = -exp
+        # 値は [10**(e10-1), 10**e10) にある。4 倍精度の最大は約 1.19e4932、
+        # 最小の非正規化数の半分は約 3.2e-4966 なので、十分外側なら決め打つ。
+        ips = ip.lstrip('0')
+        e10 = len(ips) if ips else -(len(fp) - len(fp.lstrip('0')))
+        if e10 + exp > 4940:
+            return float('inf'), i
+        if e10 + exp < -4970:
+            return (Fraction(0), False), i
+        # 桁の多い綴りを int にするので、Python の 4300 桁の制限をこの間だけ外す。
+        _lim = getattr(sys, 'get_int_max_str_digits', None)
+        _old = _lim() if _lim else None
+        if _lim:
+            sys.set_int_max_str_digits(0)
+        try:
+            q = Fraction(int(ip + fp), 10 ** len(fp))
+        finally:
+            if _lim:
+                sys.set_int_max_str_digits(_old)
+        if exp > 0:
+            q *= 10 ** exp
+        elif exp < 0:
+            q /= 10 ** (-exp)
         return self._make(q), i
 
     def _factor(self, i):
@@ -4020,6 +4059,7 @@ class ExpressionEvaluator:
         浮動小数点モードでは _ieee_pow に渡して C 版と同じ nan を作る。
         整数モードでは、負の指数・1024 を超える指数・結果が 256bit の帯を
         超える場合をエラーにして 0 にする。連鎖した `**` で爆発させないため。
+        エラーのあとも残りの `**` を読み進める（caxx.c の expr_term0_0() と同じ）。
         """
         x, idx = self.factor(s, idx)
         while idx < len(s) and StringUtils.q(s, '**', idx):
@@ -4042,11 +4082,11 @@ class ExpressionEvaluator:
             if t_int < 0:
                 self.state.diag(" error - Negative exponent in ** expression; result set to 0.", set_error=True)
                 x = 0
-                break
+                continue
             if t_int > _EXP_MAX:
                 self.state.diag(f" error - Exponent {t_int} exceeds maximum {_EXP_MAX} in ** expression; result set to 0.", set_error=True)
                 x = 0
-                break
+                continue
 
             if t_int == 0:
                 x = 1
@@ -4062,13 +4102,13 @@ class ExpressionEvaluator:
                 self.state.diag(f" error - ** result would exceed {_EXP_RESULT_MAX_BITS} bits "
                          f"(chained exponentiation); result set to 0.", set_error=True)
                 x = 0
-                break
+                continue
             try:
                 x = x ** t_int
             except OverflowError:
                 self.state.diag(" error - ** result is too large to represent as a float; result set to 0.", set_error=True)
                 x = 0
-                break
+                continue
             if isinstance(x, float) and x.is_integer():
                 x = int(x)
         return x, idx
@@ -4140,7 +4180,11 @@ class ExpressionEvaluator:
         return x, idx
 
     def term2(self, s, idx):
-        """`<<` `>>`。負のシフト量と 65536 を超えるシフト量はエラーにする。"""
+        """`<<` `>>`。負のシフト量と 65536 を超えるシフト量はエラーにする。
+
+        エラーのあとも 0 にして残りのシフトを読み進める。途中で抜けると残りが
+        宙に浮き、行がパターンに当たらなくなる。caxx.c の expr_term2() と同じ。
+        """
         x, idx = self.term1(s, idx)
         _SHIFT_MAX = 65536
         while idx < len(s):
@@ -4158,11 +4202,11 @@ class ExpressionEvaluator:
                 if t < 0:
                     self.state.diag(f" error - negative shift count ({t}) in << expression.", set_error=True)
                     x = 0
-                    break
+                    continue
                 if t > _SHIFT_MAX:
                     self.state.diag(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in << expression.", set_error=True)
                     x = 0
-                    break
+                    continue
                 x <<= t
             elif StringUtils.q(s, '>>', idx):
                 t, idx = self.term1(s, idx + 2)
@@ -4178,11 +4222,11 @@ class ExpressionEvaluator:
                 if t < 0:
                     self.state.diag(f" error - negative shift count ({t}) in >> expression.", set_error=True)
                     x = 0
-                    break
+                    continue
                 if t > _SHIFT_MAX:
                     self.state.diag(f" error - shift count {t} exceeds maximum {_SHIFT_MAX} in >> expression.", set_error=True)
                     x = 0
-                    break
+                    continue
                 x >>= t
             else:
                 break
@@ -6383,7 +6427,7 @@ class PatternMatcher:
                         h = '0' * 32
                     else:
                         try:
-                            if not 0 < len(raw_text) < 1024:
+                            if not raw_text:
                                 raise ValueError
                             h = IEEE754Converter.decimal_eval_expr(raw_text)
                         except (ValueError, ZeroDivisionError):
@@ -12223,6 +12267,12 @@ def _bi_int(pp, a, pos):
     if isinstance(a[0], int):
         return a[0]
     base = a[1] if len(a) > 1 else 0
+    if not isinstance(base, int):
+        raise MacroError(f"{_fmt_pos(pos)}: int() base must be an integer")
+    # ASCII だけを数として読む。Python の int() は全角数字なども受け付けるが、
+    # caxx.c の m_py_int() は ASCII しか読まないので、受理範囲をそろえる。
+    if not a[0].isascii():
+        raise MacroError(f"{_fmt_pos(pos)}: int({a[0]!r}) is not a number")
     try:
         return int(a[0].strip(), base)
     except ValueError:
@@ -14281,6 +14331,20 @@ class Assembler:
                 self.sh_type    = sh_type
                 self.align      = align
                 self.entsize    = entsize
+
+        # 中身の大きさに -b と同じ上限を置く。`.org` の誤りで巨大なファイルを
+        # 書き始めないため。caxx.c の write_elf_obj() と同じ数え方である。
+        _MAX_OUTPUT_BYTES = 1 << 30
+        if self.state.sections:
+            _tot_w = sum(rl for _sn in self.state.sections
+                         for _rs, rl in self._section_word_ranges(_sn))
+        else:
+            _tot_w = max(buf.keys(), default=-1) + 1
+        if _tot_w * bpw > _MAX_OUTPUT_BYTES:
+            self.state.diag(f" error - output size {_tot_w * bpw} bytes exceeds maximum "
+                            f"{_MAX_OUTPUT_BYTES}. Check for incorrect .ORG or address "
+                            f"values.", set_error=True, force=True)
+            return
 
         csecs = []
         max_w = max(buf.keys(), default=-1)
