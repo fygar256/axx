@@ -3022,7 +3022,9 @@ class _F128Eval:
         if _lim:
             sys.set_int_max_str_digits(0)
         try:
-            q = Fraction(int(ip + fp), 10 ** len(fp))
+            # len() を int() で包む。Cython では 10 ** len(fp) が C の整数の
+            # べき乗になって float を返し、Fraction が TypeError を出す。
+            q = Fraction(int(ip + fp), 10 ** int(len(fp)))
         finally:
             if _lim:
                 sys.set_int_max_str_digits(_old)
