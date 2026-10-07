@@ -1,0 +1,1636 @@
+/* ===================================================================
+/* sparc.axx -- SPARC (V7 / V8 / V9, VIS 1-3) pattern file for axx
+/*
+/* Assemble with:
+/*   axx sparc.axx prog.s -b out.bin       (a flat binary)
+/*   axx sparc.axx prog.s -o out.o         (an ELF64 SPARCV9 object)
+/*
+/* The syntax is that of GNU as and llvm-mc (the Sun / SPARC
+/* International assembly language): registers with a %, the
+/* destination last, addresses in brackets ([%o0+8], [%o0+%o1],
+/* [%o0-8], [%o0], [100]), annulled and predicted branches written
+/* with suffixes (bne,a,pn %xcc, label). Nothing is put into a delay
+/* slot on its own: write the delay slot yourself. A comment starts
+/* with ';' (as in every axx source), not with '!'.
+/*
+/* Coverage
+/*   Integer      add sub and andn or orn xor xnor and their cc forms,
+/*                addx / addc / subx / subc and the cc forms (addxcc
+/*                addccc subxcc subccc), tagged add / sub (taddcc
+/*                tsubcc taddcctv tsubcctv), mulscc, umul smul umulcc
+/*                smulcc, udiv sdiv udivcc sdivcc, mulx sdivx udivx,
+/*                popc, the 32-bit and 64-bit shifts (sll srl sra
+/*                sllx srlx srax), sethi, save / restore (also with no
+/*                operands), the LEON umac / smac
+/*   Every 13-bit immediate and every displacement from a base
+/*   register ([%o0+%lo(sym)], jmpl %g1+%lo(sym)) takes the operand
+/*   modifiers %lo %hm %ulo %m44 %l44 %lox %pc10 %got10 %got13
+/*   %tgd_lo10 %tldm_lo10 %tldo_lox10 %tie_lo10 %tle_lox10
+/*   %gdop_lox10, and sethi takes %hi %hh %uhi %lm %h44 %hix %pc22
+/*   %got22 %tgd_hi22 %tldm_hi22 %tldo_hix22 %tie_hi22 %tle_hix22
+/*   %gdop_hix22. An address with no base register ([100]) and the
+/*   alternate space forms ([%o0+8] %asi) take a plain immediate.
+/*   Branches     Bicc (ba bn bne bnz be bz bg ble bge bl bgu bleu bcc
+/*                bgeu bcs blu bpos bneg bvc bvs, and b), the V9 BPcc
+/*                with %icc / %xcc, FBfcc and the V9 FBPfcc with
+/*                %fcc0-%fcc3, BPr (brz brlez brlz brnz brgz brgez and
+/*                bre brne), the V8 coprocessor branches (cba ... cb012),
+/*                all of them with ",a" and the V9 ones with ",pt" /
+/*                ",pn" (",pt" when neither is written); call, jmpl,
+/*                return, rett, the trap Tcc (ta ... tvs, with %icc /
+/*                %xcc), iprefetch
+/*   Conditional  movcc on %icc / %xcc / %fcc0-%fcc3 (mova ... movo,
+/*   moves        with the integer and the floating point condition
+/*                names), movr (movrz ... movrgez, movre, movrne),
+/*                fmovs / fmovd / fmovq cc and fmovr{s,d,q}
+/*   Load / store every integer load and store (ld lduw ldub lduh ldsb
+/*                ldsh ldsw ldx ldd ldtw st stw stuw stsw stb stub stsb
+/*                sth stuh stsh stx std sttw), ldstub, swap, the
+/*                alternate space forms with an ASI number or name
+/*                ([%o0+%o1] #ASI_P) or %asi ([%o0+8] %asi), casa /
+/*                casxa and cas casl casx casxl, prefetch / prefetcha
+/*                with the function names (#n_reads ... #one_write_strong)
+/*   FPU          the floating point loads and stores (ld ldd ldq st std
+/*                stq, the alternate forms lda ldda ldqa sta stda stqa),
+/*                ld / ldx / st / stx of %fsr, every FPop1 and FPop2:
+/*                fmov fneg fabs fsqrt fadd fsub fmul fdiv in s d q,
+/*                fsmuld fdmulq, every conversion (fitos ... fqtox),
+/*                fcmp / fcmpe in s d q with an optional %fcc, the
+/*                UltraSPARC Architecture 2007 fnadd fnmul fhadd fhsub
+/*                fnhadd fnsmuld, and the fused multiply-add of
+/*                SPARC64 VI / Oracle SPARC Architecture 2011 (fmadd
+/*                fmsub fnmsub fnmadd in s d)
+/*   Registers    rd / wr of %y %ccr %asi %tick %pc %fprs %asr0-%asr31
+/*   and control  and their names (%pcr %pic %dcr %gsr %set_softint
+/*                %clear_softint %softint %tick_cmpr %stick %stick_cmpr
+/*                ...), rdpr / wrpr of every privileged register, the
+/*                V8 rd / wr of %psr %wim %tbr, the UltraSPARC
+/*                Architecture 2005 rdhpr / wrhpr, membar (with the
+/*                #LoadLoad ... #Sync names), stbar, flush / iflush,
+/*                flushw, saved / restored / allclean / otherw /
+/*                normalw / invalw, done / retry, sir, illtrap / unimp,
+/*                the LEON pwr
+/*   VIS          VIS 1, 2 and 3: edge*, array*, alignaddr(l),
+/*                faligndata, the partitioned arithmetic, compares,
+/*                multiplies, pack / expand / merge, pdist(n), the 64
+/*                logical operations, fsrc / fnot / fzero / fone,
+/*                bmask / bshuffle, siam, shutdown, cmask*, fmean16,
+/*                fchksm16, fpadd64 / fpsub64, the saturating fpadds /
+/*                fpsubs, the partitioned shifts, fucmp*8, flcmps /
+/*                flcmpd, lzcnt, addxc / addxccc, umulxhi, xmulx /
+/*                xmulxhi, movdtox movstouw movstosw movxtod movwtos
+/*   V8           the coprocessor: ld / ldd / st / std of %c0-%c31, ld
+/*                / st of %csr, std of %cq, cpop1 / cpop2; std of %fq
+/*   Synthetic    nop, cmp, tst, mov (also from and to %y and the ASRs),
+/*                clr (register and memory: clr clrb clrh clrx), not,
+/*                neg, inc / inccc / dec / deccc, btst / bset / bclr /
+/*                btog, signx, clruw, jmp, call through a register,
+/*                ret, retl, set / setuw / setsw / setx (set, setuw
+/*                and setx take the sequences of llvm-mc, setsw that
+/*                of the SPARC V9 manual)
+/*
+/* Registers. %g0-%g7 %o0-%o7 %l0-%l7 %i0-%i7, %r0-%r31, %sp (= %o6)
+/* and %fp (= %i6). Floating point: %f0-%f31 for single precision,
+/* the even %f0-%f62 for double and %f0, %f4, ... %f60 for quad (V9
+/* folds the upper bit of a double / quad register number into bit
+/* 0 of the field, as the architecture defines). %fcc0-%fcc3, %icc,
+/* %xcc. The coprocessor registers are %c0-%c31.
+/*
+/* Names. The membar masks (#LoadLoad #StoreLoad #LoadStore
+/* #StoreStore #Lookaside #MemIssue #Sync), the prefetch functions
+/* (#n_reads #one_read #n_writes #one_write #page #unified
+/* #n_reads_strong #one_read_strong #n_writes_strong
+/* #one_write_strong) and the ASI names (#ASI_P #ASI_PRIMARY ...)
+/* are pattern-file symbols that an expression reads with '#', so they
+/* combine like numbers: membar #StoreLoad | #StoreStore. axx does not
+/* let an assembly-source label share a name with a symbol, so give
+/* labels names that none of these use (such as PAGE or SYNC).
+/*
+/* Data. BYTE (1 byte), HALF (2), WORD (4), XWORD and NWORD (8),
+/* SINGLE / FLOAT and DOUBLE, big-endian.
+/*
+/* ELF output (-o). An ELF64 object for SPARC V9 (EM_SPARCV9, RELA).
+/* Every operand that can hold a symbol carries its relocation type:
+/* R_SPARC_WDISP30 (call), WDISP22 (Bicc FBfcc CBccc), WDISP19 (BPcc
+/* FBPfcc), WDISP16 (BPr), 13 (a plain 13-bit immediate), 22 (a
+/* plain sethi operand), and for the modifiers LO10 HI22 HH22 HM10
+/* LM22 H44 M44 L44 HIX22 LOX10 PC10 PC22 GOT10 GOT13 GOT22, the TLS
+/* types and GOTDATA_HIX22 / LOX10. BYTE HALF WORD XWORD take 8 16 32
+/* and 64. The field is written as 0 and the addend goes in the RELA
+/* entry, as GNU as and llvm-mc do. A 32-bit object for the same
+/* relocations comes from -f 32 -m 18 (EM_SPARC32PLUS) or -m 2
+/* (EM_SPARC).
+/*
+/* set / setsw / setx of a label compute the address themselves and
+/* carry no relocation (one row cannot carry two types). They are
+/* exact in a flat binary (-b). In an object, write the pair yourself:
+/*   sethi %hi(sym),%o0  /  or %o0,%lo(sym),%o0
+/*
+/* Differences from llvm-mc, by design
+/*   - a plain sethi operand takes R_SPARC_22 (llvm-mc writes
+/*     R_SPARC_13, GNU as R_SPARC_22);
+/*   - %hix leaves the field 0 where llvm-mc fills it with ones; the
+/*     linker writes the whole field either way;
+/*   - the VIS operations whose operands are single precision
+/*     registers by the architecture (fexpand fpack16 fpackfix fpmerge
+/*     fmul8x16 fmul8x16au fmul8x16al fmuld8sux16 fmuld8ulx16 movstouw
+/*     movstosw flcmps fnadds fhadds ...) take single precision
+/*     register names, where llvm-mc 19 asks for double ones;
+/*   - xmulxhi is opf 0x116 and bshuffle 0x04c, as in the architecture
+/*     manuals and the GNU opcode table (llvm-mc 19 writes 0x117 and
+/*     0x01c);
+/*   - a branch or call to a label of the same section is a relocation
+/*     against that label, where llvm-mc and GNU as resolve it
+/*     themselves. Both link the same, but ld.lld 19 does not handle
+/*     R_SPARC_WDISP22 / WDISP19 / WDISP16: to link with it, define the
+/*     branch targets as constants (name: .equ $$), as bf_sparc.s does.
+/*
+/* Not covered: the TLS call / add annotations (add ...,
+/* %tgd_add(sym) and the like), the SPARC T4 / M7 crypto and VIS 4
+/* instructions, and the impdep1 / impdep2 raw forms.
+/*
+/* Verification. caxx and axx.py give identical output.
+/*   asmsrc/sparc_test.s   every row, about 2400 lines. The rows llvm-mc
+/*                         19 has are byte-for-byte identical to
+/*                         llvm-mc -triple=sparcv9 -mattr=+vis,+vis2,
+/*                         +vis3,+hard-quad-float,+hasumacsmac (the V8
+/*                         rows to -triple=sparc), apart from the two
+/*                         opf values above; the others (about 110 rows:
+/*                         %r names, fpadds / fpsubs, fucmp*8, movxtod /
+/*                         movwtos, the 2007 FPop1, fmadd ..., rdhpr /
+/*                         wrhpr, allclean ..., cpop1 / cpop2, ldtw /
+/*                         sttw, setuw / setsw, clrx / clruw, iprefetch,
+/*                         the data rows) were checked against encodings
+/*                         written out from the manuals
+/*   asmsrc/sparc_reloc.s  every relocating operand against an external
+/*                         symbol: the relocation entries (offset, type,
+/*                         symbol, addend) and the bytes are those of
+/*                         llvm-mc 19
+/*   asmsrc/bf_sparc.s     the Brainfuck interpreter, linked with ld.lld
+/*                         and run under qemu-sparc64 (bsd-user) with
+/*                         mandelbrot.bf: the output is that of bfi.s
+/*                         on x86_64
+/* The out-of-range errors (immediates, displacements, shift counts,
+/* ASIs, trap numbers, branch distances, odd registers for ldd / std)
+/* were checked in both implementations.
+/* =================================================================== */
+.bits::big::8
+
+.error::2::"branch target out of range or not a multiple of 4"
+.error::3::"immediate value out of range"
+.error::5::"register not allowed here (an even register is required)"
+.error::8::"displacement out of range"
+.error::10::"shift count out of range"
+.error::11::"ASI out of range (0-255)"
+
+/* ===================================================================
+/* ELF description
+/* =================================================================== */
+.elfbuiltin::0
+.elfmachine::43::SPARCV9
+.elfclass::64
+.elfrela::1
+
+/*     name             number  width  pc-relative */
+.elftype::r8::1::1
+.elftype::r16::2::2
+.elftype::r32::3::4
+.elftype::disp8::4::1::1
+.elftype::disp16::5::2::1
+.elftype::disp32::6::4::1
+.elftype::wdisp30::7::4::1
+.elftype::wdisp22::8::4::1
+.elftype::hi22::9::4
+.elftype::r22::10::4
+.elftype::r13::11::4
+.elftype::lo10::12::4
+.elftype::got10::13::4
+.elftype::got13::14::4
+.elftype::got22::15::4
+.elftype::pc10::16::4::1
+.elftype::pc22::17::4::1
+.elftype::r64::32::8
+.elftype::hh22::34::4
+.elftype::hm10::35::4
+.elftype::lm22::36::4
+.elftype::wdisp16::40::4::1
+.elftype::wdisp19::41::4::1
+.elftype::disp64::46::8::1
+.elftype::hix22::48::4
+.elftype::lox10::49::4
+.elftype::h44::50::4
+.elftype::m44::51::4
+.elftype::l44::52::4
+.elftype::tls_gd_hi22::56::4
+.elftype::tls_gd_lo10::57::4
+.elftype::tls_ldm_hi22::60::4
+.elftype::tls_ldm_lo10::61::4
+.elftype::tls_ldo_hix22::64::4
+.elftype::tls_ldo_lox10::65::4
+.elftype::tls_ie_hi22::67::4
+.elftype::tls_ie_lo10::68::4
+.elftype::tls_le_hix22::72::4
+.elftype::tls_le_lox10::73::4
+.elftype::gotdata_hix22::80::4
+.elftype::gotdata_lox10::81::4
+
+/* The fields, in the big-endian instruction word. */
+.elffield::wdisp30::0x3fffffff
+.elffield::wdisp22::0x3fffff
+.elffield::wdisp19::0x7ffff
+.elffield::wdisp16::0x303fff
+.elffield::r13::0x1fff
+.elffield::got13::0x1fff
+.elffield::l44::0xfff
+!def F22(ty) {
+.elffield::!{ty}::0x3fffff
+}
+!def F10(ty) {
+.elffield::!{ty}::0x3ff
+}
+!F22("hi22")
+!F22("r22")
+!F22("got22")
+!F22("pc22")
+!F22("hh22")
+!F22("lm22")
+!F22("hix22")
+!F22("h44")
+!F22("tls_gd_hi22")
+!F22("tls_ldm_hi22")
+!F22("tls_ldo_hix22")
+!F22("tls_ie_hi22")
+!F22("tls_le_hix22")
+!F22("gotdata_hix22")
+!F10("lo10")
+!F10("got10")
+!F10("pc10")
+!F10("hm10")
+!F10("lox10")
+!F10("m44")
+!F10("tls_gd_lo10")
+!F10("tls_ldm_lo10")
+!F10("tls_ldo_lox10")
+!F10("tls_ie_lo10")
+!F10("tls_le_lox10")
+!F10("gotdata_lox10")
+
+.elfwidth::8::r64
+.elfwidth::4::r32
+.elfwidth::2::r16
+.elfwidth::1::r8
+.elfextern::r64
+.elfdwarf::r64
+
+/* ===================================================================
+/* Registers and names
+/* =================================================================== */
+!def setr(p, n, b) {
+!local i = 0
+!while i < n {
+.setsym::!{p}!{i}::!{b + i}
+!set i = i + 1
+}
+}
+!setr("%G", 8, 0)
+!setr("%O", 8, 8)
+!setr("%L", 8, 16)
+!setr("%I", 8, 24)
+!setr("%R", 32, 0)
+.setsym::%SP::14
+.setsym::%FP::30
+
+/* %f0-%f31 hold their number; the even %f32-%f62 fold bit 5 into
+/* bit 0 (the V9 encoding of a double / quad register) */
+!def fregs() {
+!local i = 0
+!while i < 64 {
+!if i < 32 !then {
+.setsym::%F!{i}::!{i}
+} !elif (i & 1) == 0 !then {
+.setsym::%F!{i}::!{(i & 30) | 1}
+}
+!set i = i + 1
+}
+}
+!fregs()
+!setr("%C", 32, 0)
+
+/* lst(p, a, n, s): the list "p<a>,p<a+s>,..." of n names */
+!def lst(p, a, n, s) {
+!local r = ""
+!local i = 0
+!while i < n {
+!if i > 0 !then {
+!set r = r + ","
+}
+!set r = r + p + str(a + i * s)
+!set i = i + 1
+}
+!return r
+}
+.setsym::R_GPR::!{lst("%G", 0, 8, 1)},!{lst("%O", 0, 8, 1)},!{lst("%L", 0, 8, 1)},!{lst("%I", 0, 8, 1)},!{lst("%R", 0, 32, 1)},%SP,%FP
+.setsym::R_FPS::!{lst("%F", 0, 32, 1)}
+.setsym::R_FPD::!{lst("%F", 0, 32, 2)}
+.setsym::R_FPQ::!{lst("%F", 0, 16, 4)}
+.setsym::R_CPR::!{lst("%C", 0, 32, 1)}
+
+/* condition codes: the value is the cc2:cc1:cc0 of movcc and the
+/* opf_cc of fmovcc; the low two bits are the cc1:cc0 of BPcc, FBPfcc,
+/* Tcc and fcmp */
+.setsym::%ICC::4
+.setsym::%XCC::6
+!setr("%FCC", 4, 0)
+.setsym::R_ICC::%ICC,%XCC
+.setsym::R_FCC::!{lst("%FCC", 0, 4, 1)}
+.setsym::R_ANYCC::R_ICC,R_FCC
+
+/* ancillary state registers (rd / wr) */
+!setr("%ASR", 32, 0)
+.setsym::%Y::0
+.setsym::%CCR::2
+.setsym::%ASI::3
+.setsym::%TICK::4
+.setsym::%PC::5
+.setsym::%FPRS::6
+.setsym::%PCR::16
+.setsym::%PIC::17
+.setsym::%DCR::18
+.setsym::%GSR::19
+.setsym::%SET_SOFTINT::20
+.setsym::%SOFTINT_SET::20
+.setsym::%CLEAR_SOFTINT::21
+.setsym::%SOFTINT_CLR::21
+.setsym::%SOFTINT::22
+.setsym::%TICK_CMPR::23
+.setsym::%STICK::24
+.setsym::%SYS_TICK::24
+.setsym::%STICK_CMPR::25
+.setsym::%SYS_TICK_CMPR::25
+.setsym::R_ASR::!{lst("%ASR", 0, 32, 1)},%Y,%CCR,%ASI,%TICK,%PC,%FPRS,%PCR,%PIC,%DCR,%GSR,%SET_SOFTINT,%SOFTINT_SET,%CLEAR_SOFTINT,%SOFTINT_CLR,%SOFTINT,%TICK_CMPR,%STICK,%SYS_TICK,%STICK_CMPR,%SYS_TICK_CMPR
+
+/* privileged registers (rdpr / wrpr) */
+.setsym::%TPC::0
+.setsym::%TNPC::1
+.setsym::%TSTATE::2
+.setsym::%TT::3
+.setsym::%TBA::5
+.setsym::%PSTATE::6
+.setsym::%TL::7
+.setsym::%PIL::8
+.setsym::%CWP::9
+.setsym::%CANSAVE::10
+.setsym::%CANRESTORE::11
+.setsym::%CLEANWIN::12
+.setsym::%OTHERWIN::13
+.setsym::%WSTATE::14
+.setsym::%FQ::15
+.setsym::%GL::16
+.setsym::%VER::31
+.setsym::R_PR::%TPC,%TNPC,%TSTATE,%TT,%TICK,%TBA,%PSTATE,%TL,%PIL,%CWP,%CANSAVE,%CANRESTORE,%CLEANWIN,%OTHERWIN,%WSTATE,%FQ,%GL,%VER
+
+/* hyperprivileged registers (rdhpr / wrhpr) */
+.setsym::%HPSTATE::0
+.setsym::%HTSTATE::1
+.setsym::%HINTP::3
+.setsym::%HTBA::5
+.setsym::%HVER::6
+.setsym::%HSTICK_CMPR::31
+.setsym::%HSYS_TICK_CMPR::31
+.setsym::R_HPR::%HPSTATE,%HTSTATE,%HINTP,%HTBA,%HVER,%HSTICK_CMPR,%HSYS_TICK_CMPR
+
+/* the variables of the register classes
+/*   ra rb rd rt   integer rs1 rs2 rd, and the setx temporary
+/*   sa sb sc sd   single precision rs1 rs2 rs3 rd
+/*   da db dc dd   double precision
+/*   qa qb qd      quad precision
+/*   ic            %icc / %xcc        fc  %fcc0-%fcc3
+/*   mc            any of them (movcc, fmovcc)
+/*   ar pr hr      ASR, privileged and hyperprivileged registers
+/*   cd            coprocessor register */
+.check::ra::R_GPR
+.check::rb::R_GPR
+.check::rd::R_GPR
+.check::rt::R_GPR
+.check::sa::R_FPS
+.check::sb::R_FPS
+.check::sc::R_FPS
+.check::sd::R_FPS
+.check::da::R_FPD
+.check::db::R_FPD
+.check::dc::R_FPD
+.check::dd::R_FPD
+.check::qa::R_FPQ
+.check::qb::R_FPQ
+.check::qd::R_FPQ
+.check::ic::R_ICC
+.check::fc::R_FCC
+.check::mc::R_ANYCC
+.check::ar::R_ASR
+.check::pr::R_PR
+.check::hr::R_HPR
+.check::cd::R_CPR
+
+/* membar masks, prefetch functions and ASI names (read with #) */
+.setsym::LOADLOAD::0x01
+.setsym::STORELOAD::0x02
+.setsym::LOADSTORE::0x04
+.setsym::STORESTORE::0x08
+.setsym::LOOKASIDE::0x10
+.setsym::MEMISSUE::0x20
+.setsym::SYNC::0x40
+.setsym::N_READS::0
+.setsym::ONE_READ::1
+.setsym::N_WRITES::2
+.setsym::ONE_WRITE::3
+.setsym::PAGE::4
+.setsym::UNIFIED::17
+.setsym::N_READS_STRONG::20
+.setsym::ONE_READ_STRONG::21
+.setsym::N_WRITES_STRONG::22
+.setsym::ONE_WRITE_STRONG::23
+!def asi(n, v) {
+.setsym::ASI_!{n}::!{v}
+}
+!asi("N", 0x04)
+!asi("NUCLEUS", 0x04)
+!asi("NL", 0x0c)
+!asi("N_L", 0x0c)
+!asi("NUCLEUS_LITTLE", 0x0c)
+!asi("AIUP", 0x10)
+!asi("AS_IF_USER_PRIMARY", 0x10)
+!asi("AIUS", 0x11)
+!asi("AS_IF_USER_SECONDARY", 0x11)
+!asi("AIUPL", 0x18)
+!asi("AIUP_L", 0x18)
+!asi("AS_IF_USER_PRIMARY_LITTLE", 0x18)
+!asi("AIUSL", 0x19)
+!asi("AIUS_L", 0x19)
+!asi("AS_IF_USER_SECONDARY_LITTLE", 0x19)
+!asi("BLK_AIUP", 0x70)
+!asi("BLK_AIUS", 0x71)
+!asi("BLK_AIUPL", 0x78)
+!asi("BLK_AIUSL", 0x79)
+!asi("P", 0x80)
+!asi("PRIMARY", 0x80)
+!asi("S", 0x81)
+!asi("SECONDARY", 0x81)
+!asi("PNF", 0x82)
+!asi("PRIMARY_NOFAULT", 0x82)
+!asi("SNF", 0x83)
+!asi("SECONDARY_NOFAULT", 0x83)
+!asi("PL", 0x88)
+!asi("P_L", 0x88)
+!asi("PRIMARY_LITTLE", 0x88)
+!asi("SL", 0x89)
+!asi("S_L", 0x89)
+!asi("SECONDARY_LITTLE", 0x89)
+!asi("PNFL", 0x8a)
+!asi("PNF_L", 0x8a)
+!asi("PRIMARY_NOFAULT_LITTLE", 0x8a)
+!asi("SNFL", 0x8b)
+!asi("SNF_L", 0x8b)
+!asi("SECONDARY_NOFAULT_LITTLE", 0x8b)
+!asi("BLK_P", 0xf0)
+!asi("BLK_S", 0xf1)
+!asi("BLK_PL", 0xf8)
+!asi("BLK_SL", 0xf9)
+
+/* ===================================================================
+/* Word emitters (mini language, section 3.15)
+/* =================================================================== */
+.func w4(z)
+.return [(z >> 24) & 0xff, (z >> 16) & 0xff, (z >> 8) & 0xff, z & 0xff]
+.endfunc
+.func ew(z)
+.emit((z >> 24) & 0xff, (z >> 16) & 0xff, (z >> 8) & 0xff, z & 0xff)
+.return
+.endfunc
+
+/* sethi / or words */
+.func sethi(rd, v)
+.return 0x01000000 | (rd << 25) | ((v >> 10) & 0x3fffff)
+.endfunc
+.func orlo(rd, rs, v)
+.return 0x80102000 | (rd << 25) | (rs << 14) | (v & 0x3ff)
+.endfunc
+.func ori(rd, rs, v)
+.return 0x80102000 | (rd << 25) | (rs << 14) | (v & 0x1fff)
+.endfunc
+
+/* set / setuw: the 32-bit value zero extended (SPARC V9 manual G.3,
+/* and llvm-mc) -- or alone when it fits 0..4095, sethi alone when the
+/* low 10 bits are zero, sethi + or otherwise */
+.func setuw(rd, v)
+.if v < -2147483648 || v > 4294967295 .then
+.raise 3
+.return
+.endif
+v = v & 0xffffffff
+.if v < 4096 .then
+w = .call ori(rd, 0, v)
+.call ew(w)
+.return
+.endif
+w = .call sethi(rd, v)
+.call ew(w)
+.if (v & 0x3ff) != 0 .then
+w = .call orlo(rd, rd, v)
+.call ew(w)
+.endif
+.return
+.endfunc
+
+/* setsw: the 32-bit value sign extended (SPARC V9 manual G.3) */
+.func setsw(rd, v)
+.if v < -2147483648 || v > 4294967295 .then
+.raise 3
+.return
+.endif
+v = ((v & 0xffffffff) ^ 0x80000000) - 0x80000000
+.if v >= -4096 && v < 4096 .then
+w = .call ori(rd, 0, v)
+.call ew(w)
+.return
+.endif
+w = .call sethi(rd, v)
+.call ew(w)
+.if (v & 0x3ff) != 0 .then
+w = .call orlo(rd, rd, v)
+.call ew(w)
+.endif
+.if v < 0 .then
+.call ew(0x81380000 | (rd << 25) | (rd << 14))
+.endif
+.return
+.endfunc
+
+/* setx value, rtmp, rd: the expansion of llvm-mc -- or alone for a
+/* 13-bit signed value, sethi + or for a 32-bit unsigned one, and
+/* otherwise sethi %hi / or %lo into rd, sethi %hh / or %hm into rtmp,
+/* sllx rtmp,32 and or rtmp,rd,rd */
+.func setx(rd, rt, v)
+.if v < -9223372036854775808 || v > 18446744073709551615 .then
+.raise 3
+.return
+.endif
+v = ((v & 0xffffffffffffffff) ^ 0x8000000000000000) - 0x8000000000000000
+.if v >= -4096 && v < 4096 .then
+w = .call ori(rd, 0, v)
+.call ew(w)
+.return
+.endif
+w = .call sethi(rd, v)
+.call ew(w)
+w = .call orlo(rd, rd, v)
+.call ew(w)
+.if v >= 0 && v <= 4294967295 .then
+.return
+.endif
+.call ew(0x01000000 | (rt << 25) | ((v >> 42) & 0x3fffff))
+w = .call orlo(rt, rt, v >> 32)
+.call ew(w)
+.call ew(0x81283020 | (rt << 25) | (rt << 14))
+.call ew(0x80100000 | (rd << 25) | (rt << 14) | rd)
+.return
+.endfunc
+
+/* ===================================================================
+/* Row generators (macro layer, section 7)
+/*
+/* Z emits one row: the mnemonic, the operand text, the error list,
+/* the constant part of the word and the operand fields or'ed into it.
+/* =================================================================== */
+!def Z(nm, ops, er, base, fx) {
+!local head = nm
+!if ops != "" !then {
+!set head = nm + " " + ops
+}
+!if er == "" !then {
+!{head} :: .call w4(0x!{base:08x}!{fx})
+} !else {
+!{head} :: !{er} :: .call w4(0x!{base:08x}!{fx})
+}
+}
+
+/* the range tests */
+!def ES13() {
+!return "v<-4096||v>4095;3"
+}
+!def ED13() {
+!return "v<-4096||v>4095;8"
+}
+!def EASI() {
+!return "w<0||w>255;11"
+}
+/* J(a, b): two error lists joined */
+!def J(a, b) {
+!if a == "" !then {
+!return b
+}
+!if b == "" !then {
+!return a
+}
+!return a + "," + b
+}
+
+/* the operand modifiers of a 13-bit field. M13 emits one row with
+/* the operand text pre + %md(!v) + post; val is the value the field
+/* takes in a flat binary (the GOT and TLS ones are known only to the
+/* linker and give 0 there). xer is an error list for the other
+/* operands. */
+!def M13(nm, pre, post, base, fx, xer, md, ty, val) {
+.reloc::v::!{ty}
+!Z(nm, pre + "%" + md + "(!v)" + post, xer, base, fx + "|0x2000|((" + val + ")&0x1fff)")
+.clrreloc::v
+}
+/* I13: every form of a 13-bit signed immediate at one place: !v
+/* (R_SPARC_13 against a symbol, range error er) and the modifiers;
+/* I13N: !v alone */
+!def I13N(nm, pre, post, base, fx, er, xer) {
+.reloc::v::r13
+!Z(nm, pre + "!v" + post, J(xer, er), base, fx + "|0x2000|(v&0x1fff)")
+.clrreloc::v
+}
+!def I13(nm, pre, post, base, fx, er, xer) {
+!I13N(nm, pre, post, base, fx, er, xer)
+!M13(nm, pre, post, base, fx, xer, "LO", "lo10", "v&0x3ff")
+!M13(nm, pre, post, base, fx, xer, "HM", "hm10", "(v>>32)&0x3ff")
+!M13(nm, pre, post, base, fx, xer, "ULO", "hm10", "(v>>32)&0x3ff")
+!M13(nm, pre, post, base, fx, xer, "M44", "m44", "(v>>12)&0x3ff")
+!M13(nm, pre, post, base, fx, xer, "L44", "l44", "v&0xfff")
+!M13(nm, pre, post, base, fx, xer, "LOX", "lox10", "(v&0x3ff)|0x1c00")
+!M13(nm, pre, post, base, fx, xer, "PC10", "pc10", "(v-$$)&0x3ff")
+!M13(nm, pre, post, base, fx, xer, "GOT10", "got10", "v&0")
+!M13(nm, pre, post, base, fx, xer, "GOT13", "got13", "v&0")
+!M13(nm, pre, post, base, fx, xer, "TGD\\_LO10", "tls_gd_lo10", "v&0")
+!M13(nm, pre, post, base, fx, xer, "TLDM\\_LO10", "tls_ldm_lo10", "v&0")
+!M13(nm, pre, post, base, fx, xer, "TLDO\\_LOX10", "tls_ldo_lox10", "v&0")
+!M13(nm, pre, post, base, fx, xer, "TIE\\_LO10", "tls_ie_lo10", "v&0")
+!M13(nm, pre, post, base, fx, xer, "TLE\\_LOX10", "tls_le_lox10", "v&0")
+!M13(nm, pre, post, base, fx, xer, "GDOP\\_LOX10", "gotdata_lox10", "v&0")
+}
+
+/* reg_or_imm at one place: a register rb, or a 13-bit immediate */
+!def RI(nm, pre, post, base, fx) {
+!Z(nm, pre + "rb" + post, "", base, fx + "|rb")
+!I13(nm, pre, post, base, fx, ES13(), "")
+}
+
+/* an address without brackets (jmpl, return, rett, flush): ra+rb,
+/* ra, ra+imm (and so ra-imm) and, when im is 1, a bare imm (the
+/* modifiers go with a base register: [%o0+%lo(sym)]) */
+!def AD(nm, pre, post, base, fx, xer, im) {
+!Z(nm, pre + "ra+rb" + post, xer, base, fx + "|(ra<<14)|rb")
+!Z(nm, pre + "ra" + post, xer, base, fx + "|(ra<<14)")
+!I13(nm, pre + "ra+", post, base, fx + "|(ra<<14)", ED13(), xer)
+!if im !then {
+!I13N(nm, pre, post, base, fx, ED13(), xer)
+}
+}
+
+/* a memory address [ ... ] of a load or store */
+!def MA(nm, pre, post, base, fx, xer) {
+!AD(nm, pre + "[", "]" + post, base, fx, xer, 1)
+}
+
+/* the alternate space address: [ra+rb] asi and [ra] asi with an ASI
+/* number or name in the instruction, and [ra+imm] %asi, [ra] %asi and
+/* [imm] %asi with the ASI from the %asi register (a plain immediate:
+/* the operand modifiers are not taken here) */
+!def MAA(nm, pre, post, base, fx, xer) {
+!Z(nm, pre + "[ra+rb]!w" + post, J(xer, EASI()), base, fx + "|(ra<<14)|((w&0xff)<<5)|rb")
+!Z(nm, pre + "[ra]!w" + post, J(xer, EASI()), base, fx + "|(ra<<14)|((w&0xff)<<5)")
+!Z(nm, pre + "[ra]%ASI" + post, xer, base, fx + "|(ra<<14)|0x2000")
+!I13N(nm, pre + "[ra+", "]%ASI" + post, base, fx + "|(ra<<14)", ED13(), xer)
+!I13N(nm, pre + "[", "]%ASI" + post, base, fx, ED13(), xer)
+}
+
+/* ===================================================================
+/* Integer arithmetic and logic: nm rs1, reg_or_imm, rd
+/* =================================================================== */
+!def ALU(nm, op3) {
+!RI(nm, "ra,", ",rd", 0x80000000 | (op3 << 19), "|(rd<<25)|(ra<<14)")
+}
+!ALU("ADD", 0x00)
+!ALU("AND", 0x01)
+!ALU("OR", 0x02)
+!ALU("XOR", 0x03)
+!ALU("SUB", 0x04)
+!ALU("ANDN", 0x05)
+!ALU("ORN", 0x06)
+!ALU("XNOR", 0x07)
+!ALU("ADDX", 0x08)
+!ALU("ADDC", 0x08)
+!ALU("MULX", 0x09)
+!ALU("UMUL", 0x0a)
+!ALU("SMUL", 0x0b)
+!ALU("SUBX", 0x0c)
+!ALU("SUBC", 0x0c)
+!ALU("UDIVX", 0x0d)
+!ALU("UDIV", 0x0e)
+!ALU("SDIV", 0x0f)
+!ALU("ADDCC", 0x10)
+!ALU("ANDCC", 0x11)
+!ALU("ORCC", 0x12)
+!ALU("XORCC", 0x13)
+!ALU("SUBCC", 0x14)
+!ALU("ANDNCC", 0x15)
+!ALU("ORNCC", 0x16)
+!ALU("XNORCC", 0x17)
+!ALU("ADDXCC", 0x18)
+!ALU("ADDCCC", 0x18)
+!ALU("UMULCC", 0x1a)
+!ALU("SMULCC", 0x1b)
+!ALU("SUBXCC", 0x1c)
+!ALU("SUBCCC", 0x1c)
+!ALU("UDIVCC", 0x1e)
+!ALU("SDIVCC", 0x1f)
+!ALU("TADDCC", 0x20)
+!ALU("TSUBCC", 0x21)
+!ALU("TADDCCTV", 0x22)
+!ALU("TSUBCCTV", 0x23)
+!ALU("MULSCC", 0x24)
+!ALU("SDIVX", 0x2d)
+!ALU("SAVE", 0x3c)
+!ALU("RESTORE", 0x3d)
+/* LEON: multiply-accumulate */
+!ALU("UMAC", 0x3e)
+!ALU("SMAC", 0x3f)
+SAVE :: .call w4(0x81e00000)
+RESTORE :: .call w4(0x81e80000)
+
+/* population count: popc reg_or_imm, rd (rs1 = 0) */
+!RI("POPC", "", ",rd", 0x81700000, "|(rd<<25)")
+
+/* shifts: the count is 5 bits (sll srl sra) or 6 bits (x = 1) */
+!def SH(nm, op3, x) {
+!local b = 0x80000000 | (op3 << 19) | (x << 12)
+!Z(nm, "ra,rb,rd", "", b, "|(rd<<25)|(ra<<14)|rb")
+!if x !then {
+!Z(nm, "ra,!v,rd", "v<0||v>63;10", b, "|(rd<<25)|(ra<<14)|0x2000|(v&63)")
+} !else {
+!Z(nm, "ra,!v,rd", "v<0||v>31;10", b, "|(rd<<25)|(ra<<14)|0x2000|(v&31)")
+}
+}
+!SH("SLL", 0x25, 0)
+!SH("SRL", 0x26, 0)
+!SH("SRA", 0x27, 0)
+!SH("SLLX", 0x25, 1)
+!SH("SRLX", 0x26, 1)
+!SH("SRAX", 0x27, 1)
+
+/* sethi: a plain 22-bit value (R_SPARC_22 against a symbol) and the
+/* modifiers of a 22-bit field */
+.reloc::v::r22
+SETHI !v,rd :: v<0||v>0x3fffff;3 :: .call w4(0x01000000|(rd<<25)|(v&0x3fffff))
+.clrreloc::v
+!def M22(md, ty, val) {
+.reloc::v::!{ty}
+SETHI %!{md}(!v),rd :: .call w4(0x01000000|(rd<<25)|((!{val})&0x3fffff))
+.clrreloc::v
+}
+!M22("HI", "hi22", "v>>10")
+!M22("HH", "hh22", "v>>42")
+!M22("UHI", "hh22", "v>>42")
+!M22("LM", "lm22", "v>>10")
+!M22("H44", "h44", "v>>22")
+!M22("HIX", "hix22", "(~v)>>10")
+!M22("PC22", "pc22", "(v-$$)>>10")
+!M22("GOT22", "got22", "v&0")
+!M22("TGD\\_HI22", "tls_gd_hi22", "v&0")
+!M22("TLDM\\_HI22", "tls_ldm_hi22", "v&0")
+!M22("TLDO\\_HIX22", "tls_ldo_hix22", "v&0")
+!M22("TIE\\_HI22", "tls_ie_hi22", "v&0")
+!M22("TLE\\_HIX22", "tls_le_hix22", "v&0")
+!M22("GDOP\\_HIX22", "gotdata_hix22", "v&0")
+NOP :: .call w4(0x01000000)
+
+/* ===================================================================
+/* Branches
+/* =================================================================== */
+!def EB(bits) {
+!local m = 1 << (bits + 1)
+!return "(v-$$)>" + str(m - 4) + "||(v-$$)<-" + str(m) + "||((v-$$)&3)!=0;2"
+}
+!def D(bits) {
+!return "|(((v-$$)>>2)&0x" + hex((1 << bits) - 1) + ")"
+}
+
+/* Bicc (op2 2, disp22) and BPcc (op2 1, %icc / %xcc, disp19) */
+!def BI(nm, c) {
+!local b = (c << 25) | (2 << 22)
+.reloc::v::wdisp22
+!Z(nm, "!v", EB(22), b, D(22))
+!Z(nm + ",A", "!v", EB(22), b | 0x20000000, D(22))
+.clrreloc::v
+!local p = (c << 25) | (1 << 22)
+!local f = "|((ic&3)<<20)" + D(19)
+.reloc::v::wdisp19
+!Z(nm, "ic,!v", EB(19), p | 0x80000, f)
+!Z(nm + ",PT", "ic,!v", EB(19), p | 0x80000, f)
+!Z(nm + ",PN", "ic,!v", EB(19), p, f)
+!Z(nm + ",A", "ic,!v", EB(19), p | 0x20080000, f)
+!Z(nm + ",A,PT", "ic,!v", EB(19), p | 0x20080000, f)
+!Z(nm + ",A,PN", "ic,!v", EB(19), p | 0x20000000, f)
+.clrreloc::v
+}
+!BI("BA", 8)
+!BI("B", 8)
+!BI("BN", 0)
+!BI("BNE", 9)
+!BI("BNZ", 9)
+!BI("BE", 1)
+!BI("BZ", 1)
+!BI("BG", 10)
+!BI("BLE", 2)
+!BI("BGE", 11)
+!BI("BL", 3)
+!BI("BGU", 12)
+!BI("BLEU", 4)
+!BI("BCC", 13)
+!BI("BGEU", 13)
+!BI("BCS", 5)
+!BI("BLU", 5)
+!BI("BPOS", 14)
+!BI("BNEG", 6)
+!BI("BVC", 15)
+!BI("BVS", 7)
+
+/* FBfcc (op2 6, disp22) and FBPfcc (op2 5, %fcc0-%fcc3, disp19) */
+!def FB(nm, c) {
+!local b = (c << 25) | (6 << 22)
+.reloc::v::wdisp22
+!Z(nm, "!v", EB(22), b, D(22))
+!Z(nm + ",A", "!v", EB(22), b | 0x20000000, D(22))
+.clrreloc::v
+!local p = (c << 25) | (5 << 22)
+!local f = "|((fc&3)<<20)" + D(19)
+.reloc::v::wdisp19
+!Z(nm, "fc,!v", EB(19), p | 0x80000, f)
+!Z(nm + ",PT", "fc,!v", EB(19), p | 0x80000, f)
+!Z(nm + ",PN", "fc,!v", EB(19), p, f)
+!Z(nm + ",A", "fc,!v", EB(19), p | 0x20080000, f)
+!Z(nm + ",A,PT", "fc,!v", EB(19), p | 0x20080000, f)
+!Z(nm + ",A,PN", "fc,!v", EB(19), p | 0x20000000, f)
+.clrreloc::v
+}
+!FB("FBA", 8)
+!FB("FBN", 0)
+!FB("FBU", 7)
+!FB("FBG", 6)
+!FB("FBUG", 5)
+!FB("FBL", 4)
+!FB("FBUL", 3)
+!FB("FBLG", 2)
+!FB("FBNE", 1)
+!FB("FBNZ", 1)
+!FB("FBE", 9)
+!FB("FBZ", 9)
+!FB("FBUE", 10)
+!FB("FBGE", 11)
+!FB("FBUGE", 12)
+!FB("FBLE", 13)
+!FB("FBULE", 14)
+!FB("FBO", 15)
+
+/* BPr (op2 3): rs1 and a 16-bit displacement split d16hi:d16lo */
+!def BR(nm, c) {
+!local p = (c << 25) | (3 << 22)
+!local f = "|(ra<<14)|(((((v-$$)>>2)>>14)&3)<<20)|(((v-$$)>>2)&0x3fff)"
+.reloc::v::wdisp16
+!Z(nm, "ra,!v", EB(16), p | 0x80000, f)
+!Z(nm + ",PT", "ra,!v", EB(16), p | 0x80000, f)
+!Z(nm + ",PN", "ra,!v", EB(16), p, f)
+!Z(nm + ",A", "ra,!v", EB(16), p | 0x20080000, f)
+!Z(nm + ",A,PT", "ra,!v", EB(16), p | 0x20080000, f)
+!Z(nm + ",A,PN", "ra,!v", EB(16), p | 0x20000000, f)
+.clrreloc::v
+}
+!BR("BRZ", 1)
+!BR("BRE", 1)
+!BR("BRLEZ", 2)
+!BR("BRLZ", 3)
+!BR("BRNZ", 5)
+!BR("BRNE", 5)
+!BR("BRGZ", 6)
+!BR("BRGEZ", 7)
+
+/* the V8 coprocessor branches CBccc (op2 7, disp22) */
+!def CB(nm, c) {
+!local b = (c << 25) | (7 << 22)
+.reloc::v::wdisp22
+!Z(nm, "!v", EB(22), b, D(22))
+!Z(nm + ",A", "!v", EB(22), b | 0x20000000, D(22))
+.clrreloc::v
+}
+!CB("CBA", 8)
+!CB("CBN", 0)
+!CB("CB3", 7)
+!CB("CB2", 6)
+!CB("CB23", 5)
+!CB("CB1", 4)
+!CB("CB13", 3)
+!CB("CB12", 2)
+!CB("CB123", 1)
+!CB("CB0", 9)
+!CB("CB03", 10)
+!CB("CB02", 11)
+!CB("CB023", 12)
+!CB("CB01", 13)
+!CB("CB013", 14)
+!CB("CB012", 15)
+
+/* iprefetch label: bn,a,pt %xcc,label (SPARC V9 manual G.3) */
+.reloc::v::wdisp19
+!Z("IPREFETCH", "!v", EB(19), 0x20680000, D(19))
+.clrreloc::v
+
+/* call: disp30 (R_SPARC_WDISP30), or through a register (jmpl ...,%o7) */
+.reloc::v::wdisp30
+!Z("CALL", "!v", EB(30), 0x40000000, D(30))
+.clrreloc::v
+!AD("CALL", "", "", 0x9fc00000, "", "", 0)
+
+/* jmpl address, rd; jmp address; return; rett */
+!AD("JMPL", "", ",rd", 0x81c00000, "|(rd<<25)", "", 1)
+!AD("JMP", "", "", 0x81c00000, "", "", 1)
+!AD("RETURN", "", "", 0x81c80000, "", "", 1)
+!AD("RETT", "", "", 0x81c80000, "", "", 1)
+RET :: .call w4(0x81c7e008)
+RETL :: .call w4(0x81c3e008)
+
+/* Tcc: t<cond> [%icc|%xcc,] trap number, with the number given as
+/* imm, rs2, rs1+rs2 or rs1+imm (0-255, the UltraSPARC Architecture
+/* range; V8 and V9 use 0-127) */
+!def TC(nm, c) {
+!local b = 0x81d00000 | (c << 25)
+!Z(nm, "!v", "v<0||v>255;3", b, "|0x2000|(v&0xff)")
+!Z(nm, "rb", "", b, "|rb")
+!Z(nm, "ra+rb", "", b, "|(ra<<14)|rb")
+!Z(nm, "ra+!v", "v<0||v>255;3", b, "|(ra<<14)|0x2000|(v&0xff)")
+!Z(nm, "ic,!v", "v<0||v>255;3", b, "|((ic&3)<<11)|0x2000|(v&0xff)")
+!Z(nm, "ic,rb", "", b, "|((ic&3)<<11)|rb")
+!Z(nm, "ic,ra+rb", "", b, "|((ic&3)<<11)|(ra<<14)|rb")
+!Z(nm, "ic,ra+!v", "v<0||v>255;3", b, "|((ic&3)<<11)|(ra<<14)|0x2000|(v&0xff)")
+}
+!TC("TA", 8)
+!TC("TN", 0)
+!TC("TNE", 9)
+!TC("TNZ", 9)
+!TC("TE", 1)
+!TC("TZ", 1)
+!TC("TG", 10)
+!TC("TLE", 2)
+!TC("TGE", 11)
+!TC("TL", 3)
+!TC("TGU", 12)
+!TC("TLEU", 4)
+!TC("TCC", 13)
+!TC("TGEU", 13)
+!TC("TCS", 5)
+!TC("TLU", 5)
+!TC("TPOS", 14)
+!TC("TNEG", 6)
+!TC("TVC", 15)
+!TC("TVS", 7)
+
+/* ===================================================================
+/* Conditional moves
+/* =================================================================== */
+/* movcc: the cc variable (ic or fc) gives cc2 (bit 18) and cc1:cc0 */
+!def MV(nm, c, cv) {
+!local b = 0x81600000 | (c << 14)
+!local f = "|(rd<<25)|((" + cv + "&4)<<16)|((" + cv + "&3)<<11)"
+!Z(nm, cv + ",rb,rd", "", b, f + "|rb")
+!Z(nm, cv + ",!v,rd", "v<-1024||v>1023;3", b, f + "|0x2000|(v&0x7ff)")
+}
+!def MVI(nm, c) {
+!MV(nm, c, "ic")
+}
+!def MVF(nm, c) {
+!MV(nm, c, "fc")
+}
+!MVI("MOVA", 8)
+!MVI("MOVN", 0)
+!MVI("MOVNE", 9)
+!MVI("MOVNZ", 9)
+!MVI("MOVE", 1)
+!MVI("MOVZ", 1)
+!MVI("MOVG", 10)
+!MVI("MOVLE", 2)
+!MVI("MOVGE", 11)
+!MVI("MOVL", 3)
+!MVI("MOVGU", 12)
+!MVI("MOVLEU", 4)
+!MVI("MOVCC", 13)
+!MVI("MOVGEU", 13)
+!MVI("MOVCS", 5)
+!MVI("MOVLU", 5)
+!MVI("MOVPOS", 14)
+!MVI("MOVNEG", 6)
+!MVI("MOVVC", 15)
+!MVI("MOVVS", 7)
+!MVF("MOVA", 8)
+!MVF("MOVN", 0)
+!MVF("MOVU", 7)
+!MVF("MOVG", 6)
+!MVF("MOVUG", 5)
+!MVF("MOVL", 4)
+!MVF("MOVUL", 3)
+!MVF("MOVLG", 2)
+!MVF("MOVNE", 1)
+!MVF("MOVNZ", 1)
+!MVF("MOVE", 9)
+!MVF("MOVZ", 9)
+!MVF("MOVUE", 10)
+!MVF("MOVGE", 11)
+!MVF("MOVUGE", 12)
+!MVF("MOVLE", 13)
+!MVF("MOVULE", 14)
+!MVF("MOVO", 15)
+
+/* fmovcc: opf_cc = the cc value (fcc0-3, icc 4, xcc 6), opf_low
+/* 1 / 2 / 3 for s / d / q */
+!def FMV(nm, c, cv) {
+!local b = 0x81a80000 | (c << 14)
+!local f = "|((" + cv + "&7)<<11)"
+!Z("FMOVS" + nm, cv + ",sb,sd", "", b | (1 << 5), f + "|(sd<<25)|sb")
+!Z("FMOVD" + nm, cv + ",db,dd", "", b | (2 << 5), f + "|(dd<<25)|db")
+!Z("FMOVQ" + nm, cv + ",qb,qd", "", b | (3 << 5), f + "|(qd<<25)|qb")
+}
+!def FMVI(nm, c) {
+!FMV(nm, c, "ic")
+}
+!def FMVF(nm, c) {
+!FMV(nm, c, "fc")
+}
+!FMVI("A", 8)
+!FMVI("N", 0)
+!FMVI("NE", 9)
+!FMVI("NZ", 9)
+!FMVI("E", 1)
+!FMVI("Z", 1)
+!FMVI("G", 10)
+!FMVI("LE", 2)
+!FMVI("GE", 11)
+!FMVI("L", 3)
+!FMVI("GU", 12)
+!FMVI("LEU", 4)
+!FMVI("CC", 13)
+!FMVI("GEU", 13)
+!FMVI("CS", 5)
+!FMVI("LU", 5)
+!FMVI("POS", 14)
+!FMVI("NEG", 6)
+!FMVI("VC", 15)
+!FMVI("VS", 7)
+!FMVF("A", 8)
+!FMVF("N", 0)
+!FMVF("U", 7)
+!FMVF("G", 6)
+!FMVF("UG", 5)
+!FMVF("L", 4)
+!FMVF("UL", 3)
+!FMVF("LG", 2)
+!FMVF("NE", 1)
+!FMVF("NZ", 1)
+!FMVF("E", 9)
+!FMVF("Z", 9)
+!FMVF("UE", 10)
+!FMVF("GE", 11)
+!FMVF("UGE", 12)
+!FMVF("LE", 13)
+!FMVF("ULE", 14)
+!FMVF("O", 15)
+
+/* movr and fmovr: rcond on the value of rs1 */
+!def MR(nm, c) {
+!local b = 0x81780000 | (c << 10)
+!Z("MOVR" + nm, "ra,rb,rd", "", b, "|(rd<<25)|(ra<<14)|rb")
+!Z("MOVR" + nm, "ra,!v,rd", "v<-512||v>511;3", b, "|(rd<<25)|(ra<<14)|0x2000|(v&0x3ff)")
+!local f = 0x81a80000 | (c << 10)
+!Z("FMOVRS" + nm, "ra,sb,sd", "", f | (5 << 5), "|(sd<<25)|(ra<<14)|sb")
+!Z("FMOVRD" + nm, "ra,db,dd", "", f | (6 << 5), "|(dd<<25)|(ra<<14)|db")
+!Z("FMOVRQ" + nm, "ra,qb,qd", "", f | (7 << 5), "|(qd<<25)|(ra<<14)|qb")
+}
+!MR("Z", 1)
+!MR("E", 1)
+!MR("LEZ", 2)
+!MR("LZ", 3)
+!MR("NZ", 5)
+!MR("NE", 5)
+!MR("GZ", 6)
+!MR("GEZ", 7)
+
+/* ===================================================================
+/* Loads and stores
+/* =================================================================== */
+/* integer: nm [address],rd (loads) and nm rd,[address] (stores); ev
+/* asks for an even register (ldd / std); a = 1 is the alternate
+/* space form */
+!def LG(nm, op3, ev) {
+!local x = ""
+!if ev !then {
+!set x = "rd&1;5"
+}
+!MA(nm, "", ",rd", 0xc0000000 | (op3 << 19), "|(rd<<25)", x)
+}
+!def SG(nm, op3, ev) {
+!local x = ""
+!if ev !then {
+!set x = "rd&1;5"
+}
+!MA(nm, "rd,", "", 0xc0000000 | (op3 << 19), "|(rd<<25)", x)
+}
+!def LGA(nm, op3, ev) {
+!local x = ""
+!if ev !then {
+!set x = "rd&1;5"
+}
+!MAA(nm, "", ",rd", 0xc0000000 | (op3 << 19), "|(rd<<25)", x)
+}
+!def SGA(nm, op3, ev) {
+!local x = ""
+!if ev !then {
+!set x = "rd&1;5"
+}
+!MAA(nm, "rd,", "", 0xc0000000 | (op3 << 19), "|(rd<<25)", x)
+}
+!LG("LD", 0x00, 0)
+!LG("LDUW", 0x00, 0)
+!LG("LDUB", 0x01, 0)
+!LG("LDUH", 0x02, 0)
+!LG("LDD", 0x03, 1)
+!LG("LDTW", 0x03, 1)
+!LG("LDSW", 0x08, 0)
+!LG("LDSB", 0x09, 0)
+!LG("LDSH", 0x0a, 0)
+!LG("LDX", 0x0b, 0)
+!LG("LDSTUB", 0x0d, 0)
+!LG("SWAP", 0x0f, 0)
+!SG("ST", 0x04, 0)
+!SG("STW", 0x04, 0)
+!SG("STUW", 0x04, 0)
+!SG("STSW", 0x04, 0)
+!SG("STB", 0x05, 0)
+!SG("STUB", 0x05, 0)
+!SG("STSB", 0x05, 0)
+!SG("STH", 0x06, 0)
+!SG("STUH", 0x06, 0)
+!SG("STSH", 0x06, 0)
+!SG("STD", 0x07, 1)
+!SG("STTW", 0x07, 1)
+!SG("STX", 0x0e, 0)
+!LGA("LDA", 0x10, 0)
+!LGA("LDUWA", 0x10, 0)
+!LGA("LDUBA", 0x11, 0)
+!LGA("LDUHA", 0x12, 0)
+!LGA("LDDA", 0x13, 1)
+!LGA("LDTWA", 0x13, 1)
+!LGA("LDSWA", 0x18, 0)
+!LGA("LDSBA", 0x19, 0)
+!LGA("LDSHA", 0x1a, 0)
+!LGA("LDXA", 0x1b, 0)
+!LGA("LDSTUBA", 0x1d, 0)
+!LGA("SWAPA", 0x1f, 0)
+!SGA("STA", 0x14, 0)
+!SGA("STWA", 0x14, 0)
+!SGA("STUWA", 0x14, 0)
+!SGA("STSWA", 0x14, 0)
+!SGA("STBA", 0x15, 0)
+!SGA("STUBA", 0x15, 0)
+!SGA("STSBA", 0x15, 0)
+!SGA("STHA", 0x16, 0)
+!SGA("STUHA", 0x16, 0)
+!SGA("STSHA", 0x16, 0)
+!SGA("STDA", 0x17, 1)
+!SGA("STTWA", 0x17, 1)
+!SGA("STXA", 0x1e, 0)
+
+/* clear memory: clr / clrb / clrh / clrx [address] stores %g0 */
+!MA("CLR", "", "", 0xc0200000, "", "")
+!MA("CLRB", "", "", 0xc0280000, "", "")
+!MA("CLRH", "", "", 0xc0300000, "", "")
+!MA("CLRX", "", "", 0xc0700000, "", "")
+
+/* floating point: the register class gives the instruction */
+!MA("LD", "", ",sd", 0xc1000000, "|(sd<<25)", "")
+!MA("LDD", "", ",dd", 0xc1180000, "|(dd<<25)", "")
+!MA("LDQ", "", ",qd", 0xc1100000, "|(qd<<25)", "")
+!MA("ST", "sd,", "", 0xc1200000, "|(sd<<25)", "")
+!MA("STD", "dd,", "", 0xc1380000, "|(dd<<25)", "")
+!MA("STQ", "qd,", "", 0xc1300000, "|(qd<<25)", "")
+!MAA("LDA", "", ",sd", 0xc1800000, "|(sd<<25)", "")
+!MAA("LDDA", "", ",dd", 0xc1980000, "|(dd<<25)", "")
+!MAA("LDQA", "", ",qd", 0xc1900000, "|(qd<<25)", "")
+!MAA("STA", "sd,", "", 0xc1a00000, "|(sd<<25)", "")
+!MAA("STDA", "dd,", "", 0xc1b80000, "|(dd<<25)", "")
+!MAA("STQA", "qd,", "", 0xc1b00000, "|(qd<<25)", "")
+!MA("LD", "", ",%FSR", 0xc1080000, "", "")
+!MA("LDX", "", ",%FSR", 0xc3080000, "", "")
+!MA("ST", "%FSR,", "", 0xc1280000, "", "")
+!MA("STX", "%FSR,", "", 0xc3280000, "", "")
+
+/* V8: the floating point queue and the coprocessor */
+!MA("STD", "%FQ,", "", 0xc1300000, "", "")
+!MA("LD", "", ",cd", 0xc1800000, "|(cd<<25)", "")
+!MA("LDD", "", ",cd", 0xc1980000, "|(cd<<25)", "cd&1;5")
+!MA("ST", "cd,", "", 0xc1a00000, "|(cd<<25)", "")
+!MA("STD", "cd,", "", 0xc1b80000, "|(cd<<25)", "cd&1;5")
+!MA("LD", "", ",%CSR", 0xc1880000, "", "")
+!MA("ST", "%CSR,", "", 0xc1a80000, "", "")
+!MA("STD", "%CQ,", "", 0xc1b00000, "", "")
+
+/* prefetch [address], fcn and prefetcha [address] asi, fcn */
+!MA("PREFETCH", "", ",!fn", 0xc1680000, "|((fn&31)<<25)", "fn<0||fn>31;3")
+!MAA("PREFETCHA", "", ",!fn", 0xc1e80000, "|((fn&31)<<25)", "fn<0||fn>31;3")
+
+/* compare and swap: casa [rs1] asi, rs2, rd and casxa, with the ASI
+/* in the instruction or (i = 1) from %asi; cas / casl / casx / casxl
+/* use ASI_P / ASI_PL */
+!def CAS(nm, op3) {
+!local b = 0xc0000000 | (op3 << 19)
+!Z(nm, "[ra]!w,rb,rd", EASI(), b, "|(rd<<25)|(ra<<14)|((w&0xff)<<5)|rb")
+!Z(nm, "[ra]%ASI,rb,rd", "", b, "|(rd<<25)|(ra<<14)|0x2000|rb")
+}
+!CAS("CASA", 0x3c)
+!CAS("CASXA", 0x3e)
+!Z("CAS", "[ra],rb,rd", "", 0xc1e01000, "|(rd<<25)|(ra<<14)|rb")
+!Z("CASL", "[ra],rb,rd", "", 0xc1e01100, "|(rd<<25)|(ra<<14)|rb")
+!Z("CASX", "[ra],rb,rd", "", 0xc1f01000, "|(rd<<25)|(ra<<14)|rb")
+!Z("CASXL", "[ra],rb,rd", "", 0xc1f01100, "|(rd<<25)|(ra<<14)|rb")
+
+/* ===================================================================
+/* Floating point operate (FPop1, FPop2)
+/* =================================================================== */
+/* OPF(nm, base, opf, a, b, d): the operand classes of rs1, rs2 and rd:
+/*   "s" "d" "q"  single / double / quad register
+/*   "r"          integer register
+/*   "c"          %fcc0-%fcc3 in rd (written first, as fcmp does)
+/*   ""           the field is 0 and there is no operand */
+!def OPF(nm, base, opf, a, b, d) {
+!local ops = ""
+!local fx = ""
+!if d == "c" !then {
+!set ops = "fc"
+!set fx = "|((fc&3)<<25)"
+}
+!if a != "" !then {
+!if ops != "" !then {
+!set ops = ops + ","
+}
+!set ops = ops + a + "a"
+!set fx = fx + "|(" + a + "a<<14)"
+}
+!if b != "" !then {
+!if ops != "" !then {
+!set ops = ops + ","
+}
+!set ops = ops + b + "b"
+!set fx = fx + "|" + b + "b"
+}
+!if d != "" && d != "c" !then {
+!if ops != "" !then {
+!set ops = ops + ","
+}
+!set ops = ops + d + "d"
+!set fx = fx + "|(" + d + "d<<25)"
+}
+!Z(nm, ops, "", base | (opf << 5), fx)
+}
+!def P1(nm, opf, a, b, d) {
+!OPF(nm, 0x81a00000, opf, a, b, d)
+}
+!def P2(nm, opf, a, b, d) {
+!OPF(nm, 0x81a80000, opf, a, b, d)
+}
+!P1("FMOVS", 0x001, "", "s", "s")
+!P1("FMOVD", 0x002, "", "d", "d")
+!P1("FMOVQ", 0x003, "", "q", "q")
+!P1("FNEGS", 0x005, "", "s", "s")
+!P1("FNEGD", 0x006, "", "d", "d")
+!P1("FNEGQ", 0x007, "", "q", "q")
+!P1("FABSS", 0x009, "", "s", "s")
+!P1("FABSD", 0x00a, "", "d", "d")
+!P1("FABSQ", 0x00b, "", "q", "q")
+!P1("FSQRTS", 0x029, "", "s", "s")
+!P1("FSQRTD", 0x02a, "", "d", "d")
+!P1("FSQRTQ", 0x02b, "", "q", "q")
+!P1("FADDS", 0x041, "s", "s", "s")
+!P1("FADDD", 0x042, "d", "d", "d")
+!P1("FADDQ", 0x043, "q", "q", "q")
+!P1("FSUBS", 0x045, "s", "s", "s")
+!P1("FSUBD", 0x046, "d", "d", "d")
+!P1("FSUBQ", 0x047, "q", "q", "q")
+!P1("FMULS", 0x049, "s", "s", "s")
+!P1("FMULD", 0x04a, "d", "d", "d")
+!P1("FMULQ", 0x04b, "q", "q", "q")
+!P1("FDIVS", 0x04d, "s", "s", "s")
+!P1("FDIVD", 0x04e, "d", "d", "d")
+!P1("FDIVQ", 0x04f, "q", "q", "q")
+!P1("FNADDS", 0x051, "s", "s", "s")
+!P1("FNADDD", 0x052, "d", "d", "d")
+!P1("FNMULS", 0x059, "s", "s", "s")
+!P1("FNMULD", 0x05a, "d", "d", "d")
+!P1("FHADDS", 0x061, "s", "s", "s")
+!P1("FHADDD", 0x062, "d", "d", "d")
+!P1("FHSUBS", 0x065, "s", "s", "s")
+!P1("FHSUBD", 0x066, "d", "d", "d")
+!P1("FSMULD", 0x069, "s", "s", "d")
+!P1("FDMULQ", 0x06e, "d", "d", "q")
+!P1("FNHADDS", 0x071, "s", "s", "s")
+!P1("FNHADDD", 0x072, "d", "d", "d")
+!P1("FNSMULD", 0x079, "s", "s", "d")
+!P1("FSTOX", 0x081, "", "s", "d")
+!P1("FDTOX", 0x082, "", "d", "d")
+!P1("FQTOX", 0x083, "", "q", "d")
+!P1("FXTOS", 0x084, "", "d", "s")
+!P1("FXTOD", 0x088, "", "d", "d")
+!P1("FXTOQ", 0x08c, "", "d", "q")
+!P1("FITOS", 0x0c4, "", "s", "s")
+!P1("FDTOS", 0x0c6, "", "d", "s")
+!P1("FQTOS", 0x0c7, "", "q", "s")
+!P1("FITOD", 0x0c8, "", "s", "d")
+!P1("FSTOD", 0x0c9, "", "s", "d")
+!P1("FQTOD", 0x0cb, "", "q", "d")
+!P1("FITOQ", 0x0cc, "", "s", "q")
+!P1("FSTOQ", 0x0cd, "", "s", "q")
+!P1("FDTOQ", 0x0ce, "", "d", "q")
+!P1("FSTOI", 0x0d1, "", "s", "s")
+!P1("FDTOI", 0x0d2, "", "d", "s")
+!P1("FQTOI", 0x0d3, "", "q", "s")
+
+/* compares: nm [%fccN,] rs1, rs2 (%fcc0 when no cc is written) */
+!def FCMP(nm, opf, t) {
+!P2(nm, opf, t, t, "c")
+!P2(nm, opf, t, t, "")
+}
+!FCMP("FCMPS", 0x051, "s")
+!FCMP("FCMPD", 0x052, "d")
+!FCMP("FCMPQ", 0x053, "q")
+!FCMP("FCMPES", 0x055, "s")
+!FCMP("FCMPED", 0x056, "d")
+!FCMP("FCMPEQ", 0x057, "q")
+
+/* fused multiply-add (IMPDEP2, SPARC64 VI / OSA 2011):
+/* nm rs1, rs2, rs3, rd -- rd = rs1 * rs2 +- rs3 */
+!def FMA(nm, op5, t) {
+!Z(nm, t + "a," + t + "b," + t + "c," + t + "d", "", 0x81b80000 | (op5 << 5), "|(" + t + "d<<25)|(" + t + "a<<14)|(" + t + "c<<9)|" + t + "b")
+}
+!FMA("FMADDS", 1, "s")
+!FMA("FMADDD", 2, "d")
+!FMA("FMSUBS", 5, "s")
+!FMA("FMSUBD", 6, "d")
+!FMA("FNMSUBS", 9, "s")
+!FMA("FNMSUBD", 10, "d")
+!FMA("FNMADDS", 13, "s")
+!FMA("FNMADDD", 14, "d")
+
+/* ===================================================================
+/* VIS 1, 2, 3 (IMPDEP1)
+/* =================================================================== */
+!def V(nm, opf, a, b, d) {
+!OPF(nm, 0x81b00000, opf, a, b, d)
+}
+!V("EDGE8", 0x000, "r", "r", "r")
+!V("EDGE8N", 0x001, "r", "r", "r")
+!V("EDGE8L", 0x002, "r", "r", "r")
+!V("EDGE8LN", 0x003, "r", "r", "r")
+!V("EDGE16", 0x004, "r", "r", "r")
+!V("EDGE16N", 0x005, "r", "r", "r")
+!V("EDGE16L", 0x006, "r", "r", "r")
+!V("EDGE16LN", 0x007, "r", "r", "r")
+!V("EDGE32", 0x008, "r", "r", "r")
+!V("EDGE32N", 0x009, "r", "r", "r")
+!V("EDGE32L", 0x00a, "r", "r", "r")
+!V("EDGE32LN", 0x00b, "r", "r", "r")
+!V("ARRAY8", 0x010, "r", "r", "r")
+!V("ADDXC", 0x011, "r", "r", "r")
+!V("ARRAY16", 0x012, "r", "r", "r")
+!V("ADDXCCC", 0x013, "r", "r", "r")
+!V("ARRAY32", 0x014, "r", "r", "r")
+!V("UMULXHI", 0x016, "r", "r", "r")
+!V("LZCNT", 0x017, "", "r", "r")
+!V("ALIGNADDR", 0x018, "r", "r", "r")
+!V("ALIGNADDRESS", 0x018, "r", "r", "r")
+!V("BMASK", 0x019, "r", "r", "r")
+!V("ALIGNADDRL", 0x01a, "r", "r", "r")
+!V("ALIGNADDRESS\\_LITTLE", 0x01a, "r", "r", "r")
+!V("CMASK8", 0x01b, "", "r", "")
+!V("CMASK16", 0x01d, "", "r", "")
+!V("CMASK32", 0x01f, "", "r", "")
+!V("FCMPLE16", 0x020, "d", "d", "r")
+!V("FSLL16", 0x021, "d", "d", "d")
+!V("FCMPNE16", 0x022, "d", "d", "r")
+!V("FSRL16", 0x023, "d", "d", "d")
+!V("FCMPLE32", 0x024, "d", "d", "r")
+!V("FSLL32", 0x025, "d", "d", "d")
+!V("FCMPNE32", 0x026, "d", "d", "r")
+!V("FSRL32", 0x027, "d", "d", "d")
+!V("FCMPGT16", 0x028, "d", "d", "r")
+!V("FSLAS16", 0x029, "d", "d", "d")
+!V("FCMPEQ16", 0x02a, "d", "d", "r")
+!V("FSRA16", 0x02b, "d", "d", "d")
+!V("FCMPGT32", 0x02c, "d", "d", "r")
+!V("FSLAS32", 0x02d, "d", "d", "d")
+!V("FCMPEQ32", 0x02e, "d", "d", "r")
+!V("FSRA32", 0x02f, "d", "d", "d")
+!V("FMUL8X16", 0x031, "s", "d", "d")
+!V("FMUL8X16AU", 0x033, "s", "s", "d")
+!V("FMUL8X16AL", 0x035, "s", "s", "d")
+!V("FMUL8SUX16", 0x036, "d", "d", "d")
+!V("FMUL8ULX16", 0x037, "d", "d", "d")
+!V("FMULD8SUX16", 0x038, "s", "s", "d")
+!V("FMULD8ULX16", 0x039, "s", "s", "d")
+!V("FPACK32", 0x03a, "d", "d", "d")
+!V("FPACK16", 0x03b, "", "d", "s")
+!V("FPACKFIX", 0x03d, "", "d", "s")
+!V("PDIST", 0x03e, "d", "d", "d")
+!V("PDISTN", 0x03f, "d", "d", "r")
+!V("FMEAN16", 0x040, "d", "d", "d")
+!V("FPADD64", 0x042, "d", "d", "d")
+!V("FCHKSM16", 0x044, "d", "d", "d")
+!V("FPSUB64", 0x046, "d", "d", "d")
+!V("FALIGNDATA", 0x048, "d", "d", "d")
+!V("FPMERGE", 0x04b, "s", "s", "d")
+!V("BSHUFFLE", 0x04c, "d", "d", "d")
+!V("FEXPAND", 0x04d, "", "s", "d")
+!V("FPADD16", 0x050, "d", "d", "d")
+!V("FPADD16S", 0x051, "s", "s", "s")
+!V("FPADD32", 0x052, "d", "d", "d")
+!V("FPADD32S", 0x053, "s", "s", "s")
+!V("FPSUB16", 0x054, "d", "d", "d")
+!V("FPSUB16S", 0x055, "s", "s", "s")
+!V("FPSUB32", 0x056, "d", "d", "d")
+!V("FPSUB32S", 0x057, "s", "s", "s")
+!V("FPADDS16", 0x058, "d", "d", "d")
+!V("FPADDS16S", 0x059, "s", "s", "s")
+!V("FPADDS32", 0x05a, "d", "d", "d")
+!V("FPADDS32S", 0x05b, "s", "s", "s")
+!V("FPSUBS16", 0x05c, "d", "d", "d")
+!V("FPSUBS16S", 0x05d, "s", "s", "s")
+!V("FPSUBS32", 0x05e, "d", "d", "d")
+!V("FPSUBS32S", 0x05f, "s", "s", "s")
+!V("FZERO", 0x060, "", "", "d")
+!V("FZEROS", 0x061, "", "", "s")
+!V("FNOR", 0x062, "d", "d", "d")
+!V("FNORS", 0x063, "s", "s", "s")
+!V("FANDNOT2", 0x064, "d", "d", "d")
+!V("FANDNOT2S", 0x065, "s", "s", "s")
+!V("FNOT2", 0x066, "", "d", "d")
+!V("FNOT2S", 0x067, "", "s", "s")
+!V("FANDNOT1", 0x068, "d", "d", "d")
+!V("FANDNOT1S", 0x069, "s", "s", "s")
+!V("FNOT1", 0x06a, "d", "", "d")
+!V("FNOT1S", 0x06b, "s", "", "s")
+!V("FXOR", 0x06c, "d", "d", "d")
+!V("FXORS", 0x06d, "s", "s", "s")
+!V("FNAND", 0x06e, "d", "d", "d")
+!V("FNANDS", 0x06f, "s", "s", "s")
+!V("FAND", 0x070, "d", "d", "d")
+!V("FANDS", 0x071, "s", "s", "s")
+!V("FXNOR", 0x072, "d", "d", "d")
+!V("FXNORS", 0x073, "s", "s", "s")
+!V("FSRC1", 0x074, "d", "", "d")
+!V("FSRC1S", 0x075, "s", "", "s")
+!V("FORNOT2", 0x076, "d", "d", "d")
+!V("FORNOT2S", 0x077, "s", "s", "s")
+!V("FSRC2", 0x078, "", "d", "d")
+!V("FSRC2S", 0x079, "", "s", "s")
+!V("FORNOT1", 0x07a, "d", "d", "d")
+!V("FORNOT1S", 0x07b, "s", "s", "s")
+!V("FOR", 0x07c, "d", "d", "d")
+!V("FORS", 0x07d, "s", "s", "s")
+!V("FONE", 0x07e, "", "", "d")
+!V("FONES", 0x07f, "", "", "s")
+!V("SHUTDOWN", 0x080, "", "", "")
+!Z("SIAM", "!v", "v<0||v>7;3", 0x81b01020, "|(v&7)")
+!V("MOVDTOX", 0x110, "", "d", "r")
+!V("MOVSTOUW", 0x111, "", "s", "r")
+!V("MOVSTOSW", 0x113, "", "s", "r")
+!V("XMULX", 0x115, "r", "r", "r")
+!V("XMULXHI", 0x116, "r", "r", "r")
+!V("MOVXTOD", 0x118, "", "r", "d")
+!V("MOVWTOS", 0x119, "", "r", "s")
+!V("FUCMPLE8", 0x120, "d", "d", "r")
+!V("FUCMPNE8", 0x122, "d", "d", "r")
+!V("FUCMPGT8", 0x128, "d", "d", "r")
+!V("FUCMPEQ8", 0x12a, "d", "d", "r")
+!V("FLCMPS", 0x151, "s", "s", "c")
+!V("FLCMPD", 0x152, "d", "d", "c")
+
+/* V8 coprocessor operate: cpop1 / cpop2 opc, %c rs1, %c rs2, %c rd */
+!def CPOP(nm, op3) {
+!Z(nm, "!v,ca,cb,cd", "v<0||v>511;3", 0x80000000 | (op3 << 19), "|(cd<<25)|(ca<<14)|((v&0x1ff)<<5)|cb")
+}
+.check::ca::R_CPR
+.check::cb::R_CPR
+!CPOP("CPOP1", 0x36)
+!CPOP("CPOP2", 0x37)
+
+/* ===================================================================
+/* State registers and control
+/* =================================================================== */
+/* rd %asr, rd and wr rs1, reg_or_imm, %asr (also wr rs2, %asr) */
+!Z("RD", "ar,rd", "", 0x81400000, "|(rd<<25)|(ar<<14)")
+!RI("WR", "ra,", ",ar", 0x81800000, "|(ar<<25)|(ra<<14)")
+!Z("WR", "rb,ar", "", 0x81800000, "|(ar<<25)|rb")
+/* V8: %psr %wim %tbr */
+!Z("RD", "%PSR,rd", "", 0x81480000, "|(rd<<25)")
+!Z("RD", "%WIM,rd", "", 0x81500000, "|(rd<<25)")
+!Z("RD", "%TBR,rd", "", 0x81580000, "|(rd<<25)")
+!RI("WR", "ra,", ",%PSR", 0x81880000, "|(ra<<14)")
+!RI("WR", "ra,", ",%WIM", 0x81900000, "|(ra<<14)")
+!RI("WR", "ra,", ",%TBR", 0x81980000, "|(ra<<14)")
+!Z("WR", "rb,%PSR", "", 0x81880000, "|rb")
+!Z("WR", "rb,%WIM", "", 0x81900000, "|rb")
+!Z("WR", "rb,%TBR", "", 0x81980000, "|rb")
+/* LEON: pwr rs1, reg_or_imm, %psr (wr %psr with the power-down bit) */
+!RI("PWR", "ra,", ",%PSR", 0x83880000, "|(ra<<14)")
+/* V9: rdpr / wrpr */
+!Z("RDPR", "pr,rd", "", 0x81500000, "|(rd<<25)|(pr<<14)")
+!RI("WRPR", "ra,", ",pr", 0x81900000, "|(pr<<25)|(ra<<14)")
+!Z("WRPR", "ra,pr", "", 0x81900000, "|(pr<<25)|(ra<<14)")
+/* UltraSPARC Architecture 2005: rdhpr / wrhpr */
+!Z("RDHPR", "hr,rd", "", 0x81480000, "|(rd<<25)|(hr<<14)")
+!RI("WRHPR", "ra,", ",hr", 0x81980000, "|(hr<<25)|(ra<<14)")
+!Z("WRHPR", "ra,hr", "", 0x81980000, "|(hr<<25)|(ra<<14)")
+
+/* membar mask (7 bits), stbar, sir */
+!Z("MEMBAR", "!v", "v<0||v>127;3", 0x8143e000, "|(v&0x7f)")
+STBAR :: .call w4(0x8143c000)
+!Z("SIR", "!v", ES13(), 0x9f802000, "|(v&0x1fff)")
+
+/* flush address (also iflush), flush alone, flushw */
+!AD("FLUSH", "", "", 0x81d80000, "", "", 1)
+!AD("IFLUSH", "", "", 0x81d80000, "", "", 1)
+FLUSH :: .call w4(0x81d80000)
+FLUSHW :: .call w4(0x81580000)
+
+/* register windows and traps */
+SAVED :: .call w4(0x81880000)
+RESTORED :: .call w4(0x83880000)
+ALLCLEAN :: .call w4(0x85880000)
+OTHERW :: .call w4(0x87880000)
+NORMALW :: .call w4(0x89880000)
+INVALW :: .call w4(0x8b880000)
+DONE :: .call w4(0x81f00000)
+RETRY :: .call w4(0x83f00000)
+ILLTRAP !v :: v<0||v>0x3fffff;3 :: .call w4(v&0x3fffff)
+UNIMP !v :: v<0||v>0x3fffff;3 :: .call w4(v&0x3fffff)
+
+/* ===================================================================
+/* Synthetic instructions (SPARC V9 manual appendix G, GNU as, llvm-mc)
+/* =================================================================== */
+/* cmp rs1, reg_or_imm = subcc rs1, x, %g0; tst rs1 = orcc rs1, %g0, %g0
+/* (the form of GNU as and llvm-mc) */
+!RI("CMP", "ra,", "", 0x80a00000, "|(ra<<14)")
+!Z("TST", "ra", "", 0x80900000, "|(ra<<14)")
+/* mov reg_or_imm, rd = or %g0, x, rd; mov %asr, rd; mov rs2, %asr */
+!RI("MOV", "", ",rd", 0x80100000, "|(rd<<25)")
+!Z("MOV", "ar,rd", "", 0x81400000, "|(rd<<25)|(ar<<14)")
+!Z("MOV", "rb,ar", "", 0x81800000, "|(ar<<25)|rb")
+/* clr rd, not, neg, signx, clruw */
+!Z("CLR", "rd", "", 0x80100000, "|(rd<<25)")
+!Z("NOT", "ra,rd", "", 0x80380000, "|(rd<<25)|(ra<<14)")
+!Z("NOT", "rd", "", 0x80380000, "|(rd<<25)|(rd<<14)")
+!Z("NEG", "rb,rd", "", 0x80200000, "|(rd<<25)|rb")
+!Z("NEG", "rd", "", 0x80200000, "|(rd<<25)|rd")
+!Z("SIGNX", "ra,rd", "", 0x81380000, "|(rd<<25)|(ra<<14)")
+!Z("SIGNX", "rd", "", 0x81380000, "|(rd<<25)|(rd<<14)")
+!Z("CLRUW", "ra,rd", "", 0x81300000, "|(rd<<25)|(ra<<14)")
+!Z("CLRUW", "rd", "", 0x81300000, "|(rd<<25)|(rd<<14)")
+/* inc / inccc / dec / deccc [const13,] rd */
+!def INC(nm, op3) {
+!local b = 0x80002000 | (op3 << 19)
+!Z(nm, "rd", "", b, "|(rd<<25)|(rd<<14)|1")
+!I13(nm, "", ",rd", b & 0xffffdfff, "|(rd<<25)|(rd<<14)", ES13(), "")
+}
+!INC("INC", 0x00)
+!INC("INCCC", 0x10)
+!INC("DEC", 0x04)
+!INC("DECCC", 0x14)
+/* btst reg_or_imm, rs1 = andcc rs1, x, %g0; bset / bclr / btog
+/* reg_or_imm, rd = or / andn / xor rd, x, rd */
+!RI("BTST", "", ",ra", 0x80880000, "|(ra<<14)")
+!RI("BSET", "", ",rd", 0x80100000, "|(rd<<25)|(rd<<14)")
+!RI("BCLR", "", ",rd", 0x80280000, "|(rd<<25)|(rd<<14)")
+!RI("BTOG", "", ",rd", 0x80180000, "|(rd<<25)|(rd<<14)")
+/* set / setuw / setsw / setx */
+SET !v,rd :: .call setuw(rd,v)
+SETUW !v,rd :: .call setuw(rd,v)
+SETSW !v,rd :: .call setsw(rd,v)
+SETX !v,rt,rd :: .call setx(rd,rt,v)
+
+/* ===================================================================
+/* Data (big-endian)
+/* =================================================================== */
+BYTE !v :: v
+HALF !v :: v>>8,v
+WORD !v :: v>>24,v>>16,v>>8,v
+XWORD !v :: v>>56,v>>48,v>>40,v>>32,v>>24,v>>16,v>>8,v
+NWORD !v :: v>>56,v>>48,v>>40,v>>32,v>>24,v>>16,v>>8,v
+SINGLE !Fv :: v>>24,v>>16,v>>8,v
+FLOAT !Fv :: v>>24,v>>16,v>>8,v
+DOUBLE !Dv :: v>>56,v>>48,v>>40,v>>32,v>>24,v>>16,v>>8,v

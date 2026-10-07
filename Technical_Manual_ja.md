@@ -50,7 +50,7 @@ gcc caxx.c -o caxx -lm -lquadmath -O2   # -lm は式評価器が、-lquadmath �
 
 この 2 つは同じ入力に対して**バイト単位で同一の出力**を生成することを意図しています。
 同梱のパターンファイル、テストソース、`test1` スクリプトはまさにそれを検証するために
-存在します。`test1` は同梱の 54 組のパターン/ソースの対を両方の実装でアセンブルし、
+存在します。`test1` は同梱の 57 組のパターン/ソースの対を両方の実装でアセンブルし、
 結果を `cmp` します。さらに `.textmode` の 5 組については、`-V` で標準出力へ流した
 翻訳テキストどうしも、`echo.axx` と `ministr.axx` の組については標準エラーへ出た `.echo` の行どうしも
 `cmp` します。回帰テストの `regress.axx` は `-V` のテキストと標準エラーの診断を
@@ -4223,7 +4223,7 @@ AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v
 `x86_64.axx`、`x86_64m.axx`、`aarch64.axx`、`ppc64.axx`、`ppc64le.axx`、`68000.axx`、
 `z80.axx`、`8080.axx`、`8048.axx`、`8051.axx`、`6502.axx`、`6800.axx`、`6809.axx`、
 `4004.axx`、`riscv64full.axx`、`mips.axx`、`mipsel.axx`、`mips64.axx`、`mips64el.axx`、
-`mipsr6.axx`、`mipsr6el.axx`、`mips64r6.axx`、`mips64r6el.axx` は実用向けです。`riscv64.axx` は RV64I の基本整数部分の範囲で、
+`mipsr6.axx`、`mipsr6el.axx`、`mips64r6.axx`、`mips64r6el.axx`、`sparc.axx` は実用向けです。`riscv64.axx` は RV64I の基本整数部分の範囲で、
 `aarch64_logical.axx` と `aarch64_logical_mini.axx` はカバーする 1 つの命令グループの
 範囲内で実用向けです。残りはテストフィクスチャです。
 
@@ -4250,6 +4250,7 @@ x86_64 パターンファイルは
 | **mips64r6.axx** | 938 B | 1（＋ `mips_isa.axx`） | **mipsr6.s** | MIPS64 Release 6、ビッグエンディアン、n64 |
 | **mips64r6el.axx** | 945 B | 1（＋ `mips_isa.axx`） | **mipsr6.s** | 同じくリトルエンディアン、n64 |
 | **mips_isa.axx** | 79 KB | 143（展開後 約 5,000、Release 6 では約 3,560） | — | 上の 8 つが共有する MIPS の命令セット本体。axx に直接渡さない。MIPS I から MIPS64 Release 6 まで: 整数命令一式（Release 2 のビット欄・バイト入れ替え命令を含む）、特権命令（COP0、TLB）、FPU（S・D・W・L・PS の各形式、16 種の `c.cond`、COP1X）、COP2、MIPS I の COP3、GNU の疑似命令（`li`・`dli`・`la`・`dla`・`move`・`b` など、`$at` を使わない範囲）、リロケーション修飾子（`%hi`・`%lo`・`%higher`・`%highest`・`%gp_rel`・`%got` 系・`%call16` 系・TLS 系・`%pcrel_hi` / `%pcrel_lo`）。拡張は DSP（Release 1・2、R6 では Release 3）、MSA、MT、VZ、EVA、MIPS-3D、SmartMIPS、MCU、XPA、CRC、GINV。前置きファイルの `R6()` が 1 なら Release 6 で消えた命令（分岐 likely、HI / LO の乗除算、`lwl` 系、`movz` 系、FP の条件コード、PS、COP1X など）を外し、`clz`・`ll` / `sc`・`cache` / `pref`・`lwc2` 系・`jr` などを Release 6 の符号で出し、新命令（コンパクト分岐、`aui` 系、PC 相対の `lwpc` / `auipc` 系、3 オペランドの乗除算、`cmp.cond.fmt`、`maddf` などの FPU 命令）を足す。構文は `.set noreorder` / `.set noat` の GNU as。microMIPS / MIPS16e（圧縮符号）、MDMX、ベンダー拡張は含まない。`-o` では o32 は REL（加数を欄に書き戻す）、n64 は RELA（`r_info` に 3 つの型）で出し、Release 6 の PC 相対リロケーション（`R_MIPS_PC21_S2`・`PC26_S2`・`PC19_S2`・`PC18_S3`・`PCHI16`・`PCLO16`）も出す。マクロ層とミニ言語で記述 |
+| **sparc.axx** | 52 KB | 229（展開後 7,968） | **sparc_test.s**、**sparc_reloc.s**、**bf_sparc.s** | SPARC V7 / V8 / V9 と VIS 1〜3。整数・シフト・`sethi`、Bicc / BPcc / FBfcc / FBPfcc / BPr / V8 の CBccc（`,a` と `,pt` / `,pn`）、`call`・`jmpl`・`return`・Tcc、movcc / movr / fmovcc / fmovr、整数と浮動小数点のロード／ストア一式（代替空間の ASI 番号・`#ASI_*` 名・`%asi`、`casa` / `casxa`、`prefetch`）、FPop1 / FPop2 の全命令（s・d・q、変換、`fcmp`、UltraSPARC Architecture 2007 の `fnadd` 系）、積和（`fmadd` 系）、`rd` / `wr`・`rdpr` / `wrpr`・V8 の `%psr` 系・UA2005 の `rdhpr` / `wrhpr`、`membar`（`#StoreLoad` などの名前）、V8 のコプロセッサ、LEON の `umac` / `smac` / `pwr`、合成命令（`cmp`・`mov`・`set` / `setuw` / `setsw` / `setx`・`clr` 系・`inc` 系など）、修飾子（`%hi`・`%lo`・`%hh`・`%hm`・`%h44`・`%m44`・`%l44`・`%hix`・`%lox`・`%pc22`・`%pc10`・GOT 系・TLS 系）。`-o` は ELF64 SPARCV9（RELA）。llvm-mc 19 とバイト単位で照合し、llvm-mc に無い行は仕様書の符号と照合した。マクロ層とミニ言語で記述 |
 | **6809.axx** | 124 KB | 1,950 | **6809.s** | Motorola 6809 |
 | **68000.axx** | 51 KB | 453 | **68000.s** | Motorola 68000 |
 | **6800.axx** | 18 KB | 271 | **6800.s** | Motorola 6800 |
@@ -4304,10 +4305,12 @@ x86_64 パターンファイルは
 と対になり、`mipsr6.axx`・`mipsr6el.axx`・`mips64r6.axx`・`mips64r6el.axx` は
 `mipsr6.s`（Release 6 で符号の変わった命令と新命令、llvm-mc 19 とリロケーションまで
 照合）と対になります。`mips_isa.axx` はその 8 つから include されるので直接は
-渡しません。`itanium.axx` も `vliw.s` を使い、
+渡しません。`sparc.axx` は `sparc_test.s`（1 行 1 パターン行、llvm-mc 19 とバイト単位で
+照合）・`sparc_reloc.s`（`-o` のリロケーション、llvm-mc 19 と照合）・`bf_sparc.s`
+（Brainfuck インタプリタ、qemu-sparc64 で実行）と対になります。`itanium.axx` も `vliw.s` を使い、
 `aarch64_logical_mini.axx` は `aarch64_logical_mini_demo.s` と対になります。
 
-`test1` は 54 組を両方の実装で実行し、`-b` の生バイナリを比較します。
+`test1` は 57 組を両方の実装で実行し、`-b` の生バイナリを比較します。
 `.textmode` を使う 5 組（`textmode.axx` / `8080toz80.axx` / `intel2att.axx` / `a64tox64_axx.axx` / `expcap.axx`）については、`-V` で
 標準出力へ流した翻訳テキストどうしも比較します。`elftype.axx` / `elftype.s` と
 `elfgen.axx` / `elfgen.s`、型の優先順位を見る `elfprio.axx` / `elfprio.s`、
@@ -4324,14 +4327,15 @@ x86_64 パターンファイルは
 診断で比較します（後者はエラーになる行だけを集めたものです）。
 MIPS の 12 組（`mips.axx`・`mipsel.axx`・`mips64.axx`・`mips64el.axx` と `mips.s`・
 `mips_ase.s`、R6 の 4 つと `mipsr6.s`）は、`-b` に加えて `-o` の ELF オブジェクト
-（o32 は ELF32 の REL、n64 は ELF64 の RELA）どうしも比較します。
+（o32 は ELF32 の REL、n64 は ELF64 の RELA）どうしも比較します。SPARC の 3 組のうち
+`sparc_reloc.s` と `bf_sparc.s` は `-o` の ELF オブジェクトどうしを比較します。
 
 さらに中核の 16 組（`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`）は、
 `-b` だけでは一度も比較されない経路を通すために、`-o`（ELF64）、`-m 3 -f 32 -o`
 （ELF32）、`-g -o`（DWARF 付き）、`-v`（リスティング）、`-V`（テキスト出力）
 でも走らせて突き合わせます。`elfcfi` は ELF32（`-m 3 -f 32`、REL）でも比較します。
-比較は全部で 188 組です。
+比較は全部で 191 組です。
 
 `-g` を比較するときは、両実装を必ず同じディレクトリで走らせてください。DWARF は
 `DW_AT_comp_dir` にカレントディレクトリを埋めるので、別の場所で走らせると中身が
@@ -4340,7 +4344,8 @@ MIPS の 12 組（`mips.axx`・`mipsel.axx`・`mips64.axx`・`mips64el.axx` と 
 `aarch64.axx` / `aarch64.s` の組と `mips.s`・`mips_ase.s` の MIPS の 8 組が飛び抜けて
 重く、どれも 1 回あたり Python 実装で 20 秒ほど、C 実装で 1 秒ほどかかります。ソースの
 1 行ごとに大きなパターン集合と照合するためです（MIPS は組ごとに `-b` と `-o` の 2 通りで
-走らせるので計 16 回）。`test1` の所要時間はほぼこれらの組で決まります。
+走らせるので計 16 回）。`sparc.axx` / `sparc_test.s` の組はさらに重く、Python 実装で
+90 秒ほど、C 実装で 4 秒ほどかかります。`test1` の所要時間はほぼこれらの組で決まります。
 `test.axx` / `test.s` は同梱の対のうち唯一カバーされていないものです。
 
 現在実装されているものの大半は x86_64 とレガシー CPU ですが、これは作業が向けられた
@@ -4362,7 +4367,7 @@ MIPS の 12 組（`mips.axx`・`mipsel.axx`・`mips64.axx`・`mips64el.axx` と 
 | `format_of_exp_imp_file` | エクスポート/インポートファイル形式 |
 | `axx.1.gz` | man ページ |
 
-`test1` は同梱の 54 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
+`test1` は同梱の 57 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
 
 ### C.2 外部
 

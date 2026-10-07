@@ -51,7 +51,7 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all fifty-four bundled pattern/source pairs with
+exactly that: `test1` assembles all fifty-seven bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the five `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` and `ministr.axx` pairs the `.echo` lines each one writes to standard
@@ -4514,8 +4514,8 @@ AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v
 `x86_64.axx`, `x86_64m.axx`, `aarch64.axx`, `ppc64.axx`, `ppc64le.axx`,
 `68000.axx`, `z80.axx`, `8080.axx`, `8048.axx`, `8051.axx`, `6502.axx`,
 `6800.axx`, `6809.axx`, `4004.axx`, `riscv64full.axx`, `mips.axx`, `mipsel.axx`,
-`mips64.axx`, `mips64el.axx`, `mipsr6.axx`, `mipsr6el.axx`, `mips64r6.axx` and
-`mips64r6el.axx` are for practical use;
+`mips64.axx`, `mips64el.axx`, `mipsr6.axx`, `mipsr6el.axx`, `mips64r6.axx`,
+`mips64r6el.axx` and `sparc.axx` are for practical use;
 `riscv64.axx` within the RV64I base integer subset, and `aarch64_logical.axx` and
 `aarch64_logical_mini.axx` within the one instruction group they cover. The rest
 are test fixtures.
@@ -4542,6 +4542,7 @@ The x86_64 pattern file is also maintained separately at
 | **mips64r6.axx** | 938 B | 1 (plus `mips_isa.axx`) | **mipsr6.s** | MIPS64 Release 6, big-endian, n64 |
 | **mips64r6el.axx** | 945 B | 1 (plus `mips_isa.axx`) | **mipsr6.s** | The same for little-endian, n64 |
 | **mips_isa.axx** | 79 KB | 143 (about 5,000 expanded, about 3,560 under Release 6) | -- | The MIPS instruction set shared by the eight files above; not passed to axx directly. MIPS I to MIPS64 Release 6: the whole integer set (with the Release 2 bit-field and byte-swap instructions), the privileged instructions (COP0, TLB), the FPU (the S, D, W, L and PS formats, the sixteen `c.cond` compares, COP1X), COP2, the coprocessor 3 forms of MIPS I, the GNU pseudo-instructions that need no `$at` (`li`, `dli`, `la`, `dla`, `move`, `b` ...) and the relocation modifiers (`%hi`, `%lo`, `%higher`, `%highest`, `%gp_rel`, the `%got` and `%call16` families, the TLS ones, `%pcrel_hi` / `%pcrel_lo`). The extensions DSP (Release 1 and 2, Release 3 under R6), MSA, MT, VZ, EVA, MIPS-3D, SmartMIPS, MCU, XPA, CRC and GINV. When the front file sets `R6()` to 1, the instructions Release 6 removes (branch likely, multiply and divide on HI / LO, the `lwl` family, the `movz` family, the FP condition codes, PS, COP1X ...) are left out, `clz`, `ll` / `sc`, `cache` / `pref`, the `lwc2` family, `jr` ... take their Release 6 encodings, and the new instructions are added (the compact branches, the `aui` family, the PC-relative `lwpc` / `auipc` family, the three-register multiply and divide, `cmp.cond.fmt`, `maddf` and the other FPU ones). The syntax is that of GNU as under `.set noreorder` / `.set noat`. No microMIPS / MIPS16e (the compressed encodings), MDMX or vendor extensions. Under `-o`, o32 is REL (the addend written back into the field) and n64 is RELA (three types per `r_info`), with the PC-relative relocations of Release 6 (`R_MIPS_PC21_S2`, `PC26_S2`, `PC19_S2`, `PC18_S3`, `PCHI16`, `PCLO16`). Written with the macro layer and the mini language |
+| **sparc.axx** | 52 KB | 229 (7,968 expanded) | **sparc_test.s**, **sparc_reloc.s**, **bf_sparc.s** | SPARC V7 / V8 / V9 and VIS 1-3: the integer set, the shifts and `sethi`; Bicc / BPcc / FBfcc / FBPfcc / BPr and the V8 CBccc (with `,a` and `,pt` / `,pn`), `call`, `jmpl`, `return` and Tcc; movcc / movr / fmovcc / fmovr; every integer and floating point load and store (the alternate space forms with an ASI number, a `#ASI_*` name or `%asi`, `casa` / `casxa`, `prefetch`); every FPop1 / FPop2 (s, d, q, the conversions, `fcmp`, the UltraSPARC Architecture 2007 `fnadd` family) and the fused multiply-add (`fmadd` ...); `rd` / `wr`, `rdpr` / `wrpr`, the V8 `%psr` family and the UA2005 `rdhpr` / `wrhpr`; `membar` (with the `#StoreLoad` ... names); the V8 coprocessor; the LEON `umac` / `smac` / `pwr`; the synthetic instructions (`cmp`, `mov`, `set` / `setuw` / `setsw` / `setx`, the `clr` family, the `inc` family ...); the operand modifiers (`%hi`, `%lo`, `%hh`, `%hm`, `%h44`, `%m44`, `%l44`, `%hix`, `%lox`, `%pc22`, `%pc10`, the GOT and TLS ones). `-o` writes ELF64 SPARCV9 (RELA). Checked byte-for-byte against llvm-mc 19, and the rows llvm-mc does not have against the encodings of the manuals. Written with the macro layer and the mini language |
 | **6809.axx** | 124 KB | 1,950 | **6809.s** | Motorola 6809 |
 | **68000.axx** | 51 KB | 453 | **68000.s** | Motorola 68000 |
 | **6800.axx** | 18 KB | 271 | **6800.s** | Motorola 6800 |
@@ -4599,9 +4600,12 @@ extensions, checked byte-for-byte against llvm-mc 19); `mipsr6.axx`,
 `mipsr6el.axx`, `mips64r6.axx` and `mips64r6el.axx` pair with `mipsr6.s` (the
 re-encoded and the new instructions of Release 6, checked against llvm-mc 19
 down to the relocations). `mips_isa.axx` is included by those eight and is never
-passed to axx itself.
+passed to axx itself. `sparc.axx` pairs with `sparc_test.s` (one line per pattern
+row, checked against llvm-mc 19 byte-for-byte), `sparc_reloc.s` (the relocations
+under `-o`, checked against llvm-mc 19) and `bf_sparc.s` (the Brainfuck
+interpreter, run under qemu-sparc64).
 
-`test1` runs all fifty-four pairs through both implementations and
+`test1` runs all fifty-seven pairs through both implementations and
 compares the `-b` raw binaries. For the five pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
@@ -4622,13 +4626,14 @@ compared as well. The `regress.axx` regression test compares `regress.s` by its 
 `regresserr.s` (only lines that end in an error) by its diagnostics on standard error. The twelve MIPS pairs (`mips.axx`, `mipsel.axx`, `mips64.axx`
 and `mips64el.axx` with `mips.s` and with `mips_ase.s`, the four Release 6 files
 with `mipsr6.s`) also compare their `-o` ELF objects (ELF32 REL for o32, ELF64
-RELA for n64) besides the `-b` binaries.
+RELA for n64) besides the `-b` binaries. Of the three SPARC pairs,
+`sparc_reloc.s` and `bf_sparc.s` compare their `-o` ELF objects.
 
 The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for a hundred and eighty-eight comparisons in all.
+never compares, for a hundred and ninety-one comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -4638,7 +4643,9 @@ The `aarch64.axx` / `aarch64.s` pair and the eight MIPS pairs of `mips.s` and
 `mips_ase.s` are much the slowest of them: each run takes the Python
 implementation about twenty seconds, against about a second for the C one,
 because every source line is matched against a large pattern set (each MIPS pair
-runs under both `-b` and `-o`, sixteen runs in all). They dominate the running time of `test1`.
+runs under both `-b` and `-o`, sixteen runs in all). The `sparc.axx` /
+`sparc_test.s` pair is slower still: about ninety seconds in Python, about four
+in C. They dominate the running time of `test1`.
 
 x86_64 and legacy CPUs make up most of what is currently implemented, but that
 reflects where the work has gone, not the limit of what axx can describe.
@@ -4659,7 +4666,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all fifty-four bundled pattern/source pairs with both
+`test1` assembles all fifty-seven bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 five `.textmode` pairs, the `.echo` lines of the `echo.axx` and `ministr.axx` pairs,
 and the `-V` text and diagnostics of the `regress.axx` regression test.

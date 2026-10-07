@@ -85,6 +85,10 @@ caxx $P/ministr.axx $S/ministr.s -b b150 2>&1 | grep -v '^wrote ' > b150e
 # エラー系は標準エラーの診断を比べる（エラーなので出力ファイルは書かれない）。
 caxx $P/regress.axx $S/regress.s -V > b151
 caxx $P/regress.axx $S/regresserr.s -b b152 2>&1 | grep -v '^wrote ' > b152e
+# SPARC: sparc_test.s の全行、sparc_reloc.s のリロケーション、bf_sparc.s の ELF
+caxx $P/sparc.axx $S/sparc_test.s -b b153
+caxx $P/sparc.axx $S/sparc_reloc.s -o b154
+caxx $P/sparc.axx $S/bf_sparc.s -o b155 2>/dev/null
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -249,6 +253,9 @@ paxx $P/expcap.axx $S/expcap.s -V -b a149 > a149t
 paxx $P/ministr.axx $S/ministr.s -b a150 2>&1 | grep -v '^wrote ' > a150e
 paxx $P/regress.axx $S/regress.s -V > a151
 paxx $P/regress.axx $S/regresserr.s -b a152 2>&1 | grep -v '^wrote ' > a152e
+paxx $P/sparc.axx $S/sparc_test.s -b a153
+paxx $P/sparc.axx $S/sparc_reloc.s -o a154
+paxx $P/sparc.axx $S/bf_sparc.s -o a155 2>/dev/null
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -371,6 +378,9 @@ check a149t b149t
 check a150e b150e
 check a151 b151
 check a152e b152e
+check a153 b153
+check a154 b154
+check a155 b155
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"
