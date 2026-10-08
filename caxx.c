@@ -17019,6 +17019,26 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         if(_alt > 0) _rtype = _alt;
                     }
 
+                    /* `.elfresolve`: この（最終的に決まった）型が同じセクションの
+                       局所ラベル（.global / .weak でない）を指すなら、リロケーション
+                       を出さずに終える。`.elffield` の無い型（x86-64 の pc32/pc8/
+                       plt32 のような、欄がただの連続したバイト列の型）はここで見る。
+                       パターンの行はラベルの値がもう分かっているこのパスで、PC 相対
+                       の変位や絶対値をすでに正しく書き込んでいるので（`-b` と同じ
+                       計算）、そのまま残せばよい。緩和する機種では何もしない。
+                       axx.py の lineassemble() の同じ処理と同じ規則である。 */
+                    if(!elf_relaxing(st)
+                       && elf_type_in_list(st, st->elf_resolve_types, st->elf_resolve_types_len, _rtype)){
+                        LabelEntry *_rle0 = lmap_find(&st->labels, _lname);
+                        if(_rle0 && !_rle0->is_imported && !_rle0->is_equ && _rle0->section
+                           && _rle0->section[0] && strcmp(_rle0->section, sec_name) == 0
+                           && !lmap_find(&st->export_labels, _lname)
+                           && !sym_attr_get(st, _lname).weak){
+                            _gi = _gj;
+                            continue;
+                        }
+                    }
+
                     int64_t _addend;
                     {
                     /* 加数はワードで求めてから単位（.elfunit）に直す。 */

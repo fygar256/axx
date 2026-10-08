@@ -413,6 +413,13 @@ bf_sparc.s                          brainfuck interpreter for SPARC V9 (64-bit),
                                     R_SPARC_WDISP22 / 19 / 16
 format_of_exp_imp_file              format description for export/import file
 hello.s                             assembly file of x86_64 hello world. use x86_64.axx
+x86_64_reloc.s                      relocations of x86_64.axx / x86_64m.axx for
+                                    -o: call / jmp / jcc near and short, RIP-
+                                    relative operands and the absolute-addressed
+                                    MOV stores (PLT32 / PC32 / PC8 / ABS32S,
+                                    resolved in place for a local label of the
+                                    same section via .elfresolve), checked
+                                    against llvm-mc 19 and ld.lld 19
 hello.tsv                           export file of x86_64 hello world
 imp.tsv                             import file
 secsort.py                          execution file of section sort

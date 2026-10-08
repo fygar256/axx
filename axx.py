@@ -13750,6 +13750,24 @@ class Assembler:
                         if _alt is not None:
                             rtype = _alt
 
+                    # `.elfresolve`: この（最終的に決まった）型が同じセクションの局所
+                    # ラベル（.global / .weak でない）を指すなら、リロケーションを出さ
+                    # ずに終える。`.elffield` の無い型（x86-64 の pc32/pc8/plt32 のよう
+                    # な、欄がただの連続したバイト列の型）はここで見る。パターンの行は
+                    # ラベルの値がもう分かっているこのパスで、PC 相対の変位や絶対値を
+                    # すでに正しく書き込んでいるので（-b と同じ計算）、そのまま残せば
+                    # よい。緩和する機種では何もしない。caxx.c の lineassemble() の
+                    # 同じ処理と同じ規則である。
+                    if (_mach_tbl_la.get('resolve') and not _elf_relaxing(self.state)
+                            and rtype in _mach_tbl_la['resolve']):
+                        _rle0 = self.state.labels.get(lname)
+                        if (_rle0 is not None and not (len(_rle0) > 3 and _rle0[3])
+                                and not (len(_rle0) > 2 and _rle0[2])
+                                and _rle0[1] and _rle0[1] == sec_name_r
+                                and lname not in self.state.export_labels
+                                and not _sym_attr(self.state, lname)[_SA_WEAK]):
+                            continue
+
                     # 加数はワードで求めてから単位（.elfunit）に直す。
                     if rtype in _pc_rel_types_all:
                         _P_adj = self.label_manager._section_relative_offset(
