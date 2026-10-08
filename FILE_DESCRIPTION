@@ -304,45 +304,35 @@ bfsh/bf_x64_linux.sh                the same for Linux/x86_64, build_bf_linux/bf
                                     on FreeBSD it re-brands the result with
                                     brandelf -t Linux so it runs under the
                                     Linuxulator (manual 3.18)
-bfsh/bf_aarch64.sh                  build script: assembles bf_aarch64.s with
-                                    aarch64.axx -o and links it with ld.lld,
-                                    build_bf_aarch64/bf; given a .bf file it
-                                    runs it under qemu-aarch64 (the source is
-                                    Linux only; on FreeBSD the Linux qemu put
-                                    in /compat/linux for the Linuxulator is
-                                    used). given just `run`,
-                                    this and the other bf_*.sh run the bundled
-                                    mandelbrot.bf
-bfsh/bf_mips.sh                     the same for bf_mips_freebsd.s / bf_mips.s
-                                    (OS=freebsd / linux, default the host's;
-                                    ENDIAN=eb / el picks mips.axx / mipsel.axx),
-                                    build_bf_mips/bf or build_bf_mipsel/bf, run
-                                    under qemu-mips / qemu-mipsel
-bfsh/bf_ppc64.sh                    the same for bf_ppc64.s with ppc64.axx,
-                                    build_bf_ppc64/bf, run under qemu-ppc64
-                                    (Linux only; on FreeBSD the Linuxulator's
-                                    /compat/linux/usr/bin/qemu-ppc64)
-bfsh/bf_riscv64.sh                  the same for bf_riscv64_freebsd.s /
-                                    bf_riscv64.s with riscv64full.axx (OS=),
-                                    build_bf_riscv64/bf, run under qemu-riscv64;
-                                    brands the FreeBSD one, which ld.lld leaves
-                                    "System V"
-bfsh/bf_x86_64.sh                   the same for bf_x86_64.s with x86_64.axx: it
-                                    rewrites the `!set OS` line to the OS chosen
-                                    (OS=), build_bf_x86_64/bf. on FreeBSD the
-                                    Linux one is re-branded and runs under the
-                                    Linuxulator
-bfsh/bf_aarch64_linux.sh            the Linux qemu versions of the scripts
-bfsh/bf_mips_linux.sh               above: each builds the Linux source
-bfsh/bf_ppc64_linux.sh              (bf_aarch64.s, bf_mips.s with ENDIAN=eb /
-bfsh/bf_riscv64_linux.sh            el, bf_ppc64.s, bf_riscv64.s, bf_x86_64.s
-bfsh/bf_x86_64_linux.sh             with !set OS = "linux") into
-                                    build_bf_<arch>_linux/bf and runs it under
+bfsh/bf_mips_freebsd.sh             build script: assembles bf_mips_freebsd.s
+                                    with mips.axx / mipsel.axx (ENDIAN=eb / el)
+                                    -o, links it with ld.lld and brands it
+                                    FreeBSD, build_bf_mips_freebsd/bf or
+                                    build_bf_mipsel_freebsd/bf; given a .bf
+                                    file it runs it under qemu-mips-static /
+                                    qemu-mipsel-static (bsd-user). given just
+                                    `run`, this and the other bfsh/*.sh run
+                                    the bundled mandelbrot.bf
+bfsh/bf_riscv64_freebsd.sh          the same for bf_riscv64_freebsd.s with
+                                    riscv64full.axx, build_bf_riscv64_freebsd/bf,
+                                    run under qemu-riscv64 (bsd-user); the brand
+                                    is needed because ld.lld leaves "System V"
+bfsh/bf_x86_64_freebsd.sh           the same for bf_x86_64.s with x86_64.axx,
+                                    the `!set OS` line rewritten to "freebsd",
+                                    build_bf_x86_64_freebsd/bf, run directly
+bfsh/bf_aarch64_linux.sh            the Linux versions: each builds the Linux
+bfsh/bf_mips_linux.sh               source (bf_aarch64.s, bf_mips.s with
+bfsh/bf_ppc64_linux.sh              ENDIAN=eb / el, bf_ppc64.s, bf_riscv64.s,
+bfsh/bf_riscv64_linux.sh            bf_x86_64.s with !set OS = "linux") into
+bfsh/bf_x86_64_linux.sh             build_bf_<arch>_linux/bf and runs it under
                                     qemu-<arch>-static or qemu-<arch>
                                     (linux-user), or directly on the same CPU.
                                     on FreeBSD they use the Linux qemu put in
                                     /compat/linux/usr/bin for the Linuxulator
                                     (the qemu in /usr/local/bin is bsd-user);
+                                    the x86_64 one runs directly under the
+                                    Linuxulator. bf_aarch64.s and bf_ppc64.s
+                                    have no FreeBSD version;
                                     `run` runs mandelbrot.bf
 8080toz80.axx                     pattern file that translates Intel 8080 source
                                     into Zilog Z80 source text: .textmode, `!L`
