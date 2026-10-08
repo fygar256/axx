@@ -93,6 +93,10 @@ caxx $P/sparc.axx $S/bf_sparc.s -o b155 2>/dev/null
 # 改行が CR だけのファイルと UTF-8 でないバイトを含む行の -v の一覧
 caxx $P/z80.axx $S/regresself.s -o b156 2>&1 | grep -v '^elf: ' > b156e
 caxx $P/regress.axx $S/regresscr.s -v > b157
+# PowerPC64: DS / DQ 形式の欄（.reloc の第 4 欄）と、label-$$ と書いた PC 相対の
+# データ（.elfpcguess）。-o の ELF で比べる。両方のバイト順。
+caxx $P/ppc64.axx $S/ppc64_reloc2.s -o b158
+caxx $P/ppc64le.axx $S/ppc64_reloc2.s -o b159
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -262,6 +266,8 @@ paxx $P/sparc.axx $S/sparc_reloc.s -o a154
 paxx $P/sparc.axx $S/bf_sparc.s -o a155 2>/dev/null
 paxx $P/z80.axx $S/regresself.s -o a156 2>&1 | grep -v '^elf: ' > a156e
 paxx $P/regress.axx $S/regresscr.s -v > a157
+paxx $P/ppc64.axx $S/ppc64_reloc2.s -o a158
+paxx $P/ppc64le.axx $S/ppc64_reloc2.s -o a159
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -389,6 +395,8 @@ check a154 b154
 check a155 b155
 check a156e b156e
 check a157 b157
+check a158 b158
+check a159 b159
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

@@ -1587,13 +1587,15 @@ def _elf_v2l_second(state, prev, k, v):
 _DIFF_WORD = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.$')
 
 
-def _elf_v2l_finish(state, a, text):
+def _elf_v2l_finish(state, a, text, pcval=None):
     """変数 a の取り込みが終わったところで、ラベルの結び付きを決める。
 
     ラベルが 2 つ以上ならラベル差として読み取る（_elf_diff_resolve）。
     ラベルが 1 つでも、その符号が負（`-a+5` など）なら、`.elfdiff` があれば
     引く型だけのラベル差に、無ければ曖昧にする（足す型の加数では表せない
-    ため）。caxx.c の elf_v2l_finish() と同じ規則である。
+    ため）。`.elfpcguess::1` の機械では、綴りが「ラベル − `$$` + 定数」なら
+    `$$` を引く項にしたラベル差にする（PC 相対の参照。pcval は `$$` の値を
+    返す関数）。caxx.c の elf_v2l_finish() と同じ規則である。
     """
     if not state._elf_tracking:
         return
@@ -1602,6 +1604,12 @@ def _elf_v2l_finish(state, a, text):
     if isinstance(pend, list):
         v2l[a] = _elf_diff_resolve(text, pend)
     elif isinstance(pend, tuple) and len(pend) == 2:
+        if (pcval is not None and a not in state.reloc_constraints
+                and elf_machine_table(state)['pcrel_guess']):
+            r2 = _elf_diff_resolve(text, [pend, ('$$', pcval())])
+            if r2 is not None and sorted(r2[1]) == sorted(((1, pend[0]), (-1, '$$'))):
+                v2l[a] = r2
+                return
         r = _elf_diff_resolve(text, [pend])
         if r is not None and r[1][0][0] < 0:
             v2l[a] = r if (state.elf.decl_diff or state.elf.decl_diff_t) else None
@@ -1986,6 +1994,8 @@ class AssemblerState:
         self.var_tables: dict = {}
 
         self.reloc_constraints: dict = {}
+        # `.reloc` の第 4 欄（欄のマスク）。書かれた変数だけが持つ。
+        self.reloc_masks: dict = {}
         self._reloc_badname_seen: set = set()
 
         self.enum_defs: dict = {}
@@ -3782,6 +3792,18 @@ class ExpressionEvaluator:
             raise ValueError(f"xeval: unsafe result type {type(result)}")
         return result
 
+    def loc_counter_value(self):
+        """`$$` の値。binary_list の中では命令の先頭、外では今の位置。
+
+        binary_list と `.equ` の中ではセクション相対に直す。caxx.c の
+        loc_counter_value() と同じ規則である。
+        """
+        _raw = self.state.pc_instr_start if self.state._in_binary_list else self.state.pc
+        if self.state._in_binary_list or self.state._equ_sections_touched is not None:
+            _adj = self.label_manager._section_relative_offset(self.state.current_section, _raw)
+            return _adj if _adj is not None else _raw
+        return _raw
+
     def factor1(self, s, idx):
         """項そのものを 1 個読む。
 
@@ -3847,13 +3869,7 @@ class ExpressionEvaluator:
             idx += 3
         elif StringUtils.q(s, '$$', idx):
             idx += 2
-            _raw = self.state.pc_instr_start if self.state._in_binary_list else self.state.pc
-
-            if self.state._in_binary_list or self.state._equ_sections_touched is not None:
-                _adj = self.label_manager._section_relative_offset(self.state.current_section, _raw)
-                x = _adj if _adj is not None else _raw
-            else:
-                x = _raw
+            x = self.loc_counter_value()
         elif StringUtils.q(s, '$.', idx):
             idx += 2
             _raw = self.state.pc_instr_end
@@ -4064,16 +4080,23 @@ class ExpressionEvaluator:
                         _cst = 0 if _is_undef_derived(x) else int(x) - int(_tot)
                         self.state._elf_insn_reloc_hint.setdefault(
                             ('d', self.state._elf_current_word_idx),
-                            (_terms, self.state.reloc_constraints.get(ch), _cst))
+                            (_terms, self.state.reloc_constraints.get(ch), _cst,
+                             self.state.reloc_masks.get(ch, 0)))
                         entry = None
                     if isinstance(entry, tuple):
                         lname, lval = entry
                         self.state._elf_label_refs_seen.append(
                             (lname, lval, self.state._elf_current_word_idx))
+                        # オペランドの値 − ラベルの値（綴りの定数）。`.elfpcguess` の
+                        # 推測が「欄がオペランドの値を持つか」を見るのに使う。
+                        if not _is_undef_derived(x):
+                            self.state._elf_insn_reloc_hint.setdefault(
+                                ('v', self.state._elf_current_word_idx), int(x) - int(lval))
                         _rt = self.state.reloc_constraints.get(ch)
                         if _rt is not None and not _is_undef_derived(x):
                             self.state._elf_insn_reloc_hint.setdefault(
-                                self.state._elf_current_word_idx, (_rt, int(x) - int(lval)))
+                                self.state._elf_current_word_idx,
+                                (_rt, int(x) - int(lval), self.state.reloc_masks.get(ch, 0)))
         elif idx < len(s) and s[idx] in self.state.lwordchars:
             w, idx_new = self.parser.get_label_word(s, idx, eat_colon=False)
             if idx != idx_new:
@@ -5767,7 +5790,25 @@ class DirectiveProcessor:
                     f" error - .reloc: unknown relocation type '{tname}' for {_mname}.",
                     set_error=True)
             return True
+        # 第 4 欄は欄のマスク。同じ型番号でも命令によって欄の形が違うとき
+        # （PowerPC64 の DS 形式と DQ 形式）に、その行の欄だけを言い直す。
+        # `.elffield` の宣言がある型にだけ書ける。caxx.c の dir_reloc() と
+        # 同じ規則である。
+        fmask = 0
+        if len(i) > 3 and i[3].strip():
+            if insn_reloc_field_decl(self.state, rtype) is None:
+                self.state.diag(
+                    f" error - .reloc: a field mask needs a type declared with "
+                    f".elffield ('{type_field}').", set_error=True)
+                return True
+            fmask = self._elf_decl_num('.reloc', i[3], 1, 0xFFFFFFFFFFFFFFFF)
+            if fmask is None:
+                return True
         self.state.reloc_constraints[var] = rtype
+        if fmask:
+            self.state.reloc_masks[var] = fmask
+        else:
+            self.state.reloc_masks.pop(var, None)
         return True
 
     def clrreloc_processing(self, i):
@@ -5781,10 +5822,12 @@ class DirectiveProcessor:
             var = self._dir_var(var_field)
             if var is not None:
                 self.state.reloc_constraints.pop(var, None)
+                self.state.reloc_masks.pop(var, None)
             else:
                 self.state.diag(f" error - .clrreloc: variable should be a lower case name ('{var_field}').", set_error=True)
         else:
             self.state.reloc_constraints.clear()
+            self.state.reloc_masks.clear()
         return True
 
     def clrcheck_processing(self, i):
@@ -5894,6 +5937,7 @@ class DirectiveProcessor:
             if _v and PatternMatcher._var_name_at(_v, 0) == len(_v):
                 self.state.check_constraints.pop(_v, None)
                 self.state.reloc_constraints.pop(_v, None)
+                self.state.reloc_masks.pop(_v, None)
                 self.state.enum_defs.pop(_v, None)
         return True
 
@@ -6498,7 +6542,7 @@ class PatternMatcher:
                     if stopchar != chr(0) and raw_text.endswith(stopchar):
                         raw_text = raw_text[:-1]
                     self._cap_text(a, s, idx_s_text_start, idx_s, stopchar)
-                    _elf_v2l_finish(self.state, a, raw_text)
+                    _elf_v2l_finish(self.state, a, raw_text, self.expr_eval.loc_counter_value)
 
                     if self.state.textmode:
                         self.state.error_undefined_label = _cap_prior
@@ -6577,7 +6621,7 @@ class PatternMatcher:
                         v, idx_s = self.expr_eval.factor(s, idx_s)
                     finally:
                         self.state._elf_capturing_var = None
-                    _elf_v2l_finish(self.state, a, s[_cap_start:idx_s])
+                    _elf_v2l_finish(self.state, a, s[_cap_start:idx_s], self.expr_eval.loc_counter_value)
                     self._cap_text(a, s, _cap_start, idx_s)
                     _cap_undef = self.state.error_undefined_label
                     self.state.error_undefined_label = _cap_prior or _cap_undef
@@ -6600,7 +6644,7 @@ class PatternMatcher:
                         self.state._elf_capturing_var = None
                     for _k in _closes:
                         self._sub_mark(SUB_CLOSE, _k, idx_s)
-                    _elf_v2l_finish(self.state, a, s[_cap_start:idx_s])
+                    _elf_v2l_finish(self.state, a, s[_cap_start:idx_s], self.expr_eval.loc_counter_value)
                     self._cap_text(a, s, _cap_start, idx_s, stopchar)
                     _cap_undef = self.state.error_undefined_label
                     self.state.error_undefined_label = _cap_prior or _cap_undef
@@ -9593,6 +9637,7 @@ class ObjectGenerator:
                             e for e in self.state._elf_label_refs_seen if e[2] != _wi
                         ]
                         self.state._elf_insn_reloc_hint.pop(_wi, None)
+                        self.state._elf_insn_reloc_hint.pop(('v', _wi), None)
                     objl += words
                     self.state._elf_current_word_idx = -1
                     if idx < len(s) and s[idx] == ',':
@@ -12632,6 +12677,7 @@ class Assembler:
             snap['symbols'] = dict(self.state.symbols)
             snap['check_constraints'] = dict(self.state.check_constraints)
             snap['reloc_constraints'] = dict(self.state.reloc_constraints)
+            snap['reloc_masks'] = dict(self.state.reloc_masks)
             snap['enum_defs'] = dict(self.state.enum_defs)
             snap['vliwnop'] = list(self.state.vliwnop)
             snap['vliwset'] = list(self.state.vliwset)
@@ -12643,6 +12689,7 @@ class Assembler:
             self.state.symbols = dict(snap['symbols'])
             self.state.check_constraints = dict(snap['check_constraints'])
             self.state.reloc_constraints = dict(snap['reloc_constraints'])
+            self.state.reloc_masks = dict(snap['reloc_masks'])
             self.state.enum_defs = dict(snap['enum_defs'])
             self.state.vliwnop = list(snap['vliwnop'])
             self.state.vliwset = list(snap['vliwset'])
@@ -12963,6 +13010,7 @@ class Assembler:
         else:
             self.state.check_constraints.clear()
             self.state.reloc_constraints.clear()
+            self.state.reloc_masks.clear()
             self.state.enum_defs.clear()
             self.state.freed_subs.clear()
 
@@ -13107,13 +13155,53 @@ class Assembler:
                         # 足す項が無ければ最初の引く項の加数に符号を反転して置く。
                         if first_widx >= len(objl):
                             continue
-                        _dterms, _drt, _dcst = _dinfo
+                        _dterms, _drt, _dcst, _dfmask = _dinfo
+                        if _drt is None and len(_dterms) == 2:
+                            # 「ラベル − `$$`」（_elf_v2l_finish が `.elfpcguess::1` の
+                            # 機械で作る）。同じセクションのラベルなら距離は決まって
+                            # いるのでリロケーションを出さず、欄の値をそのまま使う。
+                            # それ以外はその幅の PC 相対の型で、加数は定数部。
+                            # caxx.c の lineassemble() の同じ処理と同じ規則である。
+                            _pl = next((n for sg, n in _dterms if sg > 0), None)
+                            if _pl is not None and any(sg < 0 and n == '$$' for sg, n in _dterms):
+                                _ple = self.state.labels.get(_pl)
+                                _same = (_ple is not None and not (len(_ple) > 3 and _ple[3])
+                                         and _ple[1] == sec_name_r)
+                                if not _same:
+                                    _prt = None
+                                    _psrc = _ple[4] if (_ple and len(_ple) > 4
+                                                        and _ple[4] is not None) else None
+                                    if _psrc is not None and _pl not in self.state.extern_untyped:
+                                        _pex = _mach_tbl_la['reloc_bytes'].get(_psrc)
+                                        if _pex is None or _pex == num_bytes:
+                                            _prt = _psrc
+                                    if _prt is None:
+                                        _prt = _reloc_same_width(_mach_tbl_la, num_bytes, True)
+                                    if _prt is None:
+                                        if self.state.debug:
+                                            self.state.diag(
+                                                f" warning - no PC-relative relocation type for a "
+                                                f"{num_bytes}-byte reference to '{_pl}'; relocation "
+                                                f"omitted.", set_error=False)
+                                    else:
+                                        if _mach_tbl_la['is_rela']:
+                                            for _k in range(num_words):
+                                                if first_widx + _k < len(objl):
+                                                    objl[first_widx + _k] = 0
+                                        _psec = (_completed_words
+                                                 + (self.state.pc + first_widx - _entry_pc_cur)) * bpw_r
+                                        self.state.relocations.append(
+                                            (sec_name_r, _psec, _pl, _prt, _dcst * _scale,
+                                             num_bytes, 0))
+                                continue
                         _dexpr = ''.join(('+' if sg > 0 else '-') + n for sg, n in _dterms)
                         _dexpr = _dexpr[1:] if _dexpr.startswith('+') else _dexpr
                         _dfd = None
                         if _drt is not None:
                             _dpair = _mach_tbl_la['diff_t'].get(_drt)
                             _dfd = _mach_tbl_la['field'].get(_drt)
+                            if _dfd is not None and _dfmask:
+                                _dfd = (_dfmask,) + tuple(_dfd[1:])
                         else:
                             _dpair = _mach_tbl_la['diff'].get(num_bytes)
                         if _dpair is None:
@@ -13159,7 +13247,7 @@ class Assembler:
                                 _dput = True
                             self.state.relocations.append(
                                 (sec_name_r, _dsec, n, _dpair[0] if sg > 0 else _dpair[1],
-                                 _da, _dnb))
+                                 _da, _dnb, _dfmask if _dfd is not None else 0))
                         continue
 
                     _hint = self.state._elf_insn_reloc_hint.get(first_widx)
@@ -13168,10 +13256,13 @@ class Assembler:
                                                and lentry[4] is not None) else None
                     _forced_rtype = None
                     if _hint is not None:
-                        _hint_rtype, _hint_addend = _hint
+                        _hint_rtype, _hint_addend, _hint_fmask = _hint
                         if _src_rtype is not None and lname not in self.state.extern_untyped:
                             _hint_rtype = _src_rtype
                         _fdecl = insn_reloc_field_decl(self.state, _hint_rtype)
+                        # `.reloc` の第 4 欄があれば、その行の欄のマスクはそれ。
+                        if _fdecl is not None and _hint_fmask:
+                            _fdecl = (_hint_fmask,) + tuple(_fdecl[1:])
                         if _fdecl is None:
                             _forced_rtype = _hint_rtype
                         else:
@@ -13191,7 +13282,7 @@ class Assembler:
                             # 加数は「オペランドの値 − ラベルの値」に補正を足したもの。
                             self.state.relocations.append(
                                 (sec_name_r, _sec_rel_h, lname, _hint_rtype,
-                                 _hint_addend * _scale + _fbias, _insn_bytes))
+                                 _hint_addend * _scale + _fbias, _insn_bytes, _hint_fmask))
                             continue
 
                     rtype = 0
@@ -13250,9 +13341,17 @@ class Assembler:
                         if _alt is not None:
                             rtype = _alt
 
+                    # 欄がオペランドの値（ラベル＋綴りの定数）を持っていなければ、
+                    # パターンが変位を計算したものとして PC 相対の型にする。比べるのは
+                    # 欄の幅のビットだけ。`.long ext+4` の欄は 4 で、絶対のまま。
+                    # caxx.c の lineassemble() と同じ規則である。
+                    _pcg_d = raw_val - (abs_wi + self.state._elf_insn_reloc_hint.get(
+                        ('v', first_widx), 0))
+                    if 0 < _field_bits < 64:
+                        _pcg_d &= (1 << _field_bits) - 1
                     if (_rtype_is_default_guess and _mach_tbl_la['pcrel_guess']
                             and rtype not in _pc_rel_types_all
-                            and raw_val != abs_wi):
+                            and _pcg_d != 0):
                         _alt = _reloc_same_width(_mach_tbl_la, num_bytes, True)
                         if _alt is not None:
                             rtype = _alt
@@ -13266,7 +13365,7 @@ class Assembler:
                     else:
                         addend = (raw_val - abs_wi) * _scale
 
-                    self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend, num_bytes))
+                    self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend, num_bytes, 0))
 
             if self.state.gen_debug and self.state.pas == 2 and of > 0:
                 self.state.line_map.append(
@@ -14460,14 +14559,14 @@ class Assembler:
         from collections import defaultdict as _defaultdict
         rela_entries = _defaultdict(list)
         _extra_w = _mach_tbl_w['extra']
-        for (sname, off, sym_name, rtype, addend, nbytes) in self.state.relocations:
+        for (sname, off, sym_name, rtype, addend, nbytes, fmask) in self.state.relocations:
             sidx = sec_name_to_idx.get(sname, 0)
             if sidx:
-                rela_entries[sidx].append((off, sym_name, rtype, addend, nbytes))
+                rela_entries[sidx].append((off, sym_name, rtype, addend, nbytes, fmask))
                 # `.elfextra` の添えるリロケーション。同じ位置、加数 0。
                 for (_crt, _csym) in _extra_w.get(rtype, ()):
                     rela_entries[sidx].append(
-                        (off, sym_name if _csym else None, _crt, 0, nbytes))
+                        (off, sym_name if _csym else None, _crt, 0, nbytes, 0))
             else:
                 if self.state.should_report_errors():
                     self.state.diag(
@@ -14483,11 +14582,13 @@ class Assembler:
                 # 同じ位置に複数の項目があるとき（`.elfdiff` の対、`.elfextra`）は
                 # 最初の項目の加数だけを書き戻す。後の項目の 0 で消さないため。
                 _written = set()
-                for (off, _sym_name, _rtype, addend, nbytes) in entries:
+                for (off, _sym_name, _rtype, addend, nbytes, _fmask) in entries:
                     if off in _written:
                         continue
                     _written.add(off)
                     _fd = _mach_tbl_w['field'].get(_rtype)
+                    if _fd is not None and _fmask:
+                        _fd = (_fmask,) + tuple(_fd[1:])
                     _enc = _enc_w.get(_rtype)
                     if _enc is not None:
                         # `.elfencode` の関数が (欄の値, 加数) から新しい欄を作る。
@@ -14823,7 +14924,7 @@ class Assembler:
             _warned_rt = set()
             _warned_sym = False
             for sidx in rela_sec_order:
-                for (_off, _sn, _rt, _ad, _nb) in rela_entries[sidx]:
+                for (_off, _sn, _rt, _ad, _nb, _fm) in rela_entries[sidx]:
                     if _rt > 0xFF and _rt not in _warned_rt:
                         _warned_rt.add(_rt)
                         self.state.diag(
@@ -14843,12 +14944,12 @@ class Assembler:
             if _is_rela:
                 data = b''.join(
                     _pack_rela(off, sym_name_to_idx.get(sn, 0), rtype, addend)
-                    for (off, sn, rtype, addend, _nbytes) in entries
+                    for (off, sn, rtype, addend, _nbytes, _fm) in entries
                 )
             else:
                 data = b''.join(
                     _pack_rel(off, sym_name_to_idx.get(sn, 0), rtype)
-                    for (off, sn, rtype, _addend, _nbytes) in entries
+                    for (off, sn, rtype, _addend, _nbytes, _fm) in entries
                 )
             rela_datas.append(data)
 
@@ -15242,6 +15343,7 @@ class Assembler:
             'symbols':           dict(st.symbols),
             'check_constraints': dict(st.check_constraints),
             'reloc_constraints': dict(st.reloc_constraints),
+            'reloc_masks': dict(st.reloc_masks),
             'enum_defs':         dict(st.enum_defs),
         }
         f = st.hoist_fields
@@ -15265,6 +15367,7 @@ class Assembler:
         st.symbols = dict(snap['symbols'])
         st.check_constraints = dict(snap['check_constraints'])
         st.reloc_constraints = dict(snap['reloc_constraints'])
+        st.reloc_masks = dict(snap['reloc_masks'])
         st.enum_defs = dict(snap['enum_defs'])
         f = st.hoist_fields
         if 'bits' in f:

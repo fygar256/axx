@@ -413,7 +413,12 @@ ppc64_test.s                        test assemble file for ppc64.axx / ppc64le.a
                                     GNU as byte-for-byte
 ppc64_reloc_test.s                  every relocatable row against an external
                                     symbol, for -o; relocations match GNU as
-hello_ppc64.s                       hello world for big-endian PowerPC64 Linux
+ppc64_reloc2.s                      the relocations ppc64_reloc_test.s does not
+                                    reach, for -o: DS / DQ-form fields with
+                                    addends whose bits 2-3 are set (the mask
+                                    field of .reloc) and data written as
+                                    label-$$ (REL64 / REL32 / REL16, .elfpcguess)
+hello_ppc64.s                      hello world for big-endian PowerPC64 Linux
                                     (ELFv1 function descriptor in .opd).
                                     caxx ppc64.axx hello_ppc64.s -o hello.o
 sparc.axx                           pattern file for SPARC: V7 / V8 / V9, VIS 1-3,

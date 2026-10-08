@@ -2386,7 +2386,7 @@ typedef struct {
 
     int        elf_tracking;
     struct { char *name; uint64_t val; int word_idx;
-             int rtype; int64_t addend; } *elf_refs;
+             int rtype; int64_t addend; uint64_t fmask; } *elf_refs;
     int        elf_refs_len;
     int        elf_refs_cap;
     int        elf_current_word_idx;
@@ -2403,6 +2403,7 @@ typedef struct {
         int     rtype;
         int64_t addend;
         int     nbytes;
+        uint64_t fmask;     /* `.reloc` の第 4 欄で上書きした欄のマスク（0 は型のまま） */
     } *relocations;
     int        reloc_count;
     int        reloc_cap;
@@ -2413,6 +2414,7 @@ typedef struct {
     /* `.unordered` のときだけ使う、変数ごとの名前と値の表（`.map` が作る）。 */
     SymMap    *var_tables[NVARS];
     int        reloc_constraints[NVARS];
+    uint64_t   reloc_masks[NVARS];     /* `.reloc` の第 4 欄（欄のマスク）。0 は型のまま */
     char      *reloc_badname[32];
     int        reloc_badname_len;
 
@@ -3439,6 +3441,17 @@ static int64_t equ_section_relative_offset(AsmState *st, const char *sec_name, u
     return -1;
 }
 
+/* `$$` の値。binary_list の中では命令の先頭、外では今の位置。binary_list と
+   `.equ` の中ではセクション相対に直す。axx.py の factor1() の `$$` と同じ規則である。 */
+static uint256_t loc_counter_value(AsmState *st){
+    uint256_t x = st->in_binary_list ? st->pc_instr_start : st->pc;
+    if(st->in_binary_list || st->equ_section_tracking){
+        int64_t _adj = equ_section_relative_offset(st, st->current_section, u256_to_u64(x));
+        if(_adj >= 0) x = u256_from_u64((uint64_t)_adj);
+    }
+    return x;
+}
+
 /* 現在のセクションを切り替える。 */
 static void st_set_current_section(AsmState *st, const char *name){
     size_t n = strlen(name) + 1;
@@ -3551,6 +3564,7 @@ static void state_init(AsmState *st) {
     for(int _ci=0; _ci<NVARS; _ci++) st->check_constraints[_ci] = NULL;
     for(int _ci=0; _ci<NVARS; _ci++) st->var_tables[_ci] = NULL;
     for(int _ci=0; _ci<NVARS; _ci++) st->reloc_constraints[_ci] = 0;
+    for(int _ci=0; _ci<NVARS; _ci++) st->reloc_masks[_ci] = 0;
     st->reloc_badname_len = 0;
     st->elftypes = NULL; st->elftypes_len = 0; st->elftypes_cap = 0;
     st->elf_decl_machine = -1;
@@ -4772,6 +4786,33 @@ static char *elf_diff_resolve(const char *t, int L, char **names, const uint64_t
    決まらなければ曖昧（-1）。 */
 static void elf_v2l_finish(AsmState *st, int vi, const char *text, int len){
     if(!st->elf_tracking || vi < 0 || vi >= NVARS) return;
+    if(st->elf_var_to_label[vi].set == 1 && st->reloc_constraints[vi] == 0
+       && elf_machine_effective(st)->pcrel_guess){
+        /* `.elfpcguess::1` の機械では、綴りが「ラベル − `$$` + 定数」なら PC 相対の
+           参照とする。`$$` を引く項にしたラベル差にしておけば、加数（値 − Σ）が
+           定数部になり、リロケーションを作るところが PC 相対の型を選ぶ。`.reloc`
+           の型がある変数（命令欄）は今までどおり。axx.py の _elf_v2l_finish() と
+           同じ規則である。 */
+        char *nm2[2] = { st->elf_var_to_label[vi].label_name, (char *)"$$" };
+        uint64_t v2[2] = { st->elf_var_to_label[vi].label_val,
+                           u256_to_u64(loc_counter_value(st)) };
+        uint64_t sv2 = 0;
+        char *c2 = elf_diff_resolve(text, len, nm2, v2, 2, &sv2);
+        if(c2){
+            size_t ln = strlen(nm2[0]);
+            int pcrel = (c2[0] == '+' && strncmp(c2 + 1, nm2[0], ln) == 0
+                         && strcmp(c2 + 1 + ln, "\x01-$$") == 0)
+                     || (strncmp(c2, "-$$\x01+", 5) == 0 && strcmp(c2 + 5, nm2[0]) == 0);
+            if(pcrel){
+                v2l_note_write(st, vi);
+                st->elf_var_to_label[vi].set = 3;
+                st->elf_var_to_label[vi].label_name = c2;
+                st->elf_var_to_label[vi].label_val = sv2;
+                return;
+            }
+            free(c2);
+        }
+    }
     if(st->elf_var_to_label[vi].set == 1){
         /* ラベルが 1 つでも符号が負（`-a+5` など）なら、`.elfdiff` があれば引く型
            だけのラベル差に、無ければ曖昧にする。axx.py の _elf_v2l_finish() と同じ。 */
@@ -4894,6 +4935,7 @@ static uint256_t label_get_value(AsmState *st, const char *k){
                 st->elf_refs[st->elf_refs_len].word_idx = st->elf_current_word_idx;
                 st->elf_refs[st->elf_refs_len].rtype    = 0;
                 st->elf_refs[st->elf_refs_len].addend   = 0;
+                st->elf_refs[st->elf_refs_len].fmask    = 0;
                 st->elf_refs_len++;
             }
         }
@@ -5597,11 +5639,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
         if(asmb->st.exp_typ_float) x=double_to_u256((double)cv); }
     else if(axx_q(s,slen,"$$",idx)){
         idx+=2;
-        x = st->in_binary_list ? st->pc_instr_start : st->pc;
-        if(st->in_binary_list || st->equ_section_tracking){
-            int64_t _adj = equ_section_relative_offset(st, st->current_section, u256_to_u64(x));
-            if(_adj >= 0) x = u256_from_u64((uint64_t)_adj);
-        }
+        x = loc_counter_value(st);
         if(asmb->st.exp_typ_float)
             x=double_to_u256(u256_int_to_double(x));
     }
@@ -5947,6 +5985,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     /* ラベル差でも `.reloc` の型（型付きの差）と定数部を持たせる。 */
                     (void)_isdiff;
                     st->elf_refs[st->elf_refs_len].rtype    = st->reloc_constraints[_vi];
+                    st->elf_refs[st->elf_refs_len].fmask    = st->reloc_masks[_vi];
                     st->elf_refs[st->elf_refs_len].addend   =
                         u256_is_undef_derived(x) && _isdiff ? 0 :
                         (int64_t)(u256_to_u64(x) - st->elf_var_to_label[_vi].label_val);
@@ -7862,7 +7901,21 @@ static int dir_reloc(Assembler *asmb, PatEntry *e){
         return 1;
     }
     free(tname);
+    /* 第 4 欄は欄のマスク。同じ型番号でも命令によって欄の形が違うとき
+       （PowerPC64 の DS 形式と DQ 形式）に、その行の欄だけを言い直す。
+       `.elffield` の宣言がある型にだけ書ける。axx.py の reloc_processing()
+       と同じ規則である。 */
+    uint64_t fmask = 0;
+    if(!fld_blank(e->f[3])){
+        if(!insn_reloc_field_decl(&asmb->st, rtype)){
+            axx_diagf(1, 0, " error - .reloc: a field mask needs a type declared with "
+                            ".elffield ('%s').\n", type_str);
+            return 1;
+        }
+        if(!elf_decl_u64(asmb, ".reloc", e->f[3], 1, 0xFFFFFFFFFFFFFFFFull, &fmask)) return 1;
+    }
     asmb->st.reloc_constraints[idx] = rtype;
+    asmb->st.reloc_masks[idx] = fmask;
     return 1;
 }
 
@@ -7878,8 +7931,12 @@ static int dir_clrreloc(Assembler *asmb, PatEntry *e){
             return 1;
         }
         asmb->st.reloc_constraints[idx] = 0;
+        asmb->st.reloc_masks[idx] = 0;
     } else {
-        for(int i = 0; i < g_nvars; i++) asmb->st.reloc_constraints[i] = 0;
+        for(int i = 0; i < g_nvars; i++){
+            asmb->st.reloc_constraints[i] = 0;
+            asmb->st.reloc_masks[i] = 0;
+        }
     }
     return 1;
 }
@@ -7939,6 +7996,7 @@ static void free_one_name(Assembler *asmb, const char *name){
             if(vi >= 0){
                 chk_install(&st->check_constraints[vi], NULL);
                 st->reloc_constraints[vi] = 0;
+                st->reloc_masks[vi] = 0;
                 enumdef_clear(&st->enum_defs[vi]);
             }
         }
@@ -15063,12 +15121,13 @@ typedef struct {
     PatEntry *pat;
     PatVar    vars[NVARS];
     struct { char *name; uint64_t val; int word_idx;
-             int rtype; int64_t addend; } *refs;
+             int rtype; int64_t addend; uint64_t fmask; } *refs;
     int       refs_len;
     struct { int set; char *label_name; uint64_t label_val; } vtl[NVARS];
     SymMap    symbols;
     ChkList  *check_constraints[NVARS];
     int       reloc_constraints[NVARS];
+    uint64_t  reloc_masks[NVARS];
     EnumDef   enum_defs[NVARS];
     char      swordchars[256];
     uint256_t padding;
@@ -15142,6 +15201,7 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
             b->refs[i].word_idx = st->elf_refs[saved_refs_len+i].word_idx;
             b->refs[i].rtype    = st->elf_refs[saved_refs_len+i].rtype;
             b->refs[i].addend   = st->elf_refs[saved_refs_len+i].addend;
+            b->refs[i].fmask    = st->elf_refs[saved_refs_len+i].fmask;
         }
     }
     for(int i=0;i<g_nvars;i++){
@@ -15157,6 +15217,7 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
     for(int i=0;i<g_nvars;i++){
         b->check_constraints[i] = chk_ref(st->check_constraints[i]);
         b->reloc_constraints[i] = st->reloc_constraints[i];
+        b->reloc_masks[i]       = st->reloc_masks[i];
         enumdef_init(&b->enum_defs[i]);
         enumdef_copy(&b->enum_defs[i], &st->enum_defs[i]);
     }
@@ -15182,6 +15243,7 @@ static void best_restore_dirstate(AsmState *st, const BestMatch *b){
     for(int i=0;i<g_nvars;i++){
         chk_install(&st->check_constraints[i], chk_ref(b->check_constraints[i]));
         st->reloc_constraints[i] = b->reloc_constraints[i];
+        st->reloc_masks[i]       = b->reloc_masks[i];
         enumdef_copy(&st->enum_defs[i], &b->enum_defs[i]);
     }
     memcpy(st->swordchars, b->swordchars, sizeof(st->swordchars));
@@ -15204,6 +15266,7 @@ typedef struct {
     SymMap    symbols;
     ChkList  *check_constraints[NVARS];
     int       reloc_constraints[NVARS];
+    uint64_t  reloc_masks[NVARS];
     EnumDef   enum_defs[NVARS];
     char      swordchars[256];
     uint256_t padding;
@@ -15235,6 +15298,7 @@ static void hdrsnap_take(DirSnap *d, AsmState *st){
     for(int i=0;i<g_nvars;i++){
         d->check_constraints[i] = chk_ref(st->check_constraints[i]);
         d->reloc_constraints[i] = st->reloc_constraints[i];
+        d->reloc_masks[i]       = st->reloc_masks[i];
         enumdef_init(&d->enum_defs[i]);
         enumdef_copy(&d->enum_defs[i], &st->enum_defs[i]);
     }
@@ -15257,6 +15321,7 @@ static void hdrsnap_restore(DirSnap *d, AsmState *st){
     for(int i=0;i<g_nvars;i++){
         chk_install(&st->check_constraints[i], chk_ref(d->check_constraints[i]));
         st->reloc_constraints[i] = d->reloc_constraints[i];
+        st->reloc_masks[i]       = d->reloc_masks[i];
         enumdef_copy(&st->enum_defs[i], &d->enum_defs[i]);
     }
     if(g_hoist_symbolc) memcpy(st->swordchars, d->swordchars, sizeof(st->swordchars));
@@ -15273,7 +15338,7 @@ static void hdrsnap_restore(DirSnap *d, AsmState *st){
 
 static void elf_refs_push_copy(AsmState *st, const char *name,
                                uint64_t val, int word_idx,
-                               int rtype, int64_t addend){
+                               int rtype, int64_t addend, uint64_t fmask){
     if(st->elf_refs_len >= st->elf_refs_cap){
         st->elf_refs_cap = st->elf_refs_cap ? st->elf_refs_cap*2 : 8;
         st->elf_refs = realloc(st->elf_refs,
@@ -15285,6 +15350,7 @@ static void elf_refs_push_copy(AsmState *st, const char *name,
     st->elf_refs[st->elf_refs_len].word_idx = word_idx;
     st->elf_refs[st->elf_refs_len].rtype    = rtype;
     st->elf_refs[st->elf_refs_len].addend   = addend;
+    st->elf_refs[st->elf_refs_len].fmask    = fmask;
     st->elf_refs_len++;
 }
 
@@ -15696,7 +15762,8 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
         for(int ri2=0; ri2<best.refs_len; ri2++)
             elf_refs_push_copy(st, best.refs[ri2].name,
                                best.refs[ri2].val, best.refs[ri2].word_idx,
-                               best.refs[ri2].rtype, best.refs[ri2].addend);
+                               best.refs[ri2].rtype, best.refs[ri2].addend,
+                               best.refs[ri2].fmask);
         for(int vi=0;vi<g_nvars;vi++){
             free(st->elf_var_to_label[vi].label_name);
             st->elf_var_to_label[vi].set        = best.vtl[vi].set;
@@ -15813,7 +15880,7 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
 }
 
 typedef struct { const char *name; uint64_t val; int word_idx; int ord;
-                 int rtype; int64_t addend; } ElfRef;
+                 int rtype; int64_t addend; uint64_t fmask; } ElfRef;
 
 /* ラベル参照を出力ワードの順に並べるための比較関数。 */
 static int elf_ref_cmp(const void *a, const void *b){
@@ -15863,6 +15930,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
         for(int _ci = 0; _ci < g_nvars; _ci++){
             chk_install(&asmb->st.check_constraints[_ci], NULL);
             asmb->st.reloc_constraints[_ci] = 0;
+            asmb->st.reloc_masks[_ci] = 0;
             enumdef_clear(&asmb->st.enum_defs[_ci]);
         }
         subv_unfreeze_all(&asmb->st.subs);
@@ -16052,7 +16120,8 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                                               st->elf_refs[_ri].word_idx,
                                               _nvalid,
                                               st->elf_refs[_ri].rtype,
-                                              st->elf_refs[_ri].addend};
+                                              st->elf_refs[_ri].addend,
+                                              st->elf_refs[_ri].fmask};
                     _nvalid++;
                 }
             }
@@ -16129,11 +16198,73 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                             }
                         }
                         int _drt = _valid[_gi].rtype;
+                        /* 「ラベル − `$$`」（elf_v2l_finish() が `.elfpcguess::1` の機械で
+                           作る）。同じセクションのラベルなら距離は決まっているので
+                           リロケーションを出さず、欄の値をそのまま使う。それ以外は
+                           その幅の PC 相対の型で、加数は定数部。axx.py の
+                           lineassemble() の同じ処理と同じ規則である。 */
+                        if(_nt == 2 && _drt == 0){
+                            int _pl = -1, _pd = -1;
+                            for(int k = 0; k < 2; k++){
+                                if(_ts[k] > 0) _pl = k;
+                                else if(strcmp(_tn[k], "$$") == 0) _pd = k;
+                            }
+                            if(_pl >= 0 && _pd >= 0){
+                                const char *_pname = _tn[_pl];
+                                LabelEntry *_ple = lmap_find(&st->labels, _pname);
+                                int _same = _ple && !_ple->is_imported && _ple->section
+                                            && strcmp(_ple->section, sec_name) == 0;
+                                if(!_same && _widx < objl.len){
+                                    int _prt = 0;
+                                    if(_ple && _ple->reloc_type_override >= 0
+                                       && !extern_untyped_has(st, _pname)){
+                                        int _ex = elf_machine_reloc_bytes(_mtbl_rm, _ple->reloc_type_override);
+                                        if(_ex == 0 || _ex == _nbytes) _prt = _ple->reloc_type_override;
+                                    }
+                                    if(_prt == 0) _prt = elf_reloc_same_width(_mtbl_rm, _nbytes, 1);
+                                    if(_prt == 0){
+                                        if(st->debug)
+                                            axx_diagf(0, 0, " warning - no PC-relative relocation type "
+                                                       "for a %d-byte reference to '%s'; relocation "
+                                                       "omitted.\n", _nbytes, _pname);
+                                    } else {
+                                        if(_mtbl_rm->is_rela)
+                                            for(int _k = 0; _k < _nwords; _k++)
+                                                if(_widx + _k < objl.len) objl.data[_widx + _k] = u256_zero();
+                                        if(st->reloc_count >= st->reloc_cap){
+                                            st->reloc_cap = st->reloc_cap ? st->reloc_cap*2 : 16;
+                                            st->relocations = realloc(st->relocations,
+                                                (size_t)st->reloc_cap * sizeof(st->relocations[0]));
+                                            if(!st->relocations){ perror("realloc"); exit(1); }
+                                        }
+                                        st->relocations[st->reloc_count].section    = strdup(sec_name);
+                                        st->relocations[st->reloc_count].sec_offset =
+                                            (int64_t)((sec_completed_words +
+                                                       (cur_pc + (uint64_t)_widx - sec_entry_pc_cur))
+                                                      * (uint64_t)bpw);
+                                        st->relocations[st->reloc_count].sym        = strdup(_pname);
+                                        st->relocations[st->reloc_count].rtype      = _prt;
+                                        st->relocations[st->reloc_count].addend     = _valid[_gi].addend * _scale;
+                                        st->relocations[st->reloc_count].nbytes     = _nbytes;
+                                        st->relocations[st->reloc_count].fmask      = 0;
+                                        st->reloc_count++;
+                                    }
+                                }
+                                for(int k = 0; k < _nt; k++) free(_tn[k]);
+                                free(_tn); free(_ts);
+                                _gi = _gj;
+                                continue;
+                            }
+                        }
                         int _da = 0, _ds = 0, _okp;
                         const ElfFieldInfo *_dfd = NULL;
+                        ElfFieldInfo _dfd_ov;
                         if(_drt > 0){
                             _okp = elf_diff_t_of(st, _drt, &_da, &_ds);
                             _dfd = insn_reloc_field_decl(st, _drt);
+                            if(_dfd && _valid[_gi].fmask){
+                                _dfd_ov = *_dfd; _dfd_ov.mask = _valid[_gi].fmask; _dfd = &_dfd_ov;
+                            }
                         } else {
                             _okp = elf_diff_of(st, _nbytes, &_da, &_ds);
                         }
@@ -16224,6 +16355,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                                 st->relocations[st->reloc_count].rtype      = _ts[k] > 0 ? _da : _ds;
                                 st->relocations[st->reloc_count].addend     = _ad;
                                 st->relocations[st->reloc_count].nbytes     = _dnb;
+                                st->relocations[st->reloc_count].fmask      = _dfd ? _valid[_gi].fmask : 0;
                                 st->reloc_count++;
                             }
                         for(int k = 0; k < _nt; k++) free(_tn[k]);
@@ -16242,6 +16374,11 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     int _hint_rtype = (_src_rtype >= 0 && !extern_untyped_has(st, _lname))
                                     ? _src_rtype : _valid[_gi].rtype;
                     const ElfFieldInfo *_fdecl = insn_reloc_field_decl(st, _hint_rtype);
+                    /* `.reloc` の第 4 欄があれば、その行の欄のマスクはそれ。 */
+                    ElfFieldInfo _fdecl_ov;
+                    if(_fdecl && _valid[_gi].fmask){
+                        _fdecl_ov = *_fdecl; _fdecl_ov.mask = _valid[_gi].fmask; _fdecl = &_fdecl_ov;
+                    }
                     if(!_fdecl){
                         _forced_rtype = _hint_rtype;
                     } else {
@@ -16283,6 +16420,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         st->relocations[st->reloc_count].addend     =
                             _valid[_gi].addend * _scale + (int64_t)_fdecl->bias;
                         st->relocations[st->reloc_count].nbytes     = _ibytes;
+                        st->relocations[st->reloc_count].fmask      = _valid[_gi].fmask;
                         st->reloc_count++;
                         _gi = _gj;
                         continue;
@@ -16353,9 +16491,19 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         if(_alt > 0) _rtype = _alt;
                     }
 
+                    /* 欄がオペランドの値（ラベル＋綴りの定数）を持っていなければ、
+                       パターンが変位を計算したものとして PC 相対の型にする。比べるのは
+                       欄の幅のビットだけ。`.long ext+4` の欄は 4 で、絶対のまま。
+                       axx.py の lineassemble() と同じ規則である。 */
+                    uint64_t _pcg_d = (uint64_t)((int64_t)_raw_val
+                                                 - (_abs_wi + _valid[_gi].addend));
+                    {
+                        int _pcg_b = _nwords * _bts;
+                        if(_pcg_b > 0 && _pcg_b < 64) _pcg_d &= ((uint64_t)1 << _pcg_b) - 1;
+                    }
                     if(_rtype_is_default_guess && _mtbl_rm->pcrel_guess
                        && !elf_machine_is_pcrel(_mtbl_rm, _rtype)
-                       && (int64_t)_raw_val != _abs_wi){
+                       && _pcg_d != 0){
                         int _alt = elf_reloc_same_width(_mtbl_rm, _nbytes, 1);
                         if(_alt > 0) _rtype = _alt;
                     }
@@ -16381,6 +16529,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     st->relocations[st->reloc_count].rtype      = _rtype;
                     st->relocations[st->reloc_count].addend     = _addend;
                     st->relocations[st->reloc_count].nbytes     = _nbytes;
+                    st->relocations[st->reloc_count].fmask      = 0;
                     st->reloc_count++;
                 }
                 _gi = _gj;
@@ -16485,7 +16634,7 @@ typedef struct { uint8_t*b; size_t len,cap; } WBB;
 typedef struct { const char*name; uint64_t bs,bsz,fl; uint8_t*data; uint32_t sht;
                  int al_set; uint32_t al; uint32_t es; } WCS;
 typedef struct { uint32_t shndx; uint64_t sv; } WSR;
-typedef struct { int64_t off; const char*sym; int rtype; int64_t addend; int nbytes; } WRE;
+typedef struct { int64_t off; const char*sym; int rtype; int64_t addend; int nbytes; uint64_t fmask; } WRE;
 typedef struct { WRE*data; int len,cap; } WRL;
 typedef struct { const char*name; int idx; } WSNI;
 typedef struct { const char*name; uint64_t val; int is_equ; int is_imported; int reloc_type_override; const char*section; } WLK;
@@ -17337,7 +17486,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         if(rl->len>=rl->cap){rl->cap=rl->cap?rl->cap*2:4;rl->data=realloc(rl->data,rl->cap*sizeof(WRE));if(!rl->data){perror("realloc");exit(1);}}
         rl->data[rl->len++]=(WRE){st->relocations[ri].sec_offset,st->relocations[ri].sym,
                                    st->relocations[ri].rtype,st->relocations[ri].addend,
-                                   st->relocations[ri].nbytes};
+                                   st->relocations[ri].nbytes,st->relocations[ri].fmask};
         /* `.elfextra` の添えるリロケーション。同じ位置、加数 0。 */
         int _crt[64], _csym[64];
         int _nx = elf_extras_of(st, st->relocations[ri].rtype, _crt, _csym, 64);
@@ -17345,7 +17494,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
             if(rl->len>=rl->cap){rl->cap=rl->cap?rl->cap*2:4;rl->data=realloc(rl->data,rl->cap*sizeof(WRE));if(!rl->data){perror("realloc");exit(1);}}
             rl->data[rl->len++]=(WRE){st->relocations[ri].sec_offset,
                                        _csym[_x] ? st->relocations[ri].sym : NULL,
-                                       _crt[_x], 0, st->relocations[ri].nbytes};
+                                       _crt[_x], 0, st->relocations[ri].nbytes, 0};
         }
     }
 
@@ -17362,6 +17511,10 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
                 for(int ej=0;ej<ei;ej++) if(rl->data[ej].off == off){ _dup = 1; break; }
                 if(_dup) continue;
                 const ElfFieldInfo *_fd = insn_reloc_field_decl(st, rl->data[ei].rtype);
+                ElfFieldInfo _fd_ov;
+                if(_fd && rl->data[ei].fmask){
+                    _fd_ov = *_fd; _fd_ov.mask = rl->data[ei].fmask; _fd = &_fd_ov;
+                }
                 const char *_enc = elf_encode_of(st, rl->data[ei].rtype);
                 if(_enc){
                     /* `.elfencode` の関数が (欄の値, 加数) から新しい欄を作る。 */

@@ -30,6 +30,7 @@
 .elftype::addr16_higha::111::2
 .elftype::d34::128::8
 .elftype::pcrel34::132::8::1
+.elftype::rel16::249::2::1
 .elffield::rel24::0x03fffffc
 .elffield::addr24::0x03fffffc
 .elffield::rel14::0xfffc
@@ -44,10 +45,13 @@
 .elffield::addr16_highera::0xffff::2
 .elffield::addr16_highest::0xffff::2
 .elffield::addr16_highesta::0xffff::2
-/* DS / DQ forms: the low bits of the field hold opcode bits (and TX
-/* for lxv / stxv), which the linker keeps, so they are not cleared. */
-.elffield::addr16_ds::0xfff0::2
-.elffield::addr16_lo_ds::0xfff0::2
+/* DS form: the low 2 bits of the field are opcode bits (XO), which the
+/* linker keeps, so they are not cleared. The DQ forms (lq, lxv, stxv,
+/* lxvp, stxvp) use the same two types with a 12-bit field; their rows
+/* in ppc64_isa.axx say so with .reloc::d::<type>::0xfff0, which keeps
+/* the low 4 bits (opcode bits, and TX for lxv / stxv). */
+.elffield::addr16_ds::0xfffc::2
+.elffield::addr16_lo_ds::0xfffc::2
 .elffield::d34::0x0003ffff0000ffff
 .elffield::pcrel34::0x0003ffff0000ffff
 /* data: .long / .short / .quad of a symbol, and .extern with no type */
@@ -56,6 +60,10 @@
 .elfwidth::2::addr16
 .elfextern::addr64
 .elfdwarf::addr64
+/* data written as label-$$ (.long ext-$$) is PC-relative: R_PPC64_REL64 /
+/* REL32 / REL16 with the constant part as the addend, as GNU as gives
+/* .quad / .long / .short ext-. (section 3.7.9) */
+.elfpcguess::1
 /* A prefixed instruction must not cross a 64-byte boundary, so .text
 /* keeps that alignment through the link, as GNU as does. */
 .elfsection::.text::6::1::64

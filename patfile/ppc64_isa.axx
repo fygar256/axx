@@ -77,8 +77,15 @@
 /* _HIGHA / _HIGHER(A) / _HIGHEST(A) (the @ modifiers), ADDR16_DS /
 /* _LO_DS (DS and DQ forms), D34 / PCREL34 (prefixed), and ADDR16 /
 /* ADDR32 / ADDR64 for data. The field is written as 0 and the addend
-/* goes in the RELA entry. The .elffield directive needs an axx that
-/* has it (added together with this file). Differences from GNU as
+/* goes in the RELA entry. A DS-form field is 14 bits and a DQ-form
+/* field 12 bits under the same two types, so the DQ rows (lq, lxv,
+/* stxv, lxvp, stxvp) give their own mask with .reloc::d::<type>::0xfff0
+/* and the opcode bits below the field (XO, TX) are kept. Data written
+/* as label-$$ is PC-relative (.elfpcguess::1 in the wrappers): REL64 /
+/* REL32 / REL16 with the constant part as the addend, and a label of
+/* the same section gives a constant, as GNU as does for .quad / .long /
+/* .short label-. (see ppc64_reloc2.s). The .elffield directive and the
+/* mask field of .reloc need an axx that has them. Differences from GNU as
 /* that the linker makes disappear: references to a local label are
 /* relocations against that label (GNU as resolves same-section
 /* branches itself and uses the section symbol), and GNU as leaves
@@ -96,6 +103,13 @@
 /*     text (GNU ld) identical;
 /*   - the C (caxx) and Python (axx.py) implementations give identical
 /*     output. See ppc64_test.s.
+/* Rechecked against llvm-mc 19 (-mcpu=pwr10) and ld.lld 19 in both
+/* byte orders with ppc64_reloc_test.s at the addends 16 and 12 and with
+/* ppc64_reloc2.s: words and relocation entries identical apart from
+/* the symbol (a local label against llvm-mc's section symbol), and the
+/* linked .text / .data identical. llvm-mc 19 cannot be compared on D34
+/* (it writes no relocation for pla / paddi / pli / pl* with a symbol
+/* and a register) or REL16 (it rejects .short label-.).
 /* =================================================================== */
 
 /* ===================================================================
@@ -729,10 +743,10 @@ STMW rs,!d@HA(ra) ::#PPCLE!=0;15 :: .call w4(0xbc000000|(rs<<21)|(ra<<16)|(((d+0
 !dsmem("STD", 62, 0, "rs")
 !dsmem("STDU", 62, 1, "rs")
 /* quadword: RTp / RSp is an even register */
-.reloc::d::addr16_ds
+.reloc::d::addr16_ds::0xfff0
 LQ rt,!d(ra) ::(rt&1)!=0;5,d<-32768;8,d>32767;8,(d&15)!=0;8 :: .call w4(0xe0000000|(rt<<21)|(ra<<16)|(d&0xfff0))
 .clrreloc::d
-.reloc::d::addr16_lo_ds
+.reloc::d::addr16_lo_ds::0xfff0
 LQ rt,!d@L(ra) ::(rt&1)!=0;5,(d&15)!=0;8 :: .call w4(0xe0000000|(rt<<21)|(ra<<16)|(d&0xfff0))
 .clrreloc::d
 LQ rt,(ra) ::(rt&1)!=0;5 :: .call w4(0xe0000000|(rt<<21)|(ra<<16))
@@ -1955,16 +1969,16 @@ VNOT vt,va :: .call w4(0x10000504|(vt<<21)|(va<<16)|(va<<11))
 /* paired vector load/store: XTp = 32*TX + 2*Tp, even */
 LXVPX xt,ra,rb ::(xt&1)!=0;5 :: .call w4(0x7c00029a|(((xt>>1)&15)<<22)|(((xt>>5)&1)<<21)|(ra<<16)|(rb<<11))
 STXVPX xs,ra,rb ::(xs&1)!=0;5 :: .call w4(0x7c00039a|(((xs>>1)&15)<<22)|(((xs>>5)&1)<<21)|(ra<<16)|(rb<<11))
-.reloc::d::addr16_ds
+.reloc::d::addr16_ds::0xfff0
 LXVP xt,!d(ra) ::(xt&1)!=0;5,d<-32768;8,d>32767;8,(d&15)!=0;8 :: .call w4(0x18000000|(((xt>>1)&15)<<22)|(((xt>>5)&1)<<21)|(ra<<16)|(d&0xfff0))
 .clrreloc::d
-.reloc::d::addr16_lo_ds
+.reloc::d::addr16_lo_ds::0xfff0
 LXVP xt,!d@L(ra) ::(xt&1)!=0;5,(d&15)!=0;8 :: .call w4(0x18000000|(((xt>>1)&15)<<22)|(((xt>>5)&1)<<21)|(ra<<16)|(d&0xfff0))
 .clrreloc::d
-.reloc::d::addr16_ds
+.reloc::d::addr16_ds::0xfff0
 STXVP xs,!d(ra) ::(xs&1)!=0;5,d<-32768;8,d>32767;8,(d&15)!=0;8 :: .call w4(0x18000001|(((xs>>1)&15)<<22)|(((xs>>5)&1)<<21)|(ra<<16)|(d&0xfff0))
 .clrreloc::d
-.reloc::d::addr16_lo_ds
+.reloc::d::addr16_lo_ds::0xfff0
 STXVP xs,!d@L(ra) ::(xs&1)!=0;5,(d&15)!=0;8 :: .call w4(0x18000001|(((xs>>1)&15)<<22)|(((xs>>5)&1)<<21)|(ra<<16)|(d&0xfff0))
 .clrreloc::d
 /* DS / DQ form VSX loads and stores (op 57 / 61) */
@@ -1972,17 +1986,17 @@ STXVP xs,!d@L(ra) ::(xs&1)!=0;5,(d&15)!=0;8 :: .call w4(0x18000001|(((xs>>1)&15)
 !dsmem("LXSSP", 57, 3, "vt")
 !dsmem("STXSD", 61, 2, "vs")
 !dsmem("STXSSP", 61, 3, "vs")
-.reloc::d::addr16_ds
+.reloc::d::addr16_ds::0xfff0
 LXV xt,!d(ra) ::d<-32768;8,d>32767;8,(d&15)!=0;8 :: .call w4(0xf4000001|((xt&31)<<21)|(((xt>>5)&1)<<3)|(ra<<16)|(d&0xfff0))
 .clrreloc::d
-.reloc::d::addr16_lo_ds
+.reloc::d::addr16_lo_ds::0xfff0
 LXV xt,!d@L(ra) ::(d&15)!=0;8 :: .call w4(0xf4000001|((xt&31)<<21)|(((xt>>5)&1)<<3)|(ra<<16)|(d&0xfff0))
 .clrreloc::d
 LXV xt,(ra) :: .call w4(0xf4000001|((xt&31)<<21)|(((xt>>5)&1)<<3)|(ra<<16))
-.reloc::d::addr16_ds
+.reloc::d::addr16_ds::0xfff0
 STXV xs,!d(ra) ::d<-32768;8,d>32767;8,(d&15)!=0;8 :: .call w4(0xf4000005|((xs&31)<<21)|(((xs>>5)&1)<<3)|(ra<<16)|(d&0xfff0))
 .clrreloc::d
-.reloc::d::addr16_lo_ds
+.reloc::d::addr16_lo_ds::0xfff0
 STXV xs,!d@L(ra) ::(d&15)!=0;8 :: .call w4(0xf4000005|((xs&31)<<21)|(((xs>>5)&1)<<3)|(ra<<16)|(d&0xfff0))
 .clrreloc::d
 STXV xs,(ra) :: .call w4(0xf4000005|((xs&31)<<21)|(((xs>>5)&1)<<3)|(ra<<16))

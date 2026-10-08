@@ -51,14 +51,14 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all fifty-nine bundled pattern/source pairs with
+exactly that: `test1` assembles all sixty-one bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the five `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` and `ministr.axx` pairs the `.echo` lines each one writes to standard
 error, and for the `regress.axx` regression test its `-V` text and its diagnostics.
 The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for a hundred and eighty-eight comparisons in all.
+text output are compared too, for a hundred and ninety-five comparisons in all.
 
 **Contents**
 
@@ -1375,7 +1375,7 @@ AFTER      :: :: #N1        /* error - undefined symbol: '#N1' */
 #### 3.7.5 `.reloc` — declaring a relocation type
 
 ```
-.reloc::<variable>::<type name>
+.reloc::<variable>::<type name>[::<mask>]
 ```
 
 Writes the label reference that variable captured into the `-o` output as the
@@ -1489,6 +1489,37 @@ declares its own with `.elffield`, section 3.7.7). The data types
 The two GOT types differ in kind from the rest. Their value is the address of a
 GOT entry the linker builds, so it is not knowable at assembly time: the field
 goes out as 0 and the relocation carries the whole meaning.
+
+**The mask field — one type, fields of two shapes.** The optional fourth field
+replaces, for the rows below it, the mask of the type's `.elffield`
+(section 3.7.7): the bits that RELA writes as 0 and REL fills with the addend.
+The offset, shift and bias stay those of `.elffield`, and the type number is
+unchanged. It is for an ABI that uses one relocation type for fields of
+different widths and tells them apart by the instruction. PowerPC64's
+`R_PPC64_ADDR16_DS` / `_LO_DS` cover both the DS form (`ld`, `std`: a 14-bit
+field over bits 2-15, opcode bits in bits 0-1) and the DQ form (`lq`, `lxv`: a
+12-bit field over bits 4-15, opcode bits and `TX` in bits 0-3), and the linker
+keeps the low bits by looking at the opcode. One `.elffield` cannot say both:
+with the DQ mask a DS row leaks bits 2-3 of the address into the object, with
+the DS mask a DQ row loses its `TX` bit. So the type gets the DS mask and the DQ
+rows say theirs:
+
+```
+.elffield::addr16_ds::0xfffc::2           /* DS: bits 2-15 of the low halfword */
+.reloc::d::addr16_ds::0xfff0              /* DQ: bits 4-15                     */
+LXV xt,!d(ra) :: ...
+.clrreloc::d
+```
+
+```
+ld  3,ext+12(1)   ->  e8 61 00 00   R_PPC64_ADDR16_DS  ext + 12
+lxv 35,ext+48(1)  ->  f4 61 00 09   R_PPC64_ADDR16_DS  ext + 48   (TX and XO kept)
+```
+
+The mask is a constant expression (1 to 0xFFFFFFFFFFFFFFFF) and is written only
+for a type that has an `.elffield`; for any other type it is an error. Like the
+type, it is only read under `-o`, and `.clrreloc` / `.free` take it back with the
+type.
 
 #### 3.7.6 `.elftype` — naming a relocation type yourself
 
@@ -1734,6 +1765,8 @@ linker. What the field holds depends on RELA or REL:
   plus 8, so the bias is -8 (GNU as gives `bl ext` the addend -8 too).
 - The type may be an `.elftype` name, a built-in name or a number. Writing the
   same type again replaces the earlier declaration.
+- A row whose field has another shape under the same type number can replace
+  the mask with the fourth field of `.reloc` (section 3.7.5).
 - Because the bits of the mask are filled from the bottom up, a type whose
   field reorders the bits of the value (RISC-V's B format, for one) cannot be
   written back under REL. Describe such a machine with RELA, as the real ABIs
@@ -1883,10 +1916,34 @@ declarations alone. The default 1 lays the declarations over the table
 (section 3.7.7). Use it for a closed description that no type of the table can
 leak into.
 
-**`.elfpcguess::<0|1>`.** With 1, when the type guessed from a field's width is
-absolute but the field does not hold the label's value (a PC-relative
-expression such as `dc.w label-*`), the type is swapped for the PC-relative type
-of the same width. Of the built-in tables only m68k sets it; any machine may.
+**`.elfpcguess::<0|1>`.** With 1, a reference in a field that `.reloc` does not
+type is recognised as PC-relative in two ways:
+
+- **By the spelling.** An operand written as a label minus `$$` plus a constant
+  (`.long ext-$$`, `.quad ext+8-$$`, `.short ext-$$-2`) is PC-relative: it gets
+  the PC-relative type of the field's width, the constant part as its addend,
+  and under RELA a field of 0 — the relocation GNU as writes for
+  `.long ext-.`. A label in the section being assembled gives a constant
+  instead: the distance is known, so no relocation is written and the field
+  keeps it. The spelling is read the way the label differences of section 3.7.10
+  are (labels, numbers, `+`, `-`, parentheses); a type written in the source on
+  the label (`::<type>`) is used when its width matches.
+- **By the value.** Otherwise, when the type is guessed from the field's width
+  (the source wrote none) and the field does not hold the operand's value
+  (the label plus the constant written with it), the pattern computed a
+  displacement from it — the field of an m68k `bra.w label`, `t-$$-2` in the
+  `binary_list` — and the absolute type guessed from the width is swapped for
+  the PC-relative type of the same width. `.long ext+4` holds `ext+4` and stays
+  absolute. The comparison is made on the bits of the field's width.
+
+The two `$$` differ, which is why the spelling is read rather than the value:
+written in the source, `$$` is the location in the whole image, while inside a
+`binary_list` it is relative to the start of the section (section 3.7.10), so
+the value alone cannot tell `ext-$$` from `ext+<constant>`, least of all at
+offset 0 of a section.
+
+Of the built-in tables only m68k sets it; any machine may. `ppc64.axx` and
+`ppc64le.axx` set it for `R_PPC64_REL64` / `REL32` / `REL16`.
 
 **`--elfdesc`.** Prints the description in effect — the built-in table of the
 `-m` machine with the pattern file's declarations laid over it — to standard
@@ -4651,9 +4708,9 @@ The x86_64 pattern file is also maintained separately at
 | **aarch64.axx** | 347 KB | 2,068 (9,387 expanded) | **aarch64.s** | AArch64 (A64): data processing, branches, exception generation, hints, barriers, system registers and SYS aliases, loads and stores, LSE atomics, scalar floating point, Advanced SIMD (vector and scalar) including the LD1-LD4 / ST1-ST4 structure accesses, cryptography, and the scalar extensions (PAuth, MTE, MOPS, FCMA, dot product, BFloat16, matrix multiply, LS64), and the GNU-style relocation modifiers `:lo12:`, `:pg_hi21:`, `:abs_g0:`-`:abs_g3:`, `:prel_g0:`-`:prel_g3:` and `:got:` / `:got_lo12:`, which with `-o` are emitted as relocations for the linker to fill in (`R_AARCH64_ADR_PREL_PG_HI21`, `ADD_ABS_LO12_NC`, the `LDST*_ABS_LO12_NC` family, `MOVW_UABS_G*` / `MOVW_PREL_G*`, `ADR_GOT_PAGE` and `LD64_GOT_LO12_NC`) and which with `-b` axx resolves itself, reading the GOT pair as naming the slot. Also SVE and SVE2 -- arithmetic, shifts, compares, predicates, element counts, permutes, reductions, the whole load/store family (contiguous, replicating, non-fault, first-fault, gather, scatter, prefetch), the widening and narrowing groups, complex arithmetic and the SVE2 cryptography -- SME: streaming mode, the ZA array, and the integer, floating-point and BFloat16 outer products -- and SME2: the predicate-as-counter registers, the ZT0 lookup table, the multi-vector operations on Z registers, accumulation into the ZA array, and the multi-vector loads and stores in both their consecutive and strided forms |
 | **aarch64_logical.axx** | 9.5 KB | 76 (82 expanded) | **aarch64_logical_mini_demo.s** | The macro-layer version of the same AArch64 logical (immediate) group: the rows are generated with `!def`, and the bitmask immediate is encoded in a `binary_list` expression |
 | **aarch64_logical_mini.axx** | 9.2 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 logical (immediate): AND/ORR/EOR/ANDS/TST, 32- and 64-bit. Encodes the bitmask immediate with the mini language (section 3.15) |
-| **ppc64.axx** | 2.1 KB | 48 (plus `ppc64_isa.axx`) | **ppc64_test.s** and others | PowerPC64 big-endian (ELFv1): sets the byte order and the ELF description (`.elftype` / `.elffield` / `.elfsection`), then includes `ppc64_isa.axx` |
-| **ppc64le.axx** | 2.2 KB | 49 (plus `ppc64_isa.axx`) | **ppc64_test.s** and others | The same for little-endian PowerPC64 (ELFv2) |
-| **ppc64_isa.axx** | 95 KB | 452 (4,774 expanded) | -- | The PowerPC64 instruction set (Power ISA v3.1, POWER10) shared by `ppc64.axx` and `ppc64le.axx`; not passed to axx directly. Fixed point, branches with the extended mnemonics, floating point, decimal floating point, VMX, VSX, quad precision, MMA including the prefixed masked forms, and the prefixed instructions, with a nop inserted before one that would cross a 64-byte boundary. Written with the macro layer and the mini language |
+| **ppc64.axx** | 2.6 KB | 51 (plus `ppc64_isa.axx`) | **ppc64_test.s**, **ppc64_reloc2.s** and others | PowerPC64 big-endian (ELFv1): sets the byte order and the ELF description (`.elftype` / `.elffield` / `.elfpcguess` / `.elfsection`), then includes `ppc64_isa.axx` |
+| **ppc64le.axx** | 2.6 KB | 52 (plus `ppc64_isa.axx`) | **ppc64_test.s**, **ppc64_reloc2.s** and others | The same for little-endian PowerPC64 (ELFv2) |
+| **ppc64_isa.axx** | 96 KB | 454 (4,774 expanded) | -- | The PowerPC64 instruction set (Power ISA v3.1, POWER10) shared by `ppc64.axx` and `ppc64le.axx`; not passed to axx directly. Fixed point, branches with the extended mnemonics, floating point, decimal floating point, VMX, VSX, quad precision, MMA including the prefixed masked forms, and the prefixed instructions, with a nop inserted before one that would cross a 64-byte boundary. Written with the macro layer and the mini language |
 | **mips.axx** | 919 B | 1 (plus `mips_isa.axx`) | **mips.s**, **mips_ase.s** | MIPS big-endian, o32 (ELF32, REL), up to Release 5: sets the byte order, the ABI and the release, then includes `mips_isa.axx` |
 | **mipsel.axx** | 926 B | 1 (plus `mips_isa.axx`) | **mips.s**, **mips_ase.s** | The same for little-endian, o32 |
 | **mips64.axx** | 928 B | 1 (plus `mips_isa.axx`) | **mips.s**, **mips_ase.s** | MIPS64 big-endian, n64 (ELF64, RELA) |
@@ -4712,7 +4769,9 @@ Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
 `itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
 `aarch64_logical_mini_demo.s`. `ppc64.axx` and `ppc64le.axx` pair with
 `ppc64_test.s` (one line per pattern row, checked against GNU as byte-for-byte),
-`ppc64_reloc_test.s` (the relocations under `-o`) and `hello_ppc64.s` (the
+`ppc64_reloc_test.s` (the relocations under `-o`), `ppc64_reloc2.s` (the DS /
+DQ-form fields with addends whose bits 2-3 are set, and data written as
+`label-$$`; checked against llvm-mc 19 and ld.lld 19) and `hello_ppc64.s` (the
 big-endian hello world); `ppc64_isa.axx` is included by those two and is never
 passed to axx itself. `mips.axx`, `mipsel.axx`, `mips64.axx` and `mips64el.axx`
 all pair with `mips.s` (every row of the base set, checked byte-for-byte against
@@ -4726,7 +4785,7 @@ row, checked against llvm-mc 19 byte-for-byte), `sparc_reloc.s` (the relocations
 under `-o`, checked against llvm-mc 19) and `bf_sparc.s` (the Brainfuck
 interpreter, run under qemu-sparc64).
 
-`test1` runs all fifty-nine pairs through both implementations and
+`test1` runs all sixty-one pairs through both implementations and
 compares the `-b` raw binaries. For the five pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
@@ -4750,13 +4809,16 @@ compared as well. The `regress.axx` regression test compares `regress.s` by its 
 and `mips64el.axx` with `mips.s` and with `mips_ase.s`, the four Release 6 files
 with `mipsr6.s`) also compare their `-o` ELF objects (ELF32 REL for o32, ELF64
 RELA for n64) besides the `-b` binaries. Of the three SPARC pairs,
-`sparc_reloc.s` and `bf_sparc.s` compare their `-o` ELF objects.
+`sparc_reloc.s` and `bf_sparc.s` compare their `-o` ELF objects. The two
+PowerPC64 pairs (`ppc64.axx` and `ppc64le.axx` with `ppc64_reloc2.s`) compare their
+`-o` ELF objects: the DS / DQ-form fields (the mask field of `.reloc`) and the
+PC-relative data of `.elfpcguess`.
 
 The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for a hundred and ninety-three comparisons in all.
+never compares, for a hundred and ninety-five comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -4789,7 +4851,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all fifty-nine bundled pattern/source pairs with both
+`test1` assembles all sixty-one bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 five `.textmode` pairs, the `.echo` lines of the `echo.axx` and `ministr.axx` pairs,
 and the `-V` text and diagnostics of the `regress.axx` regression test.
