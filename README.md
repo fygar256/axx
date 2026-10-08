@@ -103,7 +103,7 @@ ld.lld -o bf bf.o && qemu-sparc64-static ./bf mandelbrot.bf         # links with
 ./bfsh/bf_riscv64_linux.sh run    # build the RISC-V Brainfuck interpreter and run mandelbrot.bf under qemu
 ```
 
-`bfsh/` has one such script per CPU and OS (`bf_<CPU>_<OS>.sh`: x86_64, AArch64, PowerPC64, MIPS, RISC-V); `run` builds and runs `mandelbrot.bf`, and Technical_Manual.md Appendix A.4 explains the options and which qemu each one uses.
+`bfsh/` has one such script per CPU and OS (`bf_<CPU>_<OS>.sh`: x86_64, AArch64, PowerPC64, MIPS, RISC-V, SPARC); `run` builds and runs `mandelbrot.bf`, and Technical_Manual.md Appendix A.4 explains the options and which qemu each one uses.
 
 A pattern file for ARM (A32/T32) doesn't exist yet. Getting there — including real hardware/emulator validation — is more than one person can reasonably do alone. If you're interested in taking it on, that's where help would matter most.
 

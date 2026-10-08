@@ -23,8 +23,9 @@
 ;     16-word register save area, at %sp + 2047 (the V9 stack bias) +
 ;     128.
 ; The FreeBSD build was run under qemu-sparc64-static (bsd-user) with
-; mandelbrot.bf. The Linux build was checked for assembly only: there
-; was no Linux qemu-sparc64 to run it in.
+; mandelbrot.bf. The Linux build was run under the Linux qemu-sparc64
+; (linux-user, on FreeBSD's Linuxulator). bfsh/bf_sparc_freebsd.sh and
+; bfsh/bf_sparc_linux.sh do the build and the run.
 ;
 ; The branch targets are defined as `name: .equ $$` (the address as a
 ; constant) instead of `name:`. axx makes every branch to a label a

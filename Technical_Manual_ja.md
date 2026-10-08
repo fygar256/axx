@@ -4272,11 +4272,13 @@ AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v
 | `bf_riscv64_linux.sh` | `bf_riscv64.s` | `riscv64full.axx` | qemu-riscv64（linux-user） |
 | `bf_aarch64_linux.sh` | `bf_aarch64.s` | `aarch64.axx` | qemu-aarch64（linux-user） |
 | `bf_ppc64_linux.sh` | `bf_ppc64.s` | `ppc64.axx` | qemu-ppc64（linux-user） |
+| `bf_sparc_freebsd.sh` | `bf_sparc.s`（`!set OS = "freebsd"`） | `sparc.axx` | qemu-sparc64（bsd-user） |
+| `bf_sparc_linux.sh` | `bf_sparc.s`（`!set OS = "linux"`） | `sparc.axx` | qemu-sparc64（linux-user） |
 | `bf_x64_freebsd.sh` / `bf_x64_linux.sh` | `bf_aarch64.s` を x86_64 へ翻訳したもの | `a64tox64_axx.axx`、`x86_64.axx` | そのまま（3.18 節） |
 
 `bf_aarch64.s` と `bf_ppc64.s` には Linux 用しかないので、この 2 つには `_freebsd` の
-スクリプトがありません。SPARC の `bf_sparc.s` はスクリプトにしていません（ソースの
-冒頭に組み方があります）。
+スクリプトがありません。`bf_x86_64.s` と `bf_sparc.s` はマクロ層の `!set OS` で OS を
+切り替えるので、スクリプトはその行を書き換えた写しを組みます。
 
 **使い方。** 引数で、組み立てたあとに何を走らせるかを決めます。
 

@@ -320,11 +320,16 @@ bfsh/bf_riscv64_freebsd.sh          the same for bf_riscv64_freebsd.s with
 bfsh/bf_x86_64_freebsd.sh           the same for bf_x86_64.s with x86_64.axx,
                                     the `!set OS` line rewritten to "freebsd",
                                     build_bf_x86_64_freebsd/bf, run directly
+bfsh/bf_sparc_freebsd.sh            the same for bf_sparc.s with sparc.axx,
+                                    the `!set OS` line rewritten to "freebsd",
+                                    build_bf_sparc_freebsd/bf, run under
+                                    qemu-sparc64-static (bsd-user)
 bfsh/bf_aarch64_linux.sh            the Linux versions: each builds the Linux
 bfsh/bf_mips_linux.sh               source (bf_aarch64.s, bf_mips.s with
 bfsh/bf_ppc64_linux.sh              ENDIAN=eb / el, bf_ppc64.s, bf_riscv64.s,
-bfsh/bf_riscv64_linux.sh            bf_x86_64.s with !set OS = "linux") into
-bfsh/bf_x86_64_linux.sh             build_bf_<arch>_linux/bf and runs it under
+bfsh/bf_riscv64_linux.sh            and bf_x86_64.s / bf_sparc.s with
+bfsh/bf_x86_64_linux.sh             !set OS = "linux") into
+bfsh/bf_sparc_linux.sh              build_bf_<arch>_linux/bf and runs it under
                                     qemu-<arch>-static or qemu-<arch>
                                     (linux-user), or directly on the same CPU.
                                     on FreeBSD they use the Linux qemu put in
@@ -382,7 +387,8 @@ bf_sparc.s                          brainfuck interpreter for SPARC V9 (64-bit),
                                     switch (!set OS = "freebsd" / "linux").
                                     assemble with sparc.axx -o, link with
                                     ld.lld, run under qemu-sparc64-static
-                                    (bsd-user); the branch targets are
+                                    (bsd-user) or the Linux qemu-sparc64
+                                    (bfsh/bf_sparc_*.sh); the branch targets are
                                     `name: .equ $$` because ld.lld 19 has no
                                     R_SPARC_WDISP22 / 19 / 16
 format_of_exp_imp_file              format description for export/import file

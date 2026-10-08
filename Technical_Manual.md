@@ -4569,10 +4569,13 @@ per build that does all of it. The names are `bf_<CPU>_<OS>.sh`.
 | `bf_riscv64_linux.sh` | `bf_riscv64.s` | `riscv64full.axx` | qemu-riscv64 (linux-user) |
 | `bf_aarch64_linux.sh` | `bf_aarch64.s` | `aarch64.axx` | qemu-aarch64 (linux-user) |
 | `bf_ppc64_linux.sh` | `bf_ppc64.s` | `ppc64.axx` | qemu-ppc64 (linux-user) |
+| `bf_sparc_freebsd.sh` | `bf_sparc.s` (`!set OS = "freebsd"`) | `sparc.axx` | qemu-sparc64 (bsd-user) |
+| `bf_sparc_linux.sh` | `bf_sparc.s` (`!set OS = "linux"`) | `sparc.axx` | qemu-sparc64 (linux-user) |
 | `bf_x64_freebsd.sh` / `bf_x64_linux.sh` | `bf_aarch64.s` translated to x86_64 | `a64tox64_axx.axx`, `x86_64.axx` | directly (section 3.18) |
 
 `bf_aarch64.s` and `bf_ppc64.s` exist for Linux only, so they have no `_freebsd`
-script. SPARC's `bf_sparc.s` has no script; its header shows how to build it.
+script. `bf_x86_64.s` and `bf_sparc.s` pick the OS with the macro layer's
+`!set OS`, so the scripts build a copy with that line rewritten.
 
 **Usage.** The argument decides what runs after the build.
 
