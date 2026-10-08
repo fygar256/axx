@@ -3098,7 +3098,8 @@ Linux では `a64rt_axx.s` を `--osabi Linux` で組み、`-e _start` でリン
 
 この手順は同梱のスクリプト `bf_x64_freebsd.sh` と `bf_x64_linux.sh` にまとめてあり、
 `build_bf_freebsd/bf` または `build_bf_linux/bf` を作ります。引数に `.bf` ファイルを
-渡すと、作ったあとでそれを走らせます。`AXX=paxx` で Python 版を使えます。
+渡すと、作ったあとでそれを走らせます。引数に `run` だけを渡すと、同梱の
+`mandelbrot.bf` を走らせます。`AXX=paxx` で Python 版を使えます。
 Linux 版は FreeBSD の Linuxulator（`linux64.ko`）でも動きます。FreeBSD の `ld` は
 出力に FreeBSD のブランドを付けるので、FreeBSD 上で実行した `bf_x64_linux.sh` は
 リンクの後で `brandelf -t Linux` を付け直します。

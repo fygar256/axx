@@ -7,6 +7,7 @@
 # 実行:
 #       ./bf_x64_linux.sh                    (build_bf_linux/bf を作る)
 #       ./bf_x64_linux.sh mandelbrot.bf      (作ったあとでその .bf を走らせる)
+#       ./bf_x64_linux.sh run                (作ったあとで同梱の mandelbrot.bf を走らせる)
 #       AXX=paxx ./bf_x64_linux.sh           (Python 版で翻訳・アセンブルする)
 #
 # FreeBSD の Linuxulator (linux64.ko) でも走る。FreeBSD の ld は出力に
@@ -28,6 +29,15 @@ LD=${LD:-ld}
 D=$(cd "$(dirname "$0")" && pwd)
 P=$D/patfile; [ -d "$P" ] || P=$D
 S=$D/asmsrc;  [ -d "$S" ] || S=$D
+
+# 引数が run だけなら、作ったあとで同梱の mandelbrot.bf を走らせる。
+# run のあとに .bf ファイルを書けば、それを走らせる。
+if [ "$1" = run ]; then
+    shift
+    if [ $# -eq 0 ]; then
+        set -- "$D/mandelbrot.bf"
+    fi
+fi
 
 W=build_bf_linux
 mkdir -p $W

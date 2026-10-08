@@ -3327,7 +3327,8 @@ in front of the translated text.
 
 The bundled scripts `bf_x64_freebsd.sh` and `bf_x64_linux.sh` run these steps
 and build `build_bf_freebsd/bf` or `build_bf_linux/bf`. Given a `.bf` file as an
-argument, they run it afterwards. `AXX=paxx` makes them use the Python
+argument, they run it afterwards; given just `run`, they run the bundled
+`mandelbrot.bf`. `AXX=paxx` makes them use the Python
 implementation. The Linux build also runs under FreeBSD's Linuxulator
 (`linux64.ko`). FreeBSD's `ld` brands its output as FreeBSD, so when
 `bf_x64_linux.sh` runs on FreeBSD it re-brands the result with

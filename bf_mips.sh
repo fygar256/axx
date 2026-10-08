@@ -7,6 +7,7 @@
 # 実行:
 #       ./bf_mips.sh                        (build_bf_mips/bf を作る)
 #       ./bf_mips.sh mandelbrot.bf          (作ったあとでその .bf を走らせる)
+#       ./bf_mips.sh run                    (作ったあとで同梱の mandelbrot.bf を走らせる)
 #       ENDIAN=el ./bf_mips.sh              (リトルエンディアン。build_bf_mipsel/bf)
 #       OS=linux ./bf_mips.sh               (OS を選ぶ。既定はホストの OS)
 #       AXX=paxx ./bf_mips.sh               (Python 版でアセンブルする)
@@ -34,6 +35,15 @@ ENDIAN=${ENDIAN:-eb}
 D=$(cd "$(dirname "$0")" && pwd)
 P=$D/patfile; [ -d "$P" ] || P=$D
 S=$D/asmsrc;  [ -d "$S" ] || S=$D
+
+# 引数が run だけなら、作ったあとで同梱の mandelbrot.bf を走らせる。
+# run のあとに .bf ファイルを書けば、それを走らせる。
+if [ "$1" = run ]; then
+    shift
+    if [ $# -eq 0 ]; then
+        set -- "$D/mandelbrot.bf"
+    fi
+fi
 
 case $OS in
     freebsd) SRC=bf_mips_freebsd.s; OSABI=FreeBSD ;;

@@ -7,6 +7,7 @@
 # 実行:
 #       ./bf_riscv64.sh                     (build_bf_riscv64/bf を作る)
 #       ./bf_riscv64.sh mandelbrot.bf       (作ったあとでその .bf を走らせる)
+#       ./bf_riscv64.sh run                 (作ったあとで同梱の mandelbrot.bf を走らせる)
 #       OS=linux ./bf_riscv64.sh            (OS を選ぶ。既定はホストの OS)
 #       AXX=paxx ./bf_riscv64.sh            (Python 版でアセンブルする)
 #       QEMU= ./bf_riscv64.sh x.bf          (qemu を通さずに走らせる)
@@ -35,6 +36,15 @@ OS=${OS:-$HOST}
 D=$(cd "$(dirname "$0")" && pwd)
 P=$D/patfile; [ -d "$P" ] || P=$D
 S=$D/asmsrc;  [ -d "$S" ] || S=$D
+
+# 引数が run だけなら、作ったあとで同梱の mandelbrot.bf を走らせる。
+# run のあとに .bf ファイルを書けば、それを走らせる。
+if [ "$1" = run ]; then
+    shift
+    if [ $# -eq 0 ]; then
+        set -- "$D/mandelbrot.bf"
+    fi
+fi
 
 case $OS in
     freebsd) SRC=bf_riscv64_freebsd.s; OSABI=FreeBSD ;;

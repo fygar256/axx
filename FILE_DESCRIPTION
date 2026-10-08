@@ -308,7 +308,9 @@ bf_aarch64.sh                       build script: assembles bf_aarch64.s with
                                     aarch64.axx -o and links it with ld.lld,
                                     build_bf_aarch64/bf; given a .bf file it
                                     runs it, on Linux under qemu-aarch64 (the
-                                    source is Linux only)
+                                    source is Linux only). given just `run`,
+                                    this and the other bf_*.sh run the bundled
+                                    mandelbrot.bf
 bf_mips.sh                          the same for bf_mips_freebsd.s / bf_mips.s
                                     (OS=freebsd / linux, default the host's;
                                     ENDIAN=eb / el picks mips.axx / mipsel.axx),

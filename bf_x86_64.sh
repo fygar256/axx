@@ -8,6 +8,7 @@
 # 実行:
 #       ./bf_x86_64.sh                   (build_bf_x86_64/bf を作る)
 #       ./bf_x86_64.sh mandelbrot.bf     (作ったあとでその .bf を走らせる)
+#       ./bf_x86_64.sh run               (作ったあとで同梱の mandelbrot.bf を走らせる)
 #       OS=linux ./bf_x86_64.sh          (OS を選ぶ。既定はホストの OS)
 #       AXX=paxx ./bf_x86_64.sh          (Python 版でアセンブルする)
 #
@@ -32,6 +33,15 @@ OS=${OS:-$HOST}
 D=$(cd "$(dirname "$0")" && pwd)
 P=$D/patfile; [ -d "$P" ] || P=$D
 S=$D/asmsrc;  [ -d "$S" ] || S=$D
+
+# 引数が run だけなら、作ったあとで同梱の mandelbrot.bf を走らせる。
+# run のあとに .bf ファイルを書けば、それを走らせる。
+if [ "$1" = run ]; then
+    shift
+    if [ $# -eq 0 ]; then
+        set -- "$D/mandelbrot.bf"
+    fi
+fi
 
 case $OS in
     freebsd) OSABI=FreeBSD ;;
