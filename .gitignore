@@ -23,5 +23,8 @@ bf_mips_freebsd
 paxx
 caxx
 
+# bf_*.sh が作る作業ディレクトリ（build_bf_aarch64/ など）
+build_bf_*/
+
 
 __pycache__/

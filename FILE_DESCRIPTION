@@ -258,7 +258,7 @@ bf_riscv64.s                        brainfuck interpreter written in RISC-V
                                     qemu-riscv64: qemu-riscv64 ./bf prog.bf
 bf_riscv64_freebsd.s                the same for FreeBSD/riscv64 (syscall number
                                     in t0, FreeBSD numbers, errors in t0);
-                                    assembly checked only
+                                    runs under qemu-riscv64 (bsd-user)
 endsub.axx                          pattern file for closing a `.sub` block with
                                     `.endsub` instead of `.return`: the two
                                     spellings mean the same thing and can be
@@ -304,7 +304,30 @@ bf_x64_linux.sh                     the same for Linux/x86_64, build_bf_linux/bf
                                     on FreeBSD it re-brands the result with
                                     brandelf -t Linux so it runs under the
                                     Linuxulator (manual 3.18)
-8080toz80.axx                       pattern file that translates Intel 8080 source
+bf_aarch64.sh                       build script: assembles bf_aarch64.s with
+                                    aarch64.axx -o and links it with ld.lld,
+                                    build_bf_aarch64/bf; given a .bf file it
+                                    runs it, on Linux under qemu-aarch64 (the
+                                    source is Linux only)
+bf_mips.sh                          the same for bf_mips_freebsd.s / bf_mips.s
+                                    (OS=freebsd / linux, default the host's;
+                                    ENDIAN=eb / el picks mips.axx / mipsel.axx),
+                                    build_bf_mips/bf or build_bf_mipsel/bf, run
+                                    under qemu-mips / qemu-mipsel
+bf_ppc64.sh                         the same for bf_ppc64.s with ppc64.axx,
+                                    build_bf_ppc64/bf, run on Linux under
+                                    qemu-ppc64 (the source is Linux only)
+bf_riscv64.sh                       the same for bf_riscv64_freebsd.s /
+                                    bf_riscv64.s with riscv64full.axx (OS=),
+                                    build_bf_riscv64/bf, run under qemu-riscv64;
+                                    brands the FreeBSD one, which ld.lld leaves
+                                    "System V"
+bf_x86_64.sh                        the same for bf_x86_64.s with x86_64.axx: it
+                                    rewrites the `!set OS` line to the OS chosen
+                                    (OS=), build_bf_x86_64/bf. on FreeBSD the
+                                    Linux one is re-branded and runs under the
+                                    Linuxulator
+8080toz80.axx                      pattern file that translates Intel 8080 source
                                     into Zilog Z80 source text: .textmode, `!L`
                                     captures and `{{.exp()}}`, so labels and
                                     expressions keep the spelling they had in the
@@ -328,7 +351,16 @@ bf_aarch64.s                        brainfuck interpreter written in AArch64
                                     assembly (axx syntax). assembles with
                                     aarch64.axx, into an ELF object with -o or a
                                     flat image with -b
-bf_mips.s                           brainfuck interpreter for Linux / MIPS32 o32,
+bf_ppc64.s                          brainfuck interpreter for Linux / PowerPC64
+                                    big-endian (ELFv1), ported from bf_aarch64.s.
+                                    assembles with ppc64.axx -o, links with
+                                    ld.lld -static -e _start, runs under Linux
+                                    qemu-ppc64
+bf_x86_64.s                         brainfuck interpreter for FreeBSD / Linux
+                                    x86_64 in Intel syntax, switched by the
+                                    macro layer (!set OS = "freebsd" / "linux").
+                                    assembles with x86_64.axx -o, links with ld
+bf_mips.s                          brainfuck interpreter for Linux / MIPS32 o32,
                                     ported from bf_ppc64.s. the same source
                                     assembles with mips.axx (big-endian) and
                                     mipsel.axx (little-endian); link with

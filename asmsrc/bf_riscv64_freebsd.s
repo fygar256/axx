@@ -2,11 +2,13 @@
 ; RISC-V 64 / FreeBSD (qemu-riscv64 bsd-user, or FreeBSD/riscv64)
 ; axx syntax; the FreeBSD version of bf_riscv64.s (which is for Linux)
 ;
-; build (on FreeBSD the system ld / lld brands the executable itself):
+; build:
 ;   axx --osabi freebsd riscv64full.axx bf_riscv64_freebsd.s -o bf.o
 ;   ld.lld -m elf64lriscv -static -e _start -o bf bf.o
-; with a cross ld.lld that writes OS/ABI "System V", brand it by hand:
-;   elfedit --output-osabi FreeBSD bf        (the FreeBSD kernel needs the brand)
+; ld.lld writes OS/ABI "System V" for RISC-V (even ld.lld 19 on FreeBSD/amd64),
+; so brand it by hand (the FreeBSD kernel needs the brand; qemu does not):
+;   brandelf -t FreeBSD bf          or      elfedit --output-osabi FreeBSD bf
+; bf_riscv64.sh does all of this.
 ;
 ; run:
 ;   qemu-riscv64-static ./bf program.bf
@@ -18,9 +20,8 @@
 ;     negative), so the error test is `bnez t0`, right after the ecall;
 ;   - at process entry a0 points at argc, argv[0], argv[1] ... (sp is the
 ;     same place, after alignment); the code reads them through a0.
-; This file has been checked for assembly only: there was no FreeBSD or
-; bsd-user environment to run it in. The interpreter itself is the Linux
-; file's, which was run under qemu-riscv64 with mandelbrot.bf.
+; Run with mandelbrot.bf under qemu-riscv64 11.0.2 (bsd-user) on
+; FreeBSD/amd64; qemu-riscv64-static 3.1.0 runs it too.
 ;
 ; The addresses of the data are formed with auipc + %pcrel_hi / %pcrel_lo
 ; pairs (the macro `la` below), so the object carries R_RISCV_PCREL_HI20 /
