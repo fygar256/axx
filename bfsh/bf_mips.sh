@@ -5,13 +5,13 @@
 #               FreeBSD 用は bf_mips_freebsd.s、Linux 用は bf_mips.s。
 #
 # 実行:
-#       ./bf_mips.sh                        (build_bf_mips/bf を作る)
-#       ./bf_mips.sh mandelbrot.bf          (作ったあとでその .bf を走らせる)
-#       ./bf_mips.sh run                    (作ったあとで同梱の mandelbrot.bf を走らせる)
-#       ENDIAN=el ./bf_mips.sh              (リトルエンディアン。build_bf_mipsel/bf)
-#       OS=linux ./bf_mips.sh               (OS を選ぶ。既定はホストの OS)
-#       AXX=paxx ./bf_mips.sh               (Python 版でアセンブルする)
-#       QEMU= ./bf_mips.sh x.bf             (MIPS のホストで、qemu を通さずに走らせる)
+#       ./bfsh/bf_mips.sh                (build_bf_mips/bf を作る)
+#       ./bfsh/bf_mips.sh mandelbrot.bf  (作ったあとでその .bf を走らせる)
+#       ./bfsh/bf_mips.sh run            (作ったあとで同梱の mandelbrot.bf を走らせる)
+#       ENDIAN=el ./bfsh/bf_mips.sh      (リトルエンディアン。build_bf_mipsel/bf)
+#       OS=linux ./bfsh/bf_mips.sh       (OS を選ぶ。既定はホストの OS)
+#       AXX=paxx ./bfsh/bf_mips.sh       (Python 版でアセンブルする)
+#       QEMU= ./bfsh/bf_mips.sh x.bf     (MIPS のホストで、qemu を通さずに走らせる)
 #
 # 走らせるのは qemu のユーザーモード（qemu-mips / qemu-mipsel）。FreeBSD の
 # qemu-mips-static は bsd-user なので FreeBSD 用しか、Linux の qemu-mips は
@@ -30,9 +30,10 @@ HOST=$(uname -s | tr A-Z a-z)
 OS=${OS:-$HOST}
 ENDIAN=${ENDIAN:-eb}
 
-# パターンファイルとアセンブリソースの置き場。リポジトリでは patfile/ と
-# asmsrc/ に分かれ、作業場ではどちらも同じ階層にある（test1 と同じ判定）。
-D=$(cd "$(dirname "$0")" && pwd)
+# パターンファイルとアセンブリソースの置き場。スクリプトは bfsh/ に置くので、
+# その一つ上が最上位。リポジトリでは patfile/ と asmsrc/ に分かれ、作業場では
+# どちらも最上位にある（test1 と同じ判定）。
+D=$(cd "$(dirname "$0")/.." && pwd)
 P=$D/patfile; [ -d "$P" ] || P=$D
 S=$D/asmsrc;  [ -d "$S" ] || S=$D
 

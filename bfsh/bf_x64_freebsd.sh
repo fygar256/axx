@@ -5,10 +5,10 @@
 #                      実行ファイルにする（Technical_Manual 3.18 節）。
 #
 # 実行:
-#       ./bf_x64_freebsd.sh                  (build_bf_freebsd/bf を作る)
-#       ./bf_x64_freebsd.sh mandelbrot.bf    (作ったあとでその .bf を走らせる)
-#       ./bf_x64_freebsd.sh run              (作ったあとで同梱の mandelbrot.bf を走らせる)
-#       AXX=paxx ./bf_x64_freebsd.sh         (Python 版で翻訳・アセンブルする)
+#       ./bfsh/bf_x64_freebsd.sh                (build_bf_freebsd/bf を作る)
+#       ./bfsh/bf_x64_freebsd.sh mandelbrot.bf  (作ったあとでその .bf を走らせる)
+#       ./bfsh/bf_x64_freebsd.sh run            (作ったあとで同梱の mandelbrot.bf を走らせる)
+#       AXX=paxx ./bfsh/bf_x64_freebsd.sh       (Python 版で翻訳・アセンブルする)
 #
 # 入口はランタイムの __a64_start。FreeBSD/amd64 のカーネルは argc の場所を
 # rdi で渡し、rsp を 8 バイトずらすので、__a64_start が rsp を合わせてから
@@ -24,9 +24,10 @@ if [ -d "$AXX" ]; then
 fi
 LD=${LD:-ld}
 
-# パターンファイルとアセンブリソースの置き場。リポジトリでは patfile/ と
-# asmsrc/ に分かれ、作業場ではどちらも同じ階層にある（test1 と同じ判定）。
-D=$(cd "$(dirname "$0")" && pwd)
+# パターンファイルとアセンブリソースの置き場。スクリプトは bfsh/ に置くので、
+# その一つ上が最上位。リポジトリでは patfile/ と asmsrc/ に分かれ、作業場では
+# どちらも最上位にある（test1 と同じ判定）。
+D=$(cd "$(dirname "$0")/.." && pwd)
 P=$D/patfile; [ -d "$P" ] || P=$D
 S=$D/asmsrc;  [ -d "$S" ] || S=$D
 

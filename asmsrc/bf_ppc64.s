@@ -21,12 +21,13 @@
 ;            structural difference from the AArch64 original, which could
 ;            just compare x0 against 0.
 ;
-; At process entry the PowerPC ELF ABI hands the arguments over in registers:
-;   r3 = argc,  r4 = argv,  r5 = envp
-; and this uses them.  They can be read off the stack instead, but argc is
-; not at 0(r1): the ABI requires a minimum stack frame, so r1 points 48
-; bytes below argc.  The registers are the documented interface.  No stack
-; frame is set up here because nothing in this program calls anything.
+; At process entry of a static executable the stack holds argc and argv:
+;   0(r1) = argc,  8(r1) = argv[0],  16(r1) = argv[1] ...
+; The registers r3 = argc, r4 = argv, r5 = envp of the PowerPC ELF ABI are
+; set by the dynamic linker, not by the kernel (nor by qemu-ppc64), so a
+; static program has to read the stack; glibc's static start-up does the
+; same.  No stack frame is set up here because nothing in this program
+; calls anything.
 ;
 ; The kernel preserves r14-r31 across sc, so all interpreter state lives
 ; there and survives every syscall:
@@ -56,8 +57,9 @@ SYS_close:  .equ 6
 .section .text
 
 _start:
-    mr 14,4                       ; argv; r4 is volatile across sc
-    cmpdi 3,2                     ; argc
+    ld 3,0(1)                     ; argc
+    addi 14,1,8                   ; argv
+    cmpdi 3,2
     bge _open_file
 
     ; write(2, usage, usage_len)

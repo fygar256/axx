@@ -8,7 +8,7 @@
 ; ld.lld writes OS/ABI "System V" for RISC-V (even ld.lld 19 on FreeBSD/amd64),
 ; so brand it by hand (the FreeBSD kernel needs the brand; qemu does not):
 ;   brandelf -t FreeBSD bf          or      elfedit --output-osabi FreeBSD bf
-; bf_riscv64.sh does all of this.
+; bfsh/bf_riscv64.sh does all of this.
 ;
 ; run:
 ;   qemu-riscv64-static ./bf program.bf

@@ -3325,7 +3325,7 @@ On Linux, build `a64rt_axx.s` with `--osabi Linux` and link with `-e _start`.
 `a64ext.s` is one line that declares the runtime's names with `.extern`; it goes
 in front of the translated text.
 
-The bundled scripts `bf_x64_freebsd.sh` and `bf_x64_linux.sh` run these steps
+The bundled scripts `bfsh/bf_x64_freebsd.sh` and `bfsh/bf_x64_linux.sh` run these steps
 and build `build_bf_freebsd/bf` or `build_bf_linux/bf`. Given a `.bf` file as an
 argument, they run it afterwards; given just `run`, they run the bundled
 `mandelbrot.bf`. `AXX=paxx` makes them use the Python

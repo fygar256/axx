@@ -6,11 +6,11 @@
 #                 切り替えるので、その行を選んだ OS に書き換えた写しを組む。
 #
 # 実行:
-#       ./bf_x86_64.sh                   (build_bf_x86_64/bf を作る)
-#       ./bf_x86_64.sh mandelbrot.bf     (作ったあとでその .bf を走らせる)
-#       ./bf_x86_64.sh run               (作ったあとで同梱の mandelbrot.bf を走らせる)
-#       OS=linux ./bf_x86_64.sh          (OS を選ぶ。既定はホストの OS)
-#       AXX=paxx ./bf_x86_64.sh          (Python 版でアセンブルする)
+#       ./bfsh/bf_x86_64.sh                (build_bf_x86_64/bf を作る)
+#       ./bfsh/bf_x86_64.sh mandelbrot.bf  (作ったあとでその .bf を走らせる)
+#       ./bfsh/bf_x86_64.sh run            (作ったあとで同梱の mandelbrot.bf を走らせる)
+#       OS=linux ./bfsh/bf_x86_64.sh       (OS を選ぶ。既定はホストの OS)
+#       AXX=paxx ./bfsh/bf_x86_64.sh       (Python 版でアセンブルする)
 #
 # FreeBSD で OS=linux にしたものは Linuxulator (linux64.ko) で走る。FreeBSD の
 # ld は出力に FreeBSD のブランドを付けるので、リンクの後で brandelf -t Linux
@@ -28,9 +28,10 @@ LD=${LD:-ld}
 HOST=$(uname -s | tr A-Z a-z)
 OS=${OS:-$HOST}
 
-# パターンファイルとアセンブリソースの置き場。リポジトリでは patfile/ と
-# asmsrc/ に分かれ、作業場ではどちらも同じ階層にある（test1 と同じ判定）。
-D=$(cd "$(dirname "$0")" && pwd)
+# パターンファイルとアセンブリソースの置き場。スクリプトは bfsh/ に置くので、
+# その一つ上が最上位。リポジトリでは patfile/ と asmsrc/ に分かれ、作業場では
+# どちらも最上位にある（test1 と同じ判定）。
+D=$(cd "$(dirname "$0")/.." && pwd)
 P=$D/patfile; [ -d "$P" ] || P=$D
 S=$D/asmsrc;  [ -d "$S" ] || S=$D
 

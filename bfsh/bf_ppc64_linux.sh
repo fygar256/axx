@@ -6,16 +6,18 @@
 #                      qemu-ppc64 (linux-user) で走らせる。
 #
 # 実行:
-#       ./bf_ppc64_linux.sh                  (build_bf_ppc64_linux/bf を作る)
-#       ./bf_ppc64_linux.sh mandelbrot.bf    (作ったあとでその .bf を走らせる)
-#       ./bf_ppc64_linux.sh run              (作ったあとで同梱の mandelbrot.bf を走らせる)
-#       AXX=paxx ./bf_ppc64_linux.sh         (Python 版でアセンブルする)
-#       QEMU= ./bf_ppc64_linux.sh x.bf       (qemu を通さずに走らせる)
+#       ./bfsh/bf_ppc64_linux.sh                (build_bf_ppc64_linux/bf を作る)
+#       ./bfsh/bf_ppc64_linux.sh mandelbrot.bf  (作ったあとでその .bf を走らせる)
+#       ./bfsh/bf_ppc64_linux.sh run            (作ったあとで同梱の mandelbrot.bf を走らせる)
+#       AXX=paxx ./bfsh/bf_ppc64_linux.sh       (Python 版でアセンブルする)
+#       QEMU= ./bfsh/bf_ppc64_linux.sh x.bf     (qemu を通さずに走らせる)
 #
 # qemu は qemu-ppc64-static（Debian の qemu-user-static）を探し、無ければ
 # qemu-ppc64 を使う。ビッグエンディアンの PowerPC64 の Linux ではそのまま
-# 走らせる（ppc64le の Linux では qemu-ppc64 を通す）。FreeBSD の
-# qemu-ppc64-static は bsd-user で Linux の実行ファイルを走らせない。
+# 走らせる（ppc64le の Linux では qemu-ppc64 を通す）。FreeBSD では
+# Linuxulator (linux64.ko) に入れた Linux の qemu
+# (/compat/linux/usr/bin/qemu-ppc64) を使う（/usr/local/bin の qemu は
+# bsd-user で、Linux の実行ファイルを走らせない）。
 #
 
 set -e
@@ -28,9 +30,10 @@ fi
 LD=${LD:-ld.lld}
 HOST=$(uname -s | tr A-Z a-z)
 
-# パターンファイルとアセンブリソースの置き場。リポジトリでは patfile/ と
-# asmsrc/ に分かれ、作業場ではどちらも同じ階層にある（test1 と同じ判定）。
-D=$(cd "$(dirname "$0")" && pwd)
+# パターンファイルとアセンブリソースの置き場。スクリプトは bfsh/ に置くので、
+# その一つ上が最上位。リポジトリでは patfile/ と asmsrc/ に分かれ、作業場では
+# どちらも最上位にある（test1 と同じ判定）。
+D=$(cd "$(dirname "$0")/.." && pwd)
 P=$D/patfile; [ -d "$P" ] || P=$D
 S=$D/asmsrc;  [ -d "$S" ] || S=$D
 
@@ -47,8 +50,12 @@ fi
 # qemu に渡す。
 case $(uname -m) in
     ppc64) Q= ;;
-    *) Q=qemu-ppc64-static
-       command -v $Q >/dev/null 2>&1 || Q=qemu-ppc64 ;;
+    *) if [ $HOST = freebsd ]; then
+           Q=/compat/linux/usr/bin/qemu-ppc64
+       else
+           Q=qemu-ppc64-static
+           command -v $Q >/dev/null 2>&1 || Q=qemu-ppc64
+       fi ;;
 esac
 QEMU=${QEMU-$Q}
 
@@ -61,8 +68,13 @@ $LD -static -e _start -o $W/bf $W/bf.o
 echo "built $W/bf (linux)"
 
 if [ $# -gt 0 ]; then
-    if [ $HOST != linux ]; then
+    # FreeBSD では Linuxulator の上の Linux の qemu で走らせる。
+    if [ $HOST != linux ] && [ $HOST != freebsd ]; then
         echo "$W/bf は linux 用なので、$HOST では走らせられない" >&2
+        exit 1
+    fi
+    if [ -n "$QEMU" ] && ! command -v "$QEMU" >/dev/null 2>&1; then
+        echo "$QEMU が無い（FreeBSD では Linux の qemu-user を /compat/linux に入れる）" >&2
         exit 1
     fi
     $QEMU $W/bf "$@"

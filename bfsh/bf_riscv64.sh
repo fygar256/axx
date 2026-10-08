@@ -5,12 +5,12 @@
 #                  FreeBSD 用は bf_riscv64_freebsd.s、Linux 用は bf_riscv64.s。
 #
 # 実行:
-#       ./bf_riscv64.sh                     (build_bf_riscv64/bf を作る)
-#       ./bf_riscv64.sh mandelbrot.bf       (作ったあとでその .bf を走らせる)
-#       ./bf_riscv64.sh run                 (作ったあとで同梱の mandelbrot.bf を走らせる)
-#       OS=linux ./bf_riscv64.sh            (OS を選ぶ。既定はホストの OS)
-#       AXX=paxx ./bf_riscv64.sh            (Python 版でアセンブルする)
-#       QEMU= ./bf_riscv64.sh x.bf          (qemu を通さずに走らせる)
+#       ./bfsh/bf_riscv64.sh                (build_bf_riscv64/bf を作る)
+#       ./bfsh/bf_riscv64.sh mandelbrot.bf  (作ったあとでその .bf を走らせる)
+#       ./bfsh/bf_riscv64.sh run            (作ったあとで同梱の mandelbrot.bf を走らせる)
+#       OS=linux ./bfsh/bf_riscv64.sh       (OS を選ぶ。既定はホストの OS)
+#       AXX=paxx ./bfsh/bf_riscv64.sh       (Python 版でアセンブルする)
+#       QEMU= ./bfsh/bf_riscv64.sh x.bf     (qemu を通さずに走らせる)
 #
 # RISC-V 以外のホストでは qemu のユーザーモードで走らせる。FreeBSD の
 # qemu-riscv64-static は bsd-user なので FreeBSD 用しか、Linux の
@@ -31,9 +31,10 @@ LD=${LD:-ld.lld}
 HOST=$(uname -s | tr A-Z a-z)
 OS=${OS:-$HOST}
 
-# パターンファイルとアセンブリソースの置き場。リポジトリでは patfile/ と
-# asmsrc/ に分かれ、作業場ではどちらも同じ階層にある（test1 と同じ判定）。
-D=$(cd "$(dirname "$0")" && pwd)
+# パターンファイルとアセンブリソースの置き場。スクリプトは bfsh/ に置くので、
+# その一つ上が最上位。リポジトリでは patfile/ と asmsrc/ に分かれ、作業場では
+# どちらも最上位にある（test1 と同じ判定）。
+D=$(cd "$(dirname "$0")/.." && pwd)
 P=$D/patfile; [ -d "$P" ] || P=$D
 S=$D/asmsrc;  [ -d "$S" ] || S=$D
 
