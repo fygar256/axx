@@ -76,6 +76,21 @@
 .elfwidth::1::0                /* no absolute 8-bit type exists   */
 .elfextern::abs64
 .elfdwarf::abs64
+/* --- differences of labels and PC-relative data ------------------- */
+/* A 4- or 8-byte difference of labels in different sections, or with
+/* an external one (dword ext-dat), is an ADD/SUB pair; one that stays
+/* inside a section is a constant, since this linker does not shrink
+/* code (.elfrelax::0). Data written as label-$$ is the label added
+/* and a local symbol axx places on the field subtracted (.elfpcguess),
+/* as llvm-mc writes .word / .quad ext-. (manual 3.7.9, 3.7.10).      */
+.elftype::add32::35            /* R_RISCV_ADD32                     */
+.elftype::add64::36            /* R_RISCV_ADD64                     */
+.elftype::sub32::39            /* R_RISCV_SUB32                     */
+.elftype::sub64::40            /* R_RISCV_SUB64                     */
+.elfdiff::4::add32::sub32
+.elfdiff::8::add64::sub64
+.elfpcguess::1
+.elfrelax::0                   /* the linker does not shrink code */
 
 /* ===================================================================
 /* Registers

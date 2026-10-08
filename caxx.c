@@ -1224,7 +1224,7 @@ enum {
     PD_ELFEXTERN, PD_ELFDWARF, PD_ELFHEADER, PD_ELFSECTION, PD_ECHO, PD_ELFFIELD,
     PD_ELFPCGUESS, PD_ELFBUILTIN, PD_ELFEXTRA, PD_ELFDIFF, PD_ELFENCODE,
     PD_ELFRINFO, PD_ELFUNIT, PD_ELFLINK, PD_ELFGROUP, PD_ELFCFI, PD_ELFCFIINIT,
-    PD_ELFCFIREG, PD_UNORDERED
+    PD_ELFCFIREG, PD_UNORDERED, PD_ELFRELAX, PD_ELFANCHOR
 };
 
 /* パターン行がどのディレクティブか（種別の番号）。 */
@@ -1246,6 +1246,7 @@ static int pat_dir_kind(const PatEntry *e){
         { ".elfheader", PD_ELFHEADER }, { ".elfsection", PD_ELFSECTION },
         { ".elffield", PD_ELFFIELD },
         { ".elfpcguess", PD_ELFPCGUESS }, { ".elfbuiltin", PD_ELFBUILTIN },
+        { ".elfrelax", PD_ELFRELAX }, { ".elfanchor", PD_ELFANCHOR },
         { ".elfextra", PD_ELFEXTRA }, { ".elfdiff", PD_ELFDIFF },
         { ".elfencode", PD_ELFENCODE }, { ".elfrinfo", PD_ELFRINFO },
         { ".elfunit", PD_ELFUNIT }, { ".elflink", PD_ELFLINK },
@@ -1278,7 +1279,7 @@ static int pat_is_directive(const PatEntry *e){
         ".elftype", ".elfmachine", ".elfclass", ".elfrela", ".elfwidth",
         ".elfextern", ".elfdwarf", ".elfheader", ".elfsection", ".echo", ".elffield",
         ".elfpcguess", ".elfbuiltin", ".elfextra", ".elfdiff", ".elfencode",
-        ".elfrinfo", ".elfunit", ".elflink", ".elfgroup", ".elfcfi", ".elfcfiinit",
+        ".elfrelax", ".elfanchor", ".elfrinfo", ".elfunit", ".elflink", ".elfgroup", ".elfcfi", ".elfcfiinit",
         ".elfcfireg", ".unordered", NULL };
     if(!e || !e->f[0] || !e->f[0][0]) return 0;
     const char *n = e->f[0];
@@ -1730,7 +1731,7 @@ static int pat_dir_line_invariant(const PatEntry *e){
     case PD_ELFMACHINE: case PD_ELFCLASS: case PD_ELFRELA: case PD_ELFWIDTH:
     case PD_ELFEXTERN: case PD_ELFDWARF: case PD_ELFHEADER:
     case PD_ELFSECTION: case PD_ELFFIELD: case PD_ELFPCGUESS: case PD_ELFBUILTIN:
-    case PD_ELFEXTRA: case PD_ELFDIFF: case PD_ELFENCODE: case PD_ELFRINFO:
+    case PD_ELFRELAX: case PD_ELFANCHOR: case PD_ELFEXTRA: case PD_ELFDIFF: case PD_ELFENCODE: case PD_ELFRINFO:
     case PD_ELFUNIT: case PD_ELFLINK: case PD_ELFGROUP: case PD_ELFCFI:
     case PD_ELFCFIINIT: case PD_ELFCFIREG:
         for(int i=1;i<PAT_FIELDS;i++)
@@ -2386,7 +2387,7 @@ typedef struct {
 
     int        elf_tracking;
     struct { char *name; uint64_t val; int word_idx;
-             int rtype; int64_t addend; uint64_t fmask; } *elf_refs;
+             int rtype; int64_t addend; uint64_t fmask; int pair; } *elf_refs;
     int        elf_refs_len;
     int        elf_refs_cap;
     int        elf_current_word_idx;
@@ -2415,6 +2416,16 @@ typedef struct {
     SymMap    *var_tables[NVARS];
     int        reloc_constraints[NVARS];
     uint64_t   reloc_masks[NVARS];     /* `.reloc` の第 4 欄（欄のマスク）。0 は型のまま */
+    int        reloc_pairs[NVARS];     /* `.reloc` の第 5 欄（追加の再配置の並び）の番号。0 は無し */
+    /* 追加の再配置の並び（`.reloc` の第 5 欄）。同じ並びは同じ番号（添字 + 1）を共有する。 */
+    struct { int n; int rt[8]; int off[8]; } *rex;
+    int        rex_len, rex_cap;
+    /* `.elfanchor` の型（綴り）。追加の再配置のうち、行のアンカーを指すもの。 */
+    char     **elf_anchor_types;
+    int        elf_anchor_types_len, elf_anchor_types_cap;
+    /* アンカー（再配置が指す、axx が置く局所シンボル）。名前・セクション・バイト位置。 */
+    struct { char *name; char *section; int64_t off; } *anchors;
+    int        anchors_len, anchors_cap;
     char      *reloc_badname[32];
     int        reloc_badname_len;
 
@@ -2426,6 +2437,7 @@ typedef struct {
     int        elf_decl_class;
     int        elf_decl_rela;
     int        elf_decl_pcguess;
+    int        elf_decl_relax;     /* `.elfrelax`。-1 は宣言なし（`.elfdiff` があれば 1） */
     int        elf_decl_builtin;
     /* `.elfextra` / `.elfdiff` / `.elfencode` / `.elfrinfo` / `.elfunit` /
        `.elflink` / `.elfgroup`。axx.py の ElfState の decl_* と同じ中身。 */
@@ -2968,6 +2980,7 @@ static int elf_machine_is_pcrel(const ElfMachineInfo *m, int rtype){
 }
 
 /* 欄の幅と PC 相対かどうかが一致する型を 1 つ探す。 */
+static int elf_reloc_data_pcrel(const AsmState *st, const ElfMachineInfo *m, int nbytes);
 static int elf_reloc_same_width(const ElfMachineInfo *m, int nbytes, int want_pcrel){
     if(!m) return 0;
     for(int i=0; m->named[i].name; i++){
@@ -3232,6 +3245,21 @@ static int elf_diff_of(const AsmState *st, int nbytes, int *add, int *sub){
 static int elf_diff_any(const AsmState *st){
     for(int w = 1; w < 9; w++) if(st->elf_diff_add[w]) return 1;
     return st->elf_diff_t_len > 0;
+}
+
+/* `.elfanchor` で宣言した型か。 */
+static int elf_is_anchor_type(const AsmState *st, int rtype){
+    if(st->elf_anchor_types_len == 0) return 0;
+    const ElfMachineInfo *m = elf_machine_effective(st);
+    for(int i = 0; i < st->elf_anchor_types_len; i++)
+        if(elf_decl_type_in(m->named, st->elf_anchor_types[i]) == rtype) return 1;
+    return 0;
+}
+
+/* リンカがコードを縮める機種か。`.elfrelax` が無ければ `.elfdiff` があるとき。
+   axx.py の _elf_relaxing() と同じ規則である。 */
+static int elf_relaxing(const AsmState *st){
+    return st->elf_decl_relax >= 0 ? st->elf_decl_relax : elf_diff_any(st);
 }
 
 /* 型付きの `.elfdiff`（`.reloc` がその型を付けた欄）の対を引く。最初に
@@ -3565,6 +3593,7 @@ static void state_init(AsmState *st) {
     for(int _ci=0; _ci<NVARS; _ci++) st->var_tables[_ci] = NULL;
     for(int _ci=0; _ci<NVARS; _ci++) st->reloc_constraints[_ci] = 0;
     for(int _ci=0; _ci<NVARS; _ci++) st->reloc_masks[_ci] = 0;
+    for(int _ci=0; _ci<NVARS; _ci++) st->reloc_pairs[_ci] = 0;
     st->reloc_badname_len = 0;
     st->elftypes = NULL; st->elftypes_len = 0; st->elftypes_cap = 0;
     st->elf_decl_machine = -1;
@@ -3572,6 +3601,7 @@ static void state_init(AsmState *st) {
     st->elf_decl_class = 0;
     st->elf_decl_rela = -1;
     st->elf_decl_pcguess = -1;
+    st->elf_decl_relax = -1;
     st->elf_decl_builtin = -1;
     st->elf_extras = NULL; st->elf_extras_len = 0; st->elf_extras_cap = 0;
     for(int _wi=0;_wi<9;_wi++){ st->elf_diff_add[_wi] = NULL; st->elf_diff_sub[_wi] = NULL; }
@@ -4903,8 +4933,9 @@ static uint256_t label_get_value(AsmState *st, const char *k){
                         st->elf_var_to_label[vi].set = 1;
                         st->elf_var_to_label[vi].label_name = strdup(k);
                         st->elf_var_to_label[vi].label_val = u256_to_u64(e->value);
-                    } else if(st->elf_var_to_label[vi].set == 1 && elf_diff_any(st)){
-                        /* `.elfdiff` があればラベル差の候補にする。各ラベルの
+                    } else if(st->elf_var_to_label[vi].set == 1
+                              && (elf_diff_any(st) || elf_machine_effective(st)->pcrel_guess)){
+                        /* `.elfdiff` か `.elfpcguess::1` があればラベル差の候補にする。各ラベルの
                            符号は取り込みが終わってから elf_v2l_finish() が
                            決める。axx.py の _elf_v2l_second() と同じ規則。 */
                         char *first = strdup(st->elf_var_to_label[vi].label_name);
@@ -4936,6 +4967,7 @@ static uint256_t label_get_value(AsmState *st, const char *k){
                 st->elf_refs[st->elf_refs_len].rtype    = 0;
                 st->elf_refs[st->elf_refs_len].addend   = 0;
                 st->elf_refs[st->elf_refs_len].fmask    = 0;
+                st->elf_refs[st->elf_refs_len].pair     = 0;
                 st->elf_refs_len++;
             }
         }
@@ -5986,6 +6018,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                     (void)_isdiff;
                     st->elf_refs[st->elf_refs_len].rtype    = st->reloc_constraints[_vi];
                     st->elf_refs[st->elf_refs_len].fmask    = st->reloc_masks[_vi];
+                    st->elf_refs[st->elf_refs_len].pair     = st->reloc_pairs[_vi];
                     st->elf_refs[st->elf_refs_len].addend   =
                         u256_is_undef_derived(x) && _isdiff ? 0 :
                         (int64_t)(u256_to_u64(x) - st->elf_var_to_label[_vi].label_val);
@@ -7374,6 +7407,35 @@ static int dir_elfpcguess(Assembler *asmb, PatEntry *e){
     return dir_elf_flag(asmb, e, ".elfpcguess", &asmb->st.elf_decl_pcguess);
 }
 
+static void *elf_decl_grow(void *p, int *cap, int len, size_t sz);
+/* `.elfanchor` — `.reloc` の追加の再配置のうち、行のアンカーを指す型。
+   axx.py の elfanchor_processing() と同じ規則である。 */
+static int dir_elfanchor(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".elfanchor") != 0) return 0;
+    AsmState *st = &asmb->st;
+    const char *f1, *f2; elf_decl_fields(e, &f1, &f2);
+    char *t = elf_decl_trim_dup(f1);
+    if(!t[0]){
+        axx_diagf(1, 0, " error - .elfanchor: relocation type is not specified.\n");
+        free(t);
+        return 1;
+    }
+    for(int i = 0; i < st->elf_anchor_types_len; i++)
+        if(strcmp(st->elf_anchor_types[i], t) == 0){ free(t); return 1; }
+    st->elf_anchor_types = elf_decl_grow(st->elf_anchor_types, &st->elf_anchor_types_cap,
+                                         st->elf_anchor_types_len, sizeof(char*));
+    st->elf_anchor_types[st->elf_anchor_types_len++] = t;
+    st->elf_decl_gen++;
+    return 1;
+}
+
+/* `.elfrelax` — リンカがコードを縮める（緩和する）機種か。
+   axx.py の elfrelax_processing() と同じ規則である。 */
+static int dir_elfrelax(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".elfrelax") != 0) return 0;
+    return dir_elf_flag(asmb, e, ".elfrelax", &asmb->st.elf_decl_relax);
+}
+
 /* `.elfbuiltin` — 組み込みのマシン表を土台にするか。
    axx.py の elfbuiltin_processing() と同じ規則である。 */
 static int dir_elfbuiltin(Assembler *asmb, PatEntry *e){
@@ -7914,8 +7976,75 @@ static int dir_reloc(Assembler *asmb, PatEntry *e){
         }
         if(!elf_decl_u64(asmb, ".reloc", e->f[3], 1, 0xFFFFFFFFFFFFFFFFull, &fmask)) return 1;
     }
+    /* 第 5 欄は追加の再配置の並び `<型>@<オフセット>[,...]`（8 つまで）。オフセットは
+       参照の先頭からのバイト数（`.elffield` のオフセットと同じ数え方）。それぞれ
+       同じシンボルを同じ加数で指す。`.elfanchor` の型だけは、この行の最初の
+       リロケーションの位置に axx が置くアンカー（局所シンボル）を指す。MIPS の
+       la（%hi と %lo）や RISC-V の la（%pcrel_hi と、auipc を指す %pcrel_lo）。
+       axx.py の reloc_processing() と同じ規則である。 */
+    int pair = 0;
+    if(!fld_blank(e->f[4])){
+        int xn = 0, xrt[8], xoff[8];
+        char *lst = strdup(e->f[4]);
+        if(!lst){ perror("strdup"); exit(1); }
+        char *save = NULL;
+        for(char *it = strtok_r(lst, ",", &save); it; it = strtok_r(NULL, ",", &save)){
+            char *at = strrchr(it, '@');
+            if(!at){
+                char *tt = elf_decl_trim_dup(it);
+                axx_diagf(1, 0, " error - .reloc: an extra relocation is written "
+                                "<type>@<offset> ('%s').\n", tt);
+                free(tt); free(lst);
+                return 1;
+            }
+            *at = '\0';
+            char *pn = elf_decl_trim_dup(it);
+            for(char *q = pn; *q; q++) *q = (char)tolower((unsigned char)*q);
+            int prt = elf_reloc_named(&asmb->st, m, pn);
+            if(prt <= 0){
+                axx_diagf(1, 0, " error - .reloc: unknown relocation type '%s' for %s.\n",
+                           pn, m->name);
+                free(pn); free(lst);
+                return 1;
+            }
+            if(!insn_reloc_field_decl(&asmb->st, prt)){
+                axx_diagf(1, 0, " error - .reloc: an extra relocation needs a type declared "
+                                "with .elffield ('%s').\n", pn);
+                free(pn); free(lst);
+                return 1;
+            }
+            free(pn);
+            long long poff = 0;
+            if(!elf_decl_num(asmb, ".reloc", at + 1, 0, 255, &poff)){ free(lst); return 1; }
+            if(xn >= 8){
+                axx_diagf(1, 0, " error - .reloc: at most 8 extra relocations.\n");
+                free(lst);
+                return 1;
+            }
+            xrt[xn] = prt; xoff[xn] = (int)poff; xn++;
+        }
+        free(lst);
+        if(xn > 0){
+            AsmState *st = &asmb->st;
+            for(int i = 0; i < st->rex_len && !pair; i++){
+                if(st->rex[i].n != xn) continue;
+                int same = 1;
+                for(int k = 0; k < xn; k++)
+                    if(st->rex[i].rt[k] != xrt[k] || st->rex[i].off[k] != xoff[k]){ same = 0; break; }
+                if(same) pair = i + 1;
+            }
+            if(!pair){
+                st->rex = elf_decl_grow(st->rex, &st->rex_cap, st->rex_len, sizeof(st->rex[0]));
+                st->rex[st->rex_len].n = xn;
+                for(int k = 0; k < xn; k++){ st->rex[st->rex_len].rt[k] = xrt[k]; st->rex[st->rex_len].off[k] = xoff[k]; }
+                st->rex_len++;
+                pair = st->rex_len;
+            }
+        }
+    }
     asmb->st.reloc_constraints[idx] = rtype;
     asmb->st.reloc_masks[idx] = fmask;
+    asmb->st.reloc_pairs[idx] = pair;
     return 1;
 }
 
@@ -7932,10 +8061,12 @@ static int dir_clrreloc(Assembler *asmb, PatEntry *e){
         }
         asmb->st.reloc_constraints[idx] = 0;
         asmb->st.reloc_masks[idx] = 0;
+        asmb->st.reloc_pairs[idx] = 0;
     } else {
         for(int i = 0; i < g_nvars; i++){
             asmb->st.reloc_constraints[i] = 0;
             asmb->st.reloc_masks[i] = 0;
+            asmb->st.reloc_pairs[i] = 0;
         }
     }
     return 1;
@@ -7997,6 +8128,7 @@ static void free_one_name(Assembler *asmb, const char *name){
                 chk_install(&st->check_constraints[vi], NULL);
                 st->reloc_constraints[vi] = 0;
                 st->reloc_masks[vi] = 0;
+                st->reloc_pairs[vi] = 0;
                 enumdef_clear(&st->enum_defs[vi]);
             }
         }
@@ -15121,13 +15253,14 @@ typedef struct {
     PatEntry *pat;
     PatVar    vars[NVARS];
     struct { char *name; uint64_t val; int word_idx;
-             int rtype; int64_t addend; uint64_t fmask; } *refs;
+             int rtype; int64_t addend; uint64_t fmask; int pair; } *refs;
     int       refs_len;
     struct { int set; char *label_name; uint64_t label_val; } vtl[NVARS];
     SymMap    symbols;
     ChkList  *check_constraints[NVARS];
     int       reloc_constraints[NVARS];
     uint64_t  reloc_masks[NVARS];
+    int       reloc_pairs[NVARS];
     EnumDef   enum_defs[NVARS];
     char      swordchars[256];
     uint256_t padding;
@@ -15202,6 +15335,7 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
             b->refs[i].rtype    = st->elf_refs[saved_refs_len+i].rtype;
             b->refs[i].addend   = st->elf_refs[saved_refs_len+i].addend;
             b->refs[i].fmask    = st->elf_refs[saved_refs_len+i].fmask;
+            b->refs[i].pair     = st->elf_refs[saved_refs_len+i].pair;
         }
     }
     for(int i=0;i<g_nvars;i++){
@@ -15218,6 +15352,7 @@ static void best_capture(AsmState *st, BestMatch *b, PatEntry *pat, int pln,
         b->check_constraints[i] = chk_ref(st->check_constraints[i]);
         b->reloc_constraints[i] = st->reloc_constraints[i];
         b->reloc_masks[i]       = st->reloc_masks[i];
+        b->reloc_pairs[i]       = st->reloc_pairs[i];
         enumdef_init(&b->enum_defs[i]);
         enumdef_copy(&b->enum_defs[i], &st->enum_defs[i]);
     }
@@ -15244,6 +15379,7 @@ static void best_restore_dirstate(AsmState *st, const BestMatch *b){
         chk_install(&st->check_constraints[i], chk_ref(b->check_constraints[i]));
         st->reloc_constraints[i] = b->reloc_constraints[i];
         st->reloc_masks[i]       = b->reloc_masks[i];
+        st->reloc_pairs[i]       = b->reloc_pairs[i];
         enumdef_copy(&st->enum_defs[i], &b->enum_defs[i]);
     }
     memcpy(st->swordchars, b->swordchars, sizeof(st->swordchars));
@@ -15267,6 +15403,7 @@ typedef struct {
     ChkList  *check_constraints[NVARS];
     int       reloc_constraints[NVARS];
     uint64_t  reloc_masks[NVARS];
+    int       reloc_pairs[NVARS];
     EnumDef   enum_defs[NVARS];
     char      swordchars[256];
     uint256_t padding;
@@ -15299,6 +15436,7 @@ static void hdrsnap_take(DirSnap *d, AsmState *st){
         d->check_constraints[i] = chk_ref(st->check_constraints[i]);
         d->reloc_constraints[i] = st->reloc_constraints[i];
         d->reloc_masks[i]       = st->reloc_masks[i];
+        d->reloc_pairs[i]       = st->reloc_pairs[i];
         enumdef_init(&d->enum_defs[i]);
         enumdef_copy(&d->enum_defs[i], &st->enum_defs[i]);
     }
@@ -15322,6 +15460,7 @@ static void hdrsnap_restore(DirSnap *d, AsmState *st){
         chk_install(&st->check_constraints[i], chk_ref(d->check_constraints[i]));
         st->reloc_constraints[i] = d->reloc_constraints[i];
         st->reloc_masks[i]       = d->reloc_masks[i];
+        st->reloc_pairs[i]       = d->reloc_pairs[i];
         enumdef_copy(&st->enum_defs[i], &d->enum_defs[i]);
     }
     if(g_hoist_symbolc) memcpy(st->swordchars, d->swordchars, sizeof(st->swordchars));
@@ -15336,9 +15475,37 @@ static void hdrsnap_restore(DirSnap *d, AsmState *st){
     }
 }
 
+/* セクション sec のバイト位置 off に置くアンカー（局所シンボル）の名前を返す。
+   同じ位置には同じアンカーを使う。名前は .Lanchor<n> で、ラベルと重なれば
+   `_` を足す（.Lcfi<n> と同じ）。axx.py の _elf_anchor_at() と同じ規則である。 */
+static const char *elf_anchor_at(AsmState *st, const char *sec, int64_t off){
+    for(int i = 0; i < st->anchors_len; i++)
+        if(st->anchors[i].off == off && strcmp(st->anchors[i].section, sec) == 0)
+            return st->anchors[i].name;
+    char nm[64]; snprintf(nm, sizeof(nm), ".Lanchor%d", st->anchors_len);
+    char *name = malloc(strlen(nm) + 64);
+    if(!name){ perror("malloc"); exit(1); }
+    strcpy(name, nm);
+    while(lmap_find(&st->labels, name) || lmap_find(&st->export_labels, name)){
+        name = realloc(name, strlen(name) + 2);
+        if(!name){ perror("realloc"); exit(1); }
+        strcat(name, "_");
+    }
+    if(st->anchors_len >= st->anchors_cap){
+        st->anchors_cap = st->anchors_cap ? st->anchors_cap * 2 : 8;
+        st->anchors = realloc(st->anchors, (size_t)st->anchors_cap * sizeof(st->anchors[0]));
+        if(!st->anchors){ perror("realloc"); exit(1); }
+    }
+    st->anchors[st->anchors_len].name = name;
+    st->anchors[st->anchors_len].section = strdup(sec);
+    st->anchors[st->anchors_len].off = off;
+    st->anchors_len++;
+    return name;
+}
+
 static void elf_refs_push_copy(AsmState *st, const char *name,
                                uint64_t val, int word_idx,
-                               int rtype, int64_t addend, uint64_t fmask){
+                               int rtype, int64_t addend, uint64_t fmask, int pair){
     if(st->elf_refs_len >= st->elf_refs_cap){
         st->elf_refs_cap = st->elf_refs_cap ? st->elf_refs_cap*2 : 8;
         st->elf_refs = realloc(st->elf_refs,
@@ -15351,6 +15518,7 @@ static void elf_refs_push_copy(AsmState *st, const char *name,
     st->elf_refs[st->elf_refs_len].rtype    = rtype;
     st->elf_refs[st->elf_refs_len].addend   = addend;
     st->elf_refs[st->elf_refs_len].fmask    = fmask;
+    st->elf_refs[st->elf_refs_len].pair     = pair;
     st->elf_refs_len++;
 }
 
@@ -15482,6 +15650,8 @@ static int pat_dir_exec(Assembler *asmb, PatEntry *i){
     case PD_ELFSECTION:_dir_done = dir_elfsection(asmb,i);    break;
     case PD_ELFFIELD: _dir_done = dir_elffield(asmb,i);      break;
     case PD_ELFPCGUESS:_dir_done = dir_elfpcguess(asmb,i);   break;
+    case PD_ELFRELAX:  _dir_done = dir_elfrelax(asmb,i);     break;
+    case PD_ELFANCHOR: _dir_done = dir_elfanchor(asmb,i);    break;
     case PD_ELFBUILTIN:_dir_done = dir_elfbuiltin(asmb,i);   break;
     case PD_ELFEXTRA: _dir_done = dir_elfextra(asmb,i);      break;
     case PD_ELFDIFF:  _dir_done = dir_elfdiff(asmb,i);       break;
@@ -15763,7 +15933,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
             elf_refs_push_copy(st, best.refs[ri2].name,
                                best.refs[ri2].val, best.refs[ri2].word_idx,
                                best.refs[ri2].rtype, best.refs[ri2].addend,
-                               best.refs[ri2].fmask);
+                               best.refs[ri2].fmask, best.refs[ri2].pair);
         for(int vi=0;vi<g_nvars;vi++){
             free(st->elf_var_to_label[vi].label_name);
             st->elf_var_to_label[vi].set        = best.vtl[vi].set;
@@ -15880,7 +16050,7 @@ static int lineassemble2(Assembler *asmb, const char *line, int idx,
 }
 
 typedef struct { const char *name; uint64_t val; int word_idx; int ord;
-                 int rtype; int64_t addend; uint64_t fmask; } ElfRef;
+                 int rtype; int64_t addend; uint64_t fmask; int pair; } ElfRef;
 
 /* ラベル参照を出力ワードの順に並べるための比較関数。 */
 static int elf_ref_cmp(const void *a, const void *b){
@@ -15931,6 +16101,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
             chk_install(&asmb->st.check_constraints[_ci], NULL);
             asmb->st.reloc_constraints[_ci] = 0;
             asmb->st.reloc_masks[_ci] = 0;
+            asmb->st.reloc_pairs[_ci] = 0;
             enumdef_clear(&asmb->st.enum_defs[_ci]);
         }
         subv_unfreeze_all(&asmb->st.subs);
@@ -16121,7 +16292,8 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                                               _nvalid,
                                               st->elf_refs[_ri].rtype,
                                               st->elf_refs[_ri].addend,
-                                              st->elf_refs[_ri].fmask};
+                                              st->elf_refs[_ri].fmask,
+                                              st->elf_refs[_ri].pair};
                     _nvalid++;
                 }
             }
@@ -16221,8 +16393,13 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                                         int _ex = elf_machine_reloc_bytes(_mtbl_rm, _ple->reloc_type_override);
                                         if(_ex == 0 || _ex == _nbytes) _prt = _ple->reloc_type_override;
                                     }
-                                    if(_prt == 0) _prt = elf_reloc_same_width(_mtbl_rm, _nbytes, 1);
-                                    if(_prt == 0){
+                                    /* その幅の `.elfdiff` があれば足す型・引く型の対にし、
+                                       引く項はこの欄に置くアンカーにする（llvm-mc が
+                                       RISC-V の `.quad ext-.` に付ける形）。 */
+                                    int _pda = 0, _pds = 0;
+                                    int _ppair = _prt == 0 && elf_diff_of(st, _nbytes, &_pda, &_pds);
+                                    if(_prt == 0 && !_ppair) _prt = elf_reloc_data_pcrel(st, _mtbl_rm, _nbytes);
+                                    if(_prt == 0 && !_ppair){
                                         if(st->debug)
                                             axx_diagf(0, 0, " warning - no PC-relative relocation type "
                                                        "for a %d-byte reference to '%s'; relocation "
@@ -16243,12 +16420,110 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                                                        (cur_pc + (uint64_t)_widx - sec_entry_pc_cur))
                                                       * (uint64_t)bpw);
                                         st->relocations[st->reloc_count].sym        = strdup(_pname);
-                                        st->relocations[st->reloc_count].rtype      = _prt;
+                                        st->relocations[st->reloc_count].rtype      = _ppair ? _pda : _prt;
                                         st->relocations[st->reloc_count].addend     = _valid[_gi].addend * _scale;
                                         st->relocations[st->reloc_count].nbytes     = _nbytes;
                                         st->relocations[st->reloc_count].fmask      = 0;
                                         st->reloc_count++;
+                                        if(_ppair){
+                                            int64_t _poff = st->relocations[st->reloc_count - 1].sec_offset;
+                                            const char *_anc = elf_anchor_at(st, sec_name, _poff);
+                                            if(st->reloc_count >= st->reloc_cap){
+                                                st->reloc_cap = st->reloc_cap ? st->reloc_cap*2 : 16;
+                                                st->relocations = realloc(st->relocations,
+                                                    (size_t)st->reloc_cap * sizeof(st->relocations[0]));
+                                                if(!st->relocations){ perror("realloc"); exit(1); }
+                                            }
+                                            st->relocations[st->reloc_count].section    = strdup(sec_name);
+                                            st->relocations[st->reloc_count].sec_offset = _poff;
+                                            st->relocations[st->reloc_count].sym        = strdup(_anc);
+                                            st->relocations[st->reloc_count].rtype      = _pds;
+                                            st->relocations[st->reloc_count].addend     = 0;
+                                            st->relocations[st->reloc_count].nbytes     = _nbytes;
+                                            st->relocations[st->reloc_count].fmask      = 0;
+                                            st->reloc_count++;
+                                        }
                                     }
+                                }
+                                for(int k = 0; k < _nt; k++) free(_tn[k]);
+                                free(_tn); free(_ts);
+                                _gi = _gj;
+                                continue;
+                            }
+                        }
+                        /* 緩和しない機種では、どのラベルも 1 つのセクションで定義され、
+                           足す項と引く項の数が同じ差は定数（距離が変わらない）。
+                           リロケーションを出さず、欄の値をそのまま使う。axx.py の
+                           lineassemble() の同じ処理と同じ規則である。 */
+                        if(!elf_relaxing(st)){
+                            const char *_dsec0 = NULL;
+                            int _dok = 1, _dbal = 0;
+                            for(int k = 0; k < _nt && _dok; k++){
+                                LabelEntry *_dle = lmap_find(&st->labels, _tn[k]);
+                                if(!_dle || _dle->is_imported || !_dle->section || !_dle->section[0]){
+                                    _dok = 0; break;
+                                }
+                                if(!_dsec0) _dsec0 = _dle->section;
+                                else if(strcmp(_dsec0, _dle->section) != 0) _dok = 0;
+                                _dbal += _ts[k];
+                            }
+                            if(_dok && _dbal == 0){
+                                for(int k = 0; k < _nt; k++) free(_tn[k]);
+                                free(_tn); free(_ts);
+                                _gi = _gj;
+                                continue;
+                            }
+                        }
+                        /* `.elfpcguess::1` の機械で、その幅の `.elfdiff` が無いとき、
+                           「ラベル − いまのセクションのラベル」はその位置からの
+                           PC 相対（GNU as と llvm-mc の形）。加数は定数部に「欄の位置 −
+                           引くラベルの位置」を足したもの。axx.py の lineassemble() の
+                           同じ処理と同じ規則である。 */
+                        if(_nt == 2 && _drt == 0 && _mtbl_rm->pcrel_guess){
+                            int _da0 = 0, _ds0 = 0;
+                            int _pl = -1, _pm = -1;
+                            for(int k = 0; k < 2; k++){ if(_ts[k] > 0) _pl = k; else _pm = k; }
+                            LabelEntry *_mle = _pm >= 0 ? lmap_find(&st->labels, _tn[_pm]) : NULL;
+                            int64_t _mw = -1;
+                            if(_pl >= 0 && _mle && !_mle->is_imported && _mle->section
+                               && strcmp(_mle->section, sec_name) == 0
+                               && !elf_diff_of(st, _nbytes, &_da0, &_ds0))
+                                _mw = equ_section_relative_offset(st, sec_name, u256_to_u64(_mle->value));
+                            if(_mw >= 0 && _widx < objl.len){
+                                LabelEntry *_lle = lmap_find(&st->labels, _tn[_pl]);
+                                int _prt = 0;
+                                if(_lle && _lle->reloc_type_override >= 0
+                                   && !extern_untyped_has(st, _tn[_pl])){
+                                    int _ex = elf_machine_reloc_bytes(_mtbl_rm, _lle->reloc_type_override);
+                                    if(_ex == 0 || _ex == _nbytes) _prt = _lle->reloc_type_override;
+                                }
+                                if(_prt == 0) _prt = elf_reloc_data_pcrel(st, _mtbl_rm, _nbytes);
+                                if(_prt == 0){
+                                    if(st->debug)
+                                        axx_diagf(0, 0, " warning - no PC-relative relocation type "
+                                                   "for a %d-byte reference to '%s'; relocation "
+                                                   "omitted.\n", _nbytes, _tn[_pl]);
+                                } else {
+                                    int64_t _pwo = (int64_t)(sec_completed_words +
+                                                             (cur_pc + (uint64_t)_widx - sec_entry_pc_cur));
+                                    if(_mtbl_rm->is_rela)
+                                        for(int _k = 0; _k < _nwords; _k++)
+                                            if(_widx + _k < objl.len) objl.data[_widx + _k] = u256_zero();
+                                    if(st->reloc_count >= st->reloc_cap){
+                                        st->reloc_cap = st->reloc_cap ? st->reloc_cap*2 : 16;
+                                        st->relocations = realloc(st->relocations,
+                                            (size_t)st->reloc_cap * sizeof(st->relocations[0]));
+                                        if(!st->relocations){ perror("realloc"); exit(1); }
+                                    }
+                                    st->relocations[st->reloc_count].section    = strdup(sec_name);
+                                    st->relocations[st->reloc_count].sec_offset = _pwo * (int64_t)bpw;
+                                    st->relocations[st->reloc_count].sym        = strdup(_tn[_pl]);
+                                    st->relocations[st->reloc_count].rtype      = _prt;
+                                    st->relocations[st->reloc_count].addend     =
+                                        (_valid[_gi].addend + (_pwo - _mw)) * _scale;
+                                    st->relocations[st->reloc_count].nbytes     = _nbytes;
+                                    st->relocations[st->reloc_count].fmask      = 0;
+                                    st->reloc_count++;
                                 }
                                 for(int k = 0; k < _nt; k++) free(_tn[k]);
                                 free(_tn); free(_ts);
@@ -16422,6 +16697,51 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         st->relocations[st->reloc_count].nbytes     = _ibytes;
                         st->relocations[st->reloc_count].fmask      = _valid[_gi].fmask;
                         st->reloc_count++;
+                        /* `.reloc` の追加の再配置。同じシンボルを同じ加数（と型の補正）で
+                           指す。`.elfanchor` の型はこの位置に置くアンカーを指し、加数は
+                           補正だけ。 */
+                        int _pr = _valid[_gi].pair;
+                        int _pn = (_pr > 0 && _pr <= st->rex_len) ? st->rex[_pr - 1].n : 0;
+                        for(int _pk = 0; _pk < _pn; _pk++){
+                            int _prt = st->rex[_pr - 1].rt[_pk];
+                            const ElfFieldInfo *_pfd = insn_reloc_field_decl(st, _prt);
+                            if(!_pfd) continue;
+                            int _pw = _widx + st->rex[_pr - 1].off[_pk] / bpw;
+                            int _pbytes = elf_machine_reloc_bytes(_mtbl_rm, _prt);
+                            if(_pbytes <= 0) _pbytes = 4;
+                            int _pwords = _pbytes / bpw; if(_pwords < 1) _pwords = 1;
+                            if(_pw + _pwords > objl.len) continue;
+                            if(_mtbl_rm->is_rela){
+                                uint64_t _wmask_p = axx_word_mask(st->bts);
+                                for(int _k = 0; _k < _pwords; _k++){
+                                    int _sh = st->endian_big ? st->bts * (_pwords - 1 - _k)
+                                                             : st->bts * _k;
+                                    uint64_t _clear = (_sh < 64) ? ((_pfd->mask >> _sh) & _wmask_p) : 0;
+                                    uint64_t _wv = u256_to_u64(objl.data[_pw + _k]);
+                                    objl.data[_pw + _k] = u256_from_u64((_wv & ~_clear) & _wmask_p);
+                                }
+                            }
+                            int _panc = elf_is_anchor_type(st, _prt);
+                            const char *_psym = _panc ? elf_anchor_at(st, sec_name, _sec_rel_h) : _lname;
+                            if(st->reloc_count >= st->reloc_cap){
+                                st->reloc_cap = st->reloc_cap ? st->reloc_cap*2 : 16;
+                                st->relocations = realloc(st->relocations,
+                                    (size_t)st->reloc_cap * sizeof(st->relocations[0]));
+                                if(!st->relocations){ perror("realloc"); exit(1); }
+                            }
+                            st->relocations[st->reloc_count].section    = strdup(sec_name);
+                            st->relocations[st->reloc_count].sec_offset =
+                                (int64_t)((sec_completed_words +
+                                           (cur_pc + (uint64_t)_pw - sec_entry_pc_cur))
+                                          * (uint64_t)bpw);
+                            st->relocations[st->reloc_count].sym        = strdup(_psym);
+                            st->relocations[st->reloc_count].rtype      = _prt;
+                            st->relocations[st->reloc_count].addend     =
+                                (_panc ? 0 : _valid[_gi].addend * _scale) + (int64_t)_pfd->bias;
+                            st->relocations[st->reloc_count].nbytes     = _pbytes;
+                            st->relocations[st->reloc_count].fmask      = 0;
+                            st->reloc_count++;
+                        }
                         _gi = _gj;
                         continue;
                     }
@@ -16504,7 +16824,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     if(_rtype_is_default_guess && _mtbl_rm->pcrel_guess
                        && !elf_machine_is_pcrel(_mtbl_rm, _rtype)
                        && _pcg_d != 0){
-                        int _alt = elf_reloc_same_width(_mtbl_rm, _nbytes, 1);
+                        int _alt = elf_reloc_data_pcrel(st, _mtbl_rm, _nbytes);
                         if(_alt > 0) _rtype = _alt;
                     }
 
@@ -17111,7 +17431,7 @@ static void build_eh_frame(AsmState *st, const ElfMachineInfo *m, int is_elf64, 
         return;
     }
     int radd = 0, rsub = 0;
-    int relax = elf_diff_of(st, 4, &radd, &rsub);
+    int relax = elf_relaxing(st) && elf_diff_of(st, 4, &radd, &rsub);
     if(relax && code != 1){
         axx_diagf(1, 0, " error - CFI: relocated advances need a code alignment factor of 1.\n");
         return;
@@ -17658,7 +17978,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     int WEO_SYMSZ = _is_elf64 ? 24 : 16;
     WBB symtab_bb; symtab_bb.b=calloc(32,(size_t)WEO_SYMSZ); symtab_bb.len=0; symtab_bb.cap=32*WEO_SYMSZ;
     int nsyms=0;
-    WSNI *snimap=calloc((size_t)(st->labels.count+st->export_labels.count+8),sizeof(WSNI));
+    WSNI *snimap=calloc((size_t)(st->labels.count+st->export_labels.count+st->anchors_len+8),sizeof(WSNI));
     int snimap_len=0;
 
     /* 節番号が SHN_LORESERVE (0xff00) 以上のセクションがあれば、st_shndx に
@@ -17680,7 +18000,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     CfiPt *cfi_pts = NULL; int n_cfi_pts = 0;
     {
         int _ra, _rs;
-        if(st->cfi_fdes_len > 0 && elf_diff_of(st, 4, &_ra, &_rs)){
+        if(st->cfi_fdes_len > 0 && elf_relaxing(st) && elf_diff_of(st, 4, &_ra, &_rs)){
             n_cfi_pts = cfi_points(st, bpw, &cfi_pts);
             for(int k = 0; k < n_cfi_pts; k++){
                 char nm[64]; snprintf(nm, sizeof(nm), ".Lcfi%d", k);
@@ -17747,6 +18067,16 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         cfi_pts[k].sym = nsyms;
         uint64_t _cv = _word_unit ? (uint64_t)cfi_pts[k].b / (uint64_t)bpw : (uint64_t)cfi_pts[k].b;
         WEO_PSYM(noff, 0, 0, (uint32_t)(_si + G), 0, _cv, 0);
+    }
+    /* アンカー（.Lanchor<n>）。対のリロケーションと `ラベル − $$` の引く項が指す。 */
+    for(int k = 0; k < st->anchors_len; k++){
+        int _si = 0;
+        for(int i = 0; i < ncs; i++) if(strcmp(csecs[i].name, st->anchors[k].section) == 0){ _si = i + 1; break; }
+        if(!_si) continue;
+        uint32_t noff = wbb_str(&strtab_bb, st->anchors[k].name);
+        snimap[snimap_len++]=(WSNI){st->anchors[k].name,nsyms};
+        uint64_t _av = _word_unit ? (uint64_t)st->anchors[k].off / (uint64_t)bpw : (uint64_t)st->anchors[k].off;
+        WEO_PSYM(noff, 0, 0, (uint32_t)(_si + G), 0, _av, 0);
     }
     int first_global=nsyms;
     for(int i=0;i<nl;i++){
@@ -21027,6 +21357,9 @@ static void elf_desc_print(AsmState *st, FILE *fp){
     fprintf(fp, ".elfextern::%s\n", elf_desc_tname(m, m->extern_default, b1, sizeof(b1)));
     fprintf(fp, ".elfdwarf::%s\n", elf_desc_tname(m, m->dwarf_abs, b1, sizeof(b1)));
     fprintf(fp, ".elfpcguess::%d\n", m->pcrel_guess ? 1 : 0);
+    if(st->elf_decl_relax >= 0) fprintf(fp, ".elfrelax::%d\n", st->elf_decl_relax);
+    for(int i = 0; i < st->elf_anchor_types_len; i++)
+        fprintf(fp, ".elfanchor::%s\n", st->elf_anchor_types[i]);
     fprintf(fp, ".elfunit::%s\n", st->elf_decl_unit == 1 ? "word" : "byte");
     for(int w = 1; w < 9; w++){
         int ra, rb;
@@ -21197,6 +21530,8 @@ static void register_elfdecls(Assembler *asmb){
         case PD_ELFSECTION: dir_elfsection(asmb, e);  break;
         case PD_ELFFIELD:   dir_elffield(asmb, e);    break;
         case PD_ELFPCGUESS: dir_elfpcguess(asmb, e);  break;
+        case PD_ELFRELAX:   dir_elfrelax(asmb, e);    break;
+        case PD_ELFANCHOR:  dir_elfanchor(asmb, e);   break;
         case PD_ELFBUILTIN: dir_elfbuiltin(asmb, e);  break;
         case PD_ELFEXTRA:   dir_elfextra(asmb, e);    break;
         case PD_ELFDIFF:    dir_elfdiff(asmb, e);     break;
@@ -21918,6 +22253,11 @@ int main(int argc, char *argv[]){
             free(st->relocations[ri].sym);
         }
         st->reloc_count=0;
+        for(int _ai=0;_ai<st->anchors_len;_ai++){
+            free(st->anchors[_ai].name);
+            free(st->anchors[_ai].section);
+        }
+        st->anchors_len=0;
         for(int _li=0;_li<st->line_map_len;_li++){
             free(st->line_map[_li].section);
             free(st->line_map[_li].file);

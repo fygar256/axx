@@ -232,6 +232,10 @@ riscv64.s                           test assemble file for riscv64.axx. it
                                     file declares, and links and runs:
                                     axx riscv64.axx riscv64.s -o out.o &&
                                     ld -m elf64lriscv -o out out.o
+riscv64_reloc2.s                    data relocations of riscv64.axx for -o:
+                                    label-$$ and label differences across
+                                    sections as ADD/SUB pairs (.elfpcguess,
+                                    .elfrelax::0), checked against llvm-mc
 riscv64full.axx                     pattern file for RISC-V RV64, the whole
                                     ISA: I, M, A, F, D, Q, Zfh, Zfa, C (Zca
                                     Zcd Zcb Zcmp Zcmt Zcmop), Zba Zbb Zbc Zbs,
@@ -250,6 +254,12 @@ riscv64full.s                       test assemble file for riscv64full.axx:
 riscv64full_reloc.s                 every relocation riscv64full.axx declares,
                                     against external symbols, for -o:
                                     axx riscv64full.axx riscv64full_reloc.s -o out.o
+riscv64full_reloc2.s                the relocations riscv64full_reloc.s does
+                                    not reach, for -o: la / lla and the global
+                                    loads and stores (PCREL_HI20 + PCREL_LO12
+                                    against a local symbol on the auipc, the
+                                    pair fields of .reloc), label-$$ data and
+                                    label differences, checked against llvm-mc
 bf_riscv64.s                        brainfuck interpreter written in RISC-V
                                     assembly (axx syntax), a port of
                                     bf_aarch64.s. assembles with
@@ -477,6 +487,17 @@ mipsr6.s                            test assemble file for mipsr6.axx /
                                     instructions of Release 6, checked against
                                     llvm-mc 19 byte-for-byte (relocations
                                     included)
+mips_reloc2.s                       o32 relocations for -o (mips.axx and the
+                                    other o32 front files): la with R_MIPS_HI16
+                                    + LO16 (the extra relocations of .reloc)
+                                    and PC-relative data (R_MIPS_PC32),
+                                    checked against llvm-mc 19 and ld.lld
+mips64_reloc2.s                     n64 relocations for -o (mips64.axx and the
+                                    other n64 front files): la / dla with
+                                    HIGHEST + HIGHER + HI16 + LO16 and
+                                    PC-relative data (R_MIPS_PC32, and the
+                                    composite PC32 / 64 for 8 bytes), checked
+                                    against llvm-mc 19 and ld.lld
 z80.axx                             pattern file for Z80
 z80.s                               test assemble file for Z80
 vliw.axx                            test pattern file for vliw

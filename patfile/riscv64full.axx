@@ -80,19 +80,28 @@
 /* hold a symbol is typed with .reloc, so an object links with GNU ld
 /* and LLD: BRANCH, JAL, CALL_PLT, PCREL_HI20 / LO12_I / LO12_S, HI20,
 /* LO12_I / LO12_S, GOT_HI20, TLS_GOT_HI20, TLS_GD_HI20, TPREL_HI20,
-/* TPREL_LO12_I / LO12_S, RVC_BRANCH and RVC_JUMP.
+/* TPREL_LO12_I / LO12_S, RVC_BRANCH and RVC_JUMP. la / lla and the
+/* global load / store forms carry PCREL_HI20 on the auipc and
+/* PCREL_LO12_I / _S on the second instruction against a local symbol
+/* axx places on the auipc (.Lanchor<n>), as GNU as and llvm-mc do. In
+/* data, a difference of labels across sections and a value written as
+/* label-$$ are ADD32 / SUB32 or ADD64 / SUB64 pairs, and a difference
+/* inside one section is a constant (.elfrelax::0: no relaxation).
 /*
 /* Limits of a one-row-one-instruction model
 /*   - R_RISCV_RELAX is not emitted, so a linker does not relax.
 /*   - %pcrel_lo(label) names the label of the AUIPC. In the object the
 /*     relocation is right; in a flat binary (-b) its field is 0.
 /*   - la / lla and the global load / store forms work out the
-/*     pc-relative offset themselves, so they are exact for a target in
-/*     the same section (or in a flat binary), and not for a symbol of
-/*     another section or an external one. There, write the explicit
-/*     auipc + addi / %pcrel_hi / %pcrel_lo pair, which carries the
-/*     relocations. call, tail and jump are one relocation over the
-/*     auipc + jalr pair and work for an external symbol.
+/*     pc-relative offset themselves for -b; under -o they carry the
+/*     relocation pair even for a target in the same section, which
+/*     GNU as -mno-relax and llvm-mc resolve themselves (the linked
+/*     image is the same). The same holds for a branch, j, jal or call
+/*     to a label of the same section. call, tail and jump are one
+/*     relocation over the auipc + jalr pair.
+/*   - a 2- or 1-byte difference of labels across sections (half / db)
+/*     gets no relocation: no ADD16 / ADD8 pair is declared, so that an
+/*     instruction row can never be given one.
 /*   - li of a label or an expression is encoded once the value is
 /*     known, so its length can differ between the passes.
 /*   - li chooses the same instruction sequence as LLVM for nearly every
@@ -115,6 +124,10 @@
 /* instructions (checked against the D encodings with the format field
 /* changed), Zabha, vwsll, mnret, c.ntl.*, c.sspush and c.sspopchk. See
 /* riscv64full.s (the rows) and riscv64full_reloc.s (every relocation).
+/* riscv64full_reloc2.s (la / lla, the global forms, PC-relative data
+/* and label differences) was checked against llvm-mc 19 without relax:
+/* the same relocation entries, apart from the name of the local symbol,
+/* and the same image linked with ld.lld 19.
 /*
 /* Assemble and link with:
 /*   axx riscv64full.axx prog.s -o out.o
@@ -171,6 +184,10 @@
 .elffield::branch::0xfe000f80         /* B-type, split               */
 .elffield::rvc_branch::0x1c7c         /* CB-type, scattered          */
 .elffield::rvc_jump::0x1ffc           /* CJ-type, scattered          */
+/* a %pcrel_lo written by la / lla and the global forms (the extra
+/* relocation of .reloc) names the local symbol axx places on the auipc */
+.elfanchor::pcrel_lo12_i
+.elfanchor::pcrel_lo12_s
 /* a call is two words: auipc's U field, then jalr's I field, read as
 /* one little-endian 8-byte integer */
 .elffield::call::0xfff00000fffff000
@@ -182,6 +199,22 @@
 .elfwidth::1::0                /* no absolute 8-bit type exists   */
 .elfextern::abs64
 .elfdwarf::abs64
+
+/* --- differences of labels and PC-relative data ------------------- */
+/* A 4- or 8-byte difference of labels in different sections, or with
+/* an external one (dword ext-dat), is an ADD/SUB pair; one that stays
+/* inside a section is a constant, since this linker does not shrink
+/* code (.elfrelax::0). Data written as label-$$ is the label added
+/* and a local symbol axx places on the field subtracted (.elfpcguess),
+/* as llvm-mc writes .word / .quad ext-. (manual 3.7.9, 3.7.10).      */
+.elftype::add32::35            /* R_RISCV_ADD32                     */
+.elftype::add64::36            /* R_RISCV_ADD64                     */
+.elftype::sub32::39            /* R_RISCV_SUB32                     */
+.elftype::sub64::40            /* R_RISCV_SUB64                     */
+.elfdiff::4::add32::sub32
+.elfdiff::8::add64::sub64
+.elfpcguess::1
+.elfrelax::0                   /* the linker does not shrink code */
 
 /* ===================================================================
 /* Registers
@@ -721,7 +754,12 @@ CALL d,!v :: .call call8(v-$$,d,d)
 TAIL !v :: .call call8(v-$$,0,6)
 JUMP !v,s :: .call call8(v-$$,0,s)
 .clrreloc::v
-/* la / lla: auipc + addi, the offset worked out here */
+/* la / lla: auipc + addi. The offset is worked out here for -b; under -o
+/* the auipc carries R_RISCV_PCREL_HI20 against the symbol and the addi
+/* R_RISCV_PCREL_LO12_I against a local symbol axx places on the auipc
+/* (the extra relocation of .reloc and .elfanchor), as GNU as and llvm-mc
+/* write. */
+.reloc::v::pcrel_hi20::::pcrel_lo12_i@4
 LA d,!v :: .call pair_i(v-$$,d,0x13|(d<<15)|(d<<7))
 LLA d,!v :: .call pair_i(v-$$,d,0x13|(d<<15)|(d<<7))
 /* the global load / store forms: auipc + load, auipc + store */
@@ -738,10 +776,12 @@ LLA d,!v :: .call pair_i(v-$$,d,0x13|(d<<15)|(d<<7))
 !gl("LBU", 4, 0x03, "d")
 !gl("LHU", 5, 0x03, "d")
 !gl("LWU", 6, 0x03, "d")
+.reloc::v::pcrel_hi20::::pcrel_lo12_s@4
 !gs("SB", 0, 0x23, "t")
 !gs("SH", 1, 0x23, "t")
 !gs("SW", 2, 0x23, "t")
 !gs("SD", 3, 0x23, "t")
+.clrreloc::v
 
 /* ===================================================================
 /* M: multiply and divide
@@ -1161,14 +1201,18 @@ z = base | (ix << 15) | (rd << 7)
 !def gsf(nm, f3, rt) {
 !{nm} !{rt},!v,s :: .call pair_s(v-$$,s,0x!{(f3 << 12) | 0x27:x}|(s<<15)|(!{rt}<<20))
 }
+/* under -o, R_RISCV_PCREL_HI20 + PCREL_LO12_I / _S as for la (above) */
+.reloc::v::pcrel_hi20::::pcrel_lo12_i@4
 !glf("FLH", 1, "fd")
 !glf("FLW", 2, "fd")
 !glf("FLD", 3, "fd")
 !glf("FLQ", 4, "fd")
+.reloc::v::pcrel_hi20::::pcrel_lo12_s@4
 !gsf("FSH", 1, "ft")
 !gsf("FSW", 2, "ft")
 !gsf("FSD", 3, "ft")
 !gsf("FSQ", 4, "ft")
+.clrreloc::v
 
 /* ===================================================================
 /* C: the compressed instructions (Zca, Zcf-less RV64, Zcd, Zcb), and

@@ -51,8 +51,11 @@
 .elfextra::call::relax
 
 /* --- label differences in data ------------------------------------ */
+/* The linker may shrink code here, so even a difference inside one   */
+/* section stays an ADD/SUB pair (riscv64.axx says .elfrelax::0).     */
 .elfdiff::4::add32::sub32
 .elfdiff::8::add64::sub64
+.elfrelax::1
 
 /* --- typed differences: a ULEB128 field and a 6-bit field ---------- */
 /* A difference in a field `.reloc` types gets the pair declared for  */

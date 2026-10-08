@@ -97,6 +97,14 @@ caxx $P/regress.axx $S/regresscr.s -v > b157
 # データ（.elfpcguess）。-o の ELF で比べる。両方のバイト順。
 caxx $P/ppc64.axx $S/ppc64_reloc2.s -o b158
 caxx $P/ppc64le.axx $S/ppc64_reloc2.s -o b159
+# RISC-V: la / lla と大域ロード・ストアの PCREL の対（.reloc の第 5・6 欄とアンカー）、
+# label-$$ と書いた PC 相対のデータ、セクションをまたぐラベル差（.elfrelax::0）。
+caxx $P/riscv64full.axx $S/riscv64full_reloc2.s -o b160
+caxx $P/riscv64.axx $S/riscv64_reloc2.s -o b161
+# MIPS: la / dla の追加の再配置（HI16+LO16、HIGHEST+HIGHER+HI16+LO16）と PC 相対の
+# データ（R_MIPS_PC32 ほか）。o32 REL ビッグエンディアンと n64 RELA リトルエンディアン。
+caxx $P/mips.axx $S/mips_reloc2.s -o b162
+caxx $P/mips64el.axx $S/mips64_reloc2.s -o b163
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -268,6 +276,10 @@ paxx $P/z80.axx $S/regresself.s -o a156 2>&1 | grep -v '^elf: ' > a156e
 paxx $P/regress.axx $S/regresscr.s -v > a157
 paxx $P/ppc64.axx $S/ppc64_reloc2.s -o a158
 paxx $P/ppc64le.axx $S/ppc64_reloc2.s -o a159
+paxx $P/riscv64full.axx $S/riscv64full_reloc2.s -o a160
+paxx $P/riscv64.axx $S/riscv64_reloc2.s -o a161
+paxx $P/mips.axx $S/mips_reloc2.s -o a162
+paxx $P/mips64el.axx $S/mips64_reloc2.s -o a163
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -397,6 +409,10 @@ check a156e b156e
 check a157 b157
 check a158 b158
 check a159 b159
+check a160 b160
+check a161 b161
+check a162 b162
+check a163 b163
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

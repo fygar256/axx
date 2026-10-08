@@ -161,10 +161,15 @@
 /* PC18_S3 (ldpc), PCHI16 and PCLO16 (%pcrel_hi %pcrel_lo); its
 /* 16-bit compact branches take PC16.
 /*
-/* li of a label, la and dla compute the address themselves and carry
-/* no relocation (one row cannot carry two types). They are exact in a
-/* flat binary (-b). In an object, write the pair yourself:
-/*   lui $t0,%hi(sym)  /  addiu $t0,$t0,%lo(sym)
+/* la and dla carry the relocations GNU as and llvm-mc give them, all
+/* against the symbol with its addend: HI16 + LO16 on the o32 la (lui +
+/* addiu), HIGHEST + HIGHER + HI16 + LO16 on the six-word n64 la / dla
+/* (the extra relocations of .reloc). Data written as label-$$, or as a
+/* label minus a label of the section being assembled (word ext-$$,
+/* word ext-dat), is PC-relative: R_MIPS_PC32, and for 8 bytes on n64
+/* the composite R_MIPS_PC32 / R_MIPS_64 (.elfpcguess). li of a label
+/* and dla under o32 still compute the address themselves and carry no
+/* relocation; in an object write lui %hi / addiu %lo.
 /*
 /* Differences from GNU as, by design
 /*   - div / divu / ddiv / ddivu rs,rt is the instruction itself, as
@@ -206,6 +211,11 @@
 /* of the same sources assembled by GNU as, in both byte orders.
 /* (In a flat binary j / jal hold the target, where GNU as leaves the
 /* field to the linker.)
+/* asmsrc/mips_reloc2.s (o32) and asmsrc/mips64_reloc2.s (n64), the la /
+/* dla forms and the PC-relative data, were checked against llvm-mc 19
+/* in all eight front files: the same words and relocation entries (a
+/* local label named by its own symbol, as above), and the same image
+/* linked with ld.lld 19.
 /* =================================================================== */
 
 .error::2::"branch or jump target out of range, or not a multiple of 4"
@@ -277,6 +287,17 @@
 .elftype::pc19_s2::63::4::1
 .elftype::pchi16::64::4::1
 .elftype::pclo16::65::4::1
+
+/* Data written as label-$$, or as a label minus a label of the section
+/* being assembled (.word ext-$$, .word ext-dat), is PC-relative
+/* (.elfpcguess, manual 3.7.9): R_MIPS_PC32, and on n64 for 8 bytes the
+/* composite R_MIPS_PC32 / R_MIPS_64 / R_MIPS_NONE, as GNU as and
+/* llvm-mc write them. */
+.elftype::pc32::248::4::1
+!if N64() !then {
+.elftype::pc64::0x12f8::8::1
+}
+.elfpcguess::1
 
 /* The fields, read as one 32-bit word in the byte order of the file:
 /* the immediate is the low half of the word in either order. */
@@ -984,11 +1005,20 @@ DINS t,s,!p,!z :: .call dinsf(t,s,p,z)
 
 LI t,!v :: .call li32(t,v)
 DLI t,!v :: .call ldemit(t,v,1)
-DLA t,!v :: .call la64(t,v)
+/* la / dla: under -o the words carry the relocations GNU as and llvm-mc
+/* give them, all against the symbol with its addend: HI16 + LO16 for
+/* the o32 la (lui + addiu), HIGHEST + HIGHER + HI16 + LO16 for the
+/* six-word n64 form (the extra relocations of .reloc, manual 3.7.5) */
 !if N64() !then {
+.reloc::v::highest::::higher@4,hi16@12,lo16@20
+DLA t,!v :: .call la64(t,v)
 LA t,!v :: .call la64(t,v)
+.clrreloc::v
 } !else {
+DLA t,!v :: .call la64(t,v)
+.reloc::v::hi16::::lo16@4
 LA t,!v :: .call la32(t,v)
+.clrreloc::v
 }
 
 /* ===================================================================
