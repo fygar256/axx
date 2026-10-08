@@ -31,9 +31,14 @@
 .elftype::d34::128::8
 .elftype::pcrel34::132::8::1
 .elftype::rel16::249::2::1
-.elffield::rel24::0x03fffffc
+.elffield::rel24::0x03fffffc::0::2
 .elffield::addr24::0x03fffffc
-.elffield::rel14::0xfffc
+.elffield::rel14::0xfffc::0::2
+/* A branch to a local label of the same section is resolved here with
+/* no relocation, as GNU as and llvm-mc do (manual 3.7.7); a global or
+/* weak target keeps REL24 / REL14. */
+.elfresolve::rel24
+.elfresolve::rel14
 .elffield::addr14::0xfffc
 .elffield::addr16::0xffff::2
 .elffield::addr16_lo::0xffff::2

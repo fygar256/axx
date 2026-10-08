@@ -121,10 +121,12 @@
 /* relocations comes from -f 32 -m 18 (EM_SPARC32PLUS) or -m 2
 /* (EM_SPARC).
 /*
-/* set / setsw / setx of a label compute the address themselves and
-/* carry no relocation (one row cannot carry two types). They are
-/* exact in a flat binary (-b). In an object, write the pair yourself:
-/*   sethi %hi(sym),%o0  /  or %o0,%lo(sym),%o0
+/* set / setuw / setsw / setx of a label take the fixed form GNU as and
+/* llvm-mc write for a symbol (sethi %hi + or %lo, setsw adding sra, and
+/* the six words of setx), with R_SPARC_HI22 + LO10 (and HH22 + HM10 for
+/* setx) against the symbol and its addend; a number still takes the
+/* shortest form. Data written as label-$$ or as a label minus a label
+/* of this section takes R_SPARC_DISP8 / 16 / 32 / 64.
 /*
 /* Differences from llvm-mc, by design
 /*   - a plain sethi operand takes R_SPARC_22 (llvm-mc writes
@@ -139,11 +141,10 @@
 /*   - xmulxhi is opf 0x116 and bshuffle 0x04c, as in the architecture
 /*     manuals and the GNU opcode table (llvm-mc 19 writes 0x117 and
 /*     0x01c);
-/*   - a branch or call to a label of the same section is a relocation
-/*     against that label, where llvm-mc and GNU as resolve it
-/*     themselves. Both link the same, but ld.lld 19 does not handle
-/*     R_SPARC_WDISP22 / WDISP19 / WDISP16: to link with it, define the
-/*     branch targets as constants (name: .equ $$), as bf_sparc.s does.
+/*   - a local label is named by its own symbol in a relocation, where
+/*     llvm-mc uses the section symbol plus an offset; both link the
+/*     same. (A call or branch to a local label of the same section is
+/*     resolved, as by llvm-mc; see .elfresolve below.)
 /*
 /* Not covered: the TLS call / add annotations (add ...,
 /* %tgd_add(sym) and the like), the SPARC T4 / M7 crypto and VIS 4
@@ -166,6 +167,11 @@
 /*                         symbol: the relocation entries (offset, type,
 /*                         symbol, addend) and the bytes are those of
 /*                         llvm-mc 19
+/*   asmsrc/sparc_reloc2.s set / setx of a label, PC-relative data and
+/*                         branches to local labels: the bytes and the
+/*                         relocation entries are those of llvm-mc 19
+/*                         (a local label named by its own symbol), and
+/*                         the object links with ld.lld 19
 /*   asmsrc/bf_sparc.s     the Brainfuck interpreter, linked with ld.lld
 /*                         and run under qemu-sparc64 (bsd-user) with
 /*                         mandelbrot.bf: the output is that of bfi.s
@@ -234,11 +240,21 @@
 .elftype::gotdata_hix22::80::4
 .elftype::gotdata_lox10::81::4
 
-/* The fields, in the big-endian instruction word. */
-.elffield::wdisp30::0x3fffffff
-.elffield::wdisp22::0x3fffff
-.elffield::wdisp19::0x7ffff
-.elffield::wdisp16::0x303fff
+/* The fields, in the big-endian instruction word. The branch fields
+/* count words (shift 2), which RELA itself does not use but the
+/* resolution below does. */
+.elffield::wdisp30::0x3fffffff::0::2
+.elffield::wdisp22::0x3fffff::0::2
+.elffield::wdisp19::0x7ffff::0::2
+.elffield::wdisp16::0x303fff::0::2
+/* A call or branch to a local label of the same section is resolved
+/* here, with no relocation, as GNU as and llvm-mc do (manual 3.7.7):
+/* the object then links with ld.lld, which cannot apply WDISP22 /
+/* WDISP19 / WDISP16. A global or weak target keeps its relocation. */
+.elfresolve::wdisp30
+.elfresolve::wdisp22
+.elfresolve::wdisp19
+.elfresolve::wdisp16
 .elffield::r13::0x1fff
 .elffield::got13::0x1fff
 .elffield::l44::0xfff
@@ -281,6 +297,10 @@
 .elfwidth::1::r8
 .elfextern::r64
 .elfdwarf::r64
+/* Data written as label-$$, or as a label minus a label of the section
+/* being assembled (word ext-$$, xword ext-dat), is PC-relative:
+/* R_SPARC_DISP8 / DISP16 / DISP32 / DISP64 (manual 3.7.9). */
+.elfpcguess::1
 
 /* ===================================================================
 /* Registers and names
@@ -520,13 +540,22 @@
 
 /* set / setuw: the 32-bit value zero extended (SPARC V9 manual G.3,
 /* and llvm-mc) -- or alone when it fits 0..4095, sethi alone when the
-/* low 10 bits are zero, sethi + or otherwise */
-.func setuw(rd, v)
+/* low 10 bits are zero, sethi + or otherwise. sym = 1 (the operand
+/* names a label, .islabel) always gives sethi %hi + or %lo, the two
+/* words GNU as and llvm-mc write for a symbol, whatever its value. */
+.func setuw(rd, v, sym)
 .if v < -2147483648 || v > 4294967295 .then
 .raise 3
 .return
 .endif
 v = v & 0xffffffff
+.if sym .then
+w = .call sethi(rd, v)
+.call ew(w)
+w = .call orlo(rd, rd, v)
+.call ew(w)
+.return
+.endif
 .if v < 4096 .then
 w = .call ori(rd, 0, v)
 .call ew(w)
@@ -541,10 +570,20 @@ w = .call orlo(rd, rd, v)
 .return
 .endfunc
 
-/* setsw: the 32-bit value sign extended (SPARC V9 manual G.3) */
-.func setsw(rd, v)
+/* setsw: the 32-bit value sign extended (SPARC V9 manual G.3). For a
+/* label (sym = 1): sethi %hi + or %lo + sra rd,%g0,rd, as its sign is
+/* not known until the link */
+.func setsw(rd, v, sym)
 .if v < -2147483648 || v > 4294967295 .then
 .raise 3
+.return
+.endif
+.if sym .then
+w = .call sethi(rd, v)
+.call ew(w)
+w = .call orlo(rd, rd, v)
+.call ew(w)
+.call ew(0x81380000 | (rd << 25) | (rd << 14))
 .return
 .endif
 v = ((v & 0xffffffff) ^ 0x80000000) - 0x80000000
@@ -568,13 +607,26 @@ w = .call orlo(rd, rd, v)
 /* setx value, rtmp, rd: the expansion of llvm-mc -- or alone for a
 /* 13-bit signed value, sethi + or for a 32-bit unsigned one, and
 /* otherwise sethi %hi / or %lo into rd, sethi %hh / or %hm into rtmp,
-/* sllx rtmp,32 and or rtmp,rd,rd */
-.func setx(rd, rt, v)
+/* sllx rtmp,32 and or rtmp,rd,rd. For a label (sym = 1) always the
+/* last, six-word form, as llvm-mc writes it for a symbol */
+.func setx(rd, rt, v, sym)
 .if v < -9223372036854775808 || v > 18446744073709551615 .then
 .raise 3
 .return
 .endif
 v = ((v & 0xffffffffffffffff) ^ 0x8000000000000000) - 0x8000000000000000
+.if sym .then
+w = .call sethi(rd, v)
+.call ew(w)
+w = .call orlo(rd, rd, v)
+.call ew(w)
+.call ew(0x01000000 | (rt << 25) | ((v >> 42) & 0x3fffff))
+w = .call orlo(rt, rt, v >> 32)
+.call ew(w)
+.call ew(0x81283020 | (rt << 25) | (rt << 14))
+.call ew(0x80100000 | (rd << 25) | (rt << 14) | rd)
+.return
+.endif
 .if v >= -4096 && v < 4096 .then
 w = .call ori(rd, 0, v)
 .call ew(w)
@@ -1617,11 +1669,17 @@ UNIMP !v :: v<0||v>0x3fffff;3 :: .call w4(v&0x3fffff)
 !RI("BSET", "", ",rd", 0x80100000, "|(rd<<25)|(rd<<14)")
 !RI("BCLR", "", ",rd", 0x80280000, "|(rd<<25)|(rd<<14)")
 !RI("BTOG", "", ",rd", 0x80180000, "|(rd<<25)|(rd<<14)")
-/* set / setuw / setsw / setx */
-SET !v,rd :: .call setuw(rd,v)
-SETUW !v,rd :: .call setuw(rd,v)
-SETSW !v,rd :: .call setsw(rd,v)
-SETX !v,rt,rd :: .call setx(rd,rt,v)
+/* set / setuw / setsw / setx. With a label the words are the fixed
+/* form, and under -o they carry R_SPARC_HI22 + LO10 (set, setuw, setsw)
+/* or HI22 + LO10 + HH22 + HM10 (setx) against the symbol with its
+/* addend (the extra relocations of .reloc), as GNU as and llvm-mc do */
+.reloc::v::hi22::::lo10@4
+SET !v,rd :: .call setuw(rd,v,.islabel(v))
+SETUW !v,rd :: .call setuw(rd,v,.islabel(v))
+SETSW !v,rd :: .call setsw(rd,v,.islabel(v))
+.reloc::v::hi22::::lo10@4,hh22@8,hm10@12
+SETX !v,rt,rd :: .call setx(rd,rt,v,.islabel(v))
+.clrreloc::v
 
 /* ===================================================================
 /* Data (big-endian)

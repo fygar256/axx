@@ -25,6 +25,12 @@ aarch64.axx                         pattern file for AArch64 (A64): data process
                                     (:lo12:, :pg_hi21:, :abs_g0:-:abs_g3:, :got: ...).
                                     written with the macro layer
 aarch64.s                           test assemble file for aarch64.axx
+aarch64_reloc.s                     relocations of aarch64.axx for -o: every
+                                    instruction relocation against an external
+                                    symbol, branches / adr / literal ldr to a
+                                    local label resolved in place (.elfresolve,
+                                    .elfencode), and data (ABS*, PREL*),
+                                    checked against llvm-mc 19 and ld.lld 19
 aarch64_logical.axx                 pattern file for the AArch64 logical (immediate)
                                     group, AND/ORR/EOR/ANDS/TST, 32 and 64 bit.
                                     the macro-layer version: the rows are
@@ -107,6 +113,10 @@ regresself.s                        regression test assembled with z80.axx under
                                     .align / .zero / .resb given the value of
                                     an .equ that contains an undefined label
                                     (the diagnostics on standard error)
+bsection.s                          regression test assembled with x86_64.axx under
+                                    -b: jmp / call in a section that comes after
+                                    another (and is entered again), counted between
+                                    the addresses of the flat image
 unordered.axx                       pattern file for .unordered: directives that
                                     hold for the whole file wherever they are
                                     written, and .map tables per variable, so
@@ -447,6 +457,13 @@ sparc_test.s                        test assemble file for sparc.axx: one line
 sparc_reloc.s                       every relocating operand of sparc.axx
                                     against an external symbol, for -o;
                                     relocations match llvm-mc 19
+sparc_reloc2.s                      the relocations sparc_reloc.s does not
+                                    reach, for -o: set / setx of a label (the
+                                    fixed form, .islabel), calls and branches to
+                                    a local label resolved in place
+                                    (.elfresolve) and PC-relative data
+                                    (R_SPARC_DISP*), checked against llvm-mc
+                                    19 and ld.lld 19
 mips.axx                            pattern file for MIPS, big-endian, o32
                                     (ELF32 REL), up to Release 5: sets the byte
                                     order, the ABI and the release, then

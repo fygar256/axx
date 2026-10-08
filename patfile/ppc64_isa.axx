@@ -85,11 +85,13 @@
 /* REL32 / REL16 with the constant part as the addend, and a label of
 /* the same section gives a constant, as GNU as does for .quad / .long /
 /* .short label-. (see ppc64_reloc2.s). The .elffield directive and the
-/* mask field of .reloc need an axx that has them. Differences from GNU as
-/* that the linker makes disappear: references to a local label are
-/* relocations against that label (GNU as resolves same-section
-/* branches itself and uses the section symbol), and GNU as leaves
-/* the addend in the field of hinted bc and of prefixed instructions.
+/* mask field of .reloc need an axx that has them. A branch to a local
+/* label of the same section is resolved here with no relocation, as
+/* GNU as and llvm-mc do (.elfresolve in the wrappers). Differences from
+/* GNU as that the linker makes disappear: a relocation against a local
+/* label names that label (GNU as uses the section symbol), and GNU as
+/* leaves the addend in the field of hinted bc and of prefixed
+/* instructions.
 /* .align inside code pads with the .padding byte, not with nops.
 /*
 /* Extras beyond GNU as: a zero displacement may be omitted

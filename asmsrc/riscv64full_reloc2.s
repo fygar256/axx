@@ -11,6 +11,8 @@
 ;    local symbol on the field subtracted.
 ; 3. Label differences: across sections (or with an external symbol)
 ;    an ADD/SUB pair; inside one section a constant.
+; 4. A branch, jump or call to a local label of the same section is
+;    resolved here with no relocation (.elfresolve, .elfencode).
 ;
 ; The relocation entries are those llvm-mc 19 (no relax) writes, apart
 ; from the name of the local symbol (.Lanchor<n> for .Lpcrel_hi<n> /
@@ -33,6 +35,13 @@ start:
         fld     fa1,dat,t1
         fsw     fa0,ext,t2
         fsd     fa1,dat+8,t2
+        beq     a0,a1,start
+        bne     a0,a1,fwd
+        j       start
+        jal     fwd
+        call    start
+        tail    fwd
+fwd:
         ret
         .section .data
 dat:

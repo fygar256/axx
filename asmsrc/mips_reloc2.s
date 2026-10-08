@@ -7,7 +7,9 @@
 ; symbol; o32 is REL, so the addend goes back into the fields (HI16
 ; rounded). Data written as label-$$, or as a label minus a label of
 ; this section, is R_MIPS_PC32. A difference inside a section is a
-; constant. The words and the relocation entries are those of llvm-mc
+; constant. A branch to a local label of the same section is resolved
+; here with no relocation (.elfresolve). The words and the relocation
+; entries are those of llvm-mc
 ; 19 (a local label named by its own symbol), and the image linked with
 ; ld.lld is the same.
 ; ===================================================================
@@ -22,6 +24,13 @@ start:
         la      $t3,dat+0x10
         lui     $t4,%hi(ext+0x18000)
         addiu   $t4,$t4,%lo(ext+0x18000)
+        b       start
+        nop
+        beq     $t0,$t1,start
+        nop
+        bne     $t0,$t1,fwd
+        nop
+fwd:
         jr      $ra
         nop
         .section .data

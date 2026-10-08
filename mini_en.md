@@ -66,6 +66,18 @@ SPELL !x,r :: .call func1(x,.exp(x),.exp(r))
 spell 1+2*3,rb       -> func1(7, "1+2*3", "rb")
 ```
 
+An argument written `.islabel(variable)` passes the number 1 when the text that
+pattern variable captured names a label (defined with `name:`, external, an
+`.equ` that carries a relocation type, or not defined yet), and 0 otherwise
+(numbers, character constants, strings, `$$`, `#symbol`, pattern symbols, `.equ`
+constants). The text is scanned, not evaluated, so every pass gives the same
+answer. A pseudo-instruction uses it to keep a fixed form for a symbol, as the
+SPARC `set` of `sparc.axx` does (Technical_Manual section 3.15).
+
+```
+SET !v,rd :: .call setuw(rd,v,.islabel(v))
+```
+
 An argument that is just the name of a string symbol (`.setsym::name::"..."`)
 passes that string. It is read as if `.call func1(10,"...")` had been written,
 so the same four escapes are opened. The name is case-insensitive. When the name

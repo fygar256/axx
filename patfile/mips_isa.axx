@@ -307,6 +307,14 @@
 .elffield::pc26_s2::0x3ffffff::0::2::-4
 .elffield::pc19_s2::0x7ffff::0::2
 .elffield::pc18_s3::0x3ffff::0::3
+/* A branch or PC-relative load to a local label of the same section is
+/* resolved here with no relocation, as GNU as and llvm-mc do (manual
+/* 3.7.7). ldpc (PC18_S3) counts from the doubleword-aligned PC, which
+/* no field declaration states, so it keeps its relocation. */
+.elfresolve::pc16
+.elfresolve::pc21_s2
+.elfresolve::pc26_s2
+.elfresolve::pc19_s2
 !def F16(ty) {
 .elffield::!{ty}::0xffff
 }

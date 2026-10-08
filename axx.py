@@ -381,7 +381,8 @@ _HOIST_TEXT_ONLY = ('.check', '.clrcheck', '.reloc', '.clrreloc',
                     '.symbolc', '.passthru', '.eol', '.textmode',
                     '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
                     '.elfextern', '.elfdwarf', '.elfheader', '.elfsection',
-                    '.elffield', '.elfpcguess', '.elfrelax', '.elfanchor', '.elfbuiltin', '.elfextra',
+                    '.elffield', '.elfpcguess', '.elfrelax', '.elfanchor', '.elfresolve',
+                    '.elfbuiltin', '.elfextra',
                     '.elfdiff', '.elfencode', '.elfrinfo', '.elfunit', '.elflink',
                     '.elfgroup', '.elfcfi', '.elfcfiinit', '.elfcfireg')
 
@@ -1249,6 +1250,11 @@ def elf_machine_table(state):
         rt = _elf_decl_type(state, named, text)
         if rt is not None:
             anchor.add(rt)
+    resolve = set()
+    for text in e.decl_resolve:
+        rt = _elf_decl_type(state, named, text)
+        if rt is not None:
+            resolve.add(rt)
 
     tbl = dict(base, name=name, elfclass=elfclass, is_rela=is_rela,
                width_guess=width_guess, pc_rel=pc_rel,
@@ -1256,7 +1262,8 @@ def elf_machine_table(state):
                named=named, reloc_bytes=reloc_bytes, reverse=reverse,
                pcrel_guess=pcrel_guess, field=field, extra=extra, diff=diff,
                diff_t=diff_t,
-               encode=encode, anchor=anchor, rinfo=e.decl_rinfo, unit=e.decl_unit or 'byte')
+               encode=encode, anchor=anchor, resolve=resolve, rinfo=e.decl_rinfo,
+               unit=e.decl_unit or 'byte')
     e.mach_cache_key = key
     e.mach_cache = tbl
     return tbl
@@ -1276,6 +1283,14 @@ def _reloc_same_width(mach, nbytes, want_pcrel):
         if (rt in mach['pc_rel']) == bool(want_pcrel):
             return rt
     return None
+
+
+def _sectioned(state):
+    """セクション相対の位置で考える出力か（-o か -E）。-b だけの平らなイメージでは
+    binary_list と `.equ` の中の位置・同じセクションのラベル・`.align` は通し番地の
+    まま。caxx.c の st_sectioned() と同じ規則である。
+    """
+    return bool(state.elf_objfile or state.expfile_elf)
 
 
 def _elf_relaxing(state):
@@ -1617,6 +1632,7 @@ def _elf_v2l_second(state, prev, k, v):
     return None
 
 
+_ISLABEL_ALNUM = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789')
 _DIFF_WORD = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.$')
 
 
@@ -1813,6 +1829,8 @@ class ElfState:
         self.decl_encode = {}
         # `.elfanchor` の型の綴り（宣言順）。
         self.decl_anchor = []
+        # `.elfresolve` の型の綴り（宣言順）。
+        self.decl_resolve = []
         self.decl_rinfo = ''
         self.decl_unit = None
         self.decl_link = {}
@@ -3357,10 +3375,12 @@ class LabelManager:
         if self.state._equ_sections_touched is not None:
             self.state._equ_sections_touched.add(_sec)
 
-            _adj = None if _undef(v) else self._section_relative_offset(_sec, v)
+            _adj = (None if (_undef(v) or not _sectioned(self.state))
+                    else self._section_relative_offset(_sec, v))
             if _adj is not None:
                 v = _adj
-        elif self.state._in_binary_list and _sec == self.state.current_section:
+        elif (self.state._in_binary_list and _sec == self.state.current_section
+                and _sectioned(self.state)):
 
             _adj = None if _undef(v) else self._section_relative_offset(_sec, v)
             if _adj is not None:
@@ -3840,7 +3860,8 @@ class ExpressionEvaluator:
         loc_counter_value() と同じ規則である。
         """
         _raw = self.state.pc_instr_start if self.state._in_binary_list else self.state.pc
-        if self.state._in_binary_list or self.state._equ_sections_touched is not None:
+        if ((self.state._in_binary_list or self.state._equ_sections_touched is not None)
+                and _sectioned(self.state)):
             _adj = self.label_manager._section_relative_offset(self.state.current_section, _raw)
             return _adj if _adj is not None else _raw
         return _raw
@@ -3914,7 +3935,8 @@ class ExpressionEvaluator:
         elif StringUtils.q(s, '$.', idx):
             idx += 2
             _raw = self.state.pc_instr_end
-            if self.state._in_binary_list or self.state._equ_sections_touched is not None:
+            if ((self.state._in_binary_list or self.state._equ_sections_touched is not None)
+                    and _sectioned(self.state)):
                 _adj = self.label_manager._section_relative_offset(self.state.current_section, _raw)
                 x = _adj if _adj is not None else _raw
             else:
@@ -4741,14 +4763,15 @@ class BinaryWriter:
         print(f"wrote raw binary {self.state.outfile} ({len(data)} bytes)", file=sys.stderr)
 
         if self.state.elf_objfile:
+            _rela_z = elf_machine_table(self.state)['is_rela']
             _zeroed = [r for r in self.state.relocations
-                       if insn_reloc_field_mask(r[3], self.state) is not None]
+                       if _rela_z or insn_reloc_field_mask(r[3], self.state) is not None]
             if _zeroed:
                 _where = ', '.join(f"{r[0]}+0x{r[1]:x}" for r in _zeroed[:4])
                 if len(_zeroed) > 4:
                     _where += ', ...'
                 self.state.diag(
-                    f" warning - {len(_zeroed)} instruction field(s) were left 0 for the"
+                    f" warning - {len(_zeroed)} field(s) were left 0 for the"
                     f" linker ({_where}); this raw binary is only correct after linking"
                     f" {self.state.elf_objfile}. Drop -o to have axx fill them in.",
                     set_error=False, force=True)
@@ -5524,6 +5547,23 @@ class DirectiveProcessor:
             e.decl_gen += 1
         return True
 
+    def elfresolve_processing(self, i):
+        """`.elfresolve` — 同じセクションの局所ラベルへのこの型の PC 相対の欄は
+        axx が解決する（分岐の変位）。caxx.c の dir_elfresolve() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.elfresolve':
+            return False
+        t = self._elf_decl_fields(i)[0].lstrip(' \t').rstrip(' \t\r\n')
+        if not t:
+            self.state.diag(" error - .elfresolve: relocation type is not specified.",
+                            set_error=True)
+            return True
+        e = self.state.elf
+        if t not in e.decl_resolve:
+            e.decl_resolve.append(t)
+            e.decl_gen += 1
+        return True
+
     def elfrelax_processing(self, i):
         """`.elfrelax` — リンカがコードを縮める（緩和する）機種か。
 
@@ -6236,7 +6276,8 @@ _PAT_DIRECTIVES = frozenset((
     '.echo', '.unordered',
     '.elftype', '.elfmachine', '.elfclass', '.elfrela', '.elfwidth',
     '.elfextern', '.elfdwarf', '.elfheader', '.elfsection', '.elffield',
-    '.elfpcguess', '.elfrelax', '.elfanchor', '.elfbuiltin', '.elfextra', '.elfdiff', '.elfencode',
+    '.elfpcguess', '.elfrelax', '.elfanchor', '.elfresolve', '.elfbuiltin', '.elfextra',
+    '.elfdiff', '.elfencode',
     '.elfrinfo', '.elfunit', '.elflink', '.elfgroup', '.elfcfi', '.elfcfiinit',
     '.elfcfireg'))
 
@@ -9057,6 +9098,88 @@ class ObjectGenerator:
         return k
 
     @staticmethod
+    def _mini_is_islabel(t, a):
+        """t[a] から `.islabel(` が始まるか。"""
+        if StringUtils.upper(t[a:a + 8]) != '.ISLABEL':
+            return False
+        k = a + 8
+        if k < len(t) and (t[k] in _ISLABEL_ALNUM or t[k] == '_'):
+            return False
+        k = StringUtils.skipspc(t, k)
+        return k < len(t) and t[k] == '('
+
+    def _captext_has_label(self, txt):
+        """綴りがラベルを含むか。
+
+        数・文字定数・文字列・`$$` / `$.`・`#記号`・パターンの記号は飛ばし、
+        ラベル（再配置を持たない `.equ` は除く）か、まだ定義されていない名前
+        （前方参照のラベル）があれば True。式は評価しない。caxx.c の
+        captext_has_label() と同じ規則である。
+        """
+        n = len(txt)
+        i = 0
+        lw = self.state.lwordchars
+        while i < n:
+            c = txt[i]
+            if c in '"\'':
+                j = i + 1
+                while j < n and txt[j] != c:
+                    if txt[j] == '\\' and j + 1 < n:
+                        j += 1
+                    j += 1
+                i = j + 1
+                continue
+            if c == '$':
+                i += 2 if (i + 1 < n and txt[i + 1] in '$.') else 1
+                continue
+            if c == '#':
+                i += 1
+                while i < n and (txt[i] in _ISLABEL_ALNUM or txt[i] in '_.'):
+                    i += 1
+                continue
+            if c in '0123456789':
+                while i < n and (txt[i] in _ISLABEL_ALNUM or txt[i] in '_.'):
+                    i += 1
+                continue
+            if c in lw:
+                j = i
+                while j < n and txt[j] in lw:
+                    j += 1
+                w = txt[i:j][:511]
+                i = j
+                le = self.state.labels.get(w)
+                if le is not None:
+                    _is_equ = len(le) > 2 and le[2]
+                    _rt = le[4] if len(le) > 4 else None
+                    if not _is_equ or _rt is not None:
+                        return True
+                    continue
+                if StringUtils.upper(w) in self.state.symbols:
+                    continue
+                return True
+            i += 1
+        return False
+
+    def _mini_arg_islabel(self, t, a, name):
+        """`.islabel(変数)` — その変数が捕捉した綴りがラベルを含めば 1、含まなければ 0。
+
+        caxx.c の mini_arg_islabel() と同じ規則である。
+        """
+        k = StringUtils.skipspc(t, a + 8) + 1
+        e = t.find(')', k)
+        nm = t[k:e].strip(' \t') if e >= 0 else ''
+        if e < 0 or not nm or PatternMatcher._var_name_at(nm, 0) != len(nm):
+            self._mini_diag(f" error - '.call {name}': '.islabel' needs "
+                            f"'.islabel(variable)'.")
+            return None, len(t)
+        if nm not in self.state.varnames:
+            self._mini_diag(f" error - '{nm}' is not a pattern variable; "
+                            f"'.islabel({nm})' needs '{nm}' captured in the "
+                            f"instruction field.")
+            return None, len(t)
+        return (1 if self._captext_has_label(self.state.vars_text.get(nm, '')) else 0), e + 1
+
+    @staticmethod
     def _mini_is_exp(t, a):
         """t[a] から `.exp(` が始まるか。`.expx` のような別の名前は除く。"""
         if StringUtils.upper(t[a:a + 4]) != '.EXP':
@@ -9175,6 +9298,8 @@ class ObjectGenerator:
             return self._mini_arg_str(t, a, name)
         if self._mini_is_exp(t, a):
             return self._mini_arg_exp(t, a, name)
+        if self._mini_is_islabel(t, a):
+            return self._mini_arg_islabel(t, a, name)
         hit = self._mini_strsym_at(t, a)
         if hit is not None:
             key, a = hit
@@ -10497,8 +10622,8 @@ class AssemblyDirectiveProcessor:
                 return True
             self.state.align = u_int
 
-        _sec_rel = self.label_manager._section_relative_offset(
-            self.state.current_section, self.state.pc)
+        _sec_rel = (self.label_manager._section_relative_offset(
+            self.state.current_section, self.state.pc) if _sectioned(self.state) else None)
         _base = _sec_rel if _sec_rel is not None else self.state.pc
         _padding = self.binary_writer.align_(_base) - _base
         self.state.pc += _padding
@@ -13462,6 +13587,56 @@ class Assembler:
                             _insn_bytes = _mach_tbl_la['reloc_bytes'].get(_hint_rtype, 4)
                             _insn_words = max(1, _insn_bytes // bpw_r)
                             _fw = first_widx + _foff // bpw_r
+                            # `.elfresolve`: 同じセクションの局所ラベルへの PC 相対の欄は、
+                            # リンカが書く値（ラベル + 加数 + 補正 − 位置）をシフトして
+                            # マスクへ詰め、リロケーションは出さない。欄に収まらなければ
+                            # エラー。caxx.c の lineassemble() の同じ処理と同じ規則である。
+                            if (_mach_tbl_la.get('resolve') and not _elf_relaxing(self.state)
+                                    and _hint_rtype in _mach_tbl_la['resolve']
+                                    and _fw + _insn_words <= len(objl)):
+                                _rle = self.state.labels.get(lname)
+                                _lw = None
+                                if (_rle is not None and not (len(_rle) > 3 and _rle[3])
+                                        and not (len(_rle) > 2 and _rle[2])
+                                        and _rle[1] and _rle[1] == sec_name_r
+                                        and lname not in self.state.export_labels
+                                        and not _sym_attr(self.state, lname)[_SA_WEAK]):
+                                    _lw = self.label_manager._section_relative_offset(
+                                        sec_name_r, int(_rle[0]))
+                                if _lw is not None:
+                                    _pw = _completed_words + (self.state.pc + _fw - _entry_pc_cur)
+                                    _val = (_lw - _pw) * _scale + _hint_addend * _scale + _fbias
+                                    _sv = _val >> _fsh
+                                    _nb = bin(_fmask).count('1')
+                                    _fits = _nb >= 64 or (-(1 << (_nb - 1)) <= _sv < (1 << (_nb - 1)))
+                                    if 0 < _fsh < 63 and (_val & ((1 << _fsh) - 1)) != 0:
+                                        _fits = False
+                                    if not _fits and self.state.should_report_errors():
+                                        self.state.diag(
+                                            f" error - the reference to '{lname}' resolved in its "
+                                            f"section does not fit the field.  "
+                                            f"[{self.state.current_file}:{self.state.ln}]",
+                                            set_error=True)
+                                    _wmask = (1 << self.state.bts) - 1
+                                    _iv = 0
+                                    for _k in range(_insn_words):
+                                        _sh = self.state.bts * _k if self.state.endian == 'little' \
+                                            else self.state.bts * (_insn_words - 1 - _k)
+                                        _iv |= (int(objl[_fw + _k]) & _wmask) << _sh
+                                    # 欄の中でビットが並び替わる型（AArch64 の adr、RISC-V の
+                                    # B / J 形式）は `.elfencode` の関数が (欄の値, 値) から書く。
+                                    _renc = _mach_tbl_la['encode'].get(_hint_rtype)
+                                    if _renc is not None:
+                                        _rnv = self._elf_call_func('.elfencode', _renc, [_iv, _val])
+                                        if _rnv is not None:
+                                            _iv = int(_rnv)
+                                    else:
+                                        _iv = (_iv & ~_fmask) | _field_deposit(_fmask, _sv)
+                                    for _k in range(_insn_words):
+                                        _sh = self.state.bts * _k if self.state.endian == 'little' \
+                                            else self.state.bts * (_insn_words - 1 - _k)
+                                        objl[_fw + _k] = (_iv >> _sh) & _wmask
+                                    continue
                             if _fw + _insn_words <= len(objl):
                                 _wmask = (1 << self.state.bts) - 1
                                 for _k in range(_insn_words):
@@ -13584,6 +13759,12 @@ class Assembler:
                     else:
                         addend = (raw_val - abs_wi) * _scale
 
+                    # RELA では加数は項目が持つので、欄は 0 で出す（GNU as と llvm-mc の
+                    # 形）。REL では書き出しのときに加数を欄へ書き戻す。
+                    if _mach_tbl_la['is_rela']:
+                        for _k in range(num_words):
+                            if first_widx + _k < len(objl):
+                                objl[first_widx + _k] = 0
                     self.state.relocations.append((sec_name_r, sec_rel, lname, rtype, addend, num_bytes, 0))
 
             if self.state.gen_debug and self.state.pas == 2 and of > 0:
@@ -13634,6 +13815,7 @@ class Assembler:
     _ELF_DECL_DIRECTIVES = ('.elftype', '.elfmachine', '.elfclass', '.elfrela',
                             '.elfwidth', '.elfextern', '.elfdwarf', '.elfheader',
                             '.elfsection', '.elffield', '.elfpcguess', '.elfrelax', '.elfanchor',
+                            '.elfresolve',
                             '.elfbuiltin', '.elfextra', '.elfdiff', '.elfencode',
                             '.elfrinfo', '.elfunit', '.elflink', '.elfgroup',
                             '.elfcfi', '.elfcfiinit', '.elfcfireg')
@@ -13655,6 +13837,7 @@ class Assembler:
             '.elfpcguess': d.elfpcguess_processing,
             '.elfrelax':   d.elfrelax_processing,
             '.elfanchor':  d.elfanchor_processing,
+            '.elfresolve': d.elfresolve_processing,
             '.elfbuiltin': d.elfbuiltin_processing,
             '.elfextra':   d.elfextra_processing,
             '.elfdiff':    d.elfdiff_processing,
@@ -13720,6 +13903,8 @@ class Assembler:
             out.append(".elfrelax::%d" % self.state.elf.decl_relax)
         for _at in self.state.elf.decl_anchor:
             out.append(".elfanchor::%s" % _at)
+        for _rt in self.state.elf.decl_resolve:
+            out.append(".elfresolve::%s" % _rt)
         out.append(".elfunit::%s" % tbl['unit'])
         for w in sorted(tbl['diff']):
             ra, rb = tbl['diff'][w]
@@ -15666,6 +15851,7 @@ class Assembler:
             '.elfpcguess': d.elfpcguess_processing,
             '.elfrelax':   d.elfrelax_processing,
             '.elfanchor':  d.elfanchor_processing,
+            '.elfresolve': d.elfresolve_processing,
             '.elfbuiltin': d.elfbuiltin_processing,
             '.elfextra':   d.elfextra_processing,
             '.elfdiff':    d.elfdiff_processing,

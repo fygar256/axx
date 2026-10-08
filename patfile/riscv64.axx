@@ -59,12 +59,12 @@
 /* --- which bits of the instruction the linker writes -------------- */
 .elffield::hi20::0xfffff000           /* U-type imm[31:12]           */
 .elffield::pcrel_hi20::0xfffff000
-.elffield::jal::0xfffff000            /* J-type, scattered           */
+.elffield::jal::0xfffff000::0::1      /* J-type, scattered           */
 .elffield::lo12_i::0xfff00000         /* I-type imm[11:0]            */
 .elffield::pcrel_lo12_i::0xfff00000
 .elffield::lo12_s::0xfe000f80         /* S-type, split               */
 .elffield::pcrel_lo12_s::0xfe000f80
-.elffield::branch::0xfe000f80         /* B-type, split               */
+.elffield::branch::0xfe000f80::0::1   /* B-type, split               */
 /* a call is two words: auipc's U field, then jalr's I field, read as
 /* one little-endian 8-byte integer */
 .elffield::call::0xfff00000fffff000
@@ -91,6 +91,29 @@
 .elfdiff::8::add64::sub64
 .elfpcguess::1
 .elfrelax::0                   /* the linker does not shrink code */
+
+/* --- resolved in place --------------------------------------------- */
+/* A branch, jump or call to a local label of the same section is
+/* resolved here with no relocation, as GNU as -mno-relax and llvm-mc
+/* do (manual 3.7.7); a global or weak target keeps its relocation. The
+/* B / J / CB / CJ fields reorder the bits of the offset and a call
+/* splits it over auipc + jalr, so .elfencode functions write them. */
+.elfresolve::branch
+.elfresolve::jal
+.elfresolve::call
+.elfencode::branch::benc
+.elfencode::jal::jenc
+.elfencode::call::callenc
+.func benc(f, a)
+.return (f & 0x01fff07f) | (((a >> 12) & 1) << 31) | (((a >> 5) & 0x3f) << 25) | (((a >> 1) & 0xf) << 8) | (((a >> 11) & 1) << 7)
+.endfunc
+.func jenc(f, a)
+.return (f & 0xfff) | (((a >> 20) & 1) << 31) | (((a >> 1) & 0x3ff) << 21) | (((a >> 11) & 1) << 20) | (((a >> 12) & 0xff) << 12)
+.endfunc
+/* f is the auipc word (bits 0-31) and the jalr word (bits 32-63) */
+.func callenc(f, a)
+.return (f & 0x000fffff00000fff) | ((((a + 0x800) >> 12) & 0xfffff) << 12) | ((a & 0xfff) << 52)
+.endfunc
 
 /* ===================================================================
 /* Registers

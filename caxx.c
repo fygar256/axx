@@ -1224,7 +1224,7 @@ enum {
     PD_ELFEXTERN, PD_ELFDWARF, PD_ELFHEADER, PD_ELFSECTION, PD_ECHO, PD_ELFFIELD,
     PD_ELFPCGUESS, PD_ELFBUILTIN, PD_ELFEXTRA, PD_ELFDIFF, PD_ELFENCODE,
     PD_ELFRINFO, PD_ELFUNIT, PD_ELFLINK, PD_ELFGROUP, PD_ELFCFI, PD_ELFCFIINIT,
-    PD_ELFCFIREG, PD_UNORDERED, PD_ELFRELAX, PD_ELFANCHOR
+    PD_ELFCFIREG, PD_UNORDERED, PD_ELFRELAX, PD_ELFANCHOR, PD_ELFRESOLVE
 };
 
 /* パターン行がどのディレクティブか（種別の番号）。 */
@@ -1247,6 +1247,7 @@ static int pat_dir_kind(const PatEntry *e){
         { ".elffield", PD_ELFFIELD },
         { ".elfpcguess", PD_ELFPCGUESS }, { ".elfbuiltin", PD_ELFBUILTIN },
         { ".elfrelax", PD_ELFRELAX }, { ".elfanchor", PD_ELFANCHOR },
+        { ".elfresolve", PD_ELFRESOLVE },
         { ".elfextra", PD_ELFEXTRA }, { ".elfdiff", PD_ELFDIFF },
         { ".elfencode", PD_ELFENCODE }, { ".elfrinfo", PD_ELFRINFO },
         { ".elfunit", PD_ELFUNIT }, { ".elflink", PD_ELFLINK },
@@ -1279,7 +1280,7 @@ static int pat_is_directive(const PatEntry *e){
         ".elftype", ".elfmachine", ".elfclass", ".elfrela", ".elfwidth",
         ".elfextern", ".elfdwarf", ".elfheader", ".elfsection", ".echo", ".elffield",
         ".elfpcguess", ".elfbuiltin", ".elfextra", ".elfdiff", ".elfencode",
-        ".elfrelax", ".elfanchor", ".elfrinfo", ".elfunit", ".elflink", ".elfgroup", ".elfcfi", ".elfcfiinit",
+        ".elfrelax", ".elfanchor", ".elfresolve", ".elfrinfo", ".elfunit", ".elflink", ".elfgroup", ".elfcfi", ".elfcfiinit",
         ".elfcfireg", ".unordered", NULL };
     if(!e || !e->f[0] || !e->f[0][0]) return 0;
     const char *n = e->f[0];
@@ -1731,7 +1732,7 @@ static int pat_dir_line_invariant(const PatEntry *e){
     case PD_ELFMACHINE: case PD_ELFCLASS: case PD_ELFRELA: case PD_ELFWIDTH:
     case PD_ELFEXTERN: case PD_ELFDWARF: case PD_ELFHEADER:
     case PD_ELFSECTION: case PD_ELFFIELD: case PD_ELFPCGUESS: case PD_ELFBUILTIN:
-    case PD_ELFRELAX: case PD_ELFANCHOR: case PD_ELFEXTRA: case PD_ELFDIFF: case PD_ELFENCODE: case PD_ELFRINFO:
+    case PD_ELFRELAX: case PD_ELFANCHOR: case PD_ELFRESOLVE: case PD_ELFEXTRA: case PD_ELFDIFF: case PD_ELFENCODE: case PD_ELFRINFO:
     case PD_ELFUNIT: case PD_ELFLINK: case PD_ELFGROUP: case PD_ELFCFI:
     case PD_ELFCFIINIT: case PD_ELFCFIREG:
         for(int i=1;i<PAT_FIELDS;i++)
@@ -2438,6 +2439,9 @@ typedef struct {
     int        elf_decl_rela;
     int        elf_decl_pcguess;
     int        elf_decl_relax;     /* `.elfrelax`。-1 は宣言なし（`.elfdiff` があれば 1） */
+    /* `.elfresolve` の型（綴り）。同じセクションの局所ラベルへは axx が解決する。 */
+    char     **elf_resolve_types;
+    int        elf_resolve_types_len, elf_resolve_types_cap;
     int        elf_decl_builtin;
     /* `.elfextra` / `.elfdiff` / `.elfencode` / `.elfrinfo` / `.elfunit` /
        `.elflink` / `.elfgroup`。axx.py の ElfState の decl_* と同じ中身。 */
@@ -3190,6 +3194,8 @@ static uint64_t insn_reloc_field_mask(const AsmState *st, int rtype){
 /* value の下位ビットから順に、mask の立っているビットへ下から詰める。
    REL で命令欄の型の加数を命令語へ書き戻すときに使う。axx.py の
    _field_deposit() と同じ規則である。 */
+static int elf_call_func(AsmState *st, const char *dname, const char *fname,
+                         const uint256_t *args, int nargs, uint256_t *out);
 static uint64_t field_deposit(uint64_t mask, int64_t value){
     uint64_t out = 0;
     int bit = 0;
@@ -3247,13 +3253,18 @@ static int elf_diff_any(const AsmState *st){
     return st->elf_diff_t_len > 0;
 }
 
+/* 型の綴りの並び（`.elfanchor` / `.elfresolve`）に rtype があるか。 */
+static int elf_type_in_list(const AsmState *st, char **lst, int n, int rtype){
+    if(n == 0) return 0;
+    const ElfMachineInfo *m = elf_machine_effective(st);
+    for(int i = 0; i < n; i++)
+        if(elf_decl_type_in(m->named, lst[i]) == rtype) return 1;
+    return 0;
+}
+
 /* `.elfanchor` で宣言した型か。 */
 static int elf_is_anchor_type(const AsmState *st, int rtype){
-    if(st->elf_anchor_types_len == 0) return 0;
-    const ElfMachineInfo *m = elf_machine_effective(st);
-    for(int i = 0; i < st->elf_anchor_types_len; i++)
-        if(elf_decl_type_in(m->named, st->elf_anchor_types[i]) == rtype) return 1;
-    return 0;
+    return elf_type_in_list(st, st->elf_anchor_types, st->elf_anchor_types_len, rtype);
 }
 
 /* リンカがコードを縮める機種か。`.elfrelax` が無ければ `.elfdiff` があるとき。
@@ -3469,11 +3480,20 @@ static int64_t equ_section_relative_offset(AsmState *st, const char *sec_name, u
     return -1;
 }
 
+/* セクション相対の位置で考える出力か。オブジェクト（-o）とセクション付きの
+   エクスポート（-E）では各セクションが 0 から始まるので、binary_list と `.equ` の
+   中の位置・同じセクションのラベルと `.align` はセクション相対で扱う。-b だけの
+   平らなイメージではどれも通し番地のまま。axx.py の _sectioned() と同じ規則である。 */
+static int st_sectioned(const AsmState *st){
+    return st->elf_objfile[0] || st->expfile_elf[0];
+}
+
 /* `$$` の値。binary_list の中では命令の先頭、外では今の位置。binary_list と
-   `.equ` の中ではセクション相対に直す。axx.py の factor1() の `$$` と同じ規則である。 */
+   `.equ` の中では、セクション相対で扱う出力ならセクション相対に直す。
+   axx.py の factor1() の `$$` と同じ規則である。 */
 static uint256_t loc_counter_value(AsmState *st){
     uint256_t x = st->in_binary_list ? st->pc_instr_start : st->pc;
-    if(st->in_binary_list || st->equ_section_tracking){
+    if((st->in_binary_list || st->equ_section_tracking) && st_sectioned(st)){
         int64_t _adj = equ_section_relative_offset(st, st->current_section, u256_to_u64(x));
         if(_adj >= 0) x = u256_from_u64((uint64_t)_adj);
     }
@@ -4562,8 +4582,9 @@ static void binary_flush(AsmState *st){
     if(st->elf_objfile[0]){
         int _nz = 0;
         char _where[256]; size_t _wl = 0; _where[0] = '\0';
+        int _rela_z = elf_machine_effective(st)->is_rela;
         for(int i = 0; i < st->reloc_count; i++){
-            if(insn_reloc_field_mask(st, st->relocations[i].rtype) == 0) continue;
+            if(!_rela_z && insn_reloc_field_mask(st, st->relocations[i].rtype) == 0) continue;
             _nz++;
             if(_nz <= 4){
                 int _n = snprintf(_where + _wl, sizeof(_where) - _wl, "%s%s+0x%llx",
@@ -4575,7 +4596,7 @@ static void binary_flush(AsmState *st){
         }
         if(_nz > 0){
             if(_nz > 4) snprintf(_where + _wl, sizeof(_where) - _wl, ", ...");
-            axx_diagf(0, 1, " warning - %d instruction field(s) were left 0 for the"
+            axx_diagf(0, 1, " warning - %d field(s) were left 0 for the"
                             " linker (%s); this raw binary is only correct after linking"
                             " %s. Drop -o to have axx fill them in.\n",
                       _nz, _where, st->elf_objfile);
@@ -4915,10 +4936,10 @@ static uint256_t label_get_value(AsmState *st, const char *k){
             /* 未定義の番兵（未定義を含む .equ の値）はセクション相対に直さない。
                64 ビットへ切り詰めると番兵でなくなり、毒が後ろの式へ伝わらない。
                axx.py の LabelManager.get_value() と同じ。 */
-            int64_t _adj = u256_is_undef(e->value) ? -1
+            int64_t _adj = (u256_is_undef(e->value) || !st_sectioned(st)) ? -1
                          : equ_section_relative_offset(st, sec, u256_to_u64(e->value));
             if(_adj >= 0) ret_val = u256_from_u64((uint64_t)_adj);
-        } else if(st->in_binary_list && strcmp(sec, st->current_section) == 0){
+        } else if(st->in_binary_list && strcmp(sec, st->current_section) == 0 && st_sectioned(st)){
             int64_t _adj = u256_is_undef(e->value) ? -1
                          : equ_section_relative_offset(st, sec, u256_to_u64(e->value));
             if(_adj >= 0) ret_val = u256_from_u64((uint64_t)_adj);
@@ -5678,7 +5699,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
     else if(axx_q(s,slen,"$.",idx)){
         idx+=2;
         x = st->pc_instr_end;
-        if(st->in_binary_list || st->equ_section_tracking){
+        if((st->in_binary_list || st->equ_section_tracking) && st_sectioned(st)){
             int64_t _adj = equ_section_relative_offset(st, st->current_section, u256_to_u64(x));
             if(_adj >= 0) x = u256_from_u64((uint64_t)_adj);
         }
@@ -7410,23 +7431,39 @@ static int dir_elfpcguess(Assembler *asmb, PatEntry *e){
 static void *elf_decl_grow(void *p, int *cap, int len, size_t sz);
 /* `.elfanchor` — `.reloc` の追加の再配置のうち、行のアンカーを指す型。
    axx.py の elfanchor_processing() と同じ規則である。 */
+static int dir_elf_typelist(Assembler *asmb, PatEntry *e, const char *dname,
+                            char ***lst, int *len, int *cap);
 static int dir_elfanchor(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".elfanchor") != 0) return 0;
+    return dir_elf_typelist(asmb, e, ".elfanchor", &asmb->st.elf_anchor_types,
+                            &asmb->st.elf_anchor_types_len, &asmb->st.elf_anchor_types_cap);
+}
+
+/* `.elfanchor` / `.elfresolve` の型の綴りを並びに足す（同じ綴りは 1 つ）。 */
+static int dir_elf_typelist(Assembler *asmb, PatEntry *e, const char *dname,
+                            char ***lst, int *len, int *cap){
     AsmState *st = &asmb->st;
     const char *f1, *f2; elf_decl_fields(e, &f1, &f2);
     char *t = elf_decl_trim_dup(f1);
     if(!t[0]){
-        axx_diagf(1, 0, " error - .elfanchor: relocation type is not specified.\n");
+        axx_diagf(1, 0, " error - %s: relocation type is not specified.\n", dname);
         free(t);
         return 1;
     }
-    for(int i = 0; i < st->elf_anchor_types_len; i++)
-        if(strcmp(st->elf_anchor_types[i], t) == 0){ free(t); return 1; }
-    st->elf_anchor_types = elf_decl_grow(st->elf_anchor_types, &st->elf_anchor_types_cap,
-                                         st->elf_anchor_types_len, sizeof(char*));
-    st->elf_anchor_types[st->elf_anchor_types_len++] = t;
+    for(int i = 0; i < *len; i++)
+        if(strcmp((*lst)[i], t) == 0){ free(t); return 1; }
+    *lst = elf_decl_grow(*lst, cap, *len, sizeof(char*));
+    (*lst)[(*len)++] = t;
     st->elf_decl_gen++;
     return 1;
+}
+
+/* `.elfresolve` — 同じセクションの局所ラベルへのこの型の PC 相対の欄は axx が
+   解決する（分岐の変位）。axx.py の elfresolve_processing() と同じ規則である。 */
+static int dir_elfresolve(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".elfresolve") != 0) return 0;
+    return dir_elf_typelist(asmb, e, ".elfresolve", &asmb->st.elf_resolve_types,
+                            &asmb->st.elf_resolve_types_len, &asmb->st.elf_resolve_types_cap);
 }
 
 /* `.elfrelax` — リンカがコードを縮める（緩和する）機種か。
@@ -11726,6 +11763,99 @@ static MiniVal mini_arg_str(const char *t, int a, int *out_i, int *ok,
     return v;
 }
 
+/* t[a] から `.islabel(` が始まるか。 */
+static int mini_is_islabel(const char *t, int a){
+    static const char *w = ".ISLABEL";
+    for(int i = 0; i < 8; i++) if(axx_upper_char(t[a+i]) != w[i]) return 0;
+    int k = a + 8;
+    if(isalnum((unsigned char)t[k]) || t[k] == '_') return 0;
+    k = axx_skipspc(t, k);
+    return t[k] == '(';
+}
+
+/* 綴りがラベルを含むか。数・文字定数・文字列・`$$` / `$.`・`#記号`・パターンの
+   記号は飛ばし、ラベル（再配置を持たない `.equ` は除く）か、まだ定義されていない
+   名前（前方参照のラベル）があれば 1。式は評価しない。
+   axx.py の ObjectGenerator._captext_has_label() と同じ規則である。 */
+static int captext_has_label(AsmState *st, const char *txt){
+    int n = (int)strlen(txt), i = 0;
+    while(i < n){
+        unsigned char c = (unsigned char)txt[i];
+        if(c == '"' || c == '\''){
+            int j = i + 1;
+            while(j < n && (unsigned char)txt[j] != c){ if(txt[j] == '\\' && j + 1 < n) j++; j++; }
+            i = j + 1;
+            continue;
+        }
+        if(c == '$'){ i += (i + 1 < n && (txt[i+1] == '$' || txt[i+1] == '.')) ? 2 : 1; continue; }
+        if(c == '#'){
+            i++;
+            while(i < n && (isalnum((unsigned char)txt[i]) || txt[i] == '_' || txt[i] == '.')) i++;
+            continue;
+        }
+        if(isdigit(c)){
+            while(i < n && (isalnum((unsigned char)txt[i]) || txt[i] == '_' || txt[i] == '.')) i++;
+            continue;
+        }
+        if(char_in((char)c, st->lwordchars)){
+            int j = i;
+            while(j < n && char_in(txt[j], st->lwordchars)) j++;
+            char w[512];
+            int L = j - i; if(L >= (int)sizeof(w)) L = (int)sizeof(w) - 1;
+            memcpy(w, txt + i, (size_t)L); w[L] = 0;
+            i = j;
+            LabelEntry *le = lmap_find(&st->labels, w);
+            if(le){
+                if(!le->is_equ || le->reloc_type_override >= 0) return 1;
+                continue;
+            }
+            char key[512];
+            axx_strupr_to(key, w, sizeof(key));
+            if(smap_find(&st->symbols, key)) continue;
+            return 1;
+        }
+        i++;
+    }
+    return 0;
+}
+
+/* `.islabel(変数)` — その変数が捕捉した綴りがラベルを含めば 1、含まなければ 0。
+   ラベルなら決まった長さの命令列を選ぶ疑似命令（SPARC の set、setx）に使う。
+   axx.py の ObjectGenerator._mini_arg_islabel() と同じ規則である。 */
+static MiniVal mini_arg_islabel(Assembler *asmb, const char *t, int a, int *out_i, int *ok,
+                                const char *name, int quiet){
+    AsmState *st = &asmb->st;
+    int len = (int)strlen(t);
+    int k = axx_skipspc(t, a + 8) + 1;
+    const char *cp = strchr(t + k, ')');
+    *ok = 0;
+    *out_i = len;
+    int b = k, e = cp ? (int)(cp - t) : k;
+    while(b < e && (t[b] == ' ' || t[b] == '\t')) b++;
+    while(e > b && (t[e-1] == ' ' || t[e-1] == '\t')) e--;
+    int nl = e - b;
+    if(!cp || nl == 0 || var_name_len(t + b) != nl){
+        if(!quiet)
+            axx_diagf(1, 0, " error - '.call %s': '.islabel' needs '.islabel(variable)'.\n", name);
+        return mini_num(u256_zero());
+    }
+    char nm[512];
+    if(nl >= (int)sizeof(nm)) nl = (int)sizeof(nm) - 1;
+    memcpy(nm, t + b, (size_t)nl); nm[nl] = 0;
+    int slot = var_slot(nm, nl, 0);
+    if(slot < 0){
+        if(!quiet)
+            axx_diagf(1, 0, " error - '%s' is not a pattern variable; '.islabel(%s)' "
+                       "needs '%s' captured in the instruction field.\n", nm, nm, nm);
+        return mini_num(u256_zero());
+    }
+    int off = st->vars[slot].text_off;
+    const char *txt = (off < 0 || off >= st->captext_len) ? "" : st->captext + off;
+    *ok = 1;
+    *out_i = (int)(cp - t) + 1;
+    return mini_num(u256_from_u64(captext_has_label(st, txt) ? 1 : 0));
+}
+
 /* t[a] から `.exp(` が始まるか。`.expx` のような別の名前は除く。 */
 static int mini_is_exp(const char *t, int a){
     static const char *w = ".EXP";
@@ -11911,6 +12041,7 @@ static MiniVal mini_arg_one(Assembler *asmb, char *t, int a, int *out_i, int *ok
     }
     if(t[a] == '"') return mini_arg_str(t, a, out_i, ok, name, quiet);
     if(mini_is_exp(t, a)) return mini_arg_exp(asmb, t, a, out_i, ok, name, quiet);
+    if(mini_is_islabel(t, a)) return mini_arg_islabel(asmb, t, a, out_i, ok, name, quiet);
     int e;
     const char *sv = mini_strsym_at(st, t, a, &e);
     if(sv){
@@ -14575,7 +14706,8 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
     }
     {
         uint64_t _raw = u256_to_u64(asmb->st.pc);
-        int64_t _adj = equ_section_relative_offset(&asmb->st, asmb->st.current_section, _raw);
+        int64_t _adj = st_sectioned(&asmb->st)
+                     ? equ_section_relative_offset(&asmb->st, asmb->st.current_section, _raw) : -1;
         uint64_t _base = (_adj >= 0) ? (uint64_t)_adj : _raw;
         uint256_t _aligned_base = align_addr256(&asmb->st, u256_from_u64(_base));
         uint256_t _padding = u256_sub(_aligned_base, u256_from_u64(_base));
@@ -15652,6 +15784,7 @@ static int pat_dir_exec(Assembler *asmb, PatEntry *i){
     case PD_ELFPCGUESS:_dir_done = dir_elfpcguess(asmb,i);   break;
     case PD_ELFRELAX:  _dir_done = dir_elfrelax(asmb,i);     break;
     case PD_ELFANCHOR: _dir_done = dir_elfanchor(asmb,i);    break;
+    case PD_ELFRESOLVE:_dir_done = dir_elfresolve(asmb,i);   break;
     case PD_ELFBUILTIN:_dir_done = dir_elfbuiltin(asmb,i);   break;
     case PD_ELFEXTRA: _dir_done = dir_elfextra(asmb,i);      break;
     case PD_ELFDIFF:  _dir_done = dir_elfdiff(asmb,i);       break;
@@ -16664,6 +16797,64 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         int _iwords = _ibytes / bpw;
                         if(_iwords < 1) _iwords = 1;
                         int _fw = _widx + _foff / bpw;
+                        /* `.elfresolve::1`: 同じセクションの局所ラベルへの PC 相対の欄は、
+                           リンカが書く値（ラベル + 加数 + 補正 − 位置）をシフトして
+                           マスクへ詰め、リロケーションは出さない（GNU as と llvm-mc が
+                           自分で解決する形）。欄に収まらなければエラー。axx.py の
+                           lineassemble() の同じ処理と同じ規則である。 */
+                        if(st->elf_resolve_types_len > 0 && !elf_relaxing(st)
+                           && elf_type_in_list(st, st->elf_resolve_types, st->elf_resolve_types_len, _hint_rtype)
+                           && _fw + _iwords <= objl.len){
+                            LabelEntry *_rle = lmap_find(&st->labels, _lname);
+                            int64_t _lw = -1;
+                            if(_rle && !_rle->is_imported && !_rle->is_equ && _rle->section
+                               && _rle->section[0] && strcmp(_rle->section, sec_name) == 0
+                               && !lmap_find(&st->export_labels, _lname)
+                               && !sym_attr_get(st, _lname).weak)
+                                _lw = equ_section_relative_offset(st, sec_name, u256_to_u64(_rle->value));
+                            if(_lw >= 0){
+                                int64_t _pw = (int64_t)(sec_completed_words +
+                                                        (cur_pc + (uint64_t)_fw - sec_entry_pc_cur));
+                                int64_t _val = (_lw - _pw) * _scale + _valid[_gi].addend * _scale
+                                               + (int64_t)_fdecl->bias;
+                                int64_t _sv = (_fdecl->shift < 64) ? (_val >> _fdecl->shift)
+                                                                   : (_val < 0 ? -1 : 0);
+                                int _nb = 0;
+                                for(int _b = 0; _b < 64; _b++) if((_fmask >> _b) & 1) _nb++;
+                                int _fits = _nb >= 64 || (_sv >= -((int64_t)1 << (_nb - 1))
+                                                          && _sv < ((int64_t)1 << (_nb - 1)));
+                                if(_fdecl->shift > 0 && _fdecl->shift < 63
+                                   && (_val & (((int64_t)1 << _fdecl->shift) - 1)) != 0) _fits = 0;
+                                if(!_fits && should_report_errors(st))
+                                    axx_diagf(1, 0, " error - the reference to '%s' resolved in "
+                                               "its section does not fit the field.  [%s:%d]\n",
+                                               _lname, st->current_file, (int)st->ln);
+                                uint64_t _wmask_r = axx_word_mask(st->bts);
+                                uint64_t _iv = 0;
+                                for(int _k = 0; _k < _iwords; _k++){
+                                    int _sh = st->endian_big ? st->bts * (_iwords - 1 - _k)
+                                                             : st->bts * _k;
+                                    if(_sh < 64) _iv |= (u256_to_u64(objl.data[_fw + _k]) & _wmask_r) << _sh;
+                                }
+                                /* 欄の中でビットが並び替わる型（AArch64 の adr、RISC-V の
+                                   B / J 形式）は `.elfencode` の関数が (欄の値, 値) から書く。 */
+                                const char *_renc = elf_encode_of(st, _hint_rtype);
+                                if(_renc){
+                                    uint256_t _ra[2] = { u256_from_u64(_iv), u256_from_i64(_val) };
+                                    uint256_t _rnv;
+                                    if(elf_call_func(st, ".elfencode", _renc, _ra, 2, &_rnv))
+                                        _iv = u256_to_u64(_rnv);
+                                } else
+                                    _iv = (_iv & ~_fmask) | field_deposit(_fmask, _sv);
+                                for(int _k = 0; _k < _iwords; _k++){
+                                    int _sh = st->endian_big ? st->bts * (_iwords - 1 - _k)
+                                                             : st->bts * _k;
+                                    objl.data[_fw + _k] = u256_from_u64(_sh < 64 ? ((_iv >> _sh) & _wmask_r) : 0);
+                                }
+                                _gi = _gj;
+                                continue;
+                            }
+                        }
                         if(_fw + _iwords <= objl.len){
                             uint64_t _wmask_i = axx_word_mask(st->bts);
                             for(int _k = 0; _k < _iwords; _k++){
@@ -16843,6 +17034,11 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                             (size_t)st->reloc_cap * sizeof(st->relocations[0]));
                         if(!st->relocations){ perror("realloc"); exit(1); }
                     }
+                    /* RELA では加数は項目が持つので、欄は 0 で出す（GNU as と llvm-mc の
+                       形）。REL では書き出しのときに加数を欄へ書き戻す。 */
+                    if(_mtbl_rm->is_rela)
+                        for(int _k = 0; _k < _nwords; _k++)
+                            if(_widx + _k < objl.len) objl.data[_widx + _k] = u256_zero();
                     st->relocations[st->reloc_count].section   = strdup(sec_name);
                     st->relocations[st->reloc_count].sec_offset = _sec_rel;
                     st->relocations[st->reloc_count].sym        = strdup(_lname);
@@ -21358,6 +21554,8 @@ static void elf_desc_print(AsmState *st, FILE *fp){
     fprintf(fp, ".elfdwarf::%s\n", elf_desc_tname(m, m->dwarf_abs, b1, sizeof(b1)));
     fprintf(fp, ".elfpcguess::%d\n", m->pcrel_guess ? 1 : 0);
     if(st->elf_decl_relax >= 0) fprintf(fp, ".elfrelax::%d\n", st->elf_decl_relax);
+    for(int i = 0; i < st->elf_resolve_types_len; i++)
+        fprintf(fp, ".elfresolve::%s\n", st->elf_resolve_types[i]);
     for(int i = 0; i < st->elf_anchor_types_len; i++)
         fprintf(fp, ".elfanchor::%s\n", st->elf_anchor_types[i]);
     fprintf(fp, ".elfunit::%s\n", st->elf_decl_unit == 1 ? "word" : "byte");
@@ -21532,6 +21730,7 @@ static void register_elfdecls(Assembler *asmb){
         case PD_ELFPCGUESS: dir_elfpcguess(asmb, e);  break;
         case PD_ELFRELAX:   dir_elfrelax(asmb, e);    break;
         case PD_ELFANCHOR:  dir_elfanchor(asmb, e);   break;
+        case PD_ELFRESOLVE: dir_elfresolve(asmb, e);  break;
         case PD_ELFBUILTIN: dir_elfbuiltin(asmb, e);  break;
         case PD_ELFEXTRA:   dir_elfextra(asmb, e);    break;
         case PD_ELFDIFF:    dir_elfdiff(asmb, e);     break;

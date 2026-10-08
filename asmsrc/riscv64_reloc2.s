@@ -6,7 +6,9 @@
 ; Data written as label-$$ is an ADD/SUB pair: the label added and a
 ; local symbol (.Lanchor<n>) axx places on the field subtracted. A
 ; label difference across sections, or with an external symbol, is an
-; ADD/SUB pair too; one inside a section is a constant. The entries are
+; ADD/SUB pair too; one inside a section is a constant. A branch, jump or
+; call to a local label of the same section is resolved here with no
+; relocation (.elfresolve, .elfencode). The entries are
 ; those llvm-mc 19 (no relax) writes, and the linked image (ld.lld) is
 ; identical.
 ; ===================================================================
@@ -14,6 +16,9 @@
         .section .text
 start:
         call    ext
+        beq     a0,a1,start
+        j       start
+        call    start
         ret
         .section .data
 dat:

@@ -105,6 +105,13 @@ caxx $P/riscv64.axx $S/riscv64_reloc2.s -o b161
 # データ（R_MIPS_PC32 ほか）。o32 REL ビッグエンディアンと n64 RELA リトルエンディアン。
 caxx $P/mips.axx $S/mips_reloc2.s -o b162
 caxx $P/mips64el.axx $S/mips64_reloc2.s -o b163
+# SPARC: ラベルの set / setx（.islabel と追加の再配置）、セクション内の分岐の解決
+# （.elfresolve）、PC 相対のデータ（R_SPARC_DISP*）。
+caxx $P/sparc.axx $S/sparc_reloc2.s -o b164
+# -b で、先頭でないセクション（入り直した後も）にある分岐の変位。
+caxx $P/x86_64.axx $S/bsection.s -b b165
+# AArch64: 命令とデータの再配置、セクション内の分岐の解決（.elfresolve / .elfencode）。
+caxx $P/aarch64.axx $S/aarch64_reloc.s -o b166
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -280,6 +287,9 @@ paxx $P/riscv64full.axx $S/riscv64full_reloc2.s -o a160
 paxx $P/riscv64.axx $S/riscv64_reloc2.s -o a161
 paxx $P/mips.axx $S/mips_reloc2.s -o a162
 paxx $P/mips64el.axx $S/mips64_reloc2.s -o a163
+paxx $P/sparc.axx $S/sparc_reloc2.s -o a164
+paxx $P/x86_64.axx $S/bsection.s -b a165
+paxx $P/aarch64.axx $S/aarch64_reloc.s -o a166
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -413,6 +423,9 @@ check a160 b160
 check a161 b161
 check a162 b162
 check a163 b163
+check a164 b164
+check a165 b165
+check a166 b166
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

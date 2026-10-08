@@ -51,14 +51,14 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all sixty-five bundled pattern/source pairs with
+exactly that: `test1` assembles all sixty-eight bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the five `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` and `ministr.axx` pairs the `.echo` lines each one writes to standard
 error, and for the `regress.axx` regression test its `-V` text and its diagnostics.
 The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for a hundred and ninety-nine comparisons in all.
+text output are compared too, for two hundred and two comparisons in all.
 
 **Contents**
 
@@ -1453,11 +1453,12 @@ rows it belongs to.
 
 One caveat when both outputs are asked for in the same run. The fields left at
 0 are left at 0 in the raw binary too, so a `-b` image written alongside a `-o`
-object is only correct once that object has been linked. axx says so rather
-than letting it pass:
+object is only correct once that object has been linked. Under RELA the same
+holds for a data field (`.quad sym+8`): the addend is in the entry and the field
+is 0, as GNU as and llvm-mc write it. axx says so rather than letting it pass:
 
 ```
- warning - 16 instruction field(s) were left 0 for the linker (.text+0x0, ...);
+ warning - 16 field(s) were left 0 for the linker (.text+0x0, ...);
  this raw binary is only correct after linking a.o. Drop -o to have axx fill
  them in.
 ```
@@ -1671,6 +1672,7 @@ ELF object should look like.
 | `.elfpcguess::<0>` / `<1>` | whether a width-guessed absolute type is swapped for a PC-relative one (section 3.7.9) |
 | `.elfrelax::<0>` / `<1>` | whether the linker may shrink code, which keeps label differences inside a section as relocations (section 3.7.10) |
 | `.elfanchor::<type>` | an extra relocation of `.reloc` of this type names a local symbol on the row's first relocation (section 3.7.5) |
+| `.elfresolve::<type>` | a field of this PC-relative type that refers to a local label of the same section is resolved by axx, with no relocation (below) |
 | `.elfbuiltin::<0>` / `<1>` | whether the built-in table is the base (section 3.7.9) |
 | `.elfextra::<type>::<companion>[::<symbol>]` | a relocation added at the same offset (section 3.7.10) |
 | `.elfdiff::<width or type>::<add type>::<subtract type>` | sums and differences of labels as add/subtract relocations (section 3.7.10) |
@@ -1862,6 +1864,51 @@ A `.extern` written without a type name does not override the type `.reloc`
 gives an instruction field: only a type the source wrote (`.extern ext::abs64`)
 counts as "the source file" in the priority of section 3.7.8.
 
+**Resolved in place (`.elfresolve`).**
+
+```
+.elfresolve::<type>
+```
+
+A field of `<type>` — a PC-relative instruction-field type with an `.elffield` —
+that refers to a local label of the section being assembled gets no relocation:
+axx writes into it the value a linker would, `(label + addend + bias - place) >>
+shift`, filling the mask's bits from the bottom up, as GNU as and llvm-mc resolve
+a branch within a section. A type with an `.elfencode` function (section 3.7.10)
+is written by that function instead, given (the field, `label + addend + bias -
+place`): that is how a field whose bits are reordered is written — the AArch64
+`adr`, the RISC-V B, J, CB and CJ formats, and the RISC-V `call` split over
+`auipc` + `jalr`. The label must be defined in this section, and not be
+`.global` or `.weak`; any other reference keeps its relocation. A value that does
+not fit the field (`.elffield`'s mask bits, after the shift) or is not a multiple
+of `1 << shift` is an error, since under `-o` the range checks of the pattern are
+left to the linker. Write one line per type, and only for a type whose value is
+a displacement checked for range: a truncating type such as SPARC's `%pc10`
+would be reported as out of range. Nothing is resolved on a machine that relaxes
+(`.elfrelax::1`, section 3.7.10).
+
+```
+.elffield::wdisp22::0x3fffff::0::2
+.elfresolve::wdisp22
+```
+
+```
+start: nop
+       nop
+       ba start      ->  10bf fffe   no relocation (two words back)
+       nop
+       ba ext        ->  1080 0000   R_SPARC_WDISP22 ext
+```
+
+`sparc.axx` resolves WDISP30, WDISP22, WDISP19 and WDISP16 (an object that
+branches within its sections then links with ld.lld, which cannot apply the last
+three), `ppc64.axx` / `ppc64le.axx` REL24 and REL14, `mips_isa.axx` PC16,
+PC21_S2, PC26_S2 and PC19_S2, `riscv64.axx` / `riscv64full.axx` BRANCH, JAL,
+CALL_PLT (and RVC_BRANCH / RVC_JUMP), and `aarch64.axx` JUMP26, CALL26,
+CONDBR19, TSTBR14, LD_PREL_LO19 and ADR_PREL_LO21. Each matches what llvm-mc 19
+resolves; the page-relative and `%pcrel_hi` / `%pcrel_lo` pairs and the MIPS
+`ldpc` keep their relocations, as there.
+
 **Example.** A description of EM_MSP430 (105), a machine axx has no built-in
 table for.
 
@@ -2006,7 +2053,8 @@ instruction field, such as RISC-V's `R_RISCV_BRANCH`, which is PC-relative and
 
 The two `$$` differ, which is why the spelling is read rather than the value:
 written in the source, `$$` is the location in the whole image, while inside a
-`binary_list` it is relative to the start of the section (section 3.7.10), so
+`binary_list` under `-o` it is relative to the start of the section (section
+3.7.10), so
 the value alone cannot tell `ext-$$` from `ext+<constant>`, least of all at
 offset 0 of a section.
 
@@ -2163,7 +2211,8 @@ and returns the new field. The field's value is the type's width of words read
 as an integer in the target byte order (the reading `.elffield`'s mask uses);
 the addend may be negative. When `.elffield` is declared too, `.elfencode`
 does the write-back (`.elffield` still places the relocation and zeroes the field
-under RELA). It is not called under RELA.
+under RELA). Under RELA it is called only to resolve a field in place, for a type
+named by `.elfresolve` (section 3.7.7), given (the field, the value).
 
 ```
 .elftype::hi16::5::4
@@ -2276,9 +2325,10 @@ same code.
 | `elfword.axx` / `elfword.s` | a toy machine with 16-bit words | `.elfunit::word`: addends and symbol values written in words |
 
 **Outside the scope — executables and shared libraries.** axx writes
-relocatable objects (`ET_REL`). Inside a `binary_list` a label of the same
-section and `$$` are filled in relative to the section start (the linker decides
-where it goes), so writing an executable (`ET_EXEC`, with program headers) would
+relocatable objects (`ET_REL`). Under `-o` (and `-E`), inside a `binary_list` a
+label of the same section and `$$` are filled in relative to the section start
+(the linker decides where it goes); under `-b` alone they are addresses in the
+flat image, where the sections lie one after another. So writing an executable (`ET_EXEC`, with program headers) would
 mean axx resolving every relocation itself, type by type. That is the linker's
 job, and so is a shared library (`ET_DYN`, with `.dynamic`, `.dynsym` and the hash
 table). For a raw image at fixed addresses use `-b`; for an executable, hand the
@@ -2583,6 +2633,22 @@ variable captured from the source. It is the same text the template
 
 ```
 SPELL !x,r :: .call func1(x,.exp(x),.exp(r))     /* spell 1+2*3,rb → func1(7, "1+2*3", "rb") */
+```
+
+An argument written `.islabel(variable)` is the **number** 1 when the text that
+pattern variable captured names a label, and 0 when it does not. A label here is
+one defined with `name:`, an external one, an `.equ` that carries a relocation
+type, or a name not defined yet (a forward reference); numbers, character
+constants, strings, `$$`, `#symbol`, pattern symbols and `.equ` constants do not
+count. The text is scanned, not evaluated, so the answer is the same in every
+pass. It is for a pseudo-instruction whose expansion is shortened for a known
+value but must keep a fixed form for a symbol the linker fills in, as GNU as does
+with the SPARC `set` and `setx`:
+
+```
+.reloc::v::hi22::::lo10@4
+SET !v,rd :: .call setuw(rd,v,.islabel(v))   /* set ext,%o0 -> sethi %hi + or %lo */
+.clrreloc::v
 ```
 
 An argument that is just the name of a string symbol (section 3.6,
@@ -3740,7 +3806,9 @@ reports "argument contains undefined label" and does nothing.
 ```
 
 Aligns to a multiple of 16, padding with the `.padding` byte. With no argument,
-the previous (or default) alignment is used.
+the previous (or default) alignment is used. Under `-o` and `-E` the multiple is
+counted from the start of the section (the linker places the section at an
+aligned address); under `-b` alone it is counted in the flat image.
 
 ### 5.3 Data
 
@@ -4798,9 +4866,9 @@ The x86_64 pattern file is also maintained separately at
 
 | Pattern file | Size | `::` lines | Source | Notes |
 |---|---|---|---|---|
-| **x86_64.axx** | 3.9 MB | 23,923 | **hello.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512 |
+| **x86_64.axx** | 3.9 MB | 23,923 | **hello.s**, **bsection.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512 |
 | **x86_64m.axx** | 935 KB | 5,787 (23,923 expanded) | **hello.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo |
-| **aarch64.axx** | 347 KB | 2,068 (9,387 expanded) | **aarch64.s** | AArch64 (A64): data processing, branches, exception generation, hints, barriers, system registers and SYS aliases, loads and stores, LSE atomics, scalar floating point, Advanced SIMD (vector and scalar) including the LD1-LD4 / ST1-ST4 structure accesses, cryptography, and the scalar extensions (PAuth, MTE, MOPS, FCMA, dot product, BFloat16, matrix multiply, LS64), and the GNU-style relocation modifiers `:lo12:`, `:pg_hi21:`, `:abs_g0:`-`:abs_g3:`, `:prel_g0:`-`:prel_g3:` and `:got:` / `:got_lo12:`, which with `-o` are emitted as relocations for the linker to fill in (`R_AARCH64_ADR_PREL_PG_HI21`, `ADD_ABS_LO12_NC`, the `LDST*_ABS_LO12_NC` family, `MOVW_UABS_G*` / `MOVW_PREL_G*`, `ADR_GOT_PAGE` and `LD64_GOT_LO12_NC`) and which with `-b` axx resolves itself, reading the GOT pair as naming the slot. Also SVE and SVE2 -- arithmetic, shifts, compares, predicates, element counts, permutes, reductions, the whole load/store family (contiguous, replicating, non-fault, first-fault, gather, scatter, prefetch), the widening and narrowing groups, complex arithmetic and the SVE2 cryptography -- SME: streaming mode, the ZA array, and the integer, floating-point and BFloat16 outer products -- and SME2: the predicate-as-counter registers, the ZT0 lookup table, the multi-vector operations on Z registers, accumulation into the ZA array, and the multi-vector loads and stores in both their consecutive and strided forms |
+| **aarch64.axx** | 350 KB | 2,097 (9,387 expanded) | **aarch64.s**, **aarch64_reloc.s** | AArch64 (A64): data processing, branches, exception generation, hints, barriers, system registers and SYS aliases, loads and stores, LSE atomics, scalar floating point, Advanced SIMD (vector and scalar) including the LD1-LD4 / ST1-ST4 structure accesses, cryptography, and the scalar extensions (PAuth, MTE, MOPS, FCMA, dot product, BFloat16, matrix multiply, LS64), and the GNU-style relocation modifiers `:lo12:`, `:pg_hi21:`, `:abs_g0:`-`:abs_g3:`, `:prel_g0:`-`:prel_g3:` and `:got:` / `:got_lo12:`, which with `-o` are emitted as relocations for the linker to fill in (`R_AARCH64_ADR_PREL_PG_HI21`, `ADD_ABS_LO12_NC`, the `LDST*_ABS_LO12_NC` family, `MOVW_UABS_G*` / `MOVW_PREL_G*`, `ADR_GOT_PAGE` and `LD64_GOT_LO12_NC`) and which with `-b` axx resolves itself, reading the GOT pair as naming the slot. With `-o` it is an AArch64 object without `-m`; a branch, `adr` or literal `ldr` to a local label of the same section is resolved in place, and the data directives (`.byte` `.hword` `.word` `.quad` `.xword` ...) take ABS / PREL relocations (`aarch64_reloc.s`, checked against llvm-mc 19). Also SVE and SVE2 -- arithmetic, shifts, compares, predicates, element counts, permutes, reductions, the whole load/store family (contiguous, replicating, non-fault, first-fault, gather, scatter, prefetch), the widening and narrowing groups, complex arithmetic and the SVE2 cryptography -- SME: streaming mode, the ZA array, and the integer, floating-point and BFloat16 outer products -- and SME2: the predicate-as-counter registers, the ZT0 lookup table, the multi-vector operations on Z registers, accumulation into the ZA array, and the multi-vector loads and stores in both their consecutive and strided forms |
 | **aarch64_logical.axx** | 9.5 KB | 76 (82 expanded) | **aarch64_logical_mini_demo.s** | The macro-layer version of the same AArch64 logical (immediate) group: the rows are generated with `!def`, and the bitmask immediate is encoded in a `binary_list` expression |
 | **aarch64_logical_mini.axx** | 9.2 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 logical (immediate): AND/ORR/EOR/ANDS/TST, 32- and 64-bit. Encodes the bitmask immediate with the mini language (section 3.15) |
 | **ppc64.axx** | 2.6 KB | 51 (plus `ppc64_isa.axx`) | **ppc64_test.s**, **ppc64_reloc2.s** and others | PowerPC64 big-endian (ELFv1): sets the byte order and the ELF description (`.elftype` / `.elffield` / `.elfpcguess` / `.elfsection`), then includes `ppc64_isa.axx` |
@@ -4815,7 +4883,7 @@ The x86_64 pattern file is also maintained separately at
 | **mips64r6.axx** | 938 B | 1 (plus `mips_isa.axx`) | **mipsr6.s** | MIPS64 Release 6, big-endian, n64 |
 | **mips64r6el.axx** | 945 B | 1 (plus `mips_isa.axx`) | **mipsr6.s** | The same for little-endian, n64 |
 | **mips_isa.axx** | 80 KB | 151 (about 5,000 expanded, about 3,560 under Release 6) | -- | The MIPS instruction set shared by the eight files above; not passed to axx directly. MIPS I to MIPS64 Release 6: the whole integer set (with the Release 2 bit-field and byte-swap instructions), the privileged instructions (COP0, TLB), the FPU (the S, D, W, L and PS formats, the sixteen `c.cond` compares, COP1X), COP2, the coprocessor 3 forms of MIPS I, the GNU pseudo-instructions that need no `$at` (`li`, `dli`, `la`, `dla`, `move`, `b` ...) and the relocation modifiers (`%hi`, `%lo`, `%higher`, `%highest`, `%gp_rel`, the `%got` and `%call16` families, the TLS ones, `%pcrel_hi` / `%pcrel_lo`). The extensions DSP (Release 1 and 2, Release 3 under R6), MSA, MT, VZ, EVA, MIPS-3D, SmartMIPS, MCU, XPA, CRC and GINV. When the front file sets `R6()` to 1, the instructions Release 6 removes (branch likely, multiply and divide on HI / LO, the `lwl` family, the `movz` family, the FP condition codes, PS, COP1X ...) are left out, `clz`, `ll` / `sc`, `cache` / `pref`, the `lwc2` family, `jr` ... take their Release 6 encodings, and the new instructions are added (the compact branches, the `aui` family, the PC-relative `lwpc` / `auipc` family, the three-register multiply and divide, `cmp.cond.fmt`, `maddf` and the other FPU ones). The syntax is that of GNU as under `.set noreorder` / `.set noat`. No microMIPS / MIPS16e (the compressed encodings), MDMX or vendor extensions. Under `-o`, o32 is REL (the addend written back into the field) and n64 is RELA (three types per `r_info`), with the PC-relative relocations of Release 6 (`R_MIPS_PC21_S2`, `PC26_S2`, `PC19_S2`, `PC18_S3`, `PCHI16`, `PCLO16`). Written with the macro layer and the mini language |
-| **sparc.axx** | 52 KB | 229 (7,968 expanded) | **sparc_test.s**, **sparc_reloc.s**, **bf_sparc.s** | SPARC V7 / V8 / V9 and VIS 1-3: the integer set, the shifts and `sethi`; Bicc / BPcc / FBfcc / FBPfcc / BPr and the V8 CBccc (with `,a` and `,pt` / `,pn`), `call`, `jmpl`, `return` and Tcc; movcc / movr / fmovcc / fmovr; every integer and floating point load and store (the alternate space forms with an ASI number, a `#ASI_*` name or `%asi`, `casa` / `casxa`, `prefetch`); every FPop1 / FPop2 (s, d, q, the conversions, `fcmp`, the UltraSPARC Architecture 2007 `fnadd` family) and the fused multiply-add (`fmadd` ...); `rd` / `wr`, `rdpr` / `wrpr`, the V8 `%psr` family and the UA2005 `rdhpr` / `wrhpr`; `membar` (with the `#StoreLoad` ... names); the V8 coprocessor; the LEON `umac` / `smac` / `pwr`; the synthetic instructions (`cmp`, `mov`, `set` / `setuw` / `setsw` / `setx`, the `clr` family, the `inc` family ...); the operand modifiers (`%hi`, `%lo`, `%hh`, `%hm`, `%h44`, `%m44`, `%l44`, `%hix`, `%lox`, `%pc22`, `%pc10`, the GOT and TLS ones). `-o` writes ELF64 SPARCV9 (RELA). Checked byte-for-byte against llvm-mc 19, and the rows llvm-mc does not have against the encodings of the manuals. Written with the macro layer and the mini language |
+| **sparc.axx** | 56 KB | 237 (7,968 expanded) | **sparc_test.s**, **sparc_reloc.s**, **sparc_reloc2.s**, **bf_sparc.s** | SPARC V7 / V8 / V9 and VIS 1-3: the integer set, the shifts and `sethi`; Bicc / BPcc / FBfcc / FBPfcc / BPr and the V8 CBccc (with `,a` and `,pt` / `,pn`), `call`, `jmpl`, `return` and Tcc; movcc / movr / fmovcc / fmovr; every integer and floating point load and store (the alternate space forms with an ASI number, a `#ASI_*` name or `%asi`, `casa` / `casxa`, `prefetch`); every FPop1 / FPop2 (s, d, q, the conversions, `fcmp`, the UltraSPARC Architecture 2007 `fnadd` family) and the fused multiply-add (`fmadd` ...); `rd` / `wr`, `rdpr` / `wrpr`, the V8 `%psr` family and the UA2005 `rdhpr` / `wrhpr`; `membar` (with the `#StoreLoad` ... names); the V8 coprocessor; the LEON `umac` / `smac` / `pwr`; the synthetic instructions (`cmp`, `mov`, `set` / `setuw` / `setsw` / `setx`, the `clr` family, the `inc` family ...); the operand modifiers (`%hi`, `%lo`, `%hh`, `%hm`, `%h44`, `%m44`, `%l44`, `%hix`, `%lox`, `%pc22`, `%pc10`, the GOT and TLS ones). `-o` writes ELF64 SPARCV9 (RELA). Checked byte-for-byte against llvm-mc 19, and the rows llvm-mc does not have against the encodings of the manuals. Written with the macro layer and the mini language |
 | **6809.axx** | 124 KB | 1,950 | **6809.s** | Motorola 6809 |
 | **68000.axx** | 51 KB | 453 | **68000.s** | Motorola 68000 |
 | **6800.axx** | 18 KB | 271 | **6800.s** | Motorola 6800 |
@@ -4860,7 +4928,8 @@ The `::` lines column counts the lines containing `::` in the file as written.
 For files whose rows are generated by the macro layer the expanded count follows
 in brackets (`caxx <pattern file> -p <out>` writes the expansion out).
 
-Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`.
+Note that `x86_64.axx` pairs with `hello.s`, not with a file named `x86_64.s`,
+and with `bsection.s` (branches in a section placed after another, under `-b`).
 `itanium.axx` also uses `vliw.s`, and `aarch64_logical_mini.axx` pairs with
 `aarch64_logical_mini_demo.s`. `ppc64.axx` and `ppc64le.axx` pair with
 `ppc64_test.s` (one line per pattern row, checked against GNU as byte-for-byte),
@@ -4879,10 +4948,12 @@ for `-o`: `la` / `dla` and the PC-relative data, checked against llvm-mc 19 and
 ld.lld 19 in all eight front files. `mips_isa.axx` is included by those eight and is never
 passed to axx itself. `sparc.axx` pairs with `sparc_test.s` (one line per pattern
 row, checked against llvm-mc 19 byte-for-byte), `sparc_reloc.s` (the relocations
-under `-o`, checked against llvm-mc 19) and `bf_sparc.s` (the Brainfuck
+under `-o`, checked against llvm-mc 19), `sparc_reloc2.s` (`set` / `setx` of a
+label, branches resolved within a section and PC-relative data, checked against
+llvm-mc 19 and ld.lld 19) and `bf_sparc.s` (the Brainfuck
 interpreter, run under qemu-sparc64).
 
-`test1` runs all sixty-five pairs through both implementations and
+`test1` runs all sixty-eight pairs through both implementations and
 compares the `-b` raw binaries. For the five pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
@@ -4915,13 +4986,16 @@ ELF objects too: the extra relocations of `.reloc` and `.elfanchor`, `label-$$`
 data, and the label differences of `.elfrelax::0`. The two MIPS pairs
 (`mips.axx` with `mips_reloc2.s`, o32 REL big-endian, and `mips64el.axx` with
 `mips64_reloc2.s`, n64 RELA little-endian) compare their `-o` ELF objects: the
-`la` / `dla` relocations and the PC-relative data.
+`la` / `dla` relocations and the PC-relative data. The SPARC pair `sparc.axx` with
+`sparc_reloc2.s` compares its `-o` ELF objects too: `.islabel`, `.elfresolve` and
+the PC-relative data. The AArch64 pair `aarch64.axx` with `aarch64_reloc.s` compares
+its `-o` ELF objects (no `-m`), and `x86_64.axx` with `bsection.s` its `-b` image.
 
 The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for a hundred and ninety-nine comparisons in all.
+never compares, for two hundred and two comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -4954,7 +5028,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all sixty-five bundled pattern/source pairs with both
+`test1` assembles all sixty-eight bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 five `.textmode` pairs, the `.echo` lines of the `echo.axx` and `ministr.axx` pairs,
 and the `-V` text and diagnostics of the `regress.axx` regression test.

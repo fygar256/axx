@@ -8,7 +8,9 @@
 ; R_MIPS_HI16 and R_MIPS_LO16, all against the symbol with its addend.
 ; Data written as label-$$, or as a label minus a label of this
 ; section, is R_MIPS_PC32, or for 8 bytes the composite R_MIPS_PC32 /
-; R_MIPS_64. The words and the relocation entries are those of llvm-mc
+; R_MIPS_64. A branch to a local label of the same section is resolved
+; here with no relocation (.elfresolve). The words and the relocation
+; entries are those of llvm-mc
 ; 19 (a local label named by its own symbol), and the image linked with
 ; ld.lld is the same.
 ; ===================================================================
@@ -21,6 +23,10 @@ start:
         dla     $t1,ext+0x123456789
         la      $t2,dat
         la      $t3,dat+0x10
+        b       start
+        nop
+        bne     $t0,$t1,start
+        nop
         jr      $ra
         nop
         .section .data

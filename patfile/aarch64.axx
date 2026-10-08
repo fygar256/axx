@@ -114,7 +114,49 @@
 /* checked the same way for their opcode bits, and their computed
 /* slices against independently worked-out values. Paxx and Caxx
 /* agree byte for byte on all of it.
+/*
+/* ELF output (-o). The object is AArch64 (EM_AARCH64, 183) without -m.
+/* Every operand that can hold a symbol carries its relocation, as GNU
+/* as and llvm-mc write it: CALL26 / JUMP26, CONDBR19, TSTBR14,
+/* ADR_PREL_LO21, ADR_PREL_PG_HI21, ADD_ABS_LO12_NC, LDST*_ABS_LO12_NC,
+/* LD_PREL_LO19, MOVW_UABS / MOVW_PREL, ADR_GOT_PAGE, LD64_GOT_LO12_NC.
+/* A branch, adr or literal ldr to a local label of the same section is
+/* resolved here with no relocation, as llvm-mc does (.elfresolve);
+/* adrp and :lo12: keep theirs. The data directives (.byte .hword .word
+/* .quad ...) take ABS16 / ABS32 / ABS64, and data written as label-$$,
+/* or as a label minus a label of the section being assembled, takes
+/* PREL16 / PREL32 / PREL64. asmsrc/aarch64_reloc.s was checked against
+/* llvm-mc 19 and ld.lld 19.
+/* =================================================================== */
+
 /* ===================================================================
+/* ELF description (laid over the built-in AArch64 table)
+/* =================================================================== */
+.elfmachine::183::AArch64
+/* data: absolute by default (the built-in table guesses PREL32 /
+/* PREL16 for 4 and 2 bytes); PC-relative when written so */
+.elfwidth::4::abs32
+.elfwidth::2::abs16
+.elfextern::abs64
+.elfpcguess::1
+/* the branch and literal fields count words */
+.elffield::jump26::0x3ffffff::0::2
+.elffield::call26::0x3ffffff::0::2
+.elffield::condbr19::0xffffe0::0::2
+.elffield::tstbr14::0x7ffe0::0::2
+.elffield::ld_prel_lo19::0xffffe0::0::2
+/* resolved against a local label of the same section */
+.elfresolve::jump26
+.elfresolve::call26
+.elfresolve::condbr19
+.elfresolve::tstbr14
+.elfresolve::ld_prel_lo19
+.elfresolve::adr_prel_lo21
+/* adr splits its 21 bits into immlo (bits 29-30) and immhi (5-23) */
+.elfencode::adr_prel_lo21::adrenc
+.func adrenc(f, a)
+.return (f & 0x9f00001f) | ((a & 3) << 29) | (((a >> 2) & 0x7ffff) << 5)
+.endfunc
 
 /* ===================================================================
 /* Registers
@@ -7671,3 +7713,19 @@ q = .call slq(o, p, w, mx)
 !zasi4d("SMLSLL", 0xc1800008)
 !zasi4d("UMLALL", 0xc1800010)
 !zasi4d("UMLSLL", 0xc1800018)
+
+/* ===================================================================
+/* Data (little-endian), with the GNU names
+/* =================================================================== */
+.BYTE !v :: v
+.HWORD !v :: v,v>>8
+.SHORT !v :: v,v>>8
+.2BYTE !v :: v,v>>8
+.WORD !v :: v,v>>8,v>>16,v>>24
+.LONG !v :: v,v>>8,v>>16,v>>24
+.INT !v :: v,v>>8,v>>16,v>>24
+.4BYTE !v :: v,v>>8,v>>16,v>>24
+.XWORD !v :: v,v>>8,v>>16,v>>24,v>>32,v>>40,v>>48,v>>56
+.QUAD !v :: v,v>>8,v>>16,v>>24,v>>32,v>>40,v>>48,v>>56
+.DWORD !v :: v,v>>8,v>>16,v>>24,v>>32,v>>40,v>>48,v>>56
+.8BYTE !v :: v,v>>8,v>>16,v>>24,v>>32,v>>40,v>>48,v>>56

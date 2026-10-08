@@ -8,6 +8,8 @@
 ; 2. Data written as label-$$: R_PPC64_REL64 / REL32 / REL16 with the
 ;    constant part as the addend (GNU as: .quad / .long / .short ext-.).
 ;    A label of the same section gives a constant and no relocation.
+; 3. A branch to a local label of the same section is resolved here with
+;    no relocation (.elfresolve), as GNU as and llvm-mc do.
  .extern ext
  .section .text
 code0:
@@ -30,6 +32,12 @@ code0:
  lxvp 40,ext+64(1)
  stxvp 34,ext+80@l(1)
  ld 4,dat0+12@l(3)
+loop0:
+ b loop0
+ bl loop0
+ beq loop0
+ bdnz loop0
+ bne cr3,loop0
  blr
  .section .data
 dat0:
