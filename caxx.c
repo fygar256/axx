@@ -4841,10 +4841,15 @@ static uint256_t label_get_value(AsmState *st, const char *k){
                 if(!st->equ_secs[st->equ_nsecs]){ perror("strdup"); exit(1); }
                 st->equ_nsecs++;
             }
-            int64_t _adj = equ_section_relative_offset(st, sec, u256_to_u64(e->value));
+            /* 未定義の番兵（未定義を含む .equ の値）はセクション相対に直さない。
+               64 ビットへ切り詰めると番兵でなくなり、毒が後ろの式へ伝わらない。
+               axx.py の LabelManager.get_value() と同じ。 */
+            int64_t _adj = u256_is_undef(e->value) ? -1
+                         : equ_section_relative_offset(st, sec, u256_to_u64(e->value));
             if(_adj >= 0) ret_val = u256_from_u64((uint64_t)_adj);
         } else if(st->in_binary_list && strcmp(sec, st->current_section) == 0){
-            int64_t _adj = equ_section_relative_offset(st, sec, u256_to_u64(e->value));
+            int64_t _adj = u256_is_undef(e->value) ? -1
+                         : equ_section_relative_offset(st, sec, u256_to_u64(e->value));
             if(_adj >= 0) ret_val = u256_from_u64((uint64_t)_adj);
         }
         int _equ_has_reloc = e->is_equ && (e->reloc_type_override >= 0);
@@ -14248,7 +14253,8 @@ static int adir_resX(Assembler *asmb, const char *l, const char *l2,
     asmb->st.error_undefined_label = 0;
     int io;
     uint256_t x=expr_expression_asm(asmb,l2,0,&io);
-    if(asmb->st.error_undefined_label){
+    /* 未定義を含む .EQU の値（未定義の番兵）も未定義のラベルとして扱う。 */
+    if(asmb->st.error_undefined_label || u256_is_undef(x)){
         if(should_report_errors(&asmb->st)){
             axx_diagf(1, 0, " error - %s argument contains undefined label.\n",directive);
         }
@@ -14302,7 +14308,7 @@ static int adir_zero(Assembler *asmb, const char *l, const char *l2){
     asmb->st.error_undefined_label = 0;
     int io;
     uint256_t x=expr_expression_asm(asmb,l2,0,&io);
-    if(asmb->st.error_undefined_label){
+    if(asmb->st.error_undefined_label || u256_is_undef(x)){
         if(should_report_errors(&asmb->st)){
             axx_diagf(1, 0, " error - .ZERO argument contains undefined label.\n");
         }
@@ -14361,7 +14367,7 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
     if(l2&&l2[0]){
         asmb->st.error_undefined_label = 0;
         int io; uint256_t u=expr_expression_asm(asmb,l2,0,&io);
-        if(asmb->st.error_undefined_label){
+        if(asmb->st.error_undefined_label || u256_is_undef(u)){
             if(should_report_errors(&asmb->st)){
                 axx_diagf(1, 0, " error - .ALIGN argument contains undefined label.\n");
             }
@@ -14396,7 +14402,7 @@ static int adir_org(Assembler *asmb, const char *l, const char *l2){
     asmb->st.error_undefined_label = 0;
     int io;
     uint256_t u=expr_expression_asm(asmb,l2,0,&io);
-    if(asmb->st.error_undefined_label){
+    if(asmb->st.error_undefined_label || u256_is_undef(u)){
         if(should_report_errors(&asmb->st)){
             axx_diagf(1, 0, " error - .ORG argument contains undefined label.\n");
         }
@@ -14406,6 +14412,20 @@ static int adir_org(Assembler *asmb, const char *l, const char *l2){
         if(should_report_errors(&asmb->st)){
             char nb[96]; u256_to_pydec(u, nb, sizeof(nb));
             axx_diagf(1, 0, " error - .ORG address must be non-negative, got %s.\n", nb);
+        }
+        return 1;
+    }
+    /* ELF の各セクションは入ったところから出たところまでの範囲で持つので、
+       後ろへ戻すと範囲が負になったり、書いたものが範囲の外へこぼれたりする
+       （GNU as も後ろへ戻す .org を受け付けない）。axx.py の org_processing() と同じ。 */
+    if((asmb->st.elf_objfile[0] || asmb->st.expfile_elf[0])
+       && u256_gt_signed(asmb->st.pc, u)){
+        if(should_report_errors(&asmb->st)){
+            char nb[96], pb[96];
+            u256_to_pydec(u, nb, sizeof(nb));
+            u256_to_pydec(asmb->st.pc, pb, sizeof(pb));
+            axx_diagf(1, 0, " error - .ORG moves the location counter backwards (from %s "
+                            "to %s); an ELF object (-o, -E) cannot hold that.\n", pb, nb);
         }
         return 1;
     }
@@ -17951,7 +17971,8 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     FILE *fp=fopen(path,"wb");
     if(!fp){
         char _eb[1200]; axx_oserr_str(path, errno, _eb, sizeof(_eb));
-        axx_diagf(1, 0, " error - cannot write '%s': %s\n", path, _eb);
+        /* 文面は axx.py の write_elf_obj() と同じ。 */
+        axx_diagf(1, 0, " error - cannot create ELF output file '%s': %s\n", path, _eb);
         goto weo_done;
     }
 
@@ -20402,6 +20423,39 @@ static void m_exec_block(MacroPP *mp, MBlock *b){
 }
 
 
+/* getline() と同じ形で 1 行読む。行の終わりは LF・CR LF・CR のどれでもよく、
+   返す行の終わりは LF 1 つに直す。axx.py がファイルをテキストモードで読むとき
+   の universal newlines と同じ切り方である（CR だけで改行したファイルも行に
+   分かれる）。 */
+static ssize_t axx_getline_u(char **line, size_t *cap, FILE *f){
+    size_t n = 0;
+    int c = EOF;
+    if(!*line || *cap < 2){
+        char *p = realloc(*line, 128);
+        if(!p){ perror("realloc"); exit(1); }
+        *line = p; *cap = 128;
+    }
+    while((c = getc(f)) != EOF){
+        if(n + 2 > *cap){
+            size_t nc = *cap * 2;
+            char *p = realloc(*line, nc);
+            if(!p){ perror("realloc"); exit(1); }
+            *line = p; *cap = nc;
+        }
+        if(c == '\r'){
+            int d = getc(f);
+            if(d != '\n' && d != EOF) ungetc(d, f);
+            (*line)[n++] = '\n';
+            break;
+        }
+        (*line)[n++] = (char)c;
+        if(c == '\n') break;
+    }
+    if(n == 0 && c == EOF) return -1;
+    (*line)[n] = '\0';
+    return (ssize_t)n;
+}
+
 /* 行を読み込む。行末のバックスラッシュで続く行はつなぎ、つないだぶんだけ
    空行を残すので行番号は入力とずれない。 */
 static void m_read_lines(MacroPP *mp, FILE *f, const char *display, MSrc *out){
@@ -20411,7 +20465,7 @@ static void m_read_lines(MacroPP *mp, FILE *f, const char *display, MSrc *out){
     ssize_t r;
     char *name = marena_strdup(&mp->arena, display);
     char *pending = NULL; size_t pending_len = 0;
-    while((r = getline(&line, &lcap, f)) != -1){
+    while((r = axx_getline_u(&line, &lcap, f)) != -1){
         while(r > 0 && (line[r-1] == '\n' || line[r-1] == '\r')) line[--r] = '\0';
         if(n >= cap){
             int nc = cap * 2;
@@ -21263,15 +21317,16 @@ typedef struct {
     int     nu;
 } OSABIENT;
 
-static OSABIENT osabitbl[]={{"Linux",0},{"linux",0},{"FreeBSD",9},{"freebsd",9},{"EOTBL",-1}};
+static OSABIENT osabitbl[]={{"linux",0},{"freebsd",9},{"EOTBL",-1}};
 
-/* `--osabi` の名前を ELF の OSABI 値にする。大文字小文字を区別しない。 */
-int find_osabi( char *osname ) {
+/* `--osabi` の名前を ELF の OSABI 値にする。大文字小文字を区別しない
+   （axx.py は名前を lower() してから表を引く）。 */
+int find_osabi( const char *osname ) {
     int idx = 0;
     while (1) {
         if (strcmp(osabitbl[idx].s,"EOTBL")==0)
             return -1;
-        if (strcmp(osabitbl[idx].s,osname)==0)
+        if (strcasecmp(osabitbl[idx].s,osname)==0)
             return osabitbl[idx].nu;
         idx++;
     }
@@ -21294,7 +21349,7 @@ int main(int argc, char *argv[]){
     macro_init_pattern(asmb);
 
     const char *patternfile=NULL, *sourcefile=NULL;
-    char osabistr[16]="Linux";
+    const char *osabistr="Linux";
     const char *macro_expand_dest=NULL;
     const char *pat_macro_expand_dest=NULL;
     int elf_desc_only=0;
@@ -21304,7 +21359,7 @@ int main(int argc, char *argv[]){
             print_help(argv[0]);
             return 0;
         }
-        if(strcmp(argv[i],"--osabi")==0&&i+1<argc&&argv[i+1][0]!='-'){ strncpy(osabistr,argv[++i],sizeof(osabistr)-1); }
+        if(strcmp(argv[i],"--osabi")==0&&i+1<argc&&argv[i+1][0]!='-'){ osabistr = argv[++i]; }
         else if(strcmp(argv[i],"-b")==0&&i+1<argc&&argv[i+1][0]!='-'){ st->outfile = argv[++i]; }
         else if(strcmp(argv[i],"-e")==0&&i+1<argc&&argv[i+1][0]!='-'){ st->expfile = argv[++i]; }
         else if(strcmp(argv[i],"-E")==0&&i+1<argc&&argv[i+1][0]!='-'){ st->expfile_elf = argv[++i]; }
@@ -21316,7 +21371,7 @@ int main(int argc, char *argv[]){
             else if(strcmp(_fs,"32")==0){ st->elf_class = 1; }
             else {
                 axx_diagf(0, 0, " error - -f: invalid choice: %s (choose from 32, 64)\n", _fs);
-                return 1;
+                return 2;   /* axx.py（argparse）と同じ終了コード */
             }
         }
         else if(strcmp(argv[i],"-m")==0&&i+1<argc
@@ -21329,7 +21384,7 @@ int main(int argc, char *argv[]){
             if(_mend == _mstr || *_mend != '\0' || errno == ERANGE){
                 char _mq[600]; m_pyrepr(_mstr, _mq, sizeof(_mq));
                 axx_diagf(0, 0, " error - -m/--machine: invalid int value: %s\n", _mq);
-                return 1;
+                return 2;   /* axx.py（argparse）と同じ終了コード */
             }
             int _mval = (int)_mlong;
             if(_mlong < 0 || _mlong > 65535){
@@ -21394,7 +21449,7 @@ int main(int argc, char *argv[]){
             else{
                 fprintf(stderr,"error: unexpected extra argument '%s'.\n",argv[i]);
                 print_usage(argv[0]);
-                return 1;
+                return 2;   /* axx.py（argparse）と同じ終了コード */
             }
         }
         else if(strcmp(argv[i],"--osabi")==0||strcmp(argv[i],"-b")==0
@@ -21416,8 +21471,9 @@ int main(int argc, char *argv[]){
 
     int osa = find_osabi(osabistr);
     if (osa==-1) {
+        /* 文面は axx.py と同じ（表の名前を Python のリストの形で並べる）。 */
         fprintf(stderr, "warning: unknown --osabi value '%s'; "
-                "valid choices are Linux/linux/FreeBSD/freebsd. Using 'Linux'.\n",
+                "valid choices are ['linux', 'freebsd'] (case-insensitive). Using 'Linux'.\n",
                 osabistr);
         osa = find_osabi("Linux");
     }
@@ -21533,7 +21589,7 @@ int main(int argc, char *argv[]){
         if(!lf){ exit_code=1; goto cleanup; }
         StrVec _implines; sv_init(&_implines);
         { char *l=NULL; size_t lc=0;
-          while(getline(&l,&lc,lf)!=-1) sv_push(&_implines, l);
+          while(axx_getline_u(&l,&lc,lf)!=-1) sv_push(&_implines, l);
           free(l); }
         fclose(lf);
         for(int _phase=0; _phase<2; _phase++){

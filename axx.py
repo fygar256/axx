@@ -159,6 +159,22 @@ VLIW_STOP = chr(0x93)
 # VAR_UNDEF はパターン変数側の未束縛値で、マッチしなかった省略可能
 # オペランドが 0 として読まれるのと同じ 0。
 UNDEF = (1 << 1024) - 1
+
+
+def _byte_char(c):
+    """1 バイトで書かれた文字ならそのバイトの値、そうでなければ None。
+
+    ソースは surrogateescape で読むので、UTF-8 として読めないバイトは
+    U+DC80〜U+DCFF の代用の文字になっている。caxx.c はバイト単位で読むので、
+    文字定数 `'c'` になれるのは 1 バイトの文字（ASCII か、読めない 1 バイト）
+    だけで、値はそのバイトになる。
+    """
+    o = ord(c)
+    if o < 0x80:
+        return o
+    if 0xDC80 <= o <= 0xDCFF:
+        return o - 0xDC00
+    return None
 VAR_UNDEF = 0
 
 # `.check` の許可リストに `""` が書かれたときに積む印。「その位置は省略可、
@@ -2189,7 +2205,8 @@ class StringUtils:
                     return k + 1
             elif j + 2 < len(s) and s[j + 2] == '\'':
                 return j + 3
-        elif j < len(s) and j + 1 < len(s) and s[j + 1] == '\'':
+        elif (j < len(s) and j + 1 < len(s) and s[j + 1] == '\''
+              and _byte_char(s[j]) is not None):
             return j + 2
         return i + 1
 
@@ -2208,7 +2225,10 @@ class StringUtils:
             return True, int(hex_digits, 16), j + 1
         return False, 0, idx
 
-    _SPACE_RUNS = re.compile(r'\s{2,}')
+    # 潰すのはスペース・タブ・LF・CR の連なりだけ（1 文字でも 1 個のスペースに
+    # する）。caxx.c の axx_reduce_spaces() と同じ。\s は \f や Unicode の空白にも
+    # 当たる。
+    _SPACE_RUNS = re.compile(r'[ \t\n\r]+')
 
     @staticmethod
     def reduce_spaces(text):
@@ -2368,13 +2388,15 @@ class StringUtils:
                 i = j
                 continue
             elif ch == ';' and not in_dquote:
-                return ''.join(out).rstrip(), l[i:].rstrip()
+                # 落とす空白は caxx.c の axx_split_comment_asm() と同じ文字だけ
+                # （引数なしの rstrip() は \f や Unicode の空白まで落とす）。
+                return ''.join(out).rstrip(' \t'), l[i:].rstrip(' \t\n\r')
 
             out.append(ch)
             i += 1
         if in_dquote:
             diag(f" warning - unterminated string literal in line: {l!r}", set_error=False)
-        return ''.join(out).rstrip(), ''
+        return ''.join(out).rstrip(' \t\n\r'), ''
 
     @staticmethod
     def resolve_vliw_escapes(l):
@@ -3222,7 +3244,9 @@ class LabelManager:
         ranges = [(rs, rl) for (rn, rs, rl) in self.state.section_ranges if rn == name]
         cum = 0
         for rs, rl in ranges:
-            if rs <= word_pc < rs + rl:
+            # 範囲の終わりちょうど（セクションを出る直前に置いたラベル）も
+            # その範囲に入れる。caxx.c の addr_to_word_offset() と同じ。
+            if rs <= word_pc <= rs + rl:
                 return cum + (word_pc - rs)
             cum += rl
         entry = self.state.sections.get(name)
@@ -3276,15 +3300,18 @@ class LabelManager:
                      f"  [{_fn}:{_ln}]", set_error=True)
             return v
         _sec = self.state.labels[k][1]
+        # 未定義の番兵（未定義を含む .equ の値）はセクション相対に直さない。
+        # 直すと番兵でなくなり、毒が後ろの式へ伝わらない。caxx.c の
+        # label_get_value() と同じ。
         if self.state._equ_sections_touched is not None:
             self.state._equ_sections_touched.add(_sec)
 
-            _adj = self._section_relative_offset(_sec, v)
+            _adj = None if _undef(v) else self._section_relative_offset(_sec, v)
             if _adj is not None:
                 v = _adj
         elif self.state._in_binary_list and _sec == self.state.current_section:
 
-            _adj = self._section_relative_offset(_sec, v)
+            _adj = None if _undef(v) else self._section_relative_offset(_sec, v)
             if _adj is not None:
                 v = _adj
 
@@ -3814,8 +3841,9 @@ class ExpressionEvaluator:
             idx += 4
         elif (_hexlit := StringUtils.parse_hex_char_literal(s, idx))[0]:
             x, idx = _hexlit[1], _hexlit[2]
-        elif idx + 3 <= len(s) and s[idx] == '\'' and s[idx + 1] != '\\' and s[idx + 2] == '\'':
-            x = ord(s[idx + 1])
+        elif (idx + 3 <= len(s) and s[idx] == '\'' and s[idx + 1] != '\\' and s[idx + 2] == '\''
+              and _byte_char(s[idx + 1]) is not None):
+            x = _byte_char(s[idx + 1])
             idx += 3
         elif StringUtils.q(s, '$$', idx):
             idx += 2
@@ -10184,7 +10212,9 @@ class AssemblyDirectiveProcessor:
             return False
         self.state.error_undefined_label = False
         x, idx = self.expr_eval.expression_asm(l2, 0)
-        if self.state.error_undefined_label:
+        # 未定義を含む .EQU の値（未定義の番兵）も未定義のラベルとして扱う。
+        # caxx.c の adir_resb() など（u256_is_undef()）と同じ。
+        if self.state.error_undefined_label or _undef(x):
             self.state.diag(f" error - {_directive} argument contains undefined label.", set_error=True)
             return True
         try:
@@ -10209,7 +10239,7 @@ class AssemblyDirectiveProcessor:
             return False
         self.state.error_undefined_label = False
         x, idx = self.expr_eval.expression_asm(l2, 0)
-        if self.state.error_undefined_label:
+        if self.state.error_undefined_label or _undef(x):
             self.state.diag(" error - .ZERO argument contains undefined label.", set_error=True)
             return True
         try:
@@ -10289,7 +10319,7 @@ class AssemblyDirectiveProcessor:
         if l2 != '':
             self.state.error_undefined_label = False
             u, idx = self.expr_eval.expression_asm(l2, 0)
-            if self.state.error_undefined_label:
+            if self.state.error_undefined_label or _undef(u):
                 self.state.diag(" error - .ALIGN argument contains undefined label.", set_error=True)
                 return True
             try:
@@ -10720,7 +10750,7 @@ class AssemblyDirectiveProcessor:
             return False
         self.state.error_undefined_label = False
         u, idx = self.expr_eval.expression_asm(l2, 0)
-        if self.state.error_undefined_label:
+        if self.state.error_undefined_label or _undef(u):
             self.state.diag(" error - .ORG argument contains undefined label.", set_error=True)
             return True
         try:
@@ -10730,6 +10760,14 @@ class AssemblyDirectiveProcessor:
             return True
         if u < 0:
             self.state.diag(f" error - .ORG address must be non-negative, got {u}.", set_error=True)
+            return True
+        # ELF の各セクションは入ったところから出たところまでの範囲で持つので、
+        # 後ろへ戻すと範囲が負になったり、書いたものが範囲の外へこぼれたりする
+        # （GNU as も後ろへ戻す .org を受け付けない）。caxx.c の adir_org() と同じ。
+        if (self.state.elf_objfile or self.state.expfile_elf) and u < self.state.pc:
+            self.state.diag(f" error - .ORG moves the location counter backwards (from "
+                            f"{self.state.pc} to {u}); an ELF object (-o, -E) cannot "
+                            f"hold that.", set_error=True)
             return True
         if idx + 2 <= len(l2) and l2[idx:idx + 2].upper() == ',P':
             if u > self.state.pc:
@@ -10746,6 +10784,8 @@ class AssemblyDirectiveProcessor:
 
 
 
+# マクロ層で落とす空白はスペースとタブだけ（caxx.c の m_ 系の関数と同じ）。
+# 引数なしの strip() は \f や Unicode の空白まで落とすので使わない。
 _MACRO_MAX_DEPTH = 200
 _MACRO_MAX_ITER = 1000000
 _MACRO_MAX_LINES = 2000000
@@ -10800,7 +10840,7 @@ def _sext_tick_at(s, i):
     j = i + 1
     while j < len(s) and s[j] in ' \t':
         j += 1
-    return j < len(s) and (s[j].isdigit() or s[j] == '(')
+    return j < len(s) and (_ad(s[j]) or s[j] == '(')
 
 
 def _fmt_pos(pos):
@@ -10831,11 +10871,11 @@ def _strip_comment(text, pat_mode=False):
                 quote = c
         elif pat_mode:
             if c == '/' and text[i + 1:i + 2] == '*':
-                return text[:i].rstrip()
+                return text[:i].rstrip(' \t')
         elif c == ';':
-            return text[:i].rstrip()
+            return text[:i].rstrip(' \t')
         i += 1
-    return text.rstrip()
+    return text.rstrip(' \t')
 
 
 
@@ -10880,9 +10920,9 @@ class _ExprParser:
         """次がそのトークンなら消費して真。"""
         self.skip()
         if self.s.startswith(tok, self.i):
-            if tok[-1].isalpha():
+            if _aa(tok[-1]):
                 j = self.i + len(tok)
-                if j < self.n and (self.s[j].isalnum() or self.s[j] == '_'):
+                if j < self.n and (_aan(self.s[j]) or self.s[j] == '_'):
                     return False
             self.i += len(tok)
             return True
@@ -11076,7 +11116,7 @@ class _ExprParser:
                 self.i += 1
                 r = self.multiplicative()
                 if isinstance(v, str) or isinstance(r, str):
-                    v = _as_str(v) + _as_str(r)
+                    v = _mnorm(_as_str(v) + _as_str(r))
                 else:
                     v = v + r
             elif self.s.startswith('-', self.i):
@@ -11169,8 +11209,8 @@ class _ExprParser:
 
         if c == "'":
             t = self.read_string("'")
-            if len(t) == 1:
-                return ord(t)
+            if len(_mb(t)) == 1:
+                return _mb(t)[0]
             return t
 
         if c == '$':
@@ -11179,10 +11219,10 @@ class _ExprParser:
                 self.i += 1
             return self.pp.loc_counter(self.pos)
 
-        if c.isdigit():
+        if _ad(c):
             return self.read_number()
 
-        if c == '_' or c.isalpha():
+        if c == '_' or _aa(c):
             name = self.read_ident()
             if name == 'defined':
                 self.expect('(')
@@ -11214,7 +11254,7 @@ class _ExprParser:
         """識別子を 1 個読む。"""
         self.skip()
         j = self.i
-        while j < len(self.s) and (self.s[j].isalnum() or self.s[j] == '_'):
+        while j < len(self.s) and (_aan(self.s[j]) or self.s[j] == '_'):
             j += 1
         if j == self.i:
             self.err("expected a name")
@@ -11243,7 +11283,7 @@ class _ExprParser:
             txt, base = s[j + 2:k], 8
         else:
             k = j
-            while k < len(s) and (s[k].isdigit() or s[k] == '_'):
+            while k < len(s) and (_ad(s[k]) or s[k] == '_'):
                 k += 1
             txt, base = s[j:k], 10
         txt = txt.replace('_', '')
@@ -11403,12 +11443,12 @@ def _echo_items_parse(text):
         buf.append(c)
         k += 1
     parts.append(''.join(buf))
-    if len(parts) == 1 and parts[0].strip() == '':
+    if len(parts) == 1 and parts[0].strip(' \t') == '':
         return [], None
 
     items = []
     for p in parts:
-        p = p.strip()
+        p = p.strip(' \t')
         if p == '':
             return None, "empty item in the argument list"
         if p[0] == '"':
@@ -11445,10 +11485,50 @@ def _echo_items_cached(text):
     return ent
 
 
+# マクロ層の文字列は、ミニ言語と同じく UTF-8 のバイトの並びとして扱う
+# （caxx.c は C 文字列をそのまま持つ）。長さ・添字・大文字化・比較・1 文字の
+# 文字定数はバイトで決める。Python の str は文字単位なので、ここで変換する。
+def _mb(s):
+    """マクロ層の文字列を UTF-8 のバイト列にする。"""
+    return s.encode('utf-8', 'surrogateescape')
+
+
+def _mt(b):
+    """バイト列を文字列に戻す。途中で切れた UTF-8 は surrogateescape の文字になる。"""
+    return b.decode('utf-8', 'surrogateescape')
+
+
+def _mnorm(s):
+    """連結などで割れた UTF-8 をつなぎ直す（バイト列として同じなら同じ文字列にする）。"""
+    return _mt(_mb(s))
+
+
+def _ad(c):
+    """ASCII の数字か。str.isdigit() は全角数字や上付きの数字も数字とみなす。"""
+    return '0' <= c <= '9'
+
+
+def _aa(c):
+    """ASCII の英字か。"""
+    return ('a' <= c <= 'z') or ('A' <= c <= 'Z')
+
+
+def _aan(c):
+    """ASCII の英数字か。caxx.c の isalnum() と同じ範囲。"""
+    return _ad(c) or _aa(c)
+
+
+def _alow(s):
+    """ASCII だけを小文字にする。caxx.c の strcasecmp() と同じ範囲。"""
+    return ''.join(chr(ord(c) + 32) if 'A' <= c <= 'Z' else c for c in s)
+
+
 def _cmp_eq(a, b):
     """`==` の比較。整数と文字列が混ざる場合の規則をここに閉じる。"""
     if isinstance(a, str) != isinstance(b, str):
         return False
+    if isinstance(a, str):
+        return _mb(a) == _mb(b)
     return a == b
 
 
@@ -11458,6 +11538,8 @@ def _cmp_lt_eq(p, a, b, or_equal):
         if getattr(p, 'suppress', 0):
             return False
         p.err("cannot order a string against an integer")
+    if isinstance(a, str):
+        a, b = _mb(a), _mb(b)
     return (a <= b) if or_equal else (a < b)
 
 
@@ -11589,7 +11671,7 @@ class MacroPreprocessor:
 
     def eval(self, text, pos):
         """マクロ式を 1 個評価する。"""
-        text = text.strip()
+        text = text.strip(' \t')
         if text == '':
             raise MacroError(f"{_fmt_pos(pos)}: empty macro expression")
         return _ExprParser(text, self, pos).parse()
@@ -11606,7 +11688,7 @@ class MacroPreprocessor:
             emitted = self.out[mark]
             del self.out[mark:]
             raise MacroError(f"{_fmt_pos(pos)}: macro '{name}' emits source text "
-                             f"({emitted[0].strip()!r}) but was called from inside an "
+                             f"({emitted[0].strip(' \t')!r}) but was called from inside an "
                              f"expression, where there is nowhere to put it")
         return value
 
@@ -11725,7 +11807,7 @@ class MacroPreprocessor:
                 if '?' in body[:k]:
                     k += 1
                     continue
-                spec = body[k + 1:].strip()
+                spec = body[k + 1:].strip(' \t')
                 body = body[:k]
                 break
             k += 1
@@ -11744,11 +11826,11 @@ class MacroPreprocessor:
     @staticmethod
     def statement_word(text):
         """行頭の `!` 文のキーワードと残りを取り出す。"""
-        t = text.lstrip()
+        t = text.lstrip(' \t')
         if not t.startswith('!') or t.startswith('!!'):
             return None, None
         j = 1
-        while j < len(t) and (t[j].isalnum() or t[j] == '_'):
+        while j < len(t) and (_aan(t[j]) or t[j] == '_'):
             j += 1
         if j == 1:
             return None, None
@@ -11761,7 +11843,7 @@ class MacroPreprocessor:
         while i < n:
             text, fn, ln = lines[i]
             pos = (fn, ln)
-            stripped = text.strip()
+            stripped = text.strip(' \t')
 
             if stripped.startswith('}') and depth > 0:
                 return nodes, i
@@ -11772,7 +11854,7 @@ class MacroPreprocessor:
                 i += 1
                 continue
 
-            lw = word.lower()
+            lw = _alow(word)
             if lw not in _MACRO_KEYWORDS and word not in self.funcs \
                     and word not in self.declared and not self.looks_like_call(rest):
                 nodes.append(('text', text, pos))
@@ -11804,7 +11886,7 @@ class MacroPreprocessor:
     @staticmethod
     def looks_like_call(rest):
         """行の残りがマクロ呼び出しの形か。"""
-        r = rest.strip()
+        r = rest.strip(' \t')
         return r.startswith('(')
 
     def parse_simple(self, lw, word, rest, pos):
@@ -11813,40 +11895,40 @@ class MacroPreprocessor:
             if '=' not in rest:
                 raise MacroError(f"{_fmt_pos(pos)}: '!set' needs 'name = expression'")
             name, expr = rest.split('=', 1)
-            return ('set', name.strip(), expr, pos)
+            return ('set', name.strip(' \t'), expr, pos)
         if lw == 'local':
             if '=' in rest:
                 name, expr = rest.split('=', 1)
-                return ('local', name.strip(), expr, pos)
-            return ('local', rest.strip(), None, pos)
+                return ('local', name.strip(' \t'), expr, pos)
+            return ('local', rest.strip(' \t'), None, pos)
         if lw == 'undef':
-            return ('undef', rest.strip(), pos)
+            return ('undef', rest.strip(' \t'), pos)
         if lw == 'return':
-            return ('return', rest.strip() or None, pos)
+            return ('return', rest.strip(' \t') or None, pos)
         if lw == 'break':
             return ('break', pos)
         if lw == 'continue':
             return ('continue', pos)
         if lw in ('error', 'warning', 'echo'):
-            return (lw, rest.strip(), pos)
+            return (lw, rest.strip(' \t'), pos)
         if lw == 'include':
-            return ('include', rest.strip(), pos)
-        return ('call', word, rest.strip(), pos)
+            return ('include', rest.strip(' \t'), pos)
+        return ('call', word, rest.strip(' \t'), pos)
 
     def parse_header(self, text, kw, pos):
         """ブロック文のヘッダを解析する。開き `{` はヘッダ行の最後に要る。"""
-        t = text.strip()
+        t = text.strip(' \t')
         body = t[len(kw) + 1:]
-        if not body.rstrip().endswith('{'):
+        if not body.rstrip(' \t').endswith('{'):
             raise MacroError(f"{_fmt_pos(pos)}: '!{kw}' header must end with '{{'")
-        body = body.rstrip()[:-1]
+        body = body.rstrip(' \t')[:-1]
         if kw == 'if' or kw == 'elif':
-            low = body.lower()
+            low = _alow(body)
             k = low.rfind('!then')
             if k < 0:
                 raise MacroError(f"{_fmt_pos(pos)}: '!{kw}' needs '!then' before '{{'")
             body = body[:k]
-        return body.strip()
+        return body.strip(' \t')
 
     def parse_if(self, lines, i, depth):
         """`!if` / `!elif` / `!else` の連なりを解析する。"""
@@ -11862,17 +11944,17 @@ class MacroPreprocessor:
                 raise MacroError(f"{_fmt_pos(pos)}: '!if' block is never closed with '}}'")
             close, cfn, cln = lines[i]
             cpos = (cfn, cln)
-            tail = _strip_comment(close, self.pat_mode).strip()[1:].strip()
+            tail = _strip_comment(close, self.pat_mode).strip(' \t')[1:].strip(' \t')
             if tail == '' or tail.startswith(';'):
                 return ('if', arms, else_body, pos), i + 1
             w, rest = self.statement_word(tail)
             if w is None:
                 raise MacroError(f"{_fmt_pos(cpos)}: unexpected text after '}}': {tail!r}")
-            if w.lower() == 'elif':
+            if _alow(w) == 'elif':
                 cond = self.parse_header(tail, 'elif', cpos)
                 continue
-            if w.lower() == 'else':
-                r = rest.strip()
+            if _alow(w) == 'else':
+                r = rest.strip(' \t')
                 if r.startswith('!if'):
                     cond = self.parse_header(r, 'if', cpos)
                     continue
@@ -11881,7 +11963,7 @@ class MacroPreprocessor:
                 else_body, i = self.parse_block(lines, i + 1, depth + 1)
                 if i >= len(lines):
                     raise MacroError(f"{_fmt_pos(cpos)}: '!else' block is never closed")
-                trailer = _strip_comment(lines[i][0], self.pat_mode).strip()[1:].strip()
+                trailer = _strip_comment(lines[i][0], self.pat_mode).strip(' \t')[1:].strip(' \t')
                 if trailer and not trailer.startswith(';'):
                     raise MacroError(f"{lines[i][1]}:{lines[i][2]}: unexpected text "
                                      f"after '}}': {trailer!r}")
@@ -11896,7 +11978,7 @@ class MacroPreprocessor:
         body, i = self.parse_block(lines, i + 1, depth + 1)
         if i >= len(lines):
             raise MacroError(f"{_fmt_pos(pos)}: '!while' block is never closed with '}}'")
-        trailer = _strip_comment(lines[i][0], self.pat_mode).strip()[1:].strip()
+        trailer = _strip_comment(lines[i][0], self.pat_mode).strip(' \t')[1:].strip(' \t')
         if trailer and not trailer.startswith(';'):
             raise MacroError(f"{lines[i][1]}:{lines[i][2]}: unexpected text after "
                              f"'}}': {trailer!r}")
@@ -11906,32 +11988,32 @@ class MacroPreprocessor:
         """`!def` を解析する。既定値付きの引数を受ける。"""
         text, fn, ln = lines[i]
         pos = (fn, ln)
-        t = _strip_comment(text, self.pat_mode).strip()[4:].strip()
-        if not t.rstrip().endswith('{'):
+        t = _strip_comment(text, self.pat_mode).strip(' \t')[4:].strip(' \t')
+        if not t.rstrip(' \t').endswith('{'):
             raise MacroError(f"{_fmt_pos(pos)}: '!def' header must end with '{{'")
-        t = t.rstrip()[:-1].strip()
+        t = t.rstrip(' \t')[:-1].strip(' \t')
         if '(' not in t or not t.endswith(')'):
             raise MacroError(f"{_fmt_pos(pos)}: '!def' needs 'name(p1, p2, ...)'")
         name, plist = t.split('(', 1)
-        name = name.strip()
-        plist = plist[:-1].strip()
-        if not name or not (name[0].isalpha() or name[0] == '_') \
-                or not all(c.isalnum() or c == '_' for c in name):
+        name = name.strip(' \t')
+        plist = plist[:-1].strip(' \t')
+        if not name or not (_aa(name[0]) or name[0] == '_') \
+                or not all(_aan(c) or c == '_' for c in name):
             raise MacroError(f"{_fmt_pos(pos)}: bad macro name {name!r}")
-        if name.lower() in _MACRO_KEYWORDS or name in _BUILTINS:
+        if _alow(name) in _MACRO_KEYWORDS or name in _BUILTINS:
             raise MacroError(f"{_fmt_pos(pos)}: '{name}' is a reserved macro name")
         params, defaults = [], []
         if plist:
             for p in plist.split(','):
-                p = p.strip()
+                p = p.strip(' \t')
                 if '=' in p:
                     pn, dv = p.split('=', 1)
-                    params.append(pn.strip())
-                    defaults.append(dv.strip())
+                    params.append(pn.strip(' \t'))
+                    defaults.append(dv.strip(' \t'))
                 else:
                     params.append(p)
                     defaults.append(None)
-                if not params[-1] or not (params[-1][0].isalpha() or params[-1][0] == '_'):
+                if not params[-1] or not (_aa(params[-1][0]) or params[-1][0] == '_'):
                     raise MacroError(f"{_fmt_pos(pos)}: bad parameter name "
                                      f"{params[-1]!r} in '!def {name}'")
         seen = None
@@ -11946,7 +12028,7 @@ class MacroPreprocessor:
         body, i = self.parse_block(lines, i + 1, depth + 1)
         if i >= len(lines):
             raise MacroError(f"{_fmt_pos(pos)}: '!def {name}' block is never closed")
-        trailer = _strip_comment(lines[i][0], self.pat_mode).strip()[1:].strip()
+        trailer = _strip_comment(lines[i][0], self.pat_mode).strip(' \t')[1:].strip(' \t')
         if trailer and not trailer.startswith(';'):
             raise MacroError(f"{lines[i][1]}:{lines[i][2]}: unexpected text after "
                              f"'}}': {trailer!r}")
@@ -12073,7 +12155,7 @@ class MacroPreprocessor:
 
     def parse_args(self, argtext, pos):
         """マクロ呼び出しの引数を解析する。"""
-        t = argtext.strip()
+        t = argtext.strip(' \t')
         if t.startswith(';') or t == '':
             return []
         if not t.startswith('('):
@@ -12090,7 +12172,7 @@ class MacroPreprocessor:
                     continue
                 p.expect(')')
                 break
-        rest = p.s[p.i:].strip()
+        rest = p.s[p.i:].strip(' \t')
         if rest and not rest.startswith(';'):
             raise MacroError(f"{_fmt_pos(pos)}: unexpected text after macro call: "
                              f"{rest!r}")
@@ -12148,7 +12230,7 @@ class MacroPreprocessor:
     def contains_macros(self, raw):
         """ソース側に展開すべきものがあるか（軽い前判定）。"""
         for t in raw:
-            if '!' in t or t.lstrip().startswith('}'):
+            if '!' in t or t.lstrip(' \t').startswith('}'):
                 return True
         return False
 
@@ -12165,7 +12247,7 @@ class MacroPreprocessor:
     def has_macro_constructs(self, raw):
         """パターン側に展開すべきものがあるか（軽い前判定）。"""
         for t in raw:
-            s = t.lstrip()
+            s = t.lstrip(' \t')
             if s.startswith('}'):
                 return True
             if self.has_interpolation(t):
@@ -12173,7 +12255,7 @@ class MacroPreprocessor:
             word, rest = self.statement_word(s)
             if word is None:
                 continue
-            if word.lower() in _MACRO_KEYWORDS or word in self.funcs \
+            if _alow(word) in _MACRO_KEYWORDS or word in self.funcs \
                     or word in self.declared or self.looks_like_call(rest):
                 return True
         return False
@@ -12238,7 +12320,7 @@ def _bi_check(pp, args, pos, name, lo, hi=None):
 def _bi_len(pp, a, pos):
     """`len(s)` — 文字列の長さ。"""
     _bi_check(pp, a, pos, 'len', 1)
-    return len(a[0]) if isinstance(a[0], str) else len(str(a[0]))
+    return len(_mb(a[0])) if isinstance(a[0], str) else len(str(a[0]))
 
 
 def _bi_hex(pp, a, pos):
@@ -12284,19 +12366,19 @@ def _bi_int(pp, a, pos):
 def _bi_upper(pp, a, pos):
     """`upper(s)`。"""
     _bi_check(pp, a, pos, 'upper', 1)
-    return _as_str(a[0]).upper()
+    return _mt(_mb(_as_str(a[0])).upper())
 
 
 def _bi_lower(pp, a, pos):
     """`lower(s)`。"""
     _bi_check(pp, a, pos, 'lower', 1)
-    return _as_str(a[0]).lower()
+    return _mt(_mb(_as_str(a[0])).lower())
 
 
 def _bi_substr(pp, a, pos):
     """`substr(s, start[, len])`。"""
     _bi_check(pp, a, pos, 'substr', 2, 3)
-    s = _as_str(a[0])
+    s = _mb(_as_str(a[0]))
     start = a[1]
     if not isinstance(start, int):
         raise MacroError(f"{_fmt_pos(pos)}: substr() index must be an integer")
@@ -12315,7 +12397,7 @@ def _bi_substr(pp, a, pos):
         cnt = 0
     if start + cnt > ln:
         cnt = ln - start
-    return s[start:start + cnt]
+    return _mt(s[start:start + cnt])
 
 
 def _bi_abs(pp, a, pos):
@@ -12457,8 +12539,10 @@ class Assembler:
         """
         l, idx = StringUtils.get_param_to_spc(line, idx)
         l2, idx = StringUtils.get_param_to_eon(line, idx)
-        l = l.rstrip()
-        l2 = l2.rstrip()
+        # 落とすのはスペースとタブだけ。caxx.c の lineassemble2_impl() と同じ
+        # （引数なしの rstrip() は \f や Unicode の空白まで落とす）。
+        l = l.rstrip(' \t')
+        l2 = l2.rstrip(' \t')
         l = l.replace(' ', '')
 
         # 未定義ラベルの印はこの命令の評価だけのもの。前の行（`.global` など）で
@@ -15776,6 +15860,14 @@ class Assembler:
 
 def main():
     """コマンドとしての入口。終了コードを決める。"""
+    # ソースは surrogateescape で読むので、UTF-8 でないバイトは代用の文字のまま
+    # 運ばれる。一覧や診断に書くときもそのバイトに戻す（caxx.c は元のバイトを
+    # そのまま書く）。既定の strict では UnicodeEncodeError で落ちる。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors='surrogateescape')
+        except (AttributeError, ValueError):
+            pass
     if sys.getrecursionlimit() < _EXPR_RECLIMIT:
         sys.setrecursionlimit(_EXPR_RECLIMIT)
     assembler = Assembler()

@@ -51,7 +51,7 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all fifty-seven bundled pattern/source pairs with
+exactly that: `test1` assembles all fifty-nine bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the five `.textmode` pairs it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` and `ministr.axx` pairs the `.echo` lines each one writes to standard
@@ -248,7 +248,7 @@ axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV]
 | `-o OBJ_FILE` | Write ELF relocatable object; class selected by `-f` |
 | `-f {32,64}` | ELF class for `-o`. Default: the pattern file's `.elfclass`, else the machine's conventional class (section 3.7.7) |
 | `-m MACHINE` | ELF `e_machine` value. Default: the pattern file's `.elfmachine`, else 62 (`EM_X86_64`). A number outside the built-in table is accepted too (section 3.7.7) |
-| `--osabi ELF_OSABI` | ELF OSABI. Default FreeBSD; FreeBSD/Linux, case-insensitive |
+| `--osabi ELF_OSABI` | ELF OSABI. Default Linux; FreeBSD/Linux, case-insensitive |
 | `-e EXPORT_TSV` | Export labels to TSV (plain format) |
 | `-E EXPORT_ELF_TSV` | Export labels to TSV (with ELF section flags) |
 | `-i IMPORT_TSV` | Import labels from TSV |
@@ -315,6 +315,19 @@ honored, with a warning.
   argument as the output file only when both the pattern file and the source
   file have already been given: `caxx pat.axx src.s -P out.s`. `-p` follows the
   same rule.
+- A command-line mistake (an unknown option, a missing or invalid value, an
+  extra argument) stops both with exit status 2, but the wording and the usage
+  text differ: `axx.py` uses the format of Python's argparse, `caxx` its own.
+  The `-h` help text differs too.
+- When a diagnostic quotes non-ASCII UTF-8 text, `axx.py` escapes the
+  characters Python's `repr()` does not print (spaces such as U+00A0 become
+  `\xa0`), where `caxx` writes the bytes as they are. Where and how many
+  diagnostics appear is the same.
+- The characters used internally to split VLIW bundles differ: `caxx` uses the
+  single bytes 0xFE / 0xFF, `axx.py` U+0092 / U+0093. Writing those characters
+  in a source (Latin-1 `þ` `ÿ`, or the C1 controls) makes each implementation
+  mistake them for a separator in a different place. UTF-8 sources never
+  contain the bytes 0xFE / 0xFF.
 
 ### 2.4 Prompt mode
 
@@ -3520,6 +3533,17 @@ Lines read from a source file or from stdin are called **assembly lines**.
 Comments start with `;`. A comment is dropped, except in text replacement mode
 (section 3.18), where it stays in the output spelled as written.
 
+- **Line ends.** A line ends at LF, CR LF or CR (a file that breaks its lines
+  with CR alone is split into lines as well). Pattern files are read the same
+  way.
+- **White space.** Only spaces and tabs separate words. `\f` (form feed),
+  `\v`, the no-break space (U+00A0), the ideographic space (U+3000) and the
+  like are read as ordinary characters, so inside a mnemonic or at the start or
+  the end of a line they make the match fail.
+- **Encoding.** A source is read as UTF-8. Bytes that are not valid UTF-8 are
+  carried as they are: `.ascii` puts those bytes in the output, and the `-v`
+  listing writes them unchanged.
+
 ### 5.1 Labels
 
 ```
@@ -3545,6 +3569,16 @@ letters, digits, `_` and `.`.
 
 `.org` sets the location counter. With `,p`, if the counter is currently below
 the target, the gap is padded.
+
+In a raw binary (`-b`), `.org` may move the counter back and overwrite what was
+written before. In an ELF object (`-o`) and in the export with sections (`-E`),
+a `.org` that moves backwards is an error (as in GNU as): each section is held
+as ranges from where it was entered to where it was left, and moving backwards
+would make a range negative or let what was written fall outside it.
+
+When the argument of `.org`, `.align`, `.zero`, `.resb` and the like contains an
+undefined label (including the value of an `.equ` that contains one), the line
+reports "argument contains undefined label" and does nothing.
 
 ```
 .align 16
@@ -3848,6 +3882,7 @@ pattern variables cannot be referenced from an assembly line.**
 | `%%` | Number of times `%%` has appeared so far (index from 0) |
 | `$$` | Current location counter |
 | `$.` | Start address of the following instruction |
+| `'c'` | Character constant. `c` is a one-byte character (ASCII, or a single byte that is not valid UTF-8) and the value is that byte; the escapes `'\n'` `'\t'` `'\xHH'` ... work too. A multi-byte UTF-8 character such as `'é'` is not a character constant |
 
 ### 6.2 Operators
 
@@ -4066,7 +4101,15 @@ unary:  -  +  ~  !
 `/` and `%` truncate toward zero as in C (`-7/2 == -3`). `+` concatenates if
 either operand is a string; `"ab" * 3` repeats. Integer literals: `10`,
 `0x1f`, `0b1010`, `0o17`, underscores permitted. `'A'` is a character code if
-it is one character, a string if more.
+it is one byte, a string if more.
+
+As in the mini language (section 3.15), a string is **a sequence of UTF-8
+bytes**: `len("あ")` is 3, the start and length of `substr()` count bytes,
+`upper()` / `lower()` change only the ASCII letters, and `<` and the other
+comparisons order the byte sequences. `'é'` is two bytes, so it is a string,
+not a character code. Names and numbers take ASCII characters only. Only the
+width and precision of a format spec (section 7.2) count characters, as in
+Python.
 
 Three more come across from the assembler's own evaluator, sharing one
 implementation with it so that they mean the same thing in either place:
@@ -4562,7 +4605,7 @@ The x86_64 pattern file is also maintained separately at
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | `.echo` on a body line (3.14.1); test only |
 | **ministr.axx** | 6.4 KB | 15 | **ministr.s** | Strings, arrays of strings and `.for ... in <array>` in the mini language (3.15); test only |
-| **regress.axx** | 1.3 KB | 4 | **regress.s**, **regresserr.s** | Regression test for the disagreements between the two implementations found by differential fuzzing and fixed (nested `?:`, long numeric literals, pow() special cases, the macro layer's `int()`, `hex()` and format specs, the diagnostics after an error); test only |
+| **regress.axx** | 2.1 KB | 4 | **regress.s**, **regresserr.s**, **regresscr.s** (and **regresself.s** with `z80.axx`) | Regression test for the disagreements between the two implementations found by differential fuzzing and fixed (nested `?:`, long numeric literals, pow() special cases, the macro layer's `int()`, `hex()` and format specs, the diagnostics after an error, an `.equ` of a label at the end of a section, the value of an `.equ` that contains an undefined label, the rules for white space and character constants, the byte strings of the macro layer, CR line ends, the listing of bytes that are not UTF-8, a `.org` that moves backwards under `-o`); test only |
 | **elftype.axx** | 1.5 KB | 20 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
@@ -4605,7 +4648,7 @@ row, checked against llvm-mc 19 byte-for-byte), `sparc_reloc.s` (the relocations
 under `-o`, checked against llvm-mc 19) and `bf_sparc.s` (the Brainfuck
 interpreter, run under qemu-sparc64).
 
-`test1` runs all fifty-seven pairs through both implementations and
+`test1` runs all fifty-nine pairs through both implementations and
 compares the `-b` raw binaries. For the five pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`) it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
@@ -4623,7 +4666,9 @@ CFI, so for those twelve the `-o` ELF objects are compared (`elfcfi` under ELF32
 For the
 `echo.axx` / `echo.s` and `ministr.axx` / `ministr.s` pairs the `.echo` lines written to standard error are
 compared as well. The `regress.axx` regression test compares `regress.s` by its `-V` text and
-`regresserr.s` (only lines that end in an error) by its diagnostics on standard error. The twelve MIPS pairs (`mips.axx`, `mipsel.axx`, `mips64.axx`
+`regresserr.s` (only lines that end in an error) by its diagnostics on standard error;
+`regresscr.s` (a file whose lines end in CR alone) is compared by its `-v` listing, and
+`regresself.s`, assembled with `z80.axx`, by the diagnostics of `-o` on standard error. The twelve MIPS pairs (`mips.axx`, `mipsel.axx`, `mips64.axx`
 and `mips64el.axx` with `mips.s` and with `mips_ase.s`, the four Release 6 files
 with `mipsr6.s`) also compare their `-o` ELF objects (ELF32 REL for o32, ELF64
 RELA for n64) besides the `-b` binaries. Of the three SPARC pairs,
@@ -4633,7 +4678,7 @@ The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for a hundred and ninety-one comparisons in all.
+never compares, for a hundred and ninety-three comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -4666,7 +4711,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all fifty-seven bundled pattern/source pairs with both
+`test1` assembles all fifty-nine bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 five `.textmode` pairs, the `.echo` lines of the `echo.axx` and `ministr.axx` pairs,
 and the `-V` text and diagnostics of the `regress.axx` regression test.

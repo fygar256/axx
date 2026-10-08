@@ -91,10 +91,22 @@ regress.axx                         regression test for disagreements between
                                     cases, macro int()/hex()/format specs, and
                                     the diagnostics after `**`/shift errors,
                                     failed label definitions and .EQU across
-                                    sections
+                                    sections; and (2026-10-08) .EQU of a label
+                                    at the end of a section, undefined values
+                                    carried through .EQU, white space and
+                                    character constants, the byte strings of
+                                    the macro layer
 regress.s                           test assemble file for regress.axx (-V text)
 regresserr.s                        test assemble file for regress.axx (the
                                     diagnostics on standard error)
+regresscr.s                         test assemble file for regress.axx whose
+                                    lines end in CR alone, with a byte that is
+                                    not UTF-8 (the -v listing)
+regresself.s                        regression test assembled with z80.axx under
+                                    -o: a .org that moves backwards, and .org /
+                                    .align / .zero / .resb given the value of
+                                    an .equ that contains an undefined label
+                                    (the diagnostics on standard error)
 unordered.axx                       pattern file for .unordered: directives that
                                     hold for the whole file wherever they are
                                     written, and .map tables per variable, so

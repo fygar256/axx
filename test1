@@ -89,6 +89,10 @@ caxx $P/regress.axx $S/regresserr.s -b b152 2>&1 | grep -v '^wrote ' > b152e
 caxx $P/sparc.axx $S/sparc_test.s -b b153
 caxx $P/sparc.axx $S/sparc_reloc.s -o b154
 caxx $P/sparc.axx $S/bf_sparc.s -o b155 2>/dev/null
+# 回帰テストの続き: -o では .org を後ろへ戻せない（標準エラーの診断で比べる）、
+# 改行が CR だけのファイルと UTF-8 でないバイトを含む行の -v の一覧
+caxx $P/z80.axx $S/regresself.s -o b156 2>&1 | grep -v '^elf: ' > b156e
+caxx $P/regress.axx $S/regresscr.s -v > b157
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -256,6 +260,8 @@ paxx $P/regress.axx $S/regresserr.s -b a152 2>&1 | grep -v '^wrote ' > a152e
 paxx $P/sparc.axx $S/sparc_test.s -b a153
 paxx $P/sparc.axx $S/sparc_reloc.s -o a154
 paxx $P/sparc.axx $S/bf_sparc.s -o a155 2>/dev/null
+paxx $P/z80.axx $S/regresself.s -o a156 2>&1 | grep -v '^elf: ' > a156e
+paxx $P/regress.axx $S/regresscr.s -v > a157
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -381,6 +387,8 @@ check a152e b152e
 check a153 b153
 check a154 b154
 check a155 b155
+check a156e b156e
+check a157 b157
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

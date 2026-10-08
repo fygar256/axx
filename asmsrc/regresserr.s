@@ -12,3 +12,10 @@ t1: e 1
 .section .data
 d1: e 2
 c1: .equ d1-t1
+; 未定義を含む .EQU の値はセクション相対に直さず、未定義のまま後ろへ伝える
+.section .data
+u1: .equ nosuch+1
+u2: .equ u1+2
+e u2
+; UTF-8 の多バイト文字は文字定数にならない
+e 'é'

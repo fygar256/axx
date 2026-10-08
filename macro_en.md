@@ -65,7 +65,13 @@ Values ​​are limited to integers and strings. Operators are C-compliant:
 plus unary `-` `+` `~` `!`. `/` and `%` truncate towards zero, just like in C (`-7/2 == -3`).
 `+` performs concatenation if either operand is a string; `"ab" * 3` performs repetition.
 Integer literals: `10` / `0x1f` / `0b1010` / `0o17` (underscores allowed).
-`'A'` is treated as a character code if it is a single character, or a string if multiple characters.
+`'A'` is treated as a character code if it is a single byte, or a string if more.
+
+As in the mini language, a string is a sequence of UTF-8 bytes: `len("あ")` is 3, the start
+and length of `substr()` count bytes, `upper()` / `lower()` change only the ASCII letters,
+and comparisons order the byte sequences. `'é'` is two bytes, so it is a string. Names and
+numbers take ASCII characters only. Only the width and precision of a format spec count
+characters, as in Python.
 
 Three unary/postfix operators come across from the assembler's own evaluator.
 They share one implementation with it, so they mean the same thing:
