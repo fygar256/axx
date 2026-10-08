@@ -3332,7 +3332,9 @@ argument, they run it afterwards; given just `run`, they run the bundled
 implementation. The Linux build also runs under FreeBSD's Linuxulator
 (`linux64.ko`). FreeBSD's `ld` brands its output as FreeBSD, so when
 `bf_x64_linux.sh` runs on FreeBSD it re-brands the result with
-`brandelf -t Linux` after linking.
+`brandelf -t Linux` after linking. These and the scripts that run the bf
+interpreters for the other CPUs are described in
+[Appendix A.4](#a4-running-the-bf-interpreters--bfsh).
 
 ```
         ldr x19, [sp]               ->  mov rbx, [rsp]
@@ -4550,6 +4552,78 @@ reach.
 AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v)?2:((v&0xf)*0x1111111111111111==v)?4:((v&0xff)*0x0101010101010101==v)?8:((v&0xffff)*0x1000100010001==v)?16:((v&0xffffffff)*0x100000001==v)?32:64)*0,;(m:=(1<<e)-1)*0,;(y:=v&m)*0,;(t:=@(y^(y-1))-1)*0,;(u:=y>>t)*0,;(w:=(y^m)==0?1:y^m)*0,;(p:=@(w^(w-1))-1)*0,;(q:=w>>p)*0,;(c:=((u+1)&u)==0)*0,;(b:=c?@u:e-@q)*0,
  ;(r:=c?(e-t)&(e-1):(e-(p+@q))&(e-1))*0,;(s:=((-2*e)&0x7f)|(b-1))*0,;(z:=(1<<31)|(0x24<<23)|((((s>>6)&1)^1)<<22)|(r<<16)|((s&0x3f)<<10)|(n<<5)|d)*0,@@[4,z>>(%%*8)]
 ```
+
+### A.4 Running the bf interpreters — `bfsh/`
+
+The bundled Brainfuck interpreters (`bf_*.s` in `asmsrc/`) can be assembled with
+axx, linked into executables and run as they are. `bfsh/` holds one shell script
+per build that does all of it. The names are `bf_<CPU>_<OS>.sh`.
+
+| Script | Source | Pattern file | Runs under |
+|---|---|---|---|
+| `bf_x86_64_freebsd.sh` | `bf_x86_64.s` (`!set OS = "freebsd"`) | `x86_64.axx` | directly |
+| `bf_x86_64_linux.sh` | `bf_x86_64.s` (`!set OS = "linux"`) | `x86_64.axx` | directly (the Linuxulator on FreeBSD) |
+| `bf_mips_freebsd.sh` | `bf_mips_freebsd.s` | `mips.axx` / `mipsel.axx` | qemu-mips / qemu-mipsel (bsd-user) |
+| `bf_mips_linux.sh` | `bf_mips.s` | `mips.axx` / `mipsel.axx` | qemu-mips / qemu-mipsel (linux-user) |
+| `bf_riscv64_freebsd.sh` | `bf_riscv64_freebsd.s` | `riscv64full.axx` | qemu-riscv64 (bsd-user) |
+| `bf_riscv64_linux.sh` | `bf_riscv64.s` | `riscv64full.axx` | qemu-riscv64 (linux-user) |
+| `bf_aarch64_linux.sh` | `bf_aarch64.s` | `aarch64.axx` | qemu-aarch64 (linux-user) |
+| `bf_ppc64_linux.sh` | `bf_ppc64.s` | `ppc64.axx` | qemu-ppc64 (linux-user) |
+| `bf_x64_freebsd.sh` / `bf_x64_linux.sh` | `bf_aarch64.s` translated to x86_64 | `a64tox64_axx.axx`, `x86_64.axx` | directly (section 3.18) |
+
+`bf_aarch64.s` and `bf_ppc64.s` exist for Linux only, so they have no `_freebsd`
+script. SPARC's `bf_sparc.s` has no script; its header shows how to build it.
+
+**Usage.** The argument decides what runs after the build.
+
+```sh
+./bfsh/bf_riscv64_freebsd.sh                # build only: build_bf_riscv64_freebsd/bf
+./bfsh/bf_riscv64_freebsd.sh run            # build, then run the bundled mandelbrot.bf
+./bfsh/bf_riscv64_freebsd.sh run hello.bf   # build, then run the .bf given
+./bfsh/bf_riscv64_freebsd.sh hello.bf       # the same without `run`
+```
+
+The build goes to `build_bf_<CPU>_<OS>/` in the current directory
+(`build_bf_mipsel_<OS>/` for mipsel, `build_bf_freebsd/` / `build_bf_linux/` for
+`bf_x64_*.sh`). The scripts can be called from any directory: they look for the
+pattern files and sources one level above the script, so they work both with the
+repository's `patfile/` / `asmsrc/` layout and with everything in one directory.
+
+**Environment variables.**
+
+| Variable | Meaning |
+|---|---|
+| `AXX` | The assembler. Default `caxx`; `AXX=paxx` uses the Python implementation. If it names a directory, the `caxx` in it is used |
+| `LD` | The linker. Default `ld.lld` (`ld` for x86_64) |
+| `QEMU` | The qemu to run under. Empty (`QEMU=`) runs the executable directly. The default follows the rules below |
+| `ENDIAN` | `bf_mips_*.sh` only: `eb` (default, `mips.axx`) or `el` (`mipsel.axx`) |
+
+**Which qemu.** On a host with the same CPU nothing goes through qemu. Otherwise
+the choice is as follows; qemu's user mode runs executables of its own OS only.
+
+- The `_freebsd` scripts: FreeBSD's `qemu-<CPU>-static` (bsd-user), or
+  `qemu-<CPU>` if that is missing. On a host other than FreeBSD they stop after
+  the build.
+- The `_linux` scripts on Linux: `qemu-<CPU>-static` (qemu-user-static on Debian
+  and others), or `qemu-<CPU>` if that is missing.
+- The `_linux` scripts on FreeBSD: the qemu in `/usr/local/bin` is bsd-user and
+  does not run Linux executables, so they use the Linux qemu-user installed for
+  the Linuxulator (`linux64.ko`), `/compat/linux/usr/bin/qemu-<CPU>`. With a
+  Rocky Linux 9 based `/compat/linux`, unpack the el9 qemu-user rpm into it with
+  `rpm2cpio | bsdtar -x`; qemu 11.1.1 also needs `libcapstone.so.4` (capstone)
+  and `libnuma.so.1` (numactl-libs). The x86_64 Linux build needs no qemu and
+  runs directly under the Linuxulator.
+
+**Brands.** The FreeBSD kernel looks at the OS/ABI byte of the ELF header.
+ld.lld leaves a RISC-V executable as System V, so the `_freebsd` scripts brand
+the result with `brandelf -t FreeBSD` (or `elfedit --output-osabi FreeBSD`) after
+linking. The other way round, FreeBSD's `ld` brands x86_64 output as FreeBSD, so
+`bf_x86_64_linux.sh` and `bf_x64_linux.sh` re-brand it with `brandelf -t Linux`
+on FreeBSD.
+
+On FreeBSD 14.3/amd64 the executable of every script runs `mandelbrot.bf` to the
+end, and all the outputs are identical (under qemu one run takes two to five
+minutes).
 
 ---
 

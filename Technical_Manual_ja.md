@@ -3102,7 +3102,9 @@ Linux では `a64rt_axx.s` を `--osabi Linux` で組み、`-e _start` でリン
 `mandelbrot.bf` を走らせます。`AXX=paxx` で Python 版を使えます。
 Linux 版は FreeBSD の Linuxulator（`linux64.ko`）でも動きます。FreeBSD の `ld` は
 出力に FreeBSD のブランドを付けるので、FreeBSD 上で実行した `bf_x64_linux.sh` は
-リンクの後で `brandelf -t Linux` を付け直します。
+リンクの後で `brandelf -t Linux` を付け直します。ほかの CPU の bf インタプリタを
+動かすスクリプトとあわせて、[付録 A.4](#a4-bf-インタプリタを動かす--bfsh) に
+まとめてあります。
 
 ```
         ldr x19, [sp]               ->  mov rbx, [rsp]
@@ -4253,6 +4255,76 @@ $ axx test.axx test.s -v
 AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v)?2:((v&0xf)*0x1111111111111111==v)?4:((v&0xff)*0x0101010101010101==v)?8:((v&0xffff)*0x1000100010001==v)?16:((v&0xffffffff)*0x100000001==v)?32:64)*0,;(m:=(1<<e)-1)*0,;(y:=v&m)*0,;(t:=@(y^(y-1))-1)*0,;(u:=y>>t)*0,;(w:=(y^m)==0?1:y^m)*0,;(p:=@(w^(w-1))-1)*0,;(q:=w>>p)*0,;(c:=((u+1)&u)==0)*0,;(b:=c?@u:e-@q)*0,
  ;(r:=c?(e-t)&(e-1):(e-(p+@q))&(e-1))*0,;(s:=((-2*e)&0x7f)|(b-1))*0,;(z:=(1<<31)|(0x24<<23)|((((s>>6)&1)^1)<<22)|(r<<16)|((s&0x3f)<<10)|(n<<5)|d)*0,@@[4,z>>(%%*8)]
 ```
+
+### A.4 bf インタプリタを動かす — `bfsh/`
+
+同梱の Brainfuck インタプリタ（`asmsrc/` の `bf_*.s`）は、axx でアセンブルし、リンカで
+実行ファイルにして、そのまま動かせます。この手順を 1 本ずつにまとめたシェルスクリプトが
+`bfsh/` にあります。名前は `bf_<CPU>_<OS>.sh` です。
+
+| スクリプト | 組むソース | パターンファイル | 走らせ方 |
+|---|---|---|---|
+| `bf_x86_64_freebsd.sh` | `bf_x86_64.s`（`!set OS = "freebsd"`） | `x86_64.axx` | そのまま |
+| `bf_x86_64_linux.sh` | `bf_x86_64.s`（`!set OS = "linux"`） | `x86_64.axx` | そのまま（FreeBSD では Linuxulator） |
+| `bf_mips_freebsd.sh` | `bf_mips_freebsd.s` | `mips.axx` / `mipsel.axx` | qemu-mips / qemu-mipsel（bsd-user） |
+| `bf_mips_linux.sh` | `bf_mips.s` | `mips.axx` / `mipsel.axx` | qemu-mips / qemu-mipsel（linux-user） |
+| `bf_riscv64_freebsd.sh` | `bf_riscv64_freebsd.s` | `riscv64full.axx` | qemu-riscv64（bsd-user） |
+| `bf_riscv64_linux.sh` | `bf_riscv64.s` | `riscv64full.axx` | qemu-riscv64（linux-user） |
+| `bf_aarch64_linux.sh` | `bf_aarch64.s` | `aarch64.axx` | qemu-aarch64（linux-user） |
+| `bf_ppc64_linux.sh` | `bf_ppc64.s` | `ppc64.axx` | qemu-ppc64（linux-user） |
+| `bf_x64_freebsd.sh` / `bf_x64_linux.sh` | `bf_aarch64.s` を x86_64 へ翻訳したもの | `a64tox64_axx.axx`、`x86_64.axx` | そのまま（3.18 節） |
+
+`bf_aarch64.s` と `bf_ppc64.s` には Linux 用しかないので、この 2 つには `_freebsd` の
+スクリプトがありません。SPARC の `bf_sparc.s` はスクリプトにしていません（ソースの
+冒頭に組み方があります）。
+
+**使い方。** 引数で、組み立てたあとに何を走らせるかを決めます。
+
+```sh
+./bfsh/bf_riscv64_freebsd.sh                # 組み立てるだけ。build_bf_riscv64_freebsd/bf ができる
+./bfsh/bf_riscv64_freebsd.sh run            # 組み立てて、同梱の mandelbrot.bf を走らせる
+./bfsh/bf_riscv64_freebsd.sh run hello.bf   # 組み立てて、指定した .bf を走らせる
+./bfsh/bf_riscv64_freebsd.sh hello.bf       # run を省いても同じ
+```
+
+組み立て先はカレントディレクトリの `build_bf_<CPU>_<OS>/`（mipsel は
+`build_bf_mipsel_<OS>/`、`bf_x64_*.sh` は `build_bf_freebsd/` / `build_bf_linux/`）です。
+スクリプトはどのディレクトリから呼んでも構いません。パターンファイルとソースは
+スクリプトの一つ上のディレクトリから探すので、リポジトリの `patfile/`・`asmsrc/` の配置
+でも、すべてが同じ階層にある配置でも動きます。
+
+**環境変数。**
+
+| 変数 | 意味 |
+|---|---|
+| `AXX` | 使うアセンブラ。既定は `caxx`。`AXX=paxx` で Python 版。ディレクトリを指しているときは、その中の `caxx` を使う |
+| `LD` | 使うリンカ。既定は `ld.lld`（x86_64 は `ld`） |
+| `QEMU` | 実行に使う qemu。空（`QEMU=`）にすると qemu を通さずに走らせる。既定は下の規則で決まる |
+| `ENDIAN` | `bf_mips_*.sh` だけ。`eb`（既定、`mips.axx`）か `el`（`mipsel.axx`） |
+
+**qemu の選び方。** ホストと同じ CPU なら qemu を通さずに走らせます。違うときは次の
+ように選びます。qemu のユーザーモードは、自分と同じ OS の実行ファイルしか走らせません。
+
+- `_freebsd` のスクリプト: FreeBSD の `qemu-<CPU>-static`（bsd-user）、無ければ
+  `qemu-<CPU>`。FreeBSD 以外のホストでは、組み立てたところで止まります。
+- `_linux` のスクリプトを Linux で使うとき: `qemu-<CPU>-static`（Debian などの
+  qemu-user-static）、無ければ `qemu-<CPU>`。
+- `_linux` のスクリプトを FreeBSD で使うとき: `/usr/local/bin` の qemu は bsd-user で、
+  Linux の実行ファイルを走らせません。そこで Linuxulator（`linux64.ko`）に入れた Linux の
+  qemu-user、`/compat/linux/usr/bin/qemu-<CPU>` を使います。Rocky Linux 9 系の
+  `/compat/linux` なら、el9 の qemu-user の rpm を `rpm2cpio | bsdtar -x` で展開して
+  入れます。qemu 11.1.1 では、ほかに `libcapstone.so.4`（capstone）と `libnuma.so.1`
+  （numactl-libs）が要ります。x86_64 の Linux 版は qemu を使わず、Linuxulator で直接
+  走ります。
+
+**ブランド。** FreeBSD のカーネルは ELF ヘッダの OS/ABI を見ます。ld.lld は RISC-V の
+実行ファイルの OS/ABI を System V にするので、`_freebsd` のスクリプトはリンクの後で
+`brandelf -t FreeBSD`（無ければ `elfedit --output-osabi FreeBSD`）を付けます。逆に
+FreeBSD の `ld` は x86_64 の出力に FreeBSD のブランドを付けるので、FreeBSD 上の
+`bf_x86_64_linux.sh` と `bf_x64_linux.sh` は `brandelf -t Linux` を付け直します。
+
+FreeBSD 14.3/amd64 で、どのスクリプトの実行ファイルも `mandelbrot.bf` を最後まで描き、
+出力がすべて一致することを確かめてあります（qemu の上では 1 本 2〜5 分ほどかかります）。
 
 ---
 
