@@ -19,6 +19,10 @@
 set -e
 
 AXX=${AXX:-caxx}
+# AXX に axx の置き場（ディレクトリ）を入れている環境では、そこの caxx を使う。
+if [ -d "$AXX" ]; then
+    AXX=$AXX/caxx
+fi
 LD=${LD:-ld}
 HOST=$(uname -s | tr A-Z a-z)
 OS=${OS:-$HOST}

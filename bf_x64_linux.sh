@@ -17,6 +17,10 @@
 set -e
 
 AXX=${AXX:-caxx}
+# AXX に axx の置き場（ディレクトリ）を入れている環境では、そこの caxx を使う。
+if [ -d "$AXX" ]; then
+    AXX=$AXX/caxx
+fi
 LD=${LD:-ld}
 
 # パターンファイルとアセンブリソースの置き場。リポジトリでは patfile/ と
