@@ -329,7 +329,16 @@ bf_x86_64.sh                        the same for bf_x86_64.s with x86_64.axx: it
                                     (OS=), build_bf_x86_64/bf. on FreeBSD the
                                     Linux one is re-branded and runs under the
                                     Linuxulator
-8080toz80.axx                      pattern file that translates Intel 8080 source
+bf_aarch64_linux.sh                 the Linux qemu versions of the scripts
+bf_mips_linux.sh                    above: each builds the Linux source
+bf_ppc64_linux.sh                   (bf_aarch64.s, bf_mips.s with ENDIAN=eb /
+bf_riscv64_linux.sh                 el, bf_ppc64.s, bf_riscv64.s, bf_x86_64.s
+bf_x86_64_linux.sh                  with !set OS = "linux") into
+                                    build_bf_<arch>_linux/bf and runs it under
+                                    qemu-<arch>-static or qemu-<arch>
+                                    (linux-user), or directly on the same CPU;
+                                    `run` runs mandelbrot.bf
+8080toz80.axx                     pattern file that translates Intel 8080 source
                                     into Zilog Z80 source text: .textmode, `!L`
                                     captures and `{{.exp()}}`, so labels and
                                     expressions keep the spelling they had in the
