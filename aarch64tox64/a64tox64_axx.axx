@@ -1,0 +1,869 @@
+/* =====================================================================
+/*  a64tox64_axx.axx -- AArch64 アセンブリ -> x86_64 アセンブリ 翻訳器
+/*                      （出力は axx の x86_64.axx でアセンブルできる記法）
+/*
+/*  使い方:
+/*    caxx a64tox64_axx.axx prog.s -V | cat a64ext.s - > prog_x64.s
+/*    caxx x86_64.axx prog_x64.s --osabi Linux -o prog.o
+/*    caxx x86_64.axx a64rt_axx.s --osabi Linux -o a64rt.o   （ランタイム。1 回だけ）
+/*    ld -static -e _start prog.o a64rt.o -o prog
+/*
+/*  FreeBSD/amd64 では a64rt_axx_freebsd.s を --osabi FreeBSD で組み、
+/*  入口をランタイムの __a64_start にする（rsp を argc に合わせてから
+/*  _start へ飛ぶ）:
+/*    caxx x86_64.axx prog_x64.s --osabi FreeBSD -o prog.o
+/*    caxx x86_64.axx a64rt_axx_freebsd.s --osabi FreeBSD -o a64rt.o
+/*    ld -static -e __a64_start prog.o a64rt.o -o prog
+/*
+/*  a64ext.s はランタイムの名前を .extern で宣言する 1 行で、出力の先頭に付ける。
+/*  axx のソース記法（; コメント、label: .equ、$$、.resb、.section）は
+/*  AArch64 側の axx ソースと同じなので、そのまま通る。
+/*
+/*  x86_64.axx の記法に合わせていること:
+/*    * メモリオペランドに PTR を書かない（幅はレジスタで決まる）。
+/*      幅の指定が要るのは即値のストアだけ（QWORD [r11], 0 など）
+/*    * PC 相対は [RIP+名前]。使うのは mov r64,[RIP+x] / mov [RIP+x],r64 /
+/*      lea r64,[RIP+x] の 3 つだけにして、ほかはレジスタ経由にする
+/*    * mov r64, 即値 は常に 64 ビット即値になるので movabs は使わない
+/*    * 1 行に命令は 1 つ（; はコメント）。条件付きで省く命令は
+/*      その行を ; だけのコメント行にする
+/*    * movzx / movsx のメモリ形はバイトから 64 ビットだけなので、
+/*      ハーフワードは mov r10w で読んでから拡張する
+/*
+/*  レジスタの対応:
+/*    x0  -> rdi   x1  -> rsi   x2  -> rdx   x3  -> rcx     引数レジスタ
+/*    x4  -> r8    x5  -> r9                                 （SysV と同じ順）
+/*    x8  -> rax                                             syscall 番号
+/*    x19 -> rbx   x20 -> r12   x21 -> r13   x22 -> r14      callee-saved
+/*    x23 -> r15
+/*    x29/fp -> rbp   sp -> rsp
+/*    x6 x7 x9-x18 x24-x28 -> メモリ（a64rt_axx.s の __a64_xN、8 バイト）
+/*    r10, r11 は翻訳器の作業用レジスタ
+/*
+/*  呼び出し規約のつなぎ:
+/*    ret    -> mov rax, rdi ; ret        （x0 の戻り値を rax へ）
+/*    bl f   -> call f ; mov rdi, rax     （rax の戻り値を x0 へ）
+/*    svc #0 -> call __a64_svc            （番号を引き直して syscall。戻り値は x0）
+/*
+/*  関数のフレーム:
+/*    stp x29, x30, [sp, #-N]!  -> sub rsp, N+8 ; mov [rsp], rbp
+/*    ldp x29, x30, [sp], #N    -> mov rbp, [rsp] ; add rsp, N+8
+/*
+/*  条件コードは cmp / subs / tst の直後を想定して対応づけている。
+/*  対応していない行は .textmode によりそのまま素通しされる。
+/* =====================================================================
+
+.textmode
+
+/* ---------------------------------------------------------------------
+/*  x86 のレジスタに置く AArch64 レジスタ（q 配列の添字 16 は空文字）
+/* ---------------------------------------------------------------------
+.setsym::xr::[x0,x1,x2,x3,x4,x5,x8,x19,x20,x21,x22,x23,x29,fp,sp]
+.setsym::wr::[w0,w1,w2,w3,w4,w5,w8,w19,w20,w21,w22,w23,w29]
+.setsym::q64::[rdi,rsi,rdx,rcx,r8,r9,rax,rbx,r12,r13,r14,r15,rbp,rbp,rsp,"",""]
+.setsym::q32::[edi,esi,edx,ecx,r8d,r9d,eax,ebx,r12d,r13d,r14d,r15d,ebp,ebp,esp,"",""]
+.setsym::q16::[di,si,dx,cx,r8w,r9w,ax,bx,r12w,r13w,r14w,r15w,bp,bp,sp,"",""]
+.setsym::q8::[dil,sil,dl,cl,r8b,r9b,al,bl,r12b,r13b,r14b,r15b,bpl,bpl,spl,"",""]
+
+/* ---------------------------------------------------------------------
+/*  メモリに置く AArch64 レジスタ（ms 配列の添字 17 は空文字）
+/* ---------------------------------------------------------------------
+.setsym::xs::[x6,x7,x9,x10,x11,x12,x13,x14,x15,x16,x17,x18,x24,x25,x26,x27,x28]
+.setsym::ws::[w6,w7,w9,w10,w11,w12,w13,w14,w15,w16,w17,w18,w24,w25,w26,w27,w28]
+.setsym::ms::["[RIP+__a64_x6]","[RIP+__a64_x7]","[RIP+__a64_x9]","[RIP+__a64_x10]","[RIP+__a64_x11]","[RIP+__a64_x12]","[RIP+__a64_x13]","[RIP+__a64_x14]","[RIP+__a64_x15]","[RIP+__a64_x16]","[RIP+__a64_x17]","[RIP+__a64_x18]","[RIP+__a64_x24]","[RIP+__a64_x25]","[RIP+__a64_x26]","[RIP+__a64_x27]","[RIP+__a64_x28]",""]
+
+/*  条件コード（AArch64 -> x86。al は j + mp = jmp になる）
+.setsym::acc::[eq,ne,cs,hs,cc,lo,mi,pl,vs,vc,hi,ls,ge,lt,gt,le,al]
+.setsym::xcc::[e,ne,ae,ae,b,b,s,ns,o,no,a,be,ge,l,g,le,mp]
+
+/*  条件付きで出す「mov 先, 元」の行（添字 0 = ; だけのコメント行）
+.setsym::cpa::[";","mov "]
+.setsym::cpb::["",", "]
+/*  :lo12: の加算（添字 0 = 何も出さずにコメントだけ）
+.setsym::loa::["","mov "]
+/*  メモリどうしの「mov r11, 元」「mov 先, r11」
+.setsym::mma::[";","mov r11, "]
+.setsym::mmb::["",", r11"]
+/*  sub の 1 行目（0: なし、1: mov 先, 元、2: neg 先）と演算
+.setsym::s1a::[";","mov ","neg "]
+.setsym::s1b::["",", ",""]
+.setsym::sbop::["sub","add"]
+
+/* =====================================================================
+/*  マクロ
+/*    w: 幅（0 = X / 64 ビット、1 = W / 32 ビット）
+/*    c: レジスタの置き場所（0 = x86 のレジスタ、1 = メモリ）
+/* =====================================================================
+!set NL = "\\n\\t"
+
+/*  照合に使う集合の名前と捕捉子
+!def SN(w, c) {
+!return w == 0 ? (c == 0 ? "xr" : "xs") : (c == 0 ? "wr" : "ws")
+}
+!def CP(w, c, v) {
+!return "!Y" + SN(w, c) + "[" + v + "]"
+}
+
+/*  x86 のレジスタ名（幅 w）と、メモリ上の置き場所
+!def Q(w, v) {
+!return w == 0 ? "{{q64[" + v + "]}}" : "{{q32[" + v + "]}}"
+}
+!def SL(v) {
+!return "{{ms[" + v + "]}}"
+}
+/*  作業用レジスタ
+!def T(w) {
+!return w == 0 ? "r11" : "r11d"
+}
+!def U(w) {
+!return w == 0 ? "r10" : "r10d"
+}
+!def BITS(w) {
+!return w == 0 ? "64" : "32"
+}
+
+/*  値を r11 に入れる / r10 に入れる（メモリなら 64 ビットで読む）
+!def INT(w, c, v) {
+!return c == 0 ? "mov " + T(w) + ", " + Q(w, v) : "mov r11, " + SL(v)
+}
+!def INU(w, c, v) {
+!return c == 0 ? "mov " + U(w) + ", " + Q(w, v) : "mov r10, " + SL(v)
+}
+/*  オペランドとして使う前の読み込み（メモリなら r10 / r11 へ）と、その綴り
+!def PU(c, v) {
+!return c == 1 ? "mov r10, " + SL(v) + NL : ""
+}
+!def OU(w, c, v) {
+!return c == 0 ? Q(w, v) : U(w)
+}
+!def PT(c, v) {
+!return c == 1 ? "mov r11, " + SL(v) + NL : ""
+}
+!def OT(w, c, v) {
+!return c == 0 ? Q(w, v) : T(w)
+}
+/*  r11 / r10 の値を宛先へ書き戻す（W でメモリなら 64 ビットで書いて上位を 0 に）
+!def WB(w, c, v) {
+!return c == 0 ? "mov " + Q(w, v) + ", " + T(w) : "mov " + SL(v) + ", r11"
+}
+!def WB10(w, c, v) {
+!return c == 0 ? "mov " + Q(w, v) + ", " + U(w) : "mov " + SL(v) + ", r10"
+}
+
+/*  レジスタどうしで cond が真のときだけ「mov dst, src」を出す（偽なら ; の行）
+!def pre(w, src, dst, cond) {
+!local c = "(" + cond + ")"
+!local q = w == 0 ? "q64" : "q32"
+!return "{{cpa[" + c + "]}}{{" + q + "[" + c + "?" + dst + ":16]}}{{cpb[" + c + "]}}{{" + q + "[" + c + "?" + src + ":16]}}" + NL
+}
+
+/* =====================================================================
+/*  データ処理
+/* =====================================================================
+
+/*  3 オペランドの演算（kind 1: 可換、2: sub）
+!def alu3(w, mn, op, kind) {
+!local q = w == 0 ? "q64" : "q32"
+!local cd = 0
+!while cd < 2 {
+!local cn = 0
+!while cn < 2 {
+!local cm = 0
+!while cm < 2 {
+!local P = CP(w, cd, "d") + "," + CP(w, cn, "n") + "," + CP(w, cm, "m")
+!if cd + cn + cm == 0 && kind == 1 !then {
+!{mn} !{P} :: "!{pre(w, "n", "d", "(d!=n)&&(d!=m)")}!{op} {{!{q}[d]}}, {{!{q}[(d!=n)&&(d==m)?n:m]}}"
+}
+!if cd + cn + cm == 0 && kind == 2 !then {
+!local sel = "((d!=n)&&(d!=m))?1:(((d!=n)&&(d==m))?2:0)"
+!local k = "(d!=n)&&(d==m)"
+!{mn} !{P} :: "{{s1a[!{sel}]}}{{!{q}[(!{sel})?d:16]}}{{s1b[!{sel}]}}{{!{q}[((!{sel})==1)?n:16]}}!{NL}{{sbop[!{k}]}} {{!{q}[d]}}, {{!{q}[(!{k})?n:m]}}"
+}
+!if cd + cn + cm > 0 !then {
+!{mn} !{P} :: "!{PU(cm, "m")}!{INT(w, cn, "n")}!{NL}!{op} !{T(w)}, !{OU(w, cm, "m")}!{NL}!{WB(w, cd, "d")}"
+}
+/*  シフトした第 2 オペランド
+!{mn} !{P},LSL #!s :: "!{INU(w, cm, "m")}!{NL}shl !{U(w)}, {{s}}!{NL}!{INT(w, cn, "n")}!{NL}!{op} !{T(w)}, !{U(w)}!{NL}!{WB(w, cd, "d")}"
+!{mn} !{P},LSR #!s :: "!{INU(w, cm, "m")}!{NL}shr !{U(w)}, {{s}}!{NL}!{INT(w, cn, "n")}!{NL}!{op} !{T(w)}, !{U(w)}!{NL}!{WB(w, cd, "d")}"
+!{mn} !{P},ASR #!s :: "!{INU(w, cm, "m")}!{NL}sar !{U(w)}, {{s}}!{NL}!{INT(w, cn, "n")}!{NL}!{op} !{T(w)}, !{U(w)}!{NL}!{WB(w, cd, "d")}"
+!set cm = cm + 1
+}
+!set cn = cn + 1
+}
+!set cd = cd + 1
+}
+}
+
+/*  否定付きの論理演算: bic = n & ~m、orn = n | ~m、eon = n ^ ~m
+/*  フラグを立てる演算（adds / subs / ands）も r11 で計算する
+!def alur11(w, mn, op, neg) {
+!local cd = 0
+!while cd < 2 {
+!local cn = 0
+!while cn < 2 {
+!local cm = 0
+!while cm < 2 {
+!local P = CP(w, cd, "d") + "," + CP(w, cn, "n") + "," + CP(w, cm, "m")
+!if neg == 1 !then {
+!{mn} !{P} :: "!{INT(w, cm, "m")}!{NL}not !{T(w)}!{NL}!{PU(cn, "n")}!{op} !{T(w)}, !{OU(w, cn, "n")}!{NL}!{WB(w, cd, "d")}"
+}
+!if neg == 0 !then {
+!{mn} !{P} :: "!{PU(cm, "m")}!{INT(w, cn, "n")}!{NL}!{op} !{T(w)}, !{OU(w, cm, "m")}!{NL}!{WB(w, cd, "d")}"
+}
+!set cm = cm + 1
+}
+!if neg == 0 !then {
+!{mn} !{CP(w, cd, "d")},!{CP(w, cn, "n")},#!Li :: "!{INT(w, cn, "n")}!{NL}!{op} !{T(w)}, {{.exp(i)}}!{NL}!{WB(w, cd, "d")}"
+}
+!set cn = cn + 1
+}
+!set cd = cd + 1
+}
+}
+
+/*  即値の演算（kind 1: 加減算、2: 論理演算、0: シフト）
+!def aluimm(w, mn, op, kind) {
+!local q = w == 0 ? "q64" : "q32"
+!local cd = 0
+!while cd < 2 {
+!local cn = 0
+!while cn < 2 {
+!local P = CP(w, cd, "d") + "," + CP(w, cn, "n") + ",#!Li"
+/*  64 ビットの論理演算の即値はビットマスクなので、いつも r10 に入れてから使う
+!if kind == 2 && w == 0 !then {
+!if cd + cn == 0 !then {
+!{mn} !{P} :: "!{pre(w, "n", "d", "d!=n")}mov r10, {{.exp(i)}}!{NL}!{op} {{q64[d]}}, r10"
+}
+!if cd + cn > 0 !then {
+!{mn} !{P} :: "!{INT(0, cn, "n")}!{NL}mov r10, {{.exp(i)}}!{NL}!{op} r11, r10!{NL}!{WB(0, cd, "d")}"
+}
+}
+!if kind != 2 || w == 1 !then {
+!if cd + cn == 0 !then {
+!{mn} !{P} :: "!{pre(w, "n", "d", "d!=n")}!{op} {{!{q}[d]}}, {{.exp(i)}}"
+}
+!if cd + cn > 0 !then {
+!{mn} !{P} :: "!{INT(w, cn, "n")}!{NL}!{op} !{T(w)}, {{.exp(i)}}!{NL}!{WB(w, cd, "d")}"
+}
+}
+/*  加減算は LSL #12 も
+!if kind == 1 !then {
+!{mn} !{P},LSL #12 :: "!{INT(w, cn, "n")}!{NL}!{op} !{T(w)}, ({{.exp(i)}})<<12!{NL}!{WB(w, cd, "d")}"
+}
+!set cn = cn + 1
+}
+!set cd = cd + 1
+}
+}
+
+/*  2 オペランド（neg / mvn / clz / rev / ビットフィールド）とレジスタでのシフト
+!def unary(w) {
+!local q = w == 0 ? "q64" : "q32"
+!local cd = 0
+!while cd < 2 {
+!local cn = 0
+!while cn < 2 {
+!local P = CP(w, cd, "d") + "," + CP(w, cn, "n")
+!if cd + cn == 0 !then {
+NEG !{P} :: "!{pre(w, "n", "d", "d!=n")}neg {{!{q}[d]}}"
+MVN !{P} :: "!{pre(w, "n", "d", "d!=n")}not {{!{q}[d]}}"
+CLZ !{P} :: "lzcnt {{!{q}[d]}}, {{!{q}[n]}}"
+}
+!if cd + cn > 0 !then {
+NEG !{P} :: "!{INT(w, cn, "n")}!{NL}neg !{T(w)}!{NL}!{WB(w, cd, "d")}"
+MVN !{P} :: "!{INT(w, cn, "n")}!{NL}not !{T(w)}!{NL}!{WB(w, cd, "d")}"
+CLZ !{P} :: "!{PT(cn, "n")}lzcnt !{T(w)}, !{OT(w, cn, "n")}!{NL}!{WB(w, cd, "d")}"
+}
+REV !{P} :: "!{INT(w, cn, "n")}!{NL}bswap !{T(w)}!{NL}!{WB(w, cd, "d")}"
+UBFX !{P},#!p,#!r :: "!{INT(w, cn, "n")}!{NL}shl !{T(w)}, {{!{BITS(w)}-p-r}}!{NL}shr !{T(w)}, {{!{BITS(w)}-r}}!{NL}!{WB(w, cd, "d")}"
+SBFX !{P},#!p,#!r :: "!{INT(w, cn, "n")}!{NL}shl !{T(w)}, {{!{BITS(w)}-p-r}}!{NL}sar !{T(w)}, {{!{BITS(w)}-r}}!{NL}!{WB(w, cd, "d")}"
+UBFIZ !{P},#!p,#!r :: "!{INT(w, cn, "n")}!{NL}shl !{T(w)}, {{!{BITS(w)}-r}}!{NL}shr !{T(w)}, {{!{BITS(w)}-r-p}}!{NL}!{WB(w, cd, "d")}"
+!local cm = 0
+!while cm < 2 {
+!local P3 = P + "," + CP(w, cm, "m")
+!if cd + cn + cm == 0 !then {
+LSL !{P3} :: "shlx {{!{q}[d]}}, {{!{q}[n]}}, {{!{q}[m]}}"
+LSR !{P3} :: "shrx {{!{q}[d]}}, {{!{q}[n]}}, {{!{q}[m]}}"
+ASR !{P3} :: "sarx {{!{q}[d]}}, {{!{q}[n]}}, {{!{q}[m]}}"
+}
+!if cd + cn + cm > 0 !then {
+LSL !{P3} :: "!{PT(cn, "n")}!{PU(cm, "m")}shlx !{T(w)}, !{OT(w, cn, "n")}, !{OU(w, cm, "m")}!{NL}!{WB(w, cd, "d")}"
+LSR !{P3} :: "!{PT(cn, "n")}!{PU(cm, "m")}shrx !{T(w)}, !{OT(w, cn, "n")}, !{OU(w, cm, "m")}!{NL}!{WB(w, cd, "d")}"
+ASR !{P3} :: "!{PT(cn, "n")}!{PU(cm, "m")}sarx !{T(w)}, !{OT(w, cn, "n")}, !{OU(w, cm, "m")}!{NL}!{WB(w, cd, "d")}"
+}
+!set cm = cm + 1
+}
+!set cn = cn + 1
+}
+!set cd = cd + 1
+}
+}
+
+/*  乗除算（4 オペランドの madd / msub を含む）
+!def muldiv(w) {
+!local a = w == 0 ? "rax" : "eax"
+!local x = w == 0 ? "cqo" : "cdq"
+!local cd = 0
+!while cd < 2 {
+!local cn = 0
+!while cn < 2 {
+!local cm = 0
+!while cm < 2 {
+!local P = CP(w, cd, "d") + "," + CP(w, cn, "n") + "," + CP(w, cm, "m")
+/*  rax に n を入れる（メモリなら 64 ビットで読んで下位を使う）
+!local NA = cn == 0 ? "mov " + a + ", " + Q(w, "n") : "mov rax, " + SL("n")
+MNEG !{P} :: "!{PU(cm, "m")}!{INT(w, cn, "n")}!{NL}imul !{T(w)}, !{OU(w, cm, "m")}!{NL}neg !{T(w)}!{NL}!{WB(w, cd, "d")}"
+/*  x86 の除算は rax:rdx を使うので、x8(rax) と x2(rdx) を退避する
+SDIV !{P} :: "push rax!{NL}push rdx!{NL}!{INT(w, cm, "m")}!{NL}!{NA}!{NL}!{x}!{NL}idiv !{T(w)}!{NL}mov !{T(w)}, !{a}!{NL}pop rdx!{NL}pop rax!{NL}!{WB(w, cd, "d")}"
+UDIV !{P} :: "push rax!{NL}push rdx!{NL}!{INT(w, cm, "m")}!{NL}!{NA}!{NL}xor edx, edx!{NL}div !{T(w)}!{NL}mov !{T(w)}, !{a}!{NL}pop rdx!{NL}pop rax!{NL}!{WB(w, cd, "d")}"
+!if w == 0 !then {
+SMULH !{P} :: "push rax!{NL}push rdx!{NL}!{INT(0, cm, "m")}!{NL}!{NA}!{NL}imul r11!{NL}mov r11, rdx!{NL}pop rdx!{NL}pop rax!{NL}!{WB(0, cd, "d")}"
+UMULH !{P} :: "push rax!{NL}push rdx!{NL}!{INT(0, cm, "m")}!{NL}!{NA}!{NL}mul r11!{NL}mov r11, rdx!{NL}pop rdx!{NL}pop rax!{NL}!{WB(0, cd, "d")}"
+}
+!local ck = 0
+!while ck < 2 {
+!local P4 = P + "," + CP(w, ck, "k")
+MADD !{P4} :: "!{PU(cm, "m")}!{INT(w, cn, "n")}!{NL}imul !{T(w)}, !{OU(w, cm, "m")}!{NL}!{PU(ck, "k")}add !{T(w)}, !{OU(w, ck, "k")}!{NL}!{WB(w, cd, "d")}"
+MSUB !{P4} :: "!{PU(cm, "m")}!{INT(w, cn, "n")}!{NL}imul !{T(w)}, !{OU(w, cm, "m")}!{NL}neg !{T(w)}!{NL}!{PU(ck, "k")}add !{T(w)}, !{OU(w, ck, "k")}!{NL}!{WB(w, cd, "d")}"
+!set ck = ck + 1
+}
+!set cm = cm + 1
+}
+!set cn = cn + 1
+}
+!set cd = cd + 1
+}
+}
+
+/*  32 x 32 -> 64 ビットの乗算（宛先は X、元は W）
+!def mullong() {
+!local cd = 0
+!while cd < 2 {
+!local cn = 0
+!while cn < 2 {
+!local cm = 0
+!while cm < 2 {
+!local P = CP(0, cd, "d") + "," + CP(1, cn, "n") + "," + CP(1, cm, "m")
+SMULL !{P} :: "!{INT(1, cn, "n")}!{NL}movsxd r11, r11d!{NL}!{INU(1, cm, "m")}!{NL}movsxd r10, r10d!{NL}imul r11, r10!{NL}!{WB(0, cd, "d")}"
+UMULL !{P} :: "!{INT(1, cn, "n")}!{NL}mov r11d, r11d!{NL}!{INU(1, cm, "m")}!{NL}mov r10d, r10d!{NL}imul r11, r10!{NL}!{WB(0, cd, "d")}"
+!set cm = cm + 1
+}
+!set cn = cn + 1
+}
+!set cd = cd + 1
+}
+}
+
+/*  転送・比較・分岐
+!def movcmp(w) {
+!local z = w == 0 ? "XZR" : "WZR"
+MOV !{CP(w, 0, "d")},!{z} :: "xor {{q32[d]}}, {{q32[d]}}"
+MOV !{CP(w, 1, "d")},!{z} :: "xor r11d, r11d!{NL}mov {{ms[d]}}, r11"
+!local cd = 0
+!while cd < 2 {
+!local cn = 0
+!while cn < 2 {
+!local P = CP(w, cd, "d") + "," + CP(w, cn, "n")
+!if w == 0 && cd == 0 && cn == 0 !then {
+MOV !{P} :: "mov {{q64[d]}}, {{q64[n]}}"
+}
+!if w == 0 && cd == 1 && cn == 0 !then {
+MOV !{P} :: "mov {{ms[d]}}, {{q64[n]}}"
+}
+!if w == 0 && cd == 0 && cn == 1 !then {
+MOV !{P} :: "mov {{q64[d]}}, {{ms[n]}}"
+}
+!if w == 0 && cd == 1 && cn == 1 !then {
+MOV !{P} :: "mov r11, {{ms[n]}}!{NL}mov {{ms[d]}}, r11"
+}
+!if w == 1 && cd == 0 && cn == 0 !then {
+MOV !{P} :: "mov {{q32[d]}}, {{q32[n]}}"
+}
+!if w == 1 && (cd == 1 || cn == 1) !then {
+MOV !{P} :: "!{INT(1, cn, "n")}!{NL}mov r11d, r11d!{NL}!{WB(1, cd, "d")}"
+}
+!set cn = cn + 1
+}
+!set cd = cd + 1
+}
+/*  比較・テスト
+!local cn = 0
+!while cn < 2 {
+!local cm = 0
+!while cm < 2 {
+!local P = CP(w, cn, "n") + "," + CP(w, cm, "m")
+CMP !{P} :: "!{PT(cn, "n")}!{PU(cm, "m")}cmp !{OT(w, cn, "n")}, !{OU(w, cm, "m")}"
+TST !{P} :: "!{PT(cn, "n")}!{PU(cm, "m")}test !{OT(w, cn, "n")}, !{OU(w, cm, "m")}"
+CMN !{P} :: "!{PU(cm, "m")}!{INT(w, cn, "n")}!{NL}add !{T(w)}, !{OU(w, cm, "m")}"
+!set cm = cm + 1
+}
+!local N = OT(w, cn, "n")
+CMP !{CP(w, cn, "n")},#!Li :: "!{PT(cn, "n")}cmp !{N}, {{.exp(i)}}"
+CMN !{CP(w, cn, "n")},#!Li :: "!{INT(w, cn, "n")}!{NL}add !{T(w)}, {{.exp(i)}}"
+!if w == 0 !then {
+TST !{CP(0, cn, "n")},#!Li :: "!{PT(cn, "n")}mov r10, {{.exp(i)}}!{NL}test !{N}, r10"
+}
+!if w == 1 !then {
+TST !{CP(1, cn, "n")},#!Li :: "!{PT(cn, "n")}test !{N}, {{.exp(i)}}"
+}
+CBZ !{CP(w, cn, "n")},!Lt :: "!{PT(cn, "n")}test !{N}, !{N}!{NL}jz {{.exp(t)}}"
+CBNZ !{CP(w, cn, "n")},!Lt :: "!{PT(cn, "n")}test !{N}, !{N}!{NL}jnz {{.exp(t)}}"
+/*  bt は 64 ビットのレジスタで（ビット番号が 32 未満なら W と同じ）
+TBZ !{CP(w, cn, "n")},#!b,!Lt :: "!{PT(cn, "n")}bt !{cn == 0 ? "{{q64[n]}}" : "r11"}, {{b}}!{NL}jnc {{.exp(t)}}"
+TBNZ !{CP(w, cn, "n")},#!b,!Lt :: "!{PT(cn, "n")}bt !{cn == 0 ? "{{q64[n]}}" : "r11"}, {{b}}!{NL}jc {{.exp(t)}}"
+!set cn = cn + 1
+}
+}
+
+/*  条件選択（csel 系。mov と lea と not はフラグを変えない）
+!def condsel(w) {
+!local cd = 0
+!while cd < 2 {
+!local D = CP(w, cd, "d")
+CSET !{D},!Yacc[c] :: "set{{xcc[c]}} r11b!{NL}movzx r11d, r11b!{NL}!{WB(w, cd, "d")}"
+CSETM !{D},!Yacc[c] :: "mov r11d, 0!{NL}mov r10, -1!{NL}cmov{{xcc[c]}} !{T(w)}, !{U(w)}!{NL}!{WB(w, cd, "d")}"
+!local cn = 0
+!while cn < 2 {
+!local P = D + "," + CP(w, cn, "n")
+CINC !{P},!Yacc[c] :: "!{INT(w, cn, "n")}!{NL}lea r10, [r11+1]!{NL}cmov{{xcc[c]}} !{T(w)}, !{U(w)}!{NL}!{WB(w, cd, "d")}"
+CINV !{P},!Yacc[c] :: "!{INT(w, cn, "n")}!{NL}mov r10, r11!{NL}not r10!{NL}cmov{{xcc[c]}} !{T(w)}, !{U(w)}!{NL}!{WB(w, cd, "d")}"
+CNEG !{P},!Yacc[c] :: "!{INT(w, cn, "n")}!{NL}mov r10, r11!{NL}not r10!{NL}lea r10, [r10+1]!{NL}cmov{{xcc[c]}} !{T(w)}, !{U(w)}!{NL}!{WB(w, cd, "d")}"
+!local cm = 0
+!while cm < 2 {
+!local P3 = P + "," + CP(w, cm, "m")
+CSEL !{P3},!Yacc[c] :: "!{INT(w, cm, "m")}!{NL}!{PU(cn, "n")}cmov{{xcc[c]}} !{T(w)}, !{OU(w, cn, "n")}!{NL}!{WB(w, cd, "d")}"
+CSINC !{P3},!Yacc[c] :: "!{INT(w, cm, "m")}!{NL}lea r11, [r11+1]!{NL}!{PU(cn, "n")}cmov{{xcc[c]}} !{T(w)}, !{OU(w, cn, "n")}!{NL}!{WB(w, cd, "d")}"
+CSINV !{P3},!Yacc[c] :: "!{INT(w, cm, "m")}!{NL}not !{T(w)}!{NL}!{PU(cn, "n")}cmov{{xcc[c]}} !{T(w)}, !{OU(w, cn, "n")}!{NL}!{WB(w, cd, "d")}"
+CSNEG !{P3},!Yacc[c] :: "!{INT(w, cm, "m")}!{NL}not !{T(w)}!{NL}lea r11, [r11+1]!{NL}!{PU(cn, "n")}cmov{{xcc[c]}} !{T(w)}, !{OU(w, cn, "n")}!{NL}!{WB(w, cd, "d")}"
+!set cm = cm + 1
+}
+!set cn = cn + 1
+}
+!set cd = cd + 1
+}
+}
+
+/*  即値の転送（x86_64.axx の mov r64, 即値 は常に 64 ビット即値）
+!def movimm() {
+MOV !Yxr[d],#!Li :: "mov {{q64[d]}}, {{.exp(i)}}"
+MOV !Yxs[d],#!Li :: "mov r11, {{.exp(i)}}!{NL}mov {{ms[d]}}, r11"
+MOVZ !Yxr[d],#!Li[[,LSL #!s]] :: "mov {{q64[d]}}, ({{.exp(i)}})<<{{s}}"
+MOVZ !Yxs[d],#!Li[[,LSL #!s]] :: "mov r11, ({{.exp(i)}})<<{{s}}!{NL}mov {{ms[d]}}, r11"
+MOVN !Yxr[d],#!Li[[,LSL #!s]] :: "mov {{q64[d]}}, ~(({{.exp(i)}})<<{{s}})"
+MOVN !Yxs[d],#!Li[[,LSL #!s]] :: "mov r11, ~(({{.exp(i)}})<<{{s}})!{NL}mov {{ms[d]}}, r11"
+MOVK !Yxr[d],#!Li[[,LSL #!s]] :: "mov r11, ~(0xffff<<{{s}})!{NL}and {{q64[d]}}, r11!{NL}mov r11, ({{.exp(i)}})<<{{s}}!{NL}or {{q64[d]}}, r11"
+MOVK !Yxs[d],#!Li[[,LSL #!s]] :: "mov r10, {{ms[d]}}!{NL}mov r11, ~(0xffff<<{{s}})!{NL}and r10, r11!{NL}mov r11, ({{.exp(i)}})<<{{s}}!{NL}or r10, r11!{NL}mov {{ms[d]}}, r10"
+MOV !Ywr[d],#!Li :: "mov {{q32[d]}}, {{.exp(i)}}"
+MOV !Yws[d],#!Li :: "mov r11d, {{.exp(i)}}!{NL}mov {{ms[d]}}, r11"
+MOVZ !Ywr[d],#!Li[[,LSL #!s]] :: "mov {{q32[d]}}, ({{.exp(i)}})<<{{s}}"
+MOVZ !Yws[d],#!Li[[,LSL #!s]] :: "mov r11d, ({{.exp(i)}})<<{{s}}!{NL}mov {{ms[d]}}, r11"
+MOVN !Ywr[d],#!Li[[,LSL #!s]] :: "mov {{q32[d]}}, (~(({{.exp(i)}})<<{{s}}))&0xffffffff"
+MOVN !Yws[d],#!Li[[,LSL #!s]] :: "mov r11d, (~(({{.exp(i)}})<<{{s}}))&0xffffffff!{NL}mov {{ms[d]}}, r11"
+MOVK !Ywr[d],#!Li[[,LSL #!s]] :: "and {{q32[d]}}, (~(0xffff<<{{s}}))&0xffffffff!{NL}or {{q32[d]}}, ({{.exp(i)}})<<{{s}}"
+MOVK !Yws[d],#!Li[[,LSL #!s]] :: "mov r11, {{ms[d]}}!{NL}and r11d, (~(0xffff<<{{s}}))&0xffffffff!{NL}or r11d, ({{.exp(i)}})<<{{s}}!{NL}mov {{ms[d]}}, r11"
+}
+
+/*  符号・ゼロ拡張（元は W）
+!def extend() {
+!local cd = 0
+!while cd < 2 {
+!local cn = 0
+!while cn < 2 {
+!local PX = CP(0, cd, "d") + "," + CP(1, cn, "n")
+!local PW = CP(1, cd, "d") + "," + CP(1, cn, "n")
+!local N32 = cn == 0 ? "{{q32[n]}}" : "r11d"
+!local N16 = cn == 0 ? "{{q16[n]}}" : "r11w"
+!local N8 = cn == 0 ? "{{q8[n]}}" : "r11b"
+!local L = PT(cn, "n")
+SXTW !{PX} :: "!{L}movsxd r11, !{N32}!{NL}!{WB(0, cd, "d")}"
+SXTB !{PX} :: "!{L}movsx r11, !{N8}!{NL}!{WB(0, cd, "d")}"
+SXTH !{PX} :: "!{L}movsx r11, !{N16}!{NL}!{WB(0, cd, "d")}"
+SXTB !{PW} :: "!{L}movsx r11d, !{N8}!{NL}!{WB(1, cd, "d")}"
+SXTH !{PW} :: "!{L}movsx r11d, !{N16}!{NL}!{WB(1, cd, "d")}"
+UXTB !{PW} :: "!{L}movzx r11d, !{N8}!{NL}!{WB(1, cd, "d")}"
+UXTH !{PW} :: "!{L}movzx r11d, !{N16}!{NL}!{WB(1, cd, "d")}"
+!set cn = cn + 1
+}
+!set cd = cd + 1
+}
+}
+
+/*  アドレス（ラベルの即値は mov r64, ラベル。PC 相対は lea [RIP+ラベル]）
+!def addr() {
+ADR  !Yxr[d],!Ll :: "lea {{q64[d]}}, [RIP+{{.exp(l)}}]"
+ADRP !Yxr[d],!Ll :: "lea {{q64[d]}}, [RIP+{{.exp(l)}}]"
+ADR  !Yxs[d],!Ll :: "lea r11, [RIP+{{.exp(l)}}]!{NL}mov {{ms[d]}}, r11"
+ADRP !Yxs[d],!Ll :: "lea r11, [RIP+{{.exp(l)}}]!{NL}mov {{ms[d]}}, r11"
+/*  adrp で全アドレスを作ってあるので、:lo12: の加算は複写だけでよい
+ADD !Yxr[d],!Yxr[n],:LO12:!Ll :: "{{loa[d!=n]}}{{q64[(d!=n)?d:16]}}{{cpb[d!=n]}}{{q64[(d!=n)?n:16]}} ; :lo12:{{.exp(l)}} (adrp で計算済み)"
+ADD !Yxs[d],!Yxs[n],:LO12:!Ll :: "{{mma[d!=n]}}{{ms[(d!=n)?n:17]}}!{NL}{{loa[d!=n]}}{{ms[(d!=n)?d:17]}}{{mmb[d!=n]}} ; :lo12:{{.exp(l)}} (adrp で計算済み)"
+ADD !Yxr[d],!Yxs[n],:LO12:!Ll :: "mov {{q64[d]}}, {{ms[n]}} ; :lo12:{{.exp(l)}} (adrp で計算済み)"
+ADD !Yxs[d],!Yxr[n],:LO12:!Ll :: "mov {{ms[d]}}, {{q64[n]}} ; :lo12:{{.exp(l)}} (adrp で計算済み)"
+/*  リテラルプール（=label / =定数）と PC 相対のリテラル
+LDR !Yxr[d],=!Ll :: "mov {{q64[d]}}, {{.exp(l)}}"
+LDR !Yxs[d],=!Ll :: "mov r11, {{.exp(l)}}!{NL}mov {{ms[d]}}, r11"
+LDR !Ywr[d],=!Ll :: "mov {{q32[d]}}, {{.exp(l)}}"
+LDR !Yws[d],=!Ll :: "mov r11d, {{.exp(l)}}!{NL}mov {{ms[d]}}, r11"
+LDR !Yxr[d],!Ll :: "mov {{q64[d]}}, [RIP+{{.exp(l)}}]"
+LDR !Yxs[d],!Ll :: "mov r11, [RIP+{{.exp(l)}}]!{NL}mov {{ms[d]}}, r11"
+LDR !Ywr[d],!Ll :: "lea r11, [RIP+{{.exp(l)}}]!{NL}mov {{q32[d]}}, [r11]"
+LDR !Yws[d],!Ll :: "lea r11, [RIP+{{.exp(l)}}]!{NL}mov r11d, [r11]!{NL}mov {{ms[d]}}, r11"
+}
+
+/* =====================================================================
+/*  ロード・ストア
+/*    メモリ形 k: 0 [Xn]  1 [Xn,#i]  2 [Xn,Xm]  3 [Xn,Xm,LSL #s]
+/*                4 [Xn,:lo12:label]（adrp の後。アドレスは adrp で計算済み）
+/*                5 [Xn,#i]!（前置）  6 [Xn],#i（後置）
+/*    ベース・インデックスがメモリにあるときは r11 にアドレスを作る
+/*    （両方メモリなら r10 も使う）。値がメモリにあるときは、アドレスを
+/*    作ったあとで r10 を通す。
+/* =====================================================================
+!def MP(k, cn, cm) {
+!local N = CP(0, cn, "n")
+!local M = CP(0, cm, "m")
+!if k == 0 !then {
+!return "[" + N + "\\]"
+}
+!if k == 1 !then {
+!return "[" + N + ",#!Li]"
+}
+!if k == 2 !then {
+!return "[" + N + "," + M + "\\]"
+}
+!if k == 3 !then {
+!return "[" + N + "," + M + ",LSL #!s]"
+}
+!if k == 4 !then {
+!return "[" + N + ",:LO12:!Ll]"
+}
+!if k == 5 !then {
+!return "[" + N + ",#!Li]\\!"
+}
+!return "[" + N + "\\],#!Li"
+}
+
+/*  アドレス計算の前置き
+!def MS(k, cn, cm) {
+!local LN = "mov r11, {{ms[n]}}" + NL
+!local LM = "mov r11, {{ms[m]}}" + NL
+!if k == 2 || k == 3 !then {
+!if cn == 1 && cm == 0 !then {
+!return LN
+}
+!if cn == 0 && cm == 1 !then {
+!return LM
+}
+!if cn == 1 && cm == 1 && k == 2 !then {
+!return LN + "mov r10, {{ms[m]}}" + NL + "add r11, r10" + NL
+}
+!if cn == 1 && cm == 1 && k == 3 !then {
+!return LM + "shl r11, {{s}}" + NL + "mov r10, {{ms[n]}}" + NL + "add r11, r10" + NL
+}
+!return ""
+}
+!if k == 5 !then {
+!if cn == 0 !then {
+!return "lea {{q64[n]}}, [{{q64[n]}}+{{.exp(i)}}]" + NL
+}
+!return LN + "lea r11, [r11+{{.exp(i)}}]" + NL + "mov {{ms[n]}}, r11" + NL
+}
+!return cn == 1 ? LN : ""
+}
+
+/*  アドレス
+!def MA(k, cn, cm) {
+!local B = cn == 0 ? "{{q64[n]}}" : "r11"
+!if k == 1 !then {
+!return "[" + B + "+{{.exp(i)}}]"
+}
+!if k == 2 !then {
+!if cn == 1 && cm == 1 !then {
+!return "[r11]"
+}
+!return "[" + B + "+" + (cm == 0 ? "{{q64[m]}}" : "r11") + "*1]"
+}
+!if k == 3 !then {
+!if cn == 1 && cm == 1 !then {
+!return "[r11]"
+}
+!return "[" + B + "+" + (cm == 0 ? "{{q64[m]}}" : "r11") + "*{{1<<s}}]"
+}
+!return "[" + B + "]"
+}
+
+/*  後置インデックスの書き戻し
+!def MF(k, cn) {
+!if k != 6 !then {
+!return ""
+}
+!if cn == 0 !then {
+!return NL + "lea {{q64[n]}}, [{{q64[n]}}+{{.exp(i)}}]"
+}
+!return NL + "lea r11, [r11+{{.exp(i)}}]" + NL + "mov {{ms[n]}}, r11"
+}
+
+/*  どのメモリ形を作るか（mode 0: 全部、1: ldur / stur の 0 と 1、2: ldar / stlr の 0）
+!def KOK(mode, k) {
+!return mode == 0 ? 1 : (mode == 1 ? (k < 2) : (k == 0))
+}
+
+/*  ロードの命令列（kind: 0 X, 1 W, 2 B, 3 H, 4 SB->X, 5 SB->W, 6 SH->X, 7 SH->W, 8 SW->X）
+/*    r64 / r32 は宛先の 64 / 32 ビットの綴り、A はアドレス
+!def LDOP(kind, r64, r32, A) {
+!if kind == 0 !then {
+!return "mov " + r64 + ", " + A
+}
+!if kind == 1 !then {
+!return "mov " + r32 + ", " + A
+}
+!if kind == 2 !then {
+!return "movzx " + r64 + ", " + A
+}
+!if kind == 3 !then {
+!return "mov r10w, " + A + NL + "movzx " + r32 + ", r10w"
+}
+!if kind == 4 !then {
+!return "movsx " + r64 + ", " + A
+}
+!if kind == 5 !then {
+!return "movsx " + r64 + ", " + A + NL + "mov " + r32 + ", " + r32
+}
+!if kind == 6 !then {
+!return "mov r10w, " + A + NL + "movsx " + r64 + ", r10w"
+}
+!if kind == 7 !then {
+!return "mov r10w, " + A + NL + "movsx " + r32 + ", r10w"
+}
+!return "movsxd " + r64 + ", " + A
+}
+
+!def ld(mn, w, kind, mode) {
+!local k = 0
+!while k < 7 {
+!if KOK(mode, k) !then {
+!local cn = 0
+!while cn < 2 {
+!local cm = 0
+!while cm < (k == 2 || k == 3 ? 2 : 1) {
+!local A = MA(k, cn, cm)
+!local ct = 0
+!while ct < 2 {
+!local P = CP(w, ct, "t") + "," + MP(k, cn, cm)
+!if ct == 0 !then {
+!{mn} !{P} :: "!{MS(k, cn, cm)}!{LDOP(kind, "{{q64[t]}}", "{{q32[t]}}", A)}!{MF(k, cn)}"
+}
+!if ct == 1 !then {
+!{mn} !{P} :: "!{MS(k, cn, cm)}!{LDOP(kind, "r10", "r10d", A)}!{MF(k, cn)}!{NL}mov {{ms[t]}}, r10"
+}
+!set ct = ct + 1
+}
+!set cm = cm + 1
+}
+!set cn = cn + 1
+}
+}
+!set k = k + 1
+}
+}
+
+/*  ストア: w は元の幅、b は書く幅（64 / 32 / 16 / 8）
+!def st(mn, w, b, mode) {
+!local rq = b == 64 ? "q64" : (b == 32 ? "q32" : (b == 16 ? "q16" : "q8"))
+!local rs = b == 64 ? "r10" : (b == 32 ? "r10d" : (b == 16 ? "r10w" : "r10b"))
+!local k = 0
+!while k < 7 {
+!if KOK(mode, k) !then {
+!local cn = 0
+!while cn < 2 {
+!local cm = 0
+!while cm < (k == 2 || k == 3 ? 2 : 1) {
+!local A = MA(k, cn, cm)
+!local ct = 0
+!while ct < 2 {
+!local P = CP(w, ct, "t") + "," + MP(k, cn, cm)
+!if ct == 0 !then {
+!{mn} !{P} :: "!{MS(k, cn, cm)}mov !{A}, {{!{rq}[t]}}!{MF(k, cn)}"
+}
+!if ct == 1 !then {
+!{mn} !{P} :: "!{MS(k, cn, cm)}mov r10, {{ms[t]}}!{NL}mov !{A}, !{rs}!{MF(k, cn)}"
+}
+!set ct = ct + 1
+}
+!set cm = cm + 1
+}
+!set cn = cn + 1
+}
+}
+!set k = k + 1
+}
+}
+
+/*  ゼロレジスタのストア
+!def stz(mn, sz, mode) {
+!local k = 0
+!while k < 7 {
+!if KOK(mode, k) !then {
+!local cn = 0
+!while cn < 2 {
+!local cm = 0
+!while cm < (k == 2 || k == 3 ? 2 : 1) {
+!{mn} !{MP(k, cn, cm)} :: "!{MS(k, cn, cm)}mov !{sz} !{MA(k, cn, cm)}, 0!{MF(k, cn)}"
+!set cm = cm + 1
+}
+!set cn = cn + 1
+}
+}
+!set k = k + 1
+}
+}
+
+/*  ペア（ldp / stp。メモリ形 0, 1, 5, 6）
+!def pair(w) {
+!local o = w == 0 ? "8" : "4"
+!local rq = w == 0 ? "q64" : "q32"
+!local k = 0
+!while k < 7 {
+!if k == 0 || k == 1 || k == 5 || k == 6 !then {
+!local cn = 0
+!while cn < 2 {
+!local B = cn == 0 ? "{{q64[n]}}" : "r11"
+!local A1 = k == 1 ? "[" + B + "+{{.exp(i)}}]" : "[" + B + "]"
+!local A2 = k == 1 ? "[" + B + "+{{.exp(i)}}+" + o + "]" : "[" + B + "+" + o + "]"
+!local ct = 0
+!while ct < 2 {
+!local cu = 0
+!while cu < 2 {
+!local P = CP(w, ct, "t") + "," + CP(w, cu, "u") + "," + MP(k, cn, 0)
+!local L1 = ct == 0 ? "mov {{" + rq + "[t]}}, " + A1 : "mov " + U(w) + ", " + A1 + NL + "mov {{ms[t]}}, r10"
+!local L2 = cu == 0 ? "mov {{" + rq + "[u]}}, " + A2 : "mov " + U(w) + ", " + A2 + NL + "mov {{ms[u]}}, r10"
+!local S1 = ct == 0 ? "mov " + A1 + ", {{" + rq + "[t]}}" : "mov r10, {{ms[t]}}" + NL + "mov " + A1 + ", " + U(w)
+!local S2 = cu == 0 ? "mov " + A2 + ", {{" + rq + "[u]}}" : "mov r10, {{ms[u]}}" + NL + "mov " + A2 + ", " + U(w)
+LDP !{P} :: "!{MS(k, cn, 0)}!{L1}!{NL}!{L2}!{MF(k, cn)}"
+STP !{P} :: "!{MS(k, cn, 0)}!{S1}!{NL}!{S2}!{MF(k, cn)}"
+!set cu = cu + 1
+}
+!set ct = ct + 1
+}
+!set cn = cn + 1
+}
+}
+!set k = k + 1
+}
+}
+
+/* =====================================================================
+/*  展開
+/* =====================================================================
+!set w = 0
+!while w < 2 {
+!alu3(w, "ADD", "add", 1)
+!alu3(w, "AND", "and", 1)
+!alu3(w, "ORR", "or", 1)
+!alu3(w, "EOR", "xor", 1)
+!alu3(w, "MUL", "imul", 1)
+!alu3(w, "SUB", "sub", 2)
+!alur11(w, "BIC", "and", 1)
+!alur11(w, "ORN", "or", 1)
+!alur11(w, "EON", "xor", 1)
+!alur11(w, "ADDS", "add", 0)
+!alur11(w, "SUBS", "sub", 0)
+!alur11(w, "ANDS", "and", 0)
+!aluimm(w, "ADD", "add", 1)
+!aluimm(w, "SUB", "sub", 1)
+!aluimm(w, "AND", "and", 2)
+!aluimm(w, "ORR", "or", 2)
+!aluimm(w, "EOR", "xor", 2)
+!aluimm(w, "LSL", "shl", 0)
+!aluimm(w, "LSR", "shr", 0)
+!aluimm(w, "ASR", "sar", 0)
+!aluimm(w, "ROR", "ror", 0)
+!unary(w)
+!muldiv(w)
+!movcmp(w)
+!condsel(w)
+!pair(w)
+!set w = w + 1
+}
+!mullong()
+!movimm()
+!extend()
+!addr()
+
+/*  ロード（ldr / ldur / ldar）
+!ld("LDR",    0, 0, 0)
+!ld("LDR",    1, 1, 0)
+!ld("LDRB",   1, 2, 0)
+!ld("LDRH",   1, 3, 0)
+!ld("LDRSB",  0, 4, 0)
+!ld("LDRSB",  1, 5, 0)
+!ld("LDRSH",  0, 6, 0)
+!ld("LDRSH",  1, 7, 0)
+!ld("LDRSW",  0, 8, 0)
+!ld("LDUR",   0, 0, 1)
+!ld("LDUR",   1, 1, 1)
+!ld("LDURB",  1, 2, 1)
+!ld("LDURH",  1, 3, 1)
+!ld("LDURSB", 0, 4, 1)
+!ld("LDURSB", 1, 5, 1)
+!ld("LDURSH", 0, 6, 1)
+!ld("LDURSH", 1, 7, 1)
+!ld("LDURSW", 0, 8, 1)
+!ld("LDAR",   0, 0, 2)
+!ld("LDAR",   1, 1, 2)
+!ld("LDARB",  1, 2, 2)
+!ld("LDARH",  1, 3, 2)
+
+/*  ストア（str / stur / stlr。x86 の mov はそのままリリースの順序を満たす）
+!st("STR",   0, 64, 0)
+!st("STR",   1, 32, 0)
+!st("STRB",  1, 8,  0)
+!st("STRH",  1, 16, 0)
+!st("STUR",  0, 64, 1)
+!st("STUR",  1, 32, 1)
+!st("STURB", 1, 8,  1)
+!st("STURH", 1, 16, 1)
+!st("STLR",  0, 64, 2)
+!st("STLR",  1, 32, 2)
+!st("STLRB", 1, 8,  2)
+!st("STLRH", 1, 16, 2)
+!stz("STR XZR,",  "QWORD", 0)
+!stz("STR WZR,",  "DWORD", 0)
+!stz("STRB WZR,", "BYTE",  0)
+!stz("STRH WZR,", "WORD",  0)
+
+/* ---------------------------------------------------------------------
+/*  関数のフレーム（x30 は x86 では戻り番地としてスタックにある）
+/* ---------------------------------------------------------------------
+STP X29,X30,[SP,#!i]\! :: i>=0;3,(i&15)!=0;3 :: "sub rsp, {{8-i}}\n\tmov [rsp], rbp"
+LDP X29,X30,[SP\],#!i  :: i<=0;3,(i&15)!=0;3 :: "mov rbp, [rsp]\n\tadd rsp, {{i+8}}"
+
+/* ---------------------------------------------------------------------
+/*  分岐
+/* ---------------------------------------------------------------------
+B !Lt              :: "jmp {{.exp(t)}}"
+B.!Yacc[c] !Lt     :: "j{{xcc[c]}} {{.exp(t)}}"
+BL !Lt             :: "call {{.exp(t)}}\n\tmov rdi, rax"
+BR !Yxr[n]         :: "jmp {{q64[n]}}"
+BR !Yxs[n]         :: "mov r11, {{ms[n]}}\n\tjmp r11"
+BLR !Yxr[n]        :: "call {{q64[n]}}\n\tmov rdi, rax"
+BLR !Yxs[n]        :: "mov r11, {{ms[n]}}\n\tcall r11\n\tmov rdi, rax"
+RET                :: "mov rax, rdi\n\tret"
+
+/* ---------------------------------------------------------------------
+/*  システム
+/* ---------------------------------------------------------------------
+NOP                :: "nop"
+SVC #!Li           :: "call __a64_svc"
+BRK #!Li           :: "int3"
+DMB !Lx            :: "mfence"
+DSB !Lx            :: "mfence"
+ISB                :: "lfence"
+YIELD              :: "pause"
+
+/* ---------------------------------------------------------------------
+/*  GNU as の短縮形のセクション指定を axx の .section に
+/* ---------------------------------------------------------------------
+\.TEXT             :: ".section .text"
+\.DATA             :: ".section .data"
+\.BSS              :: ".section .bss"
