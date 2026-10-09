@@ -8482,6 +8482,8 @@ static int dir_errmsg(Assembler *asmb, PatEntry *e){
     return 1;
 }
 
+static int bare_name_of(const char *text, char *out, size_t cap);
+
 /* `.echo` — 本文行から標準エラーへ印字する。ワードは出さない。 */
 static int dir_echo(Assembler *asmb, PatEntry *e){
     if(!e || strcmp(e->f[0], ".echo") != 0) return 0;
@@ -8494,6 +8496,47 @@ static int dir_echo(Assembler *asmb, PatEntry *e){
     if(!parts){ perror("malloc"); exit(1); }
     for(int k = 0; k < n; k++){
         if(items[k].is_str){ parts[k] = items[k].text; continue; }
+        /* 裸の名前は 文字列シンボル → 配列シンボル → 式 の順で解く。集合も
+           配列も同じ配列シンボルなので、どちらも `[...]` の形で出る。 */
+        {
+            char nm[256];
+            if(bare_name_of(items[k].text, nm, sizeof(nm))){
+                for(char *q = nm; *q; q++) *q = axx_upper_char(*q);
+                const char *sv = strsym_get(st, nm);
+                if(sv){
+                    parts[k] = strdup(sv);
+                    if(!parts[k]){ perror("strdup"); exit(1); }
+                    continue;
+                }
+                struct ArrSym *ar = arrsym_get(st, nm);
+                if(ar){
+                    size_t cap = 4;
+                    for(int a = 0; a < ar->len; a++)
+                        cap += 100 + (ar->items[a].is_str && ar->items[a].s
+                                      ? strlen(ar->items[a].s) * 2 + 2 : 0);
+                    char *b = malloc(cap);
+                    if(!b){ perror("malloc"); exit(1); }
+                    size_t len = 0;
+                    b[len++] = '[';
+                    for(int a = 0; a < ar->len; a++){
+                        if(a){ b[len++] = ','; b[len++] = ' '; }
+                        if(ar->items[a].is_str){
+                            b[len++] = '"';
+                            for(const char *q = ar->items[a].s ? ar->items[a].s : ""; *q; q++)
+                                b[len++] = *q;
+                            b[len++] = '"';
+                        } else {
+                            char cb2[96]; u256_to_pydec(ar->items[a].v, cb2, sizeof(cb2));
+                            size_t l = strlen(cb2);
+                            memcpy(b + len, cb2, l); len += l;
+                        }
+                    }
+                    b[len++] = ']'; b[len] = 0;
+                    parts[k] = b;
+                    continue;
+                }
+            }
+        }
         int io = 0;
         uint256_t v = expr_expression_pat(asmb, items[k].text, 0, &io);
         char cb[96];

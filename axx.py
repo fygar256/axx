@@ -6116,6 +6116,21 @@ class DirectiveProcessor:
             if k == 's':
                 parts.append(v)
             else:
+                # 裸の名前は 文字列シンボル → 配列シンボル → 式 の順で解く。
+                # 集合 (`.setsym::e::R1,R2`) も配列 (`[R1,R2]`) も同じ配列
+                # シンボルなので、どちらも `[...]` の形で出る。
+                _nm = bare_name_of(v)
+                if _nm is not None:
+                    _key = StringUtils.upper(_nm)
+                    if _key in st.strsymbols:
+                        parts.append(st.strsymbols[_key])
+                        continue
+                    if _key in st.arrsymbols:
+                        parts.append('[' + ', '.join(
+                            '"' + e.replace('\0', '\\0') + '"' if isinstance(e, str)
+                            else str(_mini_signed(e))
+                            for e in st.arrsymbols[_key]) + ']')
+                        continue
                 val, _idx = self.expr_eval.expression_pat(v, 0)
                 # 未定義は番兵の数字ではなく UNDEF と出す（caxx.c と同じ）。
                 parts.append('UNDEF' if _undef(val) else _mini_signed(val))
