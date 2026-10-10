@@ -1989,6 +1989,11 @@ class AssemblerState:
 
         self._in_match_attempt = False
 
+        # 因子を 1 文字も読めなかったら立つ印（_factor_impl が立てる）。
+        # 照合が式・因子の捕捉の前に倒し、後で見て、立っていればその
+        # パターンを不一致にする。caxx.c の expr_missing と同じ。
+        self.expr_missing = False
+
         # 出力ワードの形。bts が 1 ワードのビット数（`.bits`）、endian が
         # バイト順、align と padding が `.align` の既定値と詰め物の値。
         self.align = 16
@@ -3602,6 +3607,8 @@ class ExpressionEvaluator:
         命令の数）と `!!!!`（ストップビット）。VLIW の 2 つは expcaps が
         許していなければ読まない。factor1 が 1 文字も進めず、しかも区切り
         文字でもないときだけ「読めない字」の警告を出す（照合の試行中は出さない）。
+        factor1 が 1 文字も進めなかったときは、区切り文字の有無にかかわらず
+        state.expr_missing を立てる（因子のあるべきところに因子が無い）。
         """
         idx = StringUtils.skipspc(s, idx)
         x = 0
@@ -3657,6 +3664,8 @@ class ExpressionEvaluator:
         else:
             prev_idx = idx
             x, idx = self.factor1(s, idx)
+            if idx == prev_idx:
+                self.state.expr_missing = True
             if (idx == prev_idx
                     and idx < len(s)
                     and s[idx] not in (chr(0), ',', ')', ']', CB, ' ', '\t')
@@ -6510,6 +6519,8 @@ class PatternMatcher:
         式とその綴り、`!E` は列挙リスト、`!Y集合[変数]` は集合の項目番号。
         当たるたびに値を変数へ束縛し、同時に n_expr / n_lit / n_sym を数えて
         last_score に特異度スコアを残す。
+        式・因子の捕捉（`!x` `!!x` `!L` `!F/!D/!Q`）で、因子のあるべきところに
+        因子が無ければ（空、`1+`、`-`、`()` など）、そのパターンは当たらない。
         """
         self.state.deb1 = s
         self.state.deb2 = t
@@ -6595,6 +6606,7 @@ class PatternMatcher:
                     stopchar, idx_t, _closes = self._var_stopchar(t, idx_t + _nl)
 
                     _cap_start = idx_s
+                    self.state.expr_missing = False
                     try:
                         v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
                     finally:
@@ -6611,6 +6623,8 @@ class PatternMatcher:
                         self.state.diag(" error - !F: cannot convert value to float32; using 0.", set_error=True)
                         v = 0
                     self.var_manager.put(a, v)
+                    if self.state.expr_missing:
+                        return False
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
                         idx_s += 1
                     continue
@@ -6624,6 +6638,7 @@ class PatternMatcher:
                     stopchar, idx_t, _closes = self._var_stopchar(t, idx_t + _nl)
 
                     _cap_start = idx_s
+                    self.state.expr_missing = False
                     try:
                         v, idx_s = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
                     finally:
@@ -6638,6 +6653,8 @@ class PatternMatcher:
                         self.state.diag(" error - !D: cannot convert value to float64; using 0.", set_error=True)
                         v = 0
                     self.var_manager.put(a, v)
+                    if self.state.expr_missing:
+                        return False
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
                         idx_s += 1
                     continue
@@ -6652,6 +6669,7 @@ class PatternMatcher:
 
                     idx_s_q_start = idx_s
 
+                    self.state.expr_missing = False
                     try:
                         v, idx_s_after = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
                     finally:
@@ -6689,6 +6707,8 @@ class PatternMatcher:
 
                     x = int(h, 16)
                     self.var_manager.put(a, x)
+                    if self.state.expr_missing:
+                        return False
                     idx_s = idx_s_after
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
                         idx_s += 1
@@ -6706,6 +6726,7 @@ class PatternMatcher:
                     self.state._elf_capturing_var = a
                     _cap_prior = self.state.error_undefined_label
                     self.state.error_undefined_label = False
+                    self.state.expr_missing = False
                     try:
                         v, idx_s = self.expr_eval.expression_esc(s, idx_s, stopchar)
                     finally:
@@ -6728,6 +6749,8 @@ class PatternMatcher:
                     else:
                         self.state.error_undefined_label = _cap_prior or _cap_undef
                         self.var_manager.put_tagged(a, v, _cap_undef)
+                    if self.state.expr_missing:
+                        return False
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
                         idx_s += 1
                     continue
@@ -6793,6 +6816,7 @@ class PatternMatcher:
                     _cap_prior = self.state.error_undefined_label
                     self.state.error_undefined_label = False
                     _cap_start = idx_s
+                    self.state.expr_missing = False
                     try:
                         v, idx_s = self.expr_eval.factor(s, idx_s)
                     finally:
@@ -6802,6 +6826,8 @@ class PatternMatcher:
                     _cap_undef = self.state.error_undefined_label
                     self.state.error_undefined_label = _cap_prior or _cap_undef
                     self.var_manager.put_tagged(a, v, _cap_undef)
+                    if self.state.expr_missing:
+                        return False
                     continue
                 else:
                     _nl = self._var_name_at(t, idx_t - 1)
@@ -6814,6 +6840,7 @@ class PatternMatcher:
                     _cap_prior = self.state.error_undefined_label
                     self.state.error_undefined_label = False
                     _cap_start = idx_s
+                    self.state.expr_missing = False
                     try:
                         v, idx_s = self.expr_eval.expression_esc(s, idx_s, stopchar)
                     finally:
@@ -6825,6 +6852,8 @@ class PatternMatcher:
                     _cap_undef = self.state.error_undefined_label
                     self.state.error_undefined_label = _cap_prior or _cap_undef
                     self.var_manager.put_tagged(a, v, _cap_undef)
+                    if self.state.expr_missing:
+                        return False
                     if stopchar != chr(0) and idx_s < len(s) and s[idx_s] == stopchar:
                         idx_s += 1
                     continue

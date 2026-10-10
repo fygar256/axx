@@ -2329,6 +2329,11 @@ typedef struct {
 
     int        in_match_attempt;
 
+    /* 因子を 1 文字も読めなかったら立つ印（expr_factor_impl が立てる）。
+       照合が式・因子の捕捉の前に倒し、後で見て、立っていればその
+       パターンを不一致にする。axx.py の state.expr_missing と同じ。 */
+    int        expr_missing;
+
     int        match_score_expr;
     int        match_score_sym;
     int        match_score_lit;
@@ -5587,6 +5592,8 @@ static uint256_t expr_factor_impl(Assembler *asmb, const char *s, int idx, int *
     } else {
         int prev_idx = idx;
         x=expr_factor1(asmb,s,idx,&idx);
+        /* 因子のあるべきところに因子が無い（axx.py の _factor_impl と同じ）。 */
+        if(idx == prev_idx) st->expr_missing = 1;
         if(idx == prev_idx && idx < slen){
             char c = s[idx];
             if(c!='\0' && c!=',' && c!=')' && c!=']' && c!=CB_CHAR && c!=' ' && c!='\t'
@@ -8956,6 +8963,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 char stopchar = '\0';
                 idx_t = pat_var_stopchar(t, tlen, idx_t + _nl, &stopchar, closes, &nclose);
                 int idx_s_q_start = idx_s;
+                st->expr_missing = 0;
                 uint256_t fv = expr_expression_esc_float(asmb, s, idx_s, stopchar, &idx_s);
                 /* 未定義は 0（未定義はすでに報告済み）。axx.py と同じ。 */
                 int fv_undef = u256_is_undef(fv);
@@ -9026,6 +9034,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     }
                     var_slot_put(st, vslot, qbits);
                 }
+                if(st->expr_missing){ result=0; break; }
                 continue;
             } else if(a=='L'){
                 if(idx_t >= tlen){ result=0; break; }
@@ -9039,6 +9048,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 st->elf_capturing_var = vslot;
                 int _cap_prior_l = st->error_undefined_label;
                 st->error_undefined_label = 0;
+                st->expr_missing = 0;
                 uint256_t v = expr_expression_esc(asmb,s,idx_s,stopchar,&idx_s);
                 int _cap_undef_l = st->error_undefined_label;
                 st->elf_capturing_var = -1;
@@ -9053,6 +9063,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                     st->error_undefined_label = _cap_prior_l || _cap_undef_l;
                     var_slot_put_tagged(st,vslot,v,_cap_undef_l);
                 }
+                if(st->expr_missing){ result=0; break; }
                 if(stopchar && s[idx_s]==stopchar) idx_s++;
                 continue;
             } else if(a=='E'){
@@ -9111,6 +9122,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 int _cap_prior_eul = st->error_undefined_label;
                 st->error_undefined_label = 0;
                 int _cap_start = idx_s;
+                st->expr_missing = 0;
                 uint256_t v=expr_factor(asmb,s,idx_s,&idx_s);
                 int _cap_this_undef = st->error_undefined_label;
                 st->error_undefined_label = _cap_prior_eul || _cap_this_undef;
@@ -9118,6 +9130,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 elf_v2l_finish(st, vslot, s + _cap_start, idx_s - _cap_start);
                 cap_text_set(st, vslot, s, _cap_start, idx_s, '\0');
                 var_slot_put_tagged(st,vslot,v,_cap_this_undef);
+                if(st->expr_missing){ result=0; break; }
                 continue;
             } else {
                 int _nl = var_name_len(t+idx_t-1);
@@ -9130,6 +9143,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 int _cap_prior_eul2 = st->error_undefined_label;
                 st->error_undefined_label = 0;
                 int _cap_start2 = idx_s;
+                st->expr_missing = 0;
                 uint256_t v=expr_expression_esc(asmb,s,idx_s,stopchar,&idx_s);
                 int _cap_this_undef2 = st->error_undefined_label;
                 st->error_undefined_label = _cap_prior_eul2 || _cap_this_undef2;
@@ -9138,6 +9152,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 elf_v2l_finish(st, vslot, s + _cap_start2, idx_s - _cap_start2);
                 cap_text_set(st, vslot, s, _cap_start2, idx_s, stopchar);
                 var_slot_put_tagged(st,vslot,v,_cap_this_undef2);
+                if(st->expr_missing){ result=0; break; }
                 if(stopchar && s[idx_s]==stopchar) idx_s++;
                 continue;
             }

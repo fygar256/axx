@@ -51,14 +51,14 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all seventy bundled pattern/source pairs with
-both implementations and `cmp`s the results. For the five `.textmode` pairs it also
+exactly that: `test1` assembles all seventy-one bundled pattern/source pairs with
+both implementations and `cmp`s the results. For the five `.textmode` pairs and the `exprmiss.axx` pair it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` and `ministr.axx` pairs the `.echo` lines each one writes to standard
 error, and for the `regress.axx` regression test its `-V` text and its diagnostics.
 The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for two hundred and four comparisons in all.
+text output are compared too, for two hundred and six comparisons in all.
 
 **Contents**
 
@@ -450,6 +450,27 @@ expression read (`1+2*3`), `!E` the whole list (`a0-a2`); the table in section
 Captured values are referenced from `error_patterns` and `binary_list` by the
 bare name — the `!` prefix is not repeated there. Every variable is reset to 0
 for each pattern line, so an unmatched optional operand reads as 0.
+
+**No expression or factor, no match.** The expression captures `!x`, `!Lx`,
+`!Fx`, `!Dx` and `!Qx` and the factor capture `!!x` do not match when there is
+no expression or factor at that position. That covers the empty case (`ld a,`
+against `LD A,!n`) and also an expression with a factor missing inside it —
+`1+`, `-`, `~`, `()`, `( )`. The value is never read as 0 to make the pattern
+match. A line that fails this way takes another pattern if one matches, and
+otherwise is a *Syntax error* (or is let through when `.passthru` is on,
+3.16). To let an operand be left out, enclose it in `[[ ]]` (3.8).
+
+```
+LD A,!n :: 0x3e,n
+```
+
+| Source | Result |
+|---|---|
+| `ld a,5` | `0x3e 0x05` |
+| `ld a,(2)` | `0x3e 0x02` |
+| `ld a,` | no match |
+| `ld a,1+` | no match |
+| `ld a,()` | no match |
 
 **Variable names.** A variable is written `x` above, but a name may be longer:
 it starts with a lowercase letter and continues over lowercase letters, digits
@@ -4897,6 +4918,7 @@ The x86_64 pattern file is also maintained separately at
 | **8080toz80.axx** | 5.7 KB | 117 | **hello8080.s** | Intel 8080 to Zilog Z80 source translator; `.textmode`, `!L` and `{{.exp()}}` (3.18) at work |
 | **textmode.axx** | 2.0 KB | 13 | **textmode.s** | `.textmode`, `!L`, `{{.exp()}}` and `;` comments (3.18); test only |
 | **expcap.axx** | 2.9 KB | 41 | **expcap.s** | `{{.exp()}}` emits the text of every kind of capture (3.18); test only |
+| **exprmiss.axx** | 1.1 KB | 8 | **exprmiss.s** | A line with no expression or factor where one belongs (empty, `1+`, `-`, `~`, `()`) matches none of `!`, `!!`, `!L` and `!F`/`!D`/`!Q`, and is let through by `.passthru` (3.3); test only |
 | **arrindex.axx** | 860 B | 14 | **arrindex.s** | Array symbols: bare names as items, a name as a subscript, `.index` (3.6.1); test only |
 | **passthru.axx** | 686 B | 6 | **passthru.s** | `.passthru` and `.eol` (3.16 / 3.17); test only |
 | **unordered.axx** | 1.7 KB | 28 | **unordered.s** | `.unordered` and per-variable `.map` (3.19): the Z80 `C` as a register and as carry; test only |
@@ -4953,9 +4975,10 @@ label, branches resolved within a section and PC-relative data, checked against
 llvm-mc 19 and ld.lld 19) and `bf_sparc.s` (the Brainfuck
 interpreter, run under qemu-sparc64).
 
-`test1` runs all seventy pairs through both implementations and
+`test1` runs all seventy-one pairs through both implementations and
 compares the `-b` raw binaries. For the five pairs that use `.textmode`
-(`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`) it also compares the translated text each
+(`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`),
+and for `exprmiss.axx`, which looks at lines let through by `.passthru`, it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
 `elftype.s` and `elfgen.axx` / `elfgen.s` pairs are about relocations and the
 ELF header, the `elfprio.axx` / `elfprio.s` pair is about which of the three
@@ -4998,7 +5021,7 @@ The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for two hundred and four comparisons in all.
+never compares, for two hundred and six comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -5031,7 +5054,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all seventy bundled pattern/source pairs with both
+`test1` assembles all seventy-one bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 five `.textmode` pairs, the `.echo` lines of the `echo.axx` and `ministr.axx` pairs,
 and the `-V` text and diagnostics of the `regress.axx` regression test.
