@@ -157,7 +157,7 @@ caxx $P/x86_64.axx $S/hello.s -m 3 -f 32 -o b58
 caxx $P/x86_64m.axx $S/hello.s -m 3 -f 32 -o b59
 caxx $P/bf.axx $S/bf.s -m 3 -f 32 -o b60
 caxx $P/8080toz80.axx $S/hello8080.s -m 3 -f 32 -o b61
-caxx $P/aarch64.axx $S/aarch64.s -m 3 -f 32 -o b62
+caxx $P/aarch64.axx $S/aarch64.s -m 183 -f 64 -o b62
 
 caxx $P/4004.axx $S/4004.s -g -o b63
 caxx $P/z80.axx $S/z80.s -g -o b64
@@ -333,7 +333,7 @@ paxx $P/x86_64.axx $S/hello.s -m 3 -f 32 -o a58
 paxx $P/x86_64m.axx $S/hello.s -m 3 -f 32 -o a59
 paxx $P/bf.axx $S/bf.s -m 3 -f 32 -o a60
 paxx $P/8080toz80.axx $S/hello8080.s -m 3 -f 32 -o a61
-paxx $P/aarch64.axx $S/aarch64.s -m 3 -f 32 -o a62
+paxx $P/aarch64.axx $S/aarch64.s -m 183 -f 64 -o a62
 
 paxx $P/4004.axx $S/4004.s -g -o a63
 paxx $P/z80.axx $S/z80.s -g -o a64
