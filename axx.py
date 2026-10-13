@@ -5116,6 +5116,74 @@ class DirectiveProcessor:
                 return True
         return False
 
+    def _captext_has_linked_label(self, txt):
+        """綴りが、値をリンカが決めるラベルを含むか。
+
+        外部のラベル（`.extern` / `.weak` / `-i`）と、いまアセンブルしている
+        セクションとは別のセクションのラベルがそれに当たる。`-o` では、そうした
+        ラベルの今の値（外部は 0、別セクションはそのセクションの中の位置）から
+        求めた距離や大きさには意味がない。読み方は _captext_has_label() と同じ。
+        caxx.c の captext_has_linked_label() と同じ規則である。
+        """
+        n = len(txt)
+        i = 0
+        lw = self.state.lwordchars
+        while i < n:
+            c = txt[i]
+            if c in '"\'':
+                j = i + 1
+                while j < n and txt[j] != c:
+                    if txt[j] == '\\' and j + 1 < n:
+                        j += 1
+                    j += 1
+                i = j + 1
+                continue
+            if c == '$':
+                i += 2 if (i + 1 < n and txt[i + 1] in '$.') else 1
+                continue
+            if c == '#' or c in '0123456789':
+                i += 1
+                while i < n and (txt[i] in _ISLABEL_ALNUM or txt[i] in '_.'):
+                    i += 1
+                continue
+            if c in lw:
+                j = i
+                while j < n and txt[j] in lw:
+                    j += 1
+                le = self.state.labels.get(txt[i:j][:511])
+                i = j
+                if le is None or (len(le) > 2 and le[2] and not (len(le) > 4 and le[4] is not None)):
+                    continue
+                if len(le) > 3 and le[3]:
+                    return True
+                if le[1] and le[1] != self.state.current_section:
+                    return True
+                continue
+            i += 1
+        return False
+
+    def _cond_tests_linked_label(self, cond_src):
+        """そのエラー条件が、値をリンカが決めるラベルを拾った変数を見ているか。
+
+        `-o` だけで働く。外部のラベルや別のセクションのラベルへの変位・値の範囲は
+        リンカが確かめるもので、ここでは判定しない（GNU as もリロケーションを
+        出すだけで、範囲の検査はリンカがする）。名前は語として一致したときだけ
+        数える。caxx.c の cond_tests_linked_label() と同じ規則である。
+        """
+        if not self.state.elf_objfile:
+            return False
+        for var, txt in self.state.vars_text.items():
+            if not txt or not self._captext_has_linked_label(txt):
+                continue
+            for m in re.finditer(re.escape(var), cond_src):
+                b, e = m.start(), m.end()
+                if b > 0 and (cond_src[b - 1].isalnum() or cond_src[b - 1] == '_'):
+                    continue
+                if e < len(cond_src) and (cond_src[e].isalnum() or cond_src[e] == '_'):
+                    continue
+                return True
+        return False
+
     def error(self, s):
         """error_patterns 欄を評価する。返り値は (発生したか, エラーコード)。
 
@@ -5164,7 +5232,8 @@ class DirectiveProcessor:
                 break
 
             if (self.state.should_report_errors()) and u and not _cond_undef \
-                    and not self._cond_tests_relocated_var(s[idx_before:idx]):
+                    and not self._cond_tests_relocated_var(s[idx_before:idx]) \
+                    and not self._cond_tests_linked_label(s[idx_before:idx]):
                 # caxx.c と同じく、倍精度を経て 64 ビットの範囲で読む。範囲外・
                 # 有限でない・未定義は 0。
                 _tf = 0.0 if _undef(t) else _float_of(t)
@@ -13821,7 +13890,17 @@ class Assembler:
                         _P_adj = self.label_manager._section_relative_offset(
                             self.state.current_section, self.state.pc + first_widx)
                         _P_w = _P_adj if _P_adj is not None else self.state.pc + first_widx
-                        addend = (raw_val - abs_wi + _P_w) * _scale
+                        # 欄は幅で切られているので、位置が欄の幅を超えると
+                        # 「欄 − ラベル + 位置」が幅の倍数だけずれる。加数のうち綴りの
+                        # 定数を除いた部分（位置と変位の基点の差）は小さいので、そこを
+                        # 欄の幅で符号付きに折り返す。caxx.c の lineassemble() と同じ。
+                        _cst = self.state._elf_insn_reloc_hint.get(('v', first_widx), 0)
+                        _pd = raw_val - abs_wi + _P_w - _cst
+                        if 0 < _field_bits < 64:
+                            _pd &= (1 << _field_bits) - 1
+                            if _pd >= (1 << (_field_bits - 1)):
+                                _pd -= 1 << _field_bits
+                        addend = (_cst + _pd) * _scale
                     else:
                         addend = (raw_val - abs_wi) * _scale
 

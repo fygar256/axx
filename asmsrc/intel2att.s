@@ -109,6 +109,10 @@ main:
         mov     rax, [rbx+rcx]
         mov     rax, [rbx+rcx+16]
         mov     rax, [rbx+rcx-16]
+# 倍率を書かない 2 つ目が rsp なら基底と入れ替える（rsp はインデックスになれない）
+        mov     rax, [r13+rsp]
+        mov     rax, [r13+rsp+16]
+        mov     rax, [r13+rsp-16]
         mov     rax, [rip+msg]
         mov     rax, [msg]
 

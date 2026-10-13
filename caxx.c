@@ -8587,6 +8587,79 @@ static int cond_tests_relocated_var(AsmState *st, const char *cond, size_t len){
     return 0;
 }
 
+/* 綴りが、値をリンカが決めるラベルを含むか。外部のラベル（`.extern` / `.weak` /
+   `-i`）と、いまアセンブルしているセクションとは別のセクションのラベルがそれに
+   当たる。`-o` では、そうしたラベルの今の値から求めた距離や大きさには意味がない。
+   読み方は captext_has_label() と同じ。
+   axx.py の DirectiveProcessor._captext_has_linked_label() と同じ規則である。 */
+static int captext_has_linked_label(AsmState *st, const char *txt){
+    int n = (int)strlen(txt), i = 0;
+    while(i < n){
+        unsigned char c = (unsigned char)txt[i];
+        if(c == '"' || c == '\''){
+            int j = i + 1;
+            while(j < n && (unsigned char)txt[j] != c){ if(txt[j] == '\\' && j + 1 < n) j++; j++; }
+            i = j + 1;
+            continue;
+        }
+        if(c == '$'){ i += (i + 1 < n && (txt[i+1] == '$' || txt[i+1] == '.')) ? 2 : 1; continue; }
+        if(c == '#' || isdigit(c)){
+            i++;
+            while(i < n && (isalnum((unsigned char)txt[i]) || txt[i] == '_' || txt[i] == '.')) i++;
+            continue;
+        }
+        if(char_in((char)c, st->lwordchars)){
+            int j = i;
+            while(j < n && char_in(txt[j], st->lwordchars)) j++;
+            char w[512];
+            int L = j - i; if(L >= (int)sizeof(w)) L = (int)sizeof(w) - 1;
+            memcpy(w, txt + i, (size_t)L); w[L] = 0;
+            i = j;
+            LabelEntry *le = lmap_find(&st->labels, w);
+            if(!le || (le->is_equ && le->reloc_type_override < 0)) continue;
+            if(le->is_imported) return 1;
+            if(le->section && le->section[0] && st->current_section
+               && strcmp(le->section, st->current_section) != 0) return 1;
+            continue;
+        }
+        i++;
+    }
+    return 0;
+}
+
+/* そのエラー条件が、値をリンカが決めるラベルを拾った変数を見ているか。`-o` だけで
+   働く。外部のラベルや別のセクションのラベルへの変位・値の範囲はリンカが確かめる
+   もので、ここでは判定しない（GNU as もリロケーションを出すだけで、範囲の検査は
+   リンカがする）。名前は語として一致したときだけ数える。
+   axx.py の DirectiveProcessor._cond_tests_linked_label() と同じ規則である。 */
+static int cond_tests_linked_label(AsmState *st, const char *cond, size_t len){
+    if(!st->elf_objfile[0]) return 0;
+    for(int vi = 0; vi < g_nvars; vi++){
+        const char *nm = g_varnames[vi];
+        if(!nm || !*nm) continue;
+        size_t nl = strlen(nm);
+        if(nl > len) continue;
+        int hit = 0;
+        for(size_t b = 0; b + nl <= len && !hit; b++){
+            if(memcmp(cond + b, nm, nl) != 0) continue;
+            if(b > 0){
+                char c = cond[b - 1];
+                if(isalnum((unsigned char)c) || c == '_') continue;
+            }
+            if(b + nl < len){
+                char c = cond[b + nl];
+                if(isalnum((unsigned char)c) || c == '_') continue;
+            }
+            hit = 1;
+        }
+        if(!hit) continue;
+        int off = st->vars[vi].text_off;
+        const char *txt = (off < 0 || off >= st->captext_len) ? "" : st->captext + off;
+        if(*txt && captext_has_linked_label(st, txt)) return 1;
+    }
+    return 0;
+}
+
 /* error_patterns 欄を評価する。`条件;コード` をカンマで並べたものを順に見る。
    評価は浮動小数点モードで行う。 */
 static int dir_error(Assembler *asmb, const char *s){
@@ -8628,7 +8701,9 @@ static int dir_error(Assembler *asmb, const char *s){
         if(idx <= idx_before) break;
         if((should_report_errors(st))&&!cond_false&&!cond_undef
            && !cond_tests_relocated_var(st, buf + idx_before,
-                                        (size_t)(io_cond - idx_before))){
+                                        (size_t)(io_cond - idx_before))
+           && !cond_tests_linked_label(st, buf + idx_before,
+                                       (size_t)(io_cond - idx_before))){
             double _tdv = u256_to_double(t);
             int64_t tc = (isfinite(_tdv) && _tdv > -9223372036854775808.0
                           && _tdv < 9223372036854775808.0) ? (int64_t)_tdv : 0;
@@ -17106,9 +17181,21 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                     {
                     /* 加数はワードで求めてから単位（.elfunit）に直す。 */
                     int _is_pcrel = elf_machine_is_pcrel(_mtbl_rm, _rtype);
-                        if(_is_pcrel)
-                            _addend = ((int64_t)_raw_val - _abs_wi + _sec_rel / (int64_t)bpw) * _scale;
-                        else
+                        if(_is_pcrel){
+                            /* 欄は幅で切られているので、位置が欄の幅を超えると
+                               「欄 − ラベル + 位置」が幅の倍数だけずれる。加数のうち綴りの
+                               定数を除いた部分（位置と変位の基点の差）は小さいので、そこを
+                               欄の幅で符号付きに折り返す。axx.py の lineassemble() と同じ。 */
+                            int64_t _cst = _valid[_gi].addend;
+                            int64_t _pd = (int64_t)_raw_val - _abs_wi + _sec_rel / (int64_t)bpw - _cst;
+                            int _fb = _nwords * _bts;
+                            if(_fb > 0 && _fb < 64){
+                                uint64_t _u = (uint64_t)_pd & (((uint64_t)1 << _fb) - 1);
+                                _pd = (_u >= ((uint64_t)1 << (_fb - 1)))
+                                      ? (int64_t)(_u - ((uint64_t)1 << _fb)) : (int64_t)_u;
+                            }
+                            _addend = (_cst + _pd) * _scale;
+                        } else
                             _addend = ((int64_t)_raw_val - _abs_wi) * _scale;
                     }
                     if(st->reloc_count >= st->reloc_cap){

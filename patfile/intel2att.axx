@@ -155,6 +155,9 @@
 !return "[!Lmd]"
 }
 
+/* 倍率を書かない ma() の [B+I]（k = 23〜25）では、I が RSP（r64 の 4 番）なら B と入れ替える。RSP は
+/* インデックスになれないが、倍率 1 なら基底に回せば同じ番地になる（GAS と
+/* llvm-mc の Intel 記法も [r13+rsp] をそう読む）。AT&T には入れ替えた形で書く。
 !def ma(k) {
 !local B = "%{{r64[mb]}}"
 !local I = "%{{r64[mi]}}"
@@ -183,14 +186,16 @@
 !if k < 23 !then {
 !return "0(," + I + "," + str(scl(k)) + ")"
 }
+!local B2 = "%{{r64[(mi==4)?mi:mb]}}"
+!local I2 = "%{{r64[(mi==4)?mb:mi]}}"
 !if k == 23 !then {
-!return "(" + B + "," + I + ")"
+!return "(" + B2 + "," + I2 + ")"
 }
 !if k == 24 !then {
-!return D + "(" + B + "," + I + ")"
+!return D + "(" + B2 + "," + I2 + ")"
 }
 !if k == 25 !then {
-!return "-" + D + "(" + B + "," + I + ")"
+!return "-" + D + "(" + B2 + "," + I2 + ")"
 }
 !if k == 26 !then {
 !return D + "(%rip)"

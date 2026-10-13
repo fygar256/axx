@@ -51,14 +51,14 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all seventy-seven bundled pattern/source pairs with
+exactly that: `test1` assembles all eighty-six bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the five `.textmode` pairs and the `exprmiss.axx` pair it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` and `ministr.axx` pairs the `.echo` lines each one writes to standard
 error, and for the `regress.axx` regression test its `-V` text and its diagnostics.
 The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for two hundred and thirteen comparisons in all.
+text output are compared too, for two hundred and twenty-two comparisons in all.
 
 **Contents**
 
@@ -544,6 +544,25 @@ with text, or add your own to the `ERRORS` table in `axx.py` and `caxx.c`.
 `error_patterns` is evaluated in floating-point mode, so values travel as
 IEEE-754 double bit patterns. The bitwise and shift operators compensate
 internally, so `(8>>2)>0;2` evaluates as written.
+
+**Labels whose value the linker decides, under `-o`.** Under `-o` the value of
+an external label (`.extern`, `.weak`, `-i`) and of a label in a section other
+than the one being assembled is decided by the linker. A displacement or size
+worked out from its present value (0 for an external label, the position within
+its own section otherwise) means nothing, so a condition that touches a variable
+whose spelling contains such a label is not judged; the linker checks the range
+(GNU as, too, only writes the relocation). Conditions on labels of the same
+section and on numbers are judged as usual. Whether the spelling contains a
+label is read the same way as for `.islabel` (section 3.15). For the same
+reason, under `-o` a condition on a variable that `.reloc` gave an instruction
+field type (a type with `.elffield`) is not judged either: that field is still 0
+and the linker puts the value in.
+
+```
+.extern ext
+.org 0x20000
+bra.w ext            ; 68000.axx: under -o, no error, an R_68K_PC16
+```
 
 ### 3.5 binary_list
 
@@ -2066,7 +2085,11 @@ type is recognised as PC-relative in two ways:
   displacement from it — the field of an m68k `bra.w label`, `t-$$-2` in the
   `binary_list` — and the absolute type guessed from the width is swapped for
   the PC-relative type of the same width. `.long ext+4` holds `ext+4` and stays
-  absolute. The comparison is made on the bits of the field's width.
+  absolute. The comparison is made on the bits of the field's width. The
+  addend is the spelled constant plus (field - label + place - constant,
+  wrapped signed to the field's width); since the field is cut to its width,
+  this keeps the addend right where the place is beyond that width (a 68000
+  `bra.w ext` after `.org 0x10000`, say).
 
 Either way the PC-relative type is a data type: a type with an `.elffield` (an
 instruction field, such as RISC-V's `R_RISCV_BRANCH`, which is PC-relative and
@@ -4920,14 +4943,14 @@ The x86_64 pattern file is also maintained separately at
 | **mips64r6el.axx** | 945 B | 1 (plus `mips_isa.axx`) | **mipsr6.s** | The same for little-endian, n64 |
 | **mips_isa.axx** | 80 KB | 151 (about 5,000 expanded, about 3,560 under Release 6) | -- | The MIPS instruction set shared by the eight files above; not passed to axx directly. MIPS I to MIPS64 Release 6: the whole integer set (with the Release 2 bit-field and byte-swap instructions), the privileged instructions (COP0, TLB), the FPU (the S, D, W, L and PS formats, the sixteen `c.cond` compares, COP1X), COP2, the coprocessor 3 forms of MIPS I, the GNU pseudo-instructions that need no `$at` (`li`, `dli`, `la`, `dla`, `move`, `b` ...) and the relocation modifiers (`%hi`, `%lo`, `%higher`, `%highest`, `%gp_rel`, the `%got` and `%call16` families, the TLS ones, `%pcrel_hi` / `%pcrel_lo`). The extensions DSP (Release 1 and 2, Release 3 under R6), MSA, MT, VZ, EVA, MIPS-3D, SmartMIPS, MCU, XPA, CRC and GINV. When the front file sets `R6()` to 1, the instructions Release 6 removes (branch likely, multiply and divide on HI / LO, the `lwl` family, the `movz` family, the FP condition codes, PS, COP1X ...) are left out, `clz`, `ll` / `sc`, `cache` / `pref`, the `lwc2` family, `jr` ... take their Release 6 encodings, and the new instructions are added (the compact branches, the `aui` family, the PC-relative `lwpc` / `auipc` family, the three-register multiply and divide, `cmp.cond.fmt`, `maddf` and the other FPU ones). The syntax is that of GNU as under `.set noreorder` / `.set noat`. No microMIPS / MIPS16e (the compressed encodings), MDMX or vendor extensions. Under `-o`, o32 is REL (the addend written back into the field) and n64 is RELA (three types per `r_info`), with the PC-relative relocations of Release 6 (`R_MIPS_PC21_S2`, `PC26_S2`, `PC19_S2`, `PC18_S3`, `PCHI16`, `PCLO16`). Written with the macro layer and the mini language |
 | **sparc.axx** | 56 KB | 237 (7,968 expanded) | **sparc_test.s**, **sparc_reloc.s**, **sparc_reloc2.s**, **bf_sparc.s** | SPARC V7 / V8 / V9 and VIS 1-3: the integer set, the shifts and `sethi`; Bicc / BPcc / FBfcc / FBPfcc / BPr and the V8 CBccc (with `,a` and `,pt` / `,pn`), `call`, `jmpl`, `return` and Tcc; movcc / movr / fmovcc / fmovr; every integer and floating point load and store (the alternate space forms with an ASI number, a `#ASI_*` name or `%asi`, `casa` / `casxa`, `prefetch`); every FPop1 / FPop2 (s, d, q, the conversions, `fcmp`, the UltraSPARC Architecture 2007 `fnadd` family) and the fused multiply-add (`fmadd` ...); `rd` / `wr`, `rdpr` / `wrpr`, the V8 `%psr` family and the UA2005 `rdhpr` / `wrhpr`; `membar` (with the `#StoreLoad` ... names); the V8 coprocessor; the LEON `umac` / `smac` / `pwr`; the synthetic instructions (`cmp`, `mov`, `set` / `setuw` / `setsw` / `setx`, the `clr` family, the `inc` family ...); the operand modifiers (`%hi`, `%lo`, `%hh`, `%hm`, `%h44`, `%m44`, `%l44`, `%hix`, `%lox`, `%pc22`, `%pc10`, the GOT and TLS ones). `-o` writes ELF64 SPARCV9 (RELA). Checked byte-for-byte against llvm-mc 19, and the rows llvm-mc does not have against the encodings of the manuals. Written with the macro layer and the mini language |
-| **6809.axx** | 124 KB | 1,950 | **6809.s** | Motorola 6809 |
-| **68000.axx** | 51 KB | 453 | **68000.s** | Motorola 68000 |
-| **6800.axx** | 18 KB | 271 | **6800.s** | Motorola 6800 |
-| **6502.axx** | 14 KB | 192 | **6502.s** | MOS 6502 |
-| **z80.axx** | 7.5 KB | 283 | **z80.s** | Zilog Z80 |
-| **8051.axx** | 8.9 KB | 111 | **8051.s** | Intel 8051 |
-| **8080.axx** | 6.0 KB | 113 | **8080.s** | Intel 8080 |
-| **8048.axx** | 6.3 KB | 95 | **8048.s** | Intel 8048 |
+| **6809.axx** | 137 KB | 1,950 | **6809.s**, **6809_err.s** | Motorola 6809 |
+| **68000.axx** | 59 KB | 457 | **68000.s**, **68000_reloc.s**, **68000_err.s** | Motorola 68000. `-o` writes ELF32 M68K (RELA) without `-m`. An `.extern` with no type is `R_68K_32`; 16 / 8 bit PC relative references within the section are resolved by axx |
+| **6800.axx** | 19 KB | 271 | **6800.s**, **6800_err.s** | Motorola 6800 |
+| **6502.axx** | 14 KB | 192 | **6502.s**, **6502_err.s** | MOS 6502 |
+| **z80.axx** | 8.8 KB | 283 | **z80.s**, **z80_err.s** | Zilog Z80 |
+| **8051.axx** | 9.1 KB | 111 | **8051.s**, **8051_err.s** | Intel 8051 |
+| **8080.axx** | 6.4 KB | 113 | **8080.s**, **8080_err.s** | Intel 8080 |
+| **8048.axx** | 6.2 KB | 95 | **8048.s**, **8048_err.s** | Intel 8048 |
 | **4004.axx** | 5.4 KB | 53 | **4004.s** | Intel 4004 |
 | **test.axx** | 1.1 KB | 40 | **test.s** | Fragments of several ISAs; test only |
 | **8080toz80.axx** | 5.7 KB | 117 | **hello8080.s** | Intel 8080 to Zilog Z80 source translator; `.textmode`, `!L` and `{{.exp()}}` (3.18) at work |
@@ -5035,7 +5058,7 @@ drops the label references it read, so for a symbol only the bytes of the
 immediate field read the label, and the relocation lands on that field). The three-operand `IMUL` with an
 immediate and `MOV` with `[RIP+...]` have their 32 / 16 / 8-bit forms too.
 
-`test1` runs all seventy-seven pairs through both implementations and
+`test1` runs all eighty-six pairs through both implementations and
 compares the `-b` raw binaries. For the five pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`),
 and for `exprmiss.axx`, which looks at lines let through by `.passthru`, it also compares the translated text each
@@ -5086,12 +5109,20 @@ too: every VEX / EVEX mnemonic and the string instructions with `[[rep]]`.
 The two pairs with `x86_64_err.s` compare the diagnostics on standard error:
 an immediate out of range, and AH / CH / DH / BH where the instruction needs a
 REX prefix, are errors.
+The `68000.axx` / `68000_reloc.s` pair compares the `-o` ELF32 M68K objects:
+`R_68K_32` for an `.extern` with no type, `R_68K_PC16` / `R_68K_PC8` told apart
+by value, the reference on the field of a bare branch, branches resolved within
+the section, and the addends after `.org 0x10000`. The eight pairs of
+`68000_err.s`, `z80_err.s`, `6502_err.s`, `6800_err.s`, `6809_err.s`,
+`8080_err.s`, `8051_err.s` and `8048_err.s` compare the diagnostics on standard
+error: with each pattern file, an immediate, address or displacement that does
+not fit its field is an error instead of being cut down.
 
 The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
-under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
+under `-o` (the ELF of the pattern's machine; x86-64 ELF64 when it has no `.elfmachine`), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for two hundred and thirteen comparisons in all.
+never compares, for two hundred and twenty-two comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -5124,7 +5155,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all seventy-seven bundled pattern/source pairs with both
+`test1` assembles all eighty-six bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 five `.textmode` pairs, the `.echo` lines of the `echo.axx` and `ministr.axx` pairs,
 and the `-V` text and diagnostics of the `regress.axx` regression test.

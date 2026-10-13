@@ -65,31 +65,31 @@ LD s,(IY[[+!d]]) ::d>127;3,d<-128;3:: 0xfd,0x46|(s<<3),d
 LD (HL),s :: s|0x70
 LD s,(HL) :: (s<<3)|0x46
 
-LD (HL),!d :: 0x36,d
-LD (IY[[+!e]]),!d ::e>127;3,e<-128;3:: 0xfd,0x36,e,d
-LD (IX[[+!e]]),!d ::e>127;3,e<-128;3:: 0xdd,0x36,e,d
+LD (HL),!d :: d>255;3,d<-128;3 :: 0x36,d
+LD (IY[[+!e]]),!d :: e>127;3,e<-128;3,d>255;3,d<-128;3 :: 0xfd,0x36,e,d
+LD (IX[[+!e]]),!d :: e>127;3,e<-128;3,d>255;3,d<-128;3 :: 0xdd,0x36,e,d
 
 LD A,(BC) :: 0xa
 LD A,(DE) :: 0x1A
 LD (BC),A :: 0x02
 LD (DE),A :: 0x12
-LD A,(!n) :: 0x3a,n&0xff,n>>8
-LD (!n),A :: 0x32,n&0xff,n>>8
+LD A,(!n) :: n>65535;2,n<-32768;2 :: 0x3a,n&0xff,n>>8
+LD (!n),A :: n>65535;2,n<-32768;2 :: 0x32,n&0xff,n>>8
 
 
-LD HL,(!d) :: 0x2a,d&0xff,d>>8
-LD BC,(!d) :: 0xed,0x4b,d&0xff,d>>8
-LD DE,(!d) :: 0xed,0x5b,d&0xff,d>>8
-LD SP,(!d) :: 0xed,0x7b,d&0xff,d>>8
-LD IX,(!d) :: 0xdd,0x2a,d&0xff,d>>8
-LD IY,(!d) :: 0xfd,0x2a,d&0xff,d>>8
+LD HL,(!d) :: d>65535;2,d<-32768;2 :: 0x2a,d&0xff,d>>8
+LD BC,(!d) :: d>65535;2,d<-32768;2 :: 0xed,0x4b,d&0xff,d>>8
+LD DE,(!d) :: d>65535;2,d<-32768;2 :: 0xed,0x5b,d&0xff,d>>8
+LD SP,(!d) :: d>65535;2,d<-32768;2 :: 0xed,0x7b,d&0xff,d>>8
+LD IX,(!d) :: d>65535;2,d<-32768;2 :: 0xdd,0x2a,d&0xff,d>>8
+LD IY,(!d) :: d>65535;2,d<-32768;2 :: 0xfd,0x2a,d&0xff,d>>8
 
-LD (!d),HL :: 0x22,d&0xff,d>>8
-LD (!d),BC :: 0xed,0x43,d&0xff,d>>8
-LD (!d),DE :: 0xed,0x53,d&0xff,d>>8
-LD (!d),SP :: 0xed,0x73,d&0xff,d>>8
-LD (!d),IX :: 0xdd,0x22,d&0xff,d>>8
-LD (!d),IY :: 0xfd,0x22,d&0xff,d>>8
+LD (!d),HL :: d>65535;2,d<-32768;2 :: 0x22,d&0xff,d>>8
+LD (!d),BC :: d>65535;2,d<-32768;2 :: 0xed,0x43,d&0xff,d>>8
+LD (!d),DE :: d>65535;2,d<-32768;2 :: 0xed,0x53,d&0xff,d>>8
+LD (!d),SP :: d>65535;2,d<-32768;2 :: 0xed,0x73,d&0xff,d>>8
+LD (!d),IX :: d>65535;2,d<-32768;2 :: 0xdd,0x22,d&0xff,d>>8
+LD (!d),IY :: d>65535;2,d<-32768;2 :: 0xfd,0x22,d&0xff,d>>8
 
 LD SP,HL :: 0xf9
 LD SP,IX :: 0xdd,0xf9
@@ -98,17 +98,17 @@ LD A,I :: 0xed,0x57
 LD A,R :: 0xed,0x5f
 LD I,A :: 0xed,0x47
 LD R,A :: 0xed,0x4f
-LD IX,!d :: 0xdd,0x21,d&0xff,d>>8
-LD IY,!d :: 0xfd,0x21,d&0xff,d>>8
-LD HL,!d :: 0x21,d&0xff,d>>8
-LD DE,!d :: 0x11,d&0xff,d>>8
-LD BC,!d :: 0x01,d&0xff,d>>8
-LD SP,!d :: 0x31,d&0xff,d>>8
-LD HL,!d :: 0x21,d&0xff,d>>8
+LD IX,!d :: d>65535;2,d<-32768;2 :: 0xdd,0x21,d&0xff,d>>8
+LD IY,!d :: d>65535;2,d<-32768;2 :: 0xfd,0x21,d&0xff,d>>8
+LD HL,!d :: d>65535;2,d<-32768;2 :: 0x21,d&0xff,d>>8
+LD DE,!d :: d>65535;2,d<-32768;2 :: 0x11,d&0xff,d>>8
+LD BC,!d :: d>65535;2,d<-32768;2 :: 0x01,d&0xff,d>>8
+LD SP,!d :: d>65535;2,d<-32768;2 :: 0x31,d&0xff,d>>8
+LD HL,!d :: d>65535;2,d<-32768;2 :: 0x21,d&0xff,d>>8
 .check::t::B,C,D,E,H,L,A
 LD s,t :: 0x40|(s<<3)|t
 .clrcheck::t
-LD s,!d :: (s<<3)|0x6,d
+LD s,!d :: d>255;3,d<-128;3 :: (s<<3)|0x6,d
 .clrcheck::s
 
 .check::s::BC,DE,HL,AF
@@ -125,89 +125,89 @@ ADD A,(HL) :: 0x86
 ADD A,(IX[[+!d]]) ::d>127;3,d<-128;3:: 0xdd,0x86,d
 ADD A,(IY[[+!d]]) ::d>127;3,d<-128;3:: 0xfd,0x86,d
 ADD A,s :: 0x80|s
-ADD A,!d :: 0xc6,d
+ADD A,!d :: d>255;3,d<-128;3 :: 0xc6,d
 
 ADC A,(HL) :: 0x8e
 ADC A,(IX[[+!d]]) ::d>127;3,d<-128;3:: 0xdd,0x8e,d
 ADC A,(IY[[+!d]]) ::d>127;3,d<-128;3:: 0xfd,0x8e,d
 ADC A,s :: 0x88|s
-ADC A,!d :: 0xce,d
+ADC A,!d :: d>255;3,d<-128;3 :: 0xce,d
 
 SUB A,(HL) :: 0x96
 SUB A,(IX[[+!n]]) ::n>127;3,n<-128;3:: 0xdd,0x96,n
 SUB A,(IY[[+!n]]) ::n>127;3,n<-128;3:: 0xfd,0x96,n
 SUB A,s :: 0x90|s
-SUB A,!d :: 0xd6,d
+SUB A,!d :: d>255;3,d<-128;3 :: 0xd6,d
 SUB (HL) :: 0x96
 SUB (IX[[+!n]]) ::n>127;3,n<-128;3:: 0xdd,0x96,n
 SUB (IY[[+!n]]) ::n>127;3,n<-128;3:: 0xfd,0x96,n
 SUB s :: 0x90|s
-SUB !d :: 0xd6,d
+SUB !d :: d>255;3,d<-128;3 :: 0xd6,d
 
 SBC A,(HL) :: 0x9e
 SBC A,(IX[[+!n]]) ::n>127;3,n<-128;3:: 0xdd,0x9e,n
 SBC A,(IY[[+!n]]) ::n>127;3,n<-128;3:: 0xfd,0x9e,n
 SBC A,s :: 0x98|s
-SBC A,!d :: 0xde,d
+SBC A,!d :: d>255;3,d<-128;3 :: 0xde,d
 
 AND A,(HL) :: 0xa6
 AND A,(IX[[+!n]]) ::n>127;3,n<-128;3:: 0xdd,0xa6,n
 AND A,(IY[[+!n]]) ::n>127;3,n<-128;3:: 0xfd,0xa6,n
 AND A,s :: 0xa0|s
-AND A,!d :: 0xe6,d
+AND A,!d :: d>255;3,d<-128;3 :: 0xe6,d
 AND (HL) :: 0xa6
 AND (IX[[+!n]]) ::n>127;3,n<-128;3:: 0xdd,0xa6,n
 AND (IY[[+!n]]) ::n>127;3,n<-128;3:: 0xfd,0xa6,n
 AND s :: 0xa0|s
-AND !d :: 0xe6,d
+AND !d :: d>255;3,d<-128;3 :: 0xe6,d
 
 OR A,(HL) :: 0xb6
 OR A,(IX[[+!n]]) ::n>127;3,n<-128;3:: 0xdd,0xb6,n
 OR A,(IY[[+!n]]) ::n>127;3,n<-128;3:: 0xfd,0xb6,n
 OR A,s :: 0xb0|s
-OR A,!d :: 0xf6,d
+OR A,!d :: d>255;3,d<-128;3 :: 0xf6,d
 OR (HL) :: 0xb6
 OR (IX[[+!n]]) ::n>127;3,n<-128;3:: 0xdd,0xb6,n
 OR (IY[[+!n]]) ::n>127;3,n<-128;3:: 0xfd,0xb6,n
 OR s :: 0xb0|s
-OR !d :: 0xf6,d
+OR !d :: d>255;3,d<-128;3 :: 0xf6,d
 
 XOR A,(HL) :: 0xae
 XOR A,(IX[[+!n]]) ::n>127;3,n<-128;3:: 0xdd,0xae,n
 XOR A,(IY[[+!n]]) ::n>127;3,n<-128;3:: 0xfd,0xae,n
 XOR A,s :: 0xa8|s
-XOR A,!d :: 0xee,d
+XOR A,!d :: d>255;3,d<-128;3 :: 0xee,d
 XOR (HL) :: 0xae
 XOR (IX[[+!n]]) ::n>127;3,n<-128;3:: 0xdd,0xae,n
 XOR (IY[[+!n]]) ::n>127;3,n<-128;3:: 0xfd,0xae,n
 XOR s :: 0xa8|s
-XOR !d :: 0xee,d
+XOR !d :: d>255;3,d<-128;3 :: 0xee,d
 
 CP A,(HL) :: 0xbe
 CP A,(IX[[+!n]]) ::n>127;3,n<-128;3:: 0xdd,0xbe,n
 CP A,(IY[[+!n]]) ::n>127;3,n<-128;3:: 0xfd,0xbe,n
 CP A,s :: 0xb8|s
-CP A,!d :: 0xfe,d
+CP A,!d :: d>255;3,d<-128;3 :: 0xfe,d
 CP (HL) :: 0xbe
 CP (IX[[+!n]]) ::n>127;3,n<-128;3:: 0xdd,0xbe,n
 CP (IY[[+!n]]) ::n>127;3,n<-128;3:: 0xfd,0xbe,n
 CP s :: 0xb8|s
-CP !d :: 0xfe,d
+CP !d :: d>255;3,d<-128;3 :: 0xfe,d
 
-BIT !x,s :: 0xcb,0x40|x<<3|s
-BIT !x,(HL) :: 0xcb,0x46|x<<3
-BIT !x,(IX[[+!d]]) ::d>127;3,d<-128;3:: 0xdd,0xcb,d,0x46|x<<3
-BIT !x,(IY[[+!d]]) ::d>127;3,d<-128;3:: 0xfd,0xcb,d,0x46|x<<3
+BIT !x,s :: x>7;3,x<0;3 :: 0xcb,0x40|x<<3|s
+BIT !x,(HL) :: x>7;3,x<0;3 :: 0xcb,0x46|x<<3
+BIT !x,(IX[[+!d]]) ::d>127;3,d<-128;3,x>7;3,x<0;3:: 0xdd,0xcb,d,0x46|x<<3
+BIT !x,(IY[[+!d]]) ::d>127;3,d<-128;3,x>7;3,x<0;3:: 0xfd,0xcb,d,0x46|x<<3
 
-SET !x,s :: 0xcb,0xc0|x<<3|s
-SET !x,(HL) :: 0xcb,0xc6|x<<3
-SET !x,(IX[[+!d]]) ::d>127;3,d<-128;3:: 0xdd,0xcb,d,0xc6|x<<3
-SET !x,(IY[[+!d]]) ::d>127;3,d<-128;3:: 0xfd,0xcb,d,0xc6|x<<3
+SET !x,s :: x>7;3,x<0;3 :: 0xcb,0xc0|x<<3|s
+SET !x,(HL) :: x>7;3,x<0;3 :: 0xcb,0xc6|x<<3
+SET !x,(IX[[+!d]]) ::d>127;3,d<-128;3,x>7;3,x<0;3:: 0xdd,0xcb,d,0xc6|x<<3
+SET !x,(IY[[+!d]]) ::d>127;3,d<-128;3,x>7;3,x<0;3:: 0xfd,0xcb,d,0xc6|x<<3
 
-RES !x,s :: 0xcb,0x80|x<<3|s
-RES !x,(HL) :: 0xcb,0x86|x<<3
-RES !x,(IX[[+!d]]) ::d>127;3,d<-128;3:: 0xdd,0xcb,d,0x86|x<<3
-RES !x,(IY[[+!d]]) ::d>127;3,d<-128;3:: 0xfd,0xcb,d,0x86|x<<3
+RES !x,s :: x>7;3,x<0;3 :: 0xcb,0x80|x<<3|s
+RES !x,(HL) :: x>7;3,x<0;3 :: 0xcb,0x86|x<<3
+RES !x,(IX[[+!d]]) ::d>127;3,d<-128;3,x>7;3,x<0;3:: 0xdd,0xcb,d,0x86|x<<3
+RES !x,(IY[[+!d]]) ::d>127;3,d<-128;3,x>7;3,x<0;3:: 0xfd,0xcb,d,0x86|x<<3
 
 RLCA :: 0x07
 RLA :: 0x17
@@ -282,13 +282,13 @@ CPD :: 0xed,0xa9
 CPDR :: 0xed,0xb9
 
 IN s,(C) :: 0xed,0x40|s<<3
-IN A,(!n) :: 0xdb,n
+IN A,(!n) :: n>255;6,n<0;6 :: 0xdb,n
 INI :: 0xed,0xa2
 INIR :: 0xed,0xb2
 IND :: 0xed,0xaa
 INDR :: 0xed,0xba
 OUT (C),s :: 0xed,0x41|s<<3
-OUT (!n),A :: 0xd3,n
+OUT (!n),A :: n>255;6,n<0;6 :: 0xd3,n
 OUTI :: 0xed,0xa3
 OTIR :: 0xed,0xb3
 OUTD :: 0xed,0xab
@@ -309,21 +309,21 @@ JP (HL) :: 0xe9
 JP (IX) :: 0xdd,0xe9
 JP (IY) :: 0xfd,0xe9
 .check::s::NZ,Z,NC,C,PO,PE,P,M
-JP s,!d :: 0xc2|s<<3,d&0xff,d>>8
-JP !d :: 0xc3,d&0xff,d>>8
-JR NZ,!e :: 0x20,e-$$-2
-JR Z,!e :: 0x28,e-$$-2
-JR NC,!e :: 0x30,e-$$-2
-JR C,!e :: 0x38,e-$$-2
-JR !e :: 0x18,e-$$-2
-DJNZ !e :: 0x10,e-$$-2
+JP s,!d :: d>65535;2,d<-32768;2 :: 0xc2|s<<3,d&0xff,d>>8
+JP !d :: d>65535;2,d<-32768;2 :: 0xc3,d&0xff,d>>8
+JR NZ,!e :: (e-$$-2)>127;2,(e-$$-2)<-128;2 :: 0x20,e-$$-2
+JR Z,!e :: (e-$$-2)>127;2,(e-$$-2)<-128;2 :: 0x28,e-$$-2
+JR NC,!e :: (e-$$-2)>127;2,(e-$$-2)<-128;2 :: 0x30,e-$$-2
+JR C,!e :: (e-$$-2)>127;2,(e-$$-2)<-128;2 :: 0x38,e-$$-2
+JR !e :: (e-$$-2)>127;2,(e-$$-2)<-128;2 :: 0x18,e-$$-2
+DJNZ !e :: (e-$$-2)>127;2,(e-$$-2)<-128;2 :: 0x10,e-$$-2
 
-CALL s,!d :: 0xc4|s<<3,d&0xff,d>>8
-CALL !d :: 0xcd,d&0xff,d>>8
+CALL s,!d :: d>65535;2,d<-32768;2 :: 0xc4|s<<3,d&0xff,d>>8
+CALL !d :: d>65535;2,d<-32768;2 :: 0xcd,d&0xff,d>>8
 RET s :: 0xc0|s<<3
 .clrcheck::s
 RET :: 0xc9
 RETI :: 0xed,0x4d
 RETN :: 0xed,0x45
-RST !d :: 0xc7|(d//8)<<3
+RST !d :: d>0x38;3,d<0;3,(d&7)!=0;3 :: 0xc7|(d//8)<<3
 

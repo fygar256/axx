@@ -51,31 +51,31 @@
 /* --------------------------------------------------------------- */
 /*  Arithmetic: ADD / ADDC / SUBB / INC / DEC / MUL / DIV / DA      */
 /* --------------------------------------------------------------- */
-ADD A,R!n     :: n>7;5           :: 0x28|n
-ADD A,@R!n    :: n>1;5           :: 0x26|n
-ADD A,#!d     :: d>0xff;3        :: 0x24,d
-ADD A,!d      :: d>0xff;2        :: 0x25,d
+ADD A,R!n     :: n>7;5,n<0;5 :: 0x28|n
+ADD A,@R!n    :: n>1;5,n<0;5 :: 0x26|n
+ADD A,#!d     :: d>0xff;3,d<-128;3 :: 0x24,d
+ADD A,!d      :: d>0xff;2,d<0;2 :: 0x25,d
 
-ADDC A,R!n    :: n>7;5           :: 0x38|n
-ADDC A,@R!n   :: n>1;5           :: 0x36|n
-ADDC A,#!d    :: d>0xff;3        :: 0x34,d
-ADDC A,!d     :: d>0xff;2        :: 0x35,d
+ADDC A,R!n    :: n>7;5,n<0;5 :: 0x38|n
+ADDC A,@R!n   :: n>1;5,n<0;5 :: 0x36|n
+ADDC A,#!d    :: d>0xff;3,d<-128;3 :: 0x34,d
+ADDC A,!d     :: d>0xff;2,d<0;2 :: 0x35,d
 
-SUBB A,R!n    :: n>7;5           :: 0x98|n
-SUBB A,@R!n   :: n>1;5           :: 0x96|n
-SUBB A,#!d    :: d>0xff;3        :: 0x94,d
-SUBB A,!d     :: d>0xff;2        :: 0x95,d
+SUBB A,R!n    :: n>7;5,n<0;5 :: 0x98|n
+SUBB A,@R!n   :: n>1;5,n<0;5 :: 0x96|n
+SUBB A,#!d    :: d>0xff;3,d<-128;3 :: 0x94,d
+SUBB A,!d     :: d>0xff;2,d<0;2 :: 0x95,d
 
 INC A         ::                    0x04
 INC DPTR      ::                    0xa3
-INC @R!n      :: n>1;5           :: 0x06|n
-INC R!n       :: n>7;5           :: 0x08|n
-INC !d        :: d>0xff;2        :: 0x05,d
+INC @R!n      :: n>1;5,n<0;5 :: 0x06|n
+INC R!n       :: n>7;5,n<0;5 :: 0x08|n
+INC !d        :: d>0xff;2,d<0;2 :: 0x05,d
 
 DEC A         ::                    0x14
-DEC @R!n      :: n>1;5           :: 0x16|n
-DEC R!n       :: n>7;5           :: 0x18|n
-DEC !d        :: d>0xff;2        :: 0x15,d
+DEC @R!n      :: n>1;5,n<0;5 :: 0x16|n
+DEC R!n       :: n>7;5,n<0;5 :: 0x18|n
+DEC !d        :: d>0xff;2,d<0;2 :: 0x15,d
 
 MUL AB        ::                    0xa4
 DIV AB        ::                    0x84
@@ -86,26 +86,26 @@ DA A          ::                    0xd4
 /*  SWAP (accumulator forms; bit/carry forms are in the Boolean     */
 /*  group below)                                                   */
 /* --------------------------------------------------------------- */
-ANL A,R!n     :: n>7;5           :: 0x58|n
-ANL A,@R!n    :: n>1;5           :: 0x56|n
-ANL A,#!d     :: d>0xff;3        :: 0x54,d
-ANL A,!d      :: d>0xff;2        :: 0x55,d
-ANL !d,A      :: d>0xff;2        :: 0x52,d
-ANL !d,#!e    :: d>0xff;2,e>0xff;3 :: 0x53,d,e
+ANL A,R!n     :: n>7;5,n<0;5 :: 0x58|n
+ANL A,@R!n    :: n>1;5,n<0;5 :: 0x56|n
+ANL A,#!d     :: d>0xff;3,d<-128;3 :: 0x54,d
+ANL A,!d      :: d>0xff;2,d<0;2 :: 0x55,d
+ANL !d,A      :: d>0xff;2,d<0;2 :: 0x52,d
+ANL !d,#!e    :: d>0xff;2,e>0xff;3,d<0;2,e<-128;3 :: 0x53,d,e
 
-ORL A,R!n     :: n>7;5           :: 0x48|n
-ORL A,@R!n    :: n>1;5           :: 0x46|n
-ORL A,#!d     :: d>0xff;3        :: 0x44,d
-ORL A,!d      :: d>0xff;2        :: 0x45,d
-ORL !d,A      :: d>0xff;2        :: 0x42,d
-ORL !d,#!e    :: d>0xff;2,e>0xff;3 :: 0x43,d,e
+ORL A,R!n     :: n>7;5,n<0;5 :: 0x48|n
+ORL A,@R!n    :: n>1;5,n<0;5 :: 0x46|n
+ORL A,#!d     :: d>0xff;3,d<-128;3 :: 0x44,d
+ORL A,!d      :: d>0xff;2,d<0;2 :: 0x45,d
+ORL !d,A      :: d>0xff;2,d<0;2 :: 0x42,d
+ORL !d,#!e    :: d>0xff;2,e>0xff;3,d<0;2,e<-128;3 :: 0x43,d,e
 
-XRL A,R!n     :: n>7;5           :: 0x68|n
-XRL A,@R!n    :: n>1;5           :: 0x66|n
-XRL A,#!d     :: d>0xff;3        :: 0x64,d
-XRL A,!d      :: d>0xff;2        :: 0x65,d
-XRL !d,A      :: d>0xff;2        :: 0x62,d
-XRL !d,#!e    :: d>0xff;2,e>0xff;3 :: 0x63,d,e
+XRL A,R!n     :: n>7;5,n<0;5 :: 0x68|n
+XRL A,@R!n    :: n>1;5,n<0;5 :: 0x66|n
+XRL A,#!d     :: d>0xff;3,d<-128;3 :: 0x64,d
+XRL A,!d      :: d>0xff;2,d<0;2 :: 0x65,d
+XRL !d,A      :: d>0xff;2,d<0;2 :: 0x62,d
+XRL !d,#!e    :: d>0xff;2,e>0xff;3,d<0;2,e<-128;3 :: 0x63,d,e
 
 CLR A         ::                    0xe4
 CPL A         ::                    0xf4
@@ -118,66 +118,66 @@ SWAP A        ::                    0xc4
 /* --------------------------------------------------------------- */
 /*  Data transfer: MOV / MOVC / MOVX / PUSH / POP / XCH / XCHD      */
 /* --------------------------------------------------------------- */
-MOV A,R!n     :: n>7;5           :: 0xe8|n
-MOV A,@R!n    :: n>1;5           :: 0xe6|n
-MOV A,#!d     :: d>0xff;3        :: 0x74,d
-MOV A,!d      :: d>0xff;2        :: 0xe5,d
+MOV A,R!n     :: n>7;5,n<0;5 :: 0xe8|n
+MOV A,@R!n    :: n>1;5,n<0;5 :: 0xe6|n
+MOV A,#!d     :: d>0xff;3,d<-128;3 :: 0x74,d
+MOV A,!d      :: d>0xff;2,d<0;2 :: 0xe5,d
 
-MOV R!n,A     :: n>7;5           :: 0xf8|n
-MOV R!n,#!d   :: n>7;5,d>0xff;3  :: 0x78|n,d
-MOV R!n,!d    :: n>7;5,d>0xff;2  :: 0xa8|n,d
+MOV R!n,A     :: n>7;5,n<0;5 :: 0xf8|n
+MOV R!n,#!d   :: n>7;5,d>0xff;3,n<0;5,d<-128;3 :: 0x78|n,d
+MOV R!n,!d    :: n>7;5,d>0xff;2,n<0;5,d<0;2 :: 0xa8|n,d
 
-MOV @R!n,A    :: n>1;5           :: 0xf6|n
-MOV @R!n,#!d  :: n>1;5,d>0xff;3  :: 0x76|n,d
-MOV @R!n,!d   :: n>1;5,d>0xff;2  :: 0xa6|n,d
+MOV @R!n,A    :: n>1;5,n<0;5 :: 0xf6|n
+MOV @R!n,#!d  :: n>1;5,d>0xff;3,n<0;5,d<-128;3 :: 0x76|n,d
+MOV @R!n,!d   :: n>1;5,d>0xff;2,n<0;5,d<0;2 :: 0xa6|n,d
 
-MOV DPTR,#!d  :: d>0xffff;3      :: 0x90,d>>8,d&0xff
+MOV DPTR,#!d  :: d>0xffff;3,d<-0x8000;3 :: 0x90,d>>8,d&0xff
 
-MOV !d,C      :: d>0xff;2        :: 0x92,d
-MOV C,!d      :: d>0xff;2        :: 0xa2,d
+MOV !d,C      :: d>0xff;2,d<0;2 :: 0x92,d
+MOV C,!d      :: d>0xff;2,d<0;2 :: 0xa2,d
 
-MOV !d,A      :: d>0xff;2        :: 0xf5,d
-MOV !d,R!n    :: d>0xff;2,n>7;5  :: 0x88|n,d
-MOV !d,@R!n   :: d>0xff;2,n>1;5  :: 0x86|n,d
-MOV !d,#!e    :: d>0xff;2,e>0xff;3 :: 0x75,d,e
-MOV !d,!e     :: d>0xff;2,e>0xff;2 :: 0x85,e,d
+MOV !d,A      :: d>0xff;2,d<0;2 :: 0xf5,d
+MOV !d,R!n    :: d>0xff;2,n>7;5,d<0;2,n<0;5 :: 0x88|n,d
+MOV !d,@R!n   :: d>0xff;2,n>1;5,d<0;2,n<0;5 :: 0x86|n,d
+MOV !d,#!e    :: d>0xff;2,e>0xff;3,d<0;2,e<-128;3 :: 0x75,d,e
+MOV !d,!e     :: d>0xff;2,e>0xff;2,d<0;2,e<0;2 :: 0x85,e,d
 
 MOVC A,@A+DPTR ::                   0x93
 MOVC A,@A+PC   ::                   0x83
 
 MOVX A,@DPTR  ::                    0xe0
-MOVX A,@R!n   :: n>1;5           :: 0xe2|n
+MOVX A,@R!n   :: n>1;5,n<0;5 :: 0xe2|n
 MOVX @DPTR,A  ::                    0xf0
-MOVX @R!n,A   :: n>1;5           :: 0xf2|n
+MOVX @R!n,A   :: n>1;5,n<0;5 :: 0xf2|n
 
-PUSH !d       :: d>0xff;2        :: 0xc0,d
-POP !d        :: d>0xff;2        :: 0xd0,d
+PUSH !d       :: d>0xff;2,d<0;2 :: 0xc0,d
+POP !d        :: d>0xff;2,d<0;2 :: 0xd0,d
 
-XCH A,R!n     :: n>7;5           :: 0xc8|n
-XCH A,@R!n    :: n>1;5           :: 0xc6|n
-XCH A,!d      :: d>0xff;2        :: 0xc5,d
-XCHD A,@R!n   :: n>1;5           :: 0xd6|n
+XCH A,R!n     :: n>7;5,n<0;5 :: 0xc8|n
+XCH A,@R!n    :: n>1;5,n<0;5 :: 0xc6|n
+XCH A,!d      :: d>0xff;2,d<0;2 :: 0xc5,d
+XCHD A,@R!n   :: n>1;5,n<0;5 :: 0xd6|n
 
 /* --------------------------------------------------------------- */
 /*  Boolean (bit-addressable / carry) group                        */
 /* --------------------------------------------------------------- */
 CLR C         ::                    0xc3
-CLR !b        :: b>0xff;2        :: 0xc2,b
+CLR !b        :: b>0xff;2,b<0;2 :: 0xc2,b
 SETB C        ::                    0xd3
-SETB !b       :: b>0xff;2        :: 0xd2,b
+SETB !b       :: b>0xff;2,b<0;2 :: 0xd2,b
 CPL C         ::                    0xb3
-CPL !b        :: b>0xff;2        :: 0xb2,b
+CPL !b        :: b>0xff;2,b<0;2 :: 0xb2,b
 
-ANL C,/!b     :: b>0xff;2        :: 0xb0,b
-ANL C,!b      :: b>0xff;2        :: 0x82,b
-ORL C,/!b     :: b>0xff;2        :: 0xa0,b
-ORL C,!b      :: b>0xff;2        :: 0x72,b
+ANL C,/!b     :: b>0xff;2,b<0;2 :: 0xb0,b
+ANL C,!b      :: b>0xff;2,b<0;2 :: 0x82,b
+ORL C,/!b     :: b>0xff;2,b<0;2 :: 0xa0,b
+ORL C,!b      :: b>0xff;2,b<0;2 :: 0x72,b
 
 JC !e   :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x40,(e-$$-2)&0xff
 JNC !e  :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x50,(e-$$-2)&0xff
-JB !b,!e  :: b>0xff;2,(e-$$-3)>127||(e-$$-3)<-128;2 :: 0x20,b,(e-$$-3)&0xff
-JNB !b,!e :: b>0xff;2,(e-$$-3)>127||(e-$$-3)<-128;2 :: 0x30,b,(e-$$-3)&0xff
-JBC !b,!e :: b>0xff;2,(e-$$-3)>127||(e-$$-3)<-128;2 :: 0x10,b,(e-$$-3)&0xff
+JB !b,!e  :: b>0xff;2,(e-$$-3)>127||(e-$$-3)<-128;2,b<0;2 :: 0x20,b,(e-$$-3)&0xff
+JNB !b,!e :: b>0xff;2,(e-$$-3)>127||(e-$$-3)<-128;2,b<0;2 :: 0x30,b,(e-$$-3)&0xff
+JBC !b,!e :: b>0xff;2,(e-$$-3)>127||(e-$$-3)<-128;2,b<0;2 :: 0x10,b,(e-$$-3)&0xff
 
 /* --------------------------------------------------------------- */
 /*  Program branching: ACALL / LCALL / RET / RETI / AJMP / LJMP /   */
@@ -185,8 +185,8 @@ JBC !b,!e :: b>0xff;2,(e-$$-3)>127||(e-$$-3)<-128;2 :: 0x10,b,(e-$$-3)&0xff
 /* --------------------------------------------------------------- */
 ACALL !a :: (a>>11)!=(($$+2)>>11);2 :: ((a>>8)&7)<<5|0x11,a&0xff
 AJMP  !a :: (a>>11)!=(($$+2)>>11);2 :: ((a>>8)&7)<<5|0x01,a&0xff
-LCALL !a :: a>0xffff;2 :: 0x12,a>>8,a&0xff
-LJMP  !a :: a>0xffff;2 :: 0x02,a>>8,a&0xff
+LCALL !a :: a>0xffff;2,a<-0x8000;2 :: 0x12,a>>8,a&0xff
+LJMP  !a :: a>0xffff;2,a<-0x8000;2 :: 0x02,a>>8,a&0xff
 RET      ::                    0x22
 RETI     ::                    0x32
 SJMP  !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x80,(e-$$-2)&0xff
@@ -195,12 +195,12 @@ JMP @A+DPTR ::                 0x73
 JZ  !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x60,(e-$$-2)&0xff
 JNZ !e :: (e-$$-2)>127||(e-$$-2)<-128;2 :: 0x70,(e-$$-2)&0xff
 
-CJNE A,#!d,!e  :: d>0xff;3,(e-$$-3)>127||(e-$$-3)<-128;2 :: 0xb4,d,(e-$$-3)&0xff
-CJNE A,!d,!e   :: d>0xff;2,(e-$$-3)>127||(e-$$-3)<-128;2 :: 0xb5,d,(e-$$-3)&0xff
-CJNE @R!n,#!d,!e :: n>1;5,d>0xff;3,(e-$$-3)>127||(e-$$-3)<-128;2 :: 0xb6|n,d,(e-$$-3)&0xff
-CJNE R!n,#!d,!e  :: n>7;5,d>0xff;3,(e-$$-3)>127||(e-$$-3)<-128;2 :: 0xb8|n,d,(e-$$-3)&0xff
+CJNE A,#!d,!e  :: d>0xff;3,(e-$$-3)>127||(e-$$-3)<-128;2,d<-128;3 :: 0xb4,d,(e-$$-3)&0xff
+CJNE A,!d,!e   :: d>0xff;2,(e-$$-3)>127||(e-$$-3)<-128;2,d<0;2 :: 0xb5,d,(e-$$-3)&0xff
+CJNE @R!n,#!d,!e :: n>1;5,d>0xff;3,(e-$$-3)>127||(e-$$-3)<-128;2,n<0;5,d<-128;3 :: 0xb6|n,d,(e-$$-3)&0xff
+CJNE R!n,#!d,!e  :: n>7;5,d>0xff;3,(e-$$-3)>127||(e-$$-3)<-128;2,n<0;5,d<-128;3 :: 0xb8|n,d,(e-$$-3)&0xff
 
-DJNZ R!n,!e :: n>7;5,(e-$$-2)>127||(e-$$-2)<-128;2 :: 0xd8|n,(e-$$-2)&0xff
-DJNZ !d,!e  :: d>0xff;2,(e-$$-3)>127||(e-$$-3)<-128;2 :: 0xd5,d,(e-$$-3)&0xff
+DJNZ R!n,!e :: n>7;5,(e-$$-2)>127||(e-$$-2)<-128;2,n<0;5 :: 0xd8|n,(e-$$-2)&0xff
+DJNZ !d,!e  :: d>0xff;2,(e-$$-3)>127||(e-$$-3)<-128;2,d<0;2 :: 0xd5,d,(e-$$-3)&0xff
 
 NOP ::                          0x00

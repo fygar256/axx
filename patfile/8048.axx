@@ -1,37 +1,37 @@
-ADD    A,@R!n  ::       n>1;5         ::       n|0x60
-ADD    A,# !d  ::       d>0xFF;1      ::       0x03,d
-ADD    A ,R!n  ::       n > 7 ; 5     ::       n | 0x68
-ADDC   A,@R!n  ::       n>1;5         ::       n|0x70
-ADDC   A,R!n   ::       n>7;5         ::       n|0x78
-ADDC   A,# !d  ::       d>0xFF;1      ::       0x13,d
-ANL    A,@R!n  ::       n>1;5         ::       n|0x50
-ANL    A,R!n   ::       n>7;5         ::       n|0x58
-ANL    A,# !d  ::       d>0xFF;1      ::       0x53,d
-ANL    BUS,# !d::       d>0xFF;1      ::       0x98,d
+ADD    A,@R!n  ::       n>1;5,n<0;5 ::       n|0x60
+ADD    A,# !d  ::       d>0xFF;1,d<-128;1 ::       0x03,d
+ADD    A ,R!n  ::       n > 7 ; 5,n<0;5 ::       n | 0x68
+ADDC   A,@R!n  ::       n>1;5,n<0;5 ::       n|0x70
+ADDC   A,R!n   ::       n>7;5,n<0;5 ::       n|0x78
+ADDC   A,# !d  ::       d>0xFF;1,d<-128;1 ::       0x13,d
+ANL    A,@R!n  ::       n>1;5,n<0;5 ::       n|0x50
+ANL    A,R!n   ::       n>7;5,n<0;5 ::       n|0x58
+ANL    A,# !d  ::       d>0xFF;1,d<-128;1 ::       0x53,d
+ANL    BUS,# !d::       d>0xFF;1,d<-128;1 ::       0x98,d
 
 /* ANL/ORL Px,#d → P1とP2のみ有効 */
-ANL    P!c,# !d::       c!=1&&c!=2;6,d>0xFF;1  ::       (c|0x98),d
-ORL    P!c,# !d::       c!=1&&c!=2;6,d>0xFF;1  ::       (c|0x88),d
+ANL    P!c,# !d::       c!=1&&c!=2;6,d>0xFF;1,d<-128;1 ::       (c|0x98),d
+ORL    P!c,# !d::       c!=1&&c!=2;6,d>0xFF;1,d<-128;1 ::       (c|0x88),d
 
 /* ANLD/ORLD → P4～P7のみ有効（8243用） */
 ANLD   P!z,A   ::       z<4||z>7;6             ::       (z&3)|0x9C
 ORLD   P!c,A   ::       c<4||c>7;6             ::       (c&3)|0x8C
 
-CALL   !a      ::       a>0xFFF;2             ::       (((a&0x7FF)>>3)&0xE0)|0x14,a
+CALL   !a      ::       a>0xFFF;2,a<0;2 ::       (((a&0x7FF)>>3)&0xE0)|0x14,a
 CPL    A       ::                               0x37
 CPL    C       ::                               0xA7
-CPL    F!f     ::       f>1;7                 ::       (f<<5)|0x95
+CPL    F!f     ::       f>1;7,f<0;7 ::       (f<<5)|0x95
 
 CLR    A       ::                               0x27
 CLR    C       ::                               0x97
-CLR    F!f     ::       f>1;7                 ::       (f<<5)|0x85
+CLR    F!f     ::       f>1;7,f<0;7 ::       (f<<5)|0x85
 DB     !d      ::                               d
 DA     A       ::                               0x57
 DEC    A       ::                               0x07
-DEC    R!n     ::       n>7;5                 ::       n|0xC8
+DEC    R!n     ::       n>7;5,n<0;5 ::       n|0xC8
 DIS    I       ::                               0x15
 DIS    TCNTI   ::                               0x35
-DJNZ   R!n,!a  :: n>7;5,((a>>8)&7)>((($$+2)>>8)&7);2,((a>>8)&7)<((($$+2)>>8)&7);2  ::       n|0xE8,a
+DJNZ   R!n,!a  :: n>7;5,((a>>8)&7)>((($$+2)>>8)&7);2,((a>>8)&7)<((($$+2)>>8)&7);2,n<0;5 ::       n|0xE8,a
 EN     I       ::                               0x05
 EN     TCNTI   ::                               0x25
 ENT0   CLK     ::                               0x75
@@ -44,11 +44,11 @@ OUTL   P!c,A   ::       c!=1&&c!=2;6          ::       c|0x38
 OUTL   BUS,A   ::                               0x02
 
 INC    A       ::                               0x17
-INC    @R!n    ::       n>1;5                 ::       n|0x10
-INC    R!n     ::       n>7;5                 ::       n|0x18
+INC    @R!n    ::       n>1;5,n<0;5 ::       n|0x10
+INC    R!n     ::       n>7;5,n<0;5 ::       n|0x18
 INS    A,BUS   ::                               0x08
 
-JB!n   !a      :: n>7;5,((a>>8)&7)>((($$+2)>>8)&7);2,((a>>8)&7)<((($$+2)>>8)&7);2  ::       (0x20*n)+0x12,a
+JB!n   !a      :: n>7;5,((a>>8)&7)>((($$+2)>>8)&7);2,((a>>8)&7)<((($$+2)>>8)&7);2,n<0;5 ::       (0x20*n)+0x12,a
 JC     !a      :: ((a>>8)&7)>((($$+2)>>8)&7);2,((a>>8)&7)<((($$+2)>>8)&7);2  ::                               0xF6,a
 JF0    !a      :: ((a>>8)&7)>((($$+2)>>8)&7);2,((a>>8)&7)<((($$+2)>>8)&7);2  ::                               0xB6,a
 JF1    !a      :: ((a>>8)&7)>((($$+2)>>8)&7);2,((a>>8)&7)<((($$+2)>>8)&7);2  ::                               0x76,a
@@ -62,31 +62,31 @@ JT0    !a      :: ((a>>8)&7)>((($$+2)>>8)&7);2,((a>>8)&7)<((($$+2)>>8)&7);2  :: 
 JT1    !a      :: ((a>>8)&7)>((($$+2)>>8)&7);2,((a>>8)&7)<((($$+2)>>8)&7);2  ::                               0x56,a
 JZ     !a      :: ((a>>8)&7)>((($$+2)>>8)&7);2,((a>>8)&7)<((($$+2)>>8)&7);2  ::                               0xC6,a
 JMPP   @A      ::                               0xB3
-JMP    !a      ::       a>0xFFF;2             ::       (((a&0x7FF)>>3)&0xE0)|4,a
+JMP    !a      ::       a>0xFFF;2,a<0;2 ::       (((a&0x7FF)>>3)&0xE0)|4,a
 
 MOV    A,PSW   ::                               0xC7
 MOV    PSW,A   ::                               0xD7
 MOV    A,T     ::                               0x42
-MOV    A,@R!n  ::       n>1;5                 ::       n|0xF0
-MOV    A,R!n   ::       n>7;5                 ::       n|0xF8
-MOV    A,# !d  ::       d>0xFF;1              ::       0x23,d
-MOV    @R!n,A  ::       n>1;5                 ::       n|0xA0
-MOV    @R!n,# !d::      n>1;5,d>0xFF;1        ::       n|0xB0,d
-MOV    R!n,A   ::       n>7;5                 ::       n|0xA8
-MOV    R!n,# !d::       n>7;5,d>0xFF;1        ::       n|0xB8,d
+MOV    A,@R!n  ::       n>1;5,n<0;5 ::       n|0xF0
+MOV    A,R!n   ::       n>7;5,n<0;5 ::       n|0xF8
+MOV    A,# !d  ::       d>0xFF;1,d<-128;1 ::       0x23,d
+MOV    @R!n,A  ::       n>1;5,n<0;5 ::       n|0xA0
+MOV    @R!n,# !d::      n>1;5,d>0xFF;1,n<0;5,d<-128;1 ::       n|0xB0,d
+MOV    R!n,A   ::       n>7;5,n<0;5 ::       n|0xA8
+MOV    R!n,# !d::       n>7;5,d>0xFF;1,n<0;5,d<-128;1 ::       n|0xB8,d
 MOV    T,A     ::                               0x62
 MOVD   P!c,A   ::       c<4||c>7;6             ::       (c&3)|0x3C
 MOVD   A,P!c   ::       c<4||c>7;6             ::       (c&3)|0x0C
 MOVP   A,@A    ::                               0xA3
 MOVP3  A,@A    ::                               0xE3
-MOVX   A,@R!n  ::       n>1;5                 ::       n|0x80
-MOVX   @R!n,A  ::       n>1;5                 ::       n|0x90
+MOVX   A,@R!n  ::       n>1;5,n<0;5 ::       n|0x80
+MOVX   @R!n,A  ::       n>1;5,n<0;5 ::       n|0x90
 NOP            ::                               0x00
 
-ORL    A,R!n   ::       n>7;5                 ::       n|0x48
-ORL    A,@R!n  ::       n>1;5                 ::       n|0x40
-ORL    A,# !d  ::       d>0xFF;1              ::       0x43,d
-ORL    BUS,# !d::       d>0xFF;1              ::       0x88,d
+ORL    A,R!n   ::       n>7;5,n<0;5 ::       n|0x48
+ORL    A,@R!n  ::       n>1;5,n<0;5 ::       n|0x40
+ORL    A,# !d  ::       d>0xFF;1,d<-128;1 ::       0x43,d
+ORL    BUS,# !d::       d>0xFF;1,d<-128;1 ::       0x88,d
 
 RET            ::                               0x83
 RETR           ::                               0x93
@@ -102,9 +102,9 @@ STOP   TCNT    ::                               0x65
 STRT   CNT     ::                               0x45
 STRT   T       ::                               0x55
 SWAP   A       ::                               0x47
-XCH    A,@R!n  ::       n>1;5                 ::       n|0x20
-XCH    A,R!n   ::       n>7;5                 ::       n|0x28
-XCHD   A,@R!n  ::       n>1;5                 ::       n|0x30
-XRL    A,@R!n  ::       n>1;5                 ::       n|0xD0
-XRL    A,R!n   ::       n>7;5                 ::       n|0xD8
-XRL    A,# !d  ::       d>0xFF;1              ::       0xD3,d
+XCH    A,@R!n  ::       n>1;5,n<0;5 ::       n|0x20
+XCH    A,R!n   ::       n>7;5,n<0;5 ::       n|0x28
+XCHD   A,@R!n  ::       n>1;5,n<0;5 ::       n|0x30
+XRL    A,@R!n  ::       n>1;5,n<0;5 ::       n|0xD0
+XRL    A,R!n   ::       n>7;5,n<0;5 ::       n|0xD8
+XRL    A,# !d  ::       d>0xFF;1,d<-128;1 ::       0xD3,d
