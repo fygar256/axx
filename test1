@@ -128,6 +128,9 @@ caxx $P/x86_64m.axx $S/x86_64_rex.s -b b172
 # x86-64: VEX / EVEX の全命令名（llvm-mc 19 と照合した抜粋）と [[rep]] の文字列命令。
 caxx $P/x86_64.axx $S/x86_64_avx.s -b b173
 caxx $P/x86_64m.axx $S/x86_64_avx.s -b b174
+# x86-64: 範囲外の即値と、REX の要る行の AH / CH / DH / BH はエラー（標準エラーの診断で比べる）。
+caxx $P/x86_64.axx $S/x86_64_err.s -b b175 2>&1 | grep -v '^raw: wrote ' > b175e
+caxx $P/x86_64m.axx $S/x86_64_err.s -b b176 2>&1 | grep -v '^raw: wrote ' > b176e
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -314,6 +317,8 @@ paxx $P/x86_64.axx $S/x86_64_rex.s -b a171
 paxx $P/x86_64m.axx $S/x86_64_rex.s -b a172
 paxx $P/x86_64.axx $S/x86_64_avx.s -b a173
 paxx $P/x86_64m.axx $S/x86_64_avx.s -b a174
+paxx $P/x86_64.axx $S/x86_64_err.s -b a175 2>&1 | grep -v '^raw: wrote ' > a175e
+paxx $P/x86_64m.axx $S/x86_64_err.s -b a176 2>&1 | grep -v '^raw: wrote ' > a176e
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -459,6 +464,8 @@ check a171 b171
 check a172 b172
 check a173 b173
 check a174 b174
+check a175e b175e
+check a176e b176e
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

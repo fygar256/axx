@@ -22,6 +22,21 @@
 ;    qword [sym],imm, with no base register and no RIP) carry
 ;    R_X86_64_32S: the ModRM+SIB (base=none) encoding sign-extends the
 ;    32-bit displacement, so GNU as and llvm-mc give it the signed type.
+; 6. A 32-bit immediate against a symbol carries R_X86_64_32 (mov eax,ext,
+;    mov dword [rbx],ext, test eax,ext), or R_X86_64_32S where the CPU
+;    sign-extends it to 64 bits (REX.W: movs rax,ext, mov qword [rbx],ext,
+;    imul rax,rbx,ext; and push ext). A 32-bit displacement against a
+;    symbol ([rbx+ext], [rbx+rcx*4+ext], also in the VEX / EVEX forms)
+;    carries R_X86_64_32S. These used to come out as R_X86_64_PC32, the
+;    default guess for a 4-byte field.
+; 7. ADD / OR / ADC / SBB / AND / SUB / XOR / CMP of a register and an
+;    immediate pick the short imm8 form for a small number, and the
+;    0x81 /r imm16 / imm32 form for a symbol (as GNU as does), since the
+;    linker fills it in: R_X86_64_16 / 32 / 32S at the field after the
+;    opcode and ModRM. These used to turn the opcode itself into a
+;    relocation. A local label is a symbol here too.
+; 8. MOV of a 32 / 16 / 8-bit register to or from [RIP+sym] carries
+;    R_X86_64_PC32, like the 64-bit form.
 ;
 ; The relocation entries (type, addend) match llvm-mc 19 wherever both
 ; can express the same thing; llvm-mc auto-relaxes the generic "jmp" /
@@ -53,6 +68,36 @@ start:
         mov     word [ext],1
         mov     dword [ext],1
         mov     qword [ext],1
+        mov     eax,ext
+        mov     r9d,ext+4
+        mov     dword [rbx],ext
+        mov     dword [rbx+8]b,ext
+        mov     qword [rbx],ext
+        movs    rax,ext
+        push    ext
+        test    eax,ext
+        imul    rax,rbx,ext
+        mov     eax,[rbx+ext]
+        mov     rax,[rbx+rcx*4+ext]
+        mov     [rbx+ext],ecx
+        lea     rax,[rbx+ext]
+        vmovaps xmm1,[rbx+ext]
+        vaddps256 ymm1,ymm2,[rbx+rcx*2+ext]
+        vmovaps512 zmm1,[rbx+ext]
+        mov     ax,ext
+        mov     al,ext
+        add     eax,ext
+        sub     r9d,ext+8
+        cmp     rax,ext
+        and     r15,ext-4
+        or      cx,ext
+        xor     ebx,start
+        add     ecx,5
+        mov     eax,[RIP+ext]
+        mov     [RIP+ext],r9d
+        mov     ax,[RIP+ext]
+        mov     sil,[RIP+ext]
+        mov     [RIP+ext],r15b
 gfn:
         ret
         .section .data

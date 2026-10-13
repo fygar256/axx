@@ -1,0 +1,30 @@
+; x86_64_err.s -- lines x86_64.axx / x86_64m.axx must refuse
+;
+; Assemble with:  axx x86_64.axx x86_64_err.s -b out.bin
+;             or: axx x86_64m.axx x86_64_err.s -b out.bin
+;
+; Every line is an error, so no output file is written; test1 compares
+; the diagnostics on standard error. An immediate beyond its field
+; ("Value out of range": 8-bit -128..255, or -128..127 when sign-extended;
+; 16-bit -32768..65535; 32-bit -2**31..2**32-1, or -2**31..2**31-1 when
+; sign-extended to 64 bits), and AH / CH / DH / BH where the instruction
+; needs a REX prefix ("Register out of range"; it used to become SPL /
+; BPL / SIL / DIL without a word). The boundary values that are accepted
+; are at the end of x86_64_rex.s.
+        add al,256
+        add al,-129
+        add8 ax,128
+        add8 ax,-129
+        shl eax,256
+        mov ax,65536
+        mov ax,-32769
+        mov eax,4294967296
+        mov eax,-2147483649
+        movs rax,2147483648
+        ret 65536
+        enter 65536,1
+        mov ah,r8b
+        mov ah,sil
+        mov ah,[r8]
+        mov [rcx+r9*2],bh
+        add ch,[r12+5]b

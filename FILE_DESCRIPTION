@@ -425,11 +425,21 @@ format_of_exp_imp_file              format description for export/import file
 hello.s                             assembly file of x86_64 hello world. use x86_64.axx
 x86_64_reloc.s                      relocations of x86_64.axx / x86_64m.axx for
                                     -o: call / jmp / jcc near and short, RIP-
-                                    relative operands and the absolute-addressed
-                                    MOV stores (PLT32 / PC32 / PC8 / ABS32S,
+                                    relative operands, the absolute-addressed
+                                    MOV stores, 32-bit immediates and
+                                    displacements against a symbol, ADD / SUB /
+                                    CMP ... of a register and a symbol (the
+                                    imm32 form), MOV to and from [RIP+sym] for
+                                    32 / 16 / 8 bits (PLT32 / PC32 / PC8 /
+                                    ABS32 / ABS32S,
                                     resolved in place for a local label of the
                                     same section via .elfresolve), checked
                                     against llvm-mc 19 and ld.lld 19
+x86_64_err.s                        lines x86_64.axx / x86_64m.axx must refuse:
+                                    immediates out of range (8 / 16 / 32 bits,
+                                    signed when sign-extended) and AH / CH / DH
+                                    / BH where a REX prefix is needed; test1
+                                    compares the diagnostics
 x86_64_avx.s                        VEX / EVEX instructions of x86_64.axx /
                                     x86_64m.axx: one register form and one
                                     short-displacement form of every AVX /
@@ -441,7 +451,10 @@ x86_64_rex.s                        REX prefixes of x86_64.axx / x86_64m.axx for
                                     R8-R15: [disp+index], MOV CR / DR, VMREAD /
                                     VMWRITE, PEXTRB / PEXTRD / PEXTRQ, MOVDG /
                                     MOVQG, and the 8-bit range of LOOP* / JRCXZ,
-                                    checked by disassembling with llvm-mc 19
+                                    checked by disassembling with llvm-mc 19;
+                                    the boundary values of the immediates, and
+                                    the 32 / 16-bit three-operand IMUL and the
+                                    32 / 16 / 8-bit MOV with [RIP+label]
 hello.tsv                           export file of x86_64 hello world
 imp.tsv                             import file
 secsort.py                          execution file of section sort

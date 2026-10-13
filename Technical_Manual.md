@@ -51,14 +51,14 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all seventy-five bundled pattern/source pairs with
+exactly that: `test1` assembles all seventy-seven bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the five `.textmode` pairs and the `exprmiss.axx` pair it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` and `ministr.axx` pairs the `.echo` lines each one writes to standard
 error, and for the `regress.axx` regression test its `-V` text and its diagnostics.
 The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for two hundred and eleven comparisons in all.
+text output are compared too, for two hundred and thirteen comparisons in all.
 
 **Contents**
 
@@ -4902,8 +4902,8 @@ The x86_64 pattern file is also maintained separately at
 
 | Pattern file | Size | `::` lines | Source | Notes |
 |---|---|---|---|---|
-| **x86_64.axx** | 3.8 MB | 23,533 | **hello.s**, **bsection.s**, **x86_64_reloc.s**, **x86_64_rex.s**, **x86_64_avx.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512. From AVX on checked against llvm-mc (see the note after the table) |
-| **x86_64m.axx** | 957 KB | 5,504 (23,533 expanded) | **hello.s**, **x86_64_reloc.s**, **x86_64_rex.s**, **x86_64_avx.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo. Expands to the same rows as `x86_64.axx` |
+| **x86_64.axx** | 4.0 MB | 23,583 | **hello.s**, **bsection.s**, **x86_64_reloc.s**, **x86_64_rex.s**, **x86_64_avx.s**, **x86_64_err.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512. From AVX on checked against llvm-mc (see the note after the table) |
+| **x86_64m.axx** | 1007 KB | 5,554 (23,583 expanded) | **hello.s**, **x86_64_reloc.s**, **x86_64_rex.s**, **x86_64_avx.s**, **x86_64_err.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo. Expands to the same rows as `x86_64.axx` |
 | **aarch64.axx** | 350 KB | 2,097 (9,387 expanded) | **aarch64.s**, **aarch64_reloc.s** | AArch64 (A64): data processing, branches, exception generation, hints, barriers, system registers and SYS aliases, loads and stores, LSE atomics, scalar floating point, Advanced SIMD (vector and scalar) including the LD1-LD4 / ST1-ST4 structure accesses, cryptography, and the scalar extensions (PAuth, MTE, MOPS, FCMA, dot product, BFloat16, matrix multiply, LS64), and the GNU-style relocation modifiers `:lo12:`, `:pg_hi21:`, `:abs_g0:`-`:abs_g3:`, `:prel_g0:`-`:prel_g3:` and `:got:` / `:got_lo12:`, which with `-o` are emitted as relocations for the linker to fill in (`R_AARCH64_ADR_PREL_PG_HI21`, `ADD_ABS_LO12_NC`, the `LDST*_ABS_LO12_NC` family, `MOVW_UABS_G*` / `MOVW_PREL_G*`, `ADR_GOT_PAGE` and `LD64_GOT_LO12_NC`) and which with `-b` axx resolves itself, reading the GOT pair as naming the slot. With `-o` it is an AArch64 object without `-m`; a branch, `adr` or literal `ldr` to a local label of the same section is resolved in place, and the data directives (`.byte` `.hword` `.word` `.quad` `.xword` ...) take ABS / PREL relocations (`aarch64_reloc.s`, checked against llvm-mc 19). Also SVE and SVE2 -- arithmetic, shifts, compares, predicates, element counts, permutes, reductions, the whole load/store family (contiguous, replicating, non-fault, first-fault, gather, scatter, prefetch), the widening and narrowing groups, complex arithmetic and the SVE2 cryptography -- SME: streaming mode, the ZA array, and the integer, floating-point and BFloat16 outer products -- and SME2: the predicate-as-counter registers, the ZT0 lookup table, the multi-vector operations on Z registers, accumulation into the ZA array, and the multi-vector loads and stores in both their consecutive and strided forms |
 | **aarch64_logical.axx** | 9.5 KB | 76 (82 expanded) | **aarch64_logical_mini_demo.s** | The macro-layer version of the same AArch64 logical (immediate) group: the rows are generated with `!def`, and the bitmask immediate is encoded in a `binary_list` expression |
 | **aarch64_logical_mini.axx** | 9.2 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 logical (immediate): AND/ORR/EOR/ANDS/TST, 32- and 64-bit. Encodes the bitmask immediate with the mini language (section 3.15) |
@@ -5015,12 +5015,27 @@ agree, apart from the REX errors fixed with `x86_64_rex.s`. The conventions:
   gather without an index, `VMOVSS` / `VMOVSD` with three operands and memory)
   are not provided.
 
-Two known problems remain. AH, CH, DH or BH combined with an operand that needs
-REX silently becomes SPL, BPL, SIL or DIL instead of an error. The 8-bit
-immediates of the general-register instructions are not range checked and only
-their low 8 bits are used (those of VEX and EVEX are checked).
+Immediates are range checked: an 8-bit one takes -128 to 255 (-128 to 127 when
+it is sign-extended, as with `ADD8`, `IMUL8` and `PUSH8`), a 16-bit one -32768
+to 65535, a 32-bit one -2**31 to 2**32-1 (-2**31 to 2**31-1 when it is
+sign-extended to 64 bits); beyond that it is "Value out of range". AH, CH, DH
+and BH cannot be used where the instruction needs a REX prefix (paired with
+R8-R15 or SPL-DIL, or with REX.W), which is "Register out of range". The
+boundary values are at the end of `x86_64_rex.s`, and the lines that must be
+refused are in `x86_64_err.s`.
 
-`test1` runs all seventy-five pairs through both implementations and
+The relocations under `-o` are the types GNU as and llvm-mc give. A 32-bit
+immediate against a symbol is `R_X86_64_32` (`R_X86_64_32S` when sign-extended
+to 64 bits), and a 32-bit memory displacement `R_X86_64_32S` (a `.reloc` on the
+line). ADD / OR / ADC / SBB / AND / SUB / XOR / CMP of a register and an
+immediate pick the imm8 form for a number from -128 to 127, and the 0x81 /r
+imm16 / imm32 form for a symbol (`.islabel`) whatever its value (the
+mini-language `alulab()` / `alunum()` / `alub()`; a `.call` that emits nothing
+drops the label references it read, so for a symbol only the bytes of the
+immediate field read the label, and the relocation lands on that field). The three-operand `IMUL` with an
+immediate and `MOV` with `[RIP+...]` have their 32 / 16 / 8-bit forms too.
+
+`test1` runs all seventy-seven pairs through both implementations and
 compares the `-b` raw binaries. For the five pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`),
 and for `exprmiss.axx`, which looks at lines let through by `.passthru`, it also compares the translated text each
@@ -5060,19 +5075,23 @@ data, and the label differences of `.elfrelax::0`. The two MIPS pairs
 the PC-relative data. The AArch64 pair `aarch64.axx` with `aarch64_reloc.s` compares
 its `-o` ELF objects (no `-m`), and `x86_64.axx` with `bsection.s` its `-b` image.
 The two x86-64 pairs (`x86_64.axx` and `x86_64m.axx`, each with `x86_64_reloc.s`)
-compare their `-o` ELF objects too: `PLT32` / `PC32` / `PC8` / `ABS32S` and the
+compare their `-o` ELF objects too: `PLT32` / `PC32` / `PC8` / `ABS32` / `ABS32S`
+(including 32-bit immediates and displacements against a symbol) and the
 resolution of a local branch or RIP-relative reference within a section. The two
 pairs of the same pattern files with `x86_64_rex.s` compare the `-b` image: the
 REX prefixes for R8-R15 (`[disp+index]`, CR / DR, `VMREAD` / `VMWRITE`,
 `PEXTRB` / `PEXTRD` / `PEXTRQ`, `MOVDG` / `MOVQG`) and the 8-bit range of
 `LOOP*` / `JRCXZ`. The two pairs with `x86_64_avx.s` compare the `-b` image
 too: every VEX / EVEX mnemonic and the string instructions with `[[rep]]`.
+The two pairs with `x86_64_err.s` compare the diagnostics on standard error:
+an immediate out of range, and AH / CH / DH / BH where the instruction needs a
+REX prefix, are errors.
 
 The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for two hundred and eleven comparisons in all.
+never compares, for two hundred and thirteen comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -5105,7 +5124,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all seventy-five bundled pattern/source pairs with both
+`test1` assembles all seventy-seven bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 five `.textmode` pairs, the `.echo` lines of the `echo.axx` and `ministr.axx` pairs,
 and the `-V` text and diagnostics of the `regress.axx` regression test.
