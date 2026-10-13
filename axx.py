@@ -13720,6 +13720,10 @@ class Assembler:
                                         and not _sym_attr(self.state, lname)[_SA_WEAK]):
                                     _lw = self.label_manager._section_relative_offset(
                                         sec_name_r, int(_rle[0]))
+                                    # `.section` を書かないソース（既定のセクションだけ）では
+                                    # 範囲の記録が無いので、`$$` と同じく番地をそのまま使う。
+                                    if _lw is None:
+                                        _lw = int(_rle[0])
                                 if _lw is not None:
                                     _pw = _completed_words + (self.state.pc + _fw - _entry_pc_cur)
                                     _val = (_lw - _pw) * _scale + _hint_addend * _scale + _fbias

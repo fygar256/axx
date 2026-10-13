@@ -16948,8 +16948,13 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                             if(_rle && !_rle->is_imported && !_rle->is_equ && _rle->section
                                && _rle->section[0] && strcmp(_rle->section, sec_name) == 0
                                && !lmap_find(&st->export_labels, _lname)
-                               && !sym_attr_get(st, _lname).weak)
+                               && !sym_attr_get(st, _lname).weak){
                                 _lw = equ_section_relative_offset(st, sec_name, u256_to_u64(_rle->value));
+                                /* `.section` を書かないソース（既定のセクションだけ）では範囲の
+                                   記録が無いので、`$$` と同じく番地をそのまま使う。
+                                   axx.py の lineassemble() と同じ規則である。 */
+                                if(_lw < 0) _lw = (int64_t)u256_to_u64(_rle->value);
+                            }
                             if(_lw >= 0){
                                 int64_t _pw = (int64_t)(sec_completed_words +
                                                         (cur_pc + (uint64_t)_fw - sec_entry_pc_cur));

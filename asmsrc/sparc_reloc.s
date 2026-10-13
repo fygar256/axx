@@ -1,9 +1,11 @@
 ; sparc_reloc.s -- the relocations of sparc.axx (-o, ELF64 SPARCV9):
 ; every operand type that can hold a symbol, against an external one.
 ; The relocation entries (offset, type, symbol, addend) and the bytes
-; are those of llvm-mc 19 for the same source, except the two calls /
-; branches to the local label loc at the end, which axx makes
-; relocations against loc where llvm-mc resolves them itself.
+; are those of llvm-mc 19 for the same source.  The call and the branch
+; to the local label loc at the end are resolved in place (.elfresolve),
+; as llvm-mc does, though this file never writes .section .text.  The one
+; difference is the XWORD at .data+12, which is not 8 byte aligned:
+; llvm-mc writes R_SPARC_UA64 there and axx R_SPARC_64.
 ;
 ;   axx sparc.axx sparc_reloc.s -o out.o
 
