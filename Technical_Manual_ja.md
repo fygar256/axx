@@ -50,13 +50,13 @@ gcc caxx.c -o caxx -lm -lquadmath -O2   # -lm は式評価器が、-lquadmath �
 
 この 2 つは同じ入力に対して**バイト単位で同一の出力**を生成することを意図しています。
 同梱のパターンファイル、テストソース、`test1` スクリプトはまさにそれを検証するために
-存在します。`test1` は同梱の 71 組のパターン/ソースの対を両方の実装でアセンブルし、
+存在します。`test1` は同梱の 73 組のパターン/ソースの対を両方の実装でアセンブルし、
 結果を `cmp` します。さらに `.textmode` の 5 組と `exprmiss.axx` の組については、`-V` で標準出力へ流した
 翻訳テキストどうしも、`echo.axx` と `ministr.axx` の組については標準エラーへ出た `.echo` の行どうしも
 `cmp` します。回帰テストの `regress.axx` は `-V` のテキストと標準エラーの診断を
 `cmp` します。中核の 16 組は `-o`・`-m 3 -f 32 -o`・`-g -o`・`-v`・`-V` でも
 走らせるので、ELF32/ELF64 のオブジェクト、DWARF、リスティング、テキスト出力の
-経路も比較されます（全 206 組）。
+経路も比較されます（全 209 組）。
 
 **目次**
 
@@ -4566,8 +4566,8 @@ x86_64 パターンファイルは
 
 | パターンファイル | サイズ | `::` 行数 | ソース | 備考 |
 |---|---|---|---|---|
-| **x86_64.axx** | 3.9 MB | 23,948 | **hello.s**、**bsection.s**、**x86_64_reloc.s** | x86_64-v3: セグメントアドレッシング、AVX/AVX2、BMI1/BMI2、x87、EVEX/AVX-512 |
-| **x86_64m.axx** | 937 KB | 5,812（展開後 23,948） | **hello.s**、**x86_64_reloc.s** | マクロで書かれた x86_64-v3。Brainfuck デモでも使用 |
+| **x86_64.axx** | 3.9 MB | 23,948 | **hello.s**、**bsection.s**、**x86_64_reloc.s**、**x86_64_rex.s** | x86_64-v3: セグメントアドレッシング、AVX/AVX2、BMI1/BMI2、x87、EVEX/AVX-512。AVX 以降に既知の誤りあり（表の後の注） |
+| **x86_64m.axx** | 937 KB | 5,812（展開後 23,948） | **hello.s**、**x86_64_reloc.s**、**x86_64_rex.s** | マクロで書かれた x86_64-v3。Brainfuck デモでも使用。`x86_64.axx` と同じ既知の誤りあり |
 | **aarch64.axx** | 350 KB | 2,097（展開後 9,387） | **aarch64.s**、**aarch64_reloc.s** | AArch64 (A64): データ処理、分岐、例外生成、ヒント、バリア、システムレジスタと SYS 別名、ロード／ストア、LSE アトミック、スカラ浮動小数点、Advanced SIMD（LD1〜LD4 / ST1〜ST4 の構造アクセスを含む）、暗号、スカラ拡張（PAuth・MTE・MOPS・FCMA・ドット積・BFloat16・行列積・LS64）。さらに SVE・SVE2（算術、シフト、比較、述語、要素数、置換、リダクション、ギャザー／スキャッタを含むロード／ストア一式、拡幅・縮小群、複素演算、SVE2 暗号）、SME（ストリーミングモード、ZA 配列、整数・浮動小数点・BFloat16 の外積）、SME2（述語カウンタレジスタ、ZT0 参照表、Z レジスタのマルチベクタ演算、ZA への累算、連続形と跨ぎ形のマルチベクタロード／ストア）。GNU 式のリロケーション修飾子（`:lo12:`・`:pg_hi21:`・`:abs_g0:`〜`:abs_g3:`・`:prel_g0:`〜`:prel_g3:`・`:got:`／`:got_lo12:`）は `-o` でリンカ向けのリロケーションとして出し、`-b` では axx 自身が解決する。`-o` では `-m` なしで AArch64 のオブジェクトになり、同じセクションの局所ラベルへの分岐・`adr`・リテラルの `ldr` はその場で解決し、データの命令（`.byte` `.hword` `.word` `.quad` `.xword` など）は ABS / PREL のリロケーションを持つ（`aarch64_reloc.s`、llvm-mc 19 と照合）。マクロ層で記述 |
 | **aarch64_logical.axx** | 9.5 KB | 76（展開後 82） | **aarch64_logical_mini_demo.s** | 同じ AArch64 論理（即値）グループのマクロ層版。行を `!def` で生成し、ビットマスク即値は `binary_list` の式で符号化する |
 | **aarch64_logical_mini.axx** | 9.2 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 論理（即値）: AND/ORR/EOR/ANDS/TST、32 ビットと 64 ビット。ビットマスク即値をミニ言語（3.15 節）でエンコード |
@@ -4650,7 +4650,30 @@ ld.lld 19 と照合）・`bf_sparc.s`
 （Brainfuck インタプリタ、qemu-sparc64 で実行）と対になります。`itanium.axx` も `vliw.s` を使い、
 `aarch64_logical_mini.axx` は `aarch64_logical_mini_demo.s` と対になります。
 
-`test1` は 71 組を両方の実装で実行し、`-b` の生バイナリを比較します。
+`x86_64.axx` と `x86_64m.axx` は、全パターン行を乱数のオペランドで具体化した命令を、
+llvm-mc 19 の逆アセンブルと照合しています（`x86_64.axx` の書き方は GNU as と違うので、
+組むのではなく出したバイト列を逆アセンブルして元の行と比べます）。汎用レジスタ・x87・
+SSE〜SSE4.2 の範囲は、`x86_64_rex.s` で直した REX の誤りを除いて一致しました。
+**AVX 以降（VEX・EVEX）には、誤った、あるいは無効な符号を出す行がまだ多く残っています
+（既知の問題、約 3,700 行）。** 主なものは次のとおりです。
+
+- VEX の map・pp・vvvv の誤り: `VMASKMOV*`・`VPMASKMOV*`、ギャザー、`*256` の単項命令
+  （`VPMOVSX*256`・`VPMOVZX*256`・`VCVT*256` など）、`VBROADCAST*`、`VPERM*`、
+  `VINSERT*128` / `VEXTRACT*128`、BMI の `*64` 形、`VFFM*` の全体
+- `VMOVSS` / `VMOVSD` のストア（`[mem],x`）がロードとして符号化される。`VMOVAPS` などの
+  ストアは XMM / YMM を取らない
+- `KMOV*` のメモリ形で R8〜R15 の REX.B / REX.X が落ちる。`KSHIFT*` の W が違う
+- EVEX の disp8*N（変位の圧縮）を考えていない。`[b+!o]B` の変位がそのまま N 倍される
+- `VCVTSI2SD` と `VCVTSI2SS`、`VPSHUFHW` と `VPSHUFLW` が入れ替わっている。
+  `VCOMPRESSPS512` / `VCOMPRESSPD512` は源レジスタを符号化しない。`VPSRAQ512` が
+  `VPSRAVQ` に、`VRNDSCALEPS512`・`VREDUCEPS512`・`VGETMANTPS512` が `*PH` に、
+  `VPBROADCASTD256` / `VPBROADCASTQ256` のメモリ形が別の命令になる
+- AH・CH・DH・BH を REX の要るオペランドと組み合わせると、エラーにならず SPL・BPL・
+  SIL・DIL になる。多くの 8 ビット即値は範囲を検査せず、下位 8 ビットだけを使う
+
+これらの命令を使うときは、llvm-mc などで符号を確かめてください。
+
+`test1` は 73 組を両方の実装で実行し、`-b` の生バイナリを比較します。
 `.textmode` を使う 5 組（`textmode.axx` / `8080toz80.axx` / `intel2att.axx` / `a64tox64_axx.axx` / `expcap.axx`）と、
 `.passthru` で素通しした行を見る `exprmiss.axx` については、`-V` で
 標準出力へ流した翻訳テキストどうしも比較します。`elftype.axx` / `elftype.s` と
@@ -4661,7 +4684,7 @@ ld.lld 19 と照合）・`bf_sparc.s`
 3.7.10 節の宣言を見る `elfpair`・`elfmips`・`elfmips64`・`elfword`、CFI を見る
 `elfcfi` の 12 組は
 リロケーションと ELF のヘッダ・シンボル表を見るものなので、`-o` の ELF
-オブジェクトどうしを比較します。`aarch64.axx`（`-m 183`）と `elfpair.axx` は
+オブジェクトどうしを比較します。`aarch64.axx`（`-m 183`）・`elfpair.axx`・`riscv64full.axx` は
 `--elfdesc` の出力（記述を宣言に書き直したもの）どうしも比較します。
 `echo.axx` / `echo.s` と `ministr.axx` / `ministr.s` の組は標準エラーへ出た `.echo` の行どうしも比較します。
 回帰テストの `regress.axx` は、`regress.s` を `-V` のテキストで、`regresserr.s` を標準エラーの
@@ -4687,14 +4710,17 @@ PowerPC64 の 2 組（`ppc64.axx` と `ppc64le.axx` に `ppc64_reloc2.s`）は `
 `bsection.s` の組は `-b` の像を比較します。x86-64 の 2 組（`x86_64.axx`・
 `x86_64m.axx` にそれぞれ `x86_64_reloc.s`）も `-o` の ELF オブジェクトどうしを
 比較します。`PLT32`・`PC32`・`PC8`・`ABS32S` と、セクション内の局所の分岐・
-RIP 相対参照の解決を見る組です。
+RIP 相対参照の解決を見る組です。同じ 2 つのパターンファイルに `x86_64_rex.s` の 2 組は
+`-b` の像を比較します。R8〜R15 の REX（`[disp+index]`・CR / DR・`VMREAD` / `VMWRITE`・
+`PEXTRB` / `PEXTRD` / `PEXTRQ`・`MOVDG` / `MOVQG`）と `LOOP` 系・`JRCXZ` の 8 ビットの範囲を
+見る組です。
 
 さらに中核の 16 組（`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`）は、
 `-b` だけでは一度も比較されない経路を通すために、`-o`（ELF64）、`-m 3 -f 32 -o`
 （ELF32）、`-g -o`（DWARF 付き）、`-v`（リスティング）、`-V`（テキスト出力）
 でも走らせて突き合わせます。`elfcfi` は ELF32（`-m 3 -f 32`、REL）でも比較します。
-比較は全部で 206 組です。
+比較は全部で 209 組です。
 
 `-g` を比較するときは、両実装を必ず同じディレクトリで走らせてください。DWARF は
 `DW_AT_comp_dir` にカレントディレクトリを埋めるので、別の場所で走らせると中身が
@@ -4726,7 +4752,7 @@ RIP 相対参照の解決を見る組です。
 | `format_of_exp_imp_file` | エクスポート/インポートファイル形式 |
 | `axx.1.gz` | man ページ |
 
-`test1` は同梱の 71 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
+`test1` は同梱の 73 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
 
 ### C.2 外部
 

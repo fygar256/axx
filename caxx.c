@@ -21632,10 +21632,10 @@ static void elf_desc_print(AsmState *st, FILE *fp){
     fprintf(fp, ".elfdwarf::%s\n", elf_desc_tname(m, m->dwarf_abs, b1, sizeof(b1)));
     fprintf(fp, ".elfpcguess::%d\n", m->pcrel_guess ? 1 : 0);
     if(st->elf_decl_relax >= 0) fprintf(fp, ".elfrelax::%d\n", st->elf_decl_relax);
-    for(int i = 0; i < st->elf_resolve_types_len; i++)
-        fprintf(fp, ".elfresolve::%s\n", st->elf_resolve_types[i]);
     for(int i = 0; i < st->elf_anchor_types_len; i++)
         fprintf(fp, ".elfanchor::%s\n", st->elf_anchor_types[i]);
+    for(int i = 0; i < st->elf_resolve_types_len; i++)
+        fprintf(fp, ".elfresolve::%s\n", st->elf_resolve_types[i]);
     fprintf(fp, ".elfunit::%s\n", st->elf_decl_unit == 1 ? "word" : "byte");
     for(int w = 1; w < 9; w++){
         int ra, rb;

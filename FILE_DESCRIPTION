@@ -427,6 +427,11 @@ x86_64_reloc.s                      relocations of x86_64.axx / x86_64m.axx for
                                     resolved in place for a local label of the
                                     same section via .elfresolve), checked
                                     against llvm-mc 19 and ld.lld 19
+x86_64_rex.s                        REX prefixes of x86_64.axx / x86_64m.axx for
+                                    R8-R15: [disp+index], MOV CR / DR, VMREAD /
+                                    VMWRITE, PEXTRB / PEXTRD / PEXTRQ, MOVDG /
+                                    MOVQG, and the 8-bit range of LOOP* / JRCXZ,
+                                    checked by disassembling with llvm-mc 19
 hello.tsv                           export file of x86_64 hello world
 imp.tsv                             import file
 secsort.py                          execution file of section sort
@@ -533,8 +538,11 @@ z80.axx                             pattern file for Z80
 z80.s                               test assemble file for Z80
 vliw.axx                            test pattern file for vliw
 vliw.s                              test assembly file for vliw
-x86_64.axx                          pattern file for x86_64-v3 (includes segment addressing, AVX/AVX2, BMI1/BMI2, x87 and EVEX/AVX-512)
+x86_64.axx                          pattern file for x86_64-v3 (includes segment addressing, AVX/AVX2, BMI1/BMI2, x87 and EVEX/AVX-512);
+                                    many AVX and later rows still give wrong
+                                    encodings (manual appendix B)
 x86_64m.axx                         pattern file for x86_64-v3 with macro
+                                    (the same known errors as x86_64.axx)
 itanium.axx                         test pattern file for itanium
 MACRO.md                            macro layer reference (Japanese)
 macro_en.md                         macro layer reference (English)

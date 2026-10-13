@@ -119,6 +119,12 @@ caxx $P/x86_64.axx $S/x86_64_reloc.s -o b167
 caxx $P/x86_64m.axx $S/x86_64_reloc.s -o b168
 # 式・因子のあるべきところに式・因子が無い行は当たらず、.passthru で素通しされる。
 caxx $P/exprmiss.axx $S/exprmiss.s -V -b b169 > b169t
+# --elfdesc の .elfanchor と .elfresolve の並び（RISC-V は両方を宣言する）。
+caxx $P/riscv64full.axx --elfdesc > b170
+# x86-64: R8-R15 の REX（[disp+index]・CR / DR・VMREAD / VMWRITE・PEXTR*・MOVDG / MOVQG）。
+# 両パターンファイルで。
+caxx $P/x86_64.axx $S/x86_64_rex.s -b b171
+caxx $P/x86_64m.axx $S/x86_64_rex.s -b b172
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -300,6 +306,9 @@ paxx $P/aarch64.axx $S/aarch64_reloc.s -o a166
 paxx $P/x86_64.axx $S/x86_64_reloc.s -o a167
 paxx $P/x86_64m.axx $S/x86_64_reloc.s -o a168
 paxx $P/exprmiss.axx $S/exprmiss.s -V -b a169 > a169t
+paxx $P/riscv64full.axx --elfdesc > a170
+paxx $P/x86_64.axx $S/x86_64_rex.s -b a171
+paxx $P/x86_64m.axx $S/x86_64_rex.s -b a172
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -440,6 +449,9 @@ check a167 b167
 check a168 b168
 check a169 b169
 check a169t b169t
+check a170 b170
+check a171 b171
+check a172 b172
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"
