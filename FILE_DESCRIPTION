@@ -108,8 +108,11 @@ regress.axx                         regression test for disagreements between
                                     at the end of a section, undefined values
                                     carried through .EQU, white space and
                                     character constants, the byte strings of
-                                    the macro layer
-regress.s                           test assemble file for regress.axx (-V text)
+                                    the macro layer; and (2026-10-13)
+                                    mnemonics with `_` after a capital letter
+                                    (VADDSS_E), which the prefix index used to
+                                    drop
+regress.s                          test assemble file for regress.axx (-V text)
 regresserr.s                        test assemble file for regress.axx (the
                                     diagnostics on standard error)
 regresscr.s                         test assemble file for regress.axx whose
@@ -427,6 +430,13 @@ x86_64_reloc.s                      relocations of x86_64.axx / x86_64m.axx for
                                     resolved in place for a local label of the
                                     same section via .elfresolve), checked
                                     against llvm-mc 19 and ld.lld 19
+x86_64_avx.s                        VEX / EVEX instructions of x86_64.axx /
+                                    x86_64m.axx: one register form and one
+                                    short-displacement form of every AVX /
+                                    AVX2 / FMA / F16C / BMI / K-mask / AVX-512
+                                    mnemonic, and the string instructions with
+                                    the optional [[rep]] prefix, checked
+                                    against llvm-mc 19
 x86_64_rex.s                        REX prefixes of x86_64.axx / x86_64m.axx for
                                     R8-R15: [disp+index], MOV CR / DR, VMREAD /
                                     VMWRITE, PEXTRB / PEXTRD / PEXTRQ, MOVDG /
@@ -539,10 +549,10 @@ z80.s                               test assemble file for Z80
 vliw.axx                            test pattern file for vliw
 vliw.s                              test assembly file for vliw
 x86_64.axx                          pattern file for x86_64-v3 (includes segment addressing, AVX/AVX2, BMI1/BMI2, x87 and EVEX/AVX-512);
-                                    many AVX and later rows still give wrong
-                                    encodings (manual appendix B)
+                                    the VEX / EVEX rows are built from the
+                                    encodings of llvm-mc 19 (manual appendix B)
 x86_64m.axx                         pattern file for x86_64-v3 with macro
-                                    (the same known errors as x86_64.axx)
+                                    (expands to the same rows as x86_64.axx)
 itanium.axx                         test pattern file for itanium
 MACRO.md                            macro layer reference (Japanese)
 macro_en.md                         macro layer reference (English)

@@ -31,7 +31,7 @@ caxx $P/aarch64.axx $S/aarch64.s -b b21
 caxx $P/elftype.axx $S/elftype.s -o b22 -m 62
 caxx $P/elfgen.axx $S/elfgen.s -o b23
 caxx $P/symcap.axx $S/symcap.s -b b24
-caxx $P/echo.axx $S/echo.s -b b25 2>&1 | grep -v '^wrote ' > b25e
+caxx $P/echo.axx $S/echo.s -b b25 2>&1 | grep -v '^raw: wrote ' > b25e
 caxx $P/elfprio.axx $S/elfprio.s -o b26
 caxx $P/elfsec.axx $S/elfsec.s -o b27
 caxx $P/endsub.axx $S/endsub.s -b b28
@@ -80,11 +80,11 @@ caxx $P/unordered.axx $S/unordered.s -b b146
 caxx $P/a64tox64_axx.axx $S/bf_aarch64.s -V > b147
 caxx $P/a64tox64_axx.axx $S/bf_aarch64.s -b b148
 caxx $P/expcap.axx $S/expcap.s -V -b b149 > b149t
-caxx $P/ministr.axx $S/ministr.s -b b150 2>&1 | grep -v '^wrote ' > b150e
+caxx $P/ministr.axx $S/ministr.s -b b150 2>&1 | grep -v '^raw: wrote ' > b150e
 # 差分ファジングで見つけて直した食い違いの回帰テスト。正常系は -V のテキスト、
 # エラー系は標準エラーの診断を比べる（エラーなので出力ファイルは書かれない）。
 caxx $P/regress.axx $S/regress.s -V > b151
-caxx $P/regress.axx $S/regresserr.s -b b152 2>&1 | grep -v '^wrote ' > b152e
+caxx $P/regress.axx $S/regresserr.s -b b152 2>&1 | grep -v '^raw: wrote ' > b152e
 # SPARC: sparc_test.s の全行、sparc_reloc.s のリロケーション、bf_sparc.s の ELF
 caxx $P/sparc.axx $S/sparc_test.s -b b153
 caxx $P/sparc.axx $S/sparc_reloc.s -o b154
@@ -125,6 +125,9 @@ caxx $P/riscv64full.axx --elfdesc > b170
 # 両パターンファイルで。
 caxx $P/x86_64.axx $S/x86_64_rex.s -b b171
 caxx $P/x86_64m.axx $S/x86_64_rex.s -b b172
+# x86-64: VEX / EVEX の全命令名（llvm-mc 19 と照合した抜粋）と [[rep]] の文字列命令。
+caxx $P/x86_64.axx $S/x86_64_avx.s -b b173
+caxx $P/x86_64m.axx $S/x86_64_avx.s -b b174
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -241,7 +244,7 @@ paxx $P/aarch64.axx $S/aarch64.s -b a21
 paxx $P/elftype.axx $S/elftype.s -o a22 -m 62
 paxx $P/elfgen.axx $S/elfgen.s -o a23
 paxx $P/symcap.axx $S/symcap.s -b a24
-paxx $P/echo.axx $S/echo.s -b a25 2>&1 | grep -v '^wrote ' > a25e
+paxx $P/echo.axx $S/echo.s -b a25 2>&1 | grep -v '^raw: wrote ' > a25e
 paxx $P/elfprio.axx $S/elfprio.s -o a26
 paxx $P/elfsec.axx $S/elfsec.s -o a27
 paxx $P/endsub.axx $S/endsub.s -b a28
@@ -286,9 +289,9 @@ paxx $P/unordered.axx $S/unordered.s -b a146
 paxx $P/a64tox64_axx.axx $S/bf_aarch64.s -V > a147
 paxx $P/a64tox64_axx.axx $S/bf_aarch64.s -b a148
 paxx $P/expcap.axx $S/expcap.s -V -b a149 > a149t
-paxx $P/ministr.axx $S/ministr.s -b a150 2>&1 | grep -v '^wrote ' > a150e
+paxx $P/ministr.axx $S/ministr.s -b a150 2>&1 | grep -v '^raw: wrote ' > a150e
 paxx $P/regress.axx $S/regress.s -V > a151
-paxx $P/regress.axx $S/regresserr.s -b a152 2>&1 | grep -v '^wrote ' > a152e
+paxx $P/regress.axx $S/regresserr.s -b a152 2>&1 | grep -v '^raw: wrote ' > a152e
 paxx $P/sparc.axx $S/sparc_test.s -b a153
 paxx $P/sparc.axx $S/sparc_reloc.s -o a154
 paxx $P/sparc.axx $S/bf_sparc.s -o a155 2>/dev/null
@@ -309,6 +312,8 @@ paxx $P/exprmiss.axx $S/exprmiss.s -V -b a169 > a169t
 paxx $P/riscv64full.axx --elfdesc > a170
 paxx $P/x86_64.axx $S/x86_64_rex.s -b a171
 paxx $P/x86_64m.axx $S/x86_64_rex.s -b a172
+paxx $P/x86_64.axx $S/x86_64_avx.s -b a173
+paxx $P/x86_64m.axx $S/x86_64_avx.s -b a174
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -452,6 +457,8 @@ check a169t b169t
 check a170 b170
 check a171 b171
 check a172 b172
+check a173 b173
+check a174 b174
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

@@ -1545,7 +1545,7 @@ static void pat_mark_static(PatVec *v){
             } else if(*q){
                 char c = *q;
                 if((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
-                   || c == '!' || c == '\\' || c == '[') closed = 0;
+                   || c == '!' || c == '\\' || c == '[' || c == '_') closed = 0;
             }
             e->pfx_closed = closed;
         }
@@ -4581,7 +4581,7 @@ static void binary_flush(AsmState *st){
     }
     if(total_size) fwrite(data,1,(size_t)total_size,fp);
     if(axx_close_out(fp, st->outfile)){ free(data); return; }
-    fprintf(stderr,"wrote raw binary %s (%llu bytes)\n",st->outfile,(unsigned long long)total_size);
+    fprintf(stderr,"raw: wrote %s (%llu bytes)\n",st->outfile,(unsigned long long)total_size);
     free(data);
 
     if(st->elf_objfile[0]){
@@ -8886,9 +8886,14 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
     char *s = sbuf_take(&sb_s, s_len + 2);
     memcpy(s, s_orig, s_len); s[s_len] = 0; s[s_len+1] = 0;
     char *t = sbuf_take(&sb_t, t_len + 2);
+    /* `[[xxx]]yyy` は `xxx yyy` として読む。閉じの印を空白にしておかないと、
+       `[[rep]]p` の rep と p が 1 つの変数名 repp につながってしまう
+       （axx.py の PatternMatcher.match() と同じ規則である）。 */
     { int n2=0;
-      for(size_t i=0;i<t_len;i++)
-          if(t_orig[i]!=OB_CHAR && t_orig[i]!=CB_CHAR) t[n2++]=t_orig[i];
+      for(size_t i=0;i<t_len;i++){
+          if(t_orig[i]==CB_CHAR) t[n2++]=' ';
+          else if(t_orig[i]!=OB_CHAR) t[n2++]=t_orig[i];
+      }
       t[n2]=0; t[n2+1]=0; }
 
     int idx_s=0,idx_t=0;

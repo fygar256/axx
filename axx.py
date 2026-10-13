@@ -353,7 +353,7 @@ def _lead_caps(pat_text):
 
     パターン索引の鍵に使う。空白は読み飛ばし、大文字以外が出たところで止める。
     返り値は (大文字の連なり, その直後が索引を閉じてよい文字か)。閉じてよいのは
-    次が小文字・数字・`!`・`\\`・`[` のいずれでもないとき、つまりニーモニックが
+    次が小文字・数字・`!`・`\\`・`[`・`_` のいずれでもないとき、つまりニーモニックが
     そこで終わっているときだけで、そうでなければ前方一致の見落としが起きる。
     lru_cache にしてあるのは、同じ書式が照合のたびに何度も問われるため。
     """
@@ -737,10 +737,11 @@ XDIGIT = "0123456789ABCDEF"
 ALPHABET = LOWER + CAPITAL
 
 # _PFX_OPEN … 先頭大文字列の直後にこれが来たら、ニーモニックはまだ続いている
-#             （小文字のオペランド、`!` の式捕捉、`[[` の省略可能部分など）。
+#             （小文字のオペランド、`!` の式捕捉、`[[` の省略可能部分、`VADDSS_E`
+#             のような `_` など）。
 # _PFX_WORD … 語を構成する文字。ソース側で鍵の直後がこれなら語の途中なので、
 #             そこで終わる書式を候補に入れてはいけない。
-_PFX_OPEN = frozenset(LOWER + DIGIT + '!\\[')
+_PFX_OPEN = frozenset(LOWER + DIGIT + '!\\[_')
 _PFX_WORD = frozenset(ALPHABET + DIGIT + '_')
 
 
@@ -4769,7 +4770,7 @@ class BinaryWriter:
             self.state.diag(f" error - cannot write '{self.state.outfile}': {e}",
                             set_error=True)
             return
-        print(f"wrote raw binary {self.state.outfile} ({len(data)} bytes)", file=sys.stderr)
+        print(f"raw: wrote {self.state.outfile} ({len(data)} bytes)", file=sys.stderr)
 
         if self.state.elf_objfile:
             _rela_z = elf_machine_table(self.state)['is_rela']
@@ -6529,7 +6530,10 @@ class PatternMatcher:
         n_sym = 0
         n_lit = 0
 
-        t = t.replace(OB, '').replace(CB, '')
+        # `[[xxx]]yyy` は `xxx yyy` として読む。閉じの印を空白にしておかないと、
+        # `[[rep]]p` の rep と p が 1 つの変数名 repp につながってしまう
+        # （caxx.c の pat_match() と同じ規則である）。
+        t = t.replace(OB, '').replace(CB, ' ')
         idx_s = 0
         idx_t = 0
         idx_s = StringUtils.skipspc(s, idx_s)
