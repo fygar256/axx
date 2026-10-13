@@ -384,7 +384,7 @@ _HOIST_TEXT_ONLY = ('.check', '.clrcheck', '.reloc', '.clrreloc',
                     '.elffield', '.elfpcguess', '.elfrelax', '.elfanchor', '.elfresolve',
                     '.elfbuiltin', '.elfextra',
                     '.elfdiff', '.elfencode', '.elfrinfo', '.elfunit', '.elflink',
-                    '.elfgroup', '.elfcfi', '.elfcfiinit', '.elfcfireg')
+                    '.elfgroup', '.elfcfi', '.elfcfiinit', '.elfcfireg', '.elfunaligned')
 
 
 def _pat_text_dynamic(t):
@@ -1256,6 +1256,12 @@ def elf_machine_table(state):
         rt = _elf_decl_type(state, named, text)
         if rt is not None:
             resolve.add(rt)
+    unaligned = {}
+    for text, utext in e.decl_unaligned.items():
+        rt = _elf_decl_type(state, named, text)
+        urt = _elf_decl_type(state, named, utext)
+        if rt is not None and urt is not None:
+            unaligned.setdefault(rt, urt)
 
     tbl = dict(base, name=name, elfclass=elfclass, is_rela=is_rela,
                width_guess=width_guess, pc_rel=pc_rel,
@@ -1263,7 +1269,8 @@ def elf_machine_table(state):
                named=named, reloc_bytes=reloc_bytes, reverse=reverse,
                pcrel_guess=pcrel_guess, field=field, extra=extra, diff=diff,
                diff_t=diff_t,
-               encode=encode, anchor=anchor, resolve=resolve, rinfo=e.decl_rinfo,
+               encode=encode, anchor=anchor, resolve=resolve, unaligned=unaligned,
+               rinfo=e.decl_rinfo,
                unit=e.decl_unit or 'byte')
     e.mach_cache_key = key
     e.mach_cache = tbl
@@ -1792,7 +1799,7 @@ class ElfState:
     decl_* はパターンファイルの ELF 記述（.elfmachine / .elfclass / .elfrela /
     .elfwidth / .elfextern / .elfdwarf / .elfheader / .elfsection / .elffield /
     .elfpcguess / .elfbuiltin / .elfextra / .elfdiff / .elfencode / .elfrinfo /
-    .elfunit / .elflink / .elfgroup）が
+    .elfunit / .elflink / .elfgroup / .elfunaligned）が
     書き込む先で、組み込みの表にかぶせて elf_machine_table() が実表を作る。
     decl_gen はそのキャッシュを捨てるための世代番号。
     """
@@ -1832,6 +1839,8 @@ class ElfState:
         self.decl_anchor = []
         # `.elfresolve` の型の綴り（宣言順）。
         self.decl_resolve = []
+        # `.elfunaligned`: 型の綴り → 欄の位置が幅の倍数でないときに代わりに使う型の綴り。
+        self.decl_unaligned = {}
         self.decl_rinfo = ''
         self.decl_unit = None
         self.decl_link = {}
@@ -5742,6 +5751,28 @@ class DirectiveProcessor:
             e.decl_gen += 1
         return True
 
+    def elfunaligned_processing(self, i):
+        """`.elfunaligned` — 境界に合わない位置のデータの欄に使う型を決める。
+
+        `.elfunaligned::<型>::<代わりの型>`。`.reloc` で型を付けていない欄（データ）で、
+        決まった型がこの型で、欄のセクションの中の位置が欄の幅の倍数でなければ、
+        代わりの型にする（SPARC の `R_SPARC_UA64` など）。
+        caxx.c の dir_elfunaligned() と同じ規則である。
+        """
+        if len(i) == 0 or i[0] != '.elfunaligned':
+            return False
+        t = (i[1] if len(i) > 1 else '').strip()
+        u = (i[2] if len(i) > 2 else '').strip()
+        if not t or not u:
+            self.state.diag(" error - .elfunaligned: a relocation type and its unaligned type "
+                            "are required.", set_error=True)
+            return True
+        e = self.state.elf
+        if e.decl_unaligned.get(t) != u:
+            e.decl_unaligned[t] = u
+            e.decl_gen += 1
+        return True
+
     def elfencode_processing(self, i):
         """`.elfencode` — REL で加数を欄へ書き戻す関数を型ごとに決める。
 
@@ -6373,7 +6404,7 @@ _PAT_DIRECTIVES = frozenset((
     '.elfpcguess', '.elfrelax', '.elfanchor', '.elfresolve', '.elfbuiltin', '.elfextra',
     '.elfdiff', '.elfencode',
     '.elfrinfo', '.elfunit', '.elflink', '.elfgroup', '.elfcfi', '.elfcfiinit',
-    '.elfcfireg'))
+    '.elfcfireg', '.elfunaligned'))
 
 
 _CONST_SETSYM_RE = re.compile(r"^[\s0-9+\-*/%()<>|&^~]+$|^\s*0[xX][0-9a-fA-F]+\s*$")
@@ -13871,6 +13902,13 @@ class Assembler:
                         if _alt is not None:
                             rtype = _alt
 
+                    # `.elfunaligned`: 欄のセクションの中の位置が欄の幅の倍数でなければ、
+                    # 宣言された境界に合わない位置用の型にする（SPARC の UA64 など。
+                    # llvm-mc と同じ）。caxx.c の lineassemble() と同じ規則である。
+                    _ua = _mach_tbl_la.get('unaligned', {}).get(rtype)
+                    if _ua is not None and num_bytes > 0 and sec_rel % num_bytes != 0:
+                        rtype = _ua
+
                     # `.elfresolve`: この（最終的に決まった）型が同じセクションの局所
                     # ラベル（.global / .weak でない）を指すなら、リロケーションを出さ
                     # ずに終える。`.elffield` の無い型（x86-64 の pc32/pc8/plt32 のよう
@@ -13967,7 +14005,7 @@ class Assembler:
                             '.elfresolve',
                             '.elfbuiltin', '.elfextra', '.elfdiff', '.elfencode',
                             '.elfrinfo', '.elfunit', '.elflink', '.elfgroup',
-                            '.elfcfi', '.elfcfiinit', '.elfcfireg')
+                            '.elfcfi', '.elfcfiinit', '.elfcfireg', '.elfunaligned')
 
     def register_elfdecls(self, pat):
         """パターンファイル中の ELF 記述ディレクティブを先に読んでおく。"""
@@ -13998,6 +14036,7 @@ class Assembler:
             '.elfcfi':     d.elfcfi_processing,
             '.elfcfiinit': d.elfcfiinit_processing,
             '.elfcfireg':  d.elfcfireg_processing,
+            '.elfunaligned': d.elfunaligned_processing,
         }
         for i in pat:
             if i and i[0] in table:
@@ -14054,6 +14093,8 @@ class Assembler:
             out.append(".elfanchor::%s" % _at)
         for _rt in self.state.elf.decl_resolve:
             out.append(".elfresolve::%s" % _rt)
+        for rt in sorted(tbl['unaligned']):
+            out.append(".elfunaligned::%s::%s" % (tname(rt), tname(tbl['unaligned'][rt])))
         out.append(".elfunit::%s" % tbl['unit'])
         for w in sorted(tbl['diff']):
             ra, rb = tbl['diff'][w]
@@ -14131,6 +14172,11 @@ class Assembler:
             for tt in (t,) + pair:
                 if _elf_decl_type(self.state, named, tt) is None:
                     self.state.diag(f" warning - .elfdiff: unknown relocation type '{tt}' "
+                                    f"for {tbl['name']}; ignored.", set_error=False)
+        for t, u in e.decl_unaligned.items():
+            for tt in (t, u):
+                if _elf_decl_type(self.state, named, tt) is None:
+                    self.state.diag(f" warning - .elfunaligned: unknown relocation type '{tt}' "
                                     f"for {tbl['name']}; ignored.", set_error=False)
         for t, fn in e.decl_encode.items():
             if _elf_decl_type(self.state, named, t) is None:
@@ -16012,6 +16058,7 @@ class Assembler:
             '.elfcfi':     d.elfcfi_processing,
             '.elfcfiinit': d.elfcfiinit_processing,
             '.elfcfireg':  d.elfcfireg_processing,
+            '.elfunaligned': d.elfunaligned_processing,
         }
         out = []
         for row, i in enumerate(pat):

@@ -239,6 +239,9 @@
 .elftype::tls_le_lox10::73::4
 .elftype::gotdata_hix22::80::4
 .elftype::gotdata_lox10::81::4
+.elftype::ua32::23::4
+.elftype::ua64::54::8
+.elftype::ua16::55::2
 
 /* The fields, in the big-endian instruction word. The branch fields
 /* count words (shift 2), which RELA itself does not use but the
@@ -255,6 +258,13 @@
 .elfresolve::wdisp22
 .elfresolve::wdisp19
 .elfresolve::wdisp16
+/* A data field whose offset in its section is not a multiple of its
+/* width (an XWORD at .data+12, say) takes the unaligned type, as
+/* llvm-mc does: R_SPARC_UA64 / UA32 / UA16 in place of R_SPARC_64 /
+/* 32 / 16 (manual 3.7.9). */
+.elfunaligned::r64::ua64
+.elfunaligned::r32::ua32
+.elfunaligned::r16::ua16
 .elffield::r13::0x1fff
 .elffield::got13::0x1fff
 .elffield::l44::0xfff

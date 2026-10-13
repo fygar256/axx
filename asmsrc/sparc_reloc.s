@@ -3,9 +3,9 @@
 ; The relocation entries (offset, type, symbol, addend) and the bytes
 ; are those of llvm-mc 19 for the same source.  The call and the branch
 ; to the local label loc at the end are resolved in place (.elfresolve),
-; as llvm-mc does, though this file never writes .section .text.  The one
-; difference is the XWORD at .data+12, which is not 8 byte aligned:
-; llvm-mc writes R_SPARC_UA64 there and axx R_SPARC_64.
+; as llvm-mc does, though this file never writes .section .text.  The
+; XWORD at .data+12 is not 8 byte aligned and takes R_SPARC_UA64, as
+; llvm-mc writes (.elfunaligned in sparc.axx).
 ;
 ;   axx sparc.axx sparc_reloc.s -o out.o
 

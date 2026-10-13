@@ -504,7 +504,18 @@ MRS xt,S!S{{tbl}}a_Z
 ```
 
 the name reads as `a_`, the separator disappears, and `mrs x0,s3_z` no longer
-matches. Escaping it ends the name and matches the underscore literally:
+matches. The same happens before a capture when a lowercase variable name comes
+first: `r_!c` is the name `r_`. Putting a space where the name should end —
+`!a _X`, `r _!c` — ends it there and matches the underscore as text; a space in
+a pattern matches zero or more spaces in the source, so `!a _X` matches both
+`5_X` and `5 _X`:
+
+```
+LD !a _X :: :: 0x10,a          /* ld 5_X -> 0x10 0x05 */
+DP r _!c :: :: 0x50,r,c        /* dp A_3 -> 0x50 0x01 0x03 (r from .check) */
+```
+
+Escaping it ends the name and matches the underscore literally as well:
 
 ```
 MRS xt,S!S{{tbl}}a\_Z          /* matches mrs x0,s3_z */
@@ -512,9 +523,10 @@ MRS xt,S!S{{tbl}}a\_Z          /* matches mrs x0,s3_z */
 
 The same escape is what separates two expression captures, since a numeric
 literal also accepts `_` as a digit separator — `!v_!w` reads `3_5` as the
-single number 35, while `!v\_!w` reads it as 3 and 5. This applies to every
+single number 35, while `!v _!w` or `!v\_!w` reads it as 3 and 5. This applies to every
 kind of capture: a symbol placeholder, `!x`, `!!x` and `!S{{name}}x` alike.
-An underscore that is not preceded by a capture needs no escape, and a
+An underscore that follows neither a capture nor a variable name (`_!b`,
+`X_!c`) needs no space or escape, and a
 `.setsym` name containing one — `TPIDR_EL0` — is unaffected, because `_` is in
 the default symbol character set and the whole word is one symbol.
 
@@ -1713,6 +1725,7 @@ ELF object should look like.
 | `.elfrelax::<0>` / `<1>` | whether the linker may shrink code, which keeps label differences inside a section as relocations (section 3.7.10) |
 | `.elfanchor::<type>` | an extra relocation of `.reloc` of this type names a local symbol on the row's first relocation (section 3.7.5) |
 | `.elfresolve::<type>` | a field of this PC-relative type that refers to a local label of the same section is resolved by axx, with no relocation (below) |
+| `.elfunaligned::<type>::<unaligned type>` | the type used in place of this one when a data field's offset in its section is not a multiple of its width (section 3.7.9) |
 | `.elfbuiltin::<0>` / `<1>` | whether the built-in table is the base (section 3.7.9) |
 | `.elfextra::<type>::<companion>[::<symbol>]` | a relocation added at the same offset (section 3.7.10) |
 | `.elfdiff::<width or type>::<add type>::<subtract type>` | sums and differences of labels as add/subtract relocations (section 3.7.10) |
@@ -2094,6 +2107,21 @@ type is recognised as PC-relative in two ways:
 Either way the PC-relative type is a data type: a type with an `.elffield` (an
 instruction field, such as RISC-V's `R_RISCV_BRANCH`, which is PC-relative and
 4 bytes wide too) is never chosen.
+
+**`.elfunaligned::<type>::<unaligned type>`.** In a field `.reloc` does not type
+(data), when the type decided is this one and the field's offset in its section
+is not a multiple of the field's width, the unaligned type is used instead. It
+is for machines with relocation types for unaligned places: `sparc.axx` gives
+`r64` / `r32` / `r16` the types `R_SPARC_UA64` / `UA32` / `UA16`, as llvm-mc
+does. It is looked at after the type is guessed from the width and after the
+`.elfpcguess` swap. `--elfdesc` writes the declarations in order of type number.
+
+```
+.elfunaligned::r64::ua64
+        .section .data
+        WORD    ext             ; .data+0 -> R_SPARC_32
+        XWORD   ext+8           ; .data+4 -> R_SPARC_UA64 (4 is not a multiple of 8)
+```
 
 The two `$$` differ, which is why the spelling is read rather than the value:
 written in the source, `$$` is the location in the whole image, while inside a

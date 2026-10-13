@@ -1224,7 +1224,8 @@ enum {
     PD_ELFEXTERN, PD_ELFDWARF, PD_ELFHEADER, PD_ELFSECTION, PD_ECHO, PD_ELFFIELD,
     PD_ELFPCGUESS, PD_ELFBUILTIN, PD_ELFEXTRA, PD_ELFDIFF, PD_ELFENCODE,
     PD_ELFRINFO, PD_ELFUNIT, PD_ELFLINK, PD_ELFGROUP, PD_ELFCFI, PD_ELFCFIINIT,
-    PD_ELFCFIREG, PD_UNORDERED, PD_ELFRELAX, PD_ELFANCHOR, PD_ELFRESOLVE
+    PD_ELFCFIREG, PD_UNORDERED, PD_ELFRELAX, PD_ELFANCHOR, PD_ELFRESOLVE,
+    PD_ELFUNALIGNED
 };
 
 /* パターン行がどのディレクティブか（種別の番号）。 */
@@ -1247,7 +1248,7 @@ static int pat_dir_kind(const PatEntry *e){
         { ".elffield", PD_ELFFIELD },
         { ".elfpcguess", PD_ELFPCGUESS }, { ".elfbuiltin", PD_ELFBUILTIN },
         { ".elfrelax", PD_ELFRELAX }, { ".elfanchor", PD_ELFANCHOR },
-        { ".elfresolve", PD_ELFRESOLVE },
+        { ".elfresolve", PD_ELFRESOLVE }, { ".elfunaligned", PD_ELFUNALIGNED },
         { ".elfextra", PD_ELFEXTRA }, { ".elfdiff", PD_ELFDIFF },
         { ".elfencode", PD_ELFENCODE }, { ".elfrinfo", PD_ELFRINFO },
         { ".elfunit", PD_ELFUNIT }, { ".elflink", PD_ELFLINK },
@@ -1281,7 +1282,7 @@ static int pat_is_directive(const PatEntry *e){
         ".elfextern", ".elfdwarf", ".elfheader", ".elfsection", ".echo", ".elffield",
         ".elfpcguess", ".elfbuiltin", ".elfextra", ".elfdiff", ".elfencode",
         ".elfrelax", ".elfanchor", ".elfresolve", ".elfrinfo", ".elfunit", ".elflink", ".elfgroup", ".elfcfi", ".elfcfiinit",
-        ".elfcfireg", ".unordered", NULL };
+        ".elfcfireg", ".elfunaligned", ".unordered", NULL };
     if(!e || !e->f[0] || !e->f[0][0]) return 0;
     const char *n = e->f[0];
     for(int k=0; tbl[k]; k++) if(strcmp(n, tbl[k]) == 0) return 1;
@@ -1734,7 +1735,7 @@ static int pat_dir_line_invariant(const PatEntry *e){
     case PD_ELFSECTION: case PD_ELFFIELD: case PD_ELFPCGUESS: case PD_ELFBUILTIN:
     case PD_ELFRELAX: case PD_ELFANCHOR: case PD_ELFRESOLVE: case PD_ELFEXTRA: case PD_ELFDIFF: case PD_ELFENCODE: case PD_ELFRINFO:
     case PD_ELFUNIT: case PD_ELFLINK: case PD_ELFGROUP: case PD_ELFCFI:
-    case PD_ELFCFIINIT: case PD_ELFCFIREG:
+    case PD_ELFCFIINIT: case PD_ELFCFIREG: case PD_ELFUNALIGNED:
         for(int i=1;i<PAT_FIELDS;i++)
             for(const char *q=e->f[i]; *q; q++)
                 if(*q=='!' || *q=='$' || *q=='#' || *q=='@') return 0;
@@ -2456,6 +2457,9 @@ typedef struct {
     char      *elf_diff_sub[9];
     struct { char *type; char *add; char *sub; } *elf_diff_t;
     int        elf_diff_t_len, elf_diff_t_cap;
+    /* `.elfunaligned`: 型の綴りと、欄の位置が幅の倍数でないときに代わりに使う型の綴り。 */
+    struct { char *type; char *ua; } *elf_unaligned;
+    int        elf_unaligned_len, elf_unaligned_cap;
     struct { char *type; char *fn; } *elf_encodes;
     int        elf_encodes_len, elf_encodes_cap;
     char      *elf_decl_rinfo;
@@ -3294,6 +3298,20 @@ static int elf_diff_t_of(const AsmState *st, int rtype, int *add, int *sub){
     return 0;
 }
 
+/* `.elfunaligned` で、型 rtype の代わりに境界に合わない位置で使う型を引く。最初に
+   当たった宣言を使う。無ければ -1。axx.py の elf_machine_table() の unaligned と同じ。 */
+static int elf_unaligned_of(const AsmState *st, int rtype){
+    if(st->elf_unaligned_len == 0) return -1;
+    const ElfMachineInfo *m = elf_machine_effective(st);
+    for(int i = 0; i < st->elf_unaligned_len; i++){
+        if(elf_decl_type_in(m->named, st->elf_unaligned[i].type) != rtype) continue;
+        int u = elf_decl_type_in(m->named, st->elf_unaligned[i].ua);
+        if(u < 0) continue;
+        return u;
+    }
+    return -1;
+}
+
 /* `.elfencode` の関数名を型番号で引く（最初に当たった宣言）。無ければ NULL。 */
 static const char *elf_encode_of(const AsmState *st, int rtype){
     if(st->elf_encodes_len == 0) return NULL;
@@ -3631,6 +3649,7 @@ static void state_init(AsmState *st) {
     st->elf_extras = NULL; st->elf_extras_len = 0; st->elf_extras_cap = 0;
     for(int _wi=0;_wi<9;_wi++){ st->elf_diff_add[_wi] = NULL; st->elf_diff_sub[_wi] = NULL; }
     st->elf_diff_t = NULL; st->elf_diff_t_len = 0; st->elf_diff_t_cap = 0;
+    st->elf_unaligned = NULL; st->elf_unaligned_len = 0; st->elf_unaligned_cap = 0;
     st->elf_encodes = NULL; st->elf_encodes_len = 0; st->elf_encodes_cap = 0;
     st->elf_decl_rinfo = NULL;
     st->elf_decl_unit = -1;
@@ -7626,6 +7645,41 @@ static int dir_elfencode(Assembler *asmb, PatEntry *e){
     st->elf_encodes[st->elf_encodes_len].type = t;
     st->elf_encodes[st->elf_encodes_len].fn   = f;
     st->elf_encodes_len++;
+    st->elf_decl_gen++;
+    return 1;
+}
+
+/* `.elfunaligned` — 境界に合わない位置のデータの欄に使う型を決める。
+   `.elfunaligned::<型>::<代わりの型>`。`.reloc` で型を付けていない欄（データ）で、
+   決まった型がこの型で、欄のセクションの中の位置が欄の幅の倍数でなければ、
+   代わりの型にする（SPARC の R_SPARC_UA64 など）。
+   axx.py の elfunaligned_processing() と同じ規則である。 */
+static int dir_elfunaligned(Assembler *asmb, PatEntry *e){
+    if(!e || strcmp(e->f[0], ".elfunaligned") != 0) return 0;
+    AsmState *st = &asmb->st;
+    char *t = elf_decl_trim_dup(e->f[1]);
+    char *u = elf_decl_trim_dup(e->f[2]);
+    if(!t[0] || !u[0]){
+        axx_diagf(1, 0, " error - .elfunaligned: a relocation type and its unaligned type "
+                   "are required.\n");
+        free(t); free(u);
+        return 1;
+    }
+    for(int i = 0; i < st->elf_unaligned_len; i++)
+        if(strcmp(st->elf_unaligned[i].type, t) == 0){
+            if(strcmp(st->elf_unaligned[i].ua, u) != 0){
+                free(st->elf_unaligned[i].ua);
+                st->elf_unaligned[i].ua = u;
+                st->elf_decl_gen++;
+            } else free(u);
+            free(t);
+            return 1;
+        }
+    st->elf_unaligned = elf_decl_grow(st->elf_unaligned, &st->elf_unaligned_cap,
+                                      st->elf_unaligned_len, sizeof(st->elf_unaligned[0]));
+    st->elf_unaligned[st->elf_unaligned_len].type = t;
+    st->elf_unaligned[st->elf_unaligned_len].ua   = u;
+    st->elf_unaligned_len++;
     st->elf_decl_gen++;
     return 1;
 }
@@ -15923,6 +15977,7 @@ static int pat_dir_exec(Assembler *asmb, PatEntry *i){
     case PD_ELFRELAX:  _dir_done = dir_elfrelax(asmb,i);     break;
     case PD_ELFANCHOR: _dir_done = dir_elfanchor(asmb,i);    break;
     case PD_ELFRESOLVE:_dir_done = dir_elfresolve(asmb,i);   break;
+    case PD_ELFUNALIGNED:_dir_done = dir_elfunaligned(asmb,i); break;
     case PD_ELFBUILTIN:_dir_done = dir_elfbuiltin(asmb,i);   break;
     case PD_ELFEXTRA: _dir_done = dir_elfextra(asmb,i);      break;
     case PD_ELFDIFF:  _dir_done = dir_elfdiff(asmb,i);       break;
@@ -17160,6 +17215,14 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                        && _pcg_d != 0){
                         int _alt = elf_reloc_data_pcrel(st, _mtbl_rm, _nbytes);
                         if(_alt > 0) _rtype = _alt;
+                    }
+
+                    /* `.elfunaligned`: 欄のセクションの中の位置が欄の幅の倍数でなければ、
+                       宣言された境界に合わない位置用の型にする（SPARC の UA64 など。
+                       llvm-mc と同じ）。axx.py の lineassemble() と同じ規則である。 */
+                    {
+                        int _ua = elf_unaligned_of(st, _rtype);
+                        if(_ua >= 0 && _nbytes > 0 && (_sec_rel % _nbytes) != 0) _rtype = _ua;
                     }
 
                     /* `.elfresolve`: この（最終的に決まった）型が同じセクションの
@@ -21663,6 +21726,13 @@ static void check_elfdecls(Assembler *asmb){
                 axx_diagf(0, 0, " warning - .elfdiff: unknown relocation type '%s' for %s; "
                            "ignored.\n", tt[k], m->name);
     }
+    for(int i = 0; i < st->elf_unaligned_len; i++){
+        const char *tt[2] = { st->elf_unaligned[i].type, st->elf_unaligned[i].ua };
+        for(int k = 0; k < 2; k++)
+            if(elf_decl_type_in(m->named, tt[k]) < 0)
+                axx_diagf(0, 0, " warning - .elfunaligned: unknown relocation type '%s' for %s; "
+                           "ignored.\n", tt[k], m->name);
+    }
     for(int i = 0; i < st->elf_encodes_len; i++)
         if(elf_decl_type_in(m->named, st->elf_encodes[i].type) < 0)
             axx_diagf(0, 0, " warning - .elfencode: unknown relocation type '%s' for %s; "
@@ -21733,6 +21803,27 @@ static void elf_desc_print(AsmState *st, FILE *fp){
         fprintf(fp, ".elfanchor::%s\n", st->elf_anchor_types[i]);
     for(int i = 0; i < st->elf_resolve_types_len; i++)
         fprintf(fp, ".elfresolve::%s\n", st->elf_resolve_types[i]);
+    {
+        /* 型番号の小さい順（同じ型は最初の宣言）。axx.py の sorted(tbl['unaligned']) と同じ。 */
+        int *rts = NULL; int nrt = 0, crt_ = 0;
+        for(int i = 0; i < st->elf_unaligned_len; i++){
+            int rt = elf_decl_type_in(m->named, st->elf_unaligned[i].type);
+            if(rt < 0 || elf_unaligned_of(st, rt) < 0) continue;
+            int dup = 0;
+            for(int k = 0; k < nrt; k++) if(rts[k] == rt){ dup = 1; break; }
+            if(dup) continue;
+            rts = elf_decl_grow(rts, &crt_, nrt, sizeof(int));
+            rts[nrt++] = rt;
+        }
+        for(int a = 1; a < nrt; a++)
+            for(int b = a; b > 0 && rts[b-1] > rts[b]; b--){ int t = rts[b]; rts[b] = rts[b-1]; rts[b-1] = t; }
+        for(int k = 0; k < nrt; k++){
+            char b2[32];
+            fprintf(fp, ".elfunaligned::%s::%s\n", elf_desc_tname(m, rts[k], b1, sizeof(b1)),
+                    elf_desc_tname(m, elf_unaligned_of(st, rts[k]), b2, sizeof(b2)));
+        }
+        free(rts);
+    }
     fprintf(fp, ".elfunit::%s\n", st->elf_decl_unit == 1 ? "word" : "byte");
     for(int w = 1; w < 9; w++){
         int ra, rb;
@@ -21906,6 +21997,7 @@ static void register_elfdecls(Assembler *asmb){
         case PD_ELFRELAX:   dir_elfrelax(asmb, e);    break;
         case PD_ELFANCHOR:  dir_elfanchor(asmb, e);   break;
         case PD_ELFRESOLVE: dir_elfresolve(asmb, e);  break;
+        case PD_ELFUNALIGNED: dir_elfunaligned(asmb, e); break;
         case PD_ELFBUILTIN: dir_elfbuiltin(asmb, e);  break;
         case PD_ELFEXTRA:   dir_elfextra(asmb, e);    break;
         case PD_ELFDIFF:    dir_elfdiff(asmb, e);     break;
