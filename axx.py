@@ -49,8 +49,10 @@ import functools
 import itertools
 import struct
 import sys
+import errno
 import os
 import math
+import signal
 import re
 import tempfile
 import uuid
@@ -7536,11 +7538,11 @@ class PatternFileReader:
                     if l[0].strip() != '' and _kw not in ('.PASSTHRU', '.EOL',
                                                          '.TEXTMODE', '.UNORDERED'):
                         diag(f" warning - pattern line has no '::' field separator "
-                             f"and can never match (a pattern file has no line-"
-                             f"continuation mechanism, so this is likely a stray "
-                             f"line left over from a multi-line comment, or a "
-                             f"binary_list/error_patterns that was continued onto "
-                             f"the next physical line): {l[0]!r}", set_error=False)
+                             f"and can never match (likely a stray line left over "
+                             f"from a multi-line comment, or a binary_list/"
+                             f"error_patterns continued onto the next physical "
+                             f"line without a '\\' at the end of the line before): "
+                             f"{l[0]!r}", set_error=False)
                     p = [l[0], '', '', '', '', '']
                 elif len(l) == 2:
                     p = [l[0], '', l[1], '', '', '']
@@ -12726,6 +12728,8 @@ class MacroPreprocessor:
                 raw = f.readlines()
         except OSError as e:
             raise MacroError(f"{_fmt_pos(pos)}: cannot '!include' {name!r}: {e}")
+        # 行末の `\` の継続もソースと同じにつなぐ（caxx.c の m_read_lines()）。
+        raw = StringUtils.join_backslash_continuations(raw)
         lines = [(t.rstrip('\r\n'), path, k + 1) for k, t in enumerate(raw)]
         self.include_stack.append(real)
         try:
@@ -16478,7 +16482,15 @@ class Assembler:
                 _initial_vars_undef = dict(self.state.vars_undef)
                 _initial_vars_float = dict(self.state.vars_float)
 
-                for relax_iter in range(MAX_RELAX):
+                # 前の反復から値の変わったラベルの数が最小を更新した反復は上限に
+                # 数えない。前方参照の `.equ` の連鎖は反復ごとに 1 段ずつ決まるので、
+                # 16 段を超える連鎖でも動くラベルが減っている限り回す。その数は
+                # 有限なので必ず止まる。振動では減らないので、従来どおり上限で止まる。
+                # caxx.c の main() の relax_budget / min_moving と同じ規則である。
+                _relax_budget = MAX_RELAX
+                _min_moving = None
+                relax_iter = 0
+                while relax_iter < _relax_budget:
                     self.state._relax_optimistic = (relax_iter == 0)
                     self.state._macro_line_pcs_cur = {}
                     self.state.pc = 0
@@ -16505,6 +16517,21 @@ class Assembler:
                             self.state.section_ranges.append((_last_sec1, _ep1, _blk1))
 
                     current_pcs = {k: (v[0], v[1]) for k, v in self.state.labels.items()}
+                    _prev_pcs = self.state._pass1_prev_label_pcs
+                    if isinstance(_prev_pcs, dict):
+                        _n_moving = sum(
+                            1 for k, (pc, _sec) in current_pcs.items()
+                            if _is_undef_derived(pc) or k not in _prev_pcs
+                            or _prev_pcs[k][0] != pc)
+                        # 0 は前の反復と同じ値（収束）なので、下の検出に任せる。
+                        if _n_moving and (_min_moving is None or _n_moving < _min_moving):
+                            if _min_moving is not None:
+                                _relax_budget += 1
+                                # 振動の検出に使う履歴はここから取り直す。振動が
+                                # 続くなら動く数は減らないので、次の周で見つかる。
+                                # 履歴が反復の数だけ膨らむのも防ぐ。
+                                _seen_pcs_history.clear()
+                            _min_moving = _n_moving
                     has_undef = any(
                         _is_undef_derived(pc)
                         for k, (pc, _sec) in current_pcs.items()
@@ -16537,9 +16564,10 @@ class Assembler:
                                 return False
                         _seen_pcs_history[_pcs_key] = relax_iter + 1
                     self.state._pass1_prev_label_pcs = current_pcs
+                    relax_iter += 1
                 else:
 
-                    self.state.diag(" error - Pass1 relaxation did not converge after {0} iterations.".format(MAX_RELAX), set_error=False, force=True)
+                    self.state.diag(" error - Pass1 relaxation did not converge after {0} iterations.".format(_relax_budget), set_error=False, force=True)
                     print("         Generated code would have incorrect addresses for", file=sys.stderr)
                     print("         variable-length instructions with forward references.", file=sys.stderr)
                     print("         Aborting: no output file written.", file=sys.stderr)
@@ -16707,20 +16735,45 @@ class Assembler:
                     pass
                 self.state.stdin_tmp_path = None
 
-        try:
-            sys.stdout.flush()
-        except OSError as _oe:
-            print(f" error - cannot write to standard output: {_oe}", file=sys.stderr)
-            try:
-                _devnull = os.open(os.devnull, os.O_WRONLY)
-                os.dup2(_devnull, 1)
-                os.close(_devnull)
-            except OSError:
-                sys.stderr.flush()
-                os._exit(1)
-            return False
-
         return True
+
+
+class _StdoutGuard:
+    """標準出力の書き込みの失敗を覚えておき、それ以後の書き込みを捨てる。
+
+    caxx.c は標準出力を stdio のバッファに溜め、最後の fflush で失敗を見て
+    「cannot write to standard output」を一度だけ出す（main() の cleanup）。
+    print() はその場で OSError を投げるので、ここで受け止めて組み立てを
+    続け、main() の終わりで同じ文言を一度だけ出す。
+    """
+
+    def __init__(self, stream):
+        # 標準出力が閉じたまま起動されると sys.stdout は None になる。書こうと
+        # したときに caxx.c の fflush と同じく EBADF として報告する。
+        self._stream = stream
+        self.error = None
+
+    def write(self, text):
+        if self.error is None:
+            if self._stream is None:
+                if text:
+                    self.error = OSError(errno.EBADF, os.strerror(errno.EBADF))
+                return len(text)
+            try:
+                return self._stream.write(text)
+            except OSError as e:
+                self.error = e
+        return len(text)
+
+    def flush(self):
+        if self.error is None and self._stream is not None:
+            try:
+                self._stream.flush()
+            except OSError as e:
+                self.error = e
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
 
 
 def main():
@@ -16735,8 +16788,28 @@ def main():
             pass
     if sys.getrecursionlimit() < _EXPR_RECLIMIT:
         sys.setrecursionlimit(_EXPR_RECLIMIT)
+    # 読み手が先に閉じたパイプ（`-v | head` など）では、caxx.c と同じく
+    # SIGPIPE で黙って終わる。Python の既定は無視なので BrokenPipeError になる。
+    if hasattr(signal, 'SIGPIPE'):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    guard = _StdoutGuard(sys.stdout)
+    sys.stdout = guard
     assembler = Assembler()
-    return assembler.run()
+    ok = assembler.run()
+    guard.flush()
+    if guard.error is not None:
+        print(f" error - cannot write to standard output: {guard.error}", file=sys.stderr)
+        # 書けなかった分がバッファに残り、終了時の flush でもう一度失敗して
+        # 「Exception ignored」を出さないよう、標準出力を捨て先へ付け替える。
+        try:
+            _devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(_devnull, 1)
+            os.close(_devnull)
+        except OSError:
+            sys.stderr.flush()
+            os._exit(1)
+        return False
+    return ok
 
 
 if __name__ == '__main__':

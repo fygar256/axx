@@ -2776,20 +2776,6 @@ static int axx_close_out(FILE *fp, const char *path){
     return 0;
 }
 
-/* 標準出力を流し、失敗を報告する。 */
-static int axx_flush_stdout(const char *path){
-    int err = 0;
-    errno = 0;
-    if(fflush(stdout) != 0 || ferror(stdout)) err = errno ? errno : EIO;
-    if(err){
-        char eb[2*PATH_MAX + 256]; axx_oserr_nopath(err, eb, sizeof(eb));
-        axx_diagf(1, 0, " error - cannot write '%s': %s\n", path, eb);
-        clearerr(stdout);
-        return 1;
-    }
-    return 0;
-}
-
 /* 入力を開く。失敗したら文言を出して NULL を返す。 */
 static FILE *axx_open_input(const char *fn, const char *what){
     char eb[2*PATH_MAX + 256];
@@ -9756,37 +9742,88 @@ static void axx_resolve_path(const char *base_dir, const char *fn,
     if(fn[0]=='/' || !base_dir || !base_dir[0]){
         strncpy(out, fn, osz-1); out[osz-1]='\0'; return;
     }
-    snprintf(out, osz, "%s/%s", base_dir, fn);
+    /* os.path.join と同じく、base_dir が / で終わるなら / を足さない。 */
+    size_t bl = strlen(base_dir);
+    snprintf(out, osz, "%s%s%s", base_dir, base_dir[bl-1]=='/' ? "" : "/", fn);
 }
 
-/* パスのディレクトリ部分を取る。 */
+/* os.path.abspath と同じ。相対パスなら作業ディレクトリにつなぎ、`.`・`..`・
+   重なった `/` を字面の上で畳む（シンボリックリンクはたどらない）。一覧と
+   診断に出る .include 先の名前を axx.py とそろえるために使う。 */
+static void axx_abspath(const char *path, char *out, size_t osz)
+{
+    char buf[2*PATH_MAX + 2];
+    if(!path) path = "";
+    if(path[0] == '/'){
+        axx_copy_trunc(buf, sizeof(buf), path);
+    } else {
+        char cwd_buf[PATH_MAX];
+        if(getcwd(cwd_buf, sizeof(cwd_buf)))
+            snprintf(buf, sizeof(buf), "%s%s%s", cwd_buf,
+                     (cwd_buf[0] && cwd_buf[strlen(cwd_buf)-1]=='/') ? "" : "/", path);
+        else
+            axx_copy_trunc(buf, sizeof(buf), path);
+    }
+    /* posixpath.normpath: 先頭のちょうど 2 つの / は残し、3 つ以上は 1 つにする。 */
+    int lead = 0;
+    if(buf[0] == '/') lead = (buf[1] == '/' && buf[2] != '/') ? 2 : 1;
+    size_t n = strlen(buf);
+    char *res = malloc(n + 3);
+    size_t *stk = malloc((n / 2 + 2) * sizeof(size_t));   /* 各要素の res の中の開始位置 */
+    if(!res || !stk){ perror("malloc"); exit(1); }
+    size_t rl = 0; int depth = 0;
+    for(int k = 0; k < lead; k++) res[rl++] = '/';
+    size_t base = rl;
+    const char *p = buf;
+    while(*p){
+        while(*p == '/') p++;
+        if(!*p) break;
+        const char *e = p;
+        while(*e && *e != '/') e++;
+        size_t cl = (size_t)(e - p);
+        int is_dot = (cl == 1 && p[0] == '.');
+        int is_dotdot = (cl == 2 && p[0] == '.' && p[1] == '.');
+        int top_dotdot = depth > 0 && rl - stk[depth-1] == 2
+                         && res[stk[depth-1]] == '.' && res[stk[depth-1]+1] == '.';
+        if(is_dot){
+            /* 捨てる */
+        } else if(!is_dotdot || (!lead && depth == 0) || top_dotdot){
+            if(rl > base) res[rl++] = '/';
+            stk[depth++] = rl;
+            memcpy(res + rl, p, cl); rl += cl;
+        } else if(depth > 0){
+            depth--;
+            rl = stk[depth];
+            if(rl > base) rl--;          /* 前の区切りの / も外す */
+        }
+        p = e;
+    }
+    res[rl] = '\0';
+    axx_copy_trunc(out, osz, rl ? res : ".");
+    free(stk); free(res);
+}
+
+/* パスのディレクトリ部分を取る。os.path.dirname と同じく、/ を含まなければ
+   空文字（C の dirname() は "." を返すので、"./a.s" と "a.s" が区別できない）、
+   末尾の / は落とす（ただし / だけなら残す）。 */
 static void axx_dir_of(const char *path, char *out, size_t osz)
 {
-    snprintf(out, osz, "%s", path ? path : "");
-    char *d = dirname(out);
-    if(d != out) memmove(out, d, strlen(d) + 1);
+    if(!path) path = "";
+    const char *sl = strrchr(path, '/');
+    size_t hl = sl ? (size_t)(sl - path) + 1 : 0;
+    size_t k = hl;
+    while(k > 0 && path[k-1] == '/') k--;
+    if(k > 0) hl = k;                    /* / だけでできた頭はそのまま */
+    if(hl >= osz) hl = osz - 1;
+    memcpy(out, path, hl);
+    out[hl] = '\0';
 }
 
-/* パスのディレクトリ部分を絶対パスで取る。 */
+/* パスのディレクトリ部分を絶対パスで取る（os.path.dirname(os.path.abspath())）。 */
 static void axx_abs_dir_of(const char *path, char *out, size_t osz)
 {
     char abs_buf[2*PATH_MAX + 2];
-    if(path && path[0] == '/'){
-        axx_copy_trunc(abs_buf, sizeof(abs_buf), path);
-    } else {
-        char cwd_buf[PATH_MAX];
-        if(getcwd(cwd_buf, sizeof(cwd_buf))){
-            size_t cl = strlen(cwd_buf);
-            axx_copy_trunc(abs_buf, sizeof(abs_buf), cwd_buf);
-            if(cl + 1 < sizeof(abs_buf)){
-                abs_buf[cl] = '/';
-                axx_copy_trunc(abs_buf + cl + 1, sizeof(abs_buf) - cl - 1,
-                               path ? path : "");
-            }
-        } else {
-            axx_copy_trunc(abs_buf, sizeof(abs_buf), path ? path : "");
-        }
-    }
+    axx_abspath(path, abs_buf, sizeof(abs_buf));
     char *d = dirname(abs_buf);
     axx_copy_trunc(out, osz, d ? d : ".");
 }
@@ -13022,11 +13059,11 @@ static void readpat(Assembler *asmb, const char *fn){
                   if(!_fr){ perror("malloc"); exit(1); }
                   m_pyrepr(fields[0], _fr, _rsz);
                   axx_diagf(0, 0, " warning - pattern line has no '::' field separator "
-                             "and can never match (a pattern file has no line-"
-                             "continuation mechanism, so this is likely a stray "
-                             "line left over from a multi-line comment, or a "
-                             "binary_list/error_patterns that was continued onto "
-                             "the next physical line): %s\n", _fr);
+                             "and can never match (likely a stray line left over "
+                             "from a multi-line comment, or a binary_list/"
+                             "error_patterns continued onto the next physical "
+                             "line without a '\\' at the end of the line before): "
+                             "%s\n", _fr);
                   free(_fr); }
             }
         }
@@ -16205,20 +16242,9 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
                   strncpy(resolved, raw, sizeof(resolved)-1);
                   resolved[sizeof(resolved)-1]='\0';
               } else if(cur && cur[0] && strcmp(cur,"(stdin)")!=0 && strcmp(cur,"stdin")!=0){
-                  char abs_buf[2*PATH_MAX + 2], dir_buf[2*PATH_MAX + 2];
-                  if(cur[0]=='/'){
-                      strncpy(abs_buf, cur, sizeof(abs_buf)-1);
-                      abs_buf[sizeof(abs_buf)-1]='\0';
-                  } else {
-                      char cwd_buf[PATH_MAX];
-                      if(getcwd(cwd_buf, sizeof(cwd_buf)))
-                          snprintf(abs_buf, sizeof(abs_buf), "%s/%s", cwd_buf, cur);
-                      else {
-                          strncpy(abs_buf, cur, sizeof(abs_buf)-1);
-                          abs_buf[sizeof(abs_buf)-1]='\0';
-                      }
-                  }
-                  axx_dir_of(abs_buf, dir_buf, sizeof(dir_buf));
+                  /* axx.py の os.path.dirname(os.path.abspath(cur)) と同じ。 */
+                  char dir_buf[2*PATH_MAX + 2];
+                  axx_abs_dir_of(cur, dir_buf, sizeof(dir_buf));
                   axx_resolve_path(dir_buf, raw, resolved, sizeof(resolved));
               } else {
                   strncpy(resolved, raw, sizeof(resolved)-1);
@@ -21576,8 +21602,9 @@ static void m_do_include(MacroPP *mp, const char *name, const char *file, int li
     if(name[0] == '/'){
         snprintf(path, psz, "%s", name);
     } else {
-        axx_dir_of(file && file[0] ? file : ".", dir, dsz);
-        if(dir[0] == '.' && dir[1] == '\0')
+        /* axx.py の do_include() と同じく、取り込む側のディレクトリが空なら名前のまま。 */
+        axx_dir_of(file, dir, dsz);
+        if(!dir[0])
             snprintf(path, psz, "%s", name);
         else
             axx_resolve_path(dir, name, path, psz);
@@ -22644,8 +22671,8 @@ int main(int argc, char *argv[]){
             pat_macro_expand_free(_pv,_pn); exit_code=1; goto cleanup;
         }
         for(int _pi=0;_pi<_pn;_pi++) fprintf(of,"%s\n",_pv[_pi]);
-        if(of!=stdout ? axx_close_out(of, pat_macro_expand_dest)
-                      : axx_flush_stdout(pat_macro_expand_dest)) exit_code=1;
+        /* 標準出力へ書いたときの失敗は cleanup の fflush が一度だけ報告する。 */
+        if(of!=stdout && axx_close_out(of, pat_macro_expand_dest)) exit_code=1;
         pat_macro_expand_free(_pv,_pn);
         goto cleanup;
     }
@@ -22675,8 +22702,8 @@ int main(int argc, char *argv[]){
             exit_code=1; goto cleanup;
         }
         for(int _mi=0;_mi<mv.len;_mi++) fprintf(of,"%s\n",mv.d[_mi].text);
-        if(of!=stdout ? axx_close_out(of, macro_expand_dest)
-                      : axx_flush_stdout(macro_expand_dest)) exit_code=1;
+        /* 標準出力へ書いたときの失敗は cleanup の fflush が一度だけ報告する。 */
+        if(of!=stdout && axx_close_out(of, macro_expand_dest)) exit_code=1;
         goto cleanup;
     }
 
@@ -22762,12 +22789,23 @@ int main(int argc, char *argv[]){
         lmap_init(&prev_labels);
         int converged = 0;
 
+        /* 振動の検出に使う配置の履歴。動くラベルが減った反復で取り直すので、
+           上限に数える反復の数を超えない。 */
         LabelMap history[MAX_RELAX];
+        int history_iter[MAX_RELAX];   /* その配置が出た反復の番号（1 起点） */
         int history_count = 0;
+
+        /* 前の反復から値の変わったラベルの数が最小を更新した反復は上限に
+           数えない。前方参照の .equ の連鎖は反復ごとに 1 段ずつ決まるので、
+           16 段を超える連鎖でも動くラベルが減っている限り回す。その数は
+           有限なので必ず止まる。振動では減らないので、従来どおり上限で止まる。
+           axx.py の _relax_budget / _min_moving と同じ規則である。 */
+        int relax_budget = MAX_RELAX;
+        int min_moving = -1;
 
         st->relax_prev = &prev_labels;
 
-        for(int relax=0; relax<MAX_RELAX; relax++){
+        for(int relax=0; relax<relax_budget; relax++){
             st->relax_optimistic = (relax == 0);
             st->pc=u256_zero(); st->pas=1; st->ln=1;
             lmap_free(&st->labels); lmap_init(&st->labels);
@@ -22791,6 +22829,29 @@ int main(int argc, char *argv[]){
 
             secmap_finalize_current(st);
 
+            if(relax > 0){
+                /* prev_labels は前の反復の、未定義由来でないラベルだけを持つ。 */
+                int n_moving = 0;
+                for(int bi=0; bi<st->labels.nbuckets; bi++)
+                    for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next){
+                        LabelEntry *pe;
+                        if(u256_is_undef_derived(e->value)
+                           || !(pe = lmap_find(&prev_labels, e->key))
+                           || !u256_eq(pe->value, e->value)) n_moving++;
+                    }
+                /* 0 は前の反復と同じ値（収束）なので、下の検出に任せる。 */
+                if(n_moving && (min_moving < 0 || n_moving < min_moving)){
+                    if(min_moving >= 0){
+                        relax_budget++;
+                        /* 振動の検出に使う履歴はここから取り直す。振動が続くなら
+                           動く数は減らないので、次の周で見つかる。 */
+                        for(int hi=0; hi<history_count; hi++) lmap_free(&history[hi]);
+                        history_count = 0;
+                    }
+                    min_moving = n_moving;
+                }
+            }
+
             int has_undef = 0;
             for(int bi=0; bi<st->labels.nbuckets && !has_undef; bi++)
                 for(LabelEntry *e=st->labels.buckets[bi]; e; e=e->next){
@@ -22805,14 +22866,15 @@ int main(int argc, char *argv[]){
                     if(label_maps_equal(&st->labels, &history[hi])){ first_seen = hi; break; }
                 }
                 if(first_seen >= 0){
-                    int cycle_len = history_count - first_seen;
+                    /* 周期と番号は反復で数える（axx.py の _seen_pcs_history と同じ）。 */
+                    int cycle_len = (relax+1) - history_iter[first_seen];
                     if(cycle_len == 1){
                         converged = 1;
                     } else {
                         axx_diagf(0, 1, " error - Pass1 relaxation is oscillating with period %d "
                                    "(the instruction layout at iteration %d is identical to "
                                    "iteration %d); it will never converge by simple repetition.\n",
-                                   cycle_len, relax+1, first_seen+1);
+                                   cycle_len, relax+1, history_iter[first_seen]);
                         fprintf(stderr,"         Aborting: no output file written.\n");
                         for(int hi=0; hi<history_count; hi++) lmap_free(&history[hi]);
                         lmap_free(&prev_labels);
@@ -22821,8 +22883,9 @@ int main(int argc, char *argv[]){
                         exit_code = 1;
                         goto cleanup;
                     }
-                } else {
+                } else if(history_count < MAX_RELAX){
                     label_map_copy_from(&history[history_count], &st->labels);
+                    history_iter[history_count] = relax+1;
                     history_count++;
                 }
             }
@@ -22869,7 +22932,7 @@ int main(int argc, char *argv[]){
 
         if(!converged){
             axx_diagf(0, 1, " error - Pass1 relaxation did not converge after %d iterations.\n",
-                       MAX_RELAX);
+                       relax_budget);
             fprintf(stderr,"         Generated code would have incorrect addresses for\n");
             fprintf(stderr,"         variable-length instructions with forward references.\n");
             fprintf(stderr,"         Aborting: no output file written.\n");

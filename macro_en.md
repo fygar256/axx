@@ -134,7 +134,8 @@ stabilise across iterations, so does the expansion.
 
 **Convergence.** Because expansion can now depend on label values, it can differ
 from one iteration to the next. Convergence is enforced by the pass-1 relaxation
-loop, which caps iterations (16), detects oscillation, and aborts without
+loop, which caps iterations (16, not counting an iteration in which fewer
+labels change value than ever before), detects oscillation, and aborts without
 writing an output file if it does not converge. It will not silently emit a
 wrong binary, but unlike before it is possible to write a macro that never
 converges.

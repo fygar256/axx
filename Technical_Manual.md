@@ -58,7 +58,7 @@ both implementations and `cmp`s the results. For the five `.textmode` pairs and 
 error, and for the `regress.axx` regression test its `-V` text and its diagnostics.
 The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for two hundred and thirty-eight comparisons in all.
+text output are compared too, for two hundred and forty-three comparisons in all.
 
 **Contents**
 
@@ -233,8 +233,8 @@ Ordinary von Neumann processors rarely come near any of them.
 ```
 axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV]
     [-E EXPORT_ELF_TSV] [-i IMPORT_TSV] [-o OBJ_FILE] [-f {32,64}]
-    [-m MACHINE] [-v] [-d] [-g] [--no-macro] [-P [FILE]] [-p [FILE]]
-    patternfile [sourcefile]
+    [-m MACHINE] [-v] [-V] [-d] [-g] [--no-macro] [-P [FILE]] [-p [FILE]]
+    [--elfdesc] patternfile [sourcefile]
 ```
 
 | Argument | Meaning |
@@ -255,7 +255,7 @@ axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV]
 | `-v`, `--verbose` | Print assembly listing to stdout (default: silent) |
 | `-V`, `--text-output` | Print the text built from string templates (section 3.5.2) plain to stdout (default: silent). This is what you use to translate a source with `.textmode` (section 3.18) |
 | `-d`, `--debug` | Debug output: forward-ref fallback, relaxation log |
-| `-g`, `--gen-debug` | Emit DWARF (`.debug_info`/`.debug_abbrev`/`.debug_line`). Requires `-o` and ELF64 |
+| `-g`, `--gen-debug` | Emit DWARF (`.debug_info`/`.debug_abbrev`/`.debug_line`). Requires `-o` (written for ELF32 and ELF64 alike) |
 | `--no-macro` | Disable the macro layer on both the source and pattern side |
 | `-P [FILE]` | Macro-expand the source and write it out without assembling |
 | `-p [FILE]` | Macro-expand the pattern file and write it out without assembling |
@@ -310,7 +310,10 @@ honored, with a warning.
 
 `caxx` takes the same option names as `axx.py`, except:
 
-- `-d` / `--debug` is not implemented.
+- Of the `-d` / `--debug` output, the Python exceptions caught while matching or
+  in the forward-reference fallback, with their tracebacks, come from `axx.py`
+  only (`caxx` has no exceptions). The other lines (the relaxation converging,
+  relocations left out, ...) are the same in both.
 - Because the filename after `-P` may be omitted, `caxx` treats the next
   argument as the output file only when both the pattern file and the source
   file have already been given: `caxx pat.axx src.s -P out.s`. `-p` follows the
@@ -383,6 +386,13 @@ as written. A `"` opens a string only when a closing `"` follows on the same
 line; an unclosed `"`, `\"` and the character constant `'"'` are read as plain
 characters, so a `"` written in the `instruction` field never turns the rest of
 the line into a string.
+
+**Line continuation.** A line whose last character before the line end is `\`
+is joined to the next line, without the `\` (the same rule as for sources,
+chapter 5). A long `binary_list` can be folded by putting a `\` there. The
+blanks at the start of the next line become part of the text too, so when
+folding in the middle of an expression, do not indent the next line. A line
+folded without the `\` is warned about as a line with no `::`.
 
 ### 3.2 Pattern order does not matter
 
@@ -3854,6 +3864,14 @@ Comments start with `;`. A comment is dropped, except in text replacement mode
 - **Line ends.** A line ends at LF, CR LF or CR (a file that breaks its lines
   with CR alone is split into lines as well). Pattern files are read the same
   way.
+- **Line continuation.** A line whose last character before the line end is
+  `\` is joined to the next line, without the `\`. The joined line counts as
+  the last physical line of the run and the ones before it stay as empty
+  lines, so the line numbers in diagnostics and in the `-v` listing match the
+  file as it looks. A blank or a comment after the `\` stops it from being a
+  continuation; the other way round, a `;` comment that ends in `\` takes the
+  next line into the comment as well (`; C:\` and the like). Pattern files
+  (section 3.1) and files taken in with `!include` follow the same rule.
 - **White space.** Only spaces and tabs separate words. `\f` (form feed),
   `\v`, the no-break space (U+00A0), the ideographic space (U+3000) and the
   like are read as ordinary characters, so inside a mnemonic or at the start or
@@ -3874,6 +3892,14 @@ label4: .equ label1
 A label is a sequence of letters, digits and some symbols, starting with a
 non-digit. A label defined with `.equ` loses its relocation information and is
 treated as a constant.
+
+`.equ` may refer to a label defined further on. Forward references are settled
+by the pass 1 iterations (relaxation), so a chain such as `a: .equ b+1` /
+`b: .equ c+1` / ... is settled one link per iteration. The iterations are capped
+at sixteen, but an iteration in which fewer labels change value than ever before
+is not counted, so a chain more than sixteen deep still assembles (it gives up
+once sixteen iterations without that progress have gone by, and reports an
+oscillating layout as such).
 
 `.labelc::<characters>` extends the label character set. The default is
 letters, digits, `_` and `.`.
@@ -4211,12 +4237,16 @@ pattern variables cannot be referenced from an assembly line.**
 
 ### 6.2 Operators
 
-Precedence follows Python, loosest last:
+Precedence mostly follows Python, loosest last. It differs from Python in that
+`|` binds more tightly than `^` (Python is the other way round), `**` is
+left-associative (`2**3**2` is 64, not 512), unary `-` binds more tightly than
+`**` (`-2**2` is 4) and comparisons do not chain (`5>3>1` is `(5>3)>1`, which
+is 0). Both implementations read the table below as it stands.
 
 ```
 (expr)          parenthesized expression
 #               value of the following symbol
-*(x,y)          the yth byte of x from the least significant end (y>=0)
+*(x,y)          x shifted right by y bytes (y>=0); its low 8 bits are byte y
 -, ~            negation, bitwise NOT
 @               position of the most significant set bit, counted from the right
 'c'             character code
@@ -4240,7 +4270,13 @@ x?a:b           ternary
 - `#name` yields the value of symbol `name`.
 - `@v` gives the bit position of the highest set bit of `v` counted from the
   right. (The Hebimarumatta operator.)
-- `a'24` sign-extends `a`, treating bit 24 as the sign bit. (The SEX operator.)
+- `a'24` takes the low 24 bits of `a` and sign-extends them, treating bit 23
+  (the width minus one) as the sign bit (`0xff'8 == -1`, `0x80'7 == 0`). (The
+  SEX operator.)
+- `*(x,y)` is `x >> (8*y)`; the higher bits are kept (`*(0x123456,1) == 0x1234`).
+  Put into a one-byte field, its low 8 bits -- byte y of x, counting from the
+  low end -- remain. With a repetition such as `@@[2,*(v,%%)]` it lays out a
+  multi-byte value from the low end.
 - `/` truncates toward zero (`-7/3 == -2`). `%` follows Python: the result takes
   the sign of the **divisor** (`-7%3 == 2`, `7%-3 == -2`). `a == (a/b)*b + a%b`
   does not hold between the two.
@@ -4856,24 +4892,24 @@ ldf a,flt{enfloat(:label)*2}
 
 ```
 $ axx test.axx test.s -v
-0000000000000000 test.s 1 ldf a,3.14  0x01 0xc3 0xf5 0x48 0x40
-0000000000000005 test.s 2 ldf a,3.14*2+1  0x01 0xc3 0xf5 0xe8 0x40
-000000000000000a test.s 3 ldd a,3.14  0x01 0x1f 0x85 0xeb 0x51 0xb8 0x1e 0x09 0x40
-0000000000000013 test.s 4 ldd a,-inf  0x01 0x00 0x00 0x00 0x00 0x00 0x00 0xf0 0xff
-000000000000001c test.s 5 ldq a,3.14*2+1  0x01 0x1f 0x85 0xeb 0x51 0xb8 0x1e 0x85 0xeb 0x51 0xb8 0x1e 0x85 0xeb 0xd1 0x01 0x40
-000000000000002d test.s 6 leaq rax , [ rbx , rcx , 2 , 0x40]  0x48 0x8d 0x04 0x4b 0x40
-0000000000000032 test.s 7 leaq rax , ( rbx + rcx * (2+2) + 0x40 )  0x48 0x8d 0x04 0x8b 0x40
-0000000000000037 test.s 8 addi $v0,$a0,5  0x20 0x82 0x00 0x05
-000000000000003b test.s 9 vmov.f32 s0,#3.14  0x80 0x40 0x48 0xf5 0xc3
-0000000000000040 test.s 10 st1 {v0.4s},[x0]  0x01 0x00 0x01 0x00
-0000000000000044 test.s 11 add r1, r2, r3 lsl #20  0x88 0x14
-0000000000000046 test.s 12 rep movsb  0xf3 0xa4
-0000000000000048 test.s 13 movsb  0xa4
-0000000000000049 test.s 14 load a,[b]  0x43
-000000000000004a test.s 15 repeat 10  0x00 0x01 0x02 0x03 0x04 0x05 0x06 0x07 0x08 0x09 0x10 0x11 0x12 0x13 0x14 0x15 0x16 0x17 0x18 0x19
-000000000000005e test.s 16 ldf a,label  0x01 0xec 0x91 0x80 0x4e
-0000000000000063 test.s 17 label: .equ flt{3.14} 
-0000000000000063 test.s 18 ldf a,flt{enfloat(:label)*2}  0x01 0xec 0x91 0x81 0x4e
+0000000000000000 test.s 1 ldf a,3.14 // 0x01 0xc3 0xf5 0x48 0x40
+0000000000000005 test.s 2 ldf a,3.14*2+1 // 0x01 0xc3 0xf5 0xe8 0x40
+000000000000000a test.s 3 ldd a,3.14 // 0x01 0x1f 0x85 0xeb 0x51 0xb8 0x1e 0x09 0x40
+0000000000000013 test.s 4 ldd a,-inf // 0x01 0x00 0x00 0x00 0x00 0x00 0x00 0xf0 0xff
+000000000000001c test.s 5 ldq a,3.14*2+1 // 0x01 0x1f 0x85 0xeb 0x51 0xb8 0x1e 0x85 0xeb 0x51 0xb8 0x1e 0x85 0xeb 0xd1 0x01 0x40
+000000000000002d test.s 6 leaq rax , [ rbx , rcx , 2 , 0x40] // 0x48 0x8d 0x04 0x4b 0x40
+0000000000000032 test.s 7 leaq rax , ( rbx + rcx * (2+2) + 0x40 ) // 0x48 0x8d 0x04 0x8b 0x40
+0000000000000037 test.s 8 addi $v0,$a0,5 // 0x20 0x82 0x00 0x05
+000000000000003b test.s 9 vmov.f32 s0,#3.14 // 0x80 0x40 0x48 0xf5 0xc3
+0000000000000040 test.s 10 st1 {v0.4s},[x0] // 0x01 0x00 0x01 0x00
+0000000000000044 test.s 11 add r1, r2, r3 lsl #20 // 0x88 0x14
+0000000000000046 test.s 12 rep movsb // 0xf3 0xa4
+0000000000000048 test.s 13 movsb // 0xa4
+0000000000000049 test.s 14 load a,[b] // 0x43
+000000000000004a test.s 15 repeat 10 // 0x00 0x01 0x02 0x03 0x04 0x05 0x06 0x07 0x08 0x09 0x10 0x11 0x12 0x13 0x14 0x15 0x16 0x17 0x18 0x19
+000000000000005e test.s 16 ldf a,label // 0x01 0xec 0x91 0x80 0x4e
+0000000000000063 test.s 17 label: .equ flt{3.14} //
+0000000000000063 test.s 18 ldf a,flt{enfloat(:label)*2} // 0x01 0xec 0x91 0x81 0x4e
 ```
 
 ### A.3 AArch64 logical immediate
@@ -4891,6 +4927,14 @@ reach.
 AND d,n,#!v ::v==0;3,v==0xFFFFFFFFFFFFFFFF;3 ::;(e:=((v&3)*0x5555555555555555==v)?2:((v&0xf)*0x1111111111111111==v)?4:((v&0xff)*0x0101010101010101==v)?8:((v&0xffff)*0x1000100010001==v)?16:((v&0xffffffff)*0x100000001==v)?32:64)*0,;(m:=(1<<e)-1)*0,;(y:=v&m)*0,;(t:=@(y^(y-1))-1)*0,;(u:=y>>t)*0,;(w:=(y^m)==0?1:y^m)*0,;(p:=@(w^(w-1))-1)*0,;(q:=w>>p)*0,;(c:=((u+1)&u)==0)*0,;(b:=c?@u:e-@q)*0,
  ;(r:=c?(e-t)&(e-1):(e-(p+@q))&(e-1))*0,;(s:=((-2*e)&0x7f)|(b-1))*0,;(z:=(1<<31)|(0x24<<23)|((((s>>6)&1)^1)<<22)|(r<<16)|((s&0x3f)<<10)|(n<<5)|d)*0,@@[4,z>>(%%*8)]
 ```
+
+The line is folded in two here to fit the page. Join the two lines into one,
+dropping the leading blank of the second, or put a `\` at the end of the first
+and write the second without indenting it (line continuation, section 3.1;
+copied as two lines, the second is warned about as a line with no `::`).
+`d` and `n` are register symbols (`.setsym ::x0:: 0` and so on). The encodings of
+`#0x5555555555555555`, `#0xff`, `#0xf0f0f0f0f0f0f0f0`, `#0x7ffffffffffffffe`
+and the like agree with llvm-mc.
 
 ### A.4 Running the bf interpreters — `bfsh/`
 
@@ -5197,13 +5241,21 @@ so on), and the `aarch64_err.s` pair the diagnostics of PC-relative targets that
 are not a multiple of 4, `adrp` out of range and SVE signed bytes out of range.
 The `riscv64full_err.s`, `mips_err.s` and `sparc_err.s` pairs compare the
 diagnostics of data directives (`db`, `half`, `word`, `quad` and the like) whose
-value does not fit, which used to be cut down without a word.
+value does not fit, which used to be cut down without a word. The
+`relaxchain.s` pair (`z80.axx`) compares the `-b` image and the `-d` count of a
+chain of forward-referencing `.equ` more than sixteen deep, and the
+`relaxosc_err.s` pair (`6502.axx`) the diagnostics that report an oscillating
+layout with the same period and iteration numbers when such a chain stretches
+pass 1. The `contin.s` pair (`z80.axx`, given as a `./` path) compares the `-v`
+listing of `\` line continuation (in a file taken in with `!include` too) and the
+names of the `.include` / `!include` files. The last pair compares the report
+when standard output cannot be written (`/dev/full`), under `-v` and `-P`.
 
 The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (the ELF of the pattern's machine; x86-64 ELF64 when it has no `.elfmachine`), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for two hundred and thirty-eight comparisons in all.
+never compares, for two hundred and forty-three comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different

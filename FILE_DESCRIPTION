@@ -644,6 +644,22 @@ listinc.s                           z80.axx: the -v listing of an .include and
                                     the implicit .text of -o reaching the
                                     final .org; test1 compares both
 listinc_inc.s                       the file listinc.s includes
+relaxchain.s                        z80.axx: forward-referencing .equ chained
+                                    deeper than 16 still assembles (pass 1 keeps
+                                    going while fewer labels move each time);
+                                    test1 compares the -b image and the -d count
+relaxosc_err.s                      6502.axx: an oscillating layout is still
+                                    reported as oscillating, with the same
+                                    period and iteration numbers in both, when a
+                                    long .equ chain stretches pass 1;
+                                    test1 compares the diagnostics
+contin.s                            z80.axx: a \ at the end of a line joins the
+                                    next line, in the source and in a file taken
+                                    in with !include; and the names of the
+                                    .include / !include files when the source is
+                                    given as ./...; test1 compares the -v listing
+contin_inc.s                        the file contin.s takes in with !include
+contin_inc2.s                       the file contin.s takes in with .include
 vliw.axx                            test pattern file for vliw
 vliw.s                              test assembly file for vliw
 x86_64.axx                          pattern file for x86_64-v3 (includes segment addressing, AVX/AVX2, BMI1/BMI2, x87 and EVEX/AVX-512);

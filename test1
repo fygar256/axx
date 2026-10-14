@@ -164,6 +164,14 @@ caxx $P/riscv64full.axx $S/riscv64full_edge.s -b b198
 caxx $P/riscv64full.axx $S/riscv64full_err.s -b b199 2>&1 | grep -v '^raw: wrote ' > b199e
 caxx $P/mips.axx $S/mips_err.s -b b200 2>&1 | grep -v '^raw: wrote ' > b200e
 caxx $P/sparc.axx $S/sparc_err.s -b b201 2>&1 | grep -v '^raw: wrote ' > b201e
+# 前方参照の .equ が 16 段を超える連鎖（-d の収束の回数も比べる）と、連鎖で延びた反復の
+# 中での振動の報告。行末の \ の継続が !include 先でもつながること、./ を含むパスで渡した
+# ソースの .include / !include 先の名前。標準出力へ書けないときの報告（/dev/full）。
+caxx $P/z80.axx $S/relaxchain.s -d -b b202 2>&1 | grep -v '^raw: wrote ' > b202e
+caxx $P/6502.axx $S/relaxosc_err.s -b b203 2>&1 | grep -v '^raw: wrote ' > b203e
+caxx $P/z80.axx ./$S/contin.s -v > b204
+caxx $P/z80.axx $S/z80.s -v > /dev/full 2> b205e
+caxx $P/z80.axx $S/z80.s -P > /dev/full 2>> b205e
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -377,6 +385,11 @@ paxx $P/riscv64full.axx $S/riscv64full_edge.s -b a198
 paxx $P/riscv64full.axx $S/riscv64full_err.s -b a199 2>&1 | grep -v '^raw: wrote ' > a199e
 paxx $P/mips.axx $S/mips_err.s -b a200 2>&1 | grep -v '^raw: wrote ' > a200e
 paxx $P/sparc.axx $S/sparc_err.s -b a201 2>&1 | grep -v '^raw: wrote ' > a201e
+paxx $P/z80.axx $S/relaxchain.s -d -b a202 2>&1 | grep -v '^raw: wrote ' > a202e
+paxx $P/6502.axx $S/relaxosc_err.s -b a203 2>&1 | grep -v '^raw: wrote ' > a203e
+paxx $P/z80.axx ./$S/contin.s -v > a204
+paxx $P/z80.axx $S/z80.s -v > /dev/full 2> a205e
+paxx $P/z80.axx $S/z80.s -P > /dev/full 2>> a205e
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -549,6 +562,11 @@ check a198 b198
 check a199e b199e
 check a200e b200e
 check a201e b201e
+check a202 b202
+check a202e b202e
+check a203e b203e
+check a204 b204
+check a205e b205e
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"
