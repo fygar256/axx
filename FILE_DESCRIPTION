@@ -6,6 +6,10 @@ File description
 8048_err.s                          lines 8048.axx must refuse: immediates,
                                     addresses and displacements out of range;
                                     test1 compares the diagnostics
+8048_edge.s                         lines 8048.axx must assemble at the edges of
+                                    the ranges: conditional jumps within the
+                                    page of their second byte ($$+1);
+                                    test1 compares the -b image
 8051.axx                            pattern file for 8051 CPU
 8051.s                              test assemble file for 8051 CPU
 8051_err.s                          lines 8051.axx must refuse: immediates,
@@ -16,11 +20,19 @@ File description
 6809_err.s                          lines 6809.axx must refuse: immediates,
                                     addresses and displacements out of range;
                                     test1 compares the diagnostics
+6809_edge.s                         lines 6809.axx must assemble at the edges of
+                                    the ranges: immediates down to -0x80 /
+                                    -0x8000, < on the page 1 / 2 instructions;
+                                    test1 compares the -b image
 6800.axx                            pattern file for 6800 CPU
 6800.s                              test assemble file for 6800
 6800_err.s                          lines 6800.axx must refuse: immediates,
                                     addresses and displacements out of range;
                                     test1 compares the diagnostics
+6800_edge.s                         lines 6800.axx must assemble at the edges of
+                                    the ranges: immediates down to -0x80 /
+                                    -0x8000, FCB values;
+                                    test1 compares the -b image
 68000.axx                           pattern file for 68000 CPU
 68000.s                             test assemble file for 68000
 68000_reloc.s                       -o of 68000.axx (ELF32 M68K): R_68K_32 for an
@@ -36,6 +48,10 @@ File description
 6502_err.s                          lines 6502.axx must refuse: immediates,
                                     addresses and displacements out of range;
                                     test1 compares the diagnostics
+6502_edge.s                         lines 6502.axx must assemble at the edges of
+                                    the ranges: negative addresses, immediates
+                                    down to -0x80, the < / > forced forms;
+                                    test1 compares the -b image
 8080.axx                            pattern file for 8080
 8080.s                              test assemble file for 8080
 8080_err.s                          lines 8080.axx must refuse: immediates,
@@ -43,6 +59,13 @@ File description
                                     test1 compares the diagnostics
 4004.axx                            pattern file for 4004
 4004.s                              test assemble file for 4004
+4004_edge.s                         lines 4004.axx must assemble at the edges of
+                                    the ranges: JCN / ISZ within the page of
+                                    the next instruction ($$+2);
+                                    test1 compares the -b image
+4004_err.s                          lines 4004.axx must refuse: JCN / ISZ
+                                    outside that page, values out of range;
+                                    test1 compares the diagnostics
 aarch64.axx                         pattern file for AArch64 (A64): data processing,
                                     branches, system, loads and stores, scalar
                                     floating point, Advanced SIMD, cryptography and

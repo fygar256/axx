@@ -1934,6 +1934,8 @@ class AssemblerState:
         self.expr_depth = 0
 
         self._diag_pending = None
+        # いまのソース行で出した、場所付きの診断の文面（_diag_print を参照）。
+        self._diag_line_seen = set()
 
         self.outfile = ""
         self.expfile = ""
@@ -2101,16 +2103,53 @@ class AssemblerState:
         """
         self.diag_count += 1
         if not force:
+            text = self._diag_locate(text)
+        if not force:
             if self._in_match_attempt:
                 if self._diag_pending is not None:
                     self._diag_pending.append((text, set_error))
                 return False
             if not self.should_report_errors():
                 return False
-        print(text, file=sys.stderr)
+        self._diag_print(text)
         if set_error:
             self.had_error = True
         return True
+
+    def _diag_print(self, text):
+        """診断を 1 行 stderr へ出す。
+
+        1 つのソース行の中で、場所 `[file:line]` で終わるまったく同じ行は 2 度目から
+        出さない。式の値はパターンの照合で何度も評価されるので、同じ誤りが同じ行で
+        3 回並ぶことがあった（未定義のラベルなど）。行の切れ目は lineassemble0 で
+        数え直す。caxx.c の diag_print() と同じ規則である。
+        """
+        if "\n" not in text and self._DIAG_HAS_LOC.search(text):
+            if text in self._diag_line_seen:
+                return
+            self._diag_line_seen.add(text)
+        print(text, file=sys.stderr)
+
+    _DIAG_HAS_LOC = re.compile(r'\[[^\[\]]*:[0-9]+\][ \t]*$')
+
+    def _diag_locate(self, text):
+        """ソースの行を組んでいる最中の 1 行の error / warning に、構文エラーと
+        同じ形の場所 `  [file:line]` を足す。
+
+        式の評価器（0 除算・負のシフト・** の範囲など）やディレクティブの診断は
+        どの行のものか分からなかった。パターンファイルを読んでいる間とソースを
+        読み終えた後は current_file が空なので足さない。すでに場所で終わる行と、
+        複数行の文面には足さない。force で出す診断（マクロ層・出力の大きさ・
+        リラクゼーションなど、行ではなく全体についてのもの）には呼ばない。
+        caxx.c の diag_locate() と同じ規則である。
+        """
+        if not self.current_file:
+            return text
+        if not (text.startswith(" error - ") or text.startswith(" warning - ")):
+            return text
+        if "\n" in text or self._DIAG_HAS_LOC.search(text):
+            return text
+        return f"{text}  [{self.current_file}:{self.ln}]"
 
     def diag_capture_begin(self):
         """以降の診断を溜め始める（照合の試行に入るとき）。"""
@@ -2126,7 +2165,7 @@ class AssemblerState:
         """溜めた診断を出す。採択されたパターンのぶんだけ流すために使う。"""
         for text, set_error in items:
             if self.should_report_errors():
-                print(text, file=sys.stderr)
+                self._diag_print(text)
                 if set_error:
                     self.had_error = True
 
@@ -13978,6 +14017,7 @@ class Assembler:
 
     def lineassemble0(self, line):
         """1 行を処理する外枠。行の前処理と診断の文脈を整える。"""
+        self.state._diag_line_seen.clear()
         cleaned = line.replace('\n', '').replace('\r', '')
         _show = (self.state.pas == 2 and self.state.verbose) or self.state.pas == 0
         if _show:
@@ -14295,8 +14335,9 @@ class Assembler:
         _caller_file = self.state.current_file
         self.state.fnstack.append(fn)
         self.state.lnstack.append(self.state.ln)
-        self.state.current_file = fn
-        self.state.ln = 1
+        # 現在のファイルを切り替えるのは開けた後にする。開けないときの診断には
+        # .include を書いた行の場所が付く（caxx.c の fileassemble と同じ）。
+        _self_file = fn
 
         try:
             if fn == "stdin":
@@ -14321,6 +14362,8 @@ class Assembler:
                 self.state.diag(f" error - source file '{fn}' is not valid UTF-8: {e}",
                                 set_error=True)
                 return
+            self.state.current_file = _self_file
+            self.state.ln = 1
             af = StringUtils.join_backslash_continuations(af)
 
             _expkey = self.state.current_file

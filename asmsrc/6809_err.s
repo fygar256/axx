@@ -6,3 +6,9 @@ bne $$+300
 lda 70000,x
 jmp 0x10000
 leax >0x12345,y
+lda #-0x81
+ldx #-0x8001
+andcc #-0x81
+ldy <0x10000
+ldy <-1
+fcb 0x100

@@ -2533,6 +2533,9 @@ typedef struct {
     int        diag_pending_len;
     int        diag_pending_cap;
     int        diag_capturing;
+    /* いまのソース行で出した、場所付きの診断の文面（diag_print を参照） */
+    char     **diag_seen;
+    int        diag_seen_len, diag_seen_cap;
 } AsmState;
 
 /* いま診断を出してよいパスか。パス2と対話モードだけ真。パス1は推定値で
@@ -2615,16 +2618,92 @@ static AXX_UNUSED void diag_suppress_end(AsmState *st, DiagSuppress *sv){
 }
 
 /* 溜めた診断を出す。採択されたパターンのぶんだけ流す。 */
+static void diag_print(AsmState *st, const char *text);
+
 static void diag_replay(AsmState *st, char **texts, int *seterr, int n){
     for(int i=0;i<n;i++){
         if(should_report_errors(st)){
-            fputs(texts[i], stderr);
+            diag_print(st, texts[i]);
             if(seterr[i]) st->had_error = 1;
         }
     }
 }
 
 static long long g_diag_count = 0;
+
+/* text の先頭 n バイトが [ ... :数字] （後ろに空白・タブ）で終わるか。
+   axx.py の AssemblerState._DIAG_HAS_LOC と同じ判定である。 */
+static int diag_has_loc(const char *text, size_t n){
+    size_t e = n;
+    while(e > 0 && (text[e-1] == ' ' || text[e-1] == '\t')) e--;
+    if(e == 0 || text[e-1] != ']') return 0;
+    size_t d = e - 1;
+    while(d > 0 && text[d-1] >= '0' && text[d-1] <= '9') d--;
+    if(d == e - 1 || d == 0 || text[d-1] != ':') return 0;
+    size_t b = d - 1;
+    while(b > 0 && text[b-1] != '[' && text[b-1] != ']') b--;
+    return b > 0 && text[b-1] == '[';
+}
+
+/* ソースの行を組んでいる最中の 1 行の error / warning に、構文エラーと同じ形の
+   場所 "  [file:line]" を足した文字列を malloc して返す。足さないときは NULL。
+   式の評価器（0 除算・負のシフト・** の範囲など）やディレクティブの診断は
+   どの行のものか分からなかった。パターンファイルを読んでいる間とソースを読み
+   終えた後は current_file が空なので足さない。すでに場所で終わる行と、複数行の
+   文面には足さない。force で出す診断（マクロ層・出力の大きさ・リラクゼーション
+   など、行ではなく全体についてのもの）には呼ばない。
+   axx.py の AssemblerState._diag_locate() と同じ規則である。 */
+static char *diag_locate(const AsmState *st, const char *text){
+    if(!st || !st->current_file || !st->current_file[0]) return NULL;
+    if(strncmp(text, " error - ", 9) != 0 && strncmp(text, " warning - ", 11) != 0)
+        return NULL;
+    size_t n = strlen(text);
+    if(n > 0 && text[n-1] == '\n') n--;          /* 末尾の改行 1 つは py の print の分 */
+    if(memchr(text, '\n', n)) return NULL;
+    if(diag_has_loc(text, n)) return NULL;       /* もう場所がある */
+    char tail[64];
+    snprintf(tail, sizeof(tail), ":%d]", (int)st->ln);
+    size_t fl = strlen(st->current_file);
+    char *out = malloc(n + 3 + fl + strlen(tail) + 2);
+    if(!out) return NULL;
+    memcpy(out, text, n);
+    size_t o = n;
+    memcpy(out + o, "  [", 3); o += 3;
+    memcpy(out + o, st->current_file, fl); o += fl;
+    memcpy(out + o, tail, strlen(tail)); o += strlen(tail);
+    if(n < strlen(text)) out[o++] = '\n';
+    out[o] = '\0';
+    return out;
+}
+
+/* 新しいソース行に入るときに、diag_print の記録を空にする（lineassemble0）。 */
+static void diag_seen_clear(AsmState *st){
+    for(int i = 0; i < st->diag_seen_len; i++) free(st->diag_seen[i]);
+    st->diag_seen_len = 0;
+}
+
+/* 診断を 1 行 stderr へ出す。1 つのソース行の中で、場所 [file:line] で終わる
+   まったく同じ行は 2 度目から出さない。式の値はパターンの照合で何度も評価
+   されるので、同じ誤りが同じ行で 3 回並ぶことがあった（未定義のラベルなど）。
+   axx.py の AssemblerState._diag_print() と同じ規則である。 */
+static void diag_print(AsmState *st, const char *text){
+    size_t n = strlen(text);
+    if(n > 0 && text[n-1] == '\n') n--;
+    if(st && !memchr(text, '\n', n) && diag_has_loc(text, n)){
+        for(int i = 0; i < st->diag_seen_len; i++)
+            if(strcmp(st->diag_seen[i], text) == 0) return;
+        if(st->diag_seen_len >= st->diag_seen_cap){
+            int nc = st->diag_seen_cap ? st->diag_seen_cap * 2 : 8;
+            char **nv = realloc(st->diag_seen, (size_t)nc * sizeof(char *));
+            if(!nv){ perror("realloc"); exit(1); }
+            st->diag_seen = nv; st->diag_seen_cap = nc;
+        }
+        char *cp = strdup(text);
+        if(!cp){ perror("strdup"); exit(1); }
+        st->diag_seen[st->diag_seen_len++] = cp;
+    }
+    fputs(text, stderr);
+}
 
 /* 診断を 1 行出す。set_error で had_error を立て、force でパスと照合の
    状況を無視して必ず出す。 */
@@ -2646,6 +2725,13 @@ static void axx_diagf(int set_error, int force, const char *fmt, ...){
             buf = heap;
         }
     }
+    if(!force){
+        char *located = diag_locate(st, buf);
+        if(located){
+            if(buf != stackbuf) free(buf);
+            buf = located;
+        }
+    }
 
     if(st && !force){
         if(st->in_match_attempt){
@@ -2655,7 +2741,7 @@ static void axx_diagf(int set_error, int force, const char *fmt, ...){
         }
         if(!should_report_errors(st)){ if(buf != stackbuf) free(buf); return; }
     }
-    fputs(buf, stderr);
+    diag_print(st, buf);
     if(buf != stackbuf) free(buf);
     if(st && set_error) st->had_error = 1;
 }
@@ -17326,6 +17412,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
 /* 1 行を処理する外枠。行の前処理と診断の文脈を整える。 */
 static int lineassemble0(Assembler *asmb, const char *line){
     AsmState *st=&asmb->st;
+    diag_seen_clear(st);
 
     size_t n = strlen(line);
     char *cleaned = malloc(n + 1);
@@ -21629,8 +21716,9 @@ static void fileassemble(Assembler *asmb, const char *fn){
     if(!_caller_file){ perror("strdup"); exit(1); }
     sv_push(&st->fnstack, fn);
     is_push(&st->lnstack, st->ln);
-    set_current_file(st, fn);
-    st->ln=1;
+    /* 現在のファイルを切り替えるのは開けた後にする。開けないときの診断には
+       .include を書いた行の場所が付く（axx.py の fileassemble と同じ）。 */
+    const char *_self_fn = fn;
 
     FILE *f=NULL;
     char *stdin_buf=NULL;
@@ -21654,6 +21742,8 @@ static void fileassemble(Assembler *asmb, const char *fn){
 
     f=axx_open_input(fn, "source file");
     if(!f) goto done;
+    set_current_file(st, _self_fn);
+    st->ln=1;
     {
         char *_expkey = strdup(st->current_file);
         if(!_expkey){ perror("strdup"); exit(1); }

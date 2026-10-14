@@ -140,6 +140,14 @@ caxx $P/6809.axx $S/6809_err.s -b b182 2>&1 | grep -v '^raw: wrote ' > b182e
 caxx $P/8080.axx $S/8080_err.s -b b183 2>&1 | grep -v '^raw: wrote ' > b183e
 caxx $P/8051.axx $S/8051_err.s -b b184 2>&1 | grep -v '^raw: wrote ' > b184e
 caxx $P/8048.axx $S/8048_err.s -b b185 2>&1 | grep -v '^raw: wrote ' > b185e
+# 8 ビット系の範囲の境目（負の番地・即値の下限・強制形）と、8048 / 4004 の条件分岐の
+# ページ（8048 は 2 バイト目、4004 は次の命令のページ）。外部の照合（capstone・ucsim・MAME）で見つけたもの。
+caxx $P/6502.axx $S/6502_edge.s -b b186
+caxx $P/6800.axx $S/6800_edge.s -b b187
+caxx $P/6809.axx $S/6809_edge.s -b b188
+caxx $P/8048.axx $S/8048_edge.s -b b189
+caxx $P/4004.axx $S/4004_edge.s -b b190
+caxx $P/4004.axx $S/4004_err.s -b b191 2>&1 | grep -v '^raw: wrote ' > b191e
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -337,6 +345,12 @@ paxx $P/6809.axx $S/6809_err.s -b a182 2>&1 | grep -v '^raw: wrote ' > a182e
 paxx $P/8080.axx $S/8080_err.s -b a183 2>&1 | grep -v '^raw: wrote ' > a183e
 paxx $P/8051.axx $S/8051_err.s -b a184 2>&1 | grep -v '^raw: wrote ' > a184e
 paxx $P/8048.axx $S/8048_err.s -b a185 2>&1 | grep -v '^raw: wrote ' > a185e
+paxx $P/6502.axx $S/6502_edge.s -b a186
+paxx $P/6800.axx $S/6800_edge.s -b a187
+paxx $P/6809.axx $S/6809_edge.s -b a188
+paxx $P/8048.axx $S/8048_edge.s -b a189
+paxx $P/4004.axx $S/4004_edge.s -b a190
+paxx $P/4004.axx $S/4004_err.s -b a191 2>&1 | grep -v '^raw: wrote ' > a191e
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -493,6 +507,12 @@ check a182e b182e
 check a183e b183e
 check a184e b184e
 check a185e b185e
+check a186 b186
+check a187 b187
+check a188 b188
+check a189 b189
+check a190 b190
+check a191e b191e
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

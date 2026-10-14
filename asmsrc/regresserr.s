@@ -19,3 +19,8 @@ u2: .equ u1+2
 e u2
 ; UTF-8 の多バイト文字は文字定数にならない
 e 'é'
+; 2026-10-14: ソースの行の error / warning には場所 [file:line] が付く。同じ行で場所まで
+; 同じ診断は 1 回だけ。.include で開けないときは .include を書いた行の場所
+e 1/0+1/0
+e nosuch2+nosuch2
+ .include "regress_no_such_file.s"

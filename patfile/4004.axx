@@ -40,12 +40,15 @@
 /*
 /*  JCN/ISZ addresses are 8-bit and same-page only: the assembled byte
 /*  holds just the low 8 bits, and the omitted high bits are supplied
-/*  at run time from the CURRENT instruction's own page (not the
-/*  target's). Writing an address on a different page therefore
-/*  assembles silently to the wrong target -- exactly the class of bug
-/*  already found and fixed in 8048.axx's page-crossing branches -- so
-/*  both patterns here reject a target page (a>>8) that differs from
-/*  the current page ($$>>8). JUN/JMS take a full 12-bit address and
+/*  at run time from the program counter (not from the target). The
+/*  4004 has already advanced the counter past BOTH bytes of the
+/*  instruction when it replaces the low 8 bits, so the page is that
+/*  of the NEXT instruction, (($$+2)&0xfff)>>8 -- which is why the
+/*  manual warns that a JCN/ISZ in words 254 and 255 of a ROM jumps
+/*  into the following ROM. Writing an address on any other page
+/*  would assemble silently to the wrong target, so the patterns here
+/*  reject a target page (a>>8) that differs from it. JUN/JMS take a
+/*  full 12-bit address and
 /*  are page-independent, per the manual's own explicit recommendation
 /*  that only JUN/JMS be used to cross page boundaries.
 /*
@@ -100,17 +103,17 @@ LDM !d ::d>15;3,d<0;3:: 0xd0|d
 JUN !a ::a>0xfff;2,a<0;2:: 0x40|(a>>8),a&0xff
 JMS !a ::a>0xfff;2,a<0;2:: 0x50|(a>>8),a&0xff
 
-JCN !c,!a ::c>15;3,c<0;3,a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x10|c,a&0xff
-ISZ !r,!a ::r>15;5,r<0;5,a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x70|r,a&0xff
+JCN !c,!a ::c>15;3,c<0;3,a>0xfff;2,a<0;2,(a>>8)!=((($$+2)&0xfff)>>8);2:: 0x10|c,a&0xff
+ISZ !r,!a ::r>15;5,r<0;5,a>0xfff;2,a<0;2,(a>>8)!=((($$+2)&0xfff)>>8);2:: 0x70|r,a&0xff
 
 /* Single-bit JCN condition aliases (common informal convention -- see
 /* the SYNTAX note above; not part of Intel's own mnemonic set). */
-JNT !a ::a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x11,a&0xff
-JC  !a ::a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x12,a&0xff
-JZ  !a ::a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x14,a&0xff
-JT  !a ::a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x19,a&0xff
-JNC !a ::a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x1a,a&0xff
-JNZ !a ::a>0xfff;2,a<0;2,(a>>8)!=($$>>8);2:: 0x1c,a&0xff
+JNT !a ::a>0xfff;2,a<0;2,(a>>8)!=((($$+2)&0xfff)>>8);2:: 0x11,a&0xff
+JC  !a ::a>0xfff;2,a<0;2,(a>>8)!=((($$+2)&0xfff)>>8);2:: 0x12,a&0xff
+JZ  !a ::a>0xfff;2,a<0;2,(a>>8)!=((($$+2)&0xfff)>>8);2:: 0x14,a&0xff
+JT  !a ::a>0xfff;2,a<0;2,(a>>8)!=((($$+2)&0xfff)>>8);2:: 0x19,a&0xff
+JNC !a ::a>0xfff;2,a<0;2,(a>>8)!=((($$+2)&0xfff)>>8);2:: 0x1a,a&0xff
+JNZ !a ::a>0xfff;2,a<0;2,(a>>8)!=((($$+2)&0xfff)>>8);2:: 0x1c,a&0xff
 
 /* --- Subroutine linkage --- */
 BBL !d ::d>15;3,d<0;3:: 0xc0|d
