@@ -50,13 +50,13 @@ gcc caxx.c -o caxx -lm -lquadmath -O2   # -lm は式評価器が、-lquadmath �
 
 この 2 つは同じ入力に対して**バイト単位で同一の出力**を生成することを意図しています。
 同梱のパターンファイル、テストソース、`test1` スクリプトはまさにそれを検証するために
-存在します。`test1` は同梱の 95 組のパターン/ソースの対を両方の実装でアセンブルし、
+存在します。`test1` は同梱の 98 組のパターン/ソースの対を両方の実装でアセンブルし、
 結果を `cmp` します。さらに `.textmode` の 5 組と `exprmiss.axx` の組については、`-V` で標準出力へ流した
 翻訳テキストどうしも、`echo.axx` と `ministr.axx` の組については標準エラーへ出た `.echo` の行どうしも
 `cmp` します。回帰テストの `regress.axx` は `-V` のテキストと標準エラーの診断を
 `cmp` します。中核の 16 組は `-o`・`-m 3 -f 32 -o`・`-g -o`・`-v`・`-V` でも
 走らせるので、ELF32/ELF64 のオブジェクト、DWARF、リスティング、テキスト出力の
-経路も比較されます（全 232 組）。
+経路も比較されます（全 235 組）。
 
 **目次**
 
@@ -517,9 +517,17 @@ a>3;4,b>7;5
 を表示します。本文のある 5 つのどれかを選ぶか、`axx.py` と `caxx.c` の `ERRORS` テーブル
 に自分のものを追加してください。
 
-`error_patterns` は浮動小数点モードで評価されるので、値は IEEE-754 倍精度ビットパターン
-として運ばれます。ビット演算子とシフト演算子は内部で補正するので、`(8>>2)>0;2` は書いた
-とおりに評価されます。
+`error_patterns` の `条件;コード` の組は、まず整数モードで評価されます。整数は正確に
+比べられるので、`e>18446744073709551615;3` のような 64 ビットの範囲検査も書いたとおりに
+働きます。次のどれかに当たる組だけは浮動小数点モードで評価され、値は IEEE-754 倍精度
+ビットパターンとして運ばれます（2**53 を超える整数は丸められます）。
+
+- `!F` などで取った、浮動小数点モードで書かれた変数を読む組
+- `1.5` のような浮動小数点の定数を含む組
+- `/` か `**` を含む組（整数と浮動小数点で結果が違うため。`7/2>3` は 3.5>3 として真）
+
+浮動小数点モードでも、ビット演算子とシフト演算子は内部で補正するので、`(8>>2)>0;2` は
+書いたとおりに評価されます。
 
 **`-o` でリンカが値を決めるラベル。** `-o` では、外部のラベル（`.extern`・`.weak`・
 `-i`）と、いまアセンブルしているセクションとは別のセクションのラベルの値はリンカが
@@ -4655,9 +4663,9 @@ x86_64 パターンファイルは
 
 | パターンファイル | サイズ | `::` 行数 | ソース | 備考 |
 |---|---|---|---|---|
-| **x86_64.axx** | 4.0 MB | 23,583 | **hello.s**、**bsection.s**、**x86_64_reloc.s**、**x86_64_rex.s**、**x86_64_avx.s**、**x86_64_err.s** | x86_64-v3: セグメントアドレッシング、AVX/AVX2、BMI1/BMI2、x87、EVEX/AVX-512。AVX 以降は llvm-mc と照合（表の後の注） |
-| **x86_64m.axx** | 1007 KB | 5,554（展開後 23,583） | **hello.s**、**x86_64_reloc.s**、**x86_64_rex.s**、**x86_64_avx.s**、**x86_64_err.s** | マクロで書かれた x86_64-v3。Brainfuck デモでも使用。展開結果は `x86_64.axx` と一致 |
-| **aarch64.axx** | 350 KB | 2,097（展開後 9,387） | **aarch64.s**、**aarch64_reloc.s** | AArch64 (A64): データ処理、分岐、例外生成、ヒント、バリア、システムレジスタと SYS 別名、ロード／ストア、LSE アトミック、スカラ浮動小数点、Advanced SIMD（LD1〜LD4 / ST1〜ST4 の構造アクセスを含む）、暗号、スカラ拡張（PAuth・MTE・MOPS・FCMA・ドット積・BFloat16・行列積・LS64）。さらに SVE・SVE2（算術、シフト、比較、述語、要素数、置換、リダクション、ギャザー／スキャッタを含むロード／ストア一式、拡幅・縮小群、複素演算、SVE2 暗号）、SME（ストリーミングモード、ZA 配列、整数・浮動小数点・BFloat16 の外積）、SME2（述語カウンタレジスタ、ZT0 参照表、Z レジスタのマルチベクタ演算、ZA への累算、連続形と跨ぎ形のマルチベクタロード／ストア）。GNU 式のリロケーション修飾子（`:lo12:`・`:pg_hi21:`・`:abs_g0:`〜`:abs_g3:`・`:prel_g0:`〜`:prel_g3:`・`:got:`／`:got_lo12:`）は `-o` でリンカ向けのリロケーションとして出し、`-b` では axx 自身が解決する。`-o` では `-m` なしで AArch64 のオブジェクトになり、同じセクションの局所ラベルへの分岐・`adr`・リテラルの `ldr` はその場で解決し、データの命令（`.byte` `.hword` `.word` `.quad` `.xword` など）は ABS / PREL のリロケーションを持つ（`aarch64_reloc.s`、llvm-mc 19 と照合）。マクロ層で記述 |
+| **x86_64.axx** | 4.2 MB | 23,587 | **hello.s**、**bsection.s**、**x86_64_reloc.s**、**x86_64_rex.s**、**x86_64_avx.s**、**x86_64_err.s** | x86_64-v3: セグメントアドレッシング、AVX/AVX2、BMI1/BMI2、x87、EVEX/AVX-512。AVX 以降は llvm-mc と照合（表の後の注） |
+| **x86_64m.axx** | 1.0 MB | 5,555（展開後 23,587） | **hello.s**、**x86_64_reloc.s**、**x86_64_rex.s**、**x86_64_avx.s**、**x86_64_err.s** | マクロで書かれた x86_64-v3。Brainfuck デモでも使用。展開結果は `x86_64.axx` と一致 |
+| **aarch64.axx** | 352 KB | 2,097（展開後 9,387） | **aarch64.s**、**aarch64_reloc.s**、**aarch64_edge.s**、**aarch64_err.s** | AArch64 (A64): データ処理、分岐、例外生成、ヒント、バリア、システムレジスタと SYS 別名、ロード／ストア、LSE アトミック、スカラ浮動小数点、Advanced SIMD（LD1〜LD4 / ST1〜ST4 の構造アクセスを含む）、暗号、スカラ拡張（PAuth・MTE・MOPS・FCMA・ドット積・BFloat16・行列積・LS64）。さらに SVE・SVE2（算術、シフト、比較、述語、要素数、置換、リダクション、ギャザー／スキャッタを含むロード／ストア一式、拡幅・縮小群、複素演算、SVE2 暗号）、SME（ストリーミングモード、ZA 配列、整数・浮動小数点・BFloat16 の外積）、SME2（述語カウンタレジスタ、ZT0 参照表、Z レジスタのマルチベクタ演算、ZA への累算、連続形と跨ぎ形のマルチベクタロード／ストア）。GNU 式のリロケーション修飾子（`:lo12:`・`:pg_hi21:`・`:abs_g0:`〜`:abs_g3:`・`:prel_g0:`〜`:prel_g3:`・`:got:`／`:got_lo12:`）は `-o` でリンカ向けのリロケーションとして出し、`-b` では axx 自身が解決する。`-o` では `-m` なしで AArch64 のオブジェクトになり、同じセクションの局所ラベルへの分岐・`adr`・リテラルの `ldr` はその場で解決し、データの命令（`.byte` `.hword` `.word` `.quad` `.xword` など）は ABS / PREL のリロケーションを持つ（`aarch64_reloc.s`、llvm-mc 19 と照合）。マクロ層で記述 |
 | **aarch64_logical.axx** | 9.5 KB | 76（展開後 82） | **aarch64_logical_mini_demo.s** | 同じ AArch64 論理（即値）グループのマクロ層版。行を `!def` で生成し、ビットマスク即値は `binary_list` の式で符号化する |
 | **aarch64_logical_mini.axx** | 9.2 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 論理（即値）: AND/ORR/EOR/ANDS/TST、32 ビットと 64 ビット。ビットマスク即値をミニ言語（3.15 節）でエンコード |
 | **ppc64.axx** | 2.6 KB | 51（＋ `ppc64_isa.axx`） | **ppc64_test.s**、**ppc64_reloc2.s** ほか | PowerPC64 ビッグエンディアン (ELFv1)。バイト順と ELF 記述（`.elftype`／`.elffield`／`.elfpcguess`／`.elfsection`）を決めて `ppc64_isa.axx` を include する |
@@ -4693,7 +4701,7 @@ x86_64 パターンファイルは
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | シンボル捕捉子 `!Y<集合>[<変数>]`（3.6.3 節）。テスト専用 |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | 本文行に書く `.echo`（3.14.1 節）。テスト専用 |
 | **ministr.axx** | 6.4 KB | 15 | **ministr.s** | ミニ言語の文字列・文字列の配列・`.for ... in 配列`（3.15 節）。テスト専用 |
-| **regress.axx** | 2.1 KB | 4 | **regress.s**、**regresserr.s**、**regresscr.s**（と `z80.axx` で **regresself.s**） | 差分ファジングで見つけて直した両実装の食い違いの回帰テスト（入れ子の三項、桁の多い数値リテラル、pow の特別な場合、マクロ層の `int()`・`hex()`・書式指定、エラー後の診断、セクションの終わりのラベルを指す `.equ`、未定義を含む `.equ` の値、空白と文字定数の規則、マクロ層のバイト単位の文字列、CR だけの改行、UTF-8 でないバイトの一覧、`-o` で後ろへ戻す `.org`）。テスト専用 |
+| **regress.axx** | 2.1 KB | 4 | **regress.s**、**regresserr.s**、**regresscr.s**（と `z80.axx` で **regresself.s**） | 差分ファジングで見つけて直した両実装の食い違いの回帰テスト（入れ子の三項、桁の多い数値リテラル、pow の特別な場合、マクロ層の `int()`・`hex()`・書式指定、エラー後の診断、セクションの終わりのラベルを指す `.equ`、未定義を含む `.equ` の値、空白と文字定数の規則、マクロ層のバイト単位の文字列、CR だけの改行、UTF-8 でないバイトの一覧、`-o` で後ろへ戻す `.org`、`error_patterns` の整数での評価）。テスト専用 |
 | **elftype.axx** | 1.5 KB | 20 | **elftype.s** | `.elftype` で決めた型名を `.reloc` / `.extern` / `.global` に書く（3.7.6 節）。テスト専用 |
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | 組み込みの表に無いマシン（EM_MSP430）の ELF 記述（3.7.7 節）。テスト専用 |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | リロケーション型の優先順位（既定 < パターンファイル < ソースファイル、3.7.8 節）。テスト専用 |
@@ -4706,7 +4714,7 @@ x86_64 パターンファイルは
 | **elfrel.axx** | 4.1 KB | 41 | **elfrel.s** | `.elfbuiltin::0` で組み込みの表を使わずに書いた ARM（EM_ARM）の記述と、REL の命令フィールド型（`.elffield` のシフトと補正、3.7.7・3.7.9 節）。命令語とリロケーションは llvm-mc と一致。テスト専用 |
 | **elfsym.axx** | 2.8 KB | 23 | **elfsym.s** | ソース側の ELF シンボル属性（`.type`・`.size`・`.weak`・`.hidden`・`.protected`・`.internal`・`.other`・`.comm`、5.6.1 節）と、2 の冪でない欄の幅（`.elfwidth::3`）・セクションの要素長（`.elfsection` の第 5 欄、3.7.7 節）。機種は組み込みの表に無い EM_MN10300。テスト専用 |
 | **riscv64.axx** | 12 KB | 131 | **riscv64.s**、**riscv64_reloc2.s** | RV64I の基本整数命令（U/I/S/B/J/R 形式、ロード／ストア、分岐、ジャンプ、`call`、`li`/`mv`/`j`/`ret`/`nop`、`ecall`/`ebreak`）。C・M・A・F/D 拡張、CSR、fence 群は含みません。組み込みの EM_RISCV 表はデータ型しか持たないので、`CALL_PLT`・`BRANCH`・`JAL`・`HI20`・`LO12_I`/`_S`・`PCREL` 対を `.elftype`／`.elffield`／`.reloc` で宣言する実例でもあります（3.7.5〜3.7.7 節）。`ld -m elf64lriscv` でリンクでき、動きます |
-| **riscv64full.axx** | 78 KB | 2,225（展開後 4,137） | **riscv64full.s**、**riscv64full_reloc.s**、**riscv64full_reloc2.s** | RISC-V RV64 の全体: I、M、A（Zabha・Zacas・Zawrs を含む）、F、D、Q、Zfh、Zfa、C（Zca・Zcd・Zcb・Zcmp・Zcmt・Zcmop）、Zba / Zbb / Zbc / Zbs、Zbkb / Zbkc / Zbkx、Zknd / Zkne / Zknh / Zksed / Zksh、Zicond、Zicbom / Zicboz / Zicbop、Zihintntl、Zimop、Zicfiss / Zicfilp、CSR 名つきの Zicsr、特権命令と H 拡張、V 1.0（Zvbb・Zvbc・Zvkg・Zvkned・Zvknh・Zvksed・Zvksh と bf16 の部分を含む）。GNU の疑似命令（任意の 64 ビット定数の `li`、`call`、`tail`、`la`、グローバルのロード／ストアなど）と、丸めモードや `v0.t` マスクの省略可能な指定にも対応します。`riscv64.axx` の上位版で、命令が持つ RISC-V psABI のリロケーションを宣言します。llvm-mc 18 とバイト単位で照合し、`-o` のリロケーションとリンク後のイメージも LLVM のものと照合しました。LLVM 18 に無い部分（Q、Zabha、`vwsll`、`mnret`、`c.ntl.*`、`c.sspush`）は仕様書から起こしています。`riscv64full.s` は各行の実行例、`riscv64full_reloc.s` と `riscv64full_reloc2.s`（`la` / `lla` とグローバルのロード／ストア、PC 相対のデータ、ラベル差。llvm-mc 19 と照合）は `-o` 用 |
+| **riscv64full.axx** | 78 KB | 2,225（展開後 4,137） | **riscv64full.s**、**riscv64full_reloc.s**、**riscv64full_reloc2.s**、**riscv64full_edge.s** | RISC-V RV64 の全体: I、M、A（Zabha・Zacas・Zawrs を含む）、F、D、Q、Zfh、Zfa、C（Zca・Zcd・Zcb・Zcmp・Zcmt・Zcmop）、Zba / Zbb / Zbc / Zbs、Zbkb / Zbkc / Zbkx、Zknd / Zkne / Zknh / Zksed / Zksh、Zicond、Zicbom / Zicboz / Zicbop、Zihintntl、Zimop、Zicfiss / Zicfilp、CSR 名つきの Zicsr、特権命令と H 拡張、V 1.0（Zvbb・Zvbc・Zvkg・Zvkned・Zvknh・Zvksed・Zvksh と bf16 の部分を含む）。GNU の疑似命令（任意の 64 ビット定数の `li`、`call`、`tail`、`la`、グローバルのロード／ストアなど）と、丸めモードや `v0.t` マスクの省略可能な指定にも対応します。`riscv64.axx` の上位版で、命令が持つ RISC-V psABI のリロケーションを宣言します。llvm-mc 18 とバイト単位で照合し、`-o` のリロケーションとリンク後のイメージも LLVM のものと照合しました。LLVM 18 に無い部分（Q、Zabha、`vwsll`、`mnret`、`c.ntl.*`、`c.sspush`）は仕様書から起こしています。`riscv64full.s` は各行の実行例、`riscv64full_reloc.s` と `riscv64full_reloc2.s`（`la` / `lla` とグローバルのロード／ストア、PC 相対のデータ、ラベル差。llvm-mc 19 と照合）は `-o` 用 |
 | **endsub.axx** | 1.2 KB | 20 | **endsub.s** | `.sub` ブロックを `.endsub` で閉じる（3.7.2 節）。テスト専用 |
 | **intel2att.axx** | 12 KB | 60（展開後 3,437） | **intel2att.s** | x86-64 Intel 記法 → AT&T 記法 のソース翻訳器。`.textmode`・`!Y`・`!L`・マクロ層でのパターン生成（3.18 節）。翻訳結果は GNU as に通る |
 | **a64tox64_axx.axx** | 32 KB | 152（展開後 1,903） | **bf_aarch64.s** | AArch64 → x86_64 のソース翻訳器。出力は `x86_64.axx` でアセンブルできる記法。ランタイム `a64rt_axx.s`（Linux）・`a64rt_axx_freebsd.s`（FreeBSD）と宣言 `a64ext.s` を使う（3.18 節） |
@@ -4774,7 +4782,7 @@ REX の要る命令（R8〜R15 や SPL〜DIL と組む、REX.W が付くなど�
 だけがラベルを読み、再配置はその欄に付きます）。3 オペランドの `IMUL` の即値形と
 `MOV` の RIP 相対は、32 / 16 / 8 ビットの形もあります。
 
-`test1` は 95 組を両方の実装で実行し、`-b` の生バイナリを比較します。
+`test1` は 98 組を両方の実装で実行し、`-b` の生バイナリを比較します。
 `.textmode` を使う 5 組（`textmode.axx` / `8080toz80.axx` / `intel2att.axx` / `a64tox64_axx.axx` / `expcap.axx`）と、
 `.passthru` で素通しした行を見る `exprmiss.axx` については、`-V` で
 標準出力へ流した翻訳テキストどうしも比較します。`elftype.axx` / `elftype.s` と
@@ -4832,13 +4840,17 @@ AH / CH / DH / BH がエラーになることを、標準エラーの診断で�
 ラベルが未定義になることを標準エラーの診断で比較します。`listinc.s` は `-v` の一覧で
 `.include` の行と include 先の行が 1 行ずつに分かれることと、`.section` を書かないときの
 `-o` の `.text` が末尾の `.org` まで届くことを、一覧と ELF オブジェクトで比較します。
+`aarch64_edge.s` と `riscv64full_edge.s` は llvm-mc 19 と照合した範囲の境目で組めるべき行
+（SVE の `dup` / `mov` / `mul` / `smax` の即値、`c.lui` の -32 / 0xfffe0 など）を `-b` の像で、
+`aarch64_err.s` は 4 の倍数でない PC 相対・範囲外の `adrp`・SVE の符号付きバイトの範囲外が
+エラーになることを標準エラーの診断で比較します。
 
 さらに中核の 16 組（`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`）は、
 `-b` だけでは一度も比較されない経路を通すために、`-o`（ELF64）、`-m 3 -f 32 -o`
 （ELF32）、`-g -o`（DWARF 付き）、`-v`（リスティング）、`-V`（テキスト出力）
 でも走らせて突き合わせます（`-o` の ELF はパターンの機種のもので、`.elfmachine` が無ければ x86-64 の ELF64）。`elfcfi` は ELF32（`-m 3 -f 32`、REL）でも比較します。
-比較は全部で 232 組です。
+比較は全部で 235 組です。
 
 `-g` を比較するときは、両実装を必ず同じディレクトリで走らせてください。DWARF は
 `DW_AT_comp_dir` にカレントディレクトリを埋めるので、別の場所で走らせると中身が
@@ -4870,7 +4882,7 @@ AH / CH / DH / BH がエラーになることを、標準エラーの診断で�
 | `format_of_exp_imp_file` | エクスポート/インポートファイル形式 |
 | `axx.1.gz` | man ページ |
 
-`test1` は同梱の 95 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
+`test1` は同梱の 98 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
 
 ### C.2 外部
 

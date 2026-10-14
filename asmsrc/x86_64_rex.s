@@ -111,3 +111,16 @@ here:
         mov     sil,[rip+here]
         mov     [rip+here],r15b
         mov     [rip+here],ah
+; 2026-10-14: 32 ビットのレジスタと即値の BT 系（64 ビットの形しか無かった）、push の imm32 は
+; 64 ビットへ符号拡張されるので -2**31..2**31-1、mov r64 の imm64、変位の 32 ビットの端
+        bt      eax, 3
+        bts     r9d, 31
+        btr     ecx, 255
+        btc     r15d, -128
+        push    -2147483648
+        push    2147483647
+        mov     rax, -9223372036854775808
+        mov     rax, 0xffffffffffffffff
+        lea     rax, [rbx+0x7fffffff]
+        lea     rax, [rbx-0x80000000]
+        mov     eax, [rax+0xffffffff]

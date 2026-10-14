@@ -1326,8 +1326,8 @@ z = base | (ix << 15) | (rd << 7)
 .func clui(rd, v)
 n = v & 63
 .if v >= 1 && v <= 31 .then
-.elif v >= 0xfffe1 && v <= 0xfffff .then
-.elif v >= -31 && v <= -1 .then
+.elif v >= 0xfffe0 && v <= 0xfffff .then
+.elif v >= -32 && v <= -1 .then
 .else
 .raise 3
 .return

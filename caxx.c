@@ -2538,6 +2538,8 @@ typedef struct {
     int        diag_seen_len, diag_seen_cap;
     /* -v の一覧で、行頭を出したがまだ改行していない行があるか（lineassemble0） */
     int        listing_open;
+    /* 整数モードの式が、浮動小数点モードで書かれた変数を読んだか（dir_error） */
+    int        expr_read_float_var;
 } AsmState;
 
 /* いま診断を出してよいパスか。パス2と対話モードだけ真。パス1は推定値で
@@ -4727,6 +4729,7 @@ static uint256_t var_slot_for_mode(AsmState *st, int slot, int want_float){
     PatVar *pv = &st->vars[slot];
     if(want_float && !pv->is_float && !u256_is_undef(pv->val))
         return double_to_u256(u256_int_to_double(pv->val));
+    if(!want_float && pv->is_float) st->expr_read_float_var = 1;
     return pv->val;
 }
 typedef struct { int slot; PatVar old; } VarUndo;
@@ -8806,7 +8809,13 @@ static int cond_tests_linked_label(AsmState *st, const char *cond, size_t len){
 }
 
 /* error_patterns 欄を評価する。`条件;コード` をカンマで並べたものを順に見る。
-   評価は浮動小数点モードで行う。 */
+   1 つの組はまず整数モードで評価する。浮動小数点モードで書かれた変数（!F などで
+   取ったもの）を読んだとき、整数モードでは `条件;コード` を読み切れないとき
+   （1.5 のような浮動小数点の定数）、組が `/` か `**` を含むとき（整数と浮動小数点
+   で結果が違う）だけ、浮動小数点モードで評価し直す。
+   浮動小数点モードだけで評価していた頃は、2**53 を超える整数の比較が倍精度に
+   丸められて、64 ビットの範囲検査（e>18446744073709551615 など）が働かなかった。
+   axx.py の DirectiveProcessor.error() と同じ規則である。 */
 static int dir_error(Assembler *asmb, const char *s){
     AsmState *st=&asmb->st;
     int has_content=0;
@@ -8827,19 +8836,41 @@ static int dir_error(Assembler *asmb, const char *s){
         int idx_before = idx;
         int io;
         int prev_flt = st->exp_typ_float;
-        st->exp_typ_float = 1;
         /* 条件が未定義のラベル・変数に触れたら、その条件では判定しない。未定義は
            すでに報告済みで、番兵の値で範囲を判定しても意味がない。
            axx.py の DirectiveProcessor.error() と同じ規則である。 */
         int undef_prior = st->error_undefined_label;
+        uint256_t u, t;
+        int cond_undef, cond_false, io_cond;
+        /* 1 回目: 整数モード */
+        st->exp_typ_float = 0;
+        st->expr_read_float_var = 0;
         st->error_undefined_label = 0;
-        uint256_t u=expr_expression_pat(asmb,buf,idx,&io);
-        int cond_undef = st->error_undefined_label || u256_is_undef(u);
-        int cond_false = expr_is_false(asmb, u);
-        idx=io;
-        int io_cond = io;
-        if(buf[idx]==';') idx++;
-        uint256_t t=expr_expression_pat(asmb,buf,idx,&io);
+        u = expr_expression_pat(asmb,buf,idx_before,&io);
+        cond_undef = st->error_undefined_label || u256_is_undef(u);
+        cond_false = expr_is_false(asmb, u);
+        io_cond = io;
+        int int_ok = 0;
+        if(buf[io_cond]==';'){
+            t = expr_expression_pat(asmb,buf,io_cond+1,&io);
+            if((buf[io]==','||buf[io]=='\0') && !st->expr_read_float_var) int_ok = 1;
+            /* `/` と `**` は整数と浮動小数点で結果が違う（7/2 は 3 と 3.5）ので、
+               含む組は従来どおり浮動小数点モードで読む */
+            for(int _k = idx_before; int_ok && _k < io; _k++)
+                if(buf[_k]=='/' || (buf[_k]=='*' && buf[_k+1]=='*')) int_ok = 0;
+        }
+        if(!int_ok){
+            /* 2 回目: 浮動小数点モード（従来の読み方） */
+            st->exp_typ_float = 1;
+            st->error_undefined_label = 0;
+            u = expr_expression_pat(asmb,buf,idx_before,&io);
+            cond_undef = st->error_undefined_label || u256_is_undef(u);
+            cond_false = expr_is_false(asmb, u);
+            idx=io;
+            io_cond = io;
+            if(buf[idx]==';') idx++;
+            t = expr_expression_pat(asmb,buf,idx,&io);
+        }
         st->exp_typ_float = prev_flt;
         st->error_undefined_label = undef_prior || st->error_undefined_label;
         idx=io;
@@ -8849,7 +8880,10 @@ static int dir_error(Assembler *asmb, const char *s){
                                         (size_t)(io_cond - idx_before))
            && !cond_tests_linked_label(st, buf + idx_before,
                                        (size_t)(io_cond - idx_before))){
-            double _tdv = u256_to_double(t);
+            /* 整数モードで読めた組のコードは整数、浮動小数点モードなら倍精度の
+               ビット列。どちらも倍精度を経て 64 ビットの範囲で読む */
+            double _tdv = int_ok ? (u256_is_undef(t) ? 0.0 : u256_int_to_double(t))
+                                 : u256_to_double(t);
             int64_t tc = (isfinite(_tdv) && _tdv > -9223372036854775808.0
                           && _tdv < 9223372036854775808.0) ? (int64_t)_tdv : 0;
             fprintf(stderr,"Line %d Error code %lld ",(int)st->ln,(long long)tc);

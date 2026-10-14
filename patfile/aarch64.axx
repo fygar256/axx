@@ -337,6 +337,7 @@
 .error::11::"immediate not encodable as a move-wide or bitmask value"
 .error::12::"condition AL and NV cannot be used with this alias"
 .error::13::"every byte of a 64-bit MOVI immediate must be 0x00 or 0xff"
+.error::14::"PC-relative target is not a multiple of 4"
 
 /* ===================================================================
 /* Mini-language encoders (Technical_Manual.md section 3.15)
@@ -374,6 +375,52 @@ w = v / 256
 .endif
 .raise 3
 .return 0
+.endfunc
+/* DUP / MOV (immediate) into an element of ew bits. The value must fit
+/* the element, signed or unsigned; taken modulo 2**ew it must then be a
+/* sign-extended byte, or one shifted left by 8 when sh8 is 1. So #255
+/* is a byte element's -1 but no wider element's, while a halfword
+/* element takes #0xff00 (-1, LSL #8). svdupvm falls back on the bitmask
+/* broadcast, as MOV does. */
+.func::svdupv::base,v,ew,sh8,rd
+.if v < -(1 << (ew - 1)) || v > (1 << ew) - 1 .then
+.raise 3
+.return 0
+.endif
+u = v & ((1 << ew) - 1)
+.if u >= (1 << (ew - 1)) .then
+u = u - (1 << ew)
+.endif
+.if u >= -128 && u <= 127 .then
+.return .call w4(base | ((u & 0xff) << 5) | rd)
+.endif
+.if sh8 == 1 && (u & 0xff) == 0 .then
+w = u / 256
+.if w >= -128 && w <= 127 .then
+.return .call w4(base | 0x2000 | ((w & 0xff) << 5) | rd)
+.endif
+.endif
+.raise 3
+.return 0
+.endfunc
+.func::svdupvm::base,v,ew,sh8,rd
+.if v >= -(1 << (ew - 1)) && v <= (1 << ew) - 1 .then
+u = v & ((1 << ew) - 1)
+.if u >= (1 << (ew - 1)) .then
+u = u - (1 << ew)
+.endif
+.if u >= -128 && u <= 127 .then
+.return .call w4(base | ((u & 0xff) << 5) | rd)
+.endif
+.if sh8 == 1 && (u & 0xff) == 0 .then
+w = u / 256
+.if w >= -128 && w <= 127 .then
+.return .call w4(base | 0x2000 | ((w & 0xff) << 5) | rd)
+.endif
+.endif
+.endif
+i13 = .call bitmask13(v, ew)
+.return .call w4(0x05c00000 | (i13 << 5) | rd)
 .endfunc
 /* the same, falling back on the bitmask broadcast that MOV allows */
 .func::svaim::base,v,lo,hi,sh8,maxw,rd
@@ -623,7 +670,7 @@ i8 = .call fpimm8(v)
 ADR xd,!t ::((t-$$)<-1048576)||((t-$$)>1048575);2 :: .call w4((((t-$$)&3)<<29)|(0x10<<24)|((((t-$$)>>2)&0x7ffff)<<5)|xd)
 .clrreloc::t
 .reloc::t::adr_prel_pg_hi21
-ADRP xd,!t :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
+ADRP xd,!t ::(((t>>12)-($$>>12))<-1048576)||(((t>>12)-($$>>12))>1048575);2 :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
 .clrreloc::t
 
 /* Add/subtract (immediate). sh selects the LSL #12 form. */
@@ -1014,19 +1061,19 @@ CMP WSP,wm[[,LSL #!a]] ::a<0;10,a>4;10 :: .call w4((1<<30)|(1<<29)|(0x0b<<24)|(1
 /* same way as ADR/ADRP above. Each group names its type with `.reloc`
 /* and takes it back with `.clrreloc`. */
 .reloc::t::jump26
-B !t ::((t-$$)<-134217728)||((t-$$)>134217724);2 :: .call w4(0x14000000|(((t-$$)>>2)&0x3ffffff))
+B !t ::((t-$$)<-134217728)||((t-$$)>134217724);2,((t-$$)&3)!=0;14 :: .call w4(0x14000000|(((t-$$)>>2)&0x3ffffff))
 .clrreloc::t
 .reloc::t::call26
-BL !t ::((t-$$)<-134217728)||((t-$$)>134217724);2 :: .call w4(0x94000000|(((t-$$)>>2)&0x3ffffff))
+BL !t ::((t-$$)<-134217728)||((t-$$)>134217724);2,((t-$$)&3)!=0;14 :: .call w4(0x94000000|(((t-$$)>>2)&0x3ffffff))
 .clrreloc::t
 
 /* Conditional branch */
 .reloc::t::condbr19
-B.cnd !t ::((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4(0x54000000|((((t-$$)>>2)&0x7ffff)<<5)|cnd)
+B.cnd !t ::((t-$$)<-1048576)||((t-$$)>1048572);2,((t-$$)&3)!=0;14 :: .call w4(0x54000000|((((t-$$)>>2)&0x7ffff)<<5)|cnd)
 
 /* Compare and branch */
 !def cb(nm, op, rt, sf) {
-!{nm} !{rt},!t ::((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4((!{sf}<<31)|(0x1a<<25)|(!{op}<<24)|((((t-$$)>>2)&0x7ffff)<<5)|!{rt})
+!{nm} !{rt},!t ::((t-$$)<-1048576)||((t-$$)>1048572);2,((t-$$)&3)!=0;14 :: .call w4((!{sf}<<31)|(0x1a<<25)|(!{op}<<24)|((((t-$$)>>2)&0x7ffff)<<5)|!{rt})
 }
 !cb("CBZ", 0, "xt", 1)
 !cb("CBZ", 0, "wt", 0)
@@ -1037,7 +1084,7 @@ B.cnd !t ::((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4(0x54000000|((((t-$$
 /* Test bit and branch */
 .reloc::t::tstbr14
 !def tb(nm, op, rt, mx) {
-!{nm} !{rt},#!b,!t ::b<0;3,b>!{mx};3,((t-$$)<-32768)||((t-$$)>32764);2 :: .call w4(((b>>5)<<31)|(0x1b<<25)|(!{op}<<24)|((b&31)<<19)|((((t-$$)>>2)&0x3fff)<<5)|!{rt})
+!{nm} !{rt},#!b,!t ::b<0;3,b>!{mx};3,((t-$$)<-32768)||((t-$$)>32764);2,((t-$$)&3)!=0;14 :: .call w4(((b>>5)<<31)|(0x1b<<25)|(!{op}<<24)|((b&31)<<19)|((((t-$$)>>2)&0x3fff)<<5)|!{rt})
 }
 !tb("TBZ", 0, "xt", 63)
 !tb("TBZ", 0, "wt", 31)
@@ -1424,7 +1471,7 @@ SYSL xt,#!p,crn,crm,#!q ::p<0;3,p>7;3,q<0;3,q>7;3 :: .call w4(0xd5280000|(p<<16)
 /* linker's under `-o`, as for the branches. */
 .reloc::t::ld_prel_lo19
 !def lslit(mn, rt, opc, v) {
-!{mn} !{rt},!t ::((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4((!{opc}<<30)|(3<<27)|(!{v}<<26)|((((t-$$)>>2)&0x7ffff)<<5)|!{rt})
+!{mn} !{rt},!t ::((t-$$)<-1048576)||((t-$$)>1048572);2,((t-$$)&3)!=0;14 :: .call w4((!{opc}<<30)|(3<<27)|(!{v}<<26)|((((t-$$)>>2)&0x7ffff)<<5)|!{rt})
 }
 !lslit("LDR", "wt", 0, 0)
 !lslit("LDR", "xt", 1, 0)
@@ -1439,7 +1486,7 @@ SYSL xt,#!p,crn,crm,#!q ::p<0;3,p>7;3,q<0;3,q>7;3 :: .call w4(0xd5280000|(p<<16)
 PRFM #!p,[xb[[,#!o]]] ::p<0;3,p>31;3 :: .call lsoff(3,0,2,o,xb,p,3)
 PRFM #!p,[xb,xm[[,LSL #!a]]] ::p<0;3,p>31;3,(a!=0)&&(a!=3);10 :: .call w4((3<<30)|(7<<27)|(2<<22)|(1<<21)|(xm<<16)|(3<<13)|((a==3?1:0)<<12)|(2<<10)|(xb<<5)|p)
 .reloc::t::ld_prel_lo19
-PRFM #!p,!t ::p<0;3,p>31;3,((t-$$)<-1048576)||((t-$$)>1048572);2 :: .call w4((3<<30)|(3<<27)|((((t-$$)>>2)&0x7ffff)<<5)|p)
+PRFM #!p,!t ::p<0;3,p>31;3,((t-$$)<-1048576)||((t-$$)>1048572);2,((t-$$)&3)!=0;14 :: .call w4((3<<30)|(3<<27)|((((t-$$)>>2)&0x7ffff)<<5)|p)
 .clrreloc::t
 PRFUM #!p,[xb[[,#!o]]] ::p<0;3,p>31;3,o<-256;8,o>255;8 :: .call w4((3<<30)|(7<<27)|(2<<22)|((o&0x1ff)<<12)|(xb<<5)|p)
 
@@ -3667,7 +3714,7 @@ PRFM #!p,[xb,#:LO12:!t] ::p<0;3,p>31;3,(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1
 /* already means there, so it encodes identically to the plain row
 /* further up. GNU as takes this spelling; llvm-mc does not. */
 .reloc::t::adr_prel_pg_hi21
-ADRP xd,:PG_HI21:!t :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
+ADRP xd,:PG_HI21:!t ::(((t>>12)-($$>>12))<-1048576)||(((t>>12)-($$>>12))>1048575);2 :: .call w4((1<<31)|((((t>>12)-($$>>12))&3)<<29)|(0x10<<24)|(((((t>>12)-($$>>12))>>2)&0x7ffff)<<5)|xd)
 .clrreloc::t
 
 /* The GOT pair. :got: is the page of the slot, :got_lo12: its low
@@ -3994,41 +4041,45 @@ LDR xt,[xb,#:GOT_LO12:!t] ::(t&7)!=0;8 :: .call w4((3<<30)|(7<<27)|(1<<24)|(1<<2
 /*   00100101 size opc 11 sh imm8 Zdn
 /* The shifted form multiplies the byte by 256; only the wrapping
 /* arithmetic operations have it. */
-!def svimm1(nm, opc, el, sz, sg, sh8) {
-!{nm} zd.!{el},zd.!{el},#!v :: .call svai(0x2500c000|(!{sz}<<22)|(!{opc}<<16),v,!{sg},255,!{sh8},zd)
+!def svimm1(nm, opc, el, sz, sg, hi, sh8) {
+!{nm} zd.!{el},zd.!{el},#!v :: .call svai(0x2500c000|(!{sz}<<22)|(!{opc}<<16),v,!{sg},!{hi},!{sh8},zd)
 !if sh8 !then {
-!{nm} zd.!{el},zd.!{el},#!v,LSL #!h ::v<!{sg};3,v>255;3,h!=8;10 :: .call w4(0x2500e000|(!{sz}<<22)|(!{opc}<<16)|((v&0xff)<<5)|zd)
+!{nm} zd.!{el},zd.!{el},#!v,LSL #!h ::v<!{sg};3,v>!{hi};3,h!=8;10 :: .call w4(0x2500e000|(!{sz}<<22)|(!{opc}<<16)|((v&0xff)<<5)|zd)
 }
 }
 /* The shifted form has no byte version: a byte element has nowhere
-/* to put the top half. */
-!def svimm(nm, opc, sg, sh8) {
-!svimm1(nm, opc, "B", 0, sg, 0)
-!svimm1(nm, opc, "H", 1, sg, sh8)
-!svimm1(nm, opc, "S", 2, sg, sh8)
-!svimm1(nm, opc, "D", 3, sg, sh8)
+/* to put the top half. The signed ones (SMAX/SMIN/MUL) take -128..127:
+/* 128..255 would be read back as -128..-1, so MUL by 255 would become
+/* MUL by -1 (llvm-mc refuses them too). */
+!def svimm(nm, opc, sg, hi, sh8) {
+!svimm1(nm, opc, "B", 0, sg, hi, 0)
+!svimm1(nm, opc, "H", 1, sg, hi, sh8)
+!svimm1(nm, opc, "S", 2, sg, hi, sh8)
+!svimm1(nm, opc, "D", 3, sg, hi, sh8)
 }
-!svimm("ADD", 0x20, 0, 1)
-!svimm("SUB", 0x21, 0, 1)
-!svimm("SUBR", 0x23, 0, 1)
-!svimm("SQADD", 0x24, 0, 1)
-!svimm("UQADD", 0x25, 0, 1)
-!svimm("SQSUB", 0x26, 0, 1)
-!svimm("UQSUB", 0x27, 0, 1)
-!svimm("SMAX", 0x28, -128, 0)
-!svimm("SMIN", 0x2a, -128, 0)
-!svimm("UMAX", 0x29, 0, 0)
-!svimm("UMIN", 0x2b, 0, 0)
-!svimm("MUL", 0x30, -128, 0)
-/* DUP with an immediate, and its MOV spelling */
+!svimm("ADD", 0x20, 0, 255, 1)
+!svimm("SUB", 0x21, 0, 255, 1)
+!svimm("SUBR", 0x23, 0, 255, 1)
+!svimm("SQADD", 0x24, 0, 255, 1)
+!svimm("UQADD", 0x25, 0, 255, 1)
+!svimm("SQSUB", 0x26, 0, 255, 1)
+!svimm("UQSUB", 0x27, 0, 255, 1)
+!svimm("SMAX", 0x28, -128, 127, 0)
+!svimm("SMIN", 0x2a, -128, 127, 0)
+!svimm("UMAX", 0x29, 0, 255, 0)
+!svimm("UMIN", 0x2b, 0, 255, 0)
+!svimm("MUL", 0x30, -128, 127, 0)
+/* DUP with an immediate, and its MOV spelling (svdupv / svdupvm). The
+/* explicit LSL #8 form takes a byte that, shifted, still fits the
+/* element: up to 255 for a halfword, -128..127 for the wider ones. */
 !def svdupi(nm, el, sz, sh8, bm) {
 !if bm !then {
-!{nm} zd.!{el},#!v :: .call svaim(0x2538c000|(!{sz}<<22),v,-128,255,!{sh8},!{bm},zd)
+!{nm} zd.!{el},#!v :: .call svdupvm(0x2538c000|(!{sz}<<22),v,!{bm},!{sh8},zd)
 } !else {
-!{nm} zd.!{el},#!v :: .call svai(0x2538c000|(!{sz}<<22),v,-128,255,!{sh8},zd)
+!{nm} zd.!{el},#!v :: .call svdupv(0x2538c000|(!{sz}<<22),v,!{8<<sz},!{sh8},zd)
 }
 !if sh8 !then {
-!{nm} zd.!{el},#!v,LSL #!h ::v<-128;3,v>255;3,h!=8;10 :: .call w4(0x2538e000|(!{sz}<<22)|((v&0xff)<<5)|zd)
+!{nm} zd.!{el},#!v,LSL #!h ::v<-128;3,v>!{sz==1?255:127};3,h!=8;10 :: .call w4(0x2538e000|(!{sz}<<22)|((v&0xff)<<5)|zd)
 }
 }
 !svdupi("DUP", "B", 0, 0, 0)

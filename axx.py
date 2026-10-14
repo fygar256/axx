@@ -1938,6 +1938,8 @@ class AssemblerState:
         self._diag_line_seen = set()
         # -v の一覧で、行頭を出したがまだ改行していない行があるか（lineassemble0）。
         self._listing_open = False
+        # 整数モードの式が、浮動小数点モードで書かれた変数を読んだか（error()）。
+        self._expr_read_float_var = False
 
         self.outfile = ""
         self.expfile = ""
@@ -2028,6 +2030,8 @@ class AssemblerState:
         self.vars = {}
 
         self.vars_undef = {}
+        # 浮動小数点モードで書いた変数（caxx.c の PatVar.is_float と同じ印）。
+        self.vars_float = {}
 
         self.vars_text = {}
 
@@ -3347,6 +3351,15 @@ class VariableManager:
             except (OverflowError, ValueError):
                 self.state.vars[c] = v
         self.state.vars_undef[c] = bool(is_undef)
+        if self.state.exp_typ == 'f':
+            self.state.vars_float[c] = True
+        else:
+            self.state.vars_float.pop(c, None)
+
+    def is_float(self, s):
+        """浮動小数点モードで書かれた変数か（caxx.c の PatVar.is_float）。"""
+        i = self._index(s)
+        return i is not None and self.state.vars_float.get(i, False)
 
 
 class LabelManager:
@@ -4184,6 +4197,8 @@ class ExpressionEvaluator:
                 self.var_manager.put_tagged(ch, x, _assign_undef)
             else:
                 x = self.var_manager.get(ch)
+                if self.state.exp_typ != 'f' and self.var_manager.is_float(ch):
+                    self.state._expr_read_float_var = True
                 idx += _vnl
                 if (not self.state._in_match_attempt
                         and not self.state._pass1_size_mode
@@ -5240,8 +5255,14 @@ class DirectiveProcessor:
     def error(self, s):
         """error_patterns 欄を評価する。返り値は (発生したか, エラーコード)。
 
-        `条件;コード` をカンマで並べたものを順に見る。評価は浮動小数点モードで
-        行う（ビット演算とシフトは内部で補正するので、書いたとおりに読める）。
+        `条件;コード` をカンマで並べたものを順に見る。1 つの組はまず整数モードで
+        評価し、浮動小数点モードで書かれた変数（!F などで取ったもの）を読んだとき、
+        整数モードでは `条件;コード` を読み切れないとき（1.5 のような浮動小数点の
+        定数）、組が `/` か `**` を含むとき（整数と浮動小数点で結果が違う）だけ、
+        浮動小数点モードで評価し直す（ビット演算と
+        シフトは内部で補正するので、書いたとおりに読める）。浮動小数点モード
+        だけで評価していた頃は、2**53 を超える整数の比較が倍精度に丸められて、
+        64 ビットの範囲検査が働かなかった。caxx.c の dir_error() と同じ規則である。
         リンカが埋める変数を見ている条件は _cond_tests_relocated_var で外す。
         """
         ss = s.replace(' ', '')
@@ -5263,19 +5284,37 @@ class DirectiveProcessor:
 
             idx_before = idx
             prev_typ = self.expr_eval.state.exp_typ
-            self.expr_eval.state.exp_typ = 'f'
             # 条件が未定義のラベル・変数に触れたら、その条件では判定しない。
             # 未定義はすでに報告済みで、番兵の値で範囲を判定しても意味がない。
             # caxx.c の dir_error() と同じ規則である。
             _undef_prior = self.state.error_undefined_label
-            self.state.error_undefined_label = False
             try:
-                u, idxn = self.expr_eval.expression_pat(s, idx)
+                # 1 回目: 整数モード
+                self.expr_eval.state.exp_typ = 'i'
+                self.state._expr_read_float_var = False
+                self.state.error_undefined_label = False
+                u, idxn = self.expr_eval.expression_pat(s, idx_before)
                 _cond_undef = self.state.error_undefined_label or _undef(u)
-                idx = idxn
-                if idx < len(s) and s[idx] == ';':
-                    idx += 1
-                t, idx = self.expr_eval.expression_pat(s, idx)
+                _int_ok = False
+                if idxn < len(s) and s[idxn] == ';':
+                    t, idx = self.expr_eval.expression_pat(s, idxn + 1)
+                    if ((idx >= len(s) or s[idx] in (',', chr(0)))
+                            and not self.state._expr_read_float_var):
+                        _int_ok = True
+                    # `/` と `**` は整数と浮動小数点で結果が違う（7/2 は 3 と 3.5）
+                    # ので、含む組は従来どおり浮動小数点モードで読む
+                    if _int_ok and ('/' in s[idx_before:idx] or '**' in s[idx_before:idx]):
+                        _int_ok = False
+                if not _int_ok:
+                    # 2 回目: 浮動小数点モード（従来の読み方）
+                    self.expr_eval.state.exp_typ = 'f'
+                    self.state.error_undefined_label = False
+                    u, idxn = self.expr_eval.expression_pat(s, idx_before)
+                    _cond_undef = self.state.error_undefined_label or _undef(u)
+                    idx = idxn
+                    if idx < len(s) and s[idx] == ';':
+                        idx += 1
+                    t, idx = self.expr_eval.expression_pat(s, idx)
             finally:
                 self.expr_eval.state.exp_typ = prev_typ
                 self.state.error_undefined_label = (_undef_prior
@@ -7182,6 +7221,7 @@ class PatternMatcher:
         for vt, binds in self._sub_variants(t):
             saved_vars = dict(self.state.vars)
             saved_vars_undef = dict(self.state.vars_undef)
+            saved_vars_float = dict(self.state.vars_float)
             saved_vars_text = dict(self.state.vars_text)
             saved_refs_len = len(self.state._elf_label_refs_seen)
             saved_v2l = dict(self.state._elf_var_to_label)
@@ -7199,6 +7239,7 @@ class PatternMatcher:
                 return True
             self.state.vars = saved_vars
             self.state.vars_undef = saved_vars_undef
+            self.state.vars_float = saved_vars_float
             self.state.vars_text = saved_vars_text
             del self.state._elf_label_refs_seen[saved_refs_len:]
             self.state._elf_var_to_label = saved_v2l
@@ -7253,6 +7294,7 @@ class PatternMatcher:
                 lt = self.remove_brackets(t, list(j))
                 saved_vars = dict(self.state.vars)
                 saved_vars_undef = dict(self.state.vars_undef)
+                saved_vars_float = dict(self.state.vars_float)
                 saved_vars_text = dict(self.state.vars_text)
                 saved_refs_len = len(self.state._elf_label_refs_seen)
                 saved_v2l      = dict(self.state._elf_var_to_label)
@@ -7262,6 +7304,7 @@ class PatternMatcher:
                     return True
                 self.state.vars = saved_vars
                 self.state.vars_undef = saved_vars_undef
+                self.state.vars_float = saved_vars_float
                 self.state.vars_text = saved_vars_text
                 del self.state._elf_label_refs_seen[saved_refs_len:]
                 self.state._elf_var_to_label = saved_v2l
@@ -13155,6 +13198,7 @@ class Assembler:
             for _row in self.state.pat_dirorder:
                 self.state.vars = {}
                 self.state.vars_undef = {}
+                self.state.vars_float = {}
                 self.state.vars_text = {}
                 _fn = _dirfn[_row]
                 if _fn is not None:
@@ -13196,6 +13240,8 @@ class Assembler:
                     self.state.vars = {}
                 if self.state.vars_undef:
                     self.state.vars_undef = {}
+                if self.state.vars_float:
+                    self.state.vars_float = {}
                 if self.state.vars_text:
                     self.state.vars_text = {}
                 _fn = _dirfn[_row]
@@ -13210,6 +13256,7 @@ class Assembler:
                 if best is None:
                     self.state.vars = {}
                     self.state.vars_undef = {}
+                    self.state.vars_float = {}
                     self.state.vars_text = {}
                     idxs, _ = self.expr_eval.expression_pat(i[3], 0)
                 break
@@ -13239,6 +13286,7 @@ class Assembler:
 
             self.state.vars = {}
             self.state.vars_undef = {}
+            self.state.vars_float = {}
             self.state.vars_text = {}
 
             self.state.error_undefined_label = False
@@ -13248,6 +13296,7 @@ class Assembler:
 
             saved_vars = dict(self.state.vars)
             saved_vars_undef = dict(self.state.vars_undef)
+            saved_vars_float = dict(self.state.vars_float)
             saved_vars_text = dict(self.state.vars_text)
             saved_refs_len = len(self.state._elf_label_refs_seen)
             saved_v2l = dict(self.state._elf_var_to_label)
@@ -13279,6 +13328,7 @@ class Assembler:
                         'pat':   i,
                         'vars':  dict(self.state.vars),
                         'vars_undef': dict(self.state.vars_undef),
+                        'vars_float': dict(self.state.vars_float),
                         'vars_text': dict(self.state.vars_text),
                         'refs':  self.state._elf_label_refs_seen[saved_refs_len:],
                         'v2l':   dict(self.state._elf_var_to_label),
@@ -13290,6 +13340,7 @@ class Assembler:
 
                 self.state.vars = saved_vars
                 self.state.vars_undef = saved_vars_undef
+                self.state.vars_float = saved_vars_float
                 self.state.vars_text = saved_vars_text
                 del self.state._elf_label_refs_seen[saved_refs_len:]
                 self.state._elf_var_to_label = saved_v2l
@@ -13316,6 +13367,7 @@ class Assembler:
             _restore_dirstate(best['dir'])
             self.state.vars = dict(best['vars'])
             self.state.vars_undef = dict(best['vars_undef'])
+            self.state.vars_float = dict(best['vars_float'])
             self.state.vars_text = dict(best['vars_text'])
             self.state._elf_label_refs_seen.extend(best['refs'])
             self.state._elf_var_to_label = dict(best['v2l'])
@@ -16424,6 +16476,7 @@ class Assembler:
 
                 _initial_vars = dict(self.state.vars)
                 _initial_vars_undef = dict(self.state.vars_undef)
+                _initial_vars_float = dict(self.state.vars_float)
 
                 for relax_iter in range(MAX_RELAX):
                     self.state._relax_optimistic = (relax_iter == 0)
@@ -16438,6 +16491,7 @@ class Assembler:
                     self.state.symbols = dict(self.state.patsymbols)
                     self.state.vars = dict(_initial_vars)
                     self.state.vars_undef = dict(_initial_vars_undef)
+                    self.state.vars_float = dict(_initial_vars_float)
                     self.state.section_ranges = []
                     self.fileassemble(args.sourcefile)
 

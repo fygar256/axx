@@ -51,14 +51,14 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all ninety-five bundled pattern/source pairs with
+exactly that: `test1` assembles all ninety-eight bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the five `.textmode` pairs and the `exprmiss.axx` pair it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` and `ministr.axx` pairs the `.echo` lines each one writes to standard
 error, and for the `regress.axx` regression test its `-V` text and its diagnostics.
 The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for two hundred and thirty-two comparisons in all.
+text output are compared too, for two hundred and thirty-five comparisons in all.
 
 **Contents**
 
@@ -553,8 +553,18 @@ code — including 4, and anything from 7 up — still raises the error and stil
 aborts the assembly, but prints an empty message. Either pick one of the five
 with text, or add your own to the `ERRORS` table in `axx.py` and `caxx.c`.
 
-`error_patterns` is evaluated in floating-point mode, so values travel as
-IEEE-754 double bit patterns. The bitwise and shift operators compensate
+Each `condition;code` pair of `error_patterns` is evaluated in integer mode
+first. Integers compare exactly, so a 64-bit range check such as
+`e>18446744073709551615;3` works as written. Only a pair that matches one of
+the following is evaluated in floating-point mode, where values travel as
+IEEE-754 double bit patterns (integers above 2**53 are rounded):
+
+- it reads a variable written in floating-point mode, such as one taken by `!F`;
+- it contains a floating-point constant such as `1.5`;
+- it contains `/` or `**`, whose results differ between the two modes
+  (`7/2>3` is true, as 3.5>3).
+
+In floating-point mode too the bitwise and shift operators compensate
 internally, so `(8>>2)>0;2` evaluates as written.
 
 **Labels whose value the linker decides, under `-o`.** Under `-o` the value of
@@ -4975,9 +4985,9 @@ The x86_64 pattern file is also maintained separately at
 
 | Pattern file | Size | `::` lines | Source | Notes |
 |---|---|---|---|---|
-| **x86_64.axx** | 4.0 MB | 23,583 | **hello.s**, **bsection.s**, **x86_64_reloc.s**, **x86_64_rex.s**, **x86_64_avx.s**, **x86_64_err.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512. From AVX on checked against llvm-mc (see the note after the table) |
-| **x86_64m.axx** | 1007 KB | 5,554 (23,583 expanded) | **hello.s**, **x86_64_reloc.s**, **x86_64_rex.s**, **x86_64_avx.s**, **x86_64_err.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo. Expands to the same rows as `x86_64.axx` |
-| **aarch64.axx** | 350 KB | 2,097 (9,387 expanded) | **aarch64.s**, **aarch64_reloc.s** | AArch64 (A64): data processing, branches, exception generation, hints, barriers, system registers and SYS aliases, loads and stores, LSE atomics, scalar floating point, Advanced SIMD (vector and scalar) including the LD1-LD4 / ST1-ST4 structure accesses, cryptography, and the scalar extensions (PAuth, MTE, MOPS, FCMA, dot product, BFloat16, matrix multiply, LS64), and the GNU-style relocation modifiers `:lo12:`, `:pg_hi21:`, `:abs_g0:`-`:abs_g3:`, `:prel_g0:`-`:prel_g3:` and `:got:` / `:got_lo12:`, which with `-o` are emitted as relocations for the linker to fill in (`R_AARCH64_ADR_PREL_PG_HI21`, `ADD_ABS_LO12_NC`, the `LDST*_ABS_LO12_NC` family, `MOVW_UABS_G*` / `MOVW_PREL_G*`, `ADR_GOT_PAGE` and `LD64_GOT_LO12_NC`) and which with `-b` axx resolves itself, reading the GOT pair as naming the slot. With `-o` it is an AArch64 object without `-m`; a branch, `adr` or literal `ldr` to a local label of the same section is resolved in place, and the data directives (`.byte` `.hword` `.word` `.quad` `.xword` ...) take ABS / PREL relocations (`aarch64_reloc.s`, checked against llvm-mc 19). Also SVE and SVE2 -- arithmetic, shifts, compares, predicates, element counts, permutes, reductions, the whole load/store family (contiguous, replicating, non-fault, first-fault, gather, scatter, prefetch), the widening and narrowing groups, complex arithmetic and the SVE2 cryptography -- SME: streaming mode, the ZA array, and the integer, floating-point and BFloat16 outer products -- and SME2: the predicate-as-counter registers, the ZT0 lookup table, the multi-vector operations on Z registers, accumulation into the ZA array, and the multi-vector loads and stores in both their consecutive and strided forms |
+| **x86_64.axx** | 4.2 MB | 23,587 | **hello.s**, **bsection.s**, **x86_64_reloc.s**, **x86_64_rex.s**, **x86_64_avx.s**, **x86_64_err.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512. From AVX on checked against llvm-mc (see the note after the table) |
+| **x86_64m.axx** | 1.0 MB | 5,555 (23,587 expanded) | **hello.s**, **x86_64_reloc.s**, **x86_64_rex.s**, **x86_64_avx.s**, **x86_64_err.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo. Expands to the same rows as `x86_64.axx` |
+| **aarch64.axx** | 352 KB | 2,097 (9,387 expanded) | **aarch64.s**, **aarch64_reloc.s**, **aarch64_edge.s**, **aarch64_err.s** | AArch64 (A64): data processing, branches, exception generation, hints, barriers, system registers and SYS aliases, loads and stores, LSE atomics, scalar floating point, Advanced SIMD (vector and scalar) including the LD1-LD4 / ST1-ST4 structure accesses, cryptography, and the scalar extensions (PAuth, MTE, MOPS, FCMA, dot product, BFloat16, matrix multiply, LS64), and the GNU-style relocation modifiers `:lo12:`, `:pg_hi21:`, `:abs_g0:`-`:abs_g3:`, `:prel_g0:`-`:prel_g3:` and `:got:` / `:got_lo12:`, which with `-o` are emitted as relocations for the linker to fill in (`R_AARCH64_ADR_PREL_PG_HI21`, `ADD_ABS_LO12_NC`, the `LDST*_ABS_LO12_NC` family, `MOVW_UABS_G*` / `MOVW_PREL_G*`, `ADR_GOT_PAGE` and `LD64_GOT_LO12_NC`) and which with `-b` axx resolves itself, reading the GOT pair as naming the slot. With `-o` it is an AArch64 object without `-m`; a branch, `adr` or literal `ldr` to a local label of the same section is resolved in place, and the data directives (`.byte` `.hword` `.word` `.quad` `.xword` ...) take ABS / PREL relocations (`aarch64_reloc.s`, checked against llvm-mc 19). Also SVE and SVE2 -- arithmetic, shifts, compares, predicates, element counts, permutes, reductions, the whole load/store family (contiguous, replicating, non-fault, first-fault, gather, scatter, prefetch), the widening and narrowing groups, complex arithmetic and the SVE2 cryptography -- SME: streaming mode, the ZA array, and the integer, floating-point and BFloat16 outer products -- and SME2: the predicate-as-counter registers, the ZT0 lookup table, the multi-vector operations on Z registers, accumulation into the ZA array, and the multi-vector loads and stores in both their consecutive and strided forms |
 | **aarch64_logical.axx** | 9.5 KB | 76 (82 expanded) | **aarch64_logical_mini_demo.s** | The macro-layer version of the same AArch64 logical (immediate) group: the rows are generated with `!def`, and the bitmask immediate is encoded in a `binary_list` expression |
 | **aarch64_logical_mini.axx** | 9.2 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 logical (immediate): AND/ORR/EOR/ANDS/TST, 32- and 64-bit. Encodes the bitmask immediate with the mini language (section 3.15) |
 | **ppc64.axx** | 2.6 KB | 51 (plus `ppc64_isa.axx`) | **ppc64_test.s**, **ppc64_reloc2.s** and others | PowerPC64 big-endian (ELFv1): sets the byte order and the ELF description (`.elftype` / `.elffield` / `.elfpcguess` / `.elfsection`), then includes `ppc64_isa.axx` |
@@ -5013,7 +5023,7 @@ The x86_64 pattern file is also maintained separately at
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | `.echo` on a body line (3.14.1); test only |
 | **ministr.axx** | 6.4 KB | 15 | **ministr.s** | Strings, arrays of strings and `.for ... in <array>` in the mini language (3.15); test only |
-| **regress.axx** | 2.1 KB | 4 | **regress.s**, **regresserr.s**, **regresscr.s** (and **regresself.s** with `z80.axx`) | Regression test for the disagreements between the two implementations found by differential fuzzing and fixed (nested `?:`, long numeric literals, pow() special cases, the macro layer's `int()`, `hex()` and format specs, the diagnostics after an error, an `.equ` of a label at the end of a section, the value of an `.equ` that contains an undefined label, the rules for white space and character constants, the byte strings of the macro layer, CR line ends, the listing of bytes that are not UTF-8, a `.org` that moves backwards under `-o`); test only |
+| **regress.axx** | 2.1 KB | 4 | **regress.s**, **regresserr.s**, **regresscr.s** (and **regresself.s** with `z80.axx`) | Regression test for the disagreements between the two implementations found by differential fuzzing and fixed (nested `?:`, long numeric literals, pow() special cases, the macro layer's `int()`, `hex()` and format specs, the diagnostics after an error, an `.equ` of a label at the end of a section, the value of an `.equ` that contains an undefined label, the rules for white space and character constants, the byte strings of the macro layer, CR line ends, the listing of bytes that are not UTF-8, a `.org` that moves backwards under `-o`, the integer evaluation of `error_patterns`); test only |
 | **elftype.axx** | 1.5 KB | 20 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
@@ -5026,7 +5036,7 @@ The x86_64 pattern file is also maintained separately at
 | **elfrel.axx** | 4.1 KB | 41 | **elfrel.s** | ARM (EM_ARM) described with `.elfbuiltin::0`, without the built-in table, and the REL instruction-field types (the shift and bias of `.elffield`; 3.7.7, 3.7.9). The instruction words and relocations match llvm-mc; test only |
 | **elfsym.axx** | 2.8 KB | 23 | **elfsym.s** | the ELF symbol attributes written from the source (`.type`, `.size`, `.weak`, `.hidden`, `.protected`, `.internal`, `.other`, `.comm`; 5.6.1), together with a field width that is not a power of two (`.elfwidth::3`) and a section element size (the fifth field of `.elfsection`; 3.7.7). The machine is EM_MN10300, which is not in the built-in table; test only |
 | **riscv64.axx** | 12 KB | 131 | **riscv64.s**, **riscv64_reloc2.s** | RV64I, the base integer instruction set (U/I/S/B/J/R formats, loads and stores, branches, jumps, `call`, `li`/`mv`/`j`/`ret`/`nop`, `ecall`/`ebreak`). No C, M, A or F/D extension, no CSR instructions, no fence group. It is also the worked example of declaring what axx has no built-in numbers for: the built-in EM_RISCV table holds only the data types, so `CALL_PLT`, `BRANCH`, `JAL`, `HI20`, `LO12_I`/`_S` and the `PCREL` pair come from `.elftype` / `.elffield` / `.reloc` (3.7.5-3.7.7). It links with `ld -m elf64lriscv` and runs |
-| **riscv64full.axx** | 78 KB | 2,225 (4,137 expanded) | **riscv64full.s**, **riscv64full_reloc.s**, **riscv64full_reloc2.s** | RISC-V RV64 in full: I, M, A (with Zabha, Zacas, Zawrs), F, D, Q, Zfh, Zfa, C (Zca, Zcd, Zcb, Zcmp, Zcmt, Zcmop), Zba / Zbb / Zbc / Zbs, Zbkb / Zbkc / Zbkx, Zknd / Zkne / Zknh / Zksed / Zksh, Zicond, Zicbom / Zicboz / Zicbop, Zihintntl, Zimop, Zicfiss / Zicfilp, Zicsr with the CSR names, the privileged and H instructions, and V 1.0 with Zvbb, Zvbc, Zvkg, Zvkned, Zvknh, Zvksed, Zvksh and the bf16 parts; the GNU pseudo-instructions (`li` of any 64-bit constant, `call`, `tail`, `la`, the global loads and stores ...); optional rounding modes and `v0.t` masks. A superset of `riscv64.axx` that declares the RISC-V psABI relocations the instructions carry. Checked against llvm-mc 18 byte for byte, its `-o` relocations and linked images against LLVM's; the part of the ISA that LLVM 18 does not have (Q, Zabha, `vwsll`, `mnret`, `c.ntl.*`, `c.sspush`) is from the specifications. `riscv64full.s` exercises the rows; `riscv64full_reloc.s` and `riscv64full_reloc2.s` (`la` / `lla` and the global loads and stores, PC-relative data and label differences, checked against llvm-mc 19) are for `-o` |
+| **riscv64full.axx** | 78 KB | 2,225 (4,137 expanded) | **riscv64full.s**, **riscv64full_reloc.s**, **riscv64full_reloc2.s**, **riscv64full_edge.s** | RISC-V RV64 in full: I, M, A (with Zabha, Zacas, Zawrs), F, D, Q, Zfh, Zfa, C (Zca, Zcd, Zcb, Zcmp, Zcmt, Zcmop), Zba / Zbb / Zbc / Zbs, Zbkb / Zbkc / Zbkx, Zknd / Zkne / Zknh / Zksed / Zksh, Zicond, Zicbom / Zicboz / Zicbop, Zihintntl, Zimop, Zicfiss / Zicfilp, Zicsr with the CSR names, the privileged and H instructions, and V 1.0 with Zvbb, Zvbc, Zvkg, Zvkned, Zvknh, Zvksed, Zvksh and the bf16 parts; the GNU pseudo-instructions (`li` of any 64-bit constant, `call`, `tail`, `la`, the global loads and stores ...); optional rounding modes and `v0.t` masks. A superset of `riscv64.axx` that declares the RISC-V psABI relocations the instructions carry. Checked against llvm-mc 18 byte for byte, its `-o` relocations and linked images against LLVM's; the part of the ISA that LLVM 18 does not have (Q, Zabha, `vwsll`, `mnret`, `c.ntl.*`, `c.sspush`) is from the specifications. `riscv64full.s` exercises the rows; `riscv64full_reloc.s` and `riscv64full_reloc2.s` (`la` / `lla` and the global loads and stores, PC-relative data and label differences, checked against llvm-mc 19) are for `-o` |
 | **endsub.axx** | 1.2 KB | 20 | **endsub.s** | closing a `.sub` block with `.endsub` (3.7.2); test only |
 | **intel2att.axx** | 12 KB | 60 (3,437 expanded) | **intel2att.s** | x86-64 Intel to AT&T source translator; `.textmode`, `!Y`, `!L` and macro-layer pattern generation (3.18). The translated text assembles with GNU as |
 | **a64tox64_axx.axx** | 32 KB | 152 (1,903 expanded) | **bf_aarch64.s** | AArch64 to x86_64 source translator whose output `x86_64.axx` assembles; uses the runtimes `a64rt_axx.s` (Linux) and `a64rt_axx_freebsd.s` (FreeBSD) and the declaration file `a64ext.s` (3.18) |
@@ -5108,7 +5118,7 @@ drops the label references it read, so for a symbol only the bytes of the
 immediate field read the label, and the relocation lands on that field). The three-operand `IMUL` with an
 immediate and `MOV` with `[RIP+...]` have their 32 / 16 / 8-bit forms too.
 
-`test1` runs all ninety-five pairs through both implementations and
+`test1` runs all ninety-eight pairs through both implementations and
 compares the `-b` raw binaries. For the five pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`),
 and for `exprmiss.axx`, which looks at lines let through by `.passthru`, it also compares the translated text each
@@ -5180,12 +5190,17 @@ diagnostics when unreadable values are dropped and their labels stay undefined.
 The `listinc.s` pair compares the `-v` listing, where the line of an `.include`
 and the lines of the included file come out one per line, and the `-o` object,
 whose implicit `.text` reaches the `.org` at the end.
+The `aarch64_edge.s` and `riscv64full_edge.s` pairs compare the `-b` image of
+lines at the edges of the ranges, checked against llvm-mc 19, that must assemble
+(the SVE `dup` / `mov` / `mul` / `smax` immediates, `c.lui` with -32 / 0xfffe0 and
+so on), and the `aarch64_err.s` pair the diagnostics of PC-relative targets that
+are not a multiple of 4, `adrp` out of range and SVE signed bytes out of range.
 
 The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (the ELF of the pattern's machine; x86-64 ELF64 when it has no `.elfmachine`), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for two hundred and thirty-two comparisons in all.
+never compares, for two hundred and thirty-five comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -5218,7 +5233,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all ninety-five bundled pattern/source pairs with both
+`test1` assembles all ninety-eight bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 five `.textmode` pairs, the `.echo` lines of the `echo.axx` and `ministr.axx` pairs,
 and the `-V` text and diagnostics of the `regress.axx` regression test.

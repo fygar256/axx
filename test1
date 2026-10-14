@@ -155,6 +155,11 @@ caxx $P/z80.axx $S/import_test_err.s -i $S/import_test_err.tsv -b b193 2>&1 | gr
 # -o の .text が末尾の .org まで届くこと。
 caxx $P/z80.axx $S/listinc.s -v > b194
 caxx $P/z80.axx $S/listinc.s -o b195
+# AArch64 / RISC-V の範囲の境目（llvm-mc 19 と照合）: 4 の倍数でない PC 相対と ADRP の範囲、
+# SVE の DUP / MOV / MUL / SMAX の即値、c.lui の -32 / 0xfffe0。
+caxx $P/aarch64.axx $S/aarch64_edge.s -b b196
+caxx $P/aarch64.axx $S/aarch64_err.s -b b197 2>&1 | grep -v '^raw: wrote ' > b197e
+caxx $P/riscv64full.axx $S/riscv64full_edge.s -b b198
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -362,6 +367,9 @@ paxx $P/z80.axx $S/import_test.s -i $S/import_test.tsv -b a192
 paxx $P/z80.axx $S/import_test_err.s -i $S/import_test_err.tsv -b a193 2>&1 | grep -v '^raw: wrote ' > a193e
 paxx $P/z80.axx $S/listinc.s -v > a194
 paxx $P/z80.axx $S/listinc.s -o a195
+paxx $P/aarch64.axx $S/aarch64_edge.s -b a196
+paxx $P/aarch64.axx $S/aarch64_err.s -b a197 2>&1 | grep -v '^raw: wrote ' > a197e
+paxx $P/riscv64full.axx $S/riscv64full_edge.s -b a198
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -528,6 +536,9 @@ check a192 b192
 check a193e b193e
 check a194 b194
 check a195 b195
+check a196 b196
+check a197e b197e
+check a198 b198
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

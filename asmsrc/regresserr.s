@@ -24,3 +24,10 @@ e 'é'
 e 1/0+1/0
 e nosuch2+nosuch2
  .include "regress_no_such_file.s"
+; error_patterns の整数モード: 64 ビットを 1 だけ外れた値、ちょうど 0xffffffffffffffff、
+; 浮動小数点モードの割り算（7/2 = 3.5 > 3）、条件の := の値
+C64 18446744073709551616
+C64 -9223372036854775809
+CX 0xffffffffffffffff
+CD 7
+CA 60

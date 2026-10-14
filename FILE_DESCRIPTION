@@ -80,6 +80,14 @@ aarch64_reloc.s                     relocations of aarch64.axx for -o: every
                                     local label resolved in place (.elfresolve,
                                     .elfencode), and data (ABS*, PREL*),
                                     checked against llvm-mc 19 and ld.lld 19
+aarch64_edge.s                      lines aarch64.axx must assemble at the edges
+                                    of the ranges (checked against llvm-mc 19):
+                                    SVE dup/mov/mul/smax immediates, branch and
+                                    adrp limits; test1 compares the -b image
+aarch64_err.s                       lines aarch64.axx must refuse: PC-relative
+                                    targets not a multiple of 4, adrp out of
+                                    range, SVE signed bytes out of range;
+                                    test1 compares the diagnostics
 aarch64_logical.axx                 pattern file for the AArch64 logical (immediate)
                                     group, AND/ORR/EOR/ANDS/TST, 32 and 64 bit.
                                     the macro-layer version: the rows are
@@ -329,6 +337,10 @@ riscv64full_reloc2.s                the relocations riscv64full_reloc.s does
                                     against a local symbol on the auipc, the
                                     pair fields of .reloc), label-$$ data and
                                     label differences, checked against llvm-mc
+riscv64full_edge.s                  lines riscv64full.axx must assemble at the
+                                    edges of the ranges (checked against
+                                    llvm-mc 19), c.lui -32 / 0xfffe0 among them;
+                                    test1 compares the -b image
 bf_riscv64.s                        brainfuck interpreter written in RISC-V
                                     assembly (axx syntax), a port of
                                     bf_aarch64.s. assembles with
