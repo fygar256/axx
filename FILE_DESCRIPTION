@@ -611,6 +611,18 @@ z80.s                               test assemble file for Z80
 z80_err.s                           lines z80.axx must refuse: immediates,
                                     addresses and displacements out of range;
                                     test1 compares the diagnostics
+import_test.s                       -i of z80.axx with import_test.tsv: values with
+                                    a sign, 0x, spaces, wider than 64 bits;
+                                    test1 compares the -b image
+import_test.tsv                     the import file of import_test.s
+import_test_err.s                   -i of z80.axx with import_test_err.tsv: lines
+                                    whose value cannot be read are dropped;
+                                    test1 compares the diagnostics
+import_test_err.tsv                 the import file of import_test_err.s
+listinc.s                           z80.axx: the -v listing of an .include and
+                                    the implicit .text of -o reaching the
+                                    final .org; test1 compares both
+listinc_inc.s                       the file listinc.s includes
 vliw.axx                            test pattern file for vliw
 vliw.s                              test assembly file for vliw
 x86_64.axx                          pattern file for x86_64-v3 (includes segment addressing, AVX/AVX2, BMI1/BMI2, x87 and EVEX/AVX-512);

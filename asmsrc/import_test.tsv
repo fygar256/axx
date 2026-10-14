@@ -1,0 +1,9 @@
+.text	0	10
+.data	0x10	0x10
+neg	-0x5
+neg2	-1
+lab	4
+dat	0x12
+sp1	 7 
+big	0x123456789abcdef01
+upper	0X1F

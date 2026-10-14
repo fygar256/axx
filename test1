@@ -148,6 +148,13 @@ caxx $P/6809.axx $S/6809_edge.s -b b188
 caxx $P/8048.axx $S/8048_edge.s -b b189
 caxx $P/4004.axx $S/4004_edge.s -b b190
 caxx $P/4004.axx $S/4004_err.s -b b191 2>&1 | grep -v '^raw: wrote ' > b191e
+# -i のインポートファイルの値（符号・0x・前後の空白・64 ビット超え、読めない値は行ごと捨てる）。
+caxx $P/z80.axx $S/import_test.s -i $S/import_test.tsv -b b192
+caxx $P/z80.axx $S/import_test_err.s -i $S/import_test_err.tsv -b b193 2>&1 | grep -v '^raw: wrote ' > b193e
+# -v の一覧で .include の行と include 先の行が分かれること、.section を書かないときの
+# -o の .text が末尾の .org まで届くこと。
+caxx $P/z80.axx $S/listinc.s -v > b194
+caxx $P/z80.axx $S/listinc.s -o b195
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -351,6 +358,10 @@ paxx $P/6809.axx $S/6809_edge.s -b a188
 paxx $P/8048.axx $S/8048_edge.s -b a189
 paxx $P/4004.axx $S/4004_edge.s -b a190
 paxx $P/4004.axx $S/4004_err.s -b a191 2>&1 | grep -v '^raw: wrote ' > a191e
+paxx $P/z80.axx $S/import_test.s -i $S/import_test.tsv -b a192
+paxx $P/z80.axx $S/import_test_err.s -i $S/import_test_err.tsv -b a193 2>&1 | grep -v '^raw: wrote ' > a193e
+paxx $P/z80.axx $S/listinc.s -v > a194
+paxx $P/z80.axx $S/listinc.s -o a195
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -513,6 +524,10 @@ check a188 b188
 check a189 b189
 check a190 b190
 check a191e b191e
+check a192 b192
+check a193e b193e
+check a194 b194
+check a195 b195
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

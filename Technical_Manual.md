@@ -51,14 +51,14 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all ninety-two bundled pattern/source pairs with
+exactly that: `test1` assembles all ninety-five bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the five `.textmode` pairs and the `exprmiss.axx` pair it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` and `ministr.axx` pairs the `.echo` lines each one writes to standard
 error, and for the `regress.axx` regression test its `-V` text and its diagnostics.
 The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for two hundred and twenty-eight comparisons in all.
+text output are compared too, for two hundred and thirty-two comparisons in all.
 
 **Contents**
 
@@ -3883,6 +3883,11 @@ written before. In an ELF object (`-o`) and in the export with sections (`-E`),
 a `.org` that moves backwards is an error (as in GNU as): each section is held
 as ranges from where it was entered to where it was left, and moving backwards
 would make a range negative or let what was written fall outside it.
+A range ends at the location counter where the section was left, so what a
+`.org` at the end of a section skips is part of the section, and a label after it
+points at the very end of the section. The same holds for a source that never
+writes `.section` (the implicit `.text`): `.text` runs from 0 to the last location
+counter.
 
 When the argument of `.org`, `.align`, `.zero`, `.resb` and the like contains an
 undefined label (including the value of an `.equ` that contains one), the line
@@ -4601,13 +4606,17 @@ len	0xd
 ### 8.3 Import (`-i`)
 
 The import file uses the same two record shapes and may mix them.
-**Values are read as hexadecimal, without a `0x` prefix** — this differs from
-the export format.
+**Values are read as hexadecimal.** A `0x` prefix, a sign (`+` / `-`) and spaces
+around the value are optional; the digits are `0-9`, `a-f` and `A-F` only (no
+underscores, no full-width digits). The magnitude must be below `2**192`
+(section 6.4). A file written by `-e` / `-E` (with values such as `-0x5` or wider
+than 64 bits) therefore reads back as it is. A line whose value cannot be read is
+silently dropped.
 
 - A three-field line declares the address range of a section.
 - A two-field line defines an imported label. Its section is inferred by
-  finding which declared range the address falls into; if none matches, `.text`
-  is assumed.
+  finding which declared range the address falls into, trying the range lines in
+  the order the file gives them; if none matches, `.text` is assumed.
 
 A relocation type can be attached to an imported label with `::`:
 
@@ -4988,7 +4997,7 @@ The x86_64 pattern file is also maintained separately at
 | **68000.axx** | 59 KB | 457 | **68000.s**, **68000_reloc.s**, **68000_err.s** | Motorola 68000. `-o` writes ELF32 M68K (RELA) without `-m`. An `.extern` with no type is `R_68K_32`; 16 / 8 bit PC relative references within the section are resolved by axx |
 | **6800.axx** | 20 KB | 271 | **6800.s**, **6800_edge.s**, **6800_err.s** | Motorola 6800 |
 | **6502.axx** | 15 KB | 202 | **6502.s**, **6502_edge.s**, **6502_err.s** | MOS 6502 |
-| **z80.axx** | 8.8 KB | 283 | **z80.s**, **z80_err.s** | Zilog Z80 |
+| **z80.axx** | 8.8 KB | 283 | **z80.s**, **z80_err.s**, **import_test.s**, **import_test_err.s**, **listinc.s** | Zilog Z80 |
 | **8051.axx** | 9.1 KB | 111 | **8051.s**, **8051_err.s** | Intel 8051 |
 | **8080.axx** | 6.4 KB | 113 | **8080.s**, **8080_err.s** | Intel 8080 |
 | **8048.axx** | 6.5 KB | 95 | **8048.s**, **8048_edge.s**, **8048_err.s** | Intel 8048 |
@@ -5099,7 +5108,7 @@ drops the label references it read, so for a symbol only the bytes of the
 immediate field read the label, and the relocation lands on that field). The three-operand `IMUL` with an
 immediate and `MOV` with `[RIP+...]` have their 32 / 16 / 8-bit forms too.
 
-`test1` runs all ninety-two pairs through both implementations and
+`test1` runs all ninety-five pairs through both implementations and
 compares the `-b` raw binaries. For the five pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`),
 and for `exprmiss.axx`, which looks at lines let through by `.passthru`, it also compares the translated text each
@@ -5164,12 +5173,19 @@ negative addresses (16-bit two's complement), the lower limit of immediates
 (-0x80 / -0x8000), the `<` / `>` forced forms, and the page of the conditional
 jumps of the 8048 and the 4004 (the 8048 jumps within the page of its second
 byte, `$$+1`; the 4004 within the page of the next instruction, `$$+2`).
+The `import_test.s` pair (with `-i import_test.tsv`) compares the `-b` image of
+how `-i` reads its values (a sign, `0x`, spaces around the value, values wider than
+64 bits), and the `import_test_err.s` pair (with `-i import_test_err.tsv`) the
+diagnostics when unreadable values are dropped and their labels stay undefined.
+The `listinc.s` pair compares the `-v` listing, where the line of an `.include`
+and the lines of the included file come out one per line, and the `-o` object,
+whose implicit `.text` reaches the `.org` at the end.
 
 The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (the ELF of the pattern's machine; x86-64 ELF64 when it has no `.elfmachine`), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for two hundred and twenty-eight comparisons in all.
+never compares, for two hundred and thirty-two comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -5202,7 +5218,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all ninety-two bundled pattern/source pairs with both
+`test1` assembles all ninety-five bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 five `.textmode` pairs, the `.echo` lines of the `echo.axx` and `ministr.axx` pairs,
 and the `-V` text and diagnostics of the `regress.axx` regression test.

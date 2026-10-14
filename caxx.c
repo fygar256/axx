@@ -2536,6 +2536,8 @@ typedef struct {
     /* いまのソース行で出した、場所付きの診断の文面（diag_print を参照） */
     char     **diag_seen;
     int        diag_seen_len, diag_seen_cap;
+    /* -v の一覧で、行頭を出したがまだ改行していない行があるか（lineassemble0） */
+    int        listing_open;
 } AsmState;
 
 /* いま診断を出してよいパスか。パス2と対話モードだけ真。パス1は推定値で
@@ -5116,7 +5118,10 @@ static uint256_t label_get_value(AsmState *st, const char *k){
     }
     st->error_undefined_label = 1;
     if(st->pass1_size_mode) return u256_zero();
-    if(!st->in_match_attempt && should_report_errors(st)){
+    /* 照合の試行中でも出す（axx_diagf が溜めて、採った試行の分だけ流す）。
+       以前は試行中は出さなかったので、命令のオペランドの未定義ラベルは名前が
+       一度も示されなかった。axx.py の get_value() と同じ。 */
+    if(should_report_errors(st)){
         axx_diagf(1, 0, " error - Label undefined: '%s'  [%s:%d]\n",
                    k, st->current_file, (int)st->ln);
     }
@@ -17427,8 +17432,13 @@ static int lineassemble0(Assembler *asmb, const char *line){
 
     int show = (st->pas==0) || ((st->pas==2) && st->verbose);
     if(show){
+        /* 外側の行（.include）の一覧がまだ閉じていなければ、ここで改行して
+           閉じる。include 先の 1 行目が .include の行に続いて出ていた。
+           axx.py の lineassemble0() の _listing_open と同じ。 */
+        if(st->listing_open) printf("\n");
         printf("%016llx %s %d %s //",(unsigned long long)u256_to_u64(st->pc),
                st->current_file, st->ln, cleaned);
+        st->listing_open = 1;
     }
     free(st->asmtext); st->asmtext=NULL;
     free(st->asmtext_disp); st->asmtext_disp=NULL;
@@ -17439,7 +17449,8 @@ static int lineassemble0(Assembler *asmb, const char *line){
     }
     free(st->asmtext); st->asmtext=NULL;
     free(st->asmtext_disp); st->asmtext_disp=NULL;
-    if(show) printf("\n");
+    if(show && st->listing_open) printf("\n");
+    if(show) st->listing_open = 0;
     free(cleaned);
     st->ln++;
     return f;
@@ -18260,6 +18271,12 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         for(BufEntry*be=st->buf.buckets[i];be;be=be->next)
             if(!have_w||be->pos>max_w){max_w=be->pos;have_w=1;}
 
+    /* .section を使わないとき、暗黙の .text は語 0 から最後の位置カウンタまで。
+       末尾の .org で進めた分（その後ろのラベルが指す所）も入れる。明示の
+       .section .text なら範囲が pc で閉じるのと同じ大きさになる。axx.py の
+       write_elf_obj() の _end_w と同じ。 */
+    uint256_t _end_w = u256_is_neg256(st->pc) ? u256_zero() : st->pc;
+
     /* 中身の大きさに -b と同じ上限を置く。`.org` の誤りで巨大なファイルを
        書き始めないため。axx.py の write_elf_obj() と同じ数え方である。 */
     {
@@ -18267,6 +18284,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
         if(st->sections.count==0){
             if(st->pc_overflow_set) _tw = u256_add(st->pc_overflow_max, u256_from_u64(1));
             else if(have_w) _tw = u256_add(u256_from_u64(max_w), u256_from_u64(1));
+            if(u256_gt_signed(_end_w, _tw)) _tw = _end_w;
         } else {
             for(int i=0;i<st->sections.count;i++){
                 SecEntry *se=st->sections.order[i];
@@ -18295,6 +18313,7 @@ static void write_elf_obj(AsmState *st, const char *path, int machine){
     if(st->sections.count==0){
         ncs=1; csecs=calloc(1,sizeof(WCS));
         uint64_t wn=have_w?max_w+1:0;
+        if(u256_to_u64(_end_w) > wn) wn = u256_to_u64(_end_w);   /* 上限は上で検査済み */
         uint64_t _fl0; uint32_t _sht0; int _as0; uint32_t _al0; uint32_t _es0;
         elf_section_attrs(st, ".text", &_fl0, &_sht0, &_as0, &_al0, &_es0);
         csecs[0]=(WCS){".text",0,wn*(uint64_t)bpw,_fl0,weo_extract(st,bpw,0,wn),
@@ -22206,20 +22225,42 @@ static void setpatsymbols(Assembler *asmb){
     smap_free(&fresh);
 }
 
-/* インポートファイルの 16 進欄を最後まで読めたか。 */
-static int hexfield_fully_consumed(const char *endp){
-    while(*endp==' '||*endp=='\t') endp++;
-    return *endp=='\0';
+/* インポートファイルの値の欄を読む。読めれば 1 を返して *out に入れる。
+   前後の空白・タブ、符号、`0x` の接頭辞は任意で、数字は 16 進の 0-9 a-f A-F
+   だけ。絶対値は 2**192 未満（両実装の値がそろう範囲。6.4 節）。-e / -E が書く
+   `-0x5` や 64 ビットを超える値もそのまま読み戻せる（strtoull では負と
+   64 ビット超えが読めなかった）。
+   axx.py の Assembler._imp_hex() と同じ規則である。 */
+static int imp_parse_hex(const char *s, uint256_t *out){
+    while(*s == ' ' || *s == '\t') s++;
+    int neg = 0;
+    if(*s == '+' || *s == '-'){ neg = (*s == '-'); s++; }
+    if(s[0] == '0' && (s[1] == 'x' || s[1] == 'X') && isxdigit((unsigned char)s[2])) s += 2;
+    if(!isxdigit((unsigned char)*s)) return 0;
+    while(*s == '0' && isxdigit((unsigned char)s[1])) s++;    /* 先頭の 0 */
+    uint256_t v = u256_zero();
+    int nd = 0;
+    for(; isxdigit((unsigned char)*s); s++){
+        int d = isdigit((unsigned char)*s) ? *s - '0' : (tolower((unsigned char)*s) - 'a' + 10);
+        if(++nd > 64) return 0;
+        v = u256_add(u256_shl(v, 4), u256_from_u64((uint64_t)d));
+    }
+    while(*s == ' ' || *s == '\t') s++;
+    if(*s) return 0;
+    if(v.w[3]) return 0;                           /* 2**192 以上 */
+    *out = neg ? u256_neg(v) : v;
+    return 1;
 }
 
 /* インポートファイルの 1 行からラベルを取り込む。 */
 static int imp_label(Assembler *asmb, const char *l){
 
-    char buf[4096];
-    strncpy(buf, l, sizeof(buf)-1); buf[sizeof(buf)-1] = '\0';
+    char *buf = strdup(l);
+    if(!buf){ perror("strdup"); exit(1); }
+    int ret = 0;
     int blen = (int)strlen(buf);
     while(blen > 0 && (buf[blen-1]=='\n'||buf[blen-1]=='\r')) buf[--blen] = '\0';
-    if(!buf[0]) return 0;
+    if(!buf[0]) goto out;
 
     char *fields[5]; int nfields = 0;
     char *p = buf;
@@ -22233,21 +22274,17 @@ static int imp_label(Assembler *asmb, const char *l){
 
     if(nfields >= 3){
         const char *sname = fields[0];
-        char *endp;
-        uint64_t start = strtoull(fields[1], &endp, 16);
-        if(endp == fields[1] || !hexfield_fully_consumed(endp)) return 0;
-        uint64_t size  = strtoull(fields[2], &endp, 16);
-        if(endp == fields[2] || !hexfield_fully_consumed(endp)) return 0;
-        secrangevec_push(&asmb->imp_sections, sname,
-                          u256_from_u64(start), u256_from_u64(size));
-        return 1;
+        uint256_t start, size;
+        if(!imp_parse_hex(fields[1], &start) || !imp_parse_hex(fields[2], &size)) goto out;
+        secrangevec_push(&asmb->imp_sections, sname, start, size);
+        ret = 1; goto out;
     }
 
     if(nfields == 2){
         char *labelbuf = strdup(fields[0]);
         if(!labelbuf){ perror("strdup"); exit(1); }
         const char *label = labelbuf;
-        if(!label[0]){ free(labelbuf); return 0; }
+        if(!label[0]){ free(labelbuf); goto out; }
         int reloc_type = -1;
         char *sep = strstr(labelbuf, "::");
         if(sep){
@@ -22258,29 +22295,34 @@ static int imp_label(Assembler *asmb, const char *l){
                 axx_diagf(0, 0, " warning - unknown reloc type '%s' for imported label '%s'\n",
                            rt_str, label);
         }
-        if(!label[0]){ free(labelbuf); return 0; }
-        char *endp;
-        uint64_t v = strtoull(fields[1], &endp, 16);
-        if(endp == fields[1] || !hexfield_fully_consumed(endp)){ free(labelbuf); return 0; }
+        if(!label[0]){ free(labelbuf); goto out; }
+        uint256_t v;
+        if(!imp_parse_hex(fields[1], &v)){ free(labelbuf); goto out; }
 
+        /* セクションの行はファイルに書かれた順に見る。s0 <= v < s0+sz は
+           v - s0 を差（v >= s0 なら 256 ビットで正確）で比べ、和のあふれを避ける */
         const char *section = ".text";
         for(int i = 0; i < asmb->imp_sections.len; i++){
             SecRange *se = &asmb->imp_sections.data[i];
-            uint64_t s0 = u256_to_u64(se->start);
-            uint64_t sz = u256_to_u64(se->len);
-            if(sz > 0 && v >= s0 && v < s0 + sz){ section = se->name; break; }
-            if(sz == 0 && v == s0)               { section = se->name; break; }
+            uint256_t s0 = se->start, sz = se->len;
+            if(u256_gt_signed(sz, u256_zero()) && u256_ge_signed(v, s0)){
+                uint256_t d = u256_sub(v, s0);
+                if(u256_lt_signed(d, sz) && !(d.w[3] >> 63)){ section = se->name; break; }
+            }
+            if(u256_is_zero(sz) && u256_eq(v, s0)){ section = se->name; break; }
         }
         {
             int _bpw = (asmb->st.bts+7)/8; if(_bpw<1) _bpw=1;
-            v /= (uint64_t)_bpw;
+            v = u256_floordiv(v, u256_from_u64((uint64_t)_bpw));
         }
-        lmap_set_imported(&asmb->st.labels, label, u256_from_u64(v), section, reloc_type);
+        lmap_set_imported(&asmb->st.labels, label, v, section, reloc_type);
         free(labelbuf);
-        return 1;
+        ret = 1; goto out;
     }
 
-    return 0;
+out:
+    free(buf);
+    return ret;
 }
 
 /* 使い方を出す。引数なしで実行したときと、コマンド行の誤りのときに出る。 */
@@ -22848,6 +22890,12 @@ int main(int argc, char *argv[]){
                 if(st->reported_label_errors.len > 0)
                     fprintf(stderr,"         This is a consequence of the label definition "
                         "error(s) reported above; fix those first.\n");
+                else if(st->had_error)
+                    /* 誤りのある行は pass2 で何も出さないので、その後ろの番地がずれる。
+                       リラクゼーションのせいではない。axx.py と同じ文面。 */
+                    fprintf(stderr,"         This is a consequence of the error(s) reported above "
+                        "(a line in error emits nothing, so the addresses after it "
+                        "move); fix those first.\n");
                 else
                     fprintf(stderr,"         This usually means pass1 relaxation did "
                         "not fully converge for variable-length forward references.\n");

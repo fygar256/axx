@@ -1936,6 +1936,8 @@ class AssemblerState:
         self._diag_pending = None
         # いまのソース行で出した、場所付きの診断の文面（_diag_print を参照）。
         self._diag_line_seen = set()
+        # -v の一覧で、行頭を出したがまだ改行していない行があるか（lineassemble0）。
+        self._listing_open = False
 
         self.outfile = ""
         self.expfile = ""
@@ -3396,8 +3398,8 @@ class LabelManager:
           - パス1の最初の反復なら現在の PC（楽観的に短い符号化から試す）、
           - 長さだけ見ている区間なら 0、
           - それ以外は UNDEF。
-        診断を出すのは、照合の試行中ではなく、かつ報告してよいパスのときだけ。
-        照合は失敗する試行を何度も通るので、そこで出すと嘘の診断が溢れる。
+        診断を出すのは報告してよいパスのときだけ。照合の試行中の診断は diag が
+        溜め、採った試行の分だけを流すので、失敗する試行の分は出ない。
 
         `-o` の追跡中は、この参照がどの変数・どの出力ワードから来たかを
         ElfState に積む。あとでリロケーションの型と位置を決めるのに使う。
@@ -3416,7 +3418,10 @@ class LabelManager:
                 return 0
             v = UNDEF
             self.state.error_undefined_label = True
-            if not self.state._in_match_attempt and (self.state.should_report_errors()):
+            # 照合の試行中でも出す（diag が溜めて、採った試行の分だけ流す）。
+            # 以前は試行中は出さなかったので、命令のオペランドの未定義ラベルは
+            # 名前が一度も示されなかった。caxx.c の label_get_value() と同じ。
+            if self.state.should_report_errors():
                 _fn = self.state.current_file or ""
                 _ln = self.state.ln
                 self.state.diag(f" error - Label undefined: '{k}'"
@@ -12971,7 +12976,7 @@ class Assembler:
         self.asm_directive_proc = AssemblyDirectiveProcessor(self.state, self.expr_eval,
                                                              self.binary_writer, self.label_manager, self.parser)
         self.macro_proc = MacroPreprocessor(self.state)
-        self._imp_sections: dict = {}
+        self._imp_sections: list = []      # (名前, 開始, 大きさ) をファイルの順に
 
     def include_asm(self, l1, l2):
         """ソース側の `.include` を処理する。"""
@@ -14021,9 +14026,15 @@ class Assembler:
         cleaned = line.replace('\n', '').replace('\r', '')
         _show = (self.state.pas == 2 and self.state.verbose) or self.state.pas == 0
         if _show:
+            # 外側の行（.include）の一覧がまだ閉じていなければ、ここで改行して
+            # 閉じる。include 先の 1 行目が .include の行に続いて出ていた。
+            # caxx.c の lineassemble0() の listing_open と同じ。
+            if self.state._listing_open:
+                print("")
             self.state.cl = cleaned
             print("%016x " % self.state.pc, end='')
             print(f"{self.state.current_file} {self.state.ln} {self.state.cl} //", end='')
+            self.state._listing_open = True
         self.state.asmtext = None
         self.state.asmtext_disp = None
         f = self.lineassemble(cleaned)
@@ -14034,8 +14045,10 @@ class Assembler:
                 print(self.state.asmtext)
         self.state.asmtext = None
         self.state.asmtext_disp = None
-        if _show:
+        if _show and self.state._listing_open:
             print("")
+        if _show:
+            self.state._listing_open = False
         self.state.ln += 1
         return f
 
@@ -14392,6 +14405,25 @@ class Assembler:
             af += line.replace('\r', '')
         return af
 
+    _IMP_HEX_RE = re.compile(r'[ \t]*([+-]?)(?:0[xX])?([0-9A-Fa-f]+)[ \t]*\Z')
+
+    @classmethod
+    def _imp_hex(cls, s):
+        """インポートファイルの値の欄を読む。読めなければ None。
+
+        前後の空白・タブ、符号、`0x` の接頭辞は任意で、数字は 16 進の
+        0-9 a-f A-F だけ。絶対値は 2**192 未満（両実装の値がそろう範囲。6.4 節）。
+        -e / -E が書く `-0x5` や 64 ビットを超える値もそのまま読み戻せる。int() に任せると `1_0` や全角数字まで
+        読めてしまっていた。caxx.c の imp_parse_hex() と同じ規則である。
+        """
+        m = cls._IMP_HEX_RE.match(s)
+        if not m:
+            return None
+        v = int(m.group(2), 16)
+        if v >= 1 << 192:
+            return None
+        return -v if m.group(1) == '-' else v
+
     def imp_label(self, l):
         """`-i` のインポートファイルの 1 行からラベルを取り込む。"""
         l = l.rstrip('\r\n')
@@ -14402,13 +14434,12 @@ class Assembler:
 
         if len(fields) >= 3:
             sname = fields[0]
-            try:
-                start = int(fields[1], 16)
-                size  = int(fields[2], 16)
-            except ValueError:
+            start = self._imp_hex(fields[1])
+            size  = self._imp_hex(fields[2])
+            if start is None or size is None:
                 return False
 
-            self._imp_sections.setdefault(sname, []).append((start, size))
+            self._imp_sections.append((sname, start, size))
             return True
 
         if len(fields) == 2:
@@ -14425,24 +14456,18 @@ class Assembler:
                     self.state.diag(f" warning - unknown reloc type '{rt_str}' for imported label '{label}'", set_error=False)
             if not label:
                 return False
-            try:
-                v = int(fields[1], 16)
-            except ValueError:
+            v = self._imp_hex(fields[1])
+            if v is None:
                 return False
             section = '.text'
 
-            _found = False
-            for sname, _ranges in self._imp_sections.items():
-                for (start, size) in _ranges:
-                    if size > 0 and start <= v < start + size:
-                        section = sname
-                        _found = True
-                        break
-                    if size == 0 and v == start:
-                        section = sname
-                        _found = True
-                        break
-                if _found:
+            # セクションの行はファイルに書かれた順に見る（caxx.c と同じ）
+            for sname, start, size in self._imp_sections:
+                if size > 0 and start <= v < start + size:
+                    section = sname
+                    break
+                if size == 0 and v == start:
+                    section = sname
                     break
 
             bpw = max(1, (self.state.bts + 7) // 8)
@@ -15170,11 +15195,16 @@ class Assembler:
         # 中身の大きさに -b と同じ上限を置く。`.org` の誤りで巨大なファイルを
         # 書き始めないため。caxx.c の write_elf_obj() と同じ数え方である。
         _MAX_OUTPUT_BYTES = 1 << 30
+        # .section を使わないとき、暗黙の .text は語 0 から最後の位置カウンタまで。
+        # 末尾の .org で進めた分（その後ろのラベルが指す所）も入れる。明示の
+        # .section .text なら範囲が pc で閉じるのと同じ大きさになる。caxx.c の
+        # write_elf_obj() の _end_w と同じ。
+        _end_w = self.state.pc if isinstance(self.state.pc, int) and self.state.pc > 0 else 0
         if self.state.sections:
             _tot_w = sum(rl for _sn in self.state.sections
                          for _rs, rl in self._section_word_ranges(_sn))
         else:
-            _tot_w = max(buf.keys(), default=-1) + 1
+            _tot_w = max(max(buf.keys(), default=-1) + 1, _end_w)
         if _tot_w * bpw > _MAX_OUTPUT_BYTES:
             self.state.diag(f" error - output size {_tot_w * bpw} bytes exceeds maximum "
                             f"{_MAX_OUTPUT_BYTES}. Check for incorrect .ORG or address "
@@ -15185,7 +15215,7 @@ class Assembler:
         max_w = max(buf.keys(), default=-1)
 
         if not self.state.sections:
-            w_count = max_w + 1 if max_w >= 0 else 0
+            w_count = max(max_w + 1 if max_w >= 0 else 0, _end_w)
             _fl0, _sht0, _al0, _es0 = _elf_section_attrs(self.state, '.text')
             csecs.append(_CSec('.text', 0, _extract(0, w_count), _fl0, _sht0,
                                _al0, _es0))
@@ -16509,6 +16539,12 @@ class Assembler:
                     if self.state.reported_label_errors:
                         print("         This is a consequence of the label definition "
                               "error(s) reported above; fix those first.", file=sys.stderr)
+                    elif self.state.had_error:
+                        # 誤りのある行は pass2 で何も出さないので、その後ろの番地がずれる。
+                        # リラクゼーションのせいではない。caxx.c と同じ文面。
+                        print("         This is a consequence of the error(s) reported above "
+                              "(a line in error emits nothing, so the addresses after it "
+                              "move); fix those first.", file=sys.stderr)
                     else:
                         print("         This usually means pass1 relaxation did not fully "
                               "converge for variable-length forward references.", file=sys.stderr)
