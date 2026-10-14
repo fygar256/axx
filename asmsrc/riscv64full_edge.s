@@ -10,3 +10,9 @@
         c.addi4spn a0, sp, 1020
         c.j     $$+2046
         c.beqz  a0, $$-256
+; データ定義の端
+        db      -128
+        db      255
+        half    65535
+        word    -2147483648
+        quad    0xffffffffffffffff

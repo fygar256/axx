@@ -25,3 +25,8 @@ move.w d0,200(a1,d1.w)
 move.w d0,(0x12345).W
 movep.w 40000(a0),d0
 ori.w #0x12345,d0
+; 2026-10-14: MOVEM の絶対番地 .L と PC 相対の変位（以前は検査が無く黙って切り詰めた）
+movem.l (0x100000000).L,d0-d3
+movem.w d0/a1,(-2147483649).L
+movem.l $$+40000(pc),d0
+movem.w $$+200(pc,d1.w),d0

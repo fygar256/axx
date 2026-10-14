@@ -36,3 +36,14 @@
         lea     rax, [rbx+0x100000000]
         lea     rax, [rbx-0x80000001]
         mov     dword [rcx+r8*4+0x100000000], 1
+; 2026-10-14: 倍率は 1/2/4/8 だけ（以前は *3 を *2、*16 を *1 などとして黙って組んだ）、
+; 基底の無い [disp+index] の変位、movabs の番地、データ定義の範囲
+        lea     rax, [rbx+rcx*3]
+        lea     rax, [rbx+rcx*16]
+        mov     eax, [rbx+rcx*0+8]
+        inc     byte [0x100000000+rcx]
+        movabs  al, 18446744073709551616
+        db      256
+        dw      -32769
+        dd      4294967296
+        dq      -9223372036854775809

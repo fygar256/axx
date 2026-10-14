@@ -51,14 +51,14 @@ above.
 
 The two are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all ninety-eight bundled pattern/source pairs with
+exactly that: `test1` assembles all one hundred and one bundled pattern/source pairs with
 both implementations and `cmp`s the results. For the five `.textmode` pairs and the `exprmiss.axx` pair it also
 `cmp`s the translated text each implementation sends to standard output under
 `-V`, and for the `echo.axx` and `ministr.axx` pairs the `.echo` lines each one writes to standard
 error, and for the `regress.axx` regression test its `-V` text and its diagnostics.
 The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for two hundred and thirty-five comparisons in all.
+text output are compared too, for two hundred and thirty-eight comparisons in all.
 
 **Contents**
 
@@ -4993,7 +4993,7 @@ The x86_64 pattern file is also maintained separately at
 | **ppc64.axx** | 2.6 KB | 51 (plus `ppc64_isa.axx`) | **ppc64_test.s**, **ppc64_reloc2.s** and others | PowerPC64 big-endian (ELFv1): sets the byte order and the ELF description (`.elftype` / `.elffield` / `.elfpcguess` / `.elfsection`), then includes `ppc64_isa.axx` |
 | **ppc64le.axx** | 2.6 KB | 52 (plus `ppc64_isa.axx`) | **ppc64_test.s**, **ppc64_reloc2.s** and others | The same for little-endian PowerPC64 (ELFv2) |
 | **ppc64_isa.axx** | 96 KB | 454 (4,774 expanded) | -- | The PowerPC64 instruction set (Power ISA v3.1, POWER10) shared by `ppc64.axx` and `ppc64le.axx`; not passed to axx directly. Fixed point, branches with the extended mnemonics, floating point, decimal floating point, VMX, VSX, quad precision, MMA including the prefixed masked forms, and the prefixed instructions, with a nop inserted before one that would cross a 64-byte boundary. Written with the macro layer and the mini language |
-| **mips.axx** | 919 B | 1 (plus `mips_isa.axx`) | **mips.s**, **mips_ase.s**, **mips_reloc2.s** | MIPS big-endian, o32 (ELF32, REL), up to Release 5: sets the byte order, the ABI and the release, then includes `mips_isa.axx` |
+| **mips.axx** | 919 B | 1 (plus `mips_isa.axx`) | **mips.s**, **mips_ase.s**, **mips_reloc2.s**, **mips_err.s** | MIPS big-endian, o32 (ELF32, REL), up to Release 5: sets the byte order, the ABI and the release, then includes `mips_isa.axx` |
 | **mipsel.axx** | 926 B | 1 (plus `mips_isa.axx`) | **mips.s**, **mips_ase.s**, **mips_reloc2.s** | The same for little-endian, o32 |
 | **mips64.axx** | 928 B | 1 (plus `mips_isa.axx`) | **mips.s**, **mips_ase.s**, **mips64_reloc2.s** | MIPS64 big-endian, n64 (ELF64, RELA) |
 | **mips64el.axx** | 935 B | 1 (plus `mips_isa.axx`) | **mips.s**, **mips_ase.s**, **mips64_reloc2.s** | The same for little-endian, n64 |
@@ -5002,7 +5002,7 @@ The x86_64 pattern file is also maintained separately at
 | **mips64r6.axx** | 938 B | 1 (plus `mips_isa.axx`) | **mipsr6.s** | MIPS64 Release 6, big-endian, n64 |
 | **mips64r6el.axx** | 945 B | 1 (plus `mips_isa.axx`) | **mipsr6.s** | The same for little-endian, n64 |
 | **mips_isa.axx** | 80 KB | 151 (about 5,000 expanded, about 3,560 under Release 6) | -- | The MIPS instruction set shared by the eight files above; not passed to axx directly. MIPS I to MIPS64 Release 6: the whole integer set (with the Release 2 bit-field and byte-swap instructions), the privileged instructions (COP0, TLB), the FPU (the S, D, W, L and PS formats, the sixteen `c.cond` compares, COP1X), COP2, the coprocessor 3 forms of MIPS I, the GNU pseudo-instructions that need no `$at` (`li`, `dli`, `la`, `dla`, `move`, `b` ...) and the relocation modifiers (`%hi`, `%lo`, `%higher`, `%highest`, `%gp_rel`, the `%got` and `%call16` families, the TLS ones, `%pcrel_hi` / `%pcrel_lo`). The extensions DSP (Release 1 and 2, Release 3 under R6), MSA, MT, VZ, EVA, MIPS-3D, SmartMIPS, MCU, XPA, CRC and GINV. When the front file sets `R6()` to 1, the instructions Release 6 removes (branch likely, multiply and divide on HI / LO, the `lwl` family, the `movz` family, the FP condition codes, PS, COP1X ...) are left out, `clz`, `ll` / `sc`, `cache` / `pref`, the `lwc2` family, `jr` ... take their Release 6 encodings, and the new instructions are added (the compact branches, the `aui` family, the PC-relative `lwpc` / `auipc` family, the three-register multiply and divide, `cmp.cond.fmt`, `maddf` and the other FPU ones). The syntax is that of GNU as under `.set noreorder` / `.set noat`. No microMIPS / MIPS16e (the compressed encodings), MDMX or vendor extensions. Under `-o`, o32 is REL (the addend written back into the field) and n64 is RELA (three types per `r_info`), with the PC-relative relocations of Release 6 (`R_MIPS_PC21_S2`, `PC26_S2`, `PC19_S2`, `PC18_S3`, `PCHI16`, `PCLO16`). Written with the macro layer and the mini language |
-| **sparc.axx** | 56 KB | 237 (7,968 expanded) | **sparc_test.s**, **sparc_reloc.s**, **sparc_reloc2.s**, **bf_sparc.s** | SPARC V7 / V8 / V9 and VIS 1-3: the integer set, the shifts and `sethi`; Bicc / BPcc / FBfcc / FBPfcc / BPr and the V8 CBccc (with `,a` and `,pt` / `,pn`), `call`, `jmpl`, `return` and Tcc; movcc / movr / fmovcc / fmovr; every integer and floating point load and store (the alternate space forms with an ASI number, a `#ASI_*` name or `%asi`, `casa` / `casxa`, `prefetch`); every FPop1 / FPop2 (s, d, q, the conversions, `fcmp`, the UltraSPARC Architecture 2007 `fnadd` family) and the fused multiply-add (`fmadd` ...); `rd` / `wr`, `rdpr` / `wrpr`, the V8 `%psr` family and the UA2005 `rdhpr` / `wrhpr`; `membar` (with the `#StoreLoad` ... names); the V8 coprocessor; the LEON `umac` / `smac` / `pwr`; the synthetic instructions (`cmp`, `mov`, `set` / `setuw` / `setsw` / `setx`, the `clr` family, the `inc` family ...); the operand modifiers (`%hi`, `%lo`, `%hh`, `%hm`, `%h44`, `%m44`, `%l44`, `%hix`, `%lox`, `%pc22`, `%pc10`, the GOT and TLS ones). `-o` writes ELF64 SPARCV9 (RELA). Checked byte-for-byte against llvm-mc 19, and the rows llvm-mc does not have against the encodings of the manuals. Written with the macro layer and the mini language |
+| **sparc.axx** | 56 KB | 237 (7,968 expanded) | **sparc_test.s**, **sparc_reloc.s**, **sparc_reloc2.s**, **bf_sparc.s**, **sparc_err.s** | SPARC V7 / V8 / V9 and VIS 1-3: the integer set, the shifts and `sethi`; Bicc / BPcc / FBfcc / FBPfcc / BPr and the V8 CBccc (with `,a` and `,pt` / `,pn`), `call`, `jmpl`, `return` and Tcc; movcc / movr / fmovcc / fmovr; every integer and floating point load and store (the alternate space forms with an ASI number, a `#ASI_*` name or `%asi`, `casa` / `casxa`, `prefetch`); every FPop1 / FPop2 (s, d, q, the conversions, `fcmp`, the UltraSPARC Architecture 2007 `fnadd` family) and the fused multiply-add (`fmadd` ...); `rd` / `wr`, `rdpr` / `wrpr`, the V8 `%psr` family and the UA2005 `rdhpr` / `wrhpr`; `membar` (with the `#StoreLoad` ... names); the V8 coprocessor; the LEON `umac` / `smac` / `pwr`; the synthetic instructions (`cmp`, `mov`, `set` / `setuw` / `setsw` / `setx`, the `clr` family, the `inc` family ...); the operand modifiers (`%hi`, `%lo`, `%hh`, `%hm`, `%h44`, `%m44`, `%l44`, `%hix`, `%lox`, `%pc22`, `%pc10`, the GOT and TLS ones). `-o` writes ELF64 SPARCV9 (RELA). Checked byte-for-byte against llvm-mc 19, and the rows llvm-mc does not have against the encodings of the manuals. Written with the macro layer and the mini language |
 | **6809.axx** | 138 KB | 1,950 | **6809.s**, **6809_edge.s**, **6809_err.s** | Motorola 6809 |
 | **68000.axx** | 59 KB | 457 | **68000.s**, **68000_reloc.s**, **68000_err.s** | Motorola 68000. `-o` writes ELF32 M68K (RELA) without `-m`. An `.extern` with no type is `R_68K_32`; 16 / 8 bit PC relative references within the section are resolved by axx |
 | **6800.axx** | 20 KB | 271 | **6800.s**, **6800_edge.s**, **6800_err.s** | Motorola 6800 |
@@ -5036,7 +5036,7 @@ The x86_64 pattern file is also maintained separately at
 | **elfrel.axx** | 4.1 KB | 41 | **elfrel.s** | ARM (EM_ARM) described with `.elfbuiltin::0`, without the built-in table, and the REL instruction-field types (the shift and bias of `.elffield`; 3.7.7, 3.7.9). The instruction words and relocations match llvm-mc; test only |
 | **elfsym.axx** | 2.8 KB | 23 | **elfsym.s** | the ELF symbol attributes written from the source (`.type`, `.size`, `.weak`, `.hidden`, `.protected`, `.internal`, `.other`, `.comm`; 5.6.1), together with a field width that is not a power of two (`.elfwidth::3`) and a section element size (the fifth field of `.elfsection`; 3.7.7). The machine is EM_MN10300, which is not in the built-in table; test only |
 | **riscv64.axx** | 12 KB | 131 | **riscv64.s**, **riscv64_reloc2.s** | RV64I, the base integer instruction set (U/I/S/B/J/R formats, loads and stores, branches, jumps, `call`, `li`/`mv`/`j`/`ret`/`nop`, `ecall`/`ebreak`). No C, M, A or F/D extension, no CSR instructions, no fence group. It is also the worked example of declaring what axx has no built-in numbers for: the built-in EM_RISCV table holds only the data types, so `CALL_PLT`, `BRANCH`, `JAL`, `HI20`, `LO12_I`/`_S` and the `PCREL` pair come from `.elftype` / `.elffield` / `.reloc` (3.7.5-3.7.7). It links with `ld -m elf64lriscv` and runs |
-| **riscv64full.axx** | 78 KB | 2,225 (4,137 expanded) | **riscv64full.s**, **riscv64full_reloc.s**, **riscv64full_reloc2.s**, **riscv64full_edge.s** | RISC-V RV64 in full: I, M, A (with Zabha, Zacas, Zawrs), F, D, Q, Zfh, Zfa, C (Zca, Zcd, Zcb, Zcmp, Zcmt, Zcmop), Zba / Zbb / Zbc / Zbs, Zbkb / Zbkc / Zbkx, Zknd / Zkne / Zknh / Zksed / Zksh, Zicond, Zicbom / Zicboz / Zicbop, Zihintntl, Zimop, Zicfiss / Zicfilp, Zicsr with the CSR names, the privileged and H instructions, and V 1.0 with Zvbb, Zvbc, Zvkg, Zvkned, Zvknh, Zvksed, Zvksh and the bf16 parts; the GNU pseudo-instructions (`li` of any 64-bit constant, `call`, `tail`, `la`, the global loads and stores ...); optional rounding modes and `v0.t` masks. A superset of `riscv64.axx` that declares the RISC-V psABI relocations the instructions carry. Checked against llvm-mc 18 byte for byte, its `-o` relocations and linked images against LLVM's; the part of the ISA that LLVM 18 does not have (Q, Zabha, `vwsll`, `mnret`, `c.ntl.*`, `c.sspush`) is from the specifications. `riscv64full.s` exercises the rows; `riscv64full_reloc.s` and `riscv64full_reloc2.s` (`la` / `lla` and the global loads and stores, PC-relative data and label differences, checked against llvm-mc 19) are for `-o` |
+| **riscv64full.axx** | 78 KB | 2,225 (4,137 expanded) | **riscv64full.s**, **riscv64full_reloc.s**, **riscv64full_reloc2.s**, **riscv64full_edge.s**, **riscv64full_err.s** | RISC-V RV64 in full: I, M, A (with Zabha, Zacas, Zawrs), F, D, Q, Zfh, Zfa, C (Zca, Zcd, Zcb, Zcmp, Zcmt, Zcmop), Zba / Zbb / Zbc / Zbs, Zbkb / Zbkc / Zbkx, Zknd / Zkne / Zknh / Zksed / Zksh, Zicond, Zicbom / Zicboz / Zicbop, Zihintntl, Zimop, Zicfiss / Zicfilp, Zicsr with the CSR names, the privileged and H instructions, and V 1.0 with Zvbb, Zvbc, Zvkg, Zvkned, Zvknh, Zvksed, Zvksh and the bf16 parts; the GNU pseudo-instructions (`li` of any 64-bit constant, `call`, `tail`, `la`, the global loads and stores ...); optional rounding modes and `v0.t` masks. A superset of `riscv64.axx` that declares the RISC-V psABI relocations the instructions carry. Checked against llvm-mc 18 byte for byte, its `-o` relocations and linked images against LLVM's; the part of the ISA that LLVM 18 does not have (Q, Zabha, `vwsll`, `mnret`, `c.ntl.*`, `c.sspush`) is from the specifications. `riscv64full.s` exercises the rows; `riscv64full_reloc.s` and `riscv64full_reloc2.s` (`la` / `lla` and the global loads and stores, PC-relative data and label differences, checked against llvm-mc 19) are for `-o` |
 | **endsub.axx** | 1.2 KB | 20 | **endsub.s** | closing a `.sub` block with `.endsub` (3.7.2); test only |
 | **intel2att.axx** | 12 KB | 60 (3,437 expanded) | **intel2att.s** | x86-64 Intel to AT&T source translator; `.textmode`, `!Y`, `!L` and macro-layer pattern generation (3.18). The translated text assembles with GNU as |
 | **a64tox64_axx.axx** | 32 KB | 152 (1,903 expanded) | **bf_aarch64.s** | AArch64 to x86_64 source translator whose output `x86_64.axx` assembles; uses the runtimes `a64rt_axx.s` (Linux) and `a64rt_axx_freebsd.s` (FreeBSD) and the declaration file `a64ext.s` (3.18) |
@@ -5118,7 +5118,7 @@ drops the label references it read, so for a symbol only the bytes of the
 immediate field read the label, and the relocation lands on that field). The three-operand `IMUL` with an
 immediate and `MOV` with `[RIP+...]` have their 32 / 16 / 8-bit forms too.
 
-`test1` runs all ninety-eight pairs through both implementations and
+`test1` runs all one hundred and one pairs through both implementations and
 compares the `-b` raw binaries. For the five pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`),
 and for `exprmiss.axx`, which looks at lines let through by `.passthru`, it also compares the translated text each
@@ -5195,12 +5195,15 @@ lines at the edges of the ranges, checked against llvm-mc 19, that must assemble
 (the SVE `dup` / `mov` / `mul` / `smax` immediates, `c.lui` with -32 / 0xfffe0 and
 so on), and the `aarch64_err.s` pair the diagnostics of PC-relative targets that
 are not a multiple of 4, `adrp` out of range and SVE signed bytes out of range.
+The `riscv64full_err.s`, `mips_err.s` and `sparc_err.s` pairs compare the
+diagnostics of data directives (`db`, `half`, `word`, `quad` and the like) whose
+value does not fit, which used to be cut down without a word.
 
 The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (the ELF of the pattern's machine; x86-64 ELF64 when it has no `.elfmachine`), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for two hundred and thirty-five comparisons in all.
+never compares, for two hundred and thirty-eight comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -5233,7 +5236,7 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all ninety-eight bundled pattern/source pairs with both
+`test1` assembles all one hundred and one bundled pattern/source pairs with both
 implementations and compares the results, plus the `-V` translation text of the
 five `.textmode` pairs, the `.echo` lines of the `echo.axx` and `ministr.axx` pairs,
 and the `-V` text and diagnostics of the `regress.axx` regression test.

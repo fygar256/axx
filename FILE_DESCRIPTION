@@ -341,6 +341,9 @@ riscv64full_edge.s                  lines riscv64full.axx must assemble at the
                                     edges of the ranges (checked against
                                     llvm-mc 19), c.lui -32 / 0xfffe0 among them;
                                     test1 compares the -b image
+riscv64full_err.s                   lines riscv64full.axx must refuse: data
+                                    directives whose value does not fit;
+                                    test1 compares the diagnostics
 bf_riscv64.s                        brainfuck interpreter written in RISC-V
                                     assembly (axx syntax), a port of
                                     bf_aarch64.s. assembles with
@@ -567,6 +570,9 @@ sparc_reloc2.s                      the relocations sparc_reloc.s does not
                                     (.elfresolve) and PC-relative data
                                     (R_SPARC_DISP*), checked against llvm-mc
                                     19 and ld.lld 19
+sparc_err.s                         lines sparc.axx must refuse: data directives
+                                    whose value does not fit; test1 compares
+                                    the diagnostics
 mips.axx                            pattern file for MIPS, big-endian, o32
                                     (ELF32 REL), up to Release 5: sets the byte
                                     order, the ABI and the release, then
@@ -612,6 +618,9 @@ mips_reloc2.s                       o32 relocations for -o (mips.axx and the
                                     + LO16 (the extra relocations of .reloc)
                                     and PC-relative data (R_MIPS_PC32),
                                     checked against llvm-mc 19 and ld.lld
+mips_err.s                          lines mips.axx must refuse: data directives
+                                    whose value does not fit; test1 compares
+                                    the diagnostics
 mips64_reloc2.s                     n64 relocations for -o (mips64.axx and the
                                     other n64 front files): la / dla with
                                     HIGHEST + HIGHER + HI16 + LO16 and

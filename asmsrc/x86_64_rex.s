@@ -124,3 +124,12 @@ here:
         lea     rax, [rbx+0x7fffffff]
         lea     rax, [rbx-0x80000000]
         mov     eax, [rax+0xffffffff]
+; 2026-10-14: 倍率と変位とデータ定義の端
+        lea     rax, [rbx+rcx*8]
+        inc     byte [0xffffffff+rcx]
+        movabs  al, 0xffffffffffffffff
+        db      -128
+        db      255
+        dw      65535
+        dd      -2147483648
+        dq      0xffffffffffffffff
