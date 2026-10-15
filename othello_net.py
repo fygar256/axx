@@ -8,6 +8,7 @@
 
 使い方:  python3 othello_net.py [接続先ホスト]
 """
+import os
 import queue
 import socket
 import sys
@@ -170,7 +171,15 @@ def main():
     entry = pygame.Rect(W // 2 - 160, 420, 320, 40)
 
     net = Net()
-    state = "menu"      # menu / waiting / playing / over / closed
+    # タイトル画像 (title.jpg)。なければタイトルを飛ばして menu から始める
+    title_img = None
+    try:
+        img = pygame.image.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "title.jpg")).convert()
+        k = min(W / img.get_width(), H / img.get_height())
+        title_img = pygame.transform.smoothscale(img, (int(img.get_width() * k), int(img.get_height() * k)))
+    except (pygame.error, FileNotFoundError):
+        pass
+    state = "title" if title_img else "menu"   # title / menu / waiting / playing / over / closed
     me = EMPTY
     board = new_board()
     turn = BLACK
@@ -210,6 +219,9 @@ def main():
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 running = False
+            elif state == "title":
+                if ev.type in (pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN):
+                    state = "menu"
             elif state == "menu":
                 if ev.type == pygame.KEYDOWN:
                     if ev.key == pygame.K_BACKSPACE:
@@ -259,7 +271,9 @@ def main():
 
         # 描画
         screen.fill(BG)
-        if state == "menu":
+        if state == "title":
+            screen.blit(title_img, title_img.get_rect(center=(W // 2, H // 2)))
+        elif state == "menu":
             draw_text(T("ネットワーク対戦オセロ", "Network Othello"), big, WHITE_C, center=(W // 2, 100))
             draw_text("TCP port %d" % PORT, font, (180, 180, 180), center=(W // 2, 150))
             for r, label in ((btn_server, T("サーバになる (黒・先手)", "Be SERVER (Black)")),
