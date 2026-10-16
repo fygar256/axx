@@ -25,7 +25,9 @@ All statements begin with `!` at the start of the line (ignoring leading whitesp
 | `!error expr` | Abort expansion and report error |
 | `!warning expr` / `!echo expr` | Output to stderr (`!echo` shares its layout with the mini language's `.echo`) |
 
-The opening `{` must appear at the end of the header line, and the closing `}` at the start of a line. `; comment` may be written after a statement. ## Embedding in Expressions
+The opening `{` must appear at the end of the header line, and the closing `}` at the start of a line. `; comment` may be written after a statement.
+
+## Embedding in Expressions
 
 | Notation | Meaning |
 |---|---|
