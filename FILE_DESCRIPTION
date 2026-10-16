@@ -377,6 +377,12 @@ intel2att.s                         test assemble file for intel2att.axx. the
                                     translated text is valid AT&T assembly:
                                     `caxx intel2att.axx intel2att.s -V |
                                     as --64 -o att.o -`
+sample_intel.s                      a short x86-64 program in Intel syntax
+                                    (moves, arithmetic, shifts, memory operands
+                                    written with `dword ptr` / `qword ptr`, a
+                                    call, a loop and data), a further input for
+                                    intel2att.axx: `caxx intel2att.axx
+                                    sample_intel.s -V`
 a64tox64_axx.axx                    pattern file that translates AArch64 assembly
                                     into x86_64 assembly in the notation of
                                     x86_64.axx: register mapping, calling-
@@ -433,6 +439,36 @@ bfsh/bf_sparc_linux.sh              build_bf_<arch>_linux/bf and runs it under
                                     Linuxulator. bf_aarch64.s and bf_ppc64.s
                                     have no FreeBSD version;
                                     `run` runs mandelbrot.bf
+aarch64tox64/                       the working directory of the AArch64 ->
+                                    x86_64 port of the brainfuck interpreter
+aarch64tox64/aarch64tox64.sh        builds and runs it on FreeBSD/amd64:
+                                    assembles the runtime a64rt_axx_freebsd.s,
+                                    translates bf_aarch64.s with
+                                    a64tox64_axx.axx -V (a64ext.s in front) into
+                                    bf_x64.s, assembles that with x86_64.axx
+                                    (../x86_64.axx in a flat layout, else
+                                    ../patfile/x86_64.axx), links with ld -e
+                                    __a64_start and runs mandelbrot.bf
+aarch64tox64/testrun.sh             the same for Linux/x86_64 (a64rt_axx.s, ld
+                                    -e _start)
+aarch64tox64/testrun_freebsd.sh     the same as aarch64tox64.sh without --osabi
+                                    FreeBSD; the runtime object is
+                                    a64rt_freebsd.o
+aarch64tox64/aarch64tox86_64.axx    pattern file that translates AArch64
+                                    assembly into GNU as AT&T syntax
+                                    (.textmode): x0 -> rdi, x1 -> rsi ...,
+                                    calling-convention glue for ret / bl / svc,
+                                    frames from stp / ldp, three operands into
+                                    two. `caxx aarch64tox86_64.axx prog_a64.s -V
+                                    > prog_x64.s`, then as --64
+aarch64tox64/bf_x64.s               bf_aarch64.s translated by a64tox64_axx.axx
+                                    with a64ext.s in front (what the scripts
+                                    above make)
+aarch64tox64/x86_64.axx             an earlier copy of x86_64.axx (2026-10-14)
+aarch64tox64/(others)               copies of the files of the same name above:
+                                    a64ext.s, a64rt_axx.s, a64rt_axx_freebsd.s,
+                                    a64tox64_axx.axx, bf_aarch64.s and
+                                    mandelbrot.bf
 8080toz80.axx                     pattern file that translates Intel 8080 source
                                     into Zilog Z80 source text: .textmode, `!L`
                                     captures and `{{.exp()}}`, so labels and
@@ -466,6 +502,8 @@ bf_x86_64.s                         brainfuck interpreter for FreeBSD / Linux
                                     x86_64 in Intel syntax, switched by the
                                     macro layer (!set OS = "freebsd" / "linux").
                                     assembles with x86_64.axx -o, links with ld
+bfi.s                               the same source as bf_x86_64.s under its
+                                    earlier name; bf_sparc.s was ported from it
 bf_mips.s                          brainfuck interpreter for Linux / MIPS32 o32,
                                     ported from bf_ppc64.s. the same source
                                     assembles with mips.axx (big-endian) and

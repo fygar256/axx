@@ -4752,7 +4752,7 @@ x86_64 パターンファイルは
 | **a64tox64_axx.axx** | 32 KB | 152（展開後 1,903） | **bf_aarch64.s** | AArch64 → x86_64 のソース翻訳器。出力は `x86_64.axx` でアセンブルできる記法。ランタイム `a64rt_axx.s`（Linux）・`a64rt_axx_freebsd.s`（FreeBSD）と宣言 `a64ext.s` を使う（3.18 節） |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) のスケッチ。未完成 |
 | **vliw.axx** | 192 B | 10 | **vliw.s** | 非 EPIC VLIW。テスト専用 |
-| **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck 仮想 CPU。hello-world デモ。同梱だが `test1` の対象外 |
+| **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck 仮想 CPU。hello-world デモ |
 
 `::` 行数は、ファイルに書かれている `::` を含む行の数です。マクロ層で行を生成して
 いるファイルには、括弧内に展開後の行数を添えています（展開後は
