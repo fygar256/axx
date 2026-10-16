@@ -50,7 +50,7 @@ gcc caxx.c -o caxx -lm -lquadmath -O2   # -lm は式評価器が、-lquadmath �
 
 この 2 つは同じ入力に対して**バイト単位で同一の出力**を生成することを意図しています。
 同梱のパターンファイル、テストソース、`test1` スクリプトはまさにそれを検証するために
-存在します。`test1` は同梱の 101 組のパターン/ソースの対を両方の実装でアセンブルし、
+存在します。`test1` は同梱の 104 組のパターン/ソースの対を両方の実装でアセンブルし、
 結果を `cmp` します。さらに `.textmode` の 5 組と `exprmiss.axx` の組については、`-V` で標準出力へ流した
 翻訳テキストどうしも、`echo.axx` と `ministr.axx` の組については標準エラーへ出た `.echo` の行どうしも
 `cmp` します。回帰テストの `regress.axx` は `-V` のテキストと標準エラーの診断を
@@ -4695,14 +4695,14 @@ x86_64 パターンファイルは
 
 | パターンファイル | サイズ | `::` 行数 | ソース | 備考 |
 |---|---|---|---|---|
-| **x86_64.axx** | 4.2 MB | 23,587 | **hello.s**、**bsection.s**、**x86_64_reloc.s**、**x86_64_rex.s**、**x86_64_avx.s**、**x86_64_err.s** | x86_64-v3: セグメントアドレッシング、AVX/AVX2、BMI1/BMI2、x87、EVEX/AVX-512。AVX 以降は llvm-mc と照合（表の後の注） |
-| **x86_64m.axx** | 1.0 MB | 5,555（展開後 23,587） | **hello.s**、**x86_64_reloc.s**、**x86_64_rex.s**、**x86_64_avx.s**、**x86_64_err.s** | マクロで書かれた x86_64-v3。Brainfuck デモでも使用。展開結果は `x86_64.axx` と一致 |
-| **aarch64.axx** | 352 KB | 2,097（展開後 9,387） | **aarch64.s**、**aarch64_reloc.s**、**aarch64_edge.s**、**aarch64_err.s** | AArch64 (A64): データ処理、分岐、例外生成、ヒント、バリア、システムレジスタと SYS 別名、ロード／ストア、LSE アトミック、スカラ浮動小数点、Advanced SIMD（LD1〜LD4 / ST1〜ST4 の構造アクセスを含む）、暗号、スカラ拡張（PAuth・MTE・MOPS・FCMA・ドット積・BFloat16・行列積・LS64）。さらに SVE・SVE2（算術、シフト、比較、述語、要素数、置換、リダクション、ギャザー／スキャッタを含むロード／ストア一式、拡幅・縮小群、複素演算、SVE2 暗号）、SME（ストリーミングモード、ZA 配列、整数・浮動小数点・BFloat16 の外積）、SME2（述語カウンタレジスタ、ZT0 参照表、Z レジスタのマルチベクタ演算、ZA への累算、連続形と跨ぎ形のマルチベクタロード／ストア）。GNU 式のリロケーション修飾子（`:lo12:`・`:pg_hi21:`・`:abs_g0:`〜`:abs_g3:`・`:prel_g0:`〜`:prel_g3:`・`:got:`／`:got_lo12:`）は `-o` でリンカ向けのリロケーションとして出し、`-b` では axx 自身が解決する。`-o` では `-m` なしで AArch64 のオブジェクトになり、同じセクションの局所ラベルへの分岐・`adr`・リテラルの `ldr` はその場で解決し、データの命令（`.byte` `.hword` `.word` `.quad` `.xword` など）は ABS / PREL のリロケーションを持つ（`aarch64_reloc.s`、llvm-mc 19 と照合）。マクロ層で記述 |
+| **x86_64.axx** | 4.2 MB | 28,659 | **hello.s**、**bsection.s**、**x86_64_reloc.s**、**x86_64_rex.s**、**x86_64_avx.s**、**x86_64_err.s** | x86_64-v3: セグメントアドレッシング、AVX/AVX2、BMI1/BMI2、x87、EVEX/AVX-512。AVX 以降は llvm-mc と照合（表の後の注） |
+| **x86_64m.axx** | 1.0 MB | 6,531（展開後 28,791） | **hello.s**、**x86_64_reloc.s**、**x86_64_rex.s**、**x86_64_avx.s**、**x86_64_err.s** | マクロで書かれた x86_64-v3。Brainfuck デモでも使用。展開結果は `x86_64.axx` と同じパターンの集合（重複行を除けば一致） |
+| **aarch64.axx** | 352 KB | 2,112（展開後 9,431） | **aarch64.s**、**aarch64_reloc.s**、**aarch64_edge.s**、**aarch64_err.s** | AArch64 (A64): データ処理、分岐、例外生成、ヒント、バリア、システムレジスタと SYS 別名、ロード／ストア、LSE アトミック、スカラ浮動小数点、Advanced SIMD（LD1〜LD4 / ST1〜ST4 の構造アクセスを含む）、暗号、スカラ拡張（PAuth・MTE・MOPS・FCMA・ドット積・BFloat16・行列積・LS64）。さらに SVE・SVE2（算術、シフト、比較、述語、要素数、置換、リダクション、ギャザー／スキャッタを含むロード／ストア一式、拡幅・縮小群、複素演算、SVE2 暗号）、SME（ストリーミングモード、ZA 配列、整数・浮動小数点・BFloat16 の外積）、SME2（述語カウンタレジスタ、ZT0 参照表、Z レジスタのマルチベクタ演算、ZA への累算、連続形と跨ぎ形のマルチベクタロード／ストア）。GNU 式のリロケーション修飾子（`:lo12:`・`:pg_hi21:`・`:abs_g0:`〜`:abs_g3:`・`:prel_g0:`〜`:prel_g3:`・`:got:`／`:got_lo12:`）は `-o` でリンカ向けのリロケーションとして出し、`-b` では axx 自身が解決する。`-o` では `-m` なしで AArch64 のオブジェクトになり、同じセクションの局所ラベルへの分岐・`adr`・リテラルの `ldr` はその場で解決し、データの命令（`.byte` `.hword` `.word` `.quad` `.xword` など）は ABS / PREL のリロケーションを持つ（`aarch64_reloc.s`、llvm-mc 19 と照合）。マクロ層で記述 |
 | **aarch64_logical.axx** | 9.5 KB | 76（展開後 82） | **aarch64_logical_mini_demo.s** | 同じ AArch64 論理（即値）グループのマクロ層版。行を `!def` で生成し、ビットマスク即値は `binary_list` の式で符号化する |
 | **aarch64_logical_mini.axx** | 9.2 KB | 86 | **aarch64_logical_mini_demo.s** | AArch64 論理（即値）: AND/ORR/EOR/ANDS/TST、32 ビットと 64 ビット。ビットマスク即値をミニ言語（3.15 節）でエンコード |
-| **ppc64.axx** | 2.6 KB | 51（＋ `ppc64_isa.axx`） | **ppc64_test.s**、**ppc64_reloc2.s** ほか | PowerPC64 ビッグエンディアン (ELFv1)。バイト順と ELF 記述（`.elftype`／`.elffield`／`.elfpcguess`／`.elfsection`）を決めて `ppc64_isa.axx` を include する |
-| **ppc64le.axx** | 2.6 KB | 52（＋ `ppc64_isa.axx`） | **ppc64_test.s**、**ppc64_reloc2.s** ほか | 同じくリトルエンディアン (ELFv2) |
-| **ppc64_isa.axx** | 96 KB | 454（展開後 4,774） | — | `ppc64.axx` / `ppc64le.axx` が共有する Power ISA v3.1 (POWER10) の命令セット本体。axx に直接渡さない。固定小数点、拡張ニーモニックを含む分岐、浮動小数点、十進浮動小数点、VMX、VSX、四倍精度、前置形マスク付きを含む MMA、前置命令（64 バイト境界を跨ぐ前置命令の前には nop を入れる）。マクロ層とミニ言語で記述 |
+| **ppc64.axx** | 2.8 KB | 53（＋ `ppc64_isa.axx`） | **ppc64_test.s**、**ppc64_reloc2.s** ほか | PowerPC64 ビッグエンディアン (ELFv1)。バイト順と ELF 記述（`.elftype`／`.elffield`／`.elfpcguess`／`.elfsection`）を決めて `ppc64_isa.axx` を include する |
+| **ppc64le.axx** | 2.8 KB | 54（＋ `ppc64_isa.axx`） | **ppc64_test.s**、**ppc64_reloc2.s** ほか | 同じくリトルエンディアン (ELFv2) |
+| **ppc64_isa.axx** | 96 KB | 454（展開後 4,776） | — | `ppc64.axx` / `ppc64le.axx` が共有する Power ISA v3.1 (POWER10) の命令セット本体。axx に直接渡さない。固定小数点、拡張ニーモニックを含む分岐、浮動小数点、十進浮動小数点、VMX、VSX、四倍精度、前置形マスク付きを含む MMA、前置命令（64 バイト境界を跨ぐ前置命令の前には nop を入れる）。マクロ層とミニ言語で記述 |
 | **mips.axx** | 919 B | 1（＋ `mips_isa.axx`） | **mips.s**、**mips_ase.s**、**mips_reloc2.s**、**mips_err.s** | MIPS ビッグエンディアン、o32（ELF32、REL）、Release 5 まで。バイト順と ABI とリリースを決めて `mips_isa.axx` を include する |
 | **mipsel.axx** | 926 B | 1（＋ `mips_isa.axx`） | **mips.s**、**mips_ase.s**、**mips_reloc2.s** | 同じくリトルエンディアン、o32 |
 | **mips64.axx** | 928 B | 1（＋ `mips_isa.axx`） | **mips.s**、**mips_ase.s**、**mips64_reloc2.s** | MIPS64 ビッグエンディアン、n64（ELF64、RELA） |
@@ -4711,8 +4711,8 @@ x86_64 パターンファイルは
 | **mipsr6el.axx** | 938 B | 1（＋ `mips_isa.axx`） | **mipsr6.s** | 同じくリトルエンディアン、o32 |
 | **mips64r6.axx** | 938 B | 1（＋ `mips_isa.axx`） | **mipsr6.s** | MIPS64 Release 6、ビッグエンディアン、n64 |
 | **mips64r6el.axx** | 945 B | 1（＋ `mips_isa.axx`） | **mipsr6.s** | 同じくリトルエンディアン、n64 |
-| **mips_isa.axx** | 80 KB | 151（展開後 約 5,000、Release 6 では約 3,560） | — | 上の 8 つが共有する MIPS の命令セット本体。axx に直接渡さない。MIPS I から MIPS64 Release 6 まで: 整数命令一式（Release 2 のビット欄・バイト入れ替え命令を含む）、特権命令（COP0、TLB）、FPU（S・D・W・L・PS の各形式、16 種の `c.cond`、COP1X）、COP2、MIPS I の COP3、GNU の疑似命令（`li`・`dli`・`la`・`dla`・`move`・`b` など、`$at` を使わない範囲）、リロケーション修飾子（`%hi`・`%lo`・`%higher`・`%highest`・`%gp_rel`・`%got` 系・`%call16` 系・TLS 系・`%pcrel_hi` / `%pcrel_lo`）。拡張は DSP（Release 1・2、R6 では Release 3）、MSA、MT、VZ、EVA、MIPS-3D、SmartMIPS、MCU、XPA、CRC、GINV。前置きファイルの `R6()` が 1 なら Release 6 で消えた命令（分岐 likely、HI / LO の乗除算、`lwl` 系、`movz` 系、FP の条件コード、PS、COP1X など）を外し、`clz`・`ll` / `sc`・`cache` / `pref`・`lwc2` 系・`jr` などを Release 6 の符号で出し、新命令（コンパクト分岐、`aui` 系、PC 相対の `lwpc` / `auipc` 系、3 オペランドの乗除算、`cmp.cond.fmt`、`maddf` などの FPU 命令）を足す。構文は `.set noreorder` / `.set noat` の GNU as。microMIPS / MIPS16e（圧縮符号）、MDMX、ベンダー拡張は含まない。`-o` では o32 は REL（加数を欄に書き戻す）、n64 は RELA（`r_info` に 3 つの型）で出し、Release 6 の PC 相対リロケーション（`R_MIPS_PC21_S2`・`PC26_S2`・`PC19_S2`・`PC18_S3`・`PCHI16`・`PCLO16`）も出す。マクロ層とミニ言語で記述 |
-| **sparc.axx** | 56 KB | 237（展開後 7,968） | **sparc_test.s**、**sparc_reloc.s**、**sparc_reloc2.s**、**bf_sparc.s**、**sparc_err.s** | SPARC V7 / V8 / V9 と VIS 1〜3。整数・シフト・`sethi`、Bicc / BPcc / FBfcc / FBPfcc / BPr / V8 の CBccc（`,a` と `,pt` / `,pn`）、`call`・`jmpl`・`return`・Tcc、movcc / movr / fmovcc / fmovr、整数と浮動小数点のロード／ストア一式（代替空間の ASI 番号・`#ASI_*` 名・`%asi`、`casa` / `casxa`、`prefetch`）、FPop1 / FPop2 の全命令（s・d・q、変換、`fcmp`、UltraSPARC Architecture 2007 の `fnadd` 系）、積和（`fmadd` 系）、`rd` / `wr`・`rdpr` / `wrpr`・V8 の `%psr` 系・UA2005 の `rdhpr` / `wrhpr`、`membar`（`#StoreLoad` などの名前）、V8 のコプロセッサ、LEON の `umac` / `smac` / `pwr`、合成命令（`cmp`・`mov`・`set` / `setuw` / `setsw` / `setx`・`clr` 系・`inc` 系など）、修飾子（`%hi`・`%lo`・`%hh`・`%hm`・`%h44`・`%m44`・`%l44`・`%hix`・`%lox`・`%pc22`・`%pc10`・GOT 系・TLS 系）。`-o` は ELF64 SPARCV9（RELA）。llvm-mc 19 とバイト単位で照合し、llvm-mc に無い行は仕様書の符号と照合した。マクロ層とミニ言語で記述 |
+| **mips_isa.axx** | 79 KB | 155（展開後 約 5,000、Release 6 では約 3,570） | — | 上の 8 つが共有する MIPS の命令セット本体。axx に直接渡さない。MIPS I から MIPS64 Release 6 まで: 整数命令一式（Release 2 のビット欄・バイト入れ替え命令を含む）、特権命令（COP0、TLB）、FPU（S・D・W・L・PS の各形式、16 種の `c.cond`、COP1X）、COP2、MIPS I の COP3、GNU の疑似命令（`li`・`dli`・`la`・`dla`・`move`・`b` など、`$at` を使わない範囲）、リロケーション修飾子（`%hi`・`%lo`・`%higher`・`%highest`・`%gp_rel`・`%got` 系・`%call16` 系・TLS 系・`%pcrel_hi` / `%pcrel_lo`）。拡張は DSP（Release 1・2、R6 では Release 3）、MSA、MT、VZ、EVA、MIPS-3D、SmartMIPS、MCU、XPA、CRC、GINV。前置きファイルの `R6()` が 1 なら Release 6 で消えた命令（分岐 likely、HI / LO の乗除算、`lwl` 系、`movz` 系、FP の条件コード、PS、COP1X など）を外し、`clz`・`ll` / `sc`・`cache` / `pref`・`lwc2` 系・`jr` などを Release 6 の符号で出し、新命令（コンパクト分岐、`aui` 系、PC 相対の `lwpc` / `auipc` 系、3 オペランドの乗除算、`cmp.cond.fmt`、`maddf` などの FPU 命令）を足す。構文は `.set noreorder` / `.set noat` の GNU as。microMIPS / MIPS16e（圧縮符号）、MDMX、ベンダー拡張は含まない。`-o` では o32 は REL（加数を欄に書き戻す）、n64 は RELA（`r_info` に 3 つの型）で出し、Release 6 の PC 相対リロケーション（`R_MIPS_PC21_S2`・`PC26_S2`・`PC19_S2`・`PC18_S3`・`PCHI16`・`PCLO16`）も出す。マクロ層とミニ言語で記述 |
+| **sparc.axx** | 55 KB | 243（展開後 7,982） | **sparc_test.s**、**sparc_reloc.s**、**sparc_reloc2.s**、**bf_sparc.s**、**sparc_err.s** | SPARC V7 / V8 / V9 と VIS 1〜3。整数・シフト・`sethi`、Bicc / BPcc / FBfcc / FBPfcc / BPr / V8 の CBccc（`,a` と `,pt` / `,pn`）、`call`・`jmpl`・`return`・Tcc、movcc / movr / fmovcc / fmovr、整数と浮動小数点のロード／ストア一式（代替空間の ASI 番号・`#ASI_*` 名・`%asi`、`casa` / `casxa`、`prefetch`）、FPop1 / FPop2 の全命令（s・d・q、変換、`fcmp`、UltraSPARC Architecture 2007 の `fnadd` 系）、積和（`fmadd` 系）、`rd` / `wr`・`rdpr` / `wrpr`・V8 の `%psr` 系・UA2005 の `rdhpr` / `wrhpr`、`membar`（`#StoreLoad` などの名前）、V8 のコプロセッサ、LEON の `umac` / `smac` / `pwr`、合成命令（`cmp`・`mov`・`set` / `setuw` / `setsw` / `setx`・`clr` 系・`inc` 系など）、修飾子（`%hi`・`%lo`・`%hh`・`%hm`・`%h44`・`%m44`・`%l44`・`%hix`・`%lox`・`%pc22`・`%pc10`・GOT 系・TLS 系）。`-o` は ELF64 SPARCV9（RELA）。llvm-mc 19 とバイト単位で照合し、llvm-mc に無い行は仕様書の符号と照合した。マクロ層とミニ言語で記述 |
 | **6809.axx** | 138 KB | 1,950 | **6809.s**、**6809_edge.s**、**6809_err.s** | Motorola 6809 |
 | **68000.axx** | 59 KB | 457 | **68000.s**、**68000_reloc.s**、**68000_err.s** | Motorola 68000。`-o` は `-m` なしで ELF32 M68K（RELA）。型を書かない `.extern` は `R_68K_32`、同じセクションへの 16 / 8 ビットの PC 相対は axx が解決する |
 | **6800.axx** | 20 KB | 271 | **6800.s**、**6800_edge.s**、**6800_err.s** | Motorola 6800 |
@@ -4720,33 +4720,33 @@ x86_64 パターンファイルは
 | **z80.axx** | 8.8 KB | 283 | **z80.s**、**z80_err.s**、**import_test.s**、**import_test_err.s**、**listinc.s** | Zilog Z80 |
 | **8051.axx** | 9.1 KB | 111 | **8051.s**、**8051_err.s** | Intel 8051 |
 | **8080.axx** | 6.4 KB | 113 | **8080.s**、**8080_err.s** | Intel 8080 |
-| **8048.axx** | 6.5 KB | 95 | **8048.s**、**8048_edge.s**、**8048_err.s** | Intel 8048 |
+| **8048.axx** | 6.5 KB | 96 | **8048.s**、**8048_edge.s**、**8048_err.s** | Intel 8048 |
 | **4004.axx** | 5.6 KB | 53 | **4004.s**、**4004_edge.s**、**4004_err.s** | Intel 4004 |
 | **test.axx** | 1.1 KB | 40 | **test.s** | 複数 ISA の断片。テスト専用 |
 | **8080toz80.axx** | 5.7 KB | 117 | **hello8080.s** | Intel 8080 → Zilog Z80 のソース翻訳器。`.textmode`・`!L`・`{{.exp()}}`（3.18 節）の実例 |
 | **textmode.axx** | 2.0 KB | 13 | **textmode.s** | `.textmode`・`!L`・`{{.exp()}}`・`;` コメント（3.18 節）。テスト専用 |
-| **expcap.axx** | 2.9 KB | 41 | **expcap.s** | どの捕捉子でも `{{.exp()}}` が綴りを出すこと（3.18 節）。テスト専用 |
+| **expcap.axx** | 2.8 KB | 36 | **expcap.s** | どの捕捉子でも `{{.exp()}}` が綴りを出すこと（3.18 節）。テスト専用 |
 | **exprmiss.axx** | 1.1 KB | 8 | **exprmiss.s** | 式・因子のあるべきところに式・因子が無い行（空、`1+`、`-`、`~`、`()`）は `!`・`!!`・`!L`・`!F`/`!D`/`!Q` のどれにも当たらず、`.passthru` で素通しされること（3.3 節）。テスト専用 |
 | **arrindex.axx** | 860 B | 14 | **arrindex.s** | 配列シンボルの素の名前・名前の添字・`.index`（3.6.1 節）。テスト専用 |
 | **passthru.axx** | 686 B | 6 | **passthru.s** | `.passthru` と `.eol`（3.16 / 3.17 節）。テスト専用 |
 | **unordered.axx** | 1.7 KB | 28 | **unordered.s** | `.unordered` と変数ごとの `.map`（3.19 節）。Z80 の C をレジスタとキャリーに使い分ける。テスト専用 |
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | シンボル捕捉子 `!Y<集合>[<変数>]`（3.6.3 節）。テスト専用 |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | 本文行に書く `.echo`（3.14.1 節）。テスト専用 |
-| **ministr.axx** | 6.4 KB | 15 | **ministr.s** | ミニ言語の文字列・文字列の配列・`.for ... in 配列`（3.15 節）。テスト専用 |
-| **regress.axx** | 2.1 KB | 4 | **regress.s**、**regresserr.s**、**regresscr.s**（と `z80.axx` で **regresself.s**） | 差分ファジングで見つけて直した両実装の食い違いの回帰テスト（入れ子の三項、桁の多い数値リテラル、pow の特別な場合、マクロ層の `int()`・`hex()`・書式指定、エラー後の診断、セクションの終わりのラベルを指す `.equ`、未定義を含む `.equ` の値、空白と文字定数の規則、マクロ層のバイト単位の文字列、CR だけの改行、UTF-8 でないバイトの一覧、`-o` で後ろへ戻す `.org`、`error_patterns` の整数での評価）。テスト専用 |
+| **ministr.axx** | 6.4 KB | 27 | **ministr.s** | ミニ言語の文字列・文字列の配列・`.for ... in 配列`（3.15 節）。テスト専用 |
+| **regress.axx** | 3.4 KB | 10 | **regress.s**、**regresserr.s**、**regresscr.s**（と `z80.axx` で **regresself.s**） | 差分ファジングで見つけて直した両実装の食い違いの回帰テスト（入れ子の三項、桁の多い数値リテラル、pow の特別な場合、マクロ層の `int()`・`hex()`・書式指定、エラー後の診断、セクションの終わりのラベルを指す `.equ`、未定義を含む `.equ` の値、空白と文字定数の規則、マクロ層のバイト単位の文字列、CR だけの改行、UTF-8 でないバイトの一覧、`-o` で後ろへ戻す `.org`、`error_patterns` の整数での評価）。テスト専用 |
 | **elftype.axx** | 1.5 KB | 20 | **elftype.s** | `.elftype` で決めた型名を `.reloc` / `.extern` / `.global` に書く（3.7.6 節）。テスト専用 |
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | 組み込みの表に無いマシン（EM_MSP430）の ELF 記述（3.7.7 節）。テスト専用 |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | リロケーション型の優先順位（既定 < パターンファイル < ソースファイル、3.7.8 節）。テスト専用 |
 | **elfsec.axx** | 1.4 KB | 8 | **elfsec.s** | `.elfsection` で宣言するセクションの属性と `sh_addralign`（3.7.7 節）。テスト専用 |
 | **elfpair.axx** | 4.7 KB | 39（＋ `riscv64.axx`） | **elfpair.s** | 対になるリロケーションと添え物（`.elfextra`・`.elfdiff`、多項の式・型付きの差を含む）、セクショングループ（`.elfgroup`）、`sh_link`（`.elflink`）、リンカ緩和の機種の CFI。RISC-V。リロケーション・グループ・セクションヘッダは llvm-mc と一致（3.7.10・3.7.11 節）。テスト専用 |
-| **elfcfi.axx** | 2.0 KB | 29 | **elfcfi.s** | CFI（`.cfi_*` から `.eh_frame`、`.elfcfi`・`.elfcfiinit`・`.elfcfireg`）。x86-64。`.eh_frame` の表は llvm-mc と一致（3.7.11 節）。テスト専用 |
+| **elfcfi.axx** | 1.9 KB | 29 | **elfcfi.s** | CFI（`.cfi_*` から `.eh_frame`、`.elfcfi`・`.elfcfiinit`・`.elfcfireg`）。x86-64。`.eh_frame` の表は llvm-mc と一致（3.7.11 節）。テスト専用 |
 | **elfmips.axx** | 3.1 KB | 31 | **elfmips.s** | REL の書き戻し関数（`.elfencode`、`R_MIPS_HI16`）。MIPS32。命令語・リロケーション・リンク後の `.text` は llvm-mc / ld.lld と一致（3.7.10 節）。テスト専用 |
 | **elfmips64.axx** | 2.5 KB | 28 | **elfmips64.s** | `r_info` を組む関数（`.elfrinfo`）。MIPS64 n64（3.7.10 節）。テスト専用 |
-| **elfword.axx** | 1.7 KB | 24 | **elfword.s** | 加数とシンボル値の単位（`.elfunit::word`）。1 ワード 16 ビットの架空の機種（3.7.10 節）。テスト専用 |
+| **elfword.axx** | 1.6 KB | 24 | **elfword.s** | 加数とシンボル値の単位（`.elfunit::word`）。1 ワード 16 ビットの架空の機種（3.7.10 節）。テスト専用 |
 | **elfrel.axx** | 4.1 KB | 41 | **elfrel.s** | `.elfbuiltin::0` で組み込みの表を使わずに書いた ARM（EM_ARM）の記述と、REL の命令フィールド型（`.elffield` のシフトと補正、3.7.7・3.7.9 節）。命令語とリロケーションは llvm-mc と一致。テスト専用 |
 | **elfsym.axx** | 2.8 KB | 23 | **elfsym.s** | ソース側の ELF シンボル属性（`.type`・`.size`・`.weak`・`.hidden`・`.protected`・`.internal`・`.other`・`.comm`、5.6.1 節）と、2 の冪でない欄の幅（`.elfwidth::3`）・セクションの要素長（`.elfsection` の第 5 欄、3.7.7 節）。機種は組み込みの表に無い EM_MN10300。テスト専用 |
-| **riscv64.axx** | 12 KB | 131 | **riscv64.s**、**riscv64_reloc2.s** | RV64I の基本整数命令（U/I/S/B/J/R 形式、ロード／ストア、分岐、ジャンプ、`call`、`li`/`mv`/`j`/`ret`/`nop`、`ecall`/`ebreak`）。C・M・A・F/D 拡張、CSR、fence 群は含みません。組み込みの EM_RISCV 表はデータ型しか持たないので、`CALL_PLT`・`BRANCH`・`JAL`・`HI20`・`LO12_I`/`_S`・`PCREL` 対を `.elftype`／`.elffield`／`.reloc` で宣言する実例でもあります（3.7.5〜3.7.7 節）。`ld -m elf64lriscv` でリンクでき、動きます |
-| **riscv64full.axx** | 78 KB | 2,225（展開後 4,137） | **riscv64full.s**、**riscv64full_reloc.s**、**riscv64full_reloc2.s**、**riscv64full_edge.s**、**riscv64full_err.s** | RISC-V RV64 の全体: I、M、A（Zabha・Zacas・Zawrs を含む）、F、D、Q、Zfh、Zfa、C（Zca・Zcd・Zcb・Zcmp・Zcmt・Zcmop）、Zba / Zbb / Zbc / Zbs、Zbkb / Zbkc / Zbkx、Zknd / Zkne / Zknh / Zksed / Zksh、Zicond、Zicbom / Zicboz / Zicbop、Zihintntl、Zimop、Zicfiss / Zicfilp、CSR 名つきの Zicsr、特権命令と H 拡張、V 1.0（Zvbb・Zvbc・Zvkg・Zvkned・Zvknh・Zvksed・Zvksh と bf16 の部分を含む）。GNU の疑似命令（任意の 64 ビット定数の `li`、`call`、`tail`、`la`、グローバルのロード／ストアなど）と、丸めモードや `v0.t` マスクの省略可能な指定にも対応します。`riscv64.axx` の上位版で、命令が持つ RISC-V psABI のリロケーションを宣言します。llvm-mc 18 とバイト単位で照合し、`-o` のリロケーションとリンク後のイメージも LLVM のものと照合しました。LLVM 18 に無い部分（Q、Zabha、`vwsll`、`mnret`、`c.ntl.*`、`c.sspush`）は仕様書から起こしています。`riscv64full.s` は各行の実行例、`riscv64full_reloc.s` と `riscv64full_reloc2.s`（`la` / `lla` とグローバルのロード／ストア、PC 相対のデータ、ラベル差。llvm-mc 19 と照合）は `-o` 用 |
+| **riscv64.axx** | 13 KB | 137 | **riscv64.s**、**riscv64_reloc2.s** | RV64I の基本整数命令（U/I/S/B/J/R 形式、ロード／ストア、分岐、ジャンプ、`call`、`li`/`mv`/`j`/`ret`/`nop`、`ecall`/`ebreak`）。C・M・A・F/D 拡張、CSR、fence 群は含みません。組み込みの EM_RISCV 表はデータ型しか持たないので、`CALL_PLT`・`BRANCH`・`JAL`・`HI20`・`LO12_I`/`_S`・`PCREL` 対を `.elftype`／`.elffield`／`.reloc` で宣言する実例でもあります（3.7.5〜3.7.7 節）。`ld -m elf64lriscv` でリンクでき、動きます |
+| **riscv64full.axx** | 78 KB | 281（展開後 3,585） | **riscv64full.s**、**riscv64full_reloc.s**、**riscv64full_reloc2.s**、**riscv64full_edge.s**、**riscv64full_err.s** | RISC-V RV64 の全体: I、M、A（Zabha・Zacas・Zawrs を含む）、F、D、Q、Zfh、Zfa、C（Zca・Zcd・Zcb・Zcmp・Zcmt・Zcmop）、Zba / Zbb / Zbc / Zbs、Zbkb / Zbkc / Zbkx、Zknd / Zkne / Zknh / Zksed / Zksh、Zicond、Zicbom / Zicboz / Zicbop、Zihintntl、Zimop、Zicfiss / Zicfilp、CSR 名つきの Zicsr、特権命令と H 拡張、V 1.0（Zvbb・Zvbc・Zvkg・Zvkned・Zvknh・Zvksed・Zvksh と bf16 の部分を含む）。GNU の疑似命令（任意の 64 ビット定数の `li`、`call`、`tail`、`la`、グローバルのロード／ストアなど）と、丸めモードや `v0.t` マスクの省略可能な指定にも対応します。`riscv64.axx` の上位版で、命令が持つ RISC-V psABI のリロケーションを宣言します。llvm-mc 18 とバイト単位で照合し、`-o` のリロケーションとリンク後のイメージも LLVM のものと照合しました。LLVM 18 に無い部分（Q、Zabha、`vwsll`、`mnret`、`c.ntl.*`、`c.sspush`）は仕様書から起こしています。`riscv64full.s` は各行の実行例、`riscv64full_reloc.s` と `riscv64full_reloc2.s`（`la` / `lla` とグローバルのロード／ストア、PC 相対のデータ、ラベル差。llvm-mc 19 と照合）は `-o` 用 |
 | **endsub.axx** | 1.2 KB | 20 | **endsub.s** | `.sub` ブロックを `.endsub` で閉じる（3.7.2 節）。テスト専用 |
 | **intel2att.axx** | 12 KB | 60（展開後 3,437） | **intel2att.s** | x86-64 Intel 記法 → AT&T 記法 のソース翻訳器。`.textmode`・`!Y`・`!L`・マクロ層でのパターン生成（3.18 節）。翻訳結果は GNU as に通る |
 | **a64tox64_axx.axx** | 32 KB | 152（展開後 1,903） | **bf_aarch64.s** | AArch64 → x86_64 のソース翻訳器。出力は `x86_64.axx` でアセンブルできる記法。ランタイム `a64rt_axx.s`（Linux）・`a64rt_axx_freebsd.s`（FreeBSD）と宣言 `a64ext.s` を使う（3.18 節） |
@@ -4814,7 +4814,7 @@ REX の要る命令（R8〜R15 や SPL〜DIL と組む、REX.W が付くなど�
 だけがラベルを読み、再配置はその欄に付きます）。3 オペランドの `IMUL` の即値形と
 `MOV` の RIP 相対は、32 / 16 / 8 ビットの形もあります。
 
-`test1` は 101 組を両方の実装で実行し、`-b` の生バイナリを比較します。
+`test1` は 104 組を両方の実装で実行し、`-b` の生バイナリを比較します。
 `.textmode` を使う 5 組（`textmode.axx` / `8080toz80.axx` / `intel2att.axx` / `a64tox64_axx.axx` / `expcap.axx`）と、
 `.passthru` で素通しした行を見る `exprmiss.axx` については、`-V` で
 標準出力へ流した翻訳テキストどうしも比較します。`elftype.axx` / `elftype.s` と
@@ -4921,7 +4921,7 @@ pass 1 の中でも配置の振動が同じ周期・同じ反復の番号で報�
 | `format_of_exp_imp_file` | エクスポート/インポートファイル形式 |
 | `axx.1.gz` | man ページ |
 
-`test1` は同梱の 101 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
+`test1` は同梱の 104 組のパターン/ソースの対を両方の実装でアセンブルし、結果を比較します。
 
 ### C.2 外部
 

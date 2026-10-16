@@ -31,12 +31,12 @@ That gap wasn't just dormancy — it doubled as a validation period. VLIW, EPIC,
 
 Not marketing copy — things you can reproduce yourself in a few minutes.
 
-**Two independent implementations agree byte-for-byte.** axx ships a Python implementation (`axx.py`, nicknamed Paxx, 16,611 lines) and a C implementation (`caxx.c`, nicknamed Caxx, 22,920 lines). The bundled `test1` script assembles all eighty-six bundled pattern/source pairs — from the 4004 to x86_64 to AArch64 to PowerPC64 to MIPS to SPARC to a Brainfuck virtual CPU — with both implementations and `cmp`s the results, 222 comparisons in all: the sixteen core pairs also go through `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v` and `-V`, so the ELF32 and ELF64 objects, the DWARF, the listing and the text output are compared too. Run it and you get `test all passed`. This isn't a claim; it's reproducible in five minutes from a fresh clone.
+**Two independent implementations agree byte-for-byte.** axx ships a Python implementation (`axx.py`, nicknamed Paxx, 16,817 lines) and a C implementation (`caxx.c`, nicknamed Caxx, 23,155 lines). The bundled `test1` script assembles all one hundred and four bundled pattern/source pairs — from the 4004 to x86_64 to AArch64 to PowerPC64 to MIPS to SPARC to a Brainfuck virtual CPU — with both implementations and `cmp`s the results, 243 comparisons in all: the sixteen core pairs also go through `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v` and `-V`, so the ELF32 and ELF64 objects, the DWARF, the listing and the text output are compared too. Run it and you get `test all passed`. This isn't a claim; it's reproducible in five minutes from a fresh clone.
 
 **It produces real ELF objects.**
 
 ```sh
-axx x86_64.axx hello.s -o out.o
+axx patfile/x86_64.axx asmsrc/hello.s -o out.o
 file out.o
 # => out.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
 ```
@@ -45,7 +45,7 @@ file out.o
 
 **The grammar itself is free-form.** axx has no tokenizer; it matches character by character. That means it isn't limited to the conventional "mnemonic plus operands" shape — a register-transfer style instruction like `r1 = r2 + r3` is just as legal a pattern as `MOV A,B`. This isn't incidental: LLVM's assembler-generation machinery (TableGen/AsmMatcher) explicitly assumes mnemonic-led syntax, and had to be specially patched to handle Hexagon's mnemonic-less `r0 = r1` transfer syntax. axx never had that assumption baked in to begin with.
 
-**A macro layer keeps large ISAs maintainable.** The full x86_64 pattern set (through AVX-512/EVEX) is 23,923 pattern lines written flat. The macro-based version is 5,787 — a quarter of the size — and expands back to an identical, byte-for-byte matching pattern set at load time. Runtime cost of matching against ~24,000 patterns is still sub-second in the C implementation (0.2 s to assemble `hello.s`).
+**A macro layer keeps large ISAs maintainable.** The full x86_64 pattern set (through AVX-512/EVEX) is 28,659 pattern lines written flat. The macro-based version is 6,531 — a quarter of the size — and expands back to an identical, byte-for-byte matching pattern set at load time. Runtime cost of matching against ~24,000 patterns is still sub-second in the C implementation (0.2 s to assemble `hello.s`).
 
 **When an encoding can't be written as an expression, compute it.** The output field of a pattern is normally just data — `0x03,d` emits two bytes — but it can also be `.call f(d)`, which runs a function written in a small procedural language kept in the same pattern file:
 
