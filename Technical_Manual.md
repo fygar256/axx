@@ -1197,7 +1197,7 @@ its own value.
 The block can be closed with either `.return` or `.endsub`. The two spellings
 mean the same thing and may be mixed in one pattern file; use `.endsub` when you
 want the spelling to match `.func … .endfunc`
-([section 3.15](#315-the-mini-language-func--call)).
+([section 3.15](#315-mini-language-func--call)).
 
 ```
 .sub::<name>
@@ -4319,7 +4319,7 @@ comparisons, because macro-layer precedence follows C and there comparisons
 bind tighter than the bitwise operators.
 
 The mini language does not have these three. The operators listed in
-[section 3.15](#315-the-mini-language-func--call) are all of them: `@` and `'`
+[section 3.15](#315-mini-language-func--call) are all of them: `@` and `'`
 are syntax errors there and `*(` reads as multiplication. Write the same thing
 at the `.call` site (on a pattern line) and pass the result in as an argument.
 
@@ -4701,11 +4701,11 @@ Diagnostics raised by the assembler itself:
 | Condition | Message |
 |---|---|
 | A label collides with a pattern-file symbol | *is a pattern file symbol* |
-| A label is defined more than once | *label already defined* |
+| A label is defined more than once | *label 'name' is already defined.* |
 | A line cannot be parsed | *Syntax error* (let through instead when `.passthru` is on — section 3.16) |
 | A referenced label is never defined | *Label undefined* |
-| Malformed assembler or pattern line | *Illegal syntax in assembler line or pattern line* |
-| An EPIC template is not set | *No VLIW instruction-set defined* |
+| Malformed assembler or pattern line | *Illegal syntax in assemble line or pattern line.* |
+| An EPIC template is not set | *No vliw instruction-set defined.* |
 | A malformed VLIW pattern file | reported during interpretation |
 | The output (`-b` raw binary, or the contents of the `-o` ELF) exceeds 1 GiB | *output size ... exceeds maximum* (usually a wrong `.org`) |
 
