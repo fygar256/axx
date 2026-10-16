@@ -161,14 +161,18 @@ axx は 11 機種ぶんの組み込みの表を持っていますが、表はパ
 | `.elfextern::<型>` | `.extern` が型名を書かなかったときの既定の型 |
 | `.elfdwarf::<型>` | `-g` の DWARF が書く絶対参照の型 |
 | `.elfpcguess::<0>` / `<1>` | 幅から推定した絶対型を PC 相対型に取り替えるか |
+| `.elfunaligned::<型>::<代わりの型>` | データの欄がその幅の境界に合わないとき、代わりに使う型 |
 | `.elfheader::<欄名>::<値>` | ELF ヘッダの欄 |
 | `.elfsection::<名前>::<sh_flags>[::<sh_type>[::<整列>[::<要素長>]]]` | セクションヘッダの属性 |
 | `.elflink::<セクション>::<sh_link>[::<sh_info>]` | セクションの `sh_link` / `sh_info` |
 | `.elfgroup::<名前>::<署名>::<フラグ>::<メンバー>[,...]` | セクショングループ |
 | `.elffield::<型>::<マスク>[::<オフセット>[::<シフト>[::<補正>]]]` | 命令フィールド型 |
+| `.elfresolve::<型>` | この型の PC 相対の欄が同じセクションの局所ラベルを指すなら、axx が解決してリロケーションを出さない |
+| `.elfanchor::<型>` | この型の追加の再配置は、行の最初のリロケーションの位置に置く局所シンボルを指す |
 | `.elfencode::<型>::<関数>` | REL で加数を欄へ書き戻す関数 |
 | `.elfextra::<型>::<添える型>[::<シンボル>]` | 同じ位置に添えるリロケーション |
 | `.elfdiff::<幅または型>::<足す型>::<引く型>` | ラベルの和と差を足す型と引く型の組で出す |
+| `.elfrelax::<0>` / `<1>` | リンカがコードを縮めうるか |
 | `.elfrinfo::<関数>` | `r_info` を組む関数 |
 | `.elfunit::<byte>` / `<word>` | 加数とシンボル値の単位 |
 | `.elfbuiltin::<0>` / `<1>` | 組み込みの表を土台にするか |
@@ -422,6 +426,122 @@ RISC-V の `R_RISCV_RELAX` がこれです。
   `remember_state`、`restore_state`、`return_column`、`signal_frame`、
   `window_save`、`negate_ra_state`、`escape`、`personality`、`lsda`、
   `sections`（読み飛ばす）。
+
+### 2.15 `.elfrelax` — リンカがコードを縮めるか
+
+```
+.elfrelax::<0> / <1>
+```
+
+1（`.elfdiff` を宣言したときの既定）なら、リンカがコードを緩和しうるので、ラベル差は
+セクションの中のものも足す型・引く型のリロケーションで書き、2.14 節の CFI も位置の
+進みをリロケーションで書きます。0（それ以外の既定）なら、リンク時に何も動きません。
+どのラベルも 1 つのセクションで定義され、足す項と引く項の数が同じ差は定数で、
+リロケーションを出さず欄に書きます。CFI も普通の形です。GNU as の `-mno-relax` や、
+緩和なしの llvm-mc が書くのと同じです。セクションをまたぐ差や外部シンボルとの差は、
+それでも対になります。
+
+```
+.elfdiff::4::add32::sub32
+.elfrelax::0
+```
+
+```
+dword dat2-dat     ->  距離そのもの、リロケーションなし
+dword ext-dat      ->  R_RISCV_ADD32 ext   R_RISCV_SUB32 dat
+```
+
+`riscv64.axx` と `riscv64full.axx` は 0 です（そこでは `R_RISCV_RELAX` を出しません）。
+それを出す `elfpair.axx` は 1 を宣言しています。`--elfdesc` は宣言されたときだけ
+これを出します。
+
+### 2.16 `.elfresolve` — その場で解決する分岐
+
+```
+.elfresolve::<型>
+```
+
+`<型>`（`.elffield` を持つ PC 相対の命令欄の型、2.7 節）の欄が、いまアセンブルして
+いるセクションの局所ラベルを指すなら、リロケーションは出しません。リンカが書くのと
+同じ値 `(ラベル + 加数 + 補正 − 位置) >> シフト` を、マスクのビットへ下から詰めて
+書きます。GNU as と llvm-mc がセクション内の分岐を自分で解決するのと同じです。
+`.elfencode` の関数（2.8 節）を持つ型は、代わりにその関数が (欄の値, `ラベル +
+加数 + 補正 − 位置`) から書きます。欄の中でビットが並び替わる型 — AArch64 の
+`adr`、RISC-V の B・J・CB・CJ 形式、`auipc` + `jalr` に分かれる RISC-V の
+`call` — はこれで書きます。
+
+ラベルはこのセクションで定義され、`.global` でも `.weak` でもないこと。それ以外の
+参照はリロケーションのままです。欄に収まらない値や `1 << シフト` の倍数でない値は
+エラーです。`-o` ではパターンの範囲検査をリンカに任せているためです。値が範囲検査の
+ある変位である型にだけ使います（SPARC の `%pc10` のような切り詰める型に書くと範囲外と
+報告されます）。緩和する機種（`.elfrelax::1`、2.15 節）では何も解決しません。
+
+```
+.elffield::wdisp22::0x3fffff::0::2
+.elfresolve::wdisp22
+```
+
+```
+start: nop
+       nop
+       ba start      ->  10bf fffe   リロケーションなし（2 語前）
+       nop
+       ba ext        ->  1080 0000   R_SPARC_WDISP22 ext
+```
+
+`sparc.axx` は WDISP30・WDISP22・WDISP19・WDISP16、`ppc64.axx` / `ppc64le.axx` は
+REL24・REL14、`mips_isa.axx` は PC16・PC21_S2・PC26_S2・PC19_S2、`riscv64.axx` /
+`riscv64full.axx` は BRANCH・JAL・CALL_PLT（と RVC_BRANCH・RVC_JUMP）、
+`aarch64.axx` は JUMP26・CALL26・CONDBR19・TSTBR14・LD_PREL_LO19・ADR_PREL_LO21
+を解決します。どれも llvm-mc 19 が解決するものと同じです。
+
+### 2.17 `.elfanchor` — 命令そのものを指すリロケーション
+
+```
+.elfanchor::<型>
+```
+
+`.reloc` の追加の再配置（`<型>@<オフセット>` の並び）のうち、ここで宣言した型の
+ものは、シンボルではなく、その行の最初のリロケーションの位置に axx が置く局所
+シンボルを指し、加数は型の補正だけです。RISC-V の `auipc` の対がこれで、2 つ目の
+命令の `%pcrel_lo` は `%pcrel_hi` を持つ `auipc` を指します。
+
+```
+.elfanchor::pcrel_lo12_i
+.reloc::v::pcrel_hi20::::pcrel_lo12_i@4
+LA d,!v :: .call pair_i(v-$$,d,0x13|(d<<15)|(d<<7))
+.clrreloc::v
+```
+
+```
+la a0,ext   ->  auipc a0,0    R_RISCV_PCREL_HI20    ext + 0
+                addi  a0,a0,0 R_RISCV_PCREL_LO12_I  .Lanchor0 + 0
+```
+
+局所シンボルの名前は `.Lanchor<n>` です（`.Lcfi<n>` と同じく、ラベルと重なる間は
+`_` を足します）。1 つの位置には、いくつのリロケーションが指しても 1 つのシンボルを
+置きます。効くのは追加の再配置だけで、`.reloc` が直接 `pcrel_lo12_i` を付けた行
+（`%pcrel_lo(label)`）は今までどおりそのラベルを指します。並べる型は `.elffield` を
+持つこと、オフセットは 0〜255 です。
+
+### 2.18 `.elfunaligned` — 境界に合わないデータの型
+
+```
+.elfunaligned::<型>::<代わりの型>
+```
+
+`.reloc` が型を付けていない欄（データ）で、決まった型が `<型>` で、欄のセクションの
+中の位置が欄の幅の倍数でなければ、`<代わりの型>` にします。境界に合わない位置用の
+型を持つ機種のためのもので、`sparc.axx` は `r64` / `r32` / `r16` に `R_SPARC_UA64` /
+`UA32` / `UA16` を当てています（llvm-mc と同じ）。型を欄の幅から推測したあと、
+`.elfpcguess` の取り替え（2.13 節）のあとに見ます。
+
+```
+.elfunaligned::r64::ua64
+        .section .data
+        WORD    ext             ; .data+0  -> R_SPARC_32
+        XWORD   ext+8           ; .data+4  -> R_SPARC_UA64（4 は 8 の倍数でない）
+```
 
 ---
 

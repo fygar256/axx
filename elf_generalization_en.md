@@ -175,14 +175,18 @@ written.
 | `.elfextern::<type>` | the default type for `.extern` with no type name |
 | `.elfdwarf::<type>` | the absolute type the `-g` DWARF output uses |
 | `.elfpcguess::<0>` / `<1>` | whether a width-guessed absolute type may become PC-relative |
+| `.elfunaligned::<type>::<unaligned type>` | the type used instead when a data field is not aligned to its width |
 | `.elfheader::<field>::<value>` | a field of the ELF header |
 | `.elfsection::<name>::<sh_flags>[::<sh_type>[::<align>[::<entsize>]]]` | the attributes of a section header |
 | `.elflink::<section>::<sh_link>[::<sh_info>]` | the `sh_link` / `sh_info` of a section |
 | `.elfgroup::<name>::<signature>::<flags>::<member>[,...]` | a section group |
 | `.elffield::<type>::<mask>[::<offset>[::<shift>[::<bias>]]]` | an instruction-field type |
+| `.elfresolve::<type>` | a PC-relative field of this type that refers to a local label of the same section is resolved by axx, with no relocation |
+| `.elfanchor::<type>` | an extra relocation of this type names a local symbol on the row's first relocation |
 | `.elfencode::<type>::<function>` | the function that writes a REL addend back |
 | `.elfextra::<type>::<companion>[::<symbol>]` | a relocation added at the same offset |
 | `.elfdiff::<width or type>::<add type>::<subtract type>` | sums and differences of labels as add/subtract relocations |
+| `.elfrelax::<0>` / `<1>` | whether the linker may shrink code |
 | `.elfrinfo::<function>` | the function that lays out `r_info` |
 | `.elfunit::<byte>` / `<word>` | the unit of addends and symbol values |
 | `.elfbuiltin::<0>` / `<1>` | whether the built-in table is the base |
@@ -452,6 +456,127 @@ as). What depends on the machine is declared in the pattern file.
   `remember_state`, `restore_state`, `return_column`, `signal_frame`,
   `window_save`, `negate_ra_state`, `escape`, `personality`, `lsda`, and
   `sections` (ignored).
+
+### 2.15 `.elfrelax` — whether the linker shrinks code
+
+```
+.elfrelax::<0> / <1>
+```
+
+With 1 (the default when an `.elfdiff` is declared) the linker may relax the
+code, so every label difference is written as its add/subtract relocations, even
+one inside a section, and the CFI of 2.14 is written with relocated advances.
+With 0 (the default otherwise) nothing moves at link time: a difference whose
+labels are all defined in one section, with as many added as subtracted, is a
+constant written into the field with no relocation, and the CFI is the plain
+form — what GNU as `-mno-relax` and llvm-mc without relaxation write. A
+difference across sections, or with an external symbol, still gets its pair.
+
+```
+.elfdiff::4::add32::sub32
+.elfrelax::0
+```
+
+```
+dword dat2-dat     ->  the distance, no relocation
+dword ext-dat      ->  R_RISCV_ADD32 ext   R_RISCV_SUB32 dat
+```
+
+`riscv64.axx` and `riscv64full.axx` declare 0 (they write no `R_RISCV_RELAX`);
+`elfpair.axx`, which does, declares 1. `--elfdesc` writes it only when declared.
+
+### 2.16 `.elfresolve` — branches resolved in place
+
+```
+.elfresolve::<type>
+```
+
+A field of `<type>` — a PC-relative instruction-field type with an `.elffield`
+(2.7) — that refers to a local label of the section being assembled gets no
+relocation: axx writes into it the value a linker would, `(label + addend + bias
+- place) >> shift`, filling the mask's bits from the bottom up, as GNU as and
+llvm-mc resolve a branch within a section. A type with an `.elfencode` function
+(2.8) is written by that function instead, given (the field, `label + addend +
+bias - place`); that is how fields whose bits are reordered are written (the
+AArch64 `adr`, the RISC-V B, J, CB and CJ formats, the RISC-V `call` over
+`auipc` + `jalr`).
+
+The label must be defined in this section and be neither `.global` nor `.weak`;
+any other reference keeps its relocation. A value that does not fit the field, or
+is not a multiple of `1 << shift`, is an error, since under `-o` the pattern's
+range checks are left to the linker. Use it only for a type whose value is a
+displacement checked for range (a truncating type such as SPARC's `%pc10` would be
+reported as out of range). Nothing is resolved on a machine that relaxes
+(`.elfrelax::1`, 2.15).
+
+```
+.elffield::wdisp22::0x3fffff::0::2
+.elfresolve::wdisp22
+```
+
+```
+start: nop
+       nop
+       ba start      ->  10bf fffe   no relocation (two words back)
+       nop
+       ba ext        ->  1080 0000   R_SPARC_WDISP22 ext
+```
+
+`sparc.axx` resolves WDISP30, WDISP22, WDISP19 and WDISP16, `ppc64.axx` /
+`ppc64le.axx` REL24 and REL14, `mips_isa.axx` PC16, PC21_S2, PC26_S2 and PC19_S2,
+`riscv64.axx` / `riscv64full.axx` BRANCH, JAL, CALL_PLT (and RVC_BRANCH /
+RVC_JUMP), and `aarch64.axx` JUMP26, CALL26, CONDBR19, TSTBR14, LD_PREL_LO19 and
+ADR_PREL_LO21 — the same ones llvm-mc 19 resolves.
+
+### 2.17 `.elfanchor` — a relocation that points at the instruction
+
+```
+.elfanchor::<type>
+```
+
+An extra relocation of `.reloc` (the `<type>@<offset>` list) whose type is
+declared here does not name the symbol: it names a local symbol axx places where
+the row's first relocation is, and its addend is the type's bias alone. This is
+the RISC-V `auipc` pair, whose `%pcrel_lo` names the `auipc` that holds the
+`%pcrel_hi`:
+
+```
+.elfanchor::pcrel_lo12_i
+.reloc::v::pcrel_hi20::::pcrel_lo12_i@4
+LA d,!v :: .call pair_i(v-$$,d,0x13|(d<<15)|(d<<7))
+.clrreloc::v
+```
+
+```
+la a0,ext   ->  auipc a0,0    R_RISCV_PCREL_HI20    ext + 0
+                addi  a0,a0,0 R_RISCV_PCREL_LO12_I  .Lanchor0 + 0
+```
+
+The local symbol is named `.Lanchor<n>` (an underscore is added while the name is
+taken by a label, as for `.Lcfi<n>`), and one place gets one symbol however many
+relocations point at it. Only extra relocations are affected: a row that `.reloc`
+types `pcrel_lo12_i` directly (`%pcrel_lo(label)`) still names its label. Each
+type must have an `.elffield`, and an offset is 0-255.
+
+### 2.18 `.elfunaligned` — types for unaligned data
+
+```
+.elfunaligned::<type>::<unaligned type>
+```
+
+In a data field (one `.reloc` does not type), when the type decided is `<type>`
+and the field's offset in its section is not a multiple of the field's width,
+`<unaligned type>` is used instead. It is for machines with relocation types for
+unaligned places; `sparc.axx` gives `r64` / `r32` / `r16` the types
+`R_SPARC_UA64` / `UA32` / `UA16`, as llvm-mc does. It is looked at after the type
+is guessed from the width and after the `.elfpcguess` swap (2.13).
+
+```
+.elfunaligned::r64::ua64
+        .section .data
+        WORD    ext             ; .data+0 -> R_SPARC_32
+        XWORD   ext+8           ; .data+4 -> R_SPARC_UA64 (4 is not a multiple of 8)
+```
 
 ---
 
