@@ -5187,8 +5187,8 @@ compared as well. The `regress.axx` regression test compares `regress.s` by its 
 `regresself.s`, assembled with `z80.axx`, by the diagnostics of `-o` on standard error. The twelve MIPS pairs (`mips.axx`, `mipsel.axx`, `mips64.axx`
 and `mips64el.axx` with `mips.s` and with `mips_ase.s`, the four Release 6 files
 with `mipsr6.s`) also compare their `-o` ELF objects (ELF32 REL for o32, ELF64
-RELA for n64) besides the `-b` binaries. Of the three SPARC pairs,
-`sparc_reloc.s` and `bf_sparc.s` compare their `-o` ELF objects. The two
+RELA for n64) besides the `-b` binaries. Of the SPARC pairs with
+`sparc_test.s`, `sparc_reloc.s` and `bf_sparc.s`, the last two compare their `-o` ELF objects. The two
 PowerPC64 pairs (`ppc64.axx` and `ppc64le.axx` with `ppc64_reloc2.s`) compare their
 `-o` ELF objects: the DS / DQ-form fields (the mask field of `.reloc`) and the
 PC-relative data of `.elfpcguess`. The two RISC-V pairs (`riscv64full.axx` with

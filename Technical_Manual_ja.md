@@ -4848,8 +4848,8 @@ REX の要る命令（R8〜R15 や SPL〜DIL と組む、REX.W が付くなど�
 診断で比較します。
 MIPS の 12 組（`mips.axx`・`mipsel.axx`・`mips64.axx`・`mips64el.axx` と `mips.s`・
 `mips_ase.s`、R6 の 4 つと `mipsr6.s`）は、`-b` に加えて `-o` の ELF オブジェクト
-（o32 は ELF32 の REL、n64 は ELF64 の RELA）どうしも比較します。SPARC の 3 組のうち
-`sparc_reloc.s` と `bf_sparc.s` は `-o` の ELF オブジェクトどうしを比較します。
+（o32 は ELF32 の REL、n64 は ELF64 の RELA）どうしも比較します。SPARC の組のうち
+`sparc_test.s`・`sparc_reloc.s`・`bf_sparc.s` の 3 組では、後ろの 2 組（`sparc_reloc.s` と `bf_sparc.s`）が `-o` の ELF オブジェクトどうしを比較します。
 PowerPC64 の 2 組（`ppc64.axx` と `ppc64le.axx` に `ppc64_reloc2.s`）は `-o` の ELF
 オブジェクトどうしを比較します。DS / DQ 形式の欄（`.reloc` のマスクの欄）と
 `.elfpcguess` の PC 相対のデータを見る組です。RISC-V の 2 組（`riscv64full.axx` に
