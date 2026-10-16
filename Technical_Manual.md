@@ -4437,7 +4437,7 @@ the same specs, reject the same specs, and agree on the error wording.
   type      ::= b c d e E f F g G n o s x X %
 ```
 
-`!{255:#06x}` gives `0x00ff`, `!{1234567:,d}` gives `1,234,567`, `!{255:*^9b}`
+`!{255:#06x}` gives `0x00ff`, `!{1234567:,d}` gives `1,234,567`, `!{255:*^10b}`
 gives `*11111111*`, `!{255:.2f}` gives `255.00`. Python's restrictions apply
 too: no precision on integer types, no `,` with `x`/`X`/`o`/`b`/`c`/`n`, no
 sign or `#` on a string.

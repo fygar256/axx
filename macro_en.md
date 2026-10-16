@@ -31,6 +31,7 @@ The opening `{` must appear at the end of the header line, and the closing `}` a
 |---|---|
 | `!{expr}` | Expand value to text |
 | `!{expr:04x}` | Apply Python-style formatting |
+| `\!{` | Literal `!{` |
 
 The format spec is Python's format mini-language. Both implementations
 implement the same grammar, and agree on which specs are accepted, which are
@@ -44,7 +45,7 @@ rejected, and the wording of the resulting error.
   type      ::= b c d e E f F g G n o s x X %
 ```
 
-`!{255:#06x}` gives `0x00ff`, `!{1234567:,d}` gives `1,234,567`, `!{255:*^9b}`
+`!{255:#06x}` gives `0x00ff`, `!{1234567:,d}` gives `1,234,567`, `!{255:*^10b}`
 gives `*11111111*`, `!{255:.2f}` gives `255.00`. Python's restrictions apply
 too: no precision on integer types, no `,` with `x`/`X`/`o`/`b`/`c`/`n`, no
 sign or `#` on a string.
@@ -56,11 +57,10 @@ the one thing that cannot be expressed; it behaves like `!{5:d}`.
 **Known difference**: `!{0:c}` (code point 0) yields a NUL character from
 axx.py, but an empty string from caxx, which cannot carry a NUL inside a C
 string.
-| `\!{` | Literal `!{` |
 
-## Values ​​and Operators
+## Values and Operators
 
-Values ​​are limited to integers and strings. Operators are C-compliant:
+Values are limited to integers and strings. Operators are C-compliant:
 `?:` `||` `&&` `|` `^` `&` `==` `!=` `<` `<=` `>` `>=` `<<` `>>` `+` `-` `*` `/` `%`
 plus unary `-` `+` `~` `!`. `/` and `%` truncate towards zero, just like in C (`-7/2 == -3`).
 `+` performs concatenation if either operand is a string; `"ab" * 3` performs repetition.
@@ -185,11 +185,23 @@ Pattern files (`.axx`) go through the same macro layer as source files. An instr
 !alu("SUB", 0x90)
 ```
 
+The error field can be generated too, so a range check written once applies to every generated row:
+
+```
+!def imm(name, op) {
+!{name} A,!v :: v>0xff;2,v<0;2 :: 0x!{op:02x},v
+}
+!imm("ADDI", 0xc6)
+!imm("SUBI", 0xd6)
+```
+
 Only three things differ from the source side; the syntax, the built-in functions and the runaway guards are all the same.
 
 1. **A separate namespace.** The pattern side and the source side have independent macro environments and cannot see each other's macros or variables. A pattern file's macros can therefore never change how a source file expands, and the per-pass reset the source side performs during relaxation can never wipe macros defined while reading the pattern file.
 2. **Comments on statement lines start with a slash-star sequence**, matching pattern-file convention. `;` is not a comment marker there, because it separates the error-code suffix of a pattern's error field (`v>0xff;2`).
 3. **A stricter engage condition.** In a pattern file `!` is the pattern-variable sigil (`ADD A,!d`), so it appears on nearly every line. The layer is therefore engaged only when a line would really be taken as a macro statement, or contains an unescaped `!{...}`, or starts with `}`. A pattern file that uses no macros skips the layer entirely and produces byte-identical output in the same time as before.
+
+Use `-p` to inspect the generated pattern text without assembling.
 
 `.INCLUDE` on the pattern side is processed *after* macro expansion, so a macro can generate the `.INCLUDE` line itself. Each `.INCLUDE`d pattern file is macro-expanded in turn, inheriting the macros defined by the top-level pattern file.
 
