@@ -2516,10 +2516,6 @@ typedef struct {
     char      *pat_include_chain[64];
     int        pat_include_depth;
 
-    char      *combo_budget_warned_file[64];
-    int        combo_budget_warned_line[64];
-    int        combo_budget_warned_count;
-
     SecRangeVec section_ranges;
 
     int        equ_section_tracking;
@@ -6582,12 +6578,21 @@ static uint256_t expr_term8(Assembler *asmb, const char *s, int idx, int *idx_ou
 }
 
 static int skip_subexpr(const char *s, int idx);
+static int skip_subexpr_until_or(const char *s, int idx);
 
-/* `&&`。 */
+/* `&&`。左が偽と決まっていれば右は評価せずに読み飛ばす（短絡。axx.py の
+   term9() と同じ）。三項演算子の選ばれなかった側と同じく、右の `:=` の代入も、
+   右だけで起きる 0 除算などのエラーも走らない。左が UNDEF のときは決められ
+   ないので、今までどおり右も評価する。 */
 static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term8(asmb,s,idx,&idx);
     int slen=expr_slen(s);
     while(idx<slen && axx_q(s,slen,"&&",idx)){
+        if(!u256_is_undef(x) && expr_is_false(asmb,x)){
+            idx = skip_subexpr_until_or(s, idx+2);
+            x = expr_bool(asmb, 0);
+            continue;
+        }
         uint256_t t=expr_term8(asmb,s,idx+2,&idx);
         if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
         x=expr_bool(asmb, (!expr_is_false(asmb,x) && !expr_is_false(asmb,t))?1:0);
@@ -6595,11 +6600,18 @@ static uint256_t expr_term9(Assembler *asmb, const char *s, int idx, int *idx_ou
     *idx_out=idx; return x;
 }
 
-/* `||`。 */
+/* `||`。左が真と決まっていれば右は評価せずに読み飛ばす（短絡。axx.py の
+   term10() と同じ）。右の項は `&&` の連なりを含むので、skip_subexpr() で
+   `?` `,` `;` `:` か対応しない閉じ括弧まで飛ばす。 */
 static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_out){
     uint256_t x=expr_term9(asmb,s,idx,&idx);
     int slen=expr_slen(s);
     while(idx<slen && axx_q(s,slen,"||",idx)){
+        if(!u256_is_undef(x) && !expr_is_false(asmb,x)){
+            idx = skip_subexpr(s, idx+2);
+            x = expr_bool(asmb, 1);
+            continue;
+        }
         uint256_t t=expr_term9(asmb,s,idx+2,&idx);
         if(UNDEF2(x, t)){ x = UNDEF_VAL(); continue; }
         x=expr_bool(asmb, (!expr_is_false(asmb,x) || !expr_is_false(asmb,t))?1:0);
@@ -6607,6 +6619,23 @@ static uint256_t expr_term10(Assembler *asmb, const char *s, int idx, int *idx_o
     *idx_out=idx; return x;
 }
 
+
+/* i の `'` が文字定数なら、その直後の位置を返す。文字定数でなければ i+1
+   （符号拡張の `'`）。`'c'` `'\c'` `'\xHH'` を認める。axx.py の
+   StringUtils.skip_squote_literal() と同じ判定で、`'c'` の c は 1 バイト。 */
+static int skip_char_literal(const char *s, int i){
+    int slen = expr_slen(s);
+    int j = i + 1;
+    if(j < slen && s[j] == '\\' && j + 1 < slen){
+        char esc = s[j+1];
+        if(esc == 'x' || esc == 'X'){
+            int k = j + 2, nd = 0;
+            while(k < slen && nd < 2 && isxdigit((unsigned char)s[k])){ k++; nd++; }
+            if(k < slen && s[k] == '\'') return k + 1;
+        } else if(j + 2 < slen && s[j+2] == '\'') return j + 3;
+    } else if(j < slen && j + 1 < slen && s[j+1] == '\'') return j + 2;
+    return i + 1;
+}
 
 /* 括弧の対応を数えて部分式 1 個を読み飛ばす。 */
 static int skip_subexpr(const char *s, int idx) {
@@ -6616,6 +6645,46 @@ static int skip_subexpr(const char *s, int idx) {
     int ob_depth    = 0;
     while(idx < slen && s[idx]){
         char c = s[idx];
+        /* 文字定数 `')'` `','` の中の括弧や区切りで止まらないよう、評価器と同じ
+           判定で一まとまりに飛ばす（axx.py の _skip_subexpr() と同じ）。 */
+        if(c == '\'') { idx = skip_char_literal(s, idx); continue; }
+        if(c == '(') { paren_depth++; idx++; }
+        else if(c == ')') {
+            if(paren_depth > 0){ paren_depth--; idx++; }
+            else break;
+        }
+        else if(c == '[') { brack_depth++; idx++; }
+        else if(c == ']') {
+            if(brack_depth > 0){ brack_depth--; idx++; }
+            else break;
+        }
+        else if(c == OB_CHAR) { ob_depth++; idx++; }
+        else if(c == CB_CHAR) {
+            if(ob_depth > 0){ ob_depth--; idx++; }
+            else break;
+        }
+        else if(paren_depth == 0 && brack_depth == 0 && ob_depth == 0
+                && (c == '?' || c == ',' || c == ';')) break;
+        else if(paren_depth == 0 && brack_depth == 0 && ob_depth == 0
+                && c == ':' && s[idx+1] != '=') break;
+        else idx++;
+    }
+    return idx;
+}
+
+/* skip_subexpr() と同じだが、深さ 0 の `||` でも止まる。短絡した `&&` の
+   右の項を飛ばすのに使う（`&&` の右の項は `||` より強く結合する）。axx.py の
+   _skip_subexpr_until_or() と同じ。 */
+static int skip_subexpr_until_or(const char *s, int idx) {
+    int slen = expr_slen(s);
+    int paren_depth = 0;
+    int brack_depth = 0;
+    int ob_depth    = 0;
+    while(idx < slen && s[idx]){
+        char c = s[idx];
+        if(c == '\'') { idx = skip_char_literal(s, idx); continue; }
+        if(paren_depth == 0 && brack_depth == 0 && ob_depth == 0
+           && c == '|' && s[idx+1] == '|') break;
         if(c == '(') { paren_depth++; idx++; }
         else if(c == ')') {
             if(paren_depth > 0){ paren_depth--; idx++; }
@@ -9531,9 +9600,28 @@ static int pat_match0_brackets(Assembler *asmb, const char *s, const char *t_ori
 
     enum { MAX_OPT_GROUPS = 20 };
     if(cnt > MAX_OPT_GROUPS){
-        axx_diagf(0, 0, " warning - pattern has %d optional groups (max %d); "
-                   "first %d are treated as optional, remainder are always included.\n",
-                   cnt, MAX_OPT_GROUPS, MAX_OPT_GROUPS);
+        /* パターンそのものについての知らせなので、照合の試行の溜め置きを
+           通さずに出す（試行が採られないと捨てられ、一度も出なかった）。
+           報告してよいパスで、パターンごとに一度だけ。axx.py と同じ。 */
+        static char *warned_pat[64];
+        static int warned_n = 0;
+        int already = 0;
+        for(int wi = 0; wi < warned_n; wi++)
+            if(strcmp(warned_pat[wi], t) == 0){ already = 1; break; }
+        if(!already && should_report_errors(&asmb->st)){
+            if(warned_n < (int)(sizeof(warned_pat)/sizeof(warned_pat[0]))){
+                warned_pat[warned_n] = strdup(t);
+                if(!warned_pat[warned_n]){ perror("strdup"); exit(1); }
+                warned_n++;
+            }
+            char msg[256];
+            snprintf(msg, sizeof(msg), " warning - pattern has %d optional groups (max %d); "
+                     "first %d are treated as optional, remainder are always included.\n",
+                     cnt, MAX_OPT_GROUPS, MAX_OPT_GROUPS);
+            char *loc = diag_locate(&asmb->st, msg);
+            axx_diagf(0, 1, "%s", loc ? loc : msg);
+            free(loc);
+        }
         cnt = MAX_OPT_GROUPS;
     }
 
@@ -9549,26 +9637,30 @@ static int pat_match0_brackets(Assembler *asmb, const char *s, const char *t_ori
       for(int k=0;k<size;k++) comb[k]=k;
       while(!found){
         if(++tried > MAX_COMBINATIONS){
-            int _already_warned = 0;
-            for(int _wi=0; _wi<asmb->st.combo_budget_warned_count; _wi++){
-                if(asmb->st.combo_budget_warned_line[_wi] == asmb->st.ln &&
-                   strcmp(asmb->st.combo_budget_warned_file[_wi], asmb->st.current_file) == 0){
-                    _already_warned = 1;
-                    break;
+            /* 上と同じく溜め置きを通さずに出す。この行が不一致になる理由なので、
+               試行が採られないときこそ知らせる必要がある。上限を超えるパターンは
+               どの行と照らしても超える（当たらない行でも全組み合わせを試す）ので、
+               行ごとではなくパターンごとに一度だけ、最初に起きた行の場所を付けて
+               出す（axx.py と同じ）。 */
+            static char *budget_pat[64];
+            static int budget_n = 0;
+            int already = 0;
+            for(int wi = 0; wi < budget_n; wi++)
+                if(strcmp(budget_pat[wi], t) == 0){ already = 1; break; }
+            if(!already && should_report_errors(&asmb->st)){
+                if(budget_n < (int)(sizeof(budget_pat)/sizeof(budget_pat[0]))){
+                    budget_pat[budget_n] = strdup(t);
+                    if(!budget_pat[budget_n]){ perror("strdup"); exit(1); }
+                    budget_n++;
                 }
-            }
-            if(!_already_warned){
-                if(asmb->st.combo_budget_warned_count <
-                        (int)(sizeof(asmb->st.combo_budget_warned_line)/sizeof(int))){
-                    int _wi = asmb->st.combo_budget_warned_count++;
-                    asmb->st.combo_budget_warned_file[_wi] = strdup(asmb->st.current_file);
-                    if(!asmb->st.combo_budget_warned_file[_wi]){ perror("strdup"); exit(1); }
-                    asmb->st.combo_budget_warned_line[_wi] = asmb->st.ln;
-                }
-                axx_diagf(0, 0, " warning - a pattern with %d optional group(s) exceeded the "
-                           "%llu-combination match budget and was treated as non-matching; "
-                           "consider splitting it into multiple explicit pattern entries.\n",
-                           cnt, (unsigned long long)MAX_COMBINATIONS);
+                char msg[320];
+                snprintf(msg, sizeof(msg), " warning - a pattern with %d optional group(s) exceeded the "
+                         "%llu-combination match budget and was treated as non-matching; "
+                         "consider splitting it into multiple explicit pattern entries.\n",
+                         cnt, (unsigned long long)MAX_COMBINATIONS);
+                char *loc = diag_locate(&asmb->st, msg);
+                axx_diagf(0, 1, "%s", loc ? loc : msg);
+                free(loc);
             }
             goto combo_done;
         }

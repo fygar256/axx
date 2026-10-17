@@ -31,3 +31,10 @@ C64 -9223372036854775809
 CX 0xffffffffffffffff
 CD 7
 CA 60
+; 2026-10-18: 短絡しない側の見張りは働く（100/10 > 3 でエラー 3）。`[[ ]]` が 20 個を
+; 超えるパターンの警告はパターンごとに 1 回、組み合わせの上限で当たらなかった警告も 1 回
+CZ 10
+oh bbbbbbbbbbbbbbbbbbbbbc
+oh bbbbbbbbbbbbbbbbbbbbbc
+og bbbbbbbbc
+og bbbbbbbbc

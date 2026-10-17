@@ -168,7 +168,13 @@ regress.axx                         regression test for disagreements between
                                     the macro layer; and (2026-10-13)
                                     mnemonics with `_` after a capital letter
                                     (VADDSS_E), which the prefix index used to
-                                    drop
+                                    drop; and (2026-10-18) `&&` / `||` that
+                                    short-circuit (a guard such as
+                                    x!=0 && 100/x>3), skipping past character
+                                    constants such as ')' (`?:` too), and the
+                                    warnings for too many `[[ ]]` groups and
+                                    for the combination budget, which never
+                                    came out
 regress.s                          test assemble file for regress.axx (-V text)
 regresserr.s                        test assemble file for regress.axx (the
                                     diagnostics on standard error)

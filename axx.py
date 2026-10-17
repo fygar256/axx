@@ -1912,8 +1912,10 @@ class RelaxationState:
         # 未定義ラベルを楽観的に扱い、短い符号化から試させるためのもの。
         self.relax_optimistic = False
 
-        # 組み合わせ数の上限に当たったことを行ごとに一度だけ警告するための印。
+        # 組み合わせ数の上限に当たったパターンを一度だけ警告するための印。
         self.combo_budget_warned = set()
+        # 省略可能部分の数が上限を超えたパターンを一度だけ警告するための印。
+        self.optgroups_warned = set()
 
 
 class AssemblerState:
@@ -2202,6 +2204,7 @@ class AssemblerState:
         '_relax_prev_values':    ('relax', 'relax_prev_values'),
         '_relax_optimistic':     ('relax', 'relax_optimistic'),
         '_combo_budget_warned':  ('relax', 'combo_budget_warned'),
+        '_optgroups_warned':     ('relax', 'optgroups_warned'),
 
         'vliwinstbits':     ('vliw', 'instbits'),
         'vliwnop':          ('vliw', 'nop'),
@@ -4532,20 +4535,89 @@ class ExpressionEvaluator:
         return self.term7(s, idx)
 
     def term9(self, s, idx):
-        """`&&`。結果は 1 か 0。"""
+        """`&&`。結果は 1 か 0。
+
+        左が偽と決まっていれば右は評価せずに読み飛ばす（短絡。caxx.c の
+        expr_term9() と同じ）。三項演算子の選ばれなかった側と同じく、右の
+        `:=` の代入も、右だけで起きる 0 除算などのエラーも走らない。左が
+        UNDEF のときは決められないので、今までどおり右も評価する。
+        """
         x, idx = self.term8(s, idx)
         while idx < len(s) and StringUtils.q(s, '&&', idx):
+            if not _undef(x) and not x:
+                idx = self._skip_logic_operand(s, idx + 2, True)
+                x = 0
+                continue
             t, idx = self.term8(s, idx + 2)
             x = UNDEF if _undef(x) or _undef(t) else (1 if x and t else 0)
         return x, idx
 
     def term10(self, s, idx):
-        """`||`。結果は 1 か 0。"""
+        """`||`。結果は 1 か 0。
+
+        左が真と決まっていれば右は評価せずに読み飛ばす（短絡。caxx.c の
+        expr_term10() と同じ）。
+        """
         x, idx = self.term9(s, idx)
         while idx < len(s) and StringUtils.q(s, '||', idx):
+            if not _undef(x) and x:
+                idx = self._skip_logic_operand(s, idx + 2, False)
+                x = 1
+                continue
             t, idx = self.term9(s, idx + 2)
             x = UNDEF if _undef(x) or _undef(t) else (1 if x or t else 0)
         return x, idx
+
+    @classmethod
+    def _skip_logic_operand(cls, s, idx, stop_at_or):
+        """短絡した `&&` / `||` の右の項を読み飛ばした位置を返す。
+
+        区切りは _skip_subexpr() と同じ（深さ 0 の `?` `,` `;` `:`、対応しない
+        閉じ括弧）。`&&` の右の項は `||` より強く結合するので、stop_at_or が
+        真なら深さ 0 の `||` でも止まる。`||` の右の項は `&&` の連なりを
+        含むので、そこでは止まらない。
+        """
+        if stop_at_or:
+            return cls._skip_subexpr_until_or(s, idx)
+        return cls._skip_subexpr(s, idx)
+
+    @staticmethod
+    def _skip_subexpr_until_or(s, idx):
+        """_skip_subexpr() と同じだが、深さ 0 の `||` でも止まる。"""
+        paren = brack = ob = 0
+        n = len(s)
+        while idx < n and s[idx] != chr(0):
+            c = s[idx]
+            if c == "'":
+                idx = StringUtils.skip_squote_literal(s, idx)
+                continue
+            if paren == 0 and brack == 0 and ob == 0 and s.startswith('||', idx):
+                break
+            if c == '(':
+                paren += 1
+            elif c == ')':
+                if paren <= 0:
+                    break
+                paren -= 1
+            elif c == '[':
+                brack += 1
+            elif c == ']':
+                if brack <= 0:
+                    break
+                brack -= 1
+            elif c == OB:
+                ob += 1
+            elif c == CB:
+                if ob <= 0:
+                    break
+                ob -= 1
+            elif paren == 0 and brack == 0 and ob == 0 and c in '?,;':
+                break
+            elif (paren == 0 and brack == 0 and ob == 0 and c == ':'
+                    and (idx + 1 >= n or s[idx + 1] != '=')):
+                break
+            idx += 1
+        return idx
 
     @staticmethod
     def _skip_subexpr(s, idx):
@@ -4554,6 +4626,12 @@ class ExpressionEvaluator:
         n = len(s)
         while idx < n and s[idx] != chr(0):
             c = s[idx]
+            if c == "'":
+                # 文字定数 `')'` `','` の中の括弧や区切りで止まらないよう、評価器と
+                # 同じ判定（skip_squote_literal）で一まとまりに飛ばす。文字定数で
+                # なければ 1 文字進む（符号拡張の `'`）。caxx.c の skip_subexpr() と同じ。
+                idx = StringUtils.skip_squote_literal(s, idx)
+                continue
             if c == '(':
                 paren += 1
                 idx += 1
@@ -7254,7 +7332,7 @@ class PatternMatcher:
         取り除く群の数を 0 個から増やしていくので、省略可能部分は
         「できるだけ残す」方向から試される。群の数は 20 までで、
         それを超えたぶんは常に含める。組み合わせの総数にも上限 (65536) が
-        あり、超えたパターンは不一致として扱い、行ごとに一度だけ警告する。
+        あり、超えたパターンは不一致として扱い、パターンごとに一度だけ警告する。
         組み合わせ爆発でアセンブルが止まらなくなるのを防ぐため。
         ここも試行ごとに状態を保存して巻き戻す。
         """
@@ -7270,9 +7348,16 @@ class PatternMatcher:
 
         _MAX_OPT_GROUPS = 20
         if cnt > _MAX_OPT_GROUPS:
-            self.state.diag(f" warning - pattern has {cnt} optional groups (max {_MAX_OPT_GROUPS}); "
-                     f"first {_MAX_OPT_GROUPS} are treated as optional, "
-                     f"remainder are always included.", set_error=False)
+            # パターンそのものについての知らせなので、照合の試行の溜め置きを
+            # 通さずに出す（試行が採られないと捨てられ、一度も出なかった）。
+            # 報告してよいパスで、パターンごとに一度だけ。caxx.c と同じ。
+            if (self.state.should_report_errors()
+                    and t not in self.state._optgroups_warned):
+                self.state._optgroups_warned.add(t)
+                self.state.diag(self.state._diag_locate(
+                    f" warning - pattern has {cnt} optional groups (max {_MAX_OPT_GROUPS}); "
+                    f"first {_MAX_OPT_GROUPS} are treated as optional, "
+                    f"remainder are always included."), set_error=False, force=True)
             sl = sl[:_MAX_OPT_GROUPS]
             cnt = _MAX_OPT_GROUPS
 
@@ -7283,15 +7368,19 @@ class PatternMatcher:
                 _tried += 1
                 if _tried > self._MAX_COMBINATIONS:
 
-                    _warn_key = (getattr(self.state, 'current_file', None),
-                                 getattr(self.state, 'ln', None), t)
+                    # 上と同じく溜め置きを通さずに出す。この行が不一致になる理由
+                    # なので、試行が採られないときこそ知らせる必要がある。上限を
+                    # 超えるパターンはどの行と照らしても超える（当たらない行でも
+                    # 全組み合わせを試す）ので、行ごとではなくパターンごとに一度
+                    # だけ、最初に起きた行の場所を付けて出す（caxx.c と同じ）。
                     if (self.state.should_report_errors()
-                            and _warn_key not in self.state._combo_budget_warned):
-                        self.state._combo_budget_warned.add(_warn_key)
-                        self.state.diag(f" warning - a pattern with {cnt} optional group(s) exceeded the "
-                             f"{self._MAX_COMBINATIONS}-combination match budget and was treated "
-                             f"as non-matching; consider splitting it into multiple explicit "
-                             f"pattern entries.", set_error=False)
+                            and t not in self.state._combo_budget_warned):
+                        self.state._combo_budget_warned.add(t)
+                        self.state.diag(self.state._diag_locate(
+                            f" warning - a pattern with {cnt} optional group(s) exceeded the "
+                            f"{self._MAX_COMBINATIONS}-combination match budget and was treated "
+                            f"as non-matching; consider splitting it into multiple explicit "
+                            f"pattern entries."), set_error=False, force=True)
                     return False
                 lt = self.remove_brackets(t, list(j))
                 saved_vars = dict(self.state.vars)

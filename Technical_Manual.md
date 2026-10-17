@@ -210,6 +210,9 @@ Ordinary von Neumann processors rarely come near any of them.
 
 **Minor limits**
 
+- At most 20 optional parts `[[ ]]` per pattern and 65,536 combinations tried
+  per line (Paxx's `_MAX_OPT_GROUPS` and `_MAX_COMBINATIONS`, Caxx's
+  `MAX_OPT_GROUPS` and `MAX_COMBINATIONS`). Section 3.8 has what happens past them.
 - The `.vliw` NOP value is truncated to 64 bits (Paxx applies
   `& 0xFFFFFFFFFFFFFFFF`, Caxx takes it as a `uint64_t`). When an instruction slot is
   wider than 64 bits the upper part is filled with 0, so a non-zero NOP encoding wider
@@ -2521,6 +2524,16 @@ written this way:
 `movsb` gives `0xa4` and `rep movsb` gives `0xf3 0xa4`. Without `rep` the
 variable is 0, so `;rep` emits nothing.
 
+**Limits.** The combinations are tried removing zero groups first, then one, and
+so on, so the form that keeps the most optional parts wins. At most 20 groups of
+one pattern are treated as optional; any beyond that are always included. At
+most 65,536 combinations are tried for one line; past that the pattern is treated
+as not matching, even on a line it would match (a line that leaves out 9 or more
+of 17 groups, for instance). Each is warned about once per pattern, with the
+place of the first line it happened on. The bundled pattern files have at most
+seven groups on a line and never come near the limits. Split a pattern into
+several lines when it needs more groups.
+
 ### 3.9 Padding
 
 ```
@@ -3601,6 +3614,13 @@ It does five things:
 - substitutes the mnemonics whose spelling differs (`cqo` to `cqto`, `cdq` to
   `cltd`, `stosd` to `stosl` and so on).
 
+Immediates and memory operands are told apart the NASM and axx way: a bare label
+operand, as in `mov rdi, msg`, is the address itself as an immediate (`movq $msg,
+%rdi`). In GNU as's Intel syntax (`.intel_syntax`) the same spelling means the
+memory at msg, the opposite. When translating source written for GNU as, write
+`[msg]` for the memory and `offset msg` for the address; those mean the same in
+both conventions and are translated as intended.
+
 ```
         mov     rsi, offset msg          ->  movq $msg, %rsi
         mov     eax, 4                   ->  movl $4, %eax
@@ -4288,6 +4308,13 @@ x?a:b           ternary
   `@@[]` repeat index to 0 (3.5.1). Writing `x%0` therefore reports no
   division-by-zero. Write `x % 0` with a space, or parenthesize, when a remainder
   is what you mean.
+- `&&` and `||` short-circuit. When the left side decides the result (false for
+  `&&`, true for `||`), the right side is not evaluated: it is skipped as the
+  unchosen side of `?:` is, so an error only the right side would raise (a
+  division by zero and the like) is not reported and a `:=` there does not run.
+  A guard such as `x!=0 && 100/x>3;3` therefore works when x is 0. When the left
+  side involves an undefined label the result cannot be decided, and the right
+  side is evaluated too.
 
 ### 6.3 What is available where
 
