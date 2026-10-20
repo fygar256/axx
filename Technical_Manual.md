@@ -58,7 +58,7 @@ both implementations and `cmp`s the results. For the five `.textmode` pairs and 
 error, and for the `regress.axx` regression test its `-V` text and its diagnostics.
 The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for two hundred and forty-three comparisons in all.
+text output are compared too, for two hundred and forty-nine comparisons in all.
 
 **Contents**
 
@@ -243,7 +243,7 @@ axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV]
 | Argument | Meaning |
 |---|---|
 | `patternfile` | Pattern definition file (`.axx`). Required. |
-| `sourcefile` | Assembly source (`.s`). Omit to read from stdin (prompt mode). |
+| `sourcefile` | Assembly source (`.s`). Omit to read from stdin (prompt mode). Naming it `stdin` reads all of standard input as the source file first (line ends, bytes that are not UTF-8 and the base directory of `.include` are treated as for a file; the base is the working directory). |
 
 | Option | Meaning |
 |---|---|
@@ -953,10 +953,13 @@ Z80 register example:
 Symbols may contain punctuation and digits: `.setsym ::$s5:: 21`.
 
 **Clearing.** `.clearsym::ax` undefines `ax`; `.clearsym` with no argument
-clears everything.
+clears everything (like the argument-less `.clrcheck`, `.clrreloc` and
+`.clrenum`, the line draws no warning for lacking `::`).
 
 **Character set.** `.symbolc::<characters>` extends the character set used for
-symbols. The default is letters, digits, and `_%$-~&|`.
+symbols. The default is letters, digits, and `_%$-~&|`. `.symbolc` rewrites the
+characters added to letters and digits, so the default `_%$-~&|` is replaced;
+list any of them you want to keep (`.symbolc::_%$-~&|{}`).
 
 Note that `-` is in the default set. This is what lets a symbol be followed
 directly by a negative displacement — the matcher tries the longest symbol
@@ -3869,6 +3872,12 @@ ad r1,r2,r3 !! lod r4,[0x1234]
 In `binary_list`, `!!!` is the number of instructions joined by `!!`, and
 `!!!!` at the end of a bundle sets the stop bit.
 
+A bundle is one line. These are errors (they used to drop instructions without
+a word): an empty slot, with nothing before or after a `!!` (`ad r1,r2,r3!!`,
+`!!ad r1,r2,r3`, `!!!!` alone); instructions that take more bytes than the
+packet's slots hold; and `!!` after an instruction when the pattern file has no
+`.vliw`. `!!` inside a string is just text.
+
 ### 4.5 Endianness
 
 Determined by the order in which you write the values in `binary_list`.
@@ -3884,6 +3893,10 @@ Comments start with `;`. A comment is dropped, except in text replacement mode
 - **Line ends.** A line ends at LF, CR LF or CR (a file that breaks its lines
   with CR alone is split into lines as well). Pattern files are read the same
   way.
+- **After a directive's argument.** `.org`, `.align`, `.zero`, `.resb` / `.resw`
+  / `.resd` / `.resq`, `.ascii` / `.asciz`, `.equ` and `.section` report an error
+  when anything but white space and a comment is left after the argument (the
+  rest of `.ascii "a","b"` or `.section .data,"aw"` is not dropped quietly).
 - **Line continuation.** A line whose last character before the line end is
   `\` is joined to the next line, without the `\`. The joined line counts as
   the last physical line of the run and the ones before it stay as empty
@@ -3921,8 +3934,12 @@ is not counted, so a chain more than sixteen deep still assembles (it gives up
 once sixteen iterations without that progress have gone by, and reports an
 oscillating layout as such).
 
-`.labelc::<characters>` extends the label character set. The default is
-letters, digits, `_` and `.`.
+`.labelc <characters>` (a source directive, so no `::`) extends the label
+character set. The default is letters, digits, `_` and `.`. It rewrites the
+characters added to letters and digits, so list `_` and `.` too if you want to
+keep them (`.labelc _.@`). It takes effect from its line onward and is counted
+afresh from the default in every pass, so it does not reach labels written
+above it.
 
 ### 5.2 Location counter
 
@@ -4017,9 +4034,42 @@ c1: .equ flt{3.14}
     LDF A,flt{enfloat(:c1)*2}
 ```
 
-`:label` inside such an expression refers to the label's value directly.
-`inf`, `-inf` and `nan` are accepted. Use `0b` for binary literals and `0x` for
-hexadecimal.
+`:label` inside such an expression refers to the label's value directly, read
+as a 256-bit signed integer (in `-o` it is the section-relative value; no
+relocation is made). `inf`, `-inf` and `nan` are accepted.
+
+**The body follows Python's number rules** (both implementations share one
+small parser; it is not Python's `eval`):
+
+- Numbers are spelled as Python literals: decimal, `0x`, `0o`, `0b`, `_` between
+  digits, and floating point with a point and/or an exponent (`.5`, `5.`,
+  `1e-3`). A decimal integer may not start with `0` (`0` itself and `00` are
+  fine), so `01` is an error.
+- The operators, from lowest precedence, are `|`, `^`, `&`, `<< >>`, `+ -`,
+  `* / // %`, unary `+ - ~`, and `**` (right-associative and binding tighter
+  than a unary operator on its left, so `-2**2` is `-4`). There are no
+  comparisons, logical operators or conditional expressions.
+- Integers stay exact: `+ - * // % ** << >> & | ^ ~` on integers give an
+  integer, so `dbl{2**70+1-2**70}` is `1.0`. When an integer result does not fit
+  in 256-bit signed, that one operation is redone in double (`dbl{2**300}`);
+  only `<<` is an error then. An integer literal that does not fit is read as a
+  double.
+- `/`, and any operation with a double operand, works in double. Integers are
+  converted with correct rounding; integer `/` integer rounds the exact
+  quotient (as Python does). `//` and `%` round toward minus infinity and `%`
+  takes the sign of the divisor, for doubles too.
+- `<< >> & | ^ ~` take integers only. Division by zero, a negative shift count,
+  `0` to a negative power, a negative number to a non-integer power, and any
+  intermediate value that is not finite are errors.
+- `enfloat` / `enflt` / `endouble` / `endbl` take one argument; a double
+  argument is truncated toward zero to an integer first, and its low 32 / 64
+  bits are read back.
+
+Outside the braces, `enflt{v}` / `endbl{v}` read `v` (evaluated as an integer
+expression) back as a float / double. In a floating-point context the result is
+that value; in an integer context it is truncated toward zero to an integer
+(`enflt{c}*2` with `c` = `flt{-2.5}` is `-4`), and a value that is not finite or
+whose magnitude is at least 2**255 is an error.
 
 **A value that overflows the width is an error.** In `!F` / `!D` / `!Q` and in
 `flt{}` / `dbl{}` / `qad{}` alike, a finite computation whose result leaves the
@@ -4036,7 +4086,10 @@ are read correctly rounded to binary128, and every `+ - * /` rounds to binary128
 exact rationals. The grammar is numbers, parentheses, unary `+ -` and `+ - * /`
 only; on division by zero, a non-finite result or unreadable trailing text, the
 value computed in double is written out with `%.17g` and converted to binary128.
-Both implementations produce the same bits on either path.
+Both implementations produce the same bits on either path. Under `!Q`, dividing by a
+number that is zero in double is no error when the binary128 path yields a value
+(`1/1e-4000` is near 1e4000), and a product or quotient that rounds to zero keeps
+its sign (`qad{1e-4960*-1e-10}` is `-0`).
 
 **Integers are read as 256-bit signed values.** When a `!F` / `!D` / `!Q`
 expression yields an integer, it is converted to floating point as a 256-bit
@@ -4067,6 +4120,12 @@ label references in the current source file:
 ```
 .reloctype name8,name16,name32,name64
 ```
+
+It takes effect from its line onward (counted afresh in every pass), and a
+position left empty keeps the guess for that width. It overrides the guess from
+the width and the default type of an untyped `.extern`, not a type fixed by the
+pattern's `.reloc`, and a type it chose is not passed through the guess that
+looks at the field's value to pick absolute or PC-relative.
 
 #### 5.5.2 Section ordering
 
@@ -5056,7 +5115,7 @@ The x86_64 pattern file is also maintained separately at
 
 | Pattern file | Size | `::` lines | Source | Notes |
 |---|---|---|---|---|
-| **x86_64.axx** | 4.2 MB | 28,659 | **hello.s**, **bsection.s**, **x86_64_reloc.s**, **x86_64_rex.s**, **x86_64_avx.s**, **x86_64_err.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512. From AVX on checked against llvm-mc (see the note after the table) |
+| **x86_64.axx** | 4.2 MB | 28,659 | **hello.s**, **bsection.s**, **x86_64_reloc.s**, **x86_64_rex.s**, **x86_64_avx.s**, **x86_64_err.s**, **reloctype.s** | x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512. From AVX on checked against llvm-mc (see the note after the table) |
 | **x86_64m.axx** | 1.0 MB | 6,531 (28,791 expanded) | **hello.s**, **x86_64_reloc.s**, **x86_64_rex.s**, **x86_64_avx.s**, **x86_64_err.s** | x86_64-v3 written with macros. Also used by the Brainfuck demo. Expands to the same set of rows as `x86_64.axx` (identical once duplicate rows are dropped) |
 | **aarch64.axx** | 352 KB | 2,112 (9,431 expanded) | **aarch64.s**, **aarch64_reloc.s**, **aarch64_edge.s**, **aarch64_err.s** | AArch64 (A64): data processing, branches, exception generation, hints, barriers, system registers and SYS aliases, loads and stores, LSE atomics, scalar floating point, Advanced SIMD (vector and scalar) including the LD1-LD4 / ST1-ST4 structure accesses, cryptography, and the scalar extensions (PAuth, MTE, MOPS, FCMA, dot product, BFloat16, matrix multiply, LS64), and the GNU-style relocation modifiers `:lo12:`, `:pg_hi21:`, `:abs_g0:`-`:abs_g3:`, `:prel_g0:`-`:prel_g3:` and `:got:` / `:got_lo12:`, which with `-o` are emitted as relocations for the linker to fill in (`R_AARCH64_ADR_PREL_PG_HI21`, `ADD_ABS_LO12_NC`, the `LDST*_ABS_LO12_NC` family, `MOVW_UABS_G*` / `MOVW_PREL_G*`, `ADR_GOT_PAGE` and `LD64_GOT_LO12_NC`) and which with `-b` axx resolves itself, reading the GOT pair as naming the slot. With `-o` it is an AArch64 object without `-m`; a branch, `adr` or literal `ldr` to a local label of the same section is resolved in place, and the data directives (`.byte` `.hword` `.word` `.quad` `.xword` ...) take ABS / PREL relocations (`aarch64_reloc.s`, checked against llvm-mc 19). Also SVE and SVE2 -- arithmetic, shifts, compares, predicates, element counts, permutes, reductions, the whole load/store family (contiguous, replicating, non-fault, first-fault, gather, scatter, prefetch), the widening and narrowing groups, complex arithmetic and the SVE2 cryptography -- SME: streaming mode, the ZA array, and the integer, floating-point and BFloat16 outer products -- and SME2: the predicate-as-counter registers, the ZT0 lookup table, the multi-vector operations on Z registers, accumulation into the ZA array, and the multi-vector loads and stores in both their consecutive and strided forms |
 | **aarch64_logical.axx** | 9.5 KB | 76 (82 expanded) | **aarch64_logical_mini_demo.s** | The macro-layer version of the same AArch64 logical (immediate) group: the rows are generated with `!def`, and the bitmask immediate is encoded in a `binary_list` expression |
@@ -5078,7 +5137,7 @@ The x86_64 pattern file is also maintained separately at
 | **68000.axx** | 59 KB | 457 | **68000.s**, **68000_reloc.s**, **68000_err.s** | Motorola 68000. `-o` writes ELF32 M68K (RELA) without `-m`. An `.extern` with no type is `R_68K_32`; 16 / 8 bit PC relative references within the section are resolved by axx |
 | **6800.axx** | 20 KB | 271 | **6800.s**, **6800_edge.s**, **6800_err.s** | Motorola 6800 |
 | **6502.axx** | 15 KB | 202 | **6502.s**, **6502_edge.s**, **6502_err.s** | MOS 6502 |
-| **z80.axx** | 8.8 KB | 283 | **z80.s**, **z80_err.s**, **import_test.s**, **import_test_err.s**, **listinc.s** | Zilog Z80 |
+| **z80.axx** | 8.8 KB | 283 | **z80.s**, **z80_err.s**, **import_test.s**, **import_test_err.s**, **listinc.s**, **labelc_err.s**, **dirjunk_err.s** | Zilog Z80 |
 | **8051.axx** | 9.1 KB | 111 | **8051.s**, **8051_err.s** | Intel 8051 |
 | **8080.axx** | 6.4 KB | 113 | **8080.s**, **8080_err.s** | Intel 8080 |
 | **8048.axx** | 6.5 KB | 96 | **8048.s**, **8048_edge.s**, **8048_err.s** | Intel 8048 |
@@ -5094,13 +5153,13 @@ The x86_64 pattern file is also maintained separately at
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | `.echo` on a body line (3.14.1); test only |
 | **ministr.axx** | 6.4 KB | 27 | **ministr.s** | Strings, arrays of strings and `.for ... in <array>` in the mini language (3.15); test only |
-| **regress.axx** | 3.4 KB | 10 | **regress.s**, **regresserr.s**, **regresscr.s** (and **regresself.s** with `z80.axx`) | Regression test for the disagreements between the two implementations found by differential fuzzing and fixed (nested `?:`, long numeric literals, pow() special cases, the macro layer's `int()`, `hex()` and format specs, the diagnostics after an error, an `.equ` of a label at the end of a section, the value of an `.equ` that contains an undefined label, the rules for white space and character constants, the byte strings of the macro layer, CR line ends, the listing of bytes that are not UTF-8, a `.org` that moves backwards under `-o`, the integer evaluation of `error_patterns`); test only |
+| **regress.axx** | 4.4 KB | 15 | **regress.s**, **regresserr.s**, **regresscr.s** (and **regresself.s** with `z80.axx`) | Regression test for the disagreements between the two implementations found by differential fuzzing and fixed (nested `?:`, long numeric literals, pow() special cases, the macro layer's `int()`, `hex()` and format specs, the diagnostics after an error, an `.equ` of a label at the end of a section, the value of an `.equ` that contains an undefined label, the rules for white space and character constants, the byte strings of the macro layer, CR line ends, the listing of bytes that are not UTF-8, a `.org` that moves backwards under `-o`, the integer evaluation of `error_patterns`); test only |
 | **elftype.axx** | 1.5 KB | 20 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
 | **elfsec.axx** | 1.4 KB | 8 | **elfsec.s** | section attributes and `sh_addralign` declared with `.elfsection` (3.7.7); test only |
 | **elfpair.axx** | 4.7 KB | 39 (+ `riscv64.axx`) | **elfpair.s** | paired and companion relocations (`.elfextra`, `.elfdiff`, with expressions of several labels and typed differences), a section group (`.elfgroup`), `sh_link` (`.elflink`) and CFI on a relaxing machine, on RISC-V. The relocations, the group and the section headers match llvm-mc (3.7.10, 3.7.11); test only |
-| **elfcfi.axx** | 1.9 KB | 29 | **elfcfi.s** | call frame information (`.cfi_*` to `.eh_frame`; `.elfcfi`, `.elfcfiinit`, `.elfcfireg`) on x86-64. The `.eh_frame` rows match llvm-mc (3.7.11); test only |
+| **elfcfi.axx** | 1.9 KB | 29 | **elfcfi.s**, **cfiptr.s** | call frame information (`.cfi_*` to `.eh_frame`; `.elfcfi`, `.elfcfiinit`, `.elfcfireg`) on x86-64. The `.eh_frame` rows match llvm-mc (3.7.11); test only |
 | **elfmips.axx** | 3.1 KB | 31 | **elfmips.s** | a REL write-back function (`.elfencode`, `R_MIPS_HI16`) on MIPS32. The words, relocations and linked `.text` match llvm-mc / ld.lld (3.7.10); test only |
 | **elfmips64.axx** | 2.5 KB | 28 | **elfmips64.s** | a function that lays out `r_info` (`.elfrinfo`), MIPS64 n64 (3.7.10); test only |
 | **elfword.axx** | 1.6 KB | 24 | **elfword.s** | the unit of addends and symbol values (`.elfunit::word`) on a toy machine with 16-bit words (3.7.10); test only |
@@ -5112,7 +5171,7 @@ The x86_64 pattern file is also maintained separately at
 | **intel2att.axx** | 12 KB | 60 (3,437 expanded) | **intel2att.s** | x86-64 Intel to AT&T source translator; `.textmode`, `!Y`, `!L` and macro-layer pattern generation (3.18). The translated text assembles with GNU as |
 | **a64tox64_axx.axx** | 32 KB | 152 (1,903 expanded) | **bf_aarch64.s** | AArch64 to x86_64 source translator whose output `x86_64.axx` assembles; uses the runtimes `a64rt_axx.s` (Linux) and `a64rt_axx_freebsd.s` (FreeBSD) and the declaration file `a64ext.s` (3.18) |
 | **itanium.axx** | 281 B | 12 | **vliw.s** | Itanium (EPIC) sketch; incomplete |
-| **vliw.axx** | 192 B | 10 | **vliw.s** | Non-EPIC VLIW; test only |
+| **vliw.axx** | 192 B | 10 | **vliw.s**, **vliw_err.s** | Non-EPIC VLIW; test only |
 | **bf.axx** | 128 B | 9 | **bf.s** | Brainfuck virtual CPU; hello-world demo |
 
 The `::` lines column counts the lines containing `::` in the file as written.
@@ -5275,14 +5334,25 @@ chain of forward-referencing `.equ` more than sixteen deep, and the
 layout with the same period and iteration numbers when such a chain stretches
 pass 1. The `contin.s` pair (`z80.axx`, given as a `./` path) compares the `-v`
 listing of `\` line continuation (in a file taken in with `!include` too) and the
-names of the `.include` / `!include` files. The last pair compares the report
-when standard output cannot be written (`/dev/full`), under `-v` and `-P`.
+names of the `.include` / `!include` files. The `/dev/full` pair compares the report
+when standard output cannot be written, under `-v` and `-P`. The `cfiptr.s` pair
+(`elfcfi.axx`) compares `-o` objects whose `.cfi_personality` / `.cfi_lsda` use
+absolute and PC-relative pointer encodings of 2, 4 and 8 bytes (an absolute one
+takes an absolute data relocation, as llvm-mc does), and the last pair reads
+`regresscr.s` from standard input (the source name `stdin`) and compares the
+`-v` listing, so lines ending in CR alone and bytes that are not UTF-8 read as
+they do from a file. The `reloctype.s` pair (`x86_64.axx`) compares
+the `-o` relocations of the types chosen with `.reloctype`. The `labelc_err.s` pair
+(`z80.axx`) compares the diagnostics showing that `.labelc` does not reach the
+labels above it. The `vliw_err.s` pair (`vliw.axx`) compares the
+diagnostics of empty slots and of a packet whose instructions do not fit. The `dirjunk_err.s` pair (`z80.axx`)
+compares the diagnostics of text left after the argument of a directive.
 
 The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (the ELF of the pattern's machine; x86-64 ELF64 when it has no `.elfmachine`), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for two hundred and forty-three comparisons in all.
+never compares, for two hundred and forty-nine comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different

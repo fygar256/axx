@@ -172,6 +172,12 @@ caxx $P/6502.axx $S/relaxosc_err.s -b b203 2>&1 | grep -v '^raw: wrote ' > b203e
 caxx $P/z80.axx ./$S/contin.s -v > b204
 caxx $P/z80.axx $S/z80.s -v > /dev/full 2> b205e
 caxx $P/z80.axx $S/z80.s -P > /dev/full 2>> b205e
+caxx $P/elfcfi.axx $S/cfiptr.s -o b206
+caxx $P/regress.axx stdin -v < $S/regresscr.s > b207
+caxx $P/x86_64.axx $S/reloctype.s -o b208
+caxx $P/z80.axx $S/labelc_err.s -b b209 2>&1 | grep -v '^raw: wrote ' > b209e
+caxx $P/vliw.axx $S/vliw_err.s -b b210 2>&1 | grep -v '^raw: wrote ' > b210e
+caxx $P/z80.axx $S/dirjunk_err.s -b b211 2>&1 | grep -v '^raw: wrote ' > b211e
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -390,6 +396,12 @@ paxx $P/6502.axx $S/relaxosc_err.s -b a203 2>&1 | grep -v '^raw: wrote ' > a203e
 paxx $P/z80.axx ./$S/contin.s -v > a204
 paxx $P/z80.axx $S/z80.s -v > /dev/full 2> a205e
 paxx $P/z80.axx $S/z80.s -P > /dev/full 2>> a205e
+paxx $P/elfcfi.axx $S/cfiptr.s -o a206
+paxx $P/regress.axx stdin -v < $S/regresscr.s > a207
+paxx $P/x86_64.axx $S/reloctype.s -o a208
+paxx $P/z80.axx $S/labelc_err.s -b a209 2>&1 | grep -v '^raw: wrote ' > a209e
+paxx $P/vliw.axx $S/vliw_err.s -b a210 2>&1 | grep -v '^raw: wrote ' > a210e
+paxx $P/z80.axx $S/dirjunk_err.s -b a211 2>&1 | grep -v '^raw: wrote ' > a211e
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -567,6 +579,12 @@ check a202e b202e
 check a203e b203e
 check a204 b204
 check a205e b205e
+check a206 b206
+check a207 b207
+check a208 b208
+check a209e b209e
+check a210e b210e
+check a211e b211e
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

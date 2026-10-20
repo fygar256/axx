@@ -44,7 +44,6 @@ try:
     import readline
 except ImportError:
     pass
-import ast
 import functools
 import itertools
 import struct
@@ -55,7 +54,6 @@ import math
 import signal
 import re
 import tempfile
-import uuid
 
 
 # パス1の反復中、「まだ一度も値が確定していない」ことを「値が 0 である」と
@@ -153,6 +151,11 @@ SUB_CLOSE = chr(0x1f)
 # 区別するために使う。StringUtils.resolve_vliw_escapes() を参照。
 VLIW_SEP = chr(0x92)
 VLIW_STOP = chr(0x93)
+# 空の VLIW スロットの診断。caxx.c の VLIW_EMPTY_SLOT_MSG と同じ文面。
+_VLIW_EMPTY_SLOT_MSG = (" error - VLIW: empty slot in the packet "
+                        "(nothing before or after a '!!').")
+_VLIW_NO_VLIW_MSG = (" error - '!!' separates VLIW slots, but the pattern file "
+                     "has no .vliw.")
 
 
 # 未定義ラベルの値を表す番兵。None ではなく巨大な整数にしてあるのは、
@@ -1330,6 +1333,24 @@ def _elf_anchor_at(state, sec, off):
     return nm
 
 
+def _reloc_data_abs(mach, nbytes):
+    """欄の幅が nbytes の、絶対のデータ型（命令欄の型を除く）を 1 つ探す。
+
+    実効表の型を宣言順に見て最初に当たったもの。無ければ幅の推測の型を、
+    それが PC 相対でなければ使う。CFI の絶対の番地に使う（幅の推測は命令の
+    欄向けで、x86-64 の 4 バイトは PC32 になるため、そのままでは使えない）。
+    caxx.c の elf_reloc_data_abs() と同じ規則である。
+    """
+    for _nm, rt in mach['named'].items():
+        if mach['reloc_bytes'].get(rt, 0) != nbytes or rt in mach['pc_rel']:
+            continue
+        if rt in mach['field']:
+            continue
+        return rt
+    rt = mach['width_guess'].get(nbytes)
+    return rt if rt and rt not in mach['pc_rel'] else None
+
+
 def _reloc_data_pcrel(mach, nbytes):
     """欄の幅が nbytes の、PC 相対のデータ型（命令欄の型を除く）を 1 つ探す。
 
@@ -2013,6 +2034,11 @@ class AssemblerState:
         # 照合が式・因子の捕捉の前に倒し、後で見て、立っていればその
         # パターンを不一致にする。caxx.c の expr_missing と同じ。
         self.expr_missing = False
+        # `!Q` の捕捉の倍精度の評価では、浮動小数点モードの 0 で割るを報告せずに
+        # 印だけ立てる。binary128 の評価で値が出ればその印は捨てる。caxx.c の
+        # fdiv0_defer と同じ。
+        self.fdiv0_defer = False
+        self.fdiv0_seen = False
 
         # 出力ワードの形。bts が 1 ワードのビット数（`.bits`）、endian が
         # バイト順、align と padding が `.align` の既定値と詰め物の値。
@@ -2862,6 +2888,326 @@ enflt = enfloat
 endbl = endouble
 
 
+def _float_brace_result(state, f, name):
+    """enflt{} / endbl{} の値を今のモードに合わせる。
+
+    浮動小数点モードでは float のまま返す。整数モードでは 0 の方向へ切り捨てた
+    整数にし、有限でない値と絶対値が 2**255 以上の値はエラーで 0 にする
+    （caxx.c の float_brace_result() と同じ）。
+    """
+    if state.exp_typ == 'f':
+        return f
+    if not math.isfinite(f) or abs(f) >= 2.0 ** 255:
+        state.diag(f" error - {name}{{}}: the value {_g17(f)} cannot be an integer; using 0.",
+                   set_error=True)
+        return 0
+    return math.trunc(f)
+
+
+# ---- flt{} / dbl{} / qad{} の中身の式 ----------------------------------------
+# 本体の 256 ビット評価器とは別の、Python の数の規則に倣った小さな再帰下降。
+# caxx.c の xeval_*() と同じ規則である。値は int（256 ビットの符号付きに
+# 収まるもの）か float（有限の binary64）。読めない・規則に外れるときは
+# ValueError を投げ、診断は呼び出し側に任せる。
+#   - 数は Python のリテラルの綴り（10 進・0x・0o・0b、桁の間の `_`、小数点と
+#     指数のある浮動小数点）。10 進の整数は 0 で始められない（0 そのものは可）。
+#   - 演算子は優先順位の低い順に `|` `^` `&` `<< >>` `+ -` `* / // %`、単項
+#     `+ - ~`、`**`（右結合で、左の単項より強い）。比較・論理演算・条件式は無い。
+#   - 整数どうしの + - * // % ** << >> & | ^ ~ は整数のまま計算する。結果が
+#     256 ビットの符号付きに収まらないときは、その演算を倍精度でやり直す（`<<`
+#     だけはエラー）。収まらない整数のリテラルも倍精度で読む。`/` と、倍精度の
+#     混じった演算は倍精度（整数は正しく丸めて倍精度にする。整数どうしの `/` は
+#     真の商を正しく丸める）。
+#   - `<< >> & | ^ ~` は整数だけ。0 で割る・負のシフト量・0 の負の数乗・
+#     負の数の非整数乗・途中で有限でない値が出る、はどれもエラー。
+#   - `:名前` はラベルの値（256 ビットの符号付きの整数）。呼べる関数は
+#     enfloat / enflt / endouble / endbl の 4 つで、引数は 1 個（整数か倍精度の
+#     値を 0 の方向へ切り捨てた整数の下位 32 / 64 ビットを読み直す）。
+_XV_MIN = -(1 << 255)
+_XV_MAX = (1 << 255) - 1
+_XV_FUNCS = {"enfloat": 32, "enflt": 32, "endouble": 64, "endbl": 64}
+
+
+class _XevalParser:
+    def __init__(self, s, label_value, lwordchars):
+        self.s = s
+        self.i = 0
+        self.n = len(s)
+        self.label_value = label_value
+        self.lwordchars = lwordchars
+
+    @staticmethod
+    def _fail(msg="bad expression"):
+        raise ValueError("xeval: " + msg)
+
+    def _int(self, v, fallback=None):
+        """整数の結果。256 ビットの符号付きに収まらなければ、fallback()（同じ演算を
+        倍精度でやり直した値）にする。fallback が無い（シフト）ならエラー。"""
+        if _XV_MIN <= v <= _XV_MAX:
+            return v
+        if fallback is None:
+            self._fail("integer out of 256-bit range")
+        return self._flt(fallback())
+
+    @classmethod
+    def _flt(cls, v):
+        if not math.isfinite(v):
+            cls._fail("non-finite value")
+        return v
+
+    def _skip(self):
+        while self.i < self.n and self.s[self.i] in ' \t':
+            self.i += 1
+
+    def _peek(self, tok):
+        return self.s.startswith(tok, self.i)
+
+    # -- 数 --
+    def _digitpart(self, digits):
+        """digit (_? digit)* を読み、`_` を除いた数字列を返す。無ければ None。"""
+        s, i = self.s, self.i
+        if i >= self.n or s[i] not in digits:
+            return None
+        out = [s[i]]
+        i += 1
+        while True:
+            if i < self.n and s[i] in digits:
+                out.append(s[i])
+                i += 1
+            elif i + 1 < self.n and s[i] == '_' and s[i + 1] in digits:
+                out.append(s[i + 1])
+                i += 2
+            else:
+                break
+        self.i = i
+        return ''.join(out)
+
+    def _number(self):
+        s = self.s
+        if (s[self.i] == '0' and self.i + 1 < self.n
+                and s[self.i + 1] in 'xXoObB'):
+            base, digits = {'x': (16, '0123456789abcdefABCDEF'),
+                            'o': (8, '01234567'),
+                            'b': (2, '01')}[s[self.i + 1].lower()]
+            self.i += 2
+            if self.i < self.n and s[self.i] == '_':
+                self.i += 1
+            d = self._digitpart(digits)
+            if d is None:
+                self._fail("bad number")
+            v = int(d, base)
+            is_float = False
+        else:
+            ip = self._digitpart('0123456789')
+            text = ip or ''
+            is_float = False
+            if self.i < self.n and s[self.i] == '.':
+                self.i += 1
+                fp = self._digitpart('0123456789')
+                if ip is None and fp is None:
+                    self._fail("bad number")
+                text += '.' + (fp or '')
+                is_float = True
+            if self.i < self.n and s[self.i] in 'eE':
+                self.i += 1
+                sign = ''
+                if self.i < self.n and s[self.i] in '+-':
+                    sign = s[self.i]
+                    self.i += 1
+                ep = self._digitpart('0123456789')
+                if ep is None:
+                    self._fail("bad number")
+                text += 'e' + sign + ep
+                is_float = True
+            if is_float:
+                v = float(text)
+            else:
+                if text[0] == '0' and text.strip('0'):
+                    self._fail("leading zeros in a decimal integer")
+                v = int(text)
+        if self.i < self.n and (s[self.i].isascii() and s[self.i].isalnum() or s[self.i] == '_'):
+            self._fail("bad number")
+        return self._flt(v) if is_float else self._int(v, lambda: self._f(v))
+
+    # -- 項 --
+    def _primary(self):
+        self._skip()
+        if self.i >= self.n:
+            self._fail("missing operand")
+        c = self.s[self.i]
+        if c == '(':
+            self.i += 1
+            v = self._expr()
+            self._skip()
+            if not self._peek(')'):
+                self._fail("missing ')'")
+            self.i += 1
+            return v
+        if c == ':':
+            self.i += 1
+            j = self.i
+            while j < self.n and self.s[j] in self.lwordchars:
+                j += 1
+            if j == self.i:
+                self._fail("missing label name")
+            name = self.s[self.i:j]
+            self.i = j
+            return self.label_value(name)
+        if ('a' <= c <= 'z') or ('A' <= c <= 'Z') or c == '_':
+            j = self.i
+            while j < self.n and (self.s[j].isascii() and self.s[j].isalnum()
+                                  or self.s[j] == '_'):
+                j += 1
+            name = self.s[self.i:j]
+            self.i = j
+            self._skip()
+            if name not in _XV_FUNCS or not self._peek('('):
+                self._fail(f"unknown name '{name}'")
+            self.i += 1
+            a = self._expr()
+            self._skip()
+            if not self._peek(')'):
+                self._fail("missing ')'")
+            self.i += 1
+            if isinstance(a, float):
+                a = int(a)
+            if _XV_FUNCS[name] == 32:
+                r = struct.unpack('<f', struct.pack('<I', a & 0xFFFFFFFF))[0]
+            else:
+                r = struct.unpack('<d', struct.pack('<Q', a & 0xFFFFFFFFFFFFFFFF))[0]
+            return self._flt(r)
+        if c.isdigit() and c.isascii() or c == '.':
+            return self._number()
+        self._fail("bad operand")
+
+    # -- 演算 --
+    @staticmethod
+    def _f(v):
+        try:
+            return float(v)
+        except OverflowError:
+            return math.inf
+
+    def _pow(self, a, b):
+        if isinstance(a, int) and isinstance(b, int) and b >= 0:
+            if abs(a) >= 2 and b > 256:
+                return self._fpow(a, b)
+            return self._int(a ** b, lambda: self._fpow(a, b))
+        return self._fpow(a, b)
+
+    def _fpow(self, a, b):
+        x, y = self._f(a), self._f(b)
+        if x == 0.0 and y < 0.0:
+            self._fail("zero to a negative power")
+        if x < 0.0 and y != math.floor(y):
+            self._fail("negative number to a non-integer power")
+        try:
+            r = x ** y
+        except OverflowError:
+            self._fail("non-finite value")
+        return self._flt(r)
+
+    def _power(self):
+        a = self._primary()
+        self._skip()
+        if self._peek('**'):
+            self.i += 2
+            return self._pow(a, self._unary())
+        return a
+
+    def _unary(self):
+        self._skip()
+        if self.i < self.n and self.s[self.i] in '+-~':
+            c = self.s[self.i]
+            self.i += 1
+            v = self._unary()
+            if c == '+':
+                return v
+            if c == '-':
+                return self._int(-v, lambda: -self._f(v)) if isinstance(v, int) else -v
+            if not isinstance(v, int):
+                self._fail("'~' needs an integer")
+            return ~v
+        return self._power()
+
+    def _binop(self, op, a, b):
+        both_int = isinstance(a, int) and isinstance(b, int)
+        if op in ('<<', '>>', '&', '|', '^'):
+            if not both_int:
+                self._fail(f"'{op}' needs integers")
+            if op == '&':
+                return a & b
+            if op == '|':
+                return a | b
+            if op == '^':
+                return a ^ b
+            if b < 0:
+                self._fail("negative shift count")
+            if op == '>>':
+                return a >> min(b, 256)
+            if a == 0:
+                return 0
+            if b > 256:
+                self._fail("integer out of 256-bit range")
+            return self._int(a << b)
+        if op == '/':
+            if b == 0:
+                self._fail("division by zero")
+            if both_int:
+                return self._flt(a / b)
+            return self._flt(self._f(a) / self._f(b))
+        if op in ('//', '%'):
+            if b == 0:
+                self._fail("division by zero")
+            x, y = self._f(a), self._f(b)
+            if both_int:
+                return self._int(a // b if op == '//' else a % b, lambda: x // y)
+            return self._flt(x // y if op == '//' else x % y)
+        x, y = self._f(a), self._f(b)
+        if both_int:
+            return self._int(a + b if op == '+' else a - b if op == '-' else a * b,
+                             lambda: x + y if op == '+' else x - y if op == '-' else x * y)
+        return self._flt(x + y if op == '+' else x - y if op == '-' else x * y)
+
+    def _level(self, sub, ops):
+        v = sub()
+        while True:
+            self._skip()
+            for op in ops:
+                if self._peek(op) and not (op == '*' and self._peek('**')) \
+                        and not (op == '/' and self._peek('//')):
+                    self.i += len(op)
+                    v = self._binop(op, v, sub())
+                    break
+            else:
+                return v
+
+    def _term(self):
+        return self._level(self._unary, ('//', '/', '%', '*'))
+
+    def _arith(self):
+        return self._level(self._term, ('+', '-'))
+
+    def _shift(self):
+        return self._level(self._arith, ('<<', '>>'))
+
+    def _band(self):
+        return self._level(self._shift, ('&',))
+
+    def _bxor(self):
+        return self._level(self._band, ('^',))
+
+    def _expr(self):
+        return self._level(self._bxor, ('|',))
+
+    def parse(self):
+        v = self._expr()
+        self._skip()
+        if self.i != self.n:
+            self._fail("unexpected text")
+        return v
+
+
 class IEEE754Converter:
     """10 進表記 → IEEE-754 のビットパターン（16 進文字列）。
 
@@ -3073,11 +3419,13 @@ class _F128Eval:
         """有理数を 4 倍精度の値にする。"""
         if q == 0:
             return (Fraction(0), neg_zero)
+        # 0 でない値が小さすぎて 0 に丸まったときも、符号は元の値のまま
+        # （-1e-5000 は -0。__float128 と同じ）。
         if q > 0:
             r = cls._round(q)
             return r if isinstance(r, float) else (r, False)
         r = cls._round(-q)
-        return -r if isinstance(r, float) else (-r, False)
+        return -r if isinstance(r, float) else (-r, r == 0)
 
     @staticmethod
     def _rep(v):
@@ -3749,190 +4097,29 @@ class ExpressionEvaluator:
         return x, idx
 
     def xeval(self, x, _=None):
-        """`:ラベル` を含む Python 構文の式を、安全に評価する。
+        """flt{} / dbl{} / qad{} の中身を _XevalParser で読み、int か float を返す。
 
-        eval() は使わない。ラベル参照を衝突しない placeholder に置き換えてから
-        ast で解析し、許可した節と演算子だけを自分で畳む。呼べる関数は
-        enfloat / endouble とその別名の 4 つだけで、それ以外の名前・呼び出し・
-        節はすべて拒否する。べき乗とシフトには上限も掛ける。
-        ラベル名をそのまま式に埋めないのは、名前が Python の構文に化けるのを
-        防ぐため。現在このメソッドはどこからも呼ばれていない。
+        `:ラベル` は登録された値を 256 ビットの符号付きとして読む（caxx.c の
+        xeval_primary() と同じ）。再配置の追跡はしない。未定義なら
+        error_undefined_label を立てて 0 と読む。読めなければ ValueError。
         """
-        def _cc_escape(chars):
-            out = []
-            for c in chars:
-                if c == '\\':
-                    out.append('\\\\')
-                elif c == ']':
-                    out.append('\\]')
-                elif c == '^':
-                    out.append('\\^')
-                elif c == '-':
-                    out.append('\\-')
-                else:
-                    out.append(re.escape(c))
-            return ''.join(out)
-
-        escaped = _cc_escape(self.state.lwordchars)
-        pattern = rf":([{escaped}]+)(?=[^{escaped}]|$)"
-
-        _tag = "_AXXLBL_" + uuid.uuid4().hex
-        _label_values = {}
-
-        def replacer(match):
-            label_name = match.group(1)
-            placeholder = f"{_tag}{len(_label_values)}"
+        def _label(name):
             try:
-                val = self.state.labels[label_name][0]
+                val = self.state.labels[name][0]
             except (KeyError, IndexError):
                 self.state.error_undefined_label = True
-                _label_values[placeholder] = 0
-                return placeholder
+                return 0
             if _is_undef_derived(val):
                 self.state.error_undefined_label = True
-                _label_values[placeholder] = 0
-                return placeholder
-            _is_equ = (len(self.state.labels.get(label_name, [])) > 2
-                       and self.state.labels[label_name][2])
-            if self.state._elf_tracking and not _is_equ:
-                if self.state._elf_capturing_var is not None:
-                    cv = self.state._elf_capturing_var
-                    if cv not in self.state._elf_var_to_label:
-                        self.state._elf_var_to_label[cv] = (label_name, val)
-                    else:
-                        self.state._elf_var_to_label[cv] = _elf_v2l_second(
-                            self.state, self.state._elf_var_to_label[cv], label_name, val)
-                elif self.state._elf_current_word_idx >= 0:
-                    self.state._elf_label_refs_seen.append(
-                        (label_name, val, self.state._elf_current_word_idx))
+                return 0
             try:
-                _label_values[placeholder] = int(val)
+                v = int(val) & ((1 << 256) - 1)
             except (TypeError, ValueError, OverflowError):
                 self.state.error_undefined_label = True
-                _label_values[placeholder] = 0
-            return placeholder
+                return 0
+            return v - (1 << 256) if v >> 255 else v
 
-        s = re.sub(pattern, replacer, x)
-
-        _ALLOWED_FUNCS = {
-            "enfloat": enfloat, "endouble": endouble,
-            "enflt": enflt, "endbl": endbl,
-        }
-
-        try:
-            tree = ast.parse(s, mode='eval')
-        except SyntaxError as e:
-            raise ValueError(f"xeval: parse error in '{s}': {e}")
-
-        def _ev(node):
-            if isinstance(node, ast.Expression):
-                return _ev(node.body)
-            if isinstance(node, ast.Constant):
-                if isinstance(node.value, (int, float, bool)):
-                    return node.value
-                raise ValueError(f"xeval: disallowed constant {node.value!r} in '{s}'")
-            if isinstance(node, ast.BinOp):
-                l = _ev(node.left)
-                r = _ev(node.right)
-                op = node.op
-                if isinstance(op, ast.Add):
-                    return l + r
-                if isinstance(op, ast.Sub):
-                    return l - r
-                if isinstance(op, ast.Mult):
-                    return l * r
-                if isinstance(op, ast.Div):
-                    return l / r
-                if isinstance(op, ast.FloorDiv):
-                    return l // r
-                if isinstance(op, ast.Mod):
-                    return l % r
-                if isinstance(op, ast.Pow):
-                    if isinstance(r, int) and r > 1024:
-                        raise ValueError("xeval: exponent exceeds 1024")
-                    return l ** r
-                if isinstance(op, ast.BitAnd):
-                    return l & r
-                if isinstance(op, ast.BitOr):
-                    return l | r
-                if isinstance(op, ast.BitXor):
-                    return l ^ r
-                if isinstance(op, ast.LShift):
-                    if isinstance(r, int) and r > 65536:
-                        raise ValueError("xeval: shift count exceeds 65536")
-                    return l << r
-                if isinstance(op, ast.RShift):
-                    return l >> r
-                raise ValueError(f"xeval: disallowed operator {type(op).__name__} in '{s}'")
-            if isinstance(node, ast.UnaryOp):
-                v = _ev(node.operand)
-                op = node.op
-                if isinstance(op, ast.UAdd):
-                    return +v
-                if isinstance(op, ast.USub):
-                    return -v
-                if isinstance(op, ast.Invert):
-                    return ~v
-                raise ValueError(f"xeval: disallowed unary operator {type(op).__name__} in '{s}'")
-            if isinstance(node, ast.BoolOp):
-                if isinstance(node.op, ast.And):
-                    res = True
-                    for vn in node.values:
-                        res = _ev(vn)
-                        if not res:
-                            return res
-                    return res
-                if isinstance(node.op, ast.Or):
-                    res = False
-                    for vn in node.values:
-                        res = _ev(vn)
-                        if res:
-                            return res
-                    return res
-                raise ValueError(f"xeval: disallowed bool operator in '{s}'")
-            if isinstance(node, ast.Compare):
-                left = _ev(node.left)
-                for cop, comp in zip(node.ops, node.comparators):
-                    right = _ev(comp)
-                    if   isinstance(cop, ast.Eq):
-                        ok = left == right
-                    elif isinstance(cop, ast.NotEq):
-                        ok = left != right
-                    elif isinstance(cop, ast.Lt):
-                        ok = left <  right
-                    elif isinstance(cop, ast.LtE):
-                        ok = left <= right
-                    elif isinstance(cop, ast.Gt):
-                        ok = left >  right
-                    elif isinstance(cop, ast.GtE):
-                        ok = left >= right
-                    else:
-                        raise ValueError(f"xeval: disallowed comparison in '{s}'")
-                    if not ok:
-                        return False
-                    left = right
-                return True
-            if isinstance(node, ast.IfExp):
-                return _ev(node.body) if _ev(node.test) else _ev(node.orelse)
-            if isinstance(node, ast.Call):
-                if (not isinstance(node.func, ast.Name)
-                        or node.func.id not in _ALLOWED_FUNCS):
-                    raise ValueError(f"xeval: disallowed function call in '{s}'")
-                if node.keywords:
-                    raise ValueError(f"xeval: keyword arguments not allowed in '{s}'")
-                args = [_ev(a) for a in node.args]
-                return _ALLOWED_FUNCS[node.func.id](*args)
-            if isinstance(node, ast.Name):
-                if node.id in _label_values:
-                    return _label_values[node.id]
-                raise ValueError(f"xeval: disallowed name '{node.id}' in '{s}'")
-            raise ValueError(
-                f"xeval: disallowed AST node {type(node).__name__} in '{s}'")
-
-        result = _ev(tree)
-        if not isinstance(result, (int, float, bool)):
-            raise ValueError(f"xeval: unsafe result type {type(result)}")
-        return result
+        return _XevalParser(x, _label, self.state.lwordchars).parse()
 
     def loc_counter_value(self):
         """`$$` の値。binary_list の中では命令の先頭、外では今の位置。
@@ -4137,39 +4324,43 @@ class ExpressionEvaluator:
             idx += 5
             f, t, idx = self.parser.get_curlb(s, idx)
             if f:
+                # 中身は整数モードで読む（caxx.c と同じ）。
                 _outer_undef = self.state.error_undefined_label
                 self.state.error_undefined_label = False
-                v, _ = self.expression(t + chr(0), 0)
+                _prev_typ = self.state.exp_typ
+                self.state.exp_typ = 'i'
+                try:
+                    v, _ = self.expression(t + chr(0), 0)
+                finally:
+                    self.state.exp_typ = _prev_typ
                 _inner_undef = self.state.error_undefined_label
                 self.state.error_undefined_label = _outer_undef or _inner_undef
                 if _inner_undef:
                     self.state.diag(" error - enflt{}: expression contains undefined label.", set_error=True)
-                    x = enflt(0)
-                else:
-                    try:
-                        x = enflt(int(v) & 0xFFFFFFFF)
-                    except (OverflowError, ValueError):
-                        self.state.diag(" error - enflt{}: non-finite float value; using 0.", set_error=True)
-                        x = enflt(0)
+                    v = 0
+                x = enflt(int(v) & 0xFFFFFFFF)
+                x = _float_brace_result(self.state, x, "enflt")
         elif (idx + 5 <= len(s) and s[idx:idx + 5] == 'endbl'
               and (lambda _j=StringUtils.skipspc(s, idx + 5): _j < len(s) and s[_j] == '{')()):
             idx += 5
             f, t, idx = self.parser.get_curlb(s, idx)
             if f:
+                # 中身は整数モードで読む（caxx.c と同じ）。
                 _outer_undef = self.state.error_undefined_label
                 self.state.error_undefined_label = False
-                v, _ = self.expression(t + chr(0), 0)
+                _prev_typ = self.state.exp_typ
+                self.state.exp_typ = 'i'
+                try:
+                    v, _ = self.expression(t + chr(0), 0)
+                finally:
+                    self.state.exp_typ = _prev_typ
                 _inner_undef = self.state.error_undefined_label
                 self.state.error_undefined_label = _outer_undef or _inner_undef
                 if _inner_undef:
                     self.state.diag(" error - endbl{}: expression contains undefined label.", set_error=True)
-                    x = endbl(0)
-                else:
-                    try:
-                        x = endbl(int(v) & 0xFFFFFFFFFFFFFFFF)
-                    except (OverflowError, ValueError):
-                        self.state.diag(" error - endbl{}: non-finite float value; using 0.", set_error=True)
-                        x = endbl(0)
+                    v = 0
+                x = endbl(int(v) & 0xFFFFFFFFFFFFFFFF)
+                x = _float_brace_result(self.state, x, "endbl")
         elif idx + 4 <= len(s) and s[idx:idx + 4] == 'not(':
             x, idx = self.expression(s, idx + 4)
             idx = StringUtils.skipspc(s, idx)
@@ -4331,7 +4522,10 @@ class ExpressionEvaluator:
                 if _undef(x) or _undef(t):
                     x = UNDEF
                 elif t == 0:
-                    self.state.diag(" error - Division by 0 error.", set_error=True)
+                    if self.state.fdiv0_defer and self.state.exp_typ == 'f':
+                        self.state.fdiv0_seen = True
+                    else:
+                        self.state.diag(" error - Division by 0 error.", set_error=True)
                     # caxx.c と同じく、0 にして式の残りは読み続ける。
                     x = 0
                 else:
@@ -4341,7 +4535,10 @@ class ExpressionEvaluator:
                 if _undef(x) or _undef(t):
                     x = UNDEF
                 elif t == 0:
-                    self.state.diag(" error - Division by 0 error.", set_error=True)
+                    if self.state.fdiv0_defer and self.state.exp_typ == 'f':
+                        self.state.fdiv0_seen = True
+                    else:
+                        self.state.diag(" error - Division by 0 error.", set_error=True)
                     # caxx.c と同じく、0 にして式の残りは読み続ける。
                     x = 0
                 else:
@@ -4356,7 +4553,10 @@ class ExpressionEvaluator:
                 if _undef(x) or _undef(t):
                     x = UNDEF
                 elif t == 0:
-                    self.state.diag(" error - Division by 0 error.", set_error=True)
+                    if self.state.fdiv0_defer and self.state.exp_typ == 'f':
+                        self.state.fdiv0_seen = True
+                    else:
+                        self.state.diag(" error - Division by 0 error.", set_error=True)
                     # caxx.c と同じく、0 にして式の残りは読み続ける。
                     x = 0
                 else:
@@ -6937,10 +7137,14 @@ class PatternMatcher:
                     idx_s_q_start = idx_s
 
                     self.state.expr_missing = False
+                    _d0_prev = (self.state.fdiv0_defer, self.state.fdiv0_seen)
+                    self.state.fdiv0_defer, self.state.fdiv0_seen = True, False
                     try:
                         v, idx_s_after = self.expr_eval.expression_esc_float(s, idx_s, stopchar)
                     finally:
                         self.state._elf_capturing_var = None
+                        _d0 = self.state.fdiv0_seen
+                        self.state.fdiv0_defer, self.state.fdiv0_seen = _d0_prev
                     for _k in _closes:
                         self._sub_mark(SUB_CLOSE, _k, idx_s_after)
                     self._cap_text(a, s, idx_s_q_start, idx_s_after, stopchar)
@@ -6965,12 +7169,15 @@ class PatternMatcher:
                             if not raw_text:
                                 raise ValueError
                             h = IEEE754Converter.decimal_eval_expr(raw_text)
+                            _d0 = False
                         except (ValueError, ZeroDivisionError):
                             if raw_text in ('inf', '-inf', 'nan'):
                                 h = IEEE754Converter.decimal_to_ieee754_128bit_hex(raw_text)
                             else:
                                 h = IEEE754Converter.decimal_to_ieee754_128bit_hex(
                                         _g17(_float_of(v)))
+                    if _d0:
+                        self.state.diag(" error - Division by 0 error.", set_error=True)
 
                     x = int(h, 16)
                     self.var_manager.put(a, x)
@@ -7624,8 +7831,12 @@ class PatternFileReader:
                              f"name ({var_str!r}).", set_error=True)
 
                 if len(l) == 1:
+                    # 引数なしで意味を持つもの（切り替えと「全部消す」）は警告しない。
+                    # caxx.c の readpat() と同じ一覧である。
                     if l[0].strip() != '' and _kw not in ('.PASSTHRU', '.EOL',
-                                                         '.TEXTMODE', '.UNORDERED'):
+                                                         '.TEXTMODE', '.UNORDERED',
+                                                         '.CLEARSYM', '.CLRCHECK',
+                                                         '.CLRRELOC', '.CLRENUM'):
                         diag(f" warning - pattern line has no '::' field separator "
                              f"and can never match (likely a stray line left over "
                              f"from a multi-line comment, or a binary_list/"
@@ -10489,6 +10700,10 @@ class VLIWProcessor:
                 idx += 1
 
                 _slot_peek = line[idx:].lstrip()
+                # 空のスロット（`ad!!`、`ad!! !!!!`）は黙ってバンドルを捨てずにエラー。
+                if _slot_peek[:1] in ('', VLIW_SEP, VLIW_STOP):
+                    self.state.diag(_VLIW_EMPTY_SLOT_MSG, set_error=True)
+                    return False
                 if _slot_peek.startswith('.'):
                     self.state.diag(" error - directives (e.g. .section/.endsection/.INCLUDE) "
                              "are not allowed inside VLIW slots (the packet's PC has not "
@@ -10540,7 +10755,9 @@ class VLIWProcessor:
 
                 target_len = ibyte * noi
                 if len(values) > target_len:
-                    self.state.diag(f"warning-VLIW:{len(values)} values exceed slot capacity {target_len},truncating.", set_error=False)
+                    # 入りきらない命令を黙って落とさずにエラーにする（caxx.c と同じ）。
+                    self.state.diag(f" error - VLIW: the packet's instructions take {len(values)} "
+                                    f"byte(s) but its slots hold only {target_len}.", set_error=True)
                     values = values[:target_len]
                 else:
                     _deficit = target_len - len(values)
@@ -10643,9 +10860,10 @@ class AssemblyDirectiveProcessor:
 
             if e.upper() == '.EQU':
                 reloc_type = None
-                expr_part = l[idx:].strip()
+                # 落とす空白はスペースとタブだけ（caxx.c と同じ）。
+                expr_part = l[idx:].strip(' \t')
                 if '::' in expr_part:
-                    parts = [p.strip() for p in expr_part.split('::', 1)]
+                    parts = [p.strip(' \t') for p in expr_part.split('::', 1)]
                     expr_part = parts[0]
                     rt_str = parts[1].lower()
 
@@ -10664,7 +10882,7 @@ class AssemblyDirectiveProcessor:
                 if _track_sections:
                     self.state._equ_sections_touched = set()
                 try:
-                    u, _ = self.expr_eval.expression_asm(expr_part, 0)
+                    u, _equ_end = self.expr_eval.expression_asm(expr_part, 0)
                 finally:
                     self.state._pass1_size_mode = saved_mode
                     _touched = self.state._equ_sections_touched
@@ -10677,6 +10895,7 @@ class AssemblyDirectiveProcessor:
                          f"section layout and will NOT be relocated by the linker.", set_error=False)
                 if self.state.error_undefined_label and self.state.should_report_errors():
                     self.state.diag(f" error - .EQU '{label}': expression contains undefined label.", set_error=True)
+                self._dir_trailing(f".EQU '{label}'", expr_part, _equ_end)
                 ok = self.label_manager.put_value(label, u, self.state.current_section, is_equ=True, reloc_type=reloc_type)
                 if self.state.textmode:
                     self.state.label_text = l[:lidx]
@@ -10765,6 +10984,8 @@ class AssemblyDirectiveProcessor:
                     self.state.pc += 1
         if idx >= len(l2):
             self.state.diag(f" warning - unterminated string literal in .ASCII/.ASCIZ: {l2!r}", set_error=False)
+        else:
+            self._dir_trailing(".ASCII/.ASCIZ", l2, idx + 1)
         if _truncated and self.state.should_report_errors():
             self.state.diag(f" warning - .ASCII/.ASCIZ: one or more characters exceed the output word "
                  f"width ({self.state.bts} bit(s)) and were truncated (high bits discarded): "
@@ -10818,6 +11039,18 @@ class AssemblyDirectiveProcessor:
                 idx += 1
         return True
 
+    def _dir_trailing(self, name, text, idx):
+        """指令の引数の後ろに残った文字をエラーにする（黙って捨てない）。
+
+        空白とタブだけなら何もしない。caxx.c の dir_trailing() と同じ。
+        """
+        rest = text[idx:].strip(' \t')
+        if not rest:
+            return False
+        self.state.diag(f" error - {name}: unexpected text after the argument: {rest!r}.",
+                        set_error=True)
+        return True
+
     _RES_UNITS = {'.RESB': 1, '.RESW': 2, '.RESD': 4, '.RESQ': 8}
 
     def resb_processing(self, l1, l2):
@@ -10828,6 +11061,8 @@ class AssemblyDirectiveProcessor:
             return False
         self.state.error_undefined_label = False
         x, idx = self.expr_eval.expression_asm(l2, 0)
+        if self._dir_trailing(_directive, l2, idx):
+            return True
         # 未定義を含む .EQU の値（未定義の番兵）も未定義のラベルとして扱う。
         # caxx.c の adir_resb() など（u256_is_undef()）と同じ。
         if self.state.error_undefined_label or _undef(x):
@@ -10855,6 +11090,8 @@ class AssemblyDirectiveProcessor:
             return False
         self.state.error_undefined_label = False
         x, idx = self.expr_eval.expression_asm(l2, 0)
+        if self._dir_trailing(".ZERO", l2, idx):
+            return True
         if self.state.error_undefined_label or _undef(x):
             self.state.diag(" error - .ZERO argument contains undefined label.", set_error=True)
             return True
@@ -10900,6 +11137,13 @@ class AssemblyDirectiveProcessor:
         """
         if StringUtils.upper(l1) != ".SECTION" and StringUtils.upper(l1) != ".SEGMENT":
             return False
+        # 名前は 1 語。空白や `,` の後ろ（GNU as の旗 `,"aw"` など）を名前に含めず、
+        # 黙って捨てもせずにエラーにする（caxx.c の adir_section() と同じ）。
+        _e = 0
+        while _e < len(l2) and l2[_e] not in ' \t,':
+            _e += 1
+        if _e < len(l2) and self._dir_trailing(".SECTION", l2, _e):
+            return True
 
         if l2 != '':
             old_sec = self.state.current_section
@@ -10935,6 +11179,8 @@ class AssemblyDirectiveProcessor:
         if l2 != '':
             self.state.error_undefined_label = False
             u, idx = self.expr_eval.expression_asm(l2, 0)
+            if self._dir_trailing(".ALIGN", l2, idx):
+                return True
             if self.state.error_undefined_label or _undef(u):
                 self.state.diag(" error - .ALIGN argument contains undefined label.", set_error=True)
                 return True
@@ -11366,6 +11612,9 @@ class AssemblyDirectiveProcessor:
             return False
         self.state.error_undefined_label = False
         u, idx = self.expr_eval.expression_asm(l2, 0)
+        _org_fill = idx + 2 <= len(l2) and l2[idx:idx + 2].upper() == ',P'
+        if self._dir_trailing(".ORG", l2, idx + 2 if _org_fill else idx):
+            return True
         if self.state.error_undefined_label or _undef(u):
             self.state.diag(" error - .ORG argument contains undefined label.", set_error=True)
             return True
@@ -13621,6 +13870,12 @@ class Assembler:
             self.state._elf_tracking = False
 
         if not flag:
+            # 先頭のスロットが空の行（`!!ad ...`、`!!!!` だけ）は黙って捨てずにエラーに
+            # する。どのパターンも読んでいないので `.vliw` の有無はまだ分からないが、
+            # どちらでも誤り（caxx.c の lineassemble() と同じ）。
+            _vl = line.lstrip(' \t')
+            if _vl[:1] in (VLIW_SEP, VLIW_STOP) and self.state.should_report_errors():
+                self.state.diag(_VLIW_EMPTY_SLOT_MSG, set_error=True)
             return False
 
         if (self.state.textmode and self.state.label_text
@@ -13664,6 +13919,14 @@ class Assembler:
 
         if self.state.eol and objl and not self.state.vliwflag:
             objl.append(ord('\n'))
+
+        # `.vliw` の無いパターンファイルで `!!` が続く行は、後ろを黙って捨てずにエラー
+        # にする（caxx.c の lineassemble() と同じ）。
+        _vrest = line[idx:].lstrip(' ')
+        if not self.state.vliwflag and _vrest[:1] in (VLIW_SEP, VLIW_STOP):
+            if self.state.should_report_errors():
+                self.state.diag(_VLIW_NO_VLIW_MSG, set_error=True)
+            return False
 
         if not self.state.vliwflag or (idx >= len(line) or line[idx] not in (VLIW_SEP, VLIW_STOP)):
             of = len(objl)
@@ -14022,19 +14285,24 @@ class Assembler:
 
                     rtype = 0
                     _rtype_is_default_guess = False
+                    # ソースの `.reloctype` はその幅の推測の型を上書きする。型を書かない
+                    # `.extern` の既定の型も推測なので上書きする。上書きした型は、値を見て
+                    # 絶対と PC 相対を選び直す推測にかけない（caxx.c と同じ）。
+                    _rt_src_ovr = self.state.reloctype_override.get(num_bytes)
                     if _forced_rtype is not None:
                         rtype = _forced_rtype
-                    elif _src_rtype is not None:
+                    elif (_src_rtype is not None
+                          and not (_rt_src_ovr is not None and lname in self.state.extern_untyped)):
                         rtype_override = _src_rtype
                         expected = _mach_tbl_la['reloc_bytes'].get(rtype_override)
                         if expected is None or expected == num_bytes:
                             rtype = rtype_override
                         else:
                             rtype = _rmap.get(num_bytes, 0)
-                            _rtype_is_default_guess = True
+                            _rtype_is_default_guess = _rt_src_ovr is None
                     else:
                         rtype = _rmap.get(num_bytes, 0)
-                        _rtype_is_default_guess = True
+                        _rtype_is_default_guess = _rt_src_ovr is None
 
                     if first_widx >= len(objl):
                         continue
@@ -14504,8 +14772,7 @@ class Assembler:
                     os.close(fd)
                     self.state.stdin_tmp_path = tmp_path
                     af = self.file_input_from_stdin()
-                    with open(self.state.stdin_tmp_path, "wt", encoding="utf-8",
-                              errors="surrogateescape") as stdintmp:
+                    with open(self.state.stdin_tmp_path, "wb") as stdintmp:
                         stdintmp.write(af)
                 fn = self.state.stdin_tmp_path
 
@@ -14538,17 +14805,13 @@ class Assembler:
             self.state.ln = self.state.lnstack.pop()
 
     def file_input_from_stdin(self):
-        """プロンプトモード。`>>` で行を読み、`?` でラベル表を出す。
+        """ソースの名前が `stdin` のとき、標準入力をバイトのまま全部読む。
 
-        このモードではマクロ層を通らない。
+        一時ファイルに書いてから普通のファイルと同じく読むので、改行（LF・CRLF・
+        CR だけ）と UTF-8 でないバイトの扱いはファイルと同じになる（caxx.c の
+        file_input_from_stdin() と同じ）。
         """
-        af = ""
-        while True:
-            line = sys.stdin.readline()
-            if line == '':
-                break
-            af += line.replace('\r', '')
-        return af
+        return sys.stdin.buffer.read()
 
     _IMP_HEX_RE = re.compile(r'[ \t]*([+-]?)(?:0[xX])?([0-9A-Fa-f]+)[ \t]*\Z')
 
@@ -15058,7 +15321,7 @@ class Assembler:
                                 set_error=True)
                 return bytes(n)
             rt = (_reloc_data_pcrel(mach, n) if app == 0x10
-                  else mach['width_guess'].get(n))
+                  else _reloc_data_abs(mach, n))
             if not rt:
                 self.state.diag(f" error - CFI: no relocation type for a {n}-byte pointer "
                                 f"(encoding 0x{enc:02x}).", set_error=True)
@@ -16585,6 +16848,10 @@ class Assembler:
                     self.state.pc = 0
                     self.state.pas = 1
                     self.state.ln = 1
+                    # ソースの `.reloctype` と `.labelc` はパスごとに先頭から効く
+                    # （前のパスの最後の設定を持ち越さない。caxx.c と同じ）。
+                    self.state.reloctype_override = {}
+                    self.state.lwordchars = DIGIT + ALPHABET + "_."
                     self.state.labels = dict(_imported_labels)
                     self.state.sections = {}
                     self.state.export_labels = {}
@@ -16680,6 +16947,8 @@ class Assembler:
                 self.state.pc = 0
                 self.state.pas = 2
                 self.state.ln = 1
+                self.state.reloctype_override = {}
+                self.state.lwordchars = DIGIT + ALPHABET + "_."
                 self.state.relocations = []
                 self.state.elf_anchors = []
                 self.state.line_map = []

@@ -87,6 +87,8 @@ typedef struct { uint256_t val; int is_undef; int is_float; int text_off; } PatV
    入った名前は g_varnext でつなぐ。名前引きは照合 1 回あたり何度も呼ばれる
    ので、全走査ではなくこの表を引く。 */
 #define NVARS 256
+/* ラベルに使える文字の既定（ソースの `.labelc` が増やす）。axx.py の DIGIT + ALPHABET + "_." と同じ。 */
+#define AXX_LWORDCHARS_DEFAULT "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_."
 static int    g_nvars = 0;
 static char  *g_varnames[NVARS];
 static int    g_varlen[NVARS];
@@ -2172,6 +2174,9 @@ static AXX_UNUSED void bufmap_free(BufMap*m){
 #define SUB_CLOSE_CHAR ((char)0x1F)
 #define VLIW_SEP_CHAR  ((char)0xFE)
 #define VLIW_STOP_CHAR ((char)0xFF)
+/* 空の VLIW スロットの診断。axx.py の _VLIW_EMPTY_SLOT_MSG と同じ文面。 */
+#define VLIW_EMPTY_SLOT_MSG " error - VLIW: empty slot in the packet (nothing before or after a '!!').\n"
+#define VLIW_NO_VLIW_MSG " error - '!!' separates VLIW slots, but the pattern file has no .vliw.\n"
 #define EXP_PAT  0
 #define EXP_ASM  1
 
@@ -2334,6 +2339,11 @@ typedef struct {
        照合が式・因子の捕捉の前に倒し、後で見て、立っていればその
        パターンを不一致にする。axx.py の state.expr_missing と同じ。 */
     int        expr_missing;
+    /* `!Q` の捕捉の倍精度の評価では、浮動小数点モードの 0 で割るを報告せずに印だけ
+       立てる。binary128 の評価で値が出ればその印は捨てる（1/1e-4000 は倍精度では
+       0 で割るが binary128 では 1e4000）。axx.py の state.fdiv0_defer と同じ。 */
+    int        fdiv0_defer;
+    int        fdiv0_seen;
 
     int        match_score_expr;
     int        match_score_sym;
@@ -3420,6 +3430,12 @@ static void extern_untyped_set(AsmState *st, const char *name, int on){
     st->extern_untyped[st->extern_untyped_len++] = strdup(name);
 }
 
+/* ソースの `.reloctype` がその幅の型を上書きしているか。 */
+static int reloctype_overridden(const AsmState *st, int nbytes){
+    int idx = nbytes==1 ? 0 : nbytes==2 ? 1 : nbytes==4 ? 2 : nbytes==8 ? 3 : -1;
+    return idx >= 0 && st->reloctype_override[idx] >= 0;
+}
+
 /* 欄の幅からリロケーション型を決める。ソースの `.reloctype` が上書きできる。 */
 static int reloctype_for(const AsmState *st, const ElfMachineInfo *m, int nbytes){
     int idx;
@@ -3620,7 +3636,7 @@ static void state_init(AsmState *st) {
     memset(st, 0, sizeof(*st));
     g_active_state = st;
     sv_init(&st->reported_label_errors);
-    strcpy(st->lwordchars, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_.");
+    strcpy(st->lwordchars, AXX_LWORDCHARS_DEFAULT);
     strcpy(st->swordchars, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_%$-~&|");
     st_set_current_section(st, ".text");
     lmap_init(&st->labels);
@@ -5248,228 +5264,489 @@ static int cap_sym_get(AsmState *st, int vi, const char *w, uint256_t *out){
     return smap_get(tb,uw,out);
 }
 
-/* 256bit 整数のビットを long double として読む。 */
-static long double u256_to_long_double(uint256_t v){
-    int neg = (int)((v.w[3] >> 63) & 1);
-    uint256_t m = v;
-    if(neg){
-        uint64_t carry = 1;
-        for(int i=0;i<4;i++){
-            uint64_t inv = ~m.w[i];
-            uint64_t sum = inv + carry;
-            carry = (sum < inv) ? 1u : 0u;
-            m.w[i] = sum;
-        }
+static uint256_t double_trunc_to_u256(double d);
+/* enflt{} / endbl{} の値を今のモードに合わせる。浮動小数点モードでは double の
+   ビットのまま返す。整数モードでは 0 の方向へ切り捨てた整数にし、有限でない値と
+   絶対値が 2**255 以上の値はエラーで 0 にする（axx.py の _float_brace_result()
+   と同じ）。 */
+static uint256_t float_brace_result(Assembler *asmb, double f, const char *name){
+    if(asmb->st.exp_typ_float) return double_to_u256(f);
+    if(!isfinite(f) || fabs(f) >= 57896044618658097711785492504343953926634992332820282019728792003956564819968.0){
+        if(should_report_errors(&asmb->st))
+            axx_diagf(1, 0, " error - %s{}: the value %.17g cannot be an integer; using 0.\n", name, f);
+        return u256_zero();
     }
-    long double r = 0.0L;
-    for(int i=3;i>=0;i--){
-        r = r * 18446744073709551616.0L + (long double)m.w[i];
-    }
-    return neg ? -r : r;
+    return double_trunc_to_u256(f);
 }
 
+/* ---- flt{} / dbl{} / qad{} の中身の式 ------------------------------------
+   本体の 256 ビット評価器とは別の、Python の数の規則に倣った小さな再帰下降。
+   axx.py の _XevalParser と同じ規則である。値は整数（256 ビットの符号付きに
+   収まるもの）か倍精度（有限のもの）。
+     - 数は Python のリテラルの綴り（10 進・0x・0o・0b、桁の間の `_`、小数点と
+       指数のある浮動小数点）。10 進の整数は 0 で始められない（0 そのものは可）。
+     - 演算子は優先順位の低い順に `|` `^` `&` `<< >>` `+ -` `* / // %`、単項
+       `+ - ~`、`**`（右結合で、左の単項より強い）。
+     - 整数どうしの + - * // % ** << >> & | ^ ~ は整数のまま計算する。結果が
+       256 ビットの符号付きに収まらないときは、その演算を倍精度でやり直す（`<<`
+       だけはエラー）。収まらない整数のリテラルも倍精度で読む。`/` と、倍精度の
+       混じった演算は倍精度（整数は正しく丸めて倍精度にする。整数どうしの `/` は
+       真の商を正しく丸める）。
+     - `<< >> & | ^ ~` は整数だけ。0 で割る・負のシフト量・0 の負の数乗・
+       負の数の非整数乗・途中で有限でない値が出る、はどれもエラー。
+     - `:名前` はラベルの値、関数は enfloat / enflt / endouble / endbl。
+   ------------------------------------------------------------------------ */
+typedef struct { int is_f; uint256_t i; double f; } XV;
 typedef struct { const char *s; int i; int len; int ok; Assembler *asmb; } XEP;
 
-static long double xeval_expr(XEP *p);
+static XV xeval_expr(XEP *p);
+static XV xeval_unary(XEP *p);
 
-/* ---- long double での式評価 ---------------------------------------------
-   浮動小数点のリテラルと部分式を、本体の 256bit 評価器とは別に long double で
-   解くための小さな再帰下降。`!F` / `!D` / `!Q` の値を作るときに使う。
-   ------------------------------------------------------------------------ */
+static XV xv_int(uint256_t v){ XV r; r.is_f=0; r.i=v; r.f=0; return r; }
+static XV xv_flt(XEP *p, double d){
+    XV r; r.is_f=1; r.i=u256_zero(); r.f=d;
+    if(!isfinite(d)) p->ok=0;
+    return r;
+}
+static int xv_neg(uint256_t v){ return (int)(v.w[3]>>63); }
+/* 符号なしで比べる。 */
+static int xv_ucmp(uint256_t a, uint256_t b){
+    for(int k=3;k>=0;k--){
+        if(a.w[k]!=b.w[k]) return a.w[k]<b.w[k] ? -1 : 1;
+    }
+    return 0;
+}
+/* 絶対値（-2**255 は符号なしの 2**255 になる）。 */
+static uint256_t xv_mag(uint256_t v){ return xv_neg(v) ? u256_neg(v) : v; }
+/* 符号と絶対値から作る。符号付き 256 ビットに収まらなければ偽。 */
+static int xv_from_mag(int neg, uint256_t m, uint256_t *out){
+    if(m.w[3]>>63){
+        if(!neg || m.w[3]!=((uint64_t)1<<63) || m.w[2] || m.w[1] || m.w[0]) return 0;
+    }
+    *out = neg ? u256_neg(m) : m;
+    return 1;
+}
+/* 符号なしの掛け算。256 ビットを溢れたら偽。 */
+static int xv_umul(uint256_t a, uint256_t b, uint256_t *out){
+    uint64_t r[8] = {0};
+    for(int i=0;i<4;i++){
+        uint64_t carry=0;
+        for(int j=0;j<4;j++){
+            __uint128_t t = (__uint128_t)a.w[i]*b.w[j] + r[i+j] + carry;
+            r[i+j] = (uint64_t)t;
+            carry = (uint64_t)(t>>64);
+        }
+        r[i+4] = carry;
+    }
+    if(r[4]|r[5]|r[6]|r[7]) return 0;
+    for(int k=0;k<4;k++) out->w[k]=r[k];
+    return 1;
+}
+/* 値を倍精度にする（整数は正しく丸める）。 */
+static double xv_d(XV v){ return v.is_f ? v.f : u256_int_to_double(v.i); }
+/* 符号なしの m を、下に捨てたビットがあるか（sticky）も見て正しく丸める。 */
+static double xv_umag_round(uint256_t m, int sticky){
+    int nb = 0;
+    for(int k=3;k>=0;k--) if(m.w[k]){
+        uint64_t w=m.w[k]; int b=0; while(w){ w>>=1; b++; }
+        nb = k*64 + b; break;
+    }
+    if(nb <= 64) return (double)(m.w[0] | (uint64_t)(sticky!=0));
+    int sh = nb - 64;
+    uint256_t top = u256_zero();
+    /* 符号なしの右シフト（u256_sar は符号を伸ばすので使わない）。 */
+    int ws = sh/64, bs = sh%64;
+    for(int k=0;k<4;k++){
+        uint64_t lo = (k+ws<4) ? m.w[k+ws] : 0;
+        uint64_t hi = (k+ws+1<4) ? m.w[k+ws+1] : 0;
+        top.w[k] = bs ? ((lo>>bs) | (hi<<(64-bs))) : lo;
+    }
+    uint256_t back = u256_shl(top, sh);
+    if(!u256_eq(back, m)) sticky = 1;
+    return ldexp((double)(top.w[0] | (uint64_t)(sticky!=0)), sh);
+}
+/* 整数どうしの `/`。真の商を正しく丸める（Python の int / int と同じ）。 */
+static double xv_int_truediv(uint256_t a, uint256_t b){
+    int neg = xv_neg(a) ^ xv_neg(b);
+    uint256_t ma = xv_mag(a), mb = xv_mag(b);
+    if(u256_is_zero(ma)) return neg ? -0.0 : 0.0;
+    uint256_t q = u256_udiv(ma, mb);
+    uint256_t r = u256_sub(ma, u256_mul(q, mb));
+    /* 商の有効桁が 55 ビットになるまで 1 ビットずつ割り進める。r < mb <= 2**255
+       なので 2r は溢れない。 */
+    int s = 0;
+    for(;;){
+        int qb = 0;
+        for(int k=3;k>=0;k--) if(q.w[k]){
+            uint64_t w=q.w[k]; int bb=0; while(w){ w>>=1; bb++; }
+            qb = k*64 + bb; break;
+        }
+        if(qb >= 55) break;
+        r = u256_shl(r, 1);
+        q = u256_shl(q, 1);
+        if(xv_ucmp(r, mb) >= 0){ r = u256_sub(r, mb); q.w[0] |= 1; }
+        s++;
+    }
+    double d = ldexp(xv_umag_round(q, !u256_is_zero(r)), -s);
+    return neg ? -d : d;
+}
+/* Python の float の divmod と同じ手順（floatobject.c の float_divmod）。 */
+static void xv_py_divmod(double vx, double wx, double *fdiv, double *fmod_out){
+    double mod = fmod(vx, wx);
+    double div = (vx - mod) / wx;
+    if(mod){
+        if((wx < 0) != (mod < 0)){ mod += wx; div -= 1.0; }
+    } else {
+        mod = copysign(0.0, wx);
+    }
+    double floordiv;
+    if(div){
+        floordiv = floor(div);
+        if(div - floordiv > 0.5) floordiv += 1.0;
+    } else {
+        floordiv = copysign(0.0, vx / wx);
+    }
+    *fdiv = floordiv; *fmod_out = mod;
+}
+/* 倍精度の値を 0 の方向へ切り捨てた整数の、下位 64 ビット（2 の補数）。 */
+static uint64_t xv_f_low64(double x){
+    double t = trunc(x);
+    int neg = t < 0;
+    double m = fabs(t);
+    uint64_t low;
+    if(m < 18446744073709551616.0) low = (uint64_t)m;
+    else {
+        int e; double fr = frexp(m, &e);
+        uint64_t mant = (uint64_t)ldexp(fr, 53);
+        int sh = e - 53;
+        low = sh >= 64 ? 0 : mant << sh;
+    }
+    return neg ? (uint64_t)0 - low : low;
+}
+
 static void xeval_skip(XEP *p){
     while(p->i<p->len && (p->s[p->i]==' '||p->s[p->i]=='\t')) p->i++;
 }
+static int xv_is_ident(char c){
+    return (c>='0'&&c<='9') || (c>='a'&&c<='z') || (c>='A'&&c<='Z') || c=='_';
+}
+static int xv_digit_val(char c, int base){
+    int v = (c>='0'&&c<='9') ? c-'0' : (c>='a'&&c<='f') ? c-'a'+10
+          : (c>='A'&&c<='F') ? c-'A'+10 : 99;
+    return v < base ? v : -1;
+}
+/* digit (_? digit)* を読み、`_` を除いた数字を buf に足す。無ければ偽。 */
+static int xv_digitpart(XEP *p, int base, char **buf, size_t *bn, size_t *bcap){
+    if(p->i>=p->len || xv_digit_val(p->s[p->i], base) < 0) return 0;
+    for(;;){
+        char c;
+        if(p->i<p->len && xv_digit_val(p->s[p->i], base) >= 0){ c = p->s[p->i]; p->i++; }
+        else if(p->i+1<p->len && p->s[p->i]=='_' && xv_digit_val(p->s[p->i+1], base) >= 0){
+            c = p->s[p->i+1]; p->i += 2;
+        } else break;
+        if(*bn + 2 > *bcap){
+            *bcap = *bcap ? *bcap*2 : 64;
+            *buf = realloc(*buf, *bcap);
+            if(!*buf){ perror("realloc"); exit(1); }
+        }
+        (*buf)[(*bn)++] = c; (*buf)[*bn] = '\0';
+    }
+    return 1;
+}
+static void xv_bufc(char **buf, size_t *bn, size_t *bcap, char c){
+    if(*bn + 2 > *bcap){
+        *bcap = *bcap ? *bcap*2 : 64;
+        *buf = realloc(*buf, *bcap);
+        if(!*buf){ perror("realloc"); exit(1); }
+    }
+    (*buf)[(*bn)++] = c; (*buf)[*bn] = '\0';
+}
+/* 数のリテラル。 */
+static XV xeval_number(XEP *p){
+    char *buf = NULL; size_t bn = 0, bcap = 0;
+    XV r = xv_int(u256_zero());
+    const char *s = p->s;
+    if(s[p->i]=='0' && p->i+1<p->len && strchr("xXoObB", s[p->i+1]) && s[p->i+1]){
+        char pc = (char)tolower((unsigned char)s[p->i+1]);
+        int base = pc=='x' ? 16 : pc=='o' ? 8 : 2;
+        p->i += 2;
+        if(p->i<p->len && s[p->i]=='_') p->i++;
+        if(!xv_digitpart(p, base, &buf, &bn, &bcap)){ p->ok=0; free(buf); return r; }
+        uint256_t v = u256_zero(); int ovf = 0;
+        for(size_t k=0;k<bn;k++) v = u256_muladd_small(v, (uint64_t)base, (uint64_t)xv_digit_val(buf[k], base), &ovf);
+        if(ovf || xv_neg(v)){
+            /* 収まらない整数は倍精度で読む。8 進と 2 進は 16 進に書き直して
+               strtod に渡す（どれも正しく丸まる）。 */
+            char *hx = malloc(bn + 8);
+            if(!hx){ perror("malloc"); exit(1); }
+            size_t hn = 0;
+            hx[hn++]='0'; hx[hn++]='x';
+            if(base == 16){
+                memcpy(hx+hn, buf, bn); hn += bn;
+            } else {
+                int bpd = base == 8 ? 3 : 1;
+                size_t nbits = bn * (size_t)bpd;
+                size_t lead = (4 - nbits % 4) % 4;
+                unsigned acc = 0; size_t cnt = lead;
+                for(size_t k=0;k<bn;k++){
+                    int dv = xv_digit_val(buf[k], base);
+                    for(int b=bpd-1;b>=0;b--){
+                        acc = (acc<<1) | (unsigned)((dv>>b)&1); cnt++;
+                        if(cnt == 4){ hx[hn++] = "0123456789abcdef"[acc]; acc = 0; cnt = 0; }
+                    }
+                }
+            }
+            hx[hn] = '\0';
+            r = xv_flt(p, strtod(hx, NULL));
+            free(hx);
+        } else r = xv_int(v);
+    } else {
+        int has_ip = xv_digitpart(p, 10, &buf, &bn, &bcap);
+        size_t ip_len = bn;
+        int is_float = 0;
+        if(p->i<p->len && s[p->i]=='.'){
+            p->i++;
+            xv_bufc(&buf, &bn, &bcap, '.');
+            int has_fp = xv_digitpart(p, 10, &buf, &bn, &bcap);
+            if(!has_ip && !has_fp){ p->ok=0; free(buf); return r; }
+            is_float = 1;
+        }
+        if(p->i<p->len && (s[p->i]=='e'||s[p->i]=='E')){
+            p->i++;
+            xv_bufc(&buf, &bn, &bcap, 'e');
+            if(p->i<p->len && (s[p->i]=='+'||s[p->i]=='-')){ xv_bufc(&buf, &bn, &bcap, s[p->i]); p->i++; }
+            if(!xv_digitpart(p, 10, &buf, &bn, &bcap)){ p->ok=0; free(buf); return r; }
+            is_float = 1;
+        }
+        if(is_float){
+            r = xv_flt(p, strtod(buf, NULL));
+        } else {
+            int nonzero = 0;
+            for(size_t k=0;k<ip_len;k++) if(buf[k]!='0') nonzero = 1;
+            if(buf[0]=='0' && nonzero){ p->ok=0; free(buf); return r; }
+            uint256_t v = u256_zero(); int ovf = 0;
+            for(size_t k=0;k<ip_len;k++) v = u256_muladd_small(v, 10, (uint64_t)(buf[k]-'0'), &ovf);
+            r = (ovf || xv_neg(v)) ? xv_flt(p, strtod(buf, NULL)) : xv_int(v);
+        }
+    }
+    free(buf);
+    if(p->i<p->len && xv_is_ident(s[p->i])) p->ok=0;
+    return r;
+}
 
-/* 項そのもの（数値・括弧）。 */
-static long double xeval_primary(XEP *p){
+/* 項そのもの（数・括弧・ラベル・関数）。 */
+static XV xeval_primary(XEP *p){
+    XV zero = xv_int(u256_zero());
     xeval_skip(p);
-    if(!p->ok || p->i>=p->len){ p->ok=0; return 0; }
+    if(!p->ok || p->i>=p->len){ p->ok=0; return zero; }
     char c = p->s[p->i];
     if(c=='('){
         p->i++;
-        long double v = xeval_expr(p);
+        XV v = xeval_expr(p);
         xeval_skip(p);
-        if(p->i<p->len && p->s[p->i]==')') p->i++;
+        if(p->ok && p->i<p->len && p->s[p->i]==')') p->i++;
         else p->ok=0;
         return v;
     }
+    AsmState *st=&p->asmb->st;
     if(c==':'){
         p->i++;
         int start=p->i;
-        while(p->i<p->len && (isalnum((unsigned char)p->s[p->i])||p->s[p->i]=='_'||p->s[p->i]=='.')) p->i++;
-        if(p->i==start){ p->ok=0; return 0; }
-        char name[512]; int n=p->i-start; if(n>(int)sizeof(name)-1) n=(int)sizeof(name)-1;
-        memcpy(name,p->s+start,(size_t)n); name[n]='\0';
-        AsmState *st=&p->asmb->st;
+        while(p->i<p->len && p->s[p->i] && char_in(p->s[p->i], st->lwordchars)) p->i++;
+        if(p->i==start){ p->ok=0; return zero; }
+        char *name = strndup(p->s+start, (size_t)(p->i-start));
+        if(!name){ perror("strndup"); exit(1); }
         LabelEntry *e = lmap_find(&st->labels, name);
+        free(name);
         if(!e || e->is_undef){
             st->error_undefined_label = 1;
-            return 0;
+            return zero;
         }
-        return u256_to_long_double(e->value);
+        return xv_int(e->value);
     }
-    if(isalpha((unsigned char)c) || c=='_'){
+    if((c>='a'&&c<='z') || (c>='A'&&c<='Z') || c=='_'){
         int start=p->i;
-        while(p->i<p->len && (isalnum((unsigned char)p->s[p->i])||p->s[p->i]=='_')) p->i++;
-        char name[64]; int n=p->i-start; if(n>(int)sizeof(name)-1) n=(int)sizeof(name)-1;
-        memcpy(name,p->s+start,(size_t)n); name[n]='\0';
+        while(p->i<p->len && xv_is_ident(p->s[p->i])) p->i++;
+        int n = p->i-start;
+        int bits = (n==7 && strncmp(p->s+start,"enfloat",7)==0) ? 32
+                 : (n==5 && strncmp(p->s+start,"enflt",5)==0) ? 32
+                 : (n==8 && strncmp(p->s+start,"endouble",8)==0) ? 64
+                 : (n==5 && strncmp(p->s+start,"endbl",5)==0) ? 64 : 0;
         xeval_skip(p);
-        if(p->i>=p->len || p->s[p->i]!='('){
-            p->ok=0; return 0;
-        }
+        if(!bits || p->i>=p->len || p->s[p->i]!='('){ p->ok=0; return zero; }
         p->i++;
-        long double arg = xeval_expr(p);
+        XV a = xeval_expr(p);
         xeval_skip(p);
-        if(p->i<p->len && p->s[p->i]==')') p->i++;
-        else { p->ok=0; return 0; }
-        if(strcmp(name,"enfloat")==0 || strcmp(name,"enflt")==0)
-            return enfloat_bits((uint64_t)(int64_t)arg);
-        if(strcmp(name,"endouble")==0 || strcmp(name,"endbl")==0)
-            return endouble_bits((uint64_t)(int64_t)arg);
-        p->ok=0; return 0;
+        if(p->ok && p->i<p->len && p->s[p->i]==')') p->i++;
+        else { p->ok=0; return zero; }
+        uint64_t low = a.is_f ? xv_f_low64(a.f) : a.i.w[0];
+        return xv_flt(p, bits==32 ? enfloat_bits(low) : endouble_bits(low));
     }
-    if(isdigit((unsigned char)c) || c=='.'){
-        int start=p->i;
-        while(p->i<p->len && (isdigit((unsigned char)p->s[p->i])||p->s[p->i]=='.')) p->i++;
-        if(p->i<p->len && (p->s[p->i]=='e'||p->s[p->i]=='E')){
-            int save=p->i;
-            p->i++;
-            if(p->i<p->len && (p->s[p->i]=='+'||p->s[p->i]=='-')) p->i++;
-            if(p->i<p->len && isdigit((unsigned char)p->s[p->i])){
-                while(p->i<p->len && isdigit((unsigned char)p->s[p->i])) p->i++;
-            } else p->i=save;
-        }
-        char buf[80]; int n=p->i-start; if(n>(int)sizeof(buf)-1) n=(int)sizeof(buf)-1;
-        memcpy(buf,p->s+start,(size_t)n); buf[n]='\0';
-        return atof(buf);
-    }
-    p->ok=0; return 0;
+    if((c>='0'&&c<='9') || c=='.') return xeval_number(p);
+    p->ok=0; return zero;
 }
 
-static long double xeval_unary(XEP *p);
-
-/* `**`。 */
-static long double xeval_power(XEP *p){
-    long double base = xeval_primary(p);
+static XV xv_fpow(XEP *p, XV a, XV b){
+    double x = xv_d(a), y = xv_d(b);
+    if(x == 0.0 && y < 0.0){ p->ok=0; return xv_int(u256_zero()); }
+    if(x < 0.0 && y != floor(y)){ p->ok=0; return xv_int(u256_zero()); }
+    return xv_flt(p, pow(x, y));
+}
+/* `**`。整数どうしで溢れたら倍精度でやり直す。 */
+static XV xv_pow(XEP *p, XV a, XV b){
+    if(!a.is_f && !b.is_f && !xv_neg(b.i)){
+        uint256_t ma = xv_mag(a.i), e = b.i, res = u256_one(), base = ma;
+        int neg = xv_neg(a.i) && (e.w[0] & 1);
+        if(xv_ucmp(ma, u256_one()) <= 0){
+            /* 0 か 1 の絶対値。0**0 は 1。 */
+            if(u256_is_zero(ma) && !u256_is_zero(e)) res = u256_zero();
+        } else {
+            if(u256_nonneg_gt_i64(e, 256)) return xv_fpow(p, a, b);
+            int64_t n = (int64_t)e.w[0];
+            while(n){
+                if(n & 1){
+                    if(!xv_umul(res, base, &res)) return xv_fpow(p, a, b);
+                }
+                n >>= 1;
+                if(n && !xv_umul(base, base, &base)) return xv_fpow(p, a, b);
+            }
+        }
+        uint256_t out;
+        if(!xv_from_mag(neg, res, &out)) return xv_fpow(p, a, b);
+        return xv_int(out);
+    }
+    return xv_fpow(p, a, b);
+}
+static XV xeval_power(XEP *p){
+    XV base = xeval_primary(p);
     xeval_skip(p);
     if(p->ok && p->i+1<p->len && p->s[p->i]=='*' && p->s[p->i+1]=='*'){
         p->i+=2;
-        long double e = xeval_unary(p);
-        return pow(base, e);
+        XV e = xeval_unary(p);
+        if(!p->ok) return e;
+        return xv_pow(p, base, e);
     }
     return base;
 }
 
 /* 単項 `-` `+` `~`。 */
-static long double xeval_unary(XEP *p){
+static XV xeval_unary(XEP *p){
     xeval_skip(p);
-    if(p->ok && p->i<p->len && p->s[p->i]=='+'){ p->i++; return xeval_unary(p); }
-    if(p->ok && p->i<p->len && p->s[p->i]=='-'){ p->i++; return -xeval_unary(p); }
-    if(p->ok && p->i<p->len && p->s[p->i]=='~'){
-        p->i++;
-        long double v = xeval_unary(p);
-        return (long double)(~(int64_t)v);
+    if(p->ok && p->i<p->len && (p->s[p->i]=='+'||p->s[p->i]=='-'||p->s[p->i]=='~')){
+        char c = p->s[p->i++];
+        XV v = xeval_unary(p);
+        if(!p->ok || c=='+') return v;
+        if(c=='-'){
+            if(v.is_f){ v.f = -v.f; return v; }
+            uint256_t out;
+            if(!xv_from_mag(!xv_neg(v.i), xv_mag(v.i), &out)) return xv_flt(p, -xv_d(v));
+            return xv_int(out);
+        }
+        if(v.is_f){ p->ok=0; return v; }
+        return xv_int(u256_not(v.i));
     }
     return xeval_power(p);
 }
 
-/* `*` `/` `%`。 */
-static long double xeval_term(XEP *p){
-    long double v = xeval_unary(p);
-    while(p->ok){
-        xeval_skip(p);
-        if(p->i+1<p->len && p->s[p->i]=='/' && p->s[p->i+1]=='/'){
-            p->i+=2; long double t=xeval_unary(p);
-            if(t==0){ p->ok=0; break; }
-            v = floor(v/t);
-        } else if(p->i<p->len && p->s[p->i]=='/'){
-            p->i++; long double t=xeval_unary(p);
-            if(t==0){ p->ok=0; break; }
-            v /= t;
-        } else if(p->i<p->len && p->s[p->i]=='%'){
-            p->i++; long double t=xeval_unary(p);
-            if(t==0){ p->ok=0; break; }
-            v = v - floor(v/t)*t;
-        } else if(p->i<p->len && p->s[p->i]=='*'
-                  && !(p->i+1<p->len && p->s[p->i+1]=='*')){
-            p->i++; v *= xeval_unary(p);
-        } else break;
+/* 2 項演算。 */
+static XV xv_binop(XEP *p, const char *op, XV a, XV b){
+    XV zero = xv_int(u256_zero());
+    if(!p->ok) return zero;
+    int both_int = !a.is_f && !b.is_f;
+    if(!strcmp(op,"<<") || !strcmp(op,">>") || !strcmp(op,"&") || !strcmp(op,"|") || !strcmp(op,"^")){
+        if(!both_int){ p->ok=0; return zero; }
+        if(op[0]=='&') return xv_int(u256_and(a.i, b.i));
+        if(op[0]=='|') return xv_int(u256_or(a.i, b.i));
+        if(op[0]=='^') return xv_int(u256_xor(a.i, b.i));
+        if(xv_neg(b.i)){ p->ok=0; return zero; }
+        int big = u256_nonneg_gt_i64(b.i, 256);
+        int n = big ? 256 : (int)b.i.w[0];
+        if(op[0]=='>') return xv_int(u256_sar(a.i, n));
+        if(u256_is_zero(a.i)) return zero;
+        if(n >= 256){ p->ok=0; return zero; }
+        uint256_t r = u256_shl(a.i, n);
+        if(!u256_eq(u256_sar(r, n), a.i)){ p->ok=0; return zero; }
+        return xv_int(r);
     }
-    return v;
+    if(!strcmp(op,"/")){
+        if(b.is_f ? b.f == 0.0 : u256_is_zero(b.i)){ p->ok=0; return zero; }
+        if(both_int) return xv_flt(p, xv_int_truediv(a.i, b.i));
+        return xv_flt(p, xv_d(a) / xv_d(b));
+    }
+    if(!strcmp(op,"//") || !strcmp(op,"%")){
+        if(b.is_f ? b.f == 0.0 : u256_is_zero(b.i)){ p->ok=0; return zero; }
+        double fd, fm;
+        if(both_int){
+            uint256_t minv = u256_shl(u256_one(), 255);
+            uint256_t m1 = u256_neg(u256_one());
+            if(op[0]=='/'){
+                if(!(u256_eq(a.i, minv) && u256_eq(b.i, m1)))
+                    return xv_int(u256_floordiv(a.i, b.i));
+            } else return xv_int(u256_mod(a.i, b.i));
+        }
+        xv_py_divmod(xv_d(a), xv_d(b), &fd, &fm);
+        return xv_flt(p, op[0]=='/' ? fd : fm);
+    }
+    if(both_int){
+        uint256_t r;
+        int ovf;
+        if(op[0]=='*'){
+            uint256_t m;
+            ovf = !xv_umul(xv_mag(a.i), xv_mag(b.i), &m)
+               || !xv_from_mag(xv_neg(a.i) ^ xv_neg(b.i), m, &r);
+        } else if(op[0]=='+'){
+            r = u256_add(a.i, b.i);
+            ovf = xv_neg(a.i)==xv_neg(b.i) && xv_neg(r)!=xv_neg(a.i);
+        } else {
+            r = u256_sub(a.i, b.i);
+            ovf = xv_neg(a.i)!=xv_neg(b.i) && xv_neg(r)!=xv_neg(a.i);
+        }
+        if(!ovf) return xv_int(r);
+    }
+    double x = xv_d(a), y = xv_d(b);
+    return xv_flt(p, op[0]=='+' ? x + y : op[0]=='-' ? x - y : x * y);
 }
 
-/* `+` `-`。 */
-static long double xeval_addsub(XEP *p){
-    long double v = xeval_term(p);
+/* 左結合の 1 段。ops は長いものを先に並べる。 */
+static XV xv_level(XEP *p, XV (*sub)(XEP *), const char *const *ops){
+    XV v = sub(p);
     while(p->ok){
         xeval_skip(p);
-        if(p->i<p->len && p->s[p->i]=='+'){ p->i++; v += xeval_term(p); }
-        else if(p->i<p->len && p->s[p->i]=='-'){ p->i++; v -= xeval_term(p); }
-        else break;
+        const char *hit = NULL;
+        for(int k=0; ops[k]; k++){
+            size_t l = strlen(ops[k]);
+            if(p->i + (int)l <= p->len && strncmp(p->s+p->i, ops[k], l)==0){
+                if(!strcmp(ops[k],"*") && p->i+1<p->len && p->s[p->i+1]=='*') continue;
+                hit = ops[k]; break;
+            }
+        }
+        if(!hit) break;
+        p->i += (int)strlen(hit);
+        XV b = sub(p);
+        v = xv_binop(p, hit, v, b);
     }
     return v;
 }
-
-/* `<<` `>>`。 */
-static long double xeval_shift(XEP *p){
-    long double v = xeval_addsub(p);
-    while(p->ok){
-        xeval_skip(p);
-        if(p->i+1<p->len && p->s[p->i]=='<' && p->s[p->i+1]=='<'){
-            p->i+=2; long double t=xeval_addsub(p);
-            int64_t sh=(int64_t)t;
-            if(sh<0 || sh>63){ p->ok=0; break; }
-            v = (long double)((int64_t)v << sh);
-        } else if(p->i+1<p->len && p->s[p->i]=='>' && p->s[p->i+1]=='>'){
-            p->i+=2; long double t=xeval_addsub(p);
-            int64_t sh=(int64_t)t;
-            if(sh<0 || sh>63){ p->ok=0; break; }
-            v = (long double)((int64_t)v >> sh);
-        } else break;
-    }
-    return v;
-}
-
-/* `&`。 */
-static long double xeval_band(XEP *p){
-    long double v = xeval_shift(p);
-    while(p->ok){
-        xeval_skip(p);
-        if(p->i<p->len && p->s[p->i]=='&'){ p->i++; v = (long double)((int64_t)v & (int64_t)xeval_shift(p)); }
-        else break;
-    }
-    return v;
-}
-
-/* `^`。 */
-static long double xeval_bxor(XEP *p){
-    long double v = xeval_band(p);
-    while(p->ok){
-        xeval_skip(p);
-        if(p->i<p->len && p->s[p->i]=='^'){ p->i++; v = (long double)((int64_t)v ^ (int64_t)xeval_band(p)); }
-        else break;
-    }
-    return v;
-}
-
-/* 式を 1 個解く。 */
-static long double xeval_expr(XEP *p){
-    long double v = xeval_bxor(p);
-    while(p->ok){
-        xeval_skip(p);
-        if(p->i<p->len && p->s[p->i]=='|'){ p->i++; v = (long double)((int64_t)v | (int64_t)xeval_bxor(p)); }
-        else break;
-    }
-    return v;
-}
+static const char *const xv_ops_term[]  = {"//","/","%","*",NULL};
+static const char *const xv_ops_arith[] = {"+","-",NULL};
+static const char *const xv_ops_shift[] = {"<<",">>",NULL};
+static const char *const xv_ops_band[]  = {"&",NULL};
+static const char *const xv_ops_bxor[]  = {"^",NULL};
+static const char *const xv_ops_bor[]   = {"|",NULL};
+static XV xeval_term(XEP *p){  return xv_level(p, xeval_unary, xv_ops_term); }
+static XV xeval_arith(XEP *p){ return xv_level(p, xeval_term,  xv_ops_arith); }
+static XV xeval_shift(XEP *p){ return xv_level(p, xeval_arith, xv_ops_shift); }
+static XV xeval_band(XEP *p){  return xv_level(p, xeval_shift, xv_ops_band); }
+static XV xeval_bxor(XEP *p){  return xv_level(p, xeval_band,  xv_ops_bxor); }
+static XV xeval_expr(XEP *p){  return xv_level(p, xeval_bxor,  xv_ops_bor); }
 
 /* テキストを評価して double で返す。読めなければ 0 を返す。 */
 static int xeval_eval(Assembler *asmb, const char *text, double *out){
     XEP p; p.s=text; p.i=0; p.len=(int)strlen(text); p.ok=1; p.asmb=asmb;
-    long double v = xeval_expr(&p);
+    XV v = xeval_expr(&p);
     xeval_skip(&p);
     if(!p.ok || p.i<p.len) return 0;
-    *out = (double)v;
+    *out = xv_d(v);
     return 1;
 }
 
@@ -5957,10 +6234,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                 }
                 iv = u256_zero();
             }
-            double fval=enfloat_bits(u256_to_u64(iv));
-            x = asmb->st.exp_typ_float ? double_to_u256(fval)
-                                       : (isfinite(fval) ? u256_from_i64((int64_t)fval)
-                                                         : u256_zero());
+            x = float_brace_result(asmb, enfloat_bits(u256_to_u64(iv)), "enflt");
             free(t);
         }
     }
@@ -5984,10 +6258,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                 }
                 iv = u256_zero();
             }
-            double fval=endouble_bits(u256_to_u64(iv));
-            x = asmb->st.exp_typ_float ? double_to_u256(fval)
-                                       : (isfinite(fval) ? u256_from_i64((int64_t)fval)
-                                                         : u256_zero());
+            x = float_brace_result(asmb, endouble_bits(u256_to_u64(iv)), "endbl");
             free(t);
         }
     }
@@ -6241,7 +6512,8 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             else if(flt){
                 double b=u256_to_double(t);
                 if(b==0.0){
-                    if(should_report_errors(&asmb->st)){
+                    if(asmb->st.fdiv0_defer) asmb->st.fdiv0_seen = 1;
+                    else if(should_report_errors(&asmb->st)){
                         axx_diagf(1, 0, " error - Division by 0 error.\n");
                     }
                     x=double_to_u256(0.0);
@@ -6262,7 +6534,8 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             else if(flt){
                 double b=u256_to_double(t);
                 if(b==0.0){
-                    if(should_report_errors(&asmb->st)){
+                    if(asmb->st.fdiv0_defer) asmb->st.fdiv0_seen = 1;
+                    else if(should_report_errors(&asmb->st)){
                         axx_diagf(1, 0, " error - Division by 0 error.\n");
                     }
                     x=double_to_u256(0.0);
@@ -6283,7 +6556,8 @@ static uint256_t expr_term0(Assembler *asmb, const char *s, int idx, int *idx_ou
             else if(flt){
                 double b=u256_to_double(t);
                 if(b==0.0){
-                    if(should_report_errors(&asmb->st)){
+                    if(asmb->st.fdiv0_defer) asmb->st.fdiv0_seen = 1;
+                    else if(should_report_errors(&asmb->st)){
                         axx_diagf(1, 0, " error - Division by 0 error.\n");
                     }
                     x=double_to_u256(0.0);
@@ -6410,13 +6684,12 @@ static uint256_t double_trunc_to_u256(double d){
     return neg ? u256_neg(r) : r;
 }
 
-/* 256bit 整数を double の値にする。 */
+/* 256bit 整数を double の値にする。偶数丸めで正しく丸める（axx.py の float(int)
+   と同じ）。64 ビットずつ足し込むと二重に丸まり、最後のビットが食い違う。 */
 static double u256_int_to_double(uint256_t v){
-    const double LIMB = 18446744073709551616.0;
     int neg = (int)((v.w[3] >> 63) & 1u);
     uint256_t m = neg ? u256_neg(v) : v;
-    double d = 0.0;
-    for(int i = 3; i >= 0; i--) d = d * LIMB + (double)m.w[i];
+    double d = xv_umag_round(m, 0);
     return neg ? -d : d;
 }
 
@@ -9278,7 +9551,11 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 idx_t = pat_var_stopchar(t, tlen, idx_t + _nl, &stopchar, closes, &nclose);
                 int idx_s_q_start = idx_s;
                 st->expr_missing = 0;
+                int _d0_prev_defer = st->fdiv0_defer, _d0_prev_seen = st->fdiv0_seen;
+                if(ftype == 'Q'){ st->fdiv0_defer = 1; st->fdiv0_seen = 0; }
                 uint256_t fv = expr_expression_esc_float(asmb, s, idx_s, stopchar, &idx_s);
+                int _d0 = ftype == 'Q' && st->fdiv0_seen;
+                st->fdiv0_defer = _d0_prev_defer; st->fdiv0_seen = _d0_prev_seen;
                 /* 未定義は 0（未定義はすでに報告済み）。axx.py と同じ。 */
                 int fv_undef = u256_is_undef(fv);
                 if(fv_undef) fv = double_to_u256(0.0);
@@ -9328,6 +9605,7 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                         }
                         int q_ok = 0;
                         qbits = f128_eval_text(f128_text, &q_ok);
+                        if(q_ok) _d0 = 0;
                         if(!q_ok){
                             if(strcmp(f128_text,"inf")==0 || strcmp(f128_text,"-inf")==0 ||
                                strcmp(f128_text,"nan")==0){
@@ -9346,6 +9624,8 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                         snprintf(fstr, sizeof(fstr), "%.17g", dv);
                         qbits = ieee754_128_from_str(fstr);
                     }
+                    if(_d0 && should_report_errors(st))
+                        axx_diagf(1, 0, " error - Division by 0 error.\n");
                     var_slot_put(st, vslot, qbits);
                 }
                 if(st->expr_missing){ result=0; break; }
@@ -13143,8 +13423,12 @@ static void readpat(Assembler *asmb, const char *fn){
                 if(e - a < (int)sizeof(kw1))
                     for(int k = a; k < e; k++) kw1[k-a] = axx_upper_char(fields[0][k]);
             }
+            /* 引数なしで意味を持つもの（切り替えと「全部消す」）は警告しない。
+               axx.py の同じ箇所と同じ一覧である。 */
             if(nonblank && strcmp(kw1,".PASSTHRU")!=0 && strcmp(kw1,".EOL")!=0
-                        && strcmp(kw1,".TEXTMODE")!=0 && strcmp(kw1,".UNORDERED")!=0){
+                        && strcmp(kw1,".TEXTMODE")!=0 && strcmp(kw1,".UNORDERED")!=0
+                        && strcmp(kw1,".CLEARSYM")!=0 && strcmp(kw1,".CLRCHECK")!=0
+                        && strcmp(kw1,".CLRRELOC")!=0 && strcmp(kw1,".CLRENUM")!=0){
                 { size_t _fl = strlen(fields[0]);
                   size_t _rsz = _fl * 4 + 8;
                   char *_fr = malloc(_rsz);
@@ -13837,7 +14121,15 @@ static void txt_float_int(TxtBuf *t, uint256_t v){
     all[n] = '\0';
     int exp10 = n - 1;
     if(n > TXT_FLOAT_PREC){
-        int round_up = (all[TXT_FLOAT_PREC] >= '5');
+        /* 偶数丸め（axx.py の Decimal の ROUND_HALF_EVEN と同じ）。ちょうど半分のときは
+           捨てる桁に 0 でないものが残っているか、残す最後の桁が奇数なら上げる。 */
+        int round_up = 0;
+        if(all[TXT_FLOAT_PREC] > '5') round_up = 1;
+        else if(all[TXT_FLOAT_PREC] == '5'){
+            int sticky = 0;
+            for(int i = TXT_FLOAT_PREC+1; i < n; i++) if(all[i] != '0'){ sticky = 1; break; }
+            round_up = sticky || ((all[TXT_FLOAT_PREC-1] - '0') & 1);
+        }
         all[TXT_FLOAT_PREC] = '\0';
         n = TXT_FLOAT_PREC;
         if(round_up){
@@ -14559,6 +14851,14 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         else if(idx<slen && line[idx]==VLIW_SEP_CHAR){
             idx+=1;
             { int _peek=idx; while(_peek<slen && (line[_peek]==' '||line[_peek]=='\t')) _peek++;
+              /* 空のスロット（`ad!!`、`ad!! !!!!`）は黙ってバンドルを捨てずにエラー。
+                 axx.py の vliwprocess() と同じ。 */
+              if(_peek>=slen || line[_peek]==VLIW_SEP_CHAR || line[_peek]==VLIW_STOP_CHAR){
+                  if(should_report_errors(st)) axx_diagf(1, 0, VLIW_EMPTY_SLOT_MSG);
+                  ivv_free(&objs); free(idxlst);
+                  if(idx_out) *idx_out=idx;
+                  return 0;
+              }
               if(_peek<slen && line[_peek]=='.'){
                   if(should_report_errors(st)){
                       axx_diagf(1, 0, " error - directives (e.g. .section/.endsection/.INCLUDE) "
@@ -14646,8 +14946,10 @@ static int vliwprocess(Assembler *asmb, const char *line, IntVec *idxs_in, IntVe
         }
         int target_len=ibyte*noi;
         if(values.len > target_len){
+            /* 入りきらない命令を黙って落とさずにエラーにする（axx.py と同じ）。 */
             if(should_report_errors(st))
-                fprintf(stderr,"warning-VLIW:%d values exceed slot capacity %d,truncating.\n",values.len,target_len);
+                axx_diagf(1, 0, " error - VLIW: the packet's instructions take %d byte(s) "
+                                "but its slots hold only %d.\n", values.len, target_len);
             values.len=target_len;
         } else {
             int needed=target_len-values.len;
@@ -14736,6 +15038,7 @@ static int adir_labelc(AsmState *st, const char *l, const char *ll){
 
 /* 行頭の `label:` と `.equ` を処理する。`.equ` のラベルは再配置情報を失い、
    定数として扱われる。 */
+static int dir_trailing(AsmState *st, const char *name, const char *text, int idx);
 static int elf_sec_name_cmp(const void *a, const void *b);
 static char *adir_label_processing(Assembler *asmb, const char *l, char *out, size_t osz){
     AsmState *st=&asmb->st;
@@ -14815,6 +15118,14 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
             if(st->error_undefined_label && should_report_errors(st)){
                 axx_diagf(1, 0, " error - .EQU '%s': expression contains undefined label.\n",
                            label);
+            }
+            {
+                size_t _nl = strlen(label) + 16;
+                char *_nm = malloc(_nl);
+                if(!_nm){ perror("malloc"); exit(1); }
+                snprintf(_nm, _nl, ".EQU '%s'", label);
+                dir_trailing(st, _nm, expr_tail, io);
+                free(_nm);
             }
 
             label_put_value(st,label,u,st->current_section,1,reloc_type,st->error_undefined_label);
@@ -14904,7 +15215,7 @@ static int asciistr(Assembler *asmb, const char *l2){
     if(!l2[idx]){
         char r[1024]; m_pyrepr(l2, r, sizeof(r));
         axx_diagf(0, 0, " warning - unterminated string literal in .ASCII/.ASCIZ: %s\n", r);
-    }
+    } else dir_trailing(st, ".ASCII/.ASCIZ", l2, idx+1);
     if(truncated && should_report_errors(st)){
         char r[1024]; m_pyrepr(l2, r, sizeof(r));
         axx_diagf(0, 0, " warning - .ASCII/.ASCIZ: one or more characters exceed the output word "
@@ -14919,6 +15230,13 @@ static int asciistr(Assembler *asmb, const char *l2){
 static int adir_section(AsmState *st, const char *l, const char *l2){
     char up[32]; axx_strupr_to(up,l,sizeof(up));
     if(strcmp(up,".SECTION")!=0 && strcmp(up,".SEGMENT")!=0) return 0;
+    /* 名前は 1 語。空白や `,` の後ろ（GNU as の旗 `,"aw"` など）を名前に含めず、
+       黙って捨てもせずにエラーにする。axx.py の section_processing() と同じ。 */
+    if(l2){
+        int _e = 0;
+        while(l2[_e] && l2[_e]!=' ' && l2[_e]!='\t' && l2[_e]!=',') _e++;
+        if(l2[_e] && dir_trailing(st, ".SECTION", l2, _e)) return 1;
+    }
     if(l2&&l2[0]){
         const char *old_sec = st->current_section;
 
@@ -15013,6 +15331,24 @@ static int adir_endsection(AsmState *st, const char *l){
     e->confirmed = 1;
     return 1;
 }
+/* 指令の引数の後ろに残った文字をエラーにする（黙って捨てない）。空白とタブだけなら
+   何もしない。axx.py の _dir_trailing() と同じ。 */
+static int dir_trailing(AsmState *st, const char *name, const char *text, int idx){
+    while(text[idx]==' '||text[idx]=='\t') idx++;
+    int n = (int)strlen(text+idx);
+    while(n > 0 && (text[idx+n-1]==' '||text[idx+n-1]=='\t')) n--;
+    if(n == 0) return 0;
+    if(should_report_errors(st)){
+        size_t rsz = (size_t)n*4 + 8;
+        char *r = malloc(rsz);
+        if(!r){ perror("malloc"); exit(1); }
+        m_pyrepr_n(text+idx, (size_t)n, r, rsz);
+        axx_diagf(1, 0, " error - %s: unexpected text after the argument: %s.\n", name, r);
+        free(r);
+    }
+    return 1;
+}
+
 static int adir_resX(Assembler *asmb, const char *l, const char *l2,
                      const char *directive, uint64_t mul){
     char up[16]; axx_strupr_to(up,l,sizeof(up));
@@ -15020,6 +15356,7 @@ static int adir_resX(Assembler *asmb, const char *l, const char *l2,
     asmb->st.error_undefined_label = 0;
     int io;
     uint256_t x=expr_expression_asm(asmb,l2,0,&io);
+    if(dir_trailing(&asmb->st, directive, l2, io)) return 1;
     /* 未定義を含む .EQU の値（未定義の番兵）も未定義のラベルとして扱う。 */
     if(asmb->st.error_undefined_label || u256_is_undef(x)){
         if(should_report_errors(&asmb->st)){
@@ -15075,6 +15412,7 @@ static int adir_zero(Assembler *asmb, const char *l, const char *l2){
     asmb->st.error_undefined_label = 0;
     int io;
     uint256_t x=expr_expression_asm(asmb,l2,0,&io);
+    if(dir_trailing(&asmb->st, ".ZERO", l2, io)) return 1;
     if(asmb->st.error_undefined_label || u256_is_undef(x)){
         if(should_report_errors(&asmb->st)){
             axx_diagf(1, 0, " error - .ZERO argument contains undefined label.\n");
@@ -15134,6 +15472,7 @@ static int adir_align(Assembler *asmb, const char *l, const char *l2){
     if(l2&&l2[0]){
         asmb->st.error_undefined_label = 0;
         int io; uint256_t u=expr_expression_asm(asmb,l2,0,&io);
+        if(dir_trailing(&asmb->st, ".ALIGN", l2, io)) return 1;
         if(asmb->st.error_undefined_label || u256_is_undef(u)){
             if(should_report_errors(&asmb->st)){
                 axx_diagf(1, 0, " error - .ALIGN argument contains undefined label.\n");
@@ -15170,6 +15509,10 @@ static int adir_org(Assembler *asmb, const char *l, const char *l2){
     asmb->st.error_undefined_label = 0;
     int io;
     uint256_t u=expr_expression_asm(asmb,l2,0,&io);
+    {
+        int _org_fill = io+2<=(int)strlen(l2) && l2[io]==',' && axx_upper_char(l2[io+1])=='P';
+        if(dir_trailing(&asmb->st, ".ORG", l2, _org_fill ? io+2 : io)) return 1;
+    }
     if(asmb->st.error_undefined_label || u256_is_undef(u)){
         if(should_report_errors(&asmb->st)){
             axx_diagf(1, 0, " error - .ORG argument contains undefined label.\n");
@@ -16333,8 +16676,9 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
               if(strcmp(raw,"stdin")==0){
                   strncpy(resolved, raw, sizeof(resolved)-1);
                   resolved[sizeof(resolved)-1]='\0';
-              } else if(cur && cur[0] && strcmp(cur,"(stdin)")!=0 && strcmp(cur,"stdin")!=0){
-                  /* axx.py の os.path.dirname(os.path.abspath(cur)) と同じ。 */
+              } else if(cur && cur[0] && strcmp(cur,"(stdin)")!=0){
+                  /* axx.py の os.path.dirname(os.path.abspath(cur)) と同じ。ソースを
+                     標準入力（`stdin`）から読んでいるときは作業ディレクトリが基準になる。 */
                   char dir_buf[2*PATH_MAX + 2];
                   axx_abs_dir_of(cur, dir_buf, sizeof(dir_buf));
                   axx_resolve_path(dir_buf, raw, resolved, sizeof(resolved));
@@ -16753,7 +17097,18 @@ static int lineassemble(Assembler *asmb, const char *line_in){
 
     st->elf_tracking=0;
 
-    if(!flag){ free(processed); iv_free(&idxs); iv_free(&objl); return 0; }
+    if(!flag){
+        /* 先頭のスロットが空の行（`!!ad ...`、`!!!!` だけ）は黙って捨てずにエラーに
+           する。どのパターンも読んでいないので `.vliw` の有無はまだ分からないが、
+           どちらでも誤り（axx.py の lineassemble() と同じ）。 */
+        {
+            const char *_vl = processed;
+            while(*_vl==' '||*_vl=='\t') _vl++;
+            if((*_vl==VLIW_SEP_CHAR || *_vl==VLIW_STOP_CHAR) && should_report_errors(st))
+                axx_diagf(1, 0, VLIW_EMPTY_SLOT_MSG);
+        }
+        free(processed); iv_free(&idxs); iv_free(&objl); return 0;
+    }
 
     if(st->textmode && st->label_text[0] && !st->vliwflag
        && (st->asmtext || objl.len == 0)){
@@ -16837,6 +17192,13 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     const char *rest=processed+new_idx;
     while(*rest==' ') rest++;
     int is_vliw_cont=(st->vliwflag && (rest[0]==VLIW_SEP_CHAR||rest[0]==VLIW_STOP_CHAR));
+    /* `.vliw` の無いパターンファイルで `!!` が続く行は、後ろを黙って捨てずにエラーに
+       する（axx.py の lineassemble() と同じ）。 */
+    if(!st->vliwflag && (rest[0]==VLIW_SEP_CHAR||rest[0]==VLIW_STOP_CHAR)){
+        if(should_report_errors(st)) axx_diagf(1, 0, VLIW_NO_VLIW_MSG);
+        free(processed); iv_free(&idxs); iv_free(&objl);
+        return 0;
+    }
 
     if(!is_vliw_cont){
         if(st->elf_objfile[0] && st->pas==2 && objl.len>0 && st->elf_refs_len>0){
@@ -17381,21 +17743,25 @@ static int lineassemble(Assembler *asmb, const char *line_in){
 
                 int _rtype = 0;
                 int _rtype_is_default_guess = 0;
+                /* ソースの `.reloctype` はその幅の推測の型を上書きする。型を書かない
+                   `.extern` の既定の型も推測なので上書きする。上書きした型は、値を見て
+                   絶対と PC 相対を選び直す推測にかけない（axx.py と同じ）。 */
+                int _rt_src_ovr = reloctype_overridden(st, _nbytes);
                 if(_forced_rtype > 0){
                     _rtype = _forced_rtype;
                 } else {
-                    if(_src_rtype >= 0){
+                    if(_src_rtype >= 0 && !(_rt_src_ovr && extern_untyped_has(st, _lname))){
                         int _rt_ov = _src_rtype;
                         int _expected = elf_machine_reloc_bytes(_mtbl_rm, _rt_ov);
                         if(_expected == 0 || _expected == _nbytes)
                             _rtype = _rt_ov;
                         else {
                             _rtype = RTYPE_FOR(_nbytes);
-                            _rtype_is_default_guess = 1;
+                            _rtype_is_default_guess = !_rt_src_ovr;
                         }
                     } else {
                         _rtype = RTYPE_FOR(_nbytes);
-                        _rtype_is_default_guess = 1;
+                        _rtype_is_default_guess = !_rt_src_ovr;
                     }
                 }
                 if(_rtype == 0 && _widx < objl.len && st->debug)
@@ -17608,26 +17974,25 @@ static int lineassemble0(Assembler *asmb, const char *line){
     return f;
 }
 
-/* プロンプトモードの 1 行入力。`?` でラベル表を出す。このモードでは
-   マクロ層を通らない。 */
-static char *file_input_from_stdin(void){
+/* ソースの名前が `stdin` のとき、標準入力をバイトのまま全部読む。一時ファイルに
+   書いてから普通のファイルと同じく読むので、改行（LF・CRLF・CR だけ）と UTF-8 で
+   ないバイトの扱いはファイルと同じになる（axx.py の file_input_from_stdin() と同じ）。 */
+static char *file_input_from_stdin(size_t *len_out){
     size_t total=0, cap=4096;
     char *buf=malloc(cap);
     if(!buf){ perror("malloc"); exit(1); }
-    char line[4096];
-    while(fgets(line,sizeof(line),stdin)){
-        size_t l=strlen(line);
-        for(size_t i=0;i<l;i++) if(line[i]=='\r'){ memmove(line+i,line+i+1,l-i); l--; i--; }
-        while(total+l+1>cap){
+    for(;;){
+        if(total == cap){
             cap*=2;
             char *tmp=realloc(buf,cap);
             if(!tmp){ free(buf); perror("realloc"); exit(1); }
             buf=tmp;
         }
-        memcpy(buf+total,line,l);
-        total+=l;
+        size_t r = fread(buf+total, 1, cap-total, stdin);
+        if(r == 0) break;
+        total += r;
     }
-    buf[total]=0;
+    *len_out = total;
     return buf;
 }
 
@@ -17939,6 +18304,21 @@ static int elf_reloc_data_pcrel(const AsmState *st, const ElfMachineInfo *m, int
     return 0;
 }
 
+/* 欄の幅が nbytes の、絶対のデータ型（命令欄の型を除く）を 1 つ探す。無ければ
+   幅の推測の型を、それが PC 相対でなければ使う。CFI の絶対の番地に使う（幅の推測は
+   命令の欄向けで、x86-64 の 4 バイトは PC32 になるため、そのままでは使えない）。
+   axx.py の _reloc_data_abs() と同じ規則である。 */
+static int elf_reloc_data_abs(const AsmState *st, const ElfMachineInfo *m, int nbytes){
+    for(int i = 0; m->named[i].name; i++){
+        int rt = m->named[i].rtype;
+        if(elf_machine_reloc_bytes(m, rt) != nbytes || elf_machine_is_pcrel(m, rt)) continue;
+        if(insn_reloc_field_decl(st, rt)) continue;
+        return rt;
+    }
+    int rt = (nbytes >= 1 && nbytes <= 8) ? m->wg[nbytes] : 0;
+    return (rt && !elf_machine_is_pcrel(m, rt)) ? rt : 0;
+}
+
 /* CFI の状態: CFA のレジスタとオフセット、remember_state の積み。 */
 typedef struct { int64_t reg, off; int64_t *stk; int nstk, cstk; } CfiStt;
 
@@ -18081,7 +18461,7 @@ static void cfi_ptr_reloc(AsmState *st, const ElfMachineInfo *m, int enc, const 
         axx_diagf(1, 0, " error - CFI: pointer encoding 0x%02x is not supported.\n", enc);
         return;
     }
-    int rt = app == 0x10 ? elf_reloc_data_pcrel(st, m, n) : (n <= 8 ? m->wg[n] : 0);
+    int rt = app == 0x10 ? elf_reloc_data_pcrel(st, m, n) : elf_reloc_data_abs(st, m, n);
     if(!rt){
         axx_diagf(1, 0, " error - CFI: no relocation type for a %d-byte pointer "
                         "(encoding 0x%02x).\n", n, enc);
@@ -21905,9 +22285,10 @@ static void fileassemble(Assembler *asmb, const char *fn){
             } else {
                 strncpy(st->stdin_tmp_path, "axx.tmp", sizeof(st->stdin_tmp_path)-1);
             }
-            stdin_buf=file_input_from_stdin();
-            FILE *tmpf=fopen(st->stdin_tmp_path,"wt");
-            if(tmpf){ fwrite(stdin_buf,1,strlen(stdin_buf),tmpf); fclose(tmpf); }
+            size_t stdin_len = 0;
+            stdin_buf=file_input_from_stdin(&stdin_len);
+            FILE *tmpf=fopen(st->stdin_tmp_path,"wb");
+            if(tmpf){ fwrite(stdin_buf,1,stdin_len,tmpf); fclose(tmpf); }
         }
         fn=st->stdin_tmp_path;
     }
@@ -22900,6 +23281,11 @@ int main(int argc, char *argv[]){
         for(int relax=0; relax<relax_budget; relax++){
             st->relax_optimistic = (relax == 0);
             st->pc=u256_zero(); st->pas=1; st->ln=1;
+            /* ソースの `.reloctype` はパスごとに先頭から効く（前のパスの最後の
+               上書きを持ち越さない）。axx.py と同じ。 */
+            for(int _rti=0; _rti<4; _rti++) st->reloctype_override[_rti] = -1;
+            /* `.labelc` も同じく、前のパスの最後の設定を持ち越さない。 */
+            strcpy(st->lwordchars, AXX_LWORDCHARS_DEFAULT);
             lmap_free(&st->labels); lmap_init(&st->labels);
             { int _n; LabelEntry **_v = lmap_in_order(&imported_labels, &_n);
               for(int _i=0;_i<_n;_i++){ LabelEntry *e=_v[_i];
@@ -23035,6 +23421,8 @@ int main(int argc, char *argv[]){
 #undef MAX_RELAX
 
         st->pc=u256_zero(); st->pas=2; st->ln=1;
+        for(int _rti=0; _rti<4; _rti++) st->reloctype_override[_rti] = -1;
+        strcpy(st->lwordchars, AXX_LWORDCHARS_DEFAULT);
         for(int ri=0;ri<st->reloc_count;ri++){
             free(st->relocations[ri].section);
             free(st->relocations[ri].sym);

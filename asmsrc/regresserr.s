@@ -38,3 +38,21 @@ oh bbbbbbbbbbbbbbbbbbbbbc
 oh bbbbbbbbbbbbbbbbbbbbbc
 og bbbbbbbbc
 og bbbbbbbbc
+; 2026-10-20: flt{} / dbl{} の中身の誤り（Python と同じく読めない綴り・整数だけの演算・
+; 0 で割る・有限でない途中の値）。enflt{} / endbl{} の整数にできない値
+rc2: .equ flt{nan}
+rd2: .equ dbl{1e300}
+e dbl{1.2.3}
+e dbl{01}
+e dbl{1_}
+e dbl{~0.5}
+e dbl{3&1.5}
+e dbl{1<<300}
+e dbl{1<2}
+e dbl{1e308*10/10}
+e dbl{2**-1/0}
+e flt{2**128}
+e enflt{rc2}
+e endbl{rd2}
+; !Q でも本当に 0 で割るとエラー
+Q 1/(1-1)

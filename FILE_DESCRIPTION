@@ -154,6 +154,14 @@ ministr.axx                         pattern file for strings in the mini
                                     by its name, and replacing a range with
                                     `x[lo:hi] = v` (MINI.md)
 ministr.s                           test assemble file for ministr.axx
+labelc_err.s                        regression test assembled with z80.axx: a
+                                    .labelc at the end of a file used to reach
+                                    the labels above it from the second pass
+                                    on; now the lines above it are errors
+dirjunk_err.s                       regression test assembled with z80.axx:
+                                    text left after the argument of .org,
+                                    .align, .zero, .res*, .ascii/.asciz, .equ
+                                    and .section, which used to be dropped
 regress.axx                         regression test for disagreements between
                                     the two implementations found by
                                     differential fuzzing (2026-10-07): nested
@@ -174,7 +182,18 @@ regress.axx                         regression test for disagreements between
                                     constants such as ')' (`?:` too), and the
                                     warnings for too many `[[ ]]` groups and
                                     for the combination budget, which never
-                                    came out
+                                    came out; and (2026-10-20) the bodies of
+                                    flt{} / dbl{} / qad{} under Python's
+                                    number rules (0x / 0o / 0b, exact
+                                    integers, endouble() of a negative
+                                    double), correctly rounded big integers
+                                    in floating-point mode, and enflt{} /
+                                    endbl{} in an integer context
+reloctype.s                         regression test assembled with x86_64.axx
+                                    under -o: the types chosen with
+                                    .reloctype (5.5.1), which the value-based
+                                    guess used to turn back and which leaked
+                                    from the last line of pass 1 into pass 2
 regress.s                          test assemble file for regress.axx (-V text)
 regresserr.s                        test assemble file for regress.axx (the
                                     diagnostics on standard error)
@@ -241,6 +260,12 @@ elfcfi.axx                          pattern file for call frame information:
 elfcfi.s                            test assemble file for elfcfi.axx. the
                                     .eh_frame rows llvm-dwarfdump reads match
                                     those of llvm-mc's object for the same code
+cfiptr.s                            test assemble file for elfcfi.axx:
+                                    .cfi_personality / .cfi_lsda with absolute
+                                    and PC-relative pointer encodings of 2, 4
+                                    and 8 bytes; the relocation types match
+                                    llvm-mc's (an absolute 4-byte pointer used
+                                    to get R_X86_64_PC32)
 elfmips.axx                         pattern file for .elfencode: MIPS32 (REL)
                                     whose R_MIPS_HI16 field is written back by a
                                     mini-language function ((addend+0x8000)>>16),
@@ -706,6 +731,10 @@ contin_inc.s                        the file contin.s takes in with !include
 contin_inc2.s                       the file contin.s takes in with .include
 vliw.axx                            test pattern file for vliw
 vliw.s                              test assembly file for vliw
+vliw_err.s                          test assemble file for vliw.axx: empty
+                                    slots and a packet whose instructions do
+                                    not fit, which used to be dropped or cut
+                                    down without an error
 x86_64.axx                          pattern file for x86_64-v3 (includes segment addressing, AVX/AVX2, BMI1/BMI2, x87 and EVEX/AVX-512);
                                     the VEX / EVEX rows are built from the
                                     encodings of llvm-mc 19 (manual appendix B)
