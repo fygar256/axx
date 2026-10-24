@@ -43,8 +43,9 @@ create vliw-pat-u 256 cells allot
   trim 2dup var-name? 0= if 2drop false exit then slower 2dup varnames om-put drop true ;
 
 \ 要素リストを展開する (elem_list_expand)。'' は省略可の印。
+: count-ch ( a u c -- n ) { a u c } 0 u 0 ?do a i + c@ c = if 1+ then loop ;
 : elem-list-expand ( a u -- l ) { a u }
-  u 2 + 4 * lst-new { out }
+  a u 44 count-ch 2 + lst-new { out }
   0 { st }
   u 1+ 0 ?do
     i u = a i + c@ 44 = or if

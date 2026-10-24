@@ -13,6 +13,7 @@ defer dir-pat-clear-extra ( a u -- )              \ .free が reloc 系も消す
 :noname 2drop ; is dir-elf
 :noname 2drop ; is dir-pat-clear-extra
 
+2 om-new constant chk-cache                       \ 変数 + 欄 -> [世代][arr]
 : exec-check ( row -- ) { r }
   r 1 rf trim nip if r 1 rf r 2 rf else
     r 2 rf trim nip if r 2 rf s" " else
@@ -24,7 +25,16 @@ defer dir-pat-clear-extra ( a u -- )              \ .free が reloc 系も消す
     mb-reset s"  error - .check: variable should be a lower case name ('" mb+ va vu mb+ s" ')." mb+ mb-get diag-e exit
   then
   { na nu }
+  na nu s\" \x01" sconcat sa su sconcat { ka ku }
+  ka ku chk-cache om-find ?dup if
+    dup @ arrgen @ = if
+      cell+ @ arr-clone { c2 } na nu c2 chk-set exit
+    then
+  then
   sa su elem-list-expand omit-list-from-names { arr }
+  ka ku chk-cache om-put { sl }
+  sl @ 0<> if sl cell+ @ arr-free then
+  arrgen @ sl !  arr arr-clone sl cell+ !
   na nu arr chk-set ;
 : exec-clrcheck ( row -- ) 2 rf trim dup if
     2dup dir-var if 2swap 2drop chk-del2

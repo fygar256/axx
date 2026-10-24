@@ -11,7 +11,7 @@ decimal
 : m-do-include-impl ( v fa fu ln -- ) { v fa fu ln }
   v mv-str? 0= if fa fu ln mfail-pos s" '!include' needs a file name string" mb+ mfail then
   v mv-s { na nu }
-  na nu fa fu dir-len { dl }
+  fa fu dir-len { dl }
   na c@ 47 <> dl 0> and if fa dl na nu sconcat else na nu then { pa pu }
   pa pu abspath sdup { ra ru }
   ra ru inc-find if fa fu ln mfail-pos s" circular '!include' of " mb+ na nu repr1 mb+ mfail then
@@ -118,9 +118,7 @@ decimal
     mb-reset s"  error - cannot open " mb+ pat if s" pattern" else s" source" then mb+ s"  file '" mb+ fa fu mb+
     s" ': [Errno 2] No such file or directory: '" mb+ fa fu mb+ s" '" mb+ mb-get diag-wf false exit
   then
-  false join-cont !
   fa fu load-lines { tab n }
-  true join-cont !
   tab n fa fu mac-expand { t2 n2 }
   mp.hadErr mp@ had-error @ or if false exit then
   t2 n2 da du mx-out ;
