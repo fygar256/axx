@@ -108,7 +108,7 @@ variable eb-names  variable eb-vals
     e1 to pos
     e1 sskip-from to pr
     pr ms-ach 45 = if
-      ms-a @ ms-u @ pr 1+ sskip-from names enum-name-at { e2 k2 }
+      ms-a @ ms-u @ pr 1+ sskip-from names enum-name-at { k2 e2 }
       k2 k1 >= if k2 1+ k1 ?do 1 present i cells + ! loop e2 to pos
       else 1 present k1 cells + ! then
     else 1 present k1 cells + ! then
