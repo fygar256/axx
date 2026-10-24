@@ -179,3 +179,13 @@ variable mb-u
 : mb-n ( n -- ) n>s mb+ ;
 : mb-c ( c -- ) mbuf mb-u @ + c! 1 mb-u +! ;
 : mb-get ( -- a u ) mbuf mb-u @ ;
+
+\ ---- 辞書の写し ----
+: om-copy ( src dst -- ) { src dst }
+  dst om-clear
+  src om-used 0 ?do
+    i src om-live? if
+      i src om-key dst om-put
+      i src om-val swap src 3 cells + @ cells move
+    then
+  loop ;
