@@ -48,7 +48,7 @@ variable h-forced
     h-fw @ i + obj-q e-mask qand sh qshl iv qor to iv
   loop
   h-rt @ rtk mt-encode om-find ?dup if
-    dstr@ s" .elfencode" 2swap iv val elf-call-func if to iv then
+    dstr@ s" .elfencode" 2swap iv val elf-call-func if qn to iv then
   else
     iv h-field-mask qun qnot qand sv h-field-mask field-deposit qun qor to iv
   then

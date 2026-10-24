@@ -164,7 +164,11 @@ variable arrgen
 : set-literal-from-text ( a u -- l true | false ) { a u }
   a u split-commas { parts }
   parts lst-n 2 < if false exit then
-  parts lst-n 64 + lst-new { items }
+  parts lst-n 64 + { cap }
+  parts lst-n 0 ?do
+    parts i lst-item item-str set-name-token if asym-get ?dup if arr-n cap + to cap then else then
+  loop
+  cap lst-new { items }
   parts lst-n 0 ?do
     parts i lst-item item-str set-name-token 0= if false unloop exit then { na nu }
     na nu asym-get ?dup if
