@@ -114,7 +114,7 @@ sb-new constant lc-b
     then
   loop
   \ 索引は降順に積んで、先頭から読むと昇順になるようにする
-  0 nrows @ 1- ?do
+  nrows @ 0> if 0 nrows @ 1- do
     i risdir @ 0= if
       i rf0 lead-caps { closed } { pa pu }
       pu 0> if
@@ -125,7 +125,7 @@ sb-new constant lc-b
         pu pmaxkey @ max pmaxkey !
       then
     then
-  -1 +loop ;
+  -1 +loop then ;
 
 : push-list ( head -- ) begin dup 0<> while 1- dup cand ncand @ cells + ! 1 ncand +! cells pn-next + @ repeat drop ;
 
