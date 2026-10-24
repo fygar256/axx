@@ -182,7 +182,7 @@ variable u-depmiss
 
 \ ---- パターンファイルのシンボルの先読み ----
 : pat-sym-row ( r -- ) dup rkind @ { k }
-  k 1 = k 2 = or k 12 = or k 4 = or  k 11 = unordered-on @ 0= and or if 1 exec-dir else drop then ;
+  k 1 = k 2 = or k 12 = or k 4 = or  k 11 = unordered-on @ 0= and or if ar-mark swap 1 exec-dir ar-release else drop then ;
 : set-pat-symbols ( -- )
   numsyms om-clear  strsyms om-clear  arrsyms om-clear  1 arrgen +!
   numsyms sym-target !

@@ -51,12 +51,14 @@ decimal
     s"  error - !S{{...}}: sub table expansion exceeds maximum depth 8." diag-e false exit
   then
   arr arr-n 2 / 0 ?do
+    ar-mark { mk }
     arr i 2 * arr-item item-str { pa pu }
     arr i 2 * 1+ arr-item item-str { xa xu }
     va depth cells bind-va + !  vu depth cells bind-vu + !
     xa depth cells bind-ea + !  xu depth cells bind-eu + !
     a i depth mk-open sconcat pa pu sconcat depth mk-close sconcat a end + u end - sconcat
     depth 1+ recurse if true unloop exit then
+    mk ar-release
   loop
   false ;
 

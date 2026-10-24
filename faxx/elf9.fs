@@ -50,7 +50,7 @@ variable h-forced
   h-rt @ rtk mt-encode om-find ?dup if
     dstr@ s" .elfencode" 2swap iv val elf-call-func if qn to iv then
   else
-    iv h-field-mask qun qnot qand sv h-field-mask field-deposit qun qor to iv
+    iv h-field-mask qun qnot qand h-field-mask sv field-deposit qun qor to iv
   then
   h-iw @ 0 ?do
     endian-big @ 0= if e-bts @ i * else e-bts @ h-iw @ 1- i - * then { sh }
@@ -61,8 +61,8 @@ variable h-forced
 : hint-pairs ( na nu sec-rel-h -- ) { na nu srh }
   h-pairs @ 0= if exit then
   h-pairs @ @ 0 ?do
-    h-pairs @ 1+ i 2* cells + @ { prt }
-    h-pairs @ 2 + i 2* cells + @ { poff }
+    h-pairs @ i 2* 1+ cells + @ { prt }
+    h-pairs @ i 2* 2 + cells + @ { poff }
     prt field-load if
       g-fm @ { pmask }  g-fbias @ { pbias }
       prt mt-bytes@ 0 max dup 0= if drop 4 then { pbytes }

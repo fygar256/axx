@@ -125,12 +125,13 @@ variable arrgen
 : tmpl-inner ( a u -- a' u' ) { q n }
   n 1+ ar-alloc { d } 0 { k }
   1 { i }
-  begin i n < while
+  false { done }
+  begin i n < done 0= and while
     q i + c@ 92 = i 1+ n < and if
       q i + c@ d k + c!  q i 1+ + c@ d k 1+ + c!  k 2 + to k  i 2 + to i
     else
-      q i + c@ 34 = if leave then
-      q i + c@ d k + c!  k 1+ to k  i 1+ to i
+      q i + c@ 34 = if true to done else
+      q i + c@ d k + c!  k 1+ to k  i 1+ to i then
     then
   repeat
   d k ;
@@ -235,3 +236,10 @@ variable arrgen
     true exit
   then
   da du ta tu ssym-set true ;
+' nsym-get is sym-num-get
+: arr-len-impl ( a u -- n ) asym-get ?dup if arr-n else -1 then ;
+' arr-len-impl is arr-len
+: arr-item-num-impl ( a u i -- q kind ) { a u i }
+  a u asym-get i arr-item { it }
+  it item-kind 1 = if q0 1 else it item-q qcopy 0 then ;
+' arr-item-num-impl is arr-item-num

@@ -128,7 +128,7 @@ sb-new constant ms-b
   el lst-n 0 ?do
     el i lst-item item-str { ia iu }
     iu 0> if
-      ia iu 0 { f }  names lst-n 0 ?do names i lst-item item-str ia iu str=cs if true to f then loop
+      false { f }  names lst-n 0 ?do names i lst-item item-str ia iu str=cs if true to f then loop
       f 0= if ia iu names lst-add-str then
     then
   loop

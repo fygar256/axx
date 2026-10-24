@@ -429,7 +429,7 @@ variable cfi-opa variable cfi-opu variable cfi-nv
       s"  error - .cfi_startproc: the previous .cfi_startproc has no .cfi_endproc." diag-e exit
     then
     ca-n @ if
-      ca-n @ 1 <> if true else 0 ca-a + @ 0 ca-u + @ slower s" simple" str=cs 0= then if
+      ca-n @ 1 <> if true else 0 cells ca-a + @ 0 cells ca-u + @ slower s" simple" str=cs 0= then if
         mb-reset s"  error - .cfi_startproc: unknown argument '" mb+ l2a l2u strip-st mb+ s" '." mb+ mb-get diag-e exit
       then
     then
@@ -452,7 +452,7 @@ variable cfi-opa variable cfi-opu variable cfi-nv
   oa ou s" signal_frame" str=cs if 1 cur F-SIGNAL fd! exit then
   oa ou s" personality" str=cs oa ou s" lsda" str=cs or if
     cv @ 0 256 within 0= if
-      mb-reset s"  error - .cfi_" mb+ oa ou mb+ s" : '" mb+ 0 ca-a + @ 0 ca-u + @ mb+ s" ' is not an encoding byte." mb+ mb-get diag-e exit
+      mb-reset s"  error - .cfi_" mb+ oa ou mb+ s" : '" mb+ 0 cells ca-a + @ 0 cells ca-u + @ mb+ s" ' is not an encoding byte." mb+ mb-get diag-e exit
     then
     oa ou s" personality" str=cs { isp }
     cv @ 255 = if
@@ -460,7 +460,7 @@ variable cfi-opa variable cfi-opu variable cfi-nv
     else
       1 cur isp if F-PERS? else F-LSDA? then fd!
       cv @ cur isp if F-PENC else F-LENC then fd!
-      1 ca-a + @ 1 ca-u + @ intern
+      1 cells ca-a + @ 1 cells ca-u + @ intern
       isp if cur F-PNU fd! cur F-PNA fd! else cur F-LNU fd! cur F-LNA fd! then
     then
     exit

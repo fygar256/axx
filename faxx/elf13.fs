@@ -119,7 +119,7 @@ variable eh-ok
     mb-reset s"  error - CFI: no relocation type for a " mb+ n mb-n s" -byte pointer (encoding 0x" mb+ enc hexs mb+ s" )." mb+ mb-get diag-e
     n sb put-zero exit
   then
-  na nu symidx om-find 0= if
+  na nu symidx om-find ?dup 0= if
     mb-reset s"  error - CFI: unknown symbol '" mb+ na nu mb+ s" '." mb+ mb-get diag-e
     n sb put-zero exit
   then

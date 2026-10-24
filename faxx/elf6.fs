@@ -60,7 +60,7 @@ create px-rt 8 cells allot  create px-off 8 cells allot
   loop
   n 0= if 0 true exit then
   n pairs-new { p }  n p !
-  n 0 ?do px-rt i cells + @ p 1+ i 2* cells + !  px-off i cells + @ p 2 + i 2* cells + ! loop
+  n 0 ?do px-rt i cells + @ p i 2* 1+ cells + !  px-off i cells + @ p i 2* 2 + cells + ! loop
   p true ;
 
 : dir-reloc-impl ( row -- ) { r }

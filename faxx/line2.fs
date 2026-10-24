@@ -305,7 +305,7 @@ variable sd-la variable sd-lu variable sd-l2a variable sd-l2u variable sd-i2
   s" .ASCII" is? if 2drop sd-l2 dir-ascii sd-plain true exit then
   s" .ASCIZ" is? if 2drop sd-l2 dir-asciz sd-plain true exit then
   s" .INCLUDE" is? if
-    2drop sd-l2 asm-include comment-text sb-clear indent-text sb-clear sd-plain true exit then
+    2drop sd-l2 asm-include comment-text sb-clear indent-text sb-clear 0 nobj ! sd-plain true exit then
   s" .ALIGN" is? if 2drop sd-l2 dir-align sd-done true exit then
   s" .ORG" is? if 2drop sd-l2 dir-org sd-done true exit then
   s" .LABELC" is? if 2drop sd-l2 dir-labelc sd-done true exit then
