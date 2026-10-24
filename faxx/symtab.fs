@@ -96,12 +96,12 @@ variable arrgen
 \ 配列リテラルを項目に割る (_arr_split)。q は "[" から始まる。結果は文字列 item のリスト
 : arr-split ( a u -- l ) { q n }
   n 2 + lst-new { l }
-  1 { i }
+  1 { i }  0 { b }  0 { dp }  false { inq }  false { dn }
   begin i n < while
     begin i n < if q i + c@ spc? else false then while i 1+ to i repeat
     i n >= if l exit then
     q i + c@ 93 = if l exit then
-    i { b }  0 { dp }  false { inq }  false { dn }
+    i to b  0 to dp  false to inq  false to dn
     begin i n < dn 0= and while
       q i + c@ { c }
       inq if
@@ -142,7 +142,7 @@ variable arrgen
   parts lst-n 8 + lst-new { out }
   parts lst-n 0 ?do
     parts i lst-item item-str { ia iu }
-    ia iu 0> if ia c@ 34 = else false then if
+    iu 0> if ia c@ 34 = else false then if
       ia iu tmpl-inner out lst-add-str
     else
       ia iu bare-name if out lst-add-str else

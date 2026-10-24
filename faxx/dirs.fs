@@ -11,7 +11,6 @@ variable passthru      variable eol-on    variable textmode
 1 om-new constant chkmap              \ 変数 -> arr (許すシンボル、'' は省略可の印)
 3 om-new constant enumdefs            \ 変数 -> [names arr][expr a][expr u]
 1 om-new constant vartabs             \ 変数 -> om (名前 -> q)  (.unordered の .map)
-1 om-new constant varnames            \ 使われた変数名 (.exp の検査用)
 1 om-new constant freed-subs
 0 constant pad-init
 variable unordered-on

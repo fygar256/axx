@@ -7,6 +7,7 @@ decimal
 
 256 constant NVARS
 2 om-new constant vname-map            \ 名前 -> slot (value[0])
+1 om-new constant varnames            \ 使われた変数名 (.exp の検査用)
 create vname-a NVARS cells allot       \ slot -> 名前
 create vname-u NVARS cells allot
 variable nvslots
@@ -40,6 +41,7 @@ variable nstouch
   a u slower { la lu }
   la lu vname-map om-find ?dup if @ exit then
   cr 0= if -1 exit then
+  la lu varnames om-put drop
   nvslots @ NVARS >= if
     s"  error - too many pattern variable names (maximum 256)." etype ecr -1 exit
   then
