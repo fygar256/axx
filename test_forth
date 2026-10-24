@@ -1,0 +1,35 @@
+#!/bin/sh
+# axx.fs (gforth) が axx.py と同じバイト列を出すことを確かめる。
+#   ./test_forth
+# 対象は axx.fs が移した範囲（4004 / z80 / 6502 / 6800 / 6809 / 8080 / 8048 / 8051）。
+# 本体の .s と _edge.s は出力のバイト列を、_err.s は診断と終了コードを比べる。
+
+P=patfile; [ -d "$P" ] || P=.
+S=asmsrc;  [ -d "$S" ] || S=.
+T=$(mktemp -d) || exit 1
+trap 'rm -rf "$T"' EXIT
+fail=0
+
+for pair in "4004 4004" "z80 z80" "6502 6502" "6800 6800" "6809 6809" "8080 8080" "8048 8048" "8051 8051" \
+            "4004 4004_edge" "6502 6502_edge" "6800 6800_edge" "6809 6809_edge" "8048 8048_edge"; do
+  set -- $pair
+  python3 axx.py $P/$1.axx $S/$2.s -b $T/py.bin >/dev/null 2>&1
+  gforth axx.fs $P/$1.axx $S/$2.s -b $T/fs.bin >/dev/null 2>&1 </dev/null
+  if cmp -s $T/py.bin $T/fs.bin; then echo "ok   $2"; else echo "FAIL $2"; fail=1; fi
+  rm -f $T/py.bin $T/fs.bin
+done
+
+for pair in "4004 4004_err" "6502 6502_err" "6800 6800_err" "6809 6809_err" "8048 8048_err" "8051 8051_err" "8080 8080_err"; do
+  set -- $pair
+  python3 axx.py $P/$1.axx $S/$2.s -b $T/py.bin >/dev/null 2>$T/py.err; pr=$?
+  gforth axx.fs $P/$1.axx $S/$2.s -b $T/fs.bin >/dev/null 2>$T/fs.err </dev/null; fr=$?
+  if [ $pr = $fr ] && [ ! -f $T/py.bin ] && [ ! -f $T/fs.bin ] && cmp -s $T/py.err $T/fs.err; then
+    echo "ok   $2"
+  else
+    echo "FAIL $2"; fail=1
+  fi
+  rm -f $T/py.bin $T/fs.bin
+done
+
+[ $fail = 0 ] && echo "test forth all passed"
+exit $fail
