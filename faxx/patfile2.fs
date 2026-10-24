@@ -56,6 +56,10 @@ variable pat-dir-a  variable pat-dir-u
 variable cur-sub-a  variable cur-sub-u  variable in-sub
 variable fdpth     variable in-func
 defer read-pattern
+defer pat-macro-reset ( -- )
+:noname ; is pat-macro-reset
+defer pat-macro-expand ( tab n fa fu -- tab' n' )
+:noname 2drop ; is pat-macro-expand
 
 : dir-len ( a u -- n ) begin dup 0> while 2dup + 1- c@ 47 = if nip exit then 1- repeat nip ;
 create pathbuf 4096 allot
@@ -152,6 +156,8 @@ create pathbuf 4096 allot
   pat-dir-a @ to oda  pat-dir-u @ to odu
   fa fa fu dir-len pat-dir-u !  pat-dir-a !
   fa fu load-lines to n to tab
+  pat-depth @ 0= if pat-macro-reset then
+  tab n fa fu pat-macro-expand to n to tab
   n 1+ cells allocate throw to rc
   false rc n cells + !
   n 0 ?do

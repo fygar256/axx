@@ -168,6 +168,7 @@ variable ar-top
   om om-used 0 ?do i om om-ent @ ?dup if free throw then loop
   om 4 cells + @ om 2 cells + @ cells erase
   0 om !  0 om cell+ ! ;
+: om-free ( om -- ) dup om-clear dup 4 cells + @ free throw dup 5 cells + @ free throw free throw ;
 : om-each ( xt om -- ) { xt om }       \ xt: ( key-a key-u slot -- )
   om om-used 0 ?do
     i om om-live? if i om om-key i om om-val xt execute then

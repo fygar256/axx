@@ -10,6 +10,9 @@ variable mm-top
   mm-top @ mm + swap mm-top +! ;
 : mm-str ( a u -- a' u ) { a u } u 1+ mm-alloc { d } a d u move  0 d u + c!  d u ;
 
+\ 算術右シフト
+: arshift ( n u -- n' ) over 0< if swap invert swap rshift invert else rshift then ;
+
 \ ---- 値 (種別 0 整数 / 1 文字列) ----
 : mv-int ( n -- v ) 3 cells mm-alloc { v } 0 v ! v cell+ ! v ;
 : mv-str ( a u -- v ) mm-str 3 cells mm-alloc { a u v } 1 v ! a v cell+ ! u v 2 cells + ! v ;
@@ -142,15 +145,11 @@ variable x-fa variable x-fu variable x-ln
   dup 0= if 2drop 0 exit then
   2dup -1 = swap $8000000000000000 = and if 2drop x-noeval? 0= if ovf-err then 0 exit then
   { a b }
-  a 0< if a negate else a then b 0< if b negate else b then u/ { q }
+  a 0< if a negate else a then b 0< if b negate else b then >r 0 r> um/mod nip { q }
   a 0>= b 0>= = if q else q negate then ;
-: c-mod ( a b -- r ) 2dup c-div over * - nip ;
+: c-mod ( a b -- r ) { a b } a a b c-div b * - ;
 
 defer x-ternary
-: x-ident ( -- a u ) x-skip x-i @ { j }
-  begin j x-u @ < if x-a @ j + c@ dup alnc? swap 95 = or else false then while j 1+ to j repeat
-  j x-i @ = if s" expected a name" x-err then
-  x-a @ x-i @ + j x-i @ - j x-i ! ;
 : x-ident ( -- a u ) x-skip x-i @ { j }
   begin j x-u @ < if x-a @ j + c@ dup alnc? swap 95 = or x-a @ j + c@ 128 < and else false then while j 1+ to j repeat
   j x-i @ = if s" expected a name" x-err then
@@ -159,17 +158,21 @@ defer x-ternary
 : x-digit ( c -- d|-1 ) dup digc? if 48 - exit then dup 97 >= over 102 <= and if 87 - exit then
   dup 65 >= over 70 <= and if 55 - exit then drop -1 ;
 : x-number ( -- v ) x-a @ x-u @ { s n } x-i @ { j } 10 { base }
-  j 1+ n < if s j + c@ 48 = if s j 1+ + c@ dup 120 = over 88 = or if 16 to base j 2 + to j then
-    dup 98 = over 66 = or if 2 to base j 2 + to j then
-    dup 111 = over 79 = or if 8 to base j 2 + to j then drop then then
-  j { st } 0 { v } 0 { nd }
-  begin j n < while
+  j 1+ n < s j + c@ 48 = and if
+    s j 1+ + c@ lc { p }
+    p 120 = if 16 to base j 2 + to j else
+    p 98 = if 2 to base j 2 + to j else
+    p 111 = if 8 to base j 2 + to j then then then
+  then
+  j { st } 0 { v } 0 { nd } false { fin }
+  begin j n < fin 0= and while
     s j + c@ { c }
     c 95 = if j 1+ to j else
       c x-digit { d }
-      d 0< d base >= or if leave then
-      v base i64* d i64+ to v
-      nd 1+ to nd  j 1+ to j
+      d 0< d base >= or if true to fin else
+        v base i64* d i64+ to v
+        nd 1+ to nd  j 1+ to j
+      then
     then
   repeat
   nd 0= j st = or if s" malformed number" x-err then
@@ -202,7 +205,7 @@ create x-args 64 cells allot
   0 x-ch { c }
   c 40 = if
     mp.exprd mp@ 1000 >= if s" nesting too deep" x-err then
-    1 mp.exprd mp@ 1+ mp.exprd mp!  1 x-i +!
+    mp.exprd mp@ 1+ mp.exprd mp!  1 x-i +!
     x-ternary s" )" x-expect
     mp.exprd mp@ 1- mp.exprd mp!
     exit
@@ -223,19 +226,18 @@ create x-args 64 cells allot
       ia iu m-defined? if 1 else 0 then mv-int exit
     then
     x-peek 40 = if
-      1 x-i +!  0 { nargs }
+      1 x-i +!  0 { nargs }  64 cells mm-alloc { arr }
       x-peek 41 = if 1 x-i +! else
         begin
           nargs 64 >= if
             xerr-head s" macro call '" mb+ na nu mb+ s" ': too many arguments" mb+ mfail
           then
-          x-ternary x-args nargs cells + !  nargs 1+ to nargs
+          x-ternary arr nargs cells + !  nargs 1+ to nargs
           s" ," x-eat if true else s" )" x-expect false then 0=
         until
       then
       x-noeval? if 0 mv-int exit then
-      nargs cells mm-alloc { arr }  x-args arr nargs cells move
-      x-fa @ x-fu @ x-ln @  na nu arr nargs m-call-value { r } 2drop drop r exit
+      na nu arr nargs m-call-value exit
     then
     x-noeval? if 0 mv-int exit then
     na nu m-lookup exit
@@ -243,11 +245,11 @@ create x-args 64 cells allot
   xerr-head s" unexpected character " mb+ x-a @ x-i @ + 1 repr1 mb+ xerr-tail 0 ;
 
 : x-unary ( -- v ) x-skip
-  0 x-ch 33 = 1 x-ch 61 <> and if 1 x-i +! x-unary mv-truth if 0 else 1 then mv-int exit then
-  0 x-ch 126 = if 1 x-i +! x-unary x-need-int invert mv-int exit then
-  0 x-ch 45 = if 1 x-i +! x-unary x-need-int i64neg mv-int exit then
-  0 x-ch 43 = if 1 x-i +! x-unary exit then
-  0 x-ch 64 = if 1 x-i +! x-unary x-need-int qn q>msb mv-int exit then
+  0 x-ch 33 = 1 x-ch 61 <> and if 1 x-i +! recurse mv-truth if 0 else 1 then mv-int exit then
+  0 x-ch 126 = if 1 x-i +! recurse x-need-int invert mv-int exit then
+  0 x-ch 45 = if 1 x-i +! recurse x-need-int i64neg mv-int exit then
+  0 x-ch 43 = if 1 x-i +! recurse exit then
+  0 x-ch 64 = if 1 x-i +! recurse x-need-int qn qabs qnbit mv-int exit then
   0 x-ch 42 = 1 x-ch 40 = and if
     2 x-i +!  x-ternary s" ," x-expect x-ternary s" )" x-expect
     x-need-int { nv } x-need-int { xv }
@@ -303,14 +305,14 @@ sb-new constant cat-b
       1 x-i +!  x-need-int { lv }  x-mul x-need-int { rv }  lv rv i64- mv-int true
     else false then then
   0= until ;
-: shift-count ( v -- n ) x-need-int { n }
+: mshift-count ( v -- n ) x-need-int { n }
   n 0< n 4096 > or if
     x-noeval? 0= if s" shift count out of range" x-err then 0 exit
   then n ;
 : x-shift ( -- v ) x-add
   begin x-skip 0 x-ch { c }
     c 60 = 1 x-ch 60 = and if
-      2 x-i +!  x-add shift-count { n } x-need-int { base }
+      2 x-i +!  x-add mshift-count { n } x-need-int { base }
       n 63 > if
         base 0<> x-noeval? 0= and if ovf-err then 0 mv-int
       else
@@ -319,7 +321,7 @@ sb-new constant cat-b
         sh mv-int
       then true
     else c 62 = 1 x-ch 62 = and if
-      2 x-i +!  x-add shift-count { n } x-need-int { rb }
+      2 x-i +!  x-add mshift-count { n } x-need-int { rb }
       n 63 > if rb 0< if -1 else 0 then else rb n arshift then mv-int true
     else false then then
   0= until ;
@@ -339,12 +341,12 @@ sb-new constant cat-b
   a mv-str? if a mv-s b mv-s str=cs else a mv-n b mv-n = then ;
 : x-rel ( -- v ) x-shift
   begin x-skip
-    0 x-ch 60 = 1 x-ch 60 = and if false exit then
-    0 x-ch 62 = 1 x-ch 62 = and if false exit then
-    s" <=" x-eat if x-shift true m-order mv-int true else
-    s" >=" x-eat if x-shift { r } r swap true m-order mv-int true else
-    s" <" x-eat if x-shift false m-order mv-int true else
-    s" >" x-eat if x-shift { r2 } r2 swap false m-order mv-int true else
+    0 x-ch 60 = 1 x-ch 60 = and if exit then
+    0 x-ch 62 = 1 x-ch 62 = and if exit then
+    s" <=" x-eat if x-shift true m-order 1 and mv-int true else
+    s" >=" x-eat if x-shift { r } r swap true m-order 1 and mv-int true else
+    s" <" x-eat if x-shift false m-order 1 and mv-int true else
+    s" >" x-eat if x-shift { r2 } r2 swap false m-order 1 and mv-int true else
     false then then then then
   0= until ;
 : x-eq ( -- v ) x-rel
@@ -423,6 +425,7 @@ sb-new constant cat-b
   x-a @ x-u @ x-i @ x-sup @ x-fa @ x-fu @ x-ln @ { sa su si ss sfa sfu sln }
   a x-a ! u x-u ! 0 x-i ! 0 x-sup ! fa x-fa ! fu x-fu ! ln x-ln !
   0 mp.exprd mp!
+  opt-debug @ if s" EVAL: " etype x-a @ x-u @ etype ecr then
   x-ternary { v }
   x-skip
   x-i @ x-u @ < if

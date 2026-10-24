@@ -10,8 +10,48 @@ decimal
   cp 18 rshift 240 or sb sb-c  cp 12 rshift 63 and 128 or sb sb-c
   cp 6 rshift 63 and 128 or sb sb-c  cp 63 and 128 or sb sb-c ;
 
-: repr1 ( a u -- a' u' ) { a u }                          \ Python の repr 相当 (単純な場合)
-  mb-reset 39 mb-c a u mb+ 39 mb-c mb-get sdup ;
+sb-new constant rp-b
+: utf8-seq-len ( a u -- n )                           \ 先頭の UTF-8 文字のバイト数 (不正なら 1)
+  { a u }
+  u 0= if 0 exit then
+  a c@ { c }
+  c $80 < if 1 exit then
+  c $c2 >= c $df <= and if u 2 >= if a 1+ c@ $c0 and $80 = if 2 exit then then 1 exit then
+  c $e0 >= c $ef <= and if
+    u 3 >= if a 1+ c@ $c0 and $80 = a 2 + c@ $c0 and $80 = and if
+      c $e0 = if a 1+ c@ $a0 >= else true then
+      c $ed = if a 1+ c@ $9f <= and then if 3 exit then
+    then then 1 exit
+  then
+  c $f0 >= c $f4 <= and if
+    u 4 >= if a 1+ c@ $c0 and $80 = a 2 + c@ $c0 and $80 = and a 3 + c@ $c0 and $80 = and if
+      c $f0 = if a 1+ c@ $90 >= else true then
+      c $f4 = if a 1+ c@ $8f <= and then if 4 exit then
+    then then 1 exit
+  then
+  1 ;
+: hex2 ( n -- ) dup 4 rshift dup 10 < if 48 + else 87 + then rp-b sb-c 15 and dup 10 < if 48 + else 87 + then rp-b sb-c ;
+: repr1 ( a u -- a' u' ) { a u }                       \ Python の repr
+  false false { sq dq }
+  u 0 ?do a i + c@ dup 39 = if true to sq then 34 = if true to dq then loop
+  sq dq 0= and if 34 else 39 then { q }
+  rp-b sb-clear  q rp-b sb-c
+  0 { k }
+  begin k u < while
+    a k + c@ { c }
+    c 92 = c q = or if 92 rp-b sb-c c rp-b sb-c k 1+ to k else
+    c 10 = if s" \n" rp-b sb+ k 1+ to k else
+    c 9 = if s" \t" rp-b sb+ k 1+ to k else
+    c 13 = if s" \r" rp-b sb+ k 1+ to k else
+    c 32 < c 127 = or if s" \x" rp-b sb+ c hex2 k 1+ to k else
+    c 128 >= if
+      a k + u k - utf8-seq-len { l }
+      l 1 = if s" \udc" rp-b sb+ c hex2 k 1+ to k
+      else a k + l rp-b sb+ k l + to k then
+    else c rp-b sb-c k 1+ to k then then then then then then
+  repeat
+  q rp-b sb-c
+  rp-b sb$ sdup ;
 
 sb-new constant gs-b
 : hex-run ( a u k maxn -- val k' n ) { a u k mx } 0 0 { v n }

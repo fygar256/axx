@@ -24,6 +24,7 @@ s" obj5.fs" included
 s" labels.fs" included
 s" srcdir.fs" included
 s" srcdir2.fs" included
+s" macro1.fs" included
 s" line1.fs" included
 s" line2.fs" included
 s" line3.fs" included
@@ -31,3 +32,6 @@ s" plan.fs" included
 s" help.fs" included
 s" main.fs" included
 s" vliw.fs" included
+s" macro2.fs" included
+s" macro3.fs" included
+s" macro4.fs" included

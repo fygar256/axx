@@ -15,6 +15,7 @@ variable lt-tab  variable lt-n  variable lt-cap
 : tl-ln ( tab i -- ln ) LTSZ * + 4 cells + @ ;
 
 variable lp  variable le
+variable join-cont  true join-cont !
 : rd-line ( -- a u true | false )
   lp @ le @ >= if false exit then
   lp @
@@ -41,7 +42,7 @@ sb-new constant pend-b
   over + le !  lp !
   false { open }
   begin rd-line while
-    2dup ends-bs? if
+    join-cont @ if 2dup ends-bs? else false then if
       1- pend-b sb+  s" " fa fu lt-n @ 1+ lt-add  true to open
     else
       pend-b sb-len if

@@ -377,6 +377,21 @@ defer pass-reset-extra ( passno -- )
   loop
   ecr ;
 
+: commit-macro-state ( -- )
+  mlabel-vals om-clear
+  relax-prev om-used 0 ?do
+    i relax-prev om-live? if i relax-prev om-key mlabel-vals om-put  i relax-prev om-val swap QB move then
+  loop
+  true mlabels-valid !
+  mline-pcs-prev om-clear
+  mline-pcs-cur om-used 0 ?do
+    i mline-pcs-cur om-live? if
+      i mline-pcs-cur om-key mline-pcs-prev om-put { dst }
+      i mline-pcs-cur om-val { src }
+      src @ dst !  src cell+ @ dst cell+ !
+    then
+  loop ;
+
 : run-pass1 ( a u -- ok ) { sa su }
   16 { budget }  -1 { minmv }  0 { it }
   pcs-prev-valid off  0 hist-n !
@@ -384,6 +399,7 @@ defer pass-reset-extra ( passno -- )
   begin it budget < while
     it 0= relax-optimistic !
     reset-for-pass
+    mline-pcs-cur om-clear
     1 pass !
     labels om-clear  imported-labels labels om-copy
     1 pass-reset-extra
@@ -400,6 +416,7 @@ defer pass-reset-extra ( passno -- )
     then
     has-undef? { hu }
     save-relax-values
+    commit-macro-state
     hu 0= if
       pcs-hash { h }
       h hist-find { fs }
@@ -600,6 +617,7 @@ create inbuf 1024 allot
     s" '; valid choices are ['linux', 'freebsd'] (case-insensitive). Using 'Linux'." etype ecr
   then
   apply-elf-options 0= if false exit then
+  o-nomacro @ if 0 mp-src mp.enabled + ! 0 mp-pat mp.enabled + ! then
   o-mp? @ if o-pat-a @ o-pat-u @ o-mp-a @ o-mp-u @ true macro-expand-only exit then
   o-mx? @ if
     o-src? @ 0= if s"  error - -P/--macro-expand needs a source file." diag-wf false exit then

@@ -230,7 +230,10 @@ defer asm-file-hook ( -- )
     { tab n }
     fa fu file!  1 line-no !
     tab n fa fu macro-expand { t2 n2 }
+    n2 1+ cells allocate throw { pcs }
+    fa fu mline-pcs-cur om-put { psl }  pcs psl !  n2 psl cell+ !
     n2 0 ?do
+      pc @ pcs i cells + !
       t2 i tl-file file!
       t2 i tl-ln line-no !
       t2 i tl@ lineassemble0 drop
