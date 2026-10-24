@@ -33,26 +33,26 @@ decimal
 : lower-ascii ( a u -- a' u ) slower ;
 
 \ ---- コメントの除去 ----
-: strip-comment ( a u -- a' u' ) { a u } 0 0 { i q }
-  begin i u < while
-    a i + c@ { c }
+: strip-comment ( a u -- a' u' ) { a u } 0 0 { p0 q }
+  begin p0 u < while
+    a p0 + c@ { c }
     q 0<> if
-      c 92 = if i 2 + to i else
-        c q = if 0 to q then i 1+ to i
+      c 92 = if p0 2 + to p0 else
+        c q = if 0 to q then p0 1+ to p0
       then
     else
-      c 34 = if 34 to q i 1+ to i else
+      c 34 = if 34 to q p0 1+ to p0 else
       c 39 = if
         \ 後ろに ' があれば文字列
-        false { found } u i 1+ ?do a i + c@ 39 = if true to found leave then loop
-        found if 39 to q then i 1+ to i
+        false { found } u p0 1+ ?do a i + c@ 39 = if true to found leave then loop
+        found if 39 to q then p0 1+ to p0
       else
         mp-pat? if
-          c 47 = i 1+ u < and if a i 1+ + c@ 42 = else false then if a i rstrip-st exit then
-          i 1+ to i
+          c 47 = p0 1+ u < and if a p0 1+ + c@ 42 = else false then if a p0 rstrip-st exit then
+          p0 1+ to p0
         else
-          c 59 = if a i rstrip-st exit then
-          i 1+ to i
+          c 59 = if a p0 rstrip-st exit then
+          p0 1+ to p0
         then
       then then
     then

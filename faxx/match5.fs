@@ -35,11 +35,11 @@ decimal
 : mk-open ( depth -- a u ) 2 ar-alloc { m } SUB-OPEN m c!  48 + m 1+ c!  m 2 ;
 : mk-close ( depth -- a u ) 2 ar-alloc { m } SUB-CLOSE m c!  48 + m 1+ c!  m 2 ;
 
-: match-sub ( a u depth -- flag ) { a u depth } 0 0 0 0 0 0 { i end na nu va vu }
+: match-sub ( a u depth -- flag ) { a u depth } 0 0 0 0 0 0 { st end na nu va vu }
   a u 0 sub-find-ref 0= if
     a u match-text if depth nbinds ! apply-binds true else false then exit
   then
-  to vu to va to nu to na to end to i
+  to vu to va to nu to na to end to st
   na nu subs om-find dup 0= na nu supper freed-subs om-find 0<> or if
     drop
     mb-reset s"  error - !S{{" mb+ na nu mb+ s" }}: no sub table named '" mb+ na nu mb+
@@ -56,7 +56,7 @@ decimal
     arr i 2 * 1+ arr-item item-str { xa xu }
     va depth cells bind-va + !  vu depth cells bind-vu + !
     xa depth cells bind-ea + !  xu depth cells bind-eu + !
-    a i depth mk-open sconcat pa pu sconcat depth mk-close sconcat a end + u end - sconcat
+    a st depth mk-open sconcat pa pu sconcat depth mk-close sconcat a end + u end - sconcat
     depth 1+ recurse if true unloop exit then
     mk ar-release
   loop
