@@ -291,18 +291,18 @@ variable mc-k
   @ { fn }
   0 mia-top !
   64 cells mi-alloc { args }  0 { n }
-  0 { i }
+  0 { ai }
   begin
-    ta tu i skip-sp-from to i
-    i tu <
+    ta tu ai skip-sp-from to ai
+    ai tu <
   while
-    ta i + c@ 44 = if i 1+ to i else
-      ta tu i na nu false mini-arg-one { v i2 }
+    ta ai + c@ 44 = if ai 1+ to ai else
+      ta tu ai na nu false mini-arg-one { v i2 }
       v 0= if nk exit then
       n 64 < if v args n cells + ! n 1+ to n then
-      i2 to i
-      ta tu i skip-sp-from to i
-      i tu < if ta i + c@ 44 = if i 1+ to i else tu to i then then
+      i2 to ai
+      ta tu ai skip-sp-from to ai
+      ai tu < if ta ai + c@ 44 = if ai 1+ to ai else tu to ai then then
     then
   repeat
   nobj @ { n0 }

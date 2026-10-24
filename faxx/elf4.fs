@@ -5,7 +5,7 @@ decimal
 \ ---- ミニ言語の関数 (.elfencode / .elfrinfo) ----
 \ 数を返せば ( n true )、だめなら診断して false
 : elf-call-func ( dname-a du fname-a fu q1 q2 -- n true | false ) { da du fa fu q1 q2 }
-  fa fu mfuncs om-find 0= if false exit then
+  fa fu mfuncs om-find ?dup 0= if false exit then
   @ { fn }
   0 mia-top !
   2 cells mi-alloc { args }

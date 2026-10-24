@@ -186,32 +186,32 @@ variable dr-n  variable dr-nord
   true ;
 
 : dr-run ( ta tu -- p|0 ) { ta tu }
-  1 dr-stk !  0 { sp }  1 { sign }  true { expect }  0 { i }
-  begin i tu < while
-    ta i + c@ { c }
-    c 32 = c 9 = or c 0= or if i 1+ to i else
+  1 dr-stk !  0 { sp }  1 { sign }  true { expect }  0 { ci }
+  begin ci tu < while
+    ta ci + c@ { c }
+    c 32 = c 9 = or c 0= or if ci 1+ to ci else
     c 43 = c 45 = or if
       c 45 = if -1 else 1 then { sg }
       expect if sign sg * to sign else sg to sign true to expect then
-      i 1+ to i
+      ci 1+ to ci
     else c 40 = if
       expect 0= sp 62 > or if 0 exit then
       dr-stk sp cells + @ sign * dr-stk sp 1+ cells + !  sp 1+ to sp  1 to sign
-      i 1+ to i
+      ci 1+ to ci
     else c 41 = if
       sp 0= expect or if 0 exit then
-      sp 1- to sp  i 1+ to i
+      sp 1- to sp  ci 1+ to ci
     else c diff-word? c 39 = or if
       expect 0= if 0 exit then
-      i { j }
+      ci { j }
       c 39 = if
-        i 1+ { k }
+        ci 1+ { k }
         begin k tu < if ta k + c@ 39 <> else false then while k 1+ to k repeat
         k tu >= if 0 exit then
         k 1+ to j
       else
         begin j tu < if ta j + c@ diff-word? else false then while j 1+ to j repeat
-        ta i + j i - supper dr-find { ix }
+        ta ci + j ci - supper dr-find { ix }
         ix 0>= if
           ix cells dr-seen + @ 0= if
             1 ix cells dr-seen + !  0 ix cells dr-cf + !
@@ -220,7 +220,7 @@ variable dr-n  variable dr-nord
           ix cells dr-cf + @ dr-stk sp cells + @ sign * + ix cells dr-cf + !
         then
       then
-      false to expect  1 to sign  j to i
+      false to expect  1 to sign  j to ci
     else 0 exit
     then then then then then
   repeat
