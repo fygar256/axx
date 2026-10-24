@@ -281,7 +281,7 @@ variable if-d
 \ ---- .for のヘッダ ----
 : ps-for-header ( i -- kind var-a var-u a b ) { i }
   i ml-pos set-pos  i lex-line
-  ntok @ 4 < if 1 tk-kind 2 <> else true then if
+  ntok @ 4 < if true else 1 tk-kind 2 <> then if
     i mini-err s" '.for' needs 'variable in range(...)' or 'variable in array'" mb+ mini-throw
   then
   1 tk-s pstr { va vu }

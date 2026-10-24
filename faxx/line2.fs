@@ -276,7 +276,7 @@ defer vliw-sentinel-hook ( -- )
 
 \ ---- ソース側ディレクティブの振り分け ----
 : is? ( a u pa pu -- a u f ) 2>r 2dup 2r> str=cs ;
-: is2? ( a u p1a p1u p2a p2u -- a u f ) 2>r is? 2r> is? or ;
+: is2? ( a u p1a p1u p2a p2u -- a u f ) { a u pa pu qa qu } a u  a u pa pu str=cs a u qa qu str=cs or ;
 : text-only-dir? ( ua uu -- f )
   s" .ORG" is? >r s" .ALIGN" is? r> or >r s" .ZERO" is? r> or >r
   s" .ASCII" is? r> or >r s" .ASCIZ" is? r> or >r

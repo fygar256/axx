@@ -120,8 +120,8 @@ defer sec-rel-offset ( a u wordpc -- off true | false )        \ セクション
     cur-section epc tent range+
   then
   a u cur-section!
-  cur-section sections om-find 0= if
-    cur-section sec-entry { ne } pc @ ne !  0 ne cell+ !  pc @ ne 2 cells + !  0 ne 3 cells + !
+  cur-section sections om-find dup 0= if
+    drop cur-section sec-entry { ne } pc @ ne !  0 ne cell+ !  pc @ ne 2 cells + !  0 ne 3 cells + !
   else
     { ex }
     ex @ { es }  ex cell+ @ { esz }  ex 3 cells + @ { econf }
@@ -129,8 +129,8 @@ defer sec-rel-offset ( a u wordpc -- off true | false )        \ セクション
     ns ex !  esz ex cell+ !  pc @ ex 2 cells + !  0 ex 3 cells + !
   then ;
 : dir-endsection ( -- )
-  cur-section sections om-find 0= if
-    mb-reset s"  error - .ENDSECTION without matching .SECTION for '" mb+ cur-section mb+ s" '." mb+ mb-get diag-e exit
+  cur-section sections om-find dup 0= if
+    drop mb-reset s"  error - .ENDSECTION without matching .SECTION for '" mb+ cur-section mb+ s" '." mb+ mb-get diag-e exit
   then
   { en }
   en @ { start }  en 2 cells + @ { epc }

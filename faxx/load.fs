@@ -37,3 +37,5 @@ s" macro3.fs" included
 s" macro4.fs" included
 s" mini1.fs" included
 s" mini2.fs" included
+s" mini3.fs" included
+s" mini4.fs" included
