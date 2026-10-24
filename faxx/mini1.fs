@@ -36,7 +36,7 @@ variable ps-fa  variable ps-fu  variable ps-ln              \ 診断に出す位
 : mini-hexnum ( a u i -- q j ) { a u i }                    \ 0x...
   i 2 + { j } q0 { v }
   begin j u < if a j + c@ dup xdig? swap 95 = or else false then while
-    a j + c@ 95 <> if v 16 q*small+ drop to v  v a j + c@ hexv qn q+ to v then
+    a j + c@ 95 <> if v 16 0 q*small+ drop to v  v a j + c@ hexv qn q+ to v then
     j 1+ to j
   repeat
   j i 2 + = if ps-err-head s" malformed hex number" mb+ mini-throw then
@@ -44,7 +44,7 @@ variable ps-fa  variable ps-fu  variable ps-ln              \ 診断に出す位
 : mini-binnum ( a u i -- q j ) { a u i }
   i 2 + { j } q0 { v }
   begin j u < if a j + c@ dup 48 = over 49 = or swap 95 = or else false then while
-    a j + c@ 95 <> if v 2 q*small+ drop to v  v a j + c@ 48 - qn q+ to v then
+    a j + c@ 95 <> if v 2 0 q*small+ drop to v  v a j + c@ 48 - qn q+ to v then
     j 1+ to j
   repeat
   j i 2 + = if ps-err-head s" malformed binary number" mb+ mini-throw then
@@ -52,7 +52,7 @@ variable ps-fa  variable ps-fu  variable ps-ln              \ 診断に出す位
 : mini-decnum ( a u i -- q j ) { a u i }
   i { j } q0 { v }
   begin j u < if a j + c@ dup digc? swap 95 = or else false then while
-    a j + c@ 95 <> if v 10 q*small+ drop to v  v a j + c@ 48 - qn q+ to v then
+    a j + c@ 95 <> if v 10 0 q*small+ drop to v  v a j + c@ 48 - qn q+ to v then
     j 1+ to j
   repeat
   v j ;

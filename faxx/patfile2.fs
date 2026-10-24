@@ -38,12 +38,16 @@ decimal
   u 0 ?do a i + c@ corec? 0= if false unloop exit then loop true ;
 
 \ ---- .func の本文の集め (ミニ言語が受け取る) ----
-defer func-hdr ( a u file-a file-u ln -- )
-defer func-line ( a u file-a file-u ln -- )
-defer func-end ( -- )
-:noname 5 0 do drop loop ; is func-hdr
-:noname 5 0 do drop loop ; is func-line
-:noname ; is func-end
+defer func-handle ( ra ru ka ku fa fu ln -- )
+:noname 7 0 do drop loop ; is func-handle
+defer func-active? ( -- f )
+:noname false ; is func-active?
+defer func-end-file ( fa fu -- )
+:noname 2drop ; is func-end-file
+defer pat-func-reset ( -- )
+:noname ; is pat-func-reset
+defer pat-func-compile ( -- )
+:noname ; is pat-func-compile
 
 : dot-kw ( a u -- ka ku )                     \ 行頭の .キーワードを大文字で
   trim dup 0= if exit then over c@ 46 <> if 2drop 0 0 exit then
@@ -95,17 +99,7 @@ create pathbuf 4096 allot
 : pat-line ( a u fa fu ln -- ) { a u fa fu ln }
   a u reduce-spaces { ra ru }
   ra ru dot-kw { ka ku }
-  in-func @ ka ku s" .FUNC" str=cs or if
-    ka ku s" .FUNC" str=cs if
-      ra ru fa fu ln func-hdr  true in-func !  0 fdpth !
-      exit
-    then
-    ka ku s" .ENDFUNC" str=cs if false in-func ! func-end exit then
-    ka ku s" .IF" str=cs ka ku s" .FOR" str=cs or ka ku s" .WHILE" str=cs or if 1 fdpth +! then
-    ka ku s" .ENDIF" str=cs ka ku s" .NEXT" str=cs or ka ku s" .ENDWHILE" str=cs or if -1 fdpth +! then
-    ra ru trim nip if ra ru fa fu ln func-line then
-    exit
-  then
+  func-active? ka ku s" .FUNC" str=cs or if ra ru ka ku fa fu ln func-handle exit then
   ka ku s" .ECHO" str=cs if
     in-sub @ if
       s"  error - '.echo' cannot be written inside '.sub'." diag-e exit
@@ -156,7 +150,7 @@ create pathbuf 4096 allot
   pat-dir-a @ to oda  pat-dir-u @ to odu
   fa fa fu dir-len pat-dir-u !  pat-dir-a !
   fa fu load-lines to n to tab
-  pat-depth @ 0= if pat-macro-reset then
+  pat-depth @ 0= if pat-macro-reset pat-func-reset then
   tab n fa fu pat-macro-expand to n to tab
   n 1+ cells allocate throw to rc
   false rc n cells + !
@@ -185,6 +179,8 @@ create pathbuf 4096 allot
     mb-reset s"  warning - pattern file '" mb+ fa fu mb+
     s" ' ends while a /* ... */ comment is still open (missing closing '*/')." mb+ mb-get diag-w
   then
+  fa fu func-end-file
+  pat-depth @ 0= if pat-func-compile then
   rc free throw  tab free throw
   oda pat-dir-a !  odu pat-dir-u ! ;
 ' read-pattern-impl is read-pattern
