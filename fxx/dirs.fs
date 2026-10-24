@@ -44,7 +44,7 @@ create vliw-pat-u 256 cells allot
 
 \ 要素リストを展開する (elem_list_expand)。'' は省略可の印。
 : elem-list-expand ( a u -- l ) { a u }
-  a u 2 + 4 * lst-new { out }
+  u 2 + 4 * lst-new { out }
   0 { st }
   u 1+ 0 ?do
     i u = a i + c@ 44 = or if

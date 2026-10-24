@@ -33,15 +33,15 @@ variable out-file-a  variable out-file-u  variable has-outfile
   1 wset @ pos + c!
   pos 1+ omax @ max omax ! ;
 : hexw ( u width -- ) { u w }                              \ 0 詰めの小文字 16 進
-  base @ >r hex
-  u s>d <# w 0 ?do # loop #s #> r> base ! type ;
+  w 0 ?do
+    u w 1- i - 4 * rshift 15 and dup 10 < if 48 + else 87 + then emit
+  loop ;
 : listing-on? ( -- f ) pass @ 2 = verbose @ and pass @ 0= or ;
 : fwrite ( pos val prt -- ) { pos v prt }
   v wmask and { x }
   prt if
     s"  0x" type
-    bts @ 3 + 4 / { w }
-    base @ >r hex x s>d <# w 0 ?do # loop #> r> base ! type
+    x bts @ 3 + 4 / hexw
   then
   pos x wstore ;
 : outbin ( pos q -- ) @ swap { v pos }

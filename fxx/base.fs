@@ -161,9 +161,11 @@ variable ar-top
   a u fnv om 2 cells + @ 1- and { h }
   begin om 4 cells + @ h cells + @ n 1+ <> while h 1+ om 2 cells + @ 1- and to h repeat
   -1 om 4 cells + @ h cells + !
+  n om om-ent @ free throw
   0 n om om-ent !
   om @ 1- om ! ;
 : om-clear ( om -- ) { om }
+  om om-used 0 ?do i om om-ent @ ?dup if free throw then loop
   om 4 cells + @ om 2 cells + @ cells erase
   0 om !  0 om cell+ ! ;
 : om-each ( xt om -- ) { xt om }       \ xt: ( key-a key-u slot -- )
@@ -189,3 +191,9 @@ variable mb-u
       i src om-val swap src 3 cells + @ cells move
     then
   loop ;
+
+\ ---- 文字列の保存 (同じ綴りは 1 つだけ。解放しない) ----
+1 om-new constant strpool
+: intern ( a u -- a' u ) { a u }
+  a u strpool om-put { sl }
+  sl 2 cells - s@ ;

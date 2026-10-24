@@ -2,8 +2,8 @@
 
 decimal
 
-146 constant VLIW-SEP-C
-147 constant VLIW-STOP-C
+254 constant VLIW-SEP-C
+255 constant VLIW-STOP-C
 
 \ 文字定数 'c' の終わり (skip_squote_literal)
 : skip-squote ( a u i -- j ) { a u i } 0 0 0 { j k dg }
@@ -59,10 +59,10 @@ sb-new constant nws-b
   nws-b sb$ ;
 
 sb-new constant cmt-b
-: split-comment ( a u -- code-a code-u cmt-a cmt-u ) { a u } 0 false { k inq }
+: rstrip-ws ( a u -- a' u' ) begin dup 0> while 2dup + 1- c@ ws? while 1- repeat then ;
+: split-comment ( a u -- ca cu ma mu ) { a u } 0 false -1 { k inq cpos }
   cmt-b sb-clear
-  s" " { ca cu }  0 0 { xa xu }
-  begin k u < while
+  begin k u < cpos 0< and while
     a k + c@ 92 = inq and k 1+ u < and if
       a k + c@ cmt-b sb-c  a k 1+ + c@ cmt-b sb-c  k 2 + to k
     else
@@ -77,23 +77,18 @@ sb-new constant cmt-b
             a k + j k - cmt-b sb+
             j to k
           else
-            a k + c@ 59 = inq 0= and if
-              cmt-b sb$ rstrip sdup to xu to xa
-              a k + u k - { ra ru }
-              begin ru 0> if ra ru + 1- c@ ws? else false then while ru 1- to ru repeat
-              xa xu ra ru sdup exit
+            a k + c@ 59 = inq 0= and if k to cpos
             else a k + c@ cmt-b sb-c  k 1+ to k then
           then
         then
       then
     then
   repeat
-  inq if
+  cpos 0< inq and if
     mb-reset s"  warning - unterminated string literal in line: " mb+ a u repr1 mb+ mb-get diag-w
   then
-  cmt-b sb$ { la lu }
-  begin lu 0> if la lu + 1- c@ ws? else false then while lu 1- to lu repeat
-  la lu sdup s" " ;
+  cmt-b sb$ cpos 0>= if rstrip else rstrip-ws then sdup
+  cpos 0>= if a cpos + u cpos - rstrip-ws sdup else s" " then ;
 
 sb-new constant vle-b
 : resolve-vliw-escapes ( a u -- a' u' ) { a u } 0 false { k inq }
@@ -158,16 +153,15 @@ sb-new constant indent-text
   k u < if a k + c@ 58 = else false then 0= if a u exit then
   k 1+ u < if a k 1+ + c@ 61 = else false then if a u exit then
   nl 1+ to lend
-  a lend + u lend - lstrip token-after { ra ru ta tu }
+  a lend + u lend - param-spc { ra ru ta tu }
   ta tu s" .EQU" str=ci if
-    a nl ra ru trim-eq do-equ
+    a nl ra ru do-equ
     textmode @ if
-      label-text sb-clear a nl label-text sb+
-      a lend + 0 exit
+      label-text sb-clear a lend label-text sb+
+      a lend + u lend - exit
     then
     a 0 exit
   then
   a nl pc @ qn cur-section 0 -1 lab-put 0= if a 0 exit then
-  label-text sb-clear a nl label-text sb+
-  textmode @ 0= if label-text sb-clear then
+  label-text sb-clear a lend label-text sb+
   a lend + u lend - ;

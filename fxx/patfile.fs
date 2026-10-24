@@ -34,8 +34,8 @@ sb-new constant pend-b
 : ends-bs? ( a u -- f ) dup 0> if + 1- c@ 92 = else 2drop false then ;
 
 \ ファイルを読み、行末の \ で続く行を結んだ表を返す (結んだぶんの行は空行で残す)
-: load-lines ( fa fu -- tab n ) { fa fu }
-  fa fu slurp-file
+: text-lines ( da du fa fu -- tab n ) { da du fa fu }
+  da du
   2dup count-lines dup lt-cap !  LTSZ * allocate throw lt-tab !
   0 lt-n !  pend-b sb-clear
   over + le !  lp !
@@ -54,6 +54,7 @@ sb-new constant pend-b
     pend-b sb$ sdup lt-tab @ lt-n @ 1- LTSZ * + s!  pend-b sb-clear
   then
   lt-tab @ lt-n @ ;
+: load-lines ( fa fu -- tab n ) 2dup slurp-file 2swap text-lines ;
 
 \ ---- コメント除去 ----
 sb-new constant cb
@@ -163,7 +164,7 @@ variable nrows
   2dup s" .error" str=cs if 2drop 18 exit then
   2dup s" .echo" str=cs if 2drop 19 exit then
   2dup s" .unordered" str=cs if 2drop 20 exit then
-  2dup s" .elftype .elfmachine .elfclass .elfrela .elfwidth .elfextern .elfdwarf .elfheader .elfsection .elffield .elfpcguess .elfrelax .elfanchor .elfresolve .elfbuiltin .elfextra .elfdiff .elfencode .elfrinfo .elfunit .elflink .elfgroup .elfcfi .elfcfiinit .elfcfireg .elfunaligned" 2swap
+  s" .elftype .elfmachine .elfclass .elfrela .elfwidth .elfextern .elfdwarf .elfheader .elfsection .elffield .elfpcguess .elfrelax .elfanchor .elfresolve .elfbuiltin .elfextra .elfdiff .elfencode .elfrinfo .elfunit .elflink .elfgroup .elfcfi .elfcfiinit .elfcfireg .elfunaligned"
   { a u la lu }
   begin lu 0> while
     la lu 32 find-ch { n }

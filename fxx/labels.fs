@@ -4,7 +4,7 @@ decimal
 
 10 om-new constant labels                \ 名前 -> [q:4][sec-a][sec-u][equ][imported][rtype]
 1 om-new constant relax-prev-dummy
-4 om-new constant relax-prev             \ 前回の反復のラベル値 (名前 -> q)
+6 om-new constant relax-prev             \ 前回の反復のラベル値 (名前 -> q)
 variable relax-optimistic
 variable relax-iter
 variable cur-sec-a  variable cur-sec-u   \ 現在のセクション名
@@ -78,7 +78,7 @@ defer elf-note-label ( a u q -- )                         \ -o の追跡 (ラベ
   rt 0< old 0>= and if old to rt then
   a u labels om-put { sl }
   q sl q!
-  sa su sdup sl 4 cells + s!
+  sa su intern sl 4 cells + s!
   eq if 1 else 0 then sl 6 cells + !
   0 sl 7 cells + !
   rt sl 8 cells + !

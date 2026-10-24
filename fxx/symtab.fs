@@ -28,7 +28,7 @@ decimal
   a arr-n 0 ?do a i arr-item r i arr-item item-copy loop r ;
 
 \ 一時リスト (領域に取る)
-: lst-new ( cap -- l ) dup 1+ ITEMSZ * ar-alloc { l } 0 l ! l ;
+: lst-new ( cap -- l ) 1+ ITEMSZ * ar-alloc { l } 0 l ! l ;
 : lst-n ( l -- n ) @ ;
 : lst-item ( l i -- it ) ITEMSZ * + cell+ ;
 : lst-add-str ( a u l -- ) { a u l }
@@ -182,7 +182,7 @@ variable arrgen
   lst-from-arr lst-dedupe true ;
 : set-op-char? ( c -- f ) s" &|^+-" in-str? ;
 : set-expr-from-text ( a u -- l true | false ) { a u }
-  a u 2 + 2 * lst-new { toks }                       \ トークン (文字列 item)
+  u 2 + 2 * lst-new { toks }                       \ トークン (文字列 item)
   0 { st }
   u 0 ?do
     a i + c@ set-op-char? if

@@ -1,12 +1,12 @@
 #!/bin/sh
-# axx.fs を axx.py と突き合わせる（test1 と同じコマンド列を使う別のスクリプト）。
+# axx.fs を caxx (caxx.c) と突き合わせる（test1 と同じコマンド列を使う別のスクリプト）。
 #   ./cmp_forth            全部
 #   ./cmp_forth 5 12       test1 の caxx 行のうち 5〜12 番目だけ
-#   FORTH_ONLY=1 ./cmp_forth ...   期待値（axx.py の結果）を作り直さない
+#   FORTH_ONLY=1 ./cmp_forth ...   期待値（caxx の結果）を作り直さない
 # 期待値は $CMP_CACHE（既定 /tmp/cmp_forth_cache）に貯める。
 R=$(cd "$(dirname "$0")" && pwd)
 P=$R/patfile; S=$R/asmsrc
-C=${CMP_CACHE:-/tmp/cmp_forth_cache}
+C=${CMP_CACHE:-/tmp/cmp_forth_cache_c}
 D=${CMP_WORK:-/tmp/cmp_forth_work}
 FROM=${1:-1}; TO=${2:-100000}
 mkdir -p $C
@@ -22,8 +22,8 @@ while IFS= read -r line; do
     rm -rf $D; mkdir -p $D; cd $D
     export IMPL=$impl
     caxx() {
-      if [ "$IMPL" = py ]; then python3 $R/axx.py "$@"
-      else timeout ${CMP_TIMEOUT:-600} gforth $R/axx.fs "$@"; fi
+      if [ "$IMPL" = py ]; then /tmp/caxx "$@"
+      else timeout ${CMP_TIMEOUT:-600} gforth $R/${AXXFS:-axx.fs} "$@"; fi
     }
     export P S
     { eval "$line"; } >/dev/null 2>&1 </dev/null

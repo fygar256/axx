@@ -175,7 +175,7 @@ sb-new constant ms-b
     8 of mode 0= if r exec-clrcheck then endof
     9 of mode 0= if r dir-reloc then endof
     10 of mode 0= if r dir-clrreloc then endof
-    11 of mode 0= if r exec-map else r patsyms false map-apply then endof
+    11 of mode 0= if r exec-map else r numsyms false map-apply then endof
     12 of r exec-free endof
     13 of mode 0= if r exec-passthru then endof
     14 of mode 0= if r exec-eol then endof
