@@ -271,7 +271,6 @@ create tf-a 8 cells allot   create tf-u 8 cells allot
 10 om-new constant imported-labels
 4 om-new constant pass1-final
 6 om-new constant pcs-prev
-4 om-new constant export-labels            \ 名前 -> [q:4]... は下の exp-* で別に持つ
 variable pcs-prev-valid
 65536 cells allocate throw constant hist-h
 65536 cells allocate throw constant hist-i

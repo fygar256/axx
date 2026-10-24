@@ -39,3 +39,7 @@ s" mini1.fs" included
 s" mini2.fs" included
 s" mini3.fs" included
 s" mini4.fs" included
+s" elf1.fs" included
+s" elf2.fs" included
+s" elf3.fs" included
+s" elf4.fs" included

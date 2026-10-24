@@ -18,6 +18,7 @@ variable cur-sec-a  variable cur-sec-u   \ 現在のセクション名
 : lab-rtype ( slot -- n ) 8 cells + @ ;
 : lab-set-sec ( slot a u -- ) rot 4 cells + s! ;
 
+1 om-new constant equ-secs                   \ .equ の式が触れたセクション
 defer lab-sec-adjust ( q secname-a secname-u -- q' )     \ セクション相対への補正 (-o / -E)
 :noname 2drop ; is lab-sec-adjust
 defer elf-note-label ( a u q -- )                         \ -o の追跡 (ラベルの読み)
@@ -27,11 +28,14 @@ defer elf-note-label ( a u q -- )                         \ -o の追跡 (ラベ
   a u lab-find ?dup if
     { sl }
     sl qcopy { v }
-    in-binlist @ if
+    equ-track @ if
+      sl lab-sec equ-secs om-put drop
+      v qundef-derived? 0= if v sl lab-sec lab-sec-adjust to v then
+    else in-binlist @ if
       sl lab-sec cur-sec-a @ cur-sec-u @ str=cs if
-        v sl lab-sec lab-sec-adjust to v
+        v qundef-derived? 0= if v sl lab-sec lab-sec-adjust to v then
       then
-    then
+    then then
     a u v elf-note-label
     v exit
   then

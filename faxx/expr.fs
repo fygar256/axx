@@ -19,6 +19,7 @@ variable fdiv0-seen
 variable read-float-var            \ _expr_read_float_var
 variable vliw-cnt  variable vliw-stop
 variable in-binlist
+variable equ-track                  \ .equ の式を評価中 (セクションの追跡)
 variable pc  variable pc-start  variable pc-end
 1000 constant EXPR-MAX-DEPTH
 
@@ -50,7 +51,8 @@ defer elf-note-var ( slot q -- )               \ -o の追跡 (変数の読み)
 :noname ( a u i -- q kind ) drop 2drop q0 0 ; is arr-item-num
 :noname ( -- q true | false ) false ; is enum-match
 :noname ( kind -- q true | false ) drop false ; is brace-eval
-:noname ( -- q ) in-binlist @ if pc-start @ else pc @ then qn ; is loc-counter
+:noname ( -- q ) in-binlist @ if pc-start @ else pc @ then qn
+  in-binlist @ equ-track @ or if sec-rel-pc then ; is loc-counter
 :noname ( q -- q' ) ; is sec-rel-pc
 :noname ( slot q -- ) 2drop ; is elf-note-var
 
@@ -299,7 +301,7 @@ defer expr
   s" $$" qtxt? if 2 adv loc-counter int-or-float fin exit then
   s" $." qtxt? if
     2 adv pc-end @ qn
-    in-binlist @ if sec-rel-pc then
+    in-binlist @ equ-track @ or if sec-rel-pc then
     int-or-float fin exit
   then
   cur 35 = if hash-term int-or-float fin exit then
