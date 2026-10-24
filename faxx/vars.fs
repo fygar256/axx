@@ -101,3 +101,30 @@ variable nstouch
     sl cells sta + @ sl cells vta + !
     sl cells stu + @ sl cells vtu + !
   loop ;
+
+\ -o の追跡の状態 (照合から参照するのでここに置く)
+variable trk-on     false trk-on !
+variable trk-widx   -1 trk-widx !
+variable trk-cap    -1 trk-cap !
+defer elf-cap-finish ( slot a u -- )               \ 変数の取り込みが終わったところ
+:noname 2drop drop ; is elf-cap-finish
+defer trk-push ( -- )
+:noname ; is trk-push
+defer trk-top-restore ( -- )
+:noname ; is trk-top-restore
+defer trk-pop ( -- )
+:noname ; is trk-pop
+defer trk-cand-begin ( -- )
+:noname ; is trk-cand-begin
+defer trk-cand-best ( -- )
+:noname ; is trk-cand-best
+defer trk-cand-restore ( -- )
+:noname ; is trk-cand-restore
+defer trk-best-install ( -- )
+:noname ; is trk-best-install
+defer trk-probe-begin ( -- )
+:noname ; is trk-probe-begin
+defer trk-probe-end ( -- )
+:noname ; is trk-probe-end
+defer elf-call-drop ( w -- )
+:noname drop ; is elf-call-drop

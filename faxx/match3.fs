@@ -43,7 +43,7 @@ sb-new constant tb
   tb sb$ ;
 : popcnt ( n -- k ) 0 swap begin dup while dup 1 and rot + swap 1 rshift repeat drop ;
 
-: match-groups ( a u cnt -- flag ) { a u cnt } 0 0 { pop mask }
+: match-groups-inner ( a u cnt -- flag ) { a u cnt } 0 0 { pop mask }
   cnt 20 > if 20 to cnt then
   a u find-groups
   cnt 1+ 0 ?do
@@ -52,6 +52,7 @@ sb-new constant tb
     begin mask 0>= while
       mask popcnt pop = if
         a u mask cnt build-text mt-u ! mt-a !
+        trk-top-restore
         vars-reset
         match1 if true unloop exit then
       then
@@ -59,6 +60,7 @@ sb-new constant tb
     repeat
   loop
   false ;
+: match-groups ( a u cnt -- flag ) trk-push match-groups-inner dup 0= if trk-top-restore then trk-pop ;
 
 : has-brackets? ( a u -- n f )                    \ [[ の数, [[ または ]] があるか
   2dup count-sub { n } 2dup s" ]]" search nip nip { cl } s" [[" search nip nip n 0> or cl or n swap ;

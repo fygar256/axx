@@ -231,6 +231,7 @@ variable nsym-dirty  true nsym-dirty !
 : try-row ( row -- ok ) { row }
   false undef-flag !
   vars-reset
+  trk-cand-begin
   cand-begin
   true in-match !
   pend-begin
@@ -250,6 +251,7 @@ variable nsym-dirty  true nsym-dirty !
     then
     if
       row best-row !
+      trk-cand-best
       e best-score !  l best-score cell+ !  s best-score 2 cells + !
       undef-flag @ best-undef !
       best-diag sb-clear  da du best-diag sb+
@@ -258,6 +260,7 @@ variable nsym-dirty  true nsym-dirty !
     then
     vars-reset
   else cand-end-fail then
+  trk-cand-restore
   false undef-flag !
   ok ;
 
@@ -268,7 +271,9 @@ defer vliw-sentinel-hook ( -- )
 : pass1-probe ( row -- ) { row }
   pc @ pc-start !  pc-start @ pc-end !
   size-mode @ { sm }  true size-mode !
+  trk-probe-begin
   row 2 rf makeobj
+  trk-probe-end
   pc-start @ nobj @ + pc-end !
   sm size-mode !
   best-undef @ undef-flag ! ;
@@ -341,6 +346,7 @@ variable sc-sent  variable sc-idxs
 : run-best ( -- idxs )
   snap-live @ if snap-restore then
   vrestore
+  trk-best-install
   best-undef @ undef-flag !
   best-diag sb$ pend-replay
   best-row @ { br }

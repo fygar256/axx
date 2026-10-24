@@ -141,7 +141,10 @@ sb-new constant pb
       else
         a k + 5 + u <= if a k + 5 supper s" .CALL" str=cs else false then
         a k 5 + + c@ corec? 0= k 5 + u >= or and if
+          nobj @ { w0 }  elf-word-begin
           a u k semi drp mini-call to k
+          nobj @ w0 = if w0 elf-call-drop then
+          -1 trk-widx !
           k u < if a k + c@ 44 = else false then if k 1+ to k else true to stp then
         else
           elf-word-begin
@@ -162,5 +165,6 @@ sb-new constant pb
   undef-flag @ { prior }  false undef-flag !
   true in-binlist !
   makeobj-run
+  -1 trk-widx !
   false in-binlist !
   undef-flag @ prior or undef-flag ! ;

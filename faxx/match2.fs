@@ -84,9 +84,12 @@ defer cap-float ( kind -- ok )                 \ !F !D !Q (kind = 文字)
   na n true vslot to sl
   undef-flag @ to pr  false undef-flag !  false expr-missing !
   si @ to st
+  sl trk-cap !
   kind 0= if ms-a @ ms-u @ si @ stop expr-esc else ms-a @ ms-u @ si @ factor-at then
   si !  to v
+  -1 trk-cap !
   ncloses @ 0 ?do SUB-CLOSE i cells closes + @ sub-mark loop
+  sl ms-a @ st + si @ st - elf-cap-finish
   undef-flag @ to cu
   kind 0= if
     textmode @ if
