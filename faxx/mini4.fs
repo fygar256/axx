@@ -285,7 +285,7 @@ variable mc-k
   then
   a k 1+ + e k 1- - { ta tu }
   e 1+ { nk }
-  na nu mfuncs om-find 0= if
+  na nu mfuncs om-find ?dup 0= if
     mb-reset s"  error - '.call': no function named " mb+ na nu repr1 mb+ s"  (define it with '.func::" mb+ na nu mb+ s" :: ... .endfunc')." mb+ mini-diag nk exit
   then
   @ { fn }

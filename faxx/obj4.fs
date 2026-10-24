@@ -139,7 +139,7 @@ sb-new constant pb
         begin k u < if a k + c@ spc? else false then while k 1+ to k repeat
         k u < if a k + c@ 44 = else false then if k 1+ to k else true to stp then
       else
-        a k + 5 + u <= if a k + 5 supper s" .CALL" str=cs else false then
+        k 5 + u <= if a k + 5 supper s" .CALL" str=cs else false then
         a k 5 + + c@ corec? 0= k 5 + u >= or and if
           nobj @ { w0 }  elf-word-begin
           a u k semi drp mini-call to k
