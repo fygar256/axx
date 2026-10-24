@@ -26,7 +26,7 @@ create vliw-pat-a 256 cells allot
 create vliw-pat-u 256 cells allot
 
 \ エラー文言
-1 om-new constant errtab               \ 10 進の番号 -> (a u) を値に持つ (value[0]=a [1]=u)
+2 om-new constant errtab               \ 10 進の番号 -> (a u) を値に持つ (value[0]=a [1]=u)
 : errtab-init ( -- )
   errtab om-clear ;
 : err-set ( code a u -- ) { c a u } c n>s errtab om-put a u hdup rot s! ;
