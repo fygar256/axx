@@ -30,3 +30,4 @@ s" line3.fs" included
 s" plan.fs" included
 s" help.fs" included
 s" main.fs" included
+s" vliw.fs" included

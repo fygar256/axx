@@ -436,7 +436,6 @@ defer pass-reset-extra ( passno -- )
   loop ;
 
 : n>hex ( n -- a u ) base @ >r hex dup >r abs s>d <# #s r> sign #> r> base ! ;
-: q>hexs ( q -- a u ) q>hex ;
 
 : drift-report ( n -- ) { n }
   mb-reset s"  error - address mismatch between pass1 and pass2 (" mb+ n mb-n
@@ -458,7 +457,7 @@ defer pass-reset-extra ( passno -- )
           sl p1 q= 0= sl qundef-derived? 0= and if
             shown 10 < if
               s"            " etype i labels om-key etype
-              s" : pass1=0x" etype p1 q>hex etype s"  pass2=0x" etype sl q>hex etype ecr
+              s" : pass1=0x" etype p1 true q>hex etype s"  pass2=0x" etype sl true q>hex etype ecr
             then
             shown 1+ to shown
           then
