@@ -68,9 +68,8 @@ defer cap-float ( kind -- ok )                 \ !F !D !Q (kind = 文字)
   then
   omit if
     prev si !
-    na n true vslot { sl2 }
-    sl2 q0 false exp-float @ vput
-    sl2 0 0 vput-text
+    na n true vslot dup q0 false exp-float @ vput
+    0 0 vput-text
     1 n-sym +!  true exit
   then
   false ;

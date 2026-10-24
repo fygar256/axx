@@ -28,16 +28,37 @@ variable vidx-n
   vidx-n @ 0 ?do arr i arr-item item-q vidx i QB * + q= 0= if false unloop exit then loop
   true ;
 
+\ 組み立てた res を出力する
+: vliw-emit ( res vbits -- ) { res vbits }
+  0 { q }
+  vbits 8 < if
+    pc @ res vbits q-ones qand outbin  1 to q
+  else vbits 7 + 8 / { tb }
+    endian-big @ 0= if
+      tb 0 ?do
+        pc @ i + res 255 qn qand outbin
+        res 8 qshr to res
+        q 1+ to q
+      loop
+    else
+      tb 0 ?do
+        pc @ i + res tb 1- i - 8 * qshr 255 qn qand outbin
+        q 1+ to q
+      loop
+    then
+  then
+  q pc +! ;
+
 : vliw-build ( k -- ok ) { k }
   vliw-bits @ abs { vbits }
   vliw-instbits @ q-ones { im }
   vliw-tmplbits @ abs q-ones { tm }
   vbits q-ones { pm }
   undef-flag @ { prior }  false undef-flag !
-  vliw-pat-a k cells + @ vliw-pat-u k cells + @ 0 expr-pat drop { x }
+  vliw-pat-a k cells + @ vliw-pat-u k cells + @ 0 expr-pat drop
   undef-flag @ report? and if true had-error ! then
   prior undef-flag @ or undef-flag !
-  x tm qand { templ }
+  tm qand { templ }
   vliw-instbits @ 7 + 8 / { ibyte }
   vbits vliw-tmplbits @ abs - vliw-instbits @ / { noi }
   noi 0<= if
@@ -84,25 +105,7 @@ variable vidx-n
   else
     r vliw-tmplbits @ qshl templ qor
   then { res }
-  0 { q }
-  vbits 8 < if
-    pc @ res vbits q-ones qand outbin  1 to q
-  else vbits 7 + 8 / { tb }
-    endian-big @ 0= if
-      tb 0 ?do
-        pc @ i + res 255 qn qand outbin
-        res 8 qshr to res
-        q 1+ to q
-      loop
-    else
-      tb 0 ?do
-        pc @ i + res tb 1- i - 8 * qshr 255 qn qand outbin
-        q 1+ to q
-      loop
-    then
-  then
-  q pc +!
-  true ;
+  res vbits vliw-emit true ;
 
 : vliw-empty-slot ( -- ) s"  error - VLIW: empty slot in the packet (nothing before or after a '!!')." diag-e ;
 

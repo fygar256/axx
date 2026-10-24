@@ -138,38 +138,36 @@ defer parse-block ( i depth -- blk i' )
     i pl-pos err-at s" unexpected text after '}': " mb+ ta tu repr1 mb+ mfail
   then ;
 
+: ps-split-eq ( ra ru nd -- )                       \ `name = expr` を nd の欄 0..3 に
+  { ra ru nd }
+  ra ru 61 find-ch { e }
+  e ru < if
+    ra e strip-st mm-str nd 0 nf s!
+    ra e 1+ + ru e - 1- mm-str nd 2 nf s!
+  else
+    ra ru strip-st mm-str nd 0 nf s!  0 0 nd 2 nf s!
+  then ;
+: ps-text1 ( kind ra ru fa fu ln -- nd ) { kind ra ru fa fu ln }
+  kind 2 fa fu ln node-new { nd }
+  ra ru strip-st mm-str nd 0 nf s!  nd ;
+: ps-opt1 ( kind ra ru fa fu ln -- nd ) { kind ra ru fa fu ln }
+  kind 2 fa fu ln node-new { nd }
+  ra ru strip-st dup if mm-str else 2drop 0 0 then nd 0 nf s!  nd ;
 : parse-simple ( lw-a lw-u word-a word-u rest-a rest-u i -- node ) { la lu wa wu ra ru i }
   i pl-pos { fa fu ln }
   la lu s" set" str=cs if
-    ra ru 61 find-ch { e }
-    e ru >= if fa fu ln err-at s" '!set' needs 'name = expression'" mb+ mfail then
-    N-SET 4 fa fu ln node-new { nd }
-    ra e strip-st mm-str nd 0 nf s!
-    ra e 1+ + ru e - 1- mm-str nd 2 nf s!
-    nd exit
+    ra ru 61 find-ch ru >= if fa fu ln err-at s" '!set' needs 'name = expression'" mb+ mfail then
+    N-SET 4 fa fu ln node-new { nd }  ra ru nd ps-split-eq  nd exit
   then
-  la lu s" local" str=cs if
-    N-LOCAL 4 fa fu ln node-new { nd }
-    ra ru 61 find-ch { e }
-    e ru < if
-      ra e strip-st mm-str nd 0 nf s!
-      ra e 1+ + ru e - 1- mm-str nd 2 nf s!
-    else
-      ra ru strip-st mm-str nd 0 nf s!  0 0 nd 2 nf s!
-    then
-    nd exit
-  then
-  la lu s" undef" str=cs if N-UNDEF 2 fa fu ln node-new { nd } ra ru strip-st mm-str nd 0 nf s! nd exit then
-  la lu s" return" str=cs if
-    N-RETURN 2 fa fu ln node-new { nd }
-    ra ru strip-st dup if mm-str else 2drop 0 0 then nd 0 nf s! nd exit
-  then
+  la lu s" local" str=cs if N-LOCAL 4 fa fu ln node-new { nd }  ra ru nd ps-split-eq  nd exit then
+  la lu s" undef" str=cs if N-UNDEF ra ru fa fu ln ps-text1 exit then
+  la lu s" return" str=cs if N-RETURN ra ru fa fu ln ps-opt1 exit then
   la lu s" break" str=cs if N-BREAK 0 fa fu ln node-new exit then
   la lu s" continue" str=cs if N-CONT 0 fa fu ln node-new exit then
-  la lu s" error" str=cs if N-ERROR 2 fa fu ln node-new { nd } ra ru strip-st mm-str nd 0 nf s! nd exit then
-  la lu s" warning" str=cs if N-WARN 2 fa fu ln node-new { nd } ra ru strip-st mm-str nd 0 nf s! nd exit then
-  la lu s" echo" str=cs if N-ECHO 2 fa fu ln node-new { nd } ra ru strip-st mm-str nd 0 nf s! nd exit then
-  la lu s" include" str=cs if N-INCLUDE 2 fa fu ln node-new { nd } ra ru strip-st mm-str nd 0 nf s! nd exit then
+  la lu s" error" str=cs if N-ERROR ra ru fa fu ln ps-text1 exit then
+  la lu s" warning" str=cs if N-WARN ra ru fa fu ln ps-text1 exit then
+  la lu s" echo" str=cs if N-ECHO ra ru fa fu ln ps-text1 exit then
+  la lu s" include" str=cs if N-INCLUDE ra ru fa fu ln ps-text1 exit then
   N-CALL 4 fa fu ln node-new { nd }
   wa wu mm-str nd 0 nf s!  ra ru strip-st mm-str nd 2 nf s!  nd ;
 

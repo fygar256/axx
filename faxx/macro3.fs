@@ -300,7 +300,6 @@ sb-new constant fg-b
   iv 0< { neg }
   neg if iv negate else iv then { uv }
   fd-b sb-clear  s" " { pa pu }
-  base @ { oldb }
   type case
     100 of uv 0 <# #s #> endof
     110 of uv 0 <# #s #> endof
@@ -324,8 +323,7 @@ sb-new constant fg-b
   du { want }
   f-align @ ?dup 0= if f-zero @ if 61 else 62 then then { eal }
   eal 61 = f-fill @ 48 = and if
-    f-width @ hu - { avail }
-    begin want step group-len avail < while want 1+ to want repeat
+    begin want step group-len f-width @ hu - < while want 1+ to want repeat
   then
   want 400 > if s" " false exit then
   fd-b sb-clear
