@@ -210,15 +210,17 @@ variable fs-u
 
 \ 語の読み取り
 : symword ( -- a u )          \ シンボルの語 (swordchars)
-  ex-a @ ep @ + 0
+  ex-a @ ep @ + 0 { a n }
   cur digc? 0= cur swc? and if
-    begin cur swc? while 1+ 1 adv repeat
-  then ;
+    begin cur swc? while n 1+ to n 1 adv repeat
+  then
+  a n ;
 : labword ( -- a u )          \ ラベルの語 (lwordchars)
-  ex-a @ ep @ + 0
+  ex-a @ ep @ + 0 { a n }
   cur 46 = cur digc? 0= cur lwc? and or if
-    begin cur lwc? while 1+ 1 adv repeat
-  then ;
+    begin cur lwc? while n 1+ to n 1 adv repeat
+  then
+  a n ;
 : varlen ( -- n )             \ パターン変数名の長さ (0 なら変数でない)
   cur lowc? 0= if 0 exit then
   1 begin dup ch dup lowc? swap digc? or over ch 95 = or while 1+ repeat ;

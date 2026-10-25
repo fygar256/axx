@@ -24,21 +24,20 @@ defer lab-sec-adjust ( q secname-a secname-u -- q' )     \ セクション相対
 defer elf-note-label ( a u q -- )                         \ -o の追跡 (ラベルの読み)
 : elf-note-label-nn22 2drop drop ; bind elf-note-label-nn22 elf-note-label
 
-: label-value-impl ( a u -- q ) { a u }
-  a u lab-find ?dup if
-    { sl }
-    sl qcopy { v }
-    equ-track @ if
-      sl lab-sec equ-secs om-put drop
+: label-found ( a u sl -- q ) { a u sl }
+  sl qcopy { v }
+  equ-track @ if
+    sl lab-sec equ-secs om-put drop
+    v qundef-derived? 0= if v sl lab-sec lab-sec-adjust to v then
+  else in-binlist @ if
+    sl lab-sec cur-sec-a @ cur-sec-u @ str=cs if
       v qundef-derived? 0= if v sl lab-sec lab-sec-adjust to v then
-    else in-binlist @ if
-      sl lab-sec cur-sec-a @ cur-sec-u @ str=cs if
-        v qundef-derived? 0= if v sl lab-sec lab-sec-adjust to v then
-      then
-    then then
-    a u v elf-note-label
-    v exit
-  then
+    then
+  then then
+  a u v elf-note-label
+  v ;
+: label-value-impl ( a u -- q ) { a u }
+  a u lab-find ?dup if a u rot label-found exit then
   pass @ 1 = if
     a u relax-prev om-find ?dup if qcopy exit then
     relax-optimistic @ if true undef-flag ! pc @ qn exit then
