@@ -80,7 +80,9 @@ defer elf-note-var ( slot q -- )               \ -o の追跡 (変数の読み)
 9223372036854775808e fconstant TWO63
 : u>f ( u -- ) ( F: -- r )                       \ 符号なし 64 ビットを正しく丸めて
   dup 0< if dup 1 rshift swap 1 and or s>f 2e f* else s>f then ;
-: fpow2 ( n -- ) ( F: -- r ) 1e 0 ?do 2e f* loop ;
+create p2buf 8 allot
+: fpow2 ( n -- ) ( F: -- r )                    \ 2^n (n は 0..1023)
+  1023 min 1023 + 52 lshift p2buf ! p2buf f@ ;
 : f>u ( F: r -- ) ( -- u )
   fdup TWO63 f>= if TWO63 f- f>s 1 63 lshift or else f>s then ;
 : qmag ( a -- m ) dup q-neg? if qneg then ;
@@ -95,17 +97,15 @@ defer elf-note-var ( slot q -- )               \ -o の追跡 (変数の読み)
   then
   neg if fnegate then ;
 : qi>dq ( a -- q ) qi>f dq ;                     \ 整数 -> 倍精度ビット列
-: dq-trunc ( F: r -- ) ( -- q )                  \ 倍精度 -> 整数 (ゼロ方向)
-  fdup f0< { neg } fabs floor
+: dq-trunc ( F: r -- ) ( -- q )                  \ 倍精度 -> 整数 (ゼロ方向)。ビット列から直接作る
+  dq @ { bits }
+  bits 52 rshift $7ff and { ex }
   q0 { r }
-  4 0 do
-    fdup 1e f< if leave then
-    fdup TWO64 f/ floor
-    fswap fover TWO64 f* f-
-    f>u r i cells + !
-  loop
-  fdrop
-  neg if r qneg else r then ;
+  ex 1023 < if r exit then
+  bits 1 52 lshift 1- and 1 52 lshift or r !
+  ex 1075 - { e }
+  e 0>= if r e 255 min qshl to r else r e negate qshr to r then
+  bits 0< if r qneg else r then ;
 : qd-fin? ( a -- f ) @ 52 rshift 2047 and 2047 <> ;
 : dtxt ( a -- c-addr u )                         \ inf / -inf / nan の綴り
   dup @ 63 rshift { neg }  dup @ $fffffffffffff and 0= { zm }  drop
