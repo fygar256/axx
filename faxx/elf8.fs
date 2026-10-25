@@ -123,6 +123,9 @@ variable g-na  variable g-nu  variable g-abs  variable g-first  variable g-nw  v
   loop
   s" '; relocation omitted." mb+ mb-get diag-w ;
 
+: dnb-of ( drt nbytes -- n ) { drt nbytes } drt mt-bytes@ 0 max { b } b 0= if nbytes else b then ;
+: dw-off ( dfd? -- n ) if g-foff @ e-bpw @ / exit then 0 ;
+: dnb-pick ( drt dfd? -- n ) if nbytes dnb-of exit then drop nbytes ;
 : diff-clear-do ( dw nw -- ) g-fm @ words-clear-mask ;
 : diff-zero-do ( -- ) g-first @ g-nw @ words-zero ;
 : diff-term-one ( terms i pass dsec pp0 pp1 dconst dnb dfd? hp dput -- dput' ) { terms i pass dsec pp0 pp1 dconst dnb dfd? hp dput }
@@ -158,8 +161,8 @@ variable g-na  variable g-nu  variable g-abs  variable g-first  variable g-nw  v
   q0 { dconst }  0 { dw }  0 { dnb }  0 { nw0 }
   drt 0>= if
     dcst scale* to dconst
-    g-first @ dfd? if g-foff @ e-bpw @ / else 0 then + to dw
-    dfd? if drt mt-bytes@ 0 max dup 0= if drop nbytes then else nbytes then to dnb
+    g-first @ dfd? dw-off + to dw
+    drt dfd? dnb-pick to dnb
     dfd? mt-rela? and if
       dnb e-bpw @ / 1 max to nw0
       dw nw0 + nobj @ <= if dw nw0 diff-clear-do then
