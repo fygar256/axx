@@ -404,18 +404,19 @@ defer mi-exec ( s -- )
     loop
   else v v-str? if v v-str emit-bytes else v v-q emit-q then then ;
 
+variable echo-cur
 : echo-str ( a u -- )                            \ NUL を \0 と書く
-  { a u } u 0 ?do a i + c@ dup 0= if drop s" \0" mi-sb sb+ else mi-sb sb-c then loop ;
+  { a u } u 0 ?do a i + c@ dup 0= if drop s" \0" echo-cur @ sb+ else echo-cur @ sb-c then loop ;
 : echo-value ( v -- ) { v }
   v v-arr? if
-    91 mi-sb sb-c
+    91 echo-cur @ sb-c
     v ma-len 0 ?do
-      i if s" , " mi-sb sb+ then
+      i if s" , " echo-cur @ sb+ then
       v i ma-ref { e }
-      e v-str? if 34 mi-sb sb-c e v-str echo-str 34 mi-sb sb-c else e v-q q>dec mi-sb sb+ then
+      e v-str? if 34 echo-cur @ sb-c e v-str echo-str 34 echo-cur @ sb-c else e v-q q>dec echo-cur @ sb+ then
     loop
-    93 mi-sb sb-c
-  else v v-str? if v v-str echo-str else v v-q q>dec mi-sb sb+ then then ;
+    93 echo-cur @ sb-c
+  else v v-str? if v v-str echo-str else v v-q q>dec echo-cur @ sb+ then then ;
 
 : mi-raise ( s -- ) { s }
   s 0 sf @ mi-eval { v }
@@ -430,13 +431,15 @@ defer mi-exec ( s -- )
   then ;
 
 : mi-echo ( s -- ) { s }
-  mi-sb sb-clear
+  echo-cur @ { prev }  sb-new { out }  out echo-cur !
   s 0 sf @ { n }  s 1 sf @ { p }
   n 0 ?do
-    i if 32 mi-sb sb-c then
+    i if 32 out sb-c then
     p i cells + @ mi-eval echo-value
   loop
-  report? size-mode @ 0= and if mi-sb sb$ etype ecr then ;
+  prev echo-cur !
+  report? size-mode @ 0= and if out sb$ etype ecr then
+  out sb-free ;
 
 : mi-call-impl ( f args n -- ret|0 ) { f args n }
   nframes @ MI-MAX-DEPTH >= if rt-head s" call nesting deeper than 128; assuming runaway recursion" mb+ mini-throw then

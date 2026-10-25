@@ -131,18 +131,49 @@ sb-new constant indent-text
   a k + u k -  a k ;
 
 \ ---- label: と label: .equ ----
+defer equ-reloc-named ( a u -- n )
+defer equ-machine-no ( -- n )
+defer equ-sort-om ( om -- arr n )
+: equ-sec-warn ( na nu -- ) { na nu }
+  equ-secs equ-sort-om { arr n }
+  mb-reset s"  warning - .EQU '" mb+ na nu mb+
+  s" ': expression combines labels from multiple sections (" mb+
+  n 0 ?do
+    i 0> if s" , " mb+ then
+    arr i cells + @ equ-secs om-key mb+
+  loop
+  s" ) without an explicit ::reloctype; the resulting constant assumes a specific section layout and will NOT be relocated by the linker." mb+
+  mb-get diag-w
+  arr free drop ;
 : do-equ ( na nu ra ru -- ) { na nu ra ru }
   ra ru trim { ea eu }
+  -1 { rt }
+  ea eu s" ::" search if
+    { pa pu }
+    pa 2 + pu 2 - trim slower { ta tu }
+    ea pa ea - trim to eu to ea
+    ta tu equ-reloc-named to rt
+    rt -1 = if
+      mb-reset s"  warning - unknown reloctype '" mb+ ta tu mb+ s" ' in .EQU for machine " mb+ equ-machine-no mb-n mb-get diag-w
+    then
+  else 2drop then
   false undef-flag !
   size-mode @ { sm }
   pass @ 1 = if true size-mode ! then
+  rt -1 = { track }
+  track if equ-secs om-clear true equ-track ! then
   ea eu 0 expr-asm { v pe }
   sm size-mode !
+  false equ-track !
+  track equ-secs om-used 0> and if
+    0 { cnt } equ-secs om-used 0 ?do i equ-secs om-live? if cnt 1+ to cnt then loop
+    cnt 1 > report? and if na nu equ-sec-warn then
+  then
   undef-flag @ if
     mb-reset s"  error - .EQU '" mb+ na nu mb+ s" ': expression contains undefined label." mb+ mb-get diag-e
   then
   ea eu pe mb-reset s" .EQU '" mb+ na nu mb+ s" '" mb+ mb-get sdup dir-rest-error drop
-  na nu v cur-section 1 -1 lab-put drop ;
+  na nu v cur-section 1 rt lab-put drop ;
 
 : label-proc ( a u -- ra ru ) { a u } 0 0 0 { k nl lend }
   u 0= if a u exit then

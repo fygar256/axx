@@ -190,11 +190,10 @@ variable av-n
   begin k u < while
     a k + c@ xdig? 0= if q0 false exit then
     a k + c@ hexv { dv }
-    v 16 q*small+ to v
-    v dv qn q+ to v
+    v 16 dv q*small+ drop to v
     nd 1+ to nd  k 1+ to k
   repeat
-  v qnbit 192 >= if q0 false exit then
+  v qnbit 192 > if q0 false exit then
   neg if v qneg else v then true ;
 
 variable imp-sec-n
@@ -649,6 +648,22 @@ create inbuf 1024 allot
   then
   write-exports ;
 
+: errno-text ( n -- a u )
+  case
+    28 of s" No space left on device" endof
+    9 of s" Bad file descriptor" endof
+    5 of s" Input/output error" endof
+    32 of s" Broken pipe" endof
+    27 of s" File too large" endof
+    122 of s" Disk quota exceeded" endof
+    s" Unknown error" rot
+  endcase ;
+\ 標準出力へ書けなかったか (caxx.c の最後の fflush と同じ報告)
+: stdout-ok? ( -- f )
+  stdout flush-file dup 0= if drop true exit then
+  512 + negate { en }
+  mb-reset s"  error - cannot write to standard output: [Errno " mb+ en mb-n s" ] " mb+ en errno-text mb+
+  mb-get etype ecr false ;
 : main ( -- )
   wbuf-init  pend-init  err-init  opts-init
-  run if 0 else 1 then (bye) ;
+  run stdout-ok? and if 0 else 1 then (bye) ;

@@ -258,6 +258,8 @@ variable mt-key-m  -1 mt-key-m !  variable mt-key-g  -1 mt-key-g !
   mach-table slower 2dup elftypes om-find ?dup if nip nip @ true exit then
   mt-named om-find ?dup if @ true else false then ;
 :noname ( a u -- n ) reloc-named-t if else -1 then ; is reloc-named
+' reloc-named is equ-reloc-named
+:noname elf-machine @ ; is equ-machine-no
 
 \ ---- 名前順の並べ替え (Python の sorted(dict.items())) ----
 \ om のエントリ番号の列を鍵 (a u) のバイト順で並べる。生きているものだけ。
@@ -280,4 +282,5 @@ variable so-num                                     \ 1 なら鍵を数として
     x arr j cells + !
   loop then
   arr n ;
+' sort-om is equ-sort-om
 : sort-om-num ( om -- arr n ) 1 so-num ! sort-om 0 so-num ! ;

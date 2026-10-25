@@ -74,24 +74,24 @@ defer cap-float ( kind -- ok )                 \ !F !D !Q (kind = 文字)
   then
   false ;
 
-\ !x !Lx !!x の捕捉。kind: 0 式 / 1 因子
+\ !x !Lx !!x の捕捉。kind: 0 式 / 1 因子 / 2 !L (式。テキスト置換モードでは未定義を 0 にする)
 : cap-expr ( kind -- ok ) { kind } 0 0 0 0 0 0 0 0 { n na stop sl pr st cu v }
   0 vname-at to n
   n 0= if false exit then
   mt-a @ ti @ + to na
   n ti +!
-  kind 0= if 0 var-stopchar to stop then
+  kind 1 <> if 0 var-stopchar to stop then
   na n true vslot to sl
   undef-flag @ to pr  false undef-flag !  false expr-missing !
   si @ to st
   sl trk-cap !
-  kind 0= if ms-a @ ms-u @ si @ stop expr-esc else ms-a @ ms-u @ si @ factor-at then
+  kind 1 <> if ms-a @ ms-u @ si @ stop expr-esc else ms-a @ ms-u @ si @ factor-at then
   si !  to v
   -1 trk-cap !
   ncloses @ 0 ?do SUB-CLOSE i cells closes + @ sub-mark loop
   sl ms-a @ st + si @ st - elf-cap-finish
   undef-flag @ to cu
-  kind 0= if
+  kind 2 = if
     textmode @ if
       pr undef-flag !
       cu v qundef-derived? or if q0 to v then
@@ -184,7 +184,7 @@ defer cap-float ( kind -- ok )                 \ !F !D !Q (kind = 文字)
   dup 70 = over 68 = or over 81 = or if
     1 ti +! cap-float if 0 else 1 then exit
   then
-  dup 76 = if drop 1 ti +! 0 cap-expr if 0 else 1 then exit then
+  dup 76 = if drop 1 ti +! 2 cap-expr if 0 else 1 then exit then
   dup 33 = if drop 1 ti +! 1 cap-expr if 0 else 1 then exit then
   dup 69 = if drop 1 ti +! cap-enum if 0 else 1 then exit then
   dup 89 = if drop 1 ti +! cap-yset if 0 else 1 then exit then

@@ -96,6 +96,8 @@ create pathbuf 4096 allot
 : warn-nosep ( a u -- )
   mb-reset s"  warning - pattern line has no '::' field separator and can never match (likely a stray line left over from a multi-line comment, or a binary_list/error_patterns continued onto the next physical line without a '\' at the end of the line before): '" mb+ mb+ s" '" mb+ mb-get diag-w ;
 
+defer echo-validate ( a u -- )                   \ .echo の引数を検査 (誤りは診断)
+:noname 2drop ; is echo-validate
 : pat-line ( a u fa fu ln -- ) { a u fa fu ln }
   a u reduce-spaces { ra ru }
   ra ru dot-kw { ka ku }
@@ -107,6 +109,7 @@ create pathbuf 4096 allot
     6 nflds !  6 0 do 0 0 i fld! loop
     s" .echo" 0 fld!
     ra ru trim 5 /string 1 fld!
+    1 fld@ echo-validate
     store-row exit
   then
   ra ru lstrip { sa su }

@@ -43,14 +43,35 @@ sb-new constant tb
   tb sb$ ;
 : popcnt ( n -- k ) 0 swap begin dup while dup 1 and rot + swap 1 rshift repeat drop ;
 
-: match-groups-inner ( a u cnt -- flag ) { a u cnt } 0 0 { pop mask }
-  cnt 20 > if 20 to cnt then
+: optg-warned-set ( -- om ) 1 om-new ;
+optg-warned-set constant optg-warned
+optg-warned-set constant budget-warned
+: warn-once ( a u om -- f ) { a u om }              \ 初めてなら登録して true
+  a u om om-find if false exit then
+  a u om om-put drop true ;
+: opt-warn ( a u cnt -- ) { a u cnt }
+  report? 0= if exit then
+  a u optg-warned warn-once 0= if exit then
+  mb-reset s"  warning - pattern has " mb+ cnt mb-n
+  s"  optional groups (max 20); first 20 are treated as optional, remainder are always included." mb+
+  mb-get diag-locate diag-wf ;
+: budget-warn ( a u cnt -- ) { a u cnt }
+  report? 0= if exit then
+  a u budget-warned warn-once 0= if exit then
+  mb-reset s"  warning - a pattern with " mb+ cnt mb-n
+  s"  optional group(s) exceeded the 65536-combination match budget and was treated as non-matching; consider splitting it into multiple explicit pattern entries." mb+
+  mb-get diag-locate diag-wf ;
+
+: match-groups-inner ( a u cnt -- flag ) { a u cnt } 0 0 0 { pop mask tried }
+  cnt 20 > if a u cnt opt-warn 20 to cnt then
   a u find-groups
   cnt 1+ 0 ?do
     i to pop
     1 cnt lshift 1- to mask
     begin mask 0>= while
       mask popcnt pop = if
+        tried 1+ to tried
+        tried 65536 > if a u cnt budget-warn false unloop exit then
         a u mask cnt build-text mt-u ! mt-a !
         trk-top-restore
         vars-reset
