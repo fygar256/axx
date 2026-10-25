@@ -13,9 +13,11 @@
 : l! ( u a -- ) over 255 and over c! over 8 rshift 255 and over 1+ c!
   over 16 rshift 255 and over 2 + c! swap 24 rshift 255 and swap 3 + c! ;
 : ul@ ( a -- u ) dup c@ over 1+ c@ 8 lshift or over 2 + c@ 16 lshift or swap 3 + c@ 24 lshift or ;
-: get-dir ( a u -- a u' ) { a u }
-  s" PWD" getenv dup 0= if 2drop s" /" then u min { sa su }
-  sa a su move a su ;
+CODE GET-DIR a u -- a n
+  #include <unistd.h>
+  r0 = p0;
+  r1 = getcwd((char*)(uintptr_t)p0, (size_t)p1) ? (cell_t)strlen((char*)(uintptr_t)p0) : 0;
+;CODE
 CODE (BYE) n --
   exit((int)p0);
 ;CODE
@@ -63,6 +65,7 @@ CODE STDIN-LINE a u -- n n n
 ;CODE
 CODE STDOUT-FLUSH -- n
   #include <errno.h>
-  if (fflush(stdout) != 0) return -512 - (cell_t)errno;
+  int _e = errno;
+  if (fflush(stdout) != 0 || ferror(stdout)) return -512 - (cell_t)(errno ? errno : (_e ? _e : ENOSPC));
   return 0;
 ;CODE

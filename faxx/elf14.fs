@@ -96,7 +96,8 @@ variable dw-ok
   0 a uleb 0 a uleb
   0 a uleb ;
 
-: get-cwd ( -- a u ) get-dir intern ;
+create cwd14 4096 allot
+: get-cwd ( -- a u ) cwd14 4096 get-dir intern ;
 
 variable dw-nlab  variable dwlab-base
 : dwlab@ ( i -- addr ) 4 * cells dwlab-base @ + ;     \ name-a name-u sidx off

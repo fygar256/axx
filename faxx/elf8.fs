@@ -123,6 +123,25 @@ variable g-na  variable g-nu  variable g-abs  variable g-first  variable g-nw  v
   loop
   s" '; relocation omitted." mb+ mb-get diag-w ;
 
+: diff-clear-do ( dw nw -- ) g-fm @ words-clear-mask ;
+: diff-zero-do ( -- ) g-first @ g-nw @ words-zero ;
+: diff-term-one ( terms i pass dsec pp0 pp1 dconst dnb dfd? hp dput -- dput' ) { terms i pass dsec pp0 pp1 dconst dnb dfd? hp dput }
+  terms i term-sign { sg }
+  sg 0> pass 0= = 0= if dput exit then
+  q0 { da }
+  dput 0= sg 0> hp 0= or and if
+    sg 0> if dconst else dconst qneg then to da  true to dput
+  then
+  e-sa @ e-su @ dsec terms i term-name sg 0> if pp0 else pp1 then da dnb dfd? if g-fm @ else 0 then rel-add
+  dput ;
+: diff-emit-terms ( terms dsec pp0 pp1 dconst dnb dfd? hp -- ) { terms dsec pp0 pp1 dconst dnb dfd? hp }
+  false { dput }
+  2 0 do
+    terms terms-n 0 ?do
+      terms i j dsec pp0 pp1 dconst dnb dfd? hp dput diff-term-one to dput
+    loop
+  loop ;
+
 : diff-general ( terms drt dfm dcst -- ) { terms drt dfm dcst }
   0 { pp0 }  0 { pp1 }  false { havep }
   false { dfd? }
@@ -136,35 +155,22 @@ variable g-na  variable g-nu  variable g-abs  variable g-first  variable g-nw  v
     opt-debug @ if terms dexpr-warn then
     exit
   then
-  q0 { dconst }  0 { dw }  0 { dnb }
+  q0 { dconst }  0 { dw }  0 { dnb }  0 { nw0 }
   drt 0>= if
     dcst scale* to dconst
     g-first @ dfd? if g-foff @ e-bpw @ / else 0 then + to dw
     dfd? if drt mt-bytes@ 0 max dup 0= if drop nbytes then else nbytes then to dnb
     dfd? mt-rela? and if
-      dnb e-bpw @ / 1 max { nw }
-      dw nw + nobj @ <= if dw nw g-fm @ words-clear-mask then
+      dnb e-bpw @ / 1 max to nw0
+      dw nw0 + nobj @ <= if dw nw0 diff-clear-do then
     then
   else
     g-first @ g-nw @ field-raw g-abs @ q- scale* to dconst
     g-first @ to dw  nbytes to dnb
-    mt-rela? if g-first @ g-nw @ words-zero then
+    mt-rela? if diff-zero-do then
   then
   dw sec-bytes { dsec }
-  false { dput }
-  terms has-plus? { hp }
-  2 0 do
-    terms terms-n 0 ?do
-      terms i term-sign { sg }
-      sg 0> j 0= = if
-        q0 { da }
-        dput 0= sg 0> hp 0= or and if
-          sg 0> if dconst else dconst qneg then to da  true to dput
-        then
-        e-sa @ e-su @ dsec terms i term-name sg 0> if pp0 else pp1 then da dnb dfd? if g-fm @ else 0 then rel-add
-      then
-    loop
-  loop ;
+  terms dsec pp0 pp1 dconst dnb dfd? terms has-plus? diff-emit-terms ;
 
 : emit-diff-group ( hd -- ) { hd }
   g-first @ nobj @ >= if exit then
