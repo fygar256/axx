@@ -56,3 +56,9 @@ s" elf14.fs" included
 s" elf15.fs" included
 s" elf16.fs" included
 s" elf17.fs" included
+s" float1.fs" included
+s" float2.fs" included
+s" float3.fs" included
+s" float4.fs" included
+s" float5.fs" included
+s" float6.fs" included

@@ -113,11 +113,20 @@ sb-new constant pb
 : word-mask ( -- q ) bts @ 0> if q1 bts @ qshl q1 q- else q0 qnot then ;
 : obj-byte ( n -- ) qn obj+ ;
 
+sb-new constant txtacc  sb-new constant dispacc  variable txt-any
 : emit-template ( ta tu -- ) { ta tu }
-  asmtext-set @ 0= if true asmtext-set ! then
-  ta tu asmtext sb+
-  asmdisp sb-len if 44 asmdisp sb-c then
-  34 asmdisp sb-c  ta tu asmdisp txt-escaped  34 asmdisp sb-c ;
+  true txt-any !
+  ta tu txtacc sb+
+  dispacc sb-len if 44 dispacc sb-c then
+  34 dispacc sb-c  ta tu dispacc txt-escaped  34 dispacc sb-c ;
+
+: text-warn-tmpl ( a u -- ) { a u }
+  bts @ 64 >= if -1 else 1 bts @ lshift 1- then { m } false { over }
+  u 0 ?do a i + c@ m u> if true to over then loop
+  over if
+    mb-reset s"  warning - text template: one or more bytes exceed the output word width (" mb+ bts @ mb-n
+    s"  bit(s)) and were truncated (high bits discarded): " mb+ a u repr1 mb+ mb-get diag-w
+  then ;
 
 : makeobj-run ( a u -- ) { a u } 0 0 0 0 { k semi drp stp }
   begin k u < stp 0= and while
@@ -132,6 +141,7 @@ sb-new constant pb
       qs u < if a qs + c@ 34 = else false then if
         a qs + u qs - tmpl-inner txt-render { ta tu }
         drp 0= semi tu 0= and 0= and if
+          size-mode @ 0= report? and if ta tu text-warn-tmpl then
           tu 0 ?do ta i + c@ obj-byte loop
           ta tu emit-template
         then
@@ -160,6 +170,7 @@ sb-new constant pb
 
 : makeobj ( a u -- )
   0 nobj !
+  txtacc sb-clear  dispacc sb-clear  false txt-any !
   expand-binlist if 2drop exit then
   pct-replace
   undef-flag @ { prior }  false undef-flag !
@@ -167,4 +178,9 @@ sb-new constant pb
   makeobj-run
   -1 trk-widx !
   false in-binlist !
+  txt-any @ if
+    true asmtext-set !
+    asmtext sb-clear  txtacc sb$ asmtext sb+
+    asmdisp sb-clear  dispacc sb$ asmdisp sb+
+  then
   undef-flag @ prior or undef-flag ! ;

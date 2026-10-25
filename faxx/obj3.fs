@@ -90,7 +90,7 @@ decimal
     ra 1+ ru 1- txt-index-call if txt-index-text out sb+ exit then
     ra 1+ ru 1- txt-conv-name if
       { nl kind }
-      ra ru 1+ nl + close-paren { cp }
+      ra ru nl 1+ close-paren { cp }
       cp 0> if
         ra nl + 2 + cp nl - 2 - kind out txt-emit-expr exit
       then
