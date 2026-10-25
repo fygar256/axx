@@ -1,36 +1,37 @@
-# axx.fs — axx の gforth 実装 (愛称 Fxx)
+# faxx — axx の gforth 実装 (愛称 Faxx)
 
-`axx.py` (Paxx) の中核を Forth（gforth 0.7.3 で確認）へ写したものです。パターンファイルとソースを読み、生のバイナリ（`-b`）を書きます。
+`axx.py` (Paxx) / `caxx.c` の全機能を Forth（gforth 0.7.3 で確認）へ写したものです。パターンファイルとソースを読み、`-b`（生のバイナリ）、`-o`（ELF オブジェクト、`-g` で DWARF）、`-e` / `-E`（エクスポート）などを書きます。
 
 ```sh
-gforth axx.fs patfile/z80.axx asmsrc/z80.s -b z80.bin
+gforth faxx.fs patfile/z80.axx asmsrc/z80.s -b z80.bin
+gforth faxx.fs patfile/x86_64.axx asmsrc/hello.s -o hello.o -g
 ```
+
+`faxx.fs` は `faxx/load.fs`（部品の読み込み順）を読んで `main` を呼ぶだけの入口です。`axx.fs` は最初に作った中核だけの版で、そのまま残してあります。
 
 ## 移した範囲
 
-| 区分 | 内容 |
-|---|---|
-| パターンファイル | `/* */` コメント（旧式の 1 行コメントの扱いを含む）、`\` 継続行、`.include`、`::` による欄の分割 |
-| ディレクティブ | `.setsym`（数値）、`.check` / `.clrcheck`、`.padding`、`.error` |
-| 照合 | 大文字＝文字定数、小文字＝シンボル、`!x` `!!x` `!Lx`、`[[ ]]`、`\c` 止め文字、`+` と `-` の読み替え |
-| 最良パターンの選択 | 特異度スコア `(n_expr, -n_lit, n_sym)` が最小のもの（行の順序は結果に影響しない） |
-| 式 | Paxx と同じ優先順位。`:=`、`? :`、`&&` `\|\|` の短絡、`'`（符号拡張）、`@`、`*(x,y)`、`$$`、`$.`、`#sym`、文字定数 |
-| 出力欄 | `error_patterns`、`binary_list`（`@@[n,..]`、`%%`、`;`、`;;`） |
-| ソース | ラベル、`label: .equ`、`.org [,p]`、`.align`、`.ascii` / `.asciz`、`.zero`、`.resb` / `.resw` / `.resd` / `.resq` |
-| パス | パス1をラベルが収束するまで反復（前の反復の値を推定値に使う）→ パス2 で生成。パス1とパス2のアドレスが食い違えばエラー |
+- パターンファイル: コメント、`\` 継続、`.include`（循環・深さ・開けないときの診断）、`.sub` / `.endsub`、`.func`（ミニ言語）、`.echo`、`.map`、`.enum`、`.check`、`.reloc`、`.error`、`.free`、`.unordered`、`.passthru`、`.eol`、`.textmode`、`.elf*` 宣言
+- 照合: 大文字＝文字定数、小文字＝シンボル、`!x` `!!x` `!Lx`、`!F` `!D` `!Q`、`!E` `!Y` `!S{{表}}`、`[[ ]]`、`\c` 止め文字
+- 式: 256 ビット整数、倍精度、`flt{}` `dbl{}` `qad{}` `enflt{}` `endbl{}`、4 倍精度（binary128）の正しい丸め
+- マクロ層（`!if` `!while` `!def` `!set` ほか）、ミニ言語（`.func` / `.call`）、VLIW
+- ソース: ラベル、`.equ`（`::reloctype`）、`.org` `.align` `.ascii` `.zero` `.res*`、`.section`、`.global` `.extern` `.weak` ほか、`.cfi_*`
+- 出力: `-b` `-o`（ELF32/64、REL/RELA、DWARF、`.eh_frame`）`-e` `-E` `-i` `-m` `-f` `--osabi` `--elfdesc` `-v` `-V` `-P` `-p`
+- パス1の緩和反復とパス2、パス1/パス2のアドレス不一致の検出
 
-## 移していないもの
+## 注意
 
-マクロ層、ソース側の `.include`、ミニ言語（`.func` / `.call`）、ELF / DWARF（`-o`）、VLIW、浮動小数点（`!F` `!D` `!Q`）、`.sub` / `.enum` / `.map` などの拡張、`.bits` が 8 以外の機械、テキスト置換モード、`-v` / `-V` / `-e` などの表示・書き出しオプション、対話モード。
-
-整数は gforth の 1 セル（64 ビット）です。Paxx は任意精度なので、64 ビットを超える値を扱うパターンは対象外です。
+- 引数の誤りの文面（usage など）は `axx.py`（argparse）の形です。`caxx` は短い 1 行の文面なので、この点だけは両者で異なります。
+- 巨大なパターンファイル向けの速度対策はしていません。
+- 辞書は gforth の既定の大きさで足ります。
 
 ## 検証
 
-`./test_forth` で次の組を実行し、`axx.py` と比べます（`test1` とは別のスクリプトです）。
+`./cmp_forth` が `test1` の `caxx` 行と同じコマンド列を `caxx`（`/tmp/caxx` として作ったもの）と `faxx.fs` の両方で実行し、出力ファイルと標準出力・標準エラーを比べます（`test1` は実行しません）。
 
-Paxx と同じ入力から同じバイト列が出ることを、次の組で確かめています。
+```sh
+./cmp_forth          # 全部
+./cmp_forth 5 12     # 5〜12 番目だけ
+```
 
-- `4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051` の各パターンファイルと `asmsrc/` の本体の `.s`
-- 同じ機械の `_edge.s`
-- 同じ機械の `_err.s`（出力が書かれないこと、診断メッセージが同じであること）
+`./test_forth` は小さな機械のパターンで `axx.py` と比べる簡易版です。
