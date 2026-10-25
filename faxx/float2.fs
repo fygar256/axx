@@ -71,7 +71,7 @@ $ffffffff constant M32
     dup M32 and a i bn-lp !  63 rshift
   loop drop
   a bn-trim ;
-: bn-sub ( a b -- c ) over @ bn-copy dup rot bn-sub! ;
+: bn-sub ( a b -- c ) { a b } a a @ bn-copy { c } c b bn-sub! c ;
 : mul-row ( r a b ri -- ) { r a b ri } a ri bn@ { x }
   0 b @ 0 ?do
     r ri i + bn-lp @ +  x b i bn@ * +

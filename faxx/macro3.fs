@@ -521,7 +521,7 @@ defer m-do-include ( v fa fu ln -- )
     N-INCLUDE of nd 0 nf s@ fa fu ln m-eval fa fu ln m-do-include endof
   endcase ;
 
-: exec-node ( nd -- ) depth 1- >r exec-node0 depth r> - if s" STACKLEAK " etype depth n>s etype ecr then ;
+: exec-node ( nd -- ) depth 1- >r exec-node0 begin depth r@ > while drop repeat r> drop ;
 : exec-block-impl ( b -- ) { b }
   b blk-n 0 ?do
     b i blk-node exec-node

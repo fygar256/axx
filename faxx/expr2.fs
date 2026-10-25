@@ -35,7 +35,15 @@ decimal
   factor
   begin s" **" qtxt? while 2 adv factor pow-op repeat ;
 
-: mul-op ( x t -- q ) 2dup u2? if 2drop qundef exit then exp-float @ if ['] f* fop2 else q* then ;
+: mul-int ( x t -- q ) { x t }
+  x t q* { r }
+  x q-zero? 0= t q-zero? 0= and if
+    x q-band? 0= t q-band? 0= and if
+      r x qtruncdiv t q= 0= if s" *" warn-wrap then
+    then
+  then
+  r ;
+: mul-op ( x t -- q ) 2dup u2? if 2drop qundef exit then exp-float @ if ['] f* fop2 else mul-int then ;
 : floordiv-op ( x t -- q ) { x t }
   x t u2? if qundef exit then
   exp-float @ if
@@ -72,8 +80,20 @@ decimal
     then then then then
   0= until ;
 
-: add-op ( x t -- q ) 2dup u2? if 2drop qundef exit then exp-float @ if ['] f+ fop2 else q+ then ;
-: sub-op ( x t -- q ) 2dup u2? if 2drop qundef exit then exp-float @ if ['] f- fop2 else q- then ;
+: add-int ( x t -- q ) { x t }
+  x t q+ { r }
+  x q-neg? t q-neg? = r q-neg? x q-neg? <> and if
+    x q-band? 0= t q-band? 0= and if s" +" warn-wrap then
+  then
+  r ;
+: sub-int ( x t -- q ) { x t }
+  x t q- { r }
+  x q-neg? t q-neg? <> r q-neg? x q-neg? <> and if
+    x q-band? 0= t q-band? 0= and if s" -" warn-wrap then
+  then
+  r ;
+: add-op ( x t -- q ) 2dup u2? if 2drop qundef exit then exp-float @ if ['] f+ fop2 else add-int then ;
+: sub-op ( x t -- q ) 2dup u2? if 2drop qundef exit then exp-float @ if ['] f- fop2 else sub-int then ;
 : term1 ( -- q )
   term0
   begin
@@ -101,7 +121,7 @@ decimal
     s" <<" qtxt? if
       2 adv term1 { t } { x }
       x t u2? if qundef else
-        t s" <<" shift-count if { n } x s" <<" safe-bw n qshl bw-result else drop q0 then
+        t s" <<" shift-count if { n } x s" <<" safe-bw { b } b q-zero? 0= if b q-band? 0= if b qnbit n + 255 > if s" <<" warn-wrap then then then b n qshl bw-result else drop q0 then
       then true
     else
     s" >>" qtxt? if

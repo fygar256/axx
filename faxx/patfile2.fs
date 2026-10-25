@@ -96,6 +96,8 @@ create pathbuf 4096 allot
 : warn-nosep ( a u -- )
   mb-reset s"  warning - pattern line has no '::' field separator and can never match (likely a stray line left over from a multi-line comment, or a binary_list/error_patterns continued onto the next physical line without a '\' at the end of the line before): '" mb+ mb+ s" '" mb+ mb-get diag-w ;
 
+defer check-sub-refs ( -- )                       \ .sub の参照の検査 (読み込み時に一度)
+:noname ; is check-sub-refs
 defer echo-validate ( a u -- )                   \ .echo の引数を検査 (誤りは診断)
 :noname 2drop ; is echo-validate
 : pat-line ( a u fa fu ln -- ) { a u fa fu ln }
@@ -183,7 +185,7 @@ defer echo-validate ( a u -- )                   \ .echo の引数を検査 (誤
     s" ' ends while a /* ... */ comment is still open (missing closing '*/')." mb+ mb-get diag-w
   then
   fa fu func-end-file
-  pat-depth @ 0= if pat-func-compile then
+  pat-depth @ 0= if check-sub-refs pat-func-compile then
   rc free throw  tab free throw
   oda pat-dir-a !  odu pat-dir-u ! ;
 ' read-pattern-impl is read-pattern

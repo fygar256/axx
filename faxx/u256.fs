@@ -179,9 +179,12 @@ variable tmp-i
 : qundef ( -- a ) q0 qnot { r } r 3 cells + dup @ 1 rshift swap ! r ;
 : qundef? ( a -- f ) qundef q= ;
 : qabs ( a -- r ) dup q-neg? if qneg then ;
+defer qband-warn ( -- )                         \ 大きな値を未定義由来とみなすときの警告 (一度だけ)
+:noname ; is qband-warn
+: q-band? ( a -- f ) qabs 3 cells + @ 0<> ;      \ u256_in_undef_band
 : qundef-derived? ( a -- f )
   dup qundef? if drop true exit then
-  qabs 3 cells + @ 0<> ;
+  q-band? dup if qband-warn then ;
 
 \ ---- 10 進・16 進の文字列 ----
 : qdivsmall ( a n -- q rem ) { a n } tmp { q } 0 { rem }

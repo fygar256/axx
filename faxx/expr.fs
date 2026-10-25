@@ -108,11 +108,20 @@ defer elf-note-var ( slot q -- )               \ -o の追跡 (変数の読み)
   neg if r qneg else r then ;
 : qd-fin? ( a -- f ) @ 52 rshift 2047 and 2047 <> ;
 : dtxt ( a -- c-addr u )                         \ inf / -inf / nan の綴り
-  dup @ 63 rshift { neg }  dup @ 1 lshift 12 rshift 0= { zm }  drop
+  dup @ 63 rshift { neg }  dup @ $fffffffffffff and 0= { zm }  drop
   zm if neg if s" -inf" else s" inf" then else s" nan" then ;
 
 : u2? ( x t -- f ) qundef? swap qundef? or ;
 : xerr ( a u -- ) diag-e ;
+variable lit-ovf
+variable band-warned
+: qband-warn-impl ( -- ) band-warned @ if exit then  true band-warned !
+  s"  warning - a value whose signed absolute magnitude is >= 2**192 was computed and is being treated as UNDEF-derived; this heuristic cannot distinguish it from a genuine large 256-bit constant (e.g. an all-ones bitmask) because uint256_t has no headroom beyond 256 bits for a true out-of-band sentinel." diag-w ;
+' qband-warn-impl is qband-warn
+variable wrap-warned
+: warn-wrap ( a u -- ) wrap-warned @ if 2drop exit then  true wrap-warned !
+  mb-reset s"  warning - a value overflowed 256 bits in '" mb+ mb+
+  s" ' and was wrapped; axx.py keeps the full precision there, so the two implementations disagree above 2**256 (manual 6.4)." mb+ mb-get diag-wf ;
 : xwarn ( a u -- ) diag-w ;
 
 \ ---- ビット演算の前処理 ----
@@ -137,9 +146,10 @@ defer elf-note-var ( slot q -- )               \ -o の追跡 (変数の読み)
 : expr-false? ( q -- f ) dup qundef? 0= exp-float @ and if qd 0e f= else q-zero? then ;
 
 \ 数値の字面
-: pdec ( -- q ) q0 begin cur digc? while 10 cur 48 - q*small+ drop 1 adv repeat ;
-: phex ( -- q ) q0 begin cur xdig? while 16 cur hexv q*small+ drop 1 adv repeat ;
-: pbin ( -- q ) q0 begin cur dup 48 = swap 49 = or while 2 cur 48 - q*small+ drop 1 adv repeat ;
+: plit-end ( q -- q ) lit-ovf @ if s" literal" warn-wrap then ;
+: pdec ( -- q ) q0 false lit-ovf ! begin cur digc? while 10 cur 48 - q*small+ lit-ovf @ or lit-ovf ! 1 adv repeat plit-end ;
+: phex ( -- q ) q0 false lit-ovf ! begin cur xdig? while 16 cur hexv q*small+ lit-ovf @ or lit-ovf ! 1 adv repeat plit-end ;
+: pbin ( -- q ) q0 false lit-ovf ! begin cur dup 48 = swap 49 = or while 2 cur 48 - q*small+ lit-ovf @ or lit-ovf ! 1 adv repeat plit-end ;
 \ 浮動小数点の字面 (get_floatstr)
 : float-start? ( -- f )
   s" -inf" qtxt-cs? s" inf" qtxt-cs? or s" nan" qtxt-cs? or if true exit then

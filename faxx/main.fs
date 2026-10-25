@@ -500,6 +500,8 @@ defer pass-reset-extra ( passno -- )
   abort-lines ;
 
 \ ---- -b のファイル ----
+defer raw-zero-warn ( -- )                       \ -o と -b を同時に使ったときの警告
+:noname ; is raw-zero-warn
 variable fl-pos
 : flush-raw ( -- )
   has-outfile @ 0= if exit then
@@ -540,7 +542,8 @@ variable fl-pos
   data total fid write-file throw
   fid close-file throw
   data free throw
-  mb-reset s" raw: wrote " mb+ out-file-a @ out-file-u @ mb+ s"  (" mb+ total mb-n s"  bytes)" mb+ mb-get etype ecr ;
+  mb-reset s" raw: wrote " mb+ out-file-a @ out-file-u @ mb+ s"  (" mb+ total mb-n s"  bytes)" mb+ mb-get etype ecr
+  raw-zero-warn ;
 
 \ ---- 出力 (-o と -e/-E) の口 ----
 defer write-elf-obj ( -- )
@@ -653,6 +656,10 @@ create inbuf 1024 allot
     28 of s" No space left on device" endof
     9 of s" Bad file descriptor" endof
     5 of s" Input/output error" endof
+    2 of s" No such file or directory" endof
+    13 of s" Permission denied" endof
+    21 of s" Is a directory" endof
+    30 of s" Read-only file system" endof
     32 of s" Broken pipe" endof
     27 of s" File too large" endof
     122 of s" Disk quota exceeded" endof

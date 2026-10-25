@@ -64,3 +64,56 @@ decimal
 
 \ 1 行 (row) のパターン欄 0 とソース (ms-a ms-u) の照合。成功ならスコアは n-expr n-lit n-sym
 : match-row ( row -- flag ) rf0 0 match-sub ;
+
+\ ---- 読み込み時の .sub 参照の検査 (axx.py の check_sub_refs) ----
+: sub-check-unknown ( ta tu wa wu -- ) { ta tu wa wu }
+  0 { from }
+  begin ta tu from sub-find-ref while
+    { st end na nu va vu }
+    na nu subs om-find 0= if
+      mb-reset s"  error - !S{{" mb+ na nu mb+ s" }} in " mb+ wa wu mb+
+      s" : no sub table named '" mb+ na nu mb+ s" ' (define it with '.sub::" mb+ na nu mb+
+      s"  ... .return')." mb+ mb-get diag-e
+    then
+    end to from
+  repeat ;
+2 om-new constant subchk-mark
+create sub-stk-a 64 cells allot  create sub-stk-u 64 cells allot
+: sub-walk ( na nu depth -- ) { na nu depth }
+  na nu subchk-mark om-find ?dup if
+    @ 2 = if exit then
+    mb-reset s"  error - sub table '" mb+ na nu mb+ s" ' is circular (" mb+
+    depth 0 ?do sub-stk-a i cells + @ sub-stk-u i cells + @ mb+ s"  -> " mb+ loop
+    na nu mb+ s" ); expansion would not terminate." mb+ mb-get diag-e
+    exit
+  then
+  na nu subchk-mark om-put 1 swap !
+  depth 63 < if na depth cells sub-stk-a + !  nu depth cells sub-stk-u + ! then
+  na nu subs om-find ?dup if
+    @ { arr }
+    arr arr-n 2 / 0 ?do
+      arr i 2 * arr-item item-str { pa pu }
+      0 { from }
+      begin pa pu from sub-find-ref while
+        { st end ra ru va vu }
+        ra ru subs om-find if ra ru depth 1+ recurse then
+        end to from
+      repeat
+    loop
+  then
+  na nu subchk-mark om-put 2 swap ! ;
+: check-sub-refs-impl ( -- )
+  nrows @ 0 ?do i rf0 trim dup if i rf0 s" pattern" sub-check-unknown else 2drop then loop
+  subs om-used 0 ?do
+    i subs om-live? if
+      i subs om-key { na nu }
+      na nu subs om-find @ { arr }
+      mb-reset s" sub table '" mb+ na nu mb+ s" '" mb+ mb-get sdup { wa wu }
+      arr arr-n 2 / 0 ?do arr i 2 * arr-item item-str wa wu sub-check-unknown loop
+    then
+  loop
+  subchk-mark om-clear
+  subs om-used 0 ?do
+    i subs om-live? if i subs om-key 0 sub-walk then
+  loop ;
+' check-sub-refs-impl is check-sub-refs

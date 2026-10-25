@@ -425,7 +425,6 @@ sb-new constant cat-b
   x-a @ x-u @ x-i @ x-sup @ x-fa @ x-fu @ x-ln @ { sa su si ss sfa sfu sln }
   a x-a ! u x-u ! 0 x-i ! 0 x-sup ! fa x-fa ! fu x-fu ! ln x-ln !
   0 mp.exprd mp!
-  opt-debug @ if s" EVAL: " etype x-a @ x-u @ etype ecr then
   x-ternary { v }
   x-skip
   x-i @ x-u @ < if

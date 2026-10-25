@@ -6,7 +6,9 @@ decimal
 : dbits>q ( bits -- q ) { bits }                              \ 倍精度のビット列を %.17g 経由で binary128 に
   rr-quad
   bits 52 rshift $7ff and $7ff = if
-    bits $fffffffffffff and 0<> if $7fff800000000000 q128 else
+    bits $fffffffffffff and 0<> if
+      \ caxx.c は "-nan" を数として読めず long double の経路へ落ち、0.5 のビットになる
+      bits 63 rshift 0<> if $3ffe000000000000 q128 else $7fff800000000000 q128 then else
       bits 63 rshift 63 lshift $7fff000000000000 or q128 then
     exit
   then
