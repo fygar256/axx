@@ -116,7 +116,7 @@ sb-new constant rb
     then
   repeat
   a st + en st - rstrip  f ;
-6 constant NFLD
+4096 constant NFLD
 create fld-a NFLD 2 + cells allot
 create fld-u NFLD 2 + cells allot
 variable nflds

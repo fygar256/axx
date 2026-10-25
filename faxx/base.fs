@@ -5,6 +5,20 @@ decimal
 \ ---- 出力 ----
 : etype ( a u -- ) stderr write-file drop ;
 : ecr ( -- ) s\" \n" etype ;
+: errno-text ( n -- a u )
+  case
+    28 of s" No space left on device" endof
+    9 of s" Bad file descriptor" endof
+    5 of s" Input/output error" endof
+    2 of s" No such file or directory" endof
+    13 of s" Permission denied" endof
+    21 of s" Is a directory" endof
+    30 of s" Read-only file system" endof
+    32 of s" Broken pipe" endof
+    27 of s" File too large" endof
+    122 of s" Disk quota exceeded" endof
+    s" Unknown error" rot
+  endcase ;
 : n>s ( n -- a u ) dup >r abs s>d <# #s r> sign #> ;
 : .en ( n -- ) n>s etype ;
 

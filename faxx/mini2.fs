@@ -41,12 +41,12 @@ variable fs-n
 : hdr-ident-end ( a u i -- j ) { a u i }
   begin i u < if a i + c@ mini-name-char? else false then while i 1+ to i repeat i ;
 : skip-sp-from ( a u i -- i' ) { a u i } begin i u < if a i + c@ dup 32 = swap 9 = or else false then while i 1+ to i repeat i ;
-create fh-pn 32 2 * cells allot
+create fh-pn 64 2 * cells allot
 variable fh-np  variable fh-name-a  variable fh-name-u  variable fh-err  variable fh-eu
 
 : fh-add-param ( a u -- )
   strip-st dup 0= if 2drop exit then
-  fh-np @ 32 >= if 2drop exit then
+  fh-np @ 64 >= if 2drop fh-err @ 0= if s"  error - '.func': more than 64 parameters." pstr fh-eu ! fh-err ! then exit then
   pstr fh-np @ 2 * cells fh-pn + s!  1 fh-np +! ;
 : fh-split-params ( a u -- )                  \ カンマで割って strip して空は飛ばす
   { a u } 0 { st }
@@ -407,6 +407,7 @@ variable fr-fa variable fr-fu variable fr-ln
 : func-handle-impl ( ra ru ka ku fa fu ln -- ) { ra ru ka ku fa fu ln }
   fa fr-fa ! fu fr-fu ! ln fr-ln !
   ka ku s" .FUNC" str=cs if
+    fs-n @ 64 >= if s"  error - '.func' nesting is deeper than 64." diag-e exit then
     ra ru parse-func-header
     fs-n @ 0> if fs-top else 0 then fn-register-new
     exit

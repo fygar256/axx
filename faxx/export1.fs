@@ -43,15 +43,15 @@ sb-new constant ex-sb
     then
   loop ;
 : ex-errno ( ior -- n ) dup -512 <= if 512 + negate else drop 2 then ;
+: ex-open-err ( pa pu ior -- ) { pa pu ior }
+  ior ex-errno { en }
+  mb-reset s"  error - cannot write '" mb+ pa pu mb+ s" ': [Errno " mb+ en mb-n s" ] " mb+ en errno-text mb+
+  s" : '" mb+ pa pu mb+ s" '" mb+ mb-get diag-e ;
 : write-export ( pa pu elf -- ok ) { pa pu elf }
   ex-sb sb-clear
   elf ex-sections  elf ex-labels
   pa pu w/o create-file { fid ior }
-  ior 0<> if
-    ior ex-errno { en }
-    mb-reset s"  error - cannot write '" mb+ pa pu mb+ s" ': [Errno " mb+ en mb-n s" ] " mb+ en errno-text mb+
-    s" : '" mb+ pa pu mb+ s" '" mb+ mb-get diag-e false exit
-  then
+  ior 0<> if pa pu ior ex-open-err false exit then
   ex-sb sb$ fid write-file drop
   fid close-file drop
   true ;

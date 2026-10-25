@@ -2,6 +2,7 @@
 
 decimal
 
+defer pat-repr ( a u -- a' u' )                  \ Python の repr (dirs2.fs で束ねる)
 : fld! ( a u i -- ) { a u i } a i cells fld-a + !  u i cells fld-u + ! ;
 
 : store-row ( -- ) nflds @ { n }
@@ -71,18 +72,66 @@ create pathbuf 4096 allot
   dup 0> if over c@ 47 = else false then if 2swap 2drop exit then
   { da du fa fu }
   da pathbuf du move  fa pathbuf du + fu move  pathbuf du fu + ;
-: unquote ( a u -- a' u' ) { a u } 0 0 { k st }
-  begin k u < if a k + c@ 34 <> else false then while k 1+ to k repeat
-  k u >= if a 0 exit then
-  k 1+ to st  st to k
-  begin k u < if a k + c@ 34 <> else false then while k 1+ to k repeat
-  a st + k st - ;
 
-: do-include ( a u -- )
-  unquote dup 0= if
-    2drop s"  error - .INCLUDE directive has no filename." diag-e exit
+\ os.path.pabspath 相当: 相対なら cwd とつなぎ、'.' '..' と重なった '/' をたたむ
+: pabspath ( a u -- a' u' ) { a u }
+  a c@ 47 = u 0> and if a u else 4096 ar-alloc 4096 get-dir s" /" sconcat a u sconcat then { fa fu }
+  fu 2 + ar-alloc { out }  0 0 { n k }
+  begin k fu < while
+    k { st }
+    begin k fu < if fa k + c@ 47 <> else false then while k 1+ to k repeat
+    fa st + k st - { ca cu }
+    k 1+ to k
+    cu 0= if else
+    ca cu s" ." compare 0= if else
+    ca cu s" .." compare 0= if
+      begin n 0> if out n 1- + c@ 47 <> else false then while n 1- to n repeat
+      n 0> if n 1- to n then
+    else
+      47 out n + c!  n 1+ to n  ca out n + cu move  n cu + to n
+    then then then
+  repeat
+  n 0= if 47 out c! 1 to n then
+  out n ;
+: abs-dir ( a u -- da du )                              \ ディレクトリ (末尾の / つき)
+  pabspath 2dup dir-len nip ;
+
+\ 引用符つきの文字列を 1 つ (axx_get_string)。先頭が " でなければ空
+: get-qstr ( a u -- ra ru ) { a u }
+  0 { k }
+  begin k u < if a k + c@ dup 32 = swap 9 = or else false then while k 1+ to k repeat
+  k u >= if 0 0 exit then
+  a k + c@ 34 <> if 0 0 exit then
+  k 1+ to k
+  u 1+ ar-alloc { buf }  0 { n }
+  begin k u < if a k + c@ 34 <> else false then while
+    a k + c@ 92 = k 1+ u < and if
+      a k 1+ + c@ dup 34 = over 92 = or if buf n + c! else
+        dup 110 = if drop 10 buf n + c! else dup 116 = if drop 9 buf n + c! else
+        dup 114 = if drop 13 buf n + c! else
+        drop 92 buf n + c! n 1+ to n a k 1+ + c@ buf n + c! then then then
+      then
+      n 1+ to n  k 2 + to k
+    else a k + c@ buf n + c! n 1+ to n  k 1+ to k then
+  repeat
+  buf n ;
+
+create pat-chain-a 64 cells allot  create pat-chain-u 64 cells allot
+: do-include ( sa su -- )                               \ sa su は .include の行 (キーワードから)
+  { sa su }
+  sa 8 + su 8 - get-qstr { ra ru }
+  ru 0= if
+    sa 8 + su 8 - lstrip { ta tu }
+    0 { k }
+    begin k tu < if ta k + c@ dup 32 <> swap 9 <> and else false then while k 1+ to k repeat
+    k 0> if
+      mb-reset s"  warning - .INCLUDE filename not quoted: '" mb+ ta k mb+ s" '. Please use double quotes." mb+ mb-get diag-w
+      ta k to ru to ra
+    else
+      mb-reset s"  error - .INCLUDE directive has no filename: " mb+ sa su mb+ mb-get diag-e exit
+    then
   then
-  sdup pat-dir-a @ pat-dir-u @ 2swap join-path sdup
+  ra ru sdup pat-dir-a @ pat-dir-u @ 2swap join-path sdup
   1 pat-depth +!  read-pattern  -1 pat-depth +! ;
 
 : word-in? ( a u la lu -- f ) { a u la lu }               \ 空白区切りの語の一覧に a u があるか
@@ -94,7 +143,7 @@ create pathbuf 4096 allot
   false ;
 
 : warn-nosep ( a u -- )
-  mb-reset s"  warning - pattern line has no '::' field separator and can never match (likely a stray line left over from a multi-line comment, or a binary_list/error_patterns continued onto the next physical line without a '\' at the end of the line before): '" mb+ mb+ s" '" mb+ mb-get diag-w ;
+  mb-reset s"  warning - pattern line has no '::' field separator and can never match (likely a stray line left over from a multi-line comment, or a binary_list/error_patterns continued onto the next physical line without a '\' at the end of the line before): " mb+ pat-repr mb+ mb-get diag-w ;
 
 defer check-sub-refs ( -- )                       \ .sub の参照の検査 (読み込み時に一度)
 :noname ; is check-sub-refs
@@ -106,7 +155,7 @@ defer echo-validate ( a u -- )                   \ .echo の引数を検査 (誤
   func-active? ka ku s" .FUNC" str=cs or if ra ru ka ku fa fu ln func-handle exit then
   ka ku s" .ECHO" str=cs if
     in-sub @ if
-      s"  error - '.echo' cannot be written inside '.sub'." diag-e exit
+      mb-reset s"  error - '.echo' cannot be written inside '.sub::" mb+ cur-sub-a @ cur-sub-u @ mb+ s" '." mb+ mb-get diag-e exit
     then
     6 nflds !  6 0 do 0 0 i fld! loop
     s" .echo" 0 fld!
@@ -116,32 +165,46 @@ defer echo-validate ( a u -- )                   \ .echo の引数を検査 (誤
   then
   ra ru lstrip { sa su }
   su 8 >= if sa 8 s" .INCLUDE" str=ci else false then
-  if sa 8 + su 8 - do-include exit then
+  if sa su do-include exit then
   ra ru split-fields
   0 fld@ trim supper { k0a k0u }
   k0a k0u s" .SUB" str=cs if
-    1 fld@ trim 2dup sub-name? 0= nflds @ 2 < or if
-      2drop s"  error - '.sub' needs a table name made of letters, digits and '_'." diag-e
+    nflds @ 1 > if 1 fld@ trim else s" " then { na nu }
+    in-sub @ if
+      mb-reset s"  error - '.sub' inside '.sub::" mb+ cur-sub-a @ cur-sub-u @ mb+ s" ': sub tables cannot be nested." mb+ mb-get diag-e
+    else na nu sub-name? 0= if
+      mb-reset s"  error - '.sub' needs a table name made of letters, digits and '_': '" mb+ na nu mb+ s" '" mb+ mb-get diag-e
     else
-      in-sub @ if
-        2drop s"  error - '.sub' inside a '.sub': sub tables cannot be nested." diag-e
-      else
-        sdup 2dup cur-sub-u ! cur-sub-a !  true in-sub !  sub-new
+      na nu subs om-find if
+        mb-reset s"  warning - sub table '" mb+ na nu mb+ s" ' is defined more than once; the later definition wins." mb+ mb-get diag-w
       then
-    then
+      na nu sdup 2dup cur-sub-u ! cur-sub-a !  true in-sub !  sub-new
+    then then
     exit
   then
   k0a k0u s" .RETURN" str=cs k0a k0u s" .ENDSUB" str=cs or if
-    in-sub @ 0= if s"  error - '.return' without a matching '.sub'." diag-e then
+    in-sub @ 0= if
+      mb-reset s"  error - '" mb+ k0a k0u slower mb+ s" ' without a matching '.sub'." mb+ mb-get diag-e
+    then
     false in-sub !  exit
   then
   in-sub @ if
     nflds @ 2 < if
-      0 fld@ trim nip if s"  error - sub table entry has no '::' field separator." diag-e then
+      0 fld@ trim nip if
+        mb-reset s"  error - sub table " mb+ cur-sub-a @ cur-sub-u @ pat-repr mb+ s" : entry has no '::' field separator: " mb+ 0 fld@ pat-repr mb+ mb-get diag-e
+      then
       exit
     then
     cur-sub-a @ cur-sub-u @  0 fld@  nflds @ 1- fld@  sub-add
     exit
+  then
+  k0a k0u s" .MAP" str=cs if
+    nflds @ 2 > if 1 fld@ trim else s" " then { va vu }
+    vu 0= nflds @ 3 < or if
+      s"  error - .map: needs '.map::<variable>::<name,name,...>[::<expression in the variable>]'." diag-e
+    else va vu var-name? 0= if
+      mb-reset s"  error - .map: variable should be a lower case name ('" mb+ va vu mb+ s" ')." mb+ mb-get diag-e
+    then then
   then
   nflds @ 1 = if
     0 fld@ trim nip if
@@ -149,11 +212,38 @@ defer echo-validate ( a u -- )                   \ .echo の引数を検査 (誤
       0= if 0 fld@ warn-nosep then
     then
   then
+  nflds @ 6 > if
+    mb-reset s"  warning - pattern line has more than 6 fields (extra fields ignored): [" mb+
+    nflds @ 6 do i 6 > if s" , " mb+ then i fld@ pat-repr mb+ loop
+    s" ]" mb+ mb-get diag-w
+  then
   store-row ;
 
+: pat-open-ok ( fa fu -- ok ) { fa fu }
+  pat-depth @ 50 > if
+    mb-reset s"  error - pattern .INCLUDE nesting exceeds 50: '" mb+ fa fu mb+ s" '" mb+ mb-get diag-e false exit
+  then
+  fa fu pabspath sdup { rpa rpu }
+  pat-depth @ 0 ?do
+    i cells pat-chain-a + @ i cells pat-chain-u + @ rpa rpu str=cs if
+      mb-reset s"  error - circular pattern .INCLUDE detected: '" mb+ fa fu mb+ s" ' (already in include chain). Skipped." mb+ mb-get diag-e
+      false unloop exit
+    then
+  loop
+  fa fu r/o open-file { fid ior }
+  ior 0<> if
+    ior -512 <= if ior 512 + negate else 2 then { en }
+    mb-reset s"  error - cannot open pattern file '" mb+ fa fu mb+ s" ': [Errno " mb+ en mb-n s" ] " mb+ en errno-text mb+
+    s" : '" mb+ fa fu mb+ s" '" mb+ mb-get diag-e false exit
+  then
+  fid close-file drop
+  pat-depth @ 64 < if rpa pat-depth @ cells pat-chain-a + !  rpu pat-depth @ cells pat-chain-u + ! then
+  true ;
 : read-pattern-impl ( fa fu -- ) { fa fu } 0 0 0 0 0 0 0 0 0 0 0 { tab n li inc legacy was bare treat rc oda odu }
+  fa fu pat-open-ok 0= if exit then
   pat-dir-a @ to oda  pat-dir-u @ to odu
-  fa fa fu dir-len pat-dir-u !  pat-dir-a !
+  in-sub @ { osub }  cur-sub-a @ { osa }  cur-sub-u @ { osu }  false in-sub !
+  fa fu abs-dir pat-dir-u !  pat-dir-a !
   fa fu load-lines to n to tab
   pat-depth @ 0= if pat-macro-reset pat-func-reset then
   tab n fa fu pat-macro-expand to n to tab
@@ -184,6 +274,11 @@ defer echo-validate ( a u -- )                   \ .echo の引数を検査 (誤
     mb-reset s"  warning - pattern file '" mb+ fa fu mb+
     s" ' ends while a /* ... */ comment is still open (missing closing '*/')." mb+ mb-get diag-w
   then
+  in-sub @ if
+    mb-reset s"  error - pattern file '" mb+ fa fu mb+ s" ' ends while sub table '" mb+ cur-sub-a @ cur-sub-u @ mb+
+    s" ' is still open (missing '.return' or '.endsub')." mb+ mb-get diag-e
+  then
+  osub in-sub !  osa cur-sub-a !  osu cur-sub-u !
   fa fu func-end-file
   pat-depth @ 0= if check-sub-refs pat-func-compile then
   rc free throw  tab free throw

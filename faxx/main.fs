@@ -651,20 +651,6 @@ create inbuf 1024 allot
   then
   write-exports ;
 
-: errno-text ( n -- a u )
-  case
-    28 of s" No space left on device" endof
-    9 of s" Bad file descriptor" endof
-    5 of s" Input/output error" endof
-    2 of s" No such file or directory" endof
-    13 of s" Permission denied" endof
-    21 of s" Is a directory" endof
-    30 of s" Read-only file system" endof
-    32 of s" Broken pipe" endof
-    27 of s" File too large" endof
-    122 of s" Disk quota exceeded" endof
-    s" Unknown error" rot
-  endcase ;
 \ 標準出力へ書けなかったか (caxx.c の最後の fflush と同じ報告)
 : stdout-ok? ( -- f )
   stdout flush-file dup 0= if drop true exit then

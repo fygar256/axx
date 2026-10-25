@@ -52,6 +52,7 @@ sb-new constant rp-b
   repeat
   q rp-b sb-c
   rp-b sb$ sdup ;
+' repr1 is pat-repr
 
 sb-new constant gs-b
 : hex-run ( a u k maxn -- val k' n ) { a u k mx } 0 0 { v n }
