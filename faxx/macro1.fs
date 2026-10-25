@@ -52,8 +52,9 @@ variable mp
   MACRO-MAX-INC 2 * cells allocate throw m mp.inca + !
   true m mp.enabled + !
   m ;
-false mp-new constant mp-src
-true mp-new constant mp-pat
+variable mp-src-v  variable mp-pat-v
+: mp-src ( -- m ) mp-src-v @ ?dup if exit then false mp-new dup mp-src-v ! ;
+: mp-pat ( -- m ) mp-pat-v @ ?dup if exit then true mp-new dup mp-pat-v ! ;
 : mp@ ( off -- v ) mp @ + @ ;
 : mp! ( v off -- ) mp @ + ! ;
 : mp-pat? ( -- f ) mp.pat mp@ ;
