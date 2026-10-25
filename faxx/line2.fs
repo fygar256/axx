@@ -74,16 +74,16 @@ defer cand-end-fail ( -- )
   textmode @ if passthru-line exit then
   nip nip nip nip l2-done ;
 
-MAXROWS cells allocate throw constant dirorder
+MAXROWS cells lazy dirorder
 variable dirorder-n
 
 \ ---- パターン索引 ----
-MAXROWS cells allocate throw constant pn-next
-MAXROWS cells allocate throw constant palways
+MAXROWS cells lazy pn-next
+MAXROWS cells lazy palways
 variable npalways
 2 om-new constant pidx                         \ 先頭大文字列 -> [開いた先頭 row+1][閉じた先頭 row+1]
 variable pmaxkey
-MAXROWS cells allocate throw constant cand
+MAXROWS cells lazy cand
 variable ncand
 
 : pfx-word? ( c -- f ) dup alnc? swap 95 = or ;

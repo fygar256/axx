@@ -4,7 +4,7 @@ decimal
 
 \ ---- 値の領域 (.call ごとに捨てる) ----
 134217728 constant MIA-SIZE
-MIA-SIZE allocate throw constant mia
+MIA-SIZE lazy mia
 variable mia-top
 : mi-alloc ( n -- a ) 7 + -8 and mia-top @ over + MIA-SIZE > abort" mini memory full"
   mia-top @ mia + swap mia-top +! ;
@@ -54,7 +54,7 @@ variable nframes
 create fr-vars 130 cells allot
 create fr-nl 130 cells allot
 create fr-func 130 cells allot
-QB MAX-EMIT * allocate throw constant mout
+QB MAX-EMIT * lazy mout
 create mout-str 1 cells allot                 \ (未使用)
 variable nout
 1 om-new constant mini-suspects

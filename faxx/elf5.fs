@@ -10,7 +10,7 @@ decimal
 \ ---- 参照の記録 ----
 8 cells constant REFSZ
 16384 constant MAXREFS
-MAXREFS REFSZ * allocate throw constant refs
+MAXREFS REFSZ * lazy refs
 variable nrefs
 : ref@ ( i -- addr ) REFSZ * refs + ;
 \ 参照: [0]=name-a [1]=name-u [2]=widx [3]=未使用 [4..7]=q
@@ -28,12 +28,12 @@ variable nrefs
 \ ---- ヒント ----
 8 cells constant HSZ
 4096 constant MAXH
-MAXH HSZ * allocate throw constant hints
+MAXH HSZ * lazy hints
 variable nhints
 : hint@ ( i -- addr ) HSZ * hints + ;
 \ [0]=kind (0 型つき / 1 'v' / 2 'd') [1]=widx [2]=a1 [3]=a2 [4]=a3 [5..]=q は別領域に
 \ q は 4 セル必要なので 2 つの表に分ける
-MAXH QB * allocate throw constant hintq
+MAXH QB * lazy hintq
 : hint-find ( kind widx -- idx|-1 ) { k w }
   nhints @ 0 ?do
     i hint@ { e }
@@ -329,10 +329,10 @@ variable nfr
 ' trk-pop-i is trk-pop
 
 \ ---- 最良の候補の写し ----
-MAXREFS REFSZ * allocate throw constant best-refs
+MAXREFS REFSZ * lazy best-refs
 variable best-nrefs  variable best-base-r
-MAXH HSZ * allocate throw constant best-hints
-MAXH QB * allocate throw constant best-hintq
+MAXH HSZ * lazy best-hints
+MAXH QB * lazy best-hintq
 variable best-nhints  variable best-base-h
 create best-kind NVARS cells allot
 create best-ptr  NVARS cells allot

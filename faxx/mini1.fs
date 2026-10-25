@@ -14,7 +14,7 @@ decimal
 \ 種類: 0 end 1 num 2 name 3 dot 4 core 5 str 6 op
 7 cells constant TKSZ
 4096 constant MAXTOK
-MAXTOK TKSZ * allocate throw constant toks
+MAXTOK TKSZ * lazy toks
 variable ntok
 variable ps-fa  variable ps-fu  variable ps-ln              \ 診断に出す位置
 

@@ -77,11 +77,11 @@ sb-new constant ul-b
     then
   repeat ;
 
-MAXROWS cells allocate throw constant u-firstv
-MAXROWS cells allocate throw constant u-symv
-MAXROWS cells allocate throw constant u-restv
-MAXROWS cells allocate throw constant u-ordv
-MAXROWS allocate throw constant u-donev
+MAXROWS cells lazy u-firstv
+MAXROWS cells lazy u-symv
+MAXROWS cells lazy u-restv
+MAXROWS cells lazy u-ordv
+MAXROWS lazy u-donev
 variable nu-first  variable nu-syms  variable nu-rest  variable nu-ord
 variable u-cur
 2 om-new constant u-definer

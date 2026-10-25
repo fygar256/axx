@@ -67,7 +67,8 @@ decimal
 
 \ ---- 領域 (一時の文字列用。mark / release で巻き戻す) ----
 134217728 constant ARENA-SIZE
-ARENA-SIZE allocate throw constant arena
+: lazy ( size "name" -- ) create 0 , , does> dup @ ?dup if nip exit then dup cell+ @ allocate throw dup rot ! ;
+ARENA-SIZE lazy arena
 variable ar-top
 : ar-alloc ( n -- a )
   ar-top @ over + ARENA-SIZE > abort" arena full"

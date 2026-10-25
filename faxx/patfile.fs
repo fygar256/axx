@@ -133,7 +133,7 @@ variable nflds
 \ ---- パターン行の表 ----
 65536 constant MAXROWS
 16 cells constant ROWSZ
-MAXROWS ROWSZ * allocate throw constant prows
+MAXROWS ROWSZ * lazy prows
 variable nrows
 : row ( i -- a ) ROWSZ * prows + ;
 : rf ( i k -- a u ) swap row swap 2* cells + s@ ;     \ k 番目の欄 (0..5)

@@ -3,7 +3,7 @@
 decimal
 
 8192 constant MAXOBJ
-MAXOBJ QB * allocate throw constant objl
+MAXOBJ QB * lazy objl
 variable nobj
 : obj+ ( q -- ) nobj @ MAXOBJ >= abort" binary_list too long" objl nobj @ QB * + q!  1 nobj +! ;
 : obj-q ( i -- q ) QB * objl + ;

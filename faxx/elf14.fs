@@ -157,7 +157,7 @@ create dw-fa 4096 cells allot  create dw-fu 4096 cells allot
   a u intern dw-nfiles @ cells dw-fu + ! dw-nfiles @ cells dw-fa + !
   1 dw-nfiles +!  dw-nfiles @ ;
 
-262144 cells allocate throw constant dw-rows  variable dw-nrows
+262144 cells lazy dw-rows  variable dw-nrows
 : dw-woff ( name-a name-u wpc -- n ) addr>woff 0= if 0 then ;
 
 : dw-line-sec ( s -- ) { s }                              \ s = セクション番号 (1 始まり)

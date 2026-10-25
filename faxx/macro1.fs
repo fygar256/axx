@@ -4,7 +4,7 @@ decimal
 
 \ ---- 領域 (パスごとに捨てる) ----
 268435456 constant MM-SIZE
-MM-SIZE allocate throw constant mm
+MM-SIZE lazy mm
 variable mm-top
 : mm-alloc ( n -- a ) 7 + -8 and mm-top @ over + MM-SIZE > abort" macro memory full"
   mm-top @ mm + swap mm-top +! ;

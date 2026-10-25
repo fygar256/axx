@@ -198,8 +198,8 @@ variable av-n
 
 variable imp-sec-n
 create imp-sec-a 4096 cells allot  create imp-sec-u 4096 cells allot
-4096 QB * allocate throw constant imp-sec-s
-4096 QB * allocate throw constant imp-sec-z
+4096 QB * lazy imp-sec-s
+4096 QB * lazy imp-sec-z
 
 defer reloc-named ( a u -- n )             \ 名前から再配置の型。分からなければ -1
 :noname 2drop -1 ; is reloc-named
@@ -271,8 +271,8 @@ create tf-a 8 cells allot   create tf-u 8 cells allot
 4 om-new constant pass1-final
 6 om-new constant pcs-prev
 variable pcs-prev-valid
-65536 cells allocate throw constant hist-h
-65536 cells allocate throw constant hist-i
+65536 cells lazy hist-h
+65536 cells lazy hist-i
 variable hist-n
 : hist-find ( h -- iter|0 ) { h }
   hist-n @ 0 ?do i cells hist-h + @ h = if i cells hist-i + @ unloop exit then loop 0 ;

@@ -2,9 +2,9 @@
 
 decimal
 
-MAXOBJ QB * allocate throw constant vbuf
+MAXOBJ QB * lazy vbuf
 variable vbuf-n
-64 QB * allocate throw constant vidx
+64 QB * lazy vidx
 variable vidx-n
 
 : vb-append ( -- )
