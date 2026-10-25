@@ -7,7 +7,7 @@ gforth faxx.fs patfile/z80.axx asmsrc/z80.s -b z80.bin
 gforth faxx.fs patfile/x86_64.axx asmsrc/hello.s -o hello.o -g
 ```
 
-`faxx.fs` は `faxx/load.fs`（部品の読み込み順）を読んで `main` を呼ぶだけの入口です。`axx.fs` は最初に作った中核だけの版で、そのまま残してあります。
+`faxx.fs` は `faxxsrc/load.fs`（部品の読み込み順）を読んで `main` を呼ぶだけの入口です。`axx.fs` は最初に作った中核だけの版で、そのまま残してあります。
 
 ## 移した範囲
 

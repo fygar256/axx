@@ -1,9 +1,9 @@
 #!/bin/sh
 # faxx を ccforth (Forth→C コンパイラ。https://github.com/ncw/ccforth) でコンパイルして実行ファイルにする。
-#   ./build_ccforth.sh [出力ファイル名 (既定: faxx.bin)]
+#   ./build_ccforth.sh [出力ファイル名 (既定: faxx)]
 # 必要なもの: ccforth (環境変数 CCFORTH で場所を指定。既定は PATH 上の ccforth)、C コンパイラ (cc / gcc / clang)
-# 実行ファイルは gforth faxx.fs と同じ引数を取る:  ./faxx.bin patfile/z80.axx asmsrc/z80.s -b z80.bin
-OUT=${1:-faxx.bin}
+# 実行ファイルは gforth faxx.fs と同じ引数を取る:  ./faxx patfile/z80.axx asmsrc/z80.s -b z80.bin
+OUT=${1:-faxx}
 case "$OUT" in /*) ;; *) OUT=$(pwd)/$OUT ;; esac
 CCF=${CCFORTH:-ccforth}
 CC=${CC:-cc}
@@ -11,8 +11,8 @@ MEMSIZE=${MEMSIZE:-67108864}
 R=$(cd "$(dirname "$0")" && pwd)
 T=$(mktemp -d) || exit 1
 trap 'rm -rf "$T"' EXIT
-cd "$R/faxx" || exit 1
-# 1) Forth → C。ccforth の取り込み (included) はカレントディレクトリからなので faxx/ で動かす
+cd "$R/faxxsrc" || exit 1
+# 1) Forth → C。ccforth の取り込み (included) はカレントディレクトリからなので faxxsrc/ で動かす
 $CCF -c -entry cc-start -memsize $MEMSIZE faxx-cc.fs > "$T/out.c" || exit 1
 # 2) ccforth の出力を 2 か所直す: メモリの大きさ (MEM_SIZE) と、使う前に宣言されていない _alloc_ptrs
 python3 - "$T/out.c" $MEMSIZE <<'PY' || exit 1
