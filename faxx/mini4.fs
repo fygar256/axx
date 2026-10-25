@@ -269,6 +269,36 @@ defer mini-arg-one ( a u k name-a name-u in-array -- v k' )
 
 \ ---- .call の実行 ----
 variable mc-k
+: mi-call-args ( ta tu na nu -- args n ok ) { ta tu na nu }
+  0 mia-top !
+  64 cells mi-alloc { args }  0 0 { n ai }
+  begin
+    ta tu ai skip-sp-from to ai
+    ai tu <
+  while
+    ta ai + c@ 44 = if ai 1+ to ai else
+      ta tu ai na nu false mini-arg-one { v i2 }
+      v 0= if args n false exit then
+      n 64 < if v args n cells + ! n 1+ to n then
+      i2 to ai
+      ta tu ai skip-sp-from to ai
+      ai tu < if ta ai + c@ 44 = if ai 1+ to ai else tu to ai then then
+    then
+  repeat
+  args n true ;
+: mi-call-finish ( ret n0 semi drp nk -- k' ) { ret n0 semi drp nk }
+  nout @ 0 ?do mout i QB * + obj+ loop
+  ret if
+    ret v-arr? if
+      ret ma-len 0 ?do
+        ret i ma-ref { el }
+        el v-str? if el v-str 0 ?do dup i + c@ obj-byte loop drop else el v-q obj+ then
+      loop
+    else ret v-str? if ret v-str 0 ?do dup i + c@ obj-byte loop drop else ret v-q obj+ then then
+  then
+  nobj @ n0 - { cnt }
+  drp cnt 1 = semi and if n0 obj-q q-zero? else false then or if n0 nobj ! then
+  nk ;
 : mini-call-impl ( a u k semi drp -- k' ) { a u k semi drp }
   k 5 + to k
   a u k skip-sp-from to k
@@ -289,39 +319,12 @@ variable mc-k
     mb-reset s"  error - '.call': no function named " mb+ na nu repr1 mb+ s"  (define it with '.func::" mb+ na nu mb+ s" :: ... .endfunc')." mb+ mini-diag nk exit
   then
   @ { fn }
-  0 mia-top !
-  64 cells mi-alloc { args }  0 { n }
-  0 { ai }
-  begin
-    ta tu ai skip-sp-from to ai
-    ai tu <
-  while
-    ta ai + c@ 44 = if ai 1+ to ai else
-      ta tu ai na nu false mini-arg-one { v i2 }
-      v 0= if nk exit then
-      n 64 < if v args n cells + ! n 1+ to n then
-      i2 to ai
-      ta tu ai skip-sp-from to ai
-      ai tu < if ta ai + c@ 44 = if ai 1+ to ai else tu to ai then then
-    then
-  repeat
+  ta tu na nu mi-call-args { args n ok }
+  ok 0= if nk exit then
   nobj @ { n0 }
   fn args n ['] mini-run catch dup X-MINI = if
     drop mb-reset s"  error - " mb+ merr-buf merr-u @ mb+ mini-diag nk exit
   then
   throw
-  { ret }
-  \ 出力語を objl へ
-  nout @ 0 ?do mout i QB * + obj+ loop
-  ret if
-    ret v-arr? if
-      ret ma-len 0 ?do
-        ret i ma-ref { el }
-        el v-str? if el v-str 0 ?do dup i + c@ obj-byte loop drop else el v-q obj+ then
-      loop
-    else ret v-str? if ret v-str 0 ?do dup i + c@ obj-byte loop drop else ret v-q obj+ then then
-  then
-  nobj @ n0 - { cnt }
-  drp cnt 1 = semi and if n0 obj-q q-zero? else false then or if n0 nobj ! then
-  nk ;
+  n0 semi drp nk mi-call-finish ;
 ' mini-call-impl is mini-call
