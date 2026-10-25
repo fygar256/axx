@@ -26,7 +26,7 @@ decimal
   0 0 parse-block drop exec-block
   mp.incn mp@ 1- mp.incn mp!
   stab pl-tab ! sn pl-n ! ;
-' m-do-include-impl is m-do-include
+bind m-do-include-impl m-do-include
 
 \ ---- 展開の前判定 ----
 : has-interp? ( a u -- f ) { a u }
@@ -90,13 +90,13 @@ decimal
 
 \ ---- ソース側・パターン側のフック ----
 : src-mexpand ( tab n fa fu -- tab' n' ) mp-src mp !  mac-expand ;
-' src-mexpand is macro-expand
+bind src-mexpand macro-expand
 : src-mreset ( -- ) mp-src mp !  mm-reset  reset-pass-mp ;
-' src-mreset is macro-reset-pass
+bind src-mreset macro-reset-pass
 : pat-mexpand ( tab n fa fu -- tab' n' ) mp-pat mp !  mac-expand ;
-' pat-mexpand is pat-macro-expand
+bind pat-mexpand pat-macro-expand
 : pat-mreset ( -- ) mp-pat mp !  mm-reset  reset-pass-mp ;
-' pat-mreset is pat-macro-reset
+bind pat-mreset pat-macro-reset
 
 \ ---- -P / -p ----
 : mx-out ( tab n da du -- ok ) { tab n da du }
@@ -122,4 +122,4 @@ decimal
   tab n fa fu mac-expand { t2 n2 }
   mp.hadErr mp@ had-error @ or if false exit then
   t2 n2 da du mx-out ;
-' macro-expand-only-impl is macro-expand-only
+bind macro-expand-only-impl macro-expand-only

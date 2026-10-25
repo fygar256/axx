@@ -30,7 +30,7 @@ variable bi-fa variable bi-fu variable bi-ln
   false { zonly }
   b 0= if 10 to b a c@ 48 = u 0> and to zonly then
   0 0 false false { acc nd lastus ov }
-  neg if $8000000000000000 else $7fffffffffffffff then { lim }
+  neg if -1 63 lshift else $7fffffffffffffff then { lim }
   prefixed u 0> and if a c@ 95 = if a 1+ to a u 1- to u true to lastus then then
   false { brk }
   begin u 0> brk 0= and while
@@ -57,7 +57,7 @@ variable bi-fa variable bi-fu variable bi-ln
   ov if 0 2 exit then
   neg if acc negate else acc then 0 ;
 
-sb-new constant bi-b
+lazy-sb bi-b
 : bi-hex ( args n -- v ) { args n }
   n 1 2 s" hex" bi-check
   args 0 arg@ { v0 }  v0 mv-str? if bi-err-head s" hex() needs an integer" mb+ mfail then
@@ -121,7 +121,7 @@ sb-new constant bi-b
     n 1 1 s" abs" bi-check
     args 0 arg@ mv-str? if bi-err-head s" abs() needs an integer" mb+ mfail then
     args 0 arg@ mv-n { v }
-    v $8000000000000000 = if bi-err-head s" macro expression: integer overflow (64-bit) in abs()" mb+ mfail then
+    v -1 63 lshift = if bi-err-head s" macro expression: integer overflow (64-bit) in abs()" mb+ mfail then
     v abs mv-int true exit
   then
   na nu s" min" str=cs if n 1 64 s" min" bi-check args n true bi-minmax true exit then
@@ -139,12 +139,12 @@ sb-new constant bi-b
   a u asm-label { kind val }
   kind 0<> if val mv-int exit then
   x-fa @ x-fu @ x-ln @ mfail-pos s" undefined macro variable '" mb+ a u mb+ s" '" mb+ mfail 0 ;
-' m-lookup-impl is m-lookup
+bind m-lookup-impl m-lookup
 : m-defined-impl ( a u -- f ) { a u }
   a u func-find if true exit then
   mp.scopen mp@ 0 ?do a u mp.scopes mp@ i cells + @ om-find if true unloop exit then loop
   a u asm-label nip 2 = ;
-' m-defined-impl is m-defined?
+bind m-defined-impl m-defined?
 
 defer m-loc-impl
 : m-loc-counter-impl ( -- n )
@@ -157,7 +157,7 @@ defer m-loc-impl
   { sl } sl @ { arr } sl cell+ @ { cnt }
   mp.outn mp@ { i }
   i 0>= i cnt < and if arr i cells + @ else 0 then ;
-' m-loc-counter-impl is m-loc-counter
+bind m-loc-counter-impl m-loc-counter
 
 \ ---- 実行 ----
 defer exec-block ( blk -- )
@@ -217,7 +217,7 @@ variable mx-ctl-dummy
     s" ) but was called from inside an expression, where there is nowhere to put it" mb+ mfail
   then
   v ;
-' m-call-value-impl is m-call-value
+bind m-call-value-impl m-call-value
 
 \ ---- 書式 ----
 variable f-fill  variable f-align  variable f-sign  variable f-hasfill  variable f-zco  variable f-alt
@@ -258,7 +258,7 @@ variable f-zero  variable f-width  variable f-group  variable f-hasprec  variabl
   p u = ;
 
 : utf8-len ( a u -- n ) 0 -rot 0 ?do dup i + c@ $c0 and $80 <> if swap 1+ swap then loop drop ;
-sb-new constant fp-b
+lazy-sb fp-b
 : fmt-pad ( ha hu ba bu defalign -- a u ) { ha hu ba bu da }
   ha hu utf8-len ba bu utf8-len + { total }
   f-align @ ?dup 0= if da then { al }
@@ -273,8 +273,8 @@ sb-new constant fp-b
   else pad 0 ?do f-fill @ fp-b sb-c loop ha hu fp-b sb+ ba bu fp-b sb+ then then then
   fp-b sb$ ;
 
-sb-new constant fd-b
-sb-new constant fg-b
+lazy-sb fd-b
+lazy-sb fg-b
 : group-len ( n iv -- m ) { n iv } n n 1- iv / + ;
 : fmt-int ( n -- a u ok ) { iv }
   f-type @ ?dup 0= if 100 then { type }
@@ -385,7 +385,7 @@ sb-new constant fg-b
     v mv-str? if v mv-s repr1 mb+ else v mv-n mb-n then mfail
   then ;
 
-sb-new constant ip-b
+lazy-sb ip-b
 : m-interpolate ( ta tu fa fu ln -- a u ) { ta tu fa fu ln }
   ta tu s" !{" search nip nip 0= if ta tu exit then
   ip-b sb-clear
@@ -521,11 +521,11 @@ defer m-do-include ( v fa fu ln -- )
     N-INCLUDE of nd 0 nf s@ fa fu ln m-eval fa fu ln m-do-include endof
   endcase ;
 
-: exec-node ( nd -- ) depth 1- >r exec-node0 begin depth r@ > while drop repeat r> drop ;
+: exec-node ( nd -- ) depth 1- { d0 } exec-node0 begin depth d0 > while drop repeat ;
 : exec-block-impl ( b -- ) { b }
   b blk-n 0 ?do
     b i blk-node exec-node
     ctl@ 0<> if leave then
   loop ;
-' exec-block-impl is exec-block
+bind exec-block-impl exec-block
 

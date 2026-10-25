@@ -10,7 +10,7 @@ decimal
   cp 18 rshift 240 or sb sb-c  cp 12 rshift 63 and 128 or sb sb-c
   cp 6 rshift 63 and 128 or sb sb-c  cp 63 and 128 or sb sb-c ;
 
-sb-new constant rp-b
+lazy-sb rp-b
 : utf8-seq-len ( a u -- n )                           \ 先頭の UTF-8 文字のバイト数 (不正なら 1)
   { a u }
   u 0= if 0 exit then
@@ -52,9 +52,9 @@ sb-new constant rp-b
   repeat
   q rp-b sb-c
   rp-b sb$ sdup ;
-' repr1 is pat-repr
+bind repr1 pat-repr
 
-sb-new constant gs-b
+lazy-sb gs-b
 : hex-run ( a u k maxn -- val k' n ) { a u k mx } 0 0 { v n }
   begin k u < n mx < and if a k + c@ xdig? else false then while
     v 16 * a k + c@ hexv + to v  k 1+ to k  n 1+ to n

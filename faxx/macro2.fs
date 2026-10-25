@@ -379,4 +379,4 @@ variable pd-na  variable pd-nu
     s" unexpected end of file: a macro block opened with '{' is never closed" mb+ mfail
   then
   m bt-finish i ;
-' parse-block-impl is parse-block
+bind parse-block-impl parse-block

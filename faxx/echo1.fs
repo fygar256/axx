@@ -103,7 +103,7 @@ variable ep-n  variable ep-arr
     mb-reset s"  error - '.echo': " mb+ echo-ma @ echo-mu @ mb+ mb-get diag-e
   then
   mk ar-release ;
-' echo-check is echo-validate
+bind echo-check echo-validate
 
 \ 裸の名前か (bare_name_of)
 : bare-name? ( a u -- f ) ws-trim { a u }
@@ -149,4 +149,4 @@ variable ep-n  variable ep-arr
   out sb$ etype ecr
   out sb-free
   mk ar-release ;
-' dir-echo-impl is dir-echo
+bind dir-echo-impl dir-echo

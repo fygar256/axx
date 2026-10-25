@@ -57,7 +57,7 @@ variable ps-fa  variable ps-fu  variable ps-ln              \ 診断に出す位
   repeat
   v j ;
 
-sb-new constant ms-sb
+lazy-sb ms-sb
 : mini-escape ( c -- c' true | false )
   dup 92 = if drop 92 true exit then
   dup 34 = if drop 34 true exit then
@@ -233,7 +233,7 @@ defer xp-unary
     xp-enter xp-unary opc swap xp-un -1 xp-depth +! exit
   then
   xp-power ;
-' xp-unary-impl is xp-unary
+bind xp-unary-impl xp-unary
 : xp-mul ( -- e ) xp-unary
   begin s" *" xp-at-op? s" /" xp-at-op? or s" %" xp-at-op? or while
     xp-peek-s drop c@ { c } 1 xp-i +!
@@ -272,7 +272,7 @@ defer xp-unary
 : xp-or-impl ( -- e ) xp-enter xp-and
   begin s" ||" xp-at-op? while 1 xp-i +! 1 swap xp-and xp-bin repeat
   -1 xp-depth +! ;
-' xp-or-impl is xp-or
+bind xp-or-impl xp-or
 
 : xp-start ( from -- ) xp-i ! 0 xp-depth ! ;
 : xp-parse-all ( -- e )                         \ 式を 1 個。余りがあれば構文エラー

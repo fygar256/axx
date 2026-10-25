@@ -2,7 +2,7 @@
 
 decimal
 
-sb-new constant ex-sb
+lazy-sb ex-sb
 : ex-hexq ( q -- ) false q>hex { a u }                  \ Python の {x:#x}
   a c@ 45 = if s" -0x" ex-sb sb+ a 1+ u 1- ex-sb sb+ else s" 0x" ex-sb sb+ a u ex-sb sb+ then ;
 : ex-hex ( n -- ) qn ex-hexq ;
@@ -59,7 +59,7 @@ sb-new constant ex-sb
   o-exp-u @ if o-exp-a @ o-exp-u @ false write-export 0= if false exit then then
   o-expe-u @ if o-expe-a @ o-expe-u @ true write-export 0= if false exit then then
   true ;
-' write-exports-impl is write-exports
+bind write-exports-impl write-exports
 
 \ -o と -b を同時に使ったときの警告 (axx.py write の _zeroed)
 : raw-zero-warn-impl ( -- )
@@ -82,4 +82,4 @@ sb-new constant ex-sb
   mb-reset s"  warning - " mb+ nz mb-n s"  field(s) were left 0 for the linker (" mb+ wa wu mb+
   s" ); this raw binary is only correct after linking " mb+ o-obj-a @ o-obj-u @ mb+
   s" . Drop -o to have axx fill them in." mb+ mb-get diag-wf ;
-' raw-zero-warn-impl is raw-zero-warn
+bind raw-zero-warn-impl raw-zero-warn

@@ -6,7 +6,7 @@ decimal
 12 cells constant RLSZ
 variable rl-base  variable rl-n  variable rl-cap
 : rl-init ( -- ) 256 rl-cap !  rl-cap @ RLSZ * allocate throw rl-base !  0 rl-n ! ;
-rl-init
+[undefined] cc-forth [if] rl-init [then]
 : rl-reset ( -- ) 0 rl-n ! ;
 : rl@ ( i -- addr ) RLSZ * rl-base @ + ;
 \ 0=sec-a 1=sec-u 2=off 3=name-a 4=name-u 5=rtype 6..9=addend(q) 10=nbytes 11=fmask

@@ -17,25 +17,25 @@ decimal
     w epc >= if cum w epc - + true exit then
   then
   false ;
-' sec-rel-offset-impl is sec-rel-offset
+bind sec-rel-offset-impl sec-rel-offset
 
 : elf-sectioned-impl ( -- f ) o-obj-u @ 0<> o-expe-u @ 0<> or ;
-' elf-sectioned-impl is elf-sectioned?
+bind elf-sectioned-impl elf-sectioned?
 
 : lab-sec-adjust-impl ( q a u -- q' ) { q a u }
   elf-sectioned? 0= if q exit then
   a u q q>n sec-rel-offset-impl if qn else q then ;
-' lab-sec-adjust-impl is lab-sec-adjust
+bind lab-sec-adjust-impl lab-sec-adjust
 
 : sec-rel-pc-impl ( q -- q' ) { q }
   elf-sectioned? 0= if q exit then
   cur-section q q>n sec-rel-offset-impl if qn else q then ;
-' sec-rel-pc-impl is sec-rel-pc
+bind sec-rel-pc-impl sec-rel-pc
 
 \ ---- シンボル属性 ----
-7 om-new constant sym-attrs        \ 名前 -> type size_set size other weak common align
-1 om-new constant extern-untyped
-7 om-new constant export-labels    \ 名前 -> q(4) sec-a sec-u equ
+7 lazy-om sym-attrs        \ 名前 -> type size_set size other weak common align
+1 lazy-om extern-untyped
+7 lazy-om export-labels    \ 名前 -> q(4) sec-a sec-u equ
 0 constant SA-TYPE   1 constant SA-SIZE-SET   2 constant SA-SIZE   3 constant SA-OTHER
 4 constant SA-WEAK   5 constant SA-COMMON     6 constant SA-ALIGN
 : sym-attr-slot ( a u -- slot ) sym-attrs om-put ;
@@ -483,4 +483,4 @@ variable cfi-opa variable cfi-opu variable cfi-nv
   ua uu s" .OTHER" str=cs if l2a l2u dir-other true exit then
   ua uu s" .COMM" str=cs if l2a l2u dir-comm true exit then
   false ;
-' elf-src-dir-impl is elf-src-dir
+bind elf-src-dir-impl elf-src-dir

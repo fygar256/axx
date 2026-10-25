@@ -147,4 +147,4 @@ variable vidx-n
   loop
   done 0= if s"  error - No vliw instruction-set defined." diag-e false exit then
   ok ;
-' vliw-process-impl is vliw-process
+bind vliw-process-impl vliw-process

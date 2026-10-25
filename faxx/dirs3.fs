@@ -7,13 +7,13 @@ defer dir-clrreloc ( row -- )
 defer dir-echo ( row -- )
 defer dir-elf ( row mode -- )
 defer dir-pat-clear-extra ( a u -- )              \ .free が reloc 系も消すための口
-:noname drop ; is dir-reloc
-:noname drop ; is dir-clrreloc
-:noname drop ; is dir-echo
-:noname 2drop ; is dir-elf
-:noname 2drop ; is dir-pat-clear-extra
+: dir-reloc-nn1 drop ; bind dir-reloc-nn1 dir-reloc
+: dir-clrreloc-nn2 drop ; bind dir-clrreloc-nn2 dir-clrreloc
+: dir-echo-nn3 drop ; bind dir-echo-nn3 dir-echo
+: dir-elf-nn4 2drop ; bind dir-elf-nn4 dir-elf
+: dir-pat-clear-extra-nn5 2drop ; bind dir-pat-clear-extra-nn5 dir-pat-clear-extra
 
-2 om-new constant chk-cache                       \ 変数 + 欄 -> [世代][arr]
+2 lazy-om chk-cache                       \ 変数 + 欄 -> [世代][arr]
 : exec-check-inner ( row -- ) { r }
   r 1 rf trim nip if r 1 rf r 2 rf else
     r 2 rf trim nip if r 2 rf s" " else
@@ -46,7 +46,7 @@ defer dir-pat-clear-extra ( a u -- )              \ .free が reloc 系も消す
   else 2drop chk-clear-all then ;
 
 \ ---- .map ----
-sb-new constant ms-b
+lazy-sb ms-b
 : word-ch? ( c -- f ) corec? ;
 : map-subst ( a u va vu n -- a' u' ) { a u va vu n }
   ms-b sb-clear

@@ -31,7 +31,7 @@ variable join-cont  true join-cont !
   lp @ over - true ;
 : count-lines ( a u -- n ) 0 -rot bounds ?do i c@ dup 10 = swap 13 = or if 1+ then loop 1+ ;
 
-sb-new constant pend-b
+lazy-sb pend-b
 : ends-bs? ( a u -- f ) dup 0> if + 1- c@ 92 = else 2drop false then ;
 
 \ ファイルを読み、行末の \ で続く行を結んだ表を返す (結んだぶんの行は空行で残す)
@@ -58,7 +58,7 @@ sb-new constant pend-b
 : load-lines ( fa fu -- tab n ) 2dup slurp-file 2swap text-lines ;
 
 \ ---- コメント除去 ----
-sb-new constant cb
+lazy-sb cb
 : quoted-span ( a u i -- n ) { a u i } 0 { j }
   a i + c@ { c }
   c 92 = i 1+ u < and if a i 1+ + c@ 34 = if 2 exit then then
@@ -91,7 +91,7 @@ sb-new constant cb
   repeat
   cb sb$ inc ;
 
-sb-new constant rb
+lazy-sb rb
 : reduce-spaces ( a u -- a' u' ) { a u } false { inws }
   rb sb-clear
   u 0 ?do
@@ -120,8 +120,9 @@ sb-new constant rb
 create fld-a NFLD 2 + cells allot
 create fld-u NFLD 2 + cells allot
 variable nflds
+: fld-at ( i -- a u ) { i } fld-a i cells + @  fld-u i cells + @ ;
 : fld@ ( i -- a u )
-  dup nflds @ < if cells >r fld-a r@ + @  fld-u r> + @ else drop 0 0 then ;
+  dup nflds @ < if fld-at else drop 0 0 then ;
 : split-fields ( a u -- ) { a u } 0 { idx }
   0 nflds !
   begin

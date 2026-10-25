@@ -283,7 +283,7 @@ decimal
   then ;
 
 : expr-top ( -- q ) skipsp term11 ;
-' expr-top is expr
+bind expr-top expr
 
 \ ---- 入口 ----
 : ev-ctx ( a u pos xt -- q pos' ) { a u pos xt } 0 0 0 { oa ou op }

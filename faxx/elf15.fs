@@ -2,7 +2,7 @@
 
 decimal
 
-1 om-new constant rp-written
+1 lazy-om rp-written
 : sec-base ( sidx -- a ) 1- cells cs-data + @ sb$ drop ;
 : sec-len ( sidx -- n ) 1- cells cs-sz + @ ;
 

@@ -46,7 +46,7 @@ decimal
     if to r false to dz else
       ra ru s" inf" compare 0= ra ru s" nan" compare 0= or ra ru s" -inf" compare 0= or if
         ra ru s" nan" compare 0= if $7fff800000000000 else
-          ra c@ 45 = if $ffff000000000000 else $7fff000000000000 then then q128 to r
+          ra c@ 45 = if $ffff 48 lshift else $7fff000000000000 then then q128 to r
       else v @ dbits>q to r then
     then
   then
@@ -59,7 +59,7 @@ decimal
 : cap-float-impl ( kind -- ok )
   dup 81 = if drop cap-q exit then
   cap-fd ;
-' cap-float-impl is cap-float
+bind cap-float-impl cap-float
 
 \ ---- 波括弧 ----
 : get-curlb ( -- a u f )
@@ -79,7 +79,7 @@ decimal
 
 : x-label-impl ( a u -- q ) lab-find dup 0= if drop true undef-flag ! q0 exit then
   lab-q dup qundef-derived? if drop true undef-flag ! q0 exit then qcopy ;
-' x-label-impl is x-label
+bind x-label-impl x-label
 
 : xv>fin ( q flag -- ) ( F: -- r ) xv>f ;
 : hex>q ( u -- q ) qun ;
@@ -87,7 +87,7 @@ decimal
 : brace-qad ( a u -- q ) { ta tu }
   ta tu s" nan" compare 0= if $7fff800000000000 q128 exit then
   ta tu s" inf" compare 0= if $7fff000000000000 q128 exit then
-  ta tu s" -inf" compare 0= if $ffff000000000000 q128 exit then
+  ta tu s" -inf" compare 0= if $ffff 48 lshift q128 exit then
   ar-mark { mk }
   q0 { r }
   ta tu text>q128 if to r else
@@ -107,7 +107,7 @@ decimal
 : brace-fd ( a u width -- q ) { ta tu w }
   ta tu s" nan" compare 0= if w 32 = if $7fc00000 else $7ff8000000000000 then qun exit then
   ta tu s" inf" compare 0= if w 32 = if $7f800000 else $7ff0000000000000 then qun exit then
-  ta tu s" -inf" compare 0= if w 32 = if $ff800000 else $fff0000000000000 then qun exit then
+  ta tu s" -inf" compare 0= if w 32 = if $ff800000 else $fff0 48 lshift then qun exit then
   ar-mark { mk }
   0 false { bits ok }
   ta tu xeval if
@@ -153,4 +153,4 @@ decimal
   kind 0 = if ta tu brace-qad else ta tu kind 3 = if 64 else 32 then brace-fd then
   exp-float @ if qi>dq then
   true ;
-' brace-eval-impl is brace-eval
+bind brace-eval-impl brace-eval

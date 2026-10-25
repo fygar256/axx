@@ -2,8 +2,20 @@
 
 decimal
 
+\ 遅延語の結びつけ: bind 実装 遅延語 (ccforth では ccshim.fs が実行時に結ぶ版を定義する)
+[undefined] bind [if]
+: bind ( "impl" "target" -- ) ' ' defer! ;
+[then]
+
 \ ---- 出力 ----
+[undefined] etype [if]
 : etype ( a u -- ) stderr write-file drop ;
+[then]
+[undefined] stdin-read [if]
+: stdin-read ( a u -- n ior ) stdin read-file ;
+: stdin-line ( a u -- n flag ior ) stdin read-line ;
+: stdout-flush ( -- ior ) stdout flush-file ;
+[then]
 : ecr ( -- ) s\" \n" etype ;
 : errno-text ( n -- a u )
   case
@@ -35,12 +47,9 @@ decimal
 : xdig? ( c -- f ) uc dup 48 58 within swap 65 71 within or ;
 : hexv ( c -- n ) uc dup 58 < if 48 - else 55 - then ;
 : in-str? ( c a u -- f )
-  rot >r
-  begin dup while
-    over c@ r@ = if 2drop r> drop true exit then
-    1 /string
-  repeat
-  2drop r> drop false ;
+  { c a u }
+  u 0 ?do a i + c@ c = if true unloop exit then loop
+  false ;
 
 \ ---- 文字列 ----
 : str=ci ( a1 u1 a2 u2 -- f )
@@ -67,7 +76,8 @@ decimal
 
 \ ---- 領域 (一時の文字列用。mark / release で巻き戻す) ----
 134217728 constant ARENA-SIZE
-: lazy ( size "name" -- ) create 0 , , does> dup @ ?dup if nip exit then dup cell+ @ allocate throw dup rot ! ;
+: lazy-get ( body -- a ) dup @ ?dup if nip exit then dup cell+ @ allocate throw dup rot ! ;
+: lazy ( size "name" -- ) create 0 , , does> lazy-get ;
 ARENA-SIZE lazy arena
 variable ar-top
 : ar-alloc ( n -- a )
@@ -117,7 +127,7 @@ variable ar-top
 \ 構造: [0]=count [1]=used [2]=cap [3]=vcells [4]=index [5]=ents
 \ エントリ: key-a key-u (key-a=0 は削除済み) value...
 : om-esz ( om -- n ) 3 cells + @ 2 + cells ;
-: fnv ( a u -- h ) { a u } 14695981039346656037 u 0 ?do a i + c@ xor 1099511628211 * loop ;
+: fnv ( a u -- h ) { a u } $cbf29ce4 32 lshift $84222325 or u 0 ?do a i + c@ xor 1099511628211 * loop ;
 : om-new ( vcells -- om ) { vc } 6 cells allocate throw { om }
   0 om !  0 om cell+ !  64 om 2 cells + !  vc om 3 cells + !
   64 cells allocate throw dup 64 cells erase om 4 cells + !
@@ -209,7 +219,11 @@ variable mb-u
   loop ;
 
 \ ---- 文字列の保存 (同じ綴りは 1 つだけ。解放しない) ----
-1 om-new constant strpool
+: lazy-om-get ( body -- om ) dup @ ?dup if nip exit then dup cell+ @ om-new dup rot ! ;
+: lazy-om ( vcells "name" -- ) create 0 , , does> lazy-om-get ;
+: lazy-sb-get ( body -- sb ) dup @ ?dup if nip exit then sb-new dup rot ! ;
+: lazy-sb ( "name" -- ) create 0 , does> lazy-sb-get ;
+1 lazy-om strpool
 : intern ( a u -- a' u ) { a u }
   a u strpool om-put { sl }
   sl 2 cells - s@ ;

@@ -100,7 +100,7 @@ create cfp-nm MAXCFP cells allot   create cfp-nmu MAXCFP cells allot
 \ ---- シンボル表 ----
 variable sy-sb  variable st-sb  variable sx-base  variable sx-n  variable sy-n
 variable sy-first-global
-1 om-new constant symidx
+1 lazy-om symidx
 create cfsyn MAXCFP cells allot                    \ .Lcfi<n> の番号 (シンボル表の添字)
 
 : sym-special-xidx ( shndx special -- shndx' )

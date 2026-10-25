@@ -2,13 +2,13 @@
 
 decimal
 
-3 om-new constant rcon-snap
+3 lazy-om rcon-snap
 : rcon-take ( -- ) rcon rcon-snap om-copy ;
 : rcon-restore ( -- ) rcon-snap rcon om-copy ;
-' rcon-take is snap-extra-take
-' rcon-restore is snap-extra-restore
-:noname rcon om-clear ; is lineclear-extra
-:noname ( a u -- ) rcon om-del ; is dir-pat-clear-extra
+bind rcon-take snap-extra-take
+bind rcon-restore snap-extra-restore
+: lineclear-extra-nn10 rcon om-clear ; bind lineclear-extra-nn10 lineclear-extra
+: dir-pat-clear-extra-nn11 ( a u -- ) rcon om-del ; bind dir-pat-clear-extra-nn11 dir-pat-clear-extra
 
 : reloc-name-err ( ta tu -- ) { ta tu }                  \ 同じ (名前, 機種) では 1 回だけ
   ta tu slower s\" \x01" sconcat elf-machine @ n>s sconcat { ka ku }
@@ -85,7 +85,7 @@ create px-rt 8 cells allot  create px-off 8 cells allot
   r reloc-pairs 0= if drop exit then { pp }
   na nu rcon om-put { sl }
   rt sl !  fmask sl cell+ !  pp sl 2 cells + ! ;
-' dir-reloc-impl is dir-reloc
+bind dir-reloc-impl dir-reloc
 
 : dir-clrreloc-impl ( row -- ) { r }
   r 2 rf strip-st { va vu }
@@ -95,7 +95,7 @@ create px-rt 8 cells allot  create px-off 8 cells allot
       mb-reset s"  error - .clrreloc: variable should be a lower case name ('" mb+ va vu mb+ s" ')." mb+ mb-get diag-e
     then
   else rcon om-clear then ;
-' dir-clrreloc-impl is dir-clrreloc
+bind dir-clrreloc-impl dir-clrreloc
 
 \ ---- エラー条件の判定 (_cond_tests_relocated_var / _cond_tests_linked_label) ----
 : cw-in? ( cond-a cond-u va vu -- f ) { ca cu va vu }
@@ -160,4 +160,4 @@ create px-rt 8 cells allot  create px-off 8 cells allot
   loop false ;
 
 : cond-relocated-impl ( a u -- f ) 2dup cond-reloc-var? if 2drop true exit then cond-linked? ;
-' cond-relocated-impl is cond-relocated?
+bind cond-relocated-impl cond-relocated?

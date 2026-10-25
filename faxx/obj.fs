@@ -9,8 +9,8 @@ variable nobj
 : obj-q ( i -- q ) QB * objl + ;
 
 \ テキスト出力 (asmtext)
-sb-new constant asmtext
-sb-new constant asmdisp
+lazy-sb asmtext
+lazy-sb asmdisp
 variable asmtext-set
 : asmtext-clear ( -- ) false asmtext-set !  asmtext sb-clear  asmdisp sb-clear ;
 
@@ -27,7 +27,7 @@ variable asmtext-set
   loop ;
 
 \ 基数つきの数字だけ (_txt_radix)。基数のプレフィックスなし、小文字
-sb-new constant rdx-b
+lazy-sb rdx-b
 : radix-str ( q radix -- a u ) { q rx }
   q qundef? if s" UNDEF" exit then
   rdx-b sb-clear
@@ -46,7 +46,7 @@ sb-new constant rdx-b
 
 \ ---- .float (10 進 34 桁、偶数丸め) ----
 34 constant TXT-PREC
-sb-new constant fl-b
+lazy-sb fl-b
 : txt-float ( q -- a u ) { q }
   q qundef? if s" UNDEF" exit then
   q q-neg? { neg }  neg if q qneg else q then q>dec { da du }

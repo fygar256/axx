@@ -242,4 +242,4 @@ variable nvr  variable nvr2
     emit-group
     j to ix
   repeat ;
-' elf-emit-relocs-impl is elf-emit-relocs
+bind elf-emit-relocs-impl elf-emit-relocs

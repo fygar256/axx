@@ -62,7 +62,7 @@ decimal
     S-FORIN of s mi-forin endof
     rt-head s" bad statement" mb+ mini-throw
   endcase ;
-' mi-exec-impl is mi-exec
+bind mi-exec-impl mi-exec
 
 \ 関数を走らせる。返り値は mini-ret の写し (なければ 0)
 : mini-run ( f args n -- ret|0 ) { f args n }
@@ -84,7 +84,7 @@ decimal
 : mini-diag ( -- ) size-mode @ 0= if mb-get diag-e then ;
 
 \ 文字列引数: エスケープは \\ \" \n \t の 4 つ。成功なら v k'、失敗なら 0 -1
-sb-new constant ma-sb
+lazy-sb ma-sb
 : arg-str ( a u k name-a name-u -- v k' ) { a u k na nu }
   ma-sb sb-clear
   k 1+ to k
@@ -265,7 +265,7 @@ defer mini-arg-one ( a u k name-a name-u in-array -- v k' )
   then
   a u k expr-pat { q pos }
   q qundef-derived? if q0 else q then mi-int pos ;
-' arg-one-impl is mini-arg-one
+bind arg-one-impl mini-arg-one
 
 \ ---- .call の実行 ----
 variable mc-k
@@ -327,4 +327,4 @@ variable mc-k
   then
   throw
   n0 semi drp nk mi-call-finish ;
-' mini-call-impl is mini-call
+bind mini-call-impl mini-call

@@ -3,7 +3,7 @@
 decimal
 
 defer cond-relocated? ( a u -- f )        \ -o で、リンカが埋める変数を見ている条件か
-:noname 2drop false ; is cond-relocated?
+: cond-relocated?-nn53 2drop false ; bind cond-relocated?-nn53 cond-relocated?
 
 : err-text ( code -- a u true | false )
   n>s errtab om-find ?dup if s@ true else false then ;

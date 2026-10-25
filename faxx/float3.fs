@@ -140,7 +140,7 @@ defer ft-expr
 : ft-estep ( r c -- r' ) { r c } 1 ft-i +! ft-term { r2 } r r2 c ev-addsub ;
 : ft-expr1 ( -- ev ) ft-skip ft-term
   begin ft-skip 0 ftch dup 43 = over 45 = or while ft-estep repeat drop ;
-' ft-expr1 is ft-expr
+bind ft-expr1 ft-expr
 
 : f128-eval ( a u -- ev true | false )
   ft-u ! ft-a ! 0 ft-i !

@@ -17,7 +17,7 @@ decimal
     drop s" " 0
   endcase ;
 
-sb-new constant uk-b
+lazy-sb uk-b
 : row-text ( r -- a u ) { r }                         \ 欄を strip して '::' でつなぐ
   uk-b sb-clear
   6 0 ?do
@@ -27,7 +27,7 @@ sb-new constant uk-b
   uk-b sb$ ;
 : setsym-name ( r -- a u ) { r } r 1 rf nip if r 1 rf else r 2 rf then trim ;
 
-sb-new constant ul-b
+lazy-sb ul-b
 \ 重複検査の鍵と、エラーで名指す言い方。返り値は ka ku la lu true | false
 : unordered-key ( r -- ka ku la lu true | false ) { r }
   r rkind @ { k }
@@ -56,7 +56,7 @@ sb-new constant ul-b
   k 21 = if s" EPIC" s" 'EPIC'" true exit then
   false ;
 
-3 om-new constant useen          \ 鍵 -> [row][text-a][text-u]
+3 lazy-om useen          \ 鍵 -> [row][text-a][text-u]
 
 \ 値欄に現れる名前 (大文字) を 1 つずつ xt へ渡す。`"..."` の中は読まない
 : each-ref ( a u xt -- ) { a u xt } 0 { k }
@@ -84,7 +84,7 @@ MAXROWS cells lazy u-ordv
 MAXROWS lazy u-donev
 variable nu-first  variable nu-syms  variable nu-rest  variable nu-ord
 variable u-cur
-2 om-new constant u-definer
+2 lazy-om u-definer
 variable u-depmiss
 
 : u-dep-hit ( a u -- )

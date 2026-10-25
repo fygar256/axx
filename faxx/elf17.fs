@@ -292,4 +292,4 @@ variable L-eh-fl variable L-eh-ty variable L-eh-al variable L-eh-es
   out sb$ fid write-file throw
   fid close-file throw
   wr-message ;
-' write-elf-obj-impl is write-elf-obj
+bind write-elf-obj-impl write-elf-obj

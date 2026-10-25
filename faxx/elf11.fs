@@ -52,7 +52,7 @@ decimal
 \ 項目: [0]=sidx(1 始まり) [2]=off [3]=name-a [4]=name-u [5]=rt [6..9]=addend [10]=nb [11]=fm
 variable xr-n  variable xr-cap  variable xr-base
 : xr-init ( -- ) 256 xr-cap ! xr-cap @ RLSZ * allocate throw xr-base ! 0 xr-n ! ;
-xr-init
+[undefined] cc-forth [if] xr-init [then]
 : xr@ ( i -- addr ) RLSZ * xr-base @ + ;
 : xr-add ( sidx off na nu rt addend nb fm -- ) { sidx off na nu rt ad nb fm }
   xr-n @ xr-cap @ >= if xr-cap @ 2* xr-cap ! xr-base @ xr-cap @ RLSZ * resize throw xr-base ! then

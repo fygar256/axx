@@ -266,7 +266,7 @@ defer xe-unary ( -- q flag )
   c 45 = if 1 xs-i +! recurse x-neg exit then
   c 126 = if 1 xs-i +! recurse x-not exit then
   x-power ;
-' xe-unary1 is xe-unary
+bind xe-unary1 xe-unary
 
 \ 演算子の読み取り: 水準ごとに現在位置 (空白は読み飛ばし済み) の演算子の番号と長さ
 : x-opcode ( lvl -- code len )
@@ -298,7 +298,7 @@ defer xe-unary ( -- q flag )
 : xe-band ( -- q flag ) ['] xe-shift 3 x-level ;
 : xe-bxor ( -- q flag ) ['] xe-band 4 x-level ;
 : xe-bor ( -- q flag ) ['] xe-bxor 5 x-level ;
-' xe-bor is x-expr
+bind xe-bor x-expr
 
 : xeval ( a u -- q flag true | false )
   xs-u ! xs-a ! 0 xs-i !

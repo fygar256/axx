@@ -6,21 +6,21 @@ variable gen-debug
 variable vliw-flag-dummy
 
 defer vliw-process ( la lu idxs flag idx -- vflag )      \ `!!` で区切った VLIW パケット
-:noname 2drop 2drop drop false ; is vliw-process
+: vliw-process-nn31 2drop 2drop drop false ; bind vliw-process-nn31 vliw-process
 defer elf-line-begin ( -- )                              \ -o のパス 2 の追跡の起点
-:noname ; is elf-line-begin
+: elf-line-begin-nn32 ; bind elf-line-begin-nn32 elf-line-begin
 defer elf-line-end ( -- )
-:noname ; is elf-line-end
+: elf-line-end-nn33 ; bind elf-line-end-nn33 elf-line-end
 defer elf-emit-relocs ( -- )                             \ 行の出力語に対するリロケーション
-:noname ; is elf-emit-relocs
+: elf-emit-relocs-nn34 ; bind elf-emit-relocs-nn34 elf-emit-relocs
 defer elf-shift-refs ( n -- )                            \ 先頭に n 語足したときの参照位置の補正
-:noname drop ; is elf-shift-refs
+: elf-shift-refs-nn35 drop ; bind elf-shift-refs-nn35 elf-shift-refs
 defer line-map-add ( -- )                                \ -g の行表
-:noname ; is line-map-add
+: line-map-add-nn36 ; bind line-map-add-nn36 line-map-add
 defer macro-expand ( tab n fa fu -- tab' n' )
-:noname 2drop ; is macro-expand
+: macro-expand-nn37 2drop ; bind macro-expand-nn37 macro-expand
 defer macro-reset-pass ( -- )
-:noname ; is macro-reset-pass
+: macro-reset-pass-nn38 ; bind macro-reset-pass-nn38 macro-reset-pass
 
 : nsym-reset ( -- ) nsym-dirty @ if patsyms numsyms om-copy false nsym-dirty ! then ;
 
@@ -153,7 +153,7 @@ variable fn-depth
 create fn-stack-a 128 cells allot   create fn-stack-u 128 cells allot
 create ln-stack 128 cells allot
 create cwdbuf 4096 allot
-sb-new constant ap-b
+lazy-sb ap-b
 : abspath ( a u -- a' u' ) { a u }
   u 0= if a u exit then
   a u s" stdin" str=cs if a u exit then
@@ -186,7 +186,7 @@ sb-new constant ap-b
 
 : slurp-stdin ( -- a u ) 0 0 { buf n }
   4096 allocate throw to buf
-  begin buf n + 4096 stdin read-file throw dup 0> while
+  begin buf n + 4096 stdin-read throw dup 0> while
     n + to n
     buf n 4096 + resize throw to buf
   repeat drop
@@ -195,7 +195,7 @@ sb-new constant ap-b
 variable stdin-cache-a  variable stdin-cache-u  variable stdin-cached
 
 defer asm-file-hook ( -- )
-:noname ; is asm-file-hook
+: asm-file-hook-nn39 ; bind asm-file-hook-nn39 asm-file-hook
 
 : read-source ( fa fu -- tab n ok ) { fa fu }
   fa fu s" stdin" str=cs if
@@ -268,4 +268,4 @@ defer asm-file-hook ( -- )
     then
   then
   sa su fileassemble ;
-' do-asm-include is asm-include
+bind do-asm-include asm-include

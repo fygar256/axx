@@ -2,13 +2,13 @@
 
 decimal
 
-10 om-new constant labels                \ 名前 -> [q:4][sec-a][sec-u][equ][imported][rtype]
-1 om-new constant relax-prev-dummy
-6 om-new constant relax-prev             \ 前回の反復のラベル値 (名前 -> q)
+10 lazy-om labels                \ 名前 -> [q:4][sec-a][sec-u][equ][imported][rtype]
+1 lazy-om relax-prev-dummy
+6 lazy-om relax-prev             \ 前回の反復のラベル値 (名前 -> q)
 variable relax-optimistic
 variable relax-iter
 variable cur-sec-a  variable cur-sec-u   \ 現在のセクション名
-1 om-new constant reported-lab-errs      \ 定義エラーを 1 回だけ出すための鍵
+1 lazy-om reported-lab-errs      \ 定義エラーを 1 回だけ出すための鍵
 
 : lab-find ( a u -- slot|0 ) labels om-find ;
 : lab-q ( slot -- q ) ;                                  \ 先頭 4 セルが値
@@ -18,11 +18,11 @@ variable cur-sec-a  variable cur-sec-u   \ 現在のセクション名
 : lab-rtype ( slot -- n ) 8 cells + @ ;
 : lab-set-sec ( slot a u -- ) rot 4 cells + s! ;
 
-1 om-new constant equ-secs                   \ .equ の式が触れたセクション
+1 lazy-om equ-secs                   \ .equ の式が触れたセクション
 defer lab-sec-adjust ( q secname-a secname-u -- q' )     \ セクション相対への補正 (-o / -E)
-:noname 2drop ; is lab-sec-adjust
+: lab-sec-adjust-nn21 2drop ; bind lab-sec-adjust-nn21 lab-sec-adjust
 defer elf-note-label ( a u q -- )                         \ -o の追跡 (ラベルの読み)
-:noname 2drop drop ; is elf-note-label
+: elf-note-label-nn22 2drop drop ; bind elf-note-label-nn22 elf-note-label
 
 : label-value-impl ( a u -- q ) { a u }
   a u lab-find ?dup if
@@ -49,7 +49,7 @@ defer elf-note-label ( a u q -- )                         \ -o の追跡 (ラベ
     mb-reset s"  error - Label undefined: '" mb+ a u mb+ s" '" mb+ mb-get diag-e
   then
   qundef ;
-' label-value-impl is label-get-value
+bind label-value-impl label-get-value
 
 : lab-report-err ( kind-a kind-u name-a name-u msg-a msg-u -- ) { ka ku na nu ma mu }
   ma mu sdup to mu to ma

@@ -45,16 +45,16 @@ defer brace-eval ( kind -- q true | false )    \ flt dbl qad enflt endbl の波�
 defer loc-counter ( -- q )                     \ $$
 defer sec-rel-pc ( q -- q' )                   \ $. をセクション相対にする
 defer elf-note-var ( slot q -- )               \ -o の追跡 (変数の読み)
-:noname ( a u -- q ) 2drop q0 ; is label-get-value
-:noname ( a u -- q true | false ) 2drop false ; is sym-num-get
-:noname ( a u -- n ) 2drop -1 ; is arr-len
-:noname ( a u i -- q kind ) drop 2drop q0 0 ; is arr-item-num
-:noname ( -- q true | false ) false ; is enum-match
-:noname ( kind -- q true | false ) drop false ; is brace-eval
-:noname ( -- q ) in-binlist @ if pc-start @ else pc @ then qn
-  in-binlist @ equ-track @ or if sec-rel-pc then ; is loc-counter
-:noname ( q -- q' ) ; is sec-rel-pc
-:noname ( slot q -- ) 2drop ; is elf-note-var
+: label-get-value-nn12 ( a u -- q ) 2drop q0 ; bind label-get-value-nn12 label-get-value
+: sym-num-get-nn13 ( a u -- q true | false ) 2drop false ; bind sym-num-get-nn13 sym-num-get
+: arr-len-nn14 ( a u -- n ) 2drop -1 ; bind arr-len-nn14 arr-len
+: arr-item-num-nn15 ( a u i -- q kind ) drop 2drop q0 0 ; bind arr-item-num-nn15 arr-item-num
+: enum-match-nn16 ( -- q true | false ) false ; bind enum-match-nn16 enum-match
+: brace-eval-nn17 ( kind -- q true | false ) drop false ; bind brace-eval-nn17 brace-eval
+: loc-counter-nn18 ( -- q ) in-binlist @ if pc-start @ else pc @ then qn
+  in-binlist @ equ-track @ or if sec-rel-pc then ; bind loc-counter-nn18 loc-counter
+: sec-rel-pc-nn19 ( q -- q' ) ; bind sec-rel-pc-nn19 sec-rel-pc
+: elf-note-var-nn20 ( slot q -- ) 2drop ; bind elf-note-var-nn20 elf-note-var
 
 \ ---- 文字の読み出し ----
 : ch ( off -- c ) ep @ + dup ex-u @ < if ex-a @ + c@ else drop 0 then ;
@@ -117,7 +117,7 @@ variable lit-ovf
 variable band-warned
 : qband-warn-impl ( -- ) band-warned @ if exit then  true band-warned !
   s"  warning - a value whose signed absolute magnitude is >= 2**192 was computed and is being treated as UNDEF-derived; this heuristic cannot distinguish it from a genuine large 256-bit constant (e.g. an all-ones bitmask) because uint256_t has no headroom beyond 256 bits for a true out-of-band sentinel." diag-w ;
-' qband-warn-impl is qband-warn
+bind qband-warn-impl qband-warn
 variable wrap-warned
 : warn-wrap ( a u -- ) wrap-warned @ if 2drop exit then  true wrap-warned !
   mb-reset s"  warning - a value overflowed 256 bits in '" mb+ mb+
@@ -159,7 +159,7 @@ variable fs-u
 : fs-c ( c -- ) fs-u @ 511 >= if drop exit then fsbuf fs-u @ + c! 1 fs-u +! ;
 : pfloat ( -- q )
   0 fs-u !
-  s" -inf" qtxt-cs? if 4 adv $FFF0000000000000 qun exit then
+  s" -inf" qtxt-cs? if 4 adv $fff0 48 lshift qun exit then
   s" inf" qtxt-cs? if 3 adv $7FF0000000000000 qun exit then
   s" nan" qtxt-cs? if 3 adv $7FF8000000000000 qun exit then
   begin cur digc? cur 46 = or while cur fs-c 1 adv repeat
@@ -406,5 +406,5 @@ defer recurse-factor
     s"  error - expression nesting too deep." xerr q0 exit
   then
   1 expr-depth +!  factor-impl  -1 expr-depth +! ;
-' factor is recurse-factor
+bind factor recurse-factor
 

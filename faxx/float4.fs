@@ -12,7 +12,7 @@ create fb-buf 16 allot
 : f-signbit ( F: x -- ) ( -- f ) fb-buf f! fb-buf @ 63 rshift 0<> ;
 : f-bits ( F: x -- ) ( -- u ) fb-buf f! fb-buf @ ;
 : bits>f ( u -- ) ( F: -- r ) fb-buf ! fb-buf f@ ;
-: f-inf ( sign -- ) ( F: -- r ) if $fff0000000000000 else $7ff0000000000000 then bits>f ;
+: f-inf ( sign -- ) ( F: -- r ) if $fff0 48 lshift else $7ff0000000000000 then bits>f ;
 : bn>u ( bn -- u ) dup 0 bn@ swap 1 bn@ 32 lshift or ;
 : rr>dbl ( sign -- ) ( F: -- r )                   \ rr-m rr-qe から
   { sign }

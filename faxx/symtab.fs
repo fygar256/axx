@@ -50,10 +50,10 @@ decimal
   a arr-n 0 ?do a i arr-item l lst-add-item loop l ;
 
 \ ---- 3 つの表 ----
-4 om-new constant numsyms           \ 名前(大文字) -> q
-2 om-new constant strsyms           \ 名前 -> (a u)
-1 om-new constant arrsyms           \ 名前 -> arr
-4 om-new constant patsyms           \ パターンファイル読み込み後の数値シンボル
+4 lazy-om numsyms           \ 名前(大文字) -> q
+2 lazy-om strsyms           \ 名前 -> (a u)
+1 lazy-om arrsyms           \ 名前 -> arr
+4 lazy-om patsyms           \ パターンファイル読み込み後の数値シンボル
 variable arrgen
 
 : skey ( a u -- a' u' ) supper ;
@@ -236,10 +236,10 @@ variable arrgen
     true exit
   then
   da du ta tu ssym-set true ;
-' nsym-get is sym-num-get
+bind nsym-get sym-num-get
 : arr-len-impl ( a u -- n ) asym-get ?dup if arr-n else -1 then ;
-' arr-len-impl is arr-len
+bind arr-len-impl arr-len
 : arr-item-num-impl ( a u i -- q kind ) { a u i }
   a u asym-get i arr-item { it }
   it item-kind 1 = if q0 1 else it item-q qcopy 0 then ;
-' arr-item-num-impl is arr-item-num
+bind arr-item-num-impl arr-item-num

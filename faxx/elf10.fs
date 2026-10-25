@@ -6,7 +6,7 @@ decimal
 variable lm-n  variable lm-cap
 variable lm-base
 : lm-init ( -- ) 1024 lm-cap ! lm-cap @ 6 * cells allocate throw lm-base ! 0 lm-n ! ;
-lm-init
+[undefined] cc-forth [if] lm-init [then]
 : lm@ ( i -- addr ) 6 * cells lm-base @ + ;
 : line-map-add-impl ( -- )
   lm-n @ lm-cap @ >= if lm-cap @ 2* lm-cap ! lm-base @ lm-cap @ 6 * cells resize throw lm-base ! then
@@ -16,10 +16,10 @@ lm-init
   file@ intern e 4 cells + ! e 3 cells + !
   line-no @ e 5 cells + !
   1 lm-n +! ;
-' line-map-add-impl is line-map-add
+bind line-map-add-impl line-map-add
 
-:noname ( passno -- )
-  1 = if ovr-clear export-labels om-clear else ovr-clear rl-reset an-reset 0 lm-n ! then ; is pass-reset-extra
+: pass-reset-extra-nn7 ( passno -- )
+  1 = if ovr-clear export-labels om-clear else ovr-clear rl-reset an-reset 0 lm-n ! then ; bind pass-reset-extra-nn7 pass-reset-extra
 
 \ ---- バイト列の組み立て ----
 variable w-le                                       \ 1 ならリトルエンディアン

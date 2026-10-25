@@ -3,7 +3,7 @@
 decimal
 
 defer sec-rel-offset ( a u wordpc -- off true | false )        \ セクション相対の位置 (-o / -E)
-:noname 2drop drop false ; is sec-rel-offset
+: sec-rel-offset-nn64 2drop drop false ; bind sec-rel-offset-nn64 sec-rel-offset
 
 : align-up ( addr -- addr' ) align-v @ 0<= if exit then
   dup align-v @ mod dup 0= if drop exit then align-v @ swap - + ;

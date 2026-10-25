@@ -25,7 +25,7 @@ defer pat-repr ( a u -- a' u' )                  \ Python の repr (dirs2.fs で
   1 nrows +! ;
 
 \ ---- .sub 表 ----
-1 om-new constant subs                       \ 名前 -> arr (pat, val, pat, val ...)
+1 lazy-om subs                       \ 名前 -> arr (pat, val, pat, val ...)
 : sub-new ( a u -- ) subs om-put dup @ arr-free 0 arr-new swap ! ;
 : sub-add ( na nu pa pu va vu -- ) { na nu pa pu va vu }
   na nu subs om-find { slot } slot @ { old }
@@ -40,15 +40,15 @@ defer pat-repr ( a u -- a' u' )                  \ Python の repr (dirs2.fs で
 
 \ ---- .func の本文の集め (ミニ言語が受け取る) ----
 defer func-handle ( ra ru ka ku fa fu ln -- )
-:noname 7 0 do drop loop ; is func-handle
+: func-handle-nn54 7 0 do drop loop ; bind func-handle-nn54 func-handle
 defer func-active? ( -- f )
-:noname false ; is func-active?
+: func-active?-nn55 false ; bind func-active?-nn55 func-active?
 defer func-end-file ( fa fu -- )
-:noname 2drop ; is func-end-file
+: func-end-file-nn56 2drop ; bind func-end-file-nn56 func-end-file
 defer pat-func-reset ( -- )
-:noname ; is pat-func-reset
+: pat-func-reset-nn57 ; bind pat-func-reset-nn57 pat-func-reset
 defer pat-func-compile ( -- )
-:noname ; is pat-func-compile
+: pat-func-compile-nn58 ; bind pat-func-compile-nn58 pat-func-compile
 
 : dot-kw ( a u -- ka ku )                     \ 行頭の .キーワードを大文字で
   trim dup 0= if exit then over c@ 46 <> if 2drop 0 0 exit then
@@ -62,9 +62,9 @@ variable cur-sub-a  variable cur-sub-u  variable in-sub
 variable fdpth     variable in-func
 defer read-pattern
 defer pat-macro-reset ( -- )
-:noname ; is pat-macro-reset
+: pat-macro-reset-nn59 ; bind pat-macro-reset-nn59 pat-macro-reset
 defer pat-macro-expand ( tab n fa fu -- tab' n' )
-:noname 2drop ; is pat-macro-expand
+: pat-macro-expand-nn60 2drop ; bind pat-macro-expand-nn60 pat-macro-expand
 
 : dir-len ( a u -- n ) begin dup 0> while 2dup + 1- c@ 47 = if nip exit then 1- repeat nip ;
 create pathbuf 4096 allot
@@ -146,9 +146,9 @@ create pat-chain-a 64 cells allot  create pat-chain-u 64 cells allot
   mb-reset s"  warning - pattern line has no '::' field separator and can never match (likely a stray line left over from a multi-line comment, or a binary_list/error_patterns continued onto the next physical line without a '\' at the end of the line before): " mb+ pat-repr mb+ mb-get diag-w ;
 
 defer check-sub-refs ( -- )                       \ .sub の参照の検査 (読み込み時に一度)
-:noname ; is check-sub-refs
+: check-sub-refs-nn61 ; bind check-sub-refs-nn61 check-sub-refs
 defer echo-validate ( a u -- )                   \ .echo の引数を検査 (誤りは診断)
-:noname 2drop ; is echo-validate
+: echo-validate-nn62 2drop ; bind echo-validate-nn62 echo-validate
 : pat-line ( a u fa fu ln -- ) { a u fa fu ln }
   a u reduce-spaces { ra ru }
   ra ru dot-kw { ka ku }
@@ -283,4 +283,4 @@ defer echo-validate ( a u -- )                   \ .echo の引数を検査 (誤
   pat-depth @ 0= if check-sub-refs pat-func-compile then
   rc free throw  tab free throw
   oda pat-dir-a !  odu pat-dir-u ! ;
-' read-pattern-impl is read-pattern
+bind read-pattern-impl read-pattern

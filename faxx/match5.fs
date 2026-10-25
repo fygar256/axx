@@ -77,7 +77,7 @@ decimal
     then
     end to from
   repeat ;
-2 om-new constant subchk-mark
+2 lazy-om subchk-mark
 create sub-stk-a 64 cells allot  create sub-stk-u 64 cells allot
 : sub-walk ( na nu depth -- ) { na nu depth }
   na nu subchk-mark om-find ?dup if
@@ -116,4 +116,4 @@ create sub-stk-a 64 cells allot  create sub-stk-u 64 cells allot
   subs om-used 0 ?do
     i subs om-live? if i subs om-key 0 sub-walk then
   loop ;
-' check-sub-refs-impl is check-sub-refs
+bind check-sub-refs-impl check-sub-refs

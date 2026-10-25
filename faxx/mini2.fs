@@ -14,7 +14,7 @@ decimal
 : mf-file ( f -- a u ) 11 fnf 2@ swap ;
 : mf-line ( f -- ln ) 13 fnf @ ;
 
-1 om-new constant mfuncs                      \ 名前 -> func ptr (トップレベル)
+1 lazy-om mfuncs                      \ 名前 -> func ptr (トップレベル)
 create fstk 64 cells allot
 variable fs-n
 
@@ -339,7 +339,7 @@ variable if-d
     then then then
   repeat
   m sbt-finish i ;
-' parse-mblock-impl is parse-mblock
+bind parse-mblock-impl parse-mblock
 
 \ ---- 関数の本体の構文解析 ----
 : parse-func-body ( f -- ) { f }
@@ -428,7 +428,7 @@ variable fr-fa variable fr-fu variable fr-ln
     then
   then then
   ra ru strip-st nip if ra ru fa fu ln cur mf-add-line then ;
-' func-handle-impl is func-handle
+bind func-handle-impl func-handle
 : mini-func-active? ( -- f ) fs-n @ 0<> ;
 : mini-func-end-file ( fa fu -- )
   begin fs-n @ 0> while
@@ -438,8 +438,8 @@ variable fr-fa variable fr-fu variable fr-ln
     -1 fs-n +!
   repeat 2drop ;
 
-' mini-func-active? is func-active?
-' mini-func-end-file is func-end-file
+bind mini-func-active? func-active?
+bind mini-func-end-file func-end-file
 : mini-func-reset ( -- ) mfuncs om-clear 0 fs-n ! ;
-' mini-func-reset is pat-func-reset
-' compile-funcs is pat-func-compile
+bind mini-func-reset pat-func-reset
+bind compile-funcs pat-func-compile

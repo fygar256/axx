@@ -81,7 +81,7 @@ variable eb-names  variable eb-vals
   ex-a @ ex-u @ ep @ eb-names @ enum-name-at { k e }
   k 0< if false exit then
   e ep !  eb-vals @ k QB * + qcopy true ;
-' enum-match-impl is enum-match
+bind enum-match-impl enum-match
 
 : enum-eval ( ea eu names present -- q true | false ) { ea eu names present }
   names arr-n QB * allocate throw { vals }

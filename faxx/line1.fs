@@ -26,7 +26,7 @@ decimal
   then
   i 1+ ;
 
-sb-new constant nws-b
+lazy-sb nws-b
 : normalize-ws ( a u -- a' u' ) { a u } 0 false false { k inq inws }
   nws-b sb-clear
   begin k u < while
@@ -58,7 +58,7 @@ sb-new constant nws-b
   repeat
   nws-b sb$ ;
 
-sb-new constant cmt-b
+lazy-sb cmt-b
 : rstrip-ws ( a u -- a' u' ) begin dup 0> while 2dup + 1- c@ ws? while 1- repeat then ;
 : split-comment ( a u -- ca cu ma mu ) { a u } 0 false -1 { k inq cpos }
   cmt-b sb-clear
@@ -90,7 +90,7 @@ sb-new constant cmt-b
   cmt-b sb$ cpos 0>= if rstrip else rstrip-ws then sdup
   cpos 0>= if a cpos + u cpos - rstrip-ws sdup else s" " then ;
 
-sb-new constant vle-b
+lazy-sb vle-b
 : resolve-vliw-escapes ( a u -- a' u' ) { a u } 0 false { k inq }
   vle-b sb-clear
   begin k u < while
@@ -121,9 +121,9 @@ sb-new constant vle-b
   vle-b sb$ ;
 
 \ ---- テキスト置換モードの断片 ----
-sb-new constant label-text
-sb-new constant comment-text
-sb-new constant indent-text
+lazy-sb label-text
+lazy-sb comment-text
+lazy-sb indent-text
 
 \ 空白で区切った最初の語 (get_param_to_spc) と残り (get_param_to_eon)
 : param-spc ( a u -- ra ru ta tu ) lstrip { a u } 0 { k }

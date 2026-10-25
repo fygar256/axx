@@ -21,7 +21,7 @@ variable pend-sb
 : file@ ( -- a u ) cur-file-a @ cur-file-u @ ;
 
 \ ---- 同じ行で同じ診断を繰り返さない ----
-sb-new constant seen-sb               \ 診断を LF 区切りで並べる
+lazy-sb seen-sb               \ 診断を LF 区切りで並べる
 : seen-reset ( -- ) seen-sb sb-clear ;
 : seen-has? ( a u -- f ) { a u }
   seen-sb sb$ { sa su }  0 { st }

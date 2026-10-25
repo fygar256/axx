@@ -4,8 +4,8 @@ decimal
 
 
 \ ---- .reloc の宣言 (変数名 -> rtype mask pairs) ----
-3 om-new constant rcon
-1 om-new constant reloc-badname
+3 lazy-om rcon
+1 lazy-om reloc-badname
 
 \ ---- 参照の記録 ----
 8 cells constant REFSZ
@@ -101,7 +101,7 @@ create v2l-ptr  NVARS cells allot
       a u q sg-new sl cells v2l-ptr + !  1 sl cells v2l-kind + !
     else sl a u q v2l-second then
   else trk-widx @ 0>= if a u q trk-widx @ ref-add then then ;
-' trk-note-label is elf-note-label
+bind trk-note-label elf-note-label
 
 \ ---- 変数の読み ----
 : rcon-for ( slot -- sl|0 ) vslot-name rcon om-find ;
@@ -151,7 +151,7 @@ create v2l-ptr  NVARS cells allot
       then
     endof
   endcase ;
-' trk-note-var is elf-note-var
+bind trk-note-var elf-note-var
 
 \ ---- ラベル差 (_elf_diff_resolve) ----
 64 constant DRMAX
@@ -291,7 +291,7 @@ variable dr-n  variable dr-nord
       then
     then
   then ;
-' v2l-finish is elf-cap-finish
+bind v2l-finish elf-cap-finish
 
 \ ---- 行の始め・終わり ----
 : trk-line-begin ( -- )
@@ -299,8 +299,8 @@ variable dr-n  variable dr-nord
     true trk-on !  0 nrefs !  -1 trk-widx !  -1 trk-cap !  0 nhints !  v2l-clear
   then ;
 : trk-line-end ( -- ) false trk-on ! ;
-' trk-line-begin is elf-line-begin
-' trk-line-end is elf-line-end
+bind trk-line-begin elf-line-begin
+bind trk-line-end elf-line-end
 
 \ ---- 保存と復元 (候補の試行、[[ ]] の組合せ) ----
 16 constant TFRAMES
@@ -316,7 +316,7 @@ variable nfr
   v2l-kind nfr @ NVARS * cells fr-kind + NVARS cells move
   v2l-ptr nfr @ NVARS * cells fr-ptr + NVARS cells move
   1 nfr +! ;
-' trk-push-i is trk-push
+bind trk-push-i trk-push
 : trk-top-restore-i ( -- )
   trk-on @ 0= if exit then
   nfr @ 0= if exit then
@@ -324,9 +324,9 @@ variable nfr
   f cells fr-nrefs + @ nrefs !  f cells fr-nhints + @ nhints !
   f NVARS * cells fr-kind + v2l-kind NVARS cells move
   f NVARS * cells fr-ptr + v2l-ptr NVARS cells move ;
-' trk-top-restore-i is trk-top-restore
+bind trk-top-restore-i trk-top-restore
 : trk-pop-i ( -- ) trk-on @ 0= if exit then nfr @ 0> if -1 nfr +! then ;
-' trk-pop-i is trk-pop
+bind trk-pop-i trk-pop
 
 \ ---- 最良の候補の写し ----
 MAXREFS REFSZ * lazy best-refs
@@ -343,7 +343,7 @@ create cand-ptr  NVARS cells allot
   trk-on @ 0= if exit then
   nrefs @ cand-nr !  nhints @ cand-nh !
   v2l-kind cand-kind NVARS cells move  v2l-ptr cand-ptr NVARS cells move ;
-' trk-cand-begin-i is trk-cand-begin
+bind trk-cand-begin-i trk-cand-begin
 : trk-cand-best-i ( -- )
   trk-on @ 0= if exit then
   cand-nr @ best-base-r !  nrefs @ cand-nr @ - best-nrefs !
@@ -354,12 +354,12 @@ create cand-ptr  NVARS cells allot
     cand-nh @ hint-q best-hintq best-nhints @ QB * move
   then
   v2l-kind best-kind NVARS cells move  v2l-ptr best-ptr NVARS cells move ;
-' trk-cand-best-i is trk-cand-best
+bind trk-cand-best-i trk-cand-best
 : trk-cand-restore-i ( -- )
   trk-on @ 0= if exit then
   cand-nr @ nrefs !  cand-nh @ nhints !
   cand-kind v2l-kind NVARS cells move  cand-ptr v2l-ptr NVARS cells move ;
-' trk-cand-restore-i is trk-cand-restore
+bind trk-cand-restore-i trk-cand-restore
 : trk-best-install-i ( -- )
   trk-on @ 0= if exit then
   best-base-r @ nrefs !
@@ -371,14 +371,14 @@ create cand-ptr  NVARS cells allot
     best-nhints @ nhints +!
   then
   best-kind v2l-kind NVARS cells move  best-ptr v2l-ptr NVARS cells move ;
-' trk-best-install-i is trk-best-install
+bind trk-best-install-i trk-best-install
 
 \ 誤り条件の事前評価 (pass1-probe) の前後
 variable probe-nr  variable probe-nh  variable probe-widx
 : trk-probe-begin-i ( -- ) nrefs @ probe-nr !  nhints @ probe-nh !  trk-widx @ probe-widx ! ;
-' trk-probe-begin-i is trk-probe-begin
+bind trk-probe-begin-i trk-probe-begin
 : trk-probe-end-i ( -- ) probe-nr @ nrefs !  probe-nh @ nhints !  probe-widx @ trk-widx ! ;
-' trk-probe-end-i is trk-probe-end
+bind trk-probe-end-i trk-probe-end
 
 \ ---- 出力語ごと ----
 : trk-word-begin ( -- ) nobj @ trk-widx ! ;
@@ -390,10 +390,10 @@ variable probe-nr  variable probe-nh  variable probe-widx
     i hint@ { e }
     e cell+ @ w = e @ 2 <> and if -2 e cell+ ! then
   loop ;
-' trk-call-drop-i is elf-call-drop
-' trk-word-begin is elf-word-begin
-' trk-word-drop is elf-word-drop
+bind trk-call-drop-i elf-call-drop
+bind trk-word-begin elf-word-begin
+bind trk-word-drop elf-word-drop
 
 : trk-shift-refs ( n -- ) { n }
   nrefs @ 0 ?do i ref@ 2 cells + { p } p @ 0>= if n p +! then loop ;
-' trk-shift-refs is elf-shift-refs
+bind trk-shift-refs elf-shift-refs

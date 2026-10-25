@@ -85,7 +85,7 @@ decimal
     i rkind @ 30 = if i 0 dir-elf then
   loop
   check-elfdecls ;
-' register-elfdecls-impl is register-elfdecls
+bind register-elfdecls-impl register-elfdecls
 
 \ ---- --elfdesc ----
 : hexs ( u -- a u ) base @ >r hex 0 <# #s #> r> base ! 2dup slower 2swap 2drop ;
@@ -225,7 +225,7 @@ decimal
   desc-diff desc-extra desc-encode
   mt-rinfo-u @ if s" .elfrinfo::" ou mt-rinfo-a @ mt-rinfo-u @ ou dnl then
   desc-cfi desc-fields desc-hdr desc-sec desc-link desc-group ;
-' elf-desc-impl is elf-desc-out
+bind elf-desc-impl elf-desc-out
 
 \ ---- オプション (-m -f --osabi) ----
 : elf-options-impl ( -- ok )
@@ -245,4 +245,4 @@ decimal
     mb-get diag-wf
   then
   true ;
-' elf-options-impl is apply-elf-options
+bind elf-options-impl apply-elf-options

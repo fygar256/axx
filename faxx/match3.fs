@@ -5,7 +5,7 @@ decimal
 create gop 24 cells allot
 create gcl 24 cells allot
 create gstk 24 cells allot
-sb-new constant tb
+lazy-sb tb
 : find-groups ( a u -- ) { a u } 0 0 0 0 { k serial sp ser }
   begin k 1+ u < while
     a u k 91 91 at2? if
@@ -43,9 +43,8 @@ sb-new constant tb
   tb sb$ ;
 : popcnt ( n -- k ) 0 swap begin dup while dup 1 and rot + swap 1 rshift repeat drop ;
 
-: optg-warned-set ( -- om ) 1 om-new ;
-optg-warned-set constant optg-warned
-optg-warned-set constant budget-warned
+1 lazy-om optg-warned
+1 lazy-om budget-warned
 : warn-once ( a u om -- f ) { a u om }              \ 初めてなら登録して true
   a u om om-find if false exit then
   a u om om-put drop true ;

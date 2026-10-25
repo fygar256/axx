@@ -57,8 +57,8 @@ create fr-func 130 cells allot
 QB MAX-EMIT * lazy mout
 create mout-str 1 cells allot                 \ (未使用)
 variable nout
-1 om-new constant mini-suspects
-1 om-new constant fallback-names
+1 lazy-om mini-suspects
+1 lazy-om fallback-names
 variable mini-ret                              \ 返り値 (0 なら値なし)
 variable ctl-m                                 \ 0 なし 1 break 2 continue 3 return
 
@@ -127,7 +127,7 @@ defer mi-call ( f args n -- ret|0 )
   rt-head s" no function named " mb+ a u repr1 mb+ mini-throw 0 ;
 
 \ ---- 文字列の道具 ----
-sb-new constant mi-sb
+lazy-sb mi-sb
 : need-strlen ( n -- ) MAX-ARRAY > if rt-head s" string longer than the maximum length 1048576" mb+ mini-throw then ;
 : mini-dec-s ( q -- v ) q>dec mi-s ;
 : str-concat ( a b -- v )
@@ -314,7 +314,7 @@ sb-new constant mi-sb
     E-BIN of e binop endof
     rt-head s" bad expression" mb+ mini-throw 0
   endcase ;
-' mi-eval-impl is mi-eval
+bind mi-eval-impl mi-eval
 
 \ ---- 代入 ----
 : slice-bound ( e -- n flag ) dup 0= if drop 0 false exit then mi-eval s" a slice bound" need-int q>n true ;
@@ -456,7 +456,7 @@ variable echo-cur
   0 ctl-m !
   -1 nframes +!
   vars om-free nl om-free ;
-' mi-call-impl is mi-call
+bind mi-call-impl mi-call
 
 : mi-call-stmt ( s -- ) { s }
   s 0 sf s@ mini-lookup { f }

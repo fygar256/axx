@@ -9,42 +9,42 @@ variable elf-class-cli 0 elf-class-cli !            \ -f: 0 なし / 1 = 32 / 2 
 variable elf-osabi-v   0 elf-osabi-v !
 variable decl-gen      0 decl-gen !
 
-1 om-new constant elftypes                          \ 型名(小文字) -> 型番号
-1 om-new constant type-width                        \ 型名 -> 欄の幅
-1 om-new constant type-pcrel                        \ 型名 -> 1
+1 lazy-om elftypes                          \ 型名(小文字) -> 型番号
+1 lazy-om type-width                        \ 型名 -> 欄の幅
+1 lazy-om type-pcrel                        \ 型名 -> 1
 
 variable d-machine  -1 d-machine !
 create d-name 2 cells allot  d-name 2 cells erase
 : d-name-a d-name ;  : d-name-u d-name cell+ ;
 variable d-class    0 d-class !                     \ 0 なし / 1 / 2
 variable d-rela     -1 d-rela !
-2 om-new constant d-width                           \ 幅(10 進) -> 型の綴り
+2 lazy-om d-width                           \ 幅(10 進) -> 型の綴り
 create d-extern 2 cells allot  d-extern 2 cells erase
 : d-extern-a d-extern ;  : d-extern-u d-extern cell+ ;
 create d-dwarf 2 cells allot  d-dwarf 2 cells erase
 : d-dwarf-a d-dwarf ;  : d-dwarf-u d-dwarf cell+ ;
-1 om-new constant d-hdr                             \ 欄名 -> 値
-4 om-new constant d-field                           \ 型の綴り -> mask off sh bias
-4 om-new constant d-sec                             \ 名前(小文字) -> fl ty al es (-1 = なし)
+1 lazy-om d-hdr                             \ 欄名 -> 値
+4 lazy-om d-field                           \ 型の綴り -> mask off sh bias
+4 lazy-om d-sec                             \ 名前(小文字) -> fl ty al es (-1 = なし)
 variable d-pcguess  -1 d-pcguess !
 variable d-relax    -1 d-relax !
 variable d-builtin  -1 d-builtin !
-1 om-new constant d-extra                           \ 型の綴り -> om (添える型の綴り -> シンボル)
-4 om-new constant d-diff                            \ 幅 -> 足す型 a u, 引く型 a u
-4 om-new constant d-diff-t
-2 om-new constant d-encode                          \ 型の綴り -> 関数名
-1 om-new constant d-anchor
-1 om-new constant d-resolve
-2 om-new constant d-unaligned
+1 lazy-om d-extra                           \ 型の綴り -> om (添える型の綴り -> シンボル)
+4 lazy-om d-diff                            \ 幅 -> 足す型 a u, 引く型 a u
+4 lazy-om d-diff-t
+2 lazy-om d-encode                          \ 型の綴り -> 関数名
+1 lazy-om d-anchor
+1 lazy-om d-resolve
+2 lazy-om d-unaligned
 create d-rinfo 2 cells allot  d-rinfo 2 cells erase
 : d-rinfo-a d-rinfo ;  : d-rinfo-u d-rinfo cell+ ;
 variable d-unit     0 d-unit !                      \ 0 なし / 1 byte / 2 word
-4 om-new constant d-link                            \ 名前(小文字) -> lk a u, inf a u
-7 om-new constant d-group                           \ 鍵 -> gn a u, sig a u, fl, mem a u
+4 lazy-om d-link                            \ 名前(小文字) -> lk a u, inf a u
+7 lazy-om d-group                           \ 鍵 -> gn a u, sig a u, fl, mem a u
 variable d-cfi?     false d-cfi? !
 variable d-cfi-ra  variable d-cfi-ca  variable d-cfi-da  variable d-cfi-pad
-1 om-new constant d-cfiinit
-1 om-new constant d-cfireg
+1 lazy-om d-cfiinit
+1 lazy-om d-cfireg
 
 : elf-gen+ ( -- ) 1 decl-gen +! ;
 
@@ -60,6 +60,12 @@ variable d-cfi-ra  variable d-cfi-ca  variable d-cfi-da  variable d-cfi-pad
   ad @ if ad @ ad cell+ @ a u str=cs if exit then then
   a u intern ad cell+ ! ad ! elf-gen+ ;
 : dstr@ ( addr -- a u ) dup @ swap cell+ @ ;
+
+: fld4= ( e m off sh bias -- f ) { e m off sh bias } e @ m = e cell+ @ off = and e 2 cells + @ sh = and e 3 cells + @ bias = and ;
+: dstr2= ( e a u b bu -- f ) { e a u b bu } e dstr@ a u str=cs e 2 cells + dstr@ b bu str=cs and ;
+: grp= ( e ga gu sa su fl mb k -- f ) { e ga gu sa su fl mb k }
+  e dstr@ ga gu str=cs e 2 cells + dstr@ sa su str=cs and e 4 cells + @ fl = and e 5 cells + dstr@ mb k str=cs and ;
+: sec4= ( e fl ty al es -- f ) { e fl ty al es } e @ fl = e cell+ @ ty = and e 2 cells + @ al = and e 3 cells + @ es = and ;
 
 \ Python の int(s, 0) (符号と 0x 0o 0b、'_' 可)
 : parse-int0 ( a u -- n ok ) { a u }
@@ -139,7 +145,7 @@ variable d-cfi-ra  variable d-cfi-ca  variable d-cfi-da  variable d-cfi-pad
 
 \ 型の綴りを型番号へ (_elf_decl_type): 数ならそのまま、名前なら .elftype、次に表
 defer mt-named-find ( a u -- rt true | false )
-:noname 2drop false ; is mt-named-find
+: mt-named-find-nn6 2drop false ; bind mt-named-find-nn6 mt-named-find
 
 : decl-type ( a u -- rt true | false ) { a u }
   a u strip-spaces2 to u to a
@@ -238,7 +244,7 @@ defer mt-named-find ( a u -- rt true | false )
   0 { bias }
   r 5 rf-nb? if s" .elffield" -2147483647 2147483647 elf-num 0= if drop exit then to bias else 2drop then
   t tl d-field om-find ?dup if
-    >r r@ @ m = r@ cell+ @ off = and r@ 2 cells + @ sh = and r@ 3 cells + @ bias = and r> drop if exit then
+    m off sh bias fld4= if exit then
   then
   t tl d-field om-put { sl }
   m sl !  off sl cell+ !  sh sl 2 cells + !  bias sl 3 cells + !  elf-gen+ ;
@@ -289,7 +295,7 @@ defer mt-named-find ( a u -- rt true | false )
   f1u 0> if f1a f1u plain-num? 0= else false then if
     au 0= bu 0= or if s"  error - .elfdiff: an add type and a subtract type are required." diag-e exit then
     f1a f1u d-diff-t om-find ?dup if
-      >r r@ dstr@ aa au str=cs r@ 2 cells + dstr@ ba bu str=cs and r> drop if exit then
+      aa au ba bu dstr2= if exit then
     then
     f1a f1u d-diff-t om-put { sl }
     aa au sl dstr  ba bu sl 2 cells + dstr  elf-gen+ exit
@@ -297,7 +303,7 @@ defer mt-named-find ( a u -- rt true | false )
   f1a f1u s" .elfdiff" 1 8 elf-num 0= if drop exit then { w }
   au 0= bu 0= or if s"  error - .elfdiff: an add type and a subtract type are required." diag-e exit then
   w n>s d-diff om-find ?dup if
-    >r r@ dstr@ aa au str=cs r@ 2 cells + dstr@ ba bu str=cs and r> drop if exit then
+    aa au ba bu dstr2= if exit then
   then
   w n>s d-diff om-put { sl }
   0 sl ! 0 sl cell+ ! 0 sl 2 cells + ! 0 sl 3 cells + !
@@ -331,7 +337,7 @@ defer mt-named-find ( a u -- rt true | false )
   nu 0= if s"  error - .elflink: section name is not specified." diag-e exit then
   na nu slower { ka ku }
   ka ku d-link om-find ?dup if
-    >r r@ dstr@ la lu str=cs r@ 2 cells + dstr@ ia iu str=cs and r> drop if exit then
+    la lu ia iu dstr2= if exit then
   then
   ka ku d-link om-put { sl }
   0 sl ! 0 sl cell+ ! 0 sl 2 cells + ! 0 sl 3 cells + !
@@ -396,8 +402,7 @@ defer mt-named-find ( a u -- rt true | false )
   k 0= if s"  error - .elfgroup: no member section is given." diag-e exit then
   ga gu slower s\" \x01" sconcat sa su sconcat { ka ku }
   ka ku d-group om-find ?dup if
-    >r r@ dstr@ ga gu str=cs r@ 2 cells + dstr@ sa su str=cs and r@ 4 cells + @ fl = and
-      r@ 5 cells + dstr@ mb k str=cs and r> drop if exit then
+    ga gu sa su fl mb k grp= if exit then
   then
   ka ku d-group om-put { sl }
   0 sl ! 0 sl cell+ ! 0 sl 2 cells + ! 0 sl 3 cells + !
@@ -423,7 +428,7 @@ defer mt-named-find ( a u -- rt true | false )
   r 5 rf-nb? if s" .elfsection" 0 4294967295 elf-num 0= if drop exit then to es else 2drop then
   nm nml slower { ka ku }
   ka ku d-sec om-find ?dup if
-    >r r@ @ fl = r@ cell+ @ ty = and r@ 2 cells + @ al = and r@ 3 cells + @ es = and r> drop if exit then
+    fl ty al es sec4= if exit then
   then
   ka ku d-sec om-put { sl }
   fl sl !  ty sl cell+ !  al sl 2 cells + !  es sl 3 cells + !  elf-gen+ ;
@@ -456,4 +461,4 @@ defer mt-named-find ( a u -- rt true | false )
   ka ku s" .elfcfiinit" str=cs if r de-cfiinit exit then
   ka ku s" .elfcfireg" str=cs if r de-cfireg exit then
   ka ku s" .elfunaligned" str=cs if r de-unaligned exit then ;
-' dir-elf-impl is dir-elf
+bind dir-elf-impl dir-elf

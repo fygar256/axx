@@ -3,7 +3,7 @@
 decimal
 
 defer elf-sectioned? ( -- f )
-:noname false ; is elf-sectioned?
+: elf-sectioned?-nn63 false ; bind elf-sectioned?-nn63 elf-sectioned?
 
 \ ---- 出力語の置き場 ----
 variable wbuf  variable wset  variable wcap  variable omax
@@ -54,7 +54,7 @@ variable out-file-a  variable out-file-u  variable has-outfile
 : outbin2-n ( pos n -- ) qn outbin2 ;
 
 \ ---- セクション ----
-4 om-new constant sections                      \ 名前 -> [start size entry_pc confirmed]
+4 lazy-om sections                      \ 名前 -> [start size entry_pc confirmed]
 variable nranges
 create range-na 4096 cells allot  create range-nu 4096 cells allot
 create range-s 4096 cells allot   create range-l 4096 cells allot

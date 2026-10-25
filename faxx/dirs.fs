@@ -8,10 +8,10 @@ variable bts           8 bts !
 variable endian-big    false endian-big !
 variable align-v       16 align-v !
 variable passthru      variable eol-on    variable textmode
-1 om-new constant chkmap              \ 変数 -> arr (許すシンボル、'' は省略可の印)
-3 om-new constant enumdefs            \ 変数 -> [names arr][expr a][expr u]
-1 om-new constant vartabs             \ 変数 -> om (名前 -> q)  (.unordered の .map)
-1 om-new constant freed-subs
+1 lazy-om chkmap              \ 変数 -> arr (許すシンボル、'' は省略可の印)
+3 lazy-om enumdefs            \ 変数 -> [names arr][expr a][expr u]
+1 lazy-om vartabs             \ 変数 -> om (名前 -> q)  (.unordered の .map)
+1 lazy-om freed-subs
 0 constant pad-init
 variable unordered-on
 
@@ -25,7 +25,7 @@ create vliw-pat-a 256 cells allot
 create vliw-pat-u 256 cells allot
 
 \ エラー文言
-2 om-new constant errtab               \ 10 進の番号 -> (a u) を値に持つ (value[0]=a [1]=u)
+2 lazy-om errtab               \ 10 進の番号 -> (a u) を値に持つ (value[0]=a [1]=u)
 : errtab-init ( -- )
   errtab om-clear ;
 : err-set ( code a u -- ) { c a u } c n>s errtab om-put a u hdup rot s! ;

@@ -180,7 +180,7 @@ variable tmp-i
 : qundef? ( a -- f ) qundef q= ;
 : qabs ( a -- r ) dup q-neg? if qneg then ;
 defer qband-warn ( -- )                         \ 大きな値を未定義由来とみなすときの警告 (一度だけ)
-:noname ; is qband-warn
+: qband-warn-nn65 ; bind qband-warn-nn65 qband-warn
 : q-band? ( a -- f ) qabs 3 cells + @ 0<> ;      \ u256_in_undef_band
 : qundef-derived? ( a -- f )
   dup qundef? if drop true exit then

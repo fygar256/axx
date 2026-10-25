@@ -3,11 +3,11 @@
 decimal
 
 \ ---- 基盤 (組み込みの表) ----
-2 om-new constant bs-named                          \ 名前 -> rt w
-1 om-new constant bs-bytes                          \ rt -> w
+2 lazy-om bs-named                          \ 名前 -> rt w
+1 lazy-om bs-bytes                          \ rt -> w
 create bs-wg 9 cells allot
-1 om-new constant bs-pc
-4 om-new constant bs-field
+1 lazy-om bs-pc
+4 lazy-om bs-field
 variable bs-ext  variable bs-dwarf  variable bs-rela  variable bs-class  variable bs-pcg
 variable bs-name-a  variable bs-name-u
 
@@ -27,7 +27,7 @@ variable bs-name-a  variable bs-name-u
 : b-field ( rt mask off sh bias -- ) { rt m off sh bias }
   rt rtk bs-field om-put { sl }
   m sl !  off sl cell+ !  sh sl 2 cells + !  bias sl 3 cells + ! ;
-sb-new constant known-sb
+lazy-sb known-sb
 : b-known+ ( a u -- ) known-sb sb-len if s" , " known-sb sb+ then known-sb sb+ ;
 
 : bs-clear ( -- )
@@ -39,18 +39,18 @@ sb-new constant known-sb
 s" elfmach.fs" included
 
 \ ---- 実表 ----
-1 om-new constant mt-named                          \ 名前 -> rt
-1 om-new constant mt-bytes                          \ rt -> 幅
-2 om-new constant mt-rev                            \ rt -> 名前
-1 om-new constant mt-pc
-4 om-new constant mt-field                          \ rt -> mask off sh bias
-1 om-new constant mt-extra                          \ rt -> 配列 [n][crt sym]*
-2 om-new constant mt-diff                           \ 幅 -> ra rb
-2 om-new constant mt-diff-t                         \ rt -> ra rb
-2 om-new constant mt-encode                         \ rt -> 関数名
-1 om-new constant mt-anchor
-1 om-new constant mt-resolve
-1 om-new constant mt-unal                           \ rt -> 代わりの rt
+1 lazy-om mt-named                          \ 名前 -> rt
+1 lazy-om mt-bytes                          \ rt -> 幅
+2 lazy-om mt-rev                            \ rt -> 名前
+1 lazy-om mt-pc
+4 lazy-om mt-field                          \ rt -> mask off sh bias
+1 lazy-om mt-extra                          \ rt -> 配列 [n][crt sym]*
+2 lazy-om mt-diff                           \ 幅 -> ra rb
+2 lazy-om mt-diff-t                         \ rt -> ra rb
+2 lazy-om mt-encode                         \ rt -> 関数名
+1 lazy-om mt-anchor
+1 lazy-om mt-resolve
+1 lazy-om mt-unal                           \ rt -> 代わりの rt
 create mt-wg 9 cells allot
 variable mt-ext  variable mt-dwarf  variable mt-rela  variable mt-class  variable mt-pcg
 variable mt-name-a  variable mt-name-u
@@ -59,7 +59,7 @@ variable mt-unit                                    \ 0 byte / 1 word
 variable mt-key-m  -1 mt-key-m !  variable mt-key-g  -1 mt-key-g !
 
 : mt-named-find-impl ( a u -- rt true | false ) mt-named om-find ?dup if @ true else false then ;
-' mt-named-find-impl is mt-named-find
+bind mt-named-find-impl mt-named-find
 
 : ml-add ( list crt csym -- list' ) { l crt cs }
   l 0= if 3 cells allocate throw to l 0 l ! else
@@ -257,9 +257,9 @@ variable mt-key-m  -1 mt-key-m !  variable mt-key-g  -1 mt-key-g !
 : reloc-named-t ( a u -- rt true | false )
   mach-table slower 2dup elftypes om-find ?dup if nip nip @ true exit then
   mt-named om-find ?dup if @ true else false then ;
-:noname ( a u -- n ) reloc-named-t if else -1 then ; is reloc-named
-' reloc-named is equ-reloc-named
-:noname elf-machine @ ; is equ-machine-no
+: reloc-named-nn8 ( a u -- n ) reloc-named-t if else -1 then ; bind reloc-named-nn8 reloc-named
+bind reloc-named equ-reloc-named
+: equ-machine-no-nn9 elf-machine @ ; bind equ-machine-no-nn9 equ-machine-no
 
 \ ---- 名前順の並べ替え (Python の sorted(dict.items())) ----
 \ om のエントリ番号の列を鍵 (a u) のバイト順で並べる。生きているものだけ。
@@ -282,5 +282,5 @@ variable so-num                                     \ 1 なら鍵を数として
     x arr j cells + !
   loop then
   arr n ;
-' sort-om is equ-sort-om
+bind sort-om equ-sort-om
 : sort-om-num ( om -- arr n ) 1 so-num ! sort-om 0 so-num ! ;

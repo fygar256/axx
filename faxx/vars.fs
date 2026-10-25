@@ -6,8 +6,8 @@
 decimal
 
 256 constant NVARS
-2 om-new constant vname-map            \ 名前 -> slot (value[0])
-1 om-new constant varnames            \ 使われた変数名 (.exp の検査用)
+2 lazy-om vname-map            \ 名前 -> slot (value[0])
+1 lazy-om varnames            \ 使われた変数名 (.exp の検査用)
 create vname-a NVARS cells allot       \ slot -> 名前
 create vname-u NVARS cells allot
 variable nvslots
@@ -109,24 +109,24 @@ variable trk-on     false trk-on !
 variable trk-widx   -1 trk-widx !
 variable trk-cap    -1 trk-cap !
 defer elf-cap-finish ( slot a u -- )               \ 変数の取り込みが終わったところ
-:noname 2drop drop ; is elf-cap-finish
+: elf-cap-finish-nn66 2drop drop ; bind elf-cap-finish-nn66 elf-cap-finish
 defer trk-push ( -- )
-:noname ; is trk-push
+: trk-push-nn67 ; bind trk-push-nn67 trk-push
 defer trk-top-restore ( -- )
-:noname ; is trk-top-restore
+: trk-top-restore-nn68 ; bind trk-top-restore-nn68 trk-top-restore
 defer trk-pop ( -- )
-:noname ; is trk-pop
+: trk-pop-nn69 ; bind trk-pop-nn69 trk-pop
 defer trk-cand-begin ( -- )
-:noname ; is trk-cand-begin
+: trk-cand-begin-nn70 ; bind trk-cand-begin-nn70 trk-cand-begin
 defer trk-cand-best ( -- )
-:noname ; is trk-cand-best
+: trk-cand-best-nn71 ; bind trk-cand-best-nn71 trk-cand-best
 defer trk-cand-restore ( -- )
-:noname ; is trk-cand-restore
+: trk-cand-restore-nn72 ; bind trk-cand-restore-nn72 trk-cand-restore
 defer trk-best-install ( -- )
-:noname ; is trk-best-install
+: trk-best-install-nn73 ; bind trk-best-install-nn73 trk-best-install
 defer trk-probe-begin ( -- )
-:noname ; is trk-probe-begin
+: trk-probe-begin-nn74 ; bind trk-probe-begin-nn74 trk-probe-begin
 defer trk-probe-end ( -- )
-:noname ; is trk-probe-end
+: trk-probe-end-nn75 ; bind trk-probe-end-nn75 trk-probe-end
 defer elf-call-drop ( w -- )
-:noname drop ; is elf-call-drop
+: elf-call-drop-nn76 drop ; bind elf-call-drop-nn76 elf-call-drop

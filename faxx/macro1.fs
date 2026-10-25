@@ -85,13 +85,13 @@ true mp-new constant mp-pat
 
 \ ---- アセンブラ側からラベルを引く (前回の反復の値) ----
 variable mlabels-valid
-2 om-new constant mlabel-names           \ unused (名前の集合は labels を使う)
-4 om-new constant mlabel-vals
+2 lazy-om mlabel-names           \ unused (名前の集合は labels を使う)
+4 lazy-om mlabel-vals
 variable mlinepcs-n
-create mlinepcs-a 1048576 cells allocate throw drop
+1048576 cells lazy mlinepcs-a
 \ ファイル名 -> 行ごとの PC の配列
-2 om-new constant mline-pcs-prev         \ 名前 -> (ptr n)
-2 om-new constant mline-pcs-cur
+2 lazy-om mline-pcs-prev         \ 名前 -> (ptr n)
+2 lazy-om mline-pcs-cur
 variable cur-line-pcs                    \ 現在の行 PC 配列 (動的)
 variable cur-line-pcs-n
 variable cur-line-pcs-cap
@@ -139,11 +139,11 @@ variable x-fa variable x-fu variable x-ln
   if x-noeval? 0= if ovf-err then then 2drop s ;
 : i64* ( a b -- c ) 2dup m* { lo hi } 2drop
   hi lo 0< if -1 else 0 then <> if x-noeval? 0= if ovf-err then then lo ;
-: i64neg ( a -- b ) dup $8000000000000000 = if x-noeval? 0= if ovf-err then then negate ;
+: i64neg ( a -- b ) dup -1 63 lshift = if x-noeval? 0= if ovf-err then then negate ;
 
 : c-div ( a b -- q )
   dup 0= if 2drop 0 exit then
-  2dup -1 = swap $8000000000000000 = and if 2drop x-noeval? 0= if ovf-err then 0 exit then
+  2dup -1 = swap -1 63 lshift = and if 2drop x-noeval? 0= if ovf-err then 0 exit then
   { a b }
   a 0< if a negate else a then b 0< if b negate else b then >r 0 r> um/mod nip { q }
   a 0>= b 0>= = if q else q negate then ;
@@ -270,7 +270,7 @@ defer x-unary-d
     xerr-head s" string repetition too large" mb+ xerr-tail
   then
   n l * ;
-sb-new constant rep-b
+lazy-sb rep-b
 : str-repeat ( a u n -- v ) { a u n }
   n u safe-rep-len { tot }
   rep-b sb-clear  n 0> if n 0 ?do a u rep-b sb+ loop then
@@ -293,7 +293,7 @@ sb-new constant rep-b
       x-need-int r c-mod mv-int true
     else false then then then
   0= until ;
-sb-new constant cat-b
+lazy-sb cat-b
 : x-add ( -- v ) x-mul
   begin x-skip 0 x-ch { c }
     c 43 = if
@@ -417,7 +417,7 @@ sb-new constant cat-b
     taken 1 = if -1 x-sup +! then
     taken 2 = if b else a then
   else c then ;
-' x-ternary-impl is x-ternary
+bind x-ternary-impl x-ternary
 
 : m-eval ( a u fa fu ln -- v ) { a u fa fu ln }
   begin u 0> if a c@ dup 32 = swap 9 = or else false then while a 1+ to a u 1- to u repeat

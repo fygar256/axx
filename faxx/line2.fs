@@ -4,19 +4,19 @@ decimal
 
 \ ---- ELF / マクロ / VLIW が差し込む口 ----
 defer elf-src-dir ( la lu l2a l2u -- handled? )        \ .extern .global .type .size .weak ... .comm .cfi_*
-:noname 2drop 2drop false ; is elf-src-dir
+: elf-src-dir-nn23 2drop 2drop false ; bind elf-src-dir-nn23 elf-src-dir
 defer asm-include ( a u -- )                           \ .include の実体 (fileassemble)
-:noname 2drop ; is asm-include
+: asm-include-nn24 2drop ; bind asm-include-nn24 asm-include
 defer snap-extra-take ( -- )                            \ ELF の表の写し
-:noname ; is snap-extra-take
+: snap-extra-take-nn25 ; bind snap-extra-take-nn25 snap-extra-take
 defer snap-extra-restore ( -- )
-:noname ; is snap-extra-restore
+: snap-extra-restore-nn26 ; bind snap-extra-restore-nn26 snap-extra-restore
 defer lineclear-extra ( -- )                            \ 行ごとに消す ELF の表
-:noname ; is lineclear-extra
+: lineclear-extra-nn27 ; bind lineclear-extra-nn27 lineclear-extra
 defer cand-begin ( -- )                                 \ 候補ごとの追跡の起点 (ELF のラベル参照)
-:noname ; is cand-begin
+: cand-begin-nn28 ; bind cand-begin-nn28 cand-begin
 defer cand-end-fail ( -- )
-:noname ; is cand-end-fail
+: cand-end-fail-nn29 ; bind cand-end-fail-nn29 cand-end-fail
 
 : vliw-sep? ( c -- f ) dup VLIW-SEP-C = swap VLIW-STOP-C = or ;
 
@@ -81,14 +81,14 @@ variable dirorder-n
 MAXROWS cells lazy pn-next
 MAXROWS cells lazy palways
 variable npalways
-2 om-new constant pidx                         \ 先頭大文字列 -> [開いた先頭 row+1][閉じた先頭 row+1]
+2 lazy-om pidx                         \ 先頭大文字列 -> [開いた先頭 row+1][閉じた先頭 row+1]
 variable pmaxkey
 MAXROWS cells lazy cand
 variable ncand
 
 : pfx-word? ( c -- f ) dup alnc? swap 95 = or ;
 : pfx-open? ( c -- f ) dup lowc? over digc? or swap dup 33 = swap dup 92 = swap dup 91 = swap 95 = or or or or ;
-sb-new constant lc-b
+lazy-sb lc-b
 : lead-caps ( a u -- pa pu closed ) { a u } 0 { k }
   lc-b sb-clear
   begin k u < if a k + c@ dup capc? swap 32 = or else false then while
@@ -164,7 +164,7 @@ create nextraw 64 allot
 variable best-row
 create best-score 3 cells allot
 variable best-undef
-sb-new constant best-diag
+lazy-sb best-diag
 variable snap-live                    \ 最良の時点の状態を写してあるか
 variable snap-need                    \ 最良の後でディレクティブが動いたか
 
@@ -174,9 +174,9 @@ create sv-nop 1024 allot
 variable sv-endian variable sv-bts variable sv-pad
 variable sv-vb variable sv-vi variable sv-vt variable sv-vf variable sv-vnn variable sv-vset
 create sv-vidx 256 cells allot  create sv-vpa 256 cells allot  create sv-vpu 256 cells allot
-4 om-new constant sv-psyms
-1 om-new constant sv-chk
-3 om-new constant sv-enum
+4 lazy-om sv-psyms
+1 lazy-om sv-chk
+3 lazy-om sv-enum
 
 : chk-copy ( src dst -- ) { src dst }                   \ 配列まで複写する
   dst om-used 0 ?do i dst om-live? if i dst om-val dup @ arr-free 0 swap ! then loop
@@ -266,7 +266,7 @@ variable nsym-dirty  true nsym-dirty !
 
 \ ---- 1 行 ----
 defer vliw-sentinel-hook ( -- )
-:noname ; is vliw-sentinel-hook
+: vliw-sentinel-hook-nn30 ; bind vliw-sentinel-hook-nn30 vliw-sentinel-hook
 
 : pass1-probe ( row -- ) { row }
   pc @ pc-start !  pc-start @ pc-end !
@@ -354,7 +354,7 @@ variable sc-sent  variable sc-idxs
   br 1 rf error-eval 0= if br 2 rf makeobj else 0 nobj ! then
   br 3 rf 0 expr-pat drop ;
 
-sb-new constant loc-b
+lazy-sb loc-b
 : loc-text ( -- a u )
   loc-b sb-clear  s"   [" loc-b sb+  file@ loc-b sb+  s" :" loc-b sb+  line-no @ n>s loc-b sb+  s" ]" loc-b sb+
   loc-b sb$ ;

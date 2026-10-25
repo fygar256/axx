@@ -3,13 +3,13 @@
 decimal
 
 defer mini-call ( a u k semi drp -- k' )         \ .call。語を objl に足し、読み終えた位置を返す
-:noname 2drop 2drop drop 1000000 ; is mini-call
+: mini-call-nn50 2drop 2drop drop 1000000 ; bind mini-call-nn50 mini-call
 defer elf-word-begin ( -- )
 defer elf-word-drop ( -- )                       \ 出力しなかった語の参照記録を捨てる
-:noname ; is elf-word-begin
-:noname ; is elf-word-drop
+: elf-word-begin-nn51 ; bind elf-word-begin-nn51 elf-word-begin
+: elf-word-drop-nn52 ; bind elf-word-drop-nn52 elf-word-drop
 
-sb-new constant epb
+lazy-sb epb
 variable epb-hc
 
 : skip-qstr ( a u i0 -- i' ) { a u i0 } i0 1+ { k }
@@ -83,14 +83,14 @@ defer ep-expand
       then
     then
   repeat ;
-' ep-expand-impl is ep-expand
+bind ep-expand-impl ep-expand
 
 : expand-binlist ( a u -- a' u' empty? )
   epb sb-clear  false epb-hc !
   ep-expand
   epb sb$ sdup epb-hc @ 0= ;
 
-sb-new constant pb
+lazy-sb pb
 : pct-replace ( a u -- a' u' ) { a u } 0 0 0 { k cnt e }
   pb sb-clear
   begin k u < while
@@ -113,7 +113,7 @@ sb-new constant pb
 : word-mask ( -- q ) bts @ 0> if q1 bts @ qshl q1 q- else q0 qnot then ;
 : obj-byte ( n -- ) qn obj+ ;
 
-sb-new constant txtacc  sb-new constant dispacc  variable txt-any
+lazy-sb txtacc  lazy-sb dispacc  variable txt-any
 : emit-template ( ta tu -- ) { ta tu }
   true txt-any !
   ta tu txtacc sb+

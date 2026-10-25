@@ -202,7 +202,7 @@ create imp-sec-a 4096 cells allot  create imp-sec-u 4096 cells allot
 4096 QB * lazy imp-sec-z
 
 defer reloc-named ( a u -- n )             \ 名前から再配置の型。分からなければ -1
-:noname 2drop -1 ; is reloc-named
+: reloc-named-nn40 2drop -1 ; bind reloc-named-nn40 reloc-named
 
 create tf-a 8 cells allot   create tf-u 8 cells allot
 : split-tabs ( a u -- n ) { a u }                   \ 最初の 4 欄を tf-a / tf-u へ。欄の数 (全部) を返す
@@ -267,9 +267,9 @@ create tf-a 8 cells allot   create tf-u 8 cells allot
   true ;
 
 \ ---- パス ----
-10 om-new constant imported-labels
-4 om-new constant pass1-final
-6 om-new constant pcs-prev
+10 lazy-om imported-labels
+4 lazy-om pass1-final
+6 lazy-om pcs-prev
 variable pcs-prev-valid
 65536 cells lazy hist-h
 65536 cells lazy hist-i
@@ -280,7 +280,7 @@ variable hist-n
   hist-n @ cells hist-i + !  hist-n @ cells hist-h + !  1 hist-n +! ;
 
 defer pass-reset-extra ( passno -- )
-:noname drop ; is pass-reset-extra
+: pass-reset-extra-nn41 drop ; bind pass-reset-extra-nn41 pass-reset-extra
 
 : reset-for-pass ( -- )
   0 pc !  1 line-no !
@@ -309,7 +309,7 @@ defer pass-reset-extra ( passno -- )
       i labels om-val { sl }
       sl @ { x } sl 1 cells + @ { x1 } sl 2 cells + @ { x2 } sl 3 cells + @ { x3 }
       sl lab-sec fnv { sh }
-      h  nh x 11400714819323198485 * xor x1 3 * xor x2 5 * xor x3 7 * xor sh 13 * xor  + to h
+      h  nh x $9e3779b9 32 lshift $7f4a7c15 or * xor x1 3 * xor x2 5 * xor x3 7 * xor sh 13 * xor  + to h
     then
   loop
   h labels om-count xor ;
@@ -501,7 +501,7 @@ defer pass-reset-extra ( passno -- )
 
 \ ---- -b のファイル ----
 defer raw-zero-warn ( -- )                       \ -o と -b を同時に使ったときの警告
-:noname ; is raw-zero-warn
+: raw-zero-warn-nn42 ; bind raw-zero-warn-nn42 raw-zero-warn
 variable fl-pos
 : flush-raw ( -- )
   has-outfile @ 0= if exit then
@@ -547,17 +547,17 @@ variable fl-pos
 
 \ ---- 出力 (-o と -e/-E) の口 ----
 defer write-elf-obj ( -- )
-:noname ; is write-elf-obj
+: write-elf-obj-nn43 ; bind write-elf-obj-nn43 write-elf-obj
 defer write-exports ( -- ok )
-:noname true ; is write-exports
+: write-exports-nn44 true ; bind write-exports-nn44 write-exports
 defer elf-desc-out ( -- )
-:noname ; is elf-desc-out
+: elf-desc-out-nn45 ; bind elf-desc-out-nn45 elf-desc-out
 defer register-elfdecls ( -- )
-:noname ; is register-elfdecls
+: register-elfdecls-nn46 ; bind register-elfdecls-nn46 register-elfdecls
 defer macro-expand-only ( fa fu dest-a dest-u pat? -- ok )
-:noname 2drop 2drop drop false ; is macro-expand-only
+: macro-expand-only-nn47 2drop 2drop drop false ; bind macro-expand-only-nn47 macro-expand-only
 defer apply-elf-options ( -- ok )
-:noname true ; is apply-elf-options
+: apply-elf-options-nn48 true ; bind apply-elf-options-nn48 apply-elf-options
 
 : pass2 ( a u -- ) { sa su }
   reset-for-pass
@@ -581,7 +581,7 @@ create inbuf 1024 allot
   begin
     pc @ 16 hexw s" : " type
     s" >> " type
-    inbuf 1024 stdin read-line throw
+    inbuf 1024 stdin-line throw
   while
     inbuf swap trim
     dup 0= if 2drop else
@@ -653,7 +653,7 @@ create inbuf 1024 allot
 
 \ 標準出力へ書けなかったか (caxx.c の最後の fflush と同じ報告)
 : stdout-ok? ( -- f )
-  stdout flush-file dup 0= if drop true exit then
+  stdout-flush dup 0= if drop true exit then
   512 + negate { en }
   mb-reset s"  error - cannot write to standard output: [Errno " mb+ en mb-n s" ] " mb+ en errno-text mb+
   mb-get etype ecr false ;

@@ -3,6 +3,7 @@
 #   ./cmp_forth            全部
 #   ./cmp_forth 5 12       test1 の caxx 行のうち 5〜12 番目だけ
 #   FORTH_ONLY=1 ./cmp_forth ...   期待値（caxx の結果）を作り直さない
+#   FAXXBIN=./faxx.bin ./cmp_forth  gforth の代わりに ccforth で作った実行ファイルを使う
 # 期待値は $CMP_CACHE（既定 /tmp/cmp_forth_cache）に貯める。
 R=$(cd "$(dirname "$0")" && pwd)
 P=$R/patfile; S=$R/asmsrc
@@ -23,6 +24,7 @@ while IFS= read -r line; do
     export IMPL=$impl
     caxx() {
       if [ "$IMPL" = py ]; then /tmp/caxx "$@"
+      elif [ -n "$FAXXBIN" ]; then timeout ${CMP_TIMEOUT:-600} "$FAXXBIN" "$@"
       else timeout ${CMP_TIMEOUT:-600} gforth $R/${AXXFS:-faxx.fs} "$@"; fi
     }
     export P S

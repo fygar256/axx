@@ -3,7 +3,7 @@
 decimal
 
 defer cap-float ( kind -- ok )                 \ !F !D !Q (kind = 文字)
-:noname drop false ; is cap-float
+: cap-float-nn49 drop false ; bind cap-float-nn49 cap-float
 
 : sym-get-for ( va vu wa wu -- q true | false ) { va vu wa wu }
   va vu vartabs om-find ?dup if
