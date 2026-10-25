@@ -103,7 +103,7 @@ create sub-stk-a 64 cells allot  create sub-stk-u 64 cells allot
   then
   na nu subchk-mark om-put 2 swap ! ;
 : check-sub-refs-impl ( -- )
-  nrows @ 0 ?do i rf0 trim dup if i rf0 s" pattern" sub-check-unknown else 2drop then loop
+  nrows @ 0 ?do i rf0 trim nip if i rf0 s" pattern" sub-check-unknown then loop
   subs om-used 0 ?do
     i subs om-live? if
       i subs om-key { na nu }
