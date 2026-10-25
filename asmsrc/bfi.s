@@ -249,7 +249,7 @@ exit:
 !sysexit(0)
 
 .section .data
-usage:     .ascii "Usage: bf <file>",10
+usage:     .ascii "Usage: bf <file>\n"
 usage_len: .equ $$ - usage
 .endsection
 
