@@ -15,7 +15,7 @@
 : ul@ ( a -- u ) dup c@ over 1+ c@ 8 lshift or over 2 + c@ 16 lshift or swap 3 + c@ 24 lshift or ;
 CODE GET-DIR a u -- a n
   #include <unistd.h>
-  r0 = p0;
+  r0 = (cell_t)(uintptr_t)p0;
   r1 = getcwd((char*)(uintptr_t)p0, (size_t)p1) ? (cell_t)strlen((char*)(uintptr_t)p0) : 0;
 ;CODE
 CODE (BYE) n --
