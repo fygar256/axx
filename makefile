@@ -1,7 +1,7 @@
 all: caxx paxx faxx
 
 faxx: faxxsrc/*
-	build_ccforth.sh
+	./build_ccforth.sh
 caxx: caxx.c
 	gcc -o caxx caxx.c -lm -lquadmath -O2
 paxx: axx.py
