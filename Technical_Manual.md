@@ -58,7 +58,7 @@ both implementations and `cmp`s the results. For the five `.textmode` pairs and 
 error, and for the `regress.axx` regression test its `-V` text and its diagnostics.
 The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
 and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for two hundred and forty-nine comparisons in all.
+text output are compared too, for two hundred and fifty-four comparisons in all.
 
 **Contents**
 
@@ -3295,7 +3295,8 @@ NOP::"NOP"
   output looks exactly as before.
 - A line that produced no output word gets nothing (a comment-only line, a
   pattern that emits nothing, a directive line such as `.section`). Bytes written
-  directly by `.ascii` and friends (section 5.3) are not affected either. In text
+  directly by `.ascii` and friends, and the lines of `.db` / `.dw` / `.dd` / `.dq` /
+  `.do` / `.dy` / `.dz` (section 5.3), are not affected either. In text
   replacement mode (section 3.18) a comment-only line and a directive line do
   emit text, so those do get the newline.
 - With `.vliw` on it does nothing, so packets stay intact.
@@ -3531,8 +3532,8 @@ msg:	.ascii	"Hello"      ->  msg: .ascii "Hello"
 val:	.equ	0x1234       ->  val: .equ 0x1234
 ```
 
-- `.org`, `.align`, `.zero`, `.ascii`, `.asciz`, `.resb`, `.resw`, `.resd` and
-  `.resq` come out as text and **emit nothing of their own**. Emitting padding or
+- `.org`, `.align`, `.zero`, `.ascii`, `.asciz`, `.resb`, `.resw`, `.resd`,
+  `.resq`, `.db`, `.dw`, `.dd`, `.dq`, `.do`, `.dy` and `.dz` come out as text and **emit nothing of their own**. Emitting padding or
   raw data as well as the text of the line would put the content in twice and mix
   it into the rewritten text. What text replacement mode emits *is* the rewritten
   text, so a `-b` file is exactly the translated text.
@@ -3590,7 +3591,7 @@ translated. `8080toz80.axx` has no `DB` pattern, so it is let through as `db`,
 and `z80.axx` does not define `DB` either -- handing the `helloz80.s` that comes
 out straight to `z80.axx` reports `Syntax error` on that line. To assemble the
 translation as it is, write the data line as a built-in directive in the input
-(`msg: .ascii "Hello, world$"`, section 5.3): lines holding a built-in directive
+(`msg: .db "Hello, world$"` or `msg: .ascii "Hello, world$"`, section 5.3): lines holding a built-in directive
 come out as text unchanged (see "Lines holding a built-in directive" below), so
 `z80.axx` takes them as they are. The passthrough itself is `.textmode` working
 as designed -- it is what makes the translated and untranslated lines tell
@@ -3894,7 +3895,8 @@ Comments start with `;`. A comment is dropped, except in text replacement mode
   with CR alone is split into lines as well). Pattern files are read the same
   way.
 - **After a directive's argument.** `.org`, `.align`, `.zero`, `.resb` / `.resw`
-  / `.resd` / `.resq`, `.ascii` / `.asciz`, `.equ` and `.section` report an error
+  / `.resd` / `.resq`, `.ascii` / `.asciz`, `.db` / `.dw` / `.dd` / `.dq` / `.do` /
+  `.dy` / `.dz`, `.equ` and `.section` report an error
   when anything but white space and a comment is left after the argument (the
   rest of `.ascii "a","b"` or `.section .data,"aw"` is not dropped quietly).
 - **Line continuation.** A line whose last character before the line end is
@@ -3992,11 +3994,60 @@ Reserve storage without emitting bytes — the location counter simply advances:
 .resq n     ; n quadwords   (n*8 bytes)
 ```
 
-**A byte-emitting mnemonic such as `DB` is not built into axx.** It exists only
-if the pattern file defines it. Among the bundled files, `8048.axx` and
-`x86_64.axx` define `DB`; `z80.axx` does not. The data directives that are
-always available regardless of the pattern file are `.ascii`, `.asciz`, `.zero`
-and the `.resb`/`.resw`/`.resd`/`.resq` family.
+Data directives that emit the values of expressions as words:
+
+```
+.db   1, 2, 'A', "Hi\n", 0      ; 1 word each; only .db also takes strings
+.dw   0x1234, -2, label         ; 2 words each
+.dd   0x12345678, end-start     ; 4 words each
+.dq   0x1122334455667788        ; 8 words each
+.do   0x112233445566778899aabbccddeeff00   ; 16 words each
+.dy   1                         ; 32 words each
+.dz   -2                        ; 64 words each
+```
+
+- **Size.** Each value takes 1 word for `.db`, 2 for `.dw`, 4 for `.dd`, 8 for
+  `.dq`, 16 for `.do`, 32 for `.dy` and 64 for `.dz` (the names are NASM's
+  `DO` / `DY` / `DZ`: o for octoword, y and z for the width of the YMM / ZMM
+  registers). Like `.resb` and
+  friends they count words, so with `.bits::8` they are 8 / 16 / 32 / 64 / 128 /
+  256 / 512 bits, and with `.bits::16` a `.db` is 16 bits and a `.dw` 32 bits.
+  The names are case-insensitive.
+- **Order.** They follow the byte order of `.bits` (section 3.10): the low word
+  first for `little` (the default), the high word first for `big`. Pattern files
+  that say `.bits::big::8`, such as `68000.axx`, `mips.axx`, `ppc64.axx` and
+  `sparc.axx`, get the high byte first without adding anything.
+- **Values.** Comma-separated expressions. The value is read as a 256-bit signed
+  integer (section 6.4); a value that fits the field neither as signed nor as
+  unsigned is an error (`.db 256`, `.db -129`). Every value fits a `.dy` or
+  `.dz` field, and `.dz` fills the bits above 256 by sign extension. Forward
+  references to labels are allowed.
+- **Strings.** Only `.db` accepts `"..."` as a value; it becomes words by the same
+  rules as `.ascii` (escapes and UTF-8 bytes). A character constant `'A'` is an
+  expression and works in all of them.
+- **Errors.** An out-of-range value, an undefined label, a `,` with no value, a
+  string in anything but `.db`, and text left after a value are errors. A value in
+  error still emits its words as 0, so the addresses of later lines do not move.
+- **`-o`.** The values are written out through the same path as pattern output, so
+  a value that contains a label gets a relocation. A field whose value is "label +
+  constant" gets the absolute type of the same width (on x86-64, `R_X86_64_64`
+  for `.dq` and `R_X86_64_32` for `.dd`; the same for symbols of an untyped
+  `.extern`). A type chosen with `.reloctype` and the type of a typed label are
+  used as they are. A value containing `$$` (`.dd ext-$$`) goes through the
+  PC-relative guess just as in a pattern. Values on one line that refer to the
+  same label (`.dq L1, L1`) get one relocation each. A field whose width has no
+  relocation type (such as `.do` on x86-64) gets no relocation, with a warning.
+- **In text replacement mode** (section 3.18) the line is passed through as text,
+  like the other built-in directives, and emits nothing itself. `.eol` (section
+  3.17) adds no newline to it. Inside `.vliw` the words are written out directly,
+  outside the packet, as `.ascii` does.
+
+Patterns such as `DB !v :: v` in the bundled pattern files (`8048.axx`,
+`4004.axx` and others) have a different name without the dot, so they do not
+collide with the built-in `.db`. The data directives that are always available
+regardless of the pattern file are `.ascii`, `.asciz`, `.zero`, the
+`.resb`/`.resw`/`.resd`/`.resq` family, and `.db`/`.dw`/`.dd`/`.dq`/`.do`/
+`.dy`/`.dz`.
 
 ### 5.4 Floating point
 
@@ -5149,6 +5200,9 @@ The x86_64 pattern file is also maintained separately at
 | **exprmiss.axx** | 1.1 KB | 8 | **exprmiss.s** | A line with no expression or factor where one belongs (empty, `1+`, `-`, `~`, `()`) matches none of `!`, `!!`, `!L` and `!F`/`!D`/`!Q`, and is let through by `.passthru` (3.3); test only |
 | **arrindex.axx** | 860 B | 14 | **arrindex.s** | Array symbols: bare names as items, a name as a subscript, `.index` (3.6.1); test only |
 | **passthru.axx** | 686 B | 6 | **passthru.s** | `.passthru` and `.eol` (3.16 / 3.17); test only |
+| **datadir.axx** | 833 B | 2 | **datadir.s**, **datadir_err.s** | `.db` / `.dw` / `.dd` / `.dq` / `.do` / `.dy` / `.dz` (5.3); 8-bit, little, with `.eol`; test only |
+| **datadirbe.axx** | 380 B | 2 | **datadir.s** | the same source with 8-bit words, big-endian; test only |
+| **datadirw.axx** | 531 B | 2 | **datadir.s** | the same source with 16-bit words; test only |
 | **unordered.axx** | 1.7 KB | 28 | **unordered.s** | `.unordered` and per-variable `.map` (3.19): the Z80 `C` as a register and as carry; test only |
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | `.echo` on a body line (3.14.1); test only |
@@ -5346,13 +5400,17 @@ the `-o` relocations of the types chosen with `.reloctype`. The `labelc_err.s` p
 (`z80.axx`) compares the diagnostics showing that `.labelc` does not reach the
 labels above it. The `vliw_err.s` pair (`vliw.axx`) compares the
 diagnostics of empty slots and of a packet whose instructions do not fit. The `dirjunk_err.s` pair (`z80.axx`)
-compares the diagnostics of text left after the argument of a directive.
+compares the diagnostics of text left after the argument of a directive. `datadir.s`
+compares the data directives such as `.db` (section 5.3): the `-v` listing built
+with three pattern files of different byte order and word width (`datadir.axx`,
+`datadirbe.axx`, `datadirw.axx`) and the `-o` ELF built with `datadir.axx`;
+`datadir_err.s` (`datadir.axx`) compares their diagnostics.
 
 The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (the ELF of the pattern's machine; x86-64 ELF64 when it has no `.elfmachine`), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for two hundred and forty-nine comparisons in all.
+never compares, for two hundred and fifty-four comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different

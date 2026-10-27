@@ -285,7 +285,9 @@ defer vliw-sentinel-hook ( -- )
 : text-only-dir? ( ua uu -- f )
   s" .ORG" is? >r s" .ALIGN" is? r> or >r s" .ZERO" is? r> or >r
   s" .ASCII" is? r> or >r s" .ASCIZ" is? r> or >r
-  s" .RESB" is? r> or >r s" .RESW" is? r> or >r s" .RESD" is? r> or >r s" .RESQ" is? r> or
+  s" .RESB" is? r> or >r s" .RESW" is? r> or >r s" .RESD" is? r> or >r s" .RESQ" is? r> or >r
+  s" .DB" is? r> or >r s" .DW" is? r> or >r s" .DD" is? r> or >r s" .DQ" is? r> or >r
+  s" .DO" is? r> or >r s" .DY" is? r> or >r s" .DZ" is? r> or
   nip nip ;
 
 variable sd-la variable sd-lu variable sd-l2a variable sd-l2u variable sd-i2
@@ -302,6 +304,13 @@ variable sd-la variable sd-lu variable sd-l2a variable sd-l2u variable sd-i2
   s" .RESD" is? if 2drop sd-l2 s" .RESD" 4 dir-res sd-done true exit then
   s" .RESQ" is? if 2drop sd-l2 s" .RESQ" 8 dir-res sd-done true exit then
   s" .ZERO" is? if 2drop sd-l2 dir-zero sd-done true exit then
+  s" .DB" is? if 2drop sd-l2 s" .DB" 1 dir-data sd-plain true exit then
+  s" .DW" is? if 2drop sd-l2 s" .DW" 2 dir-data sd-plain true exit then
+  s" .DD" is? if 2drop sd-l2 s" .DD" 4 dir-data sd-plain true exit then
+  s" .DQ" is? if 2drop sd-l2 s" .DQ" 8 dir-data sd-plain true exit then
+  s" .DO" is? if 2drop sd-l2 s" .DO" 16 dir-data sd-plain true exit then
+  s" .DY" is? if 2drop sd-l2 s" .DY" 32 dir-data sd-plain true exit then
+  s" .DZ" is? if 2drop sd-l2 s" .DZ" 64 dir-data sd-plain true exit then
   s" .ASCII" is? if 2drop sd-l2 dir-ascii sd-plain true exit then
   s" .ASCIZ" is? if 2drop sd-l2 dir-asciz sd-plain true exit then
   s" .INCLUDE" is? if
@@ -365,7 +374,7 @@ lazy-sb loc-b
   la lu rstrip-st strip-spaces to lu to la
   l2a l2u rstrip-st to l2u to l2a
   la sd-la !  lu sd-lu !  l2a sd-l2a !  l2u sd-l2u !  i2 sd-i2 !
-  false undef-flag !  0 nobj !
+  false undef-flag !  0 nobj !  false data-line !
   la lu supper { ua uu }
   textmode @ if ua uu text-only-dir? if la lu l2a l2u i2 passthru-line exit then then
   ua uu src-directive if exit then

@@ -21,6 +21,8 @@ loop:	; ラベルの後ろだけコメント
 	esc	\; エスケープした \; はコメントではない
 	nop
 	.align	4
+tbl:	.dw	loop, 0x1234	; .dw の行もテキストのまま出る
+	.db	"ok", 0
 buf:	.resb	16		; ディレクティブの行のコメント
 msg:	.ascii	"He;llo"	; 文字列の中の ; はデータ
 val:	.equ	0x1234		; .equ の行のコメント

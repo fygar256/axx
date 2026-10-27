@@ -2035,6 +2035,19 @@ class AssemblerState:
         # `Label undefined` を出さない（3.18 節）。caxx.c の textmode_lcap と同じ。
         self._textmode_lcap = False
 
+        # いまの行が `.db` / `.dw` / `.dd` / `.dq` だったか。立っていれば `.eol` の
+        # 改行を足さない（`.ascii` と同じく、データに改行を混ぜない）。行ごとに倒す。
+        self._data_dir_line = False
+
+        # `-o` の追跡で、`.db` などの 2 つ目以降の値が始まる出力ワードの位置。
+        # リロケーションの欄をまとめるとき、同じラベルが続いていてもここで切る
+        # （`.dq L1, L1` を 1 つの 16 バイトの欄と読まない）。行ごとに空にする。
+        self._elf_field_breaks = set()
+        # `.db` などの値が始まる出力ワードの位置。その欄の推測の型は同じ幅の絶対型
+        # にする（データの欄は式の値そのものなので、命令の変位を見込んだ PC 相対の
+        # 推測をかけない）。行ごとに空にする。
+        self._elf_data_fields = set()
+
         # 因子を 1 文字も読めなかったら立つ印（_factor_impl が立てる）。
         # 照合が式・因子の捕捉の前に倒し、後で見て、立っていればその
         # パターンを不一致にする。caxx.c の expr_missing と同じ。
@@ -4410,38 +4423,7 @@ class ExpressionEvaluator:
                     self.state.error_undefined_label = True
                     self.state.diag(f" error - Label undefined: variable '{ch}' contains undefined value"
                          f"  [{self.state.current_file}:{self.state.ln}]", set_error=False)
-                if (self.state._elf_tracking
-                        and self.state._elf_current_word_idx >= 0):
-                    entry = self.state._elf_var_to_label.get(ch)
-                    if isinstance(entry, tuple) and len(entry) == 3 and entry[0] == 'D':
-                        # ラベル差（ラベルの 1 次結合）。最初の足す項（無ければ
-                        # 最初の項）の名前で参照に積み、項の並び・`.reloc` の型・
-                        # 定数部をヒントの辞書に ('d', ワード位置) の鍵で添える。
-                        _terms, _tot = entry[1], entry[2]
-                        _key = next((n for sg, n in _terms if sg > 0), _terms[0][1])
-                        self.state._elf_label_refs_seen.append(
-                            (_key, _tot, self.state._elf_current_word_idx))
-                        _cst = 0 if _is_undef_derived(x) else int(x) - int(_tot)
-                        self.state._elf_insn_reloc_hint.setdefault(
-                            ('d', self.state._elf_current_word_idx),
-                            (_terms, self.state.reloc_constraints.get(ch), _cst,
-                             self.state.reloc_masks.get(ch, 0)))
-                        entry = None
-                    if isinstance(entry, tuple):
-                        lname, lval = entry
-                        self.state._elf_label_refs_seen.append(
-                            (lname, lval, self.state._elf_current_word_idx))
-                        # オペランドの値 − ラベルの値（綴りの定数）。`.elfpcguess` の
-                        # 推測が「欄がオペランドの値を持つか」を見るのに使う。
-                        if not _is_undef_derived(x):
-                            self.state._elf_insn_reloc_hint.setdefault(
-                                ('v', self.state._elf_current_word_idx), int(x) - int(lval))
-                        _rt = self.state.reloc_constraints.get(ch)
-                        if _rt is not None and not _is_undef_derived(x):
-                            self.state._elf_insn_reloc_hint.setdefault(
-                                self.state._elf_current_word_idx,
-                                (_rt, int(x) - int(lval), self.state.reloc_masks.get(ch, 0),
-                                 self.state.reloc_pairs.get(ch, ())))
+                self.elf_note_var_ref(ch, x)
         elif idx < len(s) and s[idx] in self.state.lwordchars:
             w, idx_new = self.parser.get_label_word(s, idx, eat_colon=False)
             if idx != idx_new:
@@ -4977,6 +4959,49 @@ class ExpressionEvaluator:
         finally:
             self.state.expmode = prev
             self.state.expcaps = prev_caps
+
+    def elf_note_var_ref(self, ch, x):
+        """`-o` の追跡中、いまの出力ワードが変数 ch の値を使ったことを記録する。
+
+        ch が取り込んだラベル（_elf_var_to_label）を、出力ワードの位置
+        （_elf_current_word_idx）の参照として積む。x はその変数の値。
+        binary_list の中の変数参照と、ソースの `.db` / `.dw` / `.dd` / `.dq`
+        の両方から呼ぶので、データ指令の値はパターンの `DD !t :: t,t>>8,…`
+        と同じ規則でリロケーションになる。caxx.c の elf_note_var_ref() と同じ。
+        """
+        if not (self.state._elf_tracking
+                and self.state._elf_current_word_idx >= 0):
+            return
+        entry = self.state._elf_var_to_label.get(ch)
+        if isinstance(entry, tuple) and len(entry) == 3 and entry[0] == 'D':
+            # ラベル差（ラベルの 1 次結合）。最初の足す項（無ければ
+            # 最初の項）の名前で参照に積み、項の並び・`.reloc` の型・
+            # 定数部をヒントの辞書に ('d', ワード位置) の鍵で添える。
+            _terms, _tot = entry[1], entry[2]
+            _key = next((n for sg, n in _terms if sg > 0), _terms[0][1])
+            self.state._elf_label_refs_seen.append(
+                (_key, _tot, self.state._elf_current_word_idx))
+            _cst = 0 if _is_undef_derived(x) else int(x) - int(_tot)
+            self.state._elf_insn_reloc_hint.setdefault(
+                ('d', self.state._elf_current_word_idx),
+                (_terms, self.state.reloc_constraints.get(ch), _cst,
+                 self.state.reloc_masks.get(ch, 0)))
+            entry = None
+        if isinstance(entry, tuple):
+            lname, lval = entry
+            self.state._elf_label_refs_seen.append(
+                (lname, lval, self.state._elf_current_word_idx))
+            # オペランドの値 − ラベルの値（綴りの定数）。`.elfpcguess` の
+            # 推測が「欄がオペランドの値を持つか」を見るのに使う。
+            if not _is_undef_derived(x):
+                self.state._elf_insn_reloc_hint.setdefault(
+                    ('v', self.state._elf_current_word_idx), int(x) - int(lval))
+            _rt = self.state.reloc_constraints.get(ch)
+            if _rt is not None and not _is_undef_derived(x):
+                self.state._elf_insn_reloc_hint.setdefault(
+                    self.state._elf_current_word_idx,
+                    (_rt, int(x) - int(lval), self.state.reloc_masks.get(ch, 0),
+                     self.state.reloc_pairs.get(ch, ())))
 
     def expression_asm(self, s, idx):
         """アセンブリ行の式として評価する（パターン変数と VLIW 計数は使えない）。"""
@@ -6799,7 +6824,8 @@ def _pat_is_directive(i):
 # テキスト置換モードで、バイトを出さずに綴りだけ通すべき組み込みディレクティブ。
 _TEXTMODE_TEXT_ONLY_DIRS = frozenset((
     '.ORG', '.ALIGN', '.ZERO', '.ASCII', '.ASCIZ',
-    '.RESB', '.RESW', '.RESD', '.RESQ'))
+    '.RESB', '.RESW', '.RESD', '.RESQ',
+    '.DB', '.DW', '.DD', '.DQ', '.DO', '.DY', '.DZ'))
 
 
 def _expects_expr(t, idx):
@@ -10920,15 +10946,20 @@ class AssemblyDirectiveProcessor:
                 return l[lidx:]
         return l
 
-    def asciistr(self, l2):
-        """`.ascii` / `.asciz` の文字列をバイト列にする。"""
-        idx = 0
-        if l2 == '' or l2[idx] != '"':
-            return False
-        idx += 1
+    def _string_words(self, l2, idx):
+        """l2[idx] の `"` から始まる文字列を、出力ワードの値の列に読む。
 
+        `.ascii` / `.asciz` と `.db` の文字列で共通の規則である。エスケープは
+        `\\0` `\\t` `\\n` `\\r` `\\\\` `\\"` `\\xHH` `\\uXXXX` `\\UXXXXXXXX`、
+        それ以外の文字は UTF-8 のバイトになる。
+        返すのは (値の列, 閉じる `"` の次の位置, 出力ワード幅を超えた値があったか,
+        誤りの文面)。閉じる `"` が無ければ位置は None。エスケープが誤っていれば
+        そこまでの値の列と誤りの文面を返す。caxx.c の string_words() と同じ。
+        """
+        idx += 1
         _word_mask = (1 << self.state.bts) - 1 if self.state.bts > 0 else 0xFF
         _truncated = False
+        vals = []
 
         while idx < len(l2) and not l2[idx] == '"':
             ch = None
@@ -10960,8 +10991,8 @@ class AssemblyDirectiveProcessor:
                 if hex_str:
                     ch = chr(int(hex_str, 16))
                 else:
-                    self.state.diag(f" error - '\\x' escape requires at least one hex digit in string: {l2!r}", set_error=False)
-                    return False
+                    return (vals, idx, _truncated,
+                            f" error - '\\x' escape requires at least one hex digit in string: {l2!r}")
             elif l2[idx:idx + 2] in ('\\u', '\\U'):
                 _ndigits = 4 if l2[idx:idx + 2] == '\\u' else 8
                 idx += 2
@@ -10973,12 +11004,12 @@ class AssemblyDirectiveProcessor:
                     try:
                         ch = chr(int(hex_str, 16))
                     except (ValueError, OverflowError):
-                        self.state.diag(f" error - invalid \\u/\\U escape in string: {l2!r}", set_error=False)
-                        return False
+                        return (vals, idx, _truncated,
+                                f" error - invalid \\u/\\U escape in string: {l2!r}")
                 else:
-                    self.state.diag(f" error - '\\{'u' if _ndigits == 4 else 'U'}' escape requires "
-                         f"{_ndigits} hex digits in string: {l2!r}", set_error=False)
-                    return False
+                    return (vals, idx, _truncated,
+                            f" error - '\\{'u' if _ndigits == 4 else 'U'}' escape requires "
+                            f"{_ndigits} hex digits in string: {l2!r}")
             else:
                 ch = l2[idx]
                 idx += 1
@@ -10991,12 +11022,26 @@ class AssemblyDirectiveProcessor:
                 for _v in _vals:
                     if _v > _word_mask:
                         _truncated = True
-                    self.binary_writer.outbin(self.state.pc, _v)
-                    self.state.pc += 1
+                    vals.append(_v)
         if idx >= len(l2):
+            return vals, None, _truncated, None
+        return vals, idx + 1, _truncated, None
+
+    def asciistr(self, l2):
+        """`.ascii` / `.asciz` の文字列をバイト列にする。"""
+        if l2 == '' or l2[0] != '"':
+            return False
+        vals, idx, _truncated, err = self._string_words(l2, 0)
+        for _v in vals:
+            self.binary_writer.outbin(self.state.pc, _v)
+            self.state.pc += 1
+        if err is not None:
+            self.state.diag(err, set_error=False)
+            return False
+        if idx is None:
             self.state.diag(f" warning - unterminated string literal in .ASCII/.ASCIZ: {l2!r}", set_error=False)
         else:
-            self._dir_trailing(".ASCII/.ASCIZ", l2, idx + 1)
+            self._dir_trailing(".ASCII/.ASCIZ", l2, idx)
         if _truncated and self.state.should_report_errors():
             self.state.diag(f" warning - .ASCII/.ASCIZ: one or more characters exceed the output word "
                  f"width ({self.state.bts} bit(s)) and were truncated (high bits discarded): "
@@ -11139,6 +11184,156 @@ class AssemblyDirectiveProcessor:
         self.binary_writer.outbin(self.state.pc, 0x00)
         self.state.pc += 1
         return True
+
+    # `.db` / `.dw` / `.dd` / `.dq` / `.do` / `.dy` / `.dz` の 1 つの値が使う
+    # ワード数（`.resb` などと同じ数え方。`.do` / `.dy` / `.dz` は 8 ビットワードで
+    # 128 / 256 / 512 ビット。NASM の DO / DY / DZ と同じ名前）。
+    _DATA_UNITS = {'.DB': 1, '.DW': 2, '.DD': 4, '.DQ': 8,
+                   '.DO': 16, '.DY': 32, '.DZ': 64}
+    # 値を取り込む内部の変数名。パターン変数の名前とは重ならない。
+    _DATA_VAR = '\x01data'
+
+    def data_processing(self, l1, l2):
+        """`.db` / `.dw` / `.dd` / `.dq` / `.do` / `.dy` / `.dz` — 式の値を
+        ワード列にして出す。
+
+        ディレクティブでなければ None、そうなら出力ワードの列を返す（5.3 節）。
+        1 つの値は 1 / 2 / 4 / 8 / 16 / 32 / 64 ワードで、`.bits` のバイト順に従って
+        little なら下位のワードから、big なら上位のワードから並べる。
+        `.db` だけは `"..."` の文字列も書け、`.ascii` と同じ規則でワードになる。
+        ワード列は binary_list の出力と同じ経路で書き出すので、`-o` では
+        パターンの `DD !t :: t,t>>8,t>>16,t>>24` と同じ規則で
+        リロケーションが付く。`.vliw` の中では直接書き出す（`.ascii` と同じ）。
+        値の誤りがあってもその値の分のワード（0）は出すので、行の大きさは
+        2 つのパスで変わらない。caxx.c の adir_data() と同じ。
+        """
+        name = StringUtils.upper(l1)
+        n = self._DATA_UNITS.get(name)
+        if n is None:
+            return None
+        st = self.state
+        st._data_dir_line = True
+        bts = st.bts
+        nbits = n * bts
+        wmask = (1 << bts) - 1
+        fmask = (1 << nbits) - 1
+        report = st.should_report_errors()
+        tracking = st._elf_tracking
+        objl = []
+        idx = StringUtils.skipspc(l2, 0)
+        if idx >= len(l2):
+            if report:
+                st.diag(f" error - {name} requires at least one value.", set_error=True)
+            return []
+        while True:
+            idx = StringUtils.skipspc(l2, idx)
+            if idx >= len(l2):
+                if report:
+                    st.diag(f" error - {name}: missing value after ','.", set_error=True)
+                break
+            if l2[idx] == '"':
+                if n != 1:
+                    if report:
+                        st.diag(f" error - {name}: string literals are allowed only in .DB.",
+                                set_error=True)
+                    break
+                vals, idx2, _trunc, err = self._string_words(l2, idx)
+                if err is not None:
+                    if report:
+                        st.diag(err, set_error=True)
+                    break
+                if idx2 is None:
+                    if report:
+                        st.diag(f" error - {name}: unterminated string literal.", set_error=True)
+                    break
+                if _trunc and report:
+                    st.diag(f" warning - {name}: one or more characters exceed the output word "
+                            f"width ({bts} bit(s)) and were truncated (high bits discarded).",
+                            set_error=False)
+                objl += [v & wmask for v in vals]
+                idx = idx2
+            else:
+                st.error_undefined_label = False
+                if tracking:
+                    st._elf_var_to_label.pop(self._DATA_VAR, None)
+                    st._elf_capturing_var = self._DATA_VAR
+                if st.pas == 1:
+                    st._pass1_size_mode = True
+                _start = idx
+                try:
+                    x, idx = self.expr_eval.expression_asm(l2, idx)
+                finally:
+                    st._elf_capturing_var = None
+                    if st.pas == 1:
+                        st._pass1_size_mode = False
+                _undef_hit = (st.error_undefined_label or _undef(x)) and st.pas != 1
+                st.error_undefined_label = False
+                if idx == _start:
+                    if report:
+                        st.diag(f" error - {name}: missing value.", set_error=True)
+                    break
+                if tracking:
+                    _elf_v2l_finish(st, self._DATA_VAR, l2[_start:idx].strip(' \t'),
+                                    self.expr_eval.loc_counter_value)
+                v = 0
+                xr = 0
+                if _undef_hit:
+                    if report:
+                        st.diag(f" error - {name} argument contains undefined label.",
+                                set_error=True)
+                elif not _undef(x):
+                    try:
+                        v = int(x)
+                    except (OverflowError, ValueError):
+                        if report:
+                            st.diag(f" error - {name} argument is non-finite or invalid.",
+                                    set_error=True)
+                        v = 0
+                    xr = v
+                    # 式の値は 256 ビットの符号付きとして読む（6.4 節）。
+                    v &= (1 << 256) - 1
+                    if v >> 255:
+                        v -= 1 << 256
+                    if not (-(1 << (nbits - 1)) <= v <= fmask):
+                        if report:
+                            st.diag(f" error - {name}: value out of range "
+                                    f"({nbits}-bit field).", set_error=True)
+                        v = 0
+                u = v & fmask
+                words = [(u >> (bts * k)) & wmask for k in range(n)]
+                if st.endian == 'big':
+                    words.reverse()
+                base = len(objl)
+                objl += words
+                if tracking:
+                    # 絶対型にするのは、値が「ラベル＋定数」で `$$` を含まない欄だけ。
+                    # `$$` を使った値（`.dd ext-$$`）は PC 相対の推測にかけるので、
+                    # パターンと同じ扱いのまま。
+                    _ent = st._elf_var_to_label.get(self._DATA_VAR)
+                    if (isinstance(_ent, tuple) and len(_ent) == 2
+                            and '$$' not in l2[_start:idx]):
+                        st._elf_data_fields.add(base)
+                    if base > 0:
+                        st._elf_field_breaks.add(base)
+                if tracking and not _undef_hit:
+                    for k in range(n):
+                        st._elf_current_word_idx = base + k
+                        self.expr_eval.elf_note_var_ref(self._DATA_VAR, xr)
+                    st._elf_current_word_idx = -1
+            idx = StringUtils.skipspc(l2, idx)
+            if idx >= len(l2):
+                break
+            if l2[idx] == ',':
+                idx += 1
+                continue
+            self._dir_trailing(name, l2, idx)
+            break
+        if st.vliwflag:
+            for w in objl:
+                self.binary_writer.outbin(st.pc, w)
+                st.pc += 1
+            return []
+        return objl
 
     def section_processing(self, l1, l2):
         """`.section` / `.segment` — セクションを切り替える。
@@ -13439,6 +13634,9 @@ class Assembler:
             return self._dir_line_done(l, l2, idx)
         if self.asm_directive_proc.zero_processing(l, l2):
             return self._dir_line_done(l, l2, idx)
+        _data_words = self.asm_directive_proc.data_processing(l, l2)
+        if _data_words is not None:
+            return 0, _data_words, True, idx
         _l_upper = StringUtils.upper(l)
         if _l_upper == '.ASCII':
             _ok = self.asm_directive_proc.ascii_processing(l, l2)
@@ -13862,6 +14060,7 @@ class Assembler:
             self.state.symbols = dict(self.state.patsymbols)
 
         self.state.label_text = ''
+        self.state._data_dir_line = False
         line = self.asm_directive_proc.label_processing(line)
 
         _vparts = line.replace(VLIW_STOP, VLIW_SEP).split(VLIW_SEP)
@@ -13871,6 +14070,8 @@ class Assembler:
             self.state._elf_tracking = True
             self.state._elf_label_refs_seen = []
             self.state._elf_current_word_idx = -1
+            self.state._elf_field_breaks = set()
+            self.state._elf_data_fields = set()
             self.state._elf_var_to_label = {}
             self.state._elf_capturing_var = None
             self.state._elf_insn_reloc_hint = {}
@@ -13928,7 +14129,8 @@ class Assembler:
                     (_n, _v, (_w + len(_ibytes)) if _w >= 0 else _w)
                     for (_n, _v, _w) in self.state._elf_label_refs_seen]
 
-        if self.state.eol and objl and not self.state.vliwflag:
+        if (self.state.eol and objl and not self.state.vliwflag
+                and not self.state._data_dir_line):
             objl.append(ord('\n'))
 
         # `.vliw` の無いパターンファイルで `!!` が続く行は、後ろを黙って捨てずにエラー
@@ -13976,7 +14178,9 @@ class Assembler:
                 while gi < len(valid_refs):
                     lname, abs_w, widx = valid_refs[gi]
                     gj = gi + 1
-                    while gj < len(valid_refs) and valid_refs[gj][0] == lname and valid_refs[gj][2] == widx + (gj - gi):
+                    while (gj < len(valid_refs) and valid_refs[gj][0] == lname
+                           and valid_refs[gj][2] == widx + (gj - gi)
+                           and valid_refs[gj][2] not in self.state._elf_field_breaks):
                         gj += 1
                     groups.append((lname, abs_w, widx, gj - gi))
                     gi = gj
@@ -14314,11 +14518,25 @@ class Assembler:
                     else:
                         rtype = _rmap.get(num_bytes, 0)
                         _rtype_is_default_guess = _rt_src_ovr is None
+                    # `.db` などの欄は式の値そのものなので、推測の型（型を書かない
+                    # `.extern` の既定の型を含む）は同じ幅の絶対型にする。x86-64 の
+                    # 4 バイトの推測は命令の rel32 に合わせた PC 相対なので、そのままだと
+                    # `.dd ext` や `.dd t+4` が PC 相対になる。`.reloctype` と型を書いた
+                    # ラベルはそのまま。caxx.c の lineassemble() と同じ規則である。
+                    if (first_widx in self.state._elf_data_fields
+                            and _forced_rtype is None and _rt_src_ovr is None
+                            and (_src_rtype is None or lname in self.state.extern_untyped)):
+                        _dabs = _reloc_same_width(_mach_tbl_la, num_bytes, False)
+                        if _dabs is not None:
+                            rtype = _dabs
+                            _rtype_is_default_guess = False
 
                     if first_widx >= len(objl):
                         continue
                     if rtype == 0:
-                        if self.state.debug:
+                        # `.db` などの行では -d が無くても知らせる（リンクした結果の値が
+                        # 黙って誤るのを避ける）。caxx.c と同じ。
+                        if self.state.debug or self.state._data_dir_line:
                             self.state.diag(
                                 f" warning - no relocation type available for a {num_bytes}-byte "
                                 f"reference to '{lname}'; relocation omitted.", set_error=False)

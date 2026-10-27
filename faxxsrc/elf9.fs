@@ -107,7 +107,7 @@ variable d-raw-q 4 cells allot
 : ovr@ ( n -- rt|0 ) dup 0 9 within if cells reloctype-override + @ else drop 0 then ;
 : v-hint-q ( -- q ) 1 g-first @ hint-find dup 0>= if hint-q else drop q0 then ;
 
-: data-type ( -- )
+: data-type0 ( -- )
   0 d-rtype !  false d-guess !
   g-na @ g-nu @ lab-find src-rtype { srt }
   nbytes ovr@ { ovr }
@@ -119,12 +119,23 @@ variable d-raw-q 4 cells allot
     exit
   then
   ovr if ovr else nbytes mt-wg@ then d-rtype !  ovr 0= d-guess ! ;
+\ .db などの欄は式の値そのものなので、推測の型 (型を書かない .extern の既定の型を含む) は
+\ 同じ幅の絶対型にする。.reloctype と型を書いたラベルはそのまま。axx.py と同じ規則。
+: data-type ( -- )
+  data-type0
+  g-first @ ddfield? 0= if exit then
+  h-forced @ 0>= if exit then
+  nbytes ovr@ if exit then
+  g-na @ g-nu @ lab-find src-rtype { srt }
+  srt 0>= g-na @ g-nu @ extern-untyped om-find 0= and if exit then
+  nbytes false reloc-same-width ?dup if d-rtype !  false d-guess ! then ;
 
 : emit-data-group ( -- )
   data-type
   g-first @ nobj @ >= if exit then
   d-rtype @ 0= if
-    opt-debug @ if
+    \ .db などの行では -d が無くても知らせる (リンクした結果の値が黙って誤るのを避ける)
+    opt-debug @ data-line @ or if
       mb-reset s"  warning - no relocation type available for a " mb+ nbytes mb-n s" -byte reference to '" mb+ g-na @ g-nu @ mb+
       s" '; relocation omitted." mb+ mb-get diag-w
     then
@@ -235,7 +246,7 @@ variable nvr  variable nvr2
     ix 1+ { j }
     begin j nvr @ < if
       vr j cells + @ ref@ { f }
-      f ref-name na nu str=cs f ref-widx w0 j ix - + = and
+      f ref-name na nu str=cs f ref-widx w0 j ix - + = and  f ref-widx dbreak? 0= and
     else false then while j 1+ to j repeat
     na g-na !  nu g-nu !  e ref-q g-abs !  w0 g-first !  j ix - g-nw !
     j ix - e-bpw @ * g-nb !

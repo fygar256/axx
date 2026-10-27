@@ -120,6 +120,17 @@ passthru.axx                        pattern file for .passthru and .eol: lines
                                     text, one output line per source line
                                     (manual 3.16, 3.17)
 passthru.s                          test assemble file for passthru.axx
+datadir.axx                         pattern file for the source data directives
+                                    .db/.dw/.dd/.dq/.do/.dy/.dz: 8-bit
+                                    words, little-endian, with .eol (manual 5.3)
+datadirbe.axx                       the same with 8-bit words, big-endian
+datadirw.axx                        the same with 16-bit words
+datadir.s                           test assemble file for datadir.axx,
+                                    datadirbe.axx and datadirw.axx: numbers,
+                                    strings, labels and relocations under -o
+datadir_err.s                       regression test assembled with datadir.axx:
+                                    out-of-range values, missing values,
+                                    strings outside .db and trailing text
 textmode.axx                        pattern file for .textmode, the `!L` expression
                                     /label capture and `{{.exp(x)}}`: text
                                     replacement keeping labels, expressions,

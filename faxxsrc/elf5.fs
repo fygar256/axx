@@ -153,6 +153,12 @@ bind trk-note-label elf-note-label
   endcase ;
 bind trk-note-var elf-note-var
 
+\ 1 つの変数スロットの「取り込んだラベル」を消す (.db などが値ごとに使う)
+: trk-v2l-slot-clear ( slot -- ) { sl } 0 sl cells v2l-kind + !  0 sl cells v2l-ptr + ! ;
+bind trk-v2l-slot-clear v2l-slot-clear
+: trk-v2l-slot-kind ( slot -- k ) cells v2l-kind + @ ;
+bind trk-v2l-slot-kind v2l-slot-kind
+
 \ ---- ラベル差 (_elf_diff_resolve) ----
 64 constant DRMAX
 create dr-ka DRMAX cells allot  create dr-ku DRMAX cells allot       \ 鍵 (大文字)
@@ -296,7 +302,7 @@ bind v2l-finish elf-cap-finish
 \ ---- 行の始め・終わり ----
 : trk-line-begin ( -- )
   pass @ 2 = o-obj-u @ 0<> and if
-    true trk-on !  0 nrefs !  -1 trk-widx !  -1 trk-cap !  0 nhints !  v2l-clear
+    true trk-on !  0 nrefs !  -1 trk-widx !  -1 trk-cap !  0 nhints !  v2l-clear  0 ndbreaks !  0 nddfields !
   then ;
 : trk-line-end ( -- ) false trk-on ! ;
 bind trk-line-begin elf-line-begin

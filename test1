@@ -178,6 +178,11 @@ caxx $P/x86_64.axx $S/reloctype.s -o b208
 caxx $P/z80.axx $S/labelc_err.s -b b209 2>&1 | grep -v '^raw: wrote ' > b209e
 caxx $P/vliw.axx $S/vliw_err.s -b b210 2>&1 | grep -v '^raw: wrote ' > b210e
 caxx $P/z80.axx $S/dirjunk_err.s -b b211 2>&1 | grep -v '^raw: wrote ' > b211e
+caxx $P/datadir.axx $S/datadir.s -v > b212
+caxx $P/datadirbe.axx $S/datadir.s -v > b213
+caxx $P/datadirw.axx $S/datadir.s -v > b214
+caxx $P/datadir.axx $S/datadir.s -o b215
+caxx $P/datadir.axx $S/datadir_err.s -b b216 2>&1 | grep -v '^raw: wrote ' > b216e
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -402,6 +407,11 @@ paxx $P/x86_64.axx $S/reloctype.s -o a208
 paxx $P/z80.axx $S/labelc_err.s -b a209 2>&1 | grep -v '^raw: wrote ' > a209e
 paxx $P/vliw.axx $S/vliw_err.s -b a210 2>&1 | grep -v '^raw: wrote ' > a210e
 paxx $P/z80.axx $S/dirjunk_err.s -b a211 2>&1 | grep -v '^raw: wrote ' > a211e
+paxx $P/datadir.axx $S/datadir.s -v > a212
+paxx $P/datadirbe.axx $S/datadir.s -v > a213
+paxx $P/datadirw.axx $S/datadir.s -v > a214
+paxx $P/datadir.axx $S/datadir.s -o a215
+paxx $P/datadir.axx $S/datadir_err.s -b a216 2>&1 | grep -v '^raw: wrote ' > a216e
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -585,6 +595,11 @@ check a208 b208
 check a209e b209e
 check a210e b210e
 check a211e b211e
+check a212 b212
+check a213 b213
+check a214 b214
+check a215 b215
+check a216e b216e
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

@@ -103,7 +103,7 @@ defer macro-reset-pass ( -- )
   textmode-comment? if add-comment-text then
   textmode @ indent-text sb-len 0<> and vliw-flag @ 0= and asmtext-set @ and asmtext sb-len 0<> and
   if add-indent-text then
-  eol-on @ nobj @ 0<> and vliw-flag @ 0= and if 10 obj-byte then
+  eol-on @ nobj @ 0<> and vliw-flag @ 0= and data-line @ 0= and if 10 obj-byte then
   \ `.vliw` の無いパターンで `!!` が続く行は、後ろを捨てずにエラーにする
   idx lu < if
     la idx + lu idx - lstrip-sp first-vliw? vliw-flag @ 0= and if

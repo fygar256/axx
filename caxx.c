@@ -2340,6 +2340,23 @@ typedef struct {
        `Label undefined` を出さない（3.18 節）。axx.py の _textmode_lcap と同じ。 */
     int        textmode_lcap;
 
+    /* いまの行が `.db` / `.dw` / `.dd` / `.dq` だったか。立っていれば `.eol` の
+       改行を足さない（`.ascii` と同じく、データに改行を混ぜない）。行ごとに倒す。
+       axx.py の _data_dir_line と同じ。 */
+    int        data_dir_line;
+
+    /* `-o` の追跡で、`.db` などの 2 つ目以降の値が始まる出力ワードの位置。
+       リロケーションの欄をまとめるとき、同じラベルが続いていてもここで切る
+       （`.dq L1, L1` を 1 つの 16 バイトの欄と読まない）。行ごとに空にする。
+       axx.py の _elf_field_breaks と同じ。 */
+    int       *elf_breaks;
+    int        elf_breaks_len, elf_breaks_cap;
+    /* `.db` などの値が始まる出力ワードの位置。その欄の推測の型は同じ幅の絶対型
+       にする（データの欄は式の値そのものなので、命令の変位を見込んだ PC 相対の
+       推測をかけない）。行ごとに空にする。axx.py の _elf_data_fields と同じ。 */
+    int       *elf_dfields;
+    int        elf_dfields_len, elf_dfields_cap;
+
     /* 因子を 1 文字も読めなかったら立つ印（expr_factor_impl が立てる）。
        照合が式・因子の捕捉の前に倒し、後で見て、立っていればその
        パターンを不一致にする。axx.py の state.expr_missing と同じ。 */
@@ -3686,6 +3703,9 @@ static void state_init(AsmState *st) {
                               st->vars[i].text_off=-1; }
     st->textmode = 0;
     st->textmode_lcap = 0;
+    st->data_dir_line = 0;
+    st->elf_breaks = NULL; st->elf_breaks_len = 0; st->elf_breaks_cap = 0;
+    st->elf_dfields = NULL; st->elf_dfields_len = 0; st->elf_dfields_cap = 0;
     st->captext_len = 0;
     st->captext[0] = '\0';
     st->label_text[0] = '\0';
@@ -6031,6 +6051,36 @@ static int parse_hex_char_literal(const char *s, int idx, int slen, int *val, in
    ラベル、`#シンボル`、パターン変数、`$$` / `$.`、`%%`、括弧、`:=` の代入、
    配列シンボルの添字引き、`.enum` や集合の項目など、式の葉になるものすべて。
    どれにも当たらなければ位置を動かさず 0 を返す。 */
+/* `-o` の追跡中、いまの出力ワードが変数 vi の値 x を使ったことを記録する。
+   vi が取り込んだラベルを、出力ワードの位置（elf_current_word_idx）の参照として
+   積む。binary_list の中の変数参照と、ソースの `.db` / `.dw` / `.dd` / `.dq` の
+   両方から呼ぶので、データ指令の値はパターンの `DD !t :: t,t>>8,…` と同じ規則で
+   リロケーションになる。axx.py の ExpressionEvaluator.elf_note_var_ref() と同じ。 */
+static void elf_note_var_ref(AsmState *st, int vi, uint256_t x){
+    if(!(st->elf_tracking && st->elf_current_word_idx >= 0)) return;
+    if(!(vi >= 0 && vi < g_nvars && (st->elf_var_to_label[vi].set == 1
+                                     || st->elf_var_to_label[vi].set == 3))) return;
+    /* set 3 はラベル差。名前は「足す\x01引く」で、型の指定は持たない。 */
+    int _isdiff = st->elf_var_to_label[vi].set == 3;
+    if(st->elf_refs_len >= st->elf_refs_cap){
+        st->elf_refs_cap = st->elf_refs_cap ? st->elf_refs_cap*2 : 8;
+        st->elf_refs = realloc(st->elf_refs,
+            st->elf_refs_cap * sizeof(st->elf_refs[0]));
+        if(!st->elf_refs){ perror("realloc"); exit(1); }
+    }
+    st->elf_refs[st->elf_refs_len].name     = strdup(st->elf_var_to_label[vi].label_name);
+    st->elf_refs[st->elf_refs_len].val      = st->elf_var_to_label[vi].label_val;
+    st->elf_refs[st->elf_refs_len].word_idx = st->elf_current_word_idx;
+    /* ラベル差でも `.reloc` の型（型付きの差）と定数部を持たせる。 */
+    st->elf_refs[st->elf_refs_len].rtype    = st->reloc_constraints[vi];
+    st->elf_refs[st->elf_refs_len].fmask    = st->reloc_masks[vi];
+    st->elf_refs[st->elf_refs_len].pair     = st->reloc_pairs[vi];
+    st->elf_refs[st->elf_refs_len].addend   =
+        u256_is_undef_derived(x) && _isdiff ? 0 :
+        (int64_t)(u256_to_u64(x) - st->elf_var_to_label[vi].label_val);
+    st->elf_refs_len++;
+}
+
 static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_out){
     AsmState *st=&asmb->st;
     uint256_t x=u256_zero();
@@ -6401,32 +6451,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
                                var_slot_name(vslot), st->current_file, (int)st->ln);
                 }
             }
-            if(st->elf_tracking && st->elf_current_word_idx >= 0){
-                int _vi = vslot;
-                if(_vi >= 0 && _vi < g_nvars && (st->elf_var_to_label[_vi].set == 1
-                                                 || st->elf_var_to_label[_vi].set == 3)){
-                    /* set 3 はラベル差。名前は「足す\x01引く」で、型の指定は持たない。 */
-                    int _isdiff = st->elf_var_to_label[_vi].set == 3;
-                    if(st->elf_refs_len >= st->elf_refs_cap){
-                        st->elf_refs_cap = st->elf_refs_cap ? st->elf_refs_cap*2 : 8;
-                        st->elf_refs = realloc(st->elf_refs,
-                            st->elf_refs_cap * sizeof(st->elf_refs[0]));
-                        if(!st->elf_refs){ perror("realloc"); exit(1); }
-                    }
-                    st->elf_refs[st->elf_refs_len].name     = strdup(st->elf_var_to_label[_vi].label_name);
-                    st->elf_refs[st->elf_refs_len].val      = st->elf_var_to_label[_vi].label_val;
-                    st->elf_refs[st->elf_refs_len].word_idx = st->elf_current_word_idx;
-                    /* ラベル差でも `.reloc` の型（型付きの差）と定数部を持たせる。 */
-                    (void)_isdiff;
-                    st->elf_refs[st->elf_refs_len].rtype    = st->reloc_constraints[_vi];
-                    st->elf_refs[st->elf_refs_len].fmask    = st->reloc_masks[_vi];
-                    st->elf_refs[st->elf_refs_len].pair     = st->reloc_pairs[_vi];
-                    st->elf_refs[st->elf_refs_len].addend   =
-                        u256_is_undef_derived(x) && _isdiff ? 0 :
-                        (int64_t)(u256_to_u64(x) - st->elf_var_to_label[_vi].label_val);
-                    st->elf_refs_len++;
-                }
-            }
+            elf_note_var_ref(st, vslot, x);
         }
     }
     else if(s[idx]&&char_in(s[idx],st->lwordchars)){
@@ -15169,12 +15194,18 @@ static char *adir_label_processing(Assembler *asmb, const char *l, char *out, si
 }
 
 /* `.ascii` / `.asciz` の文字列をバイト列にする。 */
-static int asciistr(Assembler *asmb, const char *l2){
-    AsmState *st=&asmb->st;
-    if(!l2[0]||l2[0]!='"') return 0;
-    int idx=1;
+/* l2[idx] の `"` から始まる文字列を、出力ワードの値の列（out）に読む。
+   `.ascii` / `.asciz` と `.db` の文字列で共通の規則である。返り値は 0 が成功、
+   -1 がエスケープの誤り（err にその文面。out にはそこまでの値が入る）。
+   *end は閉じる `"` の次の位置、閉じなければ -1。*truncated は出力ワード幅を
+   超えた値があったか。axx.py の _string_words() と同じ。 */
+static int string_words(AsmState *st, const char *l2, int idx, IntVec *out,
+                        int *end, int *truncated, char *err, size_t errsz){
+    idx++;
     uint64_t word_mask = (st->bts > 0) ? axx_word_mask(st->bts) : 0xFFu;
-    int truncated = 0;
+    *truncated = 0;
+    *end = -1;
+    err[0] = '\0';
     while(l2[idx]&&l2[idx]!='"'){
         uint32_t ch;
         if(l2[idx]=='\\'&&l2[idx+1]=='0'){ ch=0; idx+=2; }
@@ -15191,8 +15222,8 @@ static int asciistr(Assembler *asmb, const char *l2){
             hx[hn]=0;
             if(hn==0){
                 char r[1024]; m_pyrepr(l2, r, sizeof(r));
-                axx_diagf(0, 0, " error - '\\x' escape requires at least one hex digit in string: %s\n", r);
-                return 0;
+                snprintf(err, errsz, " error - '\\x' escape requires at least one hex digit in string: %s\n", r);
+                return -1;
             }
             ch=(uint32_t)strtoul(hx,NULL,16);
         }
@@ -15206,27 +15237,46 @@ static int asciistr(Assembler *asmb, const char *l2){
             hx[hn]=0;
             if(hn!=want){
                 char r[1024]; m_pyrepr(l2, r, sizeof(r));
-                axx_diagf(0, 0, " error - '\\%c' escape requires %d hex digits in string: %s\n",
-                          uc, want, r);
-                return 0;
+                snprintf(err, errsz, " error - '\\%c' escape requires %d hex digits in string: %s\n",
+                         uc, want, r);
+                return -1;
             }
             unsigned long cp = strtoul(hx,NULL,16);
             if(cp > 0x10FFFFul){
                 char r[1024]; m_pyrepr(l2, r, sizeof(r));
-                axx_diagf(0, 0, " error - invalid \\u/\\U escape in string: %s\n", r);
-                return 0;
+                snprintf(err, errsz, " error - invalid \\u/\\U escape in string: %s\n", r);
+                return -1;
             }
             ch=(uint32_t)cp;
         }
         else { ch=(uint32_t)(unsigned char)l2[idx]; idx++; }
-        if((uint64_t)ch > word_mask) truncated = 1;
-        outbin(st,st->pc,u256_from_u64((uint64_t)ch));
+        if((uint64_t)ch > word_mask) *truncated = 1;
+        iv_push(out, u256_from_u64((uint64_t)ch));
+    }
+    if(l2[idx]) *end = idx+1;
+    return 0;
+}
+
+static int asciistr(Assembler *asmb, const char *l2){
+    AsmState *st=&asmb->st;
+    if(!l2[0]||l2[0]!='"') return 0;
+    IntVec vals; iv_init(&vals);
+    int end, truncated;
+    char err[1200];
+    int rc = string_words(st, l2, 0, &vals, &end, &truncated, err, sizeof(err));
+    for(int i=0;i<vals.len;i++){
+        outbin(st,st->pc,vals.data[i]);
         st->pc=u256_add(st->pc,u256_one());
     }
-    if(!l2[idx]){
+    iv_free(&vals);
+    if(rc < 0){
+        axx_diagf(0, 0, "%s", err);
+        return 0;
+    }
+    if(end < 0){
         char r[1024]; m_pyrepr(l2, r, sizeof(r));
         axx_diagf(0, 0, " warning - unterminated string literal in .ASCII/.ASCIZ: %s\n", r);
-    } else dir_trailing(st, ".ASCII/.ASCIZ", l2, idx+1);
+    } else dir_trailing(st, ".ASCII/.ASCIZ", l2, end);
     if(truncated && should_report_errors(st)){
         char r[1024]; m_pyrepr(l2, r, sizeof(r));
         axx_diagf(0, 0, " warning - .ASCII/.ASCIZ: one or more characters exceed the output word "
@@ -15474,6 +15524,186 @@ static int adir_asciiz(Assembler *asmb, const char *l, const char *l2){
     }
     outbin(&asmb->st,asmb->st.pc,u256_zero());
     asmb->st.pc=u256_add(asmb->st.pc,u256_one());
+    return 1;
+}
+/* `.db` / `.dw` / `.dd` / `.dq` / `.do` / `.dy` / `.dz` — 式の値をワード列
+   にして出す（5.3 節）。ディレクティブでなければ 0、そうなら出力ワードを objl に
+   入れて 1 を返す。1 つの値は 1 / 2 / 4 / 8 / 16 / 32 / 64 ワードで、`.bits` のバイト順に従って little なら
+   下位のワードから、big なら上位のワードから並べる。`.db` だけは `"..."` の
+   文字列も書け、`.ascii` と同じ規則でワードになる。ワード列は binary_list の
+   出力と同じ経路で書き出すので、`-o` ではパターンの `DD !t :: t,t>>8,…` と
+   同じ規則でリロケーションが付く。`.vliw` の中では直接書き出す（`.ascii` と
+   同じ）。値の誤りがあってもその値の分のワード（0）は出すので、行の大きさは
+   2 つのパスで変わらない。axx.py の data_processing() と同じ。 */
+static int g_data_vslot = -2;
+/* 位置の列 (*a, *len, *cap) に w を足す。 */
+static void elf_pos_push(int **a, int *len, int *cap, int w){
+    if(*len >= *cap){
+        *cap = *cap ? *cap * 2 : 16;
+        *a = realloc(*a, (size_t)*cap * sizeof(int));
+        if(!*a){ perror("realloc"); exit(1); }
+    }
+    (*a)[(*len)++] = w;
+}
+/* w が `.db` などの値の境目か（AsmState の elf_breaks）。 */
+static int elf_is_field_break(const AsmState *st, int w){
+    for(int i = 0; i < st->elf_breaks_len; i++) if(st->elf_breaks[i] == w) return 1;
+    return 0;
+}
+/* w が `.db` などの値の始まりか（AsmState の elf_dfields）。 */
+static int elf_is_data_field(const AsmState *st, int w){
+    for(int i = 0; i < st->elf_dfields_len; i++) if(st->elf_dfields[i] == w) return 1;
+    return 0;
+}
+static int adir_data(Assembler *asmb, const char *l, const char *l2, IntVec *objl){
+    AsmState *st = &asmb->st;
+    char up[16]; axx_strupr_to(up, l, sizeof(up));
+    int n;
+    if(strcmp(up, ".DB") == 0) n = 1;
+    else if(strcmp(up, ".DW") == 0) n = 2;
+    else if(strcmp(up, ".DD") == 0) n = 4;
+    else if(strcmp(up, ".DQ") == 0) n = 8;
+    else if(strcmp(up, ".DO") == 0) n = 16;
+    else if(strcmp(up, ".DY") == 0) n = 32;
+    else if(strcmp(up, ".DZ") == 0) n = 64;
+    else return 0;
+    st->data_dir_line = 1;
+    int bts = st->bts;
+    int nbits = n * bts;
+    uint64_t wmask = axx_word_mask(bts);
+    int report = should_report_errors(st);
+    int tracking = st->elf_tracking;
+    int vi = -1;
+    if(tracking){
+        /* 値を取り込む内部の変数。データ指令の行はパターンを照合しないので、
+           同じ名前のパターン変数があっても互いに触れない。 */
+        if(g_data_vslot == -2) g_data_vslot = var_slot("axx_data_", 9, 1);
+        vi = g_data_vslot;
+    }
+    iv_clear(objl);
+    int idx = axx_skipspc(l2, 0);
+    if(!l2[idx]){
+        if(report) axx_diagf(1, 0, " error - %s requires at least one value.\n", up);
+        return 1;
+    }
+    for(;;){
+        idx = axx_skipspc(l2, idx);
+        if(!l2[idx]){
+            if(report) axx_diagf(1, 0, " error - %s: missing value after ','.\n", up);
+            break;
+        }
+        if(l2[idx] == '"'){
+            if(n != 1){
+                if(report) axx_diagf(1, 0, " error - %s: string literals are allowed only in .DB.\n", up);
+                break;
+            }
+            IntVec vals; iv_init(&vals);
+            int end, trunc;
+            char err[1200];
+            int rc = string_words(st, l2, idx, &vals, &end, &trunc, err, sizeof(err));
+            if(rc < 0){
+                if(report) axx_diagf(1, 0, "%s", err);
+                iv_free(&vals);
+                break;
+            }
+            if(end < 0){
+                if(report) axx_diagf(1, 0, " error - %s: unterminated string literal.\n", up);
+                iv_free(&vals);
+                break;
+            }
+            if(trunc && report)
+                axx_diagf(0, 0, " warning - %s: one or more characters exceed the output word "
+                                "width (%d bit(s)) and were truncated (high bits discarded).\n",
+                          up, bts);
+            for(int i = 0; i < vals.len; i++)
+                iv_push(objl, u256_from_u64(u256_to_u64(vals.data[i]) & wmask));
+            iv_free(&vals);
+            idx = end;
+        } else {
+            st->error_undefined_label = 0;
+            if(tracking && vi >= 0){
+                st->elf_var_to_label[vi].set = 0;
+                free(st->elf_var_to_label[vi].label_name);
+                st->elf_var_to_label[vi].label_name = NULL;
+                st->elf_var_to_label[vi].label_val = 0;
+                elf_v2l_pend_clear(vi);
+                st->elf_capturing_var = vi;
+            }
+            if(st->pas == 1) st->pass1_size_mode = 1;
+            int start = idx;
+            int io;
+            uint256_t x = expr_expression_asm(asmb, l2, idx, &io);
+            st->elf_capturing_var = -1;
+            if(st->pas == 1) st->pass1_size_mode = 0;
+            idx = io;
+            int vend = io;
+            int undef_hit = (st->error_undefined_label || u256_is_undef(x)) && st->pas != 1;
+            st->error_undefined_label = 0;
+            if(idx == start){
+                if(report) axx_diagf(1, 0, " error - %s: missing value.\n", up);
+                break;
+            }
+            if(tracking && vi >= 0){
+                int e = idx;
+                while(e > start && (l2[e-1] == ' ' || l2[e-1] == '\t')) e--;
+                elf_v2l_finish(st, vi, l2 + start, e - start);
+            }
+            uint256_t v = u256_zero();
+            if(undef_hit){
+                if(report) axx_diagf(1, 0, " error - %s argument contains undefined label.\n", up);
+            } else if(!u256_is_undef(x)){
+                v = x;
+                /* 式の値は 256 ビットの符号付きとして読む（6.4 節）。欄が 256 ビット
+                   以上なら、どの値も収まる。 */
+                if(nbits < 256){
+                    uint256_t lo = u256_neg(u256_shl(u256_one(), nbits - 1));
+                    uint256_t hi = u256_sub(u256_shl(u256_one(), nbits), u256_one());
+                    if(u256_lt_signed(v, lo) || u256_gt_signed(v, hi)){
+                        if(report) axx_diagf(1, 0, " error - %s: value out of range (%d-bit field).\n",
+                                             up, nbits);
+                        v = u256_zero();
+                    }
+                }
+            }
+            int base = objl->len;
+            if(tracking){
+                /* 絶対型にするのは、値が「ラベル＋定数」（set 1）で `$$` を含まない欄
+                   だけ。`$$` を使った値（`.dd ext-$$`）は PC 相対の推測にかけるので、
+                   パターンと同じ扱いのまま。 */
+                int _has_pc = 0;
+                for(int _q = start; _q + 1 < vend; _q++)
+                    if(l2[_q] == '$' && l2[_q+1] == '$'){ _has_pc = 1; break; }
+                if(vi >= 0 && st->elf_var_to_label[vi].set == 1 && !_has_pc)
+                    elf_pos_push(&st->elf_dfields, &st->elf_dfields_len, &st->elf_dfields_cap, base);
+                if(base > 0)
+                    elf_pos_push(&st->elf_breaks, &st->elf_breaks_len, &st->elf_breaks_cap, base);
+            }
+            for(int k = 0; k < n; k++){
+                int kk = st->endian_big ? (n - 1 - k) : k;
+                uint64_t w = u256_to_u64(u256_sar(v, bts * kk)) & wmask;
+                iv_push(objl, u256_from_u64(w));
+            }
+            if(tracking && vi >= 0 && !undef_hit){
+                for(int k = 0; k < n; k++){
+                    st->elf_current_word_idx = base + k;
+                    elf_note_var_ref(st, vi, x);
+                }
+                st->elf_current_word_idx = -1;
+            }
+        }
+        idx = axx_skipspc(l2, idx);
+        if(!l2[idx]) break;
+        if(l2[idx] == ','){ idx++; continue; }
+        dir_trailing(st, up, l2, idx);
+        break;
+    }
+    if(st->vliwflag){
+        for(int i = 0; i < objl->len; i++){
+            outbin(st, st->pc, objl->data[i]);
+            st->pc = u256_add(st->pc, u256_one());
+        }
+        iv_clear(objl);
+    }
     return 1;
 }
 /* `.align` — 整列する。引数なしなら前回の値を使う。 */
@@ -16532,7 +16762,9 @@ static void passthru_line(Assembler *asmb, const char *l, const char *l2,
 /* テキスト置換モードで、バイトを出さずに綴りだけ通すべき組み込みディレクティブか。 */
 static int textmode_text_only_dir(const char *l){
     static const char *tbl[] = { ".ORG", ".ALIGN", ".ZERO", ".ASCII", ".ASCIZ",
-                                 ".RESB", ".RESW", ".RESD", ".RESQ", NULL };
+                                 ".RESB", ".RESW", ".RESD", ".RESQ",
+                                 ".DB", ".DW", ".DD", ".DQ", ".DO", ".DY", ".DZ",
+                                 NULL };
     char up[16]; axx_strupr_to(up, l, sizeof(up));
     for(int i=0; tbl[i]; i++) if(strcmp(up, tbl[i]) == 0) return 1;
     return 0;
@@ -16636,6 +16868,7 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
     if(adir_resd(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
     if(adir_resq(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
     if(adir_zero(asmb,l,l2)) return adir_done(asmb,l,l2,objl_out,idx,idx_out);
+    if(adir_data(asmb,l,l2,objl_out)){ *idx_out=idx; return 1; }
     {
         char _adup[16]; axx_strupr_to(_adup,l,sizeof(_adup));
         if(strcmp(_adup,".ASCII")==0){
@@ -17041,6 +17274,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     st->captext_len = 0;
     st->captext[0] = '\0';
     st->label_text[0] = '\0';
+    st->data_dir_line = 0;
     adir_label_processing(asmb, line, processed, lin_len + 2);
     free(line);
 
@@ -17092,6 +17326,8 @@ static int lineassemble(Assembler *asmb, const char *line_in){
         for(int ri=0;ri<st->elf_refs_len;ri++) free(st->elf_refs[ri].name);
         st->elf_refs_len=0;
         st->elf_current_word_idx = -1;
+        st->elf_breaks_len = 0;
+        st->elf_dfields_len = 0;
         for(int _vi=0;_vi<NVARS;_vi++){
             st->elf_var_to_label[_vi].set = 0;
             free(st->elf_var_to_label[_vi].label_name);
@@ -17197,7 +17433,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
             if(st->elf_refs[ri].word_idx >= 0) st->elf_refs[ri].word_idx += ilen;
     }
 
-    if(st->eol && objl.len > 0 && !st->vliwflag)
+    if(st->eol && objl.len > 0 && !st->vliwflag && !st->data_dir_line)
         iv_push(&objl, u256_from_u64((uint64_t)'\n'));
 
     const char *rest=processed+new_idx;
@@ -17278,7 +17514,8 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                 int _gj = _gi + 1;
                 while(_gj < _nvalid
                       && strcmp(_valid[_gj].name, _lname) == 0
-                      && _valid[_gj].word_idx == _widx + (_gj - _gi))
+                      && _valid[_gj].word_idx == _widx + (_gj - _gi)
+                      && !elf_is_field_break(st, _valid[_gj].word_idx))
                     _gj++;
                 int _nwords = _gj - _gi;
                 int _nbytes = _nwords * bpw;
@@ -17775,7 +18012,20 @@ static int lineassemble(Assembler *asmb, const char *line_in){
                         _rtype_is_default_guess = !_rt_src_ovr;
                     }
                 }
-                if(_rtype == 0 && _widx < objl.len && st->debug)
+                /* `.db` などの欄は式の値そのものなので、推測の型（型を書かない
+                   `.extern` の既定の型を含む）は同じ幅の絶対型にする。`.reloctype` と
+                   型を書いたラベルはそのまま。axx.py の lineassemble() と同じ規則。 */
+                if(elf_is_data_field(st, _widx) && _forced_rtype <= 0 && !_rt_src_ovr
+                   && (_src_rtype < 0 || extern_untyped_has(st, _lname))){
+                    int _dabs = elf_reloc_same_width(_mtbl_rm, _nbytes, 0);
+                    if(_dabs > 0){
+                        _rtype = _dabs;
+                        _rtype_is_default_guess = 0;
+                    }
+                }
+                /* `.db` などの行では -d が無くても知らせる（リンクした結果の値が黙って
+                   誤るのを避ける）。axx.py と同じ。 */
+                if(_rtype == 0 && _widx < objl.len && (st->debug || st->data_dir_line))
                     axx_diagf(0, 0, " warning - no relocation type available for a %d-byte "
                                "reference to '%s'; relocation omitted.\n", _nbytes, _lname);
                 if(_rtype != 0 && _widx < objl.len){
