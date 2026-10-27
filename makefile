@@ -1,5 +1,7 @@
-all: caxx paxx
+all: caxx paxx faxx
 
+faxx: faxxsrc/*
+	build_ccforth.sh
 caxx: caxx.c
 	gcc -o caxx caxx.c -lm -lquadmath -O2
 paxx: axx.py
@@ -10,3 +12,4 @@ install:
 	install paxx /usr/local/bin/paxx
 	install axx.1.gz /usr/share/man/man1/
 	install caxx /usr/local/bin/caxx
+	install faxx /usr/local/bin/faxx
