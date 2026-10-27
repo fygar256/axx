@@ -2374,6 +2374,12 @@ typedef struct {
     uint256_t  pc_instr_start;
     uint256_t  pc_instr_end;
     int        in_binary_list;
+    /* パターンの照合（オペランドの取り込みと error_patterns）と `.db` などの式を
+       読んでいる間だけ立つ印。-o / -E では binary_list の中と同じく、同じセクションの
+       ラベルと `$$` / `$.` をセクション相対で読む。そうしないと取り込んだ `$$+5` や
+       ラベルが通し番地のまま binary_list の `$$` と混ざり、2 つ目以降のセクションで
+       値と加数がセクションの開始位置だけずれる。axx.py の _sec_frame と同じ。 */
+    int        sec_frame;
 
     uint256_t  align;
     int        bts;
@@ -3626,7 +3632,7 @@ static int st_sectioned(const AsmState *st){
    axx.py の factor1() の `$$` と同じ規則である。 */
 static uint256_t loc_counter_value(AsmState *st){
     uint256_t x = st->in_binary_list ? st->pc_instr_start : st->pc;
-    if((st->in_binary_list || st->equ_section_tracking) && st_sectioned(st)){
+    if((st->in_binary_list || st->sec_frame || st->equ_section_tracking) && st_sectioned(st)){
         int64_t _adj = equ_section_relative_offset(st, st->current_section, u256_to_u64(x));
         if(_adj >= 0) x = u256_from_u64((uint64_t)_adj);
     }
@@ -3704,6 +3710,7 @@ static void state_init(AsmState *st) {
     st->textmode = 0;
     st->textmode_lcap = 0;
     st->data_dir_line = 0;
+    st->sec_frame = 0;
     st->elf_breaks = NULL; st->elf_breaks_len = 0; st->elf_breaks_cap = 0;
     st->elf_dfields = NULL; st->elf_dfields_len = 0; st->elf_dfields_cap = 0;
     st->captext_len = 0;
@@ -5078,12 +5085,17 @@ static uint256_t label_get_value(AsmState *st, const char *k){
             int64_t _adj = (u256_is_undef(e->value) || !st_sectioned(st)) ? -1
                          : equ_section_relative_offset(st, sec, u256_to_u64(e->value));
             if(_adj >= 0) ret_val = u256_from_u64((uint64_t)_adj);
-        } else if(st->in_binary_list && strcmp(sec, st->current_section) == 0 && st_sectioned(st)){
+        } else if((st->in_binary_list || st->sec_frame)
+                  && strcmp(sec, st->current_section) == 0 && st_sectioned(st)){
             int64_t _adj = u256_is_undef(e->value) ? -1
                          : equ_section_relative_offset(st, sec, u256_to_u64(e->value));
             if(_adj >= 0) ret_val = u256_from_u64((uint64_t)_adj);
         }
         int _equ_has_reloc = e->is_equ && (e->reloc_type_override >= 0);
+        /* 記録するのは、式が読んだのと同じ値（セクション相対に直したもの）。
+           リロケーションの加数は「欄の値 − この値」で求めるので、欄と同じ基準で
+           持つ。axx.py の LabelManager.get_value() と同じ。 */
+        uint64_t _rec_val = u256_to_u64(ret_val);
         if(st->elf_tracking && (!e->is_equ || _equ_has_reloc)){
             if(st->elf_capturing_var >= 0){
                 int vi = st->elf_capturing_var;
@@ -5092,7 +5104,7 @@ static uint256_t label_get_value(AsmState *st, const char *k){
                         v2l_note_write(st, vi);
                         st->elf_var_to_label[vi].set = 1;
                         st->elf_var_to_label[vi].label_name = strdup(k);
-                        st->elf_var_to_label[vi].label_val = u256_to_u64(e->value);
+                        st->elf_var_to_label[vi].label_val = _rec_val;
                     } else if(st->elf_var_to_label[vi].set == 1
                               && (elf_diff_any(st) || elf_machine_effective(st)->pcrel_guess)){
                         /* `.elfdiff` か `.elfpcguess::1` があればラベル差の候補にする。各ラベルの
@@ -5105,9 +5117,9 @@ static uint256_t label_get_value(AsmState *st, const char *k){
                         st->elf_var_to_label[vi].label_name = first;
                         st->elf_var_to_label[vi].label_val = fv;
                         elf_v2l_pend_clear(vi);
-                        elf_v2l_pend_push(vi, k, u256_to_u64(e->value));
+                        elf_v2l_pend_push(vi, k, _rec_val);
                     } else if(st->elf_var_to_label[vi].set == 2){
-                        elf_v2l_pend_push(vi, k, u256_to_u64(e->value));
+                        elf_v2l_pend_push(vi, k, _rec_val);
                     } else {
                         v2l_note_write(st, vi);
                         st->elf_var_to_label[vi].set = -1;
@@ -5122,7 +5134,7 @@ static uint256_t label_get_value(AsmState *st, const char *k){
                     if(!st->elf_refs){ perror("realloc"); exit(1); }
                 }
                 st->elf_refs[st->elf_refs_len].name     = strdup(k);
-                st->elf_refs[st->elf_refs_len].val      = u256_to_u64(e->value);
+                st->elf_refs[st->elf_refs_len].val      = _rec_val;
                 st->elf_refs[st->elf_refs_len].word_idx = st->elf_current_word_idx;
                 st->elf_refs[st->elf_refs_len].rtype    = 0;
                 st->elf_refs[st->elf_refs_len].addend   = 0;
@@ -6136,7 +6148,7 @@ static uint256_t expr_factor1(Assembler *asmb, const char *s, int idx, int *idx_
     else if(axx_q(s,slen,"$.",idx)){
         idx+=2;
         x = st->pc_instr_end;
-        if((st->in_binary_list || st->equ_section_tracking) && st_sectioned(st)){
+        if((st->in_binary_list || st->sec_frame || st->equ_section_tracking) && st_sectioned(st)){
             int64_t _adj = equ_section_relative_offset(st, st->current_section, u256_to_u64(x));
             if(_adj >= 0) x = u256_from_u64((uint64_t)_adj);
         }
@@ -15632,7 +15644,10 @@ static int adir_data(Assembler *asmb, const char *l, const char *l2, IntVec *obj
             if(st->pas == 1) st->pass1_size_mode = 1;
             int start = idx;
             int io;
+            /* パターンの照合と同じく、-o / -E ではセクション相対で読む。 */
+            st->sec_frame = 1;
             uint256_t x = expr_expression_asm(asmb, l2, idx, &io);
+            st->sec_frame = 0;
             st->elf_capturing_var = -1;
             if(st->pas == 1) st->pass1_size_mode = 0;
             idx = io;
@@ -16855,6 +16870,8 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
        照合を 1 回も試さない行が「未定義ラベル」と報告される。axx.py の
        lineassemble2() と同じ。 */
     st->error_undefined_label = 0;
+    /* 組み込みディレクティブ（`.org $$+4` など）は通し番地で読む。パターンの段で立てる。 */
+    st->sec_frame = 0;
 
     if(st->textmode && textmode_text_only_dir(l)){
         passthru_line(asmb, l, l2, objl_out);
@@ -16958,6 +16975,8 @@ static int lineassemble2_impl(Assembler *asmb, const char *line, int idx,
                 || (st->comment_text && st->comment_text[0]))) ? 1 : 0;
     }
 
+    /* ここからはパターンの照合。-o / -E ではセクション相対で読む（sec_frame）。 */
+    st->sec_frame = 1;
     int se=0, oerr=0, pln=0;
     int idxs_val=0;
     int loopflag=1;
@@ -17343,6 +17362,7 @@ static int lineassemble(Assembler *asmb, const char *line_in){
     int flag=lineassemble2(asmb,processed,0,&idxs,&objl,&new_idx);
 
     st->elf_tracking=0;
+    st->sec_frame=0;
 
     if(!flag){
         /* 先頭のスロットが空の行（`!!ad ...`、`!!!!` だけ）は黙って捨てずにエラーに

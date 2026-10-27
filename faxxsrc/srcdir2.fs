@@ -200,7 +200,10 @@ variable dd-pc
   false undef-flag !
   dd-vi @ 0>= if dd-vi @ v2l-slot-clear  dd-vi @ trk-cap ! then
   pass @ 1 = if true size-mode ! then
+  \ パターンの照合と同じく、-o / -E ではセクション相対で読む
+  true sec-frame !
   dd-a @ dd-u @ k expr-asm { x k2 }
+  false sec-frame !
   -1 trk-cap !
   pass @ 1 = if false size-mode ! then
   undef-flag @ x qundef? or pass @ 1 <> and { uh }

@@ -375,6 +375,8 @@ lazy-sb loc-b
   l2a l2u rstrip-st to l2u to l2a
   la sd-la !  lu sd-lu !  l2a sd-l2a !  l2u sd-l2u !  i2 sd-i2 !
   false undef-flag !  0 nobj !  false data-line !
+  \ 組み込みディレクティブ (.org $$+4 など) は通し番地で読む。パターンの段で立てる
+  false sec-frame !
   la lu supper { ua uu }
   textmode @ if ua uu text-only-dir? if la lu l2a l2u i2 passthru-line exit then then
   ua uu src-directive if exit then
@@ -383,6 +385,8 @@ lazy-sb loc-b
       i2 l2-done exit then
     i2 l2-fail exit
   then
+  \ ここからはパターンの照合。-o / -E ではセクション相対で読む (sec-frame)
+  true sec-frame !
   l2u if la lu s"  " sconcat l2a l2u sconcat else la lu then reduce-spaces sdup { lin-a lin-u }
   lin-a ms-a !  lin-u ms-u !
   -1 best-row !  false snap-live !

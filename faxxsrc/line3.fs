@@ -94,7 +94,7 @@ defer macro-reset-pass ( -- )
   la lu vliw-parts vliw-cnt !
   elf-line-begin
   la lu 0 lineassemble2 { idxs flag idx }
-  elf-line-end
+  elf-line-end  false sec-frame !
   flag 0= if
     la lu first-vliw? report? and if empty-slot-msg diag-e then
     false exit

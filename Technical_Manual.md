@@ -2149,12 +2149,10 @@ does. It is looked at after the type is guessed from the width and after the
         XWORD   ext+8           ; .data+4 -> R_SPARC_UA64 (4 is not a multiple of 8)
 ```
 
-The two `$$` differ, which is why the spelling is read rather than the value:
-written in the source, `$$` is the location in the whole image, while inside a
-`binary_list` under `-o` it is relative to the start of the section (section
-3.7.10), so
-the value alone cannot tell `ext-$$` from `ext+<constant>`, least of all at
-offset 0 of a section.
+The spelling is read rather than the value because the value alone cannot tell
+`ext-$$` from `ext+<constant>`: under `-o`, `$$` is relative to the start of the
+section (section 3.7.10), so the value of `ext-$$` has the same shape as `ext`
+plus a negative constant, least of all distinguishable at offset 0 of a section.
 
 Of the built-in tables only m68k sets it; any machine may. `ppc64.axx` and
 `ppc64le.axx` set it for `R_PPC64_REL64` / `REL32` / `REL16`, `riscv64.axx`
@@ -2423,10 +2421,13 @@ same code.
 | `elfword.axx` / `elfword.s` | a toy machine with 16-bit words | `.elfunit::word`: addends and symbol values written in words |
 
 **Outside the scope — executables and shared libraries.** axx writes
-relocatable objects (`ET_REL`). Under `-o` (and `-E`), inside a `binary_list` a
-label of the same section and `$$` are filled in relative to the section start
-(the linker decides where it goes); under `-b` alone they are addresses in the
-flat image, where the sections lie one after another. So writing an executable (`ET_EXEC`, with program headers) would
+relocatable objects (`ET_REL`). Under `-o` (and `-E`), inside a `binary_list`,
+while matching a pattern (capturing operands and evaluating `error_patterns`) and
+in the values of `.db` and friends (section 5.3), a label of the same section and
+`$$` / `$.` are filled in relative to the section start (the linker decides where
+it goes); under `-b` alone they are addresses in the flat image, where the
+sections lie one after another. The arguments of built-in directives such as
+`.org` are read as addresses in the flat image either way. So writing an executable (`ET_EXEC`, with program headers) would
 mean axx resolving every relocation itself, type by type. That is the linker's
 job, and so is a shared library (`ET_DYN`, with `.dynamic`, `.dynsym` and the hash
 table). For a raw image at fixed addresses use `-b`; for an executable, hand the

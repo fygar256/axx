@@ -23,5 +23,9 @@ tbl:    .dq     start, end+4                    ; ラベル
         .dd     ext, ext+8                      ; 外部のシンボル
         .dd     fwd                             ; 前方参照
         .dw     fwd-tbl
+; 2 つ目のセクションでの `$$`。-o でも取り込んだ `$$` とラベルはセクション相対で読む
+        jr      $$+5                            ; 欄は 3（-b と同じ）
+        .dd     ext-$$                          ; PC 相対（加数 0）
+        .dd     tbl-$$
 fwd:    .db     "end", 0
         .endsection

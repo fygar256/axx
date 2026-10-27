@@ -19,6 +19,12 @@ variable fdiv0-seen
 variable read-float-var            \ _expr_read_float_var
 variable vliw-cnt  variable vliw-stop
 variable in-binlist
+\ パターンの照合 (オペランドの取り込みと error_patterns) と .db などの式を読んでいる
+\ 間だけ立つ印。-o / -E では binary_list の中と同じく、同じセクションのラベルと
+\ $$ / $. をセクション相対で読む。そうしないと取り込んだ $$+5 やラベルが通し番地の
+\ まま binary_list の $$ と混ざり、2 つ目以降のセクションで値と加数がずれる。
+\ axx.py の _sec_frame、caxx.c の sec_frame と同じ。
+variable sec-frame  false sec-frame !
 variable equ-track                  \ .equ の式を評価中 (セクションの追跡)
 variable pc  variable pc-start  variable pc-end
 1000 constant EXPR-MAX-DEPTH
@@ -52,7 +58,7 @@ defer elf-note-var ( slot q -- )               \ -o の追跡 (変数の読み)
 : enum-match-nn16 ( -- q true | false ) false ; bind enum-match-nn16 enum-match
 : brace-eval-nn17 ( kind -- q true | false ) drop false ; bind brace-eval-nn17 brace-eval
 : loc-counter-nn18 ( -- q ) in-binlist @ if pc-start @ else pc @ then qn
-  in-binlist @ equ-track @ or if sec-rel-pc then ; bind loc-counter-nn18 loc-counter
+  in-binlist @ sec-frame @ or equ-track @ or if sec-rel-pc then ; bind loc-counter-nn18 loc-counter
 : sec-rel-pc-nn19 ( q -- q' ) ; bind sec-rel-pc-nn19 sec-rel-pc
 : elf-note-var-nn20 ( slot q -- ) 2drop ; bind elf-note-var-nn20 elf-note-var
 
@@ -313,7 +319,7 @@ defer expr
   s" $$" qtxt? if 2 adv loc-counter int-or-float fin exit then
   s" $." qtxt? if
     2 adv pc-end @ qn
-    in-binlist @ equ-track @ or if sec-rel-pc then
+    in-binlist @ sec-frame @ or equ-track @ or if sec-rel-pc then
     int-or-float fin exit
   then
   cur 35 = if hash-term int-or-float fin exit then

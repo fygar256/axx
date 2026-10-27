@@ -29,7 +29,7 @@ defer elf-note-label ( a u q -- )                         \ -o の追跡 (ラベ
   equ-track @ if
     sl lab-sec equ-secs om-put drop
     v qundef-derived? 0= if v sl lab-sec lab-sec-adjust to v then
-  else in-binlist @ if
+  else in-binlist @ sec-frame @ or if
     sl lab-sec cur-sec-a @ cur-sec-u @ str=cs if
       v qundef-derived? 0= if v sl lab-sec lab-sec-adjust to v then
     then

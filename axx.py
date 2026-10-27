@@ -1977,6 +1977,13 @@ class AssemblerState:
         self.pc_instr_start = 0
         self.pc_instr_end = 0
         self._in_binary_list = False
+        # パターンの照合（オペランドの取り込みと error_patterns）と `.db` などの式を
+        # 読んでいる間だけ立つ印。-o / -E では binary_list の中と同じく、同じ
+        # セクションのラベルと `$$` / `$.` をセクション相対で読む。そうしないと
+        # 取り込んだ `$$+5` やラベルが通し番地のまま binary_list の `$$` と混ざり、
+        # 2 つ目以降のセクションで値と加数がセクションの開始位置だけずれる。
+        # caxx.c の sec_frame と同じ。
+        self._sec_frame = False
 
         # ラベルとシンボルに使える文字。`.labelc` / `.symbolc` で広げられる。
         # シンボル側に `-` が入っているのが、`(IX-5)` のような負の変位を
@@ -3824,7 +3831,8 @@ class LabelManager:
                     else self._section_relative_offset(_sec, v))
             if _adj is not None:
                 v = _adj
-        elif (self.state._in_binary_list and _sec == self.state.current_section
+        elif ((self.state._in_binary_list or self.state._sec_frame)
+                and _sec == self.state.current_section
                 and _sectioned(self.state)):
 
             _adj = None if _undef(v) else self._section_relative_offset(_sec, v)
@@ -4148,7 +4156,8 @@ class ExpressionEvaluator:
         loc_counter_value() と同じ規則である。
         """
         _raw = self.state.pc_instr_start if self.state._in_binary_list else self.state.pc
-        if ((self.state._in_binary_list or self.state._equ_sections_touched is not None)
+        if ((self.state._in_binary_list or self.state._sec_frame
+             or self.state._equ_sections_touched is not None)
                 and _sectioned(self.state)):
             _adj = self.label_manager._section_relative_offset(self.state.current_section, _raw)
             return _adj if _adj is not None else _raw
@@ -4223,7 +4232,8 @@ class ExpressionEvaluator:
         elif StringUtils.q(s, '$.', idx):
             idx += 2
             _raw = self.state.pc_instr_end
-            if ((self.state._in_binary_list or self.state._equ_sections_touched is not None)
+            if ((self.state._in_binary_list or self.state._sec_frame
+                 or self.state._equ_sections_touched is not None)
                     and _sectioned(self.state)):
                 _adj = self.label_manager._section_relative_offset(self.state.current_section, _raw)
                 x = _adj if _adj is not None else _raw
@@ -11260,9 +11270,12 @@ class AssemblyDirectiveProcessor:
                 if st.pas == 1:
                     st._pass1_size_mode = True
                 _start = idx
+                # パターンの照合と同じく、-o / -E ではセクション相対で読む。
+                st._sec_frame = True
                 try:
                     x, idx = self.expr_eval.expression_asm(l2, idx)
                 finally:
+                    st._sec_frame = False
                     st._elf_capturing_var = None
                     if st.pas == 1:
                         st._pass1_size_mode = False
@@ -13622,6 +13635,8 @@ class Assembler:
         # 立ったものを持ち越すと、当たらなかった行が「未定義ラベル」と報告される。
         # caxx.c は照合の試行ごとに印を消してから評価するので、それと同じ。
         self.state.error_undefined_label = False
+        # 組み込みディレクティブ（`.org $$+4` など）は通し番地で読む。パターンの段で立てる。
+        self.state._sec_frame = False
 
         if self.state.textmode and StringUtils.upper(l) in _TEXTMODE_TEXT_ONLY_DIRS:
             return self._passthru_line(l, l2, idx)
@@ -13685,6 +13700,8 @@ class Assembler:
                 return 0, [], True, idx
             return 0, [], False, idx
 
+        # ここからはパターンの照合。-o / -E ではセクション相対で読む（_sec_frame）。
+        self.state._sec_frame = True
         se = False
         oerr = False
         pln = 0
@@ -14080,6 +14097,7 @@ class Assembler:
             idxs, objl, flag, idx = self.lineassemble2(line, 0)
         finally:
             self.state._elf_tracking = False
+            self.state._sec_frame = False
 
         if not flag:
             # 先頭のスロットが空の行（`!!ad ...`、`!!!!` だけ）は黙って捨てずにエラーに
