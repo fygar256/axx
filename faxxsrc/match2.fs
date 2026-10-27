@@ -75,7 +75,7 @@ defer cap-float ( kind -- ok )                 \ !F !D !Q (kind = 文字)
   false ;
 
 \ !x !Lx !!x の捕捉。kind: 0 式 / 1 因子 / 2 !L (式。テキスト置換モードでは未定義を 0 にする)
-: cap-expr ( kind -- ok ) { kind } 0 0 0 0 0 0 0 0 { n na stop sl pr st cu v }
+: cap-expr ( kind -- ok ) { kind } 0 0 0 0 0 0 0 0 0 { n na stop sl pr st cu v lp }
   0 vname-at to n
   n 0= if false exit then
   mt-a @ ti @ + to na
@@ -85,8 +85,11 @@ defer cap-float ( kind -- ok )                 \ !F !D !Q (kind = 文字)
   undef-flag @ to pr  false undef-flag !  false expr-missing !
   si @ to st
   sl trk-cap !
+  textmode-lcap @ to lp
+  kind 2 = textmode @ 0<> and if true textmode-lcap ! then
   kind 1 <> if ms-a @ ms-u @ si @ stop expr-esc else ms-a @ ms-u @ si @ factor-at then
   si !  to v
+  lp textmode-lcap !
   -1 trk-cap !
   ncloses @ 0 ?do SUB-CLOSE i cells closes + @ sub-mark loop
   sl ms-a @ st + si @ st - elf-cap-finish

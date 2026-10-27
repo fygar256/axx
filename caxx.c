@@ -2335,6 +2335,11 @@ typedef struct {
 
     int        in_match_attempt;
 
+    /* テキスト置換モード（.textmode）で `!L` の式を読んでいる間だけ立つ印。
+       このとき未定義ラベルは値 0 として続けるので、label_get_value() は
+       `Label undefined` を出さない（3.18 節）。axx.py の _textmode_lcap と同じ。 */
+    int        textmode_lcap;
+
     /* 因子を 1 文字も読めなかったら立つ印（expr_factor_impl が立てる）。
        照合が式・因子の捕捉の前に倒し、後で見て、立っていればその
        パターンを不一致にする。axx.py の state.expr_missing と同じ。 */
@@ -3680,6 +3685,7 @@ static void state_init(AsmState *st) {
     for(int i=0;i<NVARS;i++){ st->vars[i].val=u256_zero(); st->vars[i].is_undef=0;
                               st->vars[i].text_off=-1; }
     st->textmode = 0;
+    st->textmode_lcap = 0;
     st->captext_len = 0;
     st->captext[0] = '\0';
     st->label_text[0] = '\0';
@@ -5121,8 +5127,10 @@ static uint256_t label_get_value(AsmState *st, const char *k){
     if(st->pass1_size_mode) return u256_zero();
     /* 照合の試行中でも出す（axx_diagf が溜めて、採った試行の分だけ流す）。
        以前は試行中は出さなかったので、命令のオペランドの未定義ラベルは名前が
-       一度も示されなかった。axx.py の get_value() と同じ。 */
-    if(should_report_errors(st)){
+       一度も示されなかった。axx.py の get_value() と同じ。
+       ただしテキスト置換モードの `!L` の中では未定義ラベルを許すので出さない
+       （3.18 節）。 */
+    if(should_report_errors(st) && !st->textmode_lcap){
         axx_diagf(1, 0, " error - Label undefined: '%s'  [%s:%d]\n",
                    k, st->current_file, (int)st->ln);
     }
@@ -9643,7 +9651,10 @@ static int pat_match(Assembler *asmb, const char *s_orig, const char *t_orig){
                 int _cap_prior_l = st->error_undefined_label;
                 st->error_undefined_label = 0;
                 st->expr_missing = 0;
+                int _lcap_prior = st->textmode_lcap;
+                if(st->textmode) st->textmode_lcap = 1;
                 uint256_t v = expr_expression_esc(asmb,s,idx_s,stopchar,&idx_s);
+                st->textmode_lcap = _lcap_prior;
                 int _cap_undef_l = st->error_undefined_label;
                 st->elf_capturing_var = -1;
                 sub_span_close_all(closes, nclose, idx_s);

@@ -2030,6 +2030,11 @@ class AssemblerState:
 
         self._in_match_attempt = False
 
+        # テキスト置換モード（.textmode）で `!L` の式を読んでいる間だけ立つ印。
+        # このとき未定義ラベルは値 0 として続けるので、LabelManager は
+        # `Label undefined` を出さない（3.18 節）。caxx.c の textmode_lcap と同じ。
+        self._textmode_lcap = False
+
         # 因子を 1 文字も読めなかったら立つ印（_factor_impl が立てる）。
         # 照合が式・因子の捕捉の前に倒し、後で見て、立っていればその
         # パターンを不一致にする。caxx.c の expr_missing と同じ。
@@ -3787,7 +3792,9 @@ class LabelManager:
             # 照合の試行中でも出す（diag が溜めて、採った試行の分だけ流す）。
             # 以前は試行中は出さなかったので、命令のオペランドの未定義ラベルは
             # 名前が一度も示されなかった。caxx.c の label_get_value() と同じ。
-            if self.state.should_report_errors():
+            # ただしテキスト置換モードの `!L` の中では未定義ラベルを許すので
+            # 出さない（3.18 節）。
+            if self.state.should_report_errors() and not self.state._textmode_lcap:
                 _fn = self.state.current_file or ""
                 _ln = self.state.ln
                 self.state.diag(f" error - Label undefined: '{k}'"
@@ -7201,10 +7208,14 @@ class PatternMatcher:
                     _cap_prior = self.state.error_undefined_label
                     self.state.error_undefined_label = False
                     self.state.expr_missing = False
+                    _lcap_prior = self.state._textmode_lcap
+                    if self.state.textmode:
+                        self.state._textmode_lcap = True
                     try:
                         v, idx_s = self.expr_eval.expression_esc(s, idx_s, stopchar)
                     finally:
                         self.state._elf_capturing_var = None
+                        self.state._textmode_lcap = _lcap_prior
                     _cap_undef = self.state.error_undefined_label
                     for _k in _closes:
                         self._sub_mark(SUB_CLOSE, _k, idx_s)

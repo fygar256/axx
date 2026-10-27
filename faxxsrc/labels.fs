@@ -44,7 +44,8 @@ defer elf-note-label ( a u q -- )                         \ -o の追跡 (ラベ
   then
   size-mode @ if q0 exit then
   true undef-flag !
-  report? if
+  \ テキスト置換モードの `!L` の中では未定義ラベルを許すので出さない (3.18 節)
+  report? textmode-lcap @ 0= and if
     mb-reset s"  error - Label undefined: '" mb+ a u mb+ s" '" mb+ mb-get diag-e
   then
   qundef ;

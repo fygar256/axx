@@ -8,6 +8,10 @@ variable bts           8 bts !
 variable endian-big    false endian-big !
 variable align-v       16 align-v !
 variable passthru      variable eol-on    variable textmode
+\ テキスト置換モードで `!L` の式を読んでいる間だけ立つ印。このとき未定義ラベルは
+\ 値 0 として続けるので、label-value-impl は `Label undefined` を出さない (3.18 節)。
+\ axx.py の _textmode_lcap、caxx.c の textmode_lcap と同じ。
+variable textmode-lcap  false textmode-lcap !
 1 lazy-om chkmap              \ 変数 -> arr (許すシンボル、'' は省略可の印)
 3 lazy-om enumdefs            \ 変数 -> [names arr][expr a][expr u]
 1 lazy-om vartabs             \ 変数 -> om (名前 -> q)  (.unordered の .map)

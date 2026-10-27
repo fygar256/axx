@@ -13,6 +13,9 @@ loop:	; ラベルの後ろだけコメント
     mov	a,l
 	    nop
 	lda	msg+2
+	jmp	far_away	; このファイルのどこにも定義のないラベル（!L はエラーにしない）
+	lxi	h,ext_buf+2
+	jmpc	far_away	; 値は 0 になる
 	jmpc	loop		; 値と綴りの両方を使う行のコメント
 	xyzzy	foo, bar	; マッチしない行のコメント
 	esc	\; エスケープした \; はコメントではない
