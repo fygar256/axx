@@ -1,113 +1,181 @@
----
-title: Generalized assembler 'axx General Assembler'
-tags: Terminal Python general assembler
-author: fygar256
-slide: false
----
+# axx General Assembler — One Line In, an Assembler for Any CPU
 
-# axx — An assembler conceived in 1986, dormant for 38 years
+Oct 28, 2026
 
-## The 30-second version
+## axx in 30 seconds
 
-axx aims to let you build an assembler for **any instruction set** from a single declarative text file — no C++, no Scheme, no code generation step.
+axx is a general assembler: write one text file, and you have an assembler for any instruction set.
 
 ```
 RET :: 0xc3
 ```
 
-That one line is a complete assembler for the x86_64 `RET` instruction. Stack up lines in the same shape (`instruction syntax :: error conditions :: output bytes`) and you get an assembler for anything from the Intel 4004 to x86_64 with AVX-512.
+That single line is a complete assembler for the x86\_64 `RET` instruction. Stack up lines of the same shape, `instruction syntax :: error conditions :: output`, and you get an assembler for real CPUs, from the Intel 4004 to x86\_64 with AVX-512 and AArch64 with SVE/SME2. No C++, no Scheme, no code-generation step.
 
-- GitHub: https://github.com/fygar256/axx
-- Author: fygar256 (Taisuke Maekawa/前川田井介)
+- Author: fygar256 (Taisuke Maekawa)
 - License: MIT
+- Repository: [github.com/fygar256/axx](https://github.com/fygar256/axx)
+- Name: **A**rbitrary e**X**tended **X** assembler
 
-## Why it exists
+axx is a *general* assembler in the sense of one mechanism common to every target, not a general-purpose tool. Its appeal lies in redefining an assembler from a program written per ISA into data that describes the ISA.
 
-The idea, the name, and a prototype written in C already existed in 1986, when the author was a university student working part-time at Tokyo Denshi Sekkei. The original listing resurfaced 38 years later and was rewritten in Python and released in 2024.
+## An idea born in 1986 that blossomed 38 years later
 
-That gap wasn't just dormancy — it doubled as a validation period. VLIW, EPIC, processors whose word size isn't 8 bits: all of these appeared during those 38 years, and the core idea still held up when it was finally implemented. axx supports all of them.
+The idea, the name and a prototype in C were born in 1986, while the author was a university student working part-time at Tokyo Denshi Sekkei. The original listing resurfaced 38 years later, and axx was rewritten in Python and released in April 2024.
 
-## What's actually been verified
+Over those 38 years, VLIW, EPIC, word sizes other than 8 bits and scalable vector extensions all appeared. axx handles every one of them without changing its core design, so those years also served as a long validation of the idea.
 
-Not marketing copy — things you can reproduce yourself in a few minutes.
+Development since release has been very active. The first commit landed on 4 April 2024, and by 28 October 2026 the repository had 1,589 commits, with improvements still arriving today.
 
-**Two independent implementations agree byte-for-byte.** axx ships a Python implementation (`axx.py`, nicknamed Paxx, 16,817 lines) and a C implementation (`caxx.c`, nicknamed Caxx, 23,155 lines). The bundled `test1` script assembles all one hundred and four bundled pattern/source pairs — from the 4004 to x86_64 to AArch64 to PowerPC64 to MIPS to SPARC to a Brainfuck virtual CPU — with both implementations and `cmp`s the results, 243 comparisons in all: the sixteen core pairs also go through `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v` and `-V`, so the ELF32 and ELF64 objects, the DWARF, the listing and the text output are compared too. Run it and you get `test all passed`. This isn't a claim; it's reproducible in five minutes from a fresh clone.
+## Eight reasons axx stands out
 
-**It produces real ELF objects.**
+### 1. One line per instruction, transcribed straight from the manual
 
-```sh
-axx patfile/x86_64.axx asmsrc/hello.s -o out.o
-file out.o
-# => out.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
-```
-
-`-o` emits an ELF32/64 relocatable object for FreeBSD or Linux that you can hand straight to `ld`, with optional DWARF debug info. Eleven architectures have their relocation numbering built in, and any other `e_machine` works too — the pattern file declares the relocation types, the ELF class, RELA/REL, the header fields and the section attributes it needs. None of the comparable tools in this space do this (more on that below).
-
-**The grammar itself is free-form.** axx has no tokenizer; it matches character by character. That means it isn't limited to the conventional "mnemonic plus operands" shape — a register-transfer style instruction like `r1 = r2 + r3` is just as legal a pattern as `MOV A,B`. This isn't incidental: LLVM's assembler-generation machinery (TableGen/AsmMatcher) explicitly assumes mnemonic-led syntax, and had to be specially patched to handle Hexagon's mnemonic-less `r0 = r1` transfer syntax. axx never had that assumption baked in to begin with.
-
-**A macro layer keeps large ISAs maintainable.** The full x86_64 pattern set (through AVX-512/EVEX) is 28,659 pattern lines written flat. The macro-based version is 6,531 — a quarter of the size — and expands back to an identical, byte-for-byte matching pattern set at load time. Runtime cost of matching against ~24,000 patterns is still sub-second in the C implementation (0.2 s to assemble `hello.s`).
-
-**When an encoding can't be written as an expression, compute it.** The output field of a pattern is normally just data — `0x03,d` emits two bytes — but it can also be `.call f(d)`, which runs a function written in a small procedural language kept in the same pattern file:
+Syntax, range checks and output fit on a single line. Here is an 8048 example:
 
 ```
-BR !t :: .call rel8(t)
-
-.func rel8(target)
-d = target - $.
-.if d < -128 || d > 127 .then
-.raise 2
-.endif
-.emit(d & 0xff)
-.return
-.endfunc
+ADD A,R!n :: n>7;5 :: n|0x68
 ```
 
-It has assignment, `.if`/`.elif`, `.while`, `.for`, recursion, arrays, strings, and `.echo` for debugging, and it can read labels, the location counter and `.setsym` symbols through the assembler's own expression evaluator. `aarch64_logical_mini.axx` uses it for real: AArch64's logical-immediate encoding is a bitmask-to-`N:immr:imms` search that no fixed expression can express, and the whole instruction group fits in 86 pattern lines because of it. Both implementations run the language to the same spec, down to 256-bit wraparound. [MINI.md](MINI.md) / [mini_en.md](mini_en.md) are the reference.
+`add a,r1` emits 0x69, and an out-of-range register number reports error 5. Pattern files look almost like the instruction tables in a datasheet, so they are easy to read and easy to fix.
 
-## What's covered today
+### 2. Free-form syntax with no tokenizer
 
-Bundled and working: **x86_64** (x86_64-v3: segment addressing, AVX/AVX2, BMI1/BMI2, x87, EVEX/AVX-512), **AArch64** (the A64 instruction set — data processing, branches, system, loads and stores, scalar floating point, Advanced SIMD, cryptography and the scalar extensions, plus SVE, SVE2, SME and SME2: the Z and P register files, predication, the whole SVE load/store family including gathers and scatters, the SVE2 widening and complex arithmetic, the SME ZA array and outer products, and the SME2 predicate-as-counter registers, ZT0 lookup table and multi-vector operations), **PowerPC64** (Power ISA v3.1 / POWER10, big- and little-endian: fixed point, branches with the extended mnemonics, floating point, decimal floating point, VMX, VSX, quad precision, MMA including the prefixed masked forms, and the prefixed instructions, with a nop inserted before one that would cross a 64-byte boundary; under `-o` the ELF relocations of the 64-bit PowerPC ABI — `REL24`, `REL14`, the `ADDR16` family for `@l` / `@ha` / `@high` / `@highest` ..., `D34` / `PCREL34` — so objects link with GNU ld), **MIPS** (MIPS I through MIPS64 Release 6, big- and little-endian, o32 and n64: the whole integer set with the Release 2 bit-field and byte-swap instructions, the privileged instructions, the FPU with paired single and COP1X, COP2, the extensions DSP, MSA, MT, VZ, EVA, MIPS-3D, SmartMIPS, MCU, XPA, CRC and GINV, and under Release 6 its re-encoded and new instructions (the compact branches, the PC-relative loads and `auipc`, the three-register multiply and divide, `cmp.cond.fmt` ...), the GNU pseudo-instructions that need no `$at` and the `%hi` / `%lo` / `%higher` / `%highest` / `%got` / `%call16` / TLS / `%pcrel` relocation modifiers — `mips.axx`, `mipsel.axx`, `mips64.axx`, `mips64el.axx` and the Release 6 `mipsr6.axx`, `mipsr6el.axx`, `mips64r6.axx`, `mips64r6el.axx`; the base set is checked byte-for-byte against GNU as, the extensions and Release 6 against llvm-mc; under `-o` o32 objects are ELF32 REL and n64 objects ELF64 RELA, and both link with GNU ld), **SPARC** (V7 / V8 / V9 and VIS 1-3 in one file, `sparc.axx`: the integer set, Bicc / BPcc / FBfcc / FBPfcc / BPr with the `,a` / `,pt` / `,pn` suffixes, Tcc, the conditional moves, every load and store including the alternate space forms and `casa` / `casxa`, every FPop with quad precision, the UltraSPARC Architecture 2005 / 2007 additions, the fused multiply-add, the privileged and hyperprivileged registers, the V8 coprocessor and the LEON extensions, the synthetic instructions such as `set` / `setx` / `mov` / `cmp`, and the `%hi` / `%lo` / `%hh` / `%hm` / `%h44` / `%m44` / `%l44` / GOT / TLS operand modifiers; checked byte-for-byte against llvm-mc, and the rows llvm-mc lacks against the architecture manuals; under `-o` ELF64 SPARCV9 objects that link with ld.lld — the bundled Brainfuck interpreter `bf_sparc.s` runs mandelbrot.bf under qemu-sparc64), **Motorola 6809 / 68000 / 6800**, **MOS 6502**, **Zilog Z80**, **Intel 8080 / 8051 / 8048 / 4004**, and **RISC-V** (RV64: the base set, M, A, F, D, Q, Zfh, C and its Zcb / Zcmp / Zcmt, the bit-manipulation and scalar cryptography groups, Zicond, the cache-block instructions, CSRs by name, the privileged and hypervisor instructions, and the vector extension 1.0 with its crypto and bit-manipulation parts, plus the GNU pseudo-instructions — `riscv64full.axx`, checked against LLVM's assembler; under `-o` the RISC-V relocations link with `ld -m elf64lriscv`. `riscv64.axx` is the small RV64I file that shows how the relocations are declared).
+axx matches character by character, so the pattern author defines the grammar. Classic forms like `MOV A,B` work, and so do assignment-style instructions like `r1 = r2 + r3` and ARM64 notation such as `{v0.4s}`, with no special handling. `.symbolc` / `.labelc` even declare which characters may form identifiers, so MIPS names like `$v0` work as-is.
 
-What AArch64 stops short of is SVE2.1, SME2.1 and the optional extensions the reference assembler used for validation does not accept either (FEAT_SME_F16F16, FEAT_SME_B16B16, FEAT_SME_LUTv2, FEAT_FAMINMAX).
+### 3. Matching that does not depend on order
 
-ARM (A32/T32) doesn't have a pattern file yet (nor 32-bit PowerPC as an ELF32 target; the PowerPC64 file covers the 64-bit ABI). RISC-V has one for RV64 (not for RV32). That's not a design limitation — it's a labor constraint: the author doesn't currently have real hardware or emulators to validate against, and doing it solo is more than one person wants to take on. The pattern-file format itself is fully documented, and there's nothing architecture-specific stopping someone from writing one. The pattern layer proper is deliberately Turing-incomplete, which is what guarantees pattern matching terminates; where an encoding genuinely needs computation, the mini language above is the escape hatch, and it is invoked only from output fields that ask for it by name.
+Among all matching patterns, axx picks the most specific one by a specificity score. You no longer need to put special cases first, so pattern files of tens of thousands of lines stay comfortable to grow. With `.unordered`, directive order becomes free as well.
 
-## How it compares
+### 4. Three layers: declarative safety plus computing power
 
-**customasm** (Rust, actively maintained) shares the same core idea — describe an ISA declaratively, get an assembler for it .  Its output formats (binary, hexdump, intelhex, and similar dump formats) stop short of anything like ELF; there's no relocatable-object output at all. If you're building a toy VM or an FPGA CPU, customasm is the better fit. If you need something that links into a real OS binary, axx is the one that does that.
+- **Macro layer** (`!def` / `!if` / `!while`): generates patterns or source before loading.
+- **Pattern layer**: the declarative core. It is Turing-incomplete, so matching always terminates.
+- **Mini language** (`.func` / `.call`): computes only the encodings that no expression can write, called by name.
 
-**LLVM MC** is the production-grade backend actually used by clang and rustc, with object-format support (ELF, COFF, Mach-O, wasm) and target coverage that axx doesn't come close to. But TableGen alone rarely suffices for a real target — most non-trivial backends carry thousands of lines of hand-written C++ alongside the declarative description. If you need a mainstream architecture in production today, use LLVM. If you want a historical or unusual ISA running from a single file you can actually read end to end, that's axx's territory.
+Thanks to the mini language, the whole AArch64 logical-immediate instruction group fits in 86 pattern lines.
 
-**CGEN** is a Scheme-based CPU description language used to generate parts of GNU binutils/GDB for a handful of embedded architectures. It describes instruction *semantics* (in an RTL-like form) rather than matching surface text patterns, which puts it in a different category from axx or customasm.
+### 5. Linkable ELF from code that knows no machine
 
-## Who this is for
+`-o` emits ELF32/64 relocatable objects that go straight to GNU ld or ld.lld. `-g` adds DWARF, and `.cfi_*` builds `.eh_frame`. The ELF writer has no per-machine branches at all: relocation types, REL/RELA, bit fields inside instruction words and the layout of `r_info` are all declared in the pattern file. Even the built-in tables for 11 machines are just declarations written in advance.
 
-- Anyone who wants a real, linkable ELF object out of an assembler for an old CPU (or a homebrew one)
-- OS/bootloader hobbyists who need a toolchain component for an unusual target
-- People interested in assembler design as a subject in its own right
-- Anyone writing a pattern file for a large ISA — it's mechanical and declarative enough that AI-assisted generation works well for it
+### 6. A translator between assembly languages
 
-## Try it
+Put string templates in the output field and declare `.textmode`, and a pattern file becomes a source-to-source translator. Bundled examples:
+
+- `8080toz80.axx`: Intel 8080 source into Z80 notation
+- `intel2att.axx`: x86-64 Intel syntax into AT&T syntax (60 lines expand to 3,437 patterns)
+- `a64tox64_axx.axx`: AArch64 assembly into x86\_64, all the way to an executable with axx alone
+
+### 7. VLIW, EPIC and any word size
+
+The `.vliw` declaration handles VLIW machines, including Itanium-style EPIC. Word sizes from 1 to 64 bits are set with `.bits::12` and the like, covering bit-slice and 4-bit machines. Floating-point immediates from half to quad precision use `!F` / `!D` / `!Q`.
+
+### 8. A formal foundation, too
+
+The bundled `axxsemantics` formalizes axx in denotational semantics: a meaning function from source through matching, environment and binary to object, with relaxation placed as a fixed point over label environments. axx is a tool, and also a research result that defines what an assembler is, small and precise.
+
+## We ran it and checked
+
+On 28 October 2026 we cloned the repository, built it on Linux/x86\_64 the way `make` does, and confirmed every demo below works as expected.
+
+| What we ran | Result |
+| --- | --- |
+| `caxx patfile/x86_64.axx asmsrc/hello.s -o out.o` | `ELF 64-bit LSB relocatable, x86-64` (about 0.12 s) |
+| The same input with the Python `axx` | Done in about 2.7 s, byte-identical to the C version |
+| `bfsh/bf_x86_64_linux.sh run` | A Brainfuck interpreter built with axx draws `mandelbrot.bf` |
+| `aarch64tox64/testrun.sh` | AArch64 source translated to x86\_64 by axx, assembled by axx, linked with ld, and it draws `mandelbrot.bf` |
+| `caxx patfile/intel2att.axx asmsrc/intel2att.s -V \| as --64` | The translated AT&T text passes GNU as unchanged |
+| `caxx patfile/8080toz80.axx asmsrc/hello8080.s -V` | A CP/M hello world in Z80 notation, labels, comments and indentation kept |
+| `caxx patfile/z80.axx asmsrc/z80.s -v` | A listing of addresses, source lines and output bytes |
+
+The AArch64 → x86\_64 demo is especially impressive: a program written for AArch64 is reborn as an executable for a different CPU using axx alone, and it runs correctly.
+
+## From legacy CPUs to today's major ISAs
+
+`patfile/` ships 61 pattern files. The major ISAs are checked byte-for-byte against external reference assemblers, and their ELF output links directly.
+
+| ISA | Coverage | Checked against / links with |
+| --- | --- | --- |
+| x86\_64 | x86\_64-v3, segments, AVX/AVX2, BMI1/2, x87, EVEX/AVX-512 | VEX/EVEX per llvm-mc 19; links with ld |
+| AArch64 | All of A64, Advanced SIMD, crypto, SVE/SVE2, SME/SME2 | llvm-mc 19 / ld.lld 19 |
+| PowerPC64 | Power ISA v3.1 (POWER10), BE/LE, VMX, VSX, MMA, prefixed instructions | GNU as, GNU ld |
+| RISC-V | All of RV64: I/M/A/F/D/Q/Zfh/C, bit manipulation, scalar crypto, H, V 1.0 | LLVM, `ld -m elf64lriscv` |
+| MIPS | MIPS I to MIPS64 Release 6, BE/LE, o32/n64, DSP, MSA and other extensions | GNU as / llvm-mc, GNU ld |
+| SPARC | V7/V8/V9, VIS 1–3, UA2005/2007, LEON | llvm-mc, ld.lld |
+| Legacy | 68000, 6809, 6800, 6502, Z80, 8080, 8051, 8048, 4004 | Edge-case and error tests included |
+| Special | VLIW, Itanium-style EPIC, a Brainfuck virtual CPU | Cross-checked by both implementations |
+
+Pattern files for ARM (A32/T32), RV32 and 32-bit PowerPC are still ahead, waiting to be written. The format is fully documented, so anyone can start one.
+
+## Python, C and Forth: three implementations, one specification
+
+axx has three independent implementations, maintained with the goal of byte-identical output for the same input.
+
+| Implementation | File | Size | Highlights |
+| --- | --- | --- | --- |
+| Paxx (Python) | `axx.py` | 17,422 lines | The reference implementation; new features land here first |
+| Caxx (C) | `caxx.c` | 23,916 lines | Fast: hello world against about 24,000 x86\_64 patterns in about 0.12 s |
+| Faxx (Forth) | `faxxsrc/` (69 files) | 15,051 lines | A new implementation that runs on gforth and compiles to an executable with ccforth |
+
+The bundled `test1` script assembles 104 pattern/source pairs with both implementations and compares the results with `cmp`. The 16 core pairs also run through `-o` (ELF64), `-m 3 -f 32 -o` (ELF32), `-g -o` (DWARF), `-v` (listing) and `-V` (text), so everything from raw binaries to translated text is compared. It is a reassuring sign that the specification stands independently of any one implementation.
+
+The C version carries its own 256-bit integer type, `uint256_t`, so expressions and the mini language wrap around exactly as the Python version does.
+
+## How axx differs from tools in the same lineage
+
+axx is unique in keeping a declarative ISA description and a declarative description of linkable ELF together in one file.
+
+| Tool | How you describe a target | Object output | Best suited for |
+| --- | --- | --- | --- |
+| **axx** | Free-form pattern files only | ELF32/64 generated from declarations, DWARF, CFI | Bringing historical, homebrew or unusual ISAs to a real OS from a description you can read end to end |
+| customasm | Declarative rules (Rust) | Dump formats such as binary, hexdump, intelhex | Homebrew CPUs targeting ROMs or emulators |
+| LLVM MC | TableGen plus substantial hand-written C++ | ELF, COFF, Mach-O, wasm | Production toolchains for mainstream architectures |
+| CGEN | Instruction semantics in Scheme | Generates parts of binutils | Embedded ports of GNU binutils/GDB |
+
+LLVM's AsmMatcher needed dedicated handling for Hexagon's mnemonic-less `r0 = r1` syntax. Because axx matches character by character from the start, syntax like this is simply natural to write.
+
+## Get started
+
+### Who axx is for
+
+- Anyone who wants an assembler that emits real ELF for a favorite vintage CPU or a homebrew one
+- OS and bootloader hobbyists building a toolchain for an unusual target
+- Anyone who wants to translate or port between assembly languages with declarations alone
+- People interested in what an assembler fundamentally is
+- Anyone writing pattern files for large ISAs with AI help (the declarative, mechanical format is a great fit)
+
+### Try it in five minutes
 
 ```sh
 git clone https://github.com/fygar256/axx.git
 cd axx
-make                              # builds caxx, paxx and axx in this directory
-sudo make install                 # optional: caxx and paxx into /usr/local/bin, the man page into /usr/share/man/man1
-./axx patfile/z80.axx asmsrc/z80.s -v              # assemble the Z80 sample, print the listing
-./axx patfile/x86_64.axx asmsrc/hello.s -o out.o   # assemble x86_64 hello-world into an ELF object
-./axx patfile/ppc64.axx asmsrc/hello_ppc64.s -o hello.o        # PowerPC64 BE hello-world
-powerpc64-linux-gnu-ld hello.o -o hello                      # links with GNU ld
-./axx patfile/sparc.axx asmsrc/bf_sparc.s -o bf.o --osabi FreeBSD   # SPARC V9 Brainfuck interpreter
-ld.lld -o bf bf.o && qemu-sparc64-static ./bf mandelbrot.bf         # links with ld.lld, runs under qemu (bsd-user)
-./bfsh/bf_riscv64_linux.sh run    # build the RISC-V Brainfuck interpreter and run mandelbrot.bf under qemu
+make                                                   # builds caxx, paxx and axx
+./axx patfile/z80.axx asmsrc/z80.s -v                  # Z80 listing
+./axx patfile/x86_64.axx asmsrc/hello.s -o out.o       # x86_64 ELF object
+./axx patfile/8080toz80.axx asmsrc/hello8080.s -V      # 8080 -> Z80 translation
+./bfsh/bf_x86_64_linux.sh run                          # draw the Mandelbrot set in Brainfuck
 ```
 
-`bfsh/` has one such script per CPU and OS (`bf_<CPU>_<OS>.sh`: x86_64, AArch64, PowerPC64, MIPS, RISC-V, SPARC); `run` builds and runs `mandelbrot.bf`, and Technical_Manual.md Appendix A.4 explains the options and which qemu each one uses.
+`bfsh/` has a script per CPU and OS (x86\_64, AArch64, PowerPC64, MIPS, RISC-V, SPARC), so you can enjoy `mandelbrot.bf` under qemu as well.
 
-A pattern file for ARM (A32/T32) doesn't exist yet. Getting there — including real hardware/emulator validation — is more than one person can reasonably do alone. If you're interested in taking it on, that's where help would matter most.
+### Documentation
 
----
+| Topic | English | Japanese |
+| --- | --- | --- |
+| Technical manual (full reference) | `Technical_Manual.md` | `Technical_Manual_ja.md` |
+| Introduction paper | `axx_introduction_paper_en.md` | `axx_introduction_paper.md` |
+| ELF generalization | `elf_generalization_en.md` | `elf_generalization.md` |
+| Macro layer reference | `macro_en.md` | `MACRO.md` |
+| Mini language reference | `mini_en.md` | `MINI.md` |
+| Denotational semantics | — | `axxsemantics` |
+| Man page | `axx.1.gz` | — |
 
-*Every verification claim in this document (byte-identical dual implementations, actual ELF object generation, the line-count comparison) was checked by cloning, building, and running the repository directly
+### Help it grow
 
+Pattern files for ARM (A32/T32), RV32 and 32-bit PowerPC, plus structured macros and optimization, are areas where contributors are warmly welcome. Come help widen the world that starts with one line, `RET :: 0xc3`.
+
+## Sources
+
+- [fygar256/axx (GitHub)](https://github.com/fygar256/axx) — README, technical manual, introduction paper, FILE\_DESCRIPTION, axxsemantics and source code (as of 28 October 2026, commit fb906b6)
+- [Original Japanese article (Qiita)](https://qiita.com/fygar256/items/1d06fb757ac422796e31)
