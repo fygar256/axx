@@ -252,6 +252,12 @@ static int u256_le_signed(uint256_t a, uint256_t b) {
 }
 static int u256_gt_signed(uint256_t a, uint256_t b) { return u256_lt_signed(b,a); }
 static int u256_ge_signed(uint256_t a, uint256_t b) { return u256_le_signed(b,a); }
+/* 符号なしで a < b か。 */
+static int u256_lt_unsigned(uint256_t a, uint256_t b) {
+    for (int k = 3; k >= 0; k--)
+        if (a.w[k] != b.w[k]) return a.w[k] < b.w[k];
+    return 0;
+}
 
 /* 加算（桁上がりを下から伝える）。 */
 static uint256_t u256_add(uint256_t a, uint256_t b) {
@@ -6516,10 +6522,28 @@ static uint256_t expr_term0_0(Assembler *asmb, const char *s, int idx, int *idx_
                 x = u256_zero();
                 continue;
             }
+            /* 結果の絶対値が 2**256 未満なら計算する。以前は「底のビット数×指数」で
+               見積もったので、2**129〜2**191 や 1**1000、(-1)**1001 まで溢れると
+               報告していた。|x| >= 2 なら結果は少なくとも (ビット数-1)×指数+1
+               ビットあるので、それが上限を超えれば報告し、超えなければ絶対値を
+               掛けながら溢れを確かめる（このとき指数は 255 以下）。axx.py の
+               term0_0() と同じ規則である。 */
             int64_t t_int = u256_to_i64(t);
             int64_t base_bits = u256_nbit(x);
-            int64_t exp_factor = t_int > 1 ? t_int : 1;
-            if(base_bits * exp_factor > EXP_RESULT_MAX_BITS){
+            int too_big = 0;
+            if(t_int >= 2 && base_bits >= 2){
+                if((base_bits - 1) * t_int + 1 > EXP_RESULT_MAX_BITS) too_big = 1;
+                else {
+                    uint256_t m = u256_is_neg256(x) ? u256_neg(x) : x;
+                    uint256_t lim = u256_udiv(u256_neg(u256_one()), m);
+                    uint256_t r = u256_one();
+                    for(int64_t k = 0; k < t_int; k++){
+                        if(u256_lt_unsigned(lim, r)){ too_big = 1; break; }
+                        r = u256_mul(r, m);
+                    }
+                }
+            }
+            if(too_big){
                 if(should_report_errors(&asmb->st)){
                     axx_diagf(1, 0, " error - ** result would exceed %lld bits (chained exponentiation); result set to 0.\n",(long long)EXP_RESULT_MAX_BITS);
                 }
@@ -7114,6 +7138,50 @@ static void        arrsym_clear_all(AsmState *st);
 static int         symbol_copy_from_name(AsmState *st, const char *dst_upper, const char *value_field);
 static int         symbol_set_from_text(AsmState *st, const char *dst_upper, const char *value_field);
 
+/* パターンファイルの式の後ろに残った文字をエラーにする（黙って捨てない）。
+   `binary_list` の要素、`error_patterns` の `条件;コード`、テンプレートの `{{ }}` は、
+   式を読み終えたところで続きを見ずに残りを捨てていたので、`0x3e,n m` や `n|0x68)`、
+   `{{1+}}` のような書き損じが黙って誤ったバイト列やテキストになった。空白・タブだけ
+   なら何もしない。残りが allowed のどれかで始まるならそれは続きなので、これも何も
+   しない。axx.py の _pat_trailing() と同じ規則である。 */
+static int pat_trailing(AsmState *st, const char *what, const char *after,
+                        const char *text, int idx, const char *allowed){
+    while(text[idx]==' '||text[idx]=='\t') idx++;
+    int n = (int)strlen(text+idx);
+    while(n > 0 && (text[idx+n-1]==' '||text[idx+n-1]=='\t')) n--;
+    if(n == 0) return 0;
+    if(allowed && strchr(allowed, text[idx])) return 0;
+    if(should_report_errors(st)){
+        size_t rsz = (size_t)n*4 + 8;
+        char *r = malloc(rsz);
+        if(!r){ perror("malloc"); exit(1); }
+        m_pyrepr_n(text+idx, (size_t)n, r, rsz);
+        axx_diagf(1, 0, " error - %s: unexpected text after %s: %s.\n", what, after, r);
+        free(r);
+    }
+    return 1;
+}
+
+/* パターンファイルの式で、因子のあるべきところに因子が無ければエラーにする。
+   `1+`、`n|`、`(a<<)` は、足りない因子を 0 と読んで黙って値になっていた。照合
+   （ソースの `ld a,1+` を当てない）と同じ st->expr_missing の印で見る。
+   axx.py の _pat_missing() と同じ規則である。 */
+static int pat_missing(AsmState *st, const char *what, const char *text, int n){
+    if(!st->expr_missing) return 0;
+    st->expr_missing = 0;
+    while(n > 0 && (*text==' '||*text=='\t')){ text++; n--; }
+    while(n > 0 && (text[n-1]==' '||text[n-1]=='\t')) n--;
+    if(should_report_errors(st)){
+        size_t rsz = (size_t)n*4 + 8;
+        char *r = malloc(rsz);
+        if(!r){ perror("malloc"); exit(1); }
+        m_pyrepr_n(text, (size_t)n, r, rsz);
+        axx_diagf(1, 0, " error - %s: an operand is missing in the expression %s.\n", what, r);
+        free(r);
+    }
+    return 1;
+}
+
 /* ---- パターン側ディレクティブ -------------------------------------------
    各ハンドラは「自分の担当でなければ 0、処理したら 1」を返し、呼び出し側が
    順に試す。ディレクティブは書かれた位置から効くので、パターン行の照合と
@@ -7209,7 +7277,13 @@ static int dir_bits(Assembler *asmb, PatEntry *e){
     if(wf[0]){
         int io;
         asmb->st.error_undefined_label = 0;
+        asmb->st.expr_missing = 0;
         uint256_t v = expr_expression_pat(asmb,wf,0,&io);
+        if(pat_missing(&asmb->st, ".bits", wf, (int)strlen(wf))
+           || pat_trailing(&asmb->st, ".bits", "the word width", wf, io, NULL)){
+            asmb->st.error_undefined_label = 0;
+            return 1;
+        }
         int64_t nb = u256_to_i64(v);
         if(asmb->st.error_undefined_label || u256_is_undef_derived(v)
            || nb < 1 || nb > 64 || !u256_eq(v, u256_from_i64(nb))){
@@ -9219,6 +9293,7 @@ static int dir_error(Assembler *asmb, const char *s){
         st->exp_typ_float = 0;
         st->expr_read_float_var = 0;
         st->error_undefined_label = 0;
+        st->expr_missing = 0;
         u = expr_expression_pat(asmb,buf,idx_before,&io);
         cond_undef = st->error_undefined_label || u256_is_undef(u);
         cond_false = expr_is_false(asmb, u);
@@ -9236,6 +9311,7 @@ static int dir_error(Assembler *asmb, const char *s){
             /* 2 回目: 浮動小数点モード（従来の読み方） */
             st->exp_typ_float = 1;
             st->error_undefined_label = 0;
+            st->expr_missing = 0;
             u = expr_expression_pat(asmb,buf,idx_before,&io);
             cond_undef = st->error_undefined_label || u256_is_undef(u);
             cond_false = expr_is_false(asmb, u);
@@ -9248,6 +9324,13 @@ static int dir_error(Assembler *asmb, const char *s){
         st->error_undefined_label = undef_prior || st->error_undefined_label;
         idx=io;
         if(idx <= idx_before) break;
+        /* 因子の欠けた条件・コード（`a>;3`、`a>3;`）も読まずにエラーにする。
+           印は最後に読んだモードの評価で立ったものだけを見る。 */
+        if(pat_missing(st, "error_patterns", buf + idx_before, io - idx_before)) break;
+        /* 条件の後ろは `;`、コードの後ろは `,` か終わり。ほかの文字が残れば
+           （`a>3 x;4`、`a>3;4 5`）その組は読まずにエラーにする。 */
+        if(pat_trailing(st, "error_patterns", "the condition", buf, io_cond, ";")
+           || pat_trailing(st, "error_patterns", "the error code", buf, io, ",")) break;
         if((should_report_errors(st))&&!cond_false&&!cond_undef
            && !cond_tests_relocated_var(st, buf + idx_before,
                                         (size_t)(io_cond - idx_before))
@@ -14236,12 +14319,25 @@ static int txt_conv_name(const char *s, int *kind){
 }
 
 /* 式を評価してテキストとして積む。 */
-static void txt_emit_expr(Assembler *asmb, TxtBuf *t, const char *expr, int kind){
+/* inner は診断に出す `{{ }}` の中身（NULL なら expr）。 */
+static void txt_emit_expr(Assembler *asmb, TxtBuf *t, const char *expr, int kind,
+                          const char *inner){
     AsmState *st = &asmb->st;
     int io;
     int saved_undef = st->error_undefined_label;
     st->error_undefined_label = 0;
+    st->expr_missing = 0;
     uint256_t v = expr_expression_pat(asmb, expr, 0, &io);
+    pat_missing(st, "text template", expr, io);
+    {
+        const char *shown = inner ? inner : expr;
+        size_t an = strlen(shown) + 32;
+        char *after = malloc(an);
+        if(!after){ perror("malloc"); exit(1); }
+        snprintf(after, an, "the expression in '{{%s}}'", shown);
+        pat_trailing(st, "text template", after, expr, io, NULL);
+        free(after);
+    }
     if(st->error_undefined_label) saved_undef = 1;
     st->error_undefined_label = saved_undef;
 
@@ -14580,8 +14676,16 @@ static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
             if(nl){
                 int cp = txt_close_paren(inner, j+1+nl);
                 if(cp > 0){
+                    char *full = strdup(inner);
+                    if(!full){ perror("strdup"); exit(1); }
                     inner[cp] = '\0';
-                    txt_emit_expr(asmb, t, inner + j + 1 + nl + 1, kind);
+                    txt_emit_expr(asmb, t, inner + j + 1 + nl + 1, kind, full);
+                    size_t an = strlen(full) * 2 + 32;
+                    char *after = malloc(an);
+                    if(!after){ perror("malloc"); exit(1); }
+                    snprintf(after, an, "'%.*s' in '{{%s}}'", cp + 1 - j, full + j, full);
+                    pat_trailing(st, "text template", after, full, cp + 1, NULL);
+                    free(after); free(full);
                     done = 1;
                 }
             }
@@ -14621,7 +14725,7 @@ static void txt_render(Assembler *asmb, TxtBuf *t, const char *s){
                     }
                 }
             }
-            if(!done) txt_emit_expr(asmb, t, inner, -1);
+            if(!done) txt_emit_expr(asmb, t, inner, -1, NULL);
             free(inner);
             i += n + 4;
             continue;
@@ -14792,6 +14896,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
                 }
                 while(s[idx]==' '||s[idx]=='\t') idx++;
                 if(s[idx]==','){ idx++; continue; }
+                pat_trailing(st, "binary_list", "an element", s, idx, NULL);
                 break;
             }
         }
@@ -14817,13 +14922,16 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
             st->elf_current_word_idx = -1;
             iv_free(&callw);
             if(s[idx]==','){ idx++; continue; }
+            pat_trailing(st, "binary_list", "an element", s, idx, NULL);
             break;
         }
         int cur_widx = objl->len;
         st->elf_current_word_idx = cur_widx;
         if(st->pas==1) st->pass1_size_mode=1;
         int io;
+        st->expr_missing = 0;
         uint256_t x=expr_expression_pat(asmb,s,idx,&io);
+        pat_missing(st, "binary_list", s + idx, io - idx);
         if(st->pas==1){ st->pass1_size_mode=0; st->error_undefined_label=0; }
         idx=io;
         if(!drop && (semicolon ? !u256_is_zero(x) : 1)){
@@ -14839,6 +14947,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
             st->elf_refs_len = wi2;
         }
         if(s[idx]==','){idx++;continue;}
+        pat_trailing(st, "binary_list", "an element", s, idx, NULL);
         break;
     }
     st->elf_current_word_idx = -1;

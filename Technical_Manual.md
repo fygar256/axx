@@ -534,9 +534,14 @@ Escaping it ends the name and matches the underscore literally as well:
 MRS xt,S!S{{tbl}}a\_Z          /* matches mrs x0,s3_z */
 ```
 
-The same escape is what separates two expression captures, since a numeric
-literal also accepts `_` as a digit separator — `!v_!w` reads `3_5` as the
-single number 35, while `!v _!w` or `!v\_!w` reads it as 3 and 5. This applies to every
+The same escape is what separates two expression captures. In `!v_!w` the
+underscore is swallowed into the variable name `v_` and never matched as a
+character, so against `3_5` the capture `v_` reads 3 and `!w` reads `_5` as a
+label (a label may start with `_`); `!v _!w` or `!v\_!w` matches the underscore
+literally and reads 3 and 5. Note that a numeric literal in the main
+expressions does not accept `_` as a digit separator (`3_5` is never one
+number); `_` is accepted only inside `flt{}` and friends (section 5.4), by the
+mini-language `.int()`, and in macro-layer integer literals. This applies to every
 kind of capture: a symbol placeholder, `!x`, `!!x` and `!S{{name}}x` alike.
 An underscore that follows neither a capture nor a variable name (`_!b`,
 `X_!c`) needs no space or escape, and a
@@ -560,6 +565,10 @@ a>3;4,b>7;5
 Here `a>3` raises code 4 and `b>7` raises code 5. Comparison operators
 including `!=` are available, so `a!=3;2` and `(s&0xf!=0)||(s>>4)>3;9` are both
 valid.
+
+A condition must be followed by `;`, and a code by `,` or the end of the field.
+Text left over after an expression (`a>3 x;4`, `a>3;4 5`) or a missing operand
+(`a>;4`, `a>3;`) is an error — the same rule as for the elements of section 3.5.
 
 Codes 1, 2, 3, 5 and 6 have message text; see [section 9](#9-errors). Any other
 code — including 4, and anything from 7 up — still raises the error and still
@@ -602,6 +611,11 @@ bra.w ext            ; 68000.axx: under -o, no error, an R_68K_PC16
 ### 3.5 binary_list
 
 Comma-separated output values. `0x03,d` emits `0x03` followed by `d`.
+
+Each element is one expression (or one of the strings and `.call`s below), and
+only `,` or the end of the field may follow it. Text left over after an
+expression (`0x3e,n m`, `n|0x68)`) or a missing operand (`1+`, `n|`) is an
+error; the rest used to be dropped silently and a missing operand read as 0.
 
 ```
 ADD A,R!n :: n>7;5 :: n|0x68
@@ -649,7 +663,10 @@ MOV A,3   ->  6c 6f 61 64 20 61 2c 33 0a 12 13   ("load a,3\n" then 0x12 0x13)
 
 **Only `{{ }}` is substituted.** Everything else in the string is the text as
 written — upper case, lower case, `.hex(e)` outside braces, all of it comes
-out unchanged. The only other thing read is a backslash escape.
+out unchanged. The only other thing read is a backslash escape. Inside `{{ }}`
+goes exactly one of the forms in the table below; text left over after the
+expression (`{{e 1}}`, `{{.hex(e)z}}`) or a missing operand (`{{e+}}`) is an
+error.
 
 | Form | Meaning |
 |---|---|
@@ -728,8 +745,11 @@ Where the text goes:
   There is no `\0` or `\xHH` escape — a byte that is not text is written as a
   number in the list, next to the string.
 - With `-V`, the rendered line alone is also written to standard output, so
-  the translated program can simply be redirected to a file. Without `-V`
-  nothing reaches standard output (silent by default).
+  the translated program can simply be redirected to a file. Standard output
+  gets one newline per source line, so a template that ends in `\n` leaves a
+  blank line there (the output words get exactly the newlines you wrote; to
+  have one line per line in both, use `.eol`, section 3.17, instead of `\n`).
+  Without `-V` nothing reaches standard output (silent by default).
 - With `-v`, it appears at the end of that line's diagnostic, after the `//`,
   enclosed in double quotes: `... MOV R1,0x10 // "LD R1,0x10"`. There it is
   shown escaped — a newline reads `\n`, not a line break — so the diagnostic
@@ -2591,9 +2611,8 @@ LEAQ r,(s+t*!!h+!!i) :: 0x48,0x8d,0x04,((@h)-1)<<6|t<<3|s,i
 matches the parenthesized form `leaq rax,(rax+rbx*(2+2)+0x40)`.
 
 The escape also ends a **name** that would otherwise run on. A variable name
-continues over lowercase letters, digits and `_`, and a numeric literal accepts
-`_` between digits, so an underscore meant as a separator has to be escaped
-where a capture precedes it:
+continues over lowercase letters, digits and `_`, so an underscore meant as a
+separator has to be escaped where a capture precedes it:
 
 ```
 MRS xt,S!S{{p0}}a\_!S{{d8}}b\_C!S{{d16}}c\_C!S{{d16}}e\_!S{{d8}}f
@@ -2601,8 +2620,8 @@ T   xt,!v\_!w
 ```
 
 The first matches `mrs x0,s3_3_c4_c2_0`, binding the five fields separately;
-the second matches `t x0,3_5` as 3 and 5 rather than as the number 35. Written
-without the escapes, both lose the separator. `aarch64.axx` uses the first form
+the second matches `t x0,3_5` as 3 and 5. Written without the escapes, both
+lose the separator, because the underscore is swallowed into a variable name. `aarch64.axx` uses the first form
 for the generic system-register spelling. Section
 [3.3](#33-case-and-variables) has the rule this follows from.
 
@@ -4426,6 +4445,9 @@ x?a:b           ternary
   A guard such as `x!=0 && 100/x>3;3` therefore works when x is 0. When the left
   side involves an undefined label the result cannot be decided, and the right
   side is evaluated too.
+- The exponent of `**` is 0..1024, and a result whose absolute value reaches
+  `2**256` is an error and reads as 0 (`2**255` and `(-2)**129` are computed;
+  section 6.4 covers values of `2**192` and above).
 
 ### 6.3 What is available where
 
@@ -5208,7 +5230,7 @@ The x86_64 pattern file is also maintained separately at
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | `.echo` on a body line (3.14.1); test only |
 | **ministr.axx** | 6.4 KB | 27 | **ministr.s** | Strings, arrays of strings and `.for ... in <array>` in the mini language (3.15); test only |
-| **regress.axx** | 4.4 KB | 15 | **regress.s**, **regresserr.s**, **regresscr.s** (and **regresself.s** with `z80.axx`) | Regression test for the disagreements between the two implementations found by differential fuzzing and fixed (nested `?:`, long numeric literals, pow() special cases, the macro layer's `int()`, `hex()` and format specs, the diagnostics after an error, an `.equ` of a label at the end of a section, the value of an `.equ` that contains an undefined label, the rules for white space and character constants, the byte strings of the macro layer, CR line ends, the listing of bytes that are not UTF-8, a `.org` that moves backwards under `-o`, the integer evaluation of `error_patterns`); test only |
+| **regress.axx** | 5.3 KB | 15 | **regress.s**, **regresserr.s**, **regresscr.s** (and **regresself.s** with `z80.axx`) | Regression test for the disagreements between the two implementations found by differential fuzzing and fixed (nested `?:`, long numeric literals, pow() special cases, the macro layer's `int()`, `hex()` and format specs, the diagnostics after an error, an `.equ` of a label at the end of a section, the value of an `.equ` that contains an undefined label, the rules for white space and character constants, the byte strings of the macro layer, CR line ends, the listing of bytes that are not UTF-8, a `.org` that moves backwards under `-o`, the integer evaluation of `error_patterns`, the size of a `**` result, case folding of non-ASCII letters, text after an expression and missing operands); test only |
 | **elftype.axx** | 1.5 KB | 20 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |

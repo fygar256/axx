@@ -199,7 +199,12 @@ regress.axx                         regression test for disagreements between
                                     integers, endouble() of a negative
                                     double), correctly rounded big integers
                                     in floating-point mode, and enflt{} /
-                                    endbl{} in an integer context
+                                    endbl{} in an integer context; and
+                                    (2026-11-04) `**` results under 2**256
+                                    (2**150, 1**1000), ASCII-only case
+                                    folding (nı is not NI), and text after
+                                    an expression or a missing operand in
+                                    binary_list / error_patterns / {{ }}
 reloctype.s                         regression test assembled with x86_64.axx
                                     under -o: the types chosen with
                                     .reloctype (5.5.1), which the value-based

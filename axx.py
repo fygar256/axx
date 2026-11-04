@@ -549,7 +549,7 @@ def _unordered_key(i):
         up = StringUtils.upper(nm)
         return '.setsym ' + up, f"symbol '{up}'"
     if name in ('.check', '.map', '.enum', '.reloc'):
-        var = (i[1] if i[1].strip() else i[2]).strip().lower()
+        var = (i[1] if i[1].strip() else i[2]).strip().translate(_ALOWER)
         grp = 'check' if name in ('.check', '.map') else name[1:]
         return grp + ' ' + var, f"variable '{var}' ({'.check/.map' if grp == 'check' else name})"
     if name == '.error':
@@ -714,7 +714,7 @@ def _pat_candidates(index, maxkey, lin):
     for ci, ch in enumerate(lin):
         if ch == ' ':
             continue
-        up = ch.upper()
+        up = _AUP1.get(ch, ch)
         key.append(up if len(up) == 1 else '\0')
         nextraw.append(lin[ci + 1] if ci + 1 < len(lin) else '')
         if len(key) >= maxkey:
@@ -740,6 +740,16 @@ SET_OPS = "&|^+-"
 DIGIT = '0123456789'
 XDIGIT = "0123456789ABCDEF"
 ALPHABET = LOWER + CAPITAL
+# 利用者の書いた綴りの大文字化・小文字化は ASCII だけにする。str.upper() は
+# 'ı' を 'I'、'ſ' を 'S'、合字 'ﬁ' を 'FI' に、str.lower() はケルビン記号を 'k' に
+# 畳むので、ASCII しか畳まない caxx.c（C ロケールの toupper()/tolower()）と
+# 食い違っていた（'ınc' が INC に当たり、'.ınclude' が読まれ、'.bſſ' が .bss の
+# 扱いになる）。StringUtils.upper() と同じ表である。
+_AUPPER = str.maketrans(LOWER, CAPITAL)
+_ALOWER = str.maketrans(CAPITAL, LOWER)
+# 照合の 1 文字ごとの大文字化用（関数呼び出しを避けて表を引く）。
+_AUP1 = dict(zip(LOWER, CAPITAL))
+_AALNUM = frozenset(ALPHABET + DIGIT)
 
 # _PFX_OPEN … 先頭大文字列の直後にこれが来たら、ニーモニックはまだ続いている
 #             （小文字のオペランド、`!` の式捕捉、`[[` の省略可能部分、`VADDSS_E`
@@ -764,7 +774,7 @@ def _dot_kw(s):
     if not t.startswith('.'):
         return ''
     j = 1
-    while j < len(t) and (t[j].isalnum() or t[j] == '_'):
+    while j < len(t) and (_aan(t[j]) or t[j] == '_'):
         j += 1
     return StringUtils.upper(t[:j])
 
@@ -779,7 +789,7 @@ def _parse_func_header(l):
     """
     t = l.strip()
     i = 1
-    while i < len(t) and (t[i].isalnum() or t[i] == '_'):
+    while i < len(t) and (_aan(t[i]) or t[i] == '_'):
         i += 1
     i = StringUtils.skipspc(t, i)
 
@@ -803,7 +813,7 @@ def _parse_func_header(l):
         return nm, ps, None
 
     j = i
-    while j < len(t) and (t[j].isalnum() or t[j] == '_'):
+    while j < len(t) and (_aan(t[j]) or t[j] == '_'):
         j += 1
     nm = t[i:j]
     k = StringUtils.skipspc(t, j)
@@ -1144,7 +1154,7 @@ def _elf_decl_type(state, named, text):
         return int(s, 0)
     except ValueError:
         pass
-    key = s.lower()
+    key = s.translate(_ALOWER)
     rt = state.elftypes.get(key)
     if rt is None:
         rt = named.get(key)
@@ -1375,7 +1385,7 @@ def _elf_section_attrs(state, name):
     `.elfsection` の宣言があれば、名前からの推測を丸ごと置き換える。
     axx が名前の規則を持たないセクション（ベクタ表、note など）はこれで書く。
     """
-    uname = name.upper()
+    uname = name.translate(_AUPPER)
     if   uname.startswith('.TEXT'):
         flags = 0x2 | 0x4
     elif uname.startswith('.DATA'):
@@ -1389,7 +1399,7 @@ def _elf_section_attrs(state, name):
     sh_type = 8 if uname.startswith('.BSS') else 1
     align = None
     entsize = 0
-    decl = state.elf.decl_sec.get(name.lower())
+    decl = state.elf.decl_sec.get(name.translate(_ALOWER))
     if decl is not None:
         flags = decl[0]
         if decl[1] is not None:
@@ -1601,7 +1611,7 @@ def _reloc_named(state, mach, name):
     """リロケーション型の名前を番号にする。`.elftype` が組み込みの表に勝つ。"""
     if not name:
         return None
-    key = name.lower()
+    key = name.translate(_ALOWER)
     rt = state.elftypes.get(key)
     if rt is not None:
         return rt
@@ -1706,7 +1716,7 @@ def _elf_diff_resolve(text, pend):
     """
     names = {}
     for n, v in pend:
-        key = n.upper()
+        key = n.translate(_AUPPER)
         if key in names:
             return None
         names[key] = (n, int(v))
@@ -1757,7 +1767,7 @@ def _elf_diff_resolve(text, pend):
                 j = i
                 while j < L and t[j] in _DIFF_WORD:
                     j += 1
-                key = t[i:j].upper()
+                key = t[i:j].translate(_AUPPER)
                 if key in names:
                     if key not in coef:
                         order.append(key)
@@ -3013,7 +3023,7 @@ class _XevalParser:
                 and s[self.i + 1] in 'xXoObB'):
             base, digits = {'x': (16, '0123456789abcdefABCDEF'),
                             'o': (8, '01234567'),
-                            'b': (2, '01')}[s[self.i + 1].lower()]
+                            'b': (2, '01')}[s[self.i + 1].translate(_ALOWER)]
             self.i += 2
             if self.i < self.n and s[self.i] == '_':
                 self.i += 1
@@ -3675,10 +3685,12 @@ class VariableManager:
     @staticmethod
     def _index(s):
         """変数名を正規の鍵（小文字）にする。変数名でなければ None。"""
-        if not s:
+        # 先に ASCII かを見る。ASCII の文字列なら str.lower() も isdigit() も
+        # ASCII の規則どおりで速い（ケルビン記号 'K' を 'k' に畳ませない）。
+        if not s or not s.isascii():
             return None
         u = s.lower()
-        if not u.isascii() or not ('a' <= u[0] <= 'z'):
+        if not ('a' <= u[0] <= 'z'):
             return None
         for ch in u[1:]:
             if not ('a' <= ch <= 'z' or ch.isdigit() or ch == '_'):
@@ -4278,7 +4290,7 @@ class ExpressionEvaluator:
         elif StringUtils.q(s, '0x', idx):
             idx += 2
             while idx < len(s) and StringUtils.upper(s[idx]) in XDIGIT:
-                x = 16 * x + int(s[idx].lower(), 16)
+                x = 16 * x + int(s[idx].translate(_ALOWER), 16)
                 idx += 1
         elif (idx + 3 <= len(s) and s[idx:idx + 3] == 'qad'
               and (lambda _j=StringUtils.skipspc(s, idx + 3): _j < len(s) and s[_j] == '{')()):
@@ -4484,21 +4496,30 @@ class ExpressionEvaluator:
             if t_int == 1:
                 continue
 
+            # 結果の絶対値が 2**256 未満なら計算する。以前は「底のビット数×指数」で
+            # 見積もったので、2**129〜2**191（両実装が一致する範囲の値）や 1**1000、
+            # (-1)**1001 まで溢れると報告していた。|x| >= 2 なら結果は少なくとも
+            # (ビット数-1)×指数+1 ビットあるので、それが上限を超えれば計算せずに
+            # 報告し、超えなければ計算して確かめる。caxx.c の expr_term0_0() と同じ規則である。
             try:
                 _base_bits = abs(x).bit_length() if isinstance(x, int) else 1024
             except (TypeError, ValueError, OverflowError):
                 _base_bits = 1024
-            if _base_bits * t_int > _EXP_RESULT_MAX_BITS:
+            _too_big = _base_bits >= 2 and (_base_bits - 1) * t_int + 1 > _EXP_RESULT_MAX_BITS
+            if not _too_big:
+                try:
+                    _r = x ** t_int
+                except OverflowError:
+                    self.state.diag(" error - ** result is too large to represent as a float; result set to 0.", set_error=True)
+                    x = 0
+                    continue
+                _too_big = isinstance(_r, int) and abs(_r).bit_length() > _EXP_RESULT_MAX_BITS
+            if _too_big:
                 self.state.diag(f" error - ** result would exceed {_EXP_RESULT_MAX_BITS} bits "
                          f"(chained exponentiation); result set to 0.", set_error=True)
                 x = 0
                 continue
-            try:
-                x = x ** t_int
-            except OverflowError:
-                self.state.diag(" error - ** result is too large to represent as a float; result set to 0.", set_error=True)
-                x = 0
-                continue
+            x = _r
             if isinstance(x, float) and x.is_integer():
                 x = int(x)
         return x, idx
@@ -5344,7 +5365,7 @@ class DirectiveProcessor:
 
         wf = ''
         for f in fields:
-            fl = f.lower()
+            fl = f.translate(_ALOWER)
             if fl == 'big':
                 self.state.endian = 'big'
             elif fl == 'little':
@@ -5357,7 +5378,12 @@ class DirectiveProcessor:
 
         if wf:
             self.state.error_undefined_label = False
+            self.state.expr_missing = False
             v, _idx = self.expr_eval.expression_pat(wf, 0)
+            if (_pat_missing(self.state, '.bits', wf)
+                    or _pat_trailing(self.state, '.bits', 'the word width', wf, _idx)):
+                self.state.error_undefined_label = False
+                return True
             ok = not self.state.error_undefined_label and not _is_undef_derived(v)
             nb = 0
             if ok:
@@ -5499,9 +5525,9 @@ class DirectiveProcessor:
                 continue
             for m in re.finditer(re.escape(var), cond_src):
                 b, e = m.start(), m.end()
-                if b > 0 and (cond_src[b - 1].isalnum() or cond_src[b - 1] == '_'):
+                if b > 0 and (_aan(cond_src[b - 1]) or cond_src[b - 1] == '_'):
                     continue
-                if e < len(cond_src) and (cond_src[e].isalnum() or cond_src[e] == '_'):
+                if e < len(cond_src) and (_aan(cond_src[e]) or cond_src[e] == '_'):
                     continue
                 return True
         return False
@@ -5567,9 +5593,9 @@ class DirectiveProcessor:
                 continue
             for m in re.finditer(re.escape(var), cond_src):
                 b, e = m.start(), m.end()
-                if b > 0 and (cond_src[b - 1].isalnum() or cond_src[b - 1] == '_'):
+                if b > 0 and (_aan(cond_src[b - 1]) or cond_src[b - 1] == '_'):
                     continue
-                if e < len(cond_src) and (cond_src[e].isalnum() or cond_src[e] == '_'):
+                if e < len(cond_src) and (_aan(cond_src[e]) or cond_src[e] == '_'):
                     continue
                 return True
         return False
@@ -5615,6 +5641,7 @@ class DirectiveProcessor:
                 self.expr_eval.state.exp_typ = 'i'
                 self.state._expr_read_float_var = False
                 self.state.error_undefined_label = False
+                self.state.expr_missing = False
                 u, idxn = self.expr_eval.expression_pat(s, idx_before)
                 _cond_undef = self.state.error_undefined_label or _undef(u)
                 _int_ok = False
@@ -5631,6 +5658,7 @@ class DirectiveProcessor:
                     # 2 回目: 浮動小数点モード（従来の読み方）
                     self.expr_eval.state.exp_typ = 'f'
                     self.state.error_undefined_label = False
+                    self.state.expr_missing = False
                     u, idxn = self.expr_eval.expression_pat(s, idx_before)
                     _cond_undef = self.state.error_undefined_label or _undef(u)
                     idx = idxn
@@ -5643,6 +5671,15 @@ class DirectiveProcessor:
                                                     or self.state.error_undefined_label)
 
             if idx <= idx_before:
+                break
+            # 因子の欠けた条件・コード（`a>;3`、`a>3;`）も読まずにエラーにする。
+            # 印は最後に読んだモードの評価で立ったものだけを見る。
+            if _pat_missing(self.state, 'error_patterns', s[idx_before:idx]):
+                break
+            # 条件の後ろは `;`、コードの後ろは `,` か終わり。ほかの文字が残れば
+            # （`a>3 x;4`、`a>3;4 5`）その組は読まずにエラーにする。
+            if (_pat_trailing(self.state, 'error_patterns', 'the condition', s, idxn, ';')
+                    or _pat_trailing(self.state, 'error_patterns', 'the error code', s, idx, ',')):
                 break
 
             if (self.state.should_report_errors()) and u and not _cond_undef \
@@ -5665,8 +5702,11 @@ class DirectiveProcessor:
 
     def _dir_var(self, field):
         """ディレクティブの変数名欄を正規化する。変数名でなければ None。"""
-        v = (field or '').strip().lower()
-        if not v or not v.isascii() or not ('a' <= v[0] <= 'z'):
+        v = (field or '').strip()
+        if not v or not v.isascii():
+            return None
+        v = v.lower()
+        if not ('a' <= v[0] <= 'z'):
             return None
         for ch in v[1:]:
             if not ('a' <= ch <= 'z' or ch.isdigit() or ch == '_'):
@@ -5734,7 +5774,7 @@ class DirectiveProcessor:
             return False
         name_field = i[1] if i[1] else i[2]
         value_field = i[2] if i[1] else ''
-        nm = ''.join(c for c in name_field if c not in ' \t').lower()
+        nm = ''.join(c for c in name_field if c not in ' \t').translate(_ALOWER)
         if not nm:
             self.state.diag(" error - .elftype: type name is not specified.", set_error=True)
             return True
@@ -5878,7 +5918,7 @@ class DirectiveProcessor:
         """`.elfrela` — .rela（加数を欄に持つ）か .rel かを決める。"""
         if len(i) == 0 or i[0] != '.elfrela':
             return False
-        text = self._elf_decl_fields(i)[0].strip().lower()
+        text = self._elf_decl_fields(i)[0].strip().translate(_ALOWER)
         if text in ('1', 'rela'):
             self._elf_decl_set('decl_rela', 1)
         elif text in ('0', 'rel'):
@@ -5948,7 +5988,7 @@ class DirectiveProcessor:
         if len(i) == 0 or i[0] != '.elfheader':
             return False
         _ff, _vf = self._elf_decl_fields(i)
-        fld = ''.join(c for c in _ff if c not in ' \t').lower()
+        fld = ''.join(c for c in _ff if c not in ' \t').translate(_ALOWER)
         rng = DirectiveProcessor._ELF_HDR_FIELDS.get(fld)
         if rng is None:
             self.state.diag(f" error - .elfheader: unknown field '{fld}' (type, flags, "
@@ -6220,7 +6260,7 @@ class DirectiveProcessor:
         """
         if len(i) == 0 or i[0] != '.elfunit':
             return False
-        text = self._elf_decl_fields(i)[0].strip().lower()
+        text = self._elf_decl_fields(i)[0].strip().translate(_ALOWER)
         if text in ('byte', 'word'):
             self._elf_decl_set('decl_unit', text)
         else:
@@ -6243,7 +6283,7 @@ class DirectiveProcessor:
             self.state.diag(" error - .elflink: section name is not specified.", set_error=True)
             return True
         e = self.state.elf
-        key = nm.lower()
+        key = nm.translate(_ALOWER)
         if e.decl_link.get(key) != (lk, inf):
             e.decl_link[key] = (lk, inf)
             e.decl_gen += 1
@@ -6306,7 +6346,7 @@ class DirectiveProcessor:
         """
         if len(i) == 0 or i[0] != '.elfcfireg':
             return False
-        nm = (i[1] if len(i) > 1 else '').strip().lower()
+        nm = (i[1] if len(i) > 1 else '').strip().translate(_ALOWER)
         if not nm:
             self.state.diag(" error - .elfcfireg: a register name is required.", set_error=True)
             return True
@@ -6341,7 +6381,7 @@ class DirectiveProcessor:
             self.state.diag(" error - .elfgroup: no member section is given.", set_error=True)
             return True
         e = self.state.elf
-        key = (gn.lower(), sig)
+        key = (gn.translate(_ALOWER), sig)
         val = (gn, sig, fl, mem)
         if e.decl_group.get(key) != val:
             e.decl_group[key] = val
@@ -6385,7 +6425,7 @@ class DirectiveProcessor:
             if es is None:
                 return True
         e = self.state.elf
-        key = nm.lower()
+        key = nm.translate(_ALOWER)
         if e.decl_sec.get(key) != (fl, ty, al, es):
             e.decl_sec[key] = (fl, ty, al, es)
             e.decl_gen += 1
@@ -6414,7 +6454,7 @@ class DirectiveProcessor:
         rtype = _reloc_named(self.state, mach, tname)
         if rtype is None:
             _mname = mach['name']
-            _key = (tname.lower(), self.state.elf_machine)
+            _key = (tname.translate(_ALOWER), self.state.elf_machine)
             if _key not in self.state._reloc_badname_seen:
                 self.state._reloc_badname_seen.add(_key)
                 self.state.diag(
@@ -6453,7 +6493,7 @@ class DirectiveProcessor:
                                     set_error=True)
                     return True
                 _tn, _po = it.rsplit('@', 1)
-                _pn = _tn.lstrip(' \t').rstrip(' \t\r\n').lower()
+                _pn = _tn.lstrip(' \t').rstrip(' \t\r\n').translate(_ALOWER)
                 prt = _reloc_named(self.state, mach, _pn)
                 if prt is None or prt <= 0:
                     self.state.diag(f" error - .reloc: unknown relocation type '{_pn}' for "
@@ -6607,7 +6647,7 @@ class DirectiveProcessor:
             self.state.freed_subs.add(key)
             for var, syms in self.state.check_constraints.items():
                 self.state.check_constraints[var] = [x for x in syms if x != key]
-            _v = nm.lower()
+            _v = nm.translate(_ALOWER)
             if _v and PatternMatcher._var_name_at(_v, 0) == len(_v):
                 self.state.check_constraints.pop(_v, None)
                 self.state.reloc_constraints.pop(_v, None)
@@ -6908,7 +6948,7 @@ class PatternMatcher:
             return 0
         n = 1
         while i + n < len(t) and ('a' <= t[i + n] <= 'z'
-                                  or t[i + n].isdigit() or t[i + n] == '_'):
+                                  or _ad(t[i + n]) or t[i + n] == '_'):
             n += 1
         return n
 
@@ -7074,7 +7114,7 @@ class PatternMatcher:
             if a == '\\':
                 idx_t += 1
                 if idx_t < len(t) - 1 and t[idx_t] == b:
-                    lit_alnum = t[idx_t].isalnum()
+                    lit_alnum = t[idx_t] in _AALNUM
                     if lit_alnum and prev_alnum and word_break:
                         return False
                     idx_t += 1
@@ -7085,7 +7125,7 @@ class PatternMatcher:
                 else:
                     return False
             elif a in CAPITAL:
-                if a == b.upper():
+                if a == _AUP1.get(b, b):
 
                     if prev_alnum and word_break:
                         return False
@@ -7439,7 +7479,7 @@ class PatternMatcher:
                 continue
             elif a == b:
 
-                lit_alnum = a.isalnum()
+                lit_alnum = a in _AALNUM
                 if lit_alnum and prev_alnum and word_break:
                     return False
                 idx_t += 1
@@ -7803,7 +7843,7 @@ class PatternFileReader:
                 elif _dk in _MINI_CLOSE:
                     cur.depth -= 1
                     if cur.depth < 0:
-                        diag(f" error - '.func::{cur.name}': {_dk.lower()} without a "
+                        diag(f" error - '.func::{cur.name}': {_dk.translate(_ALOWER)} without a "
                              f"matching block opener.", set_error=True)
                         cur.depth = 0
                 if l.strip():
@@ -7854,7 +7894,7 @@ class PatternFileReader:
                     continue
                 if _kw == '.RETURN' or _kw == '.ENDSUB':
                     if cur_sub is None:
-                        diag(f" error - '{_kw.lower()}' without a matching '.sub'.",
+                        diag(f" error - '{_kw.translate(_ALOWER)}' without a matching '.sub'.",
                              set_error=True)
                     cur_sub = None
                     continue
@@ -7927,8 +7967,11 @@ class PatternFileReader:
     @staticmethod
     def _dir_var_name(field):
         """ディレクティブの変数名欄を読む（読み込み時用の軽い版）。"""
-        v = (field or '').strip().lower()
-        if not v or not v.isascii() or not ('a' <= v[0] <= 'z'):
+        v = (field or '').strip()
+        if not v or not v.isascii():
+            return None
+        v = v.lower()
+        if not ('a' <= v[0] <= 'z'):
             return None
         for ch in v[1:]:
             if not ('a' <= ch <= 'z' or ch.isdigit() or ch == '_'):
@@ -7947,11 +7990,11 @@ class PatternFileReader:
         out = []
         k = 0
         while k < len(expr):
-            if expr[k:k + vl].lower() == var:
+            if expr[k:k + vl].translate(_ALOWER) == var:
                 prev = expr[k - 1] if k > 0 else ''
                 nxt = expr[k + vl] if k + vl < len(expr) else ''
-                if not (prev.isalnum() or prev == '_') and \
-                   not (nxt.isalnum() or nxt == '_'):
+                if not (_aan(prev) or prev == '_') and \
+                   not (_aan(nxt) or nxt == '_'):
                     out.append(num)
                     k += vl
                     continue
@@ -8035,7 +8078,7 @@ class PatternFileReader:
         """`.INCLUDE` の行を処理して、読み込んだ表を返す。"""
         idx = StringUtils.skipspc(l, 0)
         i = l[idx:idx + 8]
-        i = i.upper()
+        i = i.translate(_AUPPER)
         if i != ".INCLUDE":
             return None
         s = StringUtils.get_string(l[idx + 8:])
@@ -8487,7 +8530,7 @@ class _MiniExprParser:
                         args.append(self.or_())
                 self.expect_op(')')
                 return ('callexpr', v2, args)
-            self.fail(f"{v.lower()!r} cannot be used in an expression")
+            self.fail(f"{v.translate(_ALOWER)!r} cannot be used in an expression")
         if k == 'op' and v == '(':
             self.i += 1
             e = self.or_()
@@ -8561,7 +8604,7 @@ class MiniParser:
             if kw in enders:
                 return out, i
             if kw in self._ENDERS:
-                raise MiniLangError(f"{f}:{ln}: '{kw.lower()}' without a matching opener")
+                raise MiniLangError(f"{f}:{ln}: '{kw.translate(_ALOWER)}' without a matching opener")
             if kw == '.IF':
                 node, i = self._if_chain(i)
                 out.append(node)
@@ -8604,7 +8647,7 @@ class MiniParser:
         self._nest(pos)
         toks = _mini_lex(text, pos)
         if not toks or toks[-1] != ('dot', '.THEN'):
-            raise MiniLangError(f"{f}:{ln}: '{kw.lower()}' must end with '.then'")
+            raise MiniLangError(f"{f}:{ln}: '{kw.translate(_ALOWER)}' must end with '.then'")
         cond = _MiniExprParser(toks[1:-1], pos).parse()
         then_b, i = self._block(i + 1, ('.ELIF', '.ELSE', '.ENDIF'))
         if i >= len(self.lines):
@@ -8701,7 +8744,7 @@ class MiniParser:
                     raise MiniLangError(f"{f}:{ln}: unexpected text after '.echo(...)'")
                 return ('echo', items, pos)
             if v in ('.BREAK', '.CONTINUE'):
-                low = v.lower()
+                low = v.translate(_ALOWER)
                 if len(toks) != 1:
                     raise MiniLangError(f"{f}:{ln}: unexpected text after '{low}'")
                 if self.loopdepth <= 0:
@@ -8727,7 +8770,7 @@ class MiniParser:
                 if not names:
                     raise MiniLangError(f"{f}:{ln}: '.nonlocal' needs variable names")
                 return ('nonlocal', names, pos)
-            raise MiniLangError(f"{f}:{ln}: unknown statement {v.lower()!r}")
+            raise MiniLangError(f"{f}:{ln}: unknown statement {v.translate(_ALOWER)!r}")
         if k != 'name':
             raise MiniLangError(f"{f}:{ln}: statement must be a directive or an assignment")
         name = v
@@ -10088,11 +10131,15 @@ class ObjectGenerator:
                 return len(name), kind
         return 0, -1
 
-    def _txt_emit_expr(self, parts, expr, kind):
-        """`{{ }}` の 1 個を評価して、テキストとして積む。"""
+    def _txt_emit_expr(self, parts, expr, kind, inner=None):
+        """`{{ }}` の 1 個を評価して、テキストとして積む。inner は診断に出す `{{ }}` の中身。"""
         saved_undef = self.state.error_undefined_label
         self.state.error_undefined_label = False
-        v, _ = self.expr_eval.expression_pat(expr, 0)
+        self.state.expr_missing = False
+        v, _end = self.expr_eval.expression_pat(expr, 0)
+        _pat_missing(self.state, 'text template', expr[:_end])
+        _pat_trailing(self.state, 'text template',
+                      "the expression in '{{%s}}'" % (expr if inner is None else inner), expr, _end)
         if self.state.error_undefined_label:
             saved_undef = True
         self.state.error_undefined_label = saved_undef
@@ -10147,7 +10194,9 @@ class ObjectGenerator:
                     if nl:
                         cp = self._txt_close_paren(inner, j + 1 + nl)
                         if cp > 0:
-                            self._txt_emit_expr(parts, inner[j + 1 + nl + 1:cp], kind)
+                            self._txt_emit_expr(parts, inner[j + 1 + nl + 1:cp], kind, inner)
+                            _pat_trailing(self.state, 'text template',
+                                          "'%s' in '{{%s}}'" % (inner[j:cp + 1], inner), inner, cp + 1)
                             done = True
                 if not done:
                     nm, ix = self._txt_bare_indexed(inner)
@@ -10206,7 +10255,7 @@ class ObjectGenerator:
         if key in self.state.arrsymbols:
             return ','.join(v if isinstance(v, str) else self._txt_radix(v, 10)
                             for v in self.state.arrsymbols[key])
-        _v = name.lower()
+        _v = name.translate(_ALOWER)
         if _v == name and _v in self.state.varnames:
             return self._txt_radix(self.state.vars.get(_v, VAR_UNDEF), 10)
         return name
@@ -10337,7 +10386,7 @@ class ObjectGenerator:
         if nm is not None and nm in self.state.strsymbols:
             t = self.state.strsymbols[nm].strip()
             nm = self._txt_bare_name(t)
-        _v = t.lower()
+        _v = t.translate(_ALOWER)
         is_var = (_v == t and _v in self.state.varnames)
         if nm is not None and not is_var:
             for k, v in enumerate(arr):
@@ -10452,6 +10501,7 @@ class ObjectGenerator:
                     if idx < len(s) and s[idx] == ',':
                         idx += 1
                         continue
+                    _pat_trailing(self.state, 'binary_list', 'an element', s, idx)
                     break
 
                 if StringUtils.upper(s[idx:idx + 5]) == '.CALL' and (
@@ -10472,13 +10522,17 @@ class ObjectGenerator:
                     if idx < len(s) and s[idx] == ',':
                         idx += 1
                         continue
+                    _pat_trailing(self.state, 'binary_list', 'an element', s, idx)
                     break
 
                 self.state._elf_current_word_idx = len(objl)
 
                 if self.state.pas == 1:
                     self.state._pass1_size_mode = True
+                _el = idx
+                self.state.expr_missing = False
                 x, idx = self.expr_eval.expression_pat(s, idx)
+                _pat_missing(self.state, 'binary_list', s[_el:idx])
                 if self.state.pas == 1:
                     self.state._pass1_size_mode = False
                     self.state.error_undefined_label = False
@@ -10494,6 +10548,7 @@ class ObjectGenerator:
                 if idx < len(s) and s[idx] == ',':
                     idx += 1
                     continue
+                _pat_trailing(self.state, 'binary_list', 'an element', s, idx)
                 break
         finally:
             self.state._elf_current_word_idx = -1
@@ -10507,6 +10562,38 @@ class ObjectGenerator:
 
         return objl
 
+
+
+def _pat_trailing(state, what, after, text, idx, allowed=''):
+    """パターンファイルの式の後ろに残った文字をエラーにする（黙って捨てない）。
+
+    `binary_list` の要素、`error_patterns` の `条件;コード`、テンプレートの
+    `{{ }}` は、式を読み終えたところで続きを見ずに残りを捨てていたので、
+    `0x3e,n m` や `n|0x68)`、`{{1+}}` のような書き損じが黙って誤ったバイト列や
+    テキストになった。空白・タブ・NUL だけなら何もしない。残りが allowed の
+    どれかで始まるならそれは続きなので、これも何もしない。
+    caxx.c の pat_trailing() と同じ規則である。
+    """
+    rest = text[idx:].replace(chr(0), '').strip(' \t')
+    if not rest or rest[0] in allowed:
+        return False
+    state.diag(f" error - {what}: unexpected text after {after}: {rest!r}.", set_error=True)
+    return True
+
+
+def _pat_missing(state, what, text):
+    """パターンファイルの式で、因子のあるべきところに因子が無ければエラーにする。
+
+    `1+`、`n|`、`(a<<)` は、足りない因子を 0 と読んで黙って値になっていた。
+    照合（ソースの `ld a,1+` を当てない）と同じ state.expr_missing の印で見る。
+    caxx.c の pat_missing() と同じ規則である。
+    """
+    if not state.expr_missing:
+        return False
+    state.expr_missing = False
+    t = text.replace(chr(0), '').strip(' \t')
+    state.diag(f" error - {what}: an operand is missing in the expression {t!r}.", set_error=True)
+    return True
 
 
 def bare_name_of(text):
@@ -10884,7 +10971,7 @@ class AssemblyDirectiveProcessor:
 
     def labelc_processing(self, l, ll):
         """`.labelc` — ラベルに使える文字を増やす。"""
-        if l.upper() != '.LABELC':
+        if l.translate(_AUPPER) != '.LABELC':
             return False
         if ll:
             self.state.lwordchars = ALPHABET + DIGIT + ll
@@ -10905,14 +10992,14 @@ class AssemblyDirectiveProcessor:
             idx = StringUtils.skipspc(l, idx)
             e, idx = StringUtils.get_param_to_spc(l, idx)
 
-            if e.upper() == '.EQU':
+            if e.translate(_AUPPER) == '.EQU':
                 reloc_type = None
                 # 落とす空白はスペースとタブだけ（caxx.c と同じ）。
                 expr_part = l[idx:].strip(' \t')
                 if '::' in expr_part:
                     parts = [p.strip(' \t') for p in expr_part.split('::', 1)]
                     expr_part = parts[0]
-                    rt_str = parts[1].lower()
+                    rt_str = parts[1].translate(_ALOWER)
 
                     _mach_tbl = elf_machine_table(self.state)
                     reloc_type = _reloc_named(self.state, _mach_tbl, rt_str)
@@ -11080,7 +11167,7 @@ class AssemblyDirectiveProcessor:
                 _rt_start = idx
                 while idx < len(l2) and l2[idx] not in ' \t,:' + chr(0):
                     idx += 1
-                _rt_str = l2[_rt_start:idx].strip().lower()
+                _rt_str = l2[_rt_start:idx].strip().translate(_ALOWER)
                 if _rt_str:
                     _mach_tbl_g = elf_machine_table(self.state)
                     _rtype_g = _reloc_named(self.state, _mach_tbl_g, _rt_str)
@@ -11466,7 +11553,7 @@ class AssemblyDirectiveProcessor:
                 rt_start = idx
                 while idx < len(l2) and l2[idx] not in ' \t,:' + chr(0):
                     idx += 1
-                rt_str = l2[rt_start:idx].strip().lower()
+                rt_str = l2[rt_start:idx].strip().translate(_ALOWER)
 
                 if rt_str:
                     reloc_type = _reloc_named(self.state, _mach_tbl_ext, rt_str)
@@ -11578,7 +11665,7 @@ class AssemblyDirectiveProcessor:
 
     def _cfi_reg(self, op, text):
         """CFI 指令のレジスタの引数を読む。`.elfcfireg` の名前か、0 以上の数。"""
-        r = self.state.elf.decl_cfireg.get(text.lower())
+        r = self.state.elf.decl_cfireg.get(text.translate(_ALOWER))
         if r is not None:
             return r
         v = self._cfi_num(op, text)
@@ -11598,7 +11685,7 @@ class AssemblyDirectiveProcessor:
             return False
         if not (self.state.should_report_errors() and self.state.elf_objfile):
             return True
-        op = l1[5:].lower()
+        op = l1[5:].translate(_ALOWER)
         spec = _CFI_OPS.get(op)
         if spec is None:
             self.state.diag(f" error - unknown CFI directive '{l1}'.", set_error=True)
@@ -11616,7 +11703,7 @@ class AssemblyDirectiveProcessor:
                 self.state.diag(" error - .cfi_startproc: the previous .cfi_startproc has "
                                 "no .cfi_endproc.", set_error=True)
                 return True
-            if args and [a.lower() for a in args] != ['simple']:
+            if args and [a.translate(_ALOWER) for a in args] != ['simple']:
                 self.state.diag(f" error - .cfi_startproc: unknown argument '{l2.strip()}'.",
                                 set_error=True)
                 return True
@@ -11681,7 +11768,7 @@ class AssemblyDirectiveProcessor:
         if not self.state.should_report_errors():
             return True
         for name, f in self._sym_decl_scan(l2, 1):
-            kind = f[0].lower()
+            kind = f[0].translate(_ALOWER)
             if not kind:
                 self.state.diag(f" error - .TYPE: a symbol type is required for "
                                 f"'{name}'.", set_error=True)
@@ -11803,7 +11890,7 @@ class AssemblyDirectiveProcessor:
                 self.state.diag(" warning - .RELOCTYPE: too many arguments (only "
                      "4 widths -- 8/16/32/64-bit -- are supported)", set_error=False)
                 break
-            _name = _raw_name.strip().lower()
+            _name = _raw_name.strip().translate(_ALOWER)
             if not _name:
                 continue
             _rtype = _reloc_named(self.state, _mach_tbl_rt, _name)
@@ -11831,7 +11918,7 @@ class AssemblyDirectiveProcessor:
             return False
         self.state.error_undefined_label = False
         u, idx = self.expr_eval.expression_asm(l2, 0)
-        _org_fill = idx + 2 <= len(l2) and l2[idx:idx + 2].upper() == ',P'
+        _org_fill = idx + 2 <= len(l2) and l2[idx:idx + 2].translate(_AUPPER) == ',P'
         if self._dir_trailing(".ORG", l2, idx + 2 if _org_fill else idx):
             return True
         if self.state.error_undefined_label or _undef(u):
@@ -11853,7 +11940,7 @@ class AssemblyDirectiveProcessor:
                             f"{self.state.pc} to {u}); an ELF object (-o, -E) cannot "
                             f"hold that.", set_error=True)
             return True
-        if idx + 2 <= len(l2) and l2[idx:idx + 2].upper() == ',P':
+        if idx + 2 <= len(l2) and l2[idx:idx + 2].translate(_AUPPER) == ',P':
             if u > self.state.pc:
                 _ORG_FILL_MAX = 1 << 28
                 fill_count = u - self.state.pc
@@ -13838,7 +13925,7 @@ class Assembler:
                     for _ci, _ch in enumerate(lin):
                         if _ch == ' ':
                             continue
-                        if _ch.upper() != _pfx[_k]:
+                        if _AUP1.get(_ch, _ch) != _pfx[_k]:
                             _ok = False
                             break
                         _k += 1
@@ -15526,7 +15613,7 @@ class Assembler:
         init_ops = []
         for t in e.decl_cfiinit:
             w = t.split(' ', 1)
-            op = w[0].lower()
+            op = w[0].translate(_ALOWER)
             spec = _CFI_OPS.get(op)
             args = [a.strip() for a in w[1].split(',')] if len(w) > 1 and w[1].strip() else []
             ok = spec is not None and op not in ('startproc', 'endproc', 'sections',
@@ -15538,13 +15625,13 @@ class Assembler:
                 ok = False
             vals = []
             for a in args if ok else []:
-                r = e.decl_cfireg.get(a.lower())
+                r = e.decl_cfireg.get(a.translate(_ALOWER))
                 if r is None:
                     m = re.match(r'^([+-]?)(0[xX][0-9a-fA-F]+|[0-9]+)$', a)
                     if m is None:
                         ok = False
                         break
-                    r = int(m.group(2), 0 if m.group(2)[:2].lower() == '0x' else 10)
+                    r = int(m.group(2), 0 if m.group(2)[:2].translate(_ALOWER) == '0x' else 10)
                     if m.group(1) == '-':
                         r = -r
                 if spec == '*' and not 0 <= r <= 255:
@@ -15987,7 +16074,7 @@ class Assembler:
             _nums = []
             for _m in _gmem:
                 _k = next((i + 1 for i, cs in enumerate(csecs)
-                           if cs.name.lower() == _m.lower()), None)
+                           if cs.name.translate(_ALOWER) == _m.translate(_ALOWER)), None)
                 if _k is None:
                     self.state.diag(f" warning - .elfgroup: member section '{_m}' of group "
                                     f"'{_gn}' is not in the output; ignored.", set_error=False)
@@ -16427,16 +16514,16 @@ class Assembler:
             if not text:
                 return 0
             t = text.strip()
-            if t.isdigit():
+            if (t.isascii() and t.isdigit()):
                 return int(t, 10)
-            if t[:2].lower() == '0x' and len(t) > 2 and all(c in '0123456789abcdefABCDEF' for c in t[2:]):
+            if t[:2].translate(_ALOWER) == '0x' and len(t) > 2 and all(c in '0123456789abcdefABCDEF' for c in t[2:]):
                 return int(t, 16)
-            tl = t.lower()
+            tl = t.translate(_ALOWER)
             for i, cs in enumerate(csecs):
-                if cs.name.lower() == tl:
+                if cs.name.translate(_ALOWER) == tl:
                     return i + 1 + G
             for ri, sidx in enumerate(rela_sec_order):
-                if (_rela_prefix + csecs[sidx - 1].name).lower() == tl:
+                if (_rela_prefix + csecs[sidx - 1].name).translate(_ALOWER) == tl:
                     return ncs + 1 + ri + G
             if tl == '.symtab':
                 return symtab_shidx
@@ -16445,7 +16532,7 @@ class Assembler:
             if tl == '.shstrtab':
                 return shstrndx
             for dname in dbg_prog_shndx:
-                if dname.lower() == tl:
+                if dname.translate(_ALOWER) == tl:
                     return dbg_prog_shndx[dname]
             self.state.diag(f" warning - .elflink: {what} of '{sname}': no section "
                             f"named '{t}'; written as 0.", set_error=False)
@@ -16524,7 +16611,7 @@ class Assembler:
                 _sh_type_i = s.sh_type
                 _al_i = (s.align if s.align is not None
                          else _elf_default_align(_sh_type_i, _is_elf64))
-                _lk_t, _inf_t = self.state.elf.decl_link.get(s.name.lower(), ('', ''))
+                _lk_t, _inf_t = self.state.elf.decl_link.get(s.name.translate(_ALOWER), ('', ''))
                 f.write(_pack_shdr(
                     sec_name_offs[i], _sh_type_i, s.flags, 0,
                     sec_offsets[i], s.byte_size,
@@ -16954,7 +17041,7 @@ class Assembler:
         self.state.elf_class    = None if args.elf_format is None else \
                                   (2 if args.elf_format == 64 else 1)
 
-        _osabi_key = args.elf_osabi.lower()
+        _osabi_key = args.elf_osabi.translate(_ALOWER)
         if _osabi_key not in osabitbl:
             print(f"warning: unknown --osabi value '{args.elf_osabi}'; "
                   f"valid choices are {list(osabitbl.keys())} (case-insensitive). Using 'Linux'.",
