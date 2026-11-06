@@ -1,4 +1,11 @@
+# make       -> caxx と paxx
+# make faxx  -> faxx
+# make all   -> caxx, paxx, faxx
+default: caxx paxx
+
 all: caxx paxx faxx
+
+.PHONY: default all install
 
 faxx: faxxsrc/*
 	./build_ccforth.sh
