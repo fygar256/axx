@@ -11,17 +11,33 @@ Writing a pattern file for a processor gives you an assembler for it.
 git clone https://github.com/fygar256/axx.git
 cd axx
 make                            # builds caxx, paxx and axx in this directory
-sudo make install               # optional: caxx and paxx into /usr/local/bin, the man
-                                # page into /usr/share/man/man1
+make faxx                       # optional: builds faxx (needs ccforth, see below)
+sudo make install               # optional: caxx, paxx and faxx into /usr/local/bin,
+                                # the man page into /usr/share/man/man1
 ```
 
-To build only the C implementation:
+`make all` builds caxx, paxx, axx and faxx together. `make install` installs `faxx` as well, so build it
+first or drop that line. To build only the C implementation:
 
 ```sh
 gcc caxx.c -o caxx -lm -lquadmath -O2   # -lm for the expression evaluator,
                                         # -lquadmath for the 128-bit float
                                         # conversion (strtoflt128)
 ```
+
+The Forth implementation runs under gforth from the top of the repository,
+with no build step, or is compiled into the executable `faxx` by
+`build_ccforth.sh` (what `make faxx` runs):
+
+```sh
+gforth faxx.fs patfile/z80.axx asmsrc/z80.s -b out.bin
+./build_ccforth.sh              # writes ./faxx; needs ccforth and a C compiler
+```
+
+`build_ccforth.sh` takes the output name as its argument (default `faxx`) and
+reads `CCFORTH` (the ccforth to use), `CC`, `CFLAGS`, `MEMSIZE` (the Forth
+memory in bytes, default 64 MB) and `KEEPC` (keep the generated C under that
+name). ccforth is at <https://github.com/ncw/ccforth>.
 
 Assemble:
 
@@ -34,31 +50,38 @@ Assemble:
 
 `axx` is a copy of `axx.py` (the Python implementation) that `make` creates in
 this directory. `make install` does not install `axx`, so with the installed
-programs type `paxx` (Python) or `caxx` (C) instead. The `axx` in the examples
-that follow can be read as any of them.
+programs type `paxx` (Python), `caxx` (C) or `faxx` (Forth) instead. The `axx`
+in the examples that follow can be read as any of them.
 
 In the repository the pattern files live in `patfile/` and the assembly sources
 in `asmsrc/`. The examples further down write the bare file names for
 readability; running them on a fresh clone needs the directory in front, as
 above.
 
-## Two implementations
+## Three implementations
 
 | Language | File | Nickname | Role |
 |---|---|---|---|
 | Python | `axx.py` | Paxx | Reference implementation; new features land here first |
-| C | `caxx.c` | Caxx | Much faster; may lag behind Paxx |
+| C | `caxx.c` | Caxx | Much faster (the x86_64 hello world in about 0.1 s against several seconds for Paxx) |
+| Forth | `faxx.fs`, `faxxsrc/` | Faxx | Written from `axx.py`; runs under gforth, or as an executable built with ccforth (about 0.2 s for the same hello world) |
 
-The two are intended to produce **byte-identical output** for the same input.
+All three are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that: `test1` assembles all one hundred and four bundled pattern/source pairs with
-both implementations and `cmp`s the results. For the five `.textmode` pairs and the `exprmiss.axx` pair it also
-`cmp`s the translated text each implementation sends to standard output under
-`-V`, and for the `echo.axx` and `ministr.axx` pairs the `.echo` lines each one writes to standard
-error, and for the `regress.axx` regression test its `-V` text and its diagnostics.
-The sixteen core pairs are run under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v`
-and `-V` as well, so the ELF32 and ELF64 objects, the DWARF, the listing and the
-text output are compared too, for two hundred and fifty-four comparisons in all.
+exactly that for Paxx and Caxx: `test1` assembles all one hundred and thirteen
+bundled pattern/source pairs with both and `cmp`s the results, two hundred and
+eighteen runs on each side. Besides the `-b` images it compares the translated
+text of `-V` (the `.textmode` pairs, `exprmiss.axx`, `regress.axx`), the `.echo`
+lines written to standard error (`echo.axx`, `ministr.axx`), the diagnostics of
+the `_err.s` files and of the regression tests, the ELF objects of the
+relocation tests and the `--elfdesc` output. The sixteen core pairs are run
+under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v` and `-V` as well, so the ELF32 and
+ELF64 objects, the DWARF, the listing and the text output are compared too, for
+two hundred and fifty-four comparisons in all. Appendix B lists them.
+
+Faxx is not run by `test1`. Where this manual says "both implementations" it
+means Paxx and Caxx, the pair `test1` checks; Faxx follows the same rules,
+since it was written from `axx.py`, and section 2.4 lists where it differs.
 
 **Contents**
 
@@ -192,13 +215,14 @@ only the operands that really need evaluating, and write the rest as string
 literals. Parts of an ISA that resist structure can simply be enumerated.
 
 The execution platform is not significant. `chr(13)` at the end of DOS lines is
-ignored, and Paxx runs anywhere Python 3 runs.
+ignored, Paxx runs anywhere Python 3 runs, and Faxx anywhere gforth runs.
 
 ### 1.6 Implementation limits
 
 Section 1.3 describes the scope of the model. This section collects the concrete
-limits imposed by the code of the implementations (`axx.py` and `caxx.c`).
-Ordinary von Neumann processors rarely come near any of them.
+limits imposed by the code of the implementations (`axx.py` and `caxx.c`;
+`faxxsrc/` has the same limits, apart from the expression nesting depth noted
+in section 2.4). Ordinary von Neumann processors rarely come near any of them.
 
 **What cannot be assembled**
 
@@ -335,7 +359,32 @@ honored, with a warning.
   mistake them for a separator in a different place. UTF-8 sources never
   contain the bytes 0xFE / 0xFF.
 
-### 2.4 Prompt mode
+### 2.4 Differences in the Forth version
+
+`faxx` (and `gforth faxx.fs`) takes the same arguments as `axx.py`. Where the
+C version differs from `axx.py` in section 2.3, Faxx sides as follows:
+
+- `-d` / `--debug`: like `caxx`, there are no Python exceptions or tracebacks;
+  the other lines are the same.
+- Command-line mistakes: like `axx.py`, the messages have the form of Python's
+  argparse and the exit status is 2. `-h` prints the help text of `axx.py`; the
+  indentation of a few lines differs.
+- Non-ASCII UTF-8 text quoted in a diagnostic: like `caxx`, the bytes are
+  written as they are.
+- The VLIW bundle separators: like `caxx`, the single bytes 0xFE / 0xFF.
+- The expression nesting limit of section 1.6 is 1,000 in Faxx
+  (`EXPR-MAX-DEPTH` in `faxxsrc/expr.fs`), so a chain of 501 to 1,000 unary
+  `-` that the other two refuse with `expression nesting too deep.` is accepted.
+- `-P` / `-p` with a file name, and the other rules of section 2.3 that are not
+  listed here, are the same in all three.
+
+`faxx.fs` reads its parts with paths relative to the working directory
+(`faxxsrc/load.fs`), so under gforth run it from the top of the repository.
+The executable built by `build_ccforth.sh` has no such restriction. Under
+gforth the x86_64 hello world takes a few seconds, about as long as Paxx; the
+ccforth build takes about 0.2 s, close to Caxx.
+
+### 2.5 Prompt mode
 
 With no source file, axx reads assembly lines from the terminal at a `>>`
 prompt. `?` displays the label table. The macro layer is bypassed in this mode.
@@ -4920,7 +4969,9 @@ implementation is Python, its nickname is Paxx.
 The core idea, the name, and a prototype in C existed in 1986, conceived during
 university while working part-time at Tokyo Denshi Sekkei. The original listing
 resurfaced 38 years later, and the working code released today is a 2024
-rewrite of it in Python.
+rewrite of it in Python. The C implementation, Caxx, followed in 2026, and the
+Forth implementation, Faxx, later the same year; both were written to produce
+the same bytes as the Python one.
 
 ### 10.2 The metalanguage
 
@@ -5223,14 +5274,14 @@ The x86_64 pattern file is also maintained separately at
 | **exprmiss.axx** | 1.1 KB | 8 | **exprmiss.s** | A line with no expression or factor where one belongs (empty, `1+`, `-`, `~`, `()`) matches none of `!`, `!!`, `!L` and `!F`/`!D`/`!Q`, and is let through by `.passthru` (3.3); test only |
 | **arrindex.axx** | 860 B | 14 | **arrindex.s** | Array symbols: bare names as items, a name as a subscript, `.index` (3.6.1); test only |
 | **passthru.axx** | 686 B | 6 | **passthru.s** | `.passthru` and `.eol` (3.16 / 3.17); test only |
-| **datadir.axx** | 833 B | 2 | **datadir.s**, **datadir_err.s** | `.db` / `.dw` / `.dd` / `.dq` / `.do` / `.dy` / `.dz` (5.3); 8-bit, little, with `.eol`; test only |
-| **datadirbe.axx** | 380 B | 2 | **datadir.s** | the same source with 8-bit words, big-endian; test only |
-| **datadirw.axx** | 531 B | 2 | **datadir.s** | the same source with 16-bit words; test only |
+| **datadir.axx** | 1.0 KB | 3 | **datadir.s**, **datadir_err.s** | `.db` / `.dw` / `.dd` / `.dq` / `.do` / `.dy` / `.dz` (5.3); 8-bit, little, with `.eol`; test only |
+| **datadirbe.axx** | 613 B | 3 | **datadir.s** | the same source with 8-bit words, big-endian; test only |
+| **datadirw.axx** | 764 B | 3 | **datadir.s** | the same source with 16-bit words; test only |
 | **unordered.axx** | 1.7 KB | 28 | **unordered.s** | `.unordered` and per-variable `.map` (3.19): the Z80 `C` as a register and as carry; test only |
 | **symcap.axx** | 1.1 KB | 12 | **symcap.s** | the `!Y<set>[<var>]` symbol capture (3.6.3); test only |
 | **echo.axx** | 1.2 KB | 8 | **echo.s** | `.echo` on a body line (3.14.1); test only |
 | **ministr.axx** | 6.4 KB | 27 | **ministr.s** | Strings, arrays of strings and `.for ... in <array>` in the mini language (3.15); test only |
-| **regress.axx** | 5.3 KB | 15 | **regress.s**, **regresserr.s**, **regresscr.s** (and **regresself.s** with `z80.axx`) | Regression test for the disagreements between the two implementations found by differential fuzzing and fixed (nested `?:`, long numeric literals, pow() special cases, the macro layer's `int()`, `hex()` and format specs, the diagnostics after an error, an `.equ` of a label at the end of a section, the value of an `.equ` that contains an undefined label, the rules for white space and character constants, the byte strings of the macro layer, CR line ends, the listing of bytes that are not UTF-8, a `.org` that moves backwards under `-o`, the integer evaluation of `error_patterns`, the size of a `**` result, case folding of non-ASCII letters, text after an expression and missing operands); test only |
+| **regress.axx** | 5.2 KB | 23 | **regress.s**, **regresserr.s**, **regresscr.s** (and **regresself.s** with `z80.axx`) | Regression test for the disagreements between Paxx and Caxx found by differential fuzzing and fixed (nested `?:`, long numeric literals, pow() special cases, the macro layer's `int()`, `hex()` and format specs, the diagnostics after an error, an `.equ` of a label at the end of a section, the value of an `.equ` that contains an undefined label, the rules for white space and character constants, the byte strings of the macro layer, CR line ends, the listing of bytes that are not UTF-8, a `.org` that moves backwards under `-o`, the integer evaluation of `error_patterns`, the size of a `**` result, case folding of non-ASCII letters, text after an expression and missing operands); test only |
 | **elftype.axx** | 1.5 KB | 20 | **elftype.s** | type names defined with `.elftype`, written in `.reloc` / `.extern` / `.global` (3.7.6); test only |
 | **elfgen.axx** | 2.7 KB | 32 | **elfgen.s** | the ELF description of a machine outside the built-in table (EM_MSP430) (3.7.7); test only |
 | **elfprio.axx** | 1.7 KB | 21 | **elfprio.s** | the relocation type priority: default < pattern file < source file (3.7.8); test only |
@@ -5325,7 +5376,7 @@ drops the label references it read, so for a symbol only the bytes of the
 immediate field read the label, and the relocation lands on that field). The three-operand `IMUL` with an
 immediate and `MOV` with `[RIP+...]` have their 32 / 16 / 8-bit forms too.
 
-`test1` runs all one hundred and four pairs through both implementations and
+`test1` runs all one hundred and thirteen pairs through Paxx and Caxx and
 compares the `-b` raw binaries. For the five pairs that use `.textmode`
 (`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`),
 and for `exprmiss.axx`, which looks at lines let through by `.passthru`, it also compares the translated text each
@@ -5446,6 +5497,7 @@ because every source line is matched against a large pattern set (each MIPS pair
 runs under both `-b` and `-o`, sixteen runs in all). The `sparc.axx` /
 `sparc_test.s` pair is slower still: about ninety seconds in Python, about four
 in C. They dominate the running time of `test1`.
+`test.axx` / `test.s` is the only bundled pair `test1` does not cover.
 
 x86_64 and legacy CPUs make up most of what is currently implemented, but that
 reflects where the work has gone, not the limit of what axx can describe.
@@ -5461,15 +5513,18 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `MACRO.md` / `macro_en.md` | Macro layer reference (Japanese / English). Same material as section 7 |
 | `MINI.md` / `mini_en.md` | Mini language reference (Japanese / English). Same material as section 3.15 |
 | `axx_introduction_paper.md` / `_en.md` | Introduction paper: the design rationale behind the free-syntax pattern language, the specificity score, and the separation of computational power from the declarative core |
+| `elf_generalization.md` / `_en.md` | The generalization of the ELF output (Japanese / English): how `-o` builds a linkable object for any CPU, the machine half declared in the pattern file and the symbol half declared in the source, with worked examples. Same material as sections 3.7.5-3.7.11 and 5.6 |
+| `axx_ai_pattern_guide_ja.md` / `_en.md` | Step-by-step guide to writing pattern files with AI (Japanese / English): AI does the copying of the instruction tables, people set the scope and check the result byte for byte against another assembler |
 | `axxsemantics` | A denotational-semantics formalization of axx, including relaxation read as a fixed point over the label environment. The formulas in it are that document's own construction, not an official specification |
-| `FILE_DESCRIPTION` | One-line description of every file |
+| `axx_promo.md` | Introductory article (Japanese) |
+| `README.md` | Overview, quick start and demos |
+| `FILE_DESCRIPTION` | Description of every file, by directory |
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all one hundred and four bundled pattern/source pairs with both
-implementations and compares the results, plus the `-V` translation text of the
-five `.textmode` pairs, the `.echo` lines of the `echo.axx` and `ministr.axx` pairs,
-and the `-V` text and diagnostics of the `regress.axx` regression test.
+`test1` assembles all one hundred and thirteen bundled pattern/source pairs with
+Paxx and Caxx and compares the results, two hundred and fifty-four comparisons
+in all (Appendix B lists what each pair compares).
 
 ### C.2 External
 
@@ -5535,8 +5590,9 @@ makes compatibility with a general disassembler harder.
   computers run is quantum assembly, and what LISP machines run is not assembly
   language at all.
 - From homemade processors to supercomputers, please feel free to use it.
-- Please evaluate, extend and modify axx. The structure is complex, but it is
-  Python, so extending it is easy.
+- Please evaluate, extend and modify axx. The structure is complex, but the
+  reference implementation is Python, so extending it is easy; the C and Forth
+  implementations follow it.
 - Constants are currently limited to quadruple precision, which is a Python 3
   limitation. It would be good if Python 4 handled quad precision natively.
 - The macro layer is built in, but covering every assembly language would need
