@@ -1,667 +1,178 @@
 File description
 
+The repository keeps the pattern files (*.axx) in patfile/ and the assembly
+sources (*.s, with the .tsv files they import) in asmsrc/. In a flat working
+directory they all sit side by side; test1 and the scripts accept either
+layout. Below, the files are listed by directory and then by subject.
+
+"test1 compares ..." means test1 assembles the pair with both caxx and paxx
+and compares the results with cmp.
+
 ```
-8048.axx                            pattern file for 8048 CPU
-8048.s                              test assemble file for 8048 CPU
-8048_err.s                          lines 8048.axx must refuse: immediates,
-                                    addresses and displacements out of range;
-                                    test1 compares the diagnostics
-8048_edge.s                         lines 8048.axx must assemble at the edges of
-                                    the ranges: conditional jumps within the
-                                    page of their second byte ($$+1);
-                                    test1 compares the -b image
-8051.axx                            pattern file for 8051 CPU
-8051.s                              test assemble file for 8051 CPU
-8051_err.s                          lines 8051.axx must refuse: immediates,
-                                    addresses and displacements out of range;
-                                    test1 compares the diagnostics
-6809.axx                            pattern file for 6809 CPU
-6809.s                              test assemble file for 6809
-6809_err.s                          lines 6809.axx must refuse: immediates,
-                                    addresses and displacements out of range;
-                                    test1 compares the diagnostics
-6809_edge.s                         lines 6809.axx must assemble at the edges of
-                                    the ranges: immediates down to -0x80 /
-                                    -0x8000, < on the page 1 / 2 instructions;
-                                    test1 compares the -b image
-6800.axx                            pattern file for 6800 CPU
-6800.s                              test assemble file for 6800
-6800_err.s                          lines 6800.axx must refuse: immediates,
-                                    addresses and displacements out of range;
-                                    test1 compares the diagnostics
-6800_edge.s                         lines 6800.axx must assemble at the edges of
-                                    the ranges: immediates down to -0x80 /
-                                    -0x8000, FCB values;
-                                    test1 compares the -b image
-68000.axx                           pattern file for 68000 CPU
-68000.s                             test assemble file for 68000
-68000_reloc.s                       -o of 68000.axx (ELF32 M68K): R_68K_32 for an
-                                    .extern with no type, R_68K_PC16 / PC8 told
-                                    apart by value, bare branches to an external
-                                    symbol, branches resolved within the section,
-                                    and the addends after .org 0x10000
-68000_err.s                         lines 68000.axx must refuse: displacements,
-                                    addresses and immediates that do not fit
-                                    their field; test1 compares the diagnostics
-6502.axx                            pattern file for 6502
-6502.s                              test assemblee file for 6502
-6502_err.s                          lines 6502.axx must refuse: immediates,
-                                    addresses and displacements out of range;
-                                    test1 compares the diagnostics
-6502_edge.s                         lines 6502.axx must assemble at the edges of
-                                    the ranges: negative addresses, immediates
-                                    down to -0x80, the < / > forced forms;
-                                    test1 compares the -b image
-8080.axx                            pattern file for 8080
-8080.s                              test assemble file for 8080
-8080_err.s                          lines 8080.axx must refuse: immediates,
-                                    addresses and displacements out of range;
-                                    test1 compares the diagnostics
-4004.axx                            pattern file for 4004
-4004.s                              test assemble file for 4004
-4004_edge.s                         lines 4004.axx must assemble at the edges of
-                                    the ranges: JCN / ISZ within the page of
-                                    the next instruction ($$+2);
-                                    test1 compares the -b image
-4004_err.s                          lines 4004.axx must refuse: JCN / ISZ
-                                    outside that page, values out of range;
-                                    test1 compares the diagnostics
-aarch64.axx                         pattern file for AArch64 (A64): data processing,
-                                    branches, system, loads and stores, scalar
-                                    floating point, Advanced SIMD, cryptography and
-                                    the scalar extensions, plus SVE, SVE2, SME and
-                                    SME2, and the GNU-style relocation modifiers
-                                    (:lo12:, :pg_hi21:, :abs_g0:-:abs_g3:, :got: ...).
-                                    written with the macro layer
-aarch64.s                           test assemble file for aarch64.axx
-aarch64_reloc.s                     relocations of aarch64.axx for -o: every
-                                    instruction relocation against an external
-                                    symbol, branches / adr / literal ldr to a
-                                    local label resolved in place (.elfresolve,
-                                    .elfencode), and data (ABS*, PREL*),
-                                    checked against llvm-mc 19 and ld.lld 19
-aarch64_edge.s                      lines aarch64.axx must assemble at the edges
-                                    of the ranges (checked against llvm-mc 19):
-                                    SVE dup/mov/mul/smax immediates, branch and
-                                    adrp limits; test1 compares the -b image
-aarch64_err.s                       lines aarch64.axx must refuse: PC-relative
-                                    targets not a multiple of 4, adrp out of
-                                    range, SVE signed bytes out of range;
-                                    test1 compares the diagnostics
-aarch64_logical.axx                 pattern file for the AArch64 logical (immediate)
-                                    group, AND/ORR/EOR/ANDS/TST, 32 and 64 bit.
-                                    the macro-layer version: the rows are
+-------------------------------------------------------------------------------
+Top level: the implementations and building
+-------------------------------------------------------------------------------
+axx.py                              axx in Python, 'Paxx': the reference
+                                    implementation; new features land here
+                                    first
+caxx.c                              axx in C, 'Caxx': the same output byte for
+                                    byte, with its own 256-bit integer type
+                                    (uint256_t)
+faxx.fs                             axx in Forth, 'Faxx': the entry for gforth
+                                    (gforth faxx.fs <pattern> <source> ...);
+                                    loads faxxsrc/load.fs and runs main
+faxxsrc/                            the sources of Faxx (69 files, listed at
+                                    the end of this file)
+build_ccforth.sh                    compiles Faxx with ccforth (Forth -> C)
+                                    and a C compiler into the executable faxx,
+                                    which takes the same arguments as
+                                    gforth faxx.fs. CCFORTH / CC / CFLAGS /
+                                    MEMSIZE / KEEPC tune it
+makefile                            make: caxx and paxx (and axx, a copy of
+                                    axx.py); make faxx: faxx; make all: all
+                                    three; make install: caxx, paxx, faxx and
+                                    the man page
+test1                               the assemble test: every pattern file /
+                                    source pair through caxx and paxx, the
+                                    results compared with cmp (also -o, -g,
+                                    -v, -V and the diagnostics)
+secsort.py                          rewrites a source so that its lines are
+                                    grouped by section (.section ...
+                                    .endsection), following .include
+axx.1.gz                            axx man page
+.gitignore                          the build products, test1's a<n> / b<n>
+                                    outputs and other leftovers
+
+-------------------------------------------------------------------------------
+Top level: documents
+-------------------------------------------------------------------------------
+README.md                           readme
+LICENSE                             license
+Technical_Manual.md                 technical manual, full reference (English)
+Technical_Manual_ja.md              technical manual, full reference (Japanese)
+MACRO.md                            macro layer reference (Japanese)
+macro_en.md                         macro layer reference (English)
+MINI.md                             mini language reference (Japanese)
+mini_en.md                          mini language reference (English)
+elf_generalization.md               the generalization of the ELF output, for
+                                    writing a linkable .o for any CPU: how -o
+                                    builds it, the machine half declared in
+                                    the pattern file (.elfmachine / .elfclass
+                                    / .elfrela / .elftype / .elfwidth /
+                                    .elffield / .elfencode / .elfextra /
+                                    .elfdiff / .elfrelax / .elfresolve /
+                                    .elfanchor / .elfunaligned / .elfrinfo /
+                                    .elfunit / .elfgroup / .elfcfi and the
+                                    rest), the symbol half declared in the
+                                    source (.type / .size / .weak / .hidden /
+                                    .protected / .internal / .other / .comm,
+                                    .cfi_*), the relocation type priority, the
+                                    built-in tables and --elfdesc, and worked
+                                    examples for MSP430, PowerPC64, ARM,
+                                    RISC-V, MIPS, x86-64 and a 16-bit-word
+                                    machine (Japanese)
+elf_generalization_en.md            the same (English)
+axx_ai_pattern_guide_ja.md          step-by-step guide to writing pattern
+                                    files with AI: AI does the copying of the
+                                    instruction tables, people set the scope
+                                    and check the result byte for byte
+                                    against another assembler (Japanese)
+axx_ai_pattern_guide_en.md          the same (English)
+axx_introduction_paper.md           introduction paper (Japanese)
+axx_introduction_paper_en.md        introduction paper (English)
+axx_promo.md                        introductory article, "axx in 30 seconds"
+                                    (Japanese)
+axxsemantics                        denotational semantics of axx (Japanese)
+format_of_exp_imp_file              format of the export / import files
+                                    (-e / -E / -i)
+URL_to_newest_article_in_Japanese   URL of the newest article (Japanese)
+axxgirl.png                         mascot character picture
+FILE_DESCRIPTION                    this file
+
+-------------------------------------------------------------------------------
+Top level: data
+-------------------------------------------------------------------------------
+hello.tsv                           export file of the x86_64 hello world
+                                    (asmsrc/hello.s)
+imp.tsv                             sample import file (-i)
+mandelbrot.bf                       mandelbrot set viewer in brainfuck, by
+                                    Erik Bosman. demo input for bf.axx and the
+                                    bf_* interpreters
+bf_ppc64.s                          a copy of asmsrc/bf_ppc64.s
+
+-------------------------------------------------------------------------------
+patfile/: CPU pattern files
+-------------------------------------------------------------------------------
+4004.axx                            Intel 4004
+8048.axx                            Intel 8048
+8051.axx                            Intel 8051
+8080.axx                            Intel 8080
+z80.axx                             Zilog Z80
+6502.axx                            MOS 6502
+6800.axx                            Motorola 6800
+6809.axx                            Motorola 6809
+68000.axx                           Motorola 68000; ELF32 M68K objects with -o
+x86_64.axx                          x86_64-v3: segment addressing, AVX / AVX2,
+                                    BMI1 / BMI2, x87 and EVEX / AVX-512. the
+                                    VEX / EVEX rows are built from the
+                                    encodings of llvm-mc 19 (manual appendix B)
+x86_64m.axx                         x86_64-v3 written with the macro layer
+                                    (expands to the same rows as x86_64.axx)
+aarch64.axx                         AArch64 (A64): data processing, branches,
+                                    system, loads and stores, scalar floating
+                                    point, Advanced SIMD, cryptography and the
+                                    scalar extensions, plus SVE, SVE2, SME and
+                                    SME2, and the GNU-style relocation
+                                    modifiers (:lo12:, :pg_hi21:,
+                                    :abs_g0:-:abs_g3:, :got: ...). written
+                                    with the macro layer
+aarch64_logical.axx                 the AArch64 logical (immediate) group,
+                                    AND / ORR / EOR / ANDS / TST, 32 and 64
+                                    bit, macro-layer version: the rows are
                                     generated with !def, and the bitmask
                                     immediate is encoded in binary_list
-aarch64_logical_mini.axx            pattern file for the AArch64 logical (immediate)
-                                    group, AND/ORR/EOR/ANDS/TST, 32 and 64 bit.
-                                    encodes the bitmask immediate with the mini
-                                    language instead of one binary_list expression
-aarch64_logical_mini_demo.s         test assemble file for aarch64_logical_mini.axx
-                                    (also assembles with aarch64_logical.axx)
-arrindex.axx                        pattern file for the array-symbol features:
-                                    bare names as items, a name used as a
-                                    subscript, and .index (manual 3.6.1)
-arrindex.s                          test assemble file for arrindex.axx
-symcap.axx                          pattern file for the `!Y<set>[<var>]` symbol
-                                    capture: reads one item name of a set and
-                                    binds its index to a variable, so one set's
-                                    spelling can be rewritten into another's
-                                    (manual 3.6.3)
-symcap.s                            test assemble file for symcap.axx
-echo.axx                            pattern file for `.echo` written on a body
-                                    line of a pattern file: strings and
-                                    pattern-layer expressions printed to stderr
-                                    once per source line, emitting no words
-                                    (manual 3.14.1)
-echo.s                              test assemble file for echo.axx
-passthru.axx                        pattern file for .passthru and .eol: lines
-                                    that match no pattern are let through as
-                                    text, one output line per source line
-                                    (manual 3.16, 3.17)
-passthru.s                          test assemble file for passthru.axx
-datadir.axx                         pattern file for the source data directives
-                                    .db/.dw/.dd/.dq/.do/.dy/.dz: 8-bit
-                                    words, little-endian, with .eol (manual 5.3)
-datadirbe.axx                       the same with 8-bit words, big-endian
-datadirw.axx                        the same with 16-bit words
-datadir.s                           test assemble file for datadir.axx,
-                                    datadirbe.axx and datadirw.axx: numbers,
-                                    strings, labels and relocations under -o
-datadir_err.s                       regression test assembled with datadir.axx:
-                                    out-of-range values, missing values,
-                                    strings outside .db and trailing text
-textmode.axx                        pattern file for .textmode, the `!L` expression
-                                    /label capture and `{{.exp(x)}}`: text
-                                    replacement keeping labels, expressions,
-                                    `;` comments and the leading indentation
-                                    spelled as written (manual 3.18)
-textmode.s                          test assemble file for textmode.axx
-expcap.axx                          pattern file for `{{.exp(x)}}` on every
-                                    capture: a lowercase variable, `!`, `!!`,
-                                    `!F`/`!D`/`!Q`, `!E`, `!S{{name}}`, `!L`
-                                    and `!Y` all keep the source spelling
-                                    along with the value (manual 3.18)
-expcap.s                            test assemble file for expcap.axx
-exprmiss.axx                        pattern file for captures with no
-                                    expression or factor: `!`, `!!`, `!L`
-                                    and `!F`/`!D`/`!Q` do not match an empty
-                                    operand or one whose factor is missing
-                                    (`1+`, `-`, `~`, `()`), so those lines are
-                                    let through by .passthru (manual 3.3)
-exprmiss.s                          test assemble file for exprmiss.axx
-ministr.axx                         pattern file for strings in the mini
-                                    language: `.call f(10,"text")`, `+` `*`
-                                    and comparisons, byte subscripts and
-                                    slices, `.str` / `.chr` / `.int`, and
-                                    `.emit` / `.echo` of a string, and
-                                    `.call f(x,.exp(x))` passing a pattern
-                                    variable's captured text, and a string
-                                    symbol passed by its name, arrays holding
-                                    strings, `.for x in <array>`, and
-                                    rewriting a byte with `s[i] = v`, and
-                                    `/*` and `::` inside strings, and `.emit`
-                                    of an array, and an array symbol passed
-                                    by its name, and replacing a range with
-                                    `x[lo:hi] = v` (MINI.md)
-ministr.s                           test assemble file for ministr.axx
-labelc_err.s                        regression test assembled with z80.axx: a
-                                    .labelc at the end of a file used to reach
-                                    the labels above it from the second pass
-                                    on; now the lines above it are errors
-dirjunk_err.s                       regression test assembled with z80.axx:
-                                    text left after the argument of .org,
-                                    .align, .zero, .res*, .ascii/.asciz, .equ
-                                    and .section, which used to be dropped
-regress.axx                         regression test for disagreements between
-                                    the two implementations found by
-                                    differential fuzzing (2026-10-07): nested
-                                    `?:`, long numeric literals, pow() special
-                                    cases, macro int()/hex()/format specs, and
-                                    the diagnostics after `**`/shift errors,
-                                    failed label definitions and .EQU across
-                                    sections; and (2026-10-08) .EQU of a label
-                                    at the end of a section, undefined values
-                                    carried through .EQU, white space and
-                                    character constants, the byte strings of
-                                    the macro layer; and (2026-10-13)
-                                    mnemonics with `_` after a capital letter
-                                    (VADDSS_E), which the prefix index used to
-                                    drop; and (2026-10-18) `&&` / `||` that
-                                    short-circuit (a guard such as
-                                    x!=0 && 100/x>3), skipping past character
-                                    constants such as ')' (`?:` too), and the
-                                    warnings for too many `[[ ]]` groups and
-                                    for the combination budget, which never
-                                    came out; and (2026-10-20) the bodies of
-                                    flt{} / dbl{} / qad{} under Python's
-                                    number rules (0x / 0o / 0b, exact
-                                    integers, endouble() of a negative
-                                    double), correctly rounded big integers
-                                    in floating-point mode, and enflt{} /
-                                    endbl{} in an integer context; and
-                                    (2026-11-04) `**` results under 2**256
-                                    (2**150, 1**1000), ASCII-only case
-                                    folding (nı is not NI), and text after
-                                    an expression or a missing operand in
-                                    binary_list / error_patterns / {{ }}
-reloctype.s                         regression test assembled with x86_64.axx
-                                    under -o: the types chosen with
-                                    .reloctype (5.5.1), which the value-based
-                                    guess used to turn back and which leaked
-                                    from the last line of pass 1 into pass 2
-regress.s                          test assemble file for regress.axx (-V text)
-regresserr.s                        test assemble file for regress.axx (the
-                                    diagnostics on standard error)
-regresscr.s                         test assemble file for regress.axx whose
-                                    lines end in CR alone, with a byte that is
-                                    not UTF-8 (the -v listing)
-regresself.s                        regression test assembled with z80.axx under
-                                    -o: a .org that moves backwards, and .org /
-                                    .align / .zero / .resb given the value of
-                                    an .equ that contains an undefined label
-                                    (the diagnostics on standard error)
-bsection.s                          regression test assembled with x86_64.axx under
-                                    -b: jmp / call in a section that comes after
-                                    another (and is entered again), counted between
-                                    the addresses of the flat image
-unordered.axx                       pattern file for .unordered: directives that
-                                    hold for the whole file wherever they are
-                                    written, and .map tables per variable, so
-                                    the Z80 C is a register for one variable
-                                    and carry for another (manual 3.19)
-unordered.s                         test assemble file for unordered.axx
-elftype.axx                         pattern file for .elftype: a relocation type
-                                    name defined in the pattern file, written in
-                                    .reloc and in the source's .extern / .global
-                                    (manual 3.7.6)
-elftype.s                           test assemble file for elftype.axx. build it
-                                    with -o and -m 62 to see the relocations
-elfgen.axx                          pattern file for the ELF description
-                                    directives .elfmachine / .elfclass /
-                                    .elfrela / .elfwidth / .elfextern /
-                                    .elfdwarf / .elfheader: the whole ELF
-                                    machine description of EM_MSP430, a machine
-                                    axx has no built-in table for (manual 3.7.7)
-elfgen.s                            test assemble file for elfgen.axx. build it
-                                    with -o to see the relocations and the
-                                    ELF header fields
-elfprio.axx                         pattern file for the relocation type
-                                    priority: the default guessed from the
-                                    field width, then the pattern file's
-                                    .reloc, then the source's ::<type>, each
-                                    beating the one before (manual 3.7.8)
-elfprio.s                           test assemble file for elfprio.axx. build it
-                                    with -o to see which rank decided each
-                                    relocation
-elfpair.axx                         pattern file for relocations that come in
-                                    pairs or with a companion, section groups
-                                    and sh_link, on RISC-V (riscv64.axx is
-                                    included): .elfextra adds R_RISCV_RELAX to
-                                    every call, .elfdiff writes sums and
-                                    differences of labels as ADD/SUB pairs
-                                    (also a ULEB128 and a 6-bit field, and the
-                                    advances of a relaxed .eh_frame), .elfgroup
-                                    makes a COMDAT group and .elflink sets the
-                                    sh_link of a link-order section (manual
-                                    3.7.10)
-elfpair.s                           test assemble file for elfpair.axx. the
-                                    relocations, the group and the section
-                                    headers match llvm-mc's for the same code
-elfcfi.axx                          pattern file for call frame information:
-                                    the source's .cfi_* directives become an
-                                    .eh_frame; .elfcfi / .elfcfiinit /
-                                    .elfcfireg describe the CIE and the DWARF
-                                    register numbers (x86-64, manual 3.7.11)
-elfcfi.s                            test assemble file for elfcfi.axx. the
-                                    .eh_frame rows llvm-dwarfdump reads match
-                                    those of llvm-mc's object for the same code
-cfiptr.s                            test assemble file for elfcfi.axx:
-                                    .cfi_personality / .cfi_lsda with absolute
-                                    and PC-relative pointer encodings of 2, 4
-                                    and 8 bytes; the relocation types match
-                                    llvm-mc's (an absolute 4-byte pointer used
-                                    to get R_X86_64_PC32)
-elfmips.axx                         pattern file for .elfencode: MIPS32 (REL)
-                                    whose R_MIPS_HI16 field is written back by a
-                                    mini-language function ((addend+0x8000)>>16),
-                                    with R_MIPS_26 and R_MIPS_LO16 through
-                                    .elffield (manual 3.7.10)
-elfmips.s                           test assemble file for elfmips.axx. the
-                                    words and relocations match llvm-mc's, and
-                                    so does the result of linking with ld.lld
-elfmips64.axx                       pattern file for .elfrinfo: MIPS64 (n64,
-                                    little-endian), whose r_info puts the type
-                                    in the top byte; a mini-language function
-                                    lays it out (manual 3.7.10)
-elfmips64.s                         test assemble file for elfmips64.axx.
-                                    readelf -r shows the three types of each
-                                    entry, as for llvm-mc's object
-elfword.axx                         pattern file for .elfunit: a toy machine
-                                    with 16-bit words whose addends and symbol
-                                    values are counted in words (manual 3.7.10)
-elfword.s                           test assemble file for elfword.axx
-elfsec.axx                          pattern file for .elfsection: the sh_flags,
-                                    sh_type and sh_addralign of a section whose
-                                    name axx has no rule for -- a vector table,
-                                    an uninitialised region not called .bss, a
-                                    note section, and a section whose alignment
-                                    is written out (manual 3.7.7)
-elfsec.s                            test assemble file for elfsec.axx. build it
-                                    with -o and read the section headers.
-                                    the .note.axx section is a well-formed ELF
-                                    note, so `readelf -n` reads it and the
-                                    SHT_NOTE alignment can be checked
-elfsym.axx                          pattern file for the pieces that make the
-                                    output a linkable .o for any CPU: the ELF
-                                    symbol attributes of the source
-                                    (.type / .size / .weak / .hidden /
-                                    .protected / .internal / .other / .comm,
-                                    manual 5.6.1), a relocation field width
-                                    that is not a power of two (.elfwidth::3)
-                                    and a section element size (the fifth
-                                    field of .elfsection). the machine is
-                                    EM_MN10300, which axx has no built-in
-                                    table for
-elfsym.s                            test assemble file for elfsym.axx. build it
-                                    with -o and read the symbol table: the
-                                    types, sizes, bindings, visibilities, the
-                                    st_other byte and the SHN_COMMON symbol
-                                    are all written from the source
-elfrel.axx                          pattern file for a REL machine whose
-                                    relocations live in instruction fields:
-                                    ARM (EM_ARM) described with .elfbuiltin::0,
-                                    so no built-in table is used, and the
-                                    shift and bias fields of .elffield that
-                                    put the addend back into the instruction
-                                    (manual 3.7.7, 3.7.9)
-elfrel.s                            test assemble file for elfrel.axx. build it
-                                    with -o: the instruction words and the
-                                    relocations match llvm-mc's for the same
-                                    code, and the object links with
-                                    ld.lld -m armelf
-riscv64.axx                         pattern file for RV64I (the base integer
-                                    subset: U/I/S/B/J/R formats, loads and
-                                    stores, branches, jumps, call, li/mv/j/
-                                    ret/nop, ecall/ebreak). no C, M, A, F/D,
-                                    CSR or fence group. it is also the worked
+aarch64_logical_mini.axx            the same group, encoding the bitmask
+                                    immediate with the mini language instead
+                                    of one binary_list expression
+ppc64.axx                           PowerPC64, big-endian (ELFv1): sets the
+                                    byte order and the ELF description
+                                    (.elftype / .elffield / .elfsection), then
+                                    includes ppc64_isa.axx
+ppc64le.axx                         the same for little-endian PowerPC64
+                                    (ELFv2)
+ppc64_isa.axx                       the PowerPC64 instruction set (Power ISA
+                                    v3.1, POWER10) shared by ppc64.axx and
+                                    ppc64le.axx; not passed to axx directly.
+                                    written with the macro layer and the mini
+                                    language
+riscv64.axx                         RV64I, the base integer subset: U / I / S /
+                                    B / J / R formats, loads and stores,
+                                    branches, jumps, call, li / mv / j / ret /
+                                    nop, ecall / ebreak (no C, M, A, F / D,
+                                    CSR or fence group). also the worked
                                     example of declaring the relocations axx
                                     has no built-in numbers for: the built-in
                                     EM_RISCV table holds only the data types,
-                                    so CALL_PLT, BRANCH, JAL, HI20, LO12_I/S
+                                    so CALL_PLT, BRANCH, JAL, HI20, LO12_I / S
                                     and the PCREL pair come from .elftype /
                                     .elffield / .reloc (manual 3.7.5-3.7.7)
-riscv64.s                           test assemble file for riscv64.axx. it
-                                    uses every relocation type the pattern
-                                    file declares, and links and runs:
-                                    axx riscv64.axx riscv64.s -o out.o &&
-                                    ld -m elf64lriscv -o out out.o
-riscv64_reloc2.s                    data relocations of riscv64.axx for -o:
-                                    label-$$ and label differences across
-                                    sections as ADD/SUB pairs (.elfpcguess,
-                                    .elfrelax::0), checked against llvm-mc
-riscv64full.axx                     pattern file for RISC-V RV64, the whole
-                                    ISA: I, M, A, F, D, Q, Zfh, Zfa, C (Zca
-                                    Zcd Zcb Zcmp Zcmt Zcmop), Zba Zbb Zbc Zbs,
-                                    Zbk* and the scalar cryptography, Zicond,
-                                    Zicbo*, Zicsr with the CSR names,
-                                    privileged and H instructions, V 1.0 with
-                                    its crypto and bit-manipulation parts,
-                                    and the GNU pseudo-instructions (li of
-                                    any 64-bit constant, call, la ...). a
-                                    superset of riscv64.axx, written with the
-                                    macro layer and the mini language; checked
-                                    against llvm-mc byte for byte, and the
-                                    relocations (-o) against its objects
-riscv64full.s                       test assemble file for riscv64full.axx:
-                                    lines for the rows, every operand class
-riscv64full_reloc.s                 every relocation riscv64full.axx declares,
-                                    against external symbols, for -o:
-                                    axx riscv64full.axx riscv64full_reloc.s -o out.o
-riscv64full_reloc2.s                the relocations riscv64full_reloc.s does
-                                    not reach, for -o: la / lla and the global
-                                    loads and stores (PCREL_HI20 + PCREL_LO12
-                                    against a local symbol on the auipc, the
-                                    pair fields of .reloc), label-$$ data and
-                                    label differences, checked against llvm-mc
-riscv64full_edge.s                  lines riscv64full.axx must assemble at the
-                                    edges of the ranges (checked against
-                                    llvm-mc 19), c.lui -32 / 0xfffe0 among them;
-                                    test1 compares the -b image
-riscv64full_err.s                   lines riscv64full.axx must refuse: data
-                                    directives whose value does not fit;
-                                    test1 compares the diagnostics
-bf_riscv64.s                        brainfuck interpreter written in RISC-V
-                                    assembly (axx syntax), a port of
-                                    bf_aarch64.s. assembles with
-                                    riscv64full.axx into an ELF object (-o);
-                                    links with ld.lld / GNU ld and runs under
-                                    qemu-riscv64: qemu-riscv64 ./bf prog.bf
-bf_riscv64_freebsd.s                the same for FreeBSD/riscv64 (syscall number
-                                    in t0, FreeBSD numbers, errors in t0);
-                                    runs under qemu-riscv64 (bsd-user)
-endsub.axx                          pattern file for closing a `.sub` block with
-                                    `.endsub` instead of `.return`: the two
-                                    spellings mean the same thing and can be
-                                    mixed in one pattern file, including for
-                                    tables referred to from another table
-                                    (manual 3.7.2)
-endsub.s                            test assemble file for endsub.axx
-intel2att.axx                       pattern file that translates x86-64 Intel
-                                    syntax source into AT&T syntax source text:
-                                    .textmode with `!Y` symbol captures for the
-                                    register and mnemonic sets, `!L` captures so
-                                    labels and expressions keep the spelling
-                                    they had in the input, and the macro layer
-                                    (`!def` / `!while`) to generate the 28
-                                    memory-operand shapes for every operand
-                                    size. Swaps the operand order, adds `%` to
-                                    registers and `$` to immediates, rewrites
-                                    [base+index*scale+disp] as
-                                    disp(%base,%index,scale), and derives the
-                                    b/w/l/q suffix (manual 3.18)
-intel2att.s                         test assemble file for intel2att.axx. the
-                                    translated text is valid AT&T assembly:
-                                    `caxx intel2att.axx intel2att.s -V |
-                                    as --64 -o att.o -`
-sample_intel.s                      a short x86-64 program in Intel syntax
-                                    (moves, arithmetic, shifts, memory operands
-                                    written with `dword ptr` / `qword ptr`, a
-                                    call, a loop and data), a further input for
-                                    intel2att.axx: `caxx intel2att.axx
-                                    sample_intel.s -V`
-a64tox64_axx.axx                    pattern file that translates AArch64 assembly
-                                    into x86_64 assembly in the notation of
-                                    x86_64.axx: register mapping, calling-
-                                    convention glue and syscall remapping via a
-                                    small runtime. ported bf_aarch64.s runs
-                                    mandelbrot.bf (manual 3.18)
-a64rt_axx.s                         runtime for a64tox64_axx.axx output on Linux:
-                                    slots for the AArch64 registers x86 has no
-                                    room for, and __a64_svc (syscall remapping)
-a64rt_axx_freebsd.s                 the same runtime for FreeBSD/amd64; also
-                                    __a64_start, the entry that sets rsp to argc
-                                    (link with -e __a64_start)
-a64ext.s                            one-line .extern declaration of the runtime
-                                    names, put in front of the translated text
-bfsh/bf_x64_freebsd.sh              build script: translates bf_aarch64.s with
-                                    a64tox64_axx.axx and links a FreeBSD/amd64
-                                    executable, build_bf_freebsd/bf (manual 3.18)
-bfsh/bf_x64_linux.sh                the same for Linux/x86_64, build_bf_linux/bf;
-                                    on FreeBSD it re-brands the result with
-                                    brandelf -t Linux so it runs under the
-                                    Linuxulator (manual 3.18)
-bfsh/bf_mips_freebsd.sh             build script: assembles bf_mips_freebsd.s
-                                    with mips.axx / mipsel.axx (ENDIAN=eb / el)
-                                    -o, links it with ld.lld and brands it
-                                    FreeBSD, build_bf_mips_freebsd/bf or
-                                    build_bf_mipsel_freebsd/bf; given a .bf
-                                    file it runs it under qemu-mips-static /
-                                    qemu-mipsel-static (bsd-user). given just
-                                    `run`, this and the other bfsh/*.sh run
-                                    the bundled mandelbrot.bf
-bfsh/bf_riscv64_freebsd.sh          the same for bf_riscv64_freebsd.s with
-                                    riscv64full.axx, build_bf_riscv64_freebsd/bf,
-                                    run under qemu-riscv64 (bsd-user); the brand
-                                    is needed because ld.lld leaves "System V"
-bfsh/bf_x86_64_freebsd.sh           the same for bf_x86_64.s with x86_64.axx,
-                                    the `!set OS` line rewritten to "freebsd",
-                                    build_bf_x86_64_freebsd/bf, run directly
-bfsh/bf_sparc_freebsd.sh            the same for bf_sparc.s with sparc.axx,
-                                    the `!set OS` line rewritten to "freebsd",
-                                    build_bf_sparc_freebsd/bf, run under
-                                    qemu-sparc64-static (bsd-user)
-bfsh/bf_aarch64_linux.sh            the Linux versions: each builds the Linux
-bfsh/bf_mips_linux.sh               source (bf_aarch64.s, bf_mips.s with
-bfsh/bf_ppc64_linux.sh              ENDIAN=eb / el, bf_ppc64.s, bf_riscv64.s,
-bfsh/bf_riscv64_linux.sh            and bf_x86_64.s / bf_sparc.s with
-bfsh/bf_x86_64_linux.sh             !set OS = "linux") into
-bfsh/bf_sparc_linux.sh              build_bf_<arch>_linux/bf and runs it under
-                                    qemu-<arch>-static or qemu-<arch>
-                                    (linux-user), or directly on the same CPU.
-                                    on FreeBSD they use the Linux qemu put in
-                                    /compat/linux/usr/bin for the Linuxulator
-                                    (the qemu in /usr/local/bin is bsd-user);
-                                    the x86_64 one runs directly under the
-                                    Linuxulator. bf_aarch64.s and bf_ppc64.s
-                                    have no FreeBSD version;
-                                    `run` runs mandelbrot.bf
-aarch64tox64/                       the working directory of the AArch64 ->
-                                    x86_64 port of the brainfuck interpreter
-aarch64tox64/aarch64tox64.sh        builds and runs it on FreeBSD/amd64:
-                                    assembles the runtime a64rt_axx_freebsd.s,
-                                    translates bf_aarch64.s with
-                                    a64tox64_axx.axx -V (a64ext.s in front) into
-                                    bf_x64.s, assembles that with x86_64.axx
-                                    (../x86_64.axx in a flat layout, else
-                                    ../patfile/x86_64.axx), links with ld -e
-                                    __a64_start and runs mandelbrot.bf
-aarch64tox64/testrun.sh             the same for Linux/x86_64 (a64rt_axx.s, ld
-                                    -e _start)
-aarch64tox64/testrun_freebsd.sh     the same as aarch64tox64.sh without --osabi
-                                    FreeBSD; the runtime object is
-                                    a64rt_freebsd.o
-aarch64tox64/aarch64tox86_64.axx    pattern file that translates AArch64
-                                    assembly into GNU as AT&T syntax
-                                    (.textmode): x0 -> rdi, x1 -> rsi ...,
-                                    calling-convention glue for ret / bl / svc,
-                                    frames from stp / ldp, three operands into
-                                    two. `caxx aarch64tox86_64.axx prog_a64.s -V
-                                    > prog_x64.s`, then as --64
-aarch64tox64/bf_x64.s               bf_aarch64.s translated by a64tox64_axx.axx
-                                    with a64ext.s in front (what the scripts
-                                    above make)
-aarch64tox64/x86_64.axx             an earlier copy of x86_64.axx (2026-10-14)
-aarch64tox64/(others)               copies of the files of the same name above:
-                                    a64ext.s, a64rt_axx.s, a64rt_axx_freebsd.s,
-                                    a64tox64_axx.axx, bf_aarch64.s and
-                                    mandelbrot.bf
-8080toz80.axx                     pattern file that translates Intel 8080 source
-                                    into Zilog Z80 source text: .textmode, `!L`
-                                    captures and `{{.exp()}}`, so labels and
-                                    expressions keep the spelling they had in the
-                                    input (manual 3.18)
-hello8080.s                         test assemble file for 8080toz80.axx: CP/M
-                                    hello world in 8080 mnemonics
-LICENSE                             license
-README.md                           readme
-Technical_Manual.md                 technical manual, full reference (English)
-Technical_Manual_ja.md              technical manual, full reference (Japanese)
-URL_to_newest_article_in_Japanese   as it is
-caxx.c                              axx in C 'Caxx'
-axx.1.gz                            axx man page
-axx.py                              axx in python 'Paxx'
-axxgirl.png                         mascot character picture file
-bf.axx                              pattern file for brainfuck virtual CPU system
-bf.s                                hello world test assemble file for brainfuck virtual CPU
-mandelbrot.bf                       mandelbrot set viewer in brainfuck, by Erik
-                                    Bosman. demo input for bf.axx
-bf_aarch64.s                        brainfuck interpreter written in AArch64
-                                    assembly (axx syntax). assembles with
-                                    aarch64.axx, into an ELF object with -o or a
-                                    flat image with -b
-bf_ppc64.s                          brainfuck interpreter for Linux / PowerPC64
-                                    big-endian (ELFv1), ported from bf_aarch64.s.
-                                    assembles with ppc64.axx -o, links with
-                                    ld.lld -static -e _start, runs under Linux
-                                    qemu-ppc64
-bf_x86_64.s                         brainfuck interpreter for FreeBSD / Linux
-                                    x86_64 in Intel syntax, switched by the
-                                    macro layer (!set OS = "freebsd" / "linux").
-                                    assembles with x86_64.axx -o, links with ld
-bfi.s                               the same source as bf_x86_64.s under its
-                                    earlier name; bf_sparc.s was ported from it
-bf_mips.s                          brainfuck interpreter for Linux / MIPS32 o32,
-                                    ported from bf_ppc64.s. the same source
-                                    assembles with mips.axx (big-endian) and
-                                    mipsel.axx (little-endian); link with
-                                    ld.lld -static (entry __start), run with
-                                    Linux qemu-mips / qemu-mipsel
-bf_mips_freebsd.s                   the FreeBSD version of bf_mips.s: FreeBSD
-                                    syscall numbers, openat, argc / argv read
-                                    through a0. assemble with --osabi freebsd;
-                                    runs under qemu-mips-static (bsd-user)
-bf_sparc.s                          brainfuck interpreter for SPARC V9 (64-bit),
-                                    ported from bfi.s with the same macro layer
-                                    switch (!set OS = "freebsd" / "linux").
-                                    assemble with sparc.axx -o, link with
-                                    ld.lld, run under qemu-sparc64-static
-                                    (bsd-user) or the Linux qemu-sparc64
-                                    (bfsh/bf_sparc_*.sh); the branch targets are
-                                    `name: .equ $$` because ld.lld 19 has no
-                                    R_SPARC_WDISP22 / 19 / 16
-format_of_exp_imp_file              format description for export/import file
-hello.s                             assembly file of x86_64 hello world. use x86_64.axx
-x86_64_reloc.s                      relocations of x86_64.axx / x86_64m.axx for
-                                    -o: call / jmp / jcc near and short, RIP-
-                                    relative operands, the absolute-addressed
-                                    MOV stores, 32-bit immediates and
-                                    displacements against a symbol, ADD / SUB /
-                                    CMP ... of a register and a symbol (the
-                                    imm32 form), MOV to and from [RIP+sym] for
-                                    32 / 16 / 8 bits (PLT32 / PC32 / PC8 /
-                                    ABS32 / ABS32S,
-                                    resolved in place for a local label of the
-                                    same section via .elfresolve), checked
-                                    against llvm-mc 19 and ld.lld 19
-x86_64_err.s                        lines x86_64.axx / x86_64m.axx must refuse:
-                                    immediates out of range (8 / 16 / 32 bits,
-                                    signed when sign-extended) and AH / CH / DH
-                                    / BH where a REX prefix is needed; test1
-                                    compares the diagnostics
-x86_64_avx.s                        VEX / EVEX instructions of x86_64.axx /
-                                    x86_64m.axx: one register form and one
-                                    short-displacement form of every AVX /
-                                    AVX2 / FMA / F16C / BMI / K-mask / AVX-512
-                                    mnemonic, and the string instructions with
-                                    the optional [[rep]] prefix, checked
-                                    against llvm-mc 19
-x86_64_rex.s                        REX prefixes of x86_64.axx / x86_64m.axx for
-                                    R8-R15: [disp+index], MOV CR / DR, VMREAD /
-                                    VMWRITE, PEXTRB / PEXTRD / PEXTRQ, MOVDG /
-                                    MOVQG, and the 8-bit range of LOOP* / JRCXZ,
-                                    checked by disassembling with llvm-mc 19;
-                                    the boundary values of the immediates, and
-                                    the 32 / 16-bit three-operand IMUL and the
-                                    32 / 16 / 8-bit MOV with [RIP+label]
-hello.tsv                           export file of x86_64 hello world
-imp.tsv                             import file
-secsort.py                          execution file of section sort
-test1                               assemble test for all pattern file
-test.axx                            test pattern file of some CPUs 
-test.s                              test assemble file of some CPUs
-ppc64.axx                           pattern file for PowerPC64, big-endian (ELFv1):
-                                    sets the byte order and the ELF description
-                                    (.elftype / .elffield / .elfsection), then
-                                    includes ppc64_isa.axx
-ppc64le.axx                         the same for little-endian PowerPC64 (ELFv2)
-ppc64_isa.axx                       the PowerPC64 instruction set (Power ISA v3.1,
-                                    POWER10) shared by ppc64.axx and ppc64le.axx;
-                                    not passed to axx directly. written with the
-                                    macro layer and the mini language
-ppc64_test.s                        test assemble file for ppc64.axx / ppc64le.axx:
-                                    one line per pattern row, checked against
-                                    GNU as byte-for-byte
-ppc64_reloc_test.s                  every relocatable row against an external
-                                    symbol, for -o; relocations match GNU as
-ppc64_reloc2.s                      the relocations ppc64_reloc_test.s does not
-                                    reach, for -o: DS / DQ-form fields with
-                                    addends whose bits 2-3 are set (the mask
-                                    field of .reloc) and data written as
-                                    label-$$ (REL64 / REL32 / REL16, .elfpcguess)
-hello_ppc64.s                      hello world for big-endian PowerPC64 Linux
-                                    (ELFv1 function descriptor in .opd).
-                                    caxx ppc64.axx hello_ppc64.s -o hello.o
-sparc.axx                           pattern file for SPARC: V7 / V8 / V9, VIS 1-3,
-                                    the UltraSPARC Architecture 2005 / 2007
-                                    additions, the fused multiply-add, the V8
-                                    coprocessor and the LEON extensions, the
-                                    synthetic instructions and the operand
-                                    modifiers (%hi %lo %hh %hm %h44 ... and the
-                                    GOT / TLS ones); ELF64 SPARCV9 objects with
-                                    -o. written with the macro layer and the
-                                    mini language
-sparc_test.s                        test assemble file for sparc.axx: one line
-                                    per pattern row, checked against llvm-mc 19
-                                    byte-for-byte (and against the manuals for
-                                    the rows llvm-mc does not have)
-sparc_reloc.s                       every relocating operand of sparc.axx
-                                    against an external symbol, for -o;
-                                    relocations match llvm-mc 19
-sparc_reloc2.s                      the relocations sparc_reloc.s does not
-                                    reach, for -o: set / setx of a label (the
-                                    fixed form, .islabel), calls and branches to
-                                    a local label resolved in place
-                                    (.elfresolve) and PC-relative data
-                                    (R_SPARC_DISP*), checked against llvm-mc
-                                    19 and ld.lld 19
-sparc_err.s                         lines sparc.axx must refuse: data directives
-                                    whose value does not fit; test1 compares
-                                    the diagnostics
-mips.axx                            pattern file for MIPS, big-endian, o32
-                                    (ELF32 REL), up to Release 5: sets the byte
-                                    order, the ABI and the release, then
-                                    includes mips_isa.axx
+riscv64full.axx                     RISC-V RV64, the whole ISA: I, M, A, F, D,
+                                    Q, Zfh, Zfa, C (Zca Zcd Zcb Zcmp Zcmt
+                                    Zcmop), Zba Zbb Zbc Zbs, Zbk* and the
+                                    scalar cryptography, Zicond, Zicbo*, Zicsr
+                                    with the CSR names, privileged and H
+                                    instructions, V 1.0 with its crypto and
+                                    bit-manipulation parts, and the GNU
+                                    pseudo-instructions (li of any 64-bit
+                                    constant, call, la ...). a superset of
+                                    riscv64.axx, written with the macro layer
+                                    and the mini language; checked against
+                                    llvm-mc byte for byte, and the relocations
+                                    (-o) against its objects
+mips.axx                            MIPS, big-endian, o32 (ELF32 REL), up to
+                                    Release 5: sets the byte order, the ABI
+                                    and the release, then includes
+                                    mips_isa.axx
 mipsel.axx                          the same for little-endian MIPS, o32
 mips64.axx                          the same for big-endian MIPS64, n64 (ELF64
                                     RELA)
@@ -683,106 +194,796 @@ mips_isa.axx                        the MIPS instruction set (MIPS I to MIPS64
                                     %got / %pcrel ... relocation modifiers)
                                     shared by the eight files above; not
                                     passed to axx directly
-mips.s                              test assemble file for mips.axx / mipsel.axx
-                                    / mips64.axx / mips64el.axx: every row of
-                                    the base set of mips_isa.axx, checked
-                                    against GNU as 2.42 byte-for-byte (n64)
-mips_ase.s                          test assemble file for the same four files:
-                                    every row of the extensions (DSP, MSA, MT,
-                                    VZ, EVA, MIPS-3D, SmartMIPS, MCU, MIPS I
-                                    COP3), checked against llvm-mc 19
-                                    byte-for-byte where llvm-mc has the row
+sparc.axx                           SPARC: V7 / V8 / V9, VIS 1-3, the
+                                    UltraSPARC Architecture 2005 / 2007
+                                    additions, the fused multiply-add, the V8
+                                    coprocessor and the LEON extensions, the
+                                    synthetic instructions and the operand
+                                    modifiers (%hi %lo %hh %hm %h44 ... and
+                                    the GOT / TLS ones); ELF64 SPARCV9 objects
+                                    with -o. written with the macro layer and
+                                    the mini language
+vliw.axx                            test pattern file for VLIW
+itanium.axx                         test pattern file for Itanium-style EPIC
+bf.axx                              brainfuck virtual CPU system
+test.axx                            test pattern file of some CPUs
+
+-------------------------------------------------------------------------------
+patfile/: pattern files for features of the pattern language
+-------------------------------------------------------------------------------
+arrindex.axx                        the array-symbol features: bare names as
+                                    items, a name used as a subscript, and
+                                    .index (manual 3.6.1)
+symcap.axx                          the `!Y<set>[<var>]` symbol capture: reads
+                                    one item name of a set and binds its index
+                                    to a variable, so one set's spelling can be
+                                    rewritten into another's (manual 3.6.3)
+echo.axx                            `.echo` written on a body line: strings
+                                    and pattern-layer expressions printed to
+                                    stderr once per source line, emitting no
+                                    words (manual 3.14.1)
+passthru.axx                        .passthru and .eol: lines that match no
+                                    pattern are let through as text, one
+                                    output line per source line (manual 3.16,
+                                    3.17)
+datadir.axx                         the source data directives .db / .dw / .dd
+                                    / .dq / .do / .dy / .dz: 8-bit words,
+                                    little-endian, with .eol (manual 5.3)
+datadirbe.axx                       the same with 8-bit words, big-endian
+datadirw.axx                        the same with 16-bit words
+textmode.axx                        .textmode, the `!L` expression / label
+                                    capture and `{{.exp(x)}}`: text
+                                    replacement keeping labels, expressions,
+                                    `;` comments and the leading indentation
+                                    spelled as written (manual 3.18)
+expcap.axx                          `{{.exp(x)}}` on every capture: a
+                                    lowercase variable, `!`, `!!`, `!F` / `!D`
+                                    / `!Q`, `!E`, `!S{{name}}`, `!L` and `!Y`
+                                    all keep the source spelling along with
+                                    the value (manual 3.18)
+exprmiss.axx                        captures with no expression or factor:
+                                    `!`, `!!`, `!L` and `!F` / `!D` / `!Q` do
+                                    not match an empty operand or one whose
+                                    factor is missing (`1+`, `-`, `~`, `()`),
+                                    so those lines are let through by
+                                    .passthru (manual 3.3)
+ministr.axx                         strings in the mini language: `.call
+                                    f(10,"text")`, `+` `*` and comparisons,
+                                    byte subscripts and slices, `.str` /
+                                    `.chr` / `.int`, `.emit` / `.echo` of a
+                                    string, `.call f(x,.exp(x))` passing a
+                                    pattern variable's captured text, a string
+                                    symbol passed by its name, arrays holding
+                                    strings, `.for x in <array>`, rewriting a
+                                    byte with `s[i] = v`, `/*` and `::` inside
+                                    strings, `.emit` of an array, an array
+                                    symbol passed by its name, and replacing a
+                                    range with `x[lo:hi] = v` (MINI.md)
+endsub.axx                          closing a `.sub` block with `.endsub`
+                                    instead of `.return`: the two spellings
+                                    mean the same thing and can be mixed in
+                                    one pattern file, including for tables
+                                    referred to from another table (manual
+                                    3.7.2)
+unordered.axx                       .unordered: directives that hold for the
+                                    whole file wherever they are written, and
+                                    .map tables per variable, so the Z80 C is
+                                    a register for one variable and carry for
+                                    another (manual 3.19)
+
+-------------------------------------------------------------------------------
+patfile/: pattern files for the ELF output (-o)
+-------------------------------------------------------------------------------
+elftype.axx                         .elftype: a relocation type name defined
+                                    in the pattern file, written in .reloc and
+                                    in the source's .extern / .global (manual
+                                    3.7.6)
+elfgen.axx                          the ELF description directives
+                                    .elfmachine / .elfclass / .elfrela /
+                                    .elfwidth / .elfextern / .elfdwarf /
+                                    .elfheader: the whole ELF machine
+                                    description of EM_MSP430, a machine axx
+                                    has no built-in table for (manual 3.7.7)
+elfprio.axx                         the relocation type priority: the default
+                                    guessed from the field width, then the
+                                    pattern file's .reloc, then the source's
+                                    ::<type>, each beating the one before
+                                    (manual 3.7.8)
+elfpair.axx                         relocations that come in pairs or with a
+                                    companion, section groups and sh_link, on
+                                    RISC-V (riscv64.axx is included):
+                                    .elfextra adds R_RISCV_RELAX to every
+                                    call, .elfdiff writes sums and differences
+                                    of labels as ADD / SUB pairs (also a
+                                    ULEB128 and a 6-bit field, and the
+                                    advances of a relaxed .eh_frame),
+                                    .elfgroup makes a COMDAT group and
+                                    .elflink sets the sh_link of a link-order
+                                    section (manual 3.7.10)
+elfcfi.axx                          call frame information: the source's
+                                    .cfi_* directives become an .eh_frame;
+                                    .elfcfi / .elfcfiinit / .elfcfireg
+                                    describe the CIE and the DWARF register
+                                    numbers (x86-64, manual 3.7.11)
+elfmips.axx                         .elfencode: MIPS32 (REL) whose R_MIPS_HI16
+                                    field is written back by a mini-language
+                                    function ((addend+0x8000)>>16), with
+                                    R_MIPS_26 and R_MIPS_LO16 through
+                                    .elffield (manual 3.7.10)
+elfmips64.axx                       .elfrinfo: MIPS64 (n64, little-endian),
+                                    whose r_info puts the type in the top
+                                    byte; a mini-language function lays it out
+                                    (manual 3.7.10)
+elfword.axx                         .elfunit: a toy machine with 16-bit words
+                                    whose addends and symbol values are
+                                    counted in words (manual 3.7.10)
+elfsec.axx                          .elfsection: the sh_flags, sh_type and
+                                    sh_addralign of a section whose name axx
+                                    has no rule for -- a vector table, an
+                                    uninitialised region not called .bss, a
+                                    note section, and a section whose
+                                    alignment is written out (manual 3.7.7)
+elfsym.axx                          the pieces that make the output a linkable
+                                    .o for any CPU: the ELF symbol attributes
+                                    of the source (.type / .size / .weak /
+                                    .hidden / .protected / .internal / .other
+                                    / .comm, manual 5.6.1), a relocation field
+                                    width that is not a power of two
+                                    (.elfwidth::3) and a section element size
+                                    (the fifth field of .elfsection). the
+                                    machine is EM_MN10300, which axx has no
+                                    built-in table for
+elfrel.axx                          a REL machine whose relocations live in
+                                    instruction fields: ARM (EM_ARM) described
+                                    with .elfbuiltin::0, so no built-in table
+                                    is used, and the shift and bias fields of
+                                    .elffield that put the addend back into
+                                    the instruction (manual 3.7.7, 3.7.9)
+
+-------------------------------------------------------------------------------
+patfile/: translators (.textmode, -V)
+-------------------------------------------------------------------------------
+intel2att.axx                       translates x86-64 Intel syntax source into
+                                    AT&T syntax source text: .textmode with
+                                    `!Y` symbol captures for the register and
+                                    mnemonic sets, `!L` captures so labels and
+                                    expressions keep the spelling they had in
+                                    the input, and the macro layer (`!def` /
+                                    `!while`) to generate the 28
+                                    memory-operand shapes for every operand
+                                    size. swaps the operand order, adds `%` to
+                                    registers and `$` to immediates, rewrites
+                                    [base+index*scale+disp] as
+                                    disp(%base,%index,scale), and derives the
+                                    b / w / l / q suffix (manual 3.18)
+8080toz80.axx                       translates Intel 8080 source into Zilog
+                                    Z80 source text: .textmode, `!L` captures
+                                    and `{{.exp()}}`, so labels and
+                                    expressions keep the spelling they had in
+                                    the input (manual 3.18)
+a64tox64_axx.axx                    translates AArch64 assembly into x86_64
+                                    assembly in the notation of x86_64.axx:
+                                    register mapping, calling-convention glue
+                                    and syscall remapping via a small runtime
+                                    (a64rt_axx*.s). the translated
+                                    bf_aarch64.s runs mandelbrot.bf (manual
+                                    3.18)
+
+-------------------------------------------------------------------------------
+patfile/: regression
+-------------------------------------------------------------------------------
+regress.axx                         disagreements between the implementations
+                                    found by differential fuzzing, kept as a
+                                    regression test (with regress*.s):
+                                    2026-10-07  nested `?:`, long numeric
+                                                literals, pow() special
+                                                cases, macro int() / hex() /
+                                                format specs, the diagnostics
+                                                after `**` / shift errors,
+                                                failed label definitions and
+                                                .EQU across sections
+                                    2026-10-08  .EQU of a label at the end of
+                                                a section, undefined values
+                                                carried through .EQU, white
+                                                space and character
+                                                constants, the byte strings
+                                                of the macro layer
+                                    2026-10-13  mnemonics with `_` after a
+                                                capital letter (VADDSS_E),
+                                                which the prefix index used
+                                                to drop
+                                    2026-10-18  `&&` / `||` that
+                                                short-circuit (a guard such
+                                                as x!=0 && 100/x>3), skipping
+                                                past character constants such
+                                                as ')' (`?:` too), and the
+                                                warnings for too many `[[ ]]`
+                                                groups and for the
+                                                combination budget, which
+                                                never came out
+                                    2026-10-20  the bodies of flt{} / dbl{} /
+                                                qad{} under Python's number
+                                                rules (0x / 0o / 0b, exact
+                                                integers, endouble() of a
+                                                negative double), correctly
+                                                rounded big integers in
+                                                floating-point mode, and
+                                                enflt{} / endbl{} in an
+                                                integer context
+                                    2026-11-04  `**` results under 2**256
+                                                (2**150, 1**1000), ASCII-only
+                                                case folding (nı is not NI),
+                                                and text after an expression
+                                                or a missing operand in
+                                                binary_list / error_patterns
+                                                / {{ }}
+
+-------------------------------------------------------------------------------
+asmsrc/: test sources for the CPU pattern files
+-------------------------------------------------------------------------------
+  Naming: <cpu>.s is the test assemble file of <cpu>.axx.
+  <cpu>_err.s holds lines the pattern file must refuse (test1 compares the
+  diagnostics); <cpu>_edge.s holds lines it must assemble at the edges of the
+  ranges (test1 compares the -b image).
+
+4004.s                              test assemble file for 4004.axx
+4004_edge.s                         JCN / ISZ within the page of the next
+                                    instruction ($$+2)
+4004_err.s                          JCN / ISZ outside that page, values out of
+                                    range
+8048.s                              test assemble file for 8048.axx
+8048_edge.s                         conditional jumps within the page of their
+                                    second byte ($$+1)
+8048_err.s                          immediates, addresses and displacements
+                                    out of range
+8051.s                              test assemble file for 8051.axx
+8051_err.s                          immediates, addresses and displacements
+                                    out of range
+8080.s                              test assemble file for 8080.axx
+8080_err.s                          immediates, addresses and displacements
+                                    out of range
+z80.s                               test assemble file for z80.axx
+z80_err.s                           immediates, addresses and displacements
+                                    out of range
+6502.s                              test assemble file for 6502.axx
+6502_edge.s                         negative addresses, immediates down to
+                                    -0x80, the < / > forced forms
+6502_err.s                          immediates, addresses and displacements
+                                    out of range
+6800.s                              test assemble file for 6800.axx
+6800_edge.s                         immediates down to -0x80 / -0x8000, FCB
+                                    values
+6800_err.s                          immediates, addresses and displacements
+                                    out of range
+6809.s                              test assemble file for 6809.axx
+6809_edge.s                         immediates down to -0x80 / -0x8000, < on
+                                    the page 1 / 2 instructions
+6809_err.s                          immediates, addresses and displacements
+                                    out of range
+68000.s                             test assemble file for 68000.axx
+68000_reloc.s                       -o of 68000.axx (ELF32 M68K): R_68K_32 for
+                                    an .extern with no type, R_68K_PC16 / PC8
+                                    told apart by value, bare branches to an
+                                    external symbol, branches resolved within
+                                    the section, and the addends after .org
+                                    0x10000
+68000_err.s                         displacements, addresses and immediates
+                                    that do not fit their field
+hello.s                             x86_64 hello world, for x86_64.axx
+x86_64_reloc.s                      relocations of x86_64.axx / x86_64m.axx
+                                    for -o: call / jmp / jcc near and short,
+                                    RIP-relative operands, the
+                                    absolute-addressed MOV stores, 32-bit
+                                    immediates and displacements against a
+                                    symbol, ADD / SUB / CMP ... of a register
+                                    and a symbol (the imm32 form), MOV to and
+                                    from [RIP+sym] for 32 / 16 / 8 bits
+                                    (PLT32 / PC32 / PC8 / ABS32 / ABS32S,
+                                    resolved in place for a local label of the
+                                    same section via .elfresolve), checked
+                                    against llvm-mc 19 and ld.lld 19
+x86_64_err.s                        for x86_64.axx / x86_64m.axx: immediates
+                                    out of range (8 / 16 / 32 bits, signed
+                                    when sign-extended) and AH / CH / DH / BH
+                                    where a REX prefix is needed
+x86_64_avx.s                        VEX / EVEX instructions of x86_64.axx /
+                                    x86_64m.axx: one register form and one
+                                    short-displacement form of every AVX /
+                                    AVX2 / FMA / F16C / BMI / K-mask / AVX-512
+                                    mnemonic, and the string instructions with
+                                    the optional [[rep]] prefix, checked
+                                    against llvm-mc 19
+x86_64_rex.s                        REX prefixes of x86_64.axx / x86_64m.axx
+                                    for R8-R15: [disp+index], MOV CR / DR,
+                                    VMREAD / VMWRITE, PEXTRB / PEXTRD /
+                                    PEXTRQ, MOVDG / MOVQG, and the 8-bit range
+                                    of LOOP* / JRCXZ, checked by disassembling
+                                    with llvm-mc 19; the boundary values of
+                                    the immediates, and the 32 / 16-bit
+                                    three-operand IMUL and the 32 / 16 / 8-bit
+                                    MOV with [RIP+label]
+aarch64.s                           test assemble file for aarch64.axx
+aarch64_reloc.s                     relocations of aarch64.axx for -o: every
+                                    instruction relocation against an external
+                                    symbol, branches / adr / literal ldr to a
+                                    local label resolved in place
+                                    (.elfresolve, .elfencode), and data (ABS*,
+                                    PREL*), checked against llvm-mc 19 and
+                                    ld.lld 19
+aarch64_edge.s                      checked against llvm-mc 19: SVE dup / mov
+                                    / mul / smax immediates, branch and adrp
+                                    limits
+aarch64_err.s                       PC-relative targets not a multiple of 4,
+                                    adrp out of range, SVE signed bytes out of
+                                    range
+aarch64_logical_mini_demo.s         test assemble file for
+                                    aarch64_logical_mini.axx (also assembles
+                                    with aarch64_logical.axx)
+ppc64_test.s                        test assemble file for ppc64.axx /
+                                    ppc64le.axx: one line per pattern row,
+                                    checked against GNU as byte for byte
+ppc64_reloc_test.s                  every relocatable row against an external
+                                    symbol, for -o; relocations match GNU as
+ppc64_reloc2.s                      the relocations ppc64_reloc_test.s does
+                                    not reach, for -o: DS / DQ-form fields
+                                    with addends whose bits 2-3 are set (the
+                                    mask field of .reloc) and data written as
+                                    label-$$ (REL64 / REL32 / REL16,
+                                    .elfpcguess)
+hello_ppc64.s                       hello world for big-endian PowerPC64 Linux
+                                    (ELFv1 function descriptor in .opd):
+                                    caxx ppc64.axx hello_ppc64.s -o hello.o
+riscv64.s                           test assemble file for riscv64.axx. it
+                                    uses every relocation type the pattern
+                                    file declares, and links and runs:
+                                    axx riscv64.axx riscv64.s -o out.o &&
+                                    ld -m elf64lriscv -o out out.o
+riscv64_reloc2.s                    data relocations of riscv64.axx for -o:
+                                    label-$$ and label differences across
+                                    sections as ADD / SUB pairs (.elfpcguess,
+                                    .elfrelax::0), checked against llvm-mc
+riscv64full.s                       test assemble file for riscv64full.axx:
+                                    lines for the rows, every operand class
+riscv64full_reloc.s                 every relocation riscv64full.axx declares,
+                                    against external symbols, for -o:
+                                    axx riscv64full.axx riscv64full_reloc.s
+                                    -o out.o
+riscv64full_reloc2.s                the relocations riscv64full_reloc.s does
+                                    not reach, for -o: la / lla and the global
+                                    loads and stores (PCREL_HI20 + PCREL_LO12
+                                    against a local symbol on the auipc, the
+                                    pair fields of .reloc), label-$$ data and
+                                    label differences, checked against llvm-mc
+riscv64full_edge.s                  checked against llvm-mc 19, c.lui -32 /
+                                    0xfffe0 among them
+riscv64full_err.s                   data directives whose value does not fit
+mips.s                              test assemble file for mips.axx /
+                                    mipsel.axx / mips64.axx / mips64el.axx:
+                                    every row of the base set of mips_isa.axx,
+                                    checked against GNU as 2.42 byte for byte
+                                    (n64)
+mips_ase.s                          test assemble file for the same four
+                                    files: every row of the extensions (DSP,
+                                    MSA, MT, VZ, EVA, MIPS-3D, SmartMIPS, MCU,
+                                    MIPS I COP3), checked against llvm-mc 19
+                                    byte for byte where llvm-mc has the row
 mipsr6.s                            test assemble file for mipsr6.axx /
                                     mipsr6el.axx / mips64r6.axx /
                                     mips64r6el.axx: the re-encoded and the new
                                     instructions of Release 6, checked against
-                                    llvm-mc 19 byte-for-byte (relocations
+                                    llvm-mc 19 byte for byte (relocations
                                     included)
 mips_reloc2.s                       o32 relocations for -o (mips.axx and the
                                     other o32 front files): la with R_MIPS_HI16
                                     + LO16 (the extra relocations of .reloc)
                                     and PC-relative data (R_MIPS_PC32),
                                     checked against llvm-mc 19 and ld.lld
-mips_err.s                          lines mips.axx must refuse: data directives
-                                    whose value does not fit; test1 compares
-                                    the diagnostics
 mips64_reloc2.s                     n64 relocations for -o (mips64.axx and the
                                     other n64 front files): la / dla with
                                     HIGHEST + HIGHER + HI16 + LO16 and
                                     PC-relative data (R_MIPS_PC32, and the
                                     composite PC32 / 64 for 8 bytes), checked
                                     against llvm-mc 19 and ld.lld
-z80.axx                             pattern file for Z80
-z80.s                               test assemble file for Z80
-z80_err.s                           lines z80.axx must refuse: immediates,
-                                    addresses and displacements out of range;
-                                    test1 compares the diagnostics
-import_test.s                       -i of z80.axx with import_test.tsv: values with
-                                    a sign, 0x, spaces, wider than 64 bits;
-                                    test1 compares the -b image
+mips_err.s                          data directives whose value does not fit
+sparc_test.s                        test assemble file for sparc.axx: one line
+                                    per pattern row, checked against llvm-mc
+                                    19 byte for byte (and against the manuals
+                                    for the rows llvm-mc does not have)
+sparc_reloc.s                       every relocating operand of sparc.axx
+                                    against an external symbol, for -o;
+                                    relocations match llvm-mc 19
+sparc_reloc2.s                      the relocations sparc_reloc.s does not
+                                    reach, for -o: set / setx of a label (the
+                                    fixed form, .islabel), calls and branches
+                                    to a local label resolved in place
+                                    (.elfresolve) and PC-relative data
+                                    (R_SPARC_DISP*), checked against llvm-mc
+                                    19 and ld.lld 19
+sparc_err.s                         data directives whose value does not fit
+vliw.s                              test assemble file for vliw.axx and
+                                    itanium.axx
+vliw_err.s                          for vliw.axx: empty slots and a packet
+                                    whose instructions do not fit, which used
+                                    to be dropped or cut down without an error
+bf.s                                hello world for the brainfuck virtual CPU
+                                    (bf.axx)
+test.s                              test assemble file for test.axx
+
+-------------------------------------------------------------------------------
+asmsrc/: test sources for the pattern-language features
+-------------------------------------------------------------------------------
+arrindex.s                          test assemble file for arrindex.axx
+symcap.s                            test assemble file for symcap.axx
+echo.s                              test assemble file for echo.axx
+passthru.s                          test assemble file for passthru.axx
+datadir.s                           test assemble file for datadir.axx,
+                                    datadirbe.axx and datadirw.axx: numbers,
+                                    strings, labels and relocations under -o
+datadir_err.s                       assembled with datadir.axx: out-of-range
+                                    values, missing values, strings outside
+                                    .db and trailing text
+textmode.s                          test assemble file for textmode.axx
+expcap.s                            test assemble file for expcap.axx
+exprmiss.s                          test assemble file for exprmiss.axx
+ministr.s                           test assemble file for ministr.axx
+endsub.s                            test assemble file for endsub.axx
+unordered.s                         test assemble file for unordered.axx
+
+-------------------------------------------------------------------------------
+asmsrc/: test sources for the ELF output (-o)
+-------------------------------------------------------------------------------
+elftype.s                           test assemble file for elftype.axx. build
+                                    it with -o and -m 62 to see the
+                                    relocations
+elfgen.s                            test assemble file for elfgen.axx. build
+                                    it with -o to see the relocations and the
+                                    ELF header fields
+elfprio.s                           test assemble file for elfprio.axx. build
+                                    it with -o to see which rank decided each
+                                    relocation
+elfpair.s                           test assemble file for elfpair.axx. the
+                                    relocations, the group and the section
+                                    headers match llvm-mc's for the same code
+elfcfi.s                            test assemble file for elfcfi.axx. the
+                                    .eh_frame rows llvm-dwarfdump reads match
+                                    those of llvm-mc's object for the same
+                                    code
+cfiptr.s                            test assemble file for elfcfi.axx:
+                                    .cfi_personality / .cfi_lsda with absolute
+                                    and PC-relative pointer encodings of 2, 4
+                                    and 8 bytes; the relocation types match
+                                    llvm-mc's (an absolute 4-byte pointer used
+                                    to get R_X86_64_PC32)
+elfmips.s                           test assemble file for elfmips.axx. the
+                                    words and relocations match llvm-mc's, and
+                                    so does the result of linking with ld.lld
+elfmips64.s                         test assemble file for elfmips64.axx.
+                                    readelf -r shows the three types of each
+                                    entry, as for llvm-mc's object
+elfword.s                           test assemble file for elfword.axx
+elfsec.s                            test assemble file for elfsec.axx. build
+                                    it with -o and read the section headers.
+                                    the .note.axx section is a well-formed ELF
+                                    note, so `readelf -n` reads it and the
+                                    SHT_NOTE alignment can be checked
+elfsym.s                            test assemble file for elfsym.axx. build
+                                    it with -o and read the symbol table: the
+                                    types, sizes, bindings, visibilities, the
+                                    st_other byte and the SHN_COMMON symbol
+                                    are all written from the source
+elfrel.s                            test assemble file for elfrel.axx. build
+                                    it with -o: the instruction words and the
+                                    relocations match llvm-mc's for the same
+                                    code, and the object links with
+                                    ld.lld -m armelf
+
+-------------------------------------------------------------------------------
+asmsrc/: translator inputs and runtime
+-------------------------------------------------------------------------------
+intel2att.s                         test assemble file for intel2att.axx. the
+                                    translated text is valid AT&T assembly:
+                                    caxx intel2att.axx intel2att.s -V |
+                                    as --64 -o att.o -
+sample_intel.s                      a short x86-64 program in Intel syntax
+                                    (moves, arithmetic, shifts, memory
+                                    operands written with `dword ptr` /
+                                    `qword ptr`, a call, a loop and data), a
+                                    further input for intel2att.axx:
+                                    caxx intel2att.axx sample_intel.s -V
+hello8080.s                         test assemble file for 8080toz80.axx: CP/M
+                                    hello world in 8080 mnemonics
+a64rt_axx.s                         runtime for a64tox64_axx.axx output on
+                                    Linux: slots for the AArch64 registers x86
+                                    has no room for, and __a64_svc (syscall
+                                    remapping)
+a64rt_axx_freebsd.s                 the same runtime for FreeBSD/amd64; also
+                                    __a64_start, the entry that sets rsp to
+                                    argc (link with -e __a64_start)
+a64ext.s                            one-line .extern declaration of the
+                                    runtime names, put in front of the
+                                    translated text
+
+-------------------------------------------------------------------------------
+asmsrc/: brainfuck interpreters
+-------------------------------------------------------------------------------
+bf_aarch64.s                        brainfuck interpreter written in AArch64
+                                    assembly (axx syntax). assembles with
+                                    aarch64.axx, into an ELF object with -o or
+                                    a flat image with -b
+bf_ppc64.s                          brainfuck interpreter for Linux /
+                                    PowerPC64 big-endian (ELFv1), ported from
+                                    bf_aarch64.s. assembles with ppc64.axx -o,
+                                    links with ld.lld -static -e _start, runs
+                                    under Linux qemu-ppc64
+bf_riscv64.s                        brainfuck interpreter written in RISC-V
+                                    assembly (axx syntax), a port of
+                                    bf_aarch64.s. assembles with
+                                    riscv64full.axx into an ELF object (-o);
+                                    links with ld.lld / GNU ld and runs under
+                                    qemu-riscv64: qemu-riscv64 ./bf prog.bf
+bf_riscv64_freebsd.s                the same for FreeBSD/riscv64 (syscall
+                                    number in t0, FreeBSD numbers, errors in
+                                    t0); runs under qemu-riscv64 (bsd-user)
+bf_x86_64.s                         brainfuck interpreter for FreeBSD / Linux
+                                    x86_64 in Intel syntax, switched by the
+                                    macro layer (!set OS = "freebsd" /
+                                    "linux"). assembles with x86_64.axx -o,
+                                    links with ld
+bfi.s                               the same source as bf_x86_64.s under its
+                                    earlier name; bf_sparc.s was ported from
+                                    it
+bf_mips.s                           brainfuck interpreter for Linux / MIPS32
+                                    o32, ported from bf_ppc64.s. the same
+                                    source assembles with mips.axx
+                                    (big-endian) and mipsel.axx
+                                    (little-endian); link with ld.lld -static
+                                    (entry __start), run with Linux qemu-mips
+                                    / qemu-mipsel
+bf_mips_freebsd.s                   the FreeBSD version of bf_mips.s: FreeBSD
+                                    syscall numbers, openat, argc / argv read
+                                    through a0. assemble with --osabi freebsd;
+                                    runs under qemu-mips-static (bsd-user)
+bf_sparc.s                          brainfuck interpreter for SPARC V9
+                                    (64-bit), ported from bfi.s with the same
+                                    macro layer switch (!set OS = "freebsd" /
+                                    "linux"). assemble with sparc.axx -o, link
+                                    with ld.lld, run under qemu-sparc64-static
+                                    (bsd-user) or the Linux qemu-sparc64
+                                    (bfsh/bf_sparc_*.sh); the branch targets
+                                    are `name: .equ $$` because ld.lld 19 has
+                                    no R_SPARC_WDISP22 / 19 / 16
+
+-------------------------------------------------------------------------------
+asmsrc/: regression and assembler behaviour
+-------------------------------------------------------------------------------
+regress.s                           test assemble file for regress.axx (-V
+                                    text)
+regresserr.s                        test assemble file for regress.axx (the
+                                    diagnostics on standard error)
+regresscr.s                         test assemble file for regress.axx whose
+                                    lines end in CR alone, with a byte that is
+                                    not UTF-8 (the -v listing)
+regresself.s                        assembled with z80.axx under -o: a .org
+                                    that moves backwards, and .org / .align /
+                                    .zero / .resb given the value of an .equ
+                                    that contains an undefined label (the
+                                    diagnostics on standard error)
+reloctype.s                         assembled with x86_64.axx under -o: the
+                                    types chosen with .reloctype (5.5.1),
+                                    which the value-based guess used to turn
+                                    back and which leaked from the last line
+                                    of pass 1 into pass 2
+bsection.s                          assembled with x86_64.axx under -b: jmp /
+                                    call in a section that comes after another
+                                    (and is entered again), counted between
+                                    the addresses of the flat image
+labelc_err.s                        assembled with z80.axx: a .labelc at the
+                                    end of a file used to reach the labels
+                                    above it from the second pass on; now the
+                                    lines above it are errors
+dirjunk_err.s                       assembled with z80.axx: text left after
+                                    the argument of .org, .align, .zero,
+                                    .res*, .ascii / .asciz, .equ and .section,
+                                    which used to be dropped
+import_test.s                       -i of z80.axx with import_test.tsv: values
+                                    with a sign, 0x, spaces, wider than 64
+                                    bits; test1 compares the -b image
 import_test.tsv                     the import file of import_test.s
-import_test_err.s                   -i of z80.axx with import_test_err.tsv: lines
-                                    whose value cannot be read are dropped;
-                                    test1 compares the diagnostics
+import_test_err.s                   -i of z80.axx with import_test_err.tsv:
+                                    lines whose value cannot be read are
+                                    dropped; test1 compares the diagnostics
 import_test_err.tsv                 the import file of import_test_err.s
 listinc.s                           z80.axx: the -v listing of an .include and
                                     the implicit .text of -o reaching the
                                     final .org; test1 compares both
 listinc_inc.s                       the file listinc.s includes
 relaxchain.s                        z80.axx: forward-referencing .equ chained
-                                    deeper than 16 still assembles (pass 1 keeps
-                                    going while fewer labels move each time);
-                                    test1 compares the -b image and the -d count
+                                    deeper than 16 still assembles (pass 1
+                                    keeps going while fewer labels move each
+                                    time); test1 compares the -b image and the
+                                    -d count
 relaxosc_err.s                      6502.axx: an oscillating layout is still
                                     reported as oscillating, with the same
-                                    period and iteration numbers in both, when a
-                                    long .equ chain stretches pass 1;
-                                    test1 compares the diagnostics
-contin.s                            z80.axx: a \ at the end of a line joins the
-                                    next line, in the source and in a file taken
-                                    in with !include; and the names of the
-                                    .include / !include files when the source is
-                                    given as ./...; test1 compares the -v listing
+                                    period and iteration numbers in both, when
+                                    a long .equ chain stretches pass 1; test1
+                                    compares the diagnostics
+contin.s                            z80.axx: a \ at the end of a line joins
+                                    the next line, in the source and in a file
+                                    taken in with !include; and the names of
+                                    the .include / !include files when the
+                                    source is given as ./...; test1 compares
+                                    the -v listing
 contin_inc.s                        the file contin.s takes in with !include
 contin_inc2.s                       the file contin.s takes in with .include
-vliw.axx                            test pattern file for vliw
-vliw.s                              test assembly file for vliw
-vliw_err.s                          test assemble file for vliw.axx: empty
-                                    slots and a packet whose instructions do
-                                    not fit, which used to be dropped or cut
-                                    down without an error
-x86_64.axx                          pattern file for x86_64-v3 (includes segment addressing, AVX/AVX2, BMI1/BMI2, x87 and EVEX/AVX-512);
-                                    the VEX / EVEX rows are built from the
-                                    encodings of llvm-mc 19 (manual appendix B)
-x86_64m.axx                         pattern file for x86_64-v3 with macro
-                                    (expands to the same rows as x86_64.axx)
-itanium.axx                         test pattern file for itanium
-MACRO.md                            macro layer reference (Japanese)
-macro_en.md                         macro layer reference (English)
-MINI.md                             mini language reference (Japanese)
-mini_en.md                          mini language reference (English)
-axx_introduction_paper.md           introduction paper (Japanese)
-axx_introduction_paper_en.md        introduction paper (English)
-axx-promotion.md                    introductory article (Japanese)
-axx-promotion-en.md                 introductory article (English)
-elf_generalization.md               the generalization of the ELF output, for
-                                    writing a linkable .o for any CPU: how -o
-                                    builds it, the machine half declared in the
-                                    pattern file (.elfmachine / .elfclass /
-                                    .elfrela / .elftype / .elfwidth / .elffield
-                                    / .elfencode / .elfextra / .elfdiff /
-                                    .elfrelax / .elfresolve / .elfanchor /
-                                    .elfunaligned / .elfrinfo / .elfunit /
-                                    .elfgroup / .elfcfi and the rest), the
-                                    symbol half declared in the source (.type /
-                                    .size / .weak / .hidden / .protected /
-                                    .internal / .other / .comm, .cfi_*), the
-                                    relocation type priority, the built-in
-                                    tables and --elfdesc, and worked examples
-                                    for MSP430, PowerPC64, ARM, RISC-V, MIPS,
-                                    x86-64 and a 16-bit-word machine (Japanese)
-elf_generalization_en.md            the same (English)
-axxsemantics                        denotational semantics of axx (Japanese)
-FILE_DESCRIPTION                    this file
-makefile                            build/install rules for caxx and paxx
+
+-------------------------------------------------------------------------------
+bfsh/: build and run scripts for the brainfuck interpreters
+-------------------------------------------------------------------------------
+  Each script builds build_bf_<arch>_<os>/bf. Given a .bf file it runs it;
+  given just `run`, it runs the bundled mandelbrot.bf.
+
+bf_x64_freebsd.sh                   translates bf_aarch64.s with
+                                    a64tox64_axx.axx and links a FreeBSD/amd64
+                                    executable, build_bf_freebsd/bf (manual
+                                    3.18)
+bf_x64_linux.sh                     the same for Linux/x86_64,
+                                    build_bf_linux/bf; on FreeBSD it re-brands
+                                    the result with brandelf -t Linux so it
+                                    runs under the Linuxulator (manual 3.18)
+bf_mips_freebsd.sh                  assembles bf_mips_freebsd.s with mips.axx
+                                    / mipsel.axx (ENDIAN=eb / el) -o, links it
+                                    with ld.lld and brands it FreeBSD,
+                                    build_bf_mips_freebsd/bf or
+                                    build_bf_mipsel_freebsd/bf; runs it under
+                                    qemu-mips-static / qemu-mipsel-static
+                                    (bsd-user)
+bf_riscv64_freebsd.sh               the same for bf_riscv64_freebsd.s with
+                                    riscv64full.axx, run under qemu-riscv64
+                                    (bsd-user); the brand is needed because
+                                    ld.lld leaves "System V"
+bf_x86_64_freebsd.sh                the same for bf_x86_64.s with x86_64.axx,
+                                    the `!set OS` line rewritten to "freebsd",
+                                    run directly
+bf_sparc_freebsd.sh                 the same for bf_sparc.s with sparc.axx,
+                                    the `!set OS` line rewritten to "freebsd",
+                                    run under qemu-sparc64-static (bsd-user)
+bf_aarch64_linux.sh                 the Linux versions: each builds the Linux
+bf_mips_linux.sh                    source (bf_aarch64.s, bf_mips.s with
+bf_ppc64_linux.sh                   ENDIAN=eb / el, bf_ppc64.s, bf_riscv64.s,
+bf_riscv64_linux.sh                 and bf_x86_64.s / bf_sparc.s with
+bf_x86_64_linux.sh                  !set OS = "linux") and runs it under
+bf_sparc_linux.sh                   qemu-<arch>-static or qemu-<arch>
+                                    (linux-user), or directly on the same CPU.
+                                    on FreeBSD they use the Linux qemu put in
+                                    /compat/linux/usr/bin for the Linuxulator
+                                    (the qemu in /usr/local/bin is bsd-user);
+                                    the x86_64 one runs directly under the
+                                    Linuxulator. bf_aarch64.s and bf_ppc64.s
+                                    have no FreeBSD version
+
+-------------------------------------------------------------------------------
+aarch64tox64/: the AArch64 -> x86_64 port of the brainfuck interpreter
+-------------------------------------------------------------------------------
+aarch64tox64.sh                     builds and runs it on FreeBSD/amd64:
+                                    assembles the runtime a64rt_axx_freebsd.s,
+                                    translates bf_aarch64.s with
+                                    a64tox64_axx.axx -V (a64ext.s in front)
+                                    into bf_x64.s, assembles that with
+                                    x86_64.axx (../x86_64.axx in a flat
+                                    layout, else ../patfile/x86_64.axx), links
+                                    with ld -e __a64_start and runs
+                                    mandelbrot.bf
+testrun.sh                          the same for Linux/x86_64 (a64rt_axx.s,
+                                    ld -e _start)
+testrun_freebsd.sh                  the same as aarch64tox64.sh without
+                                    --osabi FreeBSD; the runtime object is
+                                    a64rt_freebsd.o
+aarch64tox86_64.axx                 translates AArch64 assembly into GNU as
+                                    AT&T syntax (.textmode): x0 -> rdi, x1 ->
+                                    rsi ..., calling-convention glue for ret /
+                                    bl / svc, frames from stp / ldp, three
+                                    operands into two.
+                                    caxx aarch64tox86_64.axx prog_a64.s -V
+                                    > prog_x64.s, then as --64
+bf_x64.s                            bf_aarch64.s translated by
+                                    a64tox64_axx.axx with a64ext.s in front
+                                    (what the scripts above make)
+x86_64.axx                          an earlier copy of x86_64.axx (2026-10-14)
+a64ext.s                            copies of the files of the same name in
+a64rt_axx.s                         patfile/, asmsrc/ and the top level
+a64rt_axx_freebsd.s
+a64tox64_axx.axx
+bf_aarch64.s
+mandelbrot.bf
+
+-------------------------------------------------------------------------------
+faxxsrc/: the sources of Faxx (axx in Forth)
+-------------------------------------------------------------------------------
+  Read by gforth through faxx.fs, or compiled by build_ccforth.sh. The names
+  in parentheses are the matching parts of axx.py / caxx.c.
+
+load.fs                             loads the parts below in order
+faxx-cc.fs                          the entry for ccforth: ccshim.fs, load.fs
+                                    and the start word cc-start
+ccshim.fs                           the gforth words ccforth lacks; not read
+                                    under gforth
+base.fs                             strings, arenas, ordered dictionaries and
+                                    the other groundwork
+u256.fs                             256-bit integers, two's complement (the
+                                    uint256_t of caxx.c)
+diag.fs                             the diagnostics (AssemblerState.diag)
+vars.fs                             pattern variable bindings (PatVar /
+                                    var_slot)
+symtab.fs                           .setsym symbols (numbers, strings, arrays
+                                    / sets) and string-list tools
+labels.fs                           the label table (LabelManager) and the
+                                    relaxation state
+expr.fs, expr2.fs                   the expression evaluator
+                                    (ExpressionEvaluator / expr_*)
+float1.fs                           the !F / !D captures (cap_float)
+float2.fs                           arbitrary-precision naturals and correct
+                                    rounding to binary floating point
+float3.fs                           binary128 expressions (_F128Eval /
+                                    f128_eval_text)
+float4.fs                           double-precision helpers (powers of two,
+                                    correct rounding, %.17g)
+float5.fs                           the bodies of flt{} / dbl{} / qad{}
+                                    (_XevalParser / xeval_*)
+float6.fs                           the !Q capture and flt{} dbl{} qad{}
+                                    enflt{} endbl{}
+match.fs - match5.fs                instruction pattern matching
+                                    (PatternMatcher): captures, the
+                                    character-by-character body, [[ ]] and
+                                    their combinations, .sub
+patfile.fs, patfile2.fs             reading the pattern file
+                                    (PatternFileReader): rows, .sub, .include
+plan.fs                             the processing order of .unordered
+                                    (_pat_unordered_plan) and the pattern
+                                    file's symbols read ahead (setpatsymbols)
+dirs.fs - dirs3.fs                  pattern-side directives other than ELF
+                                    (DirectiveProcessor)
+echo1.fs                            .echo on a body line (echo_processing)
+obj.fs - obj4.fs                    evaluating binary_list (ObjectGenerator):
+                                    output words, text templates and {{ }},
+                                    @@[ ], %% subscripts (makeobj)
+obj5.fs                             evaluating error_patterns
+                                    (DirectiveProcessor.error)
+mini1.fs - mini4.fs                 the mini language (.func / MiniInterp):
+                                    lexer, syntax trees, evaluator, control
+                                    statements, .call arguments
+macro1.fs - macro4.fs               the macro layer (MacroPreprocessor):
+                                    values, scopes, expressions, built-in
+                                    functions, syntax trees, interpolation,
+                                    expansion, !include, -P / -p
+line1.fs                            string handling of one source line and
+                                    labels
+line2.fs                            assembling one instruction
+                                    (Assembler.lineassemble2): the candidate
+                                    index, the best match, the output words
+line3.fs                            one source line (lineassemble /
+                                    lineassemble0) and reading the file
+                                    (fileassemble)
+srcdir.fs, srcdir2.fs               the output buffer (BinaryWriter) and the
+                                    source-side directives (align / zero /
+                                    res / ascii / section / include ...)
+vliw.fs                             VLIW / EPIC bundles
+                                    (VLIWProcessor.vliwprocess)
+elf1.fs - elf9.fs                   the ELF state, the pattern file's .elf*
+                                    declarations, the machine table, the
+                                    source-side ELF directives (.extern
+                                    .global .type .size .weak .comm .cfi_*
+                                    ...), --elfdesc, mini-language calls,
+                                    label reference tracking, .reloc /
+                                    .clrreloc and recording the relocations
+elf10.fs - elf17.fs                 writing the ELF object: line table,
+                                    sections, relocation entries, groups,
+                                    symbol table, CFI (.eh_frame), r_info,
+                                    DWARF (-g), REL addends written back,
+                                    header, name tables, layout and the file
+elfmach.fs                          the built-in ELF machine table, generated
+                                    from _ELF_MACHINE_RAW of axx.py
+export1.fs                          writing -e / -E (_write_export)
+help.fs                             the usage text (the same as --help)
+main.fs                             the command line and the passes
+                                    (Assembler.run)
 ```
