@@ -46,6 +46,7 @@ Give the AI the following material together at the start. Adding an existing pat
 | `mini_en.md` | For encodings that cannot be written as one expression, via `.call` |
 | `macro_en.md` | For generating regular rows with `!def` / `!while` |
 | `elf_generalization_en.md` | Only when ELF output with `-o` is needed |
+| `axx.py` | To learn the grammar of pattern files and the structure of axx from the reference implementation (below) |
 | An existing pattern file of a similar ISA | A model of how to write it |
 
 Pick a model close to the target.
@@ -55,6 +56,27 @@ Pick a model close to the target.
 - **Complex variable-length CISC**: `68000.axx`, `x86_64m.axx`
 - **Encodings with scattered bit fields**: `aarch64_logical_mini.axx` (how to use the mini language)
 - **ELF for a machine without a built-in table**: `elfgen.axx` (MSP430), `elfrel.axx` (ARM, REL)
+
+**Have the AI read `axx.py` to learn the grammar and the structure**
+
+`axx.py` is the reference implementation (Paxx). Reading it lets the AI see the rules of the manual as actual behaviour, so fine points are mistaken less often. It runs to more than 17,000 lines, so reading it in this order works well.
+
+1. **The docstring at the top**: the flow of processing (reading → macro expansion → pass 1 relaxation → pass 2 → output) and the three layers, macro layer, pattern layer and mini language
+2. **`PatternMatcher`** (`match` / `match0` / `match0_brackets`): character-by-character matching, the kinds of capture (`!`, `!!`, `!F` / `!D` / `!Q`, `!L`, `!E`, `!Y`, `!S`), the specificity score `(n_expr, -n_lit, n_sym)` and the combinations of `[[ ]]`
+3. **`PatternFileReader`**: splitting into fields on `::`, and how `.sub`, `.func` and `.include` are handled
+4. **`ExpressionEvaluator`**: the operator precedence (`term0` to `term11`)
+5. **`DirectiveProcessor`**: directives such as `.setsym`, `.check`, `.map`, `.reloc` and `.elf*`
+6. **`ObjectGenerator.makeobj`**: evaluating `binary_list` (`;`, `;;`, `@@[]`, text templates, `.call`)
+7. When needed, **`MiniInterp`** (the mini language) and **`MacroPreprocessor`** (the macro layer)
+
+After the reading, have the AI explain "does this spelling match?" and "which of these two rows wins on score?" before it starts generating, so the points that are easy to trip over are checked in advance.
+
+```text
+Read axx.py in the order above and summarize the grammar of pattern files and the flow of processing in axx.
+Then explain, for `mov a,b` and `mov a,5`, which of the two rows below is chosen and what is emitted.
+MOV A,!d :: 0xAA,d
+MOV A,B  :: 0xBB
+```
 
 ## Step 1: decide the scope
 
