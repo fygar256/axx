@@ -1,0 +1,606 @@
+#!/bin/sh
+
+# パターンファイルとアセンブリソースの置き場。リポジトリでは patfile/ と
+# asmsrc/ に分かれ、作業場ではどちらも同じ階層にある。どちらでもそのまま
+# 走るようにここで決める（パスを手で書き換えると組を落としやすい）。
+P=patfile; [ -d "$P" ] || P=.
+S=asmsrc;  [ -d "$S" ] || S=.
+
+caxx $P/4004.axx $S/4004.s -b b0
+caxx $P/z80.axx $S/z80.s -b b1
+caxx $P/6502.axx $S/6502.s -b b2
+caxx $P/6800.axx $S/6800.s -b b3
+caxx $P/6809.axx $S/6809.s -b b4
+caxx $P/8080.axx $S/8080.s -b b5
+caxx $P/8048.axx $S/8048.s -b b6
+caxx $P/8051.axx $S/8051.s -b b7
+caxx $P/68000.axx $S/68000.s -b b8
+caxx $P/vliw.axx $S/vliw.s -b b9
+caxx $P/itanium.axx $S/vliw.s -b b10
+caxx $P/x86_64.axx $S/hello.s -b b11
+caxx $P/x86_64m.axx $S/hello.s -b b12
+caxx $P/aarch64_logical_mini.axx $S/aarch64_logical_mini_demo.s -b b13
+caxx $P/bf.axx $S/bf.s -b b14
+caxx $P/arrindex.axx $S/arrindex.s -b b15
+caxx $P/passthru.axx $S/passthru.s -b b16
+caxx $P/textmode.axx $S/textmode.s -b b17
+caxx $P/8080toz80.axx $S/hello8080.s -b b18
+caxx $P/textmode.axx $S/textmode.s -V > b19
+caxx $P/8080toz80.axx $S/hello8080.s -V > b20
+caxx $P/aarch64.axx $S/aarch64.s -b b21
+caxx $P/elftype.axx $S/elftype.s -o b22 -m 62
+caxx $P/elfgen.axx $S/elfgen.s -o b23
+caxx $P/symcap.axx $S/symcap.s -b b24
+caxx $P/echo.axx $S/echo.s -b b25 2>&1 | grep -v '^raw: wrote ' > b25e
+caxx $P/elfprio.axx $S/elfprio.s -o b26
+caxx $P/elfsec.axx $S/elfsec.s -o b27
+caxx $P/endsub.axx $S/endsub.s -b b28
+caxx $P/intel2att.axx $S/intel2att.s -b b29
+caxx $P/intel2att.axx $S/intel2att.s -V > b30
+# 番号が飛んでいるのは、下の 31〜110 を付け替えずに後から足したためである。
+caxx $P/elfsym.axx $S/elfsym.s -o b111
+caxx $P/riscv64.axx $S/riscv64.s -o b112
+caxx $P/elfrel.axx $S/elfrel.s -o b113
+caxx $P/aarch64.axx -m 183 --elfdesc > b114
+caxx $P/elfpair.axx $S/elfpair.s -o b115
+caxx $P/elfmips.axx $S/elfmips.s -o b116
+caxx $P/elfmips64.axx $S/elfmips64.s -o b117
+caxx $P/elfword.axx $S/elfword.s -o b118
+caxx $P/elfpair.axx --elfdesc > b119
+caxx $P/elfcfi.axx $S/elfcfi.s -o b120
+caxx $P/elfcfi.axx $S/elfcfi.s -m 3 -f 32 -o b121
+# MIPS 4 種（mips_isa.axx を共有する前置きファイル）で mips.s の全行を組む。
+caxx $P/mips.axx $S/mips.s -b b122
+caxx $P/mipsel.axx $S/mips.s -b b123
+caxx $P/mips64.axx $S/mips.s -b b124
+caxx $P/mips64el.axx $S/mips.s -b b125
+caxx $P/mips.axx $S/mips.s -o b126
+caxx $P/mipsel.axx $S/mips.s -o b127
+caxx $P/mips64.axx $S/mips.s -o b128
+caxx $P/mips64el.axx $S/mips.s -o b129
+# 拡張（DSP・MSA・MT・VZ・EVA ほか）を mips_ase.s で、Release 6 を R6 の前置き
+# ファイル 4 種と mipsr6.s で組む。
+caxx $P/mips.axx $S/mips_ase.s -b b130
+caxx $P/mipsel.axx $S/mips_ase.s -b b131
+caxx $P/mips64.axx $S/mips_ase.s -b b132
+caxx $P/mips64el.axx $S/mips_ase.s -b b133
+caxx $P/mips.axx $S/mips_ase.s -o b134
+caxx $P/mipsel.axx $S/mips_ase.s -o b135
+caxx $P/mips64.axx $S/mips_ase.s -o b136
+caxx $P/mips64el.axx $S/mips_ase.s -o b137
+caxx $P/mipsr6.axx $S/mipsr6.s -b b138
+caxx $P/mipsr6el.axx $S/mipsr6.s -b b139
+caxx $P/mips64r6.axx $S/mipsr6.s -b b140
+caxx $P/mips64r6el.axx $S/mipsr6.s -b b141
+caxx $P/mipsr6.axx $S/mipsr6.s -o b142
+caxx $P/mipsr6el.axx $S/mipsr6.s -o b143
+caxx $P/mips64r6.axx $S/mipsr6.s -o b144
+caxx $P/mips64r6el.axx $S/mipsr6.s -o b145
+caxx $P/unordered.axx $S/unordered.s -b b146
+caxx $P/a64tox64_axx.axx $S/bf_aarch64.s -V > b147
+caxx $P/a64tox64_axx.axx $S/bf_aarch64.s -b b148
+caxx $P/expcap.axx $S/expcap.s -V -b b149 > b149t
+caxx $P/ministr.axx $S/ministr.s -b b150 2>&1 | grep -v '^raw: wrote ' > b150e
+# 差分ファジングで見つけて直した食い違いの回帰テスト。正常系は -V のテキスト、
+# エラー系は標準エラーの診断を比べる（エラーなので出力ファイルは書かれない）。
+caxx $P/regress.axx $S/regress.s -V > b151
+caxx $P/regress.axx $S/regresserr.s -b b152 2>&1 | grep -v '^raw: wrote ' > b152e
+# SPARC: sparc_test.s の全行、sparc_reloc.s のリロケーション、bf_sparc.s の ELF
+caxx $P/sparc.axx $S/sparc_test.s -b b153
+caxx $P/sparc.axx $S/sparc_reloc.s -o b154
+caxx $P/sparc.axx $S/bf_sparc.s -o b155 2>/dev/null
+# 回帰テストの続き: -o では .org を後ろへ戻せない（標準エラーの診断で比べる）、
+# 改行が CR だけのファイルと UTF-8 でないバイトを含む行の -v の一覧
+caxx $P/z80.axx $S/regresself.s -o b156 2>&1 | grep -v '^elf: ' > b156e
+caxx $P/regress.axx $S/regresscr.s -v > b157
+# PowerPC64: DS / DQ 形式の欄（.reloc の第 4 欄）と、label-$$ と書いた PC 相対の
+# データ（.elfpcguess）。-o の ELF で比べる。両方のバイト順。
+caxx $P/ppc64.axx $S/ppc64_reloc2.s -o b158
+caxx $P/ppc64le.axx $S/ppc64_reloc2.s -o b159
+# RISC-V: la / lla と大域ロード・ストアの PCREL の対（.reloc の第 5・6 欄とアンカー）、
+# label-$$ と書いた PC 相対のデータ、セクションをまたぐラベル差（.elfrelax::0）。
+caxx $P/riscv64full.axx $S/riscv64full_reloc2.s -o b160
+caxx $P/riscv64.axx $S/riscv64_reloc2.s -o b161
+# MIPS: la / dla の追加の再配置（HI16+LO16、HIGHEST+HIGHER+HI16+LO16）と PC 相対の
+# データ（R_MIPS_PC32 ほか）。o32 REL ビッグエンディアンと n64 RELA リトルエンディアン。
+caxx $P/mips.axx $S/mips_reloc2.s -o b162
+caxx $P/mips64el.axx $S/mips64_reloc2.s -o b163
+# SPARC: ラベルの set / setx（.islabel と追加の再配置）、セクション内の分岐の解決
+# （.elfresolve）、PC 相対のデータ（R_SPARC_DISP*）。
+caxx $P/sparc.axx $S/sparc_reloc2.s -o b164
+# -b で、先頭でないセクション（入り直した後も）にある分岐の変位。
+caxx $P/x86_64.axx $S/bsection.s -b b165
+# AArch64: 命令とデータの再配置、セクション内の分岐の解決（.elfresolve / .elfencode）。
+caxx $P/aarch64.axx $S/aarch64_reloc.s -o b166
+# x86-64: CALL / JMP / Jcc の近い形と短い形、RIP 相対の参照、絶対アドレッシングの
+# MOV ストア。セクション内の局所ラベルは解決し、外部・大域は PLT32 / PC32 / PC8
+# を持つ（.elfresolve）。両パターンファイルで確かめる。
+caxx $P/x86_64.axx $S/x86_64_reloc.s -o b167
+caxx $P/x86_64m.axx $S/x86_64_reloc.s -o b168
+# 式・因子のあるべきところに式・因子が無い行は当たらず、.passthru で素通しされる。
+caxx $P/exprmiss.axx $S/exprmiss.s -V -b b169 > b169t
+# --elfdesc の .elfanchor と .elfresolve の並び（RISC-V は両方を宣言する）。
+caxx $P/riscv64full.axx --elfdesc > b170
+# x86-64: R8-R15 の REX（[disp+index]・CR / DR・VMREAD / VMWRITE・PEXTR*・MOVDG / MOVQG）。
+# 両パターンファイルで。
+caxx $P/x86_64.axx $S/x86_64_rex.s -b b171
+caxx $P/x86_64m.axx $S/x86_64_rex.s -b b172
+# x86-64: VEX / EVEX の全命令名（llvm-mc 19 と照合した抜粋）と [[rep]] の文字列命令。
+caxx $P/x86_64.axx $S/x86_64_avx.s -b b173
+caxx $P/x86_64m.axx $S/x86_64_avx.s -b b174
+# x86-64: 範囲外の即値と、REX の要る行の AH / CH / DH / BH はエラー（標準エラーの診断で比べる）。
+caxx $P/x86_64.axx $S/x86_64_err.s -b b175 2>&1 | grep -v '^raw: wrote ' > b175e
+caxx $P/x86_64m.axx $S/x86_64_err.s -b b176 2>&1 | grep -v '^raw: wrote ' > b176e
+caxx $P/68000.axx $S/68000_reloc.s -o b177
+caxx $P/68000.axx $S/68000_err.s -b b178 2>&1 | grep -v '^raw: wrote ' > b178e
+caxx $P/z80.axx $S/z80_err.s -b b179 2>&1 | grep -v '^raw: wrote ' > b179e
+caxx $P/6502.axx $S/6502_err.s -b b180 2>&1 | grep -v '^raw: wrote ' > b180e
+caxx $P/6800.axx $S/6800_err.s -b b181 2>&1 | grep -v '^raw: wrote ' > b181e
+caxx $P/6809.axx $S/6809_err.s -b b182 2>&1 | grep -v '^raw: wrote ' > b182e
+caxx $P/8080.axx $S/8080_err.s -b b183 2>&1 | grep -v '^raw: wrote ' > b183e
+caxx $P/8051.axx $S/8051_err.s -b b184 2>&1 | grep -v '^raw: wrote ' > b184e
+caxx $P/8048.axx $S/8048_err.s -b b185 2>&1 | grep -v '^raw: wrote ' > b185e
+# 8 ビット系の範囲の境目（負の番地・即値の下限・強制形）と、8048 / 4004 の条件分岐の
+# ページ（8048 は 2 バイト目、4004 は次の命令のページ）。外部の照合（capstone・ucsim・MAME）で見つけたもの。
+caxx $P/6502.axx $S/6502_edge.s -b b186
+caxx $P/6800.axx $S/6800_edge.s -b b187
+caxx $P/6809.axx $S/6809_edge.s -b b188
+caxx $P/8048.axx $S/8048_edge.s -b b189
+caxx $P/4004.axx $S/4004_edge.s -b b190
+caxx $P/4004.axx $S/4004_err.s -b b191 2>&1 | grep -v '^raw: wrote ' > b191e
+# -i のインポートファイルの値（符号・0x・前後の空白・64 ビット超え、読めない値は行ごと捨てる）。
+caxx $P/z80.axx $S/import_test.s -i $S/import_test.tsv -b b192
+caxx $P/z80.axx $S/import_test_err.s -i $S/import_test_err.tsv -b b193 2>&1 | grep -v '^raw: wrote ' > b193e
+# -v の一覧で .include の行と include 先の行が分かれること、.section を書かないときの
+# -o の .text が末尾の .org まで届くこと。
+caxx $P/z80.axx $S/listinc.s -v > b194
+caxx $P/z80.axx $S/listinc.s -o b195
+# AArch64 / RISC-V の範囲の境目（llvm-mc 19 と照合）: 4 の倍数でない PC 相対と ADRP の範囲、
+# SVE の DUP / MOV / MUL / SMAX の即値、c.lui の -32 / 0xfffe0。
+caxx $P/aarch64.axx $S/aarch64_edge.s -b b196
+caxx $P/aarch64.axx $S/aarch64_err.s -b b197 2>&1 | grep -v '^raw: wrote ' > b197e
+caxx $P/riscv64full.axx $S/riscv64full_edge.s -b b198
+# データ定義（db / half / word / quad など）の範囲。以前は検査が無く黙って切り詰めた。
+caxx $P/riscv64full.axx $S/riscv64full_err.s -b b199 2>&1 | grep -v '^raw: wrote ' > b199e
+caxx $P/mips.axx $S/mips_err.s -b b200 2>&1 | grep -v '^raw: wrote ' > b200e
+caxx $P/sparc.axx $S/sparc_err.s -b b201 2>&1 | grep -v '^raw: wrote ' > b201e
+# 前方参照の .equ が 16 段を超える連鎖（-d の収束の回数も比べる）と、連鎖で延びた反復の
+# 中での振動の報告。行末の \ の継続が !include 先でもつながること、./ を含むパスで渡した
+# ソースの .include / !include 先の名前。標準出力へ書けないときの報告（/dev/full）。
+caxx $P/z80.axx $S/relaxchain.s -d -b b202 2>&1 | grep -v '^raw: wrote ' > b202e
+caxx $P/6502.axx $S/relaxosc_err.s -b b203 2>&1 | grep -v '^raw: wrote ' > b203e
+caxx $P/z80.axx ./$S/contin.s -v > b204
+caxx $P/z80.axx $S/z80.s -v > /dev/full 2> b205e
+caxx $P/z80.axx $S/z80.s -P > /dev/full 2>> b205e
+caxx $P/elfcfi.axx $S/cfiptr.s -o b206
+caxx $P/regress.axx stdin -v < $S/regresscr.s > b207
+caxx $P/x86_64.axx $S/reloctype.s -o b208
+caxx $P/z80.axx $S/labelc_err.s -b b209 2>&1 | grep -v '^raw: wrote ' > b209e
+caxx $P/vliw.axx $S/vliw_err.s -b b210 2>&1 | grep -v '^raw: wrote ' > b210e
+caxx $P/z80.axx $S/dirjunk_err.s -b b211 2>&1 | grep -v '^raw: wrote ' > b211e
+caxx $P/datadir.axx $S/datadir.s -v > b212
+caxx $P/datadirbe.axx $S/datadir.s -v > b213
+caxx $P/datadirw.axx $S/datadir.s -v > b214
+caxx $P/datadir.axx $S/datadir.s -o b215
+caxx $P/datadir.axx $S/datadir_err.s -b b216 2>&1 | grep -v '^raw: wrote ' > b216e
+
+# 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
+# リスティング・テキスト出力の経路が一度も比較されない。
+# 注意: -g は DWARF の comp_dir にカレントディレクトリを埋めるので、caxx 側と
+# paxx 側を必ず同じディレクトリで走らせること。別の場所で走らせると中身が
+# 同じでも食い違う。
+caxx $P/4004.axx $S/4004.s -o b31
+caxx $P/z80.axx $S/z80.s -o b32
+caxx $P/6502.axx $S/6502.s -o b33
+caxx $P/6800.axx $S/6800.s -o b34
+caxx $P/6809.axx $S/6809.s -o b35
+caxx $P/8080.axx $S/8080.s -o b36
+caxx $P/8048.axx $S/8048.s -o b37
+caxx $P/8051.axx $S/8051.s -o b38
+caxx $P/68000.axx $S/68000.s -o b39
+caxx $P/vliw.axx $S/vliw.s -o b40
+caxx $P/itanium.axx $S/vliw.s -o b41
+caxx $P/x86_64.axx $S/hello.s -o b42
+caxx $P/x86_64m.axx $S/hello.s -o b43
+caxx $P/bf.axx $S/bf.s -o b44
+caxx $P/8080toz80.axx $S/hello8080.s -o b45
+caxx $P/aarch64.axx $S/aarch64.s -o b46
+
+caxx $P/4004.axx $S/4004.s -m 3 -f 32 -o b47
+caxx $P/z80.axx $S/z80.s -m 3 -f 32 -o b48
+caxx $P/6502.axx $S/6502.s -m 3 -f 32 -o b49
+caxx $P/6800.axx $S/6800.s -m 3 -f 32 -o b50
+caxx $P/6809.axx $S/6809.s -m 3 -f 32 -o b51
+caxx $P/8080.axx $S/8080.s -m 3 -f 32 -o b52
+caxx $P/8048.axx $S/8048.s -m 3 -f 32 -o b53
+caxx $P/8051.axx $S/8051.s -m 3 -f 32 -o b54
+caxx $P/68000.axx $S/68000.s -m 3 -f 32 -o b55
+caxx $P/vliw.axx $S/vliw.s -m 3 -f 32 -o b56
+caxx $P/itanium.axx $S/vliw.s -m 3 -f 32 -o b57
+caxx $P/x86_64.axx $S/hello.s -m 3 -f 32 -o b58
+caxx $P/x86_64m.axx $S/hello.s -m 3 -f 32 -o b59
+caxx $P/bf.axx $S/bf.s -m 3 -f 32 -o b60
+caxx $P/8080toz80.axx $S/hello8080.s -m 3 -f 32 -o b61
+caxx $P/aarch64.axx $S/aarch64.s -m 183 -f 64 -o b62
+
+caxx $P/4004.axx $S/4004.s -g -o b63
+caxx $P/z80.axx $S/z80.s -g -o b64
+caxx $P/6502.axx $S/6502.s -g -o b65
+caxx $P/6800.axx $S/6800.s -g -o b66
+caxx $P/6809.axx $S/6809.s -g -o b67
+caxx $P/8080.axx $S/8080.s -g -o b68
+caxx $P/8048.axx $S/8048.s -g -o b69
+caxx $P/8051.axx $S/8051.s -g -o b70
+caxx $P/68000.axx $S/68000.s -g -o b71
+caxx $P/vliw.axx $S/vliw.s -g -o b72
+caxx $P/itanium.axx $S/vliw.s -g -o b73
+caxx $P/x86_64.axx $S/hello.s -g -o b74
+caxx $P/x86_64m.axx $S/hello.s -g -o b75
+caxx $P/bf.axx $S/bf.s -g -o b76
+caxx $P/8080toz80.axx $S/hello8080.s -g -o b77
+caxx $P/aarch64.axx $S/aarch64.s -g -o b78
+
+caxx $P/4004.axx $S/4004.s -v -b b79 > b79v
+caxx $P/z80.axx $S/z80.s -v -b b80 > b80v
+caxx $P/6502.axx $S/6502.s -v -b b81 > b81v
+caxx $P/6800.axx $S/6800.s -v -b b82 > b82v
+caxx $P/6809.axx $S/6809.s -v -b b83 > b83v
+caxx $P/8080.axx $S/8080.s -v -b b84 > b84v
+caxx $P/8048.axx $S/8048.s -v -b b85 > b85v
+caxx $P/8051.axx $S/8051.s -v -b b86 > b86v
+caxx $P/68000.axx $S/68000.s -v -b b87 > b87v
+caxx $P/vliw.axx $S/vliw.s -v -b b88 > b88v
+caxx $P/itanium.axx $S/vliw.s -v -b b89 > b89v
+caxx $P/x86_64.axx $S/hello.s -v -b b90 > b90v
+caxx $P/x86_64m.axx $S/hello.s -v -b b91 > b91v
+caxx $P/bf.axx $S/bf.s -v -b b92 > b92v
+caxx $P/8080toz80.axx $S/hello8080.s -v -b b93 > b93v
+caxx $P/aarch64.axx $S/aarch64.s -v -b b94 > b94v
+
+caxx $P/4004.axx $S/4004.s -V -b b95 > b95t
+caxx $P/z80.axx $S/z80.s -V -b b96 > b96t
+caxx $P/6502.axx $S/6502.s -V -b b97 > b97t
+caxx $P/6800.axx $S/6800.s -V -b b98 > b98t
+caxx $P/6809.axx $S/6809.s -V -b b99 > b99t
+caxx $P/8080.axx $S/8080.s -V -b b100 > b100t
+caxx $P/8048.axx $S/8048.s -V -b b101 > b101t
+caxx $P/8051.axx $S/8051.s -V -b b102 > b102t
+caxx $P/68000.axx $S/68000.s -V -b b103 > b103t
+caxx $P/vliw.axx $S/vliw.s -V -b b104 > b104t
+caxx $P/itanium.axx $S/vliw.s -V -b b105 > b105t
+caxx $P/x86_64.axx $S/hello.s -V -b b106 > b106t
+caxx $P/x86_64m.axx $S/hello.s -V -b b107 > b107t
+caxx $P/bf.axx $S/bf.s -V -b b108 > b108t
+caxx $P/8080toz80.axx $S/hello8080.s -V -b b109 > b109t
+caxx $P/aarch64.axx $S/aarch64.s -V -b b110 > b110t
+
+faxx $P/4004.axx $S/4004.s -b a0
+faxx $P/z80.axx $S/z80.s -b a1
+faxx $P/6502.axx $S/6502.s -b a2
+faxx $P/6800.axx $S/6800.s -b a3
+faxx $P/6809.axx $S/6809.s -b a4
+faxx $P/8080.axx $S/8080.s -b a5
+faxx $P/8048.axx $S/8048.s -b a6
+faxx $P/8051.axx $S/8051.s -b a7
+faxx $P/68000.axx $S/68000.s -b a8
+faxx $P/vliw.axx $S/vliw.s -b a9
+faxx $P/itanium.axx $S/vliw.s -b a10
+faxx $P/x86_64.axx $S/hello.s -b a11
+faxx $P/x86_64m.axx $S/hello.s -b a12
+faxx $P/aarch64_logical_mini.axx $S/aarch64_logical_mini_demo.s -b a13
+faxx $P/bf.axx $S/bf.s -b a14
+faxx $P/arrindex.axx $S/arrindex.s -b a15
+faxx $P/passthru.axx $S/passthru.s -b a16
+faxx $P/textmode.axx $S/textmode.s -b a17
+faxx $P/8080toz80.axx $S/hello8080.s -b a18
+faxx $P/textmode.axx $S/textmode.s -V > a19
+faxx $P/8080toz80.axx $S/hello8080.s -V > a20
+faxx $P/aarch64.axx $S/aarch64.s -b a21
+faxx $P/elftype.axx $S/elftype.s -o a22 -m 62
+faxx $P/elfgen.axx $S/elfgen.s -o a23
+faxx $P/symcap.axx $S/symcap.s -b a24
+faxx $P/echo.axx $S/echo.s -b a25 2>&1 | grep -v '^raw: wrote ' > a25e
+faxx $P/elfprio.axx $S/elfprio.s -o a26
+faxx $P/elfsec.axx $S/elfsec.s -o a27
+faxx $P/endsub.axx $S/endsub.s -b a28
+faxx $P/intel2att.axx $S/intel2att.s -b a29
+faxx $P/intel2att.axx $S/intel2att.s -V > a30
+faxx $P/elfsym.axx $S/elfsym.s -o a111
+faxx $P/riscv64.axx $S/riscv64.s -o a112
+faxx $P/elfrel.axx $S/elfrel.s -o a113
+faxx $P/aarch64.axx -m 183 --elfdesc > a114
+faxx $P/elfpair.axx $S/elfpair.s -o a115
+faxx $P/elfmips.axx $S/elfmips.s -o a116
+faxx $P/elfmips64.axx $S/elfmips64.s -o a117
+faxx $P/elfword.axx $S/elfword.s -o a118
+faxx $P/elfpair.axx --elfdesc > a119
+faxx $P/elfcfi.axx $S/elfcfi.s -o a120
+faxx $P/elfcfi.axx $S/elfcfi.s -m 3 -f 32 -o a121
+faxx $P/mips.axx $S/mips.s -b a122
+faxx $P/mipsel.axx $S/mips.s -b a123
+faxx $P/mips64.axx $S/mips.s -b a124
+faxx $P/mips64el.axx $S/mips.s -b a125
+faxx $P/mips.axx $S/mips.s -o a126
+faxx $P/mipsel.axx $S/mips.s -o a127
+faxx $P/mips64.axx $S/mips.s -o a128
+faxx $P/mips64el.axx $S/mips.s -o a129
+faxx $P/mips.axx $S/mips_ase.s -b a130
+faxx $P/mipsel.axx $S/mips_ase.s -b a131
+faxx $P/mips64.axx $S/mips_ase.s -b a132
+faxx $P/mips64el.axx $S/mips_ase.s -b a133
+faxx $P/mips.axx $S/mips_ase.s -o a134
+faxx $P/mipsel.axx $S/mips_ase.s -o a135
+faxx $P/mips64.axx $S/mips_ase.s -o a136
+faxx $P/mips64el.axx $S/mips_ase.s -o a137
+faxx $P/mipsr6.axx $S/mipsr6.s -b a138
+faxx $P/mipsr6el.axx $S/mipsr6.s -b a139
+faxx $P/mips64r6.axx $S/mipsr6.s -b a140
+faxx $P/mips64r6el.axx $S/mipsr6.s -b a141
+faxx $P/mipsr6.axx $S/mipsr6.s -o a142
+faxx $P/mipsr6el.axx $S/mipsr6.s -o a143
+faxx $P/mips64r6.axx $S/mipsr6.s -o a144
+faxx $P/mips64r6el.axx $S/mipsr6.s -o a145
+faxx $P/unordered.axx $S/unordered.s -b a146
+faxx $P/a64tox64_axx.axx $S/bf_aarch64.s -V > a147
+faxx $P/a64tox64_axx.axx $S/bf_aarch64.s -b a148
+faxx $P/expcap.axx $S/expcap.s -V -b a149 > a149t
+faxx $P/ministr.axx $S/ministr.s -b a150 2>&1 | grep -v '^raw: wrote ' > a150e
+faxx $P/regress.axx $S/regress.s -V > a151
+faxx $P/regress.axx $S/regresserr.s -b a152 2>&1 | grep -v '^raw: wrote ' > a152e
+faxx $P/sparc.axx $S/sparc_test.s -b a153
+faxx $P/sparc.axx $S/sparc_reloc.s -o a154
+faxx $P/sparc.axx $S/bf_sparc.s -o a155 2>/dev/null
+faxx $P/z80.axx $S/regresself.s -o a156 2>&1 | grep -v '^elf: ' > a156e
+faxx $P/regress.axx $S/regresscr.s -v > a157
+faxx $P/ppc64.axx $S/ppc64_reloc2.s -o a158
+faxx $P/ppc64le.axx $S/ppc64_reloc2.s -o a159
+faxx $P/riscv64full.axx $S/riscv64full_reloc2.s -o a160
+faxx $P/riscv64.axx $S/riscv64_reloc2.s -o a161
+faxx $P/mips.axx $S/mips_reloc2.s -o a162
+faxx $P/mips64el.axx $S/mips64_reloc2.s -o a163
+faxx $P/sparc.axx $S/sparc_reloc2.s -o a164
+faxx $P/x86_64.axx $S/bsection.s -b a165
+faxx $P/aarch64.axx $S/aarch64_reloc.s -o a166
+faxx $P/x86_64.axx $S/x86_64_reloc.s -o a167
+faxx $P/x86_64m.axx $S/x86_64_reloc.s -o a168
+faxx $P/exprmiss.axx $S/exprmiss.s -V -b a169 > a169t
+faxx $P/riscv64full.axx --elfdesc > a170
+faxx $P/x86_64.axx $S/x86_64_rex.s -b a171
+faxx $P/x86_64m.axx $S/x86_64_rex.s -b a172
+faxx $P/x86_64.axx $S/x86_64_avx.s -b a173
+faxx $P/x86_64m.axx $S/x86_64_avx.s -b a174
+faxx $P/x86_64.axx $S/x86_64_err.s -b a175 2>&1 | grep -v '^raw: wrote ' > a175e
+faxx $P/x86_64m.axx $S/x86_64_err.s -b a176 2>&1 | grep -v '^raw: wrote ' > a176e
+faxx $P/68000.axx $S/68000_reloc.s -o a177
+faxx $P/68000.axx $S/68000_err.s -b a178 2>&1 | grep -v '^raw: wrote ' > a178e
+faxx $P/z80.axx $S/z80_err.s -b a179 2>&1 | grep -v '^raw: wrote ' > a179e
+faxx $P/6502.axx $S/6502_err.s -b a180 2>&1 | grep -v '^raw: wrote ' > a180e
+faxx $P/6800.axx $S/6800_err.s -b a181 2>&1 | grep -v '^raw: wrote ' > a181e
+faxx $P/6809.axx $S/6809_err.s -b a182 2>&1 | grep -v '^raw: wrote ' > a182e
+faxx $P/8080.axx $S/8080_err.s -b a183 2>&1 | grep -v '^raw: wrote ' > a183e
+faxx $P/8051.axx $S/8051_err.s -b a184 2>&1 | grep -v '^raw: wrote ' > a184e
+faxx $P/8048.axx $S/8048_err.s -b a185 2>&1 | grep -v '^raw: wrote ' > a185e
+faxx $P/6502.axx $S/6502_edge.s -b a186
+faxx $P/6800.axx $S/6800_edge.s -b a187
+faxx $P/6809.axx $S/6809_edge.s -b a188
+faxx $P/8048.axx $S/8048_edge.s -b a189
+faxx $P/4004.axx $S/4004_edge.s -b a190
+faxx $P/4004.axx $S/4004_err.s -b a191 2>&1 | grep -v '^raw: wrote ' > a191e
+faxx $P/z80.axx $S/import_test.s -i $S/import_test.tsv -b a192
+faxx $P/z80.axx $S/import_test_err.s -i $S/import_test_err.tsv -b a193 2>&1 | grep -v '^raw: wrote ' > a193e
+faxx $P/z80.axx $S/listinc.s -v > a194
+faxx $P/z80.axx $S/listinc.s -o a195
+faxx $P/aarch64.axx $S/aarch64_edge.s -b a196
+faxx $P/aarch64.axx $S/aarch64_err.s -b a197 2>&1 | grep -v '^raw: wrote ' > a197e
+faxx $P/riscv64full.axx $S/riscv64full_edge.s -b a198
+faxx $P/riscv64full.axx $S/riscv64full_err.s -b a199 2>&1 | grep -v '^raw: wrote ' > a199e
+faxx $P/mips.axx $S/mips_err.s -b a200 2>&1 | grep -v '^raw: wrote ' > a200e
+faxx $P/sparc.axx $S/sparc_err.s -b a201 2>&1 | grep -v '^raw: wrote ' > a201e
+faxx $P/z80.axx $S/relaxchain.s -d -b a202 2>&1 | grep -v '^raw: wrote ' > a202e
+faxx $P/6502.axx $S/relaxosc_err.s -b a203 2>&1 | grep -v '^raw: wrote ' > a203e
+faxx $P/z80.axx ./$S/contin.s -v > a204
+faxx $P/z80.axx $S/z80.s -v > /dev/full 2> a205e
+faxx $P/z80.axx $S/z80.s -P > /dev/full 2>> a205e
+faxx $P/elfcfi.axx $S/cfiptr.s -o a206
+faxx $P/regress.axx stdin -v < $S/regresscr.s > a207
+faxx $P/x86_64.axx $S/reloctype.s -o a208
+faxx $P/z80.axx $S/labelc_err.s -b a209 2>&1 | grep -v '^raw: wrote ' > a209e
+faxx $P/vliw.axx $S/vliw_err.s -b a210 2>&1 | grep -v '^raw: wrote ' > a210e
+faxx $P/z80.axx $S/dirjunk_err.s -b a211 2>&1 | grep -v '^raw: wrote ' > a211e
+faxx $P/datadir.axx $S/datadir.s -v > a212
+faxx $P/datadirbe.axx $S/datadir.s -v > a213
+faxx $P/datadirw.axx $S/datadir.s -v > a214
+faxx $P/datadir.axx $S/datadir.s -o a215
+faxx $P/datadir.axx $S/datadir_err.s -b a216 2>&1 | grep -v '^raw: wrote ' > a216e
+
+faxx $P/4004.axx $S/4004.s -o a31
+faxx $P/z80.axx $S/z80.s -o a32
+faxx $P/6502.axx $S/6502.s -o a33
+faxx $P/6800.axx $S/6800.s -o a34
+faxx $P/6809.axx $S/6809.s -o a35
+faxx $P/8080.axx $S/8080.s -o a36
+faxx $P/8048.axx $S/8048.s -o a37
+faxx $P/8051.axx $S/8051.s -o a38
+faxx $P/68000.axx $S/68000.s -o a39
+faxx $P/vliw.axx $S/vliw.s -o a40
+faxx $P/itanium.axx $S/vliw.s -o a41
+faxx $P/x86_64.axx $S/hello.s -o a42
+faxx $P/x86_64m.axx $S/hello.s -o a43
+faxx $P/bf.axx $S/bf.s -o a44
+faxx $P/8080toz80.axx $S/hello8080.s -o a45
+faxx $P/aarch64.axx $S/aarch64.s -o a46
+
+faxx $P/4004.axx $S/4004.s -m 3 -f 32 -o a47
+faxx $P/z80.axx $S/z80.s -m 3 -f 32 -o a48
+faxx $P/6502.axx $S/6502.s -m 3 -f 32 -o a49
+faxx $P/6800.axx $S/6800.s -m 3 -f 32 -o a50
+faxx $P/6809.axx $S/6809.s -m 3 -f 32 -o a51
+faxx $P/8080.axx $S/8080.s -m 3 -f 32 -o a52
+faxx $P/8048.axx $S/8048.s -m 3 -f 32 -o a53
+faxx $P/8051.axx $S/8051.s -m 3 -f 32 -o a54
+faxx $P/68000.axx $S/68000.s -m 3 -f 32 -o a55
+faxx $P/vliw.axx $S/vliw.s -m 3 -f 32 -o a56
+faxx $P/itanium.axx $S/vliw.s -m 3 -f 32 -o a57
+faxx $P/x86_64.axx $S/hello.s -m 3 -f 32 -o a58
+faxx $P/x86_64m.axx $S/hello.s -m 3 -f 32 -o a59
+faxx $P/bf.axx $S/bf.s -m 3 -f 32 -o a60
+faxx $P/8080toz80.axx $S/hello8080.s -m 3 -f 32 -o a61
+faxx $P/aarch64.axx $S/aarch64.s -m 183 -f 64 -o a62
+
+faxx $P/4004.axx $S/4004.s -g -o a63
+faxx $P/z80.axx $S/z80.s -g -o a64
+faxx $P/6502.axx $S/6502.s -g -o a65
+faxx $P/6800.axx $S/6800.s -g -o a66
+faxx $P/6809.axx $S/6809.s -g -o a67
+faxx $P/8080.axx $S/8080.s -g -o a68
+faxx $P/8048.axx $S/8048.s -g -o a69
+faxx $P/8051.axx $S/8051.s -g -o a70
+faxx $P/68000.axx $S/68000.s -g -o a71
+faxx $P/vliw.axx $S/vliw.s -g -o a72
+faxx $P/itanium.axx $S/vliw.s -g -o a73
+faxx $P/x86_64.axx $S/hello.s -g -o a74
+faxx $P/x86_64m.axx $S/hello.s -g -o a75
+faxx $P/bf.axx $S/bf.s -g -o a76
+faxx $P/8080toz80.axx $S/hello8080.s -g -o a77
+faxx $P/aarch64.axx $S/aarch64.s -g -o a78
+
+faxx $P/4004.axx $S/4004.s -v -b a79 > a79v
+faxx $P/z80.axx $S/z80.s -v -b a80 > a80v
+faxx $P/6502.axx $S/6502.s -v -b a81 > a81v
+faxx $P/6800.axx $S/6800.s -v -b a82 > a82v
+faxx $P/6809.axx $S/6809.s -v -b a83 > a83v
+faxx $P/8080.axx $S/8080.s -v -b a84 > a84v
+faxx $P/8048.axx $S/8048.s -v -b a85 > a85v
+faxx $P/8051.axx $S/8051.s -v -b a86 > a86v
+faxx $P/68000.axx $S/68000.s -v -b a87 > a87v
+faxx $P/vliw.axx $S/vliw.s -v -b a88 > a88v
+faxx $P/itanium.axx $S/vliw.s -v -b a89 > a89v
+faxx $P/x86_64.axx $S/hello.s -v -b a90 > a90v
+faxx $P/x86_64m.axx $S/hello.s -v -b a91 > a91v
+faxx $P/bf.axx $S/bf.s -v -b a92 > a92v
+faxx $P/8080toz80.axx $S/hello8080.s -v -b a93 > a93v
+faxx $P/aarch64.axx $S/aarch64.s -v -b a94 > a94v
+
+faxx $P/4004.axx $S/4004.s -V -b a95 > a95t
+faxx $P/z80.axx $S/z80.s -V -b a96 > a96t
+faxx $P/6502.axx $S/6502.s -V -b a97 > a97t
+faxx $P/6800.axx $S/6800.s -V -b a98 > a98t
+faxx $P/6809.axx $S/6809.s -V -b a99 > a99t
+faxx $P/8080.axx $S/8080.s -V -b a100 > a100t
+faxx $P/8048.axx $S/8048.s -V -b a101 > a101t
+faxx $P/8051.axx $S/8051.s -V -b a102 > a102t
+faxx $P/68000.axx $S/68000.s -V -b a103 > a103t
+faxx $P/vliw.axx $S/vliw.s -V -b a104 > a104t
+faxx $P/itanium.axx $S/vliw.s -V -b a105 > a105t
+faxx $P/x86_64.axx $S/hello.s -V -b a106 > a106t
+faxx $P/x86_64m.axx $S/hello.s -V -b a107 > a107t
+faxx $P/bf.axx $S/bf.s -V -b a108 > a108t
+faxx $P/8080toz80.axx $S/hello8080.s -V -b a109 > a109t
+faxx $P/aarch64.axx $S/aarch64.s -V -b a110 > a110t
+
+FAIL=0
+
+# 一組を突き合わせ、一致すれば両方消す。食い違った組だけを調べられるように
+# 残す。ワイルドカードは使わず、作った名前だけを消す。
+check() {
+    if cmp "$1" "$2"; then
+        rm -f "$1" "$2"
+    else
+        FAIL=1
+    fi
+}
+
+N=0
+while [ $N -le 150 ]; do
+    check a$N b$N
+    N=$((N+1))
+done
+
+check a25e b25e
+
+N=79
+while [ $N -le 94 ]; do
+    check a${N}v b${N}v
+    N=$((N+1))
+done
+
+N=95
+while [ $N -le 110 ]; do
+    check a${N}t b${N}t
+    N=$((N+1))
+done
+
+check a149t b149t
+check a150e b150e
+check a151 b151
+check a152e b152e
+check a153 b153
+check a154 b154
+check a155 b155
+check a156e b156e
+check a157 b157
+check a158 b158
+check a159 b159
+check a160 b160
+check a161 b161
+check a162 b162
+check a163 b163
+check a164 b164
+check a165 b165
+check a166 b166
+check a167 b167
+check a168 b168
+check a169 b169
+check a169t b169t
+check a170 b170
+check a171 b171
+check a172 b172
+check a173 b173
+check a174 b174
+check a175e b175e
+check a176e b176e
+check a177 b177
+check a178e b178e
+check a179e b179e
+check a180e b180e
+check a181e b181e
+check a182e b182e
+check a183e b183e
+check a184e b184e
+check a185e b185e
+check a186 b186
+check a187 b187
+check a188 b188
+check a189 b189
+check a190 b190
+check a191e b191e
+check a192 b192
+check a193e b193e
+check a194 b194
+check a195 b195
+check a196 b196
+check a197e b197e
+check a198 b198
+check a199e b199e
+check a200e b200e
+check a201e b201e
+check a202 b202
+check a202e b202e
+check a203e b203e
+check a204 b204
+check a205e b205e
+check a206 b206
+check a207 b207
+check a208 b208
+check a209e b209e
+check a210e b210e
+check a211e b211e
+check a212 b212
+check a213 b213
+check a214 b214
+check a215 b215
+check a216e b216e
+
+if [ $FAIL -eq 0 ]; then
+    echo "test all passed"
+fi
