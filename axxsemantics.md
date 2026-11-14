@@ -104,10 +104,10 @@ S_k' = M_s(S_0, \lambda_k, \epsilon_k, pc_k)
 
 `binary_list` に `.call f(a_1,...,a_n)` が書かれている場合に限り、ミニ言語関数 `f` を実行する。
 
-```math
+$$
 \left[\!\left[ .call\ f(\vec{e}) \right]\!\right]_{\rho,\lambda}
  = \operatorname{Run}_f(\left[\!\left[\vec{e}\right]\!\right]_{\rho,\lambda})
-```
+$$
 
 ミニ言語は代入、条件分岐、`while` / `for`、再帰、配列、文字列、関数呼び出し、早期return等を持ち、チューリング完全である。`.emit` がワードを出し、関数の返り値も出力列に追加される。ミニ言語はパターン層の全命令に自動適用されるのではなく、明示的な呼び出し箇所でだけ実行される。
 
