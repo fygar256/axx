@@ -111,9 +111,9 @@ axx has three independent implementations that produce byte-identical output for
 
 | Implementation | Source | Size | Notes |
 | --- | --- | --- | --- |
-| Paxx (Python) | `axx.py` | 17,509 lines | The reference implementation; new features land here first |
-| Caxx (C) | `caxx.c` | 24,025 lines | Fast: the x86\_64 hello world against about 24,000 patterns in about 0.1 s |
-| Faxx (Forth) | `faxx.fs`, `faxxsrc/` (69 files) | 15,051 lines | Runs on gforth, or compiles to an executable with ccforth |
+| Paxx (Python) | `axx.py` | 13,968 lines | The reference implementation; new features land here first |
+| Caxx (C) | `caxx.c` | 24,048 lines | Fast: the x86\_64 hello world against about 24,000 patterns in about 0.1 s |
+| Faxx (Forth) | `faxx.fs`, `faxxsrc/` (69 files) | 15,060 lines | Runs on gforth, or compiles to an executable with ccforth |
 
 The C and Forth versions carry their own 256-bit integer type, so expressions and the mini language wrap around exactly as the Python version does.
 
@@ -129,7 +129,7 @@ make faxx                                                # or build ./faxx with 
 
 ### Testing
 
-`test1` assembles every pattern file / source pair with caxx and paxx, 218 runs on each side, and compares the results with `cmp`. Besides the `-b` images it compares ELF objects (`-o`, ELF64 and ELF32), DWARF (`-g`), listings (`-v`), translated text (`-V`) and the diagnostics on standard error, including the `_err.s` files of lines a pattern file must refuse and the `_edge.s` files of lines at the edges of the ranges.
+`test1` assembles every pattern file / source pair with caxx and paxx, 220 runs on each side, and compares the results with `cmp`. Besides the `-b` images it compares ELF objects (`-o`, ELF64 and ELF32), DWARF (`-g`), listings (`-v`), translated text (`-V`) and the diagnostics on standard error, including the `_err.s` files of lines a pattern file must refuse and the `_edge.s` files of lines at the edges of the ranges.
 
 The two implementations are also checked against each other by differential fuzzing; the disagreements found that way are kept in `regress.axx` and `regress*.s`.
 
