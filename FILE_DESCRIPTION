@@ -46,7 +46,8 @@ axx.1.gz                            axx man page
 -------------------------------------------------------------------------------
 Top level: documents
 -------------------------------------------------------------------------------
-README.md                           readme
+README.md                           readme (English)
+README_ja.md                        readme (Japanese)
 LICENSE                             license
 Technical_Manual.md                 technical manual, full reference (English)
 Technical_Manual_ja.md              technical manual, full reference (Japanese)
