@@ -7,7 +7,7 @@ loop:	mvi	c,msg+1	; テンプレートと並べる
 	semi0
 	drop	; 捨てる
 here:	empty	; 空文字列
-	nul
+	chr
 	emitret
 	num
 	xyzzy	; マッチしない行

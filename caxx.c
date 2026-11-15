@@ -2394,6 +2394,10 @@ typedef struct {
     int        debug;
     int        verbose;
     int        text_output;
+    /* `.textmode` の -V で標準出力へ出すバイト列（行の終わりに書いて空にする）。
+       axx.py の BinaryWriter.text_bytes と同じ。 */
+    unsigned char *text_bytes;
+    size_t     text_bytes_len, text_bytes_cap;
 
     char      *asmtext;
     char      *asmtext_disp;
@@ -4599,11 +4603,31 @@ static uint64_t axx_word_mask(int bts){
     return ((uint64_t)1 << bts) - 1;
 }
 
-/* 1 ワードを出力バッファに溜める。 */
+/* 1 ワードを出力バッファに溜める。`.textmode` の -V（-v でないパス2）では、
+   -b と同じバイト数とバイト順で text_bytes にも積む（axx.py の BinaryWriter._store() と同じ）。 */
 static void outbin_store(AsmState *st, uint64_t position, uint256_t word_val){
     if(st->bts <= 0) return;
     uint64_t v = u256_to_u64(word_val) & axx_word_mask(st->bts);
     bufmap_set(&st->buf, position, v);
+    if(st->textmode && st->text_output && st->pas == 2 && !st->verbose){
+        int bpw = (st->bts + 7) / 8;
+        if(st->text_bytes_len + (size_t)bpw > st->text_bytes_cap){
+            size_t nc = st->text_bytes_cap ? st->text_bytes_cap * 2 : 256;
+            while(nc < st->text_bytes_len + (size_t)bpw) nc *= 2;
+            unsigned char *nb = realloc(st->text_bytes, nc);
+            if(!nb){ perror("realloc"); exit(1); }
+            st->text_bytes = nb;
+            st->text_bytes_cap = nc;
+        }
+        unsigned char *p = st->text_bytes + st->text_bytes_len;
+        uint64_t tmp = v;
+        if(!st->endian_big){
+            for(int j = 0; j < bpw; j++){ p[j] = (unsigned char)(tmp & 0xff); tmp >>= 8; }
+        } else {
+            for(int j = bpw - 1; j >= 0; j--){ p[j] = (unsigned char)(tmp & 0xff); tmp >>= 8; }
+        }
+        st->text_bytes_len += (size_t)bpw;
+    }
 }
 
 /* 1 ワードを溜め、prt ならリスティングにも 16 進で出す。 */
@@ -18374,9 +18398,14 @@ static int lineassemble0(Assembler *asmb, const char *line){
     free(st->asmtext); st->asmtext=NULL;
     free(st->asmtext_disp); st->asmtext_disp=NULL;
     int f=lineassemble(asmb,cleaned);
+    /* `.textmode` の -V は、-b に書いたバイト列をそのまま標準出力に出す（.emit の分も）。 */
+    if(st->text_bytes_len){
+        fwrite(st->text_bytes, 1, st->text_bytes_len, stdout);
+        st->text_bytes_len = 0;
+    }
     if(st->asmtext && (st->pas==0 || st->pas==2)){
         if(show)                printf(" %s", st->asmtext_disp ? st->asmtext_disp : "");
-        else if(st->text_output) printf("%s\n", st->asmtext);
+        else if(st->text_output && !st->textmode) printf("%s\n", st->asmtext);
     }
     free(st->asmtext); st->asmtext=NULL;
     free(st->asmtext_disp); st->asmtext_disp=NULL;
@@ -23275,7 +23304,7 @@ out:
 /* 使い方を出す。引数なしで実行したときと、コマンド行の誤りのときに出る。 */
 static void print_usage(const char *prog){
     printf("usage: %s patternfile [sourcefile] [--osabi OSNAME] [-b outfile] [-e export_tsv] [-E export_elf_tsv] [-i import_tsv] [-o elf_obj] [-f {32,64}] [-m machine] [-v] [-V] [-d] [-g] [--no-macro] [-P [file]] [-p [file]]\n",prog);
-    printf("  -V           print the text built from string-template patterns (.textmode translation output) to stdout\n");
+    printf("  -V           print the text built from string-template patterns to stdout (under .textmode: the bytes -b writes)\n");
     printf("  --no-macro   disable the macro preprocessor layer (!if/!while/!def/!return/!set and !{...})\n");
     printf("  -P [file]    macro-expand the source and write it out (stdout if file is omitted), then stop\n");
     printf("  -p [file]    macro-expand the pattern file and write it out (stdout if file is omitted), then stop\n");
@@ -23305,8 +23334,9 @@ static void print_help(const char *prog){
     printf("  -m MACHINE            ELF e_machine value (default: the pattern file's\n"
            "                        .elfmachine, else 62=EM_X86_64)\n");
     printf("  -v, --verbose         Verbose: print assembly listing to stdout\n");
-    printf("  -V, --text-output     Print the text built from string-template patterns\n"
-           "                        (.textmode translation output) to stdout\n");
+    printf("  -V, --text-output     Print the text built from string-template patterns to\n"
+           "                        stdout. Under .textmode it writes the same bytes as\n"
+           "                        -b, .emit output included\n");
     printf("  -d, --debug           Enable debug output (forward-ref fallback, relaxation\n"
            "                        log, etc.)\n");
     printf("  -g, --gen-debug       Generate DWARF debug information in the ELF object\n"

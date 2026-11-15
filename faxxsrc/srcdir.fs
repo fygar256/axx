@@ -25,13 +25,22 @@ variable out-file-a  variable out-file-u  variable has-outfile
   wset @ wcap @ resize throw wset !
   wset @ old + wcap @ old - erase ;
 : wmask ( -- u ) bts @ 64 >= if -1 else 1 bts @ lshift 1- then ;
+\ .textmode の -V で標準出力へ出すバイト列（行の終わりに書いて空にする）。
+\ axx.py の BinaryWriter.text_bytes、caxx.c の st->text_bytes と同じ。
+lazy-sb text-bytes
+: text-bytes+ ( v -- ) { v } bts @ 7 + 8 / { bpw }       \ -b と同じバイト数とバイト順
+  bpw 0 ?do
+    endian-big @ 0= if v i 8 * rshift 255 and else v bpw 1- i - 8 * rshift 255 and then
+    text-bytes sb-c
+  loop ;
 : wstore ( pos val -- ) { pos val }
   bts @ 0<= if exit then
   pos 0< if exit then
   pos 1+ wgrow
   val wmask and wbuf @ pos cells + !
   1 wset @ pos + c!
-  pos 1+ omax @ max omax ! ;
+  pos 1+ omax @ max omax !
+  textmode @ text-output @ and pass @ 2 = and verbose @ 0= and if val wmask and text-bytes+ then ;
 : hexw ( u width -- ) { u w }                              \ 0 詰めの小文字 16 進
   w 0 ?do
     u w 1- i - 4 * rshift 15 and dup 10 < if 48 + else 87 + then emit

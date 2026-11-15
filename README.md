@@ -111,9 +111,9 @@ axx has three independent implementations that produce byte-identical output for
 
 | Implementation | Source | Size | Notes |
 | --- | --- | --- | --- |
-| Paxx (Python) | `axx.py` | 13,968 lines | The reference implementation; new features land here first |
-| Caxx (C) | `caxx.c` | 24,048 lines | Fast: the x86\_64 hello world against about 24,000 patterns in about 0.1 s |
-| Faxx (Forth) | `faxx.fs`, `faxxsrc/` (69 files) | 15,060 lines | Runs on gforth, or compiles to an executable with ccforth |
+| Paxx (Python) | `axx.py` | 13,985 lines | The reference implementation; new features land here first |
+| Caxx (C) | `caxx.c` | 24,078 lines | Fast: the x86\_64 hello world against about 24,000 patterns in about 0.1 s |
+| Faxx (Forth) | `faxx.fs`, `faxxsrc/` (69 files) | 15,072 lines | Runs on gforth, or compiles to an executable with ccforth |
 
 The C and Forth versions carry their own 256-bit integer type, so expressions and the mini language wrap around exactly as the Python version does.
 

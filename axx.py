@@ -3677,11 +3677,22 @@ class BinaryWriter:
     def __init__(self, state):
         self.state = state
         self._buffer = {}
+        # `.textmode` の -V で標準出力へ出すバイト列（行の終わりに書いて空にする）。
+        self.text_bytes = bytearray()
 
     def _store(self, position, word_val):
-        """1 ワードを溜める（ワード幅で切り、負の位置は捨てる）。"""
-        if self.state.bts > 0 and position >= 0:
-            self._buffer[position] = word_val & ((1 << self.state.bts) - 1)
+        """1 ワードを溜める（ワード幅で切り、負の位置は捨てる）。
+
+        `.textmode` の -V（-v でないパス2）では、-b と同じバイト数とバイト順で
+        text_bytes にも積む（caxx.c の outbin_store() と同じ）。
+        """
+        st = self.state
+        if st.bts > 0 and position >= 0:
+            val = word_val & ((1 << st.bts) - 1)
+            self._buffer[position] = val
+            if st.textmode and st.text_output and st.relax.pas == 2 and not st.verbose:
+                self.text_bytes += val.to_bytes((st.bts + 7) // 8,
+                                                'little' if st.endian == 'little' else 'big')
 
     def flush(self):
         """溜めたワードを `-b` のファイルへ書く。
@@ -11577,10 +11588,15 @@ class Assembler:
         self.state.asmtext = None
         self.state.asmtext_disp = None
         f = self.lineassemble(cleaned)
+        # `.textmode` の -V は、-b に書いたバイト列をそのまま標準出力に出す（.emit の分も）。
+        _tb = self.binary_writer.text_bytes
+        if _tb:
+            sys.stdout.write(bytes(_tb).decode('utf-8', 'surrogateescape'))
+            _tb.clear()
         if self.state.asmtext is not None and self.state.relax.pas in (0, 2):
             if _show:
                 print(' %s' % (self.state.asmtext_disp or ''), end='')
-            elif self.state.text_output:
+            elif self.state.text_output and not self.state.textmode:
                 print(self.state.asmtext)
         self.state.asmtext = None
         self.state.asmtext_disp = None
@@ -13264,7 +13280,8 @@ class Assembler:
         ap.add_argument('-V', '--text-output', dest='text_output', action='store_true',
                         default=False,
                         help='Print the text built from string-template patterns '
-                             '(.textmode translation output) to stdout (default: silent). '
+                             'to stdout (default: silent). Under .textmode it writes '
+                             'the same bytes as -b, .emit output included. '
                              'With -v the same text is shown inside the listing instead.')
         ap.add_argument('-d', '--debug', dest='debug', action='store_true',
                         default=False,

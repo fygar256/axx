@@ -239,7 +239,9 @@ textmode.axx                        .textmode, the `!L` expression / label
 callstr.axx                         .textmode with a string returned by
                                     `.call`: the string goes to both -b and
                                     -V, with the label, `;` comment and
-                                    indentation around it (manual 3.18)
+                                    indentation around it; -V writes the
+                                    same bytes as -b, .emit included
+                                    (manual 3.18)
 expcap.axx                          `{{.exp(x)}}` on every capture: a
                                     lowercase variable, `!`, `!!`, `!F` / `!D`
                                     / `!Q`, `!E`, `!S{{name}}`, `!L` and `!Y`

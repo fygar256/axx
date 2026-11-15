@@ -280,7 +280,7 @@ axx [-h] [--osabi ELF_OSABI] [-b OUTFILE] [-e EXPORT_TSV]
 | `-E EXPORT_ELF_TSV` | Export labels to TSV (with ELF section flags) |
 | `-i IMPORT_TSV` | Import labels from TSV |
 | `-v`, `--verbose` | Print assembly listing to stdout (default: silent) |
-| `-V`, `--text-output` | Print the text built from string templates (section 3.5.2) plain to stdout (default: silent). This is what you use to translate a source with `.textmode` (section 3.18) |
+| `-V`, `--text-output` | Print the text built from string templates (section 3.5.2) plain to stdout (default: silent). This is what you use to translate a source with `.textmode` (section 3.18); under `.textmode` it writes the same bytes as `-b`, the words of `.emit` included |
 | `-d`, `--debug` | Debug output: forward-ref fallback, relaxation log |
 | `-g`, `--gen-debug` | Emit DWARF (`.debug_info`/`.debug_abbrev`/`.debug_line`). Requires `-o` (written for ELF32 and ELF64 alike) |
 | `--no-macro` | Disable the macro layer on both the source and pattern side |
@@ -3398,6 +3398,14 @@ translator). It does five things at once.
 `.passthru` and `.eol` move together, so to set one of them differently write that
 directive after this line (directives take effect in the order written).
 
+In text replacement mode **`-V` writes exactly the bytes `-b` writes**, to standard
+output instead of a file. That is the rewritten text and the newline `.eol` adds,
+and also any output that is not text, such as the words a mini-language function
+passed to `.emit` or a number it returned (section 3.15). The bytes of each word
+follow `.bits` (width and byte order) as in the `-b` file. With `.eol` turned off,
+no newline is added on standard output either. Outside text replacement mode `-V`
+prints the text built from string templates, one line per source line, as before.
+
 #### `!L<variable>` — the expression/label capture
 
 Reads one expression and binds its value exactly as `!<variable>` does (3.3), and
@@ -3641,8 +3649,10 @@ start:	mov	a,b	; copy   ->  start: LD a,b ; copy
 	mvi	c,msg+1      ->  	LD c,msg+1
 ```
 
-- Only the returned string becomes text. Words passed to `.emit` go to the `-b`
-  file alone, as before, and a number or an array returned is output only to `-b`.
+- Only the returned string becomes text (what the `-v` listing shows as text, and
+  what the label and the comment are put around). Words passed to `.emit` and a
+  number or an array returned are not text, but they still come out on `-V`,
+  because `-V` writes the same bytes as `-b` in text replacement mode (above).
 - `;.call` emits nothing when the string is empty, and `;;.call` discards it, as
   with `"..."`. An empty string returned without `;` still counts as text, so the
   label and the comment of the line come out.
@@ -5306,7 +5316,7 @@ The x86_64 pattern file is also maintained separately at
 | **test.axx** | 1.1 KB | 40 | **test.s** | Fragments of several ISAs; test only |
 | **8080toz80.axx** | 5.7 KB | 117 | **hello8080.s** | Intel 8080 to Zilog Z80 source translator; `.textmode`, `!L` and `{{.exp()}}` (3.18) at work |
 | **textmode.axx** | 2.0 KB | 13 | **textmode.s** | `.textmode`, `!L`, `{{.exp()}}` and `;` comments (3.18); test only |
-| **callstr.axx** | 2.0 KB | 12 | **callstr.s** | A string returned by `.call` comes out as text in `.textmode`, to both `-b` and `-V` (3.18); test only |
+| **callstr.axx** | 2.0 KB | 12 | **callstr.s** | A string returned by `.call` comes out as text in `.textmode`, and `-V` writes the same bytes as `-b`, `.emit` included (3.18); test only |
 | **expcap.axx** | 2.8 KB | 36 | **expcap.s** | `{{.exp()}}` emits the text of every kind of capture (3.18); test only |
 | **exprmiss.axx** | 1.1 KB | 8 | **exprmiss.s** | A line with no expression or factor where one belongs (empty, `1+`, `-`, `~`, `()`) matches none of `!`, `!!`, `!L` and `!F`/`!D`/`!Q`, and is let through by `.passthru` (3.3); test only |
 | **arrindex.axx** | 860 B | 14 | **arrindex.s** | Array symbols: bare names as items, a name as a subscript, `.index` (3.6.1); test only |

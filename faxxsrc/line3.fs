@@ -137,9 +137,11 @@ defer macro-reset-pass ( -- )
   then
   asmtext-clear
   ca cu lineassemble { f }
+  \ .textmode の -V は、-b に書いたバイト列をそのまま標準出力に出す（.emit の分も）。
+  text-bytes sb-len if text-bytes sb$ type  text-bytes sb-clear then
   asmtext-set @ pass @ 2 = pass @ 0= or and if
     show if 32 emit asmdisp sb$ type
-    else text-output @ if asmtext sb$ type cr then then
+    else text-output @ textmode @ 0= and if asmtext sb$ type cr then then
   then
   asmtext-clear
   show listing-open @ and if cr then

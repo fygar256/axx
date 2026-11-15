@@ -8,9 +8,9 @@
 /*    - `"..."` のテンプレートと並べるとテキストがつながること
 /*    - `;.call` で空文字列なら何も出さず、`;;.call` は捨てること
 /*    - 空文字列（`;` 無し）でもテキストとして扱われ、ラベルとコメントが出ること
-/*    - NUL を含む文字列は -b には全部、-V には NUL の手前まで出ること
-/*    - `.emit` の語は -b だけに出て、テキストは戻り値の文字列だけであること
-/*    - 数の戻り値は今までどおり -b だけに出ること
+/*    - `.chr()` でつないだ文字列もそのまま出ること
+/*    - テキストは戻り値の文字列だけだが、`.emit` の語と数の戻り値も -V に出る
+/*      こと（.textmode の -V は -b と同じバイト列を標準出力へ書く）
 /*  を確かめる。paxx と caxx が同じバイト列・同じテキストを出すことも確かめる。
 /*  ==================================================================
 
@@ -31,8 +31,8 @@
 .return x
 .endfunc
 
-.func nul()
-.return "AB" + .chr(0) + "CD"
+.func bang()
+.return "AB" + .chr(0x21) + "CD"
 .endfunc
 
 .func emitret()
@@ -41,7 +41,7 @@
 .endfunc
 
 .func num()
-.return 5
+.return 0x35
 .endfunc
 
 /*  レジスタ名と拾った綴りを関数に渡し、組み立てた文字列を返す。 */
@@ -54,7 +54,7 @@ SEMI !La    :: ;.call id(.exp(a))
 SEMI0       :: ;.call id("")
 DROP        :: ;;.call id("dropped")
 EMPTY       :: .call id("")
-/*  NUL・.emit・数の戻り値。 */
-NUL         :: .call nul()
+/*  .chr()・.emit・数の戻り値（0x35 は "5"）。 */
+CHR         :: .call bang()
 EMITRET     :: .call emitret()
 NUM         :: .call num()
