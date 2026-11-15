@@ -186,6 +186,10 @@ EPIC and VLIW machines have meta-level structure in their machine code that the
 basic model does not cover, and are handled by a later extension — see
 [section 4](#4-vliw-and-epic-processors).
 
+The "one-to-one" condition above, restated generally as a property of the ISA,
+is the *finite static transformation* of
+[section 1.7](#17-the-generality-thesis-any-processor-whose-isa-is-a-finite-static-transformation).
+
 ### 1.4 Where axx sits relative to other tools
 
 axx operates at a **lower level of abstraction** than LLVM, CGen or customasm.
@@ -250,6 +254,121 @@ in section 2.4). Ordinary von Neumann processors rarely come near any of them.
 - Floating-point conversion (`enfloat()`) supports IEEE 754 formats only (half through
   quadruple precision). IBM hexadecimal floating point and VAX formats cannot be emitted
   by the built-in directives. This is a limit on data definitions, not on instructions.
+
+### 1.7 The generality thesis: any processor whose ISA is a finite static transformation
+
+The condition of section 1.3, that instructions map one-to-one onto machine
+code, can be stated in a general form:
+
+> **Thesis.** If an ISA has an imperative assembly language and the mapping
+> from its assembly to machine code is a **finite static transformation** —
+> call such an ISA a **generic processor ISA** — then axx can process the
+> assembly of that processor, whichever processor it is. Write a pattern file
+> that describes the ISA, and you have an assembler for that processor.
+
+#### 1.7.1 Definitions
+
+An **imperative assembly language** is one whose source is a sequence of lines
+(instructions, directives, labels), each instruction line standing for a piece
+of machine code. It need not be mnemonic-plus-operands; assignment forms such
+as `r1 = r2 + r3` are fine (section 1.2).
+
+The mapping from assembly to machine code is a **finite static
+transformation** when it is both of the following.
+
+**Static** — the encoding of each instruction line is decided by information
+known at assembly time:
+
+- the text of the line (and the values and spellings captured from it),
+- the declarations in the pattern file (symbols, sets, `.check`, `.map`, `.sub`
+  and so on),
+- the values of labels and `.equ`, and the location counters `$` / `$$`.
+
+It does not depend on the state of the running program (register contents,
+execution history, the sequence of instructions executed so far).
+
+**Finite** — all three of these are finite:
+
+1. **The number of instruction forms.** The ways of writing instructions can be
+   covered by finitely many forms. Operand values may be infinitely many, as
+   long as the forms are finite (the values are taken by the captures `!`,
+   `!!`, `!F` and so on). When there are many forms, the macro layer
+   (section 7), sets and subtables can generate them.
+2. **The length of the output.** Each instruction line emits a finite sequence
+   of words. Each word is binary, 1 to 64 bits wide (`.bits`, section 1.6).
+   An instruction may span several words, so the instruction length itself
+   has no upper bound.
+3. **The encoding computation.** The computation that turns the captured
+   values, label values and location counter into words finishes in a finite
+   number of steps (that is, it is a computable function).
+
+VLIW and EPIC machines, which bundle several instructions, are also generic
+processor ISAs when they meet the same conditions with the bundle as the unit
+(section 4).
+
+#### 1.7.2 Why axx can process them — the correspondence with the implementation
+
+Each item of the definition corresponds directly to a mechanism in axx.
+
+| Condition of a finite static transformation | The axx mechanism that handles it |
+|---|---|
+| Finitely many instruction forms | One form is one pattern line, `instruction :: error_patterns :: binary_list`. Matching is character by character, so the pattern decides how the syntax is split (section 3.3) |
+| Several forms may match the same line | Every matching pattern gets the specificity score `(n_expr, -n_lit, n_sym)` and the smallest wins, independent of the order of writing (section 3.2) |
+| Ranges and constraints on operand values | Conditions in `error_patterns`; register-class constraints with `.check`, `.map` and sets (sections 3.4, 3.7) |
+| Encodings an expression can write | Expressions in `binary_list` (bit operations, `@`, `'`, `*(x,y)` and so on; section 6) |
+| Encodings that are awkward as expressions | The mini language called with `.call`. It has loops, recursion and arrays and is Turing complete, so any computable encoding can be written there (section 3.15) |
+| Encodings that depend on label values | Pass 1 relaxation iterates until every label address equals that of the previous iteration (including forward references of variable-length instructions) |
+| Output as a sequence of words | `.bits` sets a word width of 1–64 bits; `-b` writes a raw binary, `-o` an ELF object (section 3.7.7) |
+
+In the implementation, Paxx's `Assembler.lineassemble2()` (`lineassemble2_impl()`
+in Caxx) matches every candidate pattern against a line, evaluates the
+`error_patterns` of the best one, and then turns its `binary_list` into words.
+That is exactly a function from "the text of the line, the declarations and
+the label environment" to "a finite sequence of words", the same shape as the
+definition of a finite static transformation. The dependence on labels is
+solved by the relaxation loop in `Assembler.run()`, which treats the layout as
+converged once it equals that of the previous iteration.
+
+So for a generic processor ISA, you get an assembler for the processor by
+
+1. transcribing each instruction form as a pattern line,
+2. writing ranges and constraints with `error_patterns`, `.check` and the like,
+3. writing the encoding as an expression, or as a mini-language function when
+   needed.
+
+The procedure does not depend on the kind of ISA. The bundled pattern files
+(appendix B), which run everything from the 4-bit 4004 to x86\_64 (through
+AVX-512), AArch64 (through SVE/SME2), Power ISA v3.1, all of RISC-V RV64, MIPS,
+SPARC and Itanium-style EPIC, are concrete instances of the thesis.
+
+The same holds when the output is text. If rewriting one assembly language
+into another is a finite static transformation, writing string templates in
+`binary_list` and declaring `.textmode` gives that translator (section 3.18).
+
+#### 1.7.3 A checklist
+
+Whether an ISA fits the definition can be checked with these questions:
+
+- Can the ways of writing instructions be listed as a table of finitely many
+  forms?
+- Can the machine code of each instruction be decided from the text of that
+  instruction and the label values alone?
+- Can the encoding procedure be written as an algorithm that finishes?
+- Can the output be represented as a sequence of binary words of 64 bits or
+  less?
+
+If the answer to every question is yes, the ISA is a generic processor ISA and
+axx handles it. The machines in the tables of sections 1.3 and 1.6 (the Mill
+CPU, ZISC, Thinking Machines, the ternary Setun and so on) can be understood as
+those for which one of these questions does not apply. The Mill CPU, for
+example, resolves operand references by execution history, so it is not
+"static", and the Setun's output is not binary words. Quantum computers and
+LISP machines lie outside the premise of an imperative assembly language.
+
+As practical limits, one `.call` of the mini language may run at most
+4,000,000 statements, nest calls 128 deep, emit 1,048,576 words and hold arrays
+of 1,048,576 elements (section 3.15). Encoding an ordinary instruction takes
+far less computation than that.
 
 ---
 
