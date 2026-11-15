@@ -154,12 +154,24 @@ The two implementations are also checked against each other by differential fuzz
 
 axx keeps a declarative ISA description and a declarative description of linkable ELF together in one file.
 
-| Tool | How you describe a target | Object output | Best suited for |
+Most assemblers that cover many CPUs carry the knowledge of each CPU in their own source code. axx moves all of that knowledge into pattern files, so the core stays small and identical for every target, and adding a CPU means writing a text file, not changing and rebuilding the assembler.
+
+| Tool | How you add or describe a target | Object output | Best suited for |
 | --- | --- | --- | --- |
-| **axx** | Free-form pattern files only | ELF32/64 generated from declarations, DWARF, CFI | Bringing historical, homebrew or unusual ISAs to a real OS from a description you can read end to end |
+| **axx** | One free-form pattern file; no rebuild | ELF32/64 generated from declarations, DWARF, CFI | Bringing historical, homebrew or unusual ISAs to a real OS from a description you can read end to end |
+| GNU as | C code per CPU inside binutils, then rebuild | ELF, COFF, Mach-O and more | Production toolchains in the GNU ecosystem |
+| LLVM MC | TableGen plus substantial hand-written C++, then rebuild | ELF, COFF, Mach-O, wasm | Production toolchains for mainstream architectures |
+| The Macroassembler AS, vasm | A C module per CPU, then rebuild | AS: its own format, converted to hex or binary; vasm: binary, ELF, a.out and others | Many vintage CPUs under one familiar syntax |
 | customasm | Declarative rules (Rust) | Dump formats such as binary, hexdump, intelhex | Homebrew CPUs targeting ROMs or emulators |
-| LLVM MC | TableGen plus substantial hand-written C++ | ELF, COFF, Mach-O, wasm | Production toolchains for mainstream architectures |
+| Telemark TASM | Instruction tables | Hex formats and binary | 8-bit microprocessors and microcontrollers |
 | CGEN | Instruction semantics in Scheme | Generates parts of binutils | Embedded ports of GNU binutils/GDB |
+
+Two things set axx apart beyond the table:
+
+- **A homebrew CPU gets an assembler the same day.** For an FPGA soft core or a teaching CPU that exists only on paper, transcribe the instruction table into a pattern file and you can assemble, and link ELF, right away. With other assemblers this is where most of the effort goes.
+- **The assembler and the translator are one tool.** Put text instead of bytes in the output field and the same mechanism translates between assembly languages: 8080 to Z80, Intel syntax to AT&T, AArch64 to x86\_64.
+
+GNU as and LLVM MC are the right choice for deep, optimized support of a particular mainstream CPU inside a large toolchain. axx leads along a different axis: reaching any CPU quickly, from a description you can read end to end.
 
 LLVM's AsmMatcher needed dedicated handling for Hexagon's mnemonic-less `r0 = r1` syntax. Because axx matches character by character from the start, syntax like this is natural to write.
 
