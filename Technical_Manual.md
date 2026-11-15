@@ -345,6 +345,9 @@ The same holds when the output is text. If rewriting one assembly language
 into another is a finite static transformation, writing string templates in
 `binary_list` and declaring `.textmode` gives that translator (section 3.18).
 
+Section 14.1 of `axxsemantics.md` (in Japanese) restates the thesis in terms
+of the meaning function and sketches how the pattern file is constructed.
+
 #### 1.7.3 A checklist
 
 Whether an ISA fits the definition can be checked with these questions:

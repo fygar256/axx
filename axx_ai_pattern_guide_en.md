@@ -82,6 +82,13 @@ MOV A,B  :: 0xBB
 
 A person first decides what to build, in which syntax and in which order. Leaving this vague and handing it to the AI leaves no fixed standard for the comparison, and costs rework.
 
+Before that, confirm that the target ISA is a **generic processor ISA**: one whose mapping from assembly to machine code is a finite static transformation. For an imperative assembly language whose instructions map one-to-one onto machine code, axx can build an assembler when every question below is answered "yes" (section 1.7 of the technical manual).
+
+- Can the ways of writing instructions be listed as a table of finitely many forms?
+- Is the machine code of each instruction decided by its text and the label values alone (not by run-time state)?
+- Can the encoding be written as an algorithm that finishes?
+- Can the output be expressed as a sequence of binary words of at most 64 bits?
+
 1. **Choose one syntax**: following the syntax of the external assembler used for comparison (GNU as or llvm-mc) is the safe choice. The same source then goes through both.
 2. **Fix the byte order and word width**: big- or little-endian, and whether the smallest addressable unit is 8 bits.
 3. **Split into instruction groups and rank them**: for example loads and stores, then arithmetic, then branches, then floating point, then extensions.
