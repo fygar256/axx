@@ -7152,6 +7152,7 @@ class ObjectGenerator:
         self.state = state
         self.expr_eval = expr_eval
         self.binary_writer = binary_writer
+        self.call_text = None
 
     def replace_percent_with_index(self, s):
         """`%%` を繰り返しの番号に、`%0` でその番号を 0 に戻す（文字列の中は触らない）。"""
@@ -7282,7 +7283,12 @@ class ObjectGenerator:
         return out
 
     def mini_call(self, s, idx):
-        """`.call 名前(引数, ...)` を実行し、生まれたワード列を返す（引数はパターン層の式）。"""
+        """`.call 名前(引数, ...)` を実行し、生まれたワード列を返す（引数はパターン層の式）。
+
+        戻り値が文字列なら、そのテキスト（NUL の手前まで）を self.call_text に残す
+        （`.textmode` で -V に出すため。caxx.c の mini_call_binary() の rettxt と同じ）。
+        """
+        self.call_text = None
         idx = StringUtils.skipspc(s, idx + 5)
         j = idx
         while j < len(s) and s[j] in _SYM_CORE:
@@ -7320,6 +7326,8 @@ class ObjectGenerator:
         finally:
             sys.setrecursionlimit(saved_reclimit)
         if ret is not None:
+            if isinstance(ret, bytes):
+                self.call_text = ret.split(b'\0', 1)[0].decode('utf-8', 'surrogateescape')
             # 配列は要素ごとに、文字列（の要素）は 1 バイト 1 ワードで出す。
             if isinstance(ret, list):
                 ret = [w for e in ret for w in (e if isinstance(e, bytes) else (e,))]
@@ -7933,6 +7941,11 @@ class ObjectGenerator:
                     words, idx = self.mini_call(s, idx)
                     if drop or (semicolon and len(words) == 1 and words[0] == 0):
                         words = []
+                    elif (st.textmode and self.call_text is not None
+                          and not (semicolon and self.call_text == '')):
+                        # `.textmode` では文字列の戻り値をテキストとしても出す（-V と -b の両方）。
+                        txtacc.append(self.call_text)
+                        dispacc.append('"%s"' % asmtext_escaped(self.call_text))
                     if not words:
                         wi = e.current_word_idx
                         self._drop_refs_at(wi)

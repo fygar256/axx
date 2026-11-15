@@ -183,6 +183,8 @@ caxx $P/datadirbe.axx $S/datadir.s -v > b213
 caxx $P/datadirw.axx $S/datadir.s -v > b214
 caxx $P/datadir.axx $S/datadir.s -o b215
 caxx $P/datadir.axx $S/datadir_err.s -b b216 2>&1 | grep -v '^raw: wrote ' > b216e
+caxx $P/callstr.axx $S/callstr.s -b b217
+caxx $P/callstr.axx $S/callstr.s -V > b218t
 
 # 中核 16 組を他のオプションでも突き合わせる。-b だけでは ELF 出力・DWARF・
 # リスティング・テキスト出力の経路が一度も比較されない。
@@ -412,6 +414,8 @@ paxx $P/datadirbe.axx $S/datadir.s -v > a213
 paxx $P/datadirw.axx $S/datadir.s -v > a214
 paxx $P/datadir.axx $S/datadir.s -o a215
 paxx $P/datadir.axx $S/datadir_err.s -b a216 2>&1 | grep -v '^raw: wrote ' > a216e
+paxx $P/callstr.axx $S/callstr.s -b a217
+paxx $P/callstr.axx $S/callstr.s -V > a218t
 
 paxx $P/4004.axx $S/4004.s -o a31
 paxx $P/z80.axx $S/z80.s -o a32
@@ -600,6 +604,8 @@ check a213 b213
 check a214 b214
 check a215 b215
 check a216e b216e
+check a217 b217
+check a218t b218t
 
 if [ $FAIL -eq 0 ]; then
     echo "test all passed"

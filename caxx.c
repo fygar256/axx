@@ -12937,9 +12937,14 @@ static MiniVal mini_arg_one(Assembler *asmb, char *t, int a, int *out_i, int *ok
 }
 
 /* `.call 名前(引数, ...)` を実行し、生まれたワード列を積む。引数は呼び出し側の
-   パターン式なので、ここでパターン変数が解決されてから関数へ渡る。 */
-static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *objl){
+   パターン式なので、ここでパターン変数が解決されてから関数へ渡る。
+   戻り値が文字列なら、そのテキスト（NUL の手前まで）を malloc して *rettxt に置く
+   （`.textmode` で -V に出すため。文字列でなければ NULL。axx.py の mini_call() の
+   call_text と同じ）。 */
+static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *objl,
+                            char **rettxt){
     volatile int idx = idx_in;
+    *rettxt = NULL;
     AsmState *st = &asmb->st;
     int slen = expr_slen(s);
     int quiet = st->pass1_size_mode;
@@ -13046,9 +13051,16 @@ static int mini_call_binary(Assembler *asmb, const char *s, int idx_in, IntVec *
                     else
                         iv_push(objl, r.retval.arr[i]);
                 }
-            else if(r.retval.is_str)
+            else if(r.retval.is_str){
                 for(int i = 0; i < r.retval.slen; i++)
                     iv_push(objl, u256_from_u64(r.retval.str[i]));
+                int tn = 0;
+                while(tn < r.retval.slen && r.retval.str[tn]) tn++;
+                *rettxt = malloc((size_t)tn + 1);
+                if(!*rettxt){ perror("malloc"); exit(1); }
+                if(tn) memcpy(*rettxt, r.retval.str, (size_t)tn);
+                (*rettxt)[tn] = 0;
+            }
             else
                 iv_push(objl, r.retval.num);
         }
@@ -14906,9 +14918,19 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
             IntVec callw; iv_init(&callw);
             int _call_widx = objl->len;
             st->elf_current_word_idx = _call_widx;
-            idx = mini_call_binary(asmb, s, idx, &callw);
+            char *calltxt;
+            idx = mini_call_binary(asmb, s, idx, &callw, &calltxt);
             if(!(drop || (semicolon && callw.len == 1 && u256_is_zero(callw.data[0])))){
                 for(int q = 0; q < callw.len; q++) iv_push(objl, callw.data[q]);
+                if(st->textmode && calltxt && !(semicolon && calltxt[0]=='\0')){
+                    /* `.textmode` では文字列の戻り値をテキストとしても出す（-V と -b の両方）。 */
+                    txt_adds(&txtacc, calltxt);
+                    if(have_text) txt_addc(&dispacc, ',');
+                    txt_addc(&dispacc, '"');
+                    txt_add_escaped(&dispacc, calltxt);
+                    txt_addc(&dispacc, '"');
+                    have_text = 1;
+                }
             } else {
                 int _wi3 = 0;
                 for(int _ri3 = 0; _ri3 < st->elf_refs_len; _ri3++){
@@ -14920,6 +14942,7 @@ static void makeobj(Assembler *asmb, const char *s_in, IntVec *objl){
                 st->elf_refs_len = _wi3;
             }
             st->elf_current_word_idx = -1;
+            free(calltxt);
             iv_free(&callw);
             if(s[idx]==','){ idx++; continue; }
             pat_trailing(st, "binary_list", "an element", s, idx, NULL);

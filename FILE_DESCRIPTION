@@ -236,6 +236,10 @@ textmode.axx                        .textmode, the `!L` expression / label
                                     replacement keeping labels, expressions,
                                     `;` comments and the leading indentation
                                     spelled as written (manual 3.18)
+callstr.axx                         .textmode with a string returned by
+                                    `.call`: the string goes to both -b and
+                                    -V, with the label, `;` comment and
+                                    indentation around it (manual 3.18)
 expcap.axx                          `{{.exp(x)}}` on every capture: a
                                     lowercase variable, `!`, `!!`, `!F` / `!D`
                                     / `!Q`, `!E`, `!S{{name}}`, `!L` and `!Y`
@@ -623,6 +627,7 @@ datadir_err.s                       assembled with datadir.axx: out-of-range
                                     values, missing values, strings outside
                                     .db and trailing text
 textmode.s                          test assemble file for textmode.axx
+callstr.s                           test assemble file for callstr.axx
 expcap.s                            test assemble file for expcap.axx
 exprmiss.s                          test assemble file for exprmiss.axx
 ministr.s                           test assemble file for ministr.axx

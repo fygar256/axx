@@ -68,16 +68,16 @@ above.
 
 All three are intended to produce **byte-identical output** for the same input.
 The bundled pattern files, test sources and the `test1` script exist to check
-exactly that for Paxx and Caxx: `test1` assembles all one hundred and thirteen
+exactly that for Paxx and Caxx: `test1` assembles all one hundred and fourteen
 bundled pattern/source pairs with both and `cmp`s the results, two hundred and
-eighteen runs on each side. Besides the `-b` images it compares the translated
+twenty runs on each side. Besides the `-b` images it compares the translated
 text of `-V` (the `.textmode` pairs, `exprmiss.axx`, `regress.axx`), the `.echo`
 lines written to standard error (`echo.axx`, `ministr.axx`), the diagnostics of
 the `_err.s` files and of the regression tests, the ELF objects of the
 relocation tests and the `--elfdesc` output. The sixteen core pairs are run
 under `-o`, `-m 3 -f 32 -o`, `-g -o`, `-v` and `-V` as well, so the ELF32 and
 ELF64 objects, the DWARF, the listing and the text output are compared too, for
-two hundred and fifty-four comparisons in all. Appendix B lists them.
+two hundred and fifty-six comparisons in all. Appendix B lists them.
 
 Faxx is not run by `test1`. Where this manual says "both implementations" it
 means Paxx and Caxx, the pair `test1` checks; Faxx follows the same rules,
@@ -3040,7 +3040,8 @@ i=i+1
 
 When a function is called straight from `binary_list`, its return value becomes
 output: a number is one word, an array is one word per element from index 0
-(a string element one word per byte).
+(a string element one word per byte), and a string is one word per byte (in
+text replacement mode the string also comes out as text; section 3.18).
 That is in addition to whatever it passed to `.emit`, so a function that only
 `.emit`s and returns nothing behaves exactly as before.
 
@@ -3614,6 +3615,41 @@ val:	.equ	0x1234       ->  val: .equ 0x1234
 
 The pattern file is scanned in full for every source line, so this acts as a
 setting for the whole file (the last one in the file wins).
+
+#### A string returned by `.call`
+
+In text replacement mode, when a `.call` written in `binary_list` (section 3.15)
+returns a **string**, that string **comes out as text as well**: its bytes go to
+the `-b` file and the same string is printed by `-V`, exactly as a `"..."` text
+template would. The leading `label:`, the `;` comment and the indentation are put
+around it in the same way, and it joins up with `"..."` templates on the same line.
+
+```
+.textmode
+.func ld(d,s)
+.return "LD " + d + "," + s
+.endfunc
+.func id(x)
+.return x
+.endfunc
+MOV r,r2  :: .call ld(.exp(r),.exp(r2))
+MVI r,!La :: "LD ",.call id(.exp(r)),",",.call id(.exp(a))
+```
+
+```
+start:	mov	a,b	; copy   ->  start: LD a,b ; copy
+	mvi	c,msg+1      ->  	LD c,msg+1
+```
+
+- Only the returned string becomes text. Words passed to `.emit` go to the `-b`
+  file alone, as before, and a number or an array returned is output only to `-b`.
+- `;.call` emits nothing when the string is empty, and `;;.call` discards it, as
+  with `"..."`. An empty string returned without `;` still counts as text, so the
+  label and the comment of the line come out.
+- A string holding a NUL (`.chr(0)`) goes to `-b` in full, but the text stops just
+  before the first NUL.
+- Outside text replacement mode a returned string is output to `-b` only, as before.
+- The bundled `callstr.axx` / `callstr.s` pair is the test of this.
 
 #### Example: 8080 to Z80
 
@@ -5270,6 +5306,7 @@ The x86_64 pattern file is also maintained separately at
 | **test.axx** | 1.1 KB | 40 | **test.s** | Fragments of several ISAs; test only |
 | **8080toz80.axx** | 5.7 KB | 117 | **hello8080.s** | Intel 8080 to Zilog Z80 source translator; `.textmode`, `!L` and `{{.exp()}}` (3.18) at work |
 | **textmode.axx** | 2.0 KB | 13 | **textmode.s** | `.textmode`, `!L`, `{{.exp()}}` and `;` comments (3.18); test only |
+| **callstr.axx** | 2.0 KB | 12 | **callstr.s** | A string returned by `.call` comes out as text in `.textmode`, to both `-b` and `-V` (3.18); test only |
 | **expcap.axx** | 2.8 KB | 36 | **expcap.s** | `{{.exp()}}` emits the text of every kind of capture (3.18); test only |
 | **exprmiss.axx** | 1.1 KB | 8 | **exprmiss.s** | A line with no expression or factor where one belongs (empty, `1+`, `-`, `~`, `()`) matches none of `!`, `!!`, `!L` and `!F`/`!D`/`!Q`, and is let through by `.passthru` (3.3); test only |
 | **arrindex.axx** | 860 B | 14 | **arrindex.s** | Array symbols: bare names as items, a name as a subscript, `.index` (3.6.1); test only |
@@ -5376,9 +5413,9 @@ drops the label references it read, so for a symbol only the bytes of the
 immediate field read the label, and the relocation lands on that field). The three-operand `IMUL` with an
 immediate and `MOV` with `[RIP+...]` have their 32 / 16 / 8-bit forms too.
 
-`test1` runs all one hundred and thirteen pairs through Paxx and Caxx and
-compares the `-b` raw binaries. For the five pairs that use `.textmode`
-(`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx` and `expcap.axx`),
+`test1` runs all one hundred and fourteen pairs through Paxx and Caxx and
+compares the `-b` raw binaries. For the six pairs that use `.textmode`
+(`textmode.axx`, `8080toz80.axx`, `intel2att.axx`, `a64tox64_axx.axx`, `expcap.axx` and `callstr.axx`),
 and for `exprmiss.axx`, which looks at lines let through by `.passthru`, it also compares the translated text each
 implementation writes to standard output under `-V`. The `elftype.axx` /
 `elftype.s` and `elfgen.axx` / `elfgen.s` pairs are about relocations and the
@@ -5484,7 +5521,7 @@ The sixteen core pairs (`4004` `z80` `6502` `6800` `6809` `8080` `8048` `8051`
 `68000` `vliw` `itanium` `x86_64` `x86_64m` `bf` `8080toz80` `aarch64`) are run
 under `-o` (the ELF of the pattern's machine; x86-64 ELF64 when it has no `.elfmachine`), `-m 3 -f 32 -o` (ELF32), `-g -o` (with DWARF), `-v` (the
 listing) and `-V` (the text output) as well, to exercise the paths `-b` alone
-never compares, for two hundred and fifty-four comparisons in all.
+never compares, for two hundred and fifty-six comparisons in all.
 
 When comparing under `-g`, run both implementations in the same directory: DWARF
 records the working directory in `DW_AT_comp_dir`, so running them in different
@@ -5522,8 +5559,8 @@ reflects where the work has gone, not the limit of what axx can describe.
 | `format_of_exp_imp_file` | Export/import file format |
 | `axx.1.gz` | Man page |
 
-`test1` assembles all one hundred and thirteen bundled pattern/source pairs with
-Paxx and Caxx and compares the results, two hundred and fifty-four comparisons
+`test1` assembles all one hundred and fourteen bundled pattern/source pairs with
+Paxx and Caxx and compares the results, two hundred and fifty-six comparisons
 in all (Appendix B lists what each pair compares).
 
 ### C.2 External

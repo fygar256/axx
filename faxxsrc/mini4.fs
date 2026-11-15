@@ -297,7 +297,14 @@ variable mc-k
     else ret v-str? if ret v-str 0 ?do dup i + c@ obj-byte loop drop else ret v-q obj+ then then
   then
   nobj @ n0 - { cnt }
-  drp cnt 1 = semi and if n0 obj-q q-zero? else false then or if n0 nobj ! then
+  drp cnt 1 = semi and if n0 obj-q q-zero? else false then or if n0 nobj ! nk exit then
+  \ .textmode では文字列の戻り値（NUL の手前まで）をテキストとしても出す（-V と -b の両方）。
+  \ axx.py の makeobj() の call_text、caxx.c の mini_call_binary() の rettxt と同じ規則。
+  textmode @ ret 0<> and if ret v-str? else false then if
+    ret v-str { ta tu }  0 { tn }
+    begin tn tu < if ta tn + c@ 0<> else false then while tn 1+ to tn repeat
+    semi tn 0= and 0= if ta tn emit-template then
+  then
   nk ;
 : mini-call-impl ( a u k semi drp -- k' ) { a u k semi drp }
   k 5 + to k
